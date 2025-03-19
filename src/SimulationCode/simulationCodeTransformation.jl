@@ -117,7 +117,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
     Check if the model has state variables, if not introduce a dummy state
   =#
   local addDummyState = false
-  if count(isState, simVars) < 1
+  if count(isState, simVars) < 0
     push!(simVars, SIMVAR(makeDummyVariableName(equationSystem.name), NONE(), STATE(), NONE()))
     local dummyBDAE_Var = BDAE.VAR(DAE.makeDummyCrefIdentOfTypeReal(makeDummyVariableName(equationSystem.name)),
                                    BDAE.STATE(),
@@ -208,6 +208,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
       #= Add top level variables to the sub system. These variables are shared. =#
       push!(auxSys.orderedVars, v)
     end
+    @info "All backend variables" allBackendVars
     local subSys = transformToSimCode([auxSys], shared; mode = mode)
     push!(structuralSubModels, subSys)
   end

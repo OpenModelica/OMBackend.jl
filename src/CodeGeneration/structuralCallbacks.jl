@@ -392,7 +392,7 @@ end
 """
 function extractTransitionEquationBody(structuralTransition)
   local ifEquation = structuralTransition.ifEquation
-  local structuralTransisitonAsDAE = listHead(OMFrontend.Main.convertEquation(ifEquation, nil))
+  local structuralTransisitonAsDAE = listHead(OMFrontend.Frontend.convertEquation(ifEquation, nil))
   #= For now assumed to only allow a single statement. No else. =#
   @assert length(structuralTransisitonAsDAE.condition1) == 1
   @assert length(ifEquation.branches) == 1
@@ -408,7 +408,7 @@ end
   The equations in this model does not include active DOCC equations.
 """
 function createNewFlatModel(flatModel)
-  local newFlatModel = OMFrontend.Main.FLAT_MODEL(flatModel.name,
+  local newFlatModel = OMFrontend.Frontend.FLAT_MODEL(flatModel.name,
                                                   flatModel.variables,
                                                   flatModel.unresolvedConnectEquations, #Why is this in two places?
                                                   flatModel.initialEquations,

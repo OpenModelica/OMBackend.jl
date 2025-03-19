@@ -92,7 +92,7 @@ mutable struct StructuralChangeDynamicConnection <: AbstractStructuralChange
   structureChanged::Bool
   "The meta model. A flat representation of the model itself."
   #= Would it be better to modify the SCode instead? Less code to change?=#
-  flatModel::OMFrontend.Main.FLAT_MODEL
+  flatModel::OMFrontend.Frontend.FLAT_MODEL
   "The index of the specific dynamic connection equation."
   index::Int
   """

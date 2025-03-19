@@ -520,7 +520,7 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
   used as part of DOCC.
   =#
   @Record STRUCTURAL_IF_EQUATION begin
-    ifEquation::OMFrontend.Main.EQUATION_IF
+    ifEquation::OMFrontend.Frontend.EQUATION_IF
   end
 
   #=

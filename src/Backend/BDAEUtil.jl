@@ -54,7 +54,7 @@ end
 """
   Creates a flat list of equation systems.
 """
-function createEqSystems(frontendDAE::OMFrontend.Main.FlatModel)::BDAE.EQSYSTEM
+function createEqSystems(frontendDAE::OMFrontend.Frontend.FlatModel)::BDAE.EQSYSTEM
   #= Create the first main equation system. =#
   local eqSystems = BDAE.EQSYSTEM[createEqSystem(frontendDAE)]
   for subModel in frontendDAE.structuralSubmodels
@@ -71,13 +71,13 @@ end
 """
   Creates a single equation system
 """
-function createEqSystem(flatModel::OMFrontend.Main.FlatModel)
+function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   #= TODO Extract the simple equations =#
-  local equations = [equationToBackendEquation(eq) for eq in OMFrontend.Main.convertEquations(flatModel.equations)]
-  local variables = [variableToBackendVariable(var) for var in OMFrontend.Main.convertVariables(flatModel.variables, list())]
+  local equations = [equationToBackendEquation(eq) for eq in OMFrontend.Frontend.convertEquations(flatModel.equations)]
+  local variables = [variableToBackendVariable(var) for var in OMFrontend.Frontend.convertVariables(flatModel.variables, list())]
   local algorithms = [alg for alg in flatModel.algorithms]
   local iAlgorithms = [iAlg for iAlg in flatModel.initialAlgorithms]
-  local initialEquations = [equationToBackendEquation(ieq) for ieq in OMFrontend.Main.convertEquations(flatModel.initialEquations)]
+  local initialEquations = [equationToBackendEquation(ieq) for ieq in OMFrontend.Frontend.convertEquations(flatModel.initialEquations)]
   eqSystems = [BDAEUtil.createEqSystem(flatModel.name, variables, equations)]
   #= Treat structural submodels =#
   subModels = []

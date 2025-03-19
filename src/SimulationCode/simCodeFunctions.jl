@@ -33,7 +33,7 @@
   The code in this file is used to convert frontend functions to a definition that can be used by the backend, and the code generators there.
 =#
 
-const FRONTEND_FUNCTION = OMFrontend.Main.M_FUNCTION
+const FRONTEND_FUNCTION = OMFrontend.Frontend.M_FUNCTION
 
 """
   Generates algorithmic simcode
@@ -46,24 +46,24 @@ function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{
   for f in functionList
     local n = string(f.path)
     local inputs = map(f.inputs) do input
-      OMFrontend.Main.convertFunctionParam(input)
+      OMFrontend.Frontend.convertFunctionParam(input)
     end
     local outputs = map(f.outputs) do output
-      OMFrontend.Main.convertFunctionParam(output)
+      OMFrontend.Frontend.convertFunctionParam(output)
     end
     local locals = map(f.locals) do l
-      OMFrontend.Main.convertFunctionParam(l)
+      OMFrontend.Frontend.convertFunctionParam(l)
     end
-    if ! OMFrontend.Main.isExternal(f)
-      local body::List{OMFrontend.Main.Statement} = OMFrontend.Main.getBody(f)
-      local stmts = OMFrontend.Main.convertStatements(body)
+    if ! OMFrontend.Frontend.isExternal(f)
+      local body::List{OMFrontend.Frontend.Statement} = OMFrontend.Frontend.getBody(f)
+      local stmts = OMFrontend.Frontend.convertStatements(body)
       local mf = MODELICA_FUNCTION(n, inputs, outputs, locals, listArray(stmts))
       push!(functions, mf)
     else #= The function is a wrapper for some internal builtin Modelica Function =#
       externalFunctionsUsed = true
-      s = OMFrontend.Main.IOStream_M.create(getInstanceName(), OMFrontend.Main.IOStream_M.LIST())
-      s = OMFrontend.Main.toFlatStream(OMFrontend.Main.getSections(f.node), f.path, s)#"dummy"
-      str = OMFrontend.Main.IOStream_M.string(s)
+      s = OMFrontend.Frontend.IOStream_M.create(getInstanceName(), OMFrontend.Frontend.IOStream_M.LIST())
+      s = OMFrontend.Frontend.toFlatStream(OMFrontend.Frontend.getSections(f.node), f.path, s)#"dummy"
+      str = OMFrontend.Frontend.IOStream_M.string(s)
       #=This should really really not be done by string splitting magic... =#
       local libInfo = first(split(str, "annotation"))
       libInfo = replace(libInfo, "external \"C\"" => "")

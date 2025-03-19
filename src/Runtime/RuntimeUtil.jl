@@ -8,10 +8,10 @@ import ModelingToolkit
 import OMBackend
 import OMBackend.SimulationCode
 import OMFrontend
-import OMFrontend.Main
-import OMFrontend.Main.AbsynUtil
-import OMFrontend.Main.SCodeUtil
-import OMFrontend.Main.Util
+import OMFrontend.Frontend
+import OMFrontend.Frontend.AbsynUtil
+import OMFrontend.Frontend.SCodeUtil
+import OMFrontend.Frontend.Util
 import SCode
 
 using MetaModelica
@@ -221,7 +221,7 @@ function createNewFlatModel(flatModel,
                             unresolvedEquations,
                             newEquations)
   local newFlatModel =
-    OMFrontend.Main.FLAT_MODEL(flatModel.name,
+    OMFrontend.Frontend.FLAT_MODEL(flatModel.name,
                                flatModel.variables,
                                flatModel.equations,
                                flatModel.initialEquations,
@@ -237,21 +237,21 @@ function createNewFlatModel(flatModel,
   println("********************************************************************")
   @debug length(newEquations)
   for e in newEquations
-    println(OMFrontend.Main.toString(e))
+    println(OMFrontend.Frontend.toString(e))
   end
   println("********************************************************************")
   # println("Existing equations:")
   # println("********************************************************************")
   # @debug "Length of existing system:" length(newFlatModel.equations)
   # for e in newFlatModel.equations
-  #   println(OMFrontend.Main.toString(e))
+  #   println(OMFrontend.Frontend.toString(e))
   # end
   # println("********************************************************************")
   @assign newFlatModel.equations = listAppend(unresolvedEquations, newEquations)
   # println("Unresolved System:")
   # println("********************************************************************")
   # for e in newFlatModel.equations
-  #   println(OMFrontend.Main.toString(e))
+  #   println(OMFrontend.Frontend.toString(e))
   # end
   # println("********************************************************************")
   #=
@@ -259,14 +259,14 @@ function createNewFlatModel(flatModel,
     2. Perform constant evaluation.
     3. Run the simplification pass.
   =#
-  newFlatModel = OMFrontend.Main.resolveConnections(newFlatModel, newFlatModel.name)
-  newFlatModel = OMFrontend.Main.evaluate(newFlatModel)
-  newFlatModel = OMFrontend.Main.simplifyFlatModel(newFlatModel)
+  newFlatModel = OMFrontend.Frontend.resolveConnections(newFlatModel, newFlatModel.name)
+  newFlatModel = OMFrontend.Frontend.evaluate(newFlatModel)
+  newFlatModel = OMFrontend.Frontend.simplifyFlatModel(newFlatModel)
   # println("Final System")
   # @debug "Length of final system:" length(newFlatModel.equations)
   # println("********************************************************************")
   # for e in newFlatModel.equations
-  #   println(OMFrontend.Main.toString(e))
+  #   println(OMFrontend.Frontend.toString(e))
   # end
   # println("********************************************************************")
   return newFlatModel
@@ -283,7 +283,7 @@ function createNewFlatModel(flatModel,
   local aDoccs = flatModel.active_DOCC_Equations
   aDoccs[idx] = false
   local newFlatModel =
-    OMFrontend.Main.FLAT_MODEL(flatModel.name,
+    OMFrontend.Frontend.FLAT_MODEL(flatModel.name,
                                flatModel.variables,
                                flatModel.unresolvedConnectEquations,
                                flatModel.initialEquations,
@@ -302,7 +302,7 @@ function createNewFlatModel(flatModel,
   println("********************************************************************")
   println("Length of OLD FLAT MODEL:" * string(length(OMBackend.CodeGeneration.OLD_FLAT_MODEL.equations)))
   for e in OMBackend.CodeGeneration.OLD_FLAT_MODEL.equations
-    println(OMFrontend.Main.toString(e))
+    println(OMFrontend.Frontend.toString(e))
   end
 
   # println("********************************************************************")
@@ -310,7 +310,7 @@ function createNewFlatModel(flatModel,
   # println("********************************************************************")
   # @info "Length of new system:" length(newFlatModel.unresolvedConnectEquations)
   # for e in newFlatModel.unresolvedConnectEquations
-  #   println(OMFrontend.Main.toString(e))
+  #   println(OMFrontend.Frontend.toString(e))
   # end
   # println("********************************************************************")
   #=
@@ -318,14 +318,14 @@ function createNewFlatModel(flatModel,
     2. Perform constant evaluation.
     3. Run the simplification pass.
   =#
-  newFlatModel = OMFrontend.Main.resolveConnections(newFlatModel, newFlatModel.name)
-  newFlatModel = OMFrontend.Main.evaluate(newFlatModel)
-  newFlatModel = OMFrontend.Main.simplifyFlatModel(newFlatModel)
+  newFlatModel = OMFrontend.Frontend.resolveConnections(newFlatModel, newFlatModel.name)
+  newFlatModel = OMFrontend.Frontend.evaluate(newFlatModel)
+  newFlatModel = OMFrontend.Frontend.simplifyFlatModel(newFlatModel)
   println("Final System")
   #@info "Length of final system:" length(newFlatModel.equations)
   println("********************************************************************")
   for e in newFlatModel.equations
-    println(OMFrontend.Main.toString(e))
+    println(OMFrontend.Frontend.toString(e))
   end
   println("********************************************************************")
   return newFlatModel
@@ -340,7 +340,7 @@ function resolveDOOCConnections(flatModel, name)
   local pathsForRoots = Dict{String, Vector{String}}()
   for rv in rootVariables
     p = findPath(searchGraph, rv)
-    pathsForRoots[OMFrontend.Main.toString(rv)] = p
+    pathsForRoots[OMFrontend.Frontend.toString(rv)] = p
   end
   for key in keys(pathsForRoots)
     vars = pathsForRoots[key]
@@ -348,7 +348,7 @@ function resolveDOOCConnections(flatModel, name)
   local rootSources = Dict{String, String}()
   #= These are the equations for which the chain starts =#
   for (lhs, rhs) in rootEquations
-    rootSources[OMFrontend.Main.toString(lhs)] = OMFrontend.Main.toString(rhs)
+    rootSources[OMFrontend.Frontend.toString(lhs)] = OMFrontend.Frontend.toString(rhs)
   end
   return (pathsForRoots, rootSources)
 end
@@ -359,7 +359,7 @@ Iterative DFS:
   Finds the path for a root variable passed as inV (in Vertices)
 """
 function findPath(g::Dict{String, Vector{String}}, inV)
-  local v = OMFrontend.Main.toString(inV)
+  local v = OMFrontend.Frontend.toString(inV)
   local S = String[]
   local discovered = String[] #= Should ideally be int instead... =#
   push!(S, v)

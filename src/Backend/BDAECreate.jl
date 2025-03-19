@@ -83,7 +83,7 @@ end
   2. We convert this representation into the BackendDAE representation.
   3. We return backend DAE to be used in the remainder of the compilation before code generation.
 """
-function lower(flatModelica::OMFrontend.Main.FlatModel)
+function lower(flatModelica::OMFrontend.Frontend.FlatModel)
   #= Creates a list of flat equation systems =#
   local eqSystems = createEqSystems(flatModelica)
   local shared
@@ -112,7 +112,7 @@ end
 """
   Creates one or more equation systems
 """
-function createEqSystems(frontendDAE::OMFrontend.Main.FlatModel)::Vector{BDAE.EQSYSTEM}
+function createEqSystems(frontendDAE::OMFrontend.Frontend.FlatModel)::Vector{BDAE.EQSYSTEM}
   #= Create the first main equation system. =#
   local eqSystems = Any[createEqSystem(frontendDAE)]
   if ! listEmpty(frontendDAE.structuralSubmodels)
@@ -127,7 +127,7 @@ end
 """
   Creates a flat list of equation systems.
 """
-function createEqSystemsWork(structuralSubmodels::List{OMFrontend.Main.FlatModel})
+function createEqSystemsWork(structuralSubmodels::List{OMFrontend.Frontend.FlatModel})
   local eqSystems = BDAE.EQSYSTEM[]
   for subModel in structuralSubmodels
     push!(eqSystems, createEqSystem(subModel))
@@ -138,16 +138,16 @@ end
 """
   Creates a single equation system
 """
-function createEqSystem(flatModel::OMFrontend.Main.FlatModel)
+function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   local name = flatModel.name
   local equations = [equationToBackendEquation(eq)
-                     for eq in OMFrontend.Main.convertEquations(flatModel.equations)]
+                     for eq in OMFrontend.Frontend.convertEquations(flatModel.equations)]
   local variables = [variableToBackendVariable(var)
-                     for var in OMFrontend.Main.convertVariables(flatModel.variables, list())]
+                     for var in OMFrontend.Frontend.convertVariables(flatModel.variables, list())]
   local algorithms = [alg for alg in flatModel.algorithms]
   local iAlgorithms = [iAlg for iAlg in flatModel.initialAlgorithms]
   local initialEquations = [equationToBackendEquation(ieq)
-                            for ieq in OMFrontend.Main.convertEquations(flatModel.initialEquations)]
+                            for ieq in OMFrontend.Frontend.convertEquations(flatModel.initialEquations)]
   #= The set of equations might also contain a  set of "binding equations" =#
   local bindingEquations = createBindingEquations(variables)
   equations = vcat(equations, bindingEquations)
@@ -156,8 +156,8 @@ function createEqSystem(flatModel::OMFrontend.Main.FlatModel)
   return BDAE.EQSYSTEM(name, variables, equations, simpleEquations, initialEquations)
 end
 
-function convertVariableIntoBDAEVariable(var::OMFrontend.Main.Variable)
-  elem = OMFrontend.Main.convertVariable(var, OMFrontend.Main.VARIABLE_CONVERSION_SETTINGS(true, false, true))
+function convertVariableIntoBDAEVariable(var::OMFrontend.Frontend.Variable)
+  elem = OMFrontend.Frontend.convertVariable(var, OMFrontend.Frontend.VARIABLE_CONVERSION_SETTINGS(true, false, true))
   BDAE.VAR(elem.componentRef,
            BDAEUtil.DAE_VarKind_to_BDAE_VarKind(elem.kind),
            elem.direction,

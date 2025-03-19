@@ -113,15 +113,20 @@ function move_diffs(eq::Equation; rewrite)
 end
 
 """
-  Rewrite equations that do not conform to the requirements of MTK
+  Rewrite equations that do not conform to the requirements of MTK.
+Since MTK currently requires the derivative to be at the lhs.
 """
 function rewriteEquations(edeqs, iv, eVars, ePars, simCode)
   #println("Recived #edeqs")
   #println(length(edeqs))
+  #= TODO: Try to move der to the top level to avoid eval here. =#
   local der = ModelingToolkit.Differential(t)
   #= Remove the t's =#
   eVars = [Symbol(replace(string(i), "(t)" => "")) for i in eVars]
   #Temporary fix for the ESCIMO climate model: eVars = vcat(eVars, [Symbol("combi_Population_Lookup_bn_y")])
+  #=
+  TODO: This should ideally be done without using eval.
+  =#
   preEval = quote
     vars = ModelingToolkit.@variables begin
       $(eVars...)

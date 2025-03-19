@@ -599,7 +599,7 @@ end
 
 function Base.string(structuralIfEquation::BDAE.STRUCTURAL_IF_EQUATION)
   local str = "DYNAMIC_"
-  local ifEqStr = replace(OMFrontend.Main.toString(structuralIfEquation.ifEquation), "\\n" => "\n")
+  local ifEqStr = replace(OMFrontend.Frontend.toString(structuralIfEquation.ifEquation), "\\n" => "\n")
   str *= ifEqStr * "\n"
 end
 
