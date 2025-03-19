@@ -96,7 +96,7 @@ const COMPILED_MODELS_MTK = Dict()
 The function list contains the sequential parts of a modelica model, that is the different functions that the model might use.
 This is not part of the lowering process but it is to be generated before we generate MTK target code
 """
-function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Main.FlatModel};
+function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatModel};
                    functionList = nothing, BackendMode = MTK_MODE)::Tuple{String, Expr}
   local bDAE = lower(frontendDAE)
   local simCode
@@ -172,11 +172,11 @@ end
 """
   Transforms given FlatModelica to backend DAE-IR (BDAE-IR).
 """
-function lower(fm::OMFrontend.Main.FLAT_MODEL)
+function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   local preprocessedFM = FrontendUtil.handleBuiltin(fm)
   local bDAE = BDAECreate.lower(preprocessedFM)
   #@debug(BDAEUtil.stringHeading1(bDAE, "translated"));
-  #debugWrite("initialBDAE.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
+  debugWrite("initialBDAE.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
   #= Expand arrays =#
   # Removed this pass since this can now
   #(bDAE, expandedVars) = Causalize.expandArrayVariables(bDAE)
@@ -187,7 +187,7 @@ function lower(fm::OMFrontend.Main.FLAT_MODEL)
   #@debug(BDAEUtil.stringHeading1(bDAE, "States marked"));
   bDAE = Causalize.residualizeEveryEquation(bDAE)
   #= Convert equations to residual form =#
-  #debugWrite("residualTransformationAllParamsAndConstants.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
+  debugWrite("residualTransformationAllParamsAndConstants.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
   #=
     Remove unused parameters and or constants.
     Important optimization for some systems.
@@ -195,7 +195,7 @@ function lower(fm::OMFrontend.Main.FLAT_MODEL)
   =#
   #bDAE = Causalize.detectUnusedParametersAndConstants(bDAE)
   #= Find and reclassify discrete variables not marked as discrete. =#
-  #debugWrite("residualTransformation.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
+  debugWrite("residualTransformation.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
   return bDAE
 end
 
@@ -211,7 +211,7 @@ end
 """
   Translates functions to simlulation code.
 """
-function generateSimCodeFunctions(functions::List{OMFrontend.Main.M_FUNCTION})
+function generateSimCodeFunctions(functions::List{OMFrontend.Frontend.M_FUNCTION})
   local simCodeFunctions = SimulationCode.generateSimCodeFunctions(functions)
   return simCodeFunctions
 end
