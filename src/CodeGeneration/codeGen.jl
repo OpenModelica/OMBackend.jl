@@ -12,7 +12,7 @@ TODO:
   Contains the headerstring defining the OpenModelica copyright notice.
 """
 const HEADER_STRING ="
-  $(copyRightString())"
+  $(copyrightString())"
 
 #= To keep track of generated callbacks. =#
 let CALLBACKS = 0
