@@ -38,7 +38,7 @@ import MacroTools
 """
 Return string containing the OSMC copyright stuff.
 """
-function copyRightString()
+function copyrightString()
 
   strOut = string("#= /*
 * This file is part of OpenModelica.
@@ -580,7 +580,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       DAE.ICONST(int) => quote $int end
       DAE.RCONST(real) => quote $real end
       DAE.SCONST(tmpStr) => quote $tmpStr end
-      DAE.CREF(DAE.CREF_IDENT("time", DAE.T_REAL(Nil{Any}())), _) => begin
+      DAE.CREF(DAE.CREF_IDENT("time", DAE.T_REAL(nil)), _) => begin
         quote
           t
         end
@@ -816,10 +816,10 @@ function odeSystemWithEvents(hasEvents, modelName)
   if hasEvents
     :(ODESystem(eqs, t, vars, parameters;
               name=:($(Symbol($modelName))),
-              continuous_events = events))
+              continuous_events = events, guesses = initialValues))
   else
     :(ODESystem(eqs, t, vars, parameters;
-              name=:($(Symbol($modelName)))))
+              name=:($(Symbol($modelName))), guesses = initialValues))
   end
 end
 
@@ -1048,14 +1048,20 @@ end
   Used for logging.
 """
 function writeEqsToFile(elems::Vector{Expr}, filename)
-  buffer = IOBuffer()
-  for e in elems
-    e = stripComments(e)
-    e = stripBeginBlocks(e)
-    eqStr = replace(string(e), "~" => "=")
-    eqStr = replace(eqStr, "(t)" => "")
-    eqStr = replace(eqStr, "Differential" => "der")
-    println(buffer, eqStr)
+  local buffer = IOBuffer()
+  try
+    for e in elems
+      e = stripComments(e)
+      e = stripBeginBlocks(e)
+      local eStr = string(e)
+      eqStr = replace(eStr, "~" => "=")
+      eqStr = replace(eqStr, "(t)" => "")
+      eqStr = replace(eqStr, "Differential" => "der")
+      println(buffer, eqStr)
+    end
+  catch e
+    @error string("Failed writing the model to the file:",  filename)
+    throw(e)
   end
   println(buffer, "------------------------------------")
   println(buffer, "Statistics:")

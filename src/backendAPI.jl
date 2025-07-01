@@ -54,6 +54,8 @@ import Plots
 import REPL
 import SCode
 
+include("util.jl")
+
 const latexSymbols = REPL.REPLCompletions.latex_symbols
 #= Settings =#
 @enum BackendMode begin
@@ -425,7 +427,7 @@ function simulateModel(modelName::String;
       @info "Interactive evaluation failed with exception: $(typeof(err)) with mode: $(MODE)"
       @info "Runnable" modelRunnable
       @info "Julia Code:"
-      #println(strippedModel)
+      println(strippedModel)
       throw(err)
     end
   else

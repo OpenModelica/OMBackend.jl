@@ -202,8 +202,9 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
         #= Save the old solution together with the name and the mode that was active =#
         push!(oldSols, integrator.sol)
         #= Now we have the start values for the next part of the system=#
+        local newF = newSystem.f
         newProbTest = ModelingToolkit.ODEProblem(
-          newSystem.f.sys,
+          newF,
           newU0,
           tspan,
           newSystem.p,
@@ -225,7 +226,6 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
           cb.structureChanged = false
         end
         oldSystem = newSystem
-        #= goto to save preformance =#
         @goto START_OF_INTEGRATION
       end
     end
@@ -587,7 +587,7 @@ end
     Fetches the symbolic variables from a problem.
 """
 function getSyms(problem::ODEProblem)::Vector{Symbol}
-  return [state.f.name for state in ModelingToolkit.get_states(problem.f.sys)]
+  return [state.f.name for state in ModelingToolkit.get_unknowns(problem.f.sys)]
 end
 
 """

@@ -140,7 +140,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
                  end)
       return result
     end
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0); solver=Rodas5())
+    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0); solver=Rodas5(autodiff=false))
       $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
       OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver)
     end
@@ -278,6 +278,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local START_CONDTIONS_EQUATIONS = createStartConditionsEquationsMTK(vcat(stateVariables, occVariables),
                                                                       algebraicVariables,
                                                                       simCode)
+
+
   local DISCRETE_START_VALUES = vcat(generateInitialEquations(simCode.initialEquations, simCode; parameterAssignment = true),
                                      getStartConditionsMTK(discreteVariables, simCode))
   local PARAMETER_EQUATIONS = createParameterEquationsMTK(parameters, simCode)
@@ -312,12 +314,19 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local ZERO_DYNAMICS_COND_EQUATIONS = collect(Iterators.flatten([component[3] for component in IF_EQUATION_COMPONENTS]))
   #= Expand the start conditions with initial equations for the zero dynamic equations for the conditional equations =#
   local ifConditionalStartEquations = [:($(Symbol(first(v))) => $(last(v))) for v in ifConditionNameAndIV]
-  local irreductableSyms = Symbol[Symbol(vn) for vn in simCode.irreductableVariables]
-  START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations,
-                                   DISCRETE_START_VALUES,
-                                   START_CONDTIONS_EQUATIONS)
   #=
-    Merge the ifConditional components into the rest of the system and merge the state conditionals with the sates
+  In the latest variant of MTK we can not reuse the old variables for the creation of the ODEProblem later.
+  Instead, we should only use the values for the unknowns we can't remove from the system.
+  =#
+  local irreductableSyms = Symbol[Symbol(vn) for vn in simCode.irreductableVariables]
+  local FINAL_START_CONDTIONS_EQUATIONS = unique!(createStartConditionsEquationsMTK(
+    String[vn for vn in simCode.irreductableVariables],
+    String[],
+    simCode))
+  FINAL_START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations,  DISCRETE_START_VALUES, FINAL_START_CONDTIONS_EQUATIONS)
+  START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations, DISCRETE_START_VALUES, START_CONDTIONS_EQUATIONS)
+  #=
+    Merge the ifConditional components into the rest of the system and merge the state conditionals with the states
   =#
   stateVariablesSym = vcat(ifConditionalVariables,
                            discreteVariablesSym,
@@ -344,7 +353,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   model = quote
     $(CALL_BACK_EQUATIONS)
     function $(Symbol(MODEL_NAME * "Model"))(tspan = (0.0, 1.0))
-      ModelingToolkit.@variables t
+      ModelingToolkit.@independent_variables t
       D = ModelingToolkit.Differential(t)
       parameters = ModelingToolkit.@parameters begin
         ($(parVariablesSym...))
@@ -370,7 +379,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       #= Mark irreductable variables irreductable. Uncomment for reinitialization =#
       local irreductableSyms = $(irreductableSyms)
       for sym in irreductableSyms
-       eval(:($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableIrreducible, true)))
+        eval(:($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableIrreducible, true)))
       end
       #= Transform the variable vector into a vector of Nums =#
       vars = map(x ->(last(x)), vars)
@@ -382,6 +391,13 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
         push!(startEquationComponents, constructor())
       end
       initialValues = collect(Iterators.flatten(startEquationComponents))
+      #= Process the final initial guesses =#
+      startEquationComponents = []
+      $(decomposeStartEquations(FINAL_START_CONDTIONS_EQUATIONS; functionSuffix = "Final"))
+      for constructor in startEquationConstructors
+        push!(startEquationComponents, constructor())
+      end
+      finalInitialValues = collect(Iterators.flatten(startEquationComponents))
       #= End construction of initial values =#
       equationComponents = []
       $(stripBeginBlocks(decomposeEquations(EQUATIONS, PARAMETER_ASSIGNMENTS)))
@@ -398,13 +414,13 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
         These arrays are introduced to handle the bolted on event handling using callbacks.
         The callback handling for MTK is subject of change should hybrid system be implemented for MTK.
       =#
-      local event_p = [$(PARAMETER_RAW_ARRAY...)]
+      local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
       local discreteVars = collect(values(ModelingToolkit.OrderedDict($(DISCRETE_START_VALUES...))))
       #= Merge the discrete and event parameters =#
-      event_p = vcat(event_p, discreteVars)
+      eventParameters = vcat(eventParameters, discreteVars)
       local aux = Vector{Any}(undef, 3)
       #= TODO init them with the initial values of them =#
-      aux[1] = event_p
+      aux[1] = eventParameters
       aux[2] = Float64[]
       aux[3] = reducedSystem
       #=
@@ -414,9 +430,9 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       =#
       callbacks = $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
       problem = ModelingToolkit.ODEProblem(reducedSystem,
-                                           initialValues,
+                                           merge(Dict(finalInitialValues), pars),
                                            tspan,
-                                           pars,
+                                           #warn_initialize_determined = false,
                                            callback=callbacks)
       return (problem, callbacks, initialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
     end
@@ -959,8 +975,9 @@ end
 
 """
   Similar to decomposeEquations but for start equations.
+  The optional argument `functionSuffix` can be used to specify a slightly different name to the function that is generated.
 """
-function decomposeStartEquations(equations)
+function decomposeStartEquations(equations; functionSuffix = "")
   local nStateVars = length(equations)
   local equationVectors = collect(Iterators.partition(equations, 50))
   local exprs = Expr[]
@@ -971,10 +988,10 @@ function decomposeStartEquations(equations)
   local i = 0
   for equationVector in equationVectors
     equationConstructorExpr = quote
-      function $(Symbol("generateStartEquations" * string(i)))()
+      function $(Symbol(string("generateStartEquations",functionSuffix, string(i))))()
         [$(equationVector...)]
       end
-      push!(startEquationConstructors, $(Symbol("generateStartEquations" * string(i))))
+      push!(startEquationConstructors, $(Symbol(string("generateStartEquations", functionSuffix, string(i)))))
     end
     push!(exprs, equationConstructorExpr)
     i += 1
@@ -986,7 +1003,7 @@ function decomposeStartEquations(equations)
 end
 
 """
-  Generates quoted Symbolics.@register_symbolic calls s.t externaly defined functions is known during the simulation.
+  Generates quoted Symbolics.@register_symbolic calls s.t externaly defined functions are known during simulation.
 """
 function generateRegisterCallsForCallExprs(simCode;
                                             funcArgGen::Function = AlgorithmicCodeGeneration.generateSignatureForRegistration)

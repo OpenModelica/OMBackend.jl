@@ -1,5 +1,11 @@
+#=
+This file contains slightly modified code from MTK.
+This is used here according to the MIT license.
+Details below.
+=#
+
 #= The ModelingToolkit.jl package is licensed under the MIT "Expat" License:
-# Copyright (c) 2018-20: Christopher Rackauckas, Julia Computing.
+# Copyright (c) 2018-25: Christopher Rackauckas, Julia Computing.
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
@@ -51,25 +57,27 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE  S
 
 #=
 This file contains "hacks".
-This is done in order
-to get the equations on a MTK compatible format before calling functions such as structurally simplify.
+This is done in order to get the equations on a MTK compatible format before calling functions such as structurally simplify.
 TODO:
 !Adjust the uncessary string conversions!
 =#
 
 #=
-  So we know about t an der in the global scope.
-  This is needed for the rules below to match correctly.
+So we know about t an der in the global scope.
+This is needed for the rules below to match correctly.
 =#
-ModelingToolkit.@variables t
+
+@independent_variables t #ModelingToolkit.@variables t
 const D = Differential(t)
 
+using DataStructures
+
 """
-  Temporary rewrite function. Not very pretty...
-  Original code by Chris R. Expanded to fix terms of type X * D(Y).
-  The solution to solve it is not pretty and is probably flaky.
-#istree returns true if x is a term. If true, operation, arguments must also be defined for x appropriately.
-"""
+    Temporary rewrite function. Not very pretty...
+    Original code by Chris R. Expanded to fix terms of type X * D(Y).
+    The solution to solve it is not pretty and is probably flaky.
+  #istree returns true if x is a term. If true, operation, arguments must also be defined for x appropriately.
+  """
 function move_diffs(eq::Equation; rewrite)
   # Do not modify `D(x) ~ ...`, already correct
   res =
@@ -85,8 +93,8 @@ function move_diffs(eq::Equation; rewrite)
         lhs ~ -rhs
       elseif !(lhs isa Number) && (operation(lhs) == *)
         #=
-          This code is probably quite flaky, however, it should not be needed after similar things are introduced in MTK.
-          TODO: Handle this more elegantly using rewrite rules instead.
+        This code is probably quite flaky, however, it should not be needed after similar things are introduced in MTK.
+        TODO: Handle this more elegantly using rewrite rules instead.
         =#
         local newRhs
         local newLhs
@@ -113,9 +121,9 @@ function move_diffs(eq::Equation; rewrite)
 end
 
 """
-  Rewrite equations that do not conform to the requirements of MTK.
-Since MTK currently requires the derivative to be at the lhs.
-"""
+    Rewrite equations that do not conform to the requirements of MTK.
+  Since MTK currently requires the derivative to be at the lhs.
+  """
 function rewriteEquations(edeqs, iv, eVars, ePars, simCode)
   #println("Recived #edeqs")
   #println(length(edeqs))
@@ -167,7 +175,7 @@ function rewriteEquations(edeqs, iv, eVars, ePars, simCode)
     #= Only do the rewrite for the differentials. The others have already been rewritten.=#
     eqStr = string(eq)
     if (contains(eqStr, "Differential")) # TODO expensive comp! Needs to be optimized.
-    req = move_diffs(eq, rewrite = remove_diffs)
+      req = move_diffs(eq, rewrite = remove_diffs)
       #@info "Left hand side of the equation" req.lhs
       if req.lhs isa Real
         push!(rewrittenDeqs, req)
@@ -189,12 +197,12 @@ function rewriteEquations(edeqs, iv, eVars, ePars, simCode)
 end
 
 """
-This function evaluates the supplied equations.
-In the case we are unable to evaluate them, we currently hack it by some string conversions.
-TODO:
-  Fix me do this the proper way.
-  This routine is way way to slow currently...
-"""
+  This function evaluates the supplied equations.
+  In the case we are unable to evaluate them, we currently hack it by some string conversions.
+  TODO:
+    Fix me do this the proper way.
+    This routine is way way to slow currently...
+  """
 function evalEDeqs(edeqs)
   #writeEqsToFile(edeqs, "beforeEqRewrite.log")
   local deqs = []
@@ -259,18 +267,18 @@ rewriteEq(eq) = begin
 end
 
 """
-$(SIGNATURES)
+  $(SIGNATURES)
 
-Structurally simplify algebraic equations in a system and compute the
-topological sort of the observed equations. When `simplify=true`, the `simplify`
-function will be applied during the tearing process. It also takes kwargs
-`allow_symbolic=false` and `allow_parameter=true` which limits the coefficient
-types during tearing.
+  Structurally simplify algebraic equations in a system and compute the
+  topological sort of the observed equations. When `simplify=true`, the `simplify`
+  function will be applied during the tearing process. It also takes kwargs
+  `allow_symbolic=false` and `allow_parameter=true` which limits the coefficient
+  types during tearing.
 
-The optional argument `io` may take a tuple `(inputs, outputs)`.
-This will convert all `inputs` to parameters and allow them to be unconnected, i.e.,
-simplification will allow models where `n_states = n_equations - n_inputs`.
-"""
+  The optional argument `io` may take a tuple `(inputs, outputs)`.
+  This will convert all `inputs` to parameters and allow them to be unconnected, i.e.,
+  simplification will allow models where `n_states = n_equations - n_inputs`.
+  """
 # function structural_simplify(sys::ModelingToolkit.AbstractSystem, io = nothing; simplify = false, kwargs...)
 #   @info "Calling custom structural_simplify"
 #   sys = expand_connections(sys)
@@ -299,17 +307,17 @@ simplification will allow models where `n_states = n_equations - n_inputs`.
 # end
 
 """
-TODO:
-Document why some parts here are outcommented
-The irreductable variables scheme does not work using plain simplify.
+  TODO:
+  Document why some parts here are outcommented
+  The irreductable variables scheme does not work using plain simplify.
 
 
-It should be noted that for some models both running tearing and structurally simplify is needed.
-Report and issue for the MTK reporters giving an example of this behavior.
+  It should be noted that for some models both running tearing and structurally simplify is needed.
+  Report and issue for the MTK reporters giving an example of this behavior.
 
-One example is running tearing twice broke the system
+  One example is running tearing twice broke the system
 
-"""
+  """
 function structural_simplify(sys::ModelingToolkit.AbstractSystem,
                              io = nothing;
                              simplify = false,
@@ -318,17 +326,130 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   #sys = ModelingToolkit.ode_order_lowering(sys)
   #sys = ModelingToolkit.dae_index_lowering(sys)
   #sys = ModelingToolkit.tearing(sys; simplify = simplify)
-   if simplify #Note report this to the developers of modeling toolkit.
-     sys = ModelingToolkit.ode_order_lowering(sys)
-     sys = ModelingToolkit.dae_index_lowering(sys)
-     #sys = ModelingToolkit.tearing(sys; simplify = false)
-     #Note some system breaks if tearing is run twice.
-     # Note2 In some cases we need to do index reduction before simplify
-   end
+  if simplify #Note report this to the developers of modeling toolkit.
+    sys = ode_order_lowering(sys)
+    sys = dae_index_lowering(sys)
+    #sys = ModelingToolkit.tearing(sys; simplify = false)
+    #Note some system breaks if tearing is run twice.
+    # Note2 In some cases we need to do index reduction before simplify
+  end
   sys = ModelingToolkit.structural_simplify(sys, simplify = false)
   return sys
- end
+end
+
+"""
+  $(TYPEDSIGNATURES)
+
+  Takes a Nth order System and returns a new System written in first order
+  form by defining new variables which represent the N-1 derivatives.
+  """
+function ode_order_lowering(sys::System)
+  iv = ModelingToolkit.get_iv(sys)
+  eqs_lowered, new_vars = ode_order_lowering(equations(sys), iv, unknowns(sys))
+  @set! sys.eqs = eqs_lowered
+  @set! sys.unknowns = new_vars
+  return sys
+end
+
+function dae_order_lowering(sys::System)
+  iv = get_iv(sys)
+  eqs_lowered, new_vars = dae_order_lowering(equations(sys), iv, unknowns(sys))
+  @set! sys.eqs = eqs_lowered
+  @set! sys.unknowns = new_vars
+  return sys
+end
+
+function ode_order_lowering(eqs, iv, unknown_vars)
+  var_order = OrderedDict{Any, Int}()
+  D = Differential(iv)
+  diff_eqs = Equation[]
+  diff_vars = []
+  alge_eqs = Equation[]
+
+  for (i, eq) in enumerate(eqs)
+    if !isdiffeq(eq)
+      push!(alge_eqs, eq)
+    else
+      var, maxorder = ModelingToolkit.var_from_nested_derivative(eq.lhs)
+      maxorder > get(var_order, var, 1) && (var_order[var] = maxorder)
+      var′ = ModelingToolkit.lower_varname(var, iv, maxorder - 1)
+      @info "eq.rhs" eq.rhs
+      @info "eq.lhs" eq.lhs
+      if ! isreal(eq.rhs) #= Modification by me. =#
+        rhs′ = ModelingToolkit.diff2term_with_unit(eq.rhs, iv)
+      else
+        rhs′ = eq.rhs
+      end
+      push!(diff_vars, var′)
+      push!(diff_eqs, D(var′) ~ rhs′)
+    end
+  end
+
+  for (var, order) in var_order
+    for o in (order - 1):-1:1
+      lvar = lower_varname(var, iv, o - 1)
+      rvar = lower_varname(var, iv, o)
+      push!(diff_vars, lvar)
+
+      rhs = rvar
+      eq = Differential(iv)(lvar) ~ rhs
+      push!(diff_eqs, eq)
+    end
+  end
+
+  # we want to order the equations and variables to be `(diff, alge)`
+  return (vcat(diff_eqs, alge_eqs), vcat(diff_vars, setdiff(unknown_vars, diff_vars)))
+end
+
+function dae_order_lowering(eqs, iv, unknown_vars)
+  var_order = OrderedDict{Any, Int}()
+  D = Differential(iv)
+  diff_eqs = Equation[]
+  diff_vars = OrderedSet()
+  alge_eqs = Equation[]
+  vars = Set()
+  subs = Dict()
+
+  for (i, eq) in enumerate(eqs)
+    vars!(vars, eq)
+    n_diffvars = 0
+    for vv in vars
+      isdifferential(vv) || continue
+      var, maxorder = var_from_nested_derivative(vv)
+      isparameter(var) && continue
+      n_diffvars += 1
+      order = get(var_order, var, nothing)
+      seen = order !== nothing
+      if !seen
+        order = 1
+      end
+      maxorder > order && (var_order[var] = maxorder)
+      var′ = lower_varname(var, iv, maxorder - 1)
+      subs[vv] = D(var′)
+      if !seen
+        push!(diff_vars, var′)
+      end
+    end
+    n_diffvars == 0 && push!(alge_eqs, eq)
+    empty!(vars)
+  end
+
+  for (var, order) in var_order
+    for o in (order - 1):-1:1
+      lvar = lower_varname(var, iv, o - 1)
+      rvar = lower_varname(var, iv, o)
+      push!(diff_vars, lvar)
+
+      rhs = rvar
+      eq = Differential(iv)(lvar) ~ rhs
+      push!(diff_eqs, eq)
+    end
+  end
+
+  return ([diff_eqs; substitute.(eqs, (subs,))],
+          vcat(collect(diff_vars), setdiff(unknown_vars, diff_vars)))
+end
 
 function getSyms(odeFunc::ODEFunction)
-  return ModelingToolkit.get_states(odeFunc.sys)
+  return ModelingToolkit.get_unknowns(odeFunc.sys)
 end

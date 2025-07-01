@@ -36,6 +36,8 @@ module CodeGeneration
 import DataStructures
 import ..Util
 using MetaModelica
+#= This was also introduced in the data structure package. We need to be explicit in which one we use.=#
+using MetaModelica: Cons
 using Setfield
 using DocStringExtensions
 using ModelingToolkit
