@@ -42,6 +42,9 @@ ENABLE_BACKEND_LOGGING=true julia
 ```
 """
 const ENABLE_BACKEND_LOGGING::Bool = get(ENV, "ENABLE_BACKEND_LOGGING", "false") == "true"
+"""
+If  ```ENABLE_BACKEND_LOGGING``` is true this macro is active. If not this macro represents a NOP.
+"""
 macro BACKEND_LOGGING(expr)
   if ENABLE_BACKEND_LOGGING
     return quote

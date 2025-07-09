@@ -74,7 +74,7 @@ function createStructuralCallback(simCode, simCodeStructuralTransition::Simulati
         local structuralChange = OMBackend.Runtime.StructuralChange($(structuralTransition.toState), false, destinationSystem, callbacks)
         #= The affect simply activates the structural callback informing us to generate code for a new system =#
         function affect!(integrator)
-          println("Potential structural change triggered at the callback " * $(callbackName) * " at $(integrator.t)")
+          @info "Potential structural change triggered at  callback:" * $(callbackName) * " at $(integrator.t)"
           structuralChange.structureChanged = true
         end
         function condition(x, t, integrator)

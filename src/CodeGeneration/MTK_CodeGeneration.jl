@@ -176,7 +176,6 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     using ModelingToolkit
     using DifferentialEquations
     using OrdinaryDiffEq
-    import ModelingToolkit.IfElse
     #= Add import to the external runtime if the generated code calls Modelica Functions =#
     $(if simCode.externalRuntime
         generateExternalRuntimeImport(simCode)
@@ -434,7 +433,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                                            tspan,
                                            #warn_initialize_determined = false,
                                            callback=callbacks)
-      return (problem, callbacks, initialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
+      #= Check before commit. =#
+      return (problem, callbacks, finalInitialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
     end
   end
   return model
@@ -957,13 +957,11 @@ function decomposeEquations(equations, parameterAssignments)
     local fName = string("generateEquations", i)
     equationConstructor = quote
       function $(Symbol(fName))()
-        #println("#Equation generated:" * $(string(length(eqv))) * "in: " * $(fName))
         [$(eqv...)]
       end
     end
     push!(functionNames, Symbol(fName))
     push!(exprs, equationConstructor)
-    #push!(equationConstructorCalls, equationConstructorCall)
     i += 1
   end
   expr = quote
@@ -1031,4 +1029,32 @@ end
 """
 function generateExternalRuntimeImport(simCode)::Expr
   :(import OMRuntimeExternalC)
+end
+
+function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.SIM_CODE; varPrefix = "", varSuffix = "")::Vector{Expr}
+  local res::Array{Expr} = []
+  @debug "Calling createWhenStatements with: $whenStatements"
+  for wStmt in  whenStatements
+    @match wStmt begin
+      BDAE.ASSIGN(__) => begin
+        throw("ASSIGN not supported in this context.")
+      end
+      #= Handles reinit =#
+      BDAE.REINIT(__) => begin
+        (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]
+        #=
+        Note:
+        The idea is that we use the variable to represent an index in the integrator to later be able to query the index via the symbol.
+        =#
+        push!(res, quote
+                idx = lookuptableStates[Symbol($(string(var.name)))]
+                @info idx
+                integrator.u[idx] = $(expToJuliaExpMTK(wStmt.value,
+                                                                                                  simCode; varPrefix = varPrefix, varSuffix = varSuffix))
+              end)
+      end
+      _ => ErrorException("$whenStatements in @__FUNCTION__ not supported")
+    end
+  end
+  return res
 end

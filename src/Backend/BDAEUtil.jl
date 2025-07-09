@@ -411,6 +411,12 @@ function getAllVariables(assignment::BDAE.ASSIGN, vars::Vector{BDAE.VAR})::Vecto
   return variablesInEq
 end
 
+function getAllVariables(bdaeRenit::BDAE.REINIT, vars::Vector{BDAE.VAR})#::Vector{DAE.ComponentRef}
+  variables = DAE.CREF[bdaeRenit.stateVar]
+  crefs = Util.getAllCrefs(bdaeRenit.value)
+  return vcat(variables, listArray(crefs))
+end
+
 
 """
   Fetches all variables in if equations.
@@ -500,7 +506,7 @@ function getIntAsUnicodeSubscript(i::Integer)
   local subscriptStr = ""
   while i > 0
     tmp = i % 10
-    subscriptStr  *= OMBackend.latexSymbols["\\_" + string(tmp)]
+    subscriptStr  *= OMBackend.LATEX_SYMBOLS["\\_" * string(tmp)]
     i =  i ÷ 10
   end
   #= Since the code above generates the string in the reverse order it needs to be re reversed=#

@@ -54,9 +54,7 @@ import Plots
 import REPL
 import SCode
 
-include("util.jl")
-
-const latexSymbols = REPL.REPLCompletions.latex_symbols
+const LATEX_SYMBOLS = REPL.REPLCompletions.latex_symbols
 #= Settings =#
 @enum BackendMode begin
   DAE_MODE = 1
@@ -114,7 +112,7 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
     end
     @assign simCode.functions = simCodeFunctions
     @assign simCode.externalRuntime = externalRuntimeNeeded
-    #debugWrite("simulationCodeStatistics.log", SimulationCode.dumpSimCode(simCode))
+    debugWrite("simulationCodeStatistics.log", SimulationCode.dumpSimCode(simCode))
     return generateMTKTargetCode(simCode)
   else
     @error "No mode specificed: valid modes are:"
@@ -178,7 +176,7 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   local preprocessedFM = FrontendUtil.handleBuiltin(fm)
   local bDAE = BDAECreate.lower(preprocessedFM)
   #@debug(BDAEUtil.stringHeading1(bDAE, "translated"));
-  debugWrite("initialBDAE.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
+  @BACKEND_LOGGING debugWrite("initialBDAE.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
   #= Expand arrays =#
   # Removed this pass since this can now
   #(bDAE, expandedVars) = Causalize.expandArrayVariables(bDAE)
@@ -189,7 +187,7 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   #@debug(BDAEUtil.stringHeading1(bDAE, "States marked"));
   bDAE = Causalize.residualizeEveryEquation(bDAE)
   #= Convert equations to residual form =#
-  debugWrite("residualTransformationAllParamsAndConstants.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
+  @BACKEND_LOGGING debugWrite("residualTransformationAllParamsAndConstants.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
   #=
     Remove unused parameters and or constants.
     Important optimization for some systems.
@@ -197,7 +195,7 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   =#
   #bDAE = Causalize.detectUnusedParametersAndConstants(bDAE)
   #= Find and reclassify discrete variables not marked as discrete. =#
-  debugWrite("residualTransformation.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
+  @BACKEND_LOGGING debugWrite("residualTransformation.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
   return bDAE
 end
 
@@ -273,6 +271,10 @@ function modelWasCompiledAgain(modelName)
 end
 
 """
+
+```
+writeModelToFile(modelName::String, filePath::String; keepComments = true, keepBeginBlocks = true)
+```
   Writes a model to file by default the file is formatted and comments are kept.
 """
 function writeModelToFile(modelName::String, filePath::String; keepComments = true, keepBeginBlocks = true)

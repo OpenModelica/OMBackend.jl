@@ -9,6 +9,7 @@ import SCode
 import OMBackend
 import OMBackend.SimulationCode
 import OMBackend.CodeGeneration
+import ..@BACKEND_LOGGING
 import OMFrontend
 import DAE
 
@@ -504,7 +505,7 @@ function recompilation(activeModeName,
   resultingModel = OMBackend.CodeGeneration.stripBeginBlocks(resultingModel)
   result = "$resultingModel"
   @eval $(resultingModel)
-  OMBackend.writeStringToFile(string("modfied", modelName * ".jl"), result)
+  @BACKEND_LOGGING OMBackend.writeStringToFile(string("modfied", modelName * ".jl"), result)
   local newParsedModel = Meta.parse(result)
   @eval $(newParsedModel)
   local modelCall = quote

@@ -394,7 +394,7 @@ end
   Also the der as symbol is really ugly..
 """
 function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
-                                              simCode::SimulationCode.SimCode, ht; varPrefix=varPrefix, derAsSymbol=false)::Expr
+                                              simCode::SimulationCode.SimCode, ht; varPrefix=varPrefix, varSuffix = varSuffix, derAsSymbol=false)::Expr
   @match pathStr begin
     "der" => begin
       varName = SimulationCode.string(listHead(expLst))
@@ -406,6 +406,12 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
         quote
           der($(Symbol(varName)))
         end
+      end
+    end
+    "pre" => begin
+      varName = SimulationCode.string(listHead(expLst))
+      quote
+        $(Symbol(varName))
       end
     end
     _  =>  begin
@@ -557,12 +563,14 @@ function getCycleInSCCs(sccs)
 end
 
 """
-  Converts a DAE expression into a MTK expression.
+Converts a DAE expression into a MTK expression.
+varPrefix and varSuffix can be used to provide a prefix and a suffix to component reference.
 """
 function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
-                          simCode::SimulationCode.SIM_CODE,
-                          varSuffix="";
-                          varPrefix="x", derSymbol::Bool=false)::Expr
+                          simCode::SimulationCode.SIM_CODE;
+                          varSuffix="",
+                          varPrefix="",
+                          derSymbol::Bool=false)::Expr
   hashTable = simCode.stringToSimVarHT
   local expr::Expr = begin
     local int::Int64
@@ -633,27 +641,27 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
           SimulationCode.STATE(__) => quote
             $(LineNumberNode(@__LINE__, "$varName state"))
-            $(Symbol(indexAndVar[2].name))
+            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
           end
           SimulationCode.PARAMETER(__) => quote
             $(LineNumberNode(@__LINE__, "$varName parameter"))
-            $(Symbol(indexAndVar[2].name))
+            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
           end
           SimulationCode.ALG_VARIABLE(__) => quote
             $(LineNumberNode(@__LINE__, "$varName, algebraic"))
-            $(Symbol(indexAndVar[2].name))
+            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
           end
           SimulationCode.DISCRETE(__) => quote
             $(LineNumberNode(@__LINE__, "$varName, discrete"))
-            $(Symbol(indexAndVar[2].name))
+            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
           end
           SimulationCode.OCC_VARIABLE(__) => quote
             $(LineNumberNode(@__LINE__, "$varName, occ variable"))
-            $(Symbol(indexAndVar[2].name))
+            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
           end
           SimulationCode.DATA_STRUCTURE(__) => quote
             $(LineNumberNode(@__LINE__, "$varName, datastructure variable"))
-            $(Symbol(indexAndVar[2].name))
+            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
           end
           _ => begin
             @error "Unsupported varKind: $(varKind)"
@@ -664,31 +672,31 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       DAE.UNARY(operator = op, exp = e1) => begin
         o = DAE_OP_toJuliaOperator(op)
         quote
-          $(o)($(expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix)))
+          $(o)($(expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix)))
         end
       end
       DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-        local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, derSymbol = derSymbol)
-        local rhs = expToJuliaExpMTK(e2, simCode, varPrefix=varPrefix, derSymbol = derSymbol)
+        local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+        local rhs = expToJuliaExpMTK(e2, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
         local op = DAE_OP_toJuliaOperator(op)
         :($op($(lhs), $(rhs)))
       end
       DAE.LUNARY(operator = op, exp = e1)  => begin
-        local operand = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, derSymbol = derSymbol)
+        local operand = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
         local op = DAE_OP_toJuliaOperator(op)
         :($op($(op)))
       end
       DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-        local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, derSymbol = derSymbol)
-        local rhs = expToJuliaExpMTK(e2, simCode, varPrefix=varPrefix, derSymbol = derSymbol)
+        local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+        local rhs = expToJuliaExpMTK(e2, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
         local op = DAE_OP_toJuliaOperator(op)
         quote
           ($op($(lhs), $(rhs)))
         end
       end
       DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
-        local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix,derSymbol = derSymbol)
-        local rhs = expToJuliaExpMTK(e2, simCode,varPrefix=varPrefix, derSymbol = derSymbol)
+        local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix,derSymbol = derSymbol)
+        local rhs = expToJuliaExpMTK(e2, simCode,varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
         local op = DAE_OP_toJuliaOperator(op)
         quote
           ($op($(lhs), $(rhs)))
@@ -726,12 +734,12 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       end
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
         #Call as symbol is really ugly.. please fix me :(
-        DAECallExpressionToMTKCallExpression(tmpStr, explst, simCode, hashTable; varPrefix=varPrefix, derAsSymbol=derSymbol)
+        DAECallExpressionToMTKCallExpression(tmpStr, explst, simCode, hashTable; varPrefix=varPrefix, varSuffix = varSuffix, derAsSymbol=derSymbol)
       end
       DAE.CALL(path, expLst) => begin
         local expr = Expr(:call, Symbol(string(path)))
         local args = map(expLst) do arg
-          expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix,derSymbol = derSymbol)
+          expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix = varSuffix,derSymbol = derSymbol)
         end
         expr.args = vcat(expr.args, args)
         expr
@@ -1012,26 +1020,28 @@ end
 """
   Generates code for DAE cast expressions for MTK code.
 """
-function generateCastExpressionMTK(@nospecialize(ty::DAE.Type), @nospecialize(exp::DAE.Exp), simCode, varPrefix)
-  return @match ty, exp begin
+function generateCastExpressionMTK(@nospecialize(ty::DAE.Type), @nospecialize(exp::DAE.Exp),
+                                   simCode, varPrefix = "", varSuffix = "")
+  expr = @match ty, exp begin
     (DAE.T_REAL(__), DAE.ICONST(__)) => begin
       quote
-        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix)))
+        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,)))
       end
     end
     (DAE.T_REAL(__), DAE.CREF(cref)) where typeof(cref.identType) === DAE.T_INTEGER => begin
       quote
-        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix)))
+        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,)))
       end
     end
-    #= Conversion to a float other alternatives, =#
+    #= Conversion to a float, other alternatives. =#
     (DAE.T_REAL(__), _) => begin
       quote
-        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix)))
+        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,)))
       end
     end
     _ => throw("Cast $ty: for exp: $exp not yet supported in codegen!")
   end
+  return expr
 end
 
 function isIntOrBool(@nospecialize(exp::DAE.Exp))
@@ -1091,4 +1101,14 @@ function isContinousCondition(cond::DAE.Exp, simCode)
     end
   end
   return isContinuousCond
+end
+
+function getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode)
+  local crefAsStr = string(x)
+  @match _, simVar = simCode.stringToSimVarHT[crefAsStr]
+  if !(SimulationCode.isParameter(simVar))
+    Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(string(x))))))
+  else
+    Expr(:call, getindex, :p, Expr(:call, :getindex, :lookuptableParams, :(Symbol($(string(x))))))
+  end
 end

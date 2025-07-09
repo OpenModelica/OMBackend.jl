@@ -147,7 +147,6 @@ function rewriteEquations(edeqs, iv, eVars, ePars, simCode)
   #= Make the derivative symbol known =#
   eval(preEval)
   eval(:(der = ModelingToolkit.Differential(t)))
-  eval(:(import ModelingToolkit.IfElse))
   #= Make the external runtime available if it is used. =#
   if simCode.externalRuntime
     eval(generateExternalRuntimeImport(simCode))
@@ -162,7 +161,7 @@ function rewriteEquations(edeqs, iv, eVars, ePars, simCode)
   end
   #==#
   local deqs = evalEDeqs(edeqs)
-  #println(debugRewrite(deqs, iv, vars, parameters; separator="\n"))
+  @BACKEND_LOGGING write("MTK_REWRITE.log", debugRewrite(deqs, iv, vars, parameters; separator="\n"))
   #= Rewrite equations =#
   D = Differential(iv)
   local r1 = SymbolicUtils.@rule ~~a * D(~~b) * ~~c => 0
@@ -192,7 +191,7 @@ function rewriteEquations(edeqs, iv, eVars, ePars, simCode)
       push!(rewrittenDeqs, eq)
     end
   end
-  #OMBackend.debugWrite("codeAfterBackendPreprocessing.log", debugRewrite(rewrittenDeqs, iv, vars, parameters; separator="\n"))
+  @BACKEND_LOGGING OMBackend.debugWrite("codeAfterBackendPreprocessing.log", debugRewrite(rewrittenDeqs, iv, vars, parameters; separator="\n"))
   return rewrittenDeqs
 end
 
@@ -365,7 +364,6 @@ function ode_order_lowering(eqs, iv, unknown_vars)
   diff_eqs = Equation[]
   diff_vars = []
   alge_eqs = Equation[]
-
   for (i, eq) in enumerate(eqs)
     if !isdiffeq(eq)
       push!(alge_eqs, eq)
@@ -373,8 +371,6 @@ function ode_order_lowering(eqs, iv, unknown_vars)
       var, maxorder = ModelingToolkit.var_from_nested_derivative(eq.lhs)
       maxorder > get(var_order, var, 1) && (var_order[var] = maxorder)
       var′ = ModelingToolkit.lower_varname(var, iv, maxorder - 1)
-      @info "eq.rhs" eq.rhs
-      @info "eq.lhs" eq.lhs
       if ! isreal(eq.rhs) #= Modification by me. =#
         rhs′ = ModelingToolkit.diff2term_with_unit(eq.rhs, iv)
       else
@@ -384,7 +380,6 @@ function ode_order_lowering(eqs, iv, unknown_vars)
       push!(diff_eqs, D(var′) ~ rhs′)
     end
   end
-
   for (var, order) in var_order
     for o in (order - 1):-1:1
       lvar = lower_varname(var, iv, o - 1)
@@ -396,7 +391,6 @@ function ode_order_lowering(eqs, iv, unknown_vars)
       push!(diff_eqs, eq)
     end
   end
-
   # we want to order the equations and variables to be `(diff, alge)`
   return (vcat(diff_eqs, alge_eqs), vcat(diff_vars, setdiff(unknown_vars, diff_vars)))
 end
@@ -450,6 +444,21 @@ function dae_order_lowering(eqs, iv, unknown_vars)
           vcat(collect(diff_vars), setdiff(unknown_vars, diff_vars)))
 end
 
-function getSyms(odeFunc::ODEFunction)
+function getStatesAsSymbolicVariables(odeFunc::ODEFunction)
   return ModelingToolkit.get_unknowns(odeFunc.sys)
+end
+
+function getStatesAsSymbols(odeFunc::ODEFunction)
+  local states = ModelingToolkit.get_unknowns(odeFunc.sys)
+  map(x->x.f.name, states)
+end
+
+function getParametersAsSymbols(odeFunc::ODEFunction)
+  local states = ModelingToolkit.parameters(odeFunc.sys)
+  map(x->x.name, states)
+end
+
+function getSymsAsStrings(odeFunc::ODEFunction)
+  local unknowns = ModelingToolkit.parameters(odeFunc.sys)
+  return map(string, unknowns)
 end

@@ -6,6 +6,8 @@ module Backend
 
 using ..FrontendUtil
 
+import ..@BACKEND_LOGGING
+
 include("BDAE.jl")
 include("BackendEquation.jl")
 include("BDAEUtil.jl")

@@ -6,12 +6,15 @@ import DifferentialEquations.ReturnCode
 import ListUtil
 import ModelingToolkit
 import OMBackend
+import OMBackend.@BACKEND_LOGGING
 import OMBackend.SimulationCode
+
 import OMFrontend
 import OMFrontend.Frontend
 import OMFrontend.Frontend.AbsynUtil
 import OMFrontend.Frontend.SCodeUtil
 import OMFrontend.Frontend.Util
+
 import SCode
 
 using MetaModelica
@@ -56,19 +59,18 @@ Currently, it is assumed to be at the top level of the class.
 A SCodeElement is either a component like a variable or a class.
 See SCode.jl for info about the SCode representation.
 
-TODO: Fix for sublevels as well
+TODO: Fix for all sub-levels as well
 """
 function setElementInSCodeProgram!(activeModeName, inIdent::String, newValue::T, inClass::SCode.Element) where {T}
   #=
   Get the class name. The active class is required to be top level currently.
   =#
-  #write("modename.log", activeModeName)
-  #write("original.log", OMBackend.JuliaFormatter.format_text(string(inClass)))
+  @BACKEND_LOGGING write("modename.log", activeModeName)
+  @BACKEND_LOGGING write("original.log", OMBackend.JuliaFormatter.format_text(string(inClass)))
   local activeModeNamePrefixes::Vector{String} = map(string, split(activeModeName, "."))
-  #write("prefixes.log", OMBackend.JuliaFormatter.format_text(string(activeModeNamePrefixes)))
+  @BACKEND_LOGGING write("prefixes.log", OMBackend.JuliaFormatter.format_text(string(activeModeNamePrefixes)))
   local activeClass  = getElementFromSCodeProgram(activeModeNamePrefixes, inClass)
-  #str = OMBackend.JuliaFormatter.format_text(string(activeClass))
-  #write("active.log", str)
+  @BACKEND_LOGGING write("active.log", OMBackend.JuliaFormatter.format_text(string(activeClass)))
   #= Get all elements from the class together with the corresponding names =#
   local elementToReplace::SCode.Element = getElementFromSCodeProgram(inIdent, activeClass)
   local elements::Vector{SCode.Element} = listArray(SCodeUtil.getClassElements(activeClass))
@@ -89,12 +91,12 @@ function setElementInSCodeProgram!(activeModeName, inIdent::String, newValue::T,
   #write("elementToReplace.log", string(OMBackend.JuliaFormatter.format_text(string(elementToReplace))))
   @assign activeClass.classDef.elementLst = arrayList(elements)
   #=Replace the element in the specific class. =#
-  #write("elementToReplace.log", OMBackend.JuliaFormatter.format_text(string(elementToReplace)))
+  @BACKEND_LOGGING write("elementToReplace.log", OMBackend.JuliaFormatter.format_text(string(elementToReplace)))
   @match modifiedProg <| nil = replaceElementInSCodeProgramByName(inClass,
                                                                   activeClass,
                                                                   activeModeName)
-  #write("modifiedProg.log", OMBackend.JuliaFormatter.format_text(string(modifiedProg)))
-  #write("tmpClass.log", OMBackend.JuliaFormatter.format_text(string(inClass)))
+  @BACKEND_LOGGING write("modifiedProg.log", OMBackend.JuliaFormatter.format_text(string(modifiedProg)))
+  @BACKEND_LOGGING write("tmpClass.log", OMBackend.JuliaFormatter.format_text(string(inClass)))
   #=
   We need to update the top level class as well in this case.
   To do this we need to search for the element representing the class wee modified in the top level program again.
@@ -157,10 +159,13 @@ function createNewU0(symsOfOldProblem::Vector{Symbol},
                      integrator,
                      specialCase)
   #=TODO: It was assumed to only be real variable not discretes, which might have other indices? =#
-  # @debug "Length of old and new" length(symsOfOldProblem) length(symsOfNewProblem)
+  @info "Length of old and new" length(symsOfOldProblem) length(symsOfNewProblem)
+  @info "initialValues" initialValues
+  @info "Old Problem" symsOfOldProblem
+  @info "New Problem" symsOfNewProblem
+  global INTEGRATOR_TEST = integrator
   local newU0 = Float64[last(initialValues[idx]) for idx in 1:length(symsOfNewProblem)]
-  #@info "symsOfNewProblem" symsOfOldProblem
-  #@info "symsOfNewProblem" symsOfNewProblem
+
   local variableNamesOldProblem = RuntimeUtil.convertSymbolsToStrings(symsOfOldProblem)
   local variableNamesNewProblem = RuntimeUtil.convertSymbolsToStrings(symsOfNewProblem)
   #@info "variableNamesOldProblem" variableNamesOldProblem

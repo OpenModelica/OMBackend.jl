@@ -208,7 +208,6 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
       #= Add top level variables to the sub system. These variables are shared. =#
       push!(auxSys.orderedVars, v)
     end
-    @info "All backend variables" allBackendVars
     local subSys = transformToSimCode([auxSys], shared; mode = mode)
     push!(structuralSubModels, subSys)
   end

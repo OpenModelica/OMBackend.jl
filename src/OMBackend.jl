@@ -32,6 +32,7 @@
 module OMBackend
 import DAE
 const CURRENT_DIRECTORY = @__DIR__
+include("$CURRENT_DIRECTORY/util.jl")
 include("$CURRENT_DIRECTORY/globalConstants.jl")
 export PLOT_PACKAGE_GRAPH
 include("$CURRENT_DIRECTORY/FrontendUtil/FrontendUtil.jl")

@@ -368,16 +368,12 @@ function createEquationVariableBidirectionGraph(equations::Vector{BDAE.RESIDUAL_
       end
     end
   end
-  # write("eqMapping.log", dumpVariableEqMapping(variableEqMapping,
-  #                                              equations,
-  #                                              ifEquations,
-  #                                              whenEquations,
-  #                                              stringToSimVarHT))
-  # @debug "#stateVariables" * string(length(stateVariables))
-  # @debug "#discretes" * string(nDiscretes)
-  # @debug "#algebraic" * string(length(unknownVariables))
-  # @debug "#equations" * string(length(equations))
-  # @debug "#state + #algebraic = " * string(length(unknownVariables) + length(stateVariables))
+  @BACKEND_LOGGING write("eqMapping.log",
+                         dumpVariableEqMapping(variableEqMapping,
+                                               equations,
+                                               ifEquations,
+                                               whenEquations,
+                                               stringToSimVarHT))
   return variableEqMapping
 end
 

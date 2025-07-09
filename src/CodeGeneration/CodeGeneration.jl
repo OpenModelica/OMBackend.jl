@@ -47,6 +47,7 @@ using ..Backend #Should maybe not be using here... since it can make certain ove
 using ..SimulationCode
 
 import ..Backend.BDAE
+import ..@BACKEND_LOGGING
 
 import Absyn
 import DAE

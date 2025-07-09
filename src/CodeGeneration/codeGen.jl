@@ -36,7 +36,7 @@ end
   generateSaveFunction to false.
 """
 function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = true) where {N, S}
-  local WHEN_EQUATIONS = createEquations(simCode.whenEquations, simCode)
+  local WHEN_EQUATIONS = createEquations(simCode.whenEquations,  simCode)
   #=
     For if equations we create zero crossing functions (Based on the conditions).
     The body of these equations are evaluated in the main body of the solver itself.
@@ -57,7 +57,7 @@ function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = tru
       $(LineNumberNode((@__LINE__), "WHEN EQUATIONS"))
       $(WHEN_EQUATIONS...)
       $(LineNumberNode((@__LINE__), "IF EQUATIONS"))
-#      $(IF_EQUATIONS...)
+      #      $(IF_EQUATIONS...)
       $(SAVE_FUNCTION)
       return $(Expr(:call, :CallbackSet, returnCallbackSet()...))
     end
@@ -214,10 +214,10 @@ function createRealToStateVariableMapping(stateVariables::Array, simCode::Simula
 end
 
 """
- Create a set for all equations T.
+ Create a set for all equations.
 """
-function createEquations(equations::Array{T}, simCode::SimulationCode.SIM_CODE)::Array{Expr} where T
-  local eqs::Array{Expr} = Expr[]
+function createEquations(equations::Vector{T}, simCode::SimulationCode.SIM_CODE)::Vector{Expr} where T
+  local eqs = Expr[]
   for (equationCounter, eq) in enumerate(equations)
     local eqJL::Expr = eqToJulia(eq, simCode, equationCounter)
     push!(eqs, eqJL)
@@ -251,9 +251,8 @@ end
 
 """
   This function creates a representation of a when equation in Julia.
-  This function shall be called in the process when constructing the different callbacks.
 """
-function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arrayIdx::Int64)::Expr
+function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arrayIdx::Int)::Expr
   local wEq = eq.whenEquation
   local whenStmts = createWhenStatements(wEq.whenStmtLst, simCode)
   local cond = transformToZeroCrossingCondition(wEq.condition)
@@ -309,27 +308,48 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
                                                          affect_neg! = $(Symbol("affect$(callbacks)!")))
       end
     else #= No elseif =#
-       quote
-         $(Symbol("condition$(callbacks)")) = (x,t,integrator) -> begin
-           #= Sometime the index is first known at runtime =#
-           local xs = $(map(x -> Symbol(string(x) * "(t)"),
-                            Util.getAllCrefs(cond)))
-           xs = indexin(xs, OMBackend.CodeGeneration.getSyms(integrator.f))
-          $(expToJuliaExp(cond, simCode;))
+      whenStatementsMTK  = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+      local cond = quote  #= NOTE. Very expensive to get it as strings. This can be done better but requires slight redesign =#
+        $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+          #local xStrs = $(map(x -> string(x), Util.getAllCrefs(cond)))
+          local xs = $(map(x -> Symbol(string(x)), Util.getAllCrefs(cond)))
+          local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
+          local NO_TRIGGER = 1.0
+          if all(isnothing, indices)
+            return NO_TRIGGER
+          end
+          local lookuptableStates = Dict((xs) .=> indices)
+          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+          local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+          $(map(x -> Expr(Symbol("="),
+                          Symbol(string(x)),
+                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
+                Util.getAllCrefs(cond))...)
+          $(expToJuliaExpMTK(cond, simCode))
         end
+      end
+      local affect = quote
         $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
-          #@info "Calling affect! at $(integrator.t)"
           local t = integrator.t + integrator.dt
           local x = integrator.u
+          local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+          local lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+          local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+          $(map(x->Expr(Symbol("="),
+                        Symbol(string(x)),
+                        getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
+                map(x -> BDAEUtil.getAllVariables(x, BDAE.VAR[]), listArray(wEq.whenStmtLst))...)...)
           if integrator.dt == 0.0
             @error "integrator.dt was zero. Aborting."
             fail()
           end
-          #@info "t + dt = " t
-          #if (Bool($(expToJuliaExp(wEq.condition, simCode))))
-          $(whenStmts...)
-          #end
+          $(whenStatementsMTK...)
         end
+      end
+      quote
+        $cond
+        $affect
         $(Symbol("cb$(callbacks)")) = ContinuousCallback($(Symbol("condition$(callbacks)")),
                                                          $(Symbol("affect$(callbacks)!")),
                                                          rootfind=true, save_positions=(true, true),
@@ -424,9 +444,8 @@ function createWhenStatements(whenStatements::List, simCode::SimulationCode.SIM_
         (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]
         if typeof(var.varKind) === SimulationCode.STATE
           push!(res, quote
-                integrator.u[$(index)] = $(expToJuliaExp(wStmt.value, simCode))
+                  integrator.u[$(index)] = $(expToJuliaExp(wStmt.value, simCode))
                 end)
-
         elseif var.varKind isa SimulationCode.ALG_VARIABLE
           push!(res, quote
                   integrator.u[$(index)] = $(expToJuliaExp(wStmt.value, simCode))
@@ -440,7 +459,6 @@ function createWhenStatements(whenStatements::List, simCode::SimulationCode.SIM_
   end
   return res
 end
-
 
 """
   Converts a DAE expression into a Julia expression
@@ -541,7 +559,7 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
       end
       DAE.IFEXP(expCond = e1, expThen = e2, expElse = e3) => begin
         throw(ErrorException("If expressions not allowed in backend code.
-                              They should have been eliminated by a previous backend  pass."))
+                              They should have been eliminated by a previous pass."))
       end
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
         DAECallExpressionToJuliaCallExpression(tmpStr, explst, context, hashTable, varPrefix=varPrefix)
