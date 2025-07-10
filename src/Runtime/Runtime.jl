@@ -266,13 +266,13 @@ function solve(omProblem::OM_ProblemRecompilation, tspan, alg; kwargs...)
         #@info "Recompilation directive triggered at:" i.t
         #@info "Δt is:" i.t - i.dt
         local newU0
-          #@info "Test syms before recompilation call..." getSyms(problem)
-          (newProblem, newSymbolTable, initialValues, reducedSystem, specialCase) = recompilation(cb.name,
-                                                                                                  cb,
-                                                                                                  integrator.u,
-                                                                                                  tspan,
-                                                                                                  callbackConditions)
-          #= Assuming the indices are the same (Which is not always true) =#
+        #@info "Test syms before recompilation call..." getSyms(problem)
+        (newProblem, newSymbolTable, finalInitialValues, initialValues, reducedSystem, specialCase) = recompilation(cb.name,
+                                                                                                                    cb,
+                                                                                                                    integrator.u,
+                                                                                                                    tspan,
+                                                                                                                    callbackConditions)
+        #= Assuming the indices are the same (Which is not always true) =#
           local symsOfOldProblem = getSyms(problem)
           local symsOfNewProlem = getSyms(newProblem)
           #@info "U0 before variables are set:"
@@ -447,11 +447,11 @@ function recompilation(activeModeName,
   modelCall = quote
     $(Symbol(modelName))($(tspan))
   end
-  (problem, callbacks, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
+  (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
   #= Reconstruct the composite problem to keep the callbacks =#
   compositeProblem = ModelingToolkit.ODEProblem(
     reducedSystem,
-    initialValues,
+    finalInitialValues,
     tspan,
     pars,
     #=
@@ -465,7 +465,7 @@ function recompilation(activeModeName,
   structuralCallback.metaModel = newMetaModel
   structuralCallback.stringToSimVarHT = simulationCode.stringToSimVarHT
   #= 4.2) Assign this system to newSystem. =#
-  return (compositeProblem, simulationCode.stringToSimVarHT, initialValues, reducedSystem, false)
+  return (compositeProblem, simulationCode.stringToSimVarHT,finalInitialValues,  initialValues, reducedSystem, false)
 end
 
 """
@@ -511,7 +511,7 @@ function recompilation(activeModeName,
   local modelCall = quote
     $(Symbol(modelName))($(tspan))
   end
-  (problem, callbacks, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
+  (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
   #= Update meta model somehow=#
   return (problem,
           simulationCode.stringToSimVarHT,

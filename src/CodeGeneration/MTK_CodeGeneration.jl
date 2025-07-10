@@ -69,7 +69,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     push!(structuralModes, ODE_MODE_MTK_MODEL_GENERATION(mode, mode.name, functions))
   end
   if isempty(simCode.subModels)
-    local modelName = MODEL_NAME * "DEFAULT"
+    local modelName = string(MODEL_NAME, "DEFAULT")
     defaultModel = ODE_MODE_MTK_MODEL_GENERATION(simCode, modelName, functions)
     activeModelName = modelName
     push!(structuralModes, defaultModel)
@@ -95,11 +95,11 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     $(structuralCallbacks...)
     #=
       This function can be used to fetch the top level callbacks that is the collected callbacks of the model.
-      Each callback is coupled to each when with a recompilation expression.
+      Each callback is coupled to each "when-equation" with a recompilation expression.
     =#
     function $(Symbol(MODEL_NAME * "Model"))(tspan = (0.0, 1.0))
       #=  Assign the initial model  =#
-      (subModel, callbacks, initialValues, reducedSystem, _, pars, vars1) = $(Symbol(activeModelName  * "Model"))(tspan)
+      (subModel, callbacks, finalInitialValues, initialValues, reducedSystem, _, pars, vars1) = $(Symbol(string(activeModelName, "Model")))(tspan)
       global LATEST_REDUCED_SYSTEM = reducedSystem
       #= Assign the structural callbacks =#
       $(structuralAssignments)
@@ -114,7 +114,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
       #= Create the composite model =#
       compositeProblem = ModelingToolkit.ODEProblem(
         reducedSystem,
-        initialValues,
+        finalInitialValues,
         tspan,
         pars,
         callback = callbackConditions,
@@ -122,7 +122,6 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
       #=
       Note the difference between the two here.
       In the case of recompilation we will get fresh callbacks updated to the new structure of the final code.
-      However, in the case of the static approach
       =#
       result = $(if simCode.metaModel == nothing
                    :(OMBackend.Runtime.OM_ProblemStructural($(activeModelName),
@@ -434,7 +433,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                                            #warn_initialize_determined = false,
                                            callback=callbacks)
       #= Check before commit. =#
-      return (problem, callbacks, finalInitialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
+      return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
     end
   end
   return model
