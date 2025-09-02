@@ -58,6 +58,10 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
     (BDAE.DISCRETE(__), _) => begin
       SimulationCode.DISCRETE()
     end
+    #= A variable of type bool. These can occur in structural changes... =#
+    (BDAE.VARIABLE(__), DAE.T_BOOL(__)) => begin
+      SimulationCode.DISCRETE()
+    end
     _ => begin
       @error("Variable: $(backendVar.varName) \n Category: $(typeof(backendVar.varKind)).\n Type: $(typeof(backendVar.varType)) of backend variable not handled.\n")
     end

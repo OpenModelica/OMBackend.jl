@@ -148,7 +148,7 @@ function createStructuralCallback(simCode,
     function affect!(integrator)
       #= Expand the when operators =#
       $(whenOperators...)
-      #println("Callback triggered at $(integrator.t)")
+      @info("Structural callback triggered at $(integrator.t)")
       #println("tprev at $(integrator.tprev)")
       structuralChange.structureChanged = true
       integrator.just_hit_tstop = true
@@ -172,7 +172,8 @@ function createStructuralCallback(simCode,
         quote
           $(affect)
           function condition(u, t, integrator)
-            return $(expToJuliaExpMTK(zeroCrossingCond, simCode))
+            @info "Checking condition... at" t
+            return $(replaceVars(expToJuliaExpMTK(zeroCrossingCond, simCode); prefix = "integrator[", suffix = "]"))
           end
           local cb = ContinuousCallback(condition, affect!)
         end

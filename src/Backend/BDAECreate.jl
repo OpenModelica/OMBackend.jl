@@ -70,11 +70,11 @@ function lower(lst::DAE.DAE_LIST)::BDAE.BACKEND_DAE
     end
   end
   local variables = BDAEUtil.convertVarArrayToBDAE_Variables(varArray)
-  @debug "varArray:" length(variableLst)
-  @debug "eqLst:" length(equationLst)
+  # @debug "varArray:" length(variableLst)
+  #@debug "eqLst:" length(equationLst)
   #= We start with an array of one system =#
-  eqSystems = [BDAE.EQSYSTEM(name, variables, eqArray, [], [])]
-  outBDAE = BDAE.BACKEND_DAE(name, eqSystems, BDAE.SHARED([], [], NONE()))
+  eqSystems = BDAE.EQSYSTEM[BDAE.EQSYSTEM(name, variables, eqArray, [], [])]
+  outBDAE = BDAE.BACKEND_DAE(name, eqSystems, BDAE.SHARED([], [], NONE(), NONE(), []))
 end
 
 """

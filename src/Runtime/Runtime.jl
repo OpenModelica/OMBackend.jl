@@ -244,12 +244,12 @@ global SHOULD_DO_REINITIALIZATION = false
   Custom solver function for Modelica code with structuralCallbacks to monitor the solving process
   (Using the integrator interface) from DifferentialEquations.jl
 """
-function solve(omProblem::OM_ProblemRecompilation, tspan, alg; kwargs...)
+function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
   local problem = omProblem.problem
   local structuralCallbacks = omProblem.structuralCallbacks
   local callbackConditions = omProblem.callbackConditions
   local activeModeName = omProblem.activeModeName
-  local integrator = init(problem, alg,  kwargs...)
+  local integrator = init(problem, alg)
   local solutions = []
   #println("Start integration")
   #= Run the integrator=#
@@ -261,7 +261,7 @@ function solve(omProblem::OM_ProblemRecompilation, tspan, alg; kwargs...)
     retCode = check_error(integrator)
     for j in 1:length(structuralCallbacks)
       local cb = structuralCallbacks[j]
-      #println("Structure Changed? $(cb.structureChanged)")
+      #@info("Structure Changed? $(cb.structureChanged)")
       if cb.structureChanged && i.t <= tspan[2]
         #@info "Recompilation directive triggered at:" i.t
         #@info "Δt is:" i.t - i.dt
@@ -283,8 +283,8 @@ function solve(omProblem::OM_ProblemRecompilation, tspan, alg; kwargs...)
                                           initialValues,
                                           integrator,
                                           specialCase)
-          #=
-          TODO:
+        #=
+        TODO:
             Also add the continuous events here
           TODO: If there are discrete events these should be evaluated before proceeding
           local discrete_events = reducedSystem.discrete_events
@@ -331,17 +331,27 @@ function solve(omProblem::OM_ProblemRecompilation, tspan, alg; kwargs...)
         #@info "Reset!"
         @goto START_OF_INTEGRATION
       end
-    end
+    end #= Structural callback handling =#
     #= invoke latest to avoid world age problems =#
-    #@info "i.t + i.dt" i.t + i.dt
-    #@info "integrator.t + integrator.dt" integrator.t + integrator.dt
-    #@info "integrator.t + integrator.dt" integrator.t + integrator.dtpropose
+    # @info "i.t + i.dt" i.t + i.dt
+    # @info "integrator.t + integrator.dt" integrator.t + integrator.dt
+    # @info "integrator.t + integrator.dt" integrator.t + integrator.dtpropose
     if integrator.t + integrator.dtpropose >= tspan[2]
+      #@info integrator.t
       #= Calculate the length of the final step=#
-      #@info "tspan[2] - i.t" tspan[2] - i.t
-      local finalStep = tspan[2] - i.t
-      Base.invokelatest(step!, integrator, finalStep, true)
-      break
+      #@info "integrator.t + integrator.dtpropose >= tspan[2]!\n tspan[2] - i.t =  " tspan[2] - i.t
+      #@info "integrator.dtpropose" integrator.dtpropose
+      # @info "tspan[2]" tspan[2]
+      # @info "i.t" i.t
+      #local finalStep = tspan[2] - i.t
+      #= Use a very small timestep =#
+      integrator.dt = 1e-6
+      integrator.dtpropose = 1e-6
+      #@info "integrator.dt" integrator.dt
+      #@info "integrator.dtpropose" integrator.dtpropose
+      Base.invokelatest(step!, integrator, integrator.dt, true)#Base.invokelatest(step!, integrator) #step!(integrator, tspan[2])
+      # @info "i.t" integrator.t
+      #break #= Restarts  integration =#
     else
       Base.invokelatest(step!, integrator, integrator.dt, false)
     end
@@ -349,11 +359,12 @@ function solve(omProblem::OM_ProblemRecompilation, tspan, alg; kwargs...)
     If a structural callback was triggered at the last integration step this boolean variable is true.
     =#
     local timeBeforeCallbackWasApplied::Float64 = 0
-    if i.just_hit_tstop == true && RuntimeUtil.isReturnCodeSuccess(i)
+    local hitTstop = false
+    if i.just_hit_tstop == true #&& RuntimeUtil.isReturnCodeSuccess(i)
+      local solAtChange
       #= Find the callback that was triggered =#
       local timeAtChange::Vector{Float64} = Float64[]
       local uAtChange#::Vector{Vector{Float64}}
-      local solAtChange
       for cb in structuralCallbacks
         if cb.structureChanged
           timeBeforeCallbackWasApplied = cb.timeAtChange
@@ -380,22 +391,31 @@ function solve(omProblem::OM_ProblemRecompilation, tspan, alg; kwargs...)
           #= The modified solution is the solution before we start the next part of the solution process. =#
           #@info "Saving solution..."
           push!(solutions, modifiedSol)
+          hitTstop = true
         end
       end
-      @assert !(isempty(solAtChange)) "Invalid structural change occured"
+      #@assert !(isempty(solAtChange)) "Invalid structural change occured"
       #@info "Reinit"
       #@info "tprev" timeAtChange
       #@info "uAtChange" uAtChange
       #@info typeof(uAtChange)
-      reinit!(i,
-              last(uAtChange);
-              t0 = timeBeforeCallbackWasApplied,
-              tf = tspan[2],
-              reset_dt = true,
-              erase_sol = true,
-              reinit_callbacks = false)
-      i.just_hit_tstop = false
-      #@info "Time after reinit" i.t
+      if hitTstop
+        reinit!(i,
+                last(uAtChange);
+                t0 = timeBeforeCallbackWasApplied,
+                tf = tspan[2],
+                reset_dt = true,
+                erase_sol = true,
+                reinit_callbacks = false)
+        i.just_hit_tstop = false
+      elseif integrator.t >= last(tspan) #= Hack to handle the special case where we are slightly above tstop=#
+        sol = integrator.sol
+        idx = findall(t -> t <= tspan[2], sol.t)
+        @assign sol.t = sol.t[idx]
+        @assign sol.u = sol.u[idx]
+        push!(solutions, sol)
+        return solutions
+      end
     end
   end
   push!(solutions, integrator.sol)

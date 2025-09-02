@@ -159,11 +159,12 @@ function createNewU0(symsOfOldProblem::Vector{Symbol},
                      integrator,
                      specialCase)
   #=TODO: It was assumed to only be real variable not discretes, which might have other indices? =#
-  @info "Length of old and new" length(symsOfOldProblem) length(symsOfNewProblem)
-  @info "initialValues" initialValues
-  @info "Old Problem" symsOfOldProblem
-  @info "New Problem" symsOfNewProblem
-  global INTEGRATOR_TEST = integrator
+  # @info "Status length of both problems" begin
+  #   length(symsOfOldProblem) length(symsOfNewProblem)
+  #   "initialValues" initialValues
+  #   "Old Problem" symsOfOldProblem
+  #   "New Problem" symsOfNewProblem
+  # end
   local newU0 = Float64[last(initialValues[idx]) for idx in 1:length(symsOfNewProblem)]
 
   local variableNamesOldProblem = RuntimeUtil.convertSymbolsToStrings(symsOfOldProblem)

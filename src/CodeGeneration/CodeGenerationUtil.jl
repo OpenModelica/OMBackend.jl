@@ -121,10 +121,21 @@ function transformToMTKConditionEquation(cond::DAE.Exp, simCode)
   return res
 end
 
-function transformToMTKContinousConditionEquation(cond::DAE.Exp, simCode)
+"""
+Transforms a DAE Condition into a MTK continous condition.
+"""
+function transformToMTKContinousConditionEquation(cond, simCode)
   res = @match cond begin
     DAE.RELATION(e1, DAE.LESS(__), e2) => begin
       :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)) ~ 0)
+    end
+
+    DAE.RELATION(e1, DAE.GREATER(__), e2) => begin
+      :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)) ~ 0)
+    end
+    #= Assumed to be a boolean variable... =#
+    DAE.CREF(__) => begin
+      :($(expToJuliaExpMTK(cond, simCode)))
     end
     _ => begin
       throw("Operator: " * "'" * string(cond.operator) * "' in: " * string(cond) * " is not supported")
@@ -1096,7 +1107,9 @@ function isContinousCondition(cond::DAE.Exp, simCode)
         continue
       end
       local var = last(ht[crefName])
-      #= If one variable in the condition is continuous treat it as a conditinous callback =#
+      #=
+      If one variable in the condition is continuous treat it as a continuous  callback
+      =#
       isContinuousCond = isContinuousCond || !(SimulationCode.isDiscrete(var))
     end
   end
@@ -1112,3 +1125,19 @@ function getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode)
     Expr(:call, getindex, :p, Expr(:call, :getindex, :lookuptableParams, :(Symbol($(string(x))))))
   end
 end
+
+"""
+Replace a variable with an optional naming convention specified by the prefix and suffix arguments
+"""
+function replaceVars(sym::Symbol; kwargs...)
+  if Base.isoperator(sym)
+    sym
+  else
+    :($(Meta.parse(string(kwargs[:prefix],":$sym", kwargs[:suffix]))))
+  end
+end
+function replaceVars(expr::Expr; kwargs...)
+  Expr(expr.head,
+       map((x) -> replaceVars(x; kwargs...), expr.args)...)
+end
+replaceVars(x; kwargs...) = x

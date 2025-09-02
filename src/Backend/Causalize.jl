@@ -72,8 +72,6 @@ function detectUnusedParametersAndConstants(bdae::BDAE.BACKEND_DAE)
       newOrderedVars[i] = tv
     end
   end
-  #  println("New ordered vars")
-  #  println(map(string, newOrderedVars))
   @assign first(bdae.eqs).orderedVars = newOrderedVars
   return bdae
 end

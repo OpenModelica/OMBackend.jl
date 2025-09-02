@@ -370,17 +370,18 @@ function availableModels()::String
 end
 
 """
-```
-SimulateModel(modelName::String; MODE = DAE_MODE ,tspan=(0.0, 1.0), solver = :solver)
-```
-Simulates model interactivly.
-The solver need to be passed with a : before the name, example:
-OMBackend.simulateModel(modelName, tspan = (0.0, 1.0), solver = :(Tsit5()));
+  ```
+  SimulateModel(modelName::String; MODE = DAE_MODE ,tspan=(0.0, 1.0), solver = :solver)
+  ```
+  Simulates model interactivly.
+  The solver need to be passed with a : before the name, example:
+  OMBackend.simulateModel(modelName, tspan = (0.0, 1.0), solver = :(Tsit5()));
 """
 function simulateModel(modelName::String;
                        MODE = MTK_MODE,
                        tspan = (0.0, 1.0),
-                       solver = :(Rodas5()))
+                       solver = :(Rodas5()),
+                       saveat = :(0.0))
   #= Strings using "." need to be in a format suitable for Julia =#
   modelName = replace(modelName, "." => "__")
   local modelCode::Expr
@@ -405,20 +406,35 @@ function simulateModel(modelName::String;
       @eval $strippedModel
       #=
       Evaluate the model runnable.
-        Expr(:kw,
-             :solver,
-             solver)
+      Expr(:kw,
+      :solver,
+      solver)
       Is used to specify the keyword arguments that are being passed along.
       =#
-      modelRunnable = eval(
-        Expr(:call,
-             Symbol(modelName, "Simulate"),
-             Expr(:kw,
-                  :solver,
-                  solver),
-             tspan,
-             )
-      )
+      if saveat != 0.0
+        modelRunnable = eval(
+          Expr(:call,
+               Symbol(modelName, "Simulate"),
+               Expr(:kw,
+                    :solver,
+                    solver),
+               Expr(:kw,
+                    :saveat,
+                    saveat),
+               tspan,
+               )
+        )
+      else
+        modelRunnable = eval(
+          Expr(:call,
+               Symbol(modelName, "Simulate"),
+               Expr(:kw,
+                    :solver,
+                    solver),
+               tspan,
+               )
+        )
+      end
       #= Run the model with the supplied tspan. =#
       @eval $modelRunnable
       #=

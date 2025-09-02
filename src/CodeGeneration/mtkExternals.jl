@@ -320,19 +320,22 @@ end
 function structural_simplify(sys::ModelingToolkit.AbstractSystem,
                              io = nothing;
                              simplify = false,
+                             allow_parameter = true,
                              kwargs...)
-  #@info "Calling custom structural_simplify"
+  @info "Calling custom structural_simplify"
   #sys = ModelingToolkit.ode_order_lowering(sys)
   #sys = ModelingToolkit.dae_index_lowering(sys)
   #sys = ModelingToolkit.tearing(sys; simplify = simplify)
-  if simplify #Note report this to the developers of modeling toolkit.
+  if false #Note report this to the developers of modeling toolkit.
     sys = ode_order_lowering(sys)
     sys = dae_index_lowering(sys)
-    #sys = ModelingToolkit.tearing(sys; simplify = false)
+    sys = ModelingToolkit.tearing(sys; simplify = false, allow_parameter = true)
+   # sys = mtkcompile(sys)
     #Note some system breaks if tearing is run twice.
     # Note2 In some cases we need to do index reduction before simplify
+    # return complete(sys) #Addition. To be removed.
   end
-  sys = ModelingToolkit.structural_simplify(sys, simplify = false)
+  sys = ModelingToolkit.structural_simplify(sys, simplify = simplify)
   return sys
 end
 

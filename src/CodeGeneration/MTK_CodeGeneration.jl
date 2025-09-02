@@ -53,7 +53,7 @@ end
   or do code generation for a model with structural submodels.
 """
 function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
-    #=If our model name is separated by . replace it with __ =#
+  #=If our model name is separated by . replace it with __ =#
   local MODEL_NAME = replace(simCode.name, "." => "__")
   #= Generate code for algorithmic Modelica =#
   (functions, functionNames) = AlgorithmicCodeGeneration.generateFunctions(simCode.functions)
@@ -139,10 +139,16 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
                  end)
       return result
     end
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0); solver=Rodas5(autodiff=false))
+    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0) ; solver=Rodas5(autodiff=false))
       $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
       OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver)
     end
+
+    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0)::Tuple{Float64, Float64}; solver=Rodas5(), kwargs...)
+      $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
+      OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver; kwargs...)
+    end
+
   end
   return (MODEL_NAME, code)
 end
@@ -183,10 +189,16 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(generateRegisterCallsForCallExprs(simCode)...)
     $(model)
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0); solver=Rodas5())
+    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0)::Tuple{Float64, Float64}; solver=Rodas5())
       ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), tspan, pars, vars, irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
       solve($(Symbol("$(MODEL_NAME)Model_problem")), solver)
     end
+
+    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0)::Tuple{Float64, Float64}; solver=Rodas5(), saveat = 1.0)
+      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), tspan, pars, vars, irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
+      solve($(Symbol("$(MODEL_NAME)Model_problem")), solver, saveat = saveat)
+    end
+
   end
   #= MODEL_NAME is preprocessed with . replaced with _=#
   return MODEL_NAME, program
