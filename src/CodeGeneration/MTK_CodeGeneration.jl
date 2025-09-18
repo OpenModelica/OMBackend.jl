@@ -189,16 +189,11 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(generateRegisterCallsForCallExprs(simCode)...)
     $(model)
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0)::Tuple{Float64, Float64}; solver=Rodas5())
+    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
       ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), tspan, pars, vars, irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
-      solve($(Symbol("$(MODEL_NAME)Model_problem")), solver)
+      sol = solve($(Symbol("$(MODEL_NAME)Model_problem")), solver; kwargs...)
+      return sol
     end
-
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0)::Tuple{Float64, Float64}; solver=Rodas5(), saveat = 1.0)
-      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), tspan, pars, vars, irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
-      solve($(Symbol("$(MODEL_NAME)Model_problem")), solver, saveat = saveat)
-    end
-
   end
   #= MODEL_NAME is preprocessed with . replaced with _=#
   return MODEL_NAME, program

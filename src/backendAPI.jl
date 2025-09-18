@@ -371,7 +371,11 @@ end
 
 """
   ```
-  SimulateModel(modelName::String; MODE = DAE_MODE ,tspan=(0.0, 1.0), solver = :solver)
+   simulateModel(modelName::String;
+                       MODE = MTK_MODE,
+                       tspan = (0.0, 1.0),
+                       solver = Rodas5(),
+                       kwargs...)
   ```
   Simulates model interactivly.
   The solver need to be passed with a : before the name, example:
@@ -380,8 +384,8 @@ end
 function simulateModel(modelName::String;
                        MODE = MTK_MODE,
                        tspan = (0.0, 1.0),
-                       solver = :(Rodas5()),
-                       saveat = :(0.0))
+                       solver = Rodas5(),
+                       kwargs...)
   #= Strings using "." need to be in a format suitable for Julia =#
   modelName = replace(modelName, "." => "__")
   local modelCode::Expr
@@ -395,7 +399,6 @@ function simulateModel(modelName::String;
       println("Available models are:")
       availableModels()
     end
-    local modelRunnable
     try
       @eval $(:(import OMBackend))
       #= Added to adjust the recent DEFAULT_PRECS issue =#
@@ -406,37 +409,17 @@ function simulateModel(modelName::String;
       @eval $strippedModel
       #=
       Evaluate the model runnable.
-      Expr(:kw,
-      :solver,
-      solver)
       Is used to specify the keyword arguments that are being passed along.
       =#
-      if saveat != 0.0
-        modelRunnable = eval(
-          Expr(:call,
-               Symbol(modelName, "Simulate"),
-               Expr(:kw,
-                    :solver,
-                    solver),
-               Expr(:kw,
-                    :saveat,
-                    saveat),
-               tspan,
-               )
-        )
-      else
-        modelRunnable = eval(
-          Expr(:call,
-               Symbol(modelName, "Simulate"),
-               Expr(:kw,
-                    :solver,
-                    solver),
-               tspan,
-               )
-        )
-      end
-      #= Run the model with the supplied tspan. =#
-      @eval $modelRunnable
+      local modelRunnable =  Expr(:call,
+                                  Symbol(modelName, "Simulate"),
+                                  Expr(:parameters,
+                                       Expr(:(...), kwargs)),
+                                  tspan,
+                                  solver)
+
+      #= Run the model =#
+      Core.eval(modelRunnable)
       #=
       The model is now compiled and a part of the OMBackend module.
       In the following path OMBackend.<modelName>Simulate

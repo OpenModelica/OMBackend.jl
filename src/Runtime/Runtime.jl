@@ -642,9 +642,6 @@ function getIndicesOfCommonVariables(syms1::Vector{Symbol} # New system
       push!(newSyms, Symbol(replace(string(name), srcPrefix => destinationPrefix)))
     end
   end
-  #@info "newSyms" newSyms
-  #@info "topVariables", topVariables
-  #@info "common variables", inCommonVariables
   local indicesOfCommonVariables = Int[]
   local idxDict1 = DataStructures.OrderedDict()
   local idxDict2 = DataStructures.OrderedDict()

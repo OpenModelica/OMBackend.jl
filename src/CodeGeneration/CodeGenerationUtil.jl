@@ -105,15 +105,29 @@ function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DA
   return res
 end
 
-function transformToMTKConditionEquation(cond::DAE.Exp, simCode)
+"""
+Transforms a DAE Condition into a MTK continous condition.
+"""
+function transformToMTKContinousCondition(cond, simCode)
   res = @match cond begin
     DAE.RELATION(e1, DAE.LESS(__), e2) => begin
-      :($(expToJuliaExpMTK(e1, simCode)) < $(expToJuliaExpMTK(e2, simCode)))
+      :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)))
     end
-    #= TODO: Is this correct? =#
+
     DAE.RELATION(e1, DAE.GREATER(__), e2) => begin
-      :($(expToJuliaExpMTK(e1, simCode)) > $(expToJuliaExpMTK(e2, simCode)))
+      :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)))
     end
+    #= Assumed to be a boolean variable... =#
+    DAE.CREF(__) => begin
+      :($(expToJuliaExpMTK(cond, simCode)))
+    end
+
+    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
+      #= Here we assume that it is used in a context such that it can be treated this way.=#
+      :(min($(transformToMTKContinousConditionEquation(e1, simCode)),
+            $(transformToMTKContinousConditionEquation(e2, simCode))))
+    end
+
     _ => begin
       throw("Operator: " * "'" * string(cond.operator) * "' in: " * string(cond) * " is not supported")
     end
@@ -122,7 +136,7 @@ function transformToMTKConditionEquation(cond::DAE.Exp, simCode)
 end
 
 """
-Transforms a DAE Condition into a MTK continous condition.
+Transforms a DAE Condition into a MTK continous condition equation.
 """
 function transformToMTKContinousConditionEquation(cond, simCode)
   res = @match cond begin
@@ -137,6 +151,19 @@ function transformToMTKContinousConditionEquation(cond, simCode)
     DAE.CREF(__) => begin
       :($(expToJuliaExpMTK(cond, simCode)))
     end
+
+    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
+      #= Here we assume that it is used in a context such that it can be treated this way.=#
+      :(min($(transformToMTKContinousCondition(e1, simCode)),
+            $(transformToMTKContinousCondition(e2, simCode))) ~ 0)
+    end
+
+    DAE.LBINARY(e1, DAE.AND(__), e2) => begin
+      #= Here we assume that it is used in a context such that it can be treated this way.=#
+      :(max($(transformToMTKContinousCondition(e1, simCode)),
+            $(transformToMTKContinousCondition(e2, simCode))) ~ 0)
+    end
+
     _ => begin
       throw("Operator: " * "'" * string(cond.operator) * "' in: " * string(cond) * " is not supported")
     end
