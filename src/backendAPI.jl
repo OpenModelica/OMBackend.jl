@@ -419,7 +419,7 @@ function simulateModel(modelName::String;
                                   solver)
 
       #= Run the model =#
-      Core.eval(modelRunnable)
+      @eval $modelRunnable
       #=
       The model is now compiled and a part of the OMBackend module.
       In the following path OMBackend.<modelName>Simulate

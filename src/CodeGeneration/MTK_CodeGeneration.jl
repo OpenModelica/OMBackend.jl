@@ -139,12 +139,12 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
                  end)
       return result
     end
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0) ; solver=Rodas5(autodiff=false))
+    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0), solver=Rodas5(autodiff=false))
       $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
       OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver)
     end
 
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0)::Tuple{Float64, Float64}; solver=Rodas5(), kwargs...)
+    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0)::Tuple{Float64, Float64}, solver=Rodas5(); kwargs...)
       $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
       OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver; kwargs...)
     end
