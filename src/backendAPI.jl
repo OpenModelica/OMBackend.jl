@@ -482,7 +482,7 @@ function plot(sol)
 end
 
 """
-  Plotting program for an OMSolution that contains several sub solutions.
+  Plot for an OMSolution that contains several sub solutions.
   Plots all part of the solution on the same graph.
 """
 function plot(sol::Runtime.OMSolutions; legend = false, limX = 0.0, limY = 1.0)
@@ -490,6 +490,19 @@ function plot(sol::Runtime.OMSolutions; legend = false, limX = 0.0, limY = 1.0)
   local prevP = Plots.plot!(sols[1]; legend = legend, xlim=limX, ylim = limY)
   for sol in sols[2:end]
     p = Plots.plot!(prevP; legend = legend, xlim=limX, ylim = limY)
+    prevP = p
+  end
+  return prevP
+end
+
+"""
+  Plots a vector of solutions
+"""
+function plot(sol::Vector; legend = false, limX = 0.0, limY = 1.0, kwargs...)
+  sols = sol
+  local prevP = Plots.plot!(sols[1]; legend = legend, xlim=limX, ylim = limY, kwargs...)
+  for sol in sols[2:end]
+    p = Plots.plot!(prevP; legend = legend, xlim=limX, ylim = limY, kwargs...)
     prevP = p
   end
   return prevP
@@ -556,7 +569,7 @@ vcat(OM.OMBackend.getVariableValues(sols, "pendulum_y", "bouncingBall_y")...)
    8.71359663258124
    ⋮
  -11.346053750176466
-   ⋮
+     ⋮
   3.3856338791378615
 ```
 """

@@ -190,16 +190,18 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
                                                                ,commonVariableSet
                                                                ;destinationPrefix = cb.name
                                                                ,srcPrefix = activeModeName)
-        #=
-        TODO: If a value is not found it should have the index specified by its initial values
-        =#
-        newU0 = Float64[0.0 for sym in getSyms(newSystem)]
-        for oldIdx in 1:length(getSyms(oldSystem))
-          if indicesOfCommonVariables[oldIdx] != 0
-            newU0[indicesOfCommonVariables[oldIdx]] = integrator.u[oldIdx]
+
+        newU0 = Float64[newSystem[sym] for sym in getSyms(newSystem)]
+        @info "new initial values" newU0
+        @info "Common vs" indicesOfCommonVariables
+        for oldIdx in 1:min(length(getSyms(oldSystem)), length(getSyms(newSystem)))
+          local idx = indicesOfCommonVariables[oldIdx]
+          @info idx
+          if idx != 0
+            newU0[idx] = integrator.u[oldIdx]
           end
         end
-        #@info "New u0:" newU0
+        @info "New u0:" newU0
         #= Save the old solution together with the name and the mode that was active =#
         push!(oldSols, integrator.sol)
         #= Now we have the start values for the next part of the system=#
