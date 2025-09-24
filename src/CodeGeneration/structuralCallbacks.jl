@@ -166,14 +166,18 @@ function createStructuralCallback(simCode,
         local cb = PeriodicCallback(affect!, Δt)
       end
     end
-    _ #=Continuous  or discrete =# => begin
+    _ #=Continuous or discrete =# => begin
       if isContinousCondition(whenCondition, simCode)
         local zeroCrossingCond = transformToZeroCrossingCondition(whenCondition)
         quote
           $(affect)
           function condition(u, t, integrator)
-            @info "Checking condition... at" t
-            return $(replaceVars(expToJuliaExpMTK(zeroCrossingCond, simCode); prefix = "integrator[", suffix = "]"))
+            @info "Checking condition... at" t integrator.ps[:state]
+            return $(replaceVars(expToJuliaExpMTK(zeroCrossingCond, simCode);
+                                 integratorCref = "integrator",
+                                 prefix = "[",
+                                 suffix = "]",
+                                 ht = simCode.stringToSimVarHT))
           end
           local cb = ContinuousCallback(condition, affect!)
         end

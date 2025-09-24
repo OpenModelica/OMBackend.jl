@@ -1159,8 +1159,25 @@ Replace a variable with an optional naming convention specified by the prefix an
 function replaceVars(sym::Symbol; kwargs...)
   if Base.isoperator(sym)
     sym
+  elseif sym === :t
+    sym
   else
-    :($(Meta.parse(string(kwargs[:prefix],":$sym", kwargs[:suffix]))))
+    local vStr = string(sym)
+    #= Lookup the variable. =#
+    local sVar = last(kwargs[:ht][vStr])
+    local isStateOrAlg = SimulationCode.isStateOrAlgebraic(sVar)
+    if isStateOrAlg
+      :($(Meta.parse(string(kwargs[:integratorCref],
+                            kwargs[:prefix],
+                            ":$sym",
+                            kwargs[:suffix]))))
+    else #Parameter or Discrete.
+      :($(Meta.parse(string(kwargs[:integratorCref],
+                            ".ps",
+                            kwargs[:prefix],
+                            ":$sym",
+                            kwargs[:suffix]))))
+    end
   end
 end
 function replaceVars(expr::Expr; kwargs...)

@@ -175,7 +175,6 @@ end
 function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   local preprocessedFM = FrontendUtil.handleBuiltin(fm)
   local bDAE = BDAECreate.lower(preprocessedFM)
-  #@debug(BDAEUtil.stringHeading1(bDAE, "translated"));
   @BACKEND_LOGGING debugWrite("initialBDAE.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
   #= Expand arrays =#
   # Removed this pass since this can now
@@ -184,7 +183,6 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   bDAE = Causalize.detectIfExpressions(bDAE)
   #= Mark state variables =#
   bDAE = Causalize.detectStates(bDAE)
-  #@debug(BDAEUtil.stringHeading1(bDAE, "States marked"));
   bDAE = Causalize.residualizeEveryEquation(bDAE)
   #= Convert equations to residual form =#
   @BACKEND_LOGGING debugWrite("residualTransformationAllParamsAndConstants.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
@@ -589,4 +587,11 @@ function getVariableValues(sols::Vector, variables...)
     end
   end
   return vcat(vals...)
+end
+
+"""
+Wrapper function to MTK `observed`
+"""
+function MTK_getObserved(sol)
+  ModelingToolkit.observed(sol.prob.f.sys)
 end

@@ -168,16 +168,15 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
   local symsOfInitialMode = getSyms(problem)
   local activeModeName = omProblem.activeModeName
   #= Create integrator =#
-  integrator = init(problem, alg, kwargs...)
-  #@info "Value of tspan[2]" tspan[2]
+  integrator = init(problem, alg; kwargs...)
   add_tstop!(integrator, tspan[2])
   local oldSols = []
   #= Run the integrator=#
   @label START_OF_INTEGRATION
   for i in integrator
-    #@info "u values at Δt $(integrator.dt) & t = $(integrator.t)" integrator.u
+    @BACKEND_LOGGING @info "u values at Δt $(integrator.dt) & t = $(integrator.t)" integrator.u
     #= Check structural callbacks in order =#
-    #@info "Stepping at:" i.t
+    @BACKEND_LOGGING @info "Stepping at:" i.t
     retCode = check_error(integrator)
     for cb in structuralCallbacks
       if cb.structureChanged && cb.name != activeModeName
@@ -192,16 +191,15 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
                                                                ,srcPrefix = activeModeName)
 
         newU0 = Float64[newSystem[sym] for sym in getSyms(newSystem)]
-        @info "new initial values" newU0
-        @info "Common vs" indicesOfCommonVariables
+        @BACKEND_LOGGING @info "new initial values" newU0
+        @BACKEND_LOGGING @info "Common vs" indicesOfCommonVariables
         for oldIdx in 1:min(length(getSyms(oldSystem)), length(getSyms(newSystem)))
           local idx = indicesOfCommonVariables[oldIdx]
-          @info idx
           if idx != 0
             newU0[idx] = integrator.u[oldIdx]
           end
         end
-        @info "New u0:" newU0
+        @BACKEND_LOGGING @info "New u0:" newU0
         #= Save the old solution together with the name and the mode that was active =#
         push!(oldSols, integrator.sol)
         #= Now we have the start values for the next part of the system=#
@@ -224,7 +222,6 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
         =#
         activeModeName = cb.name
         reinit!(integrator, newU0; t0 = i.t, reset_dt = true)
-        #@info "New integrator" integrator.u
         for cb in structuralCallbacks
           cb.structureChanged = false
         end
