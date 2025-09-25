@@ -248,7 +248,7 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
   local structuralCallbacks = omProblem.structuralCallbacks
   local callbackConditions = omProblem.callbackConditions
   local activeModeName = omProblem.activeModeName
-  local integrator = init(problem, alg)
+  local integrator = init(problem, alg; kwargs...)
   local solutions = []
   #println("Start integration")
   #= Run the integrator=#
@@ -274,9 +274,6 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
         #= Assuming the indices are the same (Which is not always true) =#
           local symsOfOldProblem = getSyms(problem)
           local symsOfNewProlem = getSyms(newProblem)
-          #@info "U0 before variables are set:"
-          #@info integrator.u
-          #@info i.u
           newU0 = RuntimeUtil.createNewU0(symsOfOldProblem,
                                           symsOfNewProlem,
                                           initialValues,
@@ -293,13 +290,14 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
           #= Now we have the start values for the next part of the system=#
           integrator = init(newProblem,
                             alg,
-                            force_dtmin = true,
+                            force_dtmin = true;
                             kwargs...)
           reinit!(integrator,
                   newU0;
                   t0 = i.t,
                   tf = tspan[2],
-                  reset_dt = true)
+                  reset_dt = true,
+                  kwargs...)
         #=
           Reset with the new values of u0
           and set the active mode to the mode we are currently using.
@@ -308,12 +306,8 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
         #= ! This runs for both routines. That is initialization and recompilation !=#
         problem = newProblem
         #= Note that the structural event might be triggered again here (We kill it later) =#
-        #@info "Stepping... at $(integrator.t)"
+        integrator.dt = min(integrator.dt, 1e-6)
         Base.invokelatest(step!, integrator, integrator.dt, true)
-        #@info "After step"
-        #@info cb.structureChanged
-        #@info "Time after step" integrator.t
-        #@info "Time after step" i.t
         #=
         We reset the structural change pointer again here just to make sure
         that we do not trigger the structural callback again.
@@ -327,28 +321,23 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
         Make a PR for the Julia guys to provide an option to step without triggering callbacks.
         This so that we can avoid the hack above.
         =#
-        #@info "Reset!"
         @goto START_OF_INTEGRATION
       end
     end #= Structural callback handling =#
     #= invoke latest to avoid world age problems =#
-    # @info "i.t + i.dt" i.t + i.dt
-    # @info "integrator.t + integrator.dt" integrator.t + integrator.dt
-    # @info "integrator.t + integrator.dt" integrator.t + integrator.dtpropose
+    @info "integrator.t + integrator.dt" integrator.t + integrator.dt
+    #@info "integrator.t + integrator.dtpropose" integrator.t + integrator.dtpropose
     if integrator.t + integrator.dtpropose >= tspan[2]
-      #@info integrator.t
-      #= Calculate the length of the final step=#
-      #@info "integrator.t + integrator.dtpropose >= tspan[2]!\n tspan[2] - i.t =  " tspan[2] - i.t
-      #@info "integrator.dtpropose" integrator.dtpropose
-      # @info "tspan[2]" tspan[2]
-      # @info "i.t" i.t
-      #local finalStep = tspan[2] - i.t
-      #= Use a very small timestep =#
+      @info "Timestep exceeds the simulation"
+      @info "integrator.t" integrator.t
+      @info "integrator.t + integrator.dtpropose" integrator.t + integrator.dtpropose
+      @info "Adjusting..."
       integrator.dt = 1e-6
       integrator.dtpropose = 1e-6
-      #@info "integrator.dt" integrator.dt
-      #@info "integrator.dtpropose" integrator.dtpropose
-      Base.invokelatest(step!, integrator, integrator.dt, true)#Base.invokelatest(step!, integrator) #step!(integrator, tspan[2])
+      @info "integrator.dt" integrator.dt
+      @info "integrator.dtpropose" integrator.dtpropose
+      @info "integrator.t + integrator.dt" integrator.dt + integrator.t
+      Base.invokelatest(step!, integrator, integrator.dt, true)
       # @info "i.t" integrator.t
       #break #= Restarts  integration =#
     else
@@ -393,11 +382,6 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
           hitTstop = true
         end
       end
-      #@assert !(isempty(solAtChange)) "Invalid structural change occured"
-      #@info "Reinit"
-      #@info "tprev" timeAtChange
-      #@info "uAtChange" uAtChange
-      #@info typeof(uAtChange)
       if hitTstop
         reinit!(i,
                 last(uAtChange);
@@ -484,7 +468,7 @@ function recompilation(activeModeName,
   structuralCallback.metaModel = newMetaModel
   structuralCallback.stringToSimVarHT = simulationCode.stringToSimVarHT
   #= 4.2) Assign this system to newSystem. =#
-  return (compositeProblem, simulationCode.stringToSimVarHT,finalInitialValues,  initialValues, reducedSystem, false)
+  return (compositeProblem, simulationCode.stringToSimVarHT,finalInitialValues, initialValues, reducedSystem, false)
 end
 
 """

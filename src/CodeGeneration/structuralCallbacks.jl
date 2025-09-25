@@ -74,7 +74,7 @@ function createStructuralCallback(simCode, simCodeStructuralTransition::Simulati
         local structuralChange = OMBackend.Runtime.StructuralChange($(structuralTransition.toState), false, destinationSystem, callbacks)
         #= The affect simply activates the structural callback informing us to generate code for a new system =#
         function affect!(integrator)
-          @info "Potential structural change triggered at  callback:" * $(callbackName) * " at $(integrator.t)"
+          #@info "Potential structural change triggered at  callback:" * $(callbackName) * " at $(integrator.t)"
           structuralChange.structureChanged = true
         end
         function condition(x, t, integrator)
@@ -149,7 +149,7 @@ function createStructuralCallback(simCode,
       #= Expand the when operators =#
       $(whenOperators...)
       @info("Structural callback triggered at $(integrator.t)")
-      #println("tprev at $(integrator.tprev)")
+      @info("tprev at $(integrator.tprev)")
       structuralChange.structureChanged = true
       integrator.just_hit_tstop = true
       structuralChange.timeAtChange = integrator.t
@@ -172,7 +172,7 @@ function createStructuralCallback(simCode,
         quote
           $(affect)
           function condition(u, t, integrator)
-            @info "Checking condition... at" t integrator.ps[:state]
+            #@info "Checking condition... at" t integrator.ps[:state]
             return $(replaceVars(expToJuliaExpMTK(zeroCrossingCond, simCode);
                                  integratorCref = "integrator",
                                  prefix = "[",
