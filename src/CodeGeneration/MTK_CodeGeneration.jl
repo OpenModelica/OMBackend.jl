@@ -324,11 +324,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   Instead, we should only use the values for the unknowns we can't remove from the system.
   =#
   local irreductableSyms = Symbol[Symbol(vn) for vn in simCode.irreductableVariables]
+
   local FINAL_START_CONDTIONS_EQUATIONS = unique!(createStartConditionsEquationsMTK(
     String[vn for vn in simCode.irreductableVariables],
     String[],
-    simCode))
-  FINAL_START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations,  DISCRETE_START_VALUES, FINAL_START_CONDTIONS_EQUATIONS)
+    simCode; onlyFixed = true))
+  FINAL_START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations, DISCRETE_START_VALUES, FINAL_START_CONDTIONS_EQUATIONS)
   START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations, DISCRETE_START_VALUES, START_CONDTIONS_EQUATIONS)
   #=
     Merge the ifConditional components into the rest of the system and merge the state conditionals with the states
@@ -465,12 +466,14 @@ end
 """
   Generates the initial value for the equations
   TODO: Currently unable to generate start condition in order
+
+if `onlyFixed` is true only start values for fixed variables with a specified start value are generated.
 """
 function createStartConditionsEquationsMTK(states::Vector,
                                         algebraics::Vector,
-                                        simCode::SimulationCode.SimCode)::Vector{Expr}
-  local algInit = getStartConditionsMTK(algebraics, simCode)
-  local stateInit = getStartConditionsMTK(states, simCode)
+                                        simCode::SimulationCode.SimCode; onlyFixed = false)::Vector{Expr}
+  local algInit = getStartConditionsMTK(algebraics, simCode; onlyFixed = onlyFixed)
+  local stateInit = getStartConditionsMTK(states, simCode; onlyFixed = onlyFixed)
   local initialEquations = simCode.initialEquations
   local ieqInit = generateInitialEquations(initialEquations, simCode)
   #=
@@ -526,8 +529,11 @@ end
 """
   Given a vector of variables and the simulation code
   extracts the start attributes to generate initial conditions.
+
+if `onlyFixed` is true only start values for fixed variables with a specified start value are generated.
+
 """
-function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode)::Vector{Expr}
+function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; onlyFixed = false)::Vector{Expr}
   local startExprs::Vector{Expr} = Expr[]
   local residuals = simCode.residualEquations
   local ht::Dict = simCode.stringToSimVarHT
@@ -575,12 +581,15 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode)::V
           continue
         end
       end
-      NONE() => begin
+      NONE() where {!onlyFixed} => begin
         #=
         If no attribute. Let it default to zero.
         This branch should only be taken for compiler generated variables.
         =#
         push!(startExprs, :($(Symbol(varName)) => 0.0))
+        continue
+      end
+      _ => begin
         continue
       end
     end
