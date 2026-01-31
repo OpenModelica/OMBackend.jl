@@ -47,10 +47,8 @@ If  ```ENABLE_BACKEND_LOGGING``` is true this macro is active. If not this macro
 """
 macro BACKEND_LOGGING(expr)
   if ENABLE_BACKEND_LOGGING
-    return quote
-      $(esc(expr))
-      __result
-    end
+    return esc(expr)
   else
+    return nothing
   end
 end

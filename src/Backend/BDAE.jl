@@ -427,7 +427,7 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
   end
 
   @Record ARRAY_EQUATION begin
-    dimSize #= dimension sizes =#::List{Integer}
+    dimSize #= dimension sizes =#::Vector{Int64}
     left #= lhs =#::DAE.Exp
     right #= rhs =#::DAE.Exp
     source #= origin of equation =#::DAE.ElementSource

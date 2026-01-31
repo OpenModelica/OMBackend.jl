@@ -34,7 +34,7 @@ Author: John Tinnerholm, john.tinnerholm@liu.se
 module CodeGeneration
 
 import DataStructures
-import ..Util
+import ..FrontendUtil.Util
 using MetaModelica
 #= This was also introduced in the data structure package. We need to be explicit in which one we use.=#
 using MetaModelica: Cons
@@ -57,6 +57,7 @@ import OMParser
 import Symbolics
 
 include("mtkExternals.jl")
+include("./arrayUtils.jl")
 include("./CodeGenerationUtil.jl")
 include("./structuralCallbacks.jl")
 include("./AlgorithmicCodeGeneration.jl")

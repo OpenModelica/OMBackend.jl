@@ -209,6 +209,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local equations::Vector = BDAE.RESIDUAL_EQUATION[]
   local exp::DAE.Exp
   local parameters::Vector = String[]
+  local arrayParameters::Vector = String[]
   local stateDerivatives::Vector = String[]
   local stateVariables::Vector = String[]
   local algebraicVariables::Vector = String[]
@@ -233,6 +234,15 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       end
       SimulationCode.PARAMETER(__) => begin
         push!(parameters, varName)
+      end
+      SimulationCode.STRING(__) => begin
+        push!(parameters, varName)
+      end
+      SimulationCode.ARRAY_PARAMETER(__) => begin
+        push!(arrayParameters, varName)
+      end
+      SimulationCode.ARRAY(__) => begin
+        push!(stateVariables, varName)
       end
       SimulationCode.DISCRETE(__) => begin
         push!(discreteVariables, varName)
@@ -290,6 +300,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local PARAMETER_EQUATIONS = createParameterEquationsMTK(parameters, simCode)
   local PARAMETER_ASSIGNMENTS = createParameterAssignmentsMTK(parameters, simCode)
   local PARAMETER_RAW_ARRAY = createParameterArray(parameters, PARAMETER_ASSIGNMENTS, simCode)
+  local ARRAY_PARAMETERS = createArrayParametersMTK(arrayParameters, simCode)
   #= Create callback equations.
     For MTK we disable the saving function for now.
   =#
@@ -346,7 +357,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                                t,
                                vcat(stateVariablesSym, algebraicVariablesSym),
                                vcat(parVariablesSym, dataStructureVariablesSym),
-                               simCode)
+                               simCode;
+                               arrayParameterExprs = ARRAY_PARAMETERS)
   #= Reset the callback counter=#
   RESET_CALLBACKS()
   #=
@@ -364,6 +376,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       parameters = ModelingToolkit.@parameters begin
         ($(parVariablesSym...))
       end
+      #= Create array parameters with proper dimensions =#
+      $(ARRAY_PARAMETERS...)
       #=
         Only variables that are present in the equation system later should be a part of the variables in the MTK system.
         This means that certain algebraic variables should not be listed among the variables (These are the discrete variables).
@@ -394,14 +408,14 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       startEquationComponents = []
       $(decomposeStartEquations(START_CONDTIONS_EQUATIONS))
       for constructor in startEquationConstructors
-        push!(startEquationComponents, constructor())
+        push!(startEquationComponents, Base.invokelatest(constructor))
       end
       initialValues = collect(Iterators.flatten(startEquationComponents))
       #= Process the final initial guesses =#
       startEquationComponents = []
       $(decomposeStartEquations(FINAL_START_CONDTIONS_EQUATIONS; functionSuffix = "Final"))
       for constructor in startEquationConstructors
-        push!(startEquationComponents, constructor())
+        push!(startEquationComponents, Base.invokelatest(constructor))
       end
       finalInitialValues = collect(Iterators.flatten(startEquationComponents))
       #= End construction of initial values =#
@@ -409,7 +423,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       $(stripBeginBlocks(decomposeEquations(EQUATIONS, PARAMETER_ASSIGNMENTS)))
       #= Generate the Equations =#
       for constructor in equationConstructorCalls
-        push!(equationComponents, constructor())
+        push!(equationComponents, Base.invokelatest(constructor))
       end
       eqs = collect(Iterators.flatten(equationComponents))
       $(IF_EQUATION_EVENT_DECLARATION)
@@ -550,14 +564,19 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; on
       SOME(attributes) => begin
         () = @match (attributes.start, attributes.fixed) begin
           (SOME(DAE.CREF(start)), SOME(__)) || (SOME(DAE.CREF(start)), _)  => begin
-            #=
-              We have a variable of sorts.
-              We look evaluate the value in the pars list.
-            =#
-            push!(startExprs,
-                  quote
-                    $(Symbol("$varName")) => pars[$(Symbol(string(start)))]
-                  end)
+            #= Check if CREF has subscripts. If so, delegate to expToJuliaExpMTK =#
+            if !isempty(FrontendUtil.Util.getSubscriptsFromCref(start))
+              push!(startExprs,
+                    quote
+                      $(Symbol("$varName")) => $(expToJuliaExpMTK(DAE.CREF(start, DAE.T_REAL(MetaModelica.Nil())), simCode))
+                    end)
+            else
+              #= Simple CREF without subscripts. Look up in pars list =#
+              push!(startExprs,
+                    quote
+                      $(Symbol("$varName")) => pars[$(Symbol(string(start)))]
+                    end)
+            end
             continue
           end
           (SOME(start), SOME(fixed)) || (SOME(start), _)  => begin
@@ -568,17 +587,19 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; on
             continue
           end
           (NONE(), SOME(fixed)) => begin
-            push!(startExprs, :($(varName) => 0.0))
+            if !onlyFixed
+              push!(startExprs, :($(Symbol(varName)) => 0.0))
+            end
             continue
           end
-          (_, _) => ()
-        end
-        NONE() => begin
-          if ! (simVarType isa SimulationCode.STATE || simVarType isa SimulationCode.DISCRETE)
-            warnings *= "\n Assumed starting value of 0.0 for variable: " * varName * "\n"
-            push!(startExprs, :($(Symbol(varName)) => 0.0))
+          (NONE(), NONE()) || (_, _) => begin
+            #= No start value specified, default to 0.0 =#
+            if !onlyFixed
+              warnings *= "\n Assumed starting value of 0.0 for variable: " * varName * "\n"
+              push!(startExprs, :($(Symbol(varName)) => 0.0))
+            end
+            continue
           end
-          continue
         end
       end
       NONE() where {!onlyFixed} => begin
@@ -765,6 +786,9 @@ function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode
           end
         end
       end
+      SimulationCode.STRING(__) => begin
+        DAE.SCONST("tmp") #TODO handle string parameters properly.
+      end
       _ => begin
         throw(ErrorException("Unknown SimulationCode.SimVarType for parameter: " * string(param)  * " of type: " * string(simVarType)))
       end
@@ -787,6 +811,33 @@ function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode
     push!(parameterEquations, expr)
   end #=For=#
   return parameterEquations
+end
+
+"""
+  Creates array parameter definitions for MTK.
+  Array parameters (e.g. record fields like R_T::Real[3,3]) are created as
+  concrete Julia arrays assigned to their symbol names, so that the generated
+  algorithmic functions can subscript into them.
+"""
+function createArrayParametersMTK(arrayParameters::Vector, simCode::SimulationCode.SimCode)::Vector{Expr}
+  local exprs = Expr[]
+  local ht = simCode.stringToSimVarHT
+  for param in arrayParameters
+    (_, simVar) = ht[param]
+    local vk = simVar.varKind
+    @match vk begin
+      SimulationCode.ARRAY_PARAMETER(dims, SOME(bindExp)) => begin
+        local valExpr = expToJuliaExpMTK(bindExp, simCode)
+        push!(exprs, :($(Symbol(simVar.name)) = $(valExpr)))
+      end
+      SimulationCode.ARRAY_PARAMETER(dims, NONE()) => begin
+        #= No binding, create zero array with the right dimensions =#
+        push!(exprs, :($(Symbol(simVar.name)) = zeros(Float64, $(dims...))))
+      end
+      _ => nothing
+    end
+  end
+  return exprs
 end
 
 """
@@ -1016,25 +1067,150 @@ function decomposeStartEquations(equations; functionSuffix = "")
 end
 
 """
+  Check if a DAE.VAR has an array type.
+  The array type info is in the componentRef's identType field, not in v.ty.
+"""
+function isArrayType(v::DAE.VAR)::Bool
+  #= Get the type from the component reference, which contains the full type including array dimensions =#
+  local crefType = @match v.componentRef begin
+    DAE.CREF_IDENT(_, identType, _) => identType
+    DAE.CREF_QUAL(_, identType, _, _) => identType
+    _ => v.ty
+  end
+  @match crefType begin
+    DAE.T_ARRAY(__) => true
+    _ => false
+  end
+end
+
+"""
+  Check if any input or output of a function is an array type.
+"""
+function hasArrayParameters(f::SimulationCode.ModelicaFunction)::Bool
+  for v in f.inputs
+    if isArrayType(v)
+      return true
+    end
+  end
+  for v in f.outputs
+    if isArrayType(v)
+      return true
+    end
+  end
+  return false
+end
+
+"""
+  Extract dimensions from a DAE.VAR as a tuple expression.
+  Returns a tuple like (3,) for a 1D array of size 3, or (3, 3) for a 3x3 matrix.
+  Gets the type from componentRef.identType which contains the full array type.
+"""
+function extractArrayDimsFromVar(v::DAE.VAR)::Expr
+  #= Get the type from the component reference =#
+  local ty = @match v.componentRef begin
+    DAE.CREF_IDENT(_, identType, _) => identType
+    DAE.CREF_QUAL(_, identType, _, _) => identType
+    _ => v.ty
+  end
+  @match ty begin
+    DAE.T_ARRAY(_, dims) => begin
+      local dimExprs = []
+      for d in dims
+        @match d begin
+          DAE.DIM_INTEGER(n) => push!(dimExprs, n)
+          DAE.DIM_UNKNOWN(__) => push!(dimExprs, :n)  #= Unknown dimension, use symbolic =#
+          DAE.DIM_EXP(__) => push!(dimExprs, :n)  #= Expression dimension, use symbolic =#
+          _ => push!(dimExprs, :n)
+        end
+      end
+      if length(dimExprs) == 1
+        :(($(dimExprs[1]),))
+      else
+        Expr(:tuple, dimExprs...)
+      end
+    end
+    _ => :()
+  end
+end
+
+"""
+  Generate @register_array_symbolic expression for a function with array parameters.
+"""
+function generateArrayRegisterExpr(f::SimulationCode.ModelicaFunction, funcArgGen::Function)::Expr
+  local normalizedName = replace(f.name, "." => "_")
+  local sb = Symbol(normalizedName)
+
+  #= Build typed argument list for array registration =#
+  local argExprs = Expr[]
+  for v in f.inputs
+    local varName = Symbol(string(v.componentRef))
+    if isArrayType(v)
+      push!(argExprs, :($varName::AbstractArray))
+    else
+      push!(argExprs, :($varName::Real))
+    end
+  end
+
+  #= Build the call signature =#
+  local callExpr = if length(argExprs) == 0
+    Expr(:call, sb)
+  elseif length(argExprs) == 1
+    Expr(:call, sb, argExprs[1])
+  else
+    Expr(:call, sb, argExprs...)
+  end
+
+  #= Determine output size and eltype =#
+  #= For now, assume first output determines the result characteristics =#
+  local sizeExpr = :()
+  local eltypeExpr = :(Symbolics.Num)  #= Use Symbolics.Num for proper type compatibility =#
+
+  if !isempty(f.outputs)
+    local firstOutput = first(f.outputs)
+    if isArrayType(firstOutput)
+      sizeExpr = extractArrayDimsFromVar(firstOutput)
+    end
+  end
+
+  #= Generate the @register_array_symbolic call =#
+  quote
+    Symbolics.@register_array_symbolic $callExpr begin
+      size = $sizeExpr
+      eltype = $eltypeExpr
+    end
+  end
+end
+
+"""
   Generates quoted Symbolics.@register_symbolic calls s.t externaly defined functions are known during simulation.
+  Functions with array parameters are not registered to avoid type issues; they rely on
+  vectorDot and other helpers to handle symbolic arrays directly.
 """
 function generateRegisterCallsForCallExprs(simCode;
                                             funcArgGen::Function = AlgorithmicCodeGeneration.generateSignatureForRegistration)
   local rFs = Expr[]
   for f in simCode.functions
-    local sb = Symbol(f.name)
-    local args = funcArgGen(f.inputs)
-    local nArgs = length(args)
-    local cExpr = if nArgs == 1
-      Expr(:call, sb, first(args))
-    elseif nArgs == 0
-      Expr(:call, sb)
+    #= Skip registration for functions with array parameters =#
+    #= These functions will be evaluated directly with symbolic arrays =#
+    if hasArrayParameters(f)
+      continue
     else
-      Expr(:call, sb, tuple(args...)...)
+      #= Use @register_symbolic for scalar functions =#
+      local normalizedName = replace(f.name, "." => "_")
+      local sb = Symbol(normalizedName)
+      local args = funcArgGen(f.inputs)
+      local nArgs = length(args)
+      local cExpr = if nArgs == 1
+        Expr(:call, sb, first(args))
+      elseif nArgs == 0
+        Expr(:call, sb)
+      else
+        Expr(:call, sb, tuple(args...)...)
+      end
+      #= Delay evaluation of the register expression until we know the call. =#
+      sbRegister = :((Symbolics.@register_symbolic($(cExpr))))
+      push!(rFs, sbRegister)
     end
-    #= Delay evaluation of the register expression until we know the call. =#
-    sbRegister = :((Symbolics.@register_symbolic($(cExpr))))
-    push!(rFs, sbRegister)
   end
   return rFs
 end

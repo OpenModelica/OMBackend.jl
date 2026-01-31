@@ -307,10 +307,44 @@ end
 
 function traverseExpListTopDown(expLst::List{DAE.Exp}, func::Function, inArg)
   outArg = inArg
+  newExpLst = DAE.Exp[]
+  allEqual = true
   for e in expLst
-    (_, outArg) = traverseExpTopDown1(true, e, func, outArg)
+    (newE, outArg) = traverseExpTopDown(e, func, outArg)
+    push!(newExpLst, newE)
+    if !referenceEq(e, newE)
+      allEqual = false
+    end
   end
-  return (expLst, outArg)
+  #= Return original list if nothing changed to preserve identity =#
+  if !allEqual
+    @info "traverseExpListTopDown: List was modified"
+  end
+  return allEqual ? (expLst, outArg) : (list(newExpLst...), outArg)
+end
+
+"""
+  Traverse reduction iterators, applying the traversal function to each iterator expression.
+"""
+function traverseReductionIteratorsTopDown(riters::DAE.ReductionIterators, func::Function, extArg)
+  outIters = DAE.ReductionIterator[]
+  outArg = extArg
+  for riter in riters
+    @match riter begin
+      DAE.REDUCTIONITER(id, exp, guardExp, ty) => begin
+        (exp2, outArg) = traverseExpTopDown(exp, func, outArg)
+        guardExp2 = @match guardExp begin
+          SOME(g) => begin
+            (g2, outArg) = traverseExpTopDown(g, func, outArg)
+            SOME(g2)
+          end
+          NONE() => NONE()
+        end
+        push!(outIters, DAE.REDUCTIONITER(id, exp2, guardExp2, ty))
+      end
+    end
+  end
+  return (list(outIters...), outArg)
 end
 
 function traverseExpTopDownCrefHelper(inCref::DAE.ComponentRef, rel::Function, iarg::Argument) ::Tuple{DAE.ComponentRef, Argument}
@@ -955,8 +989,13 @@ function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::
   (outSubscript, outArg)
 end
 
+"""
+``traverseExpCref(inCref::DAE.ComponentRef, rel::function, iarg )```
+  Traverses all subcomponent references of a component reference.
+  Takes a function and an extra argument passed through the traversal.
+"""
 
-function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::Type_a) ::Tuple{DAE.ComponentRef, Type_a}
+function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::T) ::Tuple{DAE.ComponentRef, T} where {T}
   local outArg::Type_a
   local outCref::DAE.ComponentRef
   (outCref, outArg) = begin
@@ -1024,7 +1063,11 @@ function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::Type_a) 
   (outCref, outArg)
 end
 
-
+"""
+  Evaluates a component reference to an expression, if possible.
+  It uses the variable bindings in the given list of elements.
+  If the component reference cannot be evaluated, NONE() is returned.
+"""
 function evaluateCref(icr::DAE.ComponentRef, iels::List{<:DAE.Element})::Option{DAE.Exp}
   local oexp::Option{DAE.Exp}
   local e::DAE.Exp
@@ -1129,6 +1172,24 @@ function isCref(inExp::DAE.Exp)
 end
 
 
+"""
+  Check whether a DAE.Exp is a compile-time constant (no variable references).
+  Handles literals, arrays of constants, and arithmetic on constants.
+"""
+function isConstantExp(exp::DAE.Exp)::Bool
+  @match exp begin
+    DAE.RCONST(__) => true
+    DAE.ICONST(__) => true
+    DAE.BCONST(__) => true
+    DAE.SCONST(__) => true
+    DAE.ENUM_LITERAL(__) => true
+    DAE.UNARY(exp = e) => isConstantExp(e)
+    DAE.BINARY(exp1 = e1, exp2 = e2) => isConstantExp(e1) && isConstantExp(e2)
+    DAE.ARRAY(array = elems) => all(isConstantExp, elems)
+    _ => false
+  end
+end
+
 function isEvaluatedConst(inExp::DAE.Exp) ::Bool
   local outBoolean::Bool
   outBoolean = begin
@@ -1154,6 +1215,103 @@ function isEvaluatedConst(inExp::DAE.Exp) ::Bool
     end
   end
   outBoolean
+end
+
+function getAllCrefsAsVector(cref::DAE.CREF_IDENT, crefs)
+  push!(crefs, cref)
+end
+
+function getAllCrefsAsVector(cref::DAE.CREF_QUAL, crefs)
+  push!(crefs, DAE.CREF_IDENT(cref.ident, cref.identType, cref.subscriptLst))
+  getAllCrefsAsVector(cref.componentRef, crefs)
+end
+
+function getAllCrefsAsVector(cref::DAE.CREF_ITER, crefs)
+  push!(crefs, DAE.CREF_IDENT(cref.ident, cref.ty, cref.subscriptLst))
+end
+
+function getAllCrefsAsVector(cref::DAE.ComponentRef)
+  local crefs = DAE.ComponentRef[]
+  getAllCrefsAsVector(cref, crefs)
+  return crefs
+end
+
+
+function getAllCrefsAsVector(cref::DAE.CREF)
+  local crefs = DAE.ComponentRef[]
+  getAllCrefsAsVector(cref.componentRef, crefs)
+  return crefs
+end
+
+
+"""
+  Checks whether a component reference contains an array component.
+"""
+function crefContainsArrayComponent(cref::DAE.CREF)
+  crefContainsArrayComponent(cref.componentRef::DAE.ComponentRef)
+end
+
+"""
+  Checks whether a component reference contains an array component.
+"""
+function crefContainsArrayComponent(cref::DAE.ComponentRef)
+  local crefs = getAllCrefs(cref::DAE.ComponentRef)
+  for c in crefs
+    @match c.identType begin
+      DAE.T_ARRAY(__)  => begin
+        return true
+      end
+      _  => begin
+        continue
+      end
+    end
+  end
+end
+
+function finalCrefIsArray(cref::DAE.ComponentRef)
+  getAllCrefsAsVector(cref)[end] |> c ->
+    @match c.identType begin
+      DAE.T_ARRAY(__)  => true
+      _  => false
+    end
+end
+
+function getFinalCref(cref::DAE.ComponentRef)
+  getAllCrefsAsVector(cref)[end]
+end
+
+"""
+  Creates an ASUB expression from an expression and a list of subscripts.
+"""
+function makeASUB(exp::DAE.Exp, sub::List{DAE.Exp})
+  DAE.ASUB(exp, sub)
+end
+
+"""
+  Get all subscripts from a CREF, collecting from all levels.
+  Returns a Vector of DAE.Subscript.
+"""
+function getSubscriptsFromCref(cref::DAE.ComponentRef)::Vector
+  local subscripts = []
+  for c in getAllCrefsAsVector(cref)
+    if !isempty(c.subscriptLst)
+      append!(subscripts, collect(c.subscriptLst))
+    end
+  end
+  return subscripts
+end
+
+"""
+  Get the base name of a CREF without subscripts.
+  E.g., for R_w[1] returns "R_w".
+"""
+function getBaseNameWithoutSubscripts(cref::DAE.ComponentRef)::String
+  local crefs = getAllCrefsAsVector(cref)
+  local parts = String[]
+  for c in crefs
+    push!(parts, c.ident)
+  end
+  return join(parts, "_")
 end
 
 end #=End Util=#

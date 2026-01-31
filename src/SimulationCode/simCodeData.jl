@@ -42,6 +42,8 @@ struct  INPUT <: SimVarType end
 "
 struct OCC_VARIABLE <: SimVarType end
 
+struct STRING <: SimVarType end
+
 """
   A Data structure type.
   Currently this type represents complex datastrutures such as matrices
@@ -52,9 +54,30 @@ struct DATA_STRUCTURE <: SimVarType
 end
 
 """
+An array with N dimensions.
+Contains optional binding expression for compile-time evaluation of subscripted access.
+"""
+struct ARRAY <: SimVarType
+  dimensions::Vector{Int}
+  bindExp::Option{DAE.Exp}
+end
+
+#= Backwards-compatible constructor =#
+ARRAY(dimensions::Vector{Int}) = ARRAY(dimensions, NONE())
+
+"""
 Parameter variable
 """
 struct PARAMETER <: SimVarType
+  bindExp::Option{DAE.Exp}
+end
+
+"""
+Array parameter variable. Has dimensions and an optional binding expression.
+Distinct from ARRAY (which is a state array) to ensure correct MTK code generation.
+"""
+struct ARRAY_PARAMETER <: SimVarType
+  dimensions::Vector{Int}
   bindExp::Option{DAE.Exp}
 end
 
@@ -73,7 +96,7 @@ const ELSE_BRANCH = -1
 """
 Variable data type used for code generation
 """
-struct SIMVAR{T0 <: String, T1 <: Option{Int}, T2 <: SimVarType, T3 <: Option{DAE.VariableAttributes}} <: SimVar
+struct SIMVAR{T0 <: String, T1 <: Option{Int}, T2 <: SimVarType, T3 <: Option{<:DAE.VariableAttributes}} <: SimVar
   "Readable name of variable"
   name::T0
   "Index of variable, 0 based, type based"

@@ -112,7 +112,13 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
     end
     @assign simCode.functions = simCodeFunctions
     @assign simCode.externalRuntime = externalRuntimeNeeded
+    #= Dump before record flattening =#
     debugWrite("simulationCodeStatistics.log", SimulationCode.dumpSimCode(simCode))
+    #= Flatten record parameters in functions =#
+    simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
+    @assign simCode.functions = simCodeFunctions
+    #= Dump after record flattening =#
+    debugWrite("simulationCodePostFlattenRecords.log", SimulationCode.dumpSimCode(simCode))
     return generateMTKTargetCode(simCode)
   else
     @error "No mode specificed: valid modes are:"
@@ -175,17 +181,44 @@ end
 function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   local preprocessedFM = FrontendUtil.handleBuiltin(fm)
   local bDAE = BDAECreate.lower(preprocessedFM)
-  @BACKEND_LOGGING debugWrite("initialBDAE.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
-  #= Expand arrays =#
-  # Removed this pass since this can now
-  #(bDAE, expandedVars) = Causalize.expandArrayVariables(bDAE)
-  #= Transform if expressions to if equations =#
-  bDAE = Causalize.detectIfExpressions(bDAE)
+  @BACKEND_LOGGING debugWrite("initialBDAE.log", BDAEUtil.stringHeading1(bDAE, "initial BDAE"))
+  #= Dump the actual DAE.Exp structure to a file for analysis =#
+  @BACKEND_LOGGING begin
+    open("bdae_structure_dump.log", "w") do io
+      println(io, "=== BDAE Expression Structure Dump ===")
+      for (i, eq) in enumerate(first(bDAE.eqs).orderedEqs)
+        if i <= 20  # Dump first 20 equations
+          println(io, "\n--- Equation $i: $(typeof(eq)) ---")
+          dump(io, eq; maxdepth=10)
+        end
+      end
+      println(io, "\n=== First 10 Variables ===")
+      for (i, v) in enumerate(first(bDAE.eqs).orderedVars)
+        if i <= 10
+          println(io, "\n--- Variable $i ---")
+          dump(io, v; maxdepth=8)
+        end
+      end
+    end
+  end
+  #= Transform ASUB expressions: der(array)[i] to der(array[i]) =#
+  bDAE = Causalize.transformASUBExpressions(bDAE)
   #= Mark state variables =#
   bDAE = Causalize.detectStates(bDAE)
+  @BACKEND_LOGGING debugWrite("afterDetectStates.log", BDAEUtil.stringHeading1(bDAE, "after detect states"))
+    
+  @BACKEND_LOGGING debugWrite("afterASUBTransform.log", BDAEUtil.stringHeading1(bDAE, "after ASUB transformation"))
+  #= Flatten CREF_QUAL with subscripted array finals to match hash table entries =#
+  bDAE = Causalize.flattenArrayCrefs(bDAE)
+  @BACKEND_LOGGING debugWrite("afterFlattenCrefs.log", BDAEUtil.stringHeading1(bDAE, "after CREF flattening"))
+  #= Transform if expressions to if equations =#
+  bDAE = Causalize.detectIfExpressions(bDAE)
+  @BACKEND_LOGGING debugWrite("afterIfExpressions.log", BDAEUtil.stringHeading1(bDAE, "after if expressions"))
+  #= Expand COMPLEX_EQUATIONs into scalar equations =#
+  bDAE = Causalize.expandComplexEquations(bDAE)
+  @BACKEND_LOGGING debugWrite("afterExpandComplex.log", BDAEUtil.stringHeading1(bDAE, "after complex equation expansion"))
   bDAE = Causalize.residualizeEveryEquation(bDAE)
-  #= Convert equations to residual form =#
-  @BACKEND_LOGGING debugWrite("residualTransformationAllParamsAndConstants.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
+  @BACKEND_LOGGING debugWrite("afterResidualize.log", BDAEUtil.stringHeading1(bDAE, "after residualize"))
   #=
     Remove unused parameters and or constants.
     Important optimization for some systems.

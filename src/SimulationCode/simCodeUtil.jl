@@ -219,6 +219,7 @@ function createIndices(simulationVars::Vector{SimulationCode.SIMVAR})::OrderedDi
   local discretes = SimulationCode.SIMVAR[]
   local occVariables = SimulationCode.SIMVAR[]
   local complexVariables = SimulationCode.SIMVAR[]
+  local arrayParameters = SimulationCode.SIMVAR[]
   local numberOfStates = 0
   for var in simulationVars
     @match var.varKind begin
@@ -245,8 +246,22 @@ function createIndices(simulationVars::Vector{SimulationCode.SIMVAR})::OrderedDi
         parameterCounter += 1
         push!(ht, var.name => (parameterCounter, var))
       end
+      SimulationCode.STRING(__) => begin
+        #parameterCounter += 1
+        push!(discretes, var)
+      end
+      SimulationCode.ARRAY_PARAMETER(__) => begin
+        push!(arrayParameters, var)
+      end
       _ => continue
     end
+  end
+  #= Assign indices to array parameters =#
+  local arrayParamCounter = parameterCounter
+  for var in arrayParameters
+    arrayParamCounter += 1
+    @assign var.index = SOME(arrayParamCounter)
+    push!(ht, var.name => (arrayParamCounter, var))
   end
   local discreteCounter = stateCounter
   for var in discretes
@@ -267,6 +282,12 @@ function createIndices(simulationVars::Vector{SimulationCode.SIMVAR})::OrderedDi
         algSortingIdx += 1
         @assign var.index = SOME(algIndexCounter)
         @assign var.varKind = ALG_VARIABLE(algSortingIdx)
+        push!(ht, var.name => (var.index.data, var))
+      end
+      SimulationCode.ARRAY(__) => begin
+        algIndexCounter += 1
+        algSortingIdx += 1
+        @assign var.index = SOME(algIndexCounter)
         push!(ht, var.name => (var.index.data, var))
       end
       _ => continue
@@ -412,8 +433,15 @@ This function returns the indices of these variables.
 function getIndiciesOfVariables(variables,
                                 stringToSimVarHT::OrderedDict{String, Tuple{Integer, SimVar}})
   local indicies = Int[]
+  global STRING_HT = stringToSimVarHT
   for v in variables
-    idx, var  = stringToSimVarHT[string(v)]
+    local varName = DAE_identifierToString(v)
+    if !haskey(stringToSimVarHT, varName)
+      #= TODO: Properly handle record fields and certain parameters. =#
+      @info "Variable not in hash table, skipping: $varName"
+      continue
+    end
+    idx, var = stringToSimVarHT[varName]
     if isAlgebraic(var)
       #= Algebraic variables use a special idx for backend sorting purposes. =#
       push!(indicies, var.varKind.sortIdx)
@@ -586,10 +614,9 @@ function getIrreductableVars(ifEquations::Vector{BDAE.IF_EQUATION},
     Parameters should not be marked as irreductable
     Remove them from the list
   =#
-
   local knownIrreductables::Vector{BDAE.VAR} = filter((v) -> BDAEUtil.isState(v) , algebraicAndStateVariables)
   #@info "Adding all states as irreductable variables" map(x->string(x.varName), knownIrreductables)
-  push!(irreductables, map(x->string(x.varName), knownIrreductables))
+  push!(irreductables, map(x->BDAE_identifierToVarString(x), knownIrreductables))
   irreductables = collect(Iterators.flatten(irreductables))
   irreductables = filter(irv -> !(irv != "time" && isParameter(last(ht[irv]))), irreductables)
   #TODO: Fix the dection, s.t variables critical to when equations are not removed

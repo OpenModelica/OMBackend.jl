@@ -77,7 +77,7 @@ using DataStructures
     Original code by Chris R. Expanded to fix terms of type X * D(Y).
     The solution to solve it is not pretty and is probably flaky.
   #istree returns true if x is a term. If true, operation, arguments must also be defined for x appropriately.
-  """
+"""
 function move_diffs(eq::Equation; rewrite)
   # Do not modify `D(x) ~ ...`, already correct
   res =
@@ -124,13 +124,14 @@ end
     Rewrite equations that do not conform to the requirements of MTK.
   Since MTK currently requires the derivative to be at the lhs.
   """
-function rewriteEquations(edeqs, iv, eVars, ePars, simCode)
+function rewriteEquations(edeqs, iv, eVars, ePars, simCode; arrayParameterExprs::Vector{Expr} = Expr[])
   #println("Recived #edeqs")
   #println(length(edeqs))
   #= TODO: Try to move der to the top level to avoid eval here. =#
   local der = ModelingToolkit.Differential(t)
   #= Remove the t's =#
-  eVars = [Symbol(replace(string(i), "(t)" => "")) for i in eVars]
+  @info eVars
+  eVars = [Symbol(replace(string(v), "(t)" => "")) for v in eVars]
   #Temporary fix for the ESCIMO climate model: eVars = vcat(eVars, [Symbol("combi_Population_Lookup_bn_y")])
   #=
   TODO: This should ideally be done without using eval.
@@ -147,6 +148,10 @@ function rewriteEquations(edeqs, iv, eVars, ePars, simCode)
   #= Make the derivative symbol known =#
   eval(preEval)
   eval(:(der = ModelingToolkit.Differential(t)))
+  #= Make array parameters available as concrete Julia arrays =#
+  for ap in arrayParameterExprs
+    eval(ap)
+  end
   #= Make the external runtime available if it is used. =#
   if simCode.externalRuntime
     eval(generateExternalRuntimeImport(simCode))
@@ -161,7 +166,7 @@ function rewriteEquations(edeqs, iv, eVars, ePars, simCode)
   end
   #==#
   local deqs = evalEDeqs(edeqs)
-  @BACKEND_LOGGING write("MTK_REWRITE.log", debugRewrite(deqs, iv, vars, parameters; separator="\n"))
+  write("MTK_REWRITE.log", debugRewrite(deqs, iv, vars, parameters; separator="\n"))
   #= Rewrite equations =#
   D = Differential(iv)
   local r1 = SymbolicUtils.@rule ~~a * D(~~b) * ~~c => 0
@@ -203,7 +208,7 @@ end
     This routine is way way to slow currently...
   """
 function evalEDeqs(edeqs)
-  #writeEqsToFile(edeqs, "beforeEqRewrite.log")
+  writeEqsToFile(edeqs, "beforeEqRewrite.log")
   local deqs = []
   for e in edeqs
     try
@@ -224,12 +229,13 @@ function evalEDeqs(edeqs)
         push!(deqs, estrExp2)
       end
     catch ex
+      global TEST = e
       #Hack
       local unSimplifiedString = string(e)
       unSimplifiedString = replace(unSimplifiedString, "&&" => "&")
       unSimplifiedString = replace(unSimplifiedString, r"\bbegin\b" => "(")
       unSimplifiedString = replace(unSimplifiedString, r"\bend\b" => ")")
-      #println(unSimplifiedString)
+      println(unSimplifiedString)
       estrExp = Meta.parse(unSimplifiedString)
       estrExp2 = eval(estrExp)
       estrExp2LHS = estrExp2.lhs
@@ -261,6 +267,8 @@ end
 
 rewriteEq(eq) = begin
   local eqStr = string(eq)
+  #= Remove typed array constructors - they cause conversion errors at runtime =#
+  eqStr = replace(eqStr, r"SymbolicUtils\.BasicSymbolic\{Real\}\[" => "[")
   res = Meta.parse(replace(eqStr, "Differential(t)" => "D"))
   res
 end

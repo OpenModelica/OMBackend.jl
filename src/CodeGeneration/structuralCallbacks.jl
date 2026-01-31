@@ -150,10 +150,11 @@ function createStructuralCallback(simCode,
       $(whenOperators...)
       @info("Structural callback triggered at $(integrator.t)")
       @info("tprev at $(integrator.tprev)")
+      @info("integrator.u: $(integrator.u)")
       structuralChange.structureChanged = true
       integrator.just_hit_tstop = true
       structuralChange.timeAtChange = integrator.t
-      structuralChange.solutionAtChange = integrator.sol
+      structuralChange.solutionAtChange = deepcopy(integrator.sol)
       terminate!(integrator, ReturnCode.Success)
     end
   end

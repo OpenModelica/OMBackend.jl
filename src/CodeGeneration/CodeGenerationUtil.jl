@@ -308,7 +308,7 @@ function expToJL(exp::DAE.Exp, simCode::SimulationCode.SIM_CODE; varPrefix="x"):
           TODO: Keeping it simple for now, we assume we only have one argument in the call
           We handle derivitives seperatly
         =#
-        varName = SimulationCode.string(listHead(expl))
+        varName = SimulationCode.DAE_identifierToString(listHead(expl))
         (index, type) = hashTable[varName]
         @match tmpStr begin
         "der" => "dx[$index]  #= der($varName) =#"
@@ -373,7 +373,7 @@ function DAE_OP_toJuliaOperator(@nospecialize(op::DAE.Operator))
       DAE.LESSEQ() => :(<=)
       DAE.GREATER() => :(>)
       DAE.GREATEREQ() => :(>=)
-      DAE.EQUAL() => :(=)
+      DAE.EQUAL() => :(==)
       DAE.NEQUAL() => :(!=)
       DAE.USERDEFINED() => throw("Unknown operator: Userdefined")
       _ => throw("Unknown operator")
@@ -388,14 +388,14 @@ end
 function DAECallExpressionToJuliaCallExpression(pathStr::String, expLst::List, simCode, ht; varPrefix=varPrefix)::Expr
   @match pathStr begin
     "der" => begin
-      varName = SimulationCode.string(listHead(expLst))
+      varName = SimulationCode.DAE_identifierToString(listHead(expLst))
       (index, _) = ht[varName]
       quote
         dx[$(index)] #= der($varName) =#
       end
     end
     "pre" => begin
-      varName = SimulationCode.string(listHead(expLst))
+      varName = SimulationCode.DAE_identifierToString(listHead(expLst))
       (index, _) = ht[varName]
       indexForVar = ht[varName][1]
       quote
@@ -435,7 +435,7 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
                                               simCode::SimulationCode.SimCode, ht; varPrefix=varPrefix, varSuffix = varSuffix, derAsSymbol=false)::Expr
   @match pathStr begin
     "der" => begin
-      varName = SimulationCode.string(listHead(expLst))
+      varName = SimulationCode.DAE_identifierToString(listHead(expLst))
       if derAsSymbol
         quote
           $(Symbol("der_$(varName)"))
@@ -447,7 +447,7 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
       end
     end
     "pre" => begin
-      varName = SimulationCode.string(listHead(expLst))
+      varName = SimulationCode.DAE_identifierToString(listHead(expLst))
       quote
         $(Symbol(varName))
       end
@@ -654,56 +654,190 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         expr
       end
       #=
-      This is an array acess. Note the difference to the case above,
+      This is an array access. Note the difference to the case above,
       that is a component of type array.
-      In the case above we do not lookup the subscript wheras here it is subscripted.
+      In the case above we do not lookup the subscript whereas here it is subscripted.
       =#
       DAE.CREF(DAE.CREF_IDENT(ident, identType, subscriptLst), _) where !isempty(subscriptLst) => begin
         local varName = SimulationCode.string(ident)
-        local lookUpStr = ""
-        for s in subscriptLst
-          @match DAE.INDEX(DAE.ICONST(i)) = s
-          lookUpStr *= string("[", i, "]")
-        end
-        indexAndVar = hashTable[string(varName, lookUpStr)]
-        quote
-          $(LineNumberNode(@__LINE__, "$varName array"))
-          $(Symbol(indexAndVar[2].name))
+        #= First try to handle as subscripted array with binding expression =#
+        local cref = DAE.CREF_IDENT(ident, identType, subscriptLst)
+        (success, arrayExpr) = tryHandleSubscriptedArrayCref(cref, hashTable, simCode,
+          varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+        if success
+          arrayExpr
+        else
+          #= Fallback: look up expanded variable name or generate runtime subscript =#
+          local allConstant = true
+          local lookUpStr = ""
+          for s in subscriptLst
+            @match s begin
+              DAE.INDEX(DAE.ICONST(i)) => begin
+                lookUpStr *= string("[", i, "]")
+              end
+              _ => begin
+                allConstant = false
+              end
+            end
+          end
+          if allConstant
+            indexAndVar = hashTable[string(varName, lookUpStr)]
+            quote
+              $(LineNumberNode(@__LINE__, "$varName array"))
+              $(Symbol(indexAndVar[2].name))
+            end
+          else
+            #= Variable subscripts: generate runtime indexing =#
+            local subExprs = map(subscriptLst) do sub
+              @match sub begin
+                DAE.INDEX(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+                DAE.WHOLEDIM(__) => :(:)
+                _ => throw("Unsupported subscript: $sub")
+              end
+            end
+            local baseSymbol = Symbol(varPrefix, varName, varSuffix)
+            Expr(:ref, baseSymbol, subExprs...)
+          end
         end
       end
+      #=
+      Note in some cases we still retain information that something is a part of a complex component.
+      In this case we reference a component that in turn is a part of a record.
+      =#
+      DAE.CREF(DAE.CREF_QUAL(componentRef = componentRef,
+                             ident = ident,
+                             subscriptLst = subscriptLst,
+                             identType = identType), ty) where {
+                                 FrontendUtil.Util.finalCrefIsArray(componentRef)
+                             } =>
+      begin
+        #= Debug: log entry to CREF_QUAL pattern =#
+        open("/home/johti17/Projects/Julia/OM.jl/test/cref_qual_debug.log", "a") do io
+          println(io, "=== ENTERED CREF_QUAL pattern ===")
+          println(io, "ident: $ident")
+          println(io, "componentRef dump:")
+          dump(io, componentRef; maxdepth=4)
+        end
+        local cr = DAE.CREF_QUAL(ident, identType, subscriptLst, componentRef)
+        varName = SimulationCode.DAE_identifierToString(cr)
+        #= Workaround =#
+        local fcr = FrontendUtil.Util.getFinalCref(componentRef)
+        local fcrs = FrontendUtil.Util.getAllCrefsAsVector(cr)
+        local subscripts = fcr.subscriptLst
+        @assign fcr.subscriptLst = MetaModelica.nil
+        local lookupStrPrefix = reduce((x,y) -> string(x, "_", y), map(string, fcrs[1:end-1]))
+        local lookupStr = string(lookupStrPrefix, "_", SimulationCode.DAE_identifierToString(fcr))
+
+        if !haskey(hashTable, lookupStr)
+          #= Debug: dump to log file =#
+          open("/home/johti17/Projects/Julia/OM.jl/test/cref_qual_debug.log", "a") do io
+            println(io, "=== CREF_QUAL path - NOT IN HASH TABLE ===")
+            println(io, "lookupStr: $lookupStr")
+            println(io, "exp dump:")
+            dump(io, exp; maxdepth=5)
+            println(io, "---")
+          end
+          global PROBLEM_CREF = exp
+          global PROBLEM_SUBSCRIPTS = subscripts
+          local ss = Meta.parse(string(subscripts))
+          quote
+            $(LineNumberNode(@__LINE__, "Array access to missing var: $lookupStr"))
+            getIndex($(Symbol(string(varPrefix, lookupStr, varSuffix))), $(ss))
+          end
+        else
+          local indexAndVar = hashTable[lookupStr]
+          local varKind = indexAndVar[2].varKind
+          @match varKind begin
+            (SimulationCode.ARRAY(_, SOME(bindArray && DAE.ARRAY(__))) ||
+             SimulationCode.ARRAY_PARAMETER(_, SOME(bindArray && DAE.ARRAY(__)))) => begin
+              local subIndices = Int[]
+              local allConstant = true
+              for sub in subscripts
+                @match sub begin
+                  DAE.INDEX(DAE.ICONST(i)) => push!(subIndices, i)
+                  _ => begin allConstant = false; break end
+                end
+              end
+              if allConstant && !isempty(subIndices)
+                #= Evaluate binding expression at compile time =#
+                local element = if length(subIndices) == 1
+                  listGet(bindArray.array, first(subIndices))
+                else
+                  local current = bindArray
+                  for idx in subIndices
+                    @match DAE.ARRAY(__) = current
+                    current = listGet(current.array, idx)
+                  end
+                  current
+                end
+                return expToJuliaExpMTK(element, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+              end
+            end
+            _ => ()
+          end
+          #= Fallback: generate getIndex call =#
+          local vRef = string(varPrefix, indexAndVar[2].name, varSuffix)
+          local ss = Meta.parse(string(subscripts))
+          quote
+            $(LineNumberNode(@__LINE__, "Array access to: $vRef"))
+            getIndex($(Symbol(vRef)), $(ss))
+          end
+        end
+      end
+
       DAE.CREF(cr, _)  => begin
-        varName = SimulationCode.string(cr)
-        indexAndVar = hashTable[varName]
-        varKind::SimulationCode.SimVarType = indexAndVar[2].varKind
-        @match varKind begin
-          SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
-          SimulationCode.STATE(__) => quote
-            $(LineNumberNode(@__LINE__, "$varName state"))
-            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
+        varName = SimulationCode.DAE_identifierToString(cr)
+        global TESTEXP = exp
+        if !haskey(hashTable, varName)
+          #= Try to handle as subscripted array access (e.g., R_w[1] where R_w is an ARRAY) =#
+          (success, arrayExpr) = tryHandleSubscriptedArrayCref(cr, hashTable, simCode,
+            varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+          if success
+            arrayExpr
+          else
+            @info "Variable not in hash table, using direct reference: $varName"
+            quote
+              $(LineNumberNode(@__LINE__, "$varName, missing from hash table"))
+              $(Symbol(string(varPrefix, varName, varSuffix)))
+            end
           end
-          SimulationCode.PARAMETER(__) => quote
-            $(LineNumberNode(@__LINE__, "$varName parameter"))
-            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-          end
-          SimulationCode.ALG_VARIABLE(__) => quote
-            $(LineNumberNode(@__LINE__, "$varName, algebraic"))
-            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-          end
-          SimulationCode.DISCRETE(__) => quote
-            $(LineNumberNode(@__LINE__, "$varName, discrete"))
-            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-          end
-          SimulationCode.OCC_VARIABLE(__) => quote
-            $(LineNumberNode(@__LINE__, "$varName, occ variable"))
-            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-          end
-          SimulationCode.DATA_STRUCTURE(__) => quote
-            $(LineNumberNode(@__LINE__, "$varName, datastructure variable"))
-            $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-          end
-          _ => begin
-            @error "Unsupported varKind: $(varKind)"
-            fail()
+        else
+          indexAndVar = hashTable[varName]
+          varKind::SimulationCode.SimVarType = indexAndVar[2].varKind
+          @match varKind begin
+            SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
+            SimulationCode.STATE(__) => quote
+              $(LineNumberNode(@__LINE__, "$varName state"))
+              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
+            end
+            SimulationCode.PARAMETER(__) => quote
+              $(LineNumberNode(@__LINE__, "$varName parameter"))
+              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
+            end
+            SimulationCode.ALG_VARIABLE(__) => quote
+              $(LineNumberNode(@__LINE__, "$varName, algebraic"))
+              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
+            end
+            SimulationCode.DISCRETE(__) => quote
+              $(LineNumberNode(@__LINE__, "$varName, discrete"))
+              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
+            end
+            SimulationCode.OCC_VARIABLE(__) => quote
+              $(LineNumberNode(@__LINE__, "$varName, occ variable"))
+              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
+            end
+            SimulationCode.DATA_STRUCTURE(__) => quote
+              $(LineNumberNode(@__LINE__, "$varName, datastructure variable"))
+              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
+            end
+            SimulationCode.STRING(__) => quote
+              $(LineNumberNode(@__LINE__, "$varName, datastructure variable"))
+              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
+            end
+            _ => begin
+              @error "Unsupported varKind: $(varKind)"
+              fail()
+            end
           end
         end
       end
@@ -716,8 +850,14 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
         local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
         local rhs = expToJuliaExpMTK(e2, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        local op = DAE_OP_toJuliaOperator(op)
-        :($op($(lhs), $(rhs)))
+        local opSym = DAE_OP_toJuliaOperator(op)
+        #= Special handling for matrix multiplication - operands may be nested vectors =#
+        @match op begin
+          DAE.MUL_MATRIX_PRODUCT(__) => begin
+            :(OMBackend.CodeGeneration.ensureMatrix($(lhs)) * OMBackend.CodeGeneration.ensureMatrix($(rhs)))
+          end
+          _ => :($opSym($(lhs), $(rhs)))
+        end
       end
       DAE.LUNARY(operator = op, exp = e1)  => begin
         local operand = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
@@ -775,9 +915,18 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         DAECallExpressionToMTKCallExpression(tmpStr, explst, simCode, hashTable; varPrefix=varPrefix, varSuffix = varSuffix, derAsSymbol=derSymbol)
       end
       DAE.CALL(path, expLst) => begin
-        local expr = Expr(:call, Symbol(string(path)))
-        local args = map(expLst) do arg
-          expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix = varSuffix,derSymbol = derSymbol)
+        #= Normalize function name: replace dots with underscores =#
+        local normalizedFuncName = replace(string(path), "." => "_")
+        local expr = Expr(:call, Symbol(normalizedFuncName))
+        local args::Vector{Union{Symbol, Expr}} = Union{Symbol, Expr}[]
+        for arg in expLst
+          #= Check if argument is a record CREF that needs to be flattened =#
+          local flattenedArgs::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
+          if !isempty(flattenedArgs)
+            append!(args, flattenedArgs)
+          else
+            push!(args, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix = varSuffix,derSymbol = derSymbol))
+          end
         end
         expr.args = vcat(expr.args, args)
         expr
@@ -794,11 +943,98 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           $(index)
         end
       end
-      DAE.ARRAY(DAE.T_ARRAY(DAE.T_REAL(Nil(__)), dims), scalar, arr) => begin
+      DAE.ARRAY(DAE.T_ARRAY(DAE.T_REAL(MetaModelica.Nil(__)), dims), scalar, arr) => begin
         handleArrayExp(exp, simCode)
       end
-      DAE.ARRAY(DAE.T_ARRAY(DAE.T_INTEGER(Nil(__)), dims), scalar, arr) => begin
+      DAE.ARRAY(DAE.T_ARRAY(DAE.T_INTEGER(MetaModelica.Nil(__)), dims), scalar, arr) => begin
         handleArrayExp(exp, simCode)
+      end
+      DAE.ARRAY(DAE.T_ARRAY(_, _), _, _) => begin
+        handleArrayExp(exp, simCode)
+      end
+      #= Handle array subscripting: expr[subscripts] =#
+      DAE.ASUB(innerExp, subscripts) => begin
+        local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+        #= Convert subscripts to Julia indices =#
+        local subExprs = map(subscripts) do sub
+          @match sub begin
+            DAE.ICONST(i) => i
+            DAE.INDEX(DAE.ICONST(i)) => i
+            _ => expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+          end
+        end
+        #= For function calls returning arrays, wrap with ensureMatrix for proper 2D indexing =#
+        local needsEnsureMatrix = length(subExprs) > 1 && @match innerExp begin
+          DAE.CALL(__) => true
+          _ => false
+        end
+        if length(subExprs) == 1
+          quote
+            $(innerCode)[$(first(subExprs))]
+          end
+        elseif needsEnsureMatrix
+          quote
+            OMBackend.CodeGeneration.ensureMatrix($(innerCode))[$(subExprs...)]
+          end
+        else
+          quote
+            $(innerCode)[$(subExprs...)]
+          end
+        end
+      end
+      DAE.REDUCTION(reductionInfo, bodyExp, iterators) => begin
+        #= Handle array comprehensions and reductions =#
+        local bodyExpr = expToJuliaExpMTK(bodyExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+        #= Build iterator expressions =#
+        local iterExprs = []
+        for iter in iterators
+          @match iter begin
+            DAE.REDUCTIONITER(id, rangeExp, guardExp, _) => begin
+              local rangeExpr = expToJuliaExpMTK(rangeExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+              push!(iterExprs, Expr(:(=), Symbol(id), rangeExpr))
+            end
+          end
+        end
+        #= Handle different reduction types =#
+        @match reductionInfo.path begin
+          Absyn.IDENT("array") => begin
+            #= Array comprehension: [expr for i in range] =#
+            Expr(:comprehension, bodyExpr, iterExprs...)
+          end
+          Absyn.IDENT("sum") => begin
+            #= Sum reduction: sum(expr for i in range) =#
+            local genExpr = Expr(:generator, bodyExpr, iterExprs...)
+            :(sum($genExpr))
+          end
+          Absyn.IDENT("product") => begin
+            #= Product reduction =#
+            local genExpr = Expr(:generator, bodyExpr, iterExprs...)
+            :(prod($genExpr))
+          end
+          Absyn.IDENT("min") => begin
+            local genExpr = Expr(:generator, bodyExpr, iterExprs...)
+            :(minimum($genExpr))
+          end
+          Absyn.IDENT("max") => begin
+            local genExpr = Expr(:generator, bodyExpr, iterExprs...)
+            :(maximum($genExpr))
+          end
+          _ => begin
+            #= Default: treat as array comprehension =#
+            Expr(:comprehension, bodyExpr, iterExprs...)
+          end
+        end
+      end
+      DAE.RANGE(ty, startExp, stepExpOpt, stopExp) => begin
+        #= Range expression: start:stop or start:step:stop =#
+        local startExpr = expToJuliaExpMTK(startExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+        local stopExpr = expToJuliaExpMTK(stopExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+        if stepExpOpt === nothing
+          :($startExpr:$stopExpr)
+        else
+          local stepExpr = expToJuliaExpMTK(stepExpOpt, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+          :($startExpr:$stepExpr:$stopExpr)
+        end
       end
     _ =>  throw(ErrorException("$exp not yet supported"))
     end
@@ -807,27 +1043,121 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
 end
 
 """
+  Try to handle a CREF that references a subscripted array parameter.
+  Returns (success::Bool, expr::Expr).
+  If the base array has a binding expression and subscripts are constant,
+  evaluates at compile time. Otherwise generates symbol reference.
+"""
+function tryHandleSubscriptedArrayCref(cr::DAE.ComponentRef, hashTable, simCode;
+                                        varPrefix="", varSuffix="", derSymbol=false)
+  local subscripts = FrontendUtil.Util.getSubscriptsFromCref(cr)
+  local baseName = FrontendUtil.Util.getBaseNameWithoutSubscripts(cr)
+
+  if isempty(subscripts) || !haskey(hashTable, baseName)
+    return (false, :())
+  end
+
+  local baseVar = hashTable[baseName]
+  if !(baseVar[2].varKind isa SimulationCode.ARRAY || baseVar[2].varKind isa SimulationCode.ARRAY_PARAMETER)
+    return (false, :())
+  end
+
+  local arrayKind = baseVar[2].varKind
+  local subExprs = map(subscripts) do sub
+    @match sub begin
+      DAE.INDEX(DAE.ICONST(i)) => i
+      DAE.ICONST(i) => i
+      _ => expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+    end
+  end
+
+  #= Check if we have a binding expression and all subscripts are constant integers =#
+  local allConstantSubscripts = all(s -> s isa Integer, subExprs)
+
+  if allConstantSubscripts
+    @match arrayKind begin
+      (SimulationCode.ARRAY(_, SOME(bindArray && DAE.ARRAY(__))) ||
+       SimulationCode.ARRAY_PARAMETER(_, SOME(bindArray && DAE.ARRAY(__)))) => begin
+        #= Extract element from the binding expression =#
+        local element = if length(subExprs) == 1
+          listGet(bindArray.array, first(subExprs))
+        else
+          #= Multi-dimensional array: navigate nested structure =#
+          local current = bindArray
+          for idx in subExprs
+            @match DAE.ARRAY(__) = current
+            current = listGet(current.array, idx)
+          end
+          current
+        end
+        #= Convert the extracted element to a Julia expression =#
+        local constExpr = expToJuliaExpMTK(element, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+        return (true, constExpr)
+      end
+      _ => () #= Fall through to generate symbol reference =#
+    end
+  end
+
+  #= Fallback: generate symbol reference for dynamic access =#
+  local expr = if length(subExprs) == 1
+    quote
+      $(LineNumberNode(@__LINE__, "Array subscript: $baseName"))
+      $(Symbol(string(varPrefix, baseName, varSuffix)))[$(first(subExprs))]
+    end
+  else
+    quote
+      $(LineNumberNode(@__LINE__, "Array subscript: $baseName"))
+      $(Symbol(string(varPrefix, baseName, varSuffix)))[$(subExprs...)]
+    end
+  end
+
+  return (true, expr)
+end
+
+"""
   Generate code for array expressions.
-This assumes scalarization have been sucessful and that this function does not contain anycrefs
+  For arrays with constants, evaluates at codegen time.
+  For arrays with CREFs (variable references), generates code with symbolic expressions.
 """
 function handleArrayExp(exp::DAE.ARRAY, simCode)
-  local arrJL = [] #Type yet unknown
   local steps = listHead(exp.ty.dims)
   local dimSize = length(exp.ty.dims)
   @assert(steps isa DAE.DIM_INTEGER, "Only integer dimensions are currently supported. Type was : $(typeof(steps))")
   steps = steps.integer
-  for i in 1:steps
-    push!(arrJL, eval(expToJuliaExpMTK(listGet(exp.array, i), simCode)))
+  #= Determine element type from DAE type =#
+  local elemType = @match exp.ty begin
+    DAE.T_ARRAY(ty = DAE.T_REAL(__)) => Float64
+    DAE.T_ARRAY(ty = DAE.T_INTEGER(__)) => Int
+    _ => Float64  #= Default to Float64 =#
   end
-  #= Assuming it does not contains crefs =#
-  if dimSize >= 2
-    arr = transpose(stack(eval(arrJL)))
-    quote
-      $(arr)
+  #= Check if all elements are constant (no variable references) at the DAE level =#
+  local canEval = all(FrontendUtil.Util.isConstantExp, exp.array)
+  #= Generate expressions for each element =#
+  local elemExprs = [expToJuliaExpMTK(listGet(exp.array, i), simCode) for i in 1:steps]
+  local arrJL = canEval ? [eval(expr) for expr in elemExprs] : []
+  if canEval
+    #= All elements are constants, return pre-computed array =#
+    if dimSize >= 2
+      arr = Matrix(transpose(stack(arrJL)))
+      quote
+        $(arr)
+      end
+    else
+      quote
+        $[arrJL...]
+      end
     end
   else
-    quote
-      $[arrJL...]
+    #= Contains CREFs, generate array with symbolic element expressions =#
+    if dimSize >= 2
+      #= For 2D arrays, convert nested vectors to proper matrix at runtime =#
+      quote
+        Matrix(transpose(stack([$(elemExprs...)])))
+      end
+    else
+      quote
+        [$(elemExprs...)]
+      end
     end
   end
 end
@@ -1077,6 +1407,18 @@ function generateCastExpressionMTK(@nospecialize(ty::DAE.Type), @nospecialize(ex
         float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,)))
       end
     end
+    #= Conversion of array to real array (broadcast float) =#
+    (DAE.T_ARRAY(DAE.T_REAL(__), _), _) => begin
+      quote
+        float.($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,)))
+      end
+    end
+    #= Conversion to integer array =#
+    (DAE.T_ARRAY(DAE.T_INTEGER(__), _), _) => begin
+      quote
+        Int.(round.($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,))))
+      end
+    end
     _ => throw("Cast $ty: for exp: $exp not yet supported in codegen!")
   end
   return expr
@@ -1185,3 +1527,48 @@ function replaceVars(expr::Expr; kwargs...)
        map((x) -> replaceVars(x; kwargs...), expr.args)...)
 end
 replaceVars(x; kwargs...) = x
+
+
+"""
+  Utility function to check if a given expression contains a specific datatype.
+"""
+function exprContainsDatatype(ex, datatype)
+  if ex isa Symbol
+    return false
+  elseif ex isa datatype
+    return true
+  elseif ex isa Expr
+    return any(arg -> exprContainsDatatype(arg, datatype), ex.args)
+  else
+    return false
+  end
+end
+
+"""
+  Flatten a record argument in a function call into its constituent fields.
+  Returns a vector of Symbols for the flattened fields, or empty vector if not a record.
+"""
+function flattenRecordCallArg(arg::DAE.Exp, simCode, hashTable; varPrefix::String="", varSuffix::String="")::Vector{Symbol}
+  @match arg begin
+    DAE.CREF(cr, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => begin
+      local baseName::String = replace(SimulationCode.string(cr), "." => "_")
+      local flattenedExprs::Vector{Symbol} = Symbol[]
+      for field in varLst
+        @match field begin
+          DAE.TYPES_VAR(fieldName, _, _, _, _) => begin
+            local flatName::String = baseName * "_" * fieldName
+            #= Check if the flattened variable exists in the hash table =#
+            if haskey(hashTable, flatName)
+              push!(flattenedExprs, Symbol(varPrefix * flatName * varSuffix))
+            else
+              push!(flattenedExprs, Symbol(flatName))
+            end
+          end
+          _ => nothing
+        end
+      end
+      return flattenedExprs
+    end
+    _ => return Symbol[]
+  end
+end

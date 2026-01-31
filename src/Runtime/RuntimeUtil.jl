@@ -3,6 +3,7 @@ module RuntimeUtil
 import Absyn
 import DifferentialEquations
 import DifferentialEquations.ReturnCode
+import DAE
 import ListUtil
 import ModelingToolkit
 import OMBackend
@@ -139,7 +140,7 @@ createNewU0(symsOfOldProblem::Vector{Symbol},
                      symsOfNewProblem::Vector{Symbol},
                      newHT,
                      initialValues,
-                     integrator,
+                     uVec,
                      specialCase)
 ```
   This function maps variables between two models during a structural change with recompilation.
@@ -156,7 +157,7 @@ For now we return the array for the special case with dynamic overconstrained co
 function createNewU0(symsOfOldProblem::Vector{Symbol},
                      symsOfNewProblem::Vector{Symbol},
                      initialValues,
-                     integrator,
+                     uVec,
                      specialCase)
   #=TODO: It was assumed to only be real variable not discretes, which might have other indices? =#
   # @info "Status length of both problems" begin
@@ -166,14 +167,13 @@ function createNewU0(symsOfOldProblem::Vector{Symbol},
   #   "New Problem" symsOfNewProblem
   # end
   local newU0 = Float64[last(initialValues[idx]) for idx in 1:length(symsOfNewProblem)]
-
   local variableNamesOldProblem = RuntimeUtil.convertSymbolsToStrings(symsOfOldProblem)
   local variableNamesNewProblem = RuntimeUtil.convertSymbolsToStrings(symsOfNewProblem)
   #@info "variableNamesOldProblem" variableNamesOldProblem
   #@info "variableNamesNewProblem" variableNamesNewProblem
   #= In the special case all the indices are the same as they where before the transformation. =#
   if  specialCase
-    return integrator.u
+    return uVec
   end
   #= _Remove the prefixes of the variable names <prefix>_<suffix> => <suffix> =#
   local variableNamesWithoutPrefixesOP = String[replace(k, r".*_" => "")
@@ -203,7 +203,7 @@ function createNewU0(symsOfOldProblem::Vector{Symbol},
       @assert(length(indices) == 1,
               "Zero or more than one variable with that name. Size of indices was $(length(indices)). Name was $(v)")
       local idxNewVar = first(indices)
-      newU0[idxNewVar] = integrator.u[idxOldVar]
+      newU0[idxNewVar] = uVec[idxOldVar]
     end
   end
   return newU0
@@ -551,22 +551,97 @@ end
 
 """
 ```
-isReturnCodeSuccess(integrator::OrdinaryDiffEq.ODEIntegrator)
+isReturnCodeSuccess(integrator)
 ```
 Returns true if the current return code of the supplied integrator argument is `Success`.
 """
-function isReturnCodeSuccess(integrator::DifferentialEquations.OrdinaryDiffEq.ODEIntegrator)
+function isReturnCodeSuccess(integrator)
   integrator.sol.retcode == ReturnCode.Success
 end
 
 """
 ```
-isReturnCodeDefault(integrator::DifferentialEquations.OrdinaryDiffEq.ODEIntegrator)
+isReturnCodeDefault(integrator)
 ```
 Returns true if the current return code of the supplied integrator argument is `Default`.
 """
-function isReturnCodeDefault(integrator::DifferentialEquations.OrdinaryDiffEq.ODEIntegrator)
+function isReturnCodeDefault(integrator)
   integrator.sol.retcode == ReturnCode.Default
+end
+
+function getObserved(integrator)
+  local observedSyms = ModelingToolkit.SymbolicUtils.BasicSymbolic{Real}[
+    oEq.lhs for oEq in ModelingToolkit.observed(integrator.f.sys)]
+end
+
+function getUnknowns(integrator)
+  return ModelingToolkit.SymbolicUtils.BasicSymbolic{Real}[
+    u for u in ModelingToolkit.unknowns(integrator.f.sys)]
+end
+
+function getObservedAsStrings(integrator)
+  local oStrs = String[string(o.f.name) for o in getObserved(integrator)]
+end
+
+function getUnknownsAsStrings(integrator)
+  local oStrs = String[string(o.f.name) for o in getUnknowns(integrator)]
+end
+
+function getUnknownsAsStringsNoPrefix(integrator)
+  local oStrs = String[join(split(string(o.f.name), "_")[2:end], "_") for o in getUnknowns(integrator)]
+end
+
+function getObservedAsStringsNoPrefix(integrator)
+  local oStrs = String[join(split(string(o.f.name), "_")[2:end], "_") for o in getObserved(integrator)]
+end
+
+function createLookupTableForObserved(integrator)
+  local strs = getObservedAsStringsNoPrefix(integrator)
+  local vals = getValuesForObserved(integrator)
+  return Dict(strs .=> vals)
+end
+
+function createLookupTable(integrator)
+  local strs = vcat(getUnknownsAsStringsNoPrefix(integrator),getObservedAsStringsNoPrefix(integrator))
+  local vals = vcat(getValuesForObserved(integrator), getValuesForUnknowns(integrator))
+  return Dict(strs .=> vals)
+end
+
+function getPrefix(integrator)
+  local u = first(ModelingToolkit.unknowns(integrator.f.sys))
+  return first(split(string(u.f.name), "_"))
+end
+
+function getValuesForObserved(integrator)
+  local observedSyms = ModelingToolkit.SymbolicUtils.BasicSymbolic{Real}[
+      oEq.lhs for oEq in ModelingToolkit.observed(integrator.f.sys)]
+  local vals::Vector{Float64} = Float64[last(integrator.sol[os]) for os in observedSyms]
+  return vals
+end
+
+function getValuesForUnknowns(integrator)
+  local uSyms = ModelingToolkit.SymbolicUtils.BasicSymbolic{Real}[
+    uEq for uEq in ModelingToolkit.unknowns(integrator.f.sys)]
+  local vals::Vector{Float64} = Float64[last(integrator.sol[u]) for u in uSyms]
+  return vals
+end
+
+"""
+updateObservedVariables in the simCode
+"""
+function updateInitialConditions!(simCode, integrator)
+  LT = createLookupTable(integrator)
+  local vNSys = String[join(split(vs, "_")[2:end], "_") for (i, vs) in enumerate(keys(simCode.stringToSimVarHT))]
+  indices = indexin(keys(LT), vNSys)
+  local simCode_LT = simCode.stringToSimVarHT
+  for (i, name) in enumerate(keys(LT))
+    local indexInNewSys = indices[i]
+    if indexInNewSys !== nothing
+      (idx, vToChange) = simCode_LT.vals[indexInNewSys]
+      vToChange = @assign vToChange.attributes = SOME(DAE.makeRealAttribute(;start=LT[name], fixed=true))
+      simCode_LT.vals[indexInNewSys] = (idx, vToChange)
+    end
+  end
 end
 
 end #= module =#

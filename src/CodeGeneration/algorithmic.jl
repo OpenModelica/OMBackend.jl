@@ -3,13 +3,44 @@ Code generation for algorithmic Modelica.
 author:johti17
 =#
 
+#= Check if a DAE.VAR is a multi-dimensional array (2+ dimensions). =#
+#= Dimensions may be in v.ty (T_ARRAY) or in v.dims field. =#
+function isMultiDimArray(v::DAE.VAR)::Bool
+  #= First check if ty is T_ARRAY with 2+ dims =#
+  tyHasMultiDims = @match v.ty begin
+    DAE.T_ARRAY(dims = dims) => length(dims) >= 2
+    _ => false
+  end
+  if tyHasMultiDims
+    return true
+  end
+  #= Also check v.dims field (used for function parameters) =#
+  try
+    dimCount = 0
+    for _ in v.dims
+      dimCount += 1
+    end
+    return dimCount >= 2
+  catch
+    return false
+  end
+end
+
+#= Generate ensureArray conversion statements for multi-dimensional array parameters. =#
+function generateArrayConversions(inputs::Vector)::Vector{Expr}
+  conversions = Expr[]
+  for v in inputs
+    if isMultiDimArray(v)
+      varName = Symbol(string(v.componentRef))
+      push!(conversions, :($varName = OMBackend.CodeGeneration.ensureArray($varName)))
+    end
+  end
+  return conversions
+end
+
 """
-      Generates algorithmic Modelica Code.
-      Returns the generated Julia code + the names of the functions that has been generated.
-TODO:
-  - Solve function arguments in a more elegant way.
-  - Add support for for-loops.
-  - Solve the lowering of external functions without string splitting.
+  Generates algorithmic Modelica Code.
+  Returns the generated Julia code + the names of the functions that has been generated.
 """
 function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::Tuple{Vector{Expr}, Vector{String}}
   local jFuncs = Expr[]
@@ -18,19 +49,24 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
     local inputs = generateIOL(func.inputs)
     local outputs = generateIOL(func.outputs)
     local f
+    #= Normalize function name: replace dots with underscores for valid Julia identifiers =#
+    local normalizedName = replace(func.name, "." => "_")
     inputsJL = if length(inputs) > 1
       tuple(inputs...)
     elseif length(inputs) == 1
       inputs[1]
     else
+      ()  #= Empty tuple for no inputs =#
     end
     @match func begin
       SimulationCode.MODELICA_FUNCTION(__) => begin
         local locals = generateLocals(func.locals)
+        local arrayConversions = generateArrayConversions(func.inputs)
         local statements = generateStatements(func.statements)
         if inputsJL isa Tuple
           f = quote
-            function $(Symbol(func.name))($(inputsJL...))
+            function $(Symbol(normalizedName))($(inputsJL...))
+              $(arrayConversions...)
               $(locals...)
               $(statements...)
               return $(if length(outputs) > 1
@@ -44,7 +80,8 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
           end
         else
           f = quote
-            function $(Symbol(func.name))($(inputsJL))
+            function $(Symbol(normalizedName))($(inputsJL))
+              $(arrayConversions...)
               $(locals...)
               $(statements...)
               return $(if length(outputs) > 1
@@ -63,7 +100,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
           local extCall = Meta.parse(func.libInfo)
           extCall = namespaceifyExternalFunction(extCall)
           f = quote
-            function $(Symbol(func.name))($(inputsJL...))
+            function $(Symbol(normalizedName))($(inputsJL...))
               #= Here a call to the external function should be placed =#
               $(extCall)
               $(if length(outputs) > 1
@@ -79,7 +116,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
           local extCall = Meta.parse(func.libInfo)
           extCall = namespaceifyExternalFunction(extCall)
           f = quote
-            function $(Symbol(func.name))($(inputsJL))
+            function $(Symbol(normalizedName))($(inputsJL))
               #= Here a call to the external function should be placed =#
               $(extCall)
               $(if length(outputs) > 1
@@ -95,33 +132,67 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
       end
     end
     push!(jFuncs, f)
-    push!(names, func.name)
+    push!(names, normalizedName)
   end
   return jFuncs, names
 end
 
-function generateIOL(inputs::Vector)
-  local jInputs = Symbol[]
+function generateIOL(inputs::Vector)::Vector{Symbol}
+  local jInputs::Vector{Symbol} = Symbol[]
   for i in inputs
-    local s = DAE_VAR_ToJulia(i)
-    #= Complex type, prefixed with void* =#
-    push!(jInputs, s)
+    #= Check if this is a record type. If so, flatten into individual field parameters =#
+    local flattenedInputs::Vector{Symbol} = flattenRecordInput(i)
+    if !isempty(flattenedInputs)
+      append!(jInputs, flattenedInputs)
+    else
+      local s = DAE_VAR_ToJulia(i)
+      #= Complex type, prefixed with void* =#
+      push!(jInputs, s)
+    end
   end
   return jInputs
 end
 
 """
+  Check if a DAE.VAR is a record type and flatten it into individual field parameters.
+  Returns a vector of Symbols for the flattened fields, or empty vector if not a record.
+"""
+function flattenRecordInput(v::DAE.VAR)::Vector{Symbol}
+  local baseName::String = string(v.componentRef)
+  @match v.ty begin
+    DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _) => begin
+      local flattenedSymbols::Vector{Symbol} = Symbol[]
+      for field in varLst
+        @match field begin
+          DAE.TYPES_VAR(fieldName, _, _, _, _) => begin
+            local flatName::String = baseName * "_" * fieldName
+            push!(flattenedSymbols, Symbol(flatName))
+          end
+          _ => nothing
+        end
+      end
+      return flattenedSymbols
+    end
+    _ => return Symbol[]
+  end
+end
+
+"""
 `generateSignatureForRegistration(inputs::Vector{DAE.VAR})`
-This function generates the input signature for calls to Symbolics.register
+This function generates the input signature for calls to Symbolics.register.
+Record inputs are flattened into individual field parameters to match the
+generated function signature from generateIOL/flattenRecordInput.
 """
 function generateSignatureForRegistration(inputs::Vector{DAE.VAR})
   local jInputs = Expr[]
   for i in inputs
     @match i.ty begin
-      DAE.T_COMPLEX(__) => begin
-        local s = DAE_VAR_ToJulia(i)
-        #= Complex type, prefixed with void* =#
-        push!(jInputs, Expr(:(::), s, :(Ptr{Nothing})))
+      DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), _, _) => begin
+        #= Flatten record into individual field parameters =#
+        local flattenedSymbols = flattenRecordInput(i)
+        for s in flattenedSymbols
+          push!(jInputs, Expr(:(::), s, :(Any)))
+        end
       end
       _ => begin
         local s = DAE_VAR_ToJulia(i)
@@ -167,8 +238,9 @@ function generateStatement(stmt::DAE.STMT_TUPLE_ASSIGN)
 end
 
 function generateStatement(stmt::DAE.STMT_ASSIGN_ARR)
-  #return string(stmt.lhs) * ":=" * string(stmt.exp) * "|" * string(stmt.type_)
-  throw("generateStatement(stmt::DAE.STMT_ASSIGN_ARR) not impl")
+  local lhs = string(stmt.lhs)
+  local rhs = expToJuliaExpAlg(stmt.exp)
+  return :($(Symbol(lhs)) = $(rhs))
 end
 
 function generateStatement(stmt::DAE.STMT_WHILE, simCode)
@@ -184,10 +256,16 @@ end
 
 """
   Generates for statements.
-  Currently not implemented.
 """
-function generateStatement(stmt::DAE.STMT_FOR)
-  throw("TODO: For not implemented yet")
+function generateStatement(stmt::DAE.STMT_FOR)::Expr
+  local iterVar = Symbol(stmt.iter)
+  local rangeExpr = expToJuliaExpAlg(stmt.range)
+  local bodyStmts = generateStatements(stmt.statementLst)
+  local blck = Expr(:block)
+  for s in bodyStmts
+    push!(blck.args, s)
+  end
+  return Expr(:for, Expr(:(=), iterVar, rangeExpr), blck)
 end
 
 """
@@ -203,7 +281,7 @@ function generateStatement(stmt::DAE.STMT_IF)::Expr
       for stmt in stmts
         push!(blck.args, stmt)
       end
-      push!(expr.args. blck)
+      push!(expr.args, blck)
       expr
     end
     DAE.ELSE(__) => begin
@@ -223,9 +301,10 @@ function generateStatement(stmt::DAE.STMT_IF)::Expr
       for stmt in stmts
         push!(blck.args, stmt)
       end
-      push!(expr.args. blck)
+      push!(expr.args, blck)
       local elseIfs = generateStatement(stmt.else_)
-      Expr(:if, cond, stmts, elseIfs)
+      push!(expr.args, elseIfs)
+      expr
     end
   end
   return res
@@ -250,8 +329,50 @@ Similar to the else this should never be called from the top level.
 """
 function generateStatement(stmt::DAE.ELSEIF)::Expr
   local cond = expToJuliaExpAlg(stmt.exp)
-  local stmts = generateStatments(stmt.statementLst)
-  Expr(:elseif, cond, stmts)
+  local stmts = generateStatements(stmt.statementLst)
+  local blck = Expr(:block)
+  for s in stmts
+    push!(blck.args, s)
+  end
+  local elseExpr = @match stmt.else_ begin
+    DAE.NOELSE(__) => nothing
+    _ => generateStatement(stmt.else_)
+  end
+  if elseExpr === nothing
+    Expr(:elseif, cond, blck)
+  else
+    Expr(:elseif, cond, blck, elseExpr)
+  end
+end
+
+"""
+  Generates Julia code for Modelica assert statements.
+  If level is error (index 1), throws an error when condition is false.
+  If level is warning (index 2), prints a warning when condition is false.
+"""
+function generateStatement(stmt::DAE.STMT_ASSERT)::Expr
+  local condExpr = expToJuliaExpAlg(stmt.cond)
+  local msgExpr = expToJuliaExpAlg(stmt.msg)
+  #= Check assertion level: error (1) or warning (2) =#
+  local level = @match stmt.level begin
+    DAE.ENUM_LITERAL(_, idx) => idx
+    _ => 1  #= Default to error =#
+  end
+  if level == 1
+    #= AssertionLevel.error - throw an error =#
+    quote
+      if !($condExpr)
+        error($msgExpr)
+      end
+    end
+  else
+    #= AssertionLevel.warning - print a warning =#
+    quote
+      if !($condExpr)
+        @warn $msgExpr
+      end
+    end
+  end
 end
 
 """
@@ -279,13 +400,41 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
       DAE.CREF(Absyn.IDENT("time"), _) => begin
         quote t end
       end
-      #= Array accesses =#
+      #= Array accesses for simple CREF_IDENT =#
       DAE.CREF(DAE.CREF_IDENT(ident, identType, subscriptLst), _) where !isempty(subscriptLst)  => begin
-        local arrAccess = SimulationCode.string(exp)
-        expr = Meta.parse(arrAccess)
+        #= Extract base name if ident contains subscripts =#
+        local baseName = if occursin('[', ident)
+          ident[1:findfirst('[', ident)-1]
+        else
+          ident
+        end
+        #= Convert all subscripts to Julia index expressions =#
+        local idxExprs = map(subscriptLst) do sub
+          @match sub begin
+            DAE.INDEX(e) => expToJuliaExpAlg(e)
+            _ => throw("Unsupported subscript in algorithmic code: $sub")
+          end
+        end
+        #= Construct proper Julia multi-dimensional indexing: arr[i, j, ...] =#
+        expr = Expr(:ref, Symbol(baseName), idxExprs...)
+      end
+      #= Qualified CREF (record field access like R.T) =#
+      DAE.CREF(DAE.CREF_QUAL(ident, identType, qualSubscriptLst, innerCref), _) => begin
+        local varName::String = SimulationCode.string(exp.componentRef)
+        #= Replace dots with underscores to match flattened parameter names =#
+        local flatName::String = replace(varName, "." => "_")
+        #= If the CREF has subscripts anywhere, parse it as an array access =#
+        local allSubscripts = CodeGeneration.FrontendUtil.Util.getSubscriptsFromCref(exp.componentRef)
+        if !isempty(allSubscripts)
+          expr = Meta.parse(flatName)
+        else
+          quote
+            $(Symbol(flatName))
+          end
+        end
       end
       DAE.CREF(cr, _)  => begin
-        local varName = SimulationCode.string(cr)
+        local varName::String = SimulationCode.string(cr)
         quote
           $(Symbol(varName))
         end
@@ -297,13 +446,24 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
       DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
         local lhs = expToJuliaExpAlg(e1)
         local rhs = expToJuliaExpAlg(e2)
-        local op = CodeGeneration.DAE_OP_toJuliaOperator(op)
-        :($op($(lhs), $(rhs)))
+        #= Special handling for vector dot product and matrix product =#
+        @match op begin
+          DAE.MUL_SCALAR_PRODUCT(__) => begin
+            :(OMBackend.CodeGeneration.vectorDot($(lhs), $(rhs)))
+          end
+          DAE.MUL_MATRIX_PRODUCT(__) => begin
+            :(OMBackend.CodeGeneration.ensureMatrix($(lhs)) * OMBackend.CodeGeneration.ensureMatrix($(rhs)))
+          end
+          _ => begin
+            local opSym = CodeGeneration.DAE_OP_toJuliaOperator(op)
+            :($opSym($(lhs), $(rhs)))
+          end
+        end
       end
       DAE.LUNARY(operator = op, exp = e1)  => begin
         local operand = expToJuliaExpAlg(e1)
         local op = CodeGeneration.DAE_OP_toJuliaOperator(op)
-        :($op($(op)))
+        :($op($(operand)))
       end
       DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
         local lhs = expToJuliaExpAlg(e1)
@@ -320,7 +480,7 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
       DAE.IFEXP(expCond = e1, expThen = e2, expElse = e3) => begin
         local cond = expToJuliaExpAlg(e1)
         local thenExp = expToJuliaExpAlg(e2)
-        local elseExp = expToJuliaExpAlg(e2)
+        local elseExp = expToJuliaExpAlg(e3)
         quote
           if $(cond)
             $(thenExp)
@@ -356,8 +516,58 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         expr
       end
       DAE.CAST(ty, exp)  => begin
-        quote
-          $(generateCastExpressionMTK(ty, exp, simCode, varPrefix))
+        #= Type cast expression =#
+        local innerExpr = expToJuliaExpAlg(exp)
+        @match ty begin
+          DAE.T_REAL(__) => :(float($innerExpr))
+          DAE.T_INTEGER(__) => :(Int(round($innerExpr)))
+          DAE.T_BOOL(__) => :(Bool($innerExpr))
+          _ => innerExpr  #= For other types, just return the inner expression =#
+        end
+      end
+      DAE.ARRAY(ty, scalar, expl) => begin
+        local elements = map(expl) do e
+          expToJuliaExpAlg(e)
+        end
+        Expr(:vect, elements...)
+      end
+      DAE.RANGE(ty, startExp, stepExp, stopExp) => begin
+        local startExpr = expToJuliaExpAlg(startExp)
+        local stopExpr = expToJuliaExpAlg(stopExp)
+        if stepExp === nothing
+          :($startExpr:$stopExpr)
+        else
+          local stepExpr = expToJuliaExpAlg(stepExp)
+          :($startExpr:$stepExpr:$stopExpr)
+        end
+      end
+      DAE.SIZE(arrExp, SOME(dimExp)) => begin
+        local arrExpr = expToJuliaExpAlg(arrExp)
+        local dimExpr = expToJuliaExpAlg(dimExp)
+        :(size($arrExpr, $dimExpr))
+      end
+      DAE.SIZE(arrExp, NONE()) => begin
+        local arrExpr = expToJuliaExpAlg(arrExp)
+        :(size($arrExpr))
+      end
+      DAE.ENUM_LITERAL(name, index) => begin
+        #= Enum literals are represented by their integer index =#
+        quote $index end
+      end
+      DAE.ASUB(arrExp, subLst) => begin
+        #= Array subscript expression: arr[i, j, ...] =#
+        local arrExpr = expToJuliaExpAlg(arrExp)
+        local subs = map(expToJuliaExpAlg, subLst)
+        Expr(:ref, arrExpr, subs...)
+      end
+      DAE.RECORD(path, exps, fieldNames, ty) => begin
+        #= Record constructor: generate as a simple tuple =#
+        local fieldExprs = map(expToJuliaExpAlg, exps)
+        if length(fieldExprs) == 1
+          #= Single element - return as-is or wrap =#
+          first(fieldExprs)
+        else
+          Expr(:tuple, fieldExprs...)
         end
       end
       _ =>  throw(ErrorException("$exp not yet supported"))

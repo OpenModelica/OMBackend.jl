@@ -165,6 +165,10 @@ function Base.string(@nospecialize(eq::BDAE.Equation))
         (string(lhs) + " = " + string(rhs))
       end
 
+      BDAE.ARRAY_EQUATION(dimSize, left, right, _, _, _) => begin
+        "ARRAY_EQUATION[" * join(string.(dimSize), ",") * "]: " * string(left) * " = " * string(right)
+      end
+
       BDAE.SOLVED_EQUATION(componentRef = cref, exp = rhs) => begin
         (string(cref) + " = " + string(rhs))
       end
@@ -223,6 +227,22 @@ function Base.string(@nospecialize(eq::BDAE.Equation))
           strTmp += string(feq)
         end
         strTmp += "end"
+      end
+
+      BDAE.COMPLEX_EQUATION(size, left, right, _, _) => begin
+        "COMPLEX_EQUATION[size=$size]: " * string(left) * " = " * string(right)
+      end
+
+      BDAE.FOR_EQUATION(iter, start, stop, body, _, _) => begin
+        "for " * string(iter) * " in " * string(start) * ":" * string(stop) * " loop\n  " * string(body) * "end for"
+      end
+
+      BDAE.ALGORITHM(size, alg, _, _, _) => begin
+        "ALGORITHM[size=$size]"
+      end
+
+      _ => begin
+        "UNKNOWN_EQUATION_TYPE: " * string(typeof(eq))
       end
     end
 
@@ -285,7 +305,16 @@ function Base.string(cr::DAE.ComponentRef; separator="_", printType = false)
     local cref::DAE.ComponentRef
     local identType::DAE.Type
     @match cr begin
-      DAE.CREF_QUAL(ident = ident, identType = identType ,componentRef = cref) => begin
+      DAE.CREF_QUAL(ident = ident, identType = identType , subscriptLst = subscriptLst, componentRef = cref) => begin
+        local ident = if !listEmpty(subscriptLst)
+          local str = ident
+          for s in subscriptLst
+            str = str * "[" * string(s) * "]"
+          end
+          str = str
+        else
+          ident
+        end
         ident * separator * string(cref)
       end
       DAE.CREF_IDENT(ident, identType, subscriptLst) => begin
@@ -465,7 +494,7 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
       end
 
       DAE.ARRAY(array = expl)  => begin
-        "[ARR]" + lstString(expl, ", ")
+        "[ARR]" + string("[", lstString(expl, ", "), "]")
       end
 
       DAE.MATRIX(matrix = lstexpl)  => begin
@@ -586,8 +615,12 @@ end
 
 function Base.string(ss::Cons{DAE.Subscript})::String
   local str = ""
-  for ix in ss
-    str *= "_$(string(ix))"
+  if length(ss) > 1
+    for ix in ss
+      str *= "_$(string(ix))"
+    end
+  else
+    str *= string(ss.head)
   end
   return str
 end
@@ -630,11 +663,12 @@ function Base.string(stmt::DAE.STMT_FOR)
   local buffer = IOBuffer()
   print(buffer, "FOR ")
   print(buffer, string(stmt.iter))
-  println(buffer, "|" * string(range))
+  println(buffer, " in " * string(stmt.range))
   for s in stmt.statementLst
-    println(buffer, " " * string(s))
+    println(buffer, "  " * string(s))
   end
   println(buffer, "END FOR")
+  return String(take!(buffer))
 end
 
 function Base.string(stmt::DAE.STMT_IF)
@@ -670,7 +704,7 @@ function Base.string(stmt::DAE.ELSEIF)
     println(buffer, " " * string(s))
   end
   println(buffer, "END IF")
-  print(bufer, string(stmt.else_))
+  print(buffer, string(stmt.else_))
   return String(take!(buffer))
 end
 

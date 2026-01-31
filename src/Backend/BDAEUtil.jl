@@ -38,7 +38,7 @@ using Setfield
 import ..BDAE
 import ..BackendEquation
 import OMBackend
-import ..Util
+import ..FrontendUtil.Util
 import Absyn
 import DAE
 import OMFrontend
@@ -217,6 +217,14 @@ function traverseEquationExpressions(eq::BDAE.Equation,
          lst = traverseWhenEquation!(whenEquation, traversalOperation, extArg)
          @assign eq.whenEquation.whenStmtLst = lst
          #= TODO: Handle elsewhen =#
+         (eq, extArg)
+       end
+       BDAE.ARRAY_EQUATION(left = lhs, right = rhs) => begin
+         (newLhs, extArg) = Util.traverseExpTopDown(lhs, traversalOperation, extArg)
+         (newRhs, extArg) = Util.traverseExpTopDown(rhs, traversalOperation, extArg)
+         @assign eq.left = newLhs
+         @assign eq.right = newRhs
+         @info "Processed ARRAY_EQUATION: lhs changed=$(lhs !== newLhs), rhs changed=$(rhs !== newRhs)"
          (eq, extArg)
        end
        _ => begin
@@ -541,6 +549,22 @@ function eqToWhenOperator(eq::BDAE.Equation)
     end
   end
   return res
+end
+
+function DAE_DimensionToIntVector(dims::Cons{DAE.Dimension})::Vector{Int}
+  local dimIndices = []
+  for d in dims
+    if ! (typeof(d) == DAE.DIM_INTEGER)
+      throw("Non integers dimensions for arrays are not supported by OMBackend. Dimension was $(string(dim))")
+    else
+      push!(dimIndices, d.integer)
+    end
+  end
+  return dimIndices
+end
+
+function getDimensionFromComplexType(callTy::DAE.T_COMPLEX)
+  length(callTy.varLst)
 end
 
 

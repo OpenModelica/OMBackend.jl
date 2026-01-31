@@ -51,7 +51,8 @@ import OMFrontend
   and further divides variables into known and unknown variables and the
   equations into simple and nonsimple equations.
   inputs:  lst: DAE.DAE_LIST
-  outputs: BDAE.BACKEND_DAE"""
+  outputs: BDAE.BACKEND_DAE
+"""
 function lower(lst::DAE.DAE_LIST)::BDAE.BACKEND_DAE
   local outBDAE::BDAE.BACKEND_DAE
   local eqSystems::Vector{BDAE.EQSYSTEM}
@@ -292,8 +293,22 @@ function equationToBackendEquation(elem::DAE.Element)
       #=TODO: Currently skipping asserts =#
       BDAE.ASSERT_EQUATION(c, msg, level, source)
     end
+    DAE.ARRAY_EQUATION(dim, exp, arr, source) => begin
+      #@error "Array equations not supported yet. Exp was" string(exp) string(arr) string(dim) string(source)
+      #= Generate code for array equations =#
+      dVec = BDAEUtil.DAE_DimensionToIntVector(dim)
+      BDAE.ARRAY_EQUATION(dVec, arr, exp, source, BDAE.NO_ATTRIBUTES(), NONE())
+    end
+
+    DAE.COMPLEX_EQUATION(lhs, rhs, source) where rhs isa DAE.CALL => begin
+      @match DAE.CALL(path, expLst, DAE.CALL_ATTR(ty)) = rhs
+      #= We assume the same size and  that the frontend made sure to check it. =#
+      dVec = BDAEUtil.getDimensionFromComplexType(ty)
+      size = isempty(dVec) ? 1 : prod(dVec)
+      BDAE.COMPLEX_EQUATION(size, lhs, rhs, source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
+    end
     _ => begin
-      @error "Skipped processing" elem
+      @error "Skipped processing" elem OMFrontend.Frontend.toString(elem)
       throw("Unsupported equation: $elem")
     end
   end

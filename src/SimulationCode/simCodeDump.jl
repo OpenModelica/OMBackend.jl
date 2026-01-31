@@ -34,99 +34,98 @@ using DataStructures
   File: simCodeDump.jl
   Dumping functions for simulation code structures.
 """
-function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = "Simulation-Code")
+function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = simCode.name)
   local buffer = IOBuffer()
-  print(buffer, BDAEUtil.DOUBLE_LINE + "\n")
-  print(buffer, "SIM_CODE: " + heading + "\n")
-  print(buffer, BDAEUtil.DOUBLE_LINE + "\n\n")
-  local stateVariables = String[]
-  local parameters = String[]
+  println(buffer, BDAEUtil.DOUBLE_LINE)
+  println(buffer, "SIMULATION CODE: ", heading)
+  println(buffer, BDAEUtil.DOUBLE_LINE)
+  println(buffer)
+
+  #= Classify variables =#
   local algVariables = String[]
+  local arrayVariables = Tuple{String, Int}[]
+  local arrayParameters = Tuple{String, Int}[]
   local discreteVariables = String[]
-  local stateDerivatives = String[]
-  local occVariables = String[]
   local dsVariables = String[]
-  for f in simCode.functions
-    println(buffer, string(f))
-  end
-  print(buffer, "Simulation Code Variables:" + "\n")
-  print(buffer, BDAEUtil.LINE + "\n")
+  local occVariables = String[]
+  local parameters = String[]
+  local stateVariables = String[]
   for varName in keys(simCode.stringToSimVarHT)
-    (idx, var) = simCode.stringToSimVarHT[varName]
+    (_, var) = simCode.stringToSimVarHT[varName]
     local varType = var.varKind
-    local varType = var.varKind
-    @match varType  begin
+    @match varType begin
       SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
       SimulationCode.STATE(__) => push!(stateVariables, varName)
-      SimulationCode.STATE_DERIVATIVE(__) => push!(stateDerivatives, varName)
+      SimulationCode.STATE_DERIVATIVE(__) => nothing
       SimulationCode.PARAMETER(__) => push!(parameters, varName)
+      SimulationCode.STRING(__) => push!(parameters, varName)
       SimulationCode.ALG_VARIABLE(__) => push!(algVariables, varName)
+      SimulationCode.ARRAY_PARAMETER(__) => push!(arrayParameters, (varName, sum(varType.dimensions)))
+      SimulationCode.ARRAY(__) => push!(arrayVariables, (varName, sum(varType.dimensions)))
       SimulationCode.DISCRETE(__) => push!(discreteVariables, varName)
       SimulationCode.OCC_VARIABLE(__) => push!(occVariables, varName)
       SimulationCode.DATA_STRUCTURE(__) => push!(dsVariables, varName)
     end
   end
   local algAndState = vcat(algVariables, stateVariables)
-  println(buffer, "Parameters & Constants:")
-  for p in parameters
-    println(buffer, p * "| Index:" * string(first(simCode.stringToSimVarHT[p])))
+
+  #= Functions =#
+  if !isempty(simCode.functions)
+    println(buffer, "Modelica Functions:")
+    println(buffer, BDAEUtil.LINE)
+    for f in simCode.functions
+      println(buffer, string(f))
+    end
+    println(buffer, BDAEUtil.LINE)
   end
-  print(buffer, BDAEUtil.LINE + "\n")
-  println(buffer, "State Variables:")
-  for s in stateVariables
-    println(buffer, s * "| Index:" * string(first(simCode.stringToSimVarHT[s])))
+
+  #= Variables =#
+  println(buffer, "Variables:")
+  println(buffer, BDAEUtil.LINE)
+
+  dumpVarSection(buffer, "State Variables", stateVariables, simCode)
+  dumpVarSection(buffer, "Parameters & Constants", parameters, simCode)
+  if !isempty(arrayParameters)
+    dumpVarSection(buffer, "Array Parameters", map(first, arrayParameters), simCode)
   end
-  print(buffer, BDAEUtil.LINE + "\n")
-  println(buffer, "State Derivatives:")
-  for sd in stateDerivatives
-    println(buffer, sd * "| Index:" * string(first(simCode.stringToSimVarHT[sd])))
+  dumpVarSection(buffer, "Algebraic Variables", algVariables, simCode)
+  if !isempty(arrayVariables)
+    dumpVarSection(buffer, "Array Variables", map(first, arrayVariables), simCode)
   end
-  print(buffer, BDAEUtil.LINE + "\n")
-  println(buffer, "Algebraic Variables:")
-  for a in algVariables
-    println(buffer, a * "| Index:" * string(first(simCode.stringToSimVarHT[a])))
-  end
-  print(buffer, BDAEUtil.LINE + "\n")
-  println(buffer, "OCC Variables:")
-  for a in occVariables
-    println(buffer, a * "| Index:" * string(first(simCode.stringToSimVarHT[a])))
-  end
-  print(buffer, BDAEUtil.LINE + "\n")
-  println(buffer, "Discrete Variables:")
-  for d in discreteVariables
-    println(buffer, d * "| Index:" * string(first(simCode.stringToSimVarHT[d])))
-  end
-  print(buffer, BDAEUtil.LINE + "\n")
-  println(buffer, "Datastructure Variables:")
-  for d in dsVariables
-    println(buffer, d * "| Index:" * string(first(simCode.stringToSimVarHT[d])))
-  end
-  print(buffer, BDAEUtil.LINE + "\n")
-  print(buffer, "\n")
+  dumpVarSection(buffer, "Discrete Variables", discreteVariables, simCode)
+  dumpVarSection(buffer, "OCC Variables", occVariables, simCode)
+  dumpVarSection(buffer, "Data Structure Variables", dsVariables, simCode)
+  println(buffer, BDAEUtil.LINE)
+
+  #= Initial equations =#
   if !isempty(simCode.initialEquations)
-    print(buffer, "Initial Equations" + "\n")
+    println(buffer, "Initial Equations:")
     println(buffer, BDAEUtil.LINE)
     for ieq in simCode.initialEquations
       print(buffer, string(ieq))
     end
+    println(buffer, BDAEUtil.LINE)
+  end
+
+  #= Residual equations =#
+  println(buffer, "Residual Equations:")
+  println(buffer, BDAEUtil.LINE)
+  for (i, eq) in enumerate(simCode.residualEquations)
+    println(buffer, "  [", i, "] ", BDAE.string(eq))
   end
   println(buffer, BDAEUtil.LINE)
-  print(buffer, "Residual Equations" + "\n")
-  print(buffer, BDAEUtil.LINE + "\n")
-  i::Int = 0
-  for eq in simCode.residualEquations
-    i += 1
-    print(buffer, "Index:" * string(i) * "|" * BDAE.string(eq))
-  end
-  println(buffer, BDAEUtil.LINE)
+
+  #= If-equations =#
   if !isempty(simCode.ifEquations)
-    println(buffer, "If-equations:")
-    print(buffer, BDAEUtil.LINE + "\n")
+    println(buffer, "If-Equations:")
+    println(buffer, BDAEUtil.LINE)
     for ifEq in simCode.ifEquations
       print(buffer, string(ifEq))
     end
     println(buffer, BDAEUtil.LINE)
   end
+
+  #= When-equations =#
   if !isempty(simCode.whenEquations)
     println(buffer, "When-Equations:")
     println(buffer, BDAEUtil.LINE)
@@ -135,24 +134,25 @@ function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = "Simula
     end
     println(buffer, BDAEUtil.LINE)
   end
+
+  #= Structural transitions =#
   if !isempty(simCode.structuralTransitions)
-    println(buffer, BDAEUtil.LINE)
-    println(buffer, "Structural-Equations:")
+    println(buffer, "Structural Transitions:")
     println(buffer, BDAEUtil.LINE)
     for st in simCode.structuralTransitions
       print(buffer, string(st))
     end
     println(buffer, BDAEUtil.LINE)
   end
+
+  #= Shared variables and equations =#
   if !isempty(simCode.sharedEquations)
     println(buffer, "Shared Variables:")
     println(buffer, BDAEUtil.LINE)
     for sv in simCode.sharedVariables
-      print(buffer, string(sv) * "\n")
+      println(buffer, "  ", string(sv))
     end
     println(buffer, BDAEUtil.LINE)
-  end
-  if !isempty(simCode.sharedEquations)
     println(buffer, "Shared Equations:")
     println(buffer, BDAEUtil.LINE)
     for se in simCode.sharedEquations
@@ -160,48 +160,95 @@ function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = "Simula
     end
     println(buffer, BDAEUtil.LINE)
   end
+
+  #= Statistics =#
+  println(buffer)
+  println(buffer, "Statistics:")
   println(buffer, BDAEUtil.LINE)
-  nIfEqs = 0
-  for ifEq in simCode.ifEquations
-    #Required to be balanced
-    nIfEqs += length(first(ifEq.branches).residualEquations)
-  end
-  nWhenEquations = 0
-  for wEq in simCode.whenEquations
-    nWhenEquations += length(wEq.whenEquation.whenStmtLst)
-    #if isSome(wEq.whenEquation.elsewhenPart)
-    #  @match SOME(elseW) = wEq.whenEquation.elsewhenPart
-    #  nWhenEquations += length(elseW.whenEquation.whenStmtLst)
-    #end
-  end
+  nArrayElems = isempty(arrayVariables) ? 0 : sum(map(last, arrayVariables))
+  nIfEqs = sum(length(first(ifEq.branches).residualEquations) for ifEq in simCode.ifEquations; init=0)
+  nWhenEqs = sum(length(wEq.whenEquation.whenStmtLst) for wEq in simCode.whenEquations; init=0)
+  nTotalVars = length(algAndState) + length(discreteVariables) + length(occVariables) + nArrayElems
+  nTotalEqs = length(simCode.residualEquations) + nIfEqs + nWhenEqs
+  println(buffer, "  Variables:  ", nTotalVars, " total")
+  println(buffer, "    State:      ", length(stateVariables))
+  println(buffer, "    Algebraic:  ", length(algVariables))
+  println(buffer, "    Array:      ", nArrayElems)
+  println(buffer, "    Discrete:   ", length(discreteVariables))
+  println(buffer, "    OCC:        ", length(occVariables))
+  println(buffer, "  Equations:  ", nTotalEqs, " total")
+  println(buffer, "    Residual:   ", length(simCode.residualEquations))
+  println(buffer, "    If:         ", nIfEqs)
+  println(buffer, "    When:       ", nWhenEqs)
+  println(buffer, "  Functions:  ", length(simCode.functions))
   println(buffer, BDAEUtil.LINE)
-  println(buffer, "Simulation Code Statistics:")
-  println(buffer, BDAEUtil.LINE)
-  println(buffer, "Total Number of Variables:" * string(length(algAndState) + length(discreteVariables) + length(occVariables)))
-  println(buffer, "\tNumber of State Variables:" * string(length(stateVariables)))
-  println(buffer, "\tNumber of Algebraic Variables:" * string(length(algVariables)))
-  println(buffer, "\tNumber of OCC Variables:" * string(length(occVariables)))
-  println(buffer, "\tNumber of Discrete Variables:" * string(length(discreteVariables)))
-  println(buffer, "Total Number of Equations:" * string(length(simCode.residualEquations) + nIfEqs + nWhenEquations))
-  println(buffer, "\tNumber of Residual Equations:" * string(length(simCode.residualEquations)))
-  println(buffer, "\tNumber of Equations in If-Equations:" * string(nIfEqs))
-  println(buffer, "\tNumber of Equations in When-Equations:" * string(nWhenEquations))
-  println(buffer, "Total Number of Functions:" * string(length(simCode.functions)))
-  println(buffer, BDAEUtil.LINE)
-  #local varsInEvent = 0
-  #println(buffer, "Variables involved in events:")
-  print(buffer, BDAEUtil.DOUBLE_LINE + "\n")
+
+  println(buffer, BDAEUtil.DOUBLE_LINE)
   println(buffer, "END SIM_CODE")
-  print(buffer, BDAEUtil.DOUBLE_LINE + "\n")
+  println(buffer, BDAEUtil.DOUBLE_LINE)
+
   if !isempty(simCode.subModels)
     for (i, sm) in enumerate(simCode.subModels)
-      println(buffer, "\n\n")
+      println(buffer)
       println(buffer, dumpSimCode(sm, "Structural-Sub-model #" * string(i)))
-      println(buffer, "\n\n")
     end
   end
 
   return String(take!(buffer))
+end
+
+"""
+  Helper to dump a section of variables. Skips the section entirely if empty.
+"""
+function dumpVarSection(buffer::IOBuffer, sectionName::String, varNames::Vector{String}, simCode)
+  isempty(varNames) && return
+  println(buffer, "  ", sectionName, ":")
+  for name in varNames
+    (idx, var) = simCode.stringToSimVarHT[name]
+    println(buffer, "    [", idx, "] ", name, dumpSimVarKind(var.varKind))
+  end
+end
+
+"""
+  Pretty-print a SimVarType, showing dimensions and binding expressions readably.
+"""
+function dumpSimVarKind(vk::SimVarType)::String
+  @match vk begin
+    SimulationCode.STATE(__) => ""
+    SimulationCode.ALG_VARIABLE(__) => ""
+    SimulationCode.DISCRETE(__) => ""
+    SimulationCode.OCC_VARIABLE(__) => ""
+    SimulationCode.STRING(__) => " :: String"
+    SimulationCode.PARAMETER(bindExp) => begin
+      binding = dumpBindExp(bindExp)
+      isempty(binding) ? " (parameter)" : " = " * binding
+    end
+    SimulationCode.ARRAY(dims, bindExp) => begin
+      dimStr = "[" * join(string.(dims), ", ") * "]"
+      binding = dumpBindExp(bindExp)
+      isempty(binding) ? " :: Real" * dimStr : " :: Real" * dimStr * " = " * binding
+    end
+    SimulationCode.ARRAY_PARAMETER(dims, bindExp) => begin
+      dimStr = "[" * join(string.(dims), ", ") * "]"
+      binding = dumpBindExp(bindExp)
+      isempty(binding) ? " (parameter) :: Real" * dimStr : " (parameter) :: Real" * dimStr * " = " * binding
+    end
+    SimulationCode.DATA_STRUCTURE(bindExp) => begin
+      binding = dumpBindExp(bindExp)
+      isempty(binding) ? " (data structure)" : " (data structure) = " * binding
+    end
+    _ => ""
+  end
+end
+
+"""
+  Pretty-print an optional binding expression using BDAE.string for the DAE.Exp.
+"""
+function dumpBindExp(bindExp::Option{DAE.Exp})::String
+  @match bindExp begin
+    SOME(exp) => BDAE.string(exp)
+    NONE() => ""
+  end
 end
 
 function string(ht::OrderedDict{T1, Tuple{T2, SimVar}}) where {T1, T2}
@@ -278,17 +325,92 @@ function string(f::MODELICA_FUNCTION)
   local buffer = IOBuffer()
   println(buffer, "function " * f.name)
   for arg in f.inputs
-    println(buffer, "input " * string(arg))
+    println(buffer, "  input " * string(arg) * " :: " * dumpDAEVarType(arg))
   end
   for arg in f.outputs
-    println(buffer, "output " * string(arg))
+    println(buffer, "  output " * string(arg) * " :: " * dumpDAEVarType(arg))
   end
   for l in f.locals
-    println(buffer, " local:" * string(l))
+    println(buffer, "  local " * string(l) * " :: " * dumpDAEVarType(l))
   end
+  println(buffer, "algorithm")
   for s in f.statements
-    println(buffer, " " * string(s))
+    println(buffer, "  " * string(s))
   end
   println(buffer, "end " * f.name)
   return String(take!(buffer))
+end
+
+"""
+  Dumps a DAE.VAR's type, taking into account both ty and dims fields.
+  For arrays, dimensions may be in either the ty field (T_ARRAY) or the dims field.
+"""
+function dumpDAEVarType(v::DAE.VAR)::String
+  local baseType = dumpDAEType(v.ty)
+  #= Check if dims field contains array dimensions (MetaModelica list) =#
+  local hasDims = false
+  local dimStrs = String[]
+  try
+    for dim in v.dims
+      hasDims = true
+      @match dim begin
+        DAE.DIM_INTEGER(n) => push!(dimStrs, string(n))
+        DAE.DIM_UNKNOWN(__) => push!(dimStrs, ":")
+        _ => push!(dimStrs, "?")
+      end
+    end
+  catch
+    #= Empty list or iteration error =#
+  end
+  if hasDims
+    return baseType * "[" * join(dimStrs, ", ") * "]"
+  end
+  return baseType
+end
+
+"""
+  Dumps a DAE.Type to a human-readable string.
+  Includes array dimensions and record field information.
+"""
+function dumpDAEType(ty::DAE.Type)::String
+  @match ty begin
+    DAE.T_REAL(__) => "Real"
+    DAE.T_INTEGER(__) => "Integer"
+    DAE.T_BOOL(__) => "Bool"
+    DAE.T_STRING(__) => "String"
+    DAE.T_ARRAY(elemTy, dims) => begin
+      local dimStrs = String[]
+      for dim in dims
+        @match dim begin
+          DAE.DIM_INTEGER(n) => push!(dimStrs, string(n))
+          DAE.DIM_UNKNOWN(__) => push!(dimStrs, ":")
+          _ => push!(dimStrs, "?")
+        end
+      end
+      dumpDAEType(elemTy) * "[" * join(dimStrs, ", ") * "]"
+    end
+    DAE.T_COMPLEX(state, varLst, _) => begin
+      local stateName = @match state begin
+        DAE.ClassInf.RECORD(path) => "record " * string(path)
+        _ => "complex"
+      end
+      local fieldStrs = String[]
+      for field in varLst
+        @match field begin
+          DAE.TYPES_VAR(name, _, fieldTy, _, _) => begin
+            push!(fieldStrs, name * "::" * dumpDAEType(fieldTy))
+          end
+          _ => nothing
+        end
+      end
+      stateName * "{" * join(fieldStrs, ", ") * "}"
+    end
+    DAE.T_TUPLE(types, _) => begin
+      local typeStrs = map(dumpDAEType, types)
+      "Tuple{" * join(typeStrs, ", ") * "}"
+    end
+    DAE.T_UNKNOWN(__) => "Unknown"
+    DAE.T_ANYTYPE(__) => "Any"
+    _ => "<?" * string(typeof(ty)) * ">"
+  end
 end

@@ -44,11 +44,18 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
     (BDAE.VARIABLE(__), DAE.T_REAL(__)) => begin
       SimulationCode.ALG_VARIABLE(0)
     end
-    #= Parameters are always parameters. =#
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_COMPLEX(__)) => begin
       SimulationCode.DATA_STRUCTURE(backendVar.bindExp)
     end
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_REAL(__) || DAE.T_BOOL(__) || DAE.T_INTEGER(__)) => begin
+      SimulationCode.PARAMETER(backendVar.bindExp)
+    end
+    #= String parameters - used for labels, names etc. =#
+    (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_STRING(__)) => begin
+      SimulationCode.STRING()
+    end
+    #= Enumeration parameters =#
+    (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_ENUMERATION(__)) => begin
       SimulationCode.PARAMETER(backendVar.bindExp)
     end
     (_, DAE.T_INTEGER(__)) => begin
@@ -62,8 +69,19 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
     (BDAE.VARIABLE(__), DAE.T_BOOL(__)) => begin
       SimulationCode.DISCRETE()
     end
+    (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_ARRAY(__)) => begin
+      SimulationCode.ARRAY_PARAMETER(Int[d.integer for d in backendVar.varType.dims], backendVar.bindExp)
+    end
+    (_, DAE.T_ARRAY(__)) => begin
+      SimulationCode.ARRAY(Int[d.integer for d in backendVar.varType.dims], backendVar.bindExp)
+    end
+
+    (BDAE.VARIABLE(__), DAE.T_STRING(__)) => begin
+      SimulationCode.STRING()
+    end
     _ => begin
-      @error("Variable: $(backendVar.varName) \n Category: $(typeof(backendVar.varKind)).\n Type: $(typeof(backendVar.varType)) of backend variable not handled.\n")
+      @error("\n Variable: $(backendVar.varName) \n Category: $(typeof(backendVar.varKind)).\n Type: $(typeof(backendVar.varType)) of backend variable not handled.\n")
+      throw("Type: $(typeof(backendVar.varType)) not handled.")
     end
   end
 end
@@ -75,24 +93,40 @@ The . separator is replaced with 3 `_`
 Used to name variables used by the hts in the simulation code.
 """
 function BDAE_identifierToVarString(backendVar::BDAE.VAR)
-  local varName::DAE.ComponentRef = backendVar.varName
-  @match varName begin
+  return DAE_identifierToString(backendVar.varName)
+end
+
+
+function DAE_identifierToString(daeID::DAE.CREF)
+  return DAE_identifierToString(daeID.componentRef)
+end
+
+"""
+  Converts a DAE.ComponentRef to a string representation for use in the SimulationCode during code generation.
+  This function handles different cases for arrays, complex types etc.
+"""
+function DAE_identifierToString(daeID::DAE.ComponentRef)
+  newName = @match daeID begin
     #= An array component attached to a complex component. =#
     DAE.CREF_QUAL(ident, DAE.T_COMPLEX(__), subscriptLst, DAE.CREF_IDENT(innerIdent, DAE.T_ARRAY(__), iSubscriptLst)) => begin
-      #      fail()
-      #ident * "_" * innerIdent
-      string(varName)
+      string(daeID)
     end
     DAE.CREF_QUAL(_, DAE.T_ARRAY(ty, dim), _, _) => begin
-      ident * string(cr)
+      string(ident,string(cr), string(dim))
     end
-    DAE.CREF_IDENT(__) => string(varName)
+    DAE.CREF_IDENT(__) => string(daeID)
+
+    DAE.CREF_QUAL(_, DAE.T_COMPLEX(DAE.ClassInf.RECORD(path), _), _, _) => begin
+      "'($(string(daeID))')"
+    end
+
     DAE.CREF_QUAL(__) => begin
-      string(varName)
+      string(daeID)
     end
     #= A variable of type array =#
-    _ => @error("Type $(typeof(varName)) not handled.")
+    _ => @error("Type $(typeof(daeID)) not handled.")
   end
+  return newName
 end
 
 """
@@ -411,10 +445,25 @@ If the system is singular we try index reduction before proceeding.
 function matchAndCheckStronglyConnectedComponents(eqVariableMapping,
                                                   numberOfVariablesInMapping,
                                                   stringToSimVarHT; mode = OMBackend.MTK_MODE)::Tuple
-  (isSingular::Bool, matchOrder::Vector) = GraphAlgorithms.matching(eqVariableMapping,
-                                                                    numberOfVariablesInMapping)
+  local isSingular::Bool
+  local matchOrder::Vector
   local digraph::MetaGraphs.MetaDiGraph
   local sccs::Vector
+  #=
+    For MTK_MODE, catch matching failures and let MTK handle structural analysis.
+    MTK has its own structural_simplify that can handle index reduction.
+  =#
+  try
+    (isSingular, matchOrder) = GraphAlgorithms.matching(eqVariableMapping,
+                                                        numberOfVariablesInMapping)
+  catch e
+    if mode == OMBackend.MTK_MODE
+      @info "Matching failed, delegating structural analysis to ModelingToolkit"
+      return (true, Int[], MetaGraphs.MetaDiGraph(), Vector{Int}[])
+    else
+      rethrow(e)
+    end
+  end
   #=
     Index reduction might resolve the issues with this system.
   =#
