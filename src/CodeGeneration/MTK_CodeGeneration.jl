@@ -161,6 +161,10 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
   #=
    Evaluate all functions s.t the symbols are available
    This needs to be done for the SymbolicUtils.jl inorder for it to recognise certain symbols.
+
+   The generated function expressions create wrapper functions (via createModelicaFunctionWrapper)
+   and store implementations in MODELICA_FUNCTION_IMPLS dictionary. The wrappers are defined
+   at module load time, avoiding world-age issues when called from MTK's RuntimeGeneratedFunctions.
   =#
   for f in functions
     eval(f)
@@ -205,6 +209,23 @@ end
 function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions)
   #@debug "Runnning: ODE_MODE_MTK_MODEL"
   RESET_CALLBACKS()
+  #= Eval functions FIRST so they exist before @register_symbolic is called =#
+  for f in functions
+    eval(f)
+  end
+  #= Register functions with @register_symbolic immediately after they are defined =#
+  #= This must happen before equations are processed, and at module level via eval =#
+  local registrationCalls = generateRegisterCallsForCallExprs(simCode; funcArgGen = AlgorithmicCodeGeneration.generateIOL)
+  for regCall in registrationCalls
+    try
+      eval(regCall)
+    catch e
+      #= Ignore "already has a value" errors - function was registered in a previous run =#
+      if !contains(string(e), "already has a value")
+        rethrow(e)
+      end
+    end
+  end
   local stringToSimVarHT = simCode.stringToSimVarHT
   local equations::Vector = BDAE.RESIDUAL_EQUATION[]
   local exp::DAE.Exp
@@ -319,10 +340,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   #= Create assignments for the dummies. =#
   local IF_EQUATION_EVENTS = [component[1] for component in IF_EQUATION_COMPONENTS]
   IF_EQUATION_EVENTS = collect(Iterators.flatten(IF_EQUATION_EVENTS))
+  #= Use Base.invokelatest to wrap event creation, so it runs in the current world age =#
+  #= This is necessary because the event expressions reference variables created via eval =#
   local IF_EQUATION_EVENT_DECLARATION = if isempty(IF_EQUATION_EVENTS)
     :(events = [])
   else
-    :(events = [$(IF_EQUATION_EVENTS...)])
+    :(events = Base.invokelatest(() -> [$(IF_EQUATION_EVENTS...)]))
   end
   local CONDITIONAL_EQUATIONS = collect(Iterators.flatten([component[2] for component in IF_EQUATION_COMPONENTS]))
   local ifConditionNameAndIV = collect(Iterators.flatten([component[5] for component in IF_EQUATION_COMPONENTS]))
@@ -336,10 +359,14 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   =#
   local irreductableSyms = Symbol[Symbol(vn) for vn in simCode.irreductableVariables]
 
+  #= For pure ODE systems (no algebraic variables), always provide start values.
+     For DAE systems (has algebraic variables), use onlyFixed=true to avoid
+     conflicts between default values and algebraic constraints. =#
+  local hasAlgebraicConstraints = !isempty(algebraicVariables)
   local FINAL_START_CONDTIONS_EQUATIONS = unique!(createStartConditionsEquationsMTK(
     String[vn for vn in simCode.irreductableVariables],
     String[],
-    simCode; onlyFixed = true))
+    simCode; onlyFixed = hasAlgebraicConstraints))
   FINAL_START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations, DISCRETE_START_VALUES, FINAL_START_CONDTIONS_EQUATIONS)
   START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations, DISCRETE_START_VALUES, START_CONDTIONS_EQUATIONS)
   #=
@@ -387,7 +414,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       #= Generate variables =#
       for constructor in variableConstructors
         t = Symbolics.variable(:t, T = Real)
-        vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple{Real}, Real})(t)), constructor())
+        vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple{Real}, Real})(t)), Base.invokelatest(constructor))
         #= t is no longer needed here =#
         push!(allVariables, vars)
       end
@@ -435,7 +462,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
         The callback handling for MTK is subject of change should hybrid system be implemented for MTK.
       =#
       local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
-      local discreteVars = collect(values(ModelingToolkit.OrderedDict($(DISCRETE_START_VALUES...))))
+      #= Wrap discrete start values in a function and call with invokelatest to avoid world-age issues =#
+      #= The variables referenced in DISCRETE_START_VALUES were created via eval above =#
+      function _getDiscreteVars()
+        collect(values(ModelingToolkit.OrderedDict($(DISCRETE_START_VALUES...))))
+      end
+      local discreteVars = Base.invokelatest(_getDiscreteVars)
       #= Merge the discrete and event parameters =#
       eventParameters = vcat(eventParameters, discreteVars)
       local aux = Vector{Any}(undef, 3)

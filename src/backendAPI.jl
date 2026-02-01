@@ -98,6 +98,7 @@ This is not part of the lowering process but it is to be generated before we gen
 """
 function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatModel};
                    functionList = nothing, BackendMode = MTK_MODE)::Tuple{String, Expr}
+    @info "HELLO"
   local bDAE = lower(frontendDAE)
   local simCode
   if BackendMode == DAE_MODE

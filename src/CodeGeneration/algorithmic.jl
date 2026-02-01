@@ -41,6 +41,14 @@ end
 """
   Generates algorithmic Modelica Code.
   Returns the generated Julia code + the names of the functions that has been generated.
+
+  To avoid world-age issues when these functions are called from MTK's RuntimeGeneratedFunctions,
+  we use a two-step approach:
+  1. Generate the implementation as an anonymous function stored in MODELICA_FUNCTION_IMPLS dictionary
+  2. Create a wrapper function at module load time that looks up the implementation
+
+  The wrapper is created via createModelicaFunctionWrapper which must be called before
+  the implementation is stored. This is handled in ODE_MODE_MTK_PROGRAM_GENERATION.
 """
 function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::Tuple{Vector{Expr}, Vector{String}}
   local jFuncs = Expr[]
@@ -51,9 +59,10 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
     local f
     #= Normalize function name: replace dots with underscores for valid Julia identifiers =#
     local normalizedName = replace(func.name, "." => "_")
-    inputsJL = if length(inputs) > 1
+    local nArgs = length(inputs)
+    inputsJL = if nArgs > 1
       tuple(inputs...)
-    elseif length(inputs) == 1
+    elseif nArgs == 1
       inputs[1]
     else
       ()  #= Empty tuple for no inputs =#
@@ -63,71 +72,60 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         local locals = generateLocals(func.locals)
         local arrayConversions = generateArrayConversions(func.inputs)
         local statements = generateStatements(func.statements)
-        if inputsJL isa Tuple
-          f = quote
-            function $(Symbol(normalizedName))($(inputsJL...))
-              $(arrayConversions...)
-              $(locals...)
-              $(statements...)
-              return $(if length(outputs) > 1
-                         tuple(outputs...)
-                       elseif length(outputs) == 1
-                         outputs[1]
-                       else
-                         nothing
-                       end)
-            end
-          end
+        local returnExpr = if length(outputs) > 1
+          tuple(outputs...)
+        elseif length(outputs) == 1
+          outputs[1]
         else
-          f = quote
-            function $(Symbol(normalizedName))($(inputsJL))
-              $(arrayConversions...)
-              $(locals...)
-              $(statements...)
-              return $(if length(outputs) > 1
-                         tuple(outputs...)
-                       elseif length(outputs) == 1
-                         outputs[1]
-                       else
-                         nothing
-                       end)
-            end
+          nothing
+        end
+        #= Build the anonymous function expression manually to avoid parsing issues =#
+        local funcBody = Expr(:block, arrayConversions..., locals..., statements..., :(return $(returnExpr)))
+        local anonFunc = if nArgs == 0
+          Expr(:->, Expr(:tuple), funcBody)
+        elseif inputsJL isa Tuple
+          Expr(:->, Expr(:tuple, inputsJL...), funcBody)
+        else
+          Expr(:->, inputsJL, funcBody)
+        end
+
+        f = quote
+          #= First, create the wrapper function if it does not exist =#
+          if !isdefined(@__MODULE__, $(QuoteNode(Symbol(normalizedName))))
+            OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(normalizedName))), $(nArgs))
           end
+          #= Store the implementation in the dictionary =#
+          OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(Symbol(normalizedName)))] = $(anonFunc)
         end
       end
       SimulationCode.EXTERNAL_MODELICA_FUNCTION(__) => begin
-        if inputsJL isa Tuple
-          local extCall = Meta.parse(func.libInfo)
-          extCall = namespaceifyExternalFunction(extCall)
-          f = quote
-            function $(Symbol(normalizedName))($(inputsJL...))
-              #= Here a call to the external function should be placed =#
-              $(extCall)
-              $(if length(outputs) > 1
-                  tuple(outputs...)
-                elseif length(outputs) == 1
-                  outputs[1]
-                else
-                  nothing
-                end)
-            end
-          end
+        local extCall = Meta.parse(func.libInfo)
+        extCall = namespaceifyExternalFunction(extCall)
+        local returnExpr = if length(outputs) > 1
+          tuple(outputs...)
+        elseif length(outputs) == 1
+          outputs[1]
         else
-          local extCall = Meta.parse(func.libInfo)
-          extCall = namespaceifyExternalFunction(extCall)
-          f = quote
-            function $(Symbol(normalizedName))($(inputsJL))
-              #= Here a call to the external function should be placed =#
-              $(extCall)
-              $(if length(outputs) > 1
-                  tuple(outputs...)
-                elseif length(outputs) == 1
-                  outputs[1]
-                else
-                  nothing
-                end)
-            end
+          nothing
+        end
+
+        #= Build the anonymous function expression manually =#
+        local funcBody = Expr(:block, extCall, returnExpr)
+        local anonFunc = if nArgs == 0
+          Expr(:->, Expr(:tuple), funcBody)
+        elseif inputsJL isa Tuple
+          Expr(:->, Expr(:tuple, inputsJL...), funcBody)
+        else
+          Expr(:->, inputsJL, funcBody)
+        end
+
+        f = quote
+          #= First, create the wrapper function if it does not exist =#
+          if !isdefined(@__MODULE__, $(QuoteNode(Symbol(normalizedName))))
+            OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(normalizedName))), $(nArgs))
           end
+          #= Store the implementation in the dictionary =#
+          OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(Symbol(normalizedName)))] = $(anonFunc)
         end
       end
     end
@@ -490,11 +488,13 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         end
       end
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst, attr = attr)  => begin
-        local expr = Expr(:call, if !(attr.builtin) #Note extend this when needed
-                            Symbol(tmpStr)
-                          else
-                            Symbol(tmpStr)
-                          end)
+        local funcSym = Symbol(tmpStr)
+        #= Use Base.invokelatest for non-builtin functions to avoid world-age issues =#
+        local expr = if !(attr.builtin)
+          Expr(:call, :(Base.invokelatest), funcSym)
+        else
+          Expr(:call, funcSym)
+        end
         local args = map(explst) do arg
           expToJuliaExpAlg(arg)
         end
@@ -504,11 +504,13 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         end
       end
       DAE.CALL(path, expLst, attr) => begin
-        local expr = Expr(:call, if !(attr.builtin)
-                            Symbol(string(path))
-                          else
-                            Symbol(string(path))
-                          end)
+        local funcSym = Symbol(string(path))
+        #= Use Base.invokelatest for non-builtin functions to avoid world-age issues =#
+        local expr = if !(attr.builtin)
+          Expr(:call, :(Base.invokelatest), funcSym)
+        else
+          Expr(:call, funcSym)
+        end
         local args = map(expLst) do arg
           expToJuliaExpAlg(arg)
         end

@@ -917,6 +917,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       DAE.CALL(path, expLst) => begin
         #= Normalize function name: replace dots with underscores =#
         local normalizedFuncName = replace(string(path), "." => "_")
+        #= Use direct function call - wrapper handles world-age, @register_symbolic handles symbolic =#
         local expr = Expr(:call, Symbol(normalizedFuncName))
         local args::Vector{Union{Symbol, Expr}} = Union{Symbol, Expr}[]
         for arg in expLst

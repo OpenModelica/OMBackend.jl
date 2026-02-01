@@ -62,6 +62,110 @@ TODO:
 !Adjust the uncessary string conversions!
 =#
 
+#= Global registry of dynamically generated Modelica function names =#
+#= Used by wrapWithInvokelatest to detect which bare symbols need invokelatest wrapping =#
+const DYNAMIC_MODELICA_FUNCTIONS = Set{Symbol}()
+
+"""
+  Register a dynamically generated Modelica function name.
+  Called when functions are eval'd in MTK_CodeGeneration.
+"""
+function registerDynamicFunction!(funcName::Symbol)
+  push!(DYNAMIC_MODELICA_FUNCTIONS, funcName)
+end
+
+#= Global dictionary to store dynamically generated function implementations =#
+#= The key is the function name, the value is the implementation function =#
+const MODELICA_FUNCTION_IMPLS = Dict{Symbol, Function}()
+
+#= Global dictionary to store RTG wrappers for each function =#
+const MODELICA_FUNCTION_WRAPPERS = Dict{Symbol, Any}()
+
+"""
+Helper to check if a value is symbolic (Symbolics.Num or contains symbolic expressions).
+"""
+function isSymbolicArg(x)
+  return x isa Symbolics.Num || x isa Symbolics.Arr || x isa SymbolicUtils.BasicSymbolic
+end
+
+"""
+Helper to check if any argument in a tuple/collection is symbolic.
+"""
+function hasSymbolicArgs(args...)
+  return any(isSymbolicArg, args)
+end
+
+"""
+  Create a wrapper function that calls the implementation via Base.invokelatest.
+  This handles world-age issues when the implementation is defined via eval at runtime.
+
+  The wrapper also handles symbolic arguments: if any argument is symbolic (Symbolics.Num),
+  it returns a symbolic term instead of calling the implementation. This replaces the need
+  for @register_symbolic which does not work reliably when called at runtime.
+"""
+function createModelicaFunctionWrapper(funcName::Symbol, nArgs::Int)
+  #= Check if symbol already exists - if so, skip redefinition =#
+  #= The implementation in MODELICA_FUNCTION_IMPLS is updated separately =#
+  #= Any existing callable (function or RTG object) will use the new impl via invokelatest =#
+  if isdefined(@__MODULE__, funcName)
+    return nothing
+  end
+
+  #= Define a function that:
+     1. Checks if any argument is symbolic
+     2. If so, returns a symbolic term (like @register_symbolic would)
+     3. Otherwise calls the implementation via invokelatest
+  =#
+  local fnQuote = QuoteNode(funcName)
+  if nArgs == 0
+    @eval function $funcName()
+      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+      Base.invokelatest(impl)
+    end
+  elseif nArgs == 1
+    @eval function $funcName(arg1)
+      #= If argument is symbolic, return a symbolic term =#
+      if isSymbolicArg(arg1)
+        return Symbolics.Num(SymbolicUtils.Term($funcName, [Symbolics.unwrap(arg1)]))
+      end
+      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+      Base.invokelatest(impl, arg1)
+    end
+  elseif nArgs == 2
+    @eval function $funcName(arg1, arg2)
+      if hasSymbolicArgs(arg1, arg2)
+        return Symbolics.Num(SymbolicUtils.Term($funcName, [Symbolics.unwrap(arg1), Symbolics.unwrap(arg2)]))
+      end
+      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+      Base.invokelatest(impl, arg1, arg2)
+    end
+  elseif nArgs == 3
+    @eval function $funcName(arg1, arg2, arg3)
+      if hasSymbolicArgs(arg1, arg2, arg3)
+        return Symbolics.Num(SymbolicUtils.Term($funcName, [Symbolics.unwrap(arg1), Symbolics.unwrap(arg2), Symbolics.unwrap(arg3)]))
+      end
+      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+      Base.invokelatest(impl, arg1, arg2, arg3)
+    end
+  elseif nArgs == 4
+    @eval function $funcName(arg1, arg2, arg3, arg4)
+      if hasSymbolicArgs(arg1, arg2, arg3, arg4)
+        return Symbolics.Num(SymbolicUtils.Term($funcName, [Symbolics.unwrap(arg1), Symbolics.unwrap(arg2), Symbolics.unwrap(arg3), Symbolics.unwrap(arg4)]))
+      end
+      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+      Base.invokelatest(impl, arg1, arg2, arg3, arg4)
+    end
+  else
+    @eval function $funcName(args...)
+      if any(isSymbolicArg, args)
+        return Symbolics.Num(SymbolicUtils.Term($funcName, [Symbolics.unwrap(a) for a in args]))
+      end
+      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+      Base.invokelatest(impl, args...)
+    end
+  end
+end
+
 #=
 So we know about t an der in the global scope.
 This is needed for the rules below to match correctly.
@@ -156,17 +260,13 @@ function rewriteEquations(edeqs, iv, eVars, ePars, simCode; arrayParameterExprs:
   if simCode.externalRuntime
     eval(generateExternalRuntimeImport(simCode))
   end
-  #=
-  Register all functions s.t they can be used by the symbolic transformations.
-  =#
-  #= Delay evaluation of the register expression until we have constructed the functions =#
-  local ftrs = generateRegisterCallsForCallExprs(simCode; funcArgGen = AlgorithmicCodeGeneration.generateIOL)
-  for f in ftrs
-    eval(f)
-  end
-  #==#
+  #= Note: @register_symbolic is now called earlier in ODE_MODE_MTK_MODEL_GENERATION =#
+  #= immediately after function definitions are eval'd, before equations are processed =#
   local deqs = evalEDeqs(edeqs)
-  write("MTK_REWRITE.log", debugRewrite(deqs, iv, vars, parameters; separator="\n"))
+  #= Use invokelatest to access vars which was created via eval in a newer world age =#
+  Base.invokelatest() do
+    write("MTK_REWRITE.log", debugRewrite(deqs, iv, vars, parameters; separator="\n"))
+  end
   #= Rewrite equations =#
   D = Differential(iv)
   local r1 = SymbolicUtils.@rule ~~a * D(~~b) * ~~c => 0
@@ -265,12 +365,112 @@ function debugRewrite(deqs, t, vars, parameters; separator = ",")
   return String(take!(buffer))
 end
 
+"""
+  Check if a symbol is a registered dynamic Modelica function.
+  Uses the global DYNAMIC_MODELICA_FUNCTIONS registry populated when functions are eval'd.
+"""
+function isDynamicModelicaFunction(sym::Symbol)
+  return sym in DYNAMIC_MODELICA_FUNCTIONS
+end
+
+"""
+  Wrap function calls to dynamically generated Modelica functions with Base.invokelatest
+  to avoid world-age issues.
+"""
+function wrapWithInvokelatest(expr::Expr)
+  if expr.head == :call
+    func = expr.args[1]
+    #= Check if the function is a qualified call to OMBackend.CodeGeneration =#
+    if func isa Expr && func.head == :.
+      funcStr = string(func)
+      if startswith(funcStr, "OMBackend.CodeGeneration.")
+        #= Wrap with Base.invokelatest =#
+        local newArgs = Any[:(Base.invokelatest), func]
+        for a in expr.args[2:end]
+          push!(newArgs, wrapWithInvokelatest(a))
+        end
+        return Expr(:call, newArgs...)
+      end
+    #= Check if the function is a bare symbol that is a registered dynamic function =#
+    elseif func isa Symbol && isDynamicModelicaFunction(func)
+      #= Wrap with Base.invokelatest =#
+      local newArgs = Any[:(Base.invokelatest), func]
+      for a in expr.args[2:end]
+        push!(newArgs, wrapWithInvokelatest(a))
+      end
+      return Expr(:call, newArgs...)
+    end
+    #= Recursively process arguments =#
+    local processedArgs = Any[]
+    for a in expr.args
+      push!(processedArgs, wrapWithInvokelatest(a))
+    end
+    return Expr(:call, processedArgs...)
+  elseif expr.head in (:(=), :block, :if, :elseif, :||, :&&, :comparison)
+    local processedArgs = Any[]
+    for a in expr.args
+      push!(processedArgs, wrapWithInvokelatest(a))
+    end
+    return Expr(expr.head, processedArgs...)
+  else
+    local processedArgs = Any[]
+    for a in expr.args
+      push!(processedArgs, wrapWithInvokelatest(a))
+    end
+    return Expr(expr.head, processedArgs...)
+  end
+end
+
+wrapWithInvokelatest(x) = x  #= For non-Expr types, return as-is =#
+
+"""
+Fix malformed function calls where stringification produces (FuncName())(args)
+instead of FuncName(args). This happens with some Modelica functions containing
+if-statements when processed through MTK symbolic machinery.
+"""
+function fixMalformedFunctionCalls(expr::Expr)
+  if expr.head == :call
+    local func = expr.args[1]
+    #= Check for pattern: (SomeFunc())(args) - where first arg is a zero-arg call =#
+    if func isa Expr && func.head == :call && length(func.args) == 1
+      #= This is a malformed double-call: func is (SomeFunc()) =#
+      #= Transform to: SomeFunc(args...) =#
+      local actualFunc = func.args[1]
+      local newArgs = Any[actualFunc]
+      for a in expr.args[2:end]
+        push!(newArgs, fixMalformedFunctionCalls(a))
+      end
+      return Expr(:call, newArgs...)
+    end
+  end
+  #= Recursively process all arguments for relevant expression types =#
+  if expr.head in (:call, :block, :if, :elseif, :(=), :||, :&&, :comparison)
+    local processedArgs = Any[]
+    for a in expr.args
+      push!(processedArgs, fixMalformedFunctionCalls(a))
+    end
+    return Expr(expr.head, processedArgs...)
+  end
+  return expr
+end
+
+fixMalformedFunctionCalls(x) = x  #= For non-Expr types, return as-is =#
+
 rewriteEq(eq) = begin
   local eqStr = string(eq)
   #= Remove typed array constructors - they cause conversion errors at runtime =#
   eqStr = replace(eqStr, r"SymbolicUtils\.BasicSymbolic\{Real\}\[" => "[")
+  #= Fix gensym-style function names: var"#FuncName" -> FuncName =#
+  #= MTK stringifies registered functions with # prefix that needs removal =#
+  eqStr = replace(eqStr, r"var\"#([^\"]+)\"" => s"\1")
   res = Meta.parse(replace(eqStr, "Differential(t)" => "D"))
-  res
+  #= Fix malformed function calls: (FuncName())(args) -> FuncName(args) =#
+  res = fixMalformedFunctionCalls(res)
+  #= Wrap dynamically generated function calls with Base.invokelatest =#
+  #= This is needed because the wrapper functions are defined via @eval at runtime, =#
+  #= creating them in a newer world age than the simulation code. =#
+  res = wrapWithInvokelatest(res)
+  return res
 end
 
 """
