@@ -645,8 +645,6 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           @match DAE.DIM_INTEGER(i) = d
           lookUpStr *= string("[", i, "]")
         end
-        @info "Lookup string:" * lookUpStr
-        @info "Replaced with:" * arrName
         indexAndVar = hashTable[lookUpStr]
         hashTable[arrName] = hashTable[lookUpStr]
         expr = quote $(Symbol(arrName)) end
@@ -795,7 +793,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           if success
             arrayExpr
           else
-            @info "Variable not in hash table, using direct reference: $varName"
+            #= Variable not in hash table, using direct reference =#
             quote
               $(LineNumberNode(@__LINE__, "$varName, missing from hash table"))
               $(Symbol(string(varPrefix, varName, varSuffix)))

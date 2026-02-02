@@ -148,9 +148,6 @@ function createStructuralCallback(simCode,
     function affect!(integrator)
       #= Expand the when operators =#
       $(whenOperators...)
-      @info("Structural callback triggered at $(integrator.t)")
-      @info("tprev at $(integrator.tprev)")
-      @info("integrator.u: $(integrator.u)")
       structuralChange.structureChanged = true
       integrator.just_hit_tstop = true
       structuralChange.timeAtChange = integrator.t

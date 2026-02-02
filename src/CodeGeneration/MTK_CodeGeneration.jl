@@ -185,6 +185,8 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     using ModelingToolkit
     using DifferentialEquations
     using OrdinaryDiffEq
+    using Symbolics
+    using OMBackend
     #= Add import to the external runtime if the generated code calls Modelica Functions =#
     $(if simCode.externalRuntime
         generateExternalRuntimeImport(simCode)
@@ -359,14 +361,18 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   =#
   local irreductableSyms = Symbol[Symbol(vn) for vn in simCode.irreductableVariables]
 
-  #= For pure ODE systems (no algebraic variables), always provide start values.
-     For DAE systems (has algebraic variables), use onlyFixed=true to avoid
-     conflicts between default values and algebraic constraints. =#
-  local hasAlgebraicConstraints = !isempty(algebraicVariables)
+  #= Heuristic for initialization:
+     - If any state variable has an explicit start value, assume the system has algebraic
+       constraints and only initialize states with explicit starts (avoid overdetermination).
+     - If NO state has an explicit start, provide defaults for all states (pure ODE case).
+     This handles both constrained DAE systems (like Pendulum) and pure ODE systems
+     (like MatrixVectorMult where states have no explicit start). =#
+  local anyStateHasExplicitStart = hasExplicitStartValue(simCode.irreductableVariables, simCode)
+  local skipDefaultsForStates = anyStateHasExplicitStart
   local FINAL_START_CONDTIONS_EQUATIONS = unique!(createStartConditionsEquationsMTK(
     String[vn for vn in simCode.irreductableVariables],
     String[],
-    simCode; onlyFixed = hasAlgebraicConstraints))
+    simCode; skipDefaultAlgebraicStarts = skipDefaultsForStates))
   FINAL_START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations, DISCRETE_START_VALUES, FINAL_START_CONDTIONS_EQUATIONS)
   START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations, DISCRETE_START_VALUES, START_CONDTIONS_EQUATIONS)
   #=
@@ -513,13 +519,15 @@ end
   Generates the initial value for the equations
   TODO: Currently unable to generate start condition in order
 
-if `onlyFixed` is true only start values for fixed variables with a specified start value are generated.
+If `skipDefaultAlgebraicStarts` is true, algebraic variables without explicit start values are skipped.
+State variables always get initialization since MTK ODEProblem requires all unknowns to have initial values.
 """
 function createStartConditionsEquationsMTK(states::Vector,
                                         algebraics::Vector,
-                                        simCode::SimulationCode.SimCode; onlyFixed = false)::Vector{Expr}
-  local algInit = getStartConditionsMTK(algebraics, simCode; onlyFixed = onlyFixed)
-  local stateInit = getStartConditionsMTK(states, simCode; onlyFixed = onlyFixed)
+                                        simCode::SimulationCode.SimCode; skipDefaultAlgebraicStarts = false)::Vector{Expr}
+  #= Both states and algebraics respect skipDefaultAlgebraicStarts (reverting to original behavior) =#
+  local algInit = getStartConditionsMTK(algebraics, simCode; skipDefaultStarts = skipDefaultAlgebraicStarts)
+  local stateInit = getStartConditionsMTK(states, simCode; skipDefaultStarts = skipDefaultAlgebraicStarts)
   local initialEquations = simCode.initialEquations
   local ieqInit = generateInitialEquations(initialEquations, simCode)
   #=
@@ -573,13 +581,39 @@ function generateInitialEquations(initialEqs, simCode::SimulationCode.SimCode; p
 end
 
 """
+  Checks if any variable in the list has an explicit start attribute.
+  Used to determine if the system likely has algebraic constraints that
+  determine some state variables, avoiding overdetermination.
+"""
+function hasExplicitStartValue(vars::Vector, simCode::SimulationCode.SimCode)::Bool
+  local ht::Dict = simCode.stringToSimVarHT
+  for var in vars
+    if !haskey(ht, var)
+      continue
+    end
+    (_, simVar) = ht[var]
+    local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
+    @match optAttributes begin
+      SOME(attributes) => begin
+        @match attributes.start begin
+          SOME(_) => return true
+          _ => nothing
+        end
+      end
+      _ => nothing
+    end
+  end
+  return false
+end
+
+"""
   Given a vector of variables and the simulation code
   extracts the start attributes to generate initial conditions.
 
-if `onlyFixed` is true only start values for fixed variables with a specified start value are generated.
-
+If `skipDefaultStarts` is true, variables without explicit start values are skipped.
+When false, variables without start values get default 0.0 initialization.
 """
-function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; onlyFixed = false)::Vector{Expr}
+function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; skipDefaultStarts = false)::Vector{Expr}
   local startExprs::Vector{Expr} = Expr[]
   local residuals = simCode.residualEquations
   local ht::Dict = simCode.stringToSimVarHT
@@ -619,14 +653,14 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; on
             continue
           end
           (NONE(), SOME(fixed)) => begin
-            if !onlyFixed
+            if !skipDefaultStarts
               push!(startExprs, :($(Symbol(varName)) => 0.0))
             end
             continue
           end
           (NONE(), NONE()) || (_, _) => begin
             #= No start value specified, default to 0.0 =#
-            if !onlyFixed
+            if !skipDefaultStarts
               warnings *= "\n Assumed starting value of 0.0 for variable: " * varName * "\n"
               push!(startExprs, :($(Symbol(varName)) => 0.0))
             end
@@ -634,7 +668,7 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; on
           end
         end
       end
-      NONE() where {!onlyFixed} => begin
+      NONE() where {!skipDefaultStarts} => begin
         #=
         If no attribute. Let it default to zero.
         This branch should only be taken for compiler generated variables.
@@ -1271,7 +1305,6 @@ function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.S
         =#
         push!(res, quote
                 idx = lookuptableStates[Symbol($(string(var.name)))]
-                @info idx
                 integrator.u[idx] = $(expToJuliaExpMTK(wStmt.value,
                                                                                                   simCode; varPrefix = varPrefix, varSuffix = varSuffix))
               end)

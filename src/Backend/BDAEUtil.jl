@@ -224,7 +224,6 @@ function traverseEquationExpressions(eq::BDAE.Equation,
          (newRhs, extArg) = Util.traverseExpTopDown(rhs, traversalOperation, extArg)
          @assign eq.left = newLhs
          @assign eq.right = newRhs
-         @info "Processed ARRAY_EQUATION: lhs changed=$(lhs !== newLhs), rhs changed=$(rhs !== newRhs)"
          (eq, extArg)
        end
        _ => begin

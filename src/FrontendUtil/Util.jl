@@ -317,9 +317,6 @@ function traverseExpListTopDown(expLst::List{DAE.Exp}, func::Function, inArg)
     end
   end
   #= Return original list if nothing changed to preserve identity =#
-  if !allEqual
-    @info "traverseExpListTopDown: List was modified"
-  end
   return allEqual ? (expLst, outArg) : (list(newExpLst...), outArg)
 end
 

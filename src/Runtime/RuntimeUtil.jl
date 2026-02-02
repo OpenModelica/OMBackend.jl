@@ -239,13 +239,6 @@ function createNewFlatModel(flatModel,
                                nil,
                                Bool[], #= TODO: This equation might need to be changed. =#
                                flatModel.comment)
-  println("Adding equations")
-  println("********************************************************************")
-  @debug length(newEquations)
-  for e in newEquations
-    println(OMFrontend.Frontend.toString(e))
-  end
-  println("********************************************************************")
   # println("Existing equations:")
   # println("********************************************************************")
   # @debug "Length of existing system:" length(newFlatModel.equations)
@@ -301,24 +294,7 @@ function createNewFlatModel(flatModel,
                                flatModel.unresolvedConnectEquations,
                                aDoccs,
                                flatModel.comment)
-  println("Create new model")
   local variablestoReset = resolveDOOCConnections(flatModel, flatModel.name)
-  println("********************************************************************")
-  println("Existing equations:")
-  println("********************************************************************")
-  println("Length of OLD FLAT MODEL:" * string(length(OMBackend.CodeGeneration.OLD_FLAT_MODEL.equations)))
-  for e in OMBackend.CodeGeneration.OLD_FLAT_MODEL.equations
-    println(OMFrontend.Frontend.toString(e))
-  end
-
-  # println("********************************************************************")
-  # println("New System:")
-  # println("********************************************************************")
-  # @info "Length of new system:" length(newFlatModel.unresolvedConnectEquations)
-  # for e in newFlatModel.unresolvedConnectEquations
-  #   println(OMFrontend.Frontend.toString(e))
-  # end
-  # println("********************************************************************")
   #=
     1. Reresolve the connect equations.
     2. Perform constant evaluation.
@@ -327,13 +303,6 @@ function createNewFlatModel(flatModel,
   newFlatModel = OMFrontend.Frontend.resolveConnections(newFlatModel, newFlatModel.name)
   newFlatModel = OMFrontend.Frontend.evaluate(newFlatModel)
   newFlatModel = OMFrontend.Frontend.simplifyFlatModel(newFlatModel)
-  println("Final System")
-  #@info "Length of final system:" length(newFlatModel.equations)
-  println("********************************************************************")
-  for e in newFlatModel.equations
-    println(OMFrontend.Frontend.toString(e))
-  end
-  println("********************************************************************")
   return newFlatModel
 end
 

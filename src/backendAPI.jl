@@ -98,7 +98,6 @@ This is not part of the lowering process but it is to be generated before we gen
 """
 function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatModel};
                    functionList = nothing, BackendMode = MTK_MODE)::Tuple{String, Expr}
-    @info "HELLO"
   local bDAE = lower(frontendDAE)
   local simCode
   if BackendMode == DAE_MODE
@@ -122,8 +121,7 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
     debugWrite("simulationCodePostFlattenRecords.log", SimulationCode.dumpSimCode(simCode))
     return generateMTKTargetCode(simCode)
   else
-    @error "No mode specificed: valid modes are:"
-    println("MTK_MODE")
+    @error "No mode specified: valid modes are: MTK_MODE"
   end
 end
 
@@ -315,7 +313,6 @@ function writeModelToFile(modelName::String, filePath::String; keepComments = tr
     mAsStr = modelToString(modelName; MTK = true,
                            keepComments = keepComments,
                            keepBeginBlocks = keepBeginBlocks)
-    @info "After string conversion"
     try
       #= Replace top level begin/end =#
       beginIdx = last(findfirst("begin", mAsStr)) + 1
@@ -323,12 +320,10 @@ function writeModelToFile(modelName::String, filePath::String; keepComments = tr
       mAsStr = mAsStr[beginIdx:endIdx]
       writeStringToFile(filePath, mAsStr)
     catch e
-      @error "Removing initial begin/end pairs"
-      @info e
+      @error "Error removing initial begin/end pairs" exception=(e, catch_backtrace())
     end
   catch e
-    @info "Failed writing $model to file: $filePath"
-    @error e
+    @error "Failed writing $model to file: $filePath" exception=(e, catch_backtrace())
   end
 end
 
@@ -383,9 +378,7 @@ function modelToString(modelName::String; MTK = true, keepComments = true, keepB
     end
     return formattedResults
   catch e
-    @error "Model: $(modelName) is not compiled.\n Available models are: $(availableModels())"
-    #throw("Error printing model")
-    @info e
+    @error "Model: $(modelName) is not compiled.\n Available models are: $(availableModels())" exception=(e, catch_backtrace())
   end
 end
 
@@ -457,11 +450,8 @@ function simulateModel(modelName::String;
       In the following path OMBackend.<modelName>Simulate
       =#
     catch err
-      @info "Interactive evaluation failed with exception: $(typeof(err)) with mode: $(MODE)"
-      @info "Runnable" modelRunnable
-      @info "Julia Code:"
-      println(strippedModel)
-      throw(err)
+      @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
+      rethrow(err)
     end
   else
     throw("Unsupported mode")

@@ -425,7 +425,6 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
         end
       end
       if hitTstop
-        @info "last(uAtChange)" last(uAtChange)
         reinit!(i,
                 last(uAtChange);
                 t0 = timeBeforeCallbackWasApplied,
@@ -495,8 +494,7 @@ function recompilation(activeModeName,
   local classToInstantiate = activeModeName
   #= 3) Call the frontend + the backend + JIT compile Julia code in memory =#
   local flatModelica = first(OMFrontend.instantiateSCodeToFM(classToInstantiate, newProgram))
-  #= 3.1 Run the backend=#
-  println(OMFrontend.toString(flatModelica))
+  #= 3.1 Run the backend =#
   local simulationCode = translateToSimCode(flatModelica, activeModeName)
   #= 3.2 Adjust variables and special parameters =#
   RuntimeUtil.updateInitialConditions!(simulationCode, integrator)

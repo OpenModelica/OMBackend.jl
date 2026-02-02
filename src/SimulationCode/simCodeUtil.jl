@@ -438,7 +438,6 @@ function getIndiciesOfVariables(variables,
     local varName = DAE_identifierToString(v)
     if !haskey(stringToSimVarHT, varName)
       #= TODO: Properly handle record fields and certain parameters. =#
-      @info "Variable not in hash table, skipping: $varName"
       continue
     end
     idx, var = stringToSimVarHT[varName]
@@ -509,34 +508,16 @@ function getOCCGraph(flatModel)
             (re.lhs, re.rhs))
     end
   end
-  OMFrontend.Frontend.printNFOCConnectionGraph(graph)
-  println("Broken equations")
-  OMFrontend.Frontend.printFlatEdges(broken)
   #= Remove the broken edge from the set of edges =#
   @assign graph.connections = arrayList(filter((x)->(!in(x, broken)), listArray(graph.connections)))
-  println("Graph with broken removed")
-  OMFrontend.Frontend.printNFOCConnectionGraph(graph)
   #= Convert the branches to regular edges =#
   local uniqueRoots = graph.uniqueRoots
   local definiteRoots = graph.definiteRoots
   local potentialRoots = graph.potentialRoots
-  @info "Length uniqueroots" length(uniqueRoots)
-  @info "definiteRoots" length(definiteRoots)
-  @info "Potential roots" length(potentialRoots)
-  println("Print: definiteRoots")
-  for r in potentialRoots
-    println(OMFrontend.Frontend.toString(first(r)))
-  end
-  println("Print: final roots")
-  for r in roots
-    println(OMFrontend.Frontend.toString(r))
-  end
   #= Get the roots involved in the structural change =#
   rootVariables::List{OMFrontend.Frontend.ComponentRef} = MetaModelica.list(r for r in roots)
-  #  @info "roots" roots
   #= Create a graph that we can search. =#
   local connectionEdges = convertFlatEdgeToEdges(graph.connections)
-  @info typeof(connectionEdges)
   local allEdges = listAppend(connectionEdges, graph.branches)
   local searchGraph = createSearchGraph(allEdges)
   return (searchGraph, rootVariables, rootReferenceVariables)

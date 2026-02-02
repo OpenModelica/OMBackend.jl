@@ -458,7 +458,7 @@ function matchAndCheckStronglyConnectedComponents(eqVariableMapping,
                                                         numberOfVariablesInMapping)
   catch e
     if mode == OMBackend.MTK_MODE
-      @info "Matching failed, delegating structural analysis to ModelingToolkit"
+      #= Matching failed, delegating structural analysis to ModelingToolkit =#
       return (true, Int[], MetaGraphs.MetaDiGraph(), Vector{Int}[])
     else
       rethrow(e)

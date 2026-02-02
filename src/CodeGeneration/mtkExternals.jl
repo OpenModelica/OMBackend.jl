@@ -234,7 +234,6 @@ function rewriteEquations(edeqs, iv, eVars, ePars, simCode; arrayParameterExprs:
   #= TODO: Try to move der to the top level to avoid eval here. =#
   local der = ModelingToolkit.Differential(t)
   #= Remove the t's =#
-  @info eVars
   eVars = [Symbol(replace(string(v), "(t)" => "")) for v in eVars]
   #Temporary fix for the ESCIMO climate model: eVars = vcat(eVars, [Symbol("combi_Population_Lookup_bn_y")])
   #=
@@ -330,12 +329,10 @@ function evalEDeqs(edeqs)
       end
     catch ex
       global TEST = e
-      #Hack
       local unSimplifiedString = string(e)
       unSimplifiedString = replace(unSimplifiedString, "&&" => "&")
       unSimplifiedString = replace(unSimplifiedString, r"\bbegin\b" => "(")
       unSimplifiedString = replace(unSimplifiedString, r"\bend\b" => ")")
-      println(unSimplifiedString)
       estrExp = Meta.parse(unSimplifiedString)
       estrExp2 = eval(estrExp)
       estrExp2LHS = estrExp2.lhs
@@ -530,7 +527,6 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
                              simplify = false,
                              allow_parameter = true,
                              kwargs...)
-  @info "Calling custom structural_simplify"
   #sys = ModelingToolkit.ode_order_lowering(sys)
   #sys = ModelingToolkit.dae_index_lowering(sys)
   #sys = ModelingToolkit.tearing(sys; simplify = simplify)

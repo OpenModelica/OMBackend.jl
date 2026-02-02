@@ -736,7 +736,6 @@ function simplifyASUBofARRAY(asub::DAE.Exp)::DAE.Exp
       #= Convert the list to an array to access by index =#
       elemArray = collect(elements)
       if idx >= 1 && idx <= length(elemArray)
-        @info "Simplified ASUB(ARRAY, $idx) → element"
         return elemArray[idx]
       else
         @warn "ASUB index $idx out of bounds for array of length $(length(elemArray))"
@@ -747,7 +746,6 @@ function simplifyASUBofARRAY(asub::DAE.Exp)::DAE.Exp
     DAE.ASUB(DAE.ARRAY(array = elements), Cons(DAE.INDEX(DAE.ICONST(idx)), Nil())) => begin
       elemArray = collect(elements)
       if idx >= 1 && idx <= length(elemArray)
-        @info "Simplified ASUB(ARRAY, INDEX($idx)) → element"
         return elemArray[idx]
       else
         @warn "ASUB index $idx out of bounds for array of length $(length(elemArray))"
@@ -775,15 +773,11 @@ function transformASUBInDer(exp::DAE.Exp, acc)
         simplifiedInner = simplifyASUBofARRAY(innerASUB)
         #= Wrap with der() call =#
         newDer = DAE.CALL(Absyn.IDENT("der"), list(simplifiedInner), attr)
-        @info "Transformed ASUB(der(array), subscripts) → der(simplified_subscript)"
         (newDer, true, acc)
       end
       #= Also simplify standalone ASUB(ARRAY([...]), i) expressions =#
       DAE.ASUB(DAE.ARRAY(__), _) => begin
         simplified = simplifyASUBofARRAY(exp)
-        if simplified !== exp
-          @info "Simplified ASUB(ARRAY([...]), i) → element"
-        end
         (simplified, true, acc)
       end
       _ => (exp, true, acc)
