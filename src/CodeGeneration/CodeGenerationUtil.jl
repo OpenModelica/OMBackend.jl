@@ -187,16 +187,16 @@ stateVariables, algebraicVariables, stateVariablesLoop, algebraicVariablesLoop
 """
 function separateVariables(simCode)::Tuple
   local stringToSimVarHT = simCode.stringToSimVarHT
-  local parameters::Vector = []
-  local stateDerivatives::Vector = []
-  local stateVariables::Vector = []
-  local algebraicVariables::Vector = []
-  local discreteVariables::Vector = []
+  local parameters::Vector{String} = String[]
+  local stateDerivatives::Vector{String} = String[]
+  local stateVariables::Vector{String} = String[]
+  local algebraicVariables::Vector{String} = String[]
+  local discreteVariables::Vector{String} = String[]
   #= Loop arrays=#
-  local stateDerivativesLoop::Vector = []
-  local stateVariablesLoop::Vector = []
-  local algebraicVariablesLoop::Vector = []
-  local discreteVariablesLoop::Vector = []
+  local stateDerivativesLoop::Vector{String} = String[]
+  local stateVariablesLoop::Vector{String} = String[]
+  local algebraicVariablesLoop::Vector{String} = String[]
+  local discreteVariablesLoop::Vector{String} = String[]
   #= Separate the variables =#
   for varName in keys(stringToSimVarHT)
     (idx, var) = stringToSimVarHT[varName]
@@ -497,23 +497,40 @@ function stripBeginBlocks(e)::Expr
 end
 
 """
-Transforms:s
+Transforms:
   <name>_index -> <name>[index]
+Uses direct Expr construction instead of string interpolation + Meta.parse.
 """
 const pattern = r".*_[0-9]+"
 function symbolicVariableToArrayRef(e::Expr)::Expr
   MacroTools.postwalk(e) do x
-      x isa Symbol || return let
-        x
+    x isa Symbol || return x
+    local sstr = String(x)
+    match(pattern, sstr) === nothing && return x
+    local parts = split(sstr, "_")
+    return Expr(:ref, Symbol(parts[1]), parse(Int, parts[2]))
+  end
+end
+
+"""
+Convert a MetaModelica list of DAE subscripts directly to Julia Expr form
+without going through string conversion + Meta.parse.
+Returns an integer for single constant subscripts, or a tuple Expr for multiple.
+"""
+function subscriptsToExpr(subscripts, simCode; varPrefix="", varSuffix="", derSymbol=:der)
+  local exprs = map(subscripts) do sub
+    @match sub begin
+      DAE.INDEX(DAE.ICONST(i)) => i
+      DAE.ICONST(i) => i
+      DAE.INDEX(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+      DAE.WHOLEDIM(__) => :(:)
+      _ => Meta.parse(string(sub))  #= Fallback for unknown subscript types =#
     end
-    return let
-      if match(pattern, "$x") == nothing
-        return x
-      end
-      local splitted = split("$x", "_")
-      local res = Meta.parse("$(splitted[1])[$(splitted[2])]")
-      return res
-    end
+  end
+  if length(exprs) == 1
+    return first(exprs)
+  else
+    return Expr(:tuple, exprs...)
   end
 end
 
@@ -539,7 +556,7 @@ function getVariablesInDAE_Exp(@nospecialize(exp::DAE.Exp), simCode::SimulationC
     DAE.ICONST(int) => variables
     DAE.RCONST(real) => variables
     DAE.SCONST(tmpStr) => variables
-    DAE.CREF(cr, _) where SimulationCode.string(cr)=="time" => begin
+    DAE.CREF(DAE.CREF_IDENT("time", __), _) => begin
       push!(variables, Symbol("t"))
     end
     DAE.CREF(cr, _)  => begin
@@ -646,7 +663,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           lookUpStr *= string("[", i, "]")
         end
         indexAndVar = hashTable[lookUpStr]
-        hashTable[arrName] = hashTable[lookUpStr]
+        hashTable[arrName] = indexAndVar
         expr = quote $(Symbol(arrName)) end
         #fail()
         expr
@@ -709,13 +726,6 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                                  FrontendUtil.Util.finalCrefIsArray(componentRef)
                              } =>
       begin
-        #= Debug: log entry to CREF_QUAL pattern =#
-        open("/home/johti17/Projects/Julia/OM.jl/test/cref_qual_debug.log", "a") do io
-          println(io, "=== ENTERED CREF_QUAL pattern ===")
-          println(io, "ident: $ident")
-          println(io, "componentRef dump:")
-          dump(io, componentRef; maxdepth=4)
-        end
         local cr = DAE.CREF_QUAL(ident, identType, subscriptLst, componentRef)
         varName = SimulationCode.DAE_identifierToString(cr)
         #= Workaround =#
@@ -726,24 +736,15 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         local lookupStrPrefix = reduce((x,y) -> string(x, "_", y), map(string, fcrs[1:end-1]))
         local lookupStr = string(lookupStrPrefix, "_", SimulationCode.DAE_identifierToString(fcr))
 
-        if !haskey(hashTable, lookupStr)
-          #= Debug: dump to log file =#
-          open("/home/johti17/Projects/Julia/OM.jl/test/cref_qual_debug.log", "a") do io
-            println(io, "=== CREF_QUAL path - NOT IN HASH TABLE ===")
-            println(io, "lookupStr: $lookupStr")
-            println(io, "exp dump:")
-            dump(io, exp; maxdepth=5)
-            println(io, "---")
-          end
-          global PROBLEM_CREF = exp
-          global PROBLEM_SUBSCRIPTS = subscripts
-          local ss = Meta.parse(string(subscripts))
+        local lookupEntry = get(hashTable, lookupStr, nothing)
+        if lookupEntry === nothing
+          local ss = subscriptsToExpr(subscripts, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
           quote
             $(LineNumberNode(@__LINE__, "Array access to missing var: $lookupStr"))
             getIndex($(Symbol(string(varPrefix, lookupStr, varSuffix))), $(ss))
           end
         else
-          local indexAndVar = hashTable[lookupStr]
+          local indexAndVar = lookupEntry
           local varKind = indexAndVar[2].varKind
           @match varKind begin
             (SimulationCode.ARRAY(_, SOME(bindArray && DAE.ARRAY(__))) ||
@@ -775,7 +776,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           end
           #= Fallback: generate getIndex call =#
           local vRef = string(varPrefix, indexAndVar[2].name, varSuffix)
-          local ss = Meta.parse(string(subscripts))
+          local ss = subscriptsToExpr(subscripts, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
           quote
             $(LineNumberNode(@__LINE__, "Array access to: $vRef"))
             getIndex($(Symbol(vRef)), $(ss))
@@ -785,7 +786,6 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
 
       DAE.CREF(cr, _)  => begin
         varName = SimulationCode.DAE_identifierToString(cr)
-        global TESTEXP = exp
         if !haskey(hashTable, varName)
           #= Try to handle as subscripted array access (e.g., R_w[1] where R_w is an ARRAY) =#
           (success, arrayExpr) = tryHandleSubscriptedArrayCref(cr, hashTable, simCode,
@@ -985,7 +985,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         #= Handle array comprehensions and reductions =#
         local bodyExpr = expToJuliaExpMTK(bodyExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
         #= Build iterator expressions =#
-        local iterExprs = []
+        local iterExprs = Expr[]
         for iter in iterators
           @match iter begin
             DAE.REDUCTIONITER(id, rangeExp, guardExp, _) => begin
@@ -1052,11 +1052,13 @@ function tryHandleSubscriptedArrayCref(cr::DAE.ComponentRef, hashTable, simCode;
   local subscripts = FrontendUtil.Util.getSubscriptsFromCref(cr)
   local baseName = FrontendUtil.Util.getBaseNameWithoutSubscripts(cr)
 
-  if isempty(subscripts) || !haskey(hashTable, baseName)
+  if isempty(subscripts)
     return (false, :())
   end
-
-  local baseVar = hashTable[baseName]
+  local baseVar = get(hashTable, baseName, nothing)
+  if baseVar === nothing
+    return (false, :())
+  end
   if !(baseVar[2].varKind isa SimulationCode.ARRAY || baseVar[2].varKind isa SimulationCode.ARRAY_PARAMETER)
     return (false, :())
   end

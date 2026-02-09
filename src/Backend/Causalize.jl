@@ -303,127 +303,6 @@ function detectStateExpression(exp::DAE.Exp, stateCrefs::Dict{DAE.ComponentRef, 
 end
 
 """
-  Detects if an expression is of type array.
-  If it is the case return that expression,
-  else if it is not the case return the original exp.
-"""
-function detectArrayExpression(exp::DAE.Exp, arrayCrefs::Dict{String, Bool})
-  local cont::Bool
-  local outCrefs = arrayCrefs
-  local newExp::DAE.Exp
-  @debug "detectArrayExpression for $(exp)"
-  (newExp, outCrefs, cont) = begin
-    @match exp begin
-      DAE.CREF(matchedComponentRef, ty) where typeof(matchedComponentRef.identType) == DAE.T_ARRAY => begin
-        newExp = if haskey(arrayCrefs, matchedComponentRef.ident)
-          local subscriptStr::String = BDAEUtil.getSubscriptAsUnicodeString(matchedComponentRef.subscriptLst)
-          local newName::String = matchedComponentRef.ident + subscriptStr
-          local newCref = DAE.CREF_IDENT(newName, ty, nil)
-          @debug "Replaced the expression. New type is $(ty)"
-          DAE.CREF(newCref, ty)
-        else
-          @debug "Did not replace the expression"
-          exp
-        end
-        (newExp, outCrefs, true)
-      end
-      DAE.CALL(Absyn.IDENT("sum"),
-               DAE.CREF(matchedComponentRef, ty) <| _ ) where typeof(matchedComponentRef.identType) == DAE.T_ARRAY => begin
-                 @debug "We are in sum"
-                 newExp = if haskey(arrayCrefs, matchedComponentRef.ident)
-                   local subscriptStr = BDAEUtil.getSubscriptAsUnicodeString(matchedComponentRef.subscriptLst)
-                   local newName = matchedComponentRef.ident + subscriptStr
-                   local newCref = DAE.CREF_IDENT(newName, ty, nil)
-                   @debug "Replaced the call "
-                   dimLen = listLength(ty.dims)
-                   @assert(dimLen == 1)
-                   len = listHead(ty.dims).integer
-                   arrType = ty.ty
-                   #=Add adds=#
-                   ident = BDAEUtil.getIntAsUnicodeSubscript(1)
-                   local tmp = DAE.CREF(DAE.CREF_IDENT("x$(ident)", arrType, nil), arrType)
-                   i = 2
-                   for _ in 2:len
-                     ident = BDAEUtil.getIntAsUnicodeSubscript(i)
-                     tmp = DAE.BINARY(DAE.CREF(DAE.CREF_IDENT("x$(ident)", arrType, nil), arrType), DAE.ADD(arrType), tmp)
-                     i += 1
-                   end
-                   #DAE.CALL(exp.path, list(DAE.CREF(newCref, ty)), exp.attr)
-                   tmp
-                 else
-                   @debug "Did not replace the call expression"
-                   exp
-                 end
-                 (newExp, outCrefs, true)
-               end
-      DAE.CALL(Absyn.IDENT("product"),
-               DAE.CREF(matchedComponentRef, ty) <| _ ) where typeof(matchedComponentRef.identType) == DAE.T_ARRAY => begin
-                 @debug "We are in sum"
-                 newExp = if haskey(arrayCrefs, matchedComponentRef.ident)
-                   local subscriptStr = BDAEUtil.getSubscriptAsUnicodeString(matchedComponentRef.subscriptLst)
-                   local newName = matchedComponentRef.ident + subscriptStr
-                   local newCref = DAE.CREF_IDENT(newName, ty, nil)
-                   @debug "Replaced the call "
-                   dimLen = listLength(ty.dims)
-                   @assert(dimLen == 1)
-                   len = listHead(ty.dims).integer
-                   arrType = ty.ty
-                   #=Add adds=#
-                   ident = BDAEUtil.getIntAsUnicodeSubscript(1)
-                   local tmp = DAE.CREF(DAE.CREF_IDENT("x$(ident)", arrType, nil), arrType)
-                   i = 2
-                   for _ in 2:len
-                     ident = BDAEUtil.getIntAsUnicodeSubscript(i)
-                     tmp = DAE.BINARY(DAE.CREF(DAE.CREF_IDENT("x$(ident)", arrType, nil), arrType), DAE.MUL(arrType), tmp)
-                     i += 1
-                   end
-                   #DAE.CALL(exp.path, list(DAE.CREF(newCref, ty)), exp.attr)
-                   tmp
-                 else
-                   @debug "Did not replace the call expression"
-                   exp
-                 end
-                 (newExp, outCrefs, true)
-               end
-      DAE.CALL(Absyn.IDENT("exp"),
-               DAE.CREF(matchedComponentRef, ty) <| _ ) where typeof(matchedComponentRef.identType) == DAE.T_ARRAY => begin
-                 fail()
-                 newExp = if haskey(arrayCrefs, matchedComponentRef.ident)
-                   local subscriptStr = BDAEUtil.getSubscriptAsUnicodeString(matchedComponentRef.subscriptLst)
-                   local newName = matchedComponentRef.ident + subscriptStr
-                   local newCref = DAE.CREF_IDENT(newName, ty, nil)
-                   @debug "Replaced the call expression"
-                   DAE.CALL(exp.path, list(DAE.CREF(newCref, ty)), exp.attr)
-                 else
-                   @debug "Did not replace the call expression"
-                   exp
-                 end
-                 (newExp, outCrefs, true)
-               end
-      #= Any other call that contains an array should be replaced. =#
-      DAE.CALL(Absyn.IDENT(__),
-               DAE.CREF(matchedComponentRef, ty) <| _ ) where typeof(matchedComponentRef.identType) == DAE.T_ARRAY => begin
-                 newExp = if haskey(arrayCrefs, matchedComponentRef.ident)
-                   local subscriptStr = BDAEUtil.getSubscriptAsUnicodeString(matchedComponentRef.subscriptLst)
-                   local newName = matchedComponentRef.ident + subscriptStr
-                   local newCref = DAE.CREF_IDENT(newName, ty, nil)
-                   @debug "Replaced the call expression"
-                   DAE.CALL(exp.path, list(DAE.CREF(newCref, ty)), exp.attr)
-                 else
-                   @debug "Did not replace the call expression"
-                   exp
-                 end
-                 (newExp, outCrefs, true)
-               end
-      _ => begin
-        (exp, outCrefs, true)
-      end
-    end
-  end
-  return (newExp, cont, outCrefs)
-end
-
-"""
   kabdelhak:
     Traverses all variables and uses a hashmap to determine if a variable needs
     to be updated to be a BDAE.STATE()
@@ -813,8 +692,8 @@ function resolveCrefBindings!(orderedVars::Vector{BDAE.VAR})
       @match bindExp begin
         SOME(DAE.CREF(cr, _)) => begin
           (targetName, _, _) = crefToFlatName(cr)
-          if haskey(bindingMap, targetName)
-            local targetBinding = bindingMap[targetName]
+          local targetBinding = get(bindingMap, targetName, nothing)
+          if targetBinding !== nothing
             if !(targetBinding isa DAE.CREF)
               orderedVars[i].bindExp = SOME(targetBinding)
               local varName = string(orderedVars[i].varName)
@@ -891,25 +770,25 @@ end
   Converts [INDEX(ICONST(1)), INDEX(ICONST(2))] → "[1][2]"
 """
 function subscriptListToString(subscriptLst::List{DAE.Subscript})::String
-  result = ""
+  local buf = IOBuffer()
   for s in subscriptLst
     @match s begin
       DAE.INDEX(DAE.ICONST(i)) => begin
-        result *= string("[", i, "]")
+        print(buf, "[", i, "]")
       end
       DAE.INDEX(exp) => begin
         #= Non-constant subscript - keep as is =#
-        result *= string("[", exp, "]")
+        print(buf, "[", exp, "]")
       end
       DAE.WHOLEDIM() => begin
-        result *= "[:]"
+        print(buf, "[:]")
       end
       _ => begin
         @warn "Unhandled subscript type in flattenArrayCrefInExp: $(typeof(s))"
       end
     end
   end
-  return result
+  return String(take!(buf))
 end
 
 """

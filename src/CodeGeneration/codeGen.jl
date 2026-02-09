@@ -191,21 +191,16 @@ end
   Returns the argument array for the callback set.
 """
 function returnCallbackSet()::Array
-  local cbs::Array{Symbol} = []
+  local cbs::Vector{Symbol} = Symbol[]
   for t in 1:COUNT_CALLBACKS()
     cb = Symbol("cb", t)
     push!(cbs, cb)
-  end
-  expr::Array = if length(cbs) < 1
-    []
-  else
-    cbs
   end
   return cbs
 end
 
 function createRealToStateVariableMapping(stateVariables::Array, simCode::SimulationCode.SIM_CODE; toFrom::Tuple=("reals", "x"))::Array{Expr}
-  local daeStateUpdateVector::Array = []
+  local daeStateUpdateVector::Vector{Expr} = Expr[]
   for svName in stateVariables
     local varIdx = simCode.stringToSimVarHT[svName][1]
     push!(daeStateUpdateVector, :($(Symbol(toFrom[1]))[$varIdx] = $(Symbol(toFrom[2]))[$varIdx]))
@@ -229,7 +224,7 @@ end
   Create equations for the parameters.
 """
 function createParameterEquations(parameters::Array, simCode::SimulationCode.SimCode)
-  local parameterEquations::Array = []
+  local parameterEquations::Vector{Expr} = Expr[]
   local hT = simCode.stringToSimVarHT
   for param in parameters
     (index, simVar) = hT[param]

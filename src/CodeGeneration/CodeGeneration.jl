@@ -62,6 +62,7 @@ import SymbolicUtils
 RuntimeGeneratedFunctions.init(@__MODULE__)
 
 include("mtkExternals.jl")
+include("./exprRewrite.jl")
 include("./arrayUtils.jl")
 include("./CodeGenerationUtil.jl")
 include("./structuralCallbacks.jl")

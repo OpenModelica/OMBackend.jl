@@ -485,26 +485,6 @@ function getSubscriptAsIntArray(dims)::Array
   return dimIndices
 end
 
-function getSubscriptAsUnicodeString(subscriptLst)::String
-  local subscripts = subscriptLst
-  local subscriptStr = ""
-  for s in subscripts
-    @assert(typeof(s) == DAE.INDEX, "DAE.INDEX: is expected for $(s)")
-    #= Here I assume integer index!=#
-    local indexAsInt::Integer = s.exp.integer
-    local result = 0
-    local tmp = 0
-    subscriptStr *= getIndexAsAUnicodeString(s)
-  end
-  return subscriptStr
-end
-
-function getIndexAsAUnicodeString(idx::DAE.INDEX)
-  local indexAsInt::Integer = idx.exp.integer
-  local subscriptStr = ""
-  return getIntAsUnicodeSubscript(indexAsInt)
-end
-
 """
 input: 100
 output \"₁₀₀\"

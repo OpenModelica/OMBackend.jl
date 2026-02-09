@@ -433,14 +433,14 @@ This function returns the indices of these variables.
 function getIndiciesOfVariables(variables,
                                 stringToSimVarHT::OrderedDict{String, Tuple{Integer, SimVar}})
   local indicies = Int[]
-  global STRING_HT = stringToSimVarHT
   for v in variables
     local varName = DAE_identifierToString(v)
-    if !haskey(stringToSimVarHT, varName)
+    local entry = get(stringToSimVarHT, varName, nothing)
+    if entry === nothing
       #= TODO: Properly handle record fields and certain parameters. =#
       continue
     end
-    idx, var = stringToSimVarHT[varName]
+    idx, var = entry
     if isAlgebraic(var)
       #= Algebraic variables use a special idx for backend sorting purposes. =#
       push!(indicies, var.varKind.sortIdx)

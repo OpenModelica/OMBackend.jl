@@ -42,6 +42,7 @@ import OMBackend
 import OMBackend.SimulationCode
 import OMBackend.CodeGeneration
 import ..@BACKEND_LOGGING
+import ..@VSS_DEBUG
 import OMFrontend
 import DAE
 
@@ -212,7 +213,7 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
     retCode = check_error(integrator)
     for cb in structuralCallbacks
       if cb.structureChanged && cb.name != activeModeName
-        ##@info "Structure changed at $(i.t) transition to $(cb.name) => $(cb.structureChanged)"
+        @VSS_DEBUG @info "Structure changed at $(i.t) transition to $(cb.name) => $(cb.structureChanged)"
         #= Find the correct variables and map them between the two models =#
         local newSystem = cb.system
         indicesOfCommonVariables = getIndicesOfCommonVariables(getSyms(newSystem)
@@ -292,32 +293,31 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
     retCode = check_error(integrator)
     for j in 1:length(structuralCallbacks)
       local cb = structuralCallbacks[j]
-      #@info("Structure Changed? $(cb.structureChanged)")
+      @VSS_DEBUG @info "Structure Changed? $(cb.structureChanged)"
       if cb.structureChanged && i.t <= tspan[2]
-        #@info "Recompilation directive triggered at:" i.t
-        #@info "Δt is:" i.t - i.dt
+        @VSS_DEBUG @info "Recompilation directive triggered at:" i.t "Δt is:" (i.t - i.dt)
         local newU0
-        #@info "Test syms before recompilation call..." getSyms(problem) integrator.u
+        @VSS_DEBUG @info "Syms before recompilation:" getSyms(problem) integrator.u
         (newProblem, newSymbolTable, finalInitialValues, initialValues, reducedSystem, specialCase) = recompilation(cb.name,
                                                                                                                     cb,
                                                                                                                     integrator,
                                                                                                                     tspan,
                                                                                                                     callbackConditions)
-        #= Assuming the indices are the same (Which is not always true) =#
-        #@info "Old u" integrator.u
-        #@info "tmpSolAtChange" tmpSolAtChange
-        #@info "initialValues" initialValues
-        #@info "finalInitialValues" finalInitialValues
         local symsOfOldProblem = getSyms(problem)
         local symsOfNewProblem = getSyms(newProblem)
-        #@info "symsOfOldProblem" symsOfOldProblem
-        #@info "symsOfNewProblem" symsOfNewProblem
+        @VSS_DEBUG begin
+          @info "Old u" integrator.u
+          @info "initialValues" initialValues
+          @info "finalInitialValues" finalInitialValues
+          @info "symsOfOldProblem" symsOfOldProblem
+          @info "symsOfNewProblem" symsOfNewProblem
+        end
         newU0 = RuntimeUtil.createNewU0(symsOfOldProblem,
                                         symsOfNewProblem,
                                         initialValues,
                                         last(cb.solutionAtChange.u),
                                         specialCase)
-        #@info "The new u0" newU0
+        @VSS_DEBUG @info "The new u0" newU0
         #=
         TODO:
             Also add the continuous events here
@@ -364,23 +364,13 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
       end
     end #= Structural callback handling =#
     #= invoke latest to avoid world age problems =#
-    #@info "integrator.t + integrator.dt" integrator.t + integrator.dt
-    #@info "integrator.t + integrator.dtpropose" integrator.t + integrator.dtpropose
+    @VSS_DEBUG @info "integrator step" (integrator.t + integrator.dt) (integrator.t + integrator.dtpropose)
     if integrator.t + integrator.dtpropose >= tspan[2]
-      #@info "Timestep exceeds the simulation"
-      #@info "integrator.t" integrator.t
-      #@info "integrator.u" integrator.u
-      #@info "integrator.t + integrator.dtpropose" integrator.t + integrator.dtpropose
-      #@info "Adjusting..."
+      @VSS_DEBUG @info "Timestep exceeds simulation, adjusting" integrator.t integrator.u (integrator.t + integrator.dtpropose)
       integrator.dt = 1e-6
       integrator.dtpropose = 1e-6
-      #@info "integrator.dt" integrator.dt
-      #@info "integrator.dtpropose" integrator.dtpropose
-      #@info "integrator.u" integrator.u
-      #@info "integrator.t + integrator.dt" integrator.dt + integrator.t
+      @VSS_DEBUG @info "After adjustment" integrator.dt integrator.dtpropose integrator.u
       Base.invokelatest(step!, integrator, integrator.dt, true)
-      # @info "i.t" integrator.t
-      #break #= Restarts  integration =#
     else
       Base.invokelatest(step!, integrator, integrator.dt, false)
     end
@@ -401,25 +391,21 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
           Save the old solution
           Resize the solution to the time t before the change.
           =#
-          #@info cb.solutionAtChange.t
+          @VSS_DEBUG @info "solutionAtChange.t" cb.solutionAtChange.t
           local stopIdx = findlast((x) -> x == timeBeforeCallbackWasApplied, cb.solutionAtChange.t)
           @assert stopIdx !== nothing "Invalid callback occured during simulation"
-          #@info "stopIdx" stopIdx
+          @VSS_DEBUG @info "stopIdx" stopIdx
           solAtChange = cb.solutionAtChange #Used for error checking
           local modifiedSol = deepcopy(cb.solutionAtChange)
-          #@info "modifiedSol" modifiedSol
-          #@info "modifiedSol.t"  modifiedSol.t
           resize!(modifiedSol.t, stopIdx)
           resize!(modifiedSol.u, stopIdx)
-          ##@info "After resize..."
-          #@info "modifiedSol" modifiedSol.u
-          #@info "modifiedSol.t"  modifiedSol.t
+          @VSS_DEBUG @info "modifiedSol after resize" modifiedSol.u modifiedSol.t
           #= Assign the adjusted solution vector. =#
           uAtChange = modifiedSol.u
           timeAtChange = modifiedSol.t
           tmpSolAtChange = uAtChange
           #= The modified solution is the solution before we start the next part of the solution process. =#
-          #@info "Saving solution..."
+          @VSS_DEBUG @info "Saving solution..."
           push!(solutions, modifiedSol)
           hitTstop = true
         end
@@ -433,15 +419,15 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
                 erase_sol = true,
                 reinit_callbacks = false)
         i.just_hit_tstop = false
-        #@info "uAtChange" uAtChange
-        #global INT_TMP = deepcopy(i)
-        #global TMP_NAME = activeModeName
-        #@info activeModeName
-        #@info "timeBeforeCallbackWasApplied" timeBeforeCallbackWasApplied
-        #@info "integrator.u" integrator.u
-        #@info "integrator.t" integrator.t
-        #@info "i.u" i.u
-        #@info "i.t" i.t
+        @VSS_DEBUG begin
+          @info "uAtChange" uAtChange
+          @info "activeModeName" activeModeName
+          @info "timeBeforeCallbackWasApplied" timeBeforeCallbackWasApplied
+          @info "integrator.u" integrator.u
+          @info "integrator.t" integrator.t
+          @info "i.u" i.u
+          @info "i.t" i.t
+        end
       elseif integrator.t >= last(tspan) #= Hack to handle the special case where we are slightly above tstop=#
         sol = integrator.sol
         idx = findall(t -> t <= tspan[2], sol.t)
@@ -499,8 +485,6 @@ function recompilation(activeModeName,
   #= 3.2 Adjust variables and special parameters =#
   RuntimeUtil.updateInitialConditions!(simulationCode, integrator)
   local resultingModel = translateToMTK(simulationCode, activeModeName)
-  global TMP_RES_MOD = resultingModel
-  global TMP_SIM_CODE = simulationCode
   #= 4.0 Revaulate the model=#
   local modelName = string(replace(activeModeName, "." => "__"), "Model")
   @eval $(resultingModel)
@@ -701,11 +685,8 @@ function getIndicesOfCommonVariables(syms1::Vector{Symbol} # New system
     keys(idxDict2), idxDict1
   end
   for key in smallestKeyset
-    if haskey(dict, key)
-      push!(indicesOfCommonVariables, dict[key])
-    else
-      push!(indicesOfCommonVariables, 0)
-    end
+    local val = get(dict, key, 0)
+    push!(indicesOfCommonVariables, val)
   end
   return indicesOfCommonVariables
 end

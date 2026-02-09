@@ -102,6 +102,9 @@ end
   The wrapper also handles symbolic arguments: if any argument is symbolic (Symbolics.Num),
   it returns a symbolic term instead of calling the implementation. This replaces the need
   for @register_symbolic which does not work reliably when called at runtime.
+
+TODO:
+This error still persists in some generations.
 """
 function createModelicaFunctionWrapper(funcName::Symbol, nArgs::Int)
   #= Check if symbol already exists - if so, skip redefinition =#
@@ -171,195 +174,18 @@ So we know about t an der in the global scope.
 This is needed for the rules below to match correctly.
 =#
 
-@independent_variables t #ModelingToolkit.@variables t
+@independent_variables t
 const D = Differential(t)
-
 using DataStructures
 
 """
-    Temporary rewrite function. Not very pretty...
-    Original code by Chris R. Expanded to fix terms of type X * D(Y).
-    The solution to solve it is not pretty and is probably flaky.
-  #istree returns true if x is a term. If true, operation, arguments must also be defined for x appropriately.
+Rewrite equations for MTK: move derivatives to the LHS, rename der to D,
+qualify Modelica function calls, and wrap dynamic calls with invokelatest.
 """
-function move_diffs(eq::Equation; rewrite)
-  # Do not modify `D(x) ~ ...`, already correct
-  res =
-    if !(istree(eq.lhs) && operation(eq.lhs) isa Differential) && !(istree(eq.lhs) && operation(eq.lhs) isa Difference)
-      local _eq
-      _eq = eq.rhs-eq.lhs
-      rhs = rewrite(_eq)
-      if rhs === nothing
-        return eq
-      end
-      lhs = _eq - rhs
-      if !(lhs isa Number) && (operation(lhs) isa Differential)
-        lhs ~ -rhs
-      elseif !(lhs isa Number) && (operation(lhs) == *)
-        #=
-        This code is probably quite flaky, however, it should not be needed after similar things are introduced in MTK.
-        TODO: Handle this more elegantly using rewrite rules instead.
-        =#
-        local newRhs
-        local newLhs
-        for arg in arguments(lhs)
-          local isTermAndNotDifferential = istree(arg) && !(operation(arg) isa Differential)
-          local argIsANumberOrSymbolButNotTerm = (arg isa Number || (arg isa SymbolicUtils.BasicSymbolic{Real} && !istree(arg)))
-          if argIsANumberOrSymbolButNotTerm || isTermAndNotDifferential
-            newRhs = substitute(rhs, rhs => rhs / arg)
-            rhs = newRhs
-            newLhs = substitute(lhs, lhs => lhs / arg)
-            lhs = newLhs
-            #@info "New equation in the for loop is $(lhs) = $(rhs)"
-          end
-        end
-        tmp = ~(newLhs, -newRhs)
-        tmp
-      else
-        -lhs ~ rhs
-      end
-    else
-      eq
-    end
-  return res
-end
-
-"""
-    Rewrite equations that do not conform to the requirements of MTK.
-  Since MTK currently requires the derivative to be at the lhs.
-  """
-function rewriteEquations(edeqs, iv, eVars, ePars, simCode; arrayParameterExprs::Vector{Expr} = Expr[])
-  #println("Recived #edeqs")
-  #println(length(edeqs))
-  #= TODO: Try to move der to the top level to avoid eval here. =#
-  local der = ModelingToolkit.Differential(t)
-  #= Remove the t's =#
-  eVars = [Symbol(replace(string(v), "(t)" => "")) for v in eVars]
-  #Temporary fix for the ESCIMO climate model: eVars = vcat(eVars, [Symbol("combi_Population_Lookup_bn_y")])
-  #=
-  TODO: This should ideally be done without using eval.
-  =#
-  preEval = quote
-    vars = ModelingToolkit.@variables begin
-      $(eVars...)
-    end
-    pars = ModelingToolkit.@parameters begin
-      $(ePars...)
-    end
-  end
-  #Hardcoded
-  #= Make the derivative symbol known =#
-  eval(preEval)
-  eval(:(der = ModelingToolkit.Differential(t)))
-  #= Make array parameters available as concrete Julia arrays =#
-  for ap in arrayParameterExprs
-    eval(ap)
-  end
-  #= Make the external runtime available if it is used. =#
-  if simCode.externalRuntime
-    eval(generateExternalRuntimeImport(simCode))
-  end
-  #= Note: @register_symbolic is now called earlier in ODE_MODE_MTK_MODEL_GENERATION =#
-  #= immediately after function definitions are eval'd, before equations are processed =#
-  local deqs = evalEDeqs(edeqs)
-  #= Use invokelatest to access vars which was created via eval in a newer world age =#
-  Base.invokelatest() do
-    write("MTK_REWRITE.log", debugRewrite(deqs, iv, vars, parameters; separator="\n"))
-  end
-  #= Rewrite equations =#
-  D = Differential(iv)
-  local r1 = SymbolicUtils.@rule ~~a * D(~~b) * ~~c => 0
-  local r2 = SymbolicUtils.@rule D(~~b) => 0
-  local remove_diffs = SymbolicUtils.Postwalk(SymbolicUtils.Chain([r1,r2]))
-  local usedStates = Set()
-  local rewrittenDeqs = Symbolics.Equation[]
-  local req
-  for eq in deqs
-    #= Only do the rewrite for the differentials. The others have already been rewritten.=#
-    eqStr = string(eq)
-    if (contains(eqStr, "Differential")) # TODO expensive comp! Needs to be optimized.
-      req = move_diffs(eq, rewrite = remove_diffs)
-      #@info "Left hand side of the equation" req.lhs
-      if req.lhs isa Real
-        push!(rewrittenDeqs, req)
-      elseif !(req.lhs in usedStates)
-        #@info "Not a duplicate" req.lhs
-        #@info "Used equations are" usedStates
-        push!(rewrittenDeqs, req)
-        push!(usedStates, req.lhs)
-      else
-        #@info "Duplicate:" req.lhs
-        push!(rewrittenDeqs, eq)
-      end
-    else
-      push!(rewrittenDeqs, eq)
-    end
-  end
-  @BACKEND_LOGGING OMBackend.debugWrite("codeAfterBackendPreprocessing.log", debugRewrite(rewrittenDeqs, iv, vars, parameters; separator="\n"))
-  return rewrittenDeqs
-end
-
-"""
-  This function evaluates the supplied equations.
-  In the case we are unable to evaluate them, we currently hack it by some string conversions.
-  TODO:
-    Fix me do this the proper way.
-    This routine is way way to slow currently...
-  """
-function evalEDeqs(edeqs)
-  writeEqsToFile(edeqs, "beforeEqRewrite.log")
-  local deqs = []
-  for e in edeqs
-    try
-      eq = eval(e)
-      if typeof(eq.lhs) == Int64 && eq.lhs == 0
-        push!(deqs, eq)
-      else
-        local unSimplifiedString = string(e)
-        unSimplifiedString = replace(unSimplifiedString, "&&" => "&")
-        unSimplifiedString = replace(unSimplifiedString, r"\bbegin\b" => "(")
-        unSimplifiedString = replace(unSimplifiedString, r"\bend\b" => ")")
-        #println(unSimplifiedString)
-        estrExp = Meta.parse(unSimplifiedString)
-        estrExp2 = eval(estrExp)
-        estrExp2LHS = estrExp2.lhs
-        @assign estrExp2.lhs = 0
-        @assign estrExp2.rhs = estrExp2.rhs - estrExp2LHS
-        push!(deqs, estrExp2)
-      end
-    catch ex
-      global TEST = e
-      local unSimplifiedString = string(e)
-      unSimplifiedString = replace(unSimplifiedString, "&&" => "&")
-      unSimplifiedString = replace(unSimplifiedString, r"\bbegin\b" => "(")
-      unSimplifiedString = replace(unSimplifiedString, r"\bend\b" => ")")
-      estrExp = Meta.parse(unSimplifiedString)
-      estrExp2 = eval(estrExp)
-      estrExp2LHS = estrExp2.lhs
-      @assign estrExp2.lhs = 0
-      @assign estrExp2.rhs = estrExp2.rhs - estrExp2LHS
-      push!(deqs, estrExp2)
-    end
-  end
-  return deqs
-end
-
-function debugRewrite(deqs, t, vars, parameters; separator = ",")
-  local buffer = IOBuffer()
-  print(buffer, "@variables t;")
-  print(buffer, "vars2 = @variables")
-  print(buffer, "(")
-  for v in vars
-    print(buffer, v, separator)
-  end
-  print(buffer, ");")
-  print(buffer, "eqs2 =")
-  print(buffer, "[")
-  for eq in deqs
-    print(buffer, replace(string(eq), "(t)" => "", "Differential" => "D"), separator)
-  end
-  print(buffer, "];")
-  return String(take!(buffer))
+function rewriteEquations(edeqs, simCode)
+  local funcNames = Set{Symbol}(Symbol(replace(f.name, "." => "_")) for f in simCode.functions)
+  return rewriteEquationsExprLevel(edeqs isa Vector{Expr} ? edeqs : Expr[e for e in edeqs];
+                                   modelicaFuncNames = funcNames)
 end
 
 """
@@ -371,6 +197,22 @@ function isDynamicModelicaFunction(sym::Symbol)
 end
 
 """
+Check if an Expr represents a qualified call to OMBackend.CodeGeneration.X
+by inspecting the Expr structure directly instead of stringifying.
+"""
+function _isOMBackendQualifiedCall(e::Expr)
+  e.head == :. || return false
+  length(e.args) >= 1 || return false
+  local lhs = e.args[1]
+  #= Check for nested dot: OMBackend.CodeGeneration =#
+  if lhs isa Expr && lhs.head == :.
+    return lhs == :(OMBackend.CodeGeneration)
+  end
+  return false
+end
+_isOMBackendQualifiedCall(_) = false
+
+"""
   Wrap function calls to dynamically generated Modelica functions with Base.invokelatest
   to avoid world-age issues.
 """
@@ -378,16 +220,13 @@ function wrapWithInvokelatest(expr::Expr)
   if expr.head == :call
     func = expr.args[1]
     #= Check if the function is a qualified call to OMBackend.CodeGeneration =#
-    if func isa Expr && func.head == :.
-      funcStr = string(func)
-      if startswith(funcStr, "OMBackend.CodeGeneration.")
-        #= Wrap with Base.invokelatest =#
-        local newArgs = Any[:(Base.invokelatest), func]
-        for a in expr.args[2:end]
-          push!(newArgs, wrapWithInvokelatest(a))
-        end
-        return Expr(:call, newArgs...)
+    if func isa Expr && _isOMBackendQualifiedCall(func)
+      #= Wrap with Base.invokelatest =#
+      local newArgs = Any[:(Base.invokelatest), func]
+      for a in expr.args[2:end]
+        push!(newArgs, wrapWithInvokelatest(a))
       end
+      return Expr(:call, newArgs...)
     #= Check if the function is a bare symbol that is a registered dynamic function =#
     elseif func isa Symbol && isDynamicModelicaFunction(func)
       #= Wrap with Base.invokelatest =#
@@ -403,72 +242,17 @@ function wrapWithInvokelatest(expr::Expr)
       push!(processedArgs, wrapWithInvokelatest(a))
     end
     return Expr(:call, processedArgs...)
-  elseif expr.head in (:(=), :block, :if, :elseif, :||, :&&, :comparison)
-    local processedArgs = Any[]
-    for a in expr.args
-      push!(processedArgs, wrapWithInvokelatest(a))
-    end
-    return Expr(expr.head, processedArgs...)
-  else
-    local processedArgs = Any[]
-    for a in expr.args
-      push!(processedArgs, wrapWithInvokelatest(a))
-    end
-    return Expr(expr.head, processedArgs...)
   end
+  #= For all other Expr types, recursively process arguments =#
+  local processedArgs = Any[]
+  for a in expr.args
+    push!(processedArgs, wrapWithInvokelatest(a))
+  end
+  return Expr(expr.head, processedArgs...)
 end
 
 wrapWithInvokelatest(x) = x  #= For non-Expr types, return as-is =#
 
-"""
-Fix malformed function calls where stringification produces (FuncName())(args)
-instead of FuncName(args). This happens with some Modelica functions containing
-if-statements when processed through MTK symbolic machinery.
-"""
-function fixMalformedFunctionCalls(expr::Expr)
-  if expr.head == :call
-    local func = expr.args[1]
-    #= Check for pattern: (SomeFunc())(args) - where first arg is a zero-arg call =#
-    if func isa Expr && func.head == :call && length(func.args) == 1
-      #= This is a malformed double-call: func is (SomeFunc()) =#
-      #= Transform to: SomeFunc(args...) =#
-      local actualFunc = func.args[1]
-      local newArgs = Any[actualFunc]
-      for a in expr.args[2:end]
-        push!(newArgs, fixMalformedFunctionCalls(a))
-      end
-      return Expr(:call, newArgs...)
-    end
-  end
-  #= Recursively process all arguments for relevant expression types =#
-  if expr.head in (:call, :block, :if, :elseif, :(=), :||, :&&, :comparison)
-    local processedArgs = Any[]
-    for a in expr.args
-      push!(processedArgs, fixMalformedFunctionCalls(a))
-    end
-    return Expr(expr.head, processedArgs...)
-  end
-  return expr
-end
-
-fixMalformedFunctionCalls(x) = x  #= For non-Expr types, return as-is =#
-
-rewriteEq(eq) = begin
-  local eqStr = string(eq)
-  #= Remove typed array constructors - they cause conversion errors at runtime =#
-  eqStr = replace(eqStr, r"SymbolicUtils\.BasicSymbolic\{Real\}\[" => "[")
-  #= Fix gensym-style function names: var"#FuncName" -> FuncName =#
-  #= MTK stringifies registered functions with # prefix that needs removal =#
-  eqStr = replace(eqStr, r"var\"#([^\"]+)\"" => s"\1")
-  res = Meta.parse(replace(eqStr, "Differential(t)" => "D"))
-  #= Fix malformed function calls: (FuncName())(args) -> FuncName(args) =#
-  res = fixMalformedFunctionCalls(res)
-  #= Wrap dynamically generated function calls with Base.invokelatest =#
-  #= This is needed because the wrapper functions are defined via @eval at runtime, =#
-  #= creating them in a newer world age than the simulation code. =#
-  res = wrapWithInvokelatest(res)
-  return res
-end
 
 """
   $(SIGNATURES)
@@ -483,32 +267,6 @@ end
   This will convert all `inputs` to parameters and allow them to be unconnected, i.e.,
   simplification will allow models where `n_states = n_equations - n_inputs`.
   """
-# function structural_simplify(sys::ModelingToolkit.AbstractSystem, io = nothing; simplify = false, kwargs...)
-#   @info "Calling custom structural_simplify"
-#   sys = expand_connections(sys)
-#   state = TearingState(sys)
-#   has_io = io !== nothing
-#   has_io && markio!(state, io...)
-#   state, input_idxs = ModelingToolkit.inputs_to_parameters!(state, io)
-#   sys, ag = ModelingToolkit.alias_elimination!(state; kwargs...)
-#   check_consistency(state, ag)
-#   sys = dummy_derivative(sys, state, ag; simplify)
-#   fullstates = [map(eq -> eq.lhs, observed(sys)); states(sys)]
-#   @set! sys.observed = ModelingToolkit.topsort_equations(observed(sys), fullstates)
-#   ModelingToolkit.invalidate_cache!(sys)
-#   return has_io ? (sys, input_idxs) : sys
-# end
-
-
-
-# function structural_simplify(sys::ModelingToolkit.AbstractSystem, io = nothing; simplify = false, kwargs...)
-#   @info "Calling custom structural_simplify"
-#   #sys = ModelingToolkit.ode_order_lowering(sys)
-#   #sys = ModelingToolkit.dae_index_lowering(sys)
-#   #sys = ModelingToolkit.tearing(sys; simplify = simplify)
-#   sys = ModelingToolkit.structural_simplify(sys, simplify = simplify)
-#   return sys
-# end
 
 """
   TODO:

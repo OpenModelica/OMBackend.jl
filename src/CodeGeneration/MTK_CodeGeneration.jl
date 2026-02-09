@@ -308,7 +308,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                                                algebraicVariables,
                                                simCode.residualEquations,
                                                simCode::SimulationCode.SIM_CODE)
-  writeEqsToFile(EQUATIONS, "equationFirstStageCodeGen.log")
+  @BACKEND_LOGGING writeEqsToFile(EQUATIONS, "equationFirstStageCodeGen.log")
   #=
   If missing from variable map error is thrown check the start condition.
   Readded discretes here....
@@ -386,12 +386,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                    DISCRETE_DUMMY_EQUATIONS,
                    ZERO_DYNAMICS_COND_EQUATIONS,
                    CONDITIONAL_EQUATIONS)
-  EQUATIONS = rewriteEquations(EQUATIONS,
-                               t,
-                               vcat(stateVariablesSym, algebraicVariablesSym),
-                               vcat(parVariablesSym, dataStructureVariablesSym),
-                               simCode;
-                               arrayParameterExprs = ARRAY_PARAMETERS)
+  EQUATIONS = rewriteEquations(EQUATIONS, simCode)
   #= Reset the callback counter=#
   RESET_CALLBACKS()
   #=
@@ -588,10 +583,11 @@ end
 function hasExplicitStartValue(vars::Vector, simCode::SimulationCode.SimCode)::Bool
   local ht::Dict = simCode.stringToSimVarHT
   for var in vars
-    if !haskey(ht, var)
+    local entry = get(ht, var, nothing)
+    if entry === nothing
       continue
     end
-    (_, simVar) = ht[var]
+    (_, simVar) = entry
     local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
     @match optAttributes begin
       SOME(attributes) => begin
@@ -1085,7 +1081,7 @@ function decomposeEquations(equations, parameterAssignments)
   local i = 0
   local functionNames = Symbol[]
   for equationVector in equationVectors
-    eqv = [rewriteEq(i) for i in equationVector]
+    eqv = collect(equationVector)
     local fName = string("generateEquations", i)
     equationConstructor = quote
       function $(Symbol(fName))()

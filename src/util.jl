@@ -52,3 +52,17 @@ macro BACKEND_LOGGING(expr)
     return nothing
   end
 end
+
+
+const ENABLE_VSS_DEBUG::Bool = get(ENV, "ENABLE_VSS_DEBUG", "false") == "true"
+"""
+If ```ENABLE_VSS_DEBUG``` is true this macro is active. If not this macro represents a NOP.
+Use for debug logging in the VSS (Variable Structure Systems) runtime.
+"""
+macro VSS_DEBUG(expr)
+  if ENABLE_VSS_DEBUG
+    return esc(expr)
+  else
+    return nothing
+  end
+end

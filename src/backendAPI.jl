@@ -86,7 +86,7 @@ TODO: Optimaly we should keep the fronten structure
 in memory as well s.t we only recompile if the structure of the source file changes
 (Unless retranslation is forced).
 """
-const COMPILED_MODELS_MTK = Dict()
+const COMPILED_MODELS_MTK = Dict{String, Tuple{Expr, Bool}}()
 
 """
  This function lowers the given Hybrid DAE to target code.

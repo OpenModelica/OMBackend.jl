@@ -66,7 +66,6 @@ function reconfiguration()
   #=
   Find the equations to replace
   =#
-  global ALLEQUATIONSASSTR = allEquationsAsStr
   local oldEquations = equations(OMBackend.LATEST_REDUCED_SYSTEM)
   local assignedRoots = String[]
   for (i, eqVariables) in enumerate(allEquationsAsStr)
@@ -121,7 +120,6 @@ function reconfiguration()
                               discrete_events = ModelingToolkit.discrete_events(OMBackend.LATEST_REDUCED_SYSTEM),
                               )
   newSystem = OMBackend.CodeGeneration.structural_simplify(newSystem)
-  global NEW_SYSTEM = newSystem
   local discrete_events = newSystem.discrete_events
   newU0 = integrator.u
   events = if length(discrete_events) > 0
