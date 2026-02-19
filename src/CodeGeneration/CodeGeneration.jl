@@ -64,9 +64,9 @@ RuntimeGeneratedFunctions.init(@__MODULE__)
 include("mtkExternals.jl")
 include("./exprRewrite.jl")
 include("./arrayUtils.jl")
+include("./AlgorithmicCodeGeneration.jl")
 include("./CodeGenerationUtil.jl")
 include("./structuralCallbacks.jl")
-include("./AlgorithmicCodeGeneration.jl")
 include("./MTK_CodeGeneration.jl")
 
 #= Pure DifferentialEquations.jl code generation =#

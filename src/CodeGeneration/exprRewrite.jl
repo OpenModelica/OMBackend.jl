@@ -76,8 +76,14 @@ renameDerToD!(x) = x
 Qualify bare Modelica function calls with `OMBackend.CodeGeneration.` prefix, in place.
 """
 function qualifyModelicaFunctions!(expr::Expr, funcNames::Set{Symbol})
-    if expr.head == :call && length(expr.args) >= 1 && expr.args[1] isa Symbol && expr.args[1] in funcNames
-        expr.args[1] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(expr.args[1]))
+    if expr.head == :call && length(expr.args) >= 1
+        if expr.args[1] isa Symbol && expr.args[1] in funcNames
+            #= Direct call: funcName(args...) =#
+            expr.args[1] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(expr.args[1]))
+        elseif expr.args[1] == :(Base.invokelatest) && length(expr.args) >= 2 && expr.args[2] isa Symbol && expr.args[2] in funcNames
+            #= invokelatest call: Base.invokelatest(funcName, args...) =#
+            expr.args[2] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(expr.args[2]))
+        end
     end
     for a in expr.args
         qualifyModelicaFunctions!(a, funcNames)

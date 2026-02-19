@@ -494,7 +494,7 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
       end
 
       DAE.ARRAY(array = expl)  => begin
-        "[ARR]" + string("[", lstString(expl, ", "), "]")
+        "{" + lstString(expl, ", ") + "}"
       end
 
       DAE.MATRIX(matrix = lstexpl)  => begin
@@ -522,7 +522,7 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
       end
 
       DAE.ASUB(exp = e1, sub = expl)  => begin
-         "[ASUB]" + string(e1) + "{" + lstString(expl, ", ") + "}"
+         string(e1) + "[" + lstString(expl, ", ") + "]"
       end
 
       DAE.TSUB(exp = e1, ix = int) => begin

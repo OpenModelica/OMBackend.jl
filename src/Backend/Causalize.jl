@@ -369,6 +369,135 @@ function residualizeEveryEquation(dae::BDAE.BACKEND_DAE)
 end
 
 """
+    Expand record field array variables into individual scalar element variables.
+    A variable like R.T with CREF_QUAL("R", T_COMPLEX, [], CREF_IDENT("T", T_ARRAY([3,3]), []))
+    is expanded into R_T[1][1], R_T[1][2], ..., R_T[3][3] as individual BDAE.VARs.
+    This mirrors how the frontend scalarizes standalone array variables (e.g., w_out[3]).
+"""
+function expandRecordFieldArrays(dae::BDAE.BACKEND_DAE)
+  for system in dae.eqs
+    newVars = BDAE.VAR[]
+    for v in system.orderedVars
+      expanded = expandSingleRecordFieldVar(v)
+      append!(newVars, expanded)
+    end
+    system.orderedVars = newVars
+  end
+  return dae
+end
+
+"""
+    Walk a CREF chain to find the T_COMPLEX -> T_ARRAY boundary at any depth.
+    Returns (baseName, fieldType, elemTy, dims) or nothing if no such boundary exists.
+    For comp[1].R.T where R is T_COMPLEX and T is T_ARRAY, the baseName is "comp[1]_R_T".
+"""
+function findRecordFieldArray(cr::DAE.ComponentRef)
+  @match cr begin
+    #= Direct match: record.field where record is T_COMPLEX and field is T_ARRAY =#
+    DAE.CREF_QUAL(ident, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), _, _), outerSubs,
+                  DAE.CREF_IDENT(fieldName, fieldType && DAE.T_ARRAY(elemTy, dims), _)) => begin
+      local baseName = string(ident) * subscriptListToString(outerSubs) * "_" * string(fieldName)
+      return (baseName, fieldType, elemTy, dims)
+    end
+    #= Recursive case: prefix.rest where rest contains the record boundary deeper down =#
+    DAE.CREF_QUAL(ident, _, outerSubs, innerCref) => begin
+      local inner = findRecordFieldArray(innerCref)
+      if inner !== nothing
+        local (innerBase, fieldType, elemTy, dims) = inner
+        local baseName = string(ident) * subscriptListToString(outerSubs) * "_" * innerBase
+        return (baseName, fieldType, elemTy, dims)
+      end
+      return nothing
+    end
+    _ => return nothing
+  end
+end
+
+"""
+    Extract a single element from a DAE.ARRAY binding expression at the given indices.
+    For 1D: indices = (2,) extracts the 2nd element.
+    For 2D: indices = (2,3) extracts row 2, column 3.
+    Returns the element expression, or nothing if the binding is not a literal array.
+"""
+function extractBindingElement(bindExp::DAE.Exp, indices::NTuple{N, Int}) where N
+  if N == 0
+    return bindExp
+  end
+  @match bindExp begin
+    DAE.ARRAY(array = elements) => begin
+      local elemArray = collect(elements)
+      local idx = indices[1]
+      if idx < 1 || idx > length(elemArray)
+        return nothing
+      end
+      if N == 1
+        return elemArray[idx]
+      else
+        return extractBindingElement(elemArray[idx], ntuple(i -> indices[i + 1], N - 1))
+      end
+    end
+    _ => begin
+      #= Non-literal binding: wrap with ASUB for runtime indexing =#
+      local asubSubs = list((DAE.ICONST(indices[i]) for i in 1:N)...)
+      return DAE.ASUB(bindExp, asubSubs)
+    end
+  end
+end
+
+"""
+    If a variable is a record field with array type (CREF_QUAL with T_COMPLEX base
+    and T_ARRAY inner at any depth), expand it into individual scalar element variables.
+    Otherwise return the variable unchanged in a vector.
+"""
+function expandSingleRecordFieldVar(v::BDAE.VAR)::Vector{BDAE.VAR}
+  local found = findRecordFieldArray(v.varName)
+  if found === nothing
+    return [v]
+  end
+  local (baseName, fieldType, elemTy, dims) = found
+  #= Extract integer dimensions =#
+  local dimSizes = Int[]
+  for d in dims
+    @match d begin
+      DAE.DIM_INTEGER(size) => push!(dimSizes, size)
+      _ => begin
+        @warn "Non-integer dimension in record field array, skipping expansion"
+        return [v]
+      end
+    end
+  end
+  local result = BDAE.VAR[]
+  #= Keep a synthetic parent array variable so that the base array name appears
+     in the simcode hash table as ARRAY_PARAMETER. This enables:
+     1. createArrayParametersMTK to generate a concrete local assignment
+     2. tryHandleSubscriptedArrayCref to resolve subscripts to concrete values
+     Without this, function call arguments assembled from scalarized @parameter
+     elements would be symbolic, causing failures in functions with control flow. =#
+  local parentCr = DAE.CREF_IDENT(baseName, fieldType, MetaModelica.nil)
+  push!(result, BDAE.VAR(parentCr, v.varKind, v.varDirection, fieldType,
+                         v.bindExp, v.arryDim, v.source, v.values,
+                         v.tearingSelectOption, v.connectorType, v.unreplaceable))
+  #= Generate all index combinations for N dimensions =#
+  for ci in CartesianIndices(ntuple(i -> dimSizes[i], length(dimSizes)))
+    local subs = list((DAE.INDEX(DAE.ICONST(ci[i])) for i in 1:length(dimSizes))...)
+    local cr = DAE.CREF_IDENT(baseName, fieldType, subs)
+    #= Extract element binding from the array binding expression =#
+    local elemBind = @match v.bindExp begin
+      SOME(bindExp) => begin
+        local elem = extractBindingElement(bindExp, ntuple(i -> ci[i], length(dimSizes)))
+        elem === nothing ? NONE() : SOME(elem)
+      end
+      NONE() => NONE()
+      _ => NONE()
+    end
+    push!(result, BDAE.VAR(cr, v.varKind, v.varDirection, elemTy,
+                           elemBind, v.arryDim, v.source, v.values,
+                           v.tearingSelectOption, v.connectorType, v.unreplaceable))
+  end
+  return result
+end
+
+"""
     Expand COMPLEX_EQUATIONs and ARRAY_EQUATIONs into multiple scalar EQUATION objects.
     An array equation like:
       {result[1], result[2], result[3]} = transformVector(...)
@@ -383,8 +512,13 @@ function expandComplexEquations(dae::BDAE.BACKEND_DAE)
     for eq in system.orderedEqs
       @match eq begin
         BDAE.COMPLEX_EQUATION(size, left, right, source, attr) => begin
-          expanded = expandSingleArrayEquation(size, left, right, source, attr)
-          append!(newEqs, expanded)
+          expanded = tryExpandRecordEquation(left, right, source, attr)
+          if expanded !== nothing
+            append!(newEqs, expanded)
+          else
+            expanded = expandSingleArrayEquation(size, left, right, source, attr)
+            append!(newEqs, expanded)
+          end
         end
         BDAE.ARRAY_EQUATION(dimSize, left, right, source, attr, _) => begin
           expanded = expandArrayEquationWithDims(dimSize, left, right, source, attr)
@@ -398,6 +532,59 @@ function expandComplexEquations(dae::BDAE.BACKEND_DAE)
     system.orderedEqs = newEqs
   end
   return dae
+end
+
+"""
+    Expand a record equation (R = func(...)) into fully scalar equations.
+    When the LHS is a CREF with T_COMPLEX type, extracts the field names from
+    the record type and generates per-element equations using the flattened naming
+    convention with CREF subscripts (e.g. CREF_IDENT("R_rot_T", T_REAL, [1][1]))
+    so that the code generator resolves them to scalarized variable names.
+    Returns nothing if the equation is not a record equation.
+"""
+function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
+                                  source::DAE.ElementSource, attr::BDAE.EquationAttributes)
+  #= Extract baseName and T_COMPLEX type from both CREF_IDENT and CREF_QUAL.
+     CREF_QUAL occurs when the record variable is inside a component (e.g. frame.R)
+     and flattenArrayCrefs did not flatten it (no array subscripts on the final component). =#
+  extracted = @match left begin
+    DAE.CREF(DAE.CREF_IDENT(name, _, _), t) where {t isa DAE.T_COMPLEX} => (name, t)
+    DAE.CREF(cr::DAE.CREF_QUAL, t) where {t isa DAE.T_COMPLEX} => begin
+      (flatName, _, _) = crefToFlatName(cr)
+      (flatName, t)
+    end
+    _ => nothing
+  end
+  extracted === nothing && return nothing
+  (baseName, ty) = extracted
+
+  equations = BDAE.Equation[]
+  fieldIdx = 0
+  for field in ty.varLst
+    fieldIdx += 1
+    fieldName = string(baseName, "_", field.name)
+    fieldTy = field.ty
+    rhsField = DAE.ASUB(right, list(DAE.ICONST(fieldIdx)))
+    @match fieldTy begin
+      DAE.T_ARRAY(elemTy, dims) => begin
+        dimVec = Int[d.integer for d in dims]
+        for idx in CartesianIndices(Tuple(dimVec))
+          idxTuple = Tuple(idx)
+          subs = list((DAE.INDEX(DAE.ICONST(i)) for i in idxTuple)...)
+          lhsCref = DAE.CREF_IDENT(fieldName, elemTy, subs)
+          lhsExp = DAE.CREF(lhsCref, elemTy)
+          rhsExp = DAE.ASUB(rhsField, list((DAE.ICONST(i) for i in idxTuple)...))
+          push!(equations, BDAE.EQUATION(lhsExp, rhsExp, source, attr))
+        end
+      end
+      _ => begin
+        fieldCref = DAE.CREF_IDENT(fieldName, fieldTy, MetaModelica.nil)
+        fieldExp = DAE.CREF(fieldCref, fieldTy)
+        push!(equations, BDAE.EQUATION(fieldExp, rhsField, source, attr))
+      end
+    end
+  end
+  return equations
 end
 
 """
@@ -502,8 +689,72 @@ function flattenDAEArray(exp::DAE.Exp)::Union{Vector{DAE.Exp}, Nothing}
     DAE.CAST(_, innerExp) => begin
       return flattenDAEArray(innerExp)
     end
+    DAE.REDUCTION(reductionInfo, bodyExp, iterators) => begin
+      expanded = tryExpandReduction(reductionInfo, bodyExp, iterators)
+      if expanded !== nothing
+        return expanded
+      end
+      return nothing
+    end
     _ => nothing
   end
+end
+
+"""
+    Try to expand a DAE.REDUCTION with \"array\" path and a single iterator
+    over a constant integer range into a flat vector of DAE.Exp elements.
+    Returns nothing if expansion is not possible.
+"""
+function tryExpandReduction(reductionInfo, bodyExp::DAE.Exp, iterators)
+  @match reductionInfo.path begin
+    Absyn.IDENT("array") => nothing  # continue below
+    _ => return nothing
+  end
+  if length(iterators) != 1
+    return nothing
+  end
+  local iter = first(iterators)
+  local iterId::String = ""
+  local rangeExp = nothing
+  @match iter begin
+    DAE.REDUCTIONITER(id, rExp, _, _) => begin
+      iterId = id
+      rangeExp = rExp
+    end
+    _ => return nothing
+  end
+  local startVal::Int = 0
+  local stopVal::Int = 0
+  @match rangeExp begin
+    DAE.RANGE(_, DAE.ICONST(s), _, DAE.ICONST(e)) => begin
+      startVal = s
+      stopVal = e
+    end
+    _ => return nothing
+  end
+  result = DAE.Exp[]
+  for i in startVal:stopVal
+    local substituted = substituteIteratorInExp(bodyExp, iterId, i)
+    push!(result, substituted)
+  end
+  return result
+end
+
+"""
+    Replace occurrences of an iterator variable in a DAE expression with
+    a constant integer value. Traverses the expression tree and replaces
+    CREF(CREF_IDENT(iterId, ...)) with ICONST(value).
+"""
+function substituteIteratorInExp(exp::DAE.Exp, iterId::String, value::Int)::DAE.Exp
+  function replacer(e::DAE.Exp, arg)
+    @match e begin
+      DAE.CREF(DAE.CREF_IDENT(id, _, _), _) where (id == iterId) => begin
+        (DAE.ICONST(value), arg)
+      end
+      _ => (e, arg)
+    end
+  end
+  return first(Util.traverseExpBottomUp(exp, replacer, nothing))
 end
 
 """
@@ -869,6 +1120,88 @@ function flattenArrayCrefInExp(exp::DAE.Exp, acc, prefix::String="")
     end
   end
   return (newExp, cont, acc)
+end
+
+"""
+  Reclassify integer VARIABLE types as PARAM and remove their equations.
+  Integer variables (e.g., color values for visualization) should not be part of
+  the continuous ODE system. Handles both scalar T_INTEGER and T_ARRAY(T_INTEGER).
+  This pass runs early, before expansion passes.
+"""
+function resolveIntegerVariables(dae::BDAE.BACKEND_DAE)
+  for system in dae.eqs
+    _resolveIntVarsInSystem!(system)
+  end
+  return dae
+end
+
+function _isIntegerVarType(varType)
+  varType isa DAE.T_INTEGER ||
+    (varType isa DAE.T_ARRAY && varType.ty isa DAE.T_INTEGER)
+end
+
+function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
+  #= Collect integer VARIABLE names (scalarized, e.g. "world_axisColor_x[1]")
+     and base names (un-indexed, e.g. "world_axisColor_x") for matching
+     array/complex equations that have not been expanded yet. =#
+  intVarNames = Set{String}()
+  intVarBaseNames = Set{String}()
+  for v in syst.orderedVars
+    if v.varKind isa BDAE.VARIABLE && _isIntegerVarType(v.varType)
+      name = string(v.varName)
+      push!(intVarNames, name)
+      push!(intVarBaseNames, replace(name, r"\[.*\]$" => ""))
+    end
+  end
+  isempty(intVarNames) && return
+  #= Scan equations: extract constant values and mark for removal.
+     An equation is removed if either side references an integer variable.
+     For ARRAY_EQUATION/COMPLEX_EQUATION, match against base names too. =#
+  allIntNames = union(intVarNames, intVarBaseNames)
+  valueMap = Dict{String, DAE.Exp}()
+  keepEq = trues(length(syst.orderedEqs))
+  for (i, eq) in enumerate(syst.orderedEqs)
+    if eq isa BDAE.EQUATION
+      lhsIsInt = eq.lhs isa DAE.CREF && string(eq.lhs.componentRef) in intVarNames
+      rhsIsInt = eq.rhs isa DAE.CREF && string(eq.rhs.componentRef) in intVarNames
+      if lhsIsInt || rhsIsInt
+        keepEq[i] = false
+        #= Extract constant value when possible =#
+        if lhsIsInt && eq.rhs isa DAE.ICONST
+          valueMap[string(eq.lhs.componentRef)] = eq.rhs
+        elseif rhsIsInt && eq.lhs isa DAE.ICONST
+          valueMap[string(eq.rhs.componentRef)] = eq.lhs
+        end
+      end
+    elseif eq isa BDAE.ARRAY_EQUATION
+      leftIsInt = eq.left isa DAE.CREF && string(eq.left.componentRef) in allIntNames
+      rightIsInt = eq.right isa DAE.CREF && string(eq.right.componentRef) in allIntNames
+      if leftIsInt || rightIsInt
+        keepEq[i] = false
+      end
+    elseif eq isa BDAE.COMPLEX_EQUATION
+      leftIsInt = eq.left isa DAE.CREF && string(eq.left.componentRef) in allIntNames
+      rightIsInt = eq.right isa DAE.CREF && string(eq.right.componentRef) in allIntNames
+      if leftIsInt || rightIsInt
+        keepEq[i] = false
+      end
+    end
+  end
+  #= Reclassify integer VARIABLEs as PARAMs with extracted or default values =#
+  for v in syst.orderedVars
+    if v.varKind isa BDAE.VARIABLE && _isIntegerVarType(v.varType)
+      v.varKind = BDAE.PARAM()
+      if v.varType isa DAE.T_INTEGER
+        v.bindExp = SOME(get(valueMap, string(v.varName), DAE.ICONST(0)))
+      end
+    end
+  end
+  #= Remove equations that defined integer variables =#
+  nRemoved = count(!, keepEq)
+  if nRemoved > 0
+    syst.orderedEqs = syst.orderedEqs[keepEq]
+  end
+  @info "[resolveIntegers] Reclassified $(length(intVarNames)) integer variables as parameters, removed $nRemoved equations"
 end
 
   @exportAll()

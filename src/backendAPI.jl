@@ -98,10 +98,16 @@ This is not part of the lowering process but it is to be generated before we gen
 """
 function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatModel};
                    functionList = nothing, BackendMode = MTK_MODE)::Tuple{String, Expr}
+  #= Dump the flat model with functions as it arrives from the frontend =#
+  @BACKEND_LOGGING if frontendDAE isa OMFrontend.Frontend.FlatModel
+    local fLst = functionList !== nothing ? functionList : MetaModelica.nil
+    debugWrite("frontend_initialModel.log",
+      replace(OMFrontend.Frontend.toFlatString(frontendDAE, fLst), "\\n" => "\n"))
+  end
   local bDAE = lower(frontendDAE)
   local simCode
   if BackendMode == DAE_MODE
-    throw("DAE-mode is deprecated.")
+    error("DAE-mode is deprecated.")
   elseif BackendMode == MTK_MODE
     #@debug "Generate simulation code"
     simCode = generateSimulationCode(bDAE; mode = MTK_MODE)
@@ -113,12 +119,14 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
     @assign simCode.functions = simCodeFunctions
     @assign simCode.externalRuntime = externalRuntimeNeeded
     #= Dump before record flattening =#
-    debugWrite("simulationCodeStatistics.log", SimulationCode.dumpSimCode(simCode))
+    @BACKEND_LOGGING debugWrite("simCode_initial.log", SimulationCode.dumpSimCode(simCode))
     #= Flatten record parameters in functions =#
     simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
     @assign simCode.functions = simCodeFunctions
-    #= Dump after record flattening =#
-    debugWrite("simulationCodePostFlattenRecords.log", SimulationCode.dumpSimCode(simCode))
+    @BACKEND_LOGGING debugWrite("simCode_afterFlattenRecordParams.log", SimulationCode.dumpSimCode(simCode))
+    #= Flatten record arguments in equation call sites to match flattened signatures =#
+    simCode = SimulationCode.flattenRecordCallSites(simCode)
+    @BACKEND_LOGGING debugWrite("simCode_afterFlattenRecordCallSites.log", SimulationCode.dumpSimCode(simCode))
     return generateMTKTargetCode(simCode)
   else
     @error "No mode specified: valid modes are: MTK_MODE"
@@ -180,10 +188,10 @@ end
 function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   local preprocessedFM = FrontendUtil.handleBuiltin(fm)
   local bDAE = BDAECreate.lower(preprocessedFM)
-  @BACKEND_LOGGING debugWrite("initialBDAE.log", BDAEUtil.stringHeading1(bDAE, "initial BDAE"))
+  @BACKEND_LOGGING debugWrite("bdae_initial.log", BDAEUtil.stringHeading1(bDAE, "initial BDAE"))
   #= Dump the actual DAE.Exp structure to a file for analysis =#
   @BACKEND_LOGGING begin
-    open("bdae_structure_dump.log", "w") do io
+    open("bdae_structureDump.log", "w") do io
       println(io, "=== BDAE Expression Structure Dump ===")
       for (i, eq) in enumerate(first(bDAE.eqs).orderedEqs)
         if i <= 20  # Dump first 20 equations
@@ -200,24 +208,29 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
       end
     end
   end
+  #= Reclassify integer variables as parameters and remove their equations =#
+  bDAE = Causalize.resolveIntegerVariables(bDAE)
   #= Transform ASUB expressions: der(array)[i] to der(array[i]) =#
   bDAE = Causalize.transformASUBExpressions(bDAE)
   #= Mark state variables =#
   bDAE = Causalize.detectStates(bDAE)
-  @BACKEND_LOGGING debugWrite("afterDetectStates.log", BDAEUtil.stringHeading1(bDAE, "after detect states"))
+  @BACKEND_LOGGING debugWrite("bdae_afterDetectStates.log", BDAEUtil.stringHeading1(bDAE, "after detect states"))
     
-  @BACKEND_LOGGING debugWrite("afterASUBTransform.log", BDAEUtil.stringHeading1(bDAE, "after ASUB transformation"))
+  @BACKEND_LOGGING debugWrite("bdae_afterASUBTransform.log", BDAEUtil.stringHeading1(bDAE, "after ASUB transformation"))
   #= Flatten CREF_QUAL with subscripted array finals to match hash table entries =#
   bDAE = Causalize.flattenArrayCrefs(bDAE)
-  @BACKEND_LOGGING debugWrite("afterFlattenCrefs.log", BDAEUtil.stringHeading1(bDAE, "after CREF flattening"))
+  @BACKEND_LOGGING debugWrite("bdae_afterFlattenCrefs.log", BDAEUtil.stringHeading1(bDAE, "after CREF flattening"))
   #= Transform if expressions to if equations =#
   bDAE = Causalize.detectIfExpressions(bDAE)
-  @BACKEND_LOGGING debugWrite("afterIfExpressions.log", BDAEUtil.stringHeading1(bDAE, "after if expressions"))
+  @BACKEND_LOGGING debugWrite("bdae_afterIfExpressions.log", BDAEUtil.stringHeading1(bDAE, "after if expressions"))
+  #= Expand record field array variables into individual scalar element variables =#
+  bDAE = Causalize.expandRecordFieldArrays(bDAE)
+  @BACKEND_LOGGING debugWrite("bdae_afterExpandRecordFields.log", BDAEUtil.stringHeading1(bDAE, "after record field expansion"))
   #= Expand COMPLEX_EQUATIONs into scalar equations =#
   bDAE = Causalize.expandComplexEquations(bDAE)
-  @BACKEND_LOGGING debugWrite("afterExpandComplex.log", BDAEUtil.stringHeading1(bDAE, "after complex equation expansion"))
+  @BACKEND_LOGGING debugWrite("bdae_afterExpandComplex.log", BDAEUtil.stringHeading1(bDAE, "after complex equation expansion"))
   bDAE = Causalize.residualizeEveryEquation(bDAE)
-  @BACKEND_LOGGING debugWrite("afterResidualize.log", BDAEUtil.stringHeading1(bDAE, "after residualize"))
+  @BACKEND_LOGGING debugWrite("bdae_afterResidualize.log", BDAEUtil.stringHeading1(bDAE, "after residualize"))
   #=
     Remove unused parameters and or constants.
     Important optimization for some systems.
@@ -225,7 +238,7 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   =#
   #bDAE = Causalize.detectUnusedParametersAndConstants(bDAE)
   #= Find and reclassify discrete variables not marked as discrete. =#
-  @BACKEND_LOGGING debugWrite("residualTransformation.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
+  @BACKEND_LOGGING debugWrite("bdae_residualTransformation.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
   return bDAE
 end
 
@@ -345,7 +358,7 @@ function printModel(modelName::String; MTK = true, keepComments = true, keepBegi
     println(modelToString(modelName::String; MTK = MTK, keepComments = keepComments, keepBeginBlocks = keepBeginBlocks))
   catch e
     @error "Model: $(modelName) is not compiled. Available models are: $(availableModels())"
-    throw("Error printing model")
+    error("Error printing model: $(modelName)")
   end
 end
 
@@ -409,7 +422,7 @@ end
 function simulateModel(modelName::String;
                        MODE = MTK_MODE,
                        tspan = (0.0, 1.0),
-                       solver = Rodas5(),
+                       solver = Rodas5(autodiff=false),
                        kwargs...)
   #= Strings using "." need to be in a format suitable for Julia =#
   modelName = replace(modelName, "." => "__")
@@ -454,7 +467,7 @@ function simulateModel(modelName::String;
       rethrow(err)
     end
   else
-    throw("Unsupported mode")
+    error("Unsupported mode: $(MODE)")
   end
 end
 
@@ -463,7 +476,7 @@ end
   along with a set of parameters as key value pairs.
 """
 function resimulateModel(modelName::String;
-                         solver = Rodas5(),
+                         solver = Rodas5(autodiff=false),
                          MODE = MTK_MODE,
                          tspan=(0.0, 1.0),
                          parameters::Dict = Dict())
@@ -475,9 +488,9 @@ function resimulateModel(modelName::String;
     local modelRunnable = Meta.parse("OMBackend.$(modelName)Simulate($(tspan); solver = $(solver))")
     res = @eval $modelRunnable
     return res
-  catch #= The model is not compiled yet. Proceeding.. =#
+  catch e
     availModels = availableModels()
-    @error "The model $(modelName) is not compiled.\n Available models are: $(availModels)"
+    @error "The model $(modelName) is not compiled. Available models are: $(availModels)" exception=(e, catch_backtrace())
   end
 end
 
@@ -564,8 +577,9 @@ function getVariableValues(sol::ODESolution, varName::String)
   end
   try
     res = sol[varAsJLSym]
-  catch
-    println("Did not locate a variable named " * varName * " in the model")
+  catch e
+    @warn "Did not locate a variable named '$(varName)' in the model" exception=(e, catch_backtrace())
+    nothing
   end
 end
 

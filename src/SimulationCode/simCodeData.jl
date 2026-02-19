@@ -42,7 +42,9 @@ struct  INPUT <: SimVarType end
 "
 struct OCC_VARIABLE <: SimVarType end
 
-struct STRING <: SimVarType end
+struct STRING <: SimVarType
+  bindExp::Option{DAE.Exp}
+end
 
 """
   A Data structure type.

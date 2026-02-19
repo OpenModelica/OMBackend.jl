@@ -26,6 +26,118 @@ function isMultiDimArray(v::DAE.VAR)::Bool
   end
 end
 
+#= Check if a ModelicaFunction has any array-typed output.
+   Used to decide whether the function wrapper should skip the symbolic short-circuit:
+   array-returning functions must always execute their body so the result is indexable. =#
+function hasArrayOutput(f::SimulationCode.ModelicaFunction)::Bool
+  for v in f.outputs
+    local crefType = @match v.componentRef begin
+      DAE.CREF_IDENT(_, identType, _) => identType
+      DAE.CREF_QUAL(_, identType, _, _) => identType
+      _ => v.ty
+    end
+    @match crefType begin
+      DAE.T_ARRAY(__) => return true
+      _ => nothing
+    end
+  end
+  return false
+end
+
+#= Check if a function body contains conditionals that would fail with symbolic args.
+   This includes STMT_IF statements and IFEXP (ternary if-expressions) in assignment RHS.
+   Only these functions need the symbolic Term dispatch; pure-arithmetic functions
+   work fine when called directly with symbolic values.
+   Checks recursively inside for-loops and other compound statements. =#
+function hasIfStatements(func::SimulationCode.ModelicaFunction)::Bool
+  @match func begin
+    SimulationCode.MODELICA_FUNCTION(statements = stmts, locals = locals) => begin
+      _statementsContainIf(stmts) && return true
+      for v in locals
+        @match v.binding begin
+          SOME(bindingExp) => begin
+            _expContainsIfExp(bindingExp) && return true
+          end
+          _ => nothing
+        end
+      end
+      return false
+    end
+    _ => return false
+  end
+end
+
+function _statementsContainIf(stmts)::Bool
+  for s in stmts
+    if s isa DAE.STMT_IF
+      return true
+    elseif s isa DAE.STMT_FOR
+      _statementsContainIf(s.statementLst) && return true
+    elseif s isa DAE.STMT_WHILE
+      _statementsContainIf(s.statementLst) && return true
+    elseif s isa DAE.STMT_ASSIGN
+      _expContainsIfExp(s.exp) && return true
+    end
+  end
+  return false
+end
+
+function _expContainsIfExp(exp::DAE.Exp)::Bool
+  @match exp begin
+    DAE.IFEXP(__) => return true
+    DAE.BINARY(exp1 = e1, exp2 = e2) => begin
+      return _expContainsIfExp(e1) || _expContainsIfExp(e2)
+    end
+    DAE.UNARY(exp = e1) => begin
+      return _expContainsIfExp(e1)
+    end
+    DAE.CALL(expLst = args) => begin
+      for a in args
+        _expContainsIfExp(a) && return true
+      end
+      return false
+    end
+    DAE.ARRAY(array = elems) => begin
+      for e in elems
+        _expContainsIfExp(e) && return true
+      end
+      return false
+    end
+    DAE.ASUB(exp = inner) => begin
+      return _expContainsIfExp(inner)
+    end
+    _ => return false
+  end
+end
+
+#= Compute the output dimensions for a single-array-output function.
+   Returns a tuple of ints, e.g. (4,) for a vector or (3,3) for a matrix.
+   Returns () if not applicable (multiple outputs, unknown dimensions, etc.). =#
+function computeArrayOutputDims(f::SimulationCode.ModelicaFunction)::Tuple{Vararg{Int}}
+  if length(f.outputs) != 1
+    return ()
+  end
+  local v = f.outputs[1]
+  local crefType = @match v.componentRef begin
+    DAE.CREF_IDENT(_, identType, _) => identType
+    DAE.CREF_QUAL(_, identType, _, _) => identType
+    _ => v.ty
+  end
+  @match crefType begin
+    DAE.T_ARRAY(_, dims) => begin
+      local dimVals = Int[]
+      for d in dims
+        @match d begin
+          DAE.DIM_INTEGER(n) => push!(dimVals, n)
+          _ => return ()
+        end
+      end
+      return Tuple(dimVals)
+    end
+    _ => return ()
+  end
+end
+
 #= Generate ensureArray conversion statements for multi-dimensional array parameters. =#
 function generateArrayConversions(inputs::Vector)::Vector{Expr}
   conversions = Expr[]
@@ -60,6 +172,9 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
     #= Normalize function name: replace dots with underscores for valid Julia identifiers =#
     local normalizedName = replace(func.name, "." => "_")
     local nArgs = length(inputs)
+    local isArrayFunc = hasArrayOutput(func)
+    local needsSymbolicArrayDispatch = isArrayFunc && hasIfStatements(func)
+    local outputDims = needsSymbolicArrayDispatch ? computeArrayOutputDims(func) : ()
     inputsJL = if nArgs > 1
       tuple(inputs...)
     elseif nArgs == 1
@@ -73,7 +188,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         local arrayConversions = generateArrayConversions(func.inputs)
         local statements = generateStatements(func.statements)
         local returnExpr = if length(outputs) > 1
-          tuple(outputs...)
+          Expr(:tuple, outputs...)
         elseif length(outputs) == 1
           outputs[1]
         else
@@ -90,10 +205,8 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         end
 
         f = quote
-          #= First, create the wrapper function if it does not exist =#
-          if !isdefined(@__MODULE__, $(QuoteNode(Symbol(normalizedName))))
-            OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(normalizedName))), $(nArgs))
-          end
+          #= Create the wrapper function (always re-created to apply correct flags) =#
+          OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(normalizedName))), $(nArgs), $(isArrayFunc), $(outputDims))
           #= Store the implementation in the dictionary =#
           OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(Symbol(normalizedName)))] = $(anonFunc)
         end
@@ -102,7 +215,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         local extCall = Meta.parse(func.libInfo)
         extCall = namespaceifyExternalFunction(extCall)
         local returnExpr = if length(outputs) > 1
-          tuple(outputs...)
+          Expr(:tuple, outputs...)
         elseif length(outputs) == 1
           outputs[1]
         else
@@ -120,10 +233,8 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         end
 
         f = quote
-          #= First, create the wrapper function if it does not exist =#
-          if !isdefined(@__MODULE__, $(QuoteNode(Symbol(normalizedName))))
-            OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(normalizedName))), $(nArgs))
-          end
+          #= Create the wrapper function (always re-created to apply correct flags) =#
+          OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(normalizedName))), $(nArgs), $(isArrayFunc), $(outputDims))
           #= Store the implementation in the dictionary =#
           OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(Symbol(normalizedName)))] = $(anonFunc)
         end
@@ -205,7 +316,19 @@ function generateLocals(inputs::Vector)
   local jInputs = Expr[]
   for i in inputs
     local s = DAE_VAR_ToJulia(i)
-    push!(jInputs, Expr(:local, s))
+    #= If the variable has a binding expression (e.g., protected constants),
+       generate local s = <bindingExpr> instead of just local s =#
+    local hasBinding = @match i.binding begin
+      SOME(bindingExp) => begin
+        local bindExpr = expToJuliaExpAlg(bindingExp)
+        push!(jInputs, :(local $s = $bindExpr))
+        true
+      end
+      _ => false
+    end
+    if !hasBinding
+      push!(jInputs, Expr(:local, s))
+    end
   end
   return jInputs
 end
@@ -466,8 +589,16 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
       DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
         local lhs = expToJuliaExpAlg(e1)
         local rhs = expToJuliaExpAlg(e2)
-        local op = CodeGeneration.DAE_OP_toJuliaOperator(op)
-        :($op($(lhs), $(rhs)))
+        #= || and && are special forms in Julia, not regular functions.
+           Must use Expr(:||, ...) / Expr(:&&, ...) instead of Expr(:call, :||, ...) =#
+        @match op begin
+          DAE.OR(__) => Expr(:||, lhs, rhs)
+          DAE.AND(__) => Expr(:&&, lhs, rhs)
+          _ => begin
+            local opSym = CodeGeneration.DAE_OP_toJuliaOperator(op)
+            :($opSym($(lhs), $(rhs)))
+          end
+        end
       end
       DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
         local lhs = expToJuliaExpAlg(e1)
@@ -490,10 +621,16 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst, attr = attr)  => begin
         local funcSym = Symbol(tmpStr)
         #= Use Base.invokelatest for non-builtin functions to avoid world-age issues =#
-        local expr = if !(attr.builtin)
-          Expr(:call, :(Base.invokelatest), funcSym)
+        local callTarget = if !(attr.builtin)
+          :(Base.invokelatest)
+        elseif haskey(MODELICA_BUILTIN_FUNCTIONS, tmpStr)
+          Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(:AlgorithmicCodeGeneration)), QuoteNode(MODELICA_BUILTIN_FUNCTIONS[tmpStr]))
         else
-          Expr(:call, funcSym)
+          funcSym
+        end
+        local expr = Expr(:call, callTarget)
+        if !(attr.builtin)
+          push!(expr.args, funcSym)
         end
         local args = map(explst) do arg
           expToJuliaExpAlg(arg)
@@ -504,12 +641,19 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         end
       end
       DAE.CALL(path, expLst, attr) => begin
-        local funcSym = Symbol(string(path))
+        local funcName = string(path)
+        local funcSym = Symbol(funcName)
         #= Use Base.invokelatest for non-builtin functions to avoid world-age issues =#
-        local expr = if !(attr.builtin)
-          Expr(:call, :(Base.invokelatest), funcSym)
+        local callTarget = if !(attr.builtin)
+          :(Base.invokelatest)
+        elseif haskey(MODELICA_BUILTIN_FUNCTIONS, funcName)
+          Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(:AlgorithmicCodeGeneration)), QuoteNode(MODELICA_BUILTIN_FUNCTIONS[funcName]))
         else
-          Expr(:call, funcSym)
+          funcSym
+        end
+        local expr = Expr(:call, callTarget)
+        if !(attr.builtin)
+          push!(expr.args, funcSym)
         end
         local args = map(expLst) do arg
           expToJuliaExpAlg(arg)
@@ -531,7 +675,18 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         local elements = map(expl) do e
           expToJuliaExpAlg(e)
         end
-        Expr(:vect, elements...)
+        local arrExpr = Expr(:vect, elements...)
+        #= If elements are themselves arrays (matrix literal), wrap with ensureArray
+           to convert Vector{Vector{T}} to a proper Matrix{T} =#
+        isNested = @match ty begin
+          DAE.T_ARRAY(__) => true
+          _ => false
+        end
+        if isNested
+          :(OMBackend.CodeGeneration.ensureArray($arrExpr))
+        else
+          arrExpr
+        end
       end
       DAE.RANGE(ty, startExp, stepExp, stopExp) => begin
         local startExpr = expToJuliaExpAlg(startExp)

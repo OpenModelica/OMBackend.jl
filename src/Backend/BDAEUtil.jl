@@ -530,7 +530,7 @@ function eqToWhenOperator(eq::BDAE.Equation)
   return res
 end
 
-function DAE_DimensionToIntVector(dims::Cons{DAE.Dimension})::Vector{Int}
+function DAE_DimensionToIntVector(dims::Cons{<:DAE.Dimension})::Vector{Int}
   local dimIndices = []
   for d in dims
     if ! (typeof(d) == DAE.DIM_INTEGER)
@@ -546,6 +546,49 @@ function getDimensionFromComplexType(callTy::DAE.T_COMPLEX)
   length(callTy.varLst)
 end
 
+"""
+  Extract the T_COMPLEX type from a DAE expression (typically a CREF).
+"""
+function getComplexType(exp::DAE.Exp)
+  @match exp begin
+    DAE.CREF(_, ty && DAE.T_COMPLEX(__)) => ty
+    _ => nothing
+  end
+end
+
+"""
+  Append a field name to a DAE.CREF expression, producing a deeper CREF.
+  E.g. CREF(a.b.R, T_COMPLEX) + "T" => CREF(a.b.R.T, fieldTy)
+"""
+function appendFieldToCref(exp::DAE.Exp, fieldName::String, fieldTy::DAE.Type)::DAE.Exp
+  @match exp begin
+    DAE.CREF(cref, _) => begin
+      local newCref = appendFieldToComponentRef(cref, fieldName, fieldTy)
+      DAE.CREF(newCref, fieldTy)
+    end
+    _ => begin
+      @warn "appendFieldToCref: unexpected expression type, returning as-is"
+      exp
+    end
+  end
+end
+
+"""
+  Append a field to a ComponentRef chain.
+  The last CREF_IDENT becomes a CREF_QUAL, and the field becomes the new CREF_IDENT.
+"""
+function appendFieldToComponentRef(cr::DAE.ComponentRef, fieldName::String, fieldTy::DAE.Type)::DAE.ComponentRef
+  @match cr begin
+    DAE.CREF_IDENT(ident, identType, subs) => begin
+      DAE.CREF_QUAL(ident, identType, subs,
+                    DAE.CREF_IDENT(fieldName, fieldTy, nil))
+    end
+    DAE.CREF_QUAL(ident, identType, subs, innerCref) => begin
+      DAE.CREF_QUAL(ident, identType, subs,
+                    appendFieldToComponentRef(innerCref, fieldName, fieldTy))
+    end
+  end
+end
 
 include("backendDump.jl")
 @exportAll()

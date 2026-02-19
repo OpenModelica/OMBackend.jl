@@ -321,6 +321,24 @@ function traverseExpListTopDown(expLst::List{DAE.Exp}, func::Function, inArg)
 end
 
 """
+  Calls traverseExpBottomUp for each element of list.
+  Mirrors Expression.traverseExpList from OpenModelica.
+"""
+function traverseExpList(expLst::List{DAE.Exp}, func::Function, inArg)
+  outArg = inArg
+  newExpLst = DAE.Exp[]
+  allEqual = true
+  for e in expLst
+    (newE, outArg) = traverseExpBottomUp(e, func, outArg)
+    push!(newExpLst, newE)
+    if !referenceEq(e, newE)
+      allEqual = false
+    end
+  end
+  return allEqual ? (expLst, outArg) : (list(newExpLst...), outArg)
+end
+
+"""
   Traverse reduction iterators, applying the traversal function to each iterator expression.
 """
 function traverseReductionIteratorsTopDown(riters::DAE.ReductionIterators, func::Function, extArg)

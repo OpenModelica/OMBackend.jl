@@ -141,20 +141,84 @@ end
 """
 function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   local name = flatModel.name
-  local equations = [equationToBackendEquation(eq)
-                     for eq in OMFrontend.Frontend.convertEquations(flatModel.equations)]
+  local equations = BDAE.Equation[]
+  for eq in OMFrontend.Frontend.convertEquations(flatModel.equations)
+    local result = equationToBackendEquation(eq)
+    if result isa Vector
+      append!(equations, result)
+    else
+      push!(equations, result)
+    end
+  end
   local variables = [variableToBackendVariable(var)
                      for var in OMFrontend.Frontend.convertVariables(flatModel.variables, list())]
   local algorithms = [alg for alg in flatModel.algorithms]
   local iAlgorithms = [iAlg for iAlg in flatModel.initialAlgorithms]
-  local initialEquations = [equationToBackendEquation(ieq)
-                            for ieq in OMFrontend.Frontend.convertEquations(flatModel.initialEquations)]
+  local initialEquations = BDAE.Equation[]
+  for ieq in OMFrontend.Frontend.convertEquations(flatModel.initialEquations)
+    local iresult = equationToBackendEquation(ieq)
+    if iresult isa Vector
+      append!(initialEquations, iresult)
+    else
+      push!(initialEquations, iresult)
+    end
+  end
+  #= Deduplicate variables by name (handles inner/outer duplicate emission) =#
+  variables = deduplicateVariables(variables)
+  #= Deduplicate explicit equations =#
+  equations = deduplicateEquations(equations)
   #= The set of equations might also contain a  set of "binding equations" =#
   local bindingEquations = createBindingEquations(variables)
   equations = vcat(equations, bindingEquations)
   #= TODO Extract the simple equations =#
   local simpleEquations = []
   return BDAE.EQSYSTEM(name, variables, equations, simpleEquations, initialEquations)
+end
+
+"""
+  Deduplicate variables by their component reference name.
+  Keeps the first occurrence of each uniquely-named variable.
+"""
+function deduplicateVariables(variables::Vector)::Vector
+  local seen = Set{String}()
+  local unique_vars = similar(variables, 0)
+  local duplicateCount = 0
+  for v in variables
+    local varStr = string(v.varName)
+    if varStr in seen
+      duplicateCount += 1
+      continue
+    end
+    push!(seen, varStr)
+    push!(unique_vars, v)
+  end
+  if duplicateCount > 0
+    println("[dedup] Variables: $(length(variables)) -> $(length(unique_vars)) (removed $duplicateCount duplicates)")
+  end
+  return unique_vars
+end
+
+"""
+  Deduplicate equations by comparing their string representation.
+  Keeps the first occurrence of each unique equation.
+"""
+function deduplicateEquations(equations::Vector)::Vector
+  local seen = Set{String}()
+  local unique_eqs = similar(equations, 0)
+  local duplicateCount = 0
+  for eq in equations
+    local eqStr = string(eq)
+    if eqStr in seen
+      duplicateCount += 1
+      continue
+    end
+    push!(seen, eqStr)
+    push!(unique_eqs, eq)
+  end
+  if duplicateCount > 0
+    println("[dedup] Equations: $(length(equations)) -> $(length(unique_eqs)) (removed $duplicateCount duplicates)")
+  end
+  return unique_eqs
 end
 
 function convertVariableIntoBDAEVariable(var::OMFrontend.Frontend.Variable)
@@ -307,11 +371,54 @@ function equationToBackendEquation(elem::DAE.Element)
       size = isempty(dVec) ? 1 : prod(dVec)
       BDAE.COMPLEX_EQUATION(size, lhs, rhs, source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
     end
+    #= Record-to-record equality: lhs.R = rhs.R where both are CREFs with T_COMPLEX type.
+       Decompose into per-field equations using the record type's varLst. =#
+    DAE.COMPLEX_EQUATION(lhs, rhs, source) => begin
+      decomposeComplexEquation(lhs, rhs, source)
+    end
     _ => begin
       @error "Skipped processing" elem OMFrontend.Frontend.toString(elem)
       throw("Unsupported equation: $elem")
     end
   end
+end
+
+"""
+  Decompose a COMPLEX_EQUATION (record-to-record equality) into per-field equations.
+  For a record with fields T[3,3] and w[3], this generates one ARRAY_EQUATION per
+  array field and one EQUATION per scalar field.
+"""
+function decomposeComplexEquation(lhs::DAE.Exp, rhs::DAE.Exp, source::DAE.ElementSource)::Vector{BDAE.Equation}
+  local eqs = BDAE.Equation[]
+  #= Extract the record type from the CREF expression =#
+  local recTy = BDAEUtil.getComplexType(lhs)
+  if recTy === nothing
+    @warn "decomposeComplexEquation: cannot extract record type from LHS, treating as opaque"
+    local nFields = 1
+    push!(eqs, BDAE.COMPLEX_EQUATION(nFields, lhs, rhs, source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN))
+    return eqs
+  end
+  @match DAE.T_COMPLEX(varLst = varLst) = recTy
+  for field in varLst
+    @match DAE.TYPES_VAR(name = fieldName, ty = fieldTy) = field
+    local lhsField = BDAEUtil.appendFieldToCref(lhs, fieldName, fieldTy)
+    local rhsField = BDAEUtil.appendFieldToCref(rhs, fieldName, fieldTy)
+    @match fieldTy begin
+      DAE.T_ARRAY(dims = dims) => begin
+        local dVec = BDAEUtil.DAE_DimensionToIntVector(dims)
+        push!(eqs, BDAE.ARRAY_EQUATION(dVec, lhsField, rhsField, source, BDAE.NO_ATTRIBUTES(), NONE()))
+      end
+      DAE.T_COMPLEX(__) => begin
+        #= Nested record: recurse =#
+        local nested = decomposeComplexEquation(lhsField, rhsField, source)
+        append!(eqs, nested)
+      end
+      _ => begin
+        push!(eqs, BDAE.EQUATION(lhsField, rhsField, source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN))
+      end
+    end
+  end
+  return eqs
 end
 
 function variableToBackendVariable(elem::DAE.Element)

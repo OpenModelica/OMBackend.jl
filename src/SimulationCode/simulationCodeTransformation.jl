@@ -52,7 +52,7 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
     end
     #= String parameters - used for labels, names etc. =#
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_STRING(__)) => begin
-      SimulationCode.STRING()
+      SimulationCode.STRING(backendVar.bindExp)
     end
     #= Enumeration parameters =#
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_ENUMERATION(__)) => begin
@@ -77,7 +77,7 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
     end
 
     (BDAE.VARIABLE(__), DAE.T_STRING(__)) => begin
-      SimulationCode.STRING()
+      SimulationCode.STRING(backendVar.bindExp)
     end
     _ => begin
       @error("\n Variable: $(backendVar.varName) \n Category: $(typeof(backendVar.varKind)).\n Type: $(typeof(backendVar.varType)) of backend variable not handled.\n")
@@ -111,8 +111,8 @@ function DAE_identifierToString(daeID::DAE.ComponentRef)
     DAE.CREF_QUAL(ident, DAE.T_COMPLEX(__), subscriptLst, DAE.CREF_IDENT(innerIdent, DAE.T_ARRAY(__), iSubscriptLst)) => begin
       string(daeID)
     end
-    DAE.CREF_QUAL(_, DAE.T_ARRAY(ty, dim), _, _) => begin
-      string(ident,string(cr), string(dim))
+    DAE.CREF_QUAL(ident, DAE.T_ARRAY(ty, dim), _, cr) => begin
+      string(daeID)
     end
     DAE.CREF_IDENT(__) => string(daeID)
 

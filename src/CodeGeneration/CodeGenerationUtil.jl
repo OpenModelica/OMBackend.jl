@@ -453,10 +453,19 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
       end
     end
     _  =>  begin
-      funcName = Symbol(pathStr)
       argPart = tuple(map((x) -> expToJuliaExpMTK(x, simCode), expLst)...)
-      quote
-        $(funcName)($(argPart...))
+      #= Check if this is a Modelica built-in with a dedicated Julia implementation =#
+      builtinSym = get(AlgorithmicCodeGeneration.MODELICA_BUILTIN_FUNCTIONS, pathStr, nothing)
+      if builtinSym !== nothing
+        qualifiedName = Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(:AlgorithmicCodeGeneration)), QuoteNode(builtinSym))
+        quote
+          $(qualifiedName)($(argPart...))
+        end
+      else
+        funcName = Symbol(pathStr)
+        quote
+          $(funcName)($(argPart...))
+        end
       end
     end
   end
@@ -517,6 +526,17 @@ Convert a MetaModelica list of DAE subscripts directly to Julia Expr form
 without going through string conversion + Meta.parse.
 Returns an integer for single constant subscripts, or a tuple Expr for multiple.
 """
+#= Build an array indexing Expr from a symbol and subscript expression.
+   subscriptExpr is the return value of subscriptsToExpr:
+   single value (int/Expr) or Expr(:tuple, ...) for multi-dimensional. =#
+function makeRefExpr(sym, subscriptExpr)
+  if subscriptExpr isa Expr && subscriptExpr.head == :tuple
+    return Expr(:ref, sym, subscriptExpr.args...)
+  else
+    return Expr(:ref, sym, subscriptExpr)
+  end
+end
+
 function subscriptsToExpr(subscripts, simCode; varPrefix="", varSuffix="", derSymbol=:der)
   local exprs = map(subscripts) do sub
     @match sub begin
@@ -738,10 +758,33 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
 
         local lookupEntry = get(hashTable, lookupStr, nothing)
         if lookupEntry === nothing
-          local ss = subscriptsToExpr(subscripts, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-          quote
-            $(LineNumberNode(@__LINE__, "Array access to missing var: $lookupStr"))
-            getIndex($(Symbol(string(varPrefix, lookupStr, varSuffix))), $(ss))
+          #= Base name not found. The backend scalarizes arrays into individual elements,
+             so try looking up the element name with subscripts (e.g., "var[1]"). =#
+          local allConstSubs = true
+          local subSuffix = ""
+          for sub in subscripts
+            @match sub begin
+              DAE.INDEX(DAE.ICONST(i)) => begin
+                subSuffix = string(subSuffix, "[", i, "]")
+              end
+              _ => begin
+                allConstSubs = false
+                break
+              end
+            end
+          end
+          local elemKey = string(lookupStr, subSuffix)
+          local elemLookup = allConstSubs ? get(hashTable, elemKey, nothing) : nothing
+          if elemLookup !== nothing
+            local elemName = elemLookup[2].name
+            quote $(Symbol(string(varPrefix, elemName, varSuffix))) end
+          else
+            local ss = subscriptsToExpr(subscripts, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+            local refExpr = makeRefExpr(Symbol(string(varPrefix, lookupStr, varSuffix)), ss)
+            quote
+              $(LineNumberNode(@__LINE__, "Array access to missing var: $lookupStr"))
+              $(refExpr)
+            end
           end
         else
           local indexAndVar = lookupEntry
@@ -774,12 +817,13 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             end
             _ => ()
           end
-          #= Fallback: generate getIndex call =#
+          #= Fallback: generate array indexing =#
           local vRef = string(varPrefix, indexAndVar[2].name, varSuffix)
           local ss = subscriptsToExpr(subscripts, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+          local refExpr = makeRefExpr(Symbol(vRef), ss)
           quote
             $(LineNumberNode(@__LINE__, "Array access to: $vRef"))
-            getIndex($(Symbol(vRef)), $(ss))
+            $(refExpr)
           end
         end
       end
@@ -865,9 +909,14 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
         local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
         local rhs = expToJuliaExpMTK(e2, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        local op = DAE_OP_toJuliaOperator(op)
-        quote
-          ($op($(lhs), $(rhs)))
+        #= || and && are special forms in Julia, not regular functions =#
+        @match op begin
+          DAE.OR(__) => Expr(:||, lhs, rhs)
+          DAE.AND(__) => Expr(:&&, lhs, rhs)
+          _ => begin
+            local opSym = DAE_OP_toJuliaOperator(op)
+            :($opSym($(lhs), $(rhs)))
+          end
         end
       end
       DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
@@ -1095,7 +1144,21 @@ function tryHandleSubscriptedArrayCref(cr::DAE.ComponentRef, hashTable, simCode;
         local constExpr = expToJuliaExpMTK(element, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
         return (true, constExpr)
       end
-      _ => () #= Fall through to generate symbol reference =#
+      _ => () #= Fall through to check scalarized variable or generate symbol reference =#
+    end
+  end
+
+  #= When subscripts are constant, check if a scalarized element variable exists in
+     the hash table (e.g. "R_T[1][2]" for subscripts [1,2]). Record field arrays
+     create both a parent ARRAY variable and individual scalar element variables.
+     The parent has no binding when values come from equations, so we must look up the
+     scalarized name instead of generating runtime indexing on the parent. =#
+  if allConstantSubscripts
+    local scalarLookup = baseName * join(("[" * string(s) * "]" for s in subExprs))
+    local scalarEntry = get(hashTable, scalarLookup, nothing)
+    if scalarEntry !== nothing
+      local scalarName = scalarEntry[2].name
+      return (true, quote $(Symbol(string(varPrefix, scalarName, varSuffix))) end)
     end
   end
 

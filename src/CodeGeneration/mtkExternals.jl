@@ -81,11 +81,99 @@ const MODELICA_FUNCTION_IMPLS = Dict{Symbol, Function}()
 #= Global dictionary to store RTG wrappers for each function =#
 const MODELICA_FUNCTION_WRAPPERS = Dict{Symbol, Any}()
 
+#= Cache for per-element extractor functions.
+   Key: (funcName::Symbol, indices::Tuple{Vararg{Int}})
+   Value: the created function object =#
+const ELEM_FUNC_CACHE = Dict{Tuple{Symbol, Tuple}, Function}()
+
+"""
+Unwrap a value for use in symbolic Terms.
+For arrays, unwraps each element. For scalars, unwraps directly.
+Non-symbolic values (plain Float64, Int, etc.) pass through unchanged.
+"""
+function unwrapForSymbolic(x)
+  if x isa AbstractArray
+    return map(Symbolics.unwrap, x)
+  else
+    return Symbolics.unwrap(x)
+  end
+end
+
+"""
+Get or create a per-element extractor function for an array-returning Modelica function.
+The extractor calls the implementation directly via MODELICA_FUNCTION_IMPLS and extracts
+a single element by index. This avoids creating getindex(Term{Real}(...), i) symbolic
+terms which crash Symbolics._linear_expansion (OffsetArrays.Origin error).
+"""
+function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}})
+  local key = (funcName, indices)
+  if haskey(ELEM_FUNC_CACHE, key)
+    return ELEM_FUNC_CACHE[key]
+  end
+  local idxStr = join(indices, "_")
+  local elemName = Symbol(funcName, :__e, idxStr)
+  local fnQuote = QuoteNode(funcName)
+  if length(indices) == 1
+    local idx = indices[1]
+    @eval function $elemName(args...)
+      local impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+      local result = Base.invokelatest(impl, args...)
+      return result[$idx]
+    end
+  elseif length(indices) == 2
+    local i = indices[1]
+    local j = indices[2]
+    @eval function $elemName(args...)
+      local impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+      local result = Base.invokelatest(impl, args...)
+      local row = result[$i]
+      if row isa AbstractVector
+        return row[$j]
+      else
+        return result[$i, $j]
+      end
+    end
+  end
+  local f = getfield(@__MODULE__, elemName)
+  ELEM_FUNC_CACHE[key] = f
+  return f
+end
+
+"""
+Create a symbolic array representation for an array-returning function call.
+Returns a Vector{Num} for 1D outputs or Matrix{Num} for 2D outputs.
+Each element is a scalar Term{Real} calling a per-element extractor function,
+avoiding the getindex operation that triggers OffsetArrays.Origin errors in
+Symbolics._linear_expansion.
+"""
+function createSymbolicArrayCall(funcRef, uwArgs::Vector{Any}, dims::Tuple{Vararg{Int}})
+  local funcName = nameof(funcRef)
+  if length(dims) == 1
+    return [Symbolics.Num(SymbolicUtils.Term{Real}(getOrCreateElemFunc(funcName, (i,)), uwArgs)) for i in 1:dims[1]]
+  elseif length(dims) == 2
+    return [Symbolics.Num(SymbolicUtils.Term{Real}(getOrCreateElemFunc(funcName, (i, j)), uwArgs)) for i in 1:dims[1], j in 1:dims[2]]
+  else
+    #= 3D+ fallback: use linear indexing =#
+    local totalLen = prod(dims)
+    return [Symbolics.Num(SymbolicUtils.Term{Real}(getOrCreateElemFunc(funcName, (i,)), uwArgs)) for i in 1:totalLen]
+  end
+end
+
 """
 Helper to check if a value is symbolic (Symbolics.Num or contains symbolic expressions).
+Also recursively checks arrays, since record field arrays assembled from scalarized
+parameters may be Vector{Symbolics.Num} or Vector{Vector{Symbolics.Num}}.
 """
 function isSymbolicArg(x)
-  return x isa Symbolics.Num || x isa Symbolics.Arr || x isa SymbolicUtils.BasicSymbolic
+  x isa Symbolics.Num && return true
+  x isa Symbolics.Arr && return true
+  x isa SymbolicUtils.BasicSymbolic && return true
+  if x isa AbstractArray
+    for el in x
+      isSymbolicArg(el) && return true
+    end
+  end
+  return false
 end
 
 """
@@ -106,65 +194,139 @@ end
 TODO:
 This error still persists in some generations.
 """
-function createModelicaFunctionWrapper(funcName::Symbol, nArgs::Int)
-  #= Check if symbol already exists - if so, skip redefinition =#
-  #= The implementation in MODELICA_FUNCTION_IMPLS is updated separately =#
-  #= Any existing callable (function or RTG object) will use the new impl via invokelatest =#
-  if isdefined(@__MODULE__, funcName)
-    return nothing
-  end
+function createModelicaFunctionWrapper(funcName::Symbol, nArgs::Int, arrayFunction::Bool = false, outputDims::Tuple{Vararg{Int}} = ())
+  #= Always (re-)create the wrapper so the correct arrayFunction flag is applied.
+     The wrapper is cheap to create and the impl dict lookup is the same regardless. =#
 
   #= Define a function that:
      1. Checks if any argument is symbolic
-     2. If so, returns a symbolic term (like @register_symbolic would)
+     2. If so, returns a symbolic term (scalar) or vector of symbolic terms (array)
      3. Otherwise calls the implementation via invokelatest
+     For array-returning functions with known outputLen, symbolic args produce a
+     Vector{Num} of per-element Term nodes: [f(args...)[1], f(args...)[2], ...].
+     This defers the actual computation (including any if-statements) to runtime.
   =#
   local fnQuote = QuoteNode(funcName)
+  local hasArrayDims = !isempty(outputDims)
   if nArgs == 0
     @eval function $funcName()
       impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
       Base.invokelatest(impl)
     end
   elseif nArgs == 1
-    @eval function $funcName(arg1)
-      #= If argument is symbolic, return a symbolic term =#
-      if isSymbolicArg(arg1)
-        return Symbolics.Num(SymbolicUtils.Term($funcName, [Symbolics.unwrap(arg1)]))
+    if arrayFunction && hasArrayDims
+      @eval function $funcName(arg1)
+        if isSymbolicArg(arg1)
+          return createSymbolicArrayCall($funcName, Any[unwrapForSymbolic(arg1)], $outputDims)
+        end
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1)
       end
-      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
-      Base.invokelatest(impl, arg1)
+    elseif arrayFunction
+      @eval function $funcName(arg1)
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1)
+      end
+    else
+      @eval function $funcName(arg1)
+        if isSymbolicArg(arg1)
+          return Symbolics.Num(SymbolicUtils.Term{Real}($funcName, [unwrapForSymbolic(arg1)]))
+        end
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1)
+      end
     end
   elseif nArgs == 2
-    @eval function $funcName(arg1, arg2)
-      if hasSymbolicArgs(arg1, arg2)
-        return Symbolics.Num(SymbolicUtils.Term($funcName, [Symbolics.unwrap(arg1), Symbolics.unwrap(arg2)]))
+    if arrayFunction && hasArrayDims
+      @eval function $funcName(arg1, arg2)
+        if hasSymbolicArgs(arg1, arg2)
+          return createSymbolicArrayCall($funcName, Any[unwrapForSymbolic(arg1), unwrapForSymbolic(arg2)], $outputDims)
+        end
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1, arg2)
       end
-      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
-      Base.invokelatest(impl, arg1, arg2)
+    elseif arrayFunction
+      @eval function $funcName(arg1, arg2)
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1, arg2)
+      end
+    else
+      @eval function $funcName(arg1, arg2)
+        if hasSymbolicArgs(arg1, arg2)
+          return Symbolics.Num(SymbolicUtils.Term{Real}($funcName, [unwrapForSymbolic(arg1), unwrapForSymbolic(arg2)]))
+        end
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1, arg2)
+      end
     end
   elseif nArgs == 3
-    @eval function $funcName(arg1, arg2, arg3)
-      if hasSymbolicArgs(arg1, arg2, arg3)
-        return Symbolics.Num(SymbolicUtils.Term($funcName, [Symbolics.unwrap(arg1), Symbolics.unwrap(arg2), Symbolics.unwrap(arg3)]))
+    if arrayFunction && hasArrayDims
+      @eval function $funcName(arg1, arg2, arg3)
+        if hasSymbolicArgs(arg1, arg2, arg3)
+          return createSymbolicArrayCall($funcName, Any[unwrapForSymbolic(arg1), unwrapForSymbolic(arg2), unwrapForSymbolic(arg3)], $outputDims)
+        end
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1, arg2, arg3)
       end
-      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
-      Base.invokelatest(impl, arg1, arg2, arg3)
+    elseif arrayFunction
+      @eval function $funcName(arg1, arg2, arg3)
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1, arg2, arg3)
+      end
+    else
+      @eval function $funcName(arg1, arg2, arg3)
+        if hasSymbolicArgs(arg1, arg2, arg3)
+          return Symbolics.Num(SymbolicUtils.Term{Real}($funcName, [unwrapForSymbolic(arg1), unwrapForSymbolic(arg2), unwrapForSymbolic(arg3)]))
+        end
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1, arg2, arg3)
+      end
     end
   elseif nArgs == 4
-    @eval function $funcName(arg1, arg2, arg3, arg4)
-      if hasSymbolicArgs(arg1, arg2, arg3, arg4)
-        return Symbolics.Num(SymbolicUtils.Term($funcName, [Symbolics.unwrap(arg1), Symbolics.unwrap(arg2), Symbolics.unwrap(arg3), Symbolics.unwrap(arg4)]))
+    if arrayFunction && hasArrayDims
+      @eval function $funcName(arg1, arg2, arg3, arg4)
+        if hasSymbolicArgs(arg1, arg2, arg3, arg4)
+          return createSymbolicArrayCall($funcName, Any[unwrapForSymbolic(arg1), unwrapForSymbolic(arg2), unwrapForSymbolic(arg3), unwrapForSymbolic(arg4)], $outputDims)
+        end
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1, arg2, arg3, arg4)
       end
-      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
-      Base.invokelatest(impl, arg1, arg2, arg3, arg4)
+    elseif arrayFunction
+      @eval function $funcName(arg1, arg2, arg3, arg4)
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1, arg2, arg3, arg4)
+      end
+    else
+      @eval function $funcName(arg1, arg2, arg3, arg4)
+        if hasSymbolicArgs(arg1, arg2, arg3, arg4)
+          return Symbolics.Num(SymbolicUtils.Term{Real}($funcName, [unwrapForSymbolic(arg1), unwrapForSymbolic(arg2), unwrapForSymbolic(arg3), unwrapForSymbolic(arg4)]))
+        end
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, arg1, arg2, arg3, arg4)
+      end
     end
   else
-    @eval function $funcName(args...)
-      if any(isSymbolicArg, args)
-        return Symbolics.Num(SymbolicUtils.Term($funcName, [Symbolics.unwrap(a) for a in args]))
+    if arrayFunction && hasArrayDims
+      @eval function $funcName(args...)
+        if any(isSymbolicArg, args)
+          return createSymbolicArrayCall($funcName, Any[unwrapForSymbolic(a) for a in args], $outputDims)
+        end
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, args...)
       end
-      impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
-      Base.invokelatest(impl, args...)
+    elseif arrayFunction
+      @eval function $funcName(args...)
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, args...)
+      end
+    else
+      @eval function $funcName(args...)
+        if any(isSymbolicArg, args)
+          return Symbolics.Num(SymbolicUtils.Term{Real}($funcName, [unwrapForSymbolic(a) for a in args]))
+        end
+        impl = MODELICA_FUNCTION_IMPLS[$fnQuote]
+        Base.invokelatest(impl, args...)
+      end
     end
   end
 end
@@ -297,7 +459,46 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
     # Note2 In some cases we need to do index reduction before simplify
     # return complete(sys) #Addition. To be removed.
   end
+  local pre_eqs = length(equations(sys))
+  local pre_unknowns = length(unknowns(sys))
+  @info "Before structural_simplify: $pre_eqs equations, $pre_unknowns unknowns"
   sys = ModelingToolkit.structural_simplify(sys, simplify = simplify)
+  local post_eqs = length(equations(sys))
+  local post_full_eqs = length(ModelingToolkit.full_equations(sys))
+  local post_unknowns = length(unknowns(sys))
+  @info "After structural_simplify: equations=$(post_eqs), full_equations=$(post_full_eqs), unknowns=$(post_unknowns)"
+  if post_eqs != post_unknowns
+    @warn "equations(sys) != unknowns(sys): $post_eqs vs $post_unknowns"
+    for (i, eq) in enumerate(equations(sys))
+      @info "  eq[$i]: $eq"
+    end
+    for (i, u) in enumerate(unknowns(sys))
+      @info "  unk[$i]: $u"
+    end
+  end
+  if post_full_eqs != post_unknowns
+    @warn "full_equations(sys) != unknowns(sys): $post_full_eqs vs $post_unknowns"
+  end
+  #= Workaround: after structural_simplify, the tearing state's graph may have
+     stale dimensions (more equations/variables than equations(sys)/unknowns(sys)).
+     This causes a DimensionMismatch in W_sparsity when the graph-based Jacobian
+     sparsity (nsrcs x nsrcs) is broadcast against the mass matrix (neqs x neqs).
+     Clearing the tearing state forces jacobian_sparsity to fall back to symbolic
+     computation, which uses the correct equation/unknown counts. =#
+  try
+    local ts = ModelingToolkit.get_tearing_state(sys)
+    if ts !== nothing
+      local g = ts.structure.graph
+      local graph_eqs = ModelingToolkit.BipartiteGraphs.nsrcs(g)
+      local sys_eqs = length(equations(sys))
+      if graph_eqs != sys_eqs
+        @warn "Tearing state graph has $graph_eqs equations but system has $sys_eqs; clearing tearing state"
+        @set! sys.tearing_state = nothing
+      end
+    end
+  catch ex
+    @warn "Could not inspect tearing state" exception=(ex, catch_backtrace())
+  end
   return sys
 end
 

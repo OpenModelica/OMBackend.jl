@@ -66,14 +66,15 @@ function matching(dict::DataStructures.OrderedDict, n::Int)
   local isSingular = false
   local success::Bool
   for i in 1:n
-    vMark = [false for j in 1:n]
-    eMark = [false for j in 1:n]
+    vMark = Bool[false for j in 1:n]
+    eMark = Bool[false for j in 1:n]
     try
       success = pathFound(i)
     catch e
       local msg = "Failed to match equations to variables.
-                   A possible reason is that the system is over/underdetermined."
-      @error msg
+                   A possible reason is that the system is over/underdetermined.
+                   Matching will be done by later backend processing."
+      @info msg
       throw(e)
     end
     if !success

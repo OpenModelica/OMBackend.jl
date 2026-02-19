@@ -169,26 +169,81 @@ end
   E.g., R.T[1,2] becomes R_T[1,2], and R.w becomes R_w
 """
 function transformStatementsForFlattenedRecords(statements::Vector{DAE.Statement}, recordFieldMap::Dict)::Vector{DAE.Statement}
-  return map(statements) do stmt
-    transformStatementForFlattenedRecords(stmt, recordFieldMap)
+  local result = DAE.Statement[]
+  for stmt in statements
+    append!(result, transformStatementForFlattenedRecords(stmt, recordFieldMap))
+  end
+  return result
+end
+
+function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN, recordFieldMap::Dict)::Vector{DAE.Statement}
+  #= Check if LHS is a flattened record variable =#
+  local lhsName = @match stmt.exp1 begin
+    DAE.CREF(DAE.CREF_IDENT(ident, _, _), _) => ident
+    _ => nothing
+  end
+  #= If LHS is a record variable and RHS is a RECORD expression, expand into field assignments =#
+  if lhsName !== nothing && haskey(recordFieldMap, lhsName)
+    @match stmt.exp begin
+      DAE.RECORD(path, exps, fieldNames, ty) => begin
+        local fieldInfo = recordFieldMap[lhsName]
+        local expVec = collect(exps)
+        local stmts = DAE.Statement[]
+        for (i, (fieldName, fieldTy)) in enumerate(fieldInfo)
+          local flatName = lhsName * "_" * fieldName
+          local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
+          local lhsExp = DAE.CREF(flatCref, fieldTy)
+          local rhsExp = transformExpForFlattenedRecords(expVec[i], recordFieldMap)
+          push!(stmts, DAE.STMT_ASSIGN(fieldTy, lhsExp, rhsExp, stmt.source))
+        end
+        return stmts
+      end
+      _ => begin
+        local newExp1 = transformExpForFlattenedRecords(stmt.exp1, recordFieldMap)
+        local newExp = transformExpForFlattenedRecords(stmt.exp, recordFieldMap)
+        return [DAE.STMT_ASSIGN(stmt.type_, newExp1, newExp, stmt.source)]
+      end
+    end
+  else
+    local newExp1 = transformExpForFlattenedRecords(stmt.exp1, recordFieldMap)
+    local newExp = transformExpForFlattenedRecords(stmt.exp, recordFieldMap)
+    return [DAE.STMT_ASSIGN(stmt.type_, newExp1, newExp, stmt.source)]
   end
 end
 
-function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN, recordFieldMap::Dict)::DAE.Statement
-  local newExp1 = transformExpForFlattenedRecords(stmt.exp1, recordFieldMap)
-  local newExp = transformExpForFlattenedRecords(stmt.exp, recordFieldMap)
-  return DAE.STMT_ASSIGN(stmt.type_, newExp1, newExp, stmt.source)
-end
-
-function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN_ARR, recordFieldMap::Dict)::DAE.Statement
+function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN_ARR, recordFieldMap::Dict)::Vector{DAE.Statement}
   local newLhs = transformExpForFlattenedRecords(stmt.lhs, recordFieldMap)
   local newExp = transformExpForFlattenedRecords(stmt.exp, recordFieldMap)
-  return DAE.STMT_ASSIGN_ARR(stmt.type_, newLhs, newExp, stmt.source)
+  return [DAE.STMT_ASSIGN_ARR(stmt.type_, newLhs, newExp, stmt.source)]
 end
 
-function transformStatementForFlattenedRecords(stmt::DAE.Statement, recordFieldMap::Dict)::DAE.Statement
+function transformStatementForFlattenedRecords(stmt::DAE.Statement, recordFieldMap::Dict)::Vector{DAE.Statement}
   #= For other statement types, return unchanged for now =#
-  return stmt
+  return [stmt]
+end
+
+"""
+  If exp is a plain CREF to a record variable in recordFieldMap, expand it into
+  a vector of field CREFs (e.g., R_rel becomes [R_rel_T, R_rel_w]).
+  Returns nothing if exp is not an expandable record reference.
+"""
+function expandRecordArgForCall(exp::DAE.Exp, recordFieldMap::Dict)
+  @match exp begin
+    DAE.CREF(DAE.CREF_IDENT(ident, _, _), _) => begin
+      if haskey(recordFieldMap, ident)
+        local fieldInfo = recordFieldMap[ident]
+        local fieldExps = DAE.Exp[]
+        for (fieldName, fieldTy) in fieldInfo
+          local flatName = ident * "_" * fieldName
+          local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
+          push!(fieldExps, DAE.CREF(flatCref, fieldTy))
+        end
+        return fieldExps
+      end
+      return nothing
+    end
+    _ => return nothing
+  end
 end
 
 """
@@ -229,13 +284,164 @@ function transformExpForFlattenedRecords(exp::DAE.Exp, recordFieldMap::Dict)::DA
     DAE.UNARY(op, e1) => begin
       DAE.UNARY(op, transformExpForFlattenedRecords(e1, recordFieldMap))
     end
-    #= Recursively transform function calls =#
+    #= Recursively transform function calls, expanding record args into flattened fields =#
     DAE.CALL(path, expLst, attr) => begin
-      local newExpLst = map(expLst) do e
-        transformExpForFlattenedRecords(e, recordFieldMap)
+      local newArgs = DAE.Exp[]
+      for e in expLst
+        local expanded = expandRecordArgForCall(e, recordFieldMap)
+        if expanded !== nothing
+          append!(newArgs, expanded)
+        else
+          push!(newArgs, transformExpForFlattenedRecords(e, recordFieldMap))
+        end
       end
-      DAE.CALL(path, MetaModelica.list(newExpLst...), attr)
+      DAE.CALL(path, MetaModelica.list(newArgs...), attr)
     end
     _ => exp
+  end
+end
+
+#= ============================================================================
+   Flatten record arguments in equation call sites.
+   After flattenRecordParameters has modified function signatures to accept
+   individual fields instead of records, this pass rewrites the CALL expressions
+   in equations to match. A record CREF argument like R (T_COMPLEX) is replaced
+   with individual field arguments: R_T (DAE.ARRAY of element CREFs) and R_w
+   (DAE.ARRAY of element CREFs).
+   ============================================================================ =#
+
+"""
+  Rewrite CALL expressions in all residual equations so that record arguments
+  are expanded into individual field arguments matching the flattened function
+  signatures.
+"""
+function flattenRecordCallSites(simCode)
+  #= Expand record arguments in residual equations =#
+  local newResEqs = map(simCode.residualEquations) do eq
+    @match eq begin
+      BDAE.RESIDUAL_EQUATION(exp, source, attr) => begin
+        local newExp = expandRecordArgsInExp(exp)
+        BDAE.RESIDUAL_EQUATION(newExp, source, attr)
+      end
+      _ => eq
+    end
+  end
+  @assign simCode.residualEquations = newResEqs
+  #= Expand record arguments in parameter and array-parameter binding expressions =#
+  local ht = simCode.stringToSimVarHT
+  for (name, (idx, simVar)) in ht
+    local newVarKind = @match simVar.varKind begin
+      SimulationCode.PARAMETER(SOME(bindExp)) => begin
+        local newBind = expandRecordArgsInExp(bindExp)
+        newBind === bindExp ? nothing : SimulationCode.PARAMETER(SOME(newBind))
+      end
+      SimulationCode.ARRAY_PARAMETER(dims, SOME(bindExp)) => begin
+        local newBind = expandRecordArgsInExp(bindExp)
+        newBind === bindExp ? nothing : SimulationCode.ARRAY_PARAMETER(dims, SOME(newBind))
+      end
+      _ => nothing
+    end
+    if newVarKind !== nothing
+      local newSimVar = SimulationCode.SIMVAR(simVar.name, simVar.index, newVarKind, simVar.attributes)
+      ht[name] = (idx, newSimVar)
+    end
+  end
+  return simCode
+end
+
+"""
+  Recursively traverse an expression and expand record arguments inside CALL nodes.
+"""
+function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
+  @match exp begin
+    DAE.CALL(path, expLst, attr) => begin
+      local newArgs = DAE.Exp[]
+      for arg in expLst
+        @match arg begin
+          DAE.CREF(cr, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => begin
+            local baseName = replace(string(cr), "." => "_")
+            for field in varLst
+              @match field begin
+                DAE.TYPES_VAR(fieldName, _, fieldTy, _, _) => begin
+                  local flatName = baseName * "_" * fieldName
+                  push!(newArgs, buildFieldArgExp(flatName, fieldTy))
+                end
+                _ => nothing
+              end
+            end
+          end
+          _ => push!(newArgs, expandRecordArgsInExp(arg))
+        end
+      end
+      DAE.CALL(path, MetaModelica.list(newArgs...), attr)
+    end
+    DAE.BINARY(e1, op, e2) => begin
+      DAE.BINARY(expandRecordArgsInExp(e1), op, expandRecordArgsInExp(e2))
+    end
+    DAE.UNARY(op, e1) => begin
+      DAE.UNARY(op, expandRecordArgsInExp(e1))
+    end
+    DAE.ASUB(innerExp, subscripts) => begin
+      DAE.ASUB(expandRecordArgsInExp(innerExp), subscripts)
+    end
+    DAE.IFEXP(cond, e1, e2) => begin
+      DAE.IFEXP(expandRecordArgsInExp(cond), expandRecordArgsInExp(e1), expandRecordArgsInExp(e2))
+    end
+    DAE.ARRAY(ty, scalar, arr) => begin
+      local newArr = map(expandRecordArgsInExp, arr)
+      DAE.ARRAY(ty, scalar, MetaModelica.list(newArr...))
+    end
+    _ => exp
+  end
+end
+
+"""
+  Build a DAE expression for a single record field argument.
+  For scalar fields: a simple CREF.
+  For 1D array fields: a DAE.ARRAY of element CREFs with subscripts.
+  For 2D array fields: a nested DAE.ARRAY of element CREFs.
+"""
+function buildFieldArgExp(flatName::String, fieldTy::DAE.Type)::DAE.Exp
+  @match fieldTy begin
+    DAE.T_ARRAY(elemTy, dims) => begin
+      local dimSizes = Int[]
+      for d in dims
+        @match d begin
+          DAE.DIM_INTEGER(size) => push!(dimSizes, size)
+          _ => return DAE.CREF(DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil), fieldTy)
+        end
+      end
+      if length(dimSizes) == 1
+        #= 1D array: ARRAY([CREF(name, subs=[1]), CREF(name, subs=[2]), ...]) =#
+        local elems = DAE.Exp[]
+        for i in 1:dimSizes[1]
+          local subs = MetaModelica.list(DAE.INDEX(DAE.ICONST(i)))
+          local cr = DAE.CREF_IDENT(flatName, fieldTy, subs)
+          push!(elems, DAE.CREF(cr, elemTy))
+        end
+        return DAE.ARRAY(fieldTy, true, MetaModelica.list(elems...))
+      elseif length(dimSizes) == 2
+        #= 2D array: nested ARRAY of row ARRAYs =#
+        local rowTy = DAE.T_ARRAY(elemTy, MetaModelica.list(DAE.DIM_INTEGER(dimSizes[2])))
+        local rows = DAE.Exp[]
+        for i in 1:dimSizes[1]
+          local rowElems = DAE.Exp[]
+          for j in 1:dimSizes[2]
+            local subs = MetaModelica.list(DAE.INDEX(DAE.ICONST(i)), DAE.INDEX(DAE.ICONST(j)))
+            local cr = DAE.CREF_IDENT(flatName, fieldTy, subs)
+            push!(rowElems, DAE.CREF(cr, elemTy))
+          end
+          push!(rows, DAE.ARRAY(rowTy, true, MetaModelica.list(rowElems...)))
+        end
+        return DAE.ARRAY(fieldTy, false, MetaModelica.list(rows...))
+      else
+        #= Higher dimensions: pass as bare CREF =#
+        return DAE.CREF(DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil), fieldTy)
+      end
+    end
+    _ => begin
+      #= Scalar field: simple CREF =#
+      return DAE.CREF(DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil), fieldTy)
+    end
   end
 end

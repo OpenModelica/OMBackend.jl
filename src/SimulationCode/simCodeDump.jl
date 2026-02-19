@@ -347,6 +347,12 @@ end
 """
 function dumpDAEVarType(v::DAE.VAR)::String
   local baseType = dumpDAEType(v.ty)
+  #= Only append dims if the type itself is not already an array type,
+     otherwise we double-print the dimensions =#
+  @match v.ty begin
+    DAE.T_ARRAY(__) => return baseType
+    _ => nothing
+  end
   #= Check if dims field contains array dimensions (MetaModelica list) =#
   local hasDims = false
   local dimStrs = String[]

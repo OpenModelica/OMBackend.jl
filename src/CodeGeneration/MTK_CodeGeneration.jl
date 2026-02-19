@@ -181,6 +181,16 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
   end
   local DATA_STRUCTURE_ASSIGNMENTS = createDataStructureAssignments(dataStructureVariables, simCode)
   local model = ODE_MODE_MTK_MODEL_GENERATION(simCode, modelName, functions)
+  #= Qualify bare Modelica function calls in function bodies so they resolve correctly
+     when the program is eval'd in OMBackend scope (backendAPI.jl) rather than CodeGeneration scope.
+     Without this, implementation bodies that call other Modelica functions (e.g., normalizeWithAssert
+     calling Vectors_length) would fail with UndefVarError. =#
+  local funcNames = Set{Symbol}(Symbol(replace(f.name, "." => "_")) for f in simCode.functions)
+  if !isempty(funcNames)
+    for f in functions
+      qualifyModelicaFunctions!(f, funcNames)
+    end
+  end
   program = quote
     using ModelingToolkit
     using DifferentialEquations
@@ -259,7 +269,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
         push!(parameters, varName)
       end
       SimulationCode.STRING(__) => begin
-        push!(parameters, varName)
+        #= String parameters are non-numeric; excluded from MTK parameter system. =#
       end
       SimulationCode.ARRAY_PARAMETER(__) => begin
         push!(arrayParameters, varName)
@@ -482,6 +492,10 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
        A[i] = <true_index>
       =#
       callbacks = $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
+      println("[DIAG] Before ODEProblem: eqs=", length(ModelingToolkit.equations(reducedSystem)),
+              " get_eqs=", length(ModelingToolkit.get_eqs(reducedSystem)),
+              " unknowns=", length(ModelingToolkit.unknowns(reducedSystem)),
+              " subsystems=", length(ModelingToolkit.get_systems(reducedSystem)))
       problem = ModelingToolkit.ODEProblem(reducedSystem,
                                            merge(Dict(finalInitialValues), pars),
                                            tspan,
@@ -490,6 +504,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       #= Check before commit. =#
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
     end
+  end
+  #= Qualify bare Modelica function calls with OMBackend.CodeGeneration. prefix.
+     This covers all generated code: equations, parameter assignments, start conditions. =#
+  local funcNames = Set{Symbol}(Symbol(replace(f.name, "." => "_")) for f in simCode.functions)
+  if !isempty(funcNames)
+    qualifyModelicaFunctions!(model, funcNames)
   end
   return model
 end
@@ -849,7 +869,8 @@ function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode
         end
       end
       SimulationCode.STRING(__) => begin
-        DAE.SCONST("tmp") #TODO handle string parameters properly.
+        @warn "String parameter $(param) found in numeric parameter list; skipping."
+        continue
       end
       _ => begin
         throw(ErrorException("Unknown SimulationCode.SimVarType for parameter: " * string(param)  * " of type: " * string(simVarType)))
@@ -1244,17 +1265,18 @@ function generateArrayRegisterExpr(f::SimulationCode.ModelicaFunction, funcArgGe
 end
 
 """
-  Generates quoted Symbolics.@register_symbolic calls s.t externaly defined functions are known during simulation.
-  Functions with array parameters are not registered to avoid type issues; they rely on
-  vectorDot and other helpers to handle symbolic arrays directly.
+  Generates quoted Symbolics registration calls for externally defined functions.
+  Scalar functions use @register_symbolic.
+  Functions with array parameters that return arrays use @register_array_symbolic
+  so MTK knows the output shape and can handle getindex on the result.
 """
 function generateRegisterCallsForCallExprs(simCode;
                                             funcArgGen::Function = AlgorithmicCodeGeneration.generateSignatureForRegistration)
   local rFs = Expr[]
   for f in simCode.functions
-    #= Skip registration for functions with array parameters =#
-    #= These functions will be evaluated directly with symbolic arrays =#
     if hasArrayParameters(f)
+      #= Functions with array parameters are not registered. =#
+      #= They execute eagerly with symbolic array arguments. =#
       continue
     else
       #= Use @register_symbolic for scalar functions =#
