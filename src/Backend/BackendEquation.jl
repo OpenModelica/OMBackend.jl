@@ -139,7 +139,7 @@ function makeNestedIfExpressionResidual(lstCond::List{DAE.Exp}, lstTrue::List{BD
     @match (lstCond, lstTrue) begin
       (nil, _) => begin
          #= fails for anything but BDAE.EQUATION() =#
-         makeResidualExp(eqFalse.lhs, eqFalse,rhs)
+         makeResidualExp(eqFalse.lhs, eqFalse.rhs)
       end
       (cond <| restCond, eqTrue <| restTrue) => begin
          #= fails for anything but BDAE.EQUATION() =#

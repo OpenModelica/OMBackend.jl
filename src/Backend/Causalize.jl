@@ -86,8 +86,8 @@ function detectIfExpressions(dae::BDAE.BACKEND_DAE)
   BDAEUtil.mapEqSystems(dae, detectIfEquationsEqSystem)
 end
 
-function detectAndReplaceArrayVariables(dae::BDAE.BDAE.BACKEND_DAE, expandedVariables::Array)
-  BDAEUtil.mapEqSystems(dae, replaceArrayVariables, expandedVariables)
+function detectAndReplaceArrayVariables(dae::BDAE.BACKEND_DAE, expandedVariables::Array)
+  error("replaceArrayVariables is not implemented. This code path (old DAE.DAE_LIST frontend) is not supported.")
 end
 
 """

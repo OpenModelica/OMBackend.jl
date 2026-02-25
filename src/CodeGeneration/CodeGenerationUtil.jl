@@ -113,23 +113,34 @@ function transformToMTKContinousCondition(cond, simCode)
     DAE.RELATION(e1, DAE.LESS(__), e2) => begin
       :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)))
     end
-
+    DAE.RELATION(e1, DAE.LESSEQ(__), e2) => begin
+      :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)))
+    end
     DAE.RELATION(e1, DAE.GREATER(__), e2) => begin
       :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)))
     end
-    #= Assumed to be a boolean variable... =#
+    DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => begin
+      :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)))
+    end
+    #= Assumed to be a boolean variable =#
     DAE.CREF(__) => begin
       :($(expToJuliaExpMTK(cond, simCode)))
     end
-
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      #= Here we assume that it is used in a context such that it can be treated this way.=#
       :(min($(transformToMTKContinousConditionEquation(e1, simCode)),
             $(transformToMTKContinousConditionEquation(e2, simCode))))
     end
-
+    #= Strip noEvent wrapper and recurse =#
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local innerArgs = collect(lst)
+      if length(innerArgs) == 1
+        transformToMTKContinousCondition(innerArgs[1], simCode)
+      else
+        throw("noEvent with multiple arguments not supported in condition: " * string(cond))
+      end
+    end
     _ => begin
-      throw("Operator: " * "'" * string(cond.operator) * "' in: " * string(cond) * " is not supported")
+      throw("Unsupported condition expression in IF_EQUATION: " * string(cond))
     end
   end
   return res
@@ -143,29 +154,38 @@ function transformToMTKContinousConditionEquation(cond, simCode)
     DAE.RELATION(e1, DAE.LESS(__), e2) => begin
       :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)) ~ 0)
     end
-
+    DAE.RELATION(e1, DAE.LESSEQ(__), e2) => begin
+      :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)) ~ 0)
+    end
     DAE.RELATION(e1, DAE.GREATER(__), e2) => begin
       :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)) ~ 0)
     end
-    #= Assumed to be a boolean variable... =#
+    DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => begin
+      :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)) ~ 0)
+    end
+    #= Assumed to be a boolean variable =#
     DAE.CREF(__) => begin
       :($(expToJuliaExpMTK(cond, simCode)))
     end
-
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      #= Here we assume that it is used in a context such that it can be treated this way.=#
       :(min($(transformToMTKContinousCondition(e1, simCode)),
             $(transformToMTKContinousCondition(e2, simCode))) ~ 0)
     end
-
     DAE.LBINARY(e1, DAE.AND(__), e2) => begin
-      #= Here we assume that it is used in a context such that it can be treated this way.=#
       :(max($(transformToMTKContinousCondition(e1, simCode)),
             $(transformToMTKContinousCondition(e2, simCode))) ~ 0)
     end
-
+    #= Strip noEvent wrapper and recurse =#
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local innerArgs = collect(lst)
+      if length(innerArgs) == 1
+        transformToMTKContinousConditionEquation(innerArgs[1], simCode)
+      else
+        throw("noEvent with multiple arguments not supported in condition: " * string(cond))
+      end
+    end
     _ => begin
-      throw("Operator: " * "'" * string(cond.operator) * "' in: " * string(cond) * " is not supported")
+      throw("Unsupported condition expression in IF_EQUATION: " * string(cond))
     end
   end
   return res
@@ -179,64 +199,6 @@ function flattenExprs(eqs::Vector{Expr})
   quote
     $(eqs...)
   end
-end
-
-"""
-Returns:
-stateVariables, algebraicVariables, stateVariablesLoop, algebraicVariablesLoop
-"""
-function separateVariables(simCode)::Tuple
-  local stringToSimVarHT = simCode.stringToSimVarHT
-  local parameters::Vector{String} = String[]
-  local stateDerivatives::Vector{String} = String[]
-  local stateVariables::Vector{String} = String[]
-  local algebraicVariables::Vector{String} = String[]
-  local discreteVariables::Vector{String} = String[]
-  #= Loop arrays=#
-  local stateDerivativesLoop::Vector{String} = String[]
-  local stateVariablesLoop::Vector{String} = String[]
-  local algebraicVariablesLoop::Vector{String} = String[]
-  local discreteVariablesLoop::Vector{String} = String[]
-  #= Separate the variables =#
-  for varName in keys(stringToSimVarHT)
-    (idx, var) = stringToSimVarHT[varName]
-    if simCode.matchOrder[idx] in loop
-      local varType = var.varKind
-      @match varType  begin
-        SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
-        SimulationCode.STATE(__) => push!(stateVariablesLoop, varName)
-        SimulationCode.PARAMETER(__) => push!(parameters, varName)
-        SimulationCode.ALG_VARIABLE(__) => begin
-          if idx in simCode.matchOrder
-            push!(algebraicVariablesLoop, varName)
-          else #= We have a variable that is not contained in continious system =#
-            #= Treat discrete variables separate =#
-            push!(discreteVariablesLoop, varName)
-          end
-        end
-        #=TODO: Do I need to modify this?=#
-        SimulationCode.STATE_DERIVATIVE(__) => push!(stateDerivativesLoop, varName)
-      end
-    else #= Someplace else=#
-      local varType = var.varKind
-      @match varType  begin
-        SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
-        SimulationCode.STATE(__) => push!(stateVariables, varName)
-        SimulationCode.PARAMETER(__) => push!(parameters, varName)
-        SimulationCode.ALG_VARIABLE(__) => begin
-          if idx in simCode.matchOrder
-            push!(algebraicVariables, varName)
-          else #= We have a variable that is not contained in continious system =#
-            #= Treat discrete variables separate =#
-            push!(discreteVariables, varName)
-          end
-        end
-        #=TODO: Do I need to modify this?=#
-        SimulationCode.STATE_DERIVATIVE(__) => push!(stateDerivatives, varName)
-      end
-    end
-  end
-  return (stateVariables, algebraicVariables, stateVariablesLoop, algebraicVariablesLoop)
 end
 
 
@@ -903,8 +865,8 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       end
       DAE.LUNARY(operator = op, exp = e1)  => begin
         local operand = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        local op = DAE_OP_toJuliaOperator(op)
-        :($op($(op)))
+        local opSym = DAE_OP_toJuliaOperator(op)
+        :($opSym($(operand)))
       end
       DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
         local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
@@ -946,16 +908,10 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       If that is the case the expression can be resolved.
       =#
       DAE.IFEXP(expCond, expThen, expElse) => begin
-        try
-        #   expr = evalDAEConstant(expCond, simCode)
-        #   local expThenJL = expToJuliaExpMTK(expThen, simCode)
-          local expElseJL = expToJuliaExpMTK(expElse, simCode)
-          quote
-            $(expElseJL)
-          end
-        catch e
-          throw(ErrorException("If expressions with variable conditions not allowed in backend code.\n Expression was:\t $(string(exp))"))
-        end
+        local condJL = expToJuliaExpMTK(expCond, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+        local thenJL = expToJuliaExpMTK(expThen, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+        local elseJL = expToJuliaExpMTK(expElse, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+        :(ModelingToolkit.ifelse($(condJL), $(thenJL), $(elseJL)))
       end
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
         #Call as symbol is really ugly.. please fix me :(

@@ -288,7 +288,10 @@ function splitEquationsAndVars(elementLst::List{DAE.Element})::Tuple{List, List,
           BDAE.EQ_ATTR_DEFAULT_UNKNOWN) <| initialEquationLst
         end
         DAE.COMP(__) => begin
-          variableLst,equationLst,initialEquationLst = splitEquationsAndVars(elem.dAElist)
+          (subVars, subEqs, subInitEqs) = splitEquationsAndVars(elem.dAElist)
+          variableLst = listAppend(subVars, variableLst)
+          equationLst = listAppend(subEqs, equationLst)
+          initialEquationLst = listAppend(subInitEqs, initialEquationLst)
         end
         DAE.NORETCALL(DAE.CALL(Absyn.IDENT("branch"), args)) => begin
           @match arg1 <| arg2 <| nil = args

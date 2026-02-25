@@ -56,6 +56,15 @@ import SCode
 
 const LATEX_SYMBOLS = REPL.REPLCompletions.latex_symbols
 #= Settings =#
+const WARN_MISSING_START_VALUES = Ref(false)
+
+"""
+  Toggle warnings for implicit default start values in MTK code generation.
+"""
+function warnMissingStartValues(enabled::Bool)
+  WARN_MISSING_START_VALUES[] = enabled
+end
+
 @enum BackendMode begin
   DAE_MODE = 1
   ODE_MODE = 2 #Currently not in operation
@@ -86,7 +95,7 @@ TODO: Optimaly we should keep the fronten structure
 in memory as well s.t we only recompile if the structure of the source file changes
 (Unless retranslation is forced).
 """
-const COMPILED_MODELS_MTK = Dict{String, Tuple{Expr, Bool}}()
+const COMPILED_MODELS_MTK = Dict{String, Tuple{Expr, Bool, UInt64}}()
 
 """
  This function lowers the given Hybrid DAE to target code.
@@ -97,39 +106,53 @@ The function list contains the sequential parts of a modelica model, that is the
 This is not part of the lowering process but it is to be generated before we generate MTK target code
 """
 function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatModel};
-                   functionList = nothing, BackendMode = MTK_MODE)::Tuple{String, Expr}
-  #= Dump the flat model with functions as it arrives from the frontend =#
-  @BACKEND_LOGGING if frontendDAE isa OMFrontend.Frontend.FlatModel
-    local fLst = functionList !== nothing ? functionList : MetaModelica.nil
-    debugWrite("frontend_initialModel.log",
-      replace(OMFrontend.Frontend.toFlatString(frontendDAE, fLst), "\\n" => "\n"))
+                   functionList = nothing,
+                   BackendMode = MTK_MODE,
+                   warnMissingStartValues = nothing)::Tuple{String, Expr}
+  local previousWarnSetting = WARN_MISSING_START_VALUES[]
+  if warnMissingStartValues !== nothing
+    warnMissingStartValues isa Bool || error("warnMissingStartValues must be Bool or nothing")
+    WARN_MISSING_START_VALUES[] = warnMissingStartValues
   end
-  local bDAE = lower(frontendDAE)
-  local simCode
-  if BackendMode == DAE_MODE
-    error("DAE-mode is deprecated.")
-  elseif BackendMode == MTK_MODE
-    #@debug "Generate simulation code"
-    simCode = generateSimulationCode(bDAE; mode = MTK_MODE)
-    (simCodeFunctions, externalRuntimeNeeded) = if functionList !== nothing
-      generateSimCodeFunctions(functionList)
-    else
-      (SimulationCode.ModelicaFunction[], false)
+  try
+  #= Dump the flat model with functions as it arrives from the frontend =#
+    @BACKEND_LOGGING if frontendDAE isa OMFrontend.Frontend.FlatModel
+      local fLst = functionList !== nothing ? functionList : MetaModelica.nil
+      debugWrite("frontend_initialModel.log",
+        replace(OMFrontend.Frontend.toFlatString(frontendDAE, fLst), "\\n" => "\n"))
     end
-    @assign simCode.functions = simCodeFunctions
-    @assign simCode.externalRuntime = externalRuntimeNeeded
-    #= Dump before record flattening =#
-    @BACKEND_LOGGING debugWrite("simCode_initial.log", SimulationCode.dumpSimCode(simCode))
-    #= Flatten record parameters in functions =#
-    simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
-    @assign simCode.functions = simCodeFunctions
-    @BACKEND_LOGGING debugWrite("simCode_afterFlattenRecordParams.log", SimulationCode.dumpSimCode(simCode))
-    #= Flatten record arguments in equation call sites to match flattened signatures =#
-    simCode = SimulationCode.flattenRecordCallSites(simCode)
-    @BACKEND_LOGGING debugWrite("simCode_afterFlattenRecordCallSites.log", SimulationCode.dumpSimCode(simCode))
-    return generateMTKTargetCode(simCode)
-  else
-    @error "No mode specified: valid modes are: MTK_MODE"
+    local bDAE = lower(frontendDAE)
+    local simCode
+    if BackendMode == DAE_MODE
+      error("DAE-mode is deprecated.")
+    elseif BackendMode == MTK_MODE
+      #@debug "Generate simulation code"
+      simCode = generateSimulationCode(bDAE; mode = MTK_MODE)
+      (simCodeFunctions, externalRuntimeNeeded) = if functionList !== nothing
+        generateSimCodeFunctions(functionList)
+      else
+        (SimulationCode.ModelicaFunction[], false)
+      end
+      @assign simCode.functions = simCodeFunctions
+      @assign simCode.externalRuntime = externalRuntimeNeeded
+      #= Dump before record flattening =#
+      @BACKEND_LOGGING debugWrite("simCode_initial.log", SimulationCode.dumpSimCode(simCode))
+      #= Flatten record parameters in functions =#
+      simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
+      @assign simCode.functions = simCodeFunctions
+      @BACKEND_LOGGING debugWrite("simCode_afterFlattenRecordParams.log", SimulationCode.dumpSimCode(simCode))
+      #= Flatten record arguments in equation call sites to match flattened signatures =#
+      simCode = SimulationCode.flattenRecordCallSites(simCode)
+      @BACKEND_LOGGING debugWrite("simCode_afterFlattenRecordCallSites.log", SimulationCode.dumpSimCode(simCode))
+      #= Resolve constant-condition IFEXPs in parameter bindings =#
+      simCode = SimulationCode.resolveIfExpInBindings!(simCode)
+      @BACKEND_LOGGING debugWrite("simCode_afterResolveIfExp.log", SimulationCode.dumpSimCode(simCode))
+      return generateMTKTargetCode(simCode)
+    else
+      @error "No mode specified: valid modes are: MTK_MODE"
+    end
+  finally
+    WARN_MISSING_START_VALUES[] = previousWarnSetting
   end
 end
 
@@ -287,19 +310,21 @@ function generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)
   @debug "Functions:" modelCode
   @debug "Model:" modelName
   modelName = replace(modelName, "." => "__")
+  local codeHash = hash(modelCode)
   if haskey(COMPILED_MODELS_MTK, modelName)
-    #= Check if the newly generated model is different from the previous model =#
-    local changeDetected = COMPILED_MODELS_MTK[modelName] == modelCode
-    COMPILED_MODELS_MTK[modelName] = (modelCode, changeDetected)
+    #= Compare hash instead of full Expr tree to reduce compile-time overhead. =#
+    local previousHash = COMPILED_MODELS_MTK[modelName][3]
+    local changeDetected = previousHash != codeHash
+    COMPILED_MODELS_MTK[modelName] = (modelCode, changeDetected, codeHash)
   else
-    COMPILED_MODELS_MTK[modelName] = (modelCode, false)
+    COMPILED_MODELS_MTK[modelName] = (modelCode, false, codeHash)
   end
   return (modelName, modelCode)
 end
 
 function getCompiledModel(modelName)
   try
-    return first(COMPILED_MODELS_MTK[modelName])
+    return COMPILED_MODELS_MTK[modelName][1]
   catch e
     @error "Model: $(modelName) is not compiled. Available models are: $(availableModels())"
     throw(e)
@@ -310,7 +335,7 @@ end
   Returns true if the model was compiled again
 """
 function modelWasCompiledAgain(modelName)
-  return last(COMPILED_MODELS_MTK[modelName])
+  return COMPILED_MODELS_MTK[modelName][2]
 end
 
 """
@@ -439,29 +464,15 @@ function simulateModel(modelName::String;
     end
     try
       @eval $(:(import OMBackend))
-      #= Added to adjust the recent DEFAULT_PRECS issue =#
-      @eval $(:(import OrdinaryDiffEq.DEFAULT_PRECS))
       @eval $(:(using DifferentialEquations))
       #= Below is needed to pass the custom solver=#
       strippedModel = CodeGeneration.stripBeginBlocks(modelCode)
       @eval $strippedModel
-      #=
-      Evaluate the model runnable.
-      Is used to specify the keyword arguments that are being passed along.
-      =#
-      local modelRunnable =  Expr(:call,
-                                  Symbol(modelName, "Simulate"),
-                                  Expr(:parameters,
-                                       Expr(:(...), kwargs)),
-                                  tspan,
-                                  solver)
-
-      #= Run the model =#
-      @eval $modelRunnable
-      #=
-      The model is now compiled and a part of the OMBackend module.
-      In the following path OMBackend.<modelName>Simulate
-      =#
+      #= Run in latest world age to see the just-eval'd functions =#
+      Base.invokelatest() do
+        local simulateFn = getfield(OMBackend, Symbol(modelName, "Simulate"))
+        simulateFn(tspan, solver; kwargs...)
+      end
     catch err
       @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
       rethrow(err)

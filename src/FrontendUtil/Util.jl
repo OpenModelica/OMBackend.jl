@@ -339,6 +339,24 @@ function traverseExpList(expLst::List{DAE.Exp}, func::Function, inArg)
 end
 
 """
+  Helper function to traverseExpBottomUp, traverses matrix expressions.
+  Mirrors Expression.traverseExpMatrix from OpenModelica.
+"""
+function traverseExpMatrix(inMatrix::List{List{DAE.Exp}}, func::Function, inArg)
+  outArg = inArg
+  newRows = List{DAE.Exp}[]
+  same = true
+  for row in inMatrix
+    (row_1, outArg) = traverseExpList(row, func, outArg)
+    push!(newRows, row_1)
+    if !referenceEq(row, row_1)
+      same = false
+    end
+  end
+  return same ? (inMatrix, outArg) : (list(newRows...), outArg)
+end
+
+"""
   Traverse reduction iterators, applying the traversal function to each iterator expression.
 """
 function traverseReductionIteratorsTopDown(riters::DAE.ReductionIterators, func::Function, extArg)
@@ -899,18 +917,6 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
           inExp
         else
           DAE.METARECORDCALL(fn, expl_1, fieldNames, i, typeVars)
-        end
-        (e, ext_arg) = inFunc(e, ext_arg)
-        (e, ext_arg)
-      end
-
-      DAE.MATCHEXPRESSION(matchTy, expl, aliases, localDecls, cases, tp)  => begin
-        (expl_1, ext_arg) = traverseExpList(expl, inFunc, inExtArg)
-        (cases_1, ext_arg) = Patternm.traverseCases(cases, inFunc, ext_arg)
-        e = if referenceEq(expl, expl_1) && referenceEq(cases, cases_1)
-          inExp
-        else
-          DAE.MATCHEXPRESSION(matchTy, expl_1, aliases, localDecls, cases_1, tp)
         end
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)

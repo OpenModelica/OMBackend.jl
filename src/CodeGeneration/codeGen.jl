@@ -178,7 +178,7 @@ end
 function createSaveFunction(modelName)::Expr
   ADD_CALLBACK()
   local callbacks = COUNT_CALLBACKS()
-  local cbSym = Symbol("cb$(callbacks)")r
+  local cbSym = Symbol("cb$(callbacks)")
   return quote
     savingFunction(u, t, integrator) = let
       (t, deepcopy(integrator.p))
@@ -231,7 +231,7 @@ function createParameterEquations(parameters::Array, simCode::SimulationCode.Sim
     local simVarType::SimulationCode.SimVarType = simVar.varKind
     bindExp = @match simVarType begin
       SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
-      _ => ErrorException("Unknown SimulationCode.SimVarType for parameter.")
+      _ => throw(ErrorException("Unknown SimulationCode.SimVarType for parameter."))
     end
     push!(parameterEquations,
           quote
@@ -449,7 +449,7 @@ function createWhenStatements(whenStatements::List, simCode::SimulationCode.SIM_
           throw("Unimplemented branch for: $(var.varKind)")
         end
       end
-      _ => ErrorException("$whenStatements in @__FUNCTION__ not supported")
+      _ => throw(ErrorException("$whenStatements in @__FUNCTION__ not supported"))
     end
   end
   return res

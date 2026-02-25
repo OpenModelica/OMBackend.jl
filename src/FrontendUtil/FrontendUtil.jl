@@ -38,17 +38,38 @@ end
 
 """
   Removes the smooth operator from an equation, returns the argument to smooth.
+  Handles smooth() on either LHS or RHS of EQUATION_EQUALITY.
 """
 function removeSmooth(eq::OMFrontend.Frontend.Equation)
   @match eq begin
     OMFrontend.Frontend.EQUATION_EQUALITY(lhs = e1, rhs = OMFrontend.Frontend.CALL_EXPRESSION(call)) where string(OMFrontend.Frontend.functionName(call)) == "smooth"  => begin
       local arguments = OMFrontend.Frontend.arguments(call)
-      @match x <| y <| nil = arguments
+      local exprArg = extractSmoothExpr(arguments)
       local newEq = eq
-      @assign newEq.rhs = y
+      @assign newEq.rhs = exprArg
+      newEq
+    end
+    OMFrontend.Frontend.EQUATION_EQUALITY(lhs = OMFrontend.Frontend.CALL_EXPRESSION(call), rhs = e2) where string(OMFrontend.Frontend.functionName(call)) == "smooth"  => begin
+      local arguments = OMFrontend.Frontend.arguments(call)
+      local exprArg = extractSmoothExpr(arguments)
+      local newEq = eq
+      @assign newEq.lhs = exprArg
       newEq
     end
     _ => eq
+  end
+end
+
+"""
+  Extract the expression argument from smooth(order, expr).
+  Handles both ImmutableList (cons-list) and Vector argument formats.
+"""
+function extractSmoothExpr(arguments)
+  if arguments isa AbstractVector
+    return arguments[2]
+  else
+    @match _ <| y <| _ = arguments
+    return y
   end
 end
 

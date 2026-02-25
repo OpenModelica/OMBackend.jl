@@ -173,8 +173,10 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
     local normalizedName = replace(func.name, "." => "_")
     local nArgs = length(inputs)
     local isArrayFunc = hasArrayOutput(func)
-    local needsSymbolicArrayDispatch = isArrayFunc && hasIfStatements(func)
-    local outputDims = needsSymbolicArrayDispatch ? computeArrayOutputDims(func) : ()
+    # Always enable symbolic array dispatch for array-returning functions when
+    # dimensions are known. Restricting this to functions with if-statements can
+    # leak scalar Num terms into multi-index ASUB sites (e.g. x[1,2]).
+    local outputDims = isArrayFunc ? computeArrayOutputDims(func) : ()
     inputsJL = if nArgs > 1
       tuple(inputs...)
     elseif nArgs == 1
@@ -756,7 +758,7 @@ function namespaceifyExternalFunction(expr::Expr)
   else #Otherwise a side effect call or a call that returns directly.
     @assert expr.head === :call "Invalid call passed to namespaceifyExternalFunction"
     @match Expr(:call, [funcName, y...,z]) = expr
-    Expr(:call, Expr(:(.), Symbol("OMRuntimeExternalC"), QuoteNode(funcName)))
+    Expr(:call, Expr(:(.), Symbol("OMRuntimeExternalC"), QuoteNode(funcName)), y..., z)
   end
   return res
 end

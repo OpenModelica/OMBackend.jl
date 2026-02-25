@@ -678,7 +678,6 @@ function getIndicesOfCommonVariables(syms1::Vector{Symbol} # New system
   for (i, sym) in enumerate(newSyms)
     idxDict2[sym] = i
   end
-  local commonVariables = ∩(keys(idxDict1), keys(idxDict1))
   (smallestKeyset, dict) = if length(keys(idxDict1)) < length(keys(idxDict2))
     keys(idxDict1), idxDict2
   else

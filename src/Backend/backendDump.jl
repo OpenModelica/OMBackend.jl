@@ -300,46 +300,48 @@ end
    TODO: Discuss separators. A different one should maybe be used..
 """
 function Base.string(cr::DAE.ComponentRef; separator="_", printType = false)
-  str = begin
-    local ident::String
-    local cref::DAE.ComponentRef
-    local identType::DAE.Type
+  buf = IOBuffer()
+  _writeCref(buf, cr, separator)
+  if printType
     @match cr begin
-      DAE.CREF_QUAL(ident = ident, identType = identType , subscriptLst = subscriptLst, componentRef = cref) => begin
-        local ident = if !listEmpty(subscriptLst)
-          local str = ident
-          for s in subscriptLst
-            str = str * "[" * string(s) * "]"
-          end
-          str = str
-        else
-          ident
-        end
-        ident * separator * string(cref)
+      DAE.CREF_QUAL(identType = ty) || DAE.CREF_IDENT(identType = ty) => begin
+        print(buf, '|')
+        print(buf, string(ty))
       end
-      DAE.CREF_IDENT(ident, identType, subscriptLst) => begin
-        if !listEmpty(subscriptLst)
-          local str = ident
-          for s in subscriptLst
-            str = str * "[" * string(s) * "]"
-          end
-          str = str
-        else
-          ident
-        end
-      end
-      DAE.CREF_ITER(ident = ident) => begin
-        ident
-      end
+      _ => nothing
     end
   end
-  #= Optionally adding the type =#
-  str = if printType
-    str * "|" * string(identType)
-  else
-    str
+  return String(take!(buf))
+end
+
+function _writeCref(buf::IOBuffer, cr::DAE.ComponentRef, sep::String)
+  @match cr begin
+    DAE.CREF_QUAL(ident = ident, subscriptLst = subscriptLst, componentRef = cref) => begin
+      print(buf, ident)
+      if !listEmpty(subscriptLst)
+        for s in subscriptLst
+          print(buf, '[')
+          print(buf, string(s))
+          print(buf, ']')
+        end
+      end
+      print(buf, sep)
+      _writeCref(buf, cref, sep)
+    end
+    DAE.CREF_IDENT(ident, _, subscriptLst) => begin
+      print(buf, ident)
+      if !listEmpty(subscriptLst)
+        for s in subscriptLst
+          print(buf, '[')
+          print(buf, string(s))
+          print(buf, ']')
+        end
+      end
+    end
+    DAE.CREF_ITER(ident = ident) => begin
+      print(buf, ident)
+    end
   end
-  return str
 end
 
 function Base.string(@nospecialize(op::DAE.Operator))::String
@@ -499,7 +501,7 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
 
       DAE.MATRIX(matrix = lstexpl)  => begin
         str = "[MAT]"
-        for lst in lstexp
+        for lst in lstexpl
           str = str + "{" + lstString(lst, ", ") + "}"
         end
         (str)
@@ -583,7 +585,7 @@ function Base.string(ty::DAE.Type)::String
 end
 
 function Base.string(path::Absyn.QUALIFIED; separator = "_")
-  return path.name + separator + string(path.path, separator = "_")
+  return path.name + separator + string(path.path; separator = separator)
 end
 
 function Base.string(path::Absyn.IDENT; separator = "_")
@@ -591,7 +593,7 @@ function Base.string(path::Absyn.IDENT; separator = "_")
 end
 
 function Base.string(path::Absyn.FULLYQUALIFIED; separator = "_")
-  return separator + string(path.path; seperator = separator)
+  return separator + string(path.path; separator = separator)
 end
 
 function lstString(expLst::List{T}, seperator::String)::String where{T}

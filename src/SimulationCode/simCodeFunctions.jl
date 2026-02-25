@@ -270,8 +270,9 @@ function transformExpForFlattenedRecords(exp::DAE.Exp, recordFieldMap::Dict)::DA
     end
     #= Recursively transform binary expressions =#
     DAE.BINARY(e1, op, e2) => begin
-      DAE.BINARY(transformExpForFlattenedRecords(e1, recordFieldMap), op,
-                 transformExpForFlattenedRecords(e2, recordFieldMap))
+      local new_e1 = transformExpForFlattenedRecords(e1, recordFieldMap)
+      local new_e2 = transformExpForFlattenedRecords(e2, recordFieldMap)
+      (new_e1 === e1 && new_e2 === e2) ? exp : DAE.BINARY(new_e1, op, new_e2)
     end
     #= Recursively transform arrays =#
     DAE.ARRAY(ty, scalar, arr) => begin
@@ -282,7 +283,8 @@ function transformExpForFlattenedRecords(exp::DAE.Exp, recordFieldMap::Dict)::DA
     end
     #= Recursively transform unary expressions =#
     DAE.UNARY(op, e1) => begin
-      DAE.UNARY(op, transformExpForFlattenedRecords(e1, recordFieldMap))
+      local new_e1 = transformExpForFlattenedRecords(e1, recordFieldMap)
+      new_e1 === e1 ? exp : DAE.UNARY(op, new_e1)
     end
     #= Recursively transform function calls, expanding record args into flattened fields =#
     DAE.CALL(path, expLst, attr) => begin
@@ -376,16 +378,23 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
       DAE.CALL(path, MetaModelica.list(newArgs...), attr)
     end
     DAE.BINARY(e1, op, e2) => begin
-      DAE.BINARY(expandRecordArgsInExp(e1), op, expandRecordArgsInExp(e2))
+      local new_e1 = expandRecordArgsInExp(e1)
+      local new_e2 = expandRecordArgsInExp(e2)
+      (new_e1 === e1 && new_e2 === e2) ? exp : DAE.BINARY(new_e1, op, new_e2)
     end
     DAE.UNARY(op, e1) => begin
-      DAE.UNARY(op, expandRecordArgsInExp(e1))
+      local new_e1 = expandRecordArgsInExp(e1)
+      new_e1 === e1 ? exp : DAE.UNARY(op, new_e1)
     end
     DAE.ASUB(innerExp, subscripts) => begin
-      DAE.ASUB(expandRecordArgsInExp(innerExp), subscripts)
+      local newInner = expandRecordArgsInExp(innerExp)
+      newInner === innerExp ? exp : DAE.ASUB(newInner, subscripts)
     end
     DAE.IFEXP(cond, e1, e2) => begin
-      DAE.IFEXP(expandRecordArgsInExp(cond), expandRecordArgsInExp(e1), expandRecordArgsInExp(e2))
+      local newCond = expandRecordArgsInExp(cond)
+      local new_e1 = expandRecordArgsInExp(e1)
+      local new_e2 = expandRecordArgsInExp(e2)
+      (newCond === cond && new_e1 === e1 && new_e2 === e2) ? exp : DAE.IFEXP(newCond, new_e1, new_e2)
     end
     DAE.ARRAY(ty, scalar, arr) => begin
       local newArr = map(expandRecordArgsInExp, arr)
@@ -443,5 +452,203 @@ function buildFieldArgExp(flatName::String, fieldTy::DAE.Type)::DAE.Exp
       #= Scalar field: simple CREF =#
       return DAE.CREF(DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil), fieldTy)
     end
+  end
+end
+
+# ============================================================================
+#  IFEXP resolution in parameter/variable bindings
+#
+#  Resolves constant-condition IFEXPs at the simcode level, before code gen.
+#  For non-constant conditions, the expression is left unchanged and the
+#  code-gen fallback generates ModelingToolkit.ifelse.
+# ============================================================================
+
+"""
+  Traverse all parameter and array-parameter bindings in the simcode and
+  resolve IFEXP nodes whose conditions can be evaluated at compile time.
+"""
+function resolveIfExpInBindings!(simCode)
+  local ht = simCode.stringToSimVarHT
+  for (name, (idx, simVar)) in ht
+    local newVarKind = @match simVar.varKind begin
+      SimulationCode.PARAMETER(SOME(bindExp)) => begin
+        local newBind = resolveConstantIfExp(bindExp)
+        newBind === bindExp ? nothing : SimulationCode.PARAMETER(SOME(newBind))
+      end
+      SimulationCode.ARRAY_PARAMETER(dims, SOME(bindExp)) => begin
+        local newBind = resolveConstantIfExp(bindExp)
+        newBind === bindExp ? nothing : SimulationCode.ARRAY_PARAMETER(dims, SOME(newBind))
+      end
+      _ => nothing
+    end
+    if newVarKind !== nothing
+      local newSimVar = SimulationCode.SIMVAR(simVar.name, simVar.index, newVarKind, simVar.attributes)
+      ht[name] = (idx, newSimVar)
+    end
+  end
+  return simCode
+end
+
+"""
+  Recursively resolve IFEXP nodes in a DAE expression.
+  - BCONST(true/false): select the correct branch
+  - Comparison of two constants (RCONST/ICONST): evaluate and select
+  - noEvent wrapper: strip and recurse into the inner expression
+  - Otherwise: leave unchanged (code-gen handles with ModelingToolkit.ifelse)
+"""
+function resolveConstantIfExp(exp::DAE.Exp)::DAE.Exp
+  @match exp begin
+    DAE.IFEXP(DAE.BCONST(true), thenExp, _) => resolveConstantIfExp(thenExp)
+    DAE.IFEXP(DAE.BCONST(false), _, elseExp) => resolveConstantIfExp(elseExp)
+    DAE.IFEXP(cond, thenExp, elseExp) => begin
+      #= Try to evaluate the condition to a boolean =#
+      local resolved = tryEvalCondition(cond)
+      if resolved === true
+        resolveConstantIfExp(thenExp)
+      elseif resolved === false
+        resolveConstantIfExp(elseExp)
+      else
+        #= Cannot resolve: recurse into sub-expressions but keep IFEXP =#
+        DAE.IFEXP(resolveConstantIfExp(cond),
+                  resolveConstantIfExp(thenExp),
+                  resolveConstantIfExp(elseExp))
+      end
+    end
+    #= Recurse into common expression wrappers =#
+    DAE.BINARY(e1, op, e2) => begin
+      local ne1 = resolveConstantIfExp(e1)
+      local ne2 = resolveConstantIfExp(e2)
+      (ne1 === e1 && ne2 === e2) ? exp : DAE.BINARY(ne1, op, ne2)
+    end
+    DAE.UNARY(op, e1) => begin
+      local ne1 = resolveConstantIfExp(e1)
+      ne1 === e1 ? exp : DAE.UNARY(op, ne1)
+    end
+    DAE.CALL(path, expLst, attr) => begin
+      local changed = false
+      local newArgs = DAE.Exp[]
+      for arg in expLst
+        local newArg = resolveConstantIfExp(arg)
+        if newArg !== arg
+          changed = true
+        end
+        push!(newArgs, newArg)
+      end
+      changed ? DAE.CALL(path, MetaModelica.list(newArgs...), attr) : exp
+    end
+    DAE.ARRAY(ty, scalar, arr) => begin
+      local changed = false
+      local newArr = DAE.Exp[]
+      for elem in arr
+        local newElem = resolveConstantIfExp(elem)
+        if newElem !== elem
+          changed = true
+        end
+        push!(newArr, newElem)
+      end
+      changed ? DAE.ARRAY(ty, scalar, MetaModelica.list(newArr...)) : exp
+    end
+    _ => exp
+  end
+end
+
+"""
+  Try to evaluate a DAE condition expression to a Bool.
+  Returns `true`, `false`, or `nothing` if evaluation is not possible.
+"""
+function tryEvalCondition(cond::DAE.Exp)::Union{Bool, Nothing}
+  @match cond begin
+    DAE.BCONST(val) => val
+    #= Strip noEvent wrapper =#
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local innerArgs = collect(lst)
+      length(innerArgs) == 1 ? tryEvalCondition(innerArgs[1]) : nothing
+    end
+    #= Relational comparisons between constants =#
+    DAE.RELATION(e1, op, e2, _, _) => begin
+      local v1 = tryEvalNumeric(e1)
+      local v2 = tryEvalNumeric(e2)
+      if v1 !== nothing && v2 !== nothing
+        @match op begin
+          DAE.LESS(__) => v1 < v2
+          DAE.LESSEQ(__) => v1 <= v2
+          DAE.GREATER(__) => v1 > v2
+          DAE.GREATEREQ(__) => v1 >= v2
+          DAE.EQUAL(__) => v1 == v2
+          DAE.NEQUAL(__) => v1 != v2
+          _ => nothing
+        end
+      else
+        nothing
+      end
+    end
+    DAE.LBINARY(e1, DAE.AND(__), e2) => begin
+      local r1 = tryEvalCondition(e1)
+      local r2 = tryEvalCondition(e2)
+      (r1 !== nothing && r2 !== nothing) ? (r1 && r2) : nothing
+    end
+    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
+      local r1 = tryEvalCondition(e1)
+      local r2 = tryEvalCondition(e2)
+      (r1 !== nothing && r2 !== nothing) ? (r1 || r2) : nothing
+    end
+    DAE.LUNARY(DAE.NOT(__), e1) => begin
+      local r1 = tryEvalCondition(e1)
+      r1 !== nothing ? !r1 : nothing
+    end
+    _ => nothing
+  end
+end
+
+"""
+  Try to evaluate a DAE expression to a numeric value.
+  Returns Float64, or nothing if evaluation is not possible.
+"""
+function tryEvalNumeric(exp::DAE.Exp)::Union{Float64, Nothing}
+  @match exp begin
+    DAE.RCONST(val) => Float64(val)
+    DAE.ICONST(val) => Float64(val)
+    DAE.UNARY(DAE.UMINUS(__), inner) => begin
+      local v = tryEvalNumeric(inner)
+      v !== nothing ? -v : nothing
+    end
+    DAE.UNARY(DAE.UMINUS_ARR(__), inner) => begin
+      local v = tryEvalNumeric(inner)
+      v !== nothing ? -v : nothing
+    end
+    DAE.CALL(Absyn.IDENT("abs"), lst, _) => begin
+      local innerArgs = collect(lst)
+      if length(innerArgs) == 1
+        local v = tryEvalNumeric(innerArgs[1])
+        v !== nothing ? abs(v) : nothing
+      else
+        nothing
+      end
+    end
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local innerArgs = collect(lst)
+      length(innerArgs) == 1 ? tryEvalNumeric(innerArgs[1]) : nothing
+    end
+    DAE.BINARY(e1, DAE.ADD(__), e2) => begin
+      local v1 = tryEvalNumeric(e1)
+      local v2 = tryEvalNumeric(e2)
+      (v1 !== nothing && v2 !== nothing) ? v1 + v2 : nothing
+    end
+    DAE.BINARY(e1, DAE.SUB(__), e2) => begin
+      local v1 = tryEvalNumeric(e1)
+      local v2 = tryEvalNumeric(e2)
+      (v1 !== nothing && v2 !== nothing) ? v1 - v2 : nothing
+    end
+    DAE.BINARY(e1, DAE.MUL(__), e2) => begin
+      local v1 = tryEvalNumeric(e1)
+      local v2 = tryEvalNumeric(e2)
+      (v1 !== nothing && v2 !== nothing) ? v1 * v2 : nothing
+    end
+    DAE.BINARY(e1, DAE.DIV(__), e2) => begin
+      local v1 = tryEvalNumeric(e1)
+      local v2 = tryEvalNumeric(e2)
+      (v1 !== nothing && v2 !== nothing && v2 != 0.0) ? v1 / v2 : nothing
+    end
+    _ => nothing
   end
 end

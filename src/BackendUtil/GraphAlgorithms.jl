@@ -30,8 +30,8 @@ using DataStructures
 function matching(dict::DataStructures.OrderedDict, n::Int)
   #= Global arrays for bookkeeping =#
   local assign = [0 for i in 1:n]
-  local vMark = Bool[false for i in 1:n]
-  local eMark = Bool[false for i in 1:n]
+  local vMark = fill(false, n)
+  local eMark = fill(false, n)
   """
     Calculates the path for equation i.
     returns true if a path is found.
@@ -66,8 +66,8 @@ function matching(dict::DataStructures.OrderedDict, n::Int)
   local isSingular = false
   local success::Bool
   for i in 1:n
-    vMark = Bool[false for j in 1:n]
-    eMark = Bool[false for j in 1:n]
+    fill!(vMark, false)
+    fill!(eMark, false)
     try
       success = pathFound(i)
     catch e
@@ -112,12 +112,20 @@ function merge(matchOrder::Vector, graph::OrderedDict)::MetaGraphs.MetaDiGraph
     Graphs.add_vertex!(g)
     MetaGraphs.set_prop!(g, eq, :eID, eq)
   end
+  #= Build inverse mapping: equation -> variable indices assigned to it =#
+  local invMatch = Dict{Int, Vector{Int}}()
+  for (varIdx, eqIdx) in enumerate(matchOrder)
+    if eqIdx > 0
+      if !haskey(invMatch, eqIdx)
+        invMatch[eqIdx] = Int[]
+      end
+      push!(invMatch[eqIdx], varIdx)
+    end
+  end
   for eq in 1:nMatchOrder
-    varIdx = findall(x->x==eq, matchOrder)
+    varIdx = get(invMatch, eq, Int[])
     if length(varIdx) == 0
-      #=Was zero for eq=#
-      varIdx = findall(x->x==eq, matchOrder)
-      continue;
+      continue
     end
     local depVariables = remove!(depends[eq], first(varIdx))
     #= Solve for the remaining variables =#

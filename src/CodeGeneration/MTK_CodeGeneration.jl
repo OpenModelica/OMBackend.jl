@@ -633,7 +633,7 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; sk
   local startExprs::Vector{Expr} = Expr[]
   local residuals = simCode.residualEquations
   local ht::Dict = simCode.stringToSimVarHT
-  local warnings::String = ""
+  local missingStartWarnings = Set{String}()
   if length(vars) == 0
     return Expr[]
   end
@@ -677,7 +677,7 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; sk
           (NONE(), NONE()) || (_, _) => begin
             #= No start value specified, default to 0.0 =#
             if !skipDefaultStarts
-              warnings *= "\n Assumed starting value of 0.0 for variable: " * varName * "\n"
+              push!(missingStartWarnings, varName)
               push!(startExprs, :($(Symbol(varName)) => 0.0))
             end
             continue
@@ -697,8 +697,16 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; sk
       end
     end
   end
-  if !isempty(warnings)
-    @warn warnings
+  if OMBackend.WARN_MISSING_START_VALUES[] && !isempty(missingStartWarnings)
+    local warningList = sort!(collect(missingStartWarnings))
+    local maxShown = 20
+    local shown = warningList[1:min(end, maxShown)]
+    local omitted = length(warningList) - length(shown)
+    local summary = "Assumed starting value of 0.0 for $(length(warningList)) variable(s): " * join(shown, ", ")
+    if omitted > 0
+      summary *= ", ... (+$(omitted) more)"
+    end
+    @warn summary
   end
   return startExprs
 end

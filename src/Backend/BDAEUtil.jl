@@ -197,16 +197,45 @@ function traverseEquationExpressions(eq::BDAE.Equation,
          (eq, extArg)
        end
        BDAE.IF_EQUATION(__) => begin
+         local newConds = DAE.Exp[]
+         local condChanged = false
          for exp in eq.conditions
            (resExp, extArg) = Util.traverseExpTopDown(exp, traversalOperation, extArg)
-         end
-         for eqLst in eq.eqnstrue
-           for equation in eqLst
-             traverseEquationExpressions(equation, traversalOperation, extArg)
+           push!(newConds, resExp)
+           if !referenceEq(exp, resExp)
+             condChanged = true
            end
          end
+         if condChanged
+           @assign eq.conditions = list(newConds...)
+         end
+         local newTrueBranches = List{BDAE.Equation}[]
+         local trueChanged = false
+         for eqLst in eq.eqnstrue
+           local newEqs = BDAE.Equation[]
+           for equation in eqLst
+             (newEq, extArg) = traverseEquationExpressions(equation, traversalOperation, extArg)
+             push!(newEqs, newEq)
+             if !referenceEq(equation, newEq)
+               trueChanged = true
+             end
+           end
+           push!(newTrueBranches, list(newEqs...))
+         end
+         if trueChanged
+           @assign eq.eqnstrue = list(newTrueBranches...)
+         end
+         local newFalseEqs = BDAE.Equation[]
+         local falseChanged = false
          for equation in eq.eqnsfalse
-           traverseEquationExpressions(equation, traversalOperation, extArg)
+           (newEq, extArg) = traverseEquationExpressions(equation, traversalOperation, extArg)
+           push!(newFalseEqs, newEq)
+           if !referenceEq(equation, newEq)
+             falseChanged = true
+           end
+         end
+         if falseChanged
+           @assign eq.eqnsfalse = list(newFalseEqs...)
          end
          (eq, extArg)
        end
@@ -253,6 +282,8 @@ function traverseWhenEquation!(whenEq, traversalOperation, extArg)
       end
       BDAE.NORETCALL(__) => begin
         (exp, extArg) = Util.traverseExpTopDown(stmt.exp, traversalOperation, extArg)
+        newStmt = exp === stmt.exp ? stmt : BDAE.NORETCALL(exp, stmt.source)
+        newWhenStmtLst = newStmt <| newWhenStmtLst
       end
       _ => begin
         throw(string(stmt) * " is not implemented yet!")
@@ -452,16 +483,9 @@ end
   output All variable in that specific equation except the state variables
 """
 function getAllVariablesExceptStates(eq::BDAE.IF_EQUATION, vars::Vector{BDAE.VAR})::Vector{DAE.ComponentRef}
-  local componentReferences::List = Util.getAllCrefs(eq.exp)
-  local componentReferencesArr::Array = [componentReferences...]
-  local varNames = [v.varName for v in vars]
-  variablesInEq::Vector = []
-  for vn in varNames
-    if vn in componentReferencesArr
-      push!(variablesInEq, vn)
-    end
-  end
-  return variablesInEq
+  local allVarNames = getAllVariables(eq, vars)
+  local stateNames = Set(string(v.varName) for v in vars if isState(v))
+  return filter(v -> !(v in stateNames), allVarNames)
 end
 
 function isArray(cref::DAE.ComponentRef)::Bool
@@ -543,7 +567,7 @@ function DAE_DimensionToIntVector(dims::Cons{<:DAE.Dimension})::Vector{Int}
 end
 
 function getDimensionFromComplexType(callTy::DAE.T_COMPLEX)
-  length(callTy.varLst)
+  Int[length(callTy.varLst)]
 end
 
 """

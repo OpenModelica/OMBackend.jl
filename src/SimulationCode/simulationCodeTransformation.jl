@@ -146,9 +146,8 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   #=  Fech the main equation system along with all subsystems =#
   @match [equationSystem, auxEquationSystems...] = equationSystems
   #= Fetch the different components of the model.=#
-  local allOrderedVars::Vector{BDAE.VAR} = BDAE.VAR[v  for v in equationSystem.orderedVars]
   local allSharedVars::Vector{BDAE.VAR} = getSharedVariablesLocalsAndGlobals(shared)
-  local allBackendVars = vcat(allOrderedVars, allSharedVars)
+  local allBackendVars = vcat(equationSystem.orderedVars, allSharedVars)
   local simVars::Vector{SimulationCode.SIMVAR} = createAndCollectSimulationCodeVariables(allBackendVars, shared.flatModel)
   local occVars = map((v)-> v.name, filter((v) -> isOCCVar(v), simVars))
   #=
@@ -506,19 +505,23 @@ end
 function allocateAndCollectSimulationEquations(equations::T,
                                                equationSystemName::String,
                                                shouldAddDummyEquation::Bool)::Tuple where {T}
-  local isIf(eq) = typeof(eq) === BDAE.IF_EQUATION
-  local isWhen(eq) = typeof(eq) === BDAE.WHEN_EQUATION
-  local isRe(eq) = typeof(eq) === BDAE.RESIDUAL_EQUATION
-  local isStructuralTransition(eq) = typeof(eq) === BDAE.STRUCTURAL_TRANSISTION
-  local isStructuralWhenEquation(eq) = typeof(eq) === BDAE.STRUCTURAL_WHEN_EQUATION
-  local isStructuralWhenOrTransition(eq) = begin
-    (isStructuralWhenEquation(eq) || isStructuralTransition(eq))
+  #= Split equations into categories in a single pass =#
+  regularEquations = BDAE.RESIDUAL_EQUATION[]
+  whenEquations = BDAE.WHEN_EQUATION[]
+  ifEquations = BDAE.IF_EQUATION[]
+  structuralTransitions = BDAE.Equation[]
+  for eq in equations
+    eqType = typeof(eq)
+    if eqType === BDAE.RESIDUAL_EQUATION
+      push!(regularEquations, eq)
+    elseif eqType === BDAE.WHEN_EQUATION
+      push!(whenEquations, eq)
+    elseif eqType === BDAE.IF_EQUATION
+      push!(ifEquations, eq)
+    elseif eqType === BDAE.STRUCTURAL_TRANSISTION || eqType === BDAE.STRUCTURAL_WHEN_EQUATION
+      push!(structuralTransitions, eq)
+    end
   end
-  #= Split the representation =#
-  regularEquations = filter(isRe, equations)
-  whenEquations = filter(isWhen, equations)
-  ifEquations = filter(isIf, equations)
-  structuralTransitions = filter(isStructuralWhenOrTransition, equations)
   if shouldAddDummyEquation
     push!(regularEquations, makeDummyResidualEquation(equationSystemName))
   end
