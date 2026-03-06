@@ -74,8 +74,8 @@ function lower(lst::DAE.DAE_LIST)::BDAE.BACKEND_DAE
   # @debug "varArray:" length(variableLst)
   #@debug "eqLst:" length(equationLst)
   #= We start with an array of one system =#
-  eqSystems = BDAE.EQSYSTEM[BDAE.EQSYSTEM(name, variables, eqArray, [], [])]
-  outBDAE = BDAE.BACKEND_DAE(name, eqSystems, BDAE.SHARED([], [], NONE(), NONE(), []))
+  eqSystems = BDAE.EQSYSTEM[BDAE.EQSYSTEM(name, variables, eqArray, BDAE.Equation[], BDAE.Equation[])]
+  outBDAE = BDAE.BACKEND_DAE(name, eqSystems, BDAE.SHARED(BDAE.VAR[], BDAE.VAR[], NONE(), NONE(), BDAE.Equation[]))
 end
 
 """
@@ -89,17 +89,17 @@ function lower(flatModelica::OMFrontend.Frontend.FlatModel)
   local eqSystems = createEqSystems(flatModelica)
   local shared
   if ! listEmpty(flatModelica.DOCC_equations)
-    shared = BDAE.SHARED([],
-                         [],
+    shared = BDAE.SHARED(BDAE.VAR[],
+                         BDAE.VAR[],
                          flatModelica.scodeProgram,
                          SOME(flatModelica),
                          createStructuralIfEquations(flatModelica.DOCC_equations))
   else
-    shared = BDAE.SHARED([],
-                         [],
+    shared = BDAE.SHARED(BDAE.VAR[],
+                         BDAE.VAR[],
                          flatModelica.scodeProgram,
                          NONE(),
-                         [])
+                         BDAE.Equation[])
   end
     #= The resulting backend DAE. =#
   return createBackendDAE(flatModelica.name, eqSystems, shared)
@@ -171,7 +171,7 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   local bindingEquations = createBindingEquations(variables)
   equations = vcat(equations, bindingEquations)
   #= TODO Extract the simple equations =#
-  local simpleEquations = []
+  local simpleEquations = BDAE.Equation[]
   return BDAE.EQSYSTEM(name, variables, equations, simpleEquations, initialEquations)
 end
 
@@ -199,20 +199,54 @@ function deduplicateVariables(variables::Vector)::Vector
 end
 
 """
-  Deduplicate equations by comparing their string representation.
+  Generic structural hash for @Record structs and DAE IR nodes.
+  Recursively hashes all fields without allocating intermediate strings.
+"""
+structuralHash(x::Number, h::UInt) = hash(x, h)
+structuralHash(x::Symbol, h::UInt) = hash(x, h)
+structuralHash(x::String, h::UInt) = hash(x, h)
+structuralHash(x::Bool, h::UInt) = hash(x, h)
+structuralHash(::Nothing, h::UInt) = hash(nothing, h)
+structuralHash(x::Cons, h::UInt) = begin
+  for el in x
+    h = structuralHash(el, h)
+  end
+  h
+end
+structuralHash(::Nil, h::UInt) = hash(:nil, h)
+structuralHash(x::SOME, h::UInt) = structuralHash(x.data, hash(:SOME, h))
+structuralHash(x::Vector, h::UInt) = begin
+  h = hash(length(x), h)
+  for el in x
+    h = structuralHash(el, h)
+  end
+  h
+end
+function structuralHash(@nospecialize(x), h::UInt)
+  T = typeof(x)
+  h = hash(T, h)
+  for i in 1:fieldcount(T)
+    h = structuralHash(getfield(x, i), h)
+  end
+  h
+end
+structuralHash(@nospecialize(x)) = structuralHash(x, zero(UInt))
+
+"""
+  Deduplicate equations using structural hashing.
   Keeps the first occurrence of each unique equation.
 """
 function deduplicateEquations(equations::Vector)::Vector
-  local seen = Set{String}()
+  local seen = Set{UInt}()
   local unique_eqs = similar(equations, 0)
   local duplicateCount = 0
   for eq in equations
-    local eqStr = string(eq)
-    if eqStr in seen
+    local h = structuralHash(eq)
+    if h in seen
       duplicateCount += 1
       continue
     end
-    push!(seen, eqStr)
+    push!(seen, h)
     push!(unique_eqs, eq)
   end
   if duplicateCount > 0

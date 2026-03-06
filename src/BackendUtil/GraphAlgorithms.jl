@@ -188,7 +188,7 @@ end
   Author: John Tinnerholm
   Tarjans algorithm
 """
-function tarjan(g::OrderedDict)::Vector
+function tarjan(g::OrderedDict)::Vector{Vector{Int}}
   tarjan(g, length(g.keys))
 end
 
@@ -199,11 +199,11 @@ end
  input n::Int, the number of vertices
  output sccs: The set of strongly connected components
 """
-function tarjan(g::OrderedDict, n)::Vector
+function tarjan(g::OrderedDict, n)::Vector{Vector{Int}}
   function strongConnect(v::Int)
-    vIndicies[v] = index
-    vLowLinks[v] = index
-    index += 1
+    vIndicies[v] = indexRef[]
+    vLowLinks[v] = indexRef[]
+    indexRef[] += 1
     push!(stack, v)
     vOnStack[v] = true
     v2S = g[v]
@@ -216,28 +216,25 @@ function tarjan(g::OrderedDict, n)::Vector
       end
     end
     if vLowLinks[v] == vIndicies[v]
-      stronglyConnectedComponentCandidate = []
+      scc = Int[]
       while true
         w = pop!(stack)
         vOnStack[w] = false
-        push!(stronglyConnectedComponentCandidate, w)
+        push!(scc, w)
         if w == v
           break
         end
       end
-      push!(sccs, stronglyConnectedComponentCandidate)
+      push!(sccs, scc)
     end
   end
-  local index = 1
-  local sccs = []
-  local stack = []
-  #=
-    Incidices for the vertices 1->n
-    0 = undefined
-  =#
-  local vIndicies = [0 for i in 1:n]
-  local vLowLinks = [0 for i in 1:n]
-  local vOnStack = [false for i in 1:n]
+  local indexRef = Ref{Int}(1)
+  local sccs = Vector{Int}[]
+  local stack = Int[]
+  #= Indices for the vertices 1->n. 0 = undefined. =#
+  local vIndicies = zeros(Int, n)
+  local vLowLinks = zeros(Int, n)
+  local vOnStack = fill(false, n)
   for v in g.keys
     #= If v is undefined =#
     if vIndicies[v] == 0

@@ -182,28 +182,23 @@ function createNewU0(symsOfOldProblem::Vector{Symbol},
   local variableNamesWithoutPrefixesNP = String[replace(k, r".*_" => "")
                                                 for k in variableNamesNewProblem]
   #@info "variableNamesWithoutPrefixesOP" variableNamesWithoutPrefixesOP
+  #= Build name-to-index lookup dicts for O(1) access instead of O(n) findall =#
+  local oldNameToIdx = Dict{String,Int}(name => i for (i, name) in enumerate(variableNamesWithoutPrefixesOP))
+  @assert(length(oldNameToIdx) == length(variableNamesWithoutPrefixesOP),
+          "Duplicate variable name in old problem: $(length(variableNamesWithoutPrefixesOP)) names but $(length(oldNameToIdx)) unique")
+  local newNameToIdx = Dict{String,Int}(name => i for (i, name) in enumerate(variableNamesWithoutPrefixesNP))
+  @assert(length(newNameToIdx) == length(variableNamesWithoutPrefixesNP),
+          "Duplicate variable name in new problem: $(length(variableNamesWithoutPrefixesNP)) names but $(length(newNameToIdx)) unique")
   local largestProblem = if length(variableNamesOldProblem) > length(variableNamesNewProblem)
     variableNamesWithoutPrefixesOP
   else
     variableNamesWithoutPrefixesNP
   end
   for v in largestProblem
-    local varNameWithoutPrefix = v
-    #@info "Checking variable" varNameWithoutPrefix
-    if (varNameWithoutPrefix in variableNamesWithoutPrefixesOP) && (varNameWithoutPrefix in variableNamesWithoutPrefixesNP)
-      local oldIndices = findall((x)-> x == varNameWithoutPrefix, variableNamesWithoutPrefixesOP)
-      #@info "oldIndices" oldIndices
-      @assert(length(oldIndices) == 1,
-              "Zero or more than one variable with that name. Size of oldIndicies was $(length(oldIndices)). Name was $(v)")
-      idxOldVar = first(oldIndices)
-      #= Locate the index of a variable with that name in the set of new variables=#
-      local indices = findall((x)-> x == varNameWithoutPrefix, variableNamesWithoutPrefixesNP)
-      #@info "indices" indices
-      #= I assume here that there are no duplicate variables =#
-      @assert(length(indices) == 1,
-              "Zero or more than one variable with that name. Size of indices was $(length(indices)). Name was $(v)")
-      local idxNewVar = first(indices)
-      newU0[idxNewVar] = uVec[idxOldVar]
+    local idxOld = get(oldNameToIdx, v, 0)
+    local idxNew = get(newNameToIdx, v, 0)
+    if idxOld != 0 && idxNew != 0
+      newU0[idxNew] = uVec[idxOld]
     end
   end
   return newU0
@@ -336,11 +331,13 @@ Iterative DFS:
 function findPath(g::Dict{String, Vector{String}}, inV)
   local v = OMFrontend.Frontend.toString(inV)
   local S = String[]
-  local discovered = String[] #= Should ideally be int instead... =#
+  local discovered = String[]
+  local seen = Set{String}()
   push!(S, v)
   while !isempty(S)
     local v = pop!(S)
-    if !(v in discovered)
+    if !(v in seen)
+      push!(seen, v)
       push!(discovered, v)
       neighbours = g[v]
       for n in neighbours

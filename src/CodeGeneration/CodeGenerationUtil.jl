@@ -800,10 +800,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             arrayExpr
           else
             #= Variable not in hash table, using direct reference =#
-            quote
-              $(LineNumberNode(@__LINE__, "$varName, missing from hash table"))
-              $(Symbol(string(varPrefix, varName, varSuffix)))
-            end
+            Symbol(string(varPrefix, varName, varSuffix))
           end
         else
           indexAndVar = hashTable[varName]
@@ -958,7 +955,6 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       end
       #= Handle array subscripting: expr[subscripts] =#
       DAE.ASUB(innerExp, subscripts) => begin
-        local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
         #= Convert subscripts to Julia indices =#
         local subExprs = map(subscripts) do sub
           @match sub begin
@@ -967,22 +963,54 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             _ => expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
           end
         end
-        #= For function calls returning arrays, wrap with ensureMatrix for proper 2D indexing =#
-        local needsEnsureMatrix = length(subExprs) > 1 && @match innerExp begin
-          DAE.CALL(__) => true
-          _ => false
-        end
-        if length(subExprs) == 1
-          quote
-            $(innerCode)[$(first(subExprs))]
+        local allConstSubs = all(s -> s isa Integer, subExprs)
+        #= When the inner expression is a bare CREF (no subscripts on the CREF itself)
+           and all ASUB subscripts are constant, try scalarized variable lookup.
+           This handles record field array equations like frame_b.R.T[1,1] = frame_a.R.T[1,1]
+           where the frontend flattened to ASUB(CREF("R_T"), [1,1]) instead of CREF("R_T", subs=[1,1]). =#
+        if allConstSubs
+          local scalarizedResult = @match innerExp begin
+            DAE.CREF(DAE.CREF_IDENT(ident, _, sLst), _) where {isempty(sLst)} => begin
+              local lookUpStr = string(ident) * join(("[" * string(s) * "]" for s in subExprs))
+              local entry = get(hashTable, lookUpStr, nothing)
+              if entry !== nothing
+                quote $(Symbol(string(varPrefix, entry[2].name, varSuffix))) end
+              else
+                nothing
+              end
+            end
+            _ => nothing
           end
-        elseif needsEnsureMatrix
-          quote
-            OMBackend.CodeGeneration.ensureMatrix($(innerCode))[$(subExprs...)]
+          if scalarizedResult !== nothing
+            scalarizedResult
+          else
+            #= Fall through to standard ASUB handling =#
+            local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+            if length(subExprs) == 1
+              quote $(innerCode)[$(first(subExprs))] end
+            else
+              quote $(innerCode)[$(subExprs...)] end
+            end
           end
         else
-          quote
-            $(innerCode)[$(subExprs...)]
+          local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+          #= For function calls returning arrays, wrap with ensureMatrix for proper 2D indexing =#
+          local needsEnsureMatrix = length(subExprs) > 1 && @match innerExp begin
+            DAE.CALL(__) => true
+            _ => false
+          end
+          if length(subExprs) == 1
+            quote
+              $(innerCode)[$(first(subExprs))]
+            end
+          elseif needsEnsureMatrix
+            quote
+              OMBackend.CodeGeneration.ensureMatrix($(innerCode))[$(subExprs...)]
+            end
+          else
+            quote
+              $(innerCode)[$(subExprs...)]
+            end
           end
         end
       end

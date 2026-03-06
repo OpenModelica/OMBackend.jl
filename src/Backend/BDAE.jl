@@ -122,16 +122,43 @@ const LinearIntegerJacobian = Tuple
 const InnerEquations = List
 const Constraints = List
 
+#= Component Reference Index =#
+struct CREFINDEX
+  cref::DAE.ComponentRef
+  index::Int
+end
+
+mutable struct VAR <: Var
+  varName::DAE.ComponentRef #= variable name =#
+  varKind::VarKind #= kind of variable =#
+  varDirection::DAE.VarDirection #= input, output or bidirectional =#
+  varType::DAE.Type #= built-in type or enumeration =#
+  bindExp::Option #= Binding expression e.g. for parameters =#
+  arryDim::List #= array dimensions of non-expanded var =#
+  source::DAE.ElementSource #= origin of variable =#
+  values::Option #= values on built-in attributes =#
+  tearingSelectOption::Option #= value for TearingSelect =#
+  connectorType::DAE.ConnectorType #= flow, stream, unspecified or not connector. =#
+  unreplaceable::Bool #= indicates if it is allowed to replace this variable =#
+end
+
+#=Simplify construction of var=#
+VAR(varName,varKind,varType) =
+  let
+    VAR(varName, varKind, DAE.BIDIR(), varType, NONE(), nil, DAE.emptyElementSource,
+        NONE(), NONE(), DAE.NON_CONNECTOR(), true #= Unreplaceable =#)
+  end
+
 """
 An independent system of equations (and their corresponding variables)
 Structural submodels gets converted into these.
 """
 mutable struct EQSYSTEM
   name::String
-  orderedVars #= ordered Variables, only states and alg. vars =#::Vector
-  orderedEqs #= ordered Equations =#::Vector
-  simpleEquations::Vector #= List of simple equations=#
-  initialEqs::Vector
+  orderedVars #= ordered Variables, only states and alg. vars =#::Vector{VAR}
+  orderedEqs #= ordered Equations =#::Vector{Equation}
+  simpleEquations::Vector{Equation} #= List of simple equations=#
+  initialEqs::Vector{Equation}
 end
 
 """
@@ -141,13 +168,13 @@ end
   connector option.
 """
 struct SHARED
-  globalKnownVars::Vector
-  localKnownVars::Vector
+  globalKnownVars::Vector{VAR}
+  localKnownVars::Vector{VAR}
   metaModel::Option
   #= The flat model of the system itself =#
   flatModel::Option
   #= Dynamic if equations =#
-  DOCC_equations::Vector{BDAE.Equation}
+  DOCC_equations::Vector{Equation}
 end
 
 """ THE LOWERED DAE consist of variables and equations. The variables are split into
@@ -213,35 +240,6 @@ end
     =#
   end
 end
-
-#= Component Reference Index =#
-struct CREFINDEX
-  cref::DAE.ComponentRef
-  index::Integer
-end
-
-mutable struct VAR <: Var
-  varName #= variable name =#
-  varKind #= kind of variable =#::VarKind
-  varDirection #= input, output or bidirectional =#
-  varType #= built-in type or enumeration =#
-  bindExp #= Binding expression e.g. for parameters =#
-  arryDim #= array dimensions of non-expanded var =#::List
-  source #= origin of variable =#
-  values #= values on built-in attributes =#
-  tearingSelectOption #= value for TearingSelect =#
-  #    hideResult #= expression from the hideResult annotation =#::DAE.Exp
-  connectorType #= flow, stream, unspecified or not connector. =##::DAE.ConnectorType
-  unreplaceable #= indicates if it is allowed to replace this variable =#::Bool
-end
-
-
-#=Simplify construction of var=#
-VAR(varName,varKind,varType) =
-  let
-    VAR(varName, varKind, DAE.BIDIR(), varType, NONE(), nil, DAE.emptyElementSource,
-        NONE(), NONE(), DAE.NON_CONNECTOR(), true #= Unreplaceable =#)
-  end
 
 #= variable kind =#
 @Uniontype VarKind begin

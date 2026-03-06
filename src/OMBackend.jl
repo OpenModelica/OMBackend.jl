@@ -31,6 +31,7 @@
 
 module OMBackend
 import DAE
+using MetaModelica: @assign
 const CURRENT_DIRECTORY = @__DIR__
 include("$CURRENT_DIRECTORY/util.jl")
 include("$CURRENT_DIRECTORY/globalConstants.jl")

@@ -41,6 +41,7 @@ using MetaModelica: Cons
 using Setfield
 using DocStringExtensions
 using ModelingToolkit
+using LinearAlgebra
 
 using ..FrontendUtil
 using ..Backend #Should maybe not be using here... since it can make certain overloads a bit tricky to follow.

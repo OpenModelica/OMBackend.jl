@@ -158,17 +158,8 @@ end
 """
 function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions)
   local MODEL_NAME = replace(modelName, "." => "__")
-  #=
-   Evaluate all functions s.t the symbols are available
-   This needs to be done for the SymbolicUtils.jl inorder for it to recognise certain symbols.
-
-   The generated function expressions create wrapper functions (via createModelicaFunctionWrapper)
-   and store implementations in MODELICA_FUNCTION_IMPLS dictionary. The wrappers are defined
-   at module load time, avoiding world-age issues when called from MTK's RuntimeGeneratedFunctions.
-  =#
-  for f in functions
-    eval(f)
-  end
+  #= Functions are eval'd inside ODE_MODE_MTK_MODEL_GENERATION (called below)
+     immediately before @register_symbolic, so no need to eval them here. =#
   local dataStructureVariables = String[]
   for varName in (keys(simCode.stringToSimVarHT))
     (idx, var) = simCode.stringToSimVarHT[varName]
@@ -251,6 +242,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local occDummyVariables::Vector = String[]
   local dataStructureVariables::Vector = String[]
   local performIndexReduction = false
+  local statePriorityPairs = Tuple{Symbol, Float64}[]
   for varName in keys(stringToSimVarHT)
     (idx, var) = stringToSimVarHT[varName]
     local varType = var.varKind
@@ -310,6 +302,28 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       end
       #=TODO:johti17 Do I need to modify this?=#
       SimulationCode.STATE_DERIVATIVE(__) => push!(stateDerivatives, varName)
+    end
+    #= Extract StateSelect annotation and map to MTK state_priority =#
+    local optAttrs::Option{DAE.VariableAttributes} = var.attributes
+    local _sp = @match optAttrs begin
+      SOME(attrs && DAE.VAR_ATTR_REAL(__)) => begin
+        @match attrs.stateSelectOption begin
+          SOME(DAE.NEVER(__)) => -10.0
+          SOME(DAE.AVOID(__)) => -2.0
+          SOME(DAE.PREFER(__)) => 2.0
+          SOME(DAE.ALWAYS(__)) => 10.0
+          _ => nothing
+        end
+      end
+      _ => nothing
+    end
+    if _sp !== nothing
+      #= Skip derivative variables (der(...)) since they are not standalone MTK symbols.
+         The state priority applies to the base variable which already has its own entry. =#
+      local varNameStr = string(varName)
+      if !startswith(varNameStr, "der(")
+        push!(statePriorityPairs, (Symbol(varName), _sp))
+      end
     end
   end
   local performIndexReduction = simCode.isSingular
@@ -434,13 +448,20 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       for (sym, var) in vars
         eval(:($sym = $var))
       end
-      #= Mark irreductable variables irreductable. Uncomment for reinitialization =#
+      #= Mark irreductable variables irreductable =#
       local irreductableSyms = $(irreductableSyms)
       for sym in irreductableSyms
         eval(:($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableIrreducible, true)))
       end
+      #= Apply state_priority metadata from Modelica StateSelect annotations.
+         Must use eval to update the module-level bindings so that equations
+         (which reference those bindings) carry the metadata into ODESystem. =#
+      local _statePriorityPairs = $(statePriorityPairs)
+      for (sym, priority) in _statePriorityPairs
+        eval(:($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableStatePriority, $priority)))
+      end
       #= Transform the variable vector into a vector of Nums =#
-      vars = map(x ->(last(x)), vars)
+      vars = map(x -> last(x), vars)
       #= Initial values for the continious system. =#
       pars = Dict($(PARAMETER_EQUATIONS...))
       startEquationComponents = []
@@ -464,6 +485,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
         push!(equationComponents, Base.invokelatest(constructor))
       end
       eqs = collect(Iterators.flatten(equationComponents))
+      eqs = Base.invokelatest(OMBackend.CodeGeneration.filterConstantEquations, eqs)
       $(IF_EQUATION_EVENT_DECLARATION)
       nonLinearSystem = $(odeSystemWithEvents(!(isempty(ifConditionalStartEquations)), modelName))
       firstOrderSystem = nonLinearSystem
@@ -492,16 +514,13 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
        A[i] = <true_index>
       =#
       callbacks = $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
-      println("[DIAG] Before ODEProblem: eqs=", length(ModelingToolkit.equations(reducedSystem)),
-              " get_eqs=", length(ModelingToolkit.get_eqs(reducedSystem)),
-              " unknowns=", length(ModelingToolkit.unknowns(reducedSystem)),
-              " subsystems=", length(ModelingToolkit.get_systems(reducedSystem)))
+      (reducedSystem, finalInitialValues) = Base.invokelatest(
+        OMBackend.CodeGeneration.splitInitialValues, reducedSystem, finalInitialValues, initialValues)
       problem = ModelingToolkit.ODEProblem(reducedSystem,
                                            merge(Dict(finalInitialValues), pars),
                                            tspan,
-                                           #warn_initialize_determined = false,
-                                           callback=callbacks)
-      #= Check before commit. =#
+                                           callback=callbacks,
+                                           warn_initialize_determined=false)
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
     end
   end

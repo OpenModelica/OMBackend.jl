@@ -123,7 +123,6 @@ Save those variables in a HT.
 function detectParamsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
   local pars = filter((x) -> x.varKind === BDAE.PARAM(), syst.orderedVars)
   local parStrs = Set(map((x) -> string(x.varName), pars))
-  local parStrs2 = map((x) -> string(x.varName) * "|" * string(x.varType), pars)
   local buffer = IOBuffer()
   @BACKEND_LOGGING write("allpars.log", String(take!(buffer)))
 
@@ -472,11 +471,17 @@ function expandSingleRecordFieldVar(v::BDAE.VAR)::Vector{BDAE.VAR}
      1. createArrayParametersMTK to generate a concrete local assignment
      2. tryHandleSubscriptedArrayCref to resolve subscripts to concrete values
      Without this, function call arguments assembled from scalarized @parameter
-     elements would be symbolic, causing failures in functions with control flow. =#
-  local parentCr = DAE.CREF_IDENT(baseName, fieldType, MetaModelica.nil)
-  push!(result, BDAE.VAR(parentCr, v.varKind, v.varDirection, fieldType,
-                         v.bindExp, v.arryDim, v.source, v.values,
-                         v.tearingSelectOption, v.connectorType, v.unreplaceable))
+     elements would be symbolic, causing failures in functions with control flow.
+     Only create the parent for parameters/constants: regular variables are fully
+     represented by their scalarized children. Keeping the parent for variables
+     inflates the variable count and breaks equation-variable matching. =#
+  local isParam = v.varKind isa BDAE.PARAM || v.varKind isa BDAE.CONST
+  if isParam
+    local parentCr = DAE.CREF_IDENT(baseName, fieldType, MetaModelica.nil)
+    push!(result, BDAE.VAR(parentCr, v.varKind, v.varDirection, fieldType,
+                           v.bindExp, v.arryDim, v.source, v.values,
+                           v.tearingSelectOption, v.connectorType, v.unreplaceable))
+  end
   #= Generate all index combinations for N dimensions =#
   for ci in CartesianIndices(ntuple(i -> dimSizes[i], length(dimSizes)))
     local subs = list((DAE.INDEX(DAE.ICONST(ci[i])) for i in 1:length(dimSizes))...)
@@ -596,19 +601,57 @@ function expandSingleArrayEquation(size::Integer, left::DAE.Exp, right::DAE.Exp,
   leftFlat = flattenDAEArray(left)
   rightFlat = flattenDAEArray(right)
   for i in 1:size
+    local subs = list(DAE.ICONST(i))
     leftElem = if leftFlat !== nothing && i <= length(leftFlat)
       leftFlat[i]
     else
-      DAE.ASUB(left, list(DAE.ICONST(i)))
+      makeScalarElement(left, subs)
     end
     rightElem = if rightFlat !== nothing && i <= length(rightFlat)
       rightFlat[i]
     else
-      DAE.ASUB(right, list(DAE.ICONST(i)))
+      makeScalarElement(right, subs)
     end
     push!(equations, BDAE.EQUATION(leftElem, rightElem, source, attr))
   end
   return equations
+end
+
+"""
+    Given a DAE.Exp and integer subscripts, produce a scalar element expression.
+    If the expression is a CREF (possibly CREF_QUAL), flatten the entire CREF chain
+    into a CREF_IDENT with the subscripts baked in. This ensures expanded array
+    equations use scalarized variable names (var"name[i]") instead of bare symbol
+    indexing (name[i]) which would fail at runtime with MTK's scalar Num variables.
+    Falls back to ASUB wrapping for non-CREF expressions.
+"""
+function makeScalarElement(exp::DAE.Exp, subscripts::Union{Cons{DAE.ICONST}, Cons{DAE.Exp}})
+  @match exp begin
+    DAE.CREF(cr, _) => begin
+      local (flatName, crefTy, existingSubs) = crefToFlatName(cr)
+      #= Collect existing subs into array, append new ones, convert to list once =#
+      local subsArr = DAE.Subscript[s for s in existingSubs]
+      for s in subscripts
+        @match s begin
+          DAE.ICONST(i) => push!(subsArr, DAE.INDEX(DAE.ICONST(i)))
+          _ => push!(subsArr, DAE.INDEX(s))
+        end
+      end
+      local allSubs = list(subsArr...)
+      #= After subscripting, unwrap T_ARRAY to get the element type.
+         For each new subscript dimension consumed, peel one T_ARRAY layer. =#
+      local scalarTy = crefTy
+      for _ in subscripts
+        scalarTy = @match scalarTy begin
+          DAE.T_ARRAY(ty = inner) => inner
+          _ => scalarTy
+        end
+      end
+      local newCref = DAE.CREF_IDENT(flatName, scalarTy, allSubs)
+      DAE.CREF(newCref, scalarTy)
+    end
+    _ => DAE.ASUB(exp, subscripts)
+  end
 end
 
 """
@@ -624,15 +667,16 @@ function expandArrayEquationWithDims(dimSize::Vector, left::DAE.Exp, right::DAE.
   if length(dimSize) == 1
     #= 1D array: use single index =#
     for i in 1:dimSize[1]
+      local subs1 = list(DAE.ICONST(i))
       leftElem = if leftFlat !== nothing && i <= length(leftFlat)
         leftFlat[i]
       else
-        DAE.ASUB(left, list(DAE.ICONST(i)))
+        makeScalarElement(left, subs1)
       end
       rightElem = if rightFlat !== nothing && i <= length(rightFlat)
         rightFlat[i]
       else
-        DAE.ASUB(right, list(DAE.ICONST(i)))
+        makeScalarElement(right, subs1)
       end
       push!(equations, BDAE.EQUATION(leftElem, rightElem, source, attr))
     end
@@ -641,16 +685,16 @@ function expandArrayEquationWithDims(dimSize::Vector, left::DAE.Exp, right::DAE.
     flatIdx = 1
     for i in 1:dimSize[1]
       for j in 1:dimSize[2]
-        subscripts = list(DAE.ICONST(i), DAE.ICONST(j))
+        local subs2 = list(DAE.ICONST(i), DAE.ICONST(j))
         leftElem = if leftFlat !== nothing && flatIdx <= length(leftFlat)
           leftFlat[flatIdx]
         else
-          DAE.ASUB(left, subscripts)
+          makeScalarElement(left, subs2)
         end
         rightElem = if rightFlat !== nothing && flatIdx <= length(rightFlat)
           rightFlat[flatIdx]
         else
-          DAE.ASUB(right, subscripts)
+          makeScalarElement(right, subs2)
         end
         push!(equations, BDAE.EQUATION(leftElem, rightElem, source, attr))
         flatIdx += 1

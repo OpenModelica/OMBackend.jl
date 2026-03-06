@@ -382,6 +382,166 @@ wrapWithInvokelatest(x) = x  #= For non-Expr types, return as-is =#
   """
 
 """
+  Filter out equations that contain no symbolic variables (e.g. `0 ~ 0.0`, `0 ~ 255.0`).
+  These arise when a variable is reclassified as a parameter but its defining equation is kept.
+  Such equations are either tautologies or contradictions and confuse the initialization system.
+"""
+function filterConstantEquations(eqs::Vector{Symbolics.Equation})
+  filtered = filter(eqs) do eq
+    lhs_vars = Symbolics.get_variables(eq.lhs)
+    rhs_vars = Symbolics.get_variables(eq.rhs)
+    !isempty(lhs_vars) || !isempty(rhs_vars)
+  end
+  local n_removed = length(eqs) - length(filtered)
+  if n_removed > 0
+    @info "Removed $n_removed constant-only equations (no unknowns)"
+  end
+  return filtered
+end
+
+"""
+    resolveAliasInitialValue(diffState, fullEqs, ivMap)
+
+  Resolve the initial value of a differential state that has no direct Modelica
+  start value (typically an MTK-generated derivative variable like `Xˍt`).
+
+  Scans `fullEqs` for a 2-variable linear equation where one variable is
+  `diffState` and the other has a known value in `ivMap`. Uses symbolic
+  variable analysis (`Symbolics.get_variables`, `isequal`, `substitute`).
+
+  Returns the resolved value, or `nothing` if no alias equation was found.
+"""
+function resolveAliasInitialValue(diffState, fullEqs, ivMap::Dict)
+  #= Substitute all known values into each equation, then check if the equation
+     becomes a simple linear expression in diffState alone. This avoids type
+     mismatches between get_variables output and ivMap keys. =#
+  for eq in fullEqs
+    local eqStr = string(eq)
+    local diffStr = string(diffState)
+    if !contains(eqStr, diffStr)
+      continue
+    end
+    #= Skip differential equations (Differential(t)(X) ~ ...) as these are
+       dynamic equations, not algebraic alias equations. =#
+    if contains(string(eq.lhs), "Differential")
+      continue
+    end
+    local expr = eq.lhs - eq.rhs
+    #= Substitute all known initial values =#
+    local exprSub = Symbolics.substitute(expr, ivMap)
+    #= Check if what remains is linear in diffState =#
+    local c = Symbolics.substitute(exprSub, Dict(diffState => 0))
+    local a_plus_c = Symbolics.substitute(exprSub, Dict(diffState => 1))
+    if !(c isa Number) || !(a_plus_c isa Number)
+      continue
+    end
+    local a = a_plus_c - c
+    if !iszero(a)
+      return Float64(Symbolics.unwrap(-c / a))
+    end
+  end
+  return nothing
+end
+
+"""
+    splitInitialValues(reducedSystem, finalInitialValues)
+
+  Split initial values into hard constraints and soft guesses based on the mass matrix.
+  Differential states (mass matrix diagonal != 0) get hard u0 values.
+  Algebraic states (mass matrix diagonal == 0) become guesses to avoid
+  overdetermining the initialization system.
+  For pure ODE systems (identity mass matrix), all values stay hard.
+
+  Returns `(system, hardInitialValues)` where system may have updated guesses.
+"""
+function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues = Pair[])
+  local massMatrix = ModelingToolkit.calculate_massmatrix(reducedSystem)
+  local reducedUnks = unknowns(reducedSystem)
+  #= Identity mass matrix means pure ODE: all states are differential =#
+  if massMatrix isa LinearAlgebra.UniformScaling
+    @info "ODEProblem: pure ODE (identity mass matrix), $(length(finalInitialValues)) hard u0, $(length(reducedUnks)) unknowns"
+    return (reducedSystem, finalInitialValues)
+  end
+  #= DAE system: classify states by mass matrix diagonal =#
+  @BACKEND_LOGGING @info "[splitIV] finalInitialValues keys:" [string(p.first) for p in finalInitialValues]
+  @BACKEND_LOGGING @info "[splitIV] reducedUnks:" [string(u) for u in reducedUnks]
+  local diffStateSet = Set{Any}()
+  local diffStateStrSet = Set{String}()
+  for i in 1:min(size(massMatrix, 1), length(reducedUnks))
+    if massMatrix[i, i] != 0
+      push!(diffStateSet, reducedUnks[i])
+      push!(diffStateStrSet, string(reducedUnks[i]))
+    end
+  end
+  #= Use string comparison for hard/soft split because finalInitialValues keys
+     are Num-wrapped while diffStateSet contains unwrapped BasicSymbolic values.
+     isequal(Num(x), x) can fail depending on Symbolics version. =#
+  local hardInitialValues = filter(finalInitialValues) do pair
+    string(pair.first) in diffStateStrSet
+  end
+  local softInitialValues = filter(finalInitialValues) do pair
+    !(string(pair.first) in diffStateStrSet)
+  end
+  #= If no differential state has an explicit IV but there are algebraic IVs,
+     keep all IVs as hard constraints. This handles models where only algebraic
+     variables have start values (e.g. VSS Pendulum: initial equation x=x0, y=y0
+     but no phi start). MTK needs these as hard constraints to determine the
+     differential states via algebraic equations during initialization.
+     Only demote algebraic IVs to guesses when differential states also have IVs. =#
+  if isempty(hardInitialValues) && !isempty(softInitialValues)
+    @info "No differential states have explicit IVs; keeping all $(length(softInitialValues)) algebraic IVs as hard constraints"
+    hardInitialValues = softInitialValues
+    softInitialValues = Pair[]
+  end
+  if !isempty(softInitialValues)
+    local currentGuesses = ModelingToolkit.guesses(reducedSystem)
+    local newGuesses = merge(currentGuesses, Dict(softInitialValues))
+    @set! reducedSystem.guesses = newGuesses
+  end
+  #= Ensure all differential states have hard initial values.
+     MTK's order-lowering creates derivative variables (e.g. Inertia_phiˍt for
+     der(Inertia_phi)) that have no Modelica start value.
+     Use resolveAliasInitialValue to find alias equations in the reduced system.
+     The allIVMap includes both reduced-system unknowns AND pre-simplification
+     variables (allInitialValues) so we can resolve aliases to variables that
+     were eliminated by structural_simplify. =#
+  #= Use string-based set for checking existing hard IVs, because isequal between
+     Num-wrapped keys (from finalInitialValues) and BasicSymbolic values (from
+     reducedUnks/diffStateSet) can fail. =#
+  local hardSymStrSet = Set(string(iv.first) for iv in hardInitialValues)
+  local allIVMap = Dict{Any, Any}(iv.first => iv.second
+                                  for iv in vcat(hardInitialValues, softInitialValues, allInitialValues))
+  local fullEqs = ModelingToolkit.full_equations(reducedSystem)
+  for diffState in diffStateSet
+    if !(string(diffState) in hardSymStrSet)
+      local diffStateStr = string(diffState)
+      #= Only attempt alias resolution for MTK-generated derivative variables
+         (e.g. Inertia_phiˍt created by order-lowering). These have the Unicode
+         dot character ˍ in their name and no Modelica start value.
+         For regular Modelica variables without explicit start values, do NOT add
+         a hard u0 entry. Let MTK's initialization solver infer their values from
+         algebraic constraints and guesses (e.g. phi inferred from x,y via
+         x = L*sin(phi)). Adding hard 0.0 would override this inference. =#
+      if contains(diffStateStr, "\u02cd")
+        local ivMapForResolve = filter(p -> string(p.first) != diffStateStr, allIVMap)
+        local resolved = resolveAliasInitialValue(diffState, fullEqs, ivMapForResolve)
+        local finalVal = something(resolved, 0.0)
+        push!(hardInitialValues, diffState => finalVal)
+        if resolved !== nothing
+          @info "Resolved differential state $(diffState) to $(finalVal) via equation alias"
+        else
+          @info "Defaulted MTK derivative $(diffState) to 0.0 (no alias equation found)"
+        end
+      else
+        @info "Leaving differential state $(diffState) for MTK initialization (no explicit start value)"
+      end
+    end
+  end
+  @info "ODEProblem: DAE, $(length(hardInitialValues)) hard u0 (differential), $(length(softInitialValues)) as guesses (algebraic), $(length(reducedUnks)) unknowns ($(length(diffStateSet)) differential)"
+  return (reducedSystem, hardInitialValues)
+end
+
+"""
   TODO:
   Document why some parts here are outcommented
   The irreductable variables scheme does not work using plain simplify.
@@ -413,6 +573,38 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   local pre_eqs = length(equations(sys))
   local pre_unknowns = length(unknowns(sys))
   @info "Before structural_simplify: $pre_eqs equations, $pre_unknowns unknowns"
+  @BACKEND_LOGGING begin
+    open("mtk_preSimplify.log", "w") do io
+      println(io, "############################################")
+      println(io, "MTK system before structural_simplify")
+      println(io, "############################################")
+      println(io)
+      println(io, "Unknowns ($pre_unknowns):")
+      println(io, "---------------------------------------------")
+      for (i, u) in enumerate(unknowns(sys))
+        println(io, "  [$i] $u")
+      end
+      println(io)
+      println(io, "Equations ($pre_eqs):")
+      println(io, "---------------------------------------------")
+      for (i, eq) in enumerate(equations(sys))
+        println(io, "  [$i] $eq")
+      end
+      println(io)
+      println(io, "Parameters ($(length(parameters(sys)))):")
+      println(io, "---------------------------------------------")
+      for (i, p) in enumerate(parameters(sys))
+        println(io, "  [$i] $p")
+      end
+      local defs = ModelingToolkit.defaults(sys)
+      println(io)
+      println(io, "Defaults ($(length(defs))):")
+      println(io, "---------------------------------------------")
+      for (k, v) in defs
+        println(io, "  $k => $v")
+      end
+    end
+  end
   sys = ModelingToolkit.structural_simplify(sys, simplify = simplify)
   local post_eqs = length(equations(sys))
   local post_full_eqs = length(ModelingToolkit.full_equations(sys))
@@ -429,6 +621,33 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   end
   if post_full_eqs != post_unknowns
     @warn "full_equations(sys) != unknowns(sys): $post_full_eqs vs $post_unknowns"
+  end
+  @BACKEND_LOGGING begin
+    open("mtk_postSimplify.log", "w") do io
+      println(io, "############################################")
+      println(io, "MTK system after structural_simplify")
+      println(io, "############################################")
+      println(io)
+      println(io, "Unknowns ($post_unknowns):")
+      for (i, u) in enumerate(unknowns(sys))
+        println(io, "  [$i] $u")
+      end
+      println(io)
+      println(io, "Equations ($post_eqs):")
+      for (i, eq) in enumerate(equations(sys))
+        println(io, "  [$i] $eq")
+      end
+      println(io)
+      println(io, "Guesses ($(length(ModelingToolkit.guesses(sys)))):")
+      for (k, v) in ModelingToolkit.guesses(sys)
+        println(io, "  $k => $v")
+      end
+      println(io)
+      println(io, "Full equations ($post_full_eqs):")
+      for (i, eq) in enumerate(ModelingToolkit.full_equations(sys))
+        println(io, "  [$i] $eq")
+      end
+    end
   end
   #= Workaround: after structural_simplify, the tearing state's graph may have
      stale dimensions (more equations/variables than equations(sys)/unknowns(sys)).
@@ -449,6 +668,16 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
     end
   catch ex
     @warn "Could not inspect tearing state" exception=(ex, catch_backtrace())
+  end
+  #= Filter guesses to only include variables that are unknowns of the reduced system.
+     After structural_simplify, many original unknowns become observed (algebraically
+     determined). Keeping guesses for those creates an overdetermined initialization. =#
+  local reducedUnknowns = Set(unknowns(sys))
+  local currentGuesses = ModelingToolkit.guesses(sys)
+  local filteredGuesses = Dict(k => v for (k, v) in currentGuesses if k in reducedUnknowns)
+  if length(filteredGuesses) != length(currentGuesses)
+    @info "Filtered guesses: $(length(currentGuesses)) -> $(length(filteredGuesses)) (removed $(length(currentGuesses) - length(filteredGuesses)) non-unknown guesses)"
+    @set! sys.guesses = filteredGuesses
   end
   return sys
 end

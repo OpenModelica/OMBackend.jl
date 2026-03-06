@@ -50,21 +50,21 @@ end
    work fine when called directly with symbolic values.
    Checks recursively inside for-loops and other compound statements. =#
 function hasIfStatements(func::SimulationCode.ModelicaFunction)::Bool
-  @match func begin
-    SimulationCode.MODELICA_FUNCTION(statements = stmts, locals = locals) => begin
-      _statementsContainIf(stmts) && return true
-      for v in locals
-        @match v.binding begin
-          SOME(bindingExp) => begin
-            _expContainsIfExp(bindingExp) && return true
-          end
-          _ => nothing
-        end
-      end
-      return false
-    end
-    _ => return false
+  if !(func isa SimulationCode.MODELICA_FUNCTION)
+    return false
   end
+  local stmts = func.statements
+  local locals = func.locals
+  _statementsContainIf(stmts) && return true
+  for v in locals
+    @match v.binding begin
+      SOME(bindingExp) => begin
+        _expContainsIfExp(bindingExp) && return true
+      end
+      _ => nothing
+    end
+  end
+  return false
 end
 
 function _statementsContainIf(stmts)::Bool
@@ -76,6 +76,8 @@ function _statementsContainIf(stmts)::Bool
     elseif s isa DAE.STMT_WHILE
       _statementsContainIf(s.statementLst) && return true
     elseif s isa DAE.STMT_ASSIGN
+      _expContainsIfExp(s.exp) && return true
+    elseif s isa DAE.STMT_ASSIGN_ARR
       _expContainsIfExp(s.exp) && return true
     end
   end
@@ -173,10 +175,12 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
     local normalizedName = replace(func.name, "." => "_")
     local nArgs = length(inputs)
     local isArrayFunc = hasArrayOutput(func)
-    # Always enable symbolic array dispatch for array-returning functions when
-    # dimensions are known. Restricting this to functions with if-statements can
-    # leak scalar Num terms into multi-index ASUB sites (e.g. x[1,2]).
-    local outputDims = isArrayFunc ? computeArrayOutputDims(func) : ()
+    #= Only enable opaque symbolic Term dispatch for array functions with
+       if-statements (control flow that cannot evaluate with symbolic args).
+       Pure-arithmetic array functions (resolve1, resolve2, axisRotation, etc.)
+       must execute their body directly with symbolic args so MTK can see the
+       full symbolic expressions and differentiate through them (Pantelides). =#
+    local outputDims = (isArrayFunc && hasIfStatements(func)) ? computeArrayOutputDims(func) : ()
     inputsJL = if nArgs > 1
       tuple(inputs...)
     elseif nArgs == 1
