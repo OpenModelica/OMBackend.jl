@@ -52,6 +52,7 @@ import ..OMBackend
 import ..Backend.BDAE
 import ..@BACKEND_LOGGING
 import ..BackendUtil.GraphAlgorithms
+import ..FrontendUtil.Util
 
 include("simCodeData.jl")
 include("simCodeUtil.jl")

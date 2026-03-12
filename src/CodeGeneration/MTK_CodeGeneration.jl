@@ -145,9 +145,19 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     # end
 
     function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0), solver=Rodas5(); kwargs...)
-      $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
-      OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver; kwargs...)
+      _t_model = @elapsed begin
+        $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
+      end
+      _t_solve = @elapsed begin
+        _sol = OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver; kwargs...)
+      end
+      @info "Simulate timings:" model_construction=round(_t_model, digits=2) solve=round(_t_solve, digits=2)
+      _sol
     end
+
+
+
+
 
   end
   return (MODEL_NAME, code)
@@ -197,8 +207,13 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     $(generateRegisterCallsForCallExprs(simCode)...)
     $(model)
     function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
-      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), tspan, pars, vars, irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
-      sol = solve($(Symbol("$(MODEL_NAME)Model_problem")), solver; kwargs...)
+      _t_model = @elapsed begin
+        ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), tspan, pars, vars, irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
+      end
+      _t_solve = @elapsed begin
+        sol = solve($(Symbol("$(MODEL_NAME)Model_problem")), solver; kwargs...)
+      end
+      @info "Simulate timings:" model_construction=round(_t_model, digits=2) solve=round(_t_solve, digits=2)
       return sol
     end
   end
@@ -420,107 +435,151 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   =#
   #=If our model name is separated by . replace it with __ =#
   local MODEL_NAME = replace(modelName, "." => "__")
+  #= Decompose variables, equations, and start equations into (outer_defs, inner_refs).
+     outer_defs go at module level (before model function) to avoid nested closure JIT.
+     inner_refs go inside the model function body. =#
+  local modelPrefix = "_" * MODEL_NAME * "_"
+  local (varOuterDefs, varInnerRefs) = decomposeVariables(
+    stateVariablesSym, algebraicVariablesSym; modelPrefix = modelPrefix)
   model = quote
     $(CALL_BACK_EQUATIONS)
+    #= Variable constructor function definitions at module level (outside model function)
+       to avoid JIT overhead from compiling nested closures.
+       Variable constructors only return symbol tuples, so they have no scope dependencies. =#
+    $(varOuterDefs)
     function $(Symbol(MODEL_NAME * "Model"))(tspan = (0.0, 1.0))
+      local _timings = Dict{String, Float64}()
+      local _t0_total = time()
       ModelingToolkit.@independent_variables t
       D = ModelingToolkit.Differential(t)
-      parameters = ModelingToolkit.@parameters begin
-        ($(parVariablesSym...))
+      _timings["1_parameters"] = @elapsed begin
+        $(decomposeParametersDeclaration(parVariablesSym))
+        #= Create array parameters with proper dimensions =#
+        $(ARRAY_PARAMETERS...)
       end
-      #= Create array parameters with proper dimensions =#
-      $(ARRAY_PARAMETERS...)
       #=
         Only variables that are present in the equation system later should be a part of the variables in the MTK system.
         This means that certain algebraic variables should not be listed among the variables (These are the discrete variables).
       =#
-      $(decomposeVariables(stateVariablesSym, algebraicVariablesSym))
-      allVariables = []
-      #= Generate variables =#
-      for constructor in variableConstructors
-        t = Symbolics.variable(:t, T = Real)
-        vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple{Real}, Real})(t)), Base.invokelatest(constructor))
-        #= t is no longer needed here =#
-        push!(allVariables, vars)
+      _timings["2_variables"] = @elapsed begin
+        $(varInnerRefs)
+        allVariables = []
+        #= Generate variables =#
+        for constructor in variableConstructors
+          t = Symbolics.variable(:t, T = Real)
+          vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple{Real}, Real})(t)), Base.invokelatest(constructor))
+          #= t is no longer needed here =#
+          push!(allVariables, vars)
+        end
+        vars = collect(Iterators.flatten(allVariables))
       end
-      vars = collect(Iterators.flatten(allVariables))
-      #= Evaluate the variables s.t the symbols are available =#
-      for (sym, var) in vars
-        eval(:($sym = $var))
-      end
-      #= Mark irreductable variables irreductable =#
-      local irreductableSyms = $(irreductableSyms)
-      for sym in irreductableSyms
-        eval(:($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableIrreducible, true)))
-      end
-      #= Apply state_priority metadata from Modelica StateSelect annotations.
-         Must use eval to update the module-level bindings so that equations
-         (which reference those bindings) carry the metadata into ODESystem. =#
-      local _statePriorityPairs = $(statePriorityPairs)
-      for (sym, priority) in _statePriorityPairs
-        eval(:($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableStatePriority, $priority)))
+      #= Batch all variable assignments and metadata into a single eval call.
+         Each individual eval triggers a world-age bump and JIT overhead.
+         For models with 1000+ variables this reduces N evals to 1. =#
+      _timings["3_eval_vars"] = @elapsed begin
+        local _batchBlock = Expr(:block)
+        for (sym, var) in vars
+          push!(_batchBlock.args, :($sym = $var))
+        end
+        local irreductableSyms = $(irreductableSyms)
+        for sym in irreductableSyms
+          push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableIrreducible, true)))
+        end
+        local _statePriorityPairs = $(statePriorityPairs)
+        for (sym, priority) in _statePriorityPairs
+          push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableStatePriority, $priority)))
+        end
+        eval(_batchBlock)
       end
       #= Transform the variable vector into a vector of Nums =#
       vars = map(x -> last(x), vars)
       #= Initial values for the continious system. =#
-      pars = Dict($(PARAMETER_EQUATIONS...))
-      startEquationComponents = []
-      $(decomposeStartEquations(START_CONDTIONS_EQUATIONS))
-      for constructor in startEquationConstructors
-        push!(startEquationComponents, Base.invokelatest(constructor))
+      _timings["4_initial_values"] = @elapsed begin
+        $(decomposeParameterEquationsInline(PARAMETER_EQUATIONS))
+        startEquationComponents = []
+        $(decomposeStartEquationsInline(START_CONDTIONS_EQUATIONS))
+        for constructor in startEquationConstructors
+          push!(startEquationComponents, Base.invokelatest(constructor))
+        end
+        initialValues = collect(Iterators.flatten(startEquationComponents))
+        #= Process the final initial guesses =#
+        startEquationComponents = []
+        $(decomposeStartEquationsInline(FINAL_START_CONDTIONS_EQUATIONS; functionSuffix = "Final"))
+        for constructor in startEquationConstructors
+          push!(startEquationComponents, Base.invokelatest(constructor))
+        end
+        finalInitialValues = collect(Iterators.flatten(startEquationComponents))
       end
-      initialValues = collect(Iterators.flatten(startEquationComponents))
-      #= Process the final initial guesses =#
-      startEquationComponents = []
-      $(decomposeStartEquations(FINAL_START_CONDTIONS_EQUATIONS; functionSuffix = "Final"))
-      for constructor in startEquationConstructors
-        push!(startEquationComponents, Base.invokelatest(constructor))
-      end
-      finalInitialValues = collect(Iterators.flatten(startEquationComponents))
       #= End construction of initial values =#
-      equationComponents = []
-      $(stripBeginBlocks(decomposeEquations(EQUATIONS, PARAMETER_ASSIGNMENTS)))
-      #= Generate the Equations =#
-      for constructor in equationConstructorCalls
-        push!(equationComponents, Base.invokelatest(constructor))
+      _timings["5_equations"] = @elapsed begin
+        equationComponents = []
+        $(stripBeginBlocks(decomposeEquationsInline(EQUATIONS, PARAMETER_ASSIGNMENTS)))
+        #= Generate the Equations =#
+        for constructor in equationConstructorCalls
+          push!(equationComponents, Base.invokelatest(constructor))
+        end
+        eqs = collect(Iterators.flatten(equationComponents))
+        eqs = Base.invokelatest(OMBackend.CodeGeneration.filterConstantEquations, eqs)
       end
-      eqs = collect(Iterators.flatten(equationComponents))
-      eqs = Base.invokelatest(OMBackend.CodeGeneration.filterConstantEquations, eqs)
-      $(IF_EQUATION_EVENT_DECLARATION)
-      nonLinearSystem = $(odeSystemWithEvents(!(isempty(ifConditionalStartEquations)), modelName))
-      firstOrderSystem = nonLinearSystem
-      $(performStructuralSimplify(performIndexReduction)) #TODO. Causes issues for some systems... my own simplify?
-      #=
-        These arrays are introduced to handle the bolted on event handling using callbacks.
-        The callback handling for MTK is subject of change should hybrid system be implemented for MTK.
-      =#
-      local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
-      #= Wrap discrete start values in a function and call with invokelatest to avoid world-age issues =#
-      #= The variables referenced in DISCRETE_START_VALUES were created via eval above =#
-      function _getDiscreteVars()
-        collect(values(ModelingToolkit.OrderedDict($(DISCRETE_START_VALUES...))))
+      _timings["6_events_observed"] = @elapsed begin
+        $(IF_EQUATION_EVENT_DECLARATION)
+        $(generateAliasObservedBlock(simCode))
       end
-      local discreteVars = Base.invokelatest(_getDiscreteVars)
-      #= Merge the discrete and event parameters =#
-      eventParameters = vcat(eventParameters, discreteVars)
-      local aux = Vector{Any}(undef, 3)
-      #= TODO init them with the initial values of them =#
-      aux[1] = eventParameters
-      aux[2] = Float64[]
-      aux[3] = reducedSystem
-      #=
-       This array is used to help indexing state/discrete variables.
-       It maps the index given by OMBackend to the actual index in the states.
-       A[i] = <true_index>
-      =#
-      callbacks = $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
-      (reducedSystem, finalInitialValues) = Base.invokelatest(
-        OMBackend.CodeGeneration.splitInitialValues, reducedSystem, finalInitialValues, initialValues)
-      problem = ModelingToolkit.ODEProblem(reducedSystem,
-                                           merge(Dict(finalInitialValues), pars),
-                                           tspan,
-                                           callback=callbacks,
-                                           warn_initialize_determined=false)
+      _timings["7_ODESystem"] = @elapsed begin
+        nonLinearSystem = $(odeSystemWithEvents(!(isempty(ifConditionalStartEquations)), modelName;
+                                                hasObserved = !isempty(simCode.aliasMap)))
+        firstOrderSystem = nonLinearSystem
+      end
+      _timings["8_structural_simplify"] = @elapsed begin
+        $(performStructuralSimplify(performIndexReduction; observedFilter = simCode.observedFilter))
+      end
+      _timings["9_callbacks_setup"] = @elapsed begin
+        #=
+          These arrays are introduced to handle the bolted on event handling using callbacks.
+          The callback handling for MTK is subject of change should hybrid system be implemented for MTK.
+        =#
+        local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
+        #= Wrap discrete start values in a function and call with invokelatest to avoid world-age issues =#
+        #= The variables referenced in DISCRETE_START_VALUES were created via eval above =#
+        function _getDiscreteVars()
+          collect(values(ModelingToolkit.OrderedDict($(DISCRETE_START_VALUES...))))
+        end
+        local discreteVars = Base.invokelatest(_getDiscreteVars)
+        #= Merge the discrete and event parameters =#
+        eventParameters = vcat(eventParameters, discreteVars)
+        local aux = Vector{Any}(undef, 3)
+        #= TODO init them with the initial values of them =#
+        aux[1] = eventParameters
+        aux[2] = Float64[]
+        aux[3] = reducedSystem
+        #=
+         This array is used to help indexing state/discrete variables.
+         It maps the index given by OMBackend to the actual index in the states.
+         A[i] = <true_index>
+        =#
+        callbacks = $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
+      end
+      _timings["10_splitInitialValues"] = @elapsed begin
+        (reducedSystem, finalInitialValues) = Base.invokelatest(
+          OMBackend.CodeGeneration.splitInitialValues, reducedSystem, finalInitialValues, initialValues)
+      end
+      _timings["11_ODEProblem"] = @elapsed begin
+        if OMBackend.DIRECT_RHS_GENERATION[]
+          problem = OMBackend.CodeGeneration.buildDirectRHSProblem(
+            reducedSystem, finalInitialValues, pars, tspan, callbacks)
+        else
+          problem = ModelingToolkit.ODEProblem(reducedSystem,
+                                               merge(Dict(finalInitialValues), pars),
+                                               tspan,
+                                               callback=callbacks,
+                                               warn_initialize_determined=false)
+        end
+      end
+      _timings["total"] = time() - _t0_total
+      @info "Model generation timings:" _timings
+      for (k, v) in sort(collect(_timings))
+        @info "  $k: $(round(v, digits=2))s"
+      end
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
     end
   end
@@ -531,6 +590,74 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     qualifyModelicaFunctions!(model, funcNames)
   end
   return model
+end
+
+"""
+    generateAliasObservedBlock(simCode)
+
+Generate a code block that creates observed equations for eliminated alias variables.
+Each alias entry produces:
+  - A symbolic variable declaration for the eliminated variable
+  - An observed equation: `eliminated(t) ~ representative(t)` (or negated)
+These are passed to `ODESystem` via the `observed` keyword so that eliminated
+variables remain accessible in the solution (e.g. `sol[var"eliminated"]`).
+"""
+function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE)
+  if isempty(simCode.aliasMap)
+    return :(observedEqs = [])
+  end
+  #= Generate the observed equations as runtime code.
+     The alias map entries are known at code-gen time, so we can embed
+     the variable names as string literals. At runtime, these create
+     Symbolics variables and equations. =#
+  local obsExprs = Expr[]
+  for entry in simCode.aliasMap
+    local elimSym = Symbol(entry.eliminatedName)
+    local repSym = Symbol(entry.representativeName)
+    if entry.negated
+      push!(obsExprs, :($(elimSym) ~ -$(repSym)))
+    else
+      push!(obsExprs, :($(elimSym) ~ $(repSym)))
+    end
+  end
+  #= Generate variable declarations for eliminated variables as a single batch eval.
+     Previously each variable got its own eval() call, causing O(N) world-age bumps.
+     For Engine1a with 876 aliases this took ~67s. Batching into one eval: ~1s. =#
+  local batchAssignExprs = Expr[]
+  for entry in simCode.aliasMap
+    local elimSym = Symbol(entry.eliminatedName)
+    push!(batchAssignExprs,
+      :($(elimSym) = Symbolics.variable($(QuoteNode(elimSym)),
+          T = Symbolics.FnType{Tuple{Real}, Real})(
+            Symbolics.variable(:t, T = Real))))
+  end
+  local batchBlock = Expr(:block, batchAssignExprs...)
+  #= Chunk observed equations into small functions (25 each) to avoid
+     compiling one massive lambda. For Engine1a with 876 aliases, the single
+     lambda took ~101s. Chunking into 36 functions of 25 should be much faster. =#
+  local obsChunks = collect(Iterators.partition(obsExprs, 25))
+  local chunkFuncDefs = Expr[]
+  local chunkFuncNames = Symbol[]
+  for (i, chunk) in enumerate(obsChunks)
+    local fName = Symbol("_generateObservedEqs_", i - 1)
+    push!(chunkFuncDefs, quote
+      function $(fName)()
+        [$(collect(chunk)...)]
+      end
+    end)
+    push!(chunkFuncNames, fName)
+  end
+  return quote
+    #= Declare eliminated alias variables (single batch eval) =#
+    eval($(QuoteNode(batchBlock)))
+    #= Create observed equations in chunks =#
+    $(chunkFuncDefs...)
+    local _obsComponents = []
+    for _obsFn in [$(chunkFuncNames...)]
+      push!(_obsComponents, Base.invokelatest(_obsFn))
+    end
+    observedEqs = collect(Iterators.flatten(_obsComponents))
+  end
 end
 
 """
@@ -1043,137 +1170,280 @@ function createParameterArray(parameters::Vector{T1}, parameterAssignments::Vect
 end
 
 """
- This function decomposes the continuous variables.
- This means that if the set of variables are greater than 50 a new inner function is generated.
- This is done  to not negativly impact the JIT of the system to much.
+ Decomposes the continuous variables into chunked constructor functions.
+ Returns (outer_defs, inner_refs) where:
+  - outer_defs: function definitions to be placed at module level (before model function)
+  - inner_refs: the variableConstructors array assignment (inside model function)
+ Constructor functions are defined at module level to avoid JIT overhead from
+ compiling nested closures inside the model function.
+ The `modelPrefix` avoids name collisions when multiple models are translated in one session.
 """
-function decomposeVariables(stateVariables::Vector{Symbol}, algebraicVariables::Vector{Symbol})
-  local nStateVars = length(stateVariables)
-  local nAlgVars = length(algebraicVariables)
-  if  1 < nStateVars < 50 &&  1 < nAlgVars < 50
-    expr = quote
-      function generateStateVariables()
-        $(Tuple([stateVariables...]))
+function decomposeVariables(stateVariables::Vector{Symbol}, algebraicVariables::Vector{Symbol};
+                            modelPrefix::String = "")
+  local stateVectors = collect(Iterators.partition(stateVariables, 50))
+  local algVectors = collect(Iterators.partition(algebraicVariables, 50))
+  local outerDefs = Expr[]
+  local constructorNames = Symbol[]
+  local i = 1::Int
+  for stateVector in stateVectors
+    local fName = Symbol(modelPrefix, "generateStateVariables", i)
+    push!(outerDefs, quote
+      function $(fName)()
+        $(Tuple([stateVector...]))
       end
-      function generateAlgebraicVariables()
-        $(Tuple([algebraicVariables...]))
-      end
-      variableConstructors = Function[generateStateVariables, generateAlgebraicVariables]
-    end
-  elseif (1 < nStateVars < 50) && nAlgVars == 0
-    expr = quote
-      function generateStateVariables()
-        $(Tuple([stateVariables...]))
-      end
-      variableConstructors = Function[generateStateVariables]
-    end
-  else
-    #= Split the array in chunks of 50 for the state and algebraic variables=#
-    local stateVectors = collect(Iterators.partition(stateVariables, 50))
-    local algVectors = collect(Iterators.partition(algebraicVariables, 50))
-    #= For each vector in stateVectors create a constructor for the variables =#
-    local i = 1::Int
-    local exprs = Expr[]
-    constructors = quote
-      variableConstructors = Function[]
-    end
-    push!(exprs, constructors)
-    for stateVector in stateVectors
-      stateConstructorExpr = quote
-        function $(Symbol("generateStateVariables" * string(i)))()
-          $(Tuple([stateVector...]))
-        end
-        push!(variableConstructors, $(Symbol("generateStateVariables" * string(i))))
-      end
-      push!(exprs, stateConstructorExpr)
-      i += 1
-    end
-    local i = 1
-    #= decompose the algebraic variables if needed =#
-    for algVector in algVectors
-      algConstructorExpr = quote
-        function $(Symbol("generateAlgebraicVariables" * string(i)))()
-          $(Tuple([algVector...]))
-        end
-        push!(variableConstructors, $(Symbol("generateAlgebraicVariables" * string(i))))
-      end
-      push!(exprs, algConstructorExpr)
-      i += 1
-    end
-    #= Generate the composite expression =#
-    expr = quote
-      $(exprs...)
-    end
+    end)
+    push!(constructorNames, fName)
+    i += 1
   end
-  return expr
+  i = 1
+  for algVector in algVectors
+    local fName = Symbol(modelPrefix, "generateAlgebraicVariables", i)
+    push!(outerDefs, quote
+      function $(fName)()
+        $(Tuple([algVector...]))
+      end
+    end)
+    push!(constructorNames, fName)
+    i += 1
+  end
+  local outerExpr = quote
+    $(outerDefs...)
+  end
+  local innerExpr = quote
+    variableConstructors = Function[$(constructorNames...)]
+  end
+  return (outerExpr, innerExpr)
 end
 
 """
-  Similar to decompose variables, however, decomposes the set of equations instead.
-  This function does so by dividing the total number of equations into separate blocks with 50 equations in each block.
-  This function is suppose to be called after decompose variables.
-  the parameter assignments contains the set of values assigned to parameters at the beginning of the simulation.
+  Decomposes equations into chunked constructor functions.
+  Returns (outer_defs, inner_refs) where:
+  - outer_defs: function definitions at module level
+  - inner_refs: parameter assignments + equationConstructorCalls array (inside model function)
+  The `modelPrefix` avoids name collisions when multiple models are translated in one session.
 """
-function decomposeEquations(equations, parameterAssignments)
-  local nStateVars = length(equations)
+function decomposeEquations(equations, parameterAssignments; modelPrefix::String = "")
   local equationVectors = collect(Iterators.partition(equations, 50))
+  local outerDefs = Expr[]
+  local functionNames = Symbol[]
+  local i = 0
+  for equationVector in equationVectors
+    local eqv = collect(equationVector)
+    local fName = Symbol(modelPrefix, "generateEquations", i)
+    push!(outerDefs, quote
+      function $(fName)()
+        [$(eqv...)]
+      end
+    end)
+    push!(functionNames, fName)
+    i += 1
+  end
+  local outerExpr = quote
+    $(outerDefs...)
+  end
+  local innerExpr = quote
+    $(parameterAssignments...)
+    local equationConstructors::Vector{Function}
+    local equationConstructorCalls::Vector
+    equationConstructorCalls = [$(functionNames...)]
+  end
+  return (outerExpr, innerExpr)
+end
+
+"""
+  Decomposes start equations into chunked constructor functions.
+  Returns (outer_defs, inner_refs) where:
+  - outer_defs: function definitions at module level
+  - inner_refs: startEquationConstructors array assignment (inside model function)
+  The `modelPrefix` avoids name collisions, `functionSuffix` differentiates initial vs final start eqs.
+"""
+function decomposeStartEquations(equations; functionSuffix = "", modelPrefix::String = "")
+  local equationVectors = collect(Iterators.partition(equations, 50))
+  local outerDefs = Expr[]
+  local constructorNames = Symbol[]
+  local i = 0
+  for equationVector in equationVectors
+    local fName = Symbol(modelPrefix, "generateStartEquations", functionSuffix, i)
+    push!(outerDefs, quote
+      function $(fName)()
+        [$(equationVector...)]
+      end
+    end)
+    push!(constructorNames, fName)
+    i += 1
+  end
+  local outerExpr = quote
+    $(outerDefs...)
+  end
+  local innerExpr = quote
+    startEquationConstructors = Function[$(constructorNames...)]
+  end
+  return (outerExpr, innerExpr)
+end
+
+"""
+  Inline variant of decomposeEquations that keeps function definitions inside
+  the model function body. Equation expressions reference parameter symbols that
+  are local to the model function (created by @parameters), so they cannot be
+  moved to module level.
+"""
+function decomposeEquationsInline(equations, parameterAssignments)
+  local equationVectors = collect(Iterators.partition(equations, 15))
   local exprs = Expr[]
-  local equationConstructorCalls = Function[]
+  local functionNames = Symbol[]
   local constructors = quote
-    #= Moved from line below. It is maybe not needed to repeat it for each block to repeat this to much.. =#
     $(parameterAssignments...)
     local equationConstructors::Vector{Function}
     local equationConstructorCalls::Vector
   end
   push!(exprs, constructors)
   local i = 0
-  local functionNames = Symbol[]
   for equationVector in equationVectors
-    eqv = collect(equationVector)
-    local fName = string("generateEquations", i)
-    equationConstructor = quote
-      function $(Symbol(fName))()
-        [$(eqv...)]
-      end
+    local eqv = collect(equationVector)
+    local (csEqs, csPreamble) = extractCommonHvcats(eqv)
+    local fName = Symbol("generateEquations", i)
+    if isempty(csPreamble)
+      push!(exprs, quote
+        function $(fName)()
+          [$(eqv...)]
+        end
+      end)
+    else
+      push!(exprs, quote
+        function $(fName)()
+          $(csPreamble...)
+          [$(csEqs...)]
+        end
+      end)
     end
-    push!(functionNames, Symbol(fName))
-    push!(exprs, equationConstructor)
+    push!(functionNames, fName)
     i += 1
   end
-  expr = quote
+  return quote
     $(exprs...)
     equationConstructorCalls = [$(functionNames...)]
   end
-  return expr
 end
 
 """
-  Similar to decomposeEquations but for start equations.
-  The optional argument `functionSuffix` can be used to specify a slightly different name to the function that is generated.
+  Inline variant of decomposeStartEquations that keeps function definitions inside
+  the model function body. Start equations reference symbols that may be local to
+  the model function (created by @parameters or phase 3 eval), so they cannot be
+  moved to module level.
 """
-function decomposeStartEquations(equations; functionSuffix = "")
-  local nStateVars = length(equations)
-  local equationVectors = collect(Iterators.partition(equations, 50))
+function decomposeStartEquationsInline(equations; functionSuffix = "")
+  local equationVectors = collect(Iterators.partition(equations, 25))
   local exprs = Expr[]
-  local constructors = quote
-    startEquationConstructors = Function[]
-  end
-  push!(exprs, constructors)
+  local constructorNames = Symbol[]
   local i = 0
   for equationVector in equationVectors
-    equationConstructorExpr = quote
-      function $(Symbol(string("generateStartEquations",functionSuffix, string(i))))()
-        [$(equationVector...)]
-      end
-      push!(startEquationConstructors, $(Symbol(string("generateStartEquations", functionSuffix, string(i)))))
+    local eqv = collect(equationVector)
+    local (csEqs, csPreamble) = extractCommonHvcats(eqv)
+    local fName = Symbol("generateStartEquations", functionSuffix, i)
+    if isempty(csPreamble)
+      push!(exprs, quote
+        function $(fName)()
+          [$(eqv...)]
+        end
+      end)
+    else
+      push!(exprs, quote
+        function $(fName)()
+          $(csPreamble...)
+          [$(csEqs...)]
+        end
+      end)
     end
-    push!(exprs, equationConstructorExpr)
+    push!(constructorNames, fName)
     i += 1
   end
-  expr = quote
+  return quote
     $(exprs...)
+    startEquationConstructors = Function[$(constructorNames...)]
   end
-  return expr
+end
+
+"""
+  Chunks the @parameters macro call into inner functions to reduce the model
+  function body size. Each inner function calls @parameters with a subset of
+  parameter names and returns the resulting vector. Results are concatenated.
+
+  After chunking, parameter symbols are eval'd into module scope so that
+  pars Dict closures and ARRAY_PARAMETERS code can reference them by name.
+"""
+function decomposeParametersDeclaration(parVariablesSym; chunkSize = 100)
+  if length(parVariablesSym) <= chunkSize
+    return quote
+      parameters = ModelingToolkit.@parameters begin
+        ($(parVariablesSym...))
+      end
+    end
+  end
+  local chunks = collect(Iterators.partition(parVariablesSym, chunkSize))
+  local exprs = Expr[]
+  local constructorNames = Symbol[]
+  for (i, chunk) in enumerate(chunks)
+    local fName = Symbol("_createParams_", i - 1)
+    local chunkSyms = collect(chunk)
+    push!(exprs, quote
+      function $(fName)()
+        ModelingToolkit.@parameters begin
+          ($(chunkSyms...))
+        end
+      end
+    end)
+    push!(constructorNames, fName)
+  end
+  local paramNameQuotes = [QuoteNode(s) for s in parVariablesSym]
+  return quote
+    $(exprs...)
+    local _allParamChunks = []
+    for _fn in [$(constructorNames...)]
+      push!(_allParamChunks, Base.invokelatest(_fn))
+    end
+    parameters = vcat(_allParamChunks...)
+    local _paramNames = [$(paramNameQuotes...)]
+    local _paramBindBlock = Expr(:block)
+    for (name, p) in zip(_paramNames, parameters)
+      push!(_paramBindBlock.args, :($name = $p))
+    end
+    eval(_paramBindBlock)
+  end
+end
+
+"""
+  Chunks parameter equations (sym => value pairs) into small inner functions
+  to reduce JIT overhead from compiling one massive Dict literal.
+  Each chunk function returns a Dict of parameter pairs. Results are
+  merged into the final pars Dict via invokelatest.
+
+  Parameter equations reference @parameters symbols which are local to the
+  model function, so chunk functions are defined inline as closures.
+"""
+function decomposeParameterEquationsInline(parameterEquations; chunkSize = 50)
+  if length(parameterEquations) <= chunkSize
+    return :(pars = Dict($(parameterEquations...)))
+  end
+  local chunks = collect(Iterators.partition(parameterEquations, chunkSize))
+  local exprs = Expr[]
+  local constructorNames = Symbol[]
+  for (i, chunk) in enumerate(chunks)
+    local fName = Symbol("_generatePars_", i - 1)
+    local chunkExprs = collect(chunk)
+    push!(exprs, quote
+      function $(fName)()
+        Dict($(chunkExprs...))
+      end
+    end)
+    push!(constructorNames, fName)
+  end
+  return quote
+    $(exprs...)
+    pars = Dict{Any,Any}()
+    for _parFn in [$(constructorNames...)]
+      merge!(pars, Base.invokelatest(_parFn))
+    end
+  end
 end
 
 """

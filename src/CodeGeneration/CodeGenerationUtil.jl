@@ -600,6 +600,30 @@ function getCycleInSCCs(sccs)
 end
 
 """
+    resolveAliasedCref(fullName, simCode, hashTable; varPrefix, varSuffix)
+
+Fallback for code generation when a variable was eliminated by alias elimination
+but a reference to it survived in the equation expressions (missed by substitution).
+Returns `(true, expr)` if the variable was found in `simCode.aliasMap`, or `(false, nothing)`.
+"""
+function resolveAliasedCref(fullName::String, simCode, hashTable; varPrefix="", varSuffix="")
+  for entry in simCode.aliasMap
+    if entry.eliminatedName == fullName
+      local repEntry = get(hashTable, entry.representativeName, nothing)
+      if repEntry !== nothing
+        local sym = Symbol(varPrefix, repEntry[2].name, varSuffix)
+        if entry.negated
+          return (true, :(-$(sym)))
+        else
+          return (true, quote $(sym) end)
+        end
+      end
+    end
+  end
+  return (false, nothing)
+end
+
+"""
 Converts a DAE expression into a MTK expression.
 varPrefix and varSuffix can be used to provide a prefix and a suffix to component reference.
 """
@@ -644,11 +668,21 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           @match DAE.DIM_INTEGER(i) = d
           lookUpStr *= string("[", i, "]")
         end
-        indexAndVar = hashTable[lookUpStr]
-        hashTable[arrName] = indexAndVar
-        expr = quote $(Symbol(arrName)) end
-        #fail()
-        expr
+        local arrEntry = get(hashTable, lookUpStr, nothing)
+        if arrEntry !== nothing
+          hashTable[arrName] = arrEntry
+          expr = quote $(Symbol(arrName)) end
+          expr
+        else
+          local (aliasResolved, aliasExpr) = resolveAliasedCref(lookUpStr, simCode, hashTable,
+            varPrefix=varPrefix, varSuffix=varSuffix)
+          if aliasResolved
+            @warn "expToJuliaExpMTK: resolved alias-eliminated T_ARRAY variable via fallback" lookUpStr
+            aliasExpr
+          else
+            throw(KeyError(lookUpStr))
+          end
+        end
       end
       #=
       This is an array access. Note the difference to the case above,
@@ -678,10 +712,23 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             end
           end
           if allConstant
-            indexAndVar = hashTable[string(varName, lookUpStr)]
-            quote
-              $(LineNumberNode(@__LINE__, "$varName array"))
-              $(Symbol(indexAndVar[2].name))
+            local fullKey = string(varName, lookUpStr)
+            local htEntry = get(hashTable, fullKey, nothing)
+            if htEntry !== nothing
+              quote
+                $(LineNumberNode(@__LINE__, "$varName array"))
+                $(Symbol(htEntry[2].name))
+              end
+            else
+              #= Variable was eliminated by alias elimination. Resolve via aliasMap. =#
+              local (aliasResolved, aliasExpr) = resolveAliasedCref(fullKey, simCode, hashTable,
+                varPrefix=varPrefix, varSuffix=varSuffix)
+              if aliasResolved
+                @warn "expToJuliaExpMTK: resolved alias-eliminated variable via fallback" fullKey
+                aliasExpr
+              else
+                throw(KeyError(fullKey))
+              end
             end
           else
             #= Variable subscripts: generate runtime indexing =#
@@ -741,11 +788,19 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             local elemName = elemLookup[2].name
             quote $(Symbol(string(varPrefix, elemName, varSuffix))) end
           else
-            local ss = subscriptsToExpr(subscripts, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-            local refExpr = makeRefExpr(Symbol(string(varPrefix, lookupStr, varSuffix)), ss)
-            quote
-              $(LineNumberNode(@__LINE__, "Array access to missing var: $lookupStr"))
-              $(refExpr)
+            #= Check if alias-eliminated =#
+            local (aliasRes2, aliasEx2) = resolveAliasedCref(elemKey, simCode, hashTable,
+              varPrefix=varPrefix, varSuffix=varSuffix)
+            if aliasRes2
+              @warn "expToJuliaExpMTK: resolved alias-eliminated CREF_QUAL element via fallback" elemKey
+              aliasEx2
+            else
+              local ss = subscriptsToExpr(subscripts, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+              local refExpr = makeRefExpr(Symbol(string(varPrefix, lookupStr, varSuffix)), ss)
+              quote
+                $(LineNumberNode(@__LINE__, "Array access to missing var: $lookupStr"))
+                $(refExpr)
+              end
             end
           end
         else
@@ -799,8 +854,16 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           if success
             arrayExpr
           else
-            #= Variable not in hash table, using direct reference =#
-            Symbol(string(varPrefix, varName, varSuffix))
+            #= Check if alias-eliminated =#
+            local (aliasRes, aliasEx) = resolveAliasedCref(varName, simCode, hashTable,
+              varPrefix=varPrefix, varSuffix=varSuffix)
+            if aliasRes
+              @warn "expToJuliaExpMTK: resolved alias-eliminated bare CREF via fallback" varName
+              aliasEx
+            else
+              #= Variable not in hash table, using direct reference =#
+              Symbol(string(varPrefix, varName, varSuffix))
+            end
           end
         else
           indexAndVar = hashTable[varName]
@@ -852,13 +915,10 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
         local rhs = expToJuliaExpMTK(e2, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
         local opSym = DAE_OP_toJuliaOperator(op)
-        #= Special handling for matrix multiplication - operands may be nested vectors =#
-        @match op begin
-          DAE.MUL_MATRIX_PRODUCT(__) => begin
-            :(OMBackend.CodeGeneration.ensureMatrix($(lhs)) * OMBackend.CodeGeneration.ensureMatrix($(rhs)))
-          end
-          _ => :($opSym($(lhs), $(rhs)))
-        end
+        #= Matrix multiplication: operands are always proper Matrix (from hvcat in
+           equation codegen) or symbolic Num (where ensureMatrix is a no-op).
+           Function impl params are pre-converted by generateArrayConversions. =#
+        :($opSym($(lhs), $(rhs)))
       end
       DAE.LUNARY(operator = op, exp = e1)  => begin
         local operand = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
@@ -994,18 +1054,12 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           end
         else
           local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-          #= For function calls returning arrays, wrap with ensureMatrix for proper 2D indexing =#
-          local needsEnsureMatrix = length(subExprs) > 1 && @match innerExp begin
-            DAE.CALL(__) => true
-            _ => false
-          end
+          #= Function call results are proper Matrix (impl bodies use ensureArray
+             for array construction, generateArrayConversions for params).
+             Symbolic Num handles subscripting directly. =#
           if length(subExprs) == 1
             quote
               $(innerCode)[$(first(subExprs))]
-            end
-          elseif needsEnsureMatrix
-            quote
-              OMBackend.CodeGeneration.ensureMatrix($(innerCode))[$(subExprs...)]
             end
           else
             quote
@@ -1198,9 +1252,38 @@ function handleArrayExp(exp::DAE.ARRAY, simCode)
   else
     #= Contains CREFs, generate array with symbolic element expressions =#
     if dimSize >= 2
-      #= For 2D arrays, convert nested vectors to proper matrix at runtime =#
-      quote
-        Matrix(transpose(stack([$(elemExprs...)])))
+      #= For 2D arrays, generate hvcat for direct matrix construction =#
+      local allScalars = Expr[]
+      local nCols = 0
+      local flattenable = true
+      for i in 1:steps
+        local rowDaeExp = listGet(exp.array, i)
+        if @match rowDaeExp begin
+          DAE.ARRAY(__) => true
+          _ => false
+        end
+          local rowLen = listHead(rowDaeExp.ty.dims).integer
+          if nCols == 0
+            nCols = rowLen
+          end
+          for j in 1:rowLen
+            push!(allScalars, expToJuliaExpMTK(listGet(rowDaeExp.array, j), simCode))
+          end
+        else
+          flattenable = false
+          break
+        end
+      end
+      if flattenable && nCols > 0
+        local colCounts = ntuple(_ -> nCols, steps)
+        quote
+          hvcat($(colCounts), $(allScalars...))
+        end
+      else
+        #= Fallback: rows are not plain arrays =#
+        quote
+          Matrix(transpose(stack([$(elemExprs...)])))
+        end
       end
     else
       quote
@@ -1214,17 +1297,32 @@ end
   If the system needs to conduct index reduction make sure to inform MTK.
 (We avoid structurally simplify for now since that might interfer with some other algorithms)
 """
-function performStructuralSimplify(simplify)::Expr
-  if (simplify)
-    #:(reducedSystem = ModelingToolkit.dae_index_lowering(firstOrderSystem))
-    #TODO: Report issue when variables are removed from events
-    #ModelingToolkit.dae_index_lowering(firstOrderSystem)
-    #:(reducedSystem = ModelingToolkit.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true))
-    :(reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true))
+function performStructuralSimplify(simplify; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing)::Expr
+  local simplifyExpr = :(reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true))
+  if observedFilter === nothing || isempty(observedFilter)
+    return simplifyExpr
+  end
+  #= Embed the observed filter patterns into the generated code.
+     After structural_simplify, filter the observed equations to keep only
+     those whose LHS variable name matches at least one pattern. =#
+  local patternStrings = if observedFilter isa Vector{Regex}
+    [p.pattern for p in observedFilter]
   else
-    :(reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true))
-    #:(reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true))
-    #:(reducedSystem = firstOrderSystem)
+    observedFilter
+  end
+  return quote
+    $simplifyExpr
+    local _obsPatterns = [Regex(p) for p in $(patternStrings)]
+    local _allObs = ModelingToolkit.observed(reducedSystem)
+    local _nBefore = length(_allObs)
+    local _filteredObs = filter(_allObs) do eq
+      local _varName = string(eq.lhs)
+      any(p -> occursin(p, _varName), _obsPatterns)
+    end
+    if length(_filteredObs) < _nBefore
+      @info "observedFilter: kept $(length(_filteredObs)) of $(_nBefore) MTK observed equations"
+      reducedSystem = Setfield.set(reducedSystem, Setfield.PropertyLens{:observed}(), _filteredObs)
+    end
   end
 end
 
@@ -1236,11 +1334,20 @@ They should be added as continuous events for continous variables.
 TODO:
 Clearer seperation of discrete and non discrete if equations
 """
-function odeSystemWithEvents(hasEvents, modelName)
-  if hasEvents
+function odeSystemWithEvents(hasEvents, modelName; hasObserved = false)
+  if hasEvents && hasObserved
+    :(ODESystem(eqs, t, vars, parameters;
+              name=:($(Symbol($modelName))),
+              continuous_events = events, guesses = initialValues,
+              observed = observedEqs))
+  elseif hasEvents
     :(ODESystem(eqs, t, vars, parameters;
               name=:($(Symbol($modelName))),
               continuous_events = events, guesses = initialValues))
+  elseif hasObserved
+    :(ODESystem(eqs, t, vars, parameters;
+              name=:($(Symbol($modelName))), guesses = initialValues,
+              observed = observedEqs))
   else
     :(ODESystem(eqs, t, vars, parameters;
               name=:($(Symbol($modelName))), guesses = initialValues))
@@ -1619,4 +1726,68 @@ function flattenRecordCallArg(arg::DAE.Exp, simCode, hashTable; varPrefix::Strin
     end
     _ => return Symbol[]
   end
+end
+
+"""
+  Extract common hvcat subexpressions from a list of equation Exprs.
+  Returns (modifiedEquations, preambleAssignments) where preamble contains
+  local variable assignments for deduplicated hvcat calls.
+"""
+function extractCommonHvcats(equations::Vector)
+  local allHvcats = Dict{String, Int}()
+  local hvcatExprs = Dict{String, Expr}()
+  for eq in equations
+    local found = Dict{String, Bool}()
+    _collectHvcats!(eq, allHvcats, hvcatExprs, found)
+  end
+  local duplicates = filter(p -> p.second >= 2, allHvcats)
+  if isempty(duplicates)
+    return equations, Expr[]
+  end
+  local replacements = Dict{String, Symbol}()
+  local preamble = Expr[]
+  local idx = 0
+  for (key, _) in duplicates
+    local varName = Symbol("_hv_", idx)
+    replacements[key] = varName
+    push!(preamble, :(local $varName = $(hvcatExprs[key])))
+    idx += 1
+  end
+  local modifiedEqs = [_replaceHvcats(deepcopy(eq), replacements) for eq in equations]
+  return modifiedEqs, preamble
+end
+
+function _collectHvcats!(expr, counts::Dict{String,Int}, exprs::Dict{String,Expr}, found::Dict{String,Bool})
+  if !(expr isa Expr)
+    return
+  end
+  if expr.head == :call && length(expr.args) >= 1 && expr.args[1] == :hvcat
+    local key = string(expr)
+    if !haskey(found, key)
+      found[key] = true
+      counts[key] = get(counts, key, 0) + 1
+      if !haskey(exprs, key)
+        exprs[key] = expr
+      end
+    end
+  end
+  for arg in expr.args
+    _collectHvcats!(arg, counts, exprs, found)
+  end
+end
+
+function _replaceHvcats(expr, replacements::Dict{String,Symbol})
+  if !(expr isa Expr)
+    return expr
+  end
+  if expr.head == :call && length(expr.args) >= 1 && expr.args[1] == :hvcat
+    local key = string(expr)
+    if haskey(replacements, key)
+      return replacements[key]
+    end
+  end
+  for i in eachindex(expr.args)
+    expr.args[i] = _replaceHvcats(expr.args[i], replacements)
+  end
+  return expr
 end

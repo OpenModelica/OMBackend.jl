@@ -672,3 +672,1443 @@ function makeDummyResidualEquation(equationSystemName::String, idx::Int = 1)
     BDAE.EQ_ATTR_DEFAULT_DYNAMIC,
   )
 end
+
+"""
+    buildBaseNameIndex(ht::OrderedDict{String, Tuple{Integer, SimVar}})
+
+Build a reverse index from base variable names (without subscripts) to all
+subscripted full names in the hash table. For example, if the HT contains
+"world_x[1]" and "world_x[2]", the result maps "world_x" => ["world_x[1]", "world_x[2]"].
+This handles the ASUB case where `getAllCrefs` extracts a base CREF without subscripts.
+"""
+function buildBaseNameIndex(ht::OrderedDict{String, Tuple{Integer, SimVar}})::Dict{String, Vector{String}}
+  local index = Dict{String, Vector{String}}()
+  for (varName, _) in ht
+    local bn = replace(varName, r"\[.*" => "")
+    if bn != varName
+      if !haskey(index, bn)
+        index[bn] = String[]
+      end
+      push!(index[bn], varName)
+    end
+  end
+  return index
+end
+
+"""
+    collectEquationVarNames(exp::DAE.Exp,
+                            ht::OrderedDict{String, Tuple{Integer, SimVar}},
+                            baseNameToFullNames::Dict{String, Vector{String}})
+
+Extract all variable names referenced by a DAE expression, using the robust
+`Util.getAllCrefs` traversal (via `traverseExpTopDown`). Falls back to base-name
+matching for ASUB-wrapped CREFs where subscripts are separated from the CREF.
+
+Returns a Set{String} of variable names that exist in the HT.
+"""
+function collectEquationVarNames(exp::DAE.Exp,
+                                 ht::OrderedDict{String, Tuple{Integer, SimVar}},
+                                 baseNameToFullNames::Dict{String, Vector{String}})::Set{String}
+  local crefs::List{DAE.ComponentRef} = Util.getAllCrefs(exp)
+  local names = Set{String}()
+  for cr in crefs
+    local name = DAE_identifierToString(cr)
+    if haskey(ht, name)
+      push!(names, name)
+    else
+      #= Base name fallback: the CREF may come from inside an ASUB expression,
+         missing its subscripts. Match all subscripted variants conservatively. =#
+      local bn = replace(name, r"\[.*" => "")
+      if bn != name && haskey(ht, bn)
+        #= The CREF itself has partial subscripts; try the full name and base =#
+        push!(names, bn)
+      end
+      local lookupKey = haskey(baseNameToFullNames, name) ? name : bn
+      if haskey(baseNameToFullNames, lookupKey)
+        for fullName in baseNameToFullNames[lookupKey]
+          push!(names, fullName)
+        end
+      end
+    end
+  end
+  return names
+end
+
+"""
+    rebuildMatchOrder(simCode::SIM_CODE)
+
+Rebuild a fresh bipartite matching from the current equations and variables.
+This is needed when the original matchOrder is stale (e.g. after const-prop
+and alias-elim have removed equations and variables).
+
+Returns `(matchOrder::Vector{Int}, nameToMatchIdx::Dict{String,Int}, matchIdxToName::Dict{Int,String})`
+where `matchOrder[varMatchIdx] = eqIdx` (0 = unmatched).
+"""
+function rebuildMatchOrder(simCode::SIM_CODE)
+  local ht = simCode.stringToSimVarHT
+  local resEqs = simCode.residualEquations
+  local nEqs = length(resEqs)
+  #= Collect unknown variables (those that participate in matching) =#
+  local nameToMatchIdx = Dict{String, Int}()
+  local matchIdxToName = Dict{Int, String}()
+  local matchIdx = 0
+  for (varName, (_idx, sv)) in ht
+    local isUnknown = @match sv.varKind begin
+      STATE(__) => true
+      STATE_DERIVATIVE(__) => true
+      ALG_VARIABLE(__) => true
+      SimulationCode.ARRAY(__) => true
+      OCC_VARIABLE(__) => true
+      DISCRETE(__) => true
+      _ => false
+    end
+    if isUnknown
+      matchIdx += 1
+      nameToMatchIdx[varName] = matchIdx
+      matchIdxToName[matchIdx] = varName
+    end
+  end
+  local nVars = matchIdx
+  #= Build the base name index for robust CREF extraction =#
+  local baseNameToFullNames = buildBaseNameIndex(ht)
+  #= Build bipartite adjacency: for each equation, which variable match indices does it reference? =#
+  local eqVarMapping = DataStructures.OrderedDict{String, Vector{Int}}()
+  for eqI in 1:nEqs
+    local refs = collectEquationVarNames(resEqs[eqI].exp, ht, baseNameToFullNames)
+    local indices = Int[]
+    for refName in refs
+      if haskey(nameToMatchIdx, refName)
+        push!(indices, nameToMatchIdx[refName])
+      end
+    end
+    eqVarMapping["e$(eqI)"] = sort(unique(indices))
+  end
+  #= The matching algorithm requires a square system (n used for both eq loop
+     and assign array). For over-determined systems (nVars > nEqs), pad with
+     dummy empty equations so the algorithm sees a square system. The dummy
+     equations will remain unmatched. For under-determined systems (nEqs > nVars),
+     skip since we cannot produce a valid matching. =#
+  if nEqs > nVars
+    @info "rebuildMatchOrder: under-determined system ($nEqs equations, $nVars unknowns), skipping"
+    return (Int[], nameToMatchIdx, matchIdxToName)
+  end
+  local nMatch = nVars
+  if nVars > nEqs
+    for dummyI in (nEqs + 1):nVars
+      eqVarMapping["e$(dummyI)"] = Int[]
+    end
+  end
+  local matchOrder::Vector{Int}
+  try
+    local (_isSingular, mo) = GraphAlgorithms.matching(eqVarMapping, nMatch)
+    matchOrder = mo
+  catch e
+    @info "rebuildMatchOrder: matching failed, skipping DCE" exception=(e, catch_backtrace())
+    return (Int[], nameToMatchIdx, matchIdxToName)
+  end
+  local nMatched = count(>(0), matchOrder)
+  @info "rebuildMatchOrder: $nEqs equations, $nVars unknowns, $nMatched matched"
+  return (matchOrder, nameToMatchIdx, matchIdxToName)
+end
+
+"""
+    identifyOutputOnlyVariables(simCode::SIM_CODE)
+
+Identify variables and equations that do not influence the dynamic states.
+Performs a backward reachability analysis from state and state-derivative equations
+through the causalized equation dependency graph.
+
+Returns `(outputOnlyVarNames::Set{String}, outputOnlyEqIndices::Set{Int})`.
+Variables in the returned set are purely "output" (they can be computed from states
+but do not feed back into any state derivative).
+"""
+#= Recursively collect all CREF variable names referenced in a DAE expression. =#
+function collectCrefNames!(names::Set{String}, @nospecialize(exp))
+  @match exp begin
+    DAE.CREF(cr, _) => begin
+      push!(names, DAE_identifierToString(cr))
+    end
+    DAE.BINARY(exp1 = e1, exp2 = e2) => begin
+      collectCrefNames!(names, e1)
+      collectCrefNames!(names, e2)
+    end
+    DAE.UNARY(exp = e1) => collectCrefNames!(names, e1)
+    DAE.LUNARY(exp = e1) => collectCrefNames!(names, e1)
+    DAE.LBINARY(exp1 = e1, exp2 = e2) => begin
+      collectCrefNames!(names, e1)
+      collectCrefNames!(names, e2)
+    end
+    DAE.CALL(expLst = args) => begin
+      for arg in args
+        collectCrefNames!(names, arg)
+      end
+    end
+    DAE.IFEXP(expCond = c, expThen = t, expElse = e) => begin
+      collectCrefNames!(names, c)
+      collectCrefNames!(names, t)
+      collectCrefNames!(names, e)
+    end
+    DAE.ARRAY(array = lst) => begin
+      for e in lst
+        collectCrefNames!(names, e)
+      end
+    end
+    DAE.ASUB(exp = e, sub = subs) => begin
+      #= When ASUB wraps a CREF with constant integer subscripts, reconstruct the
+         subscripted name (e.g. "R_T[1][1]") to match the hash table key format.
+         Without this, the BFS use-def chain is broken: collectCrefNames collects
+         the base name "R_T" but the hash table has "R_T[1][1]". =#
+      local asubHandled = false
+      @match e begin
+        DAE.CREF(cr, _) => begin
+          local baseName = DAE_identifierToString(cr)
+          local allConst = true
+          local subscriptStr = ""
+          for s in subs
+            @match s begin
+              DAE.ICONST(i) => begin subscriptStr *= string("[", i, "]") end
+              _ => begin allConst = false end
+            end
+          end
+          if allConst && !isempty(subscriptStr)
+            push!(names, string(baseName, subscriptStr))
+          end
+          push!(names, baseName)
+          asubHandled = true
+        end
+        _ => ()
+      end
+      if !asubHandled
+        collectCrefNames!(names, e)
+      end
+      for s in subs
+        collectCrefNames!(names, s)
+      end
+    end
+    DAE.RELATION(exp1 = e1, exp2 = e2) => begin
+      collectCrefNames!(names, e1)
+      collectCrefNames!(names, e2)
+    end
+    DAE.CAST(exp = e) => collectCrefNames!(names, e)
+    DAE.TSUB(exp = e) => collectCrefNames!(names, e)
+    DAE.RSUB(exp = e) => collectCrefNames!(names, e)
+    DAE.REDUCTION(expr = e, iterators = iters) => begin
+      collectCrefNames!(names, e)
+      for it in iters
+        @match it begin
+          DAE.REDUCTIONITER(exp = guardExp) => collectCrefNames!(names, guardExp)
+          _ => ()
+        end
+      end
+    end
+    _ => ()
+  end
+  return nothing
+end
+
+"""
+    identifyOutputOnlyVariables(simCode::SIM_CODE,
+                                matchOrder::Vector{Int},
+                                matchIdxToName::Dict{Int,String})
+
+Identify variables and equations that do not influence the dynamic states.
+Uses a fresh bipartite matching and robust CREF extraction via `traverseExpTopDown`.
+
+The BFS seeds from equations matched to essential variables (STATE, STATE_DERIVATIVE,
+DISCRETE, OCC, irreducible). It propagates backward through the use-def chain: for
+each essential equation, all variables it references are marked essential, and the
+equations that PRODUCE those variables (via matchOrder) are enqueued.
+
+Returns `(outputOnlyVarNames, outputOnlyEqIndices, eqRefs)`.
+"""
+function identifyOutputOnlyVariables(simCode::SIM_CODE,
+                                     matchOrder::Vector{Int},
+                                     matchIdxToName::Dict{Int,String})
+  local ht = simCode.stringToSimVarHT
+  local resEqs = simCode.residualEquations
+  local nEqs = length(resEqs)
+  #= Build the base name index for robust CREF extraction =#
+  local baseNameToFullNames = buildBaseNameIndex(ht)
+  #= Build expression-level dependency: for each equation, which variable names does it reference? =#
+  local eqRefs = Vector{Set{String}}(undef, nEqs)
+  for i in 1:nEqs
+    eqRefs[i] = collectEquationVarNames(resEqs[i].exp, ht, baseNameToFullNames)
+  end
+  #= Build varName -> equation index that solves it (via fresh matchOrder).
+     matchOrder[matchIdx] = eqIdx; matchIdxToName[matchIdx] = varName =#
+  local varNameToEq = Dict{String, Int}()
+  local baseNameToEqs = Dict{String, Vector{Int}}()
+  for (matchIdx, eqIdx) in enumerate(matchOrder)
+    if eqIdx > 0 && haskey(matchIdxToName, matchIdx)
+      local vn = matchIdxToName[matchIdx]
+      varNameToEq[vn] = eqIdx
+      local bn = replace(vn, r"\[.*" => "")
+      if bn != vn
+        if !haskey(baseNameToEqs, bn)
+          baseNameToEqs[bn] = Int[]
+        end
+        push!(baseNameToEqs[bn], eqIdx)
+      end
+    end
+  end
+  #= Find seed equations: those matched to essential variable kinds =#
+  local seedEqs = Set{Int}()
+  for (varName, (_idx, sv)) in ht
+    local isEssentialKind = @match sv.varKind begin
+      STATE(__) => true
+      STATE_DERIVATIVE(__) => true
+      OCC_VARIABLE(__) => true
+      DISCRETE(__) => true
+      _ => false
+    end
+    if isEssentialKind && haskey(varNameToEq, varName)
+      push!(seedEqs, varNameToEq[varName])
+    end
+  end
+  #= Add equations for irreducible variables =#
+  for irName in simCode.irreductableVariables
+    if haskey(varNameToEq, irName)
+      push!(seedEqs, varNameToEq[irName])
+    end
+  end
+  #= Protect alias representative variables from elimination.
+     These variables appear in observed equations generated from the aliasMap.
+     If they are eliminated, the observed equations will reference missing unknowns. =#
+  for alias in simCode.aliasMap
+    if haskey(varNameToEq, alias.representativeName)
+      push!(seedEqs, varNameToEq[alias.representativeName])
+    end
+  end
+  #= Classify unmatched equations: seed those referencing unknowns =#
+  local matchedEqs = Set{Int}()
+  for (matchIdx, eqIdx) in enumerate(matchOrder)
+    if eqIdx > 0
+      push!(matchedEqs, eqIdx)
+    end
+  end
+  local unknownNames = Set{String}()
+  for (vn, (_idx, sv)) in ht
+    local isUnknown = @match sv.varKind begin
+      STATE(__) => true
+      STATE_DERIVATIVE(__) => true
+      ALG_VARIABLE(__) => true
+      SimulationCode.ARRAY(__) => true
+      OCC_VARIABLE(__) => true
+      DISCRETE(__) => true
+      _ => false
+    end
+    if isUnknown
+      push!(unknownNames, vn)
+    end
+  end
+  for eqIdx in 1:nEqs
+    if !(eqIdx in matchedEqs)
+      #= Check if this unmatched equation references any unknowns =#
+      local refsUnknown = false
+      for refName in eqRefs[eqIdx]
+        if refName in unknownNames
+          refsUnknown = true
+          break
+        end
+      end
+      if refsUnknown
+        push!(seedEqs, eqIdx)
+      end
+    end
+  end
+  #= BFS: from seed equations, follow the use-def chain backward.
+     For each equation, find all variable names it references. For each referenced
+     variable, find the equation that PRODUCES it (via varNameToEq). Enqueue that. =#
+  local essentialEqs = Set{Int}()
+  local queue = collect(seedEqs)
+  while !isempty(queue)
+    local eqIdx = popfirst!(queue)
+    if eqIdx in essentialEqs
+      continue
+    end
+    push!(essentialEqs, eqIdx)
+    if eqIdx >= 1 && eqIdx <= nEqs
+      for refVarName in eqRefs[eqIdx]
+        #= Exact match =#
+        if haskey(varNameToEq, refVarName)
+          local prodEq = varNameToEq[refVarName]
+          if !(prodEq in essentialEqs)
+            push!(queue, prodEq)
+          end
+        end
+        #= Base name match for array variables =#
+        if haskey(baseNameToEqs, refVarName)
+          for prodEq in baseNameToEqs[refVarName]
+            if !(prodEq in essentialEqs)
+              push!(queue, prodEq)
+            end
+          end
+        end
+      end
+    end
+  end
+  #= Identify output-only equations and their matched variables =#
+  local outputOnlyEqIndices = Set{Int}()
+  local outputOnlyVarNames = Set{String}()
+  local eqToMatchIdx = Dict{Int, Int}()
+  for (matchIdx, eqIdx) in enumerate(matchOrder)
+    if eqIdx > 0
+      eqToMatchIdx[eqIdx] = matchIdx
+    end
+  end
+  for eqIdx in 1:nEqs
+    if !(eqIdx in essentialEqs)
+      push!(outputOnlyEqIndices, eqIdx)
+      if haskey(eqToMatchIdx, eqIdx)
+        local mIdx = eqToMatchIdx[eqIdx]
+        if haskey(matchIdxToName, mIdx)
+          push!(outputOnlyVarNames, matchIdxToName[mIdx])
+        end
+      end
+    end
+  end
+  return (outputOnlyVarNames, outputOnlyEqIndices, eqRefs)
+end
+
+"""
+    eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOptions)
+
+Remove output-only variables and their defining equations from the SimCode.
+Rebuilds a fresh bipartite matching from the current (post-optimization) equation
+and variable sets, then performs backward reachability to identify output-only
+equation-variable pairs. Only eliminates ALG_VARIABLE or ARRAY unknowns,
+preserving the equation-unknown balance that MTK requires.
+
+The eliminated equations and variable names are stored in `simCode.eliminatedEquations`
+and `simCode.eliminatedVariables` for later reconstruction (e.g. 3D visualization).
+
+Returns the modified SIM_CODE (uses @assign for immutable struct mutation).
+"""
+function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOptions)
+  #= Guard: skip for VSS or multi-mode models =#
+  if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
+    @info "eliminateNonDynamic: skipping for VSS/multi-mode model"
+    return simCode
+  end
+  #= Rebuild a fresh matching from the current (post-optimization) system =#
+  local (matchOrder, nameToMatchIdx, matchIdxToName) = rebuildMatchOrder(simCode)
+  if isempty(matchOrder)
+    @info "eliminateNonDynamic: matching failed or system not square, skipping"
+    return simCode
+  end
+  #= Identify output-only equations and variables using the fresh matching =#
+  local (outputOnlyVarNames, outputOnlyEqIndices, eqRefs) =
+    identifyOutputOnlyVariables(simCode, matchOrder, matchIdxToName)
+  if isempty(outputOnlyEqIndices)
+    @info "eliminateNonDynamic: no output-only equations found"
+    return simCode
+  end
+  #= Build inverse matching: equation index -> match index =#
+  local ht = simCode.stringToSimVarHT
+  local eqToMatchIdx = Dict{Int, Int}()
+  for (mIdx, eqIdx) in enumerate(matchOrder)
+    if eqIdx > 0
+      eqToMatchIdx[eqIdx] = mIdx
+    end
+  end
+  #= Only eliminate output-only equation-variable PAIRS where the matched variable
+     is ALG_VARIABLE or ARRAY. This preserves equation-unknown balance. =#
+  local eqsToEliminate = Set{Int}()
+  local varsToRemove = Set{String}()
+  local nSkippedNonAlg = 0
+  local nSkippedUnmatched = 0
+  for eqIdx in outputOnlyEqIndices
+    if !haskey(eqToMatchIdx, eqIdx)
+      nSkippedUnmatched += 1
+      continue
+    end
+    local mIdx = eqToMatchIdx[eqIdx]
+    if !haskey(matchIdxToName, mIdx)
+      nSkippedUnmatched += 1
+      continue
+    end
+    local vn = matchIdxToName[mIdx]
+    if !haskey(ht, vn)
+      nSkippedUnmatched += 1
+      continue
+    end
+    local (_, sv) = ht[vn]
+    local isEliminable = @match sv.varKind begin
+      ALG_VARIABLE(__) => true
+      SimulationCode.ARRAY(__) => true
+      _ => false
+    end
+    if isEliminable
+      push!(eqsToEliminate, eqIdx)
+      push!(varsToRemove, vn)
+    else
+      nSkippedNonAlg += 1
+    end
+  end
+  if isempty(eqsToEliminate)
+    @info "eliminateNonDynamic: no eliminable equation-variable pairs found"
+    return simCode
+  end
+  #= Safety check: verify no surviving equation references an eliminated variable.
+     Build reverse index: variable name -> equations that reference it. =#
+  local resEqs = simCode.residualEquations
+  local nEqs = length(resEqs)
+  local varNameToRefEqs = Dict{String, Set{Int}}()
+  for eqIdx in 1:nEqs
+    for refName in eqRefs[eqIdx]
+      if !haskey(varNameToRefEqs, refName)
+        varNameToRefEqs[refName] = Set{Int}()
+      end
+      push!(varNameToRefEqs[refName], eqIdx)
+    end
+  end
+  local rescuedVars = Set{String}()
+  for vn in varsToRemove
+    local referencedBySurvivor = false
+    if haskey(varNameToRefEqs, vn)
+      for refEqIdx in varNameToRefEqs[vn]
+        if !(refEqIdx in eqsToEliminate)
+          referencedBySurvivor = true
+          break
+        end
+      end
+    end
+    #= Also check base name =#
+    if !referencedBySurvivor
+      local bn = replace(vn, r"\[.*" => "")
+      if bn != vn && haskey(varNameToRefEqs, bn)
+        for refEqIdx in varNameToRefEqs[bn]
+          if !(refEqIdx in eqsToEliminate)
+            referencedBySurvivor = true
+            break
+          end
+        end
+      end
+    end
+    if referencedBySurvivor
+      push!(rescuedVars, vn)
+    end
+  end
+  local nRescued = length(rescuedVars)
+  if !isempty(rescuedVars)
+    for vn in rescuedVars
+      delete!(varsToRemove, vn)
+      if haskey(nameToMatchIdx, vn)
+        local rescuedMIdx = nameToMatchIdx[vn]
+        local rescuedEqIdx = matchOrder[rescuedMIdx]
+        if rescuedEqIdx > 0
+          delete!(eqsToEliminate, rescuedEqIdx)
+        end
+      end
+    end
+  end
+  #= Filter residualEquations: remove eliminated equations =#
+  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  local elimEqs = BDAE.RESIDUAL_EQUATION[]
+  sizehint!(newResEqs, length(resEqs) - length(eqsToEliminate))
+  for (i, eq) in enumerate(resEqs)
+    if i in eqsToEliminate
+      push!(elimEqs, eq)
+    else
+      push!(newResEqs, eq)
+    end
+  end
+  #= Filter stringToSimVarHT: remove eliminated variables =#
+  local newHT = copy(ht)
+  for varName in varsToRemove
+    delete!(newHT, varName)
+  end
+  @info "eliminateNonDynamic: eliminated $(length(eqsToEliminate)) eq-var pairs, $(length(varsToRemove)) variables removed (rescued: $nRescued, skipped: $nSkippedNonAlg non-algebraic, $nSkippedUnmatched unmatched). $(length(newResEqs)) equations, $(length(newHT)) variables remain"
+  @BACKEND_LOGGING begin
+    local buf = IOBuffer()
+    println(buf, "=== ELIMINATION DEBUG ===")
+    println(buf, "Removed variables ($(length(varsToRemove))):")
+    for vn in sort(collect(varsToRemove))
+      println(buf, "  ", vn)
+    end
+    println(buf, "Rescued variables ($nRescued):")
+    for vn in sort(collect(rescuedVars))
+      println(buf, "  ", vn)
+    end
+    println(buf, "Eliminated equation indices: ", sort(collect(eqsToEliminate)))
+    println(buf, "=== END DEBUG ===")
+    OMBackend.debugWrite("elimination_debug.log", String(take!(buf)))
+  end
+  @assign simCode.residualEquations = newResEqs
+  @assign simCode.stringToSimVarHT = newHT
+  @assign simCode.eliminatedEquations = elimEqs
+  @assign simCode.eliminatedVariables = collect(varsToRemove)
+  return simCode
+end
+
+"""
+    buildAsubName(baseName::String, subs::Vector)::String
+
+Reconstruct a subscripted variable name from an ASUB expression.
+Turns base name "a" with subscripts [1, 2] into "a[1][2]" to match hash table keys.
+"""
+function buildAsubName(baseName::String, subs)::String
+  buf = baseName
+  for s in subs
+    @match s begin
+      DAE.ICONST(i) => begin buf *= string("[", i, "]") end
+      _ => return ""  #= Non-constant subscript: cannot resolve statically =#
+    end
+  end
+  return buf
+end
+
+"""
+    extractCrefName(exp::DAE.Exp)
+
+Extract the variable name from a CREF or ASUB(CREF, ...) expression.
+Returns `(name::String, cref::DAE.ComponentRef, ty::DAE.Type)` or `nothing`
+if the expression is not a simple variable reference.
+"""
+function extractCrefName(@nospecialize(exp))
+  @match exp begin
+    DAE.CREF(cr, ty) => begin
+      return (DAE_identifierToString(cr), cr, ty)
+    end
+    #= ASUB-wrapped CREFs are skipped for alias detection.
+       The ASUB wraps a base CREF with subscripts, but the CREF itself does not
+       carry the subscripts. Eliminating an ASUB alias would replace the base CREF
+       in all equations (affecting all subscripts), breaking the equation balance.
+       These equations are better handled by MTK structural_simplify. =#
+    _ => return nothing
+  end
+end
+
+"""
+    isUnknownVarKind(varKind::SimVarType)::Bool
+
+Check if a variable kind represents an unknown (not a parameter or constant).
+Only unknowns participate in the equation-unknown balance.
+"""
+function isUnknownVarKind(@nospecialize(varKind::SimVarType))::Bool
+  @match varKind begin
+    STATE(__) => true
+    STATE_DERIVATIVE(__) => true
+    ALG_VARIABLE(__) => true
+    ARRAY(__) => true
+    OCC_VARIABLE(__) => true
+    DISCRETE(__) => true
+    _ => false
+  end
+end
+
+"""
+    varKindPriority(varKind::SimVarType)::Int
+
+Return priority of a variable kind for alias representative selection.
+Higher priority variables are preferred as representatives (never eliminated).
+"""
+function varKindPriority(@nospecialize(varKind::SimVarType))::Int
+  @match varKind begin
+    STATE(__) => 100
+    STATE_DERIVATIVE(__) => 90
+    DISCRETE(__) => 80
+    OCC_VARIABLE(__) => 70
+    ALG_VARIABLE(__) => 20
+    ARRAY(__) => 10
+    _ => 0
+  end
+end
+
+"""
+    isRealValued(ty::DAE.Type)::Bool
+
+Check if a DAE type represents a Real-valued (floating point) variable.
+Only Real-valued variables are eligible for alias elimination.
+"""
+function isRealValued(@nospecialize(ty))::Bool
+  @match ty begin
+    DAE.T_REAL(__) => true
+    DAE.T_ARRAY(ty = innerTy) => isRealValued(innerTy)
+    _ => false
+  end
+end
+
+"""
+    detectConstantEquation(exp::DAE.Exp, ht)
+
+Detect if a residual equation represents a constant propagation opportunity
+or a trivially true equation between parameters.
+
+Returns:
+  - `(:trivial, nothing)` if both sides are parameters (equation is tautological)
+  - `(:constprop, (unknownName, paramName, negated, paramCref, paramTy))` if one
+    side is an unknown and the other is a parameter
+  - `nothing` if the equation does not match any constant pattern
+"""
+function detectConstantEquation(@nospecialize(exp), ht)
+  @match exp begin
+    DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
+      local isSub = @match op begin
+        DAE.SUB(__) => true
+        _ => false
+      end
+      local isAdd = @match op begin
+        DAE.ADD(__) => true
+        _ => false
+      end
+      if !isSub && !isAdd
+        return nothing
+      end
+      local r1 = extractCrefName(e1)
+      local r2 = extractCrefName(e2)
+      if r1 === nothing || r2 === nothing
+        return nothing
+      end
+      local (n1, cr1, t1) = r1
+      local (n2, cr2, t2) = r2
+      if !haskey(ht, n1) || !haskey(ht, n2)
+        return nothing
+      end
+      local (_, sv1) = ht[n1]
+      local (_, sv2) = ht[n2]
+      local isUnk1 = isUnknownVarKind(sv1.varKind)
+      local isUnk2 = isUnknownVarKind(sv2.varKind)
+      local negated = isAdd
+
+      if !isUnk1 && !isUnk2
+        #= Both parameters: trivial equation, always satisfied =#
+        return (:trivial, nothing)
+      elseif isUnk1 && !isUnk2
+        #= n1 is unknown, n2 is parameter: unknown = (+/-)param =#
+        return (:constprop, (n1, n2, negated, cr2, t2))
+      elseif !isUnk1 && isUnk2
+        #= n1 is parameter, n2 is unknown: unknown = (+/-)param =#
+        return (:constprop, (n2, n1, negated, cr1, t1))
+      else
+        #= Both unknowns: handled by alias elimination, not us =#
+        return nothing
+      end
+    end
+    _ => return nothing
+  end
+end
+
+"""
+    propagateConstants(simCode::SIM_CODE)::SIM_CODE
+
+Constant propagation pass. Detects equations of the form `unknown = parameter`
+and substitutes the parameter CREF for the unknown CREF in all equations.
+Also removes trivially true `parameter = parameter` equations.
+
+This pass runs BEFORE alias elimination because removing unknowns may reveal
+new alias opportunities.
+
+Preserves equation-unknown balance: each constant propagation removes 1 equation
+and 1 unknown. Trivial equation removal only removes equations that have no
+unknowns (no balance impact).
+"""
+function propagateConstants(simCode::SIM_CODE)
+  #= Guard: skip for VSS or multi-mode models =#
+  if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
+    return simCode
+  end
+
+  local ht = simCode.stringToSimVarHT
+  local resEqs = simCode.residualEquations
+  local nEqs = length(resEqs)
+  local sharedVarSet = Set{String}(simCode.sharedVariables)
+  local irreducibleSet = Set{String}(simCode.irreductableVariables)
+
+  #= Phase 1: Detect constant equations.
+     First collect all base array names referenced in equations so we can skip
+     eliminating scalar elements whose base array is still used (e.g. as a
+     function call argument). =#
+  local allBaseNames = Set{String}()
+  for eq in resEqs
+    local eqNames = Set{String}()
+    collectCrefNames!(eqNames, eq.exp)
+    for n in eqNames
+      if !occursin('[', n)
+        push!(allBaseNames, n)
+      end
+    end
+  end
+
+  if !isempty(allBaseNames)
+    @info "constantPropagation: base array names referenced" allBaseNames=collect(allBaseNames)
+  end
+
+  local constMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
+  local constEqIndices = Set{Int}()
+  local trivialEqIndices = Set{Int}()
+
+  local changed = true
+  while changed
+    changed = false
+    for (i, eq) in enumerate(resEqs)
+      if i in constEqIndices || i in trivialEqIndices
+        continue
+      end
+      local result = detectConstantEquation(eq.exp, ht)
+      if result === nothing
+        continue
+      end
+      local (kind, data) = result
+      if kind == :trivial
+        push!(trivialEqIndices, i)
+        changed = true
+      elseif kind == :constprop
+        local (unknownName, paramName, negated, paramCref, paramTy) = data
+        #= Skip shared or irreducible unknowns =#
+        if unknownName in sharedVarSet || unknownName in irreducibleSet
+          continue
+        end
+        #= Skip if the unknown is a subscripted array element whose base name
+           is still referenced as a whole array (e.g. in function call arguments).
+           Eliminating R_T[1][1] while R_T is passed to resolve2() would break
+           code generation which looks up individual elements from the HT. =#
+        local bracketIdx = findfirst('[', unknownName)
+        if bracketIdx !== nothing
+          local baseName = unknownName[1:bracketIdx-1]
+          if baseName in allBaseNames
+            continue
+          end
+        end
+        if !haskey(constMap, unknownName)
+          constMap[unknownName] = (paramName, negated, paramCref, paramTy)
+          push!(constEqIndices, i)
+          changed = true
+        end
+      end
+    end
+    if changed && !isempty(constMap)
+      #= Apply current substitutions to all remaining equation expressions
+         so that chained constant patterns are revealed in the next iteration =#
+      local updatedEqs = BDAE.RESIDUAL_EQUATION[]
+      for (i, eq) in enumerate(resEqs)
+        local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
+        push!(updatedEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+      end
+      resEqs = updatedEqs
+    end
+  end
+
+  local nConst = length(constEqIndices)
+  local nTrivial = length(trivialEqIndices)
+  if nConst == 0 && nTrivial == 0
+    @info "constantPropagation: no constant equations found"
+    return simCode
+  end
+
+  @info "constantPropagation: found $nConst unknown=param equations and $nTrivial trivial param=param equations"
+
+  #= Phase 2: Build final equation list with substitutions applied =#
+  local allRemoved = union(constEqIndices, trivialEqIndices)
+  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  local elimEqs = BDAE.RESIDUAL_EQUATION[]
+  sizehint!(newResEqs, nEqs - length(allRemoved))
+
+  for (i, eq) in enumerate(simCode.residualEquations)
+    if i in allRemoved
+      push!(elimEqs, eq)
+    else
+      local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
+      push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+    end
+  end
+
+  #= Substitute in if-equation branches =#
+  local newIfEqs = IF_EQUATION[]
+  for ifEq in simCode.ifEquations
+    local newBranches = BRANCH[]
+    for branch in ifEq.branches
+      local newBranchEqs = BDAE.RESIDUAL_EQUATION[]
+      for brEq in branch.residualEquations
+        local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteAliasCref, constMap)
+        push!(newBranchEqs, BDAE.RESIDUAL_EQUATION(newBrExp, brEq.source, brEq.attr))
+      end
+      local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, constMap)
+      push!(newBranches, BRANCH(newCond, newBranchEqs,
+                                branch.identifier, branch.targets, branch.isSingular,
+                                branch.matchOrder, branch.equationGraph, branch.sccs,
+                                branch.stringToSimVarHT))
+    end
+    push!(newIfEqs, IF_EQUATION(newBranches))
+  end
+
+  #= Substitute in when-equation conditions =#
+  local newWhenEqs = BDAE.WHEN_EQUATION[]
+  for whenEq in simCode.whenEquations
+    local innerWhen = whenEq.whenEquation
+    local (newCond, _) = Util.traverseExpTopDown(innerWhen.condition, substituteAliasCref, constMap)
+    @assign innerWhen.condition = newCond
+    @assign whenEq.whenEquation = innerWhen
+    push!(newWhenEqs, whenEq)
+  end
+
+  #= Substitute in initial equations =#
+  local newInitEqs = typeof(simCode.initialEquations)()
+  for initEq in simCode.initialEquations
+    if initEq isa BDAE.RESIDUAL_EQUATION
+      local (newInitExp, _) = Util.traverseExpTopDown(initEq.exp, substituteAliasCref, constMap)
+      push!(newInitEqs, BDAE.RESIDUAL_EQUATION(newInitExp, initEq.source, initEq.attr))
+    elseif initEq isa BDAE.EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, constMap)
+      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, constMap)
+      push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
+    else
+      push!(newInitEqs, initEq)
+    end
+  end
+
+  #= Phase 3: Verify and remove eliminated unknowns =#
+  local eliminatedSet = Set{String}(keys(constMap))
+  local allRefNames = Set{String}()
+  for eq in newResEqs
+    collectCrefNames!(allRefNames, eq.exp)
+  end
+  for ifEq in newIfEqs
+    for branch in ifEq.branches
+      for brEq in branch.residualEquations
+        collectCrefNames!(allRefNames, brEq.exp)
+      end
+    end
+  end
+  for initEq in newInitEqs
+    if initEq isa BDAE.RESIDUAL_EQUATION
+      collectCrefNames!(allRefNames, initEq.exp)
+    elseif initEq isa BDAE.EQUATION
+      collectCrefNames!(allRefNames, initEq.lhs)
+      collectCrefNames!(allRefNames, initEq.rhs)
+    end
+  end
+
+  local survivingRefs = Set{String}()
+  for n in allRefNames
+    if n in eliminatedSet
+      push!(survivingRefs, n)
+    end
+  end
+
+  if !isempty(survivingRefs)
+    @warn "constantPropagation: $(length(survivingRefs)) eliminated variables still referenced, keeping them" survivingRefs=collect(survivingRefs)
+  end
+
+  local newHT = copy(ht)
+  local elimVarNames = String[]
+  for (varName, _) in constMap
+    if varName in survivingRefs
+      continue
+    end
+    delete!(newHT, varName)
+    push!(elimVarNames, varName)
+  end
+
+  @info "constantPropagation: eliminated $(length(elimVarNames)) unknowns and $(length(allRemoved)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
+
+  @assign simCode.residualEquations = newResEqs
+  @assign simCode.initialEquations = newInitEqs
+  @assign simCode.stringToSimVarHT = newHT
+  @assign simCode.ifEquations = newIfEqs
+  @assign simCode.whenEquations = newWhenEqs
+  @assign simCode.eliminatedEquations = vcat(simCode.eliminatedEquations, elimEqs)
+  @assign simCode.eliminatedVariables = vcat(simCode.eliminatedVariables, elimVarNames)
+  return simCode
+end
+
+"""
+Union-find: find with path compression.
+"""
+function _ufFind!(parent::Dict{String,String}, x::String)::String
+  if !haskey(parent, x)
+    parent[x] = x
+  end
+  while parent[x] != x
+    parent[x] = parent[parent[x]]
+    x = parent[x]
+  end
+  return x
+end
+
+"""
+Union-find: union two elements. Returns true if they were in different sets (merged),
+false if already in the same set (redundant).
+"""
+function _ufUnion!(parent::Dict{String,String}, a::String, b::String)::Bool
+  local ra = _ufFind!(parent, a)
+  local rb = _ufFind!(parent, b)
+  if ra != rb
+    parent[ra] = rb
+    return true
+  end
+  return false
+end
+
+"""
+    eliminateAliasVariables(simCode::SIM_CODE)::SIM_CODE
+
+Perform alias elimination on the simulation code. Detects equations of the form
+`a - b = 0` (alias) or `a + b = 0` (negated alias), builds connected components
+of alias relationships, selects a representative per component, and substitutes
+all eliminated variables with their representative in all equations.
+
+This pass always runs (not opt-in) and preserves equation-unknown balance because
+each eliminated equation removes exactly one variable.
+
+Skipped for VSS/structural models where eliminated variables might be needed
+in different structural modes.
+"""
+function eliminateAliasVariables(simCode::SIM_CODE)
+  #= Guard: skip for VSS or multi-mode models =#
+  if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
+    @info "aliasElimination: skipped (structural model)"
+    return simCode
+  end
+
+  local ht = simCode.stringToSimVarHT
+  local resEqs = simCode.residualEquations
+  local nEqs = length(resEqs)
+  local sharedVarSet = Set{String}(simCode.sharedVariables)
+  local irreducibleSet = Set{String}(simCode.irreductableVariables)
+
+  #= ===== Step 1: Detect alias equations ===== =#
+  #= Each alias is (name1, name2, negated, eqIdx, cref1, ty1, cref2, ty2) =#
+  local aliasPairs = Tuple{String, String, Bool, Int, DAE.ComponentRef, DAE.Type, DAE.ComponentRef, DAE.Type}[]
+
+  for (i, eq) in enumerate(resEqs)
+    local pair = detectAlias(eq.exp, ht)
+    if pair !== nothing
+      local (n1, n2, neg, cr1, t1, cr2, t2) = pair
+      #= Skip self-loops =#
+      if n1 == n2
+        continue
+      end
+      #= Skip shared variables =#
+      if n1 in sharedVarSet || n2 in sharedVarSet
+        continue
+      end
+      push!(aliasPairs, (n1, n2, neg, i, cr1, t1, cr2, t2))
+    end
+  end
+
+  if isempty(aliasPairs)
+    @info "aliasElimination: no alias equations found"
+    return simCode
+  end
+
+  @info "aliasElimination: detected $(length(aliasPairs)) alias equations"
+
+  #= ===== Step 2: Build alias graph and find connected components via BFS ===== =#
+  #= Adjacency list: varName -> [(neighborName, negated, edgeIdx)] =#
+  local adjList = Dict{String, Vector{Tuple{String, Bool, Int}}}()
+  for (idx, (n1, n2, neg, eqIdx, _, _, _, _)) in enumerate(aliasPairs)
+    if !haskey(adjList, n1)
+      adjList[n1] = Tuple{String, Bool, Int}[]
+    end
+    if !haskey(adjList, n2)
+      adjList[n2] = Tuple{String, Bool, Int}[]
+    end
+    push!(adjList[n1], (n2, neg, idx))
+    push!(adjList[n2], (n1, neg, idx))
+  end
+
+  #= BFS to find connected components with cumulative negation =#
+  #= componentId -> [(varName, negationRelativeToRoot)] =#
+  local visited = Dict{String, Bool}()  #= varName -> negation relative to component root =#
+  local components = Vector{Vector{Tuple{String, Bool}}}()
+  local componentEqs = Vector{Vector{Int}}()  #= equation indices per component =#
+  local usedEdges = Set{Int}()
+
+  for startNode in keys(adjList)
+    if haskey(visited, startNode)
+      continue
+    end
+    local component = Tuple{String, Bool}[]
+    local compEqs = Int[]
+    local queue = [(startNode, false)]  #= (name, negRelToRoot) =#
+    visited[startNode] = false
+    while !isempty(queue)
+      local (node, negFromRoot) = popfirst!(queue)
+      push!(component, (node, negFromRoot))
+      if haskey(adjList, node)
+        for (neighbor, edgeNeg, edgeIdx) in adjList[node]
+          if !(edgeIdx in usedEdges)
+            push!(usedEdges, edgeIdx)
+            push!(compEqs, aliasPairs[edgeIdx][4])  #= equation index =#
+          end
+          if !haskey(visited, neighbor)
+            local neighborNeg = xor(negFromRoot, edgeNeg)
+            visited[neighbor] = neighborNeg
+            push!(queue, (neighbor, neighborNeg))
+          end
+        end
+      end
+    end
+    push!(components, component)
+    push!(componentEqs, compEqs)
+  end
+
+  #= ===== Step 3: Select representative per component ===== =#
+  #= Build alias resolution map and alias entries =#
+  local aliasMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
+  local aliasEntries = AliasEntry[]
+  local aliasEqIndices = Set{Int}()
+
+  #= Build name -> (cref, type) lookup from alias pairs =#
+  local nameToCrefType = Dict{String, Tuple{DAE.ComponentRef, DAE.Type}}()
+  for (n1, n2, _, _, cr1, t1, cr2, t2) in aliasPairs
+    nameToCrefType[n1] = (cr1, t1)
+    nameToCrefType[n2] = (cr2, t2)
+  end
+
+  #= Map equation index -> (n1, n2) for deciding which equations are trivial after substitution =#
+  local eqIdxToNames = Dict{Int, Tuple{String, String}}()
+  for (n1, n2, _, eqIdx, _, _, _, _) in aliasPairs
+    eqIdxToNames[eqIdx] = (n1, n2)
+  end
+
+  for (compIdx, component) in enumerate(components)
+    #= Select representative: highest priority varKind, with ties broken by irreducibility =#
+    local bestName = ""
+    local bestPriority = -1
+    local bestNeg = false
+    for (varName, negFromRoot) in component
+      if !haskey(ht, varName)
+        continue
+      end
+      local (_, sv) = ht[varName]
+      local prio = varKindPriority(sv.varKind)
+      #= Boost priority for irreducible variables =#
+      if varName in irreducibleSet
+        prio += 60
+      end
+      if prio > bestPriority
+        bestPriority = prio
+        bestName = varName
+        bestNeg = negFromRoot
+      end
+    end
+
+    if isempty(bestName)
+      continue
+    end
+
+    #= Get representative CREF and type =#
+    if !haskey(nameToCrefType, bestName)
+      continue
+    end
+    local (repCref, repTy) = nameToCrefType[bestName]
+
+    #= Mark all other variables in this component for elimination.
+       Never eliminate irreducible variables (involved in events). =#
+    for (varName, negFromRoot) in component
+      if varName == bestName
+        continue
+      end
+      if !haskey(ht, varName)
+        continue
+      end
+      if varName in irreducibleSet
+        #= Irreducible variables must not be eliminated; they are referenced
+           by name in start conditions and callback code. =#
+        continue
+      end
+      #= Compute negation: eliminatedVar = (-1)^negated * representative
+         negFromRoot of eliminated XOR negFromRoot of representative =#
+      local negated = xor(negFromRoot, bestNeg)
+      aliasMap[varName] = (bestName, negated, repCref, repTy)
+      push!(aliasEntries, AliasEntry(varName, bestName, negated))
+    end
+
+    #= Mark equations for removal using union-find on surviving variables.
+       Trivial equations (both sides resolve to same variable) are always removed.
+       Among meaningful equations, only keep enough to span the surviving variables
+       (union-find ensures a spanning tree). Redundant equations are removed. =#
+    local ufParent = Dict{String,String}()
+    for eqIdx in componentEqs[compIdx]
+      local (n1, n2) = eqIdxToNames[eqIdx]
+      local r1 = haskey(aliasMap, n1) ? aliasMap[n1][1] : n1
+      local r2 = haskey(aliasMap, n2) ? aliasMap[n2][1] : n2
+      if r1 == r2
+        #= Trivial: both sides resolve to same variable (0 = 0). Remove. =#
+        push!(aliasEqIndices, eqIdx)
+      elseif _ufUnion!(ufParent, r1, r2)
+        #= Non-redundant constraint between surviving variables. Keep. =#
+      else
+        #= Redundant: surviving variables already connected. Remove. =#
+        push!(aliasEqIndices, eqIdx)
+      end
+    end
+  end
+
+  if isempty(aliasMap)
+    @info "aliasElimination: no variables could be eliminated"
+    return simCode
+  end
+
+  #= ===== Step 4: Substitute alias CREFs in all remaining equations ===== =#
+  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  local elimEqs = BDAE.RESIDUAL_EQUATION[]
+  sizehint!(newResEqs, nEqs - length(aliasEqIndices))
+
+  for (i, eq) in enumerate(resEqs)
+    if i in aliasEqIndices
+      push!(elimEqs, eq)
+    else
+      local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
+      push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+    end
+  end
+
+  #= Also substitute in if-equation branches =#
+  local newIfEqs = IF_EQUATION[]
+  for ifEq in simCode.ifEquations
+    local newBranches = BRANCH[]
+    for branch in ifEq.branches
+      local newBranchEqs = BDAE.RESIDUAL_EQUATION[]
+      for brEq in branch.residualEquations
+        local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteAliasCref, aliasMap)
+        push!(newBranchEqs, BDAE.RESIDUAL_EQUATION(newBrExp, brEq.source, brEq.attr))
+      end
+      local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, aliasMap)
+      #= Reconstruct BRANCH with substituted expressions but same structural info =#
+      push!(newBranches, BRANCH(newCond, newBranchEqs,
+                                branch.identifier, branch.targets, branch.isSingular,
+                                branch.matchOrder, branch.equationGraph, branch.sccs,
+                                branch.stringToSimVarHT))
+    end
+    push!(newIfEqs, IF_EQUATION(newBranches))
+  end
+
+  #= When equations: substitute alias CREFs in the inner WhenEquation condition =#
+  local newWhenEqs = BDAE.WHEN_EQUATION[]
+  for whenEq in simCode.whenEquations
+    local innerWhen = whenEq.whenEquation
+    local (newCond, _) = Util.traverseExpTopDown(innerWhen.condition, substituteAliasCref, aliasMap)
+    @assign innerWhen.condition = newCond
+    @assign whenEq.whenEquation = innerWhen
+    push!(newWhenEqs, whenEq)
+  end
+
+  #= Initial equations: substitute alias CREFs.
+     initialEquations may contain EQUATION (lhs/rhs) or RESIDUAL_EQUATION (exp). =#
+  local newInitEqs = typeof(simCode.initialEquations)()
+  for initEq in simCode.initialEquations
+    if initEq isa BDAE.RESIDUAL_EQUATION
+      local (newInitExp, _) = Util.traverseExpTopDown(initEq.exp, substituteAliasCref, aliasMap)
+      push!(newInitEqs, BDAE.RESIDUAL_EQUATION(newInitExp, initEq.source, initEq.attr))
+    elseif initEq isa BDAE.EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, aliasMap)
+      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, aliasMap)
+      push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
+    else
+      push!(newInitEqs, initEq)
+    end
+  end
+
+  #= ===== Step 5: Verify substitution and remove eliminated variables ===== =#
+  #= Collect all CREF names from remaining equations. Any eliminated variable
+     still referenced means the substitution missed it (e.g. unflatten CREF form).
+     Those variables must be kept in the HT to avoid KeyError during code gen. =#
+  local eliminatedSet = Set{String}(keys(aliasMap))
+  local survivingRefs = Set{String}()
+  local allRefNames = Set{String}()
+  for eq in newResEqs
+    collectCrefNames!(allRefNames, eq.exp)
+  end
+  for ifEq in newIfEqs
+    for branch in ifEq.branches
+      for brEq in branch.residualEquations
+        collectCrefNames!(allRefNames, brEq.exp)
+      end
+    end
+  end
+  for initEq in newInitEqs
+    if initEq isa BDAE.RESIDUAL_EQUATION
+      collectCrefNames!(allRefNames, initEq.exp)
+    elseif initEq isa BDAE.EQUATION
+      collectCrefNames!(allRefNames, initEq.lhs)
+      collectCrefNames!(allRefNames, initEq.rhs)
+    end
+  end
+  for n in allRefNames
+    if n in eliminatedSet
+      push!(survivingRefs, n)
+    end
+  end
+
+  if !isempty(survivingRefs)
+    @warn "aliasElimination: $(length(survivingRefs)) eliminated variables still referenced, keeping them" survivingRefs=collect(survivingRefs)
+  end
+
+  #= Remove only safely eliminated variables from hash table =#
+  local newHT = copy(ht)
+  local elimVarNames = String[]
+  local keptAliasEntries = AliasEntry[]
+  for (varName, _) in aliasMap
+    if varName in survivingRefs
+      #= Keep this variable: still referenced in equations =#
+      continue
+    end
+    delete!(newHT, varName)
+    push!(elimVarNames, varName)
+  end
+  #= Filter alias entries to only include actually eliminated variables =#
+  for entry in aliasEntries
+    if !(entry.eliminatedName in survivingRefs)
+      push!(keptAliasEntries, entry)
+    end
+  end
+
+  @info "aliasElimination: eliminated $(length(elimVarNames)) variables and $(length(aliasEqIndices)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
+
+  @assign simCode.residualEquations = newResEqs
+  @assign simCode.initialEquations = newInitEqs
+  @assign simCode.stringToSimVarHT = newHT
+  @assign simCode.ifEquations = newIfEqs
+  @assign simCode.whenEquations = newWhenEqs
+  @assign simCode.aliasMap = keptAliasEntries
+  #= Append eliminated equations/variables to the existing lists =#
+  @assign simCode.eliminatedEquations = vcat(simCode.eliminatedEquations, elimEqs)
+  @assign simCode.eliminatedVariables = vcat(simCode.eliminatedVariables, elimVarNames)
+  return simCode
+end
+
+"""
+    detectAlias(exp::DAE.Exp, ht)
+
+Detect if an expression represents an alias equation.
+Recognizes patterns:
+  - `BINARY(cref_a, SUB, cref_b)` meaning `a - b = 0`, i.e. `a = b` (negated=false)
+  - `BINARY(cref_a, ADD, cref_b)` meaning `a + b = 0`, i.e. `a = -b` (negated=true)
+
+Where cref_a and cref_b can be bare CREFs or ASUB-wrapped CREFs.
+Both variables must exist in the hash table and be Real-valued.
+
+Returns `(name1, name2, negated, cref1, type1, cref2, type2)` or `nothing`.
+"""
+function detectAlias(@nospecialize(exp), ht)
+  @match exp begin
+    DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
+      local isSub = @match op begin
+        DAE.SUB(__) => true
+        _ => false
+      end
+      local isAdd = @match op begin
+        DAE.ADD(__) => true
+        _ => false
+      end
+      if !isSub && !isAdd
+        return nothing
+      end
+      local r1 = extractCrefName(e1)
+      local r2 = extractCrefName(e2)
+      if r1 === nothing || r2 === nothing
+        return nothing
+      end
+      local (n1, cr1, t1) = r1
+      local (n2, cr2, t2) = r2
+      #= Both must exist in hash table =#
+      if !haskey(ht, n1) || !haskey(ht, n2)
+        return nothing
+      end
+      #= Both must be Real-valued =#
+      local (_, sv1) = ht[n1]
+      local (_, sv2) = ht[n2]
+      if !isRealValued(t1) && !isRealValued(t2)
+        return nothing
+      end
+      #= Both must be unknowns (not parameters, strings, or data structures).
+         Alias elimination removes equations and variables in pairs. If one side
+         is a parameter, removing the equation leaves the unknown without a
+         defining equation, breaking the equation-unknown balance. =#
+      if !isUnknownVarKind(sv1.varKind) || !isUnknownVarKind(sv2.varKind)
+        return nothing
+      end
+      local negated = isAdd  #= a + b = 0 means a = -b =#
+      return (n1, n2, negated, cr1, t1, cr2, t2)
+    end
+    _ => return nothing
+  end
+end
+
+"""
+    substituteAliasCref(exp::DAE.Exp, aliasMap)
+
+Callback for `traverseExpTopDown`. Replaces CREF expressions whose name
+matches an alias map entry with the representative CREF (possibly negated).
+Also handles ASUB-wrapped CREFs.
+"""
+function substituteAliasCref(@nospecialize(exp), aliasMap)
+  @match exp begin
+    DAE.ASUB(innerExp, subs) => begin
+      @match innerExp begin
+        DAE.CREF(cr, ty) => begin
+          local baseName = DAE_identifierToString(cr)
+          local fullName = buildAsubName(baseName, subs)
+          if !isempty(fullName) && haskey(aliasMap, fullName)
+            local (repName, negated, repCref, repTy) = aliasMap[fullName]
+            #= Check if the representative also has ASUB subscripts =#
+            local repBase = replace(repName, r"\[.*" => "")
+            if repBase != repName
+              #= Representative is also subscripted. Build ASUB with rep CREF. =#
+              local repSubs = parseSubscriptsFromName(repName)
+              local newInner = DAE.CREF(repCref, repTy)
+              local newExp = DAE.ASUB(newInner, repSubs)
+              if negated
+                return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(nil)), newExp), false, aliasMap)
+              else
+                return (newExp, false, aliasMap)
+              end
+            else
+              #= Representative is a scalar. Use bare CREF. =#
+              local newExp = DAE.CREF(repCref, repTy)
+              if negated
+                return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(nil)), newExp), false, aliasMap)
+              else
+                return (newExp, false, aliasMap)
+              end
+            end
+          end
+          #= Also check the base name (for cases where ASUB+CREF base name is aliased) =#
+          if haskey(aliasMap, baseName)
+            local (repName, negated, repCref, repTy) = aliasMap[baseName]
+            local newInner = DAE.CREF(repCref, repTy)
+            local newExp = DAE.ASUB(newInner, subs)
+            if negated
+              return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(nil)), newExp), false, aliasMap)
+            else
+              return (newExp, false, aliasMap)
+            end
+          end
+          return (exp, true, aliasMap)
+        end
+        _ => return (exp, true, aliasMap)
+      end
+    end
+    DAE.CREF(cr, ty) => begin
+      local name = DAE_identifierToString(cr)
+      if haskey(aliasMap, name)
+        local (repName, negated, repCref, repTy) = aliasMap[name]
+        local newExp = DAE.CREF(repCref, repTy)
+        if negated
+          return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(nil)), newExp), false, aliasMap)
+        else
+          return (newExp, false, aliasMap)
+        end
+      end
+      return (exp, true, aliasMap)
+    end
+    _ => return (exp, true, aliasMap)
+  end
+end
+
+"""
+    parseSubscriptsFromName(name::String)::Vector{DAE.Exp}
+
+Parse subscripts from a variable name like "a[1][2]" into [DAE.ICONST(1), DAE.ICONST(2)].
+Used to reconstruct ASUB subscripts for the representative variable.
+"""
+function parseSubscriptsFromName(name::String)::Vector{DAE.Exp}
+  local subs = DAE.Exp[]
+  for m in eachmatch(r"\[(\d+)\]", name)
+    push!(subs, DAE.ICONST(parse(Int, m.captures[1])))
+  end
+  return subs
+end

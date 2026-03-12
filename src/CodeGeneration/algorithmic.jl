@@ -579,7 +579,9 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
             :(OMBackend.CodeGeneration.vectorDot($(lhs), $(rhs)))
           end
           DAE.MUL_MATRIX_PRODUCT(__) => begin
-            :(OMBackend.CodeGeneration.ensureMatrix($(lhs)) * OMBackend.CodeGeneration.ensureMatrix($(rhs)))
+            #= Operands are proper Matrix: function impl params are pre-converted
+               by generateArrayConversions, and array literals use ensureArray. =#
+            :($(lhs) * $(rhs))
           end
           _ => begin
             local opSym = CodeGeneration.DAE_OP_toJuliaOperator(op)

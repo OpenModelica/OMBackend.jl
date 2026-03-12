@@ -58,6 +58,16 @@ const LATEX_SYMBOLS = REPL.REPLCompletions.latex_symbols
 #= Settings =#
 const WARN_MISSING_START_VALUES = Ref(false)
 
+"""
+Toggle direct RHS generation, bypassing MTK's ODEProblem constructor.
+When enabled, the RHS function is built directly from symbolic equations
+using Symbolics.build_function with CSE, resulting in much faster
+compilation for large models.
+
+Toggle with: `OMBackend.DIRECT_RHS_GENERATION[] = true`
+"""
+const DIRECT_RHS_GENERATION = Ref{Bool}(false)
+
 const OSMC_COPYRIGHT_HEADER = """
 #=
 * This file is part of OpenModelica.
@@ -142,7 +152,9 @@ This is not part of the lowering process but it is to be generated before we gen
 function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatModel};
                    functionList = nothing,
                    BackendMode = MTK_MODE,
-                   warnMissingStartValues = nothing)::Tuple{String, Expr}
+                   warnMissingStartValues = nothing,
+                   eliminateNonDynamic::Union{Nothing, Bool, SimulationCode.EliminationOptions} = nothing,
+                   observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing)::Tuple{String, Expr}
   local previousWarnSetting = WARN_MISSING_START_VALUES[]
   if warnMissingStartValues !== nothing
     warnMissingStartValues isa Bool || error("warnMissingStartValues must be Bool or nothing")
@@ -181,6 +193,56 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
       #= Resolve constant-condition IFEXPs in parameter bindings =#
       simCode = SimulationCode.resolveIfExpInBindings!(simCode)
       @BACKEND_LOGGING debugWrite("simCode_afterResolveIfExp.log", SimulationCode.dumpSimCode(simCode))
+      #= Constant propagation and alias elimination run AFTER record flattening
+         so that all CREF references are in their final form before substitution.
+         Running these earlier caused dangling references when flattenRecordCallSites
+         introduced new CREFs for already-eliminated variables. =#
+      simCode = SimulationCode.propagateConstants(simCode)
+      @BACKEND_LOGGING debugWrite("simCode_afterConstantProp.log", SimulationCode.dumpSimCode(simCode))
+      simCode = SimulationCode.eliminateAliasVariables(simCode)
+      @BACKEND_LOGGING debugWrite("simCode_afterAliasElimination.log", SimulationCode.dumpSimCode(simCode))
+      #= Output-only variable elimination runs AFTER const-prop and alias-elim,
+         so that alias chains are resolved and the output-only subgraph is cleanly separated.
+         A fresh matching is computed from the current equation/variable set. =#
+      local elimOpts = if eliminateNonDynamic === true
+        SimulationCode.EliminationOptions()
+      elseif eliminateNonDynamic isa SimulationCode.EliminationOptions
+        eliminateNonDynamic
+      else
+        nothing
+      end
+      if elimOpts !== nothing
+        @BACKEND_LOGGING debugWrite("simCode_beforeElimination.log", SimulationCode.dumpSimCode(simCode))
+        simCode = SimulationCode.eliminateOutputOnlyVariables(simCode, elimOpts)
+        @BACKEND_LOGGING debugWrite("simCode_afterElimination.log", SimulationCode.dumpSimCode(simCode))
+      end
+      #= Observed filter: controls which alias-eliminated variables become observed equations.
+         Default (nothing): skip ALL alias observed equations for fast compilation.
+         With filter patterns: keep only matching aliases as observed. =#
+      if observedFilter === nothing
+        #= Fast default: no observed equations from alias elimination =#
+        if !isempty(simCode.aliasMap)
+          @info "observedFilter: clearing $(length(simCode.aliasMap)) alias observed equations (default: none)"
+          @assign simCode.aliasMap = empty(simCode.aliasMap)
+        end
+      else
+        local filterStrings = if observedFilter isa Vector{Regex}
+          [p.pattern for p in observedFilter]
+        else
+          observedFilter
+        end
+        @assign simCode.observedFilter = filterStrings
+        #= Filter alias map entries to keep only matching patterns =#
+        if !isempty(simCode.aliasMap)
+          local originalCount = length(simCode.aliasMap)
+          local patterns = [Regex(p) for p in filterStrings]
+          local filteredMap = filter(simCode.aliasMap) do entry
+            any(p -> occursin(p, entry.eliminatedName), patterns)
+          end
+          @assign simCode.aliasMap = filteredMap
+          @info "observedFilter: kept $(length(filteredMap)) of $originalCount alias observed equations"
+        end
+      end
       return generateMTKTargetCode(simCode)
     else
       @error "No mode specified: valid modes are: MTK_MODE"
@@ -300,11 +362,17 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
 end
 
 """
-  Transforms  BDAE-IR to simulation code for DAE-mode
+  Transforms  BDAE-IR to simulation code for DAE-mode.
+  If `eliminateNonDynamic` is provided, output-only variables are eliminated after SimCode creation.
 """
-function generateSimulationCode(bDAE::BDAE.BACKEND_DAE; mode)::SimulationCode.SimCode
+function generateSimulationCode(bDAE::BDAE.BACKEND_DAE;
+                                mode)::SimulationCode.SimCode
   local simCode = SimulationCode.transformToSimCode(bDAE; mode = mode)
   @debug BDAEUtil.stringHeading1(simCode, "SIM_CODE: transformed simcode")
+  #= NOTE: propagateConstants, eliminateAliasVariables, and eliminateOutputOnlyVariables
+     are now called from translate() AFTER flattenRecordCallSites, so that record
+     argument expansion does not introduce dangling references to already-eliminated
+     variables, and output-only elimination sees the fully simplified system. =#
   return simCode
 end
 

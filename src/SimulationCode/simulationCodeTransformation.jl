@@ -275,6 +275,10 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
                           irreductableVars,
                           ModelicaFunction[],
                           #= Specify if external runtime should be used =# false,
+                          BDAE.RESIDUAL_EQUATION[],
+                          String[],
+                          AliasEntry[],
+                          nothing,
                           )
 end
 

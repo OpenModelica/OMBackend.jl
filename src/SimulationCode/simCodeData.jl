@@ -176,6 +176,56 @@ struct DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION <: StructuralTransition
 end
 
 """
+    EliminationOptions(; reachability=true, patterns=Regex[], keepPatterns=Regex[])
+
+Options for non-dynamic variable elimination. Controls which variables and equations
+are removed from the system before MTK code generation.
+
+When passed to `OM.translate` or `OM.simulate` via the `eliminateNonDynamic` keyword,
+variables that do not influence the dynamic states are removed, reducing ODEProblem
+compilation time. The eliminated equations are bookkept in the SIM_CODE for later
+reconstruction (e.g., 3D visualization).
+
+# Fields
+- `reachability::Bool` -- eliminate variables not reachable from state derivatives
+  via backward dependency analysis. Default: `true`.
+- `patterns::Vector{Regex}` -- additionally eliminate variables whose names match
+  any of these patterns (e.g., `r"^world_"`). Reserved for future use.
+- `keepPatterns::Vector{Regex}` -- force-keep variables matching any of these patterns,
+  overriding both reachability and pattern elimination. Reserved for future use.
+
+# Examples
+```julia
+# Eliminate all non-dynamic variables (default when passing true)
+OM.translate(...; eliminateNonDynamic=true)
+
+# Fine-grained control
+OM.translate(...; eliminateNonDynamic=EliminationOptions(keepPatterns=[r"revolute"]))
+```
+"""
+struct EliminationOptions
+  reachability::Bool
+  patterns::Vector{Regex}
+  keepPatterns::Vector{Regex}
+end
+
+EliminationOptions(; reachability::Bool = true,
+                     patterns::Vector{Regex} = Regex[],
+                     keepPatterns::Vector{Regex} = Regex[]) =
+  EliminationOptions(reachability, patterns, keepPatterns)
+
+"""
+Represents an alias relationship discovered during alias elimination.
+`eliminatedVar = representativeVar` when `negated` is false,
+`eliminatedVar = -representativeVar` when `negated` is true.
+"""
+struct AliasEntry
+  eliminatedName::String
+  representativeName::String
+  negated::Bool
+end
+
+"""
   Root data structure containing information required for code generation to
   generate simulation code for a Modelica model.
 
@@ -252,4 +302,12 @@ struct SIM_CODE{T0<:String,
   functions::Vector{ModelicaFunction}
   "Specify if an external Modelica runtime is needed or not. Used for build in functions"
   externalRuntime::Bool
+  "Equations eliminated by non-dynamic variable elimination (bookkept for later reconstruction)"
+  eliminatedEquations::Vector{BDAE.RESIDUAL_EQUATION}
+  "Names of variables eliminated by non-dynamic variable elimination"
+  eliminatedVariables::Vector{String}
+  "Alias map: eliminated alias variables and their representative (for observed equation reconstruction)"
+  aliasMap::Vector{AliasEntry}
+  "Filter patterns for observed equations. Only alias/observed variables matching these patterns are kept. Nothing means keep all."
+  observedFilter::Union{Nothing, Vector{String}}
 end

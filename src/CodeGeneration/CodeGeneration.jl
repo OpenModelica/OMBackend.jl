@@ -68,6 +68,7 @@ include("./arrayUtils.jl")
 include("./AlgorithmicCodeGeneration.jl")
 include("./CodeGenerationUtil.jl")
 include("./structuralCallbacks.jl")
+include("./DirectRHSGeneration.jl")
 include("./MTK_CodeGeneration.jl")
 
 #= Pure DifferentialEquations.jl code generation =#

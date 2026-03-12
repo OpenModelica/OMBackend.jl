@@ -605,7 +605,13 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
       end
     end
   end
-  sys = ModelingToolkit.structural_simplify(sys, simplify = simplify)
+  if OMBackend.ENABLE_BACKEND_LOGGING
+    local _ss_timed = @timed ModelingToolkit.structural_simplify(sys, simplify = simplify)
+    sys = _ss_timed.value
+    @info "structural_simplify took $(_ss_timed.time)s, $(round(_ss_timed.bytes / 1e9, digits=2)) GiB"
+  else
+    sys = ModelingToolkit.structural_simplify(sys, simplify = simplify)
+  end
   local post_eqs = length(equations(sys))
   local post_full_eqs = length(ModelingToolkit.full_equations(sys))
   local post_unknowns = length(unknowns(sys))
