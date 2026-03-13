@@ -1115,6 +1115,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
      is ALG_VARIABLE or ARRAY. This preserves equation-unknown balance. =#
   local eqsToEliminate = Set{Int}()
   local varsToRemove = Set{String}()
+  local eliminatedPairs = Tuple{String, Int}[]  #= (varName, eqIdx) for pairing =#
   local nSkippedNonAlg = 0
   local nSkippedUnmatched = 0
   for eqIdx in outputOnlyEqIndices
@@ -1141,12 +1142,19 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     if isEliminable
       push!(eqsToEliminate, eqIdx)
       push!(varsToRemove, vn)
+      push!(eliminatedPairs, (vn, eqIdx))
     else
       nSkippedNonAlg += 1
     end
   end
   if isempty(eqsToEliminate)
     @info "eliminateNonDynamic: no eliminable equation-variable pairs found"
+    return simCode
+  end
+  #= Guard: never eliminate ALL equations. A system with zero equations
+     after elimination would crash downstream (filterConstantEquations, MTK). =#
+  if length(eqsToEliminate) >= length(simCode.residualEquations)
+    @info "eliminateNonDynamic: would eliminate all $(length(simCode.residualEquations)) equations, skipping"
     return simCode
   end
   #= Safety check: verify no surviving equation references an eliminated variable.
@@ -1204,15 +1212,17 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   end
   #= Filter residualEquations: remove eliminated equations =#
   local newResEqs = BDAE.RESIDUAL_EQUATION[]
-  local elimEqs = BDAE.RESIDUAL_EQUATION[]
   sizehint!(newResEqs, length(resEqs) - length(eqsToEliminate))
   for (i, eq) in enumerate(resEqs)
-    if i in eqsToEliminate
-      push!(elimEqs, eq)
-    else
+    if !(i in eqsToEliminate)
       push!(newResEqs, eq)
     end
   end
+  #= Build parallel (varName, equation) vectors from the paired data.
+     Filter out rescued variables. =#
+  local survivingPairs = filter(p -> !(p[1] in rescuedVars), eliminatedPairs)
+  local elimPairedVars = String[p[1] for p in survivingPairs]
+  local elimPairedEqs = BDAE.RESIDUAL_EQUATION[resEqs[p[2]] for p in survivingPairs]
   #= Filter stringToSimVarHT: remove eliminated variables =#
   local newHT = copy(ht)
   for varName in varsToRemove
@@ -1236,8 +1246,8 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   end
   @assign simCode.residualEquations = newResEqs
   @assign simCode.stringToSimVarHT = newHT
-  @assign simCode.eliminatedEquations = elimEqs
-  @assign simCode.eliminatedVariables = collect(varsToRemove)
+  @assign simCode.eliminatedEquations = elimPairedEqs
+  @assign simCode.eliminatedVariables = elimPairedVars
   return simCode
 end
 

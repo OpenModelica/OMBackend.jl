@@ -51,10 +51,8 @@ import JuliaFormatter
 import OMBackend.CodeGeneration
 import OMFrontend
 import Plots
-import REPL
 import SCode
 
-const LATEX_SYMBOLS = REPL.REPLCompletions.latex_symbols
 #= Settings =#
 const WARN_MISSING_START_VALUES = Ref(false)
 
@@ -64,9 +62,9 @@ When enabled, the RHS function is built directly from symbolic equations
 using Symbolics.build_function with CSE, resulting in much faster
 compilation for large models.
 
-Toggle with: `OMBackend.DIRECT_RHS_GENERATION[] = true`
+Toggle with: `OMBackend.DIRECT_RHS_GENERATION[] = false` to disable.
 """
-const DIRECT_RHS_GENERATION = Ref{Bool}(false)
+const DIRECT_RHS_GENERATION = Ref{Bool}(true)
 
 const OSMC_COPYRIGHT_HEADER = """
 #=
@@ -140,6 +138,29 @@ in memory as well s.t we only recompile if the structure of the source file chan
 (Unless retranslation is forced).
 """
 const COMPILED_MODELS_MTK = Dict{String, Tuple{Expr, Bool, UInt64}}()
+
+"""
+    clearCaches!(; models=true, implementations=true, wrappers=true, extractors=true)
+
+Clear persistent caches. By default all caches are cleared.
+Use keyword arguments to selectively clear individual caches.
+
+- `models`: compiled MTK model ASTs
+- `implementations`: Modelica function implementations
+- `wrappers`: RTG wrapper functions for symbolic dispatch
+- `extractors`: per-element array extractor functions
+"""
+function clearCaches!(; models::Bool=true,
+                        implementations::Bool=true,
+                        wrappers::Bool=true,
+                        extractors::Bool=true)
+  cleared = String[]
+  models          && (empty!(COMPILED_MODELS_MTK);                       push!(cleared, "models"))
+  implementations && (empty!(CodeGeneration.MODELICA_FUNCTION_IMPLS);    push!(cleared, "implementations"))
+  wrappers        && (empty!(CodeGeneration.MODELICA_FUNCTION_WRAPPERS); push!(cleared, "wrappers"))
+  extractors      && (empty!(CodeGeneration.ELEM_FUNC_CACHE);            push!(cleared, "extractors"))
+  return cleared
+end
 
 """
  This function lowers the given Hybrid DAE to target code.
@@ -276,24 +297,25 @@ end
 """
 function lower(frontendDAE::DAE.DAE_LIST)::BDAE.BACKEND_DAE
   local bDAE::BDAE.BACKEND_DAE
-  local simCode::SIM_CODE
   @debug "Length of frontend DAE:" length(frontendDAE.elementLst)
   @assert typeof(listHead(frontendDAE.elementLst)) == DAE.COMP
   #= Create Backend structure from Frontend structure =#
   bDAE = BDAECreate.lower(frontendDAE)
   @debug(BDAEUtil.stringHeading1(bDAE, "translated"));
-  #= Expand arrays =#
-  (bDAE, expandedVars) = Causalize.expandArrayVariables(bDAE)
-  @debug(BDAEUtil.stringHeading1(bDAE, "Array variables expanded"));
-  #= Expand Array variables in equation system=#
-  bDAE = Causalize.detectAndReplaceArrayVariables(bDAE, expandedVars)
-  @debug(BDAEUtil.stringHeading1(bDAE, "Equation system variables expanded"));
-  #= Transform if expressions to if equations =#
-  @debug(BDAEUtil.stringHeading1(bDAE, "if equations transformed"));
-  bDAE = Causalize.detectIfExpressions(bDAE)
+  #= Transform ASUB expressions: der(array)[i] to der(array[i]) =#
+  bDAE = Causalize.transformASUBExpressions(bDAE)
   #= Mark state variables =#
   bDAE = Causalize.detectStates(bDAE)
   @debug(BDAEUtil.stringHeading1(bDAE, "states marked"));
+  #= Flatten CREF_QUAL with subscripted array finals =#
+  bDAE = Causalize.flattenArrayCrefs(bDAE)
+  #= Transform if expressions to if equations =#
+  bDAE = Causalize.detectIfExpressions(bDAE)
+  @debug(BDAEUtil.stringHeading1(bDAE, "if equations transformed"));
+  #= Expand record field array variables into individual scalar element variables =#
+  bDAE = Causalize.expandRecordFieldArrays(bDAE)
+  #= Expand COMPLEX_EQUATIONs into scalar equations =#
+  bDAE = Causalize.expandComplexEquations(bDAE)
   #= We always residualize since residuals are easier to work with =#
   bDAE = Causalize.residualizeEveryEquation(bDAE)
   @debug(BDAEUtil.stringHeading1(bDAE, "residuals"));
@@ -419,7 +441,11 @@ function generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)
     local changeDetected = previousHash != codeHash
     COMPILED_MODELS_MTK[modelName] = (modelCode, changeDetected, codeHash)
   else
-    COMPILED_MODELS_MTK[modelName] = (modelCode, false, codeHash)
+    #= If the module already exists from a previous compilation (e.g. after
+       clearCaches!), mark as needing re-eval so simulateModel picks up the
+       new code instead of reusing the stale module. =#
+    local moduleAlreadyExists = isdefined(OMBackend, Symbol(modelName))
+    COMPILED_MODELS_MTK[modelName] = (modelCode, moduleAlreadyExists, codeHash)
   end
   return (modelName, modelCode)
 end
@@ -453,15 +479,21 @@ function writeModelToFile(modelName::String, filePath::String; keepComments = tr
     mAsStr = modelToString(modelName; MTK = true,
                            keepComments = keepComments,
                            keepBeginBlocks = keepBeginBlocks)
-    try
-      #= Replace top level begin/end =#
-      beginIdx = last(findfirst("begin", mAsStr)) + 1
-      endIdx = first(findlast("end",  mAsStr)) - 1
-      mAsStr = mAsStr[beginIdx:endIdx]
+    if model.head == :module
+      #= Module expression serializes cleanly, no begin/end stripping needed =#
       mAsStr = OSMC_COPYRIGHT_HEADER * mAsStr
       writeStringToFile(filePath, mAsStr)
-    catch e
-      @error "Error removing initial begin/end pairs" exception=(e, catch_backtrace())
+    else
+      try
+        #= Replace top level begin/end for legacy quote blocks =#
+        beginIdx = last(findfirst("begin", mAsStr)) + 1
+        endIdx = first(findlast("end",  mAsStr)) - 1
+        mAsStr = mAsStr[beginIdx:endIdx]
+        mAsStr = OSMC_COPYRIGHT_HEADER * mAsStr
+        writeStringToFile(filePath, mAsStr)
+      catch e
+        @error "Error removing initial begin/end pairs" exception=(e, catch_backtrace())
+      end
     end
   catch e
     @error "Failed writing $model to file: $filePath" exception=(e, catch_backtrace())
@@ -551,11 +583,11 @@ function simulateModel(modelName::String;
                        MODE = MTK_MODE,
                        tspan = (0.0, 1.0),
                        solver = Rodas5(autodiff=false),
+                       overwriteCache::Bool = false,
                        kwargs...)
   #= Strings using "." need to be in a format suitable for Julia =#
   modelName = replace(modelName, "." => "__")
   local modelCode::Expr
-  local strippedModel::Expr
   if MODE == MTK_MODE
     #= This does a redundant string conversion for now due to modeling toolkit being as is...=#
     try
@@ -566,15 +598,15 @@ function simulateModel(modelName::String;
       availableModels()
     end
     try
-      @eval $(:(import OMBackend))
-      @eval $(:(using DifferentialEquations))
-      #= Below is needed to pass the custom solver=#
-      strippedModel = CodeGeneration.stripBeginBlocks(modelCode)
-      @eval $strippedModel
-      #= Run in latest world age to see the just-eval'd functions =#
+      #= Only re-eval if the module does not exist yet or the code changed =#
+      local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) || modelWasCompiledAgain(modelName)
+      if needsEval
+        @eval $modelCode
+      end
+      #= Run in latest world age to see the just-eval'd module =#
       Base.invokelatest() do
-        local simulateFn = getfield(OMBackend, Symbol(modelName, "Simulate"))
-        simulateFn(tspan, solver; kwargs...)
+        local mod = getfield(OMBackend, Symbol(modelName))
+        mod.simulate(tspan, solver; kwargs...)
       end
     catch err
       @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
@@ -599,9 +631,11 @@ function resimulateModel(modelName::String;
   If that is the case we do not have to recompile it.
   =#
   try
-    local modelRunnable = Meta.parse("OMBackend.$(modelName)Simulate($(tspan); solver = $(solver))")
-    res = @eval $modelRunnable
-    return res
+    modelName = replace(modelName, "." => "__")
+    Base.invokelatest() do
+      local mod = getfield(OMBackend, Symbol(modelName))
+      mod.simulate(tspan, solver)
+    end
   catch e
     availModels = availableModels()
     @error "The model $(modelName) is not compiled. Available models are: $(availModels)" exception=(e, catch_backtrace())

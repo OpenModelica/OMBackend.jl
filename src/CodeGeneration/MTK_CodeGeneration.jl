@@ -66,11 +66,11 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
   local activeModelName = simCode.activeModel
   local structuralModes = Expr[]
   for mode in simCode.subModels
-    push!(structuralModes, ODE_MODE_MTK_MODEL_GENERATION(mode, mode.name, functions))
+    push!(structuralModes, ODE_MODE_MTK_MODEL_GENERATION(mode, mode.name, functions; useDirectRHS = false))
   end
   if isempty(simCode.subModels)
     local modelName = string(MODEL_NAME, "DEFAULT")
-    defaultModel = ODE_MODE_MTK_MODEL_GENERATION(simCode, modelName, functions)
+    defaultModel = ODE_MODE_MTK_MODEL_GENERATION(simCode, modelName, functions; useDirectRHS = false)
     activeModelName = modelName
     push!(structuralModes, defaultModel)
   end
@@ -91,6 +91,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     import OMBackend.CodeGeneration
     using ModelingToolkit
     using DifferentialEquations
+    Base.Experimental.@compiler_options optimize=0
     $(structuralModes...)
     $(structuralCallbacks...)
     #=
@@ -144,23 +145,13 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     #   OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver)
     # end
 
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0), solver=Rodas5(); kwargs...)
-      _t_model = @elapsed begin
-        $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
-      end
-      _t_solve = @elapsed begin
-        _sol = OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver; kwargs...)
-      end
-      @info "Simulate timings:" model_construction=round(_t_model, digits=2) solve=round(_t_solve, digits=2)
-      _sol
+    function simulate(tspan = (0.0, 1.0), solver=Rodas5(); kwargs...)
+      $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
+      OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver; kwargs...)
     end
-
-
-
-
-
   end
-  return (MODEL_NAME, code)
+  local moduleExpr = Expr(:module, true, Symbol(MODEL_NAME), stripBeginBlocks(code))
+  return (MODEL_NAME, moduleExpr)
 end
 
 """
@@ -192,12 +183,13 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       qualifyModelicaFunctions!(f, funcNames)
     end
   end
-  program = quote
+  programBody = quote
     using ModelingToolkit
     using DifferentialEquations
     using OrdinaryDiffEq
     using Symbolics
     using OMBackend
+    Base.Experimental.@compiler_options optimize=0
     #= Add import to the external runtime if the generated code calls Modelica Functions =#
     $(if simCode.externalRuntime
         generateExternalRuntimeImport(simCode)
@@ -206,25 +198,20 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(generateRegisterCallsForCallExprs(simCode)...)
     $(model)
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
-      _t_model = @elapsed begin
-        ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), tspan, pars, vars, irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
-      end
-      _t_solve = @elapsed begin
-        sol = solve($(Symbol("$(MODEL_NAME)Model_problem")), solver; kwargs...)
-      end
-      @info "Simulate timings:" model_construction=round(_t_model, digits=2) solve=round(_t_solve, digits=2)
-      return sol
+    function simulate(tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
+      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), tspan, pars, vars, irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
+      solve($(Symbol("$(MODEL_NAME)Model_problem")), solver; kwargs...)
     end
   end
   #= MODEL_NAME is preprocessed with . replaced with _=#
-  return MODEL_NAME, program
+  local moduleExpr = Expr(:module, true, Symbol(MODEL_NAME), stripBeginBlocks(programBody))
+  return MODEL_NAME, moduleExpr
 end
 
 """
   Generates a MTK model
 """
-function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions)
+function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions; useDirectRHS::Bool = OMBackend.DIRECT_RHS_GENERATION[])
   #@debug "Runnning: ODE_MODE_MTK_MODEL"
   RESET_CALLBACKS()
   #= Eval functions FIRST so they exist before @register_symbolic is called =#
@@ -399,6 +386,20 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   Instead, we should only use the values for the unknowns we can't remove from the system.
   =#
   local irreductableSyms = Symbol[Symbol(vn) for vn in simCode.irreductableVariables]
+  #= Mark ifCond and ifEq_tmp variables as irreducible so MTK tearing does not
+     attempt to eliminate them. The ifCond variables appear inside ifelse conditions
+     where the Jacobian is structurally zero. MTK also creates Shift(t,1) versions
+     of these variables for discrete events, which inherit the equation structure
+     but not the metadata, so we also mark the ifEq_tmp LHS variables. =#
+  append!(irreductableSyms, ifConditionalVariables)
+  for ceq in CONDITIONAL_EQUATIONS
+    if ceq isa Expr && ceq.head == :call && length(ceq.args) >= 2
+      lhs = ceq.args[2]
+      if lhs isa Symbol
+        push!(irreductableSyms, lhs)
+      end
+    end
+  end
 
   #= Heuristic for initialization:
      - If any state variable has an explicit start value, assume the system has algebraic
@@ -448,137 +449,102 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
        Variable constructors only return symbol tuples, so they have no scope dependencies. =#
     $(varOuterDefs)
     function $(Symbol(MODEL_NAME * "Model"))(tspan = (0.0, 1.0))
-      local _timings = Dict{String, Float64}()
-      local _t0_total = time()
       ModelingToolkit.@independent_variables t
       D = ModelingToolkit.Differential(t)
-      _timings["1_parameters"] = @elapsed begin
-        $(decomposeParametersDeclaration(parVariablesSym))
-        #= Create array parameters with proper dimensions =#
-        $(ARRAY_PARAMETERS...)
-      end
+      $(decomposeParametersDeclaration(parVariablesSym))
+      #= Create array parameters with proper dimensions =#
+      $(ARRAY_PARAMETERS...)
       #=
         Only variables that are present in the equation system later should be a part of the variables in the MTK system.
         This means that certain algebraic variables should not be listed among the variables (These are the discrete variables).
       =#
-      _timings["2_variables"] = @elapsed begin
-        $(varInnerRefs)
-        allVariables = []
-        #= Generate variables =#
-        for constructor in variableConstructors
-          t = Symbolics.variable(:t, T = Real)
-          vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple{Real}, Real})(t)), Base.invokelatest(constructor))
-          #= t is no longer needed here =#
-          push!(allVariables, vars)
-        end
-        vars = collect(Iterators.flatten(allVariables))
+      $(varInnerRefs)
+      allVariables = []
+      #= Generate variables =#
+      for constructor in variableConstructors
+        t = Symbolics.variable(:t, T = Real)
+        vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple{Real}, Real})(t)), Base.invokelatest(constructor))
+        push!(allVariables, vars)
       end
+      vars = collect(Iterators.flatten(allVariables))
       #= Batch all variable assignments and metadata into a single eval call.
          Each individual eval triggers a world-age bump and JIT overhead.
          For models with 1000+ variables this reduces N evals to 1. =#
-      _timings["3_eval_vars"] = @elapsed begin
-        local _batchBlock = Expr(:block)
-        for (sym, var) in vars
-          push!(_batchBlock.args, :($sym = $var))
-        end
-        local irreductableSyms = $(irreductableSyms)
-        for sym in irreductableSyms
-          push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableIrreducible, true)))
-        end
-        local _statePriorityPairs = $(statePriorityPairs)
-        for (sym, priority) in _statePriorityPairs
-          push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableStatePriority, $priority)))
-        end
-        eval(_batchBlock)
+      local _batchBlock = Expr(:block)
+      for (sym, var) in vars
+        push!(_batchBlock.args, :($sym = $var))
       end
+      local irreductableSyms = $(irreductableSyms)
+      for sym in irreductableSyms
+        push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableIrreducible, true)))
+      end
+      local _statePriorityPairs = $(statePriorityPairs)
+      for (sym, priority) in _statePriorityPairs
+        push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableStatePriority, $priority)))
+      end
+      eval(_batchBlock)
       #= Transform the variable vector into a vector of Nums =#
       vars = map(x -> last(x), vars)
-      #= Initial values for the continious system. =#
-      _timings["4_initial_values"] = @elapsed begin
-        $(decomposeParameterEquationsInline(PARAMETER_EQUATIONS))
-        startEquationComponents = []
-        $(decomposeStartEquationsInline(START_CONDTIONS_EQUATIONS))
-        for constructor in startEquationConstructors
-          push!(startEquationComponents, Base.invokelatest(constructor))
-        end
-        initialValues = collect(Iterators.flatten(startEquationComponents))
-        #= Process the final initial guesses =#
-        startEquationComponents = []
-        $(decomposeStartEquationsInline(FINAL_START_CONDTIONS_EQUATIONS; functionSuffix = "Final"))
-        for constructor in startEquationConstructors
-          push!(startEquationComponents, Base.invokelatest(constructor))
-        end
-        finalInitialValues = collect(Iterators.flatten(startEquationComponents))
+      #= Initial values for the continuous system. =#
+      $(decomposeParameterEquationsInline(PARAMETER_EQUATIONS))
+      startEquationComponents = []
+      $(decomposeStartEquationsInline(START_CONDTIONS_EQUATIONS))
+      for constructor in startEquationConstructors
+        push!(startEquationComponents, Base.invokelatest(constructor))
       end
-      #= End construction of initial values =#
-      _timings["5_equations"] = @elapsed begin
-        equationComponents = []
-        $(stripBeginBlocks(decomposeEquationsInline(EQUATIONS, PARAMETER_ASSIGNMENTS)))
-        #= Generate the Equations =#
-        for constructor in equationConstructorCalls
-          push!(equationComponents, Base.invokelatest(constructor))
-        end
-        eqs = collect(Iterators.flatten(equationComponents))
-        eqs = Base.invokelatest(OMBackend.CodeGeneration.filterConstantEquations, eqs)
+      initialValues = collect(Iterators.flatten(startEquationComponents))
+      #= Process the final initial guesses =#
+      startEquationComponents = []
+      $(decomposeStartEquationsInline(FINAL_START_CONDTIONS_EQUATIONS; functionSuffix = "Final"))
+      for constructor in startEquationConstructors
+        push!(startEquationComponents, Base.invokelatest(constructor))
       end
-      _timings["6_events_observed"] = @elapsed begin
-        $(IF_EQUATION_EVENT_DECLARATION)
-        $(generateAliasObservedBlock(simCode))
+      finalInitialValues = collect(Iterators.flatten(startEquationComponents))
+      #= Equations =#
+      equationComponents = []
+      $(stripBeginBlocks(decomposeEquationsInline(EQUATIONS, PARAMETER_ASSIGNMENTS)))
+      for constructor in equationConstructorCalls
+        push!(equationComponents, Base.invokelatest(constructor))
       end
-      _timings["7_ODESystem"] = @elapsed begin
-        nonLinearSystem = $(odeSystemWithEvents(!(isempty(ifConditionalStartEquations)), modelName;
-                                                hasObserved = !isempty(simCode.aliasMap)))
-        firstOrderSystem = nonLinearSystem
+      eqs = collect(Iterators.flatten(equationComponents))
+      eqs = Base.invokelatest(OMBackend.CodeGeneration.filterConstantEquations, eqs)
+      #= Events and observed equations =#
+      $(IF_EQUATION_EVENT_DECLARATION)
+      $(generateAliasObservedBlock(simCode))
+      $(generateEliminatedObservedBlock(simCode))
+      #= ODE System =#
+      nonLinearSystem = $(odeSystemWithEvents(!(isempty(ifConditionalStartEquations)), modelName;
+                                              hasObserved = !isempty(simCode.aliasMap)))
+      firstOrderSystem = nonLinearSystem
+      #= Structural simplification =#
+      $(performStructuralSimplify(performIndexReduction; observedFilter = simCode.observedFilter, split = !useDirectRHS))
+      #= Callbacks setup =#
+      local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
+      #= Wrap discrete start values in a function and call with invokelatest to avoid world-age issues =#
+      function _getDiscreteVars()
+        collect(values(ModelingToolkit.OrderedDict($(DISCRETE_START_VALUES...))))
       end
-      _timings["8_structural_simplify"] = @elapsed begin
-        $(performStructuralSimplify(performIndexReduction; observedFilter = simCode.observedFilter))
-      end
-      _timings["9_callbacks_setup"] = @elapsed begin
-        #=
-          These arrays are introduced to handle the bolted on event handling using callbacks.
-          The callback handling for MTK is subject of change should hybrid system be implemented for MTK.
-        =#
-        local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
-        #= Wrap discrete start values in a function and call with invokelatest to avoid world-age issues =#
-        #= The variables referenced in DISCRETE_START_VALUES were created via eval above =#
-        function _getDiscreteVars()
-          collect(values(ModelingToolkit.OrderedDict($(DISCRETE_START_VALUES...))))
-        end
-        local discreteVars = Base.invokelatest(_getDiscreteVars)
-        #= Merge the discrete and event parameters =#
-        eventParameters = vcat(eventParameters, discreteVars)
-        local aux = Vector{Any}(undef, 3)
-        #= TODO init them with the initial values of them =#
-        aux[1] = eventParameters
-        aux[2] = Float64[]
-        aux[3] = reducedSystem
-        #=
-         This array is used to help indexing state/discrete variables.
-         It maps the index given by OMBackend to the actual index in the states.
-         A[i] = <true_index>
-        =#
-        callbacks = $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
-      end
-      _timings["10_splitInitialValues"] = @elapsed begin
-        (reducedSystem, finalInitialValues) = Base.invokelatest(
-          OMBackend.CodeGeneration.splitInitialValues, reducedSystem, finalInitialValues, initialValues)
-      end
-      _timings["11_ODEProblem"] = @elapsed begin
-        if OMBackend.DIRECT_RHS_GENERATION[]
-          problem = OMBackend.CodeGeneration.buildDirectRHSProblem(
-            reducedSystem, finalInitialValues, pars, tspan, callbacks)
-        else
-          problem = ModelingToolkit.ODEProblem(reducedSystem,
-                                               merge(Dict(finalInitialValues), pars),
-                                               tspan,
-                                               callback=callbacks,
-                                               warn_initialize_determined=false)
-        end
-      end
-      _timings["total"] = time() - _t0_total
-      @info "Model generation timings:" _timings
-      for (k, v) in sort(collect(_timings))
-        @info "  $k: $(round(v, digits=2))s"
+      local discreteVars = Base.invokelatest(_getDiscreteVars)
+      eventParameters = vcat(eventParameters, discreteVars)
+      local aux = Vector{Any}(undef, 3)
+      aux[1] = eventParameters
+      aux[2] = Float64[]
+      aux[3] = reducedSystem
+      #= Maps OMBackend variable indices to actual state indices =#
+      callbacks = $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
+      #= Split initial values =#
+      (reducedSystem, finalInitialValues) = Base.invokelatest(
+        OMBackend.CodeGeneration.splitInitialValues, reducedSystem, finalInitialValues, initialValues)
+      #= Build ODEProblem =#
+      if $(useDirectRHS)
+        problem = OMBackend.CodeGeneration.buildDirectRHSProblem(
+          reducedSystem, finalInitialValues, pars, tspan, callbacks)
+      else
+        problem = ModelingToolkit.ODEProblem(reducedSystem,
+                                             merge(Dict(finalInitialValues), pars),
+                                             tspan,
+                                             callback=callbacks,
+                                             warn_initialize_determined=false)
       end
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
     end
@@ -657,6 +623,67 @@ function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE)
       push!(_obsComponents, Base.invokelatest(_obsFn))
     end
     observedEqs = collect(Iterators.flatten(_obsComponents))
+  end
+end
+
+"""
+    generateEliminatedObservedBlock(simCode)
+
+Generate a code block that creates observed equations for variables eliminated by
+`eliminateNonDynamic`. Each eliminated (varName, equation) pair produces:
+  - A symbolic variable declaration for the eliminated variable
+  - An observed equation derived by solving the residual for the variable
+These are appended to `observedEqs` so that eliminated variables remain
+accessible in the solution (e.g. `sol[:y]`).
+
+The `eliminatedVariables` and `eliminatedEquations` vectors must be parallel
+(paired by index). The residual equation `0 = expr` is converted to MTK form
+and `Symbolics.solve_for` extracts the solved form `elimVar ~ rhs`.
+"""
+function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE)
+  if isempty(simCode.eliminatedVariables)
+    return :()
+  end
+  local elimVars = simCode.eliminatedVariables
+  local elimEqs = simCode.eliminatedEquations
+  @assert length(elimVars) == length(elimEqs) "eliminatedVariables and eliminatedEquations must be parallel"
+  #= Generate variable declarations for eliminated variables (batch eval) =#
+  local batchAssignExprs = Expr[]
+  for varName in elimVars
+    local elimSym = Symbol(varName)
+    push!(batchAssignExprs,
+      :($(elimSym) = Symbolics.variable($(QuoteNode(elimSym)),
+          T = Symbolics.FnType{Tuple{Real}, Real})(
+            Symbolics.variable(:t, T = Real))))
+  end
+  local batchBlock = Expr(:block, batchAssignExprs...)
+  #= Generate residual expressions and solve_for calls inside a function.
+     The function is defined AFTER the eval (so it sees the new bindings)
+     and called via Base.invokelatest (to cross the world-age barrier).
+     For each eliminated pair (varName, residualEq), the residual is
+     0 = expr_involving_var. We use Symbolics.solve_for to extract the
+     solved form elimVar ~ rhs. =#
+  local solveBodyExprs = Expr[]
+  for (i, varName) in enumerate(elimVars)
+    local elimSym = Symbol(varName)
+    local residualExpr = expToJuliaExpMTK(elimEqs[i].exp, simCode; derSymbol = false)
+    push!(solveBodyExprs, quote
+      local _elimResidual = $(residualExpr)
+      local _elimRhs = Symbolics.solve_for(0 ~ _elimResidual, $(elimSym))
+      push!(_elimObsEqs, $(elimSym) ~ _elimRhs)
+    end)
+  end
+  return quote
+    #= Declare eliminated non-dynamic variables (single batch eval) =#
+    eval($(QuoteNode(batchBlock)))
+    #= Solve residuals and create observed equations.
+       Wrapped in a function + invokelatest to handle world-age from eval. =#
+    function _solveEliminatedObserved()
+      local _elimObsEqs = Symbolics.Equation[]
+      $(solveBodyExprs...)
+      return _elimObsEqs
+    end
+    append!(observedEqs, Base.invokelatest(_solveEliminatedObserved))
   end
 end
 

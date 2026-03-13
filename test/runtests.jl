@@ -31,102 +31,171 @@
 
 #= Author John Tinnerholm & Andreas Heureman =#
 
-import CSV
-import Tables
+#=
+  OMBackend unit tests.
+
+  These tests exercise the backend pipeline using hand-crafted DAE IR
+  constructs. The ExampleDAE module provides the IR as a stable contract
+  for the DAE.DAE_LIST input format.
+
+  For full integration tests (frontend + backend + simulation), see
+  the top-level OM.jl test suite at /test/runtests.jl.
+=#
 
 import Absyn
 import SCode
 import DAE
 using MetaModelica
-#=
-  Danger: Do not remove this using line it is needed to init the parser.
-=#
 import OMParser
 import OMFrontend
-
-#= **** =#
-
 using OMBackend
-include("./ExampleDAE/ExampleDAEs.jl")
-import ..ExampleDAEs
 using Test
+using DifferentialEquations: ReturnCode
 
-import OMBackend.Runtime.OMSolution
+include("./ExampleDAE/ExampleDAEs.jl")
+import .ExampleDAEs
 
-"""
-  Test translation to backend DAE.
-  Also test simulation from 0.0 to 1.0 seconds. 
-  Does not verify semantics, only checks that the model was simulated correctly.
-"""
-function testBackend(TEST_CASES::Array; mode)
-  local MODEL_NAME = ""
-  #= These tests does not validate the semantics. Only that we can successfully compile and simulate this set of models=#
-  @testset "Sanity test. Simple translation and simulation of non-hybrid-DAE" begin
-    @testset "Simple non-hybrid continuous systems" begin
-      for testCase in TEST_CASES
-        @testset "$testCase" begin
-          @testset "Compile" begin
-            frontendDAE::OMBackend.DAE.DAE_LIST = getfield(ExampleDAEs,Symbol("$(testCase)_DAE"))
-            try
-              #= TODO: We should check this with some reference IR =#
-              (MODEL_NAME, modelCode) = OMBackend.translate(frontendDAE; BackendMode = mode)
-              @debug generateFile(testCase, modelCode)
-              @info "Translated: $MODEL_NAME"
-              @test true
-            catch e
-              @info e
-              throw(e)
-              @test false
-            end
-          end
-          @testset "Simulate" begin
-            @info "Simulating: $MODEL_NAME"
-            try
-              simulationResult = getSimulationResult(OMBackend.simulateModel(MODEL_NAME; MODE = mode, tspan=(0.0, 1.0)))
-              @test simulationResult == :Success
-            catch e
-              @info "Simulation failure: see $(testCase)_result.csv"
-              @info "Simulatio result was:"
-              @test false
-            end
-          end
-        end
-      end
+@testset "OMBackend" begin
+
+  #= ── 1. Cache management ──────────────────────────────────────── =#
+
+  @testset "clearCaches!" begin
+    @testset "clears all caches" begin
+      #= Populate each cache with dummy entries =#
+      OMBackend.COMPILED_MODELS_MTK["TestModel"] = (Expr(:block, :nothing), false, UInt64(0))
+      OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[:testFunc] = identity
+      OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS[:testFunc] = identity
+      OMBackend.CodeGeneration.ELEM_FUNC_CACHE[(:testFunc, (1,))] = identity
+      @test !isempty(OMBackend.COMPILED_MODELS_MTK)
+      @test !isempty(OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS)
+      @test !isempty(OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS)
+      @test !isempty(OMBackend.CodeGeneration.ELEM_FUNC_CACHE)
+
+      cleared = OMBackend.clearCaches!()
+      @test Set(cleared) == Set(["models", "implementations", "wrappers", "extractors"])
+      @test isempty(OMBackend.COMPILED_MODELS_MTK)
+      @test isempty(OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS)
+      @test isempty(OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS)
+      @test isempty(OMBackend.CodeGeneration.ELEM_FUNC_CACHE)
+    end
+
+    @testset "selective clearing" begin
+      #= Populate all caches =#
+      OMBackend.COMPILED_MODELS_MTK["TestModel"] = (Expr(:block, :nothing), false, UInt64(0))
+      OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[:testFunc] = identity
+      OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS[:testFunc] = identity
+      OMBackend.CodeGeneration.ELEM_FUNC_CACHE[(:testFunc, (1,))] = identity
+
+      #= Clear only models =#
+      cleared = OMBackend.clearCaches!(models=true, implementations=false,
+                                       wrappers=false, extractors=false)
+      @test cleared == ["models"]
+      @test isempty(OMBackend.COMPILED_MODELS_MTK)
+      #= Others should still have entries =#
+      @test !isempty(OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS)
+      @test !isempty(OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS)
+      @test !isempty(OMBackend.CodeGeneration.ELEM_FUNC_CACHE)
+
+      #= Clean up =#
+      OMBackend.clearCaches!()
     end
   end
-end
 
-"Get the solution code for an OMSolution"
-function getSimulationResult(solution::OMBackend.Runtime.OMSolution)
-  return solution.diffEqSol.retcode
-end
+  #= ── 2. Lowering (DAE IR -> BDAE IR) ──────────────────────────── =#
 
-"""
-  Get solution from a \"regular\" solution from DifferentialEquation.jl suite
-"""
-function getSimulationResult(regularSol)
-  return regularSol.retcode
-end
-
-"""
-  Main driver to run the test cases.
-"""
-function runTests()
-  #= DAE's to use for the sanity check. =#
-  TEST_CASES_BASIC = ["helloWorld", "lotkaVolterra", "vanDerPol"]
-  TEST_CASES_ADVANCED = ["simpleMech", "simpleCircuit"]
-  TEST_CASES_HYBRID = ["bouncingBallReals"]
-  @testset "Backend test" begin
-    @testset "DifferentialEquations.jl Backend tests" begin
-#      testBackend(TEST_CASES_BASIC; mode= OMBackend.DAE_MODE)
-#      testBackend(TEST_CASES_ADVANCED; mode= OMBackend.DAE_MODE)
-      #= Currently failing due to  https://github.com/SciML/Sundials.jl/issues/292 and https://github.com/SciML/Sundials.jl/issues/290=#
-      #testBackend(TEST_CASES_HYBRID; mode = OMBackend.DAE_MODE)
+  @testset "Lowering" begin
+    @testset "HelloWorld" begin
+      bDAE = OMBackend.lower(ExampleDAEs.helloWorld_DAE)
+      eqSys = first(bDAE.eqs)
+      @test length(eqSys.orderedEqs) >= 1
+      @test length(eqSys.orderedVars) >= 1
     end
-    @testset "MTK backend test" begin
-      testBackend(TEST_CASES_BASIC; mode= OMBackend.MTK_MODE)
+
+    @testset "LotkaVolterra" begin
+      bDAE = OMBackend.lower(ExampleDAEs.lotkaVolterra_DAE)
+      eqSys = first(bDAE.eqs)
+      @test length(eqSys.orderedEqs) >= 2
+    end
+
+    @testset "VanDerPol" begin
+      bDAE = OMBackend.lower(ExampleDAEs.vanDerPol_DAE)
+      eqSys = first(bDAE.eqs)
+      @test length(eqSys.orderedEqs) >= 2
+    end
+
+    @testset "SimpleMech" begin
+      bDAE = OMBackend.lower(ExampleDAEs.simpleMech_DAE)
+      eqSys = first(bDAE.eqs)
+      @test length(eqSys.orderedEqs) >= 4
+    end
+
+    @testset "SimpleCircuit" begin
+      bDAE = OMBackend.lower(ExampleDAEs.simpleCircuit_DAE)
+      eqSys = first(bDAE.eqs)
+      @test length(eqSys.orderedEqs) >= 6
     end
   end
-end
 
-runTests()
+  #= ── 3. Translation (DAE IR -> MTK code) ──────────────────────── =#
+
+  @testset "Translation" begin
+    OMBackend.clearCaches!()
+
+    @testset "HelloWorld translates" begin
+      (name, code) = OMBackend.translate(ExampleDAEs.helloWorld_DAE;
+                                          BackendMode=OMBackend.MTK_MODE)
+      @test name == "HelloWorld"
+      @test code isa Expr
+    end
+
+    @testset "LotkaVolterra translates" begin
+      (name, code) = OMBackend.translate(ExampleDAEs.lotkaVolterra_DAE;
+                                          BackendMode=OMBackend.MTK_MODE)
+      @test name == "LotkaVolterra"
+      @test code isa Expr
+    end
+
+    @testset "VanDerPol translates" begin
+      (name, code) = OMBackend.translate(ExampleDAEs.vanDerPol_DAE;
+                                          BackendMode=OMBackend.MTK_MODE)
+      @test name == "VanDerPol"
+      @test code isa Expr
+    end
+  end
+
+  #= ── 4. Simulation with result verification ───────────────────── =#
+
+  @testset "Simulation" begin
+    OMBackend.clearCaches!()
+
+    @testset "HelloWorld: der(x) = -a*x" begin
+      OMBackend.translate(ExampleDAEs.helloWorld_DAE;
+                          BackendMode=OMBackend.MTK_MODE)
+      sol = OMBackend.simulateModel("HelloWorld";
+                                     MODE=OMBackend.MTK_MODE,
+                                     tspan=(0.0, 1.0))
+      @test sol.retcode == ReturnCode.Success
+      # Analytical: x(t) = exp(-t), so x(1) = exp(-1)
+      @test isapprox(last(sol.u)[1], exp(-1.0); atol=1e-4)
+    end
+
+    @testset "LotkaVolterra simulates" begin
+      OMBackend.translate(ExampleDAEs.lotkaVolterra_DAE;
+                          BackendMode=OMBackend.MTK_MODE)
+      sol = OMBackend.simulateModel("LotkaVolterra";
+                                     MODE=OMBackend.MTK_MODE,
+                                     tspan=(0.0, 1.0))
+      @test sol.retcode == ReturnCode.Success
+    end
+
+    @testset "VanDerPol simulates" begin
+      OMBackend.translate(ExampleDAEs.vanDerPol_DAE;
+                          BackendMode=OMBackend.MTK_MODE)
+      sol = OMBackend.simulateModel("VanDerPol";
+                                     MODE=OMBackend.MTK_MODE,
+                                     tspan=(0.0, 1.0))
+      @test sol.retcode == ReturnCode.Success
+    end
+  end
+
+end

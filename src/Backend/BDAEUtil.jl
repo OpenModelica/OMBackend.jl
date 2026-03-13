@@ -509,20 +509,6 @@ function getSubscriptAsIntArray(dims)::Array
   return dimIndices
 end
 
-"""
-input: 100
-output \"₁₀₀\"
-"""
-function getIntAsUnicodeSubscript(i::Integer)
-  local subscriptStr = ""
-  while i > 0
-    tmp = i % 10
-    subscriptStr  *= OMBackend.LATEX_SYMBOLS["\\_" * string(tmp)]
-    i =  i ÷ 10
-  end
-  #= Since the code above generates the string in the reverse order it needs to be re reversed=#
-  return reverse(subscriptStr)
-end
 
 """
   Inverts a given DAE.Exp

@@ -603,7 +603,7 @@ Returns, a tuple of the new model and the simulation code of this model.
 function runBackend(flatModelica, classToInstantiate)
   local bdae = OMBackend.lower(flatModelica)
   local simulationCode = OMBackend.generateSimulationCode(bdae; mode = OMBackend.MTK_MODE)
-  local newModel = OMBackend.CodeGeneration.ODE_MODE_MTK_MODEL_GENERATION(simulationCode, classToInstantiate, [])
+  local newModel = OMBackend.CodeGeneration.ODE_MODE_MTK_MODEL_GENERATION(simulationCode, classToInstantiate, []; useDirectRHS = false)
   return (newModel, simulationCode)
 end
 
@@ -615,7 +615,7 @@ function translateToSimCode(flatModelica, classToInstantiate)
 end
 
 function translateToMTK(simulationCode, classToInstantiate)
-  local newModel = OMBackend.CodeGeneration.ODE_MODE_MTK_MODEL_GENERATION(simulationCode, classToInstantiate, [])
+  local newModel = OMBackend.CodeGeneration.ODE_MODE_MTK_MODEL_GENERATION(simulationCode, classToInstantiate, []; useDirectRHS = false)
   return newModel
 end
 

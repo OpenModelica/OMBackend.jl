@@ -86,9 +86,6 @@ function detectIfExpressions(dae::BDAE.BACKEND_DAE)
   BDAEUtil.mapEqSystems(dae, detectIfEquationsEqSystem)
 end
 
-function detectAndReplaceArrayVariables(dae::BDAE.BACKEND_DAE, expandedVariables::Array)
-  error("replaceArrayVariables is not implemented. This code path (old DAE.DAE_LIST frontend) is not supported.")
-end
 
 """
     kabdelhak:
@@ -809,65 +806,6 @@ function makeResidualEquations(syst::BDAE.EQSYSTEM)
   syst = BDAEUtil.mapEqSystemEquations(syst, BackendEquation.makeResidualEquation)
 end
 
-"""
-johti17:
-  Expand variables in arrays.
- if x = [x₁, x₂, x₃, x₄] is an array of 4 elements it is replaced by
-  x₁, x₂, x₃, x₄.
- The new name for each component is <variable-name>_<index>
-"""
-function expandArrayVariables(bDAE::BDAE.BACKEND_DAE)::Tuple{BDAE.BACKEND_DAE, Array}
-  local systems = bDAE.eqs
-  local expandedVars = []
-  local newVars = []
-  for system in systems
-    local orderedVars = system.orderedVars
-    local indexOfExpandedVariables = []
-    for v in orderedVars
-      if typeof(v.varType) == DAE.T_ARRAY
-        local dims = v.varType.dims
-        local dimIndices = BDAEUtil.getSubscriptAsIntArray(dims)
-        #= We know how many variables we are supposed to generate now. =#
-        local etype = v.varType.ty
-        local varPrototype = v
-        local newVarNames = []
-        for r in dimIndices
-          for i in 1:r
-            local newVarName = string(v.varName)
-            newVarName *= BDAEUtil.getIntAsUnicodeSubscript(i)
-            push!(newVarNames, newVarName)
-          end
-        end
-        for vName in newVarNames
-          nV = BDAE.VAR(DAE.CREF_IDENT(vName, etype, nil),
-                            varPrototype.varKind,
-                            varPrototype.varDirection,
-                            etype,
-                            varPrototype.bindExp,
-                            varPrototype.arryDim,
-                            varPrototype.source,
-                            varPrototype.values,
-                            varPrototype.tearingSelectOption,
-                            varPrototype.connectorType,
-                            varPrototype.unreplaceable
-                            )
-          push!(newVars, nV)
-        end
-        push!(expandedVars, v)
-        #= Expanding v=#
-        @debug "Expanding:" v
-        @debug "Expanded into: $(newVarNames)"
-      end
-    end
-  end
-  #= Expanded variables =#
-  #= TODO: Consider if there are more than one system =#
-  @debug "Expanded variables" string(expandedVars)
-  newOrderedVars = setdiff(bDAE.eqs[1].orderedVars, expandedVars)
-  newOrderedVars = vcat(newOrderedVars, newVars)
-  @assign bDAE.eqs[1].orderedVars = newOrderedVars
-  return (bDAE, expandedVars)
-end
 
 """
   Transform ASUB expressions where the inner expression is a der() call.

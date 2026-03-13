@@ -386,7 +386,7 @@ wrapWithInvokelatest(x) = x  #= For non-Expr types, return as-is =#
   These arise when a variable is reclassified as a parameter but its defining equation is kept.
   Such equations are either tautologies or contradictions and confuse the initialization system.
 """
-function filterConstantEquations(eqs::Vector{Symbolics.Equation})
+function filterConstantEquations(eqs::AbstractVector)
   filtered = filter(eqs) do eq
     lhs_vars = Symbolics.get_variables(eq.lhs)
     rhs_vars = Symbolics.get_variables(eq.rhs)
@@ -605,12 +605,19 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
       end
     end
   end
+  #= DirectRHS uses a plain Float64[] parameter vector, so the reduced system
+     must use split=false (flat vector) rather than split=true (MTKParameters).
+     This also makes generate_continuous_callbacks produce callbacks compatible
+     with the flat format. The non-DirectRHS path (VSS, standard ODEProblem)
+     needs split=true for SCCNonlinearProblem initialization to work.
+     The split value is embedded at codegen time by performStructuralSimplify. =#
+  local useSplit = get(kwargs, :split, true)
   if OMBackend.ENABLE_BACKEND_LOGGING
-    local _ss_timed = @timed ModelingToolkit.structural_simplify(sys, simplify = simplify)
+    local _ss_timed = @timed ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
     sys = _ss_timed.value
     @info "structural_simplify took $(_ss_timed.time)s, $(round(_ss_timed.bytes / 1e9, digits=2)) GiB"
   else
-    sys = ModelingToolkit.structural_simplify(sys, simplify = simplify)
+    sys = ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
   end
   local post_eqs = length(equations(sys))
   local post_full_eqs = length(ModelingToolkit.full_equations(sys))

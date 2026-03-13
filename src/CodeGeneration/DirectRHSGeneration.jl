@@ -70,6 +70,15 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
 
   @debug "DirectRHS: $(nStates) states, $(nParams) params, $(length(eqs)) equations"
 
+  # Handle empty systems (0 unknowns after structural_simplify).
+  # Use a dummy 1-element state so the ODE solver does not reject an empty range.
+  if nStates == 0
+    @debug "DirectRHS: empty system (0 unknowns), building trivial dummy problem"
+    local emptyRHS = (du, u, p, t) -> (du[1] = 0.0)
+    local f0 = ModelingToolkit.ODEFunction{true}(emptyRHS)
+    return ModelingToolkit.ODEProblem{true}(f0, [0.0], tspan, Float64[]; callback=callbacks)
+  end
+
   # 1. Build the RHS function expression from symbolic equations
   local rhs_list = [eq.rhs for eq in eqs]
   local f_ip_expr = _buildRHSExpression(rhs_list, states, params, iv)
@@ -83,18 +92,25 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
 
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
 
-  # 4. Construct ODEProblem, handling mass matrix for DAE systems
+  # 4. Extract event callbacks from the reduced system and merge with custom callbacks.
+  #    Our structural_simplify wrapper uses split=false, so the compiled event
+  #    callbacks expect a flat parameter vector matching our p_vec format.
+  local allCallbacks = _extractAndMergeEventCallbacks(reducedSystem, callbacks)
+
+  # 5. Construct ODEProblem, handling mass matrix for DAE systems.
+  #    Attach reducedSystem via sys= so callbacks can look up state/parameter
+  #    names from integrator.f.sys (used by getStatesAsSymbols/getParametersAsSymbols).
   local massMatrix = ModelingToolkit.calculate_massmatrix(reducedSystem)
   local problem
   if massMatrix isa LinearAlgebra.UniformScaling
     @debug "DirectRHS: pure ODE (identity mass matrix)"
-    local f = ModelingToolkit.ODEFunction{true}(rhsFunc)
-    problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=callbacks)
+    local f = ModelingToolkit.ODEFunction{true}(rhsFunc; sys=reducedSystem)
+    problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   else
     @debug "DirectRHS: DAE with mass matrix"
     local mm = collect(massMatrix)
-    local f = ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mm)
-    problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=callbacks)
+    local f = ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mm, sys=reducedSystem)
+    problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   end
 
   @debug "DirectRHS: problem constructed successfully"
@@ -275,6 +291,32 @@ function _resolveParamValues(pars)
   end
 
   return numericByStr
+end
+
+
+"""
+    _extractAndMergeEventCallbacks(reducedSystem, customCallbacks)
+
+Extract continuous and discrete event callbacks from the reduced MTK system
+and merge them with custom callbacks (e.g. VSS structural change callbacks).
+
+Requires the reduced system to have been compiled with `split=false` so that
+the generated event callback functions expect a flat parameter vector.
+"""
+function _extractAndMergeEventCallbacks(reducedSystem, customCallbacks)
+  local eventCBs = nothing
+  try
+    eventCBs = ModelingToolkit.process_events(reducedSystem; callback=customCallbacks)
+  catch ex
+    @warn "DirectRHS: failed to extract event callbacks, using custom callbacks only" exception=(ex, catch_backtrace())
+    return customCallbacks
+  end
+  if eventCBs === nothing
+    @debug "DirectRHS: no events in reduced system"
+    return customCallbacks
+  end
+  @debug "DirectRHS: extracted event callbacks from reduced system"
+  return eventCBs
 end
 
 

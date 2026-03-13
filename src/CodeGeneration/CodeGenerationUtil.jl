@@ -404,7 +404,7 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
         end
       else
         quote
-          der($(Symbol(varName)))
+          D($(Symbol(varName)))
         end
       end
     end
@@ -680,7 +680,8 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             @warn "expToJuliaExpMTK: resolved alias-eliminated T_ARRAY variable via fallback" lookUpStr
             aliasExpr
           else
-            throw(KeyError(lookUpStr))
+            #= Variable not in hash table (may have been eliminated), using direct reference =#
+            quote $(Symbol(string(varPrefix, arrName, varSuffix))) end
           end
         end
       end
@@ -727,7 +728,8 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                 @warn "expToJuliaExpMTK: resolved alias-eliminated variable via fallback" fullKey
                 aliasExpr
               else
-                throw(KeyError(fullKey))
+                #= Variable not in hash table (may have been eliminated), using direct reference =#
+                quote $(Symbol(string(varPrefix, fullKey, varSuffix))) end
               end
             end
           else
@@ -862,7 +864,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
               aliasEx
             else
               #= Variable not in hash table, using direct reference =#
-              Symbol(string(varPrefix, varName, varSuffix))
+              quote $(Symbol(string(varPrefix, varName, varSuffix))) end
             end
           end
         else
@@ -1297,8 +1299,9 @@ end
   If the system needs to conduct index reduction make sure to inform MTK.
 (We avoid structurally simplify for now since that might interfer with some other algorithms)
 """
-function performStructuralSimplify(simplify; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing)::Expr
-  local simplifyExpr = :(reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true))
+function performStructuralSimplify(simplify; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
+                                   split::Bool = !OMBackend.DIRECT_RHS_GENERATION[])::Expr
+  local simplifyExpr = :(reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true, split = $(split)))
   if observedFilter === nothing || isempty(observedFilter)
     return simplifyExpr
   end
@@ -1335,6 +1338,12 @@ TODO:
 Clearer seperation of discrete and non discrete if equations
 """
 function odeSystemWithEvents(hasEvents, modelName; hasObserved = false)
+  #= NOTE: When the model has events (if-equations), do not pass observed
+     equations to ODESystem. The ifCond variables created by if-equation
+     lowering appear inside ifelse conditions where the Jacobian is
+     structurally zero. MTK creates Shift(t,1) versions for discrete events
+     that inherit this structure, and passing observed equations in this
+     case breaks the tearing algorithm. =#
   if hasEvents && hasObserved
     :(ODESystem(eqs, t, vars, parameters;
               name=:($(Symbol($modelName))),
