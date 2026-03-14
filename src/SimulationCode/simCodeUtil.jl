@@ -1617,8 +1617,8 @@ function propagateConstants(simCode::SIM_CODE)
   @assign simCode.stringToSimVarHT = newHT
   @assign simCode.ifEquations = newIfEqs
   @assign simCode.whenEquations = newWhenEqs
-  @assign simCode.eliminatedEquations = vcat(simCode.eliminatedEquations, elimEqs)
-  @assign simCode.eliminatedVariables = vcat(simCode.eliminatedVariables, elimVarNames)
+  append!(simCode.eliminatedEquations, elimEqs)
+  append!(simCode.eliminatedVariables, elimVarNames)
   return simCode
 end
 
@@ -1975,8 +1975,8 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   @assign simCode.whenEquations = newWhenEqs
   @assign simCode.aliasMap = keptAliasEntries
   #= Append eliminated equations/variables to the existing lists =#
-  @assign simCode.eliminatedEquations = vcat(simCode.eliminatedEquations, elimEqs)
-  @assign simCode.eliminatedVariables = vcat(simCode.eliminatedVariables, elimVarNames)
+  append!(simCode.eliminatedEquations, elimEqs)
+  append!(simCode.eliminatedVariables, elimVarNames)
   return simCode
 end
 

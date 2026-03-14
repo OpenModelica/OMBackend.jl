@@ -226,8 +226,8 @@ function detectIfEquationsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
         #= Append the new variables to the list of variables =#
         local newVariables = collect(keys(tmpVarToElement))
         local newEquations = collect(values(tmpVarToElement))
-        @assign syst.orderedEqs = vcat(syst.orderedEqs, newEquations)
-        @assign syst.orderedVars = vcat(syst.orderedVars, newVariables)
+        append!(syst.orderedEqs, newEquations)
+        append!(syst.orderedVars, newVariables)
         syst
       end
     end

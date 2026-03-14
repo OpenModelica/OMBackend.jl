@@ -514,10 +514,15 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       $(generateEliminatedObservedBlock(simCode))
       #= ODE System =#
       nonLinearSystem = $(odeSystemWithEvents(!(isempty(ifConditionalStartEquations)), modelName;
-                                              hasObserved = !isempty(simCode.aliasMap)))
+                                              hasObserved = !isempty(simCode.aliasMap) || !isempty(simCode.eliminatedVariables)))
       firstOrderSystem = nonLinearSystem
       #= Structural simplification =#
       $(performStructuralSimplify(performIndexReduction; observedFilter = simCode.observedFilter, split = !useDirectRHS))
+      #= Inject observed equations post-simplification so they do not interfere
+         with AffectSystem tearing during callback compilation. =#
+      if @isdefined(observedEqs) && !isempty(observedEqs)
+        reducedSystem = OMBackend.CodeGeneration.injectObservedEquations(reducedSystem, observedEqs)
+      end
       #= Callbacks setup =#
       local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
       #= Wrap discrete start values in a function and call with invokelatest to avoid world-age issues =#

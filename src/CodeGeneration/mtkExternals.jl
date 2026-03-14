@@ -542,34 +542,42 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
 end
 
 """
+    injectObservedEquations(sys, observedEqs)
+
+Append `observedEqs` to the observed equations of a completed system.
+Used to inject observed equations AFTER structural_simplify so they do not
+interfere with AffectSystem tearing during callback compilation.
+"""
+function injectObservedEquations(sys, observedEqs::Vector)
+  #= MTK's getproperty follows the parent chain: if a completed system has
+     a parent, getvar is called on the PARENT, not on the child. So we must
+     inject into the parent as well, otherwise variable lookups from the
+     solution (e.g. sol[:absX]) will fail with "variable does not exist".
+     The observed field is a mutable Vector{Equation}, so we append! in-place
+     to avoid copying the entire immutable System struct. =#
+  append!(ModelingToolkit.get_observed(sys), observedEqs)
+  parent = ModelingToolkit.get_parent(sys)
+  if parent !== nothing
+    append!(ModelingToolkit.get_observed(parent), observedEqs)
+  end
+  return sys
+end
+
+"""
   TODO:
   Document why some parts here are outcommented
   The irreductable variables scheme does not work using plain simplify.
-
 
   It should be noted that for some models both running tearing and structurally simplify is needed.
   Report and issue for the MTK reporters giving an example of this behavior.
 
   One example is running tearing twice broke the system
-
-  """
+"""
 function structural_simplify(sys::ModelingToolkit.AbstractSystem,
                              io = nothing;
                              simplify = false,
                              allow_parameter = true,
                              kwargs...)
-  #sys = ModelingToolkit.ode_order_lowering(sys)
-  #sys = ModelingToolkit.dae_index_lowering(sys)
-  #sys = ModelingToolkit.tearing(sys; simplify = simplify)
-  if false #Note report this to the developers of modeling toolkit.
-    sys = ode_order_lowering(sys)
-    sys = dae_index_lowering(sys)
-    sys = ModelingToolkit.tearing(sys; simplify = false, allow_parameter = true)
-   # sys = mtkcompile(sys)
-    #Note some system breaks if tearing is run twice.
-    # Note2 In some cases we need to do index reduction before simplify
-    # return complete(sys) #Addition. To be removed.
-  end
   local pre_eqs = length(equations(sys))
   local pre_unknowns = length(unknowns(sys))
   @info "Before structural_simplify: $pre_eqs equations, $pre_unknowns unknowns"

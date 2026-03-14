@@ -991,7 +991,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             push!(args, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix = varSuffix,derSymbol = derSymbol))
           end
         end
-        expr.args = vcat(expr.args, args)
+        append!(expr.args, args)
         expr
       end
       DAE.CAST(ty, exp)  => begin
@@ -1338,18 +1338,13 @@ TODO:
 Clearer seperation of discrete and non discrete if equations
 """
 function odeSystemWithEvents(hasEvents, modelName; hasObserved = false)
-  #= NOTE: When the model has events (if-equations), do not pass observed
-     equations to ODESystem. The ifCond variables created by if-equation
-     lowering appear inside ifelse conditions where the Jacobian is
-     structurally zero. MTK creates Shift(t,1) versions for discrete events
-     that inherit this structure, and passing observed equations in this
-     case breaks the tearing algorithm. =#
-  if hasEvents && hasObserved
-    :(ODESystem(eqs, t, vars, parameters;
-              name=:($(Symbol($modelName))),
-              continuous_events = events, guesses = initialValues,
-              observed = observedEqs))
-  elseif hasEvents
+  #= When the model has events (if-equations), do NOT pass observed equations here.
+     MTK's complete(sys) injects observed(sys) into every callback's AffectSystem
+     (abstractsystem.jl:651), which causes tearing failures when observed equations
+     introduce variables the callback sub-system cannot solve.
+     Observed equations are injected into the reduced system AFTER structural_simplify
+     returns, so callbacks never see them (see MTK_CodeGeneration.jl). =#
+  if hasEvents
     :(ODESystem(eqs, t, vars, parameters;
               name=:($(Symbol($modelName))),
               continuous_events = events, guesses = initialValues))

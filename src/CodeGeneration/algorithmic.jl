@@ -643,7 +643,7 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         local args = map(explst) do arg
           expToJuliaExpAlg(arg)
         end
-        expr.args = vcat(expr.args, args)
+        append!(expr.args, args)
         quote
           $(expr)
         end
@@ -666,7 +666,7 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         local args = map(expLst) do arg
           expToJuliaExpAlg(arg)
         end
-        expr.args = vcat(expr.args, args)
+        append!(expr.args, args)
         expr
       end
       DAE.CAST(ty, exp)  => begin

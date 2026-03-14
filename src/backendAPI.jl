@@ -618,6 +618,39 @@ function simulateModel(modelName::String;
 end
 
 """
+    getMTKProblem(modelName; tspan=(0.0, 1.0), overwriteCache=false)
+
+Return the MTK ODEProblem for an already-translated model without solving it.
+Call `OM.translate` first, then use this to inspect the problem.
+
+# Example
+```julia
+OM.translate("Modelica.Mechanics.MultiBody.Examples.Elementary.Pendulum")
+prob = OMBackend.getMTKProblem("Modelica.Mechanics.MultiBody.Examples.Elementary.Pendulum")
+```
+"""
+function getMTKProblem(modelName::String;
+                       tspan = (0.0, 1.0),
+                       overwriteCache::Bool = false)
+  modelName = replace(modelName, "." => "__")
+  local modelCode::Expr
+  try
+    modelCode = getCompiledModel(modelName)
+  catch err
+    error("Model $(modelName) is not compiled. Call OMBackend.translate first. Available: $(availableModels())")
+  end
+  local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) || modelWasCompiledAgain(modelName)
+  if needsEval
+    @eval $modelCode
+  end
+  Base.invokelatest() do
+    local mod = getfield(OMBackend, Symbol(modelName))
+    local modelFn = getfield(mod, Symbol(string(modelName, "Model")))
+    modelFn(tspan)
+  end
+end
+
+"""
   Resimulates an already compiled model given a model that is already active in th environment
   along with a set of parameters as key value pairs.
 """
