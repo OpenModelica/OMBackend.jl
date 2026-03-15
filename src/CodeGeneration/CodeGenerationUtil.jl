@@ -1646,6 +1646,9 @@ end
 
 function getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode)
   local crefAsStr = string(x)
+  if crefAsStr == "time"
+    return :t
+  end
   @match _, simVar = simCode.stringToSimVarHT[crefAsStr]
   if !(SimulationCode.isParameter(simVar))
     Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(string(x))))))

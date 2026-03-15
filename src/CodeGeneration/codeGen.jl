@@ -307,10 +307,10 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
       local cond = quote  #= NOTE. Very expensive to get it as strings. This can be done better but requires slight redesign =#
         $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
           #local xStrs = $(map(x -> string(x), Util.getAllCrefs(cond)))
-          local xs = $(map(x -> Symbol(string(x)), Util.getAllCrefs(cond)))
+          local xs = $(map(x -> Symbol(string(x)), filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))))
           local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
           local NO_TRIGGER = 1.0
-          if all(isnothing, indices)
+          if !isempty(xs) && all(isnothing, indices)
             return NO_TRIGGER
           end
           local lookuptableStates = Dict((xs) .=> indices)
@@ -334,7 +334,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
           $(map(x->Expr(Symbol("="),
                         Symbol(string(x)),
                         getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
-                map(x -> BDAEUtil.getAllVariables(x, BDAE.VAR[]), listArray(wEq.whenStmtLst))...)...)
+                vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...))...)
           if integrator.dt == 0.0
             @error "integrator.dt was zero. Aborting."
             fail()

@@ -441,12 +441,9 @@ end
   output All variable in that specific equation
 """
 function getAllVariables(assignment::BDAE.ASSIGN, vars::Vector{BDAE.VAR})::Vector{DAE.ComponentRef}
-  local assignmentAsEq = BDAE.RESIDUAL_EQUATION(DAE.BINARY(assignment.left,
-                                                           DAE.SUB(assignment.left.ty),
-                                                           assignment.right),
-                                                assignment.source, BDAE.NO_ATTRIBUTES())
-  local variablesInEq = getAllVariables(assignmentAsEq, vars)
-  return variablesInEq
+  local leftCrefs = listArray(Util.getAllCrefs(assignment.left))
+  local rightCrefs = listArray(Util.getAllCrefs(assignment.right))
+  return vcat(leftCrefs, rightCrefs)
 end
 
 function getAllVariables(bdaeRenit::BDAE.REINIT, vars::Vector{BDAE.VAR})#::Vector{DAE.ComponentRef}
@@ -455,6 +452,19 @@ function getAllVariables(bdaeRenit::BDAE.REINIT, vars::Vector{BDAE.VAR})#::Vecto
   return vcat(variables, listArray(crefs))
 end
 
+"""
+  Returns CREFs from the right-hand side of a when-statement.
+  Used for generating local variable bindings in callback affect functions.
+  Excludes the target (stateVar/LHS) because the affect body accesses it
+  via integrator.u[idx] directly.
+"""
+function getRHSVariables(assignment::BDAE.ASSIGN)::Vector{DAE.ComponentRef}
+  return listArray(Util.getAllCrefs(assignment.right))
+end
+
+function getRHSVariables(bdaeReinit::BDAE.REINIT)::Vector{DAE.ComponentRef}
+  return listArray(Util.getAllCrefs(bdaeReinit.value))
+end
 
 """
   Fetches all variables in if equations.

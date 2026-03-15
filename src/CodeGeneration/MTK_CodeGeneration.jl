@@ -973,6 +973,15 @@ function createIfEquation(stateVariables::Vector,
   local nBranches::Int = length(ifEq.branches)
   local conditions = Expr[]
   local ivConditions = Bool[]
+  #= Pin all differential state variables in event affects so that MTK's DAE
+     reinitialization does not corrupt them. Without this, MTK treats all unknowns
+     as modifiable (documented behavior) and the reinitialization solver can change
+     differential states when algebraic variables are coupled to them via ifelse.
+     The fix uses the documented Pre() mechanism: x ~ Pre(x) preserves the value. =#
+  local statePinExprs = Expr[]
+  for sv in stateVariables
+    push!(statePinExprs, :($(Symbol(sv)) ~ ModelingToolkit.Pre($(Symbol(sv)))))
+  end
   for branch in ifEq.branches
     i += 1
     @match branch begin
@@ -985,10 +994,8 @@ function createIfEquation(stateVariables::Vector,
         local branchesWithConds::Int = nBranches - 1 #TODO DOCC - 1
         local affects::Vector{Expr} = generateAffect(i, branchesWithConds, ivCond)
         local inverseAffects::Vector{Expr} = generateInverseAffect(i, branchesWithConds, ivCond)
-        local cond = :(($(mtkCond)) => [$(affects...), $(inverseAffects...)])
-        #local inverseCond = :((!$(mtkCond)) => [$(inverseAffects...)])
+        local cond = :(($(mtkCond)) => [$(affects...), $(inverseAffects...), $(statePinExprs...)])
         push!(conditions, cond)
-        #push!(conditions, inverseCond)
         push!(ivConditions, ivCond)
       end
     end
@@ -996,13 +1003,11 @@ function createIfEquation(stateVariables::Vector,
   #= Create the equations themselves =#
   local target = 1
   local resEqs = ifEq.branches[target].residualEquations
-  local msg = "More than one equation in an if equation is not currently supported by OpenModelica.jl"
-  @assert(length(resEqs) == 1, msg)
   local ifExpressions = Expr[]
   #= The number of residuals is the same for both branches. =#
-  local nResEqsInTarget = length(ifEq.branches[target].residualEquations)
+  local nResEqsInTarget = length(resEqs)
   for resEqIdx in 1:nResEqsInTarget
-    local resEq = first(ifEq.branches[target].residualEquations)
+    local resEq = resEqs[resEqIdx]
     push!(ifExpressions,
           :($(last(deCausalize(resEq, simCode))) ~ $(generateIfExpressions(ifEq.branches,
                                                                            target,
@@ -1641,7 +1646,13 @@ function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.S
   for wStmt in  whenStatements
     @match wStmt begin
       BDAE.ASSIGN(__) => begin
-        throw("ASSIGN not supported in this context.")
+        local leftStr = SimulationCode.string(wStmt.left)
+        (index, var) = simCode.stringToSimVarHT[leftStr]
+        push!(res, quote
+                idx = lookuptableStates[Symbol($(string(var.name)))]
+                integrator.u[idx] = $(expToJuliaExpMTK(wStmt.right,
+                                                       simCode; varPrefix = varPrefix, varSuffix = varSuffix))
+              end)
       end
       #= Handles reinit =#
       BDAE.REINIT(__) => begin
