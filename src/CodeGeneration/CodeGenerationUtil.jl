@@ -122,9 +122,9 @@ function transformToMTKContinousCondition(cond, simCode)
     DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => begin
       :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)))
     end
-    #= Assumed to be a boolean variable =#
+    #= Boolean variable: convert to zero-crossing (var - 0.5) =#
     DAE.CREF(__) => begin
-      :($(expToJuliaExpMTK(cond, simCode)))
+      :($(expToJuliaExpMTK(cond, simCode)) - 0.5)
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
       :(min($(transformToMTKContinousConditionEquation(e1, simCode)),
@@ -163,9 +163,9 @@ function transformToMTKContinousConditionEquation(cond, simCode)
     DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => begin
       :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)) ~ 0)
     end
-    #= Assumed to be a boolean variable =#
+    #= Boolean variable: convert to zero-crossing equation (var - 0.5 ~ 0) =#
     DAE.CREF(__) => begin
-      :($(expToJuliaExpMTK(cond, simCode)))
+      :($(expToJuliaExpMTK(cond, simCode)) - 0.5 ~ 0)
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
       :(min($(transformToMTKContinousCondition(e1, simCode)),
@@ -412,6 +412,13 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
       varName = SimulationCode.DAE_identifierToString(listHead(expLst))
       quote
         $(Symbol(varName))
+      end
+    end
+    "initial" => begin
+      #= Modelica initial() is true only during initialization (handled separately by MTK).
+         In continuous equations it is always false (0 in arithmetic boolean context). =#
+      quote
+        0
       end
     end
     _  =>  begin
@@ -924,16 +931,23 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       end
       DAE.LUNARY(operator = op, exp = e1)  => begin
         local operand = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        local opSym = DAE_OP_toJuliaOperator(op)
-        :($opSym($(operand)))
+        @match op begin
+          DAE.NOT(__) => :(1 - $(operand))
+          _ => begin
+            local opSym = DAE_OP_toJuliaOperator(op)
+            :($opSym($(operand)))
+          end
+        end
       end
       DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
         local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
         local rhs = expToJuliaExpMTK(e2, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        #= || and && are special forms in Julia, not regular functions =#
+        #= Use arithmetic for boolean ops: AND = a*b, OR = a+b-a*b, on 0/1 values.
+           Neither short-circuit (&&/||) nor bitwise (|/&) work reliably with Symbolics.jl
+           due to type mismatches between Bool, Num, and BasicSymbolic{Real}. =#
         @match op begin
-          DAE.OR(__) => Expr(:||, lhs, rhs)
-          DAE.AND(__) => Expr(:&&, lhs, rhs)
+          DAE.OR(__) => :($(lhs) + $(rhs) - $(lhs) * $(rhs))
+          DAE.AND(__) => :($(lhs) * $(rhs))
           _ => begin
             local opSym = DAE_OP_toJuliaOperator(op)
             :($opSym($(lhs), $(rhs)))
@@ -970,7 +984,9 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         local condJL = expToJuliaExpMTK(expCond, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
         local thenJL = expToJuliaExpMTK(expThen, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
         local elseJL = expToJuliaExpMTK(expElse, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-        :(ModelingToolkit.ifelse($(condJL), $(thenJL), $(elseJL)))
+        #= Use arithmetic ifelse: cond*then + (1-cond)*else. This avoids type dispatch
+           issues with ModelingToolkit.ifelse on BasicSymbolic{Real} vs Num. =#
+        :($(condJL) * $(thenJL) + (1 - $(condJL)) * $(elseJL))
       end
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
         #Call as symbol is really ugly.. please fix me :(
@@ -1123,6 +1139,11 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           local stepExpr = expToJuliaExpMTK(stepExpOpt, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
           :($startExpr:$stepExpr:$stopExpr)
         end
+      end
+      DAE.TSUB(tupleExp, ix, _) => begin
+        #= Tuple subscript: extract element ix from a tuple-returning expression =#
+        local tupleExpr = expToJuliaExpMTK(tupleExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+        :($tupleExpr[$ix])
       end
     _ =>  throw(ErrorException("$exp not yet supported"))
     end
@@ -1331,11 +1352,8 @@ end
 
 """
   Generates different constructors for the ODESystem depending on given parameters.
-TODO:
-Having them as discrete events are currently a workaround...
-They should be added as continuous events for continous variables.
-TODO:
-Clearer seperation of discrete and non discrete if equations
+  If-equation events use SymbolicContinuousCallback with discrete_parameters,
+  so ifCond variables live in the parameter vector (not ODE state).
 """
 function odeSystemWithEvents(hasEvents, modelName; hasObserved = false)
   #= When the model has events (if-equations), do NOT pass observed equations here.
@@ -1424,14 +1442,21 @@ function evalDAE_Expression(expr, simCode)::Expr
   function replaceParameterVariable(exp, ht)
     if Util.isCref(exp)
       local simVar = last(simCode.stringToSimVarHT[string(exp)])
-      if ! SimulationCode.isStateOrAlgebraic(simVar)
-        @match SimulationCode.SIMVAR(name, _, SimulationCode.PARAMETER(SOME(bindExp)), _) = simVar
-        return (bindExp, true, ht)
-      else
-        @warn "States and Algebraic variables in initial equations is not supported"
+      if SimulationCode.isStateOrAlgebraic(simVar)
         shouldEval = false
-        #fail()
-        #return (expToJuliaExpMTK(), )
+      else
+        #= Try to get binding expression for parameter substitution =#
+        local bindExp = @match simVar.varKind begin
+          SimulationCode.PARAMETER(SOME(be)) => be
+          _ => nothing
+        end
+        if bindExp !== nothing
+          return (bindExp, true, ht)
+        else
+          #= Parameter without binding (fixed=false, determined by initial equation).
+             Leave CREF in place like a state/algebraic variable. =#
+          shouldEval = false
+        end
       end
     end
     (exp, true, ht)
@@ -1445,25 +1470,284 @@ function evalDAE_Expression(expr, simCode)::Expr
 end
 
 """
-  Decide the iv of the condition.
-  This currently assumes that the simulation starts at 0.0 (which might not be the case).
-  This function needs to be improved so that it also evaluates static parameters.
+    isParametricOnlyEquation(eq, simCode) -> Bool
+
+Check if an initial equation only involves parameters (no state/algebraic variables).
+Such equations determine parameter values and should not be treated as initial conditions.
 """
-function evalInitialCondition(mtkCond)
+function isParametricOnlyEquation(eq, simCode::SimulationCode.SimCode)::Bool
+  ht = simCode.stringToSimVarHT
+  hasStateOrAlg = Ref(false)
+  function checker(exp, acc)
+    if Util.isCref(exp)
+      local key = string(exp)
+      local entry = get(ht, key, nothing)
+      if entry !== nothing
+        local sv = last(entry)
+        if SimulationCode.isStateOrAlgebraic(sv)
+          hasStateOrAlg[] = true
+        end
+      end
+    end
+    (exp, true, acc)
+  end
+  Util.traverseExpBottomUp(eq.lhs, checker, 0)
+  if !hasStateOrAlg[]
+    Util.traverseExpBottomUp(eq.rhs, checker, 0)
+  end
+  return !hasStateOrAlg[]
+end
+
+"""
+    solveParametricInitialEquations!(simCode)
+
+For initial equations that only involve parameters (no states/algebraics),
+solve numerically for parameters with `fixed=false` (no binding).
+Updates the simCode hash table with the solved binding values.
+"""
+function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
+  ht = simCode.stringToSimVarHT
+  for ieq in simCode.initialEquations
+    if !isParametricOnlyEquation(ieq, simCode)
+      continue
+    end
+    #= Find free parameters (no binding) in this equation =#
+    freeParams = String[]
+    function findFree(exp, acc)
+      if Util.isCref(exp)
+        local key = string(exp)
+        local entry = get(ht, key, nothing)
+        if entry !== nothing
+          local sv = last(entry)
+          if !SimulationCode.hasBindingExp(sv) && SimulationCode.isParameter(sv)
+            push!(freeParams, key)
+          end
+        end
+      end
+      (exp, true, acc)
+    end
+    Util.traverseExpBottomUp(ieq.lhs, findFree, 0)
+    Util.traverseExpBottomUp(ieq.rhs, findFree, 0)
+    unique!(freeParams)
+    if length(freeParams) != 1
+      continue
+    end
+    freeName = freeParams[1]
+    #= Build a parameter value map for all bound parameters =#
+    paramValues = Dict{String, Float64}()
+    for (key, (_, sv)) in ht
+      if sv.varKind isa SimulationCode.PARAMETER && SimulationCode.hasBindingExp(sv)
+        try
+          paramValues[key] = Float64(evalSimCodeParameter(sv, simCode))
+        catch
+        end
+      end
+    end
+    #= Get initial guess from start attribute =#
+    local (_, freeSV) = ht[freeName]
+    local guess = 0.1
+    @match freeSV.attributes begin
+      SOME(attr) => begin
+        @match attr.start begin
+          SOME(startExp) => begin
+            try
+              guess = Float64(evalDAEConstant(startExp, simCode))
+            catch
+            end
+          end
+          _ => nothing
+        end
+      end
+      _ => nothing
+    end
+    #= Build residual: LHS - RHS = 0 =#
+    #= Replace all bound params with their values, leave free param as variable =#
+    function substituteParams(exp, acc)
+      if Util.isCref(exp)
+        local key = string(exp)
+        if key == freeName
+          return (exp, true, acc)
+        end
+        local val = get(paramValues, key, nothing)
+        if val !== nothing
+          return (DAE.RCONST(val), true, acc)
+        end
+      end
+      (exp, true, acc)
+    end
+    local lhsSubst = first(Util.traverseExpBottomUp(ieq.lhs, substituteParams, 0))
+    local rhsSubst = first(Util.traverseExpBottomUp(ieq.rhs, substituteParams, 0))
+    #= Evaluate LHS (should be all constants) =#
+    local lhsJl = expToJuliaExpMTK(lhsSubst, simCode)
+    local lhsVal = try
+      Float64(eval(lhsJl))
+    catch
+      @warn "solveParametricInitialEquations: could not evaluate LHS" freeName
+      continue
+    end
+    #= Build a Julia function for RHS with the free param as argument =#
+    local freeSymbol = Symbol(replace(freeName, "." => "_"))
+    local rhsJl = expToJuliaExpMTK(rhsSubst, simCode)
+    #= Create residual function: f(x) = lhsVal - rhs(x) =#
+    local residualFn = try
+      eval(Expr(:->, freeSymbol, Expr(:call, :-, lhsVal, rhsJl)))
+    catch e
+      @warn "solveParametricInitialEquations: could not build residual" freeName e
+      continue
+    end
+    #= Newton-Raphson solver (use invokelatest to avoid world-age issues) =#
+    local x = guess
+    local eps = 1e-10
+    local maxIter = 100
+    for _ in 1:maxIter
+      local fx = Base.invokelatest(residualFn, x)
+      if abs(fx) < eps
+        break
+      end
+      local h = max(abs(x) * 1e-8, 1e-12)
+      local dfx = (Base.invokelatest(residualFn, x + h) - Base.invokelatest(residualFn, x - h)) / (2h)
+      if abs(dfx) < 1e-15
+        break
+      end
+      x -= fx / dfx
+    end
+    @info "solveParametricInitialEquations: solved $freeName = $x (from initial equation)"
+    #= Update the simCode hash table with the solved value =#
+    local (idx, oldSV) = ht[freeName]
+    local newSV = SimulationCode.SIMVAR(oldSV.name, oldSV.index,
+      SimulationCode.PARAMETER(SOME(DAE.RCONST(x))), oldSV.attributes)
+    ht[freeName] = (idx, newSV)
+  end
+end
+
+"""
+  Decide the iv of the condition (whether the zero-crossing function is at zero at t=0).
+  Returns true if the zero-crossing expression evaluates to zero at t=0.
+  Returns false if it evaluates to a nonzero value (guard is active or inactive).
+  When simCode is provided, substitutes parameter values and state variable start values.
+"""
+function evalInitialCondition(mtkCond, simCode = nothing)
+  #= Evaluate zero-crossing function at t=0 to determine initial condition.
+     Works at the Expr level: walks the mtkCond Expr tree, substitutes all
+     variable/parameter references with numeric values, then evals the result.
+     Returns true when the zero-crossing function is non-negative at t=0
+     (condition FALSE), false when negative (condition TRUE).
+     The caller inverts: ifCond = !(evalInitialCondition(...)). =#
   try
-    local mtkCondE = eval(mtkCond)
-    local v = substitute(mtkCondE.lhs, t => 0.0)
-    local ivCond = (v == 0)
-    if ivCond == false
-      return ivCond
+    if simCode === nothing
+      #= No simCode: fall back to old behavior =#
+      local mtkCondE = Base.invokelatest(eval, mtkCond)
+      local lhs = mtkCondE.lhs
+      local tSym = eval(:(Symbolics.variable(:t, T = Real)))
+      local v = Base.invokelatest(substitute, lhs, Dict(tSym => 0.0))
+      local numV = try Float64(v) catch; nothing end
+      if numV !== nothing
+        return numV >= 0.0
+      end
+      return (v == 0) != false
     end
-    if length(v.val.arguments) > 1
-      return true
+    #= Build symbol -> value map from simCode =#
+    local valMap = Dict{Symbol, Float64}()
+    local ht = simCode.stringToSimVarHT
+    for (key, (_, sv)) in ht
+      local sym = Symbol(replace(key, "." => "_"))
+      if sv.varKind isa SimulationCode.PARAMETER
+        local pval = try
+          Float64(evalSimCodeParameter(sv, simCode))
+        catch
+          try
+            @match SOME(attr) = sv.attributes
+            @match SOME(startExp) = attr.start
+            Float64(evalDAEConstant(startExp, simCode))
+          catch
+            nothing
+          end
+        end
+        if pval !== nothing
+          valMap[sym] = pval
+        end
+      elseif SimulationCode.isStateOrAlgebraic(sv)
+        local sval = 0.0
+        try
+          @match SOME(attr) = sv.attributes
+          @match SOME(startExp) = attr.start
+          sval = Float64(evalDAEConstant(startExp, simCode))
+        catch
+        end
+        valMap[sym] = sval
+      end
     end
-    return ivCond
-  catch #= Unable to evaluate at this point in time. =#
+    #= Extract LHS from the mtkCond Expr (form: :(lhs ~ 0)) =#
+    local lhsExpr = _extractZeroCrossingLHS(mtkCond)
+    #= Substitute all variable references with numeric values =#
+    local numExpr = _substituteExprValues(lhsExpr, valMap)
+    #= Evaluate the resulting numeric expression =#
+    local result = Base.invokelatest(eval, numExpr)
+    local numResult = Float64(result)
+    #= The zero-crossing function is negative when the condition is TRUE,
+       positive when FALSE. Return true when condition is FALSE (positive),
+       because the caller inverts: ifCond = !(evalInitialCondition(...)). =#
+    return numResult >= 0.0
+  catch e
+    @warn "evalInitialCondition: failed to evaluate, defaulting to true" exception=(e, catch_backtrace())
     return true
   end
+end
+
+"""
+Extract the LHS from a zero-crossing equation Expr of the form :(lhs ~ 0).
+Handles nested forms like :(min(a, b) ~ 0).
+"""
+function _extractZeroCrossingLHS(expr::Expr)
+  if expr.head == :call && length(expr.args) == 3 && expr.args[1] == :~
+    return expr.args[2]
+  end
+  return expr
+end
+
+"""
+Walk an Expr tree and substitute variable references with numeric values.
+- `sym(t)` calls (MTK variable references) -> look up sym in valMap
+- bare Symbols -> look up in valMap if present
+- :t -> 0.0
+"""
+function _substituteExprValues(expr, valMap::Dict{Symbol, Float64})
+  if expr isa Number
+    return Float64(expr)
+  end
+  if expr isa Symbol
+    if expr == :t
+      return 0.0
+    end
+    if haskey(valMap, expr)
+      return valMap[expr]
+    end
+    return expr
+  end
+  if !(expr isa Expr)
+    return expr
+  end
+  if expr.head == :call
+    local fname = expr.args[1]
+    #= Pattern: varName(t) -> substitute with value from valMap =#
+    if fname isa Symbol && length(expr.args) == 2 && expr.args[2] == :t
+      if haskey(valMap, fname)
+        return valMap[fname]
+      end
+    end
+    #= Recurse into call arguments =#
+    local newArgs = Any[fname]
+    for i in 2:length(expr.args)
+      push!(newArgs, _substituteExprValues(expr.args[i], valMap))
+    end
+    return Expr(:call, newArgs...)
+  end
+  #= Generic recursion for other Expr types =#
+  local newExpr = Expr(expr.head)
+  for arg in expr.args
+    push!(newExpr.args, _substituteExprValues(arg, valMap))
+  end
+  return newExpr
 end
 
 """
@@ -1509,7 +1793,9 @@ function generateIfExpressions(branches,
     return :($(first(deCausalize(branch.residualEquations[resEqIdx], simCode))))
   end
   #= Otherwise generate code for the other part =#
-  local cond = :( $(Symbol(string("ifCond", identifier, subIdentifier))) == true )
+  #= ifCond variables are discrete parameters (not ODE unknowns), so the solver
+     never perturbs them during Jacobian computation. Exact comparison is safe. =#
+  local cond = :( $(Symbol(string("ifCond", identifier, subIdentifier))) == 1 )
   local rhs = first(deCausalize(branch.residualEquations[resEqIdx], simCode))
   quote
     ModelingToolkit.ifelse($(cond),

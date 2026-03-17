@@ -533,7 +533,14 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
           @info "Defaulted MTK derivative $(diffState) to 0.0 (no alias equation found)"
         end
       else
-        @info "Leaving differential state $(diffState) for MTK initialization (no explicit start value)"
+        #= Provide 0.0 as a guess (not hard) for Modelica variables without explicit start.
+           This gives MTK an initial iterate. If algebraic constraints determine the
+           value, MTK can override the guess during initialization. =#
+        push!(softInitialValues, diffState => 0.0)
+        local currentGuesses2 = ModelingToolkit.guesses(reducedSystem)
+        local newGuesses2 = merge(currentGuesses2, Dict(diffState => 0.0))
+        @set! reducedSystem.guesses = newGuesses2
+        @info "Providing default 0.0 guess for differential state $(diffState) (no explicit start value)"
       end
     end
   end
@@ -821,8 +828,13 @@ function getStatesAsSymbols(odeFunc::ODEFunction)
 end
 
 function getParametersAsSymbols(odeFunc::ODEFunction)
-  local states = ModelingToolkit.parameters(odeFunc.sys)
-  map(x->x.name, states)
+  local params = ModelingToolkit.parameters(odeFunc.sys)
+  map(params) do x
+    local uw = SymbolicUtils.unwrap(x)
+    #= Regular parameters are Sym (have .name), time-dependent discrete
+       parameters like ifCond(t) are Term (have .f.name). =#
+    hasproperty(uw, :name) ? uw.name : uw.f.name
+  end
 end
 
 function getSymsAsStrings(odeFunc::ODEFunction)

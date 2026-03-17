@@ -191,6 +191,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
     @match func begin
       SimulationCode.MODELICA_FUNCTION(__) => begin
         local locals = generateLocals(func.locals)
+        local outputDefaults = generateOutputDefaults(func.outputs)
         local arrayConversions = generateArrayConversions(func.inputs)
         local statements = generateStatements(func.statements)
         local returnExpr = if length(outputs) > 1
@@ -201,7 +202,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
           nothing
         end
         #= Build the anonymous function expression manually to avoid parsing issues =#
-        local funcBody = Expr(:block, arrayConversions..., locals..., statements..., :(return $(returnExpr)))
+        local funcBody = Expr(:block, arrayConversions..., outputDefaults..., locals..., statements..., :(return $(returnExpr)))
         local anonFunc = if nArgs == 0
           Expr(:->, Expr(:tuple), funcBody)
         elseif inputsJL isa Tuple
@@ -339,6 +340,27 @@ function generateLocals(inputs::Vector)
   return jInputs
 end
 
+"""
+  Generate default-initialized local declarations for Modelica function output variables.
+  In Modelica, output variables are implicitly initialized (Real=0.0, Integer=0, Bool=false).
+  Without this, variables assigned only in one if-branch are undefined in other branches.
+"""
+function generateOutputDefaults(outputs::Vector)::Vector{Expr}
+  local decls = Expr[]
+  for v in outputs
+    local s = DAE_VAR_ToJulia(v)
+    local defaultVal = @match v.ty begin
+      DAE.T_REAL(__) => 0.0
+      DAE.T_INTEGER(__) => 0
+      DAE.T_BOOL(__) => false
+      DAE.T_STRING(__) => ""
+      _ => 0
+    end
+    push!(decls, :(local $s = $defaultVal))
+  end
+  return decls
+end
+
 function generateStatements(statements::Union{List{DAE.Statement}, Vector{DAE.Statement}})
   local jStmts = Expr[]
   for s in statements
@@ -370,8 +392,7 @@ function generateStatement(stmt::DAE.STMT_ASSIGN_ARR)
   return :($(Symbol(lhs)) = $(rhs))
 end
 
-function generateStatement(stmt::DAE.STMT_WHILE, simCode)
-  local buffer = IOBuffer()
+function generateStatement(stmt::DAE.STMT_WHILE)
   local cond = expToJuliaExpAlg(stmt.exp)
   local stmts = generateStatements(stmt.statementLst)
   quote

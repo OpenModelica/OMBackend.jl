@@ -39,6 +39,16 @@ function isParameter(simvar::SimVar)::Bool
 end
 
 """
+Returns true if the parameter has a binding expression.
+"""
+function hasBindingExp(simvar::SimVar)::Bool
+  @match simvar.varKind begin
+    PARAMETER(SOME(_)) => true
+    _ => false
+  end
+end
+
+"""
 Returns true if the variable is involved in a OCC chain.
 """
 function isOCCVar(simVar::SimVar)::Bool

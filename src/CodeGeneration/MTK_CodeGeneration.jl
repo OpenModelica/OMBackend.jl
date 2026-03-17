@@ -329,6 +329,9 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     end
   end
   local performIndexReduction = simCode.isSingular
+  #= Solve parametric initial equations (initial equations that only involve parameters).
+     This determines values for fixed=false parameters before code generation. =#
+  solveParametricInitialEquations!(simCode)
   #= Create equations for variables not in a loop + parameters and stuff=#
   local EQUATIONS = createResidualEquationsMTK(stateVariables,
                                                algebraicVariables,
@@ -378,20 +381,25 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local CONDITIONAL_EQUATIONS = collect(Iterators.flatten([component[2] for component in IF_EQUATION_COMPONENTS]))
   local ifConditionNameAndIV = collect(Iterators.flatten([component[5] for component in IF_EQUATION_COMPONENTS]))
   local ifConditionalVariables = collect(Iterators.flatten([component[4] for component in IF_EQUATION_COMPONENTS]))
-  local ZERO_DYNAMICS_COND_EQUATIONS = collect(Iterators.flatten([component[3] for component in IF_EQUATION_COMPONENTS]))
-  #= Expand the start conditions with initial equations for the zero dynamic equations for the conditional equations =#
-  local ifConditionalStartEquations = [:($(Symbol(first(v))) => $(last(v))) for v in ifConditionNameAndIV]
+  #= ifCond variables are parameters (not ODE unknowns).
+     Build @parameters declarations WITHOUT time dependency to avoid MTK creating
+     Shift operators. Plain parameters are still modifiable by callback affects. =#
+  local ifCondParamDecls = Expr[]
+  local ifCondParamPairs = Expr[]
+  for (name, initVal) in ifConditionNameAndIV
+    local sym = Symbol(name)
+    local numVal = initVal ? 1.0 : 0.0
+    push!(ifCondParamDecls, Expr(:(=), sym, numVal))
+    push!(ifCondParamPairs, :($(sym) => $(numVal)))
+  end
   #=
   In the latest variant of MTK we can not reuse the old variables for the creation of the ODEProblem later.
   Instead, we should only use the values for the unknowns we can't remove from the system.
   =#
   local irreductableSyms = Symbol[Symbol(vn) for vn in simCode.irreductableVariables]
-  #= Mark ifCond and ifEq_tmp variables as irreducible so MTK tearing does not
-     attempt to eliminate them. The ifCond variables appear inside ifelse conditions
-     where the Jacobian is structurally zero. MTK also creates Shift(t,1) versions
-     of these variables for discrete events, which inherit the equation structure
-     but not the metadata, so we also mark the ifEq_tmp LHS variables. =#
-  append!(irreductableSyms, ifConditionalVariables)
+  #= Mark ifEq_tmp LHS variables as irreducible so MTK tearing does not
+     eliminate them. ifCond variables are discrete parameters (not unknowns)
+     and do not need irreducible marking. =#
   for ceq in CONDITIONAL_EQUATIONS
     if ceq isa Expr && ceq.head == :call && length(ceq.args) >= 2
       lhs = ceq.args[2]
@@ -413,18 +421,17 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     String[vn for vn in simCode.irreductableVariables],
     String[],
     simCode; skipDefaultAlgebraicStarts = skipDefaultsForStates))
-  FINAL_START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations, DISCRETE_START_VALUES, FINAL_START_CONDTIONS_EQUATIONS)
-  START_CONDTIONS_EQUATIONS = vcat(ifConditionalStartEquations, DISCRETE_START_VALUES, START_CONDTIONS_EQUATIONS)
+  FINAL_START_CONDTIONS_EQUATIONS = vcat(DISCRETE_START_VALUES, FINAL_START_CONDTIONS_EQUATIONS)
+  START_CONDTIONS_EQUATIONS = vcat(DISCRETE_START_VALUES, START_CONDTIONS_EQUATIONS)
   #=
-    Merge the ifConditional components into the rest of the system and merge the state conditionals with the states
+    Merge equations. ifCond variables are discrete parameters so they are NOT
+    included in stateVariablesSym and do NOT get der() ~ 0 equations.
   =#
-  stateVariablesSym = vcat(ifConditionalVariables,
-                           discreteVariablesSym,
+  stateVariablesSym = vcat(discreteVariablesSym,
                            stateVariablesSym,
                            occVariablesSym)
   EQUATIONS = vcat(EQUATIONS,
                    DISCRETE_DUMMY_EQUATIONS,
-                   ZERO_DYNAMICS_COND_EQUATIONS,
                    CONDITIONAL_EQUATIONS)
   EQUATIONS = rewriteEquations(EQUATIONS, simCode)
   #= Reset the callback counter=#
@@ -454,6 +461,10 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       $(decomposeParametersDeclaration(parVariablesSym))
       #= Create array parameters with proper dimensions =#
       $(ARRAY_PARAMETERS...)
+      #= Declare ifCond variables as discrete time-dependent parameters.
+         These are modified by SymbolicContinuousCallback affects and are NOT
+         part of the ODE state vector, so the solver never perturbs them. =#
+      $(generateDiscreteIfCondDeclaration(ifCondParamDecls, ifConditionalVariables))
       #=
         Only variables that are present in the equation system later should be a part of the variables in the MTK system.
         This means that certain algebraic variables should not be listed among the variables (These are the discrete variables).
@@ -487,6 +498,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       vars = map(x -> last(x), vars)
       #= Initial values for the continuous system. =#
       $(decomposeParameterEquationsInline(PARAMETER_EQUATIONS))
+      #= Add ifCond discrete parameter values to pars dict =#
+      $(generateIfCondParamAssignments(ifCondParamPairs))
       startEquationComponents = []
       $(decomposeStartEquationsInline(START_CONDTIONS_EQUATIONS))
       for constructor in startEquationConstructors
@@ -513,7 +526,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       $(generateAliasObservedBlock(simCode))
       $(generateEliminatedObservedBlock(simCode))
       #= ODE System =#
-      nonLinearSystem = $(odeSystemWithEvents(!(isempty(ifConditionalStartEquations)), modelName;
+      nonLinearSystem = $(odeSystemWithEvents(!isempty(ifConditionalVariables), modelName;
                                               hasObserved = !isempty(simCode.aliasMap) || !isempty(simCode.eliminatedVariables)))
       firstOrderSystem = nonLinearSystem
       #= Structural simplification =#
@@ -738,6 +751,10 @@ end
 function generateInitialEquations(initialEqs, simCode::SimulationCode.SimCode; parameterAssignment = true)::Vector{Expr}
   local initialEqsExps = Expr[]
   for ieq in initialEqs
+    #= Skip parametric-only initial equations (already solved by solveParametricInitialEquations!) =#
+    if isParametricOnlyEquation(ieq, simCode)
+      continue
+    end
     #= LHS will typically be a variable. Don't have to be though.. =#
     lhs = expToJuliaExpMTK(ieq.lhs, simCode)
     rhs = @match ieq.rhs begin
@@ -746,10 +763,12 @@ function generateInitialEquations(initialEqs, simCode::SimulationCode.SimCode; p
         local crefAsStr = string(ieq.rhs)
         local simCodeVar = last(simCode.stringToSimVarHT[crefAsStr])
         local res = if SimulationCode.isStateOrAlgebraic(simCodeVar)
-          #= Otherwise get the start attribute =#
           expToJuliaExpMTK(ieq.rhs, simCode)
-        else
+        elseif SimulationCode.hasBindingExp(simCodeVar)
           evalSimCodeParameter(simCodeVar, simCode)
+        else
+          #= Parameter without binding (fixed=false): leave as symbol =#
+          expToJuliaExpMTK(ieq.rhs, simCode)
         end
       end
       #= For more complicated expressions, we do local constant folding. =#
@@ -947,41 +966,14 @@ function createIfEquation(stateVariables::Vector,
                           identifier::Int,
                           simCode)
   local result::Tuple{Vector{Expr}, Vector{Expr}, Vector{Expr}, Vector{Symbol}, Vector{Tuple}}
-  #= The cond res is what we are going to evaluate it to. =#
-  generateAffect(subIdentifier, nConditions, condRes) = begin
-    local exprs = Expr[]
-    local e
-      e = :($(Symbol(("ifCond$(identifier)$(subIdentifier)"))) ~ $(condRes))
-      push!(exprs, e)
-    return exprs
-  end
-  """
-  Generates the inverse affects. if one branch of the if equation is true.
-  Set the other dummy variables to false.
-  """
-  generateInverseAffect(subIdentifier, nConditions, condRes) = begin
-    local exprs = Expr[]
-    for i in 1:nConditions
-      if i != subIdentifier
-        local e = :($(Symbol(("ifCond$(identifier)$(i)"))) ~ $(!condRes))
-        push!(exprs, e)
-      end
-    end
-    return exprs
-  end
   local i::Int = 0
   local nBranches::Int = length(ifEq.branches)
+  local branchesWithConds::Int = nBranches - 1
+  #= Collect all ifCond symbols for this if-equation.
+     These are parameters modified by imperative affects. =#
+  local allIfCondSyms = [Symbol(string("ifCond", identifier, j)) for j in 1:branchesWithConds]
   local conditions = Expr[]
   local ivConditions = Bool[]
-  #= Pin all differential state variables in event affects so that MTK's DAE
-     reinitialization does not corrupt them. Without this, MTK treats all unknowns
-     as modifiable (documented behavior) and the reinitialization solver can change
-     differential states when algebraic variables are coupled to them via ifelse.
-     The fix uses the documented Pre() mechanism: x ~ Pre(x) preserves the value. =#
-  local statePinExprs = Expr[]
-  for sv in stateVariables
-    push!(statePinExprs, :($(Symbol(sv)) ~ ModelingToolkit.Pre($(Symbol(sv)))))
-  end
   for branch in ifEq.branches
     i += 1
     @match branch begin
@@ -990,11 +982,23 @@ function createIfEquation(stateVariables::Vector,
       SimulationCode.BRANCH(condition, residuals, _, targets, _, _, _, _, _) => begin
         local mtkCond = transformToMTKContinousConditionEquation(branch.condition, simCode)
         #= Evaluate the initial value condition. =#
-        local ivCond = evalInitialCondition(mtkCond)
-        local branchesWithConds::Int = nBranches - 1 #TODO DOCC - 1
-        local affects::Vector{Expr} = generateAffect(i, branchesWithConds, ivCond)
-        local inverseAffects::Vector{Expr} = generateInverseAffect(i, branchesWithConds, ivCond)
-        local cond = :(($(mtkCond)) => [$(affects...), $(inverseAffects...), $(statePinExprs...)])
+        local ivCond = evalInitialCondition(mtkCond, simCode)
+        local numVal = ivCond ? 1.0 : 0.0
+        local invVal = ivCond ? 0.0 : 1.0
+        #= Build ImperativeAffect: function returns a NamedTuple of new values.
+           modified NamedTuple maps aliases to the symbolic parameter variables. =#
+        local returnKws = [Expr(:kw, sym, (j == i) ? numVal : invVal) for (j, sym) in enumerate(allIfCondSyms)]
+        local returnNT = Expr(:tuple, Expr(:parameters, returnKws...))
+        local fExpr = :((modified, observed, ctx, integrator) -> $returnNT)
+        local modifiedKws = [Expr(:kw, sym, sym) for sym in allIfCondSyms]
+        local modifiedNT = Expr(:tuple, Expr(:parameters, modifiedKws...))
+        local affectTuple = :(($(fExpr), $(modifiedNT)))
+        #= Wrap in SymbolicContinuousCallback with ImperativeAffect.
+           Use NoInit so the solver continues from current state. =#
+        local cond = :(ModelingToolkit.SymbolicContinuousCallback(
+          ($(mtkCond)) => $(affectTuple);
+          reinitializealg = SciMLBase.NoInit()
+        ))
         push!(conditions, cond)
         push!(ivConditions, ivCond)
       end
@@ -1016,13 +1020,13 @@ function createIfEquation(stateVariables::Vector,
                                                                            simCode;
                                                                            subIdentifier = 1))))
   end
-  #= Generate zero dynamic equations for the conditions =#
-  conditionEquations = Expr[]
+  #= ifCond variables are discrete parameters (not ODE unknowns), so they do not need
+     der() ~ 0 equations. Collect their names and initial values for parameter declaration. =#
+  conditionEquations = Expr[]  #= empty: no dynamics equations for discrete parameters =#
   conditionVariables = Symbol[]
   conditionVariableNames = Tuple{String, Bool}[]
   for i in 1:length(ivConditions)
-    push!(conditionEquations, :(der($(Symbol(string("ifCond", identifier, i)))) ~ 0))
-    push!(conditionVariables, :($(Symbol(string("ifCond", identifier, i)))))
+    push!(conditionVariables, Symbol(string("ifCond", identifier, i)))
     push!(conditionVariableNames, (string("ifCond", identifier, i), !(ivConditions[i])))
   end
   local conditionExpr = conditions
@@ -1408,6 +1412,47 @@ end
   After chunking, parameter symbols are eval'd into module scope so that
   pars Dict closures and ARRAY_PARAMETERS code can reference them by name.
 """
+
+"""
+Generate code to declare ifCond variables as plain parameters (not time-dependent).
+These parameters are modified by SymbolicContinuousCallback affects and are NOT
+part of the ODE state vector, so the solver never perturbs them during Jacobian
+computation. Using plain parameters (not `p(t)`) avoids MTK creating Shift operators.
+Returns a no-op expression if there are no ifCond parameters.
+"""
+function generateDiscreteIfCondDeclaration(ifCondParamDecls::Vector{Expr}, ifCondNames::Vector{Symbol})
+  if isempty(ifCondParamDecls)
+    return :()
+  end
+  local nameQuotes = [QuoteNode(s) for s in ifCondNames]
+  quote
+    local _ifCondParams = ModelingToolkit.@parameters begin
+      $(ifCondParamDecls...)
+    end
+    local _ifCondBindBlock = Expr(:block)
+    for (name, p) in zip([$(nameQuotes...)], _ifCondParams)
+      push!(_ifCondBindBlock.args, :($name = $p))
+    end
+    eval(_ifCondBindBlock)
+    parameters = vcat(parameters, _ifCondParams)
+  end
+end
+
+"""
+Generate code to add ifCond discrete parameter values to the pars Dict.
+Returns a no-op expression if there are no ifCond parameters.
+"""
+function generateIfCondParamAssignments(ifCondParamPairs::Vector{Expr})
+  if isempty(ifCondParamPairs)
+    return :()
+  end
+  quote
+    for (k, v) in [$(ifCondParamPairs...)]
+      pars[k] = v
+    end
+  end
+end
+
 function decomposeParametersDeclaration(parVariablesSym; chunkSize = 100)
   if length(parVariablesSym) <= chunkSize
     return quote
