@@ -586,6 +586,17 @@ function appendFieldToCref(exp::DAE.Exp, fieldName::String, fieldTy::DAE.Type)::
       local newCref = appendFieldToComponentRef(cref, fieldName, fieldTy)
       DAE.CREF(newCref, fieldTy)
     end
+    DAE.RECORD(_, exps, fieldNames, _) => begin
+      local expVec = collect(exps)
+      local nameVec = collect(fieldNames)
+      local fieldIdx = findfirst(==(fieldName), nameVec)
+      if fieldIdx === nothing
+        @warn "appendFieldToCref: record constructor missing field $fieldName, returning original expression"
+        exp
+      else
+        expVec[fieldIdx]
+      end
+    end
     _ => begin
       @warn "appendFieldToCref: unexpected expression type, returning as-is"
       exp
