@@ -92,7 +92,6 @@ using ExportAll
 
 import Absyn
 import DAE
-import DoubleEnded
 import SCode
 
 #=  AdjacencyMatrixes =#
@@ -574,6 +573,12 @@ end
     componentToChange::DAE.CREF
     newValue::DAE.Exp
   end
+  #= Agentic recompilation: new values are determined at runtime by an external agent. =#
+  @Record AGENTIC_RECOMPILATION begin
+    componentsToChange::Vector{DAE.CREF}
+    prompt::Option{String}           #= Natural-language hint forwarded to the agent =#
+    initialEquations::Option{String} #= Serialized constraint equations for the agent =#
+  end
 end
 
 #= class of external objects =#
@@ -711,14 +716,14 @@ end
   @Record EVENT_INFO begin
     timeEvents #= stores all information related to time events =#::List{TimeEvent}
     zeroCrossings #= list of zero crossing conditions =# #=TODO: Use something else..=#
-    relations #= list of zero crossing function as before =#::DoubleEnded.MutableList
+    relations #= list of zero crossing function as before =#::Vector
     numberMathEvents #= stores the number of math function that trigger events e.g. floor, ceil, integer, ... =#::Integer
   end
 end
 
 @Uniontype ZeroCrossingSet begin
   @Record ZERO_CROSSING_SET begin
-    zc::DoubleEnded.MutableList
+    zc::Vector
     tree::Array
   end
 end

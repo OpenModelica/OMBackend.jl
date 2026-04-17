@@ -66,3 +66,47 @@ macro VSS_DEBUG(expr)
     return nothing
   end
 end
+
+
+#= -----------------------------------------------------------------------------
+   Log directory helpers.
+
+   All per-stage log files go under a single OS-appropriate root so they do not
+   pollute the working directory (repo root during test runs). The root is:
+
+     * `ENV["OMJL_LOG_DIR"]` if set, or
+     * `joinpath(tempdir(), "OMJL", OMJL_SESSION_ID)` otherwise.
+
+   `OMJL_SESSION_ID` = "<pid>_<epoch_seconds>", which keeps concurrent Julia
+   processes from stomping on each other while letting all dumps from a single
+   session live in one directory. Override via env var if needed.
+
+   Use:
+
+     logPath("backend/bdae", "bdae_initial.log")   # returns absolute path and
+                                                   # ensures the directory exists
+
+----------------------------------------------------------------------------- =#
+const OMJL_SESSION_ID = string(getpid(), "_", round(Int, time()))
+
+"""
+    logDir() -> String
+
+Root directory for OMJL log/dump files in the current session. Respects
+`ENV["OMJL_LOG_DIR"]`; otherwise a per-session subdirectory under `tempdir()`.
+"""
+function logDir()
+  return get(ENV, "OMJL_LOG_DIR", joinpath(tempdir(), "OMJL", OMJL_SESSION_ID))
+end
+
+"""
+    logPath(stage::AbstractString, filename::AbstractString) -> String
+
+Absolute path for a log file in the given pipeline stage (e.g. `"backend/bdae"`,
+`"frontend/flat"`, `"backend/mtk"`). Creates the stage subdirectory on first use.
+"""
+function logPath(stage::AbstractString, filename::AbstractString)
+  dir = joinpath(logDir(), stage)
+  isdir(dir) || mkpath(dir)
+  return joinpath(dir, filename)
+end

@@ -121,7 +121,7 @@ function detectParamsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
   local pars = filter((x) -> x.varKind === BDAE.PARAM(), syst.orderedVars)
   local parStrs = Set(map((x) -> string(x.varName), pars))
   local buffer = IOBuffer()
-  @BACKEND_LOGGING write("allpars.log", String(take!(buffer)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/bdae", "allpars.log"), String(take!(buffer)))
 
   function detectParamExpression(exp::DAE.Exp, paramCrefs::Dict{DAE.ComponentRef, Bool})
     local cont::Bool
@@ -373,13 +373,159 @@ end
 function expandRecordFieldArrays(dae::BDAE.BACKEND_DAE)
   for system in dae.eqs
     newVars = BDAE.VAR[]
+    #= Track scalarized record field array elements to synthesize parents.
+       Key: baseName, Value: (fieldType, dims, elementBindings, templateVar) =#
+    scalarizedGroups = Dict{String, Tuple{DAE.Type, Vector{Int}, Dict{Tuple, Any}, BDAE.VAR}}()
     for v in system.orderedVars
-      expanded = expandSingleRecordFieldVar(v)
-      append!(newVars, expanded)
+      local found = findRecordFieldArray(v.varName)
+      if found !== nothing && isAlreadyScalarizedCref(v.varName)
+        #= Already scalarized by the frontend: pass through unchanged,
+           but record the element for parent reconstruction. =#
+        push!(newVars, v)
+        local (baseName, fieldType, _, dims) = found
+        local isParam = v.varKind isa BDAE.PARAM || v.varKind isa BDAE.CONST
+        if isParam
+          local dimSizes = Int[]
+          for d in dims
+            @match d begin
+              DAE.DIM_INTEGER(size) => push!(dimSizes, size)
+              _ => nothing
+            end
+          end
+          if !isempty(dimSizes)
+            if !haskey(scalarizedGroups, baseName)
+              scalarizedGroups[baseName] = (fieldType, dimSizes, Dict{Tuple, Any}(), v)
+            end
+            local indices = extractInnermostSubscripts(v.varName)
+            if indices !== nothing
+              @match v.bindExp begin
+                SOME(bindExp) => begin
+                  scalarizedGroups[baseName][3][indices] = bindExp
+                end
+                _ => nothing
+              end
+            end
+          end
+        end
+      else
+        expanded = expandSingleRecordFieldVar(v)
+        append!(newVars, expanded)
+      end
+    end
+    #= Synthesize parent ARRAY_PARAMETERs from scalarized groups =#
+    for (baseName, (fieldType, dimSizes, elemBindings, templateVar)) in scalarizedGroups
+      local parentExists = any(v -> begin
+        @match v.varName begin
+          DAE.CREF_IDENT(n, _, MetaModelica.Nil(__)) where n == baseName => true
+          _ => false
+        end
+      end, newVars)
+      if parentExists
+        continue
+      end
+      local arrayBind = reconstructArrayBinding(dimSizes, elemBindings; baseName = baseName)
+      local parentCr = DAE.CREF_IDENT(baseName, fieldType, MetaModelica.nil)
+      pushfirst!(newVars, BDAE.VAR(parentCr, templateVar.varKind, templateVar.varDirection,
+                                   fieldType, arrayBind, templateVar.arryDim, templateVar.source,
+                                   templateVar.values, templateVar.tearingSelectOption,
+                                   templateVar.connectorType, templateVar.unreplaceable))
     end
     system.orderedVars = newVars
   end
   return dae
+end
+
+"""Check if the innermost CREF_IDENT in a CREF chain has subscripts (already scalarized)."""
+function isAlreadyScalarizedCref(cr::DAE.ComponentRef)::Bool
+  @match cr begin
+    DAE.CREF_QUAL(_, _, _, inner) => isAlreadyScalarizedCref(inner)
+    DAE.CREF_IDENT(_, _, subs) => begin
+      try
+        return !isempty(collect(subs))
+      catch
+        return false
+      end
+    end
+    _ => false
+  end
+end
+
+"""Extract integer subscript indices from the innermost CREF_IDENT."""
+function extractInnermostSubscripts(cr::DAE.ComponentRef)
+  @match cr begin
+    DAE.CREF_QUAL(_, _, _, inner) => extractInnermostSubscripts(inner)
+    DAE.CREF_IDENT(_, _, subs) => begin
+      local indices = Int[]
+      for s in subs
+        @match s begin
+          DAE.INDEX(DAE.ICONST(i)) => push!(indices, i)
+          _ => return nothing
+        end
+      end
+      return isempty(indices) ? nothing : tuple(indices...)
+    end
+    _ => nothing
+  end
+end
+
+"""Reconstruct a DAE.ARRAY binding from scalarized element bindings.
+   Emits a warning when only a subset of elements have bindings, because
+   the missing elements are silently filled with 0.0. That default follows
+   Modelica semantics for unbound parameters, but mixed-binding scenarios
+   can otherwise mask a frontend extraction bug.
+"""
+function reconstructArrayBinding(dimSizes::Vector{Int}, elemBindings::Dict;
+                                 baseName::String = "")
+  if isempty(elemBindings)
+    return NONE()
+  end
+  local expectedCount = prod(dimSizes)
+  if length(elemBindings) < expectedCount
+    local missingIndices = Tuple[]
+    _collectMissingIndices!(missingIndices, dimSizes, 1, elemBindings, ())
+    @warn "Causalize.reconstructArrayBinding: $(length(missingIndices)) of $(expectedCount) element bindings missing for array '$(baseName)'; defaulting to 0.0" missing_indices=missingIndices
+  end
+  local arr = buildArrayFromBindings(dimSizes, 1, elemBindings, ())
+  return arr === nothing ? NONE() : SOME(arr)
+end
+
+function _collectMissingIndices!(out::Vector{Tuple}, dimSizes::Vector{Int}, dimIdx::Int,
+                                 elemBindings::Dict, prefix::Tuple)
+  if dimIdx > length(dimSizes)
+    if !haskey(elemBindings, prefix)
+      push!(out, prefix)
+    end
+    return
+  end
+  for i in 1:dimSizes[dimIdx]
+    _collectMissingIndices!(out, dimSizes, dimIdx + 1, elemBindings, (prefix..., i))
+  end
+end
+
+function buildArrayFromBindings(dimSizes::Vector{Int}, dimIdx::Int,
+                                elemBindings::Dict, prefix::Tuple)
+  if dimIdx > length(dimSizes)
+    return get(elemBindings, prefix, DAE.RCONST(0.0))
+  end
+  local n = dimSizes[dimIdx]
+  local elems = DAE.Exp[]
+  for i in 1:n
+    local newPrefix = (prefix..., i)
+    local elem = buildArrayFromBindings(dimSizes, dimIdx + 1, elemBindings, newPrefix)
+    if elem === nothing
+      push!(elems, DAE.RCONST(0.0))
+    else
+      push!(elems, elem)
+    end
+  end
+  local innerTy = if dimIdx < length(dimSizes)
+    DAE.T_ARRAY(DAE.T_REAL(MetaModelica.nil),
+                list((DAE.DIM_INTEGER(dimSizes[j]) for j in (dimIdx+1):length(dimSizes))...))
+  else
+    DAE.T_REAL(MetaModelica.nil)
+  end
+  local arrayTy = DAE.T_ARRAY(innerTy, list(DAE.DIM_INTEGER(n)))
+  return DAE.ARRAY(arrayTy, false, MetaModelica.list(elems...))
 end
 
 """

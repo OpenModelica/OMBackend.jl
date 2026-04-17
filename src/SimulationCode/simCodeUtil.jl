@@ -399,7 +399,7 @@ function createEquationVariableBidirectionGraph(equations::Vector{BDAE.RESIDUAL_
       end
     end
   end
-  @BACKEND_LOGGING write("eqMapping.log",
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/simCode", "eqMapping.log"),
                          dumpVariableEqMapping(variableEqMapping,
                                                equations,
                                                ifEquations,
@@ -490,7 +490,7 @@ function getOCCGraph(flatModel)
                                                    flatModel.initialEquations,
                                                    flatModel.algorithms,
                                                    flatModel.initialAlgorithms,
-                                                   ImmutableList.nil,
+                                                   MetaModelica.nil,
                                                    NONE(),
                                                    flatModel.DOCC_equations,
                                                    flatModel.unresolvedConnectEquations,
@@ -502,8 +502,8 @@ function getOCCGraph(flatModel)
   local csets::OMFrontend.Frontend.ConnectionSets.Sets
   local csets_array::Vector{List{OMFrontend.Frontend.Connector}}
   local ctable::OMFrontend.Frontend.CardinalityTable.Table
-  local broken::OMFrontend.Frontend.BrokenEdges = ImmutableList.nil
-  local rootEquations::List{OMFrontend.Frontend.Equation} = MetaModelica.nil
+  local broken::OMFrontend.Frontend.BrokenEdges = MetaModelica.nil
+  local rootEquations::Vector{OMFrontend.Frontend.Equation} = OMFrontend.Frontend.Equation[]
   local rootReferenceVariables::Vector{Tuple} = Tuple{OMFrontend.Frontend.NFComponentRef,
                                                       OMFrontend.Frontend.NFComponentRef}[]
   (unresolvedFlatModel, conns) = OMFrontend.Frontend.collect(unresolvedFlatModel)
@@ -1095,8 +1095,10 @@ and `simCode.eliminatedVariables` for later reconstruction (e.g. 3D visualizatio
 Returns the modified SIM_CODE (uses @assign for immutable struct mutation).
 """
 function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOptions)
-  #= Guard: skip for VSS or multi-mode models =#
-  if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
+  #= Guard: skip for VSS/multi-mode models (subModels or recompilation-based
+     metaModel/flatModel), but allow DOCC models (structuralTransitions only)
+     since they re-flatten at runtime =#
+  if !isempty(simCode.subModels) || !isnothing(simCode.metaModel) || !isnothing(simCode.flatModel)
     @info "eliminateNonDynamic: skipping for VSS/multi-mode model"
     return simCode
   end
@@ -1180,9 +1182,16 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
       push!(varNameToRefEqs[refName], eqIdx)
     end
   end
+  #= Collect variable names referenced by when-equations so they are never eliminated.
+     When-equations live outside the residual system and are not in varNameToRefEqs. =#
+  local whenRefNames = Set{String}()
+  for whenEq in simCode.whenEquations
+    _collectWhenCrefNames!(whenRefNames, whenEq.whenEquation)
+  end
   local rescuedVars = Set{String}()
   for vn in varsToRemove
     local referencedBySurvivor = false
+    #= Check residual equations =#
     if haskey(varNameToRefEqs, vn)
       for refEqIdx in varNameToRefEqs[vn]
         if !(refEqIdx in eqsToEliminate)
@@ -1202,6 +1211,10 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
           end
         end
       end
+    end
+    #= Check when-equations =#
+    if !referencedBySurvivor && vn in whenRefNames
+      referencedBySurvivor = true
     end
     if referencedBySurvivor
       push!(rescuedVars, vn)
@@ -1252,7 +1265,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     end
     println(buf, "Eliminated equation indices: ", sort(collect(eqsToEliminate)))
     println(buf, "=== END DEBUG ===")
-    OMBackend.debugWrite("elimination_debug.log", String(take!(buf)))
+    OMBackend.debugWrite(OMBackend.logPath("backend/simCode", "elimination_debug.log"), String(take!(buf)))
   end
   @assign simCode.residualEquations = newResEqs
   @assign simCode.stringToSimVarHT = newHT
@@ -1675,9 +1688,11 @@ Skipped for VSS/structural models where eliminated variables might be needed
 in different structural modes.
 """
 function eliminateAliasVariables(simCode::SIM_CODE)
-  #= Guard: skip for VSS or multi-mode models =#
-  if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
-    @info "aliasElimination: skipped (structural model)"
+  #= Guard: skip for VSS/multi-mode models (subModels or recompilation-based
+     metaModel/flatModel), but allow DOCC models (structuralTransitions only)
+     since they re-flatten at runtime =#
+  if !isempty(simCode.subModels) || !isnothing(simCode.metaModel) || !isnothing(simCode.flatModel)
+    @info "aliasElimination: skipped (VSS/multi-mode model)"
     return simCode
   end
 
@@ -1896,12 +1911,10 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     push!(newIfEqs, IF_EQUATION(newBranches))
   end
 
-  #= When equations: substitute alias CREFs in the inner WhenEquation condition =#
+  #= When equations: substitute alias CREFs in conditions AND statements =#
   local newWhenEqs = BDAE.WHEN_EQUATION[]
   for whenEq in simCode.whenEquations
-    local innerWhen = whenEq.whenEquation
-    local (newCond, _) = Util.traverseExpTopDown(innerWhen.condition, substituteAliasCref, aliasMap)
-    @assign innerWhen.condition = newCond
+    local innerWhen = _substituteAliasInWhenStmts(whenEq.whenEquation, aliasMap)
     @assign whenEq.whenEquation = innerWhen
     push!(newWhenEqs, whenEq)
   end
@@ -1947,6 +1960,10 @@ function eliminateAliasVariables(simCode::SIM_CODE)
       collectCrefNames!(allRefNames, initEq.rhs)
     end
   end
+  #= Also check when-equations (conditions and statements) for surviving references =#
+  for whenEq in newWhenEqs
+    _collectWhenCrefNames!(allRefNames, whenEq.whenEquation)
+  end
   for n in allRefNames
     if n in eliminatedSet
       push!(survivingRefs, n)
@@ -1988,6 +2005,82 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   append!(simCode.eliminatedEquations, elimEqs)
   append!(simCode.eliminatedVariables, elimVarNames)
   return simCode
+end
+
+"""
+Recursively substitute alias CREFs in a WHEN_STMTS node (condition + statements + elsewhen).
+"""
+function _substituteAliasInWhenStmts(whenStmts::BDAE.WHEN_STMTS, aliasMap)
+  local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteAliasCref, aliasMap)
+  local newStmtLst = list()
+  for stmt in whenStmts.whenStmtLst
+    local newStmt = @match stmt begin
+      BDAE.ASSIGN(__) => begin
+        local (newL, _) = Util.traverseExpTopDown(stmt.left, substituteAliasCref, aliasMap)
+        local (newR, _) = Util.traverseExpTopDown(stmt.right, substituteAliasCref, aliasMap)
+        BDAE.ASSIGN(newL, newR, stmt.source)
+      end
+      BDAE.REINIT(__) => begin
+        local (newSV, _) = Util.traverseExpTopDown(stmt.stateVar, substituteAliasCref, aliasMap)
+        local (newVal, _) = Util.traverseExpTopDown(stmt.value, substituteAliasCref, aliasMap)
+        BDAE.REINIT(newSV, newVal, stmt.source)
+      end
+      BDAE.NORETCALL(__) => begin
+        local (newExp, _) = Util.traverseExpTopDown(stmt.exp, substituteAliasCref, aliasMap)
+        BDAE.NORETCALL(newExp, stmt.source)
+      end
+      BDAE.ASSERT(__) => begin
+        local (newC, _) = Util.traverseExpTopDown(stmt.condition, substituteAliasCref, aliasMap)
+        local (newM, _) = Util.traverseExpTopDown(stmt.message, substituteAliasCref, aliasMap)
+        BDAE.ASSERT(newC, newM, stmt.level, stmt.source)
+      end
+      _ => stmt
+    end
+    newStmtLst = newStmt <| newStmtLst
+  end
+  newStmtLst = listReverse(newStmtLst)
+  local newElse = @match whenStmts.elsewhenPart begin
+    SOME(elseWhenEq) => SOME(_substituteAliasInElseWhen(elseWhenEq, aliasMap))
+    NONE() => NONE()
+  end
+  return BDAE.WHEN_STMTS(newCond, newStmtLst, newElse)
+end
+
+function _substituteAliasInElseWhen(elseWhenEq, aliasMap)
+  local inner = elseWhenEq.whenEquation
+  local newInner = _substituteAliasInWhenStmts(inner, aliasMap)
+  @assign elseWhenEq.whenEquation = newInner
+  return elseWhenEq
+end
+
+"""
+Collect all CREF names from a WHEN_STMTS node (condition + statements + elsewhen).
+"""
+function _collectWhenCrefNames!(names::Set{String}, whenStmts::BDAE.WHEN_STMTS)
+  collectCrefNames!(names, whenStmts.condition)
+  for stmt in whenStmts.whenStmtLst
+    @match stmt begin
+      BDAE.ASSIGN(__) => begin
+        collectCrefNames!(names, stmt.left)
+        collectCrefNames!(names, stmt.right)
+      end
+      BDAE.REINIT(__) => begin
+        collectCrefNames!(names, stmt.stateVar)
+        collectCrefNames!(names, stmt.value)
+      end
+      BDAE.NORETCALL(__) => collectCrefNames!(names, stmt.exp)
+      BDAE.ASSERT(__) => begin
+        collectCrefNames!(names, stmt.condition)
+        collectCrefNames!(names, stmt.message)
+      end
+      _ => ()
+    end
+  end
+  @match whenStmts.elsewhenPart begin
+    SOME(elseWhenEq) => _collectWhenCrefNames!(names, elseWhenEq.whenEquation)
+    NONE() => ()
+  end
+  return nothing
 end
 
 """
@@ -2072,7 +2165,7 @@ function substituteAliasCref(@nospecialize(exp), aliasMap)
               local newInner = DAE.CREF(repCref, repTy)
               local newExp = DAE.ASUB(newInner, repSubs)
               if negated
-                return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(nil)), newExp), false, aliasMap)
+                return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(MetaModelica.nil)), newExp), false, aliasMap)
               else
                 return (newExp, false, aliasMap)
               end
@@ -2080,7 +2173,7 @@ function substituteAliasCref(@nospecialize(exp), aliasMap)
               #= Representative is a scalar. Use bare CREF. =#
               local newExp = DAE.CREF(repCref, repTy)
               if negated
-                return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(nil)), newExp), false, aliasMap)
+                return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(MetaModelica.nil)), newExp), false, aliasMap)
               else
                 return (newExp, false, aliasMap)
               end
@@ -2092,7 +2185,7 @@ function substituteAliasCref(@nospecialize(exp), aliasMap)
             local newInner = DAE.CREF(repCref, repTy)
             local newExp = DAE.ASUB(newInner, subs)
             if negated
-              return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(nil)), newExp), false, aliasMap)
+              return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(MetaModelica.nil)), newExp), false, aliasMap)
             else
               return (newExp, false, aliasMap)
             end
@@ -2108,7 +2201,7 @@ function substituteAliasCref(@nospecialize(exp), aliasMap)
         local (repName, negated, repCref, repTy) = aliasMap[name]
         local newExp = DAE.CREF(repCref, repTy)
         if negated
-          return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(nil)), newExp), false, aliasMap)
+          return (DAE.UNARY(DAE.UMINUS(DAE.T_REAL(MetaModelica.nil)), newExp), false, aliasMap)
         else
           return (newExp, false, aliasMap)
         end

@@ -277,22 +277,56 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
       false
     end
     if isElseIf
+      #= Use MTK-aware runtime symbol lookup for the elseif continuous path.
+         The hardcoded x[N] indices from expToJuliaExp/createWhenStatements
+         become invalid after MTK structural_simplify reorders unknowns. =#
+      local whenStatementsMTKIf = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+      local whenStatementsMTKElse = createWhenStatementsMTK(elsePart.whenEquation.whenStmtLst, simCode)
+      local condCrefsElseIf = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
       quote
-        $(Symbol("condition$(callbacks)")) = (x,t,integrator) -> begin
-          $(expToJuliaExp(cond, simCode))
+        $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+          local xs = $(map(x -> Symbol(string(x)), condCrefsElseIf))
+          local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
+          if !isempty(xs) && all(isnothing, indices)
+            return 1.0
+          end
+          local lookuptableStates = if isempty(xs)
+            Dict{Symbol, Int}()
+          else
+            Dict(xs .=> indices)
+          end
+          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+          local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+          $(map(x -> Expr(Symbol("="),
+                          Symbol(string(x)),
+                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
+                Util.getAllCrefs(cond))...)
+          $(expToJuliaExpMTK(cond, simCode))
         end
         $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
           local t = integrator.t + integrator.dt
           local x = integrator.u
+          local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+          local lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+          local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+          $(map(x -> Expr(Symbol("="),
+                          Symbol(string(x)),
+                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
+                vcat(
+                  listArray(Util.getAllCrefs(wEq.condition)),
+                  vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...),
+                  vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(elsePart.whenEquation.whenStmtLst))...)
+                ))...)
           if integrator.dt == 0.0
             @error "integrator.dt was zero. Aborting."
             fail()
           end
-          if (Bool($(expToJuliaExp(wEq.condition, simCode))))
-            $(whenStmts...)
+          if (Bool($(expToJuliaExpMTK(wEq.condition, simCode))))
+            $(whenStatementsMTKIf...)
             add_tstop!(integrator, integrator.t + 1E-12) #=TODO: Some small number for now=#
           else
-            $(createWhenStatements(elsePart.whenEquation.whenStmtLst, simCode)...)
+            $(whenStatementsMTKElse...)
             add_tstop!(integrator, integrator.t + 1E-12) #=TODO: Some small number for now=#
           end
         end
@@ -375,32 +409,61 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
       $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), Δt)
     end
   else #= If none of the variables in the condition was continuous.. =#
-    quote
-      $(Symbol("condition$(callbacks)")) = (x,t,integrator) -> begin
-        Bool($(expToJuliaExp(cond, simCode)))
+    #= Use MTK-aware runtime symbol lookup for discrete callbacks.
+       The hardcoded x[N] indices from expToJuliaExp become invalid after
+       MTK structural_simplify reorders unknowns. Mirror the continuous
+       callback path (above) which uses getStatesAsSymbols + lookuptable. =#
+    whenStatementsMTKDiscrete = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    local condCrefs = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
+    #= Build condition-reset expressions: set each state cref in the condition to false =#
+    local condResetExprs = map(condCrefs) do c
+      local cStr = string(c)
+      local entry = get(simCode.stringToSimVarHT, cStr, nothing)
+      if entry !== nothing && !SimulationCode.isParameter(entry[2])
+        local sym = Symbol(cStr)
+        :(x[lookuptableStates[$(QuoteNode(sym))]] = false)
+      else
+        :()
       end
-    $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
-      # @info "Calling affect for discrete at $(integrator.t). Condition was:"
-      # @info "Δt was:" integrator.dt
-      # @info "Value of x is:" integrator.u
-      local t = integrator.t
-      local x = integrator.u
-      $(whenStmts...)
-      auto_dt_reset!(integrator)
-      add_tstop!(integrator, integrator.t + 1E-12) #=TODO: Some small number for now=#
-      #= TODO:
-      This will not work if the condition consists of several boolean operators.
-      The purpose is to reset the condition so that it is not triggered again at the end of the next integration step.
-      =#
-      $(expToJuliaExp(cond, simCode)) = false
     end
+    quote
+      $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+        local xs = $(map(c -> Symbol(string(c)), condCrefs))
+        local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
+        if !isempty(xs) && all(isnothing, indices)
+          return false
+        end
+        local lookuptableStates = Dict((xs) .=> indices)
+        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+        $(map(x -> Expr(Symbol("="),
+                        Symbol(string(x)),
+                        getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
+              Util.getAllCrefs(cond))...)
+        Bool($(expToJuliaExpMTK(cond, simCode)))
+      end
+      $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+        local t = integrator.t
+        local x = integrator.u
+        local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+        local lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+        $(map(x -> Expr(Symbol("="),
+                        Symbol(string(x)),
+                        getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
+              vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...))...)
+        $(whenStatementsMTKDiscrete...)
+        auto_dt_reset!(integrator)
+        add_tstop!(integrator, integrator.t + 1E-12)
+        $(condResetExprs...)
+      end
       $(Symbol("cb$(callbacks)")) = DiscreteCallback($(Symbol("condition$(callbacks)")),
                                                      $(Symbol("affect$(callbacks)!"));
                                                      save_positions=(true, true))
       $(if wEq.elsewhenPart !== nothing
           eqToJulia(wEq.elsewhenPart.data, simCode, 4)
-        end
-        )
+        end)
     end
   end
 end

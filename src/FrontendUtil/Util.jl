@@ -2,7 +2,6 @@ module Util
 
 import Absyn
 import DAE
-import DoubleEnded
 
 using MetaModelica
 
@@ -422,7 +421,7 @@ end
 function traverseExpTopDownSubs(inSubscript::List{<:DAE.Subscript}, rel::Function, iarg::Argument) ::Tuple{List{DAE.Subscript}, Argument}
   local allEq::Bool = true
   local arg::Argument = iarg
-  local delst::DoubleEnded.MutableList{DAE.Subscript}
+  local acc::Vector{DAE.Subscript}
   local exp::DAE.Exp
   local nEq::ModelicaInteger = 0
   local nsub::DAE.Subscript
@@ -469,26 +468,30 @@ function traverseExpTopDownSubs(inSubscript::List{<:DAE.Subscript}, rel::Functio
       false
     end
       allEq = false
-      delst = DoubleEnded.empty(nsub)
+      acc = Vector{DAE.Subscript}()
       for elt in inSubscript
         if nEq < 1
           break
         end
-        DoubleEnded.push_back(delst, elt)
+        push!(acc, elt)
         nEq = nEq - 1
       end
     end
     if allEq
       nEq = nEq + 1
     else
-      DoubleEnded.push_back(delst, nsub)
+      push!(acc, nsub)
     end
   end
   #=  Preserve reference equality without any allocation if nothing changed =#
   outSubscript = if allEq
     inSubscript
   else
-    DoubleEnded.toListAndClear(delst)
+    local lst::List{DAE.Subscript} = nil
+    for x in Iterators.reverse(acc)
+      lst = x <| lst
+    end
+    lst
   end
   (outSubscript, arg)
 end

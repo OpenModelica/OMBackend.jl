@@ -107,6 +107,33 @@ function flattenRecordParametersInFunction(func::MODELICA_FUNCTION)::MODELICA_FU
   #= Transform statements to use flattened names =#
   local transformedStatements = transformStatementsForFlattenedRecords(func.statements, recordFieldMap)
 
+  #= For record constructors with empty algorithm sections, generate synthetic
+     assignments binding each output field to the matching input by name.
+     E.g., Complex(re, im) with output Complex result -> result_re = re; result_im = im.
+     This handles implicit record constructors and constructor functions where
+     output fields are bound via modifiers (output Complex result(re=re, im=im)). =#
+  if isempty(transformedStatements) && !isempty(recordFieldMap)
+    local inputNameSet = Set{String}(string(inp.componentRef) for inp in flattenedInputs)
+    for output in func.outputs
+      local outName = string(output.componentRef)
+      if haskey(recordFieldMap, outName)
+        for (fieldName, fieldTy) in recordFieldMap[outName]
+          if fieldName in inputNameSet
+            local flatOutName = outName * "_" * fieldName
+            local outCref = DAE.CREF_IDENT(flatOutName, fieldTy, MetaModelica.nil)
+            local inCref = DAE.CREF_IDENT(fieldName, fieldTy, MetaModelica.nil)
+            push!(transformedStatements, DAE.STMT_ASSIGN(
+              fieldTy,
+              DAE.CREF(outCref, fieldTy),
+              DAE.CREF(inCref, fieldTy),
+              DAE.emptyElementSource
+            ))
+          end
+        end
+      end
+    end
+  end
+
   return MODELICA_FUNCTION(func.name, flattenedInputs, flattenedOutputs, func.locals, transformedStatements)
 end
 
@@ -199,9 +226,22 @@ function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN, recordFiel
         return stmts
       end
       _ => begin
-        local newExp1 = transformExpForFlattenedRecords(stmt.exp1, recordFieldMap)
         local newExp = transformExpForFlattenedRecords(stmt.exp, recordFieldMap)
-        return [DAE.STMT_ASSIGN(stmt.type_, newExp1, newExp, stmt.source)]
+        #= RHS is not a RECORD literal but LHS is a record variable.
+           Keep the original assignment to evaluate the RHS once (into a tuple),
+           then extract each field via tuple indexing. =#
+        local fieldInfo = recordFieldMap[lhsName]
+        local stmts = DAE.Statement[]
+        push!(stmts, DAE.STMT_ASSIGN(stmt.type_, stmt.exp1, newExp, stmt.source))
+        for (i, (fieldName, fieldTy)) in enumerate(fieldInfo)
+          local flatName = lhsName * "_" * fieldName
+          local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
+          local lhsExp = DAE.CREF(flatCref, fieldTy)
+          local rhsCref = DAE.CREF_IDENT(lhsName, stmt.type_, MetaModelica.nil)
+          local rhsExp = DAE.ASUB(DAE.CREF(rhsCref, stmt.type_), MetaModelica.list(DAE.ICONST(i)))
+          push!(stmts, DAE.STMT_ASSIGN(fieldTy, lhsExp, rhsExp, stmt.source))
+        end
+        return stmts
       end
     end
   else
@@ -372,7 +412,24 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
               end
             end
           end
-          _ => push!(newArgs, expandRecordArgsInExp(arg))
+          _ => begin
+            local expandedArg = expandRecordArgsInExp(arg)
+            #= Check if the expanded argument has Complex record return type.
+               If so, split it into TSUB expressions for each field, because the
+               outer function wrapper expects flattened scalar arguments. =#
+            local complexFields = _getComplexReturnFields(expandedArg)
+            if complexFields !== nothing
+              for (fieldIdx, field) in enumerate(complexFields)
+                local fieldTy = @match field begin
+                  DAE.TYPES_VAR(_, _, fTy, _, _) => fTy
+                  _ => DAE.T_REAL_DEFAULT
+                end
+                push!(newArgs, DAE.TSUB(expandedArg, fieldIdx, fieldTy))
+              end
+            else
+              push!(newArgs, expandedArg)
+            end
+          end
         end
       end
       DAE.CALL(path, MetaModelica.list(newArgs...), attr)
@@ -401,6 +458,20 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
       DAE.ARRAY(ty, scalar, MetaModelica.list(newArr...))
     end
     _ => exp
+  end
+end
+
+"""
+  Extract the field list from a DAE expression with Complex record return type.
+  Returns the varLst if the expression has T_COMPLEX(RECORD) type, nothing otherwise.
+  Used to split non-CREF Complex-typed arguments into per-field TSUB expressions.
+"""
+function _getComplexReturnFields(exp::DAE.Exp)
+  @match exp begin
+    DAE.CALL(_, _, DAE.CALL_ATTR(ty = DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _))) => begin
+      return collect(varLst)
+    end
+    _ => return nothing
   end
 end
 

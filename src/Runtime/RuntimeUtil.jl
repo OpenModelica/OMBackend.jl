@@ -66,12 +66,12 @@ function setElementInSCodeProgram!(activeModeName, inIdent::String, newValue::T,
   #=
   Get the class name. The active class is required to be top level currently.
   =#
-  @BACKEND_LOGGING write("modename.log", activeModeName)
-  @BACKEND_LOGGING write("original.log", OMBackend.JuliaFormatter.format_text(string(inClass)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modename.log"), activeModeName)
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "original.log"), OMBackend.JuliaFormatter.format_text(string(inClass)))
   local activeModeNamePrefixes::Vector{String} = map(string, split(activeModeName, "."))
-  @BACKEND_LOGGING write("prefixes.log", OMBackend.JuliaFormatter.format_text(string(activeModeNamePrefixes)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "prefixes.log"), OMBackend.JuliaFormatter.format_text(string(activeModeNamePrefixes)))
   local activeClass  = getElementFromSCodeProgram(activeModeNamePrefixes, inClass)
-  @BACKEND_LOGGING write("active.log", OMBackend.JuliaFormatter.format_text(string(activeClass)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "active.log"), OMBackend.JuliaFormatter.format_text(string(activeClass)))
   #= Get all elements from the class together with the corresponding names =#
   local elementToReplace::SCode.Element = getElementFromSCodeProgram(inIdent, activeClass)
   local elements::Vector{SCode.Element} = listArray(SCodeUtil.getClassElements(activeClass))
@@ -92,12 +92,12 @@ function setElementInSCodeProgram!(activeModeName, inIdent::String, newValue::T,
   #write("elementToReplace.log", string(OMBackend.JuliaFormatter.format_text(string(elementToReplace))))
   @assign activeClass.classDef.elementLst = arrayList(elements)
   #=Replace the element in the specific class. =#
-  @BACKEND_LOGGING write("elementToReplace.log", OMBackend.JuliaFormatter.format_text(string(elementToReplace)))
-  @match modifiedProg <| nil = replaceElementInSCodeProgramByName(inClass,
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "elementToReplace.log"), OMBackend.JuliaFormatter.format_text(string(elementToReplace)))
+  @match modifiedProg <| MetaModelica.nil = replaceElementInSCodeProgramByName(inClass,
                                                                   activeClass,
                                                                   activeModeName)
-  @BACKEND_LOGGING write("modifiedProg.log", OMBackend.JuliaFormatter.format_text(string(modifiedProg)))
-  @BACKEND_LOGGING write("tmpClass.log", OMBackend.JuliaFormatter.format_text(string(inClass)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modifiedProg.log"), OMBackend.JuliaFormatter.format_text(string(modifiedProg)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "tmpClass.log"), OMBackend.JuliaFormatter.format_text(string(inClass)))
   #=
   We need to update the top level class as well in this case.
   To do this we need to search for the element representing the class wee modified in the top level program again.
@@ -228,19 +228,12 @@ function createNewFlatModel(flatModel,
                                flatModel.initialEquations,
                                flatModel.algorithms,
                                flatModel.initialAlgorithms,
-                               nil,
+                               MetaModelica.nil,
                                NONE(),
-                               nil,
-                               nil,
+                               MetaModelica.nil,
+                               MetaModelica.nil,
                                Bool[], #= TODO: This equation might need to be changed. =#
                                flatModel.comment)
-  # println("Existing equations:")
-  # println("********************************************************************")
-  # @debug "Length of existing system:" length(newFlatModel.equations)
-  # for e in newFlatModel.equations
-  #   println(OMFrontend.Frontend.toString(e))
-  # end
-  # println("********************************************************************")
   @assign newFlatModel.equations = listAppend(unresolvedEquations, newEquations)
   # println("Unresolved System:")
   # println("********************************************************************")
@@ -283,7 +276,7 @@ function createNewFlatModel(flatModel,
                                flatModel.initialEquations,
                                flatModel.algorithms,
                                flatModel.initialAlgorithms,
-                               nil,
+                               MetaModelica.nil,
                                NONE(),
                                flatModel.DOCC_equations,
                                flatModel.unresolvedConnectEquations,
@@ -536,13 +529,11 @@ function isReturnCodeDefault(integrator)
 end
 
 function getObserved(integrator)
-  local observedSyms = ModelingToolkit.SymbolicUtils.BasicSymbolic{Real}[
-    oEq.lhs for oEq in ModelingToolkit.observed(integrator.f.sys)]
+  return [oEq.lhs for oEq in ModelingToolkit.observed(integrator.f.sys)]
 end
 
 function getUnknowns(integrator)
-  return ModelingToolkit.SymbolicUtils.BasicSymbolic{Real}[
-    u for u in ModelingToolkit.unknowns(integrator.f.sys)]
+  return [u for u in ModelingToolkit.unknowns(integrator.f.sys)]
 end
 
 function getObservedAsStrings(integrator)
@@ -561,16 +552,45 @@ function getObservedAsStringsNoPrefix(integrator)
   local oStrs = String[join(split(string(o.f.name), "_")[2:end], "_") for o in getObserved(integrator)]
 end
 
+function _resolveObservedValue(integrator, os)
+  local raw = integrator.sol[os]
+  if raw isa AbstractArray
+    isempty(raw) && return nothing
+    return Float64(last(raw))
+  end
+  return Float64(raw)
+end
+
+function _resolvableObservedPairs(integrator)
+  local pairs = Tuple{String, Float64}[]
+  for oEq in ModelingToolkit.observed(integrator.f.sys)
+    local os = oEq.lhs
+    local v = try
+      _resolveObservedValue(integrator, os)
+    catch e
+      e isa InterruptException && rethrow()
+      nothing
+    end
+    if v !== nothing
+      local name = join(split(string(os.f.name), "_")[2:end], "_")
+      push!(pairs, (name, v))
+    end
+  end
+  return pairs
+end
+
 function createLookupTableForObserved(integrator)
-  local strs = getObservedAsStringsNoPrefix(integrator)
-  local vals = getValuesForObserved(integrator)
-  return Dict(strs .=> vals)
+  return Dict{String, Float64}(_resolvableObservedPairs(integrator))
 end
 
 function createLookupTable(integrator)
-  local strs = vcat(getUnknownsAsStringsNoPrefix(integrator),getObservedAsStringsNoPrefix(integrator))
-  local vals = vcat(getValuesForObserved(integrator), getValuesForUnknowns(integrator))
-  return Dict(strs .=> vals)
+  local unknownNames = getUnknownsAsStringsNoPrefix(integrator)
+  local unknownVals = getValuesForUnknowns(integrator)
+  local d = Dict{String, Float64}(zip(unknownNames, unknownVals))
+  for (name, v) in _resolvableObservedPairs(integrator)
+    d[name] = v
+  end
+  return d
 end
 
 function getPrefix(integrator)
@@ -579,15 +599,11 @@ function getPrefix(integrator)
 end
 
 function getValuesForObserved(integrator)
-  local observedSyms = ModelingToolkit.SymbolicUtils.BasicSymbolic{Real}[
-      oEq.lhs for oEq in ModelingToolkit.observed(integrator.f.sys)]
-  local vals::Vector{Float64} = Float64[last(integrator.sol[os]) for os in observedSyms]
-  return vals
+  return Float64[v for (_, v) in _resolvableObservedPairs(integrator)]
 end
 
 function getValuesForUnknowns(integrator)
-  local uSyms = ModelingToolkit.SymbolicUtils.BasicSymbolic{Real}[
-    uEq for uEq in ModelingToolkit.unknowns(integrator.f.sys)]
+  local uSyms = [uEq for uEq in ModelingToolkit.unknowns(integrator.f.sys)]
   local vals::Vector{Float64} = Float64[last(integrator.sol[u]) for u in uSyms]
   return vals
 end

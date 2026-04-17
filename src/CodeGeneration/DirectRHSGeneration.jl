@@ -46,7 +46,110 @@
 =#
 
 """
-    buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks)
+    _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10)
+
+Solve the algebraic constraints of a DAE system to find consistent initial conditions.
+Uses a two-phase pseudoinverse Newton approach:
+
+Phase 1: Fix differential states, solve only for algebraic unknowns. This preserves
+the initial configuration (e.g. pendulum angles) while computing consistent
+algebraic values (positions, forces). Works for most DAE systems.
+
+Phase 2 (fallback): If phase 1 fails to converge, free ALL unknowns including
+differential states. This handles rank-deficient kinematic loops (e.g. Engine1a)
+where the differential state values are constrained by algebraic equations.
+"""
+function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10)
+  local n = length(u0)
+  #= Defensive clamp: the mass matrix may be smaller than u0 if MTK's
+     structural_simplify produced an imbalanced reduced system (more unknowns
+     than full_equations). buildDirectRHSProblem detects this case and errors
+     out earlier, but we guard the loop bounds here as well. =#
+  local nMM = size(mm, 1)
+  local nSafe = min(n, nMM)
+  local alg_idx = [i for i in 1:nSafe if mm[i,i] == 0]
+  local diff_idx = [i for i in 1:nSafe if mm[i,i] != 0]
+  if isempty(alg_idx)
+    return u0
+  end
+  local du = similar(u0)
+  rhsFunc(du, u0, p_vec, 0.0)
+  local init_res = maximum(abs, du[alg_idx])
+  if init_res < tol
+    @debug "DirectRHS init: algebraic residuals already consistent (max=$init_res)"
+    return u0
+  end
+  # Phase 1: Fix differential states, solve algebraic equations for algebraic unknowns only.
+  local u0_phase1 = copy(u0)
+  local phase1_ok = _solveDAEPhase!(u0_phase1, rhsFunc, p_vec, alg_idx, alg_idx,
+                                     maxiter=min(maxiter, 50), tol=tol)
+  if phase1_ok
+    copyto!(u0, u0_phase1)
+    return u0
+  end
+  # Phase 2: Free all unknowns (handles rank-deficient kinematic loops).
+  @debug "DirectRHS init: phase 1 failed, trying phase 2 with all unknowns free"
+  local all_idx = collect(1:n)
+  local phase2_ok = _solveDAEPhase!(u0, rhsFunc, p_vec, alg_idx, all_idx,
+                                     maxiter=maxiter, tol=tol)
+  if !phase2_ok
+    rhsFunc(du, u0, p_vec, 0.0)
+    local final_res = maximum(abs, du[alg_idx])
+    @warn "DirectRHS init: did not converge (residual: $(round(final_res, sigdigits=4)))"
+  end
+  return u0
+end
+
+"""
+    _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; maxiter, tol)
+
+Single-phase Newton solve: minimize residuals of equations `eq_idx` by adjusting
+unknowns `var_idx`. Uses pseudoinverse for rank-deficient/underdetermined systems.
+Returns true if converged.
+"""
+function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; maxiter=50, tol=1e-10)
+  local nEq = length(eq_idx)
+  local nVar = length(var_idx)
+  local du = similar(u0)
+  local eps_fd = 1e-7
+  for iter in 1:maxiter
+    rhsFunc(du, u0, p_vec, 0.0)
+    local res = du[eq_idx]
+    local norm_res = maximum(abs, res)
+    if !isfinite(norm_res)
+      @debug "DirectRHS init: non-finite residual at iteration $iter, aborting"
+      return false
+    end
+    if norm_res < tol
+      @debug "DirectRHS init: converged in $iter iterations (residual: $norm_res)"
+      return true
+    end
+    # Finite-difference Jacobian
+    local J = zeros(nEq, nVar)
+    local du_pert = similar(u0)
+    for (jcol, jstate) in enumerate(var_idx)
+      local u_pert = copy(u0)
+      u_pert[jstate] += eps_fd
+      rhsFunc(du_pert, u_pert, p_vec, 0.0)
+      J[:, jcol] = (du_pert[eq_idx] .- res) ./ eps_fd
+    end
+    if any(!isfinite, J)
+      @debug "DirectRHS init: non-finite Jacobian at iteration $iter, aborting"
+      return false
+    end
+    local delta = LinearAlgebra.pinv(J) * res
+    local alpha = min(1.0, 10.0 / max(1.0, LinearAlgebra.norm(delta)))
+    for (jcol, jstate) in enumerate(var_idx)
+      u0[jstate] -= alpha * delta[jcol]
+    end
+  end
+  return false
+end
+
+
+"""
+    buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
+                          allInitialValues=nothing)
 
 Build an ODEProblem by extracting the RHS function directly from the reduced MTK
 system's symbolic equations, bypassing MTK's ODEProblem constructor.
@@ -54,9 +157,14 @@ system's symbolic equations, bypassing MTK's ODEProblem constructor.
 Uses `Symbolics.build_function` with CSE to generate compact index-based code,
 wrapped in a `RuntimeGeneratedFunction` for world-age safety.
 
+`allInitialValues` provides Modelica start values for algebraic variables that
+`splitInitialValues` demoted to guesses. Without these, algebraic variables
+default to 0.0, which may cause InitialFailure for DAE systems.
+
 Returns an `ODEProblem` ready for `solve()`.
 """
-function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks)
+function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
+                               allInitialValues=nothing)  # allInitialValues kept for API compat but guesses from reducedSystem are preferred
   local states = ModelingToolkit.unknowns(reducedSystem)
   local params = ModelingToolkit.parameters(reducedSystem)
   # Use full_equations to inline observed variable definitions.
@@ -67,8 +175,22 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   local iv = ModelingToolkit.get_iv(reducedSystem)
   local nStates = length(states)
   local nParams = length(params)
+  local nEqs = length(eqs)
 
-  @debug "DirectRHS: $(nStates) states, $(nParams) params, $(length(eqs)) equations"
+  @debug "DirectRHS: $(nStates) states, $(nParams) params, $(nEqs) equations"
+
+  #= Reject structurally imbalanced systems early. MTK's structural_simplify
+     occasionally leaves reduced systems where full_equations(sys) != unknowns(sys)
+     (observed in Rotational.Friction: 35 full_equations, 36 unknowns). Attempting
+     to build an RHS from such a system produces nonsense results and eventually
+     crashes with a BoundsError in the mass-matrix DAE initialization path. Fail
+     here with a clear diagnostic instead. =#
+  if nStates != 0 && nEqs != nStates
+    error("DirectRHS: structural imbalance in reduced system: " *
+          "$(nEqs) full_equations vs $(nStates) unknowns. " *
+          "The model cannot be integrated as a well-posed DAE; " *
+          "this is typically a residual issue from MTK structural_simplify.")
+  end
 
   # Handle empty systems (0 unknowns after structural_simplify).
   # Use a dummy 1-element state so the ODE solver does not reject an empty range.
@@ -86,9 +208,21 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   # 2. Create world-age-safe function via RuntimeGeneratedFunction
   local rhsFunc = _exprToRTGFunction(f_ip_expr)
 
-  # 3. Build u0 and parameter vectors in the correct ordering
-  local u0 = _buildStateVector(states, finalInitialValues)
-  local p_vec = _buildParamVector(params, pars)
+  # 3. Build u0 and parameter vectors in the correct ordering.
+  #    Resolve parameter values first so _buildStateVector can substitute
+  #    symbolic parameter references in initial conditions.
+  local resolvedParams = _resolveParamValues(pars)
+  # Extract guesses from the reduced system. These are properly mapped to
+  # post-simplification unknowns and provide Modelica start values for variables
+  # that splitInitialValues could not map (pre-simplification names do not match).
+  local systemGuesses = try
+    ModelingToolkit.guesses(reducedSystem)
+  catch
+    Dict()
+  end
+  local u0 = _buildStateVector(states, finalInitialValues; resolvedParams=resolvedParams,
+                                systemGuesses=systemGuesses)
+  local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
 
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
 
@@ -110,6 +244,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     @debug "DirectRHS: DAE with mass matrix"
     local mm = collect(massMatrix)
     local f = ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mm, sys=reducedSystem)
+    # Solve algebraic constraints to find consistent initial conditions.
+    # Two-phase approach: first tries algebraic-only solve (fixing differential
+    # states), then falls back to full solve if needed (for kinematic loops).
+    u0 = _solveDAEInitialization!(u0, rhsFunc, p_vec, mm)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   end
 
@@ -175,22 +313,39 @@ Build the initial state vector `u0`, ordered to match `unknowns(reducedSystem)`.
 Uses string comparison for key matching to avoid `Num`/`BasicSymbolic` type
 mismatch issues.
 """
-function _buildStateVector(states, finalInitialValues)
+function _buildStateVector(states, finalInitialValues;
+                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
+                           systemGuesses=nothing)
   local nStates = length(states)
   local u0 = zeros(Float64, nStates)
   local stateStrToIdx = Dict{String, Int}()
   for (i, s) in enumerate(states)
     stateStrToIdx[string(s)] = i
   end
-  local matched = 0
+  local matchedSet = Set{String}()
   for pair in finalInitialValues
     local keyStr = string(pair.first)
     if haskey(stateStrToIdx, keyStr)
-      u0[stateStrToIdx[keyStr]] = _toFloat64(pair.second)
-      matched += 1
+      u0[stateStrToIdx[keyStr]] = _toFloat64(pair.second; resolvedParams=resolvedParams)
+      push!(matchedSet, keyStr)
     end
   end
-  @debug "DirectRHS: matched $(matched)/$(length(finalInitialValues)) initial values to $(nStates) states"
+  # Fill unmatched states from system guesses (post-simplification variable space).
+  # These provide Modelica start values for algebraic variables whose pre-simplification
+  # names did not match the reduced system unknowns.
+  local guessMatched = 0
+  if systemGuesses !== nothing && !isempty(systemGuesses)
+    for (gk, gv) in systemGuesses
+      local keyStr = string(gk)
+      if haskey(stateStrToIdx, keyStr) && !(keyStr in matchedSet)
+        local val = _toFloat64(gv; resolvedParams=resolvedParams)
+        u0[stateStrToIdx[keyStr]] = val
+        push!(matchedSet, keyStr)
+        guessMatched += 1
+      end
+    end
+  end
+  @debug "DirectRHS: matched $(length(matchedSet))/$(nStates) states ($(length(matchedSet) - guessMatched) hard, $(guessMatched) from guesses)"
   return u0
 end
 
@@ -202,12 +357,14 @@ Build the parameter vector, ordered to match `parameters(reducedSystem)`.
 Resolves parameter-to-parameter dependencies by iteratively substituting
 known numeric values until all parameters are numeric (or until convergence).
 """
-function _buildParamVector(params, pars)
+function _buildParamVector(params, pars; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
   local nParams = length(params)
   local p_vec = zeros(Float64, nParams)
 
-  # Resolve parameter values by iterative substitution
-  local resolvedParams = _resolveParamValues(pars)
+  # Resolve parameter values by iterative substitution (reuse if already done)
+  if resolvedParams === nothing
+    resolvedParams = _resolveParamValues(pars)
+  end
 
   local matched = 0
   for (i, p) in enumerate(params)
@@ -257,6 +414,12 @@ function _resolveParamValues(pars)
     end
   end
 
+  # Build a name-based lookup for substitution fallback
+  local nameToNumeric = Dict{String, Float64}()
+  for (kStr, fval) in numericByStr
+    nameToNumeric[kStr] = fval
+  end
+
   # Iteratively resolve symbolic parameters
   for iteration in 1:10
     local newlyResolved = 0
@@ -267,12 +430,79 @@ function _resolveParamValues(pars)
       catch
         uv  # substitution failed, keep original
       end
-      if resolved isa Number
-        local fval = Float64(resolved)
+      # Unwrap Num if needed before checking for numeric
+      local unwrapped = resolved isa Symbolics.Num ? Symbolics.unwrap(resolved) : resolved
+      if unwrapped isa Number
+        local fval = Float64(unwrapped)
         numericByStr[kStr] = fval
+        nameToNumeric[kStr] = fval
         subDict[uk] = fval
         newlyResolved += 1
       else
+        # Fallback: try name-based substitution by matching free variable names
+        # to known numeric parameters. This handles cases where the symbolic
+        # objects in the expression have different identity than the parameter keys.
+        local nameDict = Dict{Any, Any}()
+        local freeVars = try
+          Symbolics.get_variables(uv)
+        catch
+          Any[]
+        end
+        for fv in freeVars
+          local fvName = string(fv)
+          if haskey(nameToNumeric, fvName)
+            nameDict[fv] = nameToNumeric[fvName]
+          end
+        end
+        if !isempty(nameDict)
+          local resolved2 = try
+            Symbolics.substitute(uv, nameDict)
+          catch
+            uv
+          end
+          # Unwrap Num if needed, then check for numeric result
+          local unwrapped2 = resolved2 isa Symbolics.Num ? Symbolics.unwrap(resolved2) : resolved2
+          if unwrapped2 isa Number
+            local fval2 = Float64(unwrapped2)
+            numericByStr[kStr] = fval2
+            nameToNumeric[kStr] = fval2
+            subDict[uk] = fval2
+            newlyResolved += 1
+            continue
+          end
+          # Last resort: try Symbolics.value on the substituted result
+          local numVal = try
+            Float64(Symbolics.value(resolved2))
+          catch
+            nothing
+          end
+          if numVal !== nothing && isfinite(numVal)
+            numericByStr[kStr] = numVal
+            nameToNumeric[kStr] = numVal
+            subDict[uk] = numVal
+            newlyResolved += 1
+            continue
+          end
+        end
+        # Final fallback: evaluate expression string with known numeric bindings
+        local evalResult = try
+          local evalExpr = Meta.parse(string(uv))
+          local evalModule = Module()
+          for (n, v) in nameToNumeric
+            local sym = Symbol(n)
+            Core.eval(evalModule, :($sym = $v))
+          end
+          Float64(Core.eval(evalModule, evalExpr))
+        catch
+          nothing
+        end
+        if evalResult !== nothing && isfinite(evalResult)
+          numericByStr[kStr] = evalResult
+          nameToNumeric[kStr] = evalResult
+          subDict[uk] = evalResult
+          newlyResolved += 1
+          continue
+        end
         push!(remaining, (uk, uv, kStr))
       end
     end
@@ -284,7 +514,9 @@ function _resolveParamValues(pars)
   end
 
   if !isempty(symbolicByKey)
-    @warn "DirectRHS: $(length(symbolicByKey)) parameters could not be resolved to numeric values, defaulting to 0.0"
+    local unresolvedNames = [kStr for (_, _, kStr) in symbolicByKey]
+    local unresolvedVals = [string(uv) for (_, uv, _) in symbolicByKey]
+    @warn "DirectRHS: $(length(symbolicByKey)) parameters could not be resolved to numeric values, defaulting to 0.0" unresolvedNames unresolvedVals
     for (_, _, kStr) in symbolicByKey
       numericByStr[kStr] = 0.0
     end
@@ -321,14 +553,36 @@ end
 
 
 """
-    _toFloat64(val)
+    _toFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
 
-Convert a value to Float64, handling Symbolics.Num wrappers and other numeric types.
+Convert a value to Float64, handling Symbolics.Num wrappers, constant symbolic
+expressions, and parameter references (resolved via resolvedParams dict).
 """
-function _toFloat64(val)
+function _toFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
   local unwrapped = val isa Symbolics.Num ? Symbolics.unwrap(val) : val
-  if unwrapped isa Number
-    return Float64(unwrapped)
+  unwrapped isa Number && return Float64(unwrapped)
+  # Constant symbolic expression (no free variables): parse its string repr
+  local freeVars = Symbolics.get_variables(unwrapped)
+  if isempty(freeVars)
+    local f = tryparse(Float64, string(val))
+    f !== nothing && return f
+  end
+  if resolvedParams !== nothing
+    # Direct name lookup (handles bare parameter references)
+    local key = string(val)
+    haskey(resolvedParams, key) && return resolvedParams[key]
+    # Substitute known parameters into the expression
+    if !isempty(freeVars)
+      local subDict = Dict{Any,Any}(fv => resolvedParams[string(fv)]
+                                     for fv in freeVars
+                                     if haskey(resolvedParams, string(fv)))
+      if !isempty(subDict)
+        local resolved = Symbolics.substitute(unwrapped, subDict)
+        resolved isa Number && return Float64(resolved)
+        local rv = resolved isa Symbolics.Num ? Symbolics.unwrap(resolved) : resolved
+        rv isa Number && return Float64(rv)
+      end
+    end
   end
   @warn "DirectRHS: could not convert value to Float64, using 0.0" val=val type=typeof(val)
   return 0.0

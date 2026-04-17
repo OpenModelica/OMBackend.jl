@@ -47,16 +47,24 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_COMPLEX(__)) => begin
       SimulationCode.DATA_STRUCTURE(backendVar.bindExp)
     end
-    (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_REAL(__) || DAE.T_BOOL(__) || DAE.T_INTEGER(__)) => begin
+    #= Backend constants must be emitted as module-level bindings because generated
+       parameter/default expressions may reference them directly by name. =#
+    (BDAE.PARAM(__), DAE.T_REAL(__) || DAE.T_BOOL(__) || DAE.T_INTEGER(__)) => begin
       SimulationCode.PARAMETER(backendVar.bindExp)
+    end
+    (BDAE.CONST(__), DAE.T_REAL(__) || DAE.T_BOOL(__) || DAE.T_INTEGER(__)) => begin
+      SimulationCode.DATA_STRUCTURE(backendVar.bindExp)
     end
     #= String parameters - used for labels, names etc. =#
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_STRING(__)) => begin
       SimulationCode.STRING(backendVar.bindExp)
     end
     #= Enumeration parameters =#
-    (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_ENUMERATION(__)) => begin
+    (BDAE.PARAM(__), DAE.T_ENUMERATION(__)) => begin
       SimulationCode.PARAMETER(backendVar.bindExp)
+    end
+    (BDAE.CONST(__), DAE.T_ENUMERATION(__)) => begin
+      SimulationCode.DATA_STRUCTURE(backendVar.bindExp)
     end
     (_, DAE.T_INTEGER(__)) => begin
       SimulationCode.DISCRETE()
@@ -78,6 +86,10 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
 
     (BDAE.VARIABLE(__), DAE.T_STRING(__)) => begin
       SimulationCode.STRING(backendVar.bindExp)
+    end
+    #= Enumeration variables are discrete =#
+    (BDAE.VARIABLE(__), DAE.T_ENUMERATION(__)) => begin
+      SimulationCode.DISCRETE()
     end
     _ => begin
       @error("\n Variable: $(backendVar.varName) \n Category: $(typeof(backendVar.varKind)).\n Type: $(typeof(backendVar.varType)) of backend variable not handled.\n")
@@ -117,7 +129,7 @@ function DAE_identifierToString(daeID::DAE.ComponentRef)
     DAE.CREF_IDENT(__) => string(daeID)
 
     DAE.CREF_QUAL(_, DAE.T_COMPLEX(DAE.ClassInf.RECORD(path), _), _, _) => begin
-      "'($(string(daeID))')"
+      string(daeID)
     end
 
     DAE.CREF_QUAL(__) => begin
@@ -473,11 +485,6 @@ function matchAndCheckStronglyConnectedComponents(eqVariableMapping,
   if isSingular && mode == OMBackend.MTK_MODE
     digraph = GraphAlgorithms.merge(matchOrder, eqVariableMapping)
     sccs = GraphAlgorithms.stronglyConnectedComponents(digraph)
-    #=
-      Dumps the equation graph if the correct flag (OMBackend.PLOT_EQUATION_GRAPH)
-      is defined earlier in the compilation process
-    =#
-    plotEquationGraph(digraph, matchOrder, stringToSimVarHT)
     return (isSingular, matchOrder, digraph, sccs)
   end
 
@@ -487,19 +494,7 @@ function matchAndCheckStronglyConnectedComponents(eqVariableMapping,
   end
   digraph = GraphAlgorithms.merge(matchOrder, eqVariableMapping)
   sccs = GraphAlgorithms.stronglyConnectedComponents(digraph)
-  plotEquationGraph(digraph, matchOrder, stringToSimVarHT)
   return (isSingular, matchOrder, digraph, sccs)
-end
-
-"""
-  Function to print a representation of the equations post sorting
-"""
-function plotEquationGraph(g, matchOrder, stringToSimVarHT)
-  if OMBackend.PLOT_EQUATION_GRAPH
-    @info "Dumping the equation graph"
-    local labels = makeLabels(g, matchOrder, stringToSimVarHT)
-    GraphAlgorithms.plotEquationGraphPNG("./digraphOutput.png", g, labels)
-  end
 end
 
 """

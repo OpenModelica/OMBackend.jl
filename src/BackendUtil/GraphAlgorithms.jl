@@ -10,9 +10,6 @@ module GraphAlgorithms
 
 import Graphs
 import MetaGraphs
-import Cairo
-using GraphPlot
-using Compose
 using DataStructures
 
 """
@@ -166,19 +163,6 @@ function stronglyConnectedComponents(g::Graphs.AbstractGraph)::Vector
   Graphs.strongly_connected_components_kosaraju(g)
 end
 
-
-"""
-    Plots the given equation graph as a png
-"""
-function plotEquationGraphPNG(filePath::String, g::Graphs.AbstractGraph, labels, dims = (64cm, 64cm)::Tuple)
-  plot = gplot(g,
-               nodelabel=labels,
-               nodefillc="blue",
-               nodelabelc="white",
-               edgestrokec="black",
-               layout=spring_layout)
-  draw(Compose.PNG(filePath, dims...), plot)
-end
 
 function connected_components(g::Graphs.AbstractGraph)
   Graphs.connected_components(g)

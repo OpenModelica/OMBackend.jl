@@ -122,13 +122,28 @@ function transformToMTKContinousCondition(cond, simCode)
     DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => begin
       :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)))
     end
+    #= Equality/inequality: discrete boolean comparison, treat as boolean zero-crossing =#
+    DAE.RELATION(e1, DAE.EQUAL(__), e2) => begin
+      :($(expToJuliaExpMTK(cond, simCode)) - 0.5)
+    end
+    DAE.RELATION(e1, DAE.NEQUAL(__), e2) => begin
+      :($(expToJuliaExpMTK(cond, simCode)) - 0.5)
+    end
     #= Boolean variable: convert to zero-crossing (var - 0.5) =#
     DAE.CREF(__) => begin
       :($(expToJuliaExpMTK(cond, simCode)) - 0.5)
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      :(min($(transformToMTKContinousConditionEquation(e1, simCode)),
-            $(transformToMTKContinousConditionEquation(e2, simCode))))
+      :(min($(transformToMTKContinousCondition(e1, simCode)),
+            $(transformToMTKContinousCondition(e2, simCode))))
+    end
+    DAE.LBINARY(e1, DAE.AND(__), e2) => begin
+      :(max($(transformToMTKContinousCondition(e1, simCode)),
+            $(transformToMTKContinousCondition(e2, simCode))))
+    end
+    #= Logical NOT: negate the inner condition =#
+    DAE.LUNARY(DAE.NOT(__), e) => begin
+      :(-($(transformToMTKContinousCondition(e, simCode))))
     end
     #= Strip noEvent wrapper and recurse =#
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
@@ -138,6 +153,15 @@ function transformToMTKContinousCondition(cond, simCode)
       else
         throw("noEvent with multiple arguments not supported in condition: " * string(cond))
       end
+    end
+    #= initial() is true only during initialization (handled by MTK InitializationProblem).
+       In continuous equations it never triggers, so return constant negative. =#
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
+      :(-1)
+    end
+    #= General function call as boolean condition: treat as boolean zero-crossing =#
+    DAE.CALL(__) => begin
+      :($(expToJuliaExpMTK(cond, simCode)) - 0.5)
     end
     _ => begin
       throw("Unsupported condition expression in IF_EQUATION: " * string(cond))
@@ -163,6 +187,13 @@ function transformToMTKContinousConditionEquation(cond, simCode)
     DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => begin
       :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)) ~ 0)
     end
+    #= Equality/inequality: discrete boolean comparison, treat as boolean zero-crossing =#
+    DAE.RELATION(e1, DAE.EQUAL(__), e2) => begin
+      :($(expToJuliaExpMTK(cond, simCode)) - 0.5 ~ 0)
+    end
+    DAE.RELATION(e1, DAE.NEQUAL(__), e2) => begin
+      :($(expToJuliaExpMTK(cond, simCode)) - 0.5 ~ 0)
+    end
     #= Boolean variable: convert to zero-crossing equation (var - 0.5 ~ 0) =#
     DAE.CREF(__) => begin
       :($(expToJuliaExpMTK(cond, simCode)) - 0.5 ~ 0)
@@ -175,6 +206,10 @@ function transformToMTKContinousConditionEquation(cond, simCode)
       :(max($(transformToMTKContinousCondition(e1, simCode)),
             $(transformToMTKContinousCondition(e2, simCode))) ~ 0)
     end
+    #= Logical NOT: negate the inner condition =#
+    DAE.LUNARY(DAE.NOT(__), e) => begin
+      :(-($(transformToMTKContinousCondition(e, simCode))) ~ 0)
+    end
     #= Strip noEvent wrapper and recurse =#
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
@@ -183,6 +218,15 @@ function transformToMTKContinousConditionEquation(cond, simCode)
       else
         throw("noEvent with multiple arguments not supported in condition: " * string(cond))
       end
+    end
+    #= initial() is true only during initialization (handled by MTK InitializationProblem).
+       In continuous equations it never triggers, so return constant negative equation. =#
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
+      :(-1 ~ 0)
+    end
+    #= General function call as boolean condition: treat as boolean zero-crossing =#
+    DAE.CALL(__) => begin
+      :($(expToJuliaExpMTK(cond, simCode)) - 0.5 ~ 0)
     end
     _ => begin
       throw("Unsupported condition expression in IF_EQUATION: " * string(cond))
@@ -656,7 +700,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       DAE.ICONST(int) => quote $int end
       DAE.RCONST(real) => quote $real end
       DAE.SCONST(tmpStr) => quote $tmpStr end
-      DAE.CREF(DAE.CREF_IDENT("time", DAE.T_REAL(nil)), _) => begin
+      DAE.CREF(DAE.CREF_IDENT("time", DAE.T_REAL(_)), _) => begin
         quote
           t
         end
@@ -1047,6 +1091,55 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
            This handles record field array equations like frame_b.R.T[1,1] = frame_a.R.T[1,1]
            where the frontend flattened to ASUB(CREF("R_T"), [1,1]) instead of CREF("R_T", subs=[1,1]). =#
         if allConstSubs
+          #= First, detect nested ASUB(ASUB(CALL(qualified_path, args), [tupleIx]), [subExprs...])
+             where the inner ASUB extracts a tuple element that is an array.
+             This covers BOTH 1D access [i] and multi-D access [i, j, ...].
+             Plain indexing on tupleElementCall fails because it returns a scalar Num. =#
+          local _nestedTupleArrResult = @match innerExp begin
+            DAE.ASUB(DAE.CALL(path, expLst), innerSubs) where {!(path isa Absyn.IDENT) && length(innerSubs) == 1} => begin
+              local innerSubExpr = first(innerSubs)
+              local tupleIx = @match innerSubExpr begin
+                DAE.ICONST(i) => i
+                DAE.INDEX(DAE.ICONST(i)) => i
+                _ => nothing
+              end
+              if tupleIx === nothing
+                nothing
+              else
+                local callFuncName2 = Symbol(replace(string(path), "." => "_"))
+                local fnQuote2 = QuoteNode(callFuncName2)
+                local callArgs2 = []
+                for arg in expLst
+                  local flatArgs2::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
+                  if !isempty(flatArgs2)
+                    append!(callArgs2, flatArgs2)
+                  else
+                    push!(callArgs2, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
+                  end
+                end
+                local arrIdxTuple = Tuple(Int[Int(s) for s in subExprs])
+                :(OMBackend.CodeGeneration.tupleArrayElementAt($fnQuote2, $tupleIx, $arrIdxTuple, $(callArgs2...)))
+              end
+            end
+            #= Same pattern but with TSUB instead of inner ASUB for tuple extraction.
+               Handles ASUB(TSUB(CALL(func, args), tupleIx), [arraySubscripts]). =#
+            DAE.TSUB(DAE.CALL(path, expLst), tupleIx, _) where {!(path isa Absyn.IDENT)} => begin
+              local callFuncName3 = Symbol(replace(string(path), "." => "_"))
+              local fnQuote3 = QuoteNode(callFuncName3)
+              local callArgs3 = []
+              for arg in expLst
+                local flatArgs3::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
+                if !isempty(flatArgs3)
+                  append!(callArgs3, flatArgs3)
+                else
+                  push!(callArgs3, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
+                end
+              end
+              local arrIdxTuple3 = Tuple(Int[Int(s) for s in subExprs])
+              :(OMBackend.CodeGeneration.tupleArrayElementAt($fnQuote3, $tupleIx, $arrIdxTuple3, $(callArgs3...)))
+            end
+            _ => nothing
+          end
           local scalarizedResult = @match innerExp begin
             DAE.CREF(DAE.CREF_IDENT(ident, _, sLst), _) where {isempty(sLst)} => begin
               local lookUpStr = string(ident) * join(("[" * string(s) * "]" for s in subExprs))
@@ -1059,10 +1152,40 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             end
             _ => nothing
           end
-          if scalarizedResult !== nothing
+          if _nestedTupleArrResult !== nothing
+            _nestedTupleArrResult
+          elseif scalarizedResult !== nothing
             scalarizedResult
+          elseif length(subExprs) == 1 && first(subExprs) isa Integer
+            #= Check for multi-output Modelica function call: ASUB(CALL(qualified_path, args), [ix]).
+               Qualified paths (not Absyn.IDENT) are user-defined Modelica functions that may return
+               records (e.g., Complex with fields re, im). In symbolic mode, the wrapper returns a
+               single Num, so plain [ix] fails. Use tupleElementCall for dual numeric/symbolic dispatch. =#
+            local _asubCallResult = @match innerExp begin
+              DAE.CALL(path, expLst) where {!(path isa Absyn.IDENT)} => begin
+                local callFuncName = Symbol(replace(string(path), "." => "_"))
+                local fnQuote = QuoteNode(callFuncName)
+                local callArgs = []
+                for arg in expLst
+                  local flatArgs::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
+                  if !isempty(flatArgs)
+                    append!(callArgs, flatArgs)
+                  else
+                    push!(callArgs, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
+                  end
+                end
+                local ix = first(subExprs)
+                :(OMBackend.CodeGeneration.tupleElementCall($fnQuote, $ix, $(callArgs...)))
+              end
+              _ => nothing
+            end
+            if _asubCallResult !== nothing
+              _asubCallResult
+            else
+              local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+              quote $(innerCode)[$(first(subExprs))] end
+            end
           else
-            #= Fall through to standard ASUB handling =#
             local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
             if length(subExprs) == 1
               quote $(innerCode)[$(first(subExprs))] end
@@ -1140,15 +1263,74 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           :($startExpr:$stepExpr:$stopExpr)
         end
       end
-      DAE.TSUB(tupleExp, ix, _) => begin
-        #= Tuple subscript: extract element ix from a tuple-returning expression =#
-        local tupleExpr = expToJuliaExpMTK(tupleExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-        :($tupleExpr[$ix])
+      DAE.TSUB(tupleExp, ix, tsubTy) => begin
+        #= Tuple subscript: extract element ix from a tuple-returning expression.
+           For function calls, use tupleElementCall for scalar elements or
+           tupleArrayElementCall for array elements. Direct indexing
+           (expr[ix]) fails because Num(scalar_term)[1] is a no-op in Symbolics. =#
+        if tupleExp isa DAE.CALL
+          local callFuncName = Symbol(replace(string(tupleExp.path), "." => "_"))
+          local fnQuote = QuoteNode(callFuncName)
+          local args = []
+          for arg in tupleExp.expLst
+            local flattenedArgs::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
+            if !isempty(flattenedArgs)
+              append!(args, flattenedArgs)
+            else
+              push!(args, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
+            end
+          end
+          #= Check if the tuple element type is an array with known dimensions =#
+          local tsubArrayDims = nothing
+          if tsubTy isa DAE.T_ARRAY
+            local intDims = Int[]
+            local allKnown = true
+            for d in tsubTy.dims
+              if d isa DAE.DIM_INTEGER
+                push!(intDims, d.integer)
+              else
+                allKnown = false
+                break
+              end
+            end
+            if allKnown && !isempty(intDims)
+              tsubArrayDims = Tuple(intDims)
+            end
+          end
+          if tsubArrayDims !== nothing
+            :(OMBackend.CodeGeneration.tupleArrayElementCall($fnQuote, $ix, $tsubArrayDims, $(args...)))
+          else
+            :(OMBackend.CodeGeneration.tupleElementCall($fnQuote, $ix, $(args...)))
+          end
+        else
+          local tupleExpr = expToJuliaExpMTK(tupleExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+          :($tupleExpr[$ix])
+        end
       end
     _ =>  throw(ErrorException("$exp not yet supported"))
     end
   end
   return expr
+end
+
+"""
+Extract integer array dimensions from a DAE.Type, or nothing if not an array type.
+Used by the TSUB handler to detect when a tuple element is an array.
+"""
+function _extractTsubArrayDims(ty)
+  @match ty begin
+    DAE.T_ARRAY(_, dims) => begin
+      local intDims = Int[]
+      for d in dims
+        @match d begin
+          DAE.DIM_INTEGER(n) => push!(intDims, n)
+          _ => return nothing
+        end
+      end
+      return Tuple(intDims)
+    end
+    _ => return nothing
+  end
 end
 
 """
@@ -1484,7 +1666,7 @@ function isParametricOnlyEquation(eq, simCode::SimulationCode.SimCode)::Bool
       local entry = get(ht, key, nothing)
       if entry !== nothing
         local sv = last(entry)
-        if SimulationCode.isStateOrAlgebraic(sv)
+        if SimulationCode.isStateOrAlgebraic(sv) || SimulationCode.isDiscrete(sv)
           hasStateOrAlg[] = true
         end
       end
@@ -1638,7 +1820,7 @@ function evalInitialCondition(mtkCond, simCode = nothing)
       #= No simCode: fall back to old behavior =#
       local mtkCondE = Base.invokelatest(eval, mtkCond)
       local lhs = mtkCondE.lhs
-      local tSym = eval(:(Symbolics.variable(:t, T = Real)))
+      local tSym = ModelingToolkit.t_nounits
       local v = Base.invokelatest(substitute, lhs, Dict(tSym => 0.0))
       local numV = try Float64(v) catch; nothing end
       if numV !== nothing
@@ -1920,6 +2102,10 @@ function isContinousCondition(cond::DAE.Exp, simCode)
       if crefName == "time"
         continue
       end
+      if !haskey(ht, crefName)
+        isContinuousCond = true
+        continue
+      end
       local var = last(ht[crefName])
       #=
       If one variable in the condition is continuous treat it as a continuous  callback
@@ -1953,14 +2139,34 @@ function replaceVars(sym::Symbol; kwargs...)
     sym
   else
     local vStr = string(sym)
+    #= If the symbol is not a simulation variable (e.g. a function or module name),
+       pass it through unchanged rather than crashing with a KeyError. =#
+    if !haskey(kwargs[:ht], vStr)
+      return sym
+    end
     #= Lookup the variable. =#
-    local sVar = last(kwargs[:ht][vStr])
+    local htEntry = kwargs[:ht][vStr]
+    local sVar = last(htEntry)
     local isStateOrAlg = SimulationCode.isStateOrAlgebraic(sVar)
     if isStateOrAlg
-      :($(Meta.parse(string(kwargs[:integratorCref],
-                            kwargs[:prefix],
-                            ":$sym",
-                            kwargs[:suffix]))))
+      #= useIndexedU: for ContinuousCallback conditions the trial state is passed as u,
+         so generate u[idx] instead of integrator[:sym] to correctly detect sign changes. =#
+      if get(kwargs, :useIndexedU, false)
+        local idx = first(htEntry)
+        #= useMTKIdx: use runtime MTK variable ordering instead of BDAE index.
+           MTK may reorder unknowns (e.g., algebraic vars before differential),
+           so _mtk_idx (built from unknowns(reducedSystem)) gives the correct u position. =#
+        if get(kwargs, :useMTKIdx, false)
+          :(u[get(_mtk_idx, $vStr, $idx)])
+        else
+          :(u[$idx])
+        end
+      else
+        :($(Meta.parse(string(kwargs[:integratorCref],
+                              kwargs[:prefix],
+                              ":$sym",
+                              kwargs[:suffix]))))
+      end
     else #Parameter or Discrete.
       :($(Meta.parse(string(kwargs[:integratorCref],
                             ".ps",

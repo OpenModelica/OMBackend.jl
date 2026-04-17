@@ -109,7 +109,7 @@ function createStructuralCallback(simCode,
   global OLD_FLAT_MODEL = flatModel
   quote
     import OMBackend.CodeGeneration
-    function $(Symbol(callbackName))()
+    function $(Symbol(callbackName))(reducedSystem)
       #= Represent structural change. =#
       local stringToSimVarHT = $(simCode.stringToSimVarHT)
       local structuralChange = OMBackend.Runtime.StructuralChangeDynamicConnection($(flatModel.name),
@@ -117,7 +117,9 @@ function createStructuralCallback(simCode,
                                                                                    OMBackend.CodeGeneration.FLAT_MODEL,
                                                                                    $(idx), #= Assumes specific ordering =#
                                                                                    stringToSimVarHT,
-                                                                                   $(flatModel.active_DOCC_Equations[idx]))
+                                                                                   $(flatModel.active_DOCC_Equations[idx]),
+                                                                                   0.0,
+                                                                                   nothing)
       #= The affect simply activates the structural callback informing us to generate code for a new system =#
       $(createAffectCondPairForDOCC(cond, idx, flatModel.active_DOCC_Equations, simCode))
       local cb = DiscreteCallback(condition,
@@ -158,10 +160,21 @@ function createStructuralCallback(simCode,
   callback = @match whenCondition begin
     DAE.CALL(Absyn.IDENT("sample"), args, attrs) => begin
       @match start <| interval <| tail = args
+      #= Evaluate the interval to a concrete number at code-generation time.
+         If it is a parameter CREF, resolve it from the simCode HT. =#
+      local Δt_val = @match interval begin
+        DAE.RCONST(r) => r
+        DAE.ICONST(i) => Float64(i)
+        DAE.CREF(cr, _) => begin
+          local cname = SimulationCode.DAE_identifierToString(cr)
+          local sv = last(simCode.stringToSimVarHT[cname])
+          evalSimCodeParameter(sv, simCode)
+        end
+        _ => evalDAEConstant(interval, simCode)
+      end
       quote
         $(affect)
-        Δt = $(expToJuliaExpMTK(interval, simCode))
-        local cb = PeriodicCallback(affect!, Δt)
+        local cb = PeriodicCallback(affect!, $(Δt_val))
       end
     end
     _ #=Continuous or discrete =# => begin
@@ -170,12 +183,13 @@ function createStructuralCallback(simCode,
         quote
           $(affect)
           function condition(u, t, integrator)
-            #@info "Checking condition... at" t integrator.ps[:state]
             return $(replaceVars(expToJuliaExpMTK(zeroCrossingCond, simCode);
                                  integratorCref = "integrator",
                                  prefix = "[",
                                  suffix = "]",
-                                 ht = simCode.stringToSimVarHT))
+                                 ht = simCode.stringToSimVarHT,
+                                 useIndexedU = true,
+                                 useMTKIdx = true))
           end
           local cb = ContinuousCallback(condition, affect!)
         end
@@ -192,58 +206,85 @@ function createStructuralCallback(simCode,
     end
   end
   #=
-    Construct the specified structural change as a pair.
-    For now assume that we only change some parameter.
+    Construct the specified structural change.
+    Dispatch on whether this is a standard recompilation or an agentic one.
   =#
-  local componentToModify = string(recompilationDirective.componentToChange)
-  local newValue::Expr = if typeof(recompilationDirective.newValue) === DAE.CREF
-    #= The type we are modifying is either a parameter or a constant =#
-    local variableSpec = last(simCode.stringToSimVarHT[string(recompilationDirective.newValue)])
-    @match SimulationCode.SIMVAR(name, index, SimulationCode.PARAMETER(SOME(bindExp)), _) =  variableSpec
-    #= Above might throw. In that case it is an error.=#
-    expToJuliaExpMTK(bindExp, simCode)
-  else
-    newValue = expToJuliaExpMTK(recompilationDirective.newValue, simCode)
-    #= Get the component we are currently modifying =#
-    evalExpr = quote
-        variableSpec = last(stringToSimVarHT[$(componentToModify)])
-        @match SimulationCode.SIMVAR(name, index, SimulationCode.PARAMETER(SOME(bindExp)), _) =  variableSpec
-        parameterVal = OMBackend.CodeGeneration.evalDAEConstant(bindExp)
-        $(Symbol(componentToModify)) = parameterVal
-        $(newValue)
-      end
-    #expToJuliaExpMTK(evalExpr, simCode)
-    evalExpr
-  end
-  modification = quote
-    ($(componentToModify), $("$(newValue)"))
-  end
   @match SOME(metaModel) = simCode.metaModel
-  structuralCallback = quote
-    function $(Symbol(callbackName))()
-      #= The recompilation directive. =#
-      stringToSimVarHT = $(simCode.stringToSimVarHT)
-      #=
-      We quote the modification.
-      This is to evaluate it in the correct context later when recompiling.
-      =#
-      local modification::Tuple{String, String} = $(modification)
-      #= Represent structural change. =#
-      #=NOTE: For the implicit callbacks the model is assumed to be the same=#
-      local structuralChange = OMBackend.Runtime.StructuralChangeRecompilation($(simCode.name),
-                                                                               false,
-                                                                               $(metaModel),
-                                                                               modification,
-                                                                               stringToSimVarHT,
-                                                                               0.0,
-                                                                               Float64[])
-      #=
-        TODO, here we need to change the code generation
-        to encompass other types of callbacks not based on zero crossing functions...
-      =#
-      #= The affect simply activates the structural callback informing us to generate code for a new system =#
-      $(callback)
-      return (cb, structuralChange)
+  structuralCallback = if typeof(recompilationDirective) === BDAE.AGENTIC_RECOMPILATION
+    #= Agentic recompilation: new values come from the external agent at runtime =#
+    local componentsToChange = [string(c) for c in recompilationDirective.componentsToChange]
+    local promptVal = if isSome(recompilationDirective.prompt)
+      @match SOME(s) = recompilationDirective.prompt
+      s
+    else
+      nothing
+    end
+    local initEqVal = if isSome(recompilationDirective.initialEquations)
+      @match SOME(s) = recompilationDirective.initialEquations
+      s
+    else
+      nothing
+    end
+    quote
+      function $(Symbol(callbackName))(reducedSystem)
+        #= Build a name→MTK-index map so condition functions use the correct u[i].
+           MTK may reorder unknowns relative to the BDAE state indices. =#
+        local _mtk_idx = Dict{String, Int}(
+          split(string(v), "(")[1] => i
+          for (i, v) in enumerate(ModelingToolkit.unknowns(reducedSystem)))
+        stringToSimVarHT = $(simCode.stringToSimVarHT)
+        local structuralChange = OMBackend.Runtime.StructuralChangeAgenticRecompilation(
+          $(simCode.name),
+          false,
+          $(metaModel),
+          $(componentsToChange),
+          stringToSimVarHT,
+          0.0,
+          Float64[],
+          $(promptVal),
+          $(initEqVal))
+        $(callback)
+        return (cb, structuralChange)
+      end
+    end
+  else
+    #= Standard recompilation: new value is determined by a Modelica expression =#
+    local componentToModify = string(recompilationDirective.componentToChange)
+    local newValue::Expr = if typeof(recompilationDirective.newValue) === DAE.CREF
+      local variableSpec = last(simCode.stringToSimVarHT[string(recompilationDirective.newValue)])
+      @match SimulationCode.SIMVAR(name, index, SimulationCode.PARAMETER(SOME(bindExp)), _) = variableSpec
+      expToJuliaExpMTK(bindExp, simCode)
+    else
+      newValue = expToJuliaExpMTK(recompilationDirective.newValue, simCode)
+      evalExpr = quote
+          variableSpec = last(stringToSimVarHT[$(componentToModify)])
+          @match SimulationCode.SIMVAR(name, index, SimulationCode.PARAMETER(SOME(bindExp)), _) = variableSpec
+          parameterVal = OMBackend.CodeGeneration.evalDAEConstant(bindExp)
+          $(Symbol(componentToModify)) = parameterVal
+          $(newValue)
+        end
+      evalExpr
+    end
+    modification = quote
+      ($(componentToModify), $("$(newValue)"))
+    end
+    quote
+      function $(Symbol(callbackName))(reducedSystem)
+        local _mtk_idx = Dict{String, Int}(
+          split(string(v), "(")[1] => i
+          for (i, v) in enumerate(ModelingToolkit.unknowns(reducedSystem)))
+        stringToSimVarHT = $(simCode.stringToSimVarHT)
+        local modification::Tuple{String, String} = $(modification)
+        local structuralChange = OMBackend.Runtime.StructuralChangeRecompilation($(simCode.name),
+                                                                                 false,
+                                                                                 $(metaModel),
+                                                                                 modification,
+                                                                                 stringToSimVarHT,
+                                                                                 0.0,
+                                                                                 Float64[])
+        $(callback)
+        return (cb, structuralChange)
+      end
     end
   end
   return structuralCallback
@@ -308,7 +349,7 @@ function createStructuralAssignment(simCode, simCodeStructuralTransition::Simula
   local integratorCallbackName = string(callbackName, "_CALLBACK")
   local structuralChangeStructure = string(callbackName, "_STRUCTURAL_CHANGE")
   quote
-    ($(Symbol(integratorCallbackName)), $(Symbol(structuralChangeStructure))) = $(Symbol(callbackName))()
+    ($(Symbol(integratorCallbackName)), $(Symbol(structuralChangeStructure))) = $(Symbol(callbackName))(reducedSystem)
     push!(structuralCallbacks, $(Symbol(structuralChangeStructure)))
     push!(callbackSet, ($(Symbol(integratorCallbackName))))
   end
@@ -320,7 +361,7 @@ function createStructuralAssignment(simCode, simCodeStructuralTransition::Simula
   local integratorCallbackName = string(callbackName,  "_CALLBACK")
   local structuralChangeStructure = string(callbackName, "_STRUCTURAL_CHANGE")
   quote
-    ($(Symbol(integratorCallbackName)), $(Symbol(structuralChangeStructure))) = $(Symbol(callbackName))()
+    ($(Symbol(integratorCallbackName)), $(Symbol(structuralChangeStructure))) = $(Symbol(callbackName))(reducedSystem)
     push!(structuralCallbacks, $(Symbol(structuralChangeStructure)))
     push!(callbackSet, ($(Symbol(integratorCallbackName))))
   end
@@ -379,6 +420,9 @@ function createStructuralWhenStatements(@nospecialize(whenStatements::List{BDAE.
       BDAE.RECOMPILATION(__) => begin
         recompilationOperator = wStmt
       end
+      BDAE.AGENTIC_RECOMPILATION(__) => begin
+        recompilationOperator = wStmt
+      end
       BDAE.REINIT(__) => begin
         throw("Reinit is not allowed in a structural when equation")
       end
@@ -395,12 +439,12 @@ end
 """
 function extractTransitionEquationBody(structuralTransition)
   local ifEquation = structuralTransition.ifEquation
-  local structuralTransisitonAsDAE = listHead(OMFrontend.Frontend.convertEquation(ifEquation, nil))
+  local structuralTransisitonAsDAE = listHead(OMFrontend.Frontend.convertEquation(ifEquation, MetaModelica.nil))
   #= For now assumed to only allow a single statement. No else. =#
   @assert length(structuralTransisitonAsDAE.condition1) == 1
   @assert length(ifEquation.branches) == 1
   local cond = listHead(structuralTransisitonAsDAE.condition1)
-  local branch = listHead(ifEquation.branches)
+  local branch = first(ifEquation.branches)
   local bodyEquations = branch.body
   return (bodyEquations, cond)
 end
@@ -417,7 +461,7 @@ function createNewFlatModel(flatModel)
                                                   flatModel.initialEquations,
                                                   flatModel.algorithms,
                                                   flatModel.initialAlgorithms,
-                                                  nil,
+                                                  MetaModelica.nil,
                                                   NONE(),
                                                   flatModel.DOCC_equations,
                                                   flatModel.unresolvedConnectEquations,
@@ -434,37 +478,84 @@ function createAffectCondPairForDOCC(cond,
                                      idx::Int,
                                      active_DOCC_Equations::Vector{Bool},
                                      simCode)
+  #= Extract component references from condition for MTK-aware runtime lookup.
+     After MTK structural_simplify, hardcoded x[N] indices are invalid. =#
+  local condCrefs = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
+  local condCrefSymbols = map(c -> Symbol(string(c)), condCrefs)
+  #= Build condition-variable assignment expressions: set each cref to a new boolean value =#
+  local condSetExprs = map(condCrefs) do c
+    local cStr = string(c)
+    local entry = get(simCode.stringToSimVarHT, cStr, nothing)
+    if entry !== nothing && !SimulationCode.isParameter(entry[2])
+      local sym = Symbol(cStr)
+      (falseExpr = :(x[lookuptableStates[$(QuoteNode(sym))]] = false),
+       trueExpr  = :(x[lookuptableStates[$(QuoteNode(sym))]] = true))
+    else
+      (falseExpr = :(), trueExpr = :())
+    end
+  end
   affectCondPair = if ! active_DOCC_Equations[idx]
     quote
       function affect!(integrator)
-        #@info "Structural callback at:" integrator.t
-        #@info "Structural callback Δt" integrator.dt
         local t = integrator.t
         local x = integrator.u
+        local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+        local lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
         structuralChange.structureChanged = true
-        $(expToJuliaExp(cond, simCode)) = false
+        $(map(e -> e.falseExpr, condSetExprs)...)
         auto_dt_reset!(integrator)
-        add_tstop!(integrator, integrator.t #= Some small number =#)
-        #set_!(integrator, t)
+        add_tstop!(integrator, integrator.t)
       end
       function condition(x, t, integrator)
-        return Bool($(expToJuliaExp(cond, simCode)))
+        local xs = $(condCrefSymbols)
+        local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
+        if !isempty(xs) && all(isnothing, indices)
+          return false
+        end
+        local lookuptableStates = Dict((xs) .=> indices)
+        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+        $(map(c -> Expr(Symbol("="),
+                        Symbol(string(c)),
+                        getIdxForLookupMTK(c, simCode)),
+              Util.getAllCrefs(cond))...)
+        return Bool($(expToJuliaExpMTK(cond, simCode)))
       end
     end
   else #= The equation is active at the start =#
     quote
       function affect!(integrator)
-        #@info "Structural callback at:" integrator.t
-        #@info "Structural callback Δt" integrator.dt
         local t = integrator.t
         local x = integrator.u
+        local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+        local lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
         structuralChange.structureChanged = true
-        $(expToJuliaExp(cond, simCode)) = true
-        #= Stop integration =#
+        $(map(e -> e.trueExpr, condSetExprs)...)
+        #= Save state for the solve-loop recompilation path =#
+        integrator.just_hit_tstop = true
+        structuralChange.timeAtChange = integrator.t
+        structuralChange.solutionAtChange = deepcopy(integrator.sol)
+        #= Stop integration for reconfiguration =#
         terminate!(integrator)
       end
       function condition(x, t, integrator)
-        return Bool($(expToJuliaExp(cond, simCode))) == false
+        local xs = $(condCrefSymbols)
+        local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
+        if !isempty(xs) && all(isnothing, indices)
+          return false
+        end
+        local lookuptableStates = Dict((xs) .=> indices)
+        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+        $(map(c -> Expr(Symbol("="),
+                        Symbol(string(c)),
+                        getIdxForLookupMTK(c, simCode)),
+              Util.getAllCrefs(cond))...)
+        return Bool($(expToJuliaExpMTK(cond, simCode))) == false
       end
     end
   end

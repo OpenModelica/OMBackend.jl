@@ -3,6 +3,10 @@ Code generation for algorithmic Modelica.
 author:johti17
 =#
 
+#= Return expression for the current function being generated.
+   Set before generateStatements, read by STMT_RETURN handler. =#
+const _CURRENT_RETURN_EXPR = Ref{Any}(nothing)
+
 #= Check if a DAE.VAR is a multi-dimensional array (2+ dimensions). =#
 #= Dimensions may be in v.ty (T_ARRAY) or in v.dims field. =#
 function isMultiDimArray(v::DAE.VAR)::Bool
@@ -175,12 +179,11 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
     local normalizedName = replace(func.name, "." => "_")
     local nArgs = length(inputs)
     local isArrayFunc = hasArrayOutput(func)
-    #= Only enable opaque symbolic Term dispatch for array functions with
-       if-statements (control flow that cannot evaluate with symbolic args).
-       Pure-arithmetic array functions (resolve1, resolve2, axisRotation, etc.)
-       must execute their body directly with symbolic args so MTK can see the
-       full symbolic expressions and differentiate through them (Pantelides). =#
-    local outputDims = (isArrayFunc && hasIfStatements(func)) ? computeArrayOutputDims(func) : ()
+    #= Enable scalar element-extraction wrappers for ALL array-returning functions.
+       When called with symbolic args, array functions produce SymbolicUtils.array_literal
+       nodes that Pantelides index reduction cannot differentiate. Scalar wrappers produce
+       Term{Real} nodes instead, which Symbolics can differentiate via chain rule. =#
+    local outputDims = isArrayFunc ? computeArrayOutputDims(func) : ()
     inputsJL = if nArgs > 1
       tuple(inputs...)
     elseif nArgs == 1
@@ -193,7 +196,6 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         local locals = generateLocals(func.locals)
         local outputDefaults = generateOutputDefaults(func.outputs)
         local arrayConversions = generateArrayConversions(func.inputs)
-        local statements = generateStatements(func.statements)
         local returnExpr = if length(outputs) > 1
           Expr(:tuple, outputs...)
         elseif length(outputs) == 1
@@ -201,6 +203,8 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         else
           nothing
         end
+        _CURRENT_RETURN_EXPR[] = returnExpr
+        local statements = generateStatements(func.statements)
         #= Build the anonymous function expression manually to avoid parsing issues =#
         local funcBody = Expr(:block, arrayConversions..., outputDefaults..., locals..., statements..., :(return $(returnExpr)))
         local anonFunc = if nArgs == 0
@@ -374,6 +378,10 @@ function generateStatement(s::DAE.Statement)
   throw("Unsupported stmt:" * string(s))
 end
 
+function generateStatement(stmt::DAE.STMT_NORETCALL)
+  return expToJuliaExpAlg(stmt.exp)
+end
+
 function generateStatement(stmt::DAE.STMT_ASSIGN)
   local lhs = string(stmt.exp1)
   local rhs = expToJuliaExpAlg(stmt.exp)
@@ -400,6 +408,23 @@ function generateStatement(stmt::DAE.STMT_WHILE)
       $(stmts...)
     end
   end
+end
+
+function generateStatement(stmt::DAE.STMT_RETURN)::Expr
+  local retExpr = _CURRENT_RETURN_EXPR[]
+  if retExpr === nothing
+    return :(return)
+  else
+    return :(return $(retExpr))
+  end
+end
+
+function generateStatement(stmt::DAE.STMT_BREAK)::Expr
+  :(break)
+end
+
+function generateStatement(stmt::DAE.STMT_CONTINUE)::Expr
+  :(continue)
 end
 
 """
@@ -772,20 +797,28 @@ function DAE_VAR_ToJulia(v::DAE.VAR)
 end
 
 """
-  Adds OMRuntimeExternalC as a prefix to external calls
+  Resolves external "C" calls to concrete OMRuntimeExternalC function objects.
+  This avoids scoping issues: the function object is captured directly in the
+  generated closure rather than relying on OMRuntimeExternalC being in scope
+  at runtime.
 """
 function namespaceifyExternalFunction(expr::Expr)
+  #= Meta.parse may wrap in :toplevel -- unwrap it =#
+  if expr.head == :toplevel && length(expr.args) == 1 && expr.args[1] isa Expr
+    expr = expr.args[1]
+  end
   res = if expr.head == :(=)
     local callExpr = last(expr.args)
     @match Expr(:call, [funcName, y...,z]) = callExpr
-    exp = Expr(:call, Expr(:(.), Symbol("OMRuntimeExternalC"), QuoteNode(funcName)), y...,z)
-    #= Add the prefixes call to the right hand side of the expression. =#
+    local resolvedFunc = getfield(OMRuntimeExternalC, funcName)
+    exp = Expr(:call, resolvedFunc, y..., z)
     expr.args[2] = exp
     expr
   else #Otherwise a side effect call or a call that returns directly.
     @assert expr.head === :call "Invalid call passed to namespaceifyExternalFunction"
     @match Expr(:call, [funcName, y...,z]) = expr
-    Expr(:call, Expr(:(.), Symbol("OMRuntimeExternalC"), QuoteNode(funcName)), y..., z)
+    local resolvedFunc = getfield(OMRuntimeExternalC, funcName)
+    Expr(:call, resolvedFunc, y..., z)
   end
   return res
 end

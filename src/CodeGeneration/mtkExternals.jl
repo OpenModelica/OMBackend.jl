@@ -24,38 +24,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE  S
 
 
 #=
-* This file is part of OpenModelica.
-*
-* Copyright (c) 2021-CurrentYear, Open Source Modelica Consortium (OSMC),
-* c/o Linköpings universitet, Department of Computer and Information Science,
-* SE-58183 Linköping, Sweden.
-*
-* All rights reserved.
-*
-* THIS PROGRAM IS PROVIDED UNDER THE TERMS OF GPL VERSION 3 LICENSE OR
-* THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.2.
-* ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
-* RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GPL VERSION 3,
-* ACCORDING TO RECIPIENTS CHOICE.
-*
-* The OpenModelica software and the Open Source Modelica
-* Consortium (OSMC) Public License (OSMC-PL) are obtained
-* from OSMC, either from the above address,
-* from the URLs: http:www.ida.liu.se/projects/OpenModelica or
-* http:www.openmodelica.org, and in the OpenModelica distribution.
-* GNU version 3 is obtained from: http:www.gnu.org/copyleft/gpl.html.
-*
-* This program is distributed WITHOUT ANY WARRANTY; without
-* even the implied warranty of  MERCHANTABILITY or FITNESS
-* FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
-* IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
-*
-* See the full OSMC Public License conditions for more details.
-*
-=#
-
-
-#=
 This file contains "hacks".
 This is done in order to get the equations on a MTK compatible format before calling functions such as structurally simplify.
 TODO:
@@ -71,9 +39,17 @@ const MODELICA_FUNCTION_IMPLS = Dict{Symbol, Function}()
 const MODELICA_FUNCTION_WRAPPERS = Dict{Symbol, Any}()
 
 #= Cache for per-element extractor functions.
-   Key: (funcName::Symbol, indices::Tuple{Vararg{Int}})
-   Value: the created function object =#
-const ELEM_FUNC_CACHE = Dict{Tuple{Symbol, Tuple}, Any}()
+   Key: (funcName::Symbol, indices::Tuple{Vararg{Int}}, nArgs::Int)
+   Value: the created function object
+   nArgs is part of the key because the extractor RGF is built with
+   fixed arity — calling an extractor with the wrong number of args
+   triggers @inbounds __args[i] out-of-bounds → LLVM unreachable → SIGILL. =#
+const ELEM_FUNC_CACHE = Dict{Tuple{Symbol, Tuple, Int}, Any}()
+const TUPLE_ELEM_FUNC_CACHE = Dict{Tuple, Any}()
+
+#= Stores the count of array-shaped subtrees found in the last structural_simplify call.
+   Used by tests to assert the shape invariant (0 = clean for Pantelides). =#
+const _LAST_ARRAY_SHAPE_COUNT = Ref{Int}(-1)
 
 """
 Unwrap a value for use in symbolic Terms.
@@ -95,7 +71,7 @@ a single element by index. This avoids creating getindex(Term{Real}(...), i) sym
 terms which crash Symbolics._linear_expansion (OffsetArrays.Origin error).
 """
 function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArgs::Int)
-  local key = (funcName, indices)
+  local key = (funcName, indices, nArgs)
   if haskey(ELEM_FUNC_CACHE, key)
     return ELEM_FUNC_CACHE[key]
   end
@@ -129,26 +105,513 @@ function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArg
 end
 
 """
+Flatten array arguments into individual scalar elements.
+Returns (flatArgs, shapes) where shapes is a tuple of () for scalars,
+(n,) for vectors, or (n,m) for matrices. The flat element extractors
+use shapes to reassemble arrays before calling the real implementation.
+"""
+function _flattenSymArgs(uwArgs::Vector{Any})
+  flatArgs = Any[]
+  shapes = Tuple[]
+  for a in uwArgs
+    if a isa AbstractMatrix
+      push!(shapes, size(a))
+      for el in vec(a)
+        push!(flatArgs, el)
+      end
+    elseif a isa AbstractVector && !isempty(a) && first(a) isa AbstractVector
+      #= Nested vector: Modelica matrix stored as Vector{Vector{T}}.
+         Flatten to individual scalar elements, record as 2D shape. =#
+      local nrows = length(a)
+      local ncols = length(first(a))
+      push!(shapes, (nrows, ncols))
+      for row in a
+        for el in row
+          push!(flatArgs, el)
+        end
+      end
+    elseif a isa AbstractVector
+      push!(shapes, (length(a),))
+      for el in a
+        push!(flatArgs, el)
+      end
+    else
+      #= Scalar: pass through as-is. =#
+      push!(shapes, ())
+      push!(flatArgs, a)
+    end
+  end
+  return flatArgs, Tuple(shapes)
+end
+
+"""
+Get or create a flat element extractor that accepts individual scalar arguments,
+reassembles them into the original array shapes, calls the implementation, and
+extracts a single element. This avoids array_literal in Term arguments, which
+Pantelides index reduction cannot differentiate.
+"""
+function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nFlat::Int, shapes::Tuple)
+  local key = (funcName, :flat, indices, nFlat, shapes)
+  if haskey(TUPLE_ELEM_FUNC_CACHE, key)
+    return TUPLE_ELEM_FUNC_CACHE[key]
+  end
+  local fnQuote = QuoteNode(funcName)
+  local flatArgNames = [Symbol("f", k) for k in 1:nFlat]
+
+  #= Build reassembly statements: reconstruct each original arg from flat scalars =#
+  local stmts = Expr[]
+  local origArgNames = Symbol[]
+  local offset = 1
+  for (k, shape) in enumerate(shapes)
+    local orig = Symbol("a", k)
+    push!(origArgNames, orig)
+    if shape == ()
+      push!(stmts, :($orig = $(flatArgNames[offset])))
+      offset += 1
+    elseif length(shape) == 1
+      local n = shape[1]
+      push!(stmts, :($orig = [$(flatArgNames[offset:offset+n-1]...)]))
+      offset += n
+    elseif length(shape) == 2
+      local total = shape[1] * shape[2]
+      push!(stmts, :($orig = reshape([$(flatArgNames[offset:offset+total-1]...)], $(shape[1]), $(shape[2]))))
+      offset += total
+    end
+  end
+
+  local implCall = Expr(:call, :(Base.invokelatest), :impl, origArgNames...)
+  push!(stmts, :(impl = MODELICA_FUNCTION_IMPLS[$fnQuote]))
+  push!(stmts, :(result = $implCall))
+
+  if length(indices) == 1
+    push!(stmts, :(return result[$(indices[1])]))
+  elseif length(indices) == 2
+    local i = indices[1]
+    local j = indices[2]
+    push!(stmts, :(row = result[$i]))
+    push!(stmts, Expr(:if, :(row isa AbstractVector),
+      :(return row[$j]),
+      :(return result[$i, $j])
+    ))
+  end
+
+  local body = Expr(:->, Expr(:tuple, flatArgNames...), Expr(:block, stmts...))
+  local f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
+  TUPLE_ELEM_FUNC_CACHE[key] = f
+  return f
+end
+
+"""
+    makeSymbolicTerm(f, args)
+
+Create a `Symbolics.Num`-wrapped `SymbolicUtils.Term` for a Modelica function call.
+Centralizes the SymbolicUtils type parameter so there is a single point of change
+when the SymbolicUtils API evolves.
+
+Variant type: `SymReal` (the default variant in SymbolicUtils, and the variant
+that `Symbolics.Num` wraps via `infer_vartype(::Type{Num}) = SymReal`).
+MTK unknowns are `BasicSymbolic{SymReal}`, so terms wrapping them must also
+be `SymReal` to avoid cross-variant errors.
+
+symtype: `Real` (passed as `type = Real` keyword). This is required because the
+`Num` constructor asserts `symtype(ex) <: Number`. Without it, the safe_ctors.jl
+default `_promote_symtype(f, args)` cannot infer the return type of our RTG
+element extractor functions.
+"""
+function makeSymbolicTerm(f, args::Vector{Any})
+  #= Guard: reject ALL array arguments. SymbolicUtils wraps Term arguments into
+     BasicSymbolic nodes. Arrays (whether symbolic or numeric) get array shape
+     metadata that triggers "Differentiation with array expressions is not yet
+     supported" during Pantelides index reduction.
+     Callers must flatten array args via _flattenSymArgs before reaching here. =#
+  for (i, a) in enumerate(args)
+    if a isa AbstractArray
+      error("makeSymbolicTerm: argument $i is an AbstractArray ($(typeof(a)), length=$(length(a))). " *
+            "All array arguments must be flattened to scalars before creating Terms. " *
+            "Use _flattenSymArgs to decompose arrays into individual scalar elements.")
+    end
+  end
+  return Symbolics.Num(SymbolicUtils.Term{SymbolicUtils.SymReal}(f, args; type = Real))
+end
+
+"""
+Call a tuple-returning Modelica function and extract a specific element.
+Used by the TSUB handler in equation code generation to avoid the problem
+where Num(scalar_term)[ix] is a no-op in the Symbolics framework.
+
+When called with symbolic arguments, creates a Term{Real} wrapping an
+element-specific RTG function that extracts element `ix` at numeric evaluation time.
+When called with numeric arguments, calls the function impl directly and extracts element `ix`.
+
+All symbolic terms are created via `makeSymbolicTerm`.
+"""
+function tupleElementCall(funcName::Symbol, ix::Int, args...)
+  if hasSymbolicArgs(args...)
+    #= Try eager evaluation: call impl with original (Num-wrapped) args.
+       Produces elementary symbolic expressions Symbolics can differentiate.
+       Falls back to opaque RTG extractors if eval fails (if-statement on symbolic). =#
+    try
+      local impl = MODELICA_FUNCTION_IMPLS[funcName]
+      local preparedArgs = _prepareArgsForEagerEval(args)
+      local result = Base.invokelatest(impl, preparedArgs...)
+      return result[ix]
+    catch
+    end
+    #= Fallback: opaque RTG Term extractors =#
+    local uwArgs = Any[unwrapForSymbolic(a) for a in args]
+    local hasArrayArgs = any(a -> a isa AbstractArray, uwArgs)
+    if hasArrayArgs
+      local flatArgs, shapes = _flattenSymArgs(uwArgs)
+      local nFlat = length(flatArgs)
+      local elemFunc = _getOrCreateFlatElemFunc(funcName, (ix,), nFlat, shapes)
+      return makeSymbolicTerm(elemFunc, flatArgs)
+    else
+      local nArgs = length(uwArgs)
+      local elemFunc = getOrCreateElemFunc(funcName, (ix,), nArgs)
+      return makeSymbolicTerm(elemFunc, uwArgs)
+    end
+  else
+    local impl = MODELICA_FUNCTION_IMPLS[funcName]
+    local result = Base.invokelatest(impl, args...)
+    return result[ix]
+  end
+end
+
+"""
+Get or create a per-element extractor function for an array element within a
+tuple-returning Modelica function. The extractor calls the implementation,
+extracts the tuple element at tupleIdx, then extracts the array element at arrayIndices.
+"""
+function getOrCreateTupleElemFunc(funcName::Symbol, tupleIdx::Int, arrayIndices::Tuple{Vararg{Int}}, nArgs::Int)
+  local key = (funcName, :tsub, tupleIdx, arrayIndices, nArgs)
+  if haskey(TUPLE_ELEM_FUNC_CACHE, key)
+    return TUPLE_ELEM_FUNC_CACHE[key]
+  end
+  local fnQuote = QuoteNode(funcName)
+  local argNames = [Symbol("a", k) for k in 1:nArgs]
+  local implCall = Expr(:call, :(Base.invokelatest), :impl, argNames...)
+  local body
+  if length(arrayIndices) == 1
+    local idx = arrayIndices[1]
+    body = Expr(:->, Expr(:tuple, argNames...), Expr(:block,
+      :(impl = MODELICA_FUNCTION_IMPLS[$fnQuote]),
+      :(result = $implCall),
+      :(tupleElem = result[$tupleIdx]),
+      :(return tupleElem[$idx])
+    ))
+  elseif length(arrayIndices) == 2
+    local i = arrayIndices[1]
+    local j = arrayIndices[2]
+    body = Expr(:->, Expr(:tuple, argNames...), Expr(:block,
+      :(impl = MODELICA_FUNCTION_IMPLS[$fnQuote]),
+      :(result = $implCall),
+      :(tupleElem = result[$tupleIdx]),
+      :(row = tupleElem[$i]),
+      Expr(:if, :(row isa AbstractVector),
+        :(return row[$j]),
+        :(return tupleElem[$i, $j])
+      )
+    ))
+  else
+    error("3D+ tuple array indices not supported")
+  end
+  local f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
+  TUPLE_ELEM_FUNC_CACHE[key] = f
+  return f
+end
+
+"""
+Flat variant of `getOrCreateTupleElemFunc`. Accepts individual scalar arguments,
+reassembles them into the original array shapes, calls the implementation, extracts
+tuple element at `tupleIdx`, then extracts array element at `arrayIndices`.
+This avoids array_literal in Term arguments, which Pantelides cannot differentiate.
+"""
+function _getOrCreateFlatTupleElemFunc(funcName::Symbol, tupleIdx::Int, arrayIndices::Tuple{Vararg{Int}}, nFlat::Int, shapes::Tuple)
+  local key = (funcName, :flat_tsub, tupleIdx, arrayIndices, nFlat, shapes)
+  if haskey(TUPLE_ELEM_FUNC_CACHE, key)
+    return TUPLE_ELEM_FUNC_CACHE[key]
+  end
+  local fnQuote = QuoteNode(funcName)
+  local flatArgNames = [Symbol("f", k) for k in 1:nFlat]
+
+  #= Build reassembly statements: reconstruct each original arg from flat scalars =#
+  local stmts = Expr[]
+  local origArgNames = Symbol[]
+  local offset = 1
+  for (k, shape) in enumerate(shapes)
+    local orig = Symbol("a", k)
+    push!(origArgNames, orig)
+    if shape == ()
+      push!(stmts, :($orig = $(flatArgNames[offset])))
+      offset += 1
+    elseif length(shape) == 1
+      local n = shape[1]
+      push!(stmts, :($orig = [$(flatArgNames[offset:offset+n-1]...)]))
+      offset += n
+    elseif length(shape) == 2
+      local total = shape[1] * shape[2]
+      push!(stmts, :($orig = reshape([$(flatArgNames[offset:offset+total-1]...)], $(shape[1]), $(shape[2]))))
+      offset += total
+    end
+  end
+
+  local implCall = Expr(:call, :(Base.invokelatest), :impl, origArgNames...)
+  push!(stmts, :(impl = MODELICA_FUNCTION_IMPLS[$fnQuote]))
+  push!(stmts, :(result = $implCall))
+  push!(stmts, :(tupleElem = result[$tupleIdx]))
+
+  if length(arrayIndices) == 1
+    local idx = arrayIndices[1]
+    push!(stmts, :(return tupleElem[$idx]))
+  elseif length(arrayIndices) == 2
+    local i = arrayIndices[1]
+    local j = arrayIndices[2]
+    push!(stmts, :(row = tupleElem[$i]))
+    push!(stmts, Expr(:if, :(row isa AbstractVector),
+      :(return row[$j]),
+      :(return tupleElem[$i, $j])
+    ))
+  else
+    error("3D+ tuple array indices not supported")
+  end
+
+  local body = Expr(:->, Expr(:tuple, flatArgNames...), Expr(:block, stmts...))
+  local f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
+  TUPLE_ELEM_FUNC_CACHE[key] = f
+  return f
+end
+
+"""
+Call a tuple-returning Modelica function and extract a specific tuple element
+that is an array. Returns a symbolic array (Vector{Num} or Matrix{Num}) where
+each element is a per-element extractor Term.
+
+Used by the TSUB handler when the tuple element type is T_ARRAY.
+"""
+function tupleArrayElementCall(funcName::Symbol, tupleIdx::Int, dims::Tuple{Vararg{Int}}, args...)
+  if hasSymbolicArgs(args...)
+    #= Try eager evaluation: call impl with Num-wrapped args, extract tuple element.
+       Produces elementary symbolic expressions for Pantelides differentiation. =#
+    try
+      local impl = MODELICA_FUNCTION_IMPLS[funcName]
+      local preparedArgs = _prepareArgsForEagerEval(args)
+      local result = Base.invokelatest(impl, preparedArgs...)
+      local tupleElem = result[tupleIdx]
+      return _ensureArrayShape(tupleElem, dims)
+    catch
+    end
+    #= Fallback: opaque RTG Term extractors =#
+    local uwArgs = Any[unwrapForSymbolic(a) for a in args]
+    local hasArrayArgs = any(a -> a isa AbstractArray, uwArgs)
+    if hasArrayArgs
+      local flatArgs, shapes = _flattenSymArgs(uwArgs)
+      local nFlat = length(flatArgs)
+      if length(dims) == 1
+        return [makeSymbolicTerm(_getOrCreateFlatTupleElemFunc(funcName, tupleIdx, (i,), nFlat, shapes), flatArgs) for i in 1:dims[1]]
+      elseif length(dims) == 2
+        return [makeSymbolicTerm(_getOrCreateFlatTupleElemFunc(funcName, tupleIdx, (i, j), nFlat, shapes), flatArgs) for i in 1:dims[1], j in 1:dims[2]]
+      else
+        error("3D+ tuple array elements not supported")
+      end
+    else
+      local nArgs = length(uwArgs)
+      if length(dims) == 1
+        return [makeSymbolicTerm(getOrCreateTupleElemFunc(funcName, tupleIdx, (i,), nArgs), uwArgs) for i in 1:dims[1]]
+      elseif length(dims) == 2
+        return [makeSymbolicTerm(getOrCreateTupleElemFunc(funcName, tupleIdx, (i, j), nArgs), uwArgs) for i in 1:dims[1], j in 1:dims[2]]
+      else
+        error("3D+ tuple array elements not supported")
+      end
+    end
+  else
+    local impl = MODELICA_FUNCTION_IMPLS[funcName]
+    local result = Base.invokelatest(impl, args...)
+    return result[tupleIdx]
+  end
+end
+
+"""
+Call a tuple-returning Modelica function and extract a single element at
+(tupleIdx, arrayIndices...). Returns a symbolic Num for symbolic args, or the
+actual element value for numeric args. Used when codegen knows the specific
+indices at compile time (e.g., ASUB(ASUB(CALL, [tupleIx]), [i, j])).
+"""
+function tupleArrayElementAt(funcName::Symbol, tupleIdx::Int, arrayIndices::Tuple{Vararg{Int}}, args...)
+  if hasSymbolicArgs(args...)
+    #= Try eager evaluation: call impl with Num-wrapped args, extract scalar. =#
+    try
+      local impl = MODELICA_FUNCTION_IMPLS[funcName]
+      local preparedArgs = _prepareArgsForEagerEval(args)
+      local result = Base.invokelatest(impl, preparedArgs...)
+      local tupleElem = result[tupleIdx]
+      if length(arrayIndices) == 1
+        return tupleElem[arrayIndices[1]]
+      elseif length(arrayIndices) == 2
+        local row = tupleElem[arrayIndices[1]]
+        if row isa AbstractVector
+          return row[arrayIndices[2]]
+        else
+          return tupleElem[arrayIndices[1], arrayIndices[2]]
+        end
+      end
+    catch
+    end
+    #= Fallback: opaque RTG Term extractors =#
+    local uwArgs = Any[unwrapForSymbolic(a) for a in args]
+    local hasArrayArgs = any(a -> a isa AbstractArray, uwArgs)
+    if hasArrayArgs
+      local flatArgs, shapes = _flattenSymArgs(uwArgs)
+      local nFlat = length(flatArgs)
+      local f = _getOrCreateFlatTupleElemFunc(funcName, tupleIdx, arrayIndices, nFlat, shapes)
+      return makeSymbolicTerm(f, flatArgs)
+    else
+      local nArgs = length(uwArgs)
+      local f = getOrCreateTupleElemFunc(funcName, tupleIdx, arrayIndices, nArgs)
+      return makeSymbolicTerm(f, uwArgs)
+    end
+  else
+    local impl = MODELICA_FUNCTION_IMPLS[funcName]
+    local result = Base.invokelatest(impl, args...)
+    local tupleElem = result[tupleIdx]
+    if length(arrayIndices) == 1
+      return tupleElem[arrayIndices[1]]
+    elseif length(arrayIndices) == 2
+      local row = tupleElem[arrayIndices[1]]
+      if row isa AbstractVector
+        return row[arrayIndices[2]]
+      else
+        return tupleElem[arrayIndices[1], arrayIndices[2]]
+      end
+    else
+      error("3D+ tuple array indices not supported")
+    end
+  end
+end
+
+"""
+Get or create a flat scalar function. Like `_getOrCreateFlatElemFunc` but returns
+the function result directly (no element indexing). Used for scalar-returning
+functions that have array input arguments.
+"""
+function _getOrCreateFlatScalarFunc(funcName::Symbol, nFlat::Int, shapes::Tuple)
+  local key = (funcName, :flat_scalar, nFlat, shapes)
+  if haskey(TUPLE_ELEM_FUNC_CACHE, key)
+    return TUPLE_ELEM_FUNC_CACHE[key]
+  end
+  local fnQuote = QuoteNode(funcName)
+  local flatArgNames = [Symbol("f", k) for k in 1:nFlat]
+
+  local stmts = Expr[]
+  local origArgNames = Symbol[]
+  local offset = 1
+  for (k, shape) in enumerate(shapes)
+    local orig = Symbol("a", k)
+    push!(origArgNames, orig)
+    if shape == ()
+      push!(stmts, :($orig = $(flatArgNames[offset])))
+      offset += 1
+    elseif length(shape) == 1
+      local n = shape[1]
+      push!(stmts, :($orig = [$(flatArgNames[offset:offset+n-1]...)]))
+      offset += n
+    elseif length(shape) == 2
+      local total = shape[1] * shape[2]
+      push!(stmts, :($orig = reshape([$(flatArgNames[offset:offset+total-1]...)], $(shape[1]), $(shape[2]))))
+      offset += total
+    end
+  end
+
+  local implCall = Expr(:call, :(Base.invokelatest), :impl, origArgNames...)
+  push!(stmts, :(impl = MODELICA_FUNCTION_IMPLS[$fnQuote]))
+  push!(stmts, :(return $implCall))
+
+  local body = Expr(:->, Expr(:tuple, flatArgNames...), Expr(:block, stmts...))
+  local f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
+  TUPLE_ELEM_FUNC_CACHE[key] = f
+  return f
+end
+
+"""
+Create a scalar symbolic Term for a function call, handling array arguments.
+If any argument is a symbolic array, flattens to scalar elements and creates a
+flat scalar extractor. Otherwise calls makeSymbolicTerm directly.
+Used by wrapper functions for scalar-returning Modelica functions with array inputs.
+"""
+function _makeScalarSymbolicTerm(funcName::Symbol, uwArgs::Vector{Any})
+  local hasArrayArgs = any(a -> a isa AbstractArray, uwArgs)
+  if hasArrayArgs
+    local flatArgs, shapes = _flattenSymArgs(uwArgs)
+    local nFlat = length(flatArgs)
+    local f = _getOrCreateFlatScalarFunc(funcName, nFlat, shapes)
+    return makeSymbolicTerm(f, flatArgs)
+  else
+    return makeSymbolicTerm(MODELICA_FUNCTION_WRAPPERS[funcName], uwArgs)
+  end
+end
+
+"""
+Precreate extractor functions for array-returning Modelica wrappers.
+Creating them eagerly during wrapper setup avoids first-use world-age issues
+when symbolic array calls are constructed during MTK lowering.
+"""
+function precreateElementExtractors(funcName::Symbol, nArgs::Int, dims::Tuple{Vararg{Int}})
+  if isempty(dims)
+    return nothing
+  elseif length(dims) == 1
+    for i in 1:dims[1]
+      getOrCreateElemFunc(funcName, (i,), nArgs)
+    end
+  elseif length(dims) == 2
+    for i in 1:dims[1], j in 1:dims[2]
+      getOrCreateElemFunc(funcName, (i, j), nArgs)
+    end
+  else
+    for i in 1:prod(dims)
+      getOrCreateElemFunc(funcName, (i,), nArgs)
+    end
+  end
+  return nothing
+end
+
+"""
 Create a symbolic array representation for an array-returning function call.
 Returns a Vector{Num} for 1D outputs or Matrix{Num} for 2D outputs.
 Each element is a scalar Term{Real} calling a per-element extractor function,
 avoiding the getindex operation that triggers OffsetArrays.Origin errors in
 Symbolics._linear_expansion.
+
+Each element is a scalar symbolic term created via `makeSymbolicTerm`.
 """
 function createSymbolicArrayCall(funcRef, uwArgs::Vector{Any}, dims::Tuple{Vararg{Int}}; funcName::Symbol = Symbol())
   #= If funcName not provided, try to extract it from funcRef =#
   if funcName === Symbol()
     funcName = funcRef isa Symbol ? funcRef : nameof(funcRef)
   end
-  local nArgs = length(uwArgs)
-  if length(dims) == 1
-    return [Symbolics.Num(SymbolicUtils.Term{Real}(getOrCreateElemFunc(funcName, (i,), nArgs), uwArgs)) for i in 1:dims[1]]
-  elseif length(dims) == 2
-    return [Symbolics.Num(SymbolicUtils.Term{Real}(getOrCreateElemFunc(funcName, (i, j), nArgs), uwArgs)) for i in 1:dims[1], j in 1:dims[2]]
+  #= Check if any argument is an array. ALL arrays must be flattened to scalars
+     because SymbolicUtils wraps Term arguments with array shape metadata that
+     triggers "Differentiation with array expressions" in Pantelides. =#
+  local hasArrayArgs = any(a -> a isa AbstractArray, uwArgs)
+  if hasArrayArgs
+    local flatArgs, shapes = _flattenSymArgs(uwArgs)
+    local nFlat = length(flatArgs)
+    if length(dims) == 1
+      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(funcName, (i,), nFlat, shapes), flatArgs) for i in 1:dims[1]]
+    elseif length(dims) == 2
+      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(funcName, (i, j), nFlat, shapes), flatArgs) for i in 1:dims[1], j in 1:dims[2]]
+    else
+      local totalLen = prod(dims)
+      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(funcName, (i,), nFlat, shapes), flatArgs) for i in 1:totalLen]
+    end
   else
-    #= 3D+ fallback: use linear indexing =#
-    local totalLen = prod(dims)
-    return [Symbolics.Num(SymbolicUtils.Term{Real}(getOrCreateElemFunc(funcName, (i,), nArgs), uwArgs)) for i in 1:totalLen]
+    local nArgs = length(uwArgs)
+    if length(dims) == 1
+      return [makeSymbolicTerm(getOrCreateElemFunc(funcName, (i,), nArgs), uwArgs) for i in 1:dims[1]]
+    elseif length(dims) == 2
+      return [makeSymbolicTerm(getOrCreateElemFunc(funcName, (i, j), nArgs), uwArgs) for i in 1:dims[1], j in 1:dims[2]]
+    else
+      local totalLen = prod(dims)
+      return [makeSymbolicTerm(getOrCreateElemFunc(funcName, (i,), nArgs), uwArgs) for i in 1:totalLen]
+    end
   end
 end
 
@@ -182,6 +645,64 @@ function hasSymbolicArgs(args...)
 end
 
 """
+Prepare arguments for eager evaluation of Modelica functions with symbolic args.
+Converts Vector{Vector{T}} (Modelica nested-vector matrices) to Matrix{T} so that
+generated function bodies using A[i,j] indexing work correctly.
+Other argument types pass through unchanged.
+"""
+function _prepareArgsForEagerEval(args)
+  return map(args) do a
+    if a isa AbstractVector && !isempty(a) && first(a) isa AbstractVector
+      local nrows = length(a)
+      local ncols = length(first(a))
+      return [a[i][j] for i in 1:nrows, j in 1:ncols]
+    else
+      return a
+    end
+  end
+end
+
+"""
+Ensure an array result from eager evaluation has the expected shape.
+Converts Vector{Vector{T}} (nested vectors) to Matrix{T} for 2D output.
+"""
+function _ensureArrayShape(result, dims::Tuple{Vararg{Int}})
+  if length(dims) == 2 && result isa AbstractVector && !isempty(result) && first(result) isa AbstractVector
+    local nrows = length(result)
+    local ncols = length(first(result))
+    return [result[i][j] for i in 1:nrows, j in 1:ncols]
+  end
+  return result
+end
+
+"""
+Try eager symbolic evaluation of a Modelica function, falling back to RTG Terms.
+When the impl can be called directly with symbolic (Num) args, it produces
+elementary expressions (sin, cos, +, *) that Symbolics CAN differentiate via
+chain rule during Pantelides index reduction. If eager eval fails (e.g.,
+if-statement branches on a symbolic value), falls back to opaque RTG Term
+extractors that cannot be differentiated.
+"""
+function _symbolicFuncDispatch(funcName::Symbol, origArgs::Vector{Any}, isArray::Bool, dims::Tuple)
+  try
+    local impl = MODELICA_FUNCTION_IMPLS[funcName]
+    local preparedArgs = _prepareArgsForEagerEval(origArgs)
+    local result = Base.invokelatest(impl, preparedArgs...)
+    if isArray && !isempty(dims)
+      return _ensureArrayShape(result, dims)
+    end
+    return result
+  catch
+    local uwArgs = Any[unwrapForSymbolic(a) for a in origArgs]
+    if isArray && !isempty(dims)
+      return createSymbolicArrayCall(MODELICA_FUNCTION_WRAPPERS[funcName], uwArgs, dims; funcName=funcName)
+    else
+      return _makeScalarSymbolicTerm(funcName, uwArgs)
+    end
+  end
+end
+
+"""
 Build the body Expr for a wrapper function with the given arity and dispatch mode.
 Returns a quoted `function(args...) ... end` expression suitable for RuntimeGeneratedFunctions.
 """
@@ -202,25 +723,16 @@ function _buildWrapperBody(funcName::Symbol, nArgs::Int, arrayFunction::Bool, ou
     symbolicCheckExpr = Expr(:call, :hasSymbolicArgs, argNames...)
   end
 
-  #= Build the unwrapped args for symbolic dispatch =#
-  local uwArgsExpr
-  if nArgs > 0
-    uwArgsExpr = :(Any[$([ :(unwrapForSymbolic($a)) for a in argNames ]...)])
-  end
-
-  #= Build the symbolic return expression =#
+  #= Build the symbolic return expression.
+     Uses _symbolicFuncDispatch which tries eager evaluation first (producing
+     elementary Num expressions Symbolics can differentiate), falling back to
+     opaque RTG Terms for functions with data-dependent if-statements. =#
   local symbolicReturnExpr
   if nArgs == 0
     symbolicReturnExpr = nothing
-  elseif arrayFunction && hasArrayDims
-    symbolicReturnExpr = :(return createSymbolicArrayCall(
-      MODELICA_FUNCTION_WRAPPERS[$fnQuote], $uwArgsExpr, $outputDims;
-      funcName = $fnQuote))
-  elseif !arrayFunction
-    symbolicReturnExpr = :(return Symbolics.Num(SymbolicUtils.Term{Real}(
-      MODELICA_FUNCTION_WRAPPERS[$fnQuote], $uwArgsExpr)))
   else
-    symbolicReturnExpr = nothing
+    local origArgsExpr = Expr(:ref, :Any, argNames...)
+    symbolicReturnExpr = :(return _symbolicFuncDispatch($fnQuote, $origArgsExpr, $arrayFunction, $outputDims))
   end
 
   #= Build the impl call =#
@@ -264,16 +776,15 @@ function createModelicaFunctionWrapper(funcName::Symbol, nArgs::Int, arrayFuncti
   local body = _buildWrapperBody(funcName, nArgs, arrayFunction, outputDims)
   local rtg = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
   MODELICA_FUNCTION_WRAPPERS[funcName] = rtg
-
-  #= Create a module-level binding so equation expressions that reference
-     the function by name (e.g., in rewritten equations) can find it.
-     Only create the binding if it does not already exist. The binding is a
-     closure that delegates to the MODELICA_FUNCTION_WRAPPERS dict, so it
-     always resolves to the latest RTG wrapper even if re-created. =#
-  if !isdefined(@__MODULE__, funcName)
-    local fnQuote = QuoteNode(funcName)
-    @eval $funcName = MODELICA_FUNCTION_WRAPPERS[$fnQuote]
+  if arrayFunction && !isempty(outputDims)
+    precreateElementExtractors(funcName, nArgs, outputDims)
   end
+
+  #= Create/update a module-level binding so equation expressions that reference
+     the function by name (e.g., in rewritten equations) can find it.
+     Always update the binding to point to the latest RTG wrapper. =#
+  local fnQuote2 = QuoteNode(funcName)
+  @eval $funcName = MODELICA_FUNCTION_WRAPPERS[$fnQuote2]
 end
 
 #=
@@ -482,14 +993,15 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
   local softInitialValues = filter(finalInitialValues) do pair
     !(string(pair.first) in diffStateStrSet)
   end
-  #= If no differential state has an explicit IV but there are algebraic IVs,
-     keep all IVs as hard constraints. This handles models where only algebraic
-     variables have start values (e.g. VSS Pendulum: initial equation x=x0, y=y0
-     but no phi start). MTK needs these as hard constraints to determine the
-     differential states via algebraic equations during initialization.
-     Only demote algebraic IVs to guesses when differential states also have IVs. =#
+  #= When a DAE has only algebraic vars with explicit starts and no differential
+     state has one, pin the algebraic starts as hard u0. MTK's DAE initialiser
+     then has a well-determined system (algebraic-pin + residuals) and converges
+     to the correct root for differential states (e.g. Pendulum: x,y pinned at 10
+     forces phi = 3π/4 via x=L*sin(phi), y=-L*cos(phi)). Soft guesses alone are
+     insufficient because the NLS minimises motion from the guess and moves x,y
+     instead of phi, collapsing to phi=0 and x=0,y=-L. =#
   if isempty(hardInitialValues) && !isempty(softInitialValues)
-    @info "No differential states have explicit IVs; keeping all $(length(softInitialValues)) algebraic IVs as hard constraints"
+    @info "No differential states have explicit IVs; pinning $(length(softInitialValues)) algebraic IVs as hard u0 so DAE init can solve for diff states"
     hardInitialValues = softInitialValues
     softInitialValues = Pair[]
   end
@@ -544,8 +1056,67 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
       end
     end
   end
-  @info "ODEProblem: DAE, $(length(hardInitialValues)) hard u0 (differential), $(length(softInitialValues)) as guesses (algebraic), $(length(reducedUnks)) unknowns ($(length(diffStateSet)) differential)"
+  #= Final sweep: ensure every reduced unknown has at least a guess.
+     The loop above only covers differential states (non-zero mass matrix diagonal).
+     Algebraic unknowns that were omitted from finalInitialValues (because
+     skipDefaultStarts was true) and are not in diffStateSet fall through with
+     nothing. MTK requires every unknown to have either a hard u0 or a guess. =#
+  #= Final sweep: ensure every reduced unknown has at least a guess.
+     Even when the initialization problem is built, some unknowns may still lack
+     coverage. The sweep provides 0.0 guesses as a safety net. =#
+  local hardSymStrSetFinal = Set(string(iv.first) for iv in hardInitialValues)
+  local currentGuessKeysFinal = Set(string(k) for k in keys(ModelingToolkit.guesses(reducedSystem)))
+  local missingUnks = filter(reducedUnks) do unk
+    local s = string(unk)
+    !(s in hardSymStrSetFinal) && !(s in currentGuessKeysFinal)
+  end
+  if !isempty(missingUnks)
+    local fallbackGuesses = Dict{Any, Any}(unk => 0.0 for unk in missingUnks)
+    local currentGuesses3 = ModelingToolkit.guesses(reducedSystem)
+    @set! reducedSystem.guesses = merge(currentGuesses3, fallbackGuesses)
+    @info "Providing default 0.0 guesses for $(length(missingUnks)) uncovered unknowns: $(join([string(u) for u in missingUnks], ", "))"
+  end
+  local totalGuesses = length(softInitialValues) + length(missingUnks)
+  @info "ODEProblem: DAE, $(length(hardInitialValues)) hard u0 (differential), $(totalGuesses) as guesses (algebraic), $(length(reducedUnks)) unknowns ($(length(diffStateSet)) differential)"
   return (reducedSystem, hardInitialValues)
+end
+
+"""
+    isPureODESystem(reducedSystem) -> Bool
+
+Return `true` when `reducedSystem`'s mass matrix is the identity (pure ODE),
+`false` when it is a singular DAE mass matrix. Callable from generated code
+that does not import LinearAlgebra directly.
+"""
+function isPureODESystem(reducedSystem)
+  local mm = ModelingToolkit.calculate_massmatrix(reducedSystem)
+  return mm isa LinearAlgebra.UniformScaling
+end
+
+"""
+    buildDefaultGuesses(reducedSystem, finalInitialValues, allInitialValues)
+
+Build a Dict of default guesses for all reduced unknowns that are NOT already
+covered by `finalInitialValues` (hard u0). The init solver uses guesses as
+fallback iterates without adding equations, so this does not overdetermine
+the system. Values are taken from `allInitialValues` when available, otherwise
+defaulted to 0.0.
+"""
+function buildDefaultGuesses(reducedSystem, finalInitialValues, allInitialValues)
+  local reducedUnks = ModelingToolkit.unknowns(reducedSystem)
+  local hardKeys = Set(string(iv.first) for iv in finalInitialValues)
+  local allIVMap = Dict{String, Any}(string(iv.first) => iv.second for iv in allInitialValues)
+  local guessDict = Dict{Any, Any}()
+  for unk in reducedUnks
+    local unkStr = string(unk)
+    if !(unkStr in hardKeys)
+      guessDict[unk] = get(allIVMap, unkStr, 0.0)
+    end
+  end
+  if !isempty(guessDict)
+    @info "buildDefaultGuesses: $(length(guessDict)) guesses for unknowns not in u0"
+  end
+  return guessDict
 end
 
 """
@@ -554,20 +1125,64 @@ end
 Append `observedEqs` to the observed equations of a completed system.
 Used to inject observed equations AFTER structural_simplify so they do not
 interfere with AffectSystem tearing during callback compilation.
+
+Updates the full parent chain so that MTK's getproperty delegation
+(which walks parents until it finds a root) can resolve the new variables.
+Both `observed` and `var_to_name` are updated at every level.
 """
 function injectObservedEquations(sys, observedEqs::Vector)
-  #= MTK's getproperty follows the parent chain: if a completed system has
-     a parent, getvar is called on the PARENT, not on the child. So we must
-     inject into the parent as well, otherwise variable lookups from the
-     solution (e.g. sol[:absX]) will fail with "variable does not exist".
-     The observed field is a mutable Vector{Equation}, so we append! in-place
-     to avoid copying the entire immutable System struct. =#
-  append!(ModelingToolkit.get_observed(sys), observedEqs)
-  parent = ModelingToolkit.get_parent(sys)
-  if parent !== nothing
-    append!(ModelingToolkit.get_observed(parent), observedEqs)
+  local existingObs = ModelingToolkit.get_observed(sys)
+  local seenLHS = Set{String}()
+  for eq in existingObs
+    push!(seenLHS, string(Symbolics.unwrap(eq.lhs)))
   end
-  return sys
+  local newEqs = Symbolics.Equation[]
+  for eq in observedEqs
+    local lhsKey = string(Symbolics.unwrap(eq.lhs))
+    if !(lhsKey in seenLHS)
+      push!(seenLHS, lhsKey)
+      push!(newEqs, eq)
+    end
+  end
+  if isempty(newEqs)
+    return sys
+  end
+  @info "injectObservedEquations: existing=$(length(existingObs)), new=$(length(newEqs))"
+  local allObs = vcat(existingObs, newEqs)
+  #= Collect the full parent chain: [sys, parent, grandparent, ...] =#
+  local chain = [sys]
+  local cur = sys
+  while true
+    local p = ModelingToolkit.get_parent(cur)
+    if p === nothing
+      break
+    end
+    push!(chain, p)
+    cur = p
+  end
+  #= Update from the deepest (root) back to sys.
+     Each level gets updated observed, var_to_name, and parent pointer. =#
+  local updated = nothing
+  for i in length(chain):-1:1
+    local node = chain[i]
+    node = Setfield.set(node, Setfield.PropertyLens{:observed}(), allObs)
+    #= Add new observed LHS variables to var_to_name for getproperty lookup =#
+    local vtn = copy(ModelingToolkit.get_var_to_name(node))
+    for eq in newEqs
+      local lhsUW = Symbolics.unwrap(eq.lhs)
+      local varName = SymbolicUtils.hasmetadata(lhsUW, Symbolics.VariableSource) ?
+        SymbolicUtils.getmetadata(lhsUW, Symbolics.VariableSource)[2] : nothing
+      if varName !== nothing
+        vtn[varName] = lhsUW
+      end
+    end
+    node = Setfield.set(node, Setfield.PropertyLens{:var_to_name}(), vtn)
+    if updated !== nothing
+      node = Setfield.set(node, Setfield.PropertyLens{:parent}(), updated)
+    end
+    updated = node
+  end
+  return updated
 end
 
 """
@@ -589,7 +1204,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   local pre_unknowns = length(unknowns(sys))
   @info "Before structural_simplify: $pre_eqs equations, $pre_unknowns unknowns"
   @BACKEND_LOGGING begin
-    open("mtk_preSimplify.log", "w") do io
+    open(OMBackend.logPath("backend/mtk", "mtk_preSimplify.log"), "w") do io
       println(io, "############################################")
       println(io, "MTK system before structural_simplify")
       println(io, "############################################")
@@ -611,12 +1226,16 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
       for (i, p) in enumerate(parameters(sys))
         println(io, "  [$i] $p")
       end
-      local defs = ModelingToolkit.defaults(sys)
-      println(io)
-      println(io, "Defaults ($(length(defs))):")
-      println(io, "---------------------------------------------")
-      for (k, v) in defs
-        println(io, "  $k => $v")
+      try
+        local defs = ModelingToolkit.defaults(sys)
+        println(io)
+        println(io, "Defaults ($(length(defs))):")
+        println(io, "---------------------------------------------")
+        for (k, v) in defs
+          println(io, "  $k => $v")
+        end
+      catch
+        println(io, "\n(defaults not available in this MTK version)")
       end
     end
   end
@@ -626,6 +1245,51 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
      with the flat format. The non-DirectRHS path (VSS, standard ODEProblem)
      needs split=true for SCCNonlinearProblem initialization to work.
      The split value is embedded at codegen time by performStructuralSimplify. =#
+  #= Diagnostic: scan for array-shaped subtrees before structural_simplify =#
+  let
+    function _find_array_shapes(expr, path, results; depth=0)
+      depth > 50 && return  # guard against infinite recursion
+      if expr isa SymbolicUtils.BasicSymbolic
+        local sh = try; Symbolics.shape(expr); catch; nothing; end
+        if sh !== nothing && sh !== () && SymbolicUtils.is_array_shape(sh)
+          push!(results, (path, sh, expr))
+          return  # do not recurse further into this subtree
+        end
+        if SymbolicUtils.iscall(expr)
+          local args = SymbolicUtils.arguments(expr)
+          for (j, a) in enumerate(args)
+            _find_array_shapes(a, "$path.args[$j]", results; depth=depth+1)
+          end
+        end
+      elseif expr isa AbstractArray
+        push!(results, (path, :raw_array, expr))
+      end
+    end
+    local allResults = []
+    for (i, eq) in enumerate(equations(sys))
+      local lhsR = Pair{String,Any}[]
+      local rhsR = Pair{String,Any}[]
+      _find_array_shapes(Symbolics.unwrap(eq.lhs), "eq[$i].lhs", lhsR)
+      _find_array_shapes(Symbolics.unwrap(eq.rhs), "eq[$i].rhs", rhsR)
+      for (p, sh, node) in lhsR
+        push!(allResults, (i, p, sh, node))
+      end
+      for (p, sh, node) in rhsR
+        push!(allResults, (i, p, sh, node))
+      end
+    end
+    _LAST_ARRAY_SHAPE_COUNT[] = length(allResults)
+    if !isempty(allResults)
+      @warn "Found $(length(allResults)) array-shaped subtree(s) in equations before structural_simplify"
+      for (idx, p, sh, node) in allResults[1:min(10, length(allResults))]
+        nodeStr = try; string(node)[1:min(200, length(string(node)))]; catch e; "$(typeof(node))"; end
+        @warn "  eq $idx at $p: shape=$sh node=$nodeStr"
+      end
+    else
+      @info "No array-shaped subtrees found in equations (clean for Pantelides)"
+    end
+  end
+
   local useSplit = get(kwargs, :split, true)
   if OMBackend.ENABLE_BACKEND_LOGGING
     local _ss_timed = @timed ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
@@ -651,7 +1315,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
     @warn "full_equations(sys) != unknowns(sys): $post_full_eqs vs $post_unknowns"
   end
   @BACKEND_LOGGING begin
-    open("mtk_postSimplify.log", "w") do io
+    open(OMBackend.logPath("backend/mtk", "mtk_postSimplify.log"), "w") do io
       println(io, "############################################")
       println(io, "MTK system after structural_simplify")
       println(io, "############################################")
@@ -840,4 +1504,35 @@ end
 function getSymsAsStrings(odeFunc::ODEFunction)
   local unknowns = ModelingToolkit.parameters(odeFunc.sys)
   return map(string, unknowns)
+end
+
+"""
+Convert an ODEProblem (possibly with mass matrix) to a DAEProblem in residual
+form F(du, u, p, t) = M*du - f(u, p, t) = 0. This allows solvers like
+Sundials.IDA to be used, which share the same BDF/DASPK lineage as
+OpenModelica's DASSL and produce closely matching results.
+
+Handles both pure ODEs (UniformScaling mass matrix) and semi-explicit DAEs
+(singular mass matrix from structural_simplify).
+"""
+function ode_to_dae(prob::ODEProblem)
+  local M = prob.f.mass_matrix
+  local ode_f! = prob.f.f
+  local n = length(prob.u0)
+  local M_mat = M isa UniformScaling ? Matrix{Float64}(M, n, n) : M
+  function residual!(resid, du, u, p, t)
+    ode_f!(resid, u, p, t)
+    resid .= M_mat * du .- resid
+  end
+  local du0 = zeros(n)
+  local tmp = zeros(n)
+  ode_f!(tmp, prob.u0, prob.p, prob.tspan[1])
+  for i in 1:n
+    if M_mat[i, i] != 0.0
+      du0[i] = tmp[i] / M_mat[i, i]
+    end
+  end
+  local diff_vars = [M_mat[i, i] != 0.0 for i in 1:n]
+  SciMLBase.DAEProblem(residual!, du0, prob.u0, prob.tspan, prob.p;
+                       differential_vars = diff_vars)
 end

@@ -81,6 +81,19 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
   That is variables all modes have
   =#
   local commonVariables = createCommonVariables(simCode.sharedVariables)
+  #= Collect DATA_STRUCTURE (Modelica constant) assignments for module-level emission.
+     Without these, parameter binding expressions that reference MSL constants
+     (e.g. Modelica.Mechanics.MultiBody.Types.Defaults.*) would fail at runtime
+     because the symbols are never defined in the generated module scope. =#
+  local _dsVarNames = String[]
+  for varName in keys(simCode.stringToSimVarHT)
+    (_, var) = simCode.stringToSimVarHT[varName]
+    @match var.varKind begin
+      SimulationCode.DATA_STRUCTURE(__) => push!(_dsVarNames, varName)
+      _ => nothing
+    end
+  end
+  local DATA_STRUCTURE_ASSIGNMENTS = createDataStructureAssignments(_dsVarNames, simCode)
   #= Append top level variables to the common variables =#
   #= END =#
   code = quote
@@ -91,7 +104,8 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     import OMBackend.CodeGeneration
     using ModelingToolkit
     using DifferentialEquations
-    Base.Experimental.@compiler_options optimize=0
+    Base.Experimental.@compiler_options optimize=0 compile=min
+    $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(structuralModes...)
     $(structuralCallbacks...)
     #=
@@ -112,14 +126,36 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
                              else
                                :(CallbackSet(callbacks, callbackSet...))
                              end)
-      #= Create the composite model =#
-      compositeProblem = ModelingToolkit.ODEProblem(
-        reducedSystem,
-        finalInitialValues,
-        tspan,
-        pars,
-        callback = callbackConditions,
-      )
+      #= Create the composite model. Dispatch on the mass matrix of the initial
+         submodel exactly like the submodel builder does: pure ODE takes the
+         fast fill-all-u0 / skip-initializer path; DAE routes finalInitialValues
+         as hard u0 while letting the initialiser use reducedSystem.guesses
+         (already populated by splitInitialValues) to solve algebraic residuals
+         such as x = L*sin(phi) for the Pendulum. Injecting _compositeGuesses
+         as hard u0 for a DAE submodel would pin phi = 0 and silently violate
+         the constraint. =#
+      local _compositeIsPureODE = Base.invokelatest(
+        OMBackend.CodeGeneration.isPureODESystem, reducedSystem)
+      if _compositeIsPureODE
+        local _compositeGuesses = Base.invokelatest(
+          OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
+        compositeProblem = ModelingToolkit.ODEProblem(
+          reducedSystem,
+          merge(Dict(finalInitialValues), _compositeGuesses, pars),
+          tspan;
+          callback = callbackConditions,
+          warn_initialize_determined = false,
+          build_initializeprob = false,
+        )
+      else
+        compositeProblem = ModelingToolkit.ODEProblem(
+          reducedSystem,
+          merge(Dict(finalInitialValues), pars),
+          tspan;
+          callback = callbackConditions,
+          warn_initialize_determined = false,
+        )
+      end
       #=
       Note the difference between the two here.
       In the case of recompilation we will get fresh callbacks updated to the new structure of the final code.
@@ -189,7 +225,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     using OrdinaryDiffEq
     using Symbolics
     using OMBackend
-    Base.Experimental.@compiler_options optimize=0
+    Base.Experimental.@compiler_options optimize=0 compile=min
     #= Add import to the external runtime if the generated code calls Modelica Functions =#
     $(if simCode.externalRuntime
         generateExternalRuntimeImport(simCode)
@@ -199,7 +235,8 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     $(generateRegisterCallsForCallExprs(simCode)...)
     $(model)
     function simulate(tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
-      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), tspan, pars, vars, irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
+      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
+      global LATEST_REDUCED_SYSTEM = $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))
       solve($(Symbol("$(MODEL_NAME)Model_problem")), solver; kwargs...)
     end
   end
@@ -214,18 +251,15 @@ end
 function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions; useDirectRHS::Bool = OMBackend.DIRECT_RHS_GENERATION[])
   #@debug "Runnning: ODE_MODE_MTK_MODEL"
   RESET_CALLBACKS()
-  #= Eval functions FIRST so they exist before @register_symbolic is called =#
+  #= Eval functions and register them with @register_symbolic before equations are processed =#
   for f in functions
     eval(f)
   end
-  #= Register functions with @register_symbolic immediately after they are defined =#
-  #= This must happen before equations are processed, and at module level via eval =#
   local registrationCalls = generateRegisterCallsForCallExprs(simCode; funcArgGen = AlgorithmicCodeGeneration.generateIOL)
   for regCall in registrationCalls
     try
       eval(regCall)
     catch e
-      #= Ignore "already has a value" errors - function was registered in a previous run =#
       if !contains(string(e), "already has a value")
         rethrow(e)
       end
@@ -320,15 +354,25 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       _ => nothing
     end
     if _sp !== nothing
-      #= Skip derivative variables (der(...)) since they are not standalone MTK symbols.
-         The state priority applies to the base variable which already has its own entry. =#
+      #= State priority metadata only makes sense on actual MTK unknowns.
+         Helper parameters such as *_start may carry stateSelect from source
+         attributes, but they are not created as MTK variables and would cause
+         UndefVarError during the batched eval below. =#
       local varNameStr = string(varName)
-      if !startswith(varNameStr, "der(")
+      local supportsStatePriority =
+        varType isa SimulationCode.STATE ||
+        varType isa SimulationCode.ALG_VARIABLE ||
+        varType isa SimulationCode.OCC_VARIABLE ||
+        varType isa SimulationCode.ARRAY
+      if supportsStatePriority && !startswith(varNameStr, "der(")
         push!(statePriorityPairs, (Symbol(varName), _sp))
       end
     end
   end
   local performIndexReduction = simCode.isSingular
+  local skipInitializeProb = !isempty(simCode.structuralTransitions) ||
+                             !isnothing(simCode.metaModel) ||
+                             !isnothing(simCode.flatModel)
   #= Solve parametric initial equations (initial equations that only involve parameters).
      This determines values for fixed=false parameters before code generation. =#
   solveParametricInitialEquations!(simCode)
@@ -337,7 +381,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                                                algebraicVariables,
                                                simCode.residualEquations,
                                                simCode::SimulationCode.SIM_CODE)
-  @BACKEND_LOGGING writeEqsToFile(EQUATIONS, "equationFirstStageCodeGen.log")
+  @BACKEND_LOGGING writeEqsToFile(EQUATIONS, OMBackend.logPath("backend/codeGen", "equationFirstStageCodeGen.log"))
   #=
   If missing from variable map error is thrown check the start condition.
   Readded discretes here....
@@ -362,12 +406,63 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   #= Symbolic names =#
   local algebraicVariablesSym = Symbol[:($(Symbol(v))) for v in algebraicVariables]
   local dataStructureVariablesSym = Symbol[Symbol(v) for v in dataStructureVariables]
-  local discreteVariablesSym = Symbol[:($(Symbol(v))) for v in discreteVariables]
   local stateVariablesSym = Symbol[:($(Symbol(v))) for v in stateVariables]
   local occVariablesSym = Symbol[:($(Symbol(v))) for v in occVariables]
   local parVariablesSym = Symbol[Symbol(p) for p in parameters]
-  #=Preprocess the component of the if equations =#
+  #=Preprocess the component of the if equations.
+    Generate der(x) ~ 0 for all discrete variables (they need to be in the ODE
+    state vector for callbacks). Then detect if the total system is over-determined
+    due to discrete variables that also have alias/connector equations. Remove
+    exactly the excess dummy derivatives, targeting variables that appear in
+    pure alias equations (form 0 ~ a - b) in the residual system. =#
+  local discreteVariablesSym = Symbol[:($(Symbol(v))) for v in discreteVariables]
   local DISCRETE_DUMMY_EQUATIONS = [:(der($(Symbol(dv))) ~ 0) for dv in discreteVariables]
+  #= Check for over-determination: count total equations vs total unknowns.
+     nEqs = residual equations + discrete dummy equations + conditional equations
+     nVars = state vars + algebraic vars + discrete vars + occ vars
+     If nEqs > nVars, we have excess from discrete alias equations. =#
+  local _nConditionalEqs = sum(length(component[2]) for component in IF_EQUATION_COMPONENTS; init = 0)
+  local _nTotalEqs = length(EQUATIONS) + length(DISCRETE_DUMMY_EQUATIONS) + _nConditionalEqs
+  local _nTotalVars = length(stateVariables) + length(algebraicVariables) + length(discreteVariables) + length(occVariables)
+  local _excess = _nTotalEqs - _nTotalVars
+  if _excess > 0
+    #= Find discrete variables that appear in alias-like residual equations
+       (pure connector pass-throughs). These are safe to demote to algebraic
+       because they are fully determined by the alias equation alone. =#
+    local _discreteSet = Set(string.(Symbol.(discreteVariables)))
+    local _eqStrings = [string(eq) for eq in EQUATIONS]
+    local _aliasDiscrete = String[]
+    for dv in discreteVariables
+      local dvStr = string(Symbol(dv))
+      #= Count how many residual equations mention this discrete variable =#
+      local nMentions = count(s -> occursin(dvStr, s), _eqStrings)
+      if nMentions > 0
+        push!(_aliasDiscrete, dv)
+      end
+    end
+    #= Remove exactly _excess dummy derivatives, preferring variables with
+       the most residual equation mentions (most constrained = safest to remove). =#
+    local _toRemove = Set{String}()
+    for dv in _aliasDiscrete
+      length(_toRemove) >= _excess && break
+      push!(_toRemove, dv)
+    end
+    if !isempty(_toRemove)
+      @info "Discrete alias fix: removing $(_excess) excess dummy der equations for $(collect(_toRemove))"
+      local _newDummy = Expr[]
+      local _newDiscreteSym = Symbol[]
+      for (i, dv) in enumerate(discreteVariables)
+        if dv in _toRemove
+          push!(algebraicVariablesSym, Symbol(dv))
+        else
+          push!(_newDummy, DISCRETE_DUMMY_EQUATIONS[i])
+          push!(_newDiscreteSym, Symbol(dv))
+        end
+      end
+      DISCRETE_DUMMY_EQUATIONS = _newDummy
+      discreteVariablesSym = _newDiscreteSym
+    end
+  end
   #= Create assignments for the dummies. =#
   local IF_EQUATION_EVENTS = [component[1] for component in IF_EQUATION_COMPONENTS]
   IF_EQUATION_EVENTS = collect(Iterators.flatten(IF_EQUATION_EVENTS))
@@ -413,10 +508,16 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      - If any state variable has an explicit start value, assume the system has algebraic
        constraints and only initialize states with explicit starts (avoid overdetermination).
      - If NO state has an explicit start, provide defaults for all states (pure ODE case).
+     - Exception: when build_initializeprob is disabled (structural transition models),
+       there is no initialization solver to infer values from constraints/guesses, so
+       we MUST provide u0 defaults for all unknowns.
      This handles both constrained DAE systems (like Pendulum) and pure ODE systems
      (like MatrixVectorMult where states have no explicit start). =#
   local anyStateHasExplicitStart = hasExplicitStartValue(simCode.irreductableVariables, simCode)
   local skipDefaultsForStates = anyStateHasExplicitStart
+  #= Build default guesses for unknowns not in the heuristic-filtered u0.
+     Guesses are passed to ODEProblem so the init solver has fallback values
+     without overdetermining the system. =#
   local FINAL_START_CONDTIONS_EQUATIONS = unique!(createStartConditionsEquationsMTK(
     String[vn for vn in simCode.irreductableVariables],
     String[],
@@ -473,8 +574,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       allVariables = []
       #= Generate variables =#
       for constructor in variableConstructors
-        t = Symbolics.variable(:t, T = Real)
-        vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple{Real}, Real})(t)), Base.invokelatest(constructor))
+        vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple, Real, Nothing})(t)), Base.invokelatest(constructor))
         push!(allVariables, vars)
       end
       vars = collect(Iterators.flatten(allVariables))
@@ -534,7 +634,18 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       #= Inject observed equations post-simplification so they do not interfere
          with AffectSystem tearing during callback compilation. =#
       if @isdefined(observedEqs) && !isempty(observedEqs)
-        reducedSystem = OMBackend.CodeGeneration.injectObservedEquations(reducedSystem, observedEqs)
+        #= Deduplicate observed equations by LHS variable name before injection.
+           Both alias and eliminated observed blocks can produce the same equation. =#
+        local _seenLHS = Set{String}()
+        local _uniqueObs = Symbolics.Equation[]
+        for _obs in observedEqs
+          local _lhsKey = string(Symbolics.unwrap(_obs.lhs))
+          if !(_lhsKey in _seenLHS)
+            push!(_seenLHS, _lhsKey)
+            push!(_uniqueObs, _obs)
+          end
+        end
+        reducedSystem = OMBackend.CodeGeneration.injectObservedEquations(reducedSystem, _uniqueObs)
       end
       #= Callbacks setup =#
       local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
@@ -556,13 +667,50 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       #= Build ODEProblem =#
       if $(useDirectRHS)
         problem = OMBackend.CodeGeneration.buildDirectRHSProblem(
-          reducedSystem, finalInitialValues, pars, tspan, callbacks)
+          reducedSystem, finalInitialValues, pars, tspan, callbacks;
+          allInitialValues=initialValues)
       else
-        problem = ModelingToolkit.ODEProblem(reducedSystem,
-                                             merge(Dict(finalInitialValues), pars),
-                                             tspan,
-                                             callback=callbacks,
-                                             warn_initialize_determined=false)
+        if $(skipInitializeProb)
+          #= Structural-transition submodel. Dispatch on the mass matrix:
+             - Pure ODE (identity mass matrix): all unknowns are differential,
+               there are no constraints to solve, so provide u0 for ALL unknowns
+               (filling algebraic defaults via buildDefaultGuesses at 0.0) and
+               skip the initialization solver. This preserves the fast path for
+               models such as BouncingBall and FreeFall.
+             - DAE (singular mass matrix, e.g. Pendulum with algebraic x = L*sin(phi)
+               constraints): splitInitialValues has already pinned explicit-start
+               algebraic IVs as hard u0 and registered 0.0 soft guesses for
+               uncovered differential states on reducedSystem.guesses. Pass only
+               finalInitialValues as u0 and let MTK's initialiser solve the
+               algebraic residuals consistently. Injecting _missingU0 as hard u0
+               would override the guesses (phi=0 instead of phi=3π/4) and silently
+               violate the constraint, so do not merge it here. =#
+          local _isPureODE = Base.invokelatest(
+            OMBackend.CodeGeneration.isPureODESystem, reducedSystem)
+          if _isPureODE
+            local _missingU0 = Base.invokelatest(
+              OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
+            problem = ModelingToolkit.ODEProblem(reducedSystem,
+                                                 merge(Dict(finalInitialValues), _missingU0, pars),
+                                                 tspan;
+                                                 callback=callbacks,
+                                                 warn_initialize_determined=false,
+                                                 build_initializeprob=false)
+          else
+            problem = ModelingToolkit.ODEProblem(reducedSystem,
+                                                 merge(Dict(finalInitialValues), pars),
+                                                 tspan;
+                                                 callback=callbacks,
+                                                 warn_initialize_determined=false)
+          end
+        else
+          #= Non-structural models: let MTK default initialization handle it =#
+          problem = ModelingToolkit.ODEProblem(reducedSystem,
+                                               merge(Dict(finalInitialValues), pars),
+                                               tspan;
+                                               callback=callbacks,
+                                               warn_initialize_determined=false)
+        end
       end
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
     end
@@ -604,18 +752,10 @@ function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE)
       push!(obsExprs, :($(elimSym) ~ $(repSym)))
     end
   end
-  #= Generate variable declarations for eliminated variables as a single batch eval.
-     Previously each variable got its own eval() call, causing O(N) world-age bumps.
-     For Engine1a with 876 aliases this took ~67s. Batching into one eval: ~1s. =#
-  local batchAssignExprs = Expr[]
-  for entry in simCode.aliasMap
-    local elimSym = Symbol(entry.eliminatedName)
-    push!(batchAssignExprs,
-      :($(elimSym) = Symbolics.variable($(QuoteNode(elimSym)),
-          T = Symbolics.FnType{Tuple{Real}, Real})(
-            Symbolics.variable(:t, T = Real))))
-  end
-  local batchBlock = Expr(:block, batchAssignExprs...)
+  #= Collect eliminated symbol names at code-gen time. The Num objects
+     are constructed at runtime (below) using the function-scope `t` so
+     they share the system's independent variable. =#
+  local elimSymbols = Symbol[Symbol(entry.eliminatedName) for entry in simCode.aliasMap]
   #= Chunk observed equations into small functions (25 each) to avoid
      compiling one massive lambda. For Engine1a with 876 aliases, the single
      lambda took ~101s. Chunking into 36 functions of 25 should be much faster. =#
@@ -632,8 +772,19 @@ function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE)
     push!(chunkFuncNames, fName)
   end
   return quote
-    #= Declare eliminated alias variables (single batch eval) =#
-    eval($(QuoteNode(batchBlock)))
+    #= Build eliminated alias variables at function scope so they share
+       the `@independent_variables t` object with the main system, then
+       bind their names into the module namespace via a single eval (with
+       the Num objects embedded by value). Using `ModelingToolkit.t_nounits`
+       here would create variables with a different iv, which later trips
+       `validate_operator` with `iv::Nothing` during Pantelides. =#
+    local _elimBatch = Expr(:block)
+    for _elimName in $(elimSymbols)
+      local _elimVar = Symbolics.variable(_elimName,
+                                          T = Symbolics.FnType{Tuple, Real, Nothing})(t)
+      push!(_elimBatch.args, :($_elimName = $_elimVar))
+    end
+    eval(_elimBatch)
     #= Create observed equations in chunks =#
     $(chunkFuncDefs...)
     local _obsComponents = []
@@ -645,19 +796,29 @@ function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE)
 end
 
 """
-    generateEliminatedObservedBlock(simCode)
-
-Generate a code block that creates observed equations for variables eliminated by
-`eliminateNonDynamic`. Each eliminated (varName, equation) pair produces:
-  - A symbolic variable declaration for the eliminated variable
-  - An observed equation derived by solving the residual for the variable
-These are appended to `observedEqs` so that eliminated variables remain
-accessible in the solution (e.g. `sol[:y]`).
-
-The `eliminatedVariables` and `eliminatedEquations` vectors must be parallel
-(paired by index). The residual equation `0 = expr` is converted to MTK form
-and `Symbolics.solve_for` extracts the solved form `elimVar ~ rhs`.
+  Structurally walk a DAE expression and return true iff any subterm is a
+  `der(...)` call. Used to skip emitting observed equations whose solved
+  right-hand side would contain a `Differential(t)` operator; those equations
+  are rejected by MTK's initialization-system builder, which constructs its
+  System via the 3-argument form (eqs, unknowns, params) with iv=nothing.
 """
+function containsDerCall(@nospecialize(exp::DAE.Exp))::Bool
+  @match exp begin
+    DAE.CALL(Absyn.IDENT("der"), _) => true
+    DAE.UNARY(_, e) => containsDerCall(e)
+    DAE.BINARY(e1, _, e2) => containsDerCall(e1) || containsDerCall(e2)
+    DAE.LUNARY(_, e) => containsDerCall(e)
+    DAE.LBINARY(e1, _, e2) => containsDerCall(e1) || containsDerCall(e2)
+    DAE.RELATION(e1, _, e2) => containsDerCall(e1) || containsDerCall(e2)
+    DAE.IFEXP(c, t, e) => containsDerCall(c) || containsDerCall(t) || containsDerCall(e)
+    DAE.CALL(_, explst) => any(containsDerCall, explst)
+    DAE.CAST(_, e) => containsDerCall(e)
+    DAE.ASUB(e, _) => containsDerCall(e)
+    DAE.TSUB(e, _, _) => containsDerCall(e)
+    _ => false
+  end
+end
+
 function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE)
   if isempty(simCode.eliminatedVariables)
     return :()
@@ -665,24 +826,25 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE)
   local elimVars = simCode.eliminatedVariables
   local elimEqs = simCode.eliminatedEquations
   @assert length(elimVars) == length(elimEqs) "eliminatedVariables and eliminatedEquations must be parallel"
-  #= Generate variable declarations for eliminated variables (batch eval) =#
-  local batchAssignExprs = Expr[]
-  for varName in elimVars
-    local elimSym = Symbol(varName)
-    push!(batchAssignExprs,
-      :($(elimSym) = Symbolics.variable($(QuoteNode(elimSym)),
-          T = Symbolics.FnType{Tuple{Real}, Real})(
-            Symbolics.variable(:t, T = Real))))
-  end
-  local batchBlock = Expr(:block, batchAssignExprs...)
-  #= Generate residual expressions and solve_for calls inside a function.
-     The function is defined AFTER the eval (so it sees the new bindings)
-     and called via Base.invokelatest (to cross the world-age barrier).
-     For each eliminated pair (varName, residualEq), the residual is
-     0 = expr_involving_var. We use Symbolics.solve_for to extract the
-     solved form elimVar ~ rhs. =#
+  #= Always create Symbolics bindings for every eliminated variable so that
+     other observed equations (and any downstream code) can resolve the
+     variable name against a valid Num. Without this, an eliminated variable
+     that is referenced by another eliminated variable's residual would raise
+     a UndefVarError at module eval time (observed in DCEE_Start/DCPM_Start,
+     where `wMechanical` is referenced by sibling eliminated equations). =#
+  local allElimSymbols = Symbol[Symbol(v) for v in elimVars]
+  #= Skip generating the observed equation (solve_for + push) for pairs whose
+     residual contains a der() call. The solved form would be
+     `elimVar ~ Differential(t)(x)`, which MTK rejects when it later builds
+     the initialization system via the iv-less 3-arg
+     `System(eqs, vars, ps)` constructor (validate_operator fails with
+     OperatorIndepvarMismatchError). These eliminated variables are state
+     derivatives whose values are already exposed by MTK's solution object. =#
   local solveBodyExprs = Expr[]
   for (i, varName) in enumerate(elimVars)
+    if containsDerCall(elimEqs[i].exp)
+      continue
+    end
     local elimSym = Symbol(varName)
     local residualExpr = expToJuliaExpMTK(elimEqs[i].exp, simCode; derSymbol = false)
     push!(solveBodyExprs, quote
@@ -692,10 +854,21 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE)
     end)
   end
   return quote
-    #= Declare eliminated non-dynamic variables (single batch eval) =#
-    eval($(QuoteNode(batchBlock)))
-    #= Solve residuals and create observed equations.
-       Wrapped in a function + invokelatest to handle world-age from eval. =#
+    #= Build eliminated non-dynamic variables at function scope so they
+       share the function-scope `@independent_variables t` object with the
+       main system, then bind their names into the module namespace via a
+       single eval (with the Num objects embedded by value). =#
+    local _elimBatch = Expr(:block)
+    for _elimName in $(allElimSymbols)
+      local _elimVar = Symbolics.variable(_elimName,
+                                          T = Symbolics.FnType{Tuple, Real, Nothing})(t)
+      push!(_elimBatch.args, :($_elimName = $_elimVar))
+    end
+    eval(_elimBatch)
+    #= Solve residuals and create observed equations. Wrapped in a function
+       + invokelatest to handle world-age from the preceding eval. Variables
+       whose residual contained a der() are skipped here but still have
+       bindings above, so any sibling residual referencing them resolves. =#
     function _solveEliminatedObserved()
       local _elimObsEqs = Symbolics.Equation[]
       $(solveBodyExprs...)
@@ -1643,6 +1816,75 @@ function generateArrayRegisterExpr(f::SimulationCode.ModelicaFunction, funcArgGe
   end
 end
 
+function collectCalledFunctionNames!(names::Set{String}, @nospecialize(exp::DAE.Exp))
+  @match exp begin
+    DAE.CALL(path = path, expLst = explst) => begin
+      push!(names, string(path))
+      for arg in explst
+        collectCalledFunctionNames!(names, arg)
+      end
+    end
+    _ => begin
+      Util.traverseExpTopDown(exp,
+                              (e, acc) -> begin
+                                if e isa DAE.CALL
+                                  push!(acc, string(e.path))
+                                end
+                                (e, true, acc)
+                              end,
+                              names)
+    end
+  end
+  return names
+end
+
+function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.RESIDUAL_EQUATION)
+  collectCalledFunctionNames!(names, eq.exp)
+end
+
+function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.EQUATION)
+  collectCalledFunctionNames!(names, eq.lhs)
+  collectCalledFunctionNames!(names, eq.rhs)
+end
+
+function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.ASSIGN)
+  collectCalledFunctionNames!(names, stmt.left)
+  collectCalledFunctionNames!(names, stmt.right)
+end
+
+function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.REINIT)
+  collectCalledFunctionNames!(names, stmt.stateVar)
+  collectCalledFunctionNames!(names, stmt.value)
+end
+
+function collectCalledFunctionNames!(names::Set{String}, simCode::SimulationCode.SIM_CODE)
+  for eq in simCode.residualEquations
+    collectCalledFunctionNames!(names, eq)
+  end
+  for eq in simCode.initialEquations
+    if eq isa BDAE.RESIDUAL_EQUATION || eq isa BDAE.EQUATION
+      collectCalledFunctionNames!(names, eq)
+    end
+  end
+  for ifEq in simCode.ifEquations
+    for branch in ifEq.branches
+      collectCalledFunctionNames!(names, branch.condition)
+      for eq in branch.residualEquations
+        collectCalledFunctionNames!(names, eq)
+      end
+    end
+  end
+  for whenEq in simCode.whenEquations
+    collectCalledFunctionNames!(names, whenEq.whenEquation.condition)
+    for stmt in whenEq.whenEquation.whenStmtLst
+      if stmt isa BDAE.ASSIGN || stmt isa BDAE.REINIT
+        collectCalledFunctionNames!(names, stmt)
+      end
+    end
+  end
+  return names
+end
+
 """
   Generates quoted Symbolics registration calls for externally defined functions.
   Scalar functions use @register_symbolic.
@@ -1652,7 +1894,11 @@ end
 function generateRegisterCallsForCallExprs(simCode;
                                             funcArgGen::Function = AlgorithmicCodeGeneration.generateSignatureForRegistration)
   local rFs = Expr[]
+  local calledFunctions = collectCalledFunctionNames!(Set{String}(), simCode)
   for f in simCode.functions
+    if !(f.name in calledFunctions)
+      continue
+    end
     if hasArrayParameters(f)
       #= Functions with array parameters are not registered. =#
       #= They execute eagerly with symbolic array arguments. =#

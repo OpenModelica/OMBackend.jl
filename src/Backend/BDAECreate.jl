@@ -331,6 +331,9 @@ function splitEquationsAndVars(elementLst::List{DAE.Element})::Tuple{List, List,
           @match arg1 <| arg2 <| nil = args
           equationLst = BDAE.BRANCH(arg1, arg2) <| equationLst
         end
+        DAE.RECONFIGURE_EQUATION(__) => begin
+          equationLst = lowerReconfigureEquation(elem) <| equationLst
+        end
         _ => begin
           @error "Skipped:" elem
           throw("Unsupported equation: $elem")
@@ -384,8 +387,12 @@ function equationToBackendEquation(elem::DAE.Element)
           BDAE.STRUCTURAL_TRANSISTION(fromStateIdent, toStateIdent, conditionExp)
         end
         _ => begin
-          @error "Unknown NORETCALL of type:" path
-          throw("Unknown NORETCALL")
+          #= Skip unknown NORETCALL statements (e.g. checkBoundary, assert-like calls).
+             These are validation calls that do not contribute to the equation system.
+             Drop `maxlog` so every unique skipped call is visible — silently discarding
+             unknown semantics is how real bugs hide. =#
+          @warn "Skipping unknown NORETCALL (frontend emitted a call whose semantics the backend does not handle; treating as dummy). If this call has side effects or constraints, it will not be preserved." path
+          BDAE.DUMMY_EQUATION()
         end
       end
       res
@@ -412,6 +419,9 @@ function equationToBackendEquation(elem::DAE.Element)
        Decompose into per-field equations using the record type's varLst. =#
     DAE.COMPLEX_EQUATION(lhs, rhs, source) => begin
       decomposeComplexEquation(lhs, rhs, source)
+    end
+    DAE.RECONFIGURE_EQUATION(__) => begin
+      lowerReconfigureEquation(elem)
     end
     _ => begin
       @error "Skipped processing" elem OMFrontend.Frontend.toString(elem)
@@ -483,8 +493,8 @@ function lowerWhenEquation(eq::DAE.WHEN_EQUATION)::BDAE.Equation
   local elseOption
   local elseEq::DAE.Element
   whenOperatorLst = createWhenOperators(eq.equations, whenOperatorLst)
-  #= Check if the list of whenOperators contains a BDAE.RECOMPILATION call. =#
-  local containsRecompilation = length(findall(elem->typeof(elem)==BDAE.RECOMPILATION, listArray(whenOperatorLst))) >= 1
+  #= Check if the list of whenOperators contains a BDAE.RECOMPILATION or BDAE.AGENTIC_RECOMPILATION call. =#
+  local containsRecompilation = length(findall(elem->typeof(elem)==BDAE.RECOMPILATION || typeof(elem)==BDAE.AGENTIC_RECOMPILATION, listArray(whenOperatorLst))) >= 1
   elseOption = if isSome(eq.elsewhen_)
     @match SOME(elseEq) = eq.elsewhen_
     bdaeElse = lowerWhenEquation(elseEq)
@@ -503,6 +513,77 @@ function lowerWhenEquation(eq::DAE.WHEN_EQUATION)::BDAE.Equation
     BDAE.STRUCTURAL_WHEN_EQUATION(1, whenEquation, eq.source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
   end
   return result
+end
+
+"""
+  Serialize a List{Absyn.EquationItem} to a human-readable Modelica string.
+  Converts assert(cond, msg) calls to readable form for the LLM agent context.
+"""
+function serializeInitialEquations(eqs::MetaModelica.List)::String
+  parts = String[]
+  for item in eqs
+    s = @match item begin
+      Absyn.EQUATIONITEM(__) => begin
+        @match item.equation_ begin
+          Absyn.EQ_NORETCALL(__) => begin
+            fn_name = Absyn.dumpCref(item.equation_.functionName)
+            args_str = Absyn.dumpFunctionArgs(item.equation_.functionArgs)
+            "$(fn_name)($(args_str))"
+          end
+          _ => string(item.equation_)
+        end
+      end
+      _ => string(item)
+    end
+    push!(parts, s)
+  end
+  return join(parts, "; ")
+end
+
+"""
+  Extract variable names from a List{Absyn.ElementItem} as used in a reconfigure block.
+"""
+function extractVariableNames(variables::List{Absyn.ElementItem})::Vector{String}
+  names = String[]
+  for item in variables
+    @match Absyn.ELEMENTITEM(element = Absyn.ELEMENT(
+      specification = Absyn.COMPONENTS(components = comps))) = item
+    for c in comps
+      @match Absyn.COMPONENTITEM(component = Absyn.COMPONENT(name = varName)) = c
+      push!(names, varName)
+    end
+  end
+  return names
+end
+
+"""
+  Lower a DAE.RECONFIGURE_EQUATION into a BDAE.STRUCTURAL_WHEN_EQUATION
+  with an AGENTIC_RECOMPILATION when-operator.
+"""
+function lowerReconfigureEquation(eq::DAE.RECONFIGURE_EQUATION)::BDAE.Equation
+  varNames = extractVariableNames(eq.variables)
+  #= Type is a placeholder: downstream consumers (structuralCallbacks.jl) only
+     use the name via `string(c)`. Using T_UNKNOWN_DEFAULT avoids falsely
+     claiming Real for variables that may be Integer/Boolean/String. =#
+  crefs = DAE.CREF[
+    DAE.CREF(DAE.CREF_IDENT(name, DAE.T_UNKNOWN_DEFAULT, nil), DAE.T_UNKNOWN_DEFAULT)
+    for name in varNames
+  ]
+  promptStr = if isSome(eq.prompt)
+    @match SOME(DAE.SCONST(s)) = eq.prompt
+    SOME(s)
+  else
+    NONE()
+  end
+  initEqStr = if isSome(eq.initialEquations)
+    @match SOME(eqs) = eq.initialEquations
+    SOME(serializeInitialEquations(eqs))
+  else
+    NONE()
+  end
+  agenticOp = BDAE.AGENTIC_RECOMPILATION(crefs, promptStr, initEqStr)
+  whenStmts = BDAE.WHEN_STMTS(eq.whenCondition, list(agenticOp), NONE())
+  return BDAE.STRUCTURAL_WHEN_EQUATION(1, whenStmts, eq.source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
 end
 
 function createWhenOperators(elementLst::List{DAE.Element},lst::List{BDAE.WhenOperator})::List{BDAE.WhenOperator}
@@ -542,6 +623,11 @@ function createWhenOperators(elementLst::List{DAE.Element},lst::List{BDAE.WhenOp
       DAE.NORETCALL(exp = DAE.CALL(Absyn.IDENT("recompilation"), expLst, attr), source = source) <| rest => begin
         @match componentToChange <| newValue <| nil = expLst
         acc = BDAE.RECOMPILATION(componentToChange, newValue) <| lst
+        createWhenOperators(rest, acc)
+      end
+      DAE.NORETCALL(exp = DAE.CALL(Absyn.IDENT("agentic_recompilation"), expLst, attr), source = source) <| rest => begin
+        componentsToChange = DAE.CREF[cref for cref in expLst]
+        acc = BDAE.AGENTIC_RECOMPILATION(componentsToChange, NONE(), NONE()) <| lst
         createWhenOperators(rest, acc)
       end
       DAE.NORETCALL(exp = e1, source = source) <| rest => begin

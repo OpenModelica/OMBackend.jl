@@ -325,20 +325,38 @@ function string(f::MODELICA_FUNCTION)
   local buffer = IOBuffer()
   println(buffer, "function " * f.name)
   for arg in f.inputs
-    println(buffer, "  input " * string(arg) * " :: " * dumpDAEVarType(arg))
+    println(buffer, "  input " * safeDumpString(arg) * " :: " * safeDumpDAEVarType(arg))
   end
   for arg in f.outputs
-    println(buffer, "  output " * string(arg) * " :: " * dumpDAEVarType(arg))
+    println(buffer, "  output " * safeDumpString(arg) * " :: " * safeDumpDAEVarType(arg))
   end
   for l in f.locals
-    println(buffer, "  local " * string(l) * " :: " * dumpDAEVarType(l))
+    println(buffer, "  local " * safeDumpString(l) * " :: " * safeDumpDAEVarType(l))
   end
   println(buffer, "algorithm")
   for s in f.statements
-    println(buffer, "  " * string(s))
+    println(buffer, "  " * safeDumpString(s))
   end
   println(buffer, "end " * f.name)
   return String(take!(buffer))
+end
+
+function safeDumpString(x)::String
+  try
+    local s = string(x)
+    return s === nothing ? "<nothing>" : string(s)
+  catch err
+    return "<dump error: " * string(typeof(err)) * ">"
+  end
+end
+
+function safeDumpDAEVarType(v::DAE.VAR)::String
+  try
+    local s = dumpDAEVarType(v)
+    return s === nothing ? "<unknown type>" : s
+  catch err
+    return "<type dump error: " * string(typeof(err)) * ">"
+  end
 end
 
 """

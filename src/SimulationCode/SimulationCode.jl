@@ -45,6 +45,7 @@ using ..Backend
 import Absyn
 import DAE
 import Graphs
+import ImmutableList
 import MetaGraphs
 import OMFrontend
 

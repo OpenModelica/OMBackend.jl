@@ -58,6 +58,7 @@ import OMParser
 import Symbolics
 import Symbolics.RuntimeGeneratedFunctions
 import SymbolicUtils
+import OMRuntimeExternalC
 
 #= Initialize RTG for this module to enable world-age-safe function generation =#
 RuntimeGeneratedFunctions.init(@__MODULE__)

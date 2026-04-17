@@ -125,13 +125,6 @@ end
 
 
 """
-  If this function is called a DAG representing the equations is plotted to your working directory.
-"""
-function plotGraph(shouldPlot::Bool)
-  global PLOT_EQUATION_GRAPH = shouldPlot
-end
-
-"""
   MTK Models that have been compiled one time.
 TODO: Optimaly we should keep the fronten structure
 in memory as well s.t we only recompile if the structure of the source file changes
@@ -185,7 +178,7 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
   #= Dump the flat model with functions as it arrives from the frontend =#
     @BACKEND_LOGGING if frontendDAE isa OMFrontend.Frontend.FlatModel
       local fLst = functionList !== nothing ? functionList : MetaModelica.nil
-      debugWrite("frontend_initialModel.log",
+      debugWrite(logPath("backend/simCode", "frontend_initialModel.log"),
         replace(OMFrontend.Frontend.toFlatString(frontendDAE, fLst), "\\n" => "\n"))
     end
     local bDAE = lower(frontendDAE)
@@ -203,25 +196,25 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
       @assign simCode.functions = simCodeFunctions
       @assign simCode.externalRuntime = externalRuntimeNeeded
       #= Dump before record flattening =#
-      @BACKEND_LOGGING debugWrite("simCode_initial.log", SimulationCode.dumpSimCode(simCode))
+      @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_initial.log"), SimulationCode.dumpSimCode(simCode))
       #= Flatten record parameters in functions =#
       simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
       @assign simCode.functions = simCodeFunctions
-      @BACKEND_LOGGING debugWrite("simCode_afterFlattenRecordParams.log", SimulationCode.dumpSimCode(simCode))
+      @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFlattenRecordParams.log"), SimulationCode.dumpSimCode(simCode))
       #= Flatten record arguments in equation call sites to match flattened signatures =#
       simCode = SimulationCode.flattenRecordCallSites(simCode)
-      @BACKEND_LOGGING debugWrite("simCode_afterFlattenRecordCallSites.log", SimulationCode.dumpSimCode(simCode))
+      @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFlattenRecordCallSites.log"), SimulationCode.dumpSimCode(simCode))
       #= Resolve constant-condition IFEXPs in parameter bindings =#
       simCode = SimulationCode.resolveIfExpInBindings!(simCode)
-      @BACKEND_LOGGING debugWrite("simCode_afterResolveIfExp.log", SimulationCode.dumpSimCode(simCode))
+      @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterResolveIfExp.log"), SimulationCode.dumpSimCode(simCode))
       #= Constant propagation and alias elimination run AFTER record flattening
          so that all CREF references are in their final form before substitution.
          Running these earlier caused dangling references when flattenRecordCallSites
          introduced new CREFs for already-eliminated variables. =#
       simCode = SimulationCode.propagateConstants(simCode)
-      @BACKEND_LOGGING debugWrite("simCode_afterConstantProp.log", SimulationCode.dumpSimCode(simCode))
+      @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterConstantProp.log"), SimulationCode.dumpSimCode(simCode))
       simCode = SimulationCode.eliminateAliasVariables(simCode)
-      @BACKEND_LOGGING debugWrite("simCode_afterAliasElimination.log", SimulationCode.dumpSimCode(simCode))
+      @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterAliasElimination.log"), SimulationCode.dumpSimCode(simCode))
       #= Output-only variable elimination runs AFTER const-prop and alias-elim,
          so that alias chains are resolved and the output-only subgraph is cleanly separated.
          A fresh matching is computed from the current equation/variable set. =#
@@ -233,9 +226,9 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         nothing
       end
       if elimOpts !== nothing
-        @BACKEND_LOGGING debugWrite("simCode_beforeElimination.log", SimulationCode.dumpSimCode(simCode))
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_beforeElimination.log"), SimulationCode.dumpSimCode(simCode))
         simCode = SimulationCode.eliminateOutputOnlyVariables(simCode, elimOpts)
-        @BACKEND_LOGGING debugWrite("simCode_afterElimination.log", SimulationCode.dumpSimCode(simCode))
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterElimination.log"), SimulationCode.dumpSimCode(simCode))
       end
       #= Observed filter: controls which alias-eliminated variables become observed equations.
          Default (nothing): skip ALL alias observed equations for fast compilation.
@@ -329,10 +322,10 @@ end
 function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   local preprocessedFM = FrontendUtil.handleBuiltin(fm)
   local bDAE = BDAECreate.lower(preprocessedFM)
-  @BACKEND_LOGGING debugWrite("bdae_initial.log", BDAEUtil.stringHeading1(bDAE, "initial BDAE"))
+  @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_initial.log"), BDAEUtil.stringHeading1(bDAE, "initial BDAE"))
   #= Dump the actual DAE.Exp structure to a file for analysis =#
   @BACKEND_LOGGING begin
-    open("bdae_structureDump.log", "w") do io
+    open(logPath("backend/bdae", "bdae_structureDump.log"), "w") do io
       println(io, "=== BDAE Expression Structure Dump ===")
       for (i, eq) in enumerate(first(bDAE.eqs).orderedEqs)
         if i <= 20  # Dump first 20 equations
@@ -355,23 +348,23 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   bDAE = Causalize.transformASUBExpressions(bDAE)
   #= Mark state variables =#
   bDAE = Causalize.detectStates(bDAE)
-  @BACKEND_LOGGING debugWrite("bdae_afterDetectStates.log", BDAEUtil.stringHeading1(bDAE, "after detect states"))
-    
-  @BACKEND_LOGGING debugWrite("bdae_afterASUBTransform.log", BDAEUtil.stringHeading1(bDAE, "after ASUB transformation"))
+  @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterDetectStates.log"), BDAEUtil.stringHeading1(bDAE, "after detect states"))
+
+  @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterASUBTransform.log"), BDAEUtil.stringHeading1(bDAE, "after ASUB transformation"))
   #= Flatten CREF_QUAL with subscripted array finals to match hash table entries =#
   bDAE = Causalize.flattenArrayCrefs(bDAE)
-  @BACKEND_LOGGING debugWrite("bdae_afterFlattenCrefs.log", BDAEUtil.stringHeading1(bDAE, "after CREF flattening"))
+  @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterFlattenCrefs.log"), BDAEUtil.stringHeading1(bDAE, "after CREF flattening"))
   #= Transform if expressions to if equations =#
   bDAE = Causalize.detectIfExpressions(bDAE)
-  @BACKEND_LOGGING debugWrite("bdae_afterIfExpressions.log", BDAEUtil.stringHeading1(bDAE, "after if expressions"))
+  @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterIfExpressions.log"), BDAEUtil.stringHeading1(bDAE, "after if expressions"))
   #= Expand record field array variables into individual scalar element variables =#
   bDAE = Causalize.expandRecordFieldArrays(bDAE)
-  @BACKEND_LOGGING debugWrite("bdae_afterExpandRecordFields.log", BDAEUtil.stringHeading1(bDAE, "after record field expansion"))
+  @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterExpandRecordFields.log"), BDAEUtil.stringHeading1(bDAE, "after record field expansion"))
   #= Expand COMPLEX_EQUATIONs into scalar equations =#
   bDAE = Causalize.expandComplexEquations(bDAE)
-  @BACKEND_LOGGING debugWrite("bdae_afterExpandComplex.log", BDAEUtil.stringHeading1(bDAE, "after complex equation expansion"))
+  @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterExpandComplex.log"), BDAEUtil.stringHeading1(bDAE, "after complex equation expansion"))
   bDAE = Causalize.residualizeEveryEquation(bDAE)
-  @BACKEND_LOGGING debugWrite("bdae_afterResidualize.log", BDAEUtil.stringHeading1(bDAE, "after residualize"))
+  @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterResidualize.log"), BDAEUtil.stringHeading1(bDAE, "after residualize"))
   #=
     Remove unused parameters and or constants.
     Important optimization for some systems.
@@ -379,7 +372,7 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
   =#
   #bDAE = Causalize.detectUnusedParametersAndConstants(bDAE)
   #= Find and reclassify discrete variables not marked as discrete. =#
-  @BACKEND_LOGGING debugWrite("bdae_residualTransformation.log", BDAEUtil.stringHeading1(bDAE, "residuals"))
+  @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_residualTransformation.log"), BDAEUtil.stringHeading1(bDAE, "residuals"))
   return bDAE
 end
 
@@ -809,8 +802,57 @@ function getVariableValues(sols::Vector, variables...)
 end
 
 """
-Wrapper function to MTK `observed`
+Wrapper function to MTK `observed`.
+For models with states, the system is stored in `sol.prob.f.sys`.
+For purely algebraic (0-unknown) models, MTK does not populate `sol.prob.f.sys`,
+so we fall back to `LATEST_REDUCED_SYSTEM` stored as a module global in the
+generated simulate function.
 """
-function MTK_getObserved(sol)
-  ModelingToolkit.observed(sol.prob.f.sys)
+function MTK_getObserved(sol, modelName=nothing)
+  if sol.prob.f.sys !== nothing
+    return ModelingToolkit.observed(sol.prob.f.sys)
+  end
+  if modelName !== nothing
+    local modSym = Symbol(replace(modelName, "." => "__"))
+    if isdefined(OMBackend, modSym)
+      local mod = getfield(OMBackend, modSym)
+      if isdefined(mod, :LATEST_REDUCED_SYSTEM)
+        return ModelingToolkit.observed(mod.LATEST_REDUCED_SYSTEM)
+      end
+    end
+  end
+  return Symbolics.Equation[]
+end
+
+"""
+Evaluate all observed equations at every time point in `sol.t`, resolving
+inter-equation dependencies by processing equations in order and substituting
+previously computed LHS values into later RHS expressions.
+Returns a `Dict{String, Vector{Float64}}` mapping variable name to values, or `nothing`.
+Used as fallback for purely algebraic (0-unknown) models where `sol[sym]` is unavailable.
+"""
+function MTK_evaluateAllObserved(sol, obs_eqs, modelName::String)
+  local modSym = Symbol(replace(modelName, "." => "__"))
+  if !isdefined(OMBackend, modSym)
+    return nothing
+  end
+  local mod = getfield(OMBackend, modSym)
+  if !isdefined(mod, :LATEST_REDUCED_SYSTEM)
+    return nothing
+  end
+  local sys_t = ModelingToolkit.get_iv(mod.LATEST_REDUCED_SYSTEM)
+  local result = Dict{String, Vector{Float64}}()
+  for (i, ti) in enumerate(sol.t)
+    local subst = Dict{Any,Any}(sys_t => ti)
+    for eq in obs_eqs
+      local lhsStr = string(eq.lhs)
+      local val = Float64(Symbolics.substitute(eq.rhs, subst))
+      subst[eq.lhs] = val
+      if !haskey(result, lhsStr)
+        result[lhsStr] = Vector{Float64}(undef, length(sol.t))
+      end
+      result[lhsStr][i] = val
+    end
+  end
+  return result
 end

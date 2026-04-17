@@ -106,10 +106,10 @@ function removeSmoothFromStatement(stmt::DAE.Statement)::DAE.Statement
       DAE.STMT_ASSIGN(type_, newExp1, newExp, source)
     end
     DAE.STMT_TUPLE_ASSIGN(type_, expExpLst, exp, source) => begin
-      newExpLst = map(expExpLst) do e
-        (newE, _) = Util.traverseExpTopDown(e, removeSmoothFromExp, nothing)
-        newE
-      end
+      newExpLst::List = list(begin
+                               (newE, _) = Util.traverseExpTopDown(e, removeSmoothFromExp, nothing)
+                               newE
+                             end for e in expExpLst)
       (newExp, _) = Util.traverseExpTopDown(exp, removeSmoothFromExp, nothing)
       DAE.STMT_TUPLE_ASSIGN(type_, newExpLst, newExp, source)
     end
