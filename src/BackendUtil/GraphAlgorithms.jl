@@ -228,4 +228,104 @@ function tarjan(g::OrderedDict, n)::Vector{Vector{Int}}
   return sccs
 end
 
+"""
+  A single block in a Block Lower Triangular (BLT) decomposition.
+
+  Fields:
+  - `eqs`    equation indices belonging to the block
+  - `vars`   variable indices matched to those equations
+  - `isLoop` true iff `length(eqs) > 1` (genuine algebraic loop requiring a
+             nonlinear solver or tearing; false iff the block is a scalar
+             assignment `vars[1] := solve(eqs[1] for vars[1])`)
+
+  A `Vector{BLTBlock}` in topological order is the canonical intermediate
+  form for backend codegen: scalar blocks lower to direct assignments;
+  loop blocks lower to per-block solver calls.
+"""
+struct BLTBlock
+  eqs::Vector{Int}
+  vars::Vector{Int}
+  isLoop::Bool
+end
+
+"""
+  Block Lower Triangular (BLT) decomposition.
+
+  Given the bipartite equation-variable adjacency and a perfect matching,
+  returns the BLT form: equations grouped into strongly connected components
+  ordered so that each block depends only on variables solved in earlier
+  blocks.
+
+  Algorithm:
+    1. `merge(matchOrder, adjacency)` builds the oriented equation graph where
+       an edge `eq_i -> eq_j` means `eq_j uses the variable that eq_i solves`.
+    2. SCC decomposition of that graph yields the blocks.
+    3. Topologically sort the condensation so block order is explicit and
+       independent of the underlying SCC routine's ordering convention.
+    4. Package each SCC with its matched variables.
+
+  input  adjacency   equation index -> list of variable indices
+  input  matchOrder  variable index -> equation index (output of `matching`)
+  output Vector{BLTBlock}  blocks in execution (topological) order
+"""
+function blt(adjacency::DataStructures.OrderedDict, matchOrder::Vector{Int})::Vector{BLTBlock}
+  return blt(merge(matchOrder, adjacency), matchOrder)
+end
+
+"""
+  Overload that accepts a pre-built oriented digraph, for callers that
+  already ran `merge` (e.g. `matchAndCheckStronglyConnectedComponents`).
+"""
+function blt(digraph::MetaGraphs.MetaDiGraph, matchOrder::Vector{Int})::Vector{BLTBlock}
+  local sccs = Graphs.strongly_connected_components_kosaraju(digraph)
+  local nSCC = length(sccs)
+  #= Build an explicit condensation DAG so the topological order of blocks
+     does not depend on the internal iteration order of Kosaraju's routine. =#
+  local vertexToSCC = Dict{Int, Int}()
+  for (i, scc) in enumerate(sccs)
+    for v in scc
+      vertexToSCC[v] = i
+    end
+  end
+  local condensation = Graphs.DiGraph(nSCC)
+  for e in Graphs.edges(digraph)
+    local srcSCC = vertexToSCC[Graphs.src(e)]
+    local dstSCC = vertexToSCC[Graphs.dst(e)]
+    if srcSCC != dstSCC
+      Graphs.add_edge!(condensation, srcSCC, dstSCC)
+    end
+  end
+  local order = Graphs.topological_sort_by_dfs(condensation)
+  #= Invert the matching once so per-block variable lookup is O(1). =#
+  local eqToVars = Dict{Int, Vector{Int}}()
+  for (varIdx, eqIdx) in enumerate(matchOrder)
+    if eqIdx > 0
+      push!(get!(eqToVars, eqIdx, Int[]), varIdx)
+    end
+  end
+  local blocks = Vector{BLTBlock}(undef, nSCC)
+  for (outIdx, sccIdx) in enumerate(order)
+    local scc = sccs[sccIdx]
+    local vars = Int[]
+    for eq in scc
+      append!(vars, get(eqToVars, eq, Int[]))
+    end
+    blocks[outIdx] = BLTBlock(sort(scc), sort(vars), length(scc) > 1)
+  end
+  return blocks
+end
+
+"""
+  Human-readable dump of a BLT decomposition for debugging and log output.
+"""
+function dumpBLT(blocks::Vector{BLTBlock})::String
+  local io = IOBuffer()
+  println(io, "BLT decomposition: $(length(blocks)) block(s)")
+  for (i, b) in enumerate(blocks)
+    local kind = b.isLoop ? "LOOP(size=$(length(b.eqs)))" : "SCALAR"
+    println(io, "  [$i] $kind  eqs=$(b.eqs)  vars=$(b.vars)")
+  end
+  return String(take!(io))
+end
+
 end #= GraphAlgorithms =#

@@ -1847,6 +1847,20 @@ function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.EQUATION)
   collectCalledFunctionNames!(names, eq.rhs)
 end
 
+function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.ARRAY_EQUATION)
+  collectCalledFunctionNames!(names, eq.left)
+  collectCalledFunctionNames!(names, eq.right)
+end
+
+function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.SOLVED_EQUATION)
+  collectCalledFunctionNames!(names, eq.exp)
+end
+
+function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.COMPLEX_EQUATION)
+  collectCalledFunctionNames!(names, eq.left)
+  collectCalledFunctionNames!(names, eq.right)
+end
+
 function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.ASSIGN)
   collectCalledFunctionNames!(names, stmt.left)
   collectCalledFunctionNames!(names, stmt.right)
@@ -1857,14 +1871,26 @@ function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.REINIT)
   collectCalledFunctionNames!(names, stmt.value)
 end
 
+function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.NORETCALL)
+  collectCalledFunctionNames!(names, stmt.exp)
+end
+
+"""
+  Fallback for equation/statement kinds we do not specifically handle (ALGORITHM, BRANCH, etc.).
+  Silently ignore — we only want to skip calls that the collector knows how to look inside.
+"""
+function collectCalledFunctionNames!(names::Set{String}, ::Any)
+  return names
+end
+
 function collectCalledFunctionNames!(names::Set{String}, simCode::SimulationCode.SIM_CODE)
   for eq in simCode.residualEquations
     collectCalledFunctionNames!(names, eq)
   end
   for eq in simCode.initialEquations
-    if eq isa BDAE.RESIDUAL_EQUATION || eq isa BDAE.EQUATION
-      collectCalledFunctionNames!(names, eq)
-    end
+    #= Dispatch over every equation kind: ARRAY, SOLVED, COMPLEX as well as
+       RESIDUAL and EQUATION. Narrower filters silently dropped calls. =#
+    collectCalledFunctionNames!(names, eq)
   end
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
@@ -1877,9 +1903,8 @@ function collectCalledFunctionNames!(names::Set{String}, simCode::SimulationCode
   for whenEq in simCode.whenEquations
     collectCalledFunctionNames!(names, whenEq.whenEquation.condition)
     for stmt in whenEq.whenEquation.whenStmtLst
-      if stmt isa BDAE.ASSIGN || stmt isa BDAE.REINIT
-        collectCalledFunctionNames!(names, stmt)
-      end
+      #= Dispatch over every whenStmt kind: ASSIGN, REINIT, NORETCALL. =#
+      collectCalledFunctionNames!(names, stmt)
     end
   end
   return names

@@ -160,21 +160,39 @@ function createStructuralCallback(simCode,
   callback = @match whenCondition begin
     DAE.CALL(Absyn.IDENT("sample"), args, attrs) => begin
       @match start <| interval <| tail = args
-      #= Evaluate the interval to a concrete number at code-generation time.
-         If it is a parameter CREF, resolve it from the simCode HT. =#
-      local Δt_val = @match interval begin
-        DAE.RCONST(r) => r
-        DAE.ICONST(i) => Float64(i)
+      #= Resolve the interval at callback construction time. Literal RCONST/ICONST are
+         baked as compile-time constants (they cannot change between runs). Parameter
+         CREFs are resolved at runtime from the `pars` dict threaded into the callback
+         factory, so per-simulation parameter overrides (`simulate(tspan, parameters=...)`)
+         are honored. Falls back to the simCode-resolved value if the parameter is not
+         present in `pars` (e.g. alias-eliminated or renamed). =#
+      local Δt_code = @match interval begin
+        DAE.RCONST(r) => :( $(r) )
+        DAE.ICONST(i) => :( $(Float64(i)) )
         DAE.CREF(cr, _) => begin
           local cname = SimulationCode.DAE_identifierToString(cr)
-          local sv = last(simCode.stringToSimVarHT[cname])
-          evalSimCodeParameter(sv, simCode)
+          local fallbackVal = begin
+            local sv = last(simCode.stringToSimVarHT[cname])
+            evalSimCodeParameter(sv, simCode)
+          end
+          quote
+            let _resolved = nothing
+              for (_k, _v) in pars
+                if string(_k) == $(cname)
+                  _resolved = _v
+                  break
+                end
+              end
+              isnothing(_resolved) ? $(fallbackVal) : _resolved
+            end
+          end
         end
-        _ => evalDAEConstant(interval, simCode)
+        _ => :( $(evalDAEConstant(interval, simCode)) )
       end
       quote
         $(affect)
-        local cb = PeriodicCallback(affect!, $(Δt_val))
+        local _Δt = $(Δt_code)
+        local cb = PeriodicCallback(affect!, _Δt)
       end
     end
     _ #=Continuous or discrete =# => begin
@@ -226,7 +244,7 @@ function createStructuralCallback(simCode,
       nothing
     end
     quote
-      function $(Symbol(callbackName))(reducedSystem)
+      function $(Symbol(callbackName))(reducedSystem, pars)
         #= Build a name→MTK-index map so condition functions use the correct u[i].
            MTK may reorder unknowns relative to the BDAE state indices. =#
         local _mtk_idx = Dict{String, Int}(
@@ -269,7 +287,7 @@ function createStructuralCallback(simCode,
       ($(componentToModify), $("$(newValue)"))
     end
     quote
-      function $(Symbol(callbackName))(reducedSystem)
+      function $(Symbol(callbackName))(reducedSystem, pars)
         local _mtk_idx = Dict{String, Int}(
           split(string(v), "(")[1] => i
           for (i, v) in enumerate(ModelingToolkit.unknowns(reducedSystem)))
@@ -349,7 +367,7 @@ function createStructuralAssignment(simCode, simCodeStructuralTransition::Simula
   local integratorCallbackName = string(callbackName, "_CALLBACK")
   local structuralChangeStructure = string(callbackName, "_STRUCTURAL_CHANGE")
   quote
-    ($(Symbol(integratorCallbackName)), $(Symbol(structuralChangeStructure))) = $(Symbol(callbackName))(reducedSystem)
+    ($(Symbol(integratorCallbackName)), $(Symbol(structuralChangeStructure))) = $(Symbol(callbackName))(reducedSystem, pars)
     push!(structuralCallbacks, $(Symbol(structuralChangeStructure)))
     push!(callbackSet, ($(Symbol(integratorCallbackName))))
   end

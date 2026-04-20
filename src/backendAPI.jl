@@ -126,11 +126,17 @@ end
 
 """
   MTK Models that have been compiled one time.
-TODO: Optimaly we should keep the fronten structure
+TODO: Optimaly we should keep the frontend structure
 in memory as well s.t we only recompile if the structure of the source file changes
 (Unless retranslation is forced).
 """
 const COMPILED_MODELS_MTK = Dict{String, Tuple{Expr, Bool, UInt64}}()
+
+
+"""
+DEJL (DifferentialEquations.jl) models that have been compiled one time.
+"""
+const COMPILED_MODELS_DEJL = Dict{String, Tuple{Expr, Bool, UInt64}}()
 
 """
     clearCaches!(; models=true, implementations=true, wrappers=true, extractors=true)
@@ -211,6 +217,13 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
          so that all CREF references are in their final form before substitution.
          Running these earlier caused dangling references when flattenRecordCallSites
          introduced new CREFs for already-eliminated variables. =#
+      #= BLT-driven parameter-closure fold runs before propagateConstants so that
+         any parameter-closure chains (e.g. KinematicPTP's seven algebraic unknowns
+         defined solely by parameter expressions) are promoted to parameters before
+         MTK sees them. This removes the Newton-init failure mode where zero guesses
+         on those unknowns produce NaN/Inf evaluations. =#
+      simCode = SimulationCode.foldParameterClosure(simCode)
+      @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFoldClosure.log"), SimulationCode.dumpSimCode(simCode))
       simCode = SimulationCode.propagateConstants(simCode)
       @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterConstantProp.log"), SimulationCode.dumpSimCode(simCode))
       simCode = SimulationCode.eliminateAliasVariables(simCode)
@@ -842,11 +855,21 @@ function MTK_evaluateAllObserved(sol, obs_eqs, modelName::String)
   end
   local sys_t = ModelingToolkit.get_iv(mod.LATEST_REDUCED_SYSTEM)
   local result = Dict{String, Vector{Float64}}()
+  local warnedUnresolved = Set{String}()
   for (i, ti) in enumerate(sol.t)
     local subst = Dict{Any,Any}(sys_t => ti)
     for eq in obs_eqs
       local lhsStr = string(eq.lhs)
-      local val = Float64(Symbolics.substitute(eq.rhs, subst))
+      local substituted = Symbolics.substitute(eq.rhs, subst)
+      local raw = Symbolics.value(substituted)
+      if !(raw isa Number)
+        if !(lhsStr in warnedUnresolved)
+          push!(warnedUnresolved, lhsStr)
+          @warn "MTK_evaluateAllObserved: observed equation for `$lhsStr` did not reduce to a numeric value after substitution; remaining expression: `$substituted`. This usually indicates the observed-equation list is not in topological order. Skipping this entry."
+        end
+        continue
+      end
+      local val = Float64(raw)
       subst[eq.lhs] = val
       if !haskey(result, lhsStr)
         result[lhsStr] = Vector{Float64}(undef, length(sol.t))

@@ -59,7 +59,7 @@ Phase 2 (fallback): If phase 1 fails to converge, free ALL unknowns including
 differential states. This handles rank-deficient kinematic loops (e.g. Engine1a)
 where the differential state values are constrained by algebraic equations.
 """
-function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10)
+function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=1e-1)
   local n = length(u0)
   #= Defensive clamp: the mass matrix may be smaller than u0 if MTK's
      structural_simplify produced an imbalanced reduced system (more unknowns
@@ -95,7 +95,22 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
   if !phase2_ok
     rhsFunc(du, u0, p_vec, 0.0)
     local final_res = maximum(abs, du[alg_idx])
-    @warn "DirectRHS init: did not converge (residual: $(round(final_res, sigdigits=4)))"
+    #= NaN/Inf means the residual function broke down (division by zero, sqrt of
+       negative, etc.), not merely a large residual. `NaN >= failure_threshold` is
+       `false`, so without an explicit isfinite check NaN silently routes into the
+       "below threshold" warn branch. Surface it as @error so it is distinguishable
+       from ordinary non-convergence; still return u0 so the integrator retains its
+       chance to recover. =#
+    if !isfinite(final_res)
+      @error "DirectRHS init: residual is non-finite (value: $(final_res)); initial conditions could not be verified and the integrator may produce NaNs. Proceeding, but consider adding explicit start values."
+    elseif final_res >= failure_threshold
+      #= Residual is too large to proceed safely. Handing the solver inconsistent
+         initial conditions produces silent numerical garbage. Escalate rather than
+         warn. Callers that need a higher tolerance can pass `failure_threshold`. =#
+      error("DirectRHS init: residual $(round(final_res, sigdigits=4)) exceeds failure_threshold=$(failure_threshold); refusing to proceed with inconsistent initial conditions.")
+    else
+      @warn "DirectRHS init: did not fully converge (residual: $(round(final_res, sigdigits=4))) but is below failure_threshold=$(failure_threshold); proceeding."
+    end
   end
   return u0
 end

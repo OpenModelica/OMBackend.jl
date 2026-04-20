@@ -1835,7 +1835,16 @@ function evalInitialCondition(mtkCond, simCode = nothing)
       local sym = Symbol(replace(key, "." => "_"))
       if sv.varKind isa SimulationCode.PARAMETER
         local pval = try
-          Float64(evalSimCodeParameter(sv, simCode))
+          local raw = evalSimCodeParameter(sv, simCode)
+          if raw isa Expr
+            #= `evalDAE_Expression` wraps its result in `quote $(val) end`
+               (a `:block` Expr). That wrapper breaks `Float64(::Expr)`,
+               which is the critical failure path for fold-promoted
+               parameters whose bindExp is a BINARY/LBINARY/RELATION.
+               Evaluate once to unwrap before the numeric coercion. =#
+            raw = Base.invokelatest(eval, raw)
+          end
+          Float64(raw)
         catch
           try
             @match SOME(attr) = sv.attributes
@@ -1904,7 +1913,14 @@ function _substituteExprValues(expr, valMap::Dict{Symbol, Float64})
     if haskey(valMap, expr)
       return valMap[expr]
     end
-    return expr
+    #= Defensive fallback: a missing symbol would hit `eval` at module
+       scope and raise `UndefVarError`. Returning 0.0 (which is `false`
+       for boolean thresholds) keeps initial-condition evaluation
+       robust. The outer try/catch in `evalInitialCondition` already
+       defaults to `true` on any remaining failure, so this is defense
+       in depth for fold-promoted parameters whose valMap entry was
+       skipped. =#
+    return 0.0
   end
   if !(expr isa Expr)
     return expr
@@ -1916,6 +1932,11 @@ function _substituteExprValues(expr, valMap::Dict{Symbol, Float64})
       if haskey(valMap, fname)
         return valMap[fname]
       end
+      #= `varName(t)` where `varName` is not in valMap: recursion below
+         would rebuild `Expr(:call, :varName, 0.0)` and hit
+         `UndefVarError` on final eval. Defensive fallback to 0.0, same
+         policy as the bare-symbol branch above. =#
+      return 0.0
     end
     #= Recurse into call arguments =#
     local newArgs = Any[fname]

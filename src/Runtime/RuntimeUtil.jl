@@ -588,7 +588,11 @@ function createLookupTable(integrator)
   local unknownVals = getValuesForUnknowns(integrator)
   local d = Dict{String, Float64}(zip(unknownNames, unknownVals))
   for (name, v) in _resolvableObservedPairs(integrator)
-    d[name] = v
+    if haskey(d, name)
+      @warn "createLookupTable: observed name `$name` collides with an unknown of the same name after prefix stripping; keeping the unknown's value."
+    else
+      d[name] = v
+    end
   end
   return d
 end
