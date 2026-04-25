@@ -33,6 +33,8 @@
 This file contains utility macros used by the backend.
 =#
 
+using Dates
+
 
 """
 Enable logging by specifing the following environmental variable before compiling the backend.
@@ -88,6 +90,53 @@ end
 
 ----------------------------------------------------------------------------- =#
 const OMJL_SESSION_ID = string(getpid(), "_", round(Int, time()))
+const OMJL_LOG_RUN_DIR_STACK = String[]
+
+function sanitizeLogRunName(name::AbstractString)::String
+  sanitized = replace(strip(name), r"[\\/:*?\"<>|\s.]+" => "_")
+  sanitized = replace(sanitized, r"_+" => "_")
+  sanitized = strip(sanitized, '_')
+  return isempty(sanitized) ? "run" : sanitized
+end
+
+function createLogRunId(modelName::AbstractString; suffix::Union{Nothing, AbstractString} = nothing,
+                        timestamp::DateTime = Dates.now())::String
+  local base = sanitizeLogRunName(modelName)
+  local stamp = Dates.format(timestamp, "yyyy-mm-dd_HH-MM-SS")
+  if suffix !== nothing
+    base = string(base, "_", sanitizeLogRunName(suffix))
+  end
+  return string(base, "_", stamp)
+end
+
+function currentLogRunDir()
+  return isempty(OMJL_LOG_RUN_DIR_STACK) ? nothing : OMJL_LOG_RUN_DIR_STACK[end]
+end
+
+function hasActiveLogRunDir()::Bool
+  return !isempty(OMJL_LOG_RUN_DIR_STACK)
+end
+
+function pushLogRunDir(runDir::AbstractString)::String
+  local sanitized = sanitizeLogRunName(runDir)
+  local current = currentLogRunDir()
+  local nextDir = current === nothing ? sanitized : joinpath(current, sanitized)
+  push!(OMJL_LOG_RUN_DIR_STACK, nextDir)
+  return nextDir
+end
+
+function popLogRunDir()
+  return isempty(OMJL_LOG_RUN_DIR_STACK) ? nothing : pop!(OMJL_LOG_RUN_DIR_STACK)
+end
+
+function withLogRunDir(f::Function, runDir::AbstractString)
+  pushLogRunDir(runDir)
+  try
+    return f()
+  finally
+    popLogRunDir()
+  end
+end
 
 """
     logDir() -> String
@@ -96,7 +145,9 @@ Root directory for OMJL log/dump files in the current session. Respects
 `ENV["OMJL_LOG_DIR"]`; otherwise a per-session subdirectory under `tempdir()`.
 """
 function logDir()
-  return get(ENV, "OMJL_LOG_DIR", joinpath(tempdir(), "OMJL", OMJL_SESSION_ID))
+  local base = get(ENV, "OMJL_LOG_DIR", joinpath(tempdir(), "OMJL", OMJL_SESSION_ID))
+  local activeRunDir = currentLogRunDir()
+  return activeRunDir === nothing ? base : joinpath(base, activeRunDir)
 end
 
 """
@@ -107,6 +158,6 @@ Absolute path for a log file in the given pipeline stage (e.g. `"backend/bdae"`,
 """
 function logPath(stage::AbstractString, filename::AbstractString)
   dir = joinpath(logDir(), stage)
-  isdir(dir) || mkpath(dir)
+  mkpath(dir)
   return joinpath(dir, filename)
 end

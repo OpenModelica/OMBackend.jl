@@ -696,69 +696,72 @@ function recompilation(activeModeName,
                        integrator,
                        tspan,
                        callbackConditions)::Tuple
-  #=  Recompilation =#
-  @VSS_DEBUG @info "[recompilation] ENTER" activeModeName t=integrator.t
-  local _t_start = time()
-  local integrator_u = integrator.u
-  #= Have the SCode =#
-  #= 1) Fetch the parameter from the structural callback =#
-  local metaModel = structuralCallback.metaModel
-  local modification = structuralCallback.modification
-  local inProgram = MetaModelica.list(metaModel)
-  local elementToChange = first(modification)
-  #= Get the symbol table, using this we evaluate the new value based on the value of some parameter. =#
-  local newValueExpr = Meta.parse(last(modification))
-  newValueExpr = quote
-    stringToSimVarHT = $(structuralCallback.stringToSimVarHT)
-    $(newValueExpr)
+  local runId = OMBackend.createLogRunId(activeModeName; suffix = "recompilation")
+  return OMBackend.withLogRunDir(runId) do
+    #=  Recompilation =#
+    @VSS_DEBUG @info "[recompilation] ENTER" activeModeName t=integrator.t
+    local _t_start = time()
+    local integrator_u = integrator.u
+    #= Have the SCode =#
+    #= 1) Fetch the parameter from the structural callback =#
+    local metaModel = structuralCallback.metaModel
+    local modification = structuralCallback.modification
+    local inProgram = MetaModelica.list(metaModel)
+    local elementToChange = first(modification)
+    #= Get the symbol table, using this we evaluate the new value based on the value of some parameter. =#
+    local newValueExpr = Meta.parse(last(modification))
+    newValueExpr = quote
+      stringToSimVarHT = $(structuralCallback.stringToSimVarHT)
+      $(newValueExpr)
+    end
+    local newValue = eval(newValueExpr)
+    @VSS_DEBUG @info "[recompilation] step 1/7: parsed modification" elementToChange newValue elapsed_s=round(time()-_t_start, digits=2)
+    #=  2) Change the parameters in the SCode via API (As specified by the modification)=#
+    #=  2.1 Change the parameter so that it is the same as the modifcation. =#
+    newProgram = MetaModelica.list(RuntimeUtil.setElementInSCodeProgram!(activeModeName,
+                                                                         elementToChange,
+                                                                         newValue, metaModel))
+    @VSS_DEBUG @info "[recompilation] step 2/7: SCode mutated" elapsed_s=round(time()-_t_start, digits=2)
+    local classToInstantiate = activeModeName
+    #= 3) Call the frontend + the backend + JIT compile Julia code in memory =#
+    local flatModelica = first(OMFrontend.instantiateSCodeToFM(classToInstantiate, newProgram))
+    @VSS_DEBUG @info "[recompilation] step 3/7: frontend (instantiateSCodeToFM) done" elapsed_s=round(time()-_t_start, digits=2)
+    #= 3.1 Run the backend =#
+    local simulationCode = translateToSimCode(flatModelica, activeModeName)
+    @VSS_DEBUG @info "[recompilation] step 4/7: backend (translateToSimCode) done" elapsed_s=round(time()-_t_start, digits=2)
+    #= 3.2 Adjust variables and special parameters =#
+    RuntimeUtil.updateInitialConditions!(simulationCode, integrator)
+    local resultingModel = translateToMTK(simulationCode, activeModeName)
+    @VSS_DEBUG @info "[recompilation] step 5/7: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
+    #= 4.0 Revaulate the model=#
+    local modelName = string(replace(activeModeName, "." => "__"), "Model")
+    @eval $(resultingModel)
+    @VSS_DEBUG @info "[recompilation] step 6/7: module @eval done" modelName elapsed_s=round(time()-_t_start, digits=2)
+    modelCall = quote
+      $(Symbol(modelName))($(tspan))
+    end
+    (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
+    @VSS_DEBUG @info "[recompilation] step 7/7: modelCall @eval done (submodel ODEProblem built)" elapsed_s=round(time()-_t_start, digits=2)
+    #= Reconstruct the composite problem to keep the callbacks =#
+    compositeProblem = ModelingToolkit.ODEProblem(
+      reducedSystem,
+      finalInitialValues,
+      tspan,
+      pars,
+      #=
+        TODO currently only handles a single structural callback.
+      =#
+      callback = CallbackSet(callbackConditions, callbacks)
+    )
+    @VSS_DEBUG @info "[recompilation] composite ODEProblem rebuilt" elapsed_s=round(time()-_t_start, digits=2)
+    #=4) Changed System=#
+    #= 4.1 Update the structural callback with the new situation =#
+    @match SOME(newMetaModel) = simulationCode.metaModel
+    structuralCallback.metaModel = newMetaModel
+    structuralCallback.stringToSimVarHT = simulationCode.stringToSimVarHT
+    #= 4.2) Assign this system to newSystem. =#
+    return (compositeProblem, simulationCode.stringToSimVarHT,finalInitialValues, initialValues, reducedSystem, false)
   end
-  local newValue = eval(newValueExpr)
-  @VSS_DEBUG @info "[recompilation] step 1/7: parsed modification" elementToChange newValue elapsed_s=round(time()-_t_start, digits=2)
-  #=  2) Change the parameters in the SCode via API (As specified by the modification)=#
-  #=  2.1 Change the parameter so that it is the same as the modifcation. =#
-  newProgram = MetaModelica.list(RuntimeUtil.setElementInSCodeProgram!(activeModeName,
-                                                                       elementToChange,
-                                                                       newValue, metaModel))
-  @VSS_DEBUG @info "[recompilation] step 2/7: SCode mutated" elapsed_s=round(time()-_t_start, digits=2)
-  local classToInstantiate = activeModeName
-  #= 3) Call the frontend + the backend + JIT compile Julia code in memory =#
-  local flatModelica = first(OMFrontend.instantiateSCodeToFM(classToInstantiate, newProgram))
-  @VSS_DEBUG @info "[recompilation] step 3/7: frontend (instantiateSCodeToFM) done" elapsed_s=round(time()-_t_start, digits=2)
-  #= 3.1 Run the backend =#
-  local simulationCode = translateToSimCode(flatModelica, activeModeName)
-  @VSS_DEBUG @info "[recompilation] step 4/7: backend (translateToSimCode) done" elapsed_s=round(time()-_t_start, digits=2)
-  #= 3.2 Adjust variables and special parameters =#
-  RuntimeUtil.updateInitialConditions!(simulationCode, integrator)
-  local resultingModel = translateToMTK(simulationCode, activeModeName)
-  @VSS_DEBUG @info "[recompilation] step 5/7: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
-  #= 4.0 Revaulate the model=#
-  local modelName = string(replace(activeModeName, "." => "__"), "Model")
-  @eval $(resultingModel)
-  @VSS_DEBUG @info "[recompilation] step 6/7: module @eval done" modelName elapsed_s=round(time()-_t_start, digits=2)
-  modelCall = quote
-    $(Symbol(modelName))($(tspan))
-  end
-  (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
-  @VSS_DEBUG @info "[recompilation] step 7/7: modelCall @eval done (submodel ODEProblem built)" elapsed_s=round(time()-_t_start, digits=2)
-  #= Reconstruct the composite problem to keep the callbacks =#
-  compositeProblem = ModelingToolkit.ODEProblem(
-    reducedSystem,
-    finalInitialValues,
-    tspan,
-    pars,
-    #=
-      TODO currently only handles a single structural callback.
-    =#
-    callback = CallbackSet(callbackConditions, callbacks)
-  )
-  @VSS_DEBUG @info "[recompilation] composite ODEProblem rebuilt" elapsed_s=round(time()-_t_start, digits=2)
-  #=4) Changed System=#
-  #= 4.1 Update the structural callback with the new situation =#
-  @match SOME(newMetaModel) = simulationCode.metaModel
-  structuralCallback.metaModel = newMetaModel
-  structuralCallback.stringToSimVarHT = simulationCode.stringToSimVarHT
-  #= 4.2) Assign this system to newSystem. =#
-  return (compositeProblem, simulationCode.stringToSimVarHT,finalInitialValues, initialValues, reducedSystem, false)
 end
 
 """
@@ -778,78 +781,81 @@ function recompilation(activeModeName,
                        integrator,
                        tspan,
                        callbackConditions)::Tuple
-  @info "[RECOMPILATION] Agentic recompilation triggered at t=$(integrator.t), components=$(structuralCallback.componentsToChange)"
-  #= Build full agent context using MTK symbolic indexing for correctness =#
-  local solAtChange = structuralCallback.solutionAtChange
-  local sysAtChange = solAtChange.prob.f.sys
-  #= State variable values at the change instant =#
-  local stateVars = Dict{String,Float64}()
-  for sym in ModelingToolkit.get_unknowns(sysAtChange)
-    try
-      stateVars[string(sym.f.name)] = last(solAtChange[sym])
-    catch
-    end
-  end
-  #= Current values of the specific parameters the agent may change =#
-  local currentValues = Dict{String,Any}()
-  for p in structuralCallback.componentsToChange
-    try
-      local sym = getproperty(sysAtChange, Symbol(p))
-      if ModelingToolkit.isparameter(sym)
-        currentValues[p] = ModelingToolkit.SymbolicIndexingInterface.getp(sysAtChange, sym)(solAtChange.prob)
-      else
-        currentValues[p] = last(solAtChange[sym])
+  local runId = OMBackend.createLogRunId(activeModeName; suffix = "agentic_recompilation")
+  return OMBackend.withLogRunDir(runId) do
+    @info "[RECOMPILATION] Agentic recompilation triggered at t=$(integrator.t), components=$(structuralCallback.componentsToChange)"
+    #= Build full agent context using MTK symbolic indexing for correctness =#
+    local solAtChange = structuralCallback.solutionAtChange
+    local sysAtChange = solAtChange.prob.f.sys
+    #= State variable values at the change instant =#
+    local stateVars = Dict{String,Float64}()
+    for sym in ModelingToolkit.get_unknowns(sysAtChange)
+      try
+        stateVars[string(sym.f.name)] = last(solAtChange[sym])
+      catch
       end
-    catch
-      currentValues[p] = nothing
     end
-  end
-  #= Full parameter snapshot of the system, distinct from the parameters
-     exposed to the agent via componentsToChange. Gives the agent the
-     full context it needs to reason about which values to return. =#
-  local parameters = Dict{String,Any}()
-  for p in ModelingToolkit.parameters(sysAtChange)
-    try
-      local pname = string(ModelingToolkit.getname(p))
-      parameters[pname] = ModelingToolkit.SymbolicIndexingInterface.getp(sysAtChange, p)(solAtChange.prob)
-    catch
+    #= Current values of the specific parameters the agent may change =#
+    local currentValues = Dict{String,Any}()
+    for p in structuralCallback.componentsToChange
+      try
+        local sym = getproperty(sysAtChange, Symbol(p))
+        if ModelingToolkit.isparameter(sym)
+          currentValues[p] = ModelingToolkit.SymbolicIndexingInterface.getp(sysAtChange, sym)(solAtChange.prob)
+        else
+          currentValues[p] = last(solAtChange[sym])
+        end
+      catch
+        currentValues[p] = nothing
+      end
     end
+    #= Full parameter snapshot of the system, distinct from the parameters
+       exposed to the agent via componentsToChange. Gives the agent the
+       full context it needs to reason about which values to return. =#
+    local parameters = Dict{String,Any}()
+    for p in ModelingToolkit.parameters(sysAtChange)
+      try
+        local pname = string(ModelingToolkit.getname(p))
+        parameters[pname] = ModelingToolkit.SymbolicIndexingInterface.getp(sysAtChange, p)(solAtChange.prob)
+      catch
+      end
+    end
+    local agentCtx = AgentContext(stateVars, parameters, currentValues, tspan,
+                                  structuralCallback.prompt,
+                                  structuralCallback.initialEquations)
+    #= Serialise metamodel and query agent =#
+    local metaStr = string(structuralCallback.metaModel)
+    local newValues = queryAgent(structuralCallback.componentsToChange,
+                                 agentCtx,
+                                 metaStr,
+                                 integrator.t)
+    #= Validate agent response: length must match componentsToChange.
+       A short/long return would otherwise silently drop or truncate
+       modifications via zip() below. =#
+    if length(newValues) != length(structuralCallback.componentsToChange)
+      error("Agent returned $(length(newValues)) values for $(length(structuralCallback.componentsToChange)) components; expected equal length. components=$(structuralCallback.componentsToChange), returned=$(newValues)")
+    end
+    #= Apply each modification in sequence via the standard recompilation path =#
+    local problem = nothing
+    local ht_new = structuralCallback.stringToSimVarHT
+    local finalInitialValues = integrator.u
+    local initialValues = integrator.u
+    local reducedSystem = nothing
+    for (componentName, newValue) in zip(structuralCallback.componentsToChange, newValues)
+      scr = StructuralChangeRecompilation(activeModeName,
+                                          false,
+                                          structuralCallback.metaModel,
+                                          (componentName, string(newValue)),
+                                          structuralCallback.stringToSimVarHT,
+                                          integrator.t,
+                                          Float64[])
+      (problem, ht_new, finalInitialValues, initialValues, reducedSystem, _) =
+        recompilation(activeModeName, scr, integrator, tspan, callbackConditions)
+      structuralCallback.metaModel = scr.metaModel
+      structuralCallback.stringToSimVarHT = scr.stringToSimVarHT
+    end
+    return (problem, ht_new, finalInitialValues, initialValues, reducedSystem, false)
   end
-  local agentCtx = AgentContext(stateVars, parameters, currentValues, tspan,
-                                structuralCallback.prompt,
-                                structuralCallback.initialEquations)
-  #= Serialise metamodel and query agent =#
-  local metaStr = string(structuralCallback.metaModel)
-  local newValues = queryAgent(structuralCallback.componentsToChange,
-                               agentCtx,
-                               metaStr,
-                               integrator.t)
-  #= Validate agent response: length must match componentsToChange.
-     A short/long return would otherwise silently drop or truncate
-     modifications via zip() below. =#
-  if length(newValues) != length(structuralCallback.componentsToChange)
-    error("Agent returned $(length(newValues)) values for $(length(structuralCallback.componentsToChange)) components; expected equal length. components=$(structuralCallback.componentsToChange), returned=$(newValues)")
-  end
-  #= Apply each modification in sequence via the standard recompilation path =#
-  local problem = nothing
-  local ht_new = structuralCallback.stringToSimVarHT
-  local finalInitialValues = integrator.u
-  local initialValues = integrator.u
-  local reducedSystem = nothing
-  for (componentName, newValue) in zip(structuralCallback.componentsToChange, newValues)
-    scr = StructuralChangeRecompilation(activeModeName,
-                                        false,
-                                        structuralCallback.metaModel,
-                                        (componentName, string(newValue)),
-                                        structuralCallback.stringToSimVarHT,
-                                        integrator.t,
-                                        Float64[])
-    (problem, ht_new, finalInitialValues, initialValues, reducedSystem, _) =
-      recompilation(activeModeName, scr, integrator, tspan, callbackConditions)
-    structuralCallback.metaModel = scr.metaModel
-    structuralCallback.stringToSimVarHT = scr.stringToSimVarHT
-  end
-  return (problem, ht_new, finalInitialValues, initialValues, reducedSystem, false)
 end
 
 """
@@ -895,69 +901,72 @@ function recompilation(activeModeName,
                        integrator_u,
                        tspan,
                        callbackConditions)
-  @VSS_DEBUG @info "[recompilation DOCC] ENTER" activeModeName
-  local _t_start = time()
-  #= Fetch the model that we were generating from memory. =#
-  local flatModel = OMBackend.CodeGeneration.FLAT_MODEL
-  local unresolvedConnectEquations = flatModel.unresolvedConnectEquations
-  #= Get the relevant equation =#
-  local indexOfEquation = structuralCallback.index
-  local equationIf = MetaModelica.listGet(flatModel.DOCC_equations, indexOfEquation)
-  @assert length(equationIf.branches) == 1
-  if ! structuralCallback.activeEquations
-    equationsToAdd = first(equationIf.branches).body
-    newFlatModel = RuntimeUtil.createNewFlatModel(flatModel, unresolvedConnectEquations, equationsToAdd)
-  else
-    newFlatModel = RuntimeUtil.createNewFlatModel(flatModel, indexOfEquation, unresolvedConnectEquations)
+  local runId = OMBackend.createLogRunId(activeModeName; suffix = "docc_recompilation")
+  return OMBackend.withLogRunDir(runId) do
+    @VSS_DEBUG @info "[recompilation DOCC] ENTER" activeModeName
+    local _t_start = time()
+    #= Fetch the model that we were generating from memory. =#
+    local flatModel = OMBackend.CodeGeneration.FLAT_MODEL
+    local unresolvedConnectEquations = flatModel.unresolvedConnectEquations
+    #= Get the relevant equation =#
+    local indexOfEquation = structuralCallback.index
+    local equationIf = MetaModelica.listGet(flatModel.DOCC_equations, indexOfEquation)
+    @assert length(equationIf.branches) == 1
+    if ! structuralCallback.activeEquations
+      equationsToAdd = first(equationIf.branches).body
+      newFlatModel = RuntimeUtil.createNewFlatModel(flatModel, unresolvedConnectEquations, equationsToAdd)
+    else
+      newFlatModel = RuntimeUtil.createNewFlatModel(flatModel, indexOfEquation, unresolvedConnectEquations)
+    end
+    @VSS_DEBUG @info "[recompilation DOCC] step 1/5: new flat model built" elapsed_s=round(time()-_t_start, digits=2)
+    local simulationCode = translateToSimCode(newFlatModel, activeModeName)
+    @VSS_DEBUG @info "[recompilation DOCC] step 2/5: backend (translateToSimCode) done" elapsed_s=round(time()-_t_start, digits=2)
+    local resultingModel = translateToMTK(simulationCode, activeModeName)
+    @VSS_DEBUG @info "[recompilation DOCC] step 3/5: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
+    #println("New model generated")
+    local model = replace(activeModeName, "." => "__")
+    local modelName = string(model, "Model")
+    #local result = OMBackend.modelToString(model; MTK = true, keepComments = false, keepBeginBlocks = false)
+    #println("We have a new model!\n");
+    resultingModel = OMBackend.CodeGeneration.stripComments(resultingModel)
+    resultingModel = OMBackend.CodeGeneration.stripBeginBlocks(resultingModel)
+    #= Ensure Modelica function wrapper bindings are available in Runtime scope.
+       The wrappers are created in CodeGeneration (mtkExternals.jl:317) but the
+       recompilation eval runs here in Runtime. =#
+    for (_fn, _w) in OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS
+      @eval $_fn = OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS[$(QuoteNode(_fn))]
+    end
+    @eval $(resultingModel)
+    @VSS_DEBUG @info "[recompilation DOCC] step 4/5: module @eval done" modelName elapsed_s=round(time()-_t_start, digits=2)
+    @BACKEND_LOGGING OMBackend.writeStringToFile(string("modfied", modelName * ".jl"), "$resultingModel")
+    local modelCall = quote
+      $(Symbol(modelName))($(tspan))
+    end
+    (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
+    @VSS_DEBUG @info "[recompilation DOCC] step 5/5: modelCall @eval done (submodel ODEProblem built)" elapsed_s=round(time()-_t_start, digits=2)
+    #= Reconstruct composite problem: use 3-arg ODEProblem with complete u0
+       (including algebraic unknowns) and skip the initialization solver.
+       buildDefaultGuesses fills algebraic unknowns not in finalInitialValues with 0.0. =#
+    local _recompGuesses = Base.invokelatest(
+      OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
+    compositeProblem = ModelingToolkit.ODEProblem(
+      reducedSystem,
+      merge(Dict(finalInitialValues), _recompGuesses, pars),
+      tspan;
+      callback = CallbackSet(callbackConditions, callbacks),
+      warn_initialize_determined = false,
+      build_initializeprob = false,
+    )
+    @VSS_DEBUG @info "[recompilation DOCC] composite ODEProblem rebuilt" elapsed_s=round(time()-_t_start, digits=2)
+    #= Update the structural callback's symbol table for the new system =#
+    structuralCallback.stringToSimVarHT = simulationCode.stringToSimVarHT
+    return (compositeProblem,
+            simulationCode.stringToSimVarHT,
+            finalInitialValues,
+            initialValues,
+            reducedSystem,
+            true) #= specialCase=true: variables can be assumed unchanged for DOCC =#
   end
-  @VSS_DEBUG @info "[recompilation DOCC] step 1/5: new flat model built" elapsed_s=round(time()-_t_start, digits=2)
-  local simulationCode = translateToSimCode(newFlatModel, activeModeName)
-  @VSS_DEBUG @info "[recompilation DOCC] step 2/5: backend (translateToSimCode) done" elapsed_s=round(time()-_t_start, digits=2)
-  local resultingModel = translateToMTK(simulationCode, activeModeName)
-  @VSS_DEBUG @info "[recompilation DOCC] step 3/5: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
-  #println("New model generated")
-  local model = replace(activeModeName, "." => "__")
-  local modelName = string(model, "Model")
-  #local result = OMBackend.modelToString(model; MTK = true, keepComments = false, keepBeginBlocks = false)
-  #println("We have a new model!\n");
-  resultingModel = OMBackend.CodeGeneration.stripComments(resultingModel)
-  resultingModel = OMBackend.CodeGeneration.stripBeginBlocks(resultingModel)
-  #= Ensure Modelica function wrapper bindings are available in Runtime scope.
-     The wrappers are created in CodeGeneration (mtkExternals.jl:317) but the
-     recompilation eval runs here in Runtime. =#
-  for (_fn, _w) in OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS
-    @eval $_fn = OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS[$(QuoteNode(_fn))]
-  end
-  @eval $(resultingModel)
-  @VSS_DEBUG @info "[recompilation DOCC] step 4/5: module @eval done" modelName elapsed_s=round(time()-_t_start, digits=2)
-  @BACKEND_LOGGING OMBackend.writeStringToFile(string("modfied", modelName * ".jl"), "$resultingModel")
-  local modelCall = quote
-    $(Symbol(modelName))($(tspan))
-  end
-  (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
-  @VSS_DEBUG @info "[recompilation DOCC] step 5/5: modelCall @eval done (submodel ODEProblem built)" elapsed_s=round(time()-_t_start, digits=2)
-  #= Reconstruct composite problem: use 3-arg ODEProblem with complete u0
-     (including algebraic unknowns) and skip the initialization solver.
-     buildDefaultGuesses fills algebraic unknowns not in finalInitialValues with 0.0. =#
-  local _recompGuesses = Base.invokelatest(
-    OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
-  compositeProblem = ModelingToolkit.ODEProblem(
-    reducedSystem,
-    merge(Dict(finalInitialValues), _recompGuesses, pars),
-    tspan;
-    callback = CallbackSet(callbackConditions, callbacks),
-    warn_initialize_determined = false,
-    build_initializeprob = false,
-  )
-  @VSS_DEBUG @info "[recompilation DOCC] composite ODEProblem rebuilt" elapsed_s=round(time()-_t_start, digits=2)
-  #= Update the structural callback's symbol table for the new system =#
-  structuralCallback.stringToSimVarHT = simulationCode.stringToSimVarHT
-  return (compositeProblem,
-          simulationCode.stringToSimVarHT,
-          finalInitialValues,
-          initialValues,
-          reducedSystem,
-          true) #= specialCase=true: variables can be assumed unchanged for DOCC =#
 end
 
 """

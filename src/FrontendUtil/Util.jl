@@ -227,11 +227,13 @@ function traverseExpTopDown1(continueTraversal::Bool, inExp::DAE.Exp, func::Func
 
      (e1 && DAE.RSUB(__), rel, ext_arg)  => begin
        (e1_1, ext_arg_1) = traverseExpTopDown(e1.exp, rel, ext_arg)
-       if ! referenceEq(e1.exp, e1_1)
-         e1.exp = e1_1
+       local newE1 = if !referenceEq(e1.exp, e1_1)
+         DAE.RSUB(e1_1, e1.ix, e1.fieldName, e1.ty)
+       else
+         e1
        end
-     (e1, ext_arg_1)
-    end
+       (newE1, ext_arg_1)
+     end
 
      (DAE.SIZE(exp = e1, sz = NONE()), rel, ext_arg)  => begin
        (e1_1, ext_arg_1) = traverseExpTopDown(e1, rel, ext_arg)

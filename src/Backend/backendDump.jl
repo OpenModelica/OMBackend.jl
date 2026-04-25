@@ -284,9 +284,6 @@ function Base.string(whenOp::BDAE.WhenOperator)::String
       BDAE.NORETCALL(exp = e1) => begin
         "[NORET]" + string(e1)
       end
- #     BDAE.DYNAMIC_BRANCH(ar, br) => begin
- #       string("[DYNAMIC_BRANCH] ","(" ,string(ar),"->", string(br), ")")
- #     end
       BDAE.RECOMPILATION(componentToChange, newValue) => begin
         string("RECOMPILATION", "(", string(componentToChange), ",", string(newValue), ")")
       end
@@ -314,33 +311,35 @@ function Base.string(cr::DAE.ComponentRef; separator="_", printType = false)
   return String(take!(buf))
 end
 
+function _writeSubscripts(buf::IOBuffer, subscriptLst)
+  if !listEmpty(subscriptLst)
+    for s in subscriptLst
+      print(buf, '[')
+      print(buf, string(s))
+      print(buf, ']')
+    end
+  end
+end
+
 function _writeCref(buf::IOBuffer, cr::DAE.ComponentRef, sep::String)
   @match cr begin
     DAE.CREF_QUAL(ident = ident, subscriptLst = subscriptLst, componentRef = cref) => begin
       print(buf, ident)
-      if !listEmpty(subscriptLst)
-        for s in subscriptLst
-          print(buf, '[')
-          print(buf, string(s))
-          print(buf, ']')
-        end
-      end
+      _writeSubscripts(buf, subscriptLst)
       print(buf, sep)
       _writeCref(buf, cref, sep)
     end
     DAE.CREF_IDENT(ident, _, subscriptLst) => begin
       print(buf, ident)
-      if !listEmpty(subscriptLst)
-        for s in subscriptLst
-          print(buf, '[')
-          print(buf, string(s))
-          print(buf, ']')
-        end
-      end
+      _writeSubscripts(buf, subscriptLst)
     end
     DAE.CREF_ITER(ident = ident) => begin
       print(buf, ident)
     end
+    #= Wildcard CREF: emitted for tuple-assign placeholders like `(a, _, b) := f(...)`. =#
+    DAE.WILD() => print(buf, "_")
+    #= Optimica attribute cref: fall back to the underlying componentRef. =#
+    DAE.OPTIMICA_ATTR_INST_CREF(componentRef = inner) => _writeCref(buf, inner, sep)
   end
 end
 

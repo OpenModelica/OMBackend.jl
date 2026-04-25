@@ -394,18 +394,40 @@ end
 function DAECallExpressionToJuliaCallExpression(pathStr::String, expLst::List, simCode, ht; varPrefix=varPrefix)::Expr
   @match pathStr begin
     "der" => begin
-      varName = SimulationCode.DAE_identifierToString(listHead(expLst))
-      (index, _) = ht[varName]
-      quote
-        dx[$(index)] #= der($varName) =#
+      local arg = listHead(expLst)
+      @match arg begin
+        DAE.ARRAY(_, _, array) => begin
+          local elemExprs = map(array) do e
+            DAECallExpressionToJuliaCallExpression("der", Cons(e, MetaModelica.nil), simCode, ht; varPrefix=varPrefix)
+          end
+          Expr(:vect, elemExprs...)
+        end
+        _ => begin
+          varName = SimulationCode.DAE_identifierToString(arg)
+          (index, _) = ht[varName]
+          quote
+            dx[$(index)] #= der($varName) =#
+          end
+        end
       end
     end
     "pre" => begin
-      varName = SimulationCode.DAE_identifierToString(listHead(expLst))
-      (index, _) = ht[varName]
-      indexForVar = ht[varName][1]
-      quote
-        (integrator.u[$(indexForVar)])
+      local arg = listHead(expLst)
+      @match arg begin
+        DAE.ARRAY(_, _, array) => begin
+          local elemExprs = map(array) do e
+            DAECallExpressionToJuliaCallExpression("pre", Cons(e, MetaModelica.nil), simCode, ht; varPrefix=varPrefix)
+          end
+          Expr(:vect, elemExprs...)
+        end
+        _ => begin
+          varName = SimulationCode.DAE_identifierToString(arg)
+          (index, _) = ht[varName]
+          indexForVar = ht[varName][1]
+          quote
+            (integrator.u[$(indexForVar)])
+          end
+        end
       end
     end
     _  =>  begin
@@ -441,21 +463,49 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
                                               simCode::SimulationCode.SimCode, ht; varPrefix=varPrefix, varSuffix = varSuffix, derAsSymbol=false)::Expr
   @match pathStr begin
     "der" => begin
-      varName = SimulationCode.DAE_identifierToString(listHead(expLst))
-      if derAsSymbol
-        quote
-          $(Symbol("der_$(varName)"))
+      local arg = listHead(expLst)
+      @match arg begin
+        #= Scalarize der({c1, c2, ...}) into [der(c1), der(c2), ...].
+           MSL MultiBody (Body.Q, frame_a.R_T rows etc.) emits a DAE.ARRAY
+           of element CREFs that survives frontend scalarization. Without
+           this arm DAE_identifierToString throws on the DAE.ARRAY. =#
+        DAE.ARRAY(_, _, array) => begin
+          local elemExprs = map(array) do e
+            DAECallExpressionToMTKCallExpression("der", Cons(e, MetaModelica.nil), simCode, ht;
+              varPrefix=varPrefix, varSuffix=varSuffix, derAsSymbol=derAsSymbol)
+          end
+          Expr(:vect, elemExprs...)
         end
-      else
-        quote
-          D($(Symbol(varName)))
+        _ => begin
+          varName = SimulationCode.DAE_identifierToString(arg)
+          if derAsSymbol
+            quote
+              $(Symbol("der_$(varName)"))
+            end
+          else
+            quote
+              D($(Symbol(varName)))
+            end
+          end
         end
       end
     end
     "pre" => begin
-      varName = SimulationCode.DAE_identifierToString(listHead(expLst))
-      quote
-        $(Symbol(varName))
+      local arg = listHead(expLst)
+      @match arg begin
+        DAE.ARRAY(_, _, array) => begin
+          local elemExprs = map(array) do e
+            DAECallExpressionToMTKCallExpression("pre", Cons(e, MetaModelica.nil), simCode, ht;
+              varPrefix=varPrefix, varSuffix=varSuffix, derAsSymbol=derAsSymbol)
+          end
+          Expr(:vect, elemExprs...)
+        end
+        _ => begin
+          varName = SimulationCode.DAE_identifierToString(arg)
+          quote
+            $(Symbol(varName))
+          end
+        end
       end
     end
     "initial" => begin
@@ -556,6 +606,7 @@ function subscriptsToExpr(subscripts, simCode; varPrefix="", varSuffix="", derSy
       DAE.INDEX(DAE.ICONST(i)) => i
       DAE.ICONST(i) => i
       DAE.INDEX(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+      DAE.SLICE(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
       DAE.WHOLEDIM(__) => :(:)
       _ => Meta.parse(string(sub))  #= Fallback for unknown subscript types =#
     end
@@ -788,6 +839,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             local subExprs = map(subscriptLst) do sub
               @match sub begin
                 DAE.INDEX(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+                DAE.SLICE(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
                 DAE.WHOLEDIM(__) => :(:)
                 _ => throw("Unsupported subscript: $sub")
               end
@@ -1307,6 +1359,62 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           :($tupleExpr[$ix])
         end
       end
+      #=
+      Record constructor special case: Modelica `Complex(re, im)`.
+
+      The Modelica `Complex` operator record is inlined from
+      `Modelica.ComplexMath.j` (the imaginary unit) and similar constants
+      into backend IR as DAE.RECORD(IDENT("Complex"), [re, im], ...).
+      Lower it to Julia's built-in `Complex(re, im)` so downstream
+      arithmetic works with the standard Julia/Symbolics complex support.
+
+      Non-Complex record constructors deliberately fall through to the
+      generic `_ => throw(...)` below. A permissive tuple fallback has
+      been tried and regressed models whose call-argument handling
+      expects a CREF-stringifiable expression (FilterWithDifferentiation
+      hit `DAE_identifierToString: DAE.ARRAY` via
+      DAECallExpressionToMTKCallExpression once a non-Complex RECORD got
+      lowered to a tuple). If we encounter a non-Complex record
+      constructor we want the compile-time error, not a silent
+      type-mismatch downstream.
+      =#
+      DAE.RECORD(Absyn.IDENT("Complex"), expl, _, _) where length(expl) == 2 => begin
+        local reExpr = expToJuliaExpMTK(listGet(expl, 1), simCode,
+                                        varPrefix=varPrefix,
+                                        varSuffix=varSuffix,
+                                        derSymbol=derSymbol)
+        local imExpr = expToJuliaExpMTK(listGet(expl, 2), simCode,
+                                        varPrefix=varPrefix,
+                                        varSuffix=varSuffix,
+                                        derSymbol=derSymbol)
+        quote Complex($reExpr, $imExpr) end
+      end
+      #=
+      Generic record constructor fallback. Lowers any DAE.RECORD to a
+      Julia `NamedTuple` keyed by the Modelica field names. Used by
+      Spice3.Internal.Mosfet.Mosfet and Media.IdealGases.DataRecord
+      parameter records.
+
+      Historically a plain tuple fallback regressed FilterWithDifferentiation
+      because downstream `DAECallExpressionToMTKCallExpression` der/pre arms
+      did not handle DAE.ARRAY-of-CREFs — those arms now scalarize, so this
+      permissive arm is safe again.
+      =#
+      DAE.RECORD(_, expl, fieldNames, _) => begin
+        local elemExprs = [expToJuliaExpMTK(e, simCode;
+                                             varPrefix=varPrefix,
+                                             varSuffix=varSuffix,
+                                             derSymbol=derSymbol)
+                           for e in expl]
+        local names = [Symbol(n) for n in fieldNames]
+        if length(names) == length(elemExprs)
+          local pairs = [Expr(:(=), names[i], elemExprs[i]) for i in eachindex(names)]
+          Expr(:tuple, Expr(:parameters, pairs...))
+        else
+          #= Safety: fall back to positional tuple if field-name list is mismatched. =#
+          Expr(:tuple, elemExprs...)
+        end
+      end
     _ =>  throw(ErrorException("$exp not yet supported"))
     end
   end
@@ -1652,6 +1760,32 @@ function evalDAE_Expression(expr, simCode)::Expr
 end
 
 """
+    equationSides(eq) -> Tuple{DAE.Exp, DAE.Exp}
+
+Return (lhs, rhs) for any BDAE equation shape.
+
+- `BDAE.EQUATION`           has `.lhs` / `.rhs`
+- `BDAE.COMPLEX_EQUATION`   has `.left` / `.right`   (record-to-record equality)
+- `BDAE.ARRAY_EQUATION`     has `.left` / `.right`   (pre-scalarised array equality)
+- `BDAE.RESIDUAL_EQUATION`  has `.exp`, already in LHS−RHS=0 form → return `(eq.exp, RCONST(0.0))`
+
+Any other shape throws; the caller should have screened those out.
+"""
+function equationSides(eq)::Tuple{DAE.Exp, DAE.Exp}
+  if eq isa BDAE.EQUATION
+    return (eq.lhs, eq.rhs)
+  elseif eq isa BDAE.COMPLEX_EQUATION
+    return (eq.left, eq.right)
+  elseif eq isa BDAE.ARRAY_EQUATION
+    return (eq.left, eq.right)
+  elseif eq isa BDAE.RESIDUAL_EQUATION
+    return (eq.exp, DAE.RCONST(0.0))
+  end
+  error("equationSides: no (lhs, rhs) for $(typeof(eq)); " *
+        "caller should filter to EQUATION / COMPLEX_EQUATION / ARRAY_EQUATION / RESIDUAL_EQUATION.")
+end
+
+"""
     isParametricOnlyEquation(eq, simCode) -> Bool
 
 Check if an initial equation only involves parameters (no state/algebraic variables).
@@ -1673,9 +1807,10 @@ function isParametricOnlyEquation(eq, simCode::SimulationCode.SimCode)::Bool
     end
     (exp, true, acc)
   end
-  Util.traverseExpBottomUp(eq.lhs, checker, 0)
+  lhs, rhs = equationSides(eq)
+  Util.traverseExpBottomUp(lhs, checker, 0)
   if !hasStateOrAlg[]
-    Util.traverseExpBottomUp(eq.rhs, checker, 0)
+    Util.traverseExpBottomUp(rhs, checker, 0)
   end
   return !hasStateOrAlg[]
 end
@@ -1708,8 +1843,9 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       end
       (exp, true, acc)
     end
-    Util.traverseExpBottomUp(ieq.lhs, findFree, 0)
-    Util.traverseExpBottomUp(ieq.rhs, findFree, 0)
+    local ieqLhs, ieqRhs = equationSides(ieq)
+    Util.traverseExpBottomUp(ieqLhs, findFree, 0)
+    Util.traverseExpBottomUp(ieqRhs, findFree, 0)
     unique!(freeParams)
     if length(freeParams) != 1
       continue
@@ -1757,8 +1893,8 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       end
       (exp, true, acc)
     end
-    local lhsSubst = first(Util.traverseExpBottomUp(ieq.lhs, substituteParams, 0))
-    local rhsSubst = first(Util.traverseExpBottomUp(ieq.rhs, substituteParams, 0))
+    local lhsSubst = first(Util.traverseExpBottomUp(ieqLhs, substituteParams, 0))
+    local rhsSubst = first(Util.traverseExpBottomUp(ieqRhs, substituteParams, 0))
     #= Evaluate LHS (should be all constants) =#
     local lhsJl = expToJuliaExpMTK(lhsSubst, simCode)
     local lhsVal = try

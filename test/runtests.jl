@@ -50,12 +50,99 @@ import OMParser
 import OMFrontend
 using OMBackend
 using Test
+using Dates
 using DifferentialEquations: ReturnCode
 
 include("./ExampleDAE/ExampleDAEs.jl")
 import .ExampleDAEs
 
 @testset "OMBackend" begin
+
+  function resetLogRunDirStack!()
+    while OMBackend.hasActiveLogRunDir()
+      OMBackend.popLogRunDir()
+    end
+  end
+
+  #= ── 0. Logging helpers ──────────────────────────────────────── =#
+
+  @testset "Log Scoping" begin
+    local originalLogDir = get(ENV, "OMJL_LOG_DIR", nothing)
+    resetLogRunDirStack!()
+    try
+      delete!(ENV, "OMJL_LOG_DIR")
+
+      @test OMBackend.sanitizeLogRunName(" Modelica.Mechanics/Pendulum? ") == "Modelica_Mechanics_Pendulum"
+      @test OMBackend.createLogRunId("Pendulum";
+                                     timestamp = DateTime(2026, 4, 21, 14, 33, 8)) == "Pendulum_2026-04-21_14-33-08"
+
+      local sessionRoot = joinpath(tempdir(), "OMJL", OMBackend.OMJL_SESSION_ID)
+      @test OMBackend.logDir() == sessionRoot
+
+      local firstRun = OMBackend.pushLogRunDir("Parent.Run")
+      @test firstRun == "Parent_Run"
+      @test OMBackend.logDir() == joinpath(sessionRoot, "Parent_Run")
+
+      local nestedRun = OMBackend.pushLogRunDir("child/run")
+      @test nestedRun == joinpath("Parent_Run", "child_run")
+      @test OMBackend.logDir() == joinpath(sessionRoot, "Parent_Run", "child_run")
+
+      @test OMBackend.popLogRunDir() == joinpath("Parent_Run", "child_run")
+      @test OMBackend.logDir() == joinpath(sessionRoot, "Parent_Run")
+      @test OMBackend.popLogRunDir() == "Parent_Run"
+      @test OMBackend.logDir() == sessionRoot
+
+      mktempdir() do tmp
+        ENV["OMJL_LOG_DIR"] = tmp
+        local runId = OMBackend.createLogRunId("Scoped.Model";
+                                               timestamp = DateTime(2026, 4, 21, 16, 2, 3))
+        local path = OMBackend.withLogRunDir(runId) do
+          OMBackend.logPath("backend/bdae", "x.log")
+        end
+        @test path == joinpath(tmp, runId, "backend/bdae", "x.log")
+        @test isdir(dirname(path))
+
+        OMBackend.pushLogRunDir(runId)
+        local nestedPath = OMBackend.withLogRunDir("recompile pass") do
+          OMBackend.logPath("backend/runtime", "y.log")
+        end
+        @test nestedPath == joinpath(tmp, runId, "recompile_pass", "backend/runtime", "y.log")
+        @test OMBackend.popLogRunDir() == runId
+      end
+
+      mktempdir() do tmp
+        local repoRoot = abspath(joinpath(@__DIR__, ".."))
+        local script = """
+        ENV[\\"ENABLE_BACKEND_LOGGING\\"] = \\"true\\"
+        ENV[\\"OMJL_LOG_DIR\\"] = $(repr(tmp))
+        cd($(repr(repoRoot)))
+        include(\\"src/OMBackend.jl\\")
+        include(\\"test/ExampleDAE/ExampleDAEs.jl\\")
+        using .ExampleDAEs
+        println(\\"same_module=\\", OMBackend === OMBackend.CodeGeneration.OMBackend)
+        OMBackend.translate(ExampleDAEs.helloWorld_DAE; BackendMode = OMBackend.MTK_MODE)
+        sleep(1)
+        OMBackend.translate(ExampleDAEs.helloWorld_DAE; BackendMode = OMBackend.MTK_MODE)
+        local runDirs = sort(filter(name -> startswith(name, \\"HelloWorld_\\"), readdir(ENV[\\"OMJL_LOG_DIR\\"])))
+        println(\\"run_count=\\", length(runDirs))
+        println(\\"root_codegen=\\", isfile(joinpath(ENV[\\"OMJL_LOG_DIR\\"], \\"backend\\", \\"codeGen\\", \\"equationFirstStageCodeGen.log\\")))
+        println(\\"run_codegen=\\", all(dir -> isfile(joinpath(ENV[\\"OMJL_LOG_DIR\\"], dir, \\"backend\\", \\"codeGen\\", \\"equationFirstStageCodeGen.log\\")), runDirs))
+        """
+        local output = read(`$(Base.julia_cmd()) --startup-file=no --project=$(repoRoot) -e $script`, String)
+        @test occursin("same_module=true", output)
+        @test occursin("run_count=2", output)
+        @test occursin("root_codegen=false", output)
+        @test occursin("run_codegen=true", output)
+      end
+    finally
+      resetLogRunDirStack!()
+      if originalLogDir === nothing
+        delete!(ENV, "OMJL_LOG_DIR")
+      else
+        ENV["OMJL_LOG_DIR"] = originalLogDir
+      end
+    end
+  end
 
   #= ── 1. Cache management ──────────────────────────────────────── =#
 
@@ -65,7 +152,7 @@ import .ExampleDAEs
       OMBackend.COMPILED_MODELS_MTK["TestModel"] = (Expr(:block, :nothing), false, UInt64(0))
       OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[:testFunc] = identity
       OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS[:testFunc] = identity
-      OMBackend.CodeGeneration.ELEM_FUNC_CACHE[(:testFunc, (1,))] = identity
+      OMBackend.CodeGeneration.ELEM_FUNC_CACHE[(:testFunc, (1,), 1)] = identity
       @test !isempty(OMBackend.COMPILED_MODELS_MTK)
       @test !isempty(OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS)
       @test !isempty(OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS)
@@ -84,7 +171,7 @@ import .ExampleDAEs
       OMBackend.COMPILED_MODELS_MTK["TestModel"] = (Expr(:block, :nothing), false, UInt64(0))
       OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[:testFunc] = identity
       OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS[:testFunc] = identity
-      OMBackend.CodeGeneration.ELEM_FUNC_CACHE[(:testFunc, (1,))] = identity
+      OMBackend.CodeGeneration.ELEM_FUNC_CACHE[(:testFunc, (1,), 1)] = identity
 
       #= Clear only models =#
       cleared = OMBackend.clearCaches!(models=true, implementations=false,

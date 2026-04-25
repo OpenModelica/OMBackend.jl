@@ -60,5 +60,6 @@ include("simCodeUtil.jl")
 include("simCodeDump.jl")
 include("simulationCodeTransformation.jl")
 include("simCodeFunctions.jl")
+include("simCodeCheck.jl")
 
 end # module SimulationCode

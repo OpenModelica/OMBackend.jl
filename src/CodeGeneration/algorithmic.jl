@@ -7,6 +7,19 @@ author:johti17
    Set before generateStatements, read by STMT_RETURN handler. =#
 const _CURRENT_RETURN_EXPR = Ref{Any}(nothing)
 
+#= Unwrap a single-valued :block expression to its inner value.
+   `expToJuliaExpAlg` wraps literal DAE.ICONST/RCONST in `quote $int end`,
+   which flattens to `Expr(:block, int)`. Inside `Expr(:ref, ...)` that
+   prints as `a[(1;)]` — invalid Julia at eval time. =#
+function _unwrapSubscriptExpr(raw)
+  if raw isa Expr && raw.head === :block
+    local stripped = filter(a -> !(a isa LineNumberNode), raw.args)
+    length(stripped) == 1 ? stripped[1] : raw
+  else
+    raw
+  end
+end
+
 #= Check if a DAE.VAR is a multi-dimensional array (2+ dimensions). =#
 #= Dimensions may be in v.ty (T_ARRAY) or in v.dims field. =#
 function isMultiDimArray(v::DAE.VAR)::Bool
@@ -389,9 +402,25 @@ function generateStatement(stmt::DAE.STMT_ASSIGN)
 end
 
 function generateStatement(stmt::DAE.STMT_TUPLE_ASSIGN)
-  local lhs = string(stmt.expExpLst)
+  #= Emit a proper Julia tuple destructuring `(a, _, b) = rhs`.
+     The old code did `Symbol(string(expExpLst))`, producing a single
+     identifier like `var"(a, _, b)"` that is never actually bound —
+     silently wrong on multi-return function calls. Mapping each CREF
+     to its identifier gives a real tuple-assign. =#
+  local lhsSyms = map(_crefToTupleTarget, collect(stmt.expExpLst))
   local rhs = expToJuliaExpAlg(stmt.exp)
-  return :($(Symbol(lhs)) = $(rhs))
+  return Expr(:(=), Expr(:tuple, lhsSyms...), rhs)
+end
+
+#= Translate a single target expression inside a tuple-assign LHS to a
+   Julia symbol suitable for `Expr(:tuple, …)`. =#
+function _crefToTupleTarget(exp::DAE.Exp)
+  @match exp begin
+    DAE.CREF(DAE.WILD(), _) => :_
+    DAE.CREF(DAE.CREF_IDENT(ident, _, _), _) => Symbol(ident)
+    DAE.CREF(cr, _) => Symbol(SimulationCode.string(cr))
+    _ => Symbol(string(exp))
+  end
 end
 
 function generateStatement(stmt::DAE.STMT_ASSIGN_ARR)
@@ -581,12 +610,14 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         else
           ident
         end
-        #= Convert all subscripts to Julia index expressions =#
         local idxExprs = map(subscriptLst) do sub
-          @match sub begin
+          local raw = @match sub begin
             DAE.INDEX(e) => expToJuliaExpAlg(e)
+            DAE.SLICE(e) => expToJuliaExpAlg(e)
+            DAE.WHOLEDIM() => :(:)
             _ => throw("Unsupported subscript in algorithmic code: $sub")
           end
+          _unwrapSubscriptExpr(raw)
         end
         #= Construct proper Julia multi-dimensional indexing: arr[i, j, ...] =#
         expr = Expr(:ref, Symbol(baseName), idxExprs...)
@@ -766,9 +797,8 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         quote $index end
       end
       DAE.ASUB(arrExp, subLst) => begin
-        #= Array subscript expression: arr[i, j, ...] =#
         local arrExpr = expToJuliaExpAlg(arrExp)
-        local subs = map(expToJuliaExpAlg, subLst)
+        local subs = map(s -> _unwrapSubscriptExpr(expToJuliaExpAlg(s)), subLst)
         Expr(:ref, arrExpr, subs...)
       end
       DAE.RECORD(path, exps, fieldNames, ty) => begin
@@ -780,6 +810,36 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         else
           Expr(:tuple, fieldExprs...)
         end
+      end
+      DAE.REDUCTION(reductionInfo, bodyExp, iterators) => begin
+        #= Array comprehensions/reductions inside algorithmic code
+           (Modelica function bodies). Mirrors the handler in expToJuliaExpMTK
+           but routes bodies through expToJuliaExpAlg so iterator CREFs are
+           emitted as plain Symbols rather than hash-table lookups. =#
+        local bodyExpr = expToJuliaExpAlg(bodyExp)
+        local iterExprs = Expr[]
+        for iter in iterators
+          @match iter begin
+            DAE.REDUCTIONITER(id, rangeExp, guardExp, _) => begin
+              local rangeExpr = expToJuliaExpAlg(rangeExp)
+              push!(iterExprs, Expr(:(=), Symbol(id), rangeExpr))
+            end
+          end
+        end
+        @match reductionInfo.path begin
+          Absyn.IDENT("array") => Expr(:comprehension, bodyExpr, iterExprs...)
+          Absyn.IDENT("sum") => :(sum($(Expr(:generator, bodyExpr, iterExprs...))))
+          Absyn.IDENT("product") => :(prod($(Expr(:generator, bodyExpr, iterExprs...))))
+          Absyn.IDENT("min") => :(minimum($(Expr(:generator, bodyExpr, iterExprs...))))
+          Absyn.IDENT("max") => :(maximum($(Expr(:generator, bodyExpr, iterExprs...))))
+          _ => Expr(:comprehension, bodyExpr, iterExprs...)
+        end
+      end
+      DAE.TSUB(tupleExp, ix, _) => begin
+        #= Tuple-return element access inside algorithmic code. No Symbolics
+           quirks to worry about here, so a direct Julia index works. =#
+        local tupExpr = expToJuliaExpAlg(tupleExp)
+        :($tupExpr[$ix])
       end
       _ =>  throw(ErrorException("$exp not yet supported"))
     end

@@ -35,7 +35,7 @@
   TODO: Make duplicate code better...
   TODO: Cleanup in general.. keep this simple. Remove hacks as the SCiML team adds new features to MTK.
 =#
-import OMBackend
+import ..OMBackend
 import ..AlgorithmicCodeGeneration
 
 """
@@ -253,7 +253,22 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   RESET_CALLBACKS()
   #= Eval functions and register them with @register_symbolic before equations are processed =#
   for f in functions
-    eval(f)
+    try
+      eval(f)
+    catch e
+      local dumpPath = "/tmp/om_bad_function.jl"
+      try
+        open(dumpPath, "w") do io
+          println(io, "# Offending generated function. Eval error: ", sprint(showerror, e))
+          println(io, "# Model: $modelName")
+          println(io, string(Base.remove_linenums!(deepcopy(f))))
+        end
+        @error "Generated Modelica-function eval failed; dumped Julia source for inspection" modelName error=sprint(showerror, e) dumpPath
+      catch ioErr
+        @error "Generated function eval failed, also failed to dump" modelName error=sprint(showerror, e) ioErr
+      end
+      rethrow(e)
+    end
   end
   local registrationCalls = generateRegisterCallsForCallExprs(simCode; funcArgGen = AlgorithmicCodeGeneration.generateIOL)
   for regCall in registrationCalls
@@ -924,6 +939,10 @@ end
 function generateInitialEquations(initialEqs, simCode::SimulationCode.SimCode; parameterAssignment = true)::Vector{Expr}
   local initialEqsExps = Expr[]
   for ieq in initialEqs
+    #= COMPLEX_EQUATION/ARRAY_EQUATION should have been expanded before this point =#
+    if ieq isa BDAE.COMPLEX_EQUATION || ieq isa BDAE.ARRAY_EQUATION
+      error("generateInitialEquations: unexpected unexpanded $(typeof(ieq)) in initial equations — this is a compiler bug upstream")
+    end
     #= Skip parametric-only initial equations (already solved by solveParametricInitialEquations!) =#
     if isParametricOnlyEquation(ieq, simCode)
       continue
@@ -931,6 +950,16 @@ function generateInitialEquations(initialEqs, simCode::SimulationCode.SimCode; p
     #= LHS will typically be a variable. Don't have to be though.. =#
     lhs = expToJuliaExpMTK(ieq.lhs, simCode)
     rhs = @match ieq.rhs begin
+      #= `time` is the independent variable and never appears in
+         stringToSimVarHT. Route it directly through expToJuliaExpMTK
+         which emits the Julia symbol `t` for it. Without this guard
+         the generic DAE.CREF arm below indexes the HT with key
+         `"time"` and throws KeyError. Surfaced by models like
+         Modelica.Fluid.Examples.ControlledTankSystem.ControlledTanks
+         whose initial equations contain `<var> = time`. =#
+      DAE.CREF(DAE.CREF_IDENT("time", _, _), _) => begin
+        expToJuliaExpMTK(ieq.rhs, simCode)
+      end
       DAE.CREF(__) => begin
         #= Evaluate the right hand side at this point =#
         local crefAsStr = string(ieq.rhs)
@@ -1225,15 +1254,16 @@ function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode
       SimulationCode.PARAMETER(__) => begin
         local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
         @match optAttributes begin
-          SOME(attr) where attr.start != nothing => begin
-            @assert !(attr.start isa DAE.CREF) "Non-numeric start attributes are not currently supported"
+          SOME(attr) where attr.start isa SOME => begin
+            @assert !(attr.start.data isa DAE.CREF) "Non-numeric start attributes are not currently supported"
             @match SOME(startVal) = attr.start
             startVal
           end
-          NONE() => begin
-            #= Unassigned parameters are assumed to be floats... =#
-            DAE.RCONST(0.0)
-          end
+          #= Either NONE() for missing attributes, or SOME(attr) whose start is
+             NONE(). Both collapse to the default-float path. Without this
+             catch-all the match fails on SOME{VariableAttributes} whose start
+             is unset (e.g. several Blocks.Examples.Filter variants). =#
+          _ => DAE.RCONST(0.0)
         end
       end
       SimulationCode.STRING(__) => begin
@@ -1981,6 +2011,36 @@ function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.S
                 idx = lookuptableStates[Symbol($(string(var.name)))]
                 integrator.u[idx] = $(expToJuliaExpMTK(wStmt.value,
                                                                                                   simCode; varPrefix = varPrefix, varSuffix = varSuffix))
+              end)
+      end
+      #= Modelica terminate("msg") — request clean simulation stop via the
+         SciML integrator, logging the user-supplied message. Surfaces on
+         MSL Mechanics.MultiBody.Examples.Systems.RobotR3.{oneAxis,fullRobot}
+         where PathPlanning calls terminate() at end of motion profile. =#
+      BDAE.TERMINATE(__) => begin
+        local msgExpr = expToJuliaExpMTK(wStmt.message, simCode;
+                                          varPrefix = varPrefix, varSuffix = varSuffix)
+        push!(res, quote
+                @info "Modelica terminate() reached" message=$(msgExpr)
+                OMBackend.DifferentialEquations.terminate!(integrator)
+              end)
+      end
+      BDAE.NORETCALL(__) => begin
+        local callExpr = expToJuliaExpMTK(wStmt.exp, simCode;
+                                           varPrefix = varPrefix, varSuffix = varSuffix)
+        push!(res, quote
+                $(callExpr)
+              end)
+      end
+      BDAE.ASSERT(__) => begin
+        local condExpr = expToJuliaExpMTK(wStmt.condition, simCode;
+                                           varPrefix = varPrefix, varSuffix = varSuffix)
+        local msgExpr = expToJuliaExpMTK(wStmt.message, simCode;
+                                          varPrefix = varPrefix, varSuffix = varSuffix)
+        push!(res, quote
+                if !($(condExpr))
+                  @warn "Modelica assert()" message=$(msgExpr)
+                end
               end)
       end
       _ => ErrorException("$whenStatements in @__FUNCTION__ not supported")

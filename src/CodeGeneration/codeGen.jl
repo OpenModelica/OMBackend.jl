@@ -571,6 +571,31 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
               $(Symbol(varPrefix))[$(indexAndVar[1])]
             end
             SimulationCode.STATE_DERIVATIVE(__) => :(dx$(varSuffix)[$(indexAndVar[1])] #= der($varName) =#)
+            #=
+            DATA_STRUCTURE / OCC_VARIABLE / STRING: opaque / discrete-only
+            variables that do not live in the integrator's continuous state
+            vector. Emit by the SimVar's registered `name`, matching how
+            expToJuliaExpMTK lowers the same cases. Without these arms the
+            legacy `expToJuliaExp` path (still used by when-clause codegen,
+            parameter-assignment codegen, etc.) hits MetaModelica
+            MatchFailure on any reference to an external-object handle like
+            `combiTimeTable.tableID`. Surfaced by
+            Modelica.Thermal.FluidHeatFlow.Examples.TestOpenTank and every
+            model that passes a CombiTimeTable handle to getNextTimeEvent
+            inside a when-clause.
+            =#
+            SimulationCode.DATA_STRUCTURE(__) => quote
+              $(LineNumberNode(@__LINE__, "$varName, datastructure"))
+              $(Symbol(indexAndVar[2].name))
+            end
+            SimulationCode.OCC_VARIABLE(__) => quote
+              $(LineNumberNode(@__LINE__, "$varName, occ variable"))
+              $(Symbol(indexAndVar[2].name))
+            end
+            SimulationCode.STRING(__) => quote
+              $(LineNumberNode(@__LINE__, "$varName, string"))
+              $(Symbol(indexAndVar[2].name))
+            end
           end
         else #= Currently only time is a builtin variable. Time is represented as t in the generated code =#
           quote
@@ -622,6 +647,31 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
         DAECallExpressionToJuliaCallExpression(tmpStr, explst, context, hashTable, varPrefix=varPrefix)
       end
+      #=
+      Qualified-path DAE.CALL in the legacy (non-MTK) code path. Mirrors the
+      handler already present in expToJuliaExpMTK: emit a direct Julia call
+      with a dot-to-underscore-normalized name and recursively lower the
+      arguments. Covers Modelica-function calls appearing inside
+      when-statements (e.g. `getNextTimeEvent(...)` from CombiTimeTable),
+      which previously fell through to the `_ => throw(...)` fallback and
+      blocked translate on every model that uses a table function in a
+      when-clause.
+
+      NOTE: this makes translate succeed. Whether the generated call
+      actually resolves at runtime depends on the target function being
+      registered (external-object runtime / @register_symbolic). Models
+      whose runtime depends on these externals may still fail at simulate.
+      =#
+      DAE.CALL(path, expLst) => begin
+        local normalizedFuncName = replace(string(path), "." => "_")
+        local expr = Expr(:call, Symbol(normalizedFuncName))
+        local args::Vector{Any} = Any[]
+        for arg in expLst
+          push!(args, expToJuliaExp(arg, context, varSuffix, varPrefix=varPrefix))
+        end
+        append!(expr.args, args)
+        expr
+      end
       DAE.CAST(ty, exp)  => begin
         quote
           $(generateCastExpression(ty, exp, context, varPrefix))
@@ -671,8 +721,8 @@ function getStartConditions(vars::Array, condName::String, simCode::SimulationCo
           end
           (_, _) => ()
         end
-        NONE() => ()
       end
+      NONE() => ()
     end
   end
   return quote

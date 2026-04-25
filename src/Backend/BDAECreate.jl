@@ -305,7 +305,6 @@ function splitEquationsAndVars(elementLst::List{DAE.Element})::Tuple{List, List,
           equationLst = BDAE.EQUATION(elem.exp,
                                       elem.scalar,
                                       elem.source,
-                                      #=TODO: Below might need to be changed =#
                                       BDAE.EQ_ATTR_DEFAULT_UNKNOWN) <| equationLst
         end
         DAE.WHEN_EQUATION(__) => begin
@@ -318,7 +317,6 @@ function splitEquationsAndVars(elementLst::List{DAE.Element})::Tuple{List, List,
           initialEquationLst = BDAE.EQUATION(elem.exp1,
           elem.exp2,
           elem.source,
-          #=TODO: Below might need to be changed =#
           BDAE.EQ_ATTR_DEFAULT_UNKNOWN) <| initialEquationLst
         end
         DAE.COMP(__) => begin
@@ -333,6 +331,17 @@ function splitEquationsAndVars(elementLst::List{DAE.Element})::Tuple{List, List,
         end
         DAE.RECONFIGURE_EQUATION(__) => begin
           equationLst = lowerReconfigureEquation(elem) <| equationLst
+        end
+        DAE.ASSERT(c, msg, level, source) => begin
+          #= Mirror `equationToBackendEquation`: treat asserts as
+             ASSERT_EQUATIONs in the main equation list. Without this
+             branch, asserts nested directly under a DAE.COMP (rather than
+             inside an inner equation list) hit the catch-all below and
+             fail translate with "Unsupported equation: DAE.ASSERT(...)".
+             Surfaced by e.g. Modelica.Fluid.Examples.AST_BatchPlant.BatchPlant_StandardWater
+             whose "Attempt to fill tank while evaporating" assert lives
+             at component scope. =#
+          equationLst = BDAE.ASSERT_EQUATION(c, msg, level, source) <| equationLst
         end
         _ => begin
           @error "Skipped:" elem
@@ -350,7 +359,6 @@ function equationToBackendEquation(elem::DAE.Element)
       BDAE.EQUATION(elem.exp,
                     elem.scalar,
                     elem.source,
-                    #=TODO: Below might need to be changed =#
                     BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
     end
     DAE.WHEN_EQUATION(__) => begin
@@ -363,13 +371,11 @@ function equationToBackendEquation(elem::DAE.Element)
       BDAE.EQUATION(elem.exp1,
                     elem.exp2,
                     elem.source,
-                    #=TODO: Below might need to be changed =#
                     BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
     end
     DAE.COMP(__) => begin
       throw("Components not directly allowed in equation sections")
     end
-    #= An equation of type NORETCALL =#
     DAE.NORETCALL(DAE.CALL(path, expLst)) => begin
       #=
       Currently there are two options here.
@@ -398,12 +404,9 @@ function equationToBackendEquation(elem::DAE.Element)
       res
     end
     DAE.ASSERT(c, msg, level, source) => begin
-      #=TODO: Currently skipping asserts =#
       BDAE.ASSERT_EQUATION(c, msg, level, source)
     end
     DAE.ARRAY_EQUATION(dim, exp, arr, source) => begin
-      #@error "Array equations not supported yet. Exp was" string(exp) string(arr) string(dim) string(source)
-      #= Generate code for array equations =#
       dVec = BDAEUtil.DAE_DimensionToIntVector(dim)
       BDAE.ARRAY_EQUATION(dVec, arr, exp, source, BDAE.NO_ATTRIBUTES(), NONE())
     end
@@ -431,17 +434,37 @@ function equationToBackendEquation(elem::DAE.Element)
 end
 
 """
-  Decompose a COMPLEX_EQUATION (record-to-record equality) into per-field equations.
-  For a record with fields T[3,3] and w[3], this generates one ARRAY_EQUATION per
+  Decompose `lhs = rhs` where lhs is a record-typed expression into per-field
+  equations, using the record's fieldList from its T_COMPLEX type.
+  For a record with fields T[3,3] and w[3], this emits one ARRAY_EQUATION per
   array field and one EQUATION per scalar field.
+
+  Resolution of recTy:
+    1. getComplexType(lhs)   — matches CREF with T_COMPLEX identType, or a
+                                CALL whose CALL_ATTR returns T_COMPLEX
+    2. getComplexType(rhs)   — symmetric fallback
+    3. nothing               — we cannot model this shape; emit a single
+                                opaque COMPLEX_EQUATION as a backstop
+
+  Resolution of splitability:
+    - If LHS is a CREF or RECORD literal: per-field split via appendFieldToCref
+    - Otherwise (CALL / BINARY / IFEXP / ...): emit COMPLEX_EQUATION with
+      correct nFields from recTy, do not split
 """
 function decomposeComplexEquation(lhs::DAE.Exp, rhs::DAE.Exp, source::DAE.ElementSource)::Vector{BDAE.Equation}
   local eqs = BDAE.Equation[]
-  #= Extract the record type from the CREF expression =#
   local recTy = BDAEUtil.getComplexType(lhs)
   if recTy === nothing
-    @warn "decomposeComplexEquation: cannot extract record type from LHS, treating as opaque"
-    local nFields = 1
+    recTy = BDAEUtil.getComplexType(rhs)
+  end
+  if recTy === nothing
+    @info "DBG: decomposeComplexEquation: neither LHS nor RHS yields T_COMPLEX; emitting opaque COMPLEX_EQUATION(size=1). This path may be legitimate for BINARY/IFEXP/ASUB record expressions — leaving as info until the envelope of shapes is understood." lhsType=typeof(lhs) rhsType=typeof(rhs) lhsSummary=first(string(lhs), 160) rhsSummary=first(string(rhs), 160) maxlog=5
+    push!(eqs, BDAE.COMPLEX_EQUATION(1, lhs, rhs, source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN))
+    return eqs
+  end
+  if !(lhs isa DAE.CREF || lhs isa DAE.RECORD)
+    @match DAE.T_COMPLEX(varLst = varLst) = recTy
+    local nFields = length(collect(varLst))
     push!(eqs, BDAE.COMPLEX_EQUATION(nFields, lhs, rhs, source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN))
     return eqs
   end

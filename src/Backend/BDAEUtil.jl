@@ -107,7 +107,7 @@ end
 
 function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation::Function)
   dae = begin
-    local eqs::Vector{BDAE.BDAE.EQSYSTEM}
+    local eqs::Vector{BDAE.EQSYSTEM}
     @match dae begin
       BDAE.BACKEND_DAE(eqs = eqs) => begin
         for i in 1:arrayLength(eqs)
@@ -285,8 +285,26 @@ function traverseWhenEquation!(whenEq, traversalOperation, extArg)
         newStmt = exp === stmt.exp ? stmt : BDAE.NORETCALL(exp, stmt.source)
         newWhenStmtLst = newStmt <| newWhenStmtLst
       end
+      #= Modelica `terminate("msg")` inside a when-clause. Traverse the
+         message expression and rebuild. Surfaces on MSL
+         Mechanics.MultiBody.Examples.Systems.RobotR3.{oneAxis,fullRobot}
+         where PathPlanning calls terminate() when the motion profile
+         finishes. =#
+      BDAE.TERMINATE(__) => begin
+        (msg, extArg) = Util.traverseExpTopDown(stmt.message, traversalOperation, extArg)
+        newStmt = msg === stmt.message ? stmt : BDAE.TERMINATE(msg, stmt.source)
+        newWhenStmtLst = newStmt <| newWhenStmtLst
+      end
+      BDAE.ASSERT(__) => begin
+        (cond, extArg) = Util.traverseExpTopDown(stmt.condition, traversalOperation, extArg)
+        (msg, extArg) = Util.traverseExpTopDown(stmt.message, traversalOperation, extArg)
+        (lvl, extArg) = Util.traverseExpTopDown(stmt.level, traversalOperation, extArg)
+        newStmt = (cond === stmt.condition && msg === stmt.message && lvl === stmt.level) ?
+                    stmt : BDAE.ASSERT(cond, msg, lvl, stmt.source)
+        newWhenStmtLst = newStmt <| newWhenStmtLst
+      end
       _ => begin
-        throw(string(stmt) * " is not implemented yet!")
+        error(string(stmt) * " is not implemented yet!")
       end
     end
   end
@@ -453,6 +471,18 @@ function getAllVariables(bdaeRenit::BDAE.REINIT, vars::Vector{BDAE.VAR})#::Vecto
 end
 
 """
+  ASSERT_EQUATION participates in the runtime check, not the continuous
+  equation system. Return an empty set for matching/graph-building so
+  the assert is a passive observer. The check is still emitted via the
+  code-generation path. Variables referenced in the condition need not
+  bind new equations here — any real equation that uses the same
+  variables will already pull them into the graph.
+"""
+function getAllVariables(eq::BDAE.ASSERT_EQUATION, vars::Vector{BDAE.VAR})::Vector{DAE.ComponentRef}
+  return DAE.ComponentRef[]
+end
+
+"""
   Returns CREFs from the right-hand side of a when-statement.
   Used for generating local variable bindings in callback affect functions.
   Excludes the target (stateVar/LHS) because the affect body accesses it
@@ -481,7 +511,6 @@ function getAllVariables(eq::BDAE.IF_EQUATION, vars::Vector{BDAE.VAR})
   trueVars = collect(Iterators.flatten(trueVars))
   falseVars = collect(Iterators.flatten(falseVars))
   local res = vcat(condVars, trueVars, falseVars)
-  #=FIXME: Not pretty =#
   res = map(x ->string(x), res)
   return res
 end
@@ -567,11 +596,21 @@ function getDimensionFromComplexType(callTy::DAE.T_COMPLEX)
 end
 
 """
-  Extract the T_COMPLEX type from a DAE expression (typically a CREF).
+  Extract the T_COMPLEX type from a DAE expression.
+  Handles:
+    - CREF with T_COMPLEX identType (the simple record-variable case)
+    - CALL whose CALL_ATTR return type is T_COMPLEX (operator-record functions
+      like `Modelica_SIunits_ComplexMagneticFlux_'+'` appearing as either the
+      LHS or RHS of a COMPLEX_EQUATION)
+    - RECORD constructor literal (the RHS `Complex[REC(0.0, 0.0)]` case —
+      T_COMPLEX is reconstructable from the record path + field list)
+  Returns nothing for other shapes (BINARY / IFEXP / ASUB / T_ARRAY of records).
 """
 function getComplexType(exp::DAE.Exp)
   @match exp begin
     DAE.CREF(_, ty && DAE.T_COMPLEX(__)) => ty
+    DAE.CALL(_, _, DAE.CALL_ATTR(ty = ty && DAE.T_COMPLEX(__))) => ty
+    DAE.RECORD(ty = ty && DAE.T_COMPLEX(__)) => ty
     _ => nothing
   end
 end
@@ -597,10 +636,45 @@ function appendFieldToCref(exp::DAE.Exp, fieldName::String, fieldTy::DAE.Type)::
         expVec[fieldIdx]
       end
     end
-    _ => begin
-      @warn "appendFieldToCref: unexpected expression type, returning as-is"
-      exp
+    #= Push field access into both branches of an if-expression.
+       MSL ComplexMath.conj wrapped in `if cond then c else conj(c)` produces
+       DAE.IFEXP as the LHS of a record equation; decomposition needs to
+       descend into each branch. =#
+    DAE.IFEXP(cond, thenExp, elseExp) => begin
+      DAE.IFEXP(cond,
+                appendFieldToCref(thenExp, fieldName, fieldTy),
+                appendFieldToCref(elseExp, fieldName, fieldTy))
     end
+    #= Inline Modelica.ComplexMath.conj: conj(c).re == c.re, conj(c).im == -c.im.
+       Surfaces on SeriesBode where `conj(u2)` appears in an IFEXP branch. =#
+    DAE.CALL(path, expLst, _) where _isComplexConjCall(path, expLst) => begin
+      local innerArg = listHead(expLst)
+      if fieldName == "re"
+        appendFieldToCref(innerArg, "re", fieldTy)
+      elseif fieldName == "im"
+        local imExp = appendFieldToCref(innerArg, "im", fieldTy)
+        DAE.UNARY(DAE.UMINUS(fieldTy), imExp)
+      else
+        error("appendFieldToCref: unexpected field \"$fieldName\" on conj(); " *
+              "expected \"re\" or \"im\".")
+      end
+    end
+    _ => begin
+      error("appendFieldToCref: unexpected expression type $(typeof(exp)) " *
+            "when appending field \"$fieldName\" of type $(string(fieldTy)). " *
+            "Expression: $(first(string(exp), 200))")
+    end
+  end
+end
+
+#= Pattern match for `Modelica.ComplexMath.conj(arg)` calls. =#
+function _isComplexConjCall(path::Absyn.Path, expLst)::Bool
+  if listEmpty(expLst); return false; end
+  @match path begin
+    Absyn.QUALIFIED("Modelica",
+      Absyn.QUALIFIED("ComplexMath", Absyn.IDENT("conj"))) => true
+    Absyn.IDENT("Modelica_ComplexMath_conj") => true
+    _ => false
   end
 end
 

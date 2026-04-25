@@ -1282,6 +1282,10 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
     end
   end
   isempty(intVarNames) && return
+  #= Integers written inside a when-clause are DISCRETE state, not constant
+     parameters. Collect the set of such names so we skip them during
+     reclassification and keep their defining WHEN_EQUATIONs intact. =#
+  intVarsWrittenInWhen = _collectIntegerLhsInWhen(syst.orderedEqs, intVarNames, intVarBaseNames)
   #= Scan equations: extract constant values and mark for removal.
      An equation is removed if either side references an integer variable.
      For ARRAY_EQUATION/COMPLEX_EQUATION, match against base names too. =#
@@ -1292,9 +1296,13 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
     if eq isa BDAE.EQUATION
       lhsIsInt = eq.lhs isa DAE.CREF && string(eq.lhs.componentRef) in intVarNames
       rhsIsInt = eq.rhs isa DAE.CREF && string(eq.rhs.componentRef) in intVarNames
-      if lhsIsInt || rhsIsInt
+      #= If this integer is actually when-driven discrete state, leave the
+         equation alone (it might be a continuous default / initial value
+         assignment). =#
+      isWhenDriven = (lhsIsInt && string(eq.lhs.componentRef) in intVarsWrittenInWhen) ||
+                     (rhsIsInt && string(eq.rhs.componentRef) in intVarsWrittenInWhen)
+      if (lhsIsInt || rhsIsInt) && !isWhenDriven
         keepEq[i] = false
-        #= Extract constant value when possible =#
         if lhsIsInt && eq.rhs isa DAE.ICONST
           valueMap[string(eq.lhs.componentRef)] = eq.rhs
         elseif rhsIsInt && eq.lhs isa DAE.ICONST
@@ -1304,24 +1312,38 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
     elseif eq isa BDAE.ARRAY_EQUATION
       leftIsInt = eq.left isa DAE.CREF && string(eq.left.componentRef) in allIntNames
       rightIsInt = eq.right isa DAE.CREF && string(eq.right.componentRef) in allIntNames
-      if leftIsInt || rightIsInt
+      isWhenDriven = (leftIsInt && string(eq.left.componentRef) in intVarsWrittenInWhen) ||
+                     (rightIsInt && string(eq.right.componentRef) in intVarsWrittenInWhen)
+      if (leftIsInt || rightIsInt) && !isWhenDriven
         keepEq[i] = false
       end
     elseif eq isa BDAE.COMPLEX_EQUATION
       leftIsInt = eq.left isa DAE.CREF && string(eq.left.componentRef) in allIntNames
       rightIsInt = eq.right isa DAE.CREF && string(eq.right.componentRef) in allIntNames
-      if leftIsInt || rightIsInt
+      isWhenDriven = (leftIsInt && string(eq.left.componentRef) in intVarsWrittenInWhen) ||
+                     (rightIsInt && string(eq.right.componentRef) in intVarsWrittenInWhen)
+      if (leftIsInt || rightIsInt) && !isWhenDriven
         keepEq[i] = false
       end
     end
   end
-  #= Reclassify integer VARIABLEs as PARAMs with extracted or default values =#
+  #= Reclassify integer VARIABLEs as PARAMs with extracted or default values.
+     Skip any integer written inside a when-clause — that variable is
+     discrete state and must stay a VARIABLE so the when-update has
+     somewhere to land. =#
+  nReclassified = 0
   for v in syst.orderedVars
     if v.varKind isa BDAE.VARIABLE && _isIntegerVarType(v.varType)
+      name = string(v.varName)
+      baseName = replace(name, r"\[.*\]$" => "")
+      if name in intVarsWrittenInWhen || baseName in intVarsWrittenInWhen
+        continue
+      end
       v.varKind = BDAE.PARAM()
       if v.varType isa DAE.T_INTEGER
-        v.bindExp = SOME(get(valueMap, string(v.varName), DAE.ICONST(0)))
+        v.bindExp = SOME(get(valueMap, name, DAE.ICONST(0)))
       end
+      nReclassified += 1
     end
   end
   #= Remove equations that defined integer variables =#
@@ -1329,7 +1351,52 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
   if nRemoved > 0
     syst.orderedEqs = syst.orderedEqs[keepEq]
   end
-  @info "[resolveIntegers] Reclassified $(length(intVarNames)) integer variables as parameters, removed $nRemoved equations"
+  local nWhenDiscrete = length(intVarsWrittenInWhen)
+  @info "[resolveIntegers] Reclassified $nReclassified integer variables as parameters, kept $nWhenDiscrete as when-driven discrete, removed $nRemoved equations"
+end
+
+"""
+  Collect the set of Integer variable names (or base names) that appear on
+  the LHS of any ASSIGN statement inside a BDAE.WHEN_EQUATION. These are
+  discrete state variables — resolveIntegers must not reclassify them as
+  parameters or drop their defining when-clauses.
+"""
+function _collectIntegerLhsInWhen(orderedEqs, intVarNames::Set{String},
+                                   intVarBaseNames::Set{String})::Set{String}
+  local allIntNames = union(intVarNames, intVarBaseNames)
+  local result = Set{String}()
+  for eq in orderedEqs
+    if !(eq isa BDAE.WHEN_EQUATION)
+      continue
+    end
+    _collectWhenAssignsLhs!(result, eq.whenEquation, allIntNames)
+  end
+  return result
+end
+
+function _collectWhenAssignsLhs!(result::Set{String}, we,
+                                  allIntNames::Set{String})
+  @match we begin
+    BDAE.WHEN_STMTS(_, stmts, elsewhenPart) => begin
+      for stmt in stmts
+        if stmt isa BDAE.ASSIGN && stmt.left isa DAE.CREF
+          local name = string(stmt.left.componentRef)
+          if name in allIntNames
+            push!(result, name)
+          end
+          local baseName = replace(name, r"\[.*\]$" => "")
+          if baseName in allIntNames
+            push!(result, baseName)
+          end
+        end
+      end
+      @match elsewhenPart begin
+        SOME(inner) => _collectWhenAssignsLhs!(result, inner, allIntNames)
+        _ => nothing
+      end
+    end
+    _ => nothing
+  end
 end
 
   @exportAll()

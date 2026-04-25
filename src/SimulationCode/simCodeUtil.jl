@@ -2357,7 +2357,7 @@ Recursively substitute alias CREFs in a WHEN_STMTS node (condition + statements 
 """
 function _substituteAliasInWhenStmts(whenStmts::BDAE.WHEN_STMTS, aliasMap)
   local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteAliasCref, aliasMap)
-  local newStmtLst = list()
+  local newStmtLst = MetaModelica.list()
   for stmt in whenStmts.whenStmtLst
     local newStmt = @match stmt begin
       BDAE.ASSIGN(__) => begin

@@ -113,6 +113,14 @@ function DAE_identifierToString(daeID::DAE.CREF)
   return DAE_identifierToString(daeID.componentRef)
 end
 
+function DAE_identifierToString(s::String)
+  return s
+end
+
+function DAE_identifierToString(exp)
+  error("DAE_identifierToString: unsupported argument of type $(typeof(exp)) with value $exp. Expected DAE.CREF, DAE.ComponentRef, or String.")
+end
+
 """
   Converts a DAE.ComponentRef to a string representation for use in the SimulationCode during code generation.
   This function handles different cases for arrays, complex types etc.
@@ -371,8 +379,11 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
                                      stringToSimVarHT)::Vector{IF_EQUATION}
   local simCodeIfEquations::Vector{IF_EQUATION} = IF_EQUATION[]
   for i in 1:length(ifEquations)
-    #= Enumerate the branches of the if equation =#
-    local BDAE_ifEquation = ifEquations[i]
+    #= Enumerate the branches of the if equation.
+       Flatten any `else if` chain that the BDAE kept in nested form;
+       otherwise the typed-vector conversion at the ELSE_BRANCH step
+       below would MethodError on the inner IF_EQUATION. =#
+    local BDAE_ifEquation = flattenNestedElseIfChain(ifEquations[i])
     local otherIfEqs::Vector{BDAE.IF_EQUATION} = BDAE.IF_EQUATION[]
     for j in 1:length(ifEquations)
       if i != j
@@ -450,6 +461,44 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
     push!(simCodeIfEquations, ifEq)
   end
   return simCodeIfEquations
+end
+
+"""
+  Flatten a nested `if-else-if` chain expressed as an IF_EQUATION whose
+  `eqnsfalse` is itself an IF_EQUATION. Modelica treats `elseif` and
+  `else if` as equivalent at the source level, but some BDAE construction
+  paths produce the nested form, which `constructSimCodeIFEquations` does
+  not handle (its typed-vector conversion from `List{Equation}` to
+  `Vector{RESIDUAL_EQUATION}` at the ELSE_BRANCH step fails as soon as a
+  nested IF_EQUATION surfaces in `eqnsfalse`).
+
+  Equivalent to rewriting
+
+    if c1 then T1 else (if c2 then T2 else F2 end if) end if
+
+  as
+
+    if c1 then T1 elseif c2 then T2 else F2 end if
+
+  and doing so transitively for any chain length. If `eqnsfalse` contains
+  anything other than a single IF_EQUATION (e.g. residuals mixed with a
+  nested if, or no nested if at all), returns the original equation
+  unchanged so existing behavior is preserved.
+"""
+function flattenNestedElseIfChain(ifEq::BDAE.IF_EQUATION)::BDAE.IF_EQUATION
+  local elseList = ifEq.eqnsfalse
+  if listLength(elseList) != 1
+    return ifEq
+  end
+  local onlyElseEq = listHead(elseList)
+  if !(onlyElseEq isa BDAE.IF_EQUATION)
+    return ifEq
+  end
+  local nested = flattenNestedElseIfChain(onlyElseEq)
+  local mergedConditions = listAppend(ifEq.conditions, nested.conditions)
+  local mergedEqnsTrue = listAppend(ifEq.eqnstrue, nested.eqnstrue)
+  return BDAE.IF_EQUATION(mergedConditions, mergedEqnsTrue, nested.eqnsfalse,
+                          ifEq.source, ifEq.attr)
 end
 
 """
