@@ -161,13 +161,19 @@ non-eliminated SimVars) against the count of residual equations for the
 top-level system. A mismatch means the system is under- or overdetermined
 and MTK's `structural_simplify` will fail or produce a degenerate system.
 
-Skipped for models with structural submodels, because balance is a
-per-submodel property there.
+Skipped when:
+- structural submodels are present (balance is a per-submodel property),
+- any if-equations or when-equations exist (those contribute residuals through
+  `simCode.ifEquations[i].branches[j].residualEquations` and
+  `simCode.whenEquations` rather than `simCode.residualEquations`, so a naive
+  `length(residualEquations)` undercounts and yields false positives).
 """
 function rule_balanced(simCode::SIM_CODE)::Vector{CheckViolation}
   local out = CheckViolation[]
-  if !isempty(simCode.subModels)
-    return out   #= submodel balance is checked per-submodel elsewhere =#
+  if !isempty(simCode.subModels) ||
+     !isempty(simCode.ifEquations) ||
+     !isempty(simCode.whenEquations)
+    return out
   end
   local nUnknown = _countUnknowns(simCode)
   local nEq = length(simCode.residualEquations)
@@ -257,15 +263,24 @@ push!(RULES, rule_eliminated_vars_pruned)
 
 """
 `rule_dead_states`: every SimVar whose kind is STATE must be referenced
-inside at least one `der(...)` call in some residual equation, initial
-equation, or when-equation. If not, the state is dead and MTK will
-either eliminate it silently or produce an overdetermined system.
+inside at least one `der(...)` call in some residual / initial / if-branch /
+when-equation. If not, the state is dead and MTK will either eliminate it
+silently or produce an overdetermined system.
+
+A state name matches a der-cref if either the literal printed cref equals
+the state name, or the state's base (subscripts stripped) equals the
+der-cref's base. The base-name fallback covers array-element states like
+`boxBody1_v_0[1]` whose derivative appears as `der(boxBody1_v_0)[1]` and so
+shows up as `boxBody1_v_0` (no subscript) in the der-cref set.
 """
 function rule_dead_states(simCode::SIM_CODE)::Vector{CheckViolation}
   local out = CheckViolation[]
   local derCrefs = _collectDerCrefs(simCode)
+  local derBases = Set(_baseName(n) for n in derCrefs)
   for (_, (_, v)) in simCode.stringToSimVarHT
-    if v.varKind isa STATE && !(v.name in derCrefs)
+    if v.varKind isa STATE &&
+       !(v.name in derCrefs) &&
+       !(_baseName(v.name) in derBases)
       push!(out, CheckViolation(:dead_state, :warn, v.name,
                                 "STATE variable has no der() reference"))
     end
@@ -273,6 +288,9 @@ function rule_dead_states(simCode::SIM_CODE)::Vector{CheckViolation}
   return out
 end
 push!(RULES, rule_dead_states)
+
+#= Strip array subscripts from a printed cref name, e.g. `a[1][2]` -> `a`. =#
+_baseName(name::AbstractString) = String(first(split(name, '['; limit = 2)))
 
 function _collectDerCrefs(simCode::SIM_CODE)::Set{String}
   local names = Set{String}()
@@ -284,28 +302,64 @@ function _collectDerCrefs(simCode::SIM_CODE)::Set{String}
       _collectDerFromExp!(names, eq.exp)
     end
   end
+  #= Eliminated equations: a state's derivative may appear here if alias
+     elimination consumed the equation that referenced it, e.g.
+     `flange.w = der(flange.phi)` where `flange.w` was aliased out. =#
+  for eq in simCode.eliminatedEquations
+    if hasproperty(eq, :exp)
+      _collectDerFromExp!(names, eq.exp)
+    end
+  end
+  for ifEq in simCode.ifEquations
+    for branch in ifEq.branches
+      _collectDerFromExp!(names, branch.condition)
+      for eq in branch.residualEquations
+        _collectDerFromExp!(names, eq.exp)
+      end
+    end
+  end
+  for whenEq in simCode.whenEquations
+    _collectDerFromWhenEquation!(names, whenEq)
+  end
   return names
+end
+
+function _collectDerFromWhenEquation!(names::Set{String}, whenEq)
+  if hasproperty(whenEq, :condition)
+    _collectDerFromExp!(names, whenEq.condition)
+  end
+  if hasproperty(whenEq, :whenStmtLst)
+    for stmt in whenEq.whenStmtLst
+      for fld in (:left, :right, :exp, :stateVar, :value, :message, :condition, :level)
+        if hasproperty(stmt, fld)
+          _collectDerFromExp!(names, getproperty(stmt, fld))
+        end
+      end
+    end
+  end
 end
 
 function _collectDerFromExp!(names::Set{String}, exp)
   @match exp begin
-    DAE.CALL(Absyn.IDENT("der"), expLst, _) => begin
-      local nm = _derArgName(listHead(expLst))
-      if nm !== nothing
-        push!(names, nm)
-      end
-    end
+    DAE.CALL(Absyn.IDENT("der"), expLst, _) => _pushDerArgNames!(names, listHead(expLst))
     _ => nothing
   end
   _walkExpChildren(child -> _collectDerFromExp!(names, child), exp)
   return names
 end
 
-function _derArgName(arg)::Union{String, Nothing}
+#= Extract the canonical name(s) referenced by a `der(...)` argument and
+   record them. Handles a bare CREF as well as `der(arr)` where `arr` is a
+   DAE.ARRAY of element CREFs (the MultiBody quaternion / linear-velocity
+   pattern documented in CLAUDE.md, e.g. `der(boxBody.v_0)`). =#
+function _pushDerArgNames!(names::Set{String}, arg)
   @match arg begin
-    DAE.CREF(cref, _) => DAE_identifierToString(cref)   #= canonical flattened name used by stringToSimVarHT =#
+    DAE.CREF(cref, _) => push!(names, DAE_identifierToString(cref))
+    DAE.ARRAY(_, _, es) => for e in es; _pushDerArgNames!(names, e) end
+    DAE.CAST(_, e) => _pushDerArgNames!(names, e)
     _ => nothing
   end
+  return names
 end
 
 #= ── Rule: cref resolution ────────────────────────────────────────── =#

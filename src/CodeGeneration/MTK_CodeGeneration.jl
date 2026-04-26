@@ -57,7 +57,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
   local MODEL_NAME = replace(simCode.name, "." => "__")
   #= Generate code for algorithmic Modelica =#
   (functions, functionNames) = AlgorithmicCodeGeneration.generateFunctions(simCode.functions)
-  if isempty(simCode.structuralTransitions) && length(simCode.subModels) < 1 && isnothing(simCode.flatModel)
+  if !SimulationCode.hasStructuralTransitions(simCode) && !SimulationCode.hasSubModels(simCode) && !SimulationCode.hasFlatModel(simCode)
     #= Generate using the standard name =#
     return ODE_MODE_MTK_PROGRAM_GENERATION(simCode, simCode.name, functions)
   end
@@ -228,7 +228,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     Base.Experimental.@compiler_options optimize=0 compile=min
     #= Add import to the external runtime if the generated code calls Modelica Functions =#
     $(if simCode.externalRuntime
-        generateExternalRuntimeImport(simCode)
+        generateExternalRuntimeImport()
       end)
     $(functions...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
@@ -385,9 +385,9 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     end
   end
   local performIndexReduction = simCode.isSingular
-  local skipInitializeProb = !isempty(simCode.structuralTransitions) ||
-                             !isnothing(simCode.metaModel) ||
-                             !isnothing(simCode.flatModel)
+  local skipInitializeProb = SimulationCode.hasStructuralTransitions(simCode) ||
+                             SimulationCode.hasMetaModel(simCode) ||
+                             SimulationCode.hasFlatModel(simCode)
   #= Solve parametric initial equations (initial equations that only involve parameters).
      This determines values for fixed=false parameters before code generation. =#
   solveParametricInitialEquations!(simCode)
@@ -1368,7 +1368,7 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
     local simVarType::SimulationCode.SimVarType = simVar.varKind
     bindExp = @match simVarType begin
       SimulationCode.DATA_STRUCTURE(bindExp = SOME(exp)) => exp
-      _ => ErrorException("Data structure variable not assigned.")
+      _ => throw(ErrorException("createDataStructureAssignments: data structure variable $(ds) has no bound expression (got $(simVarType))."))
     end
     expr = quote
       $(LineNumberNode(@__LINE__, "$ds eq"))
@@ -1393,7 +1393,7 @@ function createParameterArray(parameters::Vector{T1}, parameterAssignments::Vect
     local simVarType::SimulationCode.SimVarType = simVar.varKind
     bindExp = @match simVarType begin
       SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
-      _ => ErrorException("Unknown SimulationCode.SimVarType for parameter.")
+      _ => throw(ErrorException("createParameterArray: parameter $(param) has no bound expression (got $(simVarType))."))
     end
     #= Evaluate the parameters. If it is a variable, and can't be evaluated look it up in the parameter dictonary. =#
     local parValue
@@ -1982,7 +1982,7 @@ end
 """
   Optionally generate an import statement to OMRuntimeExternalC
 """
-function generateExternalRuntimeImport(simCode)::Expr
+function generateExternalRuntimeImport()::Expr
   :(import OMRuntimeExternalC)
 end
 
@@ -2043,7 +2043,7 @@ function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.S
                 end
               end)
       end
-      _ => ErrorException("$whenStatements in @__FUNCTION__ not supported")
+      _ => throw(ErrorException("createWhenStatementsMTK: unsupported when-statement variant $(wStmt)"))
     end
   end
   return res

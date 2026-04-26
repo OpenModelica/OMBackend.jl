@@ -42,5 +42,13 @@ Add the algorithms from the external file.
 """
 module DifferentialEquationCodeGenerator
 
+#=
+  TODO STUB. Unimplemented.
+
+  This module is intentionally empty. It is NOT included from
+  CodeGeneration.jl. Future work: implement the low-level direct code
+  generator described in the docstring above, then wire it into the
+  include list in CodeGeneration.jl.
+=#
 
 end

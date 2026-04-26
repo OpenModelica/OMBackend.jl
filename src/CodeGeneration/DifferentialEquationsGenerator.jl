@@ -16,5 +16,15 @@ Integrate the external code generator
 """
 module SystemsExporter
 
+#=
+  TODO STUB. Unimplemented.
+
+  This module is intentionally empty. It is NOT included from
+  CodeGeneration.jl. Note also that the filename
+  (DifferentialEquationsGenerator.jl) does not match the module name
+  (SystemsExporter); pick one before wiring this in. Future work:
+  implement the low-level DifferentialEquations.jl exporter described
+  in the docstring above.
+=#
 
 end

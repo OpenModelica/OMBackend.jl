@@ -1,6 +1,14 @@
 #=
   This file contains various utility functions related to simulation code.
 =#
+
+#= SIM_CODE-level structural-variation axes. Different lowering passes guard
+   on different combinations; do not collapse into one predicate. =#
+hasStructuralTransitions(simCode)::Bool = !isempty(simCode.structuralTransitions)
+hasSubModels(simCode)::Bool = !isempty(simCode.subModels)
+hasFlatModel(simCode)::Bool = !isnothing(simCode.flatModel)
+hasMetaModel(simCode)::Bool = !isnothing(simCode.metaModel)
+
 """
   Returns true if simvar is either a algebraic or a state variable.
 """
@@ -1098,7 +1106,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   #= Guard: skip for VSS/multi-mode models (subModels or recompilation-based
      metaModel/flatModel), but allow DOCC models (structuralTransitions only)
      since they re-flatten at runtime =#
-  if !isempty(simCode.subModels) || !isnothing(simCode.metaModel) || !isnothing(simCode.flatModel)
+  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
     @info "eliminateNonDynamic: skipping for VSS/multi-mode model"
     return simCode
   end
@@ -1451,7 +1459,7 @@ earlier matching flagged the system as singular (index reduction has
 priority over folding there).
 """
 function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
-  if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
+  if hasStructuralTransitions(simCode) || hasSubModels(simCode)
     return simCode
   end
   if isempty(simCode.residualEquations)
@@ -1783,7 +1791,7 @@ unknowns (no balance impact).
 """
 function propagateConstants(simCode::SIM_CODE)
   #= Guard: skip for VSS or multi-mode models =#
-  if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
+  if hasStructuralTransitions(simCode) || hasSubModels(simCode)
     return simCode
   end
 
@@ -2036,7 +2044,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   #= Guard: skip for VSS/multi-mode models (subModels or recompilation-based
      metaModel/flatModel), but allow DOCC models (structuralTransitions only)
      since they re-flatten at runtime =#
-  if !isempty(simCode.subModels) || !isnothing(simCode.metaModel) || !isnothing(simCode.flatModel)
+  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
     @info "aliasElimination: skipped (VSS/multi-mode model)"
     return simCode
   end

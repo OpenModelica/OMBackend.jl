@@ -48,7 +48,12 @@ const ELEM_FUNC_CACHE = Dict{Tuple{Symbol, Tuple, Int}, Any}()
 const TUPLE_ELEM_FUNC_CACHE = Dict{Tuple, Any}()
 
 #= Stores the count of array-shaped subtrees found in the last structural_simplify call.
-   Used by tests to assert the shape invariant (0 = clean for Pantelides). =#
+   Used by tests to assert the shape invariant (0 = clean for Pantelides).
+   Contract: only updated when ENABLE_BACKEND_LOGGING is true at module load.
+   When logging is off, this Ref stays at its sentinel -1 because the
+   diagnostic walk that writes it is gated behind @BACKEND_LOGGING. Tests
+   that read this value must guard with `!OMBackend.ENABLE_BACKEND_LOGGING`
+   to skip the assertion in production runs. =#
 const _LAST_ARRAY_SHAPE_COUNT = Ref{Int}(-1)
 
 """
@@ -1245,48 +1250,54 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
      with the flat format. The non-DirectRHS path (VSS, standard ODEProblem)
      needs split=true for SCCNonlinearProblem initialization to work.
      The split value is embedded at codegen time by performStructuralSimplify. =#
-  #= Diagnostic: scan for array-shaped subtrees before structural_simplify =#
-  let
-    function _find_array_shapes(expr, path, results; depth=0)
-      depth > 50 && return  # guard against infinite recursion
-      if expr isa SymbolicUtils.BasicSymbolic
-        local sh = try; Symbolics.shape(expr); catch; nothing; end
-        if sh !== nothing && sh !== () && SymbolicUtils.is_array_shape(sh)
-          push!(results, (path, sh, expr))
-          return  # do not recurse further into this subtree
-        end
-        if SymbolicUtils.iscall(expr)
-          local args = SymbolicUtils.arguments(expr)
-          for (j, a) in enumerate(args)
-            _find_array_shapes(a, "$path.args[$j]", results; depth=depth+1)
+  #= Diagnostic: scan for array-shaped subtrees before structural_simplify.
+     Gated behind @BACKEND_LOGGING (compile-time) so production runs pay
+     nothing. _LAST_ARRAY_SHAPE_COUNT[] stays at its sentinel -1 in that
+     case; tests that need the invariant must run with ENABLE_BACKEND_LOGGING
+     set, and the assertion in mslTests.jl handles the off case. =#
+  @BACKEND_LOGGING begin
+    let
+      function _find_array_shapes(expr, path, results; depth=0)
+        depth > 50 && return  # guard against infinite recursion
+        if expr isa SymbolicUtils.BasicSymbolic
+          local sh = try; Symbolics.shape(expr); catch; nothing; end
+          if sh !== nothing && sh !== () && SymbolicUtils.is_array_shape(sh)
+            push!(results, (path, sh, expr))
+            return  # do not recurse further into this subtree
           end
+          if SymbolicUtils.iscall(expr)
+            local args = SymbolicUtils.arguments(expr)
+            for (j, a) in enumerate(args)
+              _find_array_shapes(a, "$path.args[$j]", results; depth=depth+1)
+            end
+          end
+        elseif expr isa AbstractArray
+          push!(results, (path, :raw_array, expr))
         end
-      elseif expr isa AbstractArray
-        push!(results, (path, :raw_array, expr))
       end
-    end
-    local allResults = []
-    for (i, eq) in enumerate(equations(sys))
-      local lhsR = Pair{String,Any}[]
-      local rhsR = Pair{String,Any}[]
-      _find_array_shapes(Symbolics.unwrap(eq.lhs), "eq[$i].lhs", lhsR)
-      _find_array_shapes(Symbolics.unwrap(eq.rhs), "eq[$i].rhs", rhsR)
-      for (p, sh, node) in lhsR
-        push!(allResults, (i, p, sh, node))
+      local allResults = []
+      for (i, eq) in enumerate(equations(sys))
+        local lhsR = Pair{String,Any}[]
+        local rhsR = Pair{String,Any}[]
+        _find_array_shapes(Symbolics.unwrap(eq.lhs), "eq[$i].lhs", lhsR)
+        _find_array_shapes(Symbolics.unwrap(eq.rhs), "eq[$i].rhs", rhsR)
+        for (p, sh, node) in lhsR
+          push!(allResults, (i, p, sh, node))
+        end
+        for (p, sh, node) in rhsR
+          push!(allResults, (i, p, sh, node))
+        end
       end
-      for (p, sh, node) in rhsR
-        push!(allResults, (i, p, sh, node))
+      _LAST_ARRAY_SHAPE_COUNT[] = length(allResults)
+      if !isempty(allResults)
+        @warn "Found $(length(allResults)) array-shaped subtree(s) in equations before structural_simplify"
+        for (idx, p, sh, node) in allResults[1:min(10, length(allResults))]
+          nodeStr = try; string(node)[1:min(200, length(string(node)))]; catch e; "$(typeof(node))"; end
+          @warn "  eq $idx at $p: shape=$sh node=$nodeStr"
+        end
+      else
+        @info "No array-shaped subtrees found in equations (clean for Pantelides)"
       end
-    end
-    _LAST_ARRAY_SHAPE_COUNT[] = length(allResults)
-    if !isempty(allResults)
-      @warn "Found $(length(allResults)) array-shaped subtree(s) in equations before structural_simplify"
-      for (idx, p, sh, node) in allResults[1:min(10, length(allResults))]
-        nodeStr = try; string(node)[1:min(200, length(string(node)))]; catch e; "$(typeof(node))"; end
-        @warn "  eq $idx at $p: shape=$sh node=$nodeStr"
-      end
-    else
-      @info "No array-shaped subtrees found in equations (clean for Pantelides)"
     end
   end
 

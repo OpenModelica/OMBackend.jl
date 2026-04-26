@@ -184,7 +184,7 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
                    warnMissingStartValues = nothing,
                    eliminateNonDynamic::Union{Nothing, Bool, SimulationCode.EliminationOptions} = nothing,
                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                   checkSimCode::Bool = false)::Tuple{String, Expr}
+                   checkSimCode::Bool = true)::Tuple{String, Expr}
   local previousWarnSetting = WARN_MISSING_START_VALUES[]
   local runId = createLogRunId(logRunModelName(frontendDAE))
   if warnMissingStartValues !== nothing
