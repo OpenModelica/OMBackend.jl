@@ -1,7 +1,7 @@
 #=
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -905,8 +905,11 @@ function recompilation(activeModeName,
   return OMBackend.withLogRunDir(runId) do
     @VSS_DEBUG @info "[recompilation DOCC] ENTER" activeModeName
     local _t_start = time()
-    #= Fetch the model that we were generating from memory. =#
-    local flatModel = OMBackend.CodeGeneration.FLAT_MODEL
+    #= Fetch the flat model from the struct field (embedded at codegen time
+       in structuralCallbacks.jl). Earlier this read a module-scope global
+       OMBackend.CodeGeneration.FLAT_MODEL that was overwritten on every
+       translation, corrupting earlier callbacks. =#
+    local flatModel = structuralCallback.flatModel
     local unresolvedConnectEquations = flatModel.unresolvedConnectEquations
     #= Get the relevant equation =#
     local indexOfEquation = structuralCallback.index
@@ -977,7 +980,7 @@ function returnRootIndices(activeModeName,
                 integrator_u,
                 tspan,
                 callbackConditions)
-  local flatModel = OMBackend.CodeGeneration.FLAT_MODEL
+  local flatModel = structuralCallback.flatModel
   (variablestoReset, rootSources) = RuntimeUtil.resolveDOOCConnections(flatModel, flatModel.name)
   local rootVariables = keys(variablestoReset)
   local ht = structuralCallback.stringToSimVarHT

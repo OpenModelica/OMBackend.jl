@@ -1,7 +1,7 @@
 #=
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linkoepings universitet, Department of Computer and Information Science,
 * SE-58183 Linkoeping, Sweden.
 *
@@ -395,6 +395,63 @@ end
 
 
 """
+    _evalSymbolicFunctionCall(expr, nameToNumeric)
+
+Try to numerically evaluate a Symbolics call expression (e.g. a registered
+Modelica function applied to parameter symbols) by walking down to leaf
+arguments, substituting each leaf with its known numeric value from
+`nameToNumeric`, and invoking the Julia function held by
+`SymbolicUtils.operation(expr)` via `Base.invokelatest`.
+
+Returns `Float64` on success or `nothing` if any leaf is unresolved or
+the evaluation throws. The recursive design lets the resolver handle
+nested calls like `arrayCtor(scaleFun(p1), p2)` without needing the
+symbol-name lookup to find each function.
+
+Tuple-returning Modelica functions show up as registered scalar wrappers
+that return a `Tuple`; in that case we cannot map a single Float64 back,
+so callers must treat `nothing` here as "not resolvable through this
+path" and fall back to the next strategy.
+"""
+function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
+  if expr isa Number
+    return Float64(expr)
+  end
+  if expr isa Symbolics.Num
+    expr = Symbolics.unwrap(expr)
+  end
+  if !(expr isa SymbolicUtils.BasicSymbolic)
+    return nothing
+  end
+  if SymbolicUtils.iscall(expr)
+    local f = SymbolicUtils.operation(expr)
+    local rawArgs = SymbolicUtils.arguments(expr)
+    local numArgs = Vector{Float64}(undef, length(rawArgs))
+    for (i, a) in enumerate(rawArgs)
+      local av = _evalSymbolicFunctionCall(a, nameToNumeric)
+      av === nothing && return nothing
+      numArgs[i] = av
+    end
+    local result = try
+      Base.invokelatest(f, numArgs...)
+    catch
+      return nothing
+    end
+    if result isa Number
+      return Float64(result)
+    end
+    return nothing
+  end
+  #= Leaf symbolic: look up by string name in the resolved-numerics dict. =#
+  local nm = string(expr)
+  if haskey(nameToNumeric, nm)
+    return nameToNumeric[nm]
+  end
+  return nothing
+end
+
+
+"""
     _resolveParamValues(pars)
 
 Resolve parameter values by iteratively substituting known numeric values
@@ -498,16 +555,36 @@ function _resolveParamValues(pars)
             newlyResolved += 1
             continue
           end
+          # Pre-evaluate Modelica function calls whose args are all numeric.
+          # The symbolic operation reference (`SymbolicUtils.operation`)
+          # holds the registered Julia function, so we can invoke it
+          # directly without resolving the function name through a fresh
+          # Module's namespace. `invokelatest` covers the case where the
+          # function was registered after this call site was compiled.
+          local fnVal = try
+            _evalSymbolicFunctionCall(unwrapped2, nameToNumeric)
+          catch
+            nothing
+          end
+          if fnVal !== nothing && isfinite(fnVal)
+            numericByStr[kStr] = fnVal
+            nameToNumeric[kStr] = fnVal
+            subDict[uk] = fnVal
+            newlyResolved += 1
+            continue
+          end
         end
-        # Final fallback: evaluate expression string with known numeric bindings
+        # Final fallback: evaluate expression string with known numeric bindings.
+        # `invokelatest` lets us call freshly-registered functions defined in
+        # later world ages without tripping `MethodError ... in world age`.
         local evalResult = try
           local evalExpr = Meta.parse(string(uv))
           local evalModule = Module()
           for (n, v) in nameToNumeric
             local sym = Symbol(n)
-            Core.eval(evalModule, :($sym = $v))
+            Base.invokelatest(Core.eval, evalModule, :($sym = $v))
           end
-          Float64(Core.eval(evalModule, evalExpr))
+          Float64(Base.invokelatest(Core.eval, evalModule, evalExpr))
         catch
           nothing
         end

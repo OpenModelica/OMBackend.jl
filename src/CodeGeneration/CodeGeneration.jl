@@ -1,7 +1,7 @@
 #=
 # This file is part of OpenModelica.
 #
-# Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+# Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 # c/o Linköpings universitet, Department of Computer and Information Science,
 # SE-58183 Linköping, Sweden.
 #
@@ -72,7 +72,10 @@ include("./structuralCallbacks.jl")
 include("./DirectRHSGeneration.jl")
 include("./MTK_CodeGeneration.jl")
 
-#= Pure DifferentialEquations.jl code generation =#
+#= Pure DifferentialEquations.jl code generation (legacy/donor) =#
 include("./codeGen.jl")
+
+#= Direct DifferentialEquations.jl code generation (DEMode, fresh emitter) =#
+include("./DECodeGeneration.jl")
 
 end #= End CodeGeneration=#

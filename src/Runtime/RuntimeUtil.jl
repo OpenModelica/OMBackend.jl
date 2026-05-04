@@ -624,7 +624,10 @@ function updateInitialConditions!(simCode, integrator)
     local indexInNewSys = indices[i]
     if indexInNewSys !== nothing
       (idx, vToChange) = simCode_LT.vals[indexInNewSys]
-      vToChange = @assign vToChange.attributes = SOME(DAE.makeRealAttribute(;start=LT[name], fixed=true))
+      # `start` kwarg of `DAE.makeRealAttribute` is typed `Option{Float64}`
+      # (= `Union{Nothing, SOME{Float64}}`), not raw `Float64`. Without the
+      # SOME wrapper, the call fails with `TypeError: in keyword argument start, ...`.
+      vToChange = @assign vToChange.attributes = SOME(DAE.makeRealAttribute(;start=SOME(LT[name]), fixed=true))
       simCode_LT.vals[indexInNewSys] = (idx, vToChange)
     end
   end

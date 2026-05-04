@@ -1370,6 +1370,18 @@ function isRealValued(@nospecialize(ty))::Bool
   end
 end
 
+#= Same-class check for alias eligibility: Real, Boolean, Integer, Enumeration. =#
+function _aliasTypeClass(@nospecialize(ty))::Symbol
+  @match ty begin
+    DAE.T_REAL(__) => :real
+    DAE.T_BOOL(__) => :bool
+    DAE.T_INTEGER(__) => :int
+    DAE.T_ENUMERATION(__) => :enum
+    DAE.T_ARRAY(ty = innerTy) => _aliasTypeClass(innerTy)
+    _ => :other
+  end
+end
+
 """
     detectConstantEquation(exp::DAE.Exp, ht)
 
@@ -1773,6 +1785,59 @@ function isParameterClosureExp(@nospecialize(exp), ht, foldedNames::Set{String},
     end
   end
   return true
+end
+
+"""
+    inlinePreOfConstantParameters(simCode::SIM_CODE)::SIM_CODE
+
+Replace `pre(x)` with `x` inside residual equations whenever `x` is a
+constant-bound PARAMETER. For a parameter the value at the previous event
+is the same as the value now, so this fold is exact and lets downstream
+`propagateConstants` resolve the residual naturally.
+"""
+function inlinePreOfConstantParameters(simCode::SIM_CODE)::SIM_CODE
+  if hasStructuralTransitions(simCode) || hasSubModels(simCode)
+    return simCode
+  end
+  local ht = simCode.stringToSimVarHT
+  local resEqs = simCode.residualEquations
+  local nReplaced = Ref(0)
+
+  local _isPreCall = function(e)
+    e isa DAE.CALL || return false
+    length(e.expLst) == 1 || return false
+    e.path isa Absyn.IDENT || return false
+    e.path.name in ("pre", "previous")
+  end
+
+  local _argIsConstParam = function(e)
+    local arg = listHead(e.expLst)
+    arg isa DAE.CREF || return false
+    local name = string(arg.componentRef)
+    haskey(ht, name) || return false
+    local (_, sv) = ht[name]
+    sv.varKind isa PARAMETER || return false
+    return true
+  end
+
+  local _rewrite = function(exp, _)
+    if _isPreCall(exp) && _argIsConstParam(exp)
+      nReplaced[] += 1
+      return (listHead(exp.expLst), false, nothing)
+    end
+    return (exp, true, nothing)
+  end
+
+  local newEqs = BDAE.RESIDUAL_EQUATION[]
+  for eq in resEqs
+    local (newExp, _) = Util.traverseExpTopDown(eq.exp, _rewrite, nothing)
+    push!(newEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+  end
+  if nReplaced[] > 0
+    @info "[inlinePreOfConstantParameters] replaced $(nReplaced[]) `pre(constParam)` occurrences with the parameter directly"
+  end
+  @assign simCode.residualEquations = newEqs
+  return simCode
 end
 
 """
@@ -2474,10 +2539,14 @@ function detectAlias(@nospecialize(exp), ht)
       if !haskey(ht, n1) || !haskey(ht, n2)
         return nothing
       end
-      #= Both must be Real-valued =#
+      #= Both must be of an alias-eligible type, and matching class
+         (Real-Real, Bool-Bool, Int-Int, Enum-Enum). Cross-class mixing
+         is rejected. =#
       local (_, sv1) = ht[n1]
       local (_, sv2) = ht[n2]
-      if !isRealValued(t1) && !isRealValued(t2)
+      local cls1 = _aliasTypeClass(t1)
+      local cls2 = _aliasTypeClass(t2)
+      if cls1 === :other || cls2 === :other || cls1 !== cls2
         return nothing
       end
       #= Both must be unknowns (not parameters, strings, or data structures).

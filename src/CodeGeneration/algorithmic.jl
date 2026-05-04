@@ -238,16 +238,14 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
       SimulationCode.EXTERNAL_MODELICA_FUNCTION(__) => begin
         local extCall = Meta.parse(func.libInfo)
         extCall = namespaceifyExternalFunction(extCall)
-        local returnExpr = if length(outputs) > 1
-          Expr(:tuple, outputs...)
-        elseif length(outputs) == 1
-          outputs[1]
-        else
-          nothing
-        end
+        #= Allocate ccall-mutable buffers for every output, convert array inputs
+           to the right C element type, then dereference Refs in the return. =#
+        local extInputConversions = generateExternalInputConversions(func.inputs)
+        local extOutputAllocs = generateExternalOutputAllocations(func.outputs)
+        local returnExpr = generateExternalReturnExpr(func.outputs)
 
         #= Build the anonymous function expression manually =#
-        local funcBody = Expr(:block, extCall, returnExpr)
+        local funcBody = Expr(:block, extInputConversions..., extOutputAllocs..., extCall, returnExpr)
         local anonFunc = if nArgs == 0
           Expr(:->, Expr(:tuple), funcBody)
         elseif inputsJL isa Tuple
@@ -366,16 +364,157 @@ function generateOutputDefaults(outputs::Vector)::Vector{Expr}
   local decls = Expr[]
   for v in outputs
     local s = DAE_VAR_ToJulia(v)
-    local defaultVal = @match v.ty begin
-      DAE.T_REAL(__) => 0.0
-      DAE.T_INTEGER(__) => 0
-      DAE.T_BOOL(__) => false
-      DAE.T_STRING(__) => ""
-      _ => 0
+    local defaultVal = if _funcParamIsArray(v)
+      local jlElemDefault = @match _funcParamElemType(v) begin
+        DAE.T_REAL(__) => :Float64
+        DAE.T_INTEGER(__) => :Int
+        DAE.T_BOOL(__) => :Bool
+        _ => :Float64
+      end
+      local dimVals = map(_daeDimToInt, collect(_funcParamDims(v)))
+      if !isempty(dimVals) && all(>(0), dimVals)
+        :(zeros($(jlElemDefault), $(dimVals...)))
+      else
+        :($(jlElemDefault)[])
+      end
+    else
+      @match v.ty begin
+        DAE.T_REAL(__) => 0.0
+        DAE.T_INTEGER(__) => 0
+        DAE.T_BOOL(__) => false
+        DAE.T_STRING(__) => ""
+        _ => 0
+      end
     end
     push!(decls, :(local $s = $defaultVal))
   end
   return decls
+end
+
+#=
+EXTERNAL_MODELICA_FUNCTION codegen helpers.
+
+The MODELICA_FUNCTION arm uses Julia-level rebinding via assignment, so a
+default like `local result = 0.0` works because the body's `result := expr`
+overwrites it. EXTERNAL functions cannot rebind from C — the C function
+mutates a buffer reachable through a pointer. The Julia ccall ABI requires:
+
+- A Modelica scalar `Real` output  → ccall arg type `Ref{Cdouble}` → allocate
+  `Ref{Cdouble}(0.0)` on the Julia side, dereference with `[]` for the return.
+- A Modelica scalar `Integer`/`Boolean` output → `Ref{Cint}` (Modelica Int
+  maps to C `int` not Int64) → dereference with `[]` for the return.
+- A Modelica array `Real[N]` → `Vector{Cdouble}` of length N → return as-is.
+- A Modelica array `Integer[N]` → `Vector{Cint}` of length N → return as-is.
+
+Inputs that are arrays of `Integer` need conversion to `Vector{Cint}` before
+the ccall, since the caller may legitimately pass `Vector{Int64}` and Julia's
+ccall will not silently widen the pointer cast.
+=#
+
+_daeDimToInt(d) = @match d begin
+  DAE.DIM_INTEGER(int) => int
+  _ => 0
+end
+
+function _ccallElemType(elemTy)
+  @match elemTy begin
+    DAE.T_REAL(__) => :Cdouble
+    DAE.T_INTEGER(__) => :Cint
+    DAE.T_BOOL(__) => :Cint
+    _ => :Float64
+  end
+end
+
+#= DAE.VAR encodes function-parameter array shape as (ty=elementType, dims=List).
+   Top-level array vars use DAE.T_ARRAY(ty=elementType, dims=List). Treat both
+   as arrays. =#
+function _funcParamIsArray(v::DAE.VAR)::Bool
+  @match v.ty begin
+    DAE.T_ARRAY(__) => true
+    _ => begin
+      local n = 0
+      for _ in v.dims
+        n += 1
+      end
+      n > 0
+    end
+  end
+end
+
+function _funcParamElemType(v::DAE.VAR)
+  @match v.ty begin
+    DAE.T_ARRAY(ty = e) => e
+    _ => v.ty
+  end
+end
+
+function _funcParamDims(v::DAE.VAR)
+  @match v.ty begin
+    DAE.T_ARRAY(dims = d) => d
+    _ => v.dims
+  end
+end
+
+function generateExternalOutputAllocations(outputs::Vector)::Vector{Expr}
+  local decls = Expr[]
+  for v in outputs
+    local s = DAE_VAR_ToJulia(v)
+    local alloc = if _funcParamIsArray(v)
+      local jlElemType = _ccallElemType(_funcParamElemType(v))
+      local dimVals = map(_daeDimToInt, collect(_funcParamDims(v)))
+      if !isempty(dimVals) && all(>(0), dimVals)
+        :(zeros($(jlElemType), $(dimVals...)))
+      else
+        :($(jlElemType)[])
+      end
+    else
+      @match v.ty begin
+        DAE.T_REAL(__) => :(Ref{Cdouble}(0.0))
+        DAE.T_INTEGER(__) => :(Ref{Cint}(Cint(0)))
+        DAE.T_BOOL(__) => :(Ref{Cint}(Cint(0)))
+        DAE.T_STRING(__) => ""
+        _ => 0
+      end
+    end
+    push!(decls, :(local $s = $alloc))
+  end
+  return decls
+end
+
+function generateExternalInputConversions(inputs::Vector)::Vector{Expr}
+  local conversions = Expr[]
+  for v in inputs
+    local s = DAE_VAR_ToJulia(v)
+    if _funcParamIsArray(v)
+      local jlElemType = _ccallElemType(_funcParamElemType(v))
+      local nDims = length(collect(_funcParamDims(v)))
+      local containerTy = nDims >= 2 ? :(Matrix{$jlElemType}) : :(Vector{$jlElemType})
+      push!(conversions, :($s = convert($containerTy, $s)))
+    end
+  end
+  return conversions
+end
+
+function generateExternalReturnExpr(outputs::Vector)
+  if isempty(outputs)
+    return nothing
+  end
+  local accessors = Any[]
+  for v in outputs
+    local s = DAE_VAR_ToJulia(v)
+    local accessor = if _funcParamIsArray(v)
+      :($s)
+    else
+      @match v.ty begin
+        DAE.T_REAL(__) => :($s[])
+        DAE.T_INTEGER(__) => :(Int($s[]))
+        DAE.T_BOOL(__) => :($s[] != 0)
+        _ => :($s)
+      end
+    end
+    push!(accessors, accessor)
+  end
+  return length(accessors) == 1 ? accessors[1] : Expr(:tuple, accessors...)
 end
 
 function generateStatements(statements::Union{List{DAE.Statement}, Vector{DAE.Statement}})
@@ -773,15 +912,16 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
           arrExpr
         end
       end
-      DAE.RANGE(ty, startExp, stepExp, stopExp) => begin
+      DAE.RANGE(_, startExp, NONE(), stopExp) => begin
         local startExpr = expToJuliaExpAlg(startExp)
         local stopExpr = expToJuliaExpAlg(stopExp)
-        if stepExp === nothing
-          :($startExpr:$stopExpr)
-        else
-          local stepExpr = expToJuliaExpAlg(stepExp)
-          :($startExpr:$stepExpr:$stopExpr)
-        end
+        :($startExpr:$stopExpr)
+      end
+      DAE.RANGE(_, startExp, SOME(stepExp), stopExp) => begin
+        local startExpr = expToJuliaExpAlg(startExp)
+        local stepExpr = expToJuliaExpAlg(stepExp)
+        local stopExpr = expToJuliaExpAlg(stopExp)
+        :($startExpr:$stepExpr:$stopExpr)
       end
       DAE.SIZE(arrExp, SOME(dimExp)) => begin
         local arrExpr = expToJuliaExpAlg(arrExp)
@@ -840,6 +980,21 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
            quirks to worry about here, so a direct Julia index works. =#
         local tupExpr = expToJuliaExpAlg(tupleExp)
         :($tupExpr[$ix])
+      end
+      #= Record-field subscript inside algorithmic code (Modelica function
+         body). Mirrors the MTK arm in CodeGenerationUtil.jl. Algorithmic
+         code never wraps values in Symbolics.Num, so we can use the same
+         `_recordFieldRe` / `_recordFieldIm` helpers without a separate
+         symbolic path. =#
+      DAE.RSUB(exp = innerExp, fieldName = fname) => begin
+        local innerJL = expToJuliaExpAlg(innerExp)
+        if fname == "re"
+          :(OMBackend.CodeGeneration._recordFieldRe($innerJL))
+        elseif fname == "im"
+          :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
+        else
+          :(getproperty($innerJL, $(QuoteNode(Symbol(fname)))))
+        end
       end
       _ =>  throw(ErrorException("$exp not yet supported"))
     end

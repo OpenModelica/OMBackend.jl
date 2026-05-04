@@ -47,8 +47,19 @@ function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = tru
   else
   end
   local MODEL_NAME = replace(modelName, "." => "__")
+  #= Only emit the saved_values_<model> = SavedValues(...) declaration when the
+     save function is actually generated. SavedValues lives in DiffEqCallbacks,
+     which is a transitive (not direct) dep of OMBackend; in MTK mode the save
+     function is disabled and the saved_values_ binding was never read, but its
+     unconditional emission caused UndefVarError at simulate time when the
+     per-model module tried to evaluate it without DiffEqCallbacks imported. =#
+  local SAVED_VALUES_DECL = if generateSaveFunction
+    :( $(Symbol("saved_values_$(modelName)")) = SavedValues(Float64, Tuple{Float64,Array}) )
+  else
+    nothing
+  end
   quote
-    $(Symbol("saved_values_$(modelName)")) = SavedValues(Float64, Tuple{Float64,Array})
+    $(SAVED_VALUES_DECL)
     function $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
       #= These are the location of the parameters and auxilary real variables respectivly =#
       local p = aux[1]
@@ -478,6 +489,16 @@ function createWhenStatements(whenStatements::List, simCode::SimulationCode.SIM_
   @debug "Calling createWhenStatements with: $whenStatements"
   for wStmt in  whenStatements
     @match wStmt begin
+      BDAE.ASSIGN(left = DAE.TUPLE(__)) => begin
+        local tupSym = gensym(:tupResult)
+        local rhsExpr = expToJuliaExp(wStmt.right, simCode)
+        push!(res, :(local $tupSym = $rhsExpr))
+        local i = 0
+        for elem in wStmt.left.PR
+          i += 1
+          _emitWhenTupleElementAssign!(res, elem, :($tupSym[$i]), simCode)
+        end
+      end
       BDAE.ASSIGN(__) => begin
         (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.left)]
         if typeof(var.varKind) === SimulationCode.STATE
@@ -514,6 +535,46 @@ function createWhenStatements(whenStatements::List, simCode::SimulationCode.SIM_
       end
       _ => throw(ErrorException("$whenStatements in @__FUNCTION__ not supported"))
     end
+  end
+  return res
+end
+
+#=
+  Recursively unpack a tuple-LHS element into per-cref Julia assignments.
+  `lhs` is one element of a DAE.TUPLE LHS (CREF, ARRAY, or WILD).
+  `rhsAccess` is the Julia Expr that pulls this element out of the tuple temp,
+  e.g. `tup[1]` or `tup[2][3]`. Output Julia LHS form is selected by the SimVar's
+  varKind, matching the single-cref BDAE.ASSIGN arm above.
+=#
+function _emitWhenTupleElementAssign!(res::Vector{Expr}, lhs::DAE.Exp,
+                                       rhsAccess, simCode::SimulationCode.SIM_CODE)
+  @match lhs begin
+    DAE.CREF(DAE.WILD(), _) => nothing
+    DAE.CREF(__) => begin
+      local name = SimulationCode.string(lhs)
+      local entry = get(simCode.stringToSimVarHT, name, nothing)
+      if entry === nothing
+        push!(res, :($(Symbol(name)) = $rhsAccess))
+        return res
+      end
+      local (index, var) = entry
+      local lhsJulia = if typeof(var.varKind) === SimulationCode.STATE
+        :(integrator.u[$index])
+      elseif typeof(var.varKind) === SimulationCode.ALG_VARIABLE
+        :(reals[$index])
+      else
+        Symbol(name)
+      end
+      push!(res, :($lhsJulia = $rhsAccess))
+    end
+    DAE.ARRAY(_, _, elements) => begin
+      local i = 0
+      for elem in elements
+        i += 1
+        _emitWhenTupleElementAssign!(res, elem, :($rhsAccess[$i]), simCode)
+      end
+    end
+    _ => throw(ErrorException("createWhenStatements: unsupported tuple-LHS element $lhs"))
   end
   return res
 end

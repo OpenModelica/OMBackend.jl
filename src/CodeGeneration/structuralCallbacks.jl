@@ -1,7 +1,7 @@
 #=
 # This file is part of OpenModelica.
 #
-# Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+# Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 # c/o Linköpings universitet, Department of Computer and Information Science,
 # SE-58183 Linköping, Sweden.
 #
@@ -104,17 +104,18 @@ function createStructuralCallback(simCode,
   =#
   @match SOME(flatModel) = simCode.flatModel
   unresolvedFlatModel = createNewFlatModel(flatModel)
-  #= Note in this way we can't print the flat model since we have some circular references... =#
-  global FLAT_MODEL = unresolvedFlatModel #= To be referenced as OM.OMBackend.CodeGeneration.FLAT_MODEL =#
-  global OLD_FLAT_MODEL = flatModel
+  #= Note: the flat model has circular references, so we cannot print it.
+     We embed it directly into the generated callback via $-interpolation
+     so the value rides into the StructuralChangeDynamicConnection.flatModel
+     field at codegen time. The runtime then reads it from the struct field
+     instead of from a module-scope global. =#
   quote
-    import OMBackend.CodeGeneration
     function $(Symbol(callbackName))(reducedSystem)
       #= Represent structural change. =#
       local stringToSimVarHT = $(simCode.stringToSimVarHT)
       local structuralChange = OMBackend.Runtime.StructuralChangeDynamicConnection($(flatModel.name),
                                                                                    false,
-                                                                                   OMBackend.CodeGeneration.FLAT_MODEL,
+                                                                                   $(unresolvedFlatModel),
                                                                                    $(idx), #= Assumes specific ordering =#
                                                                                    stringToSimVarHT,
                                                                                    $(flatModel.active_DOCC_Equations[idx]),

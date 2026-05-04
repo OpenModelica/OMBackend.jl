@@ -1,7 +1,7 @@
 #= /*
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -402,8 +402,25 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
     local lastConditionIdx = 0
     for conditionIdx in 1:length(conditions)
       condition = listGet(conditions, conditionIdx)
-      #= Merge the given residual equations with the equations of this particular branch. =#
-      local branchEquations::Vector{BDAE.RESIDUAL_EQUATION} = listArray(listGet(BDAE_ifEquation.eqnstrue, conditionIdx))
+      #= Merge the given residual equations with the equations of this particular branch.
+         The listArray result is `Vector{BDAE.Equation}` (the supertype) when
+         the branch contains both residuals and a sibling/nested IF_EQUATION
+         (legal Modelica: `if cond then r=a+b; if x then ...; end if; end if;`).
+         A direct `::Vector{BDAE.RESIDUAL_EQUATION}` cast would `MethodError:
+         Cannot convert IF_EQUATION to RESIDUAL_EQUATION` on those models —
+         see Modelica.Electrical.Analog.Examples.{ControlledSwitchWithArc,
+         OpAmps.*, …}. Filter to residuals here and log dropped variants so
+         the model at least translates; a follow-up pass should hoist the
+         skipped IF_EQUATIONs with conjoined conditions for full fidelity. =#
+      local rawBranchEqs = listArray(listGet(BDAE_ifEquation.eqnstrue, conditionIdx))
+      local branchEquations = BDAE.RESIDUAL_EQUATION[]
+      for eq in rawBranchEqs
+        if eq isa BDAE.RESIDUAL_EQUATION
+          push!(branchEquations, eq)
+        else
+          @warn "Skipping unsupported $(typeof(eq).name.name) inside if-branch (condition $(conditionIdx)); model may translate but lose this equation's effect"
+        end
+      end
       local equations = vcat(resEqs, branchEquations)
       target = conditionIdx + 1
       identifier = conditionIdx
@@ -437,7 +454,16 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
       break
     end
     condition = DAE.SCONST("ELSE_BRANCH")
-    branchEquations::Vector{BDAE.RESIDUAL_EQUATION} = listArray(BDAE_ifEquation.eqnsfalse)
+    #= Same defensive filtering as the eqnstrue path above. =#
+    local rawElseBranch = listArray(BDAE_ifEquation.eqnsfalse)
+    branchEquations = BDAE.RESIDUAL_EQUATION[]
+    for eq in rawElseBranch
+      if eq isa BDAE.RESIDUAL_EQUATION
+        push!(branchEquations, eq)
+      else
+        @warn "Skipping unsupported $(typeof(eq).name.name) inside if-equation else-branch; model may translate but lose this equation's effect"
+      end
+    end
     #= Equations here consists of all residual equations of the system and the equations in the if-equation =#
     equations = vcat(resEqs, branchEquations)
     lastConditionIdx += 1

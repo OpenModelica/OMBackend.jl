@@ -1,7 +1,7 @@
 #=
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -446,8 +446,34 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
         Base.string(bool)
       end
 
-      DAE.ENUM_LITERAL((Absyn.IDENT(str), int))  => begin
-        (str + "()" + string(int) + ")")
+      DAE.ENUM_LITERAL(name = Absyn.IDENT(str), index = int) => begin
+        str * "(" * Base.string(int) * ")"
+      end
+
+      DAE.ENUM_LITERAL(name = path, index = int) => begin
+        #= For qualified enum paths like
+           `Modelica.Electrical.Digital.Interfaces.Logic.'1'` keep only
+           the last two segments (`Logic.'1'`) plus the literal index. =#
+        local _segs = String[]
+        local _walk = function(p)
+          if p isa Absyn.IDENT
+            push!(_segs, p.name)
+          elseif p isa Absyn.QUALIFIED
+            push!(_segs, p.name)
+            _walk(p.path)
+          elseif p isa Absyn.FULLYQUALIFIED
+            _walk(p.path)
+          end
+        end
+        _walk(path)
+        local _short = if length(_segs) >= 2
+          _segs[end-1] * "." * _segs[end]
+        elseif length(_segs) == 1
+          _segs[1]
+        else
+          Base.string(path)
+        end
+        _short * "(" * Base.string(int) * ")"
       end
 
       DAE.CREF(cr, _)  => begin

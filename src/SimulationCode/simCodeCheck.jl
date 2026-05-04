@@ -123,8 +123,8 @@ const SUPPORTED_EXP_TYPES = Set{DataType}([
   DAE.ICONST, DAE.RCONST, DAE.SCONST, DAE.BCONST,
   DAE.CREF, DAE.BINARY, DAE.UNARY, DAE.LBINARY, DAE.LUNARY,
   DAE.RELATION, DAE.IFEXP, DAE.CAST, DAE.CALL,
-  DAE.ARRAY, DAE.RANGE, DAE.TUPLE, DAE.ASUB, DAE.TSUB,
-  DAE.RECORD, DAE.ENUM_LITERAL,
+  DAE.ARRAY, DAE.RANGE, DAE.TUPLE, DAE.ASUB, DAE.TSUB, DAE.RSUB,
+  DAE.RECORD, DAE.ENUM_LITERAL, DAE.REDUCTION,
 ])
 
 """
@@ -146,8 +146,24 @@ function _walkExpChildren(visit::Function, exp)
     DAE.CAST(_, e)              => visit(e)
     DAE.ASUB(e, subs)           => begin visit(e); for s in subs; visit(s) end end
     DAE.TSUB(e, _, _)           => visit(e)
+    DAE.RSUB(e, _, _, _)        => visit(e)
     DAE.ARRAY(_, _, es)         => for e in es; visit(e) end
     DAE.CALL(_, es, _)          => for e in es; visit(e) end
+    DAE.REDUCTION(_, body, iters) => begin
+      visit(body)
+      for it in iters
+        @match it begin
+          DAE.REDUCTIONITER(_, rangeExp, guardExp, _) => begin
+            visit(rangeExp)
+            @match guardExp begin
+              SOME(g) => visit(g)
+              _ => nothing
+            end
+          end
+          _ => nothing
+        end
+      end
+    end
     _ => nothing
   end
   return nothing
@@ -432,6 +448,73 @@ function _flagUnsupportedExp!(out::Vector{CheckViolation}, exp, where::String)
     return out
   end
   _walkExpChildren(child -> _flagUnsupportedExp!(out, child, where), exp)
+  return out
+end
+
+#= ── Rule: no literal inside der() / pre() ──────────────────────────── =#
+
+"""
+`rule_no_literal_in_der_pre`: walk every residual / initial / if-branch /
+when equation expression and flag any `der(<literal>)` or `pre(<literal>)`
+where `<literal>` is a constant (DAE.RCONST / ICONST / BCONST). The der/pre
+codegen arms now fold these to `0` and the literal value respectively
+(see CodeGenerationUtil.jl), so the system can still translate — but the
+literal only reaches codegen when an upstream pass (typically
+`solveParametricInitialEquations` or `foldParameterClosure`) substituted
+a parameter cref with its default value before residual rewriting. That
+upstream behaviour is the real bug and this :warn keeps it visible.
+"""
+function rule_no_literal_in_der_pre(simCode::SIM_CODE)::Vector{CheckViolation}
+  local out = CheckViolation[]
+  for (i, eq) in enumerate(simCode.residualEquations)
+    _flagLiteralInDerPre!(out, eq.exp, "residualEquations[$i]")
+  end
+  for (i, eq) in enumerate(simCode.initialEquations)
+    if hasproperty(eq, :exp)
+      _flagLiteralInDerPre!(out, eq.exp, "initialEquations[$i]")
+    end
+  end
+  for (i, ifEq) in enumerate(simCode.ifEquations)
+    for (j, branch) in enumerate(ifEq.branches)
+      _flagLiteralInDerPre!(out, branch.condition, "ifEquations[$i].branches[$j].condition")
+      for (k, eq) in enumerate(branch.residualEquations)
+        _flagLiteralInDerPre!(out, eq.exp, "ifEquations[$i].branches[$j].residualEquations[$k]")
+      end
+    end
+  end
+  for (i, whenEq) in enumerate(simCode.whenEquations)
+    if hasproperty(whenEq, :condition)
+      _flagLiteralInDerPre!(out, whenEq.condition, "whenEquations[$i].condition")
+    end
+    if hasproperty(whenEq, :whenStmtLst)
+      for (j, stmt) in enumerate(whenEq.whenStmtLst)
+        for fld in (:left, :right, :exp, :stateVar, :value, :message, :condition, :level)
+          if hasproperty(stmt, fld)
+            _flagLiteralInDerPre!(out, getproperty(stmt, fld),
+                                  "whenEquations[$i].stmt[$j].$fld")
+          end
+        end
+      end
+    end
+  end
+  return out
+end
+push!(RULES, rule_no_literal_in_der_pre)
+
+_isDAEConstant(exp) = exp isa DAE.RCONST || exp isa DAE.ICONST || exp isa DAE.BCONST
+
+function _flagLiteralInDerPre!(out::Vector{CheckViolation}, exp, where::String)
+  @match exp begin
+    DAE.CALL(Absyn.IDENT(name), expLst, _) where (name == "der" || name == "pre") => begin
+      local arg = listHead(expLst)
+      if _isDAEConstant(arg)
+        push!(out, CheckViolation(:no_literal_in_der_pre, :warn, where,
+                                  "$(name)(literal $(typeof(arg))) reached codegen — likely upstream parameter-eval substitution"))
+      end
+    end
+    _ => nothing
+  end
+  _walkExpChildren(child -> _flagLiteralInDerPre!(out, child, where), exp)
   return out
 end
 

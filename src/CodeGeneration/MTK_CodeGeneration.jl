@@ -1,7 +1,7 @@
 #=
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -37,6 +37,24 @@
 =#
 import ..OMBackend
 import ..AlgorithmicCodeGeneration
+
+_isCodegenNameChar(c::Char)::Bool =
+  isletter(c) || isdigit(c) || c == '_' || c == 'ˍ' || c == '[' || c == ']' || c == '"'
+
+function equationMentionsVariableName(eqStr::AbstractString, varName::AbstractString)::Bool
+  isempty(varName) && return false
+  local startIdx = firstindex(eqStr)
+  while true
+    local match = findnext(varName, eqStr, startIdx)
+    match === nothing && return false
+    local firstIdx = first(match)
+    local lastIdx = last(match)
+    local beforeOk = firstIdx == firstindex(eqStr) || !_isCodegenNameChar(eqStr[prevind(eqStr, firstIdx)])
+    local afterOk = lastIdx == lastindex(eqStr) || !_isCodegenNameChar(eqStr[nextind(eqStr, lastIdx)])
+    beforeOk && afterOk && return true
+    startIdx = nextind(eqStr, firstIdx)
+  end
+end
 
 """
   Generates simulation code targetting modeling toolkit.
@@ -105,6 +123,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     using ModelingToolkit
     using DifferentialEquations
     Base.Experimental.@compiler_options optimize=0 compile=min
+    $(createStringParameterAssignments(simCode)...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(structuralModes...)
     $(structuralCallbacks...)
@@ -231,6 +250,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
         generateExternalRuntimeImport()
       end)
     $(functions...)
+    $(createStringParameterAssignments(simCode)...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(generateRegisterCallsForCallExprs(simCode)...)
     $(model)
@@ -440,30 +460,145 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local _nTotalEqs = length(EQUATIONS) + length(DISCRETE_DUMMY_EQUATIONS) + _nConditionalEqs
   local _nTotalVars = length(stateVariables) + length(algebraicVariables) + length(discreteVariables) + length(occVariables)
   local _excess = _nTotalEqs - _nTotalVars
+  #= Pre-pass: detect definitionally constrained discrete vars from alias-shape
+     residuals. An equation of the form `0 ~ -const + cref` or `0 ~ cref - const`
+     fully pins `cref` to a constant; the matching `der(cref) ~ 0` dummy is
+     redundant. This catches the case where MTK's `structural_simplify`
+     would otherwise see two equations for one variable. Safer than relying
+     on `_excess` because it acts only on equations that uniquely determine
+     the variable. Operates on the Julia `Expr` form of EQUATIONS. =#
+  local _aliasPinned = Set{String}()
+  #= Strip `begin ... end` blocks wrapping a single value (source-location
+     decoration added by the codegen). EQUATIONS arrive as
+     `0 ~ begin <line> A end - begin <line> B end` rather than `0 ~ A - B`. =#
+  local _unwrap = function(e)
+    while e isa Expr && e.head === :block
+      local nontrivial = filter(x -> !(x isa LineNumberNode), e.args)
+      length(nontrivial) == 1 || break
+      e = nontrivial[1]
+    end
+    return e
+  end
+  local _isConstAtom = e -> begin
+    e = _unwrap(e)
+    e isa Number && return true
+    if e isa Expr && e.head === :call && length(e.args) == 2 && e.args[1] === :- && _unwrap(e.args[2]) isa Number
+      return true
+    end
+    return false
+  end
+  local _refName = e -> begin
+    e = _unwrap(e)
+    e isa Symbol && return string(e)
+    if e isa Expr && e.head === :call && length(e.args) == 2 && e.args[1] isa Symbol
+      return string(e.args[1])
+    end
+    return nothing
+  end
+  local _matchAlias = function(rhs)
+    rhs = _unwrap(rhs)
+    rhs isa Expr || return nothing
+    if rhs.head === :call && length(rhs.args) == 3
+      local op, a, b = rhs.args[1], _unwrap(rhs.args[2]), _unwrap(rhs.args[3])
+      if op === :+ || op === :-
+        if _isConstAtom(a)
+          local nm = _refName(b)
+          nm !== nothing && return nm
+        end
+        if _isConstAtom(b)
+          local nm = _refName(a)
+          nm !== nothing && return nm
+        end
+      end
+    elseif rhs.head === :call && length(rhs.args) == 2 && rhs.args[1] === :-
+      local nm = _refName(_unwrap(rhs.args[2]))
+      nm !== nothing && return nm
+    end
+    return nothing
+  end
+  #= Also detect pairwise discrete-to-discrete alias residuals of the form
+     `0 ~ varA - varB` where both varA and varB are in discreteVariables.
+     This is the connector pass-through pattern in Modelica.Electrical.Digital
+     gates: `Adder_AND_G1_y = Adder_AND_G2_x` becomes `0 ~ y - x` after
+     residualization, with both vars classified DISCRETE. MTK sees two
+     dummies + one alias residual = 3 equations for 2 vars. Demote the
+     LATER var (arbitrary choice, both are equivalent) to algebraic. =#
+  local _discreteSet = Set(string(Symbol(dv)) for dv in discreteVariables)
+  for eq in EQUATIONS
+    if eq isa Expr && eq.head === :call && length(eq.args) == 3 &&
+       eq.args[1] === :~ && eq.args[2] == 0
+      local pinned = _matchAlias(eq.args[3])
+      pinned !== nothing && push!(_aliasPinned, pinned)
+      #= Pairwise discrete alias: `0 ~ a - b` → both refs to discrete vars.
+         Demote whichever is in discreteVariables AND not already pinned. =#
+      local rhs = _unwrap(eq.args[3])
+      if rhs isa Expr && rhs.head === :call && length(rhs.args) == 3 && rhs.args[1] === :-
+        local nameA = _refName(_unwrap(rhs.args[2]))
+        local nameB = _refName(_unwrap(rhs.args[3]))
+        if nameA !== nothing && nameB !== nothing &&
+           nameA in _discreteSet && nameB in _discreteSet
+          push!(_aliasPinned, nameB)
+        end
+      end
+    end
+  end
+  local _discreteAliasOverride = String[]
+  for dv in discreteVariables
+    if string(Symbol(dv)) in _aliasPinned
+      push!(_discreteAliasOverride, dv)
+    end
+  end
+  if !isempty(_discreteAliasOverride)
+    @info "Discrete alias fix (definitional): demoting $(length(_discreteAliasOverride)) discrete vars pinned by `0 ~ const ± cref` residuals: $(_discreteAliasOverride)"
+    local _set = Set(_discreteAliasOverride)
+    local _newDummy = Expr[]
+    local _newDiscreteSym = Symbol[]
+    for (i, dv) in enumerate(discreteVariables)
+      if dv in _set
+        push!(algebraicVariablesSym, Symbol(dv))
+      else
+        push!(_newDummy, DISCRETE_DUMMY_EQUATIONS[i])
+        push!(_newDiscreteSym, Symbol(dv))
+      end
+    end
+    DISCRETE_DUMMY_EQUATIONS = _newDummy
+    discreteVariablesSym = _newDiscreteSym
+    #= Recompute totals/excess after definitional pre-pass. =#
+    _nTotalEqs = length(EQUATIONS) + length(DISCRETE_DUMMY_EQUATIONS) + _nConditionalEqs
+    _nTotalVars = length(stateVariables) + length(algebraicVariablesSym) + length(discreteVariablesSym) + length(occVariables)
+    _excess = _nTotalEqs - _nTotalVars
+  end
   if _excess > 0
     #= Find discrete variables that appear in alias-like residual equations
        (pure connector pass-throughs). These are safe to demote to algebraic
-       because they are fully determined by the alias equation alone. =#
-    local _discreteSet = Set(string.(Symbol.(discreteVariables)))
+       because they are fully determined by the alias equation alone.
+
+       Detection uses an exact symbol-token check against the generated
+       equation strings. At this stage equations can still contain bare
+       codegen symbols (`name`) rather than MTK-rendered calls (`name(t)`).
+       Naive `occursin(name, eqStr)` previously caused false positives
+       whenever one variable name was a prefix of another (e.g. `x` vs
+       `x_1`), silently demoting variables whose dummy was actually needed. =#
     local _eqStrings = [string(eq) for eq in EQUATIONS]
-    local _aliasDiscrete = String[]
+    local _mentions = Tuple{String, Int}[]
     for dv in discreteVariables
-      local dvStr = string(Symbol(dv))
-      #= Count how many residual equations mention this discrete variable =#
-      local nMentions = count(s -> occursin(dvStr, s), _eqStrings)
+      local dvSym = string(Symbol(dv))
+      local nMentions = count(s -> equationMentionsVariableName(s, dvSym), _eqStrings)
       if nMentions > 0
-        push!(_aliasDiscrete, dv)
+        push!(_mentions, (dv, nMentions))
       end
     end
-    #= Remove exactly _excess dummy derivatives, preferring variables with
-       the most residual equation mentions (most constrained = safest to remove). =#
+    #= Sort by mention count descending: the most heavily constrained
+       variable is the safest to drop because its value is determined by
+       multiple residuals already. =#
+    sort!(_mentions; by = t -> -t[2])
     local _toRemove = Set{String}()
-    for dv in _aliasDiscrete
+    for (dv, _) in _mentions
       length(_toRemove) >= _excess && break
       push!(_toRemove, dv)
     end
     if !isempty(_toRemove)
-      @info "Discrete alias fix: removing $(_excess) excess dummy der equations for $(collect(_toRemove))"
+      @info "Discrete alias fix: removing $(length(_toRemove))/$(_excess) excess dummy der equations for $(collect(_toRemove))"
       local _newDummy = Expr[]
       local _newDiscreteSym = Symbol[]
       for (i, dv) in enumerate(discreteVariables)
@@ -1045,19 +1180,16 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; sk
       SOME(attributes) => begin
         () = @match (attributes.start, attributes.fixed) begin
           (SOME(DAE.CREF(start)), SOME(__)) || (SOME(DAE.CREF(start)), _)  => begin
-            #= Check if CREF has subscripts. If so, delegate to expToJuliaExpMTK =#
-            if !isempty(FrontendUtil.Util.getSubscriptsFromCref(start))
-              push!(startExprs,
-                    quote
-                      $(Symbol("$varName")) => $(expToJuliaExpMTK(DAE.CREF(start, DAE.T_REAL(MetaModelica.Nil())), simCode))
-                    end)
-            else
-              #= Simple CREF without subscripts. Look up in pars list =#
-              push!(startExprs,
-                    quote
-                      $(Symbol("$varName")) => pars[$(Symbol(string(start)))]
-                    end)
-            end
+            #= Delegate to expToJuliaExpMTK so DATA_STRUCTURE / PARAMETER /
+               subscripted CREFs are all handled uniformly. The previous
+               two-branch split would emit `pars[name]` for non-subscripted
+               CREFs, which only works when the referenced var is a
+               PARAMETER (in `pars`). DATA_STRUCTURE constants and
+               int/enum vars reclassified by Causalize are not in `pars`. =#
+            push!(startExprs,
+                  quote
+                    $(Symbol("$varName")) => $(expToJuliaExpMTK(DAE.CREF(start, DAE.T_REAL(MetaModelica.Nil())), simCode))
+                  end)
             continue
           end
           (SOME(start), SOME(fixed)) || (SOME(start), _)  => begin
@@ -1275,15 +1407,21 @@ function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode
       end
     end
     #=
-      Check if conversions are needed
+      Check if conversions are needed.
+      Both sides of the Pair are wrapped with `Symbolics.wrap` to keep the
+      pair element type at `Pair{Num, Num}`. Without the LHS wrap MTK fails
+      `convert(Pair{Num}, Pair{BasicSymbolicImpl{SymReal}, Float64})` on
+      models like SpeedControlledDCPM where the parameter symbol resolves
+      to a bare `BasicSymbolic`. `Symbolics.wrap` is a no-op when the input
+      is already a `Num`.
     =#
     expr = if isIntOrBool(bindExp)
       quote
         $(LineNumberNode(@__LINE__, "$param eq"))
-        $(Symbol(simVar.name)) => float($((expToJuliaExpMTK(bindExp, simCode))))
+        Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap(float($((expToJuliaExpMTK(bindExp, simCode)))))
       end
     else
-        :($(Symbol(simVar.name)) => $(expToJuliaExpMTK(bindExp, simCode)))
+        :(Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap($(expToJuliaExpMTK(bindExp, simCode))))
     end
       # expr = quote
       #   $(LineNumberNode(@__LINE__, "$param eq"))
@@ -1358,11 +1496,78 @@ end
 
 
 """
-  Creates assignments for complex data structure that exist in the model.
+  createStringParameterAssignments(simCode) -> Vector{Expr}
+
+Emit one module-level Julia assignment per Modelica `String` parameter, e.g.
+
+```julia
+table2_combiTimeTable_fileName = "NoName"
+lossTable_fileName = "NoName"
+```
+
+Why this exists:
+- The MTK parameter system is numeric-only (BasicSymbolic{Real}), so String
+  parameters are deliberately excluded from `paramArray` / `parameterEquations`
+  (see the `SimulationCode.STRING(__) => # excluded` arm).
+- However, `DATA_STRUCTURE_ASSIGNMENTS` (CombiTable / CombiTimeTable
+  constructors and similar) reference these String parameters by their bare
+  Julia identifier in the per-model module scope. Without an emission step,
+  loading the module raises `UndefVarError: <param>_fileName`.
+
+Mutability for user overrides: emitting as bare `name = default` (not `const`)
+leaves the binding mutable, so `OMBackend.Modelica__<model>.<param> = "new"`
+followed by `simulate(...; overwriteCache=true)` reruns the data-structure
+init with the new value. Re-evaluating with `overwriteCache=false` reuses the
+cached tableID seeded from the previous String value.
 """
+function createStringParameterAssignments(simCode::SimulationCode.SimCode)::Vector{Expr}
+  local exprs::Vector{Expr} = Expr[]
+  for varName in keys(simCode.stringToSimVarHT)
+    (idx, simVar) = simCode.stringToSimVarHT[varName]
+    local bindExp = @match simVar.varKind begin
+      SimulationCode.STRING(bindExp = SOME(e)) => e
+      SimulationCode.PARAMETER(bindExp = SOME(e)) where _isLiteralBind(e) => e
+      _ => nothing
+    end
+    bindExp === nothing && continue
+    #= Only emit literal bindings at module level. Computed defaults / cross-
+       parameter refs cannot be safely lowered before MTK builds `pars`. The
+       DATA_STRUCTURE_ASSIGNMENTS at module top reference these names (e.g.
+       CombiTimeTable's `startTime` / `shiftTime` / `fileName`); without an
+       emission step, loading the module raises UndefVarError. =#
+    local rhs = try
+      expToJuliaExpMTK(bindExp, simCode)
+    catch
+      continue
+    end
+    push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
+  end
+  return exprs
+end
+
+#= True if `exp` is a leaf literal that resolves at module-load time
+   without needing other names in scope. Used to gate which bindings can
+   be emitted at module top via `createStringParameterAssignments`. =#
+function _isLiteralBind(exp)::Bool
+  @match exp begin
+    DAE.RCONST(__) => true
+    DAE.ICONST(__) => true
+    DAE.BCONST(__) => true
+    DAE.SCONST(__) => true
+    DAE.ENUM_LITERAL(__) => true
+    _ => false
+  end
+end
+
 function createDataStructureAssignments(dataStructureVariables::Vector{String}, simCode::SimulationCode.SimCode)::Vector{Expr}
   local dsAssignments::Vector = Expr[]
   local ht = simCode.stringToSimVarHT
+  #= Same Modelica-function name set used by rewriteEquations: needed to qualify
+     bare calls (e.g. Modelica_Blocks_Types_ExternalCombiTimeTable_constructor)
+     so they resolve to the OMBackend.CodeGeneration wrapper rather than failing
+     with UndefVarError in the per-model module scope. Surfaces on every model
+     using CombiTable / CombiTimeTable / ExternalObject constructors. =#
+  local funcNames = Set{Symbol}(Symbol(replace(f.name, "." => "_")) for f in simCode.functions)
   for ds in dataStructureVariables
     (index, simVar) = ht[ds]
     local simVarType::SimulationCode.SimVarType = simVar.varKind
@@ -1370,9 +1575,13 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
       SimulationCode.DATA_STRUCTURE(bindExp = SOME(exp)) => exp
       _ => throw(ErrorException("createDataStructureAssignments: data structure variable $(ds) has no bound expression (got $(simVarType))."))
     end
+    local rhs = expToJuliaExpMTK(bindExp, simCode)
+    if rhs isa Expr
+      qualifyModelicaFunctions!(rhs, funcNames)
+    end
     expr = quote
       $(LineNumberNode(@__LINE__, "$ds eq"))
-      $(Symbol(simVar.name)) = $(expToJuliaExpMTK(bindExp, simCode))
+      $(Symbol(simVar.name)) = $(rhs)
     end
     push!(dsAssignments, expr)
   end
@@ -1393,6 +1602,15 @@ function createParameterArray(parameters::Vector{T1}, parameterAssignments::Vect
     local simVarType::SimulationCode.SimVarType = simVar.varKind
     bindExp = @match simVarType begin
       SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
+      SimulationCode.PARAMETER(__) => begin
+        @match simVar.attributes begin
+          SOME(attr) where attr.start isa SOME => begin
+            @match SOME(startVal) = attr.start
+            startVal
+          end
+          _ => DAE.RCONST(0.0)
+        end
+      end
       _ => throw(ErrorException("createParameterArray: parameter $(param) has no bound expression (got $(simVarType))."))
     end
     #= Evaluate the parameters. If it is a variable, and can't be evaluated look it up in the parameter dictonary. =#
@@ -1962,7 +2180,7 @@ function generateRegisterCallsForCallExprs(simCode;
       #= Use @register_symbolic for scalar functions =#
       local normalizedName = replace(f.name, "." => "_")
       local sb = Symbol(normalizedName)
-      local args = funcArgGen(f.inputs)
+      local args = funcArgGen(convert(Vector{DAE.VAR}, f.inputs))
       local nArgs = length(args)
       local cExpr = if nArgs == 1
         Expr(:call, sb, first(args))
@@ -1986,12 +2204,52 @@ function generateExternalRuntimeImport()::Expr
   :(import OMRuntimeExternalC)
 end
 
+function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs::DAE.Exp,
+                                          rhsAccess, simCode::SimulationCode.SIM_CODE)
+  @match lhs begin
+    DAE.CREF(DAE.WILD(), _) => nothing
+    DAE.CREF(__) => begin
+      local name = SimulationCode.string(lhs)
+      local entry = get(simCode.stringToSimVarHT, name, nothing)
+      if entry === nothing
+        push!(res, :($(Symbol(name)) = $rhsAccess))
+        return res
+      end
+      local (_, var) = entry
+      push!(res, quote
+              idx = lookuptableStates[Symbol($(string(var.name)))]
+              integrator.u[idx] = $rhsAccess
+            end)
+    end
+    DAE.ARRAY(_, _, elements) => begin
+      local i = 0
+      for elem in elements
+        i += 1
+        _emitWhenTupleElementAssignMTK!(res, elem, :($rhsAccess[$i]), simCode)
+      end
+    end
+    _ => throw(ErrorException("createWhenStatementsMTK: unsupported tuple-LHS element $lhs"))
+  end
+  return res
+end
+
 function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.SIM_CODE; varPrefix = "", varSuffix = "")::Vector{Expr}
   local res::Array{Expr} = []
   @debug "Calling createWhenStatements with: $whenStatements"
   for wStmt in  whenStatements
     @match wStmt begin
       BDAE.ASSIGN(__) => begin
+        if wStmt.left isa DAE.TUPLE
+          local tupSym = gensym(:tupResult)
+          local rhsExpr = expToJuliaExpMTK(wStmt.right, simCode;
+                                           varPrefix = varPrefix, varSuffix = varSuffix)
+          push!(res, :(local $tupSym = $rhsExpr))
+          local i = 0
+          for elem in wStmt.left.PR
+            i += 1
+            _emitWhenTupleElementAssignMTK!(res, elem, :($tupSym[$i]), simCode)
+          end
+        else
         local leftStr = SimulationCode.string(wStmt.left)
         (index, var) = simCode.stringToSimVarHT[leftStr]
         push!(res, quote
@@ -1999,6 +2257,7 @@ function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.S
                 integrator.u[idx] = $(expToJuliaExpMTK(wStmt.right,
                                                        simCode; varPrefix = varPrefix, varSuffix = varSuffix))
               end)
+        end
       end
       #= Handles reinit =#
       BDAE.REINIT(__) => begin

@@ -1,7 +1,7 @@
 #= /*
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -692,19 +692,32 @@ end
 """
 function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
                                   source::DAE.ElementSource, attr::BDAE.EquationAttributes)
-  #= Extract baseName and T_COMPLEX type from both CREF_IDENT and CREF_QUAL.
-     CREF_QUAL occurs when the record variable is inside a component (e.g. frame.R)
-     and flattenArrayCrefs did not flatten it (no array subscripts on the final component). =#
-  extracted = @match left begin
-    DAE.CREF(DAE.CREF_IDENT(name, _, _), t) where {t isa DAE.T_COMPLEX} => (name, t)
-    DAE.CREF(cr::DAE.CREF_QUAL, t) where {t isa DAE.T_COMPLEX} => begin
-      (flatName, _, _) = crefToFlatName(cr)
-      (flatName, t)
+  #= Extract baseName and T_COMPLEX type from a CREF (CREF_IDENT or CREF_QUAL). =#
+  function _extractCrefBase(e)
+    @match e begin
+      DAE.CREF(DAE.CREF_IDENT(name, _, _), t) where {t isa DAE.T_COMPLEX} => (name, t)
+      DAE.CREF(cr::DAE.CREF_QUAL, t) where {t isa DAE.T_COMPLEX} => begin
+        (flatName, _, _) = crefToFlatName(cr)
+        (flatName, t)
+      end
+      _ => nothing
     end
-    _ => nothing
+  end
+
+  #= Try LHS first; fall back to RHS if LHS isn't a record CREF. The latter
+     case occurs for `func(...) = recordCref` shapes (e.g. Magnetic.FW
+     `subtract(port_p.V_m, port_n.V_m) = converter.V_m`). Scalarising the
+     CREF side here produces `recordCref_field = exprSide[i]` instead of
+     leaving `recordCref[i]` references that the simvar HT cannot resolve. =#
+  local extracted = _extractCrefBase(left)
+  local crefOnLeft = true
+  if extracted === nothing
+    extracted = _extractCrefBase(right)
+    crefOnLeft = false
   end
   extracted === nothing && return nothing
   (baseName, ty) = extracted
+  local exprSide = crefOnLeft ? right : left
 
   equations = BDAE.Equation[]
   fieldIdx = 0
@@ -712,7 +725,7 @@ function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
     fieldIdx += 1
     fieldName = string(baseName, "_", field.name)
     fieldTy = field.ty
-    rhsField = DAE.ASUB(right, list(DAE.ICONST(fieldIdx)))
+    exprField = DAE.ASUB(exprSide, list(DAE.ICONST(fieldIdx)))
     @match fieldTy begin
       DAE.T_ARRAY(elemTy, dims) => begin
         dimVec = Int[d.integer for d in dims]
@@ -721,14 +734,14 @@ function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
           subs = list((DAE.INDEX(DAE.ICONST(i)) for i in idxTuple)...)
           lhsCref = DAE.CREF_IDENT(fieldName, elemTy, subs)
           lhsExp = DAE.CREF(lhsCref, elemTy)
-          rhsExp = DAE.ASUB(rhsField, list((DAE.ICONST(i) for i in idxTuple)...))
+          rhsExp = DAE.ASUB(exprField, list((DAE.ICONST(i) for i in idxTuple)...))
           push!(equations, BDAE.EQUATION(lhsExp, rhsExp, source, attr))
         end
       end
       _ => begin
         fieldCref = DAE.CREF_IDENT(fieldName, fieldTy, MetaModelica.nil)
         fieldExp = DAE.CREF(fieldCref, fieldTy)
-        push!(equations, BDAE.EQUATION(fieldExp, rhsField, source, attr))
+        push!(equations, BDAE.EQUATION(fieldExp, exprField, source, attr))
       end
     end
   end
@@ -1268,14 +1281,56 @@ function _isIntegerVarType(varType)
     (varType isa DAE.T_ARRAY && varType.ty isa DAE.T_INTEGER)
 end
 
+#= Discrete-parameter-like variable types: Integer, Enumeration (e.g.
+   Modelica.Electrical.Digital.Interfaces.Logic 9-value-logic), and their
+   array variants. These can all be reclassified from BDAE.VARIABLE to
+   BDAE.PARAM when fully constrained by a constant-RHS equation, since
+   none of them have a continuous derivative. Without this `auxiliary*`
+   variables in Digital gates remain as VARIABLE and create unbalanced
+   systems via their dummy `der(x) ~ 0` plus their definitional equation. =#
+function _isIntOrEnumVarType(varType)
+  varType isa DAE.T_INTEGER || varType isa DAE.T_ENUMERATION ||
+    (varType isa DAE.T_ARRAY && (varType.ty isa DAE.T_INTEGER || varType.ty isa DAE.T_ENUMERATION))
+end
+
+"""
+Identify (target, source) pairs in an equation whose target is fully
+determined by the source via direct CREF aliasing. Used by the
+alias-chain fixpoint to propagate removal: when source is already a
+removed definer (constant parameter), target can also be removed and
+inherits source's value.
+
+Only the `intA = intB` shape is handled here. Propagation through
+value-preserving wrappers like `pre(intB)` is done at the SimCode level
+because those forms can survive Causalize and only become folding
+candidates after BDAE→SimVar reclassifies intB as PARAMETER.
+"""
+function _candidateAliasPairs(eq::BDAE.EQUATION, intNames::Set{String})
+  pairs = Tuple{String, String}[]
+  if eq.lhs isa DAE.CREF && eq.rhs isa DAE.CREF
+    lhsName = string(eq.lhs.componentRef)
+    rhsName = string(eq.rhs.componentRef)
+    if lhsName in intNames && rhsName in intNames
+      push!(pairs, (lhsName, rhsName))
+      push!(pairs, (rhsName, lhsName))
+    end
+  end
+  return pairs
+end
+
 function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
-  #= Collect integer VARIABLE names (scalarized, e.g. "world_axisColor_x[1]")
-     and base names (un-indexed, e.g. "world_axisColor_x") for matching
-     array/complex equations that have not been expanded yet. =#
+  #= Collect integer / enumeration VARIABLE names (scalarized, e.g.
+     "world_axisColor_x[1]", "Adder_AND_G1_auxiliary[2]") and base names
+     (un-indexed, e.g. "world_axisColor_x") for matching array/complex
+     equations that have not been expanded yet. Enumerations are treated
+     the same as integers here because Modelica.Electrical.Digital uses
+     enum-typed `auxiliary` lookup variables that are constant-bound
+     (DAE.ENUM_LITERAL on RHS) and would otherwise produce both a dummy
+     `der(x) ~ 0` and a defining equation, unbalancing MTK. =#
   intVarNames = Set{String}()
   intVarBaseNames = Set{String}()
   for v in syst.orderedVars
-    if v.varKind isa BDAE.VARIABLE && _isIntegerVarType(v.varType)
+    if v.varKind isa BDAE.VARIABLE && _isIntOrEnumVarType(v.varType)
       name = string(v.varName)
       push!(intVarNames, name)
       push!(intVarBaseNames, replace(name, r"\[.*\]$" => ""))
@@ -1292,6 +1347,16 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
   allIntNames = union(intVarNames, intVarBaseNames)
   valueMap = Dict{String, DAE.Exp}()
   keepEq = trues(length(syst.orderedEqs))
+  #= A literal value used as a binding for an int/enum variable. Anything
+     else (algorithm-table lookup, function call, expression) means the
+     equation is doing real computation and must NOT be dropped — that
+     was the Digital-gate `auxiliary[2] := and_table[...]` issue. =#
+  local _isLiteral = e -> (e isa DAE.ICONST || e isa DAE.ENUM_LITERAL)
+  #= Track exactly which int/enum vars had their *only* defining equation
+     removed. Only those are safe to reclassify as PARAM. Variables with
+     surviving non-literal defining equations (like `Adder_AND_G2_y =
+     pre(auxiliary_n)`) must remain VARIABLE so MTK can compute them. =#
+  local removedDefiners = Set{String}()
   for (i, eq) in enumerate(syst.orderedEqs)
     if eq isa BDAE.EQUATION
       lhsIsInt = eq.lhs isa DAE.CREF && string(eq.lhs.componentRef) in intVarNames
@@ -1302,12 +1367,19 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
       isWhenDriven = (lhsIsInt && string(eq.lhs.componentRef) in intVarsWrittenInWhen) ||
                      (rhsIsInt && string(eq.rhs.componentRef) in intVarsWrittenInWhen)
       if (lhsIsInt || rhsIsInt) && !isWhenDriven
-        keepEq[i] = false
-        if lhsIsInt && eq.rhs isa DAE.ICONST
+        #= Drop a `intvar = literal` binding outright; capture the value. =#
+        if lhsIsInt && _isLiteral(eq.rhs)
+          keepEq[i] = false
+          push!(removedDefiners, string(eq.lhs.componentRef))
           valueMap[string(eq.lhs.componentRef)] = eq.rhs
-        elseif rhsIsInt && eq.lhs isa DAE.ICONST
+        elseif rhsIsInt && _isLiteral(eq.lhs)
+          keepEq[i] = false
+          push!(removedDefiners, string(eq.rhs.componentRef))
           valueMap[string(eq.rhs.componentRef)] = eq.lhs
         end
+        #= int-to-int aliases (e.g. `auxiliary_n = auxiliary[2]`) are
+           handled in the alias-chain follow-up pass below — we cannot
+           decide here because the RHS may not yet be in removedDefiners. =#
       end
     elseif eq isa BDAE.ARRAY_EQUATION
       leftIsInt = eq.left isa DAE.CREF && string(eq.left.componentRef) in allIntNames
@@ -1315,7 +1387,13 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
       isWhenDriven = (leftIsInt && string(eq.left.componentRef) in intVarsWrittenInWhen) ||
                      (rightIsInt && string(eq.right.componentRef) in intVarsWrittenInWhen)
       if (leftIsInt || rightIsInt) && !isWhenDriven
-        keepEq[i] = false
+        if leftIsInt && _isLiteral(eq.right)
+          keepEq[i] = false
+          push!(removedDefiners, string(eq.left.componentRef))
+        elseif rightIsInt && _isLiteral(eq.left)
+          keepEq[i] = false
+          push!(removedDefiners, string(eq.right.componentRef))
+        end
       end
     elseif eq isa BDAE.COMPLEX_EQUATION
       leftIsInt = eq.left isa DAE.CREF && string(eq.left.componentRef) in allIntNames
@@ -1323,9 +1401,41 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
       isWhenDriven = (leftIsInt && string(eq.left.componentRef) in intVarsWrittenInWhen) ||
                      (rightIsInt && string(eq.right.componentRef) in intVarsWrittenInWhen)
       if (leftIsInt || rightIsInt) && !isWhenDriven
-        keepEq[i] = false
+        if leftIsInt && _isLiteral(eq.right)
+          keepEq[i] = false
+          push!(removedDefiners, string(eq.left.componentRef))
+        elseif rightIsInt && _isLiteral(eq.left)
+          keepEq[i] = false
+          push!(removedDefiners, string(eq.right.componentRef))
+        end
       end
     end
+  end
+  #= Alias-chain fixpoint: an equation `intA = intB` where intB is already
+     in `removedDefiners` (i.e. now a PARAM with known value) means intA
+     can also be removed and reclassified. Iterate until no more changes
+     so chains like `auxiliary_n = auxiliary[2]; auxiliary[2] = 'U'`
+     fully collapse. Order-of-equations does not matter with iteration. =#
+  while true
+    local progress = false
+    for (i, eq) in enumerate(syst.orderedEqs)
+      keepEq[i] || continue
+      eq isa BDAE.EQUATION || continue
+      for (target, source) in _candidateAliasPairs(eq, intVarNames)
+        target in intVarsWrittenInWhen && continue
+        source in intVarsWrittenInWhen && continue
+        if source in removedDefiners && !(target in removedDefiners)
+          keepEq[i] = false
+          push!(removedDefiners, target)
+          if haskey(valueMap, source)
+            valueMap[target] = valueMap[source]
+          end
+          progress = true
+          break
+        end
+      end
+    end
+    progress || break
   end
   #= Reclassify integer VARIABLEs as PARAMs with extracted or default values.
      Skip any integer written inside a when-clause — that variable is
@@ -1333,14 +1443,29 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
      somewhere to land. =#
   nReclassified = 0
   for v in syst.orderedVars
-    if v.varKind isa BDAE.VARIABLE && _isIntegerVarType(v.varType)
+    if v.varKind isa BDAE.VARIABLE && _isIntOrEnumVarType(v.varType)
       name = string(v.varName)
       baseName = replace(name, r"\[.*\]$" => "")
       if name in intVarsWrittenInWhen || baseName in intVarsWrittenInWhen
         continue
       end
+      #= Only reclassify variables whose defining equation we actually
+         removed. Variables with surviving non-literal definers (e.g.
+         `Adder_AND_G2_y = pre(auxiliary_n)`) must remain VARIABLE so MTK
+         continues to compute them — otherwise the gate output gets pinned
+         to a constant parameter and the model produces meaningless output. =#
+      if !(name in removedDefiners) && !(baseName in removedDefiners)
+        continue
+      end
       v.varKind = BDAE.PARAM()
       if v.varType isa DAE.T_INTEGER
+        v.bindExp = SOME(get(valueMap, name, DAE.ICONST(0)))
+      elseif v.varType isa DAE.T_ENUMERATION
+        #= Use captured ENUM_LITERAL when the equation pinned the variable
+           to a specific literal (e.g. 'U' for Logic). Fall back to ICONST(0)
+           for partially-bound enum arrays — the integer index 0 is a safe
+           default that downstream codegen will treat as "first literal" /
+           uninitialised, matching prior behaviour for unconstrained enums. =#
         v.bindExp = SOME(get(valueMap, name, DAE.ICONST(0)))
       end
       nReclassified += 1

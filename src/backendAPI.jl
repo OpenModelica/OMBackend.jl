@@ -1,7 +1,7 @@
 #=
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -70,7 +70,7 @@ const OSMC_COPYRIGHT_HEADER = """
 #=
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -111,6 +111,13 @@ end
   DAE_MODE = 1
   ODE_MODE = 2 #Currently not in operation
   MTK_MODE = 3
+  #=
+    Direct DifferentialEquations.jl emission. Builds an `ODEProblem` with an
+    in-place RHS `f!(du, u, p, t)` that indexes `u`, `du`, and `p` by integer
+    position. Bypasses ModelingToolkit entirely. Initial scope: pure ODE
+    (no algebraic constraints), no VSS / structural transitions, no DOCC.
+  =#
+  DEMode = 4
 end
 
 function info()
@@ -203,6 +210,32 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
       local simCode
       if BackendMode == DAE_MODE
         error("DAE-mode is deprecated.")
+      elseif BackendMode == DEMode
+        #=
+          Direct DifferentialEquations.jl path. Mirrors the MTK pipeline up
+          through propagateConstants/aliasElim, but skips MTK-specific
+          observed-equation work and dispatches to the DE emitter.
+        =#
+        simCode = generateSimulationCode(bDAE; mode = MTK_MODE)
+        (simCodeFunctions, externalRuntimeNeeded) = if functionList !== nothing
+          generateSimCodeFunctions(functionList)
+        else
+          (SimulationCode.ModelicaFunction[], false)
+        end
+        @assign simCode.functions = simCodeFunctions
+        @assign simCode.externalRuntime = externalRuntimeNeeded
+        simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
+        @assign simCode.functions = simCodeFunctions
+        simCode = SimulationCode.flattenRecordCallSites(simCode)
+        simCode = SimulationCode.resolveIfExpInBindings!(simCode)
+        simCode = SimulationCode.foldParameterClosure(simCode)
+        simCode = SimulationCode.propagateConstants(simCode)
+        simCode = SimulationCode.eliminateAliasVariables(simCode)
+        if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
+          error("DEMode does not support structural transitions / VSS at this time. " *
+                "Re-run with mode = OMBackend.MTK_MODE.")
+        end
+        return generateDETargetCode(simCode)
       elseif BackendMode == MTK_MODE
         #@debug "Generate simulation code"
         simCode = generateSimulationCode(bDAE; mode = MTK_MODE)
@@ -236,6 +269,8 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
            on those unknowns produce NaN/Inf evaluations. =#
         simCode = SimulationCode.foldParameterClosure(simCode)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFoldClosure.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = SimulationCode.inlinePreOfConstantParameters(simCode)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterInlinePreParam.log"), SimulationCode.dumpSimCode(simCode))
         simCode = SimulationCode.propagateConstants(simCode)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterConstantProp.log"), SimulationCode.dumpSimCode(simCode))
         simCode = SimulationCode.eliminateAliasVariables(simCode)
@@ -288,7 +323,7 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         end
         return generateMTKTargetCode(simCode)
       else
-        @error "No mode specified: valid modes are: MTK_MODE"
+        @error "Unsupported BackendMode: $BackendMode. Valid modes are: MTK_MODE, DEMode"
       end
     end
   finally
@@ -491,11 +526,44 @@ function getCompiledModel(modelName)
 end
 
 """
+`generateDETargetCode(simCode::SimulationCode.SIM_CODE)`
+  Generates code interfacing DifferentialEquations.jl directly (DEMode).
+  Produces an in-place ODEProblem with the RHS indexed by integer position.
+  Caches the result in COMPILED_MODELS_DEJL so simulateModel can pick it up.
+"""
+function generateDETargetCode(simCode::SimulationCode.SIM_CODE)
+  (modelName::String, modelCode::Expr) = CodeGeneration.generateDECode(simCode)
+  modelName = replace(modelName, "." => "__")
+  local codeHash = hash(modelCode)
+  if haskey(COMPILED_MODELS_DEJL, modelName)
+    local previousHash = COMPILED_MODELS_DEJL[modelName][3]
+    local changeDetected = previousHash != codeHash
+    COMPILED_MODELS_DEJL[modelName] = (modelCode, changeDetected, codeHash)
+  else
+    local moduleAlreadyExists = isdefined(OMBackend, Symbol(modelName))
+    COMPILED_MODELS_DEJL[modelName] = (modelCode, moduleAlreadyExists, codeHash)
+  end
+  return (modelName, modelCode)
+end
+
+"""
   Returns true if the model was compiled again
 """
 function modelWasCompiledAgain(modelName)
   return COMPILED_MODELS_MTK[modelName][2]
 end
+
+function getCompiledModelDE(modelName)
+  try
+    return COMPILED_MODELS_DEJL[modelName][1]
+  catch e
+    local available = join(keys(COMPILED_MODELS_DEJL), ", ")
+    @error "DE-mode model: $(modelName) is not compiled. Available DE-mode models: $(available)"
+    throw(e)
+  end
+end
+
+modelWasCompiledAgainDE(modelName) = COMPILED_MODELS_DEJL[modelName][2]
 
 """
 
@@ -592,9 +660,15 @@ end
 """
 function availableModels()::String
   str = "Compiled models (MTK-MODE):\n"
-    for m in keys(COMPILED_MODELS_MTK)
+  for m in keys(COMPILED_MODELS_MTK)
+    str *= "  $m\n"
+  end
+  if !isempty(COMPILED_MODELS_DEJL)
+    str *= "Compiled models (DEMode):\n"
+    for m in keys(COMPILED_MODELS_DEJL)
       str *= "  $m\n"
     end
+  end
   return str
 end
 
@@ -635,6 +709,28 @@ function simulateModel(modelName::String;
         @eval $modelCode
       end
       #= Run in latest world age to see the just-eval'd module =#
+      Base.invokelatest() do
+        local mod = getfield(OMBackend, Symbol(modelName))
+        mod.simulate(tspan, solver; kwargs...)
+      end
+    catch err
+      @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
+      rethrow(err)
+    end
+  elseif MODE == DEMode
+    try
+      modelCode = getCompiledModelDE(modelName)
+    catch err
+      println("Failed to simulate DE-mode model.")
+      println("Available models are:")
+      println(availableModels())
+      rethrow(err)
+    end
+    try
+      local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) || modelWasCompiledAgainDE(modelName)
+      if needsEval
+        @eval $modelCode
+      end
       Base.invokelatest() do
         local mod = getfield(OMBackend, Symbol(modelName))
         mod.simulate(tspan, solver; kwargs...)

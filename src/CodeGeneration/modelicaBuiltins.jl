@@ -90,6 +90,7 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
   #= --- Event and state --- =#
   "smooth"       => :modelica_smooth,
   "noEvent"      => :modelica_noEvent,
+  "sample"       => :modelica_sample,
   "homotopy"     => :modelica_homotopy,
   "semiLinear"   => :modelica_semiLinear,
 )
@@ -360,6 +361,19 @@ Modelica: noEvent(expr) disables event triggering for the expression.
 At code generation level this is a no-op (the solver does not see events).
 """
 modelica_noEvent(expr) = expr
+
+"""
+    modelica_sample(start, period)
+
+Modelica: sample(start, period) is true at sample times start+i*period.
+In continuous expression context the integrator is between sample events,
+so this returns false. The actual periodic firing is handled by a
+PeriodicCallback emitted from the when-equation pass (see codeGen.jl
+isPeriodic branch). Without this stub the per-model module raises
+UndefVarError("sample") whenever sample() leaks into a non-when expression
+(e.g. inside SignalPWM blocks used by DC-DC choppers).
+"""
+modelica_sample(start, period) = false
 
 """
     modelica_homotopy(actual, simplified)

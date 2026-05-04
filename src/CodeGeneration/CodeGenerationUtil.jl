@@ -1,7 +1,7 @@
 #=
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -43,7 +43,7 @@ function copyrightString()
   strOut = string("#= /*
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -402,6 +402,10 @@ function DAECallExpressionToJuliaCallExpression(pathStr::String, expLst::List, s
           end
           Expr(:vect, elemExprs...)
         end
+        #= der(literal) ≡ 0. See companion arm in DAECallExpressionToMTKCallExpression. =#
+        DAE.RCONST(_) => quote 0.0 end
+        DAE.ICONST(_) => quote 0 end
+        DAE.BCONST(_) => quote false end
         _ => begin
           varName = SimulationCode.DAE_identifierToString(arg)
           (index, _) = ht[varName]
@@ -420,6 +424,10 @@ function DAECallExpressionToJuliaCallExpression(pathStr::String, expLst::List, s
           end
           Expr(:vect, elemExprs...)
         end
+        #= pre(literal) ≡ literal. =#
+        DAE.RCONST(r) => quote $r end
+        DAE.ICONST(i) => quote $i end
+        DAE.BCONST(b) => quote $b end
         _ => begin
           varName = SimulationCode.DAE_identifierToString(arg)
           (index, _) = ht[varName]
@@ -431,10 +439,24 @@ function DAECallExpressionToJuliaCallExpression(pathStr::String, expLst::List, s
       end
     end
     _  =>  begin
-      funcName = Symbol(pathStr)
       argPart = tuple(map((x) -> expToJuliaExp(x, simCode, varPrefix=varPrefix), expLst)...)
-      quote
-        $(funcName)($(argPart...))
+      #= Mirror DAECallExpressionToMTKCallExpression: route Modelica built-ins
+         (sample, noEvent, smooth, ...) to their qualified
+         OMBackend.CodeGeneration.AlgorithmicCodeGeneration stubs. Without
+         this, sample() inside the body of a when-statement or any non-MTK
+         code path emits a bare `sample(...)` Julia call which the per-model
+         module cannot resolve. =#
+      builtinSym = get(AlgorithmicCodeGeneration.MODELICA_BUILTIN_FUNCTIONS, pathStr, nothing)
+      if builtinSym !== nothing
+        qualifiedName = Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(:AlgorithmicCodeGeneration)), QuoteNode(builtinSym))
+        quote
+          $(qualifiedName)($(argPart...))
+        end
+      else
+        funcName = Symbol(pathStr)
+        quote
+          $(funcName)($(argPart...))
+        end
       end
     end
   end
@@ -476,6 +498,13 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
           end
           Expr(:vect, elemExprs...)
         end
+        #= der(literal) ≡ 0. Reachable when an upstream parameter-eval pass
+           (solveParametricInitialEquations, foldParameterClosure) substituted
+           a parameter cref with its default constant before residual rewriting.
+           See SimCodeCheck rule_no_literal_in_der_pre for early diagnostic. =#
+        DAE.RCONST(_) => quote 0.0 end
+        DAE.ICONST(_) => quote 0 end
+        DAE.BCONST(_) => quote false end
         _ => begin
           varName = SimulationCode.DAE_identifierToString(arg)
           if derAsSymbol
@@ -500,6 +529,10 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
           end
           Expr(:vect, elemExprs...)
         end
+        #= pre(literal) ≡ literal — pre-of-constant is the constant itself. =#
+        DAE.RCONST(r) => quote $r end
+        DAE.ICONST(i) => quote $i end
+        DAE.BCONST(b) => quote $b end
         _ => begin
           varName = SimulationCode.DAE_identifierToString(arg)
           quote
@@ -723,6 +756,38 @@ function resolveAliasedCref(fullName::String, simCode, hashTable; varPrefix="", 
     end
   end
   return (false, nothing)
+end
+
+"""
+  _ifexpBranchIsNonReal(e::DAE.Exp) -> Bool
+
+Conservative type sniff used by the IFEXP lowering: returns `true` when the
+expression's runtime value is clearly not a Real number, so the arithmetic
+`cond*then + (1-cond)*else` encoding cannot apply.
+
+Detects:
+- `DAE.SCONST` literals — String values
+- `DAE.CREF` whose `ty` is `DAE.T_STRING` — String parameters / variables
+- `DAE.CALL` whose `attr.ty` is `DAE.T_STRING` — String-returning functions
+- Nested `DAE.IFEXP` — recurse into both branches
+
+Used to decide whether to emit `ifelse(cond, then, else)` (works for any type)
+or the MTK-friendlier arithmetic form (Real only).
+"""
+function _ifexpBranchIsNonReal(e::DAE.Exp)::Bool
+  @match e begin
+    DAE.SCONST(_) => true
+    DAE.CREF(_, ty) => ty isa DAE.T_STRING
+    DAE.CALL(_, _, attrs) => begin
+      try
+        attrs.ty isa DAE.T_STRING
+      catch
+        false
+      end
+    end
+    DAE.IFEXP(_, t, el) => _ifexpBranchIsNonReal(t) || _ifexpBranchIsNonReal(el)
+    _ => false
+  end
 end
 
 """
@@ -1080,9 +1145,19 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         local condJL = expToJuliaExpMTK(expCond, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
         local thenJL = expToJuliaExpMTK(expThen, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
         local elseJL = expToJuliaExpMTK(expElse, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-        #= Use arithmetic ifelse: cond*then + (1-cond)*else. This avoids type dispatch
-           issues with ModelingToolkit.ifelse on BasicSymbolic{Real} vs Num. =#
-        :($(condJL) * $(thenJL) + (1 - $(condJL)) * $(elseJL))
+        #= For Real branches use arithmetic ifelse: cond*then + (1-cond)*else.
+           This avoids type dispatch issues with ModelingToolkit.ifelse on
+           BasicSymbolic{Real} vs Num. For String / Boolean / Integer branches
+           the arithmetic encoding is invalid (you cannot multiply a String by
+           a number), so fall back to Julia's `ifelse(cond, then, else)`.
+           Surfaces on every CombiTable / CombiTimeTable model where the
+           constructor's `fileName` argument is wrapped in
+           `if useFile and ... then fileName else "NoName"`. =#
+        if _ifexpBranchIsNonReal(expThen) || _ifexpBranchIsNonReal(expElse)
+          :(ifelse(Bool($(condJL)), $(thenJL), $(elseJL)))
+        else
+          :($(condJL) * $(thenJL) + (1 - $(condJL)) * $(elseJL))
+        end
       end
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
         #Call as symbol is really ugly.. please fix me :(
@@ -1093,15 +1168,23 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         local normalizedFuncName = replace(string(path), "." => "_")
         #= Use direct function call - wrapper handles world-age, @register_symbolic handles symbolic =#
         local expr = Expr(:call, Symbol(normalizedFuncName))
-        local args::Vector{Union{Symbol, Expr}} = Union{Symbol, Expr}[]
+        local args::Vector{Any} = Any[]
         for arg in expLst
-          #= Check if argument is a record CREF that needs to be flattened =#
+          #= 1) Complex CREF arg → scalarise to (cref_re, cref_im, ...). =#
           local flattenedArgs::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
           if !isempty(flattenedArgs)
             append!(args, flattenedArgs)
-          else
-            push!(args, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix = varSuffix,derSymbol = derSymbol))
+            continue
           end
+          #= 2) Complex-returning sub-call → emit per-element extracts so the
+                outer wrapper sees scalar args, not bundled tuples. =#
+          local extracts = _expandComplexReturnArg(arg, simCode, hashTable;
+                                                    varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+          if extracts !== nothing
+            append!(args, extracts)
+            continue
+          end
+          push!(args, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
         end
         append!(expr.args, args)
         expr
@@ -1304,16 +1387,18 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           end
         end
       end
-      DAE.RANGE(ty, startExp, stepExpOpt, stopExp) => begin
-        #= Range expression: start:stop or start:step:stop =#
+      DAE.RANGE(_, startExp, NONE(), stopExp) => begin
+        #= Range expression: start:stop =#
         local startExpr = expToJuliaExpMTK(startExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
         local stopExpr = expToJuliaExpMTK(stopExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-        if stepExpOpt === nothing
-          :($startExpr:$stopExpr)
-        else
-          local stepExpr = expToJuliaExpMTK(stepExpOpt, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-          :($startExpr:$stepExpr:$stopExpr)
-        end
+        :($startExpr:$stopExpr)
+      end
+      DAE.RANGE(_, startExp, SOME(stepExp), stopExp) => begin
+        #= Range expression: start:step:stop =#
+        local startExpr = expToJuliaExpMTK(startExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+        local stepExpr = expToJuliaExpMTK(stepExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+        local stopExpr = expToJuliaExpMTK(stopExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
+        :($startExpr:$stepExpr:$stopExpr)
       end
       DAE.TSUB(tupleExp, ix, tsubTy) => begin
         #= Tuple subscript: extract element ix from a tuple-returning expression.
@@ -1407,12 +1492,51 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                                              derSymbol=derSymbol)
                            for e in expl]
         local names = [Symbol(n) for n in fieldNames]
-        if length(names) == length(elemExprs)
-          local pairs = [Expr(:(=), names[i], elemExprs[i]) for i in eachindex(names)]
+        #= Wrap each field with `Symbolics.wrap` so the resulting NamedTuple
+           field type is `Num` (or stays `Number` for plain literals).
+           Without the wrap, fields can hold a bare `BasicSymbolic{Real}`
+           which is rejected by `SymbolicUtils._numeric_or_arrnumeric_symtype`
+           and shows up as `MethodError: -(::SymReal, ::SymReal)` when MTK
+           applies arithmetic to a Modelica function-call argument that
+           was passed a parameter record (Spice3.Internal.Mosfet.Mosfet,
+           Media.IdealGases.DataRecord). Verified harmless on
+           Magnetic.FundamentalWave — those use the `Complex(re, im)`
+           special-case constructor handled at the previous arm, not this
+           generic record fallback. =#
+        local wrappedElems = [:(Symbolics.wrap($(e))) for e in elemExprs]
+        if length(names) == length(wrappedElems)
+          local pairs = [Expr(:(=), names[i], wrappedElems[i]) for i in eachindex(names)]
           Expr(:tuple, Expr(:parameters, pairs...))
         else
           #= Safety: fall back to positional tuple if field-name list is mismatched. =#
-          Expr(:tuple, elemExprs...)
+          Expr(:tuple, wrappedElems...)
+        end
+      end
+      #=
+        Record-field subscript: extract one named field from a record-valued
+        sub-expression. Surfaces on Magnetic.FundamentalWave / QuasiStatic
+        models where Modelica `Complex.*.multiply(c1,c2).re` reaches the
+        backend with an unevaluated outer `*` (the OMC inliner left it
+        intact). We lower this to `getproperty(inner, :fieldName)`, which
+        works for:
+          • Julia `Base.Complex` (has `re`/`im` fields directly)
+          • NamedTuple lowering of MOS / Medium parameter records (line 1480)
+          • Any user-defined Julia struct with the named field
+        For the canonical `re` / `im` fields we additionally hand off to
+        `real` / `imag` when the inner is a Symbolics `Num` so the
+        symbolic engine sees the structural complex projection rather
+        than a plain `getproperty` call. =#
+      DAE.RSUB(exp = innerExp, fieldName = fname) => begin
+        local innerJL = expToJuliaExpMTK(innerExp, simCode;
+                                          varPrefix=varPrefix,
+                                          varSuffix=varSuffix,
+                                          derSymbol=derSymbol)
+        if fname == "re"
+          :(OMBackend.CodeGeneration._recordFieldRe($innerJL))
+        elseif fname == "im"
+          :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
+        else
+          :(getproperty($innerJL, $(QuoteNode(Symbol(fname)))))
         end
       end
     _ =>  throw(ErrorException("$exp not yet supported"))
@@ -1420,6 +1544,29 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
   end
   return expr
 end
+
+"""
+  Helper used by the lowered DAE.RSUB(`re`) form. Falls back through:
+    Base.Complex — `.re`
+    NamedTuple / structs with `:re` — `getproperty`
+    Symbolics.Num wrapping a Complex term — `real(num)`
+  Annotated as `Base.Complex` because the module rebinds the bare name
+  `Complex` to a Modelica function wrapper via
+  `createModelicaFunctionWrapper(:Complex, …)`, which would otherwise
+  shadow the type and turn this method definition into "invalid type
+  for argument".
+"""
+@inline _recordFieldRe(x::Base.Complex) = x.re
+@inline _recordFieldRe(x::Tuple) = x[1]
+@inline _recordFieldRe(x) = hasproperty(x, :re) ? getproperty(x, :re) : real(x)
+
+"""
+  Companion to `_recordFieldRe` for the imaginary part (DAE.RSUB(`im`)).
+  Same `Base.Complex` reason: avoid the module-scope shadow of `Complex`.
+"""
+@inline _recordFieldIm(x::Base.Complex) = x.im
+@inline _recordFieldIm(x::Tuple) = x[2]
+@inline _recordFieldIm(x) = hasproperty(x, :im) ? getproperty(x, :im) : imag(x)
 
 """
 Extract integer array dimensions from a DAE.Type, or nothing if not an array type.
@@ -1668,10 +1815,71 @@ end
 
 
 """
-  Given the variable idx and simCode statically decide if this variable is involved in some event.
-(TODO: Unused)
+  Given the variable idx and simCode statically decide if this variable is
+  the LHS target of any when-equation `ASSIGN` / `REINIT` statement
+  (including elsewhen branches).
+
+  Such variables receive their state updates from discrete callbacks at
+  event time, so they should be routed into the discrete bucket rather than
+  the continuous residual set during MTK code generation. This prevents the
+  continuous integrator from synthesising a competing dynamic for a
+  variable that is only meaningful at event boundaries.
 """
 function involvedInEvent(idx, simCode)
+  local targetName = nothing
+  for (k, (i, sv)) in simCode.stringToSimVarHT
+    if i == idx
+      targetName = k
+      break
+    end
+  end
+  targetName === nothing && return false
+
+  for weq in simCode.whenEquations
+    local wEqInner = weq.whenEquation
+    if _whenStmtLstTargets(wEqInner.whenStmtLst, targetName)
+      return true
+    end
+    local ew = wEqInner.elsewhenPart
+    while ew !== nothing
+      local nested = ew.data
+      if _whenStmtLstTargets(nested.whenEquation.whenStmtLst, targetName)
+        return true
+      end
+      ew = nested.whenEquation.elsewhenPart
+    end
+  end
+  return false
+end
+
+"""
+  Walk a `List{BDAE.WhenOperator}` and return true if any `ASSIGN`'s
+  `left` cref-name or any `REINIT`'s `stateVar` cref-name matches
+  `targetName` (the simCode `stringToSimVarHT` key).
+"""
+function _whenStmtLstTargets(stmtLst, targetName::String)::Bool
+  for stmt in stmtLst
+    local lhsName = @match stmt begin
+      BDAE.ASSIGN(left = lhs) => begin
+        try
+          SimulationCode.string(lhs)
+        catch
+          ""
+        end
+      end
+      BDAE.REINIT(stateVar = sv) => begin
+        try
+          SimulationCode.string(sv)
+        catch
+          ""
+        end
+      end
+      _ => ""
+    end
+    if lhsName == targetName
+      return true
+    end
+  end
   return false
 end
 
@@ -1824,6 +2032,16 @@ Updates the simCode hash table with the solved binding values.
 """
 function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
   ht = simCode.stringToSimVarHT
+  #= Iterate to fixed-point: each pass may bind a free parameter that another
+     equation depends on. Cap iterations to (length+1) so a chain of N equations
+     finishes even with the worst-case ordering. =#
+  local nEq = length(simCode.initialEquations)
+  local solvedThisPass = true
+  local pass = 0
+  while solvedThisPass && pass <= nEq
+    solvedThisPass = false
+    pass += 1
+    local solvedNames = String[]
   for ieq in simCode.initialEquations
     if !isParametricOnlyEquation(ieq, simCode)
       continue
@@ -1895,12 +2113,30 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     end
     local lhsSubst = first(Util.traverseExpBottomUp(ieqLhs, substituteParams, 0))
     local rhsSubst = first(Util.traverseExpBottomUp(ieqRhs, substituteParams, 0))
+    #= If the free parameter sits on the LHS (e.g. `globalSeed_seed = automaticGlobalSeed(0.0)`),
+       swap the sides so eval(lhsJl) is on the constants side and the freeName lives in the
+       residual function we Newton-solve. Without this swap eval(lhsJl) tries to evaluate the
+       bare freeName cref and trips an UndefVarError. =#
+    local function _containsCref(exp, name::String)::Bool
+      local found = Ref(false)
+      function visit(e, acc)
+        if !found[] && Util.isCref(e) && string(e) == name
+          found[] = true
+        end
+        (e, true, acc)
+      end
+      Util.traverseExpBottomUp(exp, visit, 0)
+      return found[]
+    end
+    if _containsCref(lhsSubst, freeName) && !_containsCref(rhsSubst, freeName)
+      lhsSubst, rhsSubst = rhsSubst, lhsSubst
+    end
     #= Evaluate LHS (should be all constants) =#
     local lhsJl = expToJuliaExpMTK(lhsSubst, simCode)
     local lhsVal = try
       Float64(eval(lhsJl))
-    catch
-      @warn "solveParametricInitialEquations: could not evaluate LHS" freeName
+    catch err
+      @warn "solveParametricInitialEquations: could not evaluate LHS" freeName err
       continue
     end
     #= Build a Julia function for RHS with the free param as argument =#
@@ -1913,21 +2149,35 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       @warn "solveParametricInitialEquations: could not build residual" freeName e
       continue
     end
-    #= Newton-Raphson solver (use invokelatest to avoid world-age issues) =#
+    #= Newton-Raphson solver (use invokelatest to avoid world-age issues).
+       Wrapped in try/catch because rhsJl may reference parameters that have
+       a binding the front-end could not fold (so they are not in paramValues
+       and not freeName either). Invoking residualFn on such an expression
+       throws UndefVarError; without this catch the exception propagates out
+       of solveParametricInitialEquations and aborts translate. =#
     local x = guess
     local eps = 1e-10
     local maxIter = 100
-    for _ in 1:maxIter
-      local fx = Base.invokelatest(residualFn, x)
-      if abs(fx) < eps
-        break
+    local newtonOk = true
+    try
+      for _ in 1:maxIter
+        local fx = Base.invokelatest(residualFn, x)
+        if abs(fx) < eps
+          break
+        end
+        local h = max(abs(x) * 1e-8, 1e-12)
+        local dfx = (Base.invokelatest(residualFn, x + h) - Base.invokelatest(residualFn, x - h)) / (2h)
+        if abs(dfx) < 1e-15
+          break
+        end
+        x -= fx / dfx
       end
-      local h = max(abs(x) * 1e-8, 1e-12)
-      local dfx = (Base.invokelatest(residualFn, x + h) - Base.invokelatest(residualFn, x - h)) / (2h)
-      if abs(dfx) < 1e-15
-        break
-      end
-      x -= fx / dfx
+    catch err
+      @warn "solveParametricInitialEquations: residual call threw, skipping" freeName err
+      newtonOk = false
+    end
+    if !newtonOk
+      continue
     end
     @info "solveParametricInitialEquations: solved $freeName = $x (from initial equation)"
     #= Update the simCode hash table with the solved value =#
@@ -1935,7 +2185,15 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     local newSV = SimulationCode.SIMVAR(oldSV.name, oldSV.index,
       SimulationCode.PARAMETER(SOME(DAE.RCONST(x))), oldSV.attributes)
     ht[freeName] = (idx, newSV)
+    push!(solvedNames, freeName)
+    solvedThisPass = true
   end
+  if pass == 1 && !isempty(solvedNames)
+    @info "solveParametricInitialEquations: pass $pass solved $(length(solvedNames)) parameter(s)" solvedNames
+  elseif !isempty(solvedNames)
+    @info "solveParametricInitialEquations: pass $pass solved $(length(solvedNames)) more parameter(s)" solvedNames
+  end
+  end #= while fixed-point =#
 end
 
 """
@@ -2352,6 +2610,50 @@ function exprContainsDatatype(ex, datatype)
     return any(arg -> exprContainsDatatype(arg, datatype), ex.args)
   else
     return false
+  end
+end
+
+#= If `arg` is a Complex-returning expression (CALL with T_COMPLEX return,
+   or RECORD constructor), produce a Vector{Expr} of per-field scalar extracts
+   suitable for splicing into an enclosing call's argument list. Returns
+   `nothing` for anything else so callers can fall back to the default path.
+
+   For a CALL whose return is T_COMPLEX(varLst=[re, im]), this emits
+   `tupleElementCall(:funcName, k, ...inner-scalar-args...)` for k = 1..nFields.
+   For a RECORD literal it just splices the field expressions. =#
+function _expandComplexReturnArg(arg::DAE.Exp, simCode, hashTable;
+                                  varPrefix::String="", varSuffix::String="",
+                                  derSymbol::Bool=false)
+  @match arg begin
+    DAE.CALL(path, innerExpLst, DAE.CALL_ATTR(ty=DAE.T_COMPLEX(varLst=varLst))) => begin
+      local nFields = length(collect(varLst))
+      nFields >= 2 || return nothing
+      local fnName = Symbol(replace(string(path), "." => "_"))
+      local fnQuote = QuoteNode(fnName)
+      local innerArgs = Any[]
+      for inner in innerExpLst
+        local flat = flattenRecordCallArg(inner, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
+        if !isempty(flat)
+          append!(innerArgs, flat)
+          continue
+        end
+        local nested = _expandComplexReturnArg(inner, simCode, hashTable;
+                                                varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+        if nested !== nothing
+          append!(innerArgs, nested)
+          continue
+        end
+        push!(innerArgs, expToJuliaExpMTK(inner, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
+      end
+      return Any[:(OMBackend.CodeGeneration.tupleElementCall($fnQuote, $k, $(innerArgs...))) for k in 1:nFields]
+    end
+    DAE.RECORD(_, expl, _, DAE.T_COMPLEX(__)) => begin
+      local fieldExprs = [expToJuliaExpMTK(e, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+                          for e in expl]
+      length(fieldExprs) >= 2 || return nothing
+      return Any[fieldExprs...]
+    end
+    _ => return nothing
   end
 end
 
