@@ -650,6 +650,48 @@ function hasSymbolicArgs(args...)
 end
 
 """
+Look up an element of a constant Modelica array using runtime-resolvable
+subscripts. Used for `Table[in1, in2]` patterns where the table is constant
+but indices are runtime CREFs (Modelica.Electrical.Digital gates, lookup
+tables, etc.).
+
+When called with numeric args, returns `table[Int(round(i)), Int(round(j))]`
+directly. When called with at least one symbolic arg, wraps the lookup in an
+opaque Symbolics term so MTK structural-simplify treats it as a black box
+(rather than refusing to use a Num as an array index, or constructing an
+unwieldy ifelse chain).
+
+Vararg subscripts to support both vectors and N-dimensional arrays.
+"""
+function constTableLookup(table::AbstractArray, idxs...)
+  if hasSymbolicArgs(idxs...)
+    local _table = table
+    local f = (rt_idxs...) -> begin
+      local resolved = ntuple(length(rt_idxs)) do k
+        local v = rt_idxs[k]
+        if v isa Integer
+          Int(v)
+        else
+          Int(round(Float64(v)))
+        end
+      end
+      _table[resolved...]
+    end
+    return makeSymbolicTerm(f, Any[idxs...])
+  else
+    return table[ntuple(k -> _toIndex(idxs[k]), length(idxs))...]
+  end
+end
+
+function _toIndex(v)
+  if v isa Integer
+    return Int(v)
+  else
+    return Int(round(Float64(v)))
+  end
+end
+
+"""
 Prepare arguments for eager evaluation of Modelica functions with symbolic args.
 Converts Vector{Vector{T}} (Modelica nested-vector matrices) to Matrix{T} so that
 generated function bodies using A[i,j] indexing work correctly.
@@ -806,7 +848,7 @@ Rewrite equations for MTK: move derivatives to the LHS, rename der to D,
 qualify Modelica function calls, and wrap dynamic calls with invokelatest.
 """
 function rewriteEquations(edeqs, simCode)
-  local funcNames = Set{Symbol}(Symbol(replace(f.name, "." => "_")) for f in simCode.functions)
+  local funcNames = Set{Symbol}(Symbol(f.name) for f in simCode.functions)
   return rewriteEquationsExprLevel(edeqs isa Vector{Expr} ? edeqs : Expr[e for e in edeqs];
                                    modelicaFuncNames = funcNames)
 end
@@ -943,17 +985,18 @@ function resolveAliasInitialValue(diffState, fullEqs, ivMap::Dict)
       continue
     end
     local expr = eq.lhs - eq.rhs
-    #= Substitute all known initial values =#
     local exprSub = Symbolics.substitute(expr, ivMap)
-    #= Check if what remains is linear in diffState =#
-    local c = Symbolics.substitute(exprSub, Dict(diffState => 0))
-    local a_plus_c = Symbolics.substitute(exprSub, Dict(diffState => 1))
-    if !(c isa Number) || !(a_plus_c isa Number)
+    #= Symbolics.substitute returns a wrapped BasicSymbolic constant after a
+       full substitution; unwrap with `Symbolics.value` so `isa Number` holds. =#
+    local intercept = Symbolics.value(Symbolics.substitute(exprSub, Dict(diffState => 0)))
+    local sumOnePoint = Symbolics.value(Symbolics.substitute(exprSub, Dict(diffState => 1)))
+    local fullyResolvedToNumber = intercept isa Number && sumOnePoint isa Number
+    if !fullyResolvedToNumber
       continue
     end
-    local a = a_plus_c - c
-    if !iszero(a)
-      return Float64(Symbolics.unwrap(-c / a))
+    local slope = sumOnePoint - intercept
+    if !iszero(slope)
+      return Float64(-intercept / slope)
     end
   end
   return nothing
@@ -1004,11 +1047,41 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
      to the correct root for differential states (e.g. Pendulum: x,y pinned at 10
      forces phi = 3π/4 via x=L*sin(phi), y=-L*cos(phi)). Soft guesses alone are
      insufficient because the NLS minimises motion from the guess and moves x,y
-     instead of phi, collapsing to phi=0 and x=0,y=-L. =#
-  if isempty(hardInitialValues) && !isempty(softInitialValues)
+     instead of phi, collapsing to phi=0 and x=0,y=-L.
+
+     Skip when the System carries non-empty `initialization_eqs`: those
+     constraints define the IC, and pinning every default-0 algebraic IV as
+     hard u0 over-constrains the init problem so MTK silently picks a
+     trivial-zero root and violates the user's `start = N`. =#
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
+  local hasInitConstraints = !isempty(initEqs)
+  if isempty(hardInitialValues) && !isempty(softInitialValues) && !hasInitConstraints
     @info "No differential states have explicit IVs; pinning $(length(softInitialValues)) algebraic IVs as hard u0 so DAE init can solve for diff states"
     hardInitialValues = softInitialValues
     softInitialValues = Pair[]
+  end
+  #= Promote `lhs ~ literal` init_eqs to hard u0 entries when `lhs` is a
+     reduced unknown. MTK's init solver treats `initialization_eqs` as
+     least-squares residuals, so a single `Inertia_w ~ 10` can be sacrificed
+     against many algebraic residuals minimised toward zero. =#
+  if hasInitConstraints
+    local hardKeyStrSet = Set(string(p.first) for p in hardInitialValues)
+    local reducedUnkStrSet = Set(string(u) for u in reducedUnks)
+    local promoted = 0
+    for eq in initEqs
+      local rhsVal = Symbolics.value(eq.rhs)
+      rhsVal isa Number || continue
+      local lhsStr = string(eq.lhs)
+      lhsStr in reducedUnkStrSet || continue
+      lhsStr in hardKeyStrSet && continue
+      push!(hardInitialValues, eq.lhs => Float64(rhsVal))
+      push!(hardKeyStrSet, lhsStr)
+      softInitialValues = filter(p -> string(p.first) != lhsStr, softInitialValues)
+      promoted += 1
+    end
+    if promoted > 0
+      @info "Promoted $(promoted) initialization_eqs literal constraints to hard u0"
+    end
   end
   if !isempty(softInitialValues)
     local currentGuesses = ModelingToolkit.guesses(reducedSystem)
@@ -1026,9 +1099,37 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
      Num-wrapped keys (from finalInitialValues) and BasicSymbolic values (from
      reducedUnks/diffStateSet) can fail. =#
   local hardSymStrSet = Set(string(iv.first) for iv in hardInitialValues)
-  local allIVMap = Dict{Any, Any}(iv.first => iv.second
-                                  for iv in vcat(hardInitialValues, softInitialValues, allInitialValues))
+  #= Only feed user-explicit start values (hard + soft, both filtered through
+     `skipDefaultsForStates`) to the alias resolver. `allInitialValues` carries
+     default 0.0 entries for non-explicit vars; substituting those lets a
+     trivial-zero alias win over a non-zero user-explicit one. =#
+  local explicitIVMap = Dict{Any, Any}(iv.first => iv.second
+                                       for iv in vcat(hardInitialValues, softInitialValues))
   local fullEqs = ModelingToolkit.full_equations(reducedSystem)
+  #= Propagate hard u0 entries through algebraic alias chains in the reduced
+     system. Iterates to a fixed point so multi-step chains resolve, and
+     covers MTK-generated derivative-suffix vars regardless of mass-matrix
+     classification (Engine1a's `Inertia_phiˍt` is the differential state but
+     `Inertia_w` is its algebraic alias; promoting `Inertia_w ~ 10` to hard u0
+     lets us propagate to `Inertia_phiˍt` via the alias). =#
+  local progressed = true
+  while progressed
+    progressed = false
+    explicitIVMap = Dict{Any, Any}(iv.first => iv.second
+                                   for iv in vcat(hardInitialValues, softInitialValues))
+    for unk in reducedUnks
+      local unkStr = string(unk)
+      unkStr in hardSymStrSet && continue
+      contains(unkStr, "ˍ") || continue
+      local ivMapForResolve = filter(p -> string(p.first) != unkStr, explicitIVMap)
+      local resolved = resolveAliasInitialValue(unk, fullEqs, ivMapForResolve)
+      resolved === nothing && continue
+      push!(hardInitialValues, unk => Float64(resolved))
+      push!(hardSymStrSet, unkStr)
+      progressed = true
+      @info "Resolved $(unk) to $(resolved) via equation alias"
+    end
+  end
   for diffState in diffStateSet
     if !(string(diffState) in hardSymStrSet)
       local diffStateStr = string(diffState)
@@ -1040,7 +1141,7 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
          algebraic constraints and guesses (e.g. phi inferred from x,y via
          x = L*sin(phi)). Adding hard 0.0 would override this inference. =#
       if contains(diffStateStr, "\u02cd")
-        local ivMapForResolve = filter(p -> string(p.first) != diffStateStr, allIVMap)
+        local ivMapForResolve = filter(p -> string(p.first) != diffStateStr, explicitIVMap)
         local resolved = resolveAliasInitialValue(diffState, fullEqs, ivMapForResolve)
         local finalVal = something(resolved, 0.0)
         push!(hardInitialValues, diffState => finalVal)

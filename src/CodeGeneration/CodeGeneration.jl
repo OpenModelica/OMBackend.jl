@@ -49,6 +49,7 @@ using ..SimulationCode
 
 import ..Backend.BDAE
 import ..@BACKEND_LOGGING
+import ..COMPONENT_SEPARATOR
 
 import Absyn
 import DAE

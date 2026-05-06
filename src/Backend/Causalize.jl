@@ -42,6 +42,7 @@ import ..BackendEquation
 import ..@BACKEND_LOGGING
 import ..FrontendUtil.Util
 import DAE
+import OMBackend
 
 
 """
@@ -538,7 +539,7 @@ function findRecordFieldArray(cr::DAE.ComponentRef)
     #= Direct match: record.field where record is T_COMPLEX and field is T_ARRAY =#
     DAE.CREF_QUAL(ident, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), _, _), outerSubs,
                   DAE.CREF_IDENT(fieldName, fieldType && DAE.T_ARRAY(elemTy, dims), _)) => begin
-      local baseName = string(ident) * subscriptListToString(outerSubs) * "_" * string(fieldName)
+      local baseName = string(ident) * subscriptListToString(outerSubs) * OMBackend.COMPONENT_SEPARATOR * string(fieldName)
       return (baseName, fieldType, elemTy, dims)
     end
     #= Recursive case: prefix.rest where rest contains the record boundary deeper down =#
@@ -546,7 +547,7 @@ function findRecordFieldArray(cr::DAE.ComponentRef)
       local inner = findRecordFieldArray(innerCref)
       if inner !== nothing
         local (innerBase, fieldType, elemTy, dims) = inner
-        local baseName = string(ident) * subscriptListToString(outerSubs) * "_" * innerBase
+        local baseName = string(ident) * subscriptListToString(outerSubs) * OMBackend.COMPONENT_SEPARATOR * innerBase
         return (baseName, fieldType, elemTy, dims)
       end
       return nothing
@@ -723,7 +724,7 @@ function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
   fieldIdx = 0
   for field in ty.varLst
     fieldIdx += 1
-    fieldName = string(baseName, "_", field.name)
+    fieldName = string(baseName, OMBackend.COMPONENT_SEPARATOR, field.name)
     fieldTy = field.ty
     exprField = DAE.ASUB(exprSide, list(DAE.ICONST(fieldIdx)))
     @match fieldTy begin
@@ -1200,13 +1201,13 @@ function crefToFlatName(cref::DAE.ComponentRef, prefix::String="")::Tuple{String
       else
         identType
       end
-      baseName = isempty(prefix) ? ident : string(prefix, "_", ident)
+      baseName = isempty(prefix) ? ident : string(prefix, OMBackend.COMPONENT_SEPARATOR, ident)
       (baseName, resultType, subscriptLst)
     end
     DAE.CREF_QUAL(ident, identType, subscriptLst, componentRef) => begin
       (restName, elementType, finalSubscripts) = crefToFlatName(componentRef, "")
       subsStr = subscriptListToString(subscriptLst)
-      baseName = isempty(prefix) ? string(ident, subsStr, "_", restName) : string(prefix, "_", ident, subsStr, "_", restName)
+      baseName = isempty(prefix) ? string(ident, subsStr, OMBackend.COMPONENT_SEPARATOR, restName) : string(prefix, OMBackend.COMPONENT_SEPARATOR, ident, subsStr, OMBackend.COMPONENT_SEPARATOR, restName)
       (baseName, elementType, finalSubscripts)
     end
     _ => begin
@@ -1340,7 +1341,10 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
   #= Integers written inside a when-clause are DISCRETE state, not constant
      parameters. Collect the set of such names so we skip them during
      reclassification and keep their defining WHEN_EQUATIONs intact. =#
-  intVarsWrittenInWhen = _collectIntegerLhsInWhen(syst.orderedEqs, intVarNames, intVarBaseNames)
+  intVarsWrittenInWhen = union(
+    _collectIntegerLhsInWhen(syst.orderedEqs, intVarNames, intVarBaseNames),
+    _collectIntegerLhsInAlgorithm(syst.orderedEqs, intVarNames, intVarBaseNames),
+  )
   #= Scan equations: extract constant values and mark for removal.
      An equation is removed if either side references an integer variable.
      For ARRAY_EQUATION/COMPLEX_EQUATION, match against base names too. =#
@@ -1521,6 +1525,61 @@ function _collectWhenAssignsLhs!(result::Set{String}, we,
       end
     end
     _ => nothing
+  end
+end
+
+"""
+  Collect the set of Integer/enum variable names that appear on the LHS of
+  any assignment statement inside a BDAE.ALGORITHM equation. Gate logic in
+  Modelica.Electrical.Digital uses algorithm sections (not when-clauses) to
+  update auxiliary lookup arrays — variables assigned here must not be
+  reclassified as constant parameters.
+"""
+function _collectIntegerLhsInAlgorithm(orderedEqs, intVarNames::Set{String},
+                                        intVarBaseNames::Set{String})::Set{String}
+  local allIntNames = union(intVarNames, intVarBaseNames)
+  local result = Set{String}()
+  for eq in orderedEqs
+    if !(eq isa BDAE.ALGORITHM)
+      continue
+    end
+    alg = eq.alg
+    if alg isa DAE.ALGORITHM_STMTS
+      _collectAlgorithmStmtLhs!(result, alg.statementLst, allIntNames)
+    end
+  end
+  return result
+end
+
+function _collectAlgorithmStmtLhs!(result::Set{String}, stmts, allIntNames::Set{String})
+  for stmt in stmts
+    if stmt isa DAE.STMT_ASSIGN || stmt isa DAE.STMT_ASSIGN_ARR
+      local lhsExp = stmt isa DAE.STMT_ASSIGN ? stmt.exp1 : stmt.lhs
+      if lhsExp isa DAE.CREF
+        local name = string(lhsExp.componentRef)
+        if name in allIntNames
+          push!(result, name)
+        end
+        local baseName = replace(name, r"\[.*\]$" => "")
+        if baseName in allIntNames
+          push!(result, baseName)
+        end
+      end
+    elseif stmt isa DAE.STMT_FOR || stmt isa DAE.STMT_PARFOR || stmt isa DAE.STMT_WHILE
+      _collectAlgorithmStmtLhs!(result, stmt.statementLst, allIntNames)
+    elseif stmt isa DAE.STMT_IF
+      _collectAlgorithmStmtLhs!(result, stmt.statementLst, allIntNames)
+      _collectAlgorithmElseLhs!(result, stmt.else_, allIntNames)
+    end
+  end
+end
+
+function _collectAlgorithmElseLhs!(result::Set{String}, elseBranch, allIntNames::Set{String})
+  if elseBranch isa DAE.ELSEIF
+    _collectAlgorithmStmtLhs!(result, elseBranch.statementLst, allIntNames)
+    _collectAlgorithmElseLhs!(result, elseBranch.else_, allIntNames)
+  elseif elseBranch isa DAE.ELSE
+    _collectAlgorithmStmtLhs!(result, elseBranch.statementLst, allIntNames)
   end
 end
 

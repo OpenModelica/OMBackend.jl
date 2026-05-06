@@ -40,6 +40,43 @@ function getElementFromSCodeProgram(prefixes::Vector{String}, inClass::SCode.Ele
   return currentElement
 end
 
+function _findClassPathByCanonicalName(target::String,
+                                       inClass::SCode.Element,
+                                       path::Vector{String})
+  if OMBackend.canonicalName(join(path, ".")) == target
+    return copy(path)
+  end
+
+  for element in listArray(SCodeUtil.getClassElements(inClass))
+    if SCodeUtil.isClass(element)
+      push!(path, SCodeUtil.elementName(element))
+      local found = _findClassPathByCanonicalName(target, element, path)
+      pop!(path)
+      if found !== nothing
+        return found
+      end
+    end
+  end
+
+  return nothing
+end
+
+function modelicaPathName(activeModeName::String, inClass::SCode.Element)::String
+  if occursin(".", activeModeName)
+    return activeModeName
+  end
+
+  local rootPath = String[SCodeUtil.elementName(inClass)]
+  local found = _findClassPathByCanonicalName(OMBackend.canonicalName(activeModeName),
+                                             inClass,
+                                             rootPath)
+  if found !== nothing
+    return join(found, ".")
+  end
+
+  return activeModeName
+end
+
 """
 
 """
@@ -66,9 +103,11 @@ function setElementInSCodeProgram!(activeModeName, inIdent::String, newValue::T,
   #=
   Get the class name. The active class is required to be top level currently.
   =#
+  local modelicaActiveModeName = modelicaPathName(activeModeName, inClass)
   @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modename.log"), activeModeName)
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modelica_modename.log"), modelicaActiveModeName)
   @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "original.log"), OMBackend.JuliaFormatter.format_text(string(inClass)))
-  local activeModeNamePrefixes::Vector{String} = map(string, split(activeModeName, "."))
+  local activeModeNamePrefixes::Vector{String} = map(string, split(modelicaActiveModeName, "."))
   @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "prefixes.log"), OMBackend.JuliaFormatter.format_text(string(activeModeNamePrefixes)))
   local activeClass  = getElementFromSCodeProgram(activeModeNamePrefixes, inClass)
   @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "active.log"), OMBackend.JuliaFormatter.format_text(string(activeClass)))
@@ -95,7 +134,7 @@ function setElementInSCodeProgram!(activeModeName, inIdent::String, newValue::T,
   @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "elementToReplace.log"), OMBackend.JuliaFormatter.format_text(string(elementToReplace)))
   @match modifiedProg <| MetaModelica.nil = replaceElementInSCodeProgramByName(inClass,
                                                                   activeClass,
-                                                                  activeModeName)
+                                                                  modelicaActiveModeName)
   @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modifiedProg.log"), OMBackend.JuliaFormatter.format_text(string(modifiedProg)))
   @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "tmpClass.log"), OMBackend.JuliaFormatter.format_text(string(inClass)))
   #=

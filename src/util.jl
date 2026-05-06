@@ -34,6 +34,10 @@ This file contains utility macros used by the backend.
 =#
 
 using Dates
+using DataStructures: OrderedDict
+
+import Absyn
+import DAE
 
 
 """
@@ -68,6 +72,97 @@ macro VSS_DEBUG(expr)
     return nothing
   end
 end
+
+const COMPONENT_SEPARATOR = "_"
+
+function _joinCanonicalSegments(segs)::String
+  return join((String(s) for s in segs), COMPONENT_SEPARATOR)
+end
+
+function _canonicalIdentSegments(ident::AbstractString)::Vector{String}
+  local s = String(ident)
+  if startswith(s, "'") && endswith(s, "'")
+    return String[s]
+  end
+  if occursin('.', s)
+    return String[String(seg) for seg in split(s, '.')]
+  end
+  return String[s]
+end
+
+function _subscriptSuffix(subscriptLst)::String
+  local buf = IOBuffer()
+  for s in subscriptLst
+    print(buf, "[")
+    print(buf, string(s))
+    print(buf, "]")
+  end
+  return String(take!(buf))
+end
+
+function _canonicalPathSegments(path::Absyn.IDENT)
+  return _canonicalIdentSegments(path.name)
+end
+
+function _canonicalPathSegments(path::Absyn.QUALIFIED)
+  return vcat(_canonicalIdentSegments(path.name), _canonicalPathSegments(path.path))
+end
+
+function _canonicalPathSegments(path::Absyn.FULLYQUALIFIED)
+  return _canonicalPathSegments(path.path)
+end
+
+function _canonicalCrefSegments(cr::DAE.CREF_IDENT)
+  local segs = _canonicalIdentSegments(cr.ident)
+  segs[end] = string(segs[end], _subscriptSuffix(cr.subscriptLst))
+  return segs
+end
+
+function _canonicalCrefSegments(cr::DAE.CREF_QUAL)
+  local segs = _canonicalIdentSegments(cr.ident)
+  segs[end] = string(segs[end], _subscriptSuffix(cr.subscriptLst))
+  return vcat(segs,
+              _canonicalCrefSegments(cr.componentRef))
+end
+
+function _canonicalCrefSegments(cr::DAE.CREF_ITER)
+  local segs = _canonicalIdentSegments(cr.ident)
+  segs[end] = string(segs[end], _subscriptSuffix(cr.subscriptLst))
+  return segs
+end
+
+function canonicalName(name::AbstractString)::String
+  local s = String(name)
+  if startswith(s, "der(") && endswith(s, ")")
+    return string("der(", canonicalName(s[5:end-1]), ")")
+  end
+  if startswith(s, "'") && endswith(s, "'")
+    return s
+  end
+  if occursin('.', s)
+    return _joinCanonicalSegments(split(s, '.'))
+  end
+  return s
+end
+
+canonicalName(path::Absyn.Path)::String = _joinCanonicalSegments(_canonicalPathSegments(path))
+canonicalName(cr::DAE.ComponentRef)::String = _joinCanonicalSegments(_canonicalCrefSegments(cr))
+canonicalName(exp::DAE.CREF)::String = canonicalName(exp.componentRef)
+
+canonicalSymbol(x)::Symbol = Symbol(canonicalName(x))
+
+#= NameRewriteMap is populated incrementally by `_recordNameRewrite!` while the
+   canonicalize pass walks the SimCode tree. Use `canonicalToOriginal[canonical]`
+   to recover the dotted Modelica name for diagnostics; the standalone
+   "originalName" inverse cannot be reconstructed from a canonical string alone
+   because `.` is irreversibly collapsed to `_`. =#
+struct NameRewriteMap
+  originalToCanonical::OrderedDict{String, String}
+  canonicalToOriginal::OrderedDict{String, String}
+end
+
+NameRewriteMap() = NameRewriteMap(OrderedDict{String, String}(),
+                                  OrderedDict{String, String}())
 
 
 #= -----------------------------------------------------------------------------

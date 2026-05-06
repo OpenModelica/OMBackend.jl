@@ -10,6 +10,92 @@ hasFlatModel(simCode)::Bool = !isnothing(simCode.flatModel)
 hasMetaModel(simCode)::Bool = !isnothing(simCode.metaModel)
 
 """
+Compact structural counters for the SIM_CODE optimization pipeline.
+These are intentionally cheap: they help identify which simcode pass reduced
+the system before MTK sees it without walking every expression.
+"""
+struct SimCodeMetrics
+  residualEquations::Int
+  initialEquations::Int
+  ifEquations::Int
+  ifBranches::Int
+  conditionalResidualEquations::Int
+  whenEquations::Int
+  variables::Int
+  unknowns::Int
+  parameters::Int
+  aliases::Int
+  eliminatedVariables::Int
+end
+
+function simCodeMetrics(simCode::SIM_CODE)::SimCodeMetrics
+  local nUnknowns = 0
+  local nParameters = 0
+  for (_, simVar) in values(simCode.stringToSimVarHT)
+    if isUnknownVarKind(simVar.varKind)
+      nUnknowns += 1
+    elseif isParameter(simVar)
+      nParameters += 1
+    end
+  end
+  local nIfBranches = 0
+  local nConditionalResiduals = 0
+  for ifEq in simCode.ifEquations
+    nIfBranches += length(ifEq.branches)
+    for branch in ifEq.branches
+      nConditionalResiduals += length(branch.residualEquations)
+    end
+  end
+  return SimCodeMetrics(length(simCode.residualEquations),
+                        length(simCode.initialEquations),
+                        length(simCode.ifEquations),
+                        nIfBranches,
+                        nConditionalResiduals,
+                        length(simCode.whenEquations),
+                        length(simCode.stringToSimVarHT),
+                        nUnknowns,
+                        nParameters,
+                        length(simCode.aliasMap),
+                        length(simCode.eliminatedVariables))
+end
+
+function _metricDelta(before::Int, after::Int)::String
+  return before == after ? "$after" : "$before->$after"
+end
+
+function logSimCodePassMetrics(passName::AbstractString,
+                               before::SimCodeMetrics,
+                               after::SimCodeMetrics,
+                               elapsed_s::Real)
+  if before == after
+    return nothing
+  end
+  @info "[SIMCODE: $passName] metrics" elapsed_ms=round(1000 * elapsed_s, digits = 3) residuals=_metricDelta(before.residualEquations, after.residualEquations) initial=_metricDelta(before.initialEquations, after.initialEquations) ifEquations=_metricDelta(before.ifEquations, after.ifEquations) ifBranches=_metricDelta(before.ifBranches, after.ifBranches) conditionalResiduals=_metricDelta(before.conditionalResidualEquations, after.conditionalResidualEquations) variables=_metricDelta(before.variables, after.variables) unknowns=_metricDelta(before.unknowns, after.unknowns) parameters=_metricDelta(before.parameters, after.parameters) aliases=_metricDelta(before.aliases, after.aliases) eliminatedVariables=_metricDelta(before.eliminatedVariables, after.eliminatedVariables)
+  return nothing
+end
+
+function logSimCodePassMetrics(passName::AbstractString,
+                               before::SimCodeMetrics,
+                               simCode::SIM_CODE,
+                               elapsed_s::Real)
+  return logSimCodePassMetrics(passName, before, simCodeMetrics(simCode), elapsed_s)
+end
+
+function runSimCodePass(passName::AbstractString,
+                        simCode::SIM_CODE,
+                        passFn::Function;
+                        cleanup::Bool = true)::SIM_CODE
+  local before = simCodeMetrics(simCode)
+  local t0 = time()
+  local afterPass = passFn(simCode)
+  logSimCodePassMetrics(passName, before, afterPass, time() - t0)
+  if cleanup
+    afterPass = cleanupTrivialResidualEquations(afterPass; sourcePass = passName)
+  end
+  return afterPass
+end
+
+"""
   Returns true if simvar is either a algebraic or a state variable.
 """
 function isStateOrAlgebraic(simvar::SimVar)::Bool
@@ -807,7 +893,7 @@ function rebuildMatchOrder(simCode::SIM_CODE)
      equations will remain unmatched. For under-determined systems (nEqs > nVars),
      skip since we cannot produce a valid matching. =#
   if nEqs > nVars
-    @info "rebuildMatchOrder: under-determined system ($nEqs equations, $nVars unknowns), skipping"
+    @info "[SIMCODE: rebuildMatchOrder] under-determined system ($nEqs equations, $nVars unknowns), skipping"
     return (Int[], nameToMatchIdx, matchIdxToName)
   end
   local nMatch = nVars
@@ -821,11 +907,11 @@ function rebuildMatchOrder(simCode::SIM_CODE)
     local (_isSingular, mo) = GraphAlgorithms.matching(eqVarMapping, nMatch)
     matchOrder = mo
   catch e
-    @info "rebuildMatchOrder: matching failed, skipping DCE" exception=(e, catch_backtrace())
+    @info "[SIMCODE: rebuildMatchOrder] matching failed, skipping DCE" exception=(e, catch_backtrace())
     return (Int[], nameToMatchIdx, matchIdxToName)
   end
   local nMatched = count(>(0), matchOrder)
-  @info "rebuildMatchOrder: $nEqs equations, $nVars unknowns, $nMatched matched"
+  @info "[SIMCODE: rebuildMatchOrder] $nEqs equations, $nVars unknowns, $nMatched matched"
   return (matchOrder, nameToMatchIdx, matchIdxToName)
 end
 
@@ -922,6 +1008,319 @@ function collectCrefNames!(names::Set{String}, @nospecialize(exp))
     _ => ()
   end
   return nothing
+end
+
+function _hasUnknownCref(exp, ht)::Bool
+  local names = Set{String}()
+  collectCrefNames!(names, exp)
+  for name in names
+    local entry = get(ht, name, nothing)
+    if entry !== nothing && isUnknownVarKind(last(entry).varKind)
+      return true
+    end
+  end
+  return false
+end
+
+function _isZeroLiteral(@nospecialize(exp))::Bool
+  @match exp begin
+    DAE.RCONST(v) => v == 0.0
+    DAE.ICONST(v) => v == 0
+    _ => false
+  end
+end
+
+function _isSyntacticZeroResidual(@nospecialize(exp))::Bool
+  if _isZeroLiteral(exp)
+    return true
+  end
+  @match exp begin
+    DAE.BINARY(e1, DAE.SUB(__), e2) => isequal(e1, e2)
+    DAE.BINARY(e1, DAE.ADD(__), DAE.UNARY(DAE.UMINUS(__), e2)) => isequal(e1, e2)
+    DAE.BINARY(DAE.UNARY(DAE.UMINUS(__), e1), DAE.ADD(__), e2) => isequal(e1, e2)
+    _ => false
+  end
+end
+
+function _isTrivialResidualEquation(eq::BDAE.RESIDUAL_EQUATION, simCode::SIM_CODE)::Bool
+  if _hasUnknownCref(eq.exp, simCode.stringToSimVarHT)
+    return false
+  end
+  if _isSyntacticZeroResidual(eq.exp)
+    return true
+  end
+  local value = tryEvalNumeric(eq.exp, simCode)
+  return value !== nothing && value == 0.0
+end
+
+function _isTrivialInitialEquation(@nospecialize(eq), simCode::SIM_CODE)::Bool
+  if eq isa BDAE.RESIDUAL_EQUATION
+    return _isTrivialResidualEquation(eq, simCode)
+  elseif eq isa BDAE.EQUATION
+    if _hasUnknownCref(eq.lhs, simCode.stringToSimVarHT) ||
+       _hasUnknownCref(eq.rhs, simCode.stringToSimVarHT)
+      return false
+    end
+    if isequal(eq.lhs, eq.rhs)
+      return true
+    end
+    local lhsVal = tryEvalScalar(eq.lhs, simCode)
+    local rhsVal = tryEvalScalar(eq.rhs, simCode)
+    return lhsVal !== nothing && rhsVal !== nothing && lhsVal == rhsVal
+  end
+  return false
+end
+
+function _filterTrivialResiduals(eqs::Vector{BDAE.RESIDUAL_EQUATION},
+                                 simCode::SIM_CODE)::Tuple{Vector{BDAE.RESIDUAL_EQUATION}, Int}
+  local newEqs = BDAE.RESIDUAL_EQUATION[]
+  sizehint!(newEqs, length(eqs))
+  local nRemoved = 0
+  for eq in eqs
+    if _isTrivialResidualEquation(eq, simCode)
+      nRemoved += 1
+    else
+      push!(newEqs, eq)
+    end
+  end
+  return (newEqs, nRemoved)
+end
+
+function _filterTrivialInitialEquations(eqs, simCode::SIM_CODE)
+  local newEqs = typeof(eqs)()
+  local nRemoved = 0
+  for eq in eqs
+    if _isTrivialInitialEquation(eq, simCode)
+      nRemoved += 1
+    else
+      push!(newEqs, eq)
+    end
+  end
+  return (newEqs, nRemoved)
+end
+
+function _cleanupTrivialBranchResiduals(ifEq::IF_EQUATION,
+                                        simCode::SIM_CODE)::Tuple{Union{IF_EQUATION, Nothing}, Int}
+  if isempty(ifEq.branches)
+    return (nothing, 0)
+  end
+  local nResiduals = length(first(ifEq.branches).residualEquations)
+  if any(branch -> length(branch.residualEquations) != nResiduals, ifEq.branches)
+    return (ifEq, 0)
+  end
+  local keep = trues(nResiduals)
+  local nRemovedSlots = 0
+  for idx in 1:nResiduals
+    local allTrivial = true
+    for branch in ifEq.branches
+      if !_isTrivialResidualEquation(branch.residualEquations[idx], simCode)
+        allTrivial = false
+        break
+      end
+    end
+    if allTrivial
+      keep[idx] = false
+      nRemovedSlots += 1
+    end
+  end
+  if nRemovedSlots == 0
+    return (ifEq, 0)
+  end
+  if nRemovedSlots == nResiduals
+    return (nothing, nRemovedSlots * length(ifEq.branches))
+  end
+  local newBranches = BRANCH[]
+  for branch in ifEq.branches
+    local newResiduals = BDAE.RESIDUAL_EQUATION[branch.residualEquations[i] for i in 1:nResiduals if keep[i]]
+    push!(newBranches, BRANCH(branch.condition, newResiduals,
+                              branch.identifier, branch.targets, branch.isSingular,
+                              branch.matchOrder, branch.equationGraph, branch.sccs,
+                              branch.stringToSimVarHT))
+  end
+  return (IF_EQUATION(newBranches), nRemovedSlots * length(ifEq.branches))
+end
+
+"""
+    cleanupTrivialResidualEquations(simCode; sourcePass = "")
+
+Remove residuals that are provably trivial without symbolic algebra. To avoid
+changing equation/unknown balance, a residual is only removed when it contains
+no unknown cref and it evaluates or simplifies syntactically to zero. Branch
+residuals are removed only when the same residual slot is trivial in every
+branch of an IF_EQUATION, preserving the branch alignment expected by codegen.
+"""
+function cleanupTrivialResidualEquations(simCode::SIM_CODE;
+                                         sourcePass::AbstractString = "")::SIM_CODE
+  local (newResiduals, nResidualsRemoved) =
+    _filterTrivialResiduals(simCode.residualEquations, simCode)
+  local (newInitials, nInitialsRemoved) =
+    _filterTrivialInitialEquations(simCode.initialEquations, simCode)
+  local newIfEquations = IF_EQUATION[]
+  local nConditionalRemoved = 0
+  local nIfRemoved = 0
+  for ifEq in simCode.ifEquations
+    local (newIfEq, nRemoved) = _cleanupTrivialBranchResiduals(ifEq, simCode)
+    nConditionalRemoved += nRemoved
+    if newIfEq === nothing
+      nIfRemoved += 1
+    else
+      push!(newIfEquations, newIfEq)
+    end
+  end
+  if nResidualsRemoved == 0 && nInitialsRemoved == 0 &&
+     nConditionalRemoved == 0 && nIfRemoved == 0
+    return simCode
+  end
+  @assign simCode.residualEquations = newResiduals
+  @assign simCode.initialEquations = newInitials
+  @assign simCode.ifEquations = newIfEquations
+  local afterText = isempty(sourcePass) ? "" : " after $sourcePass"
+  @info "[SIMCODE: trivialCleanup] removed trivial equations$afterText" residuals=nResidualsRemoved initial=nInitialsRemoved conditionalResiduals=nConditionalRemoved ifEquations=nIfRemoved
+  return simCode
+end
+
+function _rewriteResidualIfExp(eq::BDAE.RESIDUAL_EQUATION, simCode::SIM_CODE)::BDAE.RESIDUAL_EQUATION
+  local newExp = resolveConstantIfExp(eq.exp, simCode)
+  return newExp === eq.exp ? eq : BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr)
+end
+
+function _rewriteInitialIfExp(@nospecialize(eq), simCode::SIM_CODE)
+  if eq isa BDAE.RESIDUAL_EQUATION
+    return _rewriteResidualIfExp(eq, simCode)
+  elseif eq isa BDAE.EQUATION
+    local newLhs = resolveConstantIfExp(eq.lhs, simCode)
+    local newRhs = resolveConstantIfExp(eq.rhs, simCode)
+    return (newLhs === eq.lhs && newRhs === eq.rhs) ? eq :
+           BDAE.EQUATION(newLhs, newRhs, eq.source, eq.attributes)
+  end
+  return eq
+end
+
+function _rewriteBranchIfExp(branch::BRANCH, simCode::SIM_CODE)::BRANCH
+  local newCondition = branch.identifier == ELSE_BRANCH ?
+                       branch.condition :
+                       resolveConstantIfExp(branch.condition, simCode)
+  local newResiduals = BDAE.RESIDUAL_EQUATION[
+    _rewriteResidualIfExp(eq, simCode) for eq in branch.residualEquations
+  ]
+  return BRANCH(newCondition, newResiduals,
+                branch.identifier, branch.targets, branch.isSingular,
+                branch.matchOrder, branch.equationGraph, branch.sccs,
+                branch.stringToSimVarHT)
+end
+
+function _reindexIfBranches(branches::Vector{BRANCH})::Vector{BRANCH}
+  local n = length(branches)
+  local out = BRANCH[]
+  sizehint!(out, n)
+  for (idx, branch) in enumerate(branches)
+    local isLast = idx == n
+    local isElse = branch.identifier == ELSE_BRANCH || isLast
+    local identifier = isElse ? ELSE_BRANCH : idx
+    local target = isElse ? ELSE_BRANCH : idx + 1
+    local condition = isElse ? DAE.SCONST("ELSE_BRANCH") : branch.condition
+    push!(out, BRANCH(condition, branch.residualEquations,
+                      identifier, target, branch.isSingular,
+                      branch.matchOrder, branch.equationGraph, branch.sccs,
+                      branch.stringToSimVarHT))
+  end
+  return out
+end
+
+function _pruneIfEquation(ifEq::IF_EQUATION,
+                          simCode::SIM_CODE)::Tuple{Union{IF_EQUATION, Nothing}, Vector{BDAE.RESIDUAL_EQUATION}, Int, Bool}
+  local rewrittenBranches = BRANCH[_rewriteBranchIfExp(branch, simCode) for branch in ifEq.branches]
+  local newBranches = BRANCH[]
+  local promoted = BDAE.RESIDUAL_EQUATION[]
+  local nPrunedBranches = 0
+  local hasUnconditionalFallback = false
+  for branch in rewrittenBranches
+    if branch.identifier == ELSE_BRANCH
+      hasUnconditionalFallback = true
+      if isempty(newBranches)
+        append!(promoted, branch.residualEquations)
+        return (nothing, promoted, nPrunedBranches + 1, true)
+      end
+      push!(newBranches, branch)
+      return (IF_EQUATION(_reindexIfBranches(newBranches)), promoted, nPrunedBranches, true)
+    end
+    local condValue = tryEvalCondition(branch.condition, simCode)
+    if condValue === false
+      nPrunedBranches += 1
+      continue
+    elseif condValue === true
+      hasUnconditionalFallback = true
+      if isempty(newBranches)
+        append!(promoted, branch.residualEquations)
+        return (nothing, promoted, nPrunedBranches + 1, true)
+      end
+      push!(newBranches, BRANCH(DAE.SCONST("ELSE_BRANCH"),
+                                branch.residualEquations,
+                                ELSE_BRANCH, ELSE_BRANCH, branch.isSingular,
+                                branch.matchOrder, branch.equationGraph, branch.sccs,
+                                branch.stringToSimVarHT))
+      return (IF_EQUATION(_reindexIfBranches(newBranches)), promoted, nPrunedBranches + 1, true)
+    else
+      push!(newBranches, branch)
+    end
+  end
+  if isempty(newBranches)
+    return (nothing, promoted, nPrunedBranches, hasUnconditionalFallback)
+  end
+  if !hasUnconditionalFallback
+    #= No `else` branch was found and no static-true branch fired. We saw only
+       `false` and dynamic branches. The Modelica spec says an IF_EQUATION
+       without `else` contributes equations only when one branch matches at
+       runtime; statically-false branches are dead. We could safely drop them,
+       but doing so would also need a structural recount further upstream
+       (branches participate in matching/causalisation). Keep the conservative
+       behaviour and return the IFEXP-rewritten branch list unchanged. The
+       prune count is reported truthfully so the log is not misleading. =#
+    return (IF_EQUATION(rewrittenBranches), promoted, nPrunedBranches, false)
+  end
+  return (IF_EQUATION(_reindexIfBranches(newBranches)), promoted, nPrunedBranches, true)
+end
+
+"""
+    pruneConstantConditions(simCode)
+
+Resolve constant-condition IFEXP nodes throughout the main equation vectors and
+prune IF_EQUATION branches whose guards are compile-time constants. If a branch
+is selected before any dynamic guard remains, its residual equations are promoted
+to top-level residuals and the IF_EQUATION is removed.
+"""
+function pruneConstantConditions(simCode::SIM_CODE)::SIM_CODE
+  local newResiduals = BDAE.RESIDUAL_EQUATION[
+    _rewriteResidualIfExp(eq, simCode) for eq in simCode.residualEquations
+  ]
+  local newInitials = typeof(simCode.initialEquations)()
+  for eq in simCode.initialEquations
+    push!(newInitials, _rewriteInitialIfExp(eq, simCode))
+  end
+  local newIfEquations = IF_EQUATION[]
+  local nPrunedBranches = 0
+  local nPromotedResiduals = 0
+  local nRemovedIfEquations = 0
+  for ifEq in simCode.ifEquations
+    local (newIfEq, promoted, pruned, _) = _pruneIfEquation(ifEq, simCode)
+    nPrunedBranches += pruned
+    if !isempty(promoted)
+      append!(newResiduals, promoted)
+      nPromotedResiduals += length(promoted)
+    end
+    if newIfEq === nothing
+      nRemovedIfEquations += 1
+    else
+      push!(newIfEquations, newIfEq)
+    end
+  end
+  @assign simCode.residualEquations = newResiduals
+  @assign simCode.initialEquations = newInitials
+  @assign simCode.ifEquations = newIfEquations
+  if nPrunedBranches > 0 || nPromotedResiduals > 0 || nRemovedIfEquations > 0
+    @info "[SIMCODE: constantConditionPruning] pruned constant conditions" branches=nPrunedBranches promotedResiduals=nPromotedResiduals removedIfEquations=nRemovedIfEquations
+  end
+  return simCode
 end
 
 """
@@ -1107,20 +1506,20 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
      metaModel/flatModel), but allow DOCC models (structuralTransitions only)
      since they re-flatten at runtime =#
   if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
-    @info "eliminateNonDynamic: skipping for VSS/multi-mode model"
+    @info "[SIMCODE: eliminateNonDynamic] skipping for VSS/multi-mode model"
     return simCode
   end
   #= Rebuild a fresh matching from the current (post-optimization) system =#
   local (matchOrder, nameToMatchIdx, matchIdxToName) = rebuildMatchOrder(simCode)
   if isempty(matchOrder)
-    @info "eliminateNonDynamic: matching failed or system not square, skipping"
+    @info "[SIMCODE: eliminateNonDynamic] matching failed or system not square, skipping"
     return simCode
   end
   #= Identify output-only equations and variables using the fresh matching =#
   local (outputOnlyVarNames, outputOnlyEqIndices, eqRefs) =
     identifyOutputOnlyVariables(simCode, matchOrder, matchIdxToName)
   if isempty(outputOnlyEqIndices)
-    @info "eliminateNonDynamic: no output-only equations found"
+    @info "[SIMCODE: eliminateNonDynamic] no output-only equations found"
     return simCode
   end
   #= Build inverse matching: equation index -> match index =#
@@ -1168,13 +1567,13 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     end
   end
   if isempty(eqsToEliminate)
-    @info "eliminateNonDynamic: no eliminable equation-variable pairs found"
+    @info "[SIMCODE: eliminateNonDynamic] no eliminable equation-variable pairs found"
     return simCode
   end
   #= Guard: never eliminate ALL equations. A system with zero equations
      after elimination would crash downstream (filterConstantEquations, MTK). =#
   if length(eqsToEliminate) >= length(simCode.residualEquations)
-    @info "eliminateNonDynamic: would eliminate all $(length(simCode.residualEquations)) equations, skipping"
+    @info "[SIMCODE: eliminateNonDynamic] would eliminate all $(length(simCode.residualEquations)) equations, skipping"
     return simCode
   end
   #= Safety check: verify no surviving equation references an eliminated variable.
@@ -1259,7 +1658,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   for varName in varsToRemove
     delete!(newHT, varName)
   end
-  @info "eliminateNonDynamic: eliminated $(length(eqsToEliminate)) eq-var pairs, $(length(varsToRemove)) variables removed (rescued: $nRescued, skipped: $nSkippedNonAlg non-algebraic, $nSkippedUnmatched unmatched). $(length(newResEqs)) equations, $(length(newHT)) variables remain"
+  @info "[SIMCODE: eliminateNonDynamic] eliminated $(length(eqsToEliminate)) eq-var pairs, $(length(varsToRemove)) variables removed (rescued: $nRescued, skipped: $nSkippedNonAlg non-algebraic, $nSkippedUnmatched unmatched). $(length(newResEqs)) equations, $(length(newHT)) variables remain"
   @BACKEND_LOGGING begin
     local buf = IOBuffer()
     println(buf, "=== ELIMINATION DEBUG ===")
@@ -1585,7 +1984,7 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
      case, keep at least the original residuals so the normal alias/constant
      elimination pipeline handles the trivial simplification. =#
   if length(simCode.residualEquations) - length(elimIdxSet) == 0
-    @info "foldParameterClosure: fold would eliminate all residuals; skipping to preserve MTK build" wouldFold=length(foldMap)
+    @info "[SIMCODE: foldParameterClosure] fold would eliminate all residuals; skipping to preserve MTK build" wouldFold=length(foldMap)
     return simCode
   end
 
@@ -1787,6 +2186,696 @@ function isParameterClosureExp(@nospecialize(exp), ht, foldedNames::Set{String},
   return true
 end
 
+struct _CanonicalNameContext
+  rename::Dict{String, String}
+  known::Set{String}
+  nameMap::OMBackend.NameRewriteMap
+end
+
+function _canonicalVariableKey(name::AbstractString)::String
+  return OMBackend.canonicalName(name)
+end
+
+function _recordNameRewrite!(ctx::_CanonicalNameContext, original::AbstractString,
+                             canonical::AbstractString)::String
+  local originalName = String(original)
+  local canonicalName = String(canonical)
+  ctx.nameMap.originalToCanonical[originalName] = canonicalName
+  if originalName != canonicalName || !haskey(ctx.nameMap.canonicalToOriginal, canonicalName)
+    ctx.nameMap.canonicalToOriginal[canonicalName] = originalName
+  end
+  return canonicalName
+end
+
+function _canonicalVariableKey(name::AbstractString, ctx::_CanonicalNameContext)::String
+  return _recordNameRewrite!(ctx, name, OMBackend.canonicalName(name))
+end
+
+function _originalPathName(path::Absyn.IDENT)::String
+  return path.name
+end
+
+function _originalPathName(path::Absyn.QUALIFIED)::String
+  return Base.string(path.name, ".", _originalPathName(path.path))
+end
+
+function _originalPathName(path::Absyn.FULLYQUALIFIED)::String
+  return Base.string(".", _originalPathName(path.path))
+end
+
+function _originalSubscriptSuffix(subscriptLst)::String
+  if listEmpty(subscriptLst)
+    return ""
+  end
+  local buf = IOBuffer()
+  for subscript in subscriptLst
+    print(buf, "[")
+    print(buf, Base.string(subscript))
+    print(buf, "]")
+  end
+  return String(take!(buf))
+end
+
+function _originalCrefName(cr::DAE.CREF_IDENT)::String
+  return Base.string(cr.ident, _originalSubscriptSuffix(cr.subscriptLst))
+end
+
+function _originalCrefName(cr::DAE.CREF_ITER)::String
+  return Base.string(cr.ident, _originalSubscriptSuffix(cr.subscriptLst))
+end
+
+function _originalCrefName(cr::DAE.CREF_QUAL)::String
+  return Base.string(cr.ident,
+                     _originalSubscriptSuffix(cr.subscriptLst),
+                     ".",
+                     _originalCrefName(cr.componentRef))
+end
+
+function _originalCrefName(cr::DAE.WILD)::String
+  return "_"
+end
+
+function _originalCrefName(cr::DAE.OPTIMICA_ATTR_INST_CREF)::String
+  return _originalCrefName(cr.componentRef)
+end
+
+function _canonicalizeVarKind(kind::SimVarType, ctx::_CanonicalNameContext)::SimVarType
+  return @match kind begin
+    STATE_DERIVATIVE(varName) => STATE_DERIVATIVE(_canonicalVariableKey(varName, ctx))
+    PARAMETER(SOME(bindExp)) => PARAMETER(SOME(_canonicalizeExp(bindExp, ctx)))
+    DATA_STRUCTURE(SOME(bindExp)) => DATA_STRUCTURE(SOME(_canonicalizeExp(bindExp, ctx)))
+    ARRAY(dims, SOME(bindExp)) => ARRAY(dims, SOME(_canonicalizeExp(bindExp, ctx)))
+    ARRAY_PARAMETER(dims, SOME(bindExp)) => ARRAY_PARAMETER(dims, SOME(_canonicalizeExp(bindExp, ctx)))
+    STRING(SOME(bindExp)) => STRING(SOME(_canonicalizeExp(bindExp, ctx)))
+    _ => kind
+  end
+end
+
+function _canonicalizeSimVar(sv::SIMVAR, ctx::_CanonicalNameContext)::SIMVAR
+  return SIMVAR(_canonicalVariableKey(sv.name, ctx),
+                sv.index,
+                _canonicalizeVarKind(sv.varKind, ctx),
+                sv.attributes)
+end
+
+function _canonicalizeSimVarHT(ht::AbstractDict{String, Tuple{Integer, SimVar}},
+                               ctx::_CanonicalNameContext)
+  local out = OrderedDict{String, Tuple{Integer, SimVar}}()
+  for (name, (idx, sv)) in ht
+    local canonicalName = get(ctx.rename, name, nothing)
+    if canonicalName === nothing
+      canonicalName = _canonicalVariableKey(name, ctx)
+    else
+      _recordNameRewrite!(ctx, name, canonicalName)
+    end
+    local newVar = _canonicalizeSimVar(sv, ctx)
+    if newVar.name != canonicalName
+      newVar = SIMVAR(canonicalName, newVar.index, newVar.varKind, newVar.attributes)
+    end
+    out[canonicalName] = (idx, newVar)
+  end
+  return out
+end
+
+function _canonicalizeExp(@nospecialize(exp), ctx::_CanonicalNameContext)
+  local (newExp, _) = Util.traverseExpTopDown(exp, _canonicalizeCrefExp, ctx)
+  return newExp
+end
+
+function _canonicalizeCrefExp(@nospecialize(exp), ctx::_CanonicalNameContext)
+  @match exp begin
+    DAE.CREF(cr, ty) => begin
+      return (DAE.CREF(_canonicalizeComponentRef(cr, ty, ctx), ty), false, ctx)
+    end
+    DAE.CALL(path, expLst, attr) => begin
+      local canonicalPath = OMBackend.canonicalName(path)
+      _recordNameRewrite!(ctx, _originalPathName(path), canonicalPath)
+      return (DAE.CALL(Absyn.IDENT(canonicalPath), expLst, attr), true, ctx)
+    end
+    DAE.RECORD(path, exps, comp, ty) => begin
+      local canonicalPath = OMBackend.canonicalName(path)
+      _recordNameRewrite!(ctx, _originalPathName(path), canonicalPath)
+      return (DAE.RECORD(Absyn.IDENT(canonicalPath), exps, comp, ty), true, ctx)
+    end
+    DAE.PARTEVALFUNCTION(path, expList, ty, origType) => begin
+      local canonicalPath = OMBackend.canonicalName(path)
+      _recordNameRewrite!(ctx, _originalPathName(path), canonicalPath)
+      return (DAE.PARTEVALFUNCTION(Absyn.IDENT(canonicalPath), expList, ty, origType), true, ctx)
+    end
+    _ => return (exp, true, ctx)
+  end
+end
+
+function _stripInnermostSubscripts(cr::DAE.CREF_IDENT)
+  return DAE.CREF_IDENT(cr.ident, cr.identType, MetaModelica.nil)
+end
+
+function _stripInnermostSubscripts(cr::DAE.CREF_ITER)
+  return DAE.CREF_ITER(cr.ident, cr.index, cr.identType, MetaModelica.nil)
+end
+
+function _stripInnermostSubscripts(cr::DAE.CREF_QUAL)
+  return DAE.CREF_QUAL(cr.ident,
+                       cr.identType,
+                       cr.subscriptLst,
+                       _stripInnermostSubscripts(cr.componentRef))
+end
+
+function _innermostSubscripts(cr::DAE.CREF_IDENT)
+  return cr.subscriptLst
+end
+
+function _innermostSubscripts(cr::DAE.CREF_ITER)
+  return cr.subscriptLst
+end
+
+function _innermostSubscripts(cr::DAE.CREF_QUAL)
+  return _innermostSubscripts(cr.componentRef)
+end
+
+function _innermostType(cr::DAE.CREF_IDENT)
+  return cr.identType
+end
+
+function _innermostType(cr::DAE.CREF_ITER)
+  return cr.identType
+end
+
+function _innermostType(cr::DAE.CREF_QUAL)
+  return _innermostType(cr.componentRef)
+end
+
+function _hasDimensions(dims)::Bool
+  try
+    return !listEmpty(dims)
+  catch
+    for _ in dims
+      return true
+    end
+  end
+  return false
+end
+
+function _declaredDaeVarCrefType(v::DAE.VAR)::DAE.Type
+  local crefTy = _innermostType(v.componentRef)
+  if crefTy isa DAE.T_UNKNOWN
+    crefTy = v.ty
+  elseif !(crefTy isa DAE.T_ARRAY) && v.ty isa DAE.T_ARRAY
+    crefTy = v.ty
+  end
+  if !(crefTy isa DAE.T_ARRAY) && _hasDimensions(v.dims)
+    return DAE.T_ARRAY(crefTy, v.dims)
+  end
+  return crefTy
+end
+
+function _canonicalizeComponentRef(cr::DAE.ComponentRef, ty::DAE.Type,
+                                   ctx::_CanonicalNameContext)::DAE.ComponentRef
+  local originalFull = _originalCrefName(cr)
+  local fullName = OMBackend.canonicalName(cr)
+  local canonicalFull = get(ctx.rename, originalFull, nothing)
+  if canonicalFull === nothing
+    canonicalFull = get(ctx.rename, fullName, nothing)
+  end
+  if canonicalFull === nothing
+    canonicalFull = _recordNameRewrite!(ctx, originalFull, fullName)
+  else
+    _recordNameRewrite!(ctx, originalFull, canonicalFull)
+  end
+  if canonicalFull in ctx.known
+    return DAE.CREF_IDENT(canonicalFull, ty, MetaModelica.nil)
+  end
+
+  local baseCr = _stripInnermostSubscripts(cr)
+  local originalBase = _originalCrefName(baseCr)
+  local baseName = OMBackend.canonicalName(baseCr)
+  local canonicalBase = get(ctx.rename, originalBase, nothing)
+  if canonicalBase === nothing
+    canonicalBase = get(ctx.rename, baseName, nothing)
+  end
+  if canonicalBase === nothing
+    canonicalBase = _recordNameRewrite!(ctx, originalBase, baseName)
+  else
+    _recordNameRewrite!(ctx, originalBase, canonicalBase)
+  end
+  local finalSubs = _innermostSubscripts(cr)
+  if canonicalBase in ctx.known || !listEmpty(finalSubs)
+    return DAE.CREF_IDENT(canonicalBase, _innermostType(cr), finalSubs)
+  end
+
+  return DAE.CREF_IDENT(canonicalFull, ty, MetaModelica.nil)
+end
+
+function _canonicalizeEquation(eq, ctx::_CanonicalNameContext)
+  if eq isa BDAE.RESIDUAL_EQUATION
+    return BDAE.RESIDUAL_EQUATION(_canonicalizeExp(eq.exp, ctx), eq.source, eq.attr)
+  elseif eq isa BDAE.EQUATION
+    return BDAE.EQUATION(_canonicalizeExp(eq.lhs, ctx),
+                         _canonicalizeExp(eq.rhs, ctx),
+                         eq.source,
+                         eq.attributes)
+  elseif eq isa BDAE.ARRAY_EQUATION
+    return BDAE.ARRAY_EQUATION(eq.dimSize,
+                               _canonicalizeExp(eq.left, ctx),
+                               _canonicalizeExp(eq.right, ctx),
+                               eq.source,
+                               eq.attr,
+                               eq.recordSize)
+  elseif eq isa BDAE.COMPLEX_EQUATION
+    return BDAE.COMPLEX_EQUATION(eq.size,
+                                 _canonicalizeExp(eq.left, ctx),
+                                 _canonicalizeExp(eq.right, ctx),
+                                 eq.source,
+                                 eq.attr)
+  elseif eq isa BDAE.SOLVED_EQUATION
+    return BDAE.SOLVED_EQUATION(_canonicalizeComponentRef(eq.componentRef, _innermostType(eq.componentRef), ctx),
+                                _canonicalizeExp(eq.exp, ctx),
+                                eq.source,
+                                eq.attr)
+  elseif eq isa BDAE.WHEN_EQUATION
+    return BDAE.WHEN_EQUATION(eq.size,
+                              _canonicalizeWhenStmts(eq.whenEquation, ctx),
+                              eq.source,
+                              eq.attr)
+  elseif eq isa BDAE.STRUCTURAL_WHEN_EQUATION
+    return BDAE.STRUCTURAL_WHEN_EQUATION(eq.size,
+                                         _canonicalizeWhenStmts(eq.whenEquation, ctx),
+                                         eq.source,
+                                         eq.attr)
+  elseif eq isa BDAE.IF_EQUATION
+    local newConditions = _mapList(e -> _canonicalizeExp(e, ctx), eq.conditions)
+    local newTrue = _mapList(branch -> _mapList(e -> _canonicalizeEquation(e, ctx), branch), eq.eqnstrue)
+    local newFalse = _mapList(e -> _canonicalizeEquation(e, ctx), eq.eqnsfalse)
+    return BDAE.IF_EQUATION(newConditions, newTrue, newFalse, eq.source, eq.attr)
+  elseif eq isa BDAE.ALGORITHM
+    return BDAE.ALGORITHM(eq.size, _canonicalizeAlgorithm(eq.alg, ctx), eq.source, eq.expand, eq.attr)
+  elseif eq isa BDAE.ASSERT_EQUATION
+    return BDAE.ASSERT_EQUATION(_canonicalizeExp(eq.condition, ctx),
+                                _canonicalizeExp(eq.message, ctx),
+                                _canonicalizeExp(eq.level, ctx),
+                                eq.source)
+  end
+  return eq
+end
+
+function _recordFunctionVarName!(known::Set{String}, v::DAE.VAR,
+                                 ctx::_CanonicalNameContext)
+  local original = _originalCrefName(v.componentRef)
+  local canonical = OMBackend.canonicalName(v.componentRef)
+  _recordNameRewrite!(ctx, original, canonical)
+  push!(known, canonical)
+  return nothing
+end
+
+function _mapList(f::Function, lst)
+  local out = MetaModelica.nil
+  for x in lst
+    out = f(x) <| out
+  end
+  return listReverse(out)
+end
+
+function _mapVectorLike(f::Function, xs)
+  local out = typeof(xs)()
+  for x in xs
+    push!(out, f(x))
+  end
+  return out
+end
+
+function _canonicalizeWhenStmts(whenStmts::BDAE.WHEN_STMTS,
+                                ctx::_CanonicalNameContext)
+  local newCond = _canonicalizeExp(whenStmts.condition, ctx)
+  local newStmtLst = _mapList(stmt -> _canonicalizeWhenOperator(stmt, ctx),
+                              whenStmts.whenStmtLst)
+  local newElse = @match whenStmts.elsewhenPart begin
+    SOME(elseWhenEq) => SOME(_canonicalizeElseWhenPart(elseWhenEq, ctx))
+    NONE() => NONE()
+    _ => whenStmts.elsewhenPart
+  end
+  return BDAE.WHEN_STMTS(newCond, newStmtLst, newElse)
+end
+
+function _canonicalizeElseWhenPart(elseWhen, ctx::_CanonicalNameContext)
+  if elseWhen isa BDAE.WHEN_STMTS
+    return _canonicalizeWhenStmts(elseWhen, ctx)
+  end
+  return _canonicalizeEquation(elseWhen, ctx)
+end
+
+function _canonicalizeCrefValue(exp::DAE.CREF, ctx::_CanonicalNameContext)::DAE.CREF
+  local newExp = _canonicalizeExp(exp, ctx)
+  return newExp isa DAE.CREF ? newExp : exp
+end
+
+function _canonicalizeWhenOperator(stmt, ctx::_CanonicalNameContext)
+  if stmt isa BDAE.ASSIGN
+    return BDAE.ASSIGN(_canonicalizeExp(stmt.left, ctx),
+                       _canonicalizeExp(stmt.right, ctx),
+                       stmt.source)
+  elseif stmt isa BDAE.REINIT
+    return BDAE.REINIT(_canonicalizeCrefValue(stmt.stateVar, ctx),
+                       _canonicalizeExp(stmt.value, ctx),
+                       stmt.source)
+  elseif stmt isa BDAE.ASSERT
+    return BDAE.ASSERT(_canonicalizeExp(stmt.condition, ctx),
+                       _canonicalizeExp(stmt.message, ctx),
+                       _canonicalizeExp(stmt.level, ctx),
+                       stmt.source)
+  elseif stmt isa BDAE.TERMINATE
+    return BDAE.TERMINATE(_canonicalizeExp(stmt.message, ctx), stmt.source)
+  elseif stmt isa BDAE.NORETCALL
+    return BDAE.NORETCALL(_canonicalizeExp(stmt.exp, ctx), stmt.source)
+  elseif stmt isa BDAE.RECOMPILATION
+    return BDAE.RECOMPILATION(_canonicalizeCrefValue(stmt.componentToChange, ctx),
+                              _canonicalizeExp(stmt.newValue, ctx))
+  elseif stmt isa BDAE.AGENTIC_RECOMPILATION
+    return BDAE.AGENTIC_RECOMPILATION([_canonicalizeCrefValue(c, ctx) for c in stmt.componentsToChange],
+                                      stmt.prompt,
+                                      stmt.initialEquations)
+  end
+  return stmt
+end
+
+function _canonicalizeBranch(branch::BRANCH, ctx::_CanonicalNameContext)
+  return BRANCH(_canonicalizeExp(branch.condition, ctx),
+                _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), branch.residualEquations),
+                branch.identifier,
+                branch.targets,
+                branch.isSingular,
+                branch.matchOrder,
+                branch.equationGraph,
+                branch.sccs,
+                _canonicalizeSimVarHT(branch.stringToSimVarHT, ctx))
+end
+
+function _canonicalizeStructuralTransition(tr::StructuralTransition,
+                                           ctx::_CanonicalNameContext)
+  if tr isa EXPLICIT_STRUCTURAL_TRANSISTION
+    local st = tr.structuralTransition
+    return EXPLICIT_STRUCTURAL_TRANSISTION(
+      BDAE.STRUCTURAL_TRANSISTION(_canonicalVariableKey(st.fromState, ctx),
+                                  _canonicalVariableKey(st.toState, ctx),
+                                  _canonicalizeExp(st.transistionCondition, ctx)))
+  elseif tr isa IMPLICIT_STRUCTURAL_TRANSISTION
+    return IMPLICIT_STRUCTURAL_TRANSISTION(_canonicalizeEquation(tr.structuralWhenEquation, ctx))
+  end
+  return tr
+end
+
+function _canonicalizeIfEquation(ifEq::IF_EQUATION, ctx::_CanonicalNameContext)
+  return IF_EQUATION(_mapVectorLike(branch -> _canonicalizeBranch(branch, ctx),
+                                    ifEq.branches))
+end
+
+function _canonicalizeDaeVar(v::DAE.VAR, ctx::_CanonicalNameContext)::DAE.VAR
+  local newBinding = @match v.binding begin
+    SOME(b) => SOME(_canonicalizeExp(b, ctx))
+    NONE() => NONE()
+  end
+  return DAE.VAR(_canonicalizeComponentRef(v.componentRef, _declaredDaeVarCrefType(v), ctx),
+                 v.kind,
+                 v.direction,
+                 v.parallelism,
+                 v.protection,
+                 v.ty,
+                 newBinding,
+                 v.dims,
+                 v.connectorType,
+                 v.source,
+                 v.variableAttributesOption,
+                 v.comment,
+                 v.innerOuter)
+end
+
+function _canonicalizeStatement(stmt::DAE.Statement, ctx::_CanonicalNameContext)::DAE.Statement
+  if stmt isa DAE.STMT_ASSIGN
+    return DAE.STMT_ASSIGN(stmt.type_,
+                           _canonicalizeExp(stmt.exp1, ctx),
+                           _canonicalizeExp(stmt.exp, ctx),
+                           stmt.source)
+  elseif stmt isa DAE.STMT_TUPLE_ASSIGN
+    return DAE.STMT_TUPLE_ASSIGN(stmt.type_,
+                                 _mapList(e -> _canonicalizeExp(e, ctx), stmt.expExpLst),
+                                 _canonicalizeExp(stmt.exp, ctx),
+                                 stmt.source)
+  elseif stmt isa DAE.STMT_ASSIGN_ARR
+    return DAE.STMT_ASSIGN_ARR(stmt.type_,
+                               _canonicalizeExp(stmt.lhs, ctx),
+                               _canonicalizeExp(stmt.exp, ctx),
+                               stmt.source)
+  elseif stmt isa DAE.STMT_IF
+    return DAE.STMT_IF(_canonicalizeExp(stmt.exp, ctx),
+                       _mapList(s -> _canonicalizeStatement(s, ctx), stmt.statementLst),
+                       _canonicalizeElse(stmt.else_, ctx),
+                       stmt.source)
+  elseif stmt isa DAE.STMT_FOR
+    return DAE.STMT_FOR(stmt.type_,
+                        stmt.iterIsArray,
+                        stmt.iter,
+                        stmt.index,
+                        _canonicalizeExp(stmt.range, ctx),
+                        _mapList(s -> _canonicalizeStatement(s, ctx), stmt.statementLst),
+                        stmt.source)
+  elseif stmt isa DAE.STMT_PARFOR
+    return DAE.STMT_PARFOR(stmt.type_,
+                           stmt.iterIsArray,
+                           stmt.iter,
+                           stmt.index,
+                           _canonicalizeExp(stmt.range, ctx),
+                           _mapList(s -> _canonicalizeStatement(s, ctx), stmt.statementLst),
+                           stmt.loopPrlVars,
+                           stmt.source)
+  elseif stmt isa DAE.STMT_WHILE
+    return DAE.STMT_WHILE(_canonicalizeExp(stmt.exp, ctx),
+                          _mapList(s -> _canonicalizeStatement(s, ctx), stmt.statementLst),
+                          stmt.source)
+  elseif stmt isa DAE.STMT_WHEN
+    local newElseWhen = @match stmt.elseWhen begin
+      SOME(s) => SOME(_canonicalizeStatement(s, ctx))
+      NONE() => NONE()
+    end
+    return DAE.STMT_WHEN(_canonicalizeExp(stmt.exp, ctx),
+                         _mapList(c -> _canonicalizeComponentRef(c, _innermostType(c), ctx), stmt.conditions),
+                         stmt.initialCall,
+                         _mapList(s -> _canonicalizeStatement(s, ctx), stmt.statementLst),
+                         newElseWhen,
+                         stmt.source)
+  elseif stmt isa DAE.STMT_ASSERT
+    return DAE.STMT_ASSERT(_canonicalizeExp(stmt.cond, ctx),
+                           _canonicalizeExp(stmt.msg, ctx),
+                           _canonicalizeExp(stmt.level, ctx),
+                           stmt.source)
+  elseif stmt isa DAE.STMT_TERMINATE
+    return DAE.STMT_TERMINATE(_canonicalizeExp(stmt.msg, ctx), stmt.source)
+  elseif stmt isa DAE.STMT_REINIT
+    return DAE.STMT_REINIT(_canonicalizeExp(stmt.var, ctx),
+                           _canonicalizeExp(stmt.value, ctx),
+                           stmt.source)
+  elseif stmt isa DAE.STMT_NORETCALL
+    return DAE.STMT_NORETCALL(_canonicalizeExp(stmt.exp, ctx), stmt.source)
+  elseif stmt isa DAE.STMT_FAILURE
+    return DAE.STMT_FAILURE(_mapList(s -> _canonicalizeStatement(s, ctx), stmt.body),
+                            stmt.source)
+  end
+  return stmt
+end
+
+function _canonicalizeElse(elseBranch::DAE.Else, ctx::_CanonicalNameContext)::DAE.Else
+  if elseBranch isa DAE.ELSEIF
+    return DAE.ELSEIF(_canonicalizeExp(elseBranch.exp, ctx),
+                      _mapList(s -> _canonicalizeStatement(s, ctx), elseBranch.statementLst),
+                      _canonicalizeElse(elseBranch.else_, ctx))
+  elseif elseBranch isa DAE.ELSE
+    return DAE.ELSE(_mapList(s -> _canonicalizeStatement(s, ctx), elseBranch.statementLst))
+  end
+  return elseBranch
+end
+
+function _canonicalizeAlgorithm(alg::DAE.Algorithm, ctx::_CanonicalNameContext)::DAE.Algorithm
+  if alg isa DAE.ALGORITHM_STMTS
+    return DAE.ALGORITHM_STMTS(_mapList(s -> _canonicalizeStatement(s, ctx), alg.statementLst))
+  end
+  return alg
+end
+
+function _functionCanonicalNameContext(f, ctx::_CanonicalNameContext)
+  local known = Set{String}(["time", "pi", "e"])
+  if hasproperty(f, :inputs)
+    for v in f.inputs
+      _recordFunctionVarName!(known, v, ctx)
+    end
+  end
+  if hasproperty(f, :outputs)
+    for v in f.outputs
+      _recordFunctionVarName!(known, v, ctx)
+    end
+  end
+  if hasproperty(f, :locals)
+    for v in f.locals
+      _recordFunctionVarName!(known, v, ctx)
+    end
+  end
+  return _CanonicalNameContext(ctx.rename, known, ctx.nameMap)
+end
+
+function _canonicalizeFunction(f::MODELICA_FUNCTION, ctx::_CanonicalNameContext)
+  local canonicalFunctionName = _canonicalVariableKey(f.name, ctx)
+  local functionCtx = _functionCanonicalNameContext(f, ctx)
+  return MODELICA_FUNCTION(canonicalFunctionName,
+                           _mapVectorLike(v -> _canonicalizeDaeVar(v, functionCtx), f.inputs),
+                           _mapVectorLike(v -> _canonicalizeDaeVar(v, functionCtx), f.outputs),
+                           _mapVectorLike(v -> _canonicalizeDaeVar(v, functionCtx), f.locals),
+                           _mapVectorLike(s -> _canonicalizeStatement(s, functionCtx), f.statements))
+end
+
+function _canonicalizeFunction(f::EXTERNAL_MODELICA_FUNCTION, ctx::_CanonicalNameContext)
+  local canonicalFunctionName = _canonicalVariableKey(f.name, ctx)
+  local functionCtx = _functionCanonicalNameContext(f, ctx)
+  return EXTERNAL_MODELICA_FUNCTION(canonicalFunctionName,
+                                    _mapVectorLike(v -> _canonicalizeDaeVar(v, functionCtx), f.inputs),
+                                    _mapVectorLike(v -> _canonicalizeDaeVar(v, functionCtx), f.outputs),
+                                    f.libInfo)
+end
+
+function _canonicalizeFunction(f::ModelicaFunction, ctx::_CanonicalNameContext)
+  return f
+end
+
+function canonicalizeCrefNames(simCode::SIM_CODE;
+                               nameMap::OMBackend.NameRewriteMap = OMBackend.NameRewriteMap())::SIM_CODE
+  local rename = Dict{String, String}()
+  for name in keys(simCode.stringToSimVarHT)
+    rename[name] = _canonicalVariableKey(name)
+  end
+  for name in simCode.eliminatedVariables
+    rename[name] = _canonicalVariableKey(name)
+  end
+  for entry in simCode.aliasMap
+    rename[entry.eliminatedName] = _canonicalVariableKey(entry.eliminatedName)
+    rename[entry.representativeName] = _canonicalVariableKey(entry.representativeName)
+  end
+
+  local known = Set{String}(values(rename))
+  union!(known, Set(["time", "pi", "e"]))
+  local ctx = _CanonicalNameContext(rename, known, nameMap)
+
+  @assign simCode.name = _canonicalVariableKey(simCode.name, ctx)
+  @assign simCode.stringToSimVarHT = _canonicalizeSimVarHT(simCode.stringToSimVarHT, ctx)
+  @assign simCode.residualEquations = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.residualEquations)
+  @assign simCode.initialEquations = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.initialEquations)
+  @assign simCode.whenEquations = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.whenEquations)
+  @assign simCode.ifEquations = _mapVectorLike(ifEq -> _canonicalizeIfEquation(ifEq, ctx), simCode.ifEquations)
+  @assign simCode.structuralTransitions = _mapVectorLike(tr -> _canonicalizeStructuralTransition(tr, ctx),
+                                                         simCode.structuralTransitions)
+  @assign simCode.subModels = _mapVectorLike(subModel -> canonicalizeCrefNames(subModel; nameMap = nameMap), simCode.subModels)
+  @assign simCode.sharedVariables = _mapVectorLike(name -> _canonicalVariableKey(name, ctx), simCode.sharedVariables)
+  @assign simCode.topVariables = _mapVectorLike(name -> _canonicalVariableKey(name, ctx), simCode.topVariables)
+  @assign simCode.sharedEquations = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.sharedEquations)
+  @assign simCode.activeModel = _canonicalVariableKey(simCode.activeModel, ctx)
+  @assign simCode.irreductableVariables = _mapVectorLike(name -> _canonicalVariableKey(name, ctx), simCode.irreductableVariables)
+  @assign simCode.functions = _mapVectorLike(f -> _canonicalizeFunction(f, ctx), simCode.functions)
+  @assign simCode.eliminatedEquations = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.eliminatedEquations)
+  @assign simCode.eliminatedVariables = _mapVectorLike(name -> _canonicalVariableKey(name, ctx), simCode.eliminatedVariables)
+  @assign simCode.aliasMap = _mapVectorLike(entry -> AliasEntry(_canonicalVariableKey(entry.eliminatedName, ctx),
+                                                               _canonicalVariableKey(entry.representativeName, ctx),
+                                                               entry.negated),
+                                           simCode.aliasMap)
+  return simCode
+end
+
+"""
+    simplifyEnumLiteralPaths(simCode::SIM_CODE)::SIM_CODE
+
+Collapse the qualified namespace path of every `DAE.ENUM_LITERAL` to a
+single `Absyn.IDENT` whose name is `Type.Literal` (the leaf two segments
+joined by `.`). The integer index is preserved verbatim — that is what
+arithmetic and comparison rely on. Frontend-shaped literals like
+
+    ENUM_LITERAL(QUALIFIED("Modelica", QUALIFIED("Electrical", ...
+                  QUALIFIED("Logic", IDENT("'U'")))), 1)
+
+become
+
+    ENUM_LITERAL(IDENT("Logic.'U'"), 1)
+
+Reduces memory and makes downstream dumps directly readable without
+custom @match arms for every nested QUALIFIED depth. Applied once at
+SimCode entry — no later pass synthesises fresh ENUM_LITERAL paths,
+they only substitute existing ones.
+"""
+function simplifyEnumLiteralPaths(simCode::SIM_CODE)::SIM_CODE
+  local nRewritten = Ref(0)
+  local _shortenPath = function(p)
+    local segs = String[]
+    local _walk = nothing
+    _walk = function(x)
+      if x isa Absyn.IDENT
+        push!(segs, x.name)
+      elseif x isa Absyn.QUALIFIED
+        push!(segs, x.name)
+        _walk(x.path)
+      elseif x isa Absyn.FULLYQUALIFIED
+        _walk(x.path)
+      end
+    end
+    _walk(p)
+    if length(segs) >= 2
+      return Absyn.IDENT(segs[end-1] * "." * segs[end])
+    elseif length(segs) == 1
+      return Absyn.IDENT(segs[1])
+    end
+    return p
+  end
+  local _rewrite = function(exp, _)
+    if exp isa DAE.ENUM_LITERAL && !(exp.name isa Absyn.IDENT && occursin('.', exp.name.name))
+      nRewritten[] += 1
+      return (DAE.ENUM_LITERAL(_shortenPath(exp.name), exp.index), true, nothing)
+    end
+    return (exp, true, nothing)
+  end
+
+  #= Helper: rewrite ENUM_LITERALs inside a single DAE.Exp. =#
+  local _rewriteExp = function(e)
+    local (newExp, _) = Util.traverseExpTopDown(e, _rewrite, nothing)
+    return newExp
+  end
+
+  #= 1. Variable bindings (PARAMETER, DATA_STRUCTURE, ARRAY, ARRAY_PARAMETER). =#
+  for (varName, (idx, sv)) in simCode.stringToSimVarHT
+    local newKind = @match sv.varKind begin
+      PARAMETER(SOME(b))      => PARAMETER(SOME(_rewriteExp(b)))
+      DATA_STRUCTURE(SOME(b)) => DATA_STRUCTURE(SOME(_rewriteExp(b)))
+      ARRAY(dims, SOME(b))    => ARRAY(dims, SOME(_rewriteExp(b)))
+      ARRAY_PARAMETER(dims, SOME(b)) => ARRAY_PARAMETER(dims, SOME(_rewriteExp(b)))
+      _ => sv.varKind
+    end
+    if newKind !== sv.varKind
+      @assign sv.varKind = newKind
+      simCode.stringToSimVarHT[varName] = (idx, sv)
+    end
+  end
+
+  #= 2. Residual + initial equations. `initialEquations` may contain
+        BDAE.EQUATION (lhs/rhs) entries alongside RESIDUAL_EQUATION; handle
+        both forms. =#
+  local _rewriteEq = function(eq)
+    if eq isa BDAE.RESIDUAL_EQUATION
+      return BDAE.RESIDUAL_EQUATION(_rewriteExp(eq.exp), eq.source, eq.attr)
+    elseif eq isa BDAE.EQUATION
+      return BDAE.EQUATION(_rewriteExp(eq.lhs), _rewriteExp(eq.rhs), eq.source, eq.attributes)
+    end
+    return eq
+  end
+  @assign simCode.residualEquations = [_rewriteEq(eq) for eq in simCode.residualEquations]
+  @assign simCode.initialEquations = [_rewriteEq(eq) for eq in simCode.initialEquations]
+
+  if nRewritten[] > 0
+    @info "[SIMCODE: simplifyEnumLiteralPaths] collapsed $(nRewritten[]) ENUM_LITERAL qualified paths to Type.Literal IDENT form"
+  end
+  return simCode
+end
+
 """
     inlinePreOfConstantParameters(simCode::SIM_CODE)::SIM_CODE
 
@@ -1834,7 +2923,7 @@ function inlinePreOfConstantParameters(simCode::SIM_CODE)::SIM_CODE
     push!(newEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
   end
   if nReplaced[] > 0
-    @info "[inlinePreOfConstantParameters] replaced $(nReplaced[]) `pre(constParam)` occurrences with the parameter directly"
+    @info "[SIMCODE: inlinePreOfConstantParameters] replaced $(nReplaced[]) `pre(constParam)` occurrences with the parameter directly"
   end
   @assign simCode.residualEquations = newEqs
   return simCode
@@ -1882,7 +2971,7 @@ function propagateConstants(simCode::SIM_CODE)
   end
 
   if !isempty(allBaseNames)
-    @info "constantPropagation: base array names referenced" allBaseNames=collect(allBaseNames)
+    @info "[SIMCODE: constantPropagation] base array names referenced" allBaseNames=collect(allBaseNames)
   end
 
   local constMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
@@ -1943,26 +3032,44 @@ function propagateConstants(simCode::SIM_CODE)
   local nConst = length(constEqIndices)
   local nTrivial = length(trivialEqIndices)
   if nConst == 0 && nTrivial == 0
-    @info "constantPropagation: no constant equations found"
+    @info "[SIMCODE: constantPropagation] no constant equations found"
     return simCode
   end
 
-  @info "constantPropagation: found $nConst unknown=param equations and $nTrivial trivial param=param equations"
+  @info "[SIMCODE: constantPropagation] found $nConst unknown=param equations and $nTrivial trivial param=param equations"
 
-  #= Phase 2: Build final equation list with substitutions applied =#
+  #= Phase 2: Build final equation list with substitutions applied.
+     We collect (varName, residual) pairs for const-bound eliminations so
+     the downstream `eliminatedEquations` / `eliminatedVariables` arrays
+     stay aligned. Trivial `param=param` residuals are dropped without
+     recording since they have no unknown to associate. =#
+  #= Reverse-map each constprop equation index to its unknown name by re-running
+     `detectConstantEquation` on the equations recorded during Phase 1. =#
+  local eqIdxToUnknown = Dict{Int, String}()
+  for i in constEqIndices
+    local eq = simCode.residualEquations[i]
+    local r = detectConstantEquation(eq.exp, ht)
+    r === nothing && continue
+    if r[1] == :constprop
+      eqIdxToUnknown[i] = r[2][1]
+    end
+  end
   local allRemoved = union(constEqIndices, trivialEqIndices)
   local newResEqs = BDAE.RESIDUAL_EQUATION[]
-  local elimEqs = BDAE.RESIDUAL_EQUATION[]
+  local elimPairs = Tuple{String, BDAE.RESIDUAL_EQUATION}[]
   sizehint!(newResEqs, nEqs - length(allRemoved))
 
   for (i, eq) in enumerate(simCode.residualEquations)
     if i in allRemoved
-      push!(elimEqs, eq)
+      if i in constEqIndices && haskey(eqIdxToUnknown, i)
+        push!(elimPairs, (eqIdxToUnknown[i], eq))
+      end
     else
       local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
       push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
     end
   end
+  local elimEqs = BDAE.RESIDUAL_EQUATION[p[2] for p in elimPairs]
 
   #= Substitute in if-equation branches =#
   local newIfEqs = IF_EQUATION[]
@@ -2038,20 +3145,30 @@ function propagateConstants(simCode::SIM_CODE)
   end
 
   if !isempty(survivingRefs)
-    @warn "constantPropagation: $(length(survivingRefs)) eliminated variables still referenced, keeping them" survivingRefs=collect(survivingRefs)
+    @warn "[SIMCODE: constantPropagation] $(length(survivingRefs)) eliminated variables still referenced, keeping them" survivingRefs=collect(survivingRefs)
   end
 
   local newHT = copy(ht)
+  #= Build elimVarNames from elimPairs (same order as elimEqs) and
+     drop any pairs whose variable is in survivingRefs. This keeps
+     `eliminatedEquations` and `eliminatedVariables` aligned for
+     downstream `generateEliminatedObservedBlock`. =#
   local elimVarNames = String[]
-  for (varName, _) in constMap
+  local keptElimEqs = BDAE.RESIDUAL_EQUATION[]
+  for (varName, eq) in elimPairs
     if varName in survivingRefs
+      continue
+    end
+    if !haskey(newHT, varName)
       continue
     end
     delete!(newHT, varName)
     push!(elimVarNames, varName)
+    push!(keptElimEqs, eq)
   end
+  elimEqs = keptElimEqs
 
-  @info "constantPropagation: eliminated $(length(elimVarNames)) unknowns and $(length(allRemoved)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
+  @info "[SIMCODE: constantPropagation] eliminated $(length(elimVarNames)) unknowns and $(length(allRemoved)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
 
   @assign simCode.residualEquations = newResEqs
   @assign simCode.initialEquations = newInitEqs
@@ -2110,7 +3227,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
      metaModel/flatModel), but allow DOCC models (structuralTransitions only)
      since they re-flatten at runtime =#
   if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
-    @info "aliasElimination: skipped (VSS/multi-mode model)"
+    @info "[SIMCODE: aliasElimination] skipped (VSS/multi-mode model)"
     return simCode
   end
 
@@ -2141,11 +3258,11 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   end
 
   if isempty(aliasPairs)
-    @info "aliasElimination: no alias equations found"
+    @info "[SIMCODE: aliasElimination] no alias equations found"
     return simCode
   end
 
-  @info "aliasElimination: detected $(length(aliasPairs)) alias equations"
+  @info "[SIMCODE: aliasElimination] detected $(length(aliasPairs)) alias equations"
 
   #= ===== Step 2: Build alias graph and find connected components via BFS ===== =#
   #= Adjacency list: varName -> [(neighborName, negated, edgeIdx)] =#
@@ -2291,7 +3408,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   end
 
   if isempty(aliasMap)
-    @info "aliasElimination: no variables could be eliminated"
+    @info "[SIMCODE: aliasElimination] no variables could be eliminated"
     return simCode
   end
 
@@ -2389,7 +3506,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   end
 
   if !isempty(survivingRefs)
-    @warn "aliasElimination: $(length(survivingRefs)) eliminated variables still referenced, keeping them" survivingRefs=collect(survivingRefs)
+    @warn "[SIMCODE: aliasElimination] $(length(survivingRefs)) eliminated variables still referenced, keeping them" survivingRefs=collect(survivingRefs)
   end
 
   #= Remove only safely eliminated variables from hash table =#
@@ -2411,7 +3528,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     end
   end
 
-  @info "aliasElimination: eliminated $(length(elimVarNames)) variables and $(length(aliasEqIndices)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
+  @info "[SIMCODE: aliasElimination] eliminated $(length(elimVarNames)) variables and $(length(aliasEqIndices)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
 
   @assign simCode.residualEquations = newResEqs
   @assign simCode.initialEquations = newInitEqs
@@ -2423,6 +3540,392 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   append!(simCode.eliminatedEquations, elimEqs)
   append!(simCode.eliminatedVariables, elimVarNames)
   return simCode
+end
+
+"""
+    eliminateConstantParameters(simCode::SIM_CODE) -> SIM_CODE
+
+Find every PARAMETER whose binding evaluates to a numeric/Bool literal,
+substitute the literal value at all use sites, and drop the parameter from
+`stringToSimVarHT`. This shrinks the parameter list MTK sees before
+`structural_simplify`, reducing per-simulate module-eval cost on large MSL
+models (where `foldParameterClosure` typically inflates the parameter count
+2x to 3x).
+
+Tier-1 only: skipped on VSS / DOCC / sub-model / flat-model variants because
+a parameter eliminated here can no longer be re-bound at runtime by a
+structural transition or by recompilation. The gate matches the
+conservative envelope used by `eliminateAliasVariables`.
+
+Defensive checks:
+- Parameters that appear as representatives in `aliasMap` are NOT eliminated
+  (would orphan the alias entry).
+- A survivor scan after substitution keeps any parameter still referenced
+  somewhere the substitution missed (paranoia for unflatten CREF forms).
+"""
+function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
+  if hasStructuralTransitions(simCode) || hasSubModels(simCode) ||
+     hasFlatModel(simCode) || hasMetaModel(simCode)
+    @info "[SIMCODE: eliminateConstantParameters] skipped (VSS/recompilation/sub-model variant)"
+    return simCode
+  end
+
+  local ht = simCode.stringToSimVarHT
+  local paramValueMap = Dict{String, Float64}()
+  local seen = Set{String}()
+
+  #= Build the protected-from-elimination set. We keep any parameter that:
+     1. Is an alias representative (eliminating orphans the alias entry).
+     2. Is referenced as a CREF in another simvar's `start`/`fixed`/`min`/
+        `max`/`nominal` attribute. The MTK codegen short-circuits start
+        attributes via `pars[Symbol(name)]`, bypassing the equation
+        substitution map; eliminating such a parameter produces a runtime
+        UndefVarError when the model module evaluates.
+     3. Is referenced as a condition in any IF_EQUATION branch — these are
+        structural switches the user may want to flip.
+     4. Is referenced as a condition in any WHEN_EQUATION.
+     5. Is referenced as a condition in any IFEXP, anywhere in equations or
+        in another parameter's binding.
+     6. Is referenced anywhere in any initial equation. Initial equations
+        carry constraints MTK uses at t=0; we keep their parameter inputs
+        intact so the user can re-bind a parameter and re-initialize without
+        a recompile (where supported by MTK). =#
+  local protectedNames = Set{String}()
+  for entry in simCode.aliasMap
+    push!(protectedNames, entry.representativeName)
+  end
+  _collectAttributeCrefs!(protectedNames, ht)
+  for ifEq in simCode.ifEquations
+    for branch in ifEq.branches
+      collectCrefNames!(protectedNames, branch.condition)
+    end
+  end
+  for whenEq in simCode.whenEquations
+    _collectWhenConditionCrefs!(protectedNames, whenEq.whenEquation)
+  end
+  for eq in simCode.initialEquations
+    if eq isa BDAE.RESIDUAL_EQUATION
+      collectCrefNames!(protectedNames, eq.exp)
+    elseif eq isa BDAE.EQUATION
+      collectCrefNames!(protectedNames, eq.lhs)
+      collectCrefNames!(protectedNames, eq.rhs)
+    end
+  end
+  #= IFEXP conditions inside residual equations and parameter bindings. =#
+  for eq in simCode.residualEquations
+    _collectIfexpConditionCrefs!(protectedNames, eq.exp)
+  end
+  for (_, htEntry) in ht
+    local (_, svP) = htEntry
+    @match svP.varKind begin
+      PARAMETER(SOME(b))            => _collectIfexpConditionCrefs!(protectedNames, b)
+      ARRAY_PARAMETER(_, SOME(b))   => _collectIfexpConditionCrefs!(protectedNames, b)
+      _ => nothing
+    end
+  end
+
+  #= Step 1: identify eliminable parameters via _tryEvalNumeric. =#
+  for (name, htEntry) in ht
+    name in protectedNames && continue
+    local (_, sv) = htEntry
+    local bindExp = @match sv.varKind begin
+      PARAMETER(SOME(e)) => e
+      _ => nothing
+    end
+    bindExp === nothing && continue
+    empty!(seen)
+    local v = _tryEvalNumeric(bindExp, simCode, seen)
+    v === nothing && continue
+    paramValueMap[name] = v
+  end
+
+  if isempty(paramValueMap)
+    @info "[SIMCODE: eliminateConstantParameters] no eliminable parameters found"
+    return simCode
+  end
+
+  #= Step 2: substitute throughout every equation container. =#
+  local newResiduals = BDAE.RESIDUAL_EQUATION[]
+  for eq in simCode.residualEquations
+    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
+    push!(newResiduals, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+  end
+
+  local newInitials = typeof(simCode.initialEquations)()
+  for eq in simCode.initialEquations
+    local newEq = if eq isa BDAE.RESIDUAL_EQUATION
+      local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
+      BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr)
+    elseif eq isa BDAE.EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(eq.lhs, substituteConstantParameter, paramValueMap)
+      local (newRhs, _) = Util.traverseExpTopDown(eq.rhs, substituteConstantParameter, paramValueMap)
+      BDAE.EQUATION(newLhs, newRhs, eq.source, eq.attr)
+    else
+      eq
+    end
+    push!(newInitials, newEq)
+  end
+
+  local newIfEquations = IF_EQUATION[]
+  for ifEq in simCode.ifEquations
+    local newBranches = BRANCH[]
+    for branch in ifEq.branches
+      local newBranchEqs = BDAE.RESIDUAL_EQUATION[]
+      for brEq in branch.residualEquations
+        local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteConstantParameter, paramValueMap)
+        push!(newBranchEqs, BDAE.RESIDUAL_EQUATION(newBrExp, brEq.source, brEq.attr))
+      end
+      local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteConstantParameter, paramValueMap)
+      push!(newBranches, BRANCH(newCond, newBranchEqs,
+                                branch.identifier, branch.targets, branch.isSingular,
+                                branch.matchOrder, branch.equationGraph, branch.sccs,
+                                branch.stringToSimVarHT))
+    end
+    push!(newIfEquations, IF_EQUATION(newBranches))
+  end
+
+  local newWhenEquations = BDAE.WHEN_EQUATION[]
+  for whenEq in simCode.whenEquations
+    local newInner = _substituteParamInWhenStmts(whenEq.whenEquation, paramValueMap)
+    @assign whenEq.whenEquation = newInner
+    push!(newWhenEquations, whenEq)
+  end
+
+  #= Step 3: substitute into the bindings of surviving parameters so
+     parameter-chain references resolve cleanly after elimination. =#
+  local newHT = copy(ht)
+  for (name, htEntry) in ht
+    haskey(paramValueMap, name) && continue
+    local (idx, sv) = htEntry
+    local newKind = @match sv.varKind begin
+      PARAMETER(SOME(b)) => begin
+        local (nb, _) = Util.traverseExpTopDown(b, substituteConstantParameter, paramValueMap)
+        nb === b ? sv.varKind : PARAMETER(SOME(nb))
+      end
+      _ => sv.varKind
+    end
+    if newKind !== sv.varKind
+      newHT[name] = (idx, SIMVAR(sv.name, sv.index, newKind, sv.attributes))
+    end
+  end
+
+  #= Step 4: defensive survivor scan. If a CREF for a candidate parameter
+     somehow survived substitution (unflatten form, etc.), keep the param. =#
+  local survivorCheck = Set{String}()
+  for eq in newResiduals
+    collectCrefNames!(survivorCheck, eq.exp)
+  end
+  for eq in newInitials
+    if eq isa BDAE.RESIDUAL_EQUATION
+      collectCrefNames!(survivorCheck, eq.exp)
+    elseif eq isa BDAE.EQUATION
+      collectCrefNames!(survivorCheck, eq.lhs)
+      collectCrefNames!(survivorCheck, eq.rhs)
+    end
+  end
+  for ifEq in newIfEquations
+    for branch in ifEq.branches
+      for brEq in branch.residualEquations
+        collectCrefNames!(survivorCheck, brEq.exp)
+      end
+      collectCrefNames!(survivorCheck, branch.condition)
+    end
+  end
+  for whenEq in newWhenEquations
+    _collectWhenCrefNames!(survivorCheck, whenEq.whenEquation)
+  end
+
+  #= Step 5: drop eliminated params from HT, skipping survivors. =#
+  local elimNames = String[]
+  local survivors = String[]
+  for (name, _) in paramValueMap
+    if name in survivorCheck
+      push!(survivors, name)
+      continue
+    end
+    delete!(newHT, name)
+    push!(elimNames, name)
+  end
+
+  if !isempty(survivors)
+    @warn "[SIMCODE: eliminateConstantParameters] $(length(survivors)) parameters still referenced after substitution; keeping them" survivors
+  end
+
+  if isempty(elimNames)
+    @info "[SIMCODE: eliminateConstantParameters] nothing eliminated (all candidates survived substitution)"
+    return simCode
+  end
+
+  @info "[SIMCODE: eliminateConstantParameters] eliminated $(length(elimNames)) parameters of $(length(paramValueMap)) candidates"
+
+  @assign simCode.residualEquations = newResiduals
+  @assign simCode.initialEquations = newInitials
+  @assign simCode.ifEquations = newIfEquations
+  @assign simCode.whenEquations = newWhenEquations
+  @assign simCode.stringToSimVarHT = newHT
+  #= Do NOT append eliminated parameter names to `simCode.eliminatedVariables`.
+     That list pairs with `simCode.eliminatedEquations` 1:1 and is consumed by
+     `generateEliminatedObservedBlock`, which expects each eliminated name to
+     have a defining residual equation. Parameters are substituted directly
+     into equations and have no residual to reconstruct, so adding them breaks
+     the parallel-array invariant. =#
+  return simCode
+end
+
+"""
+Collect every CREF appearing in a CREF-valued attribute (`start`, `fixed`,
+`min`, `max`, `nominal`) of any simvar in `ht`. These names must not be
+eliminated — the MTK start-condition codegen references them via
+`pars[Symbol(name)]`, which bypasses equation-level substitution.
+"""
+function _collectAttributeCrefs!(out::Set{String}, ht::AbstractDict)
+  for (_, htEntry) in ht
+    local (_, sv) = htEntry
+    local optAttrs = sv.attributes
+    @match optAttrs begin
+      SOME(attrs) => begin
+        for fname in (:start, :fixed, :min, :max, :nominal)
+          if hasproperty(attrs, fname)
+            local fv = getproperty(attrs, fname)
+            @match fv begin
+              SOME(e) => collectCrefNames!(out, e)
+              _ => nothing
+            end
+          end
+        end
+      end
+      _ => nothing
+    end
+  end
+  return out
+end
+
+"""
+Collect every CREF appearing in an IFEXP condition anywhere in `exp`. CREFs
+appearing only in IFEXP branches (`then`/`else`) are NOT collected. Used to
+protect parameters that gate runtime conditional branches from elimination.
+"""
+function _collectIfexpConditionCrefs!(out::Set{String}, @nospecialize(exp))
+  @match exp begin
+    DAE.IFEXP(expCond = c, expThen = t, expElse = e) => begin
+      collectCrefNames!(out, c)
+      _collectIfexpConditionCrefs!(out, t)
+      _collectIfexpConditionCrefs!(out, e)
+    end
+    DAE.BINARY(exp1 = e1, exp2 = e2) => begin
+      _collectIfexpConditionCrefs!(out, e1)
+      _collectIfexpConditionCrefs!(out, e2)
+    end
+    DAE.UNARY(exp = e1)        => _collectIfexpConditionCrefs!(out, e1)
+    DAE.LUNARY(exp = e1)       => _collectIfexpConditionCrefs!(out, e1)
+    DAE.LBINARY(exp1 = e1, exp2 = e2) => begin
+      _collectIfexpConditionCrefs!(out, e1)
+      _collectIfexpConditionCrefs!(out, e2)
+    end
+    DAE.RELATION(exp1 = e1, exp2 = e2) => begin
+      _collectIfexpConditionCrefs!(out, e1)
+      _collectIfexpConditionCrefs!(out, e2)
+    end
+    DAE.CALL(expLst = args) => begin
+      for arg in args
+        _collectIfexpConditionCrefs!(out, arg)
+      end
+    end
+    DAE.ARRAY(array = lst) => begin
+      for e in lst
+        _collectIfexpConditionCrefs!(out, e)
+      end
+    end
+    DAE.ASUB(exp = e, sub = subs) => begin
+      _collectIfexpConditionCrefs!(out, e)
+      for s in subs
+        _collectIfexpConditionCrefs!(out, s)
+      end
+    end
+    DAE.CAST(exp = e1) => _collectIfexpConditionCrefs!(out, e1)
+    _ => nothing
+  end
+  return out
+end
+
+"""
+Collect CREFs in the condition of a `BDAE.WHEN_STMTS` (and any nested
+`elsewhen`). Statements inside the when-clause are handled separately via
+the equation walk; we only protect parameters that gate the trigger.
+"""
+function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::BDAE.WHEN_STMTS)
+  collectCrefNames!(out, whenStmts.condition)
+  @match whenStmts.elsewhenPart begin
+    SOME(inner) => _collectWhenConditionCrefs!(out, inner)
+    _ => nothing
+  end
+  return out
+end
+
+function _collectWhenConditionCrefs!(out::Set{String}, whenEq::BDAE.WHEN_EQUATION)
+  return _collectWhenConditionCrefs!(out, whenEq.whenEquation)
+end
+
+"""
+    substituteConstantParameter(exp, paramValueMap)
+
+`Util.traverseExpTopDown` callback. Replaces a `DAE.CREF` whose name is in
+`paramValueMap` with a literal constant matching the CREF's declared type
+(RCONST for T_REAL, ICONST for T_INTEGER, BCONST for T_BOOL).
+"""
+function substituteConstantParameter(@nospecialize(exp), paramValueMap)
+  @match exp begin
+    DAE.CREF(cr, ty) => begin
+      local name = string(cr)
+      if haskey(paramValueMap, name)
+        local v = paramValueMap[name]
+        local literalExp = @match ty begin
+          DAE.T_REAL(__)    => DAE.RCONST(v)
+          DAE.T_INTEGER(__) => DAE.ICONST(Int(round(v)))
+          DAE.T_BOOL(__)    => DAE.BCONST(v != 0.0)
+          _                 => DAE.RCONST(v)
+        end
+        return (literalExp, false, paramValueMap)
+      end
+      (exp, true, paramValueMap)
+    end
+    _ => (exp, true, paramValueMap)
+  end
+end
+
+"""
+Recursively substitute eliminated-parameter CREFs in a WHEN_STMTS node.
+Mirrors `_substituteAliasInWhenStmts` but with `substituteConstantParameter`.
+"""
+function _substituteParamInWhenStmts(whenStmts::BDAE.WHEN_STMTS, paramValueMap)
+  local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteConstantParameter, paramValueMap)
+  local newStmtLst = MetaModelica.list()
+  for stmt in whenStmts.whenStmtLst
+    local newStmt = @match stmt begin
+      BDAE.ASSIGN(__) => begin
+        local (newL, _) = Util.traverseExpTopDown(stmt.left, substituteConstantParameter, paramValueMap)
+        local (newR, _) = Util.traverseExpTopDown(stmt.right, substituteConstantParameter, paramValueMap)
+        BDAE.ASSIGN(newL, newR, stmt.source)
+      end
+      BDAE.REINIT(__) => begin
+        local (newSV, _) = Util.traverseExpTopDown(stmt.stateVar, substituteConstantParameter, paramValueMap)
+        local (newVal, _) = Util.traverseExpTopDown(stmt.value, substituteConstantParameter, paramValueMap)
+        BDAE.REINIT(newSV, newVal, stmt.source)
+      end
+      BDAE.NORETCALL(__) => begin
+        local (newExp, _) = Util.traverseExpTopDown(stmt.exp, substituteConstantParameter, paramValueMap)
+        BDAE.NORETCALL(newExp, stmt.source)
+      end
+      _ => stmt
+    end
+    newStmtLst = MetaModelica.Cons(newStmt, newStmtLst)
+  end
+  newStmtLst = MetaModelica.listReverse(newStmtLst)
+  local newElseWhen = @match whenStmts.elsewhenPart begin
+    SOME(inner) => SOME(_substituteParamInWhenStmts(inner, paramValueMap))
+    NONE() => NONE()
+  end
+  return BDAE.WHEN_STMTS(newCond, newStmtLst, newElseWhen)
 end
 
 """

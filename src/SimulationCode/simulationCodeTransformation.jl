@@ -101,11 +101,11 @@ end
 """
 `BDAE_identifierToVarString(backendVar::BDAE.VAR)`
 Converts a `BDAE.VAR` to a simcode string, for use in variable names.
-The . separator is replaced with 3 `_`
+The `.` separator is replaced with `OMBackend.COMPONENT_SEPARATOR`.
 Used to name variables used by the hts in the simulation code.
 """
 function BDAE_identifierToVarString(backendVar::BDAE.VAR)
-  return DAE_identifierToString(backendVar.varName)
+  return OMBackend.canonicalName(backendVar.varName)
 end
 
 
@@ -114,7 +114,7 @@ function DAE_identifierToString(daeID::DAE.CREF)
 end
 
 function DAE_identifierToString(s::String)
-  return s
+  return OMBackend.canonicalName(s)
 end
 
 function DAE_identifierToString(exp)
@@ -126,27 +126,7 @@ end
   This function handles different cases for arrays, complex types etc.
 """
 function DAE_identifierToString(daeID::DAE.ComponentRef)
-  newName = @match daeID begin
-    #= An array component attached to a complex component. =#
-    DAE.CREF_QUAL(ident, DAE.T_COMPLEX(__), subscriptLst, DAE.CREF_IDENT(innerIdent, DAE.T_ARRAY(__), iSubscriptLst)) => begin
-      string(daeID)
-    end
-    DAE.CREF_QUAL(ident, DAE.T_ARRAY(ty, dim), _, cr) => begin
-      string(daeID)
-    end
-    DAE.CREF_IDENT(__) => string(daeID)
-
-    DAE.CREF_QUAL(_, DAE.T_COMPLEX(DAE.ClassInf.RECORD(path), _), _, _) => begin
-      string(daeID)
-    end
-
-    DAE.CREF_QUAL(__) => begin
-      string(daeID)
-    end
-    #= A variable of type array =#
-    _ => @error("Type $(typeof(daeID)) not handled.")
-  end
-  return newName
+  return OMBackend.canonicalName(daeID)
 end
 
 """
@@ -383,7 +363,7 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
        Flatten any `else if` chain that the BDAE kept in nested form;
        otherwise the typed-vector conversion at the ELSE_BRANCH step
        below would MethodError on the inner IF_EQUATION. =#
-    local BDAE_ifEquation = flattenNestedElseIfChain(ifEquations[i])
+    local BDAE_ifEquation = flattenNestedThenBranchIfs(flattenNestedElseIfChain(ifEquations[i]))
     local otherIfEqs::Vector{BDAE.IF_EQUATION} = BDAE.IF_EQUATION[]
     for j in 1:length(ifEquations)
       if i != j
@@ -525,6 +505,93 @@ function flattenNestedElseIfChain(ifEq::BDAE.IF_EQUATION)::BDAE.IF_EQUATION
   local mergedEqnsTrue = listAppend(ifEq.eqnstrue, nested.eqnstrue)
   return BDAE.IF_EQUATION(mergedConditions, mergedEqnsTrue, nested.eqnsfalse,
                           ifEq.source, ifEq.attr)
+end
+
+"""
+  Flatten any IF_EQUATION nested inside a THEN-branch (or the ELSE-branch
+  body) of an outer IF_EQUATION by conjoining the outer condition with each
+  inner condition and lifting the inner branches to the outer level.
+
+  Example (Modelica.Electrical.Analog.Ideal.IdealizedOpAmpLimited):
+
+    if strict then
+      if homotopyType then E1 else E2 end if
+    else
+      if homotopyType then E3 else E4 end if
+    end if
+
+  becomes
+
+    if strict and homotopyType        then E1
+    elseif strict and not homotopyType then E2
+    elseif not strict and homotopyType then E3
+    else                                    E4
+    end if
+
+  Without this, `constructSimCodeIFEquations` silently drops the inner
+  IF_EQUATION items (its branch-typed-vector filter only keeps
+  RESIDUAL_EQUATION instances), losing one residual per OpAmp instance and
+  triggering ExtraVariablesSystemException downstream.
+"""
+function flattenNestedThenBranchIfs(ifEq::BDAE.IF_EQUATION)::BDAE.IF_EQUATION
+  local conds = listArray(ifEq.conditions)
+  local thens = listArray(ifEq.eqnstrue)
+  local newConds = DAE.Exp[]
+  local newThens = Vector{Any}()
+  for i in 1:length(conds)
+    local thenList = listArray(thens[i])
+    local soleNested = (length(thenList) == 1 && thenList[1] isa BDAE.IF_EQUATION) ?
+                       thenList[1] : nothing
+    if soleNested === nothing
+      push!(newConds, conds[i])
+      push!(newThens, thens[i])
+      continue
+    end
+    local inner = flattenNestedThenBranchIfs(soleNested)
+    local innerConds = listArray(inner.conditions)
+    local innerThens = listArray(inner.eqnstrue)
+    for k in 1:length(innerConds)
+      push!(newConds, _conjoinConditions(conds[i], innerConds[k]))
+      push!(newThens, innerThens[k])
+    end
+    #= Inner ELSE fires when all inner conditions are false; outer condition
+       still holds. =#
+    push!(newConds, _conjoinConditions(conds[i], _negateAllConditions(innerConds)))
+    push!(newThens, inner.eqnsfalse)
+  end
+  local elseList = listArray(ifEq.eqnsfalse)
+  local newElse = ifEq.eqnsfalse
+  if length(elseList) == 1 && elseList[1] isa BDAE.IF_EQUATION
+    local innerElse = flattenNestedThenBranchIfs(elseList[1])
+    local innerConds = listArray(innerElse.conditions)
+    local innerThens = listArray(innerElse.eqnstrue)
+    local outerElseGuard = _negateAllConditions(conds)
+    for k in 1:length(innerConds)
+      push!(newConds, _conjoinConditions(outerElseGuard, innerConds[k]))
+      push!(newThens, innerThens[k])
+    end
+    newElse = innerElse.eqnsfalse
+  end
+  return BDAE.IF_EQUATION(MetaModelica.list(newConds...),
+                          MetaModelica.list(newThens...),
+                          newElse,
+                          ifEq.source,
+                          ifEq.attr)
+end
+
+function _conjoinConditions(a::DAE.Exp, b::DAE.Exp)::DAE.Exp
+  DAE.LBINARY(a, DAE.AND(DAE.T_BOOL_DEFAULT), b)
+end
+
+function _negateAllConditions(conds::Vector{DAE.Exp})::DAE.Exp
+  #= Build NOT(c1) AND NOT(c2) AND ... — left-fold for stability. =#
+  isempty(conds) && return DAE.BCONST(true)
+  local acc = DAE.LUNARY(DAE.NOT(DAE.T_BOOL_DEFAULT), conds[1])
+  for k in 2:length(conds)
+    acc = DAE.LBINARY(acc, DAE.AND(DAE.T_BOOL_DEFAULT),
+                       DAE.LUNARY(DAE.NOT(DAE.T_BOOL_DEFAULT), conds[k]))
+  end
+  return acc
 end
 
 """

@@ -72,7 +72,7 @@ end
 """
 function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
   #=If our model name is separated by . replace it with __ =#
-  local MODEL_NAME = replace(simCode.name, "." => "__")
+  local MODEL_NAME = simCode.name
   #= Generate code for algorithmic Modelica =#
   (functions, functionNames) = AlgorithmicCodeGeneration.generateFunctions(simCode.functions)
   if !SimulationCode.hasStructuralTransitions(simCode) && !SimulationCode.hasSubModels(simCode) && !SimulationCode.hasFlatModel(simCode)
@@ -122,6 +122,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     import OMBackend.CodeGeneration
     using ModelingToolkit
     using DifferentialEquations
+    using DiffEqCallbacks
     Base.Experimental.@compiler_options optimize=0 compile=min
     $(createStringParameterAssignments(simCode)...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
@@ -213,7 +214,7 @@ end
   Generates a MTK program with a model
 """
 function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions)
-  local MODEL_NAME = replace(modelName, "." => "__")
+  local MODEL_NAME = modelName
   #= Functions are eval'd inside ODE_MODE_MTK_MODEL_GENERATION (called below)
      immediately before @register_symbolic, so no need to eval them here. =#
   local dataStructureVariables = String[]
@@ -232,7 +233,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
      when the program is eval'd in OMBackend scope (backendAPI.jl) rather than CodeGeneration scope.
      Without this, implementation bodies that call other Modelica functions (e.g., normalizeWithAssert
      calling Vectors_length) would fail with UndefVarError. =#
-  local funcNames = Set{Symbol}(Symbol(replace(f.name, "." => "_")) for f in simCode.functions)
+  local funcNames = Set{Symbol}(Symbol(f.name) for f in simCode.functions)
   if !isempty(funcNames)
     for f in functions
       qualifyModelicaFunctions!(f, funcNames)
@@ -241,6 +242,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
   programBody = quote
     using ModelingToolkit
     using DifferentialEquations
+    using DiffEqCallbacks
     using OrdinaryDiffEq
     using Symbolics
     using OMBackend
@@ -524,13 +526,103 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      dummies + one alias residual = 3 equations for 2 vars. Demote the
      LATER var (arbitrary choice, both are equivalent) to algebraic. =#
   local _discreteSet = Set(string(Symbol(dv)) for dv in discreteVariables)
+  #= Detect equations whose RHS contains an `ifelse` call OR a call to
+     `constTableLookup` (anywhere): these equations come from constant-table
+     runtime indexing via `OMBackend.CodeGeneration.constTableLookup`
+     (Symbolics-aware path), and are definitional — they fully determine
+     one discrete variable on the other side. =#
+  local _isConstTableLookupCall = function(e)
+    e isa Expr || return false
+    e.head === :call || return false
+    isempty(e.args) && return false
+    local fn = e.args[1]
+    fn === :constTableLookup && return true
+    #= Match a dotted reference like OMBackend.CodeGeneration.constTableLookup
+       (Expr(:., ..., QuoteNode(:constTableLookup))). =#
+    if fn isa Expr && fn.head === :. && length(fn.args) >= 2
+      local last = fn.args[end]
+      last isa QuoteNode && last.value === :constTableLookup && return true
+    end
+    return false
+  end
+  local _containsIfelse = function(e)
+    e isa Expr || return false
+    if e.head === :call && !isempty(e.args) && e.args[1] === :ifelse
+      return true
+    end
+    _isConstTableLookupCall(e) && return true
+    for a in e.args
+      _containsIfelse(a) && return true
+    end
+    return false
+  end
+  #= A relational comparison call (`<`, `<=`, `>`, `>=`, `==`, `!=`) returns
+     a Boolean. When such an expression appears in `0 ~ disc - <cmp>`, the
+     discrete variable is fully defined by the comparison (Modelica
+     `Boolean disc = expr < literal;` flattens to this shape). MTK uses the
+     residual to eliminate `disc`, leaving the matching `der(disc) ~ 0`
+     dummy stranded, which is the over-determination we need to prevent. =#
+  local _containsComparison = function(e)
+    e isa Expr || return false
+    if e.head === :call && !isempty(e.args)
+      local op = e.args[1]
+      op in (:<, :<=, :>, :>=, :(==), :(!=)) && return true
+    end
+    for a in e.args
+      _containsComparison(a) && return true
+    end
+    return false
+  end
+  local _matchIfelseDefinedDiscrete = function(rhs)
+    rhs = _unwrap(rhs)
+    rhs isa Expr || return nothing
+    rhs.head === :call && length(rhs.args) == 3 || return nothing
+    local op = rhs.args[1]
+    (op === :+ || op === :-) || return nothing
+    local a, b = _unwrap(rhs.args[2]), _unwrap(rhs.args[3])
+    local aName = _refName(a)
+    local bName = _refName(b)
+    #= Discrete on side b, ifelse on side a. =#
+    if bName !== nothing && bName in _discreteSet && _containsIfelse(a)
+      return bName
+    end
+    if aName !== nothing && aName in _discreteSet && _containsIfelse(b)
+      return aName
+    end
+    return nothing
+  end
+  local _matchComparisonDefinedDiscrete = function(rhs)
+    rhs = _unwrap(rhs)
+    rhs isa Expr || return nothing
+    rhs.head === :call && length(rhs.args) == 3 || return nothing
+    local op = rhs.args[1]
+    (op === :+ || op === :-) || return nothing
+    local a, b = _unwrap(rhs.args[2]), _unwrap(rhs.args[3])
+    local aName = _refName(a)
+    local bName = _refName(b)
+    if bName !== nothing && bName in _discreteSet && _containsComparison(a)
+      return bName
+    end
+    if aName !== nothing && aName in _discreteSet && _containsComparison(b)
+      return aName
+    end
+    return nothing
+  end
   for eq in EQUATIONS
     if eq isa Expr && eq.head === :call && length(eq.args) == 3 &&
        eq.args[1] === :~ && eq.args[2] == 0
       local pinned = _matchAlias(eq.args[3])
       pinned !== nothing && push!(_aliasPinned, pinned)
+      local ifelseDef = _matchIfelseDefinedDiscrete(eq.args[3])
+      ifelseDef !== nothing && push!(_aliasPinned, ifelseDef)
+      local cmpDef = _matchComparisonDefinedDiscrete(eq.args[3])
+      cmpDef !== nothing && push!(_aliasPinned, cmpDef)
       #= Pairwise discrete alias: `0 ~ a - b` → both refs to discrete vars.
-         Demote whichever is in discreteVariables AND not already pinned. =#
+         One alias residual contributes exactly one excess equation relative
+         to the two discrete dummy equations, so demote one side only. If a
+         neighboring definitional equation also pins the other side, it will
+         be found independently by the pre-pass above (or by the remaining
+         `_excess` heuristic below). =#
       local rhs = _unwrap(eq.args[3])
       if rhs isa Expr && rhs.head === :call && length(rhs.args) == 3 && rhs.args[1] === :-
         local nameA = _refName(_unwrap(rhs.args[2]))
@@ -548,25 +640,16 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       push!(_discreteAliasOverride, dv)
     end
   end
-  if !isempty(_discreteAliasOverride)
-    @info "Discrete alias fix (definitional): demoting $(length(_discreteAliasOverride)) discrete vars pinned by `0 ~ const ± cref` residuals: $(_discreteAliasOverride)"
-    local _set = Set(_discreteAliasOverride)
-    local _newDummy = Expr[]
-    local _newDiscreteSym = Symbol[]
-    for (i, dv) in enumerate(discreteVariables)
-      if dv in _set
-        push!(algebraicVariablesSym, Symbol(dv))
-      else
-        push!(_newDummy, DISCRETE_DUMMY_EQUATIONS[i])
-        push!(_newDiscreteSym, Symbol(dv))
-      end
-    end
-    DISCRETE_DUMMY_EQUATIONS = _newDummy
-    discreteVariablesSym = _newDiscreteSym
-    #= Recompute totals/excess after definitional pre-pass. =#
-    _nTotalEqs = length(EQUATIONS) + length(DISCRETE_DUMMY_EQUATIONS) + _nConditionalEqs
-    _nTotalVars = length(stateVariables) + length(algebraicVariablesSym) + length(discreteVariablesSym) + length(occVariables)
-    _excess = _nTotalEqs - _nTotalVars
+  #= Combined demotion: collect ALL vars to demote (pre-pass + heuristic),
+     then apply in one final loop. Doing two separate apply-loops on
+     `discreteVariables` while mutating `DISCRETE_DUMMY_EQUATIONS` between
+     them caused index drift — the second loop would use stale dummies. =#
+  local _toDemote = Set{String}(_discreteAliasOverride)
+  if !isempty(_toDemote)
+    @info "Discrete alias fix (definitional): demoting $(length(_toDemote)) discrete vars pinned by definitional residuals (const / ifelse / comparison): $(collect(_toDemote))"
+    #= Recompute excess accounting for the pre-pass demotions, so the
+       heuristic only fills in the *remaining* shortfall. =#
+    _excess = _excess - length(_toDemote)
   end
   if _excess > 0
     #= Find discrete variables that appear in alias-like residual equations
@@ -582,6 +665,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     local _eqStrings = [string(eq) for eq in EQUATIONS]
     local _mentions = Tuple{String, Int}[]
     for dv in discreteVariables
+      dv in _toDemote && continue
       local dvSym = string(Symbol(dv))
       local nMentions = count(s -> equationMentionsVariableName(s, dvSym), _eqStrings)
       if nMentions > 0
@@ -592,26 +676,31 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
        variable is the safest to drop because its value is determined by
        multiple residuals already. =#
     sort!(_mentions; by = t -> -t[2])
-    local _toRemove = Set{String}()
+    local _toRemoveHeuristic = Set{String}()
     for (dv, _) in _mentions
-      length(_toRemove) >= _excess && break
-      push!(_toRemove, dv)
+      length(_toRemoveHeuristic) >= _excess && break
+      push!(_toRemoveHeuristic, dv)
     end
-    if !isempty(_toRemove)
-      @info "Discrete alias fix: removing $(length(_toRemove))/$(_excess) excess dummy der equations for $(collect(_toRemove))"
-      local _newDummy = Expr[]
-      local _newDiscreteSym = Symbol[]
-      for (i, dv) in enumerate(discreteVariables)
-        if dv in _toRemove
-          push!(algebraicVariablesSym, Symbol(dv))
-        else
-          push!(_newDummy, DISCRETE_DUMMY_EQUATIONS[i])
-          push!(_newDiscreteSym, Symbol(dv))
-        end
+    if !isempty(_toRemoveHeuristic)
+      @info "Discrete alias fix: removing $(length(_toRemoveHeuristic))/$(_excess) excess dummy der equations for $(collect(_toRemoveHeuristic))"
+      union!(_toDemote, _toRemoveHeuristic)
+    end
+  end
+  #= Apply all demotions in a single pass over the original lists, so
+     `DISCRETE_DUMMY_EQUATIONS[i]` always corresponds to `discreteVariables[i]`. =#
+  if !isempty(_toDemote)
+    local _newDummy = Expr[]
+    local _newDiscreteSym = Symbol[]
+    for (i, dv) in enumerate(discreteVariables)
+      if dv in _toDemote
+        push!(algebraicVariablesSym, Symbol(dv))
+      else
+        push!(_newDummy, DISCRETE_DUMMY_EQUATIONS[i])
+        push!(_newDiscreteSym, Symbol(dv))
       end
-      DISCRETE_DUMMY_EQUATIONS = _newDummy
-      discreteVariablesSym = _newDiscreteSym
     end
+    DISCRETE_DUMMY_EQUATIONS = _newDummy
+    discreteVariablesSym = _newDiscreteSym
   end
   #= Create assignments for the dummies. =#
   local IF_EQUATION_EVENTS = [component[1] for component in IF_EQUATION_COMPONENTS]
@@ -651,6 +740,16 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       if lhs isa Symbol
         push!(irreductableSyms, lhs)
       end
+    end
+  end
+  #= Mark fixed=true-with-start vars as irreducible so MTK does not eliminate
+     them via alias substitution. The init constraint emitted by
+     getFixedStartConstraintsMTK must land on a surviving unknown. =#
+  for vn in fixedStartVarNames(
+    vcat(stateVariables, algebraicVariables, occVariables), simCode)
+    local sym = Symbol(vn)
+    if !(sym in irreductableSyms)
+      push!(irreductableSyms, sym)
     end
   end
 
@@ -693,7 +792,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     https://github.com/SciML/ModelingToolkit.jl/issues/998
   =#
   #=If our model name is separated by . replace it with __ =#
-  local MODEL_NAME = replace(modelName, "." => "__")
+  local MODEL_NAME = modelName
   #= Decompose variables, equations, and start equations into (outer_defs, inner_refs).
      outer_defs go at module level (before model function) to avoid nested closure JIT.
      inner_refs go inside the model function body. =#
@@ -775,6 +874,16 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       $(IF_EQUATION_EVENT_DECLARATION)
       $(generateAliasObservedBlock(simCode))
       $(generateEliminatedObservedBlock(simCode))
+      #= Initial-equation constraints (from Modelica `initial equation` block).
+         Passed as `initialization_eqs` to MTK so they actually constrain the
+         t=0 state — the `initialValues` Pair list above is only a guess.
+         Wrapped in invokelatest so symbol references resolve against the
+         freshly-eval'd Symbolics bindings. =#
+      function _buildInitialConstraintEqs()
+        Symbolics.Equation[$(generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)...),
+                           $(getFixedStartConstraintsMTK(vcat(stateVariables, occVariables, algebraicVariables), simCode)...)]
+      end
+      local initialConstraintEqs = Base.invokelatest(_buildInitialConstraintEqs)
       #= ODE System =#
       nonLinearSystem = $(odeSystemWithEvents(!isempty(ifConditionalVariables), modelName;
                                               hasObserved = !isempty(simCode.aliasMap) || !isempty(simCode.eliminatedVariables)))
@@ -867,7 +976,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   end
   #= Qualify bare Modelica function calls with OMBackend.CodeGeneration. prefix.
      This covers all generated code: equations, parameter assignments, start conditions. =#
-  local funcNames = Set{Symbol}(Symbol(replace(f.name, "." => "_")) for f in simCode.functions)
+  local funcNames = Set{Symbol}(Symbol(f.name) for f in simCode.functions)
   if !isempty(funcNames)
     qualifyModelicaFunctions!(model, funcNames)
   end
@@ -1068,6 +1177,58 @@ function createStartConditionsEquationsMTK(states::Vector,
 end
 
 """
+  Generates initial equations as Symbolics `lhs ~ rhs` Equation forms suitable
+  for passing to MTK's `initialization_eqs` kwarg of `System(...)`. Unlike the
+  `=>` pair form (which acts as a guess only), `~` form is a real constraint
+  that MTK's initialization solver must satisfy at t=0. Required for models
+  with `InitialOutput` init mode (e.g. PID controllers' integrator state).
+"""
+function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCode.SimCode)::Vector{Expr}
+  local result = Expr[]
+  for ieq in initialEqs
+    if ieq isa BDAE.COMPLEX_EQUATION || ieq isa BDAE.ARRAY_EQUATION
+      @info "[CODEGEN: initialConstraints] skipping $(typeof(ieq)) (record/array constraints not yet lowered to scalar `~` form)"
+      continue
+    end
+    if isParametricOnlyEquation(ieq, simCode)
+      continue
+    end
+    local lhs = try
+      expToJuliaExpMTK(ieq.lhs, simCode)
+    catch err
+      @warn "[CODEGEN: initialConstraints] failed to lower LHS; constraint dropped" lhs=ieq.lhs err
+      continue
+    end
+    local rhs = try
+      @match ieq.rhs begin
+        DAE.CREF(DAE.CREF_IDENT("time", _, _), _) => expToJuliaExpMTK(ieq.rhs, simCode)
+        DAE.CREF(__) => begin
+          local crefAsStr = string(ieq.rhs)
+          if haskey(simCode.stringToSimVarHT, crefAsStr)
+            local simCodeVar = last(simCode.stringToSimVarHT[crefAsStr])
+            if SimulationCode.isStateOrAlgebraic(simCodeVar)
+              expToJuliaExpMTK(ieq.rhs, simCode)
+            elseif SimulationCode.hasBindingExp(simCodeVar)
+              evalSimCodeParameter(simCodeVar, simCode)
+            else
+              expToJuliaExpMTK(ieq.rhs, simCode)
+            end
+          else
+            expToJuliaExpMTK(ieq.rhs, simCode)
+          end
+        end
+        _ => evalDAE_Expression(ieq.rhs, simCode)
+      end
+    catch err
+      @warn "[CODEGEN: initialConstraints] failed to lower RHS; constraint dropped" rhs=ieq.rhs err
+      continue
+    end
+    push!(result, :($lhs ~ $rhs))
+  end
+  return result
+end
+
+"""
   Generates initial equations.
   Currently unsorted unless they are sorted before being passed to the simulation code phase.
 """
@@ -1240,6 +1401,73 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; sk
     @warn summary
   end
   return startExprs
+end
+
+"""
+  Emit `lhs ~ rhs` constraint Equations for state vars with `fixed=true` and an
+  explicit `start`. Goes into `initialization_eqs` so MTK pins them at t=0
+  rather than treating them as soft `guesses` the iteration may override.
+"""
+function getFixedStartConstraintsMTK(vars::Vector, simCode::SimulationCode.SimCode)::Vector{Expr}
+  local result::Vector{Expr} = Expr[]
+  if isempty(vars)
+    return result
+  end
+  local ht::Dict = simCode.stringToSimVarHT
+  local probe = Tuple{String, String, String}[]
+  for var in vars
+    (index, simVar) = ht[var]
+    local varName = simVar.name
+    local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
+    local startExp = @match optAttributes begin
+      SOME(attributes) => begin
+        local startStr = string(attributes.start)
+        local fixedStr = string(attributes.fixed)
+        if occursin("Inertia_w", varName) || occursin("Inertia_phi", varName) || occursin("Cylinder_s", varName)
+          push!(probe, (varName, startStr, fixedStr))
+        end
+        @match (attributes.start, attributes.fixed) begin
+          (SOME(s), SOME(DAE.BCONST(true))) => s
+          _ => nothing
+        end
+      end
+      _ => nothing
+    end
+    if startExp === nothing
+      continue
+    end
+    push!(result, :($(Symbol(varName)) ~ $(expToJuliaExpMTK(startExp, simCode))))
+  end
+  @info "[FIXED-START PROBE] vars=$(length(vars)) emitted=$(length(result))"
+  for p in probe; @info "[FIXED-START PROBE] $(p[1]): start=$(p[2]) fixed=$(p[3])"; end
+  return result
+end
+
+"""
+  Names of variables that have `fixed=true` AND an explicit `start`. Parallel
+  to the gating in `getFixedStartConstraintsMTK`. Marking these as irreducible
+  prevents MTK's structural_simplify from substituting them through aliases —
+  the user's init constraint must land on a surviving unknown.
+"""
+function fixedStartVarNames(vars::Vector, simCode::SimulationCode.SimCode)::Vector{String}
+  local result::Vector{String} = String[]
+  if isempty(vars)
+    return result
+  end
+  local ht::Dict = simCode.stringToSimVarHT
+  for var in vars
+    haskey(ht, var) || continue
+    (_, simVar) = ht[var]
+    local matched = @match simVar.attributes begin
+      SOME(attributes) => @match (attributes.start, attributes.fixed) begin
+        (SOME(_), SOME(DAE.BCONST(true))) => true
+        _ => false
+      end
+      _ => false
+    end
+    matched && push!(result, simVar.name)
+  end
+  return result
 end
 
 """
@@ -1567,7 +1795,7 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
      so they resolve to the OMBackend.CodeGeneration wrapper rather than failing
      with UndefVarError in the per-model module scope. Surfaces on every model
      using CombiTable / CombiTimeTable / ExternalObject constructors. =#
-  local funcNames = Set{Symbol}(Symbol(replace(f.name, "." => "_")) for f in simCode.functions)
+  local funcNames = Set{Symbol}(Symbol(f.name) for f in simCode.functions)
   for ds in dataStructureVariables
     (index, simVar) = ht[ds]
     local simVarType::SimulationCode.SimVarType = simVar.varKind
@@ -2020,8 +2248,7 @@ end
   Generate @register_array_symbolic expression for a function with array parameters.
 """
 function generateArrayRegisterExpr(f::SimulationCode.ModelicaFunction, funcArgGen::Function)::Expr
-  local normalizedName = replace(f.name, "." => "_")
-  local sb = Symbol(normalizedName)
+  local sb = Symbol(f.name)
 
   #= Build typed argument list for array registration =#
   local argExprs = Expr[]
@@ -2178,8 +2405,7 @@ function generateRegisterCallsForCallExprs(simCode;
       continue
     else
       #= Use @register_symbolic for scalar functions =#
-      local normalizedName = replace(f.name, "." => "_")
-      local sb = Symbol(normalizedName)
+      local sb = Symbol(f.name)
       local args = funcArgGen(convert(Vector{DAE.VAR}, f.inputs))
       local nArgs = length(args)
       local cExpr = if nArgs == 1

@@ -189,7 +189,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
     local outputs = generateIOL(func.outputs)
     local f
     #= Normalize function name: replace dots with underscores for valid Julia identifiers =#
-    local normalizedName = replace(func.name, "." => "_")
+    local normalizedName = func.name
     local nArgs = length(inputs)
     local isArrayFunc = hasArrayOutput(func)
     #= Enable scalar element-extraction wrappers for ALL array-returning functions.
@@ -296,7 +296,7 @@ function flattenRecordInput(v::DAE.VAR)::Vector{Symbol}
       for field in varLst
         @match field begin
           DAE.TYPES_VAR(fieldName, _, _, _, _) => begin
-            local flatName::String = baseName * "_" * fieldName
+            local flatName::String = baseName * COMPONENT_SEPARATOR * fieldName
             push!(flattenedSymbols, Symbol(flatName))
           end
           _ => nothing
@@ -743,12 +743,6 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
       end
       #= Array accesses for simple CREF_IDENT =#
       DAE.CREF(DAE.CREF_IDENT(ident, identType, subscriptLst), _) where !isempty(subscriptLst)  => begin
-        #= Extract base name if ident contains subscripts =#
-        local baseName = if occursin('[', ident)
-          ident[1:findfirst('[', ident)-1]
-        else
-          ident
-        end
         local idxExprs = map(subscriptLst) do sub
           local raw = @match sub begin
             DAE.INDEX(e) => expToJuliaExpAlg(e)
@@ -759,13 +753,13 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
           _unwrapSubscriptExpr(raw)
         end
         #= Construct proper Julia multi-dimensional indexing: arr[i, j, ...] =#
-        expr = Expr(:ref, Symbol(baseName), idxExprs...)
+        expr = Expr(:ref, Symbol(ident), idxExprs...)
       end
       #= Qualified CREF (record field access like R.T) =#
       DAE.CREF(DAE.CREF_QUAL(ident, identType, qualSubscriptLst, innerCref), _) => begin
         local varName::String = SimulationCode.string(exp.componentRef)
         #= Replace dots with underscores to match flattened parameter names =#
-        local flatName::String = replace(varName, "." => "_")
+        local flatName::String = varName
         #= If the CREF has subscripts anywhere, parse it as an array access =#
         local allSubscripts = CodeGeneration.FrontendUtil.Util.getSubscriptsFromCref(exp.componentRef)
         if !isempty(allSubscripts)

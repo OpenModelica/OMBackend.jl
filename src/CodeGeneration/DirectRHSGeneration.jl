@@ -423,6 +423,16 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
   if !(expr isa SymbolicUtils.BasicSymbolic)
     return nothing
   end
+  #= Symbolic numeric Const (e.g. literal 500.0 or pre-folded 0.0015) appears
+     as a non-call, non-sym BasicSymbolic with a `Float64`/`Int` `symtype`. Pull
+     the value out via Symbolics.value before falling through to the name-based
+     leaf lookup, otherwise we treat literals as unknown free vars. =#
+  if !SymbolicUtils.iscall(expr) && !SymbolicUtils.issym(expr)
+    local v = try; Symbolics.value(expr); catch; nothing; end
+    if v isa Number
+      return Float64(v)
+    end
+  end
   if SymbolicUtils.iscall(expr)
     local f = SymbolicUtils.operation(expr)
     local rawArgs = SymbolicUtils.arguments(expr)
@@ -442,7 +452,7 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
     end
     return nothing
   end
-  #= Leaf symbolic: look up by string name in the resolved-numerics dict. =#
+  #= Leaf symbolic (free variable): look up by string name. =#
   local nm = string(expr)
   if haskey(nameToNumeric, nm)
     return nameToNumeric[nm]

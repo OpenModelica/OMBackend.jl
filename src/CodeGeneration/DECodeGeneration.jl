@@ -314,7 +314,7 @@ function generateDECode(simCode::SimulationCode.SIM_CODE)
           "$(length(layout.stateNames)) state(s) vs $(length(simCode.residualEquations)) residual(s).")
   end
 
-  local MODEL_NAME = replace(simCode.name, "." => "__")
+  local MODEL_NAME = simCode.name
   local nStates = length(layout.stateNames)
   local nParams = length(layout.paramNames)
 

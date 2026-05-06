@@ -46,7 +46,7 @@ function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = tru
     createSaveFunction(modelName)
   else
   end
-  local MODEL_NAME = replace(modelName, "." => "__")
+  local MODEL_NAME = modelName
   #= Only emit the saved_values_<model> = SavedValues(...) declaration when the
      save function is actually generated. SavedValues lives in DiffEqCallbacks,
      which is a transitive (not direct) dep of OMBackend; in MTK mode the save
@@ -724,8 +724,7 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
       whose runtime depends on these externals may still fail at simulate.
       =#
       DAE.CALL(path, expLst) => begin
-        local normalizedFuncName = replace(string(path), "." => "_")
-        local expr = Expr(:call, Symbol(normalizedFuncName))
+        local expr = Expr(:call, Symbol(string(path)))
         local args::Vector{Any} = Any[]
         for arg in expLst
           push!(args, expToJuliaExp(arg, context, varSuffix, varPrefix=varPrefix))

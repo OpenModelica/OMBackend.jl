@@ -438,6 +438,11 @@ function DAECallExpressionToJuliaCallExpression(pathStr::String, expLst::List, s
         end
       end
     end
+    #= See sibling arm in DAECallExpressionToMTKCallExpression — Integer(enum)
+       collapses to identity since enums are already integer-indexed in codegen. =#
+    "Integer" => begin
+      expToJuliaExp(listHead(expLst), simCode, varPrefix=varPrefix)
+    end
     _  =>  begin
       argPart = tuple(map((x) -> expToJuliaExp(x, simCode, varPrefix=varPrefix), expLst)...)
       #= Mirror DAECallExpressionToMTKCallExpression: route Modelica built-ins
@@ -548,6 +553,13 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
         0
       end
     end
+    #= Modelica Integer(enum) returns the 1-based index of an enum literal. Our
+       codegen already lowers enum CREFs to integer indices and ENUM_LITERAL to
+       its `index` field, so the cast is the identity at the Julia level. Without
+       this arm the splice emits `Integer(::Num)` which has no method. =#
+    "Integer" => begin
+      expToJuliaExpMTK(listHead(expLst), simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derAsSymbol)
+    end
     _  =>  begin
       argPart = tuple(map((x) -> expToJuliaExpMTK(x, simCode), expLst)...)
       #= Check if this is a Modelica built-in with a dedicated Julia implementation =#
@@ -565,6 +577,67 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
       end
     end
   end
+end
+
+function _isSimCodeFunctionName(name::AbstractString, simCode)::Bool
+  local canonical = OMBackend.canonicalName(name)
+  for f in simCode.functions
+    if f.name == canonical
+      return true
+    end
+  end
+  return false
+end
+
+_isSimCodeFunctionPath(path::Absyn.Path, simCode)::Bool = _isSimCodeFunctionName(string(path), simCode)
+
+function _modelicaFunctionCallArgs(expLst,
+                                   simCode,
+                                   hashTable;
+                                   varPrefix = "",
+                                   varSuffix = "",
+                                   derSymbol = false)
+  local args::Vector{Any} = Any[]
+  for arg in expLst
+    local flattenedArgs::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable;
+                                                               varPrefix = varPrefix,
+                                                               varSuffix = varSuffix)
+    if !isempty(flattenedArgs)
+      append!(args, flattenedArgs)
+      continue
+    end
+
+    local extracts = _expandComplexReturnArg(arg, simCode, hashTable;
+                                             varPrefix = varPrefix,
+                                             varSuffix = varSuffix,
+                                             derSymbol = derSymbol)
+    if extracts !== nothing
+      append!(args, extracts)
+      continue
+    end
+
+    push!(args, expToJuliaExpMTK(arg, simCode;
+                                 varPrefix = varPrefix,
+                                 varSuffix = varSuffix,
+                                 derSymbol = derSymbol))
+  end
+  return args
+end
+
+function _modelicaFunctionCallExpr(path,
+                                   expLst,
+                                   simCode,
+                                   hashTable;
+                                   varPrefix = "",
+                                   varSuffix = "",
+                                   derSymbol = false)
+  local normalizedFuncName = OMBackend.canonicalName(string(path))
+  local expr = Expr(:call, Symbol(normalizedFuncName))
+  append!(expr.args, _modelicaFunctionCallArgs(expLst, simCode, hashTable;
+                                               varPrefix = varPrefix,
+                                               varSuffix = varSuffix,
+                                               derSymbol = derSymbol))
+  return expr
 end
 
 
@@ -932,8 +1005,8 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         local fcrs = FrontendUtil.Util.getAllCrefsAsVector(cr)
         local subscripts = fcr.subscriptLst
         @assign fcr.subscriptLst = MetaModelica.nil
-        local lookupStrPrefix = reduce((x,y) -> string(x, "_", y), map(string, fcrs[1:end-1]))
-        local lookupStr = string(lookupStrPrefix, "_", SimulationCode.DAE_identifierToString(fcr))
+        local lookupStrPrefix = reduce((x,y) -> string(x, COMPONENT_SEPARATOR, y), map(string, fcrs[1:end-1]))
+        local lookupStr = string(lookupStrPrefix, COMPONENT_SEPARATOR, SimulationCode.DAE_identifierToString(fcr))
 
         local lookupEntry = get(hashTable, lookupStr, nothing)
         if lookupEntry === nothing
@@ -1160,34 +1233,21 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         end
       end
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
-        #Call as symbol is really ugly.. please fix me :(
-        DAECallExpressionToMTKCallExpression(tmpStr, explst, simCode, hashTable; varPrefix=varPrefix, varSuffix = varSuffix, derAsSymbol=derSymbol)
+        if _isSimCodeFunctionName(tmpStr, simCode)
+          _modelicaFunctionCallExpr(tmpStr, explst, simCode, hashTable;
+                                    varPrefix = varPrefix,
+                                    varSuffix = varSuffix,
+                                    derSymbol = derSymbol)
+        else
+          #Call as symbol is really ugly.. please fix me :(
+          DAECallExpressionToMTKCallExpression(tmpStr, explst, simCode, hashTable; varPrefix=varPrefix, varSuffix = varSuffix, derAsSymbol=derSymbol)
+        end
       end
       DAE.CALL(path, expLst) => begin
-        #= Normalize function name: replace dots with underscores =#
-        local normalizedFuncName = replace(string(path), "." => "_")
-        #= Use direct function call - wrapper handles world-age, @register_symbolic handles symbolic =#
-        local expr = Expr(:call, Symbol(normalizedFuncName))
-        local args::Vector{Any} = Any[]
-        for arg in expLst
-          #= 1) Complex CREF arg → scalarise to (cref_re, cref_im, ...). =#
-          local flattenedArgs::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
-          if !isempty(flattenedArgs)
-            append!(args, flattenedArgs)
-            continue
-          end
-          #= 2) Complex-returning sub-call → emit per-element extracts so the
-                outer wrapper sees scalar args, not bundled tuples. =#
-          local extracts = _expandComplexReturnArg(arg, simCode, hashTable;
-                                                    varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-          if extracts !== nothing
-            append!(args, extracts)
-            continue
-          end
-          push!(args, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
-        end
-        append!(expr.args, args)
-        expr
+        _modelicaFunctionCallExpr(path, expLst, simCode, hashTable;
+                                  varPrefix = varPrefix,
+                                  varSuffix = varSuffix,
+                                  derSymbol = derSymbol)
       end
       DAE.CAST(ty, exp)  => begin
         quote
@@ -1231,7 +1291,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
              This covers BOTH 1D access [i] and multi-D access [i, j, ...].
              Plain indexing on tupleElementCall fails because it returns a scalar Num. =#
           local _nestedTupleArrResult = @match innerExp begin
-            DAE.ASUB(DAE.CALL(path, expLst), innerSubs) where {!(path isa Absyn.IDENT) && length(innerSubs) == 1} => begin
+            DAE.ASUB(DAE.CALL(path, expLst), innerSubs) where {_isSimCodeFunctionPath(path, simCode) && length(innerSubs) == 1} => begin
               local innerSubExpr = first(innerSubs)
               local tupleIx = @match innerSubExpr begin
                 DAE.ICONST(i) => i
@@ -1241,35 +1301,25 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
               if tupleIx === nothing
                 nothing
               else
-                local callFuncName2 = Symbol(replace(string(path), "." => "_"))
+                local callFuncName2 = Symbol(OMBackend.canonicalName(string(path)))
                 local fnQuote2 = QuoteNode(callFuncName2)
-                local callArgs2 = []
-                for arg in expLst
-                  local flatArgs2::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
-                  if !isempty(flatArgs2)
-                    append!(callArgs2, flatArgs2)
-                  else
-                    push!(callArgs2, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
-                  end
-                end
+                local callArgs2 = _modelicaFunctionCallArgs(expLst, simCode, hashTable;
+                                                            varPrefix = varPrefix,
+                                                            varSuffix = varSuffix,
+                                                            derSymbol = derSymbol)
                 local arrIdxTuple = Tuple(Int[Int(s) for s in subExprs])
                 :(OMBackend.CodeGeneration.tupleArrayElementAt($fnQuote2, $tupleIx, $arrIdxTuple, $(callArgs2...)))
               end
             end
             #= Same pattern but with TSUB instead of inner ASUB for tuple extraction.
                Handles ASUB(TSUB(CALL(func, args), tupleIx), [arraySubscripts]). =#
-            DAE.TSUB(DAE.CALL(path, expLst), tupleIx, _) where {!(path isa Absyn.IDENT)} => begin
-              local callFuncName3 = Symbol(replace(string(path), "." => "_"))
+            DAE.TSUB(DAE.CALL(path, expLst), tupleIx, _) where {_isSimCodeFunctionPath(path, simCode)} => begin
+              local callFuncName3 = Symbol(OMBackend.canonicalName(string(path)))
               local fnQuote3 = QuoteNode(callFuncName3)
-              local callArgs3 = []
-              for arg in expLst
-                local flatArgs3::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
-                if !isempty(flatArgs3)
-                  append!(callArgs3, flatArgs3)
-                else
-                  push!(callArgs3, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
-                end
-              end
+              local callArgs3 = _modelicaFunctionCallArgs(expLst, simCode, hashTable;
+                                                          varPrefix = varPrefix,
+                                                          varSuffix = varSuffix,
+                                                          derSymbol = derSymbol)
               local arrIdxTuple3 = Tuple(Int[Int(s) for s in subExprs])
               :(OMBackend.CodeGeneration.tupleArrayElementAt($fnQuote3, $tupleIx, $arrIdxTuple3, $(callArgs3...)))
             end
@@ -1297,18 +1347,13 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                records (e.g., Complex with fields re, im). In symbolic mode, the wrapper returns a
                single Num, so plain [ix] fails. Use tupleElementCall for dual numeric/symbolic dispatch. =#
             local _asubCallResult = @match innerExp begin
-              DAE.CALL(path, expLst) where {!(path isa Absyn.IDENT)} => begin
-                local callFuncName = Symbol(replace(string(path), "." => "_"))
+              DAE.CALL(path, expLst) where {_isSimCodeFunctionPath(path, simCode)} => begin
+                local callFuncName = Symbol(OMBackend.canonicalName(string(path)))
                 local fnQuote = QuoteNode(callFuncName)
-                local callArgs = []
-                for arg in expLst
-                  local flatArgs::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
-                  if !isempty(flatArgs)
-                    append!(callArgs, flatArgs)
-                  else
-                    push!(callArgs, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
-                  end
-                end
+                local callArgs = _modelicaFunctionCallArgs(expLst, simCode, hashTable;
+                                                           varPrefix = varPrefix,
+                                                           varSuffix = varSuffix,
+                                                           derSymbol = derSymbol)
                 local ix = first(subExprs)
                 :(OMBackend.CodeGeneration.tupleElementCall($fnQuote, $ix, $(callArgs...)))
               end
@@ -1329,11 +1374,22 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             end
           end
         else
+          #= Symbolic indexing into a literal constant array: MTK rejects
+             `arr[Num, Num]` because Num isn't a valid array index. Emit a
+             call to OMBackend.CodeGeneration.constTableLookup, which is
+             Symbolic-aware: it returns the literal element for numeric args
+             and an opaque Symbolics Term for symbolic args, so MTK
+             structural-simplify treats the whole lookup as a black box. =#
           local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-          #= Function call results are proper Matrix (impl bodies use ensureArray
-             for array construction, generateArrayConversions for params).
-             Symbolic Num handles subscripting directly. =#
-          if length(subExprs) == 1
+          local _isArrayLiteral = (innerExp isa DAE.ARRAY)
+          if _isArrayLiteral
+            quote
+              OMBackend.CodeGeneration.constTableLookup($(innerCode), $(subExprs...))
+            end
+          elseif length(subExprs) == 1
+            #= Function call results are proper Matrix (impl bodies use ensureArray
+               for array construction, generateArrayConversions for params).
+               Symbolic Num handles subscripting directly. =#
             quote
               $(innerCode)[$(first(subExprs))]
             end
@@ -1406,17 +1462,12 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
            tupleArrayElementCall for array elements. Direct indexing
            (expr[ix]) fails because Num(scalar_term)[1] is a no-op in Symbolics. =#
         if tupleExp isa DAE.CALL
-          local callFuncName = Symbol(replace(string(tupleExp.path), "." => "_"))
+          local callFuncName = Symbol(OMBackend.canonicalName(string(tupleExp.path)))
           local fnQuote = QuoteNode(callFuncName)
-          local args = []
-          for arg in tupleExp.expLst
-            local flattenedArgs::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
-            if !isempty(flattenedArgs)
-              append!(args, flattenedArgs)
-            else
-              push!(args, expToJuliaExpMTK(arg, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
-            end
-          end
+          local args = _modelicaFunctionCallArgs(tupleExp.expLst, simCode, hashTable;
+                                                 varPrefix = varPrefix,
+                                                 varSuffix = varSuffix,
+                                                 derSymbol = derSymbol)
           #= Check if the tuple element type is an array with known dimensions =#
           local tsubArrayDims = nothing
           if tsubTy isa DAE.T_ARRAY
@@ -1799,17 +1850,25 @@ function odeSystemWithEvents(hasEvents, modelName; hasObserved = false)
      introduce variables the callback sub-system cannot solve.
      Observed equations are injected into the reduced system AFTER structural_simplify
      returns, so callbacks never see them (see MTK_CodeGeneration.jl). =#
+  #= `initial_eqs` is passed as `initialization_eqs` kwarg only when non-empty.
+     These are constraints from the Modelica `initial equation` block that MUST
+     hold at t=0 (e.g. `PID.gainPID.y = 0` for InitialOutput init of a PID).
+     Without this, the constraints are passed only as `guesses` (Pair form),
+     which MTK treats as starting points the solver may ignore. =#
   if hasEvents
     :(ODESystem(eqs, t, vars, parameters;
               name=:($(Symbol($modelName))),
-              continuous_events = events, guesses = initialValues))
+              continuous_events = events, guesses = initialValues,
+              initialization_eqs = initialConstraintEqs))
   elseif hasObserved
     :(ODESystem(eqs, t, vars, parameters;
               name=:($(Symbol($modelName))), guesses = initialValues,
-              observed = observedEqs))
+              observed = observedEqs,
+              initialization_eqs = initialConstraintEqs))
   else
     :(ODESystem(eqs, t, vars, parameters;
-              name=:($(Symbol($modelName))), guesses = initialValues))
+              name=:($(Symbol($modelName))), guesses = initialValues,
+              initialization_eqs = initialConstraintEqs))
   end
 end
 
@@ -2136,17 +2195,17 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     local lhsVal = try
       Float64(eval(lhsJl))
     catch err
-      @warn "solveParametricInitialEquations: could not evaluate LHS" freeName err
+      @warn "[SIMCODE: solveParametricInitialEquations] could not evaluate LHS" freeName err
       continue
     end
     #= Build a Julia function for RHS with the free param as argument =#
-    local freeSymbol = Symbol(replace(freeName, "." => "_"))
+    local freeSymbol = Symbol(freeName)
     local rhsJl = expToJuliaExpMTK(rhsSubst, simCode)
     #= Create residual function: f(x) = lhsVal - rhs(x) =#
     local residualFn = try
       eval(Expr(:->, freeSymbol, Expr(:call, :-, lhsVal, rhsJl)))
     catch e
-      @warn "solveParametricInitialEquations: could not build residual" freeName e
+      @warn "[SIMCODE: solveParametricInitialEquations] could not build residual" freeName e
       continue
     end
     #= Newton-Raphson solver (use invokelatest to avoid world-age issues).
@@ -2173,13 +2232,13 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
         x -= fx / dfx
       end
     catch err
-      @warn "solveParametricInitialEquations: residual call threw, skipping" freeName err
+      @warn "[SIMCODE: solveParametricInitialEquations] residual call threw, skipping" freeName err
       newtonOk = false
     end
     if !newtonOk
       continue
     end
-    @info "solveParametricInitialEquations: solved $freeName = $x (from initial equation)"
+    @info "[SIMCODE: solveParametricInitialEquations] solved $freeName = $x (from initial equation)"
     #= Update the simCode hash table with the solved value =#
     local (idx, oldSV) = ht[freeName]
     local newSV = SimulationCode.SIMVAR(oldSV.name, oldSV.index,
@@ -2189,9 +2248,9 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     solvedThisPass = true
   end
   if pass == 1 && !isempty(solvedNames)
-    @info "solveParametricInitialEquations: pass $pass solved $(length(solvedNames)) parameter(s)" solvedNames
+    @info "[SIMCODE: solveParametricInitialEquations] pass $pass solved $(length(solvedNames)) parameter(s)" solvedNames
   elseif !isempty(solvedNames)
-    @info "solveParametricInitialEquations: pass $pass solved $(length(solvedNames)) more parameter(s)" solvedNames
+    @info "[SIMCODE: solveParametricInitialEquations] pass $pass solved $(length(solvedNames)) more parameter(s)" solvedNames
   end
   end #= while fixed-point =#
 end
@@ -2226,7 +2285,7 @@ function evalInitialCondition(mtkCond, simCode = nothing)
     local valMap = Dict{Symbol, Float64}()
     local ht = simCode.stringToSimVarHT
     for (key, (_, sv)) in ht
-      local sym = Symbol(replace(key, "." => "_"))
+      local sym = Symbol(key)
       if sv.varKind isa SimulationCode.PARAMETER
         local pval = try
           local raw = evalSimCodeParameter(sv, simCode)
@@ -2628,7 +2687,7 @@ function _expandComplexReturnArg(arg::DAE.Exp, simCode, hashTable;
     DAE.CALL(path, innerExpLst, DAE.CALL_ATTR(ty=DAE.T_COMPLEX(varLst=varLst))) => begin
       local nFields = length(collect(varLst))
       nFields >= 2 || return nothing
-      local fnName = Symbol(replace(string(path), "." => "_"))
+      local fnName = Symbol(string(path))
       local fnQuote = QuoteNode(fnName)
       local innerArgs = Any[]
       for inner in innerExpLst
@@ -2664,12 +2723,12 @@ end
 function flattenRecordCallArg(arg::DAE.Exp, simCode, hashTable; varPrefix::String="", varSuffix::String="")::Vector{Symbol}
   @match arg begin
     DAE.CREF(cr, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => begin
-      local baseName::String = replace(SimulationCode.string(cr), "." => "_")
+      local baseName::String = SimulationCode.string(cr)
       local flattenedExprs::Vector{Symbol} = Symbol[]
       for field in varLst
         @match field begin
           DAE.TYPES_VAR(fieldName, _, _, _, _) => begin
-            local flatName::String = baseName * "_" * fieldName
+            local flatName::String = baseName * COMPONENT_SEPARATOR * fieldName
             #= Check if the flattened variable exists in the hash table =#
             if haskey(hashTable, flatName)
               push!(flattenedExprs, Symbol(varPrefix * flatName * varSuffix))

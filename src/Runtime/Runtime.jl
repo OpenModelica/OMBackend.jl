@@ -707,6 +707,7 @@ function recompilation(activeModeName,
     local metaModel = structuralCallback.metaModel
     local modification = structuralCallback.modification
     local inProgram = MetaModelica.list(metaModel)
+    local modelicaActiveModeName = RuntimeUtil.modelicaPathName(activeModeName, metaModel)
     local elementToChange = first(modification)
     #= Get the symbol table, using this we evaluate the new value based on the value of some parameter. =#
     local newValueExpr = Meta.parse(last(modification))
@@ -722,7 +723,7 @@ function recompilation(activeModeName,
                                                                          elementToChange,
                                                                          newValue, metaModel))
     @VSS_DEBUG @info "[recompilation] step 2/7: SCode mutated" elapsed_s=round(time()-_t_start, digits=2)
-    local classToInstantiate = activeModeName
+    local classToInstantiate = modelicaActiveModeName
     #= 3) Call the frontend + the backend + JIT compile Julia code in memory =#
     local flatModelica = first(OMFrontend.instantiateSCodeToFM(classToInstantiate, newProgram))
     @VSS_DEBUG @info "[recompilation] step 3/7: frontend (instantiateSCodeToFM) done" elapsed_s=round(time()-_t_start, digits=2)
@@ -734,7 +735,7 @@ function recompilation(activeModeName,
     local resultingModel = translateToMTK(simulationCode, activeModeName)
     @VSS_DEBUG @info "[recompilation] step 5/7: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
     #= 4.0 Revaulate the model=#
-    local modelName = string(replace(activeModeName, "." => "__"), "Model")
+    local modelName = string(OMBackend.canonicalName(activeModeName), "Model")
     @eval $(resultingModel)
     @VSS_DEBUG @info "[recompilation] step 6/7: module @eval done" modelName elapsed_s=round(time()-_t_start, digits=2)
     modelCall = quote
@@ -927,7 +928,7 @@ function recompilation(activeModeName,
     local resultingModel = translateToMTK(simulationCode, activeModeName)
     @VSS_DEBUG @info "[recompilation DOCC] step 3/5: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
     #println("New model generated")
-    local model = replace(activeModeName, "." => "__")
+    local model = OMBackend.canonicalName(activeModeName)
     local modelName = string(model, "Model")
     #local result = OMBackend.modelToString(model; MTK = true, keepComments = false, keepBeginBlocks = false)
     #println("We have a new model!\n");
@@ -1013,7 +1014,9 @@ Returns, a tuple of the new model and the simulation code of this model.
 function runBackend(flatModelica, classToInstantiate)
   local bdae = OMBackend.lower(flatModelica)
   local simulationCode = OMBackend.generateSimulationCode(bdae; mode = OMBackend.MTK_MODE)
-  local newModel = OMBackend.CodeGeneration.ODE_MODE_MTK_MODEL_GENERATION(simulationCode, classToInstantiate, []; useDirectRHS = false)
+  simulationCode = OMBackend.SimulationCode.simplifyEnumLiteralPaths(simulationCode)
+  simulationCode = OMBackend.SimulationCode.canonicalizeCrefNames(simulationCode)
+  local newModel = OMBackend.CodeGeneration.ODE_MODE_MTK_MODEL_GENERATION(simulationCode, simulationCode.name, []; useDirectRHS = false)
   return (newModel, simulationCode)
 end
 
@@ -1021,11 +1024,20 @@ end
 function translateToSimCode(flatModelica, classToInstantiate)
   local bdae = OMBackend.lower(flatModelica)
   local simulationCode = OMBackend.generateSimulationCode(bdae; mode = OMBackend.MTK_MODE)
+  simulationCode = OMBackend.SimulationCode.simplifyEnumLiteralPaths(simulationCode)
+  simulationCode = OMBackend.SimulationCode.canonicalizeCrefNames(simulationCode)
   return simulationCode
 end
 
 function translateToMTK(simulationCode, classToInstantiate)
-  local newModel = OMBackend.CodeGeneration.ODE_MODE_MTK_MODEL_GENERATION(simulationCode, classToInstantiate, []; useDirectRHS = false)
+  local checkResult = OMBackend.SimulationCode.SimCodeCheck.check(simulationCode)
+  local canonicalErrors = filter(v -> v.rule === :canonical_cref_names && v.severity === :error,
+                                 checkResult.violations)
+  if !isempty(canonicalErrors)
+    local details = join([string(v.where, ": ", v.detail) for v in canonicalErrors], "\n")
+    error("SimCode still contains non-canonical names before runtime code generation:\n" * details)
+  end
+  local newModel = OMBackend.CodeGeneration.ODE_MODE_MTK_MODEL_GENERATION(simulationCode, simulationCode.name, []; useDirectRHS = false)
   return newModel
 end
 

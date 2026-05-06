@@ -24,6 +24,7 @@ import ..STATE
 import ..STATE_DERIVATIVE
 import ..DAE_identifierToString
 import ..isUnknownVarKind
+import ..BDAE
 
 using MetaModelica
 
@@ -95,10 +96,10 @@ Pretty-print a CheckResult. Quiet when there are no violations.
 """
 function report(io::IO, r::CheckResult; prefix::AbstractString = "")
   if isempty(r.violations)
-    println(io, prefix, "SimCodeCheck: clean (", round(r.elapsed_s, digits = 4), "s)")
+    println(io, prefix, "[SIMCODE: check] clean (", round(r.elapsed_s, digits = 4), "s)")
     return
   end
-  println(io, prefix, "SimCodeCheck: ", length(r.violations),
+  println(io, prefix, "[SIMCODE: check] ", length(r.violations),
           " violation(s) in ", round(r.elapsed_s, digits = 4), "s")
   for v in r.violations
     println(io, prefix, "  [", v.severity, "] ", v.rule, " @ ", v.where,
@@ -419,6 +420,259 @@ function _collectCrefNames!(missing::Vector{String}, exp, known::Set{String})
   end
   _walkExpChildren(child -> _collectCrefNames!(missing, child, known), exp)
   return missing
+end
+
+#= ── Rule: canonical CREF names before codegen ────────────────────── =#
+
+"""
+`rule_canonical_cref_names`: after the SimCode name canonicalization pass,
+code generation should only see flat `DAE.CREF_IDENT` references with no
+dotted identifiers. A `DAE.CREF_QUAL` here means some SimCode surface was not
+rewritten and would have to rely on late codegen string mangling.
+"""
+function rule_canonical_cref_names(simCode::SIM_CODE)::Vector{CheckViolation}
+  local out = CheckViolation[]
+  for name in keys(simCode.stringToSimVarHT)
+    if occursin('.', name)
+      push!(out, CheckViolation(:canonical_cref_names, :error, name,
+                                "stringToSimVarHT key is not canonical"))
+    end
+  end
+  for (_, (_, sv)) in simCode.stringToSimVarHT
+    if occursin('.', sv.name)
+      push!(out, CheckViolation(:canonical_cref_names, :error, sv.name,
+                                "SimVar name is not canonical"))
+    end
+  end
+  for (i, eq) in enumerate(simCode.residualEquations)
+    _flagCanonicalEquation!(out, eq, "residualEquations[$i]")
+  end
+  for (i, eq) in enumerate(simCode.initialEquations)
+    _flagCanonicalEquation!(out, eq, "initialEquations[$i]")
+  end
+  for (i, eq) in enumerate(simCode.eliminatedEquations)
+    _flagCanonicalEquation!(out, eq, "eliminatedEquations[$i]")
+  end
+  for (i, ifEq) in enumerate(simCode.ifEquations)
+    for (j, branch) in enumerate(ifEq.branches)
+      _flagCanonicalExp!(out, branch.condition, "ifEquations[$i].branches[$j].condition")
+      for (k, eq) in enumerate(branch.residualEquations)
+        _flagCanonicalEquation!(out, eq, "ifEquations[$i].branches[$j].residualEquations[$k]")
+      end
+    end
+  end
+  for (i, whenEq) in enumerate(simCode.whenEquations)
+    _flagCanonicalEquation!(out, whenEq, "whenEquations[$i]")
+  end
+  for (i, f) in enumerate(simCode.functions)
+    if occursin('.', f.name)
+      push!(out, CheckViolation(:canonical_cref_names, :error,
+                                "functions[$i].name",
+                                "function name is not canonical: $(f.name)"))
+    end
+    if hasproperty(f, :inputs)
+      for (j, v) in enumerate(f.inputs)
+        _flagCanonicalComponentRef!(out, v.componentRef, "functions[$i].inputs[$j]")
+      end
+    end
+    if hasproperty(f, :outputs)
+      for (j, v) in enumerate(f.outputs)
+        _flagCanonicalComponentRef!(out, v.componentRef, "functions[$i].outputs[$j]")
+      end
+    end
+    if hasproperty(f, :locals)
+      for (j, v) in enumerate(f.locals)
+        _flagCanonicalComponentRef!(out, v.componentRef, "functions[$i].locals[$j]")
+      end
+    end
+    if hasproperty(f, :statements)
+      for (j, stmt) in enumerate(f.statements)
+        _flagCanonicalStatement!(out, stmt, "functions[$i].statements[$j]")
+      end
+    end
+  end
+  return out
+end
+push!(RULES, rule_canonical_cref_names)
+
+function _flagCanonicalEquation!(out::Vector{CheckViolation}, eq, where::String)
+  if eq isa BDAE.RESIDUAL_EQUATION
+    _flagCanonicalExp!(out, eq.exp, where)
+  elseif eq isa BDAE.EQUATION
+    _flagCanonicalExp!(out, eq.lhs, where * ".lhs")
+    _flagCanonicalExp!(out, eq.rhs, where * ".rhs")
+  elseif eq isa BDAE.ARRAY_EQUATION
+    _flagCanonicalExp!(out, eq.left, where * ".left")
+    _flagCanonicalExp!(out, eq.right, where * ".right")
+  elseif eq isa BDAE.COMPLEX_EQUATION
+    _flagCanonicalExp!(out, eq.left, where * ".left")
+    _flagCanonicalExp!(out, eq.right, where * ".right")
+  elseif eq isa BDAE.SOLVED_EQUATION
+    _flagCanonicalComponentRef!(out, eq.componentRef, where * ".componentRef")
+    _flagCanonicalExp!(out, eq.exp, where * ".exp")
+  elseif eq isa BDAE.WHEN_EQUATION ||
+         eq isa BDAE.STRUCTURAL_WHEN_EQUATION
+    _flagCanonicalWhenStmts!(out, eq.whenEquation, where * ".whenEquation")
+  elseif eq isa BDAE.IF_EQUATION
+    for (i, c) in enumerate(eq.conditions)
+      _flagCanonicalExp!(out, c, where * ".conditions[$i]")
+    end
+    for (i, branchEqs) in enumerate(eq.eqnstrue)
+      for (j, brEq) in enumerate(branchEqs)
+        _flagCanonicalEquation!(out, brEq, where * ".eqnstrue[$i][$j]")
+      end
+    end
+    for (j, brEq) in enumerate(eq.eqnsfalse)
+      _flagCanonicalEquation!(out, brEq, where * ".eqnsfalse[$j]")
+    end
+  elseif eq isa BDAE.FOR_EQUATION
+    _flagCanonicalExp!(out, eq.iter, where * ".iter")
+    _flagCanonicalExp!(out, eq.start, where * ".start")
+    _flagCanonicalExp!(out, eq.stop, where * ".stop")
+    _flagCanonicalEquation!(out, eq.body, where * ".body")
+  elseif eq isa BDAE.ASSERT_EQUATION
+    _flagCanonicalExp!(out, eq.condition, where * ".condition")
+    _flagCanonicalExp!(out, eq.message, where * ".message")
+    _flagCanonicalExp!(out, eq.level, where * ".level")
+  else
+    #= Unknown equation type — surface it as a warning so a future BDAE
+       addition does not silently bypass the canonical check. =#
+    push!(out, CheckViolation(:canonical_cref_names, :warn, where,
+                              "unhandled equation type $(typeof(eq))"))
+  end
+  return out
+end
+
+function _flagCanonicalStatement!(out::Vector{CheckViolation}, stmt, where::String)
+  for fld in (:exp1, :exp, :lhs, :cond, :msg, :level, :var, :value, :range)
+    if hasproperty(stmt, fld)
+      _flagCanonicalExp!(out, getproperty(stmt, fld), where * ".$fld")
+    end
+  end
+  if hasproperty(stmt, :expExpLst)
+    for (i, e) in enumerate(stmt.expExpLst)
+      _flagCanonicalExp!(out, e, where * ".expExpLst[$i]")
+    end
+  end
+  if hasproperty(stmt, :statementLst)
+    for (i, s) in enumerate(stmt.statementLst)
+      _flagCanonicalStatement!(out, s, where * ".statementLst[$i]")
+    end
+  end
+  if hasproperty(stmt, :conditions)
+    for (i, cr) in enumerate(stmt.conditions)
+      _flagCanonicalComponentRef!(out, cr, where * ".conditions[$i]")
+    end
+  end
+  if hasproperty(stmt, :body)
+    for (i, s) in enumerate(stmt.body)
+      _flagCanonicalStatement!(out, s, where * ".body[$i]")
+    end
+  end
+  if hasproperty(stmt, :else_)
+    _flagCanonicalElse!(out, stmt.else_, where * ".else")
+  end
+  if hasproperty(stmt, :elseWhen)
+    @match stmt.elseWhen begin
+      SOME(s) => _flagCanonicalStatement!(out, s, where * ".elseWhen")
+      NONE() => nothing
+    end
+  end
+  return out
+end
+
+function _flagCanonicalElse!(out::Vector{CheckViolation}, elseBranch, where::String)
+  if elseBranch isa DAE.ELSEIF
+    _flagCanonicalExp!(out, elseBranch.exp, where * ".condition")
+    for (i, s) in enumerate(elseBranch.statementLst)
+      _flagCanonicalStatement!(out, s, where * ".statementLst[$i]")
+    end
+    _flagCanonicalElse!(out, elseBranch.else_, where * ".else")
+  elseif elseBranch isa DAE.ELSE
+    for (i, s) in enumerate(elseBranch.statementLst)
+      _flagCanonicalStatement!(out, s, where * ".statementLst[$i]")
+    end
+  end
+  return out
+end
+
+function _flagCanonicalWhenStmts!(out::Vector{CheckViolation}, whenStmts, where::String)
+  _flagCanonicalExp!(out, whenStmts.condition, where * ".condition")
+  for (i, stmt) in enumerate(whenStmts.whenStmtLst)
+    if hasproperty(stmt, :left)
+      _flagCanonicalExp!(out, stmt.left, where * ".stmt[$i].left")
+    end
+    if hasproperty(stmt, :right)
+      _flagCanonicalExp!(out, stmt.right, where * ".stmt[$i].right")
+    end
+    if hasproperty(stmt, :stateVar)
+      _flagCanonicalExp!(out, stmt.stateVar, where * ".stmt[$i].stateVar")
+    end
+    if hasproperty(stmt, :value)
+      _flagCanonicalExp!(out, stmt.value, where * ".stmt[$i].value")
+    end
+    if hasproperty(stmt, :exp)
+      _flagCanonicalExp!(out, stmt.exp, where * ".stmt[$i].exp")
+    end
+    if hasproperty(stmt, :condition)
+      _flagCanonicalExp!(out, stmt.condition, where * ".stmt[$i].condition")
+    end
+    if hasproperty(stmt, :message)
+      _flagCanonicalExp!(out, stmt.message, where * ".stmt[$i].message")
+    end
+    if hasproperty(stmt, :level)
+      _flagCanonicalExp!(out, stmt.level, where * ".stmt[$i].level")
+    end
+  end
+  @match whenStmts.elsewhenPart begin
+    SOME(elseWhenEq) => _flagCanonicalElseWhenPart!(out, elseWhenEq, where * ".elsewhen")
+    NONE() => nothing
+    _ => nothing
+  end
+  return out
+end
+
+function _flagCanonicalElseWhenPart!(out::Vector{CheckViolation}, elseWhen, where::String)
+  if elseWhen isa BDAE.WHEN_STMTS
+    _flagCanonicalWhenStmts!(out, elseWhen, where)
+  else
+    _flagCanonicalEquation!(out, elseWhen, where)
+  end
+  return out
+end
+
+function _flagCanonicalExp!(out::Vector{CheckViolation}, exp, where::String)
+  @match exp begin
+    DAE.CREF(cref, _) => _flagCanonicalComponentRef!(out, cref, where)
+    DAE.CALL(path, _, _) => _flagCanonicalPath!(out, path, where * ".call")
+    DAE.RECORD(path, _, _, _) => _flagCanonicalPath!(out, path, where * ".record")
+    DAE.PARTEVALFUNCTION(path, _, _, _) => _flagCanonicalPath!(out, path, where * ".parteval")
+    _ => nothing
+  end
+  _walkExpChildren(child -> _flagCanonicalExp!(out, child, where), exp)
+  return out
+end
+
+function _flagCanonicalComponentRef!(out::Vector{CheckViolation}, cr, where::String)
+  if cr isa DAE.CREF_QUAL
+    push!(out, CheckViolation(:canonical_cref_names, :error, where,
+                              "component reference is still DAE.CREF_QUAL: $(cr)"))
+  elseif cr isa DAE.CREF_IDENT && occursin('.', cr.ident)
+    push!(out, CheckViolation(:canonical_cref_names, :error, where,
+                              "CREF_IDENT contains a dotted name: $(cr.ident)"))
+  end
+  return out
+end
+
+function _flagCanonicalPath!(out::Vector{CheckViolation}, path, where::String)
+  if !(path isa Absyn.IDENT)
+    push!(out, CheckViolation(:canonical_cref_names, :error, where,
+                              "call/record path is not Absyn.IDENT: $(path)"))
+  elseif occursin('.', path.name)
+    push!(out, CheckViolation(:canonical_cref_names, :error, where,
+                              "call/record IDENT contains a dotted name: $(path.name)"))
+  end
+  return out
 end
 
 #= ── Rule: supported DAE.Exp variants ─────────────────────────────── =#

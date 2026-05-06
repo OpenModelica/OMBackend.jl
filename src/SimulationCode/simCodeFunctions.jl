@@ -119,7 +119,7 @@ function flattenRecordParametersInFunction(func::MODELICA_FUNCTION)::MODELICA_FU
       if haskey(recordFieldMap, outName)
         for (fieldName, fieldTy) in recordFieldMap[outName]
           if fieldName in inputNameSet
-            local flatOutName = outName * "_" * fieldName
+            local flatOutName = outName * OMBackend.COMPONENT_SEPARATOR * fieldName
             local outCref = DAE.CREF_IDENT(flatOutName, fieldTy, MetaModelica.nil)
             local inCref = DAE.CREF_IDENT(fieldName, fieldTy, MetaModelica.nil)
             push!(transformedStatements, DAE.STMT_ASSIGN(
@@ -155,7 +155,7 @@ function flattenRecordVar(v::DAE.VAR, recordFieldMap::Dict{String, Vector{Tuple{
       for field in varLst
         @match field begin
           DAE.TYPES_VAR(fieldName, _, fieldTy, _, _) => begin
-            local flatName = baseName * "_" * fieldName
+            local flatName = baseName * OMBackend.COMPONENT_SEPARATOR * fieldName
             #= Extract dims from fieldTy if it is an array type =#
             local fieldDims = @match fieldTy begin
               DAE.T_ARRAY(_, dims) => dims
@@ -217,7 +217,7 @@ function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN, recordFiel
         local expVec = collect(exps)
         local stmts = DAE.Statement[]
         for (i, (fieldName, fieldTy)) in enumerate(fieldInfo)
-          local flatName = lhsName * "_" * fieldName
+          local flatName = lhsName * OMBackend.COMPONENT_SEPARATOR * fieldName
           local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
           local lhsExp = DAE.CREF(flatCref, fieldTy)
           local rhsExp = transformExpForFlattenedRecords(expVec[i], recordFieldMap)
@@ -234,7 +234,7 @@ function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN, recordFiel
         local stmts = DAE.Statement[]
         push!(stmts, DAE.STMT_ASSIGN(stmt.type_, stmt.exp1, newExp, stmt.source))
         for (i, (fieldName, fieldTy)) in enumerate(fieldInfo)
-          local flatName = lhsName * "_" * fieldName
+          local flatName = lhsName * OMBackend.COMPONENT_SEPARATOR * fieldName
           local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
           local lhsExp = DAE.CREF(flatCref, fieldTy)
           local rhsCref = DAE.CREF_IDENT(lhsName, stmt.type_, MetaModelica.nil)
@@ -274,7 +274,7 @@ function expandRecordArgForCall(exp::DAE.Exp, recordFieldMap::Dict)
         local fieldInfo = recordFieldMap[ident]
         local fieldExps = DAE.Exp[]
         for (fieldName, fieldTy) in fieldInfo
-          local flatName = ident * "_" * fieldName
+          local flatName = ident * OMBackend.COMPONENT_SEPARATOR * fieldName
           local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
           push!(fieldExps, DAE.CREF(flatCref, fieldTy))
         end
@@ -286,6 +286,15 @@ function expandRecordArgForCall(exp::DAE.Exp, recordFieldMap::Dict)
   end
 end
 
+function _recordFieldRefParts(cr::DAE.CREF_IDENT)
+  return (cr.ident, cr.identType, cr.subscriptLst)
+end
+
+function _recordFieldRefParts(cr::DAE.CREF_QUAL)
+  local (innerName, innerTy, innerSubs) = _recordFieldRefParts(cr.componentRef)
+  return (cr.ident * OMBackend.COMPONENT_SEPARATOR * innerName, innerTy, innerSubs)
+end
+
 """
   Transform expressions to replace record field accesses with flattened names.
 """
@@ -295,15 +304,10 @@ function transformExpForFlattenedRecords(exp::DAE.Exp, recordFieldMap::Dict)::DA
     DAE.CREF(DAE.CREF_QUAL(ident, identType, subscriptLst, componentRef), ty) => begin
       #= Check if the base ident is a flattened record =#
       if haskey(recordFieldMap, ident)
-        #= Get the inner field name =#
-        local innerName = string(componentRef)
-        local flatName = ident * "_" * innerName
-        #= Preserve subscripts from the inner cref =#
-        local innerSubscripts = @match componentRef begin
-          DAE.CREF_IDENT(_, _, subs) => subs
-          _ => MetaModelica.nil
-        end
-        local flatCref = DAE.CREF_IDENT(flatName, ty, innerSubscripts)
+        #= Keep the field base name and its subscripts separate. =#
+        local (innerName, fieldTy, innerSubscripts) = _recordFieldRefParts(componentRef)
+        local flatName = ident * OMBackend.COMPONENT_SEPARATOR * innerName
+        local flatCref = DAE.CREF_IDENT(flatName, fieldTy, innerSubscripts)
         return DAE.CREF(flatCref, ty)
       end
       return exp
@@ -401,11 +405,11 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
       for arg in expLst
         @match arg begin
           DAE.CREF(cr, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => begin
-            local baseName = replace(string(cr), "." => "_")
+            local baseName = OMBackend.canonicalName(cr)
             for field in varLst
               @match field begin
                 DAE.TYPES_VAR(fieldName, _, fieldTy, _, _) => begin
-                  local flatName = baseName * "_" * fieldName
+                  local flatName = baseName * OMBackend.COMPONENT_SEPARATOR * fieldName
                   push!(newArgs, buildFieldArgExp(flatName, fieldTy))
                 end
                 _ => nothing
@@ -543,11 +547,11 @@ function resolveIfExpInBindings!(simCode)
   for (name, (idx, simVar)) in ht
     local newVarKind = @match simVar.varKind begin
       SimulationCode.PARAMETER(SOME(bindExp)) => begin
-        local newBind = resolveConstantIfExp(bindExp)
+        local newBind = resolveConstantIfExp(bindExp, simCode)
         newBind === bindExp ? nothing : SimulationCode.PARAMETER(SOME(newBind))
       end
       SimulationCode.ARRAY_PARAMETER(dims, SOME(bindExp)) => begin
-        local newBind = resolveConstantIfExp(bindExp)
+        local newBind = resolveConstantIfExp(bindExp, simCode)
         newBind === bindExp ? nothing : SimulationCode.ARRAY_PARAMETER(dims, SOME(newBind))
       end
       _ => nothing
@@ -623,6 +627,82 @@ function resolveConstantIfExp(exp::DAE.Exp)::DAE.Exp
   end
 end
 
+function resolveConstantIfExp(exp::DAE.Exp, simCode::SIM_CODE)::DAE.Exp
+  @match exp begin
+    DAE.IFEXP(cond, thenExp, elseExp) => begin
+      local resolved = tryEvalCondition(cond, simCode)
+      if resolved === true
+        resolveConstantIfExp(thenExp, simCode)
+      elseif resolved === false
+        resolveConstantIfExp(elseExp, simCode)
+      else
+        DAE.IFEXP(resolveConstantIfExp(cond, simCode),
+                  resolveConstantIfExp(thenExp, simCode),
+                  resolveConstantIfExp(elseExp, simCode))
+      end
+    end
+    DAE.BINARY(e1, op, e2) => begin
+      local ne1 = resolveConstantIfExp(e1, simCode)
+      local ne2 = resolveConstantIfExp(e2, simCode)
+      (ne1 === e1 && ne2 === e2) ? exp : DAE.BINARY(ne1, op, ne2)
+    end
+    DAE.UNARY(op, e1) => begin
+      local ne1 = resolveConstantIfExp(e1, simCode)
+      ne1 === e1 ? exp : DAE.UNARY(op, ne1)
+    end
+    DAE.LBINARY(e1, op, e2) => begin
+      local ne1 = resolveConstantIfExp(e1, simCode)
+      local ne2 = resolveConstantIfExp(e2, simCode)
+      (ne1 === e1 && ne2 === e2) ? exp : DAE.LBINARY(ne1, op, ne2)
+    end
+    DAE.LUNARY(op, e1) => begin
+      local ne1 = resolveConstantIfExp(e1, simCode)
+      ne1 === e1 ? exp : DAE.LUNARY(op, ne1)
+    end
+    DAE.RELATION(e1, op, e2, idx, opt) => begin
+      local ne1 = resolveConstantIfExp(e1, simCode)
+      local ne2 = resolveConstantIfExp(e2, simCode)
+      (ne1 === e1 && ne2 === e2) ? exp : DAE.RELATION(ne1, op, ne2, idx, opt)
+    end
+    DAE.CAST(ty, e1) => begin
+      local ne1 = resolveConstantIfExp(e1, simCode)
+      ne1 === e1 ? exp : DAE.CAST(ty, ne1)
+    end
+    DAE.CALL(path, expLst, attr) => begin
+      local changed = false
+      local newArgs = DAE.Exp[]
+      for arg in expLst
+        local newArg = resolveConstantIfExp(arg, simCode)
+        changed |= newArg !== arg
+        push!(newArgs, newArg)
+      end
+      changed ? DAE.CALL(path, MetaModelica.list(newArgs...), attr) : exp
+    end
+    DAE.ARRAY(ty, scalar, arr) => begin
+      local changed = false
+      local newArr = DAE.Exp[]
+      for elem in arr
+        local newElem = resolveConstantIfExp(elem, simCode)
+        changed |= newElem !== elem
+        push!(newArr, newElem)
+      end
+      changed ? DAE.ARRAY(ty, scalar, MetaModelica.list(newArr...)) : exp
+    end
+    DAE.ASUB(e1, subs) => begin
+      local ne1 = resolveConstantIfExp(e1, simCode)
+      local changed = ne1 !== e1
+      local newSubs = DAE.Exp[]
+      for sub in subs
+        local newSub = resolveConstantIfExp(sub, simCode)
+        changed |= newSub !== sub
+        push!(newSubs, newSub)
+      end
+      changed ? DAE.ASUB(ne1, MetaModelica.list(newSubs...)) : exp
+    end
+    _ => exp
+  end
+end
+
 """
   Try to evaluate a DAE condition expression to a Bool.
   Returns `true`, `false`, or `nothing` if evaluation is not possible.
@@ -667,6 +747,54 @@ function tryEvalCondition(cond::DAE.Exp)::Union{Bool, Nothing}
       local r1 = tryEvalCondition(e1)
       r1 !== nothing ? !r1 : nothing
     end
+    _ => nothing
+  end
+end
+
+function tryEvalCondition(cond::DAE.Exp, simCode::SIM_CODE)::Union{Bool, Nothing}
+  return _tryEvalCondition(cond, simCode, Set{String}())
+end
+
+function _tryEvalCondition(cond::DAE.Exp, simCode::SIM_CODE, seen::Set{String})::Union{Bool, Nothing}
+  @match cond begin
+    DAE.BCONST(val) => val
+    DAE.CREF(__) => begin
+      local value = tryEvalScalar(cond, simCode, seen)
+      value isa Bool ? value : nothing
+    end
+    DAE.IFEXP(c, t, e) => begin
+      local cVal = _tryEvalCondition(c, simCode, seen)
+      cVal === true ? _tryEvalCondition(t, simCode, seen) :
+      cVal === false ? _tryEvalCondition(e, simCode, seen) : nothing
+    end
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local innerArgs = collect(lst)
+      length(innerArgs) == 1 ? _tryEvalCondition(innerArgs[1], simCode, seen) : nothing
+    end
+    DAE.RELATION(e1, op, e2, _, _) => begin
+      local v1 = tryEvalScalar(e1, simCode, seen)
+      local v2 = tryEvalScalar(e2, simCode, seen)
+      _compareScalarValues(v1, op, v2)
+    end
+    DAE.LBINARY(e1, DAE.AND(__), e2) => begin
+      local r1 = _tryEvalCondition(e1, simCode, seen)
+      r1 === false && return false
+      local r2 = _tryEvalCondition(e2, simCode, seen)
+      r2 === false && return false
+      (r1 === true && r2 === true) ? true : nothing
+    end
+    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
+      local r1 = _tryEvalCondition(e1, simCode, seen)
+      r1 === true && return true
+      local r2 = _tryEvalCondition(e2, simCode, seen)
+      r2 === true && return true
+      (r1 === false && r2 === false) ? false : nothing
+    end
+    DAE.LUNARY(DAE.NOT(__), e1) => begin
+      local r1 = _tryEvalCondition(e1, simCode, seen)
+      r1 !== nothing ? !r1 : nothing
+    end
+    DAE.CAST(_, e1) => _tryEvalCondition(e1, simCode, seen)
     _ => nothing
   end
 end
@@ -720,6 +848,161 @@ function tryEvalNumeric(exp::DAE.Exp)::Union{Float64, Nothing}
       local v2 = tryEvalNumeric(e2)
       (v1 !== nothing && v2 !== nothing && v2 != 0.0) ? v1 / v2 : nothing
     end
+    _ => nothing
+  end
+end
+
+function tryEvalNumeric(exp::DAE.Exp, simCode::SIM_CODE)::Union{Float64, Nothing}
+  return _tryEvalNumeric(exp, simCode, Set{String}())
+end
+
+function tryEvalScalar(exp::DAE.Exp, simCode::SIM_CODE)
+  return tryEvalScalar(exp, simCode, Set{String}())
+end
+
+function tryEvalScalar(exp::DAE.Exp, simCode::SIM_CODE, seen::Set{String})
+  @match exp begin
+    DAE.BCONST(v) => v
+    DAE.SCONST(v) => v
+    DAE.ICONST(v) => v
+    DAE.RCONST(v) => v
+    DAE.ENUM_LITERAL(_, index) => index
+    DAE.CREF(__) => begin
+      local bound = _boundParameterExpression(exp, simCode, seen)
+      if bound === nothing
+        nothing
+      else
+        local (name, bindExp) = bound
+        local childSeen = copy(seen)
+        push!(childSeen, name)
+        tryEvalScalar(bindExp, simCode, childSeen)
+      end
+    end
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local innerArgs = collect(lst)
+      length(innerArgs) == 1 ? tryEvalScalar(innerArgs[1], simCode, seen) : nothing
+    end
+    DAE.CALL(Absyn.IDENT("Integer"), lst, _) => begin
+      local innerArgs = collect(lst)
+      if length(innerArgs) == 1
+        local v = tryEvalScalar(innerArgs[1], simCode, seen)
+        v isa Number ? Int(v) : nothing
+      else
+        nothing
+      end
+    end
+    DAE.CAST(_, e1) => tryEvalScalar(e1, simCode, seen)
+    _ => begin
+      local numeric = _tryEvalNumeric(exp, simCode, seen)
+      numeric === nothing ? nothing : numeric
+    end
+  end
+end
+
+function _tryEvalNumeric(exp::DAE.Exp, simCode::SIM_CODE, seen::Set{String})::Union{Float64, Nothing}
+  @match exp begin
+    DAE.RCONST(val) => Float64(val)
+    DAE.ICONST(val) => Float64(val)
+    DAE.ENUM_LITERAL(_, index) => Float64(index)
+    DAE.CREF(__) => begin
+      local bound = _boundParameterExpression(exp, simCode, seen)
+      if bound === nothing
+        nothing
+      else
+        local (name, bindExp) = bound
+        local childSeen = copy(seen)
+        push!(childSeen, name)
+        _tryEvalNumeric(bindExp, simCode, childSeen)
+      end
+    end
+    DAE.UNARY(DAE.UMINUS(__), inner) => begin
+      local v = _tryEvalNumeric(inner, simCode, seen)
+      v !== nothing ? -v : nothing
+    end
+    DAE.UNARY(DAE.UMINUS_ARR(__), inner) => begin
+      local v = _tryEvalNumeric(inner, simCode, seen)
+      v !== nothing ? -v : nothing
+    end
+    DAE.CALL(Absyn.IDENT("abs"), lst, _) => begin
+      local innerArgs = collect(lst)
+      if length(innerArgs) == 1
+        local v = _tryEvalNumeric(innerArgs[1], simCode, seen)
+        v !== nothing ? abs(v) : nothing
+      else
+        nothing
+      end
+    end
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local innerArgs = collect(lst)
+      length(innerArgs) == 1 ? _tryEvalNumeric(innerArgs[1], simCode, seen) : nothing
+    end
+    DAE.CALL(Absyn.IDENT("Integer"), lst, _) => begin
+      local innerArgs = collect(lst)
+      length(innerArgs) == 1 ? _tryEvalNumeric(innerArgs[1], simCode, seen) : nothing
+    end
+    DAE.BINARY(e1, DAE.ADD(__), e2) => begin
+      local v1 = _tryEvalNumeric(e1, simCode, seen)
+      local v2 = _tryEvalNumeric(e2, simCode, seen)
+      (v1 !== nothing && v2 !== nothing) ? v1 + v2 : nothing
+    end
+    DAE.BINARY(e1, DAE.SUB(__), e2) => begin
+      local v1 = _tryEvalNumeric(e1, simCode, seen)
+      local v2 = _tryEvalNumeric(e2, simCode, seen)
+      (v1 !== nothing && v2 !== nothing) ? v1 - v2 : nothing
+    end
+    DAE.BINARY(e1, DAE.MUL(__), e2) => begin
+      local v1 = _tryEvalNumeric(e1, simCode, seen)
+      local v2 = _tryEvalNumeric(e2, simCode, seen)
+      (v1 !== nothing && v2 !== nothing) ? v1 * v2 : nothing
+    end
+    DAE.BINARY(e1, DAE.DIV(__), e2) => begin
+      local v1 = _tryEvalNumeric(e1, simCode, seen)
+      local v2 = _tryEvalNumeric(e2, simCode, seen)
+      (v1 !== nothing && v2 !== nothing && v2 != 0.0) ? v1 / v2 : nothing
+    end
+    DAE.CAST(_, e1) => _tryEvalNumeric(e1, simCode, seen)
+    _ => nothing
+  end
+end
+
+function _boundParameterExpression(exp::DAE.Exp, simCode::SIM_CODE, seen::Set{String})
+  local extracted = extractCrefName(exp)
+  extracted === nothing && return nothing
+  local name = extracted[1]
+  name in seen && return nothing
+  local entry = get(simCode.stringToSimVarHT, name, nothing)
+  entry === nothing && return nothing
+  local (_, simVar) = entry
+  local bindExp = @match simVar.varKind begin
+    PARAMETER(SOME(e)) => e
+    ARRAY_PARAMETER(_, SOME(e)) => e
+    STRING(SOME(e)) => e
+    _ => nothing
+  end
+  bindExp === nothing && return nothing
+  return (name, bindExp)
+end
+
+function _compareScalarValues(v1, @nospecialize(op), v2)::Union{Bool, Nothing}
+  if v1 === nothing || v2 === nothing
+    return nothing
+  end
+  if v1 isa Number && v2 isa Number
+    local n1 = Float64(v1)
+    local n2 = Float64(v2)
+    return @match op begin
+      DAE.LESS(__) => n1 < n2
+      DAE.LESSEQ(__) => n1 <= n2
+      DAE.GREATER(__) => n1 > n2
+      DAE.GREATEREQ(__) => n1 >= n2
+      DAE.EQUAL(__) => n1 == n2
+      DAE.NEQUAL(__) => n1 != n2
+      _ => nothing
+    end
+  end
+  return @match op begin
+    DAE.EQUAL(__) => v1 == v2
+    DAE.NEQUAL(__) => v1 != v2
     _ => nothing
   end
 end

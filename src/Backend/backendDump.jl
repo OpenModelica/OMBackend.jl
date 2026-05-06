@@ -296,7 +296,7 @@ end
    Converts a `DAE.ComponentRef` to a Julia string.
    TODO: Discuss separators. A different one should maybe be used..
 """
-function Base.string(cr::DAE.ComponentRef; separator="_", printType = false)
+function Base.string(cr::DAE.ComponentRef; separator=OMBackend.COMPONENT_SEPARATOR, printType = false)
   buf = IOBuffer()
   _writeCref(buf, cr, separator)
   if printType
@@ -509,7 +509,7 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
       end
 
       DAE.CALL(Absyn.QUALIFIED(__), _)  => begin
-        tmpStr = string(exp.path; separator = "_") + "(" + lstString(exp.expLst, ", ") + ")"
+        tmpStr = string(exp.path; separator = OMBackend.COMPONENT_SEPARATOR) + "(" + lstString(exp.expLst, ", ") + ")"
       end
 
       DAE.RECORD(path = Absyn.IDENT(tmpStr), exps = expl)  => begin
@@ -609,15 +609,15 @@ function Base.string(ty::DAE.Type)::String
   end
 end
 
-function Base.string(path::Absyn.QUALIFIED; separator = "_")
+function Base.string(path::Absyn.QUALIFIED; separator = OMBackend.COMPONENT_SEPARATOR)
   return path.name + separator + string(path.path; separator = separator)
 end
 
-function Base.string(path::Absyn.IDENT; separator = "_")
+function Base.string(path::Absyn.IDENT; separator = OMBackend.COMPONENT_SEPARATOR)
   return path.name
 end
 
-function Base.string(path::Absyn.FULLYQUALIFIED; separator = "_")
+function Base.string(path::Absyn.FULLYQUALIFIED; separator = OMBackend.COMPONENT_SEPARATOR)
   return separator + string(path.path; separator = separator)
 end
 

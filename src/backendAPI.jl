@@ -191,7 +191,8 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
                    warnMissingStartValues = nothing,
                    eliminateNonDynamic::Union{Nothing, Bool, SimulationCode.EliminationOptions} = nothing,
                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                   checkSimCode::Bool = true)::Tuple{String, Expr}
+                   checkSimCode::Bool = true,
+                   returnNameMap::Bool = false)
   local previousWarnSetting = WARN_MISSING_START_VALUES[]
   local runId = createLogRunId(logRunModelName(frontendDAE))
   if warnMissingStartValues !== nothing
@@ -226,16 +227,39 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         @assign simCode.externalRuntime = externalRuntimeNeeded
         simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
         @assign simCode.functions = simCodeFunctions
-        simCode = SimulationCode.flattenRecordCallSites(simCode)
-        simCode = SimulationCode.resolveIfExpInBindings!(simCode)
-        simCode = SimulationCode.foldParameterClosure(simCode)
-        simCode = SimulationCode.propagateConstants(simCode)
-        simCode = SimulationCode.eliminateAliasVariables(simCode)
+        #= Mirror the MTK pipeline: collapse qualified ENUM_LITERAL paths up
+           front. This is a pure string-shortening pass and is a no-op for
+           enum-free models. =#
+        simCode = SimulationCode.runSimCodePass("simplifyEnumLiteralPaths", simCode,
+                                                SimulationCode.simplifyEnumLiteralPaths)
+        simCode = SimulationCode.runSimCodePass("flattenRecordCallSites", simCode,
+                                                SimulationCode.flattenRecordCallSites)
+        local nameMap = NameRewriteMap()
+        simCode = SimulationCode.runSimCodePass("canonicalizeCrefNames", simCode,
+                                                sc -> SimulationCode.canonicalizeCrefNames(sc; nameMap = nameMap))
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterCanonicalNames.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = SimulationCode.runSimCodePass("resolveIfExpInBindings", simCode,
+                                                SimulationCode.resolveIfExpInBindings!)
+        simCode = SimulationCode.runSimCodePass("pruneConstantConditions", simCode,
+                                                SimulationCode.pruneConstantConditions)
+        simCode = SimulationCode.runSimCodePass("foldParameterClosure", simCode,
+                                                SimulationCode.foldParameterClosure)
+        simCode = SimulationCode.runSimCodePass("inlinePreOfConstantParameters", simCode,
+                                                SimulationCode.inlinePreOfConstantParameters)
+        simCode = SimulationCode.runSimCodePass("propagateConstants", simCode,
+                                                SimulationCode.propagateConstants)
+        simCode = SimulationCode.runSimCodePass("eliminateAliasVariables", simCode,
+                                                SimulationCode.eliminateAliasVariables)
+        simCode = SimulationCode.runSimCodePass("eliminateConstantParameters", simCode,
+                                                SimulationCode.eliminateConstantParameters)
+        simCode = SimulationCode.runSimCodePass("pruneConstantConditions", simCode,
+                                                SimulationCode.pruneConstantConditions)
         if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
           error("DEMode does not support structural transitions / VSS at this time. " *
                 "Re-run with mode = OMBackend.MTK_MODE.")
         end
-        return generateDETargetCode(simCode)
+        _checkSimCodeBeforeCodegen(simCode, checkSimCode)
+        return _translationResult(generateDETargetCode(simCode), nameMap, returnNameMap)
       elseif BackendMode == MTK_MODE
         #@debug "Generate simulation code"
         simCode = generateSimulationCode(bDAE; mode = MTK_MODE)
@@ -248,16 +272,31 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         @assign simCode.externalRuntime = externalRuntimeNeeded
         #= Dump before record flattening =#
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_initial.log"), SimulationCode.dumpSimCode(simCode))
+        #= Collapse qualified ENUM_LITERAL paths to leaf `Type.Literal` IDENT form. =#
+        simCode = SimulationCode.runSimCodePass("simplifyEnumLiteralPaths", simCode,
+                                                SimulationCode.simplifyEnumLiteralPaths)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterEnumSimplify.log"), SimulationCode.dumpSimCode(simCode))
         #= Flatten record parameters in functions =#
         simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
         @assign simCode.functions = simCodeFunctions
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFlattenRecordParams.log"), SimulationCode.dumpSimCode(simCode))
         #= Flatten record arguments in equation call sites to match flattened signatures =#
-        simCode = SimulationCode.flattenRecordCallSites(simCode)
+        simCode = SimulationCode.runSimCodePass("flattenRecordCallSites", simCode,
+                                                SimulationCode.flattenRecordCallSites)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFlattenRecordCallSites.log"), SimulationCode.dumpSimCode(simCode))
+        #= Canonicalize every generated name once SimCode has its final record-call shape. =#
+        local nameMap = NameRewriteMap()
+        simCode = SimulationCode.runSimCodePass("canonicalizeCrefNames", simCode,
+                                                sc -> SimulationCode.canonicalizeCrefNames(sc; nameMap = nameMap))
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterCanonicalNames.log"), SimulationCode.dumpSimCode(simCode))
         #= Resolve constant-condition IFEXPs in parameter bindings =#
-        simCode = SimulationCode.resolveIfExpInBindings!(simCode)
+        simCode = SimulationCode.runSimCodePass("resolveIfExpInBindings", simCode,
+                                                SimulationCode.resolveIfExpInBindings!)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterResolveIfExp.log"), SimulationCode.dumpSimCode(simCode))
+        #= Prune IFEXP/IF_EQUATION conditions that became compile-time constants. =#
+        simCode = SimulationCode.runSimCodePass("pruneConstantConditions", simCode,
+                                                SimulationCode.pruneConstantConditions)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterConstantConditionPruning.log"), SimulationCode.dumpSimCode(simCode))
         #= Constant propagation and alias elimination run AFTER record flattening
            so that all CREF references are in their final form before substitution.
            Running these earlier caused dangling references when flattenRecordCallSites
@@ -267,14 +306,28 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
            defined solely by parameter expressions) are promoted to parameters before
            MTK sees them. This removes the Newton-init failure mode where zero guesses
            on those unknowns produce NaN/Inf evaluations. =#
-        simCode = SimulationCode.foldParameterClosure(simCode)
+        simCode = SimulationCode.runSimCodePass("foldParameterClosure", simCode,
+                                                SimulationCode.foldParameterClosure)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFoldClosure.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.inlinePreOfConstantParameters(simCode)
+        simCode = SimulationCode.runSimCodePass("inlinePreOfConstantParameters", simCode,
+                                                SimulationCode.inlinePreOfConstantParameters)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterInlinePreParam.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.propagateConstants(simCode)
+        simCode = SimulationCode.runSimCodePass("propagateConstants", simCode,
+                                                SimulationCode.propagateConstants)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterConstantProp.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.eliminateAliasVariables(simCode)
+        simCode = SimulationCode.runSimCodePass("eliminateAliasVariables", simCode,
+                                                SimulationCode.eliminateAliasVariables)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterAliasElimination.log"), SimulationCode.dumpSimCode(simCode))
+        #= Constant-parameter elimination shrinks the parameter list MTK sees
+           before structural_simplify. Tier-1 only: the pass internally skips
+           VSS / DOCC / sub-model variants where a parameter could be re-bound
+           at runtime. =#
+        simCode = SimulationCode.runSimCodePass("eliminateConstantParameters", simCode,
+                                                SimulationCode.eliminateConstantParameters)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterEliminateConstParams.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = SimulationCode.runSimCodePass("pruneConstantConditions", simCode,
+                                                SimulationCode.pruneConstantConditions)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterPostAliasConditionPruning.log"), SimulationCode.dumpSimCode(simCode))
         #= Output-only variable elimination runs AFTER const-prop and alias-elim,
            so that alias chains are resolved and the output-only subgraph is cleanly separated.
            A fresh matching is computed from the current equation/variable set. =#
@@ -287,16 +340,19 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         end
         if elimOpts !== nothing
           @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_beforeElimination.log"), SimulationCode.dumpSimCode(simCode))
-          simCode = SimulationCode.eliminateOutputOnlyVariables(simCode, elimOpts)
+          simCode = SimulationCode.runSimCodePass("eliminateNonDynamic", simCode,
+                                                  sc -> SimulationCode.eliminateOutputOnlyVariables(sc, elimOpts))
           @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterElimination.log"), SimulationCode.dumpSimCode(simCode))
         end
         #= Observed filter: controls which alias-eliminated variables become observed equations.
            Default (nothing): skip ALL alias observed equations for fast compilation.
            With filter patterns: keep only matching aliases as observed. =#
+        local observedBefore = SimulationCode.simCodeMetrics(simCode)
+        local observedT0 = time()
         if observedFilter === nothing
           #= Fast default: no observed equations from alias elimination =#
           if !isempty(simCode.aliasMap)
-            @info "observedFilter: clearing $(length(simCode.aliasMap)) alias observed equations (default: none)"
+            @info "[SIMCODE: observedFilter] clearing $(length(simCode.aliasMap)) alias observed equations (default: none)"
             @assign simCode.aliasMap = empty(simCode.aliasMap)
           end
         else
@@ -314,14 +370,13 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
               any(p -> occursin(p, entry.eliminatedName), patterns)
             end
             @assign simCode.aliasMap = filteredMap
-            @info "observedFilter: kept $(length(filteredMap)) of $originalCount alias observed equations"
+            @info "[SIMCODE: observedFilter] kept $(length(filteredMap)) of $originalCount alias observed equations"
           end
         end
-        if checkSimCode
-          local checkResult = SimulationCode.SimCodeCheck.check(simCode)
-          SimulationCode.SimCodeCheck.report(stderr, checkResult)
-        end
-        return generateMTKTargetCode(simCode)
+        SimulationCode.logSimCodePassMetrics("observedFilter", observedBefore, simCode, time() - observedT0)
+        simCode = SimulationCode.cleanupTrivialResidualEquations(simCode; sourcePass = "observedFilter")
+        _checkSimCodeBeforeCodegen(simCode, checkSimCode)
+        return _translationResult(generateMTKTargetCode(simCode), nameMap, returnNameMap)
       else
         @error "Unsupported BackendMode: $BackendMode. Valid modes are: MTK_MODE, DEMode"
       end
@@ -329,6 +384,29 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
   finally
     WARN_MISSING_START_VALUES[] = previousWarnSetting
   end
+end
+
+function _translationResult(result::Tuple{String, Expr}, nameMap::NameRewriteMap,
+                            returnNameMap::Bool)
+  if returnNameMap
+    return (result[1], result[2], nameMap)
+  end
+  return result
+end
+
+function _checkSimCodeBeforeCodegen(simCode::SimulationCode.SIM_CODE, checkSimCode::Bool)
+  if !checkSimCode
+    return nothing
+  end
+  local checkResult = SimulationCode.SimCodeCheck.check(simCode)
+  SimulationCode.SimCodeCheck.report(stderr, checkResult)
+  local canonicalErrors = filter(v -> v.rule === :canonical_cref_names && v.severity === :error,
+                                 checkResult.violations)
+  if !isempty(canonicalErrors)
+    local details = join([string(v.where, ": ", v.detail) for v in canonicalErrors], "\n")
+    error("SimCode still contains non-canonical component references before code generation:\n" * details)
+  end
+  return nothing
 end
 
 """
@@ -482,8 +560,6 @@ function generateTargetCode(simCode::SimulationCode.SIM_CODE)
   (modelName::String, modelCode::Expr) = CodeGeneration.generateCode(simCode)
   @debug "Functions:" modelCode
   @debug "Model:" modelName
-  #= TODO: This replacement should ideally be done earlier. Or be solved in a nicer way. =#
-  modelName = replace(modelName, "." => "__")
   COMPILED_MODELS[modelName] = modelCode
   return (modelName, modelCode)
 end
@@ -499,7 +575,6 @@ function generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)
   (modelName::String, modelCode::Expr) = CodeGeneration.generateMTKCode(simCode)
   @debug "Functions:" modelCode
   @debug "Model:" modelName
-  modelName = replace(modelName, "." => "__")
   local codeHash = hash(modelCode)
   if haskey(COMPILED_MODELS_MTK, modelName)
     #= Compare hash instead of full Expr tree to reduce compile-time overhead. =#
@@ -533,7 +608,6 @@ end
 """
 function generateDETargetCode(simCode::SimulationCode.SIM_CODE)
   (modelName::String, modelCode::Expr) = CodeGeneration.generateDECode(simCode)
-  modelName = replace(modelName, "." => "__")
   local codeHash = hash(modelCode)
   if haskey(COMPILED_MODELS_DEJL, modelName)
     local previousHash = COMPILED_MODELS_DEJL[modelName][3]
@@ -690,8 +764,7 @@ function simulateModel(modelName::String;
                        solver = Rodas5(autodiff=false),
                        overwriteCache::Bool = false,
                        kwargs...)
-  #= Strings using "." need to be in a format suitable for Julia =#
-  modelName = replace(modelName, "." => "__")
+  modelName = canonicalName(modelName)
   local modelCode::Expr
   if MODE == MTK_MODE
     #= This does a redundant string conversion for now due to modeling toolkit being as is...=#
@@ -759,7 +832,7 @@ prob = OMBackend.getMTKProblem("Modelica.Mechanics.MultiBody.Examples.Elementary
 function getMTKProblem(modelName::String;
                        tspan = (0.0, 1.0),
                        overwriteCache::Bool = false)
-  modelName = replace(modelName, "." => "__")
+  modelName = canonicalName(modelName)
   local modelCode::Expr
   try
     modelCode = getCompiledModel(modelName)
@@ -791,7 +864,7 @@ function resimulateModel(modelName::String;
   If that is the case we do not have to recompile it.
   =#
   try
-    modelName = replace(modelName, "." => "__")
+    modelName = canonicalName(modelName)
     Base.invokelatest() do
       local mod = getfield(OMBackend, Symbol(modelName))
       mod.simulate(tspan, solver)
@@ -879,7 +952,7 @@ OM.OMBackend.getVariableValues(sol, "x")
 function getVariableValues(sol::ODESolution, varName::String)
 
   varAsJLSym = if varName != "time"
-    Symbol(replace(varName, "." => "__"))
+    canonicalSymbol(varName)
   else
     :t
   end
@@ -922,7 +995,7 @@ function getVariableValues(sols::Vector, variables...)
   for sol in sols
     for v in variables
       local vAsJLSym = if v != "time"
-        Symbol(replace(v, "." => "__"))
+        canonicalSymbol(v)
       else
         :t
       end
@@ -947,7 +1020,7 @@ function MTK_getObserved(sol, modelName=nothing)
     return ModelingToolkit.observed(sol.prob.f.sys)
   end
   if modelName !== nothing
-    local modSym = Symbol(replace(modelName, "." => "__"))
+    local modSym = canonicalSymbol(modelName)
     if isdefined(OMBackend, modSym)
       local mod = getfield(OMBackend, modSym)
       if isdefined(mod, :LATEST_REDUCED_SYSTEM)
@@ -966,7 +1039,7 @@ Returns a `Dict{String, Vector{Float64}}` mapping variable name to values, or `n
 Used as fallback for purely algebraic (0-unknown) models where `sol[sym]` is unavailable.
 """
 function MTK_evaluateAllObserved(sol, obs_eqs, modelName::String)
-  local modSym = Symbol(replace(modelName, "." => "__"))
+  local modSym = canonicalSymbol(modelName)
   if !isdefined(OMBackend, modSym)
     return nothing
   end

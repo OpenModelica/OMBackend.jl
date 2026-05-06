@@ -35,6 +35,7 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
   "ceil"      => :modelica_ceil,
   "floor"     => :modelica_floor,
   "integer"   => :modelica_integer,
+  "Integer"   => :modelica_Integer,
   "div"       => :modelica_div,
   "mod"       => :modelica_mod,
   "rem"       => :modelica_rem,
@@ -106,6 +107,11 @@ modelica_sqrt(x) = sqrt(x)
 modelica_ceil(x) = ceil(x)
 modelica_floor(x) = floor(x)
 modelica_integer(x) = floor(Int, x)
+
+#= Modelica `Integer(enum_value)` returns the 1-based index of an enum literal.
+   Our codegen lowers enum CREFs to integer indices and ENUM_LITERAL to its
+   `index` field, so this is the identity at the Julia level. =#
+modelica_Integer(x) = x
 modelica_div(x, y) = div(x, y)
 modelica_mod(x, y) = mod(x, y)
 modelica_rem(x, y) = rem(x, y)

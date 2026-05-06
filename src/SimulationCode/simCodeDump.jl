@@ -265,7 +265,7 @@ end
  Converts a ```backendVar::BDAE.Var``` to the simcode format.
 """
 function string(backendVar::BDAE.Var)
-  BDAE.string(backendVar.varName; separator = "___")
+  BDAE.string(backendVar.varName; separator = OMBackend.COMPONENT_SEPARATOR)
 end
 
 
