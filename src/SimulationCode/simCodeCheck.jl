@@ -192,7 +192,26 @@ function rule_balanced(simCode::SIM_CODE)::Vector{CheckViolation}
      !isempty(simCode.whenEquations)
     return out
   end
-  local nUnknown = _countUnknowns(simCode)
+  # count only unknowns that actually participate in residual equations;
+  # HT may carry orphan entries from incomplete alias bookkeeping that add
+  # no DAE constraint to balance against
+  local refNames = Set{String}()
+  local missingProbe = String[]
+  for eq in simCode.residualEquations
+    _collectCrefNames!(missingProbe, eq.exp, Set{String}())
+  end
+  for n in missingProbe
+    push!(refNames, n)
+  end
+  local eliminated = Set(simCode.eliminatedVariables)
+  local nUnknown = 0
+  for (_, (_, v)) in simCode.stringToSimVarHT
+    v.name in eliminated && continue
+    if !isUnknownVarKind(v.varKind) || v.varKind isa STATE_DERIVATIVE
+      continue
+    end
+    v.name in refNames && (nUnknown += 1)
+  end
   local nEq = length(simCode.residualEquations)
   if nUnknown != nEq
     push!(out, CheckViolation(:balanced, :error, simCode.name,

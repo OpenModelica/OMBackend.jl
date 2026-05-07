@@ -214,11 +214,11 @@ function createNewU0(symsOfOldProblem::Vector{Symbol},
   if  specialCase
     return uVec
   end
-  #= _Remove the prefixes of the variable names <prefix>_<suffix> => <suffix> =#
-  local variableNamesWithoutPrefixesOP = String[replace(k, r".*_" => "")
+  # strip only the leading submodel prefix (first underscore-segment);
+  # greedy ".*_" would collapse distinct names sharing a final identifier
+  local variableNamesWithoutPrefixesOP = String[replace(k, r"^[^_]*_" => "")
                                                 for k in variableNamesOldProblem]
-  #@info "variableNamesWithoutPrefixesOP" variableNamesWithoutPrefixesOP
-  local variableNamesWithoutPrefixesNP = String[replace(k, r".*_" => "")
+  local variableNamesWithoutPrefixesNP = String[replace(k, r"^[^_]*_" => "")
                                                 for k in variableNamesNewProblem]
   #@info "variableNamesWithoutPrefixesOP" variableNamesWithoutPrefixesOP
   #= Build name-to-index lookup dicts for O(1) access instead of O(n) findall =#

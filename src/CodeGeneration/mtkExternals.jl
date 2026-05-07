@@ -1112,11 +1112,12 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
      classification (Engine1a's `Inertia_phiˍt` is the differential state but
      `Inertia_w` is its algebraic alias; promoting `Inertia_w ~ 10` to hard u0
      lets us propagate to `Inertia_phiˍt` via the alias). =#
+  # resolver consults hard u0 only; soft default-zero entries would let
+  # the wrong alias chain match first
   local progressed = true
   while progressed
     progressed = false
-    explicitIVMap = Dict{Any, Any}(iv.first => iv.second
-                                   for iv in vcat(hardInitialValues, softInitialValues))
+    explicitIVMap = Dict{Any, Any}(iv.first => iv.second for iv in hardInitialValues)
     for unk in reducedUnks
       local unkStr = string(unk)
       unkStr in hardSymStrSet && continue

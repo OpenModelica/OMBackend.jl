@@ -699,7 +699,7 @@ function recompilation(activeModeName,
   local runId = OMBackend.createLogRunId(activeModeName; suffix = "recompilation")
   return OMBackend.withLogRunDir(runId) do
     #=  Recompilation =#
-    @VSS_DEBUG @info "[recompilation] ENTER" activeModeName t=integrator.t
+    @VSS_DEBUG @info "[RECOMPILATION] ENTER" activeModeName t=integrator.t
     local _t_start = time()
     local integrator_u = integrator.u
     #= Have the SCode =#
@@ -716,45 +716,45 @@ function recompilation(activeModeName,
       $(newValueExpr)
     end
     local newValue = eval(newValueExpr)
-    @VSS_DEBUG @info "[recompilation] step 1/7: parsed modification" elementToChange newValue elapsed_s=round(time()-_t_start, digits=2)
+    @VSS_DEBUG @info "[RECOMPILATION] step 1/7: parsed modification" elementToChange newValue elapsed_s=round(time()-_t_start, digits=2)
     #=  2) Change the parameters in the SCode via API (As specified by the modification)=#
     #=  2.1 Change the parameter so that it is the same as the modifcation. =#
     newProgram = MetaModelica.list(RuntimeUtil.setElementInSCodeProgram!(activeModeName,
                                                                          elementToChange,
                                                                          newValue, metaModel))
-    @VSS_DEBUG @info "[recompilation] step 2/7: SCode mutated" elapsed_s=round(time()-_t_start, digits=2)
+    @VSS_DEBUG @info "[RECOMPILATION] step 2/7: SCode mutated" elapsed_s=round(time()-_t_start, digits=2)
     local classToInstantiate = modelicaActiveModeName
     #= 3) Call the frontend + the backend + JIT compile Julia code in memory =#
     local flatModelica = first(OMFrontend.instantiateSCodeToFM(classToInstantiate, newProgram))
-    @VSS_DEBUG @info "[recompilation] step 3/7: frontend (instantiateSCodeToFM) done" elapsed_s=round(time()-_t_start, digits=2)
+    @VSS_DEBUG @info "[RECOMPILATION] step 3/7: frontend (instantiateSCodeToFM) done" elapsed_s=round(time()-_t_start, digits=2)
     #= 3.1 Run the backend =#
     local simulationCode = translateToSimCode(flatModelica, activeModeName)
-    @VSS_DEBUG @info "[recompilation] step 4/7: backend (translateToSimCode) done" elapsed_s=round(time()-_t_start, digits=2)
+    @VSS_DEBUG @info "[RECOMPILATION] step 4/7: backend (translateToSimCode) done" elapsed_s=round(time()-_t_start, digits=2)
     #= 3.2 Adjust variables and special parameters =#
     RuntimeUtil.updateInitialConditions!(simulationCode, integrator)
     local resultingModel = translateToMTK(simulationCode, activeModeName)
-    @VSS_DEBUG @info "[recompilation] step 5/7: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
+    @VSS_DEBUG @info "[RECOMPILATION] step 5/7: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
     #= 4.0 Revaulate the model=#
     local modelName = string(OMBackend.canonicalName(activeModeName), "Model")
     @eval $(resultingModel)
-    @VSS_DEBUG @info "[recompilation] step 6/7: module @eval done" modelName elapsed_s=round(time()-_t_start, digits=2)
+    @VSS_DEBUG @info "[RECOMPILATION] step 6/7: module @eval done" modelName elapsed_s=round(time()-_t_start, digits=2)
     modelCall = quote
       $(Symbol(modelName))($(tspan))
     end
     (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
-    @VSS_DEBUG @info "[recompilation] step 7/7: modelCall @eval done (submodel ODEProblem built)" elapsed_s=round(time()-_t_start, digits=2)
-    #= Reconstruct the composite problem to keep the callbacks =#
+    @VSS_DEBUG @info "[RECOMPILATION] step 7/7: modelCall @eval done (submodel ODEProblem built)" elapsed_s=round(time()-_t_start, digits=2)
+    # NoInit prevents MTK from re-running init NLS on within-mode reinit
+    # events; the recompilation handler already supplies a consistent newU0
+    # via createNewU0, so MTK re-init would only undo within-mode reinits
     compositeProblem = ModelingToolkit.ODEProblem(
       reducedSystem,
       finalInitialValues,
       tspan,
       pars,
-      #=
-        TODO currently only handles a single structural callback.
-      =#
-      callback = CallbackSet(callbackConditions, callbacks)
+      callback = CallbackSet(callbackConditions, callbacks),
+      initializealg = ModelingToolkit.SciMLBase.NoInit()
     )
-    @VSS_DEBUG @info "[recompilation] composite ODEProblem rebuilt" elapsed_s=round(time()-_t_start, digits=2)
+    @VSS_DEBUG @info "[RECOMPILATION] composite ODEProblem rebuilt" elapsed_s=round(time()-_t_start, digits=2)
     #=4) Changed System=#
     #= 4.1 Update the structural callback with the new situation =#
     @match SOME(newMetaModel) = simulationCode.metaModel

@@ -149,7 +149,6 @@ function createStructuralCallback(simCode,
   (whenOperators, recompilationDirective) = createStructuralWhenStatements(stmtLst, simCode)
   local affect::Expr = quote
     function affect!(integrator)
-      #= Expand the when operators =#
       $(whenOperators...)
       structuralChange.structureChanged = true
       integrator.just_hit_tstop = true

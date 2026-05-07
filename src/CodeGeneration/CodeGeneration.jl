@@ -64,6 +64,7 @@ import OMRuntimeExternalC
 #= Initialize RTG for this module to enable world-age-safe function generation =#
 RuntimeGeneratedFunctions.init(@__MODULE__)
 
+include("DAEInitSolve.jl")
 include("mtkExternals.jl")
 include("./exprRewrite.jl")
 include("./arrayUtils.jl")

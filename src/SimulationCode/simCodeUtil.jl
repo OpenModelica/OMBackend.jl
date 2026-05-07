@@ -3639,6 +3639,25 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     paramValueMap[name] = v
   end
 
+  # Enumerate ARRAY_PARAMETER element bindings; iterate to fixed point so
+  # chained array references resolve in dependency order.
+  local arrChanged = true
+  while arrChanged
+    arrChanged = false
+    local mapSizeBefore = length(paramValueMap)
+    for (name, htEntry) in ht
+      name in protectedNames && continue
+      local (_, sv) = htEntry
+      local arrBind = @match sv.varKind begin
+        ARRAY_PARAMETER(_, SOME(e)) => e
+        _ => nothing
+      end
+      arrBind === nothing && continue
+      _enumerateArrayParamElements!(paramValueMap, name, arrBind, simCode, seen, protectedNames)
+    end
+    arrChanged = length(paramValueMap) > mapSizeBefore
+  end
+
   if isempty(paramValueMap)
     @info "[SIMCODE: eliminateConstantParameters] no eliminable parameters found"
     return simCode
@@ -3659,7 +3678,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     elseif eq isa BDAE.EQUATION
       local (newLhs, _) = Util.traverseExpTopDown(eq.lhs, substituteConstantParameter, paramValueMap)
       local (newRhs, _) = Util.traverseExpTopDown(eq.rhs, substituteConstantParameter, paramValueMap)
-      BDAE.EQUATION(newLhs, newRhs, eq.source, eq.attr)
+      BDAE.EQUATION(newLhs, newRhs, eq.source, eq.attributes)
     else
       eq
     end
@@ -3691,8 +3710,15 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     push!(newWhenEquations, whenEq)
   end
 
-  #= Step 3: substitute into the bindings of surviving parameters so
-     parameter-chain references resolve cleanly after elimination. =#
+  # alias-eliminated residuals are emitted verbatim by codegen; substitute
+  # eliminated-parameter element refs to avoid dangling identifiers
+  local newElimEqs = BDAE.RESIDUAL_EQUATION[]
+  for eq in simCode.eliminatedEquations
+    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
+    push!(newElimEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+  end
+
+  # substitute into surviving PARAMETER and ARRAY_PARAMETER bindings
   local newHT = copy(ht)
   for (name, htEntry) in ht
     haskey(paramValueMap, name) && continue
@@ -3701,6 +3727,10 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
       PARAMETER(SOME(b)) => begin
         local (nb, _) = Util.traverseExpTopDown(b, substituteConstantParameter, paramValueMap)
         nb === b ? sv.varKind : PARAMETER(SOME(nb))
+      end
+      ARRAY_PARAMETER(dims, SOME(b)) => begin
+        local (nb, _) = Util.traverseExpTopDown(b, substituteConstantParameter, paramValueMap)
+        nb === b ? sv.varKind : ARRAY_PARAMETER(dims, SOME(nb))
       end
       _ => sv.varKind
     end
@@ -3762,6 +3792,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   @assign simCode.initialEquations = newInitials
   @assign simCode.ifEquations = newIfEquations
   @assign simCode.whenEquations = newWhenEquations
+  @assign simCode.eliminatedEquations = newElimEqs
   @assign simCode.stringToSimVarHT = newHT
   #= Do NOT append eliminated parameter names to `simCode.eliminatedVariables`.
      That list pairs with `simCode.eliminatedEquations` 1:1 and is consumed by
@@ -3866,13 +3897,60 @@ function _collectWhenConditionCrefs!(out::Set{String}, whenEq::BDAE.WHEN_EQUATIO
   return _collectWhenConditionCrefs!(out, whenEq.whenEquation)
 end
 
-"""
-    substituteConstantParameter(exp, paramValueMap)
+# Walk a DAE.ARRAY binding and add one paramValueMap entry per numeric element.
+function _enumerateArrayParamElements!(paramValueMap, baseName::String,
+                                       exp, simCode,
+                                       seen::Set{String},
+                                       protectedNames::Set{String})
+  exp isa DAE.ARRAY || return nothing
+  local i = 0
+  for elem in exp.array
+    i += 1
+    local elemName = Base.string(baseName, "[", i, "]")
+    elemName in protectedNames && continue
+    if elem isa DAE.ARRAY
+      _enumerateArrayParamElements!(paramValueMap, elemName, elem, simCode,
+                                    seen, protectedNames)
+    else
+      empty!(seen)
+      local v = _tryEvalNumeric(elem, simCode, seen)
+      # fall back to map lookup when the element binding is a CREF/ASUB
+      # to a previously-enumerated array element
+      if v === nothing
+        local refName = _asubCanonicalName(elem)
+        if refName !== nothing && haskey(paramValueMap, refName)
+          v = paramValueMap[refName]
+        end
+      end
+      v !== nothing && (paramValueMap[elemName] = v)
+    end
+  end
+  return nothing
+end
 
-`Util.traverseExpTopDown` callback. Replaces a `DAE.CREF` whose name is in
-`paramValueMap` with a literal constant matching the CREF's declared type
-(RCONST for T_REAL, ICONST for T_INTEGER, BCONST for T_BOOL).
-"""
+# Canonical name for a (possibly nested) DAE.ASUB; nothing if non-constant.
+function _asubCanonicalName(@nospecialize(exp))::Union{Nothing,String}
+  @match exp begin
+    DAE.CREF(cr, _) => string(cr)
+    DAE.ASUB(inner, subs) => begin
+      local innerName = _asubCanonicalName(inner)
+      innerName === nothing && return nothing
+      local idxParts = String[]
+      for s in subs
+        local v = @match s begin
+          DAE.ICONST(i) => i
+          DAE.RCONST(r) where r == round(r) => Int(round(r))
+          _ => nothing
+        end
+        v === nothing && return nothing
+        push!(idxParts, Base.string("[", v, "]"))
+      end
+      Base.string(innerName, idxParts...)
+    end
+    _ => nothing
+  end
+end
+
 function substituteConstantParameter(@nospecialize(exp), paramValueMap)
   @match exp begin
     DAE.CREF(cr, ty) => begin
@@ -3886,6 +3964,14 @@ function substituteConstantParameter(@nospecialize(exp), paramValueMap)
           _                 => DAE.RCONST(v)
         end
         return (literalExp, false, paramValueMap)
+      end
+      (exp, true, paramValueMap)
+    end
+    DAE.ASUB(__) => begin
+      local name = _asubCanonicalName(exp)
+      if name !== nothing && haskey(paramValueMap, name)
+        local v = paramValueMap[name]
+        return (DAE.RCONST(v), false, paramValueMap)
       end
       (exp, true, paramValueMap)
     end

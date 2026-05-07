@@ -259,6 +259,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     function simulate(tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
       ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
       global LATEST_REDUCED_SYSTEM = $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))
+      global LATEST_PROBLEM = $(Symbol("$(MODEL_NAME)Model_problem"))
       solve($(Symbol("$(MODEL_NAME)Model_problem")), solver; kwargs...)
     end
   end
@@ -315,7 +316,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local occDummyVariables::Vector = String[]
   local dataStructureVariables::Vector = String[]
   local performIndexReduction = false
-  local statePriorityPairs = Tuple{Symbol, Float64}[]
+  local statePriorityPairs = Tuple{Symbol, Int}[]
   for varName in keys(stringToSimVarHT)
     (idx, var) = stringToSimVarHT[varName]
     local varType = var.varKind
@@ -381,10 +382,10 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     local _sp = @match optAttrs begin
       SOME(attrs && DAE.VAR_ATTR_REAL(__)) => begin
         @match attrs.stateSelectOption begin
-          SOME(DAE.NEVER(__)) => -10.0
-          SOME(DAE.AVOID(__)) => -2.0
-          SOME(DAE.PREFER(__)) => 2.0
-          SOME(DAE.ALWAYS(__)) => 10.0
+          SOME(DAE.NEVER(__)) => -10
+          SOME(DAE.AVOID(__)) => -2
+          SOME(DAE.PREFER(__)) => 2
+          SOME(DAE.ALWAYS(__)) => 10
           _ => nothing
         end
       end
@@ -843,8 +844,9 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
         push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableStatePriority, $priority)))
       end
       eval(_batchBlock)
-      #= Transform the variable vector into a vector of Nums =#
-      vars = map(x -> last(x), vars)
+      # re-fetch decorated Nums from module scope (eval rebinds names but
+      # local vars still holds pre-eval references)
+      vars = [Base.invokelatest(getfield, @__MODULE__, sym) for (sym, _) in vars]
       #= Initial values for the continuous system. =#
       $(decomposeParameterEquationsInline(PARAMETER_EQUATIONS))
       #= Add ifCond discrete parameter values to pars dict =#
