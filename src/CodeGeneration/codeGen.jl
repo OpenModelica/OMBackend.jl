@@ -390,10 +390,15 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
       quote
         $cond
         $affect
+        #= No `affect_neg!` set: transformToZeroCrossingCondition has already
+           encoded direction (positive→negative = trigger) so the same
+           Modelica `when cond then` semantics fall on `affect!` only. Setting
+           `affect_neg! = affect!` would double-fire on each oscillation
+           (classic bouncing-ball: downcrossing reinit then upcrossing reinit
+           again at the same event), driving Zeno / maxiters. =#
         $(Symbol("cb$(callbacks)")) = ContinuousCallback($(Symbol("condition$(callbacks)")),
                                                          $(Symbol("affect$(callbacks)!")),
-                                                         rootfind=true, save_positions=(true, true),
-                                                         affect_neg! = $(Symbol("affect$(callbacks)!")))
+                                                         rootfind=true, save_positions=(true, true))
         $(if wEq.elsewhenPart !== nothing
             eqToJulia(wEq.elsewhenPart.data, simCode, 0)
           end)

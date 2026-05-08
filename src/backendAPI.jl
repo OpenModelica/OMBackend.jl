@@ -325,6 +325,9 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         simCode = SimulationCode.runSimCodePass("eliminateConstantParameters", simCode,
                                                 SimulationCode.eliminateConstantParameters)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterEliminateConstParams.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = SimulationCode.runSimCodePass("classifyAdditionalDiscretes", simCode,
+                                                SimulationCode._classifyAdditionalDiscreteVariables)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterClassifyDiscretes.log"), SimulationCode.dumpSimCode(simCode))
         simCode = SimulationCode.runSimCodePass("pruneConstantConditions", simCode,
                                                 SimulationCode.pruneConstantConditions)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterPostAliasConditionPruning.log"), SimulationCode.dumpSimCode(simCode))
@@ -399,7 +402,7 @@ function _checkSimCodeBeforeCodegen(simCode::SimulationCode.SIM_CODE, checkSimCo
     return nothing
   end
   local checkResult = SimulationCode.SimCodeCheck.check(simCode)
-  SimulationCode.SimCodeCheck.report(stderr, checkResult)
+  SimulationCode.SimCodeCheck.report(stderr, checkResult; modelName = string(simCode.name))
   local canonicalErrors = filter(v -> v.rule === :canonical_cref_names && v.severity === :error,
                                  checkResult.violations)
   if !isempty(canonicalErrors)

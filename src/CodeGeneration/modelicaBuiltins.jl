@@ -40,6 +40,9 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
   "mod"       => :modelica_mod,
   "rem"       => :modelica_rem,
 
+  #= --- String formatting --- =#
+  "String"    => :modelica_String,
+
   #= --- Trigonometric --- =#
   "sin"       => :modelica_sin,
   "cos"       => :modelica_cos,
@@ -92,8 +95,39 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
   "smooth"       => :modelica_smooth,
   "noEvent"      => :modelica_noEvent,
   "sample"       => :modelica_sample,
+  "edge"         => :modelica_edge,
+  "change"       => :modelica_change,
   "homotopy"     => :modelica_homotopy,
   "semiLinear"   => :modelica_semiLinear,
+)
+
+"""
+    MODELICA_UTILITIES_TO_RUNTIME_C
+
+Maps the dot-flattened (`_`-joined) name of qualified Modelica.Utilities.*
+function paths to the corresponding flat C-level function names exported by
+OMRuntimeExternalC. Keys use the underscore form because `string(path)` on
+an `Absyn.QUALIFIED` already collapses the segments with `_`. Used by
+`_modelicaFunctionCallExpr` to route qualified Modelica.Utilities.Strings /
+Files / Streams calls to the OMRuntimeExternalC API. Without this mapping
+the per-model module raises UndefVarError for the dot-flattened Modelica
+name (e.g. `Modelica_Utilities_Strings_substring`) because no such Symbol
+is bound in the generated module.
+
+Only entries whose OMRuntimeExternalC counterpart actually exists are listed.
+Add new entries here as additional Modelica.Utilities calls show up in
+real models.
+"""
+const MODELICA_UTILITIES_TO_RUNTIME_C = Dict{String, Symbol}(
+  "Modelica_Utilities_Strings_length"          => :ModelicaStrings_length,
+  "Modelica_Utilities_Strings_substring"       => :ModelicaStrings_substring,
+  "Modelica_Utilities_Strings_compare"         => :ModelicaStrings_compare,
+  "Modelica_Utilities_Strings_skipWhiteSpace"  => :ModelicaStrings_skipWhiteSpace,
+  "Modelica_Utilities_Strings_scanIdentifier"  => :ModelicaStrings_scanIdentifier,
+  "Modelica_Utilities_Strings_scanInteger"     => :ModelicaStrings_scanInteger,
+  "Modelica_Utilities_Strings_scanReal"        => :ModelicaStrings_scanReal,
+  "Modelica_Utilities_Strings_scanString"      => :ModelicaStrings_scanString,
+  "Modelica_Utilities_Strings_hashString"      => :ModelicaStrings_hashString,
 )
 
 
@@ -380,6 +414,47 @@ UndefVarError("sample") whenever sample() leaks into a non-when expression
 (e.g. inside SignalPWM blocks used by DC-DC choppers).
 """
 modelica_sample(start, period) = false
+
+"""
+    modelica_edge(b)
+
+Modelica: edge(b) is `b and not pre(b)`, true at the instant Boolean b
+becomes true. In continuous expression context the integrator sits between
+events, so b == pre(b) and edge(b) is false. The actual rising-edge firing
+is handled by the when-clause callback infrastructure. Without this stub
+the per-model module raises UndefVarError("edge") whenever edge() leaks
+into a residual or other non-when expression (e.g. switches with arc).
+"""
+modelica_edge(b) = false
+
+"""
+    modelica_change(v)
+
+Modelica: change(v) is `v <> pre(v)`, true at the instant v changes value.
+In continuous expression context v == pre(v), so this returns false.
+Discrete change-event firing is handled by when-clause callbacks.
+"""
+modelica_change(v) = false
+
+"""
+    modelica_String(x[, sigDigits, padding, leftAdjust])
+    modelica_String(x[, minLen, leftAdjust])
+
+Modelica: `String(x, ...)` converts a value to its formatted string form.
+The signature has several variants for Real / Integer / Boolean / Enumeration
+inputs with optional formatting controls. We map all variants to a single
+helper so the per-model module sees a defined function rather than the
+raw Julia `String` constructor (which only accepts byte vectors / pointers
+and rejects `String(::Float64, ::Int64, ::Int64, ::Bool)` etc.).
+
+Returns Julia's `string(x)` representation. Padding / leftAdjust / sigDigits
+are accepted but ignored; the result is sufficient for any downstream use
+that just consumes the digits (e.g. table-name suffixes in Media examples).
+"""
+modelica_String(x) = string(x)
+modelica_String(x, sigDigits::Integer) = string(x)
+modelica_String(x, sigDigits::Integer, minLen::Integer) = string(x)
+modelica_String(x, sigDigits::Integer, minLen::Integer, leftAdjust::Bool) = string(x)
 
 """
     modelica_homotopy(actual, simplified)

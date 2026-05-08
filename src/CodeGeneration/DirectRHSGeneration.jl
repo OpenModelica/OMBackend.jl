@@ -142,10 +142,16 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     @debug "DirectRHS: DAE with mass matrix"
     local mm = collect(massMatrix)
     local f = ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mm, sys=reducedSystem)
-    # Solve algebraic constraints to find consistent initial conditions.
-    # Two-phase approach: first tries algebraic-only solve (fixing differential
-    # states), then falls back to full solve if needed (for kinematic loops).
-    u0 = _solveDAEInitialization!(u0, rhsFunc, p_vec, mm)
+    #= Pinned indices: vars whose u0 came from a fixed=true Modelica init eq
+       (after splitInitialValues). The DAE init solver must NOT modify these,
+       otherwise an algebraic var pinned by `start=1, fixed=true` (e.g.
+       sd1.s_rel = 1) gets overwritten by the alg residual that depends on
+       free vars (e.g. m1.s, m2.s) — collapsing to a different consistent
+       root than the user requested. =#
+    local pinnedKeyStrSet = Set(string(p.first) for p in finalInitialValues)
+    local pinnedIdx = Int[i for (i, st) in enumerate(states)
+                          if string(st) in pinnedKeyStrSet]
+    u0 = _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; pinned=pinnedIdx)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   end
 

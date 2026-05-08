@@ -1064,6 +1064,18 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
      reduced unknown. MTK's init solver treats `initialization_eqs` as
      least-squares residuals, so a single `Inertia_w ~ 10` can be sacrificed
      against many algebraic residuals minimised toward zero. =#
+  #= Build the set of variables that have an explicit fixed=true init constraint.
+     Modelica spec: only `fixed=true` variables get hard initial conditions; vars
+     with explicit `start` but `fixed=false` are guesses for the init solver.
+     OMBackend's getFixedStartConstraintsMTK emits one init eq per fixed=true var,
+     so reading initialization_equations(reducedSystem) gives us the authoritative
+     fixed=true set. Vars whose start landed in finalInitialValues but whose lhs
+     is not in this set are non-fixed defaults — relax them to guesses so the
+     algebraic constraints can solve consistently with the user's hard pins. =#
+  local fixedTrueLhsSet = Set{String}()
+  for eq in initEqs
+    push!(fixedTrueLhsSet, string(eq.lhs))
+  end
   if hasInitConstraints
     local hardKeyStrSet = Set(string(p.first) for p in hardInitialValues)
     local reducedUnkStrSet = Set(string(u) for u in reducedUnks)
@@ -1081,6 +1093,18 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
     end
     if promoted > 0
       @info "Promoted $(promoted) initialization_eqs literal constraints to hard u0"
+    end
+    #= Demote hard u0 entries that came from `fixed=false` defaults.
+       Modelica spec: only `fixed=true` vars get hard initial conditions; vars
+       with explicit `start` but `fixed=false` are guesses for the init solver.
+       Without this demote, e.g. m1.s(start=0) without fixed=true would over-pin
+       the DAE system and force algebraic vars (sd1.s_rel) to satisfy the
+       residual at the wrong value. =#
+    local demoted = filter(p -> !(string(p.first) in fixedTrueLhsSet), hardInitialValues)
+    if !isempty(demoted)
+      hardInitialValues = filter(p -> string(p.first) in fixedTrueLhsSet, hardInitialValues)
+      append!(softInitialValues, demoted)
+      @info "Demoted $(length(demoted)) non-fixed hard u0 entries to guesses (start without fixed=true)"
     end
   end
   if !isempty(softInitialValues)

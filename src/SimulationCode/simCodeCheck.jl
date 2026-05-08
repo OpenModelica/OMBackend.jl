@@ -90,16 +90,21 @@ Filter a result down to the `:error`-severity violations.
 strict(r::CheckResult) = filter(v -> v.severity === :error, r.violations)
 
 """
-    report(io, result; prefix="")
+    report(io, result; prefix="", modelName="")
 
 Pretty-print a CheckResult. Quiet when there are no violations.
+`modelName`, when non-empty, is interleaved into the SIMCODE label as
+`[SIMCODE: <modelName>: check]` so users running batch sweeps can see
+which model is being processed.
 """
-function report(io::IO, r::CheckResult; prefix::AbstractString = "")
+function report(io::IO, r::CheckResult; prefix::AbstractString = "",
+                modelName::AbstractString = "")
+  local label = isempty(modelName) ? "check" : Base.string(modelName, ": check")
   if isempty(r.violations)
-    println(io, prefix, "[SIMCODE: check] clean (", round(r.elapsed_s, digits = 4), "s)")
+    println(io, prefix, "[SIMCODE: ", label, "] clean (", round(r.elapsed_s, digits = 4), "s)")
     return
   end
-  println(io, prefix, "[SIMCODE: check] ", length(r.violations),
+  println(io, prefix, "[SIMCODE: ", label, "] ", length(r.violations),
           " violation(s) in ", round(r.elapsed_s, digits = 4), "s")
   for v in r.violations
     println(io, prefix, "  [", v.severity, "] ", v.rule, " @ ", v.where,

@@ -85,7 +85,27 @@ TODO:
     Fix this.
 """
 function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DAE.Exp))::DAE.Exp
+  #= Build a Real-valued zero-crossing function f such that the Modelica
+     condition becomes true exactly when f goes from positive to negative
+     (the SciML `affect!` direction). For `<` / `<=` we use `e1 - e2` so the
+     condition becomes true when e1 falls below e2. For `>` / `>=` we swap to
+     `e2 - e1` so the same affect! direction matches an upcrossing of e1
+     above e2. This lets the caller pass `affect_neg! = nothing` and avoid
+     double-firing when e1 oscillates around e2 (classic bouncing-ball Zeno
+     pattern). =#
   res = @match conditonalExpression begin
+    DAE.RELATION(exp1 = e1, operator = DAE.LESS(__), exp2 = e2) => begin
+      DAE.BINARY(e1, DAE.SUB(DAE.T_REAL_DEFAULT), e2)
+    end
+    DAE.RELATION(exp1 = e1, operator = DAE.LESSEQ(__), exp2 = e2) => begin
+      DAE.BINARY(e1, DAE.SUB(DAE.T_REAL_DEFAULT), e2)
+    end
+    DAE.RELATION(exp1 = e1, operator = DAE.GREATER(__), exp2 = e2) => begin
+      DAE.BINARY(e2, DAE.SUB(DAE.T_REAL_DEFAULT), e1)
+    end
+    DAE.RELATION(exp1 = e1, operator = DAE.GREATEREQ(__), exp2 = e2) => begin
+      DAE.BINARY(e2, DAE.SUB(DAE.T_REAL_DEFAULT), e1)
+    end
     DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
       DAE.BINARY(lhs, DAE.SUB(DAE.T_REAL_DEFAULT), rhs)
     end
@@ -368,10 +388,10 @@ function DAE_OP_toJuliaOperator(@nospecialize(op::DAE.Operator))
       DAE.MUL_MATRIX_PRODUCT() => :*
       DAE.DIV_ARRAY_SCALAR() => :/
       DAE.DIV_SCALAR_ARRAY() => :/
-      DAE.POW_ARRAY_SCALAR() => :^
-      DAE.POW_SCALAR_ARRAY() => :^
+      DAE.POW_ARRAY_SCALAR() => Symbol(".^")
+      DAE.POW_SCALAR_ARRAY() => Symbol(".^")
       DAE.POW_ARR() => :^
-      DAE.POW_ARR2() => :^
+      DAE.POW_ARR2() => Symbol(".^")
       DAE.AND() => :(&)
       DAE.OR() => :(||)
       DAE.NOT() => :(!)
@@ -632,7 +652,14 @@ function _modelicaFunctionCallExpr(path,
                                    varSuffix = "",
                                    derSymbol = false)
   local normalizedFuncName = OMBackend.canonicalName(string(path))
-  local expr = Expr(:call, Symbol(normalizedFuncName))
+  local runtimeName = get(AlgorithmicCodeGeneration.MODELICA_UTILITIES_TO_RUNTIME_C,
+                          normalizedFuncName, nothing)
+  local callee = if runtimeName !== nothing
+    Expr(:., :OMRuntimeExternalC, QuoteNode(runtimeName))
+  else
+    Symbol(normalizedFuncName)
+  end
+  local expr = Expr(:call, callee)
   append!(expr.args, _modelicaFunctionCallArgs(expLst, simCode, hashTable;
                                                varPrefix = varPrefix,
                                                varSuffix = varSuffix,
@@ -1810,7 +1837,50 @@ end
 """
 function performStructuralSimplify(simplify; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
                                    split::Bool = !OMBackend.DIRECT_RHS_GENERATION[])::Expr
-  local simplifyExpr = :(reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true, split = $(split)))
+  #= Dump the pre-simplify ODESystem (equations + unknowns) so structural-balance
+     debugging does not require re-running the model with extra instrumentation.
+     Written to `backend/codeGen/preStructuralSimplify.log` next to the existing
+     codegen logs. Only emitted when `ENABLE_BACKEND_LOGGING=true` was set at
+     OMBackend load time; @BACKEND_LOGGING is a compile-time NOP otherwise so
+     normal runs pay zero cost.
+     Capture the absolute log path at codegen time so the dump lands in the
+     same per-model run directory as the existing BDAE/simCode logs. The
+     `logRunDir` stack is active during translate; by simulate time the model
+     dir would no longer be on the stack and the dump would land in the
+     session root. =#
+  local dumpExpr = :(nothing)
+  @BACKEND_LOGGING dumpExpr = let _logPath = OMBackend.logPath("backend/codeGen", "preStructuralSimplify.log")
+    quote
+      try
+        local _buffer = IOBuffer()
+        local _eqs = ModelingToolkit.equations(firstOrderSystem)
+        local _unks = ModelingToolkit.unknowns(firstOrderSystem)
+        println(_buffer, "Pre-structural-simplify dump")
+        println(_buffer, "============================")
+        println(_buffer, "equations: ", length(_eqs))
+        println(_buffer, "unknowns:  ", length(_unks))
+        println(_buffer, "")
+        println(_buffer, "Equations:")
+        println(_buffer, "----------")
+        for (_i, _e) in enumerate(_eqs)
+          println(_buffer, "[", _i, "] ", _e)
+        end
+        println(_buffer, "")
+        println(_buffer, "Unknowns:")
+        println(_buffer, "---------")
+        for (_i, _u) in enumerate(_unks)
+          println(_buffer, "[", _i, "] ", _u)
+        end
+        write($(_logPath), String(take!(_buffer)))
+      catch _err
+        @warn "[preStructuralSimplify dump] failed" exception=_err
+      end
+    end
+  end
+  local simplifyExpr = quote
+    $dumpExpr
+    reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true, split = $(split))
+  end
   if observedFilter === nothing || isempty(observedFilter)
     return simplifyExpr
   end

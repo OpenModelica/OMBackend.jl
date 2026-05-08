@@ -861,8 +861,14 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
       DAE.CALL(path, expLst, attr) => begin
         local funcName = string(path)
         local funcSym = Symbol(funcName)
-        #= Use Base.invokelatest for non-builtin functions to avoid world-age issues =#
-        local callTarget = if !(attr.builtin)
+        local utilRuntimeName = get(MODELICA_UTILITIES_TO_RUNTIME_C, funcName, nothing)
+        #= Use Base.invokelatest for non-builtin functions to avoid world-age issues.
+           Route Modelica.Utilities.* qualified calls (e.g. Strings.substring)
+           to OMRuntimeExternalC stubs whether or not the call is flagged builtin
+           since the per-model module never binds the dot-flattened qualified name. =#
+        local callTarget = if utilRuntimeName !== nothing
+          Expr(:., :OMRuntimeExternalC, QuoteNode(utilRuntimeName))
+        elseif !(attr.builtin)
           :(Base.invokelatest)
         elseif haskey(MODELICA_BUILTIN_FUNCTIONS, funcName)
           Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(:AlgorithmicCodeGeneration)), QuoteNode(MODELICA_BUILTIN_FUNCTIONS[funcName]))
@@ -870,7 +876,7 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
           funcSym
         end
         local expr = Expr(:call, callTarget)
-        if !(attr.builtin)
+        if utilRuntimeName === nothing && !(attr.builtin)
           push!(expr.args, funcSym)
         end
         local args = map(expLst) do arg

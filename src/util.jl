@@ -131,6 +131,10 @@ function _canonicalCrefSegments(cr::DAE.CREF_ITER)
   return segs
 end
 
+function _canonicalCrefSegments(::DAE.WILD)
+  return String["_"]
+end
+
 function canonicalName(name::AbstractString)::String
   local s = String(name)
   if startswith(s, "der(") && endswith(s, ")")

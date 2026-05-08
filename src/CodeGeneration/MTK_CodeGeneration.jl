@@ -260,7 +260,35 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
       global LATEST_REDUCED_SYSTEM = $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))
       global LATEST_PROBLEM = $(Symbol("$(MODEL_NAME)Model_problem"))
-      solve($(Symbol("$(MODEL_NAME)Model_problem")), solver; kwargs...)
+      #= Auto-switch from Rosenbrock (default Rodas5) to FBDF when the system
+         has zero differential states. SciML warns that Rosenbrock methods on
+         purely-algebraic systems do not bound the interpolation error, and
+         FBDF handles index-1 DAEs without that restriction. Triggers only
+         when the user is on the default Rodas5; user-chosen solvers are
+         respected as-is. =#
+      local _solver = solver
+      local _solverName = string(nameof(typeof(solver)))
+      if startswith(_solverName, "Rodas") || startswith(_solverName, "Rosenbrock")
+        local _mm = $(Symbol("$(MODEL_NAME)Model_problem")).f.mass_matrix
+        local _n = length($(Symbol("$(MODEL_NAME)Model_problem")).u0)
+        #= UniformScaling (pure ODE) supports `_mm[i,i]` as 1; explicit Matrix
+           returns the entry. Both code paths handle by indexing the diagonal. =#
+        local _nDiff = count(i -> _mm[i,i] != 0, 1:_n)
+        if _nDiff == 0
+          @info "[OMBackend] zero differential states detected, switching default $(_solverName) -> FBDF for purely-algebraic DAE"
+          _solver = FBDF(autodiff=false)
+        end
+      end
+      #= Pass callbacks at solve time. MTK's ODEProblem(callback=...) kwarg
+         silently drops ContinuousCallback objects (only the DiscreteCallback
+         init survives), so when-clause root-find callbacks never fire when
+         routed through the prob. solve() merges with prob.kwargs[:callback]
+         so MTK's init still runs in addition to our callbacks. =#
+      if haskey(kwargs, :callback)
+        solve($(Symbol("$(MODEL_NAME)Model_problem")), _solver; kwargs...)
+      else
+        solve($(Symbol("$(MODEL_NAME)Model_problem")), _solver; callback=callbacks, kwargs...)
+      end
     end
   end
   #= MODEL_NAME is preprocessed with . replaced with _=#
@@ -965,12 +993,20 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                                                  warn_initialize_determined=false)
           end
         else
-          #= Non-structural models: let MTK default initialization handle it =#
+          #= Force MTK to build the initialization problem and solve as NLS so
+             algebraic states pinned via initialization_eqs are honoured even
+             when system algebraic residuals would otherwise pull them to a
+             different consistent root. Without `fully_determined=false` MTK
+             can sacrifice a `var ~ start` init residual against many algebraic
+             residuals; without `build_initializeprob=true` MTK may skip the
+             init solve entirely and leave prob.u0 inconsistent with init eqs. =#
           problem = ModelingToolkit.ODEProblem(reducedSystem,
                                                merge(Dict(finalInitialValues), pars),
                                                tspan;
                                                callback=callbacks,
-                                               warn_initialize_determined=false)
+                                               warn_initialize_determined=false,
+                                               build_initializeprob=true,
+                                               fully_determined=false)
         end
       end
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreductableSyms)
