@@ -3451,6 +3451,17 @@ function eliminateAliasVariables(simCode::SIM_CODE)
       if varName in irreducibleSet
         prio += 60
       end
+      #= Boost priority for variables with explicit start attribute so the
+         representative carries the start binding instead of defaulting to 0. =#
+      local hasStart = @match sv.attributes begin
+        SOME(DAE.VAR_ATTR_REAL(start = SOME(_))) => true
+        SOME(DAE.VAR_ATTR_INT(start = SOME(_)))  => true
+        SOME(DAE.VAR_ATTR_BOOL(start = SOME(_))) => true
+        _                                        => false
+      end
+      if hasStart
+        prio += 5
+      end
       if prio > bestPriority
         bestPriority = prio
         bestName = varName

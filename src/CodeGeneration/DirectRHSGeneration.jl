@@ -572,6 +572,8 @@ function _toFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=not
         resolved isa Number && return Float64(resolved)
         local rv = resolved isa Symbolics.Num ? Symbolics.unwrap(resolved) : resolved
         rv isa Number && return Float64(rv)
+        local vextract = try; Symbolics.value(rv); catch; nothing; end
+        vextract isa Number && return Float64(vextract)
       end
     end
   end

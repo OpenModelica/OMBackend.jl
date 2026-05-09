@@ -279,15 +279,21 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
           _solver = FBDF(autodiff=false)
         end
       end
+      # Route DAE-native solvers (e.g. Sundials.IDA, DABDF2, DFBDF) through a residual-form DAEProblem rather than the ODEProblem with mass matrix.
+      local _problemForSolver = if _solver isa ModelingToolkit.SciMLBase.AbstractDAEAlgorithm
+        OMBackend.CodeGeneration.ode_to_dae($(Symbol("$(MODEL_NAME)Model_problem")))
+      else
+        $(Symbol("$(MODEL_NAME)Model_problem"))
+      end
       #= Pass callbacks at solve time. MTK's ODEProblem(callback=...) kwarg
          silently drops ContinuousCallback objects (only the DiscreteCallback
          init survives), so when-clause root-find callbacks never fire when
          routed through the prob. solve() merges with prob.kwargs[:callback]
          so MTK's init still runs in addition to our callbacks. =#
       if haskey(kwargs, :callback)
-        solve($(Symbol("$(MODEL_NAME)Model_problem")), _solver; kwargs...)
+        solve(_problemForSolver, _solver; kwargs...)
       else
-        solve($(Symbol("$(MODEL_NAME)Model_problem")), _solver; callback=callbacks, kwargs...)
+        solve(_problemForSolver, _solver; callback=callbacks, kwargs...)
       end
     end
   end

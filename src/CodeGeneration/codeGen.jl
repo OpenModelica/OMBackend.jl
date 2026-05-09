@@ -295,50 +295,70 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
       local whenStatementsMTKElse = createWhenStatementsMTK(elsePart.whenEquation.whenStmtLst, simCode)
       local condCrefsElseIf = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
       quote
-        $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
-          local xs = $(map(x -> Symbol(string(x)), condCrefsElseIf))
-          local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
-          if !isempty(xs) && all(isnothing, indices)
-            return 1.0
+        let _condCache = Ref{Any}(nothing)
+          global $(Symbol("condition$(callbacks)"))
+          $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+            local lookuptableStates
+            local lookuptableParams
+            if _condCache[] === nothing
+              local xs = $(map(x -> Symbol(string(x)), condCrefsElseIf))
+              local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
+              if !isempty(xs) && all(isnothing, indices)
+                return 1.0
+              end
+              lookuptableStates = isempty(xs) ? Dict{Symbol,Union{Nothing,Int}}() : Dict(xs .=> indices)
+              local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+              lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+              _condCache[] = (lookuptableStates, lookuptableParams)
+            else
+              local cached = _condCache[]
+              lookuptableStates = cached[1]
+              lookuptableParams = cached[2]
+            end
+            $(map(x -> Expr(Symbol("="),
+                            Symbol(string(x)),
+                            getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
+                  Util.getAllCrefs(cond))...)
+            $(expToJuliaExpMTK(cond, simCode))
           end
-          local lookuptableStates = if isempty(xs)
-            Dict{Symbol, Int}()
-          else
-            Dict(xs .=> indices)
-          end
-          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-          local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
-          $(map(x -> Expr(Symbol("="),
-                          Symbol(string(x)),
-                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
-                Util.getAllCrefs(cond))...)
-          $(expToJuliaExpMTK(cond, simCode))
         end
-        $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
-          local t = integrator.t + integrator.dt
-          local x = integrator.u
-          local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
-          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-          local lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
-          local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
-          $(map(x -> Expr(Symbol("="),
-                          Symbol(string(x)),
-                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
-                vcat(
-                  listArray(Util.getAllCrefs(wEq.condition)),
-                  vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...),
-                  vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(elsePart.whenEquation.whenStmtLst))...)
-                ))...)
-          if integrator.dt == 0.0
-            @error "integrator.dt was zero. Aborting."
-            fail()
-          end
-          if (Bool($(expToJuliaExpMTK(wEq.condition, simCode))))
-            $(whenStatementsMTKIf...)
-            add_tstop!(integrator, integrator.t + 1E-12) #=TODO: Some small number for now=#
-          else
-            $(whenStatementsMTKElse...)
-            add_tstop!(integrator, integrator.t + 1E-12) #=TODO: Some small number for now=#
+        let _affCache = Ref{Any}(nothing)
+          global $(Symbol("affect$(callbacks)!"))
+          $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+            local t = integrator.t + integrator.dt
+            local x = integrator.u
+            local lookuptableStates
+            local lookuptableParams
+            if _affCache[] === nothing
+              local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+              local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+              lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+              lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+              _affCache[] = (lookuptableStates, lookuptableParams)
+            else
+              local cached = _affCache[]
+              lookuptableStates = cached[1]
+              lookuptableParams = cached[2]
+            end
+            $(map(x -> Expr(Symbol("="),
+                            Symbol(string(x)),
+                            getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
+                  vcat(
+                    listArray(Util.getAllCrefs(wEq.condition)),
+                    vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...),
+                    vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(elsePart.whenEquation.whenStmtLst))...)
+                  ))...)
+            if integrator.dt == 0.0
+              @error "integrator.dt was zero. Aborting."
+              fail()
+            end
+            if (Bool($(expToJuliaExpMTK(wEq.condition, simCode))))
+              $(whenStatementsMTKIf...)
+              add_tstop!(integrator, integrator.t + 1E-12) #=TODO: Some small number for now=#
+            else
+              $(whenStatementsMTKElse...)
+              add_tstop!(integrator, integrator.t + 1E-12) #=TODO: Some small number for now=#
+            end
           end
         end
         $(Symbol("cb$(callbacks)")) = ContinuousCallback($(Symbol("condition$(callbacks)")),
@@ -349,42 +369,65 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
       end
     else #= No elseif =#
       whenStatementsMTK  = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
-      local cond = quote  #= NOTE. Very expensive to get it as strings. This can be done better but requires slight redesign =#
-        $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
-          #local xStrs = $(map(x -> string(x), Util.getAllCrefs(cond)))
-          local xs = $(map(x -> Symbol(string(x)), filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))))
-          local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
-          local NO_TRIGGER = 1.0
-          if !isempty(xs) && all(isnothing, indices)
-            return NO_TRIGGER
+      local cond = quote
+        let _condCache = Ref{Any}(nothing)
+          global $(Symbol("condition$(callbacks)"))
+          $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+            local NO_TRIGGER = 1.0
+            local lookuptableStates
+            local lookuptableParams
+            if _condCache[] === nothing
+              local xs = $(map(x -> Symbol(string(x)), filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))))
+              local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
+              if !isempty(xs) && all(isnothing, indices)
+                return NO_TRIGGER
+              end
+              lookuptableStates = Dict((xs) .=> indices)
+              local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+              lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+              _condCache[] = (lookuptableStates, lookuptableParams)
+            else
+              local cached = _condCache[]
+              lookuptableStates = cached[1]
+              lookuptableParams = cached[2]
+            end
+            $(map(x -> Expr(Symbol("="),
+                            Symbol(string(x)),
+                            getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
+                  Util.getAllCrefs(cond))...)
+            $(expToJuliaExpMTK(cond, simCode))
           end
-          local lookuptableStates = Dict((xs) .=> indices)
-          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-          local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
-          $(map(x -> Expr(Symbol("="),
-                          Symbol(string(x)),
-                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
-                Util.getAllCrefs(cond))...)
-          $(expToJuliaExpMTK(cond, simCode))
         end
       end
       local affect = quote
-        $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
-          local t = integrator.t + integrator.dt
-          local x = integrator.u
-          local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
-          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-          local lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
-          local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
-          $(map(x->Expr(Symbol("="),
-                        Symbol(string(x)),
-                        getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
-                vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...))...)
-          if integrator.dt == 0.0
-            @error "integrator.dt was zero. Aborting."
-            fail()
+        let _affCache = Ref{Any}(nothing)
+          global $(Symbol("affect$(callbacks)!"))
+          $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+            local t = integrator.t + integrator.dt
+            local x = integrator.u
+            local lookuptableStates
+            local lookuptableParams
+            if _affCache[] === nothing
+              local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+              local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+              lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+              lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+              _affCache[] = (lookuptableStates, lookuptableParams)
+            else
+              local cached = _affCache[]
+              lookuptableStates = cached[1]
+              lookuptableParams = cached[2]
+            end
+            $(map(x->Expr(Symbol("="),
+                          Symbol(string(x)),
+                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
+                  vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...))...)
+            if integrator.dt == 0.0
+              @error "integrator.dt was zero. Aborting."
+              fail()
+            end
+            $(whenStatementsMTK...)
           end
-          $(whenStatementsMTK...)
         end
       end
       quote
@@ -443,36 +486,60 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
       end
     end
     quote
-      $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
-        local xs = $(map(c -> Symbol(string(c)), condCrefs))
-        local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
-        if !isempty(xs) && all(isnothing, indices)
-          return false
+      let _condCache = Ref{Any}(nothing)
+        global $(Symbol("condition$(callbacks)"))
+        $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+          local lookuptableStates
+          local lookuptableParams
+          if _condCache[] === nothing
+            local xs = $(map(c -> Symbol(string(c)), condCrefs))
+            local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
+            if !isempty(xs) && all(isnothing, indices)
+              return false
+            end
+            lookuptableStates = Dict((xs) .=> indices)
+            local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+            lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+            _condCache[] = (lookuptableStates, lookuptableParams)
+          else
+            local cached = _condCache[]
+            lookuptableStates = cached[1]
+            lookuptableParams = cached[2]
+          end
+          $(map(x -> Expr(Symbol("="),
+                          Symbol(string(x)),
+                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
+                Util.getAllCrefs(cond))...)
+          Bool($(expToJuliaExpMTK(cond, simCode)))
         end
-        local lookuptableStates = Dict((xs) .=> indices)
-        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
-        $(map(x -> Expr(Symbol("="),
-                        Symbol(string(x)),
-                        getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
-              Util.getAllCrefs(cond))...)
-        Bool($(expToJuliaExpMTK(cond, simCode)))
       end
-      $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
-        local t = integrator.t
-        local x = integrator.u
-        local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
-        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-        local lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
-        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
-        $(map(x -> Expr(Symbol("="),
-                        Symbol(string(x)),
-                        getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
-              vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...))...)
-        $(whenStatementsMTKDiscrete...)
-        auto_dt_reset!(integrator)
-        add_tstop!(integrator, integrator.t + 1E-12)
-        $(condResetExprs...)
+      let _affCache = Ref{Any}(nothing)
+        global $(Symbol("affect$(callbacks)!"))
+        $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+          local t = integrator.t
+          local x = integrator.u
+          local lookuptableStates
+          local lookuptableParams
+          if _affCache[] === nothing
+            local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+            local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+            lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+            lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+            _affCache[] = (lookuptableStates, lookuptableParams)
+          else
+            local cached = _affCache[]
+            lookuptableStates = cached[1]
+            lookuptableParams = cached[2]
+          end
+          $(map(x -> Expr(Symbol("="),
+                          Symbol(string(x)),
+                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
+                vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...))...)
+          $(whenStatementsMTKDiscrete...)
+          auto_dt_reset!(integrator)
+          add_tstop!(integrator, integrator.t + 1E-12)
+          $(condResetExprs...)
+        end
       end
       $(Symbol("cb$(callbacks)")) = DiscreteCallback($(Symbol("condition$(callbacks)")),
                                                      $(Symbol("affect$(callbacks)!"));

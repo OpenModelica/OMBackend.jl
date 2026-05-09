@@ -1628,12 +1628,25 @@ function getStatesAsSymbols(odeFunc::ODEFunction)
   map(x->x.f.name, states)
 end
 
+function getStatesAsSymbols(daeFunc::ModelingToolkit.SciMLBase.DAEFunction)
+  local states = ModelingToolkit.get_unknowns(daeFunc.sys)
+  map(x->x.f.name, states)
+end
+
 function getParametersAsSymbols(odeFunc::ODEFunction)
   local params = ModelingToolkit.parameters(odeFunc.sys)
   map(params) do x
     local uw = SymbolicUtils.unwrap(x)
     #= Regular parameters are Sym (have .name), time-dependent discrete
        parameters like ifCond(t) are Term (have .f.name). =#
+    hasproperty(uw, :name) ? uw.name : uw.f.name
+  end
+end
+
+function getParametersAsSymbols(daeFunc::ModelingToolkit.SciMLBase.DAEFunction)
+  local params = ModelingToolkit.parameters(daeFunc.sys)
+  map(params) do x
+    local uw = SymbolicUtils.unwrap(x)
     hasproperty(uw, :name) ? uw.name : uw.f.name
   end
 end
@@ -1670,6 +1683,19 @@ function ode_to_dae(prob::ODEProblem)
     end
   end
   local diff_vars = [M_mat[i, i] != 0.0 for i in 1:n]
-  SciMLBase.DAEProblem(residual!, du0, prob.u0, prob.tspan, prob.p;
-                       differential_vars = diff_vars)
+  # Explicitly clear initialization_data — MTK's ODE init metadata triggers
+  # CheckInit on the DAE residual form and rejects perfectly fine guesses.
+  local daefunc = ModelingToolkit.SciMLBase.DAEFunction(residual!; sys = prob.f.sys, initialization_data = nothing)
+  # Only forward the callback from the source ODEProblem; MTK's initialization_data
+  # describes ODE-mass-matrix init and conflicts with DAE residual form (gives
+  # spurious CheckInit failures with residual norm > tol).
+  local _cb = get(prob.kwargs, :callback, nothing)
+  if _cb === nothing
+    ModelingToolkit.SciMLBase.DAEProblem(daefunc, du0, prob.u0, prob.tspan, prob.p;
+                                         differential_vars = diff_vars)
+  else
+    ModelingToolkit.SciMLBase.DAEProblem(daefunc, du0, prob.u0, prob.tspan, prob.p;
+                                         differential_vars = diff_vars,
+                                         callback = _cb)
+  end
 end

@@ -2397,7 +2397,20 @@ function evalInitialCondition(mtkCond, simCode = nothing)
     local numExpr = _substituteExprValues(lhsExpr, valMap)
     #= Evaluate the resulting numeric expression =#
     local result = Base.invokelatest(eval, numExpr)
-    local numResult = Float64(result)
+    #= If result is a Symbolics.Num (parameter wasn't fully resolved in valMap),
+       unwrap it and try to coerce. If the unwrapped form is still symbolic,
+       fall through to the catch and return the default. =#
+    local numResult = if result isa Number
+      Float64(result)
+    else
+      local unwrapped = Base.invokelatest(SymbolicUtils.unwrap, result)
+      if unwrapped isa Number
+        Float64(unwrapped)
+      else
+        local valued = try Base.invokelatest(Symbolics.value, result) catch; result end
+        Float64(valued isa Number ? valued : 0.0)
+      end
+    end
     #= The zero-crossing function is negative when the condition is TRUE,
        positive when FALSE. Return true when condition is FALSE (positive),
        because the caller inverts: ifCond = !(evalInitialCondition(...)). =#
@@ -2513,7 +2526,7 @@ function generateIfExpressions(branches,
                                resEqIdx::Int,
                                identifier::Int,
                                simCode;
-                               subIdentifier::Int = identifier)
+                               subIdentifier::Int = 1)
   local branch = branches[target]
   if branch.targets == -1
     return :($(first(deCausalize(branch.residualEquations[resEqIdx], simCode))))
@@ -2531,7 +2544,7 @@ function generateIfExpressions(branches,
                                                    resEqIdx,
                                                    identifier,
                                                    simCode;
-                                                   subIdentifier = identifier + 1)))
+                                                   subIdentifier = subIdentifier + 1)))
   end
 end
 
