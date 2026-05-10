@@ -99,6 +99,24 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     return ModelingToolkit.ODEProblem{true}(f0, [0.0], tspan, Float64[]; callback=callbacks)
   end
 
+  # DirectRHS constructs the problem from an ODEFunction and then performs a
+  # small mass-matrix initialization pass over algebraic residual rows. That
+  # path cannot represent MTK initialization equations whose left hand side is
+  # a derivative, e.g. `D(x) ~ 0`: those are constraints on differential rows,
+  # not hard u0 values or algebraic residuals. Delegate these systems to MTK's
+  # ODEProblem constructor so its initialization problem is built and attached.
+  if _hasDerivativeInitializationEquations(reducedSystem)
+    @debug "DirectRHS: derivative initialization equations detected, delegating to MTK ODEProblem"
+    return ModelingToolkit.ODEProblem(
+      reducedSystem,
+      merge(Dict(finalInitialValues), pars),
+      tspan;
+      callback=callbacks,
+      warn_initialize_determined=false,
+      build_initializeprob=true,
+      fully_determined=false)
+  end
+
   # 1. Build the RHS function expression from symbolic equations
   local rhs_list = [eq.rhs for eq in eqs]
   local f_ip_expr = _buildRHSExpression(rhs_list, states, params, iv)
@@ -157,6 +175,19 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
 
   @debug "DirectRHS: problem constructed successfully"
   return problem
+end
+
+
+function _hasDerivativeInitializationEquations(reducedSystem)::Bool
+  local initEqs = try
+    ModelingToolkit.initialization_equations(reducedSystem)
+  catch
+    return false
+  end
+  for eq in initEqs
+    occursin("Differential(", string(eq.lhs)) && return true
+  end
+  return false
 end
 
 
