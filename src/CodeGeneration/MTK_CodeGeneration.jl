@@ -275,7 +275,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
            returns the entry. Both code paths handle by indexing the diagonal. =#
         local _nDiff = count(i -> _mm[i,i] != 0, 1:_n)
         if _nDiff == 0
-          @info "[OMBackend] zero differential states detected, switching default $(_solverName) -> FBDF for purely-algebraic DAE"
+          @info "[MTK GEN: solver] zero differential states detected, switching default $(_solverName) -> FBDF for purely-algebraic DAE"
           _solver = FBDF(autodiff=false)
         end
       end
@@ -681,7 +681,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      them caused index drift — the second loop would use stale dummies. =#
   local _toDemote = Set{String}(_discreteAliasOverride)
   if !isempty(_toDemote)
-    @info "Discrete alias fix (definitional): demoting $(length(_toDemote)) discrete vars pinned by definitional residuals (const / ifelse / comparison): $(collect(_toDemote))"
+    @debug "[MTK GEN: discrete] Discrete alias fix (definitional): demoting $(length(_toDemote)) discrete vars pinned by definitional residuals (const / ifelse / comparison): $(collect(_toDemote))"
     #= Recompute excess accounting for the pre-pass demotions, so the
        heuristic only fills in the *remaining* shortfall. =#
     _excess = _excess - length(_toDemote)
@@ -717,7 +717,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       push!(_toRemoveHeuristic, dv)
     end
     if !isempty(_toRemoveHeuristic)
-      @info "Discrete alias fix: removing $(length(_toRemoveHeuristic))/$(_excess) excess dummy der equations for $(collect(_toRemoveHeuristic))"
+      @debug "[MTK GEN: discrete] Discrete alias fix: removing $(length(_toRemoveHeuristic))/$(_excess) excess dummy der equations for $(collect(_toRemoveHeuristic))"
       union!(_toDemote, _toRemoveHeuristic)
     end
   end
@@ -1231,7 +1231,7 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
   local result = Expr[]
   for ieq in initialEqs
     if ieq isa BDAE.COMPLEX_EQUATION || ieq isa BDAE.ARRAY_EQUATION
-      @info "[CODEGEN: initialConstraints] skipping $(typeof(ieq)) (record/array constraints not yet lowered to scalar `~` form)"
+      @debug "[MTK GEN: initialConstraints] skipping $(typeof(ieq)) (record/array constraints not yet lowered to scalar `~` form)"
       continue
     end
     if isParametricOnlyEquation(ieq, simCode)
@@ -1482,8 +1482,6 @@ function getFixedStartConstraintsMTK(vars::Vector, simCode::SimulationCode.SimCo
     end
     push!(result, :($(Symbol(varName)) ~ $(expToJuliaExpMTK(startExp, simCode))))
   end
-  @info "[FIXED-START PROBE] vars=$(length(vars)) emitted=$(length(result))"
-  for p in probe; @info "[FIXED-START PROBE] $(p[1]): start=$(p[2]) fixed=$(p[3])"; end
   return result
 end
 

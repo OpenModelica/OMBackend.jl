@@ -1902,7 +1902,7 @@ function performStructuralSimplify(simplify; observedFilter::Union{Nothing, Vect
       any(p -> occursin(p, _varName), _obsPatterns)
     end
     if length(_filteredObs) < _nBefore
-      @info "observedFilter: kept $(length(_filteredObs)) of $(_nBefore) MTK observed equations"
+      @debug "[MTK GEN: observed] observedFilter: kept $(length(_filteredObs)) of $(_nBefore) MTK observed equations"
       reducedSystem = Setfield.set(reducedSystem, Setfield.PropertyLens{:observed}(), _filteredObs)
     end
   end
@@ -2308,7 +2308,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     if !newtonOk
       continue
     end
-    @info "[SIMCODE: solveParametricInitialEquations] solved $freeName = $x (from initial equation)"
+    @debug "[SIMCODE: solveParametricInitialEquations] solved $freeName = $x (from initial equation)"
     #= Update the simCode hash table with the solved value =#
     local (idx, oldSV) = ht[freeName]
     local newSV = SimulationCode.SIMVAR(oldSV.name, oldSV.index,
@@ -2318,9 +2318,9 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     solvedThisPass = true
   end
   if pass == 1 && !isempty(solvedNames)
-    @info "[SIMCODE: solveParametricInitialEquations] pass $pass solved $(length(solvedNames)) parameter(s)" solvedNames
+    @debug "[SIMCODE: solveParametricInitialEquations] pass $pass solved $(length(solvedNames)) parameter(s)" solvedNames
   elseif !isempty(solvedNames)
-    @info "[SIMCODE: solveParametricInitialEquations] pass $pass solved $(length(solvedNames)) more parameter(s)" solvedNames
+    @debug "[SIMCODE: solveParametricInitialEquations] pass $pass solved $(length(solvedNames)) more parameter(s)" solvedNames
   end
   end #= while fixed-point =#
 end

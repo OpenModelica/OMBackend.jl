@@ -5,17 +5,27 @@
   frees all unknowns to handle rank-deficient kinematic loops.
 =#
 
-function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=1e-1, pinned=Int[])
+function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=1e-1, pinned=Int[], derivative_targets=Pair{Int, Float64}[])
   local n = length(u0)
   local nMM = size(mm, 1)
   local nSafe = min(n, nMM)
   local alg_idx = [i for i in 1:nSafe if mm[i,i] == 0]
-  if isempty(alg_idx)
+  local der_idx = Int[]
+  local der_target = Float64[]
+  for (idx, target) in derivative_targets
+    1 <= idx <= nSafe || continue
+    mm[idx, idx] == 0 && continue
+    push!(der_idx, idx)
+    push!(der_target, mm[idx, idx] * target)
+  end
+  local eq_idx = vcat(alg_idx, der_idx)
+  local eq_target = vcat(zeros(Float64, length(alg_idx)), der_target)
+  if isempty(eq_idx)
     return u0
   end
   local du = similar(u0)
   rhsFunc(du, u0, p_vec, 0.0)
-  local init_res = maximum(abs, du[alg_idx])
+  local init_res = maximum(abs, du[eq_idx] .- eq_target)
   if init_res < tol
     return u0
   end
@@ -25,8 +35,8 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
   local pinnedSet = Set(pinned)
   local alg_unpinned = [i for i in alg_idx if !(i in pinnedSet)]
   local u0_phase1 = copy(u0)
-  if !isempty(alg_unpinned) && _solveDAEPhase!(u0_phase1, rhsFunc, p_vec, alg_idx, alg_unpinned;
-                     maxiter=min(maxiter, 50), tol=tol)
+  if !isempty(alg_unpinned) && _solveDAEPhase!(u0_phase1, rhsFunc, p_vec, eq_idx, alg_unpinned;
+                     targets=eq_target, maxiter=min(maxiter, 50), tol=tol)
     copyto!(u0, u0_phase1)
     return u0
   end
@@ -35,8 +45,8 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
      stay at user-requested values. =#
   local all_unpinned = [i for i in 1:n if !(i in pinnedSet)]
   local u0_phase2 = copy(u0)
-  if !isempty(all_unpinned) && _solveDAEPhase!(u0_phase2, rhsFunc, p_vec, alg_idx, all_unpinned;
-                                                maxiter=maxiter, tol=tol)
+  if !isempty(all_unpinned) && _solveDAEPhase!(u0_phase2, rhsFunc, p_vec, eq_idx, all_unpinned;
+                                                targets=eq_target, maxiter=maxiter, tol=tol)
     copyto!(u0, u0_phase2)
     return u0
   end
@@ -46,11 +56,11 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
      solver to relax pins to find any consistent root. Pre-pinned-fix
      behaviour. Reach here only when both unpinned phases failed. =#
   local all_idx = collect(1:n)
-  local phase3_ok = _solveDAEPhase!(u0, rhsFunc, p_vec, alg_idx, all_idx;
-                                    maxiter=maxiter, tol=tol)
+  local phase3_ok = _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, all_idx;
+                                    targets=eq_target, maxiter=maxiter, tol=tol)
   if !phase3_ok
     rhsFunc(du, u0, p_vec, 0.0)
-    local final_res = maximum(abs, du[alg_idx])
+    local final_res = maximum(abs, du[eq_idx] .- eq_target)
     if !isfinite(final_res)
       @error "DAE init: residual is non-finite ($final_res); ICs unverified, integrator may NaN."
     elseif final_res >= failure_threshold
@@ -62,14 +72,14 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
   return u0
 end
 
-function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; maxiter=50, tol=1e-10)
+function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Float64, length(eq_idx)), maxiter=50, tol=1e-10)
   local nEq = length(eq_idx)
   local nVar = length(var_idx)
   local du = similar(u0)
   local eps_fd = 1e-7
   for iter in 1:maxiter
     rhsFunc(du, u0, p_vec, 0.0)
-    local res = du[eq_idx]
+    local res = du[eq_idx] .- targets
     local norm_res = maximum(abs, res)
     if !isfinite(norm_res)
       return false
@@ -83,7 +93,7 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; maxiter=50, tol=1e
       local u_pert = copy(u0)
       u_pert[jstate] += eps_fd
       rhsFunc(du_pert, u_pert, p_vec, 0.0)
-      J[:, jcol] = (du_pert[eq_idx] .- res) ./ eps_fd
+      J[:, jcol] = (du_pert[eq_idx] .- targets .- res) ./ eps_fd
     end
     if any(!isfinite, J)
       return false

@@ -72,7 +72,7 @@ function logSimCodePassMetrics(passName::AbstractString,
     return nothing
   end
   local label = isempty(modelName) ? passName : Base.string(modelName, ": ", passName)
-  @info "[SIMCODE: $label] metrics" elapsed_ms=round(1000 * elapsed_s, digits = 3) residuals=_metricDelta(before.residualEquations, after.residualEquations) initial=_metricDelta(before.initialEquations, after.initialEquations) ifEquations=_metricDelta(before.ifEquations, after.ifEquations) ifBranches=_metricDelta(before.ifBranches, after.ifBranches) conditionalResiduals=_metricDelta(before.conditionalResidualEquations, after.conditionalResidualEquations) variables=_metricDelta(before.variables, after.variables) unknowns=_metricDelta(before.unknowns, after.unknowns) parameters=_metricDelta(before.parameters, after.parameters) aliases=_metricDelta(before.aliases, after.aliases) eliminatedVariables=_metricDelta(before.eliminatedVariables, after.eliminatedVariables)
+  @debug "[SIMCODE: $label] metrics" elapsed_ms=round(1000 * elapsed_s, digits = 3) residuals=_metricDelta(before.residualEquations, after.residualEquations) initial=_metricDelta(before.initialEquations, after.initialEquations) ifEquations=_metricDelta(before.ifEquations, after.ifEquations) ifBranches=_metricDelta(before.ifBranches, after.ifBranches) conditionalResiduals=_metricDelta(before.conditionalResidualEquations, after.conditionalResidualEquations) variables=_metricDelta(before.variables, after.variables) unknowns=_metricDelta(before.unknowns, after.unknowns) parameters=_metricDelta(before.parameters, after.parameters) aliases=_metricDelta(before.aliases, after.aliases) eliminatedVariables=_metricDelta(before.eliminatedVariables, after.eliminatedVariables)
   return nothing
 end
 
@@ -702,7 +702,7 @@ function getIrreductableVars(ifEquations::Vector{BDAE.IF_EQUATION},
     Remove them from the list
   =#
   local knownIrreductables::Vector{BDAE.VAR} = filter((v) -> BDAEUtil.isState(v) , algebraicAndStateVariables)
-  #@info "Adding all states as irreductable variables" map(x->string(x.varName), knownIrreductables)
+  #@debug "Adding all states as irreductable variables" map(x->string(x.varName), knownIrreductables)
   push!(irreductables, map(x->BDAE_identifierToVarString(x), knownIrreductables))
   irreductables = collect(Iterators.flatten(irreductables))
   irreductables = filter(irv -> !(irv != "time" && isParameter(last(ht[irv]))), irreductables)
@@ -895,7 +895,7 @@ function rebuildMatchOrder(simCode::SIM_CODE)
      equations will remain unmatched. For under-determined systems (nEqs > nVars),
      skip since we cannot produce a valid matching. =#
   if nEqs > nVars
-    @info "[SIMCODE: $(simCode.name): rebuildMatchOrder] under-determined system ($nEqs equations, $nVars unknowns), skipping"
+    @debug "[SIMCODE: $(simCode.name): rebuildMatchOrder] under-determined system ($nEqs equations, $nVars unknowns), skipping"
     return (Int[], nameToMatchIdx, matchIdxToName)
   end
   local nMatch = nVars
@@ -909,11 +909,11 @@ function rebuildMatchOrder(simCode::SIM_CODE)
     local (_isSingular, mo) = GraphAlgorithms.matching(eqVarMapping, nMatch)
     matchOrder = mo
   catch e
-    @info "[SIMCODE: $(simCode.name): rebuildMatchOrder] matching failed, skipping DCE" exception=(e, catch_backtrace())
+    @debug "[SIMCODE: $(simCode.name): rebuildMatchOrder] matching failed, skipping DCE" exception=(e, catch_backtrace())
     return (Int[], nameToMatchIdx, matchIdxToName)
   end
   local nMatched = count(>(0), matchOrder)
-  @info "[SIMCODE: $(simCode.name): rebuildMatchOrder] $nEqs equations, $nVars unknowns, $nMatched matched"
+  @debug "[SIMCODE: $(simCode.name): rebuildMatchOrder] $nEqs equations, $nVars unknowns, $nMatched matched"
   return (matchOrder, nameToMatchIdx, matchIdxToName)
 end
 
@@ -1177,7 +1177,7 @@ function cleanupTrivialResidualEquations(simCode::SIM_CODE;
   @assign simCode.initialEquations = newInitials
   @assign simCode.ifEquations = newIfEquations
   local afterText = isempty(sourcePass) ? "" : " after $sourcePass"
-  @info "[SIMCODE: $(simCode.name): trivialCleanup] removed trivial equations$afterText" residuals=nResidualsRemoved initial=nInitialsRemoved conditionalResiduals=nConditionalRemoved ifEquations=nIfRemoved
+  @debug "[SIMCODE: $(simCode.name): trivialCleanup] removed trivial equations$afterText" residuals=nResidualsRemoved initial=nInitialsRemoved conditionalResiduals=nConditionalRemoved ifEquations=nIfRemoved
   return simCode
 end
 
@@ -1320,7 +1320,7 @@ function pruneConstantConditions(simCode::SIM_CODE)::SIM_CODE
   @assign simCode.initialEquations = newInitials
   @assign simCode.ifEquations = newIfEquations
   if nPrunedBranches > 0 || nPromotedResiduals > 0 || nRemovedIfEquations > 0
-    @info "[SIMCODE: $(simCode.name): constantConditionPruning] pruned constant conditions" branches=nPrunedBranches promotedResiduals=nPromotedResiduals removedIfEquations=nRemovedIfEquations
+    @debug "[SIMCODE: $(simCode.name): constantConditionPruning] pruned constant conditions" branches=nPrunedBranches promotedResiduals=nPromotedResiduals removedIfEquations=nRemovedIfEquations
   end
   return simCode
 end
@@ -1508,20 +1508,20 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
      metaModel/flatModel), but allow DOCC models (structuralTransitions only)
      since they re-flatten at runtime =#
   if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
-    @info "[SIMCODE: $(simCode.name): eliminateNonDynamic] skipping for VSS/multi-mode model"
+    @debug "[SIMCODE: $(simCode.name): eliminateNonDynamic] skipping for VSS/multi-mode model"
     return simCode
   end
   #= Rebuild a fresh matching from the current (post-optimization) system =#
   local (matchOrder, nameToMatchIdx, matchIdxToName) = rebuildMatchOrder(simCode)
   if isempty(matchOrder)
-    @info "[SIMCODE: $(simCode.name): eliminateNonDynamic] matching failed or system not square, skipping"
+    @debug "[SIMCODE: $(simCode.name): eliminateNonDynamic] matching failed or system not square, skipping"
     return simCode
   end
   #= Identify output-only equations and variables using the fresh matching =#
   local (outputOnlyVarNames, outputOnlyEqIndices, eqRefs) =
     identifyOutputOnlyVariables(simCode, matchOrder, matchIdxToName)
   if isempty(outputOnlyEqIndices)
-    @info "[SIMCODE: $(simCode.name): eliminateNonDynamic] no output-only equations found"
+    @debug "[SIMCODE: $(simCode.name): eliminateNonDynamic] no output-only equations found"
     return simCode
   end
   #= Build inverse matching: equation index -> match index =#
@@ -1569,13 +1569,13 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     end
   end
   if isempty(eqsToEliminate)
-    @info "[SIMCODE: $(simCode.name): eliminateNonDynamic] no eliminable equation-variable pairs found"
+    @debug "[SIMCODE: $(simCode.name): eliminateNonDynamic] no eliminable equation-variable pairs found"
     return simCode
   end
   #= Guard: never eliminate ALL equations. A system with zero equations
      after elimination would crash downstream (filterConstantEquations, MTK). =#
   if length(eqsToEliminate) >= length(simCode.residualEquations)
-    @info "[SIMCODE: $(simCode.name): eliminateNonDynamic] would eliminate all $(length(simCode.residualEquations)) equations, skipping"
+    @debug "[SIMCODE: $(simCode.name): eliminateNonDynamic] would eliminate all $(length(simCode.residualEquations)) equations, skipping"
     return simCode
   end
   #= Safety check: verify no surviving equation references an eliminated variable.
@@ -1660,7 +1660,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   for varName in varsToRemove
     delete!(newHT, varName)
   end
-  @info "[SIMCODE: $(simCode.name): eliminateNonDynamic] eliminated $(length(eqsToEliminate)) eq-var pairs, $(length(varsToRemove)) variables removed (rescued: $nRescued, skipped: $nSkippedNonAlg non-algebraic, $nSkippedUnmatched unmatched). $(length(newResEqs)) equations, $(length(newHT)) variables remain"
+  @debug "[SIMCODE: $(simCode.name): eliminateNonDynamic] eliminated $(length(eqsToEliminate)) eq-var pairs, $(length(varsToRemove)) variables removed (rescued: $nRescued, skipped: $nSkippedNonAlg non-algebraic, $nSkippedUnmatched unmatched). $(length(newResEqs)) equations, $(length(newHT)) variables remain"
   @BACKEND_LOGGING begin
     local buf = IOBuffer()
     println(buf, "=== ELIMINATION DEBUG ===")
@@ -1871,7 +1871,7 @@ equation set is restructured at runtime.
 function _classifyAdditionalDiscreteVariables(simCode::SIM_CODE)::SIM_CODE
   if hasStructuralTransitions(simCode) || hasSubModels(simCode) ||
      hasFlatModel(simCode) || hasMetaModel(simCode)
-    @info "[SIMCODE: $(simCode.name): classifyAdditionalDiscretes] skipped (VSS/multi-mode model)"
+    @debug "[SIMCODE: $(simCode.name): classifyAdditionalDiscretes] skipped (VSS/multi-mode model)"
     return simCode
   end
 
@@ -1903,7 +1903,7 @@ function _classifyAdditionalDiscreteVariables(simCode::SIM_CODE)::SIM_CODE
   end
 
   if !isempty(reclassified)
-    @info "[SIMCODE: $(simCode.name): classifyAdditionalDiscretes] reclassified $(length(reclassified)) algebraic variables to discrete (when-driven): $(reclassified)"
+    @debug "[SIMCODE: $(simCode.name): classifyAdditionalDiscretes] reclassified $(length(reclassified)) algebraic variables to discrete (when-driven): $(reclassified)"
   end
   return simCode
 end
@@ -2079,7 +2079,7 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
      case, keep at least the original residuals so the normal alias/constant
      elimination pipeline handles the trivial simplification. =#
   if length(simCode.residualEquations) - length(elimIdxSet) == 0
-    @info "[SIMCODE: $(simCode.name): foldParameterClosure] fold would eliminate all residuals; skipping to preserve MTK build" wouldFold=length(foldMap)
+    @debug "[SIMCODE: $(simCode.name): foldParameterClosure] fold would eliminate all residuals; skipping to preserve MTK build" wouldFold=length(foldMap)
     return simCode
   end
 
@@ -2974,7 +2974,7 @@ function simplifyEnumLiteralPaths(simCode::SIM_CODE)::SIM_CODE
   @assign simCode.initialEquations = [_rewriteEq(eq) for eq in simCode.initialEquations]
 
   if nRewritten[] > 0
-    @info "[SIMCODE: $(simCode.name): simplifyEnumLiteralPaths] collapsed $(nRewritten[]) ENUM_LITERAL qualified paths to Type.Literal IDENT form"
+    @debug "[SIMCODE: $(simCode.name): simplifyEnumLiteralPaths] collapsed $(nRewritten[]) ENUM_LITERAL qualified paths to Type.Literal IDENT form"
   end
   return simCode
 end
@@ -3026,7 +3026,7 @@ function inlinePreOfConstantParameters(simCode::SIM_CODE)::SIM_CODE
     push!(newEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
   end
   if nReplaced[] > 0
-    @info "[SIMCODE: $(simCode.name): inlinePreOfConstantParameters] replaced $(nReplaced[]) `pre(constParam)` occurrences with the parameter directly"
+    @debug "[SIMCODE: $(simCode.name): inlinePreOfConstantParameters] replaced $(nReplaced[]) `pre(constParam)` occurrences with the parameter directly"
   end
   @assign simCode.residualEquations = newEqs
   return simCode
@@ -3074,7 +3074,7 @@ function propagateConstants(simCode::SIM_CODE)
   end
 
   if !isempty(allBaseNames)
-    @info "[SIMCODE: $(simCode.name): constantPropagation] base array names referenced" allBaseNames=collect(allBaseNames)
+    @debug "[SIMCODE: $(simCode.name): constantPropagation] base array names referenced" allBaseNames=collect(allBaseNames)
   end
 
   local constMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
@@ -3135,11 +3135,11 @@ function propagateConstants(simCode::SIM_CODE)
   local nConst = length(constEqIndices)
   local nTrivial = length(trivialEqIndices)
   if nConst == 0 && nTrivial == 0
-    @info "[SIMCODE: $(simCode.name): constantPropagation] no constant equations found"
+    @debug "[SIMCODE: $(simCode.name): constantPropagation] no constant equations found"
     return simCode
   end
 
-  @info "[SIMCODE: $(simCode.name): constantPropagation] found $nConst unknown=param equations and $nTrivial trivial param=param equations"
+  @debug "[SIMCODE: $(simCode.name): constantPropagation] found $nConst unknown=param equations and $nTrivial trivial param=param equations"
 
   #= Phase 2: Build final equation list with substitutions applied.
      We collect (varName, residual) pairs for const-bound eliminations so
@@ -3271,7 +3271,7 @@ function propagateConstants(simCode::SIM_CODE)
   end
   elimEqs = keptElimEqs
 
-  @info "[SIMCODE: $(simCode.name): constantPropagation] eliminated $(length(elimVarNames)) unknowns and $(length(allRemoved)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
+  @debug "[SIMCODE: $(simCode.name): constantPropagation] eliminated $(length(elimVarNames)) unknowns and $(length(allRemoved)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
 
   @assign simCode.residualEquations = newResEqs
   @assign simCode.initialEquations = newInitEqs
@@ -3330,7 +3330,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
      metaModel/flatModel), but allow DOCC models (structuralTransitions only)
      since they re-flatten at runtime =#
   if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
-    @info "[SIMCODE: $(simCode.name): aliasElimination] skipped (VSS/multi-mode model)"
+    @debug "[SIMCODE: $(simCode.name): aliasElimination] skipped (VSS/multi-mode model)"
     return simCode
   end
 
@@ -3361,11 +3361,11 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   end
 
   if isempty(aliasPairs)
-    @info "[SIMCODE: $(simCode.name): aliasElimination] no alias equations found"
+    @debug "[SIMCODE: $(simCode.name): aliasElimination] no alias equations found"
     return simCode
   end
 
-  @info "[SIMCODE: $(simCode.name): aliasElimination] detected $(length(aliasPairs)) alias equations"
+  @debug "[SIMCODE: $(simCode.name): aliasElimination] detected $(length(aliasPairs)) alias equations"
 
   #= ===== Step 2: Build alias graph and find connected components via BFS ===== =#
   #= Adjacency list: varName -> [(neighborName, negated, edgeIdx)] =#
@@ -3522,7 +3522,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   end
 
   if isempty(aliasMap)
-    @info "[SIMCODE: $(simCode.name): aliasElimination] no variables could be eliminated"
+    @debug "[SIMCODE: $(simCode.name): aliasElimination] no variables could be eliminated"
     return simCode
   end
 
@@ -3642,7 +3642,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     end
   end
 
-  @info "[SIMCODE: $(simCode.name): aliasElimination] eliminated $(length(elimVarNames)) variables and $(length(aliasEqIndices)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
+  @debug "[SIMCODE: $(simCode.name): aliasElimination] eliminated $(length(elimVarNames)) variables and $(length(aliasEqIndices)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
 
   @assign simCode.residualEquations = newResEqs
   @assign simCode.initialEquations = newInitEqs
@@ -3731,7 +3731,7 @@ end
 function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   if hasStructuralTransitions(simCode) || hasSubModels(simCode) ||
      hasFlatModel(simCode) || hasMetaModel(simCode)
-    @info "[SIMCODE: $(simCode.name): eliminateConstantParameters] skipped (VSS/recompilation/sub-model variant)"
+    @debug "[SIMCODE: $(simCode.name): eliminateConstantParameters] skipped (VSS/recompilation/sub-model variant)"
     return simCode
   end
 
@@ -3833,7 +3833,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   end
 
   if isempty(paramValueMap)
-    @info "[SIMCODE: $(simCode.name): eliminateConstantParameters] no eliminable parameters found"
+    @debug "[SIMCODE: $(simCode.name): eliminateConstantParameters] no eliminable parameters found"
     return simCode
   end
 
@@ -3956,11 +3956,11 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   end
 
   if isempty(elimNames)
-    @info "[SIMCODE: $(simCode.name): eliminateConstantParameters] nothing eliminated (all candidates survived substitution)"
+    @debug "[SIMCODE: $(simCode.name): eliminateConstantParameters] nothing eliminated (all candidates survived substitution)"
     return simCode
   end
 
-  @info "[SIMCODE: $(simCode.name): eliminateConstantParameters] eliminated $(length(elimNames)) parameters of $(length(paramValueMap)) candidates"
+  @debug "[SIMCODE: $(simCode.name): eliminateConstantParameters] eliminated $(length(elimNames)) parameters of $(length(paramValueMap)) candidates"
 
   @assign simCode.residualEquations = newResiduals
   @assign simCode.initialEquations = newInitials

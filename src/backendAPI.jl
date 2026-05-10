@@ -355,7 +355,7 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         if observedFilter === nothing
           #= Fast default: no observed equations from alias elimination =#
           if !isempty(simCode.aliasMap)
-            @info "[SIMCODE: observedFilter] clearing $(length(simCode.aliasMap)) alias observed equations (default: none)"
+            @debug "[SIMCODE: observedFilter] clearing $(length(simCode.aliasMap)) alias observed equations (default: none)"
             @assign simCode.aliasMap = empty(simCode.aliasMap)
           end
         else
@@ -373,7 +373,7 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
               any(p -> occursin(p, entry.eliminatedName), patterns)
             end
             @assign simCode.aliasMap = filteredMap
-            @info "[SIMCODE: observedFilter] kept $(length(filteredMap)) of $originalCount alias observed equations"
+            @debug "[SIMCODE: observedFilter] kept $(length(filteredMap)) of $originalCount alias observed equations"
           end
         end
         SimulationCode.logSimCodePassMetrics("observedFilter", observedBefore, simCode, time() - observedT0)

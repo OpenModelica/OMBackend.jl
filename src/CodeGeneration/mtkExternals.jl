@@ -952,7 +952,7 @@ function filterConstantEquations(eqs::AbstractVector)
   end
   local n_removed = length(eqs) - length(filtered)
   if n_removed > 0
-    @info "Removed $n_removed constant-only equations (no unknowns)"
+    @debug "[MTK GEN: cleanup] Removed $n_removed constant-only equations (no unknowns)"
   end
   return filtered
 end
@@ -1018,12 +1018,12 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
   local reducedUnks = unknowns(reducedSystem)
   #= Identity mass matrix means pure ODE: all states are differential =#
   if massMatrix isa LinearAlgebra.UniformScaling
-    @info "ODEProblem: pure ODE (identity mass matrix), $(length(finalInitialValues)) hard u0, $(length(reducedUnks)) unknowns"
+    @debug "[MTK GEN: init] ODEProblem: pure ODE (identity mass matrix), $(length(finalInitialValues)) hard u0, $(length(reducedUnks)) unknowns"
     return (reducedSystem, finalInitialValues)
   end
   #= DAE system: classify states by mass matrix diagonal =#
-  @BACKEND_LOGGING @info "[splitIV] finalInitialValues keys:" [string(p.first) for p in finalInitialValues]
-  @BACKEND_LOGGING @info "[splitIV] reducedUnks:" [string(u) for u in reducedUnks]
+  @BACKEND_LOGGING @debug "[splitIV] finalInitialValues keys:" [string(p.first) for p in finalInitialValues]
+  @BACKEND_LOGGING @debug "[splitIV] reducedUnks:" [string(u) for u in reducedUnks]
   local diffStateSet = Set{Any}()
   local diffStateStrSet = Set{String}()
   for i in 1:min(size(massMatrix, 1), length(reducedUnks))
@@ -1056,7 +1056,7 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
   local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
   local hasInitConstraints = !isempty(initEqs)
   if isempty(hardInitialValues) && !isempty(softInitialValues) && !hasInitConstraints
-    @info "No differential states have explicit IVs; pinning $(length(softInitialValues)) algebraic IVs as hard u0 so DAE init can solve for diff states"
+    @debug "[MTK GEN: init] No differential states have explicit IVs; pinning $(length(softInitialValues)) algebraic IVs as hard u0 so DAE init can solve for diff states"
     hardInitialValues = softInitialValues
     softInitialValues = Pair[]
   end
@@ -1092,7 +1092,7 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
       promoted += 1
     end
     if promoted > 0
-      @info "Promoted $(promoted) initialization_eqs literal constraints to hard u0"
+      @debug "[MTK GEN: init] Promoted $(promoted) initialization_eqs literal constraints to hard u0"
     end
     #= Demote hard u0 entries that came from `fixed=false` defaults.
        Modelica spec: only `fixed=true` vars get hard initial conditions; vars
@@ -1104,7 +1104,7 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
     if !isempty(demoted)
       hardInitialValues = filter(p -> string(p.first) in fixedTrueLhsSet, hardInitialValues)
       append!(softInitialValues, demoted)
-      @info "Demoted $(length(demoted)) non-fixed hard u0 entries to guesses (start without fixed=true)"
+      @debug "[MTK GEN: init] Demoted $(length(demoted)) non-fixed hard u0 entries to guesses (start without fixed=true)"
     end
   end
   if !isempty(softInitialValues)
@@ -1152,7 +1152,7 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
       push!(hardInitialValues, unk => Float64(resolved))
       push!(hardSymStrSet, unkStr)
       progressed = true
-      @info "Resolved $(unk) to $(resolved) via equation alias"
+      @debug "[MTK GEN: init] Resolved $(unk) to $(resolved) via equation alias"
     end
   end
   for diffState in diffStateSet
@@ -1171,9 +1171,9 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
         local finalVal = something(resolved, 0.0)
         push!(hardInitialValues, diffState => finalVal)
         if resolved !== nothing
-          @info "Resolved differential state $(diffState) to $(finalVal) via equation alias"
+          @debug "[MTK GEN: init] Resolved differential state $(diffState) to $(finalVal) via equation alias"
         else
-          @info "Defaulted MTK derivative $(diffState) to 0.0 (no alias equation found)"
+          @debug "[MTK GEN: init] Defaulted MTK derivative $(diffState) to 0.0 (no alias equation found)"
         end
       else
         #= Provide 0.0 as a guess (not hard) for Modelica variables without explicit start.
@@ -1183,7 +1183,7 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
         local currentGuesses2 = ModelingToolkit.guesses(reducedSystem)
         local newGuesses2 = merge(currentGuesses2, Dict(diffState => 0.0))
         @set! reducedSystem.guesses = newGuesses2
-        @info "Providing default 0.0 guess for differential state $(diffState) (no explicit start value)"
+        @debug "[MTK GEN: init] Providing default 0.0 guess for differential state $(diffState) (no explicit start value)"
       end
     end
   end
@@ -1205,10 +1205,10 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
     local fallbackGuesses = Dict{Any, Any}(unk => 0.0 for unk in missingUnks)
     local currentGuesses3 = ModelingToolkit.guesses(reducedSystem)
     @set! reducedSystem.guesses = merge(currentGuesses3, fallbackGuesses)
-    @info "Providing default 0.0 guesses for $(length(missingUnks)) uncovered unknowns: $(join([string(u) for u in missingUnks], ", "))"
+    @debug "[MTK GEN: init] Providing default 0.0 guesses for $(length(missingUnks)) uncovered unknowns: $(join([string(u) for u in missingUnks], ", "))"
   end
   local totalGuesses = length(softInitialValues) + length(missingUnks)
-  @info "ODEProblem: DAE, $(length(hardInitialValues)) hard u0 (differential), $(totalGuesses) as guesses (algebraic), $(length(reducedUnks)) unknowns ($(length(diffStateSet)) differential)"
+  @debug "[MTK GEN: init] ODEProblem: DAE, $(length(hardInitialValues)) hard u0 (differential), $(totalGuesses) as guesses (algebraic), $(length(reducedUnks)) unknowns ($(length(diffStateSet)) differential)"
   return (reducedSystem, hardInitialValues)
 end
 
@@ -1245,7 +1245,7 @@ function buildDefaultGuesses(reducedSystem, finalInitialValues, allInitialValues
     end
   end
   if !isempty(guessDict)
-    @info "buildDefaultGuesses: $(length(guessDict)) guesses for unknowns not in u0"
+    @debug "[MTK GEN: init] buildDefaultGuesses: $(length(guessDict)) guesses for unknowns not in u0"
   end
   return guessDict
 end
@@ -1278,7 +1278,7 @@ function injectObservedEquations(sys, observedEqs::Vector)
   if isempty(newEqs)
     return sys
   end
-  @info "injectObservedEquations: existing=$(length(existingObs)), new=$(length(newEqs))"
+  @debug "[MTK GEN: observed] injectObservedEquations: existing=$(length(existingObs)), new=$(length(newEqs))"
   local allObs = vcat(existingObs, newEqs)
   #= Collect the full parent chain: [sys, parent, grandparent, ...] =#
   local chain = [sys]
@@ -1333,7 +1333,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
                              kwargs...)
   local pre_eqs = length(equations(sys))
   local pre_unknowns = length(unknowns(sys))
-  @info "Before structural_simplify: $pre_eqs equations, $pre_unknowns unknowns"
+  @debug "[MTK GEN: simplify] Before structural_simplify: $pre_eqs equations, $pre_unknowns unknowns"
   @BACKEND_LOGGING begin
     open(OMBackend.logPath("backend/mtk", "mtk_preSimplify.log"), "w") do io
       println(io, "############################################")
@@ -1422,7 +1422,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
           @warn "  eq $idx at $p: shape=$sh node=$nodeStr"
         end
       else
-        @info "No array-shaped subtrees found in equations (clean for Pantelides)"
+        @debug "[MTK GEN: simplify] No array-shaped subtrees found in equations (clean for Pantelides)"
       end
     end
   end
@@ -1431,21 +1431,21 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   if OMBackend.ENABLE_BACKEND_LOGGING
     local _ss_timed = @timed ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
     sys = _ss_timed.value
-    @info "structural_simplify took $(_ss_timed.time)s, $(round(_ss_timed.bytes / 1e9, digits=2)) GiB"
+    @debug "[MTK GEN: simplify] structural_simplify took $(_ss_timed.time)s, $(round(_ss_timed.bytes / 1e9, digits=2)) GiB"
   else
     sys = ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
   end
   local post_eqs = length(equations(sys))
   local post_full_eqs = length(ModelingToolkit.full_equations(sys))
   local post_unknowns = length(unknowns(sys))
-  @info "After structural_simplify: equations=$(post_eqs), full_equations=$(post_full_eqs), unknowns=$(post_unknowns)"
+  @debug "[MTK GEN: simplify] After structural_simplify: equations=$(post_eqs), full_equations=$(post_full_eqs), unknowns=$(post_unknowns)"
   if post_eqs != post_unknowns
     @warn "equations(sys) != unknowns(sys): $post_eqs vs $post_unknowns"
     for (i, eq) in enumerate(equations(sys))
-      @info "  eq[$i]: $eq"
+      @debug "[MTK GEN: simplify] eq[$i]: $eq"
     end
     for (i, u) in enumerate(unknowns(sys))
-      @info "  unk[$i]: $u"
+      @debug "[MTK GEN: simplify] unk[$i]: $u"
     end
   end
   if post_full_eqs != post_unknowns
@@ -1505,7 +1505,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   local currentGuesses = ModelingToolkit.guesses(sys)
   local filteredGuesses = Dict(k => v for (k, v) in currentGuesses if k in reducedUnknowns)
   if length(filteredGuesses) != length(currentGuesses)
-    @info "Filtered guesses: $(length(currentGuesses)) -> $(length(filteredGuesses)) (removed $(length(currentGuesses) - length(filteredGuesses)) non-unknown guesses)"
+    @debug "[MTK GEN: init] Filtered guesses: $(length(currentGuesses)) -> $(length(filteredGuesses)) (removed $(length(currentGuesses) - length(filteredGuesses)) non-unknown guesses)"
     @set! sys.guesses = filteredGuesses
   end
   return sys
