@@ -3828,12 +3828,41 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   for eq in simCode.residualEquations
     _collectIfexpConditionCrefs!(protectedNames, eq.exp)
   end
+  #= Names of array bases referenced as bare CREFs in DATA_STRUCTURE constructor
+     calls (ExternalObject inits like CombiTable / CombiTimeTable). Array params
+     are scalarized into HT entries like `tableData[1][1]`..., but the constructor
+     call bind references the whole array (`tableData`). Eliminating any
+     scalarized element would leave the constructor referring to data that no
+     longer survives codegen, so protect every scalar element of those arrays.
+
+     Restricted to DS bindings whose RHS is a CALL — MSL constants
+     (BDAE.CONST of scalar type) are also stored as DATA_STRUCTURE but their
+     RHS is a literal and over-protecting them would block legitimate
+     constant-propagation eliminations elsewhere. =#
+  local dsArrayBaseNames = Set{String}()
   for (_, htEntry) in ht
     local (_, svP) = htEntry
     @match svP.varKind begin
       PARAMETER(SOME(b))            => _collectIfexpConditionCrefs!(protectedNames, b)
       ARRAY_PARAMETER(_, SOME(b))   => _collectIfexpConditionCrefs!(protectedNames, b)
+      DATA_STRUCTURE(SOME(b)) => begin
+        @match b begin
+          DAE.CALL(__) => begin
+            collectCrefNames!(protectedNames, b)
+            collectCrefNames!(dsArrayBaseNames, b)
+          end
+          _ => nothing
+        end
+      end
       _ => nothing
+    end
+  end
+  for htKey in keys(ht)
+    local bracketIdx = findfirst('[', htKey)
+    bracketIdx === nothing && continue
+    local baseName = htKey[1:bracketIdx-1]
+    if baseName in dsArrayBaseNames
+      push!(protectedNames, htKey)
     end
   end
 

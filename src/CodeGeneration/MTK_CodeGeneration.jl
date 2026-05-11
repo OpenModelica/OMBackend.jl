@@ -125,6 +125,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     using DiffEqCallbacks
     Base.Experimental.@compiler_options optimize=0 compile=min
     $(createStringParameterAssignments(simCode)...)
+    $(createArrayParameterPrelude(simCode)...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(structuralModes...)
     $(structuralCallbacks...)
@@ -253,6 +254,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       end)
     $(functions...)
     $(createStringParameterAssignments(simCode)...)
+    $(createArrayParameterPrelude(simCode)...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(generateRegisterCallsForCallExprs(simCode)...)
     $(generateInitialAlgorithmFunction(simCode))
@@ -768,9 +770,14 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     isempty(_comparisonPinned) && break
     delete!(_aliasPinned, pop!(_comparisonPinned))
   end
+  #= Pre-pass demotions are based on definitionally-pinned residuals: the
+     alias equation will always be used by MTK structural_simplify to eliminate
+     the discrete variable, leaving the matching `der(disc) ~ 0` dummy stranded.
+     Bounding this pre-pass by `_targetDemotions` (the codegen-time excess) is
+     wrong because the imbalance only surfaces *after* MTK simplification — at
+     codegen time the dummy still appears to balance the variable. =#
   local _discreteAliasOverride = String[]
   for dv in discreteVariables
-    length(_discreteAliasOverride) >= _targetDemotions && break
     if string(Symbol(dv)) in _aliasPinned
       push!(_discreteAliasOverride, dv)
     end
@@ -1946,6 +1953,119 @@ function _isLiteralBind(exp)::Bool
     DAE.ENUM_LITERAL(__) => true
     _ => false
   end
+end
+
+#= Emit ARRAY_PARAMETER bindings at module top so that DATA_STRUCTURE
+   constructor calls (CombiTable / CombiTimeTable / ExternalObject) can
+   reference them by their bare Julia name. Without this, the in-function
+   emission via createArrayParametersMTK happens too late: it lives inside
+   `function <Model>Model(tspan)`, while DATA_STRUCTURE_ASSIGNMENTS run at
+   module load time. =#
+#= Module-level prelude for array parameters referenced by DATA_STRUCTURE
+   constructors. Two cases:
+
+     1. The HT carries a single ARRAY_PARAMETER entry with a literal-array bind.
+        Emit `name = <array-expr>` directly.
+     2. The HT carries scalarized entries (e.g. `tableData[1][1]`,
+        `tableData[1][2]`, ..., `tableData[3][2]`) and the parent name has no
+        bind of its own. Reconstruct an N-dim Julia matrix from the scalar
+        element bindings and emit `tableData = <reconstructed>`. Required
+        because ExternalObject constructors (CombiTable, CombiTimeTable, ...)
+        appear at module top and reference the parent array name. =#
+function createArrayParameterPrelude(simCode::SimulationCode.SimCode)::Vector{Expr}
+  local exprs::Vector{Expr} = Expr[]
+  local ht = simCode.stringToSimVarHT
+
+  #= Restrict the prelude to arrays actually referenced by DATA_STRUCTURE
+     constructor calls. Emitting every ARRAY_PARAMETER at module top would
+     shadow MTK's per-model parameter handling for arrays not needed at
+     module-load time (e.g. body_r_CM in MultiBody models), perturbing the
+     resulting integration trajectory. =#
+  local neededBases = Set{String}()
+  for (_, (_, simVar)) in ht
+    @match simVar.varKind begin
+      SimulationCode.DATA_STRUCTURE(SOME(b)) => begin
+        @match b begin
+          DAE.CALL(__) => SimulationCode.collectCrefNames!(neededBases, b)
+          _ => nothing
+        end
+      end
+      _ => nothing
+    end
+  end
+  isempty(neededBases) && return exprs
+
+  local emitted = Set{String}()
+  for (varName, (_, simVar)) in ht
+    local bindExp = @match simVar.varKind begin
+      SimulationCode.ARRAY_PARAMETER(_, SOME(e)) => e
+      _ => nothing
+    end
+    bindExp === nothing && continue
+    varName ∈ neededBases || continue
+    varName ∈ emitted && continue
+    push!(emitted, varName)
+    local rhs = try
+      expToJuliaExpMTK(bindExp, simCode)
+    catch
+      continue
+    end
+    push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
+  end
+
+  local scalarGroups = Dict{String, Vector{Tuple{Vector{Int}, Any, Int}}}()
+  for (varName, (_, simVar)) in ht
+    local bracketIdx = findfirst('[', varName)
+    bracketIdx === nothing && continue
+    local baseName = varName[1:bracketIdx-1]
+    baseName ∈ neededBases || continue
+    baseName ∈ emitted && continue
+    local idxStr = varName[bracketIdx:end]
+    local indices = Int[]
+    for m in eachmatch(r"\[(\d+)\]", idxStr)
+      push!(indices, parse(Int, m.captures[1]))
+    end
+    isempty(indices) && continue
+    local val = @match simVar.varKind begin
+      SimulationCode.PARAMETER(SOME(DAE.RCONST(r))) => r
+      SimulationCode.PARAMETER(SOME(DAE.ICONST(i))) => i
+      SimulationCode.PARAMETER(SOME(DAE.BCONST(b))) => b
+      _ => nothing
+    end
+    val === nothing && continue
+    push!(get!(scalarGroups, baseName, Tuple{Vector{Int}, Any, Int}[]),
+          (indices, val, length(indices)))
+  end
+
+  for (baseName, entries) in scalarGroups
+    baseName ∈ emitted && continue
+    local nDims = entries[1][3]
+    all(e -> e[3] == nDims, entries) || continue
+    local maxIdx = zeros(Int, nDims)
+    for (idxs, _, _) in entries
+      for d in 1:nDims
+        maxIdx[d] = max(maxIdx[d], idxs[d])
+      end
+    end
+    local expectedCount = prod(maxIdx)
+    length(entries) == expectedCount || continue
+    local elemType = isa(entries[1][2], Bool) ? Bool :
+                     isa(entries[1][2], Integer) ? Int : Float64
+    local arr = Array{elemType}(undef, maxIdx...)
+    local complete = true
+    for (idxs, val, _) in entries
+      try
+        arr[idxs...] = val
+      catch
+        complete = false
+        break
+      end
+    end
+    complete || continue
+    push!(emitted, baseName)
+    push!(exprs, :( $(Symbol(baseName)) = $(arr) ))
+  end
+  return exprs
 end
 
 function createDataStructureAssignments(dataStructureVariables::Vector{String}, simCode::SimulationCode.SimCode)::Vector{Expr}
