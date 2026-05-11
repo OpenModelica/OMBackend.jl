@@ -125,6 +125,35 @@ function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DA
   return res
 end
 
+#= Bool-context lowering for DiscreteCallback condition functions: emits real
+   `&&` / `||` / `!` where `expToJuliaExpMTK` uses arithmetic encoding for
+   compatibility with Symbolics.jl in residual contexts. =#
+function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode)
+  @match cond begin
+    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
+      local lhs = expToJuliaExpMTK(e1, simCode)
+      local rhs = expToJuliaExpMTK(e2, simCode)
+      local opSym = DAE_OP_toJuliaOperator(op)
+      :($opSym($lhs, $rhs))
+    end
+    DAE.LBINARY(exp1 = e1, operator = DAE.AND(__), exp2 = e2) =>
+      :($(expToJuliaBoolMTK(e1, simCode)) && $(expToJuliaBoolMTK(e2, simCode)))
+    DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) =>
+      :($(expToJuliaBoolMTK(e1, simCode)) || $(expToJuliaBoolMTK(e2, simCode)))
+    DAE.LUNARY(operator = DAE.NOT(__), exp = e1) =>
+      :(!($(expToJuliaBoolMTK(e1, simCode))))
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local innerArgs = collect(lst)
+      if length(innerArgs) == 1
+        expToJuliaBoolMTK(innerArgs[1], simCode)
+      else
+        expToJuliaExpMTK(cond, simCode)
+      end
+    end
+    _ => expToJuliaExpMTK(cond, simCode)
+  end
+end
+
 """
 Transforms a DAE Condition into a MTK continous condition.
 """
@@ -652,6 +681,11 @@ function _modelicaFunctionCallExpr(path,
                                    varSuffix = "",
                                    derSymbol = false)
   local normalizedFuncName = OMBackend.canonicalName(string(path))
+  local lowered = lowerKnownSymbolicFunctionCall(normalizedFuncName, expLst, simCode, hashTable;
+                                                varPrefix = varPrefix,
+                                                varSuffix = varSuffix,
+                                                derSymbol = derSymbol)
+  lowered !== nothing && return lowered
   local runtimeName = get(AlgorithmicCodeGeneration.MODELICA_UTILITIES_TO_RUNTIME_C,
                           normalizedFuncName, nothing)
   local callee = if runtimeName !== nothing
@@ -675,20 +709,43 @@ function stripComments(ex::Expr)::Expr
   return Base.remove_linenums!(ex)
 end
 
+#= Iterative equivalent of `MacroTools.postwalk`. Visits each subexpression
+   bottom-up, replacing each node with the result of `f(rebuilt_node)`.
+   Used in place of the recursive walker for huge generated function-body
+   ASTs (e.g. wrappers for Modelica.Utilities.Strings.scanToken family),
+   where the recursive form blows past Julia's runtime stack guard. =#
+function _iterativePostwalk(f, root)
+  isa(root, Expr) || return f(root)
+  local todo = Any[(root, false)]
+  local newMap = Base.IdDict{Any,Any}()
+  while !isempty(todo)
+    local (node, processedChildren) = pop!(todo)
+    if !(node isa Expr)
+      newMap[node] = f(node)
+      continue
+    end
+    if !processedChildren
+      push!(todo, (node, true))
+      for a in node.args
+        push!(todo, (a, false))
+      end
+    else
+      local newArgs = Any[get(newMap, a, a) for a in node.args]
+      newMap[node] = f(Expr(node.head, newArgs...))
+    end
+  end
+  return get(newMap, root, root)
+end
+
 """
 Transforms:
   <name>[<index>] -> <name>_index
 """
 function arrayToSymbolicVariable(arrayRepr::Expr)::Expr
-  MacroTools.postwalk(arrayRepr) do x
-    MacroTools.@capture(x, T_[index_]) || return let
-      x
-    end
-    return let
-      local newVarStr::String = "$(T)_$(index)"
-      local newVar = Symbol(newVarStr)
-      return newVar
-    end
+  _iterativePostwalk(arrayRepr) do x
+    MacroTools.@capture(x, T_[index_]) || return x
+    local newVar = Symbol("$(T)_$(index)")
+    return newVar
   end
 end
 
@@ -696,9 +753,7 @@ end
  Removes all redudant blocks from a generated expression
 """
 function stripBeginBlocks(e)::Expr
-  MacroTools.postwalk(e) do x
-    return MacroTools.unblock(x)
-  end
+  _iterativePostwalk(MacroTools.unblock, e)
 end
 
 """
@@ -708,7 +763,7 @@ Uses direct Expr construction instead of string interpolation + Meta.parse.
 """
 const pattern = r".*_[0-9]+"
 function symbolicVariableToArrayRef(e::Expr)::Expr
-  MacroTools.postwalk(e) do x
+  _iterativePostwalk(e) do x
     x isa Symbol || return x
     local sstr = String(x)
     match(pattern, sstr) === nothing && return x
@@ -1370,10 +1425,14 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             scalarizedResult
           elseif length(subExprs) == 1 && first(subExprs) isa Integer
             #= Check for multi-output Modelica function call: ASUB(CALL(qualified_path, args), [ix]).
-               Qualified paths (not Absyn.IDENT) are user-defined Modelica functions that may return
-               records (e.g., Complex with fields re, im). In symbolic mode, the wrapper returns a
-               single Num, so plain [ix] fails. Use tupleElementCall for dual numeric/symbolic dispatch. =#
+               Array-returning functions are not multi-output tuple calls; they
+               must use normal indexing on the returned array. This matters for
+               Modelica.Math.Random.Generators.Xorshift128plus.initialState,
+               whose return type is Integer[4]. =#
             local _asubCallResult = @match innerExp begin
+              DAE.CALL(path, expLst, DAE.CALL_ATTR(ty=DAE.T_ARRAY(__))) where {_isSimCodeFunctionPath(path, simCode)} => begin
+                nothing
+              end
               DAE.CALL(path, expLst) where {_isSimCodeFunctionPath(path, simCode)} => begin
                 local callFuncName = Symbol(OMBackend.canonicalName(string(path)))
                 local fnQuote = QuoteNode(callFuncName)
@@ -2064,35 +2123,63 @@ end
 """
  Evalutates the components in a DAE expression (Currently if the components are parameters)
 """
-function evalDAE_Expression(expr, simCode)::Expr
-  local shouldEval = true
+function _substituteBoundParameters(exp, simCode;
+                                    skipNames::Set{String}=Set{String}(),
+                                    shouldEval::Base.RefValue{Bool}=Ref(true),
+                                    seen::Set{String}=Set{String}())
   function replaceParameterVariable(exp, ht)
     if Util.isCref(exp)
-      local simVar = last(simCode.stringToSimVarHT[string(exp)])
+      local key = string(exp)
+      if key in skipNames
+        return (exp, true, ht)
+      end
+      local entry = get(simCode.stringToSimVarHT, key, nothing)
+      if entry === nothing
+        shouldEval[] = false
+        return (exp, true, ht)
+      end
+      local simVar = last(entry)
       if SimulationCode.isStateOrAlgebraic(simVar)
-        shouldEval = false
+        shouldEval[] = false
       else
-        #= Try to get binding expression for parameter substitution =#
         local bindExp = @match simVar.varKind begin
           SimulationCode.PARAMETER(SOME(be)) => be
+          SimulationCode.ARRAY_PARAMETER(_, SOME(be)) => be
           _ => nothing
         end
         if bindExp !== nothing
-          return (bindExp, true, ht)
+          if key in seen
+            shouldEval[] = false
+            return (exp, true, ht)
+          end
+          push!(seen, key)
+          local resolved = _substituteBoundParameters(bindExp, simCode;
+                                                      skipNames=skipNames,
+                                                      shouldEval=shouldEval,
+                                                      seen=seen)
+          delete!(seen, key)
+          return (resolved, true, ht)
         else
-          #= Parameter without binding (fixed=false, determined by initial equation).
-             Leave CREF in place like a state/algebraic variable. =#
-          shouldEval = false
+          #= Parameter without binding (fixed=false, determined by an initial
+             equation not solved yet). Leave the CREF in place and avoid eval. =#
+          shouldEval[] = false
         end
       end
     end
     (exp, true, ht)
   end
-  local a = 0
-  #= Replaces all known variables in the daeExp =#
-  local daeExp = first(Util.traverseExpBottomUp(expr, replaceParameterVariable, 0))
+  return first(Util.traverseExpBottomUp(exp, replaceParameterVariable, 0))
+end
+
+function evalDAE_Expression(expr, simCode)::Expr
+  local shouldEval = Ref(true)
+  #= Replaces all known bound parameters in the DAE expression. This must be
+     recursive: parameter aliases such as `actualGlobalSeed = globalSeed_seed`
+     otherwise leave a bare `globalSeed_seed` in the generated Julia expression
+     even after `globalSeed_seed` itself has been solved from an initial equation. =#
+  local daeExp = _substituteBoundParameters(expr, simCode; shouldEval=shouldEval)
   local jlExpr = expToJuliaExpMTK(daeExp, simCode)
-  local evaluatedJLExpr = if shouldEval eval(jlExpr) else jlExpr end
+  local evaluatedJLExpr = if shouldEval[] eval(jlExpr) else jlExpr end
   return quote $(evaluatedJLExpr) end
 end
 
@@ -2161,6 +2248,40 @@ Updates the simCode hash table with the solved binding values.
 """
 function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
   ht = simCode.stringToSimVarHT
+  local function containsCref(exp, name::String)::Bool
+    local found = Ref(false)
+    function visit(e, acc)
+      if !found[] && Util.isCref(e) && string(e) == name
+        found[] = true
+      end
+      (e, true, acc)
+    end
+    Util.traverseExpBottomUp(exp, visit, 0)
+    return found[]
+  end
+  local function containsIntegerCref(exp, name::String)::Bool
+    local found = Ref(false)
+    function visit(e, acc)
+      if !found[] && Util.isCref(e) && string(e) == name
+        @match e begin
+          DAE.CREF(_, DAE.T_INTEGER(__)) => begin
+            found[] = true
+            nothing
+          end
+          _ => nothing
+        end
+      end
+      (e, true, acc)
+    end
+    Util.traverseExpBottomUp(exp, visit, 0)
+    return found[]
+  end
+  local function solvedValueExp(x, asInteger::Bool)
+    if asInteger && isfinite(x)
+      return DAE.ICONST(Int(round(x)))
+    end
+    return DAE.RCONST(x)
+  end
   #= Iterate to fixed-point: each pass may bind a free parameter that another
      equation depends on. Cap iterations to (length+1) so a chain of N equations
      finishes even with the worst-case ordering. =#
@@ -2198,16 +2319,6 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       continue
     end
     freeName = freeParams[1]
-    #= Build a parameter value map for all bound parameters =#
-    paramValues = Dict{String, Float64}()
-    for (key, (_, sv)) in ht
-      if sv.varKind isa SimulationCode.PARAMETER && SimulationCode.hasBindingExp(sv)
-        try
-          paramValues[key] = Float64(evalSimCodeParameter(sv, simCode))
-        catch
-        end
-      end
-    end
     #= Get initial guess from start attribute =#
     local (_, freeSV) = ht[freeName]
     local guess = 0.1
@@ -2225,50 +2336,57 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       end
       _ => nothing
     end
-    #= Build residual: LHS - RHS = 0 =#
-    #= Replace all bound params with their values, leave free param as variable =#
-    function substituteParams(exp, acc)
-      if Util.isCref(exp)
-        local key = string(exp)
-        if key == freeName
-          return (exp, true, acc)
-        end
-        local val = get(paramValues, key, nothing)
-        if val !== nothing
-          return (DAE.RCONST(val), true, acc)
-        end
-      end
-      (exp, true, acc)
-    end
-    local lhsSubst = first(Util.traverseExpBottomUp(ieqLhs, substituteParams, 0))
-    local rhsSubst = first(Util.traverseExpBottomUp(ieqRhs, substituteParams, 0))
+    #= Build residual: LHS - RHS = 0.
+       Replace all bound params recursively, leave the free param as the scalar
+       Newton variable. This handles alias chains like
+       actualGlobalSeed = globalSeed_seed, where globalSeed_seed was solved by
+       an earlier initial equation in the same fixed-point loop. =#
+    local skipFree = Set{String}([freeName])
+    local lhsEvalOk = Ref(true)
+    local rhsEvalOk = Ref(true)
+    local lhsSubst = _substituteBoundParameters(ieqLhs, simCode;
+                                                skipNames=skipFree,
+                                                shouldEval=lhsEvalOk)
+    local rhsSubst = _substituteBoundParameters(ieqRhs, simCode;
+                                                skipNames=skipFree,
+                                                shouldEval=rhsEvalOk)
     #= If the free parameter sits on the LHS (e.g. `globalSeed_seed = automaticGlobalSeed(0.0)`),
        swap the sides so eval(lhsJl) is on the constants side and the freeName lives in the
        residual function we Newton-solve. Without this swap eval(lhsJl) tries to evaluate the
        bare freeName cref and trips an UndefVarError. =#
-    local function _containsCref(exp, name::String)::Bool
-      local found = Ref(false)
-      function visit(e, acc)
-        if !found[] && Util.isCref(e) && string(e) == name
-          found[] = true
-        end
-        (e, true, acc)
-      end
-      Util.traverseExpBottomUp(exp, visit, 0)
-      return found[]
-    end
-    if _containsCref(lhsSubst, freeName) && !_containsCref(rhsSubst, freeName)
+    if containsCref(lhsSubst, freeName) && !containsCref(rhsSubst, freeName)
       lhsSubst, rhsSubst = rhsSubst, lhsSubst
+      lhsEvalOk, rhsEvalOk = rhsEvalOk, lhsEvalOk
     end
-    #= Evaluate LHS (should be all constants) =#
+    local freeIsInteger = containsIntegerCref(ieqLhs, freeName) || containsIntegerCref(ieqRhs, freeName)
+    #= Defer if substitution left an unresolved CREF; the fixed-point loop will retry. =#
+    if !lhsEvalOk[]
+      continue
+    end
     local lhsJl = expToJuliaExpMTK(lhsSubst, simCode)
     local lhsVal = try
-      Float64(eval(lhsJl))
+      local raw = eval(lhsJl)
+      raw isa Symbolics.Num ? Float64(Symbolics.unwrap(raw)) : Float64(raw)
     catch err
       @warn "[SIMCODE: solveParametricInitialEquations] could not evaluate LHS" freeName err
       continue
     end
-    #= Build a Julia function for RHS with the free param as argument =#
+    #= Common case: a free parameter aliases a bound parameter/literal directly,
+       e.g. `globalSeed_seed = globalSeed_fixedSeed`. Avoid Newton here; it
+       may keep the start guess if the generated residual fails to depend on the
+       argument due to world-age/module binding subtleties. =#
+    if containsCref(rhsSubst, freeName) && rhsSubst isa DAE.CREF
+      local (idx, oldSV) = ht[freeName]
+      local newSV = SimulationCode.SIMVAR(oldSV.name, oldSV.index,
+        SimulationCode.PARAMETER(SOME(solvedValueExp(lhsVal, freeIsInteger))), oldSV.attributes)
+      ht[freeName] = (idx, newSV)
+      push!(solvedNames, freeName)
+      solvedThisPass = true
+      continue
+    end
+    if !rhsEvalOk[]
+      continue
+    end
     local freeSymbol = Symbol(freeName)
     local rhsJl = expToJuliaExpMTK(rhsSubst, simCode)
     #= Create residual function: f(x) = lhsVal - rhs(x) =#
@@ -2312,7 +2430,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     #= Update the simCode hash table with the solved value =#
     local (idx, oldSV) = ht[freeName]
     local newSV = SimulationCode.SIMVAR(oldSV.name, oldSV.index,
-      SimulationCode.PARAMETER(SOME(DAE.RCONST(x))), oldSV.attributes)
+      SimulationCode.PARAMETER(SOME(solvedValueExp(x, freeIsInteger))), oldSV.attributes)
     ht[freeName] = (idx, newSV)
     push!(solvedNames, freeName)
     solvedThisPass = true

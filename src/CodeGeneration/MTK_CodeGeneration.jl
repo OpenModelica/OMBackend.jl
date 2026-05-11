@@ -255,11 +255,13 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     $(createStringParameterAssignments(simCode)...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(generateRegisterCallsForCallExprs(simCode)...)
+    $(generateInitialAlgorithmFunction(simCode))
     $(model)
     function simulate(tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
       ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
       global LATEST_REDUCED_SYSTEM = $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))
       global LATEST_PROBLEM = $(Symbol("$(MODEL_NAME)Model_problem"))
+      __runInitialAlgorithm!()
       #= Auto-switch from Rosenbrock (default Rodas5) to FBDF when the system
          has zero differential states. SciML warns that Rosenbrock methods on
          purely-algebraic systems do not bound the interpolation error, and
@@ -516,6 +518,13 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     end
     return e
   end
+  local _stripLineNodes
+  _stripLineNodes = function(e)
+    if e isa Expr
+      return Expr(e.head, (_stripLineNodes(a) for a in e.args if !(a isa LineNumberNode))...)
+    end
+    return e
+  end
   local _isConstAtom = e -> begin
     e = _unwrap(e)
     e isa Number && return true
@@ -553,6 +562,34 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     end
     return nothing
   end
+  #= Duplicate residuals are not independent equations; MTK will drop them
+     during structural_simplify. Do not use them as justification for removing
+     discrete hold equations, or the post-simplification system becomes
+     underdetermined by exactly the duplicate count.
+
+     Generated residuals often differ only by source-location LineNumberNodes
+     or only become identical after the backend rewrite pass, so compare the
+     same rewritten residual form that will later be handed to MTK. =#
+  local _seenResidualExprs = Set{String}()
+  local _nDuplicateResidualExprs = 0
+  local _duplicateResidualKeys = String[]
+  local _duplicateAccountingEqs = rewriteEquations(deepcopy(EQUATIONS), simCode)
+  for eq in _duplicateAccountingEqs
+    local key = string(_stripLineNodes(eq))
+    if key in _seenResidualExprs
+      _nDuplicateResidualExprs += 1
+      push!(_duplicateResidualKeys, key)
+    else
+      push!(_seenResidualExprs, key)
+    end
+  end
+  @debug "[MTK GEN: discrete] duplicate residual accounting" residuals=length(EQUATIONS) duplicates=_nDuplicateResidualExprs duplicateKeys=_duplicateResidualKeys
+  local _nDuplicateResidualDiscount = _nDuplicateResidualExprs
+  if _nDuplicateResidualDiscount > 0
+    _excess -= _nDuplicateResidualDiscount
+    @debug "[MTK GEN: discrete] discounted $(_nDuplicateResidualDiscount) duplicate residual equations from discrete dummy excess accounting"
+  end
+  local _targetDemotions = max(_excess, 0)
   #= Also detect pairwise discrete-to-discrete alias residuals of the form
      `0 ~ varA - varB` where both varA and varB are in discreteVariables.
      This is the connector pass-through pattern in Modelica.Electrical.Digital
@@ -561,6 +598,10 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      dummies + one alias residual = 3 equations for 2 vars. Demote the
      LATER var (arbitrary choice, both are equivalent) to algebraic. =#
   local _discreteSet = Set(string(Symbol(dv)) for dv in discreteVariables)
+  local _whenAssignedSet = Set{String}()
+  for whenEq in simCode.whenEquations
+    SimulationCode._collectWhenAssignTargets!(_whenAssignedSet, whenEq.whenEquation)
+  end
   #= Detect equations whose RHS contains an `ifelse` call OR a call to
      `constTableLookup` (anywhere): these equations come from constant-table
      runtime indexing via `OMBackend.CodeGeneration.constTableLookup`
@@ -608,6 +649,29 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     end
     return false
   end
+  #= Modelica's integer(x) builtin is lowered either as `integer(...)`,
+     `modelica_integer(...)`, or, after builtin rewriting, `floor(...)`.
+     Residuals of the form `0 ~ disc - integer(expr)` definitionally
+     determine the discrete variable, so the matching `der(disc) ~ 0`
+     dummy must be removed just like for ifelse/comparison-defined
+     discrete variables. =#
+  local _containsIntegerDefCall = function(e)
+    e isa Expr || return false
+    if e.head === :call && !isempty(e.args)
+      local fn = e.args[1]
+      if fn in (:integer, :modelica_integer, :floor)
+        return true
+      end
+      if fn isa Expr && fn.head === :. && length(fn.args) >= 2
+        local last = fn.args[end]
+        last isa QuoteNode && last.value in (:integer, :modelica_integer, :floor) && return true
+      end
+    end
+    for a in e.args
+      _containsIntegerDefCall(a) && return true
+    end
+    return false
+  end
   local _matchIfelseDefinedDiscrete = function(rhs)
     rhs = _unwrap(rhs)
     rhs isa Expr || return nothing
@@ -643,6 +707,24 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     end
     return nothing
   end
+  local _matchIntegerDefinedDiscrete = function(rhs)
+    rhs = _unwrap(rhs)
+    rhs isa Expr || return nothing
+    rhs.head === :call && length(rhs.args) == 3 || return nothing
+    local op = rhs.args[1]
+    (op === :+ || op === :-) || return nothing
+    local a, b = _unwrap(rhs.args[2]), _unwrap(rhs.args[3])
+    local aName = _refName(a)
+    local bName = _refName(b)
+    if bName !== nothing && bName in _discreteSet && _containsIntegerDefCall(a)
+      return bName
+    end
+    if aName !== nothing && aName in _discreteSet && _containsIntegerDefCall(b)
+      return aName
+    end
+    return nothing
+  end
+  local _comparisonPinned = String[]
   for eq in EQUATIONS
     if eq isa Expr && eq.head === :call && length(eq.args) == 3 &&
        eq.args[1] === :~ && eq.args[2] == 0
@@ -651,7 +733,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       local ifelseDef = _matchIfelseDefinedDiscrete(eq.args[3])
       ifelseDef !== nothing && push!(_aliasPinned, ifelseDef)
       local cmpDef = _matchComparisonDefinedDiscrete(eq.args[3])
-      cmpDef !== nothing && push!(_aliasPinned, cmpDef)
+      if cmpDef !== nothing
+        push!(_aliasPinned, cmpDef)
+        push!(_comparisonPinned, cmpDef)
+      end
+      local intDef = _matchIntegerDefinedDiscrete(eq.args[3])
+      intDef !== nothing && push!(_aliasPinned, intDef)
       #= Pairwise discrete alias: `0 ~ a - b` → both refs to discrete vars.
          One alias residual contributes exactly one excess equation relative
          to the two discrete dummy equations, so demote one side only. If a
@@ -664,13 +751,26 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
         local nameB = _refName(_unwrap(rhs.args[3]))
         if nameA !== nothing && nameB !== nothing &&
            nameA in _discreteSet && nameB in _discreteSet
-          push!(_aliasPinned, nameB)
+          if !(endswith(nameA, "_suspend") || endswith(nameA, "_resume") ||
+               endswith(nameB, "_suspend") || endswith(nameB, "_resume"))
+            push!(_aliasPinned, nameB)
+          end
         end
       end
     end
   end
+  #= Comparison-defined discrete residuals are the least certain demotions:
+     `disc - (a * (t >= ...))` is definitional, but it is also the shape used by
+     StateGraph edge pulses. If duplicate residuals made the raw equation count
+     too high, reclaim those comparison demotions first so a genuine hold
+     equation remains available after MTK drops duplicates. =#
+  for _ in 1:_nDuplicateResidualDiscount
+    isempty(_comparisonPinned) && break
+    delete!(_aliasPinned, pop!(_comparisonPinned))
+  end
   local _discreteAliasOverride = String[]
   for dv in discreteVariables
+    length(_discreteAliasOverride) >= _targetDemotions && break
     if string(Symbol(dv)) in _aliasPinned
       push!(_discreteAliasOverride, dv)
     end
@@ -681,7 +781,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      them caused index drift — the second loop would use stale dummies. =#
   local _toDemote = Set{String}(_discreteAliasOverride)
   if !isempty(_toDemote)
-    @debug "[MTK GEN: discrete] Discrete alias fix (definitional): demoting $(length(_toDemote)) discrete vars pinned by definitional residuals (const / ifelse / comparison): $(collect(_toDemote))"
+    @debug "[MTK GEN: discrete] Discrete alias fix (definitional): demoting $(length(_toDemote)) discrete vars pinned by definitional residuals (const / ifelse / comparison / integer): $(collect(_toDemote))"
     #= Recompute excess accounting for the pre-pass demotions, so the
        heuristic only fills in the *remaining* shortfall. =#
     _excess = _excess - length(_toDemote)
@@ -701,6 +801,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     local _mentions = Tuple{String, Int}[]
     for dv in discreteVariables
       dv in _toDemote && continue
+      dv in _whenAssignedSet && continue
       local dvSym = string(Symbol(dv))
       local nMentions = count(s -> equationMentionsVariableName(s, dvSym), _eqStrings)
       if nMentions > 0
@@ -819,6 +920,22 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                    DISCRETE_DUMMY_EQUATIONS,
                    CONDITIONAL_EQUATIONS)
   EQUATIONS = rewriteEquations(EQUATIONS, simCode)
+  local _seenMtkEquationExprs = Set{String}()
+  local _dedupedMtkEquations = Expr[]
+  local _nDedupedMtkEquations = 0
+  for eq in EQUATIONS
+    local key = string(_stripLineNodes(eq))
+    if key in _seenMtkEquationExprs
+      _nDedupedMtkEquations += 1
+    else
+      push!(_seenMtkEquationExprs, key)
+      push!(_dedupedMtkEquations, eq)
+    end
+  end
+  if _nDedupedMtkEquations > 0
+    @debug "[MTK GEN: equations] removed $(_nDedupedMtkEquations) duplicate MTK equations after rewrite"
+    EQUATIONS = _dedupedMtkEquations
+  end
   #= Reset the callback counter=#
   RESET_CALLBACKS()
   #=
@@ -957,8 +1074,10 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       #= Maps OMBackend variable indices to actual state indices =#
       callbacks = $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
       #= Split initial values =#
+      local _finalInitialValuesForSplit = Pair{Any, Any}[p for p in finalInitialValues]
+      local _initialValuesForSplit = Pair{Any, Any}[p for p in initialValues]
       (reducedSystem, finalInitialValues) = Base.invokelatest(
-        OMBackend.CodeGeneration.splitInitialValues, reducedSystem, finalInitialValues, initialValues)
+        OMBackend.CodeGeneration.splitInitialValues, reducedSystem, _finalInitialValuesForSplit, _initialValuesForSplit)
       #= Build ODEProblem =#
       if $(useDirectRHS)
         problem = OMBackend.CodeGeneration.buildDirectRHSProblem(
@@ -2503,7 +2622,11 @@ end
 
 function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.SIM_CODE; varPrefix = "", varSuffix = "")::Vector{Expr}
   local res::Array{Expr} = []
-  @debug "Calling createWhenStatements with: $whenStatements"
+  local nWhenStatements = 0
+  for _ in whenStatements
+    nWhenStatements += 1
+  end
+  @debug "[MTK GEN: when] createWhenStatementsMTK" statements=nWhenStatements
   for wStmt in  whenStatements
     @match wStmt begin
       BDAE.ASSIGN(__) => begin
@@ -2574,4 +2697,79 @@ function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.S
     end
   end
   return res
+end
+
+#= Rewrite `Base.invokelatest(funcSym, args...)` calls where funcSym is a bare
+   Symbol into `Base.invokelatest(OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[:funcSym], args...)`.
+   Modelica function wrappers are registered in MODELICA_FUNCTION_IMPLS but are
+   not bound as module-top names in the generated model module, so a bare-symbol
+   reference cannot resolve. The registry lookup always works. =#
+function _resolveModelicaCallTargets(expr)
+  if !(expr isa Expr)
+    return expr
+  end
+  if expr.head === :call && length(expr.args) >= 2 &&
+     expr.args[1] == :(Base.invokelatest) && expr.args[2] isa Symbol
+    local funcSym = expr.args[2]
+    local registry = :(OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(funcSym))])
+    local rest = Any[_resolveModelicaCallTargets(a) for a in expr.args[3:end]]
+    return Expr(:call, expr.args[1], registry, rest...)
+  end
+  return Expr(expr.head, Any[_resolveModelicaCallTargets(a) for a in expr.args]...)
+end
+
+#= Lower a single BDAE.WhenOperator from an INITIAL_ALGORITHM body to a Julia
+   expression suitable for module-top eval inside `__runInitialAlgorithm!`.
+   Parameter CREFs are folded to their literal bindings via _substituteBoundParameters
+   before lowering with the algorithmic (non-MTK) translator, so no Symbolics
+   bindings are needed at init time. =#
+function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE)
+  local sub = e -> _substituteBoundParameters(e, simCode)
+  local lowerAlg = e -> _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e)))
+  @match wStmt begin
+    BDAE.NORETCALL(__) => :( $(lowerAlg(wStmt.exp)); nothing )
+    BDAE.ASSIGN(__) => :( $(lowerAlg(wStmt.right)); nothing )
+    BDAE.REINIT(__) => :( $(lowerAlg(wStmt.value)); nothing )
+    BDAE.ASSERT(__) => begin
+      local cond = lowerAlg(wStmt.condition)
+      local msg = lowerAlg(wStmt.message)
+      :(if !($cond); @warn "Modelica assert() during init" message=$(msg); end)
+    end
+    BDAE.TERMINATE(__) => begin
+      local msg = lowerAlg(wStmt.message)
+      :(@info "Modelica terminate() during init" message=$(msg))
+    end
+    _ => throw(ErrorException("_initialWhenOpToJulia: unsupported variant $(typeof(wStmt))"))
+  end
+end
+
+"""
+    generateInitialAlgorithmFunction(simCode) -> Expr
+
+Emit a `function __runInitialAlgorithm!() ... end` whose body executes once
+during initialization, lowered from `simCode.initialAlgorithms`. Parameter
+literals are already baked into the body by `inlineParamsInInitialAlgorithms`
+at SimCode construction time, so no module-scope parameter bindings are needed
+here. Returns a no-op stub when the model has no `when initial()` clauses.
+"""
+function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Expr
+  local stmts = Expr[]
+  for ia in simCode.initialAlgorithms
+    for op in ia.statements
+      push!(stmts, _initialWhenOpToJulia(op, simCode))
+    end
+  end
+  if isempty(stmts)
+    return quote
+      function __runInitialAlgorithm!()
+        return nothing
+      end
+    end
+  end
+  return quote
+    function __runInitialAlgorithm!()
+      $(stmts...)
+      return nothing
+    end
+  end
 end

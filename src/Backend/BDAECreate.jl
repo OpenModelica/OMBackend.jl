@@ -154,6 +154,11 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
                      for var in OMFrontend.Frontend.convertVariables(flatModel.variables, list())]
   local algorithms = [alg for alg in flatModel.algorithms]
   local iAlgorithms = [iAlg for iAlg in flatModel.initialAlgorithms]
+  #= Synthesize BDAE.INITIAL_WHEN_EQUATION entries from `algorithm when initial()`
+     statements; without this they vanish at the flat-model → BDAE boundary. =#
+  for ieq in synthesizeInitialWhenFromAlgorithms(algorithms)
+    push!(equations, ieq)
+  end
   local initialEquations = BDAE.Equation[]
   for ieq in OMFrontend.Frontend.convertEquations(flatModel.initialEquations)
     local iresult = equationToBackendEquation(ieq)
@@ -744,6 +749,66 @@ function createStructuralIfEquations(ifEquations::List)
     push!(eqs, BDAE.STRUCTURAL_IF_EQUATION(ifEq))
   end
   return eqs
+end
+
+#= Convert a list of DAE.Statement (from converting an ALG_WHEN body) into
+   BDAE.WhenOperator entries. Unsupported variants are skipped silently. =#
+function _daeStmtsToWhenOps(daeStmts)::List
+  local ops = BDAE.WhenOperator[]
+  for s in daeStmts
+    local op = @match s begin
+      DAE.STMT_ASSIGN(_, e1, e, src) => BDAE.ASSIGN(e1, e, src)
+      DAE.STMT_NORETCALL(exp, src) => BDAE.NORETCALL(exp, src)
+      DAE.STMT_ASSERT(c, m, l, src) => BDAE.ASSERT(c, m, l, src)
+      DAE.STMT_TERMINATE(m, src) => BDAE.TERMINATE(m, src)
+      DAE.STMT_REINIT(varExp, value, src) => begin
+        @match varExp begin
+          DAE.CREF(cr, _) => BDAE.REINIT(cr, value, src)
+          _ => nothing
+        end
+      end
+      _ => nothing
+    end
+    if op !== nothing
+      push!(ops, op)
+    end
+  end
+  return list(ops...)
+end
+
+"""
+    synthesizeInitialWhenFromAlgorithms(algorithms) -> Vector{BDAE.Equation}
+
+Scan flat-model algorithm sections for `algorithm when initial() then ... end when`
+statements and lift each into a `BDAE.INITIAL_WHEN_EQUATION`. Bodies are translated
+via OMFrontend's existing Statement → DAE.Statement conversion, then mapped to
+BDAE.WhenOperator entries. Compound conditions (e.g. `when (initial() or c)`) are
+intentionally skipped per Modelica spec §8/§11.
+"""
+function synthesizeInitialWhenFromAlgorithms(algorithms)::Vector{BDAE.Equation}
+  local out = BDAE.Equation[]
+  for alg in algorithms
+    for stmt in alg.statements
+      stmt isa OMFrontend.Frontend.ALG_WHEN || continue
+      isempty(stmt.branches) && continue
+      local (frontendCond, frontendBody) = stmt.branches[1]
+      local daeCond = OMFrontend.Frontend.toDAE(frontendCond)
+      @match daeCond begin
+        DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
+          local daeStmts = OMFrontend.Frontend.convertStatements(frontendBody)
+          local whenOps = _daeStmtsToWhenOps(daeStmts)
+          push!(out, BDAE.INITIAL_WHEN_EQUATION(
+            length(frontendBody),
+            BDAE.WHEN_STMTS(daeCond, whenOps, NONE()),
+            stmt.source,
+            nothing,
+          ))
+        end
+        _ => nothing
+      end
+    end
+  end
+  return out
 end
 
 @exportAll()

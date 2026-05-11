@@ -260,7 +260,6 @@ end
 """
 function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arrayIdx::Int)::Expr
   local wEq = eq.whenEquation
-  local whenStmts = createWhenStatements(wEq.whenStmtLst, simCode)
   local cond = transformToZeroCrossingCondition(wEq.condition)
   ADD_CALLBACK()
   local callbacks = COUNT_CALLBACKS()
@@ -352,7 +351,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
               @error "integrator.dt was zero. Aborting."
               fail()
             end
-            if (Bool($(expToJuliaExpMTK(wEq.condition, simCode))))
+            if $(expToJuliaBoolMTK(wEq.condition, simCode))
               $(whenStatementsMTKIf...)
               add_tstop!(integrator, integrator.t + 1E-12) #=TODO: Some small number for now=#
             else
@@ -448,6 +447,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
       end
     end
   elseif isPeriodic
+    local whenStmts = createWhenStatements(wEq.whenStmtLst, simCode)
     @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = wEq.condition
     @match start <| interval <| tail = args
     quote
@@ -510,7 +510,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
                           Symbol(string(x)),
                           getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
                 Util.getAllCrefs(cond))...)
-          Bool($(expToJuliaExpMTK(cond, simCode)))
+          $(expToJuliaBoolMTK(wEq.condition, simCode))
         end
       end
       let _affCache = Ref{Any}(nothing)
@@ -558,7 +558,11 @@ end
 """
 function createWhenStatements(whenStatements::List, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local res::Array{Expr} = []
-  @debug "Calling createWhenStatements with: $whenStatements"
+  local nWhenStatements = 0
+  for _ in whenStatements
+    nWhenStatements += 1
+  end
+  @debug "[CODEGEN: when] createWhenStatements" statements=nWhenStatements
   for wStmt in  whenStatements
     @match wStmt begin
       BDAE.ASSIGN(left = DAE.TUPLE(__)) => begin

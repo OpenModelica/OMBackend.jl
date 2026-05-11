@@ -496,6 +496,20 @@ function getRHSVariables(bdaeReinit::BDAE.REINIT)::Vector{DAE.ComponentRef}
   return listArray(Util.getAllCrefs(bdaeReinit.value))
 end
 
+function getRHSVariables(call::BDAE.NORETCALL)::Vector{DAE.ComponentRef}
+  return listArray(Util.getAllCrefs(call.exp))
+end
+
+function getRHSVariables(assert::BDAE.ASSERT)::Vector{DAE.ComponentRef}
+  return vcat(listArray(Util.getAllCrefs(assert.condition)),
+              listArray(Util.getAllCrefs(assert.message)),
+              listArray(Util.getAllCrefs(assert.level)))
+end
+
+function getRHSVariables(term::BDAE.TERMINATE)::Vector{DAE.ComponentRef}
+  return listArray(Util.getAllCrefs(term.message))
+end
+
 """
   Fetches all variables in if equations.
 FIXME:

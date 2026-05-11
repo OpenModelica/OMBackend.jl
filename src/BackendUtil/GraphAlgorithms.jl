@@ -136,7 +136,9 @@ function merge(matchOrder::Vector, graph::OrderedDict)::MetaGraphs.MetaDiGraph
       MetaGraphs.set_prop!(g, eq, :vID, varIdx[1])
     end
   end
-  @debug dumpGraphProperties(g)
+  local nWithEquationId = count(i -> haskey(MetaGraphs.props(g, i), :eID), Graphs.vertices(g))
+  local nWithVariableId = count(i -> haskey(MetaGraphs.props(g, i), :vID), Graphs.vertices(g))
+  @debug "[GRAPH] matching graph built" vertices=Graphs.nv(g) edges=Graphs.ne(g) equationVertices=nWithEquationId variableVertices=nWithVariableId
   return g
 end
 

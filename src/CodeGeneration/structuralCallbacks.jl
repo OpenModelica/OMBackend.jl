@@ -539,7 +539,7 @@ function createAffectCondPairForDOCC(cond,
                         Symbol(string(c)),
                         getIdxForLookupMTK(c, simCode)),
               Util.getAllCrefs(cond))...)
-        return Bool($(expToJuliaExpMTK(cond, simCode)))
+        return $(expToJuliaBoolMTK(cond, simCode))
       end
     end
   else #= The equation is active at the start =#
@@ -573,7 +573,7 @@ function createAffectCondPairForDOCC(cond,
                         Symbol(string(c)),
                         getIdxForLookupMTK(c, simCode)),
               Util.getAllCrefs(cond))...)
-        return Bool($(expToJuliaExpMTK(cond, simCode))) == false
+        return !($(expToJuliaBoolMTK(cond, simCode)))
       end
     end
   end

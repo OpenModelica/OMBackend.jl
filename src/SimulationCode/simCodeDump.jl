@@ -334,8 +334,13 @@ function string(f::MODELICA_FUNCTION)
     println(buffer, "  local " * safeDumpString(l) * " :: " * safeDumpDAEVarType(l))
   end
   println(buffer, "algorithm")
+  #= Per-statement TYPE only, no recursive body dump. DAE.jl's string(::Statement)
+     recurses through nested STMT_IF/STMT_WHILE bodies; for big functions
+     (Modelica.Utilities.Strings.scanToken family) that blows past Julia's
+     runtime stack guard. The type list keeps the structure visible for
+     debugging without firing the recursion. =#
   for s in f.statements
-    println(buffer, "  " * safeDumpString(s))
+    println(buffer, "  ", string(typeof(s).name.name))
   end
   println(buffer, "end " * f.name)
   return String(take!(buffer))

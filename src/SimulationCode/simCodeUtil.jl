@@ -3642,7 +3642,55 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     end
   end
 
-  @debug "[SIMCODE: $(simCode.name): aliasElimination] eliminated $(length(elimVarNames)) variables and $(length(aliasEqIndices)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
+  #= Build parallel eliminated-variable/equation metadata. aliasEqIndices may
+     contain redundant alias equations that were removed because they add no new
+     constraint after substitution; those equations do not correspond to a
+     removed variable and must not be appended to eliminatedEquations. =#
+  local elimVarSet = Set{String}(elimVarNames)
+  local removedAliasIncidence = Tuple{Int, String, String}[]
+  for (n1, n2, _, eqIdx, _, _, _, _) in aliasPairs
+    if eqIdx in aliasEqIndices && (n1 in elimVarSet || n2 in elimVarSet)
+      push!(removedAliasIncidence, (eqIdx, n1, n2))
+    end
+  end
+
+  local eqByElimVar = Dict{String, Int}()
+  local varByElimEq = Dict{Int, String}()
+  function assignElimEq!(varName::String, seenEqIdxs::Set{Int})::Bool
+    for (eqIdx, n1, n2) in removedAliasIncidence
+      if n1 != varName && n2 != varName
+        continue
+      end
+      if eqIdx in seenEqIdxs
+        continue
+      end
+      push!(seenEqIdxs, eqIdx)
+      if !haskey(varByElimEq, eqIdx) || assignElimEq!(varByElimEq[eqIdx], seenEqIdxs)
+        varByElimEq[eqIdx] = varName
+        eqByElimVar[varName] = eqIdx
+        return true
+      end
+    end
+    return false
+  end
+
+  for varName in elimVarNames
+    assignElimEq!(varName, Set{Int}())
+  end
+
+  local pairedElimVarNames = String[]
+  local pairedElimEqs = BDAE.RESIDUAL_EQUATION[]
+  for varName in elimVarNames
+    if haskey(eqByElimVar, varName)
+      push!(pairedElimVarNames, varName)
+      push!(pairedElimEqs, resEqs[eqByElimVar[varName]])
+    end
+  end
+  if length(pairedElimVarNames) != length(elimVarNames)
+    @warn "[SIMCODE: $(simCode.name): aliasElimination] could not pair all eliminated variables with removed alias equations" eliminated=elimVarNames paired=pairedElimVarNames
+  end
+
+  @debug "[SIMCODE: $(simCode.name): aliasElimination] eliminated $(length(elimVarNames)) variables and removed $(length(aliasEqIndices)) equations ($(length(pairedElimVarNames)) paired for observation, $(length(newResEqs)) equations, $(length(newHT)) variables remain)"
 
   @assign simCode.residualEquations = newResEqs
   @assign simCode.initialEquations = newInitEqs
@@ -3651,8 +3699,8 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   @assign simCode.whenEquations = newWhenEqs
   @assign simCode.aliasMap = keptAliasEntries
   #= Append eliminated equations/variables to the existing lists =#
-  append!(simCode.eliminatedEquations, elimEqs)
-  append!(simCode.eliminatedVariables, elimVarNames)
+  append!(simCode.eliminatedEquations, pairedElimEqs)
+  append!(simCode.eliminatedVariables, pairedElimVarNames)
   return simCode
 end
 

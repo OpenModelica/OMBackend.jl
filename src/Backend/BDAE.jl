@@ -497,6 +497,16 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
     attr
   end
 
+  #= Body of an `algorithm when initial() then ... end when` clause. Distinct
+     from WHEN_EQUATION so init-time bodies stay separated from runtime
+     when-equations through the pipeline. =#
+  @Record INITIAL_WHEN_EQUATION begin
+    size::Integer
+    whenEquation::WhenEquation
+    source::DAE.ElementSource
+    attr
+  end
+
   @Record STRUCTURAL_WHEN_EQUATION begin
     size::Integer
     whenEquation::WhenEquation

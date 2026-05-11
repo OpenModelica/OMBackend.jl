@@ -170,9 +170,28 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   (resEqs::Vector{BDAE.RESIDUAL_EQUATION},
    whenEqs::Vector{BDAE.WHEN_EQUATION},
    ifEqs::Vector{BDAE.IF_EQUATION},
-   structuralTransitions::Vector{BDAE.Equation}) = allocateAndCollectSimulationEquations(equations,
-                                                                                         equationSystem.name,
-                                                                                         addDummyState)
+   structuralTransitions::Vector{BDAE.Equation},
+   initialWhenEqs::Vector{BDAE.INITIAL_WHEN_EQUATION}) = allocateAndCollectSimulationEquations(equations,
+                                                                                               equationSystem.name,
+                                                                                               addDummyState)
+  #= Combine two sources of init-time algorithm bodies:
+     (1) BDAE.INITIAL_WHEN_EQUATION nodes synthesized from `algorithm when initial()`
+         clauses in BDAECreate.
+     (2) Any BDAE.WHEN_EQUATION whose condition is bare `initial()` (rarer equation
+         form). Both feed into the same INITIAL_ALGORITHM list per Modelica spec
+         §8/§11. =#
+  local initialAlgorithms = INITIAL_ALGORITHM[]
+  for iweq in initialWhenEqs
+    push!(initialAlgorithms, INITIAL_ALGORITHM(collect(iweq.whenEquation.whenStmtLst)))
+  end
+  local (whenEqsKept, extractedInitAlgs) = extractInitialWhenAlgorithms(whenEqs)
+  whenEqs = whenEqsKept
+  append!(initialAlgorithms, extractedInitAlgs)
+  #= Inline parameter literals into init bodies NOW, while the HT still has the
+     scalarized array-parameter entries. Later passes (const-prop, alias-elim,
+     output-only elim) drop those entries because they have no consumer in the
+     equation graph, so codegen running afterwards has nothing to look up. =#
+  initialAlgorithms = inlineParamsInInitialAlgorithms(initialAlgorithms, stringToSimVarHT)
   #=
     Gather all irreductable variables.
     NB: Should also include variables affected somehow with by a structural change.
@@ -279,6 +298,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
                           String[],
                           AliasEntry[],
                           nothing,
+                          initialAlgorithms,
                           )
 end
 
@@ -649,6 +669,7 @@ function allocateAndCollectSimulationEquations(equations::T,
   #= Split equations into categories in a single pass =#
   regularEquations = BDAE.RESIDUAL_EQUATION[]
   whenEquations = BDAE.WHEN_EQUATION[]
+  initialWhenEquations = BDAE.INITIAL_WHEN_EQUATION[]
   ifEquations = BDAE.IF_EQUATION[]
   structuralTransitions = BDAE.Equation[]
   for eq in equations
@@ -657,6 +678,8 @@ function allocateAndCollectSimulationEquations(equations::T,
       push!(regularEquations, eq)
     elseif eqType === BDAE.WHEN_EQUATION
       push!(whenEquations, eq)
+    elseif eqType === BDAE.INITIAL_WHEN_EQUATION
+      push!(initialWhenEquations, eq)
     elseif eqType === BDAE.IF_EQUATION
       push!(ifEquations, eq)
     elseif eqType === BDAE.STRUCTURAL_TRANSISTION || eqType === BDAE.STRUCTURAL_WHEN_EQUATION
@@ -666,7 +689,162 @@ function allocateAndCollectSimulationEquations(equations::T,
   if shouldAddDummyEquation
     push!(regularEquations, makeDummyResidualEquation(equationSystemName))
   end
-  return (regularEquations, whenEquations, ifEquations, structuralTransitions)
+  return (regularEquations, whenEquations, ifEquations, structuralTransitions, initialWhenEquations)
+end
+
+#= Per Modelica spec, only `when initial() then ...` and `when {..., initial(), ...} then ...`
+   activate the body during initialization. Compound forms like `when not initial()` or
+   `when (initial() or x>5)` keep their runtime-event semantics. =#
+function _isBareInitialCondition(cond::DAE.Exp)::Bool
+  @match cond begin
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => true
+    DAE.ARRAY(_, _, lst) => any(_isBareInitialCondition, collect(lst))
+    _ => false
+  end
+end
+
+"""
+    extractInitialWhenAlgorithms(whenEqs) -> (runtimeWhenEqs, initialAlgorithms)
+
+Partition a vector of `BDAE.WHEN_EQUATION`. Entries whose condition is a bare
+`initial()` (or a list containing one) are lowered into `INITIAL_ALGORITHM`
+records and removed from the runtime when-list; the rest pass through.
+"""
+function extractInitialWhenAlgorithms(whenEqs::Vector{BDAE.WHEN_EQUATION})::Tuple{Vector{BDAE.WHEN_EQUATION}, Vector{INITIAL_ALGORITHM}}
+  local kept = BDAE.WHEN_EQUATION[]
+  local initialAlgs = INITIAL_ALGORITHM[]
+  for weq in whenEqs
+    local cond = weq.whenEquation.condition
+    if _isBareInitialCondition(cond)
+      local stmts = collect(weq.whenEquation.whenStmtLst)
+      push!(initialAlgs, INITIAL_ALGORITHM(stmts))
+    else
+      push!(kept, weq)
+    end
+  end
+  return (kept, initialAlgs)
+end
+
+#= Parse a scalarized cref key like "A[1][2]" into ("A", [1,2]).
+   Returns nothing if the key has no bracketed indices. =#
+function _parseScalarizedKey(key::String)::Union{Tuple{String,Vector{Int}}, Nothing}
+  local openIdx = findfirst('[', key)
+  openIdx === nothing && return nothing
+  local base = key[1:openIdx-1]
+  local rest = key[openIdx:end]
+  local indices = Int[]
+  while !isempty(rest)
+    rest[1] == '[' || return nothing
+    local closeBr = findfirst(']', rest)
+    closeBr === nothing && return nothing
+    local idx = tryparse(Int, rest[2:closeBr-1])
+    idx === nothing && return nothing
+    push!(indices, idx)
+    rest = rest[closeBr+1:end]
+  end
+  return (base, indices)
+end
+
+#= Rebuild a DAE.ARRAY (1D or 2D) literal for a parameter name whose parent has
+   been scalarized into `<name>[i]` or `<name>[i][j]` entries with literal
+   bindings. Returns nothing if reconstruction is not possible. =#
+function _reconstructScalarizedArrayDAE(baseName::String, ht)::Union{DAE.Exp, Nothing}
+  haskey(ht, baseName) && return nothing
+  local entries = Tuple{Vector{Int}, DAE.Exp}[]
+  for (k, entry) in ht
+    local parsed = _parseScalarizedKey(k)
+    parsed === nothing && continue
+    parsed[1] == baseName || continue
+    local sv = last(entry)
+    local be = @match sv.varKind begin
+      PARAMETER(SOME(b)) => b
+      _ => nothing
+    end
+    be === nothing && continue
+    push!(entries, (parsed[2], be))
+  end
+  isempty(entries) && return nothing
+  local nDims = length(entries[1][1])
+  local realTy = DAE.T_REAL_DEFAULT
+  if nDims == 1
+    local nI = maximum(e -> e[1][1], entries)
+    local arr = DAE.Exp[]
+    for i in 1:nI
+      local k = findfirst(e -> e[1] == [i], entries)
+      push!(arr, k === nothing ? DAE.RCONST(0.0) : entries[k][2])
+    end
+    local arrTy = DAE.T_ARRAY(realTy, MetaModelica.list(DAE.DIM_INTEGER(nI)))
+    return DAE.ARRAY(arrTy, false, MetaModelica.list(arr...))
+  elseif nDims == 2
+    local nI = maximum(e -> e[1][1], entries)
+    local nJ = maximum(e -> e[1][2], entries)
+    local rowTy = DAE.T_ARRAY(realTy, MetaModelica.list(DAE.DIM_INTEGER(nJ)))
+    local rows = DAE.Exp[]
+    for i in 1:nI
+      local row = DAE.Exp[]
+      for j in 1:nJ
+        local k = findfirst(e -> e[1] == [i,j], entries)
+        push!(row, k === nothing ? DAE.RCONST(0.0) : entries[k][2])
+      end
+      push!(rows, DAE.ARRAY(rowTy, false, MetaModelica.list(row...)))
+    end
+    local matTy = DAE.T_ARRAY(rowTy, MetaModelica.list(DAE.DIM_INTEGER(nI)))
+    return DAE.ARRAY(matTy, false, MetaModelica.list(rows...))
+  end
+  return nothing
+end
+
+#= Substitute parameter CREFs with their literal bindings throughout a DAE.Exp.
+   Handles PARAMETER (scalar), ARRAY_PARAMETER (direct binding), and scalarized
+   array parents (reconstructed). =#
+function _inlineParamsInExp(exp::DAE.Exp, ht)::DAE.Exp
+  function visit(e, acc)
+    if Util.isCref(e)
+      local key = string(e)
+      local entry = get(ht, key, nothing)
+      if entry !== nothing
+        local sv = last(entry)
+        local be = @match sv.varKind begin
+          PARAMETER(SOME(b)) => b
+          ARRAY_PARAMETER(_, SOME(b)) => b
+          _ => nothing
+        end
+        if be !== nothing
+          return (be, true, acc)
+        end
+      else
+        local recons = _reconstructScalarizedArrayDAE(key, ht)
+        if recons !== nothing
+          return (recons, true, acc)
+        end
+      end
+    end
+    return (e, true, acc)
+  end
+  return first(Util.traverseExpBottomUp(exp, visit, 0))
+end
+
+function _inlineParamsInWhenOp(wOp, ht)
+  return @match wOp begin
+    BDAE.ASSIGN(l, r, src) => BDAE.ASSIGN(l, _inlineParamsInExp(r, ht), src)
+    BDAE.NORETCALL(e, src) => BDAE.NORETCALL(_inlineParamsInExp(e, ht), src)
+    BDAE.REINIT(c, v, src) => BDAE.REINIT(c, _inlineParamsInExp(v, ht), src)
+    BDAE.ASSERT(c, m, l, src) => BDAE.ASSERT(_inlineParamsInExp(c, ht), _inlineParamsInExp(m, ht), _inlineParamsInExp(l, ht), src)
+    BDAE.TERMINATE(m, src) => BDAE.TERMINATE(_inlineParamsInExp(m, ht), src)
+    _ => wOp
+  end
+end
+
+"""
+    inlineParamsInInitialAlgorithms(initialAlgs, ht) -> Vector{INITIAL_ALGORITHM}
+
+For each INITIAL_ALGORITHM body, substitute parameter CREFs with their literal
+bindings using the *fresh* stringToSimVarHT. Run this before any elimination
+pass strips scalarized array-parameter entries; once a body carries literals,
+later HT changes do not affect codegen.
+"""
+function inlineParamsInInitialAlgorithms(initialAlgs::Vector{INITIAL_ALGORITHM}, ht)::Vector{INITIAL_ALGORITHM}
+  return INITIAL_ALGORITHM[INITIAL_ALGORITHM([_inlineParamsInWhenOp(op, ht) for op in ia.statements]) for ia in initialAlgs]
 end
 
 """

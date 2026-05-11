@@ -76,17 +76,25 @@ renameDerToD!(x) = x
 Qualify bare Modelica function calls with `OMBackend.CodeGeneration.` prefix, in place.
 """
 function qualifyModelicaFunctions!(expr::Expr, funcNames::Set{Symbol})
-    if expr.head == :call && length(expr.args) >= 1
-        if expr.args[1] isa Symbol && expr.args[1] in funcNames
-            #= Direct call: funcName(args...) =#
-            expr.args[1] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(expr.args[1]))
-        elseif expr.args[1] == :(Base.invokelatest) && length(expr.args) >= 2 && expr.args[2] isa Symbol && expr.args[2] in funcNames
-            #= invokelatest call: Base.invokelatest(funcName, args...) =#
-            expr.args[2] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(expr.args[2]))
+    #= Iterative traversal: deeply nested wrappers (e.g. the generated body for
+       Modelica.Utilities.Strings.scanToken and its scan-family helpers) push
+       the previous recursive walker past Julia's runtime stack guard, firing
+       SIGSEGV recoveries that cost ~30ms each. A worklist keeps the call
+       depth flat regardless of AST shape. =#
+    local worklist = Any[expr]
+    while !isempty(worklist)
+        local e = pop!(worklist)
+        e isa Expr || continue
+        if e.head == :call && length(e.args) >= 1
+            if e.args[1] isa Symbol && e.args[1] in funcNames
+                e.args[1] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(e.args[1]))
+            elseif e.args[1] == :(Base.invokelatest) && length(e.args) >= 2 && e.args[2] isa Symbol && e.args[2] in funcNames
+                e.args[2] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(e.args[2]))
+            end
         end
-    end
-    for a in expr.args
-        qualifyModelicaFunctions!(a, funcNames)
+        for a in e.args
+            a isa Expr && push!(worklist, a)
+        end
     end
     return expr
 end

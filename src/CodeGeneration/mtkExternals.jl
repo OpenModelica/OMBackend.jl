@@ -47,6 +47,112 @@ const MODELICA_FUNCTION_WRAPPERS = Dict{Symbol, Any}()
 const ELEM_FUNC_CACHE = Dict{Tuple{Symbol, Tuple, Int}, Any}()
 const TUPLE_ELEM_FUNC_CACHE = Dict{Tuple, Any}()
 
+function _isKnownBooleanAnyTrueFunction(normalizedFuncName::String)::Bool
+  return normalizedFuncName == "Modelica_StateGraph_Temporary_anyTrue" ||
+         normalizedFuncName == "Modelica_Math_BooleanVectors_anyTrue"
+end
+
+function _isKnownBooleanAllTrueFunction(normalizedFuncName::String)::Bool
+  return normalizedFuncName == "Modelica_StateGraph_Temporary_allTrue" ||
+         normalizedFuncName == "Modelica_Math_BooleanVectors_allTrue"
+end
+
+function _booleanVectorTerms(expLst,
+                             simCode,
+                             hashTable;
+                             varPrefix = "",
+                             varSuffix = "",
+                             derSymbol = false)
+  local nArgs = 0
+  local onlyArg = nothing
+  for arg in expLst
+    nArgs += 1
+    onlyArg = arg
+  end
+  nArgs == 1 || return nothing
+
+  local terms = Any[]
+  @match onlyArg begin
+    DAE.ARRAY(_, _, array) => begin
+      for e in array
+        push!(terms, expToJuliaExpMTK(e, simCode;
+                                      varPrefix = varPrefix,
+                                      varSuffix = varSuffix,
+                                      derSymbol = derSymbol))
+      end
+    end
+    _ => return nothing
+  end
+
+  return terms
+end
+
+function _booleanAnyTrueCallExpr(expLst,
+                                 simCode,
+                                 hashTable;
+                                 varPrefix = "",
+                                 varSuffix = "",
+                                 derSymbol = false)
+  local terms = _booleanVectorTerms(expLst, simCode, hashTable;
+                                    varPrefix = varPrefix,
+                                    varSuffix = varSuffix,
+                                    derSymbol = derSymbol)
+  terms === nothing && return nothing
+  isempty(terms) && return :(0)
+  local result = :(1 - $(terms[1]))
+  for term in terms[2:end]
+    result = :($result * (1 - $term))
+  end
+  return :(1 - $result)
+end
+
+function _booleanAllTrueCallExpr(expLst,
+                                 simCode,
+                                 hashTable;
+                                 varPrefix = "",
+                                 varSuffix = "",
+                                 derSymbol = false)
+  local terms = _booleanVectorTerms(expLst, simCode, hashTable;
+                                    varPrefix = varPrefix,
+                                    varSuffix = varSuffix,
+                                    derSymbol = derSymbol)
+  terms === nothing && return nothing
+  isempty(terms) && return :(1)
+  local result = terms[1]
+  for term in terms[2:end]
+    result = :($result * $term)
+  end
+  return result
+end
+
+"""
+Lower known Modelica function calls that have a stable symbolic equivalent.
+
+This keeps simple Boolean reductions out of the opaque RuntimeGeneratedFunction
+path. MTK can rebuild opaque terms with `symtype=Any` during alias elimination,
+which later trips SymbolicUtils arithmetic in linear-coefficient extraction.
+"""
+function lowerKnownSymbolicFunctionCall(normalizedFuncName::String,
+                                        expLst,
+                                        simCode,
+                                        hashTable;
+                                        varPrefix = "",
+                                        varSuffix = "",
+                                        derSymbol = false)
+  if _isKnownBooleanAnyTrueFunction(normalizedFuncName)
+    return _booleanAnyTrueCallExpr(expLst, simCode, hashTable;
+                                  varPrefix = varPrefix,
+                                  varSuffix = varSuffix,
+                                  derSymbol = derSymbol)
+  elseif _isKnownBooleanAllTrueFunction(normalizedFuncName)
+    return _booleanAllTrueCallExpr(expLst, simCode, hashTable;
+                                  varPrefix = varPrefix,
+                                  varSuffix = varSuffix,
+                                  derSymbol = derSymbol)
+  end
+  return nothing
+end
+
 #= Stores the count of array-shaped subtrees found in the last structural_simplify call.
    Used by tests to assert the shape invariant (0 = clean for Pantelides).
    Contract: only updated when ENABLE_BACKEND_LOGGING is true at module load.
@@ -1013,7 +1119,15 @@ end
 
   Returns `(system, hardInitialValues)` where system may have updated guesses.
 """
-function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues = Pair[])
+function splitInitialValues(reducedSystem,
+                            finalInitialValues::Vector{<:Pair{Symbolics.Num}},
+                            allInitialValues::Vector{<:Pair})
+  return splitInitialValues(reducedSystem,
+                            Pair{Any, Any}[p for p in finalInitialValues],
+                            Pair{Any, Any}[p for p in allInitialValues])
+end
+
+function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, allInitialValues::AbstractVector = Pair[])
   local massMatrix = ModelingToolkit.calculate_massmatrix(reducedSystem)
   local reducedUnks = unknowns(reducedSystem)
   #= Identity mass matrix means pure ODE: all states are differential =#
@@ -1035,12 +1149,10 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
   #= Use string comparison for hard/soft split because finalInitialValues keys
      are Num-wrapped while diffStateSet contains unwrapped BasicSymbolic values.
      isequal(Num(x), x) can fail depending on Symbolics version. =#
-  local hardInitialValues = filter(finalInitialValues) do pair
-    string(pair.first) in diffStateStrSet
-  end
-  local softInitialValues = filter(finalInitialValues) do pair
-    !(string(pair.first) in diffStateStrSet)
-  end
+  local hardInitialValues = Pair{Any, Any}[pair for pair in finalInitialValues
+                                           if string(pair.first) in diffStateStrSet]
+  local softInitialValues = Pair{Any, Any}[pair for pair in finalInitialValues
+                                           if !(string(pair.first) in diffStateStrSet)]
   #= When a DAE has only algebraic vars with explicit starts and no differential
      state has one, pin the algebraic starts as hard u0. MTK's DAE initialiser
      then has a well-determined system (algebraic-pin + residuals) and converges
@@ -1058,7 +1170,7 @@ function splitInitialValues(reducedSystem, finalInitialValues, allInitialValues 
   if isempty(hardInitialValues) && !isempty(softInitialValues) && !hasInitConstraints
     @debug "[MTK GEN: init] No differential states have explicit IVs; pinning $(length(softInitialValues)) algebraic IVs as hard u0 so DAE init can solve for diff states"
     hardInitialValues = softInitialValues
-    softInitialValues = Pair[]
+    softInitialValues = Pair{Any, Any}[]
   end
   #= Promote `lhs ~ literal` init_eqs to hard u0 entries when `lhs` is a
      reduced unknown. MTK's init solver treats `initialization_eqs` as
@@ -1333,7 +1445,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
                              kwargs...)
   local pre_eqs = length(equations(sys))
   local pre_unknowns = length(unknowns(sys))
-  @debug "[MTK GEN: simplify] Before structural_simplify: $pre_eqs equations, $pre_unknowns unknowns"
+  @info "[MTK GEN: simplify] Before structural_simplify: $pre_eqs equations, $pre_unknowns unknowns"
   @BACKEND_LOGGING begin
     open(OMBackend.logPath("backend/mtk", "mtk_preSimplify.log"), "w") do io
       println(io, "############################################")
@@ -1422,7 +1534,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
           @warn "  eq $idx at $p: shape=$sh node=$nodeStr"
         end
       else
-        @debug "[MTK GEN: simplify] No array-shaped subtrees found in equations (clean for Pantelides)"
+        @info "[MTK GEN: simplify] No array-shaped subtrees found in equations (clean for Pantelides)"
       end
     end
   end
@@ -1438,7 +1550,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   local post_eqs = length(equations(sys))
   local post_full_eqs = length(ModelingToolkit.full_equations(sys))
   local post_unknowns = length(unknowns(sys))
-  @debug "[MTK GEN: simplify] After structural_simplify: equations=$(post_eqs), full_equations=$(post_full_eqs), unknowns=$(post_unknowns)"
+  @info "[MTK GEN: simplify] After structural_simplify: equations=$(post_eqs), full_equations=$(post_full_eqs), unknowns=$(post_unknowns)"
   if post_eqs != post_unknowns
     @warn "equations(sys) != unknowns(sys): $post_eqs vs $post_unknowns"
     for (i, eq) in enumerate(equations(sys))

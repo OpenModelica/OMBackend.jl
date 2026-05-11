@@ -310,4 +310,6 @@ struct SIM_CODE{T0<:String,
   aliasMap::Vector{AliasEntry}
   "Filter patterns for observed equations. Only alias/observed variables matching these patterns are kept. Nothing means keep all."
   observedFilter::Union{Nothing, Vector{String}}
+  "Initial-algorithm bodies lowered from `when initial() then ... end when` clauses; run once during init, never as runtime callbacks."
+  initialAlgorithms::Vector{INITIAL_ALGORITHM}
 end

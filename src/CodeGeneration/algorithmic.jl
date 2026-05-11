@@ -20,6 +20,73 @@ function _unwrapSubscriptExpr(raw)
   end
 end
 
+function ensureAlgArrayLength!(arr::Vector, idx)
+  local n = _algAssignedMaxIndex(idx)
+  if n > length(arr)
+    resize!(arr, n)
+  end
+  return arr
+end
+ensureAlgArrayLength!(arr, idx) = arr
+
+_algAssignedMaxIndex(idx::Integer) = Int(idx)
+_algAssignedMaxIndex(idx::AbstractUnitRange) = isempty(idx) ? 0 : Int(last(idx))
+_algAssignedMaxIndex(idx::Colon) = 0
+function _algAssignedMaxIndex(idx)
+  try
+    return maximum(Int, idx; init=0)
+  catch
+    return 0
+  end
+end
+
+function _algIndexExpr(sub)
+  local raw = @match sub begin
+    DAE.INDEX(e) => expToJuliaExpAlg(e)
+    DAE.SLICE(e) => expToJuliaExpAlg(e)
+    DAE.WHOLEDIM() => :(:)
+    _ => expToJuliaExpAlg(sub)
+  end
+  _unwrapSubscriptExpr(raw)
+end
+
+function _algAssignmentPreallocation(@nospecialize(lhs))
+  @match lhs begin
+    DAE.CREF(DAE.CREF_IDENT(ident, _, subscriptLst), _) where {length(subscriptLst) == 1} => begin
+      local idx = _algIndexExpr(first(subscriptLst))
+      :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.ensureAlgArrayLength!($(Symbol(ident)), $idx))
+    end
+    DAE.ASUB(DAE.CREF(DAE.CREF_IDENT(ident, _, _), _), subLst) where {length(subLst) == 1} => begin
+      local idx = _algIndexExpr(first(subLst))
+      :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.ensureAlgArrayLength!($(Symbol(ident)), $idx))
+    end
+    DAE.CREF(cr, _) => begin
+      local allSubscripts = collect(CodeGeneration.FrontendUtil.Util.getSubscriptsFromCref(cr))
+      if length(allSubscripts) == 1
+        local baseName = first(split(SimulationCode.string(cr), "["))
+        local idx = _algIndexExpr(first(allSubscripts))
+        :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.ensureAlgArrayLength!($(Symbol(baseName)), $idx))
+      else
+        nothing
+      end
+    end
+    _ => nothing
+  end
+end
+
+function _algAssignment(@nospecialize(lhsExp), rhs::Expr)
+  local lhs = _unwrapSubscriptExpr(expToJuliaExpAlg(lhsExp))
+  local prealloc = _algAssignmentPreallocation(lhsExp)
+  if prealloc === nothing
+    return :($lhs = $rhs)
+  else
+    return quote
+      $prealloc
+      $lhs = $rhs
+    end
+  end
+end
+
 #= Check if a DAE.VAR is a multi-dimensional array (2+ dimensions). =#
 #= Dimensions may be in v.ty (T_ARRAY) or in v.dims field. =#
 function isMultiDimArray(v::DAE.VAR)::Bool
@@ -337,6 +404,16 @@ end
 function generateLocals(inputs::Vector)
   local jInputs = Expr[]
   for i in inputs
+    #= Record-typed local: mirror generateIOL — flatten into per-field locals
+       using `<baseName>_<fieldName>`, matching the convention used elsewhere
+       (e.g. expToJuliaExpAlg's CREF_QUAL site). =#
+    local flat = flattenRecordInput(i)
+    if !isempty(flat)
+      for fs in flat
+        push!(jInputs, Expr(:local, fs))
+      end
+      continue
+    end
     local s = DAE_VAR_ToJulia(i)
     #= If the variable has a binding expression (e.g., protected constants),
        generate local s = <bindingExpr> instead of just local s =#
@@ -371,9 +448,10 @@ function generateOutputDefaults(outputs::Vector)::Vector{Expr}
         DAE.T_BOOL(__) => :Bool
         _ => :Float64
       end
-      local dimVals = map(_daeDimToInt, collect(_funcParamDims(v)))
-      if !isempty(dimVals) && all(>(0), dimVals)
-        :(zeros($(jlElemDefault), $(dimVals...)))
+      local dimExprs = map(_daeDimToJulia, collect(_funcParamDims(v)))
+      local unresolved = any(d -> d isa Number && d <= 0, dimExprs)
+      if !isempty(dimExprs) && !unresolved
+        :(zeros($(jlElemDefault), $(dimExprs...)))
       else
         :($(jlElemDefault)[])
       end
@@ -411,8 +489,9 @@ the ccall, since the caller may legitimately pass `Vector{Int64}` and Julia's
 ccall will not silently widen the pointer cast.
 =#
 
-_daeDimToInt(d) = @match d begin
+_daeDimToJulia(d) = @match d begin
   DAE.DIM_INTEGER(int) => int
+  DAE.DIM_EXP(exp) => expToJuliaExpAlg(exp)
   _ => 0
 end
 
@@ -461,9 +540,10 @@ function generateExternalOutputAllocations(outputs::Vector)::Vector{Expr}
     local s = DAE_VAR_ToJulia(v)
     local alloc = if _funcParamIsArray(v)
       local jlElemType = _ccallElemType(_funcParamElemType(v))
-      local dimVals = map(_daeDimToInt, collect(_funcParamDims(v)))
-      if !isempty(dimVals) && all(>(0), dimVals)
-        :(zeros($(jlElemType), $(dimVals...)))
+      local dimExprs = map(_daeDimToJulia, collect(_funcParamDims(v)))
+      local unresolved = any(d -> d isa Number && d <= 0, dimExprs)
+      if !isempty(dimExprs) && !unresolved
+        :(zeros($(jlElemType), $(dimExprs...)))
       else
         :($(jlElemType)[])
       end
@@ -535,9 +615,8 @@ function generateStatement(stmt::DAE.STMT_NORETCALL)
 end
 
 function generateStatement(stmt::DAE.STMT_ASSIGN)
-  local lhs = string(stmt.exp1)
   local rhs = expToJuliaExpAlg(stmt.exp)
-  return :($(Symbol(lhs)) = $(rhs))
+  return _algAssignment(stmt.exp1, rhs)
 end
 
 function generateStatement(stmt::DAE.STMT_TUPLE_ASSIGN)
@@ -563,9 +642,8 @@ function _crefToTupleTarget(exp::DAE.Exp)
 end
 
 function generateStatement(stmt::DAE.STMT_ASSIGN_ARR)
-  local lhs = string(stmt.lhs)
   local rhs = expToJuliaExpAlg(stmt.exp)
-  return :($(Symbol(lhs)) = $(rhs))
+  return _algAssignment(stmt.lhs, rhs)
 end
 
 function generateStatement(stmt::DAE.STMT_WHILE)
@@ -743,15 +821,7 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
       end
       #= Array accesses for simple CREF_IDENT =#
       DAE.CREF(DAE.CREF_IDENT(ident, identType, subscriptLst), _) where !isempty(subscriptLst)  => begin
-        local idxExprs = map(subscriptLst) do sub
-          local raw = @match sub begin
-            DAE.INDEX(e) => expToJuliaExpAlg(e)
-            DAE.SLICE(e) => expToJuliaExpAlg(e)
-            DAE.WHOLEDIM() => :(:)
-            _ => throw("Unsupported subscript in algorithmic code: $sub")
-          end
-          _unwrapSubscriptExpr(raw)
-        end
+        local idxExprs = map(_algIndexExpr, subscriptLst)
         #= Construct proper Julia multi-dimensional indexing: arr[i, j, ...] =#
         expr = Expr(:ref, Symbol(ident), idxExprs...)
       end
@@ -772,8 +842,15 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
       end
       DAE.CREF(cr, _)  => begin
         local varName::String = SimulationCode.string(cr)
-        quote
-          $(Symbol(varName))
+        local allSubscripts = collect(CodeGeneration.FrontendUtil.Util.getSubscriptsFromCref(cr))
+        if !isempty(allSubscripts)
+          local baseName = first(split(varName, "["))
+          local idxExprs = map(_algIndexExpr, allSubscripts)
+          Expr(:ref, Symbol(baseName), idxExprs...)
+        else
+          quote
+            $(Symbol(varName))
+          end
         end
       end
       DAE.UNARY(operator = op, exp = e1) => begin
@@ -938,7 +1015,7 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
       end
       DAE.ASUB(arrExp, subLst) => begin
         local arrExpr = expToJuliaExpAlg(arrExp)
-        local subs = map(s -> _unwrapSubscriptExpr(expToJuliaExpAlg(s)), subLst)
+        local subs = map(_algIndexExpr, subLst)
         Expr(:ref, arrExpr, subs...)
       end
       DAE.RECORD(path, exps, fieldNames, ty) => begin

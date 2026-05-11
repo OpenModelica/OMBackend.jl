@@ -12,6 +12,7 @@
 =#
 
 import LinearAlgebra
+import Symbolics
 
 #= ============================================================================
    Mapping table: Modelica function name -> Julia function
@@ -140,7 +141,9 @@ modelica_sign(x) = sign(x)
 modelica_sqrt(x) = sqrt(x)
 modelica_ceil(x) = ceil(x)
 modelica_floor(x) = floor(x)
-modelica_integer(x) = floor(Int, x)
+modelica_integer(x::Symbolics.Num) = floor(x)
+modelica_integer(x::Number) = floor(Int, x)
+modelica_integer(x) = floor(x)
 
 #= Modelica `Integer(enum_value)` returns the 1-based index of an enum literal.
    Our codegen lowers enum CREFs to integer indices and ENUM_LITERAL to its

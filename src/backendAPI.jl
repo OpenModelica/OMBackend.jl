@@ -442,24 +442,24 @@ function lower(frontendDAE::DAE.DAE_LIST)::BDAE.BACKEND_DAE
     @assert typeof(listHead(frontendDAE.elementLst)) == DAE.COMP
     #= Create Backend structure from Frontend structure =#
     bDAE = BDAECreate.lower(frontendDAE)
-    @debug(BDAEUtil.stringHeading1(bDAE, "translated"));
+    @debug "[BDAE] translated; full dump is available in backend/bdae logs when backend logging is enabled"
     #= Transform ASUB expressions: der(array)[i] to der(array[i]) =#
     bDAE = Causalize.transformASUBExpressions(bDAE)
     #= Mark state variables =#
     bDAE = Causalize.detectStates(bDAE)
-    @debug(BDAEUtil.stringHeading1(bDAE, "states marked"));
+    @debug "[BDAE] states marked"
     #= Flatten CREF_QUAL with subscripted array finals =#
     bDAE = Causalize.flattenArrayCrefs(bDAE)
     #= Transform if expressions to if equations =#
     bDAE = Causalize.detectIfExpressions(bDAE)
-    @debug(BDAEUtil.stringHeading1(bDAE, "if equations transformed"));
+    @debug "[BDAE] if equations transformed"
     #= Expand record field array variables into individual scalar element variables =#
     bDAE = Causalize.expandRecordFieldArrays(bDAE)
     #= Expand COMPLEX_EQUATIONs into scalar equations =#
     bDAE = Causalize.expandComplexEquations(bDAE)
     #= We always residualize since residuals are easier to work with =#
     bDAE = Causalize.residualizeEveryEquation(bDAE)
-    @debug(BDAEUtil.stringHeading1(bDAE, "residuals"));
+    @debug "[BDAE] residualized"
     return bDAE
   end
   return hasActiveLogRunDir() ? lowerWork() : withLogRunDir(lowerWork, runId)
@@ -537,7 +537,7 @@ end
 function generateSimulationCode(bDAE::BDAE.BACKEND_DAE;
                                 mode)::SimulationCode.SimCode
   local simCode = SimulationCode.transformToSimCode(bDAE; mode = mode)
-  @debug BDAEUtil.stringHeading1(simCode, "SIM_CODE: transformed simcode")
+  @info "[SIMCODE: $(simCode.name)] transformed" residuals=length(simCode.residualEquations) initial=length(simCode.initialEquations) ifEquations=length(simCode.ifEquations) variables=length(simCode.stringToSimVarHT)
   #= NOTE: propagateConstants, eliminateAliasVariables, and eliminateOutputOnlyVariables
      are now called from translate() AFTER flattenRecordCallSites, so that record
      argument expansion does not introduce dangling references to already-eliminated
@@ -561,8 +561,7 @@ end
 function generateTargetCode(simCode::SimulationCode.SIM_CODE)
   #= Target code =#
   (modelName::String, modelCode::Expr) = CodeGeneration.generateCode(simCode)
-  @debug "Functions:" modelCode
-  @debug "Model:" modelName
+  @debug "[CODEGEN] generated target code" model=modelName codeHash=hash(modelCode)
   COMPILED_MODELS[modelName] = modelCode
   return (modelName, modelCode)
 end
@@ -576,9 +575,8 @@ end
 function generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)
   #= Target code =#
   (modelName::String, modelCode::Expr) = CodeGeneration.generateMTKCode(simCode)
-  @debug "Functions:" modelCode
-  @debug "Model:" modelName
   local codeHash = hash(modelCode)
+  @info "[MTK GEN] generated target code" model=modelName codeHash=codeHash
   if haskey(COMPILED_MODELS_MTK, modelName)
     #= Compare hash instead of full Expr tree to reduce compile-time overhead. =#
     local previousHash = COMPILED_MODELS_MTK[modelName][3]

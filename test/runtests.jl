@@ -250,7 +250,69 @@ import .ExampleDAEs
     end
   end
 
-  #= ── 4. Simulation with result verification ───────────────────── =#
+  #= ── 4. SimCode partition: when initial() → INITIAL_ALGORITHM ── =#
+
+  @testset "extractInitialWhenAlgorithms" begin
+    local SC = OMBackend.SimulationCode
+    local BDAE = OMBackend.Backend.BDAE
+    local callAttrBool = DAE.CALL_ATTR(DAE.T_BOOL(nil), false, true, false, false,
+                                       DAE.NO_INLINE(), DAE.NO_TAIL())
+    local initialCall = DAE.CALL(Absyn.IDENT("initial"), nil, callAttrBool)
+    local nonInitialCref = DAE.CREF(DAE.CREF_IDENT("trigger", DAE.T_BOOL(nil), nil),
+                                    DAE.T_BOOL(nil))
+    local mkNoretBody = () -> list(BDAE.NORETCALL(DAE.RCONST(0.0), DAE.emptyElementSource))
+    local mkWhenEq = cond -> BDAE.WHEN_EQUATION(
+      0,
+      BDAE.WHEN_STMTS(cond, mkNoretBody(), NONE()),
+      DAE.emptyElementSource,
+      nothing,
+    )
+
+    @testset "bare initial() condition is extracted" begin
+      local input = BDAE.WHEN_EQUATION[mkWhenEq(initialCall)]
+      local (kept, inits) = SC.extractInitialWhenAlgorithms(input)
+      @test isempty(kept)
+      @test length(inits) == 1
+      @test inits[1] isa SC.INITIAL_ALGORITHM
+      @test length(inits[1].statements) == 1
+      @test inits[1].statements[1] isa BDAE.NORETCALL
+    end
+
+    @testset "non-initial when is kept" begin
+      local input = BDAE.WHEN_EQUATION[mkWhenEq(nonInitialCref)]
+      local (kept, inits) = SC.extractInitialWhenAlgorithms(input)
+      @test length(kept) == 1
+      @test isempty(inits)
+    end
+
+    @testset "array {initial(), other} is extracted" begin
+      local arrCond = DAE.ARRAY(DAE.T_BOOL(nil), false,
+                                list(initialCall, nonInitialCref))
+      local input = BDAE.WHEN_EQUATION[mkWhenEq(arrCond)]
+      local (kept, inits) = SC.extractInitialWhenAlgorithms(input)
+      @test isempty(kept)
+      @test length(inits) == 1
+    end
+
+    @testset "mixed input partitions correctly" begin
+      local input = BDAE.WHEN_EQUATION[
+        mkWhenEq(initialCall),
+        mkWhenEq(nonInitialCref),
+        mkWhenEq(initialCall),
+      ]
+      local (kept, inits) = SC.extractInitialWhenAlgorithms(input)
+      @test length(kept) == 1
+      @test length(inits) == 2
+    end
+
+    @testset "empty input gives empty outputs" begin
+      local (kept, inits) = SC.extractInitialWhenAlgorithms(BDAE.WHEN_EQUATION[])
+      @test isempty(kept)
+      @test isempty(inits)
+    end
+  end
+
+  #= ── 5. Simulation with result verification ───────────────────── =#
 
   @testset "Simulation" begin
     OMBackend.clearCaches!()
