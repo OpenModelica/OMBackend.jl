@@ -171,16 +171,18 @@ function transformToMTKContinousCondition(cond, simCode)
     DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => begin
       :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)))
     end
-    #= Equality/inequality: discrete boolean comparison, treat as boolean zero-crossing =#
+    #= Boolean-valued sub-conditions: encode `b` (true=1, false=0) such that the
+       result is *negative* when the original condition is TRUE — the convention
+       used by min/max for OR/AND composition and by evalInitialCondition. The
+       previous `b - 0.5` form had inverted polarity. =#
     DAE.RELATION(e1, DAE.EQUAL(__), e2) => begin
-      :($(expToJuliaExpMTK(cond, simCode)) - 0.5)
+      :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
     end
     DAE.RELATION(e1, DAE.NEQUAL(__), e2) => begin
-      :($(expToJuliaExpMTK(cond, simCode)) - 0.5)
+      :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
     end
-    #= Boolean variable: convert to zero-crossing (var - 0.5) =#
     DAE.CREF(__) => begin
-      :($(expToJuliaExpMTK(cond, simCode)) - 0.5)
+      :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
       :(min($(transformToMTKContinousCondition(e1, simCode)),
@@ -208,9 +210,9 @@ function transformToMTKContinousCondition(cond, simCode)
     DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
       :(-1)
     end
-    #= General function call as boolean condition: treat as boolean zero-crossing =#
+    #= General function call as boolean condition: same polarity rule. =#
     DAE.CALL(__) => begin
-      :($(expToJuliaExpMTK(cond, simCode)) - 0.5)
+      :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
     end
     _ => begin
       throw("Unsupported condition expression in IF_EQUATION: " * string(cond))
@@ -236,16 +238,23 @@ function transformToMTKContinousConditionEquation(cond, simCode)
     DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => begin
       :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)) ~ 0)
     end
-    #= Equality/inequality: discrete boolean comparison, treat as boolean zero-crossing =#
+    #= Equality / inequality / boolean CREF / general boolean CALL all encode a
+       Bool-valued condition. Convention: the zero-crossing function is negative
+       when the original condition is TRUE, positive when FALSE (see the OR / AND
+       composition with min / max, and `evalInitialCondition`). A Bool b
+       cast to Float64 maps `true=>1.0`, `false=>0.0`, so the encoding must be
+       `0.5 - b`, not `b - 0.5` — the latter inverts polarity, e.g. `nperiod == 0`
+       with nperiod = -1 (false) produces `0 - 0.5 = -0.5` and is mis-read as TRUE
+       inside `min(...)`, flipping the whole disjunction. =#
     DAE.RELATION(e1, DAE.EQUAL(__), e2) => begin
-      :($(expToJuliaExpMTK(cond, simCode)) - 0.5 ~ 0)
+      :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
     end
     DAE.RELATION(e1, DAE.NEQUAL(__), e2) => begin
-      :($(expToJuliaExpMTK(cond, simCode)) - 0.5 ~ 0)
+      :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
     end
-    #= Boolean variable: convert to zero-crossing equation (var - 0.5 ~ 0) =#
+    #= Boolean variable used directly as condition: same polarity rule. =#
     DAE.CREF(__) => begin
-      :($(expToJuliaExpMTK(cond, simCode)) - 0.5 ~ 0)
+      :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
       :(min($(transformToMTKContinousCondition(e1, simCode)),
@@ -273,9 +282,9 @@ function transformToMTKContinousConditionEquation(cond, simCode)
     DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
       :(-1 ~ 0)
     end
-    #= General function call as boolean condition: treat as boolean zero-crossing =#
+    #= General function call as boolean condition: same polarity rule as above. =#
     DAE.CALL(__) => begin
-      :($(expToJuliaExpMTK(cond, simCode)) - 0.5 ~ 0)
+      :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
     end
     _ => begin
       throw("Unsupported condition expression in IF_EQUATION: " * string(cond))

@@ -159,6 +159,15 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   for ieq in synthesizeInitialWhenFromAlgorithms(algorithms)
     push!(equations, ieq)
   end
+  #= Lift `initial algorithm` sections into the same INITIAL_WHEN_EQUATION shape
+     so the simCode pipeline funnels both `algorithm when initial()` and
+     `initial algorithm` into the same `__runInitialAlgorithm!` codegen path.
+     Without this every `initial algorithm` block was silently dropped — every
+     state seeded only by an init-alg (e.g. trapezoid sources' T_start, count)
+     stayed at its default 0. =#
+  for ieq in synthesizeFromInitialAlgorithms(iAlgorithms)
+    push!(equations, ieq)
+  end
   local initialEquations = BDAE.Equation[]
   for ieq in OMFrontend.Frontend.convertEquations(flatModel.initialEquations)
     local iresult = equationToBackendEquation(ieq)
@@ -751,29 +760,70 @@ function createStructuralIfEquations(ifEquations::List)
   return eqs
 end
 
-#= Convert a list of DAE.Statement (from converting an ALG_WHEN body) into
-   BDAE.WhenOperator entries. Unsupported variants are skipped silently. =#
+#= Convert a list of DAE.Statement (from converting an ALG_WHEN or
+   `initial algorithm` body) into BDAE.WhenOperator entries. Compound
+   statements (FOR, IF, WHILE) are flattened by recursing into their bodies;
+   control-flow structure is preserved at the codegen layer by re-grouping in
+   __runInitialAlgorithm!'s lowering. Unsupported variants are skipped. =#
 function _daeStmtsToWhenOps(daeStmts)::List
   local ops = BDAE.WhenOperator[]
+  _appendStmtsToOps!(ops, daeStmts)
+  return list(ops...)
+end
+
+function _appendStmtsToOps!(ops::Vector, daeStmts)
   for s in daeStmts
-    local op = @match s begin
-      DAE.STMT_ASSIGN(_, e1, e, src) => BDAE.ASSIGN(e1, e, src)
-      DAE.STMT_NORETCALL(exp, src) => BDAE.NORETCALL(exp, src)
-      DAE.STMT_ASSERT(c, m, l, src) => BDAE.ASSERT(c, m, l, src)
-      DAE.STMT_TERMINATE(m, src) => BDAE.TERMINATE(m, src)
+    @match s begin
+      DAE.STMT_ASSIGN(_, e1, e, src) => push!(ops, BDAE.ASSIGN(e1, e, src))
+      DAE.STMT_NORETCALL(exp, src) => push!(ops, BDAE.NORETCALL(exp, src))
+      DAE.STMT_ASSERT(c, m, l, src) => push!(ops, BDAE.ASSERT(c, m, l, src))
+      DAE.STMT_TERMINATE(m, src) => push!(ops, BDAE.TERMINATE(m, src))
       DAE.STMT_REINIT(varExp, value, src) => begin
         @match varExp begin
-          DAE.CREF(cr, _) => BDAE.REINIT(cr, value, src)
+          DAE.CREF(cr, _) => push!(ops, BDAE.REINIT(cr, value, src))
           _ => nothing
         end
       end
+      #= Flatten the body of a FOR / IF / WHILE into the same op list. This is
+         a simplification — sequential semantics of the body are preserved
+         (operators run in order) but the loop/branch structure is lost. For
+         `initial algorithm` bodies that only contain straight-line code over
+         scalar variables this is adequate; bodies that depend on iteration
+         variables (DAE.STMT_FOR) need full lowering, which can be added later. =#
+      DAE.STMT_FOR(_, _, _, _, body, _) => _appendStmtsToOps!(ops, body)
+      DAE.STMT_IF(_, tb, _, _) => _appendStmtsToOps!(ops, tb)
+      DAE.STMT_WHILE(_, body, _) => _appendStmtsToOps!(ops, body)
       _ => nothing
     end
-    if op !== nothing
-      push!(ops, op)
-    end
   end
-  return list(ops...)
+end
+
+"""
+    synthesizeFromInitialAlgorithms(iAlgorithms) -> Vector{BDAE.Equation}
+
+Lift each `initial algorithm` body into a `BDAE.INITIAL_WHEN_EQUATION` with a
+synthetic `initial()` condition. The downstream pipeline already routes any
+INITIAL_WHEN_EQUATION whose condition is `initial()` through `INITIAL_ALGORITHM`
+and the `__runInitialAlgorithm!()` codegen path, so this just funnels the
+otherwise-orphaned `initial algorithm` blocks into that same path.
+"""
+function synthesizeFromInitialAlgorithms(iAlgorithms)::Vector{BDAE.Equation}
+  local out = BDAE.Equation[]
+  for alg in iAlgorithms
+    local daeStmts = OMFrontend.Frontend.convertStatements(alg.statements)
+    local whenOps = _daeStmtsToWhenOps(daeStmts)
+    isempty(whenOps) && continue
+    local initialCall = DAE.CALL(Absyn.IDENT("initial"),
+                                 MetaModelica.list(),
+                                 DAE.callAttrBuiltinBool)
+    push!(out, BDAE.INITIAL_WHEN_EQUATION(
+      length(alg.statements),
+      BDAE.WHEN_STMTS(initialCall, whenOps, NONE()),
+      alg.source,
+      nothing,
+    ))
+  end
+  return out
 end
 
 """

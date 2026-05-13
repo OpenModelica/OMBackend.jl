@@ -821,7 +821,22 @@ function _inlineParamsInExp(exp::DAE.Exp, ht)::DAE.Exp
     end
     return (e, true, acc)
   end
-  return first(Util.traverseExpBottomUp(exp, visit, 0))
+  #= Iterate to fixed point so that derived parameters (parameter whose bind
+     expression itself references another parameter) are inlined recursively.
+     A single bottom-up pass substitutes a CREF with its bind, but bottom-up
+     already visited the new sub-expression's children, so inner CREFs would
+     stay dangling. Loop until no further substitution occurs (or a small
+     safety cap is hit, in case of an unexpected cycle in the parameter
+     dependency graph). =#
+  local current = exp
+  for _ in 1:100
+    local next = first(Util.traverseExpBottomUp(current, visit, 0))
+    if next === current
+      return current
+    end
+    current = next
+  end
+  return current
 end
 
 function _inlineParamsInWhenOp(wOp, ht)

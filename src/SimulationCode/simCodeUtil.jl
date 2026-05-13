@@ -3687,7 +3687,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     end
   end
   if length(pairedElimVarNames) != length(elimVarNames)
-    @warn "[SIMCODE: $(simCode.name): aliasElimination] could not pair all eliminated variables with removed alias equations" eliminated=elimVarNames paired=pairedElimVarNames
+    @warn "[SIMCODE: $(simCode.name): aliasElimination] could not pair all eliminated variables with removed alias equations" eliminated=elimVarNames paired=pairedElimVarNames unpaired=setdiff(elimVarNames, pairedElimVarNames)
   end
 
   @debug "[SIMCODE: $(simCode.name): aliasElimination] eliminated $(length(elimVarNames)) variables and removed $(length(aliasEqIndices)) equations ($(length(pairedElimVarNames)) paired for observation, $(length(newResEqs)) equations, $(length(newHT)) variables remain)"

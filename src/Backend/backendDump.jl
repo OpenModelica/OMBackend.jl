@@ -485,7 +485,16 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
       end
 
       DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-        (string(e1) + " " + string(op) + " " + string(e2))
+        #= Parenthesize nested BINARY sub-expressions so the dump preserves
+           operator precedence visually. Without this, `a - (b - c)` prints
+           as `a - b - c`, which silently looks like `(a - b) - c` and has
+           burned debugging time tracing what looked like a residual sign
+           bug back into a correct AST. =#
+        local s1 = (e1 isa DAE.BINARY || e1 isa DAE.LBINARY || e1 isa DAE.RELATION) ?
+                   "(" + string(e1) + ")" : string(e1)
+        local s2 = (e2 isa DAE.BINARY || e2 isa DAE.LBINARY || e2 isa DAE.RELATION) ?
+                   "(" + string(e2) + ")" : string(e2)
+        (s1 + " " + string(op) + " " + s2)
       end
 
       DAE.LUNARY(operator = op, exp = e1)  => begin
@@ -493,7 +502,11 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
       end
 
       DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-        (string(e1) + " " + string(op) + " " + string(e2))
+        local s1 = (e1 isa DAE.BINARY || e1 isa DAE.LBINARY || e1 isa DAE.RELATION) ?
+                   "(" + string(e1) + ")" : string(e1)
+        local s2 = (e2 isa DAE.BINARY || e2 isa DAE.LBINARY || e2 isa DAE.RELATION) ?
+                   "(" + string(e2) + ")" : string(e2)
+        (s1 + " " + string(op) + " " + s2)
       end
 
       DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin

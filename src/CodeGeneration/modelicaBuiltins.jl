@@ -150,6 +150,9 @@ modelica_integer(x) = floor(x)
    `index` field, so this is the identity at the Julia level. =#
 modelica_Integer(x) = x
 modelica_div(x, y) = div(x, y)
+modelica_div(x::Symbolics.Num, y) = floor(x / y)
+modelica_div(x, y::Symbolics.Num) = floor(x / y)
+modelica_div(x::Symbolics.Num, y::Symbolics.Num) = floor(x / y)
 modelica_mod(x, y) = mod(x, y)
 modelica_rem(x, y) = rem(x, y)
 

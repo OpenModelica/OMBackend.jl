@@ -2842,14 +2842,55 @@ end
    expression suitable for module-top eval inside `__runInitialAlgorithm!`.
    Parameter CREFs are folded to their literal bindings via _substituteBoundParameters
    before lowering with the algorithmic (non-MTK) translator, so no Symbolics
-   bindings are needed at init time. =#
+   bindings are needed at init time.
+
+   ASSIGN / REINIT write their RHS into `LATEST_PROBLEM` via the
+   SymbolicIndexingInterface `prob[:name] = value` setter. The function runs
+   after the ODEProblem is constructed (see `simulate(...)` in the generated
+   module), so LATEST_PROBLEM is in scope. Without this, the LHS state stayed
+   at its default (0) — e.g. `T_start := startTime + count*period` in the
+   trapezoid signal source was silently dropped, breaking every model that
+   relies on `initial algorithm` to seed states. =#
 function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE)
   local sub = e -> _substituteBoundParameters(e, simCode)
   local lowerAlg = e -> _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e)))
+  local crefName = cr -> SimulationCode.DAE_identifierToString(cr)
   @match wStmt begin
     BDAE.NORETCALL(__) => :( $(lowerAlg(wStmt.exp)); nothing )
-    BDAE.ASSIGN(__) => :( $(lowerAlg(wStmt.right)); nothing )
-    BDAE.REINIT(__) => :( $(lowerAlg(wStmt.value)); nothing )
+    BDAE.ASSIGN(__) => begin
+      local name = @match wStmt.left begin
+        DAE.CREF(cr, _) => crefName(cr)
+        _ => nothing
+      end
+      if name === nothing
+        #= Fallback for non-CREF LHS (tuple destructuring etc.): evaluate the
+           RHS for its side effects but skip the assignment. =#
+        :( $(lowerAlg(wStmt.right)); nothing )
+      else
+        #= Bind the value to a local symbol so subsequent statements that
+           reference it pick up the freshly-assigned value (e.g. trapezoid
+           init alg: `count := integer(...); T_start := startTime + count*period`
+           where the second line reads `count`). The same value is also written
+           back into LATEST_PROBLEM so the integrator picks it up at u0.
+           Parameters must be set via LATEST_PROBLEM.ps[sym] (MTK >= 9 API). =#
+        local sym = Symbol(name)
+        local isParam = haskey(simCode.stringToSimVarHT, name) &&
+                        let (_, sv) = simCode.stringToSimVarHT[name]
+                          sv.varKind isa SimulationCode.PARAMETER ||
+                          sv.varKind isa SimulationCode.ARRAY_PARAMETER
+                        end
+        if isParam
+          :( $(sym) = $(lowerAlg(wStmt.right)); LATEST_PROBLEM.ps[$(QuoteNode(sym))] = $(sym); nothing )
+        else
+          :( $(sym) = $(lowerAlg(wStmt.right)); LATEST_PROBLEM[$(QuoteNode(sym))] = $(sym); nothing )
+        end
+      end
+    end
+    BDAE.REINIT(__) => begin
+      local name = crefName(wStmt.stateVar)
+      local sym = Symbol(name)
+      :( $(sym) = $(lowerAlg(wStmt.value)); LATEST_PROBLEM[$(QuoteNode(sym))] = $(sym); nothing )
+    end
     BDAE.ASSERT(__) => begin
       local cond = lowerAlg(wStmt.condition)
       local msg = lowerAlg(wStmt.message)
@@ -2886,9 +2927,16 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
       end
     end
   end
+  #= Shadow `Base.time` (a UNIX-time function) with the local Modelica `time`
+     value, which is 0 at simulation init. Without this, init-algorithm bodies
+     that reference `time` (e.g. trapezoid sources' `count := integer((time -
+     startTime) / period)`) generate `time - <Float64>` and hit MethodError
+     because `Base.time` is a function, not a number. =#
   return quote
     function __runInitialAlgorithm!()
-      $(stmts...)
+      let time = 0.0
+        $(stmts...)
+      end
       return nothing
     end
   end
