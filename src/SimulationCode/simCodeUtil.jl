@@ -3478,9 +3478,21 @@ function eliminateAliasVariables(simCode::SIM_CODE)
       continue
     end
     local (repCref, repTy) = nameToCrefType[bestName]
+    local (_, bestSv) = ht[bestName]
+    local bestIsState = @match bestSv.varKind begin
+      STATE(__) => true
+      _ => false
+    end
 
     #= Mark all other variables in this component for elimination.
-       Never eliminate irreducible variables (involved in events). =#
+       Never eliminate irreducible variables (involved in events).
+       Exception: state-to-state aliases inside the same component are safe to
+       collapse even when both ends are flagged irreducible — `getIrreductableVars`
+       marks every STATE as irreducible by default, which prevents two states that
+       are connected via algebraic-flange aliases (e.g. AIMC `aimc_inertiaRotor_phi`
+       and `loadInertia_phi`) from being merged. Without merging, the residual
+       `loadInertia_phi - aimc_inertiaRotor_phi = 0` survives and MTK Pantelides
+       sees the system as over-determined. =#
     for (varName, negFromRoot) in component
       if varName == bestName
         continue
@@ -3488,13 +3500,14 @@ function eliminateAliasVariables(simCode::SIM_CODE)
       if !haskey(ht, varName)
         continue
       end
-      if varName in irreducibleSet
-        #= Irreducible variables must not be eliminated; they are referenced
-           by name in start conditions and callback code. =#
+      local (_, sv) = ht[varName]
+      local isState = @match sv.varKind begin
+        STATE(__) => true
+        _ => false
+      end
+      if varName in irreducibleSet && !(bestIsState && isState)
         continue
       end
-      #= Compute negation: eliminatedVar = (-1)^negated * representative
-         negFromRoot of eliminated XOR negFromRoot of representative =#
       local negated = xor(negFromRoot, bestNeg)
       aliasMap[varName] = (bestName, negated, repCref, repTy)
       push!(aliasEntries, AliasEntry(varName, bestName, negated))
@@ -3687,7 +3700,26 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     end
   end
   if length(pairedElimVarNames) != length(elimVarNames)
-    @warn "[SIMCODE: $(simCode.name): aliasElimination] could not pair all eliminated variables with removed alias equations" eliminated=elimVarNames paired=pairedElimVarNames unpaired=setdiff(elimVarNames, pairedElimVarNames)
+    local unpairedVars = setdiff(elimVarNames, pairedElimVarNames)
+    @info "[SIMCODE: $(simCode.name): aliasElimination] could not pair all eliminated variables with removed alias equations" unpaired=unpairedVars
+    #= Fallback: synthesise an identity observation for each unpaired eliminated variable.
+       This happens when the alias equation for the eliminated variable was kept as a
+       non-trivial constraint between surviving variables (e.g. because the other side is
+       irreducible). The variable's aliasMap entry gives us the direct assignment. =#
+    for uv in unpairedVars
+      if haskey(aliasMap, uv) && haskey(nameToCrefType, uv)
+        local (repName, negated, repCref, repTy) = aliasMap[uv]
+        local (uvCref, uvTy) = nameToCrefType[uv]
+        local uvExp  = DAE.CREF(uvCref, uvTy)
+        local repExp = DAE.CREF(repCref, repTy)
+        #= 0 = uv - rep  (positive alias)  or  0 = uv + rep  (negated alias) =#
+        local synExp = negated ?
+          DAE.BINARY(uvExp, DAE.ADD(DAE.T_REAL_DEFAULT), repExp) :
+          DAE.BINARY(uvExp, DAE.SUB(DAE.T_REAL_DEFAULT), repExp)
+        push!(pairedElimVarNames, uv)
+        push!(pairedElimEqs, BDAE.RESIDUAL_EQUATION(synExp, nothing, nothing))
+      end
+    end
   end
 
   @debug "[SIMCODE: $(simCode.name): aliasElimination] eliminated $(length(elimVarNames)) variables and removed $(length(aliasEqIndices)) equations ($(length(pairedElimVarNames)) paired for observation, $(length(newResEqs)) equations, $(length(newHT)) variables remain)"
@@ -3698,6 +3730,12 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   @assign simCode.ifEquations = newIfEqs
   @assign simCode.whenEquations = newWhenEqs
   @assign simCode.aliasMap = keptAliasEntries
+  #= State-state aliases collapse two STATEs marked irreducible into one.
+     Drop the eliminated names from `irreductableVariables` so MTK codegen's
+     start-condition lookup (`getStartConditionsMTK`) doesn't try to look up
+     a name that no longer exists in `stringToSimVarHT`. =#
+  local elimVarSet = Set{String}(elimVarNames)
+  @assign simCode.irreductableVariables = filter(n -> !(n in elimVarSet), simCode.irreductableVariables)
   #= Append eliminated equations/variables to the existing lists =#
   append!(simCode.eliminatedEquations, pairedElimEqs)
   append!(simCode.eliminatedVariables, pairedElimVarNames)
@@ -4486,4 +4524,719 @@ function parseSubscriptsFromName(name::String)::Vector{DAE.Exp}
     push!(subs, DAE.ICONST(parse(Int, m.captures[1])))
   end
   return subs
+end
+
+"""
+    removeRedundantEquations(simCode::SIM_CODE) -> SIM_CODE
+
+Post-alias-elimination over-determination reduction.
+
+After alias elimination, some residual equations may become structurally
+redundant: they mention only unknowns that are already uniquely determined
+by other equations. This produces more equations than unknowns
+(ExtraEquationsSystemException in MTK structural_simplify).
+
+This pass computes a maximum bipartite matching of residual equations to
+surviving unknowns. Equations that cannot be matched to any still-free
+unknown are algebraically implied by the matched equations (assuming the
+original Modelica model is well-posed) and are safely removed.
+
+Typical trigger: balanced 3-phase star networks where the Kirchhoff current
+law `i[1]+i[2]+i[3]=0` is a zero-sum identity implied by the three
+per-phase Ohm's law equations, but survives alias elimination as an extra
+residual.
+"""
+#= Detect residual of the form `0 = var - expr` or `0 = expr - var`
+   where var is a simple unknown CREF and expr is anything more complex
+   than a single CREF. Returns (name, cref, ty, exprKey) or nothing.
+   Skips var-var form (handled by detectAlias). For both `var - expr`
+   and `expr - var` the canonical key is `string(expr)`, so two
+   equations with the same complex side group together regardless of
+   which side the leaf var was on. =#
+function _detectVarMinusExpr(@nospecialize(exp), ht)
+  @match exp begin
+    DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
+      local isSub = @match op begin
+        DAE.SUB(__) => true
+        _ => false
+      end
+      isSub || return nothing
+      local r1 = extractCrefName(e1)
+      local r2 = extractCrefName(e2)
+      #= Skip var-var (detectAlias handles this) and complex-complex. =#
+      if (r1 !== nothing && r2 !== nothing) || (r1 === nothing && r2 === nothing)
+        return nothing
+      end
+      local r, complexExp
+      if r1 !== nothing
+        r = r1; complexExp = e2
+      else
+        r = r2; complexExp = e1
+      end
+      local (n, cr, ty) = r
+      haskey(ht, n) || return nothing
+      local (_, sv) = ht[n]
+      isUnknownVarKind(sv.varKind) || return nothing
+      local cls = _aliasTypeClass(ty)
+      cls === :other && return nothing
+      return (n, cr, ty, string(complexExp))
+    end
+    _ => return nothing
+  end
+end
+
+#= After eliminateAliasVariables, two equations may implicitly assert
+   var1 = var2 via identical RHS expressions, e.g.
+     0 = x - der(z)
+     0 = y - der(z)
+   This pass groups by string form of the non-leaf side and aliases
+   matching LHS vars to a single representative. =#
+function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
+  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+    return simCode
+  end
+  local ht  = simCode.stringToSimVarHT
+  local resEqs = simCode.residualEquations
+  local irreducibleSet = Set{String}(simCode.irreductableVariables)
+  local sharedVarSet   = Set{String}(simCode.sharedVariables)
+
+  local rhsGroups = Dict{String, Vector{Tuple{String, Int, DAE.ComponentRef, DAE.Type}}}()
+  for (i, eq) in enumerate(resEqs)
+    local pair = _detectVarMinusExpr(eq.exp, ht)
+    pair === nothing && continue
+    local (n, cr, ty, key) = pair
+    if !haskey(rhsGroups, key)
+      rhsGroups[key] = Tuple{String, Int, DAE.ComponentRef, DAE.Type}[]
+    end
+    push!(rhsGroups[key], (n, i, cr, ty))
+  end
+
+  local aliasMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
+  local aliasEntries = AliasEntry[]
+  local removeEqs = Set{Int}()
+  local elimVarOrder = String[]
+  local elimEqOrder  = BDAE.RESIDUAL_EQUATION[]
+
+  for (_key, entries) in pairs(rhsGroups)
+    length(entries) >= 2 || continue
+    local bestIdx = 1
+    local bestPrio = -1
+    for (j, (n, _, _, _)) in enumerate(entries)
+      haskey(ht, n) || continue
+      local (_, sv) = ht[n]
+      local prio = varKindPriority(sv.varKind)
+      if n in irreducibleSet
+        prio += 60
+      end
+      if prio > bestPrio
+        bestPrio = prio
+        bestIdx = j
+      end
+    end
+    local (repName, _, repCref, repTy) = entries[bestIdx]
+    local (_, repSv) = ht[repName]
+    local repIsState = @match repSv.varKind begin
+      STATE(__) => true
+      _ => false
+    end
+    for (j, entry) in enumerate(entries)
+      j == bestIdx && continue
+      local (n, eqIdx, _, _) = entry
+      n == repName && continue
+      n in sharedVarSet && continue
+      #= Protect `_re` / `_im` scalarized parts of Complex variables. These
+         names are referenced from earlier-pass observed equations
+         (`simCode.eliminatedEquations`) via the original Complex CREF
+         + TSUB indexing, not via the flat `_re` name. Our
+         `substituteAliasCref` matches on the flat name and would miss
+         those references, leaving dangling refs at codegen time
+         (observed on QuasiStationary models). Keep the scalarized
+         siblings in the HT; the original RHS-equiv group still aliases
+         the non-Complex members. =#
+      if endswith(n, "_re") || endswith(n, "_im")
+        continue
+      end
+      local (_, sv) = ht[n]
+      local isState = @match sv.varKind begin
+        STATE(__) => true
+        _ => false
+      end
+      if n in irreducibleSet && !(repIsState && isState)
+        continue
+      end
+      aliasMap[n] = (repName, false, repCref, repTy)
+      push!(aliasEntries, AliasEntry(n, repName, false))
+      push!(removeEqs, eqIdx)
+      push!(elimVarOrder, n)
+      push!(elimEqOrder, resEqs[eqIdx])
+    end
+  end
+
+  if isempty(aliasMap)
+    return simCode
+  end
+
+  @info "[SIMCODE: $(simCode.name): eliminateRHSEquivalentEquations] aliased $(length(aliasMap)) variables via RHS equivalence; removing $(length(removeEqs)) redundant equations"
+
+  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  sizehint!(newResEqs, length(resEqs) - length(removeEqs))
+  for (i, eq) in enumerate(resEqs)
+    i in removeEqs && continue
+    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
+    push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+  end
+
+  #= Substitute in if-equation branches: conditions + branch residual equations.
+     Without this, an aliased variable that appears in an if-branch becomes
+     a dangling reference at codegen time. Matches eliminateAliasVariables's
+     equivalent step. =#
+  local newIfEqs = IF_EQUATION[]
+  for ifEq in simCode.ifEquations
+    local newBranches = BRANCH[]
+    for branch in ifEq.branches
+      local newBranchEqs = BDAE.RESIDUAL_EQUATION[]
+      for brEq in branch.residualEquations
+        local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteAliasCref, aliasMap)
+        push!(newBranchEqs, BDAE.RESIDUAL_EQUATION(newBrExp, brEq.source, brEq.attr))
+      end
+      local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, aliasMap)
+      push!(newBranches, BRANCH(newCond, newBranchEqs,
+                                branch.identifier, branch.targets, branch.isSingular,
+                                branch.matchOrder, branch.equationGraph, branch.sccs,
+                                branch.stringToSimVarHT))
+    end
+    push!(newIfEqs, IF_EQUATION(newBranches))
+  end
+
+  #= When equations: substitute in conditions and statements. =#
+  local newWhenEqs = BDAE.WHEN_EQUATION[]
+  for whenEq in simCode.whenEquations
+    local innerWhen = _substituteAliasInWhenStmts(whenEq.whenEquation, aliasMap)
+    @assign whenEq.whenEquation = innerWhen
+    push!(newWhenEqs, whenEq)
+  end
+
+  #= Initial equations: substitute alias CREFs. =#
+  local newInitEqs = typeof(simCode.initialEquations)()
+  for initEq in simCode.initialEquations
+    if initEq isa BDAE.RESIDUAL_EQUATION
+      local (newInitExp, _) = Util.traverseExpTopDown(initEq.exp, substituteAliasCref, aliasMap)
+      push!(newInitEqs, BDAE.RESIDUAL_EQUATION(newInitExp, initEq.source, initEq.attr))
+    elseif initEq isa BDAE.EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, aliasMap)
+      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, aliasMap)
+      push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
+    else
+      push!(newInitEqs, initEq)
+    end
+  end
+
+  #= Substitute in existing eliminatedEquations too. Earlier passes (like
+     eliminateAliasVariables) may have appended observed equations that
+     reference variables we are now eliminating; without this substitution,
+     `generateEliminatedObservedBlock` emits code referencing names that
+     have been removed from the HT, causing UndefVarError at module eval. =#
+  local oldElimEqs = simCode.eliminatedEquations
+  local rewrittenElimEqs = BDAE.RESIDUAL_EQUATION[]
+  sizehint!(rewrittenElimEqs, length(oldElimEqs))
+  for eq in oldElimEqs
+    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
+    push!(rewrittenElimEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+  end
+
+  local newHT = copy(ht)
+  local elimVarSet = Set{String}(keys(aliasMap))
+  for varName in keys(aliasMap)
+    delete!(newHT, varName)
+  end
+
+  @assign simCode.residualEquations = newResEqs
+  @assign simCode.initialEquations  = newInitEqs
+  @assign simCode.ifEquations       = newIfEqs
+  @assign simCode.whenEquations     = newWhenEqs
+  @assign simCode.stringToSimVarHT  = newHT
+  @assign simCode.eliminatedEquations = rewrittenElimEqs
+  @assign simCode.irreductableVariables = filter(n -> !(n in elimVarSet), simCode.irreductableVariables)
+  append!(simCode.aliasMap, aliasEntries)
+  append!(simCode.eliminatedVariables, elimVarOrder)
+  append!(simCode.eliminatedEquations, elimEqOrder)
+  return simCode
+end
+
+#= True if exp is a literal 1.0 or integer 1. =#
+function _isOneLiteral(@nospecialize(exp))
+  @match exp begin
+    DAE.RCONST(x) => x == 1.0
+    DAE.ICONST(x) => x == 1
+    _ => false
+  end
+end
+
+#= Return the numeric value of a literal, or nothing if not a literal. =#
+function _extractNumericValue(@nospecialize(exp))
+  @match exp begin
+    DAE.RCONST(x) => x
+    DAE.ICONST(x) => Float64(x)
+    DAE.UNARY(operator = DAE.UMINUS(__), exp = inner) => begin
+      local v = _extractNumericValue(inner)
+      v === nothing ? nothing : -v
+    end
+    _ => nothing
+  end
+end
+
+#= Fold numeric subexpressions in a DAE.Exp tree. Bottom-up evaluation:
+   when both operands of a BINARY are numeric literals, replace with the
+   evaluated result; partial-eval `0 * x`, `x * 0` to `RCONST(0)` and
+   `0 + x`, `x + 0`, `x - 0` to the surviving operand.
+
+   Used after frozen-state substitution so that residuals like
+     `0 = -phasor_i_[2] - (0.0 * 0.0 + 0.5773 * 0.0)`
+   collapse to `0 = -phasor_i_[2] - 0.0`, exposing a new pin in the next
+   iteration of `eliminateFrozenStates`.
+
+   Conservative: does not fold DIV by zero, sin/cos/exp of constants
+   (correctness OK but produces UNARY-RCONST forms that downstream code
+   may not expect). =#
+function _foldNumericExp(@nospecialize(exp))
+  @match exp begin
+    DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
+      local f1 = _foldNumericExp(e1)
+      local f2 = _foldNumericExp(e2)
+      local v1 = _extractNumericValue(f1)
+      local v2 = _extractNumericValue(f2)
+      if v1 !== nothing && v2 !== nothing
+        @match op begin
+          DAE.ADD(__) => return DAE.RCONST(v1 + v2)
+          DAE.SUB(__) => return DAE.RCONST(v1 - v2)
+          DAE.MUL(__) => return DAE.RCONST(v1 * v2)
+          DAE.DIV(__) => begin
+            v2 != 0 && return DAE.RCONST(v1 / v2)
+          end
+          _ => nothing
+        end
+      end
+      #= Partial folds: 0 * x = 0, x * 0 = 0, 0 + x = x, x + 0 = x, x - 0 = x. =#
+      @match op begin
+        DAE.MUL(__) => begin
+          (v1 !== nothing && v1 == 0) && return DAE.RCONST(0.0)
+          (v2 !== nothing && v2 == 0) && return DAE.RCONST(0.0)
+        end
+        DAE.ADD(__) => begin
+          (v1 !== nothing && v1 == 0) && return f2
+          (v2 !== nothing && v2 == 0) && return f1
+        end
+        DAE.SUB(__) => begin
+          (v2 !== nothing && v2 == 0) && return f1
+        end
+        _ => nothing
+      end
+      return DAE.BINARY(f1, op, f2)
+    end
+    DAE.UNARY(operator = op, exp = inner) => begin
+      local fin = _foldNumericExp(inner)
+      local vin = _extractNumericValue(fin)
+      if vin !== nothing
+        @match op begin
+          DAE.UMINUS(__) => return DAE.RCONST(-vin)
+          _ => nothing
+        end
+      end
+      return DAE.UNARY(op, fin)
+    end
+    _ => exp
+  end
+end
+
+#= Peel structurally-trivial wrappers around a sub-expression. Used by
+   `_detectFrozenState` so equations emitted with redundant `* 1.0` or
+   `--` decorations (common from inlining / parameter folding) still match
+   the frozen pin pattern. Conservative: stops at the first non-peelable
+   layer, so partial wrappers (e.g. `2.0 * x`) are left intact. =#
+function _peelNoOpWrappers(@nospecialize(exp))
+  local prev
+  while true
+    prev = exp
+    @match exp begin
+      DAE.BINARY(exp1 = e1, operator = DAE.MUL(__), exp2 = e2) => begin
+        if _isOneLiteral(e2)
+          exp = e1
+        elseif _isOneLiteral(e1)
+          exp = e2
+        end
+      end
+      DAE.BINARY(exp1 = e1, operator = DAE.DIV(__), exp2 = e2) => begin
+        if _isOneLiteral(e2)
+          exp = e1
+        end
+      end
+      DAE.UNARY(operator = DAE.UMINUS(__), exp = inner) => begin
+        @match inner begin
+          DAE.UNARY(operator = DAE.UMINUS(__), exp = innerInner) => begin
+            exp = innerInner
+          end
+          _ => nothing
+        end
+      end
+      _ => nothing
+    end
+    exp === prev && break
+  end
+  return exp
+end
+
+#= True if exp is a numeric literal (optionally wrapped in unary minus or
+   no-op multiplications by 1). =#
+function _isNumericLiteral(@nospecialize(exp))
+  local peeled = _peelNoOpWrappers(exp)
+  @match peeled begin
+    DAE.RCONST(__) => true
+    DAE.ICONST(__) => true
+    DAE.UNARY(operator = DAE.UMINUS(__),     exp = inner) => _isNumericLiteral(inner)
+    DAE.UNARY(operator = DAE.UMINUS_ARR(__), exp = inner) => _isNumericLiteral(inner)
+    _ => false
+  end
+end
+
+#= Detect a residual of the form `0 = var - literal` (or `0 = literal - var`)
+   where `var` is structurally pinned to a constant. Eligible varKinds are
+   STATE (the original kinematic-ground case, e.g. AIMC stator phi=0) and
+   ALG_VARIABLE (post-parameter-elimination cases, e.g. AIMC R_actual=0.03
+   after the alpha*(T-T_ref) term folds to zero). Returns
+   (name, cref, ty, literalExp, isState) or nothing.
+
+   STATE eligibility is what enables the `der(state) -> 0` substitution.
+   ALG_VARIABLE is structurally identical for substitution (no derivative
+   to handle). DISCRETE / ARRAY / OCC_VARIABLE are excluded because they
+   carry event or connector semantics. =#
+#= Extract a CREF together with its sign within a residual term.
+   Returns (name, cref, ty, sign) where sign is +1 for bare CREF, -1 for
+   UNARY(UMINUS, CREF). Also peels `* 1.0` / `/1.0` / `--` wrappers
+   first so decorated forms like `var * 1.0` still match.
+   Returns nothing if the term is anything else (multi-coefficient,
+   non-leaf, etc.). =#
+function _extractCrefSigned(@nospecialize(exp))
+  local peeled = _peelNoOpWrappers(exp)
+  @match peeled begin
+    DAE.UNARY(operator = DAE.UMINUS(__), exp = inner) => begin
+      local innerPeeled = _peelNoOpWrappers(inner)
+      local r = extractCrefName(innerPeeled)
+      r === nothing && return nothing
+      local (n, cr, ty) = r
+      return (n, cr, ty, -1)
+    end
+    _ => begin
+      local r = extractCrefName(peeled)
+      r === nothing && return nothing
+      local (n, cr, ty) = r
+      return (n, cr, ty, 1)
+    end
+  end
+end
+
+#= Negate a numeric literal expression, preserving its DAE structure when
+   trivially possible (RCONST/ICONST get value-negated; anything else gets
+   wrapped in UNARY(UMINUS)). =#
+function _negateLiteralExp(@nospecialize(litExp))
+  @match litExp begin
+    DAE.RCONST(x) => DAE.RCONST(-x)
+    DAE.ICONST(x) => DAE.ICONST(-x)
+    DAE.UNARY(operator = DAE.UMINUS(__), exp = inner) => inner
+    _ => DAE.UNARY(DAE.UMINUS(DAE.T_REAL_DEFAULT), litExp)
+  end
+end
+
+function _detectFrozenState(@nospecialize(exp), ht)
+  @match exp begin
+    DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
+      local isSub = @match op begin
+        DAE.SUB(__) => true
+        _ => false
+      end
+      isSub || return nothing
+      local e1p = _peelNoOpWrappers(e1)
+      local e2p = _peelNoOpWrappers(e2)
+      local s1 = _extractCrefSigned(e1)
+      local s2 = _extractCrefSigned(e2)
+      local stateRef, litExp, varSign
+      #= Equation form `s1*var - lit = 0` => var = lit/s1.
+         Equation form `lit - s2*var = 0` => var = lit/s2. =#
+      if s1 !== nothing && _isNumericLiteral(e2p)
+        local (n, cr, ty, sg) = s1
+        stateRef = (n, cr, ty); litExp = e2p; varSign = sg
+      elseif s2 !== nothing && _isNumericLiteral(e1p)
+        local (n, cr, ty, sg) = s2
+        stateRef = (n, cr, ty); litExp = e1p; varSign = sg
+      else
+        return nothing
+      end
+      if varSign == -1
+        litExp = _negateLiteralExp(litExp)
+      end
+      local (n, cr, ty) = stateRef
+      haskey(ht, n) || return nothing
+      local (_, sv) = ht[n]
+      local isState = @match sv.varKind begin
+        STATE(__) => true
+        _ => false
+      end
+      local isAlg = @match sv.varKind begin
+        ALG_VARIABLE(__) => true
+        _ => false
+      end
+      (isState || isAlg) || return nothing
+      return (n, cr, ty, litExp, isState)
+    end
+    _ => return nothing
+  end
+end
+
+#= traverseExpTopDown visitor: substitute eliminated states. Returns
+   (newExp, continueRecursion, frozenMap). Handles two patterns:
+     - CREF(state)                        -> literal
+     - CALL("der", [CREF(state)])         -> 0.0
+   For non-frozen subtrees, returns the original exp with continueRecursion=true. =#
+function _substituteFrozenState(@nospecialize(exp), frozenMap)
+  @match exp begin
+    DAE.CALL(Absyn.IDENT("der"), expLst, _) => begin
+      local arg = listHead(expLst)
+      @match arg begin
+        DAE.CREF(cr, _) => begin
+          local n = DAE_identifierToString(cr)
+          if haskey(frozenMap, n)
+            return (DAE.RCONST(0.0), false, frozenMap)
+          end
+          return (exp, true, frozenMap)
+        end
+        _ => return (exp, true, frozenMap)
+      end
+    end
+    DAE.CREF(cr, _) => begin
+      local n = DAE_identifierToString(cr)
+      if haskey(frozenMap, n)
+        return (frozenMap[n], false, frozenMap)
+      end
+      return (exp, true, frozenMap)
+    end
+    _ => return (exp, true, frozenMap)
+  end
+end
+
+#= Eliminate variables that are algebraically pinned to a numeric literal.
+   Two flavours, both covered:
+
+   1. STATE pinned by a kinematic ground (e.g. AIMC `aimc_inertiaStator_phi = 0`
+      from a Fixed-flange). The state has no time dynamics yet stays classified
+      as STATE because `der(state)` appears in some inertia/connector equation.
+      Pantelides then differentiates the pin and over-determines the system.
+   2. ALG_VARIABLE pinned by a folded parameter expression (e.g. AIMC
+      `aimc_rs_resistor[k]_R_actual = 0.03` after `R*(1 + alpha*(T-T_ref))`
+      collapses with alpha=0). Treated identically — no derivative to handle,
+      but the CREF substitution propagates the constant through every use.
+
+   Strategy: full elimination. Substitute the variable with its literal value
+   at every CREF site, and `der(state) -> 0.0` for the STATE case. The pin
+   equation is dropped; the (var, eq) pair moves into eliminatedVariables /
+   eliminatedEquations so MTK observed-equation generation can still expose
+   the constant value on sol[:name].
+
+   Excluded varKinds: DISCRETE (event semantics), ARRAY (subscript handling),
+   OCC_VARIABLE (over-constrained connector special cases), STATE_DERIVATIVE
+   (not a directly-pinnable form).
+
+   Safety: never eliminate a variable that appears in any if-branch or
+   when-equation (its name is needed for event registration / callback
+   pre()-tracking). Skips for VSS / multi-mode SimCode variants.
+
+   Iteration: substituting der(state) -> 0 can expose a new frozen variable
+   in equations like `w - der(state) = 0` (becomes `w - 0 = 0`). The pass
+   loops until no more matches surface, capped at 16 rounds defensively.
+
+   Placement: after eliminateConstantParameters so parameter chains like
+   `var = some_param` (with param folded to a literal) are already
+   substituted to `var = literal` form before detection. =#
+function eliminateFrozenStates(simCode::SIM_CODE)::SIM_CODE
+  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+    return simCode
+  end
+  #= Iterate to convergence: substituting der(state) -> 0 can turn a related
+     equation like `w - der(state) = 0` into `w - 0 = 0`, exposing a new
+     frozen state. Cap the loop count defensively even though the variable
+     set strictly shrinks each round. =#
+  local totalEliminated = 0
+  local maxRounds = 16
+  for round in 1:maxRounds
+    local (newCode, nEliminated) = _eliminateFrozenStatesOnePass(simCode)
+    nEliminated == 0 && break
+    simCode = newCode
+    totalEliminated += nEliminated
+  end
+  return simCode
+end
+
+function _eliminateFrozenStatesOnePass(simCode::SIM_CODE)
+  local ht = simCode.stringToSimVarHT
+  local resEqs = simCode.residualEquations
+  local sharedVarSet = Set{String}(simCode.sharedVariables)
+
+  #= Safety: collect every cref referenced in if/when so we never demote
+     a variable that participates in event dispatch / conditional flow. =#
+  local protectedNames = Set{String}()
+  for ifEq in simCode.ifEquations
+    for branch in ifEq.branches
+      collectCrefNames!(protectedNames, branch.condition)
+      for brEq in branch.residualEquations
+        collectCrefNames!(protectedNames, brEq.exp)
+      end
+    end
+  end
+  for whenEq in simCode.whenEquations
+    _collectWhenCrefNames!(protectedNames, whenEq.whenEquation)
+  end
+
+  local frozenMap   = Dict{String, DAE.Exp}()
+  local frozenEqIdx = Dict{String, Int}()
+  local frozenIsState = Dict{String, Bool}()
+  for (i, eq) in enumerate(resEqs)
+    local pair = _detectFrozenState(eq.exp, ht)
+    pair === nothing && continue
+    local (n, _, _, litExp, isState) = pair
+    n in sharedVarSet  && continue
+    n in protectedNames && continue
+    haskey(frozenMap, n) && continue
+    frozenMap[n]   = litExp
+    frozenEqIdx[n] = i
+    frozenIsState[n] = isState
+  end
+
+  isempty(frozenMap) && return (simCode, 0)
+
+  #= Safety: never reduce the residual list to empty. MTK's `System(...)`
+     constructor infers `Vector{Any}` from an empty literal `[]`, which
+     does not match the typed-vector method signatures and raises
+     MethodError at codegen time. If eliminating all detected frozen
+     variables would empty the residual set, keep one of them so MTK
+     still has a non-empty (but trivial) equation to construct from.
+     Observed on MatrixMultTest where every variable is a constant pin. =#
+  local _eqsLeftAfter = length(resEqs) - length(frozenMap)
+  if _eqsLeftAfter <= 0
+    local _keepOne = first(sort(collect(keys(frozenMap))))
+    delete!(frozenMap, _keepOne)
+    delete!(frozenEqIdx, _keepOne)
+    delete!(frozenIsState, _keepOne)
+    @info "[SIMCODE: $(simCode.name): eliminateFrozenStates] keeping $(_keepOne) to avoid emptying the residual system"
+    isempty(frozenMap) && return (simCode, 0)
+  end
+
+  local nState = count(values(frozenIsState))
+  local nAlg   = length(frozenMap) - nState
+  @info "[SIMCODE: $(simCode.name): eliminateFrozenStates] eliminating $(length(frozenMap)) frozen variable(s) ($nState state, $nAlg algebraic): $(sort(collect(keys(frozenMap))))"
+
+  local removeEqs = Set{Int}(values(frozenEqIdx))
+  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  sizehint!(newResEqs, length(resEqs) - length(removeEqs))
+  for (i, eq) in enumerate(resEqs)
+    i in removeEqs && continue
+    local (newExp, _) = Util.traverseExpTopDown(eq.exp, _substituteFrozenState, frozenMap)
+    #= Constant-fold after substitution: `0.0 * x` and friends now reduce
+       to 0 so the residual becomes a clean `0 = -y - 0` form that the
+       next iteration can detect as a pin. =#
+    newExp = _foldNumericExp(newExp)
+    push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+  end
+
+  local newInitEqs = typeof(simCode.initialEquations)()
+  for initEq in simCode.initialEquations
+    if initEq isa BDAE.RESIDUAL_EQUATION
+      local (newExp, _) = Util.traverseExpTopDown(initEq.exp, _substituteFrozenState, frozenMap)
+      newExp = _foldNumericExp(newExp)
+      push!(newInitEqs, BDAE.RESIDUAL_EQUATION(newExp, initEq.source, initEq.attr))
+    elseif initEq isa BDAE.EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, _substituteFrozenState, frozenMap)
+      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, _substituteFrozenState, frozenMap)
+      newLhs = _foldNumericExp(newLhs)
+      newRhs = _foldNumericExp(newRhs)
+      push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
+    else
+      push!(newInitEqs, initEq)
+    end
+  end
+
+  local newHT = copy(ht)
+  for n in keys(frozenMap)
+    delete!(newHT, n)
+  end
+
+  #= Parallel arrays: variable order matches paired equation order. =#
+  local elimVarOrder = sort(collect(keys(frozenMap)))
+  local elimEqOrder  = BDAE.RESIDUAL_EQUATION[resEqs[frozenEqIdx[n]] for n in elimVarOrder]
+
+  @assign simCode.residualEquations     = newResEqs
+  @assign simCode.initialEquations      = newInitEqs
+  @assign simCode.stringToSimVarHT      = newHT
+  @assign simCode.irreductableVariables = filter(n -> !haskey(frozenMap, n), simCode.irreductableVariables)
+  append!(simCode.eliminatedVariables,  elimVarOrder)
+  append!(simCode.eliminatedEquations,  elimEqOrder)
+  return (simCode, length(frozenMap))
+end
+
+function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
+  local ht  = simCode.stringToSimVarHT
+  local res = simCode.residualEquations
+  local n_eqs  = length(res)
+  local n_vars = count(((_k, (_, sv)),) -> isUnknownVarKind(sv.varKind), ht)
+
+  if n_eqs <= n_vars
+    return simCode
+  end
+
+  local n_extra = n_eqs - n_vars
+  @info "[SIMCODE: $(simCode.name): removeRedundantEquations] over-determined by $n_extra equation(s); running maximum matching to find redundant equations"
+
+  #= Build incidence: eq_idx -> Set of unknown names that equation mentions =#
+  local surviving_unknowns = Set{String}(k for (k, (_, sv)) in pairs(ht) if isUnknownVarKind(sv.varKind))
+  local incidence = map(enumerate(res)) do (i, eq)
+    local names = Set{String}()
+    collectCrefNames!(names, eq.exp)
+    intersect(names, surviving_unknowns)
+  end
+
+  #= Augmenting-path maximum bipartite matching (equations -> unknowns).
+     var_to_eq[v] = equation currently assigned to unknown v.
+     eq_to_var[i] = unknown currently assigned to equation i ("" = unmatched). =#
+  local var_to_eq = Dict{String, Int}()
+  local eq_to_var = fill("", n_eqs)
+
+  function augment!(eq_idx::Int, seen::Set{Int})::Bool
+    for var in incidence[eq_idx]
+      eq_idx in seen && continue
+      push!(seen, eq_idx)
+      if !haskey(var_to_eq, var) || augment!(var_to_eq[var], seen)
+        var_to_eq[var] = eq_idx
+        eq_to_var[eq_idx] = var
+        return true
+      end
+    end
+    return false
+  end
+
+  map(i -> augment!(i, Set{Int}()), 1:n_eqs)
+
+  #= Equations with no assigned unknown are unmatched = redundant =#
+  local redundant = Int[i for i in 1:n_eqs if isempty(eq_to_var[i])]
+
+  if isempty(redundant)
+    @warn "[SIMCODE: $(simCode.name): removeRedundantEquations] over-determined but no unmatched equations found; leaving system unchanged"
+    return simCode
+  end
+
+  map(redundant) do i
+    local eqStr = try OMFrontend.Frontend.toString(res[i].exp) catch; string(res[i].exp) end
+    @info "[SIMCODE: $(simCode.name): removeRedundantEquations] removing redundant equation [$i]: 0 = $eqStr"
+  end
+
+  local redundant_set = Set{Int}(redundant)
+  local newRes = BDAE.RESIDUAL_EQUATION[res[i] for i in 1:n_eqs if i ∉ redundant_set]
+  @assign simCode.residualEquations = newRes
+  return simCode
 end

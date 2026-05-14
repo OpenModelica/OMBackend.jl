@@ -250,8 +250,19 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
                                                 SimulationCode.propagateConstants)
         simCode = SimulationCode.runSimCodePass("eliminateAliasVariables", simCode,
                                                 SimulationCode.eliminateAliasVariables)
+        simCode = SimulationCode.runSimCodePass("eliminateRHSEquivalentEquations", simCode,
+                                                SimulationCode.eliminateRHSEquivalentEquations)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRHSEquiv.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = SimulationCode.runSimCodePass("removeRedundantEquations", simCode,
+                                                SimulationCode.removeRedundantEquations)
         simCode = SimulationCode.runSimCodePass("eliminateConstantParameters", simCode,
                                                 SimulationCode.eliminateConstantParameters)
+        #= eliminateFrozenStates runs AFTER eliminateConstantParameters so that
+           parameter chains like `state = param` (param bound to a literal) are
+           already substituted to `state = literal` before we look for them. =#
+        simCode = SimulationCode.runSimCodePass("eliminateFrozenStates", simCode,
+                                                SimulationCode.eliminateFrozenStates)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFrozenStates.log"), SimulationCode.dumpSimCode(simCode))
         simCode = SimulationCode.runSimCodePass("pruneConstantConditions", simCode,
                                                 SimulationCode.pruneConstantConditions)
         if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
@@ -318,12 +329,24 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         simCode = SimulationCode.runSimCodePass("eliminateAliasVariables", simCode,
                                                 SimulationCode.eliminateAliasVariables)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterAliasElimination.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = SimulationCode.runSimCodePass("eliminateRHSEquivalentEquations", simCode,
+                                                SimulationCode.eliminateRHSEquivalentEquations)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRHSEquiv.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = SimulationCode.runSimCodePass("removeRedundantEquations", simCode,
+                                                SimulationCode.removeRedundantEquations)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRemoveRedundant.log"), SimulationCode.dumpSimCode(simCode))
         #= Constant-parameter elimination shrinks the parameter list MTK sees
            before structural_simplify. Tier-1 only: the pass internally skips
            VSS / DOCC / sub-model variants where a parameter could be re-bound
            at runtime. =#
         simCode = SimulationCode.runSimCodePass("eliminateConstantParameters", simCode,
                                                 SimulationCode.eliminateConstantParameters)
+        #= eliminateFrozenStates runs AFTER eliminateConstantParameters so that
+           parameter chains like `state = param` (param bound to a literal) are
+           already substituted to `state = literal` before detection. =#
+        simCode = SimulationCode.runSimCodePass("eliminateFrozenStates", simCode,
+                                                SimulationCode.eliminateFrozenStates)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFrozenStates.log"), SimulationCode.dumpSimCode(simCode))
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterEliminateConstParams.log"), SimulationCode.dumpSimCode(simCode))
         simCode = SimulationCode.runSimCodePass("classifyAdditionalDiscretes", simCode,
                                                 SimulationCode._classifyAdditionalDiscreteVariables)
