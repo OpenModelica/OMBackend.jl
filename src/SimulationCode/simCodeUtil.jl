@@ -3879,19 +3879,16 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
     end
   end
 
-  #= Sweep: drop entries where the var is PARAMETER(NONE) and unreferenced.
-     The broader PARAMETER(SOME(_)) case was tested and triggered a
-     UndefVarError on SimpleMechanicalSystem (a parameter referenced from
-     a Modelica function body in `simCode.functions`, which the reachability
-     scan above does not cover). Keep the narrow form. =#
+  #= Sweep: drop any PARAMETER entry (bound or unbound) that has zero
+     references on any of the live surfaces scanned above. =#
   local toDrop = String[]
   for (name, (_, sv)) in ht
     name in referenced && continue
-    local isUnboundParam = @match sv.varKind begin
-      PARAMETER(NONE()) => true
+    local isParam = @match sv.varKind begin
+      PARAMETER(__) => true
       _ => false
     end
-    isUnboundParam && push!(toDrop, name)
+    isParam && push!(toDrop, name)
   end
 
   isempty(toDrop) && return simCode

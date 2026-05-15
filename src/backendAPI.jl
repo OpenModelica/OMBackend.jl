@@ -349,17 +349,14 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         simCode = SimulationCode.runSimCodePass("eliminateFrozenStates", simCode,
                                                 SimulationCode.eliminateFrozenStates)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFrozenStates.log"), SimulationCode.dumpSimCode(simCode))
-        #= foldExplicitSingleAssign: disabled. The pass produced a net-negative
-           on every probe (multibody no-op due to sub-model guard; tear-style
-           folds compete with MTK's structural_simplify and produce LARGER
-           post-MTK equation sets on Engine1a; SimpleMechanicalSystem hit a
-           UndefVarError because the survivor-scan does not cover every
-           surface that may reference a folded name (Modelica function
-           bodies in `simCode.functions`, structural transitions, etc.).
-           Left in the source for future targeted use; not wired by default.
+        #= foldExplicitSingleAssign: generalised single-defining-equation tearing.
+           Substitutes `0 = v - rhs` where v is an unprotected ALG_VARIABLE
+           uniquely defined by that residual. Guards: skips sub-models /
+           metaModel / flatModel; skips bracketed (scalarized array) names;
+           skips names already in aliasMap. Post-substitution survivor-scan
+           aborts the fold if any folded name still appears anywhere. =#
         simCode = SimulationCode.runSimCodePass("foldExplicitSingleAssign", simCode,
                                                 SimulationCode.foldExplicitSingleAssign)
-        =#
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterExplicitFold.log"), SimulationCode.dumpSimCode(simCode))
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterEliminateConstParams.log"), SimulationCode.dumpSimCode(simCode))
         simCode = SimulationCode.runSimCodePass("classifyAdditionalDiscretes", simCode,
