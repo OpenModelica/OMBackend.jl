@@ -95,7 +95,7 @@ function Base.string(var::BDAE.VAR)::String
   return str + "\n"
 end
 
-function Base.string(varKind::BDAE.VarKind)::String
+Base.@nospecializeinfer function Base.string(@nospecialize(varKind::BDAE.VarKind))::String
   str = begin
     @match varKind begin
       BDAE.VARIABLE() =>  "VARIABLE"
@@ -296,7 +296,7 @@ end
    Converts a `DAE.ComponentRef` to a Julia string.
    TODO: Discuss separators. A different one should maybe be used..
 """
-function Base.string(cr::DAE.ComponentRef; separator=OMBackend.COMPONENT_SEPARATOR, printType = false)
+Base.@nospecializeinfer function Base.string(@nospecialize(cr::DAE.ComponentRef); separator=OMBackend.COMPONENT_SEPARATOR, printType = false)
   buf = IOBuffer()
   _writeCref(buf, cr, separator)
   if printType
@@ -321,7 +321,7 @@ function _writeSubscripts(buf::IOBuffer, subscriptLst)
   end
 end
 
-function _writeCref(buf::IOBuffer, cr::DAE.ComponentRef, sep::String)
+Base.@nospecializeinfer function _writeCref(buf::IOBuffer, @nospecialize(cr::DAE.ComponentRef), sep::String)
   @match cr begin
     DAE.CREF_QUAL(ident = ident, subscriptLst = subscriptLst, componentRef = cref) => begin
       print(buf, ident)

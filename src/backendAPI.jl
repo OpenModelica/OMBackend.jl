@@ -133,7 +133,7 @@ end
 
 """
   MTK Models that have been compiled one time.
-TODO: Optimaly we should keep the frontend structure
+TODO: Optimally we should keep the frontend structure
 in memory as well s.t we only recompile if the structure of the source file changes
 (Unless retranslation is forced).
 """
@@ -207,7 +207,7 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         debugWrite(logPath("backend/simCode", "frontend_initialModel.log"),
           replace(OMFrontend.Frontend.toFlatString(frontendDAE, fLst), "\\n" => "\n"))
       end
-      local bDAE = lower(frontendDAE)
+      local bDAE = @BACKEND_PERFLOG "[backendAPI] lower" lower(frontendDAE)
       local simCode
       if BackendMode == DAE_MODE
         error("DAE-mode is deprecated.")
@@ -273,7 +273,7 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         return _translationResult(generateDETargetCode(simCode), nameMap, returnNameMap)
       elseif BackendMode == MTK_MODE
         #@debug "Generate simulation code"
-        simCode = generateSimulationCode(bDAE; mode = MTK_MODE)
+        simCode = @BACKEND_PERFLOG "[backendAPI] generateSimulationCode" generateSimulationCode(bDAE; mode = MTK_MODE)
         (simCodeFunctions, externalRuntimeNeeded) = if functionList !== nothing
           generateSimCodeFunctions(functionList)
         else
@@ -341,12 +341,34 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
            at runtime. =#
         simCode = SimulationCode.runSimCodePass("eliminateConstantParameters", simCode,
                                                 SimulationCode.eliminateConstantParameters)
+        #= eliminateDeadParameters: disabled. The reachability scan does not
+           cover Modelica function bodies (simCode.functions) so a parameter
+           referenced only from a user-defined Modelica function gets dropped
+           and produces UndefVarError at codegen (observed on
+           SimpleMechanicalSystem where `tau_2` is PARAMETER(NONE) referenced
+           from a function body). Left in source for future use after the scan
+           is extended to cover function bodies.
+        simCode = SimulationCode.runSimCodePass("eliminateDeadParameters", simCode,
+                                                SimulationCode.eliminateDeadParameters)
+        =#
         #= eliminateFrozenStates runs AFTER eliminateConstantParameters so that
            parameter chains like `state = param` (param bound to a literal) are
            already substituted to `state = literal` before detection. =#
         simCode = SimulationCode.runSimCodePass("eliminateFrozenStates", simCode,
                                                 SimulationCode.eliminateFrozenStates)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFrozenStates.log"), SimulationCode.dumpSimCode(simCode))
+        #= foldExplicitSingleAssign: disabled. The pass produced a net-negative
+           on every probe (multibody no-op due to sub-model guard; tear-style
+           folds compete with MTK's structural_simplify and produce LARGER
+           post-MTK equation sets on Engine1a; SimpleMechanicalSystem hit a
+           UndefVarError because the survivor-scan does not cover every
+           surface that may reference a folded name (Modelica function
+           bodies in `simCode.functions`, structural transitions, etc.).
+           Left in the source for future targeted use; not wired by default.
+        simCode = SimulationCode.runSimCodePass("foldExplicitSingleAssign", simCode,
+                                                SimulationCode.foldExplicitSingleAssign)
+        =#
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterExplicitFold.log"), SimulationCode.dumpSimCode(simCode))
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterEliminateConstParams.log"), SimulationCode.dumpSimCode(simCode))
         simCode = SimulationCode.runSimCodePass("classifyAdditionalDiscretes", simCode,
                                                 SimulationCode._classifyAdditionalDiscreteVariables)
@@ -402,7 +424,8 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         SimulationCode.logSimCodePassMetrics("observedFilter", observedBefore, simCode, time() - observedT0)
         simCode = SimulationCode.cleanupTrivialResidualEquations(simCode; sourcePass = "observedFilter")
         _checkSimCodeBeforeCodegen(simCode, checkSimCode)
-        return _translationResult(generateMTKTargetCode(simCode), nameMap, returnNameMap)
+        local _mtkCode = @BACKEND_PERFLOG "[backendAPI] generateMTKTargetCode" generateMTKTargetCode(simCode)
+        return _translationResult(_mtkCode, nameMap, returnNameMap)
       else
         @error "Unsupported BackendMode: $BackendMode. Valid modes are: MTK_MODE, DEMode"
       end
@@ -543,7 +566,7 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
     #=
       Remove unused parameters and or constants.
       Important optimization for some systems.
-      TODO: also check bindings of all parameters before readding this call.
+      TODO: also check bindings of all parameters before re-adding this call.
     =#
     #bDAE = Causalize.detectUnusedParametersAndConstants(bDAE)
     #= Find and reclassify discrete variables not marked as discrete. =#
@@ -569,7 +592,7 @@ function generateSimulationCode(bDAE::BDAE.BACKEND_DAE;
 end
 
 """
-  Translates functions to simlulation code.
+  Translates functions to simulation code.
 """
 function generateSimCodeFunctions(functions::List{OMFrontend.Frontend.M_FUNCTION})
   local simCodeFunctions = SimulationCode.generateSimCodeFunctions(functions)
@@ -578,7 +601,7 @@ end
 
 """
   Generates code interfacing DifferentialEquations.jl
-  The resulting code is saved in a dictonary which contains functions that where simulated
+  The resulting code is saved in a dictionary which contains functions that were simulated
   this session. Returns the generated modelName and corresponding generated code
 """
 function generateTargetCode(simCode::SimulationCode.SIM_CODE)
@@ -592,7 +615,7 @@ end
 """
 `generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)`
   Generates code interfacing ModelingToolkit.jl
-  The resulting code is saved in a table which contains functions that where simulated
+  The resulting code is saved in a table which contains functions that were simulated
   this session. Returns the generated modelName and corresponding generated code
 """
 function generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)
@@ -727,7 +750,7 @@ function modelToString(modelName::String; MTK = true, keepComments = true, keepB
     local model::Expr
     model = getCompiledModel(modelName)
     strippedModel = "$model"
-    #= Remove all the redudant blocks from the model =#
+    #= Remove all the redundant blocks from the model =#
     if keepComments == false
       strippedModel = CodeGeneration.stripComments(model)
     end
@@ -778,7 +801,7 @@ end
                        solver = Rodas5(),
                        kwargs...)
   ```
-  Simulates model interactivly.
+  Simulates model interactively.
   The solver need to be passed with a : before the name, example:
   OMBackend.simulateModel(modelName, tspan = (0.0, 1.0), solver = :(Tsit5()));
 """

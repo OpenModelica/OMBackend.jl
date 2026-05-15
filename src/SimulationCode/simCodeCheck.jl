@@ -22,6 +22,7 @@ import DAE
 import ..SIM_CODE
 import ..STATE
 import ..STATE_DERIVATIVE
+import ..DISCRETE
 import ..DAE_identifierToString
 import ..isUnknownVarKind
 import ..BDAE
@@ -141,7 +142,7 @@ on each. Does not recurse — the visitor decides whether to recurse by calling
 back into `_walkExpChildren` (or a wrapper that does both). Centralizes the
 DAE.Exp tree shape so individual rules don't each maintain a parallel copy.
 """
-function _walkExpChildren(visit::Function, exp)
+Base.@nospecializeinfer function _walkExpChildren(visit::Function, @nospecialize(exp))
   @match exp begin
     DAE.BINARY(l, _, r)         => begin visit(l); visit(r) end
     DAE.UNARY(_, e)             => visit(e)
@@ -210,14 +211,27 @@ function rule_balanced(simCode::SIM_CODE)::Vector{CheckViolation}
   end
   local eliminated = Set(simCode.eliminatedVariables)
   local nUnknown = 0
+  local nDiscreteImplicit = 0
   for (_, (_, v)) in simCode.stringToSimVarHT
     v.name in eliminated && continue
     if !isUnknownVarKind(v.varKind) || v.varKind isa STATE_DERIVATIVE
       continue
     end
-    v.name in refNames && (nUnknown += 1)
+    if v.name in refNames
+      nUnknown += 1
+      #= Discrete variables with no when-equation (the rule short-circuits when
+         any whenEquations are present) carry an implicit `der(disc) = 0`
+         equation that MTK adds automatically. The residual list does not
+         contain it, so without this adjustment the balance check would
+         undercount equations and report a spurious mismatch for every
+         model that has a discrete variable driven only by an initial
+         equation (e.g. `IEQ2_DiscreteFromInitEq`). =#
+      if v.varKind isa DISCRETE
+        nDiscreteImplicit += 1
+      end
+    end
   end
-  local nEq = length(simCode.residualEquations)
+  local nEq = length(simCode.residualEquations) + nDiscreteImplicit
   if nUnknown != nEq
     push!(out, CheckViolation(:balanced, :error, simCode.name,
                               "unknowns=$(nUnknown) != equations=$(nEq)"))
@@ -233,7 +247,7 @@ function _countUnknowns(simCode::SIM_CODE)::Int
     if v.name in eliminated
       continue
     end
-    #= STATE_DERIVATIVE is bookkept but not independent, so it does not count
+    #= STATE_DERIVATIVE is tracked but not independent, so it does not count
        toward unknowns even though `isUnknownVarKind` returns true for it. =#
     if isUnknownVarKind(v.varKind) && !(v.varKind isa STATE_DERIVATIVE)
       n += 1
@@ -719,7 +733,7 @@ function rule_supported_exp(simCode::SIM_CODE)::Vector{CheckViolation}
 end
 push!(RULES, rule_supported_exp)
 
-function _flagUnsupportedExp!(out::Vector{CheckViolation}, exp, where::String)
+Base.@nospecializeinfer function _flagUnsupportedExp!(out::Vector{CheckViolation}, @nospecialize(exp), where::String)
   if !(typeof(exp) in SUPPORTED_EXP_TYPES)
     push!(out, CheckViolation(:supported_exp, :warn, where,
                               "unsupported DAE.Exp variant: $(typeof(exp))"))
@@ -740,7 +754,7 @@ codegen arms now fold these to `0` and the literal value respectively
 literal only reaches codegen when an upstream pass (typically
 `solveParametricInitialEquations` or `foldParameterClosure`) substituted
 a parameter cref with its default value before residual rewriting. That
-upstream behaviour is the real bug and this :warn keeps it visible.
+upstream behavior is the real bug and this :warn keeps it visible.
 """
 function rule_no_literal_in_der_pre(simCode::SIM_CODE)::Vector{CheckViolation}
   local out = CheckViolation[]

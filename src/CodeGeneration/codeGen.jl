@@ -14,6 +14,43 @@ TODO:
 const HEADER_STRING ="
   $(copyrightString())"
 
+#= Walk a DAE.Exp condition and collect the set of cref-name strings that
+   appear OUTSIDE any `change(...)` or `pre(...)` wrapper. Used by the
+   discrete-callback codegen so the auto-reset block (which zeroes
+   condition-triggers after firing — appropriate for `when boolVar then`)
+   does NOT zero observed inputs of `change(x)` / `pre(x)` (which are state
+   variables we're watching, not latched flags). =#
+Base.@nospecializeinfer function _collectBareCrefStrings(@nospecialize(cond))::Set{String}
+  local out = Set{String}()
+  local walk = function(e, insideObs)
+    if e isa DAE.CREF
+      insideObs || push!(out, string(e))
+      return
+    elseif e isa DAE.CALL
+      local nameStr = string(e.path)
+      local nestedObs = insideObs || nameStr == "change" || nameStr == "pre"
+      for arg in e.expLst
+        walk(arg, nestedObs)
+      end
+    elseif e isa DAE.BINARY
+      walk(e.exp1, insideObs); walk(e.exp2, insideObs)
+    elseif e isa DAE.LBINARY
+      walk(e.exp1, insideObs); walk(e.exp2, insideObs)
+    elseif e isa DAE.RELATION
+      walk(e.exp1, insideObs); walk(e.exp2, insideObs)
+    elseif e isa DAE.UNARY
+      walk(e.exp, insideObs)
+    elseif e isa DAE.LUNARY
+      walk(e.exp, insideObs)
+    elseif e isa DAE.IFEXP
+      walk(e.expCond, insideObs); walk(e.expThen, insideObs); walk(e.expElse, insideObs)
+    end
+    return
+  end
+  walk(cond, false)
+  return out
+end
+
 #= To keep track of generated callbacks. =#
 let CALLBACKS = 0
   global function ADD_CALLBACK()
@@ -61,7 +98,7 @@ function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = tru
   quote
     $(SAVED_VALUES_DECL)
     function $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
-      #= These are the location of the parameters and auxilary real variables respectivly =#
+      #= These are the locations of the parameters and auxiliary real variables respectively =#
       local p = aux[1]
       local reals = aux[2]
       local reducedSystem = aux[3]
@@ -158,8 +195,8 @@ end
 
 
 """
-  This functions creates the update equations for the auxilary variables.
-  The set of auxilary variables is the set of variables of other types than state variables.
+  This function creates the update equations for the auxiliary variables.
+  The set of auxiliary variables is the set of variables of other types than state variables.
   That is booleans integers and algebraic variables.
 TODO:
   Currently only being done for the algebraic variables.
@@ -378,11 +415,19 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
             if _condCache[] === nothing
               local xs = $(map(x -> Symbol(string(x)), filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))))
               local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
-              if !isempty(xs) && all(isnothing, indices)
+              local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+              local paramIdxs = indexin(xs, params)
+              #= Short-circuit only when NONE of the non-time crefs resolve to
+                 either a state or a parameter — i.e. the cref is genuinely
+                 unknown and the condition cannot be evaluated. A cref that
+                 lives in `params` (e.g. `x_table_t[1]` in
+                 `when time >= x_table_t[1]`) is perfectly fine to read via
+                 the param lookup table, so the callback should still run. =#
+              if !isempty(xs) && all(isnothing, indices) && all(isnothing, paramIdxs)
+                @debug "[CB-CC$($(callbacks)) cond] NO_TRIGGER (no state/param mapping)" t xs
                 return NO_TRIGGER
               end
               lookuptableStates = Dict((xs) .=> indices)
-              local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
               lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
               _condCache[] = (lookuptableStates, lookuptableParams)
             else
@@ -394,7 +439,9 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
                             Symbol(string(x)),
                             getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
                   Util.getAllCrefs(cond))...)
-            $(expToJuliaExpMTK(cond, simCode))
+            local _result = $(expToJuliaExpMTK(cond, simCode))
+            @debug "[CB-CC$($(callbacks)) cond] eval" t value=_result
+            _result
           end
         end
       end
@@ -404,6 +451,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
           $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
             local t = integrator.t + integrator.dt
             local x = integrator.u
+            @debug "[CB-CC$($(callbacks)) affect] firing" t=integrator.t
             local lookuptableStates
             local lookuptableParams
             if _affCache[] === nothing
@@ -426,6 +474,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
               fail()
             end
             $(whenStatementsMTK...)
+            @debug "[CB-CC$($(callbacks)) affect] done" t=integrator.t u=copy(integrator.u)
           end
         end
       end
@@ -474,9 +523,17 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
        callback path (above) which uses getStatesAsSymbols + lookuptable. =#
     whenStatementsMTKDiscrete = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
     local condCrefs = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
+    #= Crefs that appear inside `change(...)` or `pre(...)` are OBSERVED, not
+       latched boolean triggers — they must not be reset after the callback
+       fires (e.g. INV3S-class algorithms whose synthesised condition is
+       `change(iNV3S_enable)` would otherwise zero the Logic-enum input on
+       every event). Build the bare-cref set so condReset only touches
+       standalone Boolean triggers, the original use case. =#
+    local _bareCrefStrs = _collectBareCrefStrings(cond)
     #= Build condition-reset expressions: set each state cref in the condition to false =#
     local condResetExprs = map(condCrefs) do c
       local cStr = string(c)
+      cStr in _bareCrefStrs || return :()
       local entry = get(simCode.stringToSimVarHT, cStr, nothing)
       if entry !== nothing && !SimulationCode.isParameter(entry[2])
         local sym = Symbol(cStr)
@@ -495,6 +552,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
             local xs = $(map(c -> Symbol(string(c)), condCrefs))
             local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
             if !isempty(xs) && all(isnothing, indices)
+              @debug "[CB-DC$($(callbacks)) cond] false (no state mapping)" t xs
               return false
             end
             lookuptableStates = Dict((xs) .=> indices)
@@ -510,7 +568,9 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
                           Symbol(string(x)),
                           getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
                 Util.getAllCrefs(cond))...)
-          $(expToJuliaBoolMTK(wEq.condition, simCode))
+          local _result = $(expToJuliaBoolMTK(wEq.condition, simCode))
+          @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
+          _result
         end
       end
       let _affCache = Ref{Any}(nothing)
@@ -518,6 +578,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
         $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
           local t = integrator.t
           local x = integrator.u
+          @debug "[CB-DC$($(callbacks)) affect] firing" t=integrator.t
           local lookuptableStates
           local lookuptableParams
           if _affCache[] === nothing
@@ -539,6 +600,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
           auto_dt_reset!(integrator)
           add_tstop!(integrator, integrator.t + 1E-12)
           $(condResetExprs...)
+          @debug "[CB-DC$($(callbacks)) affect] done" t=integrator.t u=copy(integrator.u)
         end
       end
       $(Symbol("cb$(callbacks)")) = DiscreteCallback($(Symbol("condition$(callbacks)")),

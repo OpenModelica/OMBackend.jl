@@ -184,12 +184,12 @@ createNewU0(symsOfOldProblem::Vector{Symbol},
 ```
   This function maps variables between two models during a structural change with recompilation.
   It returns a new vector of u₀ variables to initialize the new model.
-  We do so by assigning the old values when the structural change occured for all variables
-  that occured in the model before the structural change.
+  We do so by assigning the old values when the structural change occurred for all variables
+  that occurred in the model before the structural change.
 TODO:
 Remove the special case.
-The reason for it is in some example the containing model changes name wheras in others it does not.
-Furthermore, the way indices are handled need to be fixed since the index after reduction in MTK is not the same as
+The reason for it is in some examples the containing model changes name whereas in others it does not.
+Furthermore, the way indices are handled needs to be fixed since the index after reduction in MTK is not the same as
 the index in the simulation code stage of the backend.
 For now we return the array for the special case with dynamic overconstrained connectors.
 """
@@ -488,8 +488,8 @@ function getVariableEqDepedenceViaIdx(idx::Int, system)
     =#
     if first(indexin([vars[idx]], equationDep)) !== nothing
       #=
-      In this case we know that this equation is a depedency of the supplied variable.
-      Add this equation as a possible depdency to totalDependencies
+      In this case we know that this equation is a dependency of the supplied variable.
+      Add this equation as a possible dependency to totalDependencies
       =#
       push!(totalDependencies, equationIndex)
     end

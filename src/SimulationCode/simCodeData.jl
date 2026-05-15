@@ -48,7 +48,7 @@ end
 
 """
   A Data structure type.
-  Currently this type represents complex datastrutures such as matrices
+  Currently this type represents complex data structures such as matrices
   or pointers to data structures in memory.
 """
 struct DATA_STRUCTURE <: SimVarType
@@ -165,7 +165,7 @@ struct EXPLICIT_STRUCTURAL_TRANSISTION <: StructuralTransition
 end
 
 """
-  Represents a structural transistion where a change of a parameter in the metamodel results in a new model.
+  Represents a structural transition where a change of a parameter in the metamodel results in a new model.
 """
 struct IMPLICIT_STRUCTURAL_TRANSISTION <: StructuralTransition
   structuralWhenEquation::BDAE.STRUCTURAL_WHEN_EQUATION
@@ -183,7 +183,7 @@ are removed from the system before MTK code generation.
 
 When passed to `OM.translate` or `OM.simulate` via the `eliminateNonDynamic` keyword,
 variables that do not influence the dynamic states are removed, reducing ODEProblem
-compilation time. The eliminated equations are bookkept in the SIM_CODE for later
+compilation time. The eliminated equations are tracked in the SIM_CODE for later
 reconstruction (e.g., 3D visualization).
 
 # Fields
@@ -274,13 +274,13 @@ struct SIM_CODE{T0<:String,
   matchOrder::T7
     "
     The merged graph. E.g digraph constructed from matching info.
-    The indicies are the same as above and they are shared.
+    The indices are the same as above and they are shared.
     If the system is singular tearing is needed.
    "
   equationGraph::T8
   " The reverse topological sort of the equation-graph "
   stronglyConnectedComponents::T9
-  "Contains all structural transistions"
+  "Contains all structural transitions"
   structuralTransitions::T10
   "Structural submodels"
   subModels::T11
@@ -302,7 +302,7 @@ struct SIM_CODE{T0<:String,
   functions::Vector{ModelicaFunction}
   "Specify if an external Modelica runtime is needed or not. Used for build in functions"
   externalRuntime::Bool
-  "Equations eliminated by non-dynamic variable elimination (bookkept for later reconstruction)"
+  "Equations eliminated by non-dynamic variable elimination (tracked for later reconstruction)"
   eliminatedEquations::Vector{BDAE.RESIDUAL_EQUATION}
   "Names of variables eliminated by non-dynamic variable elimination"
   eliminatedVariables::Vector{String}

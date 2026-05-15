@@ -358,7 +358,7 @@ function createStructuralAssignment(simCode, simCodeStructuralTransition::Simula
 end
 
 """
-  Creates a structural assignment for an implicit structural transisiton.
+  Creates a structural assignment for an implicit structural transition.
   These are numbered from 1->N
 """
 function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION, idx::Int)
@@ -420,7 +420,7 @@ end
 
 """
   Generates statements for the structural when equation construct.
-  This function returns a tuple where the first part is a vector of statements occuring in the when equation.
+  This function returns a tuple where the first part is a vector of statements occurring in the when equation.
   The second part is the recompilation statement itself that specifies what structural changes are to occur.
   This last part is then used by the runtime to just-in-time compile the model when the event occurs.
 """

@@ -150,12 +150,60 @@ function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode)
         expToJuliaExpMTK(cond, simCode)
       end
     end
+    #= Modelica `change(x)` ≡ `pre(x) != x`. Used as a trigger condition in
+       discrete callbacks synthesised from non-when algorithm bodies whose
+       LHS is discrete-time. The DiscreteCallback environment exposes the
+       previous step's state vector as `integrator.uprev` and the current
+       one as `x` (via the cache lookup the surrounding affect generator
+       builds), so the runtime test is a straightforward index comparison. =#
+    DAE.CALL(Absyn.IDENT("change"), lst, _) => begin
+      local innerArgs = collect(lst)
+      if length(innerArgs) == 1
+        local curr = expToJuliaBoolMTK(innerArgs[1], simCode)
+        local prev = _preValueLookup(innerArgs[1], simCode)
+        :(($(curr)) != ($(prev)))
+      else
+        expToJuliaExpMTK(cond, simCode)
+      end
+    end
+    #= `initial()` is true exactly during the initialisation phase. The
+       DiscreteCallback we use for synthesised when-equations does not run
+       during MTK's InitializationProblem — the body's init-pass fires
+       through the `__runInitialAlgorithm!` path the BDAECreate lifter sets
+       up. So `initial()` as a runtime check is always false here. =#
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => :(false)
     _ => expToJuliaExpMTK(cond, simCode)
   end
 end
 
+#= Compile-time helper: emit the Julia expression that reads the previous
+   value of a CREF from the discrete callback's `integrator.uprev` /
+   parameter table. Falls back to `expToJuliaExpMTK` (which gives the
+   current-value lookup) for non-CREF arguments — `pre(constant)` and
+   `pre(parameter)` are the same as the current value. =#
+function _preValueLookup(@nospecialize(arg::DAE.Exp), simCode)
+  @match arg begin
+    DAE.CREF(componentRef = cr) => begin
+      local crefStr = string(arg)
+      local ht = simCode.stringToSimVarHT
+      if !haskey(ht, crefStr)
+        return expToJuliaExpMTK(arg, simCode)
+      end
+      local (_, sv) = ht[crefStr]
+      if SimulationCode.isParameter(sv)
+        return expToJuliaExpMTK(arg, simCode)
+      end
+      #= States and discretes both live on the integrator's state vector;
+         the surrounding callback codegen has populated `lookuptableStates`
+         with `Symbol(name) => index`. =#
+      :(integrator.uprev[lookuptableStates[Symbol($(string(sv.name)))]])
+    end
+    _ => expToJuliaExpMTK(arg, simCode)
+  end
+end
+
 """
-Transforms a DAE Condition into a MTK continous condition.
+Transforms a DAE Condition into a MTK continuous condition.
 """
 function transformToMTKContinousCondition(cond, simCode)
   res = @match cond begin
@@ -222,7 +270,7 @@ function transformToMTKContinousCondition(cond, simCode)
 end
 
 """
-Transforms a DAE Condition into a MTK continous condition equation.
+Transforms a DAE Condition into a MTK continuous condition equation.
 """
 function transformToMTKContinousConditionEquation(cond, simCode)
   res = @match cond begin
@@ -307,7 +355,7 @@ end
 """
  Convert DAE.Exp into a Julia string.
 """
-function expToJL(exp::DAE.Exp, simCode::SimulationCode.SIM_CODE; varPrefix="x")::String
+Base.@nospecializeinfer function expToJL(@nospecialize(exp::DAE.Exp), simCode::SimulationCode.SIM_CODE; varPrefix="x")::String
   hashTable = simCode.stringToSimVarHT
   str = begin
     local int::ModelicaInteger
@@ -344,7 +392,7 @@ function expToJL(exp::DAE.Exp, simCode::SimulationCode.SIM_CODE; varPrefix="x"):
             SimulationCode.ALG_VARIABLE(__) => "$varPrefix[$(indexAndVar[1])] #= $varName =#"
             SimulationCode.STATE_DERIVATIVE(__) => "dx[$(indexAndVar[1])] #= der($varName) =#"
           end
-        else #= Currently only time is a builtin variabe. Time is represented as t in the generated code =#
+        else #= Currently only time is a builtin variable. Time is represented as t in the generated code =#
           "t"
         end
       end
@@ -370,7 +418,7 @@ function expToJL(exp::DAE.Exp, simCode::SimulationCode.SIM_CODE; varPrefix="x"):
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = expl)  => begin
         #=
           TODO: Keeping it simple for now, we assume we only have one argument in the call
-          We handle derivitives seperatly
+          We handle derivatives separately
         =#
         varName = SimulationCode.DAE_identifierToString(listHead(expl))
         (index, type) = hashTable[varName]
@@ -447,7 +495,7 @@ end
 
 "
   TODO: Keeping it simple for now, we assume we only have one argument in the call
-  We handle derivitives seperatly
+  We handle derivatives separately
 "
 function DAECallExpressionToJuliaCallExpression(pathStr::String, expLst::List, simCode, ht; varPrefix=varPrefix)::Expr
   @match pathStr begin
@@ -759,7 +807,7 @@ function arrayToSymbolicVariable(arrayRepr::Expr)::Expr
 end
 
 """
- Removes all redudant blocks from a generated expression
+ Removes all redundant blocks from a generated expression
 """
 function stripBeginBlocks(e)::Expr
   _iterativePostwalk(MacroTools.unblock, e)
@@ -832,7 +880,7 @@ function getVariablesInDAE_Exp(@nospecialize(exp::DAE.Exp), simCode::SimulationC
   local expl::List{DAE.Exp}
   local lstexpl::List{List{DAE.Exp}}
   @match exp begin
-    #= These are not varaiables, so we simply return what we have collected thus far. =#
+    #= These are not variables, so we simply return what we have collected thus far. =#
     DAE.BCONST(bool) => variables
     DAE.ICONST(int) => variables
     DAE.RCONST(real) => variables
@@ -938,7 +986,7 @@ Detects:
 Used to decide whether to emit `ifelse(cond, then, else)` (works for any type)
 or the MTK-friendlier arithmetic form (Real only).
 """
-function _ifexpBranchIsNonReal(e::DAE.Exp)::Bool
+Base.@nospecializeinfer function _ifexpBranchIsNonReal(@nospecialize(e::DAE.Exp))::Bool
   @match e begin
     DAE.SCONST(_) => true
     DAE.CREF(_, ty) => ty isa DAE.T_STRING
@@ -1477,7 +1525,20 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
              structural-simplify treats the whole lookup as a black box. =#
           local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
           local _isArrayLiteral = (innerExp isa DAE.ARRAY)
-          if _isArrayLiteral
+          #= Detect a CREF into a constant `DATA_STRUCTURE` table (e.g.
+             `Modelica.Electrical.Digital`'s `Buf3sTable[strength,
+             UX01Conv[enable], UX01Conv[NotTable[x]]]`). Those are flattened
+             as module-level `Matrix{Int}` constants; with Symbolic Num
+             indices the plain `arr[i,j]` form throws
+             `ArgumentError: invalid index ... of type SymbolicUtils.BasicSymbolicImpl`.
+             Routing through `constTableLookup` works for both numeric and
+             symbolic indices. =#
+          local _isConstTableCref = (innerExp isa DAE.CREF) && let
+            local _crefName = SimulationCode.DAE_identifierToString(innerExp.componentRef)
+            haskey(hashTable, _crefName) &&
+              hashTable[_crefName][2].varKind isa SimulationCode.DATA_STRUCTURE
+          end
+          if _isArrayLiteral || _isConstTableCref
             quote
               OMBackend.CodeGeneration.constTableLookup($(innerCode), $(subExprs...))
             end
@@ -1489,6 +1550,11 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
               $(innerCode)[$(first(subExprs))]
             end
           else
+            #= Multi-dim non-literal non-const-table-CREF with symbolic indices.
+               This shape is rare and most likely a bug upstream — we have no
+               way to dispatch to a Symbolic-aware Matrix indexer without a
+               concrete table to look at. Keep the plain form so the runtime
+               error points at the offending expression. =#
             quote
               $(innerCode)[$(subExprs...)]
             end
@@ -1901,7 +1967,7 @@ end
 
 """
   If the system needs to conduct index reduction make sure to inform MTK.
-(We avoid structurally simplify for now since that might interfer with some other algorithms)
+(We avoid structural simplification for now since that might interfere with some other algorithms)
 """
 function performStructuralSimplify(simplify; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
                                    split::Bool = !OMBackend.DIRECT_RHS_GENERATION[])::Expr
@@ -2081,7 +2147,7 @@ function _whenStmtLstTargets(stmtLst, targetName::String)::Bool
 end
 
 """
-  This functions evaluate a single DAE-constant:{Bool, Integer, Real, String}.
+  This function evaluates a single DAE-constant:{Bool, Integer, Real, String}.
   If the argument  to this function is not a constant it throws an error.
 """
 function evalDAEConstant(daeConstant::DAE.Exp, simCode)
@@ -2199,7 +2265,7 @@ Return (lhs, rhs) for any BDAE equation shape.
 
 - `BDAE.EQUATION`           has `.lhs` / `.rhs`
 - `BDAE.COMPLEX_EQUATION`   has `.left` / `.right`   (record-to-record equality)
-- `BDAE.ARRAY_EQUATION`     has `.left` / `.right`   (pre-scalarised array equality)
+- `BDAE.ARRAY_EQUATION`     has `.left` / `.right`   (pre-scalarized array equality)
 - `BDAE.RESIDUAL_EQUATION`  has `.exp`, already in LHS−RHS=0 form → return `(eq.exp, RCONST(0.0))`
 
 Any other shape throws; the caller should have screened those out.
@@ -2617,7 +2683,7 @@ function _substituteExprValues(expr, valMap::Dict{Symbol, Float64})
 end
 
 """
-  Generates an if-expression equation and add it to the continous part of the system.
+  Generates an if-expression equation and add it to the continuous part of the system.
 Assume single equations in each if-branch for now.
 An assertion error should have been thrown earlier before reaching this function.
 

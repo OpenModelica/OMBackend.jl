@@ -27,7 +27,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE  S
 This file contains "hacks".
 This is done in order to get the equations on a MTK compatible format before calling functions such as structurally simplify.
 TODO:
-!Adjust the uncessary string conversions!
+!Adjust the unnecessary string conversions!
 =#
 
 
@@ -1154,7 +1154,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
   local softInitialValues = Pair{Any, Any}[pair for pair in finalInitialValues
                                            if !(string(pair.first) in diffStateStrSet)]
   #= When a DAE has only algebraic vars with explicit starts and no differential
-     state has one, pin the algebraic starts as hard u0. MTK's DAE initialiser
+     state has one, pin the algebraic starts as hard u0. MTK's DAE initializer
      then has a well-determined system (algebraic-pin + residuals) and converges
      to the correct root for differential states (e.g. Pendulum: x,y pinned at 10
      forces phi = 3π/4 via x=L*sin(phi), y=-L*cos(phi)). Soft guesses alone are
@@ -1430,11 +1430,11 @@ end
 
 """
   TODO:
-  Document why some parts here are outcommented
-  The irreductable variables scheme does not work using plain simplify.
+  Document why some parts here are commented out
+  The irreducible variables scheme does not work using plain simplify.
 
-  It should be noted that for some models both running tearing and structurally simplify is needed.
-  Report and issue for the MTK reporters giving an example of this behavior.
+  It should be noted that for some models both running tearing and structural simplification are needed.
+  Report an issue for the MTK reporters giving an example of this behavior.
 
   One example is running tearing twice broke the system
 """
@@ -1540,7 +1540,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   end
 
   local useSplit = get(kwargs, :split, true)
-  if OMBackend.ENABLE_BACKEND_LOGGING
+  if OMBackend.BACKEND_LOGGING[]
     local _ss_timed = @timed ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
     sys = _ss_timed.value
     @debug "[MTK GEN: simplify] structural_simplify took $(_ss_timed.time)s, $(round(_ss_timed.bytes / 1e9, digits=2)) GiB"

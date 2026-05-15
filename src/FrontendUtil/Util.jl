@@ -11,12 +11,12 @@ const Argument = Any
 """
   Traverses an expression top down.
   The traversal function is expected to be on the following format
-  function <name>(exp, dictonary).
+  function <name>(exp, dictionary).
   The function is expected to return a tuple of three elements.
   The first returning an expression, the second returning a boolean indicating if the traversal should continue
   and the last is the out argument.
 """
-function traverseExpTopDown(inExp::DAE.Exp, func::Function, ext_arg::Type_a)::Tuple{DAE.Exp, Type_a}
+Base.@nospecializeinfer function traverseExpTopDown(@nospecialize(inExp::DAE.Exp), func::Function, ext_arg::Type_a)::Tuple{DAE.Exp, Type_a}
   local outArg::Type_a
   local outExp::DAE.Exp
   local cont::Bool
@@ -25,7 +25,7 @@ function traverseExpTopDown(inExp::DAE.Exp, func::Function, ext_arg::Type_a)::Tu
   (outExp, outArg)
 end
 
-function traverseExpTopDown1(continueTraversal::Bool, inExp::DAE.Exp, func::Function, inArg::Type_a) ::Tuple{DAE.Exp, Type_a}
+Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @nospecialize(inExp::DAE.Exp), func::Function, inArg::Type_a) ::Tuple{DAE.Exp, Type_a}
   local outArg
   local outExp::DAE.Exp
   (outExp, outArg) = begin
@@ -381,7 +381,7 @@ function traverseReductionIteratorsTopDown(riters::DAE.ReductionIterators, func:
   return (list(outIters...), outArg)
 end
 
-function traverseExpTopDownCrefHelper(inCref::DAE.ComponentRef, rel::Function, iarg::Argument) ::Tuple{DAE.ComponentRef, Argument}
+Base.@nospecializeinfer function traverseExpTopDownCrefHelper(@nospecialize(inCref::DAE.ComponentRef), rel::Function, iarg::Argument) ::Tuple{DAE.ComponentRef, Argument}
   local outArg::Argument
   local outCref::DAE.ComponentRef
   (outCref, outArg) = begin
@@ -507,7 +507,7 @@ end
   NOTE: The user-provided function is not allowed to fail! If you want to
   detect a failure, return NONE() in your user-provided datatype.
 """
-function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  where {T}
+Base.@nospecializeinfer function traverseExpBottomUp(@nospecialize(inExp::DAE.Exp), inFunc::Function, inExtArg::T)  where {T}
   local outExtArg::T
   local outExp::DAE.Exp
   (outExp, outExtArg) = begin

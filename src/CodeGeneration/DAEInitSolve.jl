@@ -54,7 +54,7 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
      loops (PersonalityAspects, multibody overconstrained connectors) are
      not consistent with all fixed=true starts simultaneously and need the
      solver to relax pins to find any consistent root. Pre-pinned-fix
-     behaviour. Reach here only when both unpinned phases failed. =#
+     behavior. Reach here only when both unpinned phases failed. =#
   local all_idx = collect(1:n)
   local phase3_ok = _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, all_idx;
                                     targets=eq_target, maxiter=maxiter, tol=tol)

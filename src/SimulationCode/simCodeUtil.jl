@@ -72,7 +72,11 @@ function logSimCodePassMetrics(passName::AbstractString,
     return nothing
   end
   local label = isempty(modelName) ? passName : Base.string(modelName, ": ", passName)
-  @debug "[SIMCODE: $label] metrics" elapsed_ms=round(1000 * elapsed_s, digits = 3) residuals=_metricDelta(before.residualEquations, after.residualEquations) initial=_metricDelta(before.initialEquations, after.initialEquations) ifEquations=_metricDelta(before.ifEquations, after.ifEquations) ifBranches=_metricDelta(before.ifBranches, after.ifBranches) conditionalResiduals=_metricDelta(before.conditionalResidualEquations, after.conditionalResidualEquations) variables=_metricDelta(before.variables, after.variables) unknowns=_metricDelta(before.unknowns, after.unknowns) parameters=_metricDelta(before.parameters, after.parameters) aliases=_metricDelta(before.aliases, after.aliases) eliminatedVariables=_metricDelta(before.eliminatedVariables, after.eliminatedVariables)
+  if OMBackend.BACKEND_PERFLOG[]
+    @info "[SIMCODE: $label] metrics" elapsed_ms=round(1000 * elapsed_s, digits = 3) residuals=_metricDelta(before.residualEquations, after.residualEquations) initial=_metricDelta(before.initialEquations, after.initialEquations) ifEquations=_metricDelta(before.ifEquations, after.ifEquations) ifBranches=_metricDelta(before.ifBranches, after.ifBranches) conditionalResiduals=_metricDelta(before.conditionalResidualEquations, after.conditionalResidualEquations) variables=_metricDelta(before.variables, after.variables) unknowns=_metricDelta(before.unknowns, after.unknowns) parameters=_metricDelta(before.parameters, after.parameters) aliases=_metricDelta(before.aliases, after.aliases) eliminatedVariables=_metricDelta(before.eliminatedVariables, after.eliminatedVariables)
+  else
+    @debug "[SIMCODE: $label] metrics" elapsed_ms=round(1000 * elapsed_s, digits = 3) residuals=_metricDelta(before.residualEquations, after.residualEquations) initial=_metricDelta(before.initialEquations, after.initialEquations) ifEquations=_metricDelta(before.ifEquations, after.ifEquations) ifBranches=_metricDelta(before.ifBranches, after.ifBranches) conditionalResiduals=_metricDelta(before.conditionalResidualEquations, after.conditionalResidualEquations) variables=_metricDelta(before.variables, after.variables) unknowns=_metricDelta(before.unknowns, after.unknowns) parameters=_metricDelta(before.parameters, after.parameters) aliases=_metricDelta(before.aliases, after.aliases) eliminatedVariables=_metricDelta(before.eliminatedVariables, after.eliminatedVariables)
+  end
   return nothing
 end
 
@@ -246,7 +250,7 @@ end
 """
 input digraph
 input variablesHT
-  cref -> variable information dictonary.
+  cref -> variable information dictionary.
 output
   An array of labels for a directed graph g.
 """
@@ -306,7 +310,7 @@ end
 
 """
 Author: John & Andreas
-   This functions create and assigns indices for variables
+   This function creates and assigns indices for variables
    Thus Construct the table that maps variable name to the actual variable.
 It executes the following steps:
 1. Collect all variables
@@ -315,7 +319,7 @@ It executes the following steps:
 4. Parameters will get own set of indices, starting at 1.
 5. Discrete shares the index with the states and starts at #states + 1
 6. OCC Variables also shares the indices with the states and starts at #discretes + 1
-7. Datastructure variables, are only allowed as parameters and or constants. They share the index with the parameters.
+7. Data structure variables are only allowed as parameters and/or constants. They share the index with the parameters.
 The index of discretes and occ is updated after the state index is calculated.
 """
 function createIndices(simulationVars::Vector{SimulationCode.SIMVAR})::OrderedDict{String, Tuple{Integer, SimulationCode.SimVar}}
@@ -404,7 +408,7 @@ end
 
 """
   Given a set of residual equations, a set of if-equations and the set of all backend variables.
-  This function creates a bidrectional graph between these equations and the supplied variables.
+  This function creates a bidirectional graph between these equations and the supplied variables.
   (Note: If we need to do index reduction there might be empty equations here).
 """
 function createEquationVariableBidirectionGraph(equations::Vector{BDAE.RESIDUAL_EQUATION},
@@ -463,8 +467,8 @@ function createEquationVariableBidirectionGraph(equations::Vector{BDAE.RESIDUAL_
     <equations>
   end when;
   Currently this construct breaks the compiler.
-  I should investigat how to go about it.
-  For now lets merge in the equations in an initial-when equation as ordinary equations. =#
+  I should investigate how to go about it.
+  For now let's merge in the equations in an initial-when equation as ordinary equations. =#
   for weq in whenEquations
     @match weq begin
       BDAE.WHEN_EQUATION(_, BDAE.WHEN_STMTS(DAE.CALL(Absyn.IDENT("initial"), _, _), whenStmtLst, ewp), source, attr) => begin
@@ -529,7 +533,7 @@ function createEquationVariableBidirectionGraph(equations::RES_T,
 end
 
 """
-  Given a set of variables and a dictonary that maps the component reference
+  Given a set of variables and a dictionary that maps the component reference
   to some simulation code variable.
 This function returns the indices of these variables.
 *NOTE*:
@@ -562,7 +566,7 @@ function getIndiciesOfVariables(variables,
 end
 
 """
-  Returns the residual equation a specfic variable is solved in.
+  Returns the residual equation a specific variable is solved in.
   We search for this equation among the residuals in the context.
   The context should be either the top level simcode or a specific branch of some if equation.
 """
@@ -630,7 +634,7 @@ function getOCCGraph(flatModel)
 end
 
 """
- Convert the component references to the backend representation and create an adjecency list representation.
+ Convert the component references to the backend representation and create an adjacency list representation.
 """
 function createSearchGraph(allEdges)
   local edgeSet = Dict()
@@ -671,7 +675,7 @@ function convertFlatEdgeToEdges(connections)
 end
 
 """
- This function returns true if a backend variable is in the set of of overconstrained connector variables (occVariables).
+ This function returns true if a backend variable is in the set of overconstrained connector variables (occVariables).
 
 TODO: the name of the theta variable is hardcoded for now
 Note that this function must be called before sorting.
@@ -683,10 +687,10 @@ function isOverconstrainedConnectorVariable(simVarName::String, occVariables::Ve
 end
 
 """
-  Get all variables that should be marked as irreductable.
+  Get all variables that should be marked as irreducible.
 OBS:
 Parameters are never added to this list.
-The known irreductables should be state variables and variables directly involved in changes that change the model structure.
+The known irreducibles should be state variables and variables directly involved in changes that change the model structure.
 """
 function getIrreductableVars(ifEquations::Vector{BDAE.IF_EQUATION},
                              whenEqs::Vector{BDAE.WHEN_EQUATION},
@@ -698,24 +702,24 @@ function getIrreductableVars(ifEquations::Vector{BDAE.IF_EQUATION},
     push!(irreductables, variablesForEq)
   end
   #=
-    Parameters should not be marked as irreductable
+    Parameters should not be marked as irreducible
     Remove them from the list
   =#
   local knownIrreductables::Vector{BDAE.VAR} = filter((v) -> BDAEUtil.isState(v) , algebraicAndStateVariables)
-  #@debug "Adding all states as irreductable variables" map(x->string(x.varName), knownIrreductables)
+  #@debug "Adding all states as irreducible variables" map(x->string(x.varName), knownIrreductables)
   push!(irreductables, map(x->BDAE_identifierToVarString(x), knownIrreductables))
   irreductables = collect(Iterators.flatten(irreductables))
   irreductables = filter(irv -> !(irv != "time" && isParameter(last(ht[irv]))), irreductables)
-  #TODO: Fix the dection, s.t variables critical to when equations are not removed
+  #TODO: Fix the detection, s.t variables critical to when equations are not removed
   #for eq in whenEqs
     # variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
     # push!(variablesForEq, irreductables)
   #end
-  #= Add known irreductables to the vector =#
+  #= Add known irreducibles to the vector =#
   #push!(irreductables, map(x->x.varName, string(knownIrreductables)))
   local irreductablesAsStr = map(x -> string(x), irreductables)
   #=
-  If THETA exists, treat it as a irreductable variable
+  If THETA exists, treat it as an irreducible variable
   Currently, theta is a variable with "_THETA" in the variable name.
   This is subject to change
   =#
@@ -1275,8 +1279,8 @@ function _pruneIfEquation(ifEq::IF_EQUATION,
        without `else` contributes equations only when one branch matches at
        runtime; statically-false branches are dead. We could safely drop them,
        but doing so would also need a structural recount further upstream
-       (branches participate in matching/causalisation). Keep the conservative
-       behaviour and return the IFEXP-rewritten branch list unchanged. The
+       (branches participate in matching/causalization). Keep the conservative
+       behavior and return the IFEXP-rewritten branch list unchanged. The
        prune count is reported truthfully so the log is not misleading. =#
     return (IF_EQUATION(rewrittenBranches), promoted, nPrunedBranches, false)
   end
@@ -3814,6 +3818,93 @@ function _collectComplexFieldNames!(names::Set{String}, eqs, ht)
   return names
 end
 
+"""
+    eliminateDeadParameters(simCode) -> simCode
+
+Remove `PARAMETER(NONE)` simvars that are not referenced anywhere — no
+residual, no initial equation, no if-condition, no when statement, no
+DATA_STRUCTURE / parameter binding expression, no alias representative, no
+attribute (`start` / `fixed` / `min` / `max` / `nominal`), no eliminated
+equation. Such parameters cannot be observed and cannot be overridden
+meaningfully at runtime (no consumer would see the override).
+
+Skipped for sub-model / flatModel / metaModel variants because cross-mode
+parameter references are not visible in the standard scan.
+"""
+function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
+  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+    return simCode
+  end
+  local ht = simCode.stringToSimVarHT
+
+  #= Reachability scan: collect every cref name referenced from a live
+     surface. Anything not in this set is dead. =#
+  local referenced = Set{String}()
+  for eq in simCode.residualEquations
+    collectCrefNames!(referenced, eq.exp)
+  end
+  for eq in simCode.initialEquations
+    if eq isa BDAE.RESIDUAL_EQUATION
+      collectCrefNames!(referenced, eq.exp)
+    elseif eq isa BDAE.EQUATION
+      collectCrefNames!(referenced, eq.lhs)
+      collectCrefNames!(referenced, eq.rhs)
+    end
+  end
+  for ifEq in simCode.ifEquations
+    for branch in ifEq.branches
+      collectCrefNames!(referenced, branch.condition)
+      for brEq in branch.residualEquations
+        collectCrefNames!(referenced, brEq.exp)
+      end
+    end
+  end
+  for whenEq in simCode.whenEquations
+    _collectWhenCrefNames!(referenced, whenEq.whenEquation)
+  end
+  for eq in simCode.eliminatedEquations
+    collectCrefNames!(referenced, eq.exp)
+  end
+  for entry in simCode.aliasMap
+    push!(referenced, entry.representativeName)
+    push!(referenced, entry.eliminatedName)
+  end
+  _collectAttributeCrefs!(referenced, ht)
+  for (_n, (_, sv)) in ht
+    @match sv.varKind begin
+      PARAMETER(SOME(b)) => collectCrefNames!(referenced, b)
+      ARRAY_PARAMETER(_, SOME(b)) => collectCrefNames!(referenced, b)
+      DATA_STRUCTURE(SOME(b)) => collectCrefNames!(referenced, b)
+      _ => nothing
+    end
+  end
+
+  #= Sweep: drop entries where the var is PARAMETER(NONE) and unreferenced.
+     The broader PARAMETER(SOME(_)) case was tested and triggered a
+     UndefVarError on SimpleMechanicalSystem (a parameter referenced from
+     a Modelica function body in `simCode.functions`, which the reachability
+     scan above does not cover). Keep the narrow form. =#
+  local toDrop = String[]
+  for (name, (_, sv)) in ht
+    name in referenced && continue
+    local isUnboundParam = @match sv.varKind begin
+      PARAMETER(NONE()) => true
+      _ => false
+    end
+    isUnboundParam && push!(toDrop, name)
+  end
+
+  isempty(toDrop) && return simCode
+
+  local newHT = copy(ht)
+  for name in toDrop
+    delete!(newHT, name)
+  end
+  @assign simCode.stringToSimVarHT = newHT
+  @info "[SIMCODE: $(simCode.name): eliminateDeadParameters] dropped $(length(toDrop)) unbound / unused parameters"
+  return simCode
+end
+
 function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   if hasStructuralTransitions(simCode) || hasSubModels(simCode) ||
      hasFlatModel(simCode) || hasMetaModel(simCode)
@@ -4677,6 +4768,9 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   end
 
   @info "[SIMCODE: $(simCode.name): eliminateRHSEquivalentEquations] aliased $(length(aliasMap)) variables via RHS equivalence; removing $(length(removeEqs)) redundant equations"
+  if OMBackend.BACKEND_PERFLOG[]
+    @info "[SIMCODE: $(simCode.name): eliminateRHSEquivalentEquations] model size" residuals_before=length(resEqs) residuals_after=length(resEqs) - length(removeEqs) variables_before=length(ht) variables_after=length(ht) - length(aliasMap)
+  end
 
   local newResEqs = BDAE.RESIDUAL_EQUATION[]
   sizehint!(newResEqs, length(resEqs) - length(removeEqs))
@@ -4816,11 +4910,16 @@ function _foldNumericExp(@nospecialize(exp))
           _ => nothing
         end
       end
-      #= Partial folds: 0 * x = 0, x * 0 = 0, 0 + x = x, x + 0 = x, x - 0 = x. =#
+      #= Partial folds: 0 * x = 0, 1 * x = x, x * 0 = 0, x * 1 = x,
+         0 + x = x, x + 0 = x, x - 0 = x, 0 - x = -x, x / 1 = x.
+         Plus the structural tautology x - x = 0 (catches alias-substituted
+         residuals that became `0 = c - c` after elimination). =#
       @match op begin
         DAE.MUL(__) => begin
           (v1 !== nothing && v1 == 0) && return DAE.RCONST(0.0)
           (v2 !== nothing && v2 == 0) && return DAE.RCONST(0.0)
+          (v1 !== nothing && v1 == 1) && return f2
+          (v2 !== nothing && v2 == 1) && return f1
         end
         DAE.ADD(__) => begin
           (v1 !== nothing && v1 == 0) && return f2
@@ -4828,6 +4927,9 @@ function _foldNumericExp(@nospecialize(exp))
         end
         DAE.SUB(__) => begin
           (v2 !== nothing && v2 == 0) && return f1
+        end
+        DAE.DIV(__) => begin
+          (v2 !== nothing && v2 == 1) && return f1
         end
         _ => nothing
       end
@@ -5063,10 +5165,13 @@ function eliminateFrozenStates(simCode::SIM_CODE)::SIM_CODE
      equation like `w - der(state) = 0` into `w - 0 = 0`, exposing a new
      frozen state. Cap the loop count defensively even though the variable
      set strictly shrinks each round. =#
+  #= protectedNames is invariant across rounds (if/when equations do not
+     change), so compute it once and reuse. =#
+  local protectedNames = _computeFrozenProtectedNames(simCode)
   local totalEliminated = 0
   local maxRounds = 16
   for round in 1:maxRounds
-    local (newCode, nEliminated) = _eliminateFrozenStatesOnePass(simCode)
+    local (newCode, nEliminated) = _eliminateFrozenStatesOnePass(simCode, protectedNames)
     nEliminated == 0 && break
     simCode = newCode
     totalEliminated += nEliminated
@@ -5074,13 +5179,7 @@ function eliminateFrozenStates(simCode::SIM_CODE)::SIM_CODE
   return simCode
 end
 
-function _eliminateFrozenStatesOnePass(simCode::SIM_CODE)
-  local ht = simCode.stringToSimVarHT
-  local resEqs = simCode.residualEquations
-  local sharedVarSet = Set{String}(simCode.sharedVariables)
-
-  #= Safety: collect every cref referenced in if/when so we never demote
-     a variable that participates in event dispatch / conditional flow. =#
+function _computeFrozenProtectedNames(simCode::SIM_CODE)::Set{String}
   local protectedNames = Set{String}()
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
@@ -5093,6 +5192,13 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE)
   for whenEq in simCode.whenEquations
     _collectWhenCrefNames!(protectedNames, whenEq.whenEquation)
   end
+  return protectedNames
+end
+
+function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::Set{String})
+  local ht = simCode.stringToSimVarHT
+  local resEqs = simCode.residualEquations
+  local sharedVarSet = Set{String}(simCode.sharedVariables)
 
   local frozenMap   = Dict{String, DAE.Exp}()
   local frozenEqIdx = Dict{String, Int}()
@@ -5131,6 +5237,9 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE)
   local nState = count(values(frozenIsState))
   local nAlg   = length(frozenMap) - nState
   @info "[SIMCODE: $(simCode.name): eliminateFrozenStates] eliminating $(length(frozenMap)) frozen variable(s) ($nState state, $nAlg algebraic): $(sort(collect(keys(frozenMap))))"
+  if OMBackend.BACKEND_PERFLOG[]
+    @info "[SIMCODE: $(simCode.name): eliminateFrozenStates] model size" residuals_before=length(resEqs) residuals_after=length(resEqs) - length(frozenMap) variables_before=length(ht) variables_after=length(ht) - length(frozenMap)
+  end
 
   local removeEqs = Set{Int}(values(frozenEqIdx))
   local newResEqs = BDAE.RESIDUAL_EQUATION[]
@@ -5178,6 +5287,327 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE)
   append!(simCode.eliminatedVariables,  elimVarOrder)
   append!(simCode.eliminatedEquations,  elimEqOrder)
   return (simCode, length(frozenMap))
+end
+
+Base.@nospecializeinfer function _isAlgebraicVarKind(@nospecialize(varKind))::Bool
+  @match varKind begin
+    ALG_VARIABLE(__) => true
+    _ => false
+  end
+end
+
+Base.@nospecializeinfer function _containsDerCallDAE(@nospecialize(exp))::Bool
+  @match exp begin
+    DAE.CALL(path = p) => begin
+      @match p begin
+        Absyn.IDENT(name) => name == "der"
+        _ => false
+      end
+    end
+    DAE.BINARY(exp1 = e1, exp2 = e2) => _containsDerCallDAE(e1) || _containsDerCallDAE(e2)
+    DAE.UNARY(exp = e) => _containsDerCallDAE(e)
+    DAE.LUNARY(exp = e) => _containsDerCallDAE(e)
+    DAE.LBINARY(exp1 = e1, exp2 = e2) => _containsDerCallDAE(e1) || _containsDerCallDAE(e2)
+    DAE.IFEXP(expCond = c, expThen = t, expElse = e) => _containsDerCallDAE(c) || _containsDerCallDAE(t) || _containsDerCallDAE(e)
+    DAE.ARRAY(array = lst) => any(_containsDerCallDAE, lst)
+    DAE.ASUB(exp = e, sub = subs) => _containsDerCallDAE(e) || any(_containsDerCallDAE, subs)
+    DAE.RELATION(exp1 = e1, exp2 = e2) => _containsDerCallDAE(e1) || _containsDerCallDAE(e2)
+    DAE.CAST(exp = e) => _containsDerCallDAE(e)
+    DAE.TSUB(exp = e) => _containsDerCallDAE(e)
+    DAE.RSUB(exp = e) => _containsDerCallDAE(e)
+    DAE.REDUCTION(expr = e) => _containsDerCallDAE(e)
+    _ => false
+  end
+end
+
+Base.@nospecializeinfer function _detectVarMinusExprRaw(@nospecialize(exp), ht)
+  @match exp begin
+    DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
+      local isSub = @match op begin
+        DAE.SUB(__) => true
+        _ => false
+      end
+      isSub || return nothing
+      local r1 = extractCrefName(e1)
+      local r2 = extractCrefName(e2)
+      if (r1 !== nothing && r2 !== nothing) || (r1 === nothing && r2 === nothing)
+        return nothing
+      end
+      local r, rhs
+      if r1 !== nothing
+        r = r1; rhs = e2
+      else
+        r = r2; rhs = e1
+      end
+      local (n, _cr, _ty) = r
+      haskey(ht, n) || return nothing
+      return (n, rhs)
+    end
+    _ => return nothing
+  end
+end
+
+#= Substitution callback that, for every leaf CREF whose name is a key of
+   the fold map, returns the bound RHS expression and stops traversal so
+   the substituted form is not re-walked. ASUB-wrapped CREFs are handled
+   by reading the constant-subscript suffix into the lookup key, matching
+   `collectCrefNames!`'s asubHandled branch. =#
+function substituteFoldedVar(@nospecialize(exp), foldMap::Dict{String, DAE.Exp})
+  @match exp begin
+    DAE.CREF(cr, _) => begin
+      local name = DAE_identifierToString(cr)
+      if haskey(foldMap, name)
+        return (foldMap[name], false, foldMap)
+      end
+      return (exp, true, foldMap)
+    end
+    DAE.ASUB(exp = inner, sub = subs) => begin
+      @match inner begin
+        DAE.CREF(cr, _) => begin
+          local baseName = DAE_identifierToString(cr)
+          local allConst = true
+          local suffix = ""
+          for s in subs
+            @match s begin
+              DAE.ICONST(i) => begin suffix *= string("[", i, "]") end
+              _ => begin allConst = false end
+            end
+          end
+          if allConst && !isempty(suffix)
+            local fullName = string(baseName, suffix)
+            if haskey(foldMap, fullName)
+              return (foldMap[fullName], false, foldMap)
+            end
+          end
+          if haskey(foldMap, baseName)
+            return (foldMap[baseName], false, foldMap)
+          end
+          return (exp, true, foldMap)
+        end
+        _ => return (exp, true, foldMap)
+      end
+    end
+    _ => return (exp, true, foldMap)
+  end
+end
+
+"""
+    foldExplicitSingleAssign(simCode) -> simCode
+
+Substitute every ALG_VARIABLE that is uniquely defined by a single
+`0 = v - rhs` residual, where `rhs` has no derivative and no self-reference
+to `v`. Variables protected by if/when references, irreducible / shared
+sets are skipped. Sub-model / metaModel / flat-model variants are skipped
+entirely because runtime parameter overrides interact with cross-submodel
+references that the fold would break.
+
+Iterates to a fixed point (up to 8 rounds) so transitive chains
+(`v1 = v2 + 1; v2 = v3 + 1; v3 = literal`) collapse.
+"""
+function foldExplicitSingleAssign(simCode::SIM_CODE)::SIM_CODE
+  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+    return simCode
+  end
+  isempty(simCode.residualEquations) && return simCode
+  local protectedNames = _computeFrozenProtectedNames(simCode)
+  local irreducibleSet = Set{String}(simCode.irreductableVariables)
+  local sharedVarSet   = Set{String}(simCode.sharedVariables)
+  local totalFolded = 0
+  local maxRounds = 8
+  for round in 1:maxRounds
+    local (newCode, nFolded) = _foldExplicitSingleAssignOnePass(simCode, protectedNames, irreducibleSet, sharedVarSet)
+    nFolded == 0 && break
+    simCode = newCode
+    totalFolded += nFolded
+  end
+  if totalFolded > 0
+    @info "[SIMCODE: $(simCode.name): foldExplicitSingleAssign] folded $(totalFolded) explicit assignments"
+    if OMBackend.BACKEND_PERFLOG[]
+      @info "[SIMCODE: $(simCode.name): foldExplicitSingleAssign] model size" residuals_after=length(simCode.residualEquations) variables_after=length(simCode.stringToSimVarHT)
+    end
+  end
+  return simCode
+end
+
+function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
+                                          protectedNames::Set{String},
+                                          irreducibleSet::Set{String},
+                                          sharedVarSet::Set{String})
+  local ht = simCode.stringToSimVarHT
+  local resEqs = simCode.residualEquations
+
+  local defCountOfVar = Dict{String, Int}()
+  local defEqOfVar    = Dict{String, Int}()
+  local defRhsOfVar   = Dict{String, DAE.Exp}()
+
+  #= Skip scalarized array elements (any name containing '[' or ']').
+     The codegen rebuilds the parent array from its scalar siblings via
+     ASUB indexing; dropping a single element from the HT breaks that
+     reconstruction even though the algebraic substitution is sound. =#
+  #= Skip variables that appear in any existing alias-map entry (either
+     side). Folding a representative would orphan the alias entry; folding
+     an aliased name would double-substitute via the observed-equation
+     pipeline. =#
+  local aliasNames = Set{String}()
+  for entry in simCode.aliasMap
+    push!(aliasNames, entry.eliminatedName)
+    push!(aliasNames, entry.representativeName)
+  end
+
+  for (i, eq) in enumerate(resEqs)
+    local pair = _detectVarMinusExprRaw(eq.exp, ht)
+    pair === nothing && continue
+    local (name, rhs) = pair
+    occursin('[', name) && continue
+    occursin(']', name) && continue
+    name in protectedNames && continue
+    name in irreducibleSet && continue
+    name in sharedVarSet && continue
+    name in aliasNames && continue
+    local (_, sv) = ht[name]
+    _isAlgebraicVarKind(sv.varKind) || continue
+    _containsDerCallDAE(rhs) && continue
+    local rhsNames = Set{String}()
+    collectCrefNames!(rhsNames, rhs)
+    name in rhsNames && continue
+    defCountOfVar[name] = get(defCountOfVar, name, 0) + 1
+    if !haskey(defEqOfVar, name)
+      defEqOfVar[name]  = i
+      defRhsOfVar[name] = rhs
+    end
+  end
+
+  local foldMap = Dict{String, DAE.Exp}()
+  local foldEqIdxSet = Set{Int}()
+  for (name, cnt) in defCountOfVar
+    cnt == 1 || continue
+    foldMap[name] = defRhsOfVar[name]
+    push!(foldEqIdxSet, defEqOfVar[name])
+  end
+
+  isempty(foldMap) && return (simCode, 0)
+
+  #= Never empty the residual list. =#
+  if length(resEqs) - length(foldEqIdxSet) <= 0
+    @info "[SIMCODE: $(simCode.name): foldExplicitSingleAssign] would empty residuals; skipping"
+    return (simCode, 0)
+  end
+
+  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  sizehint!(newResEqs, length(resEqs) - length(foldEqIdxSet))
+  for (i, eq) in enumerate(resEqs)
+    i in foldEqIdxSet && continue
+    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteFoldedVar, foldMap)
+    newExp = _foldNumericExp(newExp)
+    push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+  end
+
+  local newInitEqs = typeof(simCode.initialEquations)()
+  for initEq in simCode.initialEquations
+    if initEq isa BDAE.RESIDUAL_EQUATION
+      local (newExp, _) = Util.traverseExpTopDown(initEq.exp, substituteFoldedVar, foldMap)
+      newExp = _foldNumericExp(newExp)
+      push!(newInitEqs, BDAE.RESIDUAL_EQUATION(newExp, initEq.source, initEq.attr))
+    elseif initEq isa BDAE.EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteFoldedVar, foldMap)
+      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteFoldedVar, foldMap)
+      newLhs = _foldNumericExp(newLhs)
+      newRhs = _foldNumericExp(newRhs)
+      push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
+    else
+      push!(newInitEqs, initEq)
+    end
+  end
+
+  local newIfEqs = IF_EQUATION[]
+  for ifEq in simCode.ifEquations
+    local newBranches = BRANCH[]
+    for branch in ifEq.branches
+      local newBranchEqs = BDAE.RESIDUAL_EQUATION[]
+      for brEq in branch.residualEquations
+        local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteFoldedVar, foldMap)
+        push!(newBranchEqs, BDAE.RESIDUAL_EQUATION(newBrExp, brEq.source, brEq.attr))
+      end
+      local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteFoldedVar, foldMap)
+      push!(newBranches, BRANCH(newCond, newBranchEqs,
+                                branch.identifier, branch.targets, branch.isSingular,
+                                branch.matchOrder, branch.equationGraph, branch.sccs,
+                                branch.stringToSimVarHT))
+    end
+    push!(newIfEqs, IF_EQUATION(newBranches))
+  end
+
+  local newElimEqs = BDAE.RESIDUAL_EQUATION[]
+  for eq in simCode.eliminatedEquations
+    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteFoldedVar, foldMap)
+    push!(newElimEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+  end
+
+  #= Sanity guard: scan all surviving surfaces for any folded name. If a
+     name still appears (because substituteFoldedVar missed an exotic CREF
+     wrapper, or the name is referenced from a code path we did not
+     substitute), abort the fold — return the original simCode unchanged.
+     Better to do zero folds than to leave a dangling reference that breaks
+     codegen (observed on SimpleMechanicalSystem, where `tau_2` survived
+     substitution somewhere downstream and produced UndefVarError). =#
+  local foldKeys = Set{String}(keys(foldMap))
+  local survivorNames = Set{String}()
+  for eq in newResEqs
+    collectCrefNames!(survivorNames, eq.exp)
+  end
+  for eq in newInitEqs
+    if eq isa BDAE.RESIDUAL_EQUATION
+      collectCrefNames!(survivorNames, eq.exp)
+    elseif eq isa BDAE.EQUATION
+      collectCrefNames!(survivorNames, eq.lhs)
+      collectCrefNames!(survivorNames, eq.rhs)
+    end
+  end
+  for ifEq in newIfEqs
+    for branch in ifEq.branches
+      collectCrefNames!(survivorNames, branch.condition)
+      for brEq in branch.residualEquations
+        collectCrefNames!(survivorNames, brEq.exp)
+      end
+    end
+  end
+  for eq in newElimEqs
+    collectCrefNames!(survivorNames, eq.exp)
+  end
+  for whenEq in simCode.whenEquations
+    _collectWhenCrefNames!(survivorNames, whenEq.whenEquation)
+  end
+  for (_n, (_, sv)) in ht
+    @match sv.varKind begin
+      PARAMETER(SOME(b)) => collectCrefNames!(survivorNames, b)
+      ARRAY_PARAMETER(_, SOME(b)) => collectCrefNames!(survivorNames, b)
+      DATA_STRUCTURE(SOME(b)) => collectCrefNames!(survivorNames, b)
+      _ => nothing
+    end
+  end
+  local dangling = intersect(foldKeys, survivorNames)
+  if !isempty(dangling)
+    @debug "[SIMCODE: $(simCode.name): foldExplicitSingleAssign] aborting — $(length(dangling)) folded name(s) still referenced after substitution: $(sort(collect(dangling)))"
+    return (simCode, 0)
+  end
+
+  local newHT = copy(ht)
+  for name in keys(foldMap)
+    delete!(newHT, name)
+  end
+
+  local elimVarOrder = sort(collect(keys(foldMap)))
+  local elimEqOrder  = BDAE.RESIDUAL_EQUATION[resEqs[defEqOfVar[n]] for n in elimVarOrder]
+
+  @assign simCode.residualEquations    = newResEqs
+  @assign simCode.initialEquations     = newInitEqs
+  @assign simCode.ifEquations          = newIfEqs
+  @assign simCode.stringToSimVarHT     = newHT
+  @assign simCode.eliminatedEquations  = newElimEqs
+  @assign simCode.irreductableVariables = filter(n -> !haskey(foldMap, n), simCode.irreductableVariables)
+  append!(simCode.eliminatedVariables, elimVarOrder)
+  append!(simCode.eliminatedEquations, elimEqOrder)
+  return (simCode, length(foldMap))
 end
 
 function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE

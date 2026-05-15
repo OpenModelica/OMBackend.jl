@@ -168,7 +168,7 @@ function _statementsContainIf(stmts)::Bool
   return false
 end
 
-function _expContainsIfExp(exp::DAE.Exp)::Bool
+Base.@nospecializeinfer function _expContainsIfExp(@nospecialize(exp::DAE.Exp))::Bool
   @match exp begin
     DAE.IFEXP(__) => return true
     DAE.BINARY(exp1 = e1, exp2 = e2) => begin
@@ -606,7 +606,7 @@ function generateStatements(statements::Union{List{DAE.Statement}, Vector{DAE.St
   return jStmts
 end
 
-function generateStatement(s::DAE.Statement)
+Base.@nospecializeinfer function generateStatement(@nospecialize(s::DAE.Statement))
   throw("Unsupported stmt:" * string(s))
 end
 
@@ -632,7 +632,7 @@ end
 
 #= Translate a single target expression inside a tuple-assign LHS to a
    Julia symbol suitable for `Expr(:tuple, …)`. =#
-function _crefToTupleTarget(exp::DAE.Exp)
+Base.@nospecializeinfer function _crefToTupleTarget(@nospecialize(exp::DAE.Exp))
   @match exp begin
     DAE.CREF(DAE.WILD(), _) => :_
     DAE.CREF(DAE.CREF_IDENT(ident, _, _), _) => Symbol(ident)
@@ -1080,7 +1080,7 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
 end
 
 """
-  Converts a DAE var to an equvivalent Julia repr.
+  Converts a DAE var to an equivalent Julia repr.
   Simple for now.
 """
 function DAE_VAR_ToJulia(v::DAE.VAR)

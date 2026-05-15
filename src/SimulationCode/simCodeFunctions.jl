@@ -257,7 +257,7 @@ function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN_ARR, record
   return [DAE.STMT_ASSIGN_ARR(stmt.type_, newLhs, newExp, stmt.source)]
 end
 
-function transformStatementForFlattenedRecords(stmt::DAE.Statement, recordFieldMap::Dict)::Vector{DAE.Statement}
+Base.@nospecializeinfer function transformStatementForFlattenedRecords(@nospecialize(stmt::DAE.Statement), recordFieldMap::Dict)::Vector{DAE.Statement}
   #= For other statement types, return unchanged for now =#
   return [stmt]
 end
@@ -267,7 +267,7 @@ end
   a vector of field CREFs (e.g., R_rel becomes [R_rel_T, R_rel_w]).
   Returns nothing if exp is not an expandable record reference.
 """
-function expandRecordArgForCall(exp::DAE.Exp, recordFieldMap::Dict)
+Base.@nospecializeinfer function expandRecordArgForCall(@nospecialize(exp::DAE.Exp), recordFieldMap::Dict)
   @match exp begin
     DAE.CREF(DAE.CREF_IDENT(ident, _, _), _) => begin
       if haskey(recordFieldMap, ident)
@@ -470,7 +470,7 @@ end
   Returns the varLst if the expression has T_COMPLEX(RECORD) type, nothing otherwise.
   Used to split non-CREF Complex-typed arguments into per-field TSUB expressions.
 """
-function _getComplexReturnFields(exp::DAE.Exp)
+Base.@nospecializeinfer function _getComplexReturnFields(@nospecialize(exp::DAE.Exp))
   @match exp begin
     DAE.CALL(_, _, DAE.CALL_ATTR(ty = DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _))) => begin
       return collect(varLst)
@@ -707,7 +707,7 @@ end
   Try to evaluate a DAE condition expression to a Bool.
   Returns `true`, `false`, or `nothing` if evaluation is not possible.
 """
-function tryEvalCondition(cond::DAE.Exp)::Union{Bool, Nothing}
+Base.@nospecializeinfer function tryEvalCondition(@nospecialize(cond::DAE.Exp))::Union{Bool, Nothing}
   @match cond begin
     DAE.BCONST(val) => val
     #= Strip noEvent wrapper =#
@@ -751,11 +751,11 @@ function tryEvalCondition(cond::DAE.Exp)::Union{Bool, Nothing}
   end
 end
 
-function tryEvalCondition(cond::DAE.Exp, simCode::SIM_CODE)::Union{Bool, Nothing}
+Base.@nospecializeinfer function tryEvalCondition(@nospecialize(cond::DAE.Exp), simCode::SIM_CODE)::Union{Bool, Nothing}
   return _tryEvalCondition(cond, simCode, Set{String}())
 end
 
-function _tryEvalCondition(cond::DAE.Exp, simCode::SIM_CODE, seen::Set{String})::Union{Bool, Nothing}
+Base.@nospecializeinfer function _tryEvalCondition(@nospecialize(cond::DAE.Exp), simCode::SIM_CODE, seen::Set{String})::Union{Bool, Nothing}
   @match cond begin
     DAE.BCONST(val) => val
     DAE.CREF(__) => begin
@@ -803,7 +803,7 @@ end
   Try to evaluate a DAE expression to a numeric value.
   Returns Float64, or nothing if evaluation is not possible.
 """
-function tryEvalNumeric(exp::DAE.Exp)::Union{Float64, Nothing}
+Base.@nospecializeinfer function tryEvalNumeric(@nospecialize(exp::DAE.Exp))::Union{Float64, Nothing}
   @match exp begin
     DAE.RCONST(val) => Float64(val)
     DAE.ICONST(val) => Float64(val)
@@ -852,15 +852,15 @@ function tryEvalNumeric(exp::DAE.Exp)::Union{Float64, Nothing}
   end
 end
 
-function tryEvalNumeric(exp::DAE.Exp, simCode::SIM_CODE)::Union{Float64, Nothing}
+Base.@nospecializeinfer function tryEvalNumeric(@nospecialize(exp::DAE.Exp), simCode::SIM_CODE)::Union{Float64, Nothing}
   return _tryEvalNumeric(exp, simCode, Set{String}())
 end
 
-function tryEvalScalar(exp::DAE.Exp, simCode::SIM_CODE)
+Base.@nospecializeinfer function tryEvalScalar(@nospecialize(exp::DAE.Exp), simCode::SIM_CODE)
   return tryEvalScalar(exp, simCode, Set{String}())
 end
 
-function tryEvalScalar(exp::DAE.Exp, simCode::SIM_CODE, seen::Set{String})
+Base.@nospecializeinfer function tryEvalScalar(@nospecialize(exp::DAE.Exp), simCode::SIM_CODE, seen::Set{String})
   @match exp begin
     DAE.BCONST(v) => v
     DAE.SCONST(v) => v

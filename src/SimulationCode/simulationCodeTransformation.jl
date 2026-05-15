@@ -143,7 +143,7 @@ function transformToSimCode(backendDAE::BDAE.BACKEND_DAE; mode)::SimulationCode.
 end
 
 function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode)::SimulationCode.SIM_CODE
-  #=  Fech the main equation system along with all subsystems =#
+  #=  Fetch the main equation system along with all subsystems =#
   @match [equationSystem, auxEquationSystems...] = equationSystems
   #= Fetch the different components of the model.=#
   local allSharedVars::Vector{BDAE.VAR} = getSharedVariablesLocalsAndGlobals(shared)
@@ -193,7 +193,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
      equation graph, so codegen running afterwards has nothing to look up. =#
   initialAlgorithms = inlineParamsInInitialAlgorithms(initialAlgorithms, stringToSimVarHT)
   #=
-    Gather all irreductable variables.
+    Gather all irreducible variables.
     NB: Should also include variables affected somehow with by a structural change.
   =#
   local irreductableVars::Vector{String} = vcat(occVars,
@@ -208,7 +208,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   end
   #=  Convert the structural transitions to the simcode representation. =#
   local simCodeStructuralTransitions = createSimCodeStructuralTransitions(structuralTransitions)
-  #= Sorting/Matching for the set of residual equations (This is used for the start condtions) =#
+  #= Sorting/Matching for the set of residual equations (This is used for the start conditions) =#
   local eqVariableMapping = createEquationVariableBidirectionGraph(resEqs,
                                                                    ifEqs,
                                                                    whenEqs,
@@ -447,7 +447,7 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
       It is also possible that we have an else branch.
       The else branch is located in the false equations.
       The condition for the else branch to be inactive is active
-      if all preceeding branches failed to evaluate to true.
+      if all preceding branches failed to evaluate to true.
     =#
     #= Check if we have an else if not we are done.=#
     if listEmpty(BDAE_ifEquation.eqnsfalse)
@@ -684,12 +684,47 @@ function allocateAndCollectSimulationEquations(equations::T,
       push!(ifEquations, eq)
     elseif eqType === BDAE.STRUCTURAL_TRANSISTION || eqType === BDAE.STRUCTURAL_WHEN_EQUATION
       push!(structuralTransitions, eq)
+    elseif eqType === BDAE.ALGORITHM
+      _algorithmToResiduals!(regularEquations, eq)
     end
   end
   if shouldAddDummyEquation
     push!(regularEquations, makeDummyResidualEquation(equationSystemName))
   end
   return (regularEquations, whenEquations, ifEquations, structuralTransitions, initialWhenEquations)
+end
+
+#= Lower the body of a non-when `BDAE.ALGORITHM` into one
+   `BDAE.RESIDUAL_EQUATION` per scalar assignment. Without this step every
+   such algorithm is silently dropped, so any Boolean / Integer / enum
+   variable assigned in an algorithm (and not inside a when-clause) stays
+   pinned at its start value. Surfaces on every
+   `Modelica.Electrical.Digital.Examples` model whose Logic-enum outputs
+   are driven by algorithm sections (INV3S, MUX2x1, NRXFER, ...).
+
+   Only `STMT_ASSIGN` is lowered here; nested `STMT_IF` / `STMT_FOR` are
+   not yet supported and are silently skipped. =#
+function _algorithmToResiduals!(target::Vector{BDAE.RESIDUAL_EQUATION},
+                                algEq::BDAE.ALGORITHM)
+  local alg = algEq.alg
+  alg isa DAE.ALGORITHM_STMTS || return
+  for stmt in alg.statementLst
+    _algorithmStmtToResidual!(target, stmt, algEq.source, algEq.attr)
+  end
+end
+
+function _algorithmStmtToResidual!(target::Vector{BDAE.RESIDUAL_EQUATION},
+                                   stmt, source, attr)
+  if stmt isa DAE.STMT_ASSIGN
+    push!(target, BDAE.RESIDUAL_EQUATION(
+      DAE.BINARY(stmt.exp1, DAE.SUB(DAE.T_REAL_DEFAULT), stmt.exp),
+      source, attr))
+  elseif stmt isa DAE.STMT_ASSIGN_ARR
+    push!(target, BDAE.RESIDUAL_EQUATION(
+      DAE.BINARY(stmt.lhs, DAE.SUB(DAE.T_REAL_DEFAULT), stmt.exp),
+      source, attr))
+  end
+  #= STMT_IF / STMT_FOR / STMT_WHILE not yet lowered. =#
 end
 
 #= Per Modelica spec, only `when initial() then ...` and `when {..., initial(), ...} then ...`

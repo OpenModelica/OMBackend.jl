@@ -38,7 +38,7 @@
   wrapped in a RuntimeGeneratedFunction for world-age safety.
 
   This avoids the expensive LLVM compilation of deeply nested symbolic
-  expressions that occurs with MTK's default pipeline that occured prior, reducing compilation
+  expressions that occur with MTK's default pipeline that occurred prior, reducing compilation
   time from 35+ minutes to seconds for large models.
 
 

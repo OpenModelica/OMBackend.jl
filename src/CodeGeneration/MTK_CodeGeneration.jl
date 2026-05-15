@@ -57,7 +57,7 @@ function equationMentionsVariableName(eqStr::AbstractString, varName::AbstractSt
 end
 
 """
-  Generates simulation code targetting modeling toolkit.
+  Generates simulation code targeting modeling toolkit.
   Loop code removed was on old branch.
 """
 function generateMTKCode(simCode::SimulationCode.SIM_CODE)
@@ -150,7 +150,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
       #= Create the composite model. Dispatch on the mass matrix of the initial
          submodel exactly like the submodel builder does: pure ODE takes the
          fast fill-all-u0 / skip-initializer path; DAE routes finalInitialValues
-         as hard u0 while letting the initialiser use reducedSystem.guesses
+         as hard u0 while letting the initializer use reducedSystem.guesses
          (already populated by splitInitialValues) to solve algebraic residuals
          such as x = L*sin(phi) for the Pendulum. Injecting _compositeGuesses
          as hard u0 for a DAE submodel would pin phi = 0 and silently violate
@@ -263,7 +263,13 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreductable) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
       global LATEST_REDUCED_SYSTEM = $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))
       global LATEST_PROBLEM = $(Symbol("$(MODEL_NAME)Model_problem"))
-      __runInitialAlgorithm!()
+      #= Run in the latest world age: __runInitialAlgorithm! is compiled at
+         module-eval time, before `Model()` runs `eval(_batchBlock)` to create
+         the Symbolics bindings (e.g. `a`, `iNV3S_enable`) that algorithm-lifter
+         bodies reference. Calling the function directly resolves those names
+         in the older compile-time world and throws
+         `UndefVarError: ... binding may be too new`. =#
+      Base.invokelatest(__runInitialAlgorithm!)
       #= Auto-switch from Rosenbrock (default Rodas5) to FBDF when the system
          has zero differential states. SciML warns that Rosenbrock methods on
          purely-algebraic systems do not bound the interpolation error, and
@@ -726,6 +732,53 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     end
     return nothing
   end
+  #= Generic arithmetic-defined discrete: `0 ~ disc - expr` (or `disc + expr`)
+     where `expr` is any compound expression (i.e. an `Expr` rather than a
+     bare cref). Catches the algorithm-lifter shape
+     `0 ~ out - (trigger + 10)` where `out` is DISCRETE and the RHS is a
+     non-trivial expression. Without this match the discrete-dummy
+     `der(out) ~ 0` plus the lifted residual would over-determine MTK by 1.
+
+     Skips when-assigned discrete vars: those are driven by a when-equation
+     callback (e.g. `iNV3S` internal `y_auxiliary` inside
+     `InertialDelaySensitive`) and demoting their dummy would leave the
+     callback with no state slot to write to, surfacing as
+     `UndefVarError` at integration time. =#
+  #= Walk `e` and return true if any `D(...)` or `der(...)` call appears. A
+     residual where the non-discrete side is a derivative expression (e.g.
+     `0 ~ der(x) - k` from IEQ2) is a state equation, not a definitional
+     binding for the discrete variable, so we must not treat it as one. =#
+  local _containsDerivative
+  _containsDerivative = function(e)
+    e isa Expr || return false
+    if e.head === :call && !isempty(e.args)
+      local hd = e.args[1]
+      (hd === :D || hd === :der) && return true
+    end
+    for a in e.args
+      _containsDerivative(a) && return true
+    end
+    return false
+  end
+  local _matchArithmeticDefinedDiscrete = function(rhs)
+    rhs = _unwrap(rhs)
+    rhs isa Expr || return nothing
+    rhs.head === :call && length(rhs.args) == 3 || return nothing
+    local op = rhs.args[1]
+    (op === :+ || op === :-) || return nothing
+    local a, b = _unwrap(rhs.args[2]), _unwrap(rhs.args[3])
+    local aName = _refName(a)
+    local bName = _refName(b)
+    if bName !== nothing && bName in _discreteSet && !(bName in _whenAssignedSet) && a isa Expr
+      _containsDerivative(a) && return nothing
+      return bName
+    end
+    if aName !== nothing && aName in _discreteSet && !(aName in _whenAssignedSet) && b isa Expr
+      _containsDerivative(b) && return nothing
+      return aName
+    end
+    return nothing
+  end
   local _comparisonPinned = String[]
   for eq in EQUATIONS
     if eq isa Expr && eq.head === :call && length(eq.args) == 3 &&
@@ -741,6 +794,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       end
       local intDef = _matchIntegerDefinedDiscrete(eq.args[3])
       intDef !== nothing && push!(_aliasPinned, intDef)
+      local arithDef = _matchArithmeticDefinedDiscrete(eq.args[3])
+      arithDef !== nothing && push!(_aliasPinned, arithDef)
       #= Pairwise discrete alias: `0 ~ a - b` → both refs to discrete vars.
          One alias residual contributes exactly one excess equation relative
          to the two discrete dummy equations, so demote one side only. If a
@@ -1102,7 +1157,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                constraints): splitInitialValues has already pinned explicit-start
                algebraic IVs as hard u0 and registered 0.0 soft guesses for
                uncovered differential states on reducedSystem.guesses. Pass only
-               finalInitialValues as u0 and let MTK's initialiser solve the
+               finalInitialValues as u0 and let MTK's initializer solve the
                algebraic residuals consistently. Injecting _missingU0 as hard u0
                would override the guesses (phi=0 instead of phi=3π/4) and silently
                violate the constraint, so do not merge it here. =#
@@ -1657,13 +1712,13 @@ end
 This function creates symbolic if equations for use in MTK.
 The function returns a tuple, where the first part of the tuple represent the conditions and the affect of the if-equation on the form:
   continuous_events = [
-    <Condtion> => <affect>
-    <Condtion> => <affect>
+    <Condition> => <affect>
+    <Condition> => <affect>
     ....
   ]
 Each condition generates one variable with zero dynamics the variable being true or not depending on the branch.
   Example:
-  if <condtion> then
+  if <condition> then
     <equations>
   elseif <condition> then
     <equations>
@@ -1675,7 +1730,7 @@ continuous_events = [
     <condition> => [ifCond1 ~ true, ifCond2 ~ false]
     <condition> => [ifCond1 ~ false, ifCond2 ~ true]
 ]
-An if equation with a single condition would only generate one condtion:
+An if equation with a single condition would only generate one condition:
 continuous_events = [
     <condition> => [ifCond1 ~ true]
 ]
@@ -2122,7 +2177,7 @@ function createParameterArray(parameters::Vector{T1}, parameterAssignments::Vect
       end
       _ => throw(ErrorException("createParameterArray: parameter $(param) has no bound expression (got $(simVarType))."))
     end
-    #= Evaluate the parameters. If it is a variable, and can't be evaluated look it up in the parameter dictonary. =#
+    #= Evaluate the parameters. If it is a variable, and can't be evaluated look it up in the parameter dictionary. =#
     local parValue
     try
       #= The boundvalue is known =#
@@ -2868,11 +2923,16 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE)
         :( $(lowerAlg(wStmt.right)); nothing )
       else
         #= Bind the value to a local symbol so subsequent statements that
-           reference it pick up the freshly-assigned value (e.g. trapezoid
-           init alg: `count := integer(...); T_start := startTime + count*period`
-           where the second line reads `count`). The same value is also written
-           back into LATEST_PROBLEM so the integrator picks it up at u0.
-           Parameters must be set via LATEST_PROBLEM.ps[sym] (MTK >= 9 API). =#
+           reference it pick up the freshly-assigned value. The same value
+           is also written back into LATEST_PROBLEM via
+           `SciMLBase.setu(prob, sym)(prob, value)` (state) or
+           `prob.ps[sym] = value` (parameter, MTK ≥ 9 API).
+
+           `setu` is preferred over `prob[sym] = value` for states: the
+           latter raises `Invalid symbol ... for setsym` when the cref was
+           alias-eliminated out of the simplified system, while `setu`
+           silently no-ops in that case (the canonical representative
+           already carries the value via the observed equation). =#
         local sym = Symbol(name)
         local isParam = haskey(simCode.stringToSimVarHT, name) &&
                         let (_, sv) = simCode.stringToSimVarHT[name]
@@ -2882,7 +2942,13 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE)
         if isParam
           :( $(sym) = $(lowerAlg(wStmt.right)); LATEST_PROBLEM.ps[$(QuoteNode(sym))] = $(sym); nothing )
         else
-          :( $(sym) = $(lowerAlg(wStmt.right)); LATEST_PROBLEM[$(QuoteNode(sym))] = $(sym); nothing )
+          :( $(sym) = $(lowerAlg(wStmt.right));
+             try
+               ModelingToolkit.SciMLBase.setu(LATEST_PROBLEM, $(QuoteNode(sym)))(LATEST_PROBLEM, $(sym))
+             catch
+               nothing
+             end;
+             nothing )
         end
       end
     end
@@ -2915,9 +2981,12 @@ here. Returns a no-op stub when the model has no `when initial()` clauses.
 """
 function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Expr
   local stmts = Expr[]
+  local lhsNames = Set{String}()
+  local rhsNames = Set{String}()
   for ia in simCode.initialAlgorithms
     for op in ia.statements
       push!(stmts, _initialWhenOpToJulia(op, simCode))
+      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
     end
   end
   if isempty(stmts)
@@ -2927,6 +2996,54 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
       end
     end
   end
+  #= For each non-parameter cref read on the RHS of an init-algorithm
+     statement and NOT assigned earlier in the same body, fetch its current
+     runtime value from `LATEST_PROBLEM` as a local. Without this, references
+     like `b := a + 1` resolve `a` to the Symbolics binding created inside
+     `Model()`, which produces a `Symbolics.Num` and breaks
+     `LATEST_PROBLEM[:b] = b` with `MethodError: Float64(::Symbolics.Num)`.
+     Parameter CREFs are already inlined as literals by
+     `inlineParamsInInitialAlgorithms`, so they do not appear here. =#
+  local fetches = Expr[]
+  local ht = simCode.stringToSimVarHT
+  for name in setdiff(rhsNames, lhsNames)
+    name == "time" && continue
+    local sv = nothing
+    if haskey(ht, name)
+      sv = ht[name][2]
+      if sv.varKind isa SimulationCode.PARAMETER || sv.varKind isa SimulationCode.ARRAY_PARAMETER
+        continue
+      end
+    end
+    local sym = Symbol(name)
+    #= Resolve the value through `SciMLBase.getu`, which walks MTK's
+       `observed` equations to back-substitute alias-eliminated crefs.
+       Without this, `LATEST_PROBLEM[:iNV3S_enable]` returns the bare
+       Symbolics binding (the cref was alias-eliminated to `e_table_y`) and
+       Int conversion blows up.
+
+       The `< 1 → 1` clamp at the bottom is a deliberate band-aid for the
+       wrong-IC cluster: MTK initialisation does not yet honour every
+       Modelica start attribute, so `u0[i]` for some discrete slots is left
+       at 0 instead of the declared start. A 0 returned here would
+       BoundsError on `Vector{Int64}[0]` inside the algorithm body
+       (e.g. INV3S's `UX01Conv[iNV3S_enable]`). Clamping to 1 keeps the
+       simulation running with Logic.'U' semantics until the deeper init
+       fix lands. =#
+    push!(fetches, Expr(:local,
+      Expr(:(=), sym,
+        :(let _g = ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))
+            local _raw = _g(LATEST_PROBLEM)
+            local _v = if _raw isa Integer
+              Int(_raw)
+            elseif _raw isa Real
+              Int(round(Float64(_raw)))
+            else
+              1
+            end
+            _v < 1 ? 1 : _v
+          end))))
+  end
   #= Shadow `Base.time` (a UNIX-time function) with the local Modelica `time`
      value, which is 0 at simulation init. Without this, init-algorithm bodies
      that reference `time` (e.g. trapezoid sources' `count := integer((time -
@@ -2935,9 +3052,41 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
   return quote
     function __runInitialAlgorithm!()
       let time = 0.0
+        $(fetches...)
         $(stmts...)
       end
       return nothing
     end
+  end
+end
+
+#= Walk a single `BDAE.WhenOperator` from an INITIAL_ALGORITHM body and
+   record LHS / RHS cref names. Used to figure out which non-assigned
+   externals need to be fetched from `LATEST_PROBLEM` at init time. =#
+function _collectInitAlgLhsRhsCrefs!(lhs::Set{String}, rhs::Set{String}, op)
+  local pushCrefsFrom = function(exp)
+    exp === nothing && return
+    for c in Util.getAllCrefs(exp)
+      push!(rhs, string(c))
+    end
+  end
+  @match op begin
+    BDAE.ASSIGN(__) => begin
+      @match op.left begin
+        DAE.CREF(cr, _) => push!(lhs, string(cr))
+        _ => nothing
+      end
+      pushCrefsFrom(op.right)
+    end
+    BDAE.REINIT(__) => begin
+      push!(lhs, string(op.stateVar))
+      pushCrefsFrom(op.value)
+    end
+    BDAE.NORETCALL(__) => pushCrefsFrom(op.exp)
+    BDAE.ASSERT(__) => begin
+      pushCrefsFrom(op.condition); pushCrefsFrom(op.message); pushCrefsFrom(op.level)
+    end
+    BDAE.TERMINATE(__) => pushCrefsFrom(op.message)
+    _ => nothing
   end
 end

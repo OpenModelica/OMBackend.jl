@@ -379,7 +379,7 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
   return oldSols
 end
 
-#= Enable this switch to allow DOCC without uncessary recompilation. =#
+#= Enable this switch to allow DOCC without unnecessary recompilation. =#
 global SHOULD_DO_REINITIALIZATION = false
 
 """
@@ -718,7 +718,7 @@ function recompilation(activeModeName,
     local newValue = eval(newValueExpr)
     @VSS_DEBUG @info "[RECOMPILATION] step 1/7: parsed modification" elementToChange newValue elapsed_s=round(time()-_t_start, digits=2)
     #=  2) Change the parameters in the SCode via API (As specified by the modification)=#
-    #=  2.1 Change the parameter so that it is the same as the modifcation. =#
+    #=  2.1 Change the parameter so that it is the same as the modification. =#
     newProgram = MetaModelica.list(RuntimeUtil.setElementInSCodeProgram!(activeModeName,
                                                                          elementToChange,
                                                                          newValue, metaModel))
@@ -1074,7 +1074,7 @@ end
   Get a vector of indices of the variables between syms1 and syms2.
   The destination mode might have a prefix for it's symbols.
   The prefix string is used to give the common variables the correct prefix
-  between transistions.
+  between transitions.
 """
 function getIndicesOfCommonVariables(syms1::Vector{Symbol} # New system
                                      ,syms2::Vector{Symbol} # old system

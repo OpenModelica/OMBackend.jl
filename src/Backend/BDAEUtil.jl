@@ -171,9 +171,9 @@ end
   Traverse a given equation using a traversalOperation.
   Mutates the given equation.
 """
-function traverseEquationExpressions(eq::BDAE.Equation,
-                                     traversalOperation::Function,
-                                     extArg::T)::Tuple{BDAE.Equation,T} where{T}
+Base.@nospecializeinfer function traverseEquationExpressions(@nospecialize(eq::BDAE.Equation),
+                                                             traversalOperation::Function,
+                                                             extArg::T)::Tuple{BDAE.Equation,T} where{T}
    (eq, extArg) = begin
      local lhs::DAE.Exp
      local rhs::DAE.Exp
@@ -313,9 +313,9 @@ end
 
 """
 Directly maps the DAE type to the BDAE type.
-Before casualisation we do not know if variables are state or not.
+Before causalization we do not know if variables are state or not.
 """
-function DAE_VarKind_to_BDAE_VarKind(kind::DAE.VarKind)::BDAE.VarKind
+Base.@nospecializeinfer function DAE_VarKind_to_BDAE_VarKind(@nospecialize(kind::DAE.VarKind))::BDAE.VarKind
   @match kind begin
     DAE.VARIABLE(__) => BDAE.VARIABLE()
     DAE.DISCRETE(__) => BDAE.DISCRETE()
@@ -617,7 +617,7 @@ end
       like `Modelica_SIunits_ComplexMagneticFlux_'+'` appearing as either the
       LHS or RHS of a COMPLEX_EQUATION)
     - RECORD constructor literal (the RHS `Complex[REC(0.0, 0.0)]` case —
-      T_COMPLEX is reconstructable from the record path + field list)
+      T_COMPLEX is reconstructible from the record path + field list)
   Returns nothing for other shapes (BINARY / IFEXP / ASUB / T_ARRAY of records).
 """
 function getComplexType(exp::DAE.Exp)

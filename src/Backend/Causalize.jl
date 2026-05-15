@@ -243,11 +243,11 @@ end
   We create the mapping:
   tmpVar -> equation it is assigned in
 """
-function replaceIfExpressionWithTmpVar(exp::DAE.Exp, tmpVarToElementAndTick::Tuple{Dict, Ref{Int}})
+Base.@nospecializeinfer function replaceIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{Dict, Ref{Int}})
   (newExp, cont, tmpVarToElementAndTick) = begin
     local tmpVarToElement::Dict = first(tmpVarToElementAndTick)
     local tick::Ref{Int} = last(tmpVarToElementAndTick)
-    #= NOTE: All these temporary variables are asumed to be REAL numbers for now =#
+    #= NOTE: All these temporary variables are assumed to be REAL numbers for now =#
     local varType = DAE.T_REAL_DEFAULT
     local varName = string("ifEq_tmp", tick.x)
     local var::DAE.ComponentRef = DAE.CREF_IDENT(varName, varType, nil)
@@ -437,7 +437,7 @@ function expandRecordFieldArrays(dae::BDAE.BACKEND_DAE)
 end
 
 """Check if the innermost CREF_IDENT in a CREF chain has subscripts (already scalarized)."""
-function isAlreadyScalarizedCref(cr::DAE.ComponentRef)::Bool
+Base.@nospecializeinfer function isAlreadyScalarizedCref(@nospecialize(cr::DAE.ComponentRef))::Bool
   @match cr begin
     DAE.CREF_QUAL(_, _, _, inner) => isAlreadyScalarizedCref(inner)
     DAE.CREF_IDENT(_, _, subs) => begin
@@ -452,7 +452,7 @@ function isAlreadyScalarizedCref(cr::DAE.ComponentRef)::Bool
 end
 
 """Extract integer subscript indices from the innermost CREF_IDENT."""
-function extractInnermostSubscripts(cr::DAE.ComponentRef)
+Base.@nospecializeinfer function extractInnermostSubscripts(@nospecialize(cr::DAE.ComponentRef))
   @match cr begin
     DAE.CREF_QUAL(_, _, _, inner) => extractInnermostSubscripts(inner)
     DAE.CREF_IDENT(_, _, subs) => begin
@@ -534,7 +534,7 @@ end
     Returns (baseName, fieldType, elemTy, dims) or nothing if no such boundary exists.
     For comp[1].R.T where R is T_COMPLEX and T is T_ARRAY, the baseName is "comp[1]_R_T".
 """
-function findRecordFieldArray(cr::DAE.ComponentRef)
+Base.@nospecializeinfer function findRecordFieldArray(@nospecialize(cr::DAE.ComponentRef))
   @match cr begin
     #= Direct match: record.field where record is T_COMPLEX and field is T_ARRAY =#
     DAE.CREF_QUAL(ident, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), _, _), outerSubs,
@@ -562,7 +562,7 @@ end
     For 2D: indices = (2,3) extracts row 2, column 3.
     Returns the element expression, or nothing if the binding is not a literal array.
 """
-function extractBindingElement(bindExp::DAE.Exp, indices::NTuple{N, Int}) where N
+Base.@nospecializeinfer function extractBindingElement(@nospecialize(bindExp::DAE.Exp), indices::NTuple{N, Int}) where N
   if N == 0
     return bindExp
   end
@@ -782,7 +782,7 @@ end
     indexing (name[i]) which would fail at runtime with MTK's scalar Num variables.
     Falls back to ASUB wrapping for non-CREF expressions.
 """
-function makeScalarElement(exp::DAE.Exp, subscripts::Union{Cons{DAE.ICONST}, Cons{DAE.Exp}})
+Base.@nospecializeinfer function makeScalarElement(@nospecialize(exp::DAE.Exp), subscripts::Union{Cons{DAE.ICONST}, Cons{DAE.Exp}})
   @match exp begin
     DAE.CREF(cr, _) => begin
       local (flatName, crefTy, existingSubs) = crefToFlatName(cr)
@@ -870,7 +870,7 @@ end
     For non-array expressions (CAST, TUPLE, etc.), unwraps where possible.
     Returns nothing if the expression cannot be flattened into individual elements.
 """
-function flattenDAEArray(exp::DAE.Exp)::Union{Vector{DAE.Exp}, Nothing}
+Base.@nospecializeinfer function flattenDAEArray(@nospecialize(exp::DAE.Exp))::Union{Vector{DAE.Exp}, Nothing}
   @match exp begin
     DAE.ARRAY(_, _, elements) => begin
       result = DAE.Exp[]
@@ -1469,7 +1469,7 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
            to a specific literal (e.g. 'U' for Logic). Fall back to ICONST(0)
            for partially-bound enum arrays — the integer index 0 is a safe
            default that downstream codegen will treat as "first literal" /
-           uninitialised, matching prior behaviour for unconstrained enums. =#
+           uninitialized, matching prior behavior for unconstrained enums. =#
         v.bindExp = SOME(get(valueMap, name, DAE.ICONST(0)))
       end
       nReclassified += 1

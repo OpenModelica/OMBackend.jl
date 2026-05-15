@@ -1,7 +1,7 @@
 "
   This files contains the various graph algorithms.
 
-  More specficially routines for matching, merging and strongly connected components
+  More specifically routines for matching, merging and strongly connected components
 
   Author: John Tinnerholm
 
@@ -83,8 +83,8 @@ end
 
 """
 Author: John Tinnerholm
-  Given a order, and a graph represented as an adjacency list creates a new digraph
-  representing a causalised system.
+  Given an order, and a graph represented as an adjacency list creates a new digraph
+  representing a causalized system.
   input matchOrder, assign array(j) = i The variable j is solved in equation i
   input graph equation -> {Equation -> variables belonging to it}
   output Graphs.SimpleDiGraph
@@ -180,7 +180,7 @@ end
 
 """
  Helper function.
- It is assumed that the dict g is orderd 1->N where 1->N is the indices of the nodes.
+ It is assumed that the dict g is ordered 1->N where 1->N is the indices of the nodes.
  input g::OrderedDict
  input n::Int, the number of vertices
  output sccs: The set of strongly connected components

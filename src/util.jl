@@ -41,35 +41,70 @@ import DAE
 
 
 """
-Enable logging by specifing the following environmental variable before compiling the backend.
+Runtime-toggleable backend logging switch. Default is taken from
+`ENV["ENABLE_BACKEND_LOGGING"]` at module load; flip at runtime via
+`OMBackend.BACKEND_LOGGING[] = true / false` to avoid a Julia restart.
+"""
+const BACKEND_LOGGING = Ref{Bool}(get(ENV, "ENABLE_BACKEND_LOGGING", "false") == "true")
+"""
+    @BACKEND_LOGGING expr
 
-```
-ENABLE_BACKEND_LOGGING=true julia
-```
-"""
-const ENABLE_BACKEND_LOGGING::Bool = get(ENV, "ENABLE_BACKEND_LOGGING", "false") == "true"
-"""
-If  ```ENABLE_BACKEND_LOGGING``` is true this macro is active. If not this macro represents a NOP.
+Evaluates `expr` only when `BACKEND_LOGGING[]` is true; otherwise the
+expression is dropped and a `nothing` literal is emitted. The runtime check
+is a single boolean load and branch per call site.
 """
 macro BACKEND_LOGGING(expr)
-  if ENABLE_BACKEND_LOGGING
-    return esc(expr)
-  else
-    return nothing
+  return quote
+    if $(BACKEND_LOGGING)[]
+      $(esc(expr))
+    else
+      nothing
+    end
   end
 end
 
 
-const ENABLE_VSS_DEBUG::Bool = get(ENV, "ENABLE_VSS_DEBUG", "false") == "true"
 """
-If ```ENABLE_VSS_DEBUG``` is true this macro is active. If not this macro represents a NOP.
-Use for debug logging in the VSS (Variable Structure Systems) runtime.
+Runtime-toggleable VSS debug switch. Same shape as `BACKEND_LOGGING`.
+"""
+const VSS_DEBUG = Ref{Bool}(get(ENV, "ENABLE_VSS_DEBUG", "false") == "true")
+"""
+    @VSS_DEBUG expr
+
+Active only when `VSS_DEBUG[]` is true. Use for VSS-runtime debug logging.
 """
 macro VSS_DEBUG(expr)
-  if ENABLE_VSS_DEBUG
-    return esc(expr)
-  else
-    return nothing
+  return quote
+    if $(VSS_DEBUG)[]
+      $(esc(expr))
+    else
+      nothing
+    end
+  end
+end
+
+"""
+Runtime-toggleable perf logging switch. Default is taken from
+`ENV["ENABLE_BACKEND_PERFLOG"]` at module load; flip at runtime via
+`OMBackend.BACKEND_PERFLOG[] = true / false` to avoid a Julia restart.
+"""
+const BACKEND_PERFLOG = Ref{Bool}(get(ENV, "ENABLE_BACKEND_PERFLOG", "false") == "true")
+
+"""
+    @BACKEND_PERFLOG "label" expr
+
+Wraps `expr` in `@time` when `BACKEND_PERFLOG[]` is true; otherwise the
+expression is evaluated with no instrumentation. The runtime check costs
+one boolean load and one branch per call site, so use it on coarse pass
+boundaries, not in tight inner loops.
+"""
+macro BACKEND_PERFLOG(label, expr)
+  return quote
+    if $(BACKEND_PERFLOG)[]
+      @time $(esc(label)) $(esc(expr))
+    else
+      $(esc(expr))
+    end
   end
 end
 
