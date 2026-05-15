@@ -341,16 +341,8 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
            at runtime. =#
         simCode = SimulationCode.runSimCodePass("eliminateConstantParameters", simCode,
                                                 SimulationCode.eliminateConstantParameters)
-        #= eliminateDeadParameters: disabled. The reachability scan does not
-           cover Modelica function bodies (simCode.functions) so a parameter
-           referenced only from a user-defined Modelica function gets dropped
-           and produces UndefVarError at codegen (observed on
-           SimpleMechanicalSystem where `tau_2` is PARAMETER(NONE) referenced
-           from a function body). Left in source for future use after the scan
-           is extended to cover function bodies.
         simCode = SimulationCode.runSimCodePass("eliminateDeadParameters", simCode,
                                                 SimulationCode.eliminateDeadParameters)
-        =#
         #= eliminateFrozenStates runs AFTER eliminateConstantParameters so that
            parameter chains like `state = param` (param bound to a literal) are
            already substituted to `state = literal` before detection. =#
@@ -398,10 +390,14 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         local observedBefore = SimulationCode.simCodeMetrics(simCode)
         local observedT0 = time()
         if observedFilter === nothing
-          #= Fast default: no observed equations from alias elimination =#
           if !isempty(simCode.aliasMap)
             @debug "[SIMCODE: observedFilter] clearing $(length(simCode.aliasMap)) alias observed equations (default: none)"
             @assign simCode.aliasMap = empty(simCode.aliasMap)
+          end
+          if !isempty(simCode.eliminatedVariables)
+            @debug "[SIMCODE: observedFilter] clearing $(length(simCode.eliminatedVariables)) eliminated-variable observed equations (default: none)"
+            @assign simCode.eliminatedVariables = empty(simCode.eliminatedVariables)
+            @assign simCode.eliminatedEquations = empty(simCode.eliminatedEquations)
           end
         else
           local filterStrings = if observedFilter isa Vector{Regex}
