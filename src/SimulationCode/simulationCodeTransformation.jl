@@ -182,7 +182,8 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
          §8/§11. =#
   local initialAlgorithms = INITIAL_ALGORITHM[]
   for iweq in initialWhenEqs
-    push!(initialAlgorithms, INITIAL_ALGORITHM(collect(iweq.whenEquation.whenStmtLst)))
+    local daeStmts = get(Backend.BDAECreate._INIT_ALG_DAE_STMTS, iweq, DAE.Statement[])
+    push!(initialAlgorithms, INITIAL_ALGORITHM(collect(iweq.whenEquation.whenStmtLst), daeStmts))
   end
   local (whenEqsKept, extractedInitAlgs) = extractInitialWhenAlgorithms(whenEqs)
   whenEqs = whenEqsKept
@@ -894,7 +895,62 @@ pass strips scalarized array-parameter entries; once a body carries literals,
 later HT changes do not affect codegen.
 """
 function inlineParamsInInitialAlgorithms(initialAlgs::Vector{INITIAL_ALGORITHM}, ht)::Vector{INITIAL_ALGORITHM}
-  return INITIAL_ALGORITHM[INITIAL_ALGORITHM([_inlineParamsInWhenOp(op, ht) for op in ia.statements]) for ia in initialAlgs]
+  local result = INITIAL_ALGORITHM[]
+  for ia in initialAlgs
+    local newOps = [_inlineParamsInWhenOp(op, ht) for op in ia.statements]
+    local newDae = [_inlineParamsInDAEStmt(s, ht) for s in ia.daeStatements]
+    push!(result, INITIAL_ALGORITHM(newOps, newDae))
+  end
+  return result
+end
+
+#= Recursively substitute parameter CREFs with their literal bindings inside a
+   `DAE.Statement`. Mirrors `_inlineParamsInWhenOp` for the parallel DAE.Statement
+   representation carried by `INITIAL_ALGORITHM.daeStatements`. Compound
+   statements (STMT_IF / STMT_FOR / STMT_WHILE / STMT_PARFOR) recurse into their
+   bodies. Statements with no scalar expressions pass through. =#
+function _inlineParamsInDAEStmt(stmt, ht)
+  return @match stmt begin
+    DAE.STMT_ASSIGN(ty, e1, e, src) =>
+      DAE.STMT_ASSIGN(ty, e1, _inlineParamsInExp(e, ht), src)
+    DAE.STMT_TUPLE_ASSIGN(ty, lhsList, e, src) =>
+      DAE.STMT_TUPLE_ASSIGN(ty, lhsList, _inlineParamsInExp(e, ht), src)
+    DAE.STMT_ASSIGN_ARR(ty, lhs, e, src) =>
+      DAE.STMT_ASSIGN_ARR(ty, lhs, _inlineParamsInExp(e, ht), src)
+    DAE.STMT_NORETCALL(e, src) =>
+      DAE.STMT_NORETCALL(_inlineParamsInExp(e, ht), src)
+    DAE.STMT_ASSERT(c, m, l, src) =>
+      DAE.STMT_ASSERT(_inlineParamsInExp(c, ht), _inlineParamsInExp(m, ht), _inlineParamsInExp(l, ht), src)
+    DAE.STMT_TERMINATE(m, src) =>
+      DAE.STMT_TERMINATE(_inlineParamsInExp(m, ht), src)
+    DAE.STMT_IF(cond, stmts, else_, src) =>
+      DAE.STMT_IF(_inlineParamsInExp(cond, ht),
+                  MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in stmts)...),
+                  _inlineParamsInDAEElse(else_, ht), src)
+    DAE.STMT_FOR(ty, isArr, iter, idx, range, body, src) =>
+      DAE.STMT_FOR(ty, isArr, iter, idx, _inlineParamsInExp(range, ht),
+                   MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in body)...), src)
+    DAE.STMT_PARFOR(ty, isArr, iter, idx, range, body, prl, src) =>
+      DAE.STMT_PARFOR(ty, isArr, iter, idx, _inlineParamsInExp(range, ht),
+                      MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in body)...), prl, src)
+    DAE.STMT_WHILE(cond, body, src) =>
+      DAE.STMT_WHILE(_inlineParamsInExp(cond, ht),
+                     MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in body)...), src)
+    DAE.STMT_REINIT(varExp, value, src) =>
+      DAE.STMT_REINIT(varExp, _inlineParamsInExp(value, ht), src)
+    _ => stmt
+  end
+end
+
+function _inlineParamsInDAEElse(else_, ht)
+  return @match else_ begin
+    DAE.ELSE(stmts) => DAE.ELSE(MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in stmts)...))
+    DAE.ELSEIF(cond, stmts, rest) =>
+      DAE.ELSEIF(_inlineParamsInExp(cond, ht),
+                 MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in stmts)...),
+                 _inlineParamsInDAEElse(rest, ht))
+    _ => else_
+  end
 end
 
 """

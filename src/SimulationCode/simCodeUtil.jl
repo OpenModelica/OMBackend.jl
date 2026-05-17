@@ -709,7 +709,9 @@ function getIrreductableVars(ifEquations::Vector{BDAE.IF_EQUATION},
   #@debug "Adding all states as irreducible variables" map(x->string(x.varName), knownIrreductables)
   push!(irreductables, map(x->BDAE_identifierToVarString(x), knownIrreductables))
   irreductables = collect(Iterators.flatten(irreductables))
-  irreductables = filter(irv -> !(irv != "time" && isParameter(last(ht[irv]))), irreductables)
+  irreductables = filter(irv -> irv == "time" ||
+                                  (haskey(ht, irv) && !isParameter(last(ht[irv]))),
+                          irreductables)
   #TODO: Fix the detection, s.t variables critical to when equations are not removed
   #for eq in whenEqs
     # variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
@@ -1601,6 +1603,22 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   for whenEq in simCode.whenEquations
     _collectWhenCrefNames!(whenRefNames, whenEq.whenEquation)
   end
+  #= Collect scalar `_re`/`_im` siblings of any Complex CREF that survives in
+     residuals, initial equations, if-equation branches, when-equations, or
+     eliminated equations. Codegen later flattens the parent Complex CREF into
+     its two scalar fields and looks them up by symbol; if either field is
+     dropped here we hit `UndefVarError` at MTK module eval. =#
+  local complexRefNames = Set{String}()
+  _collectComplexFieldNames!(complexRefNames, simCode.residualEquations, ht)
+  _collectComplexFieldNames!(complexRefNames, simCode.initialEquations, ht)
+  for ifEq in simCode.ifEquations
+    for branch in ifEq.branches
+      _collectComplexFieldNames!(complexRefNames, branch.residualEquations, ht)
+    end
+  end
+  for eq in simCode.eliminatedEquations
+    _collectComplexFieldNames!(complexRefNames, BDAE.RESIDUAL_EQUATION[eq], ht)
+  end
   local rescuedVars = Set{String}()
   for vn in varsToRemove
     local referencedBySurvivor = false
@@ -1627,6 +1645,10 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     end
     #= Check when-equations =#
     if !referencedBySurvivor && vn in whenRefNames
+      referencedBySurvivor = true
+    end
+    #= Check Complex `_re`/`_im` parent survival =#
+    if !referencedBySurvivor && vn in complexRefNames
       referencedBySurvivor = true
     end
     if referencedBySurvivor
@@ -3870,12 +3892,44 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
     push!(referenced, entry.eliminatedName)
   end
   _collectAttributeCrefs!(referenced, ht)
+  #= Walk every statement body inside `simCode.functions` (Modelica user
+     functions) and collect referenced crefs. Without this, a parameter
+     consumed only from a function body looks dead to the scan and gets
+     dropped — observed on SimpleMechanicalSystem (`tau_2`) and
+     ComplexBlocks.ShowTransferFunction (`transferFunction_aw_re/_im`). =#
+  _collectFunctionBodyCrefs!(referenced, simCode.functions)
+  #= Protect Complex `_re`/`_im` scalarized fields. Codegen flattens
+     `complexCref` to `[complexCref_re, complexCref_im]`, so if the original
+     Complex CREF survives anywhere those scalar siblings must too. Mirrors
+     the equivalent guard inside eliminateConstantParameters. =#
+  _collectComplexFieldNames!(referenced, simCode.residualEquations, ht)
+  _collectComplexFieldNames!(referenced, simCode.initialEquations, ht)
+  #= Track DATA_STRUCTURE constructor-bound array bases. Every scalarized
+     element of those arrays (`tableData[1][1]`, etc.) must be protected
+     because codegen rebuilds the parent array from scalar siblings when a
+     CombiTable1D / CombiTimeTable / similar DS constructor references the
+     base. Mirrors the equivalent logic in eliminateConstantParameters. =#
+  local dsArrayBaseNames = Set{String}()
   for (_n, (_, sv)) in ht
     @match sv.varKind begin
       PARAMETER(SOME(b)) => collectCrefNames!(referenced, b)
       ARRAY_PARAMETER(_, SOME(b)) => collectCrefNames!(referenced, b)
-      DATA_STRUCTURE(SOME(b)) => collectCrefNames!(referenced, b)
+      DATA_STRUCTURE(SOME(b)) => begin
+        collectCrefNames!(referenced, b)
+        @match b begin
+          DAE.CALL(__) => collectCrefNames!(dsArrayBaseNames, b)
+          _ => nothing
+        end
+      end
       _ => nothing
+    end
+  end
+  for htKey in keys(ht)
+    local bracketIdx = findfirst('[', htKey)
+    bracketIdx === nothing && continue
+    local baseName = htKey[1:bracketIdx-1]
+    if baseName in dsArrayBaseNames
+      push!(referenced, htKey)
     end
   end
 
@@ -4178,6 +4232,71 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
      into equations and have no residual to reconstruct, so adding them breaks
      the parallel-array invariant. =#
   return simCode
+end
+
+"""
+Walk every statement body inside `simCode.functions` (user-defined Modelica
+functions) and add every CREF name encountered to `out`. Used by
+reachability scans that protect parameters / variables consumed only from
+function bodies.
+"""
+function _collectFunctionBodyCrefs!(out::Set{String}, functions)
+  for fn in functions
+    try
+      @match fn begin
+        MODELICA_FUNCTION(__) => _walkStatementsForCrefs!(out, fn.statements)
+        _ => nothing
+      end
+    catch
+      #= Be tolerant: a bad statement variant or unexpected field count must
+         not break the surrounding pass. Worst case is we miss a few crefs
+         and over-eliminate downstream — the survivor-scan in callers (and
+         SimCodeCheck `rule_cref_resolution`) flags that. =#
+    end
+  end
+  return out
+end
+
+function _walkStatementsForCrefs!(out::Set{String}, stmts)
+  for s in stmts
+    try
+      @match s begin
+        DAE.STMT_ASSIGN(__) => begin
+          collectCrefNames!(out, s.exp1)
+          collectCrefNames!(out, s.exp)
+        end
+        DAE.STMT_ASSIGN_ARR(__) => begin
+          collectCrefNames!(out, s.exp1)
+          collectCrefNames!(out, s.exp)
+        end
+        DAE.STMT_IF(__) => begin
+          collectCrefNames!(out, s.exp1)
+          _walkStatementsForCrefs!(out, s.statementLst)
+        end
+        DAE.STMT_FOR(__) => begin
+          if isdefined(s, :range)
+            collectCrefNames!(out, s.range)
+          end
+          if isdefined(s, :statementLst)
+            _walkStatementsForCrefs!(out, s.statementLst)
+          end
+        end
+        DAE.STMT_WHILE(__) => begin
+          collectCrefNames!(out, s.exp)
+          _walkStatementsForCrefs!(out, s.statementLst)
+        end
+        DAE.STMT_WHEN(__) => begin
+          collectCrefNames!(out, s.exp)
+          _walkStatementsForCrefs!(out, s.statementLst)
+        end
+        DAE.STMT_NORETCALL(__) => collectCrefNames!(out, s.exp)
+        _ => nothing
+      end
+    catch
+      #= Skip statements with shapes we do not know about. Conservative. =#
+    end
+  end
+  return out
 end
 
 """
@@ -5178,6 +5297,7 @@ end
 
 function _computeFrozenProtectedNames(simCode::SIM_CODE)::Set{String}
   local protectedNames = Set{String}()
+  local ht = simCode.stringToSimVarHT
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
       collectCrefNames!(protectedNames, branch.condition)
@@ -5188,6 +5308,22 @@ function _computeFrozenProtectedNames(simCode::SIM_CODE)::Set{String}
   end
   for whenEq in simCode.whenEquations
     _collectWhenCrefNames!(protectedNames, whenEq.whenEquation)
+  end
+  #= Protect scalar `_re`/`_im` fields of any surviving Complex CREF.
+     foldExplicitSingleAssign would otherwise fold `coilQS_Psi_re` and
+     `coilQS_Psi_im` (definitional residuals after Complex-record
+     expansion) while the parent `coilQS_Psi` CREF still appears in
+     another equation; codegen later flattens the parent into the two
+     scalar siblings and fails with UndefVarError at module eval. =#
+  _collectComplexFieldNames!(protectedNames, simCode.residualEquations, ht)
+  _collectComplexFieldNames!(protectedNames, simCode.initialEquations, ht)
+  for ifEq in simCode.ifEquations
+    for branch in ifEq.branches
+      _collectComplexFieldNames!(protectedNames, branch.residualEquations, ht)
+    end
+  end
+  for eq in simCode.eliminatedEquations
+    _collectComplexFieldNames!(protectedNames, BDAE.RESIDUAL_EQUATION[eq], ht)
   end
   return protectedNames
 end

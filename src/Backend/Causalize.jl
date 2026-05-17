@@ -693,13 +693,22 @@ end
 """
 function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
                                   source::DAE.ElementSource, attr::BDAE.EquationAttributes)
-  #= Extract baseName and T_COMPLEX type from a CREF (CREF_IDENT or CREF_QUAL). =#
+  #= Extract (baseName, T_COMPLEX type, subscript-string) from a CREF
+     (CREF_IDENT or CREF_QUAL). The subscript-string is the flat-name
+     representation of any array indices on the LHS, e.g. "[3]" for
+     `transferFunction_aw[3]`. We need this so a Complex-array element
+     equation like `transferFunction_aw[3] = expr` produces field equations
+     with subscripted LHS names (`transferFunction_aw[3]_re`,
+     `transferFunction_aw[3]_im`) matching the scalarized HT keys, not
+     the bare names that would collapse three array entries into one. =#
   function _extractCrefBase(e)
     @match e begin
-      DAE.CREF(DAE.CREF_IDENT(name, _, _), t) where {t isa DAE.T_COMPLEX} => (name, t)
+      DAE.CREF(DAE.CREF_IDENT(name, _, subs), t) where {t isa DAE.T_COMPLEX} => begin
+        (name, t, subscriptListToString(subs))
+      end
       DAE.CREF(cr::DAE.CREF_QUAL, t) where {t isa DAE.T_COMPLEX} => begin
-        (flatName, _, _) = crefToFlatName(cr)
-        (flatName, t)
+        (flatName, _, leafSubs) = crefToFlatName(cr)
+        (flatName, t, subscriptListToString(leafSubs))
       end
       _ => nothing
     end
@@ -717,14 +726,19 @@ function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
     crefOnLeft = false
   end
   extracted === nothing && return nothing
-  (baseName, ty) = extracted
+  (baseName, ty, subsStr) = extracted
   local exprSide = crefOnLeft ? right : left
 
   equations = BDAE.Equation[]
   fieldIdx = 0
   for field in ty.varLst
     fieldIdx += 1
-    fieldName = string(baseName, OMBackend.COMPONENT_SEPARATOR, field.name)
+    #= Embed any LHS array subscript directly in the field name string so the
+       resulting flat name matches the scalarized HT key:
+         transferFunction_aw[3] (Complex) ⇒ transferFunction_aw[3]_re, _im
+       (not the bare `transferFunction_aw_re` that collapses all three
+       array entries.) =#
+    fieldName = string(baseName, subsStr, OMBackend.COMPONENT_SEPARATOR, field.name)
     fieldTy = field.ty
     exprField = DAE.ASUB(exprSide, list(DAE.ICONST(fieldIdx)))
     @match fieldTy begin

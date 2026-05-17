@@ -387,14 +387,14 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         local observedBefore = SimulationCode.simCodeMetrics(simCode)
         local observedT0 = time()
         if observedFilter === nothing
+          #= Fast default: drop the alias-map observed pipeline. The
+             eliminatedVariables / eliminatedEquations arrays are KEPT so
+             user code can still query folded variables via `sol(:name)`
+             (regression observed on AlgorithmDiscreteAssign which folds
+             `:out` and reads it from `sol`). =#
           if !isempty(simCode.aliasMap)
             @debug "[SIMCODE: observedFilter] clearing $(length(simCode.aliasMap)) alias observed equations (default: none)"
             @assign simCode.aliasMap = empty(simCode.aliasMap)
-          end
-          if !isempty(simCode.eliminatedVariables)
-            @debug "[SIMCODE: observedFilter] clearing $(length(simCode.eliminatedVariables)) eliminated-variable observed equations (default: none)"
-            @assign simCode.eliminatedVariables = empty(simCode.eliminatedVariables)
-            @assign simCode.eliminatedEquations = empty(simCode.eliminatedEquations)
           end
         else
           local filterStrings = if observedFilter isa Vector{Regex}

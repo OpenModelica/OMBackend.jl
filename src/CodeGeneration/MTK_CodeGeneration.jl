@@ -257,6 +257,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     $(createArrayParameterPrelude(simCode)...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(generateRegisterCallsForCallExprs(simCode)...)
+    $(generateInitialAlgorithmEarlyFunction(simCode))
     $(generateInitialAlgorithmFunction(simCode))
     $(model)
     function simulate(tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
@@ -269,7 +270,51 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
          bodies reference. Calling the function directly resolves those names
          in the older compile-time world and throws
          `UndefVarError: ... binding may be too new`. =#
-      Base.invokelatest(__runInitialAlgorithm!)
+      local _hardStarts = Base.invokelatest(__runInitialAlgorithm!)
+      #= Stash the un-remake'd problem so the solve() fallback below can
+         retry without enforced init-alg u0 if MTK's init system finds the
+         hard-start values infeasible against the algebraic constraints. =#
+      local _origProblem = $(Symbol("$(MODEL_NAME)Model_problem"))
+      local _didRemake = false
+      #= If the init algorithm assigned any non-parameter variables, replay
+         those values through `remake(prob; u0=…)` so MTK treats them as
+         hard initial conditions (Modelica §11.2). Symbolic-Num dict keys
+         from LATEST_REDUCED_SYSTEM are required — bare Symbol keys are
+         silently no-op'd by MTK's u0 dispatch. =#
+      if _hardStarts isa AbstractDict && !isempty(_hardStarts)
+        #= Filter to only the keys that are actual `unknowns` of the reduced
+           system. Init-algorithm LHSs that get alias-eliminated post-simplify
+           still resolve via `getproperty` (they survive as observed equations)
+           but `remake`'s u0 validator rejects them with "present in the
+           system but … is not an unknown". The existing `setu` mutation
+           inside __runInitialAlgorithm! already propagates those via the
+           alias-map's observed equation, so dropping them is safe. =#
+        local _unkNames = try
+          Set(string(u) for u in ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM))
+        catch
+          Set{String}()
+        end
+        local _hardFiltered = filter(p -> string(first(p)) in _unkNames, _hardStarts)
+        if !isempty(_hardFiltered)
+          try
+            global LATEST_PROBLEM = ModelingToolkit.SciMLBase.remake(
+              LATEST_PROBLEM; u0 = _hardFiltered)
+            $(Symbol("$(MODEL_NAME)Model_problem")) = LATEST_PROBLEM
+            _didRemake = true
+          catch _ialgErr
+            #= The cycle-19 remake is now redundant for variables that the
+               module-load-time `__runInitialAlgorithmEarly!()` path already
+               pinned via `initialization_eqs`. After MTK's init solve runs
+               those constraints, alias elimination can prune the symbolic
+               key out of the problem's u0 vector, and `remake(; u0 = Dict)`
+               then raises `BoundsError` / "key not an unknown". That is
+               harmless because the init-eq value is already in the solved
+               state. Demote to debug — a real failure would still surface
+               from the solve itself. =#
+            @debug "[MTK GEN: simulate] init-alg hard-start remake skipped (init-eqs already covered)" exception=_ialgErr
+          end
+        end
+      end
       #= Auto-switch from Rosenbrock (default Rodas5) to FBDF when the system
          has zero differential states. SciML warns that Rosenbrock methods on
          purely-algebraic systems do not bound the interpolation error, and
@@ -279,10 +324,13 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       local _solver = solver
       local _solverName = string(nameof(typeof(solver)))
       if startswith(_solverName, "Rodas") || startswith(_solverName, "Rosenbrock")
+        local _u0 = $(Symbol("$(MODEL_NAME)Model_problem")).u0
+        local _n = _u0 === nothing ? 0 : length(_u0)
         local _mm = $(Symbol("$(MODEL_NAME)Model_problem")).f.mass_matrix
-        local _n = length($(Symbol("$(MODEL_NAME)Model_problem")).u0)
         #= UniformScaling (pure ODE) supports `_mm[i,i]` as 1; explicit Matrix
-           returns the entry. Both code paths handle by indexing the diagonal. =#
+           returns the entry. Both code paths handle by indexing the diagonal.
+           When u0 is nothing (purely-algebraic MTK problem) the loop runs 0
+           times so _nDiff stays 0 — exactly the case where FBDF is wanted. =#
         local _nDiff = count(i -> _mm[i,i] != 0, 1:_n)
         if _nDiff == 0
           @info "[MTK GEN: solver] zero differential states detected, switching default $(_solverName) -> FBDF for purely-algebraic DAE"
@@ -300,11 +348,34 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
          init survives), so when-clause root-find callbacks never fire when
          routed through the prob. solve() merges with prob.kwargs[:callback]
          so MTK's init still runs in addition to our callbacks. =#
-      if haskey(kwargs, :callback)
+      local _sol = if haskey(kwargs, :callback)
         solve(_problemForSolver, _solver; kwargs...)
       else
         solve(_problemForSolver, _solver; callback=callbacks, kwargs...)
       end
+      #= If the init-alg-remake'd problem produced InitialFailure (MTK could
+         not reconcile init-alg hard-start u0 with the algebraic constraints),
+         fall back to the un-remake'd problem so the solver can pick any
+         consistent u0. This matches pre-cycle-19 behavior for models where
+         the init-alg LHS values would be silently overwritten by MTK's init
+         solver anyway (e.g. KinematicPTPHandwritten — algebraic-only model
+         whose init-alg assignments conflict with algebraic equations). =#
+      if _didRemake && _sol.retcode == ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
+        @info "[MTK GEN: simulate] init-alg hard-start caused InitialFailure; retrying without hard-start"
+        global LATEST_PROBLEM = _origProblem
+        $(Symbol("$(MODEL_NAME)Model_problem")) = _origProblem
+        local _fallbackProb = if _solver isa ModelingToolkit.SciMLBase.AbstractDAEAlgorithm
+          OMBackend.CodeGeneration.ode_to_dae(_origProblem)
+        else
+          _origProblem
+        end
+        _sol = if haskey(kwargs, :callback)
+          solve(_fallbackProb, _solver; kwargs...)
+        else
+          solve(_fallbackProb, _solver; callback=callbacks, kwargs...)
+        end
+      end
+      _sol
     end
   end
   #= MODEL_NAME is preprocessed with . replaced with _=#
@@ -1094,11 +1165,30 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
          t=0 state — the `initialValues` Pair list above is only a guess.
          Wrapped in invokelatest so symbol references resolve against the
          freshly-eval'd Symbolics bindings. =#
+      local _algResults = try
+        Base.invokelatest(__runInitialAlgorithmEarly!)
+      catch _err
+        @debug "[MTK GEN: init-alg] early eval threw at constraint-build" exception=_err
+        Dict{Symbol, Float64}()
+      end
       function _buildInitialConstraintEqs()
-        Symbolics.Equation[$(generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)...),
-                           $(getFixedStartConstraintsMTK(vcat(stateVariables, occVariables, algebraicVariables), simCode)...)]
+        local _eqs = Symbolics.Equation[$(generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)...),
+                                        $(getFixedStartConstraintsMTK(vcat(stateVariables, occVariables, algebraicVariables), simCode)...)]
+        $(emitInitAlgConstraintAppends(simCode)...)
+        return _eqs
       end
       local initialConstraintEqs = Base.invokelatest(_buildInitialConstraintEqs)
+      #= Also merge the early-eval init-algorithm results into `finalInitialValues`
+         as hard u0 entries. Needed because the `_isPureODE` branch (state with
+         der=0 and no algebraic constraints) skips `build_initializeprob` — MTK's
+         init solver never runs, so the `initialization_eqs` set above would not
+         be honoured on its own. With u0 set here, both the pure-ODE fast path
+         and the DAE-with-init-solver path produce the same initial values. =#
+      function _mergeInitAlgIntoU0!(fiv)
+        $(emitInitAlgU0Appends(simCode)...)
+        return fiv
+      end
+      Base.invokelatest(_mergeInitAlgIntoU0!, finalInitialValues)
       #= ODE System =#
       nonLinearSystem = $(odeSystemWithEvents(!isempty(ifConditionalVariables), modelName;
                                               hasObserved = !isempty(simCode.aliasMap) || !isempty(simCode.eliminatedVariables)))
@@ -1387,7 +1477,7 @@ State variables always get initialization since MTK ODEProblem requires all unkn
 """
 function createStartConditionsEquationsMTK(states::Vector,
                                         algebraics::Vector,
-                                        simCode::SimulationCode.SimCode; skipDefaultAlgebraicStarts = false)::Vector{Expr}
+                                        simCode::SimulationCode.SIM_CODE; skipDefaultAlgebraicStarts = false)::Vector{Expr}
   #= Both states and algebraics respect skipDefaultAlgebraicStarts (reverting to original behavior) =#
   local algInit = getStartConditionsMTK(algebraics, simCode; skipDefaultStarts = skipDefaultAlgebraicStarts)
   local stateInit = getStartConditionsMTK(states, simCode; skipDefaultStarts = skipDefaultAlgebraicStarts)
@@ -1408,7 +1498,7 @@ end
   that MTK's initialization solver must satisfy at t=0. Required for models
   with `InitialOutput` init mode (e.g. PID controllers' integrator state).
 """
-function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCode.SimCode)::Vector{Expr}
+function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local result = Expr[]
   for ieq in initialEqs
     if ieq isa BDAE.COMPLEX_EQUATION || ieq isa BDAE.ARRAY_EQUATION
@@ -1457,7 +1547,7 @@ end
   Generates initial equations.
   Currently unsorted unless they are sorted before being passed to the simulation code phase.
 """
-function generateInitialEquations(initialEqs, simCode::SimulationCode.SimCode; parameterAssignment = true)::Vector{Expr}
+function generateInitialEquations(initialEqs, simCode::SimulationCode.SIM_CODE; parameterAssignment = true)::Vector{Expr}
   local initialEqsExps = Expr[]
   for ieq in initialEqs
     #= COMPLEX_EQUATION/ARRAY_EQUATION should have been expanded before this point =#
@@ -1520,7 +1610,7 @@ end
   Used to determine if the system likely has algebraic constraints that
   determine some state variables, avoiding overdetermination.
 """
-function hasExplicitStartValue(vars::Vector, simCode::SimulationCode.SimCode)::Bool
+function hasExplicitStartValue(vars::Vector, simCode::SimulationCode.SIM_CODE)::Bool
   local ht::Dict = simCode.stringToSimVarHT
   for var in vars
     local entry = get(ht, var, nothing)
@@ -1549,7 +1639,7 @@ end
 If `skipDefaultStarts` is true, variables without explicit start values are skipped.
 When false, variables without start values get default 0.0 initialization.
 """
-function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode; skipDefaultStarts = false)::Vector{Expr}
+function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SIM_CODE; skipDefaultStarts = false)::Vector{Expr}
   local startExprs::Vector{Expr} = Expr[]
   local residuals = simCode.residualEquations
   local ht::Dict = simCode.stringToSimVarHT
@@ -1633,7 +1723,7 @@ end
   explicit `start`. Goes into `initialization_eqs` so MTK pins them at t=0
   rather than treating them as soft `guesses` the iteration may override.
 """
-function getFixedStartConstraintsMTK(vars::Vector, simCode::SimulationCode.SimCode)::Vector{Expr}
+function getFixedStartConstraintsMTK(vars::Vector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local result::Vector{Expr} = Expr[]
   if isempty(vars)
     return result
@@ -1667,12 +1757,83 @@ function getFixedStartConstraintsMTK(vars::Vector, simCode::SimulationCode.SimCo
 end
 
 """
+  Emit `Expr`s that push init-algorithm-derived (state => value) pairs into the
+  `finalInitialValues` vector inside Model(). Mirrors `emitInitAlgConstraintAppends`
+  but the push target is the u0-pair list (consumed by `ODEProblem(...; u0 = ...)`)
+  rather than `initialization_eqs`. The merge is required because the pure-ODE
+  branch of the ODEProblem build skips MTK's init solver, so the init-eq alone
+  would not propagate the init-algorithm value into u0.
+"""
+function emitInitAlgU0Appends(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local appends::Vector{Expr} = Expr[]
+  isempty(simCode.initialAlgorithms) && return appends
+  local ht::Dict = simCode.stringToSimVarHT
+  local lhsNames = Set{String}()
+  local rhsNames = Set{String}()
+  if any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
+    for ia in simCode.initialAlgorithms, s in ia.daeStatements
+      _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
+    end
+  else
+    for ia in simCode.initialAlgorithms, op in ia.statements
+      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
+    end
+  end
+  for name in lhsNames
+    haskey(ht, name) || continue
+    local (_, sv) = ht[name]
+    if sv.varKind isa SimulationCode.PARAMETER ||
+       sv.varKind isa SimulationCode.ARRAY_PARAMETER
+      continue
+    end
+    local qn = QuoteNode(Symbol(name))
+    push!(appends, :(haskey(_algResults, $(qn)) &&
+                     push!(fiv, $(Symbol(name)) => _algResults[$(qn)])))
+  end
+  return appends
+end
+
+"""
+  Emit `Expr`s that conditionally push init-algorithm-derived constraints into
+  the local `_eqs` vector inside `_buildInitialConstraintEqs`. Each emitted line
+  looks like `haskey(_algResults, :T_start) && push!(_eqs, T_start ~ _algResults[:T_start])`.
+"""
+function emitInitAlgConstraintAppends(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local appends::Vector{Expr} = Expr[]
+  isempty(simCode.initialAlgorithms) && return appends
+  local ht::Dict = simCode.stringToSimVarHT
+  local lhsNames = Set{String}()
+  local rhsNames = Set{String}()
+  if any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
+    for ia in simCode.initialAlgorithms, s in ia.daeStatements
+      _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
+    end
+  else
+    for ia in simCode.initialAlgorithms, op in ia.statements
+      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
+    end
+  end
+  for name in lhsNames
+    haskey(ht, name) || continue
+    local (_, sv) = ht[name]
+    if sv.varKind isa SimulationCode.PARAMETER ||
+       sv.varKind isa SimulationCode.ARRAY_PARAMETER
+      continue
+    end
+    local qn = QuoteNode(Symbol(name))
+    push!(appends, :(haskey(_algResults, $(qn)) &&
+                     push!(_eqs, $(Symbol(name)) ~ _algResults[$(qn)])))
+  end
+  return appends
+end
+
+"""
   Names of variables that have `fixed=true` AND an explicit `start`. Parallel
   to the gating in `getFixedStartConstraintsMTK`. Marking these as irreducible
   prevents MTK's structural_simplify from substituting them through aliases —
   the user's init constraint must land on a surviving unknown.
 """
-function fixedStartVarNames(vars::Vector, simCode::SimulationCode.SimCode)::Vector{String}
+function fixedStartVarNames(vars::Vector, simCode::SimulationCode.SIM_CODE)::Vector{String}
   local result::Vector{String} = String[]
   if isempty(vars)
     return result
@@ -1820,10 +1981,10 @@ function createIfEquation(stateVariables::Vector,
 end
 
 """
-  `createParameterEquationsMTK(parameters::Vector, type, simCode::SimulationCode.SimCode)`
+  `createParameterEquationsMTK(parameters::Vector, type, simCode::SimulationCode.SIM_CODE)`
     The Type specifies what kind of parameter equation a call to this function should yield.
 """
-function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode.SimCode)::Vector{Expr}
+function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local parameterEquations::Vector = Expr[]
   local ht = simCode.stringToSimVarHT
   for param in parameters
@@ -1889,7 +2050,7 @@ end
   concrete Julia arrays assigned to their symbol names, so that the generated
   algorithmic functions can subscript into them.
 """
-function createArrayParametersMTK(arrayParameters::Vector, simCode::SimulationCode.SimCode)::Vector{Expr}
+function createArrayParametersMTK(arrayParameters::Vector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local exprs = Expr[]
   local ht = simCode.stringToSimVarHT
   for param in arrayParameters
@@ -1914,7 +2075,7 @@ end
   Creates parameters assignments *(:=) on a MTK parameters compatible format.
 """
 function createParameterAssignmentsMTK(parameters::Vector,
-                                       simCode::SimulationCode.SimCode)::Vector{Expr}
+                                       simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local parameterEquations::Vector = Expr[]
   local ht = simCode.stringToSimVarHT
   for param in parameters
@@ -1971,7 +2132,7 @@ followed by `simulate(...; overwriteCache=true)` reruns the data-structure
 init with the new value. Re-evaluating with `overwriteCache=false` reuses the
 cached tableID seeded from the previous String value.
 """
-function createStringParameterAssignments(simCode::SimulationCode.SimCode)::Vector{Expr}
+function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local exprs::Vector{Expr} = Expr[]
   for varName in keys(simCode.stringToSimVarHT)
     (idx, simVar) = simCode.stringToSimVarHT[varName]
@@ -2027,7 +2188,7 @@ end
         element bindings and emit `tableData = <reconstructed>`. Required
         because ExternalObject constructors (CombiTable, CombiTimeTable, ...)
         appear at module top and reference the parent array name. =#
-function createArrayParameterPrelude(simCode::SimulationCode.SimCode)::Vector{Expr}
+function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local exprs::Vector{Expr} = Expr[]
   local ht = simCode.stringToSimVarHT
 
@@ -2123,7 +2284,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SimCode)::Vector{Ex
   return exprs
 end
 
-function createDataStructureAssignments(dataStructureVariables::Vector{String}, simCode::SimulationCode.SimCode)::Vector{Expr}
+function createDataStructureAssignments(dataStructureVariables::Vector{String}, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local dsAssignments::Vector = Expr[]
   local ht = simCode.stringToSimVarHT
   #= Same Modelica-function name set used by rewriteEquations: needed to qualify
@@ -2948,6 +3109,19 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE)
              catch
                nothing
              end;
+             #= Record (symbolic_var => value) so simulate() can pass it via
+                remake(prob; u0 = …, initializealg = NoInit()) as a hard
+                initial condition. Per Modelica §11.2 the LHS of an
+                `initial algorithm` ASSIGN is the variable's initial value;
+                MTK's default OverrideInit treats prob.u0 as guesses and
+                would otherwise re-solve them away. The dict key must be the
+                Symbolics `Num` from the reduced system — bare Symbols are
+                silently no-op'd by MTK's remake u0 dispatch. =#
+             try
+               _hard[getproperty(LATEST_REDUCED_SYSTEM, $(QuoteNode(sym)))] = $(sym)
+             catch
+               nothing
+             end;
              nothing )
         end
       end
@@ -2970,6 +3144,280 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE)
   end
 end
 
+#= Walk a lowered Julia expression and rename bare-identifier references to
+   crefs in `names` by adding the `_alg_` prefix, leaving the first argument of
+   `Expr(:call, ...)` untouched (so Modelica function names like `sin`, `abs`,
+   `integer` are not renamed). Used by `__runInitialAlgorithmEarly!` to give
+   each Modelica cref a local Julia binding whose value is set by sequential
+   ASSIGN statements without colliding with the Symbolics `Num` of the same
+   name living in the model module's scope. =#
+function _renameAlgIdentifiers(expr, names::Set{String})
+  if expr isa Symbol
+    return string(expr) in names ? Symbol("_alg_" * string(expr)) : expr
+  elseif expr isa Expr
+    if expr.head === :call && length(expr.args) >= 1
+      local newArgs = Any[expr.args[1]]
+      for i in 2:length(expr.args)
+        push!(newArgs, _renameAlgIdentifiers(expr.args[i], names))
+      end
+      return Expr(:call, newArgs...)
+    else
+      return Expr(expr.head, map(a -> _renameAlgIdentifiers(a, names), expr.args)...)
+    end
+  end
+  return expr
+end
+
+#= Return a Modelica-spec compatible literal seed for a non-LHS cref read on
+   the RHS of an init-algorithm statement. Reads the `start` attribute from
+   the SimVar's DAE attributes when available; otherwise defaults to 0.0. =#
+function _readStartAttributeAsLiteral(sv)::Float64
+  local attrs = sv.attributes
+  @match attrs begin
+    SOME(a) => begin
+      @match a.start begin
+        SOME(DAE.RCONST(r)) => Float64(r)
+        SOME(DAE.ICONST(i)) => Float64(i)
+        SOME(DAE.BCONST(b)) => (b ? 1.0 : 0.0)
+        _ => 0.0
+      end
+    end
+    _ => 0.0
+  end
+end
+
+#= Translate a single `BDAE.WhenOperator` from an init-algorithm body into a
+   Julia statement suitable for the procedural body of
+   `__runInitialAlgorithmEarly!`. ASSIGN emits `_alg_<lhs> = <rhs>` (with
+   `local` on the first occurrence of that LHS); RHS identifiers are renamed
+   via `_renameAlgIdentifiers` so they bind to the let-block locals rather
+   than to module-level Symbolics bindings of the same name. =#
+function _initialWhenOpToJuliaEarly(wStmt, simCode::SimulationCode.SIM_CODE,
+                                    renamedNames::Set{String}, seenLHS::Set{String})
+  local sub = e -> _substituteBoundParameters(e, simCode)
+  local lowerAlg = e -> _renameAlgIdentifiers(
+    _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))),
+    renamedNames)
+  local crefName = cr -> SimulationCode.DAE_identifierToString(cr)
+  @match wStmt begin
+    BDAE.NORETCALL(__) => :( $(lowerAlg(wStmt.exp)); nothing )
+    BDAE.ASSIGN(__) => begin
+      local name = @match wStmt.left begin
+        DAE.CREF(cr, _) => crefName(cr)
+        _ => nothing
+      end
+      if name === nothing
+        :( $(lowerAlg(wStmt.right)); nothing )
+      else
+        local algSym = Symbol("_alg_" * name)
+        if name in seenLHS
+          :( $(algSym) = $(lowerAlg(wStmt.right)); nothing )
+        else
+          push!(seenLHS, name)
+          :( local $(algSym) = $(lowerAlg(wStmt.right)); nothing )
+        end
+      end
+    end
+    BDAE.ASSERT(__) => begin
+      local cond = lowerAlg(wStmt.condition)
+      local msg = lowerAlg(wStmt.message)
+      :(if !($cond); @warn "Modelica assert() during init (early)" message=$(msg); end)
+    end
+    BDAE.TERMINATE(__) => begin
+      local msg = lowerAlg(wStmt.message)
+      :(@info "Modelica terminate() during init (early)" message=$(msg))
+    end
+    _ => :( nothing )
+  end
+end
+
+#= Recursively collect LHS / RHS cref names from a `DAE.Statement` tree.
+   Mirrors `_collectInitAlgLhsRhsCrefs!` but for the DAE.Statement variant,
+   recursing into STMT_IF / STMT_FOR / STMT_WHILE bodies so cref names inside
+   control-flow are not missed. =#
+function _collectInitAlgLhsRhsCrefsDAE!(lhs::Set{String}, rhs::Set{String}, stmt)
+  local pushCrefsFrom = function(exp)
+    exp === nothing && return
+    for c in Util.getAllCrefs(exp); push!(rhs, string(c)); end
+  end
+  local crefName = function(e)
+    @match e begin
+      DAE.CREF(cr, _) => string(cr)
+      _ => ""
+    end
+  end
+  @match stmt begin
+    DAE.STMT_ASSIGN(_, e1, e, _) => begin
+      local n = crefName(e1); !isempty(n) && push!(lhs, n)
+      pushCrefsFrom(e)
+    end
+    DAE.STMT_TUPLE_ASSIGN(_, lhsList, e, _) => begin
+      for lhsExp in lhsList
+        local n = crefName(lhsExp); !isempty(n) && push!(lhs, n)
+      end
+      pushCrefsFrom(e)
+    end
+    DAE.STMT_ASSIGN_ARR(_, e1, e, _) => begin
+      local n = crefName(e1); !isempty(n) && push!(lhs, n)
+      pushCrefsFrom(e)
+    end
+    DAE.STMT_NORETCALL(e, _) => pushCrefsFrom(e)
+    DAE.STMT_ASSERT(c, m, l, _) => begin
+      pushCrefsFrom(c); pushCrefsFrom(m); pushCrefsFrom(l)
+    end
+    DAE.STMT_TERMINATE(m, _) => pushCrefsFrom(m)
+    DAE.STMT_REINIT(v, val, _) => begin
+      pushCrefsFrom(v); pushCrefsFrom(val)
+    end
+    DAE.STMT_IF(cond, body, else_, _) => begin
+      pushCrefsFrom(cond)
+      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
+      _collectInitAlgLhsRhsCrefsDAEElse!(lhs, rhs, else_)
+    end
+    DAE.STMT_FOR(_, _, iter, _, range, body, _) => begin
+      pushCrefsFrom(range)
+      push!(lhs, iter)
+      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
+    end
+    DAE.STMT_PARFOR(_, _, iter, _, range, body, _, _) => begin
+      pushCrefsFrom(range)
+      push!(lhs, iter)
+      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
+    end
+    DAE.STMT_WHILE(cond, body, _) => begin
+      pushCrefsFrom(cond)
+      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
+    end
+    _ => nothing
+  end
+end
+
+function _collectInitAlgLhsRhsCrefsDAEElse!(lhs::Set{String}, rhs::Set{String}, else_)
+  @match else_ begin
+    DAE.ELSE(stmts) => for s in stmts; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
+    DAE.ELSEIF(cond, stmts, rest) => begin
+      for c in Util.getAllCrefs(cond); push!(rhs, string(c)); end
+      for s in stmts; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
+      _collectInitAlgLhsRhsCrefsDAEElse!(lhs, rhs, rest)
+    end
+    _ => nothing
+  end
+end
+
+"""
+    generateInitialAlgorithmEarlyFunction(simCode) -> Expr
+
+Emit `function __runInitialAlgorithmEarly!() -> Dict{Symbol, Float64}` that
+executes the `initial algorithm` bodies procedurally at module-load time
+(Modelica §11.4: statements run sequentially, the LHS final value becomes the
+variable's initial value).
+
+When `simCode.initialAlgorithms[i].daeStatements` is non-empty for any body,
+the procedural body is lowered via `AlgorithmicCodeGeneration.generateStatements`
+— the same path used for regular Modelica algorithm sections and function
+bodies, with full STMT_IF / STMT_FOR / STMT_WHILE / STMT_ASSERT / STMT_REINIT
+support. The resulting Julia AST is then rewritten by `_renameAlgIdentifiers`
+to prefix every cref name with `_alg_`, so the locals do not collide with the
+Symbolics `Num` bindings of the same name living in the surrounding model
+scope. When `daeStatements` is empty (e.g. older callers that only provide a
+`Vector{BDAE.WhenOperator}`), the legacy flat-WhenOperator translator
+`_initialWhenOpToJuliaEarly` is used as a fallback.
+
+The body is wrapped in `let time = 0.0 ... end`. Non-LHS crefs read on the
+RHS get a pre-seeded `_alg_<name>` from the SimVar's `start` attribute or
+`0.0`. After the body, each LHS final value is captured into the returned
+`Dict{Symbol, Float64}` via a per-entry try/catch (so a still-undefined
+`_alg_<name>` from a body that errored partway just skips that entry).
+
+The outer try/catch returns partial results on any error; the cycle-19
+runtime `remake` path remains as a fallback for state-cref-RHS reads whose
+post-init value differs from the `start` attribute.
+"""
+function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)::Expr
+  local lhsNames = Set{String}()
+  local rhsNames = Set{String}()
+  local useDAEPath = any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
+  if useDAEPath
+    for ia in simCode.initialAlgorithms, s in ia.daeStatements
+      _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
+    end
+  else
+    for ia in simCode.initialAlgorithms, op in ia.statements
+      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
+    end
+  end
+  if isempty(lhsNames) && isempty(rhsNames)
+    return quote
+      function __runInitialAlgorithmEarly!()
+        return Dict{Symbol, Float64}()
+      end
+    end
+  end
+  local ht = simCode.stringToSimVarHT
+  local renamedNames = union(lhsNames, rhsNames)
+  push!(renamedNames, "time")
+  local prefetches = Expr[]
+  for name in setdiff(rhsNames, lhsNames)
+    name == "time" && continue
+    haskey(ht, name) || begin
+      push!(prefetches, :(local $(Symbol("_alg_" * name)) = 0.0))
+      continue
+    end
+    local sv = ht[name][2]
+    if sv.varKind isa SimulationCode.PARAMETER ||
+       sv.varKind isa SimulationCode.ARRAY_PARAMETER
+      continue
+    end
+    local lit = _readStartAttributeAsLiteral(sv)
+    push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(lit)))
+  end
+  for name in lhsNames
+    push!(prefetches, :(local $(Symbol("_alg_" * name)) = 0.0))
+  end
+  local stmts = Expr[]
+  if useDAEPath
+    for ia in simCode.initialAlgorithms
+      isempty(ia.daeStatements) && continue
+      local body = AlgorithmicCodeGeneration.generateStatements(ia.daeStatements)
+      for s in body
+        push!(stmts, _renameAlgIdentifiers(s, renamedNames))
+      end
+    end
+  else
+    local seenLHS = Set{String}()
+    for ia in simCode.initialAlgorithms, op in ia.statements
+      push!(stmts, _initialWhenOpToJuliaEarly(op, simCode, renamedNames, seenLHS))
+    end
+  end
+  local captures = Expr[]
+  for name in lhsNames
+    haskey(ht, name) || continue
+    local sv = ht[name][2]
+    if sv.varKind isa SimulationCode.PARAMETER ||
+       sv.varKind isa SimulationCode.ARRAY_PARAMETER
+      continue
+    end
+    local algSym = Symbol("_alg_" * name)
+    local qn = QuoteNode(Symbol(name))
+    push!(captures, :(try; _results[$(qn)] = Float64($(algSym)); catch; nothing; end))
+  end
+  return quote
+    function __runInitialAlgorithmEarly!()
+      local _results = Dict{Symbol, Float64}()
+      try
+        let time = 0.0
+          $(prefetches...)
+          $(stmts...)
+          $(captures...)
+        end
+      catch _err
+        @debug "[MTK GEN: init-alg early] body raised; partial results returned" exception=_err
+      end
+      return _results
+    end
+  end
+end
+
 """
     generateInitialAlgorithmFunction(simCode) -> Expr
 
@@ -2980,6 +3428,19 @@ at SimCode construction time, so no module-scope parameter bindings are needed
 here. Returns a no-op stub when the model has no `when initial()` clauses.
 """
 function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Expr
+  #= When the DAE.Statement-based early-eval path is available, it emits
+     control-flow-correct `initialization_eqs` for every LHS. The runtime
+     `remake` here is built from the lossy WhenOperator flattening and would
+     overwrite the init-eq result with the flat-first-branch value at simulate
+     time. Emit an empty stub instead — the early path covers it. =#
+  local useDAEPath = any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
+  if useDAEPath
+    return quote
+      function __runInitialAlgorithm!()
+        return Dict{Any, Any}()
+      end
+    end
+  end
   local stmts = Expr[]
   local lhsNames = Set{String}()
   local rhsNames = Set{String}()
@@ -2992,7 +3453,7 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
   if isempty(stmts)
     return quote
       function __runInitialAlgorithm!()
-        return nothing
+        return Dict{Any, Any}()
       end
     end
   end
@@ -3030,18 +3491,26 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
        (e.g. INV3S's `UX01Conv[iNV3S_enable]`). Clamping to 1 keeps the
        simulation running with Logic.'U' semantics until the deeper init
        fix lands. =#
+    #= Wrap getu in try/catch: MTK 9+ throws "is not an unknown" when the
+       cref is observed (alias-eliminated). DCPM_Cooling et al. hit this on
+       `wMechanical`. Fall back to 1 (safe default for the existing Int-clamp
+       band-aid below). =#
     push!(fetches, Expr(:local,
       Expr(:(=), sym,
-        :(let _g = ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))
-            local _raw = _g(LATEST_PROBLEM)
-            local _v = if _raw isa Integer
-              Int(_raw)
-            elseif _raw isa Real
-              Int(round(Float64(_raw)))
-            else
-              1
+        :(try
+            let _g = ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))
+              local _raw = _g(LATEST_PROBLEM)
+              local _v = if _raw isa Integer
+                Int(_raw)
+              elseif _raw isa Real
+                Int(round(Float64(_raw)))
+              else
+                1
+              end
+              _v < 1 ? 1 : _v
             end
-            _v < 1 ? 1 : _v
+          catch
+            1
           end))))
   end
   #= Shadow `Base.time` (a UNIX-time function) with the local Modelica `time`
@@ -3051,11 +3520,16 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
      because `Base.time` is a function, not a number. =#
   return quote
     function __runInitialAlgorithm!()
+      #= `_hard` collects (symbolic_var => value) pairs for each ASSIGN to a
+         non-parameter variable. simulate() passes it to `remake(prob; u0=…,
+         initializealg=NoInit())` so MTK treats the init-algorithm-computed
+         values as hard initial conditions (Modelica §11.2), not guesses. =#
+      local _hard = Dict{Any, Any}()
       let time = 0.0
         $(fetches...)
         $(stmts...)
       end
-      return nothing
+      return _hard
     end
   end
 end

@@ -46,6 +46,17 @@ import Absyn
 import DAE
 import OMFrontend
 
+#= Side-channel from `synthesizeFromInitialAlgorithms` /
+   `synthesizeInitialWhenFromAlgorithms` to `SimulationCode`'s
+   `INITIAL_ALGORITHM` construction. Keyed by the produced
+   `BDAE.INITIAL_WHEN_EQUATION` wrapper (object identity), value is the
+   original DAE.Statement list before it was flattened to a WhenOperator list
+   by `_daeStmtsToWhenOps`. Cleared at the start of each `createEqSystem`
+   call so the dict tracks only the current model's init-algorithm bodies.
+   `IdDict` because the keys are mutable Julia structs whose equality is
+   identity-based at this layer. =#
+const _INIT_ALG_DAE_STMTS = IdDict{Any, Vector{DAE.Statement}}()
+
 """
   This function translates a DAE, which is the result from instantiating a
   class, into a more precise form, called BDAE.BDAE defined in this module.
@@ -144,6 +155,7 @@ end
 function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   local name = flatModel.name
   @info "[BDAE: createEqSystem] start" name
+  empty!(_INIT_ALG_DAE_STMTS)
   local equations = BDAE.Equation[]
   for eq in OMFrontend.Frontend.convertEquations(flatModel.equations)
     local result = equationToBackendEquation(eq)
@@ -832,7 +844,7 @@ function _appendStmtsToOps!(ops::Vector, daeStmts)
          `initial algorithm` bodies that only contain straight-line code over
          scalar variables this is adequate; bodies that depend on iteration
          variables (DAE.STMT_FOR) need full lowering, which can be added later. =#
-      DAE.STMT_FOR(_, _, _, _, body, _) => _appendStmtsToOps!(ops, body)
+      DAE.STMT_FOR(_, _, _, _, _, body, _) => _appendStmtsToOps!(ops, body)
       DAE.STMT_IF(_, tb, _, _) => _appendStmtsToOps!(ops, tb)
       DAE.STMT_WHILE(_, body, _) => _appendStmtsToOps!(ops, body)
       _ => nothing
@@ -858,12 +870,14 @@ function synthesizeFromInitialAlgorithms(iAlgorithms)::Vector{BDAE.Equation}
     local initialCall = DAE.CALL(Absyn.IDENT("initial"),
                                  MetaModelica.list(),
                                  DAE.callAttrBuiltinBool)
-    push!(out, BDAE.INITIAL_WHEN_EQUATION(
+    local node = BDAE.INITIAL_WHEN_EQUATION(
       length(alg.statements),
       BDAE.WHEN_STMTS(initialCall, whenOps, NONE()),
       alg.source,
       nothing,
-    ))
+    )
+    _INIT_ALG_DAE_STMTS[node] = collect(daeStmts)
+    push!(out, node)
   end
   return out
 end
@@ -1266,7 +1280,116 @@ Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BD
     source,
     nothing,
   ))
+  #= Per Modelica spec §17.4.4: a non-when algorithm with discrete LHS fires
+     at any event that changes its RHS inputs. The INITIAL_WHEN above sets the
+     LHS at t=0; we also need a regular WHEN_EQUATION whose condition is
+     `change(d1) OR change(d2) ... ` over every discrete cref referenced
+     in the body, so the LHS keeps tracking those inputs as they flip during
+     simulation. Without this, AlgorithmDiscreteAssign's `out := trigger + 10`
+     would stay pinned at its t=0 value (out = 13) even after `trigger`
+     becomes 7 at t=0.5. =#
+  local discRhsCrefs = _collectDiscreteRhsCrefs(daeStmts)
+  if !isempty(discRhsCrefs)
+    local cond = _buildChangeOrCondition(discRhsCrefs)
+    push!(out, BDAE.WHEN_EQUATION(
+      length(ops),
+      BDAE.WHEN_STMTS(cond, MetaModelica.list(ops...), NONE()),
+      source,
+      nothing,
+    ))
+  end
   return
+end
+
+Base.@nospecializeinfer function _pushDiscreteCref!(out::Vector{DAE.ComponentRef},
+                                                    seen::Set{String},
+                                                    blocked::Set{String},
+                                                    @nospecialize(cref))
+  cref isa DAE.ComponentRef || return nothing
+  _isTimeCref(cref) && return nothing
+  local key = string(cref)
+  key in blocked && return nothing
+  local ty = _crefType(cref)
+  ty === nothing && return nothing
+  _isDiscreteDAEType(ty) || return nothing
+  key in seen && return nothing
+  push!(seen, key)
+  push!(out, cref)
+  return nothing
+end
+
+Base.@nospecializeinfer function _visitDiscreteRhsCref(@nospecialize(exp),
+                                                       ctx::Tuple{Vector{DAE.ComponentRef}, Set{String}, Set{String}})
+  @match exp begin
+    DAE.CREF(cr, _) => _pushDiscreteCref!(ctx[1], ctx[2], ctx[3], cr)
+    DAE.REDUCTION(_, _, iters) => _collectReductionIterNames!(ctx[3], iters)
+    _ => nothing
+  end
+  return (exp, true, ctx)
+end
+
+Base.@nospecializeinfer function _collectReductionIterNames!(blocked::Set{String}, @nospecialize(iters))
+  for it in iters
+    @match it begin
+      DAE.REDUCTIONITER(id, _, _, _) => push!(blocked, id)
+      _ => nothing
+    end
+  end
+  return nothing
+end
+
+Base.@nospecializeinfer function _walkDiscreteStmtsForRhsCrefs!(out::Vector{DAE.ComponentRef},
+                                                                seen::Set{String},
+                                                                blocked::Set{String},
+                                                                @nospecialize(stmts))
+  local ctx = (out, seen, blocked)
+  for s in stmts
+    @match s begin
+      DAE.STMT_ASSIGN(_, _, rhs, _) => Util.traverseExpTopDown(rhs, _visitDiscreteRhsCref, ctx)
+      DAE.STMT_ASSIGN_ARR(_, _, rhs, _) => Util.traverseExpTopDown(rhs, _visitDiscreteRhsCref, ctx)
+      DAE.STMT_IF(cond, body, _, _) => begin
+        Util.traverseExpTopDown(cond, _visitDiscreteRhsCref, ctx)
+        _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, body)
+      end
+      DAE.STMT_FOR(_, _, iter, _, _, body, _) => begin
+        local pushed = !(iter in blocked)
+        pushed && push!(blocked, iter)
+        _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, body)
+        pushed && delete!(blocked, iter)
+      end
+      DAE.STMT_WHILE(cond, body, _) => begin
+        Util.traverseExpTopDown(cond, _visitDiscreteRhsCref, ctx)
+        _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, body)
+      end
+      _ => nothing
+    end
+  end
+  return nothing
+end
+
+Base.@nospecializeinfer function _collectDiscreteRhsCrefs(@nospecialize(daeStmts))::Vector{DAE.ComponentRef}
+  local out = DAE.ComponentRef[]
+  local seen = Set{String}()
+  local blocked = Set{String}()
+  _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, daeStmts)
+  return out
+end
+
+Base.@nospecializeinfer function _makeChangeCall(@nospecialize(cref))
+  local ty = _crefType(cref)
+  local callArg = DAE.CREF(cref, ty === nothing ? DAE.T_REAL_DEFAULT : ty)
+  return DAE.CALL(Absyn.IDENT("change"),
+                  MetaModelica.list(callArg),
+                  DAE.callAttrBuiltinBool)
+end
+
+Base.@nospecializeinfer function _buildChangeOrCondition(crefs::Vector{DAE.ComponentRef})
+  isempty(crefs) && return DAE.BCONST(false)
+  local acc = _makeChangeCall(crefs[1])
+  for i in 2:length(crefs)
+    acc = DAE.LBINARY(acc, DAE.OR(DAE.T_BOOL_DEFAULT), _makeChangeCall(crefs[i]))
+  end
+  return acc
 end
 
 #= If `stmt` is a top-level `STMT_IF { cond, body = [STMT_ASSIGN(disc, expr)] }`
@@ -1390,12 +1513,14 @@ function synthesizeInitialWhenFromAlgorithms(algorithms)::Vector{BDAE.Equation}
         DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
           local daeStmts = OMFrontend.Frontend.convertStatements(frontendBody)
           local whenOps = _daeStmtsToWhenOps(daeStmts)
-          push!(out, BDAE.INITIAL_WHEN_EQUATION(
+          local node = BDAE.INITIAL_WHEN_EQUATION(
             length(frontendBody),
             BDAE.WHEN_STMTS(daeCond, whenOps, NONE()),
             stmt.source,
             nothing,
-          ))
+          )
+          _INIT_ALG_DAE_STMTS[node] = collect(daeStmts)
+          push!(out, node)
         end
         _ => nothing
       end

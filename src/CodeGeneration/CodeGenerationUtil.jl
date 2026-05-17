@@ -2998,6 +2998,7 @@ end
 """
 function flattenRecordCallArg(arg::DAE.Exp, simCode, hashTable; varPrefix::String="", varSuffix::String="")::Vector{Symbol}
   @match arg begin
+    #= Original pattern: T_COMPLEX wrapping a RECORD class. =#
     DAE.CREF(cr, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => begin
       local baseName::String = SimulationCode.string(cr)
       local flattenedExprs::Vector{Symbol} = Symbol[]
@@ -3016,6 +3017,35 @@ function flattenRecordCallArg(arg::DAE.Exp, simCode, hashTable; varPrefix::Strin
         end
       end
       return flattenedExprs
+    end
+    #= Connector-typed Complex CREFs (e.g. `Modelica.ComplexBlocks.Interfaces.ComplexInput
+       transferFunction_u`) carry a T_COMPLEX with `ClassInf.CONNECTOR` rather than
+       `ClassInf.RECORD`. Codegen needs the same scalarization treatment — without it,
+       a bare `transferFunction_u` symbol leaks into the generated module and triggers
+       `UndefVarError` at MTK eval. Same flattening, different ClassInf. =#
+    DAE.CREF(cr, DAE.T_COMPLEX(_, varLst, _)) => begin
+      local baseName::String = SimulationCode.string(cr)
+      local flattenedExprs::Vector{Symbol} = Symbol[]
+      for field in varLst
+        @match field begin
+          DAE.TYPES_VAR(fieldName, _, _, _, _) => begin
+            local flatName::String = baseName * COMPONENT_SEPARATOR * fieldName
+            if haskey(hashTable, flatName)
+              push!(flattenedExprs, Symbol(varPrefix * flatName * varSuffix))
+            else
+              push!(flattenedExprs, Symbol(flatName))
+            end
+          end
+          _ => nothing
+        end
+      end
+      #= Only treat as flattened if at least one scalar sibling exists in HT.
+         Otherwise fall through to the default codegen path so we don't emit
+         bogus references to fields that were never produced. =#
+      if any(s -> haskey(hashTable, String(s)), flattenedExprs)
+        return flattenedExprs
+      end
+      return Symbol[]
     end
     _ => return Symbol[]
   end

@@ -1425,6 +1425,15 @@ function injectObservedEquations(sys, observedEqs::Vector)
     end
     updated = node
   end
+  if updated !== nothing && hasfield(typeof(updated), :index_cache) &&
+     ModelingToolkit.get_index_cache(updated) !== nothing
+    try
+      local _icFresh = ModelingToolkit.IndexCache(updated)
+      updated = Setfield.set(updated, Setfield.PropertyLens{:index_cache}(), _icFresh)
+    catch _err
+      @debug "[MTK GEN: observed] index_cache rebuild skipped" exception=_err
+    end
+  end
   return updated
 end
 
