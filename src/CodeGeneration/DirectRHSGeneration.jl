@@ -118,8 +118,17 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   catch
     Dict()
   end
+  local hardInitialValues = _collectHardInitializationValues(
+    reducedSystem, finalInitialValues; resolvedParams=resolvedParams)
+  local observedEquations = try
+    ModelingToolkit.observed(reducedSystem)
+  catch
+    Symbolics.Equation[]
+  end
   local u0 = _buildStateVector(states, finalInitialValues; resolvedParams=resolvedParams,
-                                systemGuesses=systemGuesses)
+                                systemGuesses=systemGuesses,
+                                hardInitialValues=hardInitialValues,
+                                observedEquations=observedEquations)
   local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
 
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
@@ -161,6 +170,41 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
 
   @debug "DirectRHS: problem constructed successfully"
   return problem
+end
+
+
+function _collectHardInitializationValues(reducedSystem, finalInitialValues;
+                                          resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
+  local values = Dict{Any, Float64}()
+  for pair in finalInitialValues
+    values[pair.first] = _toFloat64(pair.second; resolvedParams=resolvedParams)
+  end
+  local initEqs = try
+    ModelingToolkit.initialization_equations(reducedSystem)
+  catch
+    return values
+  end
+  for eq in initEqs
+    startswith(string(eq.lhs), "Differential(") && continue
+    local rhsVal = _literalNumericValue(eq.rhs)
+    rhsVal === nothing && continue
+    values[eq.lhs] = rhsVal
+  end
+  return values
+end
+
+
+function _literalNumericValue(val)
+  local raw = val
+  raw = raw isa Symbolics.Num ? Symbolics.unwrap(raw) : raw
+  raw isa Number && return Float64(raw)
+  raw = try
+    Symbolics.value(raw)
+  catch
+    return nothing
+  end
+  raw = raw isa Symbolics.Num ? Symbolics.unwrap(raw) : raw
+  return raw isa Number ? Float64(raw) : nothing
 end
 
 
@@ -254,7 +298,9 @@ mismatch issues.
 """
 function _buildStateVector(states, finalInitialValues;
                            resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
-                           systemGuesses=nothing)
+                           systemGuesses=nothing,
+                           hardInitialValues=nothing,
+                           observedEquations=nothing)
   local nStates = length(states)
   local u0 = zeros(Float64, nStates)
   local stateStrToIdx = Dict{String, Int}()
@@ -262,12 +308,30 @@ function _buildStateVector(states, finalInitialValues;
     stateStrToIdx[string(s)] = i
   end
   local matchedSet = Set{String}()
+  local hardValueMap = Dict{Any, Float64}()
   for pair in finalInitialValues
     local keyStr = string(pair.first)
+    local val = _toFloat64(pair.second; resolvedParams=resolvedParams)
+    hardValueMap[pair.first] = val
     if haskey(stateStrToIdx, keyStr)
-      u0[stateStrToIdx[keyStr]] = _toFloat64(pair.second; resolvedParams=resolvedParams)
+      u0[stateStrToIdx[keyStr]] = val
       push!(matchedSet, keyStr)
     end
+  end
+  if hardInitialValues !== nothing
+    for (key, val) in hardInitialValues
+      hardValueMap[key] = val
+      local keyStr = string(key)
+      if haskey(stateStrToIdx, keyStr) && !(keyStr in matchedSet)
+        u0[stateStrToIdx[keyStr]] = val
+        push!(matchedSet, keyStr)
+      end
+    end
+  end
+  local aliasMatched = 0
+  if observedEquations !== nothing && !isempty(observedEquations)
+    aliasMatched = _propagateObservedAliasInitialValues!(
+      u0, states, matchedSet, hardValueMap, observedEquations)
   end
   # Fill unmatched states from system guesses (post-simplification variable space).
   # These provide Modelica start values for algebraic variables whose pre-simplification
@@ -284,8 +348,67 @@ function _buildStateVector(states, finalInitialValues;
       end
     end
   end
-  @debug "DirectRHS: matched $(length(matchedSet))/$(nStates) states ($(length(matchedSet) - guessMatched) hard, $(guessMatched) from guesses)"
+  @debug "DirectRHS: matched $(length(matchedSet))/$(nStates) states ($(length(matchedSet) - guessMatched) hard, $(aliasMatched) via observed aliases, $(guessMatched) from guesses)"
   return u0
+end
+
+
+function _propagateObservedAliasInitialValues!(u0, states, matchedSet::Set{String},
+                                               hardValueMap::Dict{Any, Float64},
+                                               observedEquations)
+  local aliasMatched = 0
+  local progressed = true
+  while progressed
+    progressed = false
+    for (i, st) in enumerate(states)
+      local stStr = string(st)
+      stStr in matchedSet && continue
+      local resolved = _resolveObservedAffineInitialValue(st, observedEquations, hardValueMap)
+      resolved === nothing && continue
+      u0[i] = resolved
+      hardValueMap[st] = resolved
+      push!(matchedSet, stStr)
+      aliasMatched += 1
+      progressed = true
+    end
+  end
+  return aliasMatched
+end
+
+
+function _resolveObservedAffineInitialValue(target, observedEquations, hardValueMap::Dict{Any, Float64})
+  local targetStr = string(target)
+  for eq in observedEquations
+    contains(string(eq), targetStr) || continue
+    local knownValues = Dict{Any, Any}(k => v for (k, v) in hardValueMap
+                                      if string(k) != targetStr)
+    local resolved = _resolveAffineInitialValue(target, eq, knownValues)
+    resolved === nothing || return resolved
+  end
+  return nothing
+end
+
+
+function _resolveAffineInitialValue(target, eq, knownValues::Dict)
+  local expr = Symbolics.substitute(eq.lhs - eq.rhs, knownValues)
+  local y0 = _substituteTargetNumeric(expr, target, 0.0)
+  y0 === nothing && return nothing
+  local y1 = _substituteTargetNumeric(expr, target, 1.0)
+  y1 === nothing && return nothing
+  local y2 = _substituteTargetNumeric(expr, target, 2.0)
+  y2 === nothing && return nothing
+  local slope1 = y1 - y0
+  local slope2 = y2 - y1
+  iszero(slope1) && return nothing
+  isapprox(slope1, slope2; atol=1e-8, rtol=1e-8) || return nothing
+  local value = -y0 / slope1
+  return isfinite(value) ? Float64(value) : nothing
+end
+
+
+function _substituteTargetNumeric(expr, target, value::Float64)
+  local substituted = Symbolics.substitute(expr, Dict(target => value))
+  return _literalNumericValue(substituted)
 end
 
 

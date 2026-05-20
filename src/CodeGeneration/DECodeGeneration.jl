@@ -23,16 +23,18 @@ Builds a self-contained Julia module that defines:
 
 The emitter intentionally does NOT depend on ModelingToolkit, on
 `expToJuliaExpMTK`, or on any of the MTK helpers. It mirrors the
-SIM_CODE -> Julia mapping in the donor `codeGen.jl` but builds its own
-ordered state/parameter index assignment so derivative slots and state
-slots line up by integer position.
-
-Initial scope (per the 2026-04 audit at ../../REPORTS/dejl-codegen-audit/):
-  - pure ODE only (no DAE algebraic constraints)
-  - no structural transitions / VSS
-  - no DOCC, no agentic recompilation
-  - no record-returning Modelica function lowering
+SIM_CODE -> Julia mapping in the donor `codeGen.jl`
 =#
+
+module DEGen
+
+using MetaModelica
+import ..SimulationCode
+import ..CodeGeneration
+import ..CodeGeneration: DAE_OP_toJuliaOperator, stripBeginBlocks
+import ..Backend.BDAE
+import DAE
+import Absyn
 
 """
 Layout descriptor: ordered names of states / parameters / discretes,
@@ -362,3 +364,6 @@ function generateDECode(simCode::SimulationCode.SIM_CODE)
   local moduleExpr = Expr(:module, true, Symbol(MODEL_NAME), stripBeginBlocks(code))
   return (MODEL_NAME, moduleExpr)
 end
+
+
+end #= module DEGen =#

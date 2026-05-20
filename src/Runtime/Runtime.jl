@@ -40,14 +40,12 @@ import Absyn
 import SCode
 import OMBackend
 import OMBackend.SimulationCode
-import OMBackend.CodeGeneration
 import ..@BACKEND_LOGGING
 import ..@VSS_DEBUG
 import OMFrontend
 import DAE
 
 import ModelingToolkit
-import ModelingToolkit.IfElse
 
 using DataStructures
 using ModelingToolkit
@@ -670,8 +668,10 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
       elseif integrator.t >= last(tspan) #= Hack to handle the special case where we are slightly above tstop=#
         sol = integrator.sol
         idx = findall(t -> t <= tspan[2], sol.t)
-        @assign sol.t = sol.t[idx]
-        @assign sol.u = sol.u[idx]
+        @assign begin
+          sol.t = sol.t[idx]
+          sol.u = sol.u[idx]
+        end
         push!(solutions, sol)
         return solutions
       end

@@ -182,8 +182,10 @@ Base.@nospecializeinfer function traverseEquationExpressions(@nospecialize(eq::B
        BDAE.EQUATION(lhs, rhs) => begin
          (lhs, extArg) = Util.traverseExpTopDown(lhs, traversalOperation, extArg)
          (rhs, extArg) = Util.traverseExpTopDown(rhs, traversalOperation, extArg)
-         @assign eq.lhs = lhs
-         @assign eq.rhs = rhs
+         @assign begin
+           eq.lhs = lhs
+           eq.rhs = rhs
+         end
          (eq, extArg)
        end
        BDAE.SOLVED_EQUATION(componentRef = cref, exp = rhs) => begin
@@ -251,8 +253,10 @@ Base.@nospecializeinfer function traverseEquationExpressions(@nospecialize(eq::B
        BDAE.ARRAY_EQUATION(left = lhs, right = rhs) => begin
          (newLhs, extArg) = Util.traverseExpTopDown(lhs, traversalOperation, extArg)
          (newRhs, extArg) = Util.traverseExpTopDown(rhs, traversalOperation, extArg)
-         @assign eq.left = newLhs
-         @assign eq.right = newRhs
+         @assign begin
+           eq.left = newLhs
+           eq.right = newRhs
+         end
          (eq, extArg)
        end
        _ => begin
@@ -673,6 +677,19 @@ function appendFieldToCref(exp::DAE.Exp, fieldName::String, fieldTy::DAE.Type)::
               "expected \"re\" or \"im\".")
       end
     end
+    #= Inlined `Complex(re, im)` lowers to a call of the `fromReal` constructor.
+       Field access on the constructor result is the matching positional arg. =#
+    DAE.CALL(path, expLst, _) where _isComplexFromRealCall(path) => begin
+      local argVec = collect(expLst)
+      if fieldName == "re"
+        isempty(argVec) ? exp : argVec[1]
+      elseif fieldName == "im"
+        length(argVec) >= 2 ? argVec[2] : DAE.RCONST(0.0)
+      else
+        error("appendFieldToCref: unexpected field \"$fieldName\" on Complex() " *
+              "constructor; expected \"re\" or \"im\".")
+      end
+    end
     _ => begin
       error("appendFieldToCref: unexpected expression type $(typeof(exp)) " *
             "when appending field \"$fieldName\" of type $(string(fieldTy)). " *
@@ -688,6 +705,18 @@ function _isComplexConjCall(path::Absyn.Path, expLst)::Bool
     Absyn.QUALIFIED("Modelica",
       Absyn.QUALIFIED("ComplexMath", Absyn.IDENT("conj"))) => true
     Absyn.IDENT("Modelica_ComplexMath_conj") => true
+    _ => false
+  end
+end
+
+#= Pattern match for the `Complex.'constructor'.fromReal(re, im)` lowering
+   produced after inlining `Complex(re, im)`. =#
+function _isComplexFromRealCall(path::Absyn.Path)::Bool
+  @match path begin
+    Absyn.QUALIFIED("Complex",
+      Absyn.QUALIFIED("'constructor'", Absyn.IDENT("fromReal"))) => true
+    Absyn.IDENT("Complex_'constructor'_fromReal") => true
+    Absyn.IDENT("Complex_constructor_fromReal") => true
     _ => false
   end
 end

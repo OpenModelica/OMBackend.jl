@@ -426,7 +426,19 @@ function generateLocals(inputs::Vector)
       _ => false
     end
     if !hasBinding
-      push!(jInputs, Expr(:local, s))
+      local defaultVal = @match i.ty begin
+        DAE.T_REAL(__) => 0.0
+        DAE.T_INTEGER(__) => 0
+        DAE.T_BOOL(__) => false
+        DAE.T_STRING(__) => ""
+        DAE.T_ENUMERATION(__) => 1
+        _ => nothing
+      end
+      if defaultVal === nothing
+        push!(jInputs, Expr(:local, s))
+      else
+        push!(jInputs, :(local $s = $defaultVal))
+      end
     end
   end
   return jInputs

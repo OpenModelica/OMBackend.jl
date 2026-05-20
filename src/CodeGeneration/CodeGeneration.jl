@@ -30,7 +30,6 @@
 Author: John Tinnerholm, john.tinnerholm@liu.se
 =#
 
-#= TODO make CodeGenerationUtil its own module.. =#
 module CodeGeneration
 
 import DataStructures
@@ -70,6 +69,9 @@ include("./exprRewrite.jl")
 include("./arrayUtils.jl")
 include("./AlgorithmicCodeGeneration.jl")
 include("./CodeGenerationUtil.jl")
+using .CodeGenerationUtil
+include("./MTK_CodeGenerationUtil.jl")
+using .MTK_CodeGenerationUtil
 include("./structuralCallbacks.jl")
 include("./DirectRHSGeneration.jl")
 include("./MTK_CodeGeneration.jl")

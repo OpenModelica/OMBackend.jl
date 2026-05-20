@@ -223,8 +223,10 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         else
           (SimulationCode.ModelicaFunction[], false)
         end
-        @assign simCode.functions = simCodeFunctions
-        @assign simCode.externalRuntime = externalRuntimeNeeded
+        @assign begin
+          simCode.functions = simCodeFunctions
+          simCode.externalRuntime = externalRuntimeNeeded
+        end
         simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
         @assign simCode.functions = simCodeFunctions
         #= Mirror the MTK pipeline: collapse qualified ENUM_LITERAL paths up
@@ -279,8 +281,10 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         else
           (SimulationCode.ModelicaFunction[], false)
         end
-        @assign simCode.functions = simCodeFunctions
-        @assign simCode.externalRuntime = externalRuntimeNeeded
+        @assign begin
+          simCode.functions = simCodeFunctions
+          simCode.externalRuntime = externalRuntimeNeeded
+        end
         #= Dump before record flattening =#
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_initial.log"), SimulationCode.dumpSimCode(simCode))
         #= Collapse qualified ENUM_LITERAL paths to leaf `Type.Literal` IDENT form. =#
@@ -341,6 +345,11 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
            at runtime. =#
         simCode = SimulationCode.runSimCodePass("eliminateConstantParameters", simCode,
                                                 SimulationCode.eliminateConstantParameters)
+        #= Drop protected sink variables and their defining equations. Runs
+           before eliminateDeadParameters so any parameters whose only consumer
+           was a dropped sink get caught by the dead-parameter sweep. =#
+        simCode = SimulationCode.runSimCodePass("dropObservationOnlyVariables", simCode,
+                                                SimulationCode.dropObservationOnlyVariables)
         simCode = SimulationCode.runSimCodePass("eliminateDeadParameters", simCode,
                                                 SimulationCode.eliminateDeadParameters)
         #= eliminateFrozenStates runs AFTER eliminateConstantParameters so that

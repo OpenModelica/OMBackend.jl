@@ -36,25 +36,11 @@
   TODO: Cleanup in general.. keep this simple. Remove hacks as the SCiML team adds new features to MTK.
 =#
 import ..OMBackend
-import ..AlgorithmicCodeGeneration
+import .AlgorithmicCodeGeneration
 
-_isCodegenNameChar(c::Char)::Bool =
-  isletter(c) || isdigit(c) || c == '_' || c == 'ˍ' || c == '[' || c == ']' || c == '"'
-
-function equationMentionsVariableName(eqStr::AbstractString, varName::AbstractString)::Bool
-  isempty(varName) && return false
-  local startIdx = firstindex(eqStr)
-  while true
-    local match = findnext(varName, eqStr, startIdx)
-    match === nothing && return false
-    local firstIdx = first(match)
-    local lastIdx = last(match)
-    local beforeOk = firstIdx == firstindex(eqStr) || !_isCodegenNameChar(eqStr[prevind(eqStr, firstIdx)])
-    local afterOk = lastIdx == lastindex(eqStr) || !_isCodegenNameChar(eqStr[nextind(eqStr, lastIdx)])
-    beforeOk && afterOk && return true
-    startIdx = nextind(eqStr, firstIdx)
-  end
-end
+#= Size of each emitted helper chunk in `decompose*` and `generate*Block` paths.
+   Tunable at runtime via `OMBackend.CodeGeneration.CHUNK_SIZE[] = N`. =#
+const CHUNK_SIZE = Ref{Int}(50)
 
 """
   Generates simulation code targeting modeling toolkit.
@@ -1039,7 +1025,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local FINAL_START_CONDTIONS_EQUATIONS = unique!(createStartConditionsEquationsMTK(
     String[vn for vn in simCode.irreductableVariables],
     String[],
-    simCode; skipDefaultAlgebraicStarts = skipDefaultsForStates))
+    simCode; skipDefaultStateStarts = skipDefaultsForStates))
   FINAL_START_CONDTIONS_EQUATIONS = vcat(DISCRETE_START_VALUES, FINAL_START_CONDTIONS_EQUATIONS)
   START_CONDTIONS_EQUATIONS = vcat(DISCRETE_START_VALUES, START_CONDTIONS_EQUATIONS)
   #=
@@ -1333,7 +1319,7 @@ function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE)
   #= Chunk observed equations into small functions (25 each) to avoid
      compiling one massive lambda. For Engine1a with 876 aliases, the single
      lambda took ~101s. Chunking into 36 functions of 25 should be much faster. =#
-  local obsChunks = collect(Iterators.partition(obsExprs, 25))
+  local obsChunks = collect(Iterators.partition(obsExprs, CHUNK_SIZE[]))
   local chunkFuncDefs = Expr[]
   local chunkFuncNames = Symbol[]
   for (i, chunk) in enumerate(obsChunks)
@@ -1366,30 +1352,6 @@ function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE)
       push!(_obsComponents, Base.invokelatest(_obsFn))
     end
     observedEqs = collect(Iterators.flatten(_obsComponents))
-  end
-end
-
-"""
-  Structurally walk a DAE expression and return true iff any subterm is a
-  `der(...)` call. Used to skip emitting observed equations whose solved
-  right-hand side would contain a `Differential(t)` operator; those equations
-  are rejected by MTK's initialization-system builder, which constructs its
-  System via the 3-argument form (eqs, unknowns, params) with iv=nothing.
-"""
-function containsDerCall(@nospecialize(exp::DAE.Exp))::Bool
-  @match exp begin
-    DAE.CALL(Absyn.IDENT("der"), _) => true
-    DAE.UNARY(_, e) => containsDerCall(e)
-    DAE.BINARY(e1, _, e2) => containsDerCall(e1) || containsDerCall(e2)
-    DAE.LUNARY(_, e) => containsDerCall(e)
-    DAE.LBINARY(e1, _, e2) => containsDerCall(e1) || containsDerCall(e2)
-    DAE.RELATION(e1, _, e2) => containsDerCall(e1) || containsDerCall(e2)
-    DAE.IFEXP(c, t, e) => containsDerCall(c) || containsDerCall(t) || containsDerCall(e)
-    DAE.CALL(_, explst) => any(containsDerCall, explst)
-    DAE.CAST(_, e) => containsDerCall(e)
-    DAE.ASUB(e, _) => containsDerCall(e)
-    DAE.TSUB(e, _, _) => containsDerCall(e)
-    _ => false
   end
 end
 
@@ -1469,18 +1431,19 @@ function createResidualEquationsMTK(stateVariables::Vector, algebraicVariables::
 end
 
 """
-  Generates the initial value for the equations
-  TODO: Currently unable to generate start condition in order
-
-If `skipDefaultAlgebraicStarts` is true, algebraic variables without explicit start values are skipped.
-State variables always get initialization since MTK ODEProblem requires all unknowns to have initial values.
+  Generates the initial value for the equations.
+  Algebraics without an explicit `start =` and without `fixed = true` are
+  always skipped — MTK's init solver supplies defaults.
+  States and OCC vars emit `0.0` defaults so MTK ODEProblem has a value for
+  every unknown, unless `skipDefaultStateStarts` is true (used in the
+  final-guess pass when an explicit user start is already pinned elsewhere).
 """
 function createStartConditionsEquationsMTK(states::Vector,
                                         algebraics::Vector,
-                                        simCode::SimulationCode.SIM_CODE; skipDefaultAlgebraicStarts = false)::Vector{Expr}
-  #= Both states and algebraics respect skipDefaultAlgebraicStarts (reverting to original behavior) =#
-  local algInit = getStartConditionsMTK(algebraics, simCode; skipDefaultStarts = skipDefaultAlgebraicStarts)
-  local stateInit = getStartConditionsMTK(states, simCode; skipDefaultStarts = skipDefaultAlgebraicStarts)
+                                        simCode::SimulationCode.SIM_CODE;
+                                        skipDefaultStateStarts::Bool = false)::Vector{Expr}
+  local algInit = getStartConditionsMTK(algebraics, simCode; skipDefaultStarts = true)
+  local stateInit = getStartConditionsMTK(states, simCode; skipDefaultStarts = skipDefaultStateStarts)
   local initialEquations = simCode.initialEquations
   local ieqInit = generateInitialEquations(initialEquations, simCode)
   #=
@@ -1606,33 +1569,6 @@ function generateInitialEquations(initialEqs, simCode::SimulationCode.SIM_CODE; 
 end
 
 """
-  Checks if any variable in the list has an explicit start attribute.
-  Used to determine if the system likely has algebraic constraints that
-  determine some state variables, avoiding overdetermination.
-"""
-function hasExplicitStartValue(vars::Vector, simCode::SimulationCode.SIM_CODE)::Bool
-  local ht::Dict = simCode.stringToSimVarHT
-  for var in vars
-    local entry = get(ht, var, nothing)
-    if entry === nothing
-      continue
-    end
-    (_, simVar) = entry
-    local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
-    @match optAttributes begin
-      SOME(attributes) => begin
-        @match attributes.start begin
-          SOME(_) => return true
-          _ => nothing
-        end
-      end
-      _ => nothing
-    end
-  end
-  return false
-end
-
-"""
   Given a vector of variables and the simulation code
   extracts the start attributes to generate initial conditions.
 
@@ -1676,9 +1612,14 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SIM_CODE; s
             continue
           end
           (NONE(), SOME(fixed)) => begin
-            if !skipDefaultStarts
-              push!(startExprs, :($(Symbol(varName)) => 0.0))
+            #= `fixed = true` with no `start` pins the var at 0.0; honour even when
+               default-skipping is on. `fixed = false` / non-Bool: MTK's init solver
+               handles it, so skip emission in skip mode. =#
+            local _fixedTrue = fixed isa DAE.BCONST && fixed.bool
+            if skipDefaultStarts && !_fixedTrue
+              continue
             end
+            push!(startExprs, :($(Symbol(varName)) => 0.0))
             continue
           end
           (NONE(), NONE()) || (_, _) => begin
@@ -1827,32 +1768,6 @@ function emitInitAlgConstraintAppends(simCode::SimulationCode.SIM_CODE)::Vector{
   return appends
 end
 
-"""
-  Names of variables that have `fixed=true` AND an explicit `start`. Parallel
-  to the gating in `getFixedStartConstraintsMTK`. Marking these as irreducible
-  prevents MTK's structural_simplify from substituting them through aliases —
-  the user's init constraint must land on a surviving unknown.
-"""
-function fixedStartVarNames(vars::Vector, simCode::SimulationCode.SIM_CODE)::Vector{String}
-  local result::Vector{String} = String[]
-  if isempty(vars)
-    return result
-  end
-  local ht::Dict = simCode.stringToSimVarHT
-  for var in vars
-    haskey(ht, var) || continue
-    (_, simVar) = ht[var]
-    local matched = @match simVar.attributes begin
-      SOME(attributes) => @match (attributes.start, attributes.fixed) begin
-        (SOME(_), SOME(DAE.BCONST(true))) => true
-        _ => false
-      end
-      _ => false
-    end
-    matched && push!(result, simVar.name)
-  end
-  return result
-end
 
 """
   Creates the components of the If-Equations.
@@ -2109,28 +2024,11 @@ end
 
 """
   createStringParameterAssignments(simCode) -> Vector{Expr}
-
 Emit one module-level Julia assignment per Modelica `String` parameter, e.g.
-
 ```julia
 table2_combiTimeTable_fileName = "NoName"
 lossTable_fileName = "NoName"
 ```
-
-Why this exists:
-- The MTK parameter system is numeric-only (BasicSymbolic{Real}), so String
-  parameters are deliberately excluded from `paramArray` / `parameterEquations`
-  (see the `SimulationCode.STRING(__) => # excluded` arm).
-- However, `DATA_STRUCTURE_ASSIGNMENTS` (CombiTable / CombiTimeTable
-  constructors and similar) reference these String parameters by their bare
-  Julia identifier in the per-model module scope. Without an emission step,
-  loading the module raises `UndefVarError: <param>_fileName`.
-
-Mutability for user overrides: emitting as bare `name = default` (not `const`)
-leaves the binding mutable, so `OMBackend.Modelica__<model>.<param> = "new"`
-followed by `simulate(...; overwriteCache=true)` reruns the data-structure
-init with the new value. Re-evaluating with `overwriteCache=false` reuses the
-cached tableID seeded from the previous String value.
 """
 function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local exprs::Vector{Expr} = Expr[]
@@ -2155,20 +2053,6 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
     push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
   end
   return exprs
-end
-
-#= True if `exp` is a leaf literal that resolves at module-load time
-   without needing other names in scope. Used to gate which bindings can
-   be emitted at module top via `createStringParameterAssignments`. =#
-function _isLiteralBind(exp)::Bool
-  @match exp begin
-    DAE.RCONST(__) => true
-    DAE.ICONST(__) => true
-    DAE.BCONST(__) => true
-    DAE.SCONST(__) => true
-    DAE.ENUM_LITERAL(__) => true
-    _ => false
-  end
 end
 
 #= Emit ARRAY_PARAMETER bindings at module top so that DATA_STRUCTURE
@@ -2209,7 +2093,50 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
       _ => nothing
     end
   end
-  isempty(neededBases) && return exprs
+  #= Also include any ARRAY_PARAMETER whose subscripted form appears in
+     residual equations. This rescues `world_gravityArrowHead_lengthDirection[2]`
+     and the cluster of MultiBody examples where `eliminateDeadParameters` /
+     `eliminateConstantParameters` did not substitute the subscripted CREF
+     (parent was kept as ARRAY_PARAMETER but never emitted module-top), so
+     MTK eval fails with `<name>[idx] not defined`. We collect base names of
+     CREFs that appear in residuals and intersect with the set of
+     ARRAY_PARAMETERs in HT so we only emit parents that actually exist. =#
+  local _residualCrefs = Set{String}()
+  for eq in simCode.residualEquations
+    SimulationCode.collectCrefNames!(_residualCrefs, eq.exp)
+  end
+  for _n in _residualCrefs
+    local _bracket = findfirst('[', _n)
+    if _bracket !== nothing
+      local _base = _n[1:_bracket-1]
+      local _entry = get(ht, _base, nothing)
+      _entry === nothing && continue
+      local _isArr = @match _entry[2].varKind begin
+        SimulationCode.ARRAY_PARAMETER(__) => true
+        _ => false
+      end
+      _isArr && push!(neededBases, _base)
+    end
+  end
+  #= Collect orphan subscripted CREFs (referenced in residuals, base NOT in HT)
+     before the early-return so the defensive fallback at the end of this
+     function still emits even when no DATA_STRUCTURE/ARRAY_PARAMETER paths
+     fire. Recorded here so the fallback loop downstream can consume them. =#
+  local _orphanRefsEarly = Set{String}()
+  for _n in _residualCrefs
+    local _bracket = findfirst('[', _n)
+    _bracket === nothing && continue
+    local _base = _n[1:_bracket-1]
+    haskey(ht, _base) && continue
+    haskey(ht, _n) && continue
+    push!(_orphanRefsEarly, _n)
+  end
+  if isempty(neededBases)
+    for _ref in _orphanRefsEarly
+      push!(exprs, :( $(Symbol(_ref)) = 0.0 ))
+    end
+    return exprs
+  end
 
   local emitted = Set{String}()
   for (varName, (_, simVar)) in ht
@@ -2281,6 +2208,33 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
     push!(emitted, baseName)
     push!(exprs, :( $(Symbol(baseName)) = $(arr) ))
   end
+
+  #= Defensive fallback: a residual references `<name>[i]` for some base
+     that is NOT in HT (no ARRAY_PARAMETER, no scalarized PARAMETER) and was
+     therefore not emitted by either of the two passes above. Observed for
+     the `World` component's `gravityArrowHead.lengthDirection[2..3]` cluster
+     on MultiBody examples (RollingWheel / Surfaces / RollingWheelSetDriving
+     / ...): the frontend instantiates the parent record but never registers
+     the per-index parameters as SimVars, so codegen leaks subscripted CREFs
+     into the residual that point at nothing. Emit `var"<name>[i]" = 0.0`
+     for every observed index — the codegen produces `Symbol("<name>[i]")`
+     bindings, so the recovery variable has to be the bracketed name itself,
+     not the parent. Default value 0.0 is wrong if the model actually uses
+     the parameter dynamically, but for visualization-only constants
+     (`gravityArrowHead`, axis arrows, ...) it is benign. =#
+  local _orphanRefs = Set{String}()
+  for _n in _residualCrefs
+    local _bracket = findfirst('[', _n)
+    _bracket === nothing && continue
+    local _base = _n[1:_bracket-1]
+    haskey(ht, _base) && continue
+    haskey(ht, _n) && continue
+    push!(_orphanRefs, _n)
+  end
+  for _ref in _orphanRefs
+    push!(exprs, :( $(Symbol(_ref)) = 0.0 ))
+  end
+
   return exprs
 end
 
@@ -2319,7 +2273,9 @@ end
   The index here is the index assigned by the code generator earlier in the lowering
   of the hybrid DAE.
 """
-function createParameterArray(parameters::Vector{T1}, parameterAssignments::Vector{T2}, simCode::SIM_T) where {T1, T2, SIM_T}
+function createParameterArray(parameters::Vector{T1},
+                              parameterAssignments::Vector{T2},
+                              simCode::SIM_T) where {T1, T2, SIM_T}
   local paramArray = []
   local hT = simCode.stringToSimVarHT
   for param in parameters
@@ -2367,8 +2323,8 @@ end
 """
 function decomposeVariables(stateVariables::Vector{Symbol}, algebraicVariables::Vector{Symbol};
                             modelPrefix::String = "")
-  local stateVectors = collect(Iterators.partition(stateVariables, 50))
-  local algVectors = collect(Iterators.partition(algebraicVariables, 50))
+  local stateVectors = collect(Iterators.partition(stateVariables, CHUNK_SIZE[]))
+  local algVectors = collect(Iterators.partition(algebraicVariables, CHUNK_SIZE[]))
   local outerDefs = Expr[]
   local constructorNames = Symbol[]
   local i = 1::Int
@@ -2409,8 +2365,8 @@ end
   - inner_refs: parameter assignments + equationConstructorCalls array (inside model function)
   The `modelPrefix` avoids name collisions when multiple models are translated in one session.
 """
-function decomposeEquations(equations, parameterAssignments; modelPrefix::String = "")
-  local equationVectors = collect(Iterators.partition(equations, 50))
+function decomposeEquations(equations, parameterAssignments; modelPrefix::String = "", chunkSize::Int = CHUNK_SIZE[])
+  local equationVectors = collect(Iterators.partition(equations, chunkSize))
   local outerDefs = Expr[]
   local functionNames = Symbol[]
   local i = 0
@@ -2444,8 +2400,8 @@ end
   - inner_refs: startEquationConstructors array assignment (inside model function)
   The `modelPrefix` avoids name collisions, `functionSuffix` differentiates initial vs final start eqs.
 """
-function decomposeStartEquations(equations; functionSuffix = "", modelPrefix::String = "")
-  local equationVectors = collect(Iterators.partition(equations, 50))
+function decomposeStartEquations(equations; functionSuffix = "", modelPrefix::String = "", chunkSize::Int = CHUNK_SIZE[])
+  local equationVectors = collect(Iterators.partition(equations, chunkSize))
   local outerDefs = Expr[]
   local constructorNames = Symbol[]
   local i = 0
@@ -2474,8 +2430,8 @@ end
   are local to the model function (created by @parameters), so they cannot be
   moved to module level.
 """
-function decomposeEquationsInline(equations, parameterAssignments)
-  local equationVectors = collect(Iterators.partition(equations, 15))
+function decomposeEquationsInline(equations, parameterAssignments; chunkSize::Int = CHUNK_SIZE[])
+  local equationVectors = collect(Iterators.partition(equations, chunkSize))
   local exprs = Expr[]
   local functionNames = Symbol[]
   local constructors = quote
@@ -2518,8 +2474,8 @@ end
   the model function (created by @parameters or phase 3 eval), so they cannot be
   moved to module level.
 """
-function decomposeStartEquationsInline(equations; functionSuffix = "")
-  local equationVectors = collect(Iterators.partition(equations, 25))
+function decomposeStartEquationsInline(equations; functionSuffix = "", chunkSize::Int = CHUNK_SIZE[])
+  local equationVectors = collect(Iterators.partition(equations, chunkSize))
   local exprs = Expr[]
   local constructorNames = Symbol[]
   local i = 0
@@ -2599,7 +2555,7 @@ function generateIfCondParamAssignments(ifCondParamPairs::Vector{Expr})
   end
 end
 
-function decomposeParametersDeclaration(parVariablesSym; chunkSize = 100)
+function decomposeParametersDeclaration(parVariablesSym; chunkSize = CHUNK_SIZE[])
   if length(parVariablesSym) <= chunkSize
     return quote
       parameters = ModelingToolkit.@parameters begin
@@ -2648,7 +2604,7 @@ end
   Parameter equations reference @parameters symbols which are local to the
   model function, so chunk functions are defined inline as closures.
 """
-function decomposeParameterEquationsInline(parameterEquations; chunkSize = 50)
+function decomposeParameterEquationsInline(parameterEquations; chunkSize = CHUNK_SIZE[])
   if length(parameterEquations) <= chunkSize
     return :(pars = Dict($(parameterEquations...)))
   end
@@ -2671,73 +2627,6 @@ function decomposeParameterEquationsInline(parameterEquations; chunkSize = 50)
     for _parFn in [$(constructorNames...)]
       merge!(pars, Base.invokelatest(_parFn))
     end
-  end
-end
-
-"""
-  Check if a DAE.VAR has an array type.
-  The array type info is in the componentRef's identType field, not in v.ty.
-"""
-function isArrayType(v::DAE.VAR)::Bool
-  #= Get the type from the component reference, which contains the full type including array dimensions =#
-  local crefType = @match v.componentRef begin
-    DAE.CREF_IDENT(_, identType, _) => identType
-    DAE.CREF_QUAL(_, identType, _, _) => identType
-    _ => v.ty
-  end
-  @match crefType begin
-    DAE.T_ARRAY(__) => true
-    _ => false
-  end
-end
-
-"""
-  Check if any input or output of a function is an array type.
-"""
-function hasArrayParameters(f::SimulationCode.ModelicaFunction)::Bool
-  for v in f.inputs
-    if isArrayType(v)
-      return true
-    end
-  end
-  for v in f.outputs
-    if isArrayType(v)
-      return true
-    end
-  end
-  return false
-end
-
-"""
-  Extract dimensions from a DAE.VAR as a tuple expression.
-  Returns a tuple like (3,) for a 1D array of size 3, or (3, 3) for a 3x3 matrix.
-  Gets the type from componentRef.identType which contains the full array type.
-"""
-function extractArrayDimsFromVar(v::DAE.VAR)::Expr
-  #= Get the type from the component reference =#
-  local ty = @match v.componentRef begin
-    DAE.CREF_IDENT(_, identType, _) => identType
-    DAE.CREF_QUAL(_, identType, _, _) => identType
-    _ => v.ty
-  end
-  @match ty begin
-    DAE.T_ARRAY(_, dims) => begin
-      local dimExprs = []
-      for d in dims
-        @match d begin
-          DAE.DIM_INTEGER(n) => push!(dimExprs, n)
-          DAE.DIM_UNKNOWN(__) => push!(dimExprs, :n)  #= Unknown dimension, use symbolic =#
-          DAE.DIM_EXP(__) => push!(dimExprs, :n)  #= Expression dimension, use symbolic =#
-          _ => push!(dimExprs, :n)
-        end
-      end
-      if length(dimExprs) == 1
-        :(($(dimExprs[1]),))
-      else
-        Expr(:tuple, dimExprs...)
-      end
-    end
-    _ => :()
   end
 end
 
@@ -2786,100 +2675,6 @@ function generateArrayRegisterExpr(f::SimulationCode.ModelicaFunction, funcArgGe
       eltype = $eltypeExpr
     end
   end
-end
-
-function collectCalledFunctionNames!(names::Set{String}, @nospecialize(exp::DAE.Exp))
-  @match exp begin
-    DAE.CALL(path = path, expLst = explst) => begin
-      push!(names, string(path))
-      for arg in explst
-        collectCalledFunctionNames!(names, arg)
-      end
-    end
-    _ => begin
-      Util.traverseExpTopDown(exp,
-                              (e, acc) -> begin
-                                if e isa DAE.CALL
-                                  push!(acc, string(e.path))
-                                end
-                                (e, true, acc)
-                              end,
-                              names)
-    end
-  end
-  return names
-end
-
-function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.RESIDUAL_EQUATION)
-  collectCalledFunctionNames!(names, eq.exp)
-end
-
-function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.EQUATION)
-  collectCalledFunctionNames!(names, eq.lhs)
-  collectCalledFunctionNames!(names, eq.rhs)
-end
-
-function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.ARRAY_EQUATION)
-  collectCalledFunctionNames!(names, eq.left)
-  collectCalledFunctionNames!(names, eq.right)
-end
-
-function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.SOLVED_EQUATION)
-  collectCalledFunctionNames!(names, eq.exp)
-end
-
-function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.COMPLEX_EQUATION)
-  collectCalledFunctionNames!(names, eq.left)
-  collectCalledFunctionNames!(names, eq.right)
-end
-
-function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.ASSIGN)
-  collectCalledFunctionNames!(names, stmt.left)
-  collectCalledFunctionNames!(names, stmt.right)
-end
-
-function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.REINIT)
-  collectCalledFunctionNames!(names, stmt.stateVar)
-  collectCalledFunctionNames!(names, stmt.value)
-end
-
-function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.NORETCALL)
-  collectCalledFunctionNames!(names, stmt.exp)
-end
-
-"""
-  Fallback for equation/statement kinds we do not specifically handle (ALGORITHM, BRANCH, etc.).
-  Silently ignore — we only want to skip calls that the collector knows how to look inside.
-"""
-function collectCalledFunctionNames!(names::Set{String}, ::Any)
-  return names
-end
-
-function collectCalledFunctionNames!(names::Set{String}, simCode::SimulationCode.SIM_CODE)
-  for eq in simCode.residualEquations
-    collectCalledFunctionNames!(names, eq)
-  end
-  for eq in simCode.initialEquations
-    #= Dispatch over every equation kind: ARRAY, SOLVED, COMPLEX as well as
-       RESIDUAL and EQUATION. Narrower filters silently dropped calls. =#
-    collectCalledFunctionNames!(names, eq)
-  end
-  for ifEq in simCode.ifEquations
-    for branch in ifEq.branches
-      collectCalledFunctionNames!(names, branch.condition)
-      for eq in branch.residualEquations
-        collectCalledFunctionNames!(names, eq)
-      end
-    end
-  end
-  for whenEq in simCode.whenEquations
-    collectCalledFunctionNames!(names, whenEq.whenEquation.condition)
-    for stmt in whenEq.whenEquation.whenStmtLst
-      #= Dispatch over every whenStmt kind: ASSIGN, REINIT, NORETCALL. =#
-      collectCalledFunctionNames!(names, stmt)
-    end
-  end
-  return names
 end
 
 """
@@ -3035,25 +2830,6 @@ function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.S
   return res
 end
 
-#= Rewrite `Base.invokelatest(funcSym, args...)` calls where funcSym is a bare
-   Symbol into `Base.invokelatest(OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[:funcSym], args...)`.
-   Modelica function wrappers are registered in MODELICA_FUNCTION_IMPLS but are
-   not bound as module-top names in the generated model module, so a bare-symbol
-   reference cannot resolve. The registry lookup always works. =#
-function _resolveModelicaCallTargets(expr)
-  if !(expr isa Expr)
-    return expr
-  end
-  if expr.head === :call && length(expr.args) >= 2 &&
-     expr.args[1] == :(Base.invokelatest) && expr.args[2] isa Symbol
-    local funcSym = expr.args[2]
-    local registry = :(OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(funcSym))])
-    local rest = Any[_resolveModelicaCallTargets(a) for a in expr.args[3:end]]
-    return Expr(:call, expr.args[1], registry, rest...)
-  end
-  return Expr(expr.head, Any[_resolveModelicaCallTargets(a) for a in expr.args]...)
-end
-
 #= Lower a single BDAE.WhenOperator from an INITIAL_ALGORITHM body to a Julia
    expression suitable for module-top eval inside `__runInitialAlgorithm!`.
    Parameter CREFs are folded to their literal bindings via _substituteBoundParameters
@@ -3144,48 +2920,6 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE)
   end
 end
 
-#= Walk a lowered Julia expression and rename bare-identifier references to
-   crefs in `names` by adding the `_alg_` prefix, leaving the first argument of
-   `Expr(:call, ...)` untouched (so Modelica function names like `sin`, `abs`,
-   `integer` are not renamed). Used by `__runInitialAlgorithmEarly!` to give
-   each Modelica cref a local Julia binding whose value is set by sequential
-   ASSIGN statements without colliding with the Symbolics `Num` of the same
-   name living in the model module's scope. =#
-function _renameAlgIdentifiers(expr, names::Set{String})
-  if expr isa Symbol
-    return string(expr) in names ? Symbol("_alg_" * string(expr)) : expr
-  elseif expr isa Expr
-    if expr.head === :call && length(expr.args) >= 1
-      local newArgs = Any[expr.args[1]]
-      for i in 2:length(expr.args)
-        push!(newArgs, _renameAlgIdentifiers(expr.args[i], names))
-      end
-      return Expr(:call, newArgs...)
-    else
-      return Expr(expr.head, map(a -> _renameAlgIdentifiers(a, names), expr.args)...)
-    end
-  end
-  return expr
-end
-
-#= Return a Modelica-spec compatible literal seed for a non-LHS cref read on
-   the RHS of an init-algorithm statement. Reads the `start` attribute from
-   the SimVar's DAE attributes when available; otherwise defaults to 0.0. =#
-function _readStartAttributeAsLiteral(sv)::Float64
-  local attrs = sv.attributes
-  @match attrs begin
-    SOME(a) => begin
-      @match a.start begin
-        SOME(DAE.RCONST(r)) => Float64(r)
-        SOME(DAE.ICONST(i)) => Float64(i)
-        SOME(DAE.BCONST(b)) => (b ? 1.0 : 0.0)
-        _ => 0.0
-      end
-    end
-    _ => 0.0
-  end
-end
-
 #= Translate a single `BDAE.WhenOperator` from an init-algorithm body into a
    Julia statement suitable for the procedural body of
    `__runInitialAlgorithmEarly!`. ASSIGN emits `_alg_<lhs> = <rhs>` (with
@@ -3228,79 +2962,6 @@ function _initialWhenOpToJuliaEarly(wStmt, simCode::SimulationCode.SIM_CODE,
       :(@info "Modelica terminate() during init (early)" message=$(msg))
     end
     _ => :( nothing )
-  end
-end
-
-#= Recursively collect LHS / RHS cref names from a `DAE.Statement` tree.
-   Mirrors `_collectInitAlgLhsRhsCrefs!` but for the DAE.Statement variant,
-   recursing into STMT_IF / STMT_FOR / STMT_WHILE bodies so cref names inside
-   control-flow are not missed. =#
-function _collectInitAlgLhsRhsCrefsDAE!(lhs::Set{String}, rhs::Set{String}, stmt)
-  local pushCrefsFrom = function(exp)
-    exp === nothing && return
-    for c in Util.getAllCrefs(exp); push!(rhs, string(c)); end
-  end
-  local crefName = function(e)
-    @match e begin
-      DAE.CREF(cr, _) => string(cr)
-      _ => ""
-    end
-  end
-  @match stmt begin
-    DAE.STMT_ASSIGN(_, e1, e, _) => begin
-      local n = crefName(e1); !isempty(n) && push!(lhs, n)
-      pushCrefsFrom(e)
-    end
-    DAE.STMT_TUPLE_ASSIGN(_, lhsList, e, _) => begin
-      for lhsExp in lhsList
-        local n = crefName(lhsExp); !isempty(n) && push!(lhs, n)
-      end
-      pushCrefsFrom(e)
-    end
-    DAE.STMT_ASSIGN_ARR(_, e1, e, _) => begin
-      local n = crefName(e1); !isempty(n) && push!(lhs, n)
-      pushCrefsFrom(e)
-    end
-    DAE.STMT_NORETCALL(e, _) => pushCrefsFrom(e)
-    DAE.STMT_ASSERT(c, m, l, _) => begin
-      pushCrefsFrom(c); pushCrefsFrom(m); pushCrefsFrom(l)
-    end
-    DAE.STMT_TERMINATE(m, _) => pushCrefsFrom(m)
-    DAE.STMT_REINIT(v, val, _) => begin
-      pushCrefsFrom(v); pushCrefsFrom(val)
-    end
-    DAE.STMT_IF(cond, body, else_, _) => begin
-      pushCrefsFrom(cond)
-      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-      _collectInitAlgLhsRhsCrefsDAEElse!(lhs, rhs, else_)
-    end
-    DAE.STMT_FOR(_, _, iter, _, range, body, _) => begin
-      pushCrefsFrom(range)
-      push!(lhs, iter)
-      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-    end
-    DAE.STMT_PARFOR(_, _, iter, _, range, body, _, _) => begin
-      pushCrefsFrom(range)
-      push!(lhs, iter)
-      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-    end
-    DAE.STMT_WHILE(cond, body, _) => begin
-      pushCrefsFrom(cond)
-      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-    end
-    _ => nothing
-  end
-end
-
-function _collectInitAlgLhsRhsCrefsDAEElse!(lhs::Set{String}, rhs::Set{String}, else_)
-  @match else_ begin
-    DAE.ELSE(stmts) => for s in stmts; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-    DAE.ELSEIF(cond, stmts, rest) => begin
-      for c in Util.getAllCrefs(cond); push!(rhs, string(c)); end
-      for s in stmts; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-      _collectInitAlgLhsRhsCrefsDAEElse!(lhs, rhs, rest)
-    end
-    _ => nothing
   end
 end
 
@@ -3366,6 +3027,14 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
     local sv = ht[name][2]
     if sv.varKind isa SimulationCode.PARAMETER ||
        sv.varKind isa SimulationCode.ARRAY_PARAMETER
+      local paramLit = @match sv.varKind begin
+        SimulationCode.PARAMETER(SOME(DAE.RCONST(r))) => Float64(r)
+        SimulationCode.PARAMETER(SOME(DAE.ICONST(i))) => Float64(i)
+        SimulationCode.PARAMETER(SOME(DAE.BCONST(b))) => (b ? 1.0 : 0.0)
+        _ => nothing
+      end
+      paramLit === nothing && continue
+      push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(paramLit)))
       continue
     end
     local lit = _readStartAttributeAsLiteral(sv)
@@ -3457,17 +3126,16 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
       end
     end
   end
-  #= For each non-parameter cref read on the RHS of an init-algorithm
-     statement and NOT assigned earlier in the same body, fetch its current
-     runtime value from `LATEST_PROBLEM` as a local. Without this, references
-     like `b := a + 1` resolve `a` to the Symbolics binding created inside
-     `Model()`, which produces a `Symbolics.Num` and breaks
-     `LATEST_PROBLEM[:b] = b` with `MethodError: Float64(::Symbolics.Num)`.
-     Parameter CREFs are already inlined as literals by
-     `inlineParamsInInitialAlgorithms`, so they do not appear here. =#
+  #= Pre-fetch every non-parameter RHS-referenced cref. Names that ALSO
+     appear as LHS still need a fetch because Julia compiles `x = if c then
+     v else x end` with `x` as a function-local: the else-branch reads `x`
+     before the assignment completes and throws UndefVarError. Self-referential
+     IFEXP shapes come from the algorithm lifter at BDAECreate.jl:1263 when a
+     non-when algorithm contains an if/elseif chain whose else-branches
+     preserve a discrete LHS's previous value. =#
   local fetches = Expr[]
   local ht = simCode.stringToSimVarHT
-  for name in setdiff(rhsNames, lhsNames)
+  for name in rhsNames
     name == "time" && continue
     local sv = nothing
     if haskey(ht, name)
@@ -3534,33 +3202,3 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
   end
 end
 
-#= Walk a single `BDAE.WhenOperator` from an INITIAL_ALGORITHM body and
-   record LHS / RHS cref names. Used to figure out which non-assigned
-   externals need to be fetched from `LATEST_PROBLEM` at init time. =#
-function _collectInitAlgLhsRhsCrefs!(lhs::Set{String}, rhs::Set{String}, op)
-  local pushCrefsFrom = function(exp)
-    exp === nothing && return
-    for c in Util.getAllCrefs(exp)
-      push!(rhs, string(c))
-    end
-  end
-  @match op begin
-    BDAE.ASSIGN(__) => begin
-      @match op.left begin
-        DAE.CREF(cr, _) => push!(lhs, string(cr))
-        _ => nothing
-      end
-      pushCrefsFrom(op.right)
-    end
-    BDAE.REINIT(__) => begin
-      push!(lhs, string(op.stateVar))
-      pushCrefsFrom(op.value)
-    end
-    BDAE.NORETCALL(__) => pushCrefsFrom(op.exp)
-    BDAE.ASSERT(__) => begin
-      pushCrefsFrom(op.condition); pushCrefsFrom(op.message); pushCrefsFrom(op.level)
-    end
-    BDAE.TERMINATE(__) => pushCrefsFrom(op.message)
-    _ => nothing
-  end
-end

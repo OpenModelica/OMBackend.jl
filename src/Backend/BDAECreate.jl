@@ -332,11 +332,41 @@ function convertVariableIntoBDAEVariable(var::OMFrontend.Frontend.Variable)
            elem.binding,
            elem.dims,
            elem.source,
-           elem.variableAttributesOption,
+           _maybeMarkAttrProtected(elem.variableAttributesOption, elem.protection),
            NONE(), #=Tearing=#
            elem.connectorType,
            false #=We do not know if we can replace or not yet=#
            )
+end
+
+#= Carry the DAE.VAR `protection` flag onto the variable attribute Option so
+   the SimCode-layer `dropObservationOnlyVariables` pass can pick it up. =#
+function _maybeMarkAttrProtected(vattr, protection)
+  @match protection begin
+    DAE.PROTECTED(__) => _markAttrProtected(vattr)
+    _ => vattr
+  end
+end
+
+function _markAttrProtected(vattr)
+  local protOpt = SOME(true)
+  @match vattr begin
+    SOME(va) where va isa DAE.VAR_ATTR_REAL => SOME(DAE.VAR_ATTR_REAL(
+        va.quantity, va.unit, va.displayUnit, va.min, va.max, va.start,
+        va.fixed, va.nominal, va.stateSelectOption, va.uncertainOption,
+        va.distributionOption, va.equationBound, protOpt, va.finalPrefix,
+        va.startOrigin))
+    SOME(va) where va isa DAE.VAR_ATTR_INT => SOME(DAE.VAR_ATTR_INT(
+        va.quantity, va.min, va.max, va.start, va.fixed, va.uncertainOption,
+        va.distributionOption, va.equationBound, protOpt, va.finalPrefix,
+        va.startOrigin))
+    SOME(va) where va isa DAE.VAR_ATTR_BOOL => SOME(DAE.VAR_ATTR_BOOL(
+        va.quantity, va.start, va.fixed, va.equationBound, protOpt,
+        va.finalPrefix, va.startOrigin))
+    _ => SOME(DAE.VAR_ATTR_REAL(NONE(), NONE(), NONE(), NONE(), NONE(),
+        NONE(), NONE(), NONE(), NONE(), NONE(), NONE(), NONE(), protOpt,
+        NONE(), NONE()))
+  end
 end
 
 
@@ -363,7 +393,7 @@ function splitEquationsAndVars(elementLst::List{DAE.Element})::Tuple{List, List,
           elem.binding,
           elem.dims,
           elem.source,
-          elem.variableAttributesOption,
+          _maybeMarkAttrProtected(elem.variableAttributesOption, elem.protection),
           NONE(), #=Tearing=#
           elem.connectorType,
           false #=We do not know if we can replace or not yet=#
@@ -569,7 +599,7 @@ function variableToBackendVariable(elem::DAE.Element)
       elem.binding,
       elem.dims,
       elem.source,
-      elem.variableAttributesOption,
+      _maybeMarkAttrProtected(elem.variableAttributesOption, elem.protection),
       NONE(), #=Tearing=#
       elem.connectorType,
       false #=We do not know if we can replace or not yet=#)

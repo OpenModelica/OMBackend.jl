@@ -79,6 +79,12 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
   "symmetric"    => :modelica_symmetric,
   "promote"      => :modelica_promote,
 
+  #= --- MSL library functions with Inline=true that the frontend currently
+     does not inline (NFFunction.jl `commentIsInlineFunc` is a stub). Routed
+     here so qualified MSL calls resolve to a stable Julia equivalent rather
+     than an unresolved Symbol. =#
+  "Modelica_Math_Vectors_length" => :modelica_vectors_length,
+
   #= --- Array reductions --- =#
   "sum"       => :modelica_sum,
   "product"   => :modelica_product,
@@ -288,6 +294,10 @@ Modelica: cross(x, y) computes the cross product of two 3-vectors.
 Julia: LinearAlgebra.cross(x, y).
 """
 modelica_cross(x, y) = LinearAlgebra.cross(collect(x), collect(y))
+
+#= Euclidean norm mirroring MSL Modelica.Math.Vectors.length(v) = sqrt(v*v). =#
+modelica_vectors_length(v::AbstractVector) = sqrt(sum(x -> x * x, v))
+modelica_vectors_length(v::Number) = abs(v)
 
 """
     modelica_skew(x)

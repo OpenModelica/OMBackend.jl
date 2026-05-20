@@ -570,7 +570,14 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
                 Util.getAllCrefs(cond))...)
           local _result = $(expToJuliaBoolMTK(wEq.condition, simCode))
           @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
-          _result
+          #= DiscreteCallback condition must return Bool per SciMLBase. Modelica
+             Boolean discrete states are stored as Float64 in `integrator.u`
+             (0.0/1.0), so a bare cref read returns Float64 and triggers
+             "TypeError: non-boolean (Float64) used in boolean context" in
+             SciML's callback dispatch (affects PowerConverters Thyristor
+             models). Cast via `!= 0` so any numeric cref-as-condition
+             evaluates correctly. Bool results pass through unchanged. =#
+          _result isa Bool ? _result : (_result != 0)
         end
       end
       let _affCache = Ref{Any}(nothing)

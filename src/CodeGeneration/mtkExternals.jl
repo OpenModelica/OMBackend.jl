@@ -1220,9 +1220,23 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
     end
   end
   if !isempty(softInitialValues)
-    local currentGuesses = ModelingToolkit.guesses(reducedSystem)
-    local newGuesses = merge(currentGuesses, Dict(softInitialValues))
-    @set! reducedSystem.guesses = newGuesses
+    #= Drop pairs whose key unwrapped to a numeric constant. This happens when
+       the keyed variable was eliminated by `structural_simplify` so its module
+       symbol resolved to a constant Num at start-equation eval time. Feeding
+       such a `Num(0.0) => ...` to `guesses` later crashes `AtomicArrayDict`
+       conversion because the key cannot be a non-symbolic value. =#
+    local sanitisedSoft = filter(softInitialValues) do p
+      local k = Symbolics.value(p.first)
+      !(k isa Number)
+    end
+    if length(sanitisedSoft) != length(softInitialValues)
+      @debug "[MTK GEN: init] dropped $(length(softInitialValues) - length(sanitisedSoft)) soft IVs whose keys folded to numeric constants (eliminated by structural_simplify)"
+    end
+    if !isempty(sanitisedSoft)
+      local currentGuesses = ModelingToolkit.guesses(reducedSystem)
+      local newGuesses = merge(currentGuesses, Dict(sanitisedSoft))
+      @set! reducedSystem.guesses = newGuesses
+    end
   end
   #= Ensure all differential states have hard initial values.
      MTK's order-lowering creates derivative variables (e.g. Inertia_phiˍt for

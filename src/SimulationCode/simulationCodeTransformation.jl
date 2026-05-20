@@ -117,6 +117,10 @@ function DAE_identifierToString(s::String)
   return OMBackend.canonicalName(s)
 end
 
+function DAE_identifierToString(u::DAE.UNARY)
+  return DAE_identifierToString(u.exp)
+end
+
 function DAE_identifierToString(exp)
   error("DAE_identifierToString: unsupported argument of type $(typeof(exp)) with value $exp. Expected DAE.CREF, DAE.ComponentRef, or String.")
 end
