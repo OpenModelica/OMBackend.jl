@@ -39,6 +39,7 @@ import ..AlgorithmicCodeGeneration
 import ..CodeGenerationUtil
 using ..CodeGenerationUtil
 import ..CodeGeneration: lowerKnownSymbolicFunctionCall
+import ..MTKDump: dumpPreStructuralSimplifyExpr
 
 import ...@BACKEND_LOGGING
 import ...COMPONENT_SEPARATOR
@@ -1394,34 +1395,8 @@ function performStructuralSimplify(simplify; observedFilter::Union{Nothing, Vect
      dir would no longer be on the stack and the dump would land in the
      session root. =#
   local dumpExpr = :(nothing)
-  @BACKEND_LOGGING dumpExpr = let _logPath = OMBackend.logPath("backend/codeGen", "preStructuralSimplify.log")
-    quote
-      try
-        local _buffer = IOBuffer()
-        local _eqs = ModelingToolkit.equations(firstOrderSystem)
-        local _unks = ModelingToolkit.unknowns(firstOrderSystem)
-        println(_buffer, "Pre-structural-simplify dump")
-        println(_buffer, "============================")
-        println(_buffer, "equations: ", length(_eqs))
-        println(_buffer, "unknowns:  ", length(_unks))
-        println(_buffer, "")
-        println(_buffer, "Equations:")
-        println(_buffer, "----------")
-        for (_i, _e) in enumerate(_eqs)
-          println(_buffer, "[", _i, "] ", _e)
-        end
-        println(_buffer, "")
-        println(_buffer, "Unknowns:")
-        println(_buffer, "---------")
-        for (_i, _u) in enumerate(_unks)
-          println(_buffer, "[", _i, "] ", _u)
-        end
-        write($(_logPath), String(take!(_buffer)))
-      catch _err
-        @warn "[preStructuralSimplify dump] failed" exception=_err
-      end
-    end
-  end
+  @BACKEND_LOGGING dumpExpr = dumpPreStructuralSimplifyExpr(
+      OMBackend.logPath("backend/codeGen", "preStructuralSimplify.log"))
   local simplifyExpr = quote
     $dumpExpr
     reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true, split = $(split))

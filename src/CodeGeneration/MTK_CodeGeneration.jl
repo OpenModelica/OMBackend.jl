@@ -1113,6 +1113,11 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       for (sym, priority) in _statePriorityPairs
         push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableStatePriority, $priority)))
       end
+      #= Dump the resolved variable-binding batch before `eval`. See
+         CodeGeneration/mtkDump.jl. The dump runs at simulate time inside
+         the model module, so it must reference MTKDump by its absolute
+         module path (the model module does not import MTKDump). =#
+      OMBackend.CodeGeneration.MTKDump.dumpBatchBlock(vars, irreductableSyms, _statePriorityPairs, _batchBlock)
       eval(_batchBlock)
       # re-fetch decorated Nums from module scope (eval rebinds names but
       # local vars still holds pre-eval references)

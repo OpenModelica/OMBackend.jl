@@ -31,6 +31,9 @@ TODO:
 =#
 
 
+# MTK-stage dump helpers (see CodeGeneration/mtkDump.jl).
+import .MTKDump: dumpMTKPreSimplify, dumpMTKPostSimplify
+
 #= Global dictionary to store dynamically generated function implementations =#
 #= The key is the function name, the value is the implementation function =#
 const MODELICA_FUNCTION_IMPLS = Dict{Symbol, Function}()
@@ -311,6 +314,24 @@ function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}},
   TUPLE_ELEM_FUNC_CACHE[key] = f
   return f
 end
+
+# OMBackend always wraps Modelica-function impls in RTG callables that return
+# Real (or tuples of Real, but extractor RGFs project a single Real). Pin the
+# symtype here so any SymbolicUtils path that hits _promote_symtype on an RTG
+# (e.g. hashcons-cached Terms, internal rewrites, default safe_ctors.jl Term
+# construction) yields Real instead of Any. Without this, an Any-typed Term
+# can be cached and later returned even when makeSymbolicTerm passes
+# `type = Real` explicitly, poisoning subsequent sums and breaking
+# `-(::SymReal, ::SymReal)` in MTK alias_elimination.
+SymbolicUtils._promote_symtype(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, args) = Real
+
+# Same reason for shape. Scalar-returning extractor RGFs must be reported as
+# scalar (`ShapeVecT()`) rather than the default `Unknown(-1)` so they can be
+# summed against other scalar terms without triggering `_added_shape`'s rank
+# mismatch in MTK's substitution rebuild path (terminterface.jl `maketerm` for
+# `+`/`-`). Without this, a wrapper whose body returns a Modelica vector can
+# poison a sum with shape `Unknown(2)`.
+SymbolicUtils.promote_shape(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 
 """
     makeSymbolicTerm(f, args)
@@ -1469,42 +1490,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   local pre_eqs = length(equations(sys))
   local pre_unknowns = length(unknowns(sys))
   @info "[MTK GEN: simplify] Before structural_simplify: $pre_eqs equations, $pre_unknowns unknowns"
-  @BACKEND_LOGGING begin
-    open(OMBackend.logPath("backend/mtk", "mtk_preSimplify.log"), "w") do io
-      println(io, "############################################")
-      println(io, "MTK system before structural_simplify")
-      println(io, "############################################")
-      println(io)
-      println(io, "Unknowns ($pre_unknowns):")
-      println(io, "---------------------------------------------")
-      for (i, u) in enumerate(unknowns(sys))
-        println(io, "  [$i] $u")
-      end
-      println(io)
-      println(io, "Equations ($pre_eqs):")
-      println(io, "---------------------------------------------")
-      for (i, eq) in enumerate(equations(sys))
-        println(io, "  [$i] $eq")
-      end
-      println(io)
-      println(io, "Parameters ($(length(parameters(sys)))):")
-      println(io, "---------------------------------------------")
-      for (i, p) in enumerate(parameters(sys))
-        println(io, "  [$i] $p")
-      end
-      try
-        local defs = ModelingToolkit.defaults(sys)
-        println(io)
-        println(io, "Defaults ($(length(defs))):")
-        println(io, "---------------------------------------------")
-        for (k, v) in defs
-          println(io, "  $k => $v")
-        end
-      catch
-        println(io, "\n(defaults not available in this MTK version)")
-      end
-    end
-  end
+  dumpMTKPreSimplify(sys, pre_eqs, pre_unknowns)
   #= DirectRHS uses a plain Float64[] parameter vector, so the reduced system
      must use split=false (flat vector) rather than split=true (MTKParameters).
      This also makes generate_continuous_callbacks produce callbacks compatible
@@ -1586,33 +1572,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   if post_full_eqs != post_unknowns
     @warn "full_equations(sys) != unknowns(sys): $post_full_eqs vs $post_unknowns"
   end
-  @BACKEND_LOGGING begin
-    open(OMBackend.logPath("backend/mtk", "mtk_postSimplify.log"), "w") do io
-      println(io, "############################################")
-      println(io, "MTK system after structural_simplify")
-      println(io, "############################################")
-      println(io)
-      println(io, "Unknowns ($post_unknowns):")
-      for (i, u) in enumerate(unknowns(sys))
-        println(io, "  [$i] $u")
-      end
-      println(io)
-      println(io, "Equations ($post_eqs):")
-      for (i, eq) in enumerate(equations(sys))
-        println(io, "  [$i] $eq")
-      end
-      println(io)
-      println(io, "Guesses ($(length(ModelingToolkit.guesses(sys)))):")
-      for (k, v) in ModelingToolkit.guesses(sys)
-        println(io, "  $k => $v")
-      end
-      println(io)
-      println(io, "Full equations ($post_full_eqs):")
-      for (i, eq) in enumerate(ModelingToolkit.full_equations(sys))
-        println(io, "  [$i] $eq")
-      end
-    end
-  end
+  dumpMTKPostSimplify(sys)
   #= Workaround: after structural_simplify, the tearing state's graph may have
      stale dimensions (more equations/variables than equations(sys)/unknowns(sys)).
      This causes a DimensionMismatch in W_sparsity when the graph-based Jacobian

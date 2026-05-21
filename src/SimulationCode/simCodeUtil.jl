@@ -1501,6 +1501,26 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
   return (outputOnlyVarNames, outputOnlyEqIndices, eqRefs)
 end
 
+#= True when the variable's attributes carry an explicit `fixed = true` AND
+   an explicit `start = ...` value. Used to rescue variables from elimination
+   passes that would otherwise drop the user-pinned initial condition. =#
+function _hasExplicitFixedStart(@nospecialize(attrs))::Bool
+  return @match attrs begin
+    SOME(va) where (va isa DAE.VAR_ATTR_REAL) => begin
+      local fixedTrue = @match va.fixed begin
+        SOME(DAE.BCONST(true)) => true
+        _ => false
+      end
+      local hasStart = @match va.start begin
+        SOME(_) => true
+        _ => false
+      end
+      fixedTrue && hasStart
+    end
+    _ => false
+  end
+end
+
 """
     eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOptions)
 
@@ -1659,6 +1679,17 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     end
     if referencedBySurvivor
       push!(rescuedVars, vn)
+    end
+    #= Rescue variables carrying `fixed=true` with an explicit start value.
+       These are user-pinned initial conditions (e.g. `wMechanical(fixed=true,
+       start=w0)`); eliminating them strips the constraint and MTK's init
+       solver lands on the algebraic default (typically 0). DCPM_Cooling,
+       DCPM_QuasiStationary, DCPM_withLosses regress on this exact pattern. =#
+    if !referencedBySurvivor && haskey(ht, vn)
+      local (_, _sv) = ht[vn]
+      if _hasExplicitFixedStart(_sv.attributes)
+        push!(rescuedVars, vn)
+      end
     end
   end
   local nRescued = length(rescuedVars)
@@ -5174,17 +5205,25 @@ function _detectVarMinusExpr(@nospecialize(exp), ht)
         _ => false
       end
       isSub || return nothing
-      local r1 = extractCrefName(e1)
-      local r2 = extractCrefName(e2)
+      #= Peel a UMINUS wrapper on either side so `(-var) - X` and `var - (-X)`
+         get canonicalized into `var = ±X` with the negation tracked. =#
+      local (e1Peeled, e1Neg) = _peelUMinus(e1)
+      local (e2Peeled, e2Neg) = _peelUMinus(e2)
+      local r1 = extractCrefName(e1Peeled)
+      local r2 = extractCrefName(e2Peeled)
       #= Skip var-var (detectAlias handles this) and complex-complex. =#
       if (r1 !== nothing && r2 !== nothing) || (r1 === nothing && r2 === nothing)
         return nothing
       end
-      local r, complexExp
+      local r, complexExp, crefNeg, complexSign
       if r1 !== nothing
-        r = r1; complexExp = e2
+        r = r1; complexExp = e2Peeled; crefNeg = e1Neg
+        #= var - complex => var = complex, with complex negated if e2 had UMINUS. =#
+        complexSign = e2Neg
       else
-        r = r2; complexExp = e1
+        r = r2; complexExp = e1Peeled; crefNeg = e2Neg
+        #= complex - var => var = complex, with complex negated if e1 had UMINUS. =#
+        complexSign = e1Neg
       end
       local (n, cr, ty) = r
       haskey(ht, n) || return nothing
@@ -5192,10 +5231,92 @@ function _detectVarMinusExpr(@nospecialize(exp), ht)
       isUnknownVarKind(sv.varKind) || return nothing
       local cls = _aliasTypeClass(ty)
       cls === :other && return nothing
-      return (n, cr, ty, string(complexExp))
+      local negated = xor(crefNeg, complexSign)
+      return (n, cr, ty, string(complexExp), negated)
     end
     _ => return nothing
   end
+end
+
+function _peelUMinus(@nospecialize(exp))
+  @match exp begin
+    DAE.UNARY(operator = DAE.UMINUS(__), exp = inner) => (inner, true)
+    _ => (exp, false)
+  end
+end
+
+"""
+    _recomputeSCCsFromSimCode(simCode) -> (sccs::Vector{Vector{Int}}, eq_to_var::Vector{String})
+
+Re-derive the strongly-connected components of the residual equation set
+using only the post-pipeline `simCode.residualEquations` and
+`simCode.stringToSimVarHT`. The original SCCs computed at
+`simulationCodeTransformation.jl:217` index into the pre-pass residual list
+and are stale by codegen time; this rebuilds them on the array MTK will see.
+
+Returns the SCC partition (vector of equation-index vectors) and the
+matching `eq_to_var[i]` = name of the unknown that residual `i` is causally
+solved for (empty string when unmatched).
+"""
+function _recomputeSCCsFromSimCode(simCode::SIM_CODE)
+  local ht = simCode.stringToSimVarHT
+  local res = simCode.residualEquations
+  local n_eqs = length(res)
+  local emptySCCs = Vector{Int}[]
+  local emptyMatch = String[]
+  n_eqs == 0 && return (emptySCCs, emptyMatch)
+  local surviving = Set{String}(k for (k, (_, sv)) in pairs(ht) if isUnknownVarKind(sv.varKind))
+  local incidence = Vector{Set{String}}(undef, n_eqs)
+  for (i, eq) in enumerate(res)
+    local names = Set{String}()
+    collectCrefNames!(names, eq.exp)
+    incidence[i] = intersect(names, surviving)
+  end
+  local var_to_eq = Dict{String, Int}()
+  local eq_to_var = fill("", n_eqs)
+  function augment!(eq_idx::Int, seen::Set{String})::Bool
+    for var in incidence[eq_idx]
+      var in seen && continue
+      push!(seen, var)
+      if !haskey(var_to_eq, var) || augment!(var_to_eq[var], seen)
+        var_to_eq[var] = eq_idx
+        eq_to_var[eq_idx] = var
+        return true
+      end
+    end
+    return false
+  end
+  for i in 1:n_eqs
+    augment!(i, Set{String}())
+  end
+  local g = MetaGraphs.MetaDiGraph(n_eqs)
+  for i in 1:n_eqs
+    for v in incidence[i]
+      local j = get(var_to_eq, v, 0)
+      if j > 0 && j != i
+        Graphs.add_edge!(g, i, j)
+      end
+    end
+  end
+  local sccs = GraphAlgorithms.stronglyConnectedComponents(g)
+  return (sccs, eq_to_var)
+end
+
+"""
+    recomputeStronglyConnectedComponents(simCode) -> SIM_CODE
+
+SimCode pass: refresh `simCode.stronglyConnectedComponents` against the
+current residual array so MTK codegen can act on accurate cycle info.
+"""
+function recomputeStronglyConnectedComponents(simCode::SIM_CODE)::SIM_CODE
+  hasSubModels(simCode) && return simCode
+  local (sccs, _) = _recomputeSCCsFromSimCode(simCode)
+  local nCyclic = count(s -> length(s) > 1, sccs)
+  if nCyclic > 0
+    @debug "[SIMCODE: $(simCode.name): recomputeSCCs] cyclic SCCs found" nCyclic
+  end
+  @assign simCode.stronglyConnectedComponents = sccs
+  return simCode
 end
 
 #= After eliminateAliasVariables, two equations may implicitly assert
@@ -5213,15 +5334,15 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   local irreducibleSet = Set{String}(simCode.irreductableVariables)
   local sharedVarSet   = Set{String}(simCode.sharedVariables)
 
-  local rhsGroups = Dict{String, Vector{Tuple{String, Int, DAE.ComponentRef, DAE.Type}}}()
+  local rhsGroups = Dict{String, Vector{Tuple{String, Int, DAE.ComponentRef, DAE.Type, Bool}}}()
   for (i, eq) in enumerate(resEqs)
     local pair = _detectVarMinusExpr(eq.exp, ht)
     pair === nothing && continue
-    local (n, cr, ty, key) = pair
+    local (n, cr, ty, key, neg) = pair
     if !haskey(rhsGroups, key)
-      rhsGroups[key] = Tuple{String, Int, DAE.ComponentRef, DAE.Type}[]
+      rhsGroups[key] = Tuple{String, Int, DAE.ComponentRef, DAE.Type, Bool}[]
     end
-    push!(rhsGroups[key], (n, i, cr, ty))
+    push!(rhsGroups[key], (n, i, cr, ty, neg))
   end
 
   local aliasMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
@@ -5234,7 +5355,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
     length(entries) >= 2 || continue
     local bestIdx = 1
     local bestPrio = -1
-    for (j, (n, _, _, _)) in enumerate(entries)
+    for (j, (n, _, _, _, _)) in enumerate(entries)
       haskey(ht, n) || continue
       local (_, sv) = ht[n]
       local prio = varKindPriority(sv.varKind)
@@ -5246,7 +5367,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
         bestIdx = j
       end
     end
-    local (repName, _, repCref, repTy) = entries[bestIdx]
+    local (repName, _, repCref, repTy, repNeg) = entries[bestIdx]
     local (_, repSv) = ht[repName]
     local repIsState = @match repSv.varKind begin
       STATE(__) => true
@@ -5254,18 +5375,9 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
     end
     for (j, entry) in enumerate(entries)
       j == bestIdx && continue
-      local (n, eqIdx, _, _) = entry
+      local (n, eqIdx, _, _, entryNeg) = entry
       n == repName && continue
       n in sharedVarSet && continue
-      #= Protect `_re` / `_im` scalarized parts of Complex variables. These
-         names are referenced from earlier-pass observed equations
-         (`simCode.eliminatedEquations`) via the original Complex CREF
-         + TSUB indexing, not via the flat `_re` name. Our
-         `substituteAliasCref` matches on the flat name and would miss
-         those references, leaving dangling refs at codegen time
-         (observed on QuasiStationary models). Keep the scalarized
-         siblings in the HT; the original RHS-equiv group still aliases
-         the non-Complex members. =#
       if endswith(n, "_re") || endswith(n, "_im")
         continue
       end
@@ -5277,8 +5389,9 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
       if n in irreducibleSet && !(repIsState && isState)
         continue
       end
-      aliasMap[n] = (repName, false, repCref, repTy)
-      push!(aliasEntries, AliasEntry(n, repName, false))
+      local aliasNeg = xor(entryNeg, repNeg)
+      aliasMap[n] = (repName, aliasNeg, repCref, repTy)
+      push!(aliasEntries, AliasEntry(n, repName, aliasNeg))
       push!(removeEqs, eqIdx)
       push!(elimVarOrder, n)
       push!(elimEqOrder, resEqs[eqIdx])

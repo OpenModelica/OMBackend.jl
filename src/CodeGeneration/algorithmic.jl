@@ -1085,6 +1085,8 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
           :(getproperty($innerJL, $(QuoteNode(Symbol(fname)))))
         end
       end
+      DAE.BOX(exp = innerExp) => expToJuliaExpAlg(innerExp)
+      DAE.UNBOX(exp = innerExp) => expToJuliaExpAlg(innerExp)
       _ =>  throw(ErrorException("$exp not yet supported"))
     end
   end

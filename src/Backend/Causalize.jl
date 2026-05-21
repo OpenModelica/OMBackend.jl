@@ -221,7 +221,6 @@ function detectIfEquationsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
           if ! (eq === eq2)
             @assign syst.orderedEqs[i] = eq2
           end
-          tick.x += 1
         end
 
         #= Append the new variables to the list of variables =#
@@ -247,15 +246,18 @@ Base.@nospecializeinfer function replaceIfExpressionWithTmpVar(@nospecialize(exp
   (newExp, cont, tmpVarToElementAndTick) = begin
     local tmpVarToElement::Dict = first(tmpVarToElementAndTick)
     local tick::Ref{Int} = last(tmpVarToElementAndTick)
-    #= NOTE: All these temporary variables are assumed to be REAL numbers for now =#
-    local varType = DAE.T_REAL_DEFAULT
-    local varName = string("ifEq_tmp", tick.x)
-    local var::DAE.ComponentRef = DAE.CREF_IDENT(varName, varType, nil)
-    local emptySource = DAE.emptyElementSource
-    local attr = BDAE.EQ_ATTR_DEFAULT_UNKNOWN
     @match exp begin
       DAE.IFEXP(cond, expThen, expElse) => begin
+        #= Bump per IFEXP so siblings within the same residual get distinct
+           names; a single per-equation bump would collide every nested
+           IFEXP onto one symbolic var. =#
+        local varType = DAE.T_REAL_DEFAULT
+        local varName = string("ifEq_tmp", tick.x)
+        tick.x += 1
+        local var::DAE.ComponentRef = DAE.CREF_IDENT(varName, varType, nil)
         local varAsCREF::DAE.CREF = DAE.CREF(var, varType)
+        local emptySource = DAE.emptyElementSource
+        local attr = BDAE.EQ_ATTR_DEFAULT_UNKNOWN
         local backendVar = BDAE.VAR(DAE.CREF_IDENT(varName, DAE.T_UNKNOWN_DEFAULT, nil),
                                     BDAE.VARIABLE(), varType)
         tmpVarToElement[backendVar] = BDAE.IF_EQUATION(list(cond),
@@ -270,7 +272,6 @@ Base.@nospecializeinfer function replaceIfExpressionWithTmpVar(@nospecialize(exp
       end
     end
   end
-  #= Note we replace the if expression with our temporary variable =#
   return (newExp, cont, tmpVarToElementAndTick)
 end
 

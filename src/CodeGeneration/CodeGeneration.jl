@@ -64,6 +64,7 @@ import OMRuntimeExternalC
 RuntimeGeneratedFunctions.init(@__MODULE__)
 
 include("DAEInitSolve.jl")
+include("mtkDump.jl")
 include("mtkExternals.jl")
 include("./exprRewrite.jl")
 include("./arrayUtils.jl")

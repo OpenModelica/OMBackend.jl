@@ -45,6 +45,9 @@
   Author: John Tinnerholm
 =#
 
+# MTK-stage dump helpers (see CodeGeneration/mtkDump.jl).
+import .MTKDump: dumpBuildDirectRHSInputs, dumpRHSExpression
+
 """
     buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
                           allInitialValues=nothing)
@@ -77,6 +80,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
 
   @debug "DirectRHS: $(nStates) states, $(nParams) params, $(nEqs) equations"
 
+  # Dump every Symbol/Num touching the post-MTK boundary. See MTKDump for
+  # rationale and format.
+  dumpBuildDirectRHSInputs(states, params, eqs, finalInitialValues, pars, reducedSystem, callbacks)
+
   #= Reject structurally imbalanced systems early. MTK's structural_simplify
      occasionally leaves reduced systems where full_equations(sys) != unknowns(sys)
      (observed in Rotational.Friction: 35 full_equations, 36 unknowns). Attempting
@@ -102,6 +109,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   # 1. Build the RHS function expression from symbolic equations
   local rhs_list = [eq.rhs for eq in eqs]
   local f_ip_expr = _buildRHSExpression(rhs_list, states, params, iv)
+
+  # Dump the actual generated RHS expression — see MTKDump.
+  dumpRHSExpression(rhs_list, f_ip_expr)
 
   # 2. Create world-age-safe function via RuntimeGeneratedFunction
   local rhsFunc = _exprToRTGFunction(f_ip_expr)

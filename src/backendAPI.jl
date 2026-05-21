@@ -145,6 +145,13 @@ DEJL (DifferentialEquations.jl) models that have been compiled one time.
 """
 const COMPILED_MODELS_DEJL = Dict{String, Tuple{Expr, Bool, UInt64}}()
 
+# Per-model log-run directory captured at translate (`lower`) time. Looked up
+# at simulate time by `simulateModel` so any dumps emitted during the
+# post-MTK / `buildDirectRHSProblem` / `_solveDAEInitialization!` codegen
+# paths land in the same per-model run directory as the BDAE/simCode logs,
+# not the session root. Keyed by canonical model name.
+const MODEL_RUN_DIRS = Dict{String, String}()
+
 function logRunModelName(frontendDAE::DAE.DAE_LIST)::String
   @match DAE.COMP(ident = ident) = listHead(frontendDAE.elementLst)
   return ident
@@ -367,6 +374,31 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         simCode = SimulationCode.runSimCodePass("foldExplicitSingleAssign", simCode,
                                                 SimulationCode.foldExplicitSingleAssign)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterExplicitFold.log"), SimulationCode.dumpSimCode(simCode))
+        #= Second alias-elim pass: earlier simplifiers (foldExplicitSingleAssign,
+           propagateConstants, dropObservationOnlyVariables) collapse n-term
+           connector flow sums into 2-term residuals like `a + b = 0` that the
+           first alias-elim pass could not yet see. =#
+        simCode = SimulationCode.runSimCodePass("eliminateAliasVariables", simCode,
+                                                SimulationCode.eliminateAliasVariables)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterAliasElimination2.log"), SimulationCode.dumpSimCode(simCode))
+        #= Second RHS-equivalence pass: the alias-elim2 above can collapse two
+           equations of the form `Xi - der(s_i)` onto the same `der(s)`. The
+           pass keys equations by RHS string before its own substitution
+           propagates, so a single iteration can leave equivalent pairs
+           ungrouped when one pair must fold first to expose another's key
+           (e.g. mass1_v → brake_v before ifEq_tmp1 ↔ ifEq_tmp2 becomes
+           visible via the now-shared der(brake_v)). Iterate to fixed point;
+           a no-op call is cheap and returns simCode unchanged. =#
+        let prev = -1
+          for _ in 1:6
+            simCode = SimulationCode.runSimCodePass("eliminateRHSEquivalentEquations", simCode,
+                                                    SimulationCode.eliminateRHSEquivalentEquations)
+            local n = length(simCode.residualEquations)
+            n == prev && break
+            prev = n
+          end
+        end
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRHSEquiv2.log"), SimulationCode.dumpSimCode(simCode))
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterEliminateConstParams.log"), SimulationCode.dumpSimCode(simCode))
         simCode = SimulationCode.runSimCodePass("classifyAdditionalDiscretes", simCode,
                                                 SimulationCode._classifyAdditionalDiscreteVariables)
@@ -425,6 +457,15 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         end
         SimulationCode.logSimCodePassMetrics("observedFilter", observedBefore, simCode, time() - observedT0)
         simCode = SimulationCode.cleanupTrivialResidualEquations(simCode; sourcePass = "observedFilter")
+        #= Re-derive SCCs against the residual array MTK will actually see.
+           The SCC stamp written by transformToSimCode indexes into the
+           pre-pipeline residual list and is stale after alias-elim,
+           foldExplicitSingleAssign, output-only elimination, etc. MTK
+           codegen needs accurate cycle info to extract NonlinearSystem
+           sub-blocks per cyclic SCC. =#
+        simCode = SimulationCode.runSimCodePass("recomputeStronglyConnectedComponents", simCode,
+                                                SimulationCode.recomputeStronglyConnectedComponents)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRecomputeSCC.log"), SimulationCode.dumpSimCode(simCode))
         _checkSimCodeBeforeCodegen(simCode, checkSimCode)
         local _mtkCode = @BACKEND_PERFLOG "[backendAPI] generateMTKTargetCode" generateMTKTargetCode(simCode)
         return _translationResult(_mtkCode, nameMap, returnNameMap)
@@ -483,7 +524,12 @@ end
  Transforms given DAE-IR/Hybrid DAE to backend DAE-IR (BDAE-IR)
 """
 function lower(frontendDAE::DAE.DAE_LIST)::BDAE.BACKEND_DAE
-  local runId = createLogRunId(logRunModelName(frontendDAE))
+  local modelName = logRunModelName(frontendDAE)
+  local runId = createLogRunId(modelName)
+  # Remember the translate-time run dir so simulate-time code can land its
+  # dumps in the same per-model directory. Key by canonical name to match the
+  # lookup in simulateModel.
+  MODEL_RUN_DIRS[canonicalName(modelName)] = runId
   local lowerWork = function()
     local bDAE::BDAE.BACKEND_DAE
     @debug "Length of frontend DAE:" length(frontendDAE.elementLst)
@@ -518,7 +564,9 @@ end
   Transforms given FlatModelica to backend DAE-IR (BDAE-IR).
 """
 function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
-  local runId = createLogRunId(logRunModelName(fm))
+  local modelName = logRunModelName(fm)
+  local runId = createLogRunId(modelName)
+  MODEL_RUN_DIRS[canonicalName(modelName)] = runId
   local lowerWork = function()
     local preprocessedFM = FrontendUtil.handleBuiltin(fm)
     local bDAE = BDAECreate.lower(preprocessedFM)
@@ -830,11 +878,16 @@ function simulateModel(modelName::String;
       if needsEval
         @eval $modelCode
       end
-      #= Run in latest world age to see the just-eval'd module =#
-      Base.invokelatest() do
+      #= Run in latest world age to see the just-eval'd module. Push the
+         translate-time run dir on the log stack so any dumps emitted during
+         structural_simplify / buildDirectRHSProblem / _solveDAEInitialization!
+         land in the per-model directory instead of the session root. =#
+      local _runDir = get(MODEL_RUN_DIRS, modelName, nothing)
+      local _doSim = () -> Base.invokelatest() do
         local mod = getfield(OMBackend, Symbol(modelName))
         mod.simulate(tspan, solver; kwargs...)
       end
+      _runDir === nothing ? _doSim() : withLogRunDir(_doSim, _runDir)
     catch err
       @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
       rethrow(err)
