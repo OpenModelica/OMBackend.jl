@@ -216,6 +216,13 @@ function detectIfEquationsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
       BDAE.EQSYSTEM(__) => begin
         for i in 1:length(syst.orderedEqs)
           local eq = syst.orderedEqs[i]
+          #= Discrete callback bodies (WHEN / INITIAL_WHEN) carry IFEXPs that
+             must be lowered in-place by the callback codegen, not extracted
+             into global algebraic ifEq_tmp* equations whose conditions get
+             pinned at MTK simplify time. =#
+          if eq isa BDAE.WHEN_EQUATION || eq isa BDAE.INITIAL_WHEN_EQUATION
+            continue
+          end
           (eq2, _) = BDAEUtil.traverseEquationExpressions(eq, replaceIfExpressionWithTmpVar,
                                                                   tmpVarToElementAndTick)
           if ! (eq === eq2)

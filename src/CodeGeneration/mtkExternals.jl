@@ -796,20 +796,30 @@ function constTableLookup(table::AbstractArray, idxs...)
     local f = (rt_idxs...) -> begin
       local resolved = ntuple(length(rt_idxs)) do k
         local v = rt_idxs[k]
-        if v isa Integer
-          Int(v)
-        else
-          Int(round(Float64(v)))
-        end
+        local raw = v isa Integer ? Int(v) : Int(round(Float64(v)))
+        clamp(raw, 1, size(_table, k))
       end
       _table[resolved...]
     end
     return makeSymbolicTerm(f, Any[idxs...])
   else
-    return table[ntuple(k -> _toIndex(idxs[k]), length(idxs))...]
+    return table[ntuple(k -> clamp(_toIndex(idxs[k]), 1, size(table, k)),
+                       length(idxs))...]
   end
 end
 
+#= Clamp the resolved table index to the valid range [1, size(table, k)].
+   During DAE initialization the integer / enum simvars that index into
+   constant tables are still at their default 0.0 (Float64 unknown
+   storage) until the `start` attributes are applied. Without clamping,
+   a `constTableLookup` invoked during the init Newton solve hits a
+   BoundsError at index 0. Treating an out-of-range index as the first
+   row/column (typically the "Unknown" / "U" entry in MSL Digital
+   tables) is consistent with Modelica §17.4.4 (uninitialised discretes
+   are treated as their start values, and the init solver is allowed to
+   probe the residual with provisional values that have not yet been
+   pinned). Once init completes the indices are valid and clamping is
+   a no-op. =#
 function _toIndex(v)
   if v isa Integer
     return Int(v)

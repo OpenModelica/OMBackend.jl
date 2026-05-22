@@ -5,7 +5,7 @@
   frees all unknowns to handle rank-deficient kinematic loops.
 =#
 
-function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=1e-1, pinned=Int[], derivative_targets=Pair{Int, Float64}[])
+function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[])
   local n = length(u0)
   local nMM = size(mm, 1)
   local nSafe = min(n, nMM)

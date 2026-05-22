@@ -428,14 +428,33 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
         local observedBefore = SimulationCode.simCodeMetrics(simCode)
         local observedT0 = time()
         if observedFilter === nothing
-          #= Fast default: drop the alias-map observed pipeline. The
-             eliminatedVariables / eliminatedEquations arrays are KEPT so
-             user code can still query folded variables via `sol(:name)`
-             (regression observed on AlgorithmDiscreteAssign which folds
-             `:out` and reads it from `sol`). =#
+          #= Default: drop alias-map entries whose eliminated name is an
+             internal/auto-generated cref (scalarized array indices like
+             `R_T[1][2]`, frame-internal `frame_a_t[3]`, etc.) but KEEP
+             entries whose eliminated name is a user-visible Modelica
+             identifier. Without this, state-state aliases produced by
+             OMBackend's alias-elim passes (e.g. `rev_phi ~ damper_phi_rel`
+             from the Revolute joint flange constraint) get silently
+             dropped before codegen, so `sol(t; idxs = lookup[\"rev_phi\"])`
+             raises KeyError in tests that query the eliminated name.
+             A "user-visible" name is heuristic: no `[` (no scalarized array
+             subscript) and not a known auto-gen prefix. The bracket guard
+             catches the vast majority of MultiBody internals (Engine1a's
+             876 aliases collapse to a small handful) while preserving the
+             named Modelica vars that user code can reasonably query. =#
           if !isempty(simCode.aliasMap)
-            @debug "[SIMCODE: observedFilter] clearing $(length(simCode.aliasMap)) alias observed equations (default: none)"
-            @assign simCode.aliasMap = empty(simCode.aliasMap)
+            local originalCount = length(simCode.aliasMap)
+            local kept = filter(simCode.aliasMap) do entry
+              #= Drop dangling aliases whose representative has itself been
+                 eliminated from the SimVar HT (e.g. FrozenStateConstraint:
+                 `a → F` survives in aliasMap after `F` is removed by
+                 eliminateFrozenStates; emitting `a ~ F` then raises
+                 UndefVarError at the eval that binds alias names). =#
+              _isUserVisibleAliasName(entry.eliminatedName) &&
+                haskey(simCode.stringToSimVarHT, entry.representativeName)
+            end
+            @debug "[SIMCODE: observedFilter] kept $(length(kept)) of $originalCount user-visible alias observed equations (default filter)"
+            @assign simCode.aliasMap = kept
           end
         else
           local filterStrings = if observedFilter isa Vector{Regex}
@@ -476,6 +495,16 @@ function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatMode
   finally
     WARN_MISSING_START_VALUES[] = previousWarnSetting
   end
+end
+
+#= Heuristic predicate: is the eliminated alias name something a Modelica
+   user might reasonably query via `sol(t; idxs = :name)`? Scalarized array
+   indices and frame-internal connector names contain `[` and are filtered
+   out by default; clean identifiers like `rev_phi` / `damper_w_rel` are
+   kept so the alias observed equation reaches MTK. =#
+function _isUserVisibleAliasName(name::AbstractString)::Bool
+  occursin('[', name) && return false
+  return true
 end
 
 function _translationResult(result::Tuple{String, Expr}, nameMap::NameRewriteMap,

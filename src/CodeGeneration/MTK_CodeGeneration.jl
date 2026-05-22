@@ -301,26 +301,41 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
           end
         end
       end
-      #= Auto-switch from Rosenbrock (default Rodas5) to FBDF when the system
-         has zero differential states. SciML warns that Rosenbrock methods on
-         purely-algebraic systems do not bound the interpolation error, and
-         FBDF handles index-1 DAEs without that restriction. Triggers only
-         when the user is on the default Rodas5; user-chosen solvers are
-         respected as-is. =#
+      #= Auto-switch from Rosenbrock (default Rodas5) to FBDF for DAE shapes
+         where Rosenbrock mass-matrix stepping is known to be brittle:
+         purely-algebraic systems, and mixed systems with algebraic rows for
+         generated discrete variables. Brake reaches a consistent initial
+         residual, but Rodas5P immediately aborts with dt_epsilon/NaN while
+         FBDF advances the same mass-matrix problem. User-chosen non-Rosenbrock
+         solvers are respected as-is. =#
       local _solver = solver
       local _solverName = string(nameof(typeof(solver)))
       if startswith(_solverName, "Rodas") || startswith(_solverName, "Rosenbrock")
         local _u0 = $(Symbol("$(MODEL_NAME)Model_problem")).u0
         local _n = _u0 === nothing ? 0 : length(_u0)
         local _mm = $(Symbol("$(MODEL_NAME)Model_problem")).f.mass_matrix
+        local _discreteUnknownNames = Set{String}($(Expr(:vect, [string(varName, "(t)") for (varName, (_, simVar)) in simCode.stringToSimVarHT if simVar.varKind isa SimulationCode.DISCRETE]...)))
         #= UniformScaling (pure ODE) supports `_mm[i,i]` as 1; explicit Matrix
            returns the entry. Both code paths handle by indexing the diagonal.
            When u0 is nothing (purely-algebraic MTK problem) the loop runs 0
            times so _nDiff stays 0 — exactly the case where FBDF is wanted. =#
         local _nDiff = count(i -> _mm[i,i] != 0, 1:_n)
+        local _nAlg = _n - _nDiff
         if _nDiff == 0
           @info "[MTK GEN: solver] zero differential states detected, switching default $(_solverName) -> FBDF for purely-algebraic DAE"
           _solver = FBDF(autodiff=false)
+        elseif _nAlg > 0 && !isempty(_discreteUnknownNames)
+          local _unknowns = try
+            ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM)
+          catch
+            Any[]
+          end
+          local _nCheck = min(_n, length(_unknowns))
+          local _hasDiscreteAlgUnknown = any(i -> _mm[i,i] == 0 && string(_unknowns[i]) in _discreteUnknownNames, 1:_nCheck)
+          if _hasDiscreteAlgUnknown
+            @info "[MTK GEN: solver] discrete algebraic DAE detected, switching default $(_solverName) -> FBDF"
+            _solver = FBDF(autodiff=false)
+          end
         end
       end
       # Route DAE-native solvers (e.g. Sundials.IDA, DABDF2, DFBDF) through a residual-form DAEProblem rather than the ODEProblem with mass matrix.
@@ -667,6 +682,33 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   for whenEq in simCode.whenEquations
     SimulationCode._collectWhenAssignTargets!(_whenAssignedSet, whenEq.whenEquation)
   end
+  #= If a discrete variable participates in a recomputed cyclic residual SCC,
+     treating it as a held continuous state (`der(disc) ~ 0`) adds an
+     independent equation on top of the algebraic loop equations. The residual
+     loop already defines the discrete value at event instants; keep it as an
+     algebraic unknown and let MTK tear the loop instead of pinning it with a
+     dummy derivative. =#
+  local _cyclicSCCDiscrete = Set{String}()
+  try
+    local (_sccsForDemotion, _eqToVarForDemotion) =
+      SimulationCode._recomputeSCCsFromSimCode(simCode)
+    for _scc in _sccsForDemotion
+      length(_scc) > 1 || continue
+      for _eqIdx in _scc
+        1 <= _eqIdx <= length(_eqToVarForDemotion) || continue
+        local _varName = _eqToVarForDemotion[_eqIdx]
+        isempty(_varName) && continue
+        _varName in _whenAssignedSet && continue
+        local _entry = get(stringToSimVarHT, _varName, nothing)
+        _entry === nothing && continue
+        if _entry[2].varKind isa SimulationCode.DISCRETE
+          push!(_cyclicSCCDiscrete, _varName)
+        end
+      end
+    end
+  catch err
+    @debug "[MTK GEN: discrete] cyclic SCC demotion skipped" exception=(err, catch_backtrace())
+  end
   #= Detect equations whose RHS contains an `ifelse` call OR a call to
      `constTableLookup` (anywhere): these equations come from constant-table
      runtime indexing via `OMBackend.CodeGeneration.constTableLookup`
@@ -836,6 +878,42 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     end
     return nothing
   end
+  #= If-equation lowering emits a generated target equation such as
+       ifEq_tmpN ~ ifelse(...)
+     and the residual side often aliases a discrete variable to that target:
+       0 ~ disc - ifEq_tmpN
+     The generated target equation already defines the discrete value, so the
+     matching `der(disc) ~ 0` dummy is redundant just like the direct
+     `disc - ifelse(...)` case above. =#
+  local _conditionalTargets = Set{String}()
+  for component in IF_EQUATION_COMPONENTS
+    for ceq in component[2]
+      if ceq isa Expr && ceq.head === :call && length(ceq.args) == 3 &&
+         ceq.args[1] === :~
+        local lhsName = _refName(ceq.args[2])
+        lhsName !== nothing && push!(_conditionalTargets, lhsName)
+      end
+    end
+  end
+  local _matchConditionalTargetDefinedDiscrete = function(rhs)
+    rhs = _unwrap(rhs)
+    rhs isa Expr || return nothing
+    rhs.head === :call && length(rhs.args) == 3 || return nothing
+    local op = rhs.args[1]
+    (op === :+ || op === :-) || return nothing
+    local a, b = _unwrap(rhs.args[2]), _unwrap(rhs.args[3])
+    local aName = _refName(a)
+    local bName = _refName(b)
+    if aName !== nothing && aName in _discreteSet &&
+       bName !== nothing && bName in _conditionalTargets
+      return aName
+    end
+    if bName !== nothing && bName in _discreteSet &&
+       aName !== nothing && aName in _conditionalTargets
+      return bName
+    end
+    return nothing
+  end
   local _comparisonPinned = String[]
   for eq in EQUATIONS
     if eq isa Expr && eq.head === :call && length(eq.args) == 3 &&
@@ -853,6 +931,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       intDef !== nothing && push!(_aliasPinned, intDef)
       local arithDef = _matchArithmeticDefinedDiscrete(eq.args[3])
       arithDef !== nothing && push!(_aliasPinned, arithDef)
+      local conditionalDef = _matchConditionalTargetDefinedDiscrete(eq.args[3])
+      conditionalDef !== nothing && push!(_aliasPinned, conditionalDef)
       #= Pairwise discrete alias: `0 ~ a - b` → both refs to discrete vars.
          One alias residual contributes exactly one excess equation relative
          to the two discrete dummy equations, so demote one side only. If a
@@ -899,6 +979,11 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      `discreteVariables` while mutating `DISCRETE_DUMMY_EQUATIONS` between
      them caused index drift — the second loop would use stale dummies. =#
   local _toDemote = Set{String}(_discreteAliasOverride)
+  local _nCyclicSCCDemotions = count(v -> !(v in _toDemote), _cyclicSCCDiscrete)
+  if _nCyclicSCCDemotions > 0
+    union!(_toDemote, _cyclicSCCDiscrete)
+    @debug "[MTK GEN: discrete] Cyclic SCC fix: demoting $(_nCyclicSCCDemotions) discrete vars from held states to algebraic unknowns: $(collect(_cyclicSCCDiscrete))"
+  end
   if !isempty(_toDemote)
     @debug "[MTK GEN: discrete] Discrete alias fix (definitional): demoting $(length(_toDemote)) discrete vars pinned by definitional residuals (const / ifelse / comparison / integer): $(collect(_toDemote))"
     #= Recompute excess accounting for the pre-pass demotions, so the
@@ -1381,9 +1466,19 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE)
      `System(eqs, vars, ps)` constructor (validate_operator fails with
      OperatorIndepvarMismatchError). These eliminated variables are state
      derivatives whose values are already exposed by MTK's solution object. =#
+  #= Names already emitted by `generateAliasObservedBlock` from `aliasMap`
+     have a direct `elim ~ rep` observed equation. Re-deriving the same
+     observation here via `solve_for(0 ~ residual, elim)` is redundant and
+     fails when the residual has already been alias-substituted (the
+     residual no longer mentions `elim` and `solve_for` returns NaN, which
+     then propagates into `sol(t; idxs = elim)`). =#
+  local aliasNames = Set{String}(entry.eliminatedName for entry in simCode.aliasMap)
   local solveBodyExprs = Expr[]
   for (i, varName) in enumerate(elimVars)
     if containsDerCall(elimEqs[i].exp)
+      continue
+    end
+    if varName in aliasNames
       continue
     end
     local elimSym = Symbol(varName)
@@ -1782,11 +1877,83 @@ So the first will have 1 and so on.
 function createIfEquations(stateVariables, algebraicVariables, simCode)
   local ifEquations = Tuple{Vector{Expr}, Vector{Expr}, Vector{Expr}, Vector{Symbol}, Vector{Tuple}}[]
   local identifier::Int
+  local sortedIfEquations = sort(collect(simCode.ifEquations);
+                                 by = ifEq -> _ifEquationSortKey(ifEq, simCode))
   #= The identifier is increased by 1 in each iteration. =#
-  for (identifier, ifEq) in enumerate(simCode.ifEquations)
+  for (identifier, ifEq) in enumerate(sortedIfEquations)
     push!(ifEquations, createIfEquation(stateVariables, algebraicVariables, ifEq, identifier, simCode))
   end
   return ifEquations
+end
+
+function _ifEquationSortKey(ifEq::SimulationCode.IF_EQUATION, simCode)::String
+  local targets = String[]
+  try
+    for branch in ifEq.branches
+      for resEq in branch.residualEquations
+        push!(targets, string(last(deCausalize(resEq, simCode))))
+      end
+      isempty(targets) || break
+    end
+  catch
+    empty!(targets)
+  end
+  if isempty(targets)
+    try
+      for branch in ifEq.branches
+        push!(targets, string(branch.condition))
+      end
+    catch
+      return ""
+    end
+  end
+  sort!(targets)
+  return join(targets, "|")
+end
+
+function _ifConditionDependsOnTime(@nospecialize(condition))::Bool
+  local refs::Set{String} = Set{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, condition)
+  catch
+    return false
+  end
+  return "time" in refs
+end
+
+"""
+    _ifConditionAllDiscreteOrParameter(condition, simCode) -> Bool
+
+Return true when every variable reference in `condition` is a DISCRETE
+simvar, a PARAMETER, or a constant (no STATE / ALG_VARIABLE / `time`
+reference). For such conditions the value flips only through the
+equations that define the discrete variables — MTK propagates the
+update through the residual system on its own, so an explicit
+SymbolicContinuousCallback would only add chatter without contributing
+new event semantics.
+
+Returns false on any reference to a continuous unknown so the caller
+knows a continuous event is still required.
+"""
+function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::Bool
+  local refs::Set{String} = Set{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, condition)
+  catch
+    return false
+  end
+  isempty(refs) && return false
+  local ht = simCode.stringToSimVarHT
+  for name in refs
+    name == "time" && return false
+    local entry = get(ht, name, nothing)
+    entry === nothing && return false
+    local kind = entry[2].varKind
+    if !(kind isa SimulationCode.DISCRETE || kind isa SimulationCode.PARAMETER)
+      return false
+    end
+  end
+  return true
 end
 
 """
@@ -1852,16 +2019,16 @@ function createIfEquation(stateVariables::Vector,
         local numVal = ivCond ? 1.0 : 0.0
         local invVal = ivCond ? 0.0 : 1.0
         #= Build ImperativeAffect: function returns a NamedTuple of new values.
-           modified NamedTuple maps aliases to the symbolic parameter variables. =#
-        local returnKws = [Expr(:kw, sym, (j == i) ? numVal : invVal) for (j, sym) in enumerate(allIfCondSyms)]
-        local returnNT = Expr(:tuple, Expr(:parameters, returnKws...))
-        local fExpr = :((modified, observed, ctx, integrator) -> $returnNT)
-        local modifiedKws = [Expr(:kw, sym, sym) for sym in allIfCondSyms]
-        local modifiedNT = Expr(:tuple, Expr(:parameters, modifiedKws...))
-        local affectTuple = :(($(fExpr), $(modifiedNT)))
-        #= Wrap in SymbolicContinuousCallback with ImperativeAffect.
-           Use NoInit so the solver continues from current state. =#
-        local cond = :(ModelingToolkit.SymbolicContinuousCallback(
+           modified NamedTuple maps aliases to the symbolic parameter variables.
+           Callback fires for every branch condition; ifCondN is the load-bearing
+           branch switch the residual ifelse reads. =#
+        local returnKws::Vector{Expr} = Expr[Expr(:kw, sym, (j == i) ? numVal : invVal) for (j, sym) in enumerate(allIfCondSyms)]
+        local returnNT::Expr = Expr(:tuple, Expr(:parameters, returnKws...))
+        local fExpr::Expr = :((modified, observed, ctx, integrator) -> $returnNT)
+        local modifiedKws::Vector{Expr} = Expr[Expr(:kw, sym, sym) for sym in allIfCondSyms]
+        local modifiedNT::Expr = Expr(:tuple, Expr(:parameters, modifiedKws...))
+        local affectTuple::Expr = :(($(fExpr), $(modifiedNT)))
+        local cond::Expr = :(ModelingToolkit.SymbolicContinuousCallback(
           ($(mtkCond)) => $(affectTuple);
           reinitializealg = SciMLBase.NoInit()
         ))
@@ -2779,10 +2946,17 @@ function createWhenStatementsMTK(whenStatements::List, simCode::SimulationCode.S
         else
         local leftStr = SimulationCode.string(wStmt.left)
         (index, var) = simCode.stringToSimVarHT[leftStr]
+        local lhsSym = Symbol(string(var.name))
+        #= Refresh the local LHS binding after the write so later statements in
+           the same callback body read the freshly-assigned value. Without this,
+           sequential algorithm-section assignments lifted into one WHEN_EQUATION
+           (e.g. AlgorithmDynamicArrayWrite's word := data; mem[addr,:] := word;
+           out := mem[addr,:]) read the stale top-of-affect! binding. =#
         push!(res, quote
                 idx = lookuptableStates[Symbol($(string(var.name)))]
                 integrator.u[idx] = $(expToJuliaExpMTK(wStmt.right,
                                                        simCode; varPrefix = varPrefix, varSuffix = varSuffix))
+                $(lhsSym) = integrator.u[idx]
               end)
         end
       end
@@ -2848,9 +3022,13 @@ end
    at its default (0) — e.g. `T_start := startTime + count*period` in the
    trapezoid signal source was silently dropped, breaking every model that
    relies on `initial algorithm` to seed states. =#
-function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE)
+function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
+                               renamedNames::Set{String} = Set{String}())
   local sub = e -> _substituteBoundParameters(e, simCode)
-  local lowerAlg = e -> _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e)))
+  local lowerAlg = e -> _renameAlgIdentifiers(
+    _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))),
+    renamedNames,
+    "")
   local crefName = cr -> SimulationCode.DAE_identifierToString(cr)
   @match wStmt begin
     BDAE.NORETCALL(__) => :( $(lowerAlg(wStmt.exp)); nothing )
@@ -3058,7 +3236,7 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
       end
     end
   else
-    local seenLHS = Set{String}()
+    local seenLHS = copy(lhsNames)
     for ia in simCode.initialAlgorithms, op in ia.statements
       push!(stmts, _initialWhenOpToJuliaEarly(op, simCode, renamedNames, seenLHS))
     end
@@ -3115,13 +3293,19 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
       end
     end
   end
-  local stmts = Expr[]
   local lhsNames = Set{String}()
   local rhsNames = Set{String}()
   for ia in simCode.initialAlgorithms
     for op in ia.statements
-      push!(stmts, _initialWhenOpToJulia(op, simCode))
       _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
+    end
+  end
+  local renamedNames = union(lhsNames, rhsNames)
+  push!(renamedNames, "time")
+  local stmts = Expr[]
+  for ia in simCode.initialAlgorithms
+    for op in ia.statements
+      push!(stmts, _initialWhenOpToJulia(op, simCode, renamedNames))
     end
   end
   if isempty(stmts)
@@ -3206,4 +3390,3 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
     end
   end
 end
-

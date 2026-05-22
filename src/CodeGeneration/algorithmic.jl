@@ -842,14 +842,19 @@ function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
         local varName::String = SimulationCode.string(exp.componentRef)
         #= Replace dots with underscores to match flattened parameter names =#
         local flatName::String = varName
-        #= If the CREF has subscripts anywhere, parse it as an array access =#
-        local allSubscripts = CodeGeneration.FrontendUtil.Util.getSubscriptsFromCref(exp.componentRef)
-        if !isempty(allSubscripts)
-          expr = Meta.parse(flatName)
-        else
-          quote
-            $(Symbol(flatName))
-          end
+        #= Always emit the whole flat name as a single Symbol. Earlier code
+           routed names containing subscripts through `Meta.parse` so that
+           a final `[k]` would parse as Julia array indexing, but the
+           flattened scalar simvars carry their subscripts INLINE in the
+           identifier (e.g. `comp[2]_field`). `Meta.parse("comp[2]_field")`
+           sees `[2]` then a leading-underscore identifier and emits
+           `comp[2] * _field` (implicit multiplication after `]`), which
+           splits the qualified name and causes UndefVarError on the bare
+           array reference at simulate time. MSL Digital.Examples.RAM was
+           the canonical trip via DLATRAM's inertialDelaySensitive[i]
+           algorithm body. =#
+        quote
+          $(Symbol(flatName))
         end
       end
       DAE.CREF(cr, _)  => begin

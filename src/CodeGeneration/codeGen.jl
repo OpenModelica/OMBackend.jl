@@ -542,8 +542,53 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
         :()
       end
     end
+    local changeInitExprs = map(condCrefs) do c
+      local cStr = string(c)
+      local entry = get(simCode.stringToSimVarHT, cStr, nothing)
+      if entry !== nothing && !SimulationCode.isParameter(entry[2])
+        local sym = Symbol(entry[2].name)
+        quote
+          let _idx = get(lookuptableStates, $(QuoteNode(sym)), nothing)
+            if _idx !== nothing
+              _changePreValues[$(QuoteNode(sym))] = x[_idx]
+            end
+          end
+        end
+      else
+        :()
+      end
+    end
+    local changeUpdateExprs = map(condCrefs) do c
+      local cStr = string(c)
+      local entry = get(simCode.stringToSimVarHT, cStr, nothing)
+      if entry !== nothing && !SimulationCode.isParameter(entry[2])
+        local sym = Symbol(entry[2].name)
+        quote
+          let _idx = get(lookuptableStates, $(QuoteNode(sym)), nothing)
+            if _idx !== nothing
+              _changePreValues[$(QuoteNode(sym))] = integrator.u[_idx]
+            end
+          end
+        end
+      else
+        :()
+      end
+    end
+    local changeSeedPairs = Expr[]
+    for c in condCrefs
+      local cStr = string(c)
+      local entry = get(simCode.stringToSimVarHT, cStr, nothing)
+      if entry !== nothing && !SimulationCode.isParameter(entry[2])
+        local sym = Symbol(entry[2].name)
+        local lit = _readStartAttributeAsLiteral(entry[2])
+        push!(changeSeedPairs, :($(QuoteNode(sym)) => $(lit)))
+      end
+    end
     quote
-      let _condCache = Ref{Any}(nothing)
+      let _condCache = Ref{Any}(nothing),
+          _affCache = Ref{Any}(nothing),
+          _changeCache = Ref{Any}(nothing),
+          _changeSeedValues = Dict{Symbol, Any}($(changeSeedPairs...))
         global $(Symbol("condition$(callbacks)"))
         $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
           local lookuptableStates
@@ -564,11 +609,21 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
             lookuptableStates = cached[1]
             lookuptableParams = cached[2]
           end
+          local _changePreValues
+          if _changeCache[] === nothing
+            _changePreValues = copy(_changeSeedValues)
+            _changeCache[] = _changePreValues
+            if isempty(_changePreValues)
+              $(changeInitExprs...)
+            end
+          else
+            _changePreValues = _changeCache[]
+          end
           $(map(x -> Expr(Symbol("="),
                           Symbol(string(x)),
                           getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
                 Util.getAllCrefs(cond))...)
-          local _result = $(expToJuliaBoolMTK(wEq.condition, simCode))
+          local _result = $(expToJuliaBoolMTK(wEq.condition, simCode; cachedChange = true))
           @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
           #= DiscreteCallback condition must return Bool per SciMLBase. Modelica
              Boolean discrete states are stored as Float64 in `integrator.u`
@@ -579,8 +634,6 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
              evaluates correctly. Bool results pass through unchanged. =#
           _result isa Bool ? _result : (_result != 0)
         end
-      end
-      let _affCache = Ref{Any}(nothing)
         global $(Symbol("affect$(callbacks)!"))
         $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
           local t = integrator.t
@@ -606,6 +659,9 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
           $(whenStatementsMTKDiscrete...)
           auto_dt_reset!(integrator)
           add_tstop!(integrator, integrator.t + 1E-12)
+          local _changePreValues = _changeCache[] === nothing ? Dict{Symbol, Any}() : _changeCache[]
+          _changeCache[] = _changePreValues
+          $(changeUpdateExprs...)
           $(condResetExprs...)
           @debug "[CB-DC$($(callbacks)) affect] done" t=integrator.t u=copy(integrator.u)
         end
@@ -847,8 +903,10 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
         end
       end
       DAE.IFEXP(expCond = e1, expThen = e2, expElse = e3) => begin
-        throw(ErrorException("If expressions not allowed in backend code.
-                              They should have been eliminated by a previous pass."))
+        local condJL = expToJuliaExp(e1, context, varPrefix=varPrefix)
+        local thenJL = expToJuliaExp(e2, context, varPrefix=varPrefix)
+        local elseJL = expToJuliaExp(e3, context, varPrefix=varPrefix)
+        :(ifelse($(condJL), $(thenJL), $(elseJL)))
       end
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
         DAECallExpressionToJuliaCallExpression(tmpStr, explst, context, hashTable, varPrefix=varPrefix)

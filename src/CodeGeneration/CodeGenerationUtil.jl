@@ -1474,23 +1474,51 @@ function _resolveModelicaCallTargets(expr)
   return Expr(expr.head, Any[_resolveModelicaCallTargets(a) for a in expr.args]...)
 end
 
-function _renameAlgIdentifiers(expr, names::Set{String})
+function _literalRefName(expr::Expr)
+  expr.head === :ref || return nothing
+  isempty(expr.args) && return nothing
+  expr.args[1] isa Symbol || return nothing
+  local parts = String[string(expr.args[1])]
+  for idx in expr.args[2:end]
+    local v = if idx isa Integer
+      idx
+    elseif idx isa QuoteNode && idx.value isa Integer
+      idx.value
+    else
+      return nothing
+    end
+    push!(parts, string("[", v, "]"))
+  end
+  return join(parts)
+end
+
+function _renameAlgIdentifiers(expr, names::Set{String}, prefix::String)
   if expr isa Symbol
     local s = string(expr)
     s == "time" && return expr
-    return s in names ? Symbol("_alg_" * s) : expr
+    return s in names ? Symbol(prefix * s) : expr
   elseif expr isa Expr
+    if expr.head === :ref
+      local refName = _literalRefName(expr)
+      if refName !== nothing && refName in names
+        return Symbol(prefix * refName)
+      end
+    end
     if expr.head === :call && length(expr.args) >= 1
       local newArgs = Any[expr.args[1]]
       for i in 2:length(expr.args)
-        push!(newArgs, _renameAlgIdentifiers(expr.args[i], names))
+        push!(newArgs, _renameAlgIdentifiers(expr.args[i], names, prefix))
       end
       return Expr(:call, newArgs...)
     else
-      return Expr(expr.head, map(a -> _renameAlgIdentifiers(a, names), expr.args)...)
+      return Expr(expr.head, map(a -> _renameAlgIdentifiers(a, names, prefix), expr.args)...)
     end
   end
   return expr
+end
+
+function _renameAlgIdentifiers(expr, names::Set{String})
+  return _renameAlgIdentifiers(expr, names, "_alg_")
 end
 
 function _readStartAttributeAsLiteral(sv)::Float64

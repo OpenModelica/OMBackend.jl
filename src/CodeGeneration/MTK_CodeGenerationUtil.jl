@@ -57,7 +57,7 @@ import OMRuntimeExternalC
 #= Bool-context lowering for DiscreteCallback condition functions: emits real
    `&&` / `||` / `!` where `expToJuliaExpMTK` uses arithmetic encoding for
    compatibility with Symbolics.jl in residual contexts. =#
-function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode)
+function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode; cachedChange::Bool = false)
   @match cond begin
     DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
       local lhs = expToJuliaExpMTK(e1, simCode)
@@ -66,15 +66,15 @@ function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode)
       :($opSym($lhs, $rhs))
     end
     DAE.LBINARY(exp1 = e1, operator = DAE.AND(__), exp2 = e2) =>
-      :($(expToJuliaBoolMTK(e1, simCode)) && $(expToJuliaBoolMTK(e2, simCode)))
+      :($(expToJuliaBoolMTK(e1, simCode; cachedChange = cachedChange)) && $(expToJuliaBoolMTK(e2, simCode; cachedChange = cachedChange)))
     DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) =>
-      :($(expToJuliaBoolMTK(e1, simCode)) || $(expToJuliaBoolMTK(e2, simCode)))
+      :($(expToJuliaBoolMTK(e1, simCode; cachedChange = cachedChange)) || $(expToJuliaBoolMTK(e2, simCode; cachedChange = cachedChange)))
     DAE.LUNARY(operator = DAE.NOT(__), exp = e1) =>
-      :(!($(expToJuliaBoolMTK(e1, simCode))))
+      :(!($(expToJuliaBoolMTK(e1, simCode; cachedChange = cachedChange))))
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
-        expToJuliaBoolMTK(innerArgs[1], simCode)
+        expToJuliaBoolMTK(innerArgs[1], simCode; cachedChange = cachedChange)
       else
         expToJuliaExpMTK(cond, simCode)
       end
@@ -88,8 +88,8 @@ function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode)
     DAE.CALL(Absyn.IDENT("change"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
-        local curr = expToJuliaBoolMTK(innerArgs[1], simCode)
-        local prev = _preValueLookup(innerArgs[1], simCode)
+        local curr = expToJuliaBoolMTK(innerArgs[1], simCode; cachedChange = cachedChange)
+        local prev = _preValueLookup(innerArgs[1], simCode; cachedChange = cachedChange)
         :(($(curr)) != ($(prev)))
       else
         expToJuliaExpMTK(cond, simCode)
@@ -110,7 +110,7 @@ end
    parameter table. Falls back to `expToJuliaExpMTK` (which gives the
    current-value lookup) for non-CREF arguments — `pre(constant)` and
    `pre(parameter)` are the same as the current value. =#
-function _preValueLookup(@nospecialize(arg::DAE.Exp), simCode)
+function _preValueLookup(@nospecialize(arg::DAE.Exp), simCode; cachedChange::Bool = false)
   @match arg begin
     DAE.CREF(componentRef = cr) => begin
       local crefStr = string(arg)
@@ -125,6 +125,11 @@ function _preValueLookup(@nospecialize(arg::DAE.Exp), simCode)
       #= States and discretes both live on the integrator's state vector;
          the surrounding callback codegen has populated `lookuptableStates`
          with `Symbol(name) => index`. =#
+      if cachedChange
+        return :(get(_changePreValues,
+                     Symbol($(string(sv.name))),
+                     x[lookuptableStates[Symbol($(string(sv.name)))]]))
+      end
       :(integrator.uprev[lookuptableStates[Symbol($(string(sv.name)))]])
     end
     _ => expToJuliaExpMTK(arg, simCode)
