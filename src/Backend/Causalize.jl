@@ -211,7 +211,14 @@ function detectIfEquationsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
     #= Tick is used to keep track of generated if-equations =#
     local tick::Ref{Int} = 0
     local tmpVarToElement = Dict{BDAE.VAR, BDAE.IF_EQUATION}()
-    local tmpVarToElementAndTick = (tmpVarToElement, tick)
+    #= Canonical (cond|then|else) string -> existing CREF for structural
+       dedup. Identical lifted (cond, then, else) shapes share a single
+       ifEq_tmp var so MTK does not get two SymbolicContinuousCallbacks
+       with byte-identical zero-crossing conditions (it drops all but one,
+       leaving the other branch's ifCond parameter pinned at its initial
+       value). =#
+    local dedup = Dict{String, DAE.Exp}()
+    local tmpVarToElementAndTick = (tmpVarToElement, tick, dedup)
     @match syst begin
       BDAE.EQSYSTEM(__) => begin
         for i in 1:length(syst.orderedEqs)
@@ -243,36 +250,117 @@ function detectIfEquationsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
 end
 
 """
+  Walk a DAE expression and report whether any CREF named `time` appears in it.
+  Used to distinguish monotonic time-dependent if-conditions (safe to lift
+  to one-shot zero-crossing events) from state-dependent if-conditions
+  (which need continuous bool-product evaluation because the underlying
+  comparison can cross its threshold in either direction).
+"""
+function _expDependsOnTime(@nospecialize(e::DAE.Exp))::Bool
+  local found = Ref{Bool}(false)
+  function _scan(@nospecialize(x::DAE.Exp), seen::Ref{Bool})
+    seen[] && return (x, false, seen)
+    @match x begin
+      DAE.CREF(componentRef = c) => begin
+        local s = string(c)
+        if s == "time"
+          seen[] = true
+        end
+        (x, true, seen)
+      end
+      _ => (x, true, seen)
+    end
+  end
+  Util.traverseExpTopDown(e, _scan, found)
+  return found[]
+end
+
+"""
   Detects if expression.
   We replace the if expression with our temporary variable.
   These variables are assigned in newly created if equations that we add to the tmpVarToElement::Dict.
   We create the mapping:
   tmpVar -> equation it is assigned in
 """
-Base.@nospecializeinfer function replaceIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{Dict, Ref{Int}})
+Base.@nospecializeinfer function replaceIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{Dict, Ref{Int}, Dict})
   (newExp, cont, tmpVarToElementAndTick) = begin
-    local tmpVarToElement::Dict = first(tmpVarToElementAndTick)
-    local tick::Ref{Int} = last(tmpVarToElementAndTick)
+    local tmpVarToElement::Dict = tmpVarToElementAndTick[1]
+    local tick::Ref{Int} = tmpVarToElementAndTick[2]
+    local dedup::Dict = tmpVarToElementAndTick[3]
     @match exp begin
       DAE.IFEXP(cond, expThen, expElse) => begin
-        #= Bump per IFEXP so siblings within the same residual get distinct
-           names; a single per-equation bump would collide every nested
-           IFEXP onto one symbolic var. =#
-        local varType = DAE.T_REAL_DEFAULT
-        local varName = string("ifEq_tmp", tick.x)
-        tick.x += 1
-        local var::DAE.ComponentRef = DAE.CREF_IDENT(varName, varType, nil)
-        local varAsCREF::DAE.CREF = DAE.CREF(var, varType)
-        local emptySource = DAE.emptyElementSource
-        local attr = BDAE.EQ_ATTR_DEFAULT_UNKNOWN
-        local backendVar = BDAE.VAR(DAE.CREF_IDENT(varName, DAE.T_UNKNOWN_DEFAULT, nil),
-                                    BDAE.VARIABLE(), varType)
-        tmpVarToElement[backendVar] = BDAE.IF_EQUATION(list(cond),
-                                                       list(list(BDAE.EQUATION(varAsCREF, expThen, emptySource, attr))),
-                                                       list(BDAE.EQUATION(varAsCREF, expElse, emptySource, attr)),
-                                                       emptySource,
-                                                       BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
-        (varAsCREF, true, tmpVarToElementAndTick)
+        #= Recursively process the branches. Use the time-dependent-only
+           variant so that nested state-dependent IFEXPs (e.g. LimPID's
+           saturation) keep their bool-product lowering — one-shot events
+           would freeze the saturation at its first crossing. Nested
+           time-dependent IFEXPs DO get lifted so each transition produces
+           a proper SymbolicContinuousCallback. =#
+        local (liftedCond, _)  = Util.traverseExpTopDown(cond,    _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
+        local (liftedThen, _)  = Util.traverseExpTopDown(expThen, _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
+        local (liftedElse, _)  = Util.traverseExpTopDown(expElse, _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
+        #= Structural dedup: if a lifted IF_EQUATION with the same
+           (cond | then | else) already exists, reuse its CREF instead of
+           generating a duplicate. MTK drops SymbolicContinuousCallbacks
+           with byte-identical zero-crossing conditions; this dedup
+           prevents two separate ifCond parameters from depending on the
+           same event and ending up with one of them pinned. =#
+        local key = string(liftedCond, "|", liftedThen, "|", liftedElse)
+        local existing = get(dedup, key, nothing)
+        if existing !== nothing
+          (existing, true, tmpVarToElementAndTick)
+        else
+          #= Bump per IFEXP so siblings within the same residual get distinct
+             names; a single per-equation bump would collide every nested
+             IFEXP onto one symbolic var. =#
+          local varType = DAE.T_REAL_DEFAULT
+          local varName = string("ifEq_tmp", tick.x)
+          tick.x += 1
+          local var::DAE.ComponentRef = DAE.CREF_IDENT(varName, varType, nil)
+          local varAsCREF::DAE.CREF = DAE.CREF(var, varType)
+          local emptySource = DAE.emptyElementSource
+          local attr = BDAE.EQ_ATTR_DEFAULT_UNKNOWN
+          local backendVar = BDAE.VAR(DAE.CREF_IDENT(varName, DAE.T_UNKNOWN_DEFAULT, nil),
+                                      BDAE.VARIABLE(), varType)
+          tmpVarToElement[backendVar] = BDAE.IF_EQUATION(list(liftedCond),
+                                                         list(list(BDAE.EQUATION(varAsCREF, liftedThen, emptySource, attr))),
+                                                         list(BDAE.EQUATION(varAsCREF, liftedElse, emptySource, attr)),
+                                                         emptySource,
+                                                         BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
+          dedup[key] = varAsCREF
+          (varAsCREF, true, tmpVarToElementAndTick)
+        end
+      end
+      _ => begin
+        (exp, true, tmpVarToElementAndTick)
+      end
+    end
+  end
+  return (newExp, cont, tmpVarToElementAndTick)
+end
+
+"""
+  Recursive variant used inside `replaceIfExpressionWithTmpVar` for the
+  branches of an already-lifted IFEXP. Lifts only IFEXPs whose condition
+  references `time`; leaves state-dependent IFEXPs in place so codegen
+  emits a continuous bool-product (correct for non-monotonic conditions).
+  Recursion descends into the branches either way so deeper nested
+  time-dependent IFEXPs still reach the lifter.
+"""
+Base.@nospecializeinfer function _replaceTimeDepIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{Dict, Ref{Int}, Dict})
+  (newExp, cont, tmpVarToElementAndTick) = begin
+    @match exp begin
+      DAE.IFEXP(cond, expThen, expElse) => begin
+        if _expDependsOnTime(cond)
+          #= Time-dependent → delegate to the always-lift path. =#
+          replaceIfExpressionWithTmpVar(exp, tmpVarToElementAndTick)
+        else
+          #= State-dependent or parameter-only → do not lift. Still recurse
+             so nested time-dependent IFEXPs below get lifted. =#
+          local (lc, _)  = Util.traverseExpTopDown(cond,    _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
+          local (lt, _)  = Util.traverseExpTopDown(expThen, _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
+          local (le, _)  = Util.traverseExpTopDown(expElse, _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
+          (DAE.IFEXP(lc, lt, le), false, tmpVarToElementAndTick)
+        end
       end
       _ => begin
         (exp, true, tmpVarToElementAndTick)

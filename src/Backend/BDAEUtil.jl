@@ -598,12 +598,18 @@ function eqToWhenOperator(eq::BDAE.Equation)
 end
 
 function DAE_DimensionToIntVector(dims::Cons{<:DAE.Dimension})::Vector{Int}
-  local dimIndices = []
+  local dimIndices = Int[]
   for d in dims
-    if ! (typeof(d) == DAE.DIM_INTEGER)
-      throw("Non integers dimensions for arrays are not supported by OMBackend. Dimension was $(string(dim))")
-    else
-      push!(dimIndices, d.integer)
+    @match d begin
+      DAE.DIM_INTEGER(__) => push!(dimIndices, d.integer)
+      #= Array dimensions sized by an enumeration type (e.g. MSL Digital's
+         `output Logic out[Logic]` uses `Logic` as both element type and
+         dimension). DIM_ENUM carries the literal count as `.size`; use it
+         as the integer dimension. =#
+      DAE.DIM_ENUM(__) => push!(dimIndices, d.size)
+      #= Boolean-typed dimension: cardinality is exactly 2. =#
+      DAE.DIM_BOOLEAN(__) => push!(dimIndices, 2)
+      _ => throw("Non-integer dimension for array not supported by OMBackend. Dimension was $(string(d))")
     end
   end
   return dimIndices
