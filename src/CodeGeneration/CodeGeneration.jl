@@ -76,6 +76,7 @@ using .MTK_CodeGenerationUtil
 include("./structuralCallbacks.jl")
 include("./DirectRHSGeneration.jl")
 include("./MTK_CodeGeneration.jl")
+include("./DiscreteDummyDemotion.jl")
 
 #= Pure DifferentialEquations.jl code generation (legacy/donor) =#
 include("./codeGen.jl")

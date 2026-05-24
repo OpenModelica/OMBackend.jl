@@ -201,12 +201,12 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
     Gather all irreducible variables.
     NB: Should also include variables affected somehow with by a structural change.
   =#
-  local irreductableVars::Vector{String} = vcat(occVars,
-                                                getIrreductableVars(ifEqs,
+  local irreducibleVars::Vector{String} = vcat(occVars,
+                                                getIrreducibleVars(ifEqs,
                                                                     whenEqs,
                                                                     allBackendVars,
                                                                     stringToSimVarHT))
-  (resEqs, irreductableVars) = handleZimmerThetaConstant(resEqs, irreductableVars, stringToSimVarHT)
+  (resEqs, irreducibleVars) = handleZimmerThetaConstant(resEqs, irreducibleVars, stringToSimVarHT)
   #= ...DOCC Handling... =#
   if ! isempty(shared.DOCC_equations)
     append!(structuralTransitions, shared.DOCC_equations)
@@ -278,11 +278,21 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
     end
   end
   #= Construct SIM_CODE =#
+  #= Boundary: BDAE equation types → SimCode-native types for the field
+     types that have already migrated. =#
+  local simResEqs = SimulationCode.RESIDUAL_EQUATION[SimulationCode.toSim(r) for r in resEqs]
+  local simWhenEqs = SimulationCode.WHEN_EQUATION[SimulationCode.toSim(w) for w in whenEqs]
+  local simInitialEqs = SimulationCode.Equation[SimulationCode.toSim(e) for e in equationSystem.initialEqs]
+  local simSharedEqs = if !isempty(auxEquationSystems)
+    SimulationCode.Equation[SimulationCode.toSim(e) for e in vcat(resEqs, whenEqs, ifEqs)]
+  else
+    SimulationCode.Equation[]
+  end
   SimulationCode.SIM_CODE(equationSystem.name,
                           stringToSimVarHT,
-                          resEqs,
-                          equationSystem.initialEqs,
-                          whenEqs,
+                          simResEqs,
+                          simInitialEqs,
+                          simWhenEqs,
                           simCodeIfEquations,
                           isSingular,
                           matchOrder,
@@ -292,14 +302,14 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
                           structuralSubModels,
                           sharedVariables,
                           topVars,
-                          if !isempty(auxEquationSystems) vcat(resEqs, whenEqs, ifEqs) else BDAE.Equation[] end,
+                          simSharedEqs,
                           initialState,
                           shared.metaModel,
                           shared.flatModel,
-                          irreductableVars,
+                          irreducibleVars,
                           ModelicaFunction[],
                           #= Specify if external runtime should be used =# false,
-                          BDAE.RESIDUAL_EQUATION[],
+                          SimulationCode.RESIDUAL_EQUATION[],
                           String[],
                           AliasEntry[],
                           nothing,
@@ -358,9 +368,17 @@ function createSimCodeStructuralTransitions(structuralTransitions::Vector{ST}) w
   local transitions = StructuralTransition[]
   for st in structuralTransitions
     sst = @match st begin
-      BDAE.STRUCTURAL_TRANSISTION(__) => SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION(st)
-      BDAE.STRUCTURAL_WHEN_EQUATION(__) => SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION(st)
-      BDAE.STRUCTURAL_IF_EQUATION(__) => SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION(st)
+      BDAE.STRUCTURAL_TRANSISTION(__) =>
+        SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION(st.fromState,
+                                                      st.toState,
+                                                      st.transistionCondition)
+      BDAE.STRUCTURAL_WHEN_EQUATION(__) =>
+        SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION(st.size,
+                                                      SimulationCode.toWhenStmts(st.whenEquation),
+                                                      st.source,
+                                                      SimulationCode.toEqAttr(st.attr))
+      BDAE.STRUCTURAL_IF_EQUATION(__) =>
+        SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION(st.ifEquation)
     end
     push!(transitions, sst)
   end
@@ -418,15 +436,19 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
          the model at least translates; a follow-up pass should hoist the
          skipped IF_EQUATIONs with conjoined conditions for full fidelity. =#
       local rawBranchEqs = listArray(listGet(BDAE_ifEquation.eqnstrue, conditionIdx))
-      local branchEquations = BDAE.RESIDUAL_EQUATION[]
+      local branchEquations = SimulationCode.RESIDUAL_EQUATION[]
+      local branchEquationsBDAE = BDAE.RESIDUAL_EQUATION[]
       for eq in rawBranchEqs
         if eq isa BDAE.RESIDUAL_EQUATION
-          push!(branchEquations, eq)
+          push!(branchEquations, SimulationCode.toSim(eq))
+          push!(branchEquationsBDAE, eq)
         else
           @warn "Skipping unsupported $(typeof(eq).name.name) inside if-branch (condition $(conditionIdx)); model may translate but lose this equation's effect"
         end
       end
-      local equations = vcat(resEqs, branchEquations)
+      #= The variable-mapping graph builder is on the BDAE side (pre-boundary),
+         so still wants the BDAE residual list. BRANCH stores the SimCode-side. =#
+      local equations = vcat(resEqs, branchEquationsBDAE)
       target = conditionIdx + 1
       identifier = conditionIdx
       local eqVariableMapping = createEquationVariableBidirectionGraph(equations, otherIfEqs, whenEqs, allBackendVars, stringToSimVarHT)
@@ -461,16 +483,18 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
     condition = DAE.SCONST("ELSE_BRANCH")
     #= Same defensive filtering as the eqnstrue path above. =#
     local rawElseBranch = listArray(BDAE_ifEquation.eqnsfalse)
-    branchEquations = BDAE.RESIDUAL_EQUATION[]
+    branchEquations = SimulationCode.RESIDUAL_EQUATION[]
+    local elseBranchEquationsBDAE = BDAE.RESIDUAL_EQUATION[]
     for eq in rawElseBranch
       if eq isa BDAE.RESIDUAL_EQUATION
-        push!(branchEquations, eq)
+        push!(branchEquations, SimulationCode.toSim(eq))
+        push!(elseBranchEquationsBDAE, eq)
       else
         @warn "Skipping unsupported $(typeof(eq).name.name) inside if-equation else-branch; model may translate but lose this equation's effect"
       end
     end
-    #= Equations here consists of all residual equations of the system and the equations in the if-equation =#
-    equations = vcat(resEqs, branchEquations)
+    #= variable-mapping builder uses BDAE side; BRANCH stores SimCode side. =#
+    equations = vcat(resEqs, elseBranchEquationsBDAE)
     lastConditionIdx += 1
     target = lastConditionIdx + 1
     identifier = ELSE_BRANCH #= Indicate else =#
@@ -880,6 +904,20 @@ function _inlineParamsInExp(exp::DAE.Exp, ht)::DAE.Exp
 end
 
 function _inlineParamsInWhenOp(wOp, ht)
+  if wOp isa SimulationCode.ASSIGN
+    return SimulationCode.ASSIGN(wOp.left, _inlineParamsInExp(wOp.right, ht), wOp.source)
+  elseif wOp isa SimulationCode.NORETCALL
+    return SimulationCode.NORETCALL(_inlineParamsInExp(wOp.exp, ht), wOp.source)
+  elseif wOp isa SimulationCode.REINIT
+    return SimulationCode.REINIT(wOp.stateVar, _inlineParamsInExp(wOp.value, ht), wOp.source)
+  elseif wOp isa SimulationCode.ASSERT
+    return SimulationCode.ASSERT(_inlineParamsInExp(wOp.condition, ht),
+                                          _inlineParamsInExp(wOp.message, ht),
+                                          _inlineParamsInExp(wOp.level, ht),
+                                          wOp.source)
+  elseif wOp isa SimulationCode.TERMINATE
+    return SimulationCode.TERMINATE(_inlineParamsInExp(wOp.message, ht), wOp.source)
+  end
   return @match wOp begin
     BDAE.ASSIGN(l, r, src) => BDAE.ASSIGN(l, _inlineParamsInExp(r, ht), src)
     BDAE.NORETCALL(e, src) => BDAE.NORETCALL(_inlineParamsInExp(e, ht), src)

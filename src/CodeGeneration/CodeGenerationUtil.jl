@@ -647,22 +647,20 @@ end
 """
 function _whenStmtLstTargets(stmtLst, targetName::String)::Bool
   for stmt in stmtLst
-    local lhsName = @match stmt begin
-      BDAE.ASSIGN(left = lhs) => begin
-        try
-          SimulationCode.string(lhs)
-        catch
-          ""
-        end
+    local lhsName = if stmt isa BDAE.ASSIGN || stmt isa SimulationCode.ASSIGN
+      try
+        SimulationCode.string(stmt.left)
+      catch
+        ""
       end
-      BDAE.REINIT(stateVar = sv) => begin
-        try
-          SimulationCode.string(sv)
-        catch
-          ""
-        end
+    elseif stmt isa BDAE.REINIT || stmt isa SimulationCode.REINIT
+      try
+        SimulationCode.string(stmt.stateVar)
+      catch
+        ""
       end
-      _ => ""
+    else
+      ""
     end
     if lhsName == targetName
       return true
@@ -784,13 +782,13 @@ Return (lhs, rhs) for any BDAE equation shape.
 Any other shape throws; the caller should have screened those out.
 """
 function equationSides(eq)::Tuple{DAE.Exp, DAE.Exp}
-  if eq isa BDAE.EQUATION
+  if eq isa BDAE.EQUATION || eq isa SimulationCode.EQUATION
     return (eq.lhs, eq.rhs)
   elseif eq isa BDAE.COMPLEX_EQUATION
     return (eq.left, eq.right)
-  elseif eq isa BDAE.ARRAY_EQUATION
+  elseif eq isa BDAE.ARRAY_EQUATION || eq isa SimulationCode.ARRAY_EQUATION
     return (eq.left, eq.right)
-  elseif eq isa BDAE.RESIDUAL_EQUATION
+  elseif eq isa BDAE.RESIDUAL_EQUATION || eq isa SimulationCode.RESIDUAL_EQUATION
     return (eq.exp, DAE.RCONST(0.0))
   end
   error("equationSides: no (lhs, rhs) for $(typeof(eq)); " *
@@ -1395,7 +1393,8 @@ function collectCalledFunctionNames!(names::Set{String}, @nospecialize(exp::DAE.
   return names
 end
 
-function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.RESIDUAL_EQUATION)
+function collectCalledFunctionNames!(names::Set{String},
+                                     eq::Union{BDAE.RESIDUAL_EQUATION, SimulationCode.RESIDUAL_EQUATION})
   collectCalledFunctionNames!(names, eq.exp)
 end
 
@@ -1418,17 +1417,54 @@ function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.COMPLEX_EQUATI
   collectCalledFunctionNames!(names, eq.right)
 end
 
-function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.ASSIGN)
+"""
+    getRHSVariables(op) -> Vector{DAE.ComponentRef}
+
+Unified WhenOperator RHS-cref collector that accepts both BDAE-side and
+SimCode-side operator records. BDAE variants delegate to
+`Backend.BDAEUtil.getRHSVariables`.
+"""
+function getRHSVariables(op::Union{BDAE.ASSIGN, SimulationCode.ASSIGN})::Vector{DAE.ComponentRef}
+  return listArray(Util.getAllCrefs(op.right))
+end
+
+function getRHSVariables(op::Union{BDAE.REINIT, SimulationCode.REINIT})::Vector{DAE.ComponentRef}
+  return listArray(Util.getAllCrefs(op.value))
+end
+
+function getRHSVariables(op::Union{BDAE.NORETCALL, SimulationCode.NORETCALL})::Vector{DAE.ComponentRef}
+  return listArray(Util.getAllCrefs(op.exp))
+end
+
+function getRHSVariables(op::Union{BDAE.ASSERT, SimulationCode.ASSERT})::Vector{DAE.ComponentRef}
+  return vcat(listArray(Util.getAllCrefs(op.condition)),
+              listArray(Util.getAllCrefs(op.message)),
+              listArray(Util.getAllCrefs(op.level)))
+end
+
+function getRHSVariables(op::Union{BDAE.TERMINATE, SimulationCode.TERMINATE})::Vector{DAE.ComponentRef}
+  return listArray(Util.getAllCrefs(op.message))
+end
+
+function getRHSVariables(::Union{BDAE.RECOMPILATION, SimulationCode.RECOMPILATION})::Vector{DAE.ComponentRef}
+  return DAE.ComponentRef[]
+end
+
+function getRHSVariables(::Union{BDAE.AGENTIC_RECOMPILATION, SimulationCode.AGENTIC_RECOMPILATION})::Vector{DAE.ComponentRef}
+  return DAE.ComponentRef[]
+end
+
+function collectCalledFunctionNames!(names::Set{String}, stmt::Union{BDAE.ASSIGN, SimulationCode.ASSIGN})
   collectCalledFunctionNames!(names, stmt.left)
   collectCalledFunctionNames!(names, stmt.right)
 end
 
-function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.REINIT)
+function collectCalledFunctionNames!(names::Set{String}, stmt::Union{BDAE.REINIT, SimulationCode.REINIT})
   collectCalledFunctionNames!(names, stmt.stateVar)
   collectCalledFunctionNames!(names, stmt.value)
 end
 
-function collectCalledFunctionNames!(names::Set{String}, stmt::BDAE.NORETCALL)
+function collectCalledFunctionNames!(names::Set{String}, stmt::Union{BDAE.NORETCALL, SimulationCode.NORETCALL})
   collectCalledFunctionNames!(names, stmt.exp)
 end
 
@@ -1612,24 +1648,21 @@ function _collectInitAlgLhsRhsCrefs!(lhs::Set{String}, rhs::Set{String}, op)
       push!(rhs, string(c))
     end
   end
-  @match op begin
-    BDAE.ASSIGN(__) => begin
-      @match op.left begin
-        DAE.CREF(cr, _) => push!(lhs, string(cr))
-        _ => nothing
-      end
-      pushCrefsFrom(op.right)
+  if op isa BDAE.ASSIGN || op isa SimulationCode.ASSIGN
+    @match op.left begin
+      DAE.CREF(cr, _) => push!(lhs, string(cr))
+      _ => nothing
     end
-    BDAE.REINIT(__) => begin
-      push!(lhs, string(op.stateVar))
-      pushCrefsFrom(op.value)
-    end
-    BDAE.NORETCALL(__) => pushCrefsFrom(op.exp)
-    BDAE.ASSERT(__) => begin
-      pushCrefsFrom(op.condition); pushCrefsFrom(op.message); pushCrefsFrom(op.level)
-    end
-    BDAE.TERMINATE(__) => pushCrefsFrom(op.message)
-    _ => nothing
+    pushCrefsFrom(op.right)
+  elseif op isa BDAE.REINIT || op isa SimulationCode.REINIT
+    push!(lhs, string(op.stateVar))
+    pushCrefsFrom(op.value)
+  elseif op isa BDAE.NORETCALL || op isa SimulationCode.NORETCALL
+    pushCrefsFrom(op.exp)
+  elseif op isa BDAE.ASSERT || op isa SimulationCode.ASSERT
+    pushCrefsFrom(op.condition); pushCrefsFrom(op.message); pushCrefsFrom(op.level)
+  elseif op isa BDAE.TERMINATE || op isa SimulationCode.TERMINATE
+    pushCrefsFrom(op.message)
   end
 end
 

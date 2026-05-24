@@ -364,12 +364,14 @@ end
 function flattenRecordCallSites(simCode)
   #= Expand record arguments in residual equations =#
   local newResEqs = map(simCode.residualEquations) do eq
-    @match eq begin
-      BDAE.RESIDUAL_EQUATION(exp, source, attr) => begin
-        local newExp = expandRecordArgsInExp(exp)
-        BDAE.RESIDUAL_EQUATION(newExp, source, attr)
-      end
-      _ => eq
+    #= simCode.residualEquations is Vector{RESIDUAL_EQUATION} post-migration.
+       Pattern-match the same field shape and rebuild via typeof to preserve
+       identity. =#
+    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
+      local newExp = expandRecordArgsInExp(eq.exp)
+      newExp === eq.exp ? eq : typeof(eq)(newExp, eq.source, eq.attr)
+    else
+      eq
     end
   end
   @assign simCode.residualEquations = newResEqs

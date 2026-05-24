@@ -260,7 +260,7 @@ function dumpRHSExpression(@nospecialize(rhs_list), @nospecialize(f_ip_expr))
 end
 
 """
-    dumpBatchBlock(vars, irreductableSyms, statePriorityPairs, batchBlock)
+    dumpBatchBlock(vars, irreducibleSyms, statePriorityPairs, batchBlock)
 
 Emit `backend/mtk/batchBlock.log`: the resolved (`Symbol => Symbolics.Num`)
 pairs and the raw `Expr` that is `eval`'d at simulate time to create the
@@ -268,7 +268,7 @@ model module's Symbolics-variable bindings. A bare base-name `\$sym = ...`
 binding here (vs the expected `var"x[i]_y" = ...`) would point directly at
 the construction site of any UndefVarError on an array-of-records state.
 """
-function dumpBatchBlock(@nospecialize(vars), @nospecialize(irreductableSyms),
+function dumpBatchBlock(@nospecialize(vars), @nospecialize(irreducibleSyms),
                         @nospecialize(statePriorityPairs), @nospecialize(batchBlock))
   @BACKEND_LOGGING begin
     try
@@ -283,9 +283,9 @@ function dumpBatchBlock(@nospecialize(vars), @nospecialize(irreductableSyms),
           println(io, "  ", _sym, "  =>  ", _var)
         end
         println(io)
-        println(io, "irreductableSyms ($(length(irreductableSyms))):")
+        println(io, "irreducibleSyms ($(length(irreducibleSyms))):")
         println(io, "---------------------------------------------")
-        for _s in irreductableSyms
+        for _s in irreducibleSyms
           println(io, "  ", _s)
         end
         println(io)

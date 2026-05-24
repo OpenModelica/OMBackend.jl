@@ -413,7 +413,7 @@ end
   This function creates a bidirectional graph between these equations and the supplied variables.
   (Note: If we need to do index reduction there might be empty equations here).
 """
-function createEquationVariableBidirectionGraph(equations::Vector{BDAE.RESIDUAL_EQUATION},
+function createEquationVariableBidirectionGraph(equations::AbstractVector,
                                                 ifEquations::IF_EQS,
                                                 whenEquations::WHEN_EQS,
                                                 allBackendVars::VARS,
@@ -472,31 +472,24 @@ function createEquationVariableBidirectionGraph(equations::Vector{BDAE.RESIDUAL_
   I should investigate how to go about it.
   For now let's merge in the equations in an initial-when equation as ordinary equations. =#
   for weq in whenEquations
-    @match weq begin
-      BDAE.WHEN_EQUATION(_, BDAE.WHEN_STMTS(DAE.CALL(Absyn.IDENT("initial"), _, _), whenStmtLst, ewp), source, attr) => begin
-        #= Go through all initial statements and add them as equations. =#
-        for wstmt in weq.whenEquation.whenStmtLst
+    local cond = weq.whenEquation.condition
+    local isInitialCond = cond isa DAE.CALL && cond.path isa Absyn.IDENT && cond.path.name == "initial"
+    if isInitialCond
+      for wstmt in weq.whenEquation.whenStmtLst
+        eqCounter += 1
+        variablesForEq = BDAEUtil.getAllVariables(wstmt, algebraicAndStateVariables)
+        variableEqMapping["e$(eqCounter)"] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
+      end
+    else
+      for wstmt in weq.whenEquation.whenStmtLst
+        local isAssignReal = (wstmt isa BDAE.ASSIGN || wstmt isa ASSIGN) &&
+                             wstmt.left isa DAE.CREF && wstmt.left.ty isa DAE.T_REAL
+        if isAssignReal
+          local refAsStr = BDAEUtil.string(wstmt.left.componentRef)
+          local simVar = getSimVarByName(refAsStr, stringToSimVarHT)
           eqCounter += 1
           variablesForEq = BDAEUtil.getAllVariables(wstmt, algebraicAndStateVariables)
           variableEqMapping["e$(eqCounter)"] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
-        end
-      end
-      _ #=Other when equations =# => begin
-        #= Assignments are added to the total #equations =#
-        for wstmt in weq.whenEquation.whenStmtLst
-          @match wstmt begin
-            BDAE.ASSIGN(DAE.CREF(ref, DAE.T_REAL(__)), _, _) => begin
-              #= Add to the total number of equation if the lhs is a real variable =#
-              local refAsStr = BDAEUtil.string(ref)
-              local simVar = getSimVarByName(refAsStr, stringToSimVarHT)
-              #if isAlgebraic(simVar)
-              eqCounter += 1
-              variablesForEq = BDAEUtil.getAllVariables(wstmt, algebraicAndStateVariables)
-              variableEqMapping["e$(eqCounter)"] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
-              #end
-            end
-            _ => continue
-          end
         end
       end
     end
@@ -694,34 +687,34 @@ OBS:
 Parameters are never added to this list.
 The known irreducibles should be state variables and variables directly involved in changes that change the model structure.
 """
-function getIrreductableVars(ifEquations::Vector{BDAE.IF_EQUATION},
+function getIrreducibleVars(ifEquations::Vector{BDAE.IF_EQUATION},
                              whenEqs::Vector{BDAE.WHEN_EQUATION},
                              algebraicAndStateVariables::Vector{BDAE.VAR},
                              ht::OrderedDict{String, Tuple{Integer, SimulationCode.SimVar}})
-  local irreductables::Vector{Any} = []
+  local irreducibles::Vector{Any} = []
   for eq in ifEquations
     variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
-    push!(irreductables, variablesForEq)
+    push!(irreducibles, variablesForEq)
   end
   #=
     Parameters should not be marked as irreducible
     Remove them from the list
   =#
-  local knownIrreductables::Vector{BDAE.VAR} = filter((v) -> BDAEUtil.isState(v) , algebraicAndStateVariables)
-  #@debug "Adding all states as irreducible variables" map(x->string(x.varName), knownIrreductables)
-  push!(irreductables, map(x->BDAE_identifierToVarString(x), knownIrreductables))
-  irreductables = collect(Iterators.flatten(irreductables))
-  irreductables = filter(irv -> irv == "time" ||
+  local knownIrreducibles::Vector{BDAE.VAR} = filter((v) -> BDAEUtil.isState(v) , algebraicAndStateVariables)
+  #@debug "Adding all states as irreducible variables" map(x->string(x.varName), knownIrreducibles)
+  push!(irreducibles, map(x->BDAE_identifierToVarString(x), knownIrreducibles))
+  irreducibles = collect(Iterators.flatten(irreducibles))
+  irreducibles = filter(irv -> irv == "time" ||
                                   (haskey(ht, irv) && !isParameter(last(ht[irv]))),
-                          irreductables)
+                          irreducibles)
   #TODO: Fix the detection, s.t variables critical to when equations are not removed
   #for eq in whenEqs
     # variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
-    # push!(variablesForEq, irreductables)
+    # push!(variablesForEq, irreducibles)
   #end
   #= Add known irreducibles to the vector =#
-  #push!(irreductables, map(x->x.varName, string(knownIrreductables)))
-  local irreductablesAsStr = map(x -> string(x), irreductables)
+  #push!(irreducibles, map(x->x.varName, string(knownIrreducibles)))
+  local irreduciblesAsStr = map(x -> string(x), irreducibles)
   #=
   If THETA exists, treat it as an irreducible variable
   Currently, theta is a variable with "_THETA" in the variable name.
@@ -731,22 +724,22 @@ function getIrreductableVars(ifEquations::Vector{BDAE.IF_EQUATION},
   @assert length(thetaVariables) < 2
   if !(isempty(thetaVariables))
     #= Hardcoded for now can be fixed with annotation in the frontend =#
-    push!(irreductablesAsStr, collect(keys(ht))[first(thetaVariables)])
+    push!(irreduciblesAsStr, collect(keys(ht))[first(thetaVariables)])
   end
-  irreductablesAsStr = filter(x -> x != "time", irreductablesAsStr)
-  return irreductablesAsStr
+  irreduciblesAsStr = filter(x -> x != "time", irreduciblesAsStr)
+  return irreduciblesAsStr
 end
 
 """
 TODO: the name of the theta variable is hardcoded for now
 Note that this function must be called before sorting.
 """
-function handleZimmerThetaConstant(resEqs, irreductableVars::Vector{String}, ht)
+function handleZimmerThetaConstant(resEqs, irreducibleVars::Vector{String}, ht)
   thetaVariables = findall([endswith(x, "THETA") for x in keys(ht)])
   if !(isempty(thetaVariables))
     #= Hardcoded for now can be fixed with annotation in the frontend =#
     thetaConstant = collect(keys(ht))[first(thetaVariables)]
-    push!(irreductableVars, thetaConstant)
+    push!(irreducibleVars, thetaConstant)
     tmpResEq = DAE.BINARY(
       DAE.CREF(DAE.CREF_IDENT(thetaConstant, DAE.T_REAL_DEFAULT, MetaModelica.list()), DAE.T_REAL_DEFAULT),
       DAE.SUB(DAE.T_REAL_DEFAULT),
@@ -757,7 +750,7 @@ function handleZimmerThetaConstant(resEqs, irreductableVars::Vector{String}, ht)
     @assign simVar.varKind = ALG_VARIABLE(0)
     ht[thetaConstant] = (zimmerThetaIdx, simVar)
   end
-  return(resEqs, irreductableVars)
+  return(resEqs, irreducibleVars)
 end
 
 function getSimVarByName(name::String, ht::AbstractDict{String, Tuple{Integer, SimVar}})
@@ -1052,7 +1045,7 @@ function _isSyntacticZeroResidual(@nospecialize(exp))::Bool
   end
 end
 
-function _isTrivialResidualEquation(eq::BDAE.RESIDUAL_EQUATION, simCode::SIM_CODE)::Bool
+function _isTrivialResidualEquation(eq::Union{BDAE.RESIDUAL_EQUATION, RESIDUAL_EQUATION}, simCode::SIM_CODE)::Bool
   if _hasUnknownCref(eq.exp, simCode.stringToSimVarHT)
     return false
   end
@@ -1064,9 +1057,9 @@ function _isTrivialResidualEquation(eq::BDAE.RESIDUAL_EQUATION, simCode::SIM_COD
 end
 
 function _isTrivialInitialEquation(@nospecialize(eq), simCode::SIM_CODE)::Bool
-  if eq isa BDAE.RESIDUAL_EQUATION
+  if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
     return _isTrivialResidualEquation(eq, simCode)
-  elseif eq isa BDAE.EQUATION
+  elseif eq isa BDAE.EQUATION || eq isa EQUATION
     if _hasUnknownCref(eq.lhs, simCode.stringToSimVarHT) ||
        _hasUnknownCref(eq.rhs, simCode.stringToSimVarHT)
       return false
@@ -1081,9 +1074,9 @@ function _isTrivialInitialEquation(@nospecialize(eq), simCode::SIM_CODE)::Bool
   return false
 end
 
-function _filterTrivialResiduals(eqs::Vector{BDAE.RESIDUAL_EQUATION},
-                                 simCode::SIM_CODE)::Tuple{Vector{BDAE.RESIDUAL_EQUATION}, Int}
-  local newEqs = BDAE.RESIDUAL_EQUATION[]
+function _filterTrivialResiduals(eqs::AbstractVector,
+                                 simCode::SIM_CODE)::Tuple{AbstractVector, Int}
+  local newEqs = typeof(eqs)()
   sizehint!(newEqs, length(eqs))
   local nRemoved = 0
   for eq in eqs
@@ -1141,7 +1134,7 @@ function _cleanupTrivialBranchResiduals(ifEq::IF_EQUATION,
   end
   local newBranches = BRANCH[]
   for branch in ifEq.branches
-    local newResiduals = BDAE.RESIDUAL_EQUATION[branch.residualEquations[i] for i in 1:nResiduals if keep[i]]
+    local newResiduals = RESIDUAL_EQUATION[branch.residualEquations[i] for i in 1:nResiduals if keep[i]]
     push!(newBranches, BRANCH(branch.condition, newResiduals,
                               branch.identifier, branch.targets, branch.isSingular,
                               branch.matchOrder, branch.equationGraph, branch.sccs,
@@ -1191,19 +1184,24 @@ function cleanupTrivialResidualEquations(simCode::SIM_CODE;
   return simCode
 end
 
-function _rewriteResidualIfExp(eq::BDAE.RESIDUAL_EQUATION, simCode::SIM_CODE)::BDAE.RESIDUAL_EQUATION
+function _rewriteResidualIfExp(eq::Union{BDAE.RESIDUAL_EQUATION, RESIDUAL_EQUATION}, simCode::SIM_CODE)
   local newExp = resolveConstantIfExp(eq.exp, simCode)
-  return newExp === eq.exp ? eq : BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr)
+  return newExp === eq.exp ? eq : typeof(eq)(newExp, eq.source, eq.attr)
 end
 
 function _rewriteInitialIfExp(@nospecialize(eq), simCode::SIM_CODE)
-  if eq isa BDAE.RESIDUAL_EQUATION
+  if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
     return _rewriteResidualIfExp(eq, simCode)
   elseif eq isa BDAE.EQUATION
     local newLhs = resolveConstantIfExp(eq.lhs, simCode)
     local newRhs = resolveConstantIfExp(eq.rhs, simCode)
     return (newLhs === eq.lhs && newRhs === eq.rhs) ? eq :
            BDAE.EQUATION(newLhs, newRhs, eq.source, eq.attributes)
+  elseif eq isa EQUATION
+    local newLhs = resolveConstantIfExp(eq.lhs, simCode)
+    local newRhs = resolveConstantIfExp(eq.rhs, simCode)
+    return (newLhs === eq.lhs && newRhs === eq.rhs) ? eq :
+           EQUATION(newLhs, newRhs, eq.source, eq.attr)
   end
   return eq
 end
@@ -1212,7 +1210,7 @@ function _rewriteBranchIfExp(branch::BRANCH, simCode::SIM_CODE)::BRANCH
   local newCondition = branch.identifier == ELSE_BRANCH ?
                        branch.condition :
                        resolveConstantIfExp(branch.condition, simCode)
-  local newResiduals = BDAE.RESIDUAL_EQUATION[
+  local newResiduals = RESIDUAL_EQUATION[
     _rewriteResidualIfExp(eq, simCode) for eq in branch.residualEquations
   ]
   return BRANCH(newCondition, newResiduals,
@@ -1240,10 +1238,10 @@ function _reindexIfBranches(branches::Vector{BRANCH})::Vector{BRANCH}
 end
 
 function _pruneIfEquation(ifEq::IF_EQUATION,
-                          simCode::SIM_CODE)::Tuple{Union{IF_EQUATION, Nothing}, Vector{BDAE.RESIDUAL_EQUATION}, Int, Bool}
+                          simCode::SIM_CODE)::Tuple{Union{IF_EQUATION, Nothing}, Vector{RESIDUAL_EQUATION}, Int, Bool}
   local rewrittenBranches = BRANCH[_rewriteBranchIfExp(branch, simCode) for branch in ifEq.branches]
   local newBranches = BRANCH[]
-  local promoted = BDAE.RESIDUAL_EQUATION[]
+  local promoted = RESIDUAL_EQUATION[]
   local nPrunedBranches = 0
   local hasUnconditionalFallback = false
   for branch in rewrittenBranches
@@ -1302,7 +1300,7 @@ is selected before any dynamic guard remains, its residual equations are promote
 to top-level residuals and the IF_EQUATION is removed.
 """
 function pruneConstantConditions(simCode::SIM_CODE)::SIM_CODE
-  local newResiduals = BDAE.RESIDUAL_EQUATION[
+  local newResiduals = RESIDUAL_EQUATION[
     _rewriteResidualIfExp(eq, simCode) for eq in simCode.residualEquations
   ]
   local newInitials = typeof(simCode.initialEquations)()
@@ -1317,7 +1315,9 @@ function pruneConstantConditions(simCode::SIM_CODE)::SIM_CODE
     local (newIfEq, promoted, pruned, _) = _pruneIfEquation(ifEq, simCode)
     nPrunedBranches += pruned
     if !isempty(promoted)
-      append!(newResiduals, promoted)
+      #= `promoted` comes from BRANCH (Vector{BDAE.RESIDUAL_EQUATION}); newResiduals
+         is Vector{RESIDUAL_EQUATION}. Convert at the boundary. =#
+      append!(newResiduals, [toSim(p) for p in promoted])
       nPromotedResiduals += length(promoted)
     end
     if newIfEq === nothing
@@ -1397,7 +1397,7 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
     end
   end
   #= Add equations for irreducible variables =#
-  for irName in simCode.irreductableVariables
+  for irName in simCode.irreducibleVariables
     if haskey(varNameToEq, irName)
       push!(seedEqs, varNameToEq[irName])
     end
@@ -1643,7 +1643,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     end
   end
   for eq in simCode.eliminatedEquations
-    _collectComplexFieldNames!(complexRefNames, BDAE.RESIDUAL_EQUATION[eq], ht)
+    _collectComplexFieldNames!(complexRefNames, [eq], ht)
   end
   local rescuedVars = Set{String}()
   for vn in varsToRemove
@@ -1706,7 +1706,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     end
   end
   #= Filter residualEquations: remove eliminated equations =#
-  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  local newResEqs = RESIDUAL_EQUATION[]
   sizehint!(newResEqs, length(resEqs) - length(eqsToEliminate))
   for (i, eq) in enumerate(resEqs)
     if !(i in eqsToEliminate)
@@ -1717,7 +1717,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
      Filter out rescued variables. =#
   local survivingPairs = filter(p -> !(p[1] in rescuedVars), eliminatedPairs)
   local elimPairedVars = String[p[1] for p in survivingPairs]
-  local elimPairedEqs = BDAE.RESIDUAL_EQUATION[resEqs[p[2]] for p in survivingPairs]
+  local elimPairedEqs = RESIDUAL_EQUATION[resEqs[p[2]] for p in survivingPairs]
   #= Filter stringToSimVarHT: remove eliminated variables =#
   local newHT = copy(ht)
   for varName in varsToRemove
@@ -1976,6 +1976,22 @@ end
 #= Walk a BDAE.WhenEquation (WHEN_STMTS) tree, collecting every variable
    name that is assigned or reinit-ed inside. Recurses into elsewhen. =#
 function _collectWhenAssignTargets!(names::Set{String}, whenEq)
+  if whenEq isa WHEN_STMTS
+    for stmt in whenEq.whenStmtLst
+      if stmt isa ASSIGN
+        local r = extractCrefName(stmt.left)
+        if r !== nothing
+          push!(names, r[1])
+        end
+      elseif stmt isa REINIT
+        push!(names, DAE_identifierToString(stmt.stateVar))
+      end
+    end
+    if whenEq.elsewhenPart !== nothing
+      _collectWhenAssignTargets!(names, whenEq.elsewhenPart)
+    end
+    return nothing
+  end
   @match whenEq begin
     BDAE.WHEN_STMTS(_, stmts, elsewhen) => begin
       for stmt in stmts
@@ -2044,8 +2060,8 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
      folded PARAMETER binding lives only in the model function's local
      scope, so evaluating a condition that references a folded name
      raises `UndefVarError`. Earlier versions excluded the full
-     `simCode.irreductableVariables` set, but that was too broad:
-     `getIrreductableVars` flattens every cref reachable through any
+     `simCode.irreducibleVariables` set, but that was too broad:
+     `getIrreducibleVars` flattens every cref reachable through any
      IF_EQUATION branch body (conditions AND branch residuals), which
      accidentally blocked KinematicPTP and similar closures from folding
      even when the variable only appeared in a branch residual. Restrict
@@ -2154,7 +2170,7 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
     newHT[name] = (idx, SIMVAR(oldSV.name, oldSV.index,
                                PARAMETER(SOME(bindExp)), oldSV.attributes))
   end
-  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  local newResEqs = RESIDUAL_EQUATION[]
   sizehint!(newResEqs, nResEqs - length(elimIdxSet))
   for (i, eq) in enumerate(simCode.residualEquations)
     if !(i in elimIdxSet)
@@ -2167,17 +2183,17 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
     simCode.stringToSimVarHT = newHT
   end
   #= Invalidate derived name sets that were computed against the pre-fold
-     HT classification. `irreductableVariables` was collected by
-     `getIrreductableVars` BEFORE this pass ran, so it may still name
+     HT classification. `irreducibleVariables` was collected by
+     `getIrreducibleVars` BEFORE this pass ran, so it may still name
      variables that are now parameters. Leaving them in causes the MTK
      codegen `_batchBlock` to try `setmetadata(kinematicPTP_Ta1, Irreducible)`
      against a module-scope name that no longer exists (the parameter is
      only bound in the model function's local scope).
      Same logic applies to `sharedVariables` for completeness, though in
      practice that is populated only in multi-submodel scenarios. =#
-  if !isempty(simCode.irreductableVariables)
-    @assign simCode.irreductableVariables =
-      filter(v -> !(v in foldedNames), simCode.irreductableVariables)
+  if !isempty(simCode.irreducibleVariables)
+    @assign simCode.irreducibleVariables =
+      filter(v -> !(v in foldedNames), simCode.irreducibleVariables)
   end
   if !isempty(simCode.sharedVariables)
     @assign simCode.sharedVariables =
@@ -2597,13 +2613,18 @@ function _canonicalizeComponentRef(cr::DAE.ComponentRef, ty::DAE.Type,
 end
 
 function _canonicalizeEquation(eq, ctx::_CanonicalNameContext)
-  if eq isa BDAE.RESIDUAL_EQUATION
-    return BDAE.RESIDUAL_EQUATION(_canonicalizeExp(eq.exp, ctx), eq.source, eq.attr)
+  if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
+    return typeof(eq)(_canonicalizeExp(eq.exp, ctx), eq.source, eq.attr)
   elseif eq isa BDAE.EQUATION
     return BDAE.EQUATION(_canonicalizeExp(eq.lhs, ctx),
                          _canonicalizeExp(eq.rhs, ctx),
                          eq.source,
                          eq.attributes)
+  elseif eq isa EQUATION
+    return EQUATION(_canonicalizeExp(eq.lhs, ctx),
+                    _canonicalizeExp(eq.rhs, ctx),
+                    eq.source,
+                    eq.attr)
   elseif eq isa BDAE.ARRAY_EQUATION
     return BDAE.ARRAY_EQUATION(eq.dimSize,
                                _canonicalizeExp(eq.left, ctx),
@@ -2611,6 +2632,12 @@ function _canonicalizeEquation(eq, ctx::_CanonicalNameContext)
                                eq.source,
                                eq.attr,
                                eq.recordSize)
+  elseif eq isa ARRAY_EQUATION
+    return ARRAY_EQUATION(eq.dimSize,
+                          _canonicalizeExp(eq.left, ctx),
+                          _canonicalizeExp(eq.right, ctx),
+                          eq.source,
+                          eq.attr)
   elseif eq isa BDAE.COMPLEX_EQUATION
     return BDAE.COMPLEX_EQUATION(eq.size,
                                  _canonicalizeExp(eq.left, ctx),
@@ -2622,11 +2649,11 @@ function _canonicalizeEquation(eq, ctx::_CanonicalNameContext)
                                 _canonicalizeExp(eq.exp, ctx),
                                 eq.source,
                                 eq.attr)
-  elseif eq isa BDAE.WHEN_EQUATION
-    return BDAE.WHEN_EQUATION(eq.size,
-                              _canonicalizeWhenStmts(eq.whenEquation, ctx),
-                              eq.source,
-                              eq.attr)
+  elseif eq isa BDAE.WHEN_EQUATION || eq isa WHEN_EQUATION || eq isa INITIAL_WHEN_EQUATION
+    return typeof(eq)(eq.size,
+                      _canonicalizeWhenStmts(eq.whenEquation, ctx),
+                      eq.source,
+                      eq.attr)
   elseif eq isa BDAE.STRUCTURAL_WHEN_EQUATION
     return BDAE.STRUCTURAL_WHEN_EQUATION(eq.size,
                                          _canonicalizeWhenStmts(eq.whenEquation, ctx),
@@ -2639,6 +2666,13 @@ function _canonicalizeEquation(eq, ctx::_CanonicalNameContext)
     return BDAE.IF_EQUATION(newConditions, newTrue, newFalse, eq.source, eq.attr)
   elseif eq isa BDAE.ALGORITHM
     return BDAE.ALGORITHM(eq.size, _canonicalizeAlgorithm(eq.alg, ctx), eq.source, eq.expand, eq.attr)
+  elseif eq isa ALGORITHM
+    return ALGORITHM(eq.size, _canonicalizeAlgorithm(eq.alg, ctx), eq.source, eq.expand, eq.attr)
+  elseif eq isa INLINE_IF_EQUATION
+    local newConds = DAE.Exp[_canonicalizeExp(c, ctx) for c in eq.conditions]
+    local newTrue = Vector{Equation}[Equation[_canonicalizeEquation(e, ctx) for e in br] for br in eq.branchesTrue]
+    local newElse = Equation[_canonicalizeEquation(e, ctx) for e in eq.branchElse]
+    return INLINE_IF_EQUATION(newConds, newTrue, newElse, eq.source, eq.attr)
   elseif eq isa BDAE.ASSERT_EQUATION
     return BDAE.ASSERT_EQUATION(_canonicalizeExp(eq.condition, ctx),
                                 _canonicalizeExp(eq.message, ctx),
@@ -2673,8 +2707,13 @@ function _mapVectorLike(f::Function, xs)
   return out
 end
 
-function _canonicalizeWhenStmts(whenStmts::BDAE.WHEN_STMTS,
-                                ctx::_CanonicalNameContext)
+function _canonicalizeWhenStmts(whenStmts, ctx::_CanonicalNameContext)
+  if whenStmts isa WHEN_STMTS
+    local newCondS = _canonicalizeExp(whenStmts.condition, ctx)
+    local newStmtLstS = WhenOperator[_canonicalizeWhenOperator(s, ctx) for s in whenStmts.whenStmtLst]
+    local newElseS = whenStmts.elsewhenPart === nothing ? nothing : _canonicalizeWhenStmts(whenStmts.elsewhenPart, ctx)
+    return WHEN_STMTS(newCondS, newStmtLstS, newElseS)
+  end
   local newCond = _canonicalizeExp(whenStmts.condition, ctx)
   local newStmtLst = _mapList(stmt -> _canonicalizeWhenOperator(stmt, ctx),
                               whenStmts.whenStmtLst)
@@ -2687,7 +2726,7 @@ function _canonicalizeWhenStmts(whenStmts::BDAE.WHEN_STMTS,
 end
 
 function _canonicalizeElseWhenPart(elseWhen, ctx::_CanonicalNameContext)
-  if elseWhen isa BDAE.WHEN_STMTS
+  if elseWhen isa BDAE.WHEN_STMTS || elseWhen isa WHEN_STMTS
     return _canonicalizeWhenStmts(elseWhen, ctx)
   end
   return _canonicalizeEquation(elseWhen, ctx)
@@ -2699,30 +2738,30 @@ function _canonicalizeCrefValue(exp::DAE.CREF, ctx::_CanonicalNameContext)::DAE.
 end
 
 function _canonicalizeWhenOperator(stmt, ctx::_CanonicalNameContext)
-  if stmt isa BDAE.ASSIGN
-    return BDAE.ASSIGN(_canonicalizeExp(stmt.left, ctx),
-                       _canonicalizeExp(stmt.right, ctx),
-                       stmt.source)
-  elseif stmt isa BDAE.REINIT
-    return BDAE.REINIT(_canonicalizeCrefValue(stmt.stateVar, ctx),
-                       _canonicalizeExp(stmt.value, ctx),
-                       stmt.source)
-  elseif stmt isa BDAE.ASSERT
-    return BDAE.ASSERT(_canonicalizeExp(stmt.condition, ctx),
-                       _canonicalizeExp(stmt.message, ctx),
-                       _canonicalizeExp(stmt.level, ctx),
-                       stmt.source)
-  elseif stmt isa BDAE.TERMINATE
-    return BDAE.TERMINATE(_canonicalizeExp(stmt.message, ctx), stmt.source)
-  elseif stmt isa BDAE.NORETCALL
-    return BDAE.NORETCALL(_canonicalizeExp(stmt.exp, ctx), stmt.source)
-  elseif stmt isa BDAE.RECOMPILATION
-    return BDAE.RECOMPILATION(_canonicalizeCrefValue(stmt.componentToChange, ctx),
-                              _canonicalizeExp(stmt.newValue, ctx))
-  elseif stmt isa BDAE.AGENTIC_RECOMPILATION
-    return BDAE.AGENTIC_RECOMPILATION([_canonicalizeCrefValue(c, ctx) for c in stmt.componentsToChange],
-                                      stmt.prompt,
-                                      stmt.initialEquations)
+  if stmt isa BDAE.ASSIGN || stmt isa ASSIGN
+    return typeof(stmt)(_canonicalizeExp(stmt.left, ctx),
+                        _canonicalizeExp(stmt.right, ctx),
+                        stmt.source)
+  elseif stmt isa BDAE.REINIT || stmt isa REINIT
+    return typeof(stmt)(_canonicalizeCrefValue(stmt.stateVar, ctx),
+                        _canonicalizeExp(stmt.value, ctx),
+                        stmt.source)
+  elseif stmt isa BDAE.ASSERT || stmt isa ASSERT
+    return typeof(stmt)(_canonicalizeExp(stmt.condition, ctx),
+                        _canonicalizeExp(stmt.message, ctx),
+                        _canonicalizeExp(stmt.level, ctx),
+                        stmt.source)
+  elseif stmt isa BDAE.TERMINATE || stmt isa TERMINATE
+    return typeof(stmt)(_canonicalizeExp(stmt.message, ctx), stmt.source)
+  elseif stmt isa BDAE.NORETCALL || stmt isa NORETCALL
+    return typeof(stmt)(_canonicalizeExp(stmt.exp, ctx), stmt.source)
+  elseif stmt isa BDAE.RECOMPILATION || stmt isa RECOMPILATION
+    return typeof(stmt)(_canonicalizeCrefValue(stmt.componentToChange, ctx),
+                        _canonicalizeExp(stmt.newValue, ctx))
+  elseif stmt isa BDAE.AGENTIC_RECOMPILATION || stmt isa AGENTIC_RECOMPILATION
+    return typeof(stmt)([_canonicalizeCrefValue(c, ctx) for c in stmt.componentsToChange],
+                        stmt.prompt,
+                        stmt.initialEquations)
   end
   return stmt
 end
@@ -2742,13 +2781,14 @@ end
 function _canonicalizeStructuralTransition(tr::StructuralTransition,
                                            ctx::_CanonicalNameContext)
   if tr isa EXPLICIT_STRUCTURAL_TRANSISTION
-    local st = tr.structuralTransition
-    return EXPLICIT_STRUCTURAL_TRANSISTION(
-      BDAE.STRUCTURAL_TRANSISTION(_canonicalVariableKey(st.fromState, ctx),
-                                  _canonicalVariableKey(st.toState, ctx),
-                                  _canonicalizeExp(st.transistionCondition, ctx)))
+    return EXPLICIT_STRUCTURAL_TRANSISTION(_canonicalVariableKey(tr.fromState, ctx),
+                                           _canonicalVariableKey(tr.toState, ctx),
+                                           _canonicalizeExp(tr.transistionCondition, ctx))
   elseif tr isa IMPLICIT_STRUCTURAL_TRANSISTION
-    return IMPLICIT_STRUCTURAL_TRANSISTION(_canonicalizeEquation(tr.structuralWhenEquation, ctx))
+    return IMPLICIT_STRUCTURAL_TRANSISTION(tr.size,
+                                           _canonicalizeWhenStmts(tr.whenEquation, ctx),
+                                           tr.source,
+                                           tr.attr)
   end
   return tr
 end
@@ -2944,7 +2984,7 @@ function canonicalizeCrefNames(simCode::SIM_CODE;
     simCode.topVariables = _mapVectorLike(name -> _canonicalVariableKey(name, ctx), simCode.topVariables)
     simCode.sharedEquations = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.sharedEquations)
     simCode.activeModel = _canonicalVariableKey(simCode.activeModel, ctx)
-    simCode.irreductableVariables = _mapVectorLike(name -> _canonicalVariableKey(name, ctx), simCode.irreductableVariables)
+    simCode.irreducibleVariables = _mapVectorLike(name -> _canonicalVariableKey(name, ctx), simCode.irreducibleVariables)
     simCode.functions = _mapVectorLike(f -> _canonicalizeFunction(f, ctx), simCode.functions)
     simCode.eliminatedEquations = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.eliminatedEquations)
     simCode.eliminatedVariables = _mapVectorLike(name -> _canonicalVariableKey(name, ctx), simCode.eliminatedVariables)
@@ -3032,10 +3072,12 @@ function simplifyEnumLiteralPaths(simCode::SIM_CODE)::SIM_CODE
         BDAE.EQUATION (lhs/rhs) entries alongside RESIDUAL_EQUATION; handle
         both forms. =#
   local _rewriteEq = function(eq)
-    if eq isa BDAE.RESIDUAL_EQUATION
-      return BDAE.RESIDUAL_EQUATION(_rewriteExp(eq.exp), eq.source, eq.attr)
+    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
+      return typeof(eq)(_rewriteExp(eq.exp), eq.source, eq.attr)
     elseif eq isa BDAE.EQUATION
       return BDAE.EQUATION(_rewriteExp(eq.lhs), _rewriteExp(eq.rhs), eq.source, eq.attributes)
+    elseif eq isa EQUATION
+      return EQUATION(_rewriteExp(eq.lhs), _rewriteExp(eq.rhs), eq.source, eq.attr)
     end
     return eq
   end
@@ -3091,10 +3133,10 @@ function inlinePreOfConstantParameters(simCode::SIM_CODE)::SIM_CODE
     return (exp, true, nothing)
   end
 
-  local newEqs = BDAE.RESIDUAL_EQUATION[]
+  local newEqs = RESIDUAL_EQUATION[]
   for eq in resEqs
     local (newExp, _) = Util.traverseExpTopDown(eq.exp, _rewrite, nothing)
-    push!(newEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+    push!(newEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
   if nReplaced[] > 0
     @debug "[SIMCODE: $(simCode.name): inlinePreOfConstantParameters] replaced $(nReplaced[]) `pre(constParam)` occurrences with the parameter directly"
@@ -3127,7 +3169,7 @@ function propagateConstants(simCode::SIM_CODE)
   local resEqs = simCode.residualEquations
   local nEqs = length(resEqs)
   local sharedVarSet = Set{String}(simCode.sharedVariables)
-  local irreducibleSet = Set{String}(simCode.irreductableVariables)
+  local irreducibleSet = Set{String}(simCode.irreducibleVariables)
 
   #= Phase 1: Detect constant equations.
      First collect all base array names referenced in equations so we can skip
@@ -3194,10 +3236,10 @@ function propagateConstants(simCode::SIM_CODE)
     if changed && !isempty(constMap)
       #= Apply current substitutions to all remaining equation expressions
          so that chained constant patterns are revealed in the next iteration =#
-      local updatedEqs = BDAE.RESIDUAL_EQUATION[]
+      local updatedEqs = RESIDUAL_EQUATION[]
       for (i, eq) in enumerate(resEqs)
         local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
-        push!(updatedEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+        push!(updatedEqs, typeof(eq)(newExp, eq.source, eq.attr))
       end
       resEqs = updatedEqs
     end
@@ -3229,8 +3271,8 @@ function propagateConstants(simCode::SIM_CODE)
     end
   end
   local allRemoved = union(constEqIndices, trivialEqIndices)
-  local newResEqs = BDAE.RESIDUAL_EQUATION[]
-  local elimPairs = Tuple{String, BDAE.RESIDUAL_EQUATION}[]
+  local newResEqs = RESIDUAL_EQUATION[]
+  local elimPairs = Tuple{String, RESIDUAL_EQUATION}[]
   sizehint!(newResEqs, nEqs - length(allRemoved))
 
   for (i, eq) in enumerate(simCode.residualEquations)
@@ -3240,20 +3282,20 @@ function propagateConstants(simCode::SIM_CODE)
       end
     else
       local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
-      push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+      push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
     end
   end
-  local elimEqs = BDAE.RESIDUAL_EQUATION[p[2] for p in elimPairs]
+  local elimEqs = RESIDUAL_EQUATION[p[2] for p in elimPairs]
 
   #= Substitute in if-equation branches =#
   local newIfEqs = IF_EQUATION[]
   for ifEq in simCode.ifEquations
     local newBranches = BRANCH[]
     for branch in ifEq.branches
-      local newBranchEqs = BDAE.RESIDUAL_EQUATION[]
+      local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
         local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteAliasCref, constMap)
-        push!(newBranchEqs, BDAE.RESIDUAL_EQUATION(newBrExp, brEq.source, brEq.attr))
+        push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, constMap)
       push!(newBranches, BRANCH(newCond, newBranchEqs,
@@ -3265,7 +3307,7 @@ function propagateConstants(simCode::SIM_CODE)
   end
 
   #= Substitute in when-equation conditions =#
-  local newWhenEqs = BDAE.WHEN_EQUATION[]
+  local newWhenEqs = WHEN_EQUATION[]
   for whenEq in simCode.whenEquations
     local innerWhen = whenEq.whenEquation
     local (newCond, _) = Util.traverseExpTopDown(innerWhen.condition, substituteAliasCref, constMap)
@@ -3277,13 +3319,17 @@ function propagateConstants(simCode::SIM_CODE)
   #= Substitute in initial equations =#
   local newInitEqs = typeof(simCode.initialEquations)()
   for initEq in simCode.initialEquations
-    if initEq isa BDAE.RESIDUAL_EQUATION
+    if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
       local (newInitExp, _) = Util.traverseExpTopDown(initEq.exp, substituteAliasCref, constMap)
-      push!(newInitEqs, BDAE.RESIDUAL_EQUATION(newInitExp, initEq.source, initEq.attr))
+      push!(newInitEqs, typeof(initEq)(newInitExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
       local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, constMap)
       local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, constMap)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
+    elseif initEq isa EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, constMap)
+      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, constMap)
+      push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
     else
       push!(newInitEqs, initEq)
     end
@@ -3303,9 +3349,12 @@ function propagateConstants(simCode::SIM_CODE)
     end
   end
   for initEq in newInitEqs
-    if initEq isa BDAE.RESIDUAL_EQUATION
+    if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
       collectCrefNames!(allRefNames, initEq.exp)
     elseif initEq isa BDAE.EQUATION
+      collectCrefNames!(allRefNames, initEq.lhs)
+      collectCrefNames!(allRefNames, initEq.rhs)
+    elseif initEq isa EQUATION
       collectCrefNames!(allRefNames, initEq.lhs)
       collectCrefNames!(allRefNames, initEq.rhs)
     end
@@ -3328,7 +3377,7 @@ function propagateConstants(simCode::SIM_CODE)
      `eliminatedEquations` and `eliminatedVariables` aligned for
      downstream `generateEliminatedObservedBlock`. =#
   local elimVarNames = String[]
-  local keptElimEqs = BDAE.RESIDUAL_EQUATION[]
+  local keptElimEqs = RESIDUAL_EQUATION[]
   for (varName, eq) in elimPairs
     if varName in survivingRefs
       continue
@@ -3493,7 +3542,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   local resEqs = simCode.residualEquations
   local nEqs = length(resEqs)
   local sharedVarSet = Set{String}(simCode.sharedVariables)
-  local irreducibleSet = Set{String}(simCode.irreductableVariables)
+  local irreducibleSet = Set{String}(simCode.irreducibleVariables)
 
   #= ===== Step 1: Detect alias equations ===== =#
   #= Each alias is (name1, name2, negated, eqIdx, cref1, ty1, cref2, ty2) =#
@@ -3647,7 +3696,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     #= Mark all other variables in this component for elimination.
        Never eliminate irreducible variables (involved in events).
        Exception: state-to-state aliases inside the same component are safe to
-       collapse even when both ends are flagged irreducible — `getIrreductableVars`
+       collapse even when both ends are flagged irreducible — `getIrreducibleVars`
        marks every STATE as irreducible by default, which prevents two states that
        are connected via algebraic-flange aliases (e.g. AIMC `aimc_inertiaRotor_phi`
        and `loadInertia_phi`) from being merged. Without merging, the residual
@@ -3705,8 +3754,8 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   end
 
   #= ===== Step 4: Substitute alias CREFs in all remaining equations ===== =#
-  local newResEqs = BDAE.RESIDUAL_EQUATION[]
-  local elimEqs = BDAE.RESIDUAL_EQUATION[]
+  local newResEqs = RESIDUAL_EQUATION[]
+  local elimEqs = RESIDUAL_EQUATION[]
   sizehint!(newResEqs, nEqs - length(aliasEqIndices))
 
   for (i, eq) in enumerate(resEqs)
@@ -3714,7 +3763,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
       push!(elimEqs, eq)
     else
       local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
-      push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+      push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
     end
   end
 
@@ -3723,10 +3772,10 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   for ifEq in simCode.ifEquations
     local newBranches = BRANCH[]
     for branch in ifEq.branches
-      local newBranchEqs = BDAE.RESIDUAL_EQUATION[]
+      local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
         local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteAliasCref, aliasMap)
-        push!(newBranchEqs, BDAE.RESIDUAL_EQUATION(newBrExp, brEq.source, brEq.attr))
+        push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, aliasMap)
       #= Reconstruct BRANCH with substituted expressions but same structural info =#
@@ -3739,7 +3788,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   end
 
   #= When equations: substitute alias CREFs in conditions AND statements =#
-  local newWhenEqs = BDAE.WHEN_EQUATION[]
+  local newWhenEqs = WHEN_EQUATION[]
   for whenEq in simCode.whenEquations
     local innerWhen = _substituteAliasInWhenStmts(whenEq.whenEquation, aliasMap)
     @assign whenEq.whenEquation = innerWhen
@@ -3750,13 +3799,17 @@ function eliminateAliasVariables(simCode::SIM_CODE)
      initialEquations may contain EQUATION (lhs/rhs) or RESIDUAL_EQUATION (exp). =#
   local newInitEqs = typeof(simCode.initialEquations)()
   for initEq in simCode.initialEquations
-    if initEq isa BDAE.RESIDUAL_EQUATION
+    if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
       local (newInitExp, _) = Util.traverseExpTopDown(initEq.exp, substituteAliasCref, aliasMap)
-      push!(newInitEqs, BDAE.RESIDUAL_EQUATION(newInitExp, initEq.source, initEq.attr))
+      push!(newInitEqs, typeof(initEq)(newInitExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
       local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, aliasMap)
       local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, aliasMap)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
+    elseif initEq isa EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, aliasMap)
+      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, aliasMap)
+      push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
     else
       push!(newInitEqs, initEq)
     end
@@ -3780,9 +3833,9 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     end
   end
   for initEq in newInitEqs
-    if initEq isa BDAE.RESIDUAL_EQUATION
+    if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
       collectCrefNames!(allRefNames, initEq.exp)
-    elseif initEq isa BDAE.EQUATION
+    elseif initEq isa BDAE.EQUATION || initEq isa EQUATION
       collectCrefNames!(allRefNames, initEq.lhs)
       collectCrefNames!(allRefNames, initEq.rhs)
     end
@@ -3867,7 +3920,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   end
 
   local pairedElimVarNames = String[]
-  local pairedElimEqs = BDAE.RESIDUAL_EQUATION[]
+  local pairedElimEqs = RESIDUAL_EQUATION[]
   for varName in elimVarNames
     if haskey(eqByElimVar, varName)
       push!(pairedElimVarNames, varName)
@@ -3892,7 +3945,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
           DAE.BINARY(uvExp, DAE.ADD(DAE.T_REAL_DEFAULT), repExp) :
           DAE.BINARY(uvExp, DAE.SUB(DAE.T_REAL_DEFAULT), repExp)
         push!(pairedElimVarNames, uv)
-        push!(pairedElimEqs, BDAE.RESIDUAL_EQUATION(synExp, nothing, nothing))
+        push!(pairedElimEqs, RESIDUAL_EQUATION(synExp, nothing, nothing))
       end
     end
   end
@@ -3908,11 +3961,11 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     simCode.aliasMap = keptAliasEntries
   end
   #= State-state aliases collapse two STATEs marked irreducible into one.
-     Drop the eliminated names from `irreductableVariables` so MTK codegen's
+     Drop the eliminated names from `irreducibleVariables` so MTK codegen's
      start-condition lookup (`getStartConditionsMTK`) doesn't try to look up
      a name that no longer exists in `stringToSimVarHT`. =#
   local elimVarSet = Set{String}(elimVarNames)
-  @assign simCode.irreductableVariables = filter(n -> !(n in elimVarSet), simCode.irreductableVariables)
+  @assign simCode.irreducibleVariables = filter(n -> !(n in elimVarSet), simCode.irreducibleVariables)
   #= Append eliminated equations/variables to the existing lists =#
   append!(simCode.eliminatedEquations, pairedElimEqs)
   append!(simCode.eliminatedVariables, pairedElimVarNames)
@@ -3975,11 +4028,11 @@ function _collectComplexFieldNames!(names::Set{String}, eqs, ht)
     return (exp, true, ctx)
   end
   for eq in eqs
-    local exps = if eq isa BDAE.RESIDUAL_EQUATION
+    local exps = if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
       DAE.Exp[eq.exp]
-    elseif eq isa BDAE.EQUATION
+    elseif eq isa BDAE.EQUATION || eq isa EQUATION
       DAE.Exp[eq.lhs, eq.rhs]
-    elseif eq isa BDAE.COMPLEX_EQUATION || eq isa BDAE.ARRAY_EQUATION
+    elseif eq isa BDAE.COMPLEX_EQUATION || eq isa BDAE.ARRAY_EQUATION || eq isa ARRAY_EQUATION
       DAE.Exp[eq.left, eq.right]
     else
       DAE.Exp[]
@@ -4050,9 +4103,9 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   #= "Untouchable" surfaces — any var referenced from these must stay. =#
   local untouchable = Set{String}()
   for eq in simCode.initialEquations
-    if eq isa BDAE.RESIDUAL_EQUATION
+    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
       collectCrefNames!(untouchable, eq.exp)
-    elseif eq isa BDAE.EQUATION
+    elseif eq isa BDAE.EQUATION || eq isa EQUATION
       collectCrefNames!(untouchable, eq.lhs)
       collectCrefNames!(untouchable, eq.rhs)
     end
@@ -4132,7 +4185,7 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   for name in droppedVars
     delete!(newHT, name)
   end
-  local newResiduals = BDAE.RESIDUAL_EQUATION[]
+  local newResiduals = RESIDUAL_EQUATION[]
   sizehint!(newResiduals, nEqs - length(droppedEqs))
   for i in 1:nEqs
     i in droppedEqs && continue
@@ -4157,9 +4210,9 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
     collectCrefNames!(referenced, eq.exp)
   end
   for eq in simCode.initialEquations
-    if eq isa BDAE.RESIDUAL_EQUATION
+    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
       collectCrefNames!(referenced, eq.exp)
-    elseif eq isa BDAE.EQUATION
+    elseif eq isa BDAE.EQUATION || eq isa EQUATION
       collectCrefNames!(referenced, eq.lhs)
       collectCrefNames!(referenced, eq.rhs)
     end
@@ -4288,9 +4341,9 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     _collectWhenConditionCrefs!(protectedNames, whenEq.whenEquation)
   end
   for eq in simCode.initialEquations
-    if eq isa BDAE.RESIDUAL_EQUATION
+    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
       collectCrefNames!(protectedNames, eq.exp)
-    elseif eq isa BDAE.EQUATION
+    elseif eq isa BDAE.EQUATION || eq isa EQUATION
       collectCrefNames!(protectedNames, eq.lhs)
       collectCrefNames!(protectedNames, eq.rhs)
     end
@@ -4386,21 +4439,25 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   end
 
   #= Step 2: substitute throughout every equation container. =#
-  local newResiduals = BDAE.RESIDUAL_EQUATION[]
+  local newResiduals = RESIDUAL_EQUATION[]
   for eq in simCode.residualEquations
     local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
-    push!(newResiduals, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+    push!(newResiduals, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
   local newInitials = typeof(simCode.initialEquations)()
   for eq in simCode.initialEquations
-    local newEq = if eq isa BDAE.RESIDUAL_EQUATION
+    local newEq = if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
       local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
-      BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr)
+      typeof(eq)(newExp, eq.source, eq.attr)
     elseif eq isa BDAE.EQUATION
       local (newLhs, _) = Util.traverseExpTopDown(eq.lhs, substituteConstantParameter, paramValueMap)
       local (newRhs, _) = Util.traverseExpTopDown(eq.rhs, substituteConstantParameter, paramValueMap)
       BDAE.EQUATION(newLhs, newRhs, eq.source, eq.attributes)
+    elseif eq isa EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(eq.lhs, substituteConstantParameter, paramValueMap)
+      local (newRhs, _) = Util.traverseExpTopDown(eq.rhs, substituteConstantParameter, paramValueMap)
+      EQUATION(newLhs, newRhs, eq.source, eq.attr)
     else
       eq
     end
@@ -4411,10 +4468,10 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   for ifEq in simCode.ifEquations
     local newBranches = BRANCH[]
     for branch in ifEq.branches
-      local newBranchEqs = BDAE.RESIDUAL_EQUATION[]
+      local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
         local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteConstantParameter, paramValueMap)
-        push!(newBranchEqs, BDAE.RESIDUAL_EQUATION(newBrExp, brEq.source, brEq.attr))
+        push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteConstantParameter, paramValueMap)
       push!(newBranches, BRANCH(newCond, newBranchEqs,
@@ -4425,7 +4482,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     push!(newIfEquations, IF_EQUATION(newBranches))
   end
 
-  local newWhenEquations = BDAE.WHEN_EQUATION[]
+  local newWhenEquations = WHEN_EQUATION[]
   for whenEq in simCode.whenEquations
     local newInner = _substituteParamInWhenStmts(whenEq.whenEquation, paramValueMap)
     @assign whenEq.whenEquation = newInner
@@ -4434,10 +4491,10 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
 
   # alias-eliminated residuals are emitted verbatim by codegen; substitute
   # eliminated-parameter element refs to avoid dangling identifiers
-  local newElimEqs = BDAE.RESIDUAL_EQUATION[]
+  local newElimEqs = RESIDUAL_EQUATION[]
   for eq in simCode.eliminatedEquations
     local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
-    push!(newElimEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+    push!(newElimEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
   # substitute into surviving PARAMETER and ARRAY_PARAMETER bindings
@@ -4468,9 +4525,9 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     collectCrefNames!(survivorCheck, eq.exp)
   end
   for eq in newInitials
-    if eq isa BDAE.RESIDUAL_EQUATION
+    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
       collectCrefNames!(survivorCheck, eq.exp)
-    elseif eq isa BDAE.EQUATION
+    elseif eq isa BDAE.EQUATION || eq isa EQUATION
       collectCrefNames!(survivorCheck, eq.lhs)
       collectCrefNames!(survivorCheck, eq.rhs)
     end
@@ -4669,10 +4726,19 @@ function _collectIfexpConditionCrefs!(out::Set{String}, @nospecialize(exp))
 end
 
 """
-Collect CREFs in the condition of a `BDAE.WHEN_STMTS` (and any nested
-`elsewhen`). Statements inside the when-clause are handled separately via
-the equation walk; we only protect parameters that gate the trigger.
+Collect CREFs in the condition of a `WHEN_STMTS` node (BDAE or SIM) and
+any nested `elsewhen`. Statements inside the when-clause are handled
+separately via the equation walk; we only protect parameters that gate
+the trigger.
 """
+function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::WHEN_STMTS)
+  collectCrefNames!(out, whenStmts.condition)
+  if whenStmts.elsewhenPart !== nothing
+    _collectWhenConditionCrefs!(out, whenStmts.elsewhenPart)
+  end
+  return out
+end
+
 function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::BDAE.WHEN_STMTS)
   collectCrefNames!(out, whenStmts.condition)
   @match whenStmts.elsewhenPart begin
@@ -4682,7 +4748,7 @@ function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::BDAE.WHEN_STMT
   return out
 end
 
-function _collectWhenConditionCrefs!(out::Set{String}, whenEq::BDAE.WHEN_EQUATION)
+function _collectWhenConditionCrefs!(out::Set{String}, whenEq::Union{BDAE.WHEN_EQUATION, WHEN_EQUATION})
   return _collectWhenConditionCrefs!(out, whenEq.whenEquation)
 end
 
@@ -4772,6 +4838,31 @@ end
 Recursively substitute eliminated-parameter CREFs in a WHEN_STMTS node.
 Mirrors `_substituteAliasInWhenStmts` but with `substituteConstantParameter`.
 """
+function _substituteParamInWhenStmts(whenStmts::WHEN_STMTS, paramValueMap)
+  local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteConstantParameter, paramValueMap)
+  local newStmtLst = WhenOperator[]
+  for stmt in whenStmts.whenStmtLst
+    local newStmt::WhenOperator = if stmt isa ASSIGN
+      local (newL, _) = Util.traverseExpTopDown(stmt.left, substituteConstantParameter, paramValueMap)
+      local (newR, _) = Util.traverseExpTopDown(stmt.right, substituteConstantParameter, paramValueMap)
+      ASSIGN(newL, newR, stmt.source)
+    elseif stmt isa REINIT
+      local (newSV, _) = Util.traverseExpTopDown(stmt.stateVar, substituteConstantParameter, paramValueMap)
+      local (newVal, _) = Util.traverseExpTopDown(stmt.value, substituteConstantParameter, paramValueMap)
+      REINIT(newSV, newVal, stmt.source)
+    elseif stmt isa NORETCALL
+      local (newExp, _) = Util.traverseExpTopDown(stmt.exp, substituteConstantParameter, paramValueMap)
+      NORETCALL(newExp, stmt.source)
+    else
+      stmt
+    end
+    push!(newStmtLst, newStmt)
+  end
+  local newElseWhen = whenStmts.elsewhenPart === nothing ? nothing :
+                      _substituteParamInWhenStmts(whenStmts.elsewhenPart, paramValueMap)
+  return WHEN_STMTS(newCond, newStmtLst, newElseWhen)
+end
+
 function _substituteParamInWhenStmts(whenStmts::BDAE.WHEN_STMTS, paramValueMap)
   local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteConstantParameter, paramValueMap)
   local newStmtLst::List{BDAE.WhenOperator} = MetaModelica.nil
@@ -4806,6 +4897,35 @@ end
 """
 Recursively substitute alias CREFs in a WHEN_STMTS node (condition + statements + elsewhen).
 """
+function _substituteAliasInWhenStmts(whenStmts::WHEN_STMTS, aliasMap)
+  local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteAliasCref, aliasMap)
+  local newStmtLst = WhenOperator[]
+  for stmt in whenStmts.whenStmtLst
+    local newStmt::WhenOperator = if stmt isa ASSIGN
+      local (newL, _) = Util.traverseExpTopDown(stmt.left, substituteAliasCref, aliasMap)
+      local (newR, _) = Util.traverseExpTopDown(stmt.right, substituteAliasCref, aliasMap)
+      ASSIGN(newL, newR, stmt.source)
+    elseif stmt isa REINIT
+      local (newSV, _) = Util.traverseExpTopDown(stmt.stateVar, substituteAliasCref, aliasMap)
+      local (newVal, _) = Util.traverseExpTopDown(stmt.value, substituteAliasCref, aliasMap)
+      REINIT(newSV, newVal, stmt.source)
+    elseif stmt isa NORETCALL
+      local (newExp, _) = Util.traverseExpTopDown(stmt.exp, substituteAliasCref, aliasMap)
+      NORETCALL(newExp, stmt.source)
+    elseif stmt isa ASSERT
+      local (newC, _) = Util.traverseExpTopDown(stmt.condition, substituteAliasCref, aliasMap)
+      local (newM, _) = Util.traverseExpTopDown(stmt.message, substituteAliasCref, aliasMap)
+      ASSERT(newC, newM, stmt.level, stmt.source)
+    else
+      stmt
+    end
+    push!(newStmtLst, newStmt)
+  end
+  local newElse = whenStmts.elsewhenPart === nothing ? nothing :
+                  _substituteAliasInWhenStmts(whenStmts.elsewhenPart, aliasMap)
+  return WHEN_STMTS(newCond, newStmtLst, newElse)
+end
+
 function _substituteAliasInWhenStmts(whenStmts::BDAE.WHEN_STMTS, aliasMap)
   local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteAliasCref, aliasMap)
   local newStmtLst::List{BDAE.WhenOperator} = MetaModelica.nil
@@ -4852,6 +4972,28 @@ end
 """
 Collect all CREF names from a WHEN_STMTS node (condition + statements + elsewhen).
 """
+function _collectWhenCrefNames!(names::Set{String}, whenStmts::WHEN_STMTS)
+  collectCrefNames!(names, whenStmts.condition)
+  for stmt in whenStmts.whenStmtLst
+    if stmt isa ASSIGN
+      collectCrefNames!(names, stmt.left)
+      collectCrefNames!(names, stmt.right)
+    elseif stmt isa REINIT
+      collectCrefNames!(names, stmt.stateVar)
+      collectCrefNames!(names, stmt.value)
+    elseif stmt isa NORETCALL
+      collectCrefNames!(names, stmt.exp)
+    elseif stmt isa ASSERT
+      collectCrefNames!(names, stmt.condition)
+      collectCrefNames!(names, stmt.message)
+    end
+  end
+  if whenStmts.elsewhenPart !== nothing
+    _collectWhenCrefNames!(names, whenStmts.elsewhenPart)
+  end
+  return names
+end
+
 function _collectWhenCrefNames!(names::Set{String}, whenStmts::BDAE.WHEN_STMTS)
   collectCrefNames!(names, whenStmts.condition)
   for stmt in whenStmts.whenStmtLst
@@ -5331,7 +5473,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   end
   local ht  = simCode.stringToSimVarHT
   local resEqs = simCode.residualEquations
-  local irreducibleSet = Set{String}(simCode.irreductableVariables)
+  local irreducibleSet = Set{String}(simCode.irreducibleVariables)
   local sharedVarSet   = Set{String}(simCode.sharedVariables)
 
   local rhsGroups = Dict{String, Vector{Tuple{String, Int, DAE.ComponentRef, DAE.Type, Bool}}}()
@@ -5349,7 +5491,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   local aliasEntries = AliasEntry[]
   local removeEqs = Set{Int}()
   local elimVarOrder = String[]
-  local elimEqOrder  = BDAE.RESIDUAL_EQUATION[]
+  local elimEqOrder  = RESIDUAL_EQUATION[]
 
   for (_key, entries) in pairs(rhsGroups)
     length(entries) >= 2 || continue
@@ -5407,12 +5549,12 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
     @info "[SIMCODE: $(simCode.name): eliminateRHSEquivalentEquations] model size" residuals_before=length(resEqs) residuals_after=length(resEqs) - length(removeEqs) variables_before=length(ht) variables_after=length(ht) - length(aliasMap)
   end
 
-  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  local newResEqs = RESIDUAL_EQUATION[]
   sizehint!(newResEqs, length(resEqs) - length(removeEqs))
   for (i, eq) in enumerate(resEqs)
     i in removeEqs && continue
     local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
-    push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+    push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
   #= Substitute in if-equation branches: conditions + branch residual equations.
@@ -5423,10 +5565,10 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   for ifEq in simCode.ifEquations
     local newBranches = BRANCH[]
     for branch in ifEq.branches
-      local newBranchEqs = BDAE.RESIDUAL_EQUATION[]
+      local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
         local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteAliasCref, aliasMap)
-        push!(newBranchEqs, BDAE.RESIDUAL_EQUATION(newBrExp, brEq.source, brEq.attr))
+        push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, aliasMap)
       push!(newBranches, BRANCH(newCond, newBranchEqs,
@@ -5438,7 +5580,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   end
 
   #= When equations: substitute in conditions and statements. =#
-  local newWhenEqs = BDAE.WHEN_EQUATION[]
+  local newWhenEqs = WHEN_EQUATION[]
   for whenEq in simCode.whenEquations
     local innerWhen = _substituteAliasInWhenStmts(whenEq.whenEquation, aliasMap)
     @assign whenEq.whenEquation = innerWhen
@@ -5448,13 +5590,17 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   #= Initial equations: substitute alias CREFs. =#
   local newInitEqs = typeof(simCode.initialEquations)()
   for initEq in simCode.initialEquations
-    if initEq isa BDAE.RESIDUAL_EQUATION
+    if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
       local (newInitExp, _) = Util.traverseExpTopDown(initEq.exp, substituteAliasCref, aliasMap)
-      push!(newInitEqs, BDAE.RESIDUAL_EQUATION(newInitExp, initEq.source, initEq.attr))
+      push!(newInitEqs, typeof(initEq)(newInitExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
       local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, aliasMap)
       local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, aliasMap)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
+    elseif initEq isa EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, aliasMap)
+      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, aliasMap)
+      push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
     else
       push!(newInitEqs, initEq)
     end
@@ -5466,11 +5612,11 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
      `generateEliminatedObservedBlock` emits code referencing names that
      have been removed from the HT, causing UndefVarError at module eval. =#
   local oldElimEqs = simCode.eliminatedEquations
-  local rewrittenElimEqs = BDAE.RESIDUAL_EQUATION[]
+  local rewrittenElimEqs = RESIDUAL_EQUATION[]
   sizehint!(rewrittenElimEqs, length(oldElimEqs))
   for eq in oldElimEqs
     local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
-    push!(rewrittenElimEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+    push!(rewrittenElimEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
   local newHT = copy(ht)
@@ -5486,7 +5632,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
     simCode.whenEquations     = newWhenEqs
     simCode.stringToSimVarHT  = newHT
     simCode.eliminatedEquations = rewrittenElimEqs
-    simCode.irreductableVariables = filter(n -> !(n in elimVarSet), simCode.irreductableVariables)
+    simCode.irreducibleVariables = filter(n -> !(n in elimVarSet), simCode.irreducibleVariables)
   end
   append!(simCode.aliasMap, aliasEntries)
   append!(simCode.eliminatedVariables, elimVarOrder)
@@ -5874,7 +6020,7 @@ function _computeFrozenProtectedNames(simCode::SIM_CODE)::Set{String}
     end
   end
   for eq in simCode.eliminatedEquations
-    _collectComplexFieldNames!(protectedNames, BDAE.RESIDUAL_EQUATION[eq], ht)
+    _collectComplexFieldNames!(protectedNames, [eq], ht)
   end
   return protectedNames
 end
@@ -5926,7 +6072,7 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::Set{St
   end
 
   local removeEqs = Set{Int}(values(frozenEqIdx))
-  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  local newResEqs = RESIDUAL_EQUATION[]
   sizehint!(newResEqs, length(resEqs) - length(removeEqs))
   for (i, eq) in enumerate(resEqs)
     i in removeEqs && continue
@@ -5935,21 +6081,27 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::Set{St
        to 0 so the residual becomes a clean `0 = -y - 0` form that the
        next iteration can detect as a pin. =#
     newExp = _foldNumericExp(newExp)
-    push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+    push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
   local newInitEqs = typeof(simCode.initialEquations)()
   for initEq in simCode.initialEquations
-    if initEq isa BDAE.RESIDUAL_EQUATION
+    if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
       local (newExp, _) = Util.traverseExpTopDown(initEq.exp, _substituteFrozenState, frozenMap)
       newExp = _foldNumericExp(newExp)
-      push!(newInitEqs, BDAE.RESIDUAL_EQUATION(newExp, initEq.source, initEq.attr))
+      push!(newInitEqs, typeof(initEq)(newExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
       local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, _substituteFrozenState, frozenMap)
       local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, _substituteFrozenState, frozenMap)
       newLhs = _foldNumericExp(newLhs)
       newRhs = _foldNumericExp(newRhs)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
+    elseif initEq isa EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, _substituteFrozenState, frozenMap)
+      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, _substituteFrozenState, frozenMap)
+      newLhs = _foldNumericExp(newLhs)
+      newRhs = _foldNumericExp(newRhs)
+      push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
     else
       push!(newInitEqs, initEq)
     end
@@ -5962,13 +6114,13 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::Set{St
 
   #= Parallel arrays: variable order matches paired equation order. =#
   local elimVarOrder = sort(collect(keys(frozenMap)))
-  local elimEqOrder  = BDAE.RESIDUAL_EQUATION[resEqs[frozenEqIdx[n]] for n in elimVarOrder]
+  local elimEqOrder  = RESIDUAL_EQUATION[resEqs[frozenEqIdx[n]] for n in elimVarOrder]
 
   @assign begin
     simCode.residualEquations     = newResEqs
     simCode.initialEquations      = newInitEqs
     simCode.stringToSimVarHT      = newHT
-    simCode.irreductableVariables = filter(n -> !haskey(frozenMap, n), simCode.irreductableVariables)
+    simCode.irreducibleVariables = filter(n -> !haskey(frozenMap, n), simCode.irreducibleVariables)
   end
   append!(simCode.eliminatedVariables,  elimVarOrder)
   append!(simCode.eliminatedEquations,  elimEqOrder)
@@ -6096,7 +6248,7 @@ function foldExplicitSingleAssign(simCode::SIM_CODE)::SIM_CODE
   end
   isempty(simCode.residualEquations) && return simCode
   local protectedNames = _computeFrozenProtectedNames(simCode)
-  local irreducibleSet = Set{String}(simCode.irreductableVariables)
+  local irreducibleSet = Set{String}(simCode.irreducibleVariables)
   local sharedVarSet   = Set{String}(simCode.sharedVariables)
   local totalFolded = 0
   local maxRounds = 8
@@ -6179,27 +6331,33 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
     return (simCode, 0)
   end
 
-  local newResEqs = BDAE.RESIDUAL_EQUATION[]
+  local newResEqs = RESIDUAL_EQUATION[]
   sizehint!(newResEqs, length(resEqs) - length(foldEqIdxSet))
   for (i, eq) in enumerate(resEqs)
     i in foldEqIdxSet && continue
     local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteFoldedVar, foldMap)
     newExp = _foldNumericExp(newExp)
-    push!(newResEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+    push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
   local newInitEqs = typeof(simCode.initialEquations)()
   for initEq in simCode.initialEquations
-    if initEq isa BDAE.RESIDUAL_EQUATION
+    if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
       local (newExp, _) = Util.traverseExpTopDown(initEq.exp, substituteFoldedVar, foldMap)
       newExp = _foldNumericExp(newExp)
-      push!(newInitEqs, BDAE.RESIDUAL_EQUATION(newExp, initEq.source, initEq.attr))
+      push!(newInitEqs, typeof(initEq)(newExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
       local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteFoldedVar, foldMap)
       local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteFoldedVar, foldMap)
       newLhs = _foldNumericExp(newLhs)
       newRhs = _foldNumericExp(newRhs)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
+    elseif initEq isa EQUATION
+      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteFoldedVar, foldMap)
+      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteFoldedVar, foldMap)
+      newLhs = _foldNumericExp(newLhs)
+      newRhs = _foldNumericExp(newRhs)
+      push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
     else
       push!(newInitEqs, initEq)
     end
@@ -6209,10 +6367,10 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
   for ifEq in simCode.ifEquations
     local newBranches = BRANCH[]
     for branch in ifEq.branches
-      local newBranchEqs = BDAE.RESIDUAL_EQUATION[]
+      local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
         local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteFoldedVar, foldMap)
-        push!(newBranchEqs, BDAE.RESIDUAL_EQUATION(newBrExp, brEq.source, brEq.attr))
+        push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteFoldedVar, foldMap)
       push!(newBranches, BRANCH(newCond, newBranchEqs,
@@ -6223,10 +6381,10 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
     push!(newIfEqs, IF_EQUATION(newBranches))
   end
 
-  local newElimEqs = BDAE.RESIDUAL_EQUATION[]
+  local newElimEqs = RESIDUAL_EQUATION[]
   for eq in simCode.eliminatedEquations
     local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteFoldedVar, foldMap)
-    push!(newElimEqs, BDAE.RESIDUAL_EQUATION(newExp, eq.source, eq.attr))
+    push!(newElimEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
   #= Sanity guard: scan all surviving surfaces for any folded name. If a
@@ -6242,9 +6400,9 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
     collectCrefNames!(survivorNames, eq.exp)
   end
   for eq in newInitEqs
-    if eq isa BDAE.RESIDUAL_EQUATION
+    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
       collectCrefNames!(survivorNames, eq.exp)
-    elseif eq isa BDAE.EQUATION
+    elseif eq isa BDAE.EQUATION || eq isa EQUATION
       collectCrefNames!(survivorNames, eq.lhs)
       collectCrefNames!(survivorNames, eq.rhs)
     end
@@ -6283,7 +6441,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
   end
 
   local elimVarOrder = sort(collect(keys(foldMap)))
-  local elimEqOrder  = BDAE.RESIDUAL_EQUATION[resEqs[defEqOfVar[n]] for n in elimVarOrder]
+  local elimEqOrder  = RESIDUAL_EQUATION[resEqs[defEqOfVar[n]] for n in elimVarOrder]
 
   @assign begin
     simCode.residualEquations    = newResEqs
@@ -6291,7 +6449,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
     simCode.ifEquations          = newIfEqs
     simCode.stringToSimVarHT     = newHT
     simCode.eliminatedEquations  = newElimEqs
-    simCode.irreductableVariables = filter(n -> !haskey(foldMap, n), simCode.irreductableVariables)
+    simCode.irreducibleVariables = filter(n -> !haskey(foldMap, n), simCode.irreducibleVariables)
   end
   append!(simCode.eliminatedVariables, elimVarOrder)
   append!(simCode.eliminatedEquations, elimEqOrder)
@@ -6370,7 +6528,7 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   end
 
   local redundant_set = Set{Int}(redundant)
-  local newRes = BDAE.RESIDUAL_EQUATION[res[i] for i in 1:n_eqs if i ∉ redundant_set]
+  local newRes = RESIDUAL_EQUATION[res[i] for i in 1:n_eqs if i ∉ redundant_set]
   @assign simCode.residualEquations = newRes
   return simCode
 end

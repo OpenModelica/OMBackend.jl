@@ -293,18 +293,17 @@ function string(ifEq::IF_EQUATION)
 end
 
 function Base.string(ieq::SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION)
-  BDAE.string(ieq.structuralDOCC_equation)
+  "STRUCTURAL_DOCC_IF_EQUATION: " * string(ieq.ifEquation) * "\n"
 end
 
 function string(st::IMPLICIT_STRUCTURAL_TRANSISTION)
-  string(st.structuralWhenEquation)
+  "STRUCTURAL_WHEN_EQUATION:\n" * string(st.whenEquation)
 end
 
 function Base.string(simStructChange::SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION)
-  local structuralChange = simStructChange.structuralTransition
-  local str = "STRUCTURAL_TRANSITION: "
-  str = str * "FROM: <" * structuralChange.fromState * "> TO: <" * structuralChange.toState * "> WHEN: " * string(structuralChange.transistionCondition) * "\n"
-  return str
+  return "STRUCTURAL_TRANSITION: FROM: <" * simStructChange.fromState *
+         "> TO: <" * simStructChange.toState *
+         "> WHEN: " * string(simStructChange.transistionCondition) * "\n"
 end
 
 function string(f::EXTERNAL_MODELICA_FUNCTION)

@@ -26,6 +26,14 @@ import ..DISCRETE
 import ..DAE_identifierToString
 import ..isUnknownVarKind
 import ..BDAE
+import ..RESIDUAL_EQUATION
+import ..WHEN_EQUATION
+import ..WHEN_STMTS
+import ..EQUATION
+import ..ARRAY_EQUATION
+import ..INITIAL_WHEN_EQUATION
+import ..INLINE_IF_EQUATION
+import ..ALGORITHM
 
 using MetaModelica
 
@@ -534,12 +542,12 @@ end
 push!(RULES, rule_canonical_cref_names)
 
 function _flagCanonicalEquation!(out::Vector{CheckViolation}, eq, where::String)
-  if eq isa BDAE.RESIDUAL_EQUATION
+  if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
     _flagCanonicalExp!(out, eq.exp, where)
-  elseif eq isa BDAE.EQUATION
+  elseif eq isa BDAE.EQUATION || eq isa EQUATION
     _flagCanonicalExp!(out, eq.lhs, where * ".lhs")
     _flagCanonicalExp!(out, eq.rhs, where * ".rhs")
-  elseif eq isa BDAE.ARRAY_EQUATION
+  elseif eq isa BDAE.ARRAY_EQUATION || eq isa ARRAY_EQUATION
     _flagCanonicalExp!(out, eq.left, where * ".left")
     _flagCanonicalExp!(out, eq.right, where * ".right")
   elseif eq isa BDAE.COMPLEX_EQUATION
@@ -549,8 +557,24 @@ function _flagCanonicalEquation!(out::Vector{CheckViolation}, eq, where::String)
     _flagCanonicalComponentRef!(out, eq.componentRef, where * ".componentRef")
     _flagCanonicalExp!(out, eq.exp, where * ".exp")
   elseif eq isa BDAE.WHEN_EQUATION ||
-         eq isa BDAE.STRUCTURAL_WHEN_EQUATION
+         eq isa BDAE.STRUCTURAL_WHEN_EQUATION ||
+         eq isa WHEN_EQUATION ||
+         eq isa INITIAL_WHEN_EQUATION
     _flagCanonicalWhenStmts!(out, eq.whenEquation, where * ".whenEquation")
+  elseif eq isa ALGORITHM
+    nothing
+  elseif eq isa INLINE_IF_EQUATION
+    for (i, c) in enumerate(eq.conditions)
+      _flagCanonicalExp!(out, c, where * ".conditions[$i]")
+    end
+    for (i, branchEqs) in enumerate(eq.branchesTrue)
+      for (j, brEq) in enumerate(branchEqs)
+        _flagCanonicalEquation!(out, brEq, where * ".branchesTrue[$i][$j]")
+      end
+    end
+    for (j, brEq) in enumerate(eq.branchElse)
+      _flagCanonicalEquation!(out, brEq, where * ".branchElse[$j]")
+    end
   elseif eq isa BDAE.IF_EQUATION
     for (i, c) in enumerate(eq.conditions)
       _flagCanonicalExp!(out, c, where * ".conditions[$i]")
@@ -662,16 +686,21 @@ function _flagCanonicalWhenStmts!(out::Vector{CheckViolation}, whenStmts, where:
       _flagCanonicalExp!(out, stmt.level, where * ".stmt[$i].level")
     end
   end
-  @match whenStmts.elsewhenPart begin
-    SOME(elseWhenEq) => _flagCanonicalElseWhenPart!(out, elseWhenEq, where * ".elsewhen")
-    NONE() => nothing
-    _ => nothing
+  local elsewhen = whenStmts.elsewhenPart
+  if elsewhen isa WHEN_STMTS
+    _flagCanonicalElseWhenPart!(out, elsewhen, where * ".elsewhen")
+  elseif elsewhen !== nothing
+    @match elsewhen begin
+      SOME(elseWhenEq) => _flagCanonicalElseWhenPart!(out, elseWhenEq, where * ".elsewhen")
+      NONE() => nothing
+      _ => nothing
+    end
   end
   return out
 end
 
 function _flagCanonicalElseWhenPart!(out::Vector{CheckViolation}, elseWhen, where::String)
-  if elseWhen isa BDAE.WHEN_STMTS
+  if elseWhen isa BDAE.WHEN_STMTS || elseWhen isa WHEN_STMTS
     _flagCanonicalWhenStmts!(out, elseWhen, where)
   else
     _flagCanonicalEquation!(out, elseWhen, where)

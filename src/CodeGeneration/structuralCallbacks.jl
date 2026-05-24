@@ -47,7 +47,7 @@ end
   Creates a single structural callback for an explicit transition.
 """
 function createStructuralCallback(simCode, simCodeStructuralTransition::SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION, idx)
-  local structuralTransition = simCodeStructuralTransition.structuralTransition
+  local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition, 0)
 
   if isContinousCondition(structuralTransition.transistionCondition, simCode)
@@ -93,7 +93,7 @@ end
 function createStructuralCallback(simCode,
                                   simCodeStructuralTransition::SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION,
                                   idx)
-  local structuralTransition = simCodeStructuralTransition.structuralDOCC_equation
+  local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition, idx)
   (equationsToAddOnTrue, cond) = extractTransitionEquationBody(structuralTransition)
   #=
@@ -141,7 +141,7 @@ Also make sure to create possible other elements in the structural when equation
 function createStructuralCallback(simCode,
                                   simCodeStructuralTransition::SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION,
                                   idx)
-  local structuralTransition = simCodeStructuralTransition.structuralWhenEquation
+  local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition, idx)
   local whenCondition = structuralTransition.whenEquation.condition
   local stmtLst = structuralTransition.whenEquation.whenStmtLst
@@ -228,7 +228,8 @@ function createStructuralCallback(simCode,
     Dispatch on whether this is a standard recompilation or an agentic one.
   =#
   @match SOME(metaModel) = simCode.metaModel
-  structuralCallback = if typeof(recompilationDirective) === BDAE.AGENTIC_RECOMPILATION
+  structuralCallback = if typeof(recompilationDirective) === BDAE.AGENTIC_RECOMPILATION ||
+                          typeof(recompilationDirective) === SimulationCode.AGENTIC_RECOMPILATION
     #= Agentic recompilation: new values come from the external agent at runtime =#
     local componentsToChange = [string(c) for c in recompilationDirective.componentsToChange]
     local promptVal = if isSome(recompilationDirective.prompt)
@@ -342,7 +343,7 @@ end
   That is the constructor for a structural callback guiding structural change.
 """
 function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION)
-  local structuralTransition = simCodeStructuralTransition.structuralTransition
+  local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition)
   local toState = structuralTransition.toState
   local toStateProblem = Symbol(toState * "Problem")
@@ -362,7 +363,7 @@ end
   These are numbered from 1->N
 """
 function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION, idx::Int)
-  local structuralTransition = simCodeStructuralTransition.structuralWhenEquation
+  local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition, idx)
   local integratorCallbackName = string(callbackName, "_CALLBACK")
   local structuralChangeStructure = string(callbackName, "_STRUCTURAL_CHANGE")
@@ -374,7 +375,7 @@ function createStructuralAssignment(simCode, simCodeStructuralTransition::Simula
 end
 
 function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION, idx::Int)
-  local structuralTransition = simCodeStructuralTransition.structuralDOCC_equation
+  local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition, idx)
   local integratorCallbackName = string(callbackName,  "_CALLBACK")
   local structuralChangeStructure = string(callbackName, "_STRUCTURAL_CHANGE")
@@ -385,7 +386,7 @@ function createStructuralAssignment(simCode, simCodeStructuralTransition::Simula
   end
 end
 
-function createCallbackName(structuralTransisiton::BDAE.STRUCTURAL_TRANSISTION, idx = 0)
+function createCallbackName(structuralTransisiton::SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION, idx = 0)
   return "structuralCallback" * structuralTransisiton.fromState * structuralTransisiton.toState
 end
 
@@ -393,11 +394,11 @@ end
   Creates a structural callback for the when equation.
   The name is up to change.
 """
-function createCallbackName(structuralTransisiton::BDAE.STRUCTURAL_WHEN_EQUATION, idx::Int)
+function createCallbackName(structuralTransisiton::SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION, idx::Int)
   return string("structuralCallbackWhenEquation", idx)
 end
 
-function createCallbackName(structuralTransisiton::BDAE.STRUCTURAL_IF_EQUATION, idx::Int)
+function createCallbackName(structuralTransisiton::SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION, idx::Int)
   return string("structuralCallbackDynamicConnectEquation", idx)
 end
 
@@ -424,29 +425,23 @@ end
   The second part is the recompilation statement itself that specifies what structural changes are to occur.
   This last part is then used by the runtime to just-in-time compile the model when the event occurs.
 """
-function createStructuralWhenStatements(@nospecialize(whenStatements::List{BDAE.WhenOperator}),
+function createStructuralWhenStatements(whenStatements,
                                         simCode::SimulationCode.SIM_CODE)
   local res::Vector{Expr} = Expr[]
   local recompilationOperator
-  for wStmt in  whenStatements
-    @match wStmt begin
-      BDAE.ASSIGN(__) => begin
-        exp1 = expToJuliaExp(wStmt.left, simCode, varPrefix="integrator.u")
-        exp2 = expToJuliaExp(wStmt.right, simCode)
-        push!(res, :($(exp1) = $(exp2)))
-      end
-      BDAE.RECOMPILATION(__) => begin
-        recompilationOperator = wStmt
-      end
-      BDAE.AGENTIC_RECOMPILATION(__) => begin
-        recompilationOperator = wStmt
-      end
-      BDAE.REINIT(__) => begin
-        throw("Reinit is not allowed in a structural when equation")
-      end
-      _ => begin
-        throw("Unsupported statement in the when equation:" * string(wStmt))
-      end
+  for wStmt in whenStatements
+    if wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN
+      exp1 = expToJuliaExp(wStmt.left, simCode, varPrefix="integrator.u")
+      exp2 = expToJuliaExp(wStmt.right, simCode)
+      push!(res, :($(exp1) = $(exp2)))
+    elseif wStmt isa BDAE.RECOMPILATION || wStmt isa SimulationCode.RECOMPILATION
+      recompilationOperator = wStmt
+    elseif wStmt isa BDAE.AGENTIC_RECOMPILATION || wStmt isa SimulationCode.AGENTIC_RECOMPILATION
+      recompilationOperator = wStmt
+    elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
+      throw("Reinit is not allowed in a structural when equation")
+    else
+      throw("Unsupported statement in the when equation:" * string(wStmt))
     end
   end
   return (res, recompilationOperator)

@@ -180,7 +180,7 @@ pre-rewritten so `der(state)` appears solitary on one side.
 Returns nothing if the residual cannot be solved for a single derivative;
 the caller is expected to detect this condition and refuse the model.
 """
-function residualToDerivativeAssignment(eq::BDAE.RESIDUAL_EQUATION,
+function residualToDerivativeAssignment(eq::Union{BDAE.RESIDUAL_EQUATION, SimulationCode.RESIDUAL_EQUATION},
                                         layout::DELayout,
                                         simCode::SimulationCode.SIM_CODE)
   local rhsExp = eq.exp

@@ -14,6 +14,27 @@ TODO:
 const HEADER_STRING ="
   $(copyrightString())"
 
+#= Unwrap a `WHEN_STMTS.elsewhenPart` to the inner WHEN_EQUATION-or-WHEN_STMTS,
+   accounting for the two storage shapes carried during the BDAE → SimCode
+   migration. BDAE wraps with `SOME(WHEN_EQUATION(WHEN_STMTS(...)))`; SimCode
+   stores the bare `SIM_WHEN_STMTS`. Returns `nothing` if there is no
+   elsewhen. =#
+_elsewhenInner(::Nothing) = nothing
+_elsewhenInner(p::MetaModelica.SOME) = p.data
+_elsewhenInner(p::SimulationCode.WHEN_STMTS) =
+  SimulationCode.WHEN_EQUATION(0, p, DAE.emptyElementSource, SimulationCode.EQ_ATTR_DEFAULT)
+_elsewhenInner(p) = p
+
+#= Condition expression of an elsewhen arm regardless of wrapper shape. =#
+_elsewhenCondition(arm::SimulationCode.WHEN_STMTS) = arm.condition
+_elsewhenCondition(arm::SimulationCode.WHEN_EQUATION) = arm.whenEquation.condition
+_elsewhenCondition(arm) = arm.whenEquation.condition
+
+#= Statement list of an elsewhen arm regardless of wrapper shape. =#
+_elsewhenStmtLst(arm::SimulationCode.WHEN_STMTS) = arm.whenStmtLst
+_elsewhenStmtLst(arm::SimulationCode.WHEN_EQUATION) = arm.whenEquation.whenStmtLst
+_elsewhenStmtLst(arm) = arm.whenEquation.whenStmtLst
+
 #= Walk a DAE.Exp condition and collect the set of cref-name strings that
    appear OUTSIDE any `change(...)` or `pre(...)` wrapper. Used by the
    discrete-callback codegen so the auto-reset block (which zeroes
@@ -295,7 +316,7 @@ end
 """
   This function creates a representation of a when equation in Julia.
 """
-function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arrayIdx::Int)::Expr
+function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, simCode::SimulationCode.SIM_CODE, arrayIdx::Int)::Expr
   local wEq = eq.whenEquation
   local cond = transformToZeroCrossingCondition(wEq.condition)
   ADD_CALLBACK()
@@ -316,8 +337,8 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
   local isContinuousCond::Bool = isContinousCondition(wEq.condition, simCode)
   if isContinuousCond
     local isElseIf = if wEq.elsewhenPart !== nothing
-      local elsePart = wEq.elsewhenPart.data
-      local elseCond = elsePart.whenEquation.condition
+      local elsePart = _elsewhenInner(wEq.elsewhenPart)
+      local elseCond = _elsewhenCondition(elsePart)
       cond2 = transformToZeroCrossingCondition(elseCond)
       cond == cond2
     else
@@ -328,7 +349,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
          The hardcoded x[N] indices from expToJuliaExp/createWhenStatements
          become invalid after MTK structural_simplify reorders unknowns. =#
       local whenStatementsMTKIf = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
-      local whenStatementsMTKElse = createWhenStatementsMTK(elsePart.whenEquation.whenStmtLst, simCode)
+      local whenStatementsMTKElse = createWhenStatementsMTK(_elsewhenStmtLst(elsePart), simCode)
       local condCrefsElseIf = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
       quote
         let _condCache = Ref{Any}(nothing)
@@ -381,8 +402,8 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
                             getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
                   vcat(
                     listArray(Util.getAllCrefs(wEq.condition)),
-                    vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...),
-                    vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(elsePart.whenEquation.whenStmtLst))...)
+                    vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...),
+                    vcat(map(x -> getRHSVariables(x), _elsewhenStmtLst(elsePart))...)
                   ))...)
             if integrator.dt == 0.0
               @error "integrator.dt was zero. Aborting."
@@ -468,7 +489,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
             $(map(x->Expr(Symbol("="),
                           Symbol(string(x)),
                           getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
-                  vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...))...)
+                  vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...))...)
             if integrator.dt == 0.0
               @error "integrator.dt was zero. Aborting."
               fail()
@@ -491,7 +512,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
                                                          $(Symbol("affect$(callbacks)!")),
                                                          rootfind=true, save_positions=(true, true))
         $(if wEq.elsewhenPart !== nothing
-            eqToJulia(wEq.elsewhenPart.data, simCode, 0)
+            eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 0)
           end)
       end
     end
@@ -655,7 +676,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
           $(map(x -> Expr(Symbol("="),
                           Symbol(string(x)),
                           getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
-                vcat(map(x -> BDAEUtil.getRHSVariables(x), listArray(wEq.whenStmtLst))...))...)
+                vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...))...)
           $(whenStatementsMTKDiscrete...)
           auto_dt_reset!(integrator)
           add_tstop!(integrator, integrator.t + 1E-12)
@@ -670,7 +691,7 @@ function eqToJulia(eq::BDAE.WHEN_EQUATION, simCode::SimulationCode.SIM_CODE, arr
                                                      $(Symbol("affect$(callbacks)!"));
                                                      save_positions=(true, true))
       $(if wEq.elsewhenPart !== nothing
-          eqToJulia(wEq.elsewhenPart.data, simCode, 4)
+          eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4)
         end)
     end
   end
@@ -681,60 +702,55 @@ end
    Creates Julia code for the set of whenStatements in the when equation.
    There are some constructs that may only occur in a when equations.
 """
-function createWhenStatements(whenStatements::List, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+function createWhenStatements(whenStatements, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local res::Array{Expr} = []
   local nWhenStatements = 0
   for _ in whenStatements
     nWhenStatements += 1
   end
   @debug "[CODEGEN: when] createWhenStatements" statements=nWhenStatements
-  for wStmt in  whenStatements
-    @match wStmt begin
-      BDAE.ASSIGN(left = DAE.TUPLE(__)) => begin
-        local tupSym = gensym(:tupResult)
-        local rhsExpr = expToJuliaExp(wStmt.right, simCode)
-        push!(res, :(local $tupSym = $rhsExpr))
-        local i = 0
-        for elem in wStmt.left.PR
-          i += 1
-          _emitWhenTupleElementAssign!(res, elem, :($tupSym[$i]), simCode)
-        end
+  for wStmt in whenStatements
+    local isAssign = wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN
+    local isReinit = wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
+    if isAssign && wStmt.left isa DAE.TUPLE
+      local tupSym = gensym(:tupResult)
+      local rhsExpr = expToJuliaExp(wStmt.right, simCode)
+      push!(res, :(local $tupSym = $rhsExpr))
+      local i = 0
+      for elem in wStmt.left.PR
+        i += 1
+        _emitWhenTupleElementAssign!(res, elem, :($tupSym[$i]), simCode)
       end
-      BDAE.ASSIGN(__) => begin
-        (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.left)]
-        if typeof(var.varKind) === SimulationCode.STATE
-          exp1 = expToJuliaExp(wStmt.left, simCode, varPrefix="integrator.u")
-          exp2 = expToJuliaExp(wStmt.right, simCode)
-          push!(res, :($(exp1) = $(exp2)))
-        elseif typeof(var.varKind) === SimulationCode.ALG_VARIABLE #=TODO also check type=#
-          exp1 = expToJuliaExp(wStmt.left, simCode, varPrefix="reals")
-          exp2 = expToJuliaExp(wStmt.right, simCode)
-          push!(res, :($(exp1) = $(exp2)))
-        elseif var.varKind isa SimulationCode.DISCRETE || var.varKind isa SimulationCode.PARAMETER
-          #=
-            TODO: In reality a branch of a when equation should be sorted.
-          ==#
-          exp1 = expToJuliaExp(wStmt.left, simCode)
-          exp2 = expToJuliaExp(wStmt.right, simCode)
-          push!(res, :($(exp1) = $(exp2)))
-        end
+    elseif isAssign
+      (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.left)]
+      if typeof(var.varKind) === SimulationCode.STATE
+        exp1 = expToJuliaExp(wStmt.left, simCode, varPrefix="integrator.u")
+        exp2 = expToJuliaExp(wStmt.right, simCode)
+        push!(res, :($(exp1) = $(exp2)))
+      elseif typeof(var.varKind) === SimulationCode.ALG_VARIABLE
+        exp1 = expToJuliaExp(wStmt.left, simCode, varPrefix="reals")
+        exp2 = expToJuliaExp(wStmt.right, simCode)
+        push!(res, :($(exp1) = $(exp2)))
+      elseif var.varKind isa SimulationCode.DISCRETE || var.varKind isa SimulationCode.PARAMETER
+        exp1 = expToJuliaExp(wStmt.left, simCode)
+        exp2 = expToJuliaExp(wStmt.right, simCode)
+        push!(res, :($(exp1) = $(exp2)))
       end
-      #= Handles reinit =#
-      BDAE.REINIT(__) => begin
-        (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]
-        if typeof(var.varKind) === SimulationCode.STATE
-          push!(res, quote
-                  integrator.u[$(index)] = $(expToJuliaExp(wStmt.value, simCode))
-                end)
-        elseif var.varKind isa SimulationCode.ALG_VARIABLE
-          push!(res, quote
-                  integrator.u[$(index)] = $(expToJuliaExp(wStmt.value, simCode))
-                end)
-        else
-          throw("Unimplemented branch for: $(var.varKind)")
-        end
+    elseif isReinit
+      (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]
+      if typeof(var.varKind) === SimulationCode.STATE
+        push!(res, quote
+                integrator.u[$(index)] = $(expToJuliaExp(wStmt.value, simCode))
+              end)
+      elseif var.varKind isa SimulationCode.ALG_VARIABLE
+        push!(res, quote
+                integrator.u[$(index)] = $(expToJuliaExp(wStmt.value, simCode))
+              end)
+      else
+        throw("Unimplemented branch for: $(var.varKind)")
       end
-      _ => throw(ErrorException("$whenStatements in @__FUNCTION__ not supported"))
+    else
+      throw(ErrorException("$whenStatements in @__FUNCTION__ not supported"))
     end
   end
   return res
