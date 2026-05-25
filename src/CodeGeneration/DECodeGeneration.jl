@@ -249,7 +249,7 @@ function generateDEParameterAssignments(layout::DELayout,
   for name in layout.paramNames
     (_, simVar) = ht[name]
     local bindExp = @match simVar.varKind begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
+      SimulationCode.PARAMETER(bindExp = SOME(exp)) => SimulationCode.toDAEExp(exp)
       SimulationCode.PARAMETER(bindExp = NONE()) => nothing
       _ => error("DEMode: parameter '$(name)' has non-parameter SimVarType")
     end

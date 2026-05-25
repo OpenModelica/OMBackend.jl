@@ -244,9 +244,9 @@ end
 """
   Pretty-print an optional binding expression using BDAE.string for the DAE.Exp.
 """
-function dumpBindExp(bindExp::Option{DAE.Exp})::String
+function dumpBindExp(bindExp::Option{Exp})::String
   @match bindExp begin
-    SOME(exp) => BDAE.string(exp)
+    SOME(exp) => BDAE.string(toDAEExp(exp))
     NONE() => ""
   end
 end

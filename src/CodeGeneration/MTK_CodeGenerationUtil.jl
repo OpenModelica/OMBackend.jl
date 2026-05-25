@@ -490,10 +490,10 @@ function expToJuliaExpMTK(exp::SimulationCode.EXP_CREF, simCode::SimulationCode.
      that the DAE arm handles cannot reach here. Handle the cheap scalar / "time" /
      simple subscript cases natively; delegate T_ARRAY-typed and harder subscript
      cases to the DAE.Exp emitter. =#
-  if exp.cref.sym === :time && exp.ty isa DAE.T_REAL
+  if exp.cref.sym === :time && exp.ty isa SimulationCode.TYPE_REAL
     return quote t end
   end
-  if exp.ty isa DAE.T_ARRAY
+  if exp.ty isa SimulationCode.TYPE_ARRAY
     return expToJuliaExpMTK(SimulationCode.toDAEExp(exp), simCode;
                             varSuffix = varSuffix, varPrefix = varPrefix,
                             derSymbol = derSymbol)
@@ -603,7 +603,7 @@ end
 function expToJuliaExpMTK(exp::SimulationCode.CAST, simCode::SimulationCode.SIM_CODE;
                           varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
   return quote
-    $(generateCastExpressionMTK(exp.ty, SimulationCode.toDAEExp(exp.exp), simCode, varPrefix))
+    $(generateCastExpressionMTK(SimulationCode.toDAEType(exp.ty), SimulationCode.toDAEExp(exp.exp), simCode, varPrefix))
   end
 end
 
@@ -864,8 +864,9 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           local indexAndVar = lookupEntry
           local varKind = indexAndVar[2].varKind
           @match varKind begin
-            (SimulationCode.ARRAY(_, SOME(bindArray && DAE.ARRAY(__))) ||
-             SimulationCode.ARRAY_PARAMETER(_, SOME(bindArray && DAE.ARRAY(__)))) => begin
+            (SimulationCode.ARRAY(_, SOME(bindRaw && SimulationCode.ARRAY_EXP(__))) ||
+             SimulationCode.ARRAY_PARAMETER(_, SOME(bindRaw && SimulationCode.ARRAY_EXP(__)))) => begin
+              local bindArray = SimulationCode.toDAEExp(bindRaw)
               local subIndices = Int[]
               local allConstant = true
               for sub in subscripts
@@ -1488,8 +1489,9 @@ function tryHandleSubscriptedArrayCref(cr::DAE.ComponentRef, hashTable, simCode;
 
   if allConstantSubscripts
     @match arrayKind begin
-      (SimulationCode.ARRAY(_, SOME(bindArray && DAE.ARRAY(__))) ||
-       SimulationCode.ARRAY_PARAMETER(_, SOME(bindArray && DAE.ARRAY(__)))) => begin
+      (SimulationCode.ARRAY(_, SOME(bindRaw && SimulationCode.ARRAY_EXP(__))) ||
+       SimulationCode.ARRAY_PARAMETER(_, SOME(bindRaw && SimulationCode.ARRAY_EXP(__)))) => begin
+        local bindArray = SimulationCode.toDAEExp(bindRaw)
         #= Extract element from the binding expression =#
         local element = if length(subExprs) == 1
           listGet(bindArray.array, first(subExprs))
@@ -2087,7 +2089,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     if containsCref(rhsSubst, freeName) && rhsSubst isa DAE.CREF
       local (idx, oldSV) = ht[freeName]
       local newSV = SimulationCode.SIMVAR(oldSV.name, oldSV.index,
-        SimulationCode.PARAMETER(SOME(solvedValueExp(lhsVal, freeIsInteger))), oldSV.attributes)
+        SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(solvedValueExp(lhsVal, freeIsInteger)))), oldSV.attributes)
       ht[freeName] = (idx, newSV)
       push!(solvedNames, freeName)
       solvedThisPass = true
@@ -2139,7 +2141,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     #= Update the simCode hash table with the solved value =#
     local (idx, oldSV) = ht[freeName]
     local newSV = SimulationCode.SIMVAR(oldSV.name, oldSV.index,
-      SimulationCode.PARAMETER(SOME(solvedValueExp(x, freeIsInteger))), oldSV.attributes)
+      SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(solvedValueExp(x, freeIsInteger)))), oldSV.attributes)
     ht[freeName] = (idx, newSV)
     push!(solvedNames, freeName)
     solvedThisPass = true

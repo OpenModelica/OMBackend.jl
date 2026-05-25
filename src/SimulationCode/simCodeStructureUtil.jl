@@ -235,7 +235,7 @@ toDAEExp(e::RCONST)::DAE.Exp = DAE.RCONST(e.value)
 toDAEExp(e::BCONST)::DAE.Exp = DAE.BCONST(e.value)
 toDAEExp(e::SCONST)::DAE.Exp = DAE.SCONST(e.value)
 toDAEExp(e::ENUM_LITERAL)::DAE.Exp = DAE.ENUM_LITERAL(e.path, e.index)
-toDAEExp(e::EXP_CREF)::DAE.Exp = DAE.CREF(toDAECref(e.cref).componentRef, e.ty)
+toDAEExp(e::EXP_CREF)::DAE.Exp = DAE.CREF(toDAECref(e.cref).componentRef, toDAEType(e.ty))
 toDAEExp(e::BINARY)::DAE.Exp =
   DAE.BINARY(toDAEExp(e.exp1), toDAEOperator(e.op), toDAEExp(e.exp2))
 toDAEExp(e::UNARY)::DAE.Exp =
@@ -250,13 +250,13 @@ toDAEExp(e::RELATION)::DAE.Exp =
 toDAEExp(e::IFEXP)::DAE.Exp =
   DAE.IFEXP(toDAEExp(e.cond), toDAEExp(e.thenExp), toDAEExp(e.elseExp))
 toDAEExp(e::ARRAY_EXP)::DAE.Exp =
-  DAE.ARRAY(e.ty, e.scalar,
+  DAE.ARRAY(toDAEType(e.ty), e.scalar,
             MetaModelica.list((toDAEExp(x) for x in e.elements)...))
 toDAEExp(e::ASUB)::DAE.Exp =
   DAE.ASUB(toDAEExp(e.exp),
            MetaModelica.list((toDAEExp(x) for x in e.subs)...))
-toDAEExp(e::TSUB)::DAE.Exp = DAE.TSUB(toDAEExp(e.exp), e.index, e.ty)
-toDAEExp(e::CAST)::DAE.Exp = DAE.CAST(e.ty, toDAEExp(e.exp))
+toDAEExp(e::TSUB)::DAE.Exp = DAE.TSUB(toDAEExp(e.exp), e.index, toDAEType(e.ty))
+toDAEExp(e::CAST)::DAE.Exp = DAE.CAST(toDAEType(e.ty), toDAEExp(e.exp))
 toDAEExp(e::CALL)::DAE.Exp =
   DAE.CALL(e.path,
            MetaModelica.list((toDAEExp(x) for x in e.args)...),
@@ -265,9 +265,28 @@ toDAEExp(e::RECORD)::DAE.Exp =
   DAE.RECORD(e.path,
              MetaModelica.list((toDAEExp(x) for x in e.exps)...),
              MetaModelica.list((String(n) for n in e.fieldNames)...),
-             e.ty)
+             toDAEType(e.ty))
 toDAEExp(e::TUPLE)::DAE.Exp =
   DAE.TUPLE(MetaModelica.list((toDAEExp(x) for x in e.PR)...))
+
+#= Exp ty-field boundary constructors: accept a DAE.Type and wrap via toSimType,
+   so toSimExp and any call site handing in a DAE.Type keep working unchanged. =#
+EXP_CREF(cref::SimCref, ty::DAE.Type) = EXP_CREF(cref, toSimType(ty))
+ARRAY_EXP(ty::DAE.Type, scalar::Bool, elements::Vector{Exp}) = ARRAY_EXP(toSimType(ty), scalar, elements)
+CAST(ty::DAE.Type, exp::Exp) = CAST(toSimType(ty), exp)
+TSUB(exp::Exp, index::Int, ty::DAE.Type) = TSUB(exp, index, toSimType(ty))
+RECORD(path::Absyn.Path, exps::Vector{Exp}, fieldNames::Vector{String}, ty::DAE.Type) =
+  RECORD(path, exps, fieldNames, toSimType(ty))
+
+#= SimVarType `bindExp` boundary: an `Option{DAE.Exp}` binding (from BDAE / producer
+   sites) into the SimCode-native `Option{Exp}` the SimVarType structs store. The
+   inverse is `toDAEExp` applied to the unwrapped binding at the (DAE) consumer. =#
+Base.@nospecializeinfer function _toSimBindExp(@nospecialize(o))::Option{Exp}
+  @match o begin
+    SOME(e) => SOME(toSimExp(e))
+    _       => NONE()
+  end
+end
 
 # ============================================================================
 #  DAE.Exp-wrapping boundary constructors

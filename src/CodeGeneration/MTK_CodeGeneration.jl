@@ -1789,7 +1789,7 @@ function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode
     local simVarType::SimulationCode.SimVarType = simVar.varKind
     bindExp = @match simVarType begin
       SimulationCode.PARAMETER(bindExp = SOME(exp)) => begin
-        exp
+        SimulationCode.toDAEExp(exp)
       end
       #= We have a parameter without a binding. Check if we have a start attribute...=#
       SimulationCode.PARAMETER(__) => begin
@@ -1879,7 +1879,7 @@ function createParameterAssignmentsMTK(parameters::Vector,
     (index, simVar) = ht[param]
     local simVarType = simVar.varKind
     bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
+      SimulationCode.PARAMETER(bindExp = SOME(exp)) => SimulationCode.toDAEExp(exp)
       SimulationCode.PARAMETER(__) =>  begin
         continue
       end
@@ -1967,7 +1967,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
   for (_, (_, simVar)) in ht
     @match simVar.varKind begin
       SimulationCode.DATA_STRUCTURE(SOME(b)) => begin
-        @match b begin
+        @match SimulationCode.toDAEExp(b) begin
           DAE.CALL(__) => SimulationCode.collectCrefNames!(neededBases, b)
           _ => nothing
         end
@@ -2023,7 +2023,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
   local emitted = Set{String}()
   for (varName, (_, simVar)) in ht
     local bindExp = @match simVar.varKind begin
-      SimulationCode.ARRAY_PARAMETER(_, SOME(e)) => e
+      SimulationCode.ARRAY_PARAMETER(_, SOME(e)) => SimulationCode.toDAEExp(e)
       _ => nothing
     end
     bindExp === nothing && continue
@@ -2052,9 +2052,9 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
     end
     isempty(indices) && continue
     local val = @match simVar.varKind begin
-      SimulationCode.PARAMETER(SOME(DAE.RCONST(r))) => r
-      SimulationCode.PARAMETER(SOME(DAE.ICONST(i))) => i
-      SimulationCode.PARAMETER(SOME(DAE.BCONST(b))) => b
+      SimulationCode.PARAMETER(SOME(SimulationCode.RCONST(r))) => r
+      SimulationCode.PARAMETER(SOME(SimulationCode.ICONST(i))) => i
+      SimulationCode.PARAMETER(SOME(SimulationCode.BCONST(b))) => b
       _ => nothing
     end
     val === nothing && continue
@@ -2164,7 +2164,7 @@ function createParameterArray(parameters::Vector{T1},
     (index, simVar) = hT[param]
     local simVarType::SimulationCode.SimVarType = simVar.varKind
     bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
+      SimulationCode.PARAMETER(bindExp = SOME(exp)) => SimulationCode.toDAEExp(exp)
       SimulationCode.PARAMETER(__) => begin
         @match simVar.attributes begin
           SOME(attr) where attr.start isa SOME => begin
@@ -2876,9 +2876,9 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
     if sv.varKind isa SimulationCode.PARAMETER ||
        sv.varKind isa SimulationCode.ARRAY_PARAMETER
       local paramLit = @match sv.varKind begin
-        SimulationCode.PARAMETER(SOME(DAE.RCONST(r))) => Float64(r)
-        SimulationCode.PARAMETER(SOME(DAE.ICONST(i))) => Float64(i)
-        SimulationCode.PARAMETER(SOME(DAE.BCONST(b))) => (b ? 1.0 : 0.0)
+        SimulationCode.PARAMETER(SOME(SimulationCode.RCONST(r))) => Float64(r)
+        SimulationCode.PARAMETER(SOME(SimulationCode.ICONST(i))) => Float64(i)
+        SimulationCode.PARAMETER(SOME(SimulationCode.BCONST(b))) => (b ? 1.0 : 0.0)
         _ => nothing
       end
       paramLit === nothing && continue

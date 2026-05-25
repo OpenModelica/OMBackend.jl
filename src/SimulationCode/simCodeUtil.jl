@@ -2183,7 +2183,7 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
   for (name, bindExp) in foldMap
     local (idx, oldSV) = newHT[name]
     newHT[name] = (idx, SIMVAR(oldSV.name, oldSV.index,
-                               PARAMETER(SOME(bindExp)), oldSV.attributes))
+                               PARAMETER(SOME(toSimExp(bindExp))), oldSV.attributes))
   end
   local newResEqs = RESIDUAL_EQUATION[]
   sizehint!(newResEqs, nResEqs - length(elimIdxSet))
@@ -2491,6 +2491,9 @@ function _canonicalizeSimVarHT(ht::AbstractDict{String, Tuple{Integer, SimVar}},
 end
 
 function _canonicalizeExp(@nospecialize(exp), ctx::_CanonicalNameContext)
+  if exp isa Exp
+    return toSimExp(_canonicalizeExp(toDAEExp(exp), ctx))
+  end
   local (newExp, _) = Util.traverseExpTopDown(exp, _canonicalizeCrefExp, ctx)
   return newExp
 end
@@ -3064,8 +3067,9 @@ function simplifyEnumLiteralPaths(simCode::SIM_CODE)::SIM_CODE
 
   #= Helper: rewrite ENUM_LITERALs inside a single DAE.Exp. =#
   local _rewriteExp = function(e)
-    local (newExp, _) = Util.traverseExpTopDown(e, _rewrite, nothing)
-    return newExp
+    local ee = e isa Exp ? toDAEExp(e) : e
+    local (newExp, _) = Util.traverseExpTopDown(ee, _rewrite, nothing)
+    return e isa Exp ? toSimExp(newExp) : newExp
   end
 
   #= 1. Variable bindings (PARAMETER, DATA_STRUCTURE, ARRAY, ARRAY_PARAMETER). =#
@@ -4275,7 +4279,7 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
       ARRAY_PARAMETER(_, SOME(b)) => collectCrefNames!(referenced, b)
       DATA_STRUCTURE(SOME(b)) => begin
         collectCrefNames!(referenced, b)
-        @match b begin
+        @match toDAEExp(b) begin
           DAE.CALL(__) => collectCrefNames!(dsArrayBaseNames, b)
           _ => nothing
         end
@@ -4385,7 +4389,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
       PARAMETER(SOME(b))            => _collectIfexpConditionCrefs!(protectedNames, b)
       ARRAY_PARAMETER(_, SOME(b))   => _collectIfexpConditionCrefs!(protectedNames, b)
       DATA_STRUCTURE(SOME(b)) => begin
-        @match b begin
+        @match toDAEExp(b) begin
           DAE.CALL(__) => begin
             collectCrefNames!(protectedNames, b)
             collectCrefNames!(dsArrayBaseNames, b)
@@ -4419,7 +4423,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     name in protectedNames && continue
     local (_, sv) = htEntry
     local bindExp = @match sv.varKind begin
-      PARAMETER(SOME(e)) => e
+      PARAMETER(SOME(e)) => toDAEExp(e)
       _ => nothing
     end
     bindExp === nothing && continue
@@ -4439,7 +4443,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
       name in protectedNames && continue
       local (_, sv) = htEntry
       local arrBind = @match sv.varKind begin
-        ARRAY_PARAMETER(_, SOME(e)) => e
+        ARRAY_PARAMETER(_, SOME(e)) => toDAEExp(e)
         _ => nothing
       end
       arrBind === nothing && continue
@@ -4519,11 +4523,11 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     local (idx, sv) = htEntry
     local newKind = @match sv.varKind begin
       PARAMETER(SOME(b)) => begin
-        local (nb, _) = Util.traverseExpTopDown(b, substituteConstantParameter, paramValueMap)
+        local (nb, _) = traverseExpTopDown(b, substituteConstantParameter, paramValueMap)
         nb === b ? sv.varKind : PARAMETER(SOME(nb))
       end
       ARRAY_PARAMETER(dims, SOME(b)) => begin
-        local (nb, _) = Util.traverseExpTopDown(b, substituteConstantParameter, paramValueMap)
+        local (nb, _) = traverseExpTopDown(b, substituteConstantParameter, paramValueMap)
         nb === b ? sv.varKind : ARRAY_PARAMETER(dims, SOME(nb))
       end
       _ => sv.varKind
@@ -4698,6 +4702,9 @@ appearing only in IFEXP branches (`then`/`else`) are NOT collected. Used to
 protect parameters that gate runtime conditional branches from elimination.
 """
 function _collectIfexpConditionCrefs!(out::Set{String}, @nospecialize(exp))
+  if exp isa Exp
+    return _collectIfexpConditionCrefs!(out, toDAEExp(exp))
+  end
   @match exp begin
     DAE.IFEXP(expCond = c, expThen = t, expElse = e) => begin
       collectCrefNames!(out, c)
@@ -4855,9 +4862,9 @@ function substituteConstantParameter(exp::EXP_CREF, paramValueMap)
   local name = DAE_identifierToString(toDAECref(exp.cref).componentRef)
   if haskey(paramValueMap, name)
     local v = paramValueMap[name]
-    local literalExp = exp.ty isa DAE.T_REAL    ? RCONST(v) :
-                       exp.ty isa DAE.T_INTEGER ? ICONST(Int(round(v))) :
-                       exp.ty isa DAE.T_BOOL    ? BCONST(v != 0.0) : RCONST(v)
+    local literalExp = exp.ty isa TYPE_REAL    ? RCONST(v) :
+                       exp.ty isa TYPE_INTEGER ? ICONST(Int(round(v))) :
+                       exp.ty isa TYPE_BOOL    ? BCONST(v != 0.0) : RCONST(v)
     return (literalExp, false, paramValueMap)
   end
   return (exp, true, paramValueMap)

@@ -45,26 +45,26 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
       SimulationCode.ALG_VARIABLE(0)
     end
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_COMPLEX(__)) => begin
-      SimulationCode.DATA_STRUCTURE(backendVar.bindExp)
+      SimulationCode.DATA_STRUCTURE(SimulationCode._toSimBindExp(backendVar.bindExp))
     end
     #= Backend constants must be emitted as module-level bindings because generated
        parameter/default expressions may reference them directly by name. =#
     (BDAE.PARAM(__), DAE.T_REAL(__) || DAE.T_BOOL(__) || DAE.T_INTEGER(__)) => begin
-      SimulationCode.PARAMETER(backendVar.bindExp)
+      SimulationCode.PARAMETER(SimulationCode._toSimBindExp(backendVar.bindExp))
     end
     (BDAE.CONST(__), DAE.T_REAL(__) || DAE.T_BOOL(__) || DAE.T_INTEGER(__)) => begin
-      SimulationCode.DATA_STRUCTURE(backendVar.bindExp)
+      SimulationCode.DATA_STRUCTURE(SimulationCode._toSimBindExp(backendVar.bindExp))
     end
     #= String parameters - used for labels, names etc. =#
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_STRING(__)) => begin
-      SimulationCode.STRING(backendVar.bindExp)
+      SimulationCode.STRING(SimulationCode._toSimBindExp(backendVar.bindExp))
     end
     #= Enumeration parameters =#
     (BDAE.PARAM(__), DAE.T_ENUMERATION(__)) => begin
-      SimulationCode.PARAMETER(backendVar.bindExp)
+      SimulationCode.PARAMETER(SimulationCode._toSimBindExp(backendVar.bindExp))
     end
     (BDAE.CONST(__), DAE.T_ENUMERATION(__)) => begin
-      SimulationCode.DATA_STRUCTURE(backendVar.bindExp)
+      SimulationCode.DATA_STRUCTURE(SimulationCode._toSimBindExp(backendVar.bindExp))
     end
     (_, DAE.T_INTEGER(__)) => begin
       SimulationCode.DISCRETE()
@@ -78,14 +78,14 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
       SimulationCode.DISCRETE()
     end
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_ARRAY(__)) => begin
-      SimulationCode.ARRAY_PARAMETER(Int[d.integer for d in backendVar.varType.dims], backendVar.bindExp)
+      SimulationCode.ARRAY_PARAMETER(Int[d.integer for d in backendVar.varType.dims], SimulationCode._toSimBindExp(backendVar.bindExp))
     end
     (_, DAE.T_ARRAY(__)) => begin
-      SimulationCode.ARRAY(Int[d.integer for d in backendVar.varType.dims], backendVar.bindExp)
+      SimulationCode.ARRAY(Int[d.integer for d in backendVar.varType.dims], SimulationCode._toSimBindExp(backendVar.bindExp))
     end
 
     (BDAE.VARIABLE(__), DAE.T_STRING(__)) => begin
-      SimulationCode.STRING(backendVar.bindExp)
+      SimulationCode.STRING(SimulationCode._toSimBindExp(backendVar.bindExp))
     end
     #= Enumeration variables are discrete =#
     (BDAE.VARIABLE(__), DAE.T_ENUMERATION(__)) => begin
@@ -821,7 +821,7 @@ function _reconstructScalarizedArrayDAE(baseName::String, ht)::Union{DAE.Exp, No
     parsed[1] == baseName || continue
     local sv = last(entry)
     local be = @match sv.varKind begin
-      PARAMETER(SOME(b)) => b
+      PARAMETER(SOME(b)) => toDAEExp(b)
       _ => nothing
     end
     be === nothing && continue
@@ -872,8 +872,8 @@ function _inlineParamsInExp(exp::DAE.Exp, ht)::DAE.Exp
       if entry !== nothing
         local sv = last(entry)
         local be = @match sv.varKind begin
-          PARAMETER(SOME(b)) => b
-          ARRAY_PARAMETER(_, SOME(b)) => b
+          PARAMETER(SOME(b)) => toDAEExp(b)
+          ARRAY_PARAMETER(_, SOME(b)) => toDAEExp(b)
           _ => nothing
         end
         if be !== nothing

@@ -299,7 +299,7 @@ function createParameterEquations(parameters::Array, simCode::SimulationCode.Sim
     (index, simVar) = hT[param]
     local simVarType::SimulationCode.SimVarType = simVar.varKind
     bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
+      SimulationCode.PARAMETER(bindExp = SOME(exp)) => SimulationCode.toDAEExp(exp)
       _ => throw(ErrorException("Unknown SimulationCode.SimVarType for parameter."))
     end
     push!(parameterEquations,

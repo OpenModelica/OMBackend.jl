@@ -14,7 +14,7 @@ CG    = OMBackend.CodeGeneration
 T_R = DAEx.T_REAL(nil)
 
 # --- construction helpers ---
-simCref(name)    = SC.EXP_CREF(SC.SimCref(Symbol(name)), T_R)
+simCref(name)    = SC.EXP_CREF(SC.SimCref(Symbol(name)), SC.TYPE_REAL())
 daeCref(name)    = DAEx.CREF_IDENT(name, T_R, nil)
 daeCrefExp(name) = DAEx.CREF(daeCref(name), T_R)
 
@@ -86,6 +86,10 @@ exprEq(a, b) = _normExpr(a) == _normExpr(b)
 function e2jEqualsOracle(e, sc)
   return exprEq(CG.expToJuliaExpMTK(e, sc), CG.expToJuliaExpMTK(SC.toDAEExp(e), sc))
 end
+
+# SType -> DAE.Type -> SType is exact (SType carries no attrs to lose); the
+# DAE -> SType direction drops attrs, so the round-trip is tested from the SType side.
+tyRoundtrips(t::SC.SType) = repr(SC.toSimType(SC.toDAEType(t))) == repr(t)
 
 # function-call construction: build via DAE then toSimExp so CallAttributes are realistic
 Absynx = OMBackend.Absyn
@@ -171,7 +175,7 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
                                      simCref("x"), simCref("w")), mapXY)
       @test simEqualsOracle(SC.LBINARY(simCref("x"), SC.OP_AND, simCref("z")), mapXY)
       @test simEqualsOracle(SC.LUNARY(SC.OP_NOT, simCref("x")), mapXY)
-      @test simEqualsOracle(SC.ARRAY_EXP(T_R, true, SC.Exp[simCref("x"), simCref("w")]), mapXY)
+      @test simEqualsOracle(SC.ARRAY_EXP(SC.TYPE_REAL(), true, SC.Exp[simCref("x"), simCref("w")]), mapXY)
       @test simEqualsOracle(SC.CAST(T_R, simCref("x")), mapXY)
       @test simEqualsOracle(simCall("sin", daeCrefExp("x")), mapXY)
 
@@ -197,12 +201,12 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
     @testset "substituteConstantParameter SIM-native == DAE oracle" begin
       simCrefT(name, ty) = SC.EXP_CREF(SC.SimCref(Symbol(name)), ty)
       pmap = Dict{String,Float64}("p" => 3.5, "n" => 4.0, "b" => 1.0)
-      @test cpEqualsOracle(simCrefT("p", DAEx.T_REAL(nil)), pmap)     # T_REAL    -> RCONST
-      @test cpEqualsOracle(simCrefT("n", DAEx.T_INTEGER(nil)), pmap)  # T_INTEGER -> ICONST(round)
-      @test cpEqualsOracle(simCrefT("b", DAEx.T_BOOL(nil)), pmap)     # T_BOOL    -> BCONST
-      @test cpEqualsOracle(simCrefT("z", T_R), pmap)                  # non-param passthrough
-      @test cpEqualsOracle(SC.BINARY(simCrefT("p", DAEx.T_REAL(nil)), SC.OP_ADD, SC.RCONST(1.0)), pmap)  # nested in BINARY
-      @test cpEqualsOracle(SC.ASUB(simCrefT("arr", T_R), SC.Exp[SC.ICONST(1)]),
+      @test cpEqualsOracle(simCrefT("p", SC.TYPE_REAL()), pmap)       # Real    -> RCONST
+      @test cpEqualsOracle(simCrefT("n", SC.TYPE_INTEGER()), pmap)    # Integer -> ICONST(round)
+      @test cpEqualsOracle(simCrefT("b", SC.TYPE_BOOL()), pmap)       # Bool    -> BCONST
+      @test cpEqualsOracle(simCrefT("z", SC.TYPE_REAL()), pmap)       # non-param passthrough
+      @test cpEqualsOracle(SC.BINARY(simCrefT("p", SC.TYPE_REAL()), SC.OP_ADD, SC.RCONST(1.0)), pmap)  # nested in BINARY
+      @test cpEqualsOracle(SC.ASUB(simCrefT("arr", SC.TYPE_REAL()), SC.Exp[SC.ICONST(1)]),
                            Dict{String,Float64}("arr[1]" => 2.0))     # ASUB canonical name
     end
 
@@ -253,6 +257,58 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       @test e2jEqualsOracle(SC.BINARY(simCref("x"), SC.OP_MUL, SC.RCONST(2.0)), sc)    # cref inside expr
       @test e2jEqualsOracle(SC.IFEXP(SC.RELATION(simCref("x"), SC.OP_GREATER, SC.RCONST(0.0), 0),
                                      SC.RCONST(1.0), SC.RCONST(2.0)), sc)
+      @test e2jEqualsOracle(simCref("time"), sc)                                       # time -> t (ty isa T_REAL branch)
+      #= CAST / ARRAY_EXP arms delegate into generateCastExpressionMTK / handleArrayExp,
+         which need a real model's context — not cleanly mockable, so LRT-gated. =#
+    end
+
+    @testset "SType conversions (toSimType / toDAEType)" begin
+      # forward: DAE.Type -> SType category
+      @test SC.toSimType(DAEx.T_REAL_DEFAULT)    isa SC.TYPE_REAL
+      @test SC.toSimType(DAEx.T_INTEGER_DEFAULT) isa SC.TYPE_INTEGER
+      @test SC.toSimType(DAEx.T_BOOL_DEFAULT)    isa SC.TYPE_BOOL
+      @test SC.toSimType(DAEx.T_STRING_DEFAULT)  isa SC.TYPE_STRING
+      @test SC.toSimType(DAEx.T_UNKNOWN())       isa SC.TYPE_UNKNOWN
+      # array element type + dims preserved
+      local at = SC.toSimType(DAEx.T_ARRAY(DAEx.T_INTEGER_DEFAULT,
+                                           list(DAEx.DIM_INTEGER(2), DAEx.DIM_INTEGER(5))))
+      @test at isa SC.TYPE_ARRAY && at.elementType isa SC.TYPE_INTEGER && at.dims == [2, 5]
+      # nested array element type preserved
+      local at2 = SC.toSimType(DAEx.T_ARRAY(DAEx.T_ARRAY(DAEx.T_REAL_DEFAULT, list(DAEx.DIM_INTEGER(2))),
+                                             list(DAEx.DIM_INTEGER(3))))
+      @test at2 isa SC.TYPE_ARRAY && at2.elementType isa SC.TYPE_ARRAY && at2.dims == [3]
+      # unmapped DAE type collapses to UNKNOWN
+      @test SC.toSimType(DAEx.T_NORETCALL()) isa SC.TYPE_UNKNOWN
+      # SType -> DAE -> SType round-trips exactly
+      @test tyRoundtrips(SC.TYPE_REAL())
+      @test tyRoundtrips(SC.TYPE_INTEGER())
+      @test tyRoundtrips(SC.TYPE_BOOL())
+      @test tyRoundtrips(SC.TYPE_STRING())
+      @test tyRoundtrips(SC.TYPE_UNKNOWN())
+      @test tyRoundtrips(SC.TYPE_ENUM())
+      @test tyRoundtrips(SC.TYPE_ARRAY(SC.TYPE_REAL(), [3]))
+      @test tyRoundtrips(SC.TYPE_ARRAY(SC.TYPE_INTEGER(), [-1]))     # unknown dim
+      @test tyRoundtrips(SC.TYPE_TUPLE([SC.TYPE_REAL(), SC.TYPE_BOOL()]))
+      # COMPLEX keeps its field directory (names + element types) + RECORD/connector bit
+      @test tyRoundtrips(SC.TYPE_COMPLEX(true, ["re", "im"], SC.SType[SC.TYPE_REAL(), SC.TYPE_REAL()]))
+      @test tyRoundtrips(SC.TYPE_COMPLEX(false, ["x"], SC.SType[SC.TYPE_ARRAY(SC.TYPE_REAL(), [3])]))
+      # toSimType from the reconstructed DAE T_COMPLEX recovers the field directory
+      local cx = SC.toSimType(SC.toDAEType(SC.TYPE_COMPLEX(true, ["re", "im"], SC.SType[SC.TYPE_REAL(), SC.TYPE_REAL()])))
+      @test cx isa SC.TYPE_COMPLEX && cx.isRecord && cx.fieldNames == ["re", "im"]
+    end
+
+    @testset "bindExp Option{Exp} migration" begin
+      # SimVarType bindExp stores Option{Exp}; _toSimBindExp converts a producer's
+      # Option{DAE.Exp} binding to the SimCode-native form (NONE passes through).
+      local dae = DAEx.RCONST(2.5)
+      local sb = SC._toSimBindExp(SOME(dae))
+      @test sb isa SOME && sb.data isa SC.Exp
+      @test daeStructEq(SC.toDAEExp(sb.data), dae)
+      @test SC._toSimBindExp(NONE()) === NONE()
+      # SimVarType variants accept a SIM binding; the no-binding default is NONE
+      local p = SC.PARAMETER(SOME(SC.RCONST(1.0)))
+      @test p.bindExp isa SOME && p.bindExp.data isa SC.Exp
+      @test SC.ARRAY(Int[2]).bindExp === NONE()
     end
 
   end

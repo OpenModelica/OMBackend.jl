@@ -8,6 +8,11 @@ the DAE-wrapping boundary constructors live in `simCodeStructureUtil.jl`,
 included at the end.
 =#
 
+#= SimCode-native type representation. The Exp variants' `ty` fields hold `SType`;
+   the DAE-wrapping boundary constructors (simCodeStructureUtil.jl) accept a
+   `DAE.Type` and wrap via `toSimType`. =#
+include("simCodeStructureTypes.jl")
+
 #= ---- SimCref ----
 
    Flat component reference for SimCode and codegen.
@@ -120,7 +125,7 @@ end
 "Component reference `name[subs...]` with type tag."
 struct EXP_CREF <: Exp
   cref::SimCref
-  ty::DAE.Type
+  ty::SType
 end
 
 "`e1 op e2` over numeric / array operands."
@@ -167,7 +172,7 @@ end
 
 "`{e1, e2, ...}` array literal."
 struct ARRAY_EXP <: Exp
-  ty::DAE.Type
+  ty::SType
   scalar::Bool
   elements::Vector{Exp}
 end
@@ -182,7 +187,7 @@ end
 struct TSUB <: Exp
   exp::Exp
   index::Int
-  ty::DAE.Type
+  ty::SType
 end
 
 "Modelica function call `path(args...)`. Call attributes (builtin /
@@ -196,7 +201,7 @@ end
 
 "Type cast `(ty) e`."
 struct CAST <: Exp
-  ty::DAE.Type
+  ty::SType
   exp::Exp
 end
 
@@ -205,7 +210,7 @@ struct RECORD <: Exp
   path::Absyn.Path
   exps::Vector{Exp}
   fieldNames::Vector{String}
-  ty::DAE.Type
+  ty::SType
 end
 
 "`(e1, e2, …)` tuple, e.g. multi-return call LHS."
@@ -466,7 +471,7 @@ struct  INPUT <: SimVarType end
 struct OCC_VARIABLE <: SimVarType end
 
 struct STRING <: SimVarType
-  bindExp::Option{DAE.Exp}
+  bindExp::Option{Exp}
 end
 
 """
@@ -475,7 +480,7 @@ end
   or pointers to data structures in memory.
 """
 struct DATA_STRUCTURE <: SimVarType
-  bindExp::Option{DAE.Exp}
+  bindExp::Option{Exp}
 end
 
 """
@@ -484,7 +489,7 @@ Contains optional binding expression for compile-time evaluation of subscripted 
 """
 struct ARRAY <: SimVarType
   dimensions::Vector{Int}
-  bindExp::Option{DAE.Exp}
+  bindExp::Option{Exp}
 end
 
 #= Backwards-compatible constructor =#
@@ -494,7 +499,7 @@ ARRAY(dimensions::Vector{Int}) = ARRAY(dimensions, NONE())
 Parameter variable
 """
 struct PARAMETER <: SimVarType
-  bindExp::Option{DAE.Exp}
+  bindExp::Option{Exp}
 end
 
 """
@@ -503,7 +508,7 @@ Distinct from ARRAY (which is a state array) to ensure correct MTK code generati
 """
 struct ARRAY_PARAMETER <: SimVarType
   dimensions::Vector{Int}
-  bindExp::Option{DAE.Exp}
+  bindExp::Option{Exp}
 end
 
 """

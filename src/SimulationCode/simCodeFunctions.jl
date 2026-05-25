@@ -380,12 +380,14 @@ function flattenRecordCallSites(simCode)
   for (name, (idx, simVar)) in ht
     local newVarKind = @match simVar.varKind begin
       SimulationCode.PARAMETER(SOME(bindExp)) => begin
-        local newBind = expandRecordArgsInExp(bindExp)
-        newBind === bindExp ? nothing : SimulationCode.PARAMETER(SOME(newBind))
+        local db = SimulationCode.toDAEExp(bindExp)
+        local newBind = expandRecordArgsInExp(db)
+        newBind === db ? nothing : SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(newBind)))
       end
       SimulationCode.ARRAY_PARAMETER(dims, SOME(bindExp)) => begin
-        local newBind = expandRecordArgsInExp(bindExp)
-        newBind === bindExp ? nothing : SimulationCode.ARRAY_PARAMETER(dims, SOME(newBind))
+        local db = SimulationCode.toDAEExp(bindExp)
+        local newBind = expandRecordArgsInExp(db)
+        newBind === db ? nothing : SimulationCode.ARRAY_PARAMETER(dims, SOME(SimulationCode.toSimExp(newBind)))
       end
       _ => nothing
     end
@@ -549,12 +551,14 @@ function resolveIfExpInBindings!(simCode)
   for (name, (idx, simVar)) in ht
     local newVarKind = @match simVar.varKind begin
       SimulationCode.PARAMETER(SOME(bindExp)) => begin
-        local newBind = resolveConstantIfExp(bindExp, simCode)
-        newBind === bindExp ? nothing : SimulationCode.PARAMETER(SOME(newBind))
+        local db = SimulationCode.toDAEExp(bindExp)
+        local newBind = resolveConstantIfExp(db, simCode)
+        newBind === db ? nothing : SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(newBind)))
       end
       SimulationCode.ARRAY_PARAMETER(dims, SOME(bindExp)) => begin
-        local newBind = resolveConstantIfExp(bindExp, simCode)
-        newBind === bindExp ? nothing : SimulationCode.ARRAY_PARAMETER(dims, SOME(newBind))
+        local db = SimulationCode.toDAEExp(bindExp)
+        local newBind = resolveConstantIfExp(db, simCode)
+        newBind === db ? nothing : SimulationCode.ARRAY_PARAMETER(dims, SOME(SimulationCode.toSimExp(newBind)))
       end
       _ => nothing
     end
@@ -986,9 +990,9 @@ function _boundParameterExpression(exp::DAE.Exp, simCode::SIM_CODE, seen::Set{St
   entry === nothing && return nothing
   local (_, simVar) = entry
   local bindExp = @match simVar.varKind begin
-    PARAMETER(SOME(e)) => e
-    ARRAY_PARAMETER(_, SOME(e)) => e
-    STRING(SOME(e)) => e
+    PARAMETER(SOME(e)) => SimulationCode.toDAEExp(e)
+    ARRAY_PARAMETER(_, SOME(e)) => SimulationCode.toDAEExp(e)
+    STRING(SOME(e)) => SimulationCode.toDAEExp(e)
     _ => nothing
   end
   bindExp === nothing && return nothing

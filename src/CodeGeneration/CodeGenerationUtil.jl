@@ -714,7 +714,7 @@ end
 """
 function evalSimCodeParameter(v::V, simCode) where V
   @match SimulationCode.SIMVAR(name, _, SimulationCode.PARAMETER(SOME(bindExp)), _) = v
-  local val = evalDAEConstant(bindExp, simCode)
+  local val = evalDAEConstant(SimulationCode.toDAEExp(bindExp), simCode)
   return val
 end
 
@@ -741,8 +741,8 @@ function _substituteBoundParameters(exp, simCode;
         shouldEval[] = false
       else
         local bindExp = @match simVar.varKind begin
-          SimulationCode.PARAMETER(SOME(be)) => be
-          SimulationCode.ARRAY_PARAMETER(_, SOME(be)) => be
+          SimulationCode.PARAMETER(SOME(be)) => SimulationCode.toDAEExp(be)
+          SimulationCode.ARRAY_PARAMETER(_, SOME(be)) => SimulationCode.toDAEExp(be)
           _ => nothing
         end
         if bindExp !== nothing
@@ -1317,6 +1317,9 @@ function _isLiteralBind(exp::DAE.Exp)::Bool
     _ => false
   end
 end
+
+#= SimCode-native bindings (post-bindExp migration) reach the literal check too. =#
+_isLiteralBind(exp::SimulationCode.Exp)::Bool = _isLiteralBind(SimulationCode.toDAEExp(exp))
 
 function isArrayType(v::DAE.VAR)::Bool
   local crefType = @match v.componentRef begin
