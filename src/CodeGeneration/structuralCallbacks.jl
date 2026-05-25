@@ -283,7 +283,7 @@ function createStructuralCallback(simCode,
       evalExpr = quote
           variableSpec = last(stringToSimVarHT[$(componentToModify)])
           @match SimulationCode.SIMVAR(name, index, SimulationCode.PARAMETER(SOME(bindExp)), _) = variableSpec
-          parameterVal = OMBackend.CodeGeneration.evalDAEConstant(OMBackend.SimulationCode.toDAEExp(bindExp))
+          parameterVal = OMBackend.CodeGeneration.evalDAEConstant(bindExp)
           $(Symbol(componentToModify)) = parameterVal
           $(newValue)
         end

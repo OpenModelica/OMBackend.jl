@@ -707,6 +707,29 @@ function evalDAEConstant(daeConstant::DAE.Exp)
   end
 end
 
+#= SIM-native: literal fast-path returns the value without toDAEExp; computed
+   constants (BINARY/LBINARY) still route through the DAE constant evaluator. =#
+function evalDAEConstant(c::SimulationCode.Exp, simCode)
+  @match c begin
+    SimulationCode.BCONST(b) => b
+    SimulationCode.ICONST(i) => i
+    SimulationCode.RCONST(r) => r
+    SimulationCode.SCONST(s) => s
+    SimulationCode.BINARY(__) || SimulationCode.LBINARY(__) =>
+      OMBackend.CodeGeneration.evalDAE_Expression(SimulationCode.toDAEExp(c), simCode)
+    _ => throw("$(SimulationCode.toDAEExp(c)) is not a constant")
+  end
+end
+function evalDAEConstant(c::SimulationCode.Exp)
+  @match c begin
+    SimulationCode.BCONST(b) => b
+    SimulationCode.ICONST(i) => i
+    SimulationCode.RCONST(r) => r
+    SimulationCode.SCONST(s) => s
+    _ => throw("$(SimulationCode.toDAEExp(c)) is not a constant")
+  end
+end
+
 
 """
   Evaluates a simulation code parameter.
@@ -714,7 +737,7 @@ end
 """
 function evalSimCodeParameter(v::V, simCode) where V
   @match SimulationCode.SIMVAR(name, _, SimulationCode.PARAMETER(SOME(bindExp)), _) = v
-  local val = evalDAEConstant(SimulationCode.toDAEExp(bindExp), simCode)
+  local val = evalDAEConstant(bindExp, simCode)
   return val
 end
 
@@ -975,6 +998,10 @@ function isIntOrBool(@nospecialize(exp::DAE.Exp))
     _ => false
   end
 end
+isIntOrBool(exp::SimulationCode.Exp)::Bool =
+  exp isa SimulationCode.ICONST || exp isa SimulationCode.BCONST ||
+  (exp isa SimulationCode.EXP_CREF &&
+   (exp.ty isa SimulationCode.TYPE_INTEGER || exp.ty isa SimulationCode.TYPE_BOOL))
 
 """
 `writeEqsToFile(elems::Vector{Expr}, filename)`
@@ -1319,7 +1346,10 @@ function _isLiteralBind(exp::DAE.Exp)::Bool
 end
 
 #= SimCode-native bindings (post-bindExp migration) reach the literal check too. =#
-_isLiteralBind(exp::SimulationCode.Exp)::Bool = _isLiteralBind(SimulationCode.toDAEExp(exp))
+_isLiteralBind(exp::SimulationCode.Exp)::Bool =
+  exp isa SimulationCode.RCONST || exp isa SimulationCode.ICONST ||
+  exp isa SimulationCode.BCONST || exp isa SimulationCode.SCONST ||
+  exp isa SimulationCode.ENUM_LITERAL
 
 function isArrayType(v::DAE.VAR)::Bool
   local crefType = @match v.componentRef begin

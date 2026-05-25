@@ -930,12 +930,31 @@ Variables in the returned set are purely "output" (they can be computed from sta
 but do not feed back into any state derivative).
 """
 #= Recursively collect all CREF variable names referenced in a DAE expression. =#
-function collectCrefNames!(names::Set{String}, @nospecialize(exp))
-  # @match arms are DAE.* only; convert SIM-native Exp (e.g. BRANCH.condition,
-  # when-stmt operands post-Phase-4b) so cref names are still collected.
-  if exp isa Exp
-    return collectCrefNames!(names, toDAEExp(exp))
+# SIM-native cref-name collection: walk the SIM tree directly via traverseExpTopDown
+# (no toDAEExp of the whole tree). The ASUB arm reconstructs the subscripted key
+# (e.g. "R_T[1][1]") so the use-def chain matches the scalarized hash-table keys.
+function _collectCrefNamesVisitor(@nospecialize(e), names::Set{String})
+  if e isa EXP_CREF
+    push!(names, DAE_identifierToString(toDAECref(e.cref).componentRef))
+  elseif e isa ASUB && e.exp isa EXP_CREF
+    local allConst = true
+    local sstr = ""
+    for s in e.subs
+      @match s begin
+        ICONST(i) => (sstr *= Base.string("[", i, "]"))
+        _ => (allConst = false)
+      end
+    end
+    if allConst && !isempty(sstr)
+      push!(names, Base.string(DAE_identifierToString(toDAECref(e.exp.cref).componentRef), sstr))
+    end
   end
+  return (e, true, names)
+end
+collectCrefNames!(names::Set{String}, exp::Exp) =
+  (traverseExpTopDown(exp, _collectCrefNamesVisitor, names); names)
+
+function collectCrefNames!(names::Set{String}, @nospecialize(exp))
   @match exp begin
     DAE.CREF(cr, _) => begin
       push!(names, DAE_identifierToString(cr))
@@ -978,12 +997,12 @@ function collectCrefNames!(names::Set{String}, @nospecialize(exp))
           local subscriptStr = ""
           for s in subs
             @match s begin
-              DAE.ICONST(i) => begin subscriptStr *= string("[", i, "]") end
+              DAE.ICONST(i) => begin subscriptStr *= Base.string("[", i, "]") end
               _ => begin allConst = false end
             end
           end
           if allConst && !isempty(subscriptStr)
-            push!(names, string(baseName, subscriptStr))
+            push!(names, Base.string(baseName, subscriptStr))
           end
           push!(names, baseName)
           asubHandled = true
@@ -2490,10 +2509,30 @@ function _canonicalizeSimVarHT(ht::AbstractDict{String, Tuple{Integer, SimVar}},
   return out
 end
 
-function _canonicalizeExp(@nospecialize(exp), ctx::_CanonicalNameContext)
-  if exp isa Exp
-    return toSimExp(_canonicalizeExp(toDAEExp(exp), ctx))
+# SIM-native: walk the SimCode tree, canonicalizing CALL/RECORD paths natively and
+# crefs via the DAE ComponentRef canonicalizer (rebuilt as a SimCref). Removes the
+# whole-tree DAE round-trip; only the per-cref name canonicalization touches DAE,
+# because `_canonicalizeComponentRef` is ComponentRef-shaped (subscripts / rename map).
+function _canonicalizeCrefExpSIM(@nospecialize(exp), ctx::_CanonicalNameContext)
+  if exp isa EXP_CREF
+    local dty = toDAEType(exp.ty)
+    local canon = _canonicalizeComponentRef(toDAECref(exp.cref).componentRef, dty, ctx)
+    return (toSimExp(DAE.CREF(canon, dty)), false, ctx)
+  elseif exp isa CALL
+    local cp = OMBackend.canonicalName(exp.path)
+    _recordNameRewrite!(ctx, _originalPathName(exp.path), cp)
+    return (CALL(Absyn.IDENT(cp), exp.args, exp.attr), true, ctx)
+  elseif exp isa RECORD
+    local cp = OMBackend.canonicalName(exp.path)
+    _recordNameRewrite!(ctx, _originalPathName(exp.path), cp)
+    return (RECORD(Absyn.IDENT(cp), exp.exps, exp.fieldNames, exp.ty), true, ctx)
   end
+  return (exp, true, ctx)
+end
+_canonicalizeExp(exp::Exp, ctx::_CanonicalNameContext) =
+  traverseExpTopDown(exp, _canonicalizeCrefExpSIM, ctx)[1]
+
+function _canonicalizeExp(@nospecialize(exp), ctx::_CanonicalNameContext)
   local (newExp, _) = Util.traverseExpTopDown(exp, _canonicalizeCrefExp, ctx)
   return newExp
 end
@@ -3064,12 +3103,24 @@ function simplifyEnumLiteralPaths(simCode::SIM_CODE)::SIM_CODE
     end
     return (exp, true, nothing)
   end
+  #= SIM-native rewriter (SIM ENUM_LITERAL's path field is `path`; DAE's is `name`). =#
+  local _rewriteSIM = function(exp, _)
+    if exp isa ENUM_LITERAL && !(exp.path isa Absyn.IDENT && occursin('.', exp.path.name))
+      nRewritten[] += 1
+      return (ENUM_LITERAL(_shortenPath(exp.path), exp.index), true, nothing)
+    end
+    return (exp, true, nothing)
+  end
 
-  #= Helper: rewrite ENUM_LITERALs inside a single DAE.Exp. =#
+  #= Rewrite ENUM_LITERALs in a single Exp: SIM-native for SimCode Exps, DAE path
+     for the BDAE.EQUATION entries that still carry a DAE.Exp. =#
   local _rewriteExp = function(e)
-    local ee = e isa Exp ? toDAEExp(e) : e
-    local (newExp, _) = Util.traverseExpTopDown(ee, _rewrite, nothing)
-    return e isa Exp ? toSimExp(newExp) : newExp
+    if e isa Exp
+      local (newExp, _) = traverseExpTopDown(e, _rewriteSIM, nothing)
+      return newExp
+    end
+    local (newExp, _) = Util.traverseExpTopDown(e, _rewrite, nothing)
+    return newExp
   end
 
   #= 1. Variable bindings (PARAMETER, DATA_STRUCTURE, ARRAY, ARRAY_PARAMETER). =#
@@ -4279,8 +4330,8 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
       ARRAY_PARAMETER(_, SOME(b)) => collectCrefNames!(referenced, b)
       DATA_STRUCTURE(SOME(b)) => begin
         collectCrefNames!(referenced, b)
-        @match toDAEExp(b) begin
-          DAE.CALL(__) => collectCrefNames!(dsArrayBaseNames, b)
+        @match b begin
+          CALL(__) => collectCrefNames!(dsArrayBaseNames, b)
           _ => nothing
         end
       end
@@ -4389,8 +4440,8 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
       PARAMETER(SOME(b))            => _collectIfexpConditionCrefs!(protectedNames, b)
       ARRAY_PARAMETER(_, SOME(b))   => _collectIfexpConditionCrefs!(protectedNames, b)
       DATA_STRUCTURE(SOME(b)) => begin
-        @match toDAEExp(b) begin
-          DAE.CALL(__) => begin
+        @match b begin
+          CALL(__) => begin
             collectCrefNames!(protectedNames, b)
             collectCrefNames!(dsArrayBaseNames, b)
           end
@@ -4701,10 +4752,19 @@ Collect every CREF appearing in an IFEXP condition anywhere in `exp`. CREFs
 appearing only in IFEXP branches (`then`/`else`) are NOT collected. Used to
 protect parameters that gate runtime conditional branches from elimination.
 """
-function _collectIfexpConditionCrefs!(out::Set{String}, @nospecialize(exp))
-  if exp isa Exp
-    return _collectIfexpConditionCrefs!(out, toDAEExp(exp))
+# SIM-native: collect crefs appearing in any IFEXP condition (protects params used
+# in conditions from constant-elimination). Walk the SIM tree; at each IFEXP collect
+# its condition's crefs (collectCrefNames! grabs all of them, nested ones included).
+function _collectIfexpCondVisitor(@nospecialize(e), out::Set{String})
+  if e isa IFEXP
+    collectCrefNames!(out, e.cond)
   end
+  return (e, true, out)
+end
+_collectIfexpConditionCrefs!(out::Set{String}, exp::Exp) =
+  (traverseExpTopDown(exp, _collectIfexpCondVisitor, out); out)
+
+function _collectIfexpConditionCrefs!(out::Set{String}, @nospecialize(exp))
   @match exp begin
     DAE.IFEXP(expCond = c, expThen = t, expElse = e) => begin
       collectCrefNames!(out, c)

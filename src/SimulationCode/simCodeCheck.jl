@@ -35,6 +35,12 @@ import ..INITIAL_WHEN_EQUATION
 import ..INLINE_IF_EQUATION
 import ..ALGORITHM
 import ..toDAEExp
+import ..Exp
+import ..EXP_CREF
+import ..CALL
+import ..RECORD
+import ..traverseExpTopDown
+import ..toDAECref
 
 using MetaModelica
 
@@ -213,7 +219,7 @@ function rule_balanced(simCode::SIM_CODE)::Vector{CheckViolation}
   local refNames = Set{String}()
   local missingProbe = String[]
   for eq in simCode.residualEquations
-    _collectCrefNames!(missingProbe, toDAEExp(eq.exp), Set{String}())
+    _collectCrefNames!(missingProbe, eq.exp, Set{String}())
   end
   for n in missingProbe
     push!(refNames, n)
@@ -359,11 +365,11 @@ _baseName(name::AbstractString) = String(first(split(name, '['; limit = 2)))
 function _collectDerCrefs(simCode::SIM_CODE)::Set{String}
   local names = Set{String}()
   for eq in simCode.residualEquations
-    _collectDerFromExp!(names, toDAEExp(eq.exp))
+    _collectDerFromExp!(names, eq.exp)
   end
   for eq in simCode.initialEquations
     if hasproperty(eq, :exp)
-      _collectDerFromExp!(names, toDAEExp(eq.exp))
+      _collectDerFromExp!(names, eq.exp)
     end
   end
   #= Eliminated equations: a state's derivative may appear here if alias
@@ -371,14 +377,14 @@ function _collectDerCrefs(simCode::SIM_CODE)::Set{String}
      `flange.w = der(flange.phi)` where `flange.w` was aliased out. =#
   for eq in simCode.eliminatedEquations
     if hasproperty(eq, :exp)
-      _collectDerFromExp!(names, toDAEExp(eq.exp))
+      _collectDerFromExp!(names, eq.exp)
     end
   end
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
       _collectDerFromExp!(names, branch.condition)
       for eq in branch.residualEquations
-        _collectDerFromExp!(names, toDAEExp(eq.exp))
+        _collectDerFromExp!(names, eq.exp)
       end
     end
   end
@@ -390,7 +396,7 @@ end
 
 function _collectDerFromWhenEquation!(names::Set{String}, whenEq)
   if hasproperty(whenEq, :condition)
-    _collectDerFromExp!(names, toDAEExp(whenEq.condition))
+    _collectDerFromExp!(names, whenEq.condition)
   end
   if hasproperty(whenEq, :whenStmtLst)
     for stmt in whenEq.whenStmtLst
@@ -409,6 +415,17 @@ function _collectDerFromExp!(names::Set{String}, exp)
     _ => nothing
   end
   _walkExpChildren(child -> _collectDerFromExp!(names, child), exp)
+  return names
+end
+
+# SIM-native twin: walk the SimCode Exp; reuse the DAE der-arg extraction via a per-node projection.
+function _collectDerFromExp!(names::Set{String}, exp::Exp)
+  traverseExpTopDown(exp, (e, _) -> begin
+    if e isa CALL && e.path isa Absyn.IDENT && e.path.name == "der" && !isempty(e.args)
+      _pushDerArgNames!(names, toDAEExp(first(e.args)))
+    end
+    (e, true, nothing)
+  end, nothing)
   return names
 end
 
@@ -444,7 +461,7 @@ function rule_cref_resolution(simCode::SIM_CODE)::Vector{CheckViolation}
   union!(known, BUILTIN_CREFS)
   for (i, eq) in enumerate(simCode.residualEquations)
     local missingNames = String[]
-    _collectCrefNames!(missingNames, toDAEExp(eq.exp), known)
+    _collectCrefNames!(missingNames, eq.exp, known)
     for nm in missingNames
       push!(out, CheckViolation(:cref_resolution, :error,
                                 "residualEquations[$i]",
@@ -466,6 +483,20 @@ function _collectCrefNames!(missing::Vector{String}, exp, known::Set{String})
     _ => nothing
   end
   _walkExpChildren(child -> _collectCrefNames!(missing, child, known), exp)
+  return missing
+end
+
+# SIM-native twin: walk the SimCode Exp; collect cref names via a per-cref projection.
+function _collectCrefNames!(missing::Vector{String}, exp::Exp, known::Set{String})
+  traverseExpTopDown(exp, (e, _) -> begin
+    if e isa EXP_CREF
+      local nm = DAE_identifierToString(toDAECref(e.cref).componentRef)
+      if !(nm in known)
+        push!(missing, nm)
+      end
+    end
+    (e, true, nothing)
+  end, nothing)
   return missing
 end
 
@@ -544,13 +575,13 @@ push!(RULES, rule_canonical_cref_names)
 
 function _flagCanonicalEquation!(out::Vector{CheckViolation}, eq, where::String)
   if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-    _flagCanonicalExp!(out, toDAEExp(eq.exp), where)
+    _flagCanonicalExp!(out, eq.exp, where)
   elseif eq isa BDAE.EQUATION || eq isa EQUATION
-    _flagCanonicalExp!(out, toDAEExp(eq.lhs), where * ".lhs")
-    _flagCanonicalExp!(out, toDAEExp(eq.rhs), where * ".rhs")
+    _flagCanonicalExp!(out, eq.lhs, where * ".lhs")
+    _flagCanonicalExp!(out, eq.rhs, where * ".rhs")
   elseif eq isa BDAE.ARRAY_EQUATION || eq isa ARRAY_EQUATION
-    _flagCanonicalExp!(out, toDAEExp(eq.left), where * ".left")
-    _flagCanonicalExp!(out, toDAEExp(eq.right), where * ".right")
+    _flagCanonicalExp!(out, eq.left, where * ".left")
+    _flagCanonicalExp!(out, eq.right, where * ".right")
   elseif eq isa BDAE.COMPLEX_EQUATION
     _flagCanonicalExp!(out, eq.left, where * ".left")
     _flagCanonicalExp!(out, eq.right, where * ".right")
@@ -721,6 +752,21 @@ function _flagCanonicalExp!(out::Vector{CheckViolation}, exp, where::String)
   return out
 end
 
+# SIM-native twin: walk the SimCode Exp directly, reusing the per-node checks via a per-cref projection.
+function _flagCanonicalExp!(out::Vector{CheckViolation}, exp::Exp, where::String)
+  traverseExpTopDown(exp, (e, _) -> begin
+    if e isa EXP_CREF
+      _flagCanonicalComponentRef!(out, toDAECref(e.cref).componentRef, where)
+    elseif e isa CALL
+      _flagCanonicalPath!(out, e.path, where * ".call")
+    elseif e isa RECORD
+      _flagCanonicalPath!(out, e.path, where * ".record")
+    end
+    (e, true, nothing)
+  end, nothing)
+  return out
+end
+
 function _flagCanonicalComponentRef!(out::Vector{CheckViolation}, cr, where::String)
   if cr isa DAE.CREF_QUAL
     push!(out, CheckViolation(:canonical_cref_names, :error, where,
@@ -789,24 +835,24 @@ upstream behavior is the real bug and this :warn keeps it visible.
 function rule_no_literal_in_der_pre(simCode::SIM_CODE)::Vector{CheckViolation}
   local out = CheckViolation[]
   for (i, eq) in enumerate(simCode.residualEquations)
-    _flagLiteralInDerPre!(out, toDAEExp(eq.exp), "residualEquations[$i]")
+    _flagLiteralInDerPre!(out, eq.exp,"residualEquations[$i]")
   end
   for (i, eq) in enumerate(simCode.initialEquations)
     if hasproperty(eq, :exp)
-      _flagLiteralInDerPre!(out, toDAEExp(eq.exp), "initialEquations[$i]")
+      _flagLiteralInDerPre!(out, eq.exp,"initialEquations[$i]")
     end
   end
   for (i, ifEq) in enumerate(simCode.ifEquations)
     for (j, branch) in enumerate(ifEq.branches)
       _flagLiteralInDerPre!(out, branch.condition, "ifEquations[$i].branches[$j].condition")
       for (k, eq) in enumerate(branch.residualEquations)
-        _flagLiteralInDerPre!(out, toDAEExp(eq.exp), "ifEquations[$i].branches[$j].residualEquations[$k]")
+        _flagLiteralInDerPre!(out, eq.exp,"ifEquations[$i].branches[$j].residualEquations[$k]")
       end
     end
   end
   for (i, whenEq) in enumerate(simCode.whenEquations)
     if hasproperty(whenEq, :condition)
-      _flagLiteralInDerPre!(out, toDAEExp(whenEq.condition), "whenEquations[$i].condition")
+      _flagLiteralInDerPre!(out, whenEq.condition, "whenEquations[$i].condition")
     end
     if hasproperty(whenEq, :whenStmtLst)
       for (j, stmt) in enumerate(whenEq.whenStmtLst)
@@ -837,6 +883,21 @@ function _flagLiteralInDerPre!(out::Vector{CheckViolation}, exp, where::String)
     _ => nothing
   end
   _walkExpChildren(child -> _flagLiteralInDerPre!(out, child, where), exp)
+  return out
+end
+
+# SIM-native twin: walk the SimCode Exp; reuse the DAE literal check via a per-arg projection.
+function _flagLiteralInDerPre!(out::Vector{CheckViolation}, exp::Exp, where::String)
+  traverseExpTopDown(exp, (e, _) -> begin
+    if e isa CALL && e.path isa Absyn.IDENT && (e.path.name == "der" || e.path.name == "pre") && !isempty(e.args)
+      local arg = toDAEExp(first(e.args))
+      if _isDAEConstant(arg)
+        push!(out, CheckViolation(:no_literal_in_der_pre, :warn, where,
+                                  "$(e.path.name)(literal $(typeof(arg))) reached codegen — likely upstream parameter-eval substitution"))
+      end
+    end
+    (e, true, nothing)
+  end, nothing)
   return out
 end
 

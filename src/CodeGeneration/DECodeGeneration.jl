@@ -96,11 +96,72 @@ Differs from `expToJuliaExp` in `codeGen.jl` by:
     that as inconsistent. We allow it because IFEXP can survive when the if-
     expression-to-if-equation pass leaves expressions that depend on time).
 """
-#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp` (Phase 4b API). =#
+#= SimCode-Exp entry (Phase 4b API): per-variant dispatch mirrors `toDAEExp`;
+   only the EXP_CREF leaf and the operator map touch a per-node DAE projection. =#
+expToJuliaExpDE(e::SimulationCode.BCONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
+expToJuliaExpDE(e::SimulationCode.ICONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
+expToJuliaExpDE(e::SimulationCode.RCONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
+expToJuliaExpDE(e::SimulationCode.SCONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
+
+function expToJuliaExpDE(e::SimulationCode.EXP_CREF, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
+  local varName = SimulationCode.string(SimulationCode.toDAECref(e.cref).componentRef)
+  if varName == "time"
+    return Expr(:block, :t)
+  end
+  local entry = get(simCode.stringToSimVarHT, varName, nothing)
+  entry === nothing && error("DEMode: unknown CREF '$(varName)' in expression lowering")
+  local kind = entry[2].varKind
+  @match kind begin
+    SimulationCode.STATE(__) => Expr(:ref, :u, layout.stateIndex[varName])
+    SimulationCode.STATE_DERIVATIVE(__) => Expr(:ref, :du, layout.stateIndex[kind.varName])
+    SimulationCode.PARAMETER(__) => Expr(:ref, :p, layout.paramIndex[varName])
+    SimulationCode.ALG_VARIABLE(__) =>
+      error("DEMode: algebraic variable '$(varName)' encountered. " *
+            "Pure-ODE scope only at this milestone.")
+    SimulationCode.DISCRETE(__) =>
+      error("DEMode: discrete variable '$(varName)' encountered. " *
+            "Discrete/event support is not in the initial milestone.")
+    _ => error("DEMode: unsupported variable kind $(kind) for '$(varName)'")
+  end
+end
+
+function expToJuliaExpDE(e::SimulationCode.UNARY, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
+  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  :($o($(expToJuliaExpDE(e.exp, layout, simCode))))
+end
+function expToJuliaExpDE(e::SimulationCode.LUNARY, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
+  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  :($o($(expToJuliaExpDE(e.exp, layout, simCode))))
+end
+function expToJuliaExpDE(e::SimulationCode.BINARY, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
+  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  :($o($(expToJuliaExpDE(e.exp1, layout, simCode)), $(expToJuliaExpDE(e.exp2, layout, simCode))))
+end
+function expToJuliaExpDE(e::SimulationCode.LBINARY, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
+  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  :($o($(expToJuliaExpDE(e.exp1, layout, simCode)), $(expToJuliaExpDE(e.exp2, layout, simCode))))
+end
+function expToJuliaExpDE(e::SimulationCode.RELATION, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
+  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  :($o($(expToJuliaExpDE(e.exp1, layout, simCode)), $(expToJuliaExpDE(e.exp2, layout, simCode))))
+end
+function expToJuliaExpDE(e::SimulationCode.IFEXP, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
+  :(($(expToJuliaExpDE(e.cond, layout, simCode))) ?
+    $(expToJuliaExpDE(e.thenExp, layout, simCode)) :
+    $(expToJuliaExpDE(e.elseExp, layout, simCode)))
+end
+expToJuliaExpDE(e::SimulationCode.CAST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr =
+  expToJuliaExpDE(e.exp, layout, simCode)
+function expToJuliaExpDE(e::SimulationCode.CALL, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
+  e.path isa Absyn.IDENT || error("DEMode: unsupported call path $(e.path) in expression lowering")
+  local fn = Symbol(e.path.name)
+  local argExprs = [expToJuliaExpDE(a, layout, simCode) for a in e.args]
+  Expr(:call, fn, argExprs...)
+end
 Base.@nospecializeinfer function expToJuliaExpDE(@nospecialize(exp::SimulationCode.Exp),
-                                                 @nospecialize(layout::DELayout),
-                                                 @nospecialize(simCode::SimulationCode.SIM_CODE))::Expr
-  return expToJuliaExpDE(SimulationCode.toDAEExp(exp), layout, simCode)
+                                                 layout::DELayout,
+                                                 simCode::SimulationCode.SIM_CODE)::Expr
+  error("DEMode: unsupported SimulationCode.Exp shape $(typeof(exp)): $exp")
 end
 
 function expToJuliaExpDE(exp::DAE.Exp, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr

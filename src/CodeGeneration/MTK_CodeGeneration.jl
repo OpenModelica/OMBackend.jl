@@ -1789,7 +1789,7 @@ function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode
     local simVarType::SimulationCode.SimVarType = simVar.varKind
     bindExp = @match simVarType begin
       SimulationCode.PARAMETER(bindExp = SOME(exp)) => begin
-        SimulationCode.toDAEExp(exp)
+        exp
       end
       #= We have a parameter without a binding. Check if we have a start attribute...=#
       SimulationCode.PARAMETER(__) => begin
@@ -1879,7 +1879,7 @@ function createParameterAssignmentsMTK(parameters::Vector,
     (index, simVar) = ht[param]
     local simVarType = simVar.varKind
     bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => SimulationCode.toDAEExp(exp)
+      SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
       SimulationCode.PARAMETER(__) =>  begin
         continue
       end
@@ -1967,8 +1967,8 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
   for (_, (_, simVar)) in ht
     @match simVar.varKind begin
       SimulationCode.DATA_STRUCTURE(SOME(b)) => begin
-        @match SimulationCode.toDAEExp(b) begin
-          DAE.CALL(__) => SimulationCode.collectCrefNames!(neededBases, b)
+        @match b begin
+          SimulationCode.CALL(__) => SimulationCode.collectCrefNames!(neededBases, b)
           _ => nothing
         end
       end
@@ -2164,7 +2164,7 @@ function createParameterArray(parameters::Vector{T1},
     (index, simVar) = hT[param]
     local simVarType::SimulationCode.SimVarType = simVar.varKind
     bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => SimulationCode.toDAEExp(exp)
+      SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
       SimulationCode.PARAMETER(__) => begin
         @match simVar.attributes begin
           SOME(attr) where attr.start isa SOME => begin

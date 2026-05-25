@@ -805,10 +805,133 @@ The context can be any type that contains a set of residual equations.
 """
 #= SimCode-Exp entry: codegen consumes `SimulationCode.Exp` (Phase 4b API).
    See comment on the MTK variant. =#
+#= SimCode-Exp entry (Phase 4b API): per-variant dispatch mirrors the DAE.Exp emitter;
+   only the EXP_CREF leaf, CALL args, and CAST touch a per-node DAE projection. =#
+function expToJuliaExp(e::SimulationCode.BCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  quote $(e.value) end
+end
+function expToJuliaExp(e::SimulationCode.ICONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  quote $(e.value) end
+end
+function expToJuliaExp(e::SimulationCode.RCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  quote $(e.value) end
+end
+function expToJuliaExp(e::SimulationCode.SCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  quote $(e.value) end
+end
+
+function expToJuliaExp(e::SimulationCode.EXP_CREF, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  local hashTable = context.stringToSimVarHT
+  local varName = SimulationCode.string(SimulationCode.toDAECref(e.cref).componentRef)
+  if varName == "time"
+    return quote t end
+  end
+  local indexAndVar = hashTable[varName]
+  local varKind::SimulationCode.SimVarType = indexAndVar[2].varKind
+  @match varKind begin
+    SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
+    SimulationCode.STATE(__) => quote
+      $(LineNumberNode(@__LINE__, "$varName state"))
+      $(Symbol(varPrefix))[$(indexAndVar[1])]
+    end
+    SimulationCode.PARAMETER(__) => quote
+      $(LineNumberNode(@__LINE__, "$varName parameter"))
+      p[$(indexAndVar[1])]
+    end
+    SimulationCode.ALG_VARIABLE(__) => quote
+      $(LineNumberNode(@__LINE__, "$varName, algebraic"))
+      $(Symbol(varPrefix))[$(indexAndVar[1])]
+    end
+    SimulationCode.DISCRETE(__) => quote
+      $(LineNumberNode(@__LINE__, "$varName, Discrete"))
+      $(Symbol(varPrefix))[$(indexAndVar[1])]
+    end
+    SimulationCode.STATE_DERIVATIVE(__) => :(dx$(varSuffix)[$(indexAndVar[1])] #= der($varName) =#)
+    SimulationCode.DATA_STRUCTURE(__) => quote
+      $(LineNumberNode(@__LINE__, "$varName, datastructure"))
+      $(Symbol(indexAndVar[2].name))
+    end
+    SimulationCode.OCC_VARIABLE(__) => quote
+      $(LineNumberNode(@__LINE__, "$varName, occ variable"))
+      $(Symbol(indexAndVar[2].name))
+    end
+    SimulationCode.STRING(__) => quote
+      $(LineNumberNode(@__LINE__, "$varName, string"))
+      $(Symbol(indexAndVar[2].name))
+    end
+  end
+end
+
+function expToJuliaExp(e::SimulationCode.UNARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  quote
+    $(o)($(expToJuliaExp(e.exp, context, varPrefix=varPrefix)))
+  end
+end
+function expToJuliaExp(e::SimulationCode.BINARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  local a = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
+  local b = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
+  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  quote
+    $o($(a), $(b))
+  end
+end
+function expToJuliaExp(e::SimulationCode.LUNARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  local lhs = expToJuliaExp(e.exp, context, varPrefix=varPrefix)
+  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  quote
+    $o($(lhs))
+  end
+end
+function expToJuliaExp(e::SimulationCode.LBINARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  local l = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
+  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local r = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
+  quote
+    $o($(l), $(r))
+  end
+end
+function expToJuliaExp(e::SimulationCode.RELATION, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  local lhs = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
+  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local rhs = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
+  quote
+    $o($(lhs), $(rhs))
+  end
+end
+function expToJuliaExp(e::SimulationCode.IFEXP, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  local condJL = expToJuliaExp(e.cond, context, varPrefix=varPrefix)
+  local thenJL = expToJuliaExp(e.thenExp, context, varPrefix=varPrefix)
+  local elseJL = expToJuliaExp(e.elseExp, context, varPrefix=varPrefix)
+  :(ifelse($(condJL), $(thenJL), $(elseJL)))
+end
+function expToJuliaExp(e::SimulationCode.CALL, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  local hashTable = context.stringToSimVarHT
+  @match e.path begin
+    Absyn.IDENT(nm) => begin
+      local daeArgs = MetaModelica.list((SimulationCode.toDAEExp(a) for a in e.args)...)
+      DAECallExpressionToJuliaCallExpression(nm, daeArgs, context, hashTable, varPrefix=varPrefix)
+    end
+    _ => begin
+      local expr = Expr(:call, Symbol(string(e.path)))
+      local args::Vector{Any} = Any[]
+      for arg in e.args
+        push!(args, expToJuliaExp(arg, context, varSuffix, varPrefix=varPrefix))
+      end
+      append!(expr.args, args)
+      expr
+    end
+  end
+end
+function expToJuliaExp(e::SimulationCode.CAST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+  quote
+    $(generateCastExpression(SimulationCode.toDAEType(e.ty), SimulationCode.toDAEExp(e.exp), context, varPrefix))
+  end
+end
 Base.@nospecializeinfer function expToJuliaExp(@nospecialize(exp::SimulationCode.Exp),
                                                @nospecialize(context::C),
                                                varSuffix = ""; varPrefix = "x")::Expr where {C}
-  return expToJuliaExp(SimulationCode.toDAEExp(exp), context, varSuffix; varPrefix = varPrefix)
+  throw(ErrorException("$exp not yet supported"))
 end
 
 function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::Expr where {C}

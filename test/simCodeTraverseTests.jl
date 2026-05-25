@@ -87,6 +87,16 @@ function e2jEqualsOracle(e, sc)
   return exprEq(CG.expToJuliaExpMTK(e, sc), CG.expToJuliaExpMTK(SC.toDAEExp(e), sc))
 end
 
+# Differential: SIM-native expToJuliaExpDE (DEMode, per-variant arms) must match the DAE.Exp emitter.
+function deEqualsOracle(e, layout, sc)
+  return exprEq(CG.DEGen.expToJuliaExpDE(e, layout, sc), CG.DEGen.expToJuliaExpDE(SC.toDAEExp(e), layout, sc))
+end
+
+# Differential: SIM-native expToJuliaExp (generic emitter, per-variant arms) must match the DAE.Exp emitter.
+function ejEqualsOracle(e, sc)
+  return exprEq(CG.expToJuliaExp(e, sc), CG.expToJuliaExp(SC.toDAEExp(e), sc))
+end
+
 # SType -> DAE.Type -> SType is exact (SType carries no attrs to lose); the
 # DAE -> SType direction drops attrs, so the round-trip is tested from the SType side.
 tyRoundtrips(t::SC.SType) = repr(SC.toSimType(SC.toDAEType(t))) == repr(t)
@@ -262,6 +272,99 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
          which need a real model's context — not cleanly mockable, so LRT-gated. =#
     end
 
+    @testset "expToJuliaExpDE SIM-native == DAE oracle" begin
+      # DEMode resolves STATE -> u[i], PARAMETER -> p[i], time -> t; the layout is built
+      # from the mock HT's varKinds. No MSL test exercises DEMode, so this is the coverage.
+      sc = mockSimCode(Dict{String, Tuple{Integer, SC.SimVar}}(
+        "x" => (0, SC.SIMVAR("x", SOME(0), SC.STATE(), NONE())),
+        "p" => (1, SC.SIMVAR("p", SOME(1), SC.PARAMETER(NONE()), NONE()))))
+      layout = CG.DEGen.buildDELayout(sc)
+      @test deEqualsOracle(SC.BCONST(true), layout, sc)
+      @test deEqualsOracle(SC.ICONST(7), layout, sc)
+      @test deEqualsOracle(SC.RCONST(2.5), layout, sc)
+      @test deEqualsOracle(SC.SCONST("s"), layout, sc)
+      @test deEqualsOracle(SC.BINARY(SC.RCONST(2.0), SC.OP_ADD, SC.RCONST(3.0)), layout, sc)
+      @test deEqualsOracle(SC.UNARY(SC.OP_UMINUS, SC.RCONST(4.0)), layout, sc)
+      @test deEqualsOracle(SC.LBINARY(SC.BCONST(true), SC.OP_AND, SC.BCONST(false)), layout, sc)
+      @test deEqualsOracle(SC.RELATION(SC.RCONST(1.0), SC.OP_LESS, SC.RCONST(2.0), 0), layout, sc)
+      @test deEqualsOracle(SC.CAST(SC.TYPE_REAL(), SC.RCONST(1.0)), layout, sc)             # CAST drops to inner
+      @test deEqualsOracle(simCall("sin", SC.RCONST(1.0)), layout, sc)                      # CALL -> :call
+      @test deEqualsOracle(simCref("x"), layout, sc)                                        # STATE -> u[i]
+      @test deEqualsOracle(simCref("p"), layout, sc)                                        # PARAMETER -> p[i]
+      @test deEqualsOracle(simCref("time"), layout, sc)                                     # time -> t
+      @test deEqualsOracle(SC.BINARY(simCref("x"), SC.OP_MUL, SC.RCONST(2.0)), layout, sc)  # cref inside expr
+      @test deEqualsOracle(SC.IFEXP(SC.RELATION(simCref("x"), SC.OP_GREATER, SC.RCONST(0.0), 0),
+                                    simCref("x"), SC.RCONST(2.0)), layout, sc)              # IFEXP inlined
+    end
+
+    @testset "expToJuliaExp SIM-native == DAE oracle" begin
+      # generic emitter resolves STATE/ALG -> <varPrefix>[i], PARAMETER -> p[i], time -> t.
+      # CALL / CAST arms need real model context (LRT-gated, as for expToJuliaExpMTK).
+      sc = mockSimCode(Dict{String, Tuple{Integer, SC.SimVar}}(
+        "x" => (0, SC.SIMVAR("x", SOME(0), SC.ALG_VARIABLE(0), NONE())),
+        "p" => (1, SC.SIMVAR("p", SOME(1), SC.PARAMETER(NONE()), NONE())),
+        "s" => (2, SC.SIMVAR("s", SOME(2), SC.STATE(), NONE()))))
+      @test ejEqualsOracle(SC.BCONST(true), sc)
+      @test ejEqualsOracle(SC.ICONST(7), sc)
+      @test ejEqualsOracle(SC.RCONST(2.5), sc)
+      @test ejEqualsOracle(SC.SCONST("str"), sc)
+      @test ejEqualsOracle(SC.BINARY(SC.RCONST(2.0), SC.OP_ADD, SC.RCONST(3.0)), sc)
+      @test ejEqualsOracle(SC.UNARY(SC.OP_UMINUS, SC.RCONST(4.0)), sc)
+      @test ejEqualsOracle(SC.LBINARY(SC.BCONST(true), SC.OP_AND, SC.BCONST(false)), sc)
+      @test ejEqualsOracle(SC.RELATION(SC.RCONST(1.0), SC.OP_LESS, SC.RCONST(2.0), 0), sc)
+      @test ejEqualsOracle(simCref("x"), sc)                                          # ALG_VARIABLE
+      @test ejEqualsOracle(simCref("p"), sc)                                          # PARAMETER
+      @test ejEqualsOracle(simCref("s"), sc)                                          # STATE
+      @test ejEqualsOracle(simCref("time"), sc)                                       # time -> t
+      @test ejEqualsOracle(SC.BINARY(simCref("x"), SC.OP_MUL, SC.RCONST(2.0)), sc)    # cref inside expr
+      @test ejEqualsOracle(SC.IFEXP(SC.RELATION(simCref("x"), SC.OP_GREATER, SC.RCONST(0.0), 0),
+                                    SC.RCONST(1.0), SC.RCONST(2.0)), sc)              # IFEXP -> ifelse
+    end
+
+    @testset "_flagCanonicalExp! SIM-native == DAE oracle" begin
+      # SIM-native flagger must visit the same nodes (same violation count) as the DAE flagger
+      # on the projection — the per-node checks are shared via per-cref projection.
+      function flagCountEq(e)
+        local o1 = SC.SimCodeCheck.CheckViolation[]; SC.SimCodeCheck._flagCanonicalExp!(o1, e, "w")
+        local o2 = SC.SimCodeCheck.CheckViolation[]; SC.SimCodeCheck._flagCanonicalExp!(o2, SC.toDAEExp(e), "w")
+        return length(o1) == length(o2)
+      end
+      @test flagCountEq(simCref("x"))
+      @test flagCountEq(SC.BINARY(simCref("x"), SC.OP_ADD, SC.RCONST(1.0)))
+      @test flagCountEq(simCall("sin", simCref("x")))
+      @test flagCountEq(SC.IFEXP(SC.RELATION(simCref("x"), SC.OP_LESS, SC.RCONST(0.0), 0),
+                                 simCref("x"), SC.RCONST(1.0)))
+      @test flagCountEq(SC.UNARY(SC.OP_UMINUS, SC.BINARY(simCref("x"), SC.OP_MUL, simCref("x"))))
+    end
+
+    @testset "SimCodeCheck collectors/flaggers SIM-native == DAE oracle" begin
+      local SCC = SC.SimCodeCheck
+      function crefNamesEq(e, known)
+        local m1 = String[]; SCC._collectCrefNames!(m1, e, known)
+        local m2 = String[]; SCC._collectCrefNames!(m2, SC.toDAEExp(e), known)
+        return sort(m1) == sort(m2)
+      end
+      function derNamesEq(e)
+        local s1 = Set{String}(); SCC._collectDerFromExp!(s1, e)
+        local s2 = Set{String}(); SCC._collectDerFromExp!(s2, SC.toDAEExp(e))
+        return s1 == s2
+      end
+      function litDerPreEq(e)
+        local o1 = SCC.CheckViolation[]; SCC._flagLiteralInDerPre!(o1, e, "w")
+        local o2 = SCC.CheckViolation[]; SCC._flagLiteralInDerPre!(o2, SC.toDAEExp(e), "w")
+        return length(o1) == length(o2)
+      end
+      local kn = Set{String}(["x"])
+      @test crefNamesEq(simCref("x"), kn)                                                 # known -> no missing
+      @test crefNamesEq(simCref("y"), kn)                                                 # unknown -> missing
+      @test crefNamesEq(SC.BINARY(simCref("x"), SC.OP_ADD, simCref("z")), kn)
+      @test derNamesEq(simCall("der", daeCrefExp("x")))                                   # der(x) -> "x"
+      @test derNamesEq(SC.BINARY(simCall("der", daeCrefExp("x")), SC.OP_ADD, simCref("y")))
+      @test litDerPreEq(simCall("der", DAEx.RCONST(0.0)))                                 # der(literal) -> warn
+      @test litDerPreEq(simCall("der", daeCrefExp("x")))                                  # der(cref) -> no warn
+      @test litDerPreEq(simCall("pre", DAEx.ICONST(3)))                                   # pre(literal) -> warn
+    end
+
     @testset "SType conversions (toSimType / toDAEType)" begin
       # forward: DAE.Type -> SType category
       @test SC.toSimType(DAEx.T_REAL_DEFAULT)    isa SC.TYPE_REAL
@@ -309,6 +412,51 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       local p = SC.PARAMETER(SOME(SC.RCONST(1.0)))
       @test p.bindExp isa SOME && p.bindExp.data isa SC.Exp
       @test SC.ARRAY(Int[2]).bindExp === NONE()
+    end
+
+    @testset "collectCrefNames! SIM-native == DAE oracle" begin
+      crefNamesEq(e) = begin
+        s1 = Set{String}(); SC.collectCrefNames!(s1, e)
+        s2 = Set{String}(); SC.collectCrefNames!(s2, SC.toDAEExp(e))
+        s1 == s2
+      end
+      @test crefNamesEq(simCref("a"))
+      @test crefNamesEq(SC.BINARY(simCref("a"), SC.OP_ADD, simCref("b")))
+      @test crefNamesEq(SC.IFEXP(simCref("c"), simCref("t"), simCref("e")))
+      @test crefNamesEq(simCall("f", daeCrefExp("p"), daeCrefExp("q")))
+      @test crefNamesEq(SC.ARRAY_EXP(T_R, true, SC.Exp[simCref("u"), simCref("v")]))
+      @test crefNamesEq(SC.BINARY(simCall("g", daeCrefExp("x")), SC.OP_MUL,
+                                  SC.ASUB(simCref("M"), SC.Exp[SC.ICONST(2)])))
+      # ASUB-of-cref with constant subscripts reconstructs the scalarized key + base
+      local sA = Set{String}()
+      SC.collectCrefNames!(sA, SC.ASUB(simCref("R_T"), SC.Exp[SC.ICONST(1), SC.ICONST(1)]))
+      @test "R_T[1][1]" in sA && "R_T" in sA
+      @test crefNamesEq(SC.ASUB(simCref("R_T"), SC.Exp[SC.ICONST(1), SC.ICONST(1)]))
+    end
+
+    @testset "_collectIfexpConditionCrefs! SIM-native == DAE oracle" begin
+      ifCondEq(e) = begin
+        s1 = Set{String}(); SC._collectIfexpConditionCrefs!(s1, e)
+        s2 = Set{String}(); SC._collectIfexpConditionCrefs!(s2, SC.toDAEExp(e))
+        s1 == s2
+      end
+      @test ifCondEq(SC.IFEXP(simCref("p"), simCref("t"), simCref("e")))
+      @test ifCondEq(SC.IFEXP(simCref("a"), SC.IFEXP(simCref("b"), simCref("c"), simCref("d")), simCref("e")))
+      @test ifCondEq(SC.IFEXP(SC.IFEXP(simCref("b"), simCref("c"), simCref("d")), simCref("s"), simCref("t")))
+      @test ifCondEq(SC.BINARY(SC.IFEXP(simCref("x"), simCref("y"), simCref("z")), SC.OP_ADD, simCref("w")))
+      @test ifCondEq(SC.BINARY(simCref("m"), SC.OP_ADD, simCref("n")))
+      # at a single IFEXP only the condition's crefs are collected, not the branches
+      local sI = Set{String}()
+      SC._collectIfexpConditionCrefs!(sI, SC.IFEXP(simCref("p"), simCref("t"), simCref("e")))
+      @test sI == Set(["p"])
+    end
+
+    @testset "evalDAEConstant SIM-native literal fast-path" begin
+      for (sim, val) in Any[(SC.RCONST(2.5), 2.5), (SC.ICONST(3), 3),
+                            (SC.BCONST(true), true), (SC.SCONST("hi"), "hi")]
+        @test CG.evalDAEConstant(sim) == CG.evalDAEConstant(SC.toDAEExp(sim))
+        @test CG.evalDAEConstant(sim) == val
+      end
     end
 
   end
