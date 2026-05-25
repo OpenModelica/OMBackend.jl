@@ -816,7 +816,7 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::SimulationC
   return expToJuliaExpAlg(SimulationCode.toDAEExp(exp))
 end
 
-function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
+Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
   local expr::Expr = begin
     local int::Int64
     local real::Float64
@@ -1118,7 +1118,7 @@ end
   generated closure rather than relying on OMRuntimeExternalC being in scope
   at runtime.
 """
-function namespaceifyExternalFunction(expr::Expr)
+Base.@nospecializeinfer function namespaceifyExternalFunction(@nospecialize(expr::Expr))
   #= Meta.parse may wrap in :toplevel -- unwrap it =#
   if expr.head == :toplevel && length(expr.args) == 1 && expr.args[1] isa Expr
     expr = expr.args[1]

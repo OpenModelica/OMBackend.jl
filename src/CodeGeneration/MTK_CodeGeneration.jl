@@ -460,7 +460,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     using ModelingToolkit
     using DifferentialEquations
     using DiffEqCallbacks
-    Base.Experimental.@compiler_options optimize=0 compile=min
+    Base.Experimental.@compiler_options optimize=0 compile=min infer=false
     $(createStringParameterAssignments(simCode)...)
     $(createArrayParameterPrelude(simCode)...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
@@ -584,7 +584,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     using OrdinaryDiffEq
     using Symbolics
     using OMBackend
-    Base.Experimental.@compiler_options optimize=0 compile=min
+    Base.Experimental.@compiler_options optimize=0 compile=min infer=false
     #= Add import to the external runtime if the generated code calls Modelica Functions =#
     $(if simCode.externalRuntime
         generateExternalRuntimeImport()

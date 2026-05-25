@@ -1769,7 +1769,7 @@ function buildAsubName(baseName::String, subs)::String
   buf = baseName
   for s in subs
     @match s begin
-      DAE.ICONST(i) => begin buf *= string("[", i, "]") end
+      DAE.ICONST(i) => begin buf *= Base.string("[", i, "]") end
       _ => return ""  #= Non-constant subscript: cannot resolve statically =#
     end
   end
@@ -3253,7 +3253,7 @@ function propagateConstants(simCode::SIM_CODE)
          so that chained constant patterns are revealed in the next iteration =#
       local updatedEqs = RESIDUAL_EQUATION[]
       for (i, eq) in enumerate(resEqs)
-        local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteAliasCref, constMap)
+        local (newExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
         push!(updatedEqs, typeof(eq)(newExp, eq.source, eq.attr))
       end
       resEqs = updatedEqs
@@ -3296,7 +3296,7 @@ function propagateConstants(simCode::SIM_CODE)
         push!(elimPairs, (eqIdxToUnknown[i], eq))
       end
     else
-      local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteAliasCref, constMap)
+      local (newExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
       push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
     end
   end
@@ -3309,10 +3309,10 @@ function propagateConstants(simCode::SIM_CODE)
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = Util.traverseExpTopDown(toDAEExp(brEq.exp), substituteAliasCref, constMap)
+        local (newBrExp, _) = traverseExpTopDown(brEq.exp, substituteAliasCref, constMap)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
-      local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, constMap)
+      local (newCond, _) = traverseExpTopDown(branch.condition, substituteAliasCref, constMap)
       push!(newBranches, BRANCH(newCond, newBranchEqs,
                                 branch.identifier, branch.targets, branch.isSingular,
                                 branch.matchOrder, branch.equationGraph, branch.sccs,
@@ -3325,7 +3325,7 @@ function propagateConstants(simCode::SIM_CODE)
   local newWhenEqs = WHEN_EQUATION[]
   for whenEq in simCode.whenEquations
     local innerWhen = whenEq.whenEquation
-    local (newCond, _) = Util.traverseExpTopDown(toDAEExp(innerWhen.condition), substituteAliasCref, constMap)
+    local (newCond, _) = traverseExpTopDown(innerWhen.condition, substituteAliasCref, constMap)
     @assign innerWhen.condition = toSimExp(newCond)
     @assign whenEq.whenEquation = innerWhen
     push!(newWhenEqs, whenEq)
@@ -3777,7 +3777,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     if i in aliasEqIndices
       push!(elimEqs, eq)
     else
-      local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteAliasCref, aliasMap)
+      local (newExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
       push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
     end
   end
@@ -3789,10 +3789,10 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = Util.traverseExpTopDown(toDAEExp(brEq.exp), substituteAliasCref, aliasMap)
+        local (newBrExp, _) = traverseExpTopDown(brEq.exp, substituteAliasCref, aliasMap)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
-      local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, aliasMap)
+      local (newCond, _) = traverseExpTopDown(branch.condition, substituteAliasCref, aliasMap)
       #= Reconstruct BRANCH with substituted expressions but same structural info =#
       push!(newBranches, BRANCH(newCond, newBranchEqs,
                                 branch.identifier, branch.targets, branch.isSingular,
@@ -4456,7 +4456,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   #= Step 2: substitute throughout every equation container. =#
   local newResiduals = RESIDUAL_EQUATION[]
   for eq in simCode.residualEquations
-    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteConstantParameter, paramValueMap)
+    local (newExp, _) = traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
     push!(newResiduals, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
@@ -4485,10 +4485,10 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = Util.traverseExpTopDown(toDAEExp(brEq.exp), substituteConstantParameter, paramValueMap)
+        local (newBrExp, _) = traverseExpTopDown(brEq.exp, substituteConstantParameter, paramValueMap)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
-      local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteConstantParameter, paramValueMap)
+      local (newCond, _) = traverseExpTopDown(branch.condition, substituteConstantParameter, paramValueMap)
       push!(newBranches, BRANCH(newCond, newBranchEqs,
                                 branch.identifier, branch.targets, branch.isSingular,
                                 branch.matchOrder, branch.equationGraph, branch.sccs,
@@ -4508,7 +4508,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   # eliminated-parameter element refs to avoid dangling identifiers
   local newElimEqs = RESIDUAL_EQUATION[]
   for eq in simCode.eliminatedEquations
-    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteConstantParameter, paramValueMap)
+    local (newExp, _) = traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
     push!(newElimEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
@@ -4849,24 +4849,67 @@ function substituteConstantParameter(@nospecialize(exp), paramValueMap)
   end
 end
 
+#= SIM-native dispatch: replace a matched parameter cref with a typed literal,
+   reading the literal kind from EXP_CREF.ty; only the matched leaf converts. =#
+function substituteConstantParameter(exp::EXP_CREF, paramValueMap)
+  local name = DAE_identifierToString(toDAECref(exp.cref).componentRef)
+  if haskey(paramValueMap, name)
+    local v = paramValueMap[name]
+    local literalExp = exp.ty isa DAE.T_REAL    ? RCONST(v) :
+                       exp.ty isa DAE.T_INTEGER ? ICONST(Int(round(v))) :
+                       exp.ty isa DAE.T_BOOL    ? BCONST(v != 0.0) : RCONST(v)
+    return (literalExp, false, paramValueMap)
+  end
+  return (exp, true, paramValueMap)
+end
+
+function substituteConstantParameter(exp::ASUB, paramValueMap)
+  local name = _asubCanonicalNameSIM(exp)
+  if name !== nothing && haskey(paramValueMap, name)
+    return (RCONST(paramValueMap[name]), false, paramValueMap)
+  end
+  return (exp, true, paramValueMap)
+end
+
+substituteConstantParameter(exp::Exp, paramValueMap) = (exp, true, paramValueMap)
+
+# SIM-native mirror of _asubCanonicalName: nested ASUB over EXP_CREF with constant subs.
+function _asubCanonicalNameSIM(@nospecialize(e))::Union{Nothing,String}
+  if e isa EXP_CREF
+    return DAE_identifierToString(toDAECref(e.cref).componentRef)
+  elseif e isa ASUB
+    local innerName = _asubCanonicalNameSIM(e.exp)
+    innerName === nothing && return nothing
+    local idxParts = String[]
+    for s in e.subs
+      local v = s isa ICONST ? s.value :
+                (s isa RCONST && s.value == round(s.value)) ? Int(round(s.value)) : nothing
+      v === nothing && return nothing
+      push!(idxParts, Base.string("[", v, "]"))
+    end
+    return Base.string(innerName, idxParts...)
+  end
+  return nothing
+end
+
 """
 Recursively substitute eliminated-parameter CREFs in a WHEN_STMTS node.
 Mirrors `_substituteAliasInWhenStmts` but with `substituteConstantParameter`.
 """
 function _substituteParamInWhenStmts(whenStmts::WHEN_STMTS, paramValueMap)
-  local (newCond, _) = Util.traverseExpTopDown(toDAEExp(whenStmts.condition), substituteConstantParameter, paramValueMap)
+  local (newCond, _) = traverseExpTopDown(whenStmts.condition, substituteConstantParameter, paramValueMap)
   local newStmtLst = WhenOperator[]
   for stmt in whenStmts.whenStmtLst
     local newStmt::WhenOperator = if stmt isa ASSIGN
-      local (newL, _) = Util.traverseExpTopDown(stmt.left, substituteConstantParameter, paramValueMap)
-      local (newR, _) = Util.traverseExpTopDown(stmt.right, substituteConstantParameter, paramValueMap)
+      local (newL, _) = traverseExpTopDown(stmt.left, substituteConstantParameter, paramValueMap)
+      local (newR, _) = traverseExpTopDown(stmt.right, substituteConstantParameter, paramValueMap)
       ASSIGN(newL, newR, stmt.source)
     elseif stmt isa REINIT
       local (newSV, _) = Util.traverseExpTopDown(stmt.stateVar, substituteConstantParameter, paramValueMap)
-      local (newVal, _) = Util.traverseExpTopDown(stmt.value, substituteConstantParameter, paramValueMap)
+      local (newVal, _) = traverseExpTopDown(stmt.value, substituteConstantParameter, paramValueMap)
       REINIT(newSV, newVal, stmt.source)
     elseif stmt isa NORETCALL
-      local (newExp, _) = Util.traverseExpTopDown(stmt.exp, substituteConstantParameter, paramValueMap)
+      local (newExp, _) = traverseExpTopDown(stmt.exp, substituteConstantParameter, paramValueMap)
       NORETCALL(newExp, stmt.source)
     else
       stmt
@@ -4913,23 +4956,23 @@ end
 Recursively substitute alias CREFs in a WHEN_STMTS node (condition + statements + elsewhen).
 """
 function _substituteAliasInWhenStmts(whenStmts::WHEN_STMTS, aliasMap)
-  local (newCond, _) = Util.traverseExpTopDown(toDAEExp(whenStmts.condition), substituteAliasCref, aliasMap)
+  local (newCond, _) = traverseExpTopDown(whenStmts.condition, substituteAliasCref, aliasMap)
   local newStmtLst = WhenOperator[]
   for stmt in whenStmts.whenStmtLst
     local newStmt::WhenOperator = if stmt isa ASSIGN
-      local (newL, _) = Util.traverseExpTopDown(stmt.left, substituteAliasCref, aliasMap)
-      local (newR, _) = Util.traverseExpTopDown(stmt.right, substituteAliasCref, aliasMap)
+      local (newL, _) = traverseExpTopDown(stmt.left, substituteAliasCref, aliasMap)
+      local (newR, _) = traverseExpTopDown(stmt.right, substituteAliasCref, aliasMap)
       ASSIGN(newL, newR, stmt.source)
     elseif stmt isa REINIT
       local (newSV, _) = Util.traverseExpTopDown(stmt.stateVar, substituteAliasCref, aliasMap)
-      local (newVal, _) = Util.traverseExpTopDown(stmt.value, substituteAliasCref, aliasMap)
+      local (newVal, _) = traverseExpTopDown(stmt.value, substituteAliasCref, aliasMap)
       REINIT(newSV, newVal, stmt.source)
     elseif stmt isa NORETCALL
-      local (newExp, _) = Util.traverseExpTopDown(stmt.exp, substituteAliasCref, aliasMap)
+      local (newExp, _) = traverseExpTopDown(stmt.exp, substituteAliasCref, aliasMap)
       NORETCALL(newExp, stmt.source)
     elseif stmt isa ASSERT
-      local (newC, _) = Util.traverseExpTopDown(stmt.condition, substituteAliasCref, aliasMap)
-      local (newM, _) = Util.traverseExpTopDown(stmt.message, substituteAliasCref, aliasMap)
+      local (newC, _) = traverseExpTopDown(stmt.condition, substituteAliasCref, aliasMap)
+      local (newM, _) = traverseExpTopDown(stmt.message, substituteAliasCref, aliasMap)
       ASSERT(newC, newM, stmt.level, stmt.source)
     else
       stmt
@@ -5260,6 +5303,92 @@ function substituteAliasCref(@nospecialize(exp), aliasMap)
   end
 end
 
+#= SIM-native dispatch so traverseExpTopDown can substitute aliases without a
+   whole-tree DAE round-trip; aliasMap stays DAE-cref-valued, only the matched
+   leaf cref is converted. =#
+function substituteAliasCref(exp::EXP_CREF, aliasMap)
+  local name = DAE_identifierToString(toDAECref(exp.cref).componentRef)
+  if haskey(aliasMap, name)
+    local (_, negated, repCref, repTy) = aliasMap[name]
+    local newExp = EXP_CREF(SimCref(repCref), repTy)
+    return (negated ? UNARY(OP_UMINUS, newExp) : newExp, false, aliasMap)
+  end
+  return (exp, true, aliasMap)
+end
+
+substituteAliasCref(exp::Exp, aliasMap) = (exp, true, aliasMap)
+
+function substituteAliasCref(exp::CALL, aliasMap)
+  local fnName = @match exp.path begin
+    Absyn.IDENT(n) => n
+    _ => ""
+  end
+  if _isUnaryStateBuiltin(fnName) && _hasNegatedAliasArgSIM(exp.args, aliasMap)
+    local newCall = CALL(exp.path, _substituteAliasInBuiltinArgsSIM(exp.args, aliasMap), exp.attr)
+    return (UNARY(OP_UMINUS, newCall), false, aliasMap)
+  end
+  return (exp, true, aliasMap)
+end
+
+function substituteAliasCref(exp::ASUB, aliasMap)
+  exp.exp isa EXP_CREF || return (exp, true, aliasMap)
+  local baseName = DAE_identifierToString(toDAECref(exp.exp.cref).componentRef)
+  local fullName = buildAsubName(baseName, _subsToDAE(exp.subs))
+  if !isempty(fullName) && haskey(aliasMap, fullName)
+    local (repName, negated, repCref, repTy) = aliasMap[fullName]
+    local newExp = replace(repName, r"\[.*" => "") != repName ?
+      ASUB(EXP_CREF(SimCref(repCref), repTy), _parseSubsSIM(repName)) :
+      EXP_CREF(SimCref(repCref), repTy)
+    return (negated ? UNARY(OP_UMINUS, newExp) : newExp, false, aliasMap)
+  end
+  if haskey(aliasMap, baseName)
+    local (_, negated, repCref, repTy) = aliasMap[baseName]
+    local newExp = ASUB(EXP_CREF(SimCref(repCref), repTy), exp.subs)
+    return (negated ? UNARY(OP_UMINUS, newExp) : newExp, false, aliasMap)
+  end
+  return (exp, true, aliasMap)
+end
+
+# SIM-native mirrors of _aliasLookupName / _hasNegatedAliasArg / _substituteAliasInBuiltinArgs.
+_subsToDAE(subs) = DAE.Exp[toDAEExp(s) for s in subs]
+_parseSubsSIM(name::String) = Exp[ICONST(parse(Int, m.captures[1])) for m in eachmatch(r"\[(\d+)\]", name)]
+
+function _aliasLookupNameSIM(@nospecialize(e))::Union{Nothing,String}
+  if e isa EXP_CREF
+    return DAE_identifierToString(toDAECref(e.cref).componentRef)
+  elseif e isa ASUB && e.exp isa EXP_CREF
+    local baseName = DAE_identifierToString(toDAECref(e.exp.cref).componentRef)
+    local full = buildAsubName(baseName, _subsToDAE(e.subs))
+    return isempty(full) ? baseName : full
+  end
+  return nothing
+end
+
+function _hasNegatedAliasArgSIM(args, aliasMap)::Bool
+  for a in args
+    local n = _aliasLookupNameSIM(a)
+    n === nothing && continue
+    haskey(aliasMap, n) || continue
+    aliasMap[n][2] && return true
+  end
+  return false
+end
+
+function _substituteAliasInBuiltinArgsSIM(args, aliasMap)
+  local rebuilt = Exp[]
+  for a in args
+    local n = _aliasLookupNameSIM(a)
+    if n === nothing || !haskey(aliasMap, n)
+      push!(rebuilt, a)
+      continue
+    end
+    local (_, _, repCref, repTy) = aliasMap[n]
+    local newCref = EXP_CREF(SimCref(repCref), repTy)
+    push!(rebuilt, (a isa ASUB && !isempty(a.subs)) ? ASUB(newCref, a.subs) : newCref)
+  end
+  return rebuilt
+end
+
 _isUnaryStateBuiltin(fnName::String)::Bool =
   fnName == "der" || fnName == "pre" || fnName == "edge" || fnName == "change"
 
@@ -5568,7 +5697,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   sizehint!(newResEqs, length(resEqs) - length(removeEqs))
   for (i, eq) in enumerate(resEqs)
     i in removeEqs && continue
-    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteAliasCref, aliasMap)
+    local (newExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
     push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
@@ -5582,10 +5711,10 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = Util.traverseExpTopDown(toDAEExp(brEq.exp), substituteAliasCref, aliasMap)
+        local (newBrExp, _) = traverseExpTopDown(brEq.exp, substituteAliasCref, aliasMap)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
-      local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, aliasMap)
+      local (newCond, _) = traverseExpTopDown(branch.condition, substituteAliasCref, aliasMap)
       push!(newBranches, BRANCH(newCond, newBranchEqs,
                                 branch.identifier, branch.targets, branch.isSingular,
                                 branch.matchOrder, branch.equationGraph, branch.sccs,
@@ -5630,7 +5759,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   local rewrittenElimEqs = RESIDUAL_EQUATION[]
   sizehint!(rewrittenElimEqs, length(oldElimEqs))
   for eq in oldElimEqs
-    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteAliasCref, aliasMap)
+    local (newExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
     push!(rewrittenElimEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
@@ -5676,6 +5805,16 @@ function _extractNumericValue(@nospecialize(exp))
     _ => nothing
   end
 end
+
+# SIM-native dispatch.
+_extractNumericValue(e::RCONST) = e.value
+_extractNumericValue(e::ICONST) = Float64(e.value)
+function _extractNumericValue(e::UNARY)
+  e.op === OP_UMINUS || return nothing
+  local v = _extractNumericValue(e.exp)
+  return v === nothing ? nothing : -v
+end
+_extractNumericValue(e::Exp) = nothing
 
 #= Fold numeric subexpressions in a DAE.Exp tree. Bottom-up evaluation:
    when both operands of a BINARY are numeric literals, replace with the
@@ -5753,6 +5892,55 @@ function _foldNumericExp(@nospecialize(exp))
     _ => exp
   end
 end
+
+# SIM-native dispatch: mirrors the DAE folder over SC.Exp variants.
+function _foldNumericExp(e::BINARY)
+  local f1 = _foldNumericExp(e.exp1)
+  local f2 = _foldNumericExp(e.exp2)
+  local v1 = _extractNumericValue(f1)
+  local v2 = _extractNumericValue(f2)
+  if v1 !== nothing && v2 !== nothing
+    e.op === OP_ADD && return RCONST(v1 + v2)
+    e.op === OP_SUB && return RCONST(v1 - v2)
+    e.op === OP_MUL && return RCONST(v1 * v2)
+    (e.op === OP_DIV && v2 != 0) && return RCONST(v1 / v2)
+  end
+  if e.op === OP_MUL
+    (v1 !== nothing && v1 == 0) && return RCONST(0.0)
+    (v2 !== nothing && v2 == 0) && return RCONST(0.0)
+    (v1 !== nothing && v1 == 1) && return f2
+    (v2 !== nothing && v2 == 1) && return f1
+  elseif e.op === OP_ADD
+    (v1 !== nothing && v1 == 0) && return f2
+    (v2 !== nothing && v2 == 0) && return f1
+  elseif e.op === OP_SUB
+    (v2 !== nothing && v2 == 0) && return f1
+  elseif e.op === OP_DIV
+    (v2 !== nothing && v2 == 1) && return f1
+  end
+  return BINARY(f1, e.op, f2)
+end
+
+function _foldNumericExp(e::UNARY)
+  local fin = _foldNumericExp(e.exp)
+  local vin = _extractNumericValue(fin)
+  (vin !== nothing && e.op === OP_UMINUS) && return RCONST(-vin)
+  return UNARY(e.op, fin)
+end
+
+function _foldNumericExp(e::CALL)
+  local fnName = @match e.path begin
+    Absyn.IDENT(n) => n
+    _ => ""
+  end
+  if fnName == "der" && !isempty(e.args)
+    local fin = _foldNumericExp(e.args[1])
+    _extractNumericValue(fin) !== nothing && return RCONST(0.0)
+  end
+  return e
+end
+
+_foldNumericExp(e::Exp) = e
 
 #= Peel structurally-trivial wrappers around a sub-expression. Used by
    `_detectFrozenState` so equations emitted with redundant `* 1.0` or
@@ -5952,6 +6140,30 @@ function _substituteFrozenState(@nospecialize(exp), frozenMap)
   end
 end
 
+#= SIM-native dispatch: der(frozen state) -> 0, frozen cref -> its (DAE) value
+   converted to SIM; only the matched leaf converts. =#
+function _substituteFrozenState(exp::CALL, frozenMap)
+  local fnName = @match exp.path begin
+    Absyn.IDENT(n) => n
+    _ => ""
+  end
+  if fnName == "der" && !isempty(exp.args) && exp.args[1] isa EXP_CREF
+    local n = DAE_identifierToString(toDAECref(exp.args[1].cref).componentRef)
+    haskey(frozenMap, n) && return (RCONST(0.0), false, frozenMap)
+  end
+  return (exp, true, frozenMap)
+end
+
+function _substituteFrozenState(exp::EXP_CREF, frozenMap)
+  local n = DAE_identifierToString(toDAECref(exp.cref).componentRef)
+  if haskey(frozenMap, n)
+    return (toSimExp(frozenMap[n]), false, frozenMap)
+  end
+  return (exp, true, frozenMap)
+end
+
+_substituteFrozenState(exp::Exp, frozenMap) = (exp, true, frozenMap)
+
 #= Eliminate variables that are algebraically pinned to a numeric literal.
    Two flavours, both covered:
 
@@ -6091,7 +6303,7 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::Set{St
   sizehint!(newResEqs, length(resEqs) - length(removeEqs))
   for (i, eq) in enumerate(resEqs)
     i in removeEqs && continue
-    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), _substituteFrozenState, frozenMap)
+    local (newExp, _) = traverseExpTopDown(eq.exp, _substituteFrozenState, frozenMap)
     #= Constant-fold after substitution: `0.0 * x` and friends now reduce
        to 0 so the residual becomes a clean `0 = -y - 0` form that the
        next iteration can detect as a pin. =#
@@ -6222,12 +6434,12 @@ function substituteFoldedVar(@nospecialize(exp), foldMap::Dict{String, DAE.Exp})
           local suffix = ""
           for s in subs
             @match s begin
-              DAE.ICONST(i) => begin suffix *= string("[", i, "]") end
+              DAE.ICONST(i) => begin suffix *= Base.string("[", i, "]") end
               _ => begin allConst = false end
             end
           end
           if allConst && !isempty(suffix)
-            local fullName = string(baseName, suffix)
+            local fullName = Base.string(baseName, suffix)
             if haskey(foldMap, fullName)
               return (foldMap[fullName], false, foldMap)
             end
@@ -6243,6 +6455,42 @@ function substituteFoldedVar(@nospecialize(exp), foldMap::Dict{String, DAE.Exp})
     _ => return (exp, true, foldMap)
   end
 end
+
+#= SIM-native dispatch: replace a matched folded cref/ASUB with the foldMap's
+   replacement, converted to SIM via toSimExp (replacement applied once). =#
+function substituteFoldedVar(exp::EXP_CREF, foldMap::Dict{String, DAE.Exp})
+  local name = DAE_identifierToString(toDAECref(exp.cref).componentRef)
+  if haskey(foldMap, name)
+    return (toSimExp(foldMap[name]), false, foldMap)
+  end
+  return (exp, true, foldMap)
+end
+
+function substituteFoldedVar(exp::ASUB, foldMap::Dict{String, DAE.Exp})
+  exp.exp isa EXP_CREF || return (exp, true, foldMap)
+  local baseName = DAE_identifierToString(toDAECref(exp.exp.cref).componentRef)
+  local allConst = true
+  local suffix = ""
+  for s in exp.subs
+    if s isa ICONST
+      suffix *= Base.string("[", s.value, "]")
+    else
+      allConst = false
+    end
+  end
+  if allConst && !isempty(suffix)
+    local fullName = Base.string(baseName, suffix)
+    if haskey(foldMap, fullName)
+      return (toSimExp(foldMap[fullName]), false, foldMap)
+    end
+  end
+  if haskey(foldMap, baseName)
+    return (toSimExp(foldMap[baseName]), false, foldMap)
+  end
+  return (exp, true, foldMap)
+end
+
+substituteFoldedVar(exp::Exp, foldMap::Dict{String, DAE.Exp}) = (exp, true, foldMap)
 
 """
     foldExplicitSingleAssign(simCode) -> simCode
@@ -6350,7 +6598,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
   sizehint!(newResEqs, length(resEqs) - length(foldEqIdxSet))
   for (i, eq) in enumerate(resEqs)
     i in foldEqIdxSet && continue
-    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteFoldedVar, foldMap)
+    local (newExp, _) = traverseExpTopDown(eq.exp, substituteFoldedVar, foldMap)
     newExp = _foldNumericExp(newExp)
     push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
@@ -6384,10 +6632,10 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = Util.traverseExpTopDown(toDAEExp(brEq.exp), substituteFoldedVar, foldMap)
+        local (newBrExp, _) = traverseExpTopDown(brEq.exp, substituteFoldedVar, foldMap)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
-      local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteFoldedVar, foldMap)
+      local (newCond, _) = traverseExpTopDown(branch.condition, substituteFoldedVar, foldMap)
       push!(newBranches, BRANCH(newCond, newBranchEqs,
                                 branch.identifier, branch.targets, branch.isSingular,
                                 branch.matchOrder, branch.equationGraph, branch.sccs,
@@ -6398,7 +6646,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
 
   local newElimEqs = RESIDUAL_EQUATION[]
   for eq in simCode.eliminatedEquations
-    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteFoldedVar, foldMap)
+    local (newExp, _) = traverseExpTopDown(eq.exp, substituteFoldedVar, foldMap)
     push!(newElimEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 

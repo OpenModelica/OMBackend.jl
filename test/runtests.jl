@@ -347,4 +347,7 @@ import .ExampleDAEs
     end
   end
 
+  #= ── 6. SimCode Exp traversal + alias substitution ────────────── =#
+  include("simCodeTraverseTests.jl")
+
 end

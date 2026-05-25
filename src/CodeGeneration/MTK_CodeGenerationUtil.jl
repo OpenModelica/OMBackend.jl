@@ -459,6 +459,14 @@ end
      mechanical mirror of the matching `DAE.X` arm in the long
      function below; do it variant-by-variant so each landing is
      small and testable. =#
+"""
+    expToJuliaExpMTK(exp::SimulationCode.Exp, simCode; varPrefix="", varSuffix="", derSymbol=false)::Expr
+
+SIM-Exp method. Emits an MTK `Expr` for a `SimulationCode.Exp`: scalars and
+operators directly, complex shapes (EXP_CREF/CALL/ASUB/ARRAY_EXP/RECORD/TSUB)
+by delegating to the `::DAE.Exp` method below via `toDAEExp`. `varPrefix`/
+`varSuffix` affix emitted cref names; `derSymbol` emits derivatives as a symbol.
+"""
 Base.@nospecializeinfer function expToJuliaExpMTK(@nospecialize(exp::SimulationCode.Exp),
                           simCode::SimulationCode.SIM_CODE;
                           varSuffix = "", varPrefix = "",
@@ -630,8 +638,12 @@ Base.@nospecializeinfer function expToJuliaExpMTK(@nospecialize(exp::SimulationC
 end
 
 """
-Converts a DAE expression into a MTK expression.
-varPrefix and varSuffix can be used to provide a prefix and a suffix to component reference.
+    expToJuliaExpMTK(exp::DAE.Exp, simCode; varPrefix="", varSuffix="", derSymbol=false)::Expr
+
+DAE-Exp method (the bulk emitter). Converts a `DAE.Exp` into an MTK `Expr`. The
+`SimulationCode.Exp` method above dispatches here via `toDAEExp` for shapes it
+does not handle natively. `varPrefix`/`varSuffix` affix emitted cref names;
+`derSymbol` emits derivatives as a symbol.
 """
 function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                           simCode::SimulationCode.SIM_CODE;

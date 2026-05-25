@@ -35,9 +35,6 @@
 """
 module SimulationCode
 
-# Phase 4b unblocker; remove once recursive Exp walkers are split per-variant.
-Base.Experimental.@compiler_options compile=min infer=false optimize=0
-
 using MetaModelica
 using DataStructures
 using Setfield
