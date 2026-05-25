@@ -9,6 +9,7 @@ using Test
 SC    = OMBackend.SimulationCode
 Util  = OMBackend.FrontendUtil.Util
 DAEx  = OMBackend.DAE
+CG    = OMBackend.CodeGeneration
 
 T_R = DAEx.T_REAL(nil)
 
@@ -55,6 +56,35 @@ function fsEqualsOracle(e, m)
   (daeOut, _) = Util.traverseExpTopDown(SC.toDAEExp(e), SC._substituteFrozenState, m)
   (simOut, _) = SC.traverseExpTopDown(e, SC._substituteFrozenState, m)
   return daeStructEq(SC.toDAEExp(simOut), daeOut)
+end
+
+# Minimal mock SIM_CODE so the codegen path (expToJuliaExpMTK) can be unit-tested
+# without a full translate: only stringToSimVarHT is exercised by the arms under test.
+function mockSimCode(ht)
+  return SC.SIM_CODE("mock", ht,
+    SC.RESIDUAL_EQUATION[], SC.Equation[], SC.WHEN_EQUATION[], SC.IF_EQUATION[],
+    false, Int[], SC.Graphs.SimpleDiGraph(0), [], SC.StructuralTransition[], [],
+    String[], String[], SC.Equation[], "mock", NONE(), NONE(), String[],
+    SC.ModelicaFunction[], false, SC.RESIDUAL_EQUATION[], String[], SC.AliasEntry[],
+    nothing, SC.INITIAL_ALGORITHM[])
+end
+
+# Expr equality ignoring source-location decoration and semantically-transparent
+# single-expression `begin … end` wrappers (the DAE emitter wraps some arm results
+# in a block; the SIM arms return the bare expression — both evaluate identically).
+function _unwrapTrivialBlocks(x)
+  x isa Expr || return x
+  if x.head === :block && length(x.args) == 1
+    return _unwrapTrivialBlocks(x.args[1])
+  end
+  return Expr(x.head, Any[_unwrapTrivialBlocks(a) for a in x.args]...)
+end
+_normExpr(x) = _unwrapTrivialBlocks(Base.remove_linenums!(deepcopy(x)))
+exprEq(a, b) = _normExpr(a) == _normExpr(b)
+
+# Differential: SIM-native expToJuliaExpMTK must match the DAE.Exp emitter (the arms mirror it).
+function e2jEqualsOracle(e, sc)
+  return exprEq(CG.expToJuliaExpMTK(e, sc), CG.expToJuliaExpMTK(SC.toDAEExp(e), sc))
 end
 
 # function-call construction: build via DAE then toSimExp so CallAttributes are realistic
@@ -207,6 +237,22 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       @test fsEqualsOracle(simCall("der", daeCrefExp("s")), fzmap)                   # der(frozen) -> 0
       @test fsEqualsOracle(simCall("der", daeCrefExp("y")), fzmap)                   # der(non-frozen) unchanged
       @test fsEqualsOracle(SC.BINARY(simCref("s"), SC.OP_ADD, SC.RCONST(1.0)), fzmap) # frozen in BINARY
+    end
+
+    @testset "expToJuliaExpMTK SIM-native == DAE oracle" begin
+      sc = mockSimCode(Dict{String, Tuple{Integer, SC.SimVar}}(
+        "x" => (0, SC.SIMVAR("x", SOME(0), SC.ALG_VARIABLE(0), NONE()))))
+      @test e2jEqualsOracle(SC.BCONST(true), sc)
+      @test e2jEqualsOracle(SC.ICONST(7), sc)
+      @test e2jEqualsOracle(SC.RCONST(2.5), sc)
+      @test e2jEqualsOracle(SC.BINARY(SC.RCONST(2.0), SC.OP_ADD, SC.RCONST(3.0)), sc)
+      @test e2jEqualsOracle(SC.UNARY(SC.OP_UMINUS, SC.RCONST(4.0)), sc)
+      @test e2jEqualsOracle(SC.RELATION(SC.RCONST(1.0), SC.OP_LESS, SC.RCONST(2.0), 0), sc)
+      @test e2jEqualsOracle(SC.LBINARY(SC.BCONST(true), SC.OP_AND, SC.BCONST(false)), sc)
+      @test e2jEqualsOracle(simCref("x"), sc)                                          # EXP_CREF via mock HT
+      @test e2jEqualsOracle(SC.BINARY(simCref("x"), SC.OP_MUL, SC.RCONST(2.0)), sc)    # cref inside expr
+      @test e2jEqualsOracle(SC.IFEXP(SC.RELATION(simCref("x"), SC.OP_GREATER, SC.RCONST(0.0), 0),
+                                     SC.RCONST(1.0), SC.RCONST(2.0)), sc)
     end
 
   end
