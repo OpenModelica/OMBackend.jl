@@ -881,7 +881,7 @@ function rebuildMatchOrder(simCode::SIM_CODE)
   #= Build bipartite adjacency: for each equation, which variable match indices does it reference? =#
   local eqVarMapping = DataStructures.OrderedDict{String, Vector{Int}}()
   for eqI in 1:nEqs
-    local refs = collectEquationVarNames(resEqs[eqI].exp, ht, baseNameToFullNames)
+    local refs = collectEquationVarNames(toDAEExp(resEqs[eqI].exp), ht, baseNameToFullNames)
     local indices = Int[]
     for refName in refs
       if haskey(nameToMatchIdx, refName)
@@ -931,6 +931,11 @@ but do not feed back into any state derivative).
 """
 #= Recursively collect all CREF variable names referenced in a DAE expression. =#
 function collectCrefNames!(names::Set{String}, @nospecialize(exp))
+  # @match arms are DAE.* only; convert SIM-native Exp (e.g. BRANCH.condition,
+  # when-stmt operands post-Phase-4b) so cref names are still collected.
+  if exp isa Exp
+    return collectCrefNames!(names, toDAEExp(exp))
+  end
   @match exp begin
     DAE.CREF(cr, _) => begin
       push!(names, DAE_identifierToString(cr))
@@ -1046,13 +1051,14 @@ function _isSyntacticZeroResidual(@nospecialize(exp))::Bool
 end
 
 function _isTrivialResidualEquation(eq::Union{BDAE.RESIDUAL_EQUATION, RESIDUAL_EQUATION}, simCode::SIM_CODE)::Bool
-  if _hasUnknownCref(eq.exp, simCode.stringToSimVarHT)
+  local expDAE = toDAEExp(eq.exp)
+  if _hasUnknownCref(expDAE, simCode.stringToSimVarHT)
     return false
   end
-  if _isSyntacticZeroResidual(eq.exp)
+  if _isSyntacticZeroResidual(expDAE)
     return true
   end
-  local value = tryEvalNumeric(eq.exp, simCode)
+  local value = tryEvalNumeric(expDAE, simCode)
   return value !== nothing && value == 0.0
 end
 
@@ -1060,15 +1066,17 @@ function _isTrivialInitialEquation(@nospecialize(eq), simCode::SIM_CODE)::Bool
   if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
     return _isTrivialResidualEquation(eq, simCode)
   elseif eq isa BDAE.EQUATION || eq isa EQUATION
-    if _hasUnknownCref(eq.lhs, simCode.stringToSimVarHT) ||
-       _hasUnknownCref(eq.rhs, simCode.stringToSimVarHT)
+    local lhsDAE = toDAEExp(eq.lhs)
+    local rhsDAE = toDAEExp(eq.rhs)
+    if _hasUnknownCref(lhsDAE, simCode.stringToSimVarHT) ||
+       _hasUnknownCref(rhsDAE, simCode.stringToSimVarHT)
       return false
     end
-    if isequal(eq.lhs, eq.rhs)
+    if isequal(lhsDAE, rhsDAE)
       return true
     end
-    local lhsVal = tryEvalScalar(eq.lhs, simCode)
-    local rhsVal = tryEvalScalar(eq.rhs, simCode)
+    local lhsVal = tryEvalScalar(lhsDAE, simCode)
+    local rhsVal = tryEvalScalar(rhsDAE, simCode)
     return lhsVal !== nothing && rhsVal !== nothing && lhsVal == rhsVal
   end
   return false
@@ -1185,8 +1193,9 @@ function cleanupTrivialResidualEquations(simCode::SIM_CODE;
 end
 
 function _rewriteResidualIfExp(eq::Union{BDAE.RESIDUAL_EQUATION, RESIDUAL_EQUATION}, simCode::SIM_CODE)
-  local newExp = resolveConstantIfExp(eq.exp, simCode)
-  return newExp === eq.exp ? eq : typeof(eq)(newExp, eq.source, eq.attr)
+  local expDAE = toDAEExp(eq.exp)
+  local newExp = resolveConstantIfExp(expDAE, simCode)
+  return newExp === expDAE ? eq : typeof(eq)(newExp, eq.source, eq.attr)
 end
 
 function _rewriteInitialIfExp(@nospecialize(eq), simCode::SIM_CODE)
@@ -1198,9 +1207,11 @@ function _rewriteInitialIfExp(@nospecialize(eq), simCode::SIM_CODE)
     return (newLhs === eq.lhs && newRhs === eq.rhs) ? eq :
            BDAE.EQUATION(newLhs, newRhs, eq.source, eq.attributes)
   elseif eq isa EQUATION
-    local newLhs = resolveConstantIfExp(eq.lhs, simCode)
-    local newRhs = resolveConstantIfExp(eq.rhs, simCode)
-    return (newLhs === eq.lhs && newRhs === eq.rhs) ? eq :
+    local lhsDAE = toDAEExp(eq.lhs)
+    local rhsDAE = toDAEExp(eq.rhs)
+    local newLhs = resolveConstantIfExp(lhsDAE, simCode)
+    local newRhs = resolveConstantIfExp(rhsDAE, simCode)
+    return (newLhs === lhsDAE && newRhs === rhsDAE) ? eq :
            EQUATION(newLhs, newRhs, eq.source, eq.attr)
   end
   return eq
@@ -1228,7 +1239,7 @@ function _reindexIfBranches(branches::Vector{BRANCH})::Vector{BRANCH}
     local isElse = branch.identifier == ELSE_BRANCH || isLast
     local identifier = isElse ? ELSE_BRANCH : idx
     local target = isElse ? ELSE_BRANCH : idx + 1
-    local condition = isElse ? DAE.SCONST("ELSE_BRANCH") : branch.condition
+    local condition = isElse ? SCONST("ELSE_BRANCH") : branch.condition
     push!(out, BRANCH(condition, branch.residualEquations,
                       identifier, target, branch.isSingular,
                       branch.matchOrder, branch.equationGraph, branch.sccs,
@@ -1264,7 +1275,7 @@ function _pruneIfEquation(ifEq::IF_EQUATION,
         append!(promoted, branch.residualEquations)
         return (nothing, promoted, nPrunedBranches + 1, true)
       end
-      push!(newBranches, BRANCH(DAE.SCONST("ELSE_BRANCH"),
+      push!(newBranches, BRANCH(SCONST("ELSE_BRANCH"),
                                 branch.residualEquations,
                                 ELSE_BRANCH, ELSE_BRANCH, branch.isSingular,
                                 branch.matchOrder, branch.equationGraph, branch.sccs,
@@ -1363,7 +1374,7 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
   #= Build expression-level dependency: for each equation, which variable names does it reference? =#
   local eqRefs = Vector{Set{String}}(undef, nEqs)
   for i in 1:nEqs
-    eqRefs[i] = collectEquationVarNames(resEqs[i].exp, ht, baseNameToFullNames)
+    eqRefs[i] = collectEquationVarNames(toDAEExp(resEqs[i].exp), ht, baseNameToFullNames)
   end
   #= Build varName -> equation index that solves it (via fresh matchOrder).
      matchOrder[matchIdx] = eqIdx; matchIdxToName[matchIdx] = varName =#
@@ -1773,6 +1784,10 @@ Returns `(name::String, cref::DAE.ComponentRef, ty::DAE.Type)` or `nothing`
 if the expression is not a simple variable reference.
 """
 function extractCrefName(@nospecialize(exp))
+  # SIM.EXP_CREF (post-Phase-4b when-ASSIGN LHS) → DAE.CREF so the match fires.
+  if exp isa Exp
+    exp = toDAEExp(exp)
+  end
   @match exp begin
     DAE.CREF(cr, ty) => begin
       return (DAE_identifierToString(cr), cr, ty)
@@ -2111,7 +2126,7 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
   local defEqOfVar = Dict{String, Int}()    #= varName -> eqIdx of its defining residual =#
   local defCountOfVar = Dict{String, Int}() #= varName -> #residuals with v on LHS of BINARY SUB =#
   for (i, eq) in enumerate(simCode.residualEquations)
-    local candidateName = extractBinarySubLhsCrefName(eq.exp, algNames)
+    local candidateName = extractBinarySubLhsCrefName(toDAEExp(eq.exp), algNames)
     if candidateName !== nothing
       defCountOfVar[candidateName] = get(defCountOfVar, candidateName, 0) + 1
       if !haskey(defEqOfVar, candidateName)
@@ -2138,7 +2153,7 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
         continue
       end
       local rhs = detectSolvableParameterClosure(
-        simCode.residualEquations[eqIdx].exp, varName, ht, foldedNames)
+        toDAEExp(simCode.residualEquations[eqIdx].exp), varName, ht, foldedNames)
       if rhs !== nothing
         foldMap[varName] = rhs
         push!(foldedNames, varName)
@@ -2614,15 +2629,15 @@ end
 
 function _canonicalizeEquation(eq, ctx::_CanonicalNameContext)
   if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-    return typeof(eq)(_canonicalizeExp(eq.exp, ctx), eq.source, eq.attr)
+    return typeof(eq)(_canonicalizeExp(toDAEExp(eq.exp), ctx), eq.source, eq.attr)
   elseif eq isa BDAE.EQUATION
     return BDAE.EQUATION(_canonicalizeExp(eq.lhs, ctx),
                          _canonicalizeExp(eq.rhs, ctx),
                          eq.source,
                          eq.attributes)
   elseif eq isa EQUATION
-    return EQUATION(_canonicalizeExp(eq.lhs, ctx),
-                    _canonicalizeExp(eq.rhs, ctx),
+    return EQUATION(_canonicalizeExp(toDAEExp(eq.lhs), ctx),
+                    _canonicalizeExp(toDAEExp(eq.rhs), ctx),
                     eq.source,
                     eq.attr)
   elseif eq isa BDAE.ARRAY_EQUATION
@@ -2634,8 +2649,8 @@ function _canonicalizeEquation(eq, ctx::_CanonicalNameContext)
                                eq.recordSize)
   elseif eq isa ARRAY_EQUATION
     return ARRAY_EQUATION(eq.dimSize,
-                          _canonicalizeExp(eq.left, ctx),
-                          _canonicalizeExp(eq.right, ctx),
+                          _canonicalizeExp(toDAEExp(eq.left), ctx),
+                          _canonicalizeExp(toDAEExp(eq.right), ctx),
                           eq.source,
                           eq.attr)
   elseif eq isa BDAE.COMPLEX_EQUATION
@@ -2709,12 +2724,12 @@ end
 
 function _canonicalizeWhenStmts(whenStmts, ctx::_CanonicalNameContext)
   if whenStmts isa WHEN_STMTS
-    local newCondS = _canonicalizeExp(whenStmts.condition, ctx)
+    local newCondS = _canonicalizeExp(toDAEExp(whenStmts.condition), ctx)
     local newStmtLstS = WhenOperator[_canonicalizeWhenOperator(s, ctx) for s in whenStmts.whenStmtLst]
     local newElseS = whenStmts.elsewhenPart === nothing ? nothing : _canonicalizeWhenStmts(whenStmts.elsewhenPart, ctx)
     return WHEN_STMTS(newCondS, newStmtLstS, newElseS)
   end
-  local newCond = _canonicalizeExp(whenStmts.condition, ctx)
+  local newCond = _canonicalizeExp(toDAEExp(whenStmts.condition), ctx)
   local newStmtLst = _mapList(stmt -> _canonicalizeWhenOperator(stmt, ctx),
                               whenStmts.whenStmtLst)
   local newElse = @match whenStmts.elsewhenPart begin
@@ -3073,17 +3088,17 @@ function simplifyEnumLiteralPaths(simCode::SIM_CODE)::SIM_CODE
         both forms. =#
   local _rewriteEq = function(eq)
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      return typeof(eq)(_rewriteExp(eq.exp), eq.source, eq.attr)
+      return typeof(eq)(_rewriteExp(toDAEExp(eq.exp)), eq.source, eq.attr)
     elseif eq isa BDAE.EQUATION
       return BDAE.EQUATION(_rewriteExp(eq.lhs), _rewriteExp(eq.rhs), eq.source, eq.attributes)
     elseif eq isa EQUATION
-      return EQUATION(_rewriteExp(eq.lhs), _rewriteExp(eq.rhs), eq.source, eq.attr)
+      return EQUATION(_rewriteExp(toDAEExp(eq.lhs)), _rewriteExp(toDAEExp(eq.rhs)), eq.source, eq.attr)
     end
     return eq
   end
   @assign begin
-    simCode.residualEquations = [_rewriteEq(eq) for eq in simCode.residualEquations]
-    simCode.initialEquations = [_rewriteEq(eq) for eq in simCode.initialEquations]
+    simCode.residualEquations = RESIDUAL_EQUATION[_rewriteEq(eq) for eq in simCode.residualEquations]
+    simCode.initialEquations = Equation[_rewriteEq(eq) for eq in simCode.initialEquations]
   end
 
   if nRewritten[] > 0
@@ -3135,7 +3150,7 @@ function inlinePreOfConstantParameters(simCode::SIM_CODE)::SIM_CODE
 
   local newEqs = RESIDUAL_EQUATION[]
   for eq in resEqs
-    local (newExp, _) = Util.traverseExpTopDown(eq.exp, _rewrite, nothing)
+    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), _rewrite, nothing)
     push!(newEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
   if nReplaced[] > 0
@@ -3178,7 +3193,7 @@ function propagateConstants(simCode::SIM_CODE)
   local allBaseNames = Set{String}()
   for eq in resEqs
     local eqNames = Set{String}()
-    collectCrefNames!(eqNames, eq.exp)
+    collectCrefNames!(eqNames, toDAEExp(eq.exp))
     for n in eqNames
       if !occursin('[', n)
         push!(allBaseNames, n)
@@ -3201,7 +3216,7 @@ function propagateConstants(simCode::SIM_CODE)
       if i in constEqIndices || i in trivialEqIndices
         continue
       end
-      local result = detectConstantEquation(eq.exp, ht)
+      local result = detectConstantEquation(toDAEExp(eq.exp), ht)
       if result === nothing
         continue
       end
@@ -3238,7 +3253,7 @@ function propagateConstants(simCode::SIM_CODE)
          so that chained constant patterns are revealed in the next iteration =#
       local updatedEqs = RESIDUAL_EQUATION[]
       for (i, eq) in enumerate(resEqs)
-        local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
+        local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteAliasCref, constMap)
         push!(updatedEqs, typeof(eq)(newExp, eq.source, eq.attr))
       end
       resEqs = updatedEqs
@@ -3264,7 +3279,7 @@ function propagateConstants(simCode::SIM_CODE)
   local eqIdxToUnknown = Dict{Int, String}()
   for i in constEqIndices
     local eq = simCode.residualEquations[i]
-    local r = detectConstantEquation(eq.exp, ht)
+    local r = detectConstantEquation(toDAEExp(eq.exp), ht)
     r === nothing && continue
     if r[1] == :constprop
       eqIdxToUnknown[i] = r[2][1]
@@ -3281,7 +3296,7 @@ function propagateConstants(simCode::SIM_CODE)
         push!(elimPairs, (eqIdxToUnknown[i], eq))
       end
     else
-      local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
+      local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteAliasCref, constMap)
       push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
     end
   end
@@ -3294,7 +3309,7 @@ function propagateConstants(simCode::SIM_CODE)
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteAliasCref, constMap)
+        local (newBrExp, _) = Util.traverseExpTopDown(toDAEExp(brEq.exp), substituteAliasCref, constMap)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, constMap)
@@ -3310,8 +3325,8 @@ function propagateConstants(simCode::SIM_CODE)
   local newWhenEqs = WHEN_EQUATION[]
   for whenEq in simCode.whenEquations
     local innerWhen = whenEq.whenEquation
-    local (newCond, _) = Util.traverseExpTopDown(innerWhen.condition, substituteAliasCref, constMap)
-    @assign innerWhen.condition = newCond
+    local (newCond, _) = Util.traverseExpTopDown(toDAEExp(innerWhen.condition), substituteAliasCref, constMap)
+    @assign innerWhen.condition = toSimExp(newCond)
     @assign whenEq.whenEquation = innerWhen
     push!(newWhenEqs, whenEq)
   end
@@ -3320,15 +3335,15 @@ function propagateConstants(simCode::SIM_CODE)
   local newInitEqs = typeof(simCode.initialEquations)()
   for initEq in simCode.initialEquations
     if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
-      local (newInitExp, _) = Util.traverseExpTopDown(initEq.exp, substituteAliasCref, constMap)
+      local (newInitExp, _) = Util.traverseExpTopDown(toDAEExp(initEq.exp), substituteAliasCref, constMap)
       push!(newInitEqs, typeof(initEq)(newInitExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, constMap)
-      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, constMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteAliasCref, constMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteAliasCref, constMap)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
     elseif initEq isa EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, constMap)
-      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, constMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteAliasCref, constMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteAliasCref, constMap)
       push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
     else
       push!(newInitEqs, initEq)
@@ -3339,24 +3354,24 @@ function propagateConstants(simCode::SIM_CODE)
   local eliminatedSet = Set{String}(keys(constMap))
   local allRefNames = Set{String}()
   for eq in newResEqs
-    collectCrefNames!(allRefNames, eq.exp)
+    collectCrefNames!(allRefNames, toDAEExp(eq.exp))
   end
   for ifEq in newIfEqs
     for branch in ifEq.branches
       for brEq in branch.residualEquations
-        collectCrefNames!(allRefNames, brEq.exp)
+        collectCrefNames!(allRefNames, toDAEExp(brEq.exp))
       end
     end
   end
   for initEq in newInitEqs
     if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
-      collectCrefNames!(allRefNames, initEq.exp)
+      collectCrefNames!(allRefNames, toDAEExp(initEq.exp))
     elseif initEq isa BDAE.EQUATION
-      collectCrefNames!(allRefNames, initEq.lhs)
-      collectCrefNames!(allRefNames, initEq.rhs)
+      collectCrefNames!(allRefNames, toDAEExp(initEq.lhs))
+      collectCrefNames!(allRefNames, toDAEExp(initEq.rhs))
     elseif initEq isa EQUATION
-      collectCrefNames!(allRefNames, initEq.lhs)
-      collectCrefNames!(allRefNames, initEq.rhs)
+      collectCrefNames!(allRefNames, toDAEExp(initEq.lhs))
+      collectCrefNames!(allRefNames, toDAEExp(initEq.rhs))
     end
   end
 
@@ -3549,7 +3564,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   local aliasPairs = Tuple{String, String, Bool, Int, DAE.ComponentRef, DAE.Type, DAE.ComponentRef, DAE.Type}[]
 
   for (i, eq) in enumerate(resEqs)
-    local pair = detectAlias(eq.exp, ht)
+    local pair = detectAlias(toDAEExp(eq.exp), ht)
     if pair !== nothing
       local (n1, n2, neg, cr1, t1, cr2, t2) = pair
       #= Skip self-loops =#
@@ -3762,7 +3777,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     if i in aliasEqIndices
       push!(elimEqs, eq)
     else
-      local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
+      local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteAliasCref, aliasMap)
       push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
     end
   end
@@ -3774,7 +3789,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteAliasCref, aliasMap)
+        local (newBrExp, _) = Util.traverseExpTopDown(toDAEExp(brEq.exp), substituteAliasCref, aliasMap)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, aliasMap)
@@ -3800,15 +3815,15 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   local newInitEqs = typeof(simCode.initialEquations)()
   for initEq in simCode.initialEquations
     if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
-      local (newInitExp, _) = Util.traverseExpTopDown(initEq.exp, substituteAliasCref, aliasMap)
+      local (newInitExp, _) = Util.traverseExpTopDown(toDAEExp(initEq.exp), substituteAliasCref, aliasMap)
       push!(newInitEqs, typeof(initEq)(newInitExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, aliasMap)
-      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, aliasMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteAliasCref, aliasMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteAliasCref, aliasMap)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
     elseif initEq isa EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, aliasMap)
-      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, aliasMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteAliasCref, aliasMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteAliasCref, aliasMap)
       push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
     else
       push!(newInitEqs, initEq)
@@ -3823,21 +3838,21 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   local survivingRefs = Set{String}()
   local allRefNames = Set{String}()
   for eq in newResEqs
-    collectCrefNames!(allRefNames, eq.exp)
+    collectCrefNames!(allRefNames, toDAEExp(eq.exp))
   end
   for ifEq in newIfEqs
     for branch in ifEq.branches
       for brEq in branch.residualEquations
-        collectCrefNames!(allRefNames, brEq.exp)
+        collectCrefNames!(allRefNames, toDAEExp(brEq.exp))
       end
     end
   end
   for initEq in newInitEqs
     if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
-      collectCrefNames!(allRefNames, initEq.exp)
+      collectCrefNames!(allRefNames, toDAEExp(initEq.exp))
     elseif initEq isa BDAE.EQUATION || initEq isa EQUATION
-      collectCrefNames!(allRefNames, initEq.lhs)
-      collectCrefNames!(allRefNames, initEq.rhs)
+      collectCrefNames!(allRefNames, toDAEExp(initEq.lhs))
+      collectCrefNames!(allRefNames, toDAEExp(initEq.rhs))
     end
   end
   #= Also check when-equations (conditions and statements) for surviving references =#
@@ -4029,11 +4044,11 @@ function _collectComplexFieldNames!(names::Set{String}, eqs, ht)
   end
   for eq in eqs
     local exps = if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      DAE.Exp[eq.exp]
+      DAE.Exp[toDAEExp(eq.exp)]
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      DAE.Exp[eq.lhs, eq.rhs]
+      DAE.Exp[toDAEExp(eq.lhs), toDAEExp(eq.rhs)]
     elseif eq isa BDAE.COMPLEX_EQUATION || eq isa BDAE.ARRAY_EQUATION || eq isa ARRAY_EQUATION
-      DAE.Exp[eq.left, eq.right]
+      DAE.Exp[toDAEExp(eq.left), toDAEExp(eq.right)]
     else
       DAE.Exp[]
     end
@@ -4104,17 +4119,17 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   local untouchable = Set{String}()
   for eq in simCode.initialEquations
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(untouchable, eq.exp)
+      collectCrefNames!(untouchable, toDAEExp(eq.exp))
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(untouchable, eq.lhs)
-      collectCrefNames!(untouchable, eq.rhs)
+      collectCrefNames!(untouchable, toDAEExp(eq.lhs))
+      collectCrefNames!(untouchable, toDAEExp(eq.rhs))
     end
   end
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
       collectCrefNames!(untouchable, branch.condition)
       for brEq in branch.residualEquations
-        collectCrefNames!(untouchable, brEq.exp)
+        collectCrefNames!(untouchable, toDAEExp(brEq.exp))
       end
     end
   end
@@ -4127,10 +4142,10 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   end
   _collectAttributeCrefs!(untouchable, ht)
   for eq in simCode.residualEquations
-    _collectIfexpConditionCrefs!(untouchable, eq.exp)
+    _collectIfexpConditionCrefs!(untouchable, toDAEExp(eq.exp))
   end
   for eq in simCode.eliminatedEquations
-    collectCrefNames!(untouchable, eq.exp)
+    collectCrefNames!(untouchable, toDAEExp(eq.exp))
   end
   _collectFunctionBodyCrefs!(untouchable, simCode.functions)
 
@@ -4140,7 +4155,7 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   local refCount = Dict{String, Int}()
   for i in 1:nEqs
     local s = Set{String}()
-    collectCrefNames!(s, simCode.residualEquations[i].exp)
+    collectCrefNames!(s, toDAEExp(simCode.residualEquations[i].exp))
     eqRefs[i] = s
     for n in s
       refCount[n] = get(refCount, n, 0) + 1
@@ -4207,21 +4222,21 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
      surface. Anything not in this set is dead. =#
   local referenced = Set{String}()
   for eq in simCode.residualEquations
-    collectCrefNames!(referenced, eq.exp)
+    collectCrefNames!(referenced, toDAEExp(eq.exp))
   end
   for eq in simCode.initialEquations
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(referenced, eq.exp)
+      collectCrefNames!(referenced, toDAEExp(eq.exp))
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(referenced, eq.lhs)
-      collectCrefNames!(referenced, eq.rhs)
+      collectCrefNames!(referenced, toDAEExp(eq.lhs))
+      collectCrefNames!(referenced, toDAEExp(eq.rhs))
     end
   end
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
       collectCrefNames!(referenced, branch.condition)
       for brEq in branch.residualEquations
-        collectCrefNames!(referenced, brEq.exp)
+        collectCrefNames!(referenced, toDAEExp(brEq.exp))
       end
     end
   end
@@ -4229,7 +4244,7 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
     _collectWhenCrefNames!(referenced, whenEq.whenEquation)
   end
   for eq in simCode.eliminatedEquations
-    collectCrefNames!(referenced, eq.exp)
+    collectCrefNames!(referenced, toDAEExp(eq.exp))
   end
   for entry in simCode.aliasMap
     push!(referenced, entry.representativeName)
@@ -4342,15 +4357,15 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   end
   for eq in simCode.initialEquations
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(protectedNames, eq.exp)
+      collectCrefNames!(protectedNames, toDAEExp(eq.exp))
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(protectedNames, eq.lhs)
-      collectCrefNames!(protectedNames, eq.rhs)
+      collectCrefNames!(protectedNames, toDAEExp(eq.lhs))
+      collectCrefNames!(protectedNames, toDAEExp(eq.rhs))
     end
   end
   #= IFEXP conditions inside residual equations and parameter bindings. =#
   for eq in simCode.residualEquations
-    _collectIfexpConditionCrefs!(protectedNames, eq.exp)
+    _collectIfexpConditionCrefs!(protectedNames, toDAEExp(eq.exp))
   end
   #= Names of array bases referenced as bare CREFs in DATA_STRUCTURE constructor
      calls (ExternalObject inits like CombiTable / CombiTimeTable). Array params
@@ -4441,22 +4456,22 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   #= Step 2: substitute throughout every equation container. =#
   local newResiduals = RESIDUAL_EQUATION[]
   for eq in simCode.residualEquations
-    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
+    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteConstantParameter, paramValueMap)
     push!(newResiduals, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
   local newInitials = typeof(simCode.initialEquations)()
   for eq in simCode.initialEquations
     local newEq = if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
+      local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteConstantParameter, paramValueMap)
       typeof(eq)(newExp, eq.source, eq.attr)
     elseif eq isa BDAE.EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(eq.lhs, substituteConstantParameter, paramValueMap)
-      local (newRhs, _) = Util.traverseExpTopDown(eq.rhs, substituteConstantParameter, paramValueMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(eq.lhs), substituteConstantParameter, paramValueMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(eq.rhs), substituteConstantParameter, paramValueMap)
       BDAE.EQUATION(newLhs, newRhs, eq.source, eq.attributes)
     elseif eq isa EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(eq.lhs, substituteConstantParameter, paramValueMap)
-      local (newRhs, _) = Util.traverseExpTopDown(eq.rhs, substituteConstantParameter, paramValueMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(eq.lhs), substituteConstantParameter, paramValueMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(eq.rhs), substituteConstantParameter, paramValueMap)
       EQUATION(newLhs, newRhs, eq.source, eq.attr)
     else
       eq
@@ -4470,7 +4485,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteConstantParameter, paramValueMap)
+        local (newBrExp, _) = Util.traverseExpTopDown(toDAEExp(brEq.exp), substituteConstantParameter, paramValueMap)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteConstantParameter, paramValueMap)
@@ -4493,7 +4508,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   # eliminated-parameter element refs to avoid dangling identifiers
   local newElimEqs = RESIDUAL_EQUATION[]
   for eq in simCode.eliminatedEquations
-    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteConstantParameter, paramValueMap)
+    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteConstantParameter, paramValueMap)
     push!(newElimEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
@@ -4522,20 +4537,20 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
      somehow survived substitution (unflatten form, etc.), keep the param. =#
   local survivorCheck = Set{String}()
   for eq in newResiduals
-    collectCrefNames!(survivorCheck, eq.exp)
+    collectCrefNames!(survivorCheck, toDAEExp(eq.exp))
   end
   for eq in newInitials
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(survivorCheck, eq.exp)
+      collectCrefNames!(survivorCheck, toDAEExp(eq.exp))
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(survivorCheck, eq.lhs)
-      collectCrefNames!(survivorCheck, eq.rhs)
+      collectCrefNames!(survivorCheck, toDAEExp(eq.lhs))
+      collectCrefNames!(survivorCheck, toDAEExp(eq.rhs))
     end
   end
   for ifEq in newIfEquations
     for branch in ifEq.branches
       for brEq in branch.residualEquations
-        collectCrefNames!(survivorCheck, brEq.exp)
+        collectCrefNames!(survivorCheck, toDAEExp(brEq.exp))
       end
       collectCrefNames!(survivorCheck, branch.condition)
     end
@@ -4732,7 +4747,7 @@ separately via the equation walk; we only protect parameters that gate
 the trigger.
 """
 function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::WHEN_STMTS)
-  collectCrefNames!(out, whenStmts.condition)
+  collectCrefNames!(out, toDAEExp(whenStmts.condition))
   if whenStmts.elsewhenPart !== nothing
     _collectWhenConditionCrefs!(out, whenStmts.elsewhenPart)
   end
@@ -4740,7 +4755,7 @@ function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::WHEN_STMTS)
 end
 
 function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::BDAE.WHEN_STMTS)
-  collectCrefNames!(out, whenStmts.condition)
+  collectCrefNames!(out, toDAEExp(whenStmts.condition))
   @match whenStmts.elsewhenPart begin
     SOME(inner) => _collectWhenConditionCrefs!(out, inner)
     _ => nothing
@@ -4839,7 +4854,7 @@ Recursively substitute eliminated-parameter CREFs in a WHEN_STMTS node.
 Mirrors `_substituteAliasInWhenStmts` but with `substituteConstantParameter`.
 """
 function _substituteParamInWhenStmts(whenStmts::WHEN_STMTS, paramValueMap)
-  local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteConstantParameter, paramValueMap)
+  local (newCond, _) = Util.traverseExpTopDown(toDAEExp(whenStmts.condition), substituteConstantParameter, paramValueMap)
   local newStmtLst = WhenOperator[]
   for stmt in whenStmts.whenStmtLst
     local newStmt::WhenOperator = if stmt isa ASSIGN
@@ -4864,7 +4879,7 @@ function _substituteParamInWhenStmts(whenStmts::WHEN_STMTS, paramValueMap)
 end
 
 function _substituteParamInWhenStmts(whenStmts::BDAE.WHEN_STMTS, paramValueMap)
-  local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteConstantParameter, paramValueMap)
+  local (newCond, _) = Util.traverseExpTopDown(toDAEExp(whenStmts.condition), substituteConstantParameter, paramValueMap)
   local newStmtLst::List{BDAE.WhenOperator} = MetaModelica.nil
   for stmt in whenStmts.whenStmtLst
     local newStmt::BDAE.WhenOperator = @match stmt begin
@@ -4898,7 +4913,7 @@ end
 Recursively substitute alias CREFs in a WHEN_STMTS node (condition + statements + elsewhen).
 """
 function _substituteAliasInWhenStmts(whenStmts::WHEN_STMTS, aliasMap)
-  local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteAliasCref, aliasMap)
+  local (newCond, _) = Util.traverseExpTopDown(toDAEExp(whenStmts.condition), substituteAliasCref, aliasMap)
   local newStmtLst = WhenOperator[]
   for stmt in whenStmts.whenStmtLst
     local newStmt::WhenOperator = if stmt isa ASSIGN
@@ -4927,7 +4942,7 @@ function _substituteAliasInWhenStmts(whenStmts::WHEN_STMTS, aliasMap)
 end
 
 function _substituteAliasInWhenStmts(whenStmts::BDAE.WHEN_STMTS, aliasMap)
-  local (newCond, _) = Util.traverseExpTopDown(whenStmts.condition, substituteAliasCref, aliasMap)
+  local (newCond, _) = Util.traverseExpTopDown(toDAEExp(whenStmts.condition), substituteAliasCref, aliasMap)
   local newStmtLst::List{BDAE.WhenOperator} = MetaModelica.nil
   for stmt in whenStmts.whenStmtLst
     local newStmt::BDAE.WhenOperator = @match stmt begin
@@ -4973,7 +4988,7 @@ end
 Collect all CREF names from a WHEN_STMTS node (condition + statements + elsewhen).
 """
 function _collectWhenCrefNames!(names::Set{String}, whenStmts::WHEN_STMTS)
-  collectCrefNames!(names, whenStmts.condition)
+  collectCrefNames!(names, toDAEExp(whenStmts.condition))
   for stmt in whenStmts.whenStmtLst
     if stmt isa ASSIGN
       collectCrefNames!(names, stmt.left)
@@ -4995,7 +5010,7 @@ function _collectWhenCrefNames!(names::Set{String}, whenStmts::WHEN_STMTS)
 end
 
 function _collectWhenCrefNames!(names::Set{String}, whenStmts::BDAE.WHEN_STMTS)
-  collectCrefNames!(names, whenStmts.condition)
+  collectCrefNames!(names, toDAEExp(whenStmts.condition))
   for stmt in whenStmts.whenStmtLst
     @match stmt begin
       BDAE.ASSIGN(__) => begin
@@ -5411,7 +5426,7 @@ function _recomputeSCCsFromSimCode(simCode::SIM_CODE)
   local incidence = Vector{Set{String}}(undef, n_eqs)
   for (i, eq) in enumerate(res)
     local names = Set{String}()
-    collectCrefNames!(names, eq.exp)
+    collectCrefNames!(names, toDAEExp(eq.exp))
     incidence[i] = intersect(names, surviving)
   end
   local var_to_eq = Dict{String, Int}()
@@ -5478,7 +5493,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
 
   local rhsGroups = Dict{String, Vector{Tuple{String, Int, DAE.ComponentRef, DAE.Type, Bool}}}()
   for (i, eq) in enumerate(resEqs)
-    local pair = _detectVarMinusExpr(eq.exp, ht)
+    local pair = _detectVarMinusExpr(toDAEExp(eq.exp), ht)
     pair === nothing && continue
     local (n, cr, ty, key, neg) = pair
     if !haskey(rhsGroups, key)
@@ -5553,7 +5568,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   sizehint!(newResEqs, length(resEqs) - length(removeEqs))
   for (i, eq) in enumerate(resEqs)
     i in removeEqs && continue
-    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
+    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteAliasCref, aliasMap)
     push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
@@ -5567,7 +5582,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteAliasCref, aliasMap)
+        local (newBrExp, _) = Util.traverseExpTopDown(toDAEExp(brEq.exp), substituteAliasCref, aliasMap)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteAliasCref, aliasMap)
@@ -5594,12 +5609,12 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
       local (newInitExp, _) = Util.traverseExpTopDown(initEq.exp, substituteAliasCref, aliasMap)
       push!(newInitEqs, typeof(initEq)(newInitExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, aliasMap)
-      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, aliasMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteAliasCref, aliasMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteAliasCref, aliasMap)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
     elseif initEq isa EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteAliasCref, aliasMap)
-      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteAliasCref, aliasMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteAliasCref, aliasMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteAliasCref, aliasMap)
       push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
     else
       push!(newInitEqs, initEq)
@@ -5615,7 +5630,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   local rewrittenElimEqs = RESIDUAL_EQUATION[]
   sizehint!(rewrittenElimEqs, length(oldElimEqs))
   for eq in oldElimEqs
-    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteAliasCref, aliasMap)
+    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteAliasCref, aliasMap)
     push!(rewrittenElimEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
@@ -5999,7 +6014,7 @@ function _computeFrozenProtectedNames(simCode::SIM_CODE)::Set{String}
     for branch in ifEq.branches
       collectCrefNames!(protectedNames, branch.condition)
       for brEq in branch.residualEquations
-        collectCrefNames!(protectedNames, brEq.exp)
+        collectCrefNames!(protectedNames, toDAEExp(brEq.exp))
       end
     end
   end
@@ -6034,7 +6049,7 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::Set{St
   local frozenEqIdx = Dict{String, Int}()
   local frozenIsState = Dict{String, Bool}()
   for (i, eq) in enumerate(resEqs)
-    local pair = _detectFrozenState(eq.exp, ht)
+    local pair = _detectFrozenState(toDAEExp(eq.exp), ht)
     pair === nothing && continue
     local (n, _, _, litExp, isState) = pair
     n in sharedVarSet  && continue
@@ -6076,7 +6091,7 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::Set{St
   sizehint!(newResEqs, length(resEqs) - length(removeEqs))
   for (i, eq) in enumerate(resEqs)
     i in removeEqs && continue
-    local (newExp, _) = Util.traverseExpTopDown(eq.exp, _substituteFrozenState, frozenMap)
+    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), _substituteFrozenState, frozenMap)
     #= Constant-fold after substitution: `0.0 * x` and friends now reduce
        to 0 so the residual becomes a clean `0 = -y - 0` form that the
        next iteration can detect as a pin. =#
@@ -6091,14 +6106,14 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::Set{St
       newExp = _foldNumericExp(newExp)
       push!(newInitEqs, typeof(initEq)(newExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, _substituteFrozenState, frozenMap)
-      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, _substituteFrozenState, frozenMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), _substituteFrozenState, frozenMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), _substituteFrozenState, frozenMap)
       newLhs = _foldNumericExp(newLhs)
       newRhs = _foldNumericExp(newRhs)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
     elseif initEq isa EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, _substituteFrozenState, frozenMap)
-      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, _substituteFrozenState, frozenMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), _substituteFrozenState, frozenMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), _substituteFrozenState, frozenMap)
       newLhs = _foldNumericExp(newLhs)
       newRhs = _foldNumericExp(newRhs)
       push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
@@ -6293,7 +6308,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
   end
 
   for (i, eq) in enumerate(resEqs)
-    local pair = _detectVarMinusExprRaw(eq.exp, ht)
+    local pair = _detectVarMinusExprRaw(toDAEExp(eq.exp), ht)
     pair === nothing && continue
     local (name, rhs) = pair
     occursin('[', name) && continue
@@ -6335,7 +6350,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
   sizehint!(newResEqs, length(resEqs) - length(foldEqIdxSet))
   for (i, eq) in enumerate(resEqs)
     i in foldEqIdxSet && continue
-    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteFoldedVar, foldMap)
+    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteFoldedVar, foldMap)
     newExp = _foldNumericExp(newExp)
     push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
@@ -6347,14 +6362,14 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
       newExp = _foldNumericExp(newExp)
       push!(newInitEqs, typeof(initEq)(newExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteFoldedVar, foldMap)
-      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteFoldedVar, foldMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteFoldedVar, foldMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteFoldedVar, foldMap)
       newLhs = _foldNumericExp(newLhs)
       newRhs = _foldNumericExp(newRhs)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
     elseif initEq isa EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(initEq.lhs, substituteFoldedVar, foldMap)
-      local (newRhs, _) = Util.traverseExpTopDown(initEq.rhs, substituteFoldedVar, foldMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteFoldedVar, foldMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteFoldedVar, foldMap)
       newLhs = _foldNumericExp(newLhs)
       newRhs = _foldNumericExp(newRhs)
       push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
@@ -6369,7 +6384,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = Util.traverseExpTopDown(brEq.exp, substituteFoldedVar, foldMap)
+        local (newBrExp, _) = Util.traverseExpTopDown(toDAEExp(brEq.exp), substituteFoldedVar, foldMap)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = Util.traverseExpTopDown(branch.condition, substituteFoldedVar, foldMap)
@@ -6383,7 +6398,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
 
   local newElimEqs = RESIDUAL_EQUATION[]
   for eq in simCode.eliminatedEquations
-    local (newExp, _) = Util.traverseExpTopDown(eq.exp, substituteFoldedVar, foldMap)
+    local (newExp, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), substituteFoldedVar, foldMap)
     push!(newElimEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
@@ -6397,26 +6412,26 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
   local foldKeys = Set{String}(keys(foldMap))
   local survivorNames = Set{String}()
   for eq in newResEqs
-    collectCrefNames!(survivorNames, eq.exp)
+    collectCrefNames!(survivorNames, toDAEExp(eq.exp))
   end
   for eq in newInitEqs
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(survivorNames, eq.exp)
+      collectCrefNames!(survivorNames, toDAEExp(eq.exp))
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(survivorNames, eq.lhs)
-      collectCrefNames!(survivorNames, eq.rhs)
+      collectCrefNames!(survivorNames, toDAEExp(eq.lhs))
+      collectCrefNames!(survivorNames, toDAEExp(eq.rhs))
     end
   end
   for ifEq in newIfEqs
     for branch in ifEq.branches
       collectCrefNames!(survivorNames, branch.condition)
       for brEq in branch.residualEquations
-        collectCrefNames!(survivorNames, brEq.exp)
+        collectCrefNames!(survivorNames, toDAEExp(brEq.exp))
       end
     end
   end
   for eq in newElimEqs
-    collectCrefNames!(survivorNames, eq.exp)
+    collectCrefNames!(survivorNames, toDAEExp(eq.exp))
   end
   for whenEq in simCode.whenEquations
     _collectWhenCrefNames!(survivorNames, whenEq.whenEquation)
@@ -6473,7 +6488,7 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   local surviving_unknowns = Set{String}(k for (k, (_, sv)) in pairs(ht) if isUnknownVarKind(sv.varKind))
   local incidence = map(enumerate(res)) do (i, eq)
     local names = Set{String}()
-    collectCrefNames!(names, eq.exp)
+    collectCrefNames!(names, toDAEExp(eq.exp))
     intersect(names, surviving_unknowns)
   end
 
@@ -6531,4 +6546,15 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   local newRes = RESIDUAL_EQUATION[res[i] for i in 1:n_eqs if i ∉ redundant_set]
   @assign simCode.residualEquations = newRes
   return simCode
+end
+
+#= `Util.traverseExpTopDown(::DAE.Exp, func, ext_arg)` is the canonical
+   recursive descent over a `DAE.Exp` tree used by alias substitution,
+   constant folding, cref collection, etc. When the caller passes a
+   SimCode-native `Exp`, route through `toDAEExp` and convert the
+   returned expression back to `Exp` so the call site sees the same
+   in/out type. =#
+Base.@nospecializeinfer function Util.traverseExpTopDown(@nospecialize(inExp::Exp), func::Function, ext_arg)
+  local (outDAE, outArg) = Util.traverseExpTopDown(toDAEExp(inExp), func, ext_arg)
+  return (toSimExp(outDAE), outArg)
 end

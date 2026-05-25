@@ -140,6 +140,10 @@ end
 Transforms a DAE Condition into a MTK continuous condition.
 """
 function transformToMTKContinousCondition(cond, simCode)
+  # @match patterns are DAE.* only; convert SIM-side conditions at entry.
+  if cond isa SimulationCode.Exp
+    cond = SimulationCode.toDAEExp(cond)
+  end
   res = @match cond begin
     DAE.RELATION(e1, DAE.LESS(__), e2) => begin
       :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)))
@@ -207,6 +211,10 @@ end
 Transforms a DAE Condition into a MTK continuous condition equation.
 """
 function transformToMTKContinousConditionEquation(cond, simCode)
+  # @match patterns are DAE.* only; convert SIM-side conditions at entry.
+  if cond isa SimulationCode.Exp
+    cond = SimulationCode.toDAEExp(cond)
+  end
   res = @match cond begin
     DAE.RELATION(e1, DAE.LESS(__), e2) => begin
       :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)) ~ 0)
@@ -431,6 +439,194 @@ Base.@nospecializeinfer function _ifexpBranchIsNonReal(@nospecialize(e::DAE.Exp)
     DAE.IFEXP(_, t, el) => _ifexpBranchIsNonReal(t) || _ifexpBranchIsNonReal(el)
     _ => false
   end
+end
+
+#= SimCode-Exp entry (Phase 4b): codegen consumes `SimulationCode.Exp`
+   directly. The body below mirrors the `::DAE.Exp` version's dispatch
+   shape but operates on SIM Exp variants:
+
+   - Trivial leaves (ICONST / RCONST / BCONST / SCONST / ENUM_LITERAL)
+     are emitted natively — no DAE round-trip.
+   - Algebraic / logical / relational composites (BINARY / UNARY /
+     LBINARY / LUNARY / RELATION / IFEXP / CAST / TUPLE) recurse into
+     this same SIM-Exp entry. The `OpKind` enum maps to the existing
+     `DAE_OP_toJuliaOperator` helper by reconstructing a minimal
+     `DAE.Operator` value (the operator-side type is unused by the
+     helper for the common cases).
+   - Complex shapes that drive the bulk of the DAE.Exp version
+     (EXP_CREF, CALL, ASUB, ARRAY_EXP, RECORD, TSUB) fall through to the
+     `::DAE.Exp` emitter via `toDAEExp` for now. Migrating each is a
+     mechanical mirror of the matching `DAE.X` arm in the long
+     function below; do it variant-by-variant so each landing is
+     small and testable. =#
+Base.@nospecializeinfer function expToJuliaExpMTK(@nospecialize(exp::SimulationCode.Exp),
+                          simCode::SimulationCode.SIM_CODE;
+                          varSuffix = "", varPrefix = "",
+                          derSymbol::Bool = false)::Expr
+  if exp isa SimulationCode.BCONST
+    return quote $(exp.value) end
+  elseif exp isa SimulationCode.ICONST
+    return quote $(exp.value) end
+  elseif exp isa SimulationCode.RCONST
+    return quote $(exp.value) end
+  elseif exp isa SimulationCode.SCONST
+    return quote $(exp.value) end
+  elseif exp isa SimulationCode.ENUM_LITERAL
+    return quote
+      $(LineNumberNode(@__LINE__, "$(string(exp.path)) ENUM"))
+      $(exp.index)
+    end
+  elseif exp isa SimulationCode.EXP_CREF
+    #= SimCref is flat post-Causalize.flattenArrayCrefs, so the
+       CREF_QUAL hierarchy that the DAE arm handles cannot reach here.
+       Handle the cheap scalar / "time" / simple subscript cases
+       natively; delegate the T_ARRAY-typed and harder subscript cases
+       to the DAE.Exp emitter until SimCref-typed equivalents of
+       tryHandleSubscriptedArrayCref / resolveAliasedCref land. =#
+    if exp.cref.sym === :time && exp.ty isa DAE.T_REAL
+      return quote t end
+    end
+    if exp.ty isa DAE.T_ARRAY
+      return expToJuliaExpMTK(SimulationCode.toDAEExp(exp), simCode;
+                              varSuffix = varSuffix, varPrefix = varPrefix,
+                              derSymbol = derSymbol)
+    end
+    local hashTable = simCode.stringToSimVarHT
+    local nameStr = string(exp.cref.sym)
+    local lookUpStr = isempty(exp.cref.subs) ?
+      nameStr :
+      string(nameStr, "[", join(exp.cref.subs, ","), "]")
+    local htEntry = get(hashTable, lookUpStr, nothing)
+    if htEntry !== nothing
+      return quote
+        $(LineNumberNode(@__LINE__, "SIM cref: $lookUpStr"))
+        $(Symbol(htEntry[2].name))
+      end
+    end
+    local (aliasResolved, aliasExpr) = resolveAliasedCref(lookUpStr, simCode, hashTable,
+      varPrefix = varPrefix, varSuffix = varSuffix)
+    if aliasResolved
+      @warn "expToJuliaExpMTK[SIM]: resolved alias-eliminated cref via fallback" lookUpStr
+      return aliasExpr
+    end
+    return quote $(Symbol(string(varPrefix, lookUpStr, varSuffix))) end
+  elseif exp isa SimulationCode.BINARY
+    local lhs = expToJuliaExpMTK(exp.exp1, simCode;
+                                  varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    local rhs = expToJuliaExpMTK(exp.exp2, simCode;
+                                  varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+    return :( $opSym($(lhs), $(rhs)) )
+  elseif exp isa SimulationCode.UNARY
+    local operand = expToJuliaExpMTK(exp.exp, simCode;
+                                      varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+    return :( $opSym($(operand)) )
+  elseif exp isa SimulationCode.LUNARY
+    local operand = expToJuliaExpMTK(exp.exp, simCode;
+                                      varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    if exp.op === SimulationCode.OP_NOT
+      return :( 1 - $(operand) )
+    end
+    local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+    return :( $opSym($(operand)) )
+  elseif exp isa SimulationCode.LBINARY
+    local lhs = expToJuliaExpMTK(exp.exp1, simCode;
+                                  varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    local rhs = expToJuliaExpMTK(exp.exp2, simCode;
+                                  varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    if exp.op === SimulationCode.OP_OR
+      return :( $(lhs) + $(rhs) - $(lhs) * $(rhs) )
+    elseif exp.op === SimulationCode.OP_AND
+      return :( $(lhs) * $(rhs) )
+    end
+    local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+    return :( $opSym($(lhs), $(rhs)) )
+  elseif exp isa SimulationCode.RELATION
+    local lhs = expToJuliaExpMTK(exp.exp1, simCode;
+                                  varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    local rhs = expToJuliaExpMTK(exp.exp2, simCode;
+                                  varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+    return quote ($opSym($(lhs), $(rhs))) end
+  elseif exp isa SimulationCode.IFEXP
+    if exp.cond isa SimulationCode.BCONST
+      local branch = exp.cond.value ? exp.thenExp : exp.elseExp
+      local e = expToJuliaExpMTK(branch, simCode;
+                                  varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+      return quote
+        $(LineNumberNode(@__LINE__, "evaluated if expr"))
+        $(e)
+      end
+    end
+    local condJL = expToJuliaExpMTK(exp.cond, simCode;
+                                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    local thenJL = expToJuliaExpMTK(exp.thenExp, simCode;
+                                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    local elseJL = expToJuliaExpMTK(exp.elseExp, simCode;
+                                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    #= Same Real-vs-non-Real branch-typing rule as the DAE.Exp version
+       (see comment above the matching `DAE.IFEXP` arm). =#
+    if _ifexpBranchIsNonReal(SimulationCode.toDAEExp(exp.thenExp)) ||
+       _ifexpBranchIsNonReal(SimulationCode.toDAEExp(exp.elseExp))
+      return :(ifelse(Bool($(condJL)), $(thenJL), $(elseJL)))
+    else
+      return :( $(condJL) * $(thenJL) + (1 - $(condJL)) * $(elseJL) )
+    end
+  elseif exp isa SimulationCode.CAST
+    return quote
+      $(generateCastExpressionMTK(exp.ty, SimulationCode.toDAEExp(exp.exp), simCode, varPrefix))
+    end
+  elseif exp isa SimulationCode.TUPLE
+    local elemExprs = Expr[expToJuliaExpMTK(e, simCode;
+                                              varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+                            for e in exp.PR]
+    return Expr(:tuple, elemExprs...)
+  elseif exp isa SimulationCode.TSUB
+    #= TSUB over a CALL needs the Modelica-function dispatch in the
+       DAE arm (tupleElementCall / tupleArrayElementCall); only the
+       non-CALL form lowers cleanly to plain indexing. =#
+    if exp.exp isa SimulationCode.CALL
+      return expToJuliaExpMTK(SimulationCode.toDAEExp(exp), simCode;
+                              varSuffix = varSuffix, varPrefix = varPrefix,
+                              derSymbol = derSymbol)
+    end
+    local tupleExpr = expToJuliaExpMTK(exp.exp, simCode;
+                                        varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+    return :($tupleExpr[$(exp.index)])
+  elseif exp isa SimulationCode.ARRAY_EXP
+    return handleArrayExp(SimulationCode.toDAEExp(exp), simCode)
+  elseif exp isa SimulationCode.RECORD
+    #= Mirror the DAE.RECORD arms: Modelica `Complex(re, im)` becomes
+       Julia's `Complex(re, im)`; any other record lowers to a
+       `Symbolics.wrap`-wrapped NamedTuple keyed by field name. =#
+    if exp.path isa Absyn.IDENT && exp.path.name == "Complex" && length(exp.exps) == 2
+      local reExpr = expToJuliaExpMTK(exp.exps[1], simCode;
+                                       varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+      local imExpr = expToJuliaExpMTK(exp.exps[2], simCode;
+                                       varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+      return quote Complex($reExpr, $imExpr) end
+    end
+    local wrappedElems = Expr[:(Symbolics.wrap($(expToJuliaExpMTK(e, simCode;
+                                                                    varPrefix = varPrefix,
+                                                                    varSuffix = varSuffix,
+                                                                    derSymbol = derSymbol))))
+                               for e in exp.exps]
+    if length(exp.fieldNames) == length(wrappedElems)
+      local names = Symbol[Symbol(n) for n in exp.fieldNames]
+      local pairs = Expr[Expr(:(=), names[i], wrappedElems[i]) for i in eachindex(names)]
+      return Expr(:tuple, Expr(:parameters, pairs...))
+    end
+    return Expr(:tuple, wrappedElems...)
+  end
+  #= Fallback for EXP_CREF / CALL / ASUB / ARRAY_EXP / RECORD / TSUB. The
+     DAE.Exp version handles these with ~600 lines of HT lookup, alias
+     resolution, builtin/external function dispatch, and array-binding
+     unfolding. Each arm can be migrated incrementally to the body
+     above; for now route through the DAE.Exp emitter. =#
+  return expToJuliaExpMTK(SimulationCode.toDAEExp(exp), simCode;
+                          varSuffix = varSuffix, varPrefix = varPrefix,
+                          derSymbol = derSymbol)
 end
 
 """
@@ -1972,12 +2168,13 @@ end
   and that the original equations are written in a certain form.
 =#
 function deCausalize(eq, simCode)
-  @match eq.exp begin
+  local expDAE = SimulationCode.toDAEExp(eq.exp)
+  @match expDAE begin
     DAE.BINARY(DAE.RCONST(0.0), _, exp2) => begin
-      (:($(expToJuliaExpMTK(exp2, simCode))), :($(expToJuliaExpMTK(eq.exp.exp1, simCode))))
+      (:($(expToJuliaExpMTK(exp2, simCode))), :($(expToJuliaExpMTK(expDAE.exp1, simCode))))
     end
     DAE.BINARY(exp1, _, DAE.RCONST(0.0)) => begin
-      (:($(expToJuliaExpMTK(eq.exp.exp2, simCode))), :($(expToJuliaExpMTK(exp1, simCode))))
+      (:($(expToJuliaExpMTK(expDAE.exp2, simCode))), :($(expToJuliaExpMTK(exp1, simCode))))
     end
     DAE.BINARY(exp1, _, exp2) => begin
       (:($(expToJuliaExpMTK(exp2, simCode))), :($(expToJuliaExpMTK(exp1, simCode))))

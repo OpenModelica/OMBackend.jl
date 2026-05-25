@@ -34,6 +34,7 @@ import ..ARRAY_EQUATION
 import ..INITIAL_WHEN_EQUATION
 import ..INLINE_IF_EQUATION
 import ..ALGORITHM
+import ..toDAEExp
 
 using MetaModelica
 
@@ -212,7 +213,7 @@ function rule_balanced(simCode::SIM_CODE)::Vector{CheckViolation}
   local refNames = Set{String}()
   local missingProbe = String[]
   for eq in simCode.residualEquations
-    _collectCrefNames!(missingProbe, eq.exp, Set{String}())
+    _collectCrefNames!(missingProbe, toDAEExp(eq.exp), Set{String}())
   end
   for n in missingProbe
     push!(refNames, n)
@@ -358,11 +359,11 @@ _baseName(name::AbstractString) = String(first(split(name, '['; limit = 2)))
 function _collectDerCrefs(simCode::SIM_CODE)::Set{String}
   local names = Set{String}()
   for eq in simCode.residualEquations
-    _collectDerFromExp!(names, eq.exp)
+    _collectDerFromExp!(names, toDAEExp(eq.exp))
   end
   for eq in simCode.initialEquations
     if hasproperty(eq, :exp)
-      _collectDerFromExp!(names, eq.exp)
+      _collectDerFromExp!(names, toDAEExp(eq.exp))
     end
   end
   #= Eliminated equations: a state's derivative may appear here if alias
@@ -370,14 +371,14 @@ function _collectDerCrefs(simCode::SIM_CODE)::Set{String}
      `flange.w = der(flange.phi)` where `flange.w` was aliased out. =#
   for eq in simCode.eliminatedEquations
     if hasproperty(eq, :exp)
-      _collectDerFromExp!(names, eq.exp)
+      _collectDerFromExp!(names, toDAEExp(eq.exp))
     end
   end
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
       _collectDerFromExp!(names, branch.condition)
       for eq in branch.residualEquations
-        _collectDerFromExp!(names, eq.exp)
+        _collectDerFromExp!(names, toDAEExp(eq.exp))
       end
     end
   end
@@ -389,7 +390,7 @@ end
 
 function _collectDerFromWhenEquation!(names::Set{String}, whenEq)
   if hasproperty(whenEq, :condition)
-    _collectDerFromExp!(names, whenEq.condition)
+    _collectDerFromExp!(names, toDAEExp(whenEq.condition))
   end
   if hasproperty(whenEq, :whenStmtLst)
     for stmt in whenEq.whenStmtLst
@@ -443,7 +444,7 @@ function rule_cref_resolution(simCode::SIM_CODE)::Vector{CheckViolation}
   union!(known, BUILTIN_CREFS)
   for (i, eq) in enumerate(simCode.residualEquations)
     local missingNames = String[]
-    _collectCrefNames!(missingNames, eq.exp, known)
+    _collectCrefNames!(missingNames, toDAEExp(eq.exp), known)
     for nm in missingNames
       push!(out, CheckViolation(:cref_resolution, :error,
                                 "residualEquations[$i]",
@@ -543,19 +544,19 @@ push!(RULES, rule_canonical_cref_names)
 
 function _flagCanonicalEquation!(out::Vector{CheckViolation}, eq, where::String)
   if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-    _flagCanonicalExp!(out, eq.exp, where)
+    _flagCanonicalExp!(out, toDAEExp(eq.exp), where)
   elseif eq isa BDAE.EQUATION || eq isa EQUATION
-    _flagCanonicalExp!(out, eq.lhs, where * ".lhs")
-    _flagCanonicalExp!(out, eq.rhs, where * ".rhs")
+    _flagCanonicalExp!(out, toDAEExp(eq.lhs), where * ".lhs")
+    _flagCanonicalExp!(out, toDAEExp(eq.rhs), where * ".rhs")
   elseif eq isa BDAE.ARRAY_EQUATION || eq isa ARRAY_EQUATION
-    _flagCanonicalExp!(out, eq.left, where * ".left")
-    _flagCanonicalExp!(out, eq.right, where * ".right")
+    _flagCanonicalExp!(out, toDAEExp(eq.left), where * ".left")
+    _flagCanonicalExp!(out, toDAEExp(eq.right), where * ".right")
   elseif eq isa BDAE.COMPLEX_EQUATION
     _flagCanonicalExp!(out, eq.left, where * ".left")
     _flagCanonicalExp!(out, eq.right, where * ".right")
   elseif eq isa BDAE.SOLVED_EQUATION
     _flagCanonicalComponentRef!(out, eq.componentRef, where * ".componentRef")
-    _flagCanonicalExp!(out, eq.exp, where * ".exp")
+    _flagCanonicalExp!(out, toDAEExp(eq.exp), where * ".exp")
   elseif eq isa BDAE.WHEN_EQUATION ||
          eq isa BDAE.STRUCTURAL_WHEN_EQUATION ||
          eq isa WHEN_EQUATION ||
@@ -659,7 +660,7 @@ function _flagCanonicalElse!(out::Vector{CheckViolation}, elseBranch, where::Str
 end
 
 function _flagCanonicalWhenStmts!(out::Vector{CheckViolation}, whenStmts, where::String)
-  _flagCanonicalExp!(out, whenStmts.condition, where * ".condition")
+  _flagCanonicalExp!(out, toDAEExp(whenStmts.condition), where * ".condition")
   for (i, stmt) in enumerate(whenStmts.whenStmtLst)
     if hasproperty(stmt, :left)
       _flagCanonicalExp!(out, stmt.left, where * ".stmt[$i].left")
@@ -677,7 +678,7 @@ function _flagCanonicalWhenStmts!(out::Vector{CheckViolation}, whenStmts, where:
       _flagCanonicalExp!(out, stmt.exp, where * ".stmt[$i].exp")
     end
     if hasproperty(stmt, :condition)
-      _flagCanonicalExp!(out, stmt.condition, where * ".stmt[$i].condition")
+      _flagCanonicalExp!(out, toDAEExp(stmt.condition), where * ".stmt[$i].condition")
     end
     if hasproperty(stmt, :message)
       _flagCanonicalExp!(out, stmt.message, where * ".stmt[$i].message")
@@ -756,7 +757,7 @@ supported downstream.
 function rule_supported_exp(simCode::SIM_CODE)::Vector{CheckViolation}
   local out = CheckViolation[]
   for (i, eq) in enumerate(simCode.residualEquations)
-    _flagUnsupportedExp!(out, eq.exp, "residualEquations[$i]")
+    _flagUnsupportedExp!(out, toDAEExp(eq.exp), "residualEquations[$i]")
   end
   return out
 end
@@ -788,24 +789,24 @@ upstream behavior is the real bug and this :warn keeps it visible.
 function rule_no_literal_in_der_pre(simCode::SIM_CODE)::Vector{CheckViolation}
   local out = CheckViolation[]
   for (i, eq) in enumerate(simCode.residualEquations)
-    _flagLiteralInDerPre!(out, eq.exp, "residualEquations[$i]")
+    _flagLiteralInDerPre!(out, toDAEExp(eq.exp), "residualEquations[$i]")
   end
   for (i, eq) in enumerate(simCode.initialEquations)
     if hasproperty(eq, :exp)
-      _flagLiteralInDerPre!(out, eq.exp, "initialEquations[$i]")
+      _flagLiteralInDerPre!(out, toDAEExp(eq.exp), "initialEquations[$i]")
     end
   end
   for (i, ifEq) in enumerate(simCode.ifEquations)
     for (j, branch) in enumerate(ifEq.branches)
       _flagLiteralInDerPre!(out, branch.condition, "ifEquations[$i].branches[$j].condition")
       for (k, eq) in enumerate(branch.residualEquations)
-        _flagLiteralInDerPre!(out, eq.exp, "ifEquations[$i].branches[$j].residualEquations[$k]")
+        _flagLiteralInDerPre!(out, toDAEExp(eq.exp), "ifEquations[$i].branches[$j].residualEquations[$k]")
       end
     end
   end
   for (i, whenEq) in enumerate(simCode.whenEquations)
     if hasproperty(whenEq, :condition)
-      _flagLiteralInDerPre!(out, whenEq.condition, "whenEquations[$i].condition")
+      _flagLiteralInDerPre!(out, toDAEExp(whenEq.condition), "whenEquations[$i].condition")
     end
     if hasproperty(whenEq, :whenStmtLst)
       for (j, stmt) in enumerate(whenEq.whenStmtLst)

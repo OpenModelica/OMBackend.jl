@@ -96,6 +96,13 @@ Differs from `expToJuliaExp` in `codeGen.jl` by:
     that as inconsistent. We allow it because IFEXP can survive when the if-
     expression-to-if-equation pass leaves expressions that depend on time).
 """
+#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp` (Phase 4b API). =#
+Base.@nospecializeinfer function expToJuliaExpDE(@nospecialize(exp::SimulationCode.Exp),
+                                                 @nospecialize(layout::DELayout),
+                                                 @nospecialize(simCode::SimulationCode.SIM_CODE))::Expr
+  return expToJuliaExpDE(SimulationCode.toDAEExp(exp), layout, simCode)
+end
+
 function expToJuliaExpDE(exp::DAE.Exp, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
   local hashTable = simCode.stringToSimVarHT
   @match exp begin
@@ -183,7 +190,7 @@ the caller is expected to detect this condition and refuse the model.
 function residualToDerivativeAssignment(eq::Union{BDAE.RESIDUAL_EQUATION, SimulationCode.RESIDUAL_EQUATION},
                                         layout::DELayout,
                                         simCode::SimulationCode.SIM_CODE)
-  local rhsExp = eq.exp
+  local rhsExp = SimulationCode.toDAEExp(eq.exp)
   #=
     The residualization pass produces equations of the form lhs - rhs = 0.
     Inspect the top-level shape: BINARY(SUB, lhs, rhs) is the canonical case.

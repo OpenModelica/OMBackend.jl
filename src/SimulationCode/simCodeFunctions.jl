@@ -362,16 +362,16 @@ end
   signatures.
 """
 function flattenRecordCallSites(simCode)
-  #= Expand record arguments in residual equations =#
-  local newResEqs = map(simCode.residualEquations) do eq
-    #= simCode.residualEquations is Vector{RESIDUAL_EQUATION} post-migration.
-       Pattern-match the same field shape and rebuild via typeof to preserve
-       identity. =#
+  #= Typed-eltype Vector to satisfy `Vector{RESIDUAL_EQUATION}` field under `infer=false`. =#
+  local newResEqs = RESIDUAL_EQUATION[]
+  sizehint!(newResEqs, length(simCode.residualEquations))
+  for eq in simCode.residualEquations
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      local newExp = expandRecordArgsInExp(eq.exp)
-      newExp === eq.exp ? eq : typeof(eq)(newExp, eq.source, eq.attr)
+      local expDAE = toDAEExp(eq.exp)
+      local newExp = expandRecordArgsInExp(expDAE)
+      push!(newResEqs, newExp === expDAE ? eq : typeof(eq)(newExp, eq.source, eq.attr))
     else
-      eq
+      push!(newResEqs, eq)
     end
   end
   @assign simCode.residualEquations = newResEqs
@@ -573,6 +573,11 @@ end
   - noEvent wrapper: strip and recurse into the inner expression
   - Otherwise: leave unchanged (code-gen handles with ModelingToolkit.ifelse)
 """
+# SIM.Exp delegation: BRANCH.condition / EQUATION.lhs|rhs are SIM.Exp post-migration.
+resolveConstantIfExp(exp::Exp)::Exp = toSimExp(resolveConstantIfExp(toDAEExp(exp)))
+resolveConstantIfExp(exp::Exp, simCode::SIM_CODE)::Exp =
+  toSimExp(resolveConstantIfExp(toDAEExp(exp), simCode))
+
 function resolveConstantIfExp(exp::DAE.Exp)::DAE.Exp
   @match exp begin
     DAE.IFEXP(DAE.BCONST(true), thenExp, _) => resolveConstantIfExp(thenExp)
@@ -709,6 +714,11 @@ end
   Try to evaluate a DAE condition expression to a Bool.
   Returns `true`, `false`, or `nothing` if evaluation is not possible.
 """
+# SIM.Exp delegation: callers post-migration pass SIM-native Exp.
+tryEvalCondition(cond::Exp)::Union{Bool, Nothing} = tryEvalCondition(toDAEExp(cond))
+tryEvalCondition(cond::Exp, simCode::SIM_CODE)::Union{Bool, Nothing} =
+  tryEvalCondition(toDAEExp(cond), simCode)
+
 Base.@nospecializeinfer function tryEvalCondition(@nospecialize(cond::DAE.Exp))::Union{Bool, Nothing}
   @match cond begin
     DAE.BCONST(val) => val

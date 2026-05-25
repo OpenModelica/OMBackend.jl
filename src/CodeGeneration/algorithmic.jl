@@ -811,6 +811,11 @@ end
   Since functions do not use the model HT the original name is preserved for algorithmic generation.
 For algorithmic code outside Modelica functions do not call this function.
 """
+#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp` (Phase 4b API). =#
+Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::SimulationCode.Exp))::Expr
+  return expToJuliaExpAlg(SimulationCode.toDAEExp(exp))
+end
+
 function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::Expr
   local expr::Expr = begin
     local int::Int64

@@ -649,7 +649,7 @@ function _whenStmtLstTargets(stmtLst, targetName::String)::Bool
   for stmt in stmtLst
     local lhsName = if stmt isa BDAE.ASSIGN || stmt isa SimulationCode.ASSIGN
       try
-        SimulationCode.string(stmt.left)
+        SimulationCode.string(_asDAE(stmt.left))
       catch
         ""
       end
@@ -783,13 +783,13 @@ Any other shape throws; the caller should have screened those out.
 """
 function equationSides(eq)::Tuple{DAE.Exp, DAE.Exp}
   if eq isa BDAE.EQUATION || eq isa SimulationCode.EQUATION
-    return (eq.lhs, eq.rhs)
+    return (SimulationCode.toDAEExp(eq.lhs), SimulationCode.toDAEExp(eq.rhs))
   elseif eq isa BDAE.COMPLEX_EQUATION
     return (eq.left, eq.right)
   elseif eq isa BDAE.ARRAY_EQUATION || eq isa SimulationCode.ARRAY_EQUATION
-    return (eq.left, eq.right)
+    return (SimulationCode.toDAEExp(eq.left), SimulationCode.toDAEExp(eq.right))
   elseif eq isa BDAE.RESIDUAL_EQUATION || eq isa SimulationCode.RESIDUAL_EQUATION
-    return (eq.exp, DAE.RCONST(0.0))
+    return (SimulationCode.toDAEExp(eq.exp), DAE.RCONST(0.0))
   end
   error("equationSides: no (lhs, rhs) for $(typeof(eq)); " *
         "caller should filter to EQUATION / COMPLEX_EQUATION / ARRAY_EQUATION / RESIDUAL_EQUATION.")
@@ -1395,7 +1395,7 @@ end
 
 function collectCalledFunctionNames!(names::Set{String},
                                      eq::Union{BDAE.RESIDUAL_EQUATION, SimulationCode.RESIDUAL_EQUATION})
-  collectCalledFunctionNames!(names, eq.exp)
+  collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.exp))
 end
 
 function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.EQUATION)
@@ -1403,9 +1403,19 @@ function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.EQUATION)
   collectCalledFunctionNames!(names, eq.rhs)
 end
 
+Base.@nospecializeinfer function collectCalledFunctionNames!(names::Set{String}, @nospecialize(eq::SimulationCode.EQUATION))
+  collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.lhs))
+  collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.rhs))
+end
+
 function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.ARRAY_EQUATION)
   collectCalledFunctionNames!(names, eq.left)
   collectCalledFunctionNames!(names, eq.right)
+end
+
+Base.@nospecializeinfer function collectCalledFunctionNames!(names::Set{String}, @nospecialize(eq::SimulationCode.ARRAY_EQUATION))
+  collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.left))
+  collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.right))
 end
 
 function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.SOLVED_EQUATION)
@@ -1424,26 +1434,30 @@ Unified WhenOperator RHS-cref collector that accepts both BDAE-side and
 SimCode-side operator records. BDAE variants delegate to
 `Backend.BDAEUtil.getRHSVariables`.
 """
+# Helper: SIM-side WhenOperators carry ::Exp; Util.getAllCrefs is DAE.Exp-typed.
+_asDAE(e::DAE.Exp) = e
+_asDAE(e::SimulationCode.Exp) = SimulationCode.toDAEExp(e)
+
 function getRHSVariables(op::Union{BDAE.ASSIGN, SimulationCode.ASSIGN})::Vector{DAE.ComponentRef}
-  return listArray(Util.getAllCrefs(op.right))
+  return listArray(Util.getAllCrefs(_asDAE(op.right)))
 end
 
 function getRHSVariables(op::Union{BDAE.REINIT, SimulationCode.REINIT})::Vector{DAE.ComponentRef}
-  return listArray(Util.getAllCrefs(op.value))
+  return listArray(Util.getAllCrefs(_asDAE(op.value)))
 end
 
 function getRHSVariables(op::Union{BDAE.NORETCALL, SimulationCode.NORETCALL})::Vector{DAE.ComponentRef}
-  return listArray(Util.getAllCrefs(op.exp))
+  return listArray(Util.getAllCrefs(_asDAE(op.exp)))
 end
 
 function getRHSVariables(op::Union{BDAE.ASSERT, SimulationCode.ASSERT})::Vector{DAE.ComponentRef}
-  return vcat(listArray(Util.getAllCrefs(op.condition)),
-              listArray(Util.getAllCrefs(op.message)),
-              listArray(Util.getAllCrefs(op.level)))
+  return vcat(listArray(Util.getAllCrefs(_asDAE(op.condition))),
+              listArray(Util.getAllCrefs(_asDAE(op.message))),
+              listArray(Util.getAllCrefs(_asDAE(op.level))))
 end
 
 function getRHSVariables(op::Union{BDAE.TERMINATE, SimulationCode.TERMINATE})::Vector{DAE.ComponentRef}
-  return listArray(Util.getAllCrefs(op.message))
+  return listArray(Util.getAllCrefs(_asDAE(op.message)))
 end
 
 function getRHSVariables(::Union{BDAE.RECOMPILATION, SimulationCode.RECOMPILATION})::Vector{DAE.ComponentRef}
@@ -1455,17 +1469,22 @@ function getRHSVariables(::Union{BDAE.AGENTIC_RECOMPILATION, SimulationCode.AGEN
 end
 
 function collectCalledFunctionNames!(names::Set{String}, stmt::Union{BDAE.ASSIGN, SimulationCode.ASSIGN})
-  collectCalledFunctionNames!(names, stmt.left)
-  collectCalledFunctionNames!(names, stmt.right)
+  collectCalledFunctionNames!(names, _asDAE(stmt.left))
+  collectCalledFunctionNames!(names, _asDAE(stmt.right))
 end
 
 function collectCalledFunctionNames!(names::Set{String}, stmt::Union{BDAE.REINIT, SimulationCode.REINIT})
   collectCalledFunctionNames!(names, stmt.stateVar)
-  collectCalledFunctionNames!(names, stmt.value)
+  collectCalledFunctionNames!(names, _asDAE(stmt.value))
 end
 
 function collectCalledFunctionNames!(names::Set{String}, stmt::Union{BDAE.NORETCALL, SimulationCode.NORETCALL})
-  collectCalledFunctionNames!(names, stmt.exp)
+  collectCalledFunctionNames!(names, _asDAE(stmt.exp))
+end
+
+# SIM-Exp passthrough so `branch.condition` (now ::Exp) routes through the DAE.Exp visitor.
+function collectCalledFunctionNames!(names::Set{String}, e::SimulationCode.Exp)
+  return collectCalledFunctionNames!(names, SimulationCode.toDAEExp(e))
 end
 
 function collectCalledFunctionNames!(names::Set{String}, ::Any)
@@ -1488,7 +1507,7 @@ function collectCalledFunctionNames!(names::Set{String}, simCode::SimulationCode
     end
   end
   for whenEq in simCode.whenEquations
-    collectCalledFunctionNames!(names, whenEq.whenEquation.condition)
+    collectCalledFunctionNames!(names, SimulationCode.toDAEExp(whenEq.whenEquation.condition))
     for stmt in whenEq.whenEquation.whenStmtLst
       collectCalledFunctionNames!(names, stmt)
     end
@@ -1642,20 +1661,24 @@ function _collectInitAlgLhsRhsCrefsDAEElse!(lhs::Set{String}, rhs::Set{String}, 
 end
 
 function _collectInitAlgLhsRhsCrefs!(lhs::Set{String}, rhs::Set{String}, op)
+  # Use DAE_identifierToString → canonicalName so cref strings match stringToSimVarHT key format
+  # (per-dim brackets `mem[1][1]`, not comma-join `mem[1, 1]`).
   local pushCrefsFrom = function(exp)
     exp === nothing && return
     for c in Util.getAllCrefs(exp)
-      push!(rhs, string(c))
+      push!(rhs, SimulationCode.DAE_identifierToString(c))
     end
   end
   if op isa BDAE.ASSIGN || op isa SimulationCode.ASSIGN
-    @match op.left begin
-      DAE.CREF(cr, _) => push!(lhs, string(cr))
+    # SimulationCode.ASSIGN.left is ::Exp (SIM.EXP_CREF) post-migration; convert to DAE for the match.
+    local leftDAE = op isa SimulationCode.ASSIGN ? SimulationCode.toDAEExp(op.left) : op.left
+    @match leftDAE begin
+      DAE.CREF(cr, _) => push!(lhs, SimulationCode.DAE_identifierToString(cr))
       _ => nothing
     end
     pushCrefsFrom(op.right)
   elseif op isa BDAE.REINIT || op isa SimulationCode.REINIT
-    push!(lhs, string(op.stateVar))
+    push!(lhs, SimulationCode.DAE_identifierToString(op.stateVar))
     pushCrefsFrom(op.value)
   elseif op isa BDAE.NORETCALL || op isa SimulationCode.NORETCALL
     pushCrefsFrom(op.exp)

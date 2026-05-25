@@ -32,6 +32,9 @@ Author: John Tinnerholm, john.tinnerholm@liu.se
 
 module CodeGeneration
 
+# Phase 4b unblocker; remove once SIM-Exp codegen overloads are split per-variant.
+Base.Experimental.@compiler_options compile=min optimize=0
+
 import DataStructures
 import ..FrontendUtil.Util
 using MetaModelica

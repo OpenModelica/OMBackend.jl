@@ -318,7 +318,8 @@ end
 """
 function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, simCode::SimulationCode.SIM_CODE, arrayIdx::Int)::Expr
   local wEq = eq.whenEquation
-  local cond = transformToZeroCrossingCondition(wEq.condition)
+  local wEqCondDAE = SimulationCode.toDAEExp(wEq.condition)
+  local cond = transformToZeroCrossingCondition(wEqCondDAE)
   ADD_CALLBACK()
   local callbacks = COUNT_CALLBACKS()
   #=
@@ -330,15 +331,15 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     Get all component references.
     If this set is empty it means that we have a condition involving continuous time
   =#
-  local isPeriodic = @match wEq.condition begin
+  local isPeriodic = @match wEqCondDAE begin
     DAE.CALL(Absyn.IDENT("sample"), args, attrs) => true
     _ => false
   end
-  local isContinuousCond::Bool = isContinousCondition(wEq.condition, simCode)
+  local isContinuousCond::Bool = isContinousCondition(wEqCondDAE, simCode)
   if isContinuousCond
     local isElseIf = if wEq.elsewhenPart !== nothing
       local elsePart = _elsewhenInner(wEq.elsewhenPart)
-      local elseCond = _elsewhenCondition(elsePart)
+      local elseCond = SimulationCode.toDAEExp(_elsewhenCondition(elsePart))
       cond2 = transformToZeroCrossingCondition(elseCond)
       cond == cond2
     else
@@ -401,7 +402,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
                             Symbol(string(x)),
                             getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
                   vcat(
-                    listArray(Util.getAllCrefs(wEq.condition)),
+                    listArray(Util.getAllCrefs(wEqCondDAE)),
                     vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...),
                     vcat(map(x -> getRHSVariables(x), _elsewhenStmtLst(elsePart))...)
                   ))...)
@@ -409,7 +410,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
               @error "integrator.dt was zero. Aborting."
               fail()
             end
-            if $(expToJuliaBoolMTK(wEq.condition, simCode))
+            if $(expToJuliaBoolMTK(wEqCondDAE, simCode))
               $(whenStatementsMTKIf...)
               add_tstop!(integrator, integrator.t + 1E-12) #=TODO: Some small number for now=#
             else
@@ -518,7 +519,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     end
   elseif isPeriodic
     local whenStmts = createWhenStatements(wEq.whenStmtLst, simCode)
-    @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = wEq.condition
+    @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = wEqCondDAE
     @match start <| interval <| tail = args
     quote
       $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
@@ -530,7 +531,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           fail()
         end
         #@info "t + dt = " t
-        #if (Bool($(expToJuliaExp(wEq.condition, simCode))))
+        #if (Bool($(expToJuliaExp(wEqCondDAE, simCode))))
         $(whenStmts...)
         #end
       end
@@ -644,7 +645,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
                           Symbol(string(x)),
                           getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
                 Util.getAllCrefs(cond))...)
-          local _result = $(expToJuliaBoolMTK(wEq.condition, simCode; cachedChange = true))
+          local _result = $(expToJuliaBoolMTK(wEqCondDAE, simCode; cachedChange = true))
           @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
           #= DiscreteCallback condition must return Bool per SciMLBase. Modelica
              Boolean discrete states are stored as Float64 in `integrator.u`
@@ -722,7 +723,8 @@ function createWhenStatements(whenStatements, simCode::SimulationCode.SIM_CODE):
         _emitWhenTupleElementAssign!(res, elem, :($tupSym[$i]), simCode)
       end
     elseif isAssign
-      (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.left)]
+      # SimulationCode.ASSIGN.left is ::Exp post-migration; HT keys are DAE-stringified.
+      (index, var) = simCode.stringToSimVarHT[SimulationCode.string(SimulationCode.toDAEExp(wStmt.left))]
       if typeof(var.varKind) === SimulationCode.STATE
         exp1 = expToJuliaExp(wStmt.left, simCode, varPrefix="integrator.u")
         exp2 = expToJuliaExp(wStmt.right, simCode)
@@ -801,6 +803,14 @@ end
   $(SIGNATURES)
 The context can be any type that contains a set of residual equations.
 """
+#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp` (Phase 4b API).
+   See comment on the MTK variant. =#
+Base.@nospecializeinfer function expToJuliaExp(@nospecialize(exp::SimulationCode.Exp),
+                                               @nospecialize(context::C),
+                                               varSuffix = ""; varPrefix = "x")::Expr where {C}
+  return expToJuliaExp(SimulationCode.toDAEExp(exp), context, varSuffix; varPrefix = varPrefix)
+end
+
 function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   hashTable = context.stringToSimVarHT
   local expr::Expr = begin

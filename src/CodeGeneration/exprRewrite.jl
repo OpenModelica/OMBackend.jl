@@ -7,7 +7,10 @@ instead of the old Symbolics round-trip.
 Find `:(der(x))` in an Expr tree. Returns the variable symbol or `nothing`.
 """
 function findDerivativeVar(expr::Expr)
-    if expr.head == :call && length(expr.args) >= 2 && expr.args[1] === :der
+    # Match both :der (DAE-emit) and :D (SIM-Exp-emit) so the residual→explicit
+    # rewrite recognises the derivative regardless of which codegen path produced it.
+    if expr.head == :call && length(expr.args) >= 2 &&
+       (expr.args[1] === :der || expr.args[1] === :D)
         return expr.args[2]
     end
     for a in expr.args
@@ -25,7 +28,8 @@ findDerivativeVar(x) = nothing
 Replace `:(der(var))` with `val` throughout an Expr tree. Returns a new Expr.
 """
 function substituteDer(expr::Expr, var, val)
-    if expr.head == :call && length(expr.args) >= 2 && expr.args[1] === :der && expr.args[2] == var
+    if expr.head == :call && length(expr.args) >= 2 &&
+       (expr.args[1] === :der || expr.args[1] === :D) && expr.args[2] == var
         return val
     end
     newargs = Any[substituteDer(a, var, val) for a in expr.args]

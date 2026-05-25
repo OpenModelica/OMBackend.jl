@@ -1179,7 +1179,7 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE)
   local aliasNames = Set{String}(entry.eliminatedName for entry in simCode.aliasMap)
   local solveBodyExprs = Expr[]
   for (i, varName) in enumerate(elimVars)
-    if containsDerCall(elimEqs[i].exp)
+    if containsDerCall(SimulationCode.toDAEExp(elimEqs[i].exp))
       continue
     end
     if varName in aliasNames
@@ -1227,8 +1227,12 @@ function createResidualEquationsMTK(stateVariables::Vector, algebraicVariables::
   end
   local eqs::Vector{Expr} = Expr[]
   for eq in equations
-    local eqDAEExp = eq.exp
-    local eqExp = :(0 ~ $(expToJuliaExpMTK(eqDAEExp, simCode; derSymbol=false)))
+    #= eq.exp is `SimulationCode.Exp` post Phase 4b field migration; the
+       `expToJuliaExpMTK(::SimulationCode.Exp, ...)` overload in
+       MTK_CodeGenerationUtil.jl walks SIM Exp natively for the
+       supported variants and delegates the rest back to the DAE
+       emitter via `toDAEExp`. =#
+    local eqExp = :(0 ~ $(expToJuliaExpMTK(eq.exp, simCode; derSymbol=false)))
     push!(eqs, eqExp)
   end
     return eqs
@@ -1275,34 +1279,36 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
     if isParametricOnlyEquation(ieq, simCode)
       continue
     end
+    local ieqLhsDAE = SimulationCode.toDAEExp(ieq.lhs)
+    local ieqRhsDAE = SimulationCode.toDAEExp(ieq.rhs)
     local lhs = try
-      expToJuliaExpMTK(ieq.lhs, simCode)
+      expToJuliaExpMTK(ieqLhsDAE, simCode)
     catch err
-      @warn "[CODEGEN: initialConstraints] failed to lower LHS; constraint dropped" lhs=ieq.lhs err
+      @warn "[CODEGEN: initialConstraints] failed to lower LHS; constraint dropped" lhs=ieqLhsDAE err
       continue
     end
     local rhs = try
-      @match ieq.rhs begin
-        DAE.CREF(DAE.CREF_IDENT("time", _, _), _) => expToJuliaExpMTK(ieq.rhs, simCode)
+      @match ieqRhsDAE begin
+        DAE.CREF(DAE.CREF_IDENT("time", _, _), _) => expToJuliaExpMTK(ieqRhsDAE, simCode)
         DAE.CREF(__) => begin
-          local crefAsStr = string(ieq.rhs)
+          local crefAsStr = string(ieqRhsDAE)
           if haskey(simCode.stringToSimVarHT, crefAsStr)
             local simCodeVar = last(simCode.stringToSimVarHT[crefAsStr])
             if SimulationCode.isStateOrAlgebraic(simCodeVar)
-              expToJuliaExpMTK(ieq.rhs, simCode)
+              expToJuliaExpMTK(ieqRhsDAE, simCode)
             elseif SimulationCode.hasBindingExp(simCodeVar)
               evalSimCodeParameter(simCodeVar, simCode)
             else
-              expToJuliaExpMTK(ieq.rhs, simCode)
+              expToJuliaExpMTK(ieqRhsDAE, simCode)
             end
           else
-            expToJuliaExpMTK(ieq.rhs, simCode)
+            expToJuliaExpMTK(ieqRhsDAE, simCode)
           end
         end
-        _ => evalDAE_Expression(ieq.rhs, simCode)
+        _ => evalDAE_Expression(ieqRhsDAE, simCode)
       end
     catch err
-      @warn "[CODEGEN: initialConstraints] failed to lower RHS; constraint dropped" rhs=ieq.rhs err
+      @warn "[CODEGEN: initialConstraints] failed to lower RHS; constraint dropped" rhs=ieqRhsDAE err
       continue
     end
     push!(result, :($lhs ~ $rhs))
@@ -1325,9 +1331,11 @@ function generateInitialEquations(initialEqs, simCode::SimulationCode.SIM_CODE; 
     if isParametricOnlyEquation(ieq, simCode)
       continue
     end
+    local ieqLhsDAE = SimulationCode.toDAEExp(ieq.lhs)
+    local ieqRhsDAE = SimulationCode.toDAEExp(ieq.rhs)
     #= LHS will typically be a variable. Don't have to be though.. =#
-    lhs = expToJuliaExpMTK(ieq.lhs, simCode)
-    rhs = @match ieq.rhs begin
+    lhs = expToJuliaExpMTK(ieqLhsDAE, simCode)
+    rhs = @match ieqRhsDAE begin
       #= `time` is the independent variable and never appears in
          stringToSimVarHT. Route it directly through expToJuliaExpMTK
          which emits the Julia symbol `t` for it. Without this guard
@@ -1336,24 +1344,24 @@ function generateInitialEquations(initialEqs, simCode::SimulationCode.SIM_CODE; 
          Modelica.Fluid.Examples.ControlledTankSystem.ControlledTanks
          whose initial equations contain `<var> = time`. =#
       DAE.CREF(DAE.CREF_IDENT("time", _, _), _) => begin
-        expToJuliaExpMTK(ieq.rhs, simCode)
+        expToJuliaExpMTK(ieqRhsDAE, simCode)
       end
       DAE.CREF(__) => begin
         #= Evaluate the right hand side at this point =#
-        local crefAsStr = string(ieq.rhs)
+        local crefAsStr = string(ieqRhsDAE)
         local simCodeVar = last(simCode.stringToSimVarHT[crefAsStr])
         local res = if SimulationCode.isStateOrAlgebraic(simCodeVar)
-          expToJuliaExpMTK(ieq.rhs, simCode)
+          expToJuliaExpMTK(ieqRhsDAE, simCode)
         elseif SimulationCode.hasBindingExp(simCodeVar)
           evalSimCodeParameter(simCodeVar, simCode)
         else
           #= Parameter without binding (fixed=false): leave as symbol =#
-          expToJuliaExpMTK(ieq.rhs, simCode)
+          expToJuliaExpMTK(ieqRhsDAE, simCode)
         end
       end
       #= For more complicated expressions, we do local constant folding. =#
       _ => begin
-        res = evalDAE_Expression(ieq.rhs, simCode)
+        res = evalDAE_Expression(ieqRhsDAE, simCode)
         res
       end
     end
@@ -1977,7 +1985,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
      ARRAY_PARAMETERs in HT so we only emit parents that actually exist. =#
   local _residualCrefs = Set{String}()
   for eq in simCode.residualEquations
-    SimulationCode.collectCrefNames!(_residualCrefs, eq.exp)
+    SimulationCode.collectCrefNames!(_residualCrefs, SimulationCode.toDAEExp(eq.exp))
   end
   for _n in _residualCrefs
     local _bracket = findfirst('[', _n)
@@ -2634,7 +2642,7 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
   @debug "[MTK GEN: when] createWhenStatementsMTK" statements=nWhenStatements
   for wStmt in whenStatements
     if wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN
-      if wStmt.left isa DAE.TUPLE
+      if wStmt.left isa DAE.TUPLE || wStmt.left isa SimulationCode.TUPLE
         local tupSym = gensym(:tupResult)
         local rhsExpr = expToJuliaExpMTK(wStmt.right, simCode;
                                          varPrefix = varPrefix, varSuffix = varSuffix)
@@ -2645,7 +2653,8 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
           _emitWhenTupleElementAssignMTK!(res, elem, :($tupSym[$i]), simCode)
         end
       else
-        local leftStr = SimulationCode.string(wStmt.left)
+        # SimulationCode.ASSIGN.left is ::Exp post-migration; HT keys are DAE-stringified.
+        local leftStr = SimulationCode.string(SimulationCode.toDAEExp(wStmt.left))
         (index, var) = simCode.stringToSimVarHT[leftStr]
         local lhsSym = Symbol(string(var.name))
         push!(res, quote
@@ -2716,7 +2725,9 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
   if wStmt isa BDAE.NORETCALL || wStmt isa SimulationCode.NORETCALL
     return :( $(lowerAlg(wStmt.exp)); nothing )
   elseif wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN
-    local name = @match wStmt.left begin
+    # SimulationCode.ASSIGN.left is ::Exp post-migration; convert to DAE for the @match.
+    local leftDAE = wStmt isa SimulationCode.ASSIGN ? SimulationCode.toDAEExp(wStmt.left) : wStmt.left
+    local name = @match leftDAE begin
       DAE.CREF(cr, _) => crefName(cr)
       _ => nothing
     end
@@ -2776,7 +2787,9 @@ function _initialWhenOpToJuliaEarly(wStmt, simCode::SimulationCode.SIM_CODE,
   if wStmt isa BDAE.NORETCALL || wStmt isa SimulationCode.NORETCALL
     return :( $(lowerAlg(wStmt.exp)); nothing )
   elseif wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN
-    local name = @match wStmt.left begin
+    # SimulationCode.ASSIGN.left is ::Exp post-migration; convert to DAE for the @match.
+    local leftDAE = wStmt isa SimulationCode.ASSIGN ? SimulationCode.toDAEExp(wStmt.left) : wStmt.left
+    local name = @match leftDAE begin
       DAE.CREF(cr, _) => crefName(cr)
       _ => nothing
     end

@@ -243,7 +243,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   local initialState = initialModeInference(equationSystem)
   local topVars = String[]
   #= Use recursion to generate submodels =#
-  local sharedVariables = if !isempty(auxEquationSystems)
+  local sharedVariables::Vector{String} = if !isempty(auxEquationSystems)
     computeSharedVariables(auxEquationSystems, allBackendVars)
   else
     String[]
@@ -457,7 +457,7 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
       (isSingular, matchOrder, digraph, stronglyConnectedComponents) =
         matchAndCheckStronglyConnectedComponents(eqVariableMapping, numberOfVariablesInMapping, stringToSimVarHT)
       #= Add the branch to the collection. =#
-      branch = BRANCH(condition,
+      branch = BRANCH(toSimExp(condition),
                       branchEquations,
                       identifier,
                       target,
@@ -480,7 +480,7 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
     if listEmpty(BDAE_ifEquation.eqnsfalse)
       break
     end
-    condition = DAE.SCONST("ELSE_BRANCH")
+    condition = SCONST("ELSE_BRANCH")
     #= Same defensive filtering as the eqnstrue path above. =#
     local rawElseBranch = listArray(BDAE_ifEquation.eqnsfalse)
     branchEquations = SimulationCode.RESIDUAL_EQUATION[]
@@ -502,7 +502,7 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
     local numberOfVariablesInMapping = length(eqVariableMapping.keys)
     (isSingular, matchOrder, digraph, stronglyConnectedComponents) =
       matchAndCheckStronglyConnectedComponents(eqVariableMapping, numberOfVariablesInMapping, stringToSimVarHT)
-    branch = BRANCH(condition,
+    branch = BRANCH(toSimExp(condition),
                     branchEquations,
                     identifier,
                     ELSE_BRANCH, #The target of the else branch is -1
@@ -857,6 +857,9 @@ function _reconstructScalarizedArrayDAE(baseName::String, ht)::Union{DAE.Exp, No
   end
   return nothing
 end
+
+# SIM.Exp delegation: round-trip to DAE.Exp until the visitor is SIM-native.
+_inlineParamsInExp(exp::Exp, ht)::Exp = toSimExp(_inlineParamsInExp(toDAEExp(exp), ht))
 
 #= Substitute parameter CREFs with their literal bindings throughout a DAE.Exp.
    Handles PARAMETER (scalar), ARRAY_PARAMETER (direct binding), and scalarized

@@ -192,7 +192,7 @@ end
 The function list contains the sequential parts of a modelica model, that is the different functions that the model might use.
 This is not part of the lowering process but it is to be generated before we generate MTK target code
 """
-function translate(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatModel};
+Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatModel});
                    functionList = nothing,
                    BackendMode = MTK_MODE,
                    warnMissingStartValues = nothing,

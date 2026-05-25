@@ -35,6 +35,9 @@
 """
 module SimulationCode
 
+# Phase 4b unblocker; remove once recursive Exp walkers are split per-variant.
+Base.Experimental.@compiler_options compile=min infer=false optimize=0
+
 using MetaModelica
 using DataStructures
 using Setfield
@@ -56,10 +59,12 @@ import ..BackendUtil.GraphAlgorithms
 import ..FrontendUtil.Util
 
 include("simCodeData.jl")
+include("simCodeTraverse.jl")
 include("simCodeUtil.jl")
 include("simCodeDump.jl")
 include("simulationCodeTransformation.jl")
 include("simCodeFunctions.jl")
 include("simCodeCheck.jl")
+include("simCodeExpBridge.jl")
 
 end # module SimulationCode

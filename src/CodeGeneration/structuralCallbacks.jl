@@ -49,9 +49,11 @@ end
 function createStructuralCallback(simCode, simCodeStructuralTransition::SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION, idx)
   local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition, 0)
+  # SIM.Exp -> DAE.Exp at the boundary; DAE-typed helpers below.
+  local conditionDAE = SimulationCode.toDAEExp(structuralTransition.transistionCondition)
 
-  if isContinousCondition(structuralTransition.transistionCondition, simCode)
-    local cond = transformToZeroCrossingCondition(structuralTransition.transistionCondition)
+  if isContinousCondition(conditionDAE, simCode)
+    local cond = transformToZeroCrossingCondition(conditionDAE)
     quote
       function $(Symbol(callbackName))(destinationSystem, callbacks)
         #= Represents a structural change. =#
@@ -78,7 +80,7 @@ function createStructuralCallback(simCode, simCodeStructuralTransition::Simulati
           structuralChange.structureChanged = true
         end
         function condition(x, t, integrator)
-          return $(expToJuliaExp(structuralTransition.transistionCondition, simCode))
+          return $(expToJuliaExp(conditionDAE, simCode))
         end
         local cb = DiscreteCallback(condition, affect!)
         return (cb, structuralChange)
@@ -143,7 +145,7 @@ function createStructuralCallback(simCode,
                                   idx)
   local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition, idx)
-  local whenCondition = structuralTransition.whenEquation.condition
+  local whenCondition = SimulationCode.toDAEExp(structuralTransition.whenEquation.condition)
   local stmtLst = structuralTransition.whenEquation.whenStmtLst
   local stringToSimVarHT = simCode.stringToSimVarHT
   (whenOperators, recompilationDirective) = createStructuralWhenStatements(stmtLst, simCode)
@@ -269,12 +271,15 @@ function createStructuralCallback(simCode,
   else
     #= Standard recompilation: new value is determined by a Modelica expression =#
     local componentToModify = string(recompilationDirective.componentToChange)
-    local newValue::Expr = if typeof(recompilationDirective.newValue) === DAE.CREF
-      local variableSpec = last(simCode.stringToSimVarHT[string(recompilationDirective.newValue)])
+    # RECOMPILATION.newValue is ::Exp post-migration; collapse to DAE.Exp for both
+    # the cref-as-string lookup and the codegen call.
+    local newValueDAE = SimulationCode.toDAEExp(recompilationDirective.newValue)
+    local newValue::Expr = if typeof(newValueDAE) === DAE.CREF
+      local variableSpec = last(simCode.stringToSimVarHT[string(newValueDAE)])
       @match SimulationCode.SIMVAR(name, index, SimulationCode.PARAMETER(SOME(bindExp)), _) = variableSpec
       expToJuliaExpMTK(bindExp, simCode)
     else
-      newValue = expToJuliaExpMTK(recompilationDirective.newValue, simCode)
+      newValue = expToJuliaExpMTK(newValueDAE, simCode)
       evalExpr = quote
           variableSpec = last(stringToSimVarHT[$(componentToModify)])
           @match SimulationCode.SIMVAR(name, index, SimulationCode.PARAMETER(SOME(bindExp)), _) = variableSpec
