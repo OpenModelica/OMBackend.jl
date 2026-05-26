@@ -207,6 +207,7 @@ toSimExp(e::DAE.ARRAY)::Exp =
 toSimExp(e::DAE.ASUB)::Exp =
   ASUB(toSimExp(e.exp), Exp[toSimExp(x) for x in e.sub])
 toSimExp(e::DAE.TSUB)::Exp = TSUB(toSimExp(e.exp), Int(e.ix), e.ty)
+toSimExp(e::DAE.RSUB)::Exp = RSUB(toSimExp(e.exp), Int(e.ix), String(e.fieldName), e.ty)
 toSimExp(e::DAE.CAST)::Exp = CAST(e.ty, toSimExp(e.exp))
 toSimExp(e::DAE.CALL)::Exp =
   CALL(e.path, Exp[toSimExp(a) for a in e.expLst], e.attr)
@@ -256,6 +257,7 @@ toDAEExp(e::ASUB)::DAE.Exp =
   DAE.ASUB(toDAEExp(e.exp),
            MetaModelica.list((toDAEExp(x) for x in e.subs)...))
 toDAEExp(e::TSUB)::DAE.Exp = DAE.TSUB(toDAEExp(e.exp), e.index, toDAEType(e.ty))
+toDAEExp(e::RSUB)::DAE.Exp = DAE.RSUB(toDAEExp(e.exp), e.index, e.fieldName, toDAEType(e.ty))
 toDAEExp(e::CAST)::DAE.Exp = DAE.CAST(toDAEType(e.ty), toDAEExp(e.exp))
 toDAEExp(e::CALL)::DAE.Exp =
   DAE.CALL(e.path,
@@ -275,6 +277,8 @@ EXP_CREF(cref::SimCref, ty::DAE.Type) = EXP_CREF(cref, toSimType(ty))
 ARRAY_EXP(ty::DAE.Type, scalar::Bool, elements::Vector{Exp}) = ARRAY_EXP(toSimType(ty), scalar, elements)
 CAST(ty::DAE.Type, exp::Exp) = CAST(toSimType(ty), exp)
 TSUB(exp::Exp, index::Int, ty::DAE.Type) = TSUB(exp, index, toSimType(ty))
+RSUB(exp::Exp, index::Int, fieldName::String, ty::DAE.Type) =
+  RSUB(exp, index, fieldName, toSimType(ty))
 RECORD(path::Absyn.Path, exps::Vector{Exp}, fieldNames::Vector{String}, ty::DAE.Type) =
   RECORD(path, exps, fieldNames, toSimType(ty))
 

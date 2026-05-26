@@ -727,6 +727,8 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
           solve(_fallbackProb, _solver; callback=callbacks, kwargs...)
         end
       end
+      #= Run `when terminal()` bodies once against the final solution (gated: emitted only if the model has a terminal event). =#
+      $(createTerminalBodyRunner(simCode))
       _sol
     end
   end
@@ -986,6 +988,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       end
       eqs = collect(Iterators.flatten(equationComponents))
       eqs = Base.invokelatest(OMBackend.CodeGeneration.filterConstantEquations, eqs)
+      #= System(eqs, ...) requires eqs::Vector{Equation}; an equation-free model yields an untyped empty vector. =#
+      eqs = convert(Vector{Symbolics.Equation}, eqs)
       #= Events and observed equations =#
       $(IF_EQUATION_EVENT_DECLARATION)
       $(generateAliasObservedBlock(simCode))
@@ -2604,7 +2608,7 @@ function generateExternalRuntimeImport()::Expr
   :(import OMRuntimeExternalC)
 end
 
-function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs::DAE.Exp,
+function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
                                           rhsAccess, simCode::SimulationCode.SIM_CODE)
   @match lhs begin
     DAE.CREF(DAE.WILD(), _) => nothing
@@ -2622,6 +2626,26 @@ function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs::DAE.Exp,
             end)
     end
     DAE.ARRAY(_, _, elements) => begin
+      local i = 0
+      for elem in elements
+        i += 1
+        _emitWhenTupleElementAssignMTK!(res, elem, :($rhsAccess[$i]), simCode)
+      end
+    end
+    SimulationCode.EXP_CREF(cref, _) => begin
+      local name = string(cref)
+      local entry = get(simCode.stringToSimVarHT, name, nothing)
+      if entry === nothing
+        push!(res, :($(Symbol(name)) = $rhsAccess))
+        return res
+      end
+      local (_, var) = entry
+      push!(res, quote
+              idx = lookuptableStates[Symbol($(string(var.name)))]
+              integrator.u[idx] = $rhsAccess
+            end)
+    end
+    SimulationCode.ARRAY_EXP(_, _, elements) => begin
       local i = 0
       for elem in elements
         i += 1
@@ -2699,6 +2723,71 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
     end
   end
   return res
+end
+
+#= True when a when-equation's condition is the Modelica `terminal()` operator. =#
+function _isTerminalWhen(@nospecialize(eq))::Bool
+  (eq isa BDAE.WHEN_EQUATION || eq isa SimulationCode.WHEN_EQUATION) || return false
+  return @match SimulationCode.toDAEExp(eq.whenEquation.condition) begin
+    DAE.CALL(Absyn.IDENT("terminal"), _, _) => true
+    _ => false
+  end
+end
+
+#= Post-solve runner for `when terminal()` bodies, or `nothing` when the model
+   has none (so models without a terminal event are unchanged). The bodies
+   reuse `createWhenStatementsMTK` by mocking `integrator` from the final
+   solution point — writes land in `_sol.u[end]` using the same state-index
+   convention the discrete-callback affects rely on. Runs only on success. =#
+function createTerminalBodyRunner(simCode::SimulationCode.SIM_CODE)
+  local terminalWhens = filter(_isTerminalWhen, simCode.whenEquations)
+  isempty(terminalWhens) && return nothing
+  local modelFns = Set(replace(f.name, "." => "_") for f in simCode.functions)
+  local calledNames = Set{String}()
+  local perWhen = Expr[]
+  for eq in terminalWhens
+    local body = eq.whenEquation.whenStmtLst
+    for s in body
+      collectCalledFunctionNames!(calledNames, s)
+    end
+    for c in vcat(map(s -> getRHSVariables(s), body)...)
+      local entry = get(simCode.stringToSimVarHT, string(c), nothing)
+      #= String parameters are emitted as module-level constants; referencing them
+         directly avoids shadowing that binding with a nonexistent state lookup. =#
+      entry !== nothing && entry[2].varKind isa SimulationCode.STRING && continue
+      push!(perWhen, Expr(:(=), Symbol(string(c)), getIdxForLookupMTK(c, simCode)))
+    end
+    append!(perWhen, createWhenStatementsMTK(body, simCode))
+  end
+  #= Bind external functions the body calls to their concrete OMBackend.CodeGeneration
+     RTG wrapper: the bare model-module name is the @register_symbolic binding (symbolic
+     only), which has no method for concrete runtime arguments. =#
+  local fnRebinds = Expr[]
+  for n in calledNames
+    local nn = replace(n, "." => "_")
+    nn in modelFns && push!(fnRebinds, :(local $(Symbol(nn)) = OMBackend.CodeGeneration.$(Symbol(nn))))
+  end
+  return quote
+    if _sol.retcode == ModelingToolkit.SciMLBase.ReturnCode.Success
+      #= Best-effort: a terminal body runs after a completed, valid solution, so a
+         body we cannot evaluate (e.g. an unsupported external call) warns rather
+         than discarding the result. =#
+      try
+        let integrator = (u = _sol.u[end], t = _sol.t[end], f = _sol.prob.f, dt = 0.0),
+            x = _sol.u[end],
+            t = _sol.t[end],
+            p = _sol.prob.p,
+            lookuptableStates = Dict(sym => i for (i, sym) in enumerate(OMBackend.CodeGeneration.getStatesAsSymbols(_sol.prob.f))),
+            lookuptableParams = Dict(sym => i for (i, sym) in enumerate(OMBackend.CodeGeneration.getParametersAsSymbols(_sol.prob.f)))
+          local idx = 0
+          $(fnRebinds...)
+          $(perWhen...)
+        end
+      catch _terminalErr
+        @warn "when terminal() body could not be evaluated; returning the completed solution unchanged" exception = _terminalErr
+      end
+    end
+  end
 end
 
 #= Lower a single BDAE.WhenOperator from an INITIAL_ALGORITHM body to a Julia

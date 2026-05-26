@@ -49,6 +49,10 @@ function _traverseChildrenTopDown(e::TSUB, visitor, arg)
   (ne, narg) = traverseExpTopDown(e.exp, visitor, arg)
   return (ne === e.exp ? e : TSUB(ne, e.index, e.ty), narg)
 end
+function _traverseChildrenTopDown(e::RSUB, visitor, arg)
+  (ne, narg) = traverseExpTopDown(e.exp, visitor, arg)
+  return (ne === e.exp ? e : RSUB(ne, e.index, e.fieldName, e.ty), narg)
+end
 
 # Binary shapes
 function _traverseChildrenTopDown(e::BINARY, visitor, arg)
@@ -155,6 +159,10 @@ end
 function _traverseChildrenBottomUp(e::TSUB, visitor, arg)
   (ne, narg) = traverseExpBottomUp(e.exp, visitor, arg)
   return (ne === e.exp ? e : TSUB(ne, e.index, e.ty), narg)
+end
+function _traverseChildrenBottomUp(e::RSUB, visitor, arg)
+  (ne, narg) = traverseExpBottomUp(e.exp, visitor, arg)
+  return (ne === e.exp ? e : RSUB(ne, e.index, e.fieldName, e.ty), narg)
 end
 function _traverseChildrenBottomUp(e::BINARY, visitor, arg)
   (ne1, a1) = traverseExpBottomUp(e.exp1, visitor, arg)

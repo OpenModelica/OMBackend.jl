@@ -101,6 +101,8 @@ function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode; cachedChange::
        through the `__runInitialAlgorithm!` path the BDAECreate lifter sets
        up. So `initial()` as a runtime check is always false here. =#
     DAE.CALL(Absyn.IDENT("initial"), _, _) => :(false)
+    #= `terminal()` fires only at end-of-simulation; the per-step DiscreteCallback has no finalize hook, so it never triggers here. =#
+    DAE.CALL(Absyn.IDENT("terminal"), _, _) => :(false)
     _ => expToJuliaExpMTK(cond, simCode)
   end
 end
@@ -628,6 +630,19 @@ function expToJuliaExpMTK(exp::SimulationCode.TSUB, simCode::SimulationCode.SIM_
   local tupleExpr = expToJuliaExpMTK(exp.exp, simCode;
                                       varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
   return :($tupleExpr[$(exp.index)])
+end
+
+function expToJuliaExpMTK(exp::SimulationCode.RSUB, simCode::SimulationCode.SIM_CODE;
+                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
+  local innerJL = expToJuliaExpMTK(exp.exp, simCode;
+                                    varPrefix = varPrefix, varSuffix = varSuffix,
+                                    derSymbol = derSymbol)
+  if exp.fieldName == "re"
+    return :(OMBackend.CodeGeneration._recordFieldRe($innerJL))
+  elseif exp.fieldName == "im"
+    return :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
+  end
+  return :(getproperty($innerJL, $(QuoteNode(Symbol(exp.fieldName)))))
 end
 
 function expToJuliaExpMTK(exp::SimulationCode.ARRAY_EXP, simCode::SimulationCode.SIM_CODE;
@@ -1861,6 +1876,9 @@ function generateCastExpressionMTK(@nospecialize(ty::DAE.Type), @nospecialize(ex
   return expr
 end
 
+# TODO: unify cref resolution into one function consulting both the SimCode
+# (state / numeric-param lookup tables) and the module-level bindings (String
+# parameters, data structures), so callers need not special-case the latter.
 function getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode)
   local crefAsStr = string(x)
   if crefAsStr == "time"

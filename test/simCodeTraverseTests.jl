@@ -267,6 +267,7 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       @test e2jEqualsOracle(SC.BINARY(simCref("x"), SC.OP_MUL, SC.RCONST(2.0)), sc)    # cref inside expr
       @test e2jEqualsOracle(SC.IFEXP(SC.RELATION(simCref("x"), SC.OP_GREATER, SC.RCONST(0.0), 0),
                                      SC.RCONST(1.0), SC.RCONST(2.0)), sc)
+      @test e2jEqualsOracle(SC.RSUB(simCref("x"), 1, "re", T_R), sc)
       @test e2jEqualsOracle(simCref("time"), sc)                                       # time -> t (ty isa T_REAL branch)
       #= CAST / ARRAY_EXP arms delegate into generateCastExpressionMTK / handleArrayExp,
          which need a real model's context — not cleanly mockable, so LRT-gated. =#
@@ -335,6 +336,7 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       @test flagCountEq(SC.IFEXP(SC.RELATION(simCref("x"), SC.OP_LESS, SC.RCONST(0.0), 0),
                                  simCref("x"), SC.RCONST(1.0)))
       @test flagCountEq(SC.UNARY(SC.OP_UMINUS, SC.BINARY(simCref("x"), SC.OP_MUL, simCref("x"))))
+      @test flagCountEq(SC.RSUB(simCref("x"), 1, "re", T_R))
     end
 
     @testset "SimCodeCheck collectors/flaggers SIM-native == DAE oracle" begin
@@ -360,6 +362,7 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       @test crefNamesEq(SC.BINARY(simCref("x"), SC.OP_ADD, simCref("z")), kn)
       @test derNamesEq(simCall("der", daeCrefExp("x")))                                   # der(x) -> "x"
       @test derNamesEq(SC.BINARY(simCall("der", daeCrefExp("x")), SC.OP_ADD, simCref("y")))
+      @test derNamesEq(SC.RSUB(simCall("der", daeCrefExp("x")), 1, "re", T_R))
       @test litDerPreEq(simCall("der", DAEx.RCONST(0.0)))                                 # der(literal) -> warn
       @test litDerPreEq(simCall("der", daeCrefExp("x")))                                  # der(cref) -> no warn
       @test litDerPreEq(simCall("pre", DAEx.ICONST(3)))                                   # pre(literal) -> warn
@@ -412,6 +415,9 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       local p = SC.PARAMETER(SOME(SC.RCONST(1.0)))
       @test p.bindExp isa SOME && p.bindExp.data isa SC.Exp
       @test SC.ARRAY(Int[2]).bindExp === NONE()
+      local rsub = SC.toSimExp(DAEx.RSUB(daeCrefExp("x"), 1, "re", T_R))
+      @test rsub isa SC.RSUB
+      @test daeStructEq(SC.toDAEExp(rsub), DAEx.RSUB(daeCrefExp("x"), 1, "re", T_R))
     end
 
     @testset "collectCrefNames! SIM-native == DAE oracle" begin
@@ -423,6 +429,7 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       @test crefNamesEq(simCref("a"))
       @test crefNamesEq(SC.BINARY(simCref("a"), SC.OP_ADD, simCref("b")))
       @test crefNamesEq(SC.IFEXP(simCref("c"), simCref("t"), simCref("e")))
+      @test crefNamesEq(SC.RSUB(simCref("rec"), 1, "re", T_R))
       @test crefNamesEq(simCall("f", daeCrefExp("p"), daeCrefExp("q")))
       @test crefNamesEq(SC.ARRAY_EXP(T_R, true, SC.Exp[simCref("u"), simCref("v")]))
       @test crefNamesEq(SC.BINARY(simCall("g", daeCrefExp("x")), SC.OP_MUL,

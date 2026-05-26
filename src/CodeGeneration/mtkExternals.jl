@@ -1725,20 +1725,25 @@ function dae_order_lowering(eqs, iv, unknown_vars)
 end
 
 function getStatesAsSymbolicVariables(odeFunc::ODEFunction)
+  #= A hand-built RHS closure has no attached MTK system (.sys === nothing) and thus no symbolic states. =#
+  odeFunc.sys === nothing && return SymbolicUtils.BasicSymbolic[]
   return ModelingToolkit.get_unknowns(odeFunc.sys)
 end
 
 function getStatesAsSymbols(odeFunc::ODEFunction)
+  odeFunc.sys === nothing && return Symbol[]
   local states = ModelingToolkit.get_unknowns(odeFunc.sys)
   map(x->x.f.name, states)
 end
 
 function getStatesAsSymbols(daeFunc::ModelingToolkit.SciMLBase.DAEFunction)
+  daeFunc.sys === nothing && return Symbol[]
   local states = ModelingToolkit.get_unknowns(daeFunc.sys)
   map(x->x.f.name, states)
 end
 
 function getParametersAsSymbols(odeFunc::ODEFunction)
+  odeFunc.sys === nothing && return Symbol[]
   local params = ModelingToolkit.parameters(odeFunc.sys)
   map(params) do x
     local uw = SymbolicUtils.unwrap(x)
@@ -1749,6 +1754,7 @@ function getParametersAsSymbols(odeFunc::ODEFunction)
 end
 
 function getParametersAsSymbols(daeFunc::ModelingToolkit.SciMLBase.DAEFunction)
+  daeFunc.sys === nothing && return Symbol[]
   local params = ModelingToolkit.parameters(daeFunc.sys)
   map(params) do x
     local uw = SymbolicUtils.unwrap(x)

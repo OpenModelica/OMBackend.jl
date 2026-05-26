@@ -190,6 +190,14 @@ struct TSUB <: Exp
   ty::SType
 end
 
+"Record field subscript `e.fieldName`."
+struct RSUB <: Exp
+  exp::Exp
+  index::Int
+  fieldName::String
+  ty::SType
+end
+
 "Modelica function call `path(args...)`. Call attributes (builtin /
 ext / etc.) are preserved via `attr` because the codegen targets care
 about them; the args list is the SimCode-recursive part."
