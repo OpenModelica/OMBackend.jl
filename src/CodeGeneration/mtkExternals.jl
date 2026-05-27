@@ -324,6 +324,7 @@ end
 # `type = Real` explicitly, poisoning subsequent sums and breaking
 # `-(::SymReal, ::SymReal)` in MTK alias_elimination.
 SymbolicUtils._promote_symtype(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, args) = Real
+SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 
 # Same reason for shape. Scalar-returning extractor RGFs must be reported as
 # scalar (`ShapeVecT()`) rather than the default `Unknown(-1)` so they can be
@@ -332,6 +333,8 @@ SymbolicUtils._promote_symtype(::RuntimeGeneratedFunctions.RuntimeGeneratedFunct
 # `+`/`-`). Without this, a wrapper whose body returns a Modelica vector can
 # poison a sum with shape `Unknown(2)`.
 SymbolicUtils.promote_shape(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::typeof(floor), args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::typeof(floor), arg::SymbolicUtils.Unknown) = SymbolicUtils.ShapeVecT()
 
 """
     makeSymbolicTerm(f, args)

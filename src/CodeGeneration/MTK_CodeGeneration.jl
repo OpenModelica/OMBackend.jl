@@ -684,7 +684,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
           local _nCheck = min(_n, length(_unknowns))
           local _hasDiscreteAlgUnknown = any(i -> _mm[i,i] == 0 && string(_unknowns[i]) in _discreteUnknownNames, 1:_nCheck)
           if _hasDiscreteAlgUnknown
-            @info "[MTK GEN: solver] discrete algebraic DAE detected, switching default $(_solverName) -> FBDF"
+            @info "[MTK GEN: solver] algebraic rows involving generated discrete variables detected in mass-matrix system; switching default $(_solverName) -> FBDF"
             _solver = FBDF(autodiff=false)
           end
         end
@@ -876,6 +876,46 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   stateVariablesSym = vcat(discreteVariablesSym,
                            stateVariablesSym,
                            occVariablesSym)
+  local (_ifEqRelay_eqs, _ifEqRelay_aliases) = eliminateIfEqRelays(EQUATIONS)
+  EQUATIONS = _ifEqRelay_eqs
+  if !isempty(_ifEqRelay_aliases)
+    @info "[RELAY] aliases" _ifEqRelay_aliases
+    local _drop = Set(keys(_ifEqRelay_aliases))
+    local _dropStr = Set(string.(keys(_ifEqRelay_aliases)))
+    stateVariablesSym = filter(s -> s ∉ _drop, stateVariablesSym)
+    algebraicVariablesSym = filter(s -> s ∉ _drop, algebraicVariablesSym)
+    algebraicVariables = filter(s -> s ∉ _dropStr, algebraicVariables)
+    irreducibleSyms = filter(s -> s ∉ _drop, irreducibleSyms)
+    local _keepPair = eq -> begin
+      local inner = _unwrapBlock(eq)
+      if inner isa Expr && inner.head === :call && length(inner.args) == 3 && inner.args[1] === :(=>)
+        inner.args[2] isa Symbol && inner.args[2] in _drop && return false
+      end
+      true
+    end
+    local _keepDummy = eq -> begin
+      local inner = _unwrapBlock(eq)
+      if inner isa Expr && inner.head === :call && length(inner.args) == 3 && inner.args[1] === :~
+        local lhs = _unwrapBlock(inner.args[2])
+        if lhs isa Expr && lhs.head === :call && length(lhs.args) == 2 &&
+           (lhs.args[1] === :der || lhs.args[1] === :D)
+          local sym = _simpleLeafSymbol(lhs.args[2])
+          sym !== nothing && sym in _drop && return false
+        end
+      end
+      true
+    end
+    local _nBefore = length(INITIAL_GUESS_EQUATIONS)
+    INITIAL_GUESS_EQUATIONS = filter(_keepPair, INITIAL_GUESS_EQUATIONS)
+    @info "[RELAY] INITIAL_GUESS_EQUATIONS filtered" before=_nBefore after=length(INITIAL_GUESS_EQUATIONS)
+    INITIAL_VALUE_EQUATIONS = filter(_keepPair, INITIAL_VALUE_EQUATIONS)
+    DISCRETE_START_VALUES = filter(_keepPair, DISCRETE_START_VALUES)
+    DISCRETE_DUMMY_EQUATIONS = filter(_keepDummy, DISCRETE_DUMMY_EQUATIONS)
+    DISCRETE_DUMMY_EQUATIONS = [_substSyms(eq, _ifEqRelay_aliases) for eq in DISCRETE_DUMMY_EQUATIONS]
+    IF_EQUATION_EVENTS = [_substSyms(ev, _ifEqRelay_aliases) for ev in IF_EQUATION_EVENTS]
+    IF_EQUATION_EVENT_DECLARATION = buildIfEquationEventDecl(IF_EQUATION_EVENTS)
+    CONDITIONAL_EQUATIONS = [_substSyms(eq, _ifEqRelay_aliases) for eq in CONDITIONAL_EQUATIONS]
+  end
   EQUATIONS = vcat(EQUATIONS,
                    DISCRETE_DUMMY_EQUATIONS,
                    CONDITIONAL_EQUATIONS)
@@ -992,8 +1032,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       eqs = convert(Vector{Symbolics.Equation}, eqs)
       #= Events and observed equations =#
       $(IF_EQUATION_EVENT_DECLARATION)
-      $(generateAliasObservedBlock(simCode))
-      $(generateEliminatedObservedBlock(simCode))
+      $(generateAliasObservedBlock(simCode, _ifEqRelay_aliases))
+      $(generateEliminatedObservedBlock(simCode, _ifEqRelay_aliases))
       #= Initial-equation constraints (from Modelica `initial equation` block).
          Passed as `initialization_eqs` to MTK so they actually constrain the
          t=0 state — the `initialValues` Pair list above is only a guess.
@@ -1025,7 +1065,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       Base.invokelatest(_mergeInitAlgIntoU0!, finalInitialValues)
       #= ODE System =#
       nonLinearSystem = $(odeSystemWithEvents(!isempty(ifConditionalVariables), modelName;
-                                              hasObserved = !isempty(simCode.aliasMap) || !isempty(simCode.eliminatedVariables)))
+                                              hasObserved = !isempty(simCode.aliasMap) ||
+                                                            !isempty(simCode.eliminatedVariables)))
       firstOrderSystem = nonLinearSystem
       #= Structural simplification =#
       $(performStructuralSimplify(performIndexReduction; observedFilter = simCode.observedFilter, split = !useDirectRHS))
@@ -1092,43 +1133,46 @@ Each alias entry produces:
 These are passed to `ODESystem` via the `observed` keyword so that eliminated
 variables remain accessible in the solution (e.g. `sol[var"eliminated"]`).
 """
-function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE)
-  if isempty(simCode.aliasMap)
+function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE,
+                                    relayAliases::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
+  if isempty(simCode.aliasMap) && isempty(relayAliases)
     return :(observedEqs = [])
   end
   #= Generate the observed equations as runtime code.
      The alias map entries are known at code-gen time, so we can embed
      the variable names as string literals. At runtime, these create
      Symbolics variables and equations. =#
-  local obsExprs = Expr[]
+  local obsEntries = Tuple{Symbol, Symbol, Bool}[]
+  local elimSymbols = Symbol[]
+  local emittedElims = Set{Symbol}()
   for entry in simCode.aliasMap
     local elimSym = Symbol(entry.eliminatedName)
     local repSym = Symbol(entry.representativeName)
-    if entry.negated
-      push!(obsExprs, :($(elimSym) ~ -$(repSym)))
-    else
-      push!(obsExprs, :($(elimSym) ~ $(repSym)))
+    repSym = get(relayAliases, repSym, repSym)
+    push!(elimSymbols, elimSym)
+    push!(emittedElims, elimSym)
+    push!(obsEntries, (elimSym, repSym, entry.negated))
+  end
+  local _relayRepresentative(sym::Symbol)::Symbol = begin
+    local seen = Set{Symbol}()
+    local cur = sym
+    while haskey(relayAliases, cur) && !(cur in seen)
+      push!(seen, cur)
+      cur = relayAliases[cur]
     end
+    cur
+  end
+  for elimSym in sort!(collect(keys(relayAliases)); by = string)
+    elimSym in emittedElims && continue
+    local repSym = _relayRepresentative(relayAliases[elimSym])
+    push!(elimSymbols, elimSym)
+    push!(emittedElims, elimSym)
+    push!(obsEntries, (elimSym, repSym, false))
   end
   #= Collect eliminated symbol names at code-gen time. The Num objects
      are constructed at runtime (below) using the function-scope `t` so
      they share the system's independent variable. =#
-  local elimSymbols = Symbol[Symbol(entry.eliminatedName) for entry in simCode.aliasMap]
-  #= Chunk observed equations into small functions (25 each) to avoid
-     compiling one massive lambda. For Engine1a with 876 aliases, the single
-     lambda took ~101s. Chunking into 36 functions of 25 should be much faster. =#
-  local obsChunks = collect(Iterators.partition(obsExprs, CHUNK_SIZE[]))
-  local chunkFuncDefs = Expr[]
-  local chunkFuncNames = Symbol[]
-  for (i, chunk) in enumerate(obsChunks)
-    local fName = Symbol("_generateObservedEqs_", i - 1)
-    push!(chunkFuncDefs, quote
-      function $(fName)()
-        [$(collect(chunk)...)]
-      end
-    end)
-    push!(chunkFuncNames, fName)
-  end
+  unique!(elimSymbols)
   return quote
     #= Build eliminated alias variables at function scope so they share
        the `@independent_variables t` object with the main system, then
@@ -1143,17 +1187,20 @@ function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE)
       push!(_elimBatch.args, :($_elimName = $_elimVar))
     end
     eval(_elimBatch)
-    #= Create observed equations in chunks =#
-    $(chunkFuncDefs...)
-    local _obsComponents = []
-    for _obsFn in [$(chunkFuncNames...)]
-      push!(_obsComponents, Base.invokelatest(_obsFn))
+    #= Create observed equations using module lookups so symbols created by
+       the preceding eval are visible without relying on generated helper
+       function global resolution. =#
+    observedEqs = Symbolics.Equation[]
+    for (_elimName, _repName, _negated) in $(obsEntries)
+      local _elimVar = Base.invokelatest(getfield, @__MODULE__, _elimName)
+      local _repVar = Base.invokelatest(getfield, @__MODULE__, _repName)
+      push!(observedEqs, _negated ? (_elimVar ~ -_repVar) : (_elimVar ~ _repVar))
     end
-    observedEqs = collect(Iterators.flatten(_obsComponents))
   end
 end
 
-function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE)
+function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE,
+                                         relayAliases::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
   if isempty(simCode.eliminatedVariables)
     return :()
   end
@@ -1181,6 +1228,7 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE)
      residual no longer mentions `elim` and `solve_for` returns NaN, which
      then propagates into `sol(t; idxs = elim)`). =#
   local aliasNames = Set{String}(entry.eliminatedName for entry in simCode.aliasMap)
+  union!(aliasNames, string.(keys(relayAliases)))
   local solveBodyExprs = Expr[]
   for (i, varName) in enumerate(elimVars)
     if containsDerCall(SimulationCode.toDAEExp(elimEqs[i].exp))
@@ -1191,6 +1239,9 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE)
     end
     local elimSym = Symbol(varName)
     local residualExpr = expToJuliaExpMTK(elimEqs[i].exp, simCode; derSymbol = false)
+    if !isempty(relayAliases)
+      residualExpr = _substSyms(residualExpr, relayAliases)
+    end
     push!(solveBodyExprs, quote
       local _elimResidual = $(residualExpr)
       local _elimRhs = Symbolics.solve_for(0 ~ _elimResidual, $(elimSym))
@@ -3086,42 +3137,47 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
       if sv.varKind isa SimulationCode.PARAMETER || sv.varKind isa SimulationCode.ARRAY_PARAMETER
         continue
       end
+      if sv.varKind isa SimulationCode.DATA_STRUCTURE || sv.varKind isa SimulationCode.STRING
+        local sym = Symbol(name)
+        local boundSym = Symbol(sv.name)
+        push!(fetches, Expr(:local, Expr(:(=), sym, :(getfield(@__MODULE__, $(QuoteNode(boundSym)))))))
+        continue
+      end
+      #= DISCRETE vars (Logic/enum/Boolean) are used as array indices. MTK
+         initialisation may leave them at 0 which BoundsErrors on 1-based
+         index vectors (e.g. INV3S's UX01Conv[iNV3S_enable]). Clamp to 1 as
+         a band-aid until proper discrete-IC lowering lands. =#
+      if sv.varKind isa SimulationCode.DISCRETE
+        local sym = Symbol(name)
+        push!(fetches, Expr(:local,
+          Expr(:(=), sym,
+            :(try
+                let _g = ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))
+                  local _raw = _g(LATEST_PROBLEM)
+                  local _v = if _raw isa Integer
+                    Int(_raw)
+                  elseif _raw isa Real
+                    Int(round(Float64(_raw)))
+                  else
+                    1
+                  end
+                  _v < 1 ? 1 : _v
+                end
+              catch
+                1
+              end))))
+        continue
+      end
     end
+    #= Non-discrete SimVars (Real states, alg vars) and local algorithm
+       temporaries not in the HT: fetch as Float64, no index clamp. =#
     local sym = Symbol(name)
-    #= Resolve the value through `SciMLBase.getu`, which walks MTK's
-       `observed` equations to back-substitute alias-eliminated crefs.
-       Without this, `LATEST_PROBLEM[:iNV3S_enable]` returns the bare
-       Symbolics binding (the cref was alias-eliminated to `e_table_y`) and
-       Int conversion blows up.
-
-       The `< 1 → 1` clamp at the bottom is a deliberate band-aid for the
-       wrong-IC cluster: MTK initialisation does not yet honour every
-       Modelica start attribute, so `u0[i]` for some discrete slots is left
-       at 0 instead of the declared start. A 0 returned here would
-       BoundsError on `Vector{Int64}[0]` inside the algorithm body
-       (e.g. INV3S's `UX01Conv[iNV3S_enable]`). Clamping to 1 keeps the
-       simulation running with Logic.'U' semantics until the deeper init
-       fix lands. =#
-    #= Wrap getu in try/catch: MTK 9+ throws "is not an unknown" when the
-       cref is observed (alias-eliminated). DCPM_Cooling et al. hit this on
-       `wMechanical`. Fall back to 1 (safe default for the existing Int-clamp
-       band-aid below). =#
     push!(fetches, Expr(:local,
       Expr(:(=), sym,
         :(try
-            let _g = ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))
-              local _raw = _g(LATEST_PROBLEM)
-              local _v = if _raw isa Integer
-                Int(_raw)
-              elseif _raw isa Real
-                Int(round(Float64(_raw)))
-              else
-                1
-              end
-              _v < 1 ? 1 : _v
-            end
+            Float64(ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))(LATEST_PROBLEM))
           catch
-            1
+            0.0
           end))))
   end
   #= Shadow `Base.time` (a UNIX-time function) with the local Modelica `time`

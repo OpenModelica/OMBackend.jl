@@ -104,6 +104,7 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
   "sample"       => :modelica_sample,
   "edge"         => :modelica_edge,
   "change"       => :modelica_change,
+  "delay"        => :modelica_delay,
   "homotopy"     => :modelica_homotopy,
   "semiLinear"   => :modelica_semiLinear,
 )
@@ -147,7 +148,8 @@ modelica_sign(x) = sign(x)
 modelica_sqrt(x) = sqrt(x)
 modelica_ceil(x) = ceil(x)
 modelica_floor(x) = floor(x)
-modelica_integer(x::Symbolics.Num) = floor(x)
+modelica_integer(x::Symbolics.Num) =
+  CodeGeneration.makeSymbolicTerm(floor, Any[Symbolics.unwrap(x)])
 modelica_integer(x::Number) = floor(Int, x)
 modelica_integer(x) = floor(x)
 
@@ -451,6 +453,17 @@ In continuous expression context v == pre(v), so this returns false.
 Discrete change-event firing is handled by when-clause callbacks.
 """
 modelica_change(v) = false
+
+"""
+    modelica_delay(expr, delayTime[, delayMax])
+
+Modelica: delay(expr, delayTime) evaluates `expr` at an earlier time. OMBackend
+does not currently build DDE history terms for generated Modelica functions, so
+the algorithmic builtin must at least resolve to the current expression instead
+of leaving a bare `delay` binding inside the generated model module.
+"""
+modelica_delay(expr, delayTime) = expr
+modelica_delay(expr, delayTime, delayMax) = expr
 
 """
     modelica_String(x[, sigDigits, padding, leftAdjust])

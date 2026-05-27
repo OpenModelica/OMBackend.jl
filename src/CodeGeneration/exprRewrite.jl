@@ -259,3 +259,90 @@ function rewriteEquationsExprLevel(edeqs::Vector{Expr}; modelicaFuncNames::Set{S
     end
     return result
 end
+
+"""
+    eliminateIfEqRelays(equations) -> (Vector{Expr}, Dict{Symbol,Symbol})
+
+Remove pure relay equations `A ~ B` where both sides are simple leaf
+variables. Returns the filtered equation list and an alias map
+`A => canonical` so callers can drop the aliased symbols from variable lists.
+
+Chain A → B → C is resolved to A → C before substitution.
+"""
+function eliminateIfEqRelays(equations::Vector{Expr})
+    raw = Dict{Symbol,Symbol}()
+    non_relay = Expr[]
+    for eq in equations
+        if _isIfEqTmpRelay(eq)
+            (k, v) = _ifEqRelayPair(eq)
+            raw[k] = v
+        else
+            push!(non_relay, eq)
+        end
+    end
+    isempty(raw) && return (equations, raw)
+    alias = Dict{Symbol,Symbol}()
+    for k in keys(raw)
+        v = raw[k]
+        while haskey(raw, v)
+            v = raw[v]
+        end
+        alias[k] = v
+    end
+    resolved = [_substSyms(eq, alias) for eq in non_relay]
+    return (resolved, alias)
+end
+
+# Extract symbol from any simple leaf (plain Symbol or sym(t) call).
+function _simpleLeafSymbol(x)
+    x = _unwrapBlock(x)
+    x isa Symbol && return x
+    if x isa Expr && x.head === :call && length(x.args) == 2 && x.args[2] === :t
+        x.args[1] isa Symbol && return x.args[1]
+    end
+    return nothing
+end
+
+# Detect pure leaf aliases in both post-rewrite (`A(t) ~ B(t)`) and
+# pre-rewrite (`0 ~ A(t) - B(t)`) forms.  MTK's alias_elimination cannot
+# subtract two SymReal leaf variables, so these are eliminated before MTK.
+function _isIfEqTmpRelay(eq)
+    eq isa Expr || return false
+    eq.head === :call || return false
+    length(eq.args) == 3 || return false
+    eq.args[1] === :~ || return false
+    local lhs2 = _unwrapBlock(eq.args[2])
+    local rhs2 = _unwrapBlock(eq.args[3])
+    # Post-rewrite: A(t) ~ B(t)
+    if _isSimpleLeafExpr(lhs2) && _isSimpleLeafExpr(rhs2)
+        return true
+    end
+    # Pre-rewrite: 0 ~ A - B
+    _isZeroLiteral(lhs2) || return false
+    rhs2 isa Expr || return false
+    rhs2.head === :call || return false
+    rhs2.args[1] === :- && length(rhs2.args) == 3 || return false
+    local a = _unwrapBlock(rhs2.args[2])
+    local b = _unwrapBlock(rhs2.args[3])
+    return _isSimpleLeafExpr(a) && _isSimpleLeafExpr(b)
+end
+
+# Extract (alias_sym, canonical_sym) from a relay.
+# alias_sym → canonical_sym (alias_sym gets substituted away).
+function _ifEqRelayPair(eq)
+    local lhs = _unwrapBlock(eq.args[2])
+    local rhs = _unwrapBlock(eq.args[3])
+    if _isZeroLiteral(lhs)
+        # Pre-rewrite: 0 ~ A - B  →  A → B
+        local a = _unwrapBlock(rhs.args[2])
+        local b = _unwrapBlock(rhs.args[3])
+        return (_simpleLeafSymbol(a), _simpleLeafSymbol(b))
+    end
+    # Post-rewrite: A(t) ~ B(t)  →  A → B
+    return (_simpleLeafSymbol(lhs), _simpleLeafSymbol(rhs))
+end
+
+_substSyms(x, _) = x
+_substSyms(sym::Symbol, alias::Dict{Symbol,Symbol}) = get(alias, sym, sym)
+_substSyms(ex::Expr, alias::Dict{Symbol,Symbol}) =
+    Expr(ex.head, Any[_substSyms(a, alias) for a in ex.args]...)
