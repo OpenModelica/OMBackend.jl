@@ -477,6 +477,8 @@ expToJuliaExpMTK(exp::SimulationCode.RCONST, simCode::SimulationCode.SIM_CODE;
                  varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr = quote $(exp.value) end
 expToJuliaExpMTK(exp::SimulationCode.SCONST, simCode::SimulationCode.SIM_CODE;
                  varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr = quote $(exp.value) end
+expToJuliaExpMTK(exp::SimulationCode.WILD, simCode::SimulationCode.SIM_CODE;
+                 varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr = quote _ end
 
 function expToJuliaExpMTK(exp::SimulationCode.ENUM_LITERAL, simCode::SimulationCode.SIM_CODE;
                           varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
@@ -1734,6 +1736,69 @@ end
   Returns false if it evaluates to a nonzero value (guard is active or inactive).
   When simCode is provided, substitutes parameter values and state variable start values.
 """
+#= Numerically evaluate a scalar DAE.Exp at t0 against `valMap` (params +
+   already-seeded vars). Returns nothing for anything outside the small
+   arithmetic/`integer` subset, so callers fall back safely. =#
+function _evalDAENumeric(@nospecialize(e), valMap::Dict{Symbol, Float64})::Union{Float64, Nothing}
+  @match e begin
+    DAE.RCONST(__) => Float64(e.real)
+    DAE.ICONST(__) => Float64(e.integer)
+    DAE.BCONST(__) => e.bool ? 1.0 : 0.0
+    DAE.CREF(__) => begin
+      local nm = try SimulationCode.DAE_identifierToString(e.componentRef) catch; return nothing end
+      nm == "time" ? 0.0 : get(valMap, Symbol(nm), nothing)
+    end
+    DAE.UNARY(operator = DAE.UMINUS(__)) => begin
+      local a = _evalDAENumeric(e.exp, valMap); a === nothing ? nothing : -a
+    end
+    DAE.BINARY(__) => begin
+      local a = _evalDAENumeric(e.exp1, valMap); a === nothing && return nothing
+      local b = _evalDAENumeric(e.exp2, valMap); b === nothing && return nothing
+      @match e.operator begin
+        DAE.ADD(__) => a + b
+        DAE.SUB(__) => a - b
+        DAE.MUL(__) => a * b
+        DAE.DIV(__) => b == 0.0 ? nothing : a / b
+        DAE.POW(__) => a ^ b
+        _ => nothing
+      end
+    end
+    DAE.CAST(__) => _evalDAENumeric(e.exp, valMap)
+    DAE.CALL(path = Absyn.IDENT(fn)) => begin
+      local argv = collect(e.expLst)
+      isempty(argv) && return nothing
+      local a = _evalDAENumeric(argv[1], valMap); a === nothing && return nothing
+      fn == "integer" ? Float64(floor(Int, a)) :
+      fn == "floor"   ? floor(a) :
+      fn == "ceil"    ? ceil(a) :
+      fn == "abs"     ? abs(a) :
+      (fn == "float" || fn == "Real" || fn == "Integer") ? a : nothing
+    end
+    _ => nothing
+  end
+end
+
+#= Seed valMap with initial-algorithm-assigned values (e.g. trapezoid `count`,
+   `T_start`) evaluated at t0, in statement order. Without this, discrete states
+   set imperatively in an `initial algorithm` (no `start` attribute) default to
+   0.0 when evaluating if-equation initial branches, picking the wrong branch. =#
+function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode)
+  for ia in simCode.initialAlgorithms
+    for stmt in ia.daeStatements
+      @match stmt begin
+        DAE.STMT_ASSIGN(__) => begin
+          local nm = try SimulationCode.DAE_identifierToString(stmt.exp1) catch; nothing end
+          nm === nothing && continue
+          local v = _evalDAENumeric(stmt.exp, valMap)
+          v !== nothing && (valMap[Symbol(nm)] = v)
+        end
+        _ => nothing
+      end
+    end
+  end
+  return valMap
+end
+
 function evalInitialCondition(mtkCond, simCode = nothing)
   #= Skip during precompile output: `eval(...)` below would mutate this
      closed module's bindings and Julia rejects that. The runtime path is
@@ -1800,6 +1865,9 @@ function evalInitialCondition(mtkCond, simCode = nothing)
         valMap[sym] = sval
       end
     end
+    #= Override discrete states set by an initial algorithm (T_start, count)
+       with their t0 values before evaluating the condition. =#
+    _seedInitialAlgValues!(valMap, simCode)
     #= Extract LHS from the mtkCond Expr (form: :(lhs ~ 0)) =#
     local lhsExpr = _extractZeroCrossingLHS(mtkCond)
     #= Substitute all variable references with numeric values =#

@@ -31,6 +31,7 @@ _traverseChildrenTopDown(e::BCONST,        visitor, arg) = (e, arg)
 _traverseChildrenTopDown(e::SCONST,        visitor, arg) = (e, arg)
 _traverseChildrenTopDown(e::ENUM_LITERAL,  visitor, arg) = (e, arg)
 _traverseChildrenTopDown(e::EXP_CREF,      visitor, arg) = (e, arg)
+_traverseChildrenTopDown(e::WILD,          visitor, arg) = (e, arg)
 
 # Unary / single-child shapes
 function _traverseChildrenTopDown(e::UNARY, visitor, arg)
@@ -143,6 +144,7 @@ _traverseChildrenBottomUp(e::BCONST,        visitor, arg) = (e, arg)
 _traverseChildrenBottomUp(e::SCONST,        visitor, arg) = (e, arg)
 _traverseChildrenBottomUp(e::ENUM_LITERAL,  visitor, arg) = (e, arg)
 _traverseChildrenBottomUp(e::EXP_CREF,      visitor, arg) = (e, arg)
+_traverseChildrenBottomUp(e::WILD,          visitor, arg) = (e, arg)
 
 function _traverseChildrenBottomUp(e::UNARY, visitor, arg)
   (ne, narg) = traverseExpBottomUp(e.exp, visitor, arg)

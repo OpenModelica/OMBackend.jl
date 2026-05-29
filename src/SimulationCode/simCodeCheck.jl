@@ -106,6 +106,19 @@ Filter a result down to the `:error`-severity violations.
 strict(r::CheckResult) = filter(v -> v.severity === :error, r.violations)
 
 """
+    SimCodeCheckError(msg)
+
+Raised to abort code generation when a rule reports an `:error` that codegen
+cannot survive (e.g. an unresolved component reference). Carries only the
+categorized message so callers surface it without a code-generation stacktrace.
+"""
+struct SimCodeCheckError <: Exception
+  msg::String
+end
+
+Base.showerror(io::IO, e::SimCodeCheckError) = print(io, e.msg)
+
+"""
     report(io, result; prefix="", modelName="")
 
 Pretty-print a CheckResult. Quiet when there are no violations.
@@ -136,6 +149,7 @@ const RULES = Function[]
 #= Crefs that always resolve and need not appear in stringToSimVarHT. =#
 const BUILTIN_CREFS = Set([
   "time", "pi", "e", "Modelica_Constants_pi", "Modelica_Constants_e",
+  "_",  # wildcard discard in tuple-LHS equations; legitimately not a SimVar
 ])
 
 #= DAE.Exp concrete subtypes that the MTK + algorithmic codegen handle.
@@ -465,7 +479,7 @@ function rule_cref_resolution(simCode::SIM_CODE)::Vector{CheckViolation}
     for nm in missingNames
       push!(out, CheckViolation(:cref_resolution, :error,
                                 "residualEquations[$i]",
-                                "cref `$nm` does not resolve"))
+                                "component reference `$nm` does not resolve"))
     end
   end
   return out

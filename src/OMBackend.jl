@@ -42,6 +42,9 @@ include("$CURRENT_DIRECTORY/Backend/Backend.jl")
 include("$CURRENT_DIRECTORY/SimulationCode/SimulationCode.jl")
 include("$CURRENT_DIRECTORY/Runtime/Runtime.jl")
 include("$CURRENT_DIRECTORY/CodeGeneration/CodeGeneration.jl")
+#= In-backend MTK path (System construction + structural_simplify at translate
+   time). Included after CodeGeneration so it can `import ..CodeGeneration`. =#
+include("$CURRENT_DIRECTORY/CodeGeneration/iMTKGen.jl")
 include("backendUtils.jl")
 #= Finally add the API=#
 include("backendAPI.jl")

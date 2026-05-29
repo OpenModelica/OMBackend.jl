@@ -128,6 +128,10 @@ struct EXP_CREF <: Exp
   ty::SType
 end
 
+"Wildcard `_`: a discarded output slot in a tuple-LHS equation `(x, _) = f()`.
+Singleton; codegen emits Julia's `_` discard."
+struct WILD <: Exp end
+
 "`e1 op e2` over numeric / array operands."
 struct BINARY <: Exp
   exp1::Exp

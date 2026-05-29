@@ -1134,9 +1134,13 @@ function resolveAliasInitialValue(diffState, fullEqs, ivMap::Dict)
     if !fullyResolvedToNumber
       continue
     end
-    local slope = sumOnePoint - intercept
+    #= Convert to Float64 before arithmetic: pure Rational{Int} subtraction here
+       can overflow the denominator product to 0 and throw DivideError. =#
+    local interceptF = Float64(intercept)
+    local sumOnePointF = Float64(sumOnePoint)
+    local slope = sumOnePointF - interceptF
     if !iszero(slope)
-      return Float64(-intercept / slope)
+      return -interceptF / slope
     end
   end
   return nothing
@@ -1570,7 +1574,14 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
     sys = ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
   end
   local post_eqs = length(equations(sys))
-  local post_full_eqs = length(ModelingToolkit.full_equations(sys))
+  #= Diagnostic only: full_equations expands observed eqs and can hit
+     SymbolicUtils Rational{Int64} overflow on some systems. A log count must
+     never abort the build, so fall back to -1 (rendered as "n/a") on failure. =#
+  local post_full_eqs = try
+    length(ModelingToolkit.full_equations(sys))
+  catch
+    -1
+  end
   local post_unknowns = length(unknowns(sys))
   @info "[MTK GEN: simplify] After structural_simplify: equations=$(post_eqs), full_equations=$(post_full_eqs), unknowns=$(post_unknowns)"
   if post_eqs != post_unknowns
@@ -1582,7 +1593,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
       @debug "[MTK GEN: simplify] unk[$i]: $u"
     end
   end
-  if post_full_eqs != post_unknowns
+  if post_full_eqs >= 0 && post_full_eqs != post_unknowns
     @warn "full_equations(sys) != unknowns(sys): $post_full_eqs vs $post_unknowns"
   end
   dumpMTKPostSimplify(sys)

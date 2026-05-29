@@ -597,8 +597,11 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     $(generateInitialAlgorithmEarlyFunction(simCode))
     $(generateInitialAlgorithmFunction(simCode))
     $(model)
-    function simulate(tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
-      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreducible) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
+    #= simulateFromBuild: post-build solve pipeline (init-alg, Rodas/FBDF auto-switch,
+       DAE routing, InitialFailure retry, terminal events). Extracted from simulate so
+       the iMTK path can drive it with a cached build; simulate behavior is unchanged. =#
+    function simulateFromBuild(built, tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
+      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreducible) = built
       global LATEST_REDUCED_SYSTEM = $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))
       global LATEST_PROBLEM = $(Symbol("$(MODEL_NAME)Model_problem"))
       #= Run in the latest world age: __runInitialAlgorithm! is compiled at
@@ -730,6 +733,10 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       #= Run `when terminal()` bodies once against the final solution (gated: emitted only if the model has a terminal event). =#
       $(createTerminalBodyRunner(simCode))
       _sol
+    end
+    function simulate(tspan = (0.0, 1.0), solver = Rodas5(); cached_build = nothing, kwargs...)
+      local built = cached_build === nothing ? $(Symbol("$(MODEL_NAME)Model"))(tspan) : cached_build
+      return simulateFromBuild(built, tspan, solver; kwargs...)
     end
   end
   #= MODEL_NAME is preprocessed with . replaced with _=#
@@ -910,6 +917,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     @info "[RELAY] INITIAL_GUESS_EQUATIONS filtered" before=_nBefore after=length(INITIAL_GUESS_EQUATIONS)
     INITIAL_VALUE_EQUATIONS = filter(_keepPair, INITIAL_VALUE_EQUATIONS)
     DISCRETE_START_VALUES = filter(_keepPair, DISCRETE_START_VALUES)
+    #= Substitute the relay aliases inside the surviving pairs/equations so a
+       value side referencing an eliminated leaf (e.g. `variance_mu => variance_u`)
+       resolves to the surviving rep symbol rather than leaving an undefined name. =#
+    INITIAL_GUESS_EQUATIONS = [_substSyms(eq, _ifEqRelay_aliases) for eq in INITIAL_GUESS_EQUATIONS]
+    INITIAL_VALUE_EQUATIONS = [_substSyms(eq, _ifEqRelay_aliases) for eq in INITIAL_VALUE_EQUATIONS]
+    DISCRETE_START_VALUES = [_substSyms(eq, _ifEqRelay_aliases) for eq in DISCRETE_START_VALUES]
     DISCRETE_DUMMY_EQUATIONS = filter(_keepDummy, DISCRETE_DUMMY_EQUATIONS)
     DISCRETE_DUMMY_EQUATIONS = [_substSyms(eq, _ifEqRelay_aliases) for eq in DISCRETE_DUMMY_EQUATIONS]
     IF_EQUATION_EVENTS = [_substSyms(ev, _ifEqRelay_aliases) for ev in IF_EQUATION_EVENTS]
@@ -1046,8 +1059,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
         Dict{Symbol, Float64}()
       end
       function _buildInitialConstraintEqs()
-        local _eqs = Symbolics.Equation[$(generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)...),
-                                        $(getFixedStartConstraintsMTK(vcat(stateVariables, occVariables, algebraicVariables), simCode)...)]
+        local _eqs = Symbolics.Equation[$([_substSyms(e, _ifEqRelay_aliases) for e in generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)]...),
+                                        $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, occVariables, algebraicVariables), simCode)]...)]
         $(emitInitAlgConstraintAppends(simCode)...)
         return _eqs
       end
@@ -1724,6 +1737,34 @@ function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::
 end
 
 """
+True when the zero-crossing Expr references a non-lifted algebraic variable
+(one whose static `evalInitialCondition` value defaults to 0). Lifted helper
+names (`ifEq_tmp*`, `ifCond*`) are excluded so an init affect never observes
+another lifted value and forms a circular init dependency.
+"""
+function _zcReferencesSolvableAlgebraic(@nospecialize(zcExpr), simCode)::Bool
+  local ht = simCode.stringToSimVarHT
+  local stack = Any[zcExpr]
+  while !isempty(stack)
+    local node = pop!(stack)
+    if node isa Symbol
+      local key = string(node)
+      if !startswith(key, "ifEq_tmp") && !startswith(key, "ifCond") && haskey(ht, key)
+        local (_, sv) = ht[key]
+        if SimulationCode.isAlgebraic(sv)
+          return true
+        end
+      end
+    elseif node isa Expr
+      for a in node.args
+        push!(stack, a)
+      end
+    end
+  end
+  return false
+end
+
+"""
 This function creates symbolic if equations for use in MTK.
 The function returns a tuple, where the first part of the tuple represent the conditions and the affect of the if-equation on the form:
   continuous_events = [
@@ -1794,10 +1835,34 @@ function createIfEquation(stateVariables::Vector,
         local modifiedKws::Vector{Expr} = Expr[Expr(:kw, sym, sym) for sym in allIfCondSyms]
         local modifiedNT::Expr = Expr(:tuple, Expr(:parameters, modifiedKws...))
         local affectTuple::Expr = :(($(fExpr), $(modifiedNT)))
-        local cond::Expr = :(ModelingToolkit.SymbolicContinuousCallback(
-          ($(mtkCond)) => $(affectTuple);
-          reinitializealg = SciMLBase.NoInit()
-        ))
+        #= When the branch condition depends on a non-lifted algebraic variable
+           (an operating-point value `evalInitialCondition` defaulted to 0, e.g.
+           an op-amp input voltage), the static initial ifCond can be wrong with
+           no zero-crossing to fire the affect. Add an `initialize` affect that
+           re-evaluates the condition from the solved state (mirrors
+           evalInitialCondition: zc < 0 means the condition is TRUE). Restricted
+           to non-lifted algebraic zc so it does not observe other lifted ifEq_tmp
+           values (which would form a circular init dependency). =#
+        local zcLhs = _extractZeroCrossingLHS(mtkCond)
+        local thisSym::Symbol = allIfCondSyms[i]
+        local cond::Expr
+        if _zcReferencesSolvableAlgebraic(zcLhs, simCode)
+          local initObservedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, :zc, zcLhs)))
+          local initModifiedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, thisSym)))
+          local initRetNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :((observed.zc < 0) ? 1.0 : 0.0))))
+          local initFExpr::Expr = :((modified, observed, ctx, integrator) -> $initRetNT)
+          local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT); observed = $(initObservedNT)))
+          cond = :(ModelingToolkit.SymbolicContinuousCallback(
+            ($(mtkCond)) => $(affectTuple);
+            initialize = $(initAffect),
+            reinitializealg = SciMLBase.NoInit()
+          ))
+        else
+          cond = :(ModelingToolkit.SymbolicContinuousCallback(
+            ($(mtkCond)) => $(affectTuple);
+            reinitializealg = SciMLBase.NoInit()
+          ))
+        end
         push!(conditions, cond)
         push!(ivConditions, ivCond)
       end

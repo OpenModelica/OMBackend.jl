@@ -118,7 +118,25 @@ end
     (no algebraic constraints), no VSS / structural transitions, no DOCC.
   =#
   DEMode = 4
+  #=
+    In-backend MTK path. Same module/codegen as MTK_MODE, but additionally
+    constructs the System and runs structural_simplify in the backend at
+    translate time and dumps the post-simplify System. Simulate reuses the
+    existing module interface. Implementation in CodeGeneration/iMTKGen.jl.
+  =#
+  IMTK_MODE = 5
 end
+
+"""
+Runtime-toggleable default backend mode used by `OM.translate` / `OM.simulate`
+and `OMBackend.translate` / `OMBackend.simulateModel`. Defaults to `IMTK_MODE`
+(cached build fast path). Flip to revert to the lazy-build MTK path:
+
+    OMBackend.DEFAULT_BACKEND_MODE[] = OMBackend.MTK_MODE
+
+Read at each call site, so changes take effect immediately without restarting Julia.
+"""
+const DEFAULT_BACKEND_MODE = Ref{BackendMode}(IMTK_MODE)
 
 function info()
   println("OMBackend.jl")
@@ -194,7 +212,7 @@ This is not part of the lowering process but it is to be generated before we gen
 """
 Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatModel});
                    functionList = nothing,
-                   BackendMode = MTK_MODE,
+                   BackendMode = DEFAULT_BACKEND_MODE[],
                    warnMissingStartValues = nothing,
                    eliminateNonDynamic::Union{Nothing, Bool, SimulationCode.EliminationOptions} = nothing,
                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
@@ -280,7 +298,7 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
         end
         _checkSimCodeBeforeCodegen(simCode, checkSimCode)
         return _translationResult(generateDETargetCode(simCode), nameMap, returnNameMap)
-      elseif BackendMode == MTK_MODE
+      elseif BackendMode == MTK_MODE || BackendMode == IMTK_MODE
         #@debug "Generate simulation code"
         simCode = @BACKEND_PERFLOG "[backendAPI] generateSimulationCode" generateSimulationCode(bDAE; mode = MTK_MODE)
         (simCodeFunctions, externalRuntimeNeeded) = if functionList !== nothing
@@ -337,6 +355,9 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
         simCode = SimulationCode.runSimCodePass("propagateConstants", simCode,
                                                 SimulationCode.propagateConstants)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterConstantProp.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = SimulationCode.runSimCodePass("lowerComplexOperatorRecords", simCode,
+                                                SimulationCode.lowerComplexOperatorRecords)
+        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterComplexLowering.log"), SimulationCode.dumpSimCode(simCode))
         simCode = SimulationCode.runSimCodePass("eliminateAliasVariables", simCode,
                                                 SimulationCode.eliminateAliasVariables)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterAliasElimination.log"), SimulationCode.dumpSimCode(simCode))
@@ -486,10 +507,14 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
                                                 SimulationCode.recomputeStronglyConnectedComponents)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRecomputeSCC.log"), SimulationCode.dumpSimCode(simCode))
         _checkSimCodeBeforeCodegen(simCode, checkSimCode)
-        local _mtkCode = @BACKEND_PERFLOG "[backendAPI] generateMTKTargetCode" generateMTKTargetCode(simCode)
-        return _translationResult(_mtkCode, nameMap, returnNameMap)
+        local _genCode = if BackendMode == IMTK_MODE
+          @BACKEND_PERFLOG "[backendAPI] generateIMTKTargetCode" generateIMTKTargetCode(simCode)
+        else
+          @BACKEND_PERFLOG "[backendAPI] generateMTKTargetCode" generateMTKTargetCode(simCode)
+        end
+        return _translationResult(_genCode, nameMap, returnNameMap)
       else
-        @error "Unsupported BackendMode: $BackendMode. Valid modes are: MTK_MODE, DEMode"
+        @error "Unsupported BackendMode: $BackendMode. Valid modes are: MTK_MODE, IMTK_MODE, DEMode"
       end
     end
   finally
@@ -520,13 +545,23 @@ function _checkSimCodeBeforeCodegen(simCode::SimulationCode.SIM_CODE, checkSimCo
     return nothing
   end
   local checkResult = SimulationCode.SimCodeCheck.check(simCode)
-  SimulationCode.SimCodeCheck.report(stderr, checkResult; modelName = string(simCode.name))
-  local canonicalErrors = filter(v -> v.rule === :canonical_cref_names && v.severity === :error,
-                                 checkResult.violations)
-  if !isempty(canonicalErrors)
-    local details = join([string(v.where, ": ", v.detail) for v in canonicalErrors], "\n")
-    error("SimCode still contains non-canonical component references before code generation:\n" * details)
+  # An :error cref/canonical violation means a residual references a name that
+  # resolves to no SimVar/eliminated/builtin; code generation would otherwise
+  # throw a bare UndefVarError deep in MTK. Abort with the located reason, and
+  # skip the verbose warning report so a caller catching SimCodeCheckError can
+  # silence the failure entirely.
+  local blocking = filter(v -> v.severity === :error &&
+                               (v.rule === :canonical_cref_names || v.rule === :cref_resolution),
+                          checkResult.violations)
+  if !isempty(blocking)
+    local details = join([string("  - ", v.where, ": ", v.detail) for v in blocking], "\n")
+    throw(SimulationCode.SimCodeCheck.SimCodeCheckError(
+      string("Code generation aborted for ", simCode.name, ": ", length(blocking),
+             " unresolved component reference(s). These references do not resolve ",
+             "against the simulation variable table, the eliminated-variable set, or ",
+             "the builtin set, so code generation would raise an undefined-variable error.\n", details)))
   end
+  SimulationCode.SimCodeCheck.report(stderr, checkResult; modelName = string(simCode.name))
   return nothing
 end
 
@@ -717,6 +752,22 @@ function generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)
   return (modelName, modelCode)
 end
 
+"""
+`generateIMTKTargetCode(simCode)` — like `generateMTKTargetCode`, but via
+`IMTKGen.generateIMTKCode`, which also builds + structurally simplifies the
+System in the backend and dumps it. Caches into `COMPILED_MODELS_MTK`.
+"""
+function generateIMTKTargetCode(simCode::SimulationCode.SIM_CODE)
+  #= IMTKGen.generateIMTKCode evals the (current) module while building, so the
+     loaded module is already fresh: record changeDetected = false so a later
+     MTK-mode simulate on this model does not needlessly re-eval the module. =#
+  (modelName::String, modelCode::Expr) = IMTKGen.generateIMTKCode(simCode)
+  local codeHash = hash(modelCode)
+  @info "[IMTK GEN] generated target code" model=modelName codeHash=codeHash
+  COMPILED_MODELS_MTK[modelName] = (modelCode, false, codeHash)
+  return (modelName, modelCode)
+end
+
 function getCompiledModel(modelName)
   try
     return COMPILED_MODELS_MTK[modelName][1]
@@ -875,7 +926,7 @@ end
 """
   ```
    simulateModel(modelName::String;
-                       MODE = MTK_MODE,
+                       MODE = DEFAULT_BACKEND_MODE[],
                        tspan = (0.0, 1.0),
                        solver = Rodas5(),
                        kwargs...)
@@ -885,7 +936,7 @@ end
   OMBackend.simulateModel(modelName, tspan = (0.0, 1.0), solver = :(Tsit5()));
 """
 function simulateModel(modelName::String;
-                       MODE = MTK_MODE,
+                       MODE = DEFAULT_BACKEND_MODE[],
                        tspan = (0.0, 1.0),
                        solver = Rodas5(autodiff=false),
                        overwriteCache::Bool = false,
@@ -919,6 +970,17 @@ function simulateModel(modelName::String;
       _runDir === nothing ? _doSim() : withLogRunDir(_doSim, _runDir)
     catch err
       @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
+      rethrow(err)
+    end
+  elseif MODE == IMTK_MODE
+    #= Reuse the build cached in the backend at translate time (no
+       structural_simplify re-run); simulateIMTK falls back to module simulate. =#
+    local _runDir = get(MODEL_RUN_DIRS, modelName, nothing)
+    local _doSim = () -> IMTKGen.simulateIMTK(modelName, tspan, solver; kwargs...)
+    try
+      return _runDir === nothing ? _doSim() : withLogRunDir(_doSim, _runDir)
+    catch err
+      @error "iMTK simulate failed" exception_type=typeof(err) mode=MODE model=modelName
       rethrow(err)
     end
   elseif MODE == DEMode
@@ -987,7 +1049,7 @@ end
 """
 function resimulateModel(modelName::String;
                          solver = Rodas5(autodiff=false),
-                         MODE = MTK_MODE,
+                         MODE = DEFAULT_BACKEND_MODE[],
                          tspan=(0.0, 1.0),
                          parameters::Dict = Dict())
   #=

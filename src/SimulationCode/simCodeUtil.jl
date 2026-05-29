@@ -101,6 +101,155 @@ function runSimCodePass(passName::AbstractString,
   return afterPass
 end
 
+#= ── Complex operator-record lowering ────────────────────────────────────
+   QuasiStationary / QuasiStatic models carry Complex phasor records. The
+   frontend scalarizes the components into `<name>_re` / `<name>_im` SimVars
+   but leaves operator-record calls (`'*'.multiply`, `conj`, `fromReal`,
+   `'-'.subtract`, `'+'.add`, `'/'.divide`, `arg`, `'abs'`) and bare complex
+   crefs in the residuals. This pass rewrites them to scalar `_re`/`_im`
+   arithmetic so later passes and codegen only ever see real scalars. =#
+
+function _pathLastName(@nospecialize(p))::String
+  p isa Absyn.IDENT && return p.name
+  p isa Absyn.QUALIFIED && return _pathLastName(p.path)
+  p isa Absyn.FULLYQUALIFIED && return _pathLastName(p.path)
+  return ""
+end
+
+# Operator-record function token. canonicalizeCrefNames flattens qualified
+# paths into one IDENT with `_` separators (e.g. ComplexVoltage_'*'_multiply),
+# so the operation is the final underscore-delimited token.
+_opToken(@nospecialize(p))::String = String(last(split(_pathLastName(p), '_')))
+
+_cplxRe(base::AbstractString) = EXP_CREF(SimCref(base * "_re"), TYPE_REAL())
+_cplxIm(base::AbstractString) = EXP_CREF(SimCref(base * "_im"), TYPE_REAL())
+_mulE(a, b) = BINARY(a, OP_MUL, b)
+_addE(a, b) = BINARY(a, OP_ADD, b)
+_subE(a, b) = BINARY(a, OP_SUB, b)
+_negE(a)    = UNARY(OP_UMINUS, a)
+
+"(reExp, imExp) for a complex-valued expression, or nothing if not complex."
+function _complexParts(@nospecialize(exp))::Union{Nothing, Tuple{Exp, Exp}}
+  if exp isa EXP_CREF && exp.ty isa TYPE_COMPLEX
+    #= Preserve cref subscripts on Complex array elements: a Complex array y[m]
+       with `subs = [1]` must scalarize to `y[1]_re` / `y[1]_im`, not bare
+       `y_re` / `y_im`. The SimVar table holds the bracketed names after BDAE's
+       afterExpandComplex pass, so dropping subs leaves SimCodeCheck flagging
+       unresolved refs (this was the UnsymmetricalLoad failure shape). =#
+    local sc = exp.cref
+    local base = isempty(sc.subs) ?
+                   string(sc.sym) :
+                   string(sc.sym) * "[" * join(sc.subs, "][") * "]"
+    return (_cplxRe(base), _cplxIm(base))
+  elseif exp isa CALL
+    local fn = _opToken(exp.path)
+    local args = exp.args
+    if fn == "fromReal" && length(args) >= 1
+      return (_lowerComplexExp(args[1]),
+              length(args) >= 2 ? _lowerComplexExp(args[2]) : RCONST(0.0))
+    elseif fn == "conj" && length(args) >= 1
+      local p = _complexParts(args[1]); p === nothing && return nothing
+      return (p[1], _negE(p[2]))
+    elseif (fn == "multiply" || fn == "'*'") && length(args) == 3
+      #= 3-arg multiply: `f(c1: Complex, c2_re: Real, c2_im: Real)` shape used by
+         Modelica.ComplexBlocks.Interfaces.ComplexInput.'*'.multiply where the
+         second Complex operand is already passed pre-split. =#
+      local a = _complexParts(args[1])
+      a === nothing && return nothing
+      local br = _lowerComplexExp(args[2])
+      local bi = _lowerComplexExp(args[3])
+      return (_subE(_mulE(a[1], br), _mulE(a[2], bi)),
+              _addE(_mulE(a[1], bi), _mulE(a[2], br)))
+    elseif (fn == "multiply" || fn == "'*'") && length(args) >= 2
+      local a = _complexParts(args[1]); local b = _complexParts(args[2])
+      (a === nothing || b === nothing) && return nothing
+      return (_subE(_mulE(a[1], b[1]), _mulE(a[2], b[2])),
+              _addE(_mulE(a[1], b[2]), _mulE(a[2], b[1])))
+    elseif (fn == "subtract" || fn == "'-'") && length(args) >= 2
+      local a = _complexParts(args[1]); local b = _complexParts(args[2])
+      (a === nothing || b === nothing) && return nothing
+      return (_subE(a[1], b[1]), _subE(a[2], b[2]))
+    elseif (fn == "negate" || fn == "'-'") && length(args) == 1
+      local a = _complexParts(args[1]); a === nothing && return nothing
+      return (_negE(a[1]), _negE(a[2]))
+    elseif (fn == "add" || fn == "'+'") && length(args) >= 2
+      local a = _complexParts(args[1]); local b = _complexParts(args[2])
+      (a === nothing || b === nothing) && return nothing
+      return (_addE(a[1], b[1]), _addE(a[2], b[2]))
+    elseif (fn == "divide" || fn == "'/'") && length(args) == 4
+      #= 4-arg divide: `f(nr, ni, dr, di) -> Complex` shape used by Complex_'/'
+         where both operands are passed pre-split. =#
+      local nr = _lowerComplexExp(args[1])
+      local ni = _lowerComplexExp(args[2])
+      local dr = _lowerComplexExp(args[3])
+      local di = _lowerComplexExp(args[4])
+      local den = _addE(_mulE(dr, dr), _mulE(di, di))
+      return (BINARY(_addE(_mulE(nr, dr), _mulE(ni, di)), OP_DIV, den),
+              BINARY(_subE(_mulE(ni, dr), _mulE(nr, di)), OP_DIV, den))
+    elseif (fn == "divide" || fn == "'/'") && length(args) >= 2
+      local a = _complexParts(args[1]); local b = _complexParts(args[2])
+      (a === nothing || b === nothing) && return nothing
+      local den = _addE(_mulE(b[1], b[1]), _mulE(b[2], b[2]))
+      return (BINARY(_addE(_mulE(a[1], b[1]), _mulE(a[2], b[2])), OP_DIV, den),
+              BINARY(_subE(_mulE(a[2], b[1]), _mulE(a[1], b[2])), OP_DIV, den))
+    end
+    return nothing
+  end
+  return nothing
+end
+
+"Real scalar for a complex projection (re / im / abs / arg), or nothing."
+function _complexProjection(@nospecialize(exp))::Union{Nothing, Exp}
+  if exp isa RSUB
+    local p = _complexParts(exp.exp); p === nothing && return nothing
+    exp.fieldName == "re" && return p[1]
+    exp.fieldName == "im" && return p[2]
+    return nothing
+  elseif exp isa ASUB && length(exp.subs) == 1 && exp.subs[1] isa ICONST
+    local p = _complexParts(exp.exp); p === nothing && return nothing
+    exp.subs[1].value == 1 && return p[1]
+    exp.subs[1].value == 2 && return p[2]
+    return nothing
+  elseif exp isa TSUB
+    #= TSUB(complex_expr, idx) appears when a Modelica `'/'` / `'*'` overload
+       on Complex returns a record whose .re/.im fields are accessed by index
+       (1 = re, 2 = im) instead of by name. =#
+    local p = _complexParts(exp.exp); p === nothing && return nothing
+    exp.index == 1 && return p[1]
+    exp.index == 2 && return p[2]
+    return nothing
+  elseif exp isa CALL
+    local fn = _opToken(exp.path)
+    if (fn == "'abs'" || fn == "abs") && length(exp.args) >= 1
+      local p = _complexParts(exp.args[1]); p === nothing && return nothing
+      return BINARY(_addE(BINARY(p[1], OP_POW, RCONST(2.0)),
+                          BINARY(p[2], OP_POW, RCONST(2.0))), OP_POW, RCONST(0.5))
+    elseif fn == "arg" && length(exp.args) >= 1
+      local p = _complexParts(exp.args[1]); p === nothing && return nothing
+      return CALL(Absyn.IDENT("atan2"), Exp[p[2], p[1]], exp.attr)
+    end
+    return nothing
+  end
+  return nothing
+end
+
+function _lowerComplexVisitor(@nospecialize(exp), arg)
+  local proj = _complexProjection(exp)
+  proj === nothing ? (exp, true, arg) : (proj, false, arg)
+end
+
+_lowerComplexExp(@nospecialize(exp))::Exp = traverseExpTopDown(exp, _lowerComplexVisitor, nothing)[1]
+
+"SimCode pass: scalarize Complex operator-record expressions in residuals."
+function lowerComplexOperatorRecords(simCode::SIM_CODE)::SIM_CODE
+  local newRes = RESIDUAL_EQUATION[]
+  for eq in simCode.residualEquations
+    push!(newRes, typeof(eq)(_lowerComplexExp(eq.exp), eq.source, eq.attr))
+  end
+  @assign simCode.residualEquations = newRes
+  return simCode
+end
+
 """
   Returns true if simvar is either a algebraic or a state variable.
 """
@@ -4022,13 +4171,25 @@ function eliminateAliasVariables(simCode::SIM_CODE)
 
   @debug "[SIMCODE: $(simCode.name): aliasElimination] eliminated $(length(elimVarNames)) variables and removed $(length(aliasEqIndices)) equations ($(length(pairedElimVarNames)) paired for observation, $(length(newResEqs)) equations, $(length(newHT)) variables remain)"
 
+  #= eliminateAliasVariables can run more than once; merge (do not replace) the
+     alias observations so a later run does not discard a prior run's entries
+     (e.g. overconstrained-connector reference-gamma), keeping them retrievable. =#
+  local mergedAliasMap = copy(simCode.aliasMap)
+  local seenElimNames = Set{String}(e.eliminatedName for e in mergedAliasMap)
+  for e in keptAliasEntries
+    if !(e.eliminatedName in seenElimNames)
+      push!(mergedAliasMap, e)
+      push!(seenElimNames, e.eliminatedName)
+    end
+  end
+
   @assign begin
     simCode.residualEquations = newResEqs
     simCode.initialEquations = newInitEqs
     simCode.stringToSimVarHT = newHT
     simCode.ifEquations = newIfEqs
     simCode.whenEquations = newWhenEqs
-    simCode.aliasMap = keptAliasEntries
+    simCode.aliasMap = mergedAliasMap
   end
   #= State-state aliases collapse two STATEs marked irreducible into one.
      Drop the eliminated names from `irreducibleVariables` so MTK codegen's

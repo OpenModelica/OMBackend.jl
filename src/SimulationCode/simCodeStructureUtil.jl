@@ -64,8 +64,10 @@ function SimCref(@nospecialize(cref::DAE.ComponentRef))::SimCref
       SimCref(Symbol(id), _extractIntSubscripts(subs))
     DAE.CREF_QUAL(__) =>
       SimCref(Symbol(_flattenQualifiedName(cref)), Int[])
+    #= WILD is intercepted in toSimExp(DAE.CREF) and becomes a SimCode.WILD()
+       node, so SimCref should never see it. Defensive error if it does. =#
     DAE.WILD(__) =>
-      error("SimCref(DAE.WILD): wildcards are not valid SimCode references")
+      error("SimCref(DAE.WILD): wildcard should be a SimCode.WILD() node, not a SimCref")
     _ =>
       error("SimCref: unsupported ComponentRef variant $(typeof(cref))")
   end
@@ -191,7 +193,8 @@ toSimExp(e::DAE.RCONST)::Exp = RCONST(Float64(e.real))
 toSimExp(e::DAE.BCONST)::Exp = BCONST(e.bool)
 toSimExp(e::DAE.SCONST)::Exp = SCONST(e.string)
 toSimExp(e::DAE.ENUM_LITERAL)::Exp = ENUM_LITERAL(e.name, Int(e.index))
-toSimExp(e::DAE.CREF)::Exp = EXP_CREF(SimCref(e.componentRef), e.ty)
+toSimExp(e::DAE.CREF)::Exp =
+  e.componentRef isa DAE.WILD ? WILD() : EXP_CREF(SimCref(e.componentRef), e.ty)
 toSimExp(e::DAE.BINARY)::Exp =
   BINARY(toSimExp(e.exp1), toOpKind(e.operator), toSimExp(e.exp2))
 toSimExp(e::DAE.UNARY)::Exp = UNARY(toOpKind(e.operator), toSimExp(e.exp))
@@ -237,6 +240,7 @@ toDAEExp(e::BCONST)::DAE.Exp = DAE.BCONST(e.value)
 toDAEExp(e::SCONST)::DAE.Exp = DAE.SCONST(e.value)
 toDAEExp(e::ENUM_LITERAL)::DAE.Exp = DAE.ENUM_LITERAL(e.path, e.index)
 toDAEExp(e::EXP_CREF)::DAE.Exp = DAE.CREF(toDAECref(e.cref).componentRef, toDAEType(e.ty))
+toDAEExp(e::WILD)::DAE.Exp = DAE.CREF(DAE.WILD(), DAE.T_REAL_DEFAULT)
 toDAEExp(e::BINARY)::DAE.Exp =
   DAE.BINARY(toDAEExp(e.exp1), toDAEOperator(e.op), toDAEExp(e.exp2))
 toDAEExp(e::UNARY)::DAE.Exp =
@@ -324,6 +328,16 @@ end
 
 Base.@nospecializeinfer function RESIDUAL_EQUATION(@nospecialize(exp::DAE.Exp), src::Nothing, attr::Nothing)
   return RESIDUAL_EQUATION(toSimExp(exp), DAE.emptyElementSource, EQ_ATTR_DEFAULT)
+end
+
+#= BDAE residuals may carry a Nothing source with a real attr; preserve the attr
+   and substitute the empty source (converting the exp when it is still DAE). =#
+Base.@nospecializeinfer function RESIDUAL_EQUATION(@nospecialize(exp::Exp), src::Nothing, attr::EQ_ATTR)
+  return RESIDUAL_EQUATION(exp, DAE.emptyElementSource, attr)
+end
+
+Base.@nospecializeinfer function RESIDUAL_EQUATION(@nospecialize(exp::DAE.Exp), src::Nothing, attr::EQ_ATTR)
+  return RESIDUAL_EQUATION(toSimExp(exp), DAE.emptyElementSource, attr)
 end
 
 Base.convert(::Type{EQ_ATTR}, a::EQ_ATTR) = a
