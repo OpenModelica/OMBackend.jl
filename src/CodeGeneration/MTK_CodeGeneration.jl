@@ -391,6 +391,12 @@ struct IfEquationComponent
   conditionalEquations :: Vector{Expr}
   conditionVariables   :: Vector{Symbol}
   conditionNameAndIV   :: Vector{Tuple{String, Bool}}
+  #= Deferred pure-time-event branches: (ifCondSym, zeroCrossingLHS, mtkConditionEq,
+     postCrossingValue). `createIfEquations` builds one refresh callback per entry;
+     each fires at its own threshold, sets its own ifCond to the post-crossing value,
+     and re-derives the OTHER pure-time ifConds from their zero-crossing sign so that
+     coincident time events cannot drop one another's affect. =#
+  pureTimeEvents       :: Vector{Tuple{Symbol, Any, Any, Float64}}
 end
 
 """
@@ -1654,6 +1660,53 @@ end
 Each if equation is marked by the identifier.
 So the first will have 1 and so on.
 """
+#= Build one SymbolicContinuousCallback per deferred pure-time event. Callback K
+   fires at event K's threshold, so its affect sets ITS OWN ifCond to the known
+   post-crossing value (`numVal`, exactly what the per-branch toggle sets) and
+   re-derives every OTHER pure-time ifCond from its zero-crossing sign
+   (`zc < 0` <=> condition TRUE). Reading the firing event's own `zc` is unusable
+   because it is exactly 0 at the crossing instant; the other events are not at
+   their crossing so their sign is definite. Whichever callback fires refreshes
+   all, so coincident time events stay consistent even though MTK/DiffEq apply
+   only one affect per coincident root. =#
+function _buildTimeEventRefreshCallbacks(allPT::Vector)
+  local n = length(allPT)
+  local cbs = Expr[]
+  for k in 1:n
+    local mtkCondK = allPT[k][3]
+    local numValK = allPT[k][4]
+    local obsKws = Expr[]
+    local retKws = Expr[]
+    local modKws = Expr[]
+    for j in 1:n
+      local symJ = allPT[j][1]
+      push!(modKws, Expr(:kw, symJ, symJ))
+      if j == k
+        push!(retKws, Expr(:kw, symJ, numValK))
+      else
+        local zcName = Symbol("_zc", j)
+        push!(obsKws, Expr(:kw, zcName, allPT[j][2]))
+        push!(retKws, Expr(:kw, symJ, :((observed.$(zcName) < 0) ? 1.0 : 0.0)))
+      end
+    end
+    local modNT = Expr(:tuple, Expr(:parameters, modKws...))
+    local retNT = Expr(:tuple, Expr(:parameters, retKws...))
+    local fExpr = :((modified, observed, ctx, integrator) -> $(retNT))
+    local affect
+    if isempty(obsKws)
+      affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT)))
+    else
+      local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
+      affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT); observed = $(obsNT)))
+    end
+    push!(cbs, :(ModelingToolkit.SymbolicContinuousCallback(
+      ($(mtkCondK)) => $(affect);
+      reinitializealg = SciMLBase.NoInit()
+    )))
+  end
+  return cbs
+end
+
 function createIfEquations(stateVariables, algebraicVariables, simCode)
   local ifEquations = IfEquationComponent[]
   local identifier::Int
@@ -1662,6 +1715,15 @@ function createIfEquations(stateVariables, algebraicVariables, simCode)
   #= The identifier is increased by 1 in each iteration. =#
   for (identifier, ifEq) in enumerate(sortedIfEquations)
     push!(ifEquations, createIfEquation(stateVariables, algebraicVariables, ifEq, identifier, simCode))
+  end
+  #= Pure-time-event branches deferred their callbacks (see createIfEquation);
+     build the model-level refresh callbacks now that every if-equation's
+     pure-time conditions are known. =#
+  local allPT = collect(Iterators.flatten(c.pureTimeEvents for c in ifEquations))
+  if !isempty(allPT)
+    local refreshCbs = _buildTimeEventRefreshCallbacks(allPT)
+    push!(ifEquations, IfEquationComponent(refreshCbs, Expr[], Symbol[],
+                                           Tuple{String, Bool}[], Tuple{Symbol, Any, Any, Float64}[]))
   end
   return ifEquations
 end
@@ -1732,6 +1794,34 @@ function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::
     if !(kind isa SimulationCode.DISCRETE || kind isa SimulationCode.PARAMETER)
       return false
     end
+  end
+  return true
+end
+
+"""
+    _ifConditionIsPureTimeEvent(condition, simCode) -> Bool
+
+Return true when `condition` is a deterministic time event: it references
+`time` and every other reference is a PARAMETER (no STATE / ALG / DISCRETE).
+The transition instant is then fixed a priori, so coincident time events
+(two sources transitioning at the same instant) must all be applied at once.
+Conservative: any non-parameter reference returns false, keeping the default
+per-branch continuous callback.
+"""
+function _ifConditionIsPureTimeEvent(@nospecialize(condition), simCode)::Bool
+  local refs::Set{String} = Set{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, condition)
+  catch
+    return false
+  end
+  ("time" in refs) || return false
+  local ht = simCode.stringToSimVarHT
+  for name in refs
+    name == "time" && continue
+    local entry = get(ht, name, nothing)
+    entry === nothing && return false
+    (entry[2].varKind isa SimulationCode.PARAMETER) || return false
   end
   return true
 end
@@ -1814,6 +1904,7 @@ function createIfEquation(stateVariables::Vector,
   local allIfCondSyms = [Symbol(string("ifCond", identifier, j)) for j in 1:branchesWithConds]
   local conditions = Expr[]
   local ivConditions = Bool[]
+  local pureTimeEvents = Tuple{Symbol, Any, Any, Float64}[]
   for branch in ifEq.branches
     i += 1
     @match branch begin
@@ -1845,26 +1936,36 @@ function createIfEquation(stateVariables::Vector,
            values (which would form a circular init dependency). =#
         local zcLhs = _extractZeroCrossingLHS(mtkCond)
         local thisSym::Symbol = allIfCondSyms[i]
-        local cond::Expr
-        if _zcReferencesSolvableAlgebraic(zcLhs, simCode)
-          local initObservedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, :zc, zcLhs)))
-          local initModifiedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, thisSym)))
-          local initRetNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :((observed.zc < 0) ? 1.0 : 0.0))))
-          local initFExpr::Expr = :((modified, observed, ctx, integrator) -> $initRetNT)
-          local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT); observed = $(initObservedNT)))
-          cond = :(ModelingToolkit.SymbolicContinuousCallback(
-            ($(mtkCond)) => $(affectTuple);
-            initialize = $(initAffect),
-            reinitializealg = SciMLBase.NoInit()
-          ))
+        if _ifConditionIsPureTimeEvent(branch.condition, simCode)
+          #= Deterministic time event: defer to model-level refresh callbacks built
+             in createIfEquations, so two sources whose transitions coincide cannot
+             drop one another's affect. `numVal` is the post-crossing ifCond value
+             (same value the per-branch toggle would set). The ifCond parameter is
+             still declared and initialised below via ivConditions. =#
+          push!(pureTimeEvents, (thisSym, zcLhs, mtkCond, numVal))
+          push!(ivConditions, ivCond)
         else
-          cond = :(ModelingToolkit.SymbolicContinuousCallback(
-            ($(mtkCond)) => $(affectTuple);
-            reinitializealg = SciMLBase.NoInit()
-          ))
+          local cond::Expr
+          if _zcReferencesSolvableAlgebraic(zcLhs, simCode)
+            local initObservedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, :zc, zcLhs)))
+            local initModifiedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, thisSym)))
+            local initRetNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :((observed.zc < 0) ? 1.0 : 0.0))))
+            local initFExpr::Expr = :((modified, observed, ctx, integrator) -> $initRetNT)
+            local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT); observed = $(initObservedNT)))
+            cond = :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(mtkCond)) => $(affectTuple);
+              initialize = $(initAffect),
+              reinitializealg = SciMLBase.NoInit()
+            ))
+          else
+            cond = :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(mtkCond)) => $(affectTuple);
+              reinitializealg = SciMLBase.NoInit()
+            ))
+          end
+          push!(conditions, cond)
+          push!(ivConditions, ivCond)
         end
-        push!(conditions, cond)
-        push!(ivConditions, ivCond)
       end
     end
   end
@@ -1894,7 +1995,7 @@ function createIfEquation(stateVariables::Vector,
     push!(conditionVariableNames, (string("ifCond", identifier, i), !(ivConditions[i])))
   end
   return IfEquationComponent(conditions, ifExpressions,
-                             conditionVariables, conditionVariableNames)
+                             conditionVariables, conditionVariableNames, pureTimeEvents)
 end
 
 """
