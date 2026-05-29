@@ -793,18 +793,30 @@ unwieldy ifelse chain).
 
 Vararg subscripts to support both vectors and N-dimensional arrays.
 """
+#= Named functor for the symbolic-argument table lookup. Must be a NAMED type, not
+   an anonymous closure: MTK's `substitute` / `alias_elimination` rebuild the term
+   via `maketerm`, which RE-INFERS the symtype from `promote_symtype(op, ...)`,
+   ignoring the explicit `type = Real` set in `makeSymbolicTerm`. An anonymous
+   closure has no `promote_symtype` method, so the rebuilt term defaults to symtype
+   `Any`; arithmetic on it then trips the SymReal/`Any` subtraction guard in
+   `find_eq_solvables!` (`-(::SymReal, ::SymReal)` throws when a symtype is
+   non-numeric). Declaring the result `Real` keeps the rebuilt term numeric. =#
+struct ConstTableLookupFn{A <: AbstractArray}
+  table::A
+end
+function (c::ConstTableLookupFn)(rt_idxs...)
+  local resolved = ntuple(length(rt_idxs)) do k
+    local v = rt_idxs[k]
+    local raw = v isa Integer ? Int(v) : Int(round(Float64(v)))
+    clamp(raw, 1, size(c.table, k))
+  end
+  return c.table[resolved...]
+end
+SymbolicUtils.promote_symtype(::ConstTableLookupFn, args...) = Real
+
 function constTableLookup(table::AbstractArray, idxs...)
   if hasSymbolicArgs(idxs...)
-    local _table = table
-    local f = (rt_idxs...) -> begin
-      local resolved = ntuple(length(rt_idxs)) do k
-        local v = rt_idxs[k]
-        local raw = v isa Integer ? Int(v) : Int(round(Float64(v)))
-        clamp(raw, 1, size(_table, k))
-      end
-      _table[resolved...]
-    end
-    return makeSymbolicTerm(f, Any[idxs...])
+    return makeSymbolicTerm(ConstTableLookupFn(table), Any[idxs...])
   else
     return table[ntuple(k -> clamp(_toIndex(idxs[k]), 1, size(table, k)),
                        length(idxs))...]

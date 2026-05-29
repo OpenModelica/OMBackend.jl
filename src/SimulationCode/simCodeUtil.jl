@@ -2569,6 +2569,14 @@ function _recordNameRewrite!(ctx::_CanonicalNameContext, original::AbstractStrin
 end
 
 function _canonicalVariableKey(name::AbstractString, ctx::_CanonicalNameContext)::String
+  #= Honour an explicit override in ctx.rename (e.g. the reserved-name rename of a
+     model variable literally named `t`). For every ordinary name the override and
+     the plain canonical form coincide, so this is behaviour-preserving except for
+     the reserved override. =#
+  local override = get(ctx.rename, name, nothing)
+  if override !== nothing
+    return _recordNameRewrite!(ctx, name, override)
+  end
   return _recordNameRewrite!(ctx, name, OMBackend.canonicalName(name))
 end
 
@@ -3170,6 +3178,16 @@ function canonicalizeCrefNames(simCode::SIM_CODE;
   for entry in simCode.aliasMap
     rename[entry.eliminatedName] = _canonicalVariableKey(entry.eliminatedName)
     rename[entry.representativeName] = _canonicalVariableKey(entry.representativeName)
+  end
+
+  #= Reserved-name rename: a model variable literally named `t` collides with the
+     MTK independent variable `t` (yields a dangling `der(t) ~ 1` and a SymReal
+     clash in alias elimination). Rewrite it to `<modelName>V_t` everywhere via the
+     override; the cref/HT canonicalization both consult `rename`. =#
+  if haskey(simCode.stringToSimVarHT, "t")
+    local _renamedT = _canonicalVariableKey(simCode.name) * "V_t"
+    @warn "Variable name t clash with builtin symbol in MTK. Variable renamed $(_renamedT)"
+    rename["t"] = _renamedT
   end
 
   local known = Set{String}(values(rename))
