@@ -270,24 +270,37 @@ variables. Returns the filtered equation list and an alias map
 Chain A → B → C is resolved to A → C before substitution.
 """
 function eliminateIfEqRelays(equations::Vector{Expr})
-    raw = Dict{Symbol,Symbol}()
-    non_relay = Expr[]
+    #= Union-find (not a plain map): a variable that is the leaf-alias LHS of two
+       relays (`A~B`, `A~C`) means A≡B≡C; a `raw[k]=v` map overwrites and drops one
+       side, disconnecting it from its definer. Union-find keeps the component intact. =#
+    local parent = Dict{Symbol,Symbol}()
+    local getroot = function (x::Symbol)
+        haskey(parent, x) || (parent[x] = x)
+        while parent[x] != x
+            x = parent[x]
+        end
+        return x
+    end
+    local non_relay = Expr[]
     for eq in equations
         if _isIfEqTmpRelay(eq)
-            (k, v) = _ifEqRelayPair(eq)
-            raw[k] = v
+            local (k, v) = _ifEqRelayPair(eq)
+            if k === nothing || v === nothing
+                push!(non_relay, eq)
+                continue
+            end
+            local rk = getroot(k)
+            local rv = getroot(v)
+            rk == rv || (parent[rk] = rv)
         else
             push!(non_relay, eq)
         end
     end
-    isempty(raw) && return (equations, raw)
-    alias = Dict{Symbol,Symbol}()
-    for k in keys(raw)
-        v = raw[k]
-        while haskey(raw, v)
-            v = raw[v]
-        end
-        alias[k] = v
+    isempty(parent) && return (equations, Dict{Symbol,Symbol}())
+    local alias = Dict{Symbol,Symbol}()
+    for k in keys(parent)
+        local r = getroot(k)
+        k == r || (alias[k] = r)
     end
     resolved = [_substSyms(eq, alias) for eq in non_relay]
     return (resolved, alias)

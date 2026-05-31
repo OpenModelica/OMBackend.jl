@@ -121,6 +121,11 @@ function _preValueLookup(@nospecialize(arg::DAE.Exp), simCode; cachedChange::Boo
         return expToJuliaExpMTK(arg, simCode)
       end
       local (_, sv) = ht[crefStr]
+      if _isHeldDiscreteParam(crefStr, simCode)
+        #= held discrete is a parameter: its pre-value is the current param value,
+           read at affect entry before the when-write updates it. =#
+        return :(integrator.ps[$(QuoteNode(Symbol(string(sv.name))))])
+      end
       if SimulationCode.isParameter(sv)
         return expToJuliaExpMTK(arg, simCode)
       end
@@ -1685,10 +1690,35 @@ function performStructuralSimplify(simplify; observedFilter::Union{Nothing, Vect
     local _obsPatterns = [Regex(p) for p in $(patternStrings)]
     local _allObs = ModelingToolkit.observed(reducedSystem)
     local _nBefore = length(_allObs)
-    local _filteredObs = filter(_allObs) do eq
-      local _varName = string(eq.lhs)
-      any(p -> occursin(p, _varName), _obsPatterns)
+    #= Keep matched observed equations AND the transitive closure of observed
+       variables their RHS references; dropping a dependency leaves it
+       referenced-but-undefined in the residual/init build_function. =#
+    local _obsByLhs = Dict(string(eq.lhs) => eq for eq in _allObs)
+    local _keepNames = Set{String}()
+    local _stack = String[string(eq.lhs) for eq in _allObs
+                          if any(p -> occursin(p, string(eq.lhs)), _obsPatterns)]
+    #= Also seed from observed vars referenced by the system equations: the
+       residual / init build_function references them, so their defs must survive. =#
+    for _seq in ModelingToolkit.equations(reducedSystem)
+      for _side in (_seq.lhs, _seq.rhs)
+        for _v in Symbolics.get_variables(_side)
+          local _vn = string(_v)
+          haskey(_obsByLhs, _vn) && push!(_stack, _vn)
+        end
+      end
     end
+    while !isempty(_stack)
+      local _nm = pop!(_stack)
+      (_nm in _keepNames) && continue
+      push!(_keepNames, _nm)
+      local _eq = get(_obsByLhs, _nm, nothing)
+      _eq === nothing && continue
+      for _v in Symbolics.get_variables(_eq.rhs)
+        local _vn = string(_v)
+        (haskey(_obsByLhs, _vn) && !(_vn in _keepNames)) && push!(_stack, _vn)
+      end
+    end
+    local _filteredObs = filter(eq -> string(eq.lhs) in _keepNames, _allObs)
     if length(_filteredObs) < _nBefore
       @debug "[MTK GEN: observed] observedFilter: kept $(length(_filteredObs)) of $(_nBefore) MTK observed equations"
       reducedSystem = Setfield.set(reducedSystem, Setfield.PropertyLens{:observed}(), _filteredObs)
@@ -1947,12 +1977,23 @@ end
 # TODO: unify cref resolution into one function consulting both the SimCode
 # (state / numeric-param lookup tables) and the module-level bindings (String
 # parameters, data structures), so callers need not special-case the latter.
+#= (b) DISCRETE_AS_PARAM: a callback-driven held discrete is emitted as a parameter
+   (see the createSystem partition), so callback reads must resolve it through the
+   SymbolicIndexingInterface, not the state vector. Flag-off short-circuits to false,
+   leaving the default path untouched. =#
+function _isHeldDiscreteParam(name::AbstractString, simCode)::Bool
+  return name in OMBackend.CodeGeneration._heldDiscreteParamSet(simCode)
+end
+
 function getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode)
   local crefAsStr = string(x)
   if crefAsStr == "time"
     return :t
   end
   @match _, simVar = simCode.stringToSimVarHT[crefAsStr]
+  if _isHeldDiscreteParam(crefAsStr, simCode)
+    return :(integrator.ps[$(QuoteNode(Symbol(string(simVar.name))))])
+  end
   if !(SimulationCode.isParameter(simVar))
     Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(string(x))))))
   else

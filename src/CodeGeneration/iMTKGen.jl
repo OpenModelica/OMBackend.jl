@@ -38,9 +38,12 @@ function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
      simulate; skip _buildAndCache so iMTK falls through cleanly to the module
      `simulate` instead of warning loudly for every such model. Mirrors the
      condition in ODE_MODE_MTK (MTK_CodeGeneration.jl:415). =#
-  if !SimulationCode.hasStructuralTransitions(simCode) &&
-     !SimulationCode.hasSubModels(simCode) &&
-     !SimulationCode.hasFlatModel(simCode)
+  if ccall(:jl_generating_output, Cint, ()) != 0
+    #= Precompile/image generation: Core.eval'ing the model module into this
+       closed backend module is rejected; skip the build+eval (codegen warmed). =#
+  elseif !SimulationCode.hasStructuralTransitions(simCode) &&
+         !SimulationCode.hasSubModels(simCode) &&
+         !SimulationCode.hasFlatModel(simCode)
     _buildAndCache(modelName, modelCode)
   else
     @info "[IMTK GEN] structural / sub-model / flat-model path; build-cache skipped (iMTK delegates to MTK simulate)" model = modelName
@@ -112,6 +115,11 @@ the module's own `simulate` on cache miss / unexpected failure.
 function simulateIMTK(modelName::String, tspan, solver; kwargs...)
   local OMB = _OMBackend()
   local cname = OMB.canonicalName(modelName)
+  #= Structural/sub-model/flat-model iMTK builds skip _buildAndCache and are not
+     eval'd at translate; eval on first simulate if absent (mirrors MTK_MODE). =#
+  if !isdefined(OMB, Symbol(cname))
+    Core.eval(OMB, OMB.getCompiledModel(cname))
+  end
   if haskey(BUILT, cname)
     try
       local cached = BUILT[cname]

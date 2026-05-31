@@ -463,6 +463,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     import SCode
     import OMBackend
     import OMBackend.CodeGeneration
+    import Setfield
     using ModelingToolkit
     using DifferentialEquations
     using DiffEqCallbacks
@@ -590,6 +591,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     using OrdinaryDiffEq
     using Symbolics
     using OMBackend
+    import Setfield
     Base.Experimental.@compiler_options optimize=0 compile=min infer=false
     #= Add import to the external runtime if the generated code calls Modelica Functions =#
     $(if simCode.externalRuntime
@@ -774,6 +776,50 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local dataStructureVariables = vars.dataStructureVariables
   local statePriorityPairs     = vars.statePriorityPairs
 
+  #= (b) DISCRETE_AS_PARAM: callback-driven (when-assigned) held discretes become
+     PARAMETERS modified by the existing when-callbacks (ridden through the ifCond
+     param declaration path below), not der~0 continuous states. Partition them out
+     of `discreteVariables` here so the dummy / planDemotions / unknowns path never
+     sees them — retiring the off-by-one demotion accounting for this class. =#
+  local heldDiscreteParamDecls = Expr[]
+  local heldDiscreteParamPairs = Expr[]
+  local heldDiscreteSyms = Symbol[]
+  local _heldSet = _heldDiscreteParamSet(simCode)
+  if !isempty(_heldSet)
+    local _held = filter(dv -> dv in _heldSet, discreteVariables)
+    discreteVariables = filter(dv -> !(dv in _heldSet), discreteVariables)
+    local _unwrapPair = function (b)
+      local e = b
+      if e isa Expr && e.head === :block
+        for a in e.args
+          a isa LineNumberNode && continue
+          e = a
+          break
+        end
+      end
+      if e isa Expr && e.head === :call && length(e.args) == 3 && e.args[1] === :(=>)
+        return (e.args[2], e.args[3])
+      end
+      return nothing
+    end
+    local _seen = Set{Symbol}()
+    for _b in getStartConditionsMTK(_held, simCode)
+      local _p = _unwrapPair(_b)
+      (_p === nothing || !(_p[1] isa Symbol)) && continue
+      push!(heldDiscreteParamDecls, Expr(:(=), _p[1], _p[2]))
+      push!(heldDiscreteParamPairs, :($(_p[1]) => $(_p[2])))
+      push!(heldDiscreteSyms, _p[1]); push!(_seen, _p[1])
+    end
+    for dv in _held
+      local _s = Symbol(dv)
+      if !(_s in _seen)
+        push!(heldDiscreteParamDecls, Expr(:(=), _s, 0.0))
+        push!(heldDiscreteParamPairs, :($(_s) => 0.0))
+        push!(heldDiscreteSyms, _s)
+      end
+    end
+  end
+
   local performIndexReduction = simCode.isSingular
   local skipInitializeProb = SimulationCode.hasStructuralTransitions(simCode) ||
                              SimulationCode.hasMetaModel(simCode) ||
@@ -855,6 +901,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     push!(ifCondParamDecls, Expr(:(=), sym, numVal))
     push!(ifCondParamPairs, :($(sym) => $(numVal)))
   end
+  #= (b) held discretes ride the ifCond param path: declared as @parameters,
+     bound, added to `parameters`, and their start values pushed into `pars`.
+     Lists stay parallel (decls/syms built together above). =#
+  append!(ifCondParamDecls, heldDiscreteParamDecls)
+  append!(ifCondParamPairs, heldDiscreteParamPairs)
+  append!(ifConditionalVariables, heldDiscreteSyms)
   #= Phase G — collect the symbols MTK tearing must not eliminate
      (simCode-flagged irreducibles + ifEq_tmp LHS targets + fixed-start
      variables). =#
@@ -2898,12 +2950,20 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
         local leftStr = SimulationCode.string(SimulationCode.toDAEExp(wStmt.left))
         (index, var) = simCode.stringToSimVarHT[leftStr]
         local lhsSym = Symbol(string(var.name))
-        push!(res, quote
-                idx = lookuptableStates[Symbol($(string(var.name)))]
-                integrator.u[idx] = $(expToJuliaExpMTK(wStmt.right,
-                                                       simCode; varPrefix = varPrefix, varSuffix = varSuffix))
-                $(lhsSym) = integrator.u[idx]
-              end)
+        local rhsE = expToJuliaExpMTK(wStmt.right, simCode; varPrefix = varPrefix, varSuffix = varSuffix)
+        if leftStr in _heldDiscreteParamSet(simCode)
+          #= (b) held discrete is a parameter (not a state slot): write it through the
+             SymbolicIndexingInterface by literal-Symbol name (`integrator.ps[:name]`). =#
+          push!(res, quote
+                  integrator.ps[$(QuoteNode(lhsSym))] = $(rhsE)
+                end)
+        else
+          push!(res, quote
+                  idx = lookuptableStates[Symbol($(string(var.name)))]
+                  integrator.u[idx] = $(rhsE)
+                  $(lhsSym) = integrator.u[idx]
+                end)
+        end
       end
     elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
       (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]
@@ -2990,7 +3050,7 @@ function createTerminalBodyRunner(simCode::SimulationCode.SIM_CODE)
          body we cannot evaluate (e.g. an unsupported external call) warns rather
          than discarding the result. =#
       try
-        let integrator = (u = _sol.u[end], t = _sol.t[end], f = _sol.prob.f, dt = 0.0),
+        let integrator = (u = _sol.u[end], t = _sol.t[end], f = _sol.prob.f, dt = 0.0, ps = _sol.prob.ps),
             x = _sol.u[end],
             t = _sol.t[end],
             p = _sol.prob.p,

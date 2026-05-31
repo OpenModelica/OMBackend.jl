@@ -813,6 +813,10 @@ function (c::ConstTableLookupFn)(rt_idxs...)
   return c.table[resolved...]
 end
 SymbolicUtils.promote_symtype(::ConstTableLookupFn, args...) = Real
+#= maketerm RE-INFERS shape too, not just symtype; the generic fallback yields
+   Unknown, which trips `promote_shape(==, Unknown, scalar)` once the rebuilt term
+   lands in a relational during substitute/full_equations. The lookup is scalar. =#
+SymbolicUtils.promote_shape(::ConstTableLookupFn, szs::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 
 function constTableLookup(table::AbstractArray, idxs...)
   if hasSymbolicArgs(idxs...)

@@ -518,25 +518,59 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
   elseif isPeriodic
-    local whenStmts = createWhenStatements(wEq.whenStmtLst, simCode)
     @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = wEqCondDAE
     @match start <| interval <| tail = args
-    quote
-      $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
-        #@info "Calling affect! at $(integrator.t)"
-        local t = integrator.t + integrator.dt
-        local x = integrator.u
-        if integrator.dt == 0.0
-          @error "integrator.dt was zero. Aborting."
-          fail()
+    if OMBackend.DISCRETE_AS_PARAM[]
+      # Resolve crefs via lookuptable (mirror the discrete-callback path) so held discretes route to parameters.
+      local whenStmtsMTK = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+      quote
+        let _affCache = Ref{Any}(nothing)
+          global $(Symbol("affect$(callbacks)!"))
+          $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+            local t = integrator.t + integrator.dt
+            local x = integrator.u
+            local lookuptableStates
+            local lookuptableParams
+            if _affCache[] === nothing
+              local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+              local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+              lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+              lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+              _affCache[] = (lookuptableStates, lookuptableParams)
+            else
+              local cached = _affCache[]
+              lookuptableStates = cached[1]
+              lookuptableParams = cached[2]
+            end
+            $(map(x->Expr(Symbol("="),
+                          Symbol(string(x)),
+                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
+                  vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...))...)
+            if integrator.dt == 0.0
+              @error "integrator.dt was zero. Aborting."
+              fail()
+            end
+            $(whenStmtsMTK...)
+          end
         end
-        #@info "t + dt = " t
-        #if (Bool($(expToJuliaExp(wEqCondDAE, simCode))))
-        $(whenStmts...)
-        #end
+        Δt = $(expToJuliaExp(interval, simCode))
+        $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), Δt)
       end
-      Δt = $(expToJuliaExp(interval, simCode))
-      $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), Δt)
+    else
+      local whenStmts = createWhenStatements(wEq.whenStmtLst, simCode)
+      quote
+        $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+          local t = integrator.t + integrator.dt
+          local x = integrator.u
+          if integrator.dt == 0.0
+            @error "integrator.dt was zero. Aborting."
+            fail()
+          end
+          $(whenStmts...)
+        end
+        Δt = $(expToJuliaExp(interval, simCode))
+        $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), Δt)
+      end
     end
   else #= If none of the variables in the condition was continuous.. =#
     #= Use MTK-aware runtime symbol lookup for discrete callbacks.
