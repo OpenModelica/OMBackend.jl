@@ -249,7 +249,10 @@ function collectIrreducibleSymbols(simCode,
                                    stateVariables::Vector{String},
                                    algebraicVariables::Vector{String},
                                    occVariables::Vector{String})::Vector{Symbol}
-  local syms = Symbol[Symbol(vn) for vn in simCode.irreducibleVariables]
+  #= Sort: `irreducibleVariables` is an unordered collection, and this list feeds
+     structural_simplify's tearing — a non-deterministic order yields a
+     non-deterministic (occasionally unsolvable) reduced system. =#
+  local syms = Symbol[Symbol(vn) for vn in sort!(collect(simCode.irreducibleVariables))]
   for ceq in conditionalEquations
     if ceq isa Expr && ceq.head == :call && length(ceq.args) >= 2
       local lhs = ceq.args[2]
@@ -1089,7 +1092,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       end
       Base.invokelatest(_mergeInitAlgIntoU0!, finalInitialValues)
       #= ODE System =#
-      nonLinearSystem = $(odeSystemWithEvents(!isempty(ifConditionalVariables), modelName;
+      nonLinearSystem = $(odeSystemWithEvents(!isempty(ifConditionalVariables) || !isempty(IF_EQUATION_EVENTS), modelName;
                                               hasObserved = !isempty(simCode.aliasMap) ||
                                                             !isempty(simCode.eliminatedVariables)))
       firstOrderSystem = nonLinearSystem
@@ -2021,35 +2024,127 @@ function _substRelation(@nospecialize(exp), @nospecialize(rel), val::Bool)
   return first(Util.traverseExpBottomUp(exp, repl, nothing))
 end
 
+#= Lower a DAE boolean expression to an MTK Real (0.0/1.0). Each relation is
+   wrapped `ifelse(rel, 1.0, 0.0)` so AND/OR/NOT stay arithmetic on Reals: a bare
+   relation is a Julia Bool and `Bool + Bool` is an Int64, illegal in the boolean
+   context the affect feeds. pre()/discrete crefs are already 0/1 Reals;
+   constants and params fall through to the general emitter. =#
+#= Lower an operand inside an event affect. `pre(x)` becomes
+   `ModelingToolkit.Pre(x)` — the pre-event value — so an affect that reads a
+   discrete's own previous value (e.g. `mode = … pre(mode) …`) is solvable; a
+   bare reference would make the written variable appear on its own RHS and MTK
+   raises UnsolvableCallbackError. Continuous operands read their current value. =#
+Base.@nospecializeinfer function _affectExpToReal(@nospecialize(exp::DAE.Exp), simCode)
+  @match exp begin
+    DAE.CALL(Absyn.IDENT("pre"), args, _) =>
+      :(ModelingToolkit.Pre($(expToJuliaExpMTK(listHead(args), simCode))))
+    DAE.BINARY(e1, op, e2) =>
+      :($(DAE_OP_toJuliaOperator(op))($(_affectExpToReal(e1, simCode)), $(_affectExpToReal(e2, simCode))))
+    DAE.UNARY(op, e) => :($(DAE_OP_toJuliaOperator(op))($(_affectExpToReal(e, simCode))))
+    _ => expToJuliaExpMTK(exp, simCode)
+  end
+end
+
+Base.@nospecializeinfer function _boolDaeToReal(@nospecialize(exp::DAE.Exp), simCode)
+  @match exp begin
+    DAE.BCONST(b) => (b ? :(1.0) : :(0.0))
+    DAE.RELATION(e1, op, e2) => :(ModelingToolkit.ifelse(
+        $(DAE_OP_toJuliaOperator(op))($(_affectExpToReal(e1, simCode)), $(_affectExpToReal(e2, simCode))), 1.0, 0.0))
+    DAE.LUNARY(DAE.NOT(__), e) => :(1.0 - $(_boolDaeToReal(e, simCode)))
+    DAE.LBINARY(e1, DAE.AND(__), e2) =>
+      :($(_boolDaeToReal(e1, simCode)) * $(_boolDaeToReal(e2, simCode)))
+    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
+      local a = _boolDaeToReal(e1, simCode)
+      local b = _boolDaeToReal(e2, simCode)
+      :($(a) + $(b) - $(a) * $(b))
+    end
+    DAE.IFEXP(c, t, f) => begin
+      local cr = _boolDaeToReal(c, simCode)
+      local tr = _boolDaeToReal(t, simCode)
+      local fr = _boolDaeToReal(f, simCode)
+      :($(cr) * $(tr) + (1.0 - $(cr)) * $(fr))
+    end
+    DAE.CALL(Absyn.IDENT("pre"), _, _) => _affectExpToReal(exp, simCode)
+    _ => expToJuliaExpMTK(exp, simCode)
+  end
+end
+
+#= Lower an INTEGER/enum-valued discrete RHS to an MTK Real holding the actual
+   numeric value (NOT a 0/1 Boolean). Conditions are evaluated through the
+   Boolean lowering; integer branches keep their value, so a five-valued FSM
+   (e.g. PartialFriction `mode`) is preserved instead of clamped. =#
+Base.@nospecializeinfer function _discreteIntToReal(@nospecialize(exp::DAE.Exp), simCode)
+  @match exp begin
+    DAE.ICONST(i) => Float64(i)
+    DAE.RCONST(r) => r
+    DAE.BCONST(b) => (b ? 1.0 : 0.0)
+    DAE.ENUM_LITERAL(_, idx) => Float64(idx)
+    DAE.IFEXP(c, t, f) => :(ModelingToolkit.ifelse(
+        0.5 < $(_boolDaeToReal(c, simCode)),
+        $(_discreteIntToReal(t, simCode)),
+        $(_discreteIntToReal(f, simCode))))
+    DAE.BINARY(e1, op, e2) => begin
+      local opSym = DAE_OP_toJuliaOperator(op)
+      :($(opSym)($(_discreteIntToReal(e1, simCode)), $(_discreteIntToReal(e2, simCode))))
+    end
+    DAE.CALL(Absyn.IDENT("pre"), _, _) => _affectExpToReal(exp, simCode)
+    _ => expToJuliaExpMTK(exp, simCode)
+  end
+end
+
+#= One affect equation `disc ~ <value>` for a lifted discrete: the triggering
+   relation `rel` is pinned to `val` (its post-crossing value). Integer/enum
+   discretes keep their multi-valued result; Boolean discretes are 0/1-clamped. =#
+Base.@nospecializeinfer function _discreteAffectEq(discSym::Symbol, @nospecialize(rhsDAE::DAE.Exp),
+                                                   @nospecialize(rel::DAE.Exp), val::Bool, isInt::Bool, simCode)
+  local pinned = _substRelation(rhsDAE, rel, val)
+  if isInt
+    return :($(discSym) ~ $(_discreteIntToReal(pinned, simCode)))
+  end
+  return :($(discSym) ~ ModelingToolkit.ifelse(0.5 < $(_boolDaeToReal(pinned, simCode)), 1.0, 0.0))
+end
+
 function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
   local events = Expr[]
   for weq in simCode.whenEquations
     local rels = _extractChangeRelations(weq.whenEquation.condition)
     rels === nothing && continue
-    local stmts = collect(weq.whenEquation.whenStmtLst)
-    length(stmts) == 1 || continue
-    local st = stmts[1]
-    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
-    local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
-    haskey(simCode.stringToSimVarHT, leftStr) || continue
-    local (_, var) = simCode.stringToSimVarHT[leftStr]
-    local discSym = Symbol(string(var.name))
-    local rhsDAE = SimulationCode.toDAEExp(st.right)
-    #= One callback per relation in the RHS. transformToMTKContinousCondition
+    #= Gather the cluster's ordered (discreteSymbol, rhsDAE, isInteger) assignments.
+       A single-member cluster (Stage 1) has one; a coupled friction cluster has the
+       whole body in topological order. =#
+    local assigns = Tuple{Symbol, Any, Bool}[]
+    local ok = true
+    for st in collect(weq.whenEquation.whenStmtLst)
+      if !(st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN)
+        ok = false; break
+      end
+      local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
+      if !haskey(simCode.stringToSimVarHT, leftStr)
+        ok = false; break
+      end
+      local (_, var) = simCode.stringToSimVarHT[leftStr]
+      local isInt = @match var.attributes begin
+        SOME(DAE.VAR_ATTR_INT(__)) => true
+        SOME(DAE.VAR_ATTR_ENUMERATION(__)) => true
+        _ => false
+      end
+      push!(assigns, (Symbol(string(var.name)), SimulationCode.toDAEExp(st.right), isInt))
+    end
+    (ok && !isempty(assigns)) || continue
+    #= One callback per relation in the cluster. transformToMTKContinousCondition
        normalises zc so relation-TRUE ⟺ zc<0: the `=>` affect is the up-crossing
        (relation becomes FALSE) and affect_neg the down-crossing (relation becomes
-       TRUE). Re-evaluate the Boolean RHS with THIS relation pinned to its
-       post-crossing value (others at their current value) so the written discrete
-       is direction-correct without the `f≈0` ambiguity. =#
+       TRUE). Each callback rewrites the WHOLE ordered cluster with THIS relation
+       pinned to its post-crossing value (others at their current value) so a
+       coupled FSM recomputes consistently and direction-correctly on any member
+       crossing, without the `f≈0` ambiguity. =#
     for rel in rels
-      local rhsFalse = expToJuliaExpMTK(_substRelation(rhsDAE, rel, false), simCode)
-      local rhsTrue = expToJuliaExpMTK(_substRelation(rhsDAE, rel, true), simCode)
       local zc = transformToMTKContinousCondition(rel, simCode)
-      #= `0.5 < rhs` yields a Bool condition whether `rhs` is a Bool relation or
-         the arithmetic (0/1) encoding of a compound boolean. =#
+      local affFalse = Expr[_discreteAffectEq(d, r, rel, false, ii, simCode) for (d, r, ii) in assigns]
+      local affTrue  = Expr[_discreteAffectEq(d, r, rel, true,  ii, simCode) for (d, r, ii) in assigns]
       push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
-        ($(zc) ~ 0) => [$(discSym) ~ ModelingToolkit.ifelse(0.5 < $(rhsFalse), 1.0, 0.0)];
-        affect_neg = [$(discSym) ~ ModelingToolkit.ifelse(0.5 < $(rhsTrue), 1.0, 0.0)],
+        ($(zc) ~ 0) => [$(affFalse...)];
+        affect_neg = [$(affTrue...)],
         reinitializealg = SciMLBase.NoInit())))
     end
   end

@@ -233,7 +233,8 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   if lowercase(get(ENV, "OMBACKEND_DISCRETE_BOOL_LIFT", "false")) in ("true", "1", "yes") &&
      !isempty(equations) && !isempty(variables)
     local _discParamConst = _collectParamOrConstNames(variables)
-    local (_discEqs, _discLifted) = synthesizeWhenEquationsFromDiscreteEquations(equations, _discParamConst)
+    local _discStarts = _discreteStartExpLookup(variables)
+    local (_discEqs, _discLifted) = synthesizeWhenEquationsFromDiscreteEquations(equations, _discParamConst, _discStarts)
     if !isempty(_discLifted)
       @info "[BDAE: lifter] synthesizeWhenEquationsFromDiscreteEquations lifted $(length(_discLifted)) discrete equation(s)" lifted=collect(_discLifted)
     end
@@ -1936,6 +1937,24 @@ Base.@nospecializeinfer function _makeChangeCallExp(@nospecialize(relExp))
   return DAE.CALL(Absyn.IDENT("change"), MetaModelica.list(relExp), DAE.callAttrBuiltinBool)
 end
 
+#= True if a relation has at least one continuous-Real operand, i.e. a genuine
+   zero-crossing event source. A relation over only discrete/param/const operands
+   (e.g. `pre(mode) == Stuck`) has no smooth crossing and must NOT become an
+   event — it is re-evaluated inside the affect from pre-event state instead. =#
+Base.@nospecializeinfer function _relationHasContinuousOperand(@nospecialize(rel::DAE.Exp), paramOrConstNames::Set{String})::Bool
+  local found = false
+  function visit(@nospecialize(e), arg)
+    if e isa DAE.CREF && !found
+      if !(string(e.componentRef) in paramOrConstNames) && _isContinuousRealType(e.ty)
+        found = true
+      end
+    end
+    return (e, arg)
+  end
+  Util.traverseExpBottomUp(rel, visit, nothing)
+  return found
+end
+
 Base.@nospecializeinfer function _buildChangeOrConditionFromExps(rels::Vector{DAE.Exp})
   isempty(rels) && return DAE.BCONST(false)
   local acc = _makeChangeCallExp(rels[1])
@@ -1945,12 +1964,14 @@ Base.@nospecializeinfer function _buildChangeOrConditionFromExps(rels::Vector{DA
   return acc
 end
 
-#= Try to lift one equation. Returns the lifted LHS name (and pushes the
-   INITIAL_WHEN + runtime WHEN onto `out`), or `nothing` if `eq` does not qualify
-   (caller keeps the original). =#
-Base.@nospecializeinfer function _tryLiftDiscreteBoolEquation!(out::Vector{BDAE.Equation},
-                                                               @nospecialize(eq),
-                                                               paramOrConstNames::Set{String})
+#= A discrete (Bool/Int/enum) equation `lhs = rhs` whose RHS is a discrete-time
+   expression. Returns `(name, lhs, rhs, src, eq)` or `nothing`. Unlike the
+   when-emit step this does NOT require the RHS to contain a relation: a
+   no-relation member like `locked = pre(stuck) and not startForward` qualifies
+   as a candidate so it can join a coupled cluster (it is event-driven through
+   its siblings' relations). =#
+Base.@nospecializeinfer function _discreteBoolCandidate(@nospecialize(eq::BDAE.Equation),
+                                                        paramOrConstNames::Set{String})
   eq isa BDAE.EQUATION || return nothing
   local lhs = eq.lhs
   lhs isa DAE.CREF || return nothing
@@ -1962,49 +1983,262 @@ Base.@nospecializeinfer function _tryLiftDiscreteBoolEquation!(out::Vector{BDAE.
   lhsDiscrete || return nothing
   local lhsName = string(lhs.componentRef)
   (lhsName == "time" || lhsName in paramOrConstNames) && return nothing
-  local rhs = eq.rhs
-  _isDiscreteTimeExp(rhs, paramOrConstNames) || return nothing
-  local relations = _collectRelationsInExp(rhs)
-  isempty(relations) && return nothing
-  local src = eq.source
+  _isDiscreteTimeExp(eq.rhs, paramOrConstNames) || return nothing
+  return (name = lhsName, lhs = lhs, rhs = eq.rhs, src = eq.source, eq = eq)
+end
+
+#= Candidate cref names referenced anywhere in `exp` (including inside pre()).
+   Used to connect a cluster: two candidates are coupled if either references
+   the other. =#
+Base.@nospecializeinfer function _candRefsAnywhere(@nospecialize(exp::DAE.Exp), restrict::Set{String})::Set{String}
+  local found = Set{String}()
+  function visit(@nospecialize(e), arg)
+    if e isa DAE.CREF
+      local nm = string(e.componentRef)
+      (nm in restrict) && push!(found, nm)
+    end
+    return (e, arg)
+  end
+  Util.traverseExpBottomUp(exp, visit, nothing)
+  return found
+end
+
+#= Candidate cref names referenced OUTSIDE any pre(): the topological-order
+   edges. References inside pre() are loop-breakers (read the pre-event value)
+   and impose no order. =#
+Base.@nospecializeinfer function _candRefsOutsidePre(@nospecialize(exp::DAE.Exp), restrict::Set{String})::Set{String}
+  local found = Set{String}()
+  function f(@nospecialize(e), arg)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("pre"), _, _) => (e, false, arg)
+      DAE.CREF(cr, _) => begin
+        (string(cr) in restrict) && push!(found, string(cr))
+        (e, true, arg)
+      end
+      _ => (e, true, arg)
+    end
+  end
+  Util.traverseExpTopDown(exp, f, nothing)
+  return found
+end
+
+#= Replace every bare (outside-pre) occurrence of a sibling cref with its
+   already-inlined RHS. pre(sibling) is left untouched so it keeps reading the
+   pre-event held value. =#
+Base.@nospecializeinfer function _inlineSiblingsOutsidePre(@nospecialize(exp::DAE.Exp), subst::Dict{String, DAE.Exp})
+  function f(@nospecialize(e), arg)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("pre"), _, _) => (e, false, arg)
+      DAE.CREF(cr, _) => begin
+        local nm = string(cr)
+        haskey(subst, nm) ? (subst[nm], false, arg) : (e, true, arg)
+      end
+      _ => (e, true, arg)
+    end
+  end
+  return first(Util.traverseExpTopDown(exp, f, nothing))
+end
+
+#= Start-attribute expression for each variable that has one (Bool/Int/Real/enum).
+   Used to fold `pre(member)` at initialization: Modelica §8.6.2 — before the
+   first event `pre(v)` is `v.start`. =#
+Base.@nospecializeinfer function _discreteStartExpLookup(variables::Vector{BDAE.VAR})::Dict{String, DAE.Exp}
+  local d = Dict{String, DAE.Exp}()
+  for var in variables
+    local s = @match var.values begin
+      SOME(va) => @match va begin
+        DAE.VAR_ATTR_BOOL(start = SOME(e)) => e
+        DAE.VAR_ATTR_INT(start = SOME(e)) => e
+        DAE.VAR_ATTR_REAL(start = SOME(e)) => e
+        DAE.VAR_ATTR_ENUMERATION(start = SOME(e)) => e
+        _ => nothing
+      end
+      _ => nothing
+    end
+    s === nothing && continue
+    d[string(var.varName)] = s
+  end
+  return d
+end
+
+#= Fold `pre(member)` (member a lifted cluster discrete) to the member's start
+   value for the INITIAL_WHEN body. The default false matches the Boolean start
+   default; pre() of non-members is left untouched. =#
+Base.@nospecializeinfer function _foldPreOfMembers(@nospecialize(exp::DAE.Exp), members::Set{String},
+                                                   startLookup::Dict{String, DAE.Exp})
+  function f(@nospecialize(e), arg)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("pre"), args, _) => begin
+        local inner = listHead(args)
+        if inner isa DAE.CREF && (string(inner.componentRef) in members)
+          (get(startLookup, string(inner.componentRef), DAE.BCONST(false)), false, arg)
+        else
+          (e, false, arg)
+        end
+      end
+      _ => (e, true, arg)
+    end
+  end
+  return first(Util.traverseExpTopDown(exp, f, nothing))
+end
+
+#= Connected components over the undirected coupling graph. =#
+function _connectedComponents(names::Vector{String}, adj::Dict{String, Set{String}})::Vector{Vector{String}}
+  local seen = Set{String}()
+  local comps = Vector{String}[]
+  for start in names
+    start in seen && continue
+    local comp = String[]
+    local stack = String[start]
+    push!(seen, start)
+    while !isempty(stack)
+      local n = pop!(stack)
+      push!(comp, n)
+      for m in adj[n]
+        if !(m in seen)
+          push!(seen, m); push!(stack, m)
+        end
+      end
+    end
+    push!(comps, comp)
+  end
+  return comps
+end
+
+#= Topological order of a cluster by non-pre dependency edges (dep before the
+   member that references it outside pre). Returns the ordered names, or
+   `nothing` if a non-pre cycle survives (the cluster is then left unlifted). =#
+function _topoOrderCluster(cluster::Vector{String}, candByName::Dict{String, Any})::Union{Vector{String}, Nothing}
+  local clusterSet = Set(cluster)
+  local indeg = Dict{String, Int}(n => 0 for n in cluster)
+  local succ = Dict{String, Vector{String}}(n => String[] for n in cluster)
+  for n in cluster
+    for d in _candRefsOutsidePre(candByName[n].rhs, clusterSet)
+      if d != n && d in clusterSet
+        push!(succ[d], n); indeg[n] += 1
+      end
+    end
+  end
+  local q = sort!([n for n in cluster if indeg[n] == 0])
+  local order = String[]
+  while !isempty(q)
+    local n = popfirst!(q)
+    push!(order, n)
+    for m in succ[n]
+      indeg[m] -= 1
+      indeg[m] == 0 && push!(q, m)
+    end
+    sort!(q)
+  end
+  return length(order) == length(cluster) ? order : nothing
+end
+
+#= Emit one cluster of coupled discrete-Boolean equations as a single ordered
+   when-cluster: topologically sort, inline non-pre sibling references so each
+   ASSIGN RHS is pure in pre-event state + relations, and emit one
+   INITIAL_WHEN + one runtime WHEN (triggered by `change()` over the UNION of the
+   cluster's relations) whose bodies are the ordered ASSIGN list. =#
+function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{String},
+                               candByName::Dict{String, Any}, liftedLhs::Set{String},
+                               startLookup::Dict{String, DAE.Exp},
+                               paramOrConstNames::Set{String})
+  local order = _topoOrderCluster(cluster, candByName)
+  if order === nothing
+    @warn "[BDAE: lifter] cyclic discrete cluster left unlifted" cluster
+    for n in cluster; push!(out, candByName[n].eq); end
+    return
+  end
+  local members = Set(cluster)
+  local subst = Dict{String, DAE.Exp}()
+  local body = Tuple{DAE.Exp, DAE.Exp, Any}[]
+  for n in order
+    local c = candByName[n]
+    local inlined = isempty(subst) ? c.rhs : _inlineSiblingsOutsidePre(c.rhs, subst)
+    subst[n] = inlined
+    push!(body, (c.lhs, inlined, c.src))
+  end
+  #= Trigger only on relations with a continuous operand (real zero-crossings).
+     All-discrete relations such as `pre(mode) == Stuck` are kept in the affect
+     RHS but excluded as event sources. =#
+  local rels = DAE.Exp[]
+  local seen = Set{String}()
+  for (_, r, _) in body
+    for rel in _collectRelationsInExp(r)
+      local k = string(rel)
+      if !(k in seen) && _relationHasContinuousOperand(rel, paramOrConstNames)
+        push!(seen, k); push!(rels, rel)
+      end
+    end
+  end
+  if isempty(rels)
+    #= No continuous event source: leave as residuals. =#
+    for n in cluster; push!(out, candByName[n].eq); end
+    return
+  end
   local bareInitial = DAE.CALL(Absyn.IDENT("initial"), MetaModelica.list(), DAE.callAttrBuiltinBool)
-  local rhsInit = _replaceInitialCall(rhs, true)
-  local rhsRun = _replaceInitialCall(rhs, false)
-  local changeCond = _buildChangeOrConditionFromExps(relations)
+  local changeCond = _buildChangeOrConditionFromExps(rels)
+  local src0 = body[1][3]
+  #= INITIAL body: pre(member) ≡ member.start (no held value exists yet). The
+     runtime body keeps pre() — it resolves to the affect-entry held value. =#
+  local initAssigns = [BDAE.ASSIGN(lhs, _replaceInitialCall(_foldPreOfMembers(r, members, startLookup), true), s)
+                       for (lhs, r, s) in body]
+  local runAssigns  = [BDAE.ASSIGN(lhs, _replaceInitialCall(r, false), s) for (lhs, r, s) in body]
   push!(out, BDAE.INITIAL_WHEN_EQUATION(
     1,
-    BDAE.WHEN_STMTS(bareInitial, MetaModelica.list(BDAE.ASSIGN(lhs, rhsInit, src)), NONE()),
-    src,
+    BDAE.WHEN_STMTS(bareInitial, MetaModelica.list(initAssigns...), NONE()),
+    src0,
     nothing,
   ))
   push!(out, BDAE.WHEN_EQUATION(
     1,
-    BDAE.WHEN_STMTS(changeCond, MetaModelica.list(BDAE.ASSIGN(lhs, rhsRun, src)), NONE()),
-    src,
+    BDAE.WHEN_STMTS(changeCond, MetaModelica.list(runAssigns...), NONE()),
+    src0,
     nothing,
   ))
-  return lhsName
+  for (lhs, _, _) in body; push!(liftedLhs, string(lhs.componentRef)); end
+  return
 end
 
 """
     synthesizeWhenEquationsFromDiscreteEquations(equations, paramOrConstNames) -> (Vector{BDAE.Equation}, Set{String})
 
-Replace every qualifying discrete-Boolean/Integer equation-section definition with
-a paired INITIAL_WHEN_EQUATION + runtime WHEN_EQUATION (see `_tryLiftDiscreteBoolEquation!`).
-Self-gating: equations that do not qualify are returned unchanged, so models with no
-discrete-time defining equations pay only a single linear scan.
+Replace qualifying discrete-Boolean/Integer equation-section definitions with
+paired INITIAL_WHEN + runtime WHEN equations. Mutually-referencing definitions
+(e.g. the Coulomb-friction `{startForward, locked, stuck}` FSM) are grouped into
+one ordered cluster so a no-relation member is still event-driven through its
+siblings' relations, and the cluster recomputes in topological order on any
+member relation crossing. Self-gating: equations that do not qualify are returned
+unchanged, so models with no discrete-time defining equations pay only a single
+linear scan.
 """
 function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equation},
-                                                      paramOrConstNames::Set{String} = Set{String}())
+                                                      paramOrConstNames::Set{String} = Set{String}(),
+                                                      startLookup::Dict{String, DAE.Exp} = Dict{String, DAE.Exp}())
   local out = BDAE.Equation[]
-  local liftedLhs = Set{String}()
+  local candByName = Dict{String, Any}()
+  local candNames = String[]
   for eq in equations
-    local lifted = _tryLiftDiscreteBoolEquation!(out, eq, paramOrConstNames)
-    if lifted === nothing
+    local c = _discreteBoolCandidate(eq, paramOrConstNames)
+    if c === nothing
       push!(out, eq)
     else
-      push!(liftedLhs, lifted)
+      candByName[c.name] = c
+      push!(candNames, c.name)
     end
+  end
+  isempty(candNames) && return (equations, Set{String}())
+  local candSet = Set(candNames)
+  local adj = Dict{String, Set{String}}(n => Set{String}() for n in candNames)
+  for n in candNames
+    for r in _candRefsAnywhere(candByName[n].rhs, candSet)
+      if r != n
+        push!(adj[n], r); push!(adj[r], n)
+      end
+    end
+  end
+  local liftedLhs = Set{String}()
+  for cluster in _connectedComponents(candNames, adj)
+    _emitDiscreteCluster!(out, cluster, candByName, liftedLhs, startLookup, paramOrConstNames)
   end
   return (out, liftedLhs)
 end
