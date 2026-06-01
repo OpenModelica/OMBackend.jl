@@ -66,18 +66,6 @@ Toggle with: `OMBackend.DIRECT_RHS_GENERATION[] = false` to disable.
 """
 const DIRECT_RHS_GENERATION = Ref{Bool}(true)
 
-"""
-When enabled, callback-driven (when-assigned) held discrete variables are emitted
-as discrete PARAMETERS modified by the existing when-callbacks (via
-`integrator.ps[...]`), instead of continuous states carrying a `der(d) ~ 0` dummy
-plus the planDemotions reclassification dance. This keeps the discrete out of the
-continuous balance entirely (the `ifCond` model), retiring the dummy/demotion
-off-by-one accounting. Default off until validated across the when/sampled/VSS set.
-
-Toggle with: `OMBackend.DISCRETE_AS_PARAM[] = true`.
-"""
-const DISCRETE_AS_PARAM = Ref{Bool}(false)
-
 const OSMC_COPYRIGHT_HEADER = """
 #=
 * This file is part of OpenModelica.

@@ -136,6 +136,11 @@ function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DA
     DAE.RELATION(exp1 = e1, operator = DAE.GREATEREQ(__), exp2 = e2) => begin
       DAE.BINARY(e2, DAE.SUB(DAE.T_REAL_DEFAULT), e1)
     end
+    #= `change(rel)` fires when the relation flips: its zero-crossing is the
+       relation's own zero-crossing function. Unwrap and recurse. =#
+    DAE.CALL(path = Absyn.IDENT("change"), expLst = args) => begin
+      transformToZeroCrossingCondition(listHead(args))
+    end
     DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
       DAE.BINARY(lhs, DAE.SUB(DAE.T_REAL_DEFAULT), rhs)
     end

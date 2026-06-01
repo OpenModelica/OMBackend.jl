@@ -121,6 +121,10 @@ function DAE_identifierToString(u::DAE.UNARY)
   return DAE_identifierToString(u.exp)
 end
 
+#= TODO: nested/second-order derivatives (`der(der(x))`) arrive here as a
+   `DAE.CALL("der", ...)` and are unsupported. Modelica permits nth-order
+   derivatives; they should be reduced to auxiliary first-order states upstream
+   (order lowering) before reaching SimCode rather than erroring here. =#
 function DAE_identifierToString(exp)
   error("DAE_identifierToString: unsupported argument of type $(typeof(exp)) with value $exp. Expected DAE.CREF, DAE.ComponentRef, or String.")
 end

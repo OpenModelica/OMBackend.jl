@@ -346,44 +346,6 @@ function _collectCrefsInExp!(names::Set{String}, @nospecialize(e::SimulationCode
   return nothing
 end
 
-#= Names referenced inside any when-equation CONDITION (incl. elsewhen). A discrete
-   here cannot migrate to a parameter: change()/edge() detection and value-conditions
-   need it to stay an integrator state, so the synthesised whens of its dependents fire. =#
-function _collectWhenConditionRefs(simCode)::Set{String}
-  local names = Set{String}()
-  for whenEq in simCode.whenEquations
-    _collectCondRefs!(names, whenEq.whenEquation)
-  end
-  return names
-end
-
-function _collectCondRefs!(names::Set{String}, @nospecialize(ws))
-  ws isa SimulationCode.WHEN_STMTS || return nothing
-  ws.condition isa SimulationCode.Exp && _collectCrefsInExp!(names, ws.condition)
-  ws.elsewhenPart !== nothing && _collectCondRefs!(names, ws.elsewhenPart)
-  return nothing
-end
-
-#= (b): when-assigned discretes migrated to parameters. Empty unless the flag is on and
-   partitioning still leaves >=1 integrator state (SII parameter writes fail on a 0-state
-   system). Single source of truth for the partition and the callback read/write routing. =#
-function _heldDiscreteParamSet(simCode)::Set{String}
-  OMBackend.DISCRETE_AS_PARAM[] || return Set{String}()
-  local whenAssigned = _collectWhenAssignedNames(simCode)
-  local vars = classifyVariables(simCode)
-  local held = Set(dv for dv in vars.discreteVariables if dv in whenAssigned)
-  #= Models with a discrete-conditioned (synthesised change()) when fall back wholesale
-     to the der~0-dummy scheme. The param callbacks do not compose with the dummy
-     callbacks for that cluster: a parameter cannot be change()-detected and mixing the
-     two freezes the dependents (e.g. `yy := f(trigger)` driven by `when change(trigger)`). =#
-  isempty(intersect(_collectWhenConditionRefs(simCode), Set(vars.discreteVariables))) ||
-    return Set{String}()
-  isempty(held) && return held
-  local remaining = length(vars.stateVariables) + length(vars.occVariables) +
-                    (length(vars.discreteVariables) - length(held))
-  return remaining > 0 ? held : Set{String}()
-end
-
 #= Discrete vars that participate in a recomputed cyclic residual SCC.
    Treating them as held states adds an equation on top of the loop
    equations — keep them algebraic and let MTK tear the loop. =#

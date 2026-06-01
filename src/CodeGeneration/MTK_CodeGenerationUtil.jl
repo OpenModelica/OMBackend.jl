@@ -121,11 +121,6 @@ function _preValueLookup(@nospecialize(arg::DAE.Exp), simCode; cachedChange::Boo
         return expToJuliaExpMTK(arg, simCode)
       end
       local (_, sv) = ht[crefStr]
-      if _isHeldDiscreteParam(crefStr, simCode)
-        #= held discrete is a parameter: its pre-value is the current param value,
-           read at affect entry before the when-write updates it. =#
-        return :(integrator.ps[$(QuoteNode(Symbol(string(sv.name))))])
-      end
       if SimulationCode.isParameter(sv)
         return expToJuliaExpMTK(arg, simCode)
       end
@@ -1977,23 +1972,12 @@ end
 # TODO: unify cref resolution into one function consulting both the SimCode
 # (state / numeric-param lookup tables) and the module-level bindings (String
 # parameters, data structures), so callers need not special-case the latter.
-#= (b) DISCRETE_AS_PARAM: a callback-driven held discrete is emitted as a parameter
-   (see the createSystem partition), so callback reads must resolve it through the
-   SymbolicIndexingInterface, not the state vector. Flag-off short-circuits to false,
-   leaving the default path untouched. =#
-function _isHeldDiscreteParam(name::AbstractString, simCode)::Bool
-  return name in OMBackend.CodeGeneration._heldDiscreteParamSet(simCode)
-end
-
 function getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode)
   local crefAsStr = string(x)
   if crefAsStr == "time"
     return :t
   end
   @match _, simVar = simCode.stringToSimVarHT[crefAsStr]
-  if _isHeldDiscreteParam(crefAsStr, simCode)
-    return :(integrator.ps[$(QuoteNode(Symbol(string(simVar.name))))])
-  end
   if !(SimulationCode.isParameter(simVar))
     Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(string(x))))))
   else
@@ -2281,6 +2265,44 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
   end #= while fixed-point =#
 end
 
+#= True when every variable reference in `condition` is a DISCRETE simvar, a
+   PARAMETER, or a constant (no STATE / ALG_VARIABLE / `time`). For such conditions
+   the if-expression can gate directly on the held discrete value; the discrete's
+   own update event localises the switch, so no ifCond relay is needed. =#
+function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::Bool
+  local refs::Set{String} = Set{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, condition)
+  catch
+    return false
+  end
+  isempty(refs) && return false
+  local ht = simCode.stringToSimVarHT
+  for name in refs
+    name == "time" && return false
+    local entry = get(ht, name, nothing)
+    entry === nothing && return false
+    local kind = entry[2].varKind
+    if !(kind isa SimulationCode.DISCRETE || kind isa SimulationCode.PARAMETER)
+      return false
+    end
+  end
+  return true
+end
+
+"True when every non-else branch condition of an if-equation is discrete/parameter.
+ Tied to OMBACKEND_DISCRETE_BOOL_LIFT: direct discrete gating is only meaningful
+ alongside the event-held-discrete lowering, so when that is off this returns false
+ and the if-equation keeps the standard ifCond relay (baseline behaviour)."
+function _allBranchConditionsDiscrete(branches, simCode)::Bool
+  lowercase(get(ENV, "OMBACKEND_DISCRETE_BOOL_LIFT", "false")) in ("true", "1", "yes") || return false
+  for b in branches
+    b.targets == -1 && continue
+    _ifConditionAllDiscreteOrParameter(b.condition, simCode) || return false
+  end
+  return true
+end
+
 """
   Generates an if-expression equation and add it to the continuous part of the system.
 Assume single equations in each if-branch for now.
@@ -2323,10 +2345,17 @@ function generateIfExpressions(branches,
   if branch.targets == -1
     return :($(first(deCausalize(branch.residualEquations[resEqIdx], simCode))))
   end
-  #= Otherwise generate code for the other part =#
-  #= ifCond variables are discrete parameters (not ODE unknowns), so the solver
-     never perturbs them during Jacobian computation. Exact comparison is safe. =#
-  local cond = :( $(Symbol(string("ifCond", identifier, subIdentifier))) == 1 )
+  #= When every branch condition is discrete/parameter (e.g. an event-held Boolean),
+     gate directly on the condition value: its own update event localises the step,
+     so no `ifCond` relay parameter or continuous callback is needed (and the relay's
+     start-attribute initial value, which can pick the wrong branch, is avoided). =#
+  local cond = if _allBranchConditionsDiscrete(branches, simCode)
+    :( $(expToJuliaExpMTK(SimulationCode.toDAEExp(branch.condition), simCode)) > 0.5 )
+  else
+    #= ifCond variables are discrete parameters (not ODE unknowns), so the solver
+       never perturbs them during Jacobian computation. Exact comparison is safe. =#
+    :( $(Symbol(string("ifCond", identifier, subIdentifier))) == 1 )
+  end
   local rhs = first(deCausalize(branch.residualEquations[resEqIdx], simCode))
   quote
     ModelingToolkit.ifelse($(cond),

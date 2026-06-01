@@ -3430,6 +3430,11 @@ function propagateConstants(simCode::SIM_CODE)
   local constMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
   local constEqIndices = Set{Int}()
   local trivialEqIndices = Set{Int}()
+  #= Record eqIdx -> unknown name at detection time. Chained folds only become
+     `unknown = param` after a prior substitution, so re-detecting on the
+     original equation later would miss them and drop the equation without
+     removing its unknown. =#
+  local eqIdxToUnknown = Dict{Int, String}()
 
   local changed = true
   while changed
@@ -3466,6 +3471,7 @@ function propagateConstants(simCode::SIM_CODE)
         if !haskey(constMap, unknownName)
           constMap[unknownName] = (paramName, negated, paramCref, paramTy)
           push!(constEqIndices, i)
+          eqIdxToUnknown[i] = unknownName
           changed = true
         end
       end
@@ -3492,37 +3498,28 @@ function propagateConstants(simCode::SIM_CODE)
   @debug "[SIMCODE: $(simCode.name): constantPropagation] found $nConst unknown=param equations and $nTrivial trivial param=param equations"
 
   #= Phase 2: Build final equation list with substitutions applied.
-     We collect (varName, residual) pairs for const-bound eliminations so
-     the downstream `eliminatedEquations` / `eliminatedVariables` arrays
-     stay aligned. Trivial `param=param` residuals are dropped without
-     recording since they have no unknown to associate. =#
-  #= Reverse-map each constprop equation index to its unknown name by re-running
-     `detectConstantEquation` on the equations recorded during Phase 1. =#
-  local eqIdxToUnknown = Dict{Int, String}()
-  for i in constEqIndices
-    local eq = simCode.residualEquations[i]
-    local r = detectConstantEquation(toDAEExp(eq.exp), ht)
-    r === nothing && continue
-    if r[1] == :constprop
-      eqIdxToUnknown[i] = r[2][1]
-    end
-  end
+     We collect (varName, original-residual, substituted-residual) triples for
+     const-bound eliminations so the downstream `eliminatedEquations` /
+     `eliminatedVariables` arrays stay aligned, and so Phase 3 can re-add the
+     substituted residual if the unknown turns out not to be eliminable.
+     Trivial `param=param` residuals are dropped without recording since they
+     have no unknown to associate. =#
   local allRemoved = union(constEqIndices, trivialEqIndices)
   local newResEqs = RESIDUAL_EQUATION[]
-  local elimPairs = Tuple{String, RESIDUAL_EQUATION}[]
+  local elimPairs = Tuple{String, RESIDUAL_EQUATION, RESIDUAL_EQUATION}[]
   sizehint!(newResEqs, nEqs - length(allRemoved))
 
   for (i, eq) in enumerate(simCode.residualEquations)
     if i in allRemoved
       if i in constEqIndices && haskey(eqIdxToUnknown, i)
-        push!(elimPairs, (eqIdxToUnknown[i], eq))
+        local (subExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
+        push!(elimPairs, (eqIdxToUnknown[i], eq, typeof(eq)(subExp, eq.source, eq.attr)))
       end
     else
       local (newExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
       push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
     end
   end
-  local elimEqs = RESIDUAL_EQUATION[p[2] for p in elimPairs]
 
   #= Substitute in if-equation branches =#
   local newIfEqs = IF_EQUATION[]
@@ -3612,23 +3609,25 @@ function propagateConstants(simCode::SIM_CODE)
   #= Build elimVarNames from elimPairs (same order as elimEqs) and
      drop any pairs whose variable is in survivingRefs. This keeps
      `eliminatedEquations` and `eliminatedVariables` aligned for
-     downstream `generateEliminatedObservedBlock`. =#
+     downstream `generateEliminatedObservedBlock`. A pair whose unknown is
+     NOT eliminated (still referenced, or already gone from the HT) has its
+     substituted residual re-added to `newResEqs`: the equation was removed
+     in Phase 2 on the assumption the unknown would go with it, so keeping the
+     unknown without the equation would unbalance the system. =#
   local elimVarNames = String[]
   local keptElimEqs = RESIDUAL_EQUATION[]
-  for (varName, eq) in elimPairs
-    if varName in survivingRefs
-      continue
-    end
-    if !haskey(newHT, varName)
+  for (varName, origEq, subEq) in elimPairs
+    if varName in survivingRefs || !haskey(newHT, varName)
+      push!(newResEqs, subEq)
       continue
     end
     delete!(newHT, varName)
     push!(elimVarNames, varName)
-    push!(keptElimEqs, eq)
+    push!(keptElimEqs, origEq)
   end
-  elimEqs = keptElimEqs
+  local elimEqs = keptElimEqs
 
-  @debug "[SIMCODE: $(simCode.name): constantPropagation] eliminated $(length(elimVarNames)) unknowns and $(length(allRemoved)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
+  @debug "[SIMCODE: $(simCode.name): constantPropagation] eliminated $(length(elimVarNames)) unknowns and $(length(elimVarNames)) equations ($(length(newResEqs)) equations, $(length(newHT)) variables remain)"
 
   @assign begin
     simCode.residualEquations = newResEqs
@@ -5857,6 +5856,17 @@ end
      0 = y - der(z)
    This pass groups by string form of the non-leaf side and aliases
    matching LHS vars to a single representative. =#
+#= True when a SimVar is declared `stateSelect = StateSelect.always`: it MUST
+   remain a state and carry its own start/fixed init constraint, so it must never
+   be aliased away (doing so drops e.g. a fixed=true velocity IC and leaves the
+   DAE init free to pick the trivial zero). =#
+function _isStateSelectAlways(@nospecialize(sv))::Bool
+  @match sv.attributes begin
+    SOME(DAE.VAR_ATTR_REAL(stateSelectOption = SOME(DAE.ALWAYS(__)))) => true
+    _ => false
+  end
+end
+
 function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
     return simCode
@@ -5882,34 +5892,56 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   local removeEqs = Set{Int}()
   local elimVarOrder = String[]
   local elimEqOrder  = RESIDUAL_EQUATION[]
+  #= A variable defined by more than one `v - expr` residual appears as a
+     reducible member in several RHS-groups. It may be eliminated only once:
+     the first group removes its defining equation, later groups must leave
+     their equation in place (after substitution it becomes a constraint
+     `rep = expr`). `claimed` tracks already-eliminated names and `repSet`
+     tracks chosen representatives, so a representative is never itself
+     eliminated and each removed equation maps to exactly one eliminated
+     variable. =#
+  local claimed = Set{String}()
+  local repSet = Set{String}()
 
   for (_key, entries) in pairs(rhsGroups)
     length(entries) >= 2 || continue
-    local bestIdx = 1
+    local bestIdx = 0
     local bestPrio = -1
     for (j, (n, _, _, _, _)) in enumerate(entries)
       haskey(ht, n) || continue
+      n in claimed && continue
       local (_, sv) = ht[n]
       local prio = varKindPriority(sv.varKind)
       if n in irreducibleSet
         prio += 60
+      end
+      #= stateSelect=always must be kept as a state: make it the representative so
+         it survives and its fixed-start init constraint is emitted. =#
+      if _isStateSelectAlways(sv)
+        prio += 200
       end
       if prio > bestPrio
         bestPrio = prio
         bestIdx = j
       end
     end
+    bestIdx == 0 && continue
     local (repName, _, repCref, repTy, repNeg) = entries[bestIdx]
     local (_, repSv) = ht[repName]
     local repIsState = @match repSv.varKind begin
       STATE(__) => true
       _ => false
     end
+    push!(repSet, repName)
     for (j, entry) in enumerate(entries)
       j == bestIdx && continue
       local (n, eqIdx, _, _, entryNeg) = entry
       n == repName && continue
       n in sharedVarSet && continue
+      #= Already eliminated, or serving as a representative elsewhere: keep its
+         equation so the system stays balanced and no alias points at an
+         eliminated representative. =#
+      (n in claimed || n in repSet) && continue
       if endswith(n, "_re") || endswith(n, "_im")
         continue
       end
@@ -5917,6 +5949,12 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
       local isState = @match sv.varKind begin
         STATE(__) => true
         _ => false
+      end
+      #= Never alias away a stateSelect=always variable, even if it is not the
+         chosen representative (e.g. two such variables share an RHS). Keeping it
+         preserves its fixed=true start as an init constraint. =#
+      if _isStateSelectAlways(sv)
+        continue
       end
       if n in irreducibleSet && !(repIsState && isState)
         continue
@@ -5927,6 +5965,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
       push!(removeEqs, eqIdx)
       push!(elimVarOrder, n)
       push!(elimEqOrder, resEqs[eqIdx])
+      push!(claimed, n)
     end
   end
 

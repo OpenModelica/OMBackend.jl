@@ -776,49 +776,6 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local dataStructureVariables = vars.dataStructureVariables
   local statePriorityPairs     = vars.statePriorityPairs
 
-  #= (b) DISCRETE_AS_PARAM: callback-driven (when-assigned) held discretes become
-     PARAMETERS modified by the existing when-callbacks (ridden through the ifCond
-     param declaration path below), not der~0 continuous states. Partition them out
-     of `discreteVariables` here so the dummy / planDemotions / unknowns path never
-     sees them — retiring the off-by-one demotion accounting for this class. =#
-  local heldDiscreteParamDecls = Expr[]
-  local heldDiscreteParamPairs = Expr[]
-  local heldDiscreteSyms = Symbol[]
-  local _heldSet = _heldDiscreteParamSet(simCode)
-  if !isempty(_heldSet)
-    local _held = filter(dv -> dv in _heldSet, discreteVariables)
-    discreteVariables = filter(dv -> !(dv in _heldSet), discreteVariables)
-    local _unwrapPair = function (b)
-      local e = b
-      if e isa Expr && e.head === :block
-        for a in e.args
-          a isa LineNumberNode && continue
-          e = a
-          break
-        end
-      end
-      if e isa Expr && e.head === :call && length(e.args) == 3 && e.args[1] === :(=>)
-        return (e.args[2], e.args[3])
-      end
-      return nothing
-    end
-    local _seen = Set{Symbol}()
-    for _b in getStartConditionsMTK(_held, simCode)
-      local _p = _unwrapPair(_b)
-      (_p === nothing || !(_p[1] isa Symbol)) && continue
-      push!(heldDiscreteParamDecls, Expr(:(=), _p[1], _p[2]))
-      push!(heldDiscreteParamPairs, :($(_p[1]) => $(_p[2])))
-      push!(heldDiscreteSyms, _p[1]); push!(_seen, _p[1])
-    end
-    for dv in _held
-      local _s = Symbol(dv)
-      if !(_s in _seen)
-        push!(heldDiscreteParamDecls, Expr(:(=), _s, 0.0))
-        push!(heldDiscreteParamPairs, :($(_s) => 0.0))
-        push!(heldDiscreteSyms, _s)
-      end
-    end
-  end
 
   local performIndexReduction = simCode.isSingular
   local skipInitializeProb = SimulationCode.hasStructuralTransitions(simCode) ||
@@ -886,6 +843,9 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      bindings only created later inside the model function), plus three
      flat lists used by downstream phases. =#
   local IF_EQUATION_EVENTS = collect(Iterators.flatten(c.events for c in IF_EQUATION_COMPONENTS))
+  #= Synthesised discrete-Boolean whens become MTK SymbolicContinuousCallbacks
+     (observed-variable-capable), appended to the if-equation event vector. =#
+  IF_EQUATION_EVENTS = vcat(IF_EQUATION_EVENTS, createDiscreteBoolWhenEvents(simCode))
   local IF_EQUATION_EVENT_DECLARATION = buildIfEquationEventDecl(IF_EQUATION_EVENTS)
   local CONDITIONAL_EQUATIONS = collect(Iterators.flatten(c.conditionalEquations for c in IF_EQUATION_COMPONENTS))
   local ifConditionNameAndIV = collect(Iterators.flatten(c.conditionNameAndIV for c in IF_EQUATION_COMPONENTS))
@@ -901,12 +861,6 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     push!(ifCondParamDecls, Expr(:(=), sym, numVal))
     push!(ifCondParamPairs, :($(sym) => $(numVal)))
   end
-  #= (b) held discretes ride the ifCond param path: declared as @parameters,
-     bound, added to `parameters`, and their start values pushed into `pars`.
-     Lists stay parallel (decls/syms built together above). =#
-  append!(ifCondParamDecls, heldDiscreteParamDecls)
-  append!(ifCondParamPairs, heldDiscreteParamPairs)
-  append!(ifConditionalVariables, heldDiscreteSyms)
   #= Phase G — collect the symbols MTK tearing must not eliminate
      (simCode-flagged irreducibles + ifEq_tmp LHS targets + fixed-start
      variables). =#
@@ -1666,8 +1620,14 @@ function emitInitAlgU0Appends(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
       continue
     end
     local qn = QuoteNode(Symbol(name))
-    push!(appends, :(haskey(_algResults, $(qn)) &&
-                     push!(fiv, $(Symbol(name)) => _algResults[$(qn)])))
+    #= Replace (not append) any existing start-attribute entry so a lifted
+       discrete with both a start value and an init-algorithm value does not
+       leave a duplicate key in the u0 pair list (which drops other entries
+       during splitInitialValues). =#
+    push!(appends, :(if haskey(_algResults, $(qn))
+                       filter!(_p -> !isequal(_p.first, $(Symbol(name))), fiv)
+                       push!(fiv, $(Symbol(name)) => _algResults[$(qn)])
+                     end))
   end
   return appends
 end
@@ -1815,40 +1775,9 @@ function _ifConditionDependsOnTime(@nospecialize(condition))::Bool
   return "time" in refs
 end
 
-"""
-    _ifConditionAllDiscreteOrParameter(condition, simCode) -> Bool
-
-Return true when every variable reference in `condition` is a DISCRETE
-simvar, a PARAMETER, or a constant (no STATE / ALG_VARIABLE / `time`
-reference). For such conditions the value flips only through the
-equations that define the discrete variables — MTK propagates the
-update through the residual system on its own, so an explicit
-SymbolicContinuousCallback would only add chatter without contributing
-new event semantics.
-
-Returns false on any reference to a continuous unknown so the caller
-knows a continuous event is still required.
-"""
-function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::Bool
-  local refs::Set{String} = Set{String}()
-  try
-    SimulationCode.collectCrefNames!(refs, condition)
-  catch
-    return false
-  end
-  isempty(refs) && return false
-  local ht = simCode.stringToSimVarHT
-  for name in refs
-    name == "time" && return false
-    local entry = get(ht, name, nothing)
-    entry === nothing && return false
-    local kind = entry[2].varKind
-    if !(kind isa SimulationCode.DISCRETE || kind isa SimulationCode.PARAMETER)
-      return false
-    end
-  end
-  return true
-end
+#= _ifConditionAllDiscreteOrParameter / _allBranchConditionsDiscrete live in the
+   MTK_CodeGenerationUtil submodule (generateIfExpressions needs them); call them
+   here as MTK_CodeGenerationUtil._allBranchConditionsDiscrete. =#
 
 """
     _ifConditionIsPureTimeEvent(condition, simCode) -> Bool
@@ -2048,6 +1977,83 @@ function createIfEquation(stateVariables::Vector,
   end
   return IfEquationComponent(conditions, ifExpressions,
                              conditionVariables, conditionVariableNames, pureTimeEvents)
+end
+
+#= Identify a synthesised discrete-Boolean when (from
+   `synthesizeWhenEquationsFromDiscreteEquations`): its condition is `change(rel)`
+   or an OR-chain of `change(rel)` over relations. Returns the relation list
+   (DAE side) or `nothing`. Such whens are routed to MTK events (not the legacy
+   CallbackSet) so the relation operands resolve as MTK observed variables. =#
+function _collectChangeRelations!(rels::Vector{DAE.Exp}, @nospecialize(e))::Bool
+  @match e begin
+    DAE.CALL(Absyn.IDENT("change"), args, _) => begin
+      local inner = listHead(args)
+      if inner isa DAE.RELATION
+        push!(rels, inner)
+        true
+      else
+        false
+      end
+    end
+    DAE.LBINARY(e1, DAE.OR(__), e2) =>
+      (_collectChangeRelations!(rels, e1) && _collectChangeRelations!(rels, e2))
+    _ => false
+  end
+end
+
+function _extractChangeRelations(@nospecialize(cond))
+  local dcond = cond isa SimulationCode.Exp ? SimulationCode.toDAEExp(cond) : cond
+  local rels = DAE.Exp[]
+  local ok = _collectChangeRelations!(rels, dcond)
+  return (ok && !isempty(rels)) ? rels : nothing
+end
+
+#= Build MTK SymbolicContinuousCallbacks for the synthesised discrete-Boolean
+   whens: one callback per relation zero-crossing, whose symbolic affect rewrites
+   the held discrete unknown from its defining expression. The affect re-evaluates
+   the Boolean RHS at the (post-rootfind) event point, so it is direction-correct. =#
+#= Replace every structural occurrence of relation `rel` in `exp` with `val`. =#
+function _substRelation(@nospecialize(exp), @nospecialize(rel), val::Bool)
+  local relStr = string(rel)
+  function repl(@nospecialize(e), arg)
+    (string(e) == relStr) ? (DAE.BCONST(val), arg) : (e, arg)
+  end
+  return first(Util.traverseExpBottomUp(exp, repl, nothing))
+end
+
+function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
+  local events = Expr[]
+  for weq in simCode.whenEquations
+    local rels = _extractChangeRelations(weq.whenEquation.condition)
+    rels === nothing && continue
+    local stmts = collect(weq.whenEquation.whenStmtLst)
+    length(stmts) == 1 || continue
+    local st = stmts[1]
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+    local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
+    haskey(simCode.stringToSimVarHT, leftStr) || continue
+    local (_, var) = simCode.stringToSimVarHT[leftStr]
+    local discSym = Symbol(string(var.name))
+    local rhsDAE = SimulationCode.toDAEExp(st.right)
+    #= One callback per relation in the RHS. transformToMTKContinousCondition
+       normalises zc so relation-TRUE ⟺ zc<0: the `=>` affect is the up-crossing
+       (relation becomes FALSE) and affect_neg the down-crossing (relation becomes
+       TRUE). Re-evaluate the Boolean RHS with THIS relation pinned to its
+       post-crossing value (others at their current value) so the written discrete
+       is direction-correct without the `f≈0` ambiguity. =#
+    for rel in rels
+      local rhsFalse = expToJuliaExpMTK(_substRelation(rhsDAE, rel, false), simCode)
+      local rhsTrue = expToJuliaExpMTK(_substRelation(rhsDAE, rel, true), simCode)
+      local zc = transformToMTKContinousCondition(rel, simCode)
+      #= `0.5 < rhs` yields a Bool condition whether `rhs` is a Bool relation or
+         the arithmetic (0/1) encoding of a compound boolean. =#
+      push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+        ($(zc) ~ 0) => [$(discSym) ~ ModelingToolkit.ifelse(0.5 < $(rhsFalse), 1.0, 0.0)];
+        affect_neg = [$(discSym) ~ ModelingToolkit.ifelse(0.5 < $(rhsTrue), 1.0, 0.0)],
+        reinitializealg = SciMLBase.NoInit())))
+    end
+  end
+  return events
 end
 
 """
@@ -2951,19 +2957,11 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
         (index, var) = simCode.stringToSimVarHT[leftStr]
         local lhsSym = Symbol(string(var.name))
         local rhsE = expToJuliaExpMTK(wStmt.right, simCode; varPrefix = varPrefix, varSuffix = varSuffix)
-        if leftStr in _heldDiscreteParamSet(simCode)
-          #= (b) held discrete is a parameter (not a state slot): write it through the
-             SymbolicIndexingInterface by literal-Symbol name (`integrator.ps[:name]`). =#
-          push!(res, quote
-                  integrator.ps[$(QuoteNode(lhsSym))] = $(rhsE)
-                end)
-        else
-          push!(res, quote
-                  idx = lookuptableStates[Symbol($(string(var.name)))]
-                  integrator.u[idx] = $(rhsE)
-                  $(lhsSym) = integrator.u[idx]
-                end)
-        end
+        push!(res, quote
+                idx = lookuptableStates[Symbol($(string(var.name)))]
+                integrator.u[idx] = $(rhsE)
+                $(lhsSym) = integrator.u[idx]
+              end)
       end
     elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
       (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]

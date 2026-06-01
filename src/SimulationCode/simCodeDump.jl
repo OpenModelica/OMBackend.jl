@@ -200,12 +200,72 @@ end
 """
   Helper to dump a section of variables. Skips the section entirely if empty.
 """
+#= Literal string for a DAE.Exp attribute value (start/fixed/min/...). =#
+function _attrExpStr(@nospecialize(e))::String
+  @match e begin
+    DAE.RCONST(r) => string(r)
+    DAE.ICONST(i) => string(i)
+    DAE.BCONST(b) => string(b)
+    DAE.SCONST(s) => "\"" * s * "\""
+    _ => string(e)
+  end
+end
+
+function _stateSelectStr(@nospecialize(ss))::String
+  @match ss begin
+    DAE.NEVER(__) => "never"
+    DAE.AVOID(__) => "avoid"
+    DAE.DEFAULT(__) => "default"
+    DAE.PREFER(__) => "prefer"
+    DAE.ALWAYS(__) => "always"
+    _ => string(ss)
+  end
+end
+
+#= Compact `{start=.., fixed=.., stateSelect=.., ...}` suffix from a SimVar's
+   DAE.VariableAttributes, so each SimCode pass shows whether start / fixed /
+   stateSelect survive (e.g. through alias elimination). Empty when no attrs. =#
+function dumpSimVarAttrs(@nospecialize(var))::String
+  local attrs = @match var.attributes begin
+    SOME(a) => a
+    _ => return ""
+  end
+  local parts = String[]
+  local pushOpt = (label, o) -> @match o begin
+    SOME(e) => push!(parts, label * "=" * _attrExpStr(e))
+    _ => nothing
+  end
+  @match attrs begin
+    DAE.VAR_ATTR_REAL(start = st, fixed = fx, min = mn, max = mx,
+                      nominal = nm, stateSelectOption = ss) => begin
+      pushOpt("start", st); pushOpt("fixed", fx)
+      @match ss begin
+        SOME(s) => push!(parts, "stateSelect=" * _stateSelectStr(s))
+        _ => nothing
+      end
+      pushOpt("min", mn); pushOpt("max", mx); pushOpt("nominal", nm)
+    end
+    DAE.VAR_ATTR_INT(start = st, fixed = fx, min = mn, max = mx) => begin
+      pushOpt("start", st); pushOpt("fixed", fx); pushOpt("min", mn); pushOpt("max", mx)
+    end
+    DAE.VAR_ATTR_BOOL(start = st, fixed = fx) => begin
+      pushOpt("start", st); pushOpt("fixed", fx)
+    end
+    DAE.VAR_ATTR_ENUMERATION(start = st, fixed = fx) => begin
+      pushOpt("start", st); pushOpt("fixed", fx)
+    end
+    _ => nothing
+  end
+  isempty(parts) && return ""
+  return "  {" * join(parts, ", ") * "}"
+end
+
 function dumpVarSection(buffer::IOBuffer, sectionName::String, varNames::Vector{String}, simCode)
   isempty(varNames) && return
   println(buffer, "  ", sectionName, ":")
   for name in varNames
     (idx, var) = simCode.stringToSimVarHT[name]
-    println(buffer, "    [", idx, "] ", name, dumpSimVarKind(var.varKind))
+    println(buffer, "    [", idx, "] ", name, dumpSimVarKind(var.varKind), dumpSimVarAttrs(var))
   end
 end
 

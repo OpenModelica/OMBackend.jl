@@ -222,9 +222,23 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
       end
     end
   end
-  #= §17.4.4 lift for Boolean / Integer / Enumeration residuals into
-     event-driven WHEN updates is parked — single-pass approach is not
-     sufficient; see ~/REPORTS/ombackend-section-17-4-4-status-2026-05-21.md. =#
+  #= §17.4.4: lift discrete (Bool/Int/enum) equation-section definitions whose RHS
+     is a discrete-time relation expression into event-driven held discretes, so the
+     continuous integrator never interpolates step-valued logic. WORK IN PROGRESS:
+     the synthesised when-equations currently route through the legacy CallbackSet,
+     which cannot read MTK observed variables (the relation operands), so the
+     event does not fire for conditions over algebraic/eliminated vars. Gated OFF
+     by default until the codegen routes these through MTK SymbolicContinuousCallbacks.
+     Enable for development with OMBACKEND_DISCRETE_BOOL_LIFT=true. =#
+  if lowercase(get(ENV, "OMBACKEND_DISCRETE_BOOL_LIFT", "false")) in ("true", "1", "yes") &&
+     !isempty(equations) && !isempty(variables)
+    local _discParamConst = _collectParamOrConstNames(variables)
+    local (_discEqs, _discLifted) = synthesizeWhenEquationsFromDiscreteEquations(equations, _discParamConst)
+    if !isempty(_discLifted)
+      @info "[BDAE: lifter] synthesizeWhenEquationsFromDiscreteEquations lifted $(length(_discLifted)) discrete equation(s)" lifted=collect(_discLifted)
+    end
+    equations = _discEqs
+  end
   local initialEquations = BDAE.Equation[]
   for ieq in OMFrontend.Frontend.convertEquations(flatModel.initialEquations)
     local iresult = equationToBackendEquation(ieq)
@@ -1865,6 +1879,134 @@ Base.@nospecializeinfer function _buildChangeOrCondition(crefs::Vector{DAE.Compo
     acc = DAE.LBINARY(acc, DAE.OR(DAE.T_BOOL_DEFAULT), _makeChangeCall(crefs[i]))
   end
   return acc
+end
+
+#= §17.4.4 equation-section lift. A discrete (Bool/Int/enum) variable defined by
+   `lhs = relexpr`, where `relexpr` is a discrete-time expression (relations,
+   pre/initial/change, logical ops over discrete/param/const operands), is held
+   constant between events and recomputed only at zero-crossings of the relations
+   in its RHS. Such an equation is replaced by a paired INITIAL_WHEN_EQUATION
+   (t=0 value) + runtime WHEN_EQUATION triggered by `change(rel1) or … or change(relK)`.
+   This is the equation-section analogue of `synthesizeWhenEquationsFromRegularAlgorithms`,
+   except the trigger is built over the RELATIONS (the event sources) rather than over
+   discrete RHS crefs — `change(w_rel <= 0)` fires only at the sign flip, whereas
+   `change(w_rel)` would over-trigger every step. =#
+
+#= Discrete-time predicate: an expression with no continuous-Real dependence
+   OUTSIDE a relation. Relations are event sources, so their (possibly continuous)
+   operands are allowed. =#
+Base.@nospecializeinfer function _isDiscreteTimeExp(@nospecialize(exp), paramOrConstNames::Set{String})::Bool
+  @match exp begin
+    DAE.RELATION(__) => true
+    DAE.LBINARY(e1, _, e2) => _isDiscreteTimeExp(e1, paramOrConstNames) && _isDiscreteTimeExp(e2, paramOrConstNames)
+    DAE.LUNARY(_, e1) => _isDiscreteTimeExp(e1, paramOrConstNames)
+    DAE.BCONST(__) => true
+    DAE.ICONST(__) => true
+    DAE.RCONST(__) => true
+    DAE.SCONST(__) => true
+    DAE.ENUM_LITERAL(__) => true
+    DAE.CALL(Absyn.IDENT(n), _, _) => (n in ("pre", "initial", "change", "edge", "sample", "noEvent"))
+    DAE.IFEXP(c, t, f) => _isDiscreteTimeExp(c, paramOrConstNames) &&
+                          _isDiscreteTimeExp(t, paramOrConstNames) &&
+                          _isDiscreteTimeExp(f, paramOrConstNames)
+    DAE.CREF(cr, ty) => ((string(cr) in paramOrConstNames) ? true : !_isContinuousRealType(ty))
+    _ => false
+  end
+end
+
+#= Collect the (structurally deduplicated) RELATION subtrees of `exp`. =#
+Base.@nospecializeinfer function _collectRelationsInExp(@nospecialize(exp))::Vector{DAE.Exp}
+  local rels = DAE.Exp[]
+  local seen = Set{String}()
+  function visit(@nospecialize(e), arg)
+    if e isa DAE.RELATION
+      local key = string(e)
+      if !(key in seen)
+        push!(seen, key)
+        push!(rels, e)
+      end
+    end
+    return (e, arg)
+  end
+  Util.traverseExpBottomUp(exp, visit, nothing)
+  return rels
+end
+
+Base.@nospecializeinfer function _makeChangeCallExp(@nospecialize(relExp))
+  return DAE.CALL(Absyn.IDENT("change"), MetaModelica.list(relExp), DAE.callAttrBuiltinBool)
+end
+
+Base.@nospecializeinfer function _buildChangeOrConditionFromExps(rels::Vector{DAE.Exp})
+  isempty(rels) && return DAE.BCONST(false)
+  local acc = _makeChangeCallExp(rels[1])
+  for i in 2:length(rels)
+    acc = DAE.LBINARY(acc, DAE.OR(DAE.T_BOOL_DEFAULT), _makeChangeCallExp(rels[i]))
+  end
+  return acc
+end
+
+#= Try to lift one equation. Returns the lifted LHS name (and pushes the
+   INITIAL_WHEN + runtime WHEN onto `out`), or `nothing` if `eq` does not qualify
+   (caller keeps the original). =#
+Base.@nospecializeinfer function _tryLiftDiscreteBoolEquation!(out::Vector{BDAE.Equation},
+                                                               @nospecialize(eq),
+                                                               paramOrConstNames::Set{String})
+  eq isa BDAE.EQUATION || return nothing
+  local lhs = eq.lhs
+  lhs isa DAE.CREF || return nothing
+  local lhsDiscrete = _isDiscreteDAEType(lhs.ty)
+  if !lhsDiscrete
+    local ct = _crefType(lhs.componentRef)
+    lhsDiscrete = ct !== nothing && _isDiscreteDAEType(ct)
+  end
+  lhsDiscrete || return nothing
+  local lhsName = string(lhs.componentRef)
+  (lhsName == "time" || lhsName in paramOrConstNames) && return nothing
+  local rhs = eq.rhs
+  _isDiscreteTimeExp(rhs, paramOrConstNames) || return nothing
+  local relations = _collectRelationsInExp(rhs)
+  isempty(relations) && return nothing
+  local src = eq.source
+  local bareInitial = DAE.CALL(Absyn.IDENT("initial"), MetaModelica.list(), DAE.callAttrBuiltinBool)
+  local rhsInit = _replaceInitialCall(rhs, true)
+  local rhsRun = _replaceInitialCall(rhs, false)
+  local changeCond = _buildChangeOrConditionFromExps(relations)
+  push!(out, BDAE.INITIAL_WHEN_EQUATION(
+    1,
+    BDAE.WHEN_STMTS(bareInitial, MetaModelica.list(BDAE.ASSIGN(lhs, rhsInit, src)), NONE()),
+    src,
+    nothing,
+  ))
+  push!(out, BDAE.WHEN_EQUATION(
+    1,
+    BDAE.WHEN_STMTS(changeCond, MetaModelica.list(BDAE.ASSIGN(lhs, rhsRun, src)), NONE()),
+    src,
+    nothing,
+  ))
+  return lhsName
+end
+
+"""
+    synthesizeWhenEquationsFromDiscreteEquations(equations, paramOrConstNames) -> (Vector{BDAE.Equation}, Set{String})
+
+Replace every qualifying discrete-Boolean/Integer equation-section definition with
+a paired INITIAL_WHEN_EQUATION + runtime WHEN_EQUATION (see `_tryLiftDiscreteBoolEquation!`).
+Self-gating: equations that do not qualify are returned unchanged, so models with no
+discrete-time defining equations pay only a single linear scan.
+"""
+function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equation},
+                                                      paramOrConstNames::Set{String} = Set{String}())
+  local out = BDAE.Equation[]
+  local liftedLhs = Set{String}()
+  for eq in equations
+    local lifted = _tryLiftDiscreteBoolEquation!(out, eq, paramOrConstNames)
+    if lifted === nothing
+      push!(out, eq)
+    else
+      push!(liftedLhs, lifted)
+    end
+  end
+  return (out, liftedLhs)
 end
 
 #= If `stmt` is a top-level `STMT_IF { cond, body = [STMT_ASSIGN(disc, expr)] }`

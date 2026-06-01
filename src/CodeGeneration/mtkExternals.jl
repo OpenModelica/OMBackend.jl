@@ -1173,6 +1173,32 @@ end
 
   Returns `(system, hardInitialValues)` where system may have updated guesses.
 """
+#= Names (as strings) of variables that appear in an algebraic (non-differential)
+   equation of `sys`. A differential equation `D(x) ~ rhs` is skipped: the state `x`'s
+   initial condition is free unless it is also constrained by an algebraic equation.
+   Used by splitInitialValues to decide which non-fixed starts are safe to keep as hard
+   u0 (uncoupled states) vs must be relaxed to guesses (algebraically coupled states). =#
+function _algebraicCoupledVarStrs(sys)::Set{String}
+  local out = Set{String}()
+  local eqs = try
+    equations(sys)
+  catch
+    return out
+  end
+  for eq in eqs
+    local lhs = Symbolics.value(eq.lhs)
+    local isDiff = SymbolicUtils.iscall(lhs) && (SymbolicUtils.operation(lhs) isa ModelingToolkit.Differential)
+    isDiff && continue
+    for v in Symbolics.get_variables(eq.lhs)
+      push!(out, string(v))
+    end
+    for v in Symbolics.get_variables(eq.rhs)
+      push!(out, string(v))
+    end
+  end
+  return out
+end
+
 function splitInitialValues(reducedSystem,
                             finalInitialValues::Vector{<:Pair{Symbolics.Num}},
                             allInitialValues::Vector{<:Pair})
@@ -1265,12 +1291,23 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
        with explicit `start` but `fixed=false` are guesses for the init solver.
        Without this demote, e.g. m1.s(start=0) without fixed=true would over-pin
        the DAE system and force algebraic vars (sd1.s_rel) to satisfy the
-       residual at the wrong value. =#
-    local demoted = filter(p -> !(string(p.first) in fixedTrueLhsSet), hardInitialValues)
+       residual at the wrong value.
+
+       BUT only demote a non-fixed differential state that is actually COUPLED to an
+       algebraic constraint (appears in some non-differential equation). A differential
+       state whose IC is genuinely free — it occurs only as `D(x)` in its own equation,
+       never in an algebraic constraint — cannot over-pin anything, so its start must
+       remain a hard u0; demoting it to a soft guess that the DAE initializer then
+       fails to honour drops the user's start (e.g. an event-held discrete's consumer
+       state landing at 0 instead of its start). =#
+    local _algCoupled = _algebraicCoupledVarStrs(reducedSystem)
+    local demoted = filter(p -> !(string(p.first) in fixedTrueLhsSet) &&
+                                (string(p.first) in _algCoupled), hardInitialValues)
     if !isempty(demoted)
-      hardInitialValues = filter(p -> string(p.first) in fixedTrueLhsSet, hardInitialValues)
+      local _demotedKeys = Set(string(p.first) for p in demoted)
+      hardInitialValues = filter(p -> !(string(p.first) in _demotedKeys), hardInitialValues)
       append!(softInitialValues, demoted)
-      @debug "[MTK GEN: init] Demoted $(length(demoted)) non-fixed hard u0 entries to guesses (start without fixed=true)"
+      @debug "[MTK GEN: init] Demoted $(length(demoted)) non-fixed algebraic-coupled hard u0 entries to guesses (start without fixed=true)"
     end
   end
   if !isempty(softInitialValues)
@@ -1505,6 +1542,42 @@ function injectObservedEquations(sys, observedEqs::Vector)
   return updated
 end
 
+#= StateSelect.prefer / avoid lower to soft (|priority| <= 2) VariableStatePriority
+   hints. They are advisory; StateSelect.always / never (|priority| = 10) are hard.
+   When a soft hint forces MTK index reduction into a structurally singular reduced
+   system, neutralizing it to the default (0) lets MTK pick a feasible state set.
+   Returns the count of neutralized unknowns and a freshly-constructed System that
+   carries the neutralized unknowns. The state priority that MTK honours is read
+   from the unknowns vector passed to the constructor, so the system must be rebuilt
+   through `System(...)` (mutating the field via `@set`/`substitute` is a no-op:
+   `setmetadata` leaves variables `isequal`, so MTK keeps the original priority). =#
+function neutralizeSoftStatePriority(sys::ModelingToolkit.AbstractSystem)
+  local n = 0
+  local newUnknowns = map(ModelingToolkit.get_unknowns(sys)) do u
+    local uv = Symbolics.unwrap(u)
+    local p = SymbolicUtils.getmetadata(uv, ModelingToolkit.VariableStatePriority, nothing)
+    if p !== nothing && abs(p) <= 2
+      n += 1
+      SymbolicUtils.setmetadata(uv, ModelingToolkit.VariableStatePriority, 0)
+    else
+      uv
+    end
+  end
+  n == 0 && return (0, sys)
+  local relaxed = ModelingToolkit.System(
+    equations(sys),
+    ModelingToolkit.get_iv(sys),
+    newUnknowns,
+    ModelingToolkit.get_ps(sys);
+    name = nameof(sys),
+    continuous_events = ModelingToolkit.get_continuous_events(sys),
+    discrete_events = ModelingToolkit.get_discrete_events(sys),
+    guesses = ModelingToolkit.get_guesses(sys),
+    initialization_eqs = ModelingToolkit.get_initialization_eqs(sys),
+  )
+  return (n, relaxed)
+end
+
 """
   TODO:
   Document why some parts here are commented out
@@ -1582,12 +1655,31 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   end
 
   local useSplit = get(kwargs, :split, true)
+  local _preSimplifySys = sys
   if OMBackend.BACKEND_LOGGING[]
     local _ss_timed = @timed ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
     sys = _ss_timed.value
     @debug "[MTK GEN: simplify] structural_simplify took $(_ss_timed.time)s, $(round(_ss_timed.bytes / 1e9, digits=2)) GiB"
   else
     sys = ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
+  end
+  #= A structurally singular reduction (equations != unknowns) can be caused by a
+     soft StateSelect hint conflicting with a constraint MTK index-reduces. Retry
+     once with soft state-priority hints neutralized before accepting the result. =#
+  if length(equations(sys)) != length(unknowns(sys))
+    local (nNeutralized, relaxedSys) = neutralizeSoftStatePriority(_preSimplifySys)
+    if nNeutralized > 0
+      local retried = try
+        ModelingToolkit.structural_simplify(relaxedSys; simplify = simplify, split = useSplit)
+      catch e
+        @warn "[MTK GEN: simplify] retry without soft state-priority hints threw" exception = (e, catch_backtrace())
+        nothing
+      end
+      if retried !== nothing && length(equations(retried)) == length(unknowns(retried))
+        @info "[MTK GEN: simplify] recovered structural balance by neutralizing $(nNeutralized) soft state-priority hint(s)"
+        sys = retried
+      end
+    end
   end
   local post_eqs = length(equations(sys))
   #= Diagnostic only: full_equations expands observed eqs and can hit
