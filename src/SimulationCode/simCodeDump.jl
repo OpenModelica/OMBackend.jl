@@ -60,14 +60,53 @@ function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = simCode
       SimulationCode.PARAMETER(__) => push!(parameters, varName)
       SimulationCode.STRING(__) => push!(parameters, varName)
       SimulationCode.ALG_VARIABLE(__) => push!(algVariables, varName)
-      SimulationCode.ARRAY_PARAMETER(__) => push!(arrayParameters, (varName, sum(varType.dimensions)))
-      SimulationCode.ARRAY(__) => push!(arrayVariables, (varName, sum(varType.dimensions)))
+      SimulationCode.ARRAY_PARAMETER(__) => push!(arrayParameters, (varName, prod(varType.dimensions)))
+      SimulationCode.ARRAY(__) => push!(arrayVariables, (varName, prod(varType.dimensions)))
       SimulationCode.DISCRETE(__) => push!(discreteVariables, varName)
       SimulationCode.OCC_VARIABLE(__) => push!(occVariables, varName)
       SimulationCode.DATA_STRUCTURE(__) => push!(dsVariables, varName)
     end
   end
   local algAndState = vcat(algVariables, stateVariables)
+
+  #= Greppable scalar balance across passes. Unknowns count array variables by
+     element count; equations are summed across all sources: residual equations,
+     one active branch of each if-equation, and the discretes a when-equation
+     assigns (event-driven memory definitions). delta != 0 flags the pass that
+     unbalances the system before MTK sees it. =#
+  local arrayScalars = isempty(arrayVariables) ? 0 : sum(last, arrayVariables)
+  local arrayParamScalars = isempty(arrayParameters) ? 0 : sum(last, arrayParameters)
+  local ifBranchEqs = 0
+  for ifEq in simCode.ifEquations
+    isempty(ifEq.branches) || (ifBranchEqs += length(first(ifEq.branches).residualEquations))
+  end
+  local whenAssigned = Set{String}()
+  for weq in simCode.whenEquations
+    for wstmt in weq.whenEquation.whenStmtLst
+      #= ASSIGN carries the assigned target in `left`; REINIT/NORETCALL have no `left`. =#
+      hasproperty(wstmt, :left) && collectCrefNames!(whenAssigned, wstmt.left)
+    end
+  end
+  local nResidual = length(simCode.residualEquations)
+  local unknownsScalar = length(stateVariables) + length(algVariables) + arrayScalars + length(discreteVariables) + length(occVariables)
+  #= Directly-defined unknowns: each residual / active if-branch equation defines one,
+     each when-assignment defines one discrete. The remainder are discretes MTK pins
+     with a der(d)~0 dummy, so the system balances iff that remainder is in [0, #discrete]. =#
+  local directlyDefined = nResidual + ifBranchEqs + length(whenAssigned)
+  local derDummies = unknownsScalar - directlyDefined
+  local balancedWithDummies = (derDummies >= 0) && (derDummies <= length(discreteVariables))
+  println(buffer, "SUMMARY vars | state=", length(stateVariables), " alg=", length(algVariables),
+          " array=", length(arrayVariables), "(scalars=", arrayScalars, ") discrete=", length(discreteVariables),
+          " param=", length(parameters), " arrayParam=", length(arrayParameters), "(scalars=", arrayParamScalars, ")",
+          " occ=", length(occVariables), " ds=", length(dsVariables))
+  println(buffer, "SUMMARY eqs | residual=", nResidual,
+          " ifBranchEqs=", ifBranchEqs, " whenAssignedDiscretes=", length(whenAssigned),
+          " (ifEqs=", length(simCode.ifEquations), " whenEqs=", length(simCode.whenEquations),
+          " initial=", length(simCode.initialEquations), ")")
+  println(buffer, "SUMMARY balance | unknownsScalar=", unknownsScalar,
+          " directlyDefined=", directlyDefined, " derDummies=", derDummies,
+          " balancedWithDummies=", balancedWithDummies)
+  println(buffer)
 
   #= Functions =#
   if !isempty(simCode.functions)

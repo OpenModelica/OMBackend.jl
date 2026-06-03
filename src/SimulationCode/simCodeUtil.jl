@@ -856,14 +856,22 @@ function getIrreducibleVars(ifEquations::Vector{BDAE.IF_EQUATION},
   irreducibles = filter(irv -> irv == "time" ||
                                   (haskey(ht, irv) && !isParameter(last(ht[irv]))),
                           irreducibles)
-  #TODO: Fix the detection, s.t variables critical to when equations are not removed
-  #for eq in whenEqs
-    # variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
-    # push!(variablesForEq, irreducibles)
-  #end
-  #= Add known irreducibles to the vector =#
-  #push!(irreducibles, map(x->x.varName, string(knownIrreducibles)))
   local irreduciblesAsStr = map(x -> string(x), irreducibles)
+  #= Protect discretes referenced in a when-CONDITION: if elimination drops one to
+     observed-only, the DiscreteCallback condition still reads it from the state
+     vector and hits x[nothing]. Condition + discrete only, to stay narrow. =#
+  for weq in whenEqs
+    local stmts = weq.whenEquation
+    while stmts isa BDAE.WhenEquation
+      for cref in Util.getAllCrefs(stmts.condition)
+        local nm = string(cref)
+        if haskey(ht, nm) && isDiscrete(last(ht[nm]))
+          push!(irreduciblesAsStr, nm)
+        end
+      end
+      stmts = stmts.elsewhenPart
+    end
+  end
   #=
   If THETA exists, treat it as an irreducible variable
   Currently, theta is a variable with "_THETA" in the variable name.

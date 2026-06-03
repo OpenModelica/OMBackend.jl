@@ -37,6 +37,37 @@ using MetaModelica
 const HEAD_LINE = "############################################"
 const DOUBLE_LINE = "============================================"
 const LINE = "---------------------------------------------"
+const _ARRAY_DUMP_LIMIT = 12
+
+#= Abbreviate large literal arrays in dumps so constant lookup tables (e.g. the
+   9x9 Logic enum tables) collapse to a `{<R×C table>}` / `{…<N elems>}` summary
+   instead of flooding the log. Small arrays still print in full. =#
+function _dumpArray(expl)::String
+  local n = 0
+  local first = nothing
+  for e in expl
+    n += 1
+    n == 1 && (first = e)
+  end
+  n == 0 && return "{}"
+  if first isa DAE.ARRAY
+    local m = 0
+    for _ in first.array
+      m += 1
+    end
+    n * m > _ARRAY_DUMP_LIMIT && return "{<" * string(n) * "×" * string(m) * " table>}"
+  elseif n > _ARRAY_DUMP_LIMIT
+    local parts = String[]
+    local i = 0
+    for e in expl
+      i += 1
+      i <= 3 || break
+      push!(parts, string(e))
+    end
+    return "{" * join(parts, ", ") * ", …<" * string(n) * " elems>}"
+  end
+  return "{" * lstString(expl, ", ") * "}"
+end
 
 function stringHeading1(i::Any, heading::String)::String
   str = heading1(heading) + "\n" + string(i)
@@ -72,6 +103,18 @@ end
 
 function Base.string(eq::BDAE.EQSYSTEM)::String
   str::String = ""
+  #= One-line greppable summary mirroring the simCode dump, so a pass that shifts
+     the BDAE variable/equation counts is visible via `grep SUMMARY`. The equation
+     figure is a list-entry count: array/when/if entries are single elements that may
+     each stand for several scalar equations, so it is not a scalar balance. =#
+  local kindCounts = Dict{String, Int}()
+  for v in eq.orderedVars
+    local k = string(v.varKind)
+    kindCounts[k] = get(kindCounts, k, 0) + 1
+  end
+  local kindStr = join([ck * "=" * string(kindCounts[ck]) for ck in sort(collect(keys(kindCounts)))], " ")
+  str = str * "SUMMARY vars | " * kindStr * " total=" * string(length(eq.orderedVars)) * "\n"
+  str = str * "SUMMARY eqs | listEntries=" * string(length(eq.orderedEqs)) * " note=array/when/if-entries-not-scalar-expanded\n\n"
   str = str + heading3("Variables") + BDAEUtil.mapEqSystemVariablesNoUpdate(eq, stringTraverse, "") + "\n"
   str = str * "#Total variables, parameters and constants = " * string(length(eq.orderedVars), "\n")
   str = str + heading3("Equations") + BDAEUtil.mapEqSystemEquationsNoUpdate(eq, stringTraverse, "") + "\n"
@@ -534,15 +577,29 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
       end
 
       DAE.ARRAY(array = expl)  => begin
-        "{" + lstString(expl, ", ") + "}"
+        _dumpArray(expl)
       end
 
       DAE.MATRIX(matrix = lstexpl)  => begin
-        str = "[MAT]"
+        local nRows = 0
+        local nCols = 0
         for lst in lstexpl
-          str = str + "{" + lstString(lst, ", ") + "}"
+          nRows += 1
+          if nRows == 1
+            for _ in lst
+              nCols += 1
+            end
+          end
         end
-        (str)
+        if nRows * nCols > _ARRAY_DUMP_LIMIT
+          "[MAT <" * string(nRows) * "×" * string(nCols) * " table>]"
+        else
+          str = "[MAT]"
+          for lst in lstexpl
+            str = str + "{" + lstString(lst, ", ") + "}"
+          end
+          str
+        end
       end
 
       DAE.RANGE(start = e1, step = NONE(), stop = e2)  => begin

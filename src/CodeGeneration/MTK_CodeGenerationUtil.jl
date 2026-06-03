@@ -95,6 +95,19 @@ function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode; cachedChange::
         expToJuliaExpMTK(cond, simCode)
       end
     end
+    #= Modelica `edge(b)` ≡ `b and not pre(b)` — the rising-edge detector. Uses
+       the same previous-value machinery as `change`; the `!= 0` normalises a
+       Boolean discrete stored as a Float64 (0.0/1.0) so `&&`/`!` stay boolean. =#
+    DAE.CALL(Absyn.IDENT("edge"), lst, _) => begin
+      local innerArgs = collect(lst)
+      if length(innerArgs) == 1
+        local curr = expToJuliaBoolMTK(innerArgs[1], simCode; cachedChange = cachedChange)
+        local prev = _preValueLookup(innerArgs[1], simCode; cachedChange = cachedChange)
+        :((($(curr)) != 0) && !((($(prev)) != 0)))
+      else
+        expToJuliaExpMTK(cond, simCode)
+      end
+    end
     #= `initial()` is true exactly during the initialisation phase. The
        DiscreteCallback we use for synthesised when-equations does not run
        during MTK's InitializationProblem — the body's init-pass fires
@@ -2290,12 +2303,10 @@ function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::
   return true
 end
 
-"True when every non-else branch condition of an if-equation is discrete/parameter.
- Tied to OMBACKEND_DISCRETE_BOOL_LIFT: direct discrete gating is only meaningful
- alongside the event-held-discrete lowering, so when that is off this returns false
- and the if-equation keeps the standard ifCond relay (baseline behaviour)."
+"True when every non-else branch condition of an if-equation is discrete/parameter,
+ so the residual gates directly on the boolean condition instead of emitting a
+ continuous ifCond relay callback."
 function _allBranchConditionsDiscrete(branches, simCode)::Bool
-  lowercase(get(ENV, "OMBACKEND_DISCRETE_BOOL_LIFT", "false")) in ("true", "1", "yes") || return false
   for b in branches
     b.targets == -1 && continue
     _ifConditionAllDiscreteOrParameter(b.condition, simCode) || return false

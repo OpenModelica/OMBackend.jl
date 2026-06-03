@@ -534,6 +534,30 @@ function getAllVariables(eq::BDAE.IF_EQUATION, vars::Vector{BDAE.VAR})
 end
 
 """
+  Fetches all variables referenced by a when-equation: its condition and the
+  left/right of each assignment (REINIT state/value). Assignment targets are
+  included so a discrete written only by an event is not aliased away.
+"""
+function getAllVariables(eq::BDAE.WHEN_EQUATION, vars::Vector{BDAE.VAR})
+  local whenEq = eq.whenEquation
+  local crefs = listArray(Util.getAllCrefs(whenEq.condition))
+  for stmt in whenEq.whenStmtLst
+    @match stmt begin
+      BDAE.ASSIGN(__) => begin
+        append!(crefs, listArray(Util.getAllCrefs(stmt.left)))
+        append!(crefs, listArray(Util.getAllCrefs(stmt.right)))
+      end
+      BDAE.REINIT(__) => begin
+        append!(crefs, listArray(Util.getAllCrefs(stmt.stateVar)))
+        append!(crefs, listArray(Util.getAllCrefs(stmt.value)))
+      end
+      _ => nothing
+    end
+  end
+  return map(x -> string(x), crefs)
+end
+
+"""
   Author:johti17
   input: Backend Equation, eq
   input: All existing variables

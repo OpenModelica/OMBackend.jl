@@ -98,7 +98,7 @@ function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = tru
      MTK SymbolicContinuousCallbacks (createDiscreteBoolWhenEvents); exclude them
      here so they are not also built into the legacy CallbackSet (which cannot
      read MTK observed variables). =#
-  local _legacyWhens = filter(w -> _extractChangeRelations(w.whenEquation.condition) === nothing,
+  local _legacyWhens = filter(w -> _extractChangeRelations(w.whenEquation.condition, simCode) === nothing,
                               simCode.whenEquations)
   local WHEN_EQUATIONS = createEquations(_legacyWhens,  simCode)
   #=
@@ -342,7 +342,10 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     _ => false
   end
   local isContinuousCond::Bool = isContinousCondition(wEqCondDAE, simCode)
-  if isContinuousCond
+  #= A `sample(start, period)` is a periodic clock even when its interval is a
+     parameter, which isContinousCondition mis-flags as continuous; keep all
+     samples on the periodic branch. =#
+  if isContinuousCond && !isPeriodic
     local isElseIf = if wEq.elsewhenPart !== nothing
       local elsePart = _elsewhenInner(wEq.elsewhenPart)
       local elseCond = SimulationCode.toDAEExp(_elsewhenCondition(elsePart))
@@ -353,8 +356,8 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     end
     if isElseIf
       #= Use MTK-aware runtime symbol lookup for the elseif continuous path.
-         The hardcoded x[N] indices from expToJuliaExp/createWhenStatements
-         become invalid after MTK structural_simplify reorders unknowns. =#
+         The hardcoded x[N] indices from expToJuliaExp become invalid after
+         MTK structural_simplify reorders unknowns. =#
       local whenStatementsMTKIf = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
       local whenStatementsMTKElse = createWhenStatementsMTK(_elsewhenStmtLst(elsePart), simCode)
       local condCrefsElseIf = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
@@ -526,19 +529,44 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
   elseif isPeriodic
     @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = wEqCondDAE
     @match start <| interval <| tail = args
-    local whenStmts = createWhenStatements(wEq.whenStmtLst, simCode)
+    #= MTK-aware periodic affect: the hardcoded x[N]/p[N] indices from
+       expToJuliaExp are invalid after MTK structural_simplify reorders unknowns,
+       so resolve the interval to a literal Δt and write state via
+       getStatesAsSymbols + lookuptable, mirroring the discrete branch. =#
+    local whenStatementsMTKPeriodic = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    local _intervalVal = SimulationCode.tryEvalNumeric(interval, simCode)
+    local _dtExpr = _intervalVal === nothing ? expToJuliaExp(interval, simCode) : _intervalVal
     quote
-      $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
-        local t = integrator.t + integrator.dt
-        local x = integrator.u
-        if integrator.dt == 0.0
-          @error "integrator.dt was zero. Aborting."
-          fail()
+      let _affCache = Ref{Any}(nothing)
+        global $(Symbol("affect$(callbacks)!"))
+        $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+          local t = integrator.t
+          local x = integrator.u
+          local lookuptableStates
+          local lookuptableParams
+          if _affCache[] === nothing
+            local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+            local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+            lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+            lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+            _affCache[] = (lookuptableStates, lookuptableParams)
+          else
+            local cached = _affCache[]
+            lookuptableStates = cached[1]
+            lookuptableParams = cached[2]
+          end
+          $(map(x -> Expr(Symbol("="),
+                          Symbol(string(x)),
+                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
+                vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...))...)
+          $(whenStatementsMTKPeriodic...)
         end
-        $(whenStmts...)
       end
-      Δt = $(expToJuliaExp(interval, simCode))
+      Δt = $(_dtExpr)
       $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), Δt)
+      $(if wEq.elsewhenPart !== nothing
+          eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4)
+        end)
     end
   else #= If none of the variables in the condition was continuous.. =#
     #= Use MTK-aware runtime symbol lookup for discrete callbacks.
@@ -700,105 +728,6 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
   end
 end
 
-
-"""
-   Creates Julia code for the set of whenStatements in the when equation.
-   There are some constructs that may only occur in a when equations.
-"""
-function createWhenStatements(whenStatements, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
-  local res::Array{Expr} = []
-  local nWhenStatements = 0
-  for _ in whenStatements
-    nWhenStatements += 1
-  end
-  @debug "[CODEGEN: when] createWhenStatements" statements=nWhenStatements
-  for wStmt in whenStatements
-    local isAssign = wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN
-    local isReinit = wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
-    if isAssign && wStmt.left isa DAE.TUPLE
-      local tupSym = gensym(:tupResult)
-      local rhsExpr = expToJuliaExp(wStmt.right, simCode)
-      push!(res, :(local $tupSym = $rhsExpr))
-      local i = 0
-      for elem in wStmt.left.PR
-        i += 1
-        _emitWhenTupleElementAssign!(res, elem, :($tupSym[$i]), simCode)
-      end
-    elseif isAssign
-      # SimulationCode.ASSIGN.left is ::Exp post-migration; HT keys are DAE-stringified.
-      (index, var) = simCode.stringToSimVarHT[SimulationCode.string(SimulationCode.toDAEExp(wStmt.left))]
-      if typeof(var.varKind) === SimulationCode.STATE
-        exp1 = expToJuliaExp(wStmt.left, simCode, varPrefix="integrator.u")
-        exp2 = expToJuliaExp(wStmt.right, simCode)
-        push!(res, :($(exp1) = $(exp2)))
-      elseif typeof(var.varKind) === SimulationCode.ALG_VARIABLE
-        exp1 = expToJuliaExp(wStmt.left, simCode, varPrefix="reals")
-        exp2 = expToJuliaExp(wStmt.right, simCode)
-        push!(res, :($(exp1) = $(exp2)))
-      elseif var.varKind isa SimulationCode.DISCRETE || var.varKind isa SimulationCode.PARAMETER
-        exp1 = expToJuliaExp(wStmt.left, simCode)
-        exp2 = expToJuliaExp(wStmt.right, simCode)
-        push!(res, :($(exp1) = $(exp2)))
-      end
-    elseif isReinit
-      (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]
-      if typeof(var.varKind) === SimulationCode.STATE
-        push!(res, quote
-                integrator.u[$(index)] = $(expToJuliaExp(wStmt.value, simCode))
-              end)
-      elseif var.varKind isa SimulationCode.ALG_VARIABLE
-        push!(res, quote
-                integrator.u[$(index)] = $(expToJuliaExp(wStmt.value, simCode))
-              end)
-      else
-        throw("Unimplemented branch for: $(var.varKind)")
-      end
-    else
-      throw(ErrorException("$whenStatements in @__FUNCTION__ not supported"))
-    end
-  end
-  return res
-end
-
-#=
-  Recursively unpack a tuple-LHS element into per-cref Julia assignments.
-  `lhs` is one element of a DAE.TUPLE LHS (CREF, ARRAY, or WILD).
-  `rhsAccess` is the Julia Expr that pulls this element out of the tuple temp,
-  e.g. `tup[1]` or `tup[2][3]`. Output Julia LHS form is selected by the SimVar's
-  varKind, matching the single-cref BDAE.ASSIGN arm above.
-=#
-function _emitWhenTupleElementAssign!(res::Vector{Expr}, lhs::DAE.Exp,
-                                       rhsAccess, simCode::SimulationCode.SIM_CODE)
-  @match lhs begin
-    DAE.CREF(DAE.WILD(), _) => nothing
-    DAE.CREF(__) => begin
-      local name = SimulationCode.string(lhs)
-      local entry = get(simCode.stringToSimVarHT, name, nothing)
-      if entry === nothing
-        push!(res, :($(Symbol(name)) = $rhsAccess))
-        return res
-      end
-      local (index, var) = entry
-      local lhsJulia = if typeof(var.varKind) === SimulationCode.STATE
-        :(integrator.u[$index])
-      elseif typeof(var.varKind) === SimulationCode.ALG_VARIABLE
-        :(reals[$index])
-      else
-        Symbol(name)
-      end
-      push!(res, :($lhsJulia = $rhsAccess))
-    end
-    DAE.ARRAY(_, _, elements) => begin
-      local i = 0
-      for elem in elements
-        i += 1
-        _emitWhenTupleElementAssign!(res, elem, :($rhsAccess[$i]), simCode)
-      end
-    end
-    _ => throw(ErrorException("createWhenStatements: unsupported tuple-LHS element $lhs"))
-  end
-  return res
-end
 
 """
   Converts a DAE expression into a Julia expression

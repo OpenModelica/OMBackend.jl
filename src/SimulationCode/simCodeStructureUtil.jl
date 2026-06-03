@@ -219,6 +219,8 @@ toSimExp(e::DAE.RECORD)::Exp =
          String[string(n) for n in e.comp], e.ty)
 toSimExp(e::DAE.TUPLE)::Exp =
   TUPLE(Exp[toSimExp(x) for x in e.PR])
+toSimExp(e::DAE.REDUCTION)::Exp =
+  REDUCTION(e.reductionInfo, toSimExp(e.expr), e.iterators)
 
 """
     toDAEExp(e::Exp) -> DAE.Exp
@@ -274,6 +276,8 @@ toDAEExp(e::RECORD)::DAE.Exp =
              toDAEType(e.ty))
 toDAEExp(e::TUPLE)::DAE.Exp =
   DAE.TUPLE(MetaModelica.list((toDAEExp(x) for x in e.PR)...))
+toDAEExp(e::REDUCTION)::DAE.Exp =
+  DAE.REDUCTION(e.info, toDAEExp(e.body), e.iterators)
 
 #= Exp ty-field boundary constructors: accept a DAE.Type and wrap via toSimType,
    so toSimExp and any call site handing in a DAE.Type keep working unchanged. =#

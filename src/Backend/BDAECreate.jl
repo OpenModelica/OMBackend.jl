@@ -223,15 +223,9 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
     end
   end
   #= §17.4.4: lift discrete (Bool/Int/enum) equation-section definitions whose RHS
-     is a discrete-time relation expression into event-driven held discretes, so the
-     continuous integrator never interpolates step-valued logic. WORK IN PROGRESS:
-     the synthesised when-equations currently route through the legacy CallbackSet,
-     which cannot read MTK observed variables (the relation operands), so the
-     event does not fire for conditions over algebraic/eliminated vars. Gated OFF
-     by default until the codegen routes these through MTK SymbolicContinuousCallbacks.
-     Enable for development with OMBACKEND_DISCRETE_BOOL_LIFT=true. =#
-  if lowercase(get(ENV, "OMBACKEND_DISCRETE_BOOL_LIFT", "false")) in ("true", "1", "yes") &&
-     !isempty(equations) && !isempty(variables)
+     is a discrete-time relation into event-driven held discretes, so the
+     continuous integrator never interpolates step-valued logic. =#
+  if !isempty(equations) && !isempty(variables)
     local _discParamConst = _collectParamOrConstNames(variables)
     local _discStarts = _discreteStartExpLookup(variables)
     local (_discEqs, _discLifted) = synthesizeWhenEquationsFromDiscreteEquations(equations, _discParamConst, _discStarts)
@@ -1364,7 +1358,7 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
        emitted above continue to handle real time-event crossings later
        in the simulation. =#
     if !_isSingleStraightDiscreteAssign(daeStmts)
-      _liftAlgorithmBodyToInitialWhen!(out, daeStmts, alg.source, liftedLhsNames)
+      _liftAlgorithmBodyToInitialWhen!(out, daeStmts, alg.source, liftedLhsNames, paramOrConstNames)
     end
     #= Per-statement lifting via `_liftAlgAssignToInitialWhen!` and
        `_liftAlgIfToWhen!` covers every shape the cluster-A Digital examples
@@ -1753,7 +1747,8 @@ end
 Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BDAE.Equation},
                                                                   daeStmts,
                                                                   @nospecialize(source),
-                                                                  liftedLhsNames::Set{String})
+                                                                  liftedLhsNames::Set{String},
+                                                                  paramOrConstNames::Set{String} = Set{String}())
   local initOps, initLhs = _buildAlgorithmBodyOps(daeStmts, true)
   local runOps, runLhs = _buildAlgorithmBodyOps(daeStmts, false)
   union!(liftedLhsNames, initLhs)
@@ -1779,8 +1774,40 @@ Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BD
      would stay pinned at its t=0 value (out = 13) even after `trigger`
      becomes 7 at t=0.5. =#
   local discRhsCrefs = _collectDiscreteRhsCrefsFromWhenOps(runOps, runLhs)
-  if !isempty(runOps) && !isempty(discRhsCrefs)
-    local cond = _buildChangeOrCondition(discRhsCrefs)
+  #= Source-style bodies (Sources.Table/Step/Pulse) have the shape
+     `y := y0; y := IFEXP(time>=t[i], x[i], y)`. Their event sources are the
+     `time>=t[i]` RELATIONS in the IFEXP conditions, not the seed cref — so also
+     trigger on `change(rel)` for every body relation with a continuous operand.
+     Without this a body whose only discrete RHS cref is the constant seed (y0)
+     gets a dead `change(<param>)` trigger and never fires. =#
+  local relTriggers = DAE.Exp[]
+  local relSeen = Set{String}()
+  for op in runOps
+    @match op begin
+      BDAE.ASSIGN(_, rhs, _) => begin
+        for r in _collectRelationsInExp(rhs)
+          _relationHasContinuousOperand(r, paramOrConstNames) || continue
+          local k = string(r)
+          k in relSeen && continue
+          push!(relSeen, k)
+          push!(relTriggers, r)
+        end
+      end
+      _ => nothing
+    end
+  end
+  local changeCalls = DAE.Exp[]
+  for cr in discRhsCrefs
+    push!(changeCalls, _makeChangeCall(cr))
+  end
+  for r in relTriggers
+    push!(changeCalls, _makeChangeCallExp(r))
+  end
+  if !isempty(runOps) && !isempty(changeCalls)
+    local cond = changeCalls[1]
+    for i in 2:length(changeCalls)
+      cond = DAE.LBINARY(cond, DAE.OR(DAE.T_BOOL_DEFAULT), changeCalls[i])
+    end
     push!(out, BDAE.WHEN_EQUATION(
       length(runOps),
       BDAE.WHEN_STMTS(cond, MetaModelica.list(runOps...), NONE()),

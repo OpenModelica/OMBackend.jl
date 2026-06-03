@@ -128,6 +128,11 @@ function _traverseChildrenTopDown(e::ASUB, visitor, arg)
   end
   return (ASUB(nex, out), a)
 end
+# Reduction: only the body is SimCode-recursive; info/iterators are opaque.
+function _traverseChildrenTopDown(e::REDUCTION, visitor, arg)
+  (nb, a) = traverseExpTopDown(e.body, visitor, arg)
+  return (nb === e.body ? e : REDUCTION(e.info, nb, e.iterators), a)
+end
 
 # -------------------- traverseExpBottomUp --------------------
 
@@ -233,4 +238,8 @@ function _traverseChildrenBottomUp(e::ASUB, visitor, arg)
     push!(out, ns)
   end
   return (ASUB(nex, out), a)
+end
+function _traverseChildrenBottomUp(e::REDUCTION, visitor, arg)
+  (nb, a) = traverseExpBottomUp(e.body, visitor, arg)
+  return (nb === e.body ? e : REDUCTION(e.info, nb, e.iterators), a)
 end

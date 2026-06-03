@@ -804,10 +804,24 @@ Vararg subscripts to support both vectors and N-dimensional arrays.
 struct ConstTableLookupFn{A <: AbstractArray}
   table::A
 end
+
+#= Primal value of a table index. A constant table lookup is piecewise-constant
+   in its (discrete/enum) index, so an autodiff `Dual` index must collapse to its
+   primal before rounding to an integer: this both avoids `Float64(::Dual)` in the
+   nonlinear-solve Jacobian and gives the lookup an identically-zero derivative
+   w.r.t. the index (the returned table entry carries no partials). Dependency-free
+   so OMBackend need not depend on ForwardDiff; `Dual` exposes a `.value` field. =#
+function _primalValue(@nospecialize(v))
+  v isa Integer && return v
+  v isa AbstractFloat && return v
+  hasproperty(v, :value) && return _primalValue(getproperty(v, :value))
+  return Float64(v)
+end
+
 function (c::ConstTableLookupFn)(rt_idxs...)
   local resolved = ntuple(length(rt_idxs)) do k
     local v = rt_idxs[k]
-    local raw = v isa Integer ? Int(v) : Int(round(Float64(v)))
+    local raw = v isa Integer ? Int(v) : Int(round(_primalValue(v)))
     clamp(raw, 1, size(c.table, k))
   end
   return c.table[resolved...]
@@ -843,7 +857,7 @@ function _toIndex(v)
   if v isa Integer
     return Int(v)
   else
-    return Int(round(Float64(v)))
+    return Int(round(_primalValue(v)))
   end
 end
 

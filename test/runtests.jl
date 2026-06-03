@@ -350,4 +350,7 @@ import .ExampleDAEs
   #= ── 6. SimCode Exp traversal + alias substitution ────────────── =#
   include("simCodeTraverseTests.jl")
 
+  #= ── 7. Discrete-dummy demotion planning ──────────────────────── =#
+  include("discreteDummyDemotionTests.jl")
+
 end

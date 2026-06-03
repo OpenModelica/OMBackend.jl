@@ -900,8 +900,9 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
       end
       DAE.LUNARY(operator = op, exp = e1)  => begin
         local operand = expToJuliaExpAlg(e1)
-        local op = CodeGeneration.DAE_OP_toJuliaOperator(op)
-        :($op($(operand)))
+        local opSym = CodeGeneration.DAE_OP_toJuliaOperator(op)
+        # Boolean discretes read back from state are 0/1 numbers; coerce before logical not.
+        :($opSym($(operand) != 0))
       end
       DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
         local lhs = expToJuliaExpAlg(e1)
@@ -934,6 +935,11 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
             $(elseExp)
           end
         end
+      end
+      DAE.CALL(path = Absyn.IDENT("pre"), expLst = explst) => begin
+        #= pre(x) in an (initial) algorithm body equals the sequentially-seeded
+           held value; unwrap to the argument, as the MTK expression path does. =#
+        expToJuliaExpAlg(first(explst))
       end
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst, attr = attr)  => begin
         local funcSym = Symbol(tmpStr)

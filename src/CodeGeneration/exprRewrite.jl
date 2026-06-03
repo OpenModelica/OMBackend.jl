@@ -268,8 +268,15 @@ variables. Returns the filtered equation list and an alias map
 `A => canonical` so callers can drop the aliased symbols from variable lists.
 
 Chain A → B → C is resolved to A → C before substitution.
+
+`preferKeep` names a set of symbols that must survive as the canonical
+representative of their alias component (e.g. discretes referenced in an
+event condition, whose name the generated callback reads from the state
+vector). When a component contains such a symbol it is forced to be the
+root so it is never substituted away.
 """
-function eliminateIfEqRelays(equations::Vector{Expr})
+function eliminateIfEqRelays(equations::Vector{Expr};
+                             preferKeep::Set{Symbol} = Set{Symbol}())
     #= Union-find (not a plain map): a variable that is the leaf-alias LHS of two
        relays (`A~B`, `A~C`) means A≡B≡C; a `raw[k]=v` map overwrites and drops one
        side, disconnecting it from its definer. Union-find keeps the component intact. =#
@@ -297,6 +304,22 @@ function eliminateIfEqRelays(equations::Vector{Expr})
         end
     end
     isempty(parent) && return (equations, Dict{Symbol,Symbol}())
+    #= Re-root any component that contains a preferKeep symbol onto that symbol,
+       so the alias map substitutes the other members toward it. =#
+    if !isempty(preferKeep)
+        local rootOf = Dict{Symbol,Symbol}()
+        for k in keys(parent)
+            local r = getroot(k)
+            if k in preferKeep && !haskey(rootOf, r)
+                rootOf[r] = k
+            end
+        end
+        for (r, keep) in rootOf
+            r == keep && continue
+            parent[r] = keep
+            parent[keep] = keep
+        end
+    end
     local alias = Dict{Symbol,Symbol}()
     for k in keys(parent)
         local r = getroot(k)

@@ -432,6 +432,32 @@ function _scanDefinitionalPinning(equations::Vector{Expr},
   return (aliasPinned, comparisonPinned)
 end
 
+#= Discrete names a residual `0 ~ disc ± rhs` actually defines (the discrete is
+   a top-level operand of the subtraction/sum, or `0 ~ -disc`). Only such
+   discretes may be demoted by the heuristic excess fill: removing the
+   `der(d) ~ 0` dummy of a discrete no residual defines strands it with no
+   equation, leaving the system under-determined. =#
+function _residualDefinedDiscretes(equations::Vector{Expr}, discreteSet::Set{String})::Set{String}
+  local defined = Set{String}()
+  for eq in equations
+    if eq isa Expr && eq.head === :call && length(eq.args) == 3 &&
+       eq.args[1] === :~ && eq.args[2] == 0
+      local rhs = _unwrap(eq.args[3])
+      rhs isa Expr || continue
+      if rhs.head === :call && length(rhs.args) == 3 && (rhs.args[1] === :- || rhs.args[1] === :+)
+        for operand in (rhs.args[2], rhs.args[3])
+          local nm = _refName(_unwrap(operand))
+          (nm !== nothing && nm in discreteSet) && push!(defined, nm)
+        end
+      elseif rhs.head === :call && length(rhs.args) == 2 && rhs.args[1] === :-
+        local nm = _refName(_unwrap(rhs.args[2]))
+        (nm !== nothing && nm in discreteSet) && push!(defined, nm)
+      end
+    end
+  end
+  return defined
+end
+
 #= Collect every if-equation target LHS (`ifEq_tmpN ~ ifelse(...)`).
    These names drive the `_matchConditionalTargetDefinedDiscrete`
    pattern. =#
@@ -554,12 +580,16 @@ function planDemotions(simCode,
   #= Heuristic excess fill: sort remaining discretes by residual mention
      count, take the most-mentioned ones up to `excess`. =#
   if excess > 0
+    local residualDefined = _residualDefinedDiscretes(equations, discreteSet)
     local eqStrings = [string(eq) for eq in equations]
     local mentions = Tuple{String, Int}[]
     for dv in discreteVariables
       dv in toDemote && continue
       dv in whenAssignedSet && continue
+      #= Only demote a discrete some residual actually defines; demoting one that
+         is merely an input strands it with no equation (under-determination). =#
       local dvSym = string(Symbol(dv))
+      dvSym in residualDefined || continue
       local n = count(s -> equationMentionsVariableName(s, dvSym), eqStrings)
       n > 0 && push!(mentions, (dv, n))
     end

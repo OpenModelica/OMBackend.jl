@@ -230,6 +230,17 @@ struct TUPLE <: Exp
   PR::Vector{Exp}
 end
 
+"Reduction / array comprehension `op(body for it in range, …)` (sum/product/
+array/min/max). Only the `body` is the SimCode-recursive part; `info`
+(DAE.ReductionInfo) and `iterators` (DAE.ReductionIterator list) are kept
+opaque for faithful round-trip back to DAE.REDUCTION, which the codegen
+consumes directly via toDAEExp."
+struct REDUCTION <: Exp
+  info::Any
+  body::Exp
+  iterators::Any
+end
+
 #= ---- Equation hierarchy ----
 
    SimCode-native equation types. The goal is to give SimCode its own
