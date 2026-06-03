@@ -1606,22 +1606,14 @@ function getFixedStartConstraintsMTK(vars::Vector, simCode::SimulationCode.SIM_C
     return result
   end
   local ht::Dict = simCode.stringToSimVarHT
-  local probe = Tuple{String, String, String}[]
   for var in vars
     (index, simVar) = ht[var]
     local varName = simVar.name
     local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
     local startExp = @match optAttributes begin
-      SOME(attributes) => begin
-        local startStr = string(attributes.start)
-        local fixedStr = string(attributes.fixed)
-        if occursin("Inertia_w", varName) || occursin("Inertia_phi", varName) || occursin("Cylinder_s", varName)
-          push!(probe, (varName, startStr, fixedStr))
-        end
-        @match (attributes.start, attributes.fixed) begin
-          (SOME(s), SOME(DAE.BCONST(true))) => s
-          _ => nothing
-        end
+      SOME(attributes) => @match (attributes.start, attributes.fixed) begin
+        (SOME(s), SOME(DAE.BCONST(true))) => s
+        _ => nothing
       end
       _ => nothing
     end

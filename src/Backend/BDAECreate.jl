@@ -260,22 +260,36 @@ end
   Keeps the first occurrence of each uniquely-named variable.
 """
 function deduplicateVariables(variables::Vector)::Vector
-  local seen = Set{String}()
+  local idxByName = Dict{String, Int}()
   local unique_vars = similar(variables, 0)
   local duplicateCount = 0
   for v in variables
     local varStr = string(v.varName)
-    if varStr in seen
+    local existing = get(idxByName, varStr, 0)
+    if existing != 0
       duplicateCount += 1
+      #= Connect/alias expansion can emit an attribute-less same-named copy; prefer
+         the copy carrying the declared start/fixed so the initial condition survives. =#
+      if !_varHasStartOrFixed(unique_vars[existing]) && _varHasStartOrFixed(v)
+        unique_vars[existing] = v
+      end
       continue
     end
-    push!(seen, varStr)
     push!(unique_vars, v)
+    idxByName[varStr] = length(unique_vars)
   end
   if duplicateCount > 0
     println("[dedup] Variables: $(length(variables)) -> $(length(unique_vars)) (removed $duplicateCount duplicates)")
   end
   return unique_vars
+end
+
+function _varHasStartOrFixed(v)::Bool
+  local o = v.values
+  o isa SOME || return false
+  local a = o.data
+  return (hasproperty(a, :start) && getproperty(a, :start) isa SOME) ||
+         (hasproperty(a, :fixed) && getproperty(a, :fixed) isa SOME)
 end
 
 """

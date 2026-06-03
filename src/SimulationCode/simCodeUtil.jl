@@ -5910,6 +5910,10 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
      variable. =#
   local claimed = Set{String}()
   local repSet = Set{String}()
+  #= Lift the eliminated member's start / fixed / stateSelect onto the surviving
+     representative, mirroring eliminateAliasVariables, so a user IC on an
+     RHS-equivalent alias (e.g. a connector velocity) is not lost. =#
+  local repAttrUpdates = Dict{String, Any}()
 
   for (_key, entries) in pairs(rhsGroups)
     length(entries) >= 2 || continue
@@ -5969,6 +5973,8 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
       end
       local aliasNeg = xor(entryNeg, repNeg)
       aliasMap[n] = (repName, aliasNeg, repCref, repTy)
+      local repCurrentAttr = get(repAttrUpdates, repName, repSv.attributes)
+      repAttrUpdates[repName] = _mergeAliasAttrs(repCurrentAttr, sv.attributes, aliasNeg)
       push!(aliasEntries, AliasEntry(n, repName, aliasNeg))
       push!(removeEqs, eqIdx)
       push!(elimVarOrder, n)
@@ -6060,6 +6066,14 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   local elimVarSet = Set{String}(keys(aliasMap))
   for varName in keys(aliasMap)
     delete!(newHT, varName)
+  end
+  #= Apply lifted attributes onto the surviving representatives. =#
+  for (repName, newAttr) in repAttrUpdates
+    haskey(newHT, repName) || continue
+    local (rIdx, rOldSv) = newHT[repName]
+    if newAttr !== rOldSv.attributes
+      newHT[repName] = (rIdx, SIMVAR(rOldSv.name, rOldSv.index, rOldSv.varKind, newAttr))
+    end
   end
 
   @assign begin

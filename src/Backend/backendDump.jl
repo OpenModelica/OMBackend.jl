@@ -126,16 +126,40 @@ function stringTraverse(in, str)::String
 end
 
 function Base.string(var::BDAE.VAR)::String
-  str = string(var.varType) * " " * string(var.varName) * " | " * string(var.varKind)
-  str *= begin
-    local exp::DAE.Exp
-    @match var.bindExp begin
-      SOME(exp) => begin " | Binding: " + string(exp) end
-      _ => begin "" end
-    end
+  local bindStr = @match var.bindExp begin
+    SOME(exp) => " | Binding: " * string(exp)
+    _ => ""
   end
-  str *= " | Array-dimensions:" * string(var.arryDim)
-  return str + "\n"
+  return string(var.varType) * " " * string(var.varName) * " | " * string(var.varKind) *
+         bindStr * _dumpVarAttributes(var.values) *
+         " | Array-dimensions:" * string(var.arryDim) * "\n"
+end
+
+#= Render the start/fixed/stateSelect (and min/max/nominal) carried on the
+   attribute bundle so a pass that drops an initial-condition attribute is
+   visible in the variable dumps, not just the equation list. =#
+_attrOptStr(label, opt)::String = @match opt begin
+  SOME(v) => label * "=" * string(v) * ", "
+  _ => ""
+end
+
+function _dumpVarAttributes(values)::String
+  local s = @match values begin
+    SOME(a) where a isa DAE.VAR_ATTR_REAL =>
+      _attrOptStr("start", a.start) * _attrOptStr("fixed", a.fixed) *
+      _attrOptStr("stateSelect", a.stateSelectOption) * _attrOptStr("min", a.min) *
+      _attrOptStr("max", a.max) * _attrOptStr("nominal", a.nominal)
+    SOME(a) where a isa DAE.VAR_ATTR_INT =>
+      _attrOptStr("start", a.start) * _attrOptStr("fixed", a.fixed) *
+      _attrOptStr("min", a.min) * _attrOptStr("max", a.max)
+    SOME(a) where a isa DAE.VAR_ATTR_BOOL =>
+      _attrOptStr("start", a.start) * _attrOptStr("fixed", a.fixed)
+    SOME(a) where a isa DAE.VAR_ATTR_ENUMERATION =>
+      _attrOptStr("start", a.start) * _attrOptStr("fixed", a.fixed) *
+      _attrOptStr("min", a.min) * _attrOptStr("max", a.max)
+    _ => ""
+  end
+  return isempty(s) ? "" : " | Attr: " * rstrip(c -> (c == ',' || c == ' '), s)
 end
 
 Base.@nospecializeinfer function Base.string(@nospecialize(varKind::BDAE.VarKind))::String
