@@ -85,10 +85,17 @@ function qualifyModelicaFunctions!(expr::Expr, funcNames::Set{Symbol})
        the previous recursive walker past Julia's runtime stack guard, firing
        SIGSEGV recoveries that cost ~30ms each. A worklist keeps the call
        depth flat regardless of AST shape. =#
+    #= Dedup by object identity: the generated model Expr is a DAG with heavy
+       sub-Expr sharing, so a plain worklist re-expands shared nodes
+       exponentially. Visiting each unique node once is sufficient (the rewrite
+       mutates the shared object in place, visible through every reference). =#
     local worklist = Any[expr]
+    local visited = Base.IdSet{Any}()
     while !isempty(worklist)
         local e = pop!(worklist)
         e isa Expr || continue
+        e in visited && continue
+        push!(visited, e)
         if e.head == :call && length(e.args) >= 1
             if e.args[1] isa Symbol && e.args[1] in funcNames
                 e.args[1] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(e.args[1]))

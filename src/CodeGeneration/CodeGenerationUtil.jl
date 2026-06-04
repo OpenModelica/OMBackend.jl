@@ -114,7 +114,56 @@ TODO:
     to negative..
     Fix this.
 """
+#= integer(X) is a step (often CAST to real); a continuous zero-crossing on it never
+   triggers, so `when integer(X) ⋛ Y` freezes (e.g. Modelica.Blocks.Sources.Pulse).
+   Unwrap an optional CAST and return the integer() argument, else nothing. =#
+function _zcIntArg(@nospecialize(e::DAE.Exp))
+  local inner = @match e begin
+    DAE.CAST(exp = c) => c
+    _ => e
+  end
+  @match inner begin
+    DAE.CALL(path = Absyn.IDENT("integer"), expLst = args) => listHead(args)
+    _ => nothing
+  end
+end
+
+#= Rewrite a relation with an integer() operand to a smooth zero-crossing on X:
+   floor(X) ⋛ Y ⟺ X ⋛ Y±1 for integer-valued Y. Returns the zero-crossing or nothing. =#
+function _zcRewriteIntegerRel(@nospecialize(cond::DAE.Exp))
+  @match cond begin
+    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
+      local x1 = _zcIntArg(e1)
+      local x2 = _zcIntArg(e2)
+      (x1 === nothing && x2 === nothing) && return nothing
+      local one = DAE.RCONST(1.0)
+      local S = DAE.SUB(DAE.T_REAL_DEFAULT)
+      local A = DAE.ADD(DAE.T_REAL_DEFAULT)
+      if x1 !== nothing
+        @match op begin
+          DAE.GREATER(__)   => DAE.BINARY(DAE.BINARY(e2, A, one), S, x1)
+          DAE.GREATEREQ(__) => DAE.BINARY(e2, S, x1)
+          DAE.LESS(__)      => DAE.BINARY(x1, S, e2)
+          DAE.LESSEQ(__)    => DAE.BINARY(x1, S, DAE.BINARY(e2, A, one))
+          _ => nothing
+        end
+      else
+        @match op begin
+          DAE.LESS(__)      => DAE.BINARY(DAE.BINARY(e1, A, one), S, x2)
+          DAE.LESSEQ(__)    => DAE.BINARY(e1, S, x2)
+          DAE.GREATER(__)   => DAE.BINARY(x2, S, e1)
+          DAE.GREATEREQ(__) => DAE.BINARY(x2, S, DAE.BINARY(e1, A, one))
+          _ => nothing
+        end
+      end
+    end
+    _ => nothing
+  end
+end
+
 function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DAE.Exp))::DAE.Exp
+  local _intRW = _zcRewriteIntegerRel(conditonalExpression)
+  _intRW !== nothing && return _intRW
   #= Build a Real-valued zero-crossing function f such that the Modelica
      condition becomes true exactly when f goes from positive to negative
      (the SciML `affect!` direction). For `<` / `<=` we use `e1 - e2` so the
@@ -434,13 +483,20 @@ function _iterativePostwalk(f, root)
   isa(root, Expr) || return f(root)
   local todo = Any[(root, false)]
   local newMap = Base.IdDict{Any,Any}()
+  #= Dedup by object identity: generated ASTs are DAGs with shared sub-Expr
+     nodes, so expanding every reference re-walks shared subtrees and blows up
+     exponentially. Each unique node is expanded and rebuilt once; `f` is a pure
+     function of the node, so all references resolve to the same cached result. =#
+  local expanded = Base.IdSet{Any}()
   while !isempty(todo)
     local (node, processedChildren) = pop!(todo)
     if !(node isa Expr)
-      newMap[node] = f(node)
+      haskey(newMap, node) || (newMap[node] = f(node))
       continue
     end
     if !processedChildren
+      node in expanded && continue
+      push!(expanded, node)
       push!(todo, (node, true))
       for a in node.args
         push!(todo, (a, false))

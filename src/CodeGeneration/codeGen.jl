@@ -319,6 +319,19 @@ function createParameterEquations(parameters::Array, simCode::SimulationCode.Sim
 end
 
 
+#= Build `name = <state/param lookup index>` pre-bindings for the crefs a when
+   callback reads. Skips crefs absent from the simvar table: those are inlined
+   constants (e.g. a logic ResetMap[i] element) that expToJulia emits as literals,
+   so requesting a state/param index for them would KeyError in getIdxForLookupMTK. =#
+function _whenLookupBindings(crefs, simCode)::Vector{Expr}
+  local out = Expr[]
+  for x in collect(map(identity, crefs))
+    haskey(simCode.stringToSimVarHT, string(x)) || continue
+    push!(out, Expr(:(=), Symbol(string(x)), getIdxForLookupMTK(x, simCode)))
+  end
+  return out
+end
+
 """
   This function creates a representation of a when equation in Julia.
 """
@@ -382,10 +395,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
               lookuptableStates = cached[1]
               lookuptableParams = cached[2]
             end
-            $(map(x -> Expr(Symbol("="),
-                            Symbol(string(x)),
-                            getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
-                  Util.getAllCrefs(cond))...)
+            $(_whenLookupBindings(Util.getAllCrefs(cond), simCode)...)
             $(expToJuliaExpMTK(cond, simCode))
           end
         end
@@ -407,14 +417,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
               lookuptableStates = cached[1]
               lookuptableParams = cached[2]
             end
-            $(map(x -> Expr(Symbol("="),
-                            Symbol(string(x)),
-                            getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
-                  vcat(
+            $(_whenLookupBindings(vcat(
                     listArray(Util.getAllCrefs(wEqCondDAE)),
                     vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...),
                     vcat(map(x -> getRHSVariables(x), _elsewhenStmtLst(elsePart))...)
-                  ))...)
+                  ), simCode)...)
             if integrator.dt == 0.0
               @error "integrator.dt was zero. Aborting."
               fail()
@@ -466,10 +473,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
               lookuptableStates = cached[1]
               lookuptableParams = cached[2]
             end
-            $(map(x -> Expr(Symbol("="),
-                            Symbol(string(x)),
-                            getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
-                  Util.getAllCrefs(cond))...)
+            $(_whenLookupBindings(Util.getAllCrefs(cond), simCode)...)
             local _result = $(expToJuliaExpMTK(cond, simCode))
             @debug "[CB-CC$($(callbacks)) cond] eval" t value=_result
             _result
@@ -496,10 +500,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
               lookuptableStates = cached[1]
               lookuptableParams = cached[2]
             end
-            $(map(x->Expr(Symbol("="),
-                          Symbol(string(x)),
-                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)) ,
-                  vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...))...)
+            $(_whenLookupBindings(vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...), simCode)...)
             if integrator.dt == 0.0
               @error "integrator.dt was zero. Aborting."
               fail()
@@ -555,10 +556,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
             lookuptableStates = cached[1]
             lookuptableParams = cached[2]
           end
-          $(map(x -> Expr(Symbol("="),
-                          Symbol(string(x)),
-                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
-                vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...))...)
+          $(_whenLookupBindings(vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...), simCode)...)
           $(whenStatementsMTKPeriodic...)
         end
       end
@@ -671,10 +669,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           else
             _changePreValues = _changeCache[]
           end
-          $(map(x -> Expr(Symbol("="),
-                          Symbol(string(x)),
-                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
-                Util.getAllCrefs(cond))...)
+          $(_whenLookupBindings(Util.getAllCrefs(cond), simCode)...)
           local _result = $(expToJuliaBoolMTK(wEqCondDAE, simCode; cachedChange = true))
           @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
           #= DiscreteCallback condition must return Bool per SciMLBase. Modelica
@@ -704,10 +699,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
             lookuptableStates = cached[1]
             lookuptableParams = cached[2]
           end
-          $(map(x -> Expr(Symbol("="),
-                          Symbol(string(x)),
-                          getIdxForLookupMTK(x::Union{DAE.CREF, DAE.ComponentRef}, simCode)),
-                vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...))...)
+          $(_whenLookupBindings(vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...), simCode)...)
           $(whenStatementsMTKDiscrete...)
           auto_dt_reset!(integrator)
           add_tstop!(integrator, integrator.t + 1E-12)

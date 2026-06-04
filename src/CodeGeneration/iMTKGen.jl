@@ -21,6 +21,9 @@ const DUMP_ENABLED = Ref(false)
 const BUILT           = Dict{String, Tuple}()
 const REDUCED_SYSTEMS = Dict{String, Any}()
 const DUMP_PATHS      = Dict{String, String}()
+#= Debug hook: when OMJL_STASH_MODELCODE is set, stash the generated model Expr
+   and skip Core.eval. Lets a caller inspect a model that OOMs at eval/simplify. =#
+const LAST_MODELCODE  = Ref{Any}(nothing)
 
 @inline _OMBackend() = parentmodule(CodeGeneration)
 
@@ -58,6 +61,11 @@ function _buildAndCache(modelName::String, modelCode::Expr)
   local OMB = _OMBackend()
   local cname = OMB.canonicalName(modelName)
   try
+    if get(ENV, "OMJL_STASH_MODELCODE", "") != ""
+      LAST_MODELCODE[] = modelCode
+      @info "[IMTK GEN] modelCode stashed; skipping Core.eval (OMJL_STASH_MODELCODE)" model = modelName
+      return
+    end
     if get(ENV, "OMJL_DUMP_IMTK_SRC", "") != ""
       try
         write("/tmp/imtk_$(cname).jl", string(modelCode))

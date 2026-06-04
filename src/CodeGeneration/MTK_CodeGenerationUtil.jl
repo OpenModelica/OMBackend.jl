@@ -1025,7 +1025,10 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
            Neither short-circuit (&&/||) nor bitwise (|/&) work reliably with Symbolics.jl
            due to type mismatches between Bool, Num, and BasicSymbolic{Real}. =#
         @match op begin
-          DAE.OR(__) => :($(lhs) + $(rhs) - $(lhs) * $(rhs))
+          #= Bind both operands once: `a + b - a*b` splices `lhs`/`rhs` twice, so a
+             left-nested OR chain duplicates the accumulator at every step and the
+             generated Expr grows exponentially (Digital RAM/table when-conditions). =#
+          DAE.OR(__) => :(let _a = $(lhs), _b = $(rhs); _a + _b - _a * _b end)
           DAE.AND(__) => :($(lhs) * $(rhs))
           _ => begin
             local opSym = DAE_OP_toJuliaOperator(op)
