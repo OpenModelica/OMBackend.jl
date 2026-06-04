@@ -332,6 +332,248 @@ function _whenLookupBindings(crefs, simCode)::Vector{Expr}
   return out
 end
 
+_isTimeCref(@nospecialize(e)) = @match e begin
+  DAE.CREF(componentRef = cr) => string(cr) == "time"
+  _ => false
+end
+
+#= Extract the constant threshold of a `time <relop> c` relation, or nothing. =#
+function _timeThreshold(@nospecialize(rel), simCode)
+  @match rel begin
+    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
+      local isCmp = @match op begin
+        DAE.LESS(__) => true
+        DAE.LESSEQ(__) => true
+        DAE.GREATER(__) => true
+        DAE.GREATEREQ(__) => true
+        _ => false
+      end
+      isCmp || return nothing
+      local thr = _isTimeCref(e1) ? e2 : (_isTimeCref(e2) ? e1 : nothing)
+      thr === nothing && return nothing
+      local v = try
+        SimulationCode.tryEvalNumeric(thr, simCode)
+      catch
+        nothing
+      end
+      v === nothing ? nothing : Float64[Float64(v)]
+    end
+    _ => nothing
+  end
+end
+
+#= True for `change(p)` where p is a parameter/constant — it never fires, so it
+   contributes no event and does not disqualify a pure time-threshold chain. =#
+function _isConstChangeArg(@nospecialize(a), simCode)
+  @match a begin
+    DAE.CREF(componentRef = cr) => begin
+      local k = string(cr)
+      haskey(simCode.stringToSimVarHT, k) && SimulationCode.isParameter(simCode.stringToSimVarHT[k][2])
+    end
+    DAE.RCONST(_) => true
+    DAE.ICONST(_) => true
+    DAE.BCONST(_) => true
+    _ => false
+  end
+end
+
+#= Detect a synthesized table/time when-condition: an OR-chain whose every leaf is
+   `change(time <relop> const)` (a time threshold) or `change(param)` (never fires).
+   Returns the threshold times (Float64, may be empty) or nothing when the condition
+   has any other trigger. Such whens must fire AT the thresholds via a
+   PresetTimeCallback — a ContinuousCallback rootfinding on the spiky change() value
+   never detects the crossings (Digital.Sources.Table / time-driven sources). =#
+function _collectTimeThresholds(@nospecialize(cond), simCode)
+  @match cond begin
+    DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) => begin
+      local l = _collectTimeThresholds(e1, simCode)
+      local r = _collectTimeThresholds(e2, simCode)
+      (l === nothing || r === nothing) ? nothing : vcat(l, r)
+    end
+    DAE.CALL(Absyn.IDENT("change"), lst, _) => begin
+      local args = listArray(lst)
+      length(args) == 1 || return nothing
+      local thr = _timeThreshold(args[1], simCode)
+      thr !== nothing && return thr
+      _isConstChangeArg(args[1], simCode) ? Float64[] : nothing
+    end
+    _ => nothing
+  end
+end
+
+#= Emit a PresetTimeCallback for a table/time when: fire the (time-dependent) body at
+   each threshold so a stepped output (e.g. a Digital Table) lands on its sample times. =#
+function _emitPresetTimeWhen(eq, simCode, callbacks::Int, thresholds::Vector{Float64})
+  local wEq = eq.whenEquation
+  local whenStmts = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
+  local times = sort(unique(filter(>(0.0), thresholds)))
+  quote
+    let _affCache = Ref{Any}(nothing)
+      global $(Symbol("affect$(callbacks)!"))
+      $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+        local t = integrator.t
+        local x = integrator.u
+        local lookuptableStates
+        local lookuptableParams
+        if _affCache[] === nothing
+          local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+          lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+          lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+          _affCache[] = (lookuptableStates, lookuptableParams)
+        else
+          local cached = _affCache[]
+          lookuptableStates = cached[1]
+          lookuptableParams = cached[2]
+        end
+        $(_whenLookupBindings(bodyCrefs, simCode)...)
+        $(whenStmts...)
+      end
+    end
+    $(Symbol("cb$(callbacks)")) = PresetTimeCallback($(times), $(Symbol("affect$(callbacks)!")))
+  end
+end
+
+_isPreCref(@nospecialize(e)) = @match e begin
+  DAE.CALL(Absyn.IDENT("pre"), _, _) => true
+  _ => false
+end
+
+#= Match `(time - S)/P` (or `time/P`) and return (S, P) as numerics, or nothing. =#
+function _timeOffsetOverPeriod(@nospecialize(e), simCode)
+  @match e begin
+    DAE.BINARY(exp1 = num, operator = DAE.DIV(__), exp2 = per) => begin
+      local p = try SimulationCode.tryEvalNumeric(per, simCode) catch; nothing end
+      p === nothing && return nothing
+      local s = @match num begin
+        DAE.BINARY(exp1 = t, operator = DAE.SUB(__), exp2 = sExp) =>
+          (_isTimeCref(t) ? (try SimulationCode.tryEvalNumeric(sExp, simCode) catch; nothing end) : nothing)
+        _ => (_isTimeCref(num) ? 0.0 : nothing)
+      end
+      s === nothing && return nothing
+      (Float64(s), Float64(p))
+    end
+    _ => nothing
+  end
+end
+
+#= Detect the Modelica Source.Pulse / SignalSource periodic when-condition
+   `integer((time - startTime)/period) <relop> pre(counter)`. Returns
+   (startTime, period) or nothing. Such a condition is a periodic clock — it
+   must fire AT t = startTime + n*period via a PeriodicCallback. The legacy
+   ContinuousCallback rootfinds on the staircase `integer(...) > pre(count)`,
+   a piecewise-constant 0/1 the rootfinder cannot reliably catch, so the
+   pulse counter / T_start freeze (Blocks.Sources.Pulse and machines driven
+   by it). =#
+function _pulsePeriodicSpec(@nospecialize(cond), simCode)
+  @match cond begin
+    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
+      local isGt = @match op begin
+        DAE.GREATER(__) => true
+        DAE.GREATEREQ(__) => true
+        _ => false
+      end
+      isGt || return nothing
+      _isPreCref(e2) || return nothing
+      @match e1 begin
+        DAE.CALL(Absyn.IDENT("integer"), arglst, _) => begin
+          local args = listArray(arglst)
+          length(args) == 1 ? _timeOffsetOverPeriod(args[1], simCode) : nothing
+        end
+        _ => nothing
+      end
+    end
+    _ => nothing
+  end
+end
+
+#= An if-condition that reads a discrete a periodic when updates (e.g. the Pulse
+   `time < T_start + T_width`, T_start set at each period boundary) cannot be
+   refreshed by its own MTK continuous callback: when T_start jumps the
+   zero-crossing expression jumps across 0 with no smooth crossing for the
+   rootfinder to catch. Collect, for each if-condition referencing a variable the
+   when body writes, the assignment that re-derives its `ifCondNI` discrete
+   parameter directly from the (now-current) condition value. The ifCond naming
+   mirrors createIfEquations (`ifCond<sortIndex><branchIndex>`). =#
+function _collectIfCondRefresh(writtenLHS::Set{String}, simCode)
+  local refreshCrefs = Any[]
+  local assigns = Expr[]
+  isempty(simCode.ifEquations) && return (refreshCrefs, assigns)
+  local sortedIfEqs = sort(collect(simCode.ifEquations); by = ifEq -> _ifEquationSortKey(ifEq, simCode))
+  for (identifier, ifEq) in enumerate(sortedIfEqs)
+    local i = 0
+    for branch in ifEq.branches
+      i += 1
+      branch.identifier == -1 && continue
+      local condDAE = SimulationCode.toDAEExp(branch.condition)
+      local cCrefs = listArray(Util.getAllCrefs(condDAE))
+      any(c -> string(c) in writtenLHS, cCrefs) || continue
+      append!(refreshCrefs, cCrefs)
+      local nameSym = Symbol("ifCond$(identifier)$(i)")
+      push!(assigns, quote
+        let _pidx = get(lookuptableParams, $(QuoteNode(nameSym)), nothing)
+          if _pidx !== nothing
+            integrator.p[_pidx] = ($(expToJuliaBoolMTK(condDAE, simCode)) ? 1.0 : 0.0)
+          end
+        end
+      end)
+    end
+  end
+  return (refreshCrefs, assigns)
+end
+
+#= Emit a PeriodicCallback for a Pulse-style periodic when: fire the body at
+   t = startTime + n*period. `phase = startTime` so the first (initial) tick at
+   tspan[1]+startTime is skipped (initial_affect=false) and firing starts at the
+   first period boundary, matching the `integer((time-startTime)/period)`
+   increment. =#
+function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64, period::Float64)
+  local wEq = eq.whenEquation
+  local whenStmts = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
+  local writtenLHS = Set{String}()
+  for wStmt in wEq.whenStmtLst
+    (wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN) || continue
+    for c in listArray(Util.getAllCrefs(SimulationCode.toDAEExp(wStmt.left)))
+      push!(writtenLHS, string(c))
+    end
+  end
+  local (refreshCrefs, refreshAssigns) = _collectIfCondRefresh(writtenLHS, simCode)
+  quote
+    let _affCache = Ref{Any}(nothing)
+      global $(Symbol("affect$(callbacks)!"))
+      $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+        local t = integrator.t
+        local x = integrator.u
+        local lookuptableStates
+        local lookuptableParams
+        if _affCache[] === nothing
+          local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+          lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+          lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+          _affCache[] = (lookuptableStates, lookuptableParams)
+        else
+          local cached = _affCache[]
+          lookuptableStates = cached[1]
+          lookuptableParams = cached[2]
+        end
+        $(_whenLookupBindings(bodyCrefs, simCode)...)
+        $(whenStmts...)
+        #= Re-derive if-conditions that read the discretes just written. =#
+        $(_whenLookupBindings(refreshCrefs, simCode)...)
+        $(refreshAssigns...)
+      end
+    end
+    #= PeriodicCallback requires phase >= 0; mod keeps the same event grid
+       (startTime + n*period) and is identical to startTime for the common
+       0 <= startTime < period case (incl. 0). =#
+    $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), $(period);
+                                                   phase = mod($(startTime), $(period)), initial_affect = false)
+  end
+end
+
 """
   This function creates a representation of a when equation in Julia.
 """
@@ -355,6 +597,21 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     _ => false
   end
   local isContinuousCond::Bool = isContinousCondition(wEqCondDAE, simCode)
+  #= Table / time-driven sources: a when whose condition is purely change(time>=c)
+     thresholds must fire AT those times via PresetTimeCallback — a ContinuousCallback
+     rootfinding on the spiky change() value never detects the crossings. =#
+  if !isPeriodic
+    local _thr = _collectTimeThresholds(wEqCondDAE, simCode)
+    if _thr !== nothing && !isempty(_thr)
+      return _emitPresetTimeWhen(eq, simCode, callbacks, _thr)
+    end
+    #= Source.Pulse periodic clock `integer((time-startTime)/period) > pre(count)`:
+       fire AT the period boundaries via PeriodicCallback. =#
+    local _pulse = _pulsePeriodicSpec(wEqCondDAE, simCode)
+    if _pulse !== nothing && _pulse[2] > 0.0
+      return _emitPulsePeriodicWhen(eq, simCode, callbacks, _pulse[1], _pulse[2])
+    end
+  end
   #= A `sample(start, period)` is a periodic clock even when its interval is a
      parameter, which isContinousCondition mis-flags as continuous; keep all
      samples on the periodic branch. =#

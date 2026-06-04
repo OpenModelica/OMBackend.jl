@@ -1936,13 +1936,24 @@ function createIfEquation(stateVariables::Vector,
         #= Build ImperativeAffect: function returns a NamedTuple of new values.
            modified NamedTuple maps aliases to the symbolic parameter variables.
            Callback fires for every branch condition; ifCondN is the load-bearing
-           branch switch the residual ifelse reads. =#
-        local returnKws::Vector{Expr} = Expr[Expr(:kw, sym, (j == i) ? numVal : invVal) for (j, sym) in enumerate(allIfCondSyms)]
-        local returnNT::Expr = Expr(:tuple, Expr(:parameters, returnKws...))
-        local fExpr::Expr = :((modified, observed, ctx, integrator) -> $returnNT)
+           branch switch the residual ifelse reads.
+
+           Direction-aware toggle: the MTK convention here is `zcLhs < 0` <=>
+           condition TRUE. The positive edge (`affect`, prev_sign < 0) is a
+           true->false transition, the negative edge (`affect_neg`, prev_sign > 0)
+           is false->true. So the firing branch's own ifCond is set false on the
+           positive edge and true on the negative edge. A single constant value
+           cannot toggle a condition that crosses repeatedly (e.g. a Pulse/periodic
+           source waveform). Other branches' ifConds are left at their init value,
+           preserving the previous per-branch behaviour. =#
         local modifiedKws::Vector{Expr} = Expr[Expr(:kw, sym, sym) for sym in allIfCondSyms]
         local modifiedNT::Expr = Expr(:tuple, Expr(:parameters, modifiedKws...))
-        local affectTuple::Expr = :(($(fExpr), $(modifiedNT)))
+        local upKws::Vector{Expr}   = Expr[Expr(:kw, sym, (j == i) ? 0.0 : invVal) for (j, sym) in enumerate(allIfCondSyms)]
+        local downKws::Vector{Expr} = Expr[Expr(:kw, sym, (j == i) ? 1.0 : invVal) for (j, sym) in enumerate(allIfCondSyms)]
+        local upFExpr::Expr   = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, upKws...))))
+        local downFExpr::Expr = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, downKws...))))
+        local affectTuple::Expr     = :(($(upFExpr), $(modifiedNT)))
+        local affectNegTuple::Expr  = :(($(downFExpr), $(modifiedNT)))
         #= When the branch condition depends on a non-lifted algebraic variable
            (an operating-point value `evalInitialCondition` defaulted to 0, e.g.
            an op-amp input voltage), the static initial ifCond can be wrong with
@@ -1971,12 +1982,14 @@ function createIfEquation(stateVariables::Vector,
             local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT); observed = $(initObservedNT)))
             cond = :(ModelingToolkit.SymbolicContinuousCallback(
               ($(mtkCond)) => $(affectTuple);
+              affect_neg = $(affectNegTuple),
               initialize = $(initAffect),
               reinitializealg = SciMLBase.NoInit()
             ))
           else
             cond = :(ModelingToolkit.SymbolicContinuousCallback(
               ($(mtkCond)) => $(affectTuple);
+              affect_neg = $(affectNegTuple),
               reinitializealg = SciMLBase.NoInit()
             ))
           end

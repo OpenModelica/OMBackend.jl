@@ -288,6 +288,13 @@ Base.@nospecializeinfer function replaceIfExpressionWithTmpVar(@nospecialize(exp
     local tick::Ref{Int} = tmpVarToElementAndTick[2]
     local dedup::Dict = tmpVarToElementAndTick[3]
     @match exp begin
+      #= Per Modelica spec, `noEvent(expr)` takes relations literally and
+         triggers no events. An IFEXP inside it must stay inline (codegen emits
+         a continuous ifelse/bool-product) — lifting it to an event-driven
+         IF_EQUATION would latch the branch at the first crossing and break a
+         feedback saturation whose condition never re-crosses zero. Stop
+         descent so the whole noEvent subtree is preserved. =#
+      DAE.CALL(Absyn.IDENT("noEvent"), _, _) => (exp, false, tmpVarToElementAndTick)
       DAE.IFEXP(cond, expThen, expElse) => begin
         #= Recursively process the branches. Use the time-dependent-only
            variant so that nested state-dependent IFEXPs (e.g. LimPID's
@@ -349,6 +356,8 @@ end
 Base.@nospecializeinfer function _replaceTimeDepIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{Dict, Ref{Int}, Dict})
   (newExp, cont, tmpVarToElementAndTick) = begin
     @match exp begin
+      #= See replaceIfExpressionWithTmpVar: never lift inside noEvent. =#
+      DAE.CALL(Absyn.IDENT("noEvent"), _, _) => (exp, false, tmpVarToElementAndTick)
       DAE.IFEXP(cond, expThen, expElse) => begin
         if _expDependsOnTime(cond)
           #= Time-dependent → delegate to the always-lift path. =#
