@@ -84,6 +84,7 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
      here so qualified MSL calls resolve to a stable Julia equivalent rather
      than an unresolved Symbol. =#
   "Modelica_Math_Vectors_length" => :modelica_vectors_length,
+  "Modelica_Math_isEqual"        => :modelica_math_isEqual,
 
   #= --- Array reductions --- =#
   "sum"       => :modelica_sum,
@@ -300,6 +301,9 @@ modelica_cross(x, y) = LinearAlgebra.cross(collect(x), collect(y))
 #= Euclidean norm mirroring MSL Modelica.Math.Vectors.length(v) = sqrt(v*v). =#
 modelica_vectors_length(v::AbstractVector) = sqrt(sum(x -> x * x, v))
 modelica_vectors_length(v::Number) = abs(v)
+
+#= MSL Modelica.Math.isEqual(s1, s2, eps=0) = abs(s1-s2) <= eps. =#
+modelica_math_isEqual(s1, s2, eps = 0.0) = abs(s1 - s2) <= eps
 
 """
     modelica_skew(x)
