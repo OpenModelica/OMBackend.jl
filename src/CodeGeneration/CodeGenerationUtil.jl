@@ -1105,6 +1105,12 @@ function isContinousCondition(cond::DAE.Exp, simCode)
       local ht = simCode.stringToSimVarHT
       local crefName = string(cref)
       if crefName == "time"
+        #= A relation against `time` (e.g. `time >= t_next`) is a time/state
+           event, i.e. a zero-crossing of `time - rhs`, even when the other
+           operand is a discrete variable. Treat it as continuous so it is
+           emitted as an edge-triggered ContinuousCallback rather than a
+           level-triggered discrete callback that re-fires every step. =#
+        isContinuousCond = true
         continue
       end
       if !haskey(ht, crefName)
@@ -1112,10 +1118,12 @@ function isContinousCondition(cond::DAE.Exp, simCode)
         continue
       end
       local var = last(ht[crefName])
-      #=
-      If one variable in the condition is continuous treat it as a continuous  callback
-      =#
-      isContinuousCond = isContinuousCond || !(SimulationCode.isDiscrete(var))
+      #= Only a genuinely continuous variable makes the condition continuous.
+         Parameters are constant and discrete variables change only at events,
+         so a condition over only those (e.g. `(tLH>0 or tHL>0) and change(x)`)
+         is an event-driven discrete callback, not a zero-crossing. =#
+      isContinuousCond = isContinuousCond ||
+        (!(SimulationCode.isDiscrete(var)) && !(SimulationCode.isParameter(var)))
     end
   end
   return isContinuousCond

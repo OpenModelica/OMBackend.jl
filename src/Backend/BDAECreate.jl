@@ -1375,6 +1375,15 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
     if !_isSingleStraightDiscreteAssign(daeStmts)
       _liftAlgorithmBodyToInitialWhen!(out, daeStmts, alg.source, liftedLhsNames, paramOrConstNames)
     end
+    #= A mixed algorithm body may also contain an explicit `when/elsewhen`
+       statement (e.g. MSL InertialDelaySensitive's scheduling block). The
+       body lifter above skips STMT_WHEN; lift each into a real WHEN_EQUATION
+       so its LHS (t_next, y_auxiliary, ...) are actually assigned. =#
+    for s in daeStmts
+      if s isa DAE.STMT_WHEN
+        _liftStmtWhenToWhenEquations!(out, s, liftedLhsNames)
+      end
+    end
     #= Per-statement lifting via `_liftAlgAssignToInitialWhen!` and
        `_liftAlgIfToWhen!` covers every shape the cluster-A Digital examples
        need. The legacy single-block lifter (which combined all
@@ -1630,8 +1639,9 @@ Base.@nospecializeinfer function _emitAlgorithmAssignOps!(ops::Vector{BDAE.WhenO
                                                           @nospecialize(source),
                                                           @nospecialize(activeCond),
                                                           iterVals::Dict{String, Int},
-                                                          initialValue::Bool)::Bool
-  _isDiscreteDAEType(ty) || return true
+                                                          initialValue::Bool,
+                                                          allowContinuous::Bool = false)::Bool
+  (allowContinuous || _isDiscreteDAEType(ty)) || return true
   lhs = _prepareAlgorithmExp(lhs, iterVals, initialValue)
   rhs = _prepareAlgorithmExp(rhs, iterVals, initialValue)
   lhs isa DAE.CREF || return false
@@ -1656,20 +1666,21 @@ Base.@nospecializeinfer function _appendElseAlgorithmOps!(ops::Vector{BDAE.WhenO
                                                           @nospecialize(elsePart),
                                                           @nospecialize(activeCond),
                                                           iterVals::Dict{String, Int},
-                                                          initialValue::Bool)::Bool
+                                                          initialValue::Bool,
+                                                          allowContinuous::Bool = false)::Bool
   if elsePart isa DAE.NOELSE
     return true
   elseif elsePart isa DAE.ELSE
     return _appendAlgorithmStmtOps!(ops, liftedLhsNames, elsePart.statementLst,
-                                    activeCond, iterVals, initialValue)
+                                    activeCond, iterVals, initialValue, allowContinuous)
   elseif elsePart isa DAE.ELSEIF
     local cond = _prepareAlgorithmExp(elsePart.exp, iterVals, initialValue)
     local branchCond = _andCondition(activeCond, cond)
     _appendAlgorithmStmtOps!(ops, liftedLhsNames, elsePart.statementLst,
-                             branchCond, iterVals, initialValue) || return false
+                             branchCond, iterVals, initialValue, allowContinuous) || return false
     local restCond = _andCondition(activeCond, _notCondition(cond))
     return _appendElseAlgorithmOps!(ops, liftedLhsNames, elsePart.else_,
-                                    restCond, iterVals, initialValue)
+                                    restCond, iterVals, initialValue, allowContinuous)
   end
   return true
 end
@@ -1679,24 +1690,25 @@ Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenO
                                                           @nospecialize(stmts),
                                                           @nospecialize(activeCond),
                                                           iterVals::Dict{String, Int},
-                                                          initialValue::Bool)::Bool
+                                                          initialValue::Bool,
+                                                          allowContinuous::Bool = false)::Bool
   for s in stmts
     @match s begin
       DAE.STMT_ASSIGN(ty, lhs, rhs, src) => begin
         _emitAlgorithmAssignOps!(ops, liftedLhsNames, lhs, rhs, ty, src,
-                                 activeCond, iterVals, initialValue) || return false
+                                 activeCond, iterVals, initialValue, allowContinuous) || return false
       end
       DAE.STMT_ASSIGN_ARR(ty, lhs, rhs, src) => begin
         _emitAlgorithmAssignOps!(ops, liftedLhsNames, lhs, rhs, ty, src,
-                                 activeCond, iterVals, initialValue) || return false
+                                 activeCond, iterVals, initialValue, allowContinuous) || return false
       end
       DAE.STMT_IF(cond, body, elsePart, _) => begin
         local c = _prepareAlgorithmExp(cond, iterVals, initialValue)
         _appendAlgorithmStmtOps!(ops, liftedLhsNames, body, _andCondition(activeCond, c),
-                                 iterVals, initialValue) || return false
+                                 iterVals, initialValue, allowContinuous) || return false
         _appendElseAlgorithmOps!(ops, liftedLhsNames, elsePart,
                                  _andCondition(activeCond, _notCondition(c)),
-                                 iterVals, initialValue) || return false
+                                 iterVals, initialValue, allowContinuous) || return false
       end
       DAE.STMT_FOR(_, _, iter, _, range, body, _) => begin
         local r = _prepareAlgorithmExp(range, iterVals, initialValue)
@@ -1706,7 +1718,7 @@ Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenO
           local nested = copy(iterVals)
           nested[iter] = v
           _appendAlgorithmStmtOps!(ops, liftedLhsNames, body, activeCond,
-                                   nested, initialValue) || return false
+                                   nested, initialValue, allowContinuous) || return false
         end
       end
       DAE.STMT_WHEN(__) => nothing
@@ -1719,11 +1731,12 @@ Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenO
 end
 
 Base.@nospecializeinfer function _buildAlgorithmBodyOps(@nospecialize(daeStmts),
-                                                        initialValue::Bool)
+                                                        initialValue::Bool,
+                                                        allowContinuous::Bool = false)
   local ops = BDAE.WhenOperator[]
   local lhsNames = OrderedSet{String}()
   local ok = _appendAlgorithmStmtOps!(ops, lhsNames, daeStmts, nothing,
-                                      Dict{String, Int}(), initialValue)
+                                      Dict{String, Int}(), initialValue, allowContinuous)
   ok || return (BDAE.WhenOperator[], OrderedSet{String}())
   return (ops, lhsNames)
 end
@@ -1831,6 +1844,105 @@ Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BD
     ))
   end
   return
+end
+
+#= Logical OR of two condition expressions with BCONST simplification, the
+   disjunctive analogue of `_andCondition`. =#
+Base.@nospecializeinfer function _orCondition(@nospecialize(a), @nospecialize(b))
+  a === nothing && return b
+  b === nothing && return a
+  if a isa DAE.BCONST
+    return a.bool ? a : b
+  elseif b isa DAE.BCONST
+    return b.bool ? b : a
+  end
+  return DAE.LBINARY(a, DAE.OR(DAE.T_BOOL_DEFAULT), b)
+end
+
+#= A `when {c1, c2, ...}` array condition means "fire when any member becomes
+   true". Return the member expressions so they can be OR-folded; a scalar
+   condition is returned as a singleton. =#
+Base.@nospecializeinfer function _whenConditionMembers(@nospecialize(exp))
+  @match exp begin
+    DAE.ARRAY(_, _, arr) => collect(arr)
+    _ => Any[exp]
+  end
+end
+
+Base.@nospecializeinfer function _expMentionsInitial(@nospecialize(exp))::Bool
+  local found = false
+  function visit(@nospecialize(e), arg)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("initial"), _, _) => (found = true)
+      _ => nothing
+    end
+    return (e, arg)
+  end
+  Util.traverseExpBottomUp(exp, visit, nothing)
+  return found
+end
+
+#= Build a runtime `BDAE.WHEN_EQUATION` (with chained elsewhen) from a
+   `DAE.STMT_WHEN` that appears inside a regular (non-when) algorithm body.
+   Every assignment in each branch body is lifted (continuous and discrete
+   alike — inside a `when` all LHS are event-updated), `if` guards become
+   IFEXP-conditional assigns, and the array condition `{c1, c2}` is OR-folded
+   to a scalar. `initial()` is substituted to `false` for the runtime arm.
+   Assigned LHS names accumulate into `allLhs`. Returns the WHEN_EQUATION or
+   `nothing` if the branch contributes no operators. =#
+Base.@nospecializeinfer function _stmtWhenToBdaeWhenEquation(@nospecialize(stmtWhen),
+                                                             allLhs::OrderedSet{String})
+  local ops, lhs = _buildAlgorithmBodyOps(stmtWhen.statementLst, false, true)
+  union!(allLhs, lhs)
+  local cond = nothing
+  for e in _whenConditionMembers(stmtWhen.exp)
+    cond = _orCondition(cond, _prepareAlgorithmExp(e, Dict{String, Int}(), false))
+  end
+  cond === nothing && (cond = DAE.BCONST(true))
+  local elseOpt = NONE()
+  @match stmtWhen.elseWhen begin
+    SOME(esw) => begin
+      if esw isa DAE.STMT_WHEN
+        local eswEq = _stmtWhenToBdaeWhenEquation(esw, allLhs)
+        eswEq !== nothing && (elseOpt = SOME(eswEq))
+      end
+    end
+    _ => nothing
+  end
+  (isempty(ops) && elseOpt === NONE()) && return nothing
+  local whenStmts = BDAE.WHEN_STMTS(cond, MetaModelica.list(ops...), elseOpt)
+  return BDAE.WHEN_EQUATION(length(ops), whenStmts, stmtWhen.source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
+end
+
+#= Lift a top-level `DAE.STMT_WHEN` from a regular algorithm body into BDAE
+   equations: an INITIAL_WHEN_EQUATION (when the first branch carries
+   `initial()`, so the scheduling state is set at t=0) plus a runtime
+   WHEN_EQUATION with the elsewhen arm. Without this a mixed algorithm body
+   (a `when/elsewhen` followed by plain assignments) loses the `when` block
+   entirely, leaving its LHS frozen at the start value. =#
+Base.@nospecializeinfer function _liftStmtWhenToWhenEquations!(out::Vector{BDAE.Equation},
+                                                               @nospecialize(stmtWhen),
+                                                               liftedLhsNames::OrderedSet{String})::Bool
+  local allLhs = OrderedSet{String}()
+  if stmtWhen.initialCall || _expMentionsInitial(stmtWhen.exp)
+    local initOps, initLhs = _buildAlgorithmBodyOps(stmtWhen.statementLst, true, true)
+    union!(allLhs, initLhs)
+    if !isempty(initOps)
+      local initialCall = DAE.CALL(Absyn.IDENT("initial"),
+                                   MetaModelica.list(),
+                                   DAE.callAttrBuiltinBool)
+      push!(out, BDAE.INITIAL_WHEN_EQUATION(
+        length(initOps),
+        BDAE.WHEN_STMTS(initialCall, MetaModelica.list(initOps...), NONE()),
+        stmtWhen.source,
+        nothing,
+      ))
+    end
+  end
+  local weq = _stmtWhenToBdaeWhenEquation(stmtWhen, allLhs)
+  weq !== nothing && push!(out, weq)
+  union!(liftedLhsNames, allLhs)
+  return weq !== nothing
 end
 
 Base.@nospecializeinfer function _pushDiscreteCref!(out::Vector{DAE.ComponentRef},
