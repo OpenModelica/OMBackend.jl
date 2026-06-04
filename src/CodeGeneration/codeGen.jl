@@ -523,13 +523,17 @@ function _collectIfCondRefresh(writtenLHS::Set{String}, simCode)
   return (refreshCrefs, assigns)
 end
 
-#= Emit a PeriodicCallback for a Pulse-style periodic when: fire the body at
-   t = startTime + n*period. `phase = startTime` so the first (initial) tick at
-   tspan[1]+startTime is skipped (initial_affect=false) and firing starts at the
-   first period boundary, matching the `integer((time-startTime)/period)`
-   increment. =#
+#= Emit a PeriodicCallback for a Pulse-style periodic when: fire the body at the
+   `integer((time-startTime)/period)` increments, i.e. at t = startTime + n*period
+   for the n that fall in (tspan[1], stopTime]. `_firstEdge` is the first such
+   instant assuming tspan[1] = 0 (the Modelica `integer` = floor convention), and
+   it lies in (0, period], so it is a valid non-negative PeriodicCallback phase.
+   `initial_affect = true` fires AT that first edge. A bare `phase = mod(startTime,
+   period)` with `initial_affect = false` dropped the first edge whenever
+   startTime < 0 (e.g. -0.035), shifting the whole pulse train by one period. =#
 function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64, period::Float64)
   local wEq = eq.whenEquation
+  local _firstEdge = startTime + (floor(-startTime / period) + 1.0) * period
   local whenStmts = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
   local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
   local writtenLHS = Set{String}()
@@ -566,11 +570,11 @@ function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64,
         $(refreshAssigns...)
       end
     end
-    #= PeriodicCallback requires phase >= 0; mod keeps the same event grid
-       (startTime + n*period) and is identical to startTime for the common
-       0 <= startTime < period case (incl. 0). =#
+    #= Fire AT the first edge (phase in (0, period], non-negative) then every
+       period. For startTime = 0 this is phase = period, initial fire at period,
+       matching the previous behaviour. =#
     $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), $(period);
-                                                   phase = mod($(startTime), $(period)), initial_affect = false)
+                                                   phase = $(_firstEdge), initial_affect = true)
   end
 end
 

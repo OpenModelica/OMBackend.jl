@@ -703,7 +703,10 @@ end
   Generates If statements
 """
 function generateStatement(stmt::DAE.STMT_IF)::Expr
-  local cond = expToJuliaExpAlg(stmt.exp)
+  #= Coerce to Bool: a Boolean discrete lives numerically (0.0/1.0) on the state
+     vector, so a bare `if <float>` throws TypeError. `!= 0` is idempotent on a
+     genuine Bool. =#
+  local cond = :($(expToJuliaExpAlg(stmt.exp)) != 0)
   local stmts = generateStatements(stmt.statementLst)
   local res = @match stmt.else_ begin
     DAE.NOELSE(__) => begin
@@ -759,7 +762,8 @@ For the elseif branch we create an elseif expression.
 Similar to the else this should never be called from the top level.
 """
 function generateStatement(stmt::DAE.ELSEIF)::Expr
-  local cond = expToJuliaExpAlg(stmt.exp)
+  #= See STMT_IF: coerce a numerically-encoded Boolean condition to Bool. =#
+  local cond = :($(expToJuliaExpAlg(stmt.exp)) != 0)
   local stmts = generateStatements(stmt.statementLst)
   local blck = Expr(:block)
   for s in stmts
@@ -909,9 +913,12 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         local rhs = expToJuliaExpAlg(e2)
         #= || and && are special forms in Julia, not regular functions.
            Must use Expr(:||, ...) / Expr(:&&, ...) instead of Expr(:call, :||, ...) =#
+        #= Coerce operands: Boolean discretes read back from state are 0/1
+           numbers, so a bare `&&`/`||` throws TypeError. `!= 0` is idempotent
+           on a genuine Bool (mirrors the LUNARY `not` coercion above). =#
         @match op begin
-          DAE.OR(__) => Expr(:||, lhs, rhs)
-          DAE.AND(__) => Expr(:&&, lhs, rhs)
+          DAE.OR(__) => Expr(:||, :($(lhs) != 0), :($(rhs) != 0))
+          DAE.AND(__) => Expr(:&&, :($(lhs) != 0), :($(rhs) != 0))
           _ => begin
             local opSym = CodeGeneration.DAE_OP_toJuliaOperator(op)
             :($opSym($(lhs), $(rhs)))
@@ -925,7 +932,9 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         :($op($(lhs), $(rhs)))
       end
       DAE.IFEXP(expCond = e1, expThen = e2, expElse = e3) => begin
-        local cond = expToJuliaExpAlg(e1)
+        #= Coerce to Bool: a numerically-encoded Boolean discrete condition would
+           make this `if <float>` throw TypeError; `!= 0` is idempotent on Bool. =#
+        local cond = :($(expToJuliaExpAlg(e1)) != 0)
         local thenExp = expToJuliaExpAlg(e2)
         local elseExp = expToJuliaExpAlg(e3)
         quote
