@@ -5,6 +5,7 @@
 module Backend
 
 using ..FrontendUtil
+using DataStructures: OrderedSet
 
 import ..@BACKEND_LOGGING
 import ..@BACKEND_PERFLOG

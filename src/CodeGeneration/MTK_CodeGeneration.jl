@@ -267,14 +267,14 @@ function collectIrreducibleSymbols(simCode,
 end
 
 """
-    whenConditionDiscreteSyms(simCode) -> Set{Symbol}
+    whenConditionDiscreteSyms(simCode) -> OrderedSet{Symbol}
 
 Names of DISCRETE variables referenced in any when-equation condition. The
 generated DiscreteCallback condition reads each by its own name from the state
 vector, so these must not be aliased away by relay elimination.
 """
-function whenConditionDiscreteSyms(simCode)::Set{Symbol}
-  local out = Set{Symbol}()
+function whenConditionDiscreteSyms(simCode)::OrderedSet{Symbol}
+  local out = OrderedSet{Symbol}()
   local ht = simCode.stringToSimVarHT
   for weq in simCode.whenEquations
     local stmts = weq.whenEquation
@@ -488,6 +488,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
   code = quote
     import DAE
     import DataStructures.OrderedCollections
+    using DataStructures.OrderedCollections: OrderedSet
     import SCode
     import OMBackend
     import OMBackend.CodeGeneration
@@ -607,7 +608,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
      when the program is eval'd in OMBackend scope (backendAPI.jl) rather than CodeGeneration scope.
      Without this, implementation bodies that call other Modelica functions (e.g., normalizeWithAssert
      calling Vectors_length) would fail with UndefVarError. =#
-  local funcNames = Set{Symbol}(Symbol(f.name) for f in simCode.functions)
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
   if !isempty(funcNames)
     for f in functions
       qualifyModelicaFunctions!(f, funcNames)
@@ -620,6 +621,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     using OrdinaryDiffEq
     using Symbolics
     using OMBackend
+    using DataStructures.OrderedCollections: OrderedSet
     import Setfield
     Base.Experimental.@compiler_options optimize=0 compile=min infer=false
     #= Add import to the external runtime if the generated code calls Modelica Functions =#
@@ -667,9 +669,9 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
            inside __runInitialAlgorithm! already propagates those via the
            alias-map's observed equation, so dropping them is safe. =#
         local _unkNames = try
-          Set(string(u) for u in ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM))
+          OrderedSet(string(u) for u in ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM))
         catch
-          Set{String}()
+          OrderedSet{String}()
         end
         local _hardFiltered = filter(p -> string(first(p)) in _unkNames, _hardStarts)
         if !isempty(_hardFiltered)
@@ -709,7 +711,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
            DiscreteCallbacks and are not part of the brittle Rosenbrock mass-matrix
            coupling the FBDF switch targets; excluding them keeps the default
            Rosenbrock solver, which handles them without the FBDF tstop chatter. =#
-        local _discreteUnknownNames = Set{String}($(Expr(:vect, [string(varName, "(t)") for (varName, (_, simVar)) in simCode.stringToSimVarHT if simVar.varKind isa SimulationCode.DISCRETE && !(Symbol(varName) in _condDiscretes)]...)))
+        local _discreteUnknownNames = OrderedSet{String}($(Expr(:vect, [string(varName, "(t)") for (varName, (_, simVar)) in simCode.stringToSimVarHT if simVar.varKind isa SimulationCode.DISCRETE && !(Symbol(varName) in _condDiscretes)]...)))
         #= UniformScaling (pure ODE) supports `_mm[i,i]` as 1; explicit Matrix
            returns the entry. Both code paths handle by indexing the diagonal.
            When u0 is nothing (purely-algebraic MTK problem) the loop runs 0
@@ -940,8 +942,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   EQUATIONS = _ifEqRelay_eqs
   if !isempty(_ifEqRelay_aliases)
     @info "[RELAY] aliases" _ifEqRelay_aliases
-    local _drop = Set(keys(_ifEqRelay_aliases))
-    local _dropStr = Set(string.(keys(_ifEqRelay_aliases)))
+    local _drop = OrderedSet(keys(_ifEqRelay_aliases))
+    local _dropStr = OrderedSet(string.(keys(_ifEqRelay_aliases)))
     stateVariablesSym = filter(s -> s ∉ _drop, stateVariablesSym)
     algebraicVariablesSym = filter(s -> s ∉ _drop, algebraicVariablesSym)
     algebraicVariables = filter(s -> s ∉ _dropStr, algebraicVariables)
@@ -986,7 +988,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                    DISCRETE_DUMMY_EQUATIONS,
                    CONDITIONAL_EQUATIONS)
   EQUATIONS = rewriteEquations(EQUATIONS, simCode)
-  local _seenMtkEquationExprs = Set{String}()
+  local _seenMtkEquationExprs = OrderedSet{String}()
   local _dedupedMtkEquations = Expr[]
   local _nDedupedMtkEquations = 0
   for eq in EQUATIONS
@@ -1144,7 +1146,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       if @isdefined(observedEqs) && !isempty(observedEqs)
         #= Deduplicate observed equations by LHS variable name before injection.
            Both alias and eliminated observed blocks can produce the same equation. =#
-        local _seenLHS = Set{String}()
+        local _seenLHS = OrderedSet{String}()
         local _uniqueObs = Symbolics.Equation[]
         for _obs in observedEqs
           local _lhsKey = string(Symbolics.unwrap(_obs.lhs))
@@ -1185,7 +1187,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   end
   #= Qualify bare Modelica function calls with OMBackend.CodeGeneration. prefix.
      This covers all generated code: equations, parameter assignments, start conditions. =#
-  local funcNames = Set{Symbol}(Symbol(f.name) for f in simCode.functions)
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
   if !isempty(funcNames)
     qualifyModelicaFunctions!(model, funcNames)
   end
@@ -1213,7 +1215,7 @@ function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE,
      Symbolics variables and equations. =#
   local obsEntries = Tuple{Symbol, Symbol, Bool}[]
   local elimSymbols = Symbol[]
-  local emittedElims = Set{Symbol}()
+  local emittedElims = OrderedSet{Symbol}()
   for entry in simCode.aliasMap
     local elimSym = Symbol(entry.eliminatedName)
     local repSym = Symbol(entry.representativeName)
@@ -1223,7 +1225,7 @@ function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE,
     push!(obsEntries, (elimSym, repSym, entry.negated))
   end
   local _relayRepresentative(sym::Symbol)::Symbol = begin
-    local seen = Set{Symbol}()
+    local seen = OrderedSet{Symbol}()
     local cur = sym
     while haskey(relayAliases, cur) && !(cur in seen)
       push!(seen, cur)
@@ -1296,7 +1298,7 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE,
      fails when the residual has already been alias-substituted (the
      residual no longer mentions `elim` and `solve_for` returns NaN, which
      then propagates into `sol(t; idxs = elim)`). =#
-  local aliasNames = Set{String}(entry.eliminatedName for entry in simCode.aliasMap)
+  local aliasNames = OrderedSet{String}(entry.eliminatedName for entry in simCode.aliasMap)
   union!(aliasNames, string.(keys(relayAliases)))
   local solveBodyExprs = Expr[]
   for (i, varName) in enumerate(elimVars)
@@ -1515,7 +1517,7 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SIM_CODE; s
   local startExprs::Vector{Expr} = Expr[]
   local residuals = simCode.residualEquations
   local ht::Dict = simCode.stringToSimVarHT
-  local missingStartWarnings = Set{String}()
+  local missingStartWarnings = OrderedSet{String}()
   if length(vars) == 0
     return Expr[]
   end
@@ -1637,8 +1639,8 @@ function emitInitAlgU0Appends(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local appends::Vector{Expr} = Expr[]
   isempty(simCode.initialAlgorithms) && return appends
   local ht::Dict = simCode.stringToSimVarHT
-  local lhsNames = Set{String}()
-  local rhsNames = Set{String}()
+  local lhsNames = OrderedSet{String}()
+  local rhsNames = OrderedSet{String}()
   if any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
     for ia in simCode.initialAlgorithms, s in ia.daeStatements
       _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
@@ -1677,8 +1679,8 @@ function emitInitAlgConstraintAppends(simCode::SimulationCode.SIM_CODE)::Vector{
   local appends::Vector{Expr} = Expr[]
   isempty(simCode.initialAlgorithms) && return appends
   local ht::Dict = simCode.stringToSimVarHT
-  local lhsNames = Set{String}()
-  local rhsNames = Set{String}()
+  local lhsNames = OrderedSet{String}()
+  local rhsNames = OrderedSet{String}()
   if any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
     for ia in simCode.initialAlgorithms, s in ia.daeStatements
       _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
@@ -1802,7 +1804,7 @@ function _ifEquationSortKey(ifEq::SimulationCode.IF_EQUATION, simCode)::String
 end
 
 function _ifConditionDependsOnTime(@nospecialize(condition))::Bool
-  local refs::Set{String} = Set{String}()
+  local refs::OrderedSet{String} = OrderedSet{String}()
   try
     SimulationCode.collectCrefNames!(refs, condition)
   catch
@@ -1826,7 +1828,7 @@ Conservative: any non-parameter reference returns false, keeping the default
 per-branch continuous callback.
 """
 function _ifConditionIsPureTimeEvent(@nospecialize(condition), simCode)::Bool
-  local refs::Set{String} = Set{String}()
+  local refs::OrderedSet{String} = OrderedSet{String}()
   try
     SimulationCode.collectCrefNames!(refs, condition)
   catch
@@ -2604,7 +2606,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
      shadow MTK's per-model parameter handling for arrays not needed at
      module-load time (e.g. body_r_CM in MultiBody models), perturbing the
      resulting integration trajectory. =#
-  local neededBases = Set{String}()
+  local neededBases = OrderedSet{String}()
   for (_, (_, simVar)) in ht
     @match simVar.varKind begin
       SimulationCode.DATA_STRUCTURE(SOME(b)) => begin
@@ -2624,7 +2626,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
      MTK eval fails with `<name>[idx] not defined`. We collect base names of
      CREFs that appear in residuals and intersect with the set of
      ARRAY_PARAMETERs in HT so we only emit parents that actually exist. =#
-  local _residualCrefs = Set{String}()
+  local _residualCrefs = OrderedSet{String}()
   for eq in simCode.residualEquations
     SimulationCode.collectCrefNames!(_residualCrefs, SimulationCode.toDAEExp(eq.exp))
   end
@@ -2645,7 +2647,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
      before the early-return so the defensive fallback at the end of this
      function still emits even when no DATA_STRUCTURE/ARRAY_PARAMETER paths
      fire. Recorded here so the fallback loop downstream can consume them. =#
-  local _orphanRefsEarly = Set{String}()
+  local _orphanRefsEarly = OrderedSet{String}()
   for _n in _residualCrefs
     local _bracket = findfirst('[', _n)
     _bracket === nothing && continue
@@ -2661,7 +2663,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
     return exprs
   end
 
-  local emitted = Set{String}()
+  local emitted = OrderedSet{String}()
   for (varName, (_, simVar)) in ht
     local bindExp = @match simVar.varKind begin
       SimulationCode.ARRAY_PARAMETER(_, SOME(e)) => SimulationCode.toDAEExp(e)
@@ -2745,7 +2747,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
      not the parent. Default value 0.0 is wrong if the model actually uses
      the parameter dynamically, but for visualization-only constants
      (`gravityArrowHead`, axis arrows, ...) it is benign. =#
-  local _orphanRefs = Set{String}()
+  local _orphanRefs = OrderedSet{String}()
   for _n in _residualCrefs
     local _bracket = findfirst('[', _n)
     _bracket === nothing && continue
@@ -2769,7 +2771,7 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
      so they resolve to the OMBackend.CodeGeneration wrapper rather than failing
      with UndefVarError in the per-model module scope. Surfaces on every model
      using CombiTable / CombiTimeTable / ExternalObject constructors. =#
-  local funcNames = Set{Symbol}(Symbol(f.name) for f in simCode.functions)
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
   for ds in dataStructureVariables
     (index, simVar) = ht[ds]
     local simVarType::SimulationCode.SimVarType = simVar.varKind
@@ -3213,7 +3215,7 @@ end
 function generateRegisterCallsForCallExprs(simCode;
                                             funcArgGen::Function = AlgorithmicCodeGeneration.generateSignatureForRegistration)
   local rFs = Expr[]
-  local calledFunctions = collectCalledFunctionNames!(Set{String}(), simCode)
+  local calledFunctions = collectCalledFunctionNames!(OrderedSet{String}(), simCode)
   for f in simCode.functions
     if !(f.name in calledFunctions)
       continue
@@ -3383,8 +3385,8 @@ end
 function createTerminalBodyRunner(simCode::SimulationCode.SIM_CODE)
   local terminalWhens = filter(_isTerminalWhen, simCode.whenEquations)
   isempty(terminalWhens) && return nothing
-  local modelFns = Set(replace(f.name, "." => "_") for f in simCode.functions)
-  local calledNames = Set{String}()
+  local modelFns = OrderedSet(replace(f.name, "." => "_") for f in simCode.functions)
+  local calledNames = OrderedSet{String}()
   local perWhen = Expr[]
   for eq in terminalWhens
     local body = eq.whenEquation.whenStmtLst
@@ -3445,7 +3447,7 @@ end
    trapezoid signal source was silently dropped, breaking every model that
    relies on `initial algorithm` to seed states. =#
 function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
-                               renamedNames::Set{String} = Set{String}())
+                               renamedNames::OrderedSet{String} = OrderedSet{String}())
   local sub = e -> _substituteBoundParameters(e, simCode)
   local lowerAlg = e -> _renameAlgIdentifiers(
     _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))),
@@ -3508,7 +3510,7 @@ end
    via `_renameAlgIdentifiers` so they bind to the let-block locals rather
    than to module-level Symbolics bindings of the same name. =#
 function _initialWhenOpToJuliaEarly(wStmt, simCode::SimulationCode.SIM_CODE,
-                                    renamedNames::Set{String}, seenLHS::Set{String})
+                                    renamedNames::OrderedSet{String}, seenLHS::OrderedSet{String})
   local sub = e -> _substituteBoundParameters(e, simCode)
   local lowerAlg = e -> _renameAlgIdentifiers(
     _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))),
@@ -3573,8 +3575,8 @@ runtime `remake` path remains as a fallback for state-cref-RHS reads whose
 post-init value differs from the `start` attribute.
 """
 function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)::Expr
-  local lhsNames = Set{String}()
-  local rhsNames = Set{String}()
+  local lhsNames = OrderedSet{String}()
+  local rhsNames = OrderedSet{String}()
   local useDAEPath = any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
   if useDAEPath
     for ia in simCode.initialAlgorithms, s in ia.daeStatements
@@ -3688,8 +3690,8 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
       end
     end
   end
-  local lhsNames = Set{String}()
-  local rhsNames = Set{String}()
+  local lhsNames = OrderedSet{String}()
+  local rhsNames = OrderedSet{String}()
   for ia in simCode.initialAlgorithms
     for op in ia.statements
       _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)

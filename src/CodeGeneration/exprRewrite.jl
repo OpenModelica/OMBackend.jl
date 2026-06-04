@@ -79,7 +79,7 @@ renameDerToD!(x) = x
 """
 Qualify bare Modelica function calls with `OMBackend.CodeGeneration.` prefix, in place.
 """
-function qualifyModelicaFunctions!(expr::Expr, funcNames::Set{Symbol})
+function qualifyModelicaFunctions!(expr::Expr, funcNames::OrderedSet{Symbol})
     #= Iterative traversal: deeply nested wrappers (e.g. the generated body for
        Modelica.Utilities.Strings.scanToken and its scan-family helpers) push
        the previous recursive walker past Julia's runtime stack guard, firing
@@ -110,7 +110,7 @@ function qualifyModelicaFunctions!(expr::Expr, funcNames::Set{Symbol})
     return expr
 end
 
-qualifyModelicaFunctions!(x, funcNames::Set{Symbol}) = x
+qualifyModelicaFunctions!(x, funcNames::OrderedSet{Symbol}) = x
 
 """
 Return true when `x` is a zero numeric literal.
@@ -252,7 +252,7 @@ end
 """
 Expr-level replacement for `rewriteEquations`. Returns Vector{Expr}.
 """
-function rewriteEquationsExprLevel(edeqs::Vector{Expr}; modelicaFuncNames::Set{Symbol} = Set{Symbol}())
+function rewriteEquationsExprLevel(edeqs::Vector{Expr}; modelicaFuncNames::OrderedSet{Symbol} = OrderedSet{Symbol}())
     result = Expr[]
     for eq in edeqs
         rewritten = moveDerivativeToLHS(eq)
@@ -283,7 +283,7 @@ vector). When a component contains such a symbol it is forced to be the
 root so it is never substituted away.
 """
 function eliminateIfEqRelays(equations::Vector{Expr};
-                             preferKeep::Set{Symbol} = Set{Symbol}())
+                             preferKeep::OrderedSet{Symbol} = OrderedSet{Symbol}())
     #= Union-find (not a plain map): a variable that is the leaf-alias LHS of two
        relays (`A~B`, `A~C`) means A≡B≡C; a `raw[k]=v` map overwrites and drops one
        side, disconnecting it from its definer. Union-find keeps the component intact. =#

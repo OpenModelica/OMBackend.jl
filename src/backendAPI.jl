@@ -1242,7 +1242,7 @@ function MTK_evaluateAllObserved(sol, obs_eqs, modelName::String)
   end
   local sys_t = ModelingToolkit.get_iv(mod.LATEST_REDUCED_SYSTEM)
   local result = Dict{String, Vector{Float64}}()
-  local warnedUnresolved = Set{String}()
+  local warnedUnresolved = OrderedSet{String}()
   for (i, ti) in enumerate(sol.t)
     local subst = Dict{Any,Any}(sys_t => ti)
     for eq in obs_eqs

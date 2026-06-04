@@ -167,7 +167,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        sd1.s_rel = 1) gets overwritten by the alg residual that depends on
        free vars (e.g. m1.s, m2.s) — collapsing to a different consistent
        root than the user requested. =#
-    local pinnedKeyStrSet = Set(string(p.first) for p in finalInitialValues)
+    local pinnedKeyStrSet = OrderedSet(string(p.first) for p in finalInitialValues)
     local pinnedIdx = Int[i for (i, st) in enumerate(states)
                           if string(st) in pinnedKeyStrSet]
     local derivativeInitTargets = _derivativeInitializationTargets(
@@ -317,7 +317,7 @@ function _buildStateVector(states, finalInitialValues;
   for (i, s) in enumerate(states)
     stateStrToIdx[string(s)] = i
   end
-  local matchedSet = Set{String}()
+  local matchedSet = OrderedSet{String}()
   local hardValueMap = Dict{Any, Float64}()
   for pair in finalInitialValues
     local keyStr = string(pair.first)
@@ -363,7 +363,7 @@ function _buildStateVector(states, finalInitialValues;
 end
 
 
-function _propagateObservedAliasInitialValues!(u0, states, matchedSet::Set{String},
+function _propagateObservedAliasInitialValues!(u0, states, matchedSet::OrderedSet{String},
                                                hardValueMap::Dict{Any, Float64},
                                                observedEquations)
   local aliasMatched = 0

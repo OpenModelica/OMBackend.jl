@@ -1018,7 +1018,7 @@ Rewrite equations for MTK: move derivatives to the LHS, rename der to D,
 qualify Modelica function calls, and wrap dynamic calls with invokelatest.
 """
 function rewriteEquations(edeqs, simCode)
-  local funcNames = Set{Symbol}(Symbol(f.name) for f in simCode.functions)
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
   return rewriteEquationsExprLevel(edeqs isa Vector{Expr} ? edeqs : Expr[e for e in edeqs];
                                    modelicaFuncNames = funcNames)
 end
@@ -1192,8 +1192,8 @@ end
    initial condition is free unless it is also constrained by an algebraic equation.
    Used by splitInitialValues to decide which non-fixed starts are safe to keep as hard
    u0 (uncoupled states) vs must be relaxed to guesses (algebraically coupled states). =#
-function _algebraicCoupledVarStrs(sys)::Set{String}
-  local out = Set{String}()
+function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
+  local out = OrderedSet{String}()
   local eqs = try
     equations(sys)
   catch
@@ -1232,8 +1232,8 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
   #= DAE system: classify states by mass matrix diagonal =#
   @BACKEND_LOGGING @debug "[splitIV] finalInitialValues keys:" [string(p.first) for p in finalInitialValues]
   @BACKEND_LOGGING @debug "[splitIV] reducedUnks:" [string(u) for u in reducedUnks]
-  local diffStateSet = Set{Any}()
-  local diffStateStrSet = Set{String}()
+  local diffStateSet = OrderedSet{Any}()
+  local diffStateStrSet = OrderedSet{String}()
   for i in 1:min(size(massMatrix, 1), length(reducedUnks))
     if massMatrix[i, i] != 0
       push!(diffStateSet, reducedUnks[i])
@@ -1278,13 +1278,13 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
      fixed=true set. Vars whose start landed in finalInitialValues but whose lhs
      is not in this set are non-fixed defaults — relax them to guesses so the
      algebraic constraints can solve consistently with the user's hard pins. =#
-  local fixedTrueLhsSet = Set{String}()
+  local fixedTrueLhsSet = OrderedSet{String}()
   for eq in initEqs
     push!(fixedTrueLhsSet, string(eq.lhs))
   end
   if hasInitConstraints
-    local hardKeyStrSet = Set(string(p.first) for p in hardInitialValues)
-    local reducedUnkStrSet = Set(string(u) for u in reducedUnks)
+    local hardKeyStrSet = OrderedSet(string(p.first) for p in hardInitialValues)
+    local reducedUnkStrSet = OrderedSet(string(u) for u in reducedUnks)
     local promoted = 0
     for eq in initEqs
       local rhsVal = Symbolics.value(eq.rhs)
@@ -1318,7 +1318,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
     local demoted = filter(p -> !(string(p.first) in fixedTrueLhsSet) &&
                                 (string(p.first) in _algCoupled), hardInitialValues)
     if !isempty(demoted)
-      local _demotedKeys = Set(string(p.first) for p in demoted)
+      local _demotedKeys = OrderedSet(string(p.first) for p in demoted)
       hardInitialValues = filter(p -> !(string(p.first) in _demotedKeys), hardInitialValues)
       append!(softInitialValues, demoted)
       @debug "[MTK GEN: init] Demoted $(length(demoted)) non-fixed algebraic-coupled hard u0 entries to guesses (start without fixed=true)"
@@ -1353,7 +1353,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
   #= Use string-based set for checking existing hard IVs, because isequal between
      Num-wrapped keys (from finalInitialValues) and BasicSymbolic values (from
      reducedUnks/diffStateSet) can fail. =#
-  local hardSymStrSet = Set(string(iv.first) for iv in hardInitialValues)
+  local hardSymStrSet = OrderedSet(string(iv.first) for iv in hardInitialValues)
   #= Only feed user-explicit start values (hard + soft, both filtered through
      `skipDefaultsForStates`) to the alias resolver. `allInitialValues` carries
      default 0.0 entries for non-explicit vars; substituting those lets a
@@ -1426,8 +1426,8 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
   #= Final sweep: ensure every reduced unknown has at least a guess.
      Even when the initialization problem is built, some unknowns may still lack
      coverage. The sweep provides 0.0 guesses as a safety net. =#
-  local hardSymStrSetFinal = Set(string(iv.first) for iv in hardInitialValues)
-  local currentGuessKeysFinal = Set(string(k) for k in keys(ModelingToolkit.guesses(reducedSystem)))
+  local hardSymStrSetFinal = OrderedSet(string(iv.first) for iv in hardInitialValues)
+  local currentGuessKeysFinal = OrderedSet(string(k) for k in keys(ModelingToolkit.guesses(reducedSystem)))
   local missingUnks = filter(reducedUnks) do unk
     local s = string(unk)
     !(s in hardSymStrSetFinal) && !(s in currentGuessKeysFinal)
@@ -1466,7 +1466,7 @@ defaulted to 0.0.
 """
 function buildDefaultGuesses(reducedSystem, finalInitialValues, allInitialValues)
   local reducedUnks = ModelingToolkit.unknowns(reducedSystem)
-  local hardKeys = Set(string(iv.first) for iv in finalInitialValues)
+  local hardKeys = OrderedSet(string(iv.first) for iv in finalInitialValues)
   local allIVMap = Dict{String, Any}(string(iv.first) => iv.second for iv in allInitialValues)
   local guessDict = Dict{Any, Any}()
   for unk in reducedUnks
@@ -1494,7 +1494,7 @@ Both `observed` and `var_to_name` are updated at every level.
 """
 function injectObservedEquations(sys, observedEqs::Vector)
   local existingObs = ModelingToolkit.get_observed(sys)
-  local seenLHS = Set{String}()
+  local seenLHS = OrderedSet{String}()
   for eq in existingObs
     push!(seenLHS, string(Symbolics.unwrap(eq.lhs)))
   end
@@ -1742,7 +1742,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   #= Filter guesses to only include variables that are unknowns of the reduced system.
      After structural_simplify, many original unknowns become observed (algebraically
      determined). Keeping guesses for those creates an overdetermined initialization. =#
-  local reducedUnknowns = Set(unknowns(sys))
+  local reducedUnknowns = OrderedSet(unknowns(sys))
   local currentGuesses = ModelingToolkit.guesses(sys)
   local filteredGuesses = Dict(k => v for (k, v) in currentGuesses if k in reducedUnknowns)
   if length(filteredGuesses) != length(currentGuesses)
@@ -1817,7 +1817,7 @@ function dae_order_lowering(eqs, iv, unknown_vars)
   diff_eqs = Equation[]
   diff_vars = OrderedSet()
   alge_eqs = Equation[]
-  vars = Set()
+  vars = OrderedSet()
   subs = Dict()
 
   for (i, eq) in enumerate(eqs)

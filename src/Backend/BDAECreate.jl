@@ -37,6 +37,7 @@ module BDAECreate
 
 using MetaModelica
 using ExportAll
+using DataStructures: OrderedSet
 
 import ..BDAE
 import ..BDAEUtil
@@ -207,7 +208,7 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
      equations. So no global flag is needed — just gate the eager
      pre-collection on `isempty(algorithms)` to keep LotkaVolterra-style
      models paying zero per-model overhead. =#
-  local _whenLifterSkipLhs = Set{String}()
+  local _whenLifterSkipLhs = OrderedSet{String}()
   if !isempty(algorithms)
     local _eqLhsBoundCrefs = @BACKEND_PERFLOG "[BDAE: lifter] collectAllCrefsInEquations" _collectAllCrefsInEquations(equations)
     local _paramOrConstNames = @BACKEND_PERFLOG "[BDAE: lifter] collectParamOrConstNames" _collectParamOrConstNames(variables)
@@ -331,7 +332,7 @@ structuralHash(@nospecialize(x)) = structuralHash(x, zero(UInt))
   Keeps the first occurrence of each unique equation.
 """
 function deduplicateEquations(equations::Vector)::Vector
-  local seen = Set{UInt}()
+  local seen = OrderedSet{UInt}()
   local unique_eqs = similar(equations, 0)
   local duplicateCount = 0
   for eq in equations
@@ -947,7 +948,7 @@ via OMFrontend's existing Statement → DAE.Statement conversion, then mapped to
 BDAE.WhenOperator entries. Compound conditions (e.g. `when (initial() or c)`) are
 intentionally skipped per Modelica spec §8/§11.
 """
-Base.@nospecializeinfer function _pushExpCrefStrings!(names::Set{String}, @nospecialize(exp))
+Base.@nospecializeinfer function _pushExpCrefStrings!(names::OrderedSet{String}, @nospecialize(exp))
   exp === nothing && return
   local crefs = Util.getAllCrefs(exp)
   for c in crefs
@@ -960,8 +961,8 @@ end
    BDAE equations. Used as the "already constrained" set for the
    algorithm-residual lifter, so we do not introduce a competing residual for
    a variable that a connect-style or normal equation already binds. =#
-function _collectAllCrefsInEquations(equations)::Set{String}
-  local names = Set{String}()
+function _collectAllCrefsInEquations(equations)::OrderedSet{String}
+  local names = OrderedSet{String}()
   for eq in equations
     if eq isa BDAE.EQUATION
       _pushExpCrefStrings!(names, eq.lhs); _pushExpCrefStrings!(names, eq.rhs)
@@ -1018,8 +1019,8 @@ end
    names of every entry whose `varKind` is `PARAM` or `CONST`. Iterating
    the materialized BDAE vector avoids touching the lazier frontend list
    that triggered a multi-minute stall on first call. =#
-function _collectParamOrConstNames(variables::Vector{BDAE.VAR})::Set{String}
-  local names = Set{String}()
+function _collectParamOrConstNames(variables::Vector{BDAE.VAR})::OrderedSet{String}
+  local names = OrderedSet{String}()
   sizehint!(names, 2 * length(variables))
   for var in variables
     local k = var.varKind
@@ -1051,8 +1052,8 @@ end
 Base.@nospecializeinfer function _collectAssignResidualsFromDAEStmts!(out::Vector{BDAE.Equation},
                                               @nospecialize(daeStmts),
                                               @nospecialize(source),
-                                              eqLhsBoundCrefs::Set{String},
-                                              whenLifterSkipLhs::Set{String} = Set{String}())
+                                              eqLhsBoundCrefs::OrderedSet{String},
+                                              whenLifterSkipLhs::OrderedSet{String} = OrderedSet{String}())
   for s in daeStmts
     @match s begin
       DAE.STMT_ASSIGN(ty, lhs, rhs, src) => begin
@@ -1151,8 +1152,8 @@ the LHS cref already appears in another equation (e.g. driven by a
 over-determine the system.
 """
 Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospecialize(algorithms),
-                                                  eqLhsBoundCrefs::Set{String} = Set{String}(),
-                                                  whenLifterSkipLhs::Set{String} = Set{String}())::Vector{BDAE.Equation}
+                                                  eqLhsBoundCrefs::OrderedSet{String} = OrderedSet{String}(),
+                                                  whenLifterSkipLhs::OrderedSet{String} = OrderedSet{String}())::Vector{BDAE.Equation}
   local out = BDAE.Equation[]
   for alg in algorithms
     #= Skip whole algorithm if every top-level statement is ALG_WHEN — those are
@@ -1192,7 +1193,7 @@ end
    RHS of STMT_ASSIGN / STMT_ASSIGN_ARR and inside nested STMT_IF / STMT_FOR
    / STMT_WHILE). Used by the when-equation lifter to build the `change(...)`
    trigger condition. =#
-Base.@nospecializeinfer function _pushExpRhsCrefs!(out::Set{Tuple{DAE.ComponentRef, DAE.Type}}, @nospecialize(exp))
+Base.@nospecializeinfer function _pushExpRhsCrefs!(out::OrderedSet{Tuple{DAE.ComponentRef, DAE.Type}}, @nospecialize(exp))
   exp === nothing && return nothing
   for c in Util.getAllCrefs(exp)
     local ty = _crefType(c)
@@ -1202,7 +1203,7 @@ Base.@nospecializeinfer function _pushExpRhsCrefs!(out::Set{Tuple{DAE.ComponentR
   return nothing
 end
 
-Base.@nospecializeinfer function _walkRhsCrefsInDAEStmts!(out::Set{Tuple{DAE.ComponentRef, DAE.Type}}, @nospecialize(stmts))
+Base.@nospecializeinfer function _walkRhsCrefsInDAEStmts!(out::OrderedSet{Tuple{DAE.ComponentRef, DAE.Type}}, @nospecialize(stmts))
   for s in stmts
     @match s begin
       DAE.STMT_ASSIGN(_, _, rhs, _) => _pushExpRhsCrefs!(out, rhs)
@@ -1221,8 +1222,8 @@ Base.@nospecializeinfer function _walkRhsCrefsInDAEStmts!(out::Set{Tuple{DAE.Com
   return nothing
 end
 
-function _collectRhsCrefsInDAEStmts(daeStmts)::Set{Tuple{DAE.ComponentRef, DAE.Type}}
-  local out = Set{Tuple{DAE.ComponentRef, DAE.Type}}()
+function _collectRhsCrefsInDAEStmts(daeStmts)::OrderedSet{Tuple{DAE.ComponentRef, DAE.Type}}
+  local out = OrderedSet{Tuple{DAE.ComponentRef, DAE.Type}}()
   _walkRhsCrefsInDAEStmts!(out, daeStmts)
   return out
 end
@@ -1325,9 +1326,9 @@ INV3S's `nextstate := Buf3sTable[...]; yy := nextstate;` and resolves the
 INV3S/MUX2x1/NRXFER/NXFER/BUF3S cluster-A validate failures.
 """
 function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
-                                                      paramOrConstNames::Set{String} = Set{String}())
+                                                      paramOrConstNames::OrderedSet{String} = OrderedSet{String}())
   local out = BDAE.Equation[]
-  local liftedLhsNames = Set{String}()
+  local liftedLhsNames = OrderedSet{String}()
   for alg in algorithms
     local statements = alg.statements
     isempty(statements) && continue
@@ -1622,7 +1623,7 @@ Base.@nospecializeinfer function _scalarizeRhs(@nospecialize(rhs),
 end
 
 Base.@nospecializeinfer function _emitAlgorithmAssignOps!(ops::Vector{BDAE.WhenOperator},
-                                                          liftedLhsNames::Set{String},
+                                                          liftedLhsNames::OrderedSet{String},
                                                           @nospecialize(lhs),
                                                           @nospecialize(rhs),
                                                           @nospecialize(ty),
@@ -1651,7 +1652,7 @@ Base.@nospecializeinfer function _emitAlgorithmAssignOps!(ops::Vector{BDAE.WhenO
 end
 
 Base.@nospecializeinfer function _appendElseAlgorithmOps!(ops::Vector{BDAE.WhenOperator},
-                                                          liftedLhsNames::Set{String},
+                                                          liftedLhsNames::OrderedSet{String},
                                                           @nospecialize(elsePart),
                                                           @nospecialize(activeCond),
                                                           iterVals::Dict{String, Int},
@@ -1674,7 +1675,7 @@ Base.@nospecializeinfer function _appendElseAlgorithmOps!(ops::Vector{BDAE.WhenO
 end
 
 Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenOperator},
-                                                          liftedLhsNames::Set{String},
+                                                          liftedLhsNames::OrderedSet{String},
                                                           @nospecialize(stmts),
                                                           @nospecialize(activeCond),
                                                           iterVals::Dict{String, Int},
@@ -1720,17 +1721,17 @@ end
 Base.@nospecializeinfer function _buildAlgorithmBodyOps(@nospecialize(daeStmts),
                                                         initialValue::Bool)
   local ops = BDAE.WhenOperator[]
-  local lhsNames = Set{String}()
+  local lhsNames = OrderedSet{String}()
   local ok = _appendAlgorithmStmtOps!(ops, lhsNames, daeStmts, nothing,
                                       Dict{String, Int}(), initialValue)
-  ok || return (BDAE.WhenOperator[], Set{String}())
+  ok || return (BDAE.WhenOperator[], OrderedSet{String}())
   return (ops, lhsNames)
 end
 
 Base.@nospecializeinfer function _collectDiscreteRhsCrefsFromWhenOps(ops::Vector{BDAE.WhenOperator},
-                                                                     assignedLhs::Set{String})
+                                                                     assignedLhs::OrderedSet{String})
   local out = DAE.ComponentRef[]
-  local seen = Set{String}()
+  local seen = OrderedSet{String}()
   local blocked = copy(assignedLhs)
   local ctx = (out, seen, blocked)
   for op in ops
@@ -1761,8 +1762,8 @@ end
 Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BDAE.Equation},
                                                                   daeStmts,
                                                                   @nospecialize(source),
-                                                                  liftedLhsNames::Set{String},
-                                                                  paramOrConstNames::Set{String} = Set{String}())
+                                                                  liftedLhsNames::OrderedSet{String},
+                                                                  paramOrConstNames::OrderedSet{String} = OrderedSet{String}())
   local initOps, initLhs = _buildAlgorithmBodyOps(daeStmts, true)
   local runOps, runLhs = _buildAlgorithmBodyOps(daeStmts, false)
   union!(liftedLhsNames, initLhs)
@@ -1795,7 +1796,7 @@ Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BD
      Without this a body whose only discrete RHS cref is the constant seed (y0)
      gets a dead `change(<param>)` trigger and never fires. =#
   local relTriggers = DAE.Exp[]
-  local relSeen = Set{String}()
+  local relSeen = OrderedSet{String}()
   for op in runOps
     @match op begin
       BDAE.ASSIGN(_, rhs, _) => begin
@@ -1833,8 +1834,8 @@ Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BD
 end
 
 Base.@nospecializeinfer function _pushDiscreteCref!(out::Vector{DAE.ComponentRef},
-                                                    seen::Set{String},
-                                                    blocked::Set{String},
+                                                    seen::OrderedSet{String},
+                                                    blocked::OrderedSet{String},
                                                     @nospecialize(cref))
   cref isa DAE.ComponentRef || return nothing
   _isTimeCref(cref) && return nothing
@@ -1850,7 +1851,7 @@ Base.@nospecializeinfer function _pushDiscreteCref!(out::Vector{DAE.ComponentRef
 end
 
 Base.@nospecializeinfer function _visitDiscreteRhsCref(@nospecialize(exp),
-                                                       ctx::Tuple{Vector{DAE.ComponentRef}, Set{String}, Set{String}})
+                                                       ctx::Tuple{Vector{DAE.ComponentRef}, OrderedSet{String}, OrderedSet{String}})
   @match exp begin
     DAE.CREF(cr, _) => _pushDiscreteCref!(ctx[1], ctx[2], ctx[3], cr)
     DAE.REDUCTION(_, _, iters) => _collectReductionIterNames!(ctx[3], iters)
@@ -1859,7 +1860,7 @@ Base.@nospecializeinfer function _visitDiscreteRhsCref(@nospecialize(exp),
   return (exp, true, ctx)
 end
 
-Base.@nospecializeinfer function _collectReductionIterNames!(blocked::Set{String}, @nospecialize(iters))
+Base.@nospecializeinfer function _collectReductionIterNames!(blocked::OrderedSet{String}, @nospecialize(iters))
   for it in iters
     @match it begin
       DAE.REDUCTIONITER(id, _, _, _) => push!(blocked, id)
@@ -1870,8 +1871,8 @@ Base.@nospecializeinfer function _collectReductionIterNames!(blocked::Set{String
 end
 
 Base.@nospecializeinfer function _walkDiscreteStmtsForRhsCrefs!(out::Vector{DAE.ComponentRef},
-                                                                seen::Set{String},
-                                                                blocked::Set{String},
+                                                                seen::OrderedSet{String},
+                                                                blocked::OrderedSet{String},
                                                                 @nospecialize(stmts))
   local ctx = (out, seen, blocked)
   for s in stmts
@@ -1900,8 +1901,8 @@ end
 
 Base.@nospecializeinfer function _collectDiscreteRhsCrefs(@nospecialize(daeStmts))::Vector{DAE.ComponentRef}
   local out = DAE.ComponentRef[]
-  local seen = Set{String}()
-  local blocked = Set{String}()
+  local seen = OrderedSet{String}()
+  local blocked = OrderedSet{String}()
   _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, daeStmts)
   return out
 end
@@ -1937,7 +1938,7 @@ end
 #= Discrete-time predicate: an expression with no continuous-Real dependence
    OUTSIDE a relation. Relations are event sources, so their (possibly continuous)
    operands are allowed. =#
-Base.@nospecializeinfer function _isDiscreteTimeExp(@nospecialize(exp), paramOrConstNames::Set{String})::Bool
+Base.@nospecializeinfer function _isDiscreteTimeExp(@nospecialize(exp), paramOrConstNames::OrderedSet{String})::Bool
   @match exp begin
     DAE.RELATION(__) => true
     DAE.LBINARY(e1, _, e2) => _isDiscreteTimeExp(e1, paramOrConstNames) && _isDiscreteTimeExp(e2, paramOrConstNames)
@@ -1959,7 +1960,7 @@ end
 #= Collect the (structurally deduplicated) RELATION subtrees of `exp`. =#
 Base.@nospecializeinfer function _collectRelationsInExp(@nospecialize(exp))::Vector{DAE.Exp}
   local rels = DAE.Exp[]
-  local seen = Set{String}()
+  local seen = OrderedSet{String}()
   function visit(@nospecialize(e), arg)
     if e isa DAE.RELATION
       local key = string(e)
@@ -1982,7 +1983,7 @@ end
    zero-crossing event source. A relation over only discrete/param/const operands
    (e.g. `pre(mode) == Stuck`) has no smooth crossing and must NOT become an
    event — it is re-evaluated inside the affect from pre-event state instead. =#
-Base.@nospecializeinfer function _relationHasContinuousOperand(@nospecialize(rel::DAE.Exp), paramOrConstNames::Set{String})::Bool
+Base.@nospecializeinfer function _relationHasContinuousOperand(@nospecialize(rel::DAE.Exp), paramOrConstNames::OrderedSet{String})::Bool
   local found = false
   function visit(@nospecialize(e), arg)
     if e isa DAE.CREF && !found
@@ -2012,7 +2013,7 @@ end
    as a candidate so it can join a coupled cluster (it is event-driven through
    its siblings' relations). =#
 Base.@nospecializeinfer function _discreteBoolCandidate(@nospecialize(eq::BDAE.Equation),
-                                                        paramOrConstNames::Set{String})
+                                                        paramOrConstNames::OrderedSet{String})
   eq isa BDAE.EQUATION || return nothing
   local lhs = eq.lhs
   lhs isa DAE.CREF || return nothing
@@ -2031,8 +2032,8 @@ end
 #= Candidate cref names referenced anywhere in `exp` (including inside pre()).
    Used to connect a cluster: two candidates are coupled if either references
    the other. =#
-Base.@nospecializeinfer function _candRefsAnywhere(@nospecialize(exp::DAE.Exp), restrict::Set{String})::Set{String}
-  local found = Set{String}()
+Base.@nospecializeinfer function _candRefsAnywhere(@nospecialize(exp::DAE.Exp), restrict::OrderedSet{String})::OrderedSet{String}
+  local found = OrderedSet{String}()
   function visit(@nospecialize(e), arg)
     if e isa DAE.CREF
       local nm = string(e.componentRef)
@@ -2047,8 +2048,8 @@ end
 #= Candidate cref names referenced OUTSIDE any pre(): the topological-order
    edges. References inside pre() are loop-breakers (read the pre-event value)
    and impose no order. =#
-Base.@nospecializeinfer function _candRefsOutsidePre(@nospecialize(exp::DAE.Exp), restrict::Set{String})::Set{String}
-  local found = Set{String}()
+Base.@nospecializeinfer function _candRefsOutsidePre(@nospecialize(exp::DAE.Exp), restrict::OrderedSet{String})::OrderedSet{String}
+  local found = OrderedSet{String}()
   function f(@nospecialize(e), arg)
     @match e begin
       DAE.CALL(Absyn.IDENT("pre"), _, _) => (e, false, arg)
@@ -2105,7 +2106,7 @@ end
 #= Fold `pre(member)` (member a lifted cluster discrete) to the member's start
    value for the INITIAL_WHEN body. The default false matches the Boolean start
    default; pre() of non-members is left untouched. =#
-Base.@nospecializeinfer function _foldPreOfMembers(@nospecialize(exp::DAE.Exp), members::Set{String},
+Base.@nospecializeinfer function _foldPreOfMembers(@nospecialize(exp::DAE.Exp), members::OrderedSet{String},
                                                    startLookup::Dict{String, DAE.Exp})
   function f(@nospecialize(e), arg)
     @match e begin
@@ -2124,8 +2125,8 @@ Base.@nospecializeinfer function _foldPreOfMembers(@nospecialize(exp::DAE.Exp), 
 end
 
 #= Connected components over the undirected coupling graph. =#
-function _connectedComponents(names::Vector{String}, adj::Dict{String, Set{String}})::Vector{Vector{String}}
-  local seen = Set{String}()
+function _connectedComponents(names::Vector{String}, adj::Dict{String, OrderedSet{String}})::Vector{Vector{String}}
+  local seen = OrderedSet{String}()
   local comps = Vector{String}[]
   for start in names
     start in seen && continue
@@ -2150,7 +2151,7 @@ end
    member that references it outside pre). Returns the ordered names, or
    `nothing` if a non-pre cycle survives (the cluster is then left unlifted). =#
 function _topoOrderCluster(cluster::Vector{String}, candByName::Dict{String, Any})::Union{Vector{String}, Nothing}
-  local clusterSet = Set(cluster)
+  local clusterSet = OrderedSet(cluster)
   local indeg = Dict{String, Int}(n => 0 for n in cluster)
   local succ = Dict{String, Vector{String}}(n => String[] for n in cluster)
   for n in cluster
@@ -2180,16 +2181,16 @@ end
    INITIAL_WHEN + one runtime WHEN (triggered by `change()` over the UNION of the
    cluster's relations) whose bodies are the ordered ASSIGN list. =#
 function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{String},
-                               candByName::Dict{String, Any}, liftedLhs::Set{String},
+                               candByName::Dict{String, Any}, liftedLhs::OrderedSet{String},
                                startLookup::Dict{String, DAE.Exp},
-                               paramOrConstNames::Set{String})
+                               paramOrConstNames::OrderedSet{String})
   local order = _topoOrderCluster(cluster, candByName)
   if order === nothing
     @warn "[BDAE: lifter] cyclic discrete cluster left unlifted" cluster
     for n in cluster; push!(out, candByName[n].eq); end
     return
   end
-  local members = Set(cluster)
+  local members = OrderedSet(cluster)
   local subst = Dict{String, DAE.Exp}()
   local body = Tuple{DAE.Exp, DAE.Exp, Any}[]
   for n in order
@@ -2202,7 +2203,7 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
      All-discrete relations such as `pre(mode) == Stuck` are kept in the affect
      RHS but excluded as event sources. =#
   local rels = DAE.Exp[]
-  local seen = Set{String}()
+  local seen = OrderedSet{String}()
   for (_, r, _) in body
     for rel in _collectRelationsInExp(r)
       local k = string(rel)
@@ -2241,7 +2242,7 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
 end
 
 """
-    synthesizeWhenEquationsFromDiscreteEquations(equations, paramOrConstNames) -> (Vector{BDAE.Equation}, Set{String})
+    synthesizeWhenEquationsFromDiscreteEquations(equations, paramOrConstNames) -> (Vector{BDAE.Equation}, OrderedSet{String})
 
 Replace qualifying discrete-Boolean/Integer equation-section definitions with
 paired INITIAL_WHEN + runtime WHEN equations. Mutually-referencing definitions
@@ -2253,7 +2254,7 @@ unchanged, so models with no discrete-time defining equations pay only a single
 linear scan.
 """
 function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equation},
-                                                      paramOrConstNames::Set{String} = Set{String}(),
+                                                      paramOrConstNames::OrderedSet{String} = OrderedSet{String}(),
                                                       startLookup::Dict{String, DAE.Exp} = Dict{String, DAE.Exp}())
   local out = BDAE.Equation[]
   local candByName = Dict{String, Any}()
@@ -2267,9 +2268,9 @@ function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equ
       push!(candNames, c.name)
     end
   end
-  isempty(candNames) && return (equations, Set{String}())
-  local candSet = Set(candNames)
-  local adj = Dict{String, Set{String}}(n => Set{String}() for n in candNames)
+  isempty(candNames) && return (equations, OrderedSet{String}())
+  local candSet = OrderedSet(candNames)
+  local adj = Dict{String, OrderedSet{String}}(n => OrderedSet{String}() for n in candNames)
   for n in candNames
     for r in _candRefsAnywhere(candByName[n].rhs, candSet)
       if r != n
@@ -2277,7 +2278,7 @@ function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equ
       end
     end
   end
-  local liftedLhs = Set{String}()
+  local liftedLhs = OrderedSet{String}()
   for cluster in _connectedComponents(candNames, adj)
     _emitDiscreteCluster!(out, cluster, candByName, liftedLhs, startLookup, paramOrConstNames)
   end
@@ -2326,7 +2327,7 @@ end
 Base.@nospecializeinfer function _liftAlgAssignToInitialWhen!(out::Vector{BDAE.Equation},
                                                               @nospecialize(stmt),
                                                               @nospecialize(source),
-                                                              paramOrConstNames::Set{String} = Set{String}())
+                                                              paramOrConstNames::OrderedSet{String} = OrderedSet{String}())
   @match stmt begin
     DAE.STMT_ASSIGN(ty, lhs, rhs, asrc) => begin
       _isDiscreteDAEType(ty) || return (false, nothing)
@@ -2335,7 +2336,7 @@ Base.@nospecializeinfer function _liftAlgAssignToInitialWhen!(out::Vector{BDAE.E
                                             MetaModelica.list(),
                                             DAE.callAttrBuiltinBool)
       local changeCond::Union{DAE.Exp, Nothing} = nothing
-      local rhsCrefs = Set{Tuple{DAE.ComponentRef, DAE.Type}}()
+      local rhsCrefs = OrderedSet{Tuple{DAE.ComponentRef, DAE.Type}}()
       for c in Util.getAllCrefs(rhs)
         local cty = _crefType(c)
         cty === nothing && continue

@@ -968,13 +968,13 @@ Extract all variable names referenced by a DAE expression, using the robust
 `Util.getAllCrefs` traversal (via `traverseExpTopDown`). Falls back to base-name
 matching for ASUB-wrapped CREFs where subscripts are separated from the CREF.
 
-Returns a Set{String} of variable names that exist in the HT.
+Returns a OrderedSet{String} of variable names that exist in the HT.
 """
 function collectEquationVarNames(exp::DAE.Exp,
                                  ht::OrderedDict{String, Tuple{Integer, SimVar}},
-                                 baseNameToFullNames::Dict{String, Vector{String}})::Set{String}
+                                 baseNameToFullNames::Dict{String, Vector{String}})::OrderedSet{String}
   local crefs::List{DAE.ComponentRef} = Util.getAllCrefs(exp)
-  local names = Set{String}()
+  local names = OrderedSet{String}()
   for cr in crefs
     local name = DAE_identifierToString(cr)
     if haskey(ht, name)
@@ -1082,7 +1082,7 @@ Identify variables and equations that do not influence the dynamic states.
 Performs a backward reachability analysis from state and state-derivative equations
 through the causalized equation dependency graph.
 
-Returns `(outputOnlyVarNames::Set{String}, outputOnlyEqIndices::Set{Int})`.
+Returns `(outputOnlyVarNames::OrderedSet{String}, outputOnlyEqIndices::OrderedSet{Int})`.
 Variables in the returned set are purely "output" (they can be computed from states
 but do not feed back into any state derivative).
 """
@@ -1090,7 +1090,7 @@ but do not feed back into any state derivative).
 # SIM-native cref-name collection: walk the SIM tree directly via traverseExpTopDown
 # (no toDAEExp of the whole tree). The ASUB arm reconstructs the subscripted key
 # (e.g. "R_T[1][1]") so the use-def chain matches the scalarized hash-table keys.
-function _collectCrefNamesVisitor(@nospecialize(e), names::Set{String})
+function _collectCrefNamesVisitor(@nospecialize(e), names::OrderedSet{String})
   if e isa EXP_CREF
     push!(names, DAE_identifierToString(toDAECref(e.cref).componentRef))
   elseif e isa ASUB && e.exp isa EXP_CREF
@@ -1108,10 +1108,10 @@ function _collectCrefNamesVisitor(@nospecialize(e), names::Set{String})
   end
   return (e, true, names)
 end
-collectCrefNames!(names::Set{String}, exp::Exp) =
+collectCrefNames!(names::OrderedSet{String}, exp::Exp) =
   (traverseExpTopDown(exp, _collectCrefNamesVisitor, names); names)
 
-function collectCrefNames!(names::Set{String}, @nospecialize(exp))
+function collectCrefNames!(names::OrderedSet{String}, @nospecialize(exp))
   @match exp begin
     DAE.CREF(cr, _) => begin
       push!(names, DAE_identifierToString(cr))
@@ -1195,7 +1195,7 @@ function collectCrefNames!(names::Set{String}, @nospecialize(exp))
 end
 
 function _hasUnknownCref(exp, ht)::Bool
-  local names = Set{String}()
+  local names = OrderedSet{String}()
   collectCrefNames!(names, exp)
   for name in names
     local entry = get(ht, name, nothing)
@@ -1548,7 +1548,7 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
   #= Build the base name index for robust CREF extraction =#
   local baseNameToFullNames = buildBaseNameIndex(ht)
   #= Build expression-level dependency: for each equation, which variable names does it reference? =#
-  local eqRefs = Vector{Set{String}}(undef, nEqs)
+  local eqRefs = Vector{OrderedSet{String}}(undef, nEqs)
   for i in 1:nEqs
     eqRefs[i] = collectEquationVarNames(toDAEExp(resEqs[i].exp), ht, baseNameToFullNames)
   end
@@ -1570,7 +1570,7 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
     end
   end
   #= Find seed equations: those matched to essential variable kinds =#
-  local seedEqs = Set{Int}()
+  local seedEqs = OrderedSet{Int}()
   for (varName, (_idx, sv)) in ht
     local isEssentialKind = @match sv.varKind begin
       STATE(__) => true
@@ -1598,13 +1598,13 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
     end
   end
   #= Classify unmatched equations: seed those referencing unknowns =#
-  local matchedEqs = Set{Int}()
+  local matchedEqs = OrderedSet{Int}()
   for (matchIdx, eqIdx) in enumerate(matchOrder)
     if eqIdx > 0
       push!(matchedEqs, eqIdx)
     end
   end
-  local unknownNames = Set{String}()
+  local unknownNames = OrderedSet{String}()
   for (vn, (_idx, sv)) in ht
     local isUnknown = @match sv.varKind begin
       STATE(__) => true
@@ -1637,7 +1637,7 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
   #= BFS: from seed equations, follow the use-def chain backward.
      For each equation, find all variable names it references. For each referenced
      variable, find the equation that PRODUCES it (via varNameToEq). Enqueue that. =#
-  local essentialEqs = Set{Int}()
+  local essentialEqs = OrderedSet{Int}()
   local queue = collect(seedEqs)
   while !isempty(queue)
     local eqIdx = popfirst!(queue)
@@ -1666,8 +1666,8 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
     end
   end
   #= Identify output-only equations and their matched variables =#
-  local outputOnlyEqIndices = Set{Int}()
-  local outputOnlyVarNames = Set{String}()
+  local outputOnlyEqIndices = OrderedSet{Int}()
+  local outputOnlyVarNames = OrderedSet{String}()
   local eqToMatchIdx = Dict{Int, Int}()
   for (matchIdx, eqIdx) in enumerate(matchOrder)
     if eqIdx > 0
@@ -1753,8 +1753,8 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   end
   #= Only eliminate output-only equation-variable PAIRS where the matched variable
      is ALG_VARIABLE or ARRAY. This preserves equation-unknown balance. =#
-  local eqsToEliminate = Set{Int}()
-  local varsToRemove = Set{String}()
+  local eqsToEliminate = OrderedSet{Int}()
+  local varsToRemove = OrderedSet{String}()
   local eliminatedPairs = Tuple{String, Int}[]  #= (varName, eqIdx) for pairing =#
   local nSkippedNonAlg = 0
   local nSkippedUnmatched = 0
@@ -1801,18 +1801,18 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
      Build reverse index: variable name -> equations that reference it. =#
   local resEqs = simCode.residualEquations
   local nEqs = length(resEqs)
-  local varNameToRefEqs = Dict{String, Set{Int}}()
+  local varNameToRefEqs = Dict{String, OrderedSet{Int}}()
   for eqIdx in 1:nEqs
     for refName in eqRefs[eqIdx]
       if !haskey(varNameToRefEqs, refName)
-        varNameToRefEqs[refName] = Set{Int}()
+        varNameToRefEqs[refName] = OrderedSet{Int}()
       end
       push!(varNameToRefEqs[refName], eqIdx)
     end
   end
   #= Collect variable names referenced by when-equations so they are never eliminated.
      When-equations live outside the residual system and are not in varNameToRefEqs. =#
-  local whenRefNames = Set{String}()
+  local whenRefNames = OrderedSet{String}()
   for whenEq in simCode.whenEquations
     _collectWhenCrefNames!(whenRefNames, whenEq.whenEquation)
   end
@@ -1821,7 +1821,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
      eliminated equations. Codegen later flattens the parent Complex CREF into
      its two scalar fields and looks them up by symbol; if either field is
      dropped here we hit `UndefVarError` at MTK module eval. =#
-  local complexRefNames = Set{String}()
+  local complexRefNames = OrderedSet{String}()
   _collectComplexFieldNames!(complexRefNames, simCode.residualEquations, ht)
   _collectComplexFieldNames!(complexRefNames, simCode.initialEquations, ht)
   for ifEq in simCode.ifEquations
@@ -1832,7 +1832,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   for eq in simCode.eliminatedEquations
     _collectComplexFieldNames!(complexRefNames, [eq], ht)
   end
-  local rescuedVars = Set{String}()
+  local rescuedVars = OrderedSet{String}()
   for vn in varsToRemove
     local referencedBySurvivor = false
     #= Check residual equations =#
@@ -2137,7 +2137,7 @@ function _classifyAdditionalDiscreteVariables(simCode::SIM_CODE)::SIM_CODE
 
   #= Step 1: collect every var name that appears as LHS of a when-ASSIGN
      or as the target of a when-REINIT. =#
-  local whenLhsNames = Set{String}()
+  local whenLhsNames = OrderedSet{String}()
   for whenEq in simCode.whenEquations
     _collectWhenAssignTargets!(whenLhsNames, whenEq.whenEquation)
   end
@@ -2166,7 +2166,7 @@ end
 
 #= Walk a BDAE.WhenEquation (WHEN_STMTS) tree, collecting every variable
    name that is assigned or reinit-ed inside. Recurses into elsewhen. =#
-function _collectWhenAssignTargets!(names::Set{String}, whenEq)
+function _collectWhenAssignTargets!(names::OrderedSet{String}, whenEq)
   if whenEq isa WHEN_STMTS
     for stmt in whenEq.whenStmtLst
       if stmt isa ASSIGN
@@ -2259,7 +2259,7 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
      to condition-only references here. `_THETA` markers
      (overconstrained-connector Zimmer constant) are preserved
      separately. =#
-  local excludedFromFold = Set{String}()
+  local excludedFromFold = OrderedSet{String}()
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
       #= Else branches (identifier == -1) carry a trivial/constant
@@ -2278,7 +2278,7 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
     end
   end
   #= Snapshot of ALG-unknown names: only these are candidates for folding. =#
-  local algNames = Set{String}()
+  local algNames = OrderedSet{String}()
   for (name, (_, sv)) in ht
     if name in excludedFromFold
       continue
@@ -2312,8 +2312,8 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
   end
 
   local foldMap = Dict{String, DAE.Exp}()
-  local foldedNames = Set{String}()
-  local elimIdxSet = Set{Int}()
+  local foldedNames = OrderedSet{String}()
+  local elimIdxSet = OrderedSet{Int}()
 
   #= Iterate to fixed point: a freshly folded variable may unlock
      downstream closures (e.g. sd_max = 1/abs(aux1[1]) becomes foldable
@@ -2410,7 +2410,7 @@ Used by the fold to pre-index "defining equations": residuals that name a
 variable in their top-level subtraction. If a name appears in more than one
 such residual, MTK owns the disambiguation.
 """
-function extractBinarySubLhsCrefName(@nospecialize(exp), candidateNames::Set{String})
+function extractBinarySubLhsCrefName(@nospecialize(exp), candidateNames::OrderedSet{String})
   @match exp begin
     DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
       local isSub = @match op begin
@@ -2468,7 +2468,7 @@ Intentionally narrow: more exotic shapes (ADD with sign flip, MUL by
 parameter divisor, CALL-wrapped LHS) are left to MTK.
 """
 function detectSolvableParameterClosure(@nospecialize(exp), matchedName::String,
-                                        ht, foldedNames::Set{String})
+                                        ht, foldedNames::OrderedSet{String})
   @match exp begin
     DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
       local isSub = @match op begin
@@ -2532,9 +2532,9 @@ Names absent from `ht` are rejected conservatively: they are typically
 subscripted or array-element references whose parameter status is not
 robustly recoverable by string match here.
 """
-function isParameterClosureExp(@nospecialize(exp), ht, foldedNames::Set{String},
+function isParameterClosureExp(@nospecialize(exp), ht, foldedNames::OrderedSet{String},
                                excludeName::String)::Bool
-  local names = Set{String}()
+  local names = OrderedSet{String}()
   collectCrefNames!(names, exp)
   for n in names
     if n == excludeName
@@ -2557,7 +2557,7 @@ end
 
 struct _CanonicalNameContext
   rename::Dict{String, String}
-  known::Set{String}
+  known::OrderedSet{String}
   nameMap::OMBackend.NameRewriteMap
 end
 
@@ -2904,7 +2904,7 @@ function _canonicalizeEquation(eq, ctx::_CanonicalNameContext)
   return eq
 end
 
-function _recordFunctionVarName!(known::Set{String}, v::DAE.VAR,
+function _recordFunctionVarName!(known::OrderedSet{String}, v::DAE.VAR,
                                  ctx::_CanonicalNameContext)
   local original = _originalCrefName(v.componentRef)
   local canonical = OMBackend.canonicalName(v.componentRef)
@@ -3132,7 +3132,7 @@ function _canonicalizeAlgorithm(alg::DAE.Algorithm, ctx::_CanonicalNameContext):
 end
 
 function _functionCanonicalNameContext(f, ctx::_CanonicalNameContext)
-  local known = Set{String}(["time", "pi", "e"])
+  local known = OrderedSet{String}(["time", "pi", "e"])
   if hasproperty(f, :inputs)
     for v in f.inputs
       _recordFunctionVarName!(known, v, ctx)
@@ -3198,8 +3198,8 @@ function canonicalizeCrefNames(simCode::SIM_CODE;
     rename["t"] = _renamedT
   end
 
-  local known = Set{String}(values(rename))
-  union!(known, Set(["time", "pi", "e"]))
+  local known = OrderedSet{String}(values(rename))
+  union!(known, OrderedSet(["time", "pi", "e"]))
   local ctx = _CanonicalNameContext(rename, known, nameMap)
 
   @assign begin
@@ -3413,16 +3413,16 @@ function propagateConstants(simCode::SIM_CODE)
   local ht = simCode.stringToSimVarHT
   local resEqs = simCode.residualEquations
   local nEqs = length(resEqs)
-  local sharedVarSet = Set{String}(simCode.sharedVariables)
-  local irreducibleSet = Set{String}(simCode.irreducibleVariables)
+  local sharedVarSet = OrderedSet{String}(simCode.sharedVariables)
+  local irreducibleSet = OrderedSet{String}(simCode.irreducibleVariables)
 
   #= Phase 1: Detect constant equations.
      First collect all base array names referenced in equations so we can skip
      eliminating scalar elements whose base array is still used (e.g. as a
      function call argument). =#
-  local allBaseNames = Set{String}()
+  local allBaseNames = OrderedSet{String}()
   for eq in resEqs
-    local eqNames = Set{String}()
+    local eqNames = OrderedSet{String}()
     collectCrefNames!(eqNames, toDAEExp(eq.exp))
     for n in eqNames
       if !occursin('[', n)
@@ -3436,8 +3436,8 @@ function propagateConstants(simCode::SIM_CODE)
   end
 
   local constMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
-  local constEqIndices = Set{Int}()
-  local trivialEqIndices = Set{Int}()
+  local constEqIndices = OrderedSet{Int}()
+  local trivialEqIndices = OrderedSet{Int}()
   #= Record eqIdx -> unknown name at detection time. Chained folds only become
      `unknown = param` after a prior substitution, so re-detecting on the
      original equation later would miss them and drop the equation without
@@ -3578,8 +3578,8 @@ function propagateConstants(simCode::SIM_CODE)
   end
 
   #= Phase 3: Verify and remove eliminated unknowns =#
-  local eliminatedSet = Set{String}(keys(constMap))
-  local allRefNames = Set{String}()
+  local eliminatedSet = OrderedSet{String}(keys(constMap))
+  local allRefNames = OrderedSet{String}()
   for eq in newResEqs
     collectCrefNames!(allRefNames, toDAEExp(eq.exp))
   end
@@ -3602,7 +3602,7 @@ function propagateConstants(simCode::SIM_CODE)
     end
   end
 
-  local survivingRefs = Set{String}()
+  local survivingRefs = OrderedSet{String}()
   for n in allRefNames
     if n in eliminatedSet
       push!(survivingRefs, n)
@@ -3785,8 +3785,8 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   local ht = simCode.stringToSimVarHT
   local resEqs = simCode.residualEquations
   local nEqs = length(resEqs)
-  local sharedVarSet = Set{String}(simCode.sharedVariables)
-  local irreducibleSet = Set{String}(simCode.irreducibleVariables)
+  local sharedVarSet = OrderedSet{String}(simCode.sharedVariables)
+  local irreducibleSet = OrderedSet{String}(simCode.irreducibleVariables)
 
   #= ===== Step 1: Detect alias equations ===== =#
   #= Each alias is (name1, name2, negated, eqIdx, cref1, ty1, cref2, ty2) =#
@@ -3834,7 +3834,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   local visited = Dict{String, Bool}()  #= varName -> negation relative to component root =#
   local components = Vector{Vector{Tuple{String, Bool}}}()
   local componentEqs = Vector{Vector{Int}}()  #= equation indices per component =#
-  local usedEdges = Set{Int}()
+  local usedEdges = OrderedSet{Int}()
 
   for startNode in keys(adjList)
     if haskey(visited, startNode)
@@ -3869,7 +3869,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   #= Build alias resolution map and alias entries =#
   local aliasMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
   local aliasEntries = AliasEntry[]
-  local aliasEqIndices = Set{Int}()
+  local aliasEqIndices = OrderedSet{Int}()
   #= Pending attribute lifts: rep name -> merged Option{VariableAttributes}.
      Built incrementally as each alias is folded into its representative so a
      user-supplied start / fixed / stateSelect on the eliminated side ends up
@@ -4063,9 +4063,9 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   #= Collect all CREF names from remaining equations. Any eliminated variable
      still referenced means the substitution missed it (e.g. unflatten CREF form).
      Those variables must be kept in the HT to avoid KeyError during code gen. =#
-  local eliminatedSet = Set{String}(keys(aliasMap))
-  local survivingRefs = Set{String}()
-  local allRefNames = Set{String}()
+  local eliminatedSet = OrderedSet{String}(keys(aliasMap))
+  local survivingRefs = OrderedSet{String}()
+  local allRefNames = OrderedSet{String}()
   for eq in newResEqs
     collectCrefNames!(allRefNames, toDAEExp(eq.exp))
   end
@@ -4131,7 +4131,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
      contain redundant alias equations that were removed because they add no new
      constraint after substitution; those equations do not correspond to a
      removed variable and must not be appended to eliminatedEquations. =#
-  local elimVarSet = Set{String}(elimVarNames)
+  local elimVarSet = OrderedSet{String}(elimVarNames)
   local removedAliasIncidence = Tuple{Int, String, String}[]
   for (n1, n2, _, eqIdx, _, _, _, _) in aliasPairs
     if eqIdx in aliasEqIndices && (n1 in elimVarSet || n2 in elimVarSet)
@@ -4141,7 +4141,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
 
   local eqByElimVar = Dict{String, Int}()
   local varByElimEq = Dict{Int, String}()
-  function assignElimEq!(varName::String, seenEqIdxs::Set{Int})::Bool
+  function assignElimEq!(varName::String, seenEqIdxs::OrderedSet{Int})::Bool
     for (eqIdx, n1, n2) in removedAliasIncidence
       if n1 != varName && n2 != varName
         continue
@@ -4160,7 +4160,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   end
 
   for varName in elimVarNames
-    assignElimEq!(varName, Set{Int}())
+    assignElimEq!(varName, OrderedSet{Int}())
   end
 
   local pairedElimVarNames = String[]
@@ -4200,7 +4200,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
      alias observations so a later run does not discard a prior run's entries
      (e.g. overconstrained-connector reference-gamma), keeping them retrievable. =#
   local mergedAliasMap = copy(simCode.aliasMap)
-  local seenElimNames = Set{String}(e.eliminatedName for e in mergedAliasMap)
+  local seenElimNames = OrderedSet{String}(e.eliminatedName for e in mergedAliasMap)
   for e in keptAliasEntries
     if !(e.eliminatedName in seenElimNames)
       push!(mergedAliasMap, e)
@@ -4220,7 +4220,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
      Drop the eliminated names from `irreducibleVariables` so MTK codegen's
      start-condition lookup (`getStartConditionsMTK`) doesn't try to look up
      a name that no longer exists in `stringToSimVarHT`. =#
-  local elimVarSet = Set{String}(elimVarNames)
+  local elimVarSet = OrderedSet{String}(elimVarNames)
   @assign simCode.irreducibleVariables = filter(n -> !(n in elimVarSet), simCode.irreducibleVariables)
   #= Append eliminated equations/variables to the existing lists =#
   append!(simCode.eliminatedEquations, pairedElimEqs)
@@ -4254,7 +4254,7 @@ Defensive checks:
    name exists in the simvar hash table. Used to protect those scalar params
    from constant-elimination — codegen later flattens the complex CREF into
    the scalar field symbols, which must resolve at module eval time. =#
-function _collectComplexFieldNames!(names::Set{String}, eqs, ht)
+function _collectComplexFieldNames!(names::OrderedSet{String}, eqs, ht)
   function visitor(exp, ctx)
     @match exp begin
       DAE.CREF(cr, ty) => begin
@@ -4357,7 +4357,7 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   hasCandidate || return simCode
 
   #= "Untouchable" surfaces — any var referenced from these must stay. =#
-  local untouchable = Set{String}()
+  local untouchable = OrderedSet{String}()
   for eq in simCode.initialEquations
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
       collectCrefNames!(untouchable, toDAEExp(eq.exp))
@@ -4392,10 +4392,10 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
 
   #= Per-equation ref sets for the iterative drop. =#
   local nEqs = length(simCode.residualEquations)
-  local eqRefs = Vector{Set{String}}(undef, nEqs)
+  local eqRefs = Vector{OrderedSet{String}}(undef, nEqs)
   local refCount = Dict{String, Int}()
   for i in 1:nEqs
-    local s = Set{String}()
+    local s = OrderedSet{String}()
     collectCrefNames!(s, toDAEExp(simCode.residualEquations[i].exp))
     eqRefs[i] = s
     for n in s
@@ -4403,8 +4403,8 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
     end
   end
 
-  local droppedVars = Set{String}()
-  local droppedEqs  = Set{Int}()
+  local droppedVars = OrderedSet{String}()
+  local droppedEqs  = OrderedSet{Int}()
   local progressed  = true
   while progressed
     progressed = false
@@ -4461,7 +4461,7 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
 
   #= Reachability scan: collect every cref name referenced from a live
      surface. Anything not in this set is dead. =#
-  local referenced = Set{String}()
+  local referenced = OrderedSet{String}()
   for eq in simCode.residualEquations
     collectCrefNames!(referenced, toDAEExp(eq.exp))
   end
@@ -4509,7 +4509,7 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
      because codegen rebuilds the parent array from scalar siblings when a
      CombiTable1D / CombiTimeTable / similar DS constructor references the
      base. Mirrors the equivalent logic in eliminateConstantParameters. =#
-  local dsArrayBaseNames = Set{String}()
+  local dsArrayBaseNames = OrderedSet{String}()
   for (_n, (_, sv)) in ht
     @match sv.varKind begin
       PARAMETER(SOME(b)) => collectCrefNames!(referenced, b)
@@ -4565,7 +4565,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
 
   local ht = simCode.stringToSimVarHT
   local paramValueMap = Dict{String, Float64}()
-  local seen = Set{String}()
+  local seen = OrderedSet{String}()
 
   #= Build the protected-from-elimination set. We keep any parameter that:
      1. Is an alias representative (eliminating orphans the alias entry).
@@ -4583,7 +4583,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
         carry constraints MTK uses at t=0; we keep their parameter inputs
         intact so the user can re-bind a parameter and re-initialize without
         a recompile (where supported by MTK). =#
-  local protectedNames = Set{String}()
+  local protectedNames = OrderedSet{String}()
   for entry in simCode.aliasMap
     push!(protectedNames, entry.representativeName)
   end
@@ -4619,7 +4619,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
      (BDAE.CONST of scalar type) are also stored as DATA_STRUCTURE but their
      RHS is a literal and over-protecting them would block legitimate
      constant-propagation eliminations elsewhere. =#
-  local dsArrayBaseNames = Set{String}()
+  local dsArrayBaseNames = OrderedSet{String}()
   for (_, htEntry) in ht
     local (_, svP) = htEntry
     @match svP.varKind begin
@@ -4776,7 +4776,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
 
   #= Step 4: defensive survivor scan. If a CREF for a candidate parameter
      somehow survived substitution (unflatten form, etc.), keep the param. =#
-  local survivorCheck = Set{String}()
+  local survivorCheck = OrderedSet{String}()
   for eq in newResiduals
     collectCrefNames!(survivorCheck, toDAEExp(eq.exp))
   end
@@ -4846,7 +4846,7 @@ functions) and add every CREF name encountered to `out`. Used by
 reachability scans that protect parameters / variables consumed only from
 function bodies.
 """
-function _collectFunctionBodyCrefs!(out::Set{String}, functions)
+function _collectFunctionBodyCrefs!(out::OrderedSet{String}, functions)
   for fn in functions
     try
       @match fn begin
@@ -4863,7 +4863,7 @@ function _collectFunctionBodyCrefs!(out::Set{String}, functions)
   return out
 end
 
-function _walkStatementsForCrefs!(out::Set{String}, stmts)
+function _walkStatementsForCrefs!(out::OrderedSet{String}, stmts)
   for s in stmts
     try
       @match s begin
@@ -4911,7 +4911,7 @@ Collect every CREF appearing in a CREF-valued attribute (`start`, `fixed`,
 eliminated — the MTK start-condition codegen references them via
 `pars[Symbol(name)]`, which bypasses equation-level substitution.
 """
-function _collectAttributeCrefs!(out::Set{String}, ht::AbstractDict)
+function _collectAttributeCrefs!(out::OrderedSet{String}, ht::AbstractDict)
   for (_, htEntry) in ht
     local (_, sv) = htEntry
     local optAttrs = sv.attributes
@@ -4941,16 +4941,16 @@ protect parameters that gate runtime conditional branches from elimination.
 # SIM-native: collect crefs appearing in any IFEXP condition (protects params used
 # in conditions from constant-elimination). Walk the SIM tree; at each IFEXP collect
 # its condition's crefs (collectCrefNames! grabs all of them, nested ones included).
-function _collectIfexpCondVisitor(@nospecialize(e), out::Set{String})
+function _collectIfexpCondVisitor(@nospecialize(e), out::OrderedSet{String})
   if e isa IFEXP
     collectCrefNames!(out, e.cond)
   end
   return (e, true, out)
 end
-_collectIfexpConditionCrefs!(out::Set{String}, exp::Exp) =
+_collectIfexpConditionCrefs!(out::OrderedSet{String}, exp::Exp) =
   (traverseExpTopDown(exp, _collectIfexpCondVisitor, out); out)
 
-function _collectIfexpConditionCrefs!(out::Set{String}, @nospecialize(exp))
+function _collectIfexpConditionCrefs!(out::OrderedSet{String}, @nospecialize(exp))
   @match exp begin
     DAE.IFEXP(expCond = c, expThen = t, expElse = e) => begin
       collectCrefNames!(out, c)
@@ -4999,7 +4999,7 @@ any nested `elsewhen`. Statements inside the when-clause are handled
 separately via the equation walk; we only protect parameters that gate
 the trigger.
 """
-function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::WHEN_STMTS)
+function _collectWhenConditionCrefs!(out::OrderedSet{String}, whenStmts::WHEN_STMTS)
   collectCrefNames!(out, toDAEExp(whenStmts.condition))
   if whenStmts.elsewhenPart !== nothing
     _collectWhenConditionCrefs!(out, whenStmts.elsewhenPart)
@@ -5007,7 +5007,7 @@ function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::WHEN_STMTS)
   return out
 end
 
-function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::BDAE.WHEN_STMTS)
+function _collectWhenConditionCrefs!(out::OrderedSet{String}, whenStmts::BDAE.WHEN_STMTS)
   collectCrefNames!(out, toDAEExp(whenStmts.condition))
   @match whenStmts.elsewhenPart begin
     SOME(inner) => _collectWhenConditionCrefs!(out, inner)
@@ -5016,15 +5016,15 @@ function _collectWhenConditionCrefs!(out::Set{String}, whenStmts::BDAE.WHEN_STMT
   return out
 end
 
-function _collectWhenConditionCrefs!(out::Set{String}, whenEq::Union{BDAE.WHEN_EQUATION, WHEN_EQUATION})
+function _collectWhenConditionCrefs!(out::OrderedSet{String}, whenEq::Union{BDAE.WHEN_EQUATION, WHEN_EQUATION})
   return _collectWhenConditionCrefs!(out, whenEq.whenEquation)
 end
 
 # Walk a DAE.ARRAY binding and add one paramValueMap entry per numeric element.
 function _enumerateArrayParamElements!(paramValueMap, baseName::String,
                                        exp, simCode,
-                                       seen::Set{String},
-                                       protectedNames::Set{String})
+                                       seen::OrderedSet{String},
+                                       protectedNames::OrderedSet{String})
   exp isa DAE.ARRAY || return nothing
   local i = 0
   for elem in exp.array
@@ -5283,7 +5283,7 @@ end
 """
 Collect all CREF names from a WHEN_STMTS node (condition + statements + elsewhen).
 """
-function _collectWhenCrefNames!(names::Set{String}, whenStmts::WHEN_STMTS)
+function _collectWhenCrefNames!(names::OrderedSet{String}, whenStmts::WHEN_STMTS)
   collectCrefNames!(names, toDAEExp(whenStmts.condition))
   for stmt in whenStmts.whenStmtLst
     if stmt isa ASSIGN
@@ -5305,7 +5305,7 @@ function _collectWhenCrefNames!(names::Set{String}, whenStmts::WHEN_STMTS)
   return names
 end
 
-function _collectWhenCrefNames!(names::Set{String}, whenStmts::BDAE.WHEN_STMTS)
+function _collectWhenCrefNames!(names::OrderedSet{String}, whenStmts::BDAE.WHEN_STMTS)
   collectCrefNames!(names, toDAEExp(whenStmts.condition))
   for stmt in whenStmts.whenStmtLst
     @match stmt begin
@@ -5804,16 +5804,16 @@ function _recomputeSCCsFromSimCode(simCode::SIM_CODE)
   local emptySCCs = Vector{Int}[]
   local emptyMatch = String[]
   n_eqs == 0 && return (emptySCCs, emptyMatch)
-  local surviving = Set{String}(k for (k, (_, sv)) in pairs(ht) if isUnknownVarKind(sv.varKind))
-  local incidence = Vector{Set{String}}(undef, n_eqs)
+  local surviving = OrderedSet{String}(k for (k, (_, sv)) in pairs(ht) if isUnknownVarKind(sv.varKind))
+  local incidence = Vector{OrderedSet{String}}(undef, n_eqs)
   for (i, eq) in enumerate(res)
-    local names = Set{String}()
+    local names = OrderedSet{String}()
     collectCrefNames!(names, toDAEExp(eq.exp))
     incidence[i] = intersect(names, surviving)
   end
   local var_to_eq = Dict{String, Int}()
   local eq_to_var = fill("", n_eqs)
-  function augment!(eq_idx::Int, seen::Set{String})::Bool
+  function augment!(eq_idx::Int, seen::OrderedSet{String})::Bool
     for var in incidence[eq_idx]
       var in seen && continue
       push!(seen, var)
@@ -5826,7 +5826,7 @@ function _recomputeSCCsFromSimCode(simCode::SIM_CODE)
     return false
   end
   for i in 1:n_eqs
-    augment!(i, Set{String}())
+    augment!(i, OrderedSet{String}())
   end
   local g = MetaGraphs.MetaDiGraph(n_eqs)
   for i in 1:n_eqs
@@ -5881,8 +5881,8 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   end
   local ht  = simCode.stringToSimVarHT
   local resEqs = simCode.residualEquations
-  local irreducibleSet = Set{String}(simCode.irreducibleVariables)
-  local sharedVarSet   = Set{String}(simCode.sharedVariables)
+  local irreducibleSet = OrderedSet{String}(simCode.irreducibleVariables)
+  local sharedVarSet   = OrderedSet{String}(simCode.sharedVariables)
 
   local rhsGroups = Dict{String, Vector{Tuple{String, Int, DAE.ComponentRef, DAE.Type, Bool}}}()
   for (i, eq) in enumerate(resEqs)
@@ -5897,7 +5897,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
 
   local aliasMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
   local aliasEntries = AliasEntry[]
-  local removeEqs = Set{Int}()
+  local removeEqs = OrderedSet{Int}()
   local elimVarOrder = String[]
   local elimEqOrder  = RESIDUAL_EQUATION[]
   #= A variable defined by more than one `v - expr` residual appears as a
@@ -5908,8 +5908,8 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
      tracks chosen representatives, so a representative is never itself
      eliminated and each removed equation maps to exactly one eliminated
      variable. =#
-  local claimed = Set{String}()
-  local repSet = Set{String}()
+  local claimed = OrderedSet{String}()
+  local repSet = OrderedSet{String}()
   #= Lift the eliminated member's start / fixed / stateSelect onto the surviving
      representative, mirroring eliminateAliasVariables, so a user IC on an
      RHS-equivalent alias (e.g. a connector velocity) is not lost. =#
@@ -6063,7 +6063,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   end
 
   local newHT = copy(ht)
-  local elimVarSet = Set{String}(keys(aliasMap))
+  local elimVarSet = OrderedSet{String}(keys(aliasMap))
   for varName in keys(aliasMap)
     delete!(newHT, varName)
   end
@@ -6526,8 +6526,8 @@ function eliminateFrozenStates(simCode::SIM_CODE)::SIM_CODE
   return simCode
 end
 
-function _computeFrozenProtectedNames(simCode::SIM_CODE)::Set{String}
-  local protectedNames = Set{String}()
+function _computeFrozenProtectedNames(simCode::SIM_CODE)::OrderedSet{String}
+  local protectedNames = OrderedSet{String}()
   local ht = simCode.stringToSimVarHT
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
@@ -6559,10 +6559,10 @@ function _computeFrozenProtectedNames(simCode::SIM_CODE)::Set{String}
   return protectedNames
 end
 
-function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::Set{String})
+function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::OrderedSet{String})
   local ht = simCode.stringToSimVarHT
   local resEqs = simCode.residualEquations
-  local sharedVarSet = Set{String}(simCode.sharedVariables)
+  local sharedVarSet = OrderedSet{String}(simCode.sharedVariables)
 
   local frozenMap   = Dict{String, DAE.Exp}()
   local frozenEqIdx = Dict{String, Int}()
@@ -6605,7 +6605,7 @@ function _eliminateFrozenStatesOnePass(simCode::SIM_CODE, protectedNames::Set{St
     @info "[SIMCODE: $(simCode.name): eliminateFrozenStates] model size" residuals_before=length(resEqs) residuals_after=length(resEqs) - length(frozenMap) variables_before=length(ht) variables_after=length(ht) - length(frozenMap)
   end
 
-  local removeEqs = Set{Int}(values(frozenEqIdx))
+  local removeEqs = OrderedSet{Int}(values(frozenEqIdx))
   local newResEqs = RESIDUAL_EQUATION[]
   sizehint!(newResEqs, length(resEqs) - length(removeEqs))
   for (i, eq) in enumerate(resEqs)
@@ -6818,8 +6818,8 @@ function foldExplicitSingleAssign(simCode::SIM_CODE)::SIM_CODE
   end
   isempty(simCode.residualEquations) && return simCode
   local protectedNames = _computeFrozenProtectedNames(simCode)
-  local irreducibleSet = Set{String}(simCode.irreducibleVariables)
-  local sharedVarSet   = Set{String}(simCode.sharedVariables)
+  local irreducibleSet = OrderedSet{String}(simCode.irreducibleVariables)
+  local sharedVarSet   = OrderedSet{String}(simCode.sharedVariables)
   local totalFolded = 0
   local maxRounds = 8
   for round in 1:maxRounds
@@ -6838,9 +6838,9 @@ function foldExplicitSingleAssign(simCode::SIM_CODE)::SIM_CODE
 end
 
 function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
-                                          protectedNames::Set{String},
-                                          irreducibleSet::Set{String},
-                                          sharedVarSet::Set{String})
+                                          protectedNames::OrderedSet{String},
+                                          irreducibleSet::OrderedSet{String},
+                                          sharedVarSet::OrderedSet{String})
   local ht = simCode.stringToSimVarHT
   local resEqs = simCode.residualEquations
 
@@ -6856,7 +6856,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
      side). Folding a representative would orphan the alias entry; folding
      an aliased name would double-substitute via the observed-equation
      pipeline. =#
-  local aliasNames = Set{String}()
+  local aliasNames = OrderedSet{String}()
   for entry in simCode.aliasMap
     push!(aliasNames, entry.eliminatedName)
     push!(aliasNames, entry.representativeName)
@@ -6875,7 +6875,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
     local (_, sv) = ht[name]
     _isAlgebraicVarKind(sv.varKind) || continue
     _containsDerCallDAE(rhs) && continue
-    local rhsNames = Set{String}()
+    local rhsNames = OrderedSet{String}()
     collectCrefNames!(rhsNames, rhs)
     name in rhsNames && continue
     defCountOfVar[name] = get(defCountOfVar, name, 0) + 1
@@ -6886,7 +6886,7 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
   end
 
   local foldMap = Dict{String, DAE.Exp}()
-  local foldEqIdxSet = Set{Int}()
+  local foldEqIdxSet = OrderedSet{Int}()
   for (name, cnt) in defCountOfVar
     cnt == 1 || continue
     foldMap[name] = defRhsOfVar[name]
@@ -6964,8 +6964,8 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
      Better to do zero folds than to leave a dangling reference that breaks
      codegen (observed on SimpleMechanicalSystem, where `tau_2` survived
      substitution somewhere downstream and produced UndefVarError). =#
-  local foldKeys = Set{String}(keys(foldMap))
-  local survivorNames = Set{String}()
+  local foldKeys = OrderedSet{String}(keys(foldMap))
+  local survivorNames = OrderedSet{String}()
   for eq in newResEqs
     collectCrefNames!(survivorNames, toDAEExp(eq.exp))
   end
@@ -7040,9 +7040,9 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   @info "[SIMCODE: $(simCode.name): removeRedundantEquations] over-determined by $n_extra equation(s); running maximum matching to find redundant equations"
 
   #= Build incidence: eq_idx -> Set of unknown names that equation mentions =#
-  local surviving_unknowns = Set{String}(k for (k, (_, sv)) in pairs(ht) if isUnknownVarKind(sv.varKind))
+  local surviving_unknowns = OrderedSet{String}(k for (k, (_, sv)) in pairs(ht) if isUnknownVarKind(sv.varKind))
   local incidence = map(enumerate(res)) do (i, eq)
-    local names = Set{String}()
+    local names = OrderedSet{String}()
     collectCrefNames!(names, toDAEExp(eq.exp))
     intersect(names, surviving_unknowns)
   end
@@ -7055,7 +7055,7 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   local var_to_eq = Dict{String, Int}()
   local eq_to_var = fill("", n_eqs)
 
-  function augment!(eq_idx::Int, seenVars::Set{String})::Bool
+  function augment!(eq_idx::Int, seenVars::OrderedSet{String})::Bool
     for var in incidence[eq_idx]
       var in seenVars && continue
       push!(seenVars, var)
@@ -7068,7 +7068,7 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
     return false
   end
 
-  map(i -> augment!(i, Set{String}()), 1:n_eqs)
+  map(i -> augment!(i, OrderedSet{String}()), 1:n_eqs)
 
   #= Equations with no assigned unknown are unmatched. Only treat as
      "redundant" those that ALSO have non-empty incidence — i.e. they
@@ -7097,7 +7097,7 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
     @info "[SIMCODE: $(simCode.name): removeRedundantEquations] removing redundant equation [$i]: 0 = $eqStr"
   end
 
-  local redundant_set = Set{Int}(redundant)
+  local redundant_set = OrderedSet{Int}(redundant)
   local newRes = RESIDUAL_EQUATION[res[i] for i in 1:n_eqs if i ∉ redundant_set]
   @assign simCode.residualEquations = newRes
   return simCode

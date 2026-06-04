@@ -32,7 +32,7 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
   #= Phase 1 var set: algebraic vars that are NOT pinned by a fixed=true init eq.
      Honouring pins prevents the solver from collapsing `sd1.s_rel = 1` to the
      trivial alg-residual root (-1.5 from m1.s = m2.s = 0 default geometry). =#
-  local pinnedSet = Set(pinned)
+  local pinnedSet = OrderedSet(pinned)
   local alg_unpinned = [i for i in alg_idx if !(i in pinnedSet)]
   local u0_phase1 = copy(u0)
   if !isempty(alg_unpinned) && _solveDAEPhase!(u0_phase1, rhsFunc, p_vec, eq_idx, alg_unpinned;

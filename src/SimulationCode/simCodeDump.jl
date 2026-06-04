@@ -80,7 +80,7 @@ function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = simCode
   for ifEq in simCode.ifEquations
     isempty(ifEq.branches) || (ifBranchEqs += length(first(ifEq.branches).residualEquations))
   end
-  local whenAssigned = Set{String}()
+  local whenAssigned = OrderedSet{String}()
   for weq in simCode.whenEquations
     for wstmt in weq.whenEquation.whenStmtLst
       #= ASSIGN carries the assigned target in `left`; REINIT/NORETCALL have no `left`. =#

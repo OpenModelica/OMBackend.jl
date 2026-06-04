@@ -34,6 +34,7 @@ module Causalize
 using Setfield
 using ExportAll
 using MetaModelica
+using DataStructures: OrderedSet
 
 import Absyn
 import ..BDAE
@@ -120,7 +121,7 @@ Save those variables in a HT.
 """
 function detectParamsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
   local pars = filter((x) -> x.varKind === BDAE.PARAM(), syst.orderedVars)
-  local parStrs = Set(map((x) -> string(x.varName), pars))
+  local parStrs = OrderedSet(map((x) -> string(x.varName), pars))
   local buffer = IOBuffer()
   @BACKEND_LOGGING write(OMBackend.logPath("backend/bdae", "allpars.log"), String(take!(buffer)))
 
@@ -1425,7 +1426,7 @@ value-preserving wrappers like `pre(intB)` is done at the SimCode level
 because those forms can survive Causalize and only become folding
 candidates after BDAE→SimVar reclassifies intB as PARAMETER.
 """
-function _candidateAliasPairs(eq::BDAE.EQUATION, intNames::Set{String})
+function _candidateAliasPairs(eq::BDAE.EQUATION, intNames::OrderedSet{String})
   pairs = Tuple{String, String}[]
   if eq.lhs isa DAE.CREF && eq.rhs isa DAE.CREF
     lhsName = string(eq.lhs.componentRef)
@@ -1447,8 +1448,8 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
      enum-typed `auxiliary` lookup variables that are constant-bound
      (DAE.ENUM_LITERAL on RHS) and would otherwise produce both a dummy
      `der(x) ~ 0` and a defining equation, unbalancing MTK. =#
-  intVarNames = Set{String}()
-  intVarBaseNames = Set{String}()
+  intVarNames = OrderedSet{String}()
+  intVarBaseNames = OrderedSet{String}()
   for v in syst.orderedVars
     if v.varKind isa BDAE.VARIABLE && _isIntOrEnumVarType(v.varType)
       name = string(v.varName)
@@ -1479,7 +1480,7 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
      removed. Only those are safe to reclassify as PARAM. Variables with
      surviving non-literal defining equations (like `Adder_AND_G2_y =
      pre(auxiliary_n)`) must remain VARIABLE so MTK can compute them. =#
-  local removedDefiners = Set{String}()
+  local removedDefiners = OrderedSet{String}()
   for (i, eq) in enumerate(syst.orderedEqs)
     if eq isa BDAE.EQUATION
       lhsIsInt = eq.lhs isa DAE.CREF && string(eq.lhs.componentRef) in intVarNames
@@ -1609,10 +1610,10 @@ end
   discrete state variables — resolveIntegers must not reclassify them as
   parameters or drop their defining when-clauses.
 """
-function _collectIntegerLhsInWhen(orderedEqs, intVarNames::Set{String},
-                                   intVarBaseNames::Set{String})::Set{String}
+function _collectIntegerLhsInWhen(orderedEqs, intVarNames::OrderedSet{String},
+                                   intVarBaseNames::OrderedSet{String})::OrderedSet{String}
   local allIntNames = union(intVarNames, intVarBaseNames)
-  local result = Set{String}()
+  local result = OrderedSet{String}()
   for eq in orderedEqs
     if !(eq isa BDAE.WHEN_EQUATION)
       continue
@@ -1622,8 +1623,8 @@ function _collectIntegerLhsInWhen(orderedEqs, intVarNames::Set{String},
   return result
 end
 
-function _collectWhenAssignsLhs!(result::Set{String}, we,
-                                  allIntNames::Set{String})
+function _collectWhenAssignsLhs!(result::OrderedSet{String}, we,
+                                  allIntNames::OrderedSet{String})
   @match we begin
     BDAE.WHEN_STMTS(_, stmts, elsewhenPart) => begin
       for stmt in stmts
@@ -1654,10 +1655,10 @@ end
   update auxiliary lookup arrays — variables assigned here must not be
   reclassified as constant parameters.
 """
-function _collectIntegerLhsInAlgorithm(orderedEqs, intVarNames::Set{String},
-                                        intVarBaseNames::Set{String})::Set{String}
+function _collectIntegerLhsInAlgorithm(orderedEqs, intVarNames::OrderedSet{String},
+                                        intVarBaseNames::OrderedSet{String})::OrderedSet{String}
   local allIntNames = union(intVarNames, intVarBaseNames)
-  local result = Set{String}()
+  local result = OrderedSet{String}()
   for eq in orderedEqs
     if !(eq isa BDAE.ALGORITHM)
       continue
@@ -1670,7 +1671,7 @@ function _collectIntegerLhsInAlgorithm(orderedEqs, intVarNames::Set{String},
   return result
 end
 
-function _collectAlgorithmStmtLhs!(result::Set{String}, stmts, allIntNames::Set{String})
+function _collectAlgorithmStmtLhs!(result::OrderedSet{String}, stmts, allIntNames::OrderedSet{String})
   for stmt in stmts
     if stmt isa DAE.STMT_ASSIGN || stmt isa DAE.STMT_ASSIGN_ARR
       local lhsExp = stmt isa DAE.STMT_ASSIGN ? stmt.exp1 : stmt.lhs
@@ -1693,7 +1694,7 @@ function _collectAlgorithmStmtLhs!(result::Set{String}, stmts, allIntNames::Set{
   end
 end
 
-function _collectAlgorithmElseLhs!(result::Set{String}, elseBranch, allIntNames::Set{String})
+function _collectAlgorithmElseLhs!(result::OrderedSet{String}, elseBranch, allIntNames::OrderedSet{String})
   if elseBranch isa DAE.ELSEIF
     _collectAlgorithmStmtLhs!(result, elseBranch.statementLst, allIntNames)
     _collectAlgorithmElseLhs!(result, elseBranch.else_, allIntNames)

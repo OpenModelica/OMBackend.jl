@@ -34,6 +34,7 @@ module BDAEUtil
 using ExportAll
 using MetaModelica
 using Setfield
+using DataStructures: OrderedSet
 
 import ..BDAE
 import ..BackendEquation
@@ -421,7 +422,7 @@ end
 #=TODO. Did I do something stupid down below here.. ?=#
 
 function countAllUniqueVariablesInSetOfEquations(eqs::Vector{RES_EQ}, vars::Vector{VAR}) where {RES_EQ, VAR}
-  vars = Set()
+  vars = OrderedSet()
   for eq in eqs
     varsForEq = getAllVariables(eq, vars)
     for v in varsForEq
@@ -565,7 +566,7 @@ end
 """
 function getAllVariablesExceptStates(eq::BDAE.IF_EQUATION, vars::Vector{BDAE.VAR})::Vector{DAE.ComponentRef}
   local allVarNames = getAllVariables(eq, vars)
-  local stateNames = Set(string(v.varName) for v in vars if isState(v))
+  local stateNames = OrderedSet(string(v.varName) for v in vars if isState(v))
   return filter(v -> !(v in stateNames), allVarNames)
 end
 

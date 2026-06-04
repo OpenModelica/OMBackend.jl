@@ -1,6 +1,7 @@
 module RuntimeUtil
 
 import Absyn
+using DataStructures: OrderedSet
 import DifferentialEquations
 import DifferentialEquations.ReturnCode
 import DAE
@@ -364,7 +365,7 @@ function findPath(g::Dict{String, Vector{String}}, inV)
   local v = OMFrontend.Frontend.toString(inV)
   local S = String[]
   local discovered = String[]
-  local seen = Set{String}()
+  local seen = OrderedSet{String}()
   push!(S, v)
   while !isempty(S)
     local v = pop!(S)
@@ -502,7 +503,7 @@ end
   Get the top level equation if such equation exist for a given set of equations
   Note that if the supplied equation is not solved at the top level, this function returns 0
 """
-function getRootEquation(equationIndices; usedEqIndices = Set())::Int
+function getRootEquation(equationIndices; usedEqIndices = OrderedSet())::Int
   local G = ModelingToolkit.asgraph(OMBackend.Runtime.REDUCED_SYSTEM)
   local variableIdxToEquationIdx = G.badjlist
   local equationIdxToVariableIdx = G.fadjlist

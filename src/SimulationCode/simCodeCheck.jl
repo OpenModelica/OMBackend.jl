@@ -19,6 +19,7 @@ module SimCodeCheck
 
 import Absyn
 import DAE
+using DataStructures: OrderedSet
 import ..SIM_CODE
 import ..STATE
 import ..STATE_DERIVATIVE
@@ -147,7 +148,7 @@ end
 const RULES = Function[]
 
 #= Crefs that always resolve and need not appear in stringToSimVarHT. =#
-const BUILTIN_CREFS = Set([
+const BUILTIN_CREFS = OrderedSet([
   "time", "pi", "e", "Modelica_Constants_pi", "Modelica_Constants_e",
   "_",  # wildcard discard in tuple-LHS equations; legitimately not a SimVar
 ])
@@ -155,7 +156,7 @@ const BUILTIN_CREFS = Set([
 #= DAE.Exp concrete subtypes that the MTK + algorithmic codegen handle.
    Stored as a Set so `_flagUnsupportedExp!` does an O(1) typeof check
    instead of 21 sequential `isa` probes per node. =#
-const SUPPORTED_EXP_TYPES = Set{DataType}([
+const SUPPORTED_EXP_TYPES = OrderedSet{DataType}([
   DAE.ICONST, DAE.RCONST, DAE.SCONST, DAE.BCONST,
   DAE.CREF, DAE.BINARY, DAE.UNARY, DAE.LBINARY, DAE.LUNARY,
   DAE.RELATION, DAE.IFEXP, DAE.CAST, DAE.CALL,
@@ -230,15 +231,15 @@ function rule_balanced(simCode::SIM_CODE)::Vector{CheckViolation}
   # count only unknowns that actually participate in residual equations;
   # HT may carry orphan entries from incomplete alias bookkeeping that add
   # no DAE constraint to balance against
-  local refNames = Set{String}()
+  local refNames = OrderedSet{String}()
   local missingProbe = String[]
   for eq in simCode.residualEquations
-    _collectCrefNames!(missingProbe, eq.exp, Set{String}())
+    _collectCrefNames!(missingProbe, eq.exp, OrderedSet{String}())
   end
   for n in missingProbe
     push!(refNames, n)
   end
-  local eliminated = Set(simCode.eliminatedVariables)
+  local eliminated = OrderedSet(simCode.eliminatedVariables)
   local nUnknown = 0
   local nDiscreteImplicit = 0
   for (_, (_, v)) in simCode.stringToSimVarHT
@@ -270,7 +271,7 @@ end
 push!(RULES, rule_balanced)
 
 function _countUnknowns(simCode::SIM_CODE)::Int
-  local eliminated = Set(simCode.eliminatedVariables)
+  local eliminated = OrderedSet(simCode.eliminatedVariables)
   local n = 0
   for (_, (_, v)) in simCode.stringToSimVarHT
     if v.name in eliminated
@@ -296,7 +297,7 @@ end
 """
 function rule_alias_consistency(simCode::SIM_CODE)::Vector{CheckViolation}
   local out = CheckViolation[]
-  local elim = Set(simCode.eliminatedVariables)
+  local elim = OrderedSet(simCode.eliminatedVariables)
   local vars = simCode.stringToSimVarHT
   for a in simCode.aliasMap
     if a.eliminatedName == a.representativeName
@@ -360,7 +361,7 @@ shows up as `boxBody1_v_0` (no subscript) in the der-cref set.
 function rule_dead_states(simCode::SIM_CODE)::Vector{CheckViolation}
   local out = CheckViolation[]
   local derCrefs = _collectDerCrefs(simCode)
-  local derBases = Set(_baseName(n) for n in derCrefs)
+  local derBases = OrderedSet(_baseName(n) for n in derCrefs)
   for (_, (_, v)) in simCode.stringToSimVarHT
     if v.varKind isa STATE &&
        !(v.name in derCrefs) &&
@@ -376,8 +377,8 @@ push!(RULES, rule_dead_states)
 #= Strip array subscripts from a printed cref name, e.g. `a[1][2]` -> `a`. =#
 _baseName(name::AbstractString) = String(first(split(name, '['; limit = 2)))
 
-function _collectDerCrefs(simCode::SIM_CODE)::Set{String}
-  local names = Set{String}()
+function _collectDerCrefs(simCode::SIM_CODE)::OrderedSet{String}
+  local names = OrderedSet{String}()
   for eq in simCode.residualEquations
     _collectDerFromExp!(names, eq.exp)
   end
@@ -408,7 +409,7 @@ function _collectDerCrefs(simCode::SIM_CODE)::Set{String}
   return names
 end
 
-function _collectDerFromWhenEquation!(names::Set{String}, whenEq)
+function _collectDerFromWhenEquation!(names::OrderedSet{String}, whenEq)
   if hasproperty(whenEq, :condition)
     _collectDerFromExp!(names, whenEq.condition)
   end
@@ -423,7 +424,7 @@ function _collectDerFromWhenEquation!(names::Set{String}, whenEq)
   end
 end
 
-function _collectDerFromExp!(names::Set{String}, exp)
+function _collectDerFromExp!(names::OrderedSet{String}, exp)
   @match exp begin
     DAE.CALL(Absyn.IDENT("der"), expLst, _) => _pushDerArgNames!(names, listHead(expLst))
     _ => nothing
@@ -433,7 +434,7 @@ function _collectDerFromExp!(names::Set{String}, exp)
 end
 
 # SIM-native twin: walk the SimCode Exp; reuse the DAE der-arg extraction via a per-node projection.
-function _collectDerFromExp!(names::Set{String}, exp::Exp)
+function _collectDerFromExp!(names::OrderedSet{String}, exp::Exp)
   traverseExpTopDown(exp, (e, _) -> begin
     if e isa CALL && e.path isa Absyn.IDENT && e.path.name == "der" && !isempty(e.args)
       _pushDerArgNames!(names, toDAEExp(first(e.args)))
@@ -447,7 +448,7 @@ end
    record them. Handles a bare CREF as well as `der(arr)` where `arr` is a
    DAE.ARRAY of element CREFs (the MultiBody quaternion / linear-velocity
    pattern documented in CLAUDE.md, e.g. `der(boxBody.v_0)`). =#
-function _pushDerArgNames!(names::Set{String}, arg)
+function _pushDerArgNames!(names::OrderedSet{String}, arg)
   @match arg begin
     DAE.CREF(cref, _) => push!(names, DAE_identifierToString(cref))
     DAE.ARRAY(_, _, es) => for e in es; _pushDerArgNames!(names, e) end
@@ -470,8 +471,8 @@ move on, rather than walking the full expression.
 """
 function rule_cref_resolution(simCode::SIM_CODE)::Vector{CheckViolation}
   local out = CheckViolation[]
-  local known = Set(keys(simCode.stringToSimVarHT))
-  union!(known, Set(simCode.eliminatedVariables))
+  local known = OrderedSet(keys(simCode.stringToSimVarHT))
+  union!(known, OrderedSet(simCode.eliminatedVariables))
   union!(known, BUILTIN_CREFS)
   for (i, eq) in enumerate(simCode.residualEquations)
     local missingNames = String[]
@@ -486,7 +487,7 @@ function rule_cref_resolution(simCode::SIM_CODE)::Vector{CheckViolation}
 end
 push!(RULES, rule_cref_resolution)
 
-function _collectCrefNames!(missing::Vector{String}, exp, known::Set{String})
+function _collectCrefNames!(missing::Vector{String}, exp, known::OrderedSet{String})
   @match exp begin
     DAE.CREF(cref, _) => begin
       local nm = DAE_identifierToString(cref)
@@ -501,7 +502,7 @@ function _collectCrefNames!(missing::Vector{String}, exp, known::Set{String})
 end
 
 # SIM-native twin: walk the SimCode Exp; collect cref names via a per-cref projection.
-function _collectCrefNames!(missing::Vector{String}, exp::Exp, known::Set{String})
+function _collectCrefNames!(missing::Vector{String}, exp::Exp, known::OrderedSet{String})
   traverseExpTopDown(exp, (e, _) -> begin
     if e isa EXP_CREF
       local nm = DAE_identifierToString(toDAECref(e.cref).componentRef)

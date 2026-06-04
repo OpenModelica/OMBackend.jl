@@ -35,6 +35,7 @@
 module CodeGenerationUtil
 
 import DataStructures
+using DataStructures: OrderedSet
 import MacroTools
 using MetaModelica
 using MetaModelica: Cons
@@ -806,9 +807,9 @@ end
  Evalutates the components in a DAE expression (Currently if the components are parameters)
 """
 function _substituteBoundParameters(exp, simCode;
-                                    skipNames::Set{String}=Set{String}(),
+                                    skipNames::OrderedSet{String}=OrderedSet{String}(),
                                     shouldEval::Base.RefValue{Bool}=Ref(true),
-                                    seen::Set{String}=Set{String}())
+                                    seen::OrderedSet{String}=OrderedSet{String}())
   function replaceParameterVariable(exp, ht)
     if Util.isCref(exp)
       local key = string(exp)
@@ -1465,7 +1466,7 @@ function extractArrayDimsFromVar(v::DAE.VAR)::Expr
   end
 end
 
-function collectCalledFunctionNames!(names::Set{String}, @nospecialize(exp::DAE.Exp))
+function collectCalledFunctionNames!(names::OrderedSet{String}, @nospecialize(exp::DAE.Exp))
   @match exp begin
     DAE.CALL(path = path, expLst = explst) => begin
       push!(names, string(path))
@@ -1487,36 +1488,36 @@ function collectCalledFunctionNames!(names::Set{String}, @nospecialize(exp::DAE.
   return names
 end
 
-function collectCalledFunctionNames!(names::Set{String},
+function collectCalledFunctionNames!(names::OrderedSet{String},
                                      eq::Union{BDAE.RESIDUAL_EQUATION, SimulationCode.RESIDUAL_EQUATION})
   collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.exp))
 end
 
-function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.EQUATION)
+function collectCalledFunctionNames!(names::OrderedSet{String}, eq::BDAE.EQUATION)
   collectCalledFunctionNames!(names, eq.lhs)
   collectCalledFunctionNames!(names, eq.rhs)
 end
 
-Base.@nospecializeinfer function collectCalledFunctionNames!(names::Set{String}, @nospecialize(eq::SimulationCode.EQUATION))
+Base.@nospecializeinfer function collectCalledFunctionNames!(names::OrderedSet{String}, @nospecialize(eq::SimulationCode.EQUATION))
   collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.lhs))
   collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.rhs))
 end
 
-function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.ARRAY_EQUATION)
+function collectCalledFunctionNames!(names::OrderedSet{String}, eq::BDAE.ARRAY_EQUATION)
   collectCalledFunctionNames!(names, eq.left)
   collectCalledFunctionNames!(names, eq.right)
 end
 
-Base.@nospecializeinfer function collectCalledFunctionNames!(names::Set{String}, @nospecialize(eq::SimulationCode.ARRAY_EQUATION))
+Base.@nospecializeinfer function collectCalledFunctionNames!(names::OrderedSet{String}, @nospecialize(eq::SimulationCode.ARRAY_EQUATION))
   collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.left))
   collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.right))
 end
 
-function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.SOLVED_EQUATION)
+function collectCalledFunctionNames!(names::OrderedSet{String}, eq::BDAE.SOLVED_EQUATION)
   collectCalledFunctionNames!(names, eq.exp)
 end
 
-function collectCalledFunctionNames!(names::Set{String}, eq::BDAE.COMPLEX_EQUATION)
+function collectCalledFunctionNames!(names::OrderedSet{String}, eq::BDAE.COMPLEX_EQUATION)
   collectCalledFunctionNames!(names, eq.left)
   collectCalledFunctionNames!(names, eq.right)
 end
@@ -1562,30 +1563,30 @@ function getRHSVariables(::Union{BDAE.AGENTIC_RECOMPILATION, SimulationCode.AGEN
   return DAE.ComponentRef[]
 end
 
-function collectCalledFunctionNames!(names::Set{String}, stmt::Union{BDAE.ASSIGN, SimulationCode.ASSIGN})
+function collectCalledFunctionNames!(names::OrderedSet{String}, stmt::Union{BDAE.ASSIGN, SimulationCode.ASSIGN})
   collectCalledFunctionNames!(names, _asDAE(stmt.left))
   collectCalledFunctionNames!(names, _asDAE(stmt.right))
 end
 
-function collectCalledFunctionNames!(names::Set{String}, stmt::Union{BDAE.REINIT, SimulationCode.REINIT})
+function collectCalledFunctionNames!(names::OrderedSet{String}, stmt::Union{BDAE.REINIT, SimulationCode.REINIT})
   collectCalledFunctionNames!(names, stmt.stateVar)
   collectCalledFunctionNames!(names, _asDAE(stmt.value))
 end
 
-function collectCalledFunctionNames!(names::Set{String}, stmt::Union{BDAE.NORETCALL, SimulationCode.NORETCALL})
+function collectCalledFunctionNames!(names::OrderedSet{String}, stmt::Union{BDAE.NORETCALL, SimulationCode.NORETCALL})
   collectCalledFunctionNames!(names, _asDAE(stmt.exp))
 end
 
 # SIM-Exp passthrough so `branch.condition` (now ::Exp) routes through the DAE.Exp visitor.
-function collectCalledFunctionNames!(names::Set{String}, e::SimulationCode.Exp)
+function collectCalledFunctionNames!(names::OrderedSet{String}, e::SimulationCode.Exp)
   return collectCalledFunctionNames!(names, SimulationCode.toDAEExp(e))
 end
 
-function collectCalledFunctionNames!(names::Set{String}, ::Any)
+function collectCalledFunctionNames!(names::OrderedSet{String}, ::Any)
   return names
 end
 
-function collectCalledFunctionNames!(names::Set{String}, simCode::SimulationCode.SIM_CODE)
+function collectCalledFunctionNames!(names::OrderedSet{String}, simCode::SimulationCode.SIM_CODE)
   for eq in simCode.residualEquations
     collectCalledFunctionNames!(names, eq)
   end
@@ -1641,7 +1642,7 @@ function _literalRefName(expr::Expr)
   return join(parts)
 end
 
-function _renameAlgIdentifiers(expr, names::Set{String}, prefix::String)
+function _renameAlgIdentifiers(expr, names::OrderedSet{String}, prefix::String)
   if expr isa Symbol
     local s = string(expr)
     s == "time" && return expr
@@ -1666,7 +1667,7 @@ function _renameAlgIdentifiers(expr, names::Set{String}, prefix::String)
   return expr
 end
 
-function _renameAlgIdentifiers(expr, names::Set{String})
+function _renameAlgIdentifiers(expr, names::OrderedSet{String})
   return _renameAlgIdentifiers(expr, names, "_alg_")
 end
 
@@ -1685,7 +1686,7 @@ function _readStartAttributeAsLiteral(sv)::Float64
   end
 end
 
-function _collectInitAlgLhsRhsCrefsDAE!(lhs::Set{String}, rhs::Set{String}, stmt)
+function _collectInitAlgLhsRhsCrefsDAE!(lhs::OrderedSet{String}, rhs::OrderedSet{String}, stmt)
   local pushCrefsFrom = function(exp)
     exp === nothing && return
     for c in Util.getAllCrefs(exp); push!(rhs, string(c)); end
@@ -1742,7 +1743,7 @@ function _collectInitAlgLhsRhsCrefsDAE!(lhs::Set{String}, rhs::Set{String}, stmt
   end
 end
 
-function _collectInitAlgLhsRhsCrefsDAEElse!(lhs::Set{String}, rhs::Set{String}, else_)
+function _collectInitAlgLhsRhsCrefsDAEElse!(lhs::OrderedSet{String}, rhs::OrderedSet{String}, else_)
   @match else_ begin
     DAE.ELSE(stmts) => for s in stmts; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
     DAE.ELSEIF(cond, stmts, rest) => begin
@@ -1754,7 +1755,7 @@ function _collectInitAlgLhsRhsCrefsDAEElse!(lhs::Set{String}, rhs::Set{String}, 
   end
 end
 
-function _collectInitAlgLhsRhsCrefs!(lhs::Set{String}, rhs::Set{String}, op)
+function _collectInitAlgLhsRhsCrefs!(lhs::OrderedSet{String}, rhs::OrderedSet{String}, op)
   # Use DAE_identifierToString → canonicalName so cref strings match stringToSimVarHT key format
   # (per-dim brackets `mem[1][1]`, not comma-join `mem[1, 1]`).
   local pushCrefsFrom = function(exp)

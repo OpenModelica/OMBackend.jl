@@ -41,8 +41,8 @@ _elsewhenStmtLst(arm) = arm.whenEquation.whenStmtLst
    condition-triggers after firing — appropriate for `when boolVar then`)
    does NOT zero observed inputs of `change(x)` / `pre(x)` (which are state
    variables we're watching, not latched flags). =#
-Base.@nospecializeinfer function _collectBareCrefStrings(@nospecialize(cond))::Set{String}
-  local out = Set{String}()
+Base.@nospecializeinfer function _collectBareCrefStrings(@nospecialize(cond))::OrderedSet{String}
+  local out = OrderedSet{String}()
   local walk = function(e, insideObs)
     if e isa DAE.CREF
       insideObs || push!(out, string(e))
@@ -496,7 +496,7 @@ end
    when body writes, the assignment that re-derives its `ifCondNI` discrete
    parameter directly from the (now-current) condition value. The ifCond naming
    mirrors createIfEquations (`ifCond<sortIndex><branchIndex>`). =#
-function _collectIfCondRefresh(writtenLHS::Set{String}, simCode)
+function _collectIfCondRefresh(writtenLHS::OrderedSet{String}, simCode)
   local refreshCrefs = Any[]
   local assigns = Expr[]
   isempty(simCode.ifEquations) && return (refreshCrefs, assigns)
@@ -536,7 +536,7 @@ function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64,
   local _firstEdge = startTime + (floor(-startTime / period) + 1.0) * period
   local whenStmts = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
   local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
-  local writtenLHS = Set{String}()
+  local writtenLHS = OrderedSet{String}()
   for wStmt in wEq.whenStmtLst
     (wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN) || continue
     for c in listArray(Util.getAllCrefs(SimulationCode.toDAEExp(wStmt.left)))

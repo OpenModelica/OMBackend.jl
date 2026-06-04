@@ -113,7 +113,7 @@ function flattenRecordParametersInFunction(func::MODELICA_FUNCTION)::MODELICA_FU
      This handles implicit record constructors and constructor functions where
      output fields are bound via modifiers (output Complex result(re=re, im=im)). =#
   if isempty(transformedStatements) && !isempty(recordFieldMap)
-    local inputNameSet = Set{String}(string(inp.componentRef) for inp in flattenedInputs)
+    local inputNameSet = OrderedSet{String}(string(inp.componentRef) for inp in flattenedInputs)
     for output in func.outputs
       local outName = string(output.componentRef)
       if haskey(recordFieldMap, outName)
@@ -768,10 +768,10 @@ Base.@nospecializeinfer function tryEvalCondition(@nospecialize(cond::DAE.Exp)):
 end
 
 Base.@nospecializeinfer function tryEvalCondition(@nospecialize(cond::DAE.Exp), simCode::SIM_CODE)::Union{Bool, Nothing}
-  return _tryEvalCondition(cond, simCode, Set{String}())
+  return _tryEvalCondition(cond, simCode, OrderedSet{String}())
 end
 
-Base.@nospecializeinfer function _tryEvalCondition(@nospecialize(cond::DAE.Exp), simCode::SIM_CODE, seen::Set{String})::Union{Bool, Nothing}
+Base.@nospecializeinfer function _tryEvalCondition(@nospecialize(cond::DAE.Exp), simCode::SIM_CODE, seen::OrderedSet{String})::Union{Bool, Nothing}
   @match cond begin
     DAE.BCONST(val) => val
     DAE.CREF(__) => begin
@@ -869,14 +869,14 @@ Base.@nospecializeinfer function tryEvalNumeric(@nospecialize(exp::DAE.Exp))::Un
 end
 
 Base.@nospecializeinfer function tryEvalNumeric(@nospecialize(exp::DAE.Exp), simCode::SIM_CODE)::Union{Float64, Nothing}
-  return _tryEvalNumeric(exp, simCode, Set{String}())
+  return _tryEvalNumeric(exp, simCode, OrderedSet{String}())
 end
 
 Base.@nospecializeinfer function tryEvalScalar(@nospecialize(exp::DAE.Exp), simCode::SIM_CODE)
-  return tryEvalScalar(exp, simCode, Set{String}())
+  return tryEvalScalar(exp, simCode, OrderedSet{String}())
 end
 
-Base.@nospecializeinfer function tryEvalScalar(@nospecialize(exp::DAE.Exp), simCode::SIM_CODE, seen::Set{String})
+Base.@nospecializeinfer function tryEvalScalar(@nospecialize(exp::DAE.Exp), simCode::SIM_CODE, seen::OrderedSet{String})
   @match exp begin
     DAE.BCONST(v) => v
     DAE.SCONST(v) => v
@@ -915,7 +915,7 @@ Base.@nospecializeinfer function tryEvalScalar(@nospecialize(exp::DAE.Exp), simC
   end
 end
 
-function _tryEvalNumeric(exp::DAE.Exp, simCode::SIM_CODE, seen::Set{String})::Union{Float64, Nothing}
+function _tryEvalNumeric(exp::DAE.Exp, simCode::SIM_CODE, seen::OrderedSet{String})::Union{Float64, Nothing}
   @match exp begin
     DAE.RCONST(val) => Float64(val)
     DAE.ICONST(val) => Float64(val)
@@ -981,7 +981,7 @@ function _tryEvalNumeric(exp::DAE.Exp, simCode::SIM_CODE, seen::Set{String})::Un
   end
 end
 
-function _boundParameterExpression(exp::DAE.Exp, simCode::SIM_CODE, seen::Set{String})
+function _boundParameterExpression(exp::DAE.Exp, simCode::SIM_CODE, seen::OrderedSet{String})
   local extracted = extractCrefName(exp)
   extracted === nothing && return nothing
   local name = extracted[1]

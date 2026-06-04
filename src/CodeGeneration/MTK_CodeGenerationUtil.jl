@@ -20,6 +20,7 @@
 module MTK_CodeGenerationUtil
 
 import DataStructures
+using DataStructures: OrderedSet
 import MacroTools
 using MetaModelica
 using MetaModelica: Cons
@@ -1705,7 +1706,7 @@ function performStructuralSimplify(simplify; observedFilter::Union{Nothing, Vect
        variables their RHS references; dropping a dependency leaves it
        referenced-but-undefined in the residual/init build_function. =#
     local _obsByLhs = Dict(string(eq.lhs) => eq for eq in _allObs)
-    local _keepNames = Set{String}()
+    local _keepNames = OrderedSet{String}()
     local _stack = String[string(eq.lhs) for eq in _allObs
                           if any(p -> occursin(p, string(eq.lhs)), _obsPatterns)]
     #= Also seed from observed vars referenced by the system equations: the
@@ -2179,7 +2180,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
        Newton variable. This handles alias chains like
        actualGlobalSeed = globalSeed_seed, where globalSeed_seed was solved by
        an earlier initial equation in the same fixed-point loop. =#
-    local skipFree = Set{String}([freeName])
+    local skipFree = OrderedSet{String}([freeName])
     local lhsEvalOk = Ref(true)
     local rhsEvalOk = Ref(true)
     local lhsSubst = _substituteBoundParameters(ieqLhs, simCode;
@@ -2286,7 +2287,7 @@ end
    the if-expression can gate directly on the held discrete value; the discrete's
    own update event localises the switch, so no ifCond relay is needed. =#
 function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::Bool
-  local refs::Set{String} = Set{String}()
+  local refs::OrderedSet{String} = OrderedSet{String}()
   try
     SimulationCode.collectCrefNames!(refs, condition)
   catch

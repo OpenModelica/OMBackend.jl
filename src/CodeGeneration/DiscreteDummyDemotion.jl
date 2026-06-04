@@ -61,7 +61,7 @@ The set of discrete variable names that should be demoted from
 `planDemotions`, consumed by `applyDemotionPlan!`.
 """
 struct DemotionPlan
-  toDemote::Set{String}
+  toDemote::OrderedSet{String}
 end
 
 """
@@ -218,7 +218,7 @@ function _containsDerivative(@nospecialize(e))
 end
 
 #= `0 ~ disc ± ifelse(...)` — RHS contains an `ifelse` call. =#
-function _matchIfelseDefinedDiscrete(@nospecialize(rhs), discreteSet::Set{String})
+function _matchIfelseDefinedDiscrete(@nospecialize(rhs), discreteSet::OrderedSet{String})
   rhs = _unwrap(rhs)
   rhs isa Expr || return nothing
   rhs.head === :call && length(rhs.args) == 3 || return nothing
@@ -234,7 +234,7 @@ function _matchIfelseDefinedDiscrete(@nospecialize(rhs), discreteSet::Set{String
 end
 
 #= `0 ~ disc ± (a < b)` — RHS contains a Boolean comparison. =#
-function _matchComparisonDefinedDiscrete(@nospecialize(rhs), discreteSet::Set{String})
+function _matchComparisonDefinedDiscrete(@nospecialize(rhs), discreteSet::OrderedSet{String})
   rhs = _unwrap(rhs)
   rhs isa Expr || return nothing
   rhs.head === :call && length(rhs.args) == 3 || return nothing
@@ -250,7 +250,7 @@ function _matchComparisonDefinedDiscrete(@nospecialize(rhs), discreteSet::Set{St
 end
 
 #= `0 ~ disc ± integer(x)`. =#
-function _matchIntegerDefinedDiscrete(@nospecialize(rhs), discreteSet::Set{String})
+function _matchIntegerDefinedDiscrete(@nospecialize(rhs), discreteSet::OrderedSet{String})
   rhs = _unwrap(rhs)
   rhs isa Expr || return nothing
   rhs.head === :call && length(rhs.args) == 3 || return nothing
@@ -270,8 +270,8 @@ end
    contain a derivative call. Skips when-assigned discretes (the callback
    needs their state slot). =#
 function _matchArithmeticDefinedDiscrete(@nospecialize(rhs),
-                                         discreteSet::Set{String},
-                                         whenAssignedSet::Set{String})
+                                         discreteSet::OrderedSet{String},
+                                         whenAssignedSet::OrderedSet{String})
   rhs = _unwrap(rhs)
   rhs isa Expr || return nothing
   rhs.head === :call && length(rhs.args) == 3 || return nothing
@@ -295,8 +295,8 @@ end
 #= `0 ~ disc ± ifEq_tmpN` where ifEq_tmpN is a lifted if-equation target.
    The target equation `ifEq_tmpN ~ ifelse(...)` already pins the value. =#
 function _matchConditionalTargetDefinedDiscrete(@nospecialize(rhs),
-                                                discreteSet::Set{String},
-                                                conditionalTargets::Set{String})
+                                                discreteSet::OrderedSet{String},
+                                                conditionalTargets::OrderedSet{String})
   rhs = _unwrap(rhs)
   rhs isa Expr || return nothing
   rhs.head === :call && length(rhs.args) == 3 || return nothing
@@ -316,8 +316,8 @@ end
 #= Build the set of cref names that any when-equation writes to. Discrete
    vars in this set MUST keep their `der(d) ~ 0` dummy — the callback
    needs the state slot. =#
-function _collectWhenAssignedNames(simCode)::Set{String}
-  local names = Set{String}()
+function _collectWhenAssignedNames(simCode)::OrderedSet{String}
+  local names = OrderedSet{String}()
   for whenEq in simCode.whenEquations
     SimulationCode._collectWhenAssignTargets!(names, whenEq.whenEquation)
   end
@@ -325,14 +325,14 @@ function _collectWhenAssignedNames(simCode)::Set{String}
 end
 
 #= Collect the cref name from a leaf cref expression. =#
-function _collectCrefsInExp!(names::Set{String}, e::SimulationCode.EXP_CREF)
+function _collectCrefsInExp!(names::OrderedSet{String}, e::SimulationCode.EXP_CREF)
   local r = SimulationCode.extractCrefName(e)
   r !== nothing && push!(names, r[1])
   return nothing
 end
 
 #= Recurse into the Exp-typed fields of any other SimCode expression. =#
-function _collectCrefsInExp!(names::Set{String}, @nospecialize(e::SimulationCode.Exp))
+function _collectCrefsInExp!(names::OrderedSet{String}, @nospecialize(e::SimulationCode.Exp))
   for fn in fieldnames(typeof(e))
     local v = getfield(e, fn)
     if v isa SimulationCode.Exp
@@ -349,8 +349,8 @@ end
 #= Discrete vars that participate in a recomputed cyclic residual SCC.
    Treating them as held states adds an equation on top of the loop
    equations — keep them algebraic and let MTK tear the loop. =#
-function _collectCyclicSCCDiscretes(simCode, whenAssignedSet::Set{String})::Set{String}
-  local cyclic = Set{String}()
+function _collectCyclicSCCDiscretes(simCode, whenAssignedSet::OrderedSet{String})::OrderedSet{String}
+  local cyclic = OrderedSet{String}()
   try
     local (sccs, eqToVar) = SimulationCode._recomputeSCCsFromSimCode(simCode)
     for scc in sccs
@@ -379,10 +379,10 @@ end
    comparison-derived subset separately so the duplicate-residual
    discount can reclaim them first. =#
 function _scanDefinitionalPinning(equations::Vector{Expr},
-                                  discreteSet::Set{String},
-                                  whenAssignedSet::Set{String},
-                                  conditionalTargets::Set{String})
-  local aliasPinned = Set{String}()
+                                  discreteSet::OrderedSet{String},
+                                  whenAssignedSet::OrderedSet{String},
+                                  conditionalTargets::OrderedSet{String})
+  local aliasPinned = OrderedSet{String}()
   local comparisonPinned = String[]
   for eq in equations
     if eq isa Expr && eq.head === :call && length(eq.args) == 3 &&
@@ -437,8 +437,8 @@ end
    discretes may be demoted by the heuristic excess fill: removing the
    `der(d) ~ 0` dummy of a discrete no residual defines strands it with no
    equation, leaving the system under-determined. =#
-function _residualDefinedDiscretes(equations::Vector{Expr}, discreteSet::Set{String})::Set{String}
-  local defined = Set{String}()
+function _residualDefinedDiscretes(equations::Vector{Expr}, discreteSet::OrderedSet{String})::OrderedSet{String}
+  local defined = OrderedSet{String}()
   for eq in equations
     if eq isa Expr && eq.head === :call && length(eq.args) == 3 &&
        eq.args[1] === :~ && eq.args[2] == 0
@@ -461,8 +461,8 @@ end
 #= Collect every if-equation target LHS (`ifEq_tmpN ~ ifelse(...)`).
    These names drive the `_matchConditionalTargetDefinedDiscrete`
    pattern. =#
-function _collectConditionalTargets(ifEqComponents::Vector{IfEquationComponent})::Set{String}
-  local targets = Set{String}()
+function _collectConditionalTargets(ifEqComponents::Vector{IfEquationComponent})::OrderedSet{String}
+  local targets = OrderedSet{String}()
   for component in ifEqComponents
     for ceq in component.conditionalEquations
       if ceq isa Expr && ceq.head === :call && length(ceq.args) == 3 &&
@@ -479,7 +479,7 @@ end
    pre-rewrite form). Duplicates are dropped by MTK at simplify time, so
    the codegen-time over-determination count must discount them. =#
 function _countDuplicateResiduals(equations::Vector{Expr}, simCode)
-  local seen = Set{String}()
+  local seen = OrderedSet{String}()
   local nDup = 0
   local dupKeys = String[]
   local rewritten = rewriteEquations(deepcopy(equations), simCode)
@@ -542,7 +542,7 @@ function planDemotions(simCode,
   end
 
   #= Sets used by the matchers. =#
-  local discreteSet = Set(string(Symbol(dv)) for dv in discreteVariables)
+  local discreteSet = OrderedSet{String}(string(Symbol(dv)) for dv in discreteVariables)
   local whenAssignedSet = _collectWhenAssignedNames(simCode)
   local cyclicSCCDiscrete = _collectCyclicSCCDiscretes(simCode, whenAssignedSet)
   local conditionalTargets = _collectConditionalTargets(ifEqComponents)
@@ -558,7 +558,7 @@ function planDemotions(simCode,
     delete!(aliasPinned, pop!(comparisonPinned))
   end
 
-  local toDemote = Set{String}()
+  local toDemote = OrderedSet{String}()
   for dv in discreteVariables
     if string(Symbol(dv)) in aliasPinned
       push!(toDemote, dv)
@@ -594,7 +594,7 @@ function planDemotions(simCode,
       n > 0 && push!(mentions, (dv, n))
     end
     sort!(mentions; by = t -> -t[2])
-    local toRemoveHeuristic = Set{String}()
+    local toRemoveHeuristic = OrderedSet{String}()
     for (dv, _) in mentions
       length(toRemoveHeuristic) >= excess && break
       push!(toRemoveHeuristic, dv)
