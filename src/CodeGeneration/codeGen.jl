@@ -523,6 +523,33 @@ function _collectIfCondRefresh(writtenLHS::OrderedSet{String}, simCode)
   return (refreshCrefs, assigns)
 end
 
+#= Companion to _collectIfCondRefresh for DISCRETE-BOOL whens. A discrete-bool
+   when whose condition relation reads a discrete the periodic body writes (e.g.
+   BooleanPulse `y = time >= pulseStart and time < pulseStart + Twidth`, with
+   pulseStart re-sampled each period) is lowered to MTK continuous callbacks that
+   cannot catch the discontinuous threshold jump: when pulseStart jumps, the
+   zero-crossing `time - pulseStart` jumps across 0 with no smooth crossing. So
+   re-run such a when's body (its full rhs, the now-current threshold) inside the
+   periodic callback to re-derive the dependent discrete at the jump. Returns the
+   refresh crefs (rebound from the updated state) and the body statements. =#
+function _collectDiscreteBoolWhenRefresh(writtenLHS::OrderedSet{String}, simCode)
+  local refreshCrefs = Any[]
+  local refreshStmts = Expr[]
+  for weq in simCode.whenEquations
+    _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
+    local condDAE = SimulationCode.toDAEExp(weq.whenEquation.condition)
+    local condCrefs = listArray(Util.getAllCrefs(condDAE))
+    any(c -> string(c) in writtenLHS, condCrefs) || continue
+    append!(refreshStmts, createWhenStatementsMTK(weq.whenEquation.whenStmtLst, simCode))
+    append!(refreshCrefs, condCrefs)
+    for st in collect(weq.whenEquation.whenStmtLst)
+      (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+      append!(refreshCrefs, listArray(Util.getAllCrefs(SimulationCode.toDAEExp(st.right))))
+    end
+  end
+  return (refreshCrefs, refreshStmts)
+end
+
 #= Emit a PeriodicCallback for a Pulse-style periodic when: fire the body at the
    `integer((time-startTime)/period)` increments, i.e. at t = startTime + n*period
    for the n that fall in (tspan[1], stopTime]. `_firstEdge` is the first such
@@ -796,6 +823,18 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
        so resolve the interval to a literal Δt and write state via
        getStatesAsSymbols + lookuptable, mirroring the discrete branch. =#
     local whenStatementsMTKPeriodic = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    #= Refresh discrete-bool whens whose condition reads a discrete this periodic
+       body writes (e.g. BooleanPulse `y` reads the re-sampled `pulseStart`): their
+       own continuous callbacks cannot catch the threshold jump, so re-derive them
+       here from the now-current threshold. =#
+    local _periodicWrittenLHS = OrderedSet{String}()
+    for wStmt in wEq.whenStmtLst
+      (wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN) || continue
+      for c in listArray(Util.getAllCrefs(SimulationCode.toDAEExp(wStmt.left)))
+        push!(_periodicWrittenLHS, string(c))
+      end
+    end
+    local (_dbRefreshCrefs, _dbRefreshStmts) = _collectDiscreteBoolWhenRefresh(_periodicWrittenLHS, simCode)
     local _intervalVal = SimulationCode.tryEvalNumeric(interval, simCode)
     local _dtExpr = _intervalVal === nothing ? expToJuliaExp(interval, simCode) : _intervalVal
     quote
@@ -804,6 +843,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
         $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
           local t = integrator.t
           local x = integrator.u
+          local p = integrator.p
           local lookuptableStates
           local lookuptableParams
           if _affCache[] === nothing
@@ -819,10 +859,13 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           end
           $(_whenLookupBindings(vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...), simCode)...)
           $(whenStatementsMTKPeriodic...)
+          #= Re-derive dependent discrete-bool whens from the just-written threshold. =#
+          $(_whenLookupBindings(_dbRefreshCrefs, simCode)...)
+          $(_dbRefreshStmts...)
         end
       end
       Δt = $(_dtExpr)
-      $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), Δt)
+      $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), Δt; save_positions = (true, true))
       $(if wEq.elsewhenPart !== nothing
           eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4)
         end)

@@ -2186,6 +2186,18 @@ Base.@nospecializeinfer function _discreteAffectEq(discSym::Symbol, @nospecializ
   return :($(discSym) ~ ModelingToolkit.ifelse(0.5 < $(_boolDaeToReal(pinned, simCode)), 1.0, 0.0))
 end
 
+#= Initialize affect for a lifted discrete: evaluate the FULL rhs at t0 (no
+   relation pinned). A `time >= startTime` relation is already satisfied at t0,
+   so no zero-crossing fires there; without this the discrete is stuck at its
+   default start value. Implements the `initial()` term of the §17.4.4 condition. =#
+Base.@nospecializeinfer function _discreteAffectEqInit(discSym::Symbol, @nospecialize(rhsDAE::DAE.Exp),
+                                                       isInt::Bool, simCode)
+  if isInt
+    return :($(discSym) ~ $(_discreteIntToReal(rhsDAE, simCode)))
+  end
+  return :($(discSym) ~ ModelingToolkit.ifelse(0.5 < $(_boolDaeToReal(rhsDAE, simCode)), 1.0, 0.0))
+end
+
 #= Pre-memory path. Each model is generated as its own module, so a single
    module-level `DISCRETE_PRE_MEM` Dict per model holds the committed value of
    every lifted discrete. The cluster's ImperativeAffects read it for `pre(x)` and
@@ -2381,7 +2393,10 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
        pinned to its post-crossing value (others at their current value) so a
        coupled FSM recomputes consistently and direction-correctly on any member
        crossing, without the `f≈0` ambiguity. =#
-    for rel in rels
+    #= Initialize affect: set every discrete from its full rhs at t0 (the
+       `initial()` term). Attached to the first relation's callback only. =#
+    local affInit = Expr[_discreteAffectEqInit(d, r, ii, simCode) for (d, r, ii) in assigns]
+    for (relIdx, rel) in enumerate(rels)
       local zc = transformToMTKContinousCondition(rel, simCode)
       if preMem
         #= One live ImperativeAffect (both edges) that commits to DISCRETE_PRE_MEM
@@ -2401,18 +2416,37 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
       else
         local affFalse = Expr[_discreteAffectEq(d, r, rel, false, ii, simCode) for (d, r, ii) in assigns]
         local affTrue  = Expr[_discreteAffectEq(d, r, rel, true,  ii, simCode) for (d, r, ii) in assigns]
+        #= The `initial()` term: only the first relation's callback carries it,
+           so the discretes are set once at t0 (no double-apply). =#
+        local _withInit = relIdx == 1
         if isEdge
           #= rising-only: run the body when the relation becomes TRUE
              (down-crossing of zc = affect_neg); no-op on the falling side. =#
-          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
-            ($(zc) ~ 0) => Any[];
-            affect_neg = [$(affTrue...)],
-            reinitializealg = SciMLBase.NoInit())))
+          if _withInit
+            push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(zc) ~ 0) => Any[];
+              affect_neg = [$(affTrue...)],
+              initialize = [$(affInit...)],
+              reinitializealg = SciMLBase.NoInit())))
+          else
+            push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(zc) ~ 0) => Any[];
+              affect_neg = [$(affTrue...)],
+              reinitializealg = SciMLBase.NoInit())))
+          end
         else
-          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
-            ($(zc) ~ 0) => [$(affFalse...)];
-            affect_neg = [$(affTrue...)],
-            reinitializealg = SciMLBase.NoInit())))
+          if _withInit
+            push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(zc) ~ 0) => [$(affFalse...)];
+              affect_neg = [$(affTrue...)],
+              initialize = [$(affInit...)],
+              reinitializealg = SciMLBase.NoInit())))
+          else
+            push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(zc) ~ 0) => [$(affFalse...)];
+              affect_neg = [$(affTrue...)],
+              reinitializealg = SciMLBase.NoInit())))
+          end
         end
       end
     end
