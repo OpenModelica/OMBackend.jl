@@ -192,7 +192,7 @@ function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DA
       transformToZeroCrossingCondition(listHead(args))
     end
     DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-      DAE.BINARY(lhs, DAE.SUB(DAE.T_REAL_DEFAULT), rhs)
+      DAE.BINARY(e1, DAE.SUB(DAE.T_REAL_DEFAULT), e2)
     end
     DAE.LUNARY(operator = op, exp = e1)  => begin
       DAE.UNARY(DAE.SUB(DAE.T_REAL_DEFAULT), e1)
@@ -690,13 +690,16 @@ function involvedInEvent(idx, simCode)
     if _whenStmtLstTargets(wEqInner.whenStmtLst, targetName)
       return true
     end
+    #= elsewhenPart carries two storage shapes: BDAE wraps with
+       SOME(WHEN_EQUATION(WHEN_STMTS)), SimCode stores the bare WHEN_STMTS. =#
     local ew = wEqInner.elsewhenPart
     while ew !== nothing
-      local nested = ew.data
-      if _whenStmtLstTargets(nested.whenEquation.whenStmtLst, targetName)
+      local nested = ew isa SOME ? ew.data : ew
+      local inner = hasproperty(nested, :whenEquation) ? nested.whenEquation : nested
+      if _whenStmtLstTargets(inner.whenStmtLst, targetName)
         return true
       end
-      ew = nested.whenEquation.elsewhenPart
+      ew = inner.elsewhenPart
     end
   end
   return false

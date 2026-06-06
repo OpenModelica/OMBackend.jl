@@ -3548,7 +3548,12 @@ function propagateConstants(simCode::SIM_CODE)
     push!(newIfEqs, IF_EQUATION(newBranches))
   end
 
-  #= Substitute in when-equation conditions =#
+  #= Substitute propagated constants in when-equation CONDITIONS only. The
+     bodies are deliberately NOT passed through _substituteAliasInWhenStmts here
+     (unlike eliminateAliasVariables): that helper also rewrites the ASSIGN/REINIT
+     LHS, and substituting a CONSTANT into an assignment target is invalid. The
+     survivor scan below keeps any unknown read only from a when body, so it is
+     not dropped and does not dangle, even though it stays un-substituted. =#
   local newWhenEqs = WHEN_EQUATION[]
   for whenEq in simCode.whenEquations
     local innerWhen = whenEq.whenEquation
@@ -3600,6 +3605,14 @@ function propagateConstants(simCode::SIM_CODE)
       collectCrefNames!(allRefNames, toDAEExp(initEq.lhs))
       collectCrefNames!(allRefNames, toDAEExp(initEq.rhs))
     end
+  end
+
+  #= Also scan when-equation conditions and statement bodies for surviving
+     references (mirrors eliminateAliasVariables). Without this, a constant-bound
+     unknown read only inside a when body is judged non-surviving and removed
+     from the HT while still referenced. =#
+  for whenEq in newWhenEqs
+    _collectWhenCrefNames!(allRefNames, whenEq.whenEquation)
   end
 
   local survivingRefs = OrderedSet{String}()
@@ -4058,6 +4071,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
       push!(newInitEqs, initEq)
     end
   end
+  local newInitialAlgs = _substituteAliasInInitialAlgorithms(simCode.initialAlgorithms, aliasMap)
 
   #= ===== Step 5: Verify substitution and remove eliminated variables ===== =#
   #= Collect all CREF names from remaining equations. Any eliminated variable
@@ -4083,6 +4097,9 @@ function eliminateAliasVariables(simCode::SIM_CODE)
       collectCrefNames!(allRefNames, toDAEExp(initEq.lhs))
       collectCrefNames!(allRefNames, toDAEExp(initEq.rhs))
     end
+  end
+  for ia in newInitialAlgs
+    _collectInitialAlgorithmCrefNames!(allRefNames, ia)
   end
   #= Also check when-equations (conditions and statements) for surviving references =#
   for whenEq in newWhenEqs
@@ -4211,6 +4228,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   @assign begin
     simCode.residualEquations = newResEqs
     simCode.initialEquations = newInitEqs
+    simCode.initialAlgorithms = newInitialAlgs
     simCode.stringToSimVarHT = newHT
     simCode.ifEquations = newIfEqs
     simCode.whenEquations = newWhenEqs
@@ -4654,6 +4672,12 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
      by symbol — UndefVarError at module eval. =#
   _collectComplexFieldNames!(protectedNames, simCode.residualEquations, ht)
   _collectComplexFieldNames!(protectedNames, simCode.initialEquations, ht)
+  #= A parameter consumed only from a Modelica function body is otherwise
+     invisible to the equation/attribute/condition scans above; without this it
+     can be folded out of the HT while the function body still references its
+     symbol -> UndefVarError at module eval. Mirrors the sibling passes
+     dropObservationOnlyVariables (4391) and eliminateDeadParameters (4500). =#
+  _collectFunctionBodyCrefs!(protectedNames, simCode.functions)
 
   #= Step 1: identify eliminable parameters via _tryEvalNumeric. =#
   for (name, htEntry) in ht
@@ -5205,6 +5229,33 @@ function _substituteParamInWhenStmts(whenStmts::BDAE.WHEN_STMTS, paramValueMap)
   return BDAE.WHEN_STMTS(newCond, newStmtLst, newElseWhen)
 end
 
+#= AUDIT (ombackend-bug-audit-2026-06-05 #9): substituteAliasCref legitimately
+   wraps a NEGATED alias as UNARY(UMINUS, rep), but on an ASSIGN/REINIT target
+   that is an invalid lvalue. Redistribute the sign to the value side, which is
+   semantics-preserving: `-x := r` == `x := -r`, `reinit(-x, v)` == `reinit(x, -v)`.
+   Non-negated targets pass through unchanged. =#
+function _redistributeNegatedAliasLhs(lhsDAE::DAE.Exp, rhsDAE::DAE.Exp)
+  @match lhsDAE begin
+    DAE.UNARY(DAE.UMINUS(__), inner) =>
+      (inner, DAE.UNARY(DAE.UMINUS(DAE.T_REAL(MetaModelica.nil)), rhsDAE))
+    _ => (lhsDAE, rhsDAE)
+  end
+end
+
+#= SimExp call site: detect a negated-alias target via DAE normalization and
+   only round-trip when it actually fires, so the common (non-negated) case is
+   not perturbed. =#
+function _redistributeNegatedAliasLhsSim(newL, newR)
+  local lhsDAE = toDAEExp(newL)
+  @match lhsDAE begin
+    DAE.UNARY(DAE.UMINUS(__), _) => begin
+      local (fInner, fNegR) = _redistributeNegatedAliasLhs(lhsDAE, toDAEExp(newR))
+      (toSimExp(fInner), toSimExp(fNegR))
+    end
+    _ => (newL, newR)
+  end
+end
+
 """
 Recursively substitute alias CREFs in a WHEN_STMTS node (condition + statements + elsewhen).
 """
@@ -5215,11 +5266,13 @@ function _substituteAliasInWhenStmts(whenStmts::WHEN_STMTS, aliasMap)
     local newStmt::WhenOperator = if stmt isa ASSIGN
       local (newL, _) = traverseExpTopDown(stmt.left, substituteAliasCref, aliasMap)
       local (newR, _) = traverseExpTopDown(stmt.right, substituteAliasCref, aliasMap)
-      ASSIGN(newL, newR, stmt.source)
+      local (fL, fR) = _redistributeNegatedAliasLhsSim(newL, newR)
+      ASSIGN(fL, fR, stmt.source)
     elseif stmt isa REINIT
       local (newSV, _) = Util.traverseExpTopDown(stmt.stateVar, substituteAliasCref, aliasMap)
       local (newVal, _) = traverseExpTopDown(stmt.value, substituteAliasCref, aliasMap)
-      REINIT(newSV, newVal, stmt.source)
+      local (fSV, fVal) = _redistributeNegatedAliasLhsSim(newSV, newVal)
+      REINIT(fSV, fVal, stmt.source)
     elseif stmt isa NORETCALL
       local (newExp, _) = traverseExpTopDown(stmt.exp, substituteAliasCref, aliasMap)
       NORETCALL(newExp, stmt.source)
@@ -5245,12 +5298,14 @@ function _substituteAliasInWhenStmts(whenStmts::BDAE.WHEN_STMTS, aliasMap)
       BDAE.ASSIGN(__) => begin
         local (newL, _) = Util.traverseExpTopDown(stmt.left, substituteAliasCref, aliasMap)
         local (newR, _) = Util.traverseExpTopDown(stmt.right, substituteAliasCref, aliasMap)
-        BDAE.ASSIGN(newL, newR, stmt.source)
+        local (fL, fR) = _redistributeNegatedAliasLhs(newL, newR)
+        BDAE.ASSIGN(fL, fR, stmt.source)
       end
       BDAE.REINIT(__) => begin
         local (newSV, _) = Util.traverseExpTopDown(stmt.stateVar, substituteAliasCref, aliasMap)
         local (newVal, _) = Util.traverseExpTopDown(stmt.value, substituteAliasCref, aliasMap)
-        BDAE.REINIT(newSV, newVal, stmt.source)
+        local (fSV, fVal) = _redistributeNegatedAliasLhs(newSV, newVal)
+        BDAE.REINIT(fSV, fVal, stmt.source)
       end
       BDAE.NORETCALL(__) => begin
         local (newExp, _) = Util.traverseExpTopDown(stmt.exp, substituteAliasCref, aliasMap)
@@ -5278,6 +5333,107 @@ function _substituteAliasInElseWhen(elseWhenEq, aliasMap)
   local newInner = _substituteAliasInWhenStmts(inner, aliasMap)
   @assign elseWhenEq.whenEquation = newInner
   return elseWhenEq
+end
+
+function _substituteAliasInInitialAlgorithms(initialAlgs::Vector{INITIAL_ALGORITHM}, aliasMap)::Vector{INITIAL_ALGORITHM}
+  local result = INITIAL_ALGORITHM[]
+  sizehint!(result, length(initialAlgs))
+  for ia in initialAlgs
+    local newOps = [_substituteAliasInInitialWhenOp(op, aliasMap) for op in ia.statements]
+    local newDae = [_substituteAliasInInitialDAEStmt(stmt, aliasMap) for stmt in ia.daeStatements]
+    push!(result, INITIAL_ALGORITHM(newOps, newDae))
+  end
+  return result
+end
+
+function _substituteAliasInInitialWhenOp(stmt, aliasMap)
+  if stmt isa ASSIGN
+    local (newL, _) = traverseExpTopDown(stmt.left, substituteAliasCref, aliasMap)
+    local (newR, _) = traverseExpTopDown(stmt.right, substituteAliasCref, aliasMap)
+    local (fL, fR) = _redistributeNegatedAliasLhsSim(newL, newR)
+    return ASSIGN(fL, fR, stmt.source)
+  elseif stmt isa REINIT
+    local (newSV, _) = traverseExpTopDown(stmt.stateVar, substituteAliasCref, aliasMap)
+    local (newVal, _) = traverseExpTopDown(stmt.value, substituteAliasCref, aliasMap)
+    local (fSV, fVal) = _redistributeNegatedAliasLhsSim(newSV, newVal)
+    return REINIT(fSV, fVal, stmt.source)
+  elseif stmt isa NORETCALL
+    local (newExp, _) = traverseExpTopDown(stmt.exp, substituteAliasCref, aliasMap)
+    return NORETCALL(newExp, stmt.source)
+  elseif stmt isa ASSERT
+    local (newC, _) = traverseExpTopDown(stmt.condition, substituteAliasCref, aliasMap)
+    local (newM, _) = traverseExpTopDown(stmt.message, substituteAliasCref, aliasMap)
+    local (newL, _) = traverseExpTopDown(stmt.level, substituteAliasCref, aliasMap)
+    return ASSERT(newC, newM, newL, stmt.source)
+  elseif stmt isa TERMINATE
+    local (newM, _) = traverseExpTopDown(stmt.message, substituteAliasCref, aliasMap)
+    return TERMINATE(newM, stmt.source)
+  end
+  return stmt
+end
+
+function _substituteAliasInInitialDAEStmt(stmt, aliasMap)
+  return @match stmt begin
+    DAE.STMT_ASSIGN(ty, e1, e, src) => begin
+      local (newL, _) = Util.traverseExpTopDown(e1, substituteAliasCref, aliasMap)
+      local (newR, _) = Util.traverseExpTopDown(e, substituteAliasCref, aliasMap)
+      local (fL, fR) = _redistributeNegatedAliasLhs(newL, newR)
+      DAE.STMT_ASSIGN(ty, fL, fR, src)
+    end
+    DAE.STMT_TUPLE_ASSIGN(ty, lhsList, e, src) => begin
+      local newLhs = MetaModelica.list((first(Util.traverseExpTopDown(lhs, substituteAliasCref, aliasMap)) for lhs in lhsList)...)
+      local (newR, _) = Util.traverseExpTopDown(e, substituteAliasCref, aliasMap)
+      DAE.STMT_TUPLE_ASSIGN(ty, newLhs, newR, src)
+    end
+    DAE.STMT_ASSIGN_ARR(ty, lhs, e, src) => begin
+      local (newL, _) = Util.traverseExpTopDown(lhs, substituteAliasCref, aliasMap)
+      local (newR, _) = Util.traverseExpTopDown(e, substituteAliasCref, aliasMap)
+      local (fL, fR) = _redistributeNegatedAliasLhs(newL, newR)
+      DAE.STMT_ASSIGN_ARR(ty, fL, fR, src)
+    end
+    DAE.STMT_NORETCALL(e, src) =>
+      DAE.STMT_NORETCALL(first(Util.traverseExpTopDown(e, substituteAliasCref, aliasMap)), src)
+    DAE.STMT_ASSERT(c, m, l, src) =>
+      DAE.STMT_ASSERT(first(Util.traverseExpTopDown(c, substituteAliasCref, aliasMap)),
+                      first(Util.traverseExpTopDown(m, substituteAliasCref, aliasMap)),
+                      first(Util.traverseExpTopDown(l, substituteAliasCref, aliasMap)), src)
+    DAE.STMT_TERMINATE(m, src) =>
+      DAE.STMT_TERMINATE(first(Util.traverseExpTopDown(m, substituteAliasCref, aliasMap)), src)
+    DAE.STMT_IF(cond, stmts, else_, src) =>
+      DAE.STMT_IF(first(Util.traverseExpTopDown(cond, substituteAliasCref, aliasMap)),
+                  MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in stmts)...),
+                  _substituteAliasInInitialDAEElse(else_, aliasMap), src)
+    DAE.STMT_FOR(ty, isArr, iter, idx, range, body, src) =>
+      DAE.STMT_FOR(ty, isArr, iter, idx,
+                   first(Util.traverseExpTopDown(range, substituteAliasCref, aliasMap)),
+                   MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in body)...), src)
+    DAE.STMT_PARFOR(ty, isArr, iter, idx, range, body, prl, src) =>
+      DAE.STMT_PARFOR(ty, isArr, iter, idx,
+                      first(Util.traverseExpTopDown(range, substituteAliasCref, aliasMap)),
+                      MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in body)...), prl, src)
+    DAE.STMT_WHILE(cond, body, src) =>
+      DAE.STMT_WHILE(first(Util.traverseExpTopDown(cond, substituteAliasCref, aliasMap)),
+                     MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in body)...), src)
+    DAE.STMT_REINIT(varExp, value, src) => begin
+      local (newSV, _) = Util.traverseExpTopDown(varExp, substituteAliasCref, aliasMap)
+      local (newVal, _) = Util.traverseExpTopDown(value, substituteAliasCref, aliasMap)
+      local (fSV, fVal) = _redistributeNegatedAliasLhs(newSV, newVal)
+      DAE.STMT_REINIT(fSV, fVal, src)
+    end
+    _ => stmt
+  end
+end
+
+function _substituteAliasInInitialDAEElse(else_, aliasMap)
+  return @match else_ begin
+    DAE.ELSE(stmts) =>
+      DAE.ELSE(MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in stmts)...))
+    DAE.ELSEIF(cond, stmts, rest) =>
+      DAE.ELSEIF(first(Util.traverseExpTopDown(cond, substituteAliasCref, aliasMap)),
+                 MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in stmts)...),
+                 _substituteAliasInInitialDAEElse(rest, aliasMap))
+    _ => else_
+  end
 end
 
 """
@@ -5330,6 +5486,28 @@ function _collectWhenCrefNames!(names::OrderedSet{String}, whenStmts::BDAE.WHEN_
     NONE() => ()
   end
   return nothing
+end
+
+function _collectInitialAlgorithmCrefNames!(names::OrderedSet{String}, ia::INITIAL_ALGORITHM)
+  for stmt in ia.statements
+    if stmt isa ASSIGN
+      collectCrefNames!(names, toDAEExp(stmt.left))
+      collectCrefNames!(names, toDAEExp(stmt.right))
+    elseif stmt isa REINIT
+      collectCrefNames!(names, toDAEExp(stmt.stateVar))
+      collectCrefNames!(names, toDAEExp(stmt.value))
+    elseif stmt isa NORETCALL
+      collectCrefNames!(names, toDAEExp(stmt.exp))
+    elseif stmt isa ASSERT
+      collectCrefNames!(names, toDAEExp(stmt.condition))
+      collectCrefNames!(names, toDAEExp(stmt.message))
+      collectCrefNames!(names, toDAEExp(stmt.level))
+    elseif stmt isa TERMINATE
+      collectCrefNames!(names, toDAEExp(stmt.message))
+    end
+  end
+  _walkStatementsForCrefs!(names, ia.daeStatements)
+  return names
 end
 
 function _isZeroConstExp(@nospecialize(e))::Bool
@@ -7037,69 +7215,53 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   end
 
   local n_extra = n_eqs - n_vars
-  @info "[SIMCODE: $(simCode.name): removeRedundantEquations] over-determined by $n_extra equation(s); running maximum matching to find redundant equations"
+  @info "[SIMCODE: $(simCode.name): removeRedundantEquations] over-determined by $n_extra equation(s); removing only provably-redundant (duplicate) residuals"
 
-  #= Build incidence: eq_idx -> Set of unknown names that equation mentions =#
-  local surviving_unknowns = OrderedSet{String}(k for (k, (_, sv)) in pairs(ht) if isUnknownVarKind(sv.varKind))
-  local incidence = map(enumerate(res)) do (i, eq)
-    local names = OrderedSet{String}()
-    collectCrefNames!(names, toDAEExp(eq.exp))
-    intersect(names, surviving_unknowns)
-  end
-
-  #= Augmenting-path maximum bipartite matching (equations -> unknowns)
-     via Kuhn's algorithm. var_to_eq[v] = equation currently assigned to
-     unknown v. eq_to_var[i] = unknown currently assigned to equation i
-     ("" = unmatched). seenVars tracks variables already attempted in the
-     current augmenting path to avoid revisiting them. =#
-  local var_to_eq = Dict{String, Int}()
-  local eq_to_var = fill("", n_eqs)
-
-  function augment!(eq_idx::Int, seenVars::OrderedSet{String})::Bool
-    for var in incidence[eq_idx]
-      var in seenVars && continue
-      push!(seenVars, var)
-      if !haskey(var_to_eq, var) || augment!(var_to_eq[var], seenVars)
-        var_to_eq[var] = eq_idx
-        eq_to_var[eq_idx] = var
-        return true
-      end
+  #= The only structurally PROVABLE redundancy is a duplicate constraint: a
+     residual whose expression is identical to an earlier retained residual
+     (the same `0 = e` stated twice). A maximum bipartite matching can prove
+     the system is over-determined but NOT which equation is the algebraically
+     dependent one (Dulmage-Mendelsohn: the over-constrained block identifies
+     over-determination, not its redundant member). Dropping an arbitrary
+     unmatched equation can therefore delete a live, independent constraint and
+     silently change the solution. We do not do that: duplicates (provably
+     redundant) are removed; any remaining imbalance is reported and left for
+     the downstream solver to flag rather than masked by deleting a constraint
+     we cannot prove is redundant. =#
+  local firstSeen = Dict{String, Int}()
+  local duplicates = Int[]
+  for i in 1:n_eqs
+    local key = try string(toDAEExp(res[i].exp)) catch; string(res[i].exp) end
+    if haskey(firstSeen, key)
+      push!(duplicates, i)
+    else
+      firstSeen[key] = i
     end
-    return false
   end
 
-  map(i -> augment!(i, OrderedSet{String}()), 1:n_eqs)
-
-  #= Equations with no assigned unknown are unmatched. Only treat as
-     "redundant" those that ALSO have non-empty incidence — i.e. they
-     reference surviving unknowns but the matching could not assign one.
-     Equations whose incidence is empty after alias substitution are
-     trivial (`0 = 0` after subst) and are left for
-     cleanupTrivialResidualEquations to fold; removing them here may also
-     drop equations whose only surviving refs are parameters or constants
-     and inadvertently break structural balance. =#
-  local redundant = Int[i for i in 1:n_eqs if isempty(eq_to_var[i]) && !isempty(incidence[i])]
-
-  if isempty(redundant)
-    @warn "[SIMCODE: $(simCode.name): removeRedundantEquations] over-determined but no unmatched equations with surviving incidence found; leaving system unchanged"
+  if isempty(duplicates)
+    @warn "[SIMCODE: $(simCode.name): removeRedundantEquations] over-determined by $n_extra but found no duplicate residuals to remove; leaving the system unchanged so the imbalance surfaces in the solver rather than deleting an arbitrary constraint"
     return simCode
   end
 
-  #= Cap the number removed at n_extra to avoid runaway reduction when the
-     matching is suboptimal on a particular structural pattern. =#
-  if length(redundant) > n_extra
-    @info "[SIMCODE: $(simCode.name): removeRedundantEquations] capping removal at $n_extra (found $(length(redundant)) unmatched-with-incidence equations)"
-    redundant = redundant[1:n_extra]
+  #= Never remove more than the surplus. Each duplicate is independently and
+     provably redundant, so taking the first n_extra is safe and deterministic. =#
+  if length(duplicates) > n_extra
+    duplicates = duplicates[1:n_extra]
   end
 
-  map(redundant) do i
+  map(duplicates) do i
     local eqStr = try OMFrontend.Frontend.toString(res[i].exp) catch; string(res[i].exp) end
-    @info "[SIMCODE: $(simCode.name): removeRedundantEquations] removing redundant equation [$i]: 0 = $eqStr"
+    @info "[SIMCODE: $(simCode.name): removeRedundantEquations] removing duplicate equation [$i]: 0 = $eqStr"
   end
 
-  local redundant_set = OrderedSet{Int}(redundant)
-  local newRes = RESIDUAL_EQUATION[res[i] for i in 1:n_eqs if i ∉ redundant_set]
+  local removed_set = OrderedSet{Int}(duplicates)
+  local newRes = RESIDUAL_EQUATION[res[i] for i in 1:n_eqs if i ∉ removed_set]
   @assign simCode.residualEquations = newRes
+
+  if length(duplicates) < n_extra
+    @warn "[SIMCODE: $(simCode.name): removeRedundantEquations] still over-determined by $(n_extra - length(duplicates)) after removing $(length(duplicates)) duplicate(s); leaving the remainder for the solver to flag"
+  end
   return simCode
 end
 

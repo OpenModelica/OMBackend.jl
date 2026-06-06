@@ -291,6 +291,59 @@ function whenConditionDiscreteSyms(simCode)::OrderedSet{Symbol}
   return out
 end
 
+"""
+    substituteRelayAliasesInWhens(simCode, relayAliases) -> simCode
+
+Re-point when-equation reads of relay-eliminated leaf names at the surviving
+representative, so the generated callbacks read surviving unknowns.
+"""
+function substituteRelayAliasesInWhens(simCode, relayAliases::Dict{Symbol, Symbol})
+  isempty(relayAliases) && return simCode
+  local wanted = OrderedSet{String}(string(k) for k in keys(relayAliases))
+  local tyOf = Dict{String, DAE.Type}()
+  local collectTy = function (@nospecialize(e), acc)
+    if e isa DAE.CREF
+      local nm = string(e.componentRef)
+      if nm in wanted && !haskey(tyOf, nm)
+        tyOf[nm] = e.ty
+      end
+    end
+    return (e, true, acc)
+  end
+  for weq in simCode.whenEquations
+    local stmts = weq.whenEquation
+    while stmts isa SimulationCode.WHEN_STMTS
+      Util.traverseExpTopDown(SimulationCode.toDAEExp(stmts.condition), collectTy, nothing)
+      for st in stmts.whenStmtLst
+        if st isa SimulationCode.ASSIGN
+          Util.traverseExpTopDown(SimulationCode.toDAEExp(st.left), collectTy, nothing)
+          Util.traverseExpTopDown(SimulationCode.toDAEExp(st.right), collectTy, nothing)
+        elseif st isa SimulationCode.REINIT
+          Util.traverseExpTopDown(SimulationCode.toDAEExp(st.value), collectTy, nothing)
+        end
+      end
+      stmts = stmts.elsewhenPart
+    end
+  end
+  local aliasMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
+  for (k, r) in relayAliases
+    local kStr = string(k)
+    local ty = get(tyOf, kStr, nothing)
+    ty === nothing && continue
+    local rStr = string(r)
+    aliasMap[kStr] = (rStr, false, DAE.CREF_IDENT(rStr, ty, MetaModelica.nil), ty)
+  end
+  isempty(aliasMap) && return simCode
+  local newWhens = [begin
+                      local inner = SimulationCode._substituteAliasInWhenStmts(whenEq.whenEquation, aliasMap)
+                      @assign whenEq.whenEquation = inner
+                      whenEq
+                    end
+                    for whenEq in simCode.whenEquations]
+  @assign simCode.whenEquations = newWhens
+  return simCode
+end
+
 #= ---- ODEProblem-construction strategies ----
 
    At codegen time the function picks one of three strategies for building
@@ -718,17 +771,24 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
            times so _nDiff stays 0 — exactly the case where FBDF is wanted. =#
         local _nDiff = count(i -> _mm[i,i] != 0, 1:_n)
         local _nAlg = _n - _nDiff
+        #= MTK renders subscripted unknowns as var"name[i]"(t); strip the quote
+           wrapper so names compare against the simvar-derived literals. =#
+        local _mtkName = u -> replace(replace(string(u), "var\"" => ""), "\"" => "")
         if _nDiff == 0
           @info "[MTK GEN: solver] zero differential states detected, switching default $(_solverName) -> FBDF for purely-algebraic DAE"
           _solver = FBDF(autodiff=false)
-        elseif _nAlg > 0 && !isempty(_discreteUnknownNames)
+        elseif _nAlg > 0 && !isempty(_discreteUnknownNames) && $(isempty(simCode.whenEquations))
+          #= Only when the model has NO when-equation callbacks: event-driven
+             discretes are kept consistent by their callbacks and integrate fine
+             with the Rosenbrock default, while FBDF's post-event
+             re-initialization collapses dt at the first event instant. =#
           local _unknowns = try
             ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM)
           catch
             Any[]
           end
           local _nCheck = min(_n, length(_unknowns))
-          local _hasDiscreteAlgUnknown = any(i -> _mm[i,i] == 0 && string(_unknowns[i]) in _discreteUnknownNames, 1:_nCheck)
+          local _hasDiscreteAlgUnknown = any(i -> _mm[i,i] == 0 && _mtkName(_unknowns[i]) in _discreteUnknownNames, 1:_nCheck)
           if _hasDiscreteAlgUnknown
             @info "[MTK GEN: solver] algebraic rows involving generated discrete variables detected in mass-matrix system; switching default $(_solverName) -> FBDF"
             _solver = FBDF(autodiff=false)
@@ -843,10 +903,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local PARAMETER_ASSIGNMENTS = createParameterAssignmentsMTK(parameters, simCode)
   local PARAMETER_RAW_ARRAY = createParameterArray(parameters, PARAMETER_ASSIGNMENTS, simCode)
   local ARRAY_PARAMETERS = createArrayParametersMTK(arrayParameters, simCode)
-  #=
-  Create callback equations.
-  =#
-  local CALL_BACK_EQUATIONS = createCallbackCode(modelName, simCode; generateSaveFunction = false)
+  #= Legacy callback generation is deferred until after relay elimination so
+     the callbacks read the surviving relay representatives (see below). =#
   local IF_EQUATION_COMPONENTS::Vector{IfEquationComponent} =
     createIfEquations(stateVariables, algebraicVariables, simCode)
   #= Symbolic names =#
@@ -938,6 +996,11 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      so re-aliasing it to another leaf strands the lookup. Force them to be the
      relay component root. =#
   local _condDiscretes = whenConditionDiscreteSyms(simCode)
+  #= They must also survive structural_simplify as unknowns: a condition cref
+     demoted to an MTK observed is unreadable from the legacy callback. =#
+  for _s in _condDiscretes
+    _s in irreducibleSyms || push!(irreducibleSyms, _s)
+  end
   local (_ifEqRelay_eqs, _ifEqRelay_aliases) = eliminateIfEqRelays(EQUATIONS; preferKeep = _condDiscretes)
   EQUATIONS = _ifEqRelay_eqs
   if !isempty(_ifEqRelay_aliases)
@@ -984,6 +1047,10 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     IF_EQUATION_EVENT_DECLARATION = buildIfEquationEventDecl(IF_EQUATION_EVENTS)
     CONDITIONAL_EQUATIONS = [_substSyms(eq, _ifEqRelay_aliases) for eq in CONDITIONAL_EQUATIONS]
   end
+  #= Generate the legacy callback set against when-equations re-pointed at the
+     surviving relay representatives, so callback lookups hit live unknowns. =#
+  simCode = substituteRelayAliasesInWhens(simCode, _ifEqRelay_aliases)
+  local CALL_BACK_EQUATIONS = createCallbackCode(modelName, simCode; generateSaveFunction = false)
   EQUATIONS = vcat(EQUATIONS,
                    DISCRETE_DUMMY_EQUATIONS,
                    CONDITIONAL_EQUATIONS)
@@ -2536,8 +2603,27 @@ function createArrayParametersMTK(arrayParameters::Vector, simCode::SimulationCo
         push!(exprs, :($(Symbol(simVar.name)) = $(valExpr)))
       end
       SimulationCode.ARRAY_PARAMETER(dims, NONE()) => begin
-        #= No binding, create zero array with the right dimensions =#
-        push!(exprs, :($(Symbol(simVar.name)) = zeros(Float64, $(dims...))))
+        #= AUDIT (ombackend-bug-audit-2026-06-05 #12): no binding expression.
+           Mirror the scalar parameter paths (createParameterEquationsMTK /
+           createParameterArray) and consult the declared start attribute before
+           defaulting to zeros, so an unbound array parameter carrying a non-zero
+           array-literal start is not silently materialized as all zeros. Only an
+           explicit array-literal start is emitted directly (a scalar/other start
+           has ambiguous broadcast shape); anything else falls through to a
+           warned zeros materialization so the gap is attributable. =#
+        local arrStart = @match simVar.attributes begin
+          SOME(attr) where attr.start isa SOME => begin
+            @match SOME(sv) = attr.start
+            (sv isa DAE.ARRAY) ? expToJuliaExpMTK(sv, simCode) : nothing
+          end
+          _ => nothing
+        end
+        if arrStart === nothing
+          @warn "[MTK GEN: createArrayParametersMTK] array parameter $(simVar.name): no binding and no array-literal start; materializing as zeros($(dims)). Any function subscripting it computes with zeros."
+          push!(exprs, :($(Symbol(simVar.name)) = zeros(Float64, $(dims...))))
+        else
+          push!(exprs, :($(Symbol(simVar.name)) = $(arrStart)))
+        end
       end
       _ => nothing
     end
@@ -2867,7 +2953,20 @@ function createParameterArray(parameters::Vector{T1},
       else
         parValue = :($(Symbol(param))) #:(0.0)
       end
-    catch #=If the bound value is a more complex expression. =#
+    catch err #=If the bound value is a more complex expression. =#
+      #= AUDIT (ombackend-bug-audit-2026-06-05 #6): for a cross-parameter /
+         function-call bind that fails module-scope eval, this falls back to 0,
+         so a continuous-when body reading such a parameter via the legacy
+         CallbackSet `aux[1]` mirror sees 0.0 (wrong event-driven result). This
+         affects only the legacy/DE callback path; the modern MTK parameter
+         source (createParameterEquationsMTK) emits the bind expression
+         symbolically and is correct. Proper fix: emit the bind expression (or
+         resolve via integrator.p) instead of 0, or bind `local p = integrator.p`
+         in the continuous-when closures and drop this aux[1] mirror. The 0
+         fallback is no longer silent: it warns so a wrong event-driven value is
+         attributable. Left as-is pending the legacy-path retirement. =#
+      local bindStr = try OMFrontend.Frontend.toString(bindExp) catch; string(bindExp) end
+      @warn "[MTK GEN: createParameterArray] parameter $(param): bind expression could not be evaluated at module scope; substituting 0 in the legacy parameter array. Any event-driven read of this parameter via the aux[1] mirror will be wrong (the modern MTK path is unaffected)." bind = bindStr exception = err
       parValue = :(0) #pars[Num($(param))]) (More complex parameters are yet to be used in the benchmark..)
     end
     push!(paramArray, parValue)
@@ -3641,12 +3740,16 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
     local sv = ht[name][2]
     if sv.varKind isa SimulationCode.PARAMETER ||
        sv.varKind isa SimulationCode.ARRAY_PARAMETER
-      local paramLit = @match sv.varKind begin
-        SimulationCode.PARAMETER(SOME(SimulationCode.RCONST(r))) => Float64(r)
-        SimulationCode.PARAMETER(SOME(SimulationCode.ICONST(i))) => Float64(i)
-        SimulationCode.PARAMETER(SOME(SimulationCode.BCONST(b))) => (b ? 1.0 : 0.0)
-        _ => nothing
-      end
+	      local paramLit = @match sv.varKind begin
+	        SimulationCode.PARAMETER(SOME(SimulationCode.RCONST(r))) => Float64(r)
+	        SimulationCode.PARAMETER(SOME(SimulationCode.ICONST(i))) => Float64(i)
+	        SimulationCode.PARAMETER(SOME(SimulationCode.BCONST(b))) => (b ? 1.0 : 0.0)
+	        SimulationCode.PARAMETER(SOME(SimulationCode.ENUM_LITERAL(_, i))) => Float64(i)
+	        _ => begin
+	          @warn "Generated nothing for $(name). $(name) was $(typeof(sv.varKind))"
+	          nothing
+	        end
+	      end
       paramLit === nothing && continue
       push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(paramLit)))
       continue

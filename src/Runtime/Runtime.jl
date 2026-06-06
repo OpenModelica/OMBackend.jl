@@ -255,6 +255,12 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
     @BACKEND_LOGGING @info "u values at Δt $(integrator.dt) & t = $(integrator.t)" integrator.u
     #= Check structural callbacks in order =#
     @BACKEND_LOGGING @info "Stepping at:" i.t
+    #= AUDIT (ombackend-bug-audit-2026-06-05 #13): retCode is computed but never
+       branched on. Harmless here (inside `for i in integrator`, which
+       self-terminates on integrator failure); the concerning twin site is the
+       OM_ProblemRecompilation `while true` loop, which has no retcode /
+       dt-collapse break and relies solely on sol.retcode. VSS path; add a break
+       when the VSS-recompilation pipeline is hardened. =#
     retCode = check_error(integrator)
     for cb in structuralCallbacks
       if cb.structureChanged && cb.name != activeModeName
@@ -273,7 +279,17 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
         newU0 = Float64[newSystem[sym] for sym in newSyms]
         @BACKEND_LOGGING @info "new initial values" newU0
         @BACKEND_LOGGING @info "Common vs" indicesOfCommonVariables
-        #= Map old states to matching new states (by common variable name) =#
+        #= Map old states to matching new states (by common variable name).
+           AUDIT (ombackend-bug-audit-2026-06-05 #8): getIndicesOfCommonVariables
+           returns values ordered by whichever keyset is SMALLER. When the NEW
+           system has FEWER states than OLD, indicesOfCommonVariables[k] is the
+           OLD index of the k-th NEW sym, but this loop treats the position as an
+           OLD index and the value as a NEW index -> the two index spaces are
+           swapped, scattering old state values into the wrong new slots (or a
+           BoundsError). Correct only on the OLD<=NEW (state-adding) branch.
+           Narrow VSS (state-reducing structural change) path. Fix: make
+           getIndicesOfCommonVariables return a canonical old->new mapping
+           independent of which keyset is smaller. =#
         for oldIdx in 1:min(length(oldSyms), length(newSyms))
           local idx = indicesOfCommonVariables[oldIdx]
           if idx != 0

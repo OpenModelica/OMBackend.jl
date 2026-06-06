@@ -1082,7 +1082,14 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         end
       end
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
-        if _isSimCodeFunctionName(tmpStr, simCode)
+        #= Route through _modelicaFunctionCallExpr (which consults the runtime
+           registry) when the name is either a simcode function OR a registered
+           OMRuntimeExternalC runtime function (e.g. the impure-RNG family). The
+           registry check matters for callers that run before simCode.functions
+           is populated (solveParametricInitialEquations!), where the bare-symbol
+           fallback would emit an unbound name that fails at eval. =#
+        if _isSimCodeFunctionName(tmpStr, simCode) ||
+           haskey(AlgorithmicCodeGeneration.MODELICA_UTILITIES_TO_RUNTIME_C, OMBackend.canonicalName(tmpStr))
           _modelicaFunctionCallExpr(tmpStr, explst, simCode, hashTable;
                                     varPrefix = varPrefix,
                                     varSuffix = varSuffix,

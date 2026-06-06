@@ -142,6 +142,8 @@ function simulateIMTK(modelName::String, tspan, solver; kwargs...)
         getfield(OMB, Symbol(cname)).simulate(tspan, solver; cached_build = rebuilt, kwargs...)
       end
     catch e
+      #= A user interrupt must propagate, not trigger a retry of the same solve. =#
+      e isa InterruptException && rethrow()
       @warn "[IMTK] cached-build solve failed; falling back to module simulate" model = modelName exception = e
     end
   end

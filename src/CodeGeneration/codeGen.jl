@@ -362,6 +362,49 @@ function _timeThreshold(@nospecialize(rel), simCode)
   end
 end
 
+#= Threshold expression of a `time >= thr` (or mirrored `thr <= time`) relation
+   whose threshold contains at least one runtime discrete variable, or nothing.
+   Such a condition is a runtime-scheduled time event: the threshold is only
+   known once the assigning when fires, so it cannot use PresetTimeCallback,
+   and a ContinuousCallback is unsafe (simultaneous crossings of several such
+   callbacks are tie-broken to a single applied affect). =#
+function _discreteTimeEventThreshold(@nospecialize(cond), simCode)
+  @match cond begin
+    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
+      local thr = if _isTimeCref(e1)
+        @match op begin
+          DAE.GREATEREQ(__) => e2
+          DAE.GREATER(__) => e2
+          _ => nothing
+        end
+      elseif _isTimeCref(e2)
+        @match op begin
+          DAE.LESSEQ(__) => e1
+          DAE.LESS(__) => e1
+          _ => nothing
+        end
+      else
+        nothing
+      end
+      thr === nothing && return nothing
+      local hasDiscrete = false
+      for c in Util.getAllCrefs(thr)
+        local k = string(c)
+        k == "time" && return nothing
+        haskey(simCode.stringToSimVarHT, k) || return nothing
+        local v = simCode.stringToSimVarHT[k][2]
+        if SimulationCode.isDiscrete(v)
+          hasDiscrete = true
+        elseif !SimulationCode.isParameter(v)
+          return nothing
+        end
+      end
+      hasDiscrete ? thr : nothing
+    end
+    _ => nothing
+  end
+end
+
 #= True for `change(p)` where p is a parameter/constant — it never fires, so it
    contributes no event and does not disqualify a pure time-threshold chain. =#
 function _isConstChangeArg(@nospecialize(a), simCode)
@@ -398,6 +441,71 @@ function _collectTimeThresholds(@nospecialize(cond), simCode)
       _isConstChangeArg(args[1], simCode) ? Float64[] : nothing
     end
     _ => nothing
+  end
+end
+
+#= Emit an `elsewhen time >= thr` arm (thr containing a runtime discrete) as an
+   edge-guarded DiscreteCallback. ContinuousCallbacks are unsafe here: when
+   several such arms cross zero at the same instant the integrator applies only
+   one and the rest never re-fire. `ewRefSym` names a Ref shared with the parent
+   when-branch holding the last consumed threshold: the parent consumes the
+   threshold when it fires at or past it (elsewhen exclusivity), and this
+   callback consumes it on firing so a level-true condition stays edge-only. =#
+function _emitElsewhenThresholdTimeWhen(elseArm, simCode, ewRefSym::Symbol, thrDAE)
+  ADD_CALLBACK()
+  local callbacks = COUNT_CALLBACKS()
+  local whenStmts = createWhenStatementsMTK(_elsewhenStmtLst(elseArm), simCode)
+  local thrCrefs = listArray(Util.getAllCrefs(thrDAE))
+  local affBindCrefs = vcat(map(x -> getRHSVariables(x), _elsewhenStmtLst(elseArm))..., thrCrefs)
+  quote
+    let _condCache = Ref{Any}(nothing), _affCache = Ref{Any}(nothing)
+      global $(Symbol("condition$(callbacks)"))
+      $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+        local lookuptableStates
+        local lookuptableParams
+        if _condCache[] === nothing
+          local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+          lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+          lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+          _condCache[] = (lookuptableStates, lookuptableParams)
+        else
+          local cached = _condCache[]
+          lookuptableStates = cached[1]
+          lookuptableParams = cached[2]
+        end
+        $(_whenLookupBindings(thrCrefs, simCode)...)
+        local _thr = Float64($(expToJuliaExpMTK(thrDAE, simCode)))
+        t >= _thr && _thr != $(ewRefSym)[]
+      end
+      global $(Symbol("affect$(callbacks)!"))
+      $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+        local t = integrator.t
+        local x = integrator.u
+        @debug "[CB-EW$($(callbacks)) affect] firing" t=integrator.t
+        local lookuptableStates
+        local lookuptableParams
+        if _affCache[] === nothing
+          local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+          lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+          lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+          _affCache[] = (lookuptableStates, lookuptableParams)
+        else
+          local cached = _affCache[]
+          lookuptableStates = cached[1]
+          lookuptableParams = cached[2]
+        end
+        $(_whenLookupBindings(affBindCrefs, simCode)...)
+        $(ewRefSym)[] = Float64($(expToJuliaExpMTK(thrDAE, simCode)))
+        $(whenStmts...)
+        auto_dt_reset!(integrator)
+        add_tstop!(integrator, integrator.t + 1E-12)
+      end
+    end
+    $(Symbol("cb$(callbacks)")) = DiscreteCallback($(Symbol("condition$(callbacks)")),
+                                                   $(Symbol("affect$(callbacks)!"));
+                                                   save_positions=(true, true))
   end
 end
 
@@ -798,6 +906,20 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           end
         end
       end
+      if wEq.elsewhenPart !== nothing
+        #= AUDIT (ombackend-bug-audit-2026-06-05 #11): a continuous when/elsewhen
+           whose arm conditions differ (the normal elsewhen case) is lowered to
+           independent ContinuousCallbacks via the recursion below. There is no
+           shared per-instant exclusivity guard, so Modelica elsewhen ordering is
+           honoured for non-simultaneous events (correct, since exclusivity is
+           per-instant) but NOT when both arm conditions cross zero at the same
+           instant: both bodies execute, last-writer-wins on a shared discrete.
+           Measure-zero in practice and confined to this legacy DE callback path
+           (the modern MTK path bakes events into the problem). Warned so the
+           limitation is attributable; a shared fired-at-instant guard threaded
+           through the recursion is the proper fix. =#
+        @warn "[CodeGen: continuous when/elsewhen] $(simCode.name): continuous `when`/`elsewhen` with distinct arm conditions is lowered to independent ContinuousCallbacks; elsewhen mutual-exclusion is NOT enforced when both arm conditions cross zero at the same instant (simultaneous-event edge case). See ombackend-bug-audit-2026-06-05 #11."
+      end
       quote
         $cond
         $affect
@@ -876,6 +998,29 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
        MTK structural_simplify reorders unknowns. Mirror the continuous
        callback path (above) which uses getStatesAsSymbols + lookuptable. =#
     whenStatementsMTKDiscrete = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    #= An elsewhen arm `time >= thr` with a runtime-discrete threshold is a
+       scheduled time event: the parent affect (which assigns the threshold)
+       adds a tstop at it, and the arm itself is emitted as an edge-guarded
+       DiscreteCallback ordered after the parent (see
+       _emitElsewhenThresholdTimeWhen). =#
+    local _ewArm = _elsewhenInner(wEq.elsewhenPart)
+    local _ewThrDAE = _ewArm === nothing ? nothing :
+      _discreteTimeEventThreshold(SimulationCode.toDAEExp(_elsewhenCondition(_ewArm)), simCode)
+    local _ewRefSym = Symbol("ewLastThr$(callbacks)")
+    local _ewDecl = _ewThrDAE === nothing ? :() : :(local $(_ewRefSym) = Ref(NaN))
+    local _ewSchedule = if _ewThrDAE === nothing
+      :()
+    else
+      quote
+        $(_whenLookupBindings(listArray(Util.getAllCrefs(_ewThrDAE)), simCode)...)
+        local _ewThr = Float64($(expToJuliaExpMTK(_ewThrDAE, simCode)))
+        if _ewThr > integrator.t
+          add_tstop!(integrator, _ewThr)
+        else
+          $(_ewRefSym)[] = _ewThr
+        end
+      end
+    end
     local condCrefs = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
     #= Crefs that appear inside `change(...)` or `pre(...)` are OBSERVED, not
        latched boolean triggers — they must not be reset after the callback
@@ -891,7 +1036,22 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       local entry = get(simCode.stringToSimVarHT, cStr, nothing)
       if entry !== nothing && !SimulationCode.isParameter(entry[2])
         local sym = Symbol(cStr)
-        :(x[lookuptableStates[$(QuoteNode(sym))]] = false)
+        #= AUDIT (ombackend-bug-audit-2026-06-05 #5): guard the index exactly as
+           changeInitExprs/changeUpdateExprs do. An unguarded
+           `lookuptableStates[sym]` KeyErrors when the trigger is not a state
+           unknown, and a Boolean DEFINED by a relation is observed/algebraic
+           (not in the state vector): force-clearing it would corrupt a value the
+           integrator re-derives. Only a genuine discrete STATE Boolean is
+           de-bounced here. NOTE: for a discrete-state Boolean that is also read
+           elsewhere and meant to persist true, edge de-bounce via state mutation
+           is still a shortcut; a private per-callback latch is the proper fix. =#
+        quote
+          let _idx = get(lookuptableStates, $(QuoteNode(sym)), nothing)
+            if _idx !== nothing
+              x[_idx] = false
+            end
+          end
+        end
       else
         :()
       end
@@ -939,6 +1099,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
     quote
+      $(_ewDecl)
       let _condCache = Ref{Any}(nothing),
           _affCache = Ref{Any}(nothing),
           _changeCache = Ref{Any}(nothing),
@@ -1005,6 +1166,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           end
           $(_whenLookupBindings(vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...), simCode)...)
           $(whenStatementsMTKDiscrete...)
+          $(_ewSchedule)
           auto_dt_reset!(integrator)
           add_tstop!(integrator, integrator.t + 1E-12)
           local _changePreValues = _changeCache[] === nothing ? Dict{Symbol, Any}() : _changeCache[]
@@ -1017,7 +1179,9 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       $(Symbol("cb$(callbacks)")) = DiscreteCallback($(Symbol("condition$(callbacks)")),
                                                      $(Symbol("affect$(callbacks)!"));
                                                      save_positions=(true, true))
-      $(if wEq.elsewhenPart !== nothing
+      $(if _ewThrDAE !== nothing
+          _emitElsewhenThresholdTimeWhen(_ewArm, simCode, _ewRefSym, _ewThrDAE)
+        elseif wEq.elsewhenPart !== nothing
           eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4)
         end)
     end

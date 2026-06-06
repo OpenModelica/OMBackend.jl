@@ -137,6 +137,11 @@ const MODELICA_UTILITIES_TO_RUNTIME_C = Dict{String, Symbol}(
   "Modelica_Utilities_Strings_scanReal"        => :ModelicaStrings_scanReal,
   "Modelica_Utilities_Strings_scanString"      => :ModelicaStrings_scanString,
   "Modelica_Utilities_Strings_hashString"      => :ModelicaStrings_hashString,
+  #= Modelica.Math.Random.Utilities impure RNG: MSL algorithm bodies the codegen
+     does not translate; provided by OMRuntimeExternalC under the flattened name. =#
+  "Modelica_Math_Random_Utilities_initializeImpureRandom" => :Modelica_Math_Random_Utilities_initializeImpureRandom,
+  "Modelica_Math_Random_Utilities_impureRandom"           => :Modelica_Math_Random_Utilities_impureRandom,
+  "Modelica_Math_Random_Utilities_impureRandomInteger"    => :Modelica_Math_Random_Utilities_impureRandomInteger,
 )
 
 

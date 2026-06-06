@@ -827,6 +827,7 @@ function createBindingEquations(variables::Vector)
   bindingEqs = BDAE.Equation[]
   for v in variables
     @match v begin
+      #= Real continuous declaration binding -> defining equation. =#
       BDAE.VAR(vName, BDAE.STATE() || BDAE.VARIABLE(), _, DAE.T_REAL(__),
                SOME(bindExp), _, _, _, _, _) => begin
                  local lhs = DAE.CREF(vName, v.varType)
@@ -834,23 +835,33 @@ function createBindingEquations(variables::Vector)
                  local eq =  BDAE.EQUATION(lhs, rhs, v.source, BDAE.NO_ATTRIBUTES())
                  push!(bindingEqs, eq)
                end
-      #= Binding equations with discrete type =#
-      BDAE.VAR(vName, BDAE.STATE() || BDAE.VARIABLE(), _, DAE.T_BOOL(__),
+      #= Boolean declaration binding given as an if-expression -> when/elsewhen
+         equation (the value updates at the branch condition's events). =#
+      BDAE.VAR(vName, BDAE.STATE() || BDAE.VARIABLE() || BDAE.DISCRETE(), _, DAE.T_BOOL(__),
+               SOME(bindExp), _, _, _, _, _) where (bindExp isa DAE.IFEXP) => begin
+                 local lhs = DAE.CREF(vName, v.varType)
+                 @match DAE.IFEXP(cond, thenExp, elseExp) = bindExp
+                 local elsePart = BDAE.WHEN_STMTS(BDAEUtil.invertCondition(cond) #= The else when here has the inverted condition of the first part. =#
+                                                  ,list(BDAE.ASSIGN(lhs, elseExp, v.source))
+                                                  ,nothing)
+                 local elseWeqPart = BDAE.WHEN_EQUATION(1, elsePart, v.source, nothing)
+                 local stmts = BDAE.WHEN_STMTS(cond
+                                               ,list(BDAE.ASSIGN(lhs, thenExp, v.source))
+                                               ,SOME(elseWeqPart))
+                 local weq = BDAE.WHEN_EQUATION(1, stmts, v.source, nothing)
+                 push!(bindingEqs, weq)
+               end
+      #= Boolean (non-ifexp), Integer or enumeration declaration binding ->
+         plain defining equation. The downstream discrete classification and
+         when-synthesis passes lift `disc = expr` into a when-equation when the
+         RHS is discrete-time. Without this, such a binding was silently dropped
+         (hitting the catch-all below), leaving the variable under-determined. =#
+      BDAE.VAR(vName, BDAE.STATE() || BDAE.VARIABLE() || BDAE.DISCRETE(), _,
+               DAE.T_BOOL(__) || DAE.T_INTEGER(__) || DAE.T_ENUMERATION(__),
                SOME(bindExp), _, _, _, _, _) => begin
-                 #= Treat discrete binding equations as when equations =#
-                 if bindExp isa DAE.IFEXP
-                   local lhs = DAE.CREF(vName, v.varType)
-                   @match DAE.IFEXP(cond, thenExp, elseExp) = bindExp
-                   local elsePart = BDAE.WHEN_STMTS(BDAEUtil.invertCondition(cond) #= The else when here has the inverted condition of the first part. =#
-                                                    ,list(BDAE.ASSIGN(lhs, elseExp, v.source))
-                                                    ,nothing)
-                   local elseWeqPart = BDAE.WHEN_EQUATION(1, elsePart, v.source, nothing)
-                   local stmts = BDAE.WHEN_STMTS(cond
-                                                 ,list(BDAE.ASSIGN(lhs, thenExp, v.source))
-                                                 ,SOME(elseWeqPart))
-                   local weq = BDAE.WHEN_EQUATION(1, stmts, v.source, nothing)
-                   push!(bindingEqs, weq)
-                 end
+                 local lhs = DAE.CREF(vName, v.varType)
+                 local eq =  BDAE.EQUATION(lhs, bindExp, v.source, BDAE.NO_ATTRIBUTES())
+                 push!(bindingEqs, eq)
                end
       _ => begin
         continue
@@ -2369,12 +2380,28 @@ function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equ
                                                       paramOrConstNames::OrderedSet{String} = OrderedSet{String}(),
                                                       startLookup::Dict{String, DAE.Exp} = Dict{String, DAE.Exp}())
   local out = BDAE.Equation[]
-  local candByName = Dict{String, Any}()
-  local candNames = String[]
+  local cands = Any[]
   for eq in equations
     local c = _discreteBoolCandidate(eq, paramOrConstNames)
     if c === nothing
       push!(out, eq)
+    else
+      push!(cands, c)
+    end
+  end
+  isempty(cands) && return (equations, OrderedSet{String}())
+  #= An LHS with more than one defining equation is a connect/alias chain, not
+     a discrete definition; lifting it through a name-keyed map would silently
+     drop all but one of its equations. Keep such equations unchanged. =#
+  local lhsCount = Dict{String, Int}()
+  for c in cands
+    lhsCount[c.name] = get(lhsCount, c.name, 0) + 1
+  end
+  local candByName = Dict{String, Any}()
+  local candNames = String[]
+  for c in cands
+    if lhsCount[c.name] > 1
+      push!(out, c.eq)
     else
       candByName[c.name] = c
       push!(candNames, c.name)

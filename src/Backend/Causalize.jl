@@ -34,7 +34,7 @@ module Causalize
 using Setfield
 using ExportAll
 using MetaModelica
-using DataStructures: OrderedSet
+using DataStructures: OrderedSet, OrderedDict
 
 import Absyn
 import ..BDAE
@@ -211,7 +211,13 @@ function detectIfEquationsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
     local eqs::Array
     #= Tick is used to keep track of generated if-equations =#
     local tick::Ref{Int} = 0
-    local tmpVarToElement = Dict{BDAE.VAR, BDAE.IF_EQUATION}()
+    #= AUDIT (ombackend-bug-audit-2026-06-05 #7): BDAE.VAR is a mutable struct
+       hashed by objectid, so a plain Dict iterates the lifted ifEq_tmp vars/eqs
+       in a run-dependent order; that order perturbs variable/equation numbering
+       -> matching -> tearing-variable selection, a real determinism defect.
+       OrderedDict makes the append order deterministic (equation-traversal
+       order). =#
+    local tmpVarToElement = OrderedDict{BDAE.VAR, BDAE.IF_EQUATION}()
     #= Canonical (cond|then|else) string -> existing CREF for structural
        dedup. Identical lifted (cond, then, else) shapes share a single
        ifEq_tmp var so MTK does not get two SymbolicContinuousCallbacks
@@ -283,11 +289,11 @@ end
   We create the mapping:
   tmpVar -> equation it is assigned in
 """
-Base.@nospecializeinfer function replaceIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{Dict, Ref{Int}, Dict})
+Base.@nospecializeinfer function replaceIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{AbstractDict{BDAE.VAR, BDAE.IF_EQUATION}, Ref{Int}, Dict{String, DAE.Exp}})
   (newExp, cont, tmpVarToElementAndTick) = begin
-    local tmpVarToElement::Dict = tmpVarToElementAndTick[1]
+    local tmpVarToElement::AbstractDict{BDAE.VAR, BDAE.IF_EQUATION} = tmpVarToElementAndTick[1]
     local tick::Ref{Int} = tmpVarToElementAndTick[2]
-    local dedup::Dict = tmpVarToElementAndTick[3]
+    local dedup::Dict{String, DAE.Exp} = tmpVarToElementAndTick[3]
     @match exp begin
       #= Per Modelica spec, `noEvent(expr)` takes relations literally and
          triggers no events. An IFEXP inside it must stay inline (codegen emits
@@ -354,7 +360,7 @@ end
   Recursion descends into the branches either way so deeper nested
   time-dependent IFEXPs still reach the lifter.
 """
-Base.@nospecializeinfer function _replaceTimeDepIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{Dict, Ref{Int}, Dict})
+Base.@nospecializeinfer function _replaceTimeDepIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{AbstractDict{BDAE.VAR, BDAE.IF_EQUATION}, Ref{Int}, Dict{String, DAE.Exp}})
   (newExp, cont, tmpVarToElementAndTick) = begin
     @match exp begin
       #= See replaceIfExpressionWithTmpVar: never lift inside noEvent. =#
