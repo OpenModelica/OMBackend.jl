@@ -56,10 +56,25 @@ function _flattenQualifiedName(@nospecialize(cref))::String
   return OMBackend.canonicalName(cref)
 end
 
+#= Enum-literal subscripts cannot be carried in the Int subscript vector;
+   they are folded into the symbol using the same spelling the flat variable
+   names use (e.g. `name[Logic.'U'(1)]`), so cref-to-name resolution at
+   codegen time matches the variable-table keys. =#
+function _hasEnumLiteralSubscript(@nospecialize(subs))::Bool
+  for s in subs
+    if s isa DAE.INDEX && s.exp isa DAE.ENUM_LITERAL
+      return true
+    end
+  end
+  return false
+end
+
 function SimCref(@nospecialize(cref::DAE.ComponentRef))::SimCref
   @match cref begin
     DAE.CREF_IDENT(ident = id, subscriptLst = subs) =>
-      SimCref(Symbol(id), _extractIntSubscripts(subs))
+      _hasEnumLiteralSubscript(subs) ?
+        SimCref(Symbol(string(cref)), Int[]) :
+        SimCref(Symbol(id), _extractIntSubscripts(subs))
     DAE.CREF_ITER(ident = id, subscriptLst = subs) =>
       SimCref(Symbol(id), _extractIntSubscripts(subs))
     DAE.CREF_QUAL(__) =>

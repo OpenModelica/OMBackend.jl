@@ -1419,6 +1419,37 @@ Base.@nospecializeinfer function _arrayDimsFromType(@nospecialize(ty))::Vector{I
   return Int[]
 end
 
+Base.@nospecializeinfer function _rawArrayDims(@nospecialize(ty))::Vector{Any}
+  if ty isa DAE.T_ARRAY
+    return Any[d for d in ty.dims]
+  end
+  return Any[]
+end
+
+Base.@nospecializeinfer function _suffixEnumPath(@nospecialize(p), name::String)
+  @match p begin
+    Absyn.IDENT(n) => Absyn.QUALIFIED(n, Absyn.IDENT(name))
+    Absyn.QUALIFIED(n, rest) => Absyn.QUALIFIED(n, _suffixEnumPath(rest, name))
+    Absyn.FULLYQUALIFIED(rest) => Absyn.FULLYQUALIFIED(_suffixEnumPath(rest, name))
+  end
+end
+
+#= Subscript expression for the k-th element along a dimension. Enumeration
+   dimensions must use the enum literal, not the plain integer: the scalarized
+   declaration names carry enum-literal subscripts, and a numerically spelled
+   element name strands the lookup at codegen time. =#
+Base.@nospecializeinfer function _dimIndexExp(@nospecialize(dim), k::Int)
+  @match dim begin
+    DAE.DIM_ENUM(__) => begin
+      local lits = collect(dim.literals)
+      (1 <= k <= length(lits)) ?
+        DAE.ENUM_LITERAL(_suffixEnumPath(dim.enumTypeName, lits[k]), k) :
+        DAE.ICONST(k)
+    end
+    _ => DAE.ICONST(k)
+  end
+end
+
 Base.@nospecializeinfer function _arrayElementType(@nospecialize(ty))
   local out = ty
   while out isa DAE.T_ARRAY
@@ -1535,6 +1566,7 @@ Base.@nospecializeinfer function _scalarLhsTargets(@nospecialize(lhs::DAE.CREF),
   local baseTy = _innermostType(cr)
   local dims = _arrayDimsFromType(baseTy)
   isempty(dims) && return Any[(lhs, nothing, Int[])]
+  local rawDims = _rawArrayDims(baseTy)
 
   local subs = _innermostSubscripts(cr)
   if isempty(subs)
@@ -1555,17 +1587,17 @@ Base.@nospecializeinfer function _scalarLhsTargets(@nospecialize(lhs::DAE.CREF),
     local sub = subs[pos]
     if sub isa DAE.WHOLEDIM
       for k in 1:dims[pos]
-        rec(pos + 1, Any[newSubs...; DAE.INDEX(DAE.ICONST(k))],
+        rec(pos + 1, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))],
             guard, Int[rhsIdxs...; k])
       end
     elseif sub isa DAE.INDEX
       local idx = sub.exp
-      if idx isa DAE.ICONST
+      if idx isa DAE.ICONST || idx isa DAE.ENUM_LITERAL
         rec(pos + 1, Any[newSubs...; DAE.INDEX(idx)], guard, rhsIdxs)
       else
         for k in 1:dims[pos]
           local g = _andCondition(guard, _indexEqualsCondition(idx, k))
-          rec(pos + 1, Any[newSubs...; DAE.INDEX(DAE.ICONST(k))], g, rhsIdxs)
+          rec(pos + 1, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g, rhsIdxs)
         end
       end
     else
@@ -1585,6 +1617,7 @@ Base.@nospecializeinfer function _scalarizeCrefRead(@nospecialize(cr),
   if isempty(dims)
     return DAE.CREF(cr, expTy)
   end
+  local rawDims = _rawArrayDims(baseTy)
   local subs = _innermostSubscripts(cr)
   if isempty(subs)
     subs = Any[DAE.WHOLEDIM() for _ in dims]
@@ -1605,15 +1638,15 @@ Base.@nospecializeinfer function _scalarizeCrefRead(@nospecialize(cr),
     if sub isa DAE.WHOLEDIM
       rhsPos <= length(rhsIdxs) || return
       local k = rhsIdxs[rhsPos]
-      rec(pos + 1, rhsPos + 1, Any[newSubs...; DAE.INDEX(DAE.ICONST(k))], guard)
+      rec(pos + 1, rhsPos + 1, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))], guard)
     elseif sub isa DAE.INDEX
       local idx = sub.exp
-      if idx isa DAE.ICONST
+      if idx isa DAE.ICONST || idx isa DAE.ENUM_LITERAL
         rec(pos + 1, rhsPos, Any[newSubs...; DAE.INDEX(idx)], guard)
       else
         for k in 1:dims[pos]
           local g = _andCondition(guard, _indexEqualsCondition(idx, k))
-          rec(pos + 1, rhsPos, Any[newSubs...; DAE.INDEX(DAE.ICONST(k))], g)
+          rec(pos + 1, rhsPos, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g)
         end
       end
     else
