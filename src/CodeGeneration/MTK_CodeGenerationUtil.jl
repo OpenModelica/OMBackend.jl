@@ -1848,7 +1848,29 @@ function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode)
   return valMap
 end
 
-function evalInitialCondition(mtkCond, simCode = nothing)
+#= True if the condition is TRUE at its zero-crossing boundary (zc == 0).
+   The normalized crossing function cannot distinguish >= from > there; the
+   original relational operator decides. Conservative: false for anything
+   but a (possibly negated / noEvent-wrapped) plain relation. =#
+function condClosedAtBoundary(cond)::Bool
+  if cond isa SimulationCode.Exp
+    cond = SimulationCode.toDAEExp(cond)
+  end
+  @match cond begin
+    DAE.RELATION(_, DAE.LESSEQ(__), _) => true
+    DAE.RELATION(_, DAE.GREATEREQ(__), _) => true
+    DAE.RELATION(_, DAE.EQUAL(__), _) => true
+    DAE.LUNARY(DAE.NOT(__), DAE.RELATION(_, DAE.LESS(__), _)) => true
+    DAE.LUNARY(DAE.NOT(__), DAE.RELATION(_, DAE.GREATER(__), _)) => true
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local args = collect(lst)
+      length(args) == 1 ? condClosedAtBoundary(args[1]) : false
+    end
+    _ => false
+  end
+end
+
+function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool = false)
   #= Skip during precompile output: `eval(...)` below would mutate this
      closed module's bindings and Julia rejects that. The runtime path is
      unaffected. Fallback `true` matches the existing catch arm. =#
@@ -1870,7 +1892,7 @@ function evalInitialCondition(mtkCond, simCode = nothing)
       local v = Base.invokelatest(substitute, lhs, Dict(tSym => 0.0))
       local numV = try Float64(v) catch; nothing end
       if numV !== nothing
-        return numV >= 0.0
+        return closedBoundary ? numV > 0.0 : numV >= 0.0
       end
       return (v == 0) != false
     end
@@ -1935,8 +1957,9 @@ function evalInitialCondition(mtkCond, simCode = nothing)
     end
     #= The zero-crossing function is negative when the condition is TRUE,
        positive when FALSE. Return true when condition is FALSE (positive),
-       because the caller inverts: ifCond = !(evalInitialCondition(...)). =#
-    return numResult >= 0.0
+       because the caller inverts: ifCond = !(evalInitialCondition(...)).
+       At zc == 0 the original operator decides (closedBoundary). =#
+    return closedBoundary ? numResult > 0.0 : numResult >= 0.0
   catch e
     @warn "evalInitialCondition: failed to evaluate, defaulting to true" exception=(e, catch_backtrace())
     return true

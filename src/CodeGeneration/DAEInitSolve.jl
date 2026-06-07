@@ -99,9 +99,34 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
       return false
     end
     local delta = LinearAlgebra.pinv(J) * res
-    local alpha = min(1.0, 10.0 / max(1.0, LinearAlgebra.norm(delta)))
-    for (jcol, jstate) in enumerate(var_idx)
-      u0[jstate] -= alpha * delta[jcol]
+    #= Backtracking line search: a fixed step-length clamp starves quasi-linear
+       systems whose solution components are large (e.g. di/dt = V/L). Take the
+       full Newton step when it reduces the residual; halve only when it does not. =#
+    local alpha = 1.0
+    local accepted = false
+    local u_trial = similar(u0)
+    local du_trial = similar(u0)
+    while alpha >= 1.0 / 1024
+      copyto!(u_trial, u0)
+      for (jcol, jstate) in enumerate(var_idx)
+        u_trial[jstate] -= alpha * delta[jcol]
+      end
+      rhsFunc(du_trial, u_trial, p_vec, 0.0)
+      local trial_norm = maximum(abs, du_trial[eq_idx] .- targets)
+      if isfinite(trial_norm) && trial_norm < norm_res
+        copyto!(u0, u_trial)
+        accepted = true
+        break
+      end
+      alpha /= 2
+    end
+    if !accepted
+      #= Non-monotone fallback: piecewise residuals (ifelse branches) stall a
+         monotone search at kink-local minima; a bounded blind step can cross. =#
+      local alphaFB = min(1.0, 10.0 / max(1.0, LinearAlgebra.norm(delta)))
+      for (jcol, jstate) in enumerate(var_idx)
+        u0[jstate] -= alphaFB * delta[jcol]
+      end
     end
   end
   return false

@@ -2005,8 +2005,10 @@ function createIfEquation(stateVariables::Vector,
       end
       SimulationCode.BRANCH(condition, residuals, _, targets, _, _, _, _, _) => begin
         local mtkCond = transformToMTKContinousConditionEquation(branch.condition, simCode)
-        #= Evaluate the initial value condition. =#
-        local ivCond = evalInitialCondition(mtkCond, simCode)
+        #= Evaluate the initial value condition; the original operator decides
+           the zc == 0 boundary. =#
+        local _closedB = MTK_CodeGenerationUtil.condClosedAtBoundary(branch.condition)
+        local ivCond = evalInitialCondition(mtkCond, simCode; closedBoundary = _closedB)
         local numVal = ivCond ? 1.0 : 0.0
         local invVal = ivCond ? 0.0 : 1.0
         #= Build ImperativeAffect: function returns a NamedTuple of new values.
@@ -2053,7 +2055,8 @@ function createIfEquation(stateVariables::Vector,
           if _zcReferencesSolvableAlgebraic(zcLhs, simCode)
             local initObservedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, :zc, zcLhs)))
             local initModifiedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, thisSym)))
-            local initRetNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :((observed.zc < 0) ? 1.0 : 0.0))))
+            local _zcTest = _closedB ? :(observed.zc <= 0) : :(observed.zc < 0)
+            local initRetNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :($(_zcTest) ? 1.0 : 0.0))))
             local initFExpr::Expr = :((modified, observed, ctx, integrator) -> $initRetNT)
             local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT); observed = $(initObservedNT)))
             cond = :(ModelingToolkit.SymbolicContinuousCallback(
