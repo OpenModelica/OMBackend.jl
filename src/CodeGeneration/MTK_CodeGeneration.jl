@@ -726,7 +726,10 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
         catch
           OrderedSet{String}()
         end
-        local _hardFiltered = filter(p -> string(first(p)) in _unkNames, _hardStarts)
+        #= Float-convert: Int-valued entries make remake_buffer promote a
+           Float64 parameter buffer to Int64, failing on fractional entries. =#
+        local _hardFiltered = Dict(first(p) => Float64(last(p))
+                                   for p in _hardStarts if string(first(p)) in _unkNames)
         if !isempty(_hardFiltered)
           try
             global LATEST_PROBLEM = ModelingToolkit.SciMLBase.remake(
@@ -809,10 +812,14 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       #= Stash the exact runtime solve inputs so a manual integrator loop can
          reproduce the real event wiring (debug aid for friction/event work). =#
       global LATEST_SOLVE_TRIPLE = (_problemForSolver, _solver, callbacks)
+      #= Table-cluster models: Broyden event re-init diverges on piecewise
+         constant residuals; default to Newton-FD unless the caller chose. =#
+      local _initKw = $(_modelHasTableClusters(simCode)) && !haskey(kwargs, :initializealg) ?
+        (; initializealg = OMBackend.CodeGeneration.tableClusterInitAlg()) : (;)
       local _sol = if haskey(kwargs, :callback)
-        solve(_problemForSolver, _solver; kwargs...)
+        solve(_problemForSolver, _solver; kwargs..., _initKw...)
       else
-        solve(_problemForSolver, _solver; callback=callbacks, kwargs...)
+        solve(_problemForSolver, _solver; callback=callbacks, kwargs..., _initKw...)
       end
       #= If the init-alg-remake'd problem produced InitialFailure (MTK could
          not reconcile init-alg hard-start u0 with the algebraic constraints),
@@ -831,9 +838,9 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
           _origProblem
         end
         _sol = if haskey(kwargs, :callback)
-          solve(_fallbackProb, _solver; kwargs...)
+          solve(_fallbackProb, _solver; kwargs..., _initKw...)
         else
-          solve(_fallbackProb, _solver; callback=callbacks, kwargs...)
+          solve(_fallbackProb, _solver; callback=callbacks, kwargs..., _initKw...)
         end
       end
       #= Run `when terminal()` bodies once against the final solution (gated: emitted only if the model has a terminal event). =#
@@ -2149,6 +2156,22 @@ function _extractChangeRelations(@nospecialize(cond), simCode)
   return (ok && !isempty(rels)) ? rels : nothing
 end
 
+#= True when the when condition marks a synthesized (lifter) when: a literal
+   `initial()` term or a `change()`/`edge()` call. Such whens carry the
+   implied §17.4.4 initial() term and run their body at t0; user whens with
+   bare relation conditions must not. =#
+function _condHasInitial(@nospecialize(e))::Bool
+  local d = e isa SimulationCode.Exp ? SimulationCode.toDAEExp(e) : e
+  @match d begin
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => true
+    DAE.CALL(Absyn.IDENT("change"), _, _) => true
+    DAE.CALL(Absyn.IDENT("edge"), _, _) => true
+    DAE.LBINARY(e1, _, e2) => (_condHasInitial(e1) || _condHasInitial(e2))
+    DAE.LUNARY(_, e1) => _condHasInitial(e1)
+    _ => false
+  end
+end
+
 #= True when the when-condition is `edge(...)` (or an OR-chain of `edge`), which
    fires on the RISING transition only (false->true), unlike `change` (both). =#
 function _isEdgeWhenCondition(@nospecialize(e))::Bool
@@ -2273,6 +2296,118 @@ end
    (the latch that `ModelingToolkit.Pre`, a frozen pre-event snapshot, cannot give). =#
 _preMemEnabled()::Bool = lowercase(get(ENV, "OMBACKEND_DISCRETE_PRE_MEMORY", "false")) in ("true", "1", "yes")
 
+#= True if the expression contains a constant-table subscript (DAE.ASUB).
+   Such clusters are Newton-hostile: equation-form affects compile to an
+   implicit solve whose residuals are piecewise constant. =#
+Base.@nospecializeinfer function _expHasTableLookup(@nospecialize(exp))::Bool
+  @match exp begin
+    DAE.ASUB(__) => true
+    DAE.BINARY(e1, _, e2) => _expHasTableLookup(e1) || _expHasTableLookup(e2)
+    DAE.LBINARY(e1, _, e2) => _expHasTableLookup(e1) || _expHasTableLookup(e2)
+    DAE.RELATION(e1, _, e2) => _expHasTableLookup(e1) || _expHasTableLookup(e2)
+    DAE.UNARY(_, e) => _expHasTableLookup(e)
+    DAE.LUNARY(_, e) => _expHasTableLookup(e)
+    DAE.CAST(_, e) => _expHasTableLookup(e)
+    DAE.IFEXP(c, t, f) =>
+      _expHasTableLookup(c) || _expHasTableLookup(t) || _expHasTableLookup(f)
+    DAE.CALL(_, args, _) => begin
+      local found = false
+      for a in args
+        found = found || _expHasTableLookup(a)
+      end
+      found
+    end
+    _ => false
+  end
+end
+
+#= True if the model has lifted discrete-Boolean when clusters AND its
+   residuals read constant tables. The affect system MTK builds for an
+   equation-form affect pulls in the surrounding algebraic equations, so the
+   model-level residual content decides Newton-hostility, not the cluster
+   bodies. Selects the imperative affect lowering and the Newton-FD event
+   re-initialization. =#
+function _modelHasTableClusters(simCode)::Bool
+  local hasCluster = false
+  for weq in simCode.whenEquations
+    if _extractChangeRelations(weq.whenEquation.condition, simCode) !== nothing
+      hasCluster = true
+      break
+    end
+  end
+  hasCluster || return false
+  for eq in simCode.residualEquations
+    if _expHasTableLookup(SimulationCode.toDAEExp(eq.exp))
+      return true
+    end
+  end
+  return false
+end
+
+#= True if the expression reads pre() of any name in `names`. =#
+Base.@nospecializeinfer function _expHasPreOf(@nospecialize(exp), names::Set{String})::Bool
+  @match exp begin
+    DAE.CALL(Absyn.IDENT("pre"), args, _) => string(listHead(args).componentRef) in names
+    DAE.BINARY(e1, _, e2) => _expHasPreOf(e1, names) || _expHasPreOf(e2, names)
+    DAE.LBINARY(e1, _, e2) => _expHasPreOf(e1, names) || _expHasPreOf(e2, names)
+    DAE.RELATION(e1, _, e2) => _expHasPreOf(e1, names) || _expHasPreOf(e2, names)
+    DAE.UNARY(_, e) => _expHasPreOf(e, names)
+    DAE.LUNARY(_, e) => _expHasPreOf(e, names)
+    DAE.CAST(_, e) => _expHasPreOf(e, names)
+    DAE.IFEXP(c, t, f) =>
+      _expHasPreOf(c, names) || _expHasPreOf(t, names) || _expHasPreOf(f, names)
+    DAE.CALL(_, args, _) => begin
+      local found = false
+      for a in args
+        found = found || _expHasPreOf(a, names)
+      end
+      found
+    end
+    _ => false
+  end
+end
+
+#= True if any lifted cluster assigns an Integer/enum discrete (a mode
+   variable) whose rhs reads pre() of a discrete assigned in the same
+   cluster. Such bodies are sequential FSM transitions; the equation-form
+   affect solves them simultaneously, which mis-latches. Scoped to the
+   mode-carrying shape; Boolean-only self-pre clusters (freewheel logic)
+   stay on the equation path, which handles them correctly. =#
+function _modelHasModeFSMClusters(simCode)::Bool
+  for weq in simCode.whenEquations
+    _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
+    local assigned = Set{String}()
+    local intRhss = Any[]
+    for st in collect(weq.whenEquation.whenStmtLst)
+      (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+      local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
+      push!(assigned, leftStr)
+      haskey(simCode.stringToSimVarHT, leftStr) || continue
+      local (_, var) = simCode.stringToSimVarHT[leftStr]
+      local isInt = @match var.attributes begin
+        SOME(DAE.VAR_ATTR_INT(__)) => true
+        SOME(DAE.VAR_ATTR_ENUMERATION(__)) => true
+        _ => false
+      end
+      isInt && push!(intRhss, SimulationCode.toDAEExp(st.right))
+    end
+    isempty(intRhss) && continue
+    for rhs in intRhss
+      _expHasPreOf(rhs, assigned) && return true
+    end
+  end
+  return false
+end
+
+#= Newton with an FD Jacobian degenerates to the Gauss-Jacobi sweep that
+   piecewise-constant algebraic rows need; Broyden's secant update diverges
+   on them. Used as the event re-init default for table-cluster models. =#
+function tableClusterInitAlg()
+  local NL = OMBackend.OrdinaryDiffEq.OrdinaryDiffEqNonlinearSolve
+  return OMBackend.OrdinaryDiffEq.BrownFullBasicInit(1e-8,
+    NL.NewtonRaphson(; autodiff = NL.ADTypes.AutoFiniteDiff()))
+end
+
 #= True if `name` is a Boolean-typed discrete (so pre(name) read from the Float
    memory must become a Bool before use in an and/or/not context). =#
 Base.@nospecializeinfer function _isBoolDiscreteName(name::String, simCode)::Bool
@@ -2284,14 +2419,38 @@ Base.@nospecializeinfer function _isBoolDiscreteName(name::String, simCode)::Boo
   end
 end
 
+#= Lower a DAE exp at a boolean position of an ImperativeAffect body. Live
+   reads come back as 0/1 Floats; `> 0.5` coerces both Bool and Float.
+   `initVal` is the value `initial()` lowers to (true in an initialize affect). =#
+Base.@nospecializeinfer function _daeBoolMem(@nospecialize(exp::DAE.Exp), obsAcc::Dict{Symbol,Symbol}, simCode;
+                                             initVal::Bool = false)
+  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal)
+  @match exp begin
+    DAE.BCONST(b) => b
+    DAE.LUNARY(DAE.NOT(__), e) => :(!$(recb(e)))
+    DAE.LBINARY(e1, DAE.AND(__), e2) => :($(recb(e1)) && $(recb(e2)))
+    DAE.LBINARY(e1, DAE.OR(__), e2) => :($(recb(e1)) || $(recb(e2)))
+    DAE.RELATION(__) => _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal)
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => initVal
+    DAE.IFEXP(c, t, f) => :($(recb(c)) ? $(recb(t)) : $(recb(f)))
+    _ => begin
+      local v = _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal)
+      v isa Bool ? v : :($(v) > 0.5)
+    end
+  end
+end
+
 #= Lower a DAE exp to a Julia Expr for an ImperativeAffect body:
      pre(x)                -> DISCRETE_PRE_MEM[:x]   (committed memory)
      continuous/param cref -> observed.<name>        (collected into obsAcc)
      relation/ifelse/and/or/not/arith -> Julia control flow
-   `initial()` is false at runtime. The triggering relation is pre-substituted by
-   the caller, so it arrives as a BCONST. =#
-Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), obsAcc::Dict{Symbol,Symbol}, simCode)
-  rec(@nospecialize e) = _daeExpToJuliaMem(e, obsAcc, simCode)
+   `initVal` is the value `initial()` lowers to (true in an initialize affect).
+   The triggering relation is pre-substituted by the caller, so it arrives as a
+   BCONST. =#
+Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), obsAcc::Dict{Symbol,Symbol}, simCode;
+                                                   initVal::Bool = false)
+  rec(@nospecialize e) = _daeExpToJuliaMem(e, obsAcc, simCode; initVal = initVal)
+  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal)
   @match exp begin
     DAE.ICONST(i) => Float64(i)
     DAE.RCONST(r) => r
@@ -2302,24 +2461,40 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
       local rd = :(DISCRETE_PRE_MEM[$(QuoteNode(Symbol(nm)))])
       _isBoolDiscreteName(nm, simCode) ? :($(rd) > 0.5) : rd
     end
-    DAE.CALL(Absyn.IDENT("initial"), _, _) => false
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => initVal
     DAE.RELATION(e1, op, e2) => :($(DAE_OP_toJuliaOperator(op))($(rec(e1)), $(rec(e2))))
-    DAE.LUNARY(DAE.NOT(__), e) => :(!$(rec(e)))
-    DAE.LBINARY(e1, DAE.AND(__), e2) => :($(rec(e1)) && $(rec(e2)))
-    DAE.LBINARY(e1, DAE.OR(__), e2) => :($(rec(e1)) || $(rec(e2)))
-    DAE.IFEXP(c, t, f) => :($(rec(c)) ? $(rec(t)) : $(rec(f)))
+    DAE.LUNARY(DAE.NOT(__), e) => :(!$(recb(e)))
+    DAE.LBINARY(e1, DAE.AND(__), e2) => :($(recb(e1)) && $(recb(e2)))
+    DAE.LBINARY(e1, DAE.OR(__), e2) => :($(recb(e1)) || $(recb(e2)))
+    DAE.IFEXP(c, t, f) => :($(recb(c)) ? $(rec(t)) : $(rec(f)))
     DAE.BINARY(e1, op, e2) => :($(DAE_OP_toJuliaOperator(op))($(rec(e1)), $(rec(e2))))
     DAE.UNARY(op, e) => :($(DAE_OP_toJuliaOperator(op))($(rec(e))))
     DAE.CREF(cr, _) => begin
       local nm = Symbol(string(cr))
-      obsAcc[nm] = nm
-      :(observed.$(nm))
+      if nm === :time
+        #= module-scope `time` is Base.time; the affect reads the integrator clock =#
+        :(integrator.t)
+      else
+        obsAcc[nm] = nm
+        :(observed.$(nm))
+      end
     end
     #= Modelica index helpers used by Digital gate residuals. The lookup rounds
        its index, so floor/integer only need to evaluate the inner value. =#
     DAE.CALL(Absyn.IDENT("floor"), args, _) => :(floor($(rec(listHead(args)))))
     DAE.CALL(Absyn.IDENT("integer"), args, _) =>
       :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_integer($(rec(listHead(args)))))
+    #= Numeric calls with direct Julia equivalents. =#
+    DAE.CALL(Absyn.IDENT("abs"), args, _) => :(abs($(rec(listHead(args)))))
+    DAE.CALL(Absyn.IDENT("sign"), args, _) => :(sign($(rec(listHead(args)))))
+    DAE.CALL(Absyn.IDENT("sqrt"), args, _) => :(sqrt($(rec(listHead(args)))))
+    DAE.CALL(Absyn.IDENT("min"), args, _) =>
+      :(min($(rec(listHead(args))), $(rec(listHead(listRest(args))))))
+    DAE.CALL(Absyn.IDENT("max"), args, _) =>
+      :(max($(rec(listHead(args))), $(rec(listHead(listRest(args))))))
+    #= Event-control wrappers are semantic no-ops inside an affect body. =#
+    DAE.CALL(Absyn.IDENT("noEvent"), args, _) => rec(listHead(args))
+    DAE.CALL(Absyn.IDENT("smooth"), args, _) => rec(listHead(listRest(args)))
     #= Constant-table lookup `table[idx...]`: the table is a constant literal
        (lower via the standard expression path), the subscripts are gate inputs
        lowered through `rec` so they read observed / DISCRETE_PRE_MEM. Routes
@@ -2338,15 +2513,17 @@ end
    integrator (observed) and pre() from DISCRETE_PRE_MEM, then committing each new
    value back. No relation is pinned: with the memory latch, live evaluation at the
    consistent post-step state avoids the spurious Stuck a pinned relation forces. =#
-Base.@nospecializeinfer function _preMemAffectParts(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode)
+Base.@nospecializeinfer function _preMemAffectParts(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode;
+                                                    atInit::Bool = false)
   local obsAcc = Dict{Symbol,Symbol}()
   local stmts = Expr[]; local writes = Expr[]; local retKws = Expr[]
   local modeSym = nothing; local sfSym = nothing; local sbSym = nothing
   local lkSym = nothing; local freeSym = nothing
   for (d, rhs, isInt) in assigns
-    local jexpr = _daeExpToJuliaMem(rhs, obsAcc, simCode)
     local vsym = Symbol("_v_", d)
-    local valExpr = isInt ? :(Float64($(jexpr))) : :($(jexpr) ? 1.0 : 0.0)
+    local valExpr = isInt ?
+      :(Float64($(_daeExpToJuliaMem(rhs, obsAcc, simCode; initVal = atInit)))) :
+      :($(_daeBoolMem(rhs, obsAcc, simCode; initVal = atInit)) ? 1.0 : 0.0)
     push!(stmts, :(local $(vsym) = $(valExpr)))
     push!(writes, :(DISCRETE_PRE_MEM[$(QuoteNode(d))] = $(vsym)))
     push!(retKws, Expr(:kw, d, vsym))
@@ -2406,7 +2583,9 @@ end
    start value. Emitted only when the pre-memory flag is on and a lifted cluster
    exists; otherwise a no-op so non-friction models are unchanged. =#
 function discretePreMemDecl(simCode)::Expr
-  _preMemEnabled() || return Expr(:block)
+  #= mirror the lowering decision of createDiscreteBoolWhenEvents =#
+  (_preMemEnabled() || _modelHasTableClusters(simCode) || _modelHasModeFSMClusters(simCode)) ||
+    return Expr(:block)
   local pairs = Expr[]
   for weq in simCode.whenEquations
     _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
@@ -2424,7 +2603,8 @@ end
 
 function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
   local events = Expr[]
-  local preMem = _preMemEnabled()
+  local tableMode = _modelHasTableClusters(simCode)
+  local preMem = _preMemEnabled() || tableMode || _modelHasModeFSMClusters(simCode)
   for weq in simCode.whenEquations
     local rels = _extractChangeRelations(weq.whenEquation.condition, simCode)
     rels === nothing && continue
@@ -2460,8 +2640,12 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
        pinned to its post-crossing value (others at their current value) so a
        coupled FSM recomputes consistently and direction-correctly on any member
        crossing, without the `f≈0` ambiguity. =#
-    #= Initialize affect: set every discrete from its full rhs at t0 (the
-       `initial()` term). Attached to the first relation's callback only. =#
+    #= Initialize affect: set every discrete from its full rhs at t0. Only
+       whens whose condition carries an `initial()` term (the synthesized
+       lifter conditions) run their body at t0; user whens with plain
+       relation conditions must not (Trapezoid `T_start = time` at t0 would
+       destroy a negative-startTime phase, friction would mis-latch). =#
+    local hasInit = _condHasInitial(weq.whenEquation.condition)
     local affInit = Expr[_discreteAffectEqInit(d, r, ii, simCode) for (d, r, ii) in assigns]
     for (relIdx, rel) in enumerate(rels)
       local zc = transformToMTKContinousCondition(rel, simCode)
@@ -2474,18 +2658,34 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
            advance to Forward/Backward instead of re-localizing Stuck at v=0
            (LeftRootFind here deadlocks the breakaway). Scoped to the pre-memory
            friction callbacks. =#
-        push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
-          ($(zc) ~ 0),
-          ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs));
-          affect_neg = ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs)),
-          rootfind = SciMLBase.RightRootFind,
-          reinitializealg = SciMLBase.NoInit())))
+        #= Table-cluster models need the t0 body run (logic levels settle from
+           the synthesized condition's implied initial() term); the friction
+           FSM (pre-memory via env, no tables) must keep its init-algorithm
+           state untouched at t0 or the breakaway window mis-latches. =#
+        if relIdx == 1 && hasInit && tableMode
+          local (fnI, obsI, modI) = _preMemAffectParts(assigns, simCode; atInit = true)
+          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+            ($(zc) ~ 0),
+            ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs));
+            affect_neg = ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs)),
+            initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI)),
+            rootfind = SciMLBase.RightRootFind,
+            reinitializealg = SciMLBase.NoInit())))
+        else
+          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+            ($(zc) ~ 0),
+            ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs));
+            affect_neg = ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs)),
+            rootfind = SciMLBase.RightRootFind,
+            reinitializealg = SciMLBase.NoInit())))
+        end
       else
         local affFalse = Expr[_discreteAffectEq(d, r, rel, false, ii, simCode) for (d, r, ii) in assigns]
         local affTrue  = Expr[_discreteAffectEq(d, r, rel, true,  ii, simCode) for (d, r, ii) in assigns]
         #= The `initial()` term: only the first relation's callback carries it,
-           so the discretes are set once at t0 (no double-apply). =#
-        local _withInit = relIdx == 1
+           so the discretes are set once at t0 (no double-apply), and only
+           when the condition actually contains `initial()`. =#
+        local _withInit = relIdx == 1 && hasInit
         if isEdge
           #= rising-only: run the body when the relation becomes TRUE
              (down-crossing of zc = affect_neg); no-op on the falling side. =#
@@ -2917,6 +3117,64 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
 end
 
 """
+    _foldParameterBindStatic(exp, simCode; depth = 0)
+
+Statically fold a parameter bind expression to a Float64. Returns nothing
+when the expression depends on anything that is not a parameter chain
+grounded in literals.
+"""
+function _foldParameterBindStatic(@nospecialize(exp), simCode::SimulationCode.SIM_CODE;
+                                  depth::Int = 0)::Union{Float64, Nothing}
+  depth > 32 && return nothing
+  if exp isa SimulationCode.RCONST || exp isa SimulationCode.ICONST
+    return Float64(exp.value)
+  elseif exp isa SimulationCode.BCONST
+    return exp.value ? 1.0 : 0.0
+  elseif exp isa DAE.RCONST
+    return Float64(exp.real)
+  elseif exp isa DAE.ICONST
+    return Float64(exp.integer)
+  elseif exp isa DAE.BCONST
+    return exp.bool ? 1.0 : 0.0
+  elseif exp isa SimulationCode.ENUM_LITERAL || exp isa DAE.ENUM_LITERAL
+    return Float64(exp.index)
+  elseif exp isa SimulationCode.CAST
+    return _foldParameterBindStatic(exp.exp, simCode; depth = depth + 1)
+  elseif exp isa SimulationCode.UNARY
+    local v = _foldParameterBindStatic(exp.exp, simCode; depth = depth + 1)
+    v === nothing && return nothing
+    local op = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+    return op === :- ? -v : (op === :+ ? v : nothing)
+  elseif exp isa SimulationCode.BINARY
+    local l = _foldParameterBindStatic(exp.exp1, simCode; depth = depth + 1)
+    l === nothing && return nothing
+    local r = _foldParameterBindStatic(exp.exp2, simCode; depth = depth + 1)
+    r === nothing && return nothing
+    local binop = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+    binop === :+ && return l + r
+    binop === :- && return l - r
+    binop === :* && return l * r
+    binop === :/ && return l / r
+    binop === :^ && return l ^ r
+    return nothing
+  elseif exp isa SimulationCode.EXP_CREF
+    exp.cref.sym === :time && return nothing
+    local lookUpStr = isempty(exp.cref.subs) ?
+      string(exp.cref.sym) :
+      string(exp.cref.sym, "[", join(exp.cref.subs, ","), "]")
+    local entry = get(simCode.stringToSimVarHT, lookUpStr, nothing)
+    entry === nothing && return nothing
+    local bind = @match entry[2].varKind begin
+      SimulationCode.PARAMETER(bindExp = SOME(b)) => b
+      _ => nothing
+    end
+    bind === nothing && return nothing
+    return _foldParameterBindStatic(bind, simCode; depth = depth + 1)
+  end
+  return nothing
+end
+
+"""
   Creates a parameter array.
   A parameter array is an array containing the values of the parameters sorted by index.
   The index here is the index assigned by the code generator earlier in the lowering
@@ -2930,8 +3188,12 @@ function createParameterArray(parameters::Vector{T1},
   for param in parameters
     (index, simVar) = hT[param]
     local simVarType::SimulationCode.SimVarType = simVar.varKind
+    local hasBind::Bool = false
     bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
+      SimulationCode.PARAMETER(bindExp = SOME(exp)) => begin
+        hasBind = true
+        exp
+      end
       SimulationCode.PARAMETER(__) => begin
         @match simVar.attributes begin
           SOME(attr) where attr.start isa SOME => begin
@@ -2943,31 +3205,19 @@ function createParameterArray(parameters::Vector{T1},
       end
       _ => throw(ErrorException("createParameterArray: parameter $(param) has no bound expression (got $(simVarType))."))
     end
-    #= Evaluate the parameters. If it is a variable, and can't be evaluated look it up in the parameter dictionary. =#
+    #= Fold statically; a codegen-time module-scope eval can read stale
+       same-named symbols left behind by previously translated models. =#
+    local folded = _foldParameterBindStatic(bindExp, simCode)
     local parValue
-    try
-      #= The boundvalue is known =#
-      val = eval(expToJuliaExpMTK(bindExp, simCode))
-      if val isa Float64
-        parValue = :($(val))
-      else
-        parValue = :($(Symbol(param))) #:(0.0)
-      end
-    catch err #=If the bound value is a more complex expression. =#
-      #= AUDIT (ombackend-bug-audit-2026-06-05 #6): for a cross-parameter /
-         function-call bind that fails module-scope eval, this falls back to 0,
-         so a continuous-when body reading such a parameter via the legacy
-         CallbackSet `aux[1]` mirror sees 0.0 (wrong event-driven result). This
-         affects only the legacy/DE callback path; the modern MTK parameter
-         source (createParameterEquationsMTK) emits the bind expression
-         symbolically and is correct. Proper fix: emit the bind expression (or
-         resolve via integrator.p) instead of 0, or bind `local p = integrator.p`
-         in the continuous-when closures and drop this aux[1] mirror. The 0
-         fallback is no longer silent: it warns so a wrong event-driven value is
-         attributable. Left as-is pending the legacy-path retirement. =#
-      local bindStr = try OMFrontend.Frontend.toString(bindExp) catch; string(bindExp) end
-      @warn "[MTK GEN: createParameterArray] parameter $(param): bind expression could not be evaluated at module scope; substituting 0 in the legacy parameter array. Any event-driven read of this parameter via the aux[1] mirror will be wrong (the modern MTK path is unaffected)." bind = bindStr exception = err
-      parValue = :(0) #pars[Num($(param))]) (More complex parameters are yet to be used in the benchmark..)
+    if folded !== nothing
+      parValue = :($(folded))
+    elseif hasBind
+      #= Non-foldable bind (cross-parameter chain through a call, string,
+         array): read the in-scope parameter assignment at runtime. =#
+      parValue = :($(Symbol(param)))
+    else
+      @warn "[MTK GEN: createParameterArray] parameter $(param): no bind and non-literal start; substituting 0 in the legacy parameter array. Any event-driven read of this parameter via the aux[1] mirror will be wrong (the modern MTK path is unaffected)."
+      parValue = :(0)
     end
     push!(paramArray, parValue)
   end
@@ -3740,17 +3990,14 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
     local sv = ht[name][2]
     if sv.varKind isa SimulationCode.PARAMETER ||
        sv.varKind isa SimulationCode.ARRAY_PARAMETER
-	      local paramLit = @match sv.varKind begin
-	        SimulationCode.PARAMETER(SOME(SimulationCode.RCONST(r))) => Float64(r)
-	        SimulationCode.PARAMETER(SOME(SimulationCode.ICONST(i))) => Float64(i)
-	        SimulationCode.PARAMETER(SOME(SimulationCode.BCONST(b))) => (b ? 1.0 : 0.0)
-	        SimulationCode.PARAMETER(SOME(SimulationCode.ENUM_LITERAL(_, i))) => Float64(i)
-	        _ => begin
-	          @warn "Generated nothing for $(name). $(name) was $(typeof(sv.varKind))"
-	          nothing
-	        end
-	      end
-      paramLit === nothing && continue
+      local paramLit = @match sv.varKind begin
+        SimulationCode.PARAMETER(SOME(b)) => _foldParameterBindStatic(b, simCode)
+        _ => nothing
+      end
+      if paramLit === nothing
+        @warn "Generated nothing for $(name). $(name) was $(typeof(sv.varKind))"
+        continue
+      end
       push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(paramLit)))
       continue
     end

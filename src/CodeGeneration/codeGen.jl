@@ -706,10 +706,11 @@ function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64,
       end
     end
     #= Fire AT the first edge (phase in (0, period], non-negative) then every
-       period. For startTime = 0 this is phase = period, initial fire at period,
-       matching the previous behaviour. =#
+       period. t0 is never an edge: the when fires only when the integer ratio
+       increases, and an initial_affect body run would overwrite the
+       init-algorithm phase (T_start := 0) of negative-startTime sources. =#
     $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), $(period);
-                                                   phase = $(_firstEdge), initial_affect = true)
+                                                   phase = $(_firstEdge), initial_affect = false)
   end
 end
 
