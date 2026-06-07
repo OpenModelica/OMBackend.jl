@@ -2113,8 +2113,15 @@ function createIfEquation(stateVariables::Vector,
     end
   end
   local relayGuesses = Expr[]
-  local _t0ValMap = selBranch === nothing ? nothing :
-    try MTK_CodeGenerationUtil._buildT0ValueMap(simCode) catch; nothing end
+  local _t0ValMap = nothing
+  local _t0Explicit = Set{Symbol}()
+  if selBranch !== nothing
+    try
+      (_t0ValMap, _t0Explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
+    catch
+      _t0ValMap = nothing
+    end
+  end
   for resEqIdx in 1:nResEqsInTarget
     local resEq = resEqs[resEqIdx]
     local lhsExpr = last(deCausalize(resEq, simCode))
@@ -2128,7 +2135,7 @@ function createIfEquation(stateVariables::Vector,
     if _t0ValMap !== nothing && resEqIdx <= length(selBranch.residualEquations)
       local gv = try
         MTK_CodeGenerationUtil.evalCausalRHSAtT0(
-          first(deCausalize(selBranch.residualEquations[resEqIdx], simCode)), _t0ValMap)
+          first(deCausalize(selBranch.residualEquations[resEqIdx], simCode)), _t0ValMap, _t0Explicit)
       catch
         nothing
       end

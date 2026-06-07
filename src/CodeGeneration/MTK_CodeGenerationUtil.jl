@@ -1871,9 +1871,13 @@ function condClosedAtBoundary(cond)::Bool
 end
 
 #= Symbol -> value map at t0: parameter values plus state/algebraic start
-   attributes (default 0.0), overridden by early init-algorithm results. =#
-function _buildT0ValueMap(simCode)::Dict{Symbol, Float64}
+   attributes (default 0.0), overridden by early init-algorithm results.
+   `explicit` collects the symbols whose value came from an actual source
+   (parameter, explicit start attribute, init-algorithm result) rather than
+   the 0.0 default. =#
+function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{Symbol}}
   local valMap = Dict{Symbol, Float64}()
+  local explicit = Set{Symbol}()
   local ht = simCode.stringToSimVarHT
   for (key, (_, sv)) in ht
     local sym = Symbol(key)
@@ -1897,6 +1901,7 @@ function _buildT0ValueMap(simCode)::Dict{Symbol, Float64}
       end
       if pval !== nothing
         valMap[sym] = pval
+        push!(explicit, sym)
       end
     elseif SimulationCode.isStateOrAlgebraic(sv)
       local sval = 0.0
@@ -1904,21 +1909,51 @@ function _buildT0ValueMap(simCode)::Dict{Symbol, Float64}
         @match SOME(attr) = sv.attributes
         @match SOME(startExp) = attr.start
         sval = Float64(evalDAEConstant(startExp, simCode))
+        push!(explicit, sym)
       catch
       end
       valMap[sym] = sval
     end
   end
+  local preSeed = copy(valMap)
   _seedInitialAlgValues!(valMap, simCode)
-  return valMap
+  for (k, v) in valMap
+    if !haskey(preSeed, k) || preSeed[k] != v
+      push!(explicit, k)
+    end
+  end
+  return (valMap, explicit)
+end
+
+_buildT0ValueMap(simCode)::Dict{Symbol, Float64} = first(_buildT0ValueMapAndExplicit(simCode))
+
+#= True when every variable-position Symbol of the expression is explicit.
+   Call heads and qualified references are code, not variables. =#
+function _exprSymbolsExplicit(e, explicit::Set{Symbol})::Bool
+  if e isa Symbol
+    return e in explicit
+  elseif e isa Expr
+    e.head == :. && return true
+    local args = e.head == :call ? e.args[2:end] : e.args
+    for a in args
+      a isa LineNumberNode && continue
+      _exprSymbolsExplicit(a, explicit) || return false
+    end
+    return true
+  end
+  return true
 end
 
 #= Evaluate a causalized branch RHS at the t0 value map. Returns nothing when
-   the expression is not statically evaluable. =#
-function evalCausalRHSAtT0(rhsExpr, valMap::Dict{Symbol, Float64})::Union{Float64, Nothing}
+   the expression is not statically evaluable, or when it references any
+   non-explicit (0.0-defaulted) variable: a seed contaminated by defaults can
+   pull the consistent-IC solve to a wrong root. =#
+function evalCausalRHSAtT0(rhsExpr, valMap::Dict{Symbol, Float64},
+                           explicit::Set{Symbol} = Set{Symbol}())::Union{Float64, Nothing}
   if ccall(:jl_generating_output, Cint, ()) != 0
     return nothing
   end
+  _exprSymbolsExplicit(rhsExpr, explicit) || return nothing
   try
     local numExpr = _substituteExprValues(rhsExpr, valMap)
     local result = eval(numExpr)
