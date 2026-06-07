@@ -387,5 +387,14 @@ end
 
 _substSyms(x, _) = x
 _substSyms(sym::Symbol, alias::Dict{Symbol,Symbol}) = get(alias, sym, sym)
-_substSyms(ex::Expr, alias::Dict{Symbol,Symbol}) =
+function _substSyms(ex::Expr, alias::Dict{Symbol,Symbol})
+    #= Affect bodies read NamedTuple fields through QuoteNodes; rewrite those in
+       step with the kw keys or an aliased read misses its observed entry. =#
+    if ex.head === :. && length(ex.args) == 2 &&
+       (ex.args[1] === :observed || ex.args[1] === :modified) &&
+       ex.args[2] isa QuoteNode && ex.args[2].value isa Symbol
+        local quoted = ex.args[2].value
+        return Expr(:., ex.args[1], QuoteNode(get(alias, quoted, quoted)))
+    end
     Expr(ex.head, Any[_substSyms(a, alias) for a in ex.args]...)
+end

@@ -21,6 +21,9 @@ const DUMP_ENABLED = Ref(false)
 const BUILT           = Dict{String, Tuple}()
 const REDUCED_SYSTEMS = Dict{String, Any}()
 const DUMP_PATHS      = Dict{String, String}()
+#= Pristine parameter snapshot per build: event affects mutate the problem's
+   shared parameter vector in place, so cached re-solves must restore it. =#
+const PRISTINE_P      = Dict{String, Any}()
 #= Debug hook: when OMJL_STASH_MODELCODE is set, stash the generated model Expr
    and skip Core.eval. Lets a caller inspect a model that OOMs at eval/simplify. =#
 const LAST_MODELCODE  = Ref{Any}(nothing)
@@ -82,6 +85,11 @@ function _buildAndCache(modelName::String, modelCode::Expr)
     if res isa Tuple && length(res) >= 5
       REDUCED_SYSTEMS[cname] = res[5]
     end
+    try
+      PRISTINE_P[cname] = deepcopy(res[1].p)
+    catch
+      delete!(PRISTINE_P, cname)
+    end
     @info "[IMTK GEN] structural_simplify ran in backend; build cached" model = modelName
     DUMP_ENABLED[] && _dumpReduced(OMB, modelName, cname)
   catch e
@@ -132,6 +140,11 @@ function simulateIMTK(modelName::String, tspan, solver; kwargs...)
     try
       local cached = BUILT[cname]
       local prob   = OMB.Runtime.ModelingToolkit.SciMLBase.remake(cached[1]; tspan = tspan)
+      #= Restore the build-time parameter values: a previous run's affects may
+         have mutated the shared vector (ifCond toggles persist otherwise). =#
+      if haskey(PRISTINE_P, cname)
+        prob = OMB.Runtime.ModelingToolkit.SciMLBase.remake(prob; p = deepcopy(PRISTINE_P[cname]))
+      end
       local rebuilt = (prob, cached[2], cached[3], cached[4], cached[5],
                        tspan, cached[7], cached[8], cached[9])
       #= Route through `mod.simulate(...; cached_build = rebuilt)` using the same

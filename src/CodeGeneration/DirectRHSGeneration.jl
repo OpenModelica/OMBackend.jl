@@ -65,7 +65,8 @@ default to 0.0, which may cause InitialFailure for DAE systems.
 Returns an `ODEProblem` ready for `solve()`.
 """
 function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
-                               allInitialValues=nothing)  # allInitialValues kept for API compat but guesses from reducedSystem are preferred
+                               allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
+                               preMem=nothing)
   local states = ModelingToolkit.unknowns(reducedSystem)
   local params = ModelingToolkit.parameters(reducedSystem)
   # Use full_equations to inline observed variable definitions.
@@ -178,8 +179,34 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   end
 
+  #= After initialization pre(x) equals the committed x(t0); refresh the
+     lifted-discrete memory from the solved initial state. =#
+  resetDiscretePreMem!(preMem, reducedSystem, u0)
+
   @debug "DirectRHS: problem constructed successfully"
   return problem
+end
+
+"""
+    resetDiscretePreMem!(preMem, reducedSystem, u0)
+
+Refresh the lifted-discrete pre() memory from an initial state vector so
+pre(x) at the first event resolves to the committed x(t0). Must run at every
+solve start: a cached build otherwise carries the previous run's final values.
+"""
+function resetDiscretePreMem!(preMem, reducedSystem, u0)
+  (preMem === nothing || u0 === nothing) && return nothing
+  local states = try
+    ModelingToolkit.unknowns(reducedSystem)
+  catch
+    return nothing
+  end
+  for (i, st) in enumerate(states)
+    i <= length(u0) || break
+    local k = Symbol(replace(string(st), "(t)" => ""))
+    haskey(preMem, k) && (preMem[k] = u0[i])
+  end
+  return nothing
 end
 
 

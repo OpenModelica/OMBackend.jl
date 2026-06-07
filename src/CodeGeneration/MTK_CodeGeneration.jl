@@ -361,7 +361,8 @@ constructor in favor of the direct-RHS path.
 emitDirectRHSProblem() = :(
   problem = OMBackend.CodeGeneration.buildDirectRHSProblem(
     reducedSystem, finalInitialValues, pars, tspan, callbacks;
-    allInitialValues = initialValues)
+    allInitialValues = initialValues,
+    preMem = (@isdefined(DISCRETE_PRE_MEM) ? DISCRETE_PRE_MEM : nothing))
 )
 
 """
@@ -820,6 +821,13 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
          constant residuals; default to Newton-FD unless the caller chose. =#
       local _initKw = $(_modelHasTableClusters(simCode)) && !haskey(kwargs, :initializealg) ?
         (; initializealg = OMBackend.CodeGeneration.tableClusterInitAlg()) : (;)
+      #= pre(x) at the first event equals the committed x(t0): refresh the
+         lifted-discrete memory from this run's initial state. =#
+      if @isdefined(DISCRETE_PRE_MEM)
+        Base.invokelatest(OMBackend.CodeGeneration.resetDiscretePreMem!,
+                          DISCRETE_PRE_MEM, LATEST_REDUCED_SYSTEM,
+                          $(Symbol("$(MODEL_NAME)Model_problem")).u0)
+      end
       local _sol = if haskey(kwargs, :callback)
         solve(_problemForSolver, _solver; kwargs..., _initKw...)
       else
@@ -840,6 +848,10 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
           OMBackend.CodeGeneration.ode_to_dae(_origProblem)
         else
           _origProblem
+        end
+        if @isdefined(DISCRETE_PRE_MEM)
+          Base.invokelatest(OMBackend.CodeGeneration.resetDiscretePreMem!,
+                            DISCRETE_PRE_MEM, LATEST_REDUCED_SYSTEM, _origProblem.u0)
         end
         _sol = if haskey(kwargs, :callback)
           solve(_fallbackProb, _solver; kwargs..., _initKw...)
@@ -1800,7 +1812,9 @@ So the first will have 1 and so on.
    their crossing so their sign is definite. Whichever callback fires refreshes
    all, so coincident time events stay consistent even though MTK/DiffEq apply
    only one affect per coincident root. =#
-function _buildTimeEventRefreshCallbacks(allPT::Vector)
+function _buildTimeEventRefreshCallbacks(allPT::Vector, ptOwners::Vector, simCode,
+                                         clusters, leafAlias::Dict{Symbol,Symbol},
+                                         algDefs::Dict{Symbol,Any})
   local n = length(allPT)
   local cbs = Expr[]
   for k in 1:n
@@ -1820,15 +1834,30 @@ function _buildTimeEventRefreshCallbacks(allPT::Vector)
         push!(retKws, Expr(:kw, symJ, :((observed.$(zcName) < 0) ? 1.0 : 0.0)))
       end
     end
-    local modNT = Expr(:tuple, Expr(:parameters, modKws...))
-    local retNT = Expr(:tuple, Expr(:parameters, retKws...))
-    local fExpr = :((modified, observed, ctx, integrator) -> $(retNT))
-    local affect
-    if isempty(obsKws)
-      affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT)))
-    else
-      local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
-      affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT); observed = $(obsNT)))
+    #= Chain dependent pre-memory clusters into the firing event's affect: their
+       crossing functions can jump from an exact boundary here and never produce
+       the transversal crossing the standalone callbacks root-find on. =#
+    local affect = nothing
+    local chainInfo = _ifEqChainedClusters(ptOwners[k], clusters, simCode, leafAlias, algDefs)
+    if chainInfo !== nothing
+      local (chained, stale) = chainInfo
+      local obsAcc = Dict{Symbol,Symbol}()
+      local subst = _buildRelaySubst(ptOwners[k], numValK, simCode, leafAlias, algDefs, stale, obsAcc)
+      if subst !== nothing
+        affect = _composedIfCondAffectExpr(retKws, modKws, chained, simCode, subst, obsAcc;
+                                           extraObsKws = obsKws)
+      end
+    end
+    if affect === nothing
+      local modNT = Expr(:tuple, Expr(:parameters, modKws...))
+      local retNT = Expr(:tuple, Expr(:parameters, retKws...))
+      local fExpr = :((modified, observed, ctx, integrator) -> $(retNT))
+      if isempty(obsKws)
+        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT)))
+      else
+        local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
+        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT); observed = $(obsNT)))
+      end
     end
     push!(cbs, :(ModelingToolkit.SymbolicContinuousCallback(
       ($(mtkCondK)) => $(affect);
@@ -1838,21 +1867,280 @@ function _buildTimeEventRefreshCallbacks(allPT::Vector)
   return cbs
 end
 
+#= Union-find classes over leaf residuals `0 = a - b` (both plain crefs); mirrors
+   the MTK-level relay elimination closely enough to resolve which name a cluster
+   body uses for an if-equation relay. Returns name -> class root. =#
+function _leafAliasClasses(simCode)::Dict{Symbol,Symbol}
+  local parent = Dict{Symbol,Symbol}()
+  local root = function (s::Symbol)
+    while get(parent, s, s) !== s
+      s = parent[s]
+    end
+    return s
+  end
+  for req in simCode.residualEquations
+    req isa SimulationCode.RESIDUAL_EQUATION || continue
+    local d = SimulationCode.toDAEExp(req.exp)
+    local pair = @match d begin
+      DAE.BINARY(DAE.CREF(c1, _), DAE.SUB(__), DAE.CREF(c2, _)) =>
+        (Symbol(string(c1)), Symbol(string(c2)))
+      _ => nothing
+    end
+    pair === nothing && continue
+    local (a, b) = pair
+    get!(parent, a, a)
+    get!(parent, b, b)
+    local (ra, rb) = (root(a), root(b))
+    ra === rb || (parent[ra] = rb)
+  end
+  return Dict{Symbol,Symbol}(k => root(k) for k in keys(parent))
+end
+
+#= Causal definitions `alg = rhs` recovered from residuals `0 = alg - rhs` or
+   `0 = rhs - alg` where `alg` is an algebraic SimVar. Used to inline algebraics
+   whose value jumps with an if-equation branch flip. =#
+function _algebraicDefs(simCode)::Dict{Symbol,Any}
+  local defs = Dict{Symbol,Any}()
+  local ht = simCode.stringToSimVarHT
+  for req in simCode.residualEquations
+    req isa SimulationCode.RESIDUAL_EQUATION || continue
+    local d = SimulationCode.toDAEExp(req.exp)
+    local hit = @match d begin
+      DAE.BINARY(DAE.CREF(c1, _), DAE.SUB(__), e2) => (Symbol(string(c1)), e2)
+      DAE.BINARY(e1, DAE.SUB(__), DAE.CREF(c2, _)) => (Symbol(string(c2)), e1)
+      _ => nothing
+    end
+    hit === nothing && continue
+    local (nm, rhs) = hit
+    local entry = get(ht, string(nm), nothing)
+    entry === nothing && continue
+    SimulationCode.isAlgebraic(entry[2]) || continue
+    haskey(defs, nm) || (defs[nm] = rhs)
+  end
+  return defs
+end
+
+#= True when `exp` references any name in `names`, resolving leaf-alias classes. =#
+Base.@nospecializeinfer function _daeReferencesAny(@nospecialize(exp), names::Set{Symbol},
+                                                   leafAlias::Dict{Symbol,Symbol})::Bool
+  local refs = OrderedSet{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, exp)
+  catch
+    return false
+  end
+  for n in refs
+    local s = Symbol(n)
+    (s in names || get(leafAlias, s, s) in names) && return true
+  end
+  return false
+end
+
+function _relayLhsRhs(resEq)
+  local d = try
+    SimulationCode.toDAEExp(resEq.exp)
+  catch
+    return nothing
+  end
+  return @match d begin
+    DAE.BINARY(DAE.CREF(c1, _), DAE.SUB(__), e2) => (Symbol(string(c1)), e2)
+    _ => nothing
+  end
+end
+
+#= Per-row relay table of a single-condition if-equation: (relaySymbol,
+   condBranchRhsDAE, elseRhsDAE) per residual row. `nothing` unless every row in
+   both branches has the strict `0 = ifEq_tmpN - rhs` relay form. =#
+function _ifEqRelayRows(ifEq::SimulationCode.IF_EQUATION, simCode)
+  local condBranch = nothing
+  local elseBranch = nothing
+  for branch in ifEq.branches
+    if branch.identifier == -1
+      elseBranch === nothing || return nothing
+      elseBranch = branch
+    else
+      condBranch === nothing || return nothing
+      condBranch = branch
+    end
+  end
+  (condBranch === nothing || elseBranch === nothing) && return nothing
+  local n = length(condBranch.residualEquations)
+  n == length(elseBranch.residualEquations) || return nothing
+  local rows = Vector{Tuple{Symbol, Any, Any}}()
+  for r in 1:n
+    local hitC = _relayLhsRhs(condBranch.residualEquations[r])
+    local hitE = _relayLhsRhs(elseBranch.residualEquations[r])
+    (hitC === nothing || hitE === nothing) && return nothing
+    first(hitC) === first(hitE) || return nothing
+    startswith(string(first(hitC)), "ifEq_tmp") || return nothing
+    push!(rows, (first(hitC), last(hitC), last(hitE)))
+  end
+  return isempty(rows) ? nothing : rows
+end
+
+#= Stale-name closure for one if-equation: its relay names, their leaf-alias
+   classmates, and algebraics causally defined from any of those. `nothing` when
+   the relay table is unavailable. =#
+function _ifEqStaleNames(ifEq, simCode, leafAlias::Dict{Symbol,Symbol}, algDefs::Dict{Symbol,Any})
+  local rows = _ifEqRelayRows(ifEq, simCode)
+  rows === nothing && return nothing
+  local stale = Set{Symbol}()
+  local addWithClassmates! = function (nm::Symbol)
+    push!(stale, nm)
+    local rt = get(leafAlias, nm, nm)
+    push!(stale, rt)
+    for (other, r) in leafAlias
+      r === rt && push!(stale, other)
+    end
+  end
+  for (lhs, _, _) in rows
+    addWithClassmates!(lhs)
+  end
+  local grew = true
+  while grew
+    grew = false
+    for (alg, rhs) in algDefs
+      (alg in stale) && continue
+      _daeReferencesAny(rhs, stale, leafAlias) || continue
+      addWithClassmates!(alg)
+      grew = true
+    end
+  end
+  return stale
+end
+
+_clusterReadsAny(assigns, names::Set{Symbol}, leafAlias::Dict{Symbol,Symbol})::Bool =
+  any(_daeReferencesAny(rhs, names, leafAlias) for (_, rhs, _) in assigns)
+
+#= Clusters whose recompute reads a value that jumps with this if-equation's
+   branch flip; they re-evaluate inside the flip affect (§8.6 event iteration,
+   single sweep). Returns (chained, staleNames) or nothing. =#
+function _ifEqChainedClusters(ifEq, clusters, simCode,
+                              leafAlias::Dict{Symbol,Symbol}, algDefs::Dict{Symbol,Any})
+  isempty(clusters) && return nothing
+  local stale = _ifEqStaleNames(ifEq, simCode, leafAlias, algDefs)
+  stale === nothing && return nothing
+  local chained = [a for a in clusters if _clusterReadsAny(a, stale, leafAlias)]
+  return isempty(chained) ? nothing : (chained, stale)
+end
+
+#= Every stale name referenced by `exp` already has a substitution entry. =#
+Base.@nospecializeinfer function _daeStaleRefsReady(@nospecialize(exp), stale::Set{Symbol},
+                                                    subst::Dict{Symbol,Any},
+                                                    leafAlias::Dict{Symbol,Symbol})::Bool
+  local refs = OrderedSet{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, exp)
+  catch
+    return false
+  end
+  for n in refs
+    local s = Symbol(n)
+    if (s in stale || get(leafAlias, s, s) in stale) && !haskey(subst, s)
+      return false
+    end
+  end
+  return true
+end
+
+#= Post-event substitution map for one if-equation: each relay row's branch RHS
+   selected by the constant post-event ifCond value (1.0 = condition TRUE =
+   conditional branch), lowered for an affect body; stale algebraics inlined
+   bottom-up on top. Circular stale definitions stay live observed reads. =#
+function _buildRelaySubst(ifEq, ownVal::Float64, simCode,
+                          leafAlias::Dict{Symbol,Symbol}, algDefs::Dict{Symbol,Any},
+                          stale::Set{Symbol}, obsAcc::Dict{Symbol,Symbol})
+  local rows = _ifEqRelayRows(ifEq, simCode)
+  rows === nothing && return nothing
+  local subst = Dict{Symbol,Any}()
+  local addWithClassmates! = function (nm::Symbol, val)
+    subst[nm] = val
+    local rt = get(leafAlias, nm, nm)
+    haskey(subst, rt) || (subst[rt] = val)
+    for (other, r) in leafAlias
+      r === rt && !haskey(subst, other) && (subst[other] = val)
+    end
+  end
+  for (lhs, condRhs, elseRhs) in rows
+    local selDAE = ownVal == 1.0 ? condRhs : elseRhs
+    local lowered = try
+      _daeExpToJuliaMem(selDAE, obsAcc, simCode)
+    catch
+      return nothing
+    end
+    addWithClassmates!(lhs, lowered)
+  end
+  local grew = true
+  while grew
+    grew = false
+    for (alg, rhs) in algDefs
+      (haskey(subst, alg) || !(alg in stale)) && continue
+      _daeStaleRefsReady(rhs, stale, subst, leafAlias) || continue
+      local lowered = try
+        _daeExpToJuliaMem(rhs, obsAcc, simCode; subst = subst)
+      catch
+        return nothing
+      end
+      addWithClassmates!(alg, lowered)
+      grew = true
+    end
+  end
+  return subst
+end
+
+#= One composed ImperativeAffect Expr: the ifCond commits (constant or derived
+   post-event values in `ifKws`) plus every chained cluster's recompute under
+   the substitution, in a single event instant. =#
+function _composedIfCondAffectExpr(ifKws::Vector{Expr}, modIfKws::Vector{Expr},
+                                   chained, simCode,
+                                   subst::Dict{Symbol,Any}, obsAcc::Dict{Symbol,Symbol};
+                                   extraObsKws::Vector{Expr} = Expr[])
+  local stmts = Expr[]; local writes = Expr[]; local retKws = Expr[]
+  for assigns in chained
+    _preMemClusterBody!(stmts, writes, retKws, obsAcc, assigns, simCode; subst = subst)
+  end
+  local retNT = Expr(:tuple, Expr(:parameters, vcat(ifKws, retKws)...))
+  local fexpr = :((modified, observed, ctx, integrator) -> begin
+                    $(stmts...)
+                    $(writes...)
+                    $(retNT)
+                  end)
+  local clusterModKws = Expr[Expr(:kw, d, d) for assigns in chained for (d, _, _) in assigns]
+  local modNT = Expr(:tuple, Expr(:parameters, vcat(modIfKws, clusterModKws)...))
+  local obsKws = vcat(extraObsKws, Expr[Expr(:kw, k, v) for (k, v) in obsAcc])
+  isempty(obsKws) && return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT)))
+  local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
+  return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT); observed = $(obsNT)))
+end
+
 function createIfEquations(stateVariables, algebraicVariables, simCode)
   local ifEquations = IfEquationComponent[]
   local identifier::Int
   local sortedIfEquations = sort(collect(simCode.ifEquations);
                                  by = ifEq -> _ifEquationSortKey(ifEq, simCode))
+  #= Event-iteration chaining inputs: pre-memory clusters plus the maps that
+     resolve which names a branch flip invalidates. =#
+  local clusters = _collectPreMemClusters(simCode)
+  local leafAlias = isempty(clusters) ? Dict{Symbol,Symbol}() : _leafAliasClasses(simCode)
+  local algDefs = isempty(clusters) ? Dict{Symbol,Any}() : _algebraicDefs(simCode)
   #= The identifier is increased by 1 in each iteration. =#
   for (identifier, ifEq) in enumerate(sortedIfEquations)
-    push!(ifEquations, createIfEquation(stateVariables, algebraicVariables, ifEq, identifier, simCode))
+    push!(ifEquations, createIfEquation(stateVariables, algebraicVariables, ifEq, identifier, simCode,
+                                        clusters, leafAlias, algDefs))
   end
   #= Pure-time-event branches deferred their callbacks (see createIfEquation);
      build the model-level refresh callbacks now that every if-equation's
      pure-time conditions are known. =#
   local allPT = collect(Iterators.flatten(c.pureTimeEvents for c in ifEquations))
   if !isempty(allPT)
-    local refreshCbs = _buildTimeEventRefreshCallbacks(allPT)
+    local ptOwners = Any[]
+    for (k, c) in enumerate(ifEquations)
+      for _ in c.pureTimeEvents
+        push!(ptOwners, sortedIfEquations[k])
+      end
+    end
+    local refreshCbs = _buildTimeEventRefreshCallbacks(allPT, ptOwners, simCode,
+                                                       clusters, leafAlias, algDefs)
     push!(ifEquations, IfEquationComponent(refreshCbs, Expr[], Symbol[],
                                            Tuple{String, Bool}[], Tuple{Symbol, Any, Any, Float64}[],
                                            Expr[]))
@@ -1996,7 +2284,10 @@ function createIfEquation(stateVariables::Vector,
                           algebraicVariables::Vector,
                           ifEq::SimulationCode.IF_EQUATION,
                           identifier::Int,
-                          simCode)::IfEquationComponent
+                          simCode,
+                          clusters = Vector{Vector{Tuple{Symbol,Any,Bool}}}(),
+                          leafAlias = Dict{Symbol,Symbol}(),
+                          algDefs = Dict{Symbol,Any}())::IfEquationComponent
   local i::Int = 0
   local nBranches::Int = length(ifEq.branches)
   local branchesWithConds::Int = nBranches - 1
@@ -2006,6 +2297,9 @@ function createIfEquation(stateVariables::Vector,
   local conditions = Expr[]
   local ivConditions = Bool[]
   local pureTimeEvents = Tuple{Symbol, Any, Any, Float64}[]
+  #= Chained pre-memory clusters re-evaluate inside this if-equation's flip
+     affects (event iteration); see _ifEqChainedClusters. =#
+  local chainInfo = _ifEqChainedClusters(ifEq, clusters, simCode, leafAlias, algDefs)
   for branch in ifEq.branches
     i += 1
     @match branch begin
@@ -2040,6 +2334,21 @@ function createIfEquation(stateVariables::Vector,
         local downFExpr::Expr = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, downKws...))))
         local affectTuple::Expr     = :(($(upFExpr), $(modifiedNT)))
         local affectNegTuple::Expr  = :(($(downFExpr), $(modifiedNT)))
+        #= Compose the chained cluster recomputes into both flip directions; the
+           up edge holds the condition FALSE (own ifCond 0.0), the down edge TRUE. =#
+        if chainInfo !== nothing
+          local (_chained, _stale) = chainInfo
+          local _obsUp = Dict{Symbol,Symbol}()
+          local _substUp = _buildRelaySubst(ifEq, 0.0, simCode, leafAlias, algDefs, _stale, _obsUp)
+          local _obsDown = Dict{Symbol,Symbol}()
+          local _substDown = _buildRelaySubst(ifEq, 1.0, simCode, leafAlias, algDefs, _stale, _obsDown)
+          if _substUp !== nothing && _substDown !== nothing
+            affectTuple = _composedIfCondAffectExpr(upKws, modifiedKws, _chained, simCode,
+                                                    _substUp, _obsUp)
+            affectNegTuple = _composedIfCondAffectExpr(downKws, modifiedKws, _chained, simCode,
+                                                       _substDown, _obsDown)
+          end
+        end
         #= When the branch condition depends on a non-lifted algebraic variable
            (an operating-point value `evalInitialCondition` defaulted to 0, e.g.
            an op-amp input voltage), the static initial ifCond can be wrong with
@@ -2482,22 +2791,27 @@ Base.@nospecializeinfer function _isBoolDiscreteName(name::String, simCode)::Boo
   end
 end
 
+#= Names substituted statically inside an affect body (post-event branch values
+   replacing stale observed reads). Default: no substitution. =#
+const _EMPTY_MEM_SUBST = Dict{Symbol, Any}()
+
 #= Lower a DAE exp at a boolean position of an ImperativeAffect body. Live
    reads come back as 0/1 Floats; `> 0.5` coerces both Bool and Float.
    `initVal` is the value `initial()` lowers to (true in an initialize affect). =#
 Base.@nospecializeinfer function _daeBoolMem(@nospecialize(exp::DAE.Exp), obsAcc::Dict{Symbol,Symbol}, simCode;
-                                             initVal::Bool = false)
-  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal)
+                                             initVal::Bool = false,
+                                             subst::Dict{Symbol,Any} = _EMPTY_MEM_SUBST)
+  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal, subst = subst)
   @match exp begin
     DAE.BCONST(b) => b
     DAE.LUNARY(DAE.NOT(__), e) => :(!$(recb(e)))
     DAE.LBINARY(e1, DAE.AND(__), e2) => :($(recb(e1)) && $(recb(e2)))
     DAE.LBINARY(e1, DAE.OR(__), e2) => :($(recb(e1)) || $(recb(e2)))
-    DAE.RELATION(__) => _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal)
+    DAE.RELATION(__) => _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal, subst = subst)
     DAE.CALL(Absyn.IDENT("initial"), _, _) => initVal
     DAE.IFEXP(c, t, f) => :($(recb(c)) ? $(recb(t)) : $(recb(f)))
     _ => begin
-      local v = _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal)
+      local v = _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal, subst = subst)
       v isa Bool ? v : :($(v) > 0.5)
     end
   end
@@ -2511,9 +2825,10 @@ end
    The triggering relation is pre-substituted by the caller, so it arrives as a
    BCONST. =#
 Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), obsAcc::Dict{Symbol,Symbol}, simCode;
-                                                   initVal::Bool = false)
-  rec(@nospecialize e) = _daeExpToJuliaMem(e, obsAcc, simCode; initVal = initVal)
-  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal)
+                                                   initVal::Bool = false,
+                                                   subst::Dict{Symbol,Any} = _EMPTY_MEM_SUBST)
+  rec(@nospecialize e) = _daeExpToJuliaMem(e, obsAcc, simCode; initVal = initVal, subst = subst)
+  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal, subst = subst)
   @match exp begin
     DAE.ICONST(i) => Float64(i)
     DAE.RCONST(r) => r
@@ -2537,6 +2852,8 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
       if nm === :time
         #= module-scope `time` is Base.time; the affect reads the integrator clock =#
         :(integrator.t)
+      elseif haskey(subst, nm)
+        subst[nm]
       else
         obsAcc[nm] = nm
         :(observed.$(nm))
@@ -2576,17 +2893,18 @@ end
    integrator (observed) and pre() from DISCRETE_PRE_MEM, then committing each new
    value back. No relation is pinned: with the memory latch, live evaluation at the
    consistent post-step state avoids the spurious Stuck a pinned relation forces. =#
-Base.@nospecializeinfer function _preMemAffectParts(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode;
-                                                    atInit::Bool = false)
-  local obsAcc = Dict{Symbol,Symbol}()
-  local stmts = Expr[]; local writes = Expr[]; local retKws = Expr[]
+Base.@nospecializeinfer function _preMemClusterBody!(stmts::Vector{Expr}, writes::Vector{Expr}, retKws::Vector{Expr},
+                                                     obsAcc::Dict{Symbol,Symbol},
+                                                     assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode;
+                                                     atInit::Bool = false,
+                                                     subst::Dict{Symbol,Any} = _EMPTY_MEM_SUBST)
   local modeSym = nothing; local sfSym = nothing; local sbSym = nothing
   local lkSym = nothing; local freeSym = nothing
   for (d, rhs, isInt) in assigns
     local vsym = Symbol("_v_", d)
     local valExpr = isInt ?
-      :(Float64($(_daeExpToJuliaMem(rhs, obsAcc, simCode; initVal = atInit)))) :
-      :($(_daeBoolMem(rhs, obsAcc, simCode; initVal = atInit)) ? 1.0 : 0.0)
+      :(Float64($(_daeExpToJuliaMem(rhs, obsAcc, simCode; initVal = atInit, subst = subst)))) :
+      :($(_daeBoolMem(rhs, obsAcc, simCode; initVal = atInit, subst = subst)) ? 1.0 : 0.0)
     push!(stmts, :(local $(vsym) = $(valExpr)))
     push!(writes, :(DISCRETE_PRE_MEM[$(QuoteNode(d))] = $(vsym)))
     push!(retKws, Expr(:kw, d, vsym))
@@ -2610,6 +2928,14 @@ Base.@nospecializeinfer function _preMemAffectParts(assigns::Vector{Tuple{Symbol
       push!(stmts, :($(lkSym) = ($(freeSym) < 0.5 && $(modeSym) == 0.0) ? 1.0 : 0.0))
     end
   end
+  return nothing
+end
+
+Base.@nospecializeinfer function _preMemAffectParts(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode;
+                                                    atInit::Bool = false)
+  local obsAcc = Dict{Symbol,Symbol}()
+  local stmts = Expr[]; local writes = Expr[]; local retKws = Expr[]
+  _preMemClusterBody!(stmts, writes, retKws, obsAcc, assigns, simCode; atInit = atInit)
   local retNT = Expr(:tuple, Expr(:parameters, retKws...))
   local fexpr = :((modified, observed, ctx, integrator) -> begin
                     $(stmts...)
@@ -2646,9 +2972,7 @@ end
    start value. Emitted only when the pre-memory flag is on and a lifted cluster
    exists; otherwise a no-op so non-friction models are unchanged. =#
 function discretePreMemDecl(simCode)::Expr
-  #= mirror the lowering decision of createDiscreteBoolWhenEvents =#
-  (_preMemEnabled() || _modelHasTableClusters(simCode) || _modelHasModeFSMClusters(simCode)) ||
-    return Expr(:block)
+  _preMemActive(simCode) || return Expr(:block)
   local pairs = Expr[]
   for weq in simCode.whenEquations
     _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
@@ -2664,38 +2988,57 @@ function discretePreMemDecl(simCode)::Expr
   return :(DISCRETE_PRE_MEM = Dict{Symbol, Float64}($(pairs...)))
 end
 
+#= The pre-memory lowering trigger, shared by every site that must mirror the
+   decision (event creation, the DISCRETE_PRE_MEM declaration, if-event chaining). =#
+_preMemActive(simCode)::Bool =
+  _preMemEnabled() || _modelHasTableClusters(simCode) || _modelHasModeFSMClusters(simCode)
+
+#= Gather a synthesized when cluster's ordered (discreteSymbol, rhsDAE, isInteger)
+   assignments; `nothing` when any statement is unsupported. A single-member
+   cluster has one entry; a coupled FSM cluster has the body in topological order. =#
+function _gatherClusterAssigns(weq, simCode)
+  local assigns = Tuple{Symbol, Any, Bool}[]
+  for st in collect(weq.whenEquation.whenStmtLst)
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || return nothing
+    local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
+    haskey(simCode.stringToSimVarHT, leftStr) || return nothing
+    local (_, var) = simCode.stringToSimVarHT[leftStr]
+    local isInt = @match var.attributes begin
+      SOME(DAE.VAR_ATTR_INT(__)) => true
+      SOME(DAE.VAR_ATTR_ENUMERATION(__)) => true
+      _ => false
+    end
+    push!(assigns, (Symbol(string(var.name)), SimulationCode.toDAEExp(st.right), isInt))
+  end
+  return isempty(assigns) ? nothing : assigns
+end
+
+#= All pre-memory-lowered cluster assign lists; empty unless the pre-memory
+   path is active for this model. =#
+function _collectPreMemClusters(simCode)::Vector{Vector{Tuple{Symbol,Any,Bool}}}
+  local out = Vector{Vector{Tuple{Symbol,Any,Bool}}}()
+  _preMemActive(simCode) || return out
+  for weq in simCode.whenEquations
+    _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
+    local assigns = _gatherClusterAssigns(weq, simCode)
+    assigns === nothing && continue
+    push!(out, assigns)
+  end
+  return out
+end
+
 function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
   local events = Expr[]
   local tableMode = _modelHasTableClusters(simCode)
-  local preMem = _preMemEnabled() || tableMode || _modelHasModeFSMClusters(simCode)
+  local preMem = _preMemActive(simCode)
   for weq in simCode.whenEquations
     local rels = _extractChangeRelations(weq.whenEquation.condition, simCode)
     rels === nothing && continue
     #= `edge(b)` fires on the rising transition only (relation false->true);
        `change`/the gate lift fire on both. =#
     local isEdge = _isEdgeWhenCondition(weq.whenEquation.condition)
-    #= Gather the cluster's ordered (discreteSymbol, rhsDAE, isInteger) assignments.
-       A single-member cluster (Stage 1) has one; a coupled friction cluster has the
-       whole body in topological order. =#
-    local assigns = Tuple{Symbol, Any, Bool}[]
-    local ok = true
-    for st in collect(weq.whenEquation.whenStmtLst)
-      if !(st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN)
-        ok = false; break
-      end
-      local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
-      if !haskey(simCode.stringToSimVarHT, leftStr)
-        ok = false; break
-      end
-      local (_, var) = simCode.stringToSimVarHT[leftStr]
-      local isInt = @match var.attributes begin
-        SOME(DAE.VAR_ATTR_INT(__)) => true
-        SOME(DAE.VAR_ATTR_ENUMERATION(__)) => true
-        _ => false
-      end
-      push!(assigns, (Symbol(string(var.name)), SimulationCode.toDAEExp(st.right), isInt))
-    end
-    (ok && !isempty(assigns)) || continue
+    local assigns = _gatherClusterAssigns(weq, simCode)
+    assigns === nothing && continue
     #= One callback per relation in the cluster. transformToMTKContinousCondition
        normalises zc so relation-TRUE ⟺ zc<0: the `=>` affect is the up-crossing
        (relation becomes FALSE) and affect_neg the down-crossing (relation becomes
@@ -2732,6 +3075,19 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
             ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs));
             affect_neg = ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs)),
             initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI)),
+            rootfind = SciMLBase.RightRootFind,
+            reinitializealg = SciMLBase.NoInit())))
+        elseif relIdx == 1 && hasInit
+          #= Final pass of the t0 event iteration (§8.6): re-commit the cluster
+             from the solved initial state with initial() expired, so the stored
+             t0 discretes match the reference tools instead of carrying the
+             initial()=true iteration values. The live body (atInit = false) is
+             exactly that evaluation. =#
+          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+            ($(zc) ~ 0),
+            ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs));
+            affect_neg = ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs)),
+            initialize = ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs)),
             rootfind = SciMLBase.RightRootFind,
             reinitializealg = SciMLBase.NoInit())))
         else
