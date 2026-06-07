@@ -1213,6 +1213,40 @@ function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
   return out
 end
 
+"Seed guesses for reduced unknowns by name; overrides only absent or default-0.0 entries."
+function mergeSoftGuesses(reducedSystem, pairs::AbstractVector)
+  isempty(pairs) && return reducedSystem
+  local unkByStr = Dict{String, Any}()
+  for u in unknowns(reducedSystem)
+    unkByStr[replace(string(u), "(t)" => "")] = u
+  end
+  local gs = Dict{Any, Any}(ModelingToolkit.guesses(reducedSystem))
+  local changed = false
+  for p in pairs
+    local nm = replace(String(first(p)), "(t)" => "")
+    haskey(unkByStr, nm) || continue
+    local cur = nothing
+    for (k, v) in gs
+      if replace(string(k), "(t)" => "") == nm
+        cur = v
+        break
+      end
+    end
+    #= guesses values may be Num-wrapped; unwrap before the default-0.0 test =#
+    local curv = cur === nothing ? nothing : Symbolics.value(cur)
+    if curv === nothing || (curv isa Number && iszero(curv))
+      for k in collect(keys(gs))
+        replace(string(k), "(t)" => "") == nm && delete!(gs, k)
+      end
+      gs[unkByStr[nm]] = last(p)
+      changed = true
+    end
+  end
+  changed || return reducedSystem
+  @set! reducedSystem.guesses = gs
+  return reducedSystem
+end
+
 function splitInitialValues(reducedSystem,
                             finalInitialValues::Vector{<:Pair{Symbolics.Num}},
                             allInitialValues::Vector{<:Pair})

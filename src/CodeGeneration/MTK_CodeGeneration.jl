@@ -478,6 +478,10 @@ struct IfEquationComponent
      and re-derives the OTHER pure-time ifConds from their zero-crossing sign so that
      coincident time events cannot drop one another's affect. =#
   pureTimeEvents       :: Vector{Tuple{Symbol, Any, Any, Float64}}
+  #= `target => value` pair Exprs: the t0-selected branch RHS evaluated at the
+     start-value map, merged as soft guesses so guarded denominators do not
+     start at 0/0 in the DAE init. =#
+  relayGuesses         :: Vector{Expr}
 end
 
 """
@@ -914,6 +918,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      the callbacks read the surviving relay representatives (see below). =#
   local IF_EQUATION_COMPONENTS::Vector{IfEquationComponent} =
     createIfEquations(stateVariables, algebraicVariables, simCode)
+  local RELAY_GUESS_PAIRS = collect(Iterators.flatten(c.relayGuesses for c in IF_EQUATION_COMPONENTS))
   #= Symbolic names =#
   local algebraicVariablesSym = Symbol[:($(Symbol(v))) for v in algebraicVariables]
   local dataStructureVariablesSym = Symbol[Symbol(v) for v in dataStructureVariables]
@@ -1250,6 +1255,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       local _initialValuesForSplit = Pair{Any, Any}[p for p in initialValues]
       (reducedSystem, finalInitialValues) = Base.invokelatest(
         OMBackend.CodeGeneration.splitInitialValues, reducedSystem, _finalInitialValuesForSplit, _initialValuesForSplit)
+      reducedSystem = Base.invokelatest(OMBackend.CodeGeneration.mergeSoftGuesses,
+        reducedSystem, Pair{Any, Any}[$(RELAY_GUESS_PAIRS...)])
       #= Build ODEProblem. The codegen-time strategy (DirectRHS / structural
          transition / standard DAE-with-init-solver) is picked here; the
          structural-transition branch additionally dispatches at runtime on
@@ -1847,7 +1854,8 @@ function createIfEquations(stateVariables, algebraicVariables, simCode)
   if !isempty(allPT)
     local refreshCbs = _buildTimeEventRefreshCallbacks(allPT)
     push!(ifEquations, IfEquationComponent(refreshCbs, Expr[], Symbol[],
-                                           Tuple{String, Bool}[], Tuple{Symbol, Any, Any, Float64}[]))
+                                           Tuple{String, Bool}[], Tuple{Symbol, Any, Any, Float64}[],
+                                           Expr[]))
   end
   return ifEquations
 end
@@ -2084,15 +2092,48 @@ function createIfEquation(stateVariables::Vector,
   local ifExpressions = Expr[]
   #= The number of residuals is the same for both branches. =#
   local nResEqsInTarget = length(resEqs)
+  #= t0-selected branch: first conditional branch whose condition is TRUE at
+     t0 (ivCond stores the negation), else the else branch. Its causalized RHS
+     evaluated at the t0 value map seeds soft guesses for the targets; zero
+     default guesses put guarded denominators at 0/0 before the init solve. =#
+  local condBranches = Any[]
+  local elseBranch = nothing
+  for branch in ifEq.branches
+    if branch.identifier == -1
+      elseBranch = branch
+    else
+      push!(condBranches, branch)
+    end
+  end
+  local selBranch = elseBranch
+  for (k, branch) in enumerate(condBranches)
+    if k <= length(ivConditions) && !(ivConditions[k])
+      selBranch = branch
+      break
+    end
+  end
+  local relayGuesses = Expr[]
+  local _t0ValMap = selBranch === nothing ? nothing :
+    try MTK_CodeGenerationUtil._buildT0ValueMap(simCode) catch; nothing end
   for resEqIdx in 1:nResEqsInTarget
     local resEq = resEqs[resEqIdx]
+    local lhsExpr = last(deCausalize(resEq, simCode))
     push!(ifExpressions,
-          :($(last(deCausalize(resEq, simCode))) ~ $(generateIfExpressions(ifEq.branches,
-                                                                           target,
-                                                                           resEqIdx,
-                                                                           identifier,
-                                                                           simCode;
-                                                                           subIdentifier = 1))))
+          :($(lhsExpr) ~ $(generateIfExpressions(ifEq.branches,
+                                                 target,
+                                                 resEqIdx,
+                                                 identifier,
+                                                 simCode;
+                                                 subIdentifier = 1))))
+    if _t0ValMap !== nothing && resEqIdx <= length(selBranch.residualEquations)
+      local gv = try
+        MTK_CodeGenerationUtil.evalCausalRHSAtT0(
+          first(deCausalize(selBranch.residualEquations[resEqIdx], simCode)), _t0ValMap)
+      catch
+        nothing
+      end
+      gv === nothing || push!(relayGuesses, :($(string(_unwrapBlockExpr(lhsExpr))) => $(gv)))
+    end
   end
   #= ifCond variables are discrete parameters (not ODE unknowns), so they do
      not need der() ~ 0 equations. Collect their names and initial values for
@@ -2104,7 +2145,8 @@ function createIfEquation(stateVariables::Vector,
     push!(conditionVariableNames, (string("ifCond", identifier, i), !(ivConditions[i])))
   end
   return IfEquationComponent(conditions, ifExpressions,
-                             conditionVariables, conditionVariableNames, pureTimeEvents)
+                             conditionVariables, conditionVariableNames, pureTimeEvents,
+                             relayGuesses)
 end
 
 #= Identify a synthesised discrete-Boolean when (from
@@ -2345,6 +2387,17 @@ function _modelHasTableClusters(simCode)::Bool
     end
   end
   return false
+end
+
+#= Unwrap nested block Exprs (and their annotation LineNumberNodes) down to
+   the core expression. =#
+function _unwrapBlockExpr(e)
+  while e isa Expr && e.head == :block
+    local args = [a for a in e.args if !(a isa LineNumberNode)]
+    isempty(args) && return e
+    e = last(args)
+  end
+  return e
 end
 
 #= True if the expression reads pre() of any name in `names`. =#
