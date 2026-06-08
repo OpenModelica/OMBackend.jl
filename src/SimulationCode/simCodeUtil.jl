@@ -147,9 +147,24 @@ function _complexParts(@nospecialize(exp))::Union{Nothing, Tuple{Exp, Exp}}
     if fn == "fromReal" && length(args) >= 1
       return (_lowerComplexExp(args[1]),
               length(args) >= 2 ? _lowerComplexExp(args[2]) : RCONST(0.0))
+    elseif fn == "conj" && length(args) == 2
+      #= pre-split conj(re, im) -> (re, -im) =#
+      return (_lowerComplexExp(args[1]), _negE(_lowerComplexExp(args[2])))
+    elseif fn == "exp" && length(args) == 2
+      #= exp(re + i·im) = e^re·(cos(im) + i·sin(im)); args pre-split (re, im). =#
+      local rev = _lowerComplexExp(args[1]); local imv = _lowerComplexExp(args[2])
+      local er = CALL(Absyn.IDENT("exp"), Exp[rev], DAE.callAttrBuiltinReal)
+      return (_mulE(er, CALL(Absyn.IDENT("cos"), Exp[imv], DAE.callAttrBuiltinReal)),
+              _mulE(er, CALL(Absyn.IDENT("sin"), Exp[imv], DAE.callAttrBuiltinReal)))
     elseif fn == "conj" && length(args) >= 1
       local p = _complexParts(args[1]); p === nothing && return nothing
       return (p[1], _negE(p[2]))
+    elseif (fn == "multiply" || fn == "'*'") && length(args) == 4
+      #= pre-split multiply(re1, im1, re2, im2) -> complex product. =#
+      local r1 = _lowerComplexExp(args[1]); local i1 = _lowerComplexExp(args[2])
+      local r2 = _lowerComplexExp(args[3]); local i2 = _lowerComplexExp(args[4])
+      return (_subE(_mulE(r1, r2), _mulE(i1, i2)),
+              _addE(_mulE(r1, i2), _mulE(i1, r2)))
     elseif (fn == "multiply" || fn == "'*'") && length(args) == 3
       #= 3-arg multiply: `f(c1: Complex, c2_re: Real, c2_im: Real)` shape used by
          Modelica.ComplexBlocks.Interfaces.ComplexInput.'*'.multiply where the
@@ -165,6 +180,10 @@ function _complexParts(@nospecialize(exp))::Union{Nothing, Tuple{Exp, Exp}}
       (a === nothing || b === nothing) && return nothing
       return (_subE(_mulE(a[1], b[1]), _mulE(a[2], b[2])),
               _addE(_mulE(a[1], b[2]), _mulE(a[2], b[1])))
+    elseif (fn == "subtract" || fn == "'-'") && length(args) == 4
+      #= pre-split subtract(re1, im1, re2, im2) -> (re1-re2, im1-im2). =#
+      return (_subE(_lowerComplexExp(args[1]), _lowerComplexExp(args[3])),
+              _subE(_lowerComplexExp(args[2]), _lowerComplexExp(args[4])))
     elseif (fn == "subtract" || fn == "'-'") && length(args) >= 2
       local a = _complexParts(args[1]); local b = _complexParts(args[2])
       (a === nothing || b === nothing) && return nothing
@@ -172,6 +191,10 @@ function _complexParts(@nospecialize(exp))::Union{Nothing, Tuple{Exp, Exp}}
     elseif (fn == "negate" || fn == "'-'") && length(args) == 1
       local a = _complexParts(args[1]); a === nothing && return nothing
       return (_negE(a[1]), _negE(a[2]))
+    elseif (fn == "add" || fn == "'+'") && length(args) == 4
+      #= pre-split add(re1, im1, re2, im2) -> (re1+re2, im1+im2). =#
+      return (_addE(_lowerComplexExp(args[1]), _lowerComplexExp(args[3])),
+              _addE(_lowerComplexExp(args[2]), _lowerComplexExp(args[4])))
     elseif (fn == "add" || fn == "'+'") && length(args) >= 2
       local a = _complexParts(args[1]); local b = _complexParts(args[2])
       (a === nothing || b === nothing) && return nothing
@@ -220,13 +243,24 @@ function _complexProjection(@nospecialize(exp))::Union{Nothing, Exp}
     return nothing
   elseif exp isa CALL
     local fn = _opToken(exp.path)
-    if (fn == "'abs'" || fn == "abs") && length(exp.args) >= 1
-      local p = _complexParts(exp.args[1]); p === nothing && return nothing
-      return BINARY(_addE(BINARY(p[1], OP_POW, RCONST(2.0)),
-                          BINARY(p[2], OP_POW, RCONST(2.0))), OP_POW, RCONST(0.5))
-    elseif fn == "arg" && length(exp.args) >= 1
-      local p = _complexParts(exp.args[1]); p === nothing && return nothing
-      return CALL(Absyn.IDENT("atan2"), Exp[p[2], p[1]], exp.attr)
+    #= abs/arg may arrive with a single Complex arg, or pre-split as scalar
+       (re, im[, extra]) args. Resolve (re, im) from whichever form. =#
+    if (fn == "'abs'" || fn == "abs" || fn == "arg")
+      local re, im
+      if length(exp.args) >= 2 && _complexParts(exp.args[1]) === nothing
+        re = _lowerComplexExp(exp.args[1]); im = _lowerComplexExp(exp.args[2])
+      elseif length(exp.args) >= 1
+        local p = _complexParts(exp.args[1]); p === nothing && return nothing
+        re = p[1]; im = p[2]
+      else
+        return nothing
+      end
+      if fn == "arg"
+        return CALL(Absyn.IDENT("atan2"), Exp[im, re], exp.attr)
+      else
+        return BINARY(_addE(BINARY(re, OP_POW, RCONST(2.0)),
+                            BINARY(im, OP_POW, RCONST(2.0))), OP_POW, RCONST(0.5))
+      end
     end
     return nothing
   end
