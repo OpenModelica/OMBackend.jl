@@ -7319,7 +7319,11 @@ function indexOverconstraintDiagnostic(simCode::SIM_CODE)::SIM_CODE
     for i in unmatched
       local diff = OrderedSet{String}(); local plain = OrderedSet{String}()
       _collectDerAwareCrefs!(diff, plain, toDAEExp(simCode.residualEquations[i].exp))
-      @info "[SIMCODE: $(simCode.name): indexDiag] unmatched [$i]" der=collect(diff) plain=collect(plain)
+      local kindOf = v -> begin
+        local e = get(simCode.stringToSimVarHT, v, nothing)
+        e === nothing ? "?" : (isState(last(e)) ? "state" : (isAlgebraic(last(e)) ? "alg" : (isParameter(last(e)) ? "param" : "other")))
+      end
+      @info "[SIMCODE: $(simCode.name): indexDiag] unmatched [$i]" plain=[v * ":" * kindOf(v) for v in plain] der=collect(diff)
     end
   catch e
     @warn "[SIMCODE: $(simCode.name): indexDiag] threw" exception=(e, catch_backtrace())
