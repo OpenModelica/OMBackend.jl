@@ -506,6 +506,10 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
         simCode = SimulationCode.runSimCodePass("recomputeStronglyConnectedComponents", simCode,
                                                 SimulationCode.recomputeStronglyConnectedComponents)
         @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRecomputeSCC.log"), SimulationCode.dumpSimCode(simCode))
+        #= Standalone index-overconstraint diagnostic on the final SimCode (gated
+           by OMBACKEND_INDEX_DIAG); inspects the differential-incidence
+           localization without mutating the system. =#
+        simCode = SimulationCode.indexOverconstraintDiagnostic(simCode)
         _checkSimCodeBeforeCodegen(simCode, checkSimCode)
         local _genCode = if BackendMode == IMTK_MODE
           @BACKEND_PERFLOG "[backendAPI] generateIMTKTargetCode" generateIMTKTargetCode(simCode)
