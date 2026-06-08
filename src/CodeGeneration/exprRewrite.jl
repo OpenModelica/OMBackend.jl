@@ -281,9 +281,16 @@ representative of their alias component (e.g. discretes referenced in an
 event condition, whose name the generated callback reads from the state
 vector). When a component contains such a symbol it is forced to be the
 root so it is never substituted away.
+
+`paramSyms` names symbols that are parameters (no module-global symbolic
+binding). A relay touching one is kept as an equation rather than
+eliminated: collapsing a bound variable onto a parameter strands the
+canonical name at module scope, and `structural_simplify` aliases the
+variable to the parameter correctly on its own.
 """
 function eliminateIfEqRelays(equations::Vector{Expr};
-                             preferKeep::OrderedSet{Symbol} = OrderedSet{Symbol}())
+                             preferKeep::OrderedSet{Symbol} = OrderedSet{Symbol}(),
+                             paramSyms::OrderedSet{Symbol} = OrderedSet{Symbol}())
     #= Union-find (not a plain map): a variable that is the leaf-alias LHS of two
        relays (`A~B`, `A~C`) means A≡B≡C; a `raw[k]=v` map overwrites and drops one
        side, disconnecting it from its definer. Union-find keeps the component intact. =#
@@ -300,6 +307,13 @@ function eliminateIfEqRelays(equations::Vector{Expr};
         if _isIfEqTmpRelay(eq)
             local (k, v) = _ifEqRelayPair(eq)
             if k === nothing || v === nothing
+                push!(non_relay, eq)
+                continue
+            end
+            #= A relay onto a parameter has no module-global binding for the
+               canonical name; keep the equation so structural_simplify aliases
+               the variable to the parameter itself. =#
+            if k in paramSyms || v in paramSyms
                 push!(non_relay, eq)
                 continue
             end

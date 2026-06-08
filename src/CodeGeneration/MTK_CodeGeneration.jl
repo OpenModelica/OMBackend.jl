@@ -1025,7 +1025,13 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   for _s in _condDiscretes
     _s in irreducibleSyms || push!(irreducibleSyms, _s)
   end
-  local (_ifEqRelay_eqs, _ifEqRelay_aliases) = eliminateIfEqRelays(EQUATIONS; preferKeep = _condDiscretes)
+  #= Parameters have no module-global symbolic binding (they live in the local
+     @parameters block and the pars dict), so a relay must never collapse a
+     variable onto one. =#
+  local _paramSyms = OrderedSet{Symbol}(Symbol(name)
+    for (name, (_, sv)) in simCode.stringToSimVarHT
+    if sv.varKind isa SimulationCode.PARAMETER || sv.varKind isa SimulationCode.ARRAY_PARAMETER)
+  local (_ifEqRelay_eqs, _ifEqRelay_aliases) = eliminateIfEqRelays(EQUATIONS; preferKeep = _condDiscretes, paramSyms = _paramSyms)
   EQUATIONS = _ifEqRelay_eqs
   if !isempty(_ifEqRelay_aliases)
     @info "[RELAY] aliases" _ifEqRelay_aliases
