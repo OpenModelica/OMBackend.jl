@@ -1156,12 +1156,19 @@ function resolveAliasInitialValue(diffState, fullEqs, ivMap::Dict)
     end
     local expr = eq.lhs - eq.rhs
     local exprSub = Symbolics.substitute(expr, ivMap)
-    #= Symbolics.substitute returns a wrapped BasicSymbolic constant after a
-       full substitution; unwrap with `Symbolics.value` so `isa Number` holds. =#
+    #= Fast path: plain substitution. =#
     local intercept = Symbolics.value(Symbolics.substitute(exprSub, Dict(diffState => 0)))
     local sumOnePoint = Symbolics.value(Symbolics.substitute(exprSub, Dict(diffState => 1)))
-    local fullyResolvedToNumber = intercept isa Number && sumOnePoint isa Number
-    if !fullyResolvedToNumber
+    if !(intercept isa Number && sumOnePoint isa Number)
+      #= Slow path only when free vars remain: simplify folds a constant-condition
+         `ifelse` (e.g. a pre-evaluated `ifCond` flag) to its taken branch, so the
+         expression collapses to numeric-affine form instead of keeping spurious
+         free branch variables that would block resolution. =#
+      local exprS = Symbolics.simplify(exprSub)
+      intercept = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 0))))
+      sumOnePoint = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 1))))
+    end
+    if !(intercept isa Number && sumOnePoint isa Number)
       continue
     end
     #= Convert to Float64 before arithmetic: pure Rational{Int} subtraction here
@@ -1214,7 +1221,7 @@ function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
 end
 
 "Seed guesses for reduced unknowns by name; overrides only absent or default-0.0 entries."
-function mergeSoftGuesses(reducedSystem, pairs::AbstractVector)
+function mergeSoftGuesses(reducedSystem, pairs::AbstractVector; force::Bool = false)
   isempty(pairs) && return reducedSystem
   local unkByStr = Dict{String, Any}()
   for u in unknowns(reducedSystem)
@@ -1234,7 +1241,7 @@ function mergeSoftGuesses(reducedSystem, pairs::AbstractVector)
     end
     #= guesses values may be Num-wrapped; unwrap before the default-0.0 test =#
     local curv = cur === nothing ? nothing : Symbolics.value(cur)
-    if curv === nothing || (curv isa Number && iszero(curv))
+    if force || curv === nothing || (curv isa Number && iszero(curv))
       for k in collect(keys(gs))
         replace(string(k), "(t)" => "") == nm && delete!(gs, k)
       end
@@ -1249,13 +1256,17 @@ end
 
 function splitInitialValues(reducedSystem,
                             finalInitialValues::Vector{<:Pair{Symbolics.Num}},
-                            allInitialValues::Vector{<:Pair})
+                            allInitialValues::Vector{<:Pair},
+                            pars::AbstractDict = Dict{Any, Any}())
   return splitInitialValues(reducedSystem,
                             Pair{Any, Any}[p for p in finalInitialValues],
-                            Pair{Any, Any}[p for p in allInitialValues])
+                            Pair{Any, Any}[p for p in allInitialValues],
+                            pars)
 end
 
-function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, allInitialValues::AbstractVector = Pair[])
+function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
+                            allInitialValues::AbstractVector = Pair[],
+                            pars::AbstractDict = Dict{Any, Any}())
   local massMatrix = ModelingToolkit.calculate_massmatrix(reducedSystem)
   local reducedUnks = unknowns(reducedSystem)
   #= Identity mass matrix means pure ODE: all states are differential =#
@@ -1420,6 +1431,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
       @debug "[MTK GEN: init] Resolved $(unk) to $(resolved) via equation alias"
     end
   end
+  local _defaulted0Starts = String[]
   for diffState in diffStateSet
     if !(string(diffState) in hardSymStrSet)
       local diffStateStr = string(diffState)
@@ -1445,6 +1457,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
            This gives MTK an initial iterate. If algebraic constraints determine the
            value, MTK can override the guess during initialization. =#
         push!(softInitialValues, diffState => 0.0)
+        push!(_defaulted0Starts, diffStateStr)
         local currentGuesses2 = ModelingToolkit.guesses(reducedSystem)
         local newGuesses2 = merge(currentGuesses2, Dict(diffState => 0.0))
         @set! reducedSystem.guesses = newGuesses2
@@ -1470,10 +1483,57 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector, a
     local fallbackGuesses = Dict{Any, Any}(unk => 0.0 for unk in missingUnks)
     local currentGuesses3 = ModelingToolkit.guesses(reducedSystem)
     @set! reducedSystem.guesses = merge(currentGuesses3, fallbackGuesses)
+    append!(_defaulted0Starts, [string(u) for u in missingUnks])
     @debug "[MTK GEN: init] Providing default 0.0 guesses for $(length(missingUnks)) uncovered unknowns: $(join([string(u) for u in missingUnks], ", "))"
   end
   local totalGuesses = length(softInitialValues) + length(missingUnks)
   @debug "[MTK GEN: init] ODEProblem: DAE, $(length(hardInitialValues)) hard u0 (differential), $(totalGuesses) as guesses (algebraic), $(length(reducedUnks)) unknowns ($(length(diffStateSet)) differential)"
+  if OMBackend.WARN_MISSING_START_VALUES[] && !isempty(_defaulted0Starts)
+    local _u = sort!(unique(_defaulted0Starts))
+    local _shown = _u[1:min(end, 30)]
+    @warn "[MTK GEN: init] Defaulted $(length(_u)) unknown(s) to a 0.0 start/guess (no explicit start). A wrong 0.0 here can make the DAE-init residual NaN: " *
+          join(_shown, ", ") * (length(_u) > 30 ? ", ... (+$(length(_u) - 30) more)" : "")
+  end
+  #= Propagate non-zero initial guesses. A unknown that defaulted to a 0.0 guess
+     (no explicit start) whose true init value is set by the equations (e.g. a
+     pump speed driven by a source's offset) makes the DAE-init residual NaN via
+     downstream divisions. Seed with parameters + t0 + hard u0, then resolve the
+     0.0-guessed unknowns from their defining equations in fixed-point order; a
+     target resolves only when every other variable in some equation is already
+     known, so the chain (ramp output -> speed -> flow) resolves correctly and
+     coupled/nonlinear equations are skipped until their operands are known.
+     mergeSoftGuesses overrides only 0.0 guesses, so non-zero results replace the
+     bad defaults while genuine 0.0 starts are untouched. =#
+  if !isempty(pars)
+    local _eqsR = vcat(ModelingToolkit.equations(reducedSystem), ModelingToolkit.observed(reducedSystem))
+    local _seed = Dict{Any, Any}(ModelingToolkit.get_iv(reducedSystem) => 0.0)
+    for (k, v) in pars; _seed[k] = v; end
+    for p in hardInitialValues; _seed[p.first] = p.second; end
+    local _targets = Any[k for (k, v) in ModelingToolkit.guesses(reducedSystem)
+                         if (Symbolics.value(v) isa Number && iszero(Symbolics.value(v)))]
+    local _resolved = Dict{Any, Float64}()
+    for _round in 1:6
+      local _progress = false
+      for X in _targets
+        haskey(_resolved, X) && continue
+        local _ivm = Dict{Any, Any}(_seed)
+        for (k, v) in _resolved; _ivm[k] = v; end
+        delete!(_ivm, X)
+        local _rv = resolveAliasInitialValue(X, _eqsR, _ivm)
+        if _rv !== nothing && isfinite(_rv)
+          _resolved[X] = _rv; _progress = true
+        end
+      end
+      _progress || break
+    end
+    if !isempty(_resolved)
+      reducedSystem = mergeSoftGuesses(reducedSystem, Pair{Any, Any}[k => v for (k, v) in _resolved])
+      @info "[MTK GEN: init] PROPAGATED $(length(_resolved)) init guesses: " *
+            join([string(replace(string(k), "(t)" => ""), "=", round(v; digits=4)) for (k, v) in _resolved], ", ")
+    else
+      @info "[MTK GEN: init] propagation resolved nothing (targets=$(length(_targets)), pars=$(length(pars)))"
+    end
+  end
   return (reducedSystem, hardInitialValues)
 end
 

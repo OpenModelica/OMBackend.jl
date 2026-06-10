@@ -497,6 +497,18 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
         end
         SimulationCode.logSimCodePassMetrics("observedFilter", observedBefore, simCode, time() - observedT0)
         simCode = SimulationCode.cleanupTrivialResidualEquations(simCode; sourcePass = "observedFilter")
+        #= Companion pre-memory for self-scheduling time-event discretes
+           (CombiTimeTable nextTimeEventScaled): rewrite residual `pre(x)` to a
+           companion discrete the callback maintains, so the table runtime reads
+           the held segment boundary instead of the bare (current) value. =#
+        simCode = SimulationCode.runSimCodePass("addSelfSchedulingPreMemory", simCode,
+                                                SimulationCode.addSelfSchedulingPreMemory)
+        #= Forward-propagate initialization values through the causalized equations
+           (time=0 + params + starts -> source/ramp -> dependent flow/pressure),
+           attaching resolved values as start attributes so the init solver starts
+           from a finite, consistent iterate instead of a 0.0 that divides by zero. =#
+        simCode = SimulationCode.runSimCodePass("propagateInitialValues", simCode,
+                                                SimulationCode.propagateInitialValues)
         #= Re-derive SCCs against the residual array MTK will actually see.
            The SCC stamp written by transformToSimCode indexes into the
            pre-pipeline residual list and is stale after alias-elim,
@@ -730,6 +742,9 @@ function generateTargetCode(simCode::SimulationCode.SIM_CODE)
   return (modelName, modelCode)
 end
 
+#= Final SimCode of the most recent codegen, for interactive inspection. =#
+const LAST_SIM_CODE = Ref{Any}(nothing)
+
 """
 `generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)`
   Generates code interfacing ModelingToolkit.jl
@@ -737,6 +752,7 @@ end
   this session. Returns the generated modelName and corresponding generated code
 """
 function generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)
+  LAST_SIM_CODE[] = simCode
   #= Target code =#
   (modelName::String, modelCode::Expr) = CodeGeneration.generateMTKCode(simCode)
   local codeHash = hash(modelCode)
@@ -762,6 +778,7 @@ end
 System in the backend and dumps it. Caches into `COMPILED_MODELS_MTK`.
 """
 function generateIMTKTargetCode(simCode::SimulationCode.SIM_CODE)
+  LAST_SIM_CODE[] = simCode
   #= IMTKGen.generateIMTKCode evals the (current) module while building, so the
      loaded module is already fresh: record changeDetected = false so a later
      MTK-mode simulate on this model does not needlessly re-eval the module. =#

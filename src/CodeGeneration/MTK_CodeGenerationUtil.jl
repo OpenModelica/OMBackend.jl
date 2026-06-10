@@ -1875,9 +1875,23 @@ end
    `explicit` collects the symbols whose value came from an actual source
    (parameter, explicit start attribute, init-algorithm result) rather than
    the 0.0 default. =#
+#= One-entry memo: the map is requested once per if-equation branch but only
+   depends on the simCode object, and the forward-evaluation sweep is not free.
+   Fields: (simCode id, valMap, explicit, trusted-derived pairs). =#
+const _T0_MAP_CACHE = Ref{Tuple{UInt, Dict{Symbol, Float64}, Set{Symbol}, Vector{Pair{Symbol, Float64}}}}(
+  (UInt(0), Dict{Symbol, Float64}(), Set{Symbol}(), Pair{Symbol, Float64}[]))
+
 function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{Symbol}}
+  local cached = _T0_MAP_CACHE[]
+  if cached[1] === objectid(simCode)
+    return (copy(cached[2]), copy(cached[3]))
+  end
   local valMap = Dict{Symbol, Float64}()
   local explicit = Set{Symbol}()
+  #= Values safe for hard structural decisions (branch selection): parameters,
+     fixed=true starts, init-algorithm results. Non-fixed starts are guesses
+     and may contradict the actual initial configuration. =#
+  local trusted = Set{Symbol}()
   local ht = simCode.stringToSimVarHT
   for (key, (_, sv)) in ht
     local sym = Symbol(key)
@@ -1902,6 +1916,7 @@ function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{
       if pval !== nothing
         valMap[sym] = pval
         push!(explicit, sym)
+        push!(trusted, sym)
       end
     elseif SimulationCode.isStateOrAlgebraic(sv)
       local sval = 0.0
@@ -1910,6 +1925,10 @@ function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{
         @match SOME(startExp) = attr.start
         sval = Float64(evalDAEConstant(startExp, simCode))
         push!(explicit, sym)
+        @match attr.fixed begin
+          SOME(DAE.BCONST(true)) => push!(trusted, sym)
+          _ => nothing
+        end
       catch
       end
       valMap[sym] = sval
@@ -1920,9 +1939,35 @@ function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{
   for (k, v) in valMap
     if !haskey(preSeed, k) || preSeed[k] != v
       push!(explicit, k)
+      push!(trusted, k)
     end
   end
+  #= Trusted-first sweep: deterministic consequences of trusted data override
+     guess-grade start values in the map, so branch decisions never read a
+     value contradicted by the fixed initial configuration. =#
+  local trustedBase = copy(trusted)
+  local trustedMap = Dict{Symbol, Float64}(k => valMap[k] for k in trusted if haskey(valMap, k))
+  _forwardEvalT0!(trustedMap, trusted, simCode)
+  local trustedDerived = Pair{Symbol, Float64}[k => trustedMap[k] for k in trusted
+                                               if !(k in trustedBase) && haskey(trustedMap, k)]
+  for (k, v) in trustedMap
+    valMap[k] = v
+    push!(explicit, k)
+  end
+  _forwardEvalT0!(valMap, explicit, simCode)
+  _T0_MAP_CACHE[] = (objectid(simCode), copy(valMap), copy(explicit), trustedDerived)
   return (valMap, explicit)
+end
+
+#= Trusted-derived t0 values (deterministic consequences of parameters and
+   fixed=true starts). Used to override guess-grade init values at build time. =#
+function buildT0TrustedDerivedPairs(simCode)::Vector{Pair{Symbol, Float64}}
+  local cached = _T0_MAP_CACHE[]
+  if cached[1] === objectid(simCode)
+    return copy(cached[4])
+  end
+  _buildT0ValueMapAndExplicit(simCode)
+  return copy(_T0_MAP_CACHE[][4])
 end
 
 _buildT0ValueMap(simCode)::Dict{Symbol, Float64} = first(_buildT0ValueMapAndExplicit(simCode))
@@ -1944,6 +1989,19 @@ function _exprSymbolsExplicit(e, explicit::Set{Symbol})::Bool
   return true
 end
 
+#= Whole Float64 literals in index position fault plain numeric evaluation
+   (the lowering emits `x[3.0]`); convert them to Int literals. =#
+_intifyFloatIndices(x) = x
+function _intifyFloatIndices(x::Expr)
+  local newArgs = if x.head == :ref && length(x.args) >= 2
+    vcat(Any[_intifyFloatIndices(x.args[1])],
+         Any[(i isa Float64 && isinteger(i)) ? Int(i) : _intifyFloatIndices(i) for i in x.args[2:end]])
+  else
+    Any[_intifyFloatIndices(a) for a in x.args]
+  end
+  return Expr(x.head, newArgs...)
+end
+
 #= Evaluate a causalized branch RHS at the t0 value map. Returns nothing when
    the expression is not statically evaluable, or when it references any
    non-explicit (0.0-defaulted) variable: a seed contaminated by defaults can
@@ -1955,8 +2013,10 @@ function evalCausalRHSAtT0(rhsExpr, valMap::Dict{Symbol, Float64},
   end
   _exprSymbolsExplicit(rhsExpr, explicit) || return nothing
   try
-    local numExpr = _substituteExprValues(rhsExpr, valMap)
-    local result = eval(numExpr)
+    local numExpr = _intifyFloatIndices(_substituteExprValues(rhsExpr, valMap))
+    #= Generated Modelica function bindings live in the parent CodeGeneration
+       module (Phase A evals them there), not in this submodule. =#
+    local result = Core.eval(parentmodule(@__MODULE__), numExpr)
     local numResult = if result isa Number
       Float64(result)
     else
@@ -1971,6 +2031,93 @@ function evalCausalRHSAtT0(rhsExpr, valMap::Dict{Symbol, Float64},
   catch
     return nothing
   end
+end
+
+_t0ContainsDer(x) = false
+function _t0ContainsDer(x::Expr)
+  if x.head == :call && !isempty(x.args) && (x.args[1] === :der || x.args[1] === :D)
+    return true
+  end
+  return any(_t0ContainsDer, x.args)
+end
+
+#= Forward-evaluate explicitly causal residuals (`0 = cref - rhs`) at t0 to
+   extend the value map through chains the start attributes do not cover
+   (frame positions, guarded line-force lengths). Operands must already be
+   explicit, so defaulted values never contaminate a filled-in entry. =#
+function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, simCode)
+  if ccall(:jl_generating_output, Cint, ()) != 0
+    return
+  end
+  local loweredCache = IdDict{Any, Any}()
+  local mkPair = function (rawExp)
+    local dae = try
+      rawExp isa DAE.Exp ? rawExp : SimulationCode.toDAEExp(rawExp)
+    catch
+      return nothing
+    end
+    local arm = @match dae begin
+      DAE.BINARY(DAE.CREF(cr, _), DAE.SUB(__), rhs) => (cr, rhs)
+      _ => nothing
+    end
+    arm === nothing && return nothing
+    local (cr, rhsDAE) = arm
+    local nm = try SimulationCode.DAE_identifierToString(cr) catch; nothing end
+    nm === nothing && return nothing
+    local tgt = Symbol(nm)
+    (tgt in explicit) && return nothing
+    local rhsExpr = get!(loweredCache, rhsDAE) do
+      try
+        expToJuliaExpMTK(rhsDAE, simCode)
+      catch
+        :__t0_lower_failed
+      end
+    end
+    rhsExpr === :__t0_lower_failed && return nothing
+    _t0ContainsDer(rhsExpr) && return nothing
+    return (tgt, rhsExpr)
+  end
+  #= Outer rounds re-select if-equation branches as the value map grows: a
+     branch whose condition depends on derived values only becomes decidable
+     after the residual sweep has filled them. =#
+  for _outer in 1:3
+    local pairs = Tuple{Symbol, Any}[]
+    for eq in simCode.residualEquations
+      local p = mkPair(eq.exp)
+      p === nothing || push!(pairs, p)
+    end
+    local envStr = Dict{String, Float64}(string(k) => valMap[k] for k in explicit if haskey(valMap, k))
+    for ifEq in simCode.ifEquations
+      local br = try
+        SimulationCode._selectActiveInitBranch(ifEq, envStr)
+      catch
+        nothing
+      end
+      br === nothing && continue
+      for req in br.residualEquations
+        local p = mkPair(req.exp)
+        p === nothing || push!(pairs, p)
+      end
+    end
+    local outerProgressed = false
+    local progressed = true
+    local rounds = 0
+    while progressed && rounds < 20
+      progressed = false
+      rounds += 1
+      for (tgt, rhsExpr) in pairs
+        (tgt in explicit) && continue
+        local v = evalCausalRHSAtT0(rhsExpr, valMap, explicit)
+        v === nothing && continue
+        valMap[tgt] = v
+        push!(explicit, tgt)
+        progressed = true
+        outerProgressed = true
+      end
+    end
+    outerProgressed || break
+  end
+  return
 end
 
 function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool = false)

@@ -237,9 +237,10 @@ modelica_ones(dims...) = ones(Float64, dims...)
     modelica_fill(s, dims...)
 
 Modelica: fill(s, n1, n2, ...) returns an array filled with value s.
-Julia: fill(s, dims...) is identical.
+Julia: fill(s, dims...) is identical. Dimensions are integers in Modelica;
+coerce numeric dims so Real-typed dimension expressions do not fault.
 """
-modelica_fill(s, dims...) = fill(s, dims...)
+modelica_fill(s, dims...) = fill(s, map(d -> d isa Integer ? d : Int(round(d)), dims)...)
 
 """
     modelica_linspace(x1, x2, n)

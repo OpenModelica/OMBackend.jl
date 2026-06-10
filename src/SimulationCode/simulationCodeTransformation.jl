@@ -760,13 +760,65 @@ function _algorithmStmtToResidual!(target::Vector{BDAE.RESIDUAL_EQUATION},
   #= STMT_IF / STMT_FOR / STMT_WHILE not yet lowered. =#
 end
 
-#= Per Modelica spec, only `when initial() then ...` and `when {..., initial(), ...} then ...`
-   activate the body during initialization. Compound forms like `when not initial()` or
-   `when (initial() or x>5)` keep their runtime-event semantics. =#
-function _isBareInitialCondition(cond::DAE.Exp)::Bool
+#= True when the condition's only trigger is `initial()`: a bare `initial()` call
+   or an array whose every element reduces to `initial()`. Such a when activates
+   solely at initialization. =#
+function _isPureInitialCondition(cond::DAE.Exp)::Bool
   @match cond begin
     DAE.CALL(Absyn.IDENT("initial"), _, _) => true
-    DAE.ARRAY(_, _, lst) => any(_isBareInitialCondition, collect(lst))
+    DAE.ARRAY(_, _, lst) => (!isempty(lst) && all(_isPureInitialCondition, collect(lst)))
+    _ => false
+  end
+end
+
+#= True when an array-form condition carries an `initial()` trigger alongside at
+   least one non-initial (runtime) trigger, i.e. `when {c1, ..., initial()}`. Per
+   Modelica this is `when (c1 or ... or initial())`: the body runs at init AND on
+   the runtime triggers. =#
+function _hasMixedInitialCondition(cond::DAE.Exp)::Bool
+  @match cond begin
+    DAE.ARRAY(_, _, lst) => begin
+      local elts = collect(lst)
+      any(_isPureInitialCondition, elts) && !all(_isPureInitialCondition, elts)
+    end
+    _ => false
+  end
+end
+
+#= Drop the `initial()` triggers from an array-form condition, returning the
+   residual runtime trigger: the lone relation if one remains, otherwise an
+   OR-chain over the survivors. =#
+function _stripInitialTriggers(cond::DAE.Exp)::Union{DAE.Exp, Nothing}
+  @match cond begin
+    DAE.ARRAY(_, _, lst) => begin
+      local rest = filter(e -> !_isPureInitialCondition(e), collect(lst))
+      isempty(rest) ? nothing :
+        foldl((a, b) -> DAE.LBINARY(a, DAE.OR(DAE.T_BOOL_DEFAULT), b), rest)
+    end
+    _ => cond
+  end
+end
+
+_isTimeCrefDAE(@nospecialize(e))::Bool = @match e begin
+  DAE.CREF(componentRef = cr) => string(cr) == "time"
+  _ => false
+end
+
+_isPreCallDAE(@nospecialize(e))::Bool = @match e begin
+  DAE.CALL(Absyn.IDENT("pre"), _, _) => true
+  _ => false
+end
+
+#= True when the condition self-schedules off `time` and a `pre()` value: a
+   `time <relop> pre(x)` relation, or an OR-chain containing one. The
+   CombiTimeTable time event `time >= pre(nextTimeEvent)` is this shape; such
+   whens reach MTK via createSelfSchedulingTimeWhenEvents. =#
+function _condHasTimeAndPre(@nospecialize(cond))::Bool
+  @match cond begin
+    DAE.RELATION(exp1 = e1, exp2 = e2) =>
+      (_isTimeCrefDAE(e1) || _isTimeCrefDAE(e2)) && (_isPreCallDAE(e1) || _isPreCallDAE(e2))
+    DAE.LBINARY(exp1 = a, operator = DAE.OR(__), exp2 = b) =>
+      (_condHasTimeAndPre(a) || _condHasTimeAndPre(b))
     _ => false
   end
 end
@@ -774,18 +826,30 @@ end
 """
     extractInitialWhenAlgorithms(whenEqs) -> (runtimeWhenEqs, initialAlgorithms)
 
-Partition a vector of `BDAE.WHEN_EQUATION`. Entries whose condition is a bare
-`initial()` (or a list containing one) are lowered into `INITIAL_ALGORITHM`
-records and removed from the runtime when-list; the rest pass through.
+Partition a vector of `BDAE.WHEN_EQUATION`. A bare `initial()` when lowers to an
+`INITIAL_ALGORITHM` only. A compound `when {c1, ..., initial()}` additionally
+keeps a runtime when carrying the non-initial triggers. Others pass through.
 """
 function extractInitialWhenAlgorithms(whenEqs::Vector{BDAE.WHEN_EQUATION})::Tuple{Vector{BDAE.WHEN_EQUATION}, Vector{INITIAL_ALGORITHM}}
   local kept = BDAE.WHEN_EQUATION[]
   local initialAlgs = INITIAL_ALGORITHM[]
   for weq in whenEqs
     local cond = weq.whenEquation.condition
-    if _isBareInitialCondition(cond)
+    if _isPureInitialCondition(cond)
       local stmts = collect(weq.whenEquation.whenStmtLst)
       push!(initialAlgs, INITIAL_ALGORITHM(stmts))
+    elseif _hasMixedInitialCondition(cond)
+      local stmts = collect(weq.whenEquation.whenStmtLst)
+      push!(initialAlgs, INITIAL_ALGORITHM(stmts))
+      #= Keep the runtime arm only for a self-scheduling `time >= pre(x)` trigger,
+         which has an MTK callback lowering; other compound-initial whens stay
+         init-only (their prior behaviour). =#
+      local runtimeCond = _stripInitialTriggers(cond)
+      if runtimeCond !== nothing && _condHasTimeAndPre(runtimeCond)
+        local inner = BDAE.WHEN_STMTS(runtimeCond, weq.whenEquation.whenStmtLst,
+                                      weq.whenEquation.elsewhenPart)
+        push!(kept, BDAE.WHEN_EQUATION(weq.size, inner, weq.source, weq.attr))
+      end
     else
       push!(kept, weq)
     end

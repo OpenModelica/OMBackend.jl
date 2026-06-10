@@ -931,6 +931,11 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local IF_EQUATION_COMPONENTS::Vector{IfEquationComponent} =
     createIfEquations(stateVariables, algebraicVariables, simCode)
   local RELAY_GUESS_PAIRS = collect(Iterators.flatten(c.relayGuesses for c in IF_EQUATION_COMPONENTS))
+  #= Deterministic t0 values derived from parameters and fixed=true starts;
+     they override guess-grade init values (wrong guesses near a guarded
+     division start the consistent-IC solve at a blow-up point). =#
+  local TRUSTED_GUESS_PAIRS = Expr[:($(QuoteNode(k)) => $(v)) for (k, v) in
+                                   MTK_CodeGenerationUtil.buildT0TrustedDerivedPairs(simCode)]
   #= Symbolic names =#
   local algebraicVariablesSym = Symbol[:($(Symbol(v))) for v in algebraicVariables]
   local dataStructureVariablesSym = Symbol[Symbol(v) for v in dataStructureVariables]
@@ -965,7 +970,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local IF_EQUATION_EVENTS = collect(Iterators.flatten(c.events for c in IF_EQUATION_COMPONENTS))
   #= Synthesised discrete-Boolean whens become MTK SymbolicContinuousCallbacks
      (observed-variable-capable), appended to the if-equation event vector. =#
-  IF_EQUATION_EVENTS = vcat(IF_EQUATION_EVENTS, createDiscreteBoolWhenEvents(simCode))
+  IF_EQUATION_EVENTS = vcat(IF_EQUATION_EVENTS, createDiscreteBoolWhenEvents(simCode),
+                            createSelfSchedulingTimeWhenEvents(simCode))
   local IF_EQUATION_EVENT_DECLARATION = buildIfEquationEventDecl(IF_EQUATION_EVENTS)
   local CONDITIONAL_EQUATIONS = collect(Iterators.flatten(c.conditionalEquations for c in IF_EQUATION_COMPONENTS))
   local ifConditionNameAndIV = collect(Iterators.flatten(c.conditionNameAndIV for c in IF_EQUATION_COMPONENTS))
@@ -1272,9 +1278,11 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       local _finalInitialValuesForSplit = Pair{Any, Any}[p for p in finalInitialValues]
       local _initialValuesForSplit = Pair{Any, Any}[p for p in initialValues]
       (reducedSystem, finalInitialValues) = Base.invokelatest(
-        OMBackend.CodeGeneration.splitInitialValues, reducedSystem, _finalInitialValuesForSplit, _initialValuesForSplit)
+        OMBackend.CodeGeneration.splitInitialValues, reducedSystem, _finalInitialValuesForSplit, _initialValuesForSplit, pars)
       reducedSystem = Base.invokelatest(OMBackend.CodeGeneration.mergeSoftGuesses,
         reducedSystem, Pair{Any, Any}[$(RELAY_GUESS_PAIRS...)])
+      reducedSystem = Base.invokelatest(OMBackend.CodeGeneration.mergeSoftGuesses,
+        reducedSystem, Pair{Any, Any}[$(TRUSTED_GUESS_PAIRS...)]; force = true)
       #= Build ODEProblem. The codegen-time strategy (DirectRHS / structural
          transition / standard DAE-with-init-solver) is picked here; the
          structural-transition branch additionally dispatches at runtime on
@@ -2860,6 +2868,10 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
         :(integrator.t)
       elseif haskey(subst, nm)
         subst[nm]
+      elseif haskey(simCode.stringToSimVarHT, string(cr)) &&
+             simCode.stringToSimVarHT[string(cr)][2].varKind isa SimulationCode.DATA_STRUCTURE
+        #= module-global table handle (DATA_STRUCTURE), referenced by bare name =#
+        Symbol(string(cr))
       else
         obsAcc[nm] = nm
         :(observed.$(nm))
@@ -2890,6 +2902,11 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
       :(OMBackend.CodeGeneration.constTableLookup($(expToJuliaExpMTK(tableExp, simCode)), $(subCodes...)))
     end
     DAE.ARRAY(__) => expToJuliaExpMTK(exp, simCode)
+    #= External / qualified Modelica function (e.g. CombiTimeTable
+       Internal.getNextTimeEvent): mirror the residual's name resolution
+       (canonicalName -> underscore form), args lowered imperatively. =#
+    DAE.CALL(path = p, expLst = cargs) =>
+      Expr(:call, Symbol(OMBackend.canonicalName(string(p))), (rec(a) for a in cargs)...)
     _ => error("_daeExpToJuliaMem: unsupported in pre-memory affect: $(exp)")
   end
 end
@@ -3031,6 +3048,110 @@ function _collectPreMemClusters(simCode)::Vector{Vector{Tuple{Symbol,Any,Bool}}}
     push!(out, assigns)
   end
   return out
+end
+
+#= Collect relations comparing `time` against a `pre()` value (a self-scheduling
+   time event), recursing through OR. =#
+function _collectSelfSchedRels!(rels::Vector{DAE.Exp}, @nospecialize(e))
+  @match e begin
+    DAE.RELATION(exp1 = e1, exp2 = e2) => begin
+      if (_isTimeCref(e1) || _isTimeCref(e2)) && (_isPreCref(e1) || _isPreCref(e2))
+        push!(rels, e)
+      end
+      nothing
+    end
+    DAE.LBINARY(exp1 = a, operator = DAE.OR(__), exp2 = b) => begin
+      _collectSelfSchedRels!(rels, a)
+      _collectSelfSchedRels!(rels, b)
+      nothing
+    end
+    _ => nothing
+  end
+  return nothing
+end
+
+function _selfSchedulingTimeRels(@nospecialize(cond))
+  local d = cond isa SimulationCode.Exp ? SimulationCode.toDAEExp(cond) : cond
+  local rels = DAE.Exp[]
+  _collectSelfSchedRels!(rels, d)
+  return rels
+end
+
+#= Build (functionExpr, observedNT, modifiedNT) for the ImperativeAffect of a
+   self-scheduling time-event when. Each ASSIGN `x := rhs` is recomputed
+   imperatively (rhs lowered via `_daeExpToJuliaMem`: time->integrator.t,
+   table handle->module global, external call->resolved). A companion
+   `x_preMem` (addSelfSchedulingPreMemory) captures x's value at callback entry
+   so the table residual's pre(x) reads the held segment boundary. `atInit`
+   lowers `initial()` to true for the initialize affect. =#
+Base.@nospecializeinfer function _selfSchedAffectParts(weq, simCode; atInit::Bool = false)
+  local obsAcc = Dict{Symbol,Symbol}()
+  local stmts = Expr[]
+  local retKws = Expr[]
+  local modNames = Symbol[]
+  local subst = Dict{Symbol,Any}()
+  for st in collect(weq.whenEquation.whenStmtLst)
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+    local lhsDAE = SimulationCode.toDAEExp(st.left)
+    lhsDAE isa DAE.CREF || continue
+    local xn = string(lhsDAE.componentRef)
+    local xsym = Symbol(xn)
+    local pm = xn * "_preMem"
+    if haskey(simCode.stringToSimVarHT, pm)
+      local pmv = Symbol("_pm_", xn)
+      push!(stmts, :(local $(pmv) = modified.$(xsym)))
+      push!(retKws, Expr(:kw, Symbol(pm), pmv))
+      push!(modNames, Symbol(pm))
+    end
+    local vsym = Symbol("_v_", xn)
+    local rhsJ = _daeExpToJuliaMem(SimulationCode.toDAEExp(st.right), obsAcc, simCode;
+                                   initVal = atInit, subst = subst)
+    push!(stmts, :(local $(vsym) = $(rhsJ)))
+    push!(retKws, Expr(:kw, xsym, vsym))
+    push!(modNames, xsym)
+    subst[xsym] = vsym
+  end
+  local retNT = Expr(:tuple, Expr(:parameters, retKws...))
+  local fexpr = :((modified, observed, ctx, integrator) -> begin
+                    $(stmts...)
+                    $(retNT)
+                  end)
+  local obsNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, k, v) for (k, v) in obsAcc]...))
+  local modNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, d, d) for d in modNames]...))
+  return (fexpr, obsNT, modNT)
+end
+
+#= MTK SymbolicContinuousCallbacks for self-scheduling time-event whens. The
+   crossing `time - nextTimeEvent` fires when time reaches the held discrete; an
+   ImperativeAffect re-runs the body (updates only integrator.u, never an
+   AffectSystem, so it does not pull the table-fed continuous network into an
+   unsolvable callback). =#
+function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
+  local events = Expr[]
+  for weq in simCode.whenEquations
+    local rels = _selfSchedulingTimeRels(weq.whenEquation.condition)
+    isempty(rels) && continue
+    local (fn, obs, modN) = _selfSchedAffectParts(weq, simCode; atInit = false)
+    isempty(modN.args[1].args) && continue
+    local (fnI, obsI, modI) = _selfSchedAffectParts(weq, simCode; atInit = true)
+    for rel in rels
+      #= transformToMTKContinousCondition emits `pre(nextTimeEvent) - time` for
+         `time >= pre(nextTimeEvent)`, which falls through zero as time reaches
+         the event. Negate so the crossing RISES through zero exactly when the
+         Modelica condition becomes true (the when's rising edge), and fire only
+         on that positive edge (affect_neg = nothing). A monotone time event is
+         one-directional, so a single edge is correct and avoids double-firing. =#
+      local zc = transformToMTKContinousCondition(rel, simCode)
+      push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+        (-($(zc)) ~ 0),
+        ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs));
+        affect_neg = nothing,
+        initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI)),
+        rootfind = SciMLBase.RightRootFind,
+        reinitializealg = SciMLBase.NoInit())))
+    end
+  end
+  return events
 end
 
 function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}

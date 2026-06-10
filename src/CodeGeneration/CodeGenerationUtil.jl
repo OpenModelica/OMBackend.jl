@@ -1047,6 +1047,14 @@ function _substituteExprValues(expr, valMap::Dict{Symbol, Float64})
     end
     return Expr(:call, newArgs...)
   end
+  #= Broadcast call `f.(args)`: the callee position is code, not a variable. =#
+  if expr.head == :. && length(expr.args) == 2 && expr.args[2] isa Expr && expr.args[2].head == :tuple
+    return Expr(:., expr.args[1], _substituteExprValues(expr.args[2], valMap))
+  end
+  #= Qualified name `A.b`: not a variable reference. =#
+  if expr.head == :. && length(expr.args) == 2 && expr.args[2] isa QuoteNode
+    return expr
+  end
   #= Generic recursion for other Expr types =#
   local newExpr = Expr(expr.head)
   for arg in expr.args

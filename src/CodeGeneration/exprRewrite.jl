@@ -25,6 +25,23 @@ end
 findDerivativeVar(x) = nothing
 
 """
+Collect all distinct `:(der(x))` / `:(D(x))` argument exprs in an Expr tree.
+"""
+function findAllDerivativeVars!(found::Vector{Any}, expr::Expr)
+    if expr.head == :call && length(expr.args) >= 2 &&
+       (expr.args[1] === :der || expr.args[1] === :D)
+        any(v -> v == expr.args[2], found) || push!(found, expr.args[2])
+        return found
+    end
+    for a in expr.args
+        findAllDerivativeVars!(found, a)
+    end
+    return found
+end
+
+findAllDerivativeVars!(found::Vector{Any}, x) = found
+
+"""
 Replace `:(der(var))` with `val` throughout an Expr tree. Returns a new Expr.
 """
 function substituteDer(expr::Expr, var, val)
@@ -48,10 +65,18 @@ function moveDerivativeToLHS(eq_expr::Expr)
         return eq_expr
     end
     rhs = eq_expr.args[3]
-    der_var = findDerivativeVar(rhs isa Expr ? rhs : Expr(:block, rhs))
-    if der_var === nothing
+    local derVars = findAllDerivativeVars!(Any[], rhs isa Expr ? rhs : Expr(:block, rhs))
+    if isempty(derVars)
         return eq_expr
     end
+    #= The affine isolation below is only well-posed for a single derivative
+       variable; with several, the solve target is ambiguous and a derivative
+       that does not affect the residual yields a zero coefficient. Keep the
+       residual implicit and let structural simplification handle it. =#
+    if length(derVars) > 1
+        return eq_expr
+    end
+    der_var = derVars[1]
     rest  = rhs isa Expr ? substituteDer(rhs, der_var, 0) : rhs
     atOne = rhs isa Expr ? substituteDer(rhs, der_var, 1) : rhs
     coeff = Expr(:call, :-, atOne, rest)
