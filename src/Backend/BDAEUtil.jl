@@ -34,7 +34,7 @@ module BDAEUtil
 using ExportAll
 using MetaModelica
 using Setfield
-using DataStructures: OrderedSet
+using DataStructures: OrderedDict, OrderedSet
 
 import ..BDAE
 import ..BackendEquation
@@ -168,6 +168,27 @@ function mapEqSystemVariablesNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::F
   return extArg
 end
 
+"Type of the innermost (leaf) identifier of a component reference."
+function crefLeafType(@nospecialize(cref))
+  @match cref begin
+    DAE.CREF_IDENT(_, ty, _) => ty
+    DAE.CREF_QUAL(_, _, _, cr) => crefLeafType(cr)
+    _ => DAE.T_UNKNOWN_DEFAULT
+  end
+end
+
+function _traverseComponentRef(@nospecialize(cref::DAE.ComponentRef),
+                               traversalOperation::Function,
+                               extArg)
+  local exp = DAE.CREF(cref, crefLeafType(cref))
+  local newExp
+  (newExp, extArg) = Util.traverseExpTopDown(exp, traversalOperation, extArg)
+  if newExp isa DAE.CREF
+    return (newExp.componentRef, extArg)
+  end
+  return (cref, extArg)
+end
+
 """
   Traverse a given equation using a traversalOperation.
   Mutates the given equation.
@@ -190,8 +211,12 @@ Base.@nospecializeinfer function traverseEquationExpressions(@nospecialize(eq::B
          (eq, extArg)
        end
        BDAE.SOLVED_EQUATION(componentRef = cref, exp = rhs) => begin
+         (cref, extArg) = _traverseComponentRef(cref, traversalOperation, extArg)
          (rhs, extArg) = Util.traverseExpTopDown(rhs, traversalOperation, extArg)
-         @assign eq.rhs = rhs;
+         @assign begin
+           eq.componentRef = cref
+           eq.exp = rhs
+         end
          (eq, extArg)
        end
        BDAE.RESIDUAL_EQUATION(exp = rhs) => begin
@@ -251,6 +276,22 @@ Base.@nospecializeinfer function traverseEquationExpressions(@nospecialize(eq::B
          #= TODO: Handle elsewhen =#
          (eq, extArg)
        end
+       BDAE.INITIAL_WHEN_EQUATION(__) => begin
+         local whenEquation = eq.whenEquation
+         (newCond, extArg) = Util.traverseExpTopDown(whenEquation.condition, traversalOperation, extArg)
+         @assign eq.whenEquation.condition = newCond
+         lst = traverseWhenEquation!(whenEquation, traversalOperation, extArg)
+         @assign eq.whenEquation.whenStmtLst = lst
+         (eq, extArg)
+       end
+       BDAE.STRUCTURAL_WHEN_EQUATION(__) => begin
+         local whenEquation = eq.whenEquation
+         (newCond, extArg) = Util.traverseExpTopDown(whenEquation.condition, traversalOperation, extArg)
+         @assign eq.whenEquation.condition = newCond
+         lst = traverseWhenEquation!(whenEquation, traversalOperation, extArg)
+         @assign eq.whenEquation.whenStmtLst = lst
+         (eq, extArg)
+       end
        BDAE.ARRAY_EQUATION(left = lhs, right = rhs) => begin
          (newLhs, extArg) = Util.traverseExpTopDown(lhs, traversalOperation, extArg)
          (newRhs, extArg) = Util.traverseExpTopDown(rhs, traversalOperation, extArg)
@@ -258,6 +299,63 @@ Base.@nospecializeinfer function traverseEquationExpressions(@nospecialize(eq::B
            eq.left = newLhs
            eq.right = newRhs
          end
+         (eq, extArg)
+       end
+       BDAE.COMPLEX_EQUATION(left = lhs, right = rhs) => begin
+         (newLhs, extArg) = Util.traverseExpTopDown(lhs, traversalOperation, extArg)
+         (newRhs, extArg) = Util.traverseExpTopDown(rhs, traversalOperation, extArg)
+         @assign begin
+           eq.left = newLhs
+           eq.right = newRhs
+         end
+         (eq, extArg)
+       end
+       BDAE.FOR_EQUATION(__) => begin
+         local iter = eq.iter
+         local start = eq.start
+         local stop = eq.stop
+         local body = eq.body
+         (iter, extArg) = Util.traverseExpTopDown(iter, traversalOperation, extArg)
+         (start, extArg) = Util.traverseExpTopDown(start, traversalOperation, extArg)
+         (stop, extArg) = Util.traverseExpTopDown(stop, traversalOperation, extArg)
+         (body, extArg) = traverseEquationExpressions(body, traversalOperation, extArg)
+         @assign begin
+           eq.iter = iter
+           eq.start = start
+           eq.stop = stop
+           eq.body = body
+         end
+         (eq, extArg)
+       end
+       BDAE.ASSERT_EQUATION(__) => begin
+         local condition = eq.condition
+         local message = eq.message
+         local level = eq.level
+         (condition, extArg) = Util.traverseExpTopDown(condition, traversalOperation, extArg)
+         (message, extArg) = Util.traverseExpTopDown(message, traversalOperation, extArg)
+         (level, extArg) = Util.traverseExpTopDown(level, traversalOperation, extArg)
+         @assign begin
+           eq.condition = condition
+           eq.message = message
+           eq.level = level
+         end
+         (eq, extArg)
+       end
+       BDAE.BRANCH(__) => begin
+         local ar = eq.ar
+         local br = eq.br
+         (ar, extArg) = Util.traverseExpTopDown(ar, traversalOperation, extArg)
+         (br, extArg) = Util.traverseExpTopDown(br, traversalOperation, extArg)
+         @assign begin
+           eq.ar = ar
+           eq.br = br
+         end
+         (eq, extArg)
+       end
+       BDAE.STRUCTURAL_TRANSISTION(__) => begin
+         local cond = eq.transistionCondition
+         (cond, extArg) = Util.traverseExpTopDown(cond, traversalOperation, extArg)
+         @assign eq.transistionCondition = cond
          (eq, extArg)
        end
        _ => begin
@@ -306,6 +404,31 @@ function traverseWhenEquation!(whenEq, traversalOperation, extArg)
         (lvl, extArg) = Util.traverseExpTopDown(stmt.level, traversalOperation, extArg)
         newStmt = (cond === stmt.condition && msg === stmt.message && lvl === stmt.level) ?
                     stmt : BDAE.ASSERT(cond, msg, lvl, stmt.source)
+        newWhenStmtLst = newStmt <| newWhenStmtLst
+      end
+      BDAE.RECOMPILATION(__) => begin
+        (componentToChange, extArg) = Util.traverseExpTopDown(stmt.componentToChange, traversalOperation, extArg)
+        (newValue, extArg) = Util.traverseExpTopDown(stmt.newValue, traversalOperation, extArg)
+        componentToChange = componentToChange isa DAE.CREF ? componentToChange : stmt.componentToChange
+        newStmt = (componentToChange === stmt.componentToChange && newValue === stmt.newValue) ?
+                    stmt : BDAE.RECOMPILATION(componentToChange, newValue)
+        newWhenStmtLst = newStmt <| newWhenStmtLst
+      end
+      BDAE.AGENTIC_RECOMPILATION(__) => begin
+        local components = DAE.CREF[]
+        local changed = false
+        for component in stmt.componentsToChange
+          local newComponent
+          (newComponent, extArg) = Util.traverseExpTopDown(component, traversalOperation, extArg)
+          if newComponent isa DAE.CREF
+            push!(components, newComponent)
+            changed |= !(newComponent === component)
+          else
+            push!(components, component)
+          end
+        end
+        newStmt = changed ?
+          BDAE.AGENTIC_RECOMPILATION(components, stmt.prompt, stmt.initialEquations) : stmt
         newWhenStmtLst = newStmt <| newWhenStmtLst
       end
       _ => begin
@@ -458,18 +581,57 @@ function getAllVariables(eq::BDAE.RESIDUAL_EQUATION, vars::Vector{BDAE.VAR})::Ve
   return variablesInEq
 end
 
+"Name-keyed variable lookup for the dict-based getAllVariables methods."
+function variablesByName(vars)::OrderedDict{String, BDAE.VAR}
+  local byName = OrderedDict{String, BDAE.VAR}()
+  for v in vars
+    byName[string(v.varName)] = v
+  end
+  return byName
+end
+
+#= Name-keyed variant: iterates the equation's crefs instead of every model
+   variable, so a graph build is O(eq size), not O(eq count x var count).
+   Same selection rule as the vector method: algebraic variables by plain
+   occurrence, states only under der(). =#
+function getAllVariables(eq::BDAE.RESIDUAL_EQUATION, varByName::AbstractDict{String, BDAE.VAR})::Vector{DAE.ComponentRef}
+  local stateCrefs = Dict{DAE.ComponentRef, Bool}()
+  (_, stateElements) = traverseEquationExpressions(eq, detectStateExpression, stateCrefs)
+  local pushed = OrderedSet{String}()
+  local variablesInEq = DAE.ComponentRef[]
+  for cr in Util.getAllCrefs(eq.exp)
+    local vn = string(cr)
+    vn in pushed && continue
+    local var = get(varByName, vn, nothing)
+    var === nothing && continue
+    if isVariable(var.varKind)
+      push!(variablesInEq, var.varName)
+      push!(pushed, vn)
+    end
+  end
+  for cr in keys(stateElements)
+    local vn = string(cr)
+    vn in pushed && continue
+    local var = get(varByName, vn, nothing)
+    var === nothing && continue
+    push!(variablesInEq, var.varName)
+    push!(pushed, vn)
+  end
+  return variablesInEq
+end
+
 """
   input: Backend when assignment (BDAE.ASSIGN)
   input: All existing variables
   output All variable in that specific equation
 """
-function getAllVariables(assignment::BDAE.ASSIGN, vars::Vector{BDAE.VAR})::Vector{DAE.ComponentRef}
+function getAllVariables(assignment::BDAE.ASSIGN, @nospecialize(vars))::Vector{DAE.ComponentRef}
   local leftCrefs = listArray(Util.getAllCrefs(assignment.left))
   local rightCrefs = listArray(Util.getAllCrefs(assignment.right))
   return vcat(leftCrefs, rightCrefs)
 end
 
-function getAllVariables(bdaeRenit::BDAE.REINIT, vars::Vector{BDAE.VAR})#::Vector{DAE.ComponentRef}
+function getAllVariables(bdaeRenit::BDAE.REINIT, @nospecialize(vars))#::Vector{DAE.ComponentRef}
   variables = DAE.CREF[bdaeRenit.stateVar]
   crefs = Util.getAllCrefs(bdaeRenit.value)
   return vcat(variables, listArray(crefs))
@@ -483,7 +645,7 @@ end
   bind new equations here — any real equation that uses the same
   variables will already pull them into the graph.
 """
-function getAllVariables(eq::BDAE.ASSERT_EQUATION, vars::Vector{BDAE.VAR})::Vector{DAE.ComponentRef}
+function getAllVariables(eq::BDAE.ASSERT_EQUATION, @nospecialize(vars))::Vector{DAE.ComponentRef}
   return DAE.ComponentRef[]
 end
 
@@ -520,7 +682,7 @@ end
 FIXME:
 Ideally this function should also return a vector of component references
 """
-function getAllVariables(eq::BDAE.IF_EQUATION, vars::Vector{BDAE.VAR})
+function getAllVariables(eq::BDAE.IF_EQUATION, @nospecialize(vars))
   local condVars = map(c -> listArray(Util.getAllCrefs(c)), eq.conditions)
   condVars = map(x -> string(x), collect(Iterators.flatten(condVars)))
   local ifEqEqsTrue = collect(Iterators.flatten(listArray(eq.eqnstrue)))
@@ -539,7 +701,7 @@ end
   left/right of each assignment (REINIT state/value). Assignment targets are
   included so a discrete written only by an event is not aliased away.
 """
-function getAllVariables(eq::BDAE.WHEN_EQUATION, vars::Vector{BDAE.VAR})
+function getAllVariables(eq::BDAE.WHEN_EQUATION, @nospecialize(vars))
   local whenEq = eq.whenEquation
   local crefs = listArray(Util.getAllCrefs(whenEq.condition))
   for stmt in whenEq.whenStmtLst

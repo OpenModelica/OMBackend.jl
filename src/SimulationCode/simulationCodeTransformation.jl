@@ -592,44 +592,66 @@ function flattenNestedThenBranchIfs(ifEq::BDAE.IF_EQUATION)::BDAE.IF_EQUATION
   local newConds = DAE.Exp[]
   local newThens = Vector{Any}()
   for i in 1:length(conds)
-    local thenList = listArray(thens[i])
-    local soleNested = (length(thenList) == 1 && thenList[1] isa BDAE.IF_EQUATION) ?
-                       thenList[1] : nothing
-    if soleNested === nothing
+    local expanded = _expandBranchEquations(collect(BDAE.Equation, listArray(thens[i])))
+    if length(expanded) == 1 && expanded[1][1] === nothing
       push!(newConds, conds[i])
       push!(newThens, thens[i])
       continue
     end
-    local inner = flattenNestedThenBranchIfs(soleNested)
-    local innerConds = listArray(inner.conditions)
-    local innerThens = listArray(inner.eqnstrue)
-    for k in 1:length(innerConds)
-      push!(newConds, _conjoinConditions(conds[i], innerConds[k]))
-      push!(newThens, innerThens[k])
+    for (extra, eqsVec) in expanded
+      push!(newConds, extra === nothing ? conds[i] : _conjoinConditions(conds[i], extra))
+      push!(newThens, MetaModelica.list(eqsVec...))
     end
-    #= Inner ELSE fires when all inner conditions are false; outer condition
-       still holds. =#
-    push!(newConds, _conjoinConditions(conds[i], _negateAllConditions(innerConds)))
-    push!(newThens, inner.eqnsfalse)
   end
-  local elseList = listArray(ifEq.eqnsfalse)
   local newElse = ifEq.eqnsfalse
-  if length(elseList) == 1 && elseList[1] isa BDAE.IF_EQUATION
-    local innerElse = flattenNestedThenBranchIfs(elseList[1])
-    local innerConds = listArray(innerElse.conditions)
-    local innerThens = listArray(innerElse.eqnstrue)
+  local elseExpanded = _expandBranchEquations(collect(BDAE.Equation, listArray(ifEq.eqnsfalse)))
+  if !(length(elseExpanded) == 1 && elseExpanded[1][1] === nothing)
     local outerElseGuard = _negateAllConditions(conds)
-    for k in 1:length(innerConds)
-      push!(newConds, _conjoinConditions(outerElseGuard, innerConds[k]))
-      push!(newThens, innerThens[k])
+    #= The last expansion entry is the every-inner-else path; sequential
+       branch evaluation makes its guard redundant, so it stays the ELSE. =#
+    for (extra, eqsVec) in elseExpanded[1:(end - 1)]
+      push!(newConds, extra === nothing ? outerElseGuard : _conjoinConditions(outerElseGuard, extra))
+      push!(newThens, MetaModelica.list(eqsVec...))
     end
-    newElse = innerElse.eqnsfalse
+    newElse = MetaModelica.list(last(elseExpanded)[2]...)
   end
   return BDAE.IF_EQUATION(MetaModelica.list(newConds...),
                           MetaModelica.list(newThens...),
                           newElse,
                           ifEq.source,
                           ifEq.attr)
+end
+
+#= Expand a branch body over the IF_EQUATIONs it contains: every nested if
+   multiplies the branch into one entry per inner branch, with the inner
+   condition (or the negation of all inner conditions, for the inner else)
+   as the entry's extra guard. Entries are (extraCond, equations) pairs;
+   extraCond === nothing means the body had no nested if. The last entry is
+   always the path where every nested if took its else branch. =#
+function _expandBranchEquations(eqs::Vector{T})::Vector{Tuple{Union{DAE.Exp, Nothing}, Vector{T}}} where {T}
+  local nestedIdx = findfirst(e -> e isa BDAE.IF_EQUATION, eqs)
+  nestedIdx === nothing && return Tuple{Union{DAE.Exp, Nothing}, Vector{T}}[(nothing, eqs)]
+  local inner = flattenNestedThenBranchIfs(flattenNestedElseIfChain(eqs[nestedIdx]))
+  #= Splice the hoisted equations at the nested if's position: branch pairing
+     downstream is positional, so the sibling branches' equation order must
+     stay aligned with branches that had no nested if. =#
+  local before = T[eqs[j] for j in 1:(nestedIdx - 1)]
+  local after = T[eqs[j] for j in (nestedIdx + 1):length(eqs)]
+  local innerConds = listArray(inner.conditions)
+  local innerThens = listArray(inner.eqnstrue)
+  local out = Tuple{Union{DAE.Exp, Nothing}, Vector{T}}[]
+  for k in 1:length(innerConds)
+    local subEqs = vcat(before, collect(T, listArray(innerThens[k])), after)
+    for (extra, finalEqs) in _expandBranchEquations(subEqs)
+      push!(out, (extra === nothing ? innerConds[k] : _conjoinConditions(innerConds[k], extra), finalEqs))
+    end
+  end
+  local elseGuard = _negateAllConditions(collect(DAE.Exp, innerConds))
+  local subEqsElse = vcat(before, collect(T, listArray(inner.eqnsfalse)), after)
+  for (extra, finalEqs) in _expandBranchEquations(subEqsElse)
+    push!(out, (extra === nothing ? elseGuard : _conjoinConditions(elseGuard, extra), finalEqs))
+  end
+  return out
 end
 
 function _conjoinConditions(a::DAE.Exp, b::DAE.Exp)::DAE.Exp

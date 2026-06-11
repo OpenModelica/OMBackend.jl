@@ -37,7 +37,7 @@ module BDAECreate
 
 using MetaModelica
 using ExportAll
-using DataStructures: OrderedSet
+using DataStructures: OrderedDict, OrderedSet
 
 import ..BDAE
 import ..BDAEUtil
@@ -244,6 +244,9 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
       push!(initialEquations, iresult)
     end
   end
+  #= Distinct crefs can mangle to the same flat name (a.b vs a_b); resolve
+     before the name-keyed deduplication silently swallows a variable. =#
+  resolveMangledNameCollisions!(variables, equations, initialEquations)
   #= Deduplicate variables by name (handles inner/outer duplicate emission) =#
   variables = deduplicateVariables(variables)
   #= Deduplicate explicit equations =#
@@ -254,6 +257,101 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   #= TODO Extract the simple equations =#
   local simpleEquations = BDAE.Equation[]
   return BDAE.EQSYSTEM(name, variables, equations, simpleEquations, initialEquations)
+end
+
+function _crefDepth(cref::DAE.ComponentRef)::Int
+  @match cref begin
+    DAE.CREF_QUAL(__) => 1 + _crefDepth(cref.componentRef)
+    _ => 1
+  end
+end
+
+function _crefIsSubscriptFree(cref::DAE.ComponentRef)::Bool
+  @match cref begin
+    DAE.CREF_IDENT(__) => listEmpty(cref.subscriptLst)
+    DAE.CREF_QUAL(__) => listEmpty(cref.subscriptLst) && _crefIsSubscriptFree(cref.componentRef)
+    _ => false
+  end
+end
+
+"""
+  Distinct component references can mangle to the same flat name, e.g. `a.b`
+  and `a_b`. Keep the least-qualified claimant and rename the others to fresh
+  unique names, rewriting every occurrence (equations, initial equations and
+  bindings) so the name-keyed passes downstream stay sound.
+"""
+function resolveMangledNameCollisions!(variables::Vector, equations::Vector, initialEquations::Vector)
+  local idxsByMangled = OrderedDict{String, Vector{Int}}()
+  for (i, v) in enumerate(variables)
+    push!(get!(() -> Int[], idxsByMangled, string(v.varName)), i)
+  end
+  local taken = OrderedSet{String}(keys(idxsByMangled))
+  local renames = OrderedDict{String, DAE.ComponentRef}()
+  for (mangled, idxs) in idxsByMangled
+    length(idxs) < 2 && continue
+    local groups = OrderedDict{String, Vector{Int}}()
+    for i in idxs
+      push!(get!(() -> Int[], groups, string(variables[i].varName; separator = ".")), i)
+    end
+    #= A single group is the inner/outer duplicate-emission case, which
+       deduplicateVariables handles. =#
+    length(groups) < 2 && continue
+    local keepKey = argmin(k -> _crefDepth(variables[first(groups[k])].varName), collect(keys(groups)))
+    for (dotted, gidxs) in groups
+      dotted == keepKey && continue
+      local cref = variables[first(gidxs)].varName
+      if !_crefIsSubscriptFree(cref)
+        @warn "Mangled-name collision on subscripted variable left unresolved" mangled
+        continue
+      end
+      local k = 1
+      local newName = string(mangled, "_", k)
+      while newName in taken
+        k += 1
+        newName = string(mangled, "_", k)
+      end
+      push!(taken, newName)
+      local newCref = DAE.CREF_IDENT(newName, BDAEUtil.crefLeafType(cref), nil)
+      renames[dotted] = newCref
+      for i in gidxs
+        variables[i].varName = newCref
+      end
+    end
+  end
+  isempty(renames) && return nothing
+  local rewrite = function (exp::DAE.Exp, arg)
+    local res = exp
+    @match exp begin
+      DAE.CREF(__) => begin
+        if _crefIsSubscriptFree(exp.componentRef)
+          local hit = get(renames, string(exp.componentRef; separator = "."), nothing)
+          if hit !== nothing
+            res = DAE.CREF(hit, exp.ty)
+          end
+        end
+        ()
+      end
+      _ => begin
+        ()
+      end
+    end
+    return (res, true, arg)
+  end
+  for i in 1:length(equations)
+    (equations[i], _) = BDAEUtil.traverseEquationExpressions(equations[i], rewrite, 0)
+  end
+  for i in 1:length(initialEquations)
+    (initialEquations[i], _) = BDAEUtil.traverseEquationExpressions(initialEquations[i], rewrite, 0)
+  end
+  for v in variables
+    local b = v.bindExp
+    if b isa SOME
+      newBind, _ = Util.traverseExpTopDown(b.data, rewrite, 0)
+      v.bindExp = SOME(newBind)
+    end
+  end
+  @info "[BDAE] resolved $(length(renames)) mangled-name collision(s) by renaming"
+  return nothing
 end
 
 """

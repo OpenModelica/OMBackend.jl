@@ -560,7 +560,13 @@ function planDemotions(simCode,
 
   local toDemote = OrderedSet{String}()
   for dv in discreteVariables
-    if string(Symbol(dv)) in aliasPinned
+    local nm = string(Symbol(dv))
+    if nm in aliasPinned
+      push!(toDemote, dv)
+    elseif nm in conditionalTargets && !(nm in whenAssignedSet) &&
+           get(ENV, "OMBACKEND_DEMOTE_CONDTARGETS", "true") == "true"
+      #= The discrete IS the LHS of an if-equation relay: that equation pins
+         it definitionally, so the held-state dummy would over-determine. =#
       push!(toDemote, dv)
     end
   end

@@ -33,7 +33,7 @@ Author: John Tinnerholm, john.tinnerholm@liu.se
 module CodeGeneration
 
 import DataStructures
-using DataStructures: OrderedSet
+using DataStructures: OrderedDict, OrderedSet
 import ..FrontendUtil.Util
 using MetaModelica
 #= This was also introduced in the data structure package. We need to be explicit in which one we use.=#

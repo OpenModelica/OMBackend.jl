@@ -1139,66 +1139,132 @@ end
 
   Returns the resolved value, or `nothing` if no alias equation was found.
 """
-function resolveAliasInitialValue(diffState, fullEqs, ivMap::Dict)
-  #= Substitute all known values into each equation, then check if the equation
-     becomes a simple linear expression in diffState alone. This avoids type
-     mismatches between get_variables output and ivMap keys. =#
-  for eq in fullEqs
-    local eqStr = string(eq)
-    local diffStr = string(diffState)
-    if !contains(eqStr, diffStr)
-      continue
-    end
-    #= Skip differential equations (Differential(t)(X) ~ ...) as these are
-       dynamic equations, not algebraic alias equations. =#
-    if contains(string(eq.lhs), "Differential")
+#= Per-call-site index of the candidate (non-differential) equations, keyed by
+   the exact variable names each contains. Avoids re-stringifying and
+   re-scanning every equation for every resolve: on large reduced systems the
+   unindexed scan made initialization quadratic in system size and dominated
+   the whole simulate call. =#
+struct AliasEqIndex
+  exprs::Vector{Any}
+  varCounts::Vector{Int}
+  byVar::OrderedDict{String, Vector{Int}}
+end
+
+function buildAliasEqIndex(eqs)::AliasEqIndex
+  local exprs = Any[]
+  local varCounts = Int[]
+  local byVar = OrderedDict{String, Vector{Int}}()
+  for eq in eqs
+    local lhsV = Symbolics.value(eq.lhs)
+    #= Differential equations are dynamics, not algebraic alias candidates. =#
+    if SymbolicUtils.iscall(lhsV) && (SymbolicUtils.operation(lhsV) isa ModelingToolkit.Differential)
       continue
     end
     local expr = eq.lhs - eq.rhs
-    local exprSub = Symbolics.substitute(expr, ivMap)
-    #= Fast path: plain substitution. =#
-    local intercept = Symbolics.value(Symbolics.substitute(exprSub, Dict(diffState => 0)))
-    local sumOnePoint = Symbolics.value(Symbolics.substitute(exprSub, Dict(diffState => 1)))
-    if !(intercept isa Number && sumOnePoint isa Number)
-      #= Slow path only when free vars remain: simplify folds a constant-condition
-         `ifelse` (e.g. a pre-evaluated `ifCond` flag) to its taken branch, so the
-         expression collapses to numeric-affine form instead of keeping spurious
-         free branch variables that would block resolution. =#
-      local exprS = Symbolics.simplify(exprSub)
-      intercept = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 0))))
-      sumOnePoint = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 1))))
+    local vs = Symbolics.get_variables(expr)
+    push!(exprs, expr)
+    push!(varCounts, length(vs))
+    local i = length(exprs)
+    for v in vs
+      push!(get!(() -> Int[], byVar, string(v)), i)
     end
-    if !(intercept isa Number && sumOnePoint isa Number)
-      continue
+  end
+  return AliasEqIndex(exprs, varCounts, byVar)
+end
+
+function resolveAliasInitialValue(diffState, idx::AliasEqIndex, ivMap::Dict)
+  local diffStr = string(diffState)
+  if get(ENV, "OMBACKEND_ALIAS_INDEX", "true") != "true"
+    #= Legacy-faithful scan: every candidate equation whose text mentions the
+       state, simplify uncapped. =#
+    for i in 1:length(idx.exprs)
+      contains(string(idx.exprs[i]), diffStr) || continue
+      local resolved = try
+        _resolveAliasFromExpr(diffState, idx.exprs[i], 0, ivMap)
+      catch e
+        e isa Union{DivideError, OverflowError, InexactError} || rethrow()
+        nothing
+      end
+      resolved === nothing || return resolved
     end
-    #= Convert to Float64 before arithmetic: pure Rational{Int} subtraction here
-       can overflow the denominator product to 0 and throw DivideError. =#
-    local interceptF = Float64(intercept)
-    local sumOnePointF = Float64(sumOnePoint)
-    local slope = sumOnePointF - interceptF
-    if !iszero(slope)
-      return -interceptF / slope
+    return nothing
+  end
+  for i in get(idx.byVar, diffStr, Int[])
+    #= Rational{Int} arithmetic inside substitute/simplify can overflow the
+       denominator to 0 (DivideError) on pathological candidates; skip them. =#
+    local resolved = try
+      _resolveAliasFromExpr(diffState, idx.exprs[i], idx.varCounts[i], ivMap)
+    catch e
+      e isa Union{DivideError, OverflowError, InexactError} || rethrow()
+      nothing
     end
+    resolved === nothing || return resolved
   end
   return nothing
 end
 
-"""
-    splitInitialValues(reducedSystem, finalInitialValues)
+function _resolveAliasFromExpr(diffState, @nospecialize(expr), varCount::Int, ivMap::Dict)
+  local exprSub = Symbolics.substitute(expr, ivMap)
+  #= Fast path: plain substitution. =#
+  local intercept = Symbolics.value(Symbolics.substitute(exprSub, Dict(diffState => 0)))
+  local sumOnePoint = Symbolics.value(Symbolics.substitute(exprSub, Dict(diffState => 1)))
+  if !(intercept isa Number && sumOnePoint isa Number)
+    #= Slow path only when free vars remain: simplify folds a constant-condition
+       `ifelse` (e.g. a pre-evaluated `ifCond` flag) to its taken branch, so the
+       expression collapses to numeric-affine form instead of keeping spurious
+       free branch variables that would block resolution. Capped to small
+       equations: simplify on a large dynamics expression takes minutes and an
+       alias equation never has many variables. =#
+    varCount <= 8 || return nothing
+    local exprS = Symbolics.simplify(exprSub)
+    intercept = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 0))))
+    sumOnePoint = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 1))))
+  end
+  if !(intercept isa Number && sumOnePoint isa Number)
+    return nothing
+  end
+  #= Convert to Float64 before arithmetic: pure Rational{Int} subtraction here
+     can overflow the denominator product to 0 and throw DivideError. =#
+  local interceptF = Float64(intercept)
+  local sumOnePointF = Float64(sumOnePoint)
+  local slope = sumOnePointF - interceptF
+  if !iszero(slope)
+    return -interceptF / slope
+  end
+  return nothing
+end
 
-  Split initial values into hard constraints and soft guesses based on the mass matrix.
-  Differential states (mass matrix diagonal != 0) get hard u0 values.
-  Algebraic states (mass matrix diagonal == 0) become guesses to avoid
-  overdetermining the initialization system.
-  For pure ODE systems (identity mass matrix), all values stay hard.
+function resolveAliasInitialValue(diffState, fullEqs, ivMap::Dict)
+  return resolveAliasInitialValue(diffState, buildAliasEqIndex(fullEqs), ivMap)
+end
 
-  Returns `(system, hardInitialValues)` where system may have updated guesses.
-"""
+#= Sidecar from splitInitialValues to the DirectRHS init solve: which initial
+   values are user/Modelica constraints (pinnable) as opposed to propagated
+   seeds. Keyed by system NAME: the system object is rebound between the
+   record and lookup sites (guess merging via @set!), so identity keys miss. =#
+const _EXPLICIT_PINNED_INITIAL_VALUE_KEYS = Dict{Symbol, OrderedSet{String}}()
+
+function _pinnedSidecarKey(reducedSystem)::Symbol
+  return try
+    nameof(reducedSystem)
+  catch
+    Symbol(objectid(reducedSystem))
+  end
+end
+
+function explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues)::OrderedSet{String}
+  return get(() -> OrderedSet(string(p.first) for p in hardInitialValues),
+             _EXPLICIT_PINNED_INITIAL_VALUE_KEYS, _pinnedSidecarKey(reducedSystem))
+end
+
 #= Names (as strings) of variables that appear in an algebraic (non-differential)
-   equation of `sys`. A differential equation `D(x) ~ rhs` is skipped: the state `x`'s
-   initial condition is free unless it is also constrained by an algebraic equation.
-   Used by splitInitialValues to decide which non-fixed starts are safe to keep as hard
-   u0 (uncoupled states) vs must be relaxed to guesses (algebraically coupled states). =#
+   equation of `sys`, including observed equations: structural_simplify moves
+   eliminated algebraic constraints to observed, so a state coupled only through
+   them is still algebraically coupled. A differential equation `D(x) ~ rhs` is
+   skipped: the state `x`'s initial condition is free unless it is also
+   constrained by an algebraic equation. Used by splitInitialValues to decide
+   which non-fixed starts are safe to keep as hard u0 (uncoupled states) vs must
+   be relaxed to guesses (algebraically coupled states). =#
 function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
   local out = OrderedSet{String}()
   local eqs = try
@@ -1213,6 +1279,17 @@ function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
     for v in Symbolics.get_variables(eq.lhs)
       push!(out, string(v))
     end
+    for v in Symbolics.get_variables(eq.rhs)
+      push!(out, string(v))
+    end
+  end
+  local obsEqs = try
+    observed(sys)
+  catch
+    Symbolics.Equation[]
+  end
+  for eq in obsEqs
+    #= An observed lhs is the eliminated variable itself; only the rhs couples. =#
     for v in Symbolics.get_variables(eq.rhs)
       push!(out, string(v))
     end
@@ -1254,6 +1331,17 @@ function mergeSoftGuesses(reducedSystem, pairs::AbstractVector; force::Bool = fa
   return reducedSystem
 end
 
+"""
+    splitInitialValues(reducedSystem, finalInitialValues)
+
+  Split initial values into hard constraints and soft guesses based on the mass matrix.
+  Differential states (mass matrix diagonal != 0) get hard u0 values.
+  Algebraic states (mass matrix diagonal == 0) become guesses to avoid
+  overdetermining the initialization system.
+  For pure ODE systems (identity mass matrix), all values stay hard.
+
+  Returns `(system, hardInitialValues)` where system may have updated guesses.
+"""
 function splitInitialValues(reducedSystem,
                             finalInitialValues::Vector{<:Pair{Symbolics.Num}},
                             allInitialValues::Vector{<:Pair},
@@ -1272,6 +1360,8 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
   #= Identity mass matrix means pure ODE: all states are differential =#
   if massMatrix isa LinearAlgebra.UniformScaling
     @debug "[MTK GEN: init] ODEProblem: pure ODE (identity mass matrix), $(length(finalInitialValues)) hard u0, $(length(reducedUnks)) unknowns"
+    _EXPLICIT_PINNED_INITIAL_VALUE_KEYS[_pinnedSidecarKey(reducedSystem)] =
+      OrderedSet(string(p.first) for p in finalInitialValues)
     return (reducedSystem, finalInitialValues)
   end
   #= DAE system: classify states by mass matrix diagonal =#
@@ -1325,6 +1415,19 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
      algebraic constraints can solve consistently with the user's hard pins. =#
   local fixedTrueLhsSet = OrderedSet{String}()
   for eq in initEqs
+    #= A signal-valued initialization equation (rhs references any
+       time-dependent variable, unknown or observed) determines its lhs
+       through the init solve's residual rows; marking the lhs fixed would
+       hold it at a stale numeric guess that fights the very equation it
+       encodes. Parameters print without the (t) suffix and stay pinnable;
+       occursin also catches array elements and derivative forms whose
+       printed form does not END with the suffix. =#
+    local rhsVars = try
+      Symbolics.get_variables(eq.rhs)
+    catch
+      Any[]
+    end
+    any(occursin("(t)", string(v)) for v in rhsVars) && continue
     push!(fixedTrueLhsSet, string(eq.lhs))
   end
   if hasInitConstraints
@@ -1369,6 +1472,11 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
       @debug "[MTK GEN: init] Demoted $(length(demoted)) non-fixed algebraic-coupled hard u0 entries to guesses (start without fixed=true)"
     end
   end
+  #= Pin only user/Modelica constraints (fixed=true starts, promoted literal
+     initialization equations, and the deliberate algebraic-start special case).
+     Alias-propagated values and MTK derivative defaults added below are seeds,
+     not constraints; DirectRHS uses this sidecar to keep them adjustable. =#
+  local explicitPinnedKeyStrSet = OrderedSet(string(p.first) for p in hardInitialValues)
   if !isempty(softInitialValues)
     #= Drop pairs whose key unwrapped to a numeric constant. This happens when
        the keyed variable was eliminated by `structural_simplify` so its module
@@ -1406,6 +1514,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
   local explicitIVMap = Dict{Any, Any}(iv.first => iv.second
                                        for iv in vcat(hardInitialValues, softInitialValues))
   local fullEqs = ModelingToolkit.full_equations(reducedSystem)
+  local aliasIdx = buildAliasEqIndex(fullEqs)
   #= Propagate hard u0 entries through algebraic alias chains in the reduced
      system. Iterates to a fixed point so multi-step chains resolve, and
      covers MTK-generated derivative-suffix vars regardless of mass-matrix
@@ -1423,7 +1532,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
       unkStr in hardSymStrSet && continue
       contains(unkStr, "ˍ") || continue
       local ivMapForResolve = filter(p -> string(p.first) != unkStr, explicitIVMap)
-      local resolved = resolveAliasInitialValue(unk, fullEqs, ivMapForResolve)
+      local resolved = resolveAliasInitialValue(unk, aliasIdx, ivMapForResolve)
       resolved === nothing && continue
       push!(hardInitialValues, unk => Float64(resolved))
       push!(hardSymStrSet, unkStr)
@@ -1444,7 +1553,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
          x = L*sin(phi)). Adding hard 0.0 would override this inference. =#
       if contains(diffStateStr, "\u02cd")
         local ivMapForResolve = filter(p -> string(p.first) != diffStateStr, explicitIVMap)
-        local resolved = resolveAliasInitialValue(diffState, fullEqs, ivMapForResolve)
+        local resolved = resolveAliasInitialValue(diffState, aliasIdx, ivMapForResolve)
         local finalVal = something(resolved, 0.0)
         push!(hardInitialValues, diffState => finalVal)
         if resolved !== nothing
@@ -1506,6 +1615,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
      bad defaults while genuine 0.0 starts are untouched. =#
   if !isempty(pars)
     local _eqsR = vcat(ModelingToolkit.equations(reducedSystem), ModelingToolkit.observed(reducedSystem))
+    local _idxR = buildAliasEqIndex(_eqsR)
     local _seed = Dict{Any, Any}(ModelingToolkit.get_iv(reducedSystem) => 0.0)
     for (k, v) in pars; _seed[k] = v; end
     for p in hardInitialValues; _seed[p.first] = p.second; end
@@ -1519,7 +1629,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
         local _ivm = Dict{Any, Any}(_seed)
         for (k, v) in _resolved; _ivm[k] = v; end
         delete!(_ivm, X)
-        local _rv = resolveAliasInitialValue(X, _eqsR, _ivm)
+        local _rv = resolveAliasInitialValue(X, _idxR, _ivm)
         if _rv !== nothing && isfinite(_rv)
           _resolved[X] = _rv; _progress = true
         end
@@ -1534,6 +1644,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
       @info "[MTK GEN: init] propagation resolved nothing (targets=$(length(_targets)), pars=$(length(pars)))"
     end
   end
+  _EXPLICIT_PINNED_INITIAL_VALUE_KEYS[_pinnedSidecarKey(reducedSystem)] = explicitPinnedKeyStrSet
   return (reducedSystem, hardInitialValues)
 end
 

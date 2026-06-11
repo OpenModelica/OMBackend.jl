@@ -129,7 +129,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   catch
     Dict()
   end
-  local hardInitialValues = _collectHardInitializationValues(
+  local (hardInitialValues, initEqPinKeys) = _collectHardInitializationValues(
     reducedSystem, finalInitialValues; resolvedParams=resolvedParams)
   local observedEquations = try
     ModelingToolkit.observed(reducedSystem)
@@ -168,14 +168,69 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        sd1.s_rel = 1) gets overwritten by the alg residual that depends on
        free vars (e.g. m1.s, m2.s) — collapsing to a different consistent
        root than the user requested. =#
-    local pinnedKeyStrSet = OrderedSet(string(p.first) for p in finalInitialValues)
+    #= Hard initialization values also cover literal `x ~ v` initialization
+       equations; those are user-requested constraints exactly like fixed=true
+       starts and must survive the free phases of the init solve. The sidecar
+       only knows splitInitialValues-level keys, so the literal init-eq keys
+       are unioned in here. Lifted-discrete states are excluded everywhere:
+       their initialization is owned by the t0 initialize affects, and pinning
+       them couples Newton to relation-kink defining rows it cannot satisfy. =#
+    local discreteNames = preMem === nothing ? OrderedSet{String}() :
+                          OrderedSet{String}(string(k) for k in keys(preMem))
+    local isDiscreteKey = k -> replace(k, "(t)" => "") in discreteNames
+    local pinnedKeyStrSet = OrderedSet{String}(
+      k for k in union(explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues),
+                       initEqPinKeys)
+      if !isDiscreteKey(k))
     local pinnedIdx = Int[i for (i, st) in enumerate(states)
                           if string(st) in pinnedKeyStrSet]
+    #= Discrete latches with literal init values: kept out of the Newton
+       phases (their defining rows are relation cliffs) but re-imposed in the
+       final constrained polish. =#
+    local discretePinnedIdx = Int[i for (i, st) in enumerate(states)
+                                  if isDiscreteKey(string(st)) && string(st) in initEqPinKeys]
     local derivativeInitTargets = _derivativeInitializationTargets(
       reducedSystem, states; resolvedParams=resolvedParams)
+    local eqLabels = try
+      ModelingToolkit.equations(reducedSystem)
+    catch
+      nothing
+    end
+    #= Signal-valued initialization equations become extra residual rows of
+       the init solve. Validate the generated evaluator once on the entry
+       guesses; a throwing or non-finite evaluator must not poison Newton. =#
+    local symInit = _symbolicInitializationResiduals(reducedSystem, states, params,
+                                                     ModelingToolkit.get_iv(reducedSystem), mm;
+                                                     resolvedParams=resolvedParams,
+                                                     excludeNames=discreteNames)
+    local extraResiduals = nothing
+    if symInit !== nothing
+      local (gF, dIdxs, mmS) = symInit
+      local candidate = (du, u) -> begin
+        local g = gF(u, p_vec, 0.0)
+        Float64[dIdxs[i] == 0 ? Float64(g[i]) : du[dIdxs[i]] - mmS[i] * Float64(g[i])
+                for i in 1:length(dIdxs)]
+      end
+      local probeOk = try
+        local duProbe = similar(u0)
+        rhsFunc(duProbe, u0, p_vec, 0.0)
+        all(isfinite, candidate(duProbe, u0))
+      catch
+        false
+      end
+      if probeOk
+        extraResiduals = candidate
+        @debug "DirectRHS: enforcing $(length(dIdxs)) symbolic initialization residual rows"
+      else
+        @debug "DirectRHS: symbolic initialization residuals failed probe, skipping"
+      end
+    end
     u0 = _solveDAEInitialization!(u0, rhsFunc, p_vec, mm;
                                   pinned=pinnedIdx,
-                                  derivative_targets=derivativeInitTargets)
+                                  derivative_targets=derivativeInitTargets,
+                                  eqLabels=eqLabels,
+                                  extra_residuals=extraResiduals,
+                                  discrete_pinned=discretePinnedIdx)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   end
 
@@ -210,24 +265,35 @@ function resetDiscretePreMem!(preMem, reducedSystem, u0)
 end
 
 
+#= Returns `(values, constraintKeys)`. `values` seeds u0; `constraintKeys`
+   names the literal initialization-equation LHS variables: user-requested
+   constraints that must stay pinned through the free phases of the init
+   solve regardless of what splitInitialValues demoted to guesses. =#
 function _collectHardInitializationValues(reducedSystem, finalInitialValues;
                                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
   local values = Dict{Any, Float64}()
+  local constraintKeys = OrderedSet{String}()
   for pair in finalInitialValues
-    values[pair.first] = _toFloat64(pair.second; resolvedParams=resolvedParams)
+    local val = _tryToFloat64(pair.second; resolvedParams=resolvedParams)
+    val === nothing && continue
+    values[pair.first] = val
   end
   local initEqs = try
     ModelingToolkit.initialization_equations(reducedSystem)
   catch
-    return values
+    return (values, constraintKeys)
   end
   for eq in initEqs
     startswith(string(eq.lhs), "Differential(") && continue
     local rhsVal = _literalNumericValue(eq.rhs)
+    if rhsVal === nothing
+      rhsVal = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams)
+    end
     rhsVal === nothing && continue
     values[eq.lhs] = rhsVal
+    push!(constraintKeys, string(eq.lhs))
   end
-  return values
+  return (values, constraintKeys)
 end
 
 
@@ -265,14 +331,119 @@ function _derivativeInitializationTargets(reducedSystem, states;
       end
     end
     matchedIdx === nothing && continue
-    local target = try
-      _toFloat64(eq.rhs; resolvedParams=resolvedParams)
-    catch
-      continue
-    end
+    local target = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams)
+    target === nothing && continue
     push!(targets, matchedIdx => target)
   end
   return targets
+end
+
+
+#= Initialization equations with a signal-valued RHS (references unknowns or
+   observed variables). Literal / parameter-resolvable rows are pinned via
+   _collectHardInitializationValues and _derivativeInitializationTargets;
+   the rows collected here become extra residual rows of the DAE init solve,
+   so user initial equations like `x = signal` and `der(x) = signal` hold at
+   t0. Returns `(gFunc, derIdxs, mmScales)` where `gFunc(u, p, t)` evaluates
+   the row expressions, `derIdxs[i] == 0` marks an algebraic row with residual
+   `g[i]`, and `derIdxs[i] > 0` marks a derivative row with residual
+   `du[derIdxs[i]] - mmScales[i] * g[i]`. Returns nothing when no such rows
+   exist or they cannot be reduced to states/params. =#
+function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
+                                          resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
+                                          excludeNames::AbstractSet{String}=OrderedSet{String}())
+  get(ENV, "OMBACKEND_INIT_SYMBOLIC_EQS", "true") == "true" || return nothing
+  local initEqs = try
+    ModelingToolkit.initialization_equations(reducedSystem)
+  catch
+    return nothing
+  end
+  isempty(initEqs) && return nothing
+  local stateStrToIdx = OrderedDict{String, Int}(string(st) => i for (i, st) in enumerate(states))
+  local exprs = Any[]
+  local derIdxs = Int[]
+  local mmScales = Float64[]
+  for eq in initEqs
+    local lhsStr = string(eq.lhs)
+    if startswith(lhsStr, "Differential(")
+      #= Literal derivative rows are handled as derivative_targets. =#
+      _tryToFloat64(eq.rhs; resolvedParams=resolvedParams) === nothing || continue
+      local matchedIdx = nothing
+      for (stateStr, idx) in stateStrToIdx
+        if endswith(lhsStr, "(" * stateStr * ")")
+          matchedIdx = idx
+          break
+        end
+      end
+      matchedIdx === nothing && continue
+      push!(exprs, eq.rhs)
+      push!(derIdxs, matchedIdx)
+      push!(mmScales, Float64(mm[matchedIdx, matchedIdx]))
+    else
+      #= Lifted-discrete rows belong to the t0 initialize affects. =#
+      replace(lhsStr, "(t)" => "") in excludeNames && continue
+      #= Literal algebraic rows are pinned hard values, but only a state can
+         be pinned: a literal row on an observed variable (an acceleration-
+         zero condition, for example) must be enforced as a residual row. =#
+      local rhsVal = _literalNumericValue(eq.rhs)
+      rhsVal === nothing && (rhsVal = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams))
+      if rhsVal !== nothing && haskey(stateStrToIdx, lhsStr)
+        continue
+      end
+      push!(exprs, eq.lhs - eq.rhs)
+      push!(derIdxs, 0)
+      push!(mmScales, 1.0)
+    end
+  end
+  isempty(exprs) && return nothing
+  #= Inline observed definitions on demand so only states, params and the iv
+     remain; the observed list is topologically ordered, so bounded repeated
+     substitution terminates. =#
+  local obsEqs = try
+    ModelingToolkit.observed(reducedSystem)
+  catch
+    Symbolics.Equation[]
+  end
+  local obsByStr = OrderedDict{String, Any}(string(o.lhs) => o.rhs for o in obsEqs)
+  local allowed = OrderedSet{String}(string(st) for st in states)
+  for p in params
+    push!(allowed, string(p))
+  end
+  push!(allowed, string(iv))
+  for i in 1:length(exprs)
+    for _pass in 1:(length(obsEqs) + 1)
+      local pending = OrderedDict{Any, Any}()
+      for v in Symbolics.get_variables(exprs[i])
+        local vs = string(v)
+        vs in allowed && continue
+        haskey(obsByStr, vs) && (pending[v] = obsByStr[vs])
+      end
+      isempty(pending) && break
+      exprs[i] = Symbolics.substitute(exprs[i], pending)
+    end
+  end
+  #= Drop rows still referencing anything else (e.g. der() inside observed). =#
+  local keep = Int[]
+  for (i, ex) in enumerate(exprs)
+    if all(v -> string(v) in allowed, Symbolics.get_variables(ex))
+      push!(keep, i)
+    end
+  end
+  if length(keep) < length(exprs)
+    @debug "DirectRHS: dropped $(length(exprs) - length(keep)) symbolic initialization rows (unresolvable references)"
+  end
+  isempty(keep) && return nothing
+  exprs = exprs[keep]
+  derIdxs = derIdxs[keep]
+  mmScales = mmScales[keep]
+  local gFunc = try
+    local fExpr = Symbolics.build_function(exprs, states, params, iv; expression = Val{true})
+    _exprToRTGFunction(fExpr[1])
+  catch e
+    @debug "DirectRHS: could not build symbolic initialization residuals" exception = e
+    return nothing
+  end
+  return (gFunc, derIdxs, mmScales)
 end
 
 
@@ -745,10 +916,21 @@ Convert a value to Float64, handling Symbolics.Num wrappers, constant symbolic
 expressions, and parameter references (resolved via resolvedParams dict).
 """
 function _toFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
+  local resolved = _tryToFloat64(val; resolvedParams=resolvedParams)
+  resolved === nothing || return resolved
+  @warn "DirectRHS: could not convert value to Float64, using 0.0" val=val type=typeof(val)
+  return 0.0
+end
+
+function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)::Union{Float64, Nothing}
   local unwrapped = val isa Symbolics.Num ? Symbolics.unwrap(val) : val
   unwrapped isa Number && return Float64(unwrapped)
   # Constant symbolic expression (no free variables): parse its string repr
-  local freeVars = Symbolics.get_variables(unwrapped)
+  local freeVars = try
+    Symbolics.get_variables(unwrapped)
+  catch
+    return nothing
+  end
   if isempty(freeVars)
     local f = tryparse(Float64, string(val))
     f !== nothing && return f
@@ -772,6 +954,5 @@ function _toFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=not
       end
     end
   end
-  @warn "DirectRHS: could not convert value to Float64, using 0.0" val=val type=typeof(val)
-  return 0.0
+  return nothing
 end

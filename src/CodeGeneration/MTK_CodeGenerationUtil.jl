@@ -604,10 +604,12 @@ function expToJuliaExpMTK(exp::SimulationCode.IFEXP, simCode::SimulationCode.SIM
   end
   local condJL = expToJuliaExpMTK(exp.cond, simCode;
                                    varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local thenJL = expToJuliaExpMTK(exp.thenExp, simCode;
-                                   varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local elseJL = expToJuliaExpMTK(exp.elseExp, simCode;
-                                   varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+  local thenJL = _guardNonIntegerPowerBasesForEagerBranch(
+    expToJuliaExpMTK(exp.thenExp, simCode;
+                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol))
+  local elseJL = _guardNonIntegerPowerBasesForEagerBranch(
+    expToJuliaExpMTK(exp.elseExp, simCode;
+                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol))
   #= Same Real-vs-non-Real branch-typing rule as the DAE.Exp version
      (see comment above the matching `DAE.IFEXP` arm). =#
   if _ifexpBranchIsNonReal(SimulationCode.toDAEExp(exp.thenExp)) ||
@@ -1065,8 +1067,10 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       =#
       DAE.IFEXP(expCond, expThen, expElse) => begin
         local condJL = expToJuliaExpMTK(expCond, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-        local thenJL = expToJuliaExpMTK(expThen, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-        local elseJL = expToJuliaExpMTK(expElse, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+        local thenJL = _guardNonIntegerPowerBasesForEagerBranch(
+          expToJuliaExpMTK(expThen, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
+        local elseJL = _guardNonIntegerPowerBasesForEagerBranch(
+          expToJuliaExpMTK(expElse, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
         #= For Real branches use arithmetic ifelse: cond*then + (1-cond)*else.
            This avoids type dispatch issues with ModelingToolkit.ifelse on
            BasicSymbolic{Real} vs Num. For String / Boolean / Integer branches
@@ -1785,6 +1789,37 @@ end
   Returns false if it evaluates to a nonzero value (guard is active or inactive).
   When simCode is provided, substitutes parameter values and state variable start values.
 """
+function _singleBlockPayload(@nospecialize(e))
+  while e isa Expr && e.head === :block
+    local payload = Any[a for a in e.args if !(a isa LineNumberNode)]
+    length(payload) == 1 || return e
+    e = payload[1]
+  end
+  return e
+end
+
+function _isNonIntegerJuliaConstant(@nospecialize(e))::Bool
+  local v = _singleBlockPayload(e)
+  v isa Integer && return false
+  return v isa Real && !isinteger(v)
+end
+
+#= ModelingToolkit.ifelse and the arithmetic if-expression lowering evaluate
+   both branches. Guard only those eager branch payloads against one-sided
+   event-localization noise around a relation boundary; ordinary powers keep
+   their native domain semantics. =#
+function _guardNonIntegerPowerBasesForEagerBranch(@nospecialize(e))
+  if e isa Expr
+    local args = Any[_guardNonIntegerPowerBasesForEagerBranch(a) for a in e.args]
+    if e.head === :call && length(args) == 3 && args[1] == :^ &&
+       _isNonIntegerJuliaConstant(args[3])
+      return :(max($(args[2]), 0.0) ^ $(args[3]))
+    end
+    return Expr(e.head, args...)
+  end
+  return e
+end
+
 #= Numerically evaluate a scalar DAE.Exp at t0 against `valMap` (params +
    already-seeded vars). Returns nothing for anything outside the small
    arithmetic/`integer` subset, so callers fall back safely. =#
@@ -1808,42 +1843,210 @@ function _evalDAENumeric(@nospecialize(e), valMap::Dict{Symbol, Float64})::Union
         DAE.SUB(__) => a - b
         DAE.MUL(__) => a * b
         DAE.DIV(__) => b == 0.0 ? nothing : a / b
-        DAE.POW(__) => a ^ b
+        DAE.POW(__) => (a < 0.0 && !isinteger(b)) ? nothing : a ^ b
         _ => nothing
       end
     end
     DAE.CAST(__) => _evalDAENumeric(e.exp, valMap)
+    DAE.IFEXP(__) => begin
+      local c = _evalDAENumeric(e.expCond, valMap); c === nothing && return nothing
+      _evalDAENumeric(c != 0.0 ? e.expThen : e.expElse, valMap)
+    end
+    DAE.RELATION(__) => begin
+      local a = _evalDAENumeric(e.exp1, valMap); a === nothing && return nothing
+      local b = _evalDAENumeric(e.exp2, valMap); b === nothing && return nothing
+      @match e.operator begin
+        DAE.LESS(__) => a < b ? 1.0 : 0.0
+        DAE.LESSEQ(__) => a <= b ? 1.0 : 0.0
+        DAE.GREATER(__) => a > b ? 1.0 : 0.0
+        DAE.GREATEREQ(__) => a >= b ? 1.0 : 0.0
+        DAE.EQUAL(__) => a == b ? 1.0 : 0.0
+        DAE.NEQUAL(__) => a != b ? 1.0 : 0.0
+        _ => nothing
+      end
+    end
+    DAE.LUNARY(DAE.NOT(__), _) => begin
+      local a = _evalDAENumeric(e.exp, valMap); a === nothing && return nothing
+      a == 0.0 ? 1.0 : 0.0
+    end
+    DAE.LBINARY(__) => begin
+      local a = _evalDAENumeric(e.exp1, valMap); a === nothing && return nothing
+      local b = _evalDAENumeric(e.exp2, valMap); b === nothing && return nothing
+      @match e.operator begin
+        DAE.AND(__) => (a != 0.0 && b != 0.0) ? 1.0 : 0.0
+        DAE.OR(__) => (a != 0.0 || b != 0.0) ? 1.0 : 0.0
+        _ => nothing
+      end
+    end
     DAE.CALL(path = Absyn.IDENT(fn)) => begin
       local argv = collect(e.expLst)
       isempty(argv) && return nothing
+      #= smooth(k, expr) evaluates to its second argument. =#
+      if fn == "smooth"
+        return length(argv) == 2 ? _evalDAENumeric(argv[2], valMap) : nothing
+      end
       local a = _evalDAENumeric(argv[1], valMap); a === nothing && return nothing
+      if (fn == "min" || fn == "max") && length(argv) == 2
+        local b = _evalDAENumeric(argv[2], valMap); b === nothing && return nothing
+        return fn == "min" ? min(a, b) : max(a, b)
+      end
       fn == "integer" ? Float64(floor(Int, a)) :
       fn == "floor"   ? floor(a) :
       fn == "ceil"    ? ceil(a) :
       fn == "abs"     ? abs(a) :
+      fn == "sqrt"    ? (a < 0.0 ? nothing : sqrt(a)) :
+      fn == "noEvent" ? a :
       (fn == "float" || fn == "Real" || fn == "Integer") ? a : nothing
     end
     _ => nothing
   end
 end
 
-#= Seed valMap with initial-algorithm-assigned values (e.g. trapezoid `count`,
-   `T_start`) evaluated at t0, in statement order. Without this, discrete states
-   set imperatively in an `initial algorithm` (no `start` attribute) default to
-   0.0 when evaluating if-equation initial branches, picking the wrong branch. =#
-function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode)
-  for ia in simCode.initialAlgorithms
-    for stmt in ia.daeStatements
-      @match stmt begin
-        DAE.STMT_ASSIGN(__) => begin
-          local nm = try SimulationCode.DAE_identifierToString(stmt.exp1) catch; nothing end
-          nm === nothing && continue
-          local v = _evalDAENumeric(stmt.exp, valMap)
-          v !== nothing && (valMap[Symbol(nm)] = v)
-        end
-        _ => nothing
+#= Substitute a loop iterator with a constant integer inside an expression,
+   including in component-reference subscripts. =#
+function _substIterT0(@nospecialize(e::DAE.Exp), iterId::String, value::Int)::DAE.Exp
+  local repl = function (ex::DAE.Exp, arg)
+    local res = ex
+    @match ex begin
+      DAE.CREF(DAE.CREF_IDENT(id, _, _), _) where (id == iterId) => begin
+        res = DAE.ICONST(value)
+        ()
+      end
+      _ => ()
+    end
+    return (res, true, arg)
+  end
+  return first(Util.traverseExpTopDown(e, repl, 0))
+end
+
+function _substIterStmt(@nospecialize(stmt), iterId::String, value::Int)
+  @match stmt begin
+    DAE.STMT_ASSIGN(__) =>
+      DAE.STMT_ASSIGN(stmt.type_,
+                      _substIterT0(stmt.exp1, iterId, value),
+                      _substIterT0(stmt.exp, iterId, value),
+                      stmt.source)
+    DAE.STMT_IF(__) =>
+      DAE.STMT_IF(_substIterT0(stmt.exp, iterId, value),
+                  list((_substIterStmt(s, iterId, value) for s in stmt.statementLst)...),
+                  _substIterElse(stmt.else_, iterId, value),
+                  stmt.source)
+    DAE.STMT_FOR(__) => begin
+      #= An inner loop shadowing the same iterator keeps its own binding. =#
+      if stmt.iter == iterId
+        stmt
+      else
+        DAE.STMT_FOR(stmt.type_, stmt.iterIsArray, stmt.iter, stmt.index,
+                     _substIterT0(stmt.range, iterId, value),
+                     list((_substIterStmt(s, iterId, value) for s in stmt.statementLst)...),
+                     stmt.source)
       end
     end
+    _ => stmt
+  end
+end
+
+function _substIterElse(@nospecialize(els), iterId::String, value::Int)
+  @match els begin
+    DAE.ELSE(__) => DAE.ELSE(list((_substIterStmt(s, iterId, value) for s in els.statementLst)...))
+    DAE.ELSEIF(__) => DAE.ELSEIF(_substIterT0(els.exp, iterId, value),
+                                 list((_substIterStmt(s, iterId, value) for s in els.statementLst)...),
+                                 _substIterElse(els.else_, iterId, value))
+    _ => els
+  end
+end
+
+function _execInitAlgStmts!(valMap::Dict{Symbol, Float64}, stmts)::Nothing
+  for stmt in stmts
+    _execInitAlgStmt!(valMap, stmt)
+  end
+  return nothing
+end
+
+function _execInitAlgElse!(valMap::Dict{Symbol, Float64}, @nospecialize(els))::Nothing
+  @match els begin
+    DAE.ELSE(__) => _execInitAlgStmts!(valMap, els.statementLst)
+    DAE.ELSEIF(__) => begin
+      local c = _evalDAENumeric(els.exp, valMap)
+      if c !== nothing
+        c != 0.0 ? _execInitAlgStmts!(valMap, els.statementLst) :
+                   _execInitAlgElse!(valMap, els.else_)
+      end
+      ()
+    end
+    _ => ()
+  end
+  return nothing
+end
+
+function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt))::Nothing
+  @match stmt begin
+    DAE.STMT_ASSIGN(__) => begin
+      local nm = try
+        SimulationCode.DAE_identifierToString(stmt.exp1)
+      catch
+        nothing
+      end
+      if nm !== nothing
+        local v = _evalDAENumeric(stmt.exp, valMap)
+        v !== nothing && (valMap[Symbol(nm)] = v)
+      end
+      ()
+    end
+    DAE.STMT_IF(__) => begin
+      local c = _evalDAENumeric(stmt.exp, valMap)
+      if c !== nothing
+        if c != 0.0
+          _execInitAlgStmts!(valMap, stmt.statementLst)
+        else
+          _execInitAlgElse!(valMap, stmt.else_)
+        end
+      end
+      ()
+    end
+    DAE.STMT_FOR(__) => begin
+      @match stmt.range begin
+        DAE.RANGE(__) => begin
+          local startV = _evalDAENumeric(stmt.range.start, valMap)
+          local stopV = _evalDAENumeric(stmt.range.stop, valMap)
+          local stepV = 1.0
+          @match stmt.range.step begin
+            SOME(se) => begin
+              local sv = _evalDAENumeric(se, valMap)
+              stepV = sv === nothing ? NaN : sv
+              ()
+            end
+            _ => ()
+          end
+          if startV !== nothing && stopV !== nothing && isfinite(stepV) && stepV != 0.0 &&
+             isinteger(startV) && isinteger(stopV) && isinteger(stepV)
+            for iv in Int(startV):Int(stepV):Int(stopV)
+              for s in stmt.statementLst
+                _execInitAlgStmt!(valMap, _substIterStmt(s, stmt.iter, iv))
+              end
+            end
+          end
+          ()
+        end
+        _ => ()
+      end
+      ()
+    end
+    _ => ()
+  end
+  return nothing
+end
+
+#= Seed valMap with initial-algorithm-assigned values (e.g. trapezoid `count`,
+   `T_start`) evaluated at t0, in statement order. Interprets assignments,
+   if/elseif/else and for-loops over constant integer ranges; anything else
+   is skipped and the affected names keep their defaults. Without this,
+   discrete states set imperatively in an `initial algorithm` (no `start`
+   attribute) default to 0.0 when evaluating if-equation initial branches,
+   picking the wrong branch. =#
+function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode)
+  for ia in simCode.initialAlgorithms
+    _execInitAlgStmts!(valMap, ia.daeStatements)
   end
   return valMap
 end
@@ -2120,7 +2323,7 @@ function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, s
   return
 end
 
-function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool = false)
+function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool = false, extraVals = nothing)
   #= Skip during precompile output: `eval(...)` below would mutate this
      closed module's bindings and Julia rejects that. The runtime path is
      unaffected. Fallback `true` matches the existing catch arm. =#
@@ -2147,6 +2350,14 @@ function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool =
       return (v == 0) != false
     end
     local valMap = _buildT0ValueMap(simCode)
+    #= Relay-computed t0 values: condition operands that are themselves
+       if-equation targets would otherwise default to 0 here and select the
+       wrong initial branch. =#
+    if extraVals !== nothing
+      for (k, v) in extraVals
+        valMap[k] = v
+      end
+    end
     #= Extract LHS from the mtkCond Expr (form: :(lhs ~ 0)) =#
     local lhsExpr = _extractZeroCrossingLHS(mtkCond)
     #= Substitute all variable references with numeric values =#
@@ -2556,6 +2767,27 @@ function _allBranchConditionsDiscrete(branches, simCode)::Bool
   return true
 end
 
+#= Residuals pair across branches by the variable their causalized form
+   defines, with the positional index only as a fallback: source-order
+   differences between sibling branches (hoisted nested ifs, lifted
+   if-expressions) make pure positional pairing relay the wrong variable. =#
+function _causalLhsKey(@nospecialize(lhsExpr))::String
+  local e = lhsExpr isa Expr ? Base.remove_linenums!(copy(lhsExpr)) : lhsExpr
+  while e isa Expr && e.head === :block && length(e.args) == 1
+    e = e.args[1]
+  end
+  return string(e)
+end
+
+function _branchResidualForLhs(branch, lhsKey::String, fallbackIdx::Int, simCode)
+  for r in branch.residualEquations
+    if _causalLhsKey(last(deCausalize(r, simCode))) == lhsKey
+      return r
+    end
+  end
+  return branch.residualEquations[min(fallbackIdx, length(branch.residualEquations))]
+end
+
 """
   Generates an if-expression equation and add it to the continuous part of the system.
 Assume single equations in each if-branch for now.
@@ -2593,10 +2825,14 @@ function generateIfExpressions(branches,
                                resEqIdx::Int,
                                identifier::Int,
                                simCode;
-                               subIdentifier::Int = 1)
+                               subIdentifier::Int = 1,
+                               lhsKey::Union{String, Nothing} = nothing)
   local branch = branches[target]
+  local selEq = lhsKey === nothing ? branch.residualEquations[resEqIdx] :
+                _branchResidualForLhs(branch, lhsKey, resEqIdx, simCode)
   if branch.targets == -1
-    return :($(first(deCausalize(branch.residualEquations[resEqIdx], simCode))))
+    return :($(_guardNonIntegerPowerBasesForEagerBranch(
+      first(deCausalize(selEq, simCode)))))
   end
   #= When every branch condition is discrete/parameter (e.g. an event-held Boolean),
      gate directly on the condition value: its own update event localises the step,
@@ -2609,7 +2845,8 @@ function generateIfExpressions(branches,
        never perturbs them during Jacobian computation. Exact comparison is safe. =#
     :( $(Symbol(string("ifCond", identifier, subIdentifier))) == 1 )
   end
-  local rhs = first(deCausalize(branch.residualEquations[resEqIdx], simCode))
+  local rhs = _guardNonIntegerPowerBasesForEagerBranch(
+    first(deCausalize(selEq, simCode)))
   quote
     ModelingToolkit.ifelse($(cond),
                            $(rhs),
@@ -2618,7 +2855,8 @@ function generateIfExpressions(branches,
                                                    resEqIdx,
                                                    identifier,
                                                    simCode;
-                                                   subIdentifier = subIdentifier + 1)))
+                                                   subIdentifier = subIdentifier + 1,
+                                                   lhsKey = lhsKey)))
   end
 end
 

@@ -631,6 +631,8 @@ function lower(frontendDAE::DAE.DAE_LIST)::BDAE.BACKEND_DAE
     bDAE = Causalize.expandRecordFieldArrays(bDAE)
     #= Expand COMPLEX_EQUATIONs into scalar equations =#
     bDAE = Causalize.expandComplexEquations(bDAE)
+    #= Unroll constant-range reductions before SimCode drops iterator subscripts =#
+    bDAE = Causalize.unrollConstantReductions(bDAE)
     #= We always residualize since residuals are easier to work with =#
     bDAE = Causalize.residualizeEveryEquation(bDAE)
     @debug "[BDAE] residualized"
@@ -691,6 +693,9 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
     #= Expand COMPLEX_EQUATIONs into scalar equations =#
     bDAE = Causalize.expandComplexEquations(bDAE)
     @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterExpandComplex.log"), BDAEUtil.stringHeading1(bDAE, "after complex equation expansion"))
+    #= Unroll constant-range reductions before SimCode drops iterator subscripts =#
+    bDAE = Causalize.unrollConstantReductions(bDAE)
+    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterUnrollReductions.log"), BDAEUtil.stringHeading1(bDAE, "after reduction unrolling"))
     bDAE = Causalize.residualizeEveryEquation(bDAE)
     @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterResidualize.log"), BDAEUtil.stringHeading1(bDAE, "after residualize"))
     #=

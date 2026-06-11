@@ -608,6 +608,9 @@ function createEquationVariableBidirectionGraph(equations::AbstractVector,
   local discreteVariables = filter((x) -> BDAEUtil.isDiscrete(x.varKind), allBackendVars)
   local stateVariables = filter((x) -> BDAEUtil.isState(x.varKind), allBackendVars)
   local algebraicAndStateVariables = vcat(unknownVariables, stateVariables)
+  #= Name-keyed lookup so each equation scans its own crefs, not every model
+     variable; on large models the difference is hours vs seconds. =#
+  local varByName = BDAEUtil.variablesByName(algebraicAndStateVariables)
   local nDiscretes = length(discreteVariables)
   @debug "#stateVariables" length(stateVariables)
   @debug "#discretes" nDiscretes
@@ -615,7 +618,7 @@ function createEquationVariableBidirectionGraph(equations::AbstractVector,
   @debug "#equations" length(equations)
   for eq in equations
     eqCounter += 1
-    variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
+    variablesForEq = Backend.BDAEUtil.getAllVariables(eq, varByName)
     # @debug "Variables in equation:"
     # println("Equation:", string(eq))
     # println("Variables:")
@@ -640,7 +643,7 @@ function createEquationVariableBidirectionGraph(equations::AbstractVector,
     ifEqBranch = listArray(listGet(ifEq.eqnstrue, 1))
     for eq in ifEqBranch
       eqCounter += 1
-      variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
+      variablesForEq = Backend.BDAEUtil.getAllVariables(eq, varByName)
       variableEqMapping["e$(eqCounter)"] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
     end
   end
@@ -698,13 +701,16 @@ function createEquationVariableBidirectionGraph(equations::RES_T,
   local discreteVariables = filter((x) -> BDAEUtil.isDiscrete(x.varKind), allBackendVars)
   local stateVariables = filter((x) -> BDAEUtil.isState(x.varKind), allBackendVars)
   local algebraicAndStateVariables = vcat(unknownVariables, stateVariables)
+  #= Name-keyed lookup so each equation scans its own crefs, not every model
+     variable. =#
+  local varByName = BDAEUtil.variablesByName(algebraicAndStateVariables)
   local nDiscretes = length(discreteVariables)
   @debug "#stateVariables" length(stateVariables)
   @debug "#algebraic" length(unknownVariables)
   @debug "#equations" length(equations)
   for eq in equations
     eqCounter += 1
-    variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
+    variablesForEq = Backend.BDAEUtil.getAllVariables(eq, varByName)
     variableEqMapping["e$(eqCounter)"] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
   end
   return variableEqMapping

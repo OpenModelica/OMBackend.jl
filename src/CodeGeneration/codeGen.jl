@@ -327,7 +327,13 @@ end
 function _whenLookupBindings(crefs, simCode)::Vector{Expr}
   local out = Expr[]
   for x in collect(map(identity, crefs))
-    haskey(simCode.stringToSimVarHT, string(x)) || continue
+    local entry = get(simCode.stringToSimVarHT, string(x), nothing)
+    entry === nothing && continue
+    #= String simvars live as module-level bindings, never as state or MTK
+       parameter slots; an index binding here would KeyError at runtime. =#
+    if get(ENV, "OMBACKEND_WHEN_STRING_SKIP", "true") == "true"
+      entry[2].varKind isa SimulationCode.STRING && continue
+    end
     push!(out, Expr(:(=), Symbol(string(x)), getIdxForLookupMTK(x, simCode)))
   end
   return out

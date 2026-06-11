@@ -1037,34 +1037,7 @@ function tryExpandReduction(reductionInfo, bodyExp::DAE.Exp, iterators)
     Absyn.IDENT("array") => nothing  # continue below
     _ => return nothing
   end
-  if length(iterators) != 1
-    return nothing
-  end
-  local iter = first(iterators)
-  local iterId::String = ""
-  local rangeExp = nothing
-  @match iter begin
-    DAE.REDUCTIONITER(id, rExp, _, _) => begin
-      iterId = id
-      rangeExp = rExp
-    end
-    _ => return nothing
-  end
-  local startVal::Int = 0
-  local stopVal::Int = 0
-  @match rangeExp begin
-    DAE.RANGE(_, DAE.ICONST(s), _, DAE.ICONST(e)) => begin
-      startVal = s
-      stopVal = e
-    end
-    _ => return nothing
-  end
-  result = DAE.Exp[]
-  for i in startVal:stopVal
-    local substituted = substituteIteratorInExp(bodyExp, iterId, i)
-    push!(result, substituted)
-  end
-  return result
+  return _expandReductionElems(bodyExp, iterators)
 end
 
 """
@@ -1082,6 +1055,139 @@ function substituteIteratorInExp(exp::DAE.Exp, iterId::String, value::Int)::DAE.
     end
   end
   return first(Util.traverseExpBottomUp(exp, replacer, nothing))
+end
+
+#= Expand a single-iterator reduction body over a constant integer range.
+   Returns the per-index substituted expressions, or nothing when the range
+   is not statically known. =#
+function _expandReductionElems(bodyExp::DAE.Exp, iterators)::Union{Vector{DAE.Exp}, Nothing}
+  length(iterators) == 1 || return nothing
+  local iterId::String = ""
+  local rangeExp = nothing
+  @match first(iterators) begin
+    DAE.REDUCTIONITER(id, rExp, _, _) => begin
+      iterId = id
+      rangeExp = rExp
+    end
+    _ => return nothing
+  end
+  local startVal::Int = 0
+  local stepVal::Int = 1
+  local stopVal::Int = 0
+  @match rangeExp begin
+    DAE.RANGE(_, DAE.ICONST(s), NONE(), DAE.ICONST(e)) => begin
+      startVal = s
+      stopVal = e
+    end
+    DAE.RANGE(_, DAE.ICONST(s), SOME(DAE.ICONST(st)), DAE.ICONST(e)) => begin
+      startVal = s
+      stepVal = st
+      stopVal = e
+    end
+    _ => return nothing
+  end
+  stepVal == 0 && return nothing
+  return DAE.Exp[substituteIteratorInExp(bodyExp, iterId, i) for i in startVal:stepVal:stopVal]
+end
+
+function _callAttrType(@nospecialize(attr))
+  @match attr begin
+    DAE.CALL_ATTR(ty = ty) => ty
+    _ => DAE.T_REAL_DEFAULT
+  end
+end
+
+#= Fold expanded reduction elements into a scalar expression: sum / product
+   as operator chains, min / max as nested two-argument calls. =#
+function _foldReductionScalar(fname::String, elems::Vector{DAE.Exp}, attr,
+                              foldTy::DAE.Type)::Union{DAE.Exp, Nothing}
+  isempty(elems) && return nothing
+  local acc = elems[1]
+  for k in 2:length(elems)
+    acc = if fname == "sum"
+      DAE.BINARY(acc, DAE.ADD(foldTy), elems[k])
+    elseif fname == "product"
+      DAE.BINARY(acc, DAE.MUL(foldTy), elems[k])
+    elseif fname == "min" || fname == "max"
+      DAE.CALL(Absyn.IDENT(fname), list(acc, elems[k]), attr)
+    else
+      return nothing
+    end
+  end
+  return acc
+end
+
+#= Elements of a reducing call's single argument: an array-path reduction
+   over a constant range, or an array constructor. =#
+function _reducingCallArgElems(@nospecialize(arg))::Union{Vector{DAE.Exp}, Nothing}
+  @match arg begin
+    DAE.REDUCTION(reductionInfo, bodyExp, iterators) => begin
+      @match reductionInfo.path begin
+        Absyn.IDENT("array") => _expandReductionElems(bodyExp, iterators)
+        _ => nothing
+      end
+    end
+    DAE.ARRAY(_, _, elements) => collect(elements)
+    _ => nothing
+  end
+end
+
+function unrollReductionTraverser(exp::DAE.Exp, acc)
+  local newExp = exp
+  @match exp begin
+    DAE.CALL(Absyn.IDENT(fname), args, attr) where (fname == "max" || fname == "min" ||
+                                                    fname == "sum" || fname == "product") => begin
+      local argv = collect(args)
+      if length(argv) == 1
+        local elems = _reducingCallArgElems(argv[1])
+        if elems !== nothing
+          local folded = _foldReductionScalar(fname, elems, attr, _callAttrType(attr))
+          folded === nothing || (newExp = folded)
+        end
+      end
+      ()
+    end
+    DAE.REDUCTION(reductionInfo, bodyExp, iterators) => begin
+      local pathName = @match reductionInfo.path begin
+        Absyn.IDENT(n) => n
+        _ => ""
+      end
+      local elems = _expandReductionElems(bodyExp, iterators)
+      if elems !== nothing
+        if pathName == "array"
+          newExp = DAE.ARRAY(reductionInfo.exprType, true, list(elems...))
+        elseif pathName == "sum" || pathName == "product" || pathName == "min" || pathName == "max"
+          local attr = DAE.CALL_ATTR(reductionInfo.exprType, false, true, false, false,
+                                     DAE.NO_INLINE(), DAE.NO_TAIL())
+          local folded = _foldReductionScalar(pathName, elems, attr, reductionInfo.exprType)
+          folded === nothing || (newExp = folded)
+        end
+      end
+      ()
+    end
+    _ => ()
+  end
+  return (newExp, true, acc)
+end
+
+"""
+  Unroll reductions whose single iterator spans a constant integer range, so
+  no symbolic iterator subscript survives into SimCode (SimCref carries
+  integer subscripts only). Reducing calls over array constructors fold to
+  the same scalar form.
+"""
+function unrollConstantReductions(dae::BDAE.BACKEND_DAE)
+  BDAEUtil.mapEqSystems(dae, unrollConstantReductionsSystem)
+end
+
+function unrollConstantReductionsSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
+  for eqs in (syst.orderedEqs, syst.initialEqs)
+    for i in 1:length(eqs)
+      (eq2, _) = BDAEUtil.traverseEquationExpressions(eqs[i], unrollReductionTraverser, nothing)
+      eqs[i] === eq2 || (eqs[i] = eq2)
+    end
+  end
+  return syst
 end
 
 """
