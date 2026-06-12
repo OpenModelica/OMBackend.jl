@@ -5,14 +5,16 @@
 module Backend
 
 using ..FrontendUtil
+using DataStructures: OrderedSet
+
+import ..@BACKEND_LOGGING
+import ..@BACKEND_PERFLOG
 
 include("BDAE.jl")
 include("BackendEquation.jl")
 include("BDAEUtil.jl")
 include("BDAECreate.jl")
 include("Causalize.jl")
-
-#include("backendDump.jl")
 
 export BDAE, BDAECreate, BackendEquation, BDAEUtil, Causalize, BackendDAEExp
 

@@ -1,7 +1,7 @@
 #= /*
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-2020, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -38,21 +38,30 @@ module SimulationCode
 using MetaModelica
 using DataStructures
 using Setfield
-using ImmutableList
 
 using ..FrontendUtil
 using ..Backend
 
+import Absyn
 import DAE
+import Graphs
+import ImmutableList
+import MetaGraphs
+import OMFrontend
+
 import ..OMBackend
 import ..Backend.BDAE
+import ..@BACKEND_LOGGING
 import ..BackendUtil.GraphAlgorithms
-import Graphs
-import MetaGraphs
+import ..FrontendUtil.Util
 
 include("simCodeData.jl")
+include("simCodeTraverse.jl")
 include("simCodeUtil.jl")
 include("simCodeDump.jl")
 include("simulationCodeTransformation.jl")
+include("simCodeFunctions.jl")
+include("simCodeCheck.jl")
+include("simCodeExpBridge.jl")
 
 end # module SimulationCode

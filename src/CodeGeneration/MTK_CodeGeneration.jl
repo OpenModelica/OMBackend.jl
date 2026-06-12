@@ -1,7 +1,7 @@
 #=
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-2020, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -33,13 +33,460 @@
   Author: John Tinnerholm
   TODO: Remember the state derivative scheme. What did I mean with that?
   TODO: Make duplicate code better...
-  TODO: Investigate the once again broken if equations
+  TODO: Cleanup in general.. keep this simple. Remove hacks as the SCiML team adds new features to MTK.
 =#
-using ModelingToolkit
-import OMBackend
+import ..OMBackend
+import .AlgorithmicCodeGeneration
+
+#= Size of each emitted helper chunk in `decompose*` and `generate*Block` paths.
+   Tunable at runtime via `OMBackend.CodeGeneration.CHUNK_SIZE[] = N`. =#
+const CHUNK_SIZE = Ref{Int}(50)
+
+#= Julia-AST symbols used by the discrete-dummy demotion pattern matchers in
+   ODE_MODE_MTK_MODEL_GENERATION. Promoted to module-level constants so a
+   rename upstream (e.g. `floor` → `modelica_floor`) is a single-line change
+   here instead of a scatter-hunt across closures. =#
+const DERIVATIVE_HEADS        = (:der, :D)
+const INTEGER_DEF_HEADS       = (:integer, :modelica_integer, :floor)
+const COMPARISON_OPS          = (:<, :<=, :>, :>=, :(==), :(!=))
+const IFELSE_HEAD             = :ifelse
+const CONST_TABLE_LOOKUP_HEAD = :constTableLookup
 
 """
-  Generates simulation code targetting modeling toolkit.
+    evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
+
+Phase A of `ODE_MODE_MTK_MODEL_GENERATION`: `eval` each generated Modelica
+function body in OMBackend, then `eval` the `@register_symbolic` calls that
+make Symbolics aware of them.
+
+The eval must happen here (not at simulate time) because subsequent codegen
+phases need the function bindings to exist when they construct symbolic
+equation expressions.
+
+On function-eval failure, the offending generated source is dumped to
+`/tmp/om_bad_function.jl` and the error rethrown. Register-call failures
+are tolerated when the binding "already has a value" (re-registration is
+idempotent) and rethrown otherwise.
+"""
+function evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
+  for f in functions
+    try
+      eval(f)
+    catch e
+      local dumpPath = "/tmp/om_bad_function.jl"
+      try
+        open(dumpPath, "w") do io
+          println(io, "# Offending generated function. Eval error: ", sprint(showerror, e))
+          println(io, "# Model: $modelName")
+          println(io, string(Base.remove_linenums!(deepcopy(f))))
+        end
+        @error "Generated Modelica-function eval failed; dumped Julia source for inspection" modelName error=sprint(showerror, e) dumpPath
+      catch ioErr
+        @error "Generated function eval failed, also failed to dump" modelName error=sprint(showerror, e) ioErr
+      end
+      rethrow(e)
+    end
+  end
+  local registrationCalls = generateRegisterCallsForCallExprs(simCode; funcArgGen = AlgorithmicCodeGeneration.generateIOL)
+  for regCall in registrationCalls
+    try
+      eval(regCall)
+    catch e
+      contains(string(e), "already has a value") || rethrow(e)
+    end
+  end
+  return nothing
+end
+
+"""
+    ClassifiedVariables
+
+Result of `classifyVariables` — every simvar in `simCode.stringToSimVarHT`
+bucketed by `varKind`, plus the StateSelect priority pairs MTK needs.
+
+The buckets are deliberately the names downstream phases use, so the
+unpacking at the call site reads as a phase index.
+"""
+struct ClassifiedVariables
+  stateVariables        :: Vector{String}
+  algebraicVariables    :: Vector{String}
+  discreteVariables     :: Vector{String}
+  occVariables          :: Vector{String}
+  parameters            :: Vector{String}
+  arrayParameters       :: Vector{String}
+  stateDerivatives      :: Vector{String}
+  dataStructureVariables:: Vector{String}
+  statePriorityPairs    :: Vector{Tuple{Symbol, Int}}
+end
+
+"""
+    classifyVariables(simCode) -> ClassifiedVariables
+
+Phase B of `ODE_MODE_MTK_MODEL_GENERATION`: walk `simCode.stringToSimVarHT`
+once and bucket each variable by its `varKind`. `ALG_VARIABLE` has the
+most subtle fall-through:
+
+- match-order present → algebraic.
+- involved in an event → discrete.
+- system singular → algebraic (needs index reduction).
+- otherwise → flag system singular and still call it algebraic.
+
+Also extracts the per-variable `StateSelect` annotation (`NEVER`,
+`AVOID`, `PREFER`, `ALWAYS`) into MTK state-priority pairs, but only for
+variables that will become real MTK unknowns (states / algebraic / occ /
+array). Helper parameters like `*_start` may carry stateSelect from
+source attributes but never become MTK variables, so emitting a priority
+for them would `UndefVarError` at the batched eval.
+"""
+function classifyVariables(simCode)::ClassifiedVariables
+  local stateVariables         = String[]
+  local algebraicVariables     = String[]
+  local discreteVariables      = String[]
+  local occVariables           = String[]
+  local parameters             = String[]
+  local arrayParameters        = String[]
+  local stateDerivatives       = String[]
+  local dataStructureVariables = String[]
+  local statePriorityPairs     = Tuple{Symbol, Int}[]
+  local ht = simCode.stringToSimVarHT
+  for varName in keys(ht)
+    (idx, var) = ht[varName]
+    local varType = var.varKind
+    @match varType begin
+      SimulationCode.INPUT(__) => begin
+        @error "INPUT not supported in CodeGen"
+        throw()
+      end
+      SimulationCode.STATE(__) => push!(stateVariables, varName)
+      SimulationCode.OCC_VARIABLE(__) => push!(occVariables, varName)
+      SimulationCode.PARAMETER(__) => push!(parameters, varName)
+      #= String parameters are non-numeric; excluded from MTK parameter system. =#
+      SimulationCode.STRING(__) => nothing
+      SimulationCode.ARRAY_PARAMETER(__) => push!(arrayParameters, varName)
+      SimulationCode.ARRAY(__) => push!(stateVariables, varName)
+      SimulationCode.DISCRETE(__) => push!(discreteVariables, varName)
+      SimulationCode.ALG_VARIABLE(__) => begin
+        if idx in simCode.matchOrder
+          push!(algebraicVariables, varName)
+        elseif involvedInEvent(idx, simCode)
+          push!(discreteVariables, varName)
+        elseif simCode.isSingular
+          push!(algebraicVariables, varName)
+        else
+          @assign simCode.isSingular = true
+          push!(algebraicVariables, varName)
+        end
+      end
+      SimulationCode.DATA_STRUCTURE(__) => push!(dataStructureVariables, varName)
+      SimulationCode.STATE_DERIVATIVE(__) => push!(stateDerivatives, varName)
+    end
+    #= StateSelect → MTK state_priority, only on actual MTK unknowns. =#
+    local optAttrs::Option{DAE.VariableAttributes} = var.attributes
+    local priority = @match optAttrs begin
+      SOME(attrs && DAE.VAR_ATTR_REAL(__)) => begin
+        @match attrs.stateSelectOption begin
+          SOME(DAE.NEVER(__))  => -10
+          SOME(DAE.AVOID(__))  => -2
+          SOME(DAE.PREFER(__)) => 2
+          SOME(DAE.ALWAYS(__)) => 10
+          _                    => nothing
+        end
+      end
+      _ => nothing
+    end
+    if priority !== nothing
+      local supportsStatePriority =
+        varType isa SimulationCode.STATE ||
+        varType isa SimulationCode.ALG_VARIABLE ||
+        varType isa SimulationCode.OCC_VARIABLE ||
+        varType isa SimulationCode.ARRAY
+      if supportsStatePriority && !startswith(string(varName), "der(")
+        push!(statePriorityPairs, (Symbol(varName), priority))
+      end
+    end
+  end
+  return ClassifiedVariables(stateVariables, algebraicVariables,
+                             discreteVariables, occVariables,
+                             parameters, arrayParameters,
+                             stateDerivatives, dataStructureVariables,
+                             statePriorityPairs)
+end
+
+"""
+    buildIfEquationEventDecl(events::Vector{Expr}) -> Expr
+
+Wrap the collected `SymbolicContinuousCallback` expressions in the
+`events = ...` assignment that the generated model module expects.
+`Base.invokelatest` is needed because the event exprs reference variables
+created via `eval` earlier in the model function body, so they must run
+in the new world age.
+"""
+function buildIfEquationEventDecl(events::Vector{Expr})::Expr
+  isempty(events) && return :(events = [])
+  return :(events = Base.invokelatest(() -> [$(events...)]))
+end
+
+"""
+    collectIrreducibleSymbols(simCode, conditionalEquations,
+                              stateVariables, algebraicVariables, occVariables)
+        -> Vector{Symbol}
+
+Build the list of variable symbols that MTK's tearing pass must NOT
+eliminate. Sources:
+
+1. `simCode.irreducibleVariables` — names the SimCode pass already flagged.
+2. The LHS of every `ifEq_tmpN ~ ifelse(...)` conditional equation —
+   if MTK eliminates the LHS, the if-equation lowering breaks.
+3. Variables with `fixed = true` and an explicit start value — the init
+   constraint emitted by `getFixedStartConstraintsMTK` must land on a
+   surviving unknown, so the symbol cannot be torn.
+
+ifCond discrete parameters are NOT in this list: they are parameters,
+not unknowns, so MTK never tries to eliminate them in the first place.
+"""
+function collectIrreducibleSymbols(simCode,
+                                   conditionalEquations::Vector{Expr},
+                                   stateVariables::Vector{String},
+                                   algebraicVariables::Vector{String},
+                                   occVariables::Vector{String})::Vector{Symbol}
+  #= Sort: `irreducibleVariables` is an unordered collection, and this list feeds
+     structural_simplify's tearing — a non-deterministic order yields a
+     non-deterministic (occasionally unsolvable) reduced system. =#
+  local syms = Symbol[Symbol(vn) for vn in sort!(collect(simCode.irreducibleVariables))]
+  for ceq in conditionalEquations
+    if ceq isa Expr && ceq.head == :call && length(ceq.args) >= 2
+      local lhs = ceq.args[2]
+      lhs isa Symbol && push!(syms, lhs)
+    end
+  end
+  for vn in fixedStartVarNames(vcat(stateVariables, algebraicVariables, occVariables), simCode)
+    local sym = Symbol(vn)
+    sym in syms || push!(syms, sym)
+  end
+  return syms
+end
+
+"""
+    whenConditionDiscreteSyms(simCode) -> OrderedSet{Symbol}
+
+Names of DISCRETE variables referenced in any when-equation condition. The
+generated DiscreteCallback condition reads each by its own name from the state
+vector, so these must not be aliased away by relay elimination.
+"""
+function whenConditionDiscreteSyms(simCode)::OrderedSet{Symbol}
+  local out = OrderedSet{Symbol}()
+  local ht = simCode.stringToSimVarHT
+  for weq in simCode.whenEquations
+    local stmts = weq.whenEquation
+    while stmts isa SimulationCode.WHEN_STMTS
+      for cref in Util.getAllCrefs(SimulationCode.toDAEExp(stmts.condition))
+        local nm = string(cref)
+        if haskey(ht, nm) && SimulationCode.isDiscrete(last(ht[nm]))
+          push!(out, Symbol(nm))
+        end
+      end
+      stmts = stmts.elsewhenPart
+    end
+  end
+  return out
+end
+
+"""
+    substituteRelayAliasesInWhens(simCode, relayAliases) -> simCode
+
+Re-point when-equation reads of relay-eliminated leaf names at the surviving
+representative, so the generated callbacks read surviving unknowns.
+"""
+function substituteRelayAliasesInWhens(simCode, relayAliases::Dict{Symbol, Symbol})
+  isempty(relayAliases) && return simCode
+  local wanted = OrderedSet{String}(string(k) for k in keys(relayAliases))
+  local tyOf = Dict{String, DAE.Type}()
+  local collectTy = function (@nospecialize(e), acc)
+    if e isa DAE.CREF
+      local nm = string(e.componentRef)
+      if nm in wanted && !haskey(tyOf, nm)
+        tyOf[nm] = e.ty
+      end
+    end
+    return (e, true, acc)
+  end
+  for weq in simCode.whenEquations
+    local stmts = weq.whenEquation
+    while stmts isa SimulationCode.WHEN_STMTS
+      Util.traverseExpTopDown(SimulationCode.toDAEExp(stmts.condition), collectTy, nothing)
+      for st in stmts.whenStmtLst
+        if st isa SimulationCode.ASSIGN
+          Util.traverseExpTopDown(SimulationCode.toDAEExp(st.left), collectTy, nothing)
+          Util.traverseExpTopDown(SimulationCode.toDAEExp(st.right), collectTy, nothing)
+        elseif st isa SimulationCode.REINIT
+          Util.traverseExpTopDown(SimulationCode.toDAEExp(st.value), collectTy, nothing)
+        end
+      end
+      stmts = stmts.elsewhenPart
+    end
+  end
+  local aliasMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
+  for (k, r) in relayAliases
+    local kStr = string(k)
+    local ty = get(tyOf, kStr, nothing)
+    ty === nothing && continue
+    local rStr = string(r)
+    aliasMap[kStr] = (rStr, false, DAE.CREF_IDENT(rStr, ty, MetaModelica.nil), ty)
+  end
+  isempty(aliasMap) && return simCode
+  local newWhens = [begin
+                      local inner = SimulationCode._substituteAliasInWhenStmts(whenEq.whenEquation, aliasMap)
+                      @assign whenEq.whenEquation = inner
+                      whenEq
+                    end
+                    for whenEq in simCode.whenEquations]
+  @assign simCode.whenEquations = newWhens
+  return simCode
+end
+
+#= ---- ODEProblem-construction strategies ----
+
+   At codegen time the function picks one of three strategies for building
+   the SciML ODEProblem. Each strategy lives in its own emitter so the
+   WHY-comment for each lives next to the code it justifies, and the
+   final call site reads as `problem = $(emitProblemConstruction(...))`. =#
+
+"""
+    emitDirectRHSProblem()
+
+Strategy 1: build the problem via `OMBackend.CodeGeneration.buildDirectRHSProblem`.
+Used when `useDirectRHS == true`. Skips MTK's standard `ODEProblem`
+constructor in favor of the direct-RHS path.
+"""
+emitDirectRHSProblem() = :(
+  problem = OMBackend.CodeGeneration.buildDirectRHSProblem(
+    reducedSystem, finalInitialValues, pars, tspan, callbacks;
+    allInitialValues = initialValues,
+    preMem = (@isdefined(DISCRETE_PRE_MEM) ? DISCRETE_PRE_MEM : nothing))
+)
+
+"""
+    emitStructuralTransitionProblem()
+
+Strategy 2: structural-transition submodel. The codegen-time decision is
+already made — we know we should skip MTK's initialization problem — but
+the choice between pure-ODE and DAE paths depends on the mass matrix,
+which only exists at simulate time. So this emitter returns an `Expr`
+that dispatches at runtime:
+
+- Pure ODE (identity mass matrix): all unknowns are differential, no
+  constraints to solve. Provide u0 for ALL unknowns (filling algebraic
+  defaults via `buildDefaultGuesses` at 0.0) and skip the initialization
+  solver. Preserves the fast path for models such as BouncingBall and
+  FreeFall.
+- DAE (singular mass matrix, e.g. Pendulum with algebraic `x = L*sin(phi)`
+  constraints): `splitInitialValues` has already pinned explicit-start
+  algebraic IVs as hard u0 and registered 0.0 soft guesses for uncovered
+  differential states on `reducedSystem.guesses`. Pass only
+  `finalInitialValues` as u0 and let MTK's initializer solve the algebraic
+  residuals consistently. Injecting `_missingU0` as hard u0 here would
+  override the guesses (e.g. phi=0 instead of phi=3π/4) and silently
+  violate the constraint, so it must not be merged.
+"""
+emitStructuralTransitionProblem() = quote
+  local _isPureODE = Base.invokelatest(
+    OMBackend.CodeGeneration.isPureODESystem, reducedSystem)
+  if _isPureODE
+    local _missingU0 = Base.invokelatest(
+      OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
+    problem = ModelingToolkit.ODEProblem(reducedSystem,
+                                         merge(Dict(finalInitialValues), _missingU0, pars),
+                                         tspan;
+                                         callback = callbacks,
+                                         warn_initialize_determined = false,
+                                         build_initializeprob = false)
+  else
+    problem = ModelingToolkit.ODEProblem(reducedSystem,
+                                         merge(Dict(finalInitialValues), pars),
+                                         tspan;
+                                         callback = callbacks,
+                                         warn_initialize_determined = false)
+  end
+end
+
+"""
+    emitInitSolveDAEProblem()
+
+Strategy 3: standard DAE-with-init-solver. Force MTK to build the
+initialization problem and solve as NLS so algebraic states pinned via
+`initialization_eqs` are honoured even when system algebraic residuals
+would otherwise pull them to a different consistent root. Without
+`fully_determined = false` MTK can sacrifice a `var ~ start` init
+residual against many algebraic residuals; without
+`build_initializeprob = true` MTK may skip the init solve entirely and
+leave `prob.u0` inconsistent with the init eqs.
+"""
+emitInitSolveDAEProblem() = :(
+  problem = ModelingToolkit.ODEProblem(reducedSystem,
+                                       merge(Dict(finalInitialValues), pars),
+                                       tspan;
+                                       callback = callbacks,
+                                       warn_initialize_determined = false,
+                                       build_initializeprob = true,
+                                       fully_determined = false)
+)
+
+"""
+    emitProblemConstruction(useDirectRHS::Bool, skipInitializeProb::Bool) -> Expr
+
+Pick the right ODEProblem-construction `Expr` for the codegen-time strategy
+combination. Three mutually exclusive strategies; see
+`emitDirectRHSProblem`, `emitStructuralTransitionProblem`,
+`emitInitSolveDAEProblem` for the WHY of each.
+"""
+function emitProblemConstruction(useDirectRHS::Bool, skipInitializeProb::Bool)::Expr
+  useDirectRHS         && return emitDirectRHSProblem()
+  skipInitializeProb   && return emitStructuralTransitionProblem()
+  return emitInitSolveDAEProblem()
+end
+
+"""
+    IfEquationComponent
+
+Codegen artifacts for one Modelica `if`-equation that has been lifted to an
+MTK event + residual pair. Produced by `createIfEquation`, consumed by
+`ODE_MODE_MTK_MODEL_GENERATION`.
+
+# Fields
+- `events`              : `Vector{Expr}` — one `SymbolicContinuousCallback`
+                          per branch condition. Each callback flips one of
+                          this if-equation's `ifCondN` discrete parameters
+                          at the branch's zero crossing.
+- `conditionalEquations`: `Vector{Expr}` — residual rewrites of the form
+                          `lhs ~ ifelse(ifCondN == 1, thenExpr, elseExpr)`,
+                          one per LHS variable the if-equation touches.
+- `conditionVariables`  : `Vector{Symbol}` — the `:ifCondNI` parameter
+                          symbols introduced for this if-equation. Marked
+                          irreducible at codegen time so MTK does not tear
+                          them.
+- `conditionNameAndIV`  : `Vector{Tuple{String, Bool}}` — `(name, initialValue)`
+                          pairs used to declare the discrete parameters with
+                          their compile-time initial values.
+"""
+struct IfEquationComponent
+  events               :: Vector{Expr}
+  conditionalEquations :: Vector{Expr}
+  conditionVariables   :: Vector{Symbol}
+  conditionNameAndIV   :: Vector{Tuple{String, Bool}}
+  #= Deferred pure-time-event branches: (ifCondSym, zeroCrossingLHS, mtkConditionEq,
+     postCrossingValue). `createIfEquations` builds one refresh callback per entry;
+     each fires at its own threshold, sets its own ifCond to the post-crossing value,
+     and re-derives the OTHER pure-time ifConds from their zero-crossing sign so that
+     coincident time events cannot drop one another's affect. =#
+  pureTimeEvents       :: Vector{Tuple{Symbol, Any, Any, Float64}}
+  #= `target => value` pair Exprs: the t0-selected branch RHS evaluated at the
+     start-value map, merged as soft guesses so guarded denominators do not
+     start at 0/0 in the DAE init. =#
+  relayGuesses         :: Vector{Expr}
+end
+
+"""
+  Generates simulation code targeting modeling toolkit.
   Loop code removed was on old branch.
 """
 function generateMTKCode(simCode::SimulationCode.SIM_CODE)
@@ -53,72 +500,126 @@ end
   or do code generation for a model with structural submodels.
 """
 function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
-    #=If our model name is separated by . replace it with __ =#
-  local MODEL_NAME = replace(simCode.name, "." => "__")
-  if (isempty(simCode.structuralTransitions) && length(simCode.subModels) < 1)
+  #=If our model name is separated by . replace it with __ =#
+  local MODEL_NAME = simCode.name
+  #= Generate code for algorithmic Modelica =#
+  (functions, functionNames) = AlgorithmicCodeGeneration.generateFunctions(simCode.functions)
+  if !SimulationCode.hasStructuralTransitions(simCode) && !SimulationCode.hasSubModels(simCode) && !SimulationCode.hasFlatModel(simCode)
     #= Generate using the standard name =#
-    return ODE_MODE_MTK_PROGRAM_GENERATION(simCode, simCode.name)
+    return ODE_MODE_MTK_PROGRAM_GENERATION(simCode, simCode.name, functions)
   end
   #= Handle structural submodels =#
-  #= TODO: Extract the active model =#
   local activeModelSimCode = getActiveModel(simCode)
   local activeModelName = simCode.activeModel
   local structuralModes = Expr[]
   for mode in simCode.subModels
-    push!(structuralModes, ODE_MODE_MTK_MODEL_GENERATION(mode, mode.name))
+    push!(structuralModes, ODE_MODE_MTK_MODEL_GENERATION(mode, mode.name, functions; useDirectRHS = false))
   end
   if isempty(simCode.subModels)
-    local modelName = MODEL_NAME * "DEFAULT"
-    defaultModel = ODE_MODE_MTK_MODEL_GENERATION(simCode, modelName)
+    local modelName = string(MODEL_NAME, "DEFAULT")
+    defaultModel = ODE_MODE_MTK_MODEL_GENERATION(simCode, modelName, functions; useDirectRHS = false)
     activeModelName = modelName
     push!(structuralModes, defaultModel)
   end
   local structuralCallbacks = createStructuralCallbacks(simCode, simCode.structuralTransitions)
   local structuralAssignments = createStructuralAssignments(simCode, simCode.structuralTransitions)
-  #= Initialize array where the common variables are stored. That is variables all modes have =#
+  #=
+  Initialize array where the common variables are stored.
+  That is variables all modes have
+  =#
   local commonVariables = createCommonVariables(simCode.sharedVariables)
+  #= Collect DATA_STRUCTURE (Modelica constant) assignments for module-level emission.
+     Without these, parameter binding expressions that reference MSL constants
+     (e.g. Modelica.Mechanics.MultiBody.Types.Defaults.*) would fail at runtime
+     because the symbols are never defined in the generated module scope. =#
+  local _dsVarNames = String[]
+  for varName in keys(simCode.stringToSimVarHT)
+    (_, var) = simCode.stringToSimVarHT[varName]
+    @match var.varKind begin
+      SimulationCode.DATA_STRUCTURE(__) => push!(_dsVarNames, varName)
+      _ => nothing
+    end
+  end
+  local DATA_STRUCTURE_ASSIGNMENTS = createDataStructureAssignments(_dsVarNames, simCode)
+  #= Append top level variables to the common variables =#
   #= END =#
   code = quote
     import DAE
     import DataStructures.OrderedCollections
+    using DataStructures.OrderedCollections: OrderedSet
     import SCode
     import OMBackend
     import OMBackend.CodeGeneration
+    import Setfield
     using ModelingToolkit
     using DifferentialEquations
+    using DiffEqCallbacks
+    Base.Experimental.@compiler_options optimize=0 compile=min infer=false
+    $(createStringParameterAssignments(simCode)...)
+    $(createArrayParameterPrelude(simCode)...)
+    $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(structuralModes...)
     $(structuralCallbacks...)
     #=
       This function can be used to fetch the top level callbacks that is the collected callbacks of the model.
-      Each callback is coupled to each when with recompilation expression.
+      Each callback is coupled to each "when-equation" with a recompilation expression.
     =#
     function $(Symbol(MODEL_NAME * "Model"))(tspan = (0.0, 1.0))
       #=  Assign the initial model  =#
-      (subModel, initialValues, reducedSystem, _, pars, vars1) = $(Symbol(activeModelName  * "Model"))(tspan)
+      (subModel, callbacks, finalInitialValues, initialValues, reducedSystem, _, pars, vars1) = $(Symbol(string(activeModelName, "Model")))(tspan)
+      global LATEST_REDUCED_SYSTEM = reducedSystem
       #= Assign the structural callbacks =#
       $(structuralAssignments)
       $(commonVariables)
       #= END =#
-      callbackConditions = $(if isempty(structuralCallbacks)
-                               :(CallbackSet())
-                             elseif length(structuralCallbacks) == 1
-                               :(CallbackSet(first(callbackSet)))
+      # Also need to have the original callbacks
+      callbackConditions = $(if !isempty(structuralCallbacks)
+                               :(CallbackSet(callbacks, callbackSet...))
                              else
-                               :(CallbackSet(Tuple(callbackSet), ())) #TODO: I think this only applies to continious callbacks.
+                               :(CallbackSet(callbacks, callbackSet...))
                              end)
-      #= Create the composite model =#
-      compositeProblem = ModelingToolkit.ODEProblem(
-        reducedSystem,
-        initialValues,
-        tspan,
-        pars,
-        callback = callbackConditions,
-      )
+      #= Create the composite model. Dispatch on the mass matrix of the initial
+         submodel exactly like the submodel builder does: pure ODE takes the
+         fast fill-all-u0 / skip-initializer path; DAE routes finalInitialValues
+         as hard u0 while letting the initializer use reducedSystem.guesses
+         (already populated by splitInitialValues) to solve algebraic residuals
+         such as x = L*sin(phi) for the Pendulum. Injecting _compositeGuesses
+         as hard u0 for a DAE submodel would pin phi = 0 and silently violate
+         the constraint. =#
+      local _compositeIsPureODE = Base.invokelatest(
+        OMBackend.CodeGeneration.isPureODESystem, reducedSystem)
+      if _compositeIsPureODE
+        local _compositeGuesses = Base.invokelatest(
+          OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
+        compositeProblem = ModelingToolkit.ODEProblem(
+          reducedSystem,
+          merge(Dict(finalInitialValues), _compositeGuesses, pars),
+          tspan;
+          callback = callbackConditions,
+          warn_initialize_determined = false,
+          build_initializeprob = false,
+        )
+      else
+        compositeProblem = ModelingToolkit.ODEProblem(
+          reducedSystem,
+          merge(Dict(finalInitialValues), pars),
+          tspan;
+          callback = callbackConditions,
+          warn_initialize_determined = false,
+        )
+      end
+      #=
+      Note the difference between the two here.
+      In the case of recompilation we will get fresh callbacks updated to the new structure of the final code.
+      =#
       result = $(if simCode.metaModel == nothing
-                 :(OMBackend.Runtime.OM_ProblemStructural($(activeModelName),
-                                                          compositeProblem,
-                                                          structuralCallbacks,
-                                                          commonVariables))
+                   :(OMBackend.Runtime.OM_ProblemStructural($(activeModelName),
+                                                            compositeProblem,
+                                                            structuralCallbacks,
+                                                            pars,
+                                                            commonVariables,
+                                                            $([Symbol(string(i,"(t)")) for i in simCode.topVariables]),
+                                                            callbackSet))
                  else
                  :(OMBackend.Runtime.OM_ProblemRecompilation($(activeModelName),
                                                              compositeProblem,
@@ -127,96 +628,485 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
                  end)
       return result
     end
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0); solver=Rodas5())
+    # function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0), solver=Rodas5(autodiff=false))
+    #   $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
+    #   OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver)
+    # end
+
+    function simulate(tspan = (0.0, 1.0), solver=Rodas5(); kwargs...)
       $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
-      OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver)
+      OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver; kwargs...)
     end
   end
-  return (MODEL_NAME, code)
+  local moduleExpr = Expr(:module, true, Symbol(MODEL_NAME), stripBeginBlocks(code))
+  return (MODEL_NAME, moduleExpr)
 end
 
 """
   Generates a MTK program with a model
 """
-function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, modelName)
-  local MODEL_NAME = replace(modelName, "." => "__")
-  local model = ODE_MODE_MTK_MODEL_GENERATION(simCode, modelName)
-  program = quote
+function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions)
+  local MODEL_NAME = modelName
+  local _condDiscretes = whenConditionDiscreteSyms(simCode)
+  #= Functions are eval'd inside ODE_MODE_MTK_MODEL_GENERATION (called below)
+     immediately before @register_symbolic, so no need to eval them here. =#
+  local dataStructureVariables = String[]
+  for varName in (keys(simCode.stringToSimVarHT))
+    (idx, var) = simCode.stringToSimVarHT[varName]
+    @match var.varKind begin
+      SimulationCode.DATA_STRUCTURE(__) => begin
+        push!(dataStructureVariables, varName)
+      end
+      _ => continue
+    end
+  end
+  local DATA_STRUCTURE_ASSIGNMENTS = createDataStructureAssignments(dataStructureVariables, simCode)
+  local model = ODE_MODE_MTK_MODEL_GENERATION(simCode, modelName, functions)
+  #= Qualify bare Modelica function calls in function bodies so they resolve correctly
+     when the program is eval'd in OMBackend scope (backendAPI.jl) rather than CodeGeneration scope.
+     Without this, implementation bodies that call other Modelica functions (e.g., normalizeWithAssert
+     calling Vectors_length) would fail with UndefVarError. =#
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
+  if !isempty(funcNames)
+    for f in functions
+      qualifyModelicaFunctions!(f, funcNames)
+    end
+  end
+  programBody = quote
     using ModelingToolkit
     using DifferentialEquations
+    using DiffEqCallbacks
+    using OrdinaryDiffEq
+    using Symbolics
+    using OMBackend
+    using DataStructures.OrderedCollections: OrderedSet
+    import Setfield
+    Base.Experimental.@compiler_options optimize=0 compile=min infer=false
+    #= Add import to the external runtime if the generated code calls Modelica Functions =#
+    $(if simCode.externalRuntime
+        generateExternalRuntimeImport()
+      end)
+    $(functions...)
+    $(createStringParameterAssignments(simCode)...)
+    $(createArrayParameterPrelude(simCode)...)
+    $(DATA_STRUCTURE_ASSIGNMENTS...)
+    $(generateRegisterCallsForCallExprs(simCode)...)
+    $(generateInitialAlgorithmEarlyFunction(simCode))
+    $(generateInitialAlgorithmFunction(simCode))
     $(model)
-    function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0); solver=Rodas5())
-      ($(Symbol("$(MODEL_NAME)Model_problem")), ivs, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), tspan, pars, vars) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
-      solve($(Symbol("$(MODEL_NAME)Model_problem")), solver)
+    #= simulateFromBuild: post-build solve pipeline (init-alg, Rodas/FBDF auto-switch,
+       DAE routing, InitialFailure retry, terminal events). Extracted from simulate so
+       the iMTK path can drive it with a cached build; simulate behavior is unchanged. =#
+    function simulateFromBuild(built, tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
+      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreducible) = built
+      global LATEST_REDUCED_SYSTEM = $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))
+      global LATEST_PROBLEM = $(Symbol("$(MODEL_NAME)Model_problem"))
+      #= Run in the latest world age: __runInitialAlgorithm! is compiled at
+         module-eval time, before `Model()` runs `eval(_batchBlock)` to create
+         the Symbolics bindings (e.g. `a`, `iNV3S_enable`) that algorithm-lifter
+         bodies reference. Calling the function directly resolves those names
+         in the older compile-time world and throws
+         `UndefVarError: ... binding may be too new`. =#
+      local _hardStarts = Base.invokelatest(__runInitialAlgorithm!)
+      #= Stash the un-remake'd problem so the solve() fallback below can
+         retry without enforced init-alg u0 if MTK's init system finds the
+         hard-start values infeasible against the algebraic constraints. =#
+      local _origProblem = $(Symbol("$(MODEL_NAME)Model_problem"))
+      local _didRemake = false
+      #= If the init algorithm assigned any non-parameter variables, replay
+         those values through `remake(prob; u0=…)` so MTK treats them as
+         hard initial conditions (Modelica §11.2). Symbolic-Num dict keys
+         from LATEST_REDUCED_SYSTEM are required — bare Symbol keys are
+         silently no-op'd by MTK's u0 dispatch. =#
+      if _hardStarts isa AbstractDict && !isempty(_hardStarts)
+        #= Filter to only the keys that are actual `unknowns` of the reduced
+           system. Init-algorithm LHSs that get alias-eliminated post-simplify
+           still resolve via `getproperty` (they survive as observed equations)
+           but `remake`'s u0 validator rejects them with "present in the
+           system but … is not an unknown". The existing `setu` mutation
+           inside __runInitialAlgorithm! already propagates those via the
+           alias-map's observed equation, so dropping them is safe. =#
+        local _unkNames = try
+          OrderedSet(string(u) for u in ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM))
+        catch
+          OrderedSet{String}()
+        end
+        #= Float-convert: Int-valued entries make remake_buffer promote a
+           Float64 parameter buffer to Int64, failing on fractional entries. =#
+        local _hardFiltered = Dict(first(p) => Float64(last(p))
+                                   for p in _hardStarts if string(first(p)) in _unkNames)
+        if !isempty(_hardFiltered)
+          try
+            global LATEST_PROBLEM = ModelingToolkit.SciMLBase.remake(
+              LATEST_PROBLEM; u0 = _hardFiltered)
+            $(Symbol("$(MODEL_NAME)Model_problem")) = LATEST_PROBLEM
+            _didRemake = true
+          catch _ialgErr
+            #= The cycle-19 remake is now redundant for variables that the
+               module-load-time `__runInitialAlgorithmEarly!()` path already
+               pinned via `initialization_eqs`. After MTK's init solve runs
+               those constraints, alias elimination can prune the symbolic
+               key out of the problem's u0 vector, and `remake(; u0 = Dict)`
+               then raises `BoundsError` / "key not an unknown". That is
+               harmless because the init-eq value is already in the solved
+               state. Demote to debug — a real failure would still surface
+               from the solve itself. =#
+            @debug "[MTK GEN: simulate] init-alg hard-start remake skipped (init-eqs already covered)" exception=_ialgErr
+          end
+        end
+      end
+      #= Auto-switch from Rosenbrock (default Rodas5) to FBDF for DAE shapes
+         where Rosenbrock mass-matrix stepping is known to be brittle:
+         purely-algebraic systems, and mixed systems with algebraic rows for
+         generated discrete variables. Brake reaches a consistent initial
+         residual, but Rodas5P immediately aborts with dt_epsilon/NaN while
+         FBDF advances the same mass-matrix problem. User-chosen non-Rosenbrock
+         solvers are respected as-is. =#
+      local _solver = solver
+      local _solverName = string(nameof(typeof(solver)))
+      if startswith(_solverName, "Rodas") || startswith(_solverName, "Rosenbrock")
+        local _u0 = $(Symbol("$(MODEL_NAME)Model_problem")).u0
+        local _n = _u0 === nothing ? 0 : length(_u0)
+        local _mm = $(Symbol("$(MODEL_NAME)Model_problem")).f.mass_matrix
+        #= Event-trigger discretes (referenced in a when-condition) are latched by
+           DiscreteCallbacks and are not part of the brittle Rosenbrock mass-matrix
+           coupling the FBDF switch targets; excluding them keeps the default
+           Rosenbrock solver, which handles them without the FBDF tstop chatter. =#
+        local _discreteUnknownNames = OrderedSet{String}($(Expr(:vect, [string(varName, "(t)") for (varName, (_, simVar)) in simCode.stringToSimVarHT if simVar.varKind isa SimulationCode.DISCRETE && !(Symbol(varName) in _condDiscretes)]...)))
+        #= UniformScaling (pure ODE) supports `_mm[i,i]` as 1; explicit Matrix
+           returns the entry. Both code paths handle by indexing the diagonal.
+           When u0 is nothing (purely-algebraic MTK problem) the loop runs 0
+           times so _nDiff stays 0 — exactly the case where FBDF is wanted. =#
+        local _nDiff = count(i -> _mm[i,i] != 0, 1:_n)
+        local _nAlg = _n - _nDiff
+        #= MTK renders subscripted unknowns as var"name[i]"(t); strip the quote
+           wrapper so names compare against the simvar-derived literals. =#
+        local _mtkName = u -> replace(replace(string(u), "var\"" => ""), "\"" => "")
+        if _nDiff == 0
+          @info "[MTK GEN: solver] zero differential states detected, switching default $(_solverName) -> FBDF for purely-algebraic DAE"
+          _solver = FBDF(autodiff=false)
+        elseif _nAlg > 0 && !isempty(_discreteUnknownNames) && $(isempty(simCode.whenEquations))
+          #= Only when the model has NO when-equation callbacks: event-driven
+             discretes are kept consistent by their callbacks and integrate fine
+             with the Rosenbrock default, while FBDF's post-event
+             re-initialization collapses dt at the first event instant. =#
+          local _unknowns = try
+            ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM)
+          catch
+            Any[]
+          end
+          local _nCheck = min(_n, length(_unknowns))
+          local _hasDiscreteAlgUnknown = any(i -> _mm[i,i] == 0 && _mtkName(_unknowns[i]) in _discreteUnknownNames, 1:_nCheck)
+          if _hasDiscreteAlgUnknown
+            @info "[MTK GEN: solver] algebraic rows involving generated discrete variables detected in mass-matrix system; switching default $(_solverName) -> FBDF"
+            _solver = FBDF(autodiff=false)
+          end
+        end
+      end
+      # Route DAE-native solvers (e.g. Sundials.IDA, DABDF2, DFBDF) through a residual-form DAEProblem rather than the ODEProblem with mass matrix.
+      local _problemForSolver = if _solver isa ModelingToolkit.SciMLBase.AbstractDAEAlgorithm
+        OMBackend.CodeGeneration.ode_to_dae($(Symbol("$(MODEL_NAME)Model_problem")))
+      else
+        $(Symbol("$(MODEL_NAME)Model_problem"))
+      end
+      #= Pass callbacks at solve time. MTK's ODEProblem(callback=...) kwarg
+         silently drops ContinuousCallback objects (only the DiscreteCallback
+         init survives), so when-clause root-find callbacks never fire when
+         routed through the prob. solve() merges with prob.kwargs[:callback]
+         so MTK's init still runs in addition to our callbacks. =#
+      #= Stash the exact runtime solve inputs so a manual integrator loop can
+         reproduce the real event wiring (debug aid for friction/event work). =#
+      global LATEST_SOLVE_TRIPLE = (_problemForSolver, _solver, callbacks)
+      #= Table-cluster models: Broyden event re-init diverges on piecewise
+         constant residuals; default to Newton-FD unless the caller chose. =#
+      local _initKw = $(_modelHasTableClusters(simCode)) && !haskey(kwargs, :initializealg) ?
+        (; initializealg = OMBackend.CodeGeneration.tableClusterInitAlg()) : (;)
+      #= pre(x) at the first event equals the committed x(t0): refresh the
+         lifted-discrete memory from this run's initial state. =#
+      if @isdefined(DISCRETE_PRE_MEM)
+        Base.invokelatest(OMBackend.CodeGeneration.resetDiscretePreMem!,
+                          DISCRETE_PRE_MEM, LATEST_REDUCED_SYSTEM,
+                          $(Symbol("$(MODEL_NAME)Model_problem")).u0)
+      end
+      local _sol = if haskey(kwargs, :callback)
+        solve(_problemForSolver, _solver; kwargs..., _initKw...)
+      else
+        solve(_problemForSolver, _solver; callback=callbacks, kwargs..., _initKw...)
+      end
+      #= If the init-alg-remake'd problem produced InitialFailure (MTK could
+         not reconcile init-alg hard-start u0 with the algebraic constraints),
+         fall back to the un-remake'd problem so the solver can pick any
+         consistent u0. This matches pre-cycle-19 behavior for models where
+         the init-alg LHS values would be silently overwritten by MTK's init
+         solver anyway (e.g. KinematicPTPHandwritten — algebraic-only model
+         whose init-alg assignments conflict with algebraic equations). =#
+      if _didRemake && _sol.retcode == ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
+        @info "[MTK GEN: simulate] init-alg hard-start caused InitialFailure; retrying without hard-start"
+        global LATEST_PROBLEM = _origProblem
+        $(Symbol("$(MODEL_NAME)Model_problem")) = _origProblem
+        local _fallbackProb = if _solver isa ModelingToolkit.SciMLBase.AbstractDAEAlgorithm
+          OMBackend.CodeGeneration.ode_to_dae(_origProblem)
+        else
+          _origProblem
+        end
+        if @isdefined(DISCRETE_PRE_MEM)
+          Base.invokelatest(OMBackend.CodeGeneration.resetDiscretePreMem!,
+                            DISCRETE_PRE_MEM, LATEST_REDUCED_SYSTEM, _origProblem.u0)
+        end
+        _sol = if haskey(kwargs, :callback)
+          solve(_fallbackProb, _solver; kwargs..., _initKw...)
+        else
+          solve(_fallbackProb, _solver; callback=callbacks, kwargs..., _initKw...)
+        end
+      end
+      #= Run `when terminal()` bodies once against the final solution (gated: emitted only if the model has a terminal event). =#
+      $(createTerminalBodyRunner(simCode))
+      _sol
+    end
+    function simulate(tspan = (0.0, 1.0), solver = Rodas5(); cached_build = nothing, kwargs...)
+      local built = cached_build === nothing ? $(Symbol("$(MODEL_NAME)Model"))(tspan) : cached_build
+      return simulateFromBuild(built, tspan, solver; kwargs...)
     end
   end
   #= MODEL_NAME is preprocessed with . replaced with _=#
-  return MODEL_NAME, program
+  local moduleExpr = Expr(:module, true, Symbol(MODEL_NAME), stripBeginBlocks(programBody))
+  return MODEL_NAME, moduleExpr
 end
 
 """
   Generates a MTK model
 """
-function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelName)
-  @debug "Runnning: ODE_MODE_MTK_MODEL"
+function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions; useDirectRHS::Bool = OMBackend.DIRECT_RHS_GENERATION[])
   RESET_CALLBACKS()
-  local stringToSimVarHT = simCode.stringToSimVarHT
-  local equations::Vector = BDAE.RESIDUAL_EQUATION[]
-  local exp::DAE.Exp
-  local parameters::Vector = String[]
-  local stateDerivatives::Vector = String[]
-  local stateVariables::Vector = String[]
-  local algebraicVariables::Vector = String[]
-  local discreteVariables::Vector = String[]
-  local performIndexReduction = false
-  for varName in keys(stringToSimVarHT)
-    (idx, var) = stringToSimVarHT[varName]
-    local varType = var.varKind
-    local varType = var.varKind
-    @match varType  begin
-      SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
-      SimulationCode.STATE(__) => push!(stateVariables, varName)
-      SimulationCode.PARAMETER(__) => push!(parameters, varName)
-      SimulationCode.ALG_VARIABLE(__) => begin
-        #=TODO: Seems to be unable to find variables in some cases...
-        should there be an and here? Keep track of variables that are also involved in if/when structures
-        =#
-        if idx in simCode.matchOrder
-          push!(algebraicVariables, varName)
-        elseif involvedInEvent(idx, simCode) #= We have a variable that is not contained in continious system =#
-          #= Treat discrete variables separate =#
-          push!(discreteVariables, varName)
-        elseif simCode.isSingular
-          #=
-          If the variable is not involved in an event and the index is not in match order and
-          the system is singular.
-          This means that the variable is probably algebraic however, we need to perform index reduction.
-          =#
-          push!(algebraicVariables, varName)
-        end
-      end
-      #=TODO:johti17 Do I need to modify this?=#
-      SimulationCode.STATE_DERIVATIVE(__) => push!(stateDerivatives, varName)
-    end
-  end
-  performIndexReduction = simCode.isSingular
+
+  #= Phase A — eval generated Modelica functions and their @register_symbolic
+     calls into OMBackend so subsequent codegen sees the bindings. =#
+  evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
+
+  #= Phase B — bucket each simvar by varKind (state / algebraic / discrete
+     / parameter / array / occ / data-structure / state-derivative) and
+     extract StateSelect priority pairs. =#
+  local vars = classifyVariables(simCode)
+  local stateVariables         = vars.stateVariables
+  local algebraicVariables     = vars.algebraicVariables
+  local discreteVariables      = vars.discreteVariables
+  local occVariables           = vars.occVariables
+  local parameters             = vars.parameters
+  local arrayParameters        = vars.arrayParameters
+  local stateDerivatives       = vars.stateDerivatives
+  local dataStructureVariables = vars.dataStructureVariables
+  local statePriorityPairs     = vars.statePriorityPairs
+
+
+  local performIndexReduction = simCode.isSingular
+  local skipInitializeProb = SimulationCode.hasStructuralTransitions(simCode) ||
+                             SimulationCode.hasMetaModel(simCode) ||
+                             SimulationCode.hasFlatModel(simCode)
+  #= Solve parametric initial equations (initial equations that only involve parameters).
+     This determines values for fixed=false parameters before code generation. =#
+  solveParametricInitialEquations!(simCode)
   #= Create equations for variables not in a loop + parameters and stuff=#
-  local equations = createResidualEquationsMTK(stateVariables,
+  local EQUATIONS = createResidualEquationsMTK(stateVariables,
                                                algebraicVariables,
                                                simCode.residualEquations,
                                                simCode::SimulationCode.SIM_CODE)
-  local parVariablesSym = [Symbol(p) for p in parameters]
-  local START_CONDTIONS_EQUATIONS = createStartConditionsEquationsMTK(stateVariables, algebraicVariables, simCode)
-  local DISCRETE_START_VALUES = getStartConditionsMTK(discreteVariables, simCode)
+  @BACKEND_LOGGING writeEqsToFile(EQUATIONS, OMBackend.logPath("backend/codeGen", "equationFirstStageCodeGen.log"))
+  #=
+  If missing from variable map error is thrown check the start condition.
+  Readded discretes here....
+  =#
+  local INITIAL_GUESS_EQUATIONS = createStartConditionsEquationsMTK(vcat(stateVariables, occVariables),
+                                                                      algebraicVariables,
+                                                                      simCode)
+
+
+  local DISCRETE_START_VALUES = vcat(generateInitialEquations(simCode.initialEquations, simCode; parameterAssignment = true),
+                                     getStartConditionsMTK(discreteVariables, simCode))
   local PARAMETER_EQUATIONS = createParameterEquationsMTK(parameters, simCode)
   local PARAMETER_ASSIGNMENTS = createParameterAssignmentsMTK(parameters, simCode)
-  local PARAMETER_RAW_ARRAY = createParameterArray(parameters, simCode)
-  #= Create callback equations. For MTK we disable the saving function for now. =#
-  local CALL_BACK_EQUATIONS = createCallbackCode(modelName, simCode; generateSaveFunction = false)
+  local PARAMETER_RAW_ARRAY = createParameterArray(parameters, PARAMETER_ASSIGNMENTS, simCode)
+  local ARRAY_PARAMETERS = createArrayParametersMTK(arrayParameters, simCode)
+  #= Legacy callback generation is deferred until after relay elimination so
+     the callbacks read the surviving relay representatives (see below). =#
+  local IF_EQUATION_COMPONENTS::Vector{IfEquationComponent} =
+    createIfEquations(stateVariables, algebraicVariables, simCode)
+  local RELAY_GUESS_PAIRS = collect(Iterators.flatten(c.relayGuesses for c in IF_EQUATION_COMPONENTS))
+  #= Deterministic t0 values derived from parameters and fixed=true starts;
+     they override guess-grade init values (wrong guesses near a guarded
+     division start the consistent-IC solve at a blow-up point). =#
+  local TRUSTED_GUESS_PAIRS = Expr[:($(QuoteNode(k)) => $(v)) for (k, v) in
+                                   MTK_CodeGenerationUtil.buildT0TrustedDerivedPairs(simCode)]
   #= Symbolic names =#
-  local stateVariablesSym = [:($(Symbol(v))(t)) for v in stateVariables]
-  local algebraicVariablesSym = [:($(Symbol(v))(t)) for v in algebraicVariables]
-  local discreteVariablesSym = [:($(Symbol(v))) for v in discreteVariables]
+  local algebraicVariablesSym = Symbol[:($(Symbol(v))) for v in algebraicVariables]
+  local dataStructureVariablesSym = Symbol[Symbol(v) for v in dataStructureVariables]
+  local stateVariablesSym = Symbol[:($(Symbol(v))) for v in stateVariables]
+  local occVariablesSym = Symbol[:($(Symbol(v))) for v in occVariables]
+  local parVariablesSym = Symbol[Symbol(p) for p in parameters]
+  #= Phase 6: discrete-dummy demotion. Each discrete variable starts with a
+     placeholder `der(d) ~ 0` so SciML has a state slot for callbacks to
+     write into. When a residual equation already pins `d` definitionally
+     (alias, ifelse, comparison, integer cast, ifEq_tmp target, pairwise
+     discrete alias, ...), MTK's structural_simplify uses that equation
+     to eliminate `d`, stranding the dummy and over-determining the system.
+     `planDemotions` detects those cases (plus cyclic-SCC discretes and a
+     bounded heuristic for any remaining excess) and `applyDemotionPlan!`
+     drops the corresponding dummies, reclassifying the names as algebraic.
+     See OMBackend/src/CodeGeneration/DiscreteDummyDemotion.jl for the
+     full pattern catalogue and the when-equation safety rule. =#
+  local discreteVariablesSym = Symbol[:($(Symbol(v))) for v in discreteVariables]
+  local DISCRETE_DUMMY_EQUATIONS = [:(der($(Symbol(dv))) ~ 0) for dv in discreteVariables]
+  local _demotionPlan = planDemotions(simCode, EQUATIONS, IF_EQUATION_COMPONENTS,
+                                      discreteVariables,
+                                      length(stateVariables),
+                                      length(algebraicVariables),
+                                      length(occVariables))
+  (DISCRETE_DUMMY_EQUATIONS, discreteVariablesSym) =
+    applyDemotionPlan!(_demotionPlan, discreteVariables, DISCRETE_DUMMY_EQUATIONS,
+                       discreteVariablesSym, algebraicVariablesSym)
+  #= Phase F — flatten the per-if-equation components into one event-decl
+     Expr (wrapped in invokelatest because event exprs reference Symbolics
+     bindings only created later inside the model function), plus three
+     flat lists used by downstream phases. =#
+  local IF_EQUATION_EVENTS = collect(Iterators.flatten(c.events for c in IF_EQUATION_COMPONENTS))
+  #= Synthesised discrete-Boolean whens become MTK SymbolicContinuousCallbacks
+     (observed-variable-capable), appended to the if-equation event vector. =#
+  IF_EQUATION_EVENTS = vcat(IF_EQUATION_EVENTS, createDiscreteBoolWhenEvents(simCode),
+                            createSelfSchedulingTimeWhenEvents(simCode))
+  local IF_EQUATION_EVENT_DECLARATION = buildIfEquationEventDecl(IF_EQUATION_EVENTS)
+  local CONDITIONAL_EQUATIONS = collect(Iterators.flatten(c.conditionalEquations for c in IF_EQUATION_COMPONENTS))
+  local ifConditionNameAndIV = collect(Iterators.flatten(c.conditionNameAndIV for c in IF_EQUATION_COMPONENTS))
+  local ifConditionalVariables = collect(Iterators.flatten(c.conditionVariables for c in IF_EQUATION_COMPONENTS))
+  #= ifCond variables are parameters (not ODE unknowns).
+     Build @parameters declarations WITHOUT time dependency to avoid MTK creating
+     Shift operators. Plain parameters are still modifiable by callback affects. =#
+  local ifCondParamDecls = Expr[]
+  local ifCondParamPairs = Expr[]
+  for (name, initVal) in ifConditionNameAndIV
+    local sym = Symbol(name)
+    local numVal = initVal ? 1.0 : 0.0
+    push!(ifCondParamDecls, Expr(:(=), sym, numVal))
+    push!(ifCondParamPairs, :($(sym) => $(numVal)))
+  end
+  #= Phase G — collect the symbols MTK tearing must not eliminate
+     (simCode-flagged irreducibles + ifEq_tmp LHS targets + fixed-start
+     variables). =#
+  local irreducibleSyms = collectIrreducibleSymbols(simCode, CONDITIONAL_EQUATIONS,
+                                                    stateVariables, algebraicVariables,
+                                                    occVariables)
+
+  #= Heuristic for initialization:
+     - If any state variable has an explicit start value, assume the system has algebraic
+       constraints and only initialize states with explicit starts (avoid overdetermination).
+     - If NO state has an explicit start, provide defaults for all states (pure ODE case).
+     - Exception: when build_initializeprob is disabled (structural transition models),
+       there is no initialization solver to infer values from constraints/guesses, so
+       we MUST provide u0 defaults for all unknowns.
+     This handles both constrained DAE systems (like Pendulum) and pure ODE systems
+     (like MatrixVectorMult where states have no explicit start). =#
+  local anyStateHasExplicitStart = hasExplicitStartValue(simCode.irreducibleVariables, simCode)
+  local skipDefaultsForStates = anyStateHasExplicitStart
+  #= Build default guesses for unknowns not in the heuristic-filtered u0.
+     Guesses are passed to ODEProblem so the init solver has fallback values
+     without overdetermining the system. =#
+  local INITIAL_VALUE_EQUATIONS = unique!(createStartConditionsEquationsMTK(
+    String[vn for vn in simCode.irreducibleVariables],
+    String[],
+    simCode; skipDefaultStateStarts = skipDefaultsForStates))
+  INITIAL_VALUE_EQUATIONS = vcat(DISCRETE_START_VALUES, INITIAL_VALUE_EQUATIONS)
+  INITIAL_GUESS_EQUATIONS = vcat(DISCRETE_START_VALUES, INITIAL_GUESS_EQUATIONS)
+  #=
+    Merge equations. ifCond variables are discrete parameters so they are NOT
+    included in stateVariablesSym and do NOT get der() ~ 0 equations.
+  =#
+  stateVariablesSym = vcat(discreteVariablesSym,
+                           stateVariablesSym,
+                           occVariablesSym)
+  #= Discretes read by a callback condition must survive relay elimination under
+     their own name: the generated condition indexes the state vector by that name,
+     so re-aliasing it to another leaf strands the lookup. Force them to be the
+     relay component root. =#
+  local _condDiscretes = whenConditionDiscreteSyms(simCode)
+  #= They must also survive structural_simplify as unknowns: a condition cref
+     demoted to an MTK observed is unreadable from the legacy callback. =#
+  for _s in _condDiscretes
+    _s in irreducibleSyms || push!(irreducibleSyms, _s)
+  end
+  #= Parameters have no module-global symbolic binding (they live in the local
+     @parameters block and the pars dict), so a relay must never collapse a
+     variable onto one. =#
+  local _paramSyms = OrderedSet{Symbol}(Symbol(name)
+    for (name, (_, sv)) in simCode.stringToSimVarHT
+    if sv.varKind isa SimulationCode.PARAMETER || sv.varKind isa SimulationCode.ARRAY_PARAMETER)
+  local (_ifEqRelay_eqs, _ifEqRelay_aliases) = eliminateIfEqRelays(EQUATIONS; preferKeep = _condDiscretes, paramSyms = _paramSyms)
+  EQUATIONS = _ifEqRelay_eqs
+  if !isempty(_ifEqRelay_aliases)
+    @info "[RELAY] aliases" _ifEqRelay_aliases
+    local _drop = OrderedSet(keys(_ifEqRelay_aliases))
+    local _dropStr = OrderedSet(string.(keys(_ifEqRelay_aliases)))
+    stateVariablesSym = filter(s -> s ∉ _drop, stateVariablesSym)
+    algebraicVariablesSym = filter(s -> s ∉ _drop, algebraicVariablesSym)
+    algebraicVariables = filter(s -> s ∉ _dropStr, algebraicVariables)
+    irreducibleSyms = filter(s -> s ∉ _drop, irreducibleSyms)
+    local _keepPair = eq -> begin
+      local inner = _unwrapBlock(eq)
+      if inner isa Expr && inner.head === :call && length(inner.args) == 3 && inner.args[1] === :(=>)
+        inner.args[2] isa Symbol && inner.args[2] in _drop && return false
+      end
+      true
+    end
+    local _keepDummy = eq -> begin
+      local inner = _unwrapBlock(eq)
+      if inner isa Expr && inner.head === :call && length(inner.args) == 3 && inner.args[1] === :~
+        local lhs = _unwrapBlock(inner.args[2])
+        if lhs isa Expr && lhs.head === :call && length(lhs.args) == 2 &&
+           (lhs.args[1] === :der || lhs.args[1] === :D)
+          local sym = _simpleLeafSymbol(lhs.args[2])
+          sym !== nothing && sym in _drop && return false
+        end
+      end
+      true
+    end
+    local _nBefore = length(INITIAL_GUESS_EQUATIONS)
+    INITIAL_GUESS_EQUATIONS = filter(_keepPair, INITIAL_GUESS_EQUATIONS)
+    @info "[RELAY] INITIAL_GUESS_EQUATIONS filtered" before=_nBefore after=length(INITIAL_GUESS_EQUATIONS)
+    INITIAL_VALUE_EQUATIONS = filter(_keepPair, INITIAL_VALUE_EQUATIONS)
+    DISCRETE_START_VALUES = filter(_keepPair, DISCRETE_START_VALUES)
+    #= Substitute the relay aliases inside the surviving pairs/equations so a
+       value side referencing an eliminated leaf (e.g. `variance_mu => variance_u`)
+       resolves to the surviving rep symbol rather than leaving an undefined name. =#
+    INITIAL_GUESS_EQUATIONS = [_substSyms(eq, _ifEqRelay_aliases) for eq in INITIAL_GUESS_EQUATIONS]
+    INITIAL_VALUE_EQUATIONS = [_substSyms(eq, _ifEqRelay_aliases) for eq in INITIAL_VALUE_EQUATIONS]
+    DISCRETE_START_VALUES = [_substSyms(eq, _ifEqRelay_aliases) for eq in DISCRETE_START_VALUES]
+    DISCRETE_DUMMY_EQUATIONS = filter(_keepDummy, DISCRETE_DUMMY_EQUATIONS)
+    DISCRETE_DUMMY_EQUATIONS = [_substSyms(eq, _ifEqRelay_aliases) for eq in DISCRETE_DUMMY_EQUATIONS]
+    IF_EQUATION_EVENTS = [_substSyms(ev, _ifEqRelay_aliases) for ev in IF_EQUATION_EVENTS]
+    IF_EQUATION_EVENT_DECLARATION = buildIfEquationEventDecl(IF_EQUATION_EVENTS)
+    CONDITIONAL_EQUATIONS = [_substSyms(eq, _ifEqRelay_aliases) for eq in CONDITIONAL_EQUATIONS]
+  end
+  #= Generate the legacy callback set against when-equations re-pointed at the
+     surviving relay representatives, so callback lookups hit live unknowns. =#
+  simCode = substituteRelayAliasesInWhens(simCode, _ifEqRelay_aliases)
+  local CALL_BACK_EQUATIONS = createCallbackCode(modelName, simCode; generateSaveFunction = false)
+  EQUATIONS = vcat(EQUATIONS,
+                   DISCRETE_DUMMY_EQUATIONS,
+                   CONDITIONAL_EQUATIONS)
+  EQUATIONS = rewriteEquations(EQUATIONS, simCode)
+  local _seenMtkEquationExprs = OrderedSet{String}()
+  local _dedupedMtkEquations = Expr[]
+  local _nDedupedMtkEquations = 0
+  for eq in EQUATIONS
+    local key = string(stripLineNodes(eq))
+    if key in _seenMtkEquationExprs
+      _nDedupedMtkEquations += 1
+    else
+      push!(_seenMtkEquationExprs, key)
+      push!(_dedupedMtkEquations, eq)
+    end
+  end
+  if _nDedupedMtkEquations > 0
+    @debug "[MTK GEN: equations] removed $(_nDedupedMtkEquations) duplicate MTK equations after rewrite"
+    EQUATIONS = _dedupedMtkEquations
+  end
   #= Reset the callback counter=#
   RESET_CALLBACKS()
   #=
@@ -225,98 +1115,376 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     https://github.com/SciML/ModelingToolkit.jl/issues/998
   =#
   #=If our model name is separated by . replace it with __ =#
-  local MODEL_NAME = replace(modelName, "." => "__")
+  local MODEL_NAME = modelName
+  #= Decompose variables, equations, and start equations into (outer_defs, inner_refs).
+     outer_defs go at module level (before model function) to avoid nested closure JIT.
+     inner_refs go inside the model function body. =#
+  local modelPrefix = "_" * MODEL_NAME * "_"
+  local (varOuterDefs, varInnerRefs) = decomposeVariables(
+    stateVariablesSym, algebraicVariablesSym; modelPrefix = modelPrefix)
   model = quote
     $(CALL_BACK_EQUATIONS)
+    #= Per-model pre-memory for lifted discrete clusters (module-level, seeded
+       with start values); no-op unless OMBACKEND_DISCRETE_PRE_MEMORY is set. =#
+    $(discretePreMemDecl(simCode))
+    #= Variable constructor function definitions at module level (outside model function)
+       to avoid JIT overhead from compiling nested closures.
+       Variable constructors only return symbol tuples, so they have no scope dependencies. =#
+    $(varOuterDefs)
     function $(Symbol(MODEL_NAME * "Model"))(tspan = (0.0, 1.0))
-      ModelingToolkit.@variables t
-      der = ModelingToolkit.Differential(t)
-      parameters = ModelingToolkit.@parameters begin
-        ($(parVariablesSym...), $(discreteVariablesSym...))
-      end
+      ModelingToolkit.@independent_variables t
+      D = ModelingToolkit.Differential(t)
+      $(decomposeParametersDeclaration(parVariablesSym))
+      #= Create array parameters with proper dimensions =#
+      $(ARRAY_PARAMETERS...)
+      #= Declare ifCond variables as discrete time-dependent parameters.
+         These are modified by SymbolicContinuousCallback affects and are NOT
+         part of the ODE state vector, so the solver never perturbs them. =#
+      $(generateDiscreteIfCondDeclaration(ifCondParamDecls, ifConditionalVariables))
       #=
         Only variables that are present in the equation system later should be a part of the variables in the MTK system.
         This means that certain algebraic variables should not be listed among the variables (These are the discrete variables).
       =#
-      $(decomposeVariables(stateVariablesSym, algebraicVariablesSym))
-      componentVars = []
+      $(varInnerRefs)
+      allVariables = []
+      #= Generate variables =#
       for constructor in variableConstructors
-        res = eval(ModelingToolkit.Symbolics._parse_vars("CustomCall", Real, constructor()))
-        #= t is no longer needed here =#
-        push!(componentVars, res[2:end])
+        vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple, Real, Nothing})(t)), Base.invokelatest(constructor))
+        push!(allVariables, vars)
       end
-      vars =  collect(Iterators.flatten(componentVars))
-      #= Initial values for the continious system. =#
-      pars = Dict($(PARAMETER_EQUATIONS...), $(DISCRETE_START_VALUES...))
+      vars = collect(Iterators.flatten(allVariables))
+      #= Batch all variable assignments and metadata into a single eval call.
+         Each individual eval triggers a world-age bump and JIT overhead.
+         For models with 1000+ variables this reduces N evals to 1. =#
+      local _batchBlock = Expr(:block)
+      for (sym, var) in vars
+        push!(_batchBlock.args, :($sym = $var))
+      end
+      local irreducibleSyms = $(irreducibleSyms)
+      for sym in irreducibleSyms
+        push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableIrreducible, true)))
+      end
+      local _statePriorityPairs = $(statePriorityPairs)
+      for (sym, priority) in _statePriorityPairs
+        push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableStatePriority, $priority)))
+      end
+      #= Dump the resolved variable-binding batch before `eval`. See
+         CodeGeneration/mtkDump.jl. The dump runs at simulate time inside
+         the model module, so it must reference MTKDump by its absolute
+         module path (the model module does not import MTKDump). =#
+      OMBackend.CodeGeneration.MTKDump.dumpBatchBlock(vars, irreducibleSyms, _statePriorityPairs, _batchBlock)
+      eval(_batchBlock)
+      # re-fetch decorated Nums from module scope (eval rebinds names but
+      # local vars still holds pre-eval references)
+      vars = [Base.invokelatest(getfield, @__MODULE__, sym) for (sym, _) in vars]
+      #= Initial values for the continuous system. =#
+      $(decomposeParameterEquationsInline(PARAMETER_EQUATIONS))
+      #= Add ifCond discrete parameter values to pars dict =#
+      $(generateIfCondParamAssignments(ifCondParamPairs))
       startEquationComponents = []
-      $(decomposeStartEquations(START_CONDTIONS_EQUATIONS))
+      $(decomposeStartEquationsInline(INITIAL_GUESS_EQUATIONS))
       for constructor in startEquationConstructors
-        push!(startEquationComponents, constructor())
+        push!(startEquationComponents, Base.invokelatest(constructor))
       end
       initialValues = collect(Iterators.flatten(startEquationComponents))
-      #= End construction of initial values =#
-      equationComponents = []
-      $(decomposeEquations(equations, PARAMETER_ASSIGNMENTS))
-      for constructor in equationConstructors
-        push!(equationComponents, constructor())
+      #= Process the final initial guesses =#
+      startEquationComponents = []
+      $(decomposeStartEquationsInline(INITIAL_VALUE_EQUATIONS; functionSuffix = "Final"))
+      for constructor in startEquationConstructors
+        push!(startEquationComponents, Base.invokelatest(constructor))
       end
-      eqs =  collect(Iterators.flatten(equationComponents))
-      nonLinearSystem = OMBackend.CodeGeneration.makeODESystem(eqs, t, vars, parameters, $(performIndexReduction); name=:($(Symbol($modelName))))
-      firstOrderSystem = nonLinearSystem #ModelingToolkit.ode_order_lowering(nonLinearSystem)
-      $(MTK_indexReduction(performIndexReduction))
-      #=
-        These arrays are introduced to handle the bolted on event handling using callbacks.
-        The callback handling for MTK is subject of change should hybrid system be implemented for MTK.
-      =#
-      local event_p = [$(PARAMETER_RAW_ARRAY...)]
-      local discreteVars = collect(values(Dict([$(DISCRETE_START_VALUES...)])))
-      local event_vars = vcat(collect(values(Dict([initialValues...]))),
-                              #=Discrete variables=# discreteVars)
-      local aux = Vector{Vector{Float64}}(undef, 2)
-      #= TODO init them with the initial values of them =#
-      aux[1] = event_p
-      aux[2] = event_vars
-      problem = ModelingToolkit.ODEProblem(reducedSystem,
-                                           initialValues,
-                                           tspan,
-                                           pars,
-                                           callback=$(Symbol("$(MODEL_NAME)CallbackSet"))(aux))
-      return (problem, initialValues, reducedSystem, tspan, pars, vars)
+      finalInitialValues = collect(Iterators.flatten(startEquationComponents))
+      #= Equations =#
+      equationComponents = []
+      $(stripBeginBlocks(decomposeEquationsInline(EQUATIONS, PARAMETER_ASSIGNMENTS)))
+      for constructor in equationConstructorCalls
+        push!(equationComponents, Base.invokelatest(constructor))
+      end
+      eqs = collect(Iterators.flatten(equationComponents))
+      eqs = Base.invokelatest(OMBackend.CodeGeneration.filterConstantEquations, eqs)
+      #= System(eqs, ...) requires eqs::Vector{Equation}; an equation-free model yields an untyped empty vector. =#
+      eqs = convert(Vector{Symbolics.Equation}, eqs)
+      #= Events and observed equations =#
+      $(IF_EQUATION_EVENT_DECLARATION)
+      $(generateAliasObservedBlock(simCode, _ifEqRelay_aliases))
+      $(generateEliminatedObservedBlock(simCode, _ifEqRelay_aliases))
+      #= Initial-equation constraints (from Modelica `initial equation` block).
+         Passed as `initialization_eqs` to MTK so they actually constrain the
+         t=0 state — the `initialValues` Pair list above is only a guess.
+         Wrapped in invokelatest so symbol references resolve against the
+         freshly-eval'd Symbolics bindings. =#
+      local _algResults = try
+        Base.invokelatest(__runInitialAlgorithmEarly!)
+      catch _err
+        @debug "[MTK GEN: init-alg] early eval threw at constraint-build" exception=_err
+        Dict{Symbol, Float64}()
+      end
+      function _buildInitialConstraintEqs()
+        local _eqs = Symbolics.Equation[$([_substSyms(e, _ifEqRelay_aliases) for e in generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)]...),
+                                        $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, occVariables, algebraicVariables), simCode)]...)]
+        $(emitInitAlgConstraintAppends(simCode)...)
+        return _eqs
+      end
+      local initialConstraintEqs = Base.invokelatest(_buildInitialConstraintEqs)
+      #= Also merge the early-eval init-algorithm results into `finalInitialValues`
+         as hard u0 entries. Needed because the `_isPureODE` branch (state with
+         der=0 and no algebraic constraints) skips `build_initializeprob` — MTK's
+         init solver never runs, so the `initialization_eqs` set above would not
+         be honoured on its own. With u0 set here, both the pure-ODE fast path
+         and the DAE-with-init-solver path produce the same initial values. =#
+      function _mergeInitAlgIntoU0!(fiv)
+        $(emitInitAlgU0Appends(simCode)...)
+        return fiv
+      end
+      Base.invokelatest(_mergeInitAlgIntoU0!, finalInitialValues)
+      #= ODE System =#
+      nonLinearSystem = $(odeSystemWithEvents(!isempty(ifConditionalVariables) || !isempty(IF_EQUATION_EVENTS), modelName;
+                                              hasObserved = !isempty(simCode.aliasMap) ||
+                                                            !isempty(simCode.eliminatedVariables)))
+      firstOrderSystem = nonLinearSystem
+      #= Structural simplification =#
+      $(performStructuralSimplify(performIndexReduction; observedFilter = simCode.observedFilter, split = !useDirectRHS))
+      #= Inject observed equations post-simplification so they do not interfere
+         with AffectSystem tearing during callback compilation. =#
+      if @isdefined(observedEqs) && !isempty(observedEqs)
+        #= Deduplicate observed equations by LHS variable name before injection.
+           Both alias and eliminated observed blocks can produce the same equation. =#
+        local _seenLHS = OrderedSet{String}()
+        local _uniqueObs = Symbolics.Equation[]
+        for _obs in observedEqs
+          local _lhsKey = string(Symbolics.unwrap(_obs.lhs))
+          if !(_lhsKey in _seenLHS)
+            push!(_seenLHS, _lhsKey)
+            push!(_uniqueObs, _obs)
+          end
+        end
+        reducedSystem = OMBackend.CodeGeneration.injectObservedEquations(reducedSystem, _uniqueObs)
+      end
+      #= Callbacks setup =#
+      local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
+      #= Wrap discrete start values in a function and call with invokelatest to avoid world-age issues =#
+      function _getDiscreteVars()
+        collect(values(ModelingToolkit.OrderedDict($(DISCRETE_START_VALUES...))))
+      end
+      local discreteVars = Base.invokelatest(_getDiscreteVars)
+      eventParameters = vcat(eventParameters, discreteVars)
+      local aux = Vector{Any}(undef, 3)
+      aux[1] = eventParameters
+      aux[2] = Float64[]
+      aux[3] = reducedSystem
+      #= Maps OMBackend variable indices to actual state indices =#
+      callbacks = $(Symbol("$(MODEL_NAME)CallbackSet"))(aux)
+      #= Split initial values =#
+      local _finalInitialValuesForSplit = Pair{Any, Any}[p for p in finalInitialValues]
+      local _initialValuesForSplit = Pair{Any, Any}[p for p in initialValues]
+      (reducedSystem, finalInitialValues) = Base.invokelatest(
+        OMBackend.CodeGeneration.splitInitialValues, reducedSystem, _finalInitialValuesForSplit, _initialValuesForSplit, pars)
+      reducedSystem = Base.invokelatest(OMBackend.CodeGeneration.mergeSoftGuesses,
+        reducedSystem, Pair{Any, Any}[$(RELAY_GUESS_PAIRS...)])
+      reducedSystem = Base.invokelatest(OMBackend.CodeGeneration.mergeSoftGuesses,
+        reducedSystem, Pair{Any, Any}[$(TRUSTED_GUESS_PAIRS...)]; force = true)
+      #= Build ODEProblem. The codegen-time strategy (DirectRHS / structural
+         transition / standard DAE-with-init-solver) is picked here; the
+         structural-transition branch additionally dispatches at runtime on
+         the mass matrix. See `emitProblemConstruction` and its three
+         strategy emitters for the full rationale. =#
+      $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
+      return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreducibleSyms)
     end
+  end
+  #= Qualify bare Modelica function calls with OMBackend.CodeGeneration. prefix.
+     This covers all generated code: equations, parameter assignments, start conditions. =#
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
+  if !isempty(funcNames)
+    qualifyModelicaFunctions!(model, funcNames)
   end
   return model
 end
 
+"""
+    generateAliasObservedBlock(simCode)
+
+Generate a code block that creates observed equations for eliminated alias variables.
+Each alias entry produces:
+  - A symbolic variable declaration for the eliminated variable
+  - An observed equation: `eliminated(t) ~ representative(t)` (or negated)
+These are passed to `ODESystem` via the `observed` keyword so that eliminated
+variables remain accessible in the solution (e.g. `sol[var"eliminated"]`).
+"""
+function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE,
+                                    relayAliases::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
+  if isempty(simCode.aliasMap) && isempty(relayAliases)
+    return :(observedEqs = [])
+  end
+  #= Generate the observed equations as runtime code.
+     The alias map entries are known at code-gen time, so we can embed
+     the variable names as string literals. At runtime, these create
+     Symbolics variables and equations. =#
+  local obsEntries = Tuple{Symbol, Symbol, Bool}[]
+  local elimSymbols = Symbol[]
+  local emittedElims = OrderedSet{Symbol}()
+  for entry in simCode.aliasMap
+    local elimSym = Symbol(entry.eliminatedName)
+    local repSym = Symbol(entry.representativeName)
+    repSym = get(relayAliases, repSym, repSym)
+    push!(elimSymbols, elimSym)
+    push!(emittedElims, elimSym)
+    push!(obsEntries, (elimSym, repSym, entry.negated))
+  end
+  local _relayRepresentative(sym::Symbol)::Symbol = begin
+    local seen = OrderedSet{Symbol}()
+    local cur = sym
+    while haskey(relayAliases, cur) && !(cur in seen)
+      push!(seen, cur)
+      cur = relayAliases[cur]
+    end
+    cur
+  end
+  for elimSym in sort!(collect(keys(relayAliases)); by = string)
+    elimSym in emittedElims && continue
+    local repSym = _relayRepresentative(relayAliases[elimSym])
+    push!(elimSymbols, elimSym)
+    push!(emittedElims, elimSym)
+    push!(obsEntries, (elimSym, repSym, false))
+  end
+  #= Collect eliminated symbol names at code-gen time. The Num objects
+     are constructed at runtime (below) using the function-scope `t` so
+     they share the system's independent variable. =#
+  unique!(elimSymbols)
+  return quote
+    #= Build eliminated alias variables at function scope so they share
+       the `@independent_variables t` object with the main system, then
+       bind their names into the module namespace via a single eval (with
+       the Num objects embedded by value). Using `ModelingToolkit.t_nounits`
+       here would create variables with a different iv, which later trips
+       `validate_operator` with `iv::Nothing` during Pantelides. =#
+    local _elimBatch = Expr(:block)
+    for _elimName in $(elimSymbols)
+      local _elimVar = Symbolics.variable(_elimName,
+                                          T = Symbolics.FnType{Tuple, Real, Nothing})(t)
+      push!(_elimBatch.args, :($_elimName = $_elimVar))
+    end
+    eval(_elimBatch)
+    #= Create observed equations using module lookups so symbols created by
+       the preceding eval are visible without relying on generated helper
+       function global resolution. =#
+    observedEqs = Symbolics.Equation[]
+    for (_elimName, _repName, _negated) in $(obsEntries)
+      local _elimVar = Base.invokelatest(getfield, @__MODULE__, _elimName)
+      local _repVar = Base.invokelatest(getfield, @__MODULE__, _repName)
+      push!(observedEqs, _negated ? (_elimVar ~ -_repVar) : (_elimVar ~ _repVar))
+    end
+  end
+end
+
+function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE,
+                                         relayAliases::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
+  if isempty(simCode.eliminatedVariables)
+    return :()
+  end
+  local elimVars = simCode.eliminatedVariables
+  local elimEqs = simCode.eliminatedEquations
+  @assert length(elimVars) == length(elimEqs) "eliminatedVariables and eliminatedEquations must be parallel"
+  #= Always create Symbolics bindings for every eliminated variable so that
+     other observed equations (and any downstream code) can resolve the
+     variable name against a valid Num. Without this, an eliminated variable
+     that is referenced by another eliminated variable's residual would raise
+     a UndefVarError at module eval time (observed in DCEE_Start/DCPM_Start,
+     where `wMechanical` is referenced by sibling eliminated equations). =#
+  local allElimSymbols = Symbol[Symbol(v) for v in elimVars]
+  #= Skip generating the observed equation (solve_for + push) for pairs whose
+     residual contains a der() call. The solved form would be
+     `elimVar ~ Differential(t)(x)`, which MTK rejects when it later builds
+     the initialization system via the iv-less 3-arg
+     `System(eqs, vars, ps)` constructor (validate_operator fails with
+     OperatorIndepvarMismatchError). These eliminated variables are state
+     derivatives whose values are already exposed by MTK's solution object. =#
+  #= Names already emitted by `generateAliasObservedBlock` from `aliasMap`
+     have a direct `elim ~ rep` observed equation. Re-deriving the same
+     observation here via `solve_for(0 ~ residual, elim)` is redundant and
+     fails when the residual has already been alias-substituted (the
+     residual no longer mentions `elim` and `solve_for` returns NaN, which
+     then propagates into `sol(t; idxs = elim)`). =#
+  local aliasNames = OrderedSet{String}(entry.eliminatedName for entry in simCode.aliasMap)
+  union!(aliasNames, string.(keys(relayAliases)))
+  local solveBodyExprs = Expr[]
+  for (i, varName) in enumerate(elimVars)
+    if containsDerCall(SimulationCode.toDAEExp(elimEqs[i].exp))
+      continue
+    end
+    if varName in aliasNames
+      continue
+    end
+    local elimSym = Symbol(varName)
+    local residualExpr = expToJuliaExpMTK(elimEqs[i].exp, simCode; derSymbol = false)
+    if !isempty(relayAliases)
+      residualExpr = _substSyms(residualExpr, relayAliases)
+    end
+    push!(solveBodyExprs, quote
+      local _elimResidual = $(residualExpr)
+      local _elimRhs = Symbolics.solve_for(0 ~ _elimResidual, $(elimSym))
+      push!(_elimObsEqs, $(elimSym) ~ _elimRhs)
+    end)
+  end
+  return quote
+    #= Build eliminated non-dynamic variables at function scope so they
+       share the function-scope `@independent_variables t` object with the
+       main system, then bind their names into the module namespace via a
+       single eval (with the Num objects embedded by value). =#
+    local _elimBatch = Expr(:block)
+    for _elimName in $(allElimSymbols)
+      local _elimVar = Symbolics.variable(_elimName,
+                                          T = Symbolics.FnType{Tuple, Real, Nothing})(t)
+      push!(_elimBatch.args, :($_elimName = $_elimVar))
+    end
+    eval(_elimBatch)
+    #= Solve residuals and create observed equations. Wrapped in a function
+       + invokelatest to handle world-age from the preceding eval. Variables
+       whose residual contained a der() are skipped here but still have
+       bindings above, so any sibling residual referencing them resolves. =#
+    function _solveEliminatedObserved()
+      local _elimObsEqs = Symbolics.Equation[]
+      $(solveBodyExprs...)
+      return _elimObsEqs
+    end
+    append!(observedEqs, Base.invokelatest(_solveEliminatedObserved))
+  end
+end
 
 """
- Creates equations from the residual equations in unsorted order
+   Creates equations from the residual equations in unsorted order
 """
-function createResidualEquationsMTK(stateVariables::Vector, algebraicVariables::Vector, equations::Vector{BDAE.RESIDUAL_EQUATION}, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+function createResidualEquationsMTK(stateVariables::Vector, algebraicVariables::Vector, equations::AbstractVector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   if isempty(equations)
     return Expr[]
   end
   local eqs::Vector{Expr} = Expr[]
   for eq in equations
-    local eqDAEExp = eq.exp
-    local eqExp = :(0 ~ $(expToJuliaExpMTK(eqDAEExp, simCode; derSymbol=false)))
+    #= eq.exp is `SimulationCode.Exp` post Phase 4b field migration; the
+       `expToJuliaExpMTK(::SimulationCode.Exp, ...)` overload in
+       MTK_CodeGenerationUtil.jl walks SIM Exp natively for the
+       supported variants and delegates the rest back to the DAE
+       emitter via `toDAEExp`. =#
+    local eqExp = :(0 ~ $(expToJuliaExpMTK(eq.exp, simCode; derSymbol=false)))
     push!(eqs, eqExp)
   end
-  
-  return eqs
+    return eqs
 end
 
-include("mtkExternals.jl")
-
 """
-  Generates the initial value for the equations
-  TODO: Currently unable to generate start condition in order
+  Generates the initial value for the equations.
+  Algebraics without an explicit `start =` and without `fixed = true` are
+  always skipped — MTK's init solver supplies defaults.
+  States and OCC vars emit `0.0` defaults so MTK ODEProblem has a value for
+  every unknown, unless `skipDefaultStateStarts` is true (used in the
+  final-guess pass when an explicit user start is already pinned elsewhere).
 """
 function createStartConditionsEquationsMTK(states::Vector,
                                         algebraics::Vector,
-                                        simCode::SimulationCode.SimCode)::Vector{Expr}
-  #  local startEquations = createSortedEquations([algVariables..., stateVariables...], simCode; arrayName = "reals")
-  local algInit = getStartConditionsMTK(algebraics, simCode)
-  local stateInit = getStartConditionsMTK(states, simCode)
+                                        simCode::SimulationCode.SIM_CODE;
+                                        skipDefaultStateStarts::Bool = false)::Vector{Expr}
+  local algInit = getStartConditionsMTK(algebraics, simCode; skipDefaultStarts = true)
+  local stateInit = getStartConditionsMTK(states, simCode; skipDefaultStarts = skipDefaultStateStarts)
   local initialEquations = simCode.initialEquations
   local ieqInit = generateInitialEquations(initialEquations, simCode)
   #=
@@ -328,142 +1496,2478 @@ function createStartConditionsEquationsMTK(states::Vector,
 end
 
 """
+  Generates initial equations as Symbolics `lhs ~ rhs` Equation forms suitable
+  for passing to MTK's `initialization_eqs` kwarg of `System(...)`. Unlike the
+  `=>` pair form (which acts as a guess only), `~` form is a real constraint
+  that MTK's initialization solver must satisfy at t=0. Required for models
+  with `InitialOutput` init mode (e.g. PID controllers' integrator state).
+"""
+function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local result = Expr[]
+  for ieq in initialEqs
+    if ieq isa BDAE.COMPLEX_EQUATION || ieq isa BDAE.ARRAY_EQUATION || ieq isa SimulationCode.ARRAY_EQUATION
+      @debug "[MTK GEN: initialConstraints] skipping $(typeof(ieq)) (record/array constraints not yet lowered to scalar `~` form)"
+      continue
+    end
+    if isParametricOnlyEquation(ieq, simCode)
+      continue
+    end
+    local ieqLhsDAE = SimulationCode.toDAEExp(ieq.lhs)
+    local ieqRhsDAE = SimulationCode.toDAEExp(ieq.rhs)
+    local lhs = try
+      expToJuliaExpMTK(ieqLhsDAE, simCode)
+    catch err
+      @warn "[CODEGEN: initialConstraints] failed to lower LHS; constraint dropped" lhs=ieqLhsDAE err
+      continue
+    end
+    local rhs = try
+      @match ieqRhsDAE begin
+        DAE.CREF(DAE.CREF_IDENT("time", _, _), _) => expToJuliaExpMTK(ieqRhsDAE, simCode)
+        DAE.CREF(__) => begin
+          local crefAsStr = string(ieqRhsDAE)
+          if haskey(simCode.stringToSimVarHT, crefAsStr)
+            local simCodeVar = last(simCode.stringToSimVarHT[crefAsStr])
+            if SimulationCode.isStateOrAlgebraic(simCodeVar)
+              expToJuliaExpMTK(ieqRhsDAE, simCode)
+            elseif SimulationCode.hasBindingExp(simCodeVar)
+              evalSimCodeParameter(simCodeVar, simCode)
+            else
+              expToJuliaExpMTK(ieqRhsDAE, simCode)
+            end
+          else
+            expToJuliaExpMTK(ieqRhsDAE, simCode)
+          end
+        end
+        _ => evalDAE_Expression(ieqRhsDAE, simCode)
+      end
+    catch err
+      @warn "[CODEGEN: initialConstraints] failed to lower RHS; constraint dropped" rhs=ieqRhsDAE err
+      continue
+    end
+    push!(result, :($lhs ~ $rhs))
+  end
+  return result
+end
+
+"""
   Generates initial equations.
   Currently unsorted unless they are sorted before being passed to the simulation code phase.
 """
-function generateInitialEquations(initialEqs, simCode::SimulationCode.SimCode)::Vector{Expr}
+function generateInitialEquations(initialEqs, simCode::SimulationCode.SIM_CODE; parameterAssignment = true)::Vector{Expr}
   local initialEqsExps = Expr[]
   for ieq in initialEqs
+    #= COMPLEX_EQUATION/ARRAY_EQUATION should have been expanded before this point =#
+    if ieq isa BDAE.COMPLEX_EQUATION || ieq isa BDAE.ARRAY_EQUATION || ieq isa SimulationCode.ARRAY_EQUATION
+      error("generateInitialEquations: unexpected unexpanded $(typeof(ieq)) in initial equations — this is a compiler bug upstream")
+    end
+    #= Skip parametric-only initial equations (already solved by solveParametricInitialEquations!) =#
+    if isParametricOnlyEquation(ieq, simCode)
+      continue
+    end
+    local ieqLhsDAE = SimulationCode.toDAEExp(ieq.lhs)
+    local ieqRhsDAE = SimulationCode.toDAEExp(ieq.rhs)
     #= LHS will typically be a variable. Don't have to be though.. =#
-    lhs = expToJuliaExpMTK(ieq.lhs, simCode)
-    rhs = @match ieq.rhs begin
+    lhs = expToJuliaExpMTK(ieqLhsDAE, simCode)
+    rhs = @match ieqRhsDAE begin
+      #= `time` is the independent variable and never appears in
+         stringToSimVarHT. Route it directly through expToJuliaExpMTK
+         which emits the Julia symbol `t` for it. Without this guard
+         the generic DAE.CREF arm below indexes the HT with key
+         `"time"` and throws KeyError. Surfaced by models like
+         Modelica.Fluid.Examples.ControlledTankSystem.ControlledTanks
+         whose initial equations contain `<var> = time`. =#
+      DAE.CREF(DAE.CREF_IDENT("time", _, _), _) => begin
+        expToJuliaExpMTK(ieqRhsDAE, simCode)
+      end
       DAE.CREF(__) => begin
         #= Evaluate the right hand side at this point =#
-        local crefAsStr = string(ieq.rhs)
+        local crefAsStr = string(ieqRhsDAE)
         local simCodeVar = last(simCode.stringToSimVarHT[crefAsStr])
         local res = if SimulationCode.isStateOrAlgebraic(simCodeVar)
-          #= Otherwise get the start attribute =#
-          expToJuliaExpMTK(ieq.rhs, simCode)
+          expToJuliaExpMTK(ieqRhsDAE, simCode)
+        elseif SimulationCode.hasBindingExp(simCodeVar)
+          evalSimCodeParameter(simCodeVar, simCode)
         else
-          evalSimCodeParameter(simCodeVar)
+          #= Parameter without binding (fixed=false): leave as symbol =#
+          expToJuliaExpMTK(ieqRhsDAE, simCode)
         end
       end
       #= For more complicated expressions, we do local constant folding. =#
       _ => begin
-        res = evalDAE_Expression(ieq.rhs, simCode)
+        res = evalDAE_Expression(ieqRhsDAE, simCode)
         res
       end
     end
-    push!(initialEqsExps,
-          quote
-            $(lhs) => $(rhs)
-          end)
+    if parameterAssignment
+      push!(initialEqsExps,
+            quote
+              $lhs => $rhs
+            end)
+    else
+      push!(initialEqsExps,
+            quote
+              $lhs = $rhs
+            end)
+    end
   end
   return initialEqsExps
 end
 
-function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SimCode)::Vector{Expr}
+"""
+  Given a vector of variables and the simulation code
+  extracts the start attributes to generate initial conditions.
+
+If `skipDefaultStarts` is true, variables without explicit start values are skipped.
+When false, variables without start values get default 0.0 initialization.
+"""
+function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SIM_CODE; skipDefaultStarts = false)::Vector{Expr}
   local startExprs::Vector{Expr} = Expr[]
   local residuals = simCode.residualEquations
   local ht::Dict = simCode.stringToSimVarHT
+  local missingStartWarnings = OrderedSet{String}()
   if length(vars) == 0
-    return []
+    return Expr[]
   end
   for var in vars
     (index, simVar) = ht[var]
     varName = simVar.name
     local simVarType = simVar.varKind
     local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
-    #= If no attribute. Let it default to zero =#
-    if simVar.attributes == nothing
-      push!(startExprs, :($(Symbol(varName)) => 0.0))
-      continue
-    end
     () = @match optAttributes begin
       SOME(attributes) => begin
         () = @match (attributes.start, attributes.fixed) begin
           (SOME(DAE.CREF(start)), SOME(__)) || (SOME(DAE.CREF(start)), _)  => begin
-#            push!(startExprs, :($(Symbol("$varName")) => $(exp))) what is this?
-            #=
-              We have a variable of sorts.
-              We look evaluate the value in the pars list.
-            =#
+            #= Delegate to expToJuliaExpMTK so DATA_STRUCTURE / PARAMETER /
+               subscripted CREFs are all handled uniformly. The previous
+               two-branch split would emit `pars[name]` for non-subscripted
+               CREFs, which only works when the referenced var is a
+               PARAMETER (in `pars`). DATA_STRUCTURE constants and
+               int/enum vars reclassified by Causalize are not in `pars`. =#
             push!(startExprs,
                   quote
-                  $(Symbol("$varName")) => pars[$(Symbol(string(start)))]
+                    $(Symbol("$varName")) => $(expToJuliaExpMTK(DAE.CREF(start, DAE.T_REAL(MetaModelica.Nil())), simCode))
                   end)
-            ()
+            continue
           end
           (SOME(start), SOME(fixed)) || (SOME(start), _)  => begin
             push!(startExprs,
                   quote
-                  $(Symbol("$varName")) => $(expToJuliaExpMTK(start, simCode))
+                    $(Symbol("$varName")) => $(expToJuliaExpMTK(start, simCode))
                   end)
-            ()
+            continue
           end
           (NONE(), SOME(fixed)) => begin
-            push!(startExprs, :($(varName) => 0.0))
-            ()
+            #= `fixed = true` with no `start` pins the var at 0.0; honour even when
+               default-skipping is on. `fixed = false` / non-Bool: MTK's init solver
+               handles it, so skip emission in skip mode. =#
+            local _fixedTrue = fixed isa DAE.BCONST && fixed.bool
+            if skipDefaultStarts && !_fixedTrue
+              continue
+            end
+            push!(startExprs, :($(Symbol(varName)) => 0.0))
+            continue
           end
-          (_, _) => ()
+          (NONE(), NONE()) || (_, _) => begin
+            #= No start value specified, default to 0.0 =#
+            if !skipDefaultStarts
+              push!(missingStartWarnings, varName)
+              push!(startExprs, :($(Symbol(varName)) => 0.0))
+            end
+            continue
+          end
         end
-        NONE() => ()
+      end
+      NONE() where {!skipDefaultStarts} => begin
+        #=
+        If no attribute. Let it default to zero.
+        This branch should only be taken for compiler generated variables.
+        =#
+        push!(startExprs, :($(Symbol(varName)) => 0.0))
+        continue
+      end
+      _ => begin
+        continue
       end
     end
+  end
+  if OMBackend.WARN_MISSING_START_VALUES[] && !isempty(missingStartWarnings)
+    local warningList = sort!(collect(missingStartWarnings))
+    local maxShown = 20
+    local shown = warningList[1:min(end, maxShown)]
+    local omitted = length(warningList) - length(shown)
+    local summary = "Assumed starting value of 0.0 for $(length(warningList)) variable(s): " * join(shown, ", ")
+    if omitted > 0
+      summary *= ", ... (+$(omitted) more)"
+    end
+    @warn summary
   end
   return startExprs
 end
 
 """
-  Creates parameters on a MTK parameters compatible format.
+  Emit `lhs ~ rhs` constraint Equations for state vars with `fixed=true` and an
+  explicit `start`. Goes into `initialization_eqs` so MTK pins them at t=0
+  rather than treating them as soft `guesses` the iteration may override.
 """
-function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode.SimCode)::Vector{Expr}
-  local parameterEquations::Vector = []
-  local hT = simCode.stringToSimVarHT
+function getFixedStartConstraintsMTK(vars::Vector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local result::Vector{Expr} = Expr[]
+  if isempty(vars)
+    return result
+  end
+  local ht::Dict = simCode.stringToSimVarHT
+  for var in vars
+    (index, simVar) = ht[var]
+    local varName = simVar.name
+    local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
+    local startExp = @match optAttributes begin
+      SOME(attributes) => @match (attributes.start, attributes.fixed) begin
+        (SOME(s), SOME(DAE.BCONST(true))) => s
+        _ => nothing
+      end
+      _ => nothing
+    end
+    if startExp === nothing
+      continue
+    end
+    push!(result, :($(Symbol(varName)) ~ $(expToJuliaExpMTK(startExp, simCode))))
+  end
+  return result
+end
+
+"""
+  Emit `Expr`s that push init-algorithm-derived (state => value) pairs into the
+  `finalInitialValues` vector inside Model(). Mirrors `emitInitAlgConstraintAppends`
+  but the push target is the u0-pair list (consumed by `ODEProblem(...; u0 = ...)`)
+  rather than `initialization_eqs`. The merge is required because the pure-ODE
+  branch of the ODEProblem build skips MTK's init solver, so the init-eq alone
+  would not propagate the init-algorithm value into u0.
+"""
+function emitInitAlgU0Appends(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local appends::Vector{Expr} = Expr[]
+  isempty(simCode.initialAlgorithms) && return appends
+  local ht::Dict = simCode.stringToSimVarHT
+  local lhsNames = OrderedSet{String}()
+  local rhsNames = OrderedSet{String}()
+  if any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
+    for ia in simCode.initialAlgorithms, s in ia.daeStatements
+      _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
+    end
+  else
+    for ia in simCode.initialAlgorithms, op in ia.statements
+      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
+    end
+  end
+  for name in lhsNames
+    haskey(ht, name) || continue
+    local (_, sv) = ht[name]
+    if sv.varKind isa SimulationCode.PARAMETER ||
+       sv.varKind isa SimulationCode.ARRAY_PARAMETER
+      continue
+    end
+    local qn = QuoteNode(Symbol(name))
+    #= Replace (not append) any existing start-attribute entry so a lifted
+       discrete with both a start value and an init-algorithm value does not
+       leave a duplicate key in the u0 pair list (which drops other entries
+       during splitInitialValues). =#
+    push!(appends, :(if haskey(_algResults, $(qn))
+                       filter!(_p -> !isequal(_p.first, $(Symbol(name))), fiv)
+                       push!(fiv, $(Symbol(name)) => _algResults[$(qn)])
+                     end))
+  end
+  return appends
+end
+
+"""
+  Emit `Expr`s that conditionally push init-algorithm-derived constraints into
+  the local `_eqs` vector inside `_buildInitialConstraintEqs`. Each emitted line
+  looks like `haskey(_algResults, :T_start) && push!(_eqs, T_start ~ _algResults[:T_start])`.
+"""
+function emitInitAlgConstraintAppends(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local appends::Vector{Expr} = Expr[]
+  isempty(simCode.initialAlgorithms) && return appends
+  local ht::Dict = simCode.stringToSimVarHT
+  local lhsNames = OrderedSet{String}()
+  local rhsNames = OrderedSet{String}()
+  if any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
+    for ia in simCode.initialAlgorithms, s in ia.daeStatements
+      _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
+    end
+  else
+    for ia in simCode.initialAlgorithms, op in ia.statements
+      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
+    end
+  end
+  for name in lhsNames
+    haskey(ht, name) || continue
+    local (_, sv) = ht[name]
+    if sv.varKind isa SimulationCode.PARAMETER ||
+       sv.varKind isa SimulationCode.ARRAY_PARAMETER
+      continue
+    end
+    local qn = QuoteNode(Symbol(name))
+    push!(appends, :(haskey(_algResults, $(qn)) &&
+                     push!(_eqs, $(Symbol(name)) ~ _algResults[$(qn)])))
+  end
+  return appends
+end
+
+
+"""
+  Creates the components of the If-Equations.
+Each if equation is marked by the identifier.
+So the first will have 1 and so on.
+"""
+#= Build one SymbolicContinuousCallback per deferred pure-time event. Callback K
+   fires at event K's threshold, so its affect sets ITS OWN ifCond to the known
+   post-crossing value (`numVal`, exactly what the per-branch toggle sets) and
+   re-derives every OTHER pure-time ifCond from its zero-crossing sign
+   (`zc < 0` <=> condition TRUE). Reading the firing event's own `zc` is unusable
+   because it is exactly 0 at the crossing instant; the other events are not at
+   their crossing so their sign is definite. Whichever callback fires refreshes
+   all, so coincident time events stay consistent even though MTK/DiffEq apply
+   only one affect per coincident root. =#
+function _buildTimeEventRefreshCallbacks(allPT::Vector, ptOwners::Vector, simCode,
+                                         clusters, leafAlias::Dict{Symbol,Symbol},
+                                         algDefs::Dict{Symbol,Any})
+  local n = length(allPT)
+  local cbs = Expr[]
+  for k in 1:n
+    local mtkCondK = allPT[k][3]
+    local numValK = allPT[k][4]
+    local obsKws = Expr[]
+    local retKws = Expr[]
+    local modKws = Expr[]
+    for j in 1:n
+      local symJ = allPT[j][1]
+      push!(modKws, Expr(:kw, symJ, symJ))
+      if j == k
+        push!(retKws, Expr(:kw, symJ, numValK))
+      else
+        local zcName = Symbol("_zc", j)
+        push!(obsKws, Expr(:kw, zcName, allPT[j][2]))
+        push!(retKws, Expr(:kw, symJ, :((observed.$(zcName) < 0) ? 1.0 : 0.0)))
+      end
+    end
+    #= Chain dependent pre-memory clusters into the firing event's affect: their
+       crossing functions can jump from an exact boundary here and never produce
+       the transversal crossing the standalone callbacks root-find on. =#
+    local affect = nothing
+    local chainInfo = _ifEqChainedClusters(ptOwners[k], clusters, simCode, leafAlias, algDefs)
+    if chainInfo !== nothing
+      local (chained, stale) = chainInfo
+      local obsAcc = Dict{Symbol,Symbol}()
+      local subst = _buildRelaySubst(ptOwners[k], numValK, simCode, leafAlias, algDefs, stale, obsAcc)
+      if subst !== nothing
+        affect = _composedIfCondAffectExpr(retKws, modKws, chained, simCode, subst, obsAcc;
+                                           extraObsKws = obsKws)
+      end
+    end
+    if affect === nothing
+      local modNT = Expr(:tuple, Expr(:parameters, modKws...))
+      local retNT = Expr(:tuple, Expr(:parameters, retKws...))
+      local fExpr = :((modified, observed, ctx, integrator) -> $(retNT))
+      if isempty(obsKws)
+        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT)))
+      else
+        local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
+        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT); observed = $(obsNT)))
+      end
+    end
+    push!(cbs, :(ModelingToolkit.SymbolicContinuousCallback(
+      ($(mtkCondK)) => $(affect);
+      reinitializealg = SciMLBase.NoInit()
+    )))
+  end
+  return cbs
+end
+
+#= Union-find classes over leaf residuals `0 = a - b` (both plain crefs); mirrors
+   the MTK-level relay elimination closely enough to resolve which name a cluster
+   body uses for an if-equation relay. Returns name -> class root. =#
+function _leafAliasClasses(simCode)::Dict{Symbol,Symbol}
+  local parent = Dict{Symbol,Symbol}()
+  local root = function (s::Symbol)
+    while get(parent, s, s) !== s
+      s = parent[s]
+    end
+    return s
+  end
+  for req in simCode.residualEquations
+    req isa SimulationCode.RESIDUAL_EQUATION || continue
+    local d = SimulationCode.toDAEExp(req.exp)
+    local pair = @match d begin
+      DAE.BINARY(DAE.CREF(c1, _), DAE.SUB(__), DAE.CREF(c2, _)) =>
+        (Symbol(string(c1)), Symbol(string(c2)))
+      _ => nothing
+    end
+    pair === nothing && continue
+    local (a, b) = pair
+    get!(parent, a, a)
+    get!(parent, b, b)
+    local (ra, rb) = (root(a), root(b))
+    ra === rb || (parent[ra] = rb)
+  end
+  return Dict{Symbol,Symbol}(k => root(k) for k in keys(parent))
+end
+
+#= Causal definitions `alg = rhs` recovered from residuals `0 = alg - rhs` or
+   `0 = rhs - alg` where `alg` is an algebraic SimVar. Used to inline algebraics
+   whose value jumps with an if-equation branch flip. =#
+function _algebraicDefs(simCode)::Dict{Symbol,Any}
+  local defs = Dict{Symbol,Any}()
+  local ht = simCode.stringToSimVarHT
+  for req in simCode.residualEquations
+    req isa SimulationCode.RESIDUAL_EQUATION || continue
+    local d = SimulationCode.toDAEExp(req.exp)
+    local hit = @match d begin
+      DAE.BINARY(DAE.CREF(c1, _), DAE.SUB(__), e2) => (Symbol(string(c1)), e2)
+      DAE.BINARY(e1, DAE.SUB(__), DAE.CREF(c2, _)) => (Symbol(string(c2)), e1)
+      _ => nothing
+    end
+    hit === nothing && continue
+    local (nm, rhs) = hit
+    local entry = get(ht, string(nm), nothing)
+    entry === nothing && continue
+    SimulationCode.isAlgebraic(entry[2]) || continue
+    haskey(defs, nm) || (defs[nm] = rhs)
+  end
+  return defs
+end
+
+#= True when `exp` references any name in `names`, resolving leaf-alias classes. =#
+Base.@nospecializeinfer function _daeReferencesAny(@nospecialize(exp), names::Set{Symbol},
+                                                   leafAlias::Dict{Symbol,Symbol})::Bool
+  local refs = OrderedSet{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, exp)
+  catch
+    return false
+  end
+  for n in refs
+    local s = Symbol(n)
+    (s in names || get(leafAlias, s, s) in names) && return true
+  end
+  return false
+end
+
+function _relayLhsRhs(resEq)
+  local d = try
+    SimulationCode.toDAEExp(resEq.exp)
+  catch
+    return nothing
+  end
+  return @match d begin
+    DAE.BINARY(DAE.CREF(c1, _), DAE.SUB(__), e2) => (Symbol(string(c1)), e2)
+    _ => nothing
+  end
+end
+
+#= Per-row relay table of a single-condition if-equation: (relaySymbol,
+   condBranchRhsDAE, elseRhsDAE) per residual row. `nothing` unless every row in
+   both branches has the strict `0 = ifEq_tmpN - rhs` relay form. =#
+function _ifEqRelayRows(ifEq::SimulationCode.IF_EQUATION, simCode)
+  local condBranch = nothing
+  local elseBranch = nothing
+  for branch in ifEq.branches
+    if branch.identifier == -1
+      elseBranch === nothing || return nothing
+      elseBranch = branch
+    else
+      condBranch === nothing || return nothing
+      condBranch = branch
+    end
+  end
+  (condBranch === nothing || elseBranch === nothing) && return nothing
+  local n = length(condBranch.residualEquations)
+  n == length(elseBranch.residualEquations) || return nothing
+  local rows = Vector{Tuple{Symbol, Any, Any}}()
+  for r in 1:n
+    local hitC = _relayLhsRhs(condBranch.residualEquations[r])
+    local hitE = _relayLhsRhs(elseBranch.residualEquations[r])
+    (hitC === nothing || hitE === nothing) && return nothing
+    first(hitC) === first(hitE) || return nothing
+    startswith(string(first(hitC)), "ifEq_tmp") || return nothing
+    push!(rows, (first(hitC), last(hitC), last(hitE)))
+  end
+  return isempty(rows) ? nothing : rows
+end
+
+#= Stale-name closure for one if-equation: its relay names, their leaf-alias
+   classmates, and algebraics causally defined from any of those. `nothing` when
+   the relay table is unavailable. =#
+function _ifEqStaleNames(ifEq, simCode, leafAlias::Dict{Symbol,Symbol}, algDefs::Dict{Symbol,Any})
+  local rows = _ifEqRelayRows(ifEq, simCode)
+  rows === nothing && return nothing
+  local stale = Set{Symbol}()
+  local addWithClassmates! = function (nm::Symbol)
+    push!(stale, nm)
+    local rt = get(leafAlias, nm, nm)
+    push!(stale, rt)
+    for (other, r) in leafAlias
+      r === rt && push!(stale, other)
+    end
+  end
+  for (lhs, _, _) in rows
+    addWithClassmates!(lhs)
+  end
+  local grew = true
+  while grew
+    grew = false
+    for (alg, rhs) in algDefs
+      (alg in stale) && continue
+      _daeReferencesAny(rhs, stale, leafAlias) || continue
+      addWithClassmates!(alg)
+      grew = true
+    end
+  end
+  return stale
+end
+
+_clusterReadsAny(assigns, names::Set{Symbol}, leafAlias::Dict{Symbol,Symbol})::Bool =
+  any(_daeReferencesAny(rhs, names, leafAlias) for (_, rhs, _) in assigns)
+
+#= Clusters whose recompute reads a value that jumps with this if-equation's
+   branch flip; they re-evaluate inside the flip affect (§8.6 event iteration,
+   single sweep). Returns (chained, staleNames) or nothing. =#
+function _ifEqChainedClusters(ifEq, clusters, simCode,
+                              leafAlias::Dict{Symbol,Symbol}, algDefs::Dict{Symbol,Any})
+  isempty(clusters) && return nothing
+  local stale = _ifEqStaleNames(ifEq, simCode, leafAlias, algDefs)
+  stale === nothing && return nothing
+  local chained = [a for a in clusters if _clusterReadsAny(a, stale, leafAlias)]
+  return isempty(chained) ? nothing : (chained, stale)
+end
+
+#= Every stale name referenced by `exp` already has a substitution entry. =#
+Base.@nospecializeinfer function _daeStaleRefsReady(@nospecialize(exp), stale::Set{Symbol},
+                                                    subst::Dict{Symbol,Any},
+                                                    leafAlias::Dict{Symbol,Symbol})::Bool
+  local refs = OrderedSet{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, exp)
+  catch
+    return false
+  end
+  for n in refs
+    local s = Symbol(n)
+    if (s in stale || get(leafAlias, s, s) in stale) && !haskey(subst, s)
+      return false
+    end
+  end
+  return true
+end
+
+#= Post-event substitution map for one if-equation: each relay row's branch RHS
+   selected by the constant post-event ifCond value (1.0 = condition TRUE =
+   conditional branch), lowered for an affect body; stale algebraics inlined
+   bottom-up on top. Circular stale definitions stay live observed reads. =#
+function _buildRelaySubst(ifEq, ownVal::Float64, simCode,
+                          leafAlias::Dict{Symbol,Symbol}, algDefs::Dict{Symbol,Any},
+                          stale::Set{Symbol}, obsAcc::Dict{Symbol,Symbol})
+  local rows = _ifEqRelayRows(ifEq, simCode)
+  rows === nothing && return nothing
+  local subst = Dict{Symbol,Any}()
+  local addWithClassmates! = function (nm::Symbol, val)
+    subst[nm] = val
+    local rt = get(leafAlias, nm, nm)
+    haskey(subst, rt) || (subst[rt] = val)
+    for (other, r) in leafAlias
+      r === rt && !haskey(subst, other) && (subst[other] = val)
+    end
+  end
+  for (lhs, condRhs, elseRhs) in rows
+    local selDAE = ownVal == 1.0 ? condRhs : elseRhs
+    local lowered = try
+      _daeExpToJuliaMem(selDAE, obsAcc, simCode)
+    catch
+      return nothing
+    end
+    addWithClassmates!(lhs, lowered)
+  end
+  local grew = true
+  while grew
+    grew = false
+    for (alg, rhs) in algDefs
+      (haskey(subst, alg) || !(alg in stale)) && continue
+      _daeStaleRefsReady(rhs, stale, subst, leafAlias) || continue
+      local lowered = try
+        _daeExpToJuliaMem(rhs, obsAcc, simCode; subst = subst)
+      catch
+        return nothing
+      end
+      addWithClassmates!(alg, lowered)
+      grew = true
+    end
+  end
+  return subst
+end
+
+#= One composed ImperativeAffect Expr: the ifCond commits (constant or derived
+   post-event values in `ifKws`) plus every chained cluster's recompute under
+   the substitution, in a single event instant. =#
+function _composedIfCondAffectExpr(ifKws::Vector{Expr}, modIfKws::Vector{Expr},
+                                   chained, simCode,
+                                   subst::Dict{Symbol,Any}, obsAcc::Dict{Symbol,Symbol};
+                                   extraObsKws::Vector{Expr} = Expr[])
+  local stmts = Expr[]; local writes = Expr[]; local retKws = Expr[]
+  for assigns in chained
+    _preMemClusterBody!(stmts, writes, retKws, obsAcc, assigns, simCode; subst = subst)
+  end
+  local retNT = Expr(:tuple, Expr(:parameters, vcat(ifKws, retKws)...))
+  local fexpr = :((modified, observed, ctx, integrator) -> begin
+                    $(stmts...)
+                    $(writes...)
+                    $(retNT)
+                  end)
+  local clusterModKws = Expr[Expr(:kw, d, d) for assigns in chained for (d, _, _) in assigns]
+  local modNT = Expr(:tuple, Expr(:parameters, vcat(modIfKws, clusterModKws)...))
+  local obsKws = vcat(extraObsKws, Expr[Expr(:kw, k, v) for (k, v) in obsAcc])
+  isempty(obsKws) && return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT)))
+  local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
+  return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT); observed = $(obsNT)))
+end
+
+function createIfEquations(stateVariables, algebraicVariables, simCode)
+  local ifEquations = IfEquationComponent[]
+  local identifier::Int
+  local sortedIfEquations = sort(collect(simCode.ifEquations);
+                                 by = ifEq -> _ifEquationSortKey(ifEq, simCode))
+  #= Event-iteration chaining inputs: pre-memory clusters plus the maps that
+     resolve which names a branch flip invalidates. =#
+  local clusters = _collectPreMemClusters(simCode)
+  local leafAlias = isempty(clusters) ? Dict{Symbol,Symbol}() : _leafAliasClasses(simCode)
+  local algDefs = isempty(clusters) ? Dict{Symbol,Any}() : _algebraicDefs(simCode)
+  #= Shared relay-t0 map: targets computed by earlier if-equations feed the
+     condition initial values of later ones. =#
+  local relayT0 = OrderedDict{Symbol, Float64}()
+  #= The identifier is increased by 1 in each iteration. =#
+  for (identifier, ifEq) in enumerate(sortedIfEquations)
+    push!(ifEquations, createIfEquation(stateVariables, algebraicVariables, ifEq, identifier, simCode,
+                                        clusters, leafAlias, algDefs, relayT0))
+  end
+  #= Pure-time-event branches deferred their callbacks (see createIfEquation);
+     build the model-level refresh callbacks now that every if-equation's
+     pure-time conditions are known. =#
+  local allPT = collect(Iterators.flatten(c.pureTimeEvents for c in ifEquations))
+  if !isempty(allPT)
+    local ptOwners = Any[]
+    for (k, c) in enumerate(ifEquations)
+      for _ in c.pureTimeEvents
+        push!(ptOwners, sortedIfEquations[k])
+      end
+    end
+    local refreshCbs = _buildTimeEventRefreshCallbacks(allPT, ptOwners, simCode,
+                                                       clusters, leafAlias, algDefs)
+    push!(ifEquations, IfEquationComponent(refreshCbs, Expr[], Symbol[],
+                                           Tuple{String, Bool}[], Tuple{Symbol, Any, Any, Float64}[],
+                                           Expr[]))
+  end
+  return ifEquations
+end
+
+function _ifEquationSortKey(ifEq::SimulationCode.IF_EQUATION, simCode)::String
+  local targets = String[]
+  try
+    for branch in ifEq.branches
+      for resEq in branch.residualEquations
+        push!(targets, string(last(deCausalize(resEq, simCode))))
+      end
+      isempty(targets) || break
+    end
+  catch
+    empty!(targets)
+  end
+  if isempty(targets)
+    try
+      for branch in ifEq.branches
+        push!(targets, string(branch.condition))
+      end
+    catch
+      return ""
+    end
+  end
+  sort!(targets)
+  return join(targets, "|")
+end
+
+function _ifConditionDependsOnTime(@nospecialize(condition))::Bool
+  local refs::OrderedSet{String} = OrderedSet{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, condition)
+  catch
+    return false
+  end
+  return "time" in refs
+end
+
+#= _ifConditionAllDiscreteOrParameter / _allBranchConditionsDiscrete live in the
+   MTK_CodeGenerationUtil submodule (generateIfExpressions needs them); call them
+   here as MTK_CodeGenerationUtil._allBranchConditionsDiscrete. =#
+
+"""
+    _ifConditionIsPureTimeEvent(condition, simCode) -> Bool
+
+Return true when `condition` is a deterministic time event: it references
+`time` and every other reference is a PARAMETER (no STATE / ALG / DISCRETE).
+The transition instant is then fixed a priori, so coincident time events
+(two sources transitioning at the same instant) must all be applied at once.
+Conservative: any non-parameter reference returns false, keeping the default
+per-branch continuous callback.
+"""
+function _ifConditionIsPureTimeEvent(@nospecialize(condition), simCode)::Bool
+  local refs::OrderedSet{String} = OrderedSet{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, condition)
+  catch
+    return false
+  end
+  ("time" in refs) || return false
+  local ht = simCode.stringToSimVarHT
+  for name in refs
+    name == "time" && continue
+    local entry = get(ht, name, nothing)
+    entry === nothing && return false
+    (entry[2].varKind isa SimulationCode.PARAMETER) || return false
+  end
+  return true
+end
+
+"""
+True when the zero-crossing Expr references a non-lifted algebraic variable
+(one whose static `evalInitialCondition` value defaults to 0). Lifted helper
+names (`ifEq_tmp*`, `ifCond*`) are excluded so an init affect never observes
+another lifted value and forms a circular init dependency.
+"""
+function _zcReferencesSolvableAlgebraic(@nospecialize(zcExpr), simCode)::Bool
+  local ht = simCode.stringToSimVarHT
+  local stack = Any[zcExpr]
+  while !isempty(stack)
+    local node = pop!(stack)
+    if node isa Symbol
+      local key = string(node)
+      if !startswith(key, "ifEq_tmp") && !startswith(key, "ifCond") && haskey(ht, key)
+        local (_, sv) = ht[key]
+        if SimulationCode.isAlgebraic(sv)
+          return true
+        end
+      end
+    elseif node isa Expr
+      for a in node.args
+        push!(stack, a)
+      end
+    end
+  end
+  return false
+end
+
+"""
+This function creates symbolic if equations for use in MTK.
+The function returns a tuple, where the first part of the tuple represent the conditions and the affect of the if-equation on the form:
+  continuous_events = [
+    <Condition> => <affect>
+    <Condition> => <affect>
+    ....
+  ]
+Each condition generates one variable with zero dynamics the variable being true or not depending on the branch.
+  Example:
+  if <condition> then
+    <equations>
+  elseif <condition> then
+    <equations>
+  else
+    <equations>
+  end if;
+Would result in:
+continuous_events = [
+    <condition> => [ifCond1 ~ true, ifCond2 ~ false]
+    <condition> => [ifCond1 ~ false, ifCond2 ~ true]
+]
+An if equation with a single condition would only generate one condition:
+continuous_events = [
+    <condition> => [ifCond1 ~ true]
+]
+
+The second value in the return tuple represent the if-equations itself:
+<lhs> = IfElse.ifelse(<condition>, <value>, IfElse.ifelse(<condition>, <value>, <value>))
+  lhs can be one or several variables. (TODO, fix the case for several variables in this kind of branch)
+
+The third part of the tuple contains a set of zero dynamic equations (One for each if equation condition variable)
+See the following issue: https://github.com/SciML/ModelingToolkit.jl/issues/1523
+
+The forth part of the tuple contains a vector of symbolic variables.
+One for each conditional variable created.
+"""
+#= True when a branch condition references a variable that is itself an
+   if-equation relay target (key of the shared relay-t0 map): exactly the
+   chained staged-trajectory case where a boundary crossing must re-evaluate
+   sibling conditions live instead of applying static toggles. =#
+function _conditionReferencesRelayTarget(@nospecialize(condition), rT0)::Bool
+  isempty(rT0) && return false
+  local refs::OrderedSet{String} = OrderedSet{String}()
+  try
+    SimulationCode.collectCrefNames!(refs, condition)
+  catch
+    return false
+  end
+  for name in refs
+    haskey(rT0, Symbol(name)) && return true
+  end
+  return false
+end
+
+#= Initial branch-condition values consistent with the t0 values of the
+   targets this if-equation defines. Round: evaluate every condition with the
+   current relay-t0 map, select the branch, evaluate the selected branch's
+   target RHS values at t0 and feed them back; stop when the condition vector
+   is stable. Mutates `rT0` so later if-equations see earlier targets. =#
+function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode, rT0)::Vector{Bool}
+  get(ENV, "OMBACKEND_RELAY_T0_FIXEDPOINT", "true") == "true" || return Bool[]
+  local condBranches = [b for b in ifEq.branches if b.identifier != -1]
+  local elseBranch = nothing
+  for b in ifEq.branches
+    b.identifier == -1 && (elseBranch = b)
+  end
+  local conds = Any[]
+  local closed = Bool[]
+  for b in condBranches
+    push!(conds, transformToMTKContinousConditionEquation(b.condition, simCode))
+    push!(closed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
+  end
+  local valMap = nothing
+  local explicit = Set{Symbol}()
+  try
+    (valMap, explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
+  catch
+    valMap = nothing
+  end
+  local ivs = Bool[true for _ in condBranches]
+  for _round in 1:8
+    local newIvs = Bool[evalInitialCondition(conds[k], simCode; closedBoundary = closed[k], extraVals = rT0)
+                        for k in 1:length(condBranches)]
+    local sel = elseBranch
+    for (k, b) in enumerate(condBranches)
+      if !newIvs[k]
+        sel = b
+        break
+      end
+    end
+    local rT0Changed = false
+    if valMap !== nothing && sel !== nothing
+      local mergedMap = copy(valMap)
+      local mergedExplicit = copy(explicit)
+      for (k, v) in rT0
+        mergedMap[k] = v
+        push!(mergedExplicit, k)
+      end
+      for r in sel.residualEquations
+        local gv = try
+          local (rhsE, lhsE) = deCausalize(r, simCode)
+          local key = Symbol(MTK_CodeGenerationUtil._causalLhsKey(lhsE))
+          local val = MTK_CodeGenerationUtil.evalCausalRHSAtT0(rhsE, mergedMap, mergedExplicit)
+          val === nothing ? nothing : (key => Float64(val))
+        catch
+          nothing
+        end
+        if gv !== nothing && (!haskey(rT0, gv.first) || rT0[gv.first] != gv.second)
+          rT0[gv.first] = gv.second
+          rT0Changed = true
+          #= Later targets of the same round may depend on this one. =#
+          mergedMap[gv.first] = gv.second
+          push!(mergedExplicit, gv.first)
+        end
+      end
+    end
+    if get(ENV, "OMBACKEND_RELAY_T0_TRACE", "") == "true"
+      @info "[relayT0] round" _round newIvs rT0Changed nT0=length(rT0) rT0=collect(rT0)
+    end
+    if newIvs == ivs && !rT0Changed
+      break
+    end
+    ivs = newIvs
+  end
+  return ivs
+end
+
+function createIfEquation(stateVariables::Vector,
+                          algebraicVariables::Vector,
+                          ifEq::SimulationCode.IF_EQUATION,
+                          identifier::Int,
+                          simCode,
+                          clusters = Vector{Vector{Tuple{Symbol,Any,Bool}}}(),
+                          leafAlias = Dict{Symbol,Symbol}(),
+                          algDefs = Dict{Symbol,Any}(),
+                          relayT0 = nothing)::IfEquationComponent
+  local i::Int = 0
+  local nBranches::Int = length(ifEq.branches)
+  local branchesWithConds::Int = nBranches - 1
+  #= Fixed point between branch-condition initial values and the targets the
+     selected branch defines: conditions may reference targets of this very
+     if-equation (a hoisted staged trajectory), so a single static evaluation
+     with those operands defaulted to 0 picks the wrong initial branch. =#
+  local _rT0 = relayT0 === nothing ? OrderedDict{Symbol, Float64}() : relayT0
+  local ivPre = _fixedPointInitialConditions(ifEq, simCode, _rT0)
+  #= Zero crossings of every conditional branch, for the live sibling
+     re-evaluation affect of multi-branch chains. =#
+  local allZcs = Any[]
+  local allClosed = Bool[]
+  for b in ifEq.branches
+    b.identifier == -1 && continue
+    try
+      local mc = transformToMTKContinousConditionEquation(b.condition, simCode)
+      push!(allZcs, _extractZeroCrossingLHS(mc))
+      push!(allClosed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
+    catch
+      empty!(allZcs)
+      empty!(allClosed)
+      break
+    end
+  end
+  #= Collect all ifCond symbols for this if-equation.
+     These are parameters modified by imperative affects. =#
+  local allIfCondSyms = [Symbol(string("ifCond", identifier, j)) for j in 1:branchesWithConds]
+  local conditions = Expr[]
+  local ivConditions = Bool[]
+  local pureTimeEvents = Tuple{Symbol, Any, Any, Float64}[]
+  #= Chained pre-memory clusters re-evaluate inside this if-equation's flip
+     affects (event iteration); see _ifEqChainedClusters. =#
+  local chainInfo = _ifEqChainedClusters(ifEq, clusters, simCode, leafAlias, algDefs)
+  #= ivPre is indexed over CONDITIONAL branches only; the loop counter `i`
+     also advances over the else branch, so it must not index ivPre. =#
+  local condIdx::Int = 0
+  #= One callback per UNIQUE zero crossing for live-affect equations: staged
+     chains repeat a boundary (two branches share t = Tvs), and two callbacks
+     firing in succession leave a half-flipped relay between them - a torque
+     slam. The live affect rewrites every sibling ifCond, so one suffices. =#
+  local liveZcSeen = OrderedSet{String}()
+  #= Live-affect qualification is per EQUATION, not per branch: in a staged
+     chain some boundaries are plain parameters while others are relay
+     targets. Mixing live and static toggles leaves the relay half-flipped
+     at the static boundaries. =#
+  local anyRelayCondBranch::Bool =
+    any(b -> b.identifier != -1 && _conditionReferencesRelayTarget(b.condition, _rT0),
+        ifEq.branches)
+  for branch in ifEq.branches
+    i += 1
+    @match branch begin
+      SimulationCode.BRANCH(condition, residuals, -1 #= Else =#, targets, _, _, _, _, _) => begin
+      end
+      SimulationCode.BRANCH(condition, residuals, _, targets, _, _, _, _, _) => begin
+        condIdx += 1
+        local mtkCond = transformToMTKContinousConditionEquation(branch.condition, simCode)
+        #= Evaluate the initial value condition; the original operator decides
+           the zc == 0 boundary. Precomputed via the relay-aware fixed point. =#
+        local _closedB = MTK_CodeGenerationUtil.condClosedAtBoundary(branch.condition)
+        local ivCond = condIdx <= length(ivPre) ? ivPre[condIdx] :
+                       evalInitialCondition(mtkCond, simCode; closedBoundary = _closedB, extraVals = _rT0)
+        local numVal = ivCond ? 1.0 : 0.0
+        local invVal = ivCond ? 0.0 : 1.0
+        #= Build ImperativeAffect: function returns a NamedTuple of new values.
+           modified NamedTuple maps aliases to the symbolic parameter variables.
+           Callback fires for every branch condition; ifCondN is the load-bearing
+           branch switch the residual ifelse reads.
+
+           Direction-aware toggle: the MTK convention here is `zcLhs < 0` <=>
+           condition TRUE. The positive edge (`affect`, prev_sign < 0) is a
+           true->false transition, the negative edge (`affect_neg`, prev_sign > 0)
+           is false->true. So the firing branch's own ifCond is set false on the
+           positive edge and true on the negative edge. A single constant value
+           cannot toggle a condition that crosses repeatedly (e.g. a Pulse/periodic
+           source waveform). Other branches' ifConds are left at their init value,
+           preserving the previous per-branch behaviour. =#
+        local modifiedKws::Vector{Expr} = Expr[Expr(:kw, sym, sym) for sym in allIfCondSyms]
+        local modifiedNT::Expr = Expr(:tuple, Expr(:parameters, modifiedKws...))
+        local upKws::Vector{Expr}   = Expr[Expr(:kw, sym, (j == i) ? 0.0 : invVal) for (j, sym) in enumerate(allIfCondSyms)]
+        local downKws::Vector{Expr} = Expr[Expr(:kw, sym, (j == i) ? 1.0 : invVal) for (j, sym) in enumerate(allIfCondSyms)]
+        local upFExpr::Expr   = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, upKws...))))
+        local downFExpr::Expr = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, downKws...))))
+        local affectTuple::Expr     = :(($(upFExpr), $(modifiedNT)))
+        local affectNegTuple::Expr  = :(($(downFExpr), $(modifiedNT)))
+        #= Multi-branch chains whose conditions reference solved unknowns: a
+           static toggle scrambles the selection when one boundary crossing
+           hands over to a SIBLING branch (staged trajectories with computed
+           phase times). Re-evaluate every sibling condition live from its own
+           zero crossing on either edge; first-true-wins nesting keeps the
+           relay consistent. Purely time/parameter-staged chains keep the
+           static toggles: their transition instants are exact and the
+           deferred pure-time refresh machinery owns them. =#
+        local liveAffect = nothing
+        if chainInfo === nothing && branchesWithConds > 1 && length(allZcs) == branchesWithConds &&
+           anyRelayCondBranch &&
+           get(ENV, "OMBACKEND_LIVE_IFCOND_AFFECT", "true") == "true"
+          local liveKws = Expr[]
+          local liveObsKws = Expr[]
+          for (j, sym) in enumerate(allIfCondSyms)
+            local zcName = Symbol("zc", j)
+            local test = allClosed[j] ? :(observed.$(zcName) <= 0) : :(observed.$(zcName) < 0)
+            push!(liveKws, Expr(:kw, sym, :($(test) ? 1.0 : 0.0)))
+            push!(liveObsKws, Expr(:kw, zcName, allZcs[j]))
+          end
+          local liveFn = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, liveKws...))))
+          local liveObsNT = Expr(:tuple, Expr(:parameters, liveObsKws...))
+          liveAffect = :(ModelingToolkit.ImperativeAffect($(liveFn), $(modifiedNT); observed = $(liveObsNT)))
+        end
+        #= Compose the chained cluster recomputes into both flip directions; the
+           up edge holds the condition FALSE (own ifCond 0.0), the down edge TRUE. =#
+        if chainInfo !== nothing
+          local (_chained, _stale) = chainInfo
+          local _obsUp = Dict{Symbol,Symbol}()
+          local _substUp = _buildRelaySubst(ifEq, 0.0, simCode, leafAlias, algDefs, _stale, _obsUp)
+          local _obsDown = Dict{Symbol,Symbol}()
+          local _substDown = _buildRelaySubst(ifEq, 1.0, simCode, leafAlias, algDefs, _stale, _obsDown)
+          if _substUp !== nothing && _substDown !== nothing
+            affectTuple = _composedIfCondAffectExpr(upKws, modifiedKws, _chained, simCode,
+                                                    _substUp, _obsUp)
+            affectNegTuple = _composedIfCondAffectExpr(downKws, modifiedKws, _chained, simCode,
+                                                       _substDown, _obsDown)
+          end
+        end
+        #= When the branch condition depends on a non-lifted algebraic variable
+           (an operating-point value `evalInitialCondition` defaulted to 0, e.g.
+           an op-amp input voltage), the static initial ifCond can be wrong with
+           no zero-crossing to fire the affect. Add an `initialize` affect that
+           re-evaluates the condition from the solved state (mirrors
+           evalInitialCondition: zc < 0 means the condition is TRUE). Restricted
+           to non-lifted algebraic zc so it does not observe other lifted ifEq_tmp
+           values (which would form a circular init dependency). =#
+        local zcLhs = _extractZeroCrossingLHS(mtkCond)
+        local thisSym::Symbol = allIfCondSyms[i]
+        if _ifConditionIsPureTimeEvent(branch.condition, simCode)
+          #= Deterministic time event: defer to model-level refresh callbacks built
+             in createIfEquations, so two sources whose transitions coincide cannot
+             drop one another's affect. `numVal` is the post-crossing ifCond value
+             (same value the per-branch toggle would set). The ifCond parameter is
+             still declared and initialised below via ivConditions. =#
+          push!(pureTimeEvents, (thisSym, zcLhs, mtkCond, numVal))
+          push!(ivConditions, ivCond)
+        else
+          local cond::Expr
+          local _dupLiveZc::Bool = false
+          if liveAffect !== nothing
+            local _zcKey = string(mtkCond)
+            #= A sibling may already have registered this exact crossing; its
+               live affect rewrites this branch's ifCond too. =#
+            _dupLiveZc = _zcKey in liveZcSeen
+            push!(liveZcSeen, _zcKey)
+          end
+          if _dupLiveZc
+            cond = :(nothing)
+          elseif liveAffect !== nothing
+            #= Positional affect form, matching the pre-memory FSM events: the
+               pair form does not commit an ImperativeAffect's writes. =#
+            cond = :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(mtkCond)),
+              $(liveAffect);
+              affect_neg = $(liveAffect),
+              rootfind = SciMLBase.RightRootFind,
+              reinitializealg = SciMLBase.NoInit()
+            ))
+          elseif _zcReferencesSolvableAlgebraic(zcLhs, simCode)
+            local initObservedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, :zc, zcLhs)))
+            local initModifiedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, thisSym)))
+            local _zcTest = _closedB ? :(observed.zc <= 0) : :(observed.zc < 0)
+            local initRetNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :($(_zcTest) ? 1.0 : 0.0))))
+            local initFExpr::Expr = :((modified, observed, ctx, integrator) -> $initRetNT)
+            local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT); observed = $(initObservedNT)))
+            cond = :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(mtkCond)) => $(affectTuple);
+              affect_neg = $(affectNegTuple),
+              initialize = $(initAffect),
+              reinitializealg = SciMLBase.NoInit()
+            ))
+          else
+            cond = :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(mtkCond)) => $(affectTuple);
+              affect_neg = $(affectNegTuple),
+              reinitializealg = SciMLBase.NoInit()
+            ))
+          end
+          _dupLiveZc || push!(conditions, cond)
+          push!(ivConditions, ivCond)
+        end
+      end
+    end
+  end
+  #= Create the equations themselves =#
+  local target = 1
+  local resEqs = ifEq.branches[target].residualEquations
+  local ifExpressions = Expr[]
+  #= The number of residuals is the same for both branches. =#
+  local nResEqsInTarget = length(resEqs)
+  #= t0-selected branch: first conditional branch whose condition is TRUE at
+     t0 (ivCond stores the negation), else the else branch. Its causalized RHS
+     evaluated at the t0 value map seeds soft guesses for the targets; zero
+     default guesses put guarded denominators at 0/0 before the init solve. =#
+  local condBranches = Any[]
+  local elseBranch = nothing
+  for branch in ifEq.branches
+    if branch.identifier == -1
+      elseBranch = branch
+    else
+      push!(condBranches, branch)
+    end
+  end
+  local selBranch = elseBranch
+  for (k, branch) in enumerate(condBranches)
+    if k <= length(ivConditions) && !(ivConditions[k])
+      selBranch = branch
+      break
+    end
+  end
+  local relayGuesses = Expr[]
+  local _t0ValMap = nothing
+  local _t0Explicit = Set{Symbol}()
+  if selBranch !== nothing
+    try
+      (_t0ValMap, _t0Explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
+    catch
+      _t0ValMap = nothing
+    end
+  end
+  for resEqIdx in 1:nResEqsInTarget
+    local resEq = resEqs[resEqIdx]
+    local lhsExpr = last(deCausalize(resEq, simCode))
+    local lhsKey = MTK_CodeGenerationUtil._causalLhsKey(lhsExpr)
+    push!(ifExpressions,
+          :($(lhsExpr) ~ $(generateIfExpressions(ifEq.branches,
+                                                 target,
+                                                 resEqIdx,
+                                                 identifier,
+                                                 simCode;
+                                                 subIdentifier = 1,
+                                                 lhsKey = lhsKey))))
+    if _t0ValMap !== nothing && !isempty(selBranch.residualEquations)
+      local gv = try
+        local selEq = MTK_CodeGenerationUtil._branchResidualForLhs(selBranch, lhsKey, resEqIdx, simCode)
+        MTK_CodeGenerationUtil.evalCausalRHSAtT0(
+          first(deCausalize(selEq, simCode)), _t0ValMap, _t0Explicit)
+      catch
+        nothing
+      end
+      gv === nothing || push!(relayGuesses, :($(string(_unwrapBlockExpr(lhsExpr))) => $(gv)))
+    end
+  end
+  #= ifCond variables are discrete parameters (not ODE unknowns), so they do
+     not need der() ~ 0 equations. Collect their names and initial values for
+     parameter declaration. =#
+  local conditionVariables = Symbol[]
+  local conditionVariableNames = Tuple{String, Bool}[]
+  for i in 1:length(ivConditions)
+    push!(conditionVariables, Symbol(string("ifCond", identifier, i)))
+    push!(conditionVariableNames, (string("ifCond", identifier, i), !(ivConditions[i])))
+  end
+  return IfEquationComponent(conditions, ifExpressions,
+                             conditionVariables, conditionVariableNames, pureTimeEvents,
+                             relayGuesses)
+end
+
+#= Identify a synthesised discrete-Boolean when (from
+   `synthesizeWhenEquationsFromDiscreteEquations`): its condition is `change(rel)`
+   or an OR-chain of `change(rel)` over relations. Returns the relation list
+   (DAE side) or `nothing`. Such whens are routed to MTK events (not the legacy
+   CallbackSet) so the relation operands resolve as MTK observed variables. =#
+#= Resolve a Boolean condition variable to its defining relation: a residual
+   `0 ~ v - REL` (e.g. `above = x > 0.1`). Returns the relation as a DAE.Exp, or
+   nothing. Lets `change(b)`/`edge(b)` over an observed Boolean route to an MTK
+   SymbolicContinuousCallback (which reads observed vars + root-finds) instead of
+   the legacy CallbackSet (which cannot read the observed `b`). =#
+function _condVarRelation(crefName::AbstractString, simCode)
+  for req in simCode.residualEquations
+    req isa SimulationCode.RESIDUAL_EQUATION || continue
+    local b = req.exp
+    if b isa SimulationCode.BINARY && b.op === SimulationCode.OP_SUB &&
+       b.exp1 isa SimulationCode.EXP_CREF && b.exp2 isa SimulationCode.RELATION &&
+       string(SimulationCode.toDAEExp(b.exp1).componentRef) == crefName
+      return SimulationCode.toDAEExp(b.exp2)
+    end
+  end
+  return nothing
+end
+
+#= Collect the zero-crossing relations of a `change(...)`/`edge(...)` condition
+   (or an OR-chain of them). The argument may be a relation directly or a
+   Boolean variable defined by a relation (resolved via `_condVarRelation`). =#
+function _collectChangeRelations!(rels::Vector{DAE.Exp}, @nospecialize(e), simCode)::Bool
+  @match e begin
+    DAE.CALL(Absyn.IDENT("change"), args, _) || DAE.CALL(Absyn.IDENT("edge"), args, _) => begin
+      local inner = listHead(args)
+      if inner isa DAE.RELATION
+        push!(rels, inner); true
+      elseif inner isa DAE.CREF
+        local rel = _condVarRelation(string(inner.componentRef), simCode)
+        rel === nothing ? false : (push!(rels, rel); true)
+      else
+        false
+      end
+    end
+    DAE.LBINARY(e1, DAE.OR(__), e2) =>
+      (_collectChangeRelations!(rels, e1, simCode) && _collectChangeRelations!(rels, e2, simCode))
+    _ => false
+  end
+end
+
+function _extractChangeRelations(@nospecialize(cond), simCode)
+  local dcond = cond isa SimulationCode.Exp ? SimulationCode.toDAEExp(cond) : cond
+  local rels = DAE.Exp[]
+  local ok = _collectChangeRelations!(rels, dcond, simCode)
+  return (ok && !isempty(rels)) ? rels : nothing
+end
+
+#= True when the when condition marks a synthesized (lifter) when: a literal
+   `initial()` term or a `change()`/`edge()` call. Such whens carry the
+   implied §17.4.4 initial() term and run their body at t0; user whens with
+   bare relation conditions must not. =#
+function _condHasInitial(@nospecialize(e))::Bool
+  local d = e isa SimulationCode.Exp ? SimulationCode.toDAEExp(e) : e
+  @match d begin
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => true
+    DAE.CALL(Absyn.IDENT("change"), _, _) => true
+    DAE.CALL(Absyn.IDENT("edge"), _, _) => true
+    DAE.LBINARY(e1, _, e2) => (_condHasInitial(e1) || _condHasInitial(e2))
+    DAE.LUNARY(_, e1) => _condHasInitial(e1)
+    _ => false
+  end
+end
+
+#= True when the when-condition is `edge(...)` (or an OR-chain of `edge`), which
+   fires on the RISING transition only (false->true), unlike `change` (both). =#
+function _isEdgeWhenCondition(@nospecialize(e))::Bool
+  local d = e isa SimulationCode.Exp ? SimulationCode.toDAEExp(e) : e
+  @match d begin
+    DAE.CALL(Absyn.IDENT("edge"), _, _) => true
+    DAE.LBINARY(e1, DAE.OR(__), e2) => (_isEdgeWhenCondition(e1) && _isEdgeWhenCondition(e2))
+    _ => false
+  end
+end
+
+#= Build MTK SymbolicContinuousCallbacks for the synthesised discrete-Boolean
+   whens: one callback per relation zero-crossing, whose symbolic affect rewrites
+   the held discrete unknown from its defining expression. The affect re-evaluates
+   the Boolean RHS at the (post-rootfind) event point, so it is direction-correct. =#
+#= Replace every structural occurrence of relation `rel` in `exp` with `val`. =#
+function _substRelation(@nospecialize(exp), @nospecialize(rel), val::Bool)
+  local relStr = string(rel)
+  function repl(@nospecialize(e), arg)
+    (string(e) == relStr) ? (DAE.BCONST(val), arg) : (e, arg)
+  end
+  return first(Util.traverseExpBottomUp(exp, repl, nothing))
+end
+
+#= Lower a DAE boolean expression to an MTK Real (0.0/1.0). Each relation is
+   wrapped `ifelse(rel, 1.0, 0.0)` so AND/OR/NOT stay arithmetic on Reals: a bare
+   relation is a Julia Bool and `Bool + Bool` is an Int64, illegal in the boolean
+   context the affect feeds. pre()/discrete crefs are already 0/1 Reals;
+   constants and params fall through to the general emitter. =#
+#= Lower an operand inside an event affect. `pre(x)` becomes
+   `ModelingToolkit.Pre(x)` — the pre-event value — so an affect that reads a
+   discrete's own previous value (e.g. `mode = … pre(mode) …`) is solvable; a
+   bare reference would make the written variable appear on its own RHS and MTK
+   raises UnsolvableCallbackError. Continuous operands read their current value. =#
+Base.@nospecializeinfer function _affectExpToReal(@nospecialize(exp::DAE.Exp), simCode)
+  @match exp begin
+    DAE.CALL(Absyn.IDENT("pre"), args, _) =>
+      :(ModelingToolkit.Pre($(expToJuliaExpMTK(listHead(args), simCode))))
+    DAE.BINARY(e1, op, e2) =>
+      :($(DAE_OP_toJuliaOperator(op))($(_affectExpToReal(e1, simCode)), $(_affectExpToReal(e2, simCode))))
+    DAE.UNARY(op, e) => :($(DAE_OP_toJuliaOperator(op))($(_affectExpToReal(e, simCode))))
+    _ => expToJuliaExpMTK(exp, simCode)
+  end
+end
+
+Base.@nospecializeinfer function _boolDaeToReal(@nospecialize(exp::DAE.Exp), simCode)
+  @match exp begin
+    DAE.BCONST(b) => (b ? :(1.0) : :(0.0))
+    DAE.RELATION(e1, op, e2) => :(ModelingToolkit.ifelse(
+        $(DAE_OP_toJuliaOperator(op))($(_affectExpToReal(e1, simCode)), $(_affectExpToReal(e2, simCode))), 1.0, 0.0))
+    DAE.LUNARY(DAE.NOT(__), e) => :(1.0 - $(_boolDaeToReal(e, simCode)))
+    DAE.LBINARY(e1, DAE.AND(__), e2) =>
+      :($(_boolDaeToReal(e1, simCode)) * $(_boolDaeToReal(e2, simCode)))
+    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
+      local a = _boolDaeToReal(e1, simCode)
+      local b = _boolDaeToReal(e2, simCode)
+      :($(a) + $(b) - $(a) * $(b))
+    end
+    DAE.IFEXP(c, t, f) => begin
+      local cr = _boolDaeToReal(c, simCode)
+      local tr = _boolDaeToReal(t, simCode)
+      local fr = _boolDaeToReal(f, simCode)
+      :($(cr) * $(tr) + (1.0 - $(cr)) * $(fr))
+    end
+    DAE.CALL(Absyn.IDENT("pre"), _, _) => _affectExpToReal(exp, simCode)
+    _ => expToJuliaExpMTK(exp, simCode)
+  end
+end
+
+#= Lower an INTEGER/enum-valued discrete RHS to an MTK Real holding the actual
+   numeric value (NOT a 0/1 Boolean). Conditions are evaluated through the
+   Boolean lowering; integer branches keep their value, so a five-valued FSM
+   (e.g. PartialFriction `mode`) is preserved instead of clamped. =#
+Base.@nospecializeinfer function _discreteIntToReal(@nospecialize(exp::DAE.Exp), simCode)
+  @match exp begin
+    DAE.ICONST(i) => Float64(i)
+    DAE.RCONST(r) => r
+    DAE.BCONST(b) => (b ? 1.0 : 0.0)
+    DAE.ENUM_LITERAL(_, idx) => Float64(idx)
+    DAE.IFEXP(c, t, f) => :(ModelingToolkit.ifelse(
+        0.5 < $(_boolDaeToReal(c, simCode)),
+        $(_discreteIntToReal(t, simCode)),
+        $(_discreteIntToReal(f, simCode))))
+    DAE.BINARY(e1, op, e2) => begin
+      local opSym = DAE_OP_toJuliaOperator(op)
+      :($(opSym)($(_discreteIntToReal(e1, simCode)), $(_discreteIntToReal(e2, simCode))))
+    end
+    DAE.CALL(Absyn.IDENT("pre"), _, _) => _affectExpToReal(exp, simCode)
+    _ => expToJuliaExpMTK(exp, simCode)
+  end
+end
+
+#= One affect equation `disc ~ <value>` for a lifted discrete: the triggering
+   relation `rel` is pinned to `val` (its post-crossing value). Integer/enum
+   discretes keep their multi-valued result; Boolean discretes are 0/1-clamped. =#
+Base.@nospecializeinfer function _discreteAffectEq(discSym::Symbol, @nospecialize(rhsDAE::DAE.Exp),
+                                                   @nospecialize(rel::DAE.Exp), val::Bool, isInt::Bool, simCode)
+  local pinned = _substRelation(rhsDAE, rel, val)
+  if isInt
+    return :($(discSym) ~ $(_discreteIntToReal(pinned, simCode)))
+  end
+  return :($(discSym) ~ ModelingToolkit.ifelse(0.5 < $(_boolDaeToReal(pinned, simCode)), 1.0, 0.0))
+end
+
+#= Initialize affect for a lifted discrete: evaluate the FULL rhs at t0 (no
+   relation pinned). A `time >= startTime` relation is already satisfied at t0,
+   so no zero-crossing fires there; without this the discrete is stuck at its
+   default start value. Implements the `initial()` term of the §17.4.4 condition. =#
+Base.@nospecializeinfer function _discreteAffectEqInit(discSym::Symbol, @nospecialize(rhsDAE::DAE.Exp),
+                                                       isInt::Bool, simCode)
+  if isInt
+    return :($(discSym) ~ $(_discreteIntToReal(rhsDAE, simCode)))
+  end
+  return :($(discSym) ~ ModelingToolkit.ifelse(0.5 < $(_boolDaeToReal(rhsDAE, simCode)), 1.0, 0.0))
+end
+
+#= Pre-memory path. Each model is generated as its own module, so a single
+   module-level `DISCRETE_PRE_MEM` Dict per model holds the committed value of
+   every lifted discrete. The cluster's ImperativeAffects read it for `pre(x)` and
+   write it after computing each new value; because it is plain module state, a
+   dt=0 cascade of the cluster's per-relation callbacks sees the committed values
+   (the latch that `ModelingToolkit.Pre`, a frozen pre-event snapshot, cannot give). =#
+_preMemEnabled()::Bool = lowercase(get(ENV, "OMBACKEND_DISCRETE_PRE_MEMORY", "false")) in ("true", "1", "yes")
+
+#= True if the expression contains a constant-table subscript (DAE.ASUB).
+   Such clusters are Newton-hostile: equation-form affects compile to an
+   implicit solve whose residuals are piecewise constant. =#
+Base.@nospecializeinfer function _expHasTableLookup(@nospecialize(exp))::Bool
+  @match exp begin
+    DAE.ASUB(__) => true
+    DAE.BINARY(e1, _, e2) => _expHasTableLookup(e1) || _expHasTableLookup(e2)
+    DAE.LBINARY(e1, _, e2) => _expHasTableLookup(e1) || _expHasTableLookup(e2)
+    DAE.RELATION(e1, _, e2) => _expHasTableLookup(e1) || _expHasTableLookup(e2)
+    DAE.UNARY(_, e) => _expHasTableLookup(e)
+    DAE.LUNARY(_, e) => _expHasTableLookup(e)
+    DAE.CAST(_, e) => _expHasTableLookup(e)
+    DAE.IFEXP(c, t, f) =>
+      _expHasTableLookup(c) || _expHasTableLookup(t) || _expHasTableLookup(f)
+    DAE.CALL(_, args, _) => begin
+      local found = false
+      for a in args
+        found = found || _expHasTableLookup(a)
+      end
+      found
+    end
+    _ => false
+  end
+end
+
+#= True if the model has lifted discrete-Boolean when clusters AND its
+   residuals read constant tables. The affect system MTK builds for an
+   equation-form affect pulls in the surrounding algebraic equations, so the
+   model-level residual content decides Newton-hostility, not the cluster
+   bodies. Selects the imperative affect lowering and the Newton-FD event
+   re-initialization. =#
+function _modelHasTableClusters(simCode)::Bool
+  local hasCluster = false
+  for weq in simCode.whenEquations
+    if _extractChangeRelations(weq.whenEquation.condition, simCode) !== nothing
+      hasCluster = true
+      break
+    end
+  end
+  hasCluster || return false
+  for eq in simCode.residualEquations
+    if _expHasTableLookup(SimulationCode.toDAEExp(eq.exp))
+      return true
+    end
+  end
+  return false
+end
+
+#= Unwrap nested block Exprs (and their annotation LineNumberNodes) down to
+   the core expression. =#
+function _unwrapBlockExpr(e)
+  while e isa Expr && e.head == :block
+    local args = [a for a in e.args if !(a isa LineNumberNode)]
+    isempty(args) && return e
+    e = last(args)
+  end
+  return e
+end
+
+#= True if the expression reads pre() of any name in `names`. =#
+Base.@nospecializeinfer function _expHasPreOf(@nospecialize(exp), names::Set{String})::Bool
+  @match exp begin
+    DAE.CALL(Absyn.IDENT("pre"), args, _) => string(listHead(args).componentRef) in names
+    DAE.BINARY(e1, _, e2) => _expHasPreOf(e1, names) || _expHasPreOf(e2, names)
+    DAE.LBINARY(e1, _, e2) => _expHasPreOf(e1, names) || _expHasPreOf(e2, names)
+    DAE.RELATION(e1, _, e2) => _expHasPreOf(e1, names) || _expHasPreOf(e2, names)
+    DAE.UNARY(_, e) => _expHasPreOf(e, names)
+    DAE.LUNARY(_, e) => _expHasPreOf(e, names)
+    DAE.CAST(_, e) => _expHasPreOf(e, names)
+    DAE.IFEXP(c, t, f) =>
+      _expHasPreOf(c, names) || _expHasPreOf(t, names) || _expHasPreOf(f, names)
+    DAE.CALL(_, args, _) => begin
+      local found = false
+      for a in args
+        found = found || _expHasPreOf(a, names)
+      end
+      found
+    end
+    _ => false
+  end
+end
+
+#= True if any lifted cluster assigns an Integer/enum discrete (a mode
+   variable) whose rhs reads pre() of a discrete assigned in the same
+   cluster. Such bodies are sequential FSM transitions; the equation-form
+   affect solves them simultaneously, which mis-latches. Scoped to the
+   mode-carrying shape; Boolean-only self-pre clusters (freewheel logic)
+   stay on the equation path, which handles them correctly. =#
+function _modelHasModeFSMClusters(simCode)::Bool
+  for weq in simCode.whenEquations
+    _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
+    local assigned = Set{String}()
+    local intRhss = Any[]
+    for st in collect(weq.whenEquation.whenStmtLst)
+      (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+      local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
+      push!(assigned, leftStr)
+      haskey(simCode.stringToSimVarHT, leftStr) || continue
+      local (_, var) = simCode.stringToSimVarHT[leftStr]
+      local isInt = @match var.attributes begin
+        SOME(DAE.VAR_ATTR_INT(__)) => true
+        SOME(DAE.VAR_ATTR_ENUMERATION(__)) => true
+        _ => false
+      end
+      isInt && push!(intRhss, SimulationCode.toDAEExp(st.right))
+    end
+    isempty(intRhss) && continue
+    for rhs in intRhss
+      _expHasPreOf(rhs, assigned) && return true
+    end
+  end
+  return false
+end
+
+#= Newton with an FD Jacobian degenerates to the Gauss-Jacobi sweep that
+   piecewise-constant algebraic rows need; Broyden's secant update diverges
+   on them. Used as the event re-init default for table-cluster models. =#
+function tableClusterInitAlg()
+  local NL = OMBackend.OrdinaryDiffEq.OrdinaryDiffEqNonlinearSolve
+  return OMBackend.OrdinaryDiffEq.BrownFullBasicInit(1e-8,
+    NL.NewtonRaphson(; autodiff = NL.ADTypes.AutoFiniteDiff()))
+end
+
+#= True if `name` is a Boolean-typed discrete (so pre(name) read from the Float
+   memory must become a Bool before use in an and/or/not context). =#
+Base.@nospecializeinfer function _isBoolDiscreteName(name::String, simCode)::Bool
+  haskey(simCode.stringToSimVarHT, name) || return false
+  local (_, var) = simCode.stringToSimVarHT[name]
+  return @match var.attributes begin
+    SOME(DAE.VAR_ATTR_BOOL(__)) => true
+    _ => false
+  end
+end
+
+#= Names substituted statically inside an affect body (post-event branch values
+   replacing stale observed reads). Default: no substitution. =#
+const _EMPTY_MEM_SUBST = Dict{Symbol, Any}()
+const _EMPTY_REL_PINS = Dict{String, Bool}()
+
+#= Pinned truth value of a relation inside an affect body, or nothing. =#
+Base.@nospecializeinfer function _relPinValue(@nospecialize(exp::DAE.Exp), relPins::Dict{String,Bool})::Union{Bool, Nothing}
+  (!isempty(relPins) && exp isa DAE.RELATION) || return nothing
+  return get(relPins, string(exp), nothing)
+end
+
+#= Lower a DAE exp at a boolean position of an ImperativeAffect body. Live
+   reads come back as 0/1 Floats; `> 0.5` coerces both Bool and Float.
+   `initVal` is the value `initial()` lowers to (true in an initialize affect). =#
+Base.@nospecializeinfer function _daeBoolMem(@nospecialize(exp::DAE.Exp), obsAcc::Dict{Symbol,Symbol}, simCode;
+                                             initVal::Bool = false,
+                                             subst::Dict{Symbol,Any} = _EMPTY_MEM_SUBST,
+                                             relPins::Dict{String,Bool} = _EMPTY_REL_PINS)
+  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins)
+  local pin = _relPinValue(exp, relPins)
+  pin === nothing || return pin
+  @match exp begin
+    DAE.BCONST(b) => b
+    DAE.LUNARY(DAE.NOT(__), e) => :(!$(recb(e)))
+    DAE.LBINARY(e1, DAE.AND(__), e2) => :($(recb(e1)) && $(recb(e2)))
+    DAE.LBINARY(e1, DAE.OR(__), e2) => :($(recb(e1)) || $(recb(e2)))
+    DAE.RELATION(__) => _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins)
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => initVal
+    DAE.IFEXP(c, t, f) => :($(recb(c)) ? $(recb(t)) : $(recb(f)))
+    _ => begin
+      local v = _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal, subst = subst)
+      v isa Bool ? v : :($(v) > 0.5)
+    end
+  end
+end
+
+#= Lower a DAE exp to a Julia Expr for an ImperativeAffect body:
+     pre(x)                -> DISCRETE_PRE_MEM[:x]   (committed memory)
+     continuous/param cref -> observed.<name>        (collected into obsAcc)
+     relation/ifelse/and/or/not/arith -> Julia control flow
+   `initVal` is the value `initial()` lowers to (true in an initialize affect).
+   The triggering relation is pre-substituted by the caller, so it arrives as a
+   BCONST. =#
+Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), obsAcc::Dict{Symbol,Symbol}, simCode;
+                                                   initVal::Bool = false,
+                                                   subst::Dict{Symbol,Any} = _EMPTY_MEM_SUBST,
+                                                   relPins::Dict{String,Bool} = _EMPTY_REL_PINS)
+  rec(@nospecialize e) = _daeExpToJuliaMem(e, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins)
+  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins)
+  local pin = _relPinValue(exp, relPins)
+  pin === nothing || return pin
+  @match exp begin
+    DAE.ICONST(i) => Float64(i)
+    DAE.RCONST(r) => r
+    DAE.BCONST(b) => b
+    DAE.ENUM_LITERAL(_, idx) => Float64(idx)
+    DAE.CALL(Absyn.IDENT("pre"), args, _) => begin
+      local nm = string(listHead(args).componentRef)
+      local rd = :(DISCRETE_PRE_MEM[$(QuoteNode(Symbol(nm)))])
+      _isBoolDiscreteName(nm, simCode) ? :($(rd) > 0.5) : rd
+    end
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => initVal
+    DAE.RELATION(e1, op, e2) => :($(DAE_OP_toJuliaOperator(op))($(rec(e1)), $(rec(e2))))
+    DAE.LUNARY(DAE.NOT(__), e) => :(!$(recb(e)))
+    DAE.LBINARY(e1, DAE.AND(__), e2) => :($(recb(e1)) && $(recb(e2)))
+    DAE.LBINARY(e1, DAE.OR(__), e2) => :($(recb(e1)) || $(recb(e2)))
+    DAE.IFEXP(c, t, f) => :($(recb(c)) ? $(rec(t)) : $(rec(f)))
+    DAE.BINARY(e1, op, e2) => :($(DAE_OP_toJuliaOperator(op))($(rec(e1)), $(rec(e2))))
+    DAE.UNARY(op, e) => :($(DAE_OP_toJuliaOperator(op))($(rec(e))))
+    DAE.CREF(cr, _) => begin
+      local nm = Symbol(string(cr))
+      if nm === :time
+        #= module-scope `time` is Base.time; the affect reads the integrator clock =#
+        :(integrator.t)
+      elseif haskey(subst, nm)
+        subst[nm]
+      elseif haskey(simCode.stringToSimVarHT, string(cr)) &&
+             simCode.stringToSimVarHT[string(cr)][2].varKind isa SimulationCode.DATA_STRUCTURE
+        #= module-global table handle (DATA_STRUCTURE), referenced by bare name =#
+        Symbol(string(cr))
+      else
+        obsAcc[nm] = nm
+        :(observed.$(nm))
+      end
+    end
+    #= Modelica index helpers used by Digital gate residuals. The lookup rounds
+       its index, so floor/integer only need to evaluate the inner value. =#
+    DAE.CALL(Absyn.IDENT("floor"), args, _) => :(floor($(rec(listHead(args)))))
+    DAE.CALL(Absyn.IDENT("integer"), args, _) =>
+      :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_integer($(rec(listHead(args)))))
+    #= Numeric calls with direct Julia equivalents. =#
+    DAE.CALL(Absyn.IDENT("abs"), args, _) => :(abs($(rec(listHead(args)))))
+    DAE.CALL(Absyn.IDENT("sign"), args, _) => :(sign($(rec(listHead(args)))))
+    DAE.CALL(Absyn.IDENT("sqrt"), args, _) => :(sqrt($(rec(listHead(args)))))
+    DAE.CALL(Absyn.IDENT("min"), args, _) =>
+      :(min($(rec(listHead(args))), $(rec(listHead(listRest(args))))))
+    DAE.CALL(Absyn.IDENT("max"), args, _) =>
+      :(max($(rec(listHead(args))), $(rec(listHead(listRest(args))))))
+    #= Event-control wrappers are semantic no-ops inside an affect body. =#
+    DAE.CALL(Absyn.IDENT("noEvent"), args, _) => rec(listHead(args))
+    DAE.CALL(Absyn.IDENT("smooth"), args, _) => rec(listHead(listRest(args)))
+    #= Constant-table lookup `table[idx...]`: the table is a constant literal
+       (lower via the standard expression path), the subscripts are gate inputs
+       lowered through `rec` so they read observed / DISCRETE_PRE_MEM. Routes
+       through `constTableLookup` (handles numeric + rounded indices). =#
+    DAE.ASUB(exp = tableExp, sub = subs) => begin
+      local subCodes = collect(rec(s) for s in subs)
+      :(OMBackend.CodeGeneration.constTableLookup($(expToJuliaExpMTK(tableExp, simCode)), $(subCodes...)))
+    end
+    DAE.ARRAY(__) => expToJuliaExpMTK(exp, simCode)
+    #= External / qualified Modelica function (e.g. CombiTimeTable
+       Internal.getNextTimeEvent): mirror the residual's name resolution
+       (canonicalName -> underscore form), args lowered imperatively. =#
+    DAE.CALL(path = p, expLst = cargs) =>
+      Expr(:call, Symbol(OMBackend.canonicalName(string(p))), (rec(a) for a in cargs)...)
+    _ => error("_daeExpToJuliaMem: unsupported in pre-memory affect: $(exp)")
+  end
+end
+
+#= Build (functionExpr, observedNT, modifiedNT) for one ImperativeAffect that
+   recomputes the whole cluster, reading every continuous operand LIVE from the
+   integrator (observed) and pre() from DISCRETE_PRE_MEM, then committing each new
+   value back. No relation is pinned: with the memory latch, live evaluation at the
+   consistent post-step state avoids the spurious Stuck a pinned relation forces. =#
+Base.@nospecializeinfer function _preMemClusterBody!(stmts::Vector{Expr}, writes::Vector{Expr}, retKws::Vector{Expr},
+                                                     obsAcc::Dict{Symbol,Symbol},
+                                                     assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode;
+                                                     atInit::Bool = false,
+                                                     subst::Dict{Symbol,Any} = _EMPTY_MEM_SUBST,
+                                                     relPins::Dict{String,Bool} = _EMPTY_REL_PINS)
+  local modeSym = nothing; local sfSym = nothing; local sbSym = nothing
+  local lkSym = nothing; local freeSym = nothing
+  for (d, rhs, isInt) in assigns
+    local vsym = Symbol("_v_", d)
+    local valExpr = isInt ?
+      :(Float64($(_daeExpToJuliaMem(rhs, obsAcc, simCode; initVal = atInit, subst = subst, relPins = relPins)))) :
+      :($(_daeBoolMem(rhs, obsAcc, simCode; initVal = atInit, subst = subst, relPins = relPins)) ? 1.0 : 0.0)
+    push!(stmts, :(local $(vsym) = $(valExpr)))
+    push!(writes, :(DISCRETE_PRE_MEM[$(QuoteNode(d))] = $(vsym)))
+    push!(retKws, Expr(:kw, d, vsym))
+    local ds = string(d)
+    endswith(ds, "mode") && isInt && (modeSym = vsym)
+    endswith(ds, "startForward")  && (sfSym = vsym)
+    endswith(ds, "startBackward") && (sbSym = vsym)
+    endswith(ds, "locked") && (lkSym = vsym)
+    endswith(ds, "free")   && (freeSym = vsym)
+  end
+  #= Breakaway carries the mode (PartialFriction): the discrete event framework
+     cannot let w_relfric grow positive within a v=0 event to open the `w>0` gate,
+     so a latched startForward/startBackward commits Forward/Backward directly. Then
+     `locked` is recomputed from the resolved mode (locked = not free and Stuck) so
+     it stays consistent — otherwise locked=1 alongside mode=Forward forces
+     a_relfric=0 and freezes the element. =#
+  if modeSym !== nothing && (sfSym !== nothing || sbSym !== nothing)
+    sfSym !== nothing && push!(stmts, :($(modeSym) = ($(sfSym) > 0.5) ? 1.0 : $(modeSym)))
+    sbSym !== nothing && push!(stmts, :($(modeSym) = ($(sbSym) > 0.5) ? -1.0 : $(modeSym)))
+    if lkSym !== nothing && freeSym !== nothing
+      push!(stmts, :($(lkSym) = ($(freeSym) < 0.5 && $(modeSym) == 0.0) ? 1.0 : 0.0))
+    end
+  end
+  return nothing
+end
+
+#= Reinit algorithm for the pre-memory FSM callbacks. NoInit keeps the
+   discrete latch exactly; Brown re-solves the algebraic part so loops that
+   feed the friction (motor electronics) stay consistent across a flip. =#
+_fsmReinitAlg() = get(ENV, "OMBACKEND_FSM_REINIT", "noinit") == "brown" ?
+  :(SciMLBase.BrownFullBasicInit()) : :(SciMLBase.NoInit())
+
+Base.@nospecializeinfer function _preMemAffectParts(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode;
+                                                    atInit::Bool = false, flagModified::Bool = true,
+                                                    relPins::Dict{String,Bool} = _EMPTY_REL_PINS)
+  local obsAcc = Dict{Symbol,Symbol}()
+  local stmts = Expr[]; local writes = Expr[]; local retKws = Expr[]
+  _preMemClusterBody!(stmts, writes, retKws, obsAcc, assigns, simCode; atInit = atInit, relPins = relPins)
+  #= Modelica event iteration, restricted to the instant-only start flags: a
+     second evaluation with pass-1 values committed to pre-memory clears
+     startForward/startBackward once the mode has carried (pre(mode) is no
+     longer Stuck), then locked is re-derived from the settled flags. The
+     mode keeps the carried value: w is still exactly zero at the instant,
+     so its raw equation would revert to Stuck. =#
+  if !atInit && get(ENV, "OMBACKEND_PREMEM_EVENT_ITERATION", "true") == "true"
+    local vMode = nothing; local vLocked = nothing; local vFree = nothing
+    for (d, _, isInt) in assigns
+      local ds = string(d)
+      endswith(ds, "mode") && isInt && (vMode = Symbol("_v_", d))
+      endswith(ds, "locked") && (vLocked = Symbol("_v_", d))
+      endswith(ds, "free") && (vFree = Symbol("_v_", d))
+    end
+    local flagAssigns = [a for a in assigns
+                         if endswith(string(a[1]), "startForward") || endswith(string(a[1]), "startBackward")]
+    if vMode !== nothing && !isempty(flagAssigns)
+      append!(stmts, writes)
+      for (d, rhs, isInt) in flagAssigns
+        local v2 = Symbol("_v2_", d)
+        local valExpr2 = isInt ?
+          :(Float64($(_daeExpToJuliaMem(rhs, obsAcc, simCode; initVal = atInit, relPins = relPins)))) :
+          :($(_daeBoolMem(rhs, obsAcc, simCode; initVal = atInit, relPins = relPins)) ? 1.0 : 0.0)
+        push!(stmts, :(local $(v2) = $(valExpr2)))
+        local carryVal = endswith(string(d), "startForward") ? 1.0 : -1.0
+        push!(stmts, :($(vMode) = ($(v2) > 0.5) ? $(carryVal) : $(vMode)))
+        push!(stmts, :($(Symbol("_v_", d)) = $(v2)))
+      end
+      if vLocked !== nothing && vFree !== nothing
+        push!(stmts, :($(vLocked) = ($(vFree) < 0.5 && $(vMode) == 0.0) ? 1.0 : 0.0))
+      end
+    end
+  end
+  local retNT = Expr(:tuple, Expr(:parameters, retKws...))
+  local trace = get(ENV, "OMBACKEND_PREMEM_TRACE", "") == "true" ?
+    :(@info "[preMem affect]" t = integrator.t observed retval = $(retNT)) : :(nothing)
+  #= Multistep / Rosenbrock integrators roll the committed discrete back into
+     their history unless told the state changed at this instant. Must NOT
+     fire inside initialize affects: a modification flag mid-initialization
+     forces a spurious re-init that wipes discrete declaration bindings. =#
+  local flag = flagModified ? :(SciMLBase.u_modified!(integrator, true)) : :(nothing)
+  local fexpr = :((modified, observed, ctx, integrator) -> begin
+                    $(stmts...)
+                    $(writes...)
+                    $(trace)
+                    $(flag)
+                    $(retNT)
+                  end)
+  local obsNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, k, v) for (k, v) in obsAcc]...))
+  local modNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, d, d) for (d, _, _) in assigns]...))
+  return (fexpr, obsNT, modNT)
+end
+
+#= Constant-fold a discrete variable's `start` attribute to a Float64
+   (Bool->0/1, Int/enum->value); 0.0 if absent or non-constant. Used to seed
+   DISCRETE_PRE_MEM so pre(x) at the first event resolves to x.start. =#
+Base.@nospecializeinfer function _discreteStartFloat(@nospecialize(var))::Float64
+  local s = @match var.attributes begin
+    SOME(DAE.VAR_ATTR_BOOL(start = SOME(e))) => e
+    SOME(DAE.VAR_ATTR_INT(start = SOME(e))) => e
+    SOME(DAE.VAR_ATTR_REAL(start = SOME(e))) => e
+    SOME(DAE.VAR_ATTR_ENUMERATION(start = SOME(e))) => e
+    _ => nothing
+  end
+  s === nothing && return 0.0
+  return @match s begin
+    DAE.BCONST(b) => (b ? 1.0 : 0.0)
+    DAE.ICONST(i) => Float64(i)
+    DAE.RCONST(r) => r
+    DAE.ENUM_LITERAL(_, idx) => Float64(idx)
+    _ => 0.0
+  end
+end
+
+#= Module-level declaration of DISCRETE_PRE_MEM seeded with each lifted discrete's
+   start value. Emitted only when the pre-memory flag is on and a lifted cluster
+   exists; otherwise a no-op so non-friction models are unchanged. =#
+function discretePreMemDecl(simCode)::Expr
+  _preMemActive(simCode) || return Expr(:block)
+  local pairs = Expr[]
+  for weq in simCode.whenEquations
+    _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
+    for st in collect(weq.whenEquation.whenStmtLst)
+      (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+      local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
+      haskey(simCode.stringToSimVarHT, leftStr) || continue
+      local (_, var) = simCode.stringToSimVarHT[leftStr]
+      push!(pairs, :($(QuoteNode(Symbol(string(var.name)))) => $(_discreteStartFloat(var))))
+    end
+  end
+  isempty(pairs) && return Expr(:block)
+  return :(DISCRETE_PRE_MEM = Dict{Symbol, Float64}($(pairs...)))
+end
+
+#= The pre-memory lowering trigger, shared by every site that must mirror the
+   decision (event creation, the DISCRETE_PRE_MEM declaration, if-event chaining). =#
+_preMemActive(simCode)::Bool =
+  _preMemEnabled() || _modelHasTableClusters(simCode) || _modelHasModeFSMClusters(simCode)
+
+#= Gather a synthesized when cluster's ordered (discreteSymbol, rhsDAE, isInteger)
+   assignments; `nothing` when any statement is unsupported. A single-member
+   cluster has one entry; a coupled FSM cluster has the body in topological order. =#
+function _gatherClusterAssigns(weq, simCode)
+  local assigns = Tuple{Symbol, Any, Bool}[]
+  for st in collect(weq.whenEquation.whenStmtLst)
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || return nothing
+    local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
+    haskey(simCode.stringToSimVarHT, leftStr) || return nothing
+    local (_, var) = simCode.stringToSimVarHT[leftStr]
+    local isInt = @match var.attributes begin
+      SOME(DAE.VAR_ATTR_INT(__)) => true
+      SOME(DAE.VAR_ATTR_ENUMERATION(__)) => true
+      _ => false
+    end
+    push!(assigns, (Symbol(string(var.name)), SimulationCode.toDAEExp(st.right), isInt))
+  end
+  return isempty(assigns) ? nothing : assigns
+end
+
+#= All pre-memory-lowered cluster assign lists; empty unless the pre-memory
+   path is active for this model. =#
+function _collectPreMemClusters(simCode)::Vector{Vector{Tuple{Symbol,Any,Bool}}}
+  local out = Vector{Vector{Tuple{Symbol,Any,Bool}}}()
+  _preMemActive(simCode) || return out
+  for weq in simCode.whenEquations
+    _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
+    local assigns = _gatherClusterAssigns(weq, simCode)
+    assigns === nothing && continue
+    push!(out, assigns)
+  end
+  return out
+end
+
+#= Collect relations comparing `time` against a `pre()` value (a self-scheduling
+   time event), recursing through OR. =#
+function _collectSelfSchedRels!(rels::Vector{DAE.Exp}, @nospecialize(e))
+  @match e begin
+    DAE.RELATION(exp1 = e1, exp2 = e2) => begin
+      if (_isTimeCref(e1) || _isTimeCref(e2)) && (_isPreCref(e1) || _isPreCref(e2))
+        push!(rels, e)
+      end
+      nothing
+    end
+    DAE.LBINARY(exp1 = a, operator = DAE.OR(__), exp2 = b) => begin
+      _collectSelfSchedRels!(rels, a)
+      _collectSelfSchedRels!(rels, b)
+      nothing
+    end
+    _ => nothing
+  end
+  return nothing
+end
+
+function _selfSchedulingTimeRels(@nospecialize(cond))
+  local d = cond isa SimulationCode.Exp ? SimulationCode.toDAEExp(cond) : cond
+  local rels = DAE.Exp[]
+  _collectSelfSchedRels!(rels, d)
+  return rels
+end
+
+#= Build (functionExpr, observedNT, modifiedNT) for the ImperativeAffect of a
+   self-scheduling time-event when. Each ASSIGN `x := rhs` is recomputed
+   imperatively (rhs lowered via `_daeExpToJuliaMem`: time->integrator.t,
+   table handle->module global, external call->resolved). A companion
+   `x_preMem` (addSelfSchedulingPreMemory) captures x's value at callback entry
+   so the table residual's pre(x) reads the held segment boundary. `atInit`
+   lowers `initial()` to true for the initialize affect. =#
+Base.@nospecializeinfer function _selfSchedAffectParts(weq, simCode; atInit::Bool = false)
+  local obsAcc = Dict{Symbol,Symbol}()
+  local stmts = Expr[]
+  local retKws = Expr[]
+  local modNames = Symbol[]
+  local subst = Dict{Symbol,Any}()
+  for st in collect(weq.whenEquation.whenStmtLst)
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+    local lhsDAE = SimulationCode.toDAEExp(st.left)
+    lhsDAE isa DAE.CREF || continue
+    local xn = string(lhsDAE.componentRef)
+    local xsym = Symbol(xn)
+    local pm = xn * "_preMem"
+    if haskey(simCode.stringToSimVarHT, pm)
+      local pmv = Symbol("_pm_", xn)
+      push!(stmts, :(local $(pmv) = modified.$(xsym)))
+      push!(retKws, Expr(:kw, Symbol(pm), pmv))
+      push!(modNames, Symbol(pm))
+    end
+    local vsym = Symbol("_v_", xn)
+    local rhsJ = _daeExpToJuliaMem(SimulationCode.toDAEExp(st.right), obsAcc, simCode;
+                                   initVal = atInit, subst = subst)
+    push!(stmts, :(local $(vsym) = $(rhsJ)))
+    push!(retKws, Expr(:kw, xsym, vsym))
+    push!(modNames, xsym)
+    subst[xsym] = vsym
+  end
+  local retNT = Expr(:tuple, Expr(:parameters, retKws...))
+  local fexpr = :((modified, observed, ctx, integrator) -> begin
+                    $(stmts...)
+                    $(retNT)
+                  end)
+  local obsNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, k, v) for (k, v) in obsAcc]...))
+  local modNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, d, d) for d in modNames]...))
+  return (fexpr, obsNT, modNT)
+end
+
+#= MTK SymbolicContinuousCallbacks for self-scheduling time-event whens. The
+   crossing `time - nextTimeEvent` fires when time reaches the held discrete; an
+   ImperativeAffect re-runs the body (updates only integrator.u, never an
+   AffectSystem, so it does not pull the table-fed continuous network into an
+   unsolvable callback). =#
+function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
+  local events = Expr[]
+  for weq in simCode.whenEquations
+    local rels = _selfSchedulingTimeRels(weq.whenEquation.condition)
+    isempty(rels) && continue
+    local (fn, obs, modN) = _selfSchedAffectParts(weq, simCode; atInit = false)
+    isempty(modN.args[1].args) && continue
+    local (fnI, obsI, modI) = _selfSchedAffectParts(weq, simCode; atInit = true)
+    for rel in rels
+      #= transformToMTKContinousCondition emits `pre(nextTimeEvent) - time` for
+         `time >= pre(nextTimeEvent)`, which falls through zero as time reaches
+         the event. Negate so the crossing RISES through zero exactly when the
+         Modelica condition becomes true (the when's rising edge), and fire only
+         on that positive edge (affect_neg = nothing). A monotone time event is
+         one-directional, so a single edge is correct and avoids double-firing. =#
+      local zc = transformToMTKContinousCondition(rel, simCode)
+      push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+        (-($(zc)) ~ 0),
+        ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs));
+        affect_neg = nothing,
+        initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI)),
+        rootfind = SciMLBase.RightRootFind,
+        reinitializealg = SciMLBase.NoInit())))
+    end
+  end
+  return events
+end
+
+function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
+  local events = Expr[]
+  local tableMode = _modelHasTableClusters(simCode)
+  local preMem = _preMemActive(simCode)
+  for weq in simCode.whenEquations
+    local rels = _extractChangeRelations(weq.whenEquation.condition, simCode)
+    rels === nothing && continue
+    #= `edge(b)` fires on the rising transition only (relation false->true);
+       `change`/the gate lift fire on both. =#
+    local isEdge = _isEdgeWhenCondition(weq.whenEquation.condition)
+    local assigns = _gatherClusterAssigns(weq, simCode)
+    assigns === nothing && continue
+    #= One callback per relation in the cluster. transformToMTKContinousCondition
+       normalises zc so relation-TRUE ⟺ zc<0: the `=>` affect is the up-crossing
+       (relation becomes FALSE) and affect_neg the down-crossing (relation becomes
+       TRUE). Each callback rewrites the WHOLE ordered cluster with THIS relation
+       pinned to its post-crossing value (others at their current value) so a
+       coupled FSM recomputes consistently and direction-correctly on any member
+       crossing, without the `f≈0` ambiguity. =#
+    #= Initialize affect: set every discrete from its full rhs at t0. Only
+       whens whose condition carries an `initial()` term (the synthesized
+       lifter conditions) run their body at t0; user whens with plain
+       relation conditions must not (Trapezoid `T_start = time` at t0 would
+       destroy a negative-startTime phase, friction would mis-latch). =#
+    local hasInit = _condHasInitial(weq.whenEquation.condition)
+    local affInit = Expr[_discreteAffectEqInit(d, r, ii, simCode) for (d, r, ii) in assigns]
+    for (relIdx, rel) in enumerate(rels)
+      local zc = transformToMTKContinousCondition(rel, simCode)
+      if preMem
+        #= Live ImperativeAffects that commit to DISCRETE_PRE_MEM so a dt=0
+           cascade across the cluster's callbacks latches. The FIRING relation
+           is pinned to its post-crossing truth value per edge: root-finding
+           can land exactly ON the root, where a strict live comparison misses
+           the transition forever (a breakaway threshold reads sa == tau0_max). =#
+        local _relKey = string(rel)
+        local (fnUp, obsUp, modUp) = _preMemAffectParts(assigns, simCode; relPins = Dict{String,Bool}(_relKey => false))
+        local (fnDn, obsDn, modDn) = _preMemAffectParts(assigns, simCode; relPins = Dict{String,Bool}(_relKey => true))
+        #= RightRootFind: fire the recompute on the far side of the v=0 crossing so
+           the velocity gate is evaluated past 0 at a breakaway and the mode can
+           advance to Forward/Backward instead of re-localizing Stuck at v=0
+           (LeftRootFind here deadlocks the breakaway). Scoped to the pre-memory
+           friction callbacks. =#
+        #= Table-cluster models need the t0 body run (logic levels settle from
+           the synthesized condition's implied initial() term); the friction
+           FSM (pre-memory via env, no tables) must keep its init-algorithm
+           state untouched at t0 or the breakaway window mis-latches. =#
+        if relIdx == 1 && hasInit && tableMode
+          local (fnI, obsI, modI) = _preMemAffectParts(assigns, simCode; atInit = true, flagModified = false)
+          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+            ($(zc) ~ 0),
+            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp));
+            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn)),
+            initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI)),
+            rootfind = SciMLBase.RightRootFind,
+            reinitializealg = $(_fsmReinitAlg()))))
+        elseif relIdx == 1 && hasInit
+          #= Final pass of the t0 event iteration (§8.6): re-commit the cluster
+             from the solved initial state with initial() expired, so the stored
+             t0 discretes match the reference tools instead of carrying the
+             initial()=true iteration values. The live body (atInit = false) is
+             exactly that evaluation. =#
+          local (fnNF, obsNF, modNF) = _preMemAffectParts(assigns, simCode; flagModified = false)
+          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+            ($(zc) ~ 0),
+            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp));
+            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn)),
+            initialize = ModelingToolkit.ImperativeAffect($(fnNF), $(modNF); observed = $(obsNF)),
+            rootfind = SciMLBase.RightRootFind,
+            reinitializealg = $(_fsmReinitAlg()))))
+        else
+          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+            ($(zc) ~ 0),
+            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp));
+            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn)),
+            rootfind = SciMLBase.RightRootFind,
+            reinitializealg = $(_fsmReinitAlg()))))
+        end
+      else
+        local affFalse = Expr[_discreteAffectEq(d, r, rel, false, ii, simCode) for (d, r, ii) in assigns]
+        local affTrue  = Expr[_discreteAffectEq(d, r, rel, true,  ii, simCode) for (d, r, ii) in assigns]
+        #= The `initial()` term: only the first relation's callback carries it,
+           so the discretes are set once at t0 (no double-apply), and only
+           when the condition actually contains `initial()`. =#
+        local _withInit = relIdx == 1 && hasInit
+        if isEdge
+          #= rising-only: run the body when the relation becomes TRUE
+             (down-crossing of zc = affect_neg); no-op on the falling side. =#
+          if _withInit
+            push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(zc) ~ 0) => Any[];
+              affect_neg = [$(affTrue...)],
+              initialize = [$(affInit...)],
+              reinitializealg = SciMLBase.NoInit())))
+          else
+            push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(zc) ~ 0) => Any[];
+              affect_neg = [$(affTrue...)],
+              reinitializealg = SciMLBase.NoInit())))
+          end
+        else
+          if _withInit
+            push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(zc) ~ 0) => [$(affFalse...)];
+              affect_neg = [$(affTrue...)],
+              initialize = [$(affInit...)],
+              reinitializealg = SciMLBase.NoInit())))
+          else
+            push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(zc) ~ 0) => [$(affFalse...)];
+              affect_neg = [$(affTrue...)],
+              reinitializealg = SciMLBase.NoInit())))
+          end
+        end
+      end
+    end
+  end
+  return events
+end
+
+"""
+  `createParameterEquationsMTK(parameters::Vector, type, simCode::SimulationCode.SIM_CODE)`
+    The Type specifies what kind of parameter equation a call to this function should yield.
+"""
+function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local parameterEquations::Vector = Expr[]
+  local ht = simCode.stringToSimVarHT
   for param in parameters
-    (index, simVar) = hT[param]
+    (index, simVar) = ht[param]
     local simVarType::SimulationCode.SimVarType = simVar.varKind
     bindExp = @match simVarType begin
       SimulationCode.PARAMETER(bindExp = SOME(exp)) => begin
         exp
       end
+      #= We have a parameter without a binding. Check if we have a start attribute...=#
+      SimulationCode.PARAMETER(__) => begin
+        local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
+        @match optAttributes begin
+          SOME(attr) where attr.start isa SOME => begin
+            @assert !(attr.start.data isa DAE.CREF) "Non-numeric start attributes are not currently supported"
+            @match SOME(startVal) = attr.start
+            startVal
+          end
+          #= Either NONE() for missing attributes, or SOME(attr) whose start is
+             NONE(). Both collapse to the default-float path. Without this
+             catch-all the match fails on SOME{VariableAttributes} whose start
+             is unset (e.g. several Blocks.Examples.Filter variants). =#
+          _ => DAE.RCONST(0.0)
+        end
+      end
+      SimulationCode.STRING(__) => begin
+        @warn "String parameter $(param) found in numeric parameter list; skipping."
+        continue
+      end
       _ => begin
-        throw(ErrorException("Unknown SimulationCode.SimVarType for parameter: " * string(simVarType)))
+        throw(ErrorException("Unknown SimulationCode.SimVarType for parameter: " * string(param)  * " of type: " * string(simVarType)))
       end
     end
-    #= Solution for https://github.com/SciML/ModelingToolkit.jl/issues/991 =#
-    push!(parameterEquations,
-          quote
-            $(LineNumberNode(@__LINE__, "$param eq"))
-            $(Symbol(simVar.name)) => float($((expToJuliaExpMTK(bindExp, simCode))))
-          end
-          )
-  end
+    #=
+      Check if conversions are needed.
+      Both sides of the Pair are wrapped with `Symbolics.wrap` to keep the
+      pair element type at `Pair{Num, Num}`. Without the LHS wrap MTK fails
+      `convert(Pair{Num}, Pair{BasicSymbolicImpl{SymReal}, Float64})` on
+      models like SpeedControlledDCPM where the parameter symbol resolves
+      to a bare `BasicSymbolic`. `Symbolics.wrap` is a no-op when the input
+      is already a `Num`.
+    =#
+    expr = if isIntOrBool(bindExp)
+      quote
+        $(LineNumberNode(@__LINE__, "$param eq"))
+        Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap(float($((expToJuliaExpMTK(bindExp, simCode)))))
+      end
+    else
+        :(Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap($(expToJuliaExpMTK(bindExp, simCode))))
+    end
+      # expr = quote
+      #   $(LineNumberNode(@__LINE__, "$param eq"))
+      #   $(Symbol(simVar.name)) => float($((expToJuliaExpMTK(bindExp, simCode))))
+      # end
+    push!(parameterEquations, expr)
+  end #=For=#
   return parameterEquations
 end
 
 """
-  Creates parameters assignments on a MTK parameters compatible format.
+  Creates array parameter definitions for MTK.
+  Array parameters (e.g. record fields like R_T::Real[3,3]) are created as
+  concrete Julia arrays assigned to their symbol names, so that the generated
+  algorithmic functions can subscript into them.
 """
-function createParameterAssignmentsMTK(parameters::Vector, simCode::SimulationCode.SimCode)::Vector{Expr}
-  local parameterEquations::Vector = []
-  local hT = simCode.stringToSimVarHT
+function createArrayParametersMTK(arrayParameters::Vector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local exprs = Expr[]
+  local ht = simCode.stringToSimVarHT
+  for param in arrayParameters
+    (_, simVar) = ht[param]
+    local vk = simVar.varKind
+    @match vk begin
+      SimulationCode.ARRAY_PARAMETER(dims, SOME(bindExp)) => begin
+        local valExpr = expToJuliaExpMTK(bindExp, simCode)
+        push!(exprs, :($(Symbol(simVar.name)) = $(valExpr)))
+      end
+      SimulationCode.ARRAY_PARAMETER(dims, NONE()) => begin
+        #= AUDIT (ombackend-bug-audit-2026-06-05 #12): no binding expression.
+           Mirror the scalar parameter paths (createParameterEquationsMTK /
+           createParameterArray) and consult the declared start attribute before
+           defaulting to zeros, so an unbound array parameter carrying a non-zero
+           array-literal start is not silently materialized as all zeros. Only an
+           explicit array-literal start is emitted directly (a scalar/other start
+           has ambiguous broadcast shape); anything else falls through to a
+           warned zeros materialization so the gap is attributable. =#
+        local arrStart = @match simVar.attributes begin
+          SOME(attr) where attr.start isa SOME => begin
+            @match SOME(sv) = attr.start
+            (sv isa DAE.ARRAY) ? expToJuliaExpMTK(sv, simCode) : nothing
+          end
+          _ => nothing
+        end
+        if arrStart === nothing
+          @warn "[MTK GEN: createArrayParametersMTK] array parameter $(simVar.name): no binding and no array-literal start; materializing as zeros($(dims)). Any function subscripting it computes with zeros."
+          push!(exprs, :($(Symbol(simVar.name)) = zeros(Float64, $(dims...))))
+        else
+          push!(exprs, :($(Symbol(simVar.name)) = $(arrStart)))
+        end
+      end
+      _ => nothing
+    end
+  end
+  return exprs
+end
+
+"""
+  Creates parameters assignments *(:=) on a MTK parameters compatible format.
+"""
+function createParameterAssignmentsMTK(parameters::Vector,
+                                       simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local parameterEquations::Vector = Expr[]
+  local ht = simCode.stringToSimVarHT
   for param in parameters
-    (index, simVar) = hT[param]
-    local simVarType::SimulationCode.SimVarType = simVar.varKind
+    (index, simVar) = ht[param]
+    local simVarType = simVar.varKind
     bindExp = @match simVarType begin
       SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
-      _ => ErrorException("Unknown SimulationCode.SimVarType for parameter.")
+      SimulationCode.PARAMETER(__) =>  begin
+        continue
+      end
+      _ => continue
     end
     #= Solution for https://github.com/SciML/ModelingToolkit.jl/issues/991 =#
-    push!(parameterEquations,
-          quote
-            $(LineNumberNode(@__LINE__, "$param eq"))
-            $(Symbol(simVar.name)) = float($((expToJuliaExpMTK(bindExp, simCode))))
-          end
-          )
+    #TODO: Is this workaround still relevant? John 2023-02-22
+    expr =  if isIntOrBool(bindExp)
+      quote
+        $(LineNumberNode(@__LINE__, "$param eq"))
+        $(Symbol(simVar.name)) = float($((expToJuliaExpMTK(bindExp, simCode))))
+      end
+    else
+      quote
+        $(LineNumberNode(@__LINE__, "$param eq"))
+        $(Symbol(simVar.name)) = $(expToJuliaExpMTK(bindExp, simCode))
+      end
+    end
+    push!(parameterEquations, expr)
   end
   return parameterEquations
+end
+
+
+"""
+  createStringParameterAssignments(simCode) -> Vector{Expr}
+Emit one module-level Julia assignment per Modelica `String` parameter, e.g.
+```julia
+table2_combiTimeTable_fileName = "NoName"
+lossTable_fileName = "NoName"
+```
+"""
+function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local exprs::Vector{Expr} = Expr[]
+  for varName in keys(simCode.stringToSimVarHT)
+    (idx, simVar) = simCode.stringToSimVarHT[varName]
+    local bindExp = @match simVar.varKind begin
+      SimulationCode.STRING(bindExp = SOME(e)) => e
+      SimulationCode.PARAMETER(bindExp = SOME(e)) where _isLiteralBind(e) => e
+      _ => nothing
+    end
+    bindExp === nothing && continue
+    #= Only emit literal bindings at module level. Computed defaults / cross-
+       parameter refs cannot be safely lowered before MTK builds `pars`. The
+       DATA_STRUCTURE_ASSIGNMENTS at module top reference these names (e.g.
+       CombiTimeTable's `startTime` / `shiftTime` / `fileName`); without an
+       emission step, loading the module raises UndefVarError. =#
+    local rhs = try
+      expToJuliaExpMTK(bindExp, simCode)
+    catch
+      continue
+    end
+    push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
+  end
+  return exprs
+end
+
+#= Emit ARRAY_PARAMETER bindings at module top so that DATA_STRUCTURE
+   constructor calls (CombiTable / CombiTimeTable / ExternalObject) can
+   reference them by their bare Julia name. Without this, the in-function
+   emission via createArrayParametersMTK happens too late: it lives inside
+   `function <Model>Model(tspan)`, while DATA_STRUCTURE_ASSIGNMENTS run at
+   module load time. =#
+#= Module-level prelude for array parameters referenced by DATA_STRUCTURE
+   constructors. Two cases:
+
+     1. The HT carries a single ARRAY_PARAMETER entry with a literal-array bind.
+        Emit `name = <array-expr>` directly.
+     2. The HT carries scalarized entries (e.g. `tableData[1][1]`,
+        `tableData[1][2]`, ..., `tableData[3][2]`) and the parent name has no
+        bind of its own. Reconstruct an N-dim Julia matrix from the scalar
+        element bindings and emit `tableData = <reconstructed>`. Required
+        because ExternalObject constructors (CombiTable, CombiTimeTable, ...)
+        appear at module top and reference the parent array name. =#
+function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local exprs::Vector{Expr} = Expr[]
+  local ht = simCode.stringToSimVarHT
+
+  #= Restrict the prelude to arrays actually referenced by DATA_STRUCTURE
+     constructor calls. Emitting every ARRAY_PARAMETER at module top would
+     shadow MTK's per-model parameter handling for arrays not needed at
+     module-load time (e.g. body_r_CM in MultiBody models), perturbing the
+     resulting integration trajectory. =#
+  local neededBases = OrderedSet{String}()
+  for (_, (_, simVar)) in ht
+    @match simVar.varKind begin
+      SimulationCode.DATA_STRUCTURE(SOME(b)) => begin
+        @match b begin
+          SimulationCode.CALL(__) => SimulationCode.collectCrefNames!(neededBases, b)
+          _ => nothing
+        end
+      end
+      _ => nothing
+    end
+  end
+  #= Also include any ARRAY_PARAMETER whose subscripted form appears in
+     residual equations. This rescues `world_gravityArrowHead_lengthDirection[2]`
+     and the cluster of MultiBody examples where `eliminateDeadParameters` /
+     `eliminateConstantParameters` did not substitute the subscripted CREF
+     (parent was kept as ARRAY_PARAMETER but never emitted module-top), so
+     MTK eval fails with `<name>[idx] not defined`. We collect base names of
+     CREFs that appear in residuals and intersect with the set of
+     ARRAY_PARAMETERs in HT so we only emit parents that actually exist. =#
+  local _residualCrefs = OrderedSet{String}()
+  for eq in simCode.residualEquations
+    SimulationCode.collectCrefNames!(_residualCrefs, SimulationCode.toDAEExp(eq.exp))
+  end
+  for _n in _residualCrefs
+    local _bracket = findfirst('[', _n)
+    if _bracket !== nothing
+      local _base = _n[1:_bracket-1]
+      local _entry = get(ht, _base, nothing)
+      _entry === nothing && continue
+      local _isArr = @match _entry[2].varKind begin
+        SimulationCode.ARRAY_PARAMETER(__) => true
+        _ => false
+      end
+      _isArr && push!(neededBases, _base)
+    end
+  end
+  #= Collect orphan subscripted CREFs (referenced in residuals, base NOT in HT)
+     before the early-return so the defensive fallback at the end of this
+     function still emits even when no DATA_STRUCTURE/ARRAY_PARAMETER paths
+     fire. Recorded here so the fallback loop downstream can consume them. =#
+  local _orphanRefsEarly = OrderedSet{String}()
+  for _n in _residualCrefs
+    local _bracket = findfirst('[', _n)
+    _bracket === nothing && continue
+    local _base = _n[1:_bracket-1]
+    haskey(ht, _base) && continue
+    haskey(ht, _n) && continue
+    push!(_orphanRefsEarly, _n)
+  end
+  if isempty(neededBases)
+    for _ref in _orphanRefsEarly
+      push!(exprs, :( $(Symbol(_ref)) = 0.0 ))
+    end
+    return exprs
+  end
+
+  local emitted = OrderedSet{String}()
+  for (varName, (_, simVar)) in ht
+    local bindExp = @match simVar.varKind begin
+      SimulationCode.ARRAY_PARAMETER(_, SOME(e)) => SimulationCode.toDAEExp(e)
+      _ => nothing
+    end
+    bindExp === nothing && continue
+    varName ∈ neededBases || continue
+    varName ∈ emitted && continue
+    push!(emitted, varName)
+    local rhs = try
+      expToJuliaExpMTK(bindExp, simCode)
+    catch
+      continue
+    end
+    push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
+  end
+
+  local scalarGroups = Dict{String, Vector{Tuple{Vector{Int}, Any, Int}}}()
+  for (varName, (_, simVar)) in ht
+    local bracketIdx = findfirst('[', varName)
+    bracketIdx === nothing && continue
+    local baseName = varName[1:bracketIdx-1]
+    baseName ∈ neededBases || continue
+    baseName ∈ emitted && continue
+    local idxStr = varName[bracketIdx:end]
+    local indices = Int[]
+    for m in eachmatch(r"\[(\d+)\]", idxStr)
+      push!(indices, parse(Int, m.captures[1]))
+    end
+    isempty(indices) && continue
+    local val = @match simVar.varKind begin
+      SimulationCode.PARAMETER(SOME(SimulationCode.RCONST(r))) => r
+      SimulationCode.PARAMETER(SOME(SimulationCode.ICONST(i))) => i
+      SimulationCode.PARAMETER(SOME(SimulationCode.BCONST(b))) => b
+      _ => nothing
+    end
+    val === nothing && continue
+    push!(get!(scalarGroups, baseName, Tuple{Vector{Int}, Any, Int}[]),
+          (indices, val, length(indices)))
+  end
+
+  for (baseName, entries) in scalarGroups
+    baseName ∈ emitted && continue
+    local nDims = entries[1][3]
+    all(e -> e[3] == nDims, entries) || continue
+    local maxIdx = zeros(Int, nDims)
+    for (idxs, _, _) in entries
+      for d in 1:nDims
+        maxIdx[d] = max(maxIdx[d], idxs[d])
+      end
+    end
+    local expectedCount = prod(maxIdx)
+    length(entries) == expectedCount || continue
+    local elemType = isa(entries[1][2], Bool) ? Bool :
+                     isa(entries[1][2], Integer) ? Int : Float64
+    local arr = Array{elemType}(undef, maxIdx...)
+    local complete = true
+    for (idxs, val, _) in entries
+      try
+        arr[idxs...] = val
+      catch
+        complete = false
+        break
+      end
+    end
+    complete || continue
+    push!(emitted, baseName)
+    push!(exprs, :( $(Symbol(baseName)) = $(arr) ))
+  end
+
+  #= Defensive fallback: a residual references `<name>[i]` for some base
+     that is NOT in HT (no ARRAY_PARAMETER, no scalarized PARAMETER) and was
+     therefore not emitted by either of the two passes above. Observed for
+     the `World` component's `gravityArrowHead.lengthDirection[2..3]` cluster
+     on MultiBody examples (RollingWheel / Surfaces / RollingWheelSetDriving
+     / ...): the frontend instantiates the parent record but never registers
+     the per-index parameters as SimVars, so codegen leaks subscripted CREFs
+     into the residual that point at nothing. Emit `var"<name>[i]" = 0.0`
+     for every observed index — the codegen produces `Symbol("<name>[i]")`
+     bindings, so the recovery variable has to be the bracketed name itself,
+     not the parent. Default value 0.0 is wrong if the model actually uses
+     the parameter dynamically, but for visualization-only constants
+     (`gravityArrowHead`, axis arrows, ...) it is benign. =#
+  local _orphanRefs = OrderedSet{String}()
+  for _n in _residualCrefs
+    local _bracket = findfirst('[', _n)
+    _bracket === nothing && continue
+    local _base = _n[1:_bracket-1]
+    haskey(ht, _base) && continue
+    haskey(ht, _n) && continue
+    push!(_orphanRefs, _n)
+  end
+  for _ref in _orphanRefs
+    push!(exprs, :( $(Symbol(_ref)) = 0.0 ))
+  end
+
+  return exprs
+end
+
+function createDataStructureAssignments(dataStructureVariables::Vector{String}, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local dsAssignments::Vector = Expr[]
+  local ht = simCode.stringToSimVarHT
+  #= Same Modelica-function name set used by rewriteEquations: needed to qualify
+     bare calls (e.g. Modelica_Blocks_Types_ExternalCombiTimeTable_constructor)
+     so they resolve to the OMBackend.CodeGeneration wrapper rather than failing
+     with UndefVarError in the per-model module scope. Surfaces on every model
+     using CombiTable / CombiTimeTable / ExternalObject constructors. =#
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
+  for ds in dataStructureVariables
+    (index, simVar) = ht[ds]
+    local simVarType::SimulationCode.SimVarType = simVar.varKind
+    #= An unbound DATA_STRUCTURE (bindExp NONE) is a dead/eliminated record
+       field with no remaining reference (e.g. a Medium `data` field whose uses
+       were constant-folded away); emit nothing rather than failing the model. =#
+    bindExp = @match simVarType begin
+      SimulationCode.DATA_STRUCTURE(bindExp = SOME(exp)) => exp
+      _ => nothing
+    end
+    bindExp === nothing && continue
+    local rhs = expToJuliaExpMTK(bindExp, simCode)
+    if rhs isa Expr
+      qualifyModelicaFunctions!(rhs, funcNames)
+    end
+    expr = quote
+      $(LineNumberNode(@__LINE__, "$ds eq"))
+      $(Symbol(simVar.name)) = $(rhs)
+    end
+    push!(dsAssignments, expr)
+  end
+  return dsAssignments
+end
+
+"""
+    _foldParameterBindStatic(exp, simCode; depth = 0)
+
+Statically fold a parameter bind expression to a Float64. Returns nothing
+when the expression depends on anything that is not a parameter chain
+grounded in literals.
+"""
+function _foldParameterBindStatic(@nospecialize(exp), simCode::SimulationCode.SIM_CODE;
+                                  depth::Int = 0)::Union{Float64, Nothing}
+  depth > 32 && return nothing
+  if exp isa SimulationCode.RCONST || exp isa SimulationCode.ICONST
+    return Float64(exp.value)
+  elseif exp isa SimulationCode.BCONST
+    return exp.value ? 1.0 : 0.0
+  elseif exp isa DAE.RCONST
+    return Float64(exp.real)
+  elseif exp isa DAE.ICONST
+    return Float64(exp.integer)
+  elseif exp isa DAE.BCONST
+    return exp.bool ? 1.0 : 0.0
+  elseif exp isa SimulationCode.ENUM_LITERAL || exp isa DAE.ENUM_LITERAL
+    return Float64(exp.index)
+  elseif exp isa SimulationCode.CAST
+    return _foldParameterBindStatic(exp.exp, simCode; depth = depth + 1)
+  elseif exp isa SimulationCode.UNARY
+    local v = _foldParameterBindStatic(exp.exp, simCode; depth = depth + 1)
+    v === nothing && return nothing
+    local op = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+    return op === :- ? -v : (op === :+ ? v : nothing)
+  elseif exp isa SimulationCode.BINARY
+    local l = _foldParameterBindStatic(exp.exp1, simCode; depth = depth + 1)
+    l === nothing && return nothing
+    local r = _foldParameterBindStatic(exp.exp2, simCode; depth = depth + 1)
+    r === nothing && return nothing
+    local binop = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+    binop === :+ && return l + r
+    binop === :- && return l - r
+    binop === :* && return l * r
+    binop === :/ && return l / r
+    binop === :^ && return l ^ r
+    return nothing
+  elseif exp isa SimulationCode.EXP_CREF
+    exp.cref.sym === :time && return nothing
+    local lookUpStr = isempty(exp.cref.subs) ?
+      string(exp.cref.sym) :
+      string(exp.cref.sym, "[", join(exp.cref.subs, ","), "]")
+    local entry = get(simCode.stringToSimVarHT, lookUpStr, nothing)
+    entry === nothing && return nothing
+    local bind = @match entry[2].varKind begin
+      SimulationCode.PARAMETER(bindExp = SOME(b)) => b
+      _ => nothing
+    end
+    bind === nothing && return nothing
+    return _foldParameterBindStatic(bind, simCode; depth = depth + 1)
+  end
+  return nothing
 end
 
 """
@@ -472,24 +3976,44 @@ end
   The index here is the index assigned by the code generator earlier in the lowering
   of the hybrid DAE.
 """
-function createParameterArray(parameters::Vector{T}, simCode::SIM_T) where {T, SIM_T}
+function createParameterArray(parameters::Vector{T1},
+                              parameterAssignments::Vector{T2},
+                              simCode::SIM_T) where {T1, T2, SIM_T}
   local paramArray = []
   local hT = simCode.stringToSimVarHT
   for param in parameters
     (index, simVar) = hT[param]
     local simVarType::SimulationCode.SimVarType = simVar.varKind
+    local hasBind::Bool = false
     bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
-      _ => ErrorException("Unknown SimulationCode.SimVarType for parameter.")
+      SimulationCode.PARAMETER(bindExp = SOME(exp)) => begin
+        hasBind = true
+        exp
+      end
+      SimulationCode.PARAMETER(__) => begin
+        @match simVar.attributes begin
+          SOME(attr) where attr.start isa SOME => begin
+            @match SOME(startVal) = attr.start
+            startVal
+          end
+          _ => DAE.RCONST(0.0)
+        end
+      end
+      _ => throw(ErrorException("createParameterArray: parameter $(param) has no bound expression (got $(simVarType))."))
     end
-    #= Evaluate the parameters. If it is a variable, and can't be evaluated look it up in the parameter dictonary. =#
+    #= Fold statically; a codegen-time module-scope eval can read stale
+       same-named symbols left behind by previously translated models. =#
+    local folded = _foldParameterBindStatic(bindExp, simCode)
     local parValue
-    try
-      #= The boundvalue is known =#
-      val = eval(expToJuliaExpMTK(bindExp, simCode))
-      parValue = :($(val))
-    catch #=If the bound value is a more complex expression. =#
-      parValue = :(0) #pars[Num($(param))]) (More complex parameters are yet to be used in the benchmark..)
+    if folded !== nothing
+      parValue = :($(folded))
+    elseif hasBind
+      #= Non-foldable bind (cross-parameter chain through a call, string,
+         array): read the in-scope parameter assignment at runtime. =#
+      parValue = :($(Symbol(param)))
+    else
+      @warn "[MTK GEN: createParameterArray] parameter $(param): no bind and non-literal start; substituting 0 in the legacy parameter array. Any event-driven read of this parameter via the aux[1] mirror will be wrong (the modern MTK path is unaffected)."
+      parValue = :(0)
     end
     push!(paramArray, parValue)
   end
@@ -497,154 +4021,954 @@ function createParameterArray(parameters::Vector{T}, simCode::SIM_T) where {T, S
 end
 
 """
-  Generates code for DAE cast expressions for MTK code.
+ Decomposes the continuous variables into chunked constructor functions.
+ Returns (outer_defs, inner_refs) where:
+  - outer_defs: function definitions to be placed at module level (before model function)
+  - inner_refs: the variableConstructors array assignment (inside model function)
+ Constructor functions are defined at module level to avoid JIT overhead from
+ compiling nested closures inside the model function.
+ The `modelPrefix` avoids name collisions when multiple models are translated in one session.
 """
-function generateCastExpressionMTK(ty, exp, simCode, varPrefix)
-  return @match ty, exp begin
-    (DAE.T_REAL(__), DAE.ICONST(__)) => begin
-      quote
-        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix)))
+function decomposeVariables(stateVariables::Vector{Symbol}, algebraicVariables::Vector{Symbol};
+                            modelPrefix::String = "")
+  local stateVectors = collect(Iterators.partition(stateVariables, CHUNK_SIZE[]))
+  local algVectors = collect(Iterators.partition(algebraicVariables, CHUNK_SIZE[]))
+  local outerDefs = Expr[]
+  local constructorNames = Symbol[]
+  local i = 1::Int
+  for stateVector in stateVectors
+    local fName = Symbol(modelPrefix, "generateStateVariables", i)
+    push!(outerDefs, quote
+      function $(fName)()
+        $(Tuple([stateVector...]))
       end
-    end
-    (DAE.T_REAL(__), DAE.CREF(cref)) where typeof(cref.identType) === DAE.T_INTEGER => begin
-      quote
-        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix)))
+    end)
+    push!(constructorNames, fName)
+    i += 1
+  end
+  i = 1
+  for algVector in algVectors
+    local fName = Symbol(modelPrefix, "generateAlgebraicVariables", i)
+    push!(outerDefs, quote
+      function $(fName)()
+        $(Tuple([algVector...]))
       end
-    end
-    #= Conversion to a float other alternatives, =#
-    (DAE.T_REAL(__), _) => begin
-      quote
-        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix)))
+    end)
+    push!(constructorNames, fName)
+    i += 1
+  end
+  local outerExpr = quote
+    $(outerDefs...)
+  end
+  local innerExpr = quote
+    variableConstructors = Function[$(constructorNames...)]
+  end
+  return (outerExpr, innerExpr)
+end
+
+"""
+  Decomposes equations into chunked constructor functions.
+  Returns (outer_defs, inner_refs) where:
+  - outer_defs: function definitions at module level
+  - inner_refs: parameter assignments + equationConstructorCalls array (inside model function)
+  The `modelPrefix` avoids name collisions when multiple models are translated in one session.
+"""
+function decomposeEquations(equations, parameterAssignments; modelPrefix::String = "", chunkSize::Int = CHUNK_SIZE[])
+  local equationVectors = collect(Iterators.partition(equations, chunkSize))
+  local outerDefs = Expr[]
+  local functionNames = Symbol[]
+  local i = 0
+  for equationVector in equationVectors
+    local eqv = collect(equationVector)
+    local fName = Symbol(modelPrefix, "generateEquations", i)
+    push!(outerDefs, quote
+      function $(fName)()
+        [$(eqv...)]
       end
+    end)
+    push!(functionNames, fName)
+    i += 1
+  end
+  local outerExpr = quote
+    $(outerDefs...)
+  end
+  local innerExpr = quote
+    $(parameterAssignments...)
+    local equationConstructors::Vector{Function}
+    local equationConstructorCalls::Vector
+    equationConstructorCalls = [$(functionNames...)]
+  end
+  return (outerExpr, innerExpr)
+end
+
+"""
+  Decomposes start equations into chunked constructor functions.
+  Returns (outer_defs, inner_refs) where:
+  - outer_defs: function definitions at module level
+  - inner_refs: startEquationConstructors array assignment (inside model function)
+  The `modelPrefix` avoids name collisions, `functionSuffix` differentiates initial vs final start eqs.
+"""
+function decomposeStartEquations(equations; functionSuffix = "", modelPrefix::String = "", chunkSize::Int = CHUNK_SIZE[])
+  local equationVectors = collect(Iterators.partition(equations, chunkSize))
+  local outerDefs = Expr[]
+  local constructorNames = Symbol[]
+  local i = 0
+  for equationVector in equationVectors
+    local fName = Symbol(modelPrefix, "generateStartEquations", functionSuffix, i)
+    push!(outerDefs, quote
+      function $(fName)()
+        [$(equationVector...)]
+      end
+    end)
+    push!(constructorNames, fName)
+    i += 1
+  end
+  local outerExpr = quote
+    $(outerDefs...)
+  end
+  local innerExpr = quote
+    startEquationConstructors = Function[$(constructorNames...)]
+  end
+  return (outerExpr, innerExpr)
+end
+
+"""
+  Inline variant of decomposeEquations that keeps function definitions inside
+  the model function body. Equation expressions reference parameter symbols that
+  are local to the model function (created by @parameters), so they cannot be
+  moved to module level.
+"""
+function decomposeEquationsInline(equations, parameterAssignments; chunkSize::Int = CHUNK_SIZE[])
+  local equationVectors = collect(Iterators.partition(equations, chunkSize))
+  local exprs = Expr[]
+  local functionNames = Symbol[]
+  local constructors = quote
+    $(parameterAssignments...)
+    local equationConstructors::Vector{Function}
+    local equationConstructorCalls::Vector
+  end
+  push!(exprs, constructors)
+  local i = 0
+  for equationVector in equationVectors
+    local eqv = collect(equationVector)
+    local (csEqs, csPreamble) = extractCommonHvcats(eqv)
+    local fName = Symbol("generateEquations", i)
+    if isempty(csPreamble)
+      push!(exprs, quote
+        function $(fName)()
+          [$(eqv...)]
+        end
+      end)
+    else
+      push!(exprs, quote
+        function $(fName)()
+          $(csPreamble...)
+          [$(csEqs...)]
+        end
+      end)
     end
-    _ => throw("Cast $ty: for exp: $exp not yet supported in codegen!")
+    push!(functionNames, fName)
+    i += 1
+  end
+  return quote
+    $(exprs...)
+    equationConstructorCalls = [$(functionNames...)]
   end
 end
 
 """
- This function decomposes the continuous variables.
- This means that if the set of variables are greater than 50 a new inner function is generated as to not
- impact the JIT of the system to much.
+  Inline variant of decomposeStartEquations that keeps function definitions inside
+  the model function body. Start equations reference symbols that may be local to
+  the model function (created by @parameters or phase 3 eval), so they cannot be
+  moved to module level.
 """
-function decomposeVariables(stateVariables, algebraicVariables)
-  local nStateVars = length(stateVariables)
-  local nAlgVars = length(algebraicVariables)
-  if  1 < nStateVars < 50 &&  1 < nAlgVars < 50
-    expr = quote
-      function generateStateVariables()
-        $(Tuple([:t, stateVariables...]))
-      end
-      function generateAlgebraicVariables()
-        $(Tuple([:t, algebraicVariables...]))
-      end
-      variableConstructors = Function[generateStateVariables, generateAlgebraicVariables]
+function decomposeStartEquationsInline(equations; functionSuffix = "", chunkSize::Int = CHUNK_SIZE[])
+  local equationVectors = collect(Iterators.partition(equations, chunkSize))
+  local exprs = Expr[]
+  local constructorNames = Symbol[]
+  local i = 0
+  for equationVector in equationVectors
+    local eqv = collect(equationVector)
+    local (csEqs, csPreamble) = extractCommonHvcats(eqv)
+    local fName = Symbol("generateStartEquations", functionSuffix, i)
+    if isempty(csPreamble)
+      push!(exprs, quote
+        function $(fName)()
+          [$(eqv...)]
+        end
+      end)
+    else
+      push!(exprs, quote
+        function $(fName)()
+          $(csPreamble...)
+          [$(csEqs...)]
+        end
+      end)
     end
-  elseif (1 < nStateVars < 50)
-    expr = quote
-      function generateStateVariables()
-        $(Tuple([:t, stateVariables...]))
+    push!(constructorNames, fName)
+    i += 1
+  end
+  return quote
+    $(exprs...)
+    startEquationConstructors = Function[$(constructorNames...)]
+  end
+end
+
+"""
+  Chunks the @parameters macro call into inner functions to reduce the model
+  function body size. Each inner function calls @parameters with a subset of
+  parameter names and returns the resulting vector. Results are concatenated.
+
+  After chunking, parameter symbols are eval'd into module scope so that
+  pars Dict closures and ARRAY_PARAMETERS code can reference them by name.
+"""
+
+"""
+Generate code to declare ifCond variables as plain parameters (not time-dependent).
+These parameters are modified by SymbolicContinuousCallback affects and are NOT
+part of the ODE state vector, so the solver never perturbs them during Jacobian
+computation. Using plain parameters (not `p(t)`) avoids MTK creating Shift operators.
+Returns a no-op expression if there are no ifCond parameters.
+"""
+function generateDiscreteIfCondDeclaration(ifCondParamDecls::Vector{Expr}, ifCondNames::Vector{Symbol})
+  if isempty(ifCondParamDecls)
+    return :()
+  end
+  local nameQuotes = [QuoteNode(s) for s in ifCondNames]
+  quote
+    local _ifCondParams = ModelingToolkit.@parameters begin
+      $(ifCondParamDecls...)
+    end
+    local _ifCondBindBlock = Expr(:block)
+    for (name, p) in zip([$(nameQuotes...)], _ifCondParams)
+      push!(_ifCondBindBlock.args, :($name = $p))
+    end
+    eval(_ifCondBindBlock)
+    parameters = vcat(parameters, _ifCondParams)
+  end
+end
+
+"""
+Generate code to add ifCond discrete parameter values to the pars Dict.
+Returns a no-op expression if there are no ifCond parameters.
+"""
+function generateIfCondParamAssignments(ifCondParamPairs::Vector{Expr})
+  if isempty(ifCondParamPairs)
+    return :()
+  end
+  quote
+    for (k, v) in [$(ifCondParamPairs...)]
+      pars[k] = v
+    end
+  end
+end
+
+function decomposeParametersDeclaration(parVariablesSym; chunkSize = CHUNK_SIZE[])
+  if length(parVariablesSym) <= chunkSize
+    return quote
+      parameters = ModelingToolkit.@parameters begin
+        ($(parVariablesSym...))
       end
-      variableConstructors = Function[generateStateVariables]
+    end
+  end
+  local chunks = collect(Iterators.partition(parVariablesSym, chunkSize))
+  local exprs = Expr[]
+  local constructorNames = Symbol[]
+  for (i, chunk) in enumerate(chunks)
+    local fName = Symbol("_createParams_", i - 1)
+    local chunkSyms = collect(chunk)
+    push!(exprs, quote
+      function $(fName)()
+        ModelingToolkit.@parameters begin
+          ($(chunkSyms...))
+        end
+      end
+    end)
+    push!(constructorNames, fName)
+  end
+  local paramNameQuotes = [QuoteNode(s) for s in parVariablesSym]
+  return quote
+    $(exprs...)
+    local _allParamChunks = []
+    for _fn in [$(constructorNames...)]
+      push!(_allParamChunks, Base.invokelatest(_fn))
+    end
+    parameters = vcat(_allParamChunks...)
+    local _paramNames = [$(paramNameQuotes...)]
+    local _paramBindBlock = Expr(:block)
+    for (name, p) in zip(_paramNames, parameters)
+      push!(_paramBindBlock.args, :($name = $p))
+    end
+    eval(_paramBindBlock)
+  end
+end
+
+"""
+  Chunks parameter equations (sym => value pairs) into small inner functions
+  to reduce JIT overhead from compiling one massive Dict literal.
+  Each chunk function returns a Dict of parameter pairs. Results are
+  merged into the final pars Dict via invokelatest.
+
+  Parameter equations reference @parameters symbols which are local to the
+  model function, so chunk functions are defined inline as closures.
+"""
+function decomposeParameterEquationsInline(parameterEquations; chunkSize = CHUNK_SIZE[])
+  if length(parameterEquations) <= chunkSize
+    return :(pars = Dict($(parameterEquations...)))
+  end
+  local chunks = collect(Iterators.partition(parameterEquations, chunkSize))
+  local exprs = Expr[]
+  local constructorNames = Symbol[]
+  for (i, chunk) in enumerate(chunks)
+    local fName = Symbol("_generatePars_", i - 1)
+    local chunkExprs = collect(chunk)
+    push!(exprs, quote
+      function $(fName)()
+        Dict($(chunkExprs...))
+      end
+    end)
+    push!(constructorNames, fName)
+  end
+  return quote
+    $(exprs...)
+    pars = Dict{Any,Any}()
+    for _parFn in [$(constructorNames...)]
+      merge!(pars, Base.invokelatest(_parFn))
+    end
+  end
+end
+
+"""
+  Generate @register_array_symbolic expression for a function with array parameters.
+"""
+function generateArrayRegisterExpr(f::SimulationCode.ModelicaFunction, funcArgGen::Function)::Expr
+  local sb = Symbol(f.name)
+
+  #= Build typed argument list for array registration =#
+  local argExprs = Expr[]
+  for v in f.inputs
+    local varName = Symbol(string(v.componentRef))
+    if isArrayType(v)
+      push!(argExprs, :($varName::AbstractArray))
+    else
+      push!(argExprs, :($varName::Real))
+    end
+  end
+
+  #= Build the call signature =#
+  local callExpr = if length(argExprs) == 0
+    Expr(:call, sb)
+  elseif length(argExprs) == 1
+    Expr(:call, sb, argExprs[1])
+  else
+    Expr(:call, sb, argExprs...)
+  end
+
+  #= Determine output size and eltype =#
+  #= For now, assume first output determines the result characteristics =#
+  local sizeExpr = :()
+  local eltypeExpr = :(Symbolics.Num)  #= Use Symbolics.Num for proper type compatibility =#
+
+  if !isempty(f.outputs)
+    local firstOutput = first(f.outputs)
+    if isArrayType(firstOutput)
+      sizeExpr = extractArrayDimsFromVar(firstOutput)
+    end
+  end
+
+  #= Generate the @register_array_symbolic call =#
+  quote
+    Symbolics.@register_array_symbolic $callExpr begin
+      size = $sizeExpr
+      eltype = $eltypeExpr
+    end
+  end
+end
+
+"""
+  Generates quoted Symbolics registration calls for externally defined functions.
+  Scalar functions use @register_symbolic.
+  Functions with array parameters that return arrays use @register_array_symbolic
+  so MTK knows the output shape and can handle getindex on the result.
+"""
+function generateRegisterCallsForCallExprs(simCode;
+                                            funcArgGen::Function = AlgorithmicCodeGeneration.generateSignatureForRegistration)
+  local rFs = Expr[]
+  local calledFunctions = collectCalledFunctionNames!(OrderedSet{String}(), simCode)
+  for f in simCode.functions
+    if !(f.name in calledFunctions)
+      continue
+    end
+    if hasArrayParameters(f)
+      #= Functions with array parameters are not registered. =#
+      #= They execute eagerly with symbolic array arguments. =#
+      continue
+    else
+      #= Use @register_symbolic for scalar functions =#
+      local sb = Symbol(f.name)
+      local args = funcArgGen(convert(Vector{DAE.VAR}, f.inputs))
+      local nArgs = length(args)
+      local cExpr = if nArgs == 1
+        Expr(:call, sb, first(args))
+      elseif nArgs == 0
+        Expr(:call, sb)
+      else
+        Expr(:call, sb, tuple(args...)...)
+      end
+      #= Delay evaluation of the register expression until we know the call. =#
+      sbRegister = :((Symbolics.@register_symbolic($(cExpr))))
+      push!(rFs, sbRegister)
+    end
+  end
+  return rFs
+end
+
+"""
+  Optionally generate an import statement to OMRuntimeExternalC
+"""
+function generateExternalRuntimeImport()::Expr
+  :(import OMRuntimeExternalC)
+end
+
+function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
+                                          rhsAccess, simCode::SimulationCode.SIM_CODE)
+  @match lhs begin
+    DAE.CREF(DAE.WILD(), _) => nothing
+    DAE.CREF(__) => begin
+      local name = SimulationCode.string(lhs)
+      local entry = get(simCode.stringToSimVarHT, name, nothing)
+      if entry === nothing
+        push!(res, :($(Symbol(name)) = $rhsAccess))
+        return res
+      end
+      local (_, var) = entry
+      push!(res, quote
+              idx = lookuptableStates[Symbol($(string(var.name)))]
+              integrator.u[idx] = $rhsAccess
+            end)
+    end
+    DAE.ARRAY(_, _, elements) => begin
+      local i = 0
+      for elem in elements
+        i += 1
+        _emitWhenTupleElementAssignMTK!(res, elem, :($rhsAccess[$i]), simCode)
+      end
+    end
+    SimulationCode.EXP_CREF(cref, _) => begin
+      local name = string(cref)
+      local entry = get(simCode.stringToSimVarHT, name, nothing)
+      if entry === nothing
+        push!(res, :($(Symbol(name)) = $rhsAccess))
+        return res
+      end
+      local (_, var) = entry
+      push!(res, quote
+              idx = lookuptableStates[Symbol($(string(var.name)))]
+              integrator.u[idx] = $rhsAccess
+            end)
+    end
+    SimulationCode.ARRAY_EXP(_, _, elements) => begin
+      local i = 0
+      for elem in elements
+        i += 1
+        _emitWhenTupleElementAssignMTK!(res, elem, :($rhsAccess[$i]), simCode)
+      end
+    end
+    _ => throw(ErrorException("createWhenStatementsMTK: unsupported tuple-LHS element $lhs"))
+  end
+  return res
+end
+
+function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_CODE; varPrefix = "", varSuffix = "")::Vector{Expr}
+  local res::Array{Expr} = []
+  local nWhenStatements = 0
+  for _ in whenStatements
+    nWhenStatements += 1
+  end
+  @debug "[MTK GEN: when] createWhenStatementsMTK" statements=nWhenStatements
+  for wStmt in whenStatements
+    if wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN
+      if wStmt.left isa DAE.TUPLE || wStmt.left isa SimulationCode.TUPLE
+        local tupSym = gensym(:tupResult)
+        local rhsExpr = expToJuliaExpMTK(wStmt.right, simCode;
+                                         varPrefix = varPrefix, varSuffix = varSuffix)
+        push!(res, :(local $tupSym = $rhsExpr))
+        local i = 0
+        for elem in wStmt.left.PR
+          i += 1
+          _emitWhenTupleElementAssignMTK!(res, elem, :($tupSym[$i]), simCode)
+        end
+      else
+        # SimulationCode.ASSIGN.left is ::Exp post-migration; HT keys are DAE-stringified.
+        local leftStr = SimulationCode.string(SimulationCode.toDAEExp(wStmt.left))
+        (index, var) = simCode.stringToSimVarHT[leftStr]
+        local lhsSym = Symbol(string(var.name))
+        local rhsE = expToJuliaExpMTK(wStmt.right, simCode; varPrefix = varPrefix, varSuffix = varSuffix)
+        push!(res, quote
+                idx = lookuptableStates[Symbol($(string(var.name)))]
+                integrator.u[idx] = $(rhsE)
+                $(lhsSym) = integrator.u[idx]
+              end)
+      end
+    elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
+      (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]
+      push!(res, quote
+              idx = lookuptableStates[Symbol($(string(var.name)))]
+              integrator.u[idx] = $(expToJuliaExpMTK(wStmt.value,
+                                                     simCode; varPrefix = varPrefix, varSuffix = varSuffix))
+            end)
+    elseif wStmt isa BDAE.TERMINATE || wStmt isa SimulationCode.TERMINATE
+      local msgExpr = expToJuliaExpMTK(wStmt.message, simCode;
+                                        varPrefix = varPrefix, varSuffix = varSuffix)
+      push!(res, quote
+              @info "Modelica terminate() reached" message=$(msgExpr)
+              OMBackend.DifferentialEquations.terminate!(integrator)
+            end)
+    elseif wStmt isa BDAE.NORETCALL || wStmt isa SimulationCode.NORETCALL
+      local callExpr = expToJuliaExpMTK(wStmt.exp, simCode;
+                                         varPrefix = varPrefix, varSuffix = varSuffix)
+      push!(res, quote
+              $(callExpr)
+            end)
+    elseif wStmt isa BDAE.ASSERT || wStmt isa SimulationCode.ASSERT
+      local condExpr = expToJuliaExpMTK(wStmt.condition, simCode;
+                                         varPrefix = varPrefix, varSuffix = varSuffix)
+      local msgExpr = expToJuliaExpMTK(wStmt.message, simCode;
+                                        varPrefix = varPrefix, varSuffix = varSuffix)
+      push!(res, quote
+              if !($(condExpr))
+                @warn "Modelica assert()" message=$(msgExpr)
+              end
+            end)
+    else
+      throw(ErrorException("createWhenStatementsMTK: unsupported when-statement variant $(wStmt)"))
+    end
+  end
+  return res
+end
+
+#= True when a when-equation's condition is the Modelica `terminal()` operator. =#
+function _isTerminalWhen(@nospecialize(eq))::Bool
+  (eq isa BDAE.WHEN_EQUATION || eq isa SimulationCode.WHEN_EQUATION) || return false
+  return @match SimulationCode.toDAEExp(eq.whenEquation.condition) begin
+    DAE.CALL(Absyn.IDENT("terminal"), _, _) => true
+    _ => false
+  end
+end
+
+#= Post-solve runner for `when terminal()` bodies, or `nothing` when the model
+   has none (so models without a terminal event are unchanged). The bodies
+   reuse `createWhenStatementsMTK` by mocking `integrator` from the final
+   solution point — writes land in `_sol.u[end]` using the same state-index
+   convention the discrete-callback affects rely on. Runs only on success. =#
+function createTerminalBodyRunner(simCode::SimulationCode.SIM_CODE)
+  local terminalWhens = filter(_isTerminalWhen, simCode.whenEquations)
+  isempty(terminalWhens) && return nothing
+  local modelFns = OrderedSet(replace(f.name, "." => "_") for f in simCode.functions)
+  local calledNames = OrderedSet{String}()
+  local perWhen = Expr[]
+  for eq in terminalWhens
+    local body = eq.whenEquation.whenStmtLst
+    for s in body
+      collectCalledFunctionNames!(calledNames, s)
+    end
+    for c in vcat(map(s -> getRHSVariables(s), body)...)
+      local entry = get(simCode.stringToSimVarHT, string(c), nothing)
+      #= String parameters are emitted as module-level constants; referencing them
+         directly avoids shadowing that binding with a nonexistent state lookup. =#
+      entry !== nothing && entry[2].varKind isa SimulationCode.STRING && continue
+      push!(perWhen, Expr(:(=), Symbol(string(c)), getIdxForLookupMTK(c, simCode)))
+    end
+    append!(perWhen, createWhenStatementsMTK(body, simCode))
+  end
+  #= Bind external functions the body calls to their concrete OMBackend.CodeGeneration
+     RTG wrapper: the bare model-module name is the @register_symbolic binding (symbolic
+     only), which has no method for concrete runtime arguments. =#
+  local fnRebinds = Expr[]
+  for n in calledNames
+    local nn = replace(n, "." => "_")
+    nn in modelFns && push!(fnRebinds, :(local $(Symbol(nn)) = OMBackend.CodeGeneration.$(Symbol(nn))))
+  end
+  return quote
+    if _sol.retcode == ModelingToolkit.SciMLBase.ReturnCode.Success
+      #= Best-effort: a terminal body runs after a completed, valid solution, so a
+         body we cannot evaluate (e.g. an unsupported external call) warns rather
+         than discarding the result. =#
+      try
+        let integrator = (u = _sol.u[end], t = _sol.t[end], f = _sol.prob.f, dt = 0.0, ps = _sol.prob.ps),
+            x = _sol.u[end],
+            t = _sol.t[end],
+            p = _sol.prob.p,
+            lookuptableStates = Dict(sym => i for (i, sym) in enumerate(OMBackend.CodeGeneration.getStatesAsSymbols(_sol.prob.f))),
+            lookuptableParams = Dict(sym => i for (i, sym) in enumerate(OMBackend.CodeGeneration.getParametersAsSymbols(_sol.prob.f)))
+          local idx = 0
+          $(fnRebinds...)
+          $(perWhen...)
+        end
+      catch _terminalErr
+        @warn "when terminal() body could not be evaluated; returning the completed solution unchanged" exception = _terminalErr
+      end
+    end
+  end
+end
+
+#= Lower a single BDAE.WhenOperator from an INITIAL_ALGORITHM body to a Julia
+   expression suitable for module-top eval inside `__runInitialAlgorithm!`.
+   Parameter CREFs are folded to their literal bindings via _substituteBoundParameters
+   before lowering with the algorithmic (non-MTK) translator, so no Symbolics
+   bindings are needed at init time.
+
+   ASSIGN / REINIT write their RHS into `LATEST_PROBLEM` via the
+   SymbolicIndexingInterface `prob[:name] = value` setter. The function runs
+   after the ODEProblem is constructed (see `simulate(...)` in the generated
+   module), so LATEST_PROBLEM is in scope. Without this, the LHS state stayed
+   at its default (0) — e.g. `T_start := startTime + count*period` in the
+   trapezoid signal source was silently dropped, breaking every model that
+   relies on `initial algorithm` to seed states. =#
+function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
+                               renamedNames::OrderedSet{String} = OrderedSet{String}())
+  local sub = e -> _substituteBoundParameters(e, simCode)
+  local lowerAlg = e -> _renameAlgIdentifiers(
+    _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))),
+    renamedNames,
+    "")
+  local crefName = cr -> SimulationCode.DAE_identifierToString(cr)
+  if wStmt isa BDAE.NORETCALL || wStmt isa SimulationCode.NORETCALL
+    return :( $(lowerAlg(wStmt.exp)); nothing )
+  elseif wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN
+    # SimulationCode.ASSIGN.left is ::Exp post-migration; convert to DAE for the @match.
+    local leftDAE = wStmt isa SimulationCode.ASSIGN ? SimulationCode.toDAEExp(wStmt.left) : wStmt.left
+    local name = @match leftDAE begin
+      DAE.CREF(cr, _) => crefName(cr)
+      _ => nothing
+    end
+    if name === nothing
+      return :( $(lowerAlg(wStmt.right)); nothing )
+    end
+    local sym = Symbol(name)
+    local isParam = haskey(simCode.stringToSimVarHT, name) &&
+                    let (_, sv) = simCode.stringToSimVarHT[name]
+                      sv.varKind isa SimulationCode.PARAMETER ||
+                      sv.varKind isa SimulationCode.ARRAY_PARAMETER
+                    end
+    if isParam
+      return :( $(sym) = $(lowerAlg(wStmt.right)); LATEST_PROBLEM.ps[$(QuoteNode(sym))] = $(sym); nothing )
+    else
+      return :( $(sym) = $(lowerAlg(wStmt.right));
+         try
+           ModelingToolkit.SciMLBase.setu(LATEST_PROBLEM, $(QuoteNode(sym)))(LATEST_PROBLEM, $(sym))
+         catch
+           nothing
+         end;
+         try
+           _hard[getproperty(LATEST_REDUCED_SYSTEM, $(QuoteNode(sym)))] = $(sym)
+         catch
+           nothing
+         end;
+         nothing )
+    end
+  elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
+    local name = crefName(wStmt.stateVar)
+    local sym = Symbol(name)
+    return :( $(sym) = $(lowerAlg(wStmt.value)); LATEST_PROBLEM[$(QuoteNode(sym))] = $(sym); nothing )
+  elseif wStmt isa BDAE.ASSERT || wStmt isa SimulationCode.ASSERT
+    local cond = lowerAlg(wStmt.condition)
+    local msg = lowerAlg(wStmt.message)
+    return :(if !($cond); @warn "Modelica assert() during init" message=$(msg); end)
+  elseif wStmt isa BDAE.TERMINATE || wStmt isa SimulationCode.TERMINATE
+    local msg = lowerAlg(wStmt.message)
+    return :(@info "Modelica terminate() during init" message=$(msg))
+  end
+  throw(ErrorException("_initialWhenOpToJulia: unsupported variant $(typeof(wStmt))"))
+end
+
+#= Translate a single `BDAE.WhenOperator` from an init-algorithm body into a
+   Julia statement suitable for the procedural body of
+   `__runInitialAlgorithmEarly!`. ASSIGN emits `_alg_<lhs> = <rhs>` (with
+   `local` on the first occurrence of that LHS); RHS identifiers are renamed
+   via `_renameAlgIdentifiers` so they bind to the let-block locals rather
+   than to module-level Symbolics bindings of the same name. =#
+function _initialWhenOpToJuliaEarly(wStmt, simCode::SimulationCode.SIM_CODE,
+                                    renamedNames::OrderedSet{String}, seenLHS::OrderedSet{String})
+  local sub = e -> _substituteBoundParameters(e, simCode)
+  local lowerAlg = e -> _renameAlgIdentifiers(
+    _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))),
+    renamedNames)
+  local crefName = cr -> SimulationCode.DAE_identifierToString(cr)
+  if wStmt isa BDAE.NORETCALL || wStmt isa SimulationCode.NORETCALL
+    return :( $(lowerAlg(wStmt.exp)); nothing )
+  elseif wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN
+    # SimulationCode.ASSIGN.left is ::Exp post-migration; convert to DAE for the @match.
+    local leftDAE = wStmt isa SimulationCode.ASSIGN ? SimulationCode.toDAEExp(wStmt.left) : wStmt.left
+    local name = @match leftDAE begin
+      DAE.CREF(cr, _) => crefName(cr)
+      _ => nothing
+    end
+    if name === nothing
+      return :( $(lowerAlg(wStmt.right)); nothing )
+    end
+    local algSym = Symbol("_alg_" * name)
+    if name in seenLHS
+      return :( $(algSym) = $(lowerAlg(wStmt.right)); nothing )
+    end
+    push!(seenLHS, name)
+    return :( local $(algSym) = $(lowerAlg(wStmt.right)); nothing )
+  elseif wStmt isa BDAE.ASSERT || wStmt isa SimulationCode.ASSERT
+    local cond = lowerAlg(wStmt.condition)
+    local msg = lowerAlg(wStmt.message)
+    return :(if !($cond); @warn "Modelica assert() during init (early)" message=$(msg); end)
+  elseif wStmt isa BDAE.TERMINATE || wStmt isa SimulationCode.TERMINATE
+    local msg = lowerAlg(wStmt.message)
+    return :(@info "Modelica terminate() during init (early)" message=$(msg))
+  end
+  return :( nothing )
+end
+
+"""
+    generateInitialAlgorithmEarlyFunction(simCode) -> Expr
+
+Emit `function __runInitialAlgorithmEarly!() -> Dict{Symbol, Float64}` that
+executes the `initial algorithm` bodies procedurally at module-load time
+(Modelica §11.4: statements run sequentially, the LHS final value becomes the
+variable's initial value).
+
+When `simCode.initialAlgorithms[i].daeStatements` is non-empty for any body,
+the procedural body is lowered via `AlgorithmicCodeGeneration.generateStatements`
+— the same path used for regular Modelica algorithm sections and function
+bodies, with full STMT_IF / STMT_FOR / STMT_WHILE / STMT_ASSERT / STMT_REINIT
+support. The resulting Julia AST is then rewritten by `_renameAlgIdentifiers`
+to prefix every cref name with `_alg_`, so the locals do not collide with the
+Symbolics `Num` bindings of the same name living in the surrounding model
+scope. When `daeStatements` is empty (e.g. older callers that only provide a
+`Vector{BDAE.WhenOperator}`), the legacy flat-WhenOperator translator
+`_initialWhenOpToJuliaEarly` is used as a fallback.
+
+The body is wrapped in `let time = 0.0 ... end`. Non-LHS crefs read on the
+RHS get a pre-seeded `_alg_<name>` from the SimVar's `start` attribute or
+`0.0`. After the body, each LHS final value is captured into the returned
+`Dict{Symbol, Float64}` via a per-entry try/catch (so a still-undefined
+`_alg_<name>` from a body that errored partway just skips that entry).
+
+The outer try/catch returns partial results on any error; the cycle-19
+runtime `remake` path remains as a fallback for state-cref-RHS reads whose
+post-init value differs from the `start` attribute.
+"""
+function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)::Expr
+  local lhsNames = OrderedSet{String}()
+  local rhsNames = OrderedSet{String}()
+  local useDAEPath = any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
+  if useDAEPath
+    for ia in simCode.initialAlgorithms, s in ia.daeStatements
+      _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
     end
   else
-    #= Split the array in chunks of 50  for the state and algebraic variables=#
-    local stateVectors = collect(Iterators.partition(stateVariables, 50))
-    local algVectors = collect(Iterators.partition(algebraicVariables, 50))
-    #= For each vector in stateVectors create a constructor for the variables =#
-    local i = 1::Int
-    local exprs = Expr[]
-    constructors = quote
-      variableConstructors = Function[]
-    end
-    push!(exprs, constructors)
-    for stateVector in stateVectors
-      stateConstructorExpr = quote
-        function $(Symbol("generateStateVariables" * string(i)))()
-          $(Tuple([:t, stateVector...]))
-        end
-        push!(variableConstructors, $(Symbol("generateStateVariables" * string(i))))
-      end
-      push!(exprs, stateConstructorExpr)
-      i += 1
-    end
-    local i = 1
-    #= decompose the algebraic variables if needed =#
-    for algVector in algVectors
-      algConstructorExpr = quote
-        function $(Symbol("generateAlgebraicVariables" * string(i)))()
-          $(Tuple([:t, algVector...]))
-        end
-        push!(variableConstructors, $(Symbol("generateAlgebraicVariables" * string(i))))
-      end
-      push!(exprs, algConstructorExpr)
-      i += 1
-    end
-    #= Generate the composite expression =#
-    expr = quote
-      $(exprs...)
+    for ia in simCode.initialAlgorithms, op in ia.statements
+      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
     end
   end
-  return expr
+  if isempty(lhsNames) && isempty(rhsNames)
+    return quote
+      function __runInitialAlgorithmEarly!()
+        return Dict{Symbol, Float64}()
+      end
+    end
+  end
+  local ht = simCode.stringToSimVarHT
+  local renamedNames = union(lhsNames, rhsNames)
+  push!(renamedNames, "time")
+  local prefetches = Expr[]
+  for name in setdiff(rhsNames, lhsNames)
+    name == "time" && continue
+    haskey(ht, name) || begin
+      push!(prefetches, :(local $(Symbol("_alg_" * name)) = 0.0))
+      continue
+    end
+    local sv = ht[name][2]
+    if sv.varKind isa SimulationCode.PARAMETER ||
+       sv.varKind isa SimulationCode.ARRAY_PARAMETER
+      local paramLit = @match sv.varKind begin
+        SimulationCode.PARAMETER(SOME(b)) => _foldParameterBindStatic(b, simCode)
+        _ => nothing
+      end
+      if paramLit === nothing
+        @warn "Generated nothing for $(name). $(name) was $(typeof(sv.varKind))"
+        continue
+      end
+      push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(paramLit)))
+      continue
+    end
+    local lit = _readStartAttributeAsLiteral(sv)
+    push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(lit)))
+  end
+  for name in lhsNames
+    push!(prefetches, :(local $(Symbol("_alg_" * name)) = 0.0))
+  end
+  local stmts = Expr[]
+  if useDAEPath
+    for ia in simCode.initialAlgorithms
+      isempty(ia.daeStatements) && continue
+      local body = AlgorithmicCodeGeneration.generateStatements(ia.daeStatements)
+      for s in body
+        push!(stmts, _renameAlgIdentifiers(s, renamedNames))
+      end
+    end
+  else
+    local seenLHS = copy(lhsNames)
+    for ia in simCode.initialAlgorithms, op in ia.statements
+      push!(stmts, _initialWhenOpToJuliaEarly(op, simCode, renamedNames, seenLHS))
+    end
+  end
+  local captures = Expr[]
+  for name in lhsNames
+    haskey(ht, name) || continue
+    local sv = ht[name][2]
+    if sv.varKind isa SimulationCode.PARAMETER ||
+       sv.varKind isa SimulationCode.ARRAY_PARAMETER
+      continue
+    end
+    local algSym = Symbol("_alg_" * name)
+    local qn = QuoteNode(Symbol(name))
+    push!(captures, :(try; _results[$(qn)] = Float64($(algSym)); catch; nothing; end))
+  end
+  return quote
+    function __runInitialAlgorithmEarly!()
+      local _results = Dict{Symbol, Float64}()
+      try
+        let time = 0.0
+          $(prefetches...)
+          $(stmts...)
+          $(captures...)
+        end
+      catch _err
+        @debug "[MTK GEN: init-alg early] body raised; partial results returned" exception=_err
+      end
+      return _results
+    end
+  end
 end
 
 """
-  Similar to decompose variables, however, decomposes the set of equations instead.
-  This function does so by dividing the total number of equations into separate blocks with 50 equations in each block.
-  This function is suppose to be called after decompose variables.
-  Parameter assignments contains the set of values assigned to parameters at the beginning of the simulation.
-"""
-function decomposeEquations(equations, parameterAssignments)
-  local nStateVars = length(equations)
-  local equationVectors = collect(Iterators.partition(equations, 50))
-  local exprs = Expr[]
-  r1 = SymbolicUtils.@rule ~~a * D(~~b) * ~~c => 0
-  r2 = SymbolicUtils.@rule D(~~b) => 0
-  local constructors = quote
-    equationConstructors = Function[]
-  end
-  push!(exprs, constructors)
-  local i = 0
-  for equationVector in equationVectors
-    equationConstructorExpr = quote
-      $(parameterAssignments...) #TODO: It does not seem to work to use parameters as constants, something goes wrong in the substitution. 
-      function $(Symbol("generateEquations" * string(i)))()
-        [$(equationVector...)]
-      end
-      push!(equationConstructors, $(Symbol("generateEquations" * string(i))))
-    end
-    push!(exprs, equationConstructorExpr)
-    i += 1
-  end
-  expr = quote
-    $(exprs...)
-  end
-  return expr
-end
+    generateInitialAlgorithmFunction(simCode) -> Expr
 
+Emit a `function __runInitialAlgorithm!() ... end` whose body executes once
+during initialization, lowered from `simCode.initialAlgorithms`. Parameter
+literals are already baked into the body by `inlineParamsInInitialAlgorithms`
+at SimCode construction time, so no module-scope parameter bindings are needed
+here. Returns a no-op stub when the model has no `when initial()` clauses.
 """
-  Similar to decompose equations but does so for start equations instead.
-"""
-function decomposeStartEquations(equations)
-  local nStateVars = length(equations)
-  local equationVectors = collect(Iterators.partition(equations, 50))
-  local exprs = Expr[]
-  local constructors = quote
-    startEquationConstructors = Function[]
-  end
-  push!(exprs, constructors)
-  local i = 0
-  for equationVector in equationVectors
-    equationConstructorExpr = quote
-      function $(Symbol("generateStartEquations" * string(i)))()
-        [$(equationVector...)]
+function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Expr
+  #= When the DAE.Statement-based early-eval path is available, it emits
+     control-flow-correct `initialization_eqs` for every LHS. The runtime
+     `remake` here is built from the lossy WhenOperator flattening and would
+     overwrite the init-eq result with the flat-first-branch value at simulate
+     time. Emit an empty stub instead — the early path covers it. =#
+  local useDAEPath = any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
+  if useDAEPath
+    return quote
+      function __runInitialAlgorithm!()
+        return Dict{Any, Any}()
       end
-      push!(startEquationConstructors, $(Symbol("generateStartEquations" * string(i))))
     end
-    push!(exprs, equationConstructorExpr)
-    i += 1
   end
-  expr = quote
-    $(exprs...)
+  local lhsNames = OrderedSet{String}()
+  local rhsNames = OrderedSet{String}()
+  for ia in simCode.initialAlgorithms
+    for op in ia.statements
+      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
+    end
   end
-  return expr
+  local renamedNames = union(lhsNames, rhsNames)
+  push!(renamedNames, "time")
+  local stmts = Expr[]
+  for ia in simCode.initialAlgorithms
+    for op in ia.statements
+      push!(stmts, _initialWhenOpToJulia(op, simCode, renamedNames))
+    end
+  end
+  if isempty(stmts)
+    return quote
+      function __runInitialAlgorithm!()
+        return Dict{Any, Any}()
+      end
+    end
+  end
+  #= Pre-fetch every non-parameter RHS-referenced cref. Names that ALSO
+     appear as LHS still need a fetch because Julia compiles `x = if c then
+     v else x end` with `x` as a function-local: the else-branch reads `x`
+     before the assignment completes and throws UndefVarError. Self-referential
+     IFEXP shapes come from the algorithm lifter at BDAECreate.jl:1263 when a
+     non-when algorithm contains an if/elseif chain whose else-branches
+     preserve a discrete LHS's previous value. =#
+  local fetches = Expr[]
+  local ht = simCode.stringToSimVarHT
+  for name in rhsNames
+    name == "time" && continue
+    local sv = nothing
+    if haskey(ht, name)
+      sv = ht[name][2]
+      if sv.varKind isa SimulationCode.PARAMETER || sv.varKind isa SimulationCode.ARRAY_PARAMETER
+        continue
+      end
+      if sv.varKind isa SimulationCode.DATA_STRUCTURE || sv.varKind isa SimulationCode.STRING
+        local sym = Symbol(name)
+        local boundSym = Symbol(sv.name)
+        push!(fetches, Expr(:local, Expr(:(=), sym, :(getfield(@__MODULE__, $(QuoteNode(boundSym)))))))
+        continue
+      end
+      #= DISCRETE vars (Logic/enum/Boolean) are used as array indices. MTK
+         initialisation may leave them at 0 which BoundsErrors on 1-based
+         index vectors (e.g. INV3S's UX01Conv[iNV3S_enable]). Clamp to 1 as
+         a band-aid until proper discrete-IC lowering lands. =#
+      if sv.varKind isa SimulationCode.DISCRETE
+        local sym = Symbol(name)
+        push!(fetches, Expr(:local,
+          Expr(:(=), sym,
+            :(try
+                let _g = ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))
+                  local _raw = _g(LATEST_PROBLEM)
+                  local _v = if _raw isa Integer
+                    Int(_raw)
+                  elseif _raw isa Real
+                    Int(round(Float64(_raw)))
+                  else
+                    1
+                  end
+                  _v < 1 ? 1 : _v
+                end
+              catch
+                1
+              end))))
+        continue
+      end
+    end
+    #= Non-discrete SimVars (Real states, alg vars) and local algorithm
+       temporaries not in the HT: fetch as Float64, no index clamp. =#
+    local sym = Symbol(name)
+    push!(fetches, Expr(:local,
+      Expr(:(=), sym,
+        :(try
+            Float64(ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))(LATEST_PROBLEM))
+          catch
+            0.0
+          end))))
+  end
+  #= Shadow `Base.time` (a UNIX-time function) with the local Modelica `time`
+     value, which is 0 at simulation init. Without this, init-algorithm bodies
+     that reference `time` (e.g. trapezoid sources' `count := integer((time -
+     startTime) / period)`) generate `time - <Float64>` and hit MethodError
+     because `Base.time` is a function, not a number. =#
+  return quote
+    function __runInitialAlgorithm!()
+      #= `_hard` collects (symbolic_var => value) pairs for each ASSIGN to a
+         non-parameter variable. simulate() passes it to `remake(prob; u0=…,
+         initializealg=NoInit())` so MTK treats the init-algorithm-computed
+         values as hard initial conditions (Modelica §11.2), not guesses. =#
+      local _hard = Dict{Any, Any}()
+      let time = 0.0
+        $(fetches...)
+        $(stmts...)
+      end
+      return _hard
+    end
+  end
 end

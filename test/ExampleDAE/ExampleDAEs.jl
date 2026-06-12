@@ -6,8 +6,7 @@ using ImmutableList
 import SCode
 
 using ..OMBackend.FrontendUtil
-
-import ..OMBackend.Prefix
+using ..OMBackend.FrontendUtil.Prefix
 import DAE
 import DAE.ClassInf
 #import .ClassInf

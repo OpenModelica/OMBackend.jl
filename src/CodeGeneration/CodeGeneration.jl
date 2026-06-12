@@ -1,7 +1,7 @@
 #=
 # This file is part of OpenModelica.
 #
-# Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+# Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 # c/o Linköpings universitet, Department of Computer and Information Science,
 # SE-58183 Linköping, Sweden.
 #
@@ -30,29 +30,59 @@
 Author: John Tinnerholm, john.tinnerholm@liu.se
 =#
 
-#= TODO make CodeGenerationUtil its own module.. =#
 module CodeGeneration
 
 import DataStructures
-import ..Util
+using DataStructures: OrderedDict, OrderedSet
+import ..FrontendUtil.Util
 using MetaModelica
+#= This was also introduced in the data structure package. We need to be explicit in which one we use.=#
+using MetaModelica: Cons
 using Setfield
 using DocStringExtensions
+using ModelingToolkit
+using LinearAlgebra
 
 using ..FrontendUtil
-using ..Backend
+using ..Backend #Should maybe not be using here... since it can make certain overloads a bit tricky to follow.
 using ..SimulationCode
 
 import ..Backend.BDAE
-import DAE
+import ..@BACKEND_LOGGING
+import ..COMPONENT_SEPARATOR
+
 import Absyn
+import DAE
 import MetaGraphs
+import OMFrontend
+import OMParser
+import Symbolics
+import Symbolics.RuntimeGeneratedFunctions
+import SymbolicUtils
+import OMRuntimeExternalC
 
+#= Initialize RTG for this module to enable world-age-safe function generation =#
+RuntimeGeneratedFunctions.init(@__MODULE__)
+
+include("DAEInitSolve.jl")
+include("mtkDump.jl")
+include("mtkExternals.jl")
+include("./exprRewrite.jl")
+include("./arrayUtils.jl")
+include("./AlgorithmicCodeGeneration.jl")
 include("./CodeGenerationUtil.jl")
+using .CodeGenerationUtil
+include("./MTK_CodeGenerationUtil.jl")
+using .MTK_CodeGenerationUtil
 include("./structuralCallbacks.jl")
+include("./DirectRHSGeneration.jl")
 include("./MTK_CodeGeneration.jl")
+include("./DiscreteDummyDemotion.jl")
 
-#= Pure DifferentialEquations.jl code generation =#
+#= Pure DifferentialEquations.jl code generation (legacy/donor) =#
 include("./codeGen.jl")
+
+#= Direct DifferentialEquations.jl code generation (DEMode, fresh emitter) =#
+include("./DECodeGeneration.jl")
 
 end #= End CodeGeneration=#

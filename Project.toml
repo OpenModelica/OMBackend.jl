@@ -1,25 +1,24 @@
 name = "OMBackend"
 uuid = "9400bd5f-7561-42f6-8760-03756753da50"
 authors = ["John Tinnerholm <johti17@liu.se>", "Karim Abdelhak <karim.abdelhak@fh-bielefeld.de>", "AnHeuermann <andreas.heuermann@fh-bielefeld.de>"]
-version = "0.3.3"
+version = "0.5"
 
 [deps]
 Absyn = "ce2f92e2-a952-11e9-0543-8b443f216f1d"
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
-Cairo = "159f3aea-2a34-519c-b102-8c37f9878175"
-Compose = "a81c6b42-2e10-5240-aca2-a61377ecd94b"
 DAE = "0174eeea-c361-11e9-3d0d-a9ca8048aff6"
 DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 DiffEqBase = "2b5f629d-d688-5b77-993f-72d75c75574e"
+DiffEqCallbacks = "459566f4-90b8-5000-8ac3-15dfb0a30def"
 DifferentialEquations = "0c46a032-eb83-5123-abaf-570d42b7fbaa"
 DocStringExtensions = "ffbed154-4ef7-542d-bbb7-c09d3a79fcae"
-DoubleEnded = "1bc4e7c2-c1e1-11e9-03fe-315bbef43fde"
 ExportAll = "ad2082ca-a69e-11e9-38fa-e96309a31fe4"
 GR = "28b8d3ca-fb5f-59d9-8090-bfdbd6d07a71"
-GraphPlot = "a2cc645c-3eea-5389-862e-a155d0052231"
 Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
 ImmutableList = "4a558cac-c1ed-11e9-20da-3584bcd8709a"
 JuliaFormatter = "98e50ef6-434e-11e9-1051-2b60c6c9e899"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MacroTools = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
 MetaGraphs = "626554b9-1ddb-594c-aa3c-2596fe9399a5"
 MetaModelica = "9d7f2a79-07b5-5542-8b19-c0100dda6b06"
@@ -34,9 +33,29 @@ Sundials = "c3572dad-4567-51f8-b174-8c6c989267f4"
 SymbolicUtils = "d1185830-fcd6-423d-90d6-eec64667417b"
 Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
 Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+ListUtil="b2a72b7e-c1ef-11e9-3a87-6ddc5900c366"
+OMRuntimeExternalC = "ada38df0-e20e-11ed-02f3-2b4b19c1ec8a"
+OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
+
+# All OM.jl subpackages live in-tree as sibling directories. Point Pkg at the
+# local checkouts so resolve uses the working copies instead of whatever happens
+# to be cached in the General registry. OMRuntimeExternalC in particular is not
+# registered at all. Bumping a subpackage version only requires editing the
+# sibling's Project.toml - these pointers stay the same.
+[sources]
+Absyn = { path = "../Absyn.jl" }
+DAE = { path = "../DAE.jl" }
+ImmutableList = { path = "../ImmutableList.jl" }
+ListUtil = { path = "../ListUtil.jl" }
+MetaModelica = { path = "../MetaModelica.jl" }
+OMFrontend = { path = "../OMFrontend.jl" }
+OMParser = { path = "../OMParser.jl" }
+OMRuntimeExternalC = { path = "../OMRuntimeExternalC.jl" }
+SCode = { path = "../SCode.jl" }
 
 [compat]
-julia = "1.7"
+ModelingToolkit = "= 11.21.0"
+julia = "1.12"
 
 [extras]
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"

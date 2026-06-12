@@ -1,7 +1,7 @@
 #= /*
 * This file is part of OpenModelica.
 *
-* Copyright (c) 1998-CurrentYear, Open Source Modelica Consortium (OSMC),
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
 * c/o Linköpings universitet, Department of Computer and Information Science,
 * SE-58183 Linköping, Sweden.
 *
@@ -37,7 +37,8 @@ using ExportAll
 
 import DAE
 import ..BDAE
-import ..Util
+import ..@BACKEND_LOGGING
+import ..FrontendUtil.Util
 
 """
     kabdelhak:
@@ -58,7 +59,7 @@ function makeResidualEquation(eqn::BDAE.Equation)
     local lhs::DAE.Exp
     local rhs::DAE.Exp
     local source::DAE.ElementSource
-    local attr::EquationAttributes
+    local attr::BDAE.EquationAttributes
     @match eqn begin
       BDAE.EQUATION(lhs, rhs, source, attr) => begin
         BDAE.RESIDUAL_EQUATION(makeResidualExp(lhs, rhs), source, attr)
@@ -74,7 +75,7 @@ function makeResidualEquation(eqn::BDAE.Equation)
 end
 
 """
-johti17: 
+johti17:
   Transforms the sub-equations of an if-equation into residuals
 """
 function makeResidualIfEquation(eqn::BDAE.IF_EQUATION)::BDAE.IF_EQUATION
@@ -138,7 +139,7 @@ function makeNestedIfExpressionResidual(lstCond::List{DAE.Exp}, lstTrue::List{BD
     @match (lstCond, lstTrue) begin
       (nil, _) => begin
          #= fails for anything but BDAE.EQUATION() =#
-         makeResidualExp(eqFalse.lhs, eqFalse,rhs)
+         makeResidualExp(eqFalse.lhs, eqFalse.rhs)
       end
       (cond <| restCond, eqTrue <| restTrue) => begin
          #= fails for anything but BDAE.EQUATION() =#

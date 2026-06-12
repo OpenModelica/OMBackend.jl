@@ -1,7 +1,7 @@
 module Util
 
+import Absyn
 import DAE
-import DoubleEnded
 
 using MetaModelica
 
@@ -11,12 +11,12 @@ const Argument = Any
 """
   Traverses an expression top down.
   The traversal function is expected to be on the following format
-  function <name>(exp, dictonary).
+  function <name>(exp, dictionary).
   The function is expected to return a tuple of three elements.
   The first returning an expression, the second returning a boolean indicating if the traversal should continue
   and the last is the out argument.
 """
-function traverseExpTopDown(inExp::DAE.Exp, func::Function, ext_arg::Type_a) ::Tuple{DAE.Exp, Type_a}
+Base.@nospecializeinfer function traverseExpTopDown(@nospecialize(inExp::DAE.Exp), func::Function, ext_arg::Type_a)::Tuple{DAE.Exp, Type_a}
   local outArg::Type_a
   local outExp::DAE.Exp
   local cont::Bool
@@ -25,8 +25,8 @@ function traverseExpTopDown(inExp::DAE.Exp, func::Function, ext_arg::Type_a) ::T
   (outExp, outArg)
 end
 
-function traverseExpTopDown1(continueTraversal::Bool, inExp::DAE.Exp, func::Function, inArg::Type_a) ::Tuple{DAE.Exp, Type_a}
-  local outArg::Type_a
+Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @nospecialize(inExp::DAE.Exp), func::Function, inArg::Type_a) ::Tuple{DAE.Exp, Type_a}
+  local outArg
   local outExp::DAE.Exp
   (outExp, outArg) = begin
     local aliases::List{List{String}}
@@ -43,7 +43,7 @@ function traverseExpTopDown1(continueTraversal::Bool, inExp::DAE.Exp, func::Func
     local e4::DAE.Exp
     local e4_1::DAE.Exp
     local e::DAE.Exp
-    local et::Type
+    local et::DAE.Type
     local expl::List{DAE.Exp}
     local expl_1::List{DAE.Exp}
     local ext_arg::Type_a
@@ -57,13 +57,13 @@ function traverseExpTopDown1(continueTraversal::Bool, inExp::DAE.Exp, func::Func
     local isExpisASUB::Option{Tuple{DAE.Exp, ModelicaInteger, ModelicaInteger}}
     local lstexpl::List{List{DAE.Exp}}
     local lstexpl_1::List{List{DAE.Exp}}
-    local op::Operator
+    local op::DAE.Operator
     local reductionInfo::DAE.ReductionInfo
     local rel::Function
     local riters::DAE.ReductionIterators
     local scalar::Bool
-    local t::Type
-    local tp::Type
+    local t::DAE.Type
+    local tp::DAE.Type
 
     if !continueTraversal
       return (inExp, inArg)
@@ -227,11 +227,13 @@ function traverseExpTopDown1(continueTraversal::Bool, inExp::DAE.Exp, func::Func
 
      (e1 && DAE.RSUB(__), rel, ext_arg)  => begin
        (e1_1, ext_arg_1) = traverseExpTopDown(e1.exp, rel, ext_arg)
-       if ! referenceEq(e1.exp, e1_1)
-         e1.exp = e1_1
+       local newE1 = if !referenceEq(e1.exp, e1_1)
+         DAE.RSUB(e1_1, e1.ix, e1.fieldName, e1.ty)
+       else
+         e1
        end
-     (e1, ext_arg_1)
-    end
+       (newE1, ext_arg_1)
+     end
 
      (DAE.SIZE(exp = e1, sz = NONE()), rel, ext_arg)  => begin
        (e1_1, ext_arg_1) = traverseExpTopDown(e1, rel, ext_arg)
@@ -295,7 +297,7 @@ function traverseExpTopDown1(continueTraversal::Bool, inExp::DAE.Exp, func::Func
       (inExp, ext_arg)
      end
 
-     _  => begin
+      _  => begin
        throw("Error: traverseExpTopDown1 failed")
      end
 
@@ -304,15 +306,82 @@ function traverseExpTopDown1(continueTraversal::Bool, inExp::DAE.Exp, func::Func
   (outExp, outArg)
 end
 
-function traverseExpListTopDown(expLst::List{DAE.Exp}, func::Function, inArg::Type_a)
-  outArg::Type_a = inArg
+function traverseExpListTopDown(expLst::List{DAE.Exp}, func::Function, inArg)
+  outArg = inArg
+  newExpLst = DAE.Exp[]
+  allEqual = true
   for e in expLst
-    (_, outArg) = traverseExpTopDown1(true, e, func, outArg)
+    (newE, outArg) = traverseExpTopDown(e, func, outArg)
+    push!(newExpLst, newE)
+    if !referenceEq(e, newE)
+      allEqual = false
+    end
   end
-  return (expLst, outArg)
+  #= Return original list if nothing changed to preserve identity =#
+  return allEqual ? (expLst, outArg) : (list(newExpLst...), outArg)
 end
 
-function traverseExpTopDownCrefHelper(inCref::DAE.ComponentRef, rel::Function, iarg::Argument) ::Tuple{DAE.ComponentRef, Argument}
+"""
+  Calls traverseExpBottomUp for each element of list.
+  Mirrors Expression.traverseExpList from OpenModelica.
+"""
+function traverseExpList(expLst::List{DAE.Exp}, func::Function, inArg)
+  outArg = inArg
+  newExpLst = DAE.Exp[]
+  allEqual = true
+  for e in expLst
+    (newE, outArg) = traverseExpBottomUp(e, func, outArg)
+    push!(newExpLst, newE)
+    if !referenceEq(e, newE)
+      allEqual = false
+    end
+  end
+  return allEqual ? (expLst, outArg) : (list(newExpLst...), outArg)
+end
+
+"""
+  Helper function to traverseExpBottomUp, traverses matrix expressions.
+  Mirrors Expression.traverseExpMatrix from OpenModelica.
+"""
+function traverseExpMatrix(inMatrix::List{List{DAE.Exp}}, func::Function, inArg)
+  outArg = inArg
+  newRows = List{DAE.Exp}[]
+  same = true
+  for row in inMatrix
+    (row_1, outArg) = traverseExpList(row, func, outArg)
+    push!(newRows, row_1)
+    if !referenceEq(row, row_1)
+      same = false
+    end
+  end
+  return same ? (inMatrix, outArg) : (list(newRows...), outArg)
+end
+
+"""
+  Traverse reduction iterators, applying the traversal function to each iterator expression.
+"""
+function traverseReductionIteratorsTopDown(riters::DAE.ReductionIterators, func::Function, extArg)
+  outIters = DAE.ReductionIterator[]
+  outArg = extArg
+  for riter in riters
+    @match riter begin
+      DAE.REDUCTIONITER(id, exp, guardExp, ty) => begin
+        (exp2, outArg) = traverseExpTopDown(exp, func, outArg)
+        guardExp2 = @match guardExp begin
+          SOME(g) => begin
+            (g2, outArg) = traverseExpTopDown(g, func, outArg)
+            SOME(g2)
+          end
+          NONE() => NONE()
+        end
+        push!(outIters, DAE.REDUCTIONITER(id, exp2, guardExp2, ty))
+      end
+    end
+  end
+  return (list(outIters...), outArg)
+end
+
+Base.@nospecializeinfer function traverseExpTopDownCrefHelper(@nospecialize(inCref::DAE.ComponentRef), rel::Function, iarg::Argument) ::Tuple{DAE.ComponentRef, Argument}
   local outArg::Argument
   local outCref::DAE.ComponentRef
   (outCref, outArg) = begin
@@ -322,7 +391,7 @@ function traverseExpTopDownCrefHelper(inCref::DAE.ComponentRef, rel::Function, i
     local name::String
     local subs::List{DAE.Subscript}
     local subs_1::List{DAE.Subscript}
-    local ty::Type
+    local ty::DAE.Type
     @match (inCref, rel, iarg) begin
       (DAE.CREF_QUAL(ident = name, identType = ty, subscriptLst = subs, componentRef = cr), _, arg)  => begin
         (subs_1, arg) = traverseExpTopDownSubs(subs, rel, arg)
@@ -354,7 +423,7 @@ end
 function traverseExpTopDownSubs(inSubscript::List{<:DAE.Subscript}, rel::Function, iarg::Argument) ::Tuple{List{DAE.Subscript}, Argument}
   local allEq::Bool = true
   local arg::Argument = iarg
-  local delst::DoubleEnded.MutableList{DAE.Subscript}
+  local acc::Vector{DAE.Subscript}
   local exp::DAE.Exp
   local nEq::ModelicaInteger = 0
   local nsub::DAE.Subscript
@@ -401,26 +470,30 @@ function traverseExpTopDownSubs(inSubscript::List{<:DAE.Subscript}, rel::Functio
       false
     end
       allEq = false
-      delst = DoubleEnded.empty(nsub)
+      acc = Vector{DAE.Subscript}()
       for elt in inSubscript
         if nEq < 1
           break
         end
-        DoubleEnded.push_back(delst, elt)
+        push!(acc, elt)
         nEq = nEq - 1
       end
     end
     if allEq
       nEq = nEq + 1
     else
-      DoubleEnded.push_back(delst, nsub)
+      push!(acc, nsub)
     end
   end
   #=  Preserve reference equality without any allocation if nothing changed =#
   outSubscript = if allEq
     inSubscript
   else
-    DoubleEnded.toListAndClear(delst)
+    local lst::List{DAE.Subscript} = nil
+    for x in Iterators.reverse(acc)
+      lst = x <| lst
+    end
+    lst
   end
   (outSubscript, arg)
 end
@@ -434,7 +507,7 @@ end
   NOTE: The user-provided function is not allowed to fail! If you want to
   detect a failure, return NONE() in your user-provided datatype.
 """
-function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  where {T}
+Base.@nospecializeinfer function traverseExpBottomUp(@nospecialize(inExp::DAE.Exp), inFunc::Function, inExtArg::T)  where {T}
   local outExtArg::T
   local outExp::DAE.Exp
   (outExp, outExtArg) = begin
@@ -448,14 +521,14 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
     local e4::DAE.Exp
     local e4_1::DAE.Exp
     local ext_arg::T
-    local op::Operator
+    local op::DAE.Operator
     local rel::FuncExpType
     local expl_1::List{DAE.Exp}
     local expl::List{DAE.Exp}
     local fn::Absyn.Path
     local scalar::Bool
-    local tp::Type
-    local t::Type
+    local tp::DAE.Type
+    local t::DAE.Type
     local i::Integer
     local lstexpl_1::List{List{DAE.Exp}}
     local lstexpl::List{List{DAE.Exp}}
@@ -483,27 +556,27 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(inExp, inExtArg)
         (e, ext_arg)
       end
-      
+
       DAE.ICONST(__)  => begin
         (e, ext_arg) = inFunc(inExp, inExtArg)
         (e, ext_arg)
       end
-      
+
       DAE.RCONST(__)  => begin
         (e, ext_arg) = inFunc(inExp, inExtArg)
         (e, ext_arg)
       end
-      
+
       DAE.SCONST(__)  => begin
         (e, ext_arg) = inFunc(inExp, inExtArg)
         (e, ext_arg)
       end
-      
+
       DAE.BCONST(__)  => begin
         (e, ext_arg) = inFunc(inExp, inExtArg)
         (e, ext_arg)
       end
-      
+
       DAE.CLKCONST(clk)  => begin
         (clk1, ext_arg) = traverseExpClk(clk, inFunc, inExtArg)
         e = if referenceEq(clk1, clk)
@@ -514,12 +587,12 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.ENUM_LITERAL(__)  => begin
         (e, ext_arg) = inFunc(inExp, inExtArg)
         (e, ext_arg)
       end
-      
+
       DAE.CREF(cr, tp)  => begin
         (cr_1, ext_arg) = traverseExpCref(cr, inFunc, inExtArg)
         e = if referenceEq(cr, cr_1)
@@ -530,7 +603,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.UNARY(operator = op, exp = e1)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         e = if referenceEq(e1, e1_1)
@@ -541,7 +614,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.BINARY(exp1 = e1, operator = op, exp2 = e2)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         (e2_1, ext_arg) = traverseExpBottomUp(e2, inFunc, ext_arg)
@@ -553,7 +626,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.LUNARY(operator = op, exp = e1)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         e = if referenceEq(e1, e1_1)
@@ -564,7 +637,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         (e2_1, ext_arg) = traverseExpBottomUp(e2, inFunc, ext_arg)
@@ -576,7 +649,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.RELATION(exp1 = e1, operator = op, exp2 = e2, index = index_, optionExpisASUB = isExpisASUB)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         (e2_1, ext_arg) = traverseExpBottomUp(e2, inFunc, ext_arg)
@@ -588,7 +661,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.IFEXP(expCond = e1, expThen = e2, expElse = e3)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         (e2_1, ext_arg) = traverseExpBottomUp(e2, inFunc, ext_arg)
@@ -601,7 +674,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.CALL(path = fn, expLst = expl, attr = attr)  => begin
         (expl_1, ext_arg) = traverseExpList(expl, inFunc, inExtArg)
         e = if referenceEq(expl, expl_1)
@@ -612,7 +685,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.RECORD(path = fn, exps = expl, comp = fieldNames, ty = tp)  => begin
         (expl_1, ext_arg) = traverseExpList(expl, inFunc, inExtArg)
         e = if referenceEq(expl, expl_1)
@@ -623,7 +696,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.PARTEVALFUNCTION(fn, expl, tp, t)  => begin
         (expl_1, ext_arg) = traverseExpList(expl, inFunc, inExtArg)
         e = if referenceEq(expl, expl_1)
@@ -634,7 +707,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.ARRAY(ty = tp, scalar = scalar, array = expl)  => begin
         (expl_1, ext_arg) = traverseExpList(expl, inFunc, inExtArg)
         e = if referenceEq(expl, expl_1)
@@ -645,7 +718,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.MATRIX(ty = tp, integer = dim, matrix = lstexpl)  => begin
         (lstexpl_1, ext_arg) = traverseExpMatrix(lstexpl, inFunc, inExtArg)
         e = if referenceEq(lstexpl, lstexpl_1)
@@ -656,7 +729,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.RANGE(ty = tp, start = e1, step = NONE(), stop = e2)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         (e2_1, ext_arg) = traverseExpBottomUp(e2, inFunc, ext_arg)
@@ -668,7 +741,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.RANGE(ty = tp, start = e1, step = SOME(e2), stop = e3)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         (e2_1, ext_arg) = traverseExpBottomUp(e2, inFunc, ext_arg)
@@ -681,7 +754,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.TUPLE(PR = expl)  => begin
         (expl_1, ext_arg) = traverseExpList(expl, inFunc, inExtArg)
         e = if referenceEq(expl, expl_1)
@@ -692,7 +765,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.CAST(ty = tp, exp = e1)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         e = if referenceEq(e1, e1_1)
@@ -703,7 +776,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.ASUB(exp = e1, sub = expl)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         (expl_1, ext_arg) = traverseExpList(expl, inFunc, ext_arg)
@@ -715,7 +788,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.TSUB(e1, i, tp)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         e = if referenceEq(e1, e1_1)
@@ -726,7 +799,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       e1 && DAE.RSUB(__)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1.exp, inFunc, inExtArg)
         if ! referenceEq(e1.exp, e1_1)
@@ -735,7 +808,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e1, ext_arg) = inFunc(e1, ext_arg)
         (e1, ext_arg)
       end
-      
+
       DAE.SIZE(exp = e1, sz = NONE())  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         e = if referenceEq(e1, e1_1)
@@ -746,7 +819,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.SIZE(exp = e1, sz = SOME(e2))  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         (e2_1, ext_arg) = traverseExpBottomUp(e2, inFunc, ext_arg)
@@ -758,7 +831,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.REDUCTION(reductionInfo = reductionInfo, expr = e1, iterators = riters)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         (riters_1, ext_arg) = traverseReductionIterators(riters, inFunc, ext_arg)
@@ -770,7 +843,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.CONS(e1, e2)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         (e2_1, ext_arg) = traverseExpBottomUp(e2, inFunc, ext_arg)
@@ -782,7 +855,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.LIST(expl)  => begin
         (expl_1, ext_arg) = traverseExpList(expl, inFunc, inExtArg)
         e = if referenceEq(expl, expl_1)
@@ -793,7 +866,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.META_TUPLE(expl)  => begin
         (expl_1, ext_arg) = traverseExpList(expl, inFunc, inExtArg)
         e = if referenceEq(expl, expl_1)
@@ -804,12 +877,12 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.META_OPTION(NONE())  => begin
         (e, ext_arg) = inFunc(inExp, inExtArg)
         (e, ext_arg)
       end
-      
+
       DAE.META_OPTION(SOME(e1))  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         e = if referenceEq(e1, e1_1)
@@ -820,7 +893,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.BOX(e1)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         e = if referenceEq(e1, e1_1)
@@ -831,7 +904,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.UNBOX(e1, tp)  => begin
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
         e = if referenceEq(e1, e1_1)
@@ -842,7 +915,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
+
       DAE.METARECORDCALL(fn, expl, fieldNames, i, typeVars)  => begin
         (expl_1, ext_arg) = traverseExpList(expl, inFunc, inExtArg)
         e = if referenceEq(expl, expl_1)
@@ -853,33 +926,21 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
       end
-      
-      DAE.MATCHEXPRESSION(matchTy, expl, aliases, localDecls, cases, tp)  => begin
-        (expl_1, ext_arg) = traverseExpList(expl, inFunc, inExtArg)
-        (cases_1, ext_arg) = Patternm.traverseCases(cases, inFunc, ext_arg)
-        e = if referenceEq(expl, expl_1) && referenceEq(cases, cases_1)
-          inExp
-        else
-          DAE.MATCHEXPRESSION(matchTy, expl_1, aliases, localDecls, cases_1, tp)
-        end
-        (e, ext_arg) = inFunc(e, ext_arg)
-        (e, ext_arg)
-      end
-      
+
       DAE.SHARED_LITERAL(__)  => begin
         (e, ext_arg) = inFunc(inExp, inExtArg)
         (e, ext_arg)
       end
-      
+
       DAE.PATTERN(__)  => begin
         (e, ext_arg) = inFunc(inExp, inExtArg)
         (e, ext_arg)
       end
-      
+
       DAE.CODE(__)  => begin
         (inExp, inExtArg)
       end
-      
+
       _  => begin
         str = string(inExp)
         str = "Expression.traverseExpBottomUp or one of the user-defined functions using it is not implemented correctly: " + str
@@ -892,7 +953,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
 end
 
 
-function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::Type_a) ::Tuple{List{DAE.Subscript}, Type_a} 
+function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::Type_a) ::Tuple{List{DAE.Subscript}, Type_a}
   local outArg::Type_a
   local outSubscript::List{DAE.Subscript}
 
@@ -906,7 +967,7 @@ function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::
       ( nil(), _, arg)  => begin
         (inSubscript, arg)
       end
-      
+
       (DAE.WHOLEDIM(__) <| rest, _, arg)  => begin
         (res, arg) = traverseExpSubs(rest, rel, arg)
         res = if referenceEq(rest, res)
@@ -916,7 +977,7 @@ function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::
         end
         (res, arg)
       end
-      
+
       (DAE.SLICE(exp = sub_exp) <| rest, _, arg)  => begin
         (sub_exp_1, arg) = traverseExpBottomUp(sub_exp, rel, arg)
         (res, arg) = traverseExpSubs(rest, rel, arg)
@@ -927,7 +988,7 @@ function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::
         end
         (res, arg)
       end
-      
+
       (DAE.INDEX(exp = sub_exp) <| rest, _, arg)  => begin
         (sub_exp_1, arg) = traverseExpBottomUp(sub_exp, rel, arg)
         (res, arg) = traverseExpSubs(rest, rel, arg)
@@ -938,7 +999,7 @@ function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::
         end
         (res, arg)
       end
-      
+
       (DAE.WHOLE_NONEXP(exp = sub_exp) <| rest, _, arg)  => begin
         (sub_exp_1, arg) = traverseExpBottomUp(sub_exp, rel, arg)
         (res, arg) = traverseExpSubs(rest, rel, arg)
@@ -954,15 +1015,20 @@ function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::
   (outSubscript, outArg)
 end
 
+"""
+``traverseExpCref(inCref::DAE.ComponentRef, rel::function, iarg )```
+  Traverses all subcomponent references of a component reference.
+  Takes a function and an extra argument passed through the traversal.
+"""
 
-function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::Type_a) ::Tuple{DAE.ComponentRef, Type_a} 
+function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::T) ::Tuple{DAE.ComponentRef, T} where {T}
   local outArg::Type_a
   local outCref::DAE.ComponentRef
   (outCref, outArg) = begin
     local name::String
     local cr::DAE.ComponentRef
     local cr_1::DAE.ComponentRef
-    local ty::Type
+    local ty::DAE.Type
     local subs::List{DAE.Subscript}
     local subs_1::List{DAE.Subscript}
     local arg::Type_a
@@ -979,7 +1045,7 @@ function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::Type_a) 
         end
         (cr, arg)
       end
-      
+
       (DAE.CREF_IDENT(ident = name, identType = ty, subscriptLst = subs), _, arg)  => begin
         (subs_1, arg) = traverseExpSubs(subs, rel, arg)
         cr = if referenceEq(subs, subs_1)
@@ -989,7 +1055,7 @@ function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::Type_a) 
         end
         (cr, arg)
       end
-      
+
       (DAE.CREF_ITER(ident = name, index = ix, identType = ty, subscriptLst = subs), _, arg)  => begin
         (subs_1, arg) = traverseExpSubs(subs, rel, arg)
         cr = if referenceEq(subs, subs_1)
@@ -999,7 +1065,7 @@ function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::Type_a) 
         end
         (cr, arg)
       end
-      
+
       (DAE.OPTIMICA_ATTR_INST_CREF(componentRef = cr, instant = instant), _, arg)  => begin
         (cr_1, arg) = traverseExpCref(cr, rel, arg)
         cr = if referenceEq(cr, cr_1)
@@ -1009,11 +1075,11 @@ function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::Type_a) 
         end
         (cr, arg)
       end
-      
+
       (DAE.WILD(__), _, arg)  => begin
         (inCref, arg)
       end
-      
+
       _  => begin
         @error "Expression.traverseExpCref: Unknown cref " * string(inCref)
         fail()
@@ -1023,8 +1089,12 @@ function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::Type_a) 
   (outCref, outArg)
 end
 
-
-function evaluateCref(icr::DAE.ComponentRef, iels::List{<:DAE.Element})::Option{DAE.Exp} 
+"""
+  Evaluates a component reference to an expression, if possible.
+  It uses the variable bindings in the given list of elements.
+  If the component reference cannot be evaluated, NONE() is returned.
+"""
+function evaluateCref(icr::DAE.ComponentRef, iels::List{<:DAE.Element})::Option{DAE.Exp}
   local oexp::Option{DAE.Exp}
   local e::DAE.Exp
   local ee::DAE.Exp
@@ -1054,7 +1124,7 @@ end
 """
   Replaces a component reference with an expression
 """
-function replaceCref(inExp::DAE.Exp, inTpl::Tuple{<:DAE.ComponentRef, DAE.Exp})::Tuple{DAE.Exp, Tuple{DAE.ComponentRef, DAE.Exp}} 
+function replaceCref(inExp::DAE.Exp, inTpl::Tuple{<:DAE.ComponentRef, DAE.Exp})::Tuple{DAE.Exp, Tuple{DAE.ComponentRef, DAE.Exp}}
   local otpl::Tuple{DAE.ComponentRef, DAE.Exp}
   local outExp::DAE.Exp
   (outExp, otpl) = begin
@@ -1096,6 +1166,9 @@ end
 
 " author: lochel
   This function extracts all crefs from the input expression, except 'time'.
+
+Comment, John:
+  It seems we get time as well in some cases...
 "
 function getAllCrefs(inExp::DAE.Exp)::List{DAE.ComponentRef}
   local outCrefs::List{DAE.ComponentRef}
@@ -1125,7 +1198,25 @@ function isCref(inExp::DAE.Exp)
 end
 
 
-function isEvaluatedConst(inExp::DAE.Exp) ::Bool 
+"""
+  Check whether a DAE.Exp is a compile-time constant (no variable references).
+  Handles literals, arrays of constants, and arithmetic on constants.
+"""
+function isConstantExp(exp::DAE.Exp)::Bool
+  @match exp begin
+    DAE.RCONST(__) => true
+    DAE.ICONST(__) => true
+    DAE.BCONST(__) => true
+    DAE.SCONST(__) => true
+    DAE.ENUM_LITERAL(__) => true
+    DAE.UNARY(exp = e) => isConstantExp(e)
+    DAE.BINARY(exp1 = e1, exp2 = e2) => isConstantExp(e1) && isConstantExp(e2)
+    DAE.ARRAY(array = elems) => all(isConstantExp, elems)
+    _ => false
+  end
+end
+
+function isEvaluatedConst(inExp::DAE.Exp) ::Bool
   local outBoolean::Bool
   outBoolean = begin
     @match inExp begin
@@ -1140,16 +1231,113 @@ function isEvaluatedConst(inExp::DAE.Exp) ::Bool
       end
       DAE.SCONST(__)  => begin
         true
-      end      
+      end
       DAE.ENUM_LITERAL(__)  => begin
         true
-      end      
+      end
       _  => begin
         false
       end
     end
   end
   outBoolean
+end
+
+function getAllCrefsAsVector(cref::DAE.CREF_IDENT, crefs)
+  push!(crefs, cref)
+end
+
+function getAllCrefsAsVector(cref::DAE.CREF_QUAL, crefs)
+  push!(crefs, DAE.CREF_IDENT(cref.ident, cref.identType, cref.subscriptLst))
+  getAllCrefsAsVector(cref.componentRef, crefs)
+end
+
+function getAllCrefsAsVector(cref::DAE.CREF_ITER, crefs)
+  push!(crefs, DAE.CREF_IDENT(cref.ident, cref.ty, cref.subscriptLst))
+end
+
+function getAllCrefsAsVector(cref::DAE.ComponentRef)
+  local crefs = DAE.ComponentRef[]
+  getAllCrefsAsVector(cref, crefs)
+  return crefs
+end
+
+
+function getAllCrefsAsVector(cref::DAE.CREF)
+  local crefs = DAE.ComponentRef[]
+  getAllCrefsAsVector(cref.componentRef, crefs)
+  return crefs
+end
+
+
+"""
+  Checks whether a component reference contains an array component.
+"""
+function crefContainsArrayComponent(cref::DAE.CREF)
+  crefContainsArrayComponent(cref.componentRef::DAE.ComponentRef)
+end
+
+"""
+  Checks whether a component reference contains an array component.
+"""
+function crefContainsArrayComponent(cref::DAE.ComponentRef)
+  local crefs = getAllCrefs(cref::DAE.ComponentRef)
+  for c in crefs
+    @match c.identType begin
+      DAE.T_ARRAY(__)  => begin
+        return true
+      end
+      _  => begin
+        continue
+      end
+    end
+  end
+end
+
+function finalCrefIsArray(cref::DAE.ComponentRef)
+  getAllCrefsAsVector(cref)[end] |> c ->
+    @match c.identType begin
+      DAE.T_ARRAY(__)  => true
+      _  => false
+    end
+end
+
+function getFinalCref(cref::DAE.ComponentRef)
+  getAllCrefsAsVector(cref)[end]
+end
+
+"""
+  Creates an ASUB expression from an expression and a list of subscripts.
+"""
+function makeASUB(exp::DAE.Exp, sub::List{DAE.Exp})
+  DAE.ASUB(exp, sub)
+end
+
+"""
+  Get all subscripts from a CREF, collecting from all levels.
+  Returns a Vector of DAE.Subscript.
+"""
+function getSubscriptsFromCref(cref::DAE.ComponentRef)::Vector
+  local subscripts = []
+  for c in getAllCrefsAsVector(cref)
+    if !isempty(c.subscriptLst)
+      append!(subscripts, collect(c.subscriptLst))
+    end
+  end
+  return subscripts
+end
+
+"""
+  Get the base name of a CREF without subscripts.
+  E.g., for R_w[1] returns "R_w".
+"""
+function getBaseNameWithoutSubscripts(cref::DAE.ComponentRef)::String
+  local crefs = getAllCrefsAsVector(cref)
+  local parts = String[]
+  for c in crefs
+    push!(parts, c.ident)
+  end
+  return join(parts, "_")
 end
 
 end #=End Util=#
