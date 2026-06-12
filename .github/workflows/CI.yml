@@ -37,8 +37,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Siblings are consumed via Project.toml's [sources] block. The
+          # release-tracking copies live under the OpenModelica org and their
+          # masters carry the semver line that DAE.jl, OMFrontend.jl and the
+          # other siblings compile against. JKRT forks are personal working
+          # copies and lag behind, so cloning from there made earlier CI runs
+          # fail on the ImmutableList 0.1 vs 0.3 compat mismatch.
           for repo in Absyn.jl DAE.jl ImmutableList.jl ListUtil.jl MetaModelica.jl OMFrontend.jl OMParser.jl OMRuntimeExternalC.jl SCode.jl; do
-            git clone --depth 1 "https://github.com/JKRT/${repo}.git" "${repo}"
+            git clone --depth 1 "https://github.com/OpenModelica/${repo}.git" "${repo}"
           done
 
       - name: Set up Julia ${{ matrix.version }}
