@@ -19,7 +19,7 @@ const _CG = OMBackend.CodeGeneration
   local discreteVariables = ["dDef", "dInput"]
   local equations = Expr[ :(0 ~ dDef - 5), :(0 ~ algY - foo(dInput)) ]
   local ifEqComponents = _CG.IfEquationComponent[]
-  local sc = mockSimCode()
+  local sc = BackendTestMocks.mockSimCode()
 
   local plan = _CG.planDemotions(sc, equations, ifEqComponents,
                                  discreteVariables, 0, 0, 0)

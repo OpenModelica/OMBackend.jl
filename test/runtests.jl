@@ -123,7 +123,7 @@ import .ExampleDAEs
         OMBackend.translate(ExampleDAEs.helloWorld_DAE; BackendMode = OMBackend.MTK_MODE)
         sleep(1)
         OMBackend.translate(ExampleDAEs.helloWorld_DAE; BackendMode = OMBackend.MTK_MODE)
-        local runDirs = sort(filter(name -> startswith(name, "HelloWorld_"), readdir(ENV["OMJL_LOG_DIR"])))
+        runDirs = sort(filter(name -> startswith(name, "HelloWorld_"), readdir(ENV["OMJL_LOG_DIR"])))
         println("run_count=", length(runDirs))
         println("root_codegen=", isfile(joinpath(ENV["OMJL_LOG_DIR"], "backend", "codeGen", "equationFirstStageCodeGen.log")))
         println("run_codegen=", all(dir -> isfile(joinpath(ENV["OMJL_LOG_DIR"], dir, "backend", "codeGen", "equationFirstStageCodeGen.log")), runDirs))
