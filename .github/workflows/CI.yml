@@ -6,10 +6,19 @@ on:
     branches:
       - master
     tags: '*'
+  schedule:
+    # Nightly run against master at 03:17 UTC. The odd minute avoids the
+    # top-of-the-hour queue spike on GitHub-hosted runners.
+    - cron: '17 3 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Every julia invocation picks up OMBackend.jl as the active project so the
+  # cache action and the build/test actions all key off the same Manifest.
+  JULIA_PROJECT: OMBackend.jl
 
 jobs:
   test:
@@ -53,8 +62,14 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
 
-      - name: Cache Julia artifacts and packages
+      - name: Cache Julia depot
         uses: julia-actions/cache@v2
+        with:
+          # Cache the artifact store, package store, registries and the
+          # compiled-modules directory. The compiled cache is the biggest
+          # warm-run win - without it precompile reruns from scratch.
+          cache-name: ombackend
+          include-matrix: true
 
       - name: Add OpenModelica Julia registry
         shell: julia --color=yes {0}
@@ -63,20 +78,11 @@ jobs:
           Pkg.Registry.add("General")
           Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
 
-      - name: Build OMBackend
-        shell: bash
-        working-directory: OMBackend.jl
-        run: |
-          julia --compiled-modules=no --color=yes --project -e '
-            import Pkg
-            Pkg.instantiate()
-            Pkg.build(verbose = true)
-          '
+      - name: Instantiate and build
+        uses: julia-actions/julia-buildpkg@v1
 
       - name: Run tests
         uses: julia-actions/julia-runtest@v1
-        with:
-          project: OMBackend.jl
 
       - name: Process coverage
         uses: julia-actions/julia-processcoverage@v1
@@ -89,3 +95,23 @@ jobs:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
+
+      - name: Email maintainer on nightly failure
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: OMBackend CI <${{ secrets.MAIL_USERNAME }}>
+          to: jtinnerholm@gmail.com
+          subject: "[OMBackend nightly] ${{ matrix.os }} Julia ${{ matrix.version }} FAILED"
+          body: |
+            The nightly CI run for OMBackend.jl failed.
+
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Commit:       ${{ github.sha }}
+            Branch:       ${{ github.ref_name }}
+            Matrix:       ${{ matrix.os }} / Julia ${{ matrix.version }} / ${{ matrix.arch }}
