@@ -1,53 +1,85 @@
 name: CI
+
 on:
   pull_request:
   push:
     branches:
       - master
     tags: '*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            arch: 'x64'
-            version: '1.7'
           - os: ubuntu-latest
-            arch: 'x64'
-            version: '1.7'
+            arch: x64
+            version: '1.12'
+          - os: windows-latest
+            arch: x64
+            version: '1.12'
+
     steps:
-      - uses: actions/checkout@v2
-        
-      - uses: julia-actions/setup-julia@v1
+      - name: Checkout OMBackend.jl
+        uses: actions/checkout@v4
+        with:
+          path: OMBackend.jl
+
+      - name: Checkout sibling OM*.jl packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for repo in Absyn.jl DAE.jl ImmutableList.jl ListUtil.jl MetaModelica.jl OMFrontend.jl OMParser.jl OMRuntimeExternalC.jl SCode.jl; do
+            git clone --depth 1 "https://github.com/JKRT/${repo}.git" "${repo}"
+          done
+
+      - name: Set up Julia ${{ matrix.version }}
+        uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-          
-      - uses: actions/cache@v1
-        env:
-          cache-name: cache-artifacts
-        with:
-          path: ~/.julia/artifacts
-          key: ${{ runner.os }}-test-${{ env.cache-name }}-${{ hashFiles('**/Project.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-test-${{ env.cache-name }}-
-            ${{ runner.os }}-test-
-            ${{ runner.os }}-
-      - name: Build
+
+      - name: Cache Julia artifacts and packages
+        uses: julia-actions/cache@v2
+
+      - name: Add OpenModelica Julia registry
+        shell: julia --color=yes {0}
+        run: |
+          import Pkg
+          Pkg.Registry.add("General")
+          Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
+
+      - name: Build OMBackend
         shell: bash
-        run: julia --compiled-modules=no --color=yes --project -e 'import Pkg; Pkg.Registry.add("General"); Pkg.Registry.add(Pkg.RegistrySpec(url="https://github.com/OpenModelica/OpenModelicaRegistry.git")); Pkg.build(;verbose = true);'
+        working-directory: OMBackend.jl
+        run: |
+          julia --compiled-modules=no --color=yes --project -e '
+            import Pkg
+            Pkg.instantiate()
+            Pkg.build(verbose = true)
+          '
 
-      - name: Test
+      - name: Run tests
         uses: julia-actions/julia-runtest@v1
-
-      - name: Calculate process coverage
-        uses: julia-actions/julia-processcoverage@v1
-
-      - name: Coverage report
-        uses: codecov/codecov-action@v1
         with:
-          file: lcov.info
+          project: OMBackend.jl
+
+      - name: Process coverage
+        uses: julia-actions/julia-processcoverage@v1
+        with:
+          directories: OMBackend.jl/src
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
