@@ -66,6 +66,17 @@ Toggle with: `OMBackend.DIRECT_RHS_GENERATION[] = false` to disable.
 """
 const DIRECT_RHS_GENERATION = Ref{Bool}(true)
 
+"""
+Toggle symbolic sparse Jacobian generation for direct-RHS problems.
+When enabled, the Jacobian is built from the symbolic equations and attached
+to the ODEFunction, so implicit solvers do not finite-difference one RHS
+column per state every step. Falls back to finite differences automatically
+for systems with non-differentiable (opaque) calls.
+
+Toggle with: `OMBackend.DIRECT_JAC_GENERATION[] = false` to disable.
+"""
+const DIRECT_JAC_GENERATION = Ref{Bool}(true)
+
 const OSMC_COPYRIGHT_HEADER = """
 #=
 * This file is part of OpenModelica.
