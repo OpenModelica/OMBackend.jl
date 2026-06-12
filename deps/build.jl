@@ -1,36 +1,16 @@
-@info("OMBackend: Starting build script")
-
-push!(LOAD_PATH, "@v#.#", "@stdlib")
-@info("Current loadpath: $LOAD_PATH")
+@info("OMBackend: starting build script")
 
 using Pkg
 
-function buildDeps()
-  Pkg.add("ExportAll")
-  Pkg.add("Sundials")
-  Pkg.add("CSV")
-  Pkg.add("DifferentialEquations")
-  Pkg.add("Setfield")
-  Pkg.add("DataStructures")
-  Pkg.add("Plots")
-  Pkg.add("LightGraphs")
-  Pkg.add("MetaGraphs")
-  Pkg.add("JuliaFormatter")
-  Pkg.add("MacroTools")
-  #= This packages are available using the OpenModelica Julia registry=#
-  Pkg.add("ImmutableList")
-  Pkg.add("MetaModelica")
-  Pkg.add("Absyn")
-  Pkg.add("SCode")
-  Pkg.add("DAE")
-  #= Add if we do not have it =#
-  Pkg.add("OMParser")
-  Pkg.build("OMParser") #= Build the parser =#
-  Pkg.add("OMFrontend")
-  Pkg.build("OMFrontend")
-  @info("OMFrontend + OMParser built successfully")
-  @info("All dependencies succesfull")
+# The runtime dependency set is already declared in Project.toml and resolved
+# by Pkg.instantiate, so we do not re-add packages here. The OM siblings live
+# in [sources] as local paths. The only thing the build step still owns is
+# triggering the native build steps of OMParser and OMFrontend so that their
+# generated artifacts are present before the first `using OMBackend`.
+
+for pkg in ("OMParser", "OMFrontend")
+    @info "OMBackend: building $pkg"
+    Pkg.build(pkg; verbose = true)
 end
 
-buildDeps()
-@info("OMBackend: Finished build script")
+@info("OMBackend: finished build script")
