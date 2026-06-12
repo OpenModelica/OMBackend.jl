@@ -1,74 +1,138 @@
-[![Github Action CI](https://github.com/JKRT/OMBackend.jl/workflows/CI/badge.svg)](https://github.com/JKRT/OMBackend.jl/actions) [![License: OSMC-PL](https://img.shields.io/badge/license-OSMC--PL-lightgrey.svg)](OSMC-License.txt)
+[![Github Action CI](https://github.com/JKRT/OMBackend.jl/workflows/CI/badge.svg)](https://github.com/JKRT/OMBackend.jl/actions) [![License: OSMC-PL](https://img.shields.io/badge/license-OSMC--PL-lightgrey.svg)](LICENSE.md)
+
 # About OMBackend.jl
-OMBackend.jl is one component of the new OpenModelica Compiler infrastructure for Julia.
-It is able to transform a given Hybrid DAE and simulate it using DifferentialEquations.jl.
+
+OMBackend.jl is one component of the OpenModelica compiler infrastructure for
+Julia. It transforms a Hybrid DAE produced by OMFrontend.jl into a system that
+can be simulated with DifferentialEquations.jl and ModelingToolkit.jl.
+
+# Requirements
+
+* Julia 1.12
+* Git
+* A checkout of the sibling OM*.jl packages next to this repository (see below)
 
 # Dependencies
-* Julia 1.7
-* ExportAll.jl
-* MetaModelica.jl
-* Setfield.jl
-* OMCompiler.jl
-* DifferentialEquations.jl
 
-And more..
+The main runtime dependencies are pulled in by `Project.toml`. The most
+relevant ones are:
+
+* DifferentialEquations.jl, OrdinaryDiffEq.jl, DiffEqBase.jl, DiffEqCallbacks.jl, Sundials.jl
+* ModelingToolkit.jl, Symbolics.jl, SymbolicUtils.jl
+* Graphs.jl, MetaGraphs.jl, DataStructures.jl, MacroTools.jl, Setfield.jl
+* Plots.jl, GR.jl, CSV.jl, Tables.jl
+* ExportAll.jl, DocStringExtensions.jl, JuliaFormatter.jl
+
+The OpenModelica.jl ecosystem packages are consumed as in-tree siblings via
+`Project.toml`'s `[sources]` block. They must be checked out as sibling
+directories next to `OMBackend.jl`:
+
+* Absyn.jl
+* DAE.jl
+* ImmutableList.jl
+* ListUtil.jl
+* MetaModelica.jl
+* OMFrontend.jl
+* OMParser.jl
+* OMRuntimeExternalC.jl
+* SCode.jl
+
+Layout:
+
+```
+OpenModelica.jl-workspace/
+├── Absyn.jl/
+├── DAE.jl/
+├── ImmutableList.jl/
+├── ListUtil.jl/
+├── MetaModelica.jl/
+├── OMBackend.jl/        <-- this repository
+├── OMFrontend.jl/
+├── OMParser.jl/
+├── OMRuntimeExternalC.jl/
+└── SCode.jl/
+```
+
+`OMRuntimeExternalC.jl` is not in the General registry. The others are served
+by the OpenModelica Julia registry but the local `[sources]` paths take
+precedence and are used for development.
 
 # Installation
-Install dependencies with:
+
+Add the OpenModelica Julia registry once per Julia depot:
+
 ```julia
 julia> import Pkg
-julia> Pkg.build("OMBackend")
+julia> Pkg.Registry.add("General")
+julia> Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
 ```
-or:
+
+From the `OMBackend.jl` directory, activate the project and build:
+
 ```julia
-julia> include("deps/build.jl")
+julia> import Pkg
+julia> Pkg.activate(".")
+julia> Pkg.build(verbose = true)
 ```
-Then precompile with:
+
+`deps/build.jl` resolves and builds the dependent OM*.jl packages (notably
+`OMParser` and `OMFrontend`).
+
+Then load the package:
+
 ```julia
-(v1.7) pkg> activate .
 julia> using OMBackend
 ```
 
 # Running tests
 
-In the folder containing OMBackend:
-```julia
-julia> activate .
-```
-Then run:
+From the `OMBackend.jl` directory:
 
 ```julia
-(OMBackend) pkg> test
+julia> import Pkg
+julia> Pkg.activate(".")
+julia> Pkg.test()
 ```
 
-As an alternative  assuming you have activated OMBackend:
+Or directly:
+
 ```julia
 julia> include("test/runtests.jl")
 ```
 
-# Example use 
-Assuming you use DAE.jl and a suitable frontend you can use OMBackend to simulate your Modelica models.
+# Example use
 
-```
+Given a Modelica model translated to Hybrid DAE by OMFrontend.jl, pass it to
+`OMBackend.translate` and then simulate.
+
+```modelica
 model BouncingBallReals
-  parameter Real e=0.7;
-  parameter Real g=9.81;
-  Real h(start=1);
+  parameter Real e = 0.7;
+  parameter Real g = 9.81;
+  Real h(start = 1);
   Real v;
-equation 
+equation
   der(h) = v;
-  der(v) = -g;  
+  der(v) = -g;
   when h <= 0 then
-    reinit(v, -e*pre(v));
+    reinit(v, -e * pre(v));
   end when;
 end BouncingBallReals;
 ```
 
-Simply pass the given DAE or FlatModelica to the function translate. 
-
-```
+```julia
 julia> OMBackend.translate(BouncingBallReals)
 julia> OMBackend.simulate("BouncingBallReals", tspan = (0.0, 2.5))
 ```
 
 ![image](https://user-images.githubusercontent.com/8775827/99516636-b6914280-298e-11eb-85cf-c9041314e9b4.png)
+
+# Citation
+
+If you use OMBackend.jl in academic work, please cite the entries in
+[CITATION.bib](CITATION.bib).
+
+# License
+
+OMBackend.jl is distributed under the OSMC Public License. See
+[LICENSE.md](LICENSE.md).
