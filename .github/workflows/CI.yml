@@ -24,7 +24,10 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # Ubuntu finishes the suite in ~33 min; Windows runs slower and was
+    # hitting the 60-min job timeout. Match OMFrontend.jl's 90-min cap so
+    # Windows has headroom without inviting truly runaway jobs.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
