@@ -2,9 +2,9 @@
 
 # About OMBackend.jl
 
-OMBackend.jl is one component of the OpenModelica compiler infrastructure for
-Julia. It transforms a Hybrid DAE produced by OMFrontend.jl into a system that
-can be simulated with DifferentialEquations.jl and ModelingToolkit.jl.
+OMBackend.jl is one component of OMJL, the Modelica compiler infrastructure
+for Julia. It transforms a Hybrid DAE produced by OMFrontend.jl into a system
+that can be simulated with DifferentialEquations.jl and ModelingToolkit.jl.
 
 # Requirements
 
@@ -23,7 +23,7 @@ relevant ones are:
 * Plots.jl, GR.jl, CSV.jl, Tables.jl
 * ExportAll.jl, DocStringExtensions.jl, JuliaFormatter.jl
 
-The OpenModelica.jl ecosystem packages are consumed as in-tree siblings via
+The OMJL ecosystem packages are consumed as in-tree siblings via
 `Project.toml`'s `[sources]` block. They must be checked out as sibling
 directories next to `OMBackend.jl`:
 
@@ -40,7 +40,7 @@ directories next to `OMBackend.jl`:
 Layout:
 
 ```
-OpenModelica.jl-workspace/
+OMJL-workspace/
 ├── Absyn.jl/
 ├── DAE.jl/
 ├── ImmutableList.jl/
