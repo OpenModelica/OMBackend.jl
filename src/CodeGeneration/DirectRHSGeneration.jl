@@ -144,6 +144,14 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
 
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
 
+  #= Symbolic sparse Jacobian; nothing when not differentiable. Built after
+     u0/p_vec so the generated function can be probed once: an unresolved
+     symbolic derivative surfaces only when the function runs, not at build. =#
+  local (jacFunc, jacProto) = _buildSparseJacobian(rhs_list, states, params, iv,
+                                                   u0, p_vec, tspan[1])
+  local jacKwargs = jacFunc === nothing ? NamedTuple() :
+                    (; jac = jacFunc, jac_prototype = jacProto)
+
   # 4. Extract event callbacks from the reduced system and merge with custom callbacks.
   #    Our structural_simplify wrapper uses split=false, so the compiled event
   #    callbacks expect a flat parameter vector matching our p_vec format.
@@ -156,12 +164,15 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   local problem
   if massMatrix isa LinearAlgebra.UniformScaling
     @debug "DirectRHS: pure ODE (identity mass matrix)"
-    local f = ModelingToolkit.ODEFunction{true}(rhsFunc; sys=reducedSystem)
+    local f = ModelingToolkit.ODEFunction{true}(rhsFunc; sys=reducedSystem, jacKwargs...)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   else
     @debug "DirectRHS: DAE with mass matrix"
     local mm = collect(massMatrix)
-    local f = ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mm, sys=reducedSystem)
+    #= A sparse Jacobian prototype needs a sparse mass matrix, otherwise the
+       solver's W = M - gamma*J assembly densifies or mismatches. =#
+    local mmForF = jacFunc === nothing ? mm : Symbolics.SparseArrays.sparse(mm)
+    local f = ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mmForF, sys=reducedSystem, jacKwargs...)
     #= Pinned indices: vars whose u0 came from a fixed=true Modelica init eq
        (after splitInitialValues). The DAE init solver must NOT modify these,
        otherwise an algebraic var pinned by `start=1, fixed=true` (e.g.
@@ -461,14 +472,58 @@ function _buildRHSExpression(rhs_list, states, params, iv)
     local result = Symbolics.build_function(rhs_list, states, params, iv;
                                              expression=Val{true}, cse=true)
     @debug "DirectRHS: generated RHS function with CSE"
-    return result[2]  # in-place form
+    return _demoteWideNumericLiterals!(result[2])  # in-place form
   catch e
     @warn "DirectRHS: CSE failed, using direct generation" exception=(e, catch_backtrace())
   end
   # Fallback without CSE
   local result = Symbolics.build_function(rhs_list, states, params, iv;
                                            expression=Val{true})
-  return result[2]
+  return _demoteWideNumericLiterals!(result[2])
+end
+
+"""
+    _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
+
+Build an in-place sparse symbolic Jacobian for the RHS so implicit solvers do
+not finite-difference one RHS column per state every step. The generated
+function is probed once at `(u0, p_vec, t0)`: an unresolved symbolic
+derivative (opaque external call) passes build_function silently and only
+throws when the function runs. Returns `(jacFunc, jacPrototype)`, or
+`(nothing, nothing)` when generation is disabled or the probe fails.
+"""
+function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
+  OMBackend.DIRECT_JAC_GENERATION[] || return (nothing, nothing)
+  try
+    local jacSym = Symbolics.sparsejacobian(rhs_list, states)
+    local result = Symbolics.build_function(jacSym, states, params, iv;
+                                            expression=Val{true}, cse=true)
+    local jacFunc = _exprToRTGFunction(_demoteWideNumericLiterals!(result[2]))
+    local jacProto = similar(jacSym, Float64)
+    jacProto.nzval .= 0.0
+    local probe = copy(jacProto)
+    jacFunc(probe, u0, p_vec, t0)
+    @debug "DirectRHS: symbolic sparse Jacobian with $(length(jacProto.nzval)) structural nonzeros"
+    return (jacFunc, jacProto)
+  catch e
+    @debug "DirectRHS: symbolic Jacobian generation failed; solver will finite-difference" exception=(e, catch_backtrace())
+    return (nothing, nothing)
+  end
+end
+
+#= Symbolic simplification can fold integer parameter products into exact
+   Rational{BigInt} coefficients; one such literal promotes every downstream
+   operation to BigFloat, allocating per RHS call. Demote at the generated-code
+   boundary where Float64 semantics are already assumed. Exact integer
+   literals (Int128/BigInt) stay untouched: RNG state constants are bit-exact
+   and exceed Float64's 2^53 integer range. =#
+_demoteWideNumericLiterals!(x) =
+  x isa Union{Rational, BigFloat, Irrational} ? Float64(x) : x
+function _demoteWideNumericLiterals!(ex::Expr)
+  for (i, a) in pairs(ex.args)
+    ex.args[i] = _demoteWideNumericLiterals!(a)
+  end
+  return ex
 end
 
 
