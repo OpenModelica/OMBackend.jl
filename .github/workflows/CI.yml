@@ -1,53 +1,115 @@
 name: CI
+
 on:
   pull_request:
   push:
     branches:
       - master
     tags: '*'
+  schedule:
+    # Nightly run against master at 03:17 UTC. The odd minute avoids the
+    # top-of-the-hour queue spike on GitHub-hosted runners.
+    - cron: '17 3 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Every julia invocation picks up OMBackend.jl as the active project so the
+  # cache action and the build/test actions all key off the same Manifest.
+  JULIA_PROJECT: OMBackend.jl
+
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            arch: 'x64'
-            version: '1.7'
-          - os: ubuntu-latest
-            arch: 'x64'
-            version: '1.7'
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","arch":"x64","version":"1.12"}]' || '[{"os":"ubuntu-latest","arch":"x64","version":"1.12"},{"os":"windows-latest","arch":"x64","version":"1.12"}]') }}
+
     steps:
-      - uses: actions/checkout@v2
-        
-      - uses: julia-actions/setup-julia@v1
+      - name: Checkout OMBackend.jl
+        uses: actions/checkout@v4
+        with:
+          path: OMBackend.jl
+
+      - name: Checkout sibling OM*.jl packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Siblings are consumed via Project.toml's [sources] block. The
+          # release-tracking copies live under the OpenModelica org and their
+          # masters carry the semver line that DAE.jl, OMFrontend.jl and the
+          # other siblings compile against. JKRT forks are personal working
+          # copies and lag behind, so cloning from there made earlier CI runs
+          # fail on the ImmutableList 0.1 vs 0.3 compat mismatch.
+          for repo in Absyn.jl DAE.jl ImmutableList.jl ListUtil.jl MetaModelica.jl OMFrontend.jl OMParser.jl OMRuntimeExternalC.jl SCode.jl; do
+            git clone --depth 1 "https://github.com/OpenModelica/${repo}.git" "${repo}"
+          done
+
+      - name: Set up Julia ${{ matrix.version }}
+        uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-          
-      - uses: actions/cache@v1
-        env:
-          cache-name: cache-artifacts
-        with:
-          path: ~/.julia/artifacts
-          key: ${{ runner.os }}-test-${{ env.cache-name }}-${{ hashFiles('**/Project.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-test-${{ env.cache-name }}-
-            ${{ runner.os }}-test-
-            ${{ runner.os }}-
-      - name: Build
-        shell: bash
-        run: julia --compiled-modules=no --color=yes --project -e 'import Pkg; Pkg.Registry.add("General"); Pkg.Registry.add(Pkg.RegistrySpec(url="https://github.com/OpenModelica/OpenModelicaRegistry.git")); Pkg.build(;verbose = true);'
 
-      - name: Test
+      - name: Cache Julia depot
+        uses: julia-actions/cache@v2
+        with:
+          # Cache the artifact store, package store, registries and the
+          # compiled-modules directory. The compiled cache is the biggest
+          # warm-run win - without it precompile reruns from scratch.
+          cache-name: ombackend
+          include-matrix: true
+
+      - name: Add OpenModelica Julia registry
+        shell: julia --color=yes {0}
+        run: |
+          import Pkg
+          Pkg.Registry.add("General")
+          Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
+
+      - name: Instantiate and build
+        uses: julia-actions/julia-buildpkg@v1
+        with:
+          project: OMBackend.jl
+
+      - name: Run tests
         uses: julia-actions/julia-runtest@v1
-
-      - name: Calculate process coverage
-        uses: julia-actions/julia-processcoverage@v1
-
-      - name: Coverage report
-        uses: codecov/codecov-action@v1
         with:
-          file: lcov.info
+          project: OMBackend.jl
+
+      - name: Process coverage
+        uses: julia-actions/julia-processcoverage@v1
+        with:
+          directories: OMBackend.jl/src
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: Email maintainer on nightly failure
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: OMBackend CI <${{ secrets.MAIL_USERNAME }}>
+          to: jtinnerholm@gmail.com
+          subject: "[OMBackend nightly] ${{ matrix.os }} Julia ${{ matrix.version }} FAILED"
+          body: |
+            The nightly CI run for OMBackend.jl failed.
+
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Commit:       ${{ github.sha }}
+            Branch:       ${{ github.ref_name }}
+            Matrix:       ${{ matrix.os }} / Julia ${{ matrix.version }} / ${{ matrix.arch }}

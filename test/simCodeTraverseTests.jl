@@ -5,6 +5,7 @@
    structural `repr` of their DAE projection, so no `==` on `Exp` is required. =#
 
 using Test
+using DataStructures: OrderedSet
 
 SC    = OMBackend.SimulationCode
 Util  = OMBackend.FrontendUtil.Util
@@ -347,8 +348,8 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
         return sort(m1) == sort(m2)
       end
       function derNamesEq(e)
-        local s1 = Set{String}(); SCC._collectDerFromExp!(s1, e)
-        local s2 = Set{String}(); SCC._collectDerFromExp!(s2, SC.toDAEExp(e))
+        local s1 = OrderedSet{String}(); SCC._collectDerFromExp!(s1, e)
+        local s2 = OrderedSet{String}(); SCC._collectDerFromExp!(s2, SC.toDAEExp(e))
         return s1 == s2
       end
       function litDerPreEq(e)
@@ -356,7 +357,7 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
         local o2 = SCC.CheckViolation[]; SCC._flagLiteralInDerPre!(o2, SC.toDAEExp(e), "w")
         return length(o1) == length(o2)
       end
-      local kn = Set{String}(["x"])
+      local kn = OrderedSet{String}(["x"])
       @test crefNamesEq(simCref("x"), kn)                                                 # known -> no missing
       @test crefNamesEq(simCref("y"), kn)                                                 # unknown -> missing
       @test crefNamesEq(SC.BINARY(simCref("x"), SC.OP_ADD, simCref("z")), kn)
@@ -422,8 +423,8 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
 
     @testset "collectCrefNames! SIM-native == DAE oracle" begin
       crefNamesEq(e) = begin
-        s1 = Set{String}(); SC.collectCrefNames!(s1, e)
-        s2 = Set{String}(); SC.collectCrefNames!(s2, SC.toDAEExp(e))
+        s1 = OrderedSet{String}(); SC.collectCrefNames!(s1, e)
+        s2 = OrderedSet{String}(); SC.collectCrefNames!(s2, SC.toDAEExp(e))
         s1 == s2
       end
       @test crefNamesEq(simCref("a"))
@@ -435,7 +436,7 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       @test crefNamesEq(SC.BINARY(simCall("g", daeCrefExp("x")), SC.OP_MUL,
                                   SC.ASUB(simCref("M"), SC.Exp[SC.ICONST(2)])))
       # ASUB-of-cref with constant subscripts reconstructs the scalarized key + base
-      local sA = Set{String}()
+      local sA = OrderedSet{String}()
       SC.collectCrefNames!(sA, SC.ASUB(simCref("R_T"), SC.Exp[SC.ICONST(1), SC.ICONST(1)]))
       @test "R_T[1][1]" in sA && "R_T" in sA
       @test crefNamesEq(SC.ASUB(simCref("R_T"), SC.Exp[SC.ICONST(1), SC.ICONST(1)]))
@@ -443,8 +444,8 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
 
     @testset "_collectIfexpConditionCrefs! SIM-native == DAE oracle" begin
       ifCondEq(e) = begin
-        s1 = Set{String}(); SC._collectIfexpConditionCrefs!(s1, e)
-        s2 = Set{String}(); SC._collectIfexpConditionCrefs!(s2, SC.toDAEExp(e))
+        s1 = OrderedSet{String}(); SC._collectIfexpConditionCrefs!(s1, e)
+        s2 = OrderedSet{String}(); SC._collectIfexpConditionCrefs!(s2, SC.toDAEExp(e))
         s1 == s2
       end
       @test ifCondEq(SC.IFEXP(simCref("p"), simCref("t"), simCref("e")))
@@ -453,9 +454,9 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       @test ifCondEq(SC.BINARY(SC.IFEXP(simCref("x"), simCref("y"), simCref("z")), SC.OP_ADD, simCref("w")))
       @test ifCondEq(SC.BINARY(simCref("m"), SC.OP_ADD, simCref("n")))
       # at a single IFEXP only the condition's crefs are collected, not the branches
-      local sI = Set{String}()
+      local sI = OrderedSet{String}()
       SC._collectIfexpConditionCrefs!(sI, SC.IFEXP(simCref("p"), simCref("t"), simCref("e")))
-      @test sI == Set(["p"])
+      @test sI == OrderedSet(["p"])
     end
 
     @testset "evalDAEConstant SIM-native literal fast-path" begin

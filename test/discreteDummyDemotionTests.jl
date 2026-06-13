@@ -6,6 +6,7 @@
    because removing its dummy strands it with no equation (under-determination)
    — the failure mode behind the FlipFlop ExtraVariablesSystemException. =#
 using Test
+using DataStructures: OrderedSet
 
 include(joinpath(@__DIR__, "backendTestMocks.jl"))
 using .BackendTestMocks
@@ -19,7 +20,7 @@ const _CG = OMBackend.CodeGeneration
   local discreteVariables = ["dDef", "dInput"]
   local equations = Expr[ :(0 ~ dDef - 5), :(0 ~ algY - foo(dInput)) ]
   local ifEqComponents = _CG.IfEquationComponent[]
-  local sc = mockSimCode()
+  local sc = BackendTestMocks.mockSimCode()
 
   local plan = _CG.planDemotions(sc, equations, ifEqComponents,
                                  discreteVariables, 0, 0, 0)
@@ -33,7 +34,8 @@ const _CG = OMBackend.CodeGeneration
   end
 
   @testset "_residualDefinedDiscretes detects only defined discretes" begin
-    local defined = _CG._residualDefinedDiscretes(equations, Set(discreteVariables))
+    local defined = _CG._residualDefinedDiscretes(equations,
+                                                  OrderedSet{String}(discreteVariables))
     @test "dDef" in defined
     @test !("dInput" in defined)
   end

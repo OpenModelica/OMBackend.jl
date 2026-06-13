@@ -113,20 +113,20 @@ import .ExampleDAEs
       mktempdir() do tmp
         local repoRoot = abspath(joinpath(@__DIR__, ".."))
         local script = """
-        ENV[\\"ENABLE_BACKEND_LOGGING\\"] = \\"true\\"
-        ENV[\\"OMJL_LOG_DIR\\"] = $(repr(tmp))
+        ENV["ENABLE_BACKEND_LOGGING"] = "true"
+        ENV["OMJL_LOG_DIR"] = $(repr(tmp))
         cd($(repr(repoRoot)))
-        include(\\"src/OMBackend.jl\\")
-        include(\\"test/ExampleDAE/ExampleDAEs.jl\\")
+        include("src/OMBackend.jl")
+        include("test/ExampleDAE/ExampleDAEs.jl")
         using .ExampleDAEs
-        println(\\"same_module=\\", OMBackend === OMBackend.CodeGeneration.OMBackend)
+        println("same_module=", OMBackend === OMBackend.CodeGeneration.OMBackend)
         OMBackend.translate(ExampleDAEs.helloWorld_DAE; BackendMode = OMBackend.MTK_MODE)
         sleep(1)
         OMBackend.translate(ExampleDAEs.helloWorld_DAE; BackendMode = OMBackend.MTK_MODE)
-        local runDirs = sort(filter(name -> startswith(name, \\"HelloWorld_\\"), readdir(ENV[\\"OMJL_LOG_DIR\\"])))
-        println(\\"run_count=\\", length(runDirs))
-        println(\\"root_codegen=\\", isfile(joinpath(ENV[\\"OMJL_LOG_DIR\\"], \\"backend\\", \\"codeGen\\", \\"equationFirstStageCodeGen.log\\")))
-        println(\\"run_codegen=\\", all(dir -> isfile(joinpath(ENV[\\"OMJL_LOG_DIR\\"], dir, \\"backend\\", \\"codeGen\\", \\"equationFirstStageCodeGen.log\\")), runDirs))
+        runDirs = sort(filter(name -> startswith(name, "HelloWorld_"), readdir(ENV["OMJL_LOG_DIR"])))
+        println("run_count=", length(runDirs))
+        println("root_codegen=", isfile(joinpath(ENV["OMJL_LOG_DIR"], "backend", "codeGen", "equationFirstStageCodeGen.log")))
+        println("run_codegen=", all(dir -> isfile(joinpath(ENV["OMJL_LOG_DIR"], dir, "backend", "codeGen", "equationFirstStageCodeGen.log")), runDirs))
         """
         local output = read(`$(Base.julia_cmd()) --startup-file=no --project=$(repoRoot) -e $script`, String)
         @test occursin("same_module=true", output)
@@ -275,7 +275,7 @@ import .ExampleDAEs
       @test length(inits) == 1
       @test inits[1] isa SC.INITIAL_ALGORITHM
       @test length(inits[1].statements) == 1
-      @test inits[1].statements[1] isa BDAE.NORETCALL
+      @test inits[1].statements[1] isa SC.NORETCALL
     end
 
     @testset "non-initial when is kept" begin
