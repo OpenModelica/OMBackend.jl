@@ -193,6 +193,9 @@ function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArg
   local argNames = [Symbol("a", k) for k in 1:nArgs]
   local implCall = Expr(:call, :(Base.invokelatest), :impl, argNames...)
   local body
+  #= Results pass through exactly. Converting to Float64 corrupts Integer
+     results (RNG state words exceed 2^53) and float-ifies integer exponents,
+     so non-float Reals must keep their type. =#
   if length(indices) == 1
     local idx = indices[1]
     body = Expr(:->, Expr(:tuple, argNames...), Expr(:block,
@@ -297,6 +300,9 @@ function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}},
   push!(stmts, :(impl = MODELICA_FUNCTION_IMPLS[$fnQuote]))
   push!(stmts, :(result = $implCall))
 
+  #= Results pass through exactly. Converting to Float64 corrupts Integer
+     results (RNG state words exceed 2^53) and float-ifies integer exponents,
+     so non-float Reals must keep their type. =#
   if length(indices) == 1
     push!(stmts, :(return result[$(indices[1])]))
   elseif length(indices) == 2
@@ -369,6 +375,25 @@ function makeSymbolicTerm(f, args::Vector{Any})
   return Symbolics.Num(SymbolicUtils.Term{SymbolicUtils.SymReal}(f, args; type = Real))
 end
 
+#= Closed-form symbolic expansions for library functions whose general
+   implementation branches on symbolic values (so eager evaluation fails).
+   An expander receives the original call arguments and returns the full
+   result (tuple for tuple-returning functions), or nothing when the call
+   shape is outside its closed form. Expanded calls stay differentiable and
+   never reach the opaque invokelatest extractors. =#
+const EAGER_SYMBOLIC_EXPANSIONS = Dict{Symbol, Function}()
+
+#= A 2-point abscissa has a single interval: linear inter-/extrapolation,
+   loop-free. The second tuple element is the returned interval index. =#
+EAGER_SYMBOLIC_EXPANSIONS[:Modelica_Math_Vectors_interpolate] = function (args...)
+  length(args) < 3 && return nothing
+  local x, y, xi = args[1], args[2], args[3]
+  (x isa AbstractVector && y isa AbstractVector) || return nothing
+  (length(x) == 2 && length(y) == 2) || return nothing
+  local yi = y[1] + (xi - x[1]) * ((y[2] - y[1]) / (x[2] - x[1]))
+  return (yi, 1)
+end
+
 """
 Call a tuple-returning Modelica function and extract a specific element.
 Used by the TSUB handler in equation code generation to avoid the problem
@@ -382,6 +407,11 @@ All symbolic terms are created via `makeSymbolicTerm`.
 """
 function tupleElementCall(funcName::Symbol, ix::Int, args...)
   if hasSymbolicArgs(args...)
+    local expander = get(EAGER_SYMBOLIC_EXPANSIONS, funcName, nothing)
+    if expander !== nothing
+      local expanded = expander(args...)
+      expanded === nothing || return expanded[ix]
+    end
     #= Try eager evaluation: call impl with original (Num-wrapped) args.
        Produces elementary symbolic expressions Symbolics can differentiate.
        Falls back to opaque RTG extractors if eval fails (if-statement on symbolic). =#
@@ -426,6 +456,9 @@ function getOrCreateTupleElemFunc(funcName::Symbol, tupleIdx::Int, arrayIndices:
   local argNames = [Symbol("a", k) for k in 1:nArgs]
   local implCall = Expr(:call, :(Base.invokelatest), :impl, argNames...)
   local body
+  #= Results pass through exactly. Converting to Float64 corrupts Integer
+     results (RNG state words exceed 2^53) and float-ifies integer exponents,
+     so non-float Reals must keep their type. =#
   if length(arrayIndices) == 1
     local idx = arrayIndices[1]
     body = Expr(:->, Expr(:tuple, argNames...), Expr(:block,
@@ -495,6 +528,9 @@ function _getOrCreateFlatTupleElemFunc(funcName::Symbol, tupleIdx::Int, arrayInd
   push!(stmts, :(result = $implCall))
   push!(stmts, :(tupleElem = result[$tupleIdx]))
 
+  #= Results pass through exactly. Converting to Float64 corrupts Integer
+     results (RNG state words exceed 2^53) and float-ifies integer exponents,
+     so non-float Reals must keep their type. =#
   if length(arrayIndices) == 1
     local idx = arrayIndices[1]
     push!(stmts, :(return tupleElem[$idx]))
@@ -658,6 +694,7 @@ function _getOrCreateFlatScalarFunc(funcName::Symbol, nFlat::Int, shapes::Tuple)
 
   local implCall = Expr(:call, :(Base.invokelatest), :impl, origArgNames...)
   push!(stmts, :(impl = MODELICA_FUNCTION_IMPLS[$fnQuote]))
+  #= Result passes through exactly; Float64() here corrupts Integer results. =#
   push!(stmts, :(return $implCall))
 
   local body = Expr(:->, Expr(:tuple, flatArgNames...), Expr(:block, stmts...))
@@ -901,6 +938,11 @@ if-statement branches on a symbolic value), falls back to opaque RTG Term
 extractors that cannot be differentiated.
 """
 function _symbolicFuncDispatch(funcName::Symbol, origArgs::Vector{Any}, isArray::Bool, dims::Tuple)
+  local expander = get(EAGER_SYMBOLIC_EXPANSIONS, funcName, nothing)
+  if expander !== nothing
+    local expanded = expander(origArgs...)
+    expanded === nothing || return expanded
+  end
   try
     local impl = MODELICA_FUNCTION_IMPLS[funcName]
     local preparedArgs = _prepareArgsForEagerEval(origArgs)
@@ -1797,6 +1839,52 @@ function neutralizeSoftStatePriority(sys::ModelingToolkit.AbstractSystem)
   return (n, relaxed)
 end
 
+#= simplify=true polynomial normalization rationalizes Float64 coefficients;
+   exact folding can overflow into Rational{BigInt}, and a single such literal
+   promotes every numeric consumer (RHS, Jacobian, observed, event functions)
+   to allocating BigFloat arithmetic. Demote back to Float64 once the symbolic
+   algebra is done. Only equations that actually carry a wide literal are
+   rebuilt, so shape/metadata reconstruction risk stays confined to offenders. =#
+#= Exact BigInt integer literals stay untouched: RNG state constants are
+   bit-exact and exceed Float64's 2^53 integer range. =#
+const _WideNumeric = Union{Rational{BigInt}, BigFloat}
+
+function _containsWideNumeric(ex)::Bool
+  ex isa _WideNumeric && return true
+  if ex isa SymbolicUtils.BasicSymbolic && SymbolicUtils.iscall(ex)
+    return any(_containsWideNumeric, SymbolicUtils.arguments(ex))
+  end
+  return false
+end
+
+function _demoteWideNumerics(ex)
+  ex isa _WideNumeric && return Float64(ex)
+  if ex isa SymbolicUtils.BasicSymbolic && SymbolicUtils.iscall(ex)
+    local args = SymbolicUtils.arguments(ex)
+    local newArgs = Any[_demoteWideNumerics(a) for a in args]
+    if newArgs != args
+      return SymbolicUtils.maketerm(typeof(ex), SymbolicUtils.operation(ex),
+                                    newArgs, SymbolicUtils.metadata(ex))
+    end
+  end
+  return ex
+end
+
+function _demoteWideNumericsInEquations(eqs)
+  local changed = 0
+  local newEqs = map(eqs) do eq
+    local l = Symbolics.unwrap(eq.lhs)
+    local r = Symbolics.unwrap(eq.rhs)
+    if _containsWideNumeric(l) || _containsWideNumeric(r)
+      changed += 1
+      Symbolics.Equation(_demoteWideNumerics(l), _demoteWideNumerics(r))
+    else
+      eq
+    end
+  end
+  return (newEqs, changed)
+end
+
 """
   TODO:
   Document why some parts here are commented out
@@ -1899,6 +1987,20 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
         sys = retried
       end
     end
+  end
+  try
+    local (newEqs, nEq) = _demoteWideNumericsInEquations(equations(sys))
+    local (newObs, nObs) = _demoteWideNumericsInEquations(ModelingToolkit.observed(sys))
+    if nEq > 0
+      @set! sys.eqs = newEqs
+    end
+    if nObs > 0
+      @set! sys.observed = newObs
+    end
+    (nEq + nObs) > 0 &&
+      @info "[MTK GEN: simplify] demoted wide numeric literals (Rational{BigInt}/BigFloat) in $(nEq) equation(s), $(nObs) observed equation(s)"
+  catch ex
+    @warn "[MTK GEN: simplify] wide-numeric demotion failed; continuing with original system" exception = (ex, catch_backtrace())
   end
   local post_eqs = length(equations(sys))
   #= Diagnostic only: full_equations expands observed eqs and can hit

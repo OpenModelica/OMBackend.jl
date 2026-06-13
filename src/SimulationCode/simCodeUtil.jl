@@ -988,7 +988,8 @@ This handles the ASUB case where `getAllCrefs` extracts a base CREF without subs
 function buildBaseNameIndex(ht::OrderedDict{String, Tuple{Integer, SimVar}})::Dict{String, Vector{String}}
   local index = Dict{String, Vector{String}}()
   for (varName, _) in ht
-    local bn = replace(varName, r"\[.*" => "")
+    local bi = findfirst('[', varName)
+    local bn = bi === nothing ? varName : varName[1:(bi - 1)]
     if bn != varName
       if !haskey(index, bn)
         index[bn] = String[]
@@ -1022,7 +1023,8 @@ function collectEquationVarNames(exp::DAE.Exp,
     else
       #= Base name fallback: the CREF may come from inside an ASUB expression,
          missing its subscripts. Match all subscripted variants conservatively. =#
-      local bn = replace(name, r"\[.*" => "")
+      local bi = findfirst('[', name)
+      local bn = bi === nothing ? name : name[1:(bi - 1)]
       if bn != name && haskey(ht, bn)
         #= The CREF itself has partial subscripts; try the full name and base =#
         push!(names, bn)
@@ -1600,7 +1602,8 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
     if eqIdx > 0 && haskey(matchIdxToName, matchIdx)
       local vn = matchIdxToName[matchIdx]
       varNameToEq[vn] = eqIdx
-      local bn = replace(vn, r"\[.*" => "")
+      local bi = findfirst('[', vn)
+      local bn = bi === nothing ? vn : vn[1:(bi - 1)]
       if bn != vn
         if !haskey(baseNameToEqs, bn)
           baseNameToEqs[bn] = Int[]
@@ -1886,7 +1889,8 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     end
     #= Also check base name =#
     if !referencedBySurvivor
-      local bn = replace(vn, r"\[.*" => "")
+      local bi = findfirst('[', vn)
+      local bn = bi === nothing ? vn : vn[1:(bi - 1)]
       if bn != vn && haskey(varNameToRefEqs, bn)
         for refEqIdx in varNameToRefEqs[bn]
           if !(refEqIdx in eqsToEliminate)
