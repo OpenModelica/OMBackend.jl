@@ -40,7 +40,7 @@ jobs:
             version: '1.12'
 
     steps:
-      - name: Use D: drive for the Julia depot (Windows)
+      - name: "Use D: drive for the Julia depot (Windows)"
         if: runner.os == 'Windows'
         shell: bash
         run: |
