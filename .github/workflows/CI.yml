@@ -24,19 +24,9 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
-    # Ubuntu finishes the suite in ~33 min; Windows runs slower and was
-    # hitting the 60-min job timeout. Match OMFrontend.jl's 90-min cap so
-    # Windows has headroom without inviting truly runaway jobs.
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      # Windows is roughly 5-10x slower than Ubuntu on a cold runner: just
-      # the precompile of the SciML stack burns ~25 minutes, and the test
-      # suite itself does not fit under the 90 minute job timeout from a
-      # cold cache. Ubuntu finishes the whole step in under 10 minutes.
-      # Keep PR iteration fast by running only Ubuntu on pull_request, and
-      # exercise Windows on master push and on the nightly schedule, where
-      # the runtime budget is not in the iteration loop.
       matrix:
         include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","arch":"x64","version":"1.12"}]' || '[{"os":"ubuntu-latest","arch":"x64","version":"1.12"},{"os":"windows-latest","arch":"x64","version":"1.12"}]') }}
 
