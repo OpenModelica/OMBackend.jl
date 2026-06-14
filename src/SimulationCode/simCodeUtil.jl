@@ -602,7 +602,7 @@ function createEquationVariableBidirectionGraph(equations::AbstractVector,
                                                 allBackendVars::VARS,
                                                 stringToSimVarHT)::OrderedDict where{IF_EQS, WHEN_EQS, VARS}
   local eqCounter::Int = 0
-  local variableEqMapping = OrderedDict()
+  local variableEqMapping = OrderedDict{String, Vector{Int}}()
   local unknownVariables = filter((x) -> BDAEUtil.isVariable(x.varKind), allBackendVars)
   #=TODO: The set of discrete variables are currently not in use. =#
   local discreteVariables = filter((x) -> BDAEUtil.isDiscrete(x.varKind), allBackendVars)
@@ -696,7 +696,7 @@ function createEquationVariableBidirectionGraph(equations::RES_T,
                                                 allBackendVars::VECTOR_VAR,
                                                 stringToSimVarHT)::OrderedDict where{RES_T, VECTOR_VAR}
   local eqCounter::Int = 0
-  local variableEqMapping = OrderedDict()
+  local variableEqMapping = OrderedDict{String, Vector{Int}}()
   local unknownVariables = filter((x) -> BDAEUtil.isVariable(x.varKind), allBackendVars)
   local discreteVariables = filter((x) -> BDAEUtil.isDiscrete(x.varKind), allBackendVars)
   local stateVariables = filter((x) -> BDAEUtil.isState(x.varKind), allBackendVars)

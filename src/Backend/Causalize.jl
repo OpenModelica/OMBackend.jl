@@ -1595,54 +1595,60 @@ function _resolveIntVarsInSystem!(syst::BDAE.EQSYSTEM)
   local removedDefiners = OrderedSet{String}()
   for (i, eq) in enumerate(syst.orderedEqs)
     if eq isa BDAE.EQUATION
-      lhsIsInt = eq.lhs isa DAE.CREF && string(eq.lhs.componentRef) in intVarNames
-      rhsIsInt = eq.rhs isa DAE.CREF && string(eq.rhs.componentRef) in intVarNames
+      lhsName = eq.lhs isa DAE.CREF ? string(eq.lhs.componentRef) : nothing
+      rhsName = eq.rhs isa DAE.CREF ? string(eq.rhs.componentRef) : nothing
+      lhsIsInt = lhsName !== nothing && lhsName in intVarNames
+      rhsIsInt = rhsName !== nothing && rhsName in intVarNames
       #= If this integer is actually when-driven discrete state, leave the
          equation alone (it might be a continuous default / initial value
          assignment). =#
-      isWhenDriven = (lhsIsInt && string(eq.lhs.componentRef) in intVarsWrittenInWhen) ||
-                     (rhsIsInt && string(eq.rhs.componentRef) in intVarsWrittenInWhen)
+      isWhenDriven = (lhsIsInt && lhsName in intVarsWrittenInWhen) ||
+                     (rhsIsInt && rhsName in intVarsWrittenInWhen)
       if (lhsIsInt || rhsIsInt) && !isWhenDriven
         #= Drop a `intvar = literal` binding outright; capture the value. =#
         if lhsIsInt && _isLiteral(eq.rhs)
           keepEq[i] = false
-          push!(removedDefiners, string(eq.lhs.componentRef))
-          valueMap[string(eq.lhs.componentRef)] = eq.rhs
+          push!(removedDefiners, lhsName)
+          valueMap[lhsName] = eq.rhs
         elseif rhsIsInt && _isLiteral(eq.lhs)
           keepEq[i] = false
-          push!(removedDefiners, string(eq.rhs.componentRef))
-          valueMap[string(eq.rhs.componentRef)] = eq.lhs
+          push!(removedDefiners, rhsName)
+          valueMap[rhsName] = eq.lhs
         end
         #= int-to-int aliases (e.g. `auxiliary_n = auxiliary[2]`) are
            handled in the alias-chain follow-up pass below — we cannot
            decide here because the RHS may not yet be in removedDefiners. =#
       end
     elseif eq isa BDAE.ARRAY_EQUATION
-      leftIsInt = eq.left isa DAE.CREF && string(eq.left.componentRef) in allIntNames
-      rightIsInt = eq.right isa DAE.CREF && string(eq.right.componentRef) in allIntNames
-      isWhenDriven = (leftIsInt && string(eq.left.componentRef) in intVarsWrittenInWhen) ||
-                     (rightIsInt && string(eq.right.componentRef) in intVarsWrittenInWhen)
+      leftName = eq.left isa DAE.CREF ? string(eq.left.componentRef) : nothing
+      rightName = eq.right isa DAE.CREF ? string(eq.right.componentRef) : nothing
+      leftIsInt = leftName !== nothing && leftName in allIntNames
+      rightIsInt = rightName !== nothing && rightName in allIntNames
+      isWhenDriven = (leftIsInt && leftName in intVarsWrittenInWhen) ||
+                     (rightIsInt && rightName in intVarsWrittenInWhen)
       if (leftIsInt || rightIsInt) && !isWhenDriven
         if leftIsInt && _isLiteral(eq.right)
           keepEq[i] = false
-          push!(removedDefiners, string(eq.left.componentRef))
+          push!(removedDefiners, leftName)
         elseif rightIsInt && _isLiteral(eq.left)
           keepEq[i] = false
-          push!(removedDefiners, string(eq.right.componentRef))
+          push!(removedDefiners, rightName)
         end
       end
     elseif eq isa BDAE.COMPLEX_EQUATION
-      leftIsInt = eq.left isa DAE.CREF && string(eq.left.componentRef) in allIntNames
-      rightIsInt = eq.right isa DAE.CREF && string(eq.right.componentRef) in allIntNames
-      isWhenDriven = (leftIsInt && string(eq.left.componentRef) in intVarsWrittenInWhen) ||
-                     (rightIsInt && string(eq.right.componentRef) in intVarsWrittenInWhen)
+      leftName = eq.left isa DAE.CREF ? string(eq.left.componentRef) : nothing
+      rightName = eq.right isa DAE.CREF ? string(eq.right.componentRef) : nothing
+      leftIsInt = leftName !== nothing && leftName in allIntNames
+      rightIsInt = rightName !== nothing && rightName in allIntNames
+      isWhenDriven = (leftIsInt && leftName in intVarsWrittenInWhen) ||
+                     (rightIsInt && rightName in intVarsWrittenInWhen)
       if (leftIsInt || rightIsInt) && !isWhenDriven
         if leftIsInt && _isLiteral(eq.right)
           keepEq[i] = false
-          push!(removedDefiners, string(eq.left.componentRef))
+          push!(removedDefiners, leftName)
         elseif rightIsInt && _isLiteral(eq.left)
           keepEq[i] = false
-          push!(removedDefiners, string(eq.right.componentRef))
+          push!(removedDefiners, rightName)
         end
       end
     end
