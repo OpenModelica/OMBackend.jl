@@ -107,6 +107,12 @@ jobs:
           # where it is cheap, and disable it on Windows and macOS so the
           # restored pkgimage cache is actually usable on those runners.
           coverage: ${{ runner.os == 'Linux' }}
+          # Use Julia's default bounds-check behavior (honor @inbounds) instead
+          # of the action default --check-bounds=yes. The forced setting is a
+          # separate precompile configuration, so it triggers a full pkgimage
+          # rebuild of every dependency on test entry and discards the warm
+          # depot cache restored above.
+          check_bounds: auto
 
       - name: Process coverage
         if: runner.os == 'Linux'
