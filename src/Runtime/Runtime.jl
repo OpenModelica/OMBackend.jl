@@ -255,13 +255,6 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
     @BACKEND_LOGGING @info "u values at Δt $(integrator.dt) & t = $(integrator.t)" integrator.u
     #= Check structural callbacks in order =#
     @BACKEND_LOGGING @info "Stepping at:" i.t
-    #= AUDIT (ombackend-bug-audit-2026-06-05 #13): retCode is computed but never
-       branched on. Harmless here (inside `for i in integrator`, which
-       self-terminates on integrator failure); the concerning twin site is the
-       OM_ProblemRecompilation `while true` loop, which has no retcode /
-       dt-collapse break and relies solely on sol.retcode. VSS path; add a break
-       when the VSS-recompilation pipeline is hardened. =#
-    retCode = check_error(integrator)
     for cb in structuralCallbacks
       if cb.structureChanged && cb.name != activeModeName
         @VSS_DEBUG @info "Structure changed at $(i.t) transition to $(cb.name) => $(cb.structureChanged)"
@@ -522,7 +515,6 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
     local i = integrator
     local old_t = i.t
     #= Check structural callbacks in order =#
-    retCode = check_error(integrator)
     for j in 1:length(structuralCallbacks)
       local cb = structuralCallbacks[j]
       @VSS_DEBUG @info "Structure Changed? $(cb.structureChanged)"
