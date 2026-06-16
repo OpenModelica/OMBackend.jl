@@ -415,13 +415,18 @@ structuralHash(x::Vector, h::UInt) = begin
   end
   h
 end
-function structuralHash(@nospecialize(x), h::UInt)
-  T = typeof(x)
-  h = hash(T, h)
-  for i in 1:fieldcount(T)
-    h = structuralHash(getfield(x, i), h)
+#= Generic struct fold: unrolled per concrete type so each `getfield(x, i)` has a
+   concrete field type and the recursive call dispatches statically (no boxing).
+   Semantics identical to the previous runtime-loop fallback: hash the type, then
+   each field in order. =#
+@generated function structuralHash(x, h::UInt)
+  local body = Expr(:block)
+  push!(body.args, :(h = hash($x, h)))
+  for i in 1:fieldcount(x)
+    push!(body.args, :(h = structuralHash(getfield(x, $i), h)))
   end
-  h
+  push!(body.args, :(return h))
+  return body
 end
 structuralHash(@nospecialize(x)) = structuralHash(x, zero(UInt))
 

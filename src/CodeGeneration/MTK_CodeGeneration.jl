@@ -149,6 +149,10 @@ function classifyVariables(simCode)::ClassifiedVariables
   local dataStructureVariables = String[]
   local statePriorityPairs     = Tuple{Symbol, Int}[]
   local ht = simCode.stringToSimVarHT
+  #= Membership set built once: the per-variable `idx in matchOrder` below was an
+     O(V) scan of the matchOrder Vector, making classification O(V^2). matchOrder
+     is not mutated in this loop. =#
+  local matchOrderSet = OrderedSet{Int}(simCode.matchOrder)
   for varName in keys(ht)
     (idx, var) = ht[varName]
     local varType = var.varKind
@@ -166,7 +170,7 @@ function classifyVariables(simCode)::ClassifiedVariables
       SimulationCode.ARRAY(__) => push!(stateVariables, varName)
       SimulationCode.DISCRETE(__) => push!(discreteVariables, varName)
       SimulationCode.ALG_VARIABLE(__) => begin
-        if idx in simCode.matchOrder
+        if idx in matchOrderSet
           push!(algebraicVariables, varName)
         elseif involvedInEvent(idx, simCode)
           push!(discreteVariables, varName)

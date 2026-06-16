@@ -91,10 +91,17 @@ function runSimCodePass(passName::AbstractString,
                         simCode::SIM_CODE,
                         passFn::Function;
                         cleanup::Bool = true)::SIM_CODE
-  local before = simCodeMetrics(simCode)
-  local t0 = time()
-  local afterPass = passFn(simCode)
-  logSimCodePassMetrics(passName, before, afterPass, time() - t0)
+  #= Pass metrics feed only the perf log, so compute them only when perf logging
+     is on; otherwise skip the two full hash-table sweeps per pass. Pass execution
+     and cleanup are unchanged, so this is codegen-neutral. =#
+  local perf = OMBackend.BACKEND_PERFLOG[]
+  local before = perf ? simCodeMetrics(simCode) : nothing
+  local stats = Base.@timed passFn(simCode)
+  local afterPass = stats.value
+  if perf
+    logSimCodePassMetrics(passName, before, afterPass, stats.time)
+    @info "[SIMCODE: $(simCode.name): $passName] alloc" bytes=stats.bytes
+  end
   if cleanup
     afterPass = cleanupTrivialResidualEquations(afterPass; sourcePass = passName)
   end
@@ -416,7 +423,7 @@ function dumpVariableEqMapping(mapping::OrderedDict, residualEquations, ifEquati
       variablesAtEq *= "$(v),"
     end
     variablesAtEq *= "}"
-    println(dump, "Equation $e: involves: $(variablesAtEq): Eq $(BDAEUtil.string(e))\n")
+    println(dump, "Equation $e: involves: $(variablesAtEq)\n")
   end
   for (i, e) in enumerate(residualEquations)
     println(dump, string("Equation " * string(i) * ":" * string(e)))
@@ -602,7 +609,7 @@ function createEquationVariableBidirectionGraph(equations::AbstractVector,
                                                 allBackendVars::VARS,
                                                 stringToSimVarHT)::OrderedDict where{IF_EQS, WHEN_EQS, VARS}
   local eqCounter::Int = 0
-  local variableEqMapping = OrderedDict{String, Vector{Int}}()
+  local variableEqMapping = OrderedDict{Int, Vector{Int}}()
   local unknownVariables = filter((x) -> BDAEUtil.isVariable(x.varKind), allBackendVars)
   #=TODO: The set of discrete variables are currently not in use. =#
   local discreteVariables = filter((x) -> BDAEUtil.isDiscrete(x.varKind), allBackendVars)
@@ -630,7 +637,7 @@ function createEquationVariableBidirectionGraph(equations::AbstractVector,
     # for idx in indices
     #   println("\t", string(idx))
     # end
-    variableEqMapping["e$(eqCounter)"] = sort(indices)
+    variableEqMapping[eqCounter] = sort(indices)
   end
   #=
    There is an additional case to consider.
@@ -644,7 +651,7 @@ function createEquationVariableBidirectionGraph(equations::AbstractVector,
     for eq in ifEqBranch
       eqCounter += 1
       variablesForEq = Backend.BDAEUtil.getAllVariables(eq, varByName)
-      variableEqMapping["e$(eqCounter)"] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
+      variableEqMapping[eqCounter] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
     end
   end
   #=
@@ -664,7 +671,7 @@ function createEquationVariableBidirectionGraph(equations::AbstractVector,
       for wstmt in weq.whenEquation.whenStmtLst
         eqCounter += 1
         variablesForEq = BDAEUtil.getAllVariables(wstmt, algebraicAndStateVariables)
-        variableEqMapping["e$(eqCounter)"] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
+        variableEqMapping[eqCounter] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
       end
     else
       for wstmt in weq.whenEquation.whenStmtLst
@@ -675,7 +682,7 @@ function createEquationVariableBidirectionGraph(equations::AbstractVector,
           local simVar = getSimVarByName(refAsStr, stringToSimVarHT)
           eqCounter += 1
           variablesForEq = BDAEUtil.getAllVariables(wstmt, algebraicAndStateVariables)
-          variableEqMapping["e$(eqCounter)"] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
+          variableEqMapping[eqCounter] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
         end
       end
     end
@@ -696,7 +703,7 @@ function createEquationVariableBidirectionGraph(equations::RES_T,
                                                 allBackendVars::VECTOR_VAR,
                                                 stringToSimVarHT)::OrderedDict where{RES_T, VECTOR_VAR}
   local eqCounter::Int = 0
-  local variableEqMapping = OrderedDict{String, Vector{Int}}()
+  local variableEqMapping = OrderedDict{Int, Vector{Int}}()
   local unknownVariables = filter((x) -> BDAEUtil.isVariable(x.varKind), allBackendVars)
   local discreteVariables = filter((x) -> BDAEUtil.isDiscrete(x.varKind), allBackendVars)
   local stateVariables = filter((x) -> BDAEUtil.isState(x.varKind), allBackendVars)
@@ -711,7 +718,7 @@ function createEquationVariableBidirectionGraph(equations::RES_T,
   for eq in equations
     eqCounter += 1
     variablesForEq = Backend.BDAEUtil.getAllVariables(eq, varByName)
-    variableEqMapping["e$(eqCounter)"] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
+    variableEqMapping[eqCounter] = sort(getIndiciesOfVariables(variablesForEq, stringToSimVarHT))
   end
   return variableEqMapping
 end
@@ -1078,7 +1085,9 @@ function rebuildMatchOrder(simCode::SIM_CODE)
   #= Build the base name index for robust CREF extraction =#
   local baseNameToFullNames = buildBaseNameIndex(ht)
   #= Build bipartite adjacency: for each equation, which variable match indices does it reference? =#
-  local eqVarMapping = DataStructures.OrderedDict{String, Vector{Int}}()
+  #= Int-keyed: GraphAlgorithms.matching consumes only `.vals` positionally, so the
+     interpolated "e$(i)" string keys were pure allocation/hashing overhead. =#
+  local eqVarMapping = DataStructures.OrderedDict{Int, Vector{Int}}()
   for eqI in 1:nEqs
     local refs = collectEquationVarNames(toDAEExp(resEqs[eqI].exp), ht, baseNameToFullNames)
     local indices = Int[]
@@ -1087,7 +1096,7 @@ function rebuildMatchOrder(simCode::SIM_CODE)
         push!(indices, nameToMatchIdx[refName])
       end
     end
-    eqVarMapping["e$(eqI)"] = sort(unique(indices))
+    eqVarMapping[eqI] = sort(unique(indices))
   end
   #= The matching algorithm requires a square system (n used for both eq loop
      and assign array). For over-determined systems (nVars > nEqs), pad with
@@ -1101,7 +1110,7 @@ function rebuildMatchOrder(simCode::SIM_CODE)
   local nMatch = nVars
   if nVars > nEqs
     for dummyI in (nEqs + 1):nVars
-      eqVarMapping["e$(dummyI)"] = Int[]
+      eqVarMapping[dummyI] = Int[]
     end
   end
   local matchOrder::Vector{Int}
@@ -1128,30 +1137,66 @@ Returns `(outputOnlyVarNames::OrderedSet{String}, outputOnlyEqIndices::OrderedSe
 Variables in the returned set are purely "output" (they can be computed from states
 but do not feed back into any state derivative).
 """
-#= Recursively collect all CREF variable names referenced in a DAE expression. =#
-# SIM-native cref-name collection: walk the SIM tree directly via traverseExpTopDown
-# (no toDAEExp of the whole tree). The ASUB arm reconstructs the subscripted key
-# (e.g. "R_T[1][1]") so the use-def chain matches the scalarized hash-table keys.
-function _collectCrefNamesVisitor(@nospecialize(e), names::OrderedSet{String})
-  if e isa EXP_CREF
-    push!(names, DAE_identifierToString(toDAECref(e.cref).componentRef))
-  elseif e isa ASUB && e.exp isa EXP_CREF
-    local allConst = true
-    local sstr = ""
-    for s in e.subs
-      @match s begin
-        ICONST(i) => (sstr *= Base.string("[", i, "]"))
-        _ => (allConst = false)
+#= Pure read-only cref-name collector over the SIM Exp tree. Walks the tree and
+   pushes referenced names without reconstructing any nodes (unlike
+   traverseExpTopDown, which rebuilds the tree and allocates). The ASUB arm
+   reconstructs the subscripted key (e.g. "R_T[1][1]") so the use-def chain
+   matches the scalarized hash-table keys, then descends into the base (pushing
+   the bare name) and the subscripts. =#
+function collectCrefNames!(names::OrderedSet{String}, exp::Exp)
+  @match exp begin
+    EXP_CREF(__) => push!(names, DAE_identifierToString(toDAECref(exp.cref).componentRef))
+    BINARY(__) => begin collectCrefNames!(names, exp.exp1); collectCrefNames!(names, exp.exp2) end
+    LBINARY(__) => begin collectCrefNames!(names, exp.exp1); collectCrefNames!(names, exp.exp2) end
+    RELATION(__) => begin collectCrefNames!(names, exp.exp1); collectCrefNames!(names, exp.exp2) end
+    UNARY(__) => collectCrefNames!(names, exp.exp)
+    LUNARY(__) => collectCrefNames!(names, exp.exp)
+    CAST(__) => collectCrefNames!(names, exp.exp)
+    TSUB(__) => collectCrefNames!(names, exp.exp)
+    RSUB(__) => collectCrefNames!(names, exp.exp)
+    IFEXP(__) => begin
+      collectCrefNames!(names, exp.cond)
+      collectCrefNames!(names, exp.thenExp)
+      collectCrefNames!(names, exp.elseExp)
+    end
+    ARRAY_EXP(__) => begin for x in exp.elements; collectCrefNames!(names, x) end end
+    CALL(__) => begin for x in exp.args; collectCrefNames!(names, x) end end
+    RECORD(__) => begin for x in exp.exps; collectCrefNames!(names, x) end end
+    TUPLE(__) => begin for x in exp.PR; collectCrefNames!(names, x) end end
+    REDUCTION(__) => begin
+      collectCrefNames!(names, exp.body)
+      #= iterators carry DAE.ReductionIterator range/guard exps (passed through by
+         toDAEExp); collect their crefs to match the DAE collector exactly. =#
+      for it in exp.iterators
+        @match it begin
+          DAE.REDUCTIONITER(exp = rangeExp) => collectCrefNames!(names, rangeExp)
+          _ => ()
+        end
       end
     end
-    if allConst && !isempty(sstr)
-      push!(names, Base.string(DAE_identifierToString(toDAECref(e.exp.cref).componentRef), sstr))
+    ASUB(__) => begin
+      if exp.exp isa EXP_CREF
+        local allConst = true
+        local sstr = ""
+        for s in exp.subs
+          @match s begin
+            ICONST(i) => (sstr *= Base.string("[", i, "]"))
+            _ => (allConst = false)
+          end
+        end
+        if allConst && !isempty(sstr)
+          push!(names, Base.string(DAE_identifierToString(toDAECref(exp.exp.cref).componentRef), sstr))
+        end
+      end
+      collectCrefNames!(names, exp.exp)
+      for s in exp.subs
+        collectCrefNames!(names, s)
+      end
     end
+    _ => ()
   end
-  return (e, true, names)
+  return names
 end
-collectCrefNames!(names::OrderedSet{String}, exp::Exp) =
-  (traverseExpTopDown(exp, _collectCrefNamesVisitor, names); names)
 
 function collectCrefNames!(names::OrderedSet{String}, @nospecialize(exp))
   @match exp begin
@@ -3467,7 +3512,7 @@ function propagateConstants(simCode::SIM_CODE)
   local allBaseNames = OrderedSet{String}()
   for eq in resEqs
     local eqNames = OrderedSet{String}()
-    collectCrefNames!(eqNames, toDAEExp(eq.exp))
+    collectCrefNames!(eqNames, eq.exp)
     for n in eqNames
       if !occursin('[', n)
         push!(allBaseNames, n)
@@ -3560,6 +3605,10 @@ function propagateConstants(simCode::SIM_CODE)
   local newResEqs = RESIDUAL_EQUATION[]
   local elimPairs = Tuple{String, RESIDUAL_EQUATION, RESIDUAL_EQUATION}[]
   sizehint!(newResEqs, nEqs - length(allRemoved))
+  #= Collect surviving cref names from the substituted expressions as we build
+     them, avoiding a second full traversal (and toDAEExp reconversion) in
+     Phase 3. =#
+  local allRefNames = OrderedSet{String}()
 
   for (i, eq) in enumerate(simCode.residualEquations)
     if i in allRemoved
@@ -3569,6 +3618,7 @@ function propagateConstants(simCode::SIM_CODE)
       end
     else
       local (newExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
+      collectCrefNames!(allRefNames, newExp)
       push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
     end
   end
@@ -3581,6 +3631,7 @@ function propagateConstants(simCode::SIM_CODE)
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
         local (newBrExp, _) = traverseExpTopDown(brEq.exp, substituteAliasCref, constMap)
+        collectCrefNames!(allRefNames, newBrExp)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
       local (newCond, _) = traverseExpTopDown(branch.condition, substituteAliasCref, constMap)
@@ -3612,44 +3663,28 @@ function propagateConstants(simCode::SIM_CODE)
   for initEq in simCode.initialEquations
     if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
       local (newInitExp, _) = Util.traverseExpTopDown(toDAEExp(initEq.exp), substituteAliasCref, constMap)
+      collectCrefNames!(allRefNames, newInitExp)
       push!(newInitEqs, typeof(initEq)(newInitExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
       local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteAliasCref, constMap)
       local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteAliasCref, constMap)
+      collectCrefNames!(allRefNames, newLhs)
+      collectCrefNames!(allRefNames, newRhs)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
     elseif initEq isa EQUATION
       local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteAliasCref, constMap)
       local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteAliasCref, constMap)
+      collectCrefNames!(allRefNames, newLhs)
+      collectCrefNames!(allRefNames, newRhs)
       push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
     else
       push!(newInitEqs, initEq)
     end
   end
 
-  #= Phase 3: Verify and remove eliminated unknowns =#
+  #= Phase 3: Verify and remove eliminated unknowns. Surviving refs from
+     residual/if/init expressions were collected inline during substitution. =#
   local eliminatedSet = OrderedSet{String}(keys(constMap))
-  local allRefNames = OrderedSet{String}()
-  for eq in newResEqs
-    collectCrefNames!(allRefNames, toDAEExp(eq.exp))
-  end
-  for ifEq in newIfEqs
-    for branch in ifEq.branches
-      for brEq in branch.residualEquations
-        collectCrefNames!(allRefNames, toDAEExp(brEq.exp))
-      end
-    end
-  end
-  for initEq in newInitEqs
-    if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
-      collectCrefNames!(allRefNames, toDAEExp(initEq.exp))
-    elseif initEq isa BDAE.EQUATION
-      collectCrefNames!(allRefNames, toDAEExp(initEq.lhs))
-      collectCrefNames!(allRefNames, toDAEExp(initEq.rhs))
-    elseif initEq isa EQUATION
-      collectCrefNames!(allRefNames, toDAEExp(initEq.lhs))
-      collectCrefNames!(allRefNames, toDAEExp(initEq.rhs))
-    end
-  end
 
   #= Also scan when-equation conditions and statement bodies for surviving
      references (mirrors eliminateAliasVariables). Without this, a constant-bound
@@ -4125,21 +4160,21 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   local survivingRefs = OrderedSet{String}()
   local allRefNames = OrderedSet{String}()
   for eq in newResEqs
-    collectCrefNames!(allRefNames, toDAEExp(eq.exp))
+    collectCrefNames!(allRefNames, eq.exp)
   end
   for ifEq in newIfEqs
     for branch in ifEq.branches
       for brEq in branch.residualEquations
-        collectCrefNames!(allRefNames, toDAEExp(brEq.exp))
+        collectCrefNames!(allRefNames, brEq.exp)
       end
     end
   end
   for initEq in newInitEqs
     if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
-      collectCrefNames!(allRefNames, toDAEExp(initEq.exp))
+      collectCrefNames!(allRefNames, initEq.exp)
     elseif initEq isa BDAE.EQUATION || initEq isa EQUATION
-      collectCrefNames!(allRefNames, toDAEExp(initEq.lhs))
-      collectCrefNames!(allRefNames, toDAEExp(initEq.rhs))
+      collectCrefNames!(allRefNames, initEq.lhs)
+      collectCrefNames!(allRefNames, initEq.rhs)
     end
   end
   for ia in newInitialAlgs
@@ -4422,17 +4457,17 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   local untouchable = OrderedSet{String}()
   for eq in simCode.initialEquations
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(untouchable, toDAEExp(eq.exp))
+      collectCrefNames!(untouchable, eq.exp)
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(untouchable, toDAEExp(eq.lhs))
-      collectCrefNames!(untouchable, toDAEExp(eq.rhs))
+      collectCrefNames!(untouchable, eq.lhs)
+      collectCrefNames!(untouchable, eq.rhs)
     end
   end
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
       collectCrefNames!(untouchable, branch.condition)
       for brEq in branch.residualEquations
-        collectCrefNames!(untouchable, toDAEExp(brEq.exp))
+        collectCrefNames!(untouchable, brEq.exp)
       end
     end
   end
@@ -4448,7 +4483,7 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
     _collectIfexpConditionCrefs!(untouchable, toDAEExp(eq.exp))
   end
   for eq in simCode.eliminatedEquations
-    collectCrefNames!(untouchable, toDAEExp(eq.exp))
+    collectCrefNames!(untouchable, eq.exp)
   end
   _collectFunctionBodyCrefs!(untouchable, simCode.functions)
 
@@ -4456,12 +4491,17 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   local nEqs = length(simCode.residualEquations)
   local eqRefs = Vector{OrderedSet{String}}(undef, nEqs)
   local refCount = Dict{String, Int}()
+  #= Inverted index name -> ascending equation indices referencing it, built in the
+     same pass. Replaces the O(nEqs) linear scan for a candidate's defining equation
+     with an O(degree) lookup; ascending insertion preserves the old first-match. =#
+  local varToEqs = Dict{String, Vector{Int}}()
   for i in 1:nEqs
     local s = OrderedSet{String}()
-    collectCrefNames!(s, toDAEExp(simCode.residualEquations[i].exp))
+    collectCrefNames!(s, simCode.residualEquations[i].exp)
     eqRefs[i] = s
     for n in s
       refCount[n] = get(refCount, n, 0) + 1
+      push!(get!(() -> Int[], varToEqs, n), i)
     end
   end
 
@@ -4479,11 +4519,9 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
       nref <= 1 || continue
       local definingEq = -1
       if nref == 1
-        for i in 1:nEqs
+        for i in get(varToEqs, name, Int[])
           i in droppedEqs && continue
-          if name in eqRefs[i]
-            definingEq = i; break
-          end
+          definingEq = i; break
         end
       end
       if definingEq > 0
@@ -4525,21 +4563,21 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
      surface. Anything not in this set is dead. =#
   local referenced = OrderedSet{String}()
   for eq in simCode.residualEquations
-    collectCrefNames!(referenced, toDAEExp(eq.exp))
+    collectCrefNames!(referenced, eq.exp)
   end
   for eq in simCode.initialEquations
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(referenced, toDAEExp(eq.exp))
+      collectCrefNames!(referenced, eq.exp)
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(referenced, toDAEExp(eq.lhs))
-      collectCrefNames!(referenced, toDAEExp(eq.rhs))
+      collectCrefNames!(referenced, eq.lhs)
+      collectCrefNames!(referenced, eq.rhs)
     end
   end
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
       collectCrefNames!(referenced, branch.condition)
       for brEq in branch.residualEquations
-        collectCrefNames!(referenced, toDAEExp(brEq.exp))
+        collectCrefNames!(referenced, brEq.exp)
       end
     end
   end
@@ -4547,7 +4585,7 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
     _collectWhenCrefNames!(referenced, whenEq.whenEquation)
   end
   for eq in simCode.eliminatedEquations
-    collectCrefNames!(referenced, toDAEExp(eq.exp))
+    collectCrefNames!(referenced, eq.exp)
   end
   for entry in simCode.aliasMap
     push!(referenced, entry.representativeName)
@@ -4586,12 +4624,16 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
       _ => nothing
     end
   end
-  for htKey in keys(ht)
-    local bracketIdx = findfirst('[', htKey)
-    bracketIdx === nothing && continue
-    local baseName = htKey[1:bracketIdx-1]
-    if baseName in dsArrayBaseNames
-      push!(referenced, htKey)
+  #= Only scan HT keys for scalarized DS-array elements when there are DS-array
+     bases to match; otherwise this whole-HT scan does nothing. =#
+  if !isempty(dsArrayBaseNames)
+    for htKey in keys(ht)
+      local bracketIdx = findfirst('[', htKey)
+      bracketIdx === nothing && continue
+      local baseName = htKey[1:bracketIdx-1]
+      if baseName in dsArrayBaseNames
+        push!(referenced, htKey)
+      end
     end
   end
 
@@ -4660,10 +4702,10 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   end
   for eq in simCode.initialEquations
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(protectedNames, toDAEExp(eq.exp))
+      collectCrefNames!(protectedNames, eq.exp)
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(protectedNames, toDAEExp(eq.lhs))
-      collectCrefNames!(protectedNames, toDAEExp(eq.rhs))
+      collectCrefNames!(protectedNames, eq.lhs)
+      collectCrefNames!(protectedNames, eq.rhs)
     end
   end
   #= IFEXP conditions inside residual equations and parameter bindings. =#
@@ -4699,12 +4741,16 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
       _ => nothing
     end
   end
-  for htKey in keys(ht)
-    local bracketIdx = findfirst('[', htKey)
-    bracketIdx === nothing && continue
-    local baseName = htKey[1:bracketIdx-1]
-    if baseName in dsArrayBaseNames
-      push!(protectedNames, htKey)
+  #= Only scan HT keys for scalarized DS-array elements when there are DS-array
+     bases to match; otherwise this whole-HT scan does nothing. =#
+  if !isempty(dsArrayBaseNames)
+    for htKey in keys(ht)
+      local bracketIdx = findfirst('[', htKey)
+      bracketIdx === nothing && continue
+      local baseName = htKey[1:bracketIdx-1]
+      if baseName in dsArrayBaseNames
+        push!(protectedNames, htKey)
+      end
     end
   end
 
@@ -4846,20 +4892,20 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
      somehow survived substitution (unflatten form, etc.), keep the param. =#
   local survivorCheck = OrderedSet{String}()
   for eq in newResiduals
-    collectCrefNames!(survivorCheck, toDAEExp(eq.exp))
+    collectCrefNames!(survivorCheck, eq.exp)
   end
   for eq in newInitials
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(survivorCheck, toDAEExp(eq.exp))
+      collectCrefNames!(survivorCheck, eq.exp)
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(survivorCheck, toDAEExp(eq.lhs))
-      collectCrefNames!(survivorCheck, toDAEExp(eq.rhs))
+      collectCrefNames!(survivorCheck, eq.lhs)
+      collectCrefNames!(survivorCheck, eq.rhs)
     end
   end
   for ifEq in newIfEquations
     for branch in ifEq.branches
       for brEq in branch.residualEquations
-        collectCrefNames!(survivorCheck, toDAEExp(brEq.exp))
+        collectCrefNames!(survivorCheck, brEq.exp)
       end
       collectCrefNames!(survivorCheck, branch.condition)
     end
@@ -5068,7 +5114,7 @@ separately via the equation walk; we only protect parameters that gate
 the trigger.
 """
 function _collectWhenConditionCrefs!(out::OrderedSet{String}, whenStmts::WHEN_STMTS)
-  collectCrefNames!(out, toDAEExp(whenStmts.condition))
+  collectCrefNames!(out, whenStmts.condition)
   if whenStmts.elsewhenPart !== nothing
     _collectWhenConditionCrefs!(out, whenStmts.elsewhenPart)
   end
@@ -5076,7 +5122,7 @@ function _collectWhenConditionCrefs!(out::OrderedSet{String}, whenStmts::WHEN_ST
 end
 
 function _collectWhenConditionCrefs!(out::OrderedSet{String}, whenStmts::BDAE.WHEN_STMTS)
-  collectCrefNames!(out, toDAEExp(whenStmts.condition))
+  collectCrefNames!(out, whenStmts.condition)
   @match whenStmts.elsewhenPart begin
     SOME(inner) => _collectWhenConditionCrefs!(out, inner)
     _ => nothing
@@ -5484,7 +5530,7 @@ end
 Collect all CREF names from a WHEN_STMTS node (condition + statements + elsewhen).
 """
 function _collectWhenCrefNames!(names::OrderedSet{String}, whenStmts::WHEN_STMTS)
-  collectCrefNames!(names, toDAEExp(whenStmts.condition))
+  collectCrefNames!(names, whenStmts.condition)
   for stmt in whenStmts.whenStmtLst
     if stmt isa ASSIGN
       collectCrefNames!(names, stmt.left)
@@ -5506,7 +5552,7 @@ function _collectWhenCrefNames!(names::OrderedSet{String}, whenStmts::WHEN_STMTS
 end
 
 function _collectWhenCrefNames!(names::OrderedSet{String}, whenStmts::BDAE.WHEN_STMTS)
-  collectCrefNames!(names, toDAEExp(whenStmts.condition))
+  collectCrefNames!(names, whenStmts.condition)
   for stmt in whenStmts.whenStmtLst
     @match stmt begin
       BDAE.ASSIGN(__) => begin
@@ -5535,19 +5581,19 @@ end
 function _collectInitialAlgorithmCrefNames!(names::OrderedSet{String}, ia::INITIAL_ALGORITHM)
   for stmt in ia.statements
     if stmt isa ASSIGN
-      collectCrefNames!(names, toDAEExp(stmt.left))
-      collectCrefNames!(names, toDAEExp(stmt.right))
+      collectCrefNames!(names, stmt.left)
+      collectCrefNames!(names, stmt.right)
     elseif stmt isa REINIT
-      collectCrefNames!(names, toDAEExp(stmt.stateVar))
-      collectCrefNames!(names, toDAEExp(stmt.value))
+      collectCrefNames!(names, stmt.stateVar)
+      collectCrefNames!(names, stmt.value)
     elseif stmt isa NORETCALL
-      collectCrefNames!(names, toDAEExp(stmt.exp))
+      collectCrefNames!(names, stmt.exp)
     elseif stmt isa ASSERT
-      collectCrefNames!(names, toDAEExp(stmt.condition))
-      collectCrefNames!(names, toDAEExp(stmt.message))
-      collectCrefNames!(names, toDAEExp(stmt.level))
+      collectCrefNames!(names, stmt.condition)
+      collectCrefNames!(names, stmt.message)
+      collectCrefNames!(names, stmt.level)
     elseif stmt isa TERMINATE
-      collectCrefNames!(names, toDAEExp(stmt.message))
+      collectCrefNames!(names, stmt.message)
     end
   end
   _walkStatementsForCrefs!(names, ia.daeStatements)
@@ -6030,7 +6076,7 @@ function _recomputeSCCsFromSimCode(simCode::SIM_CODE)
   local incidence = Vector{OrderedSet{String}}(undef, n_eqs)
   for (i, eq) in enumerate(res)
     local names = OrderedSet{String}()
-    collectCrefNames!(names, toDAEExp(eq.exp))
+    collectCrefNames!(names, eq.exp)
     incidence[i] = intersect(names, surviving)
   end
   local var_to_eq = Dict{String, Int}()
@@ -6755,7 +6801,7 @@ function _computeFrozenProtectedNames(simCode::SIM_CODE)::OrderedSet{String}
     for branch in ifEq.branches
       collectCrefNames!(protectedNames, branch.condition)
       for brEq in branch.residualEquations
-        collectCrefNames!(protectedNames, toDAEExp(brEq.exp))
+        collectCrefNames!(protectedNames, brEq.exp)
       end
     end
   end
@@ -7189,26 +7235,26 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
   local foldKeys = OrderedSet{String}(keys(foldMap))
   local survivorNames = OrderedSet{String}()
   for eq in newResEqs
-    collectCrefNames!(survivorNames, toDAEExp(eq.exp))
+    collectCrefNames!(survivorNames, eq.exp)
   end
   for eq in newInitEqs
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(survivorNames, toDAEExp(eq.exp))
+      collectCrefNames!(survivorNames, eq.exp)
     elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(survivorNames, toDAEExp(eq.lhs))
-      collectCrefNames!(survivorNames, toDAEExp(eq.rhs))
+      collectCrefNames!(survivorNames, eq.lhs)
+      collectCrefNames!(survivorNames, eq.rhs)
     end
   end
   for ifEq in newIfEqs
     for branch in ifEq.branches
       collectCrefNames!(survivorNames, branch.condition)
       for brEq in branch.residualEquations
-        collectCrefNames!(survivorNames, toDAEExp(brEq.exp))
+        collectCrefNames!(survivorNames, brEq.exp)
       end
     end
   end
   for eq in newElimEqs
-    collectCrefNames!(survivorNames, toDAEExp(eq.exp))
+    collectCrefNames!(survivorNames, eq.exp)
   end
   for whenEq in simCode.whenEquations
     _collectWhenCrefNames!(survivorNames, whenEq.whenEquation)
