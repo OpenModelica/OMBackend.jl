@@ -111,6 +111,7 @@ end
 const COMPONENT_SEPARATOR = "_"
 
 function _joinCanonicalSegments(segs)::String
+  length(segs) == 1 && return String(segs[1])
   return join((String(s) for s in segs), COMPONENT_SEPARATOR)
 end
 
@@ -126,6 +127,7 @@ function _canonicalIdentSegments(ident::AbstractString)::Vector{String}
 end
 
 function _subscriptSuffix(subscriptLst)::String
+  iterate(subscriptLst) === nothing && return ""
   local buf = IOBuffer()
   for s in subscriptLst
     print(buf, "[")
@@ -149,20 +151,23 @@ end
 
 function _canonicalCrefSegments(cr::DAE.CREF_IDENT)
   local segs = _canonicalIdentSegments(cr.ident)
-  segs[end] = string(segs[end], _subscriptSuffix(cr.subscriptLst))
+  local suffix = _subscriptSuffix(cr.subscriptLst)
+  isempty(suffix) || (segs[end] = string(segs[end], suffix))
   return segs
 end
 
 function _canonicalCrefSegments(cr::DAE.CREF_QUAL)
   local segs = _canonicalIdentSegments(cr.ident)
-  segs[end] = string(segs[end], _subscriptSuffix(cr.subscriptLst))
+  local suffix = _subscriptSuffix(cr.subscriptLst)
+  isempty(suffix) || (segs[end] = string(segs[end], suffix))
   return vcat(segs,
               _canonicalCrefSegments(cr.componentRef))
 end
 
 function _canonicalCrefSegments(cr::DAE.CREF_ITER)
   local segs = _canonicalIdentSegments(cr.ident)
-  segs[end] = string(segs[end], _subscriptSuffix(cr.subscriptLst))
+  local suffix = _subscriptSuffix(cr.subscriptLst)
+  isempty(suffix) || (segs[end] = string(segs[end], suffix))
   return segs
 end
 
@@ -179,7 +184,9 @@ function canonicalName(name::AbstractString)::String
     return s
   end
   if occursin('.', s)
-    return _joinCanonicalSegments(split(s, '.'))
+    #= Equivalent to joining the '.'-split segments with '_', in a single pass
+       without the intermediate segment vector. =#
+    return replace(s, '.' => '_')
   end
   return s
 end
