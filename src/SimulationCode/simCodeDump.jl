@@ -395,14 +395,14 @@ function Base.string(ieq::SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUAT
   "STRUCTURAL_DOCC_IF_EQUATION: " * string(ieq.ifEquation) * "\n"
 end
 
-function string(st::IMPLICIT_STRUCTURAL_TRANSISTION)
+function string(st::IMPLICIT_STRUCTURAL_TRANSITION)
   "STRUCTURAL_WHEN_EQUATION:\n" * string(st.whenEquation)
 end
 
-function Base.string(simStructChange::SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION)
+function Base.string(simStructChange::SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION)
   return "STRUCTURAL_TRANSITION: FROM: <" * simStructChange.fromState *
          "> TO: <" * simStructChange.toState *
-         "> WHEN: " * string(simStructChange.transistionCondition) * "\n"
+         "> WHEN: " * string(simStructChange.transitionCondition) * "\n"
 end
 
 function string(f::EXTERNAL_MODELICA_FUNCTION)

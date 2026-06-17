@@ -2334,7 +2334,7 @@ function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode,
   local conds = Any[]
   local closed = Bool[]
   for b in condBranches
-    push!(conds, transformToMTKContinousConditionEquation(b.condition, simCode))
+    push!(conds, transformToMTKContinuousConditionEquation(b.condition, simCode))
     push!(closed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
   end
   local valMap = nothing
@@ -2417,7 +2417,7 @@ function createIfEquation(stateVariables::Vector,
   for b in ifEq.branches
     b.identifier == -1 && continue
     try
-      local mc = transformToMTKContinousConditionEquation(b.condition, simCode)
+      local mc = transformToMTKContinuousConditionEquation(b.condition, simCode)
       push!(allZcs, _extractZeroCrossingLHS(mc))
       push!(allClosed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
     catch
@@ -2457,7 +2457,7 @@ function createIfEquation(stateVariables::Vector,
       end
       SimulationCode.BRANCH(condition, residuals, _, targets, _, _, _, _, _) => begin
         condIdx += 1
-        local mtkCond = transformToMTKContinousConditionEquation(branch.condition, simCode)
+        local mtkCond = transformToMTKContinuousConditionEquation(branch.condition, simCode)
         #= Evaluate the initial value condition; the original operator decides
            the zc == 0 boundary. Precomputed via the relay-aware fixed point. =#
         local _closedB = MTK_CodeGenerationUtil.condClosedAtBoundary(branch.condition)
@@ -3383,13 +3383,13 @@ function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
     isempty(modN.args[1].args) && continue
     local (fnI, obsI, modI) = _selfSchedAffectParts(weq, simCode; atInit = true)
     for rel in rels
-      #= transformToMTKContinousCondition emits `pre(nextTimeEvent) - time` for
+      #= transformToMTKContinuousCondition emits `pre(nextTimeEvent) - time` for
          `time >= pre(nextTimeEvent)`, which falls through zero as time reaches
          the event. Negate so the crossing RISES through zero exactly when the
          Modelica condition becomes true (the when's rising edge), and fire only
          on that positive edge (affect_neg = nothing). A monotone time event is
          one-directional, so a single edge is correct and avoids double-firing. =#
-      local zc = transformToMTKContinousCondition(rel, simCode)
+      local zc = transformToMTKContinuousCondition(rel, simCode)
       push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
         (-($(zc)) ~ 0),
         ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs));
@@ -3414,7 +3414,7 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
     local isEdge = _isEdgeWhenCondition(weq.whenEquation.condition)
     local assigns = _gatherClusterAssigns(weq, simCode)
     assigns === nothing && continue
-    #= One callback per relation in the cluster. transformToMTKContinousCondition
+    #= One callback per relation in the cluster. transformToMTKContinuousCondition
        normalises zc so relation-TRUE ⟺ zc<0: the `=>` affect is the up-crossing
        (relation becomes FALSE) and affect_neg the down-crossing (relation becomes
        TRUE). Each callback rewrites the WHOLE ordered cluster with THIS relation
@@ -3429,7 +3429,7 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
     local hasInit = _condHasInitial(weq.whenEquation.condition)
     local affInit = Expr[_discreteAffectEqInit(d, r, ii, simCode) for (d, r, ii) in assigns]
     for (relIdx, rel) in enumerate(rels)
-      local zc = transformToMTKContinousCondition(rel, simCode)
+      local zc = transformToMTKContinuousCondition(rel, simCode)
       if preMem
         #= Live ImperativeAffects that commit to DISCRETE_PRE_MEM so a dt=0
            cascade across the cluster's callbacks latches. The FIRING relation
@@ -3748,7 +3748,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
      ARRAY_PARAMETERs in HT so we only emit parents that actually exist. =#
   local _residualCrefs = OrderedSet{String}()
   for eq in simCode.residualEquations
-    SimulationCode.collectCrefNames!(_residualCrefs, SimulationCode.toDAEExp(eq.exp))
+    SimulationCode.collectCrefNames!(_residualCrefs, eq.exp)
   end
   for _n in _residualCrefs
     local _bracket = findfirst('[', _n)

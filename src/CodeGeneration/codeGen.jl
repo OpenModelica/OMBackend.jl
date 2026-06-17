@@ -743,7 +743,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     DAE.CALL(Absyn.IDENT("sample"), args, attrs) => true
     _ => false
   end
-  local isContinuousCond::Bool = isContinousCondition(wEqCondDAE, simCode)
+  local isContinuousCond::Bool = isContinuousCondition(wEqCondDAE, simCode)
   #= Table / time-driven sources: a when whose condition is purely change(time>=c)
      thresholds must fire AT those times via PresetTimeCallback — a ContinuousCallback
      rootfinding on the spiky change() value never detects the crossings. =#
@@ -760,7 +760,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     end
   end
   #= A `sample(start, period)` is a periodic clock even when its interval is a
-     parameter, which isContinousCondition mis-flags as continuous; keep all
+     parameter, which isContinuousCondition mis-flags as continuous; keep all
      samples on the periodic branch. =#
   if isContinuousCond && !isPeriodic
     local isElseIf = if wEq.elsewhenPart !== nothing

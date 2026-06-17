@@ -372,12 +372,12 @@ function createSimCodeStructuralTransitions(structuralTransitions::Vector{ST}) w
   local transitions = StructuralTransition[]
   for st in structuralTransitions
     sst = @match st begin
-      BDAE.STRUCTURAL_TRANSISTION(__) =>
-        SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION(st.fromState,
+      BDAE.STRUCTURAL_TRANSITION(__) =>
+        SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION(st.fromState,
                                                       st.toState,
-                                                      st.transistionCondition)
+                                                      st.transitionCondition)
       BDAE.STRUCTURAL_WHEN_EQUATION(__) =>
-        SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION(st.size,
+        SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION(st.size,
                                                       SimulationCode.toWhenStmts(st.whenEquation),
                                                       st.source,
                                                       SimulationCode.toEqAttr(st.attr))
@@ -737,7 +737,7 @@ function allocateAndCollectSimulationEquations(equations::T,
       push!(initialWhenEquations, eq)
     elseif eqType === BDAE.IF_EQUATION
       push!(ifEquations, eq)
-    elseif eqType === BDAE.STRUCTURAL_TRANSISTION || eqType === BDAE.STRUCTURAL_WHEN_EQUATION
+    elseif eqType === BDAE.STRUCTURAL_TRANSITION || eqType === BDAE.STRUCTURAL_WHEN_EQUATION
       push!(structuralTransitions, eq)
     elseif eqType === BDAE.ALGORITHM
       _algorithmToResiduals!(regularEquations, eq)

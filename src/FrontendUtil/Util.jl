@@ -33,7 +33,7 @@ Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @n
     local attr::DAE.CallAttributes
     local cr::DAE.ComponentRef
     local cr_1::DAE.ComponentRef
-    local dim::ModelicaInteger
+    local dim::Int
     local e1::DAE.Exp
     local e1_1::DAE.Exp
     local e2::DAE.Exp
@@ -52,9 +52,9 @@ Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @n
     local ext_arg_3::Type_a
     local fieldNames::List{String}
     local fn::Absyn.Path
-    local i::ModelicaInteger
-    local index_::ModelicaInteger
-    local isExpisASUB::Option{Tuple{DAE.Exp, ModelicaInteger, ModelicaInteger}}
+    local i::Int
+    local index_::Int
+    local isExpisASUB::Option{Tuple{DAE.Exp, Int, Int}}
     local lstexpl::List{List{DAE.Exp}}
     local lstexpl_1::List{List{DAE.Exp}}
     local op::DAE.Operator
@@ -160,22 +160,22 @@ Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @n
 
       (DAE.CALL(path = fn, expLst = expl, attr = attr), rel, ext_arg)  => begin
         (expl_1, ext_arg_1) = traverseExpListTopDown(expl, rel, ext_arg)
-        (DAE.CALL(fn, expl_1, attr), ext_arg_1)
+        (referenceEq(expl, expl_1) ? inExp : DAE.CALL(fn, expl_1, attr), ext_arg_1)
       end
 
       (DAE.RECORD(path = fn, exps = expl, comp = fieldNames, ty = tp), rel, ext_arg)  => begin
         (expl_1, ext_arg_1) = traverseExpListTopDown(expl, rel, ext_arg)
-        (DAE.RECORD(fn, expl_1, fieldNames, tp), ext_arg_1)
+        (referenceEq(expl, expl_1) ? inExp : DAE.RECORD(fn, expl_1, fieldNames, tp), ext_arg_1)
       end
 
       (DAE.PARTEVALFUNCTION(fn, expl, tp, t), rel, ext_arg)  => begin
         (expl_1, ext_arg_1) = traverseExpListTopDown(expl, rel, ext_arg)
-        (DAE.PARTEVALFUNCTION(fn, expl_1, tp, t), ext_arg_1)
+        (referenceEq(expl, expl_1) ? inExp : DAE.PARTEVALFUNCTION(fn, expl_1, tp, t), ext_arg_1)
       end
 
       (DAE.ARRAY(ty = tp, scalar = scalar, array = expl), rel, ext_arg)  => begin
         (expl_1, ext_arg_1) = traverseExpListTopDown(expl, rel, ext_arg)
-        (DAE.ARRAY(tp, scalar, expl_1), ext_arg_1)
+        (referenceEq(expl, expl_1) ? inExp : DAE.ARRAY(tp, scalar, expl_1), ext_arg_1)
       end
 
       (DAE.MATRIX(ty = tp, integer = dim, matrix = lstexpl), rel, ext_arg)  => begin
@@ -206,7 +206,7 @@ Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @n
 
       (DAE.TUPLE(PR = expl), rel, ext_arg)  => begin
         (expl_1, ext_arg_1) = traverseExpListTopDown(expl, rel, ext_arg)
-        (DAE.TUPLE(expl_1), ext_arg_1)
+        (referenceEq(expl, expl_1) ? inExp : DAE.TUPLE(expl_1), ext_arg_1)
       end
 
       (DAE.CAST(ty = tp, exp = e1), rel, ext_arg)  => begin
@@ -276,7 +276,7 @@ Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @n
 
      (DAE.LIST(expl), rel, ext_arg)  => begin
        (expl_1, ext_arg_1) = traverseExpListTopDown(expl, rel, ext_arg)
-       (DAE.LIST(expl_1), ext_arg_1)
+       (referenceEq(expl, expl_1) ? inExp : DAE.LIST(expl_1), ext_arg_1)
      end
 
      (DAE.UNBOX(e1, tp), rel, ext_arg)  => begin
@@ -308,17 +308,31 @@ end
 
 function traverseExpListTopDown(expLst::List{DAE.Exp}, func::Function, inArg)
   outArg = inArg
-  newExpLst = DAE.Exp[]
-  allEqual = true
+  #= Allocate the result buffer lazily: a read-only or no-op traversal leaves
+     every element identity-equal, so the common case allocates nothing and
+     returns the original list. =#
+  local newExpLst::Union{Nothing, Vector{DAE.Exp}} = nothing
+  local i = 0
   for e in expLst
+    i += 1
     (newE, outArg) = traverseExpTopDown(e, func, outArg)
-    push!(newExpLst, newE)
-    if !referenceEq(e, newE)
-      allEqual = false
+    if newExpLst === nothing
+      if !referenceEq(e, newE)
+        #= First change: materialize the unchanged prefix, then this element. =#
+        newExpLst = DAE.Exp[]
+        local j = 0
+        for pe in expLst
+          j += 1
+          j < i || break
+          push!(newExpLst, pe)
+        end
+        push!(newExpLst, newE)
+      end
+    else
+      push!(newExpLst, newE)
     end
   end
-  #= Return original list if nothing changed to preserve identity =#
-  return allEqual ? (expLst, outArg) : (list(newExpLst...), outArg)
+  return newExpLst === nothing ? (expLst, outArg) : (list(newExpLst...), outArg)
 end
 
 """
@@ -425,7 +439,7 @@ function traverseExpTopDownSubs(inSubscript::List{<:DAE.Subscript}, rel::Functio
   local arg::Argument = iarg
   local acc::Vector{DAE.Subscript}
   local exp::DAE.Exp
-  local nEq::ModelicaInteger = 0
+  local nEq::Int = 0
   local nsub::DAE.Subscript
   local outSubscript::List{DAE.Subscript}
 
@@ -529,10 +543,10 @@ Base.@nospecializeinfer function traverseExpBottomUp(@nospecialize(inExp::DAE.Ex
     local scalar::Bool
     local tp::DAE.Type
     local t::DAE.Type
-    local i::Integer
+    local i::Int
     local lstexpl_1::List{List{DAE.Exp}}
     local lstexpl::List{List{DAE.Exp}}
-    local dim::Integer
+    local dim::Int
     local str::String
     local localDecls::List{DAE.Element}
     local fieldNames::List{String}
@@ -540,8 +554,8 @@ Base.@nospecializeinfer function traverseExpBottomUp(@nospecialize(inExp::DAE.Ex
     local cases::List{DAE.MatchCase}
     local cases_1::List{DAE.MatchCase}
     local matchTy::DAE.MatchType
-    local index_::Integer
-    local isExpisASUB::Option{Tuple{DAE.Exp, Integer, Integer}}
+    local index_::Int
+    local isExpisASUB::Option{Tuple{DAE.Exp, Int, Int}}
     local reductionInfo::DAE.ReductionInfo
     local riters::DAE.ReductionIterators
     local riters_1::DAE.ReductionIterators
@@ -1032,7 +1046,7 @@ function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::T) ::Tup
     local subs::List{DAE.Subscript}
     local subs_1::List{DAE.Subscript}
     local arg::Type_a
-    local ix::Integer
+    local ix::Int
     local instant::String
     @match (inCref, rel, iarg) begin
       (DAE.CREF_QUAL(ident = name, identType = ty, subscriptLst = subs, componentRef = cr), _, arg)  => begin

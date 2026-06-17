@@ -29,7 +29,7 @@ function ensureAlgArrayLength!(arr::Vector, idx)
 end
 ensureAlgArrayLength!(arr, idx) = arr
 
-_algAssignedMaxIndex(idx::Integer) = Int(idx)
+_algAssignedMaxIndex(idx::Int) = Int(idx)
 _algAssignedMaxIndex(idx::AbstractUnitRange) = isempty(idx) ? 0 : Int(last(idx))
 _algAssignedMaxIndex(idx::Colon) = 0
 function _algAssignedMaxIndex(idx)

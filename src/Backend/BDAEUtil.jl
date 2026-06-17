@@ -352,10 +352,10 @@ Base.@nospecializeinfer function traverseEquationExpressions(@nospecialize(eq::B
          end
          (eq, extArg)
        end
-       BDAE.STRUCTURAL_TRANSISTION(__) => begin
-         local cond = eq.transistionCondition
+       BDAE.STRUCTURAL_TRANSITION(__) => begin
+         local cond = eq.transitionCondition
          (cond, extArg) = Util.traverseExpTopDown(cond, traversalOperation, extArg)
-         @assign eq.transistionCondition = cond
+         @assign eq.transitionCondition = cond
          (eq, extArg)
        end
        _ => begin

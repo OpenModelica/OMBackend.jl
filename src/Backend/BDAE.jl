@@ -173,7 +173,7 @@ using ExportAll
   - `BRANCH(ar, br)` — `Connections.branch(ar, br)`.
   - `STRUCTURAL_IF_EQUATION(ifEquation)` — DOCC if-equation preserved as a
     frontend `EQUATION_IF` so the runtime can replay the branch choice.
-  - `STRUCTURAL_TRANSISTION(fromState, toState, transistionCondition)` —
+  - `STRUCTURAL_TRANSITION(fromState, toState, transitionCondition)` —
     VSS transition; a structural callback is generated from the condition.
     (Name is a historical typo preserved across the codebase.)
 """
@@ -337,7 +337,7 @@ end
   end
 
   @Record STATE begin
-    index::Integer
+    index::Int
     derName::Option{DAE.ComponentRef}
     natural::Bool
   end
@@ -477,7 +477,7 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
     right::DAE.Exp
     source::DAE.ElementSource
     attr::EquationAttributes
-    recordSize::Option{Integer}
+    recordSize::Option{Int}
   end
 
   @Record SOLVED_EQUATION begin
@@ -494,7 +494,7 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
   end
 
   @Record ALGORITHM begin
-    size::Integer
+    size::Int
     alg::DAE.Algorithm
     source::DAE.ElementSource
     expand::DAE.Expand
@@ -502,7 +502,7 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
   end
 
   @Record WHEN_EQUATION begin
-    size::Integer
+    size::Int
     whenEquation::WhenEquation
     source::DAE.ElementSource
     attr
@@ -512,21 +512,21 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
      from WHEN_EQUATION so init-time bodies stay separated from runtime
      when-equations through the pipeline. =#
   @Record INITIAL_WHEN_EQUATION begin
-    size::Integer
+    size::Int
     whenEquation::WhenEquation
     source::DAE.ElementSource
     attr
   end
 
   @Record STRUCTURAL_WHEN_EQUATION begin
-    size::Integer
+    size::Int
     whenEquation::WhenEquation
     source::DAE.ElementSource
     attr::EquationAttributes
   end
 
   @Record COMPLEX_EQUATION begin
-    size::Integer
+    size::Int
     left::DAE.Exp
     right::DAE.Exp
     source::DAE.ElementSource
@@ -573,10 +573,10 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
     ifEquation::OMFrontend.Frontend.EQUATION_IF
   end
 
-  @Record STRUCTURAL_TRANSISTION begin
+  @Record STRUCTURAL_TRANSITION begin
     fromState::String
     toState::String
-    transistionCondition::DAE.Exp
+    transitionCondition::DAE.Exp
   end
 end
 

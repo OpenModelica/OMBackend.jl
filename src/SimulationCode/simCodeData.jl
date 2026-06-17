@@ -56,9 +56,9 @@ end
 
 SimCref(sym::Symbol) = SimCref(sym, Int[])
 SimCref(name::AbstractString) = SimCref(Symbol(name), Int[])
-SimCref(name::AbstractString, subs::AbstractVector{<:Integer}) =
+SimCref(name::AbstractString, subs::AbstractVector{<:Int}) =
   SimCref(Symbol(name), Int[s for s in subs])
-SimCref(sym::Symbol, subs::AbstractVector{<:Integer}) =
+SimCref(sym::Symbol, subs::AbstractVector{<:Int}) =
   SimCref(sym, Int[s for s in subs])
 
 #= ---- Expression hierarchy (additive, no migration yet) ----
@@ -304,7 +304,7 @@ Modelica `algorithm` section. Side-effecting statements; emitted by
 backends as a sequence of assignments inside a generated function.
 """
 struct ALGORITHM <: Equation
-  size::Integer
+  size::Int
   alg::DAE.Algorithm
   source::DAE.ElementSource
   expand::DAE.Expand
@@ -385,7 +385,7 @@ end
 Runtime `when` clause with a SimCode-native `WHEN_STMTS` body.
 """
 struct WHEN_EQUATION <: Equation
-  size::Integer
+  size::Int
   whenEquation::WHEN_STMTS
   source::DAE.ElementSource
   attr::EQ_ATTR
@@ -399,7 +399,7 @@ runtime. Same shape as `WHEN_EQUATION`, distinct type so init-time
 and runtime when-bodies stay separated through codegen.
 """
 struct INITIAL_WHEN_EQUATION <: Equation
-  size::Integer
+  size::Int
   whenEquation::WHEN_STMTS
   source::DAE.ElementSource
   attr::EQ_ATTR
@@ -585,7 +585,7 @@ struct BRANCH{T1 <: Exp,
               T5 <: Vector{Int},
               T6 <: Graphs.AbstractGraph,
               T7 <: Vector{Vector{Int}},
-              T8 <: AbstractDict{String, Tuple{Integer, SimVar}}} <: Construct
+              T8 <: AbstractDict{String, Tuple{Int, SimVar}}} <: Construct
 
   condition::T1
   residualEquations::T2
@@ -609,26 +609,26 @@ end
 abstract type StructuralTransition end
 
 """
-    EXPLICIT_STRUCTURAL_TRANSISTION(fromState, toState, transistionCondition)
+    EXPLICIT_STRUCTURAL_TRANSITION(fromState, toState, transitionCondition)
 
 Explicit transition between two named structural submodels. Fires the
-`transistionCondition` and recompiles into `toState`.
+`transitionCondition` and recompiles into `toState`.
 """
-struct EXPLICIT_STRUCTURAL_TRANSISTION <: StructuralTransition
+struct EXPLICIT_STRUCTURAL_TRANSITION <: StructuralTransition
   fromState::String
   toState::String
-  transistionCondition::Exp
+  transitionCondition::Exp
 end
 
 """
-    IMPLICIT_STRUCTURAL_TRANSISTION(size, whenEquation, source, attr)
+    IMPLICIT_STRUCTURAL_TRANSITION(size, whenEquation, source, attr)
 
 Implicit structural transition embedded in a `when` clause; the final
 state is not known until the when-body executes. Body is a SimCode-native
 `WHEN_STMTS`.
 """
-struct IMPLICIT_STRUCTURAL_TRANSISTION <: StructuralTransition
-  size::Integer
+struct IMPLICIT_STRUCTURAL_TRANSITION <: StructuralTransition
+  size::Int
   whenEquation::WHEN_STMTS
   source::DAE.ElementSource
   attr::EQ_ATTR
@@ -707,7 +707,7 @@ The topmost model of a system consisting of several sub models lacks:
 This information is instead contained for each of the structural submodels, where one model is active at the time.
 """
 struct SIM_CODE{T0<:String,
-                T1<:AbstractDict{String, Tuple{Integer, SimVar}},
+                T1<:AbstractDict{String, Tuple{Int, SimVar}},
                 T2<:Vector{RESIDUAL_EQUATION},
                 T22,
                 T4<:Vector{WHEN_EQUATION},
