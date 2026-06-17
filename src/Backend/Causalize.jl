@@ -878,7 +878,7 @@ end
 """
     Expand a single array equation into multiple scalar EQUATION objects.
 """
-function expandSingleArrayEquation(size::Integer, left::DAE.Exp, right::DAE.Exp,
+function expandSingleArrayEquation(size::Int, left::DAE.Exp, right::DAE.Exp,
                                     source::DAE.ElementSource, attr::BDAE.EquationAttributes)
   equations = BDAE.Equation[]
   leftFlat = flattenDAEArray(left)
@@ -1371,9 +1371,9 @@ function flattenArrayCrefsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
           local v = syst.orderedVars[i]
           @match v.bindExp begin
             SOME(bindingExp) => begin
-              (newBindExp, _, _) = flattenWithPrefix(bindingExp, nothing)
-              #= Also traverse sub-expressions =#
-              (newBindExp, _) = Util.traverseExpTopDown(newBindExp, flattenWithPrefix, nothing)
+              #= traverseExpTopDown applies the func to the root first, then
+                 descends, so a separate root-only call is redundant. =#
+              (newBindExp, _) = Util.traverseExpTopDown(bindingExp, flattenWithPrefix, nothing)
               if !(bindingExp === newBindExp)
                 @assign syst.orderedVars[i].bindExp = SOME(newBindExp)
               end
@@ -1395,6 +1395,8 @@ end
   Converts [INDEX(ICONST(1)), INDEX(ICONST(2))] → "[1][2]"
 """
 function subscriptListToString(subscriptLst::List{DAE.Subscript})::String
+  #= Common case is an empty subscript list -> "" without touching IOBuffer. =#
+  listEmpty(subscriptLst) && return ""
   local buf = IOBuffer()
   for s in subscriptLst
     @match s begin

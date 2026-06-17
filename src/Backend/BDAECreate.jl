@@ -226,9 +226,13 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   #= §17.4.4: lift discrete (Bool/Int/enum) equation-section definitions whose RHS
      is a discrete-time relation into event-driven held discretes, so the
      continuous integrator never interpolates step-valued logic. =#
+  #= Stringify each varName once; the four name-keyed sweeps below
+     (param/const, discrete-start, collision-resolve, dedup) all use the
+     default-separator string and share this vector instead of recomputing it. =#
+  local varNames = String[string(v.varName) for v in variables]
   if !isempty(equations) && !isempty(variables)
-    local _discParamConst = _collectParamOrConstNames(variables)
-    local _discStarts = _discreteStartExpLookup(variables)
+    local _discParamConst = _collectParamOrConstNames(variables, varNames)
+    local _discStarts = _discreteStartExpLookup(variables, varNames)
     local (_discEqs, _discLifted) = synthesizeWhenEquationsFromDiscreteEquations(equations, _discParamConst, _discStarts)
     if !isempty(_discLifted)
       @info "[BDAE: lifter] synthesizeWhenEquationsFromDiscreteEquations lifted $(length(_discLifted)) discrete equation(s)" lifted=collect(_discLifted)
@@ -246,14 +250,16 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   end
   #= Distinct crefs can mangle to the same flat name (a.b vs a_b); resolve
      before the name-keyed deduplication silently swallows a variable. =#
-  resolveMangledNameCollisions!(variables, equations, initialEquations)
+  resolveMangledNameCollisions!(variables, equations, initialEquations, varNames)
   #= Deduplicate variables by name (handles inner/outer duplicate emission) =#
-  variables = deduplicateVariables(variables)
+  variables = deduplicateVariables(variables, varNames)
   #= Deduplicate explicit equations =#
   equations = deduplicateEquations(equations)
   #= The set of equations might also contain a  set of "binding equations" =#
   local bindingEquations = createBindingEquations(variables)
-  equations = vcat(equations, bindingEquations)
+  if !isempty(bindingEquations)
+    equations = vcat(equations, bindingEquations)
+  end
   #= TODO Extract the simple equations =#
   local simpleEquations = BDAE.Equation[]
   return BDAE.EQSYSTEM(name, variables, equations, simpleEquations, initialEquations)
@@ -280,10 +286,11 @@ end
   unique names, rewriting every occurrence (equations, initial equations and
   bindings) so the name-keyed passes downstream stay sound.
 """
-function resolveMangledNameCollisions!(variables::Vector, equations::Vector, initialEquations::Vector)
+function resolveMangledNameCollisions!(variables::Vector, equations::Vector, initialEquations::Vector,
+                                       varNames::Vector{String} = String[string(v.varName) for v in variables])
   local idxsByMangled = OrderedDict{String, Vector{Int}}()
   for (i, v) in enumerate(variables)
-    push!(get!(() -> Int[], idxsByMangled, string(v.varName)), i)
+    push!(get!(() -> Int[], idxsByMangled, varNames[i]), i)
   end
   local taken = OrderedSet{String}(keys(idxsByMangled))
   local renames = OrderedDict{String, DAE.ComponentRef}()
@@ -315,6 +322,8 @@ function resolveMangledNameCollisions!(variables::Vector, equations::Vector, ini
       renames[dotted] = newCref
       for i in gidxs
         variables[i].varName = newCref
+        #= Keep the shared name vector in sync so downstream dedup keys correctly. =#
+        varNames[i] = string(newCref)
       end
     end
   end
@@ -358,12 +367,13 @@ end
   Deduplicate variables by their component reference name.
   Keeps the first occurrence of each uniquely-named variable.
 """
-function deduplicateVariables(variables::Vector)::Vector
+function deduplicateVariables(variables::Vector,
+                              varNames::Vector{String} = String[string(v.varName) for v in variables])::Vector
   local idxByName = Dict{String, Int}()
   local unique_vars = similar(variables, 0)
   local duplicateCount = 0
-  for v in variables
-    local varStr = string(v.varName)
+  for (i, v) in enumerate(variables)
+    local varStr = varNames[i]
     local existing = get(idxByName, varStr, 0)
     if existing != 0
       duplicateCount += 1
@@ -618,7 +628,7 @@ Base.@nospecializeinfer function equationToBackendEquation(@nospecialize(elem::D
           @match fromStateExp <| toStateExp <| conditionExp <| nil = expLst
           local fromStateIdent = string(fromStateExp)
           local toStateIdent = string(toStateExp)
-          BDAE.STRUCTURAL_TRANSISTION(fromStateIdent, toStateIdent, conditionExp)
+          BDAE.STRUCTURAL_TRANSITION(fromStateIdent, toStateIdent, conditionExp)
         end
         _ => begin
           #= Skip unknown NORETCALL statements (e.g. checkBoundary, assert-like calls).
@@ -1133,13 +1143,14 @@ end
    names of every entry whose `varKind` is `PARAM` or `CONST`. Iterating
    the materialized BDAE vector avoids touching the lazier frontend list
    that triggered a multi-minute stall on first call. =#
-function _collectParamOrConstNames(variables::Vector{BDAE.VAR})::OrderedSet{String}
+function _collectParamOrConstNames(variables::Vector{BDAE.VAR},
+                                   varNames::Vector{String} = String[string(v.varName) for v in variables])::OrderedSet{String}
   local names = OrderedSet{String}()
   sizehint!(names, 2 * length(variables))
-  for var in variables
+  for (i, var) in enumerate(variables)
     local k = var.varKind
     if k isa BDAE.PARAM || k isa BDAE.CONST
-      local s = string(var.varName)
+      local s = varNames[i]
       push!(names, s)
       local u = replace(s, "." => "_")
       u === s || push!(names, u)
@@ -2343,9 +2354,10 @@ end
 #= Start-attribute expression for each variable that has one (Bool/Int/Real/enum).
    Used to fold `pre(member)` at initialization: Modelica §8.6.2 — before the
    first event `pre(v)` is `v.start`. =#
-Base.@nospecializeinfer function _discreteStartExpLookup(variables::Vector{BDAE.VAR})::Dict{String, DAE.Exp}
+Base.@nospecializeinfer function _discreteStartExpLookup(variables::Vector{BDAE.VAR},
+                                   varNames::Vector{String} = String[string(v.varName) for v in variables])::Dict{String, DAE.Exp}
   local d = Dict{String, DAE.Exp}()
-  for var in variables
+  for (i, var) in enumerate(variables)
     local s = @match var.values begin
       SOME(va) => @match va begin
         DAE.VAR_ATTR_BOOL(start = SOME(e)) => e
@@ -2357,7 +2369,7 @@ Base.@nospecializeinfer function _discreteStartExpLookup(variables::Vector{BDAE.
       _ => nothing
     end
     s === nothing && continue
-    d[string(var.varName)] = s
+    d[varNames[i]] = s
   end
   return d
 end

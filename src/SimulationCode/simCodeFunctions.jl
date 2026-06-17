@@ -714,6 +714,77 @@ function resolveConstantIfExp(exp::DAE.Exp, simCode::SIM_CODE)::DAE.Exp
   end
 end
 
+#= SIM-native mirror of resolveConstantIfExp(::DAE.Exp, simCode): recurses on the
+   SimCode Exp spine so the per-residual caller (pruneConstantConditions via
+   _rewriteResidualIfExp) need not build a whole-tree DAE copy. === identity is
+   preserved so unchanged subtrees are reused (no per-node toSimExp round-trip);
+   only the small IFEXP condition round-trips through tryEvalCondition's DAE arm.
+   Arms mirror the DAE method 1:1 on SIM struct fields. =#
+function resolveConstantIfExp(exp::Exp, simCode::SIM_CODE)::Exp
+  if exp isa IFEXP
+    local resolved = tryEvalCondition(exp.cond, simCode)
+    if resolved === true
+      return resolveConstantIfExp(exp.thenExp, simCode)
+    elseif resolved === false
+      return resolveConstantIfExp(exp.elseExp, simCode)
+    end
+    local nc = resolveConstantIfExp(exp.cond, simCode)
+    local nt = resolveConstantIfExp(exp.thenExp, simCode)
+    local ne = resolveConstantIfExp(exp.elseExp, simCode)
+    return (nc === exp.cond && nt === exp.thenExp && ne === exp.elseExp) ? exp : IFEXP(nc, nt, ne)
+  elseif exp isa BINARY
+    local n1 = resolveConstantIfExp(exp.exp1, simCode)
+    local n2 = resolveConstantIfExp(exp.exp2, simCode)
+    return (n1 === exp.exp1 && n2 === exp.exp2) ? exp : BINARY(n1, exp.op, n2)
+  elseif exp isa UNARY
+    local n1 = resolveConstantIfExp(exp.exp, simCode)
+    return n1 === exp.exp ? exp : UNARY(exp.op, n1)
+  elseif exp isa LBINARY
+    local n1 = resolveConstantIfExp(exp.exp1, simCode)
+    local n2 = resolveConstantIfExp(exp.exp2, simCode)
+    return (n1 === exp.exp1 && n2 === exp.exp2) ? exp : LBINARY(n1, exp.op, n2)
+  elseif exp isa LUNARY
+    local n1 = resolveConstantIfExp(exp.exp, simCode)
+    return n1 === exp.exp ? exp : LUNARY(exp.op, n1)
+  elseif exp isa RELATION
+    local n1 = resolveConstantIfExp(exp.exp1, simCode)
+    local n2 = resolveConstantIfExp(exp.exp2, simCode)
+    return (n1 === exp.exp1 && n2 === exp.exp2) ? exp : RELATION(n1, exp.op, n2, exp.index)
+  elseif exp isa CAST
+    local n1 = resolveConstantIfExp(exp.exp, simCode)
+    return n1 === exp.exp ? exp : CAST(exp.ty, n1)
+  elseif exp isa CALL
+    local changed = false
+    local newArgs = Exp[]
+    for arg in exp.args
+      local na = resolveConstantIfExp(arg, simCode)
+      changed |= na !== arg
+      push!(newArgs, na)
+    end
+    return changed ? CALL(exp.path, newArgs, exp.attr) : exp
+  elseif exp isa ARRAY_EXP
+    local changed = false
+    local newEls = Exp[]
+    for el in exp.elements
+      local nel = resolveConstantIfExp(el, simCode)
+      changed |= nel !== el
+      push!(newEls, nel)
+    end
+    return changed ? ARRAY_EXP(exp.ty, exp.scalar, newEls) : exp
+  elseif exp isa ASUB
+    local n1 = resolveConstantIfExp(exp.exp, simCode)
+    local changed = n1 !== exp.exp
+    local newSubs = Exp[]
+    for sub in exp.subs
+      local ns = resolveConstantIfExp(sub, simCode)
+      changed |= ns !== sub
+      push!(newSubs, ns)
+    end
+    return changed ? ASUB(n1, newSubs) : exp
+  end
+  return exp
+end
+
 """
   Try to evaluate a DAE condition expression to a Bool.
   Returns `true`, `false`, or `nothing` if evaluation is not possible.

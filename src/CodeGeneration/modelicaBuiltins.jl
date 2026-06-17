@@ -341,7 +341,7 @@ until ndims(A) == n. For example, promote(vector, 2) turns a
 See Modelica Spec 3.4, Section 10.3.3.
 NOT the same as Julia's promote() which does type promotion.
 """
-function modelica_promote(A, n::Integer)
+function modelica_promote(A, n::Int)
   currentDims = ndims(A)
   if currentDims >= n
     return A
@@ -491,9 +491,9 @@ are accepted but ignored; the result is sufficient for any downstream use
 that just consumes the digits (e.g. table-name suffixes in Media examples).
 """
 modelica_String(x) = string(x)
-modelica_String(x, sigDigits::Integer) = string(x)
-modelica_String(x, sigDigits::Integer, minLen::Integer) = string(x)
-modelica_String(x, sigDigits::Integer, minLen::Integer, leftAdjust::Bool) = string(x)
+modelica_String(x, sigDigits::Int) = string(x)
+modelica_String(x, sigDigits::Int, minLen::Int) = string(x)
+modelica_String(x, sigDigits::Int, minLen::Int, leftAdjust::Bool) = string(x)
 
 """
     modelica_homotopy(actual, simplified)

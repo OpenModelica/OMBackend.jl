@@ -46,13 +46,13 @@ end
 """
   Creates a single structural callback for an explicit transition.
 """
-function createStructuralCallback(simCode, simCodeStructuralTransition::SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION, idx)
+function createStructuralCallback(simCode, simCodeStructuralTransition::SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION, idx)
   local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition, 0)
   # SIM.Exp -> DAE.Exp at the boundary; DAE-typed helpers below.
-  local conditionDAE = SimulationCode.toDAEExp(structuralTransition.transistionCondition)
+  local conditionDAE = SimulationCode.toDAEExp(structuralTransition.transitionCondition)
 
-  if isContinousCondition(conditionDAE, simCode)
+  if isContinuousCondition(conditionDAE, simCode)
     local cond = transformToZeroCrossingCondition(conditionDAE)
     quote
       function $(Symbol(callbackName))(destinationSystem, callbacks)
@@ -141,7 +141,7 @@ TODO:
 Also make sure to create possible other elements in the structural when equation
 """
 function createStructuralCallback(simCode,
-                                  simCodeStructuralTransition::SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION,
+                                  simCodeStructuralTransition::SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION,
                                   idx)
   local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition, idx)
@@ -198,7 +198,7 @@ function createStructuralCallback(simCode,
       end
     end
     _ #=Continuous or discrete =# => begin
-      if isContinousCondition(whenCondition, simCode)
+      if isContinuousCondition(whenCondition, simCode)
         local zeroCrossingCond = transformToZeroCrossingCondition(whenCondition)
         quote
           $(affect)
@@ -323,10 +323,10 @@ function createStructuralAssignments(simCode, structuralTransitions::Vector{ST})
   local idx = 1
   for structuralTransisiton in structuralTransitions
     @match structuralTransisiton begin
-      SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION(__) => begin
+      SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION(__) => begin
         push!(structuralAssignments, createStructuralAssignment(simCode, structuralTransisiton))
       end
-      SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION(__) => begin
+      SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION(__) => begin
         push!(structuralAssignments, createStructuralAssignment(simCode, structuralTransisiton, idx))
       end
       SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION(__) => begin
@@ -347,7 +347,7 @@ end
   This function creates a structural assignment.
   That is the constructor for a structural callback guiding structural change.
 """
-function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION)
+function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION)
   local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition)
   local toState = structuralTransition.toState
@@ -367,7 +367,7 @@ end
   Creates a structural assignment for an implicit structural transition.
   These are numbered from 1->N
 """
-function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION, idx::Int)
+function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION, idx::Int)
   local structuralTransition = simCodeStructuralTransition
   local callbackName = createCallbackName(structuralTransition, idx)
   local integratorCallbackName = string(callbackName, "_CALLBACK")
@@ -391,7 +391,7 @@ function createStructuralAssignment(simCode, simCodeStructuralTransition::Simula
   end
 end
 
-function createCallbackName(structuralTransisiton::SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION, idx = 0)
+function createCallbackName(structuralTransisiton::SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION, idx = 0)
   return "structuralCallback" * structuralTransisiton.fromState * structuralTransisiton.toState
 end
 
@@ -399,7 +399,7 @@ end
   Creates a structural callback for the when equation.
   The name is up to change.
 """
-function createCallbackName(structuralTransisiton::SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION, idx::Int)
+function createCallbackName(structuralTransisiton::SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION, idx::Int)
   return string("structuralCallbackWhenEquation", idx)
 end
 

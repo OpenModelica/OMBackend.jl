@@ -1113,25 +1113,28 @@ function wrapWithInvokelatest(expr::Expr)
       end
       return Expr(:call, newArgs...)
     end
-    #= Recursively process arguments; return original if nothing changed =#
-    local changed = false
-    local newArgs = copy(expr.args)
+    #= Recursively process arguments; allocate a new args vector only when a
+       child actually changes, else return the original Expr unchanged. =#
+    local newArgs = nothing
     for (i, a) in enumerate(expr.args)
-      r = wrapWithInvokelatest(a)
-      newArgs[i] = r
-      changed |= r !== a
+      local r = wrapWithInvokelatest(a)
+      if r !== a
+        newArgs === nothing && (newArgs = copy(expr.args))
+        newArgs[i] = r
+      end
     end
-    return changed ? Expr(:call, newArgs...) : expr
+    return newArgs === nothing ? expr : Expr(:call, newArgs...)
   end
-  #= For all other Expr types; return original if nothing changed =#
-  local changed = false
-  local newArgs = copy(expr.args)
+  #= For all other Expr types; allocate only when a child changes. =#
+  local newArgs = nothing
   for (i, a) in enumerate(expr.args)
-    r = wrapWithInvokelatest(a)
-    newArgs[i] = r
-    changed |= r !== a
+    local r = wrapWithInvokelatest(a)
+    if r !== a
+      newArgs === nothing && (newArgs = copy(expr.args))
+      newArgs[i] = r
+    end
   end
-  return changed ? Expr(expr.head, newArgs...) : expr
+  return newArgs === nothing ? expr : Expr(expr.head, newArgs...)
 end
 
 wrapWithInvokelatest(x) = x  #= For non-Expr types, return as-is =#

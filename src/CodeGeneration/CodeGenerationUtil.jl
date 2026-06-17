@@ -228,7 +228,7 @@ end
 Base.@nospecializeinfer function expToJL(@nospecialize(exp::DAE.Exp), simCode::SimulationCode.SIM_CODE; varPrefix="x")::String
   hashTable = simCode.stringToSimVarHT
   str = begin
-    local int::ModelicaInteger
+    local int::Int
     local real::ModelicaReal
     local bool::Bool
     local tmpStr::String
@@ -503,8 +503,19 @@ function _iterativePostwalk(f, root)
         push!(todo, (a, false))
       end
     else
-      local newArgs = Any[get(newMap, a, a) for a in node.args]
-      newMap[node] = f(Expr(node.head, newArgs...))
+      #= Lazy rebuild: only allocate a new args vector + Expr when a child
+         actually changed; otherwise pass the original node to `f`. `f` is a
+         pure function of structure, so a structurally identical node yields
+         the same result -> emitted code is unchanged. =#
+      local changed = false
+      for a in node.args
+        if get(newMap, a, a) !== a
+          changed = true
+          break
+        end
+      end
+      local rebuilt = changed ? Expr(node.head, Any[get(newMap, a, a) for a in node.args]...) : node
+      newMap[node] = f(rebuilt)
     end
   end
   return get(newMap, root, root)
@@ -1106,7 +1117,7 @@ end
 """
   Returns true if there is no discrete variables in the condition.
 """
-function isContinousCondition(cond::DAE.Exp, simCode)
+function isContinuousCondition(cond::DAE.Exp, simCode)
   local allCrefs = Util.getAllCrefs(cond)
   local isContinuousCond = false
   if isone(length(allCrefs)) && string(first(allCrefs)) == "time"

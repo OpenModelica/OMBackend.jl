@@ -638,7 +638,7 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
           =#
           @VSS_DEBUG @info "solutionAtChange.t" cb.solutionAtChange.t
           local stopIdx = findlast((x) -> x == timeBeforeCallbackWasApplied, cb.solutionAtChange.t)
-          @assert stopIdx !== nothing "Invalid callback occured during simulation"
+          @assert stopIdx !== nothing "Invalid callback occurred during simulation"
           @VSS_DEBUG @info "stopIdx" stopIdx
           solAtChange = cb.solutionAtChange #Used for error checking
           local modifiedSol = deepcopy(cb.solutionAtChange)
