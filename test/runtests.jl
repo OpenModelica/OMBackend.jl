@@ -53,7 +53,7 @@ using Test
 using Dates
 using DifferentialEquations: ReturnCode
 
-include("./ExampleDAE/ExampleDAEs.jl")
+include("../examples/ExampleDAEs.jl")
 import .ExampleDAEs
 
 @testset "OMBackend" begin
@@ -117,7 +117,7 @@ import .ExampleDAEs
         ENV["OMJL_LOG_DIR"] = $(repr(tmp))
         cd($(repr(repoRoot)))
         include("src/OMBackend.jl")
-        include("test/ExampleDAE/ExampleDAEs.jl")
+        include("examples/ExampleDAEs.jl")
         using .ExampleDAEs
         println("same_module=", OMBackend === OMBackend.CodeGeneration.OMBackend)
         OMBackend.translate(ExampleDAEs.helloWorld_DAE; BackendMode = OMBackend.MTK_MODE)
