@@ -1580,11 +1580,11 @@ Base.@nospecializeinfer function _innermostType(@nospecialize(cref))
   end
 end
 
-Base.@nospecializeinfer function _innermostSubscripts(@nospecialize(cref))::Vector
+Base.@nospecializeinfer function _innermostSubscripts(@nospecialize(cref))::Vector{DAE.Subscript}
   @match cref begin
     DAE.CREF_IDENT(_, _, subs) => collect(subs)
     DAE.CREF_QUAL(_, _, _, cr) => _innermostSubscripts(cr)
-    _ => Any[]
+    _ => DAE.Subscript[]
   end
 end
 
@@ -1679,20 +1679,21 @@ Base.@nospecializeinfer function _scalarLhsTargets(@nospecialize(lhs::DAE.CREF),
   local cr = lhs.componentRef
   local baseTy = _innermostType(cr)
   local dims = _arrayDimsFromType(baseTy)
-  isempty(dims) && return Any[(lhs, nothing, Int[])]
+  local _emptyTargets = Tuple{DAE.Exp, Union{Nothing, DAE.Exp}, Vector{Int}}[]
+  isempty(dims) && return [(lhs, nothing, Int[])]
   local rawDims = _rawArrayDims(baseTy)
 
   local subs = _innermostSubscripts(cr)
   if isempty(subs)
-    subs = Any[DAE.WHOLEDIM() for _ in dims]
+    subs = DAE.Subscript[DAE.WHOLEDIM() for _ in dims]
   elseif length(subs) < length(dims)
-    append!(subs, Any[DAE.WHOLEDIM() for _ in 1:(length(dims) - length(subs))])
+    append!(subs, DAE.Subscript[DAE.WHOLEDIM() for _ in 1:(length(dims) - length(subs))])
   end
-  length(subs) == length(dims) || return Any[]
+  length(subs) == length(dims) || return _emptyTargets
 
   local elemTy = _arrayElementType(baseTy)
-  local out = Any[]
-  function rec(pos::Int, newSubs::Vector, guard, rhsIdxs::Vector{Int})
+  local out = Tuple{DAE.Exp, Union{Nothing, DAE.Exp}, Vector{Int}}[]
+  function rec(pos::Int, newSubs::Vector{DAE.Subscript}, guard, rhsIdxs::Vector{Int})
     if pos > length(dims)
       local newCr = _replaceInnermostSubscripts(cr, newSubs)
       push!(out, (DAE.CREF(newCr, elemTy), guard, copy(rhsIdxs)))
@@ -1701,24 +1702,24 @@ Base.@nospecializeinfer function _scalarLhsTargets(@nospecialize(lhs::DAE.CREF),
     local sub = subs[pos]
     if sub isa DAE.WHOLEDIM
       for k in 1:dims[pos]
-        rec(pos + 1, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))],
-            guard, Int[rhsIdxs...; k])
+        rec(pos + 1, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))],
+            guard, Int[rhsIdxs..., k])
       end
     elseif sub isa DAE.INDEX
       local idx = sub.exp
       if idx isa DAE.ICONST || idx isa DAE.ENUM_LITERAL
-        rec(pos + 1, Any[newSubs...; DAE.INDEX(idx)], guard, rhsIdxs)
+        rec(pos + 1, DAE.Subscript[newSubs..., DAE.INDEX(idx)], guard, rhsIdxs)
       else
         for k in 1:dims[pos]
           local g = _andCondition(guard, _indexEqualsCondition(idx, k))
-          rec(pos + 1, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g, rhsIdxs)
+          rec(pos + 1, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g, rhsIdxs)
         end
       end
     else
       return
     end
   end
-  rec(1, Any[], nothing, Int[])
+  rec(1, DAE.Subscript[], nothing, Int[])
   return out
 end
 
@@ -1734,15 +1735,15 @@ Base.@nospecializeinfer function _scalarizeCrefRead(@nospecialize(cr),
   local rawDims = _rawArrayDims(baseTy)
   local subs = _innermostSubscripts(cr)
   if isempty(subs)
-    subs = Any[DAE.WHOLEDIM() for _ in dims]
+    subs = DAE.Subscript[DAE.WHOLEDIM() for _ in dims]
   elseif length(subs) < length(dims)
-    append!(subs, Any[DAE.WHOLEDIM() for _ in 1:(length(dims) - length(subs))])
+    append!(subs, DAE.Subscript[DAE.WHOLEDIM() for _ in 1:(length(dims) - length(subs))])
   end
   length(subs) == length(dims) || return fallback
 
   local elemTy = _arrayElementType(baseTy)
-  local candidates = Any[]
-  function rec(pos::Int, rhsPos::Int, newSubs::Vector, guard)
+  local candidates = Tuple{Union{Nothing, DAE.Exp}, DAE.Exp}[]
+  function rec(pos::Int, rhsPos::Int, newSubs::Vector{DAE.Subscript}, guard)
     if pos > length(dims)
       local newCr = _replaceInnermostSubscripts(cr, newSubs)
       push!(candidates, (guard, DAE.CREF(newCr, elemTy)))
@@ -1752,22 +1753,22 @@ Base.@nospecializeinfer function _scalarizeCrefRead(@nospecialize(cr),
     if sub isa DAE.WHOLEDIM
       rhsPos <= length(rhsIdxs) || return
       local k = rhsIdxs[rhsPos]
-      rec(pos + 1, rhsPos + 1, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))], guard)
+      rec(pos + 1, rhsPos + 1, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))], guard)
     elseif sub isa DAE.INDEX
       local idx = sub.exp
       if idx isa DAE.ICONST || idx isa DAE.ENUM_LITERAL
-        rec(pos + 1, rhsPos, Any[newSubs...; DAE.INDEX(idx)], guard)
+        rec(pos + 1, rhsPos, DAE.Subscript[newSubs..., DAE.INDEX(idx)], guard)
       else
         for k in 1:dims[pos]
           local g = _andCondition(guard, _indexEqualsCondition(idx, k))
-          rec(pos + 1, rhsPos, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g)
+          rec(pos + 1, rhsPos, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g)
         end
       end
     else
       return
     end
   end
-  rec(1, 1, Any[], nothing)
+  rec(1, 1, DAE.Subscript[], nothing)
   isempty(candidates) && return fallback
 
   local result = fallback

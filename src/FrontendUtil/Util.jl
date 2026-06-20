@@ -1332,7 +1332,7 @@ end
   Returns a Vector of DAE.Subscript.
 """
 function getSubscriptsFromCref(cref::DAE.ComponentRef)::Vector
-  local subscripts = []
+  local subscripts = DAE.Subscript[]
   for c in getAllCrefsAsVector(cref)
     if !isempty(c.subscriptLst)
       append!(subscripts, collect(c.subscriptLst))

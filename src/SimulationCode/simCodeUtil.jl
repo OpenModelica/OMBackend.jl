@@ -446,7 +446,7 @@ output
 """
 function makeLabels(digraph, matchOrder, variablesHT)
   variableIndexToName::OrderedDict = makeIndexVarNameDict(matchOrder, variablesHT)
-  labels = []
+  labels = String[]
   for i in 1:length(matchOrder)
     try
       variableIdx = MetaGraphs.get_prop(digraph, i, :vID)

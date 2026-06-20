@@ -248,7 +248,7 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
   #= Create integrator =#
   integrator = init(problem, alg; kwargs...)
   add_tstop!(integrator, tspan[2])
-  local oldSols = []
+  local oldSols = Any[]
   #= Run the integrator=#
   @label START_OF_INTEGRATION
   for i in integrator
@@ -507,7 +507,7 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
   local callbackConditions = omProblem.callbackConditions
   local activeModeName = omProblem.activeModeName
   local integrator = init(problem, alg; kwargs...)
-  local solutions = []
+  local solutions = Any[]
   local tmpSolAtChange
   #= Run the integrator=#
   @label START_OF_INTEGRATION
@@ -994,7 +994,7 @@ function returnRootIndices(activeModeName,
   local rootVariables = keys(variablestoReset)
   local ht = structuralCallback.stringToSimVarHT
   rootIndices = Int[]
-  variablesToSet = []
+  variablesToSet = Any[]
   variablesToSetIdx = Vector{Int}[]
   for v in rootVariables
     indexOfRoot = first(ht[v])

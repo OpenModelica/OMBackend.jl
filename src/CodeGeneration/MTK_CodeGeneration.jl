@@ -31,9 +31,6 @@
 
 #=
   Author: John Tinnerholm
-  TODO: Remember the state derivative scheme. What did I mean with that?
-  TODO: Make duplicate code better...
-  TODO: Cleanup in general.. keep this simple. Remove hacks as the SCiML team adds new features to MTK.
 =#
 import ..OMBackend
 import .AlgorithmicCodeGeneration
@@ -1150,7 +1147,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
         This means that certain algebraic variables should not be listed among the variables (These are the discrete variables).
       =#
       $(varInnerRefs)
-      allVariables = []
+      allVariables = Any[]
       #= Generate variables =#
       for constructor in variableConstructors
         vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple, Real, Nothing})(t)), Base.invokelatest(constructor))
@@ -1185,21 +1182,21 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       $(decomposeParameterEquationsInline(PARAMETER_EQUATIONS))
       #= Add ifCond discrete parameter values to pars dict =#
       $(generateIfCondParamAssignments(ifCondParamPairs))
-      startEquationComponents = []
+      startEquationComponents = Any[]
       $(decomposeStartEquationsInline(INITIAL_GUESS_EQUATIONS))
       for constructor in startEquationConstructors
         push!(startEquationComponents, Base.invokelatest(constructor))
       end
       initialValues = collect(Iterators.flatten(startEquationComponents))
       #= Process the final initial guesses =#
-      startEquationComponents = []
+      startEquationComponents = Any[]
       $(decomposeStartEquationsInline(INITIAL_VALUE_EQUATIONS; functionSuffix = "Final"))
       for constructor in startEquationConstructors
         push!(startEquationComponents, Base.invokelatest(constructor))
       end
       finalInitialValues = collect(Iterators.flatten(startEquationComponents))
       #= Equations =#
-      equationComponents = []
+      equationComponents = Any[]
       $(stripBeginBlocks(decomposeEquationsInline(EQUATIONS, PARAMETER_ASSIGNMENTS)))
       for constructor in equationConstructorCalls
         push!(equationComponents, Base.invokelatest(constructor))
@@ -3983,7 +3980,7 @@ end
 function createParameterArray(parameters::Vector{T1},
                               parameterAssignments::Vector{T2},
                               simCode::SIM_T) where {T1, T2, SIM_T}
-  local paramArray = []
+  local paramArray = Union{Float64, Symbol}[]
   local hT = simCode.stringToSimVarHT
   for param in parameters
     (index, simVar) = hT[param]
@@ -4017,7 +4014,7 @@ function createParameterArray(parameters::Vector{T1},
       parValue = :($(Symbol(param)))
     else
       @warn "[MTK GEN: createParameterArray] parameter $(param): no bind and non-literal start; substituting 0 in the legacy parameter array. Any event-driven read of this parameter via the aux[1] mirror will be wrong (the modern MTK path is unaffected)."
-      parValue = :(0)
+      parValue = :(0.0)
     end
     push!(paramArray, parValue)
   end
@@ -4293,7 +4290,7 @@ function decomposeParametersDeclaration(parVariablesSym; chunkSize = CHUNK_SIZE[
   local paramNameQuotes = [QuoteNode(s) for s in parVariablesSym]
   return quote
     $(exprs...)
-    local _allParamChunks = []
+    local _allParamChunks = Any[]
     for _fn in [$(constructorNames...)]
       push!(_allParamChunks, Base.invokelatest(_fn))
     end
