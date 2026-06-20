@@ -752,23 +752,40 @@ function resolveConstantIfExp(exp::Exp, simCode::SIM_CODE)::Exp
     local n1 = resolveConstantIfExp(exp.exp, simCode)
     return n1 === exp.exp ? exp : CAST(exp.ty, n1)
   elseif exp isa CALL
-    local changed = false
-    local newArgs = Exp[]
+    #= Allocate lazily; an unchanged arg list returns the original node. =#
+    local newArgs::Union{Nothing, Vector{Exp}} = nothing
+    local i = 0
     for arg in exp.args
+      i += 1
       local na = resolveConstantIfExp(arg, simCode)
-      changed |= na !== arg
-      push!(newArgs, na)
+      if newArgs === nothing
+        if na !== arg
+          newArgs = Exp[]
+          for j in 1:(i - 1); push!(newArgs, exp.args[j]); end
+          push!(newArgs, na)
+        end
+      else
+        push!(newArgs, na)
+      end
     end
-    return changed ? CALL(exp.path, newArgs, exp.attr) : exp
+    return newArgs === nothing ? exp : CALL(exp.path, newArgs, exp.attr)
   elseif exp isa ARRAY_EXP
-    local changed = false
-    local newEls = Exp[]
+    local newEls::Union{Nothing, Vector{Exp}} = nothing
+    local i = 0
     for el in exp.elements
+      i += 1
       local nel = resolveConstantIfExp(el, simCode)
-      changed |= nel !== el
-      push!(newEls, nel)
+      if newEls === nothing
+        if nel !== el
+          newEls = Exp[]
+          for j in 1:(i - 1); push!(newEls, exp.elements[j]); end
+          push!(newEls, nel)
+        end
+      else
+        push!(newEls, nel)
+      end
     end
-    return changed ? ARRAY_EXP(exp.ty, exp.scalar, newEls) : exp
+    return newEls === nothing ? exp : ARRAY_EXP(exp.ty, exp.scalar, newEls)
   elseif exp isa ASUB
     local n1 = resolveConstantIfExp(exp.exp, simCode)
     local changed = n1 !== exp.exp

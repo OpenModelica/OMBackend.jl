@@ -949,7 +949,7 @@ function handleZimmerThetaConstant(resEqs, irreducibleVars::Vector{String}, ht)
       DAE.SUB(DAE.T_REAL_DEFAULT),
       DAE.RCONST(1.0))
     push!(resEqs,
-          BDAE.RESIDUAL_EQUATION(tmpResEq, nothing, nothing))
+          BDAE.RESIDUAL_EQUATION(tmpResEq, DAE.emptyElementSource, BDAE.EQ_ATTR_DEFAULT_DYNAMIC))
     (zimmerThetaIdx, simVar) = ht[thetaConstant]
     @assign simVar.varKind = ALG_VARIABLE(0)
     ht[thetaConstant] = (zimmerThetaIdx, simVar)
@@ -979,7 +979,7 @@ function makeDummyResidualEquation(equationSystemName::String, idx::Int = 1)
       DAE.CALL(Absyn.IDENT("der"), crefExpression <| MetaModelica.list(), DAE.callAttrBuiltinReal),
       DAE.SUB(DAE.T_REAL_DEFAULT),
       DAE.RCONST(0.0)),
-    DAE.T_SOURCEINFO_DEFAULT,
+    DAE.emptyElementSource,
     BDAE.EQ_ATTR_DEFAULT_DYNAMIC,
   )
 end
@@ -4331,7 +4331,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
           DAE.BINARY(uvExp, DAE.ADD(DAE.T_REAL_DEFAULT), repExp) :
           DAE.BINARY(uvExp, DAE.SUB(DAE.T_REAL_DEFAULT), repExp)
         push!(pairedElimVarNames, uv)
-        push!(pairedElimEqs, RESIDUAL_EQUATION(synExp, nothing, nothing))
+        push!(pairedElimEqs, BDAE.RESIDUAL_EQUATION(synExp, DAE.emptyElementSource, BDAE.EQ_ATTR_DEFAULT_DYNAMIC))
       end
     end
   end

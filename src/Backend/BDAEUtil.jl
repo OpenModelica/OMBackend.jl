@@ -106,7 +106,7 @@ function mapEqSystemEquations(syst::BDAE.EQSYSTEM, traversalOperation::Function)
   end
 end
 
-function mapEqSystemEquationsNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::Function, extArg)
+function mapEqSystemEquationsNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::Function, extArg::T)::T where {T}
   extArg = begin
     local eqs::Array{BDAE.Equation,1}
     @match syst begin
@@ -120,7 +120,7 @@ function mapEqSystemEquationsNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::F
   end
 end
 
-function mapEqSystemVariablesNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::Function, extArg)
+function mapEqSystemVariablesNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::Function, extArg::T)::T where {T}
   extArg = begin
     local varArr::Array{BDAE.Var,1}
     @match syst begin
@@ -144,9 +144,9 @@ function crefLeafType(@nospecialize(cref))
   end
 end
 
-function _traverseComponentRef(@nospecialize(cref::DAE.ComponentRef),
+function _traverseComponentRef(cref::DAE.ComponentRef,
                                traversalOperation::Function,
-                               extArg)
+                               extArg::T)::Tuple{DAE.ComponentRef, T} where {T}
   local exp = DAE.CREF(cref, crefLeafType(cref))
   local newExp
   (newExp, extArg) = Util.traverseExpTopDown(exp, traversalOperation, extArg)
@@ -160,9 +160,9 @@ end
   Traverse a given equation using a traversalOperation.
   Mutates the given equation.
 """
-Base.@nospecializeinfer function traverseEquationExpressions(@nospecialize(eq::BDAE.Equation),
-                                                             traversalOperation::Function,
-                                                             extArg::T)::Tuple{BDAE.Equation,T} where{T}
+function traverseEquationExpressions(eq::BDAE.Equation,
+                                     traversalOperation::Function,
+                                     extArg::T)::Tuple{BDAE.Equation,T} where{T}
    (eq, extArg) = begin
      local lhs::DAE.Exp
      local rhs::DAE.Exp

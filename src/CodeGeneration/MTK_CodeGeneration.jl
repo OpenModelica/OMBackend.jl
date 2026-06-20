@@ -302,7 +302,7 @@ function substituteRelayAliasesInWhens(simCode, relayAliases::Dict{Symbol, Symbo
   isempty(relayAliases) && return simCode
   local wanted = OrderedSet{String}(string(k) for k in keys(relayAliases))
   local tyOf = Dict{String, DAE.Type}()
-  local collectTy = function (@nospecialize(e), acc)
+  local collectTy = function (e::DAE.Exp, acc)
     if e isa DAE.CREF
       local nm = string(e.componentRef)
       if nm in wanted && !haskey(tyOf, nm)
@@ -2747,7 +2747,7 @@ end
 #= Replace every structural occurrence of relation `rel` in `exp` with `val`. =#
 function _substRelation(@nospecialize(exp), @nospecialize(rel), val::Bool)
   local relStr = string(rel)
-  function repl(@nospecialize(e), arg)
+  function repl(e::DAE.Exp, arg)
     (string(e) == relStr) ? (DAE.BCONST(val), arg) : (e, arg)
   end
   return first(Util.traverseExpBottomUp(exp, repl, nothing))

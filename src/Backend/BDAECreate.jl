@@ -957,11 +957,11 @@ function createBindingEquations(variables::Vector)
                  local elsePart = BDAE.WHEN_STMTS(BDAEUtil.invertCondition(cond) #= The else when here has the inverted condition of the first part. =#
                                                   ,list(BDAE.ASSIGN(lhs, elseExp, v.source))
                                                   ,nothing)
-                 local elseWeqPart = BDAE.WHEN_EQUATION(1, elsePart, v.source, nothing)
+                 local elseWeqPart = BDAE.WHEN_EQUATION(1, elsePart, v.source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
                  local stmts = BDAE.WHEN_STMTS(cond
                                                ,list(BDAE.ASSIGN(lhs, thenExp, v.source))
                                                ,SOME(elseWeqPart))
-                 local weq = BDAE.WHEN_EQUATION(1, stmts, v.source, nothing)
+                 local weq = BDAE.WHEN_EQUATION(1, stmts, v.source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
                  push!(bindingEqs, weq)
                end
       #= Boolean (non-ifexp), Integer or enumeration declaration binding ->
@@ -1055,7 +1055,7 @@ function synthesizeFromInitialAlgorithms(iAlgorithms)::Vector{BDAE.Equation}
       length(alg.statements),
       BDAE.WHEN_STMTS(initialCall, whenOps, NONE()),
       alg.source,
-      nothing,
+      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
     )
     _INIT_ALG_DAE_STMTS[node] = collect(daeStmts)
     push!(out, node)
@@ -1949,7 +1949,7 @@ Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BD
       length(initOps),
       BDAE.WHEN_STMTS(initialCall, MetaModelica.list(initOps...), NONE()),
       source,
-      nothing,
+      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
     ))
   end
   #= Per Modelica spec §17.4.4: a non-when algorithm with discrete LHS fires
@@ -1999,7 +1999,7 @@ Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BD
       length(runOps),
       BDAE.WHEN_STMTS(cond, MetaModelica.list(runOps...), NONE()),
       source,
-      nothing,
+      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
     ))
   end
   return
@@ -2094,7 +2094,7 @@ Base.@nospecializeinfer function _liftStmtWhenToWhenEquations!(out::Vector{BDAE.
         length(initOps),
         BDAE.WHEN_STMTS(initialCall, MetaModelica.list(initOps...), NONE()),
         stmtWhen.source,
-        nothing,
+        BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
       ))
     end
   end
@@ -2501,13 +2501,13 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
     1,
     BDAE.WHEN_STMTS(bareInitial, MetaModelica.list(initAssigns...), NONE()),
     src0,
-    nothing,
+    BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
   ))
   push!(out, BDAE.WHEN_EQUATION(
     1,
     BDAE.WHEN_STMTS(changeCond, MetaModelica.list(runAssigns...), NONE()),
     src0,
-    nothing,
+    BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
   ))
   for (lhs, _, _) in body; push!(liftedLhs, string(lhs.componentRef)); end
   return
@@ -2595,7 +2595,7 @@ Base.@nospecializeinfer function _liftAlgIfToWhen!(out::Vector{BDAE.Equation},
             1,
             BDAE.WHEN_STMTS(cond, whenOps, NONE()),
             source,
-            nothing,
+            BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
           ))
           return true
         end
@@ -2656,7 +2656,7 @@ Base.@nospecializeinfer function _liftAlgAssignToInitialWhen!(out::Vector{BDAE.E
                         MetaModelica.list(BDAE.ASSIGN(lhs, rhs, asrc)),
                         NONE()),
         source,
-        nothing,
+        BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
       ))
       #= Plus a runtime WHEN_EQUATION for any change(rhs) trigger so the
          assign re-fires whenever a non-parameter input changes. =#
@@ -2665,7 +2665,7 @@ Base.@nospecializeinfer function _liftAlgAssignToInitialWhen!(out::Vector{BDAE.E
           1,
           BDAE.WHEN_STMTS(changeCond, whenOps, NONE()),
           source,
-          nothing,
+          BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
         ))
       end
       local lhsName::Union{String, Nothing} = try
@@ -2698,7 +2698,7 @@ function synthesizeInitialWhenFromAlgorithms(algorithms)::Vector{BDAE.Equation}
             length(frontendBody),
             BDAE.WHEN_STMTS(daeCond, whenOps, NONE()),
             stmt.source,
-            nothing,
+            BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
           )
           _INIT_ALG_DAE_STMTS[node] = collect(daeStmts)
           push!(out, node)
