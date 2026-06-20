@@ -281,7 +281,6 @@ Base.@nospecializeinfer function expToJL(@nospecialize(exp::DAE.Exp), simCode::S
       DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
         (expToJL(e1, simCode, varPrefix=varPrefix) + " " + SimulationCode.string(op) + " " + expToJL(e2, simCode,varPrefix=varPrefix))
       end
-      #=TODO?=#
       DAE.IFEXP(expCond = e1, expThen = e2, expElse = e3) => begin
         "if" + expToJL(e1, simCode, varPrefix=varPrefix) + "\n" + expToJL(e2, simCode,varPrefix=varPrefix) + "else\n" + expToJL(e3, simCode,varPrefix=varPrefix) + "\nend"
       end
@@ -1477,7 +1476,7 @@ function extractArrayDimsFromVar(v::DAE.VAR)::Expr
   end
   @match ty begin
     DAE.T_ARRAY(_, dims) => begin
-      local dimExprs = []
+      local dimExprs = Union{Int,Symbol}[]
       for d in dims
         @match d begin
           DAE.DIM_INTEGER(n) => push!(dimExprs, n)

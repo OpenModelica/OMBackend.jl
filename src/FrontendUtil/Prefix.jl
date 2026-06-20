@@ -31,7 +31,7 @@ NOTE: Component prefixes are stored in inverse order c.b[2].a! =#
 @Uniontype ComponentPrefix begin
   @Record PRE begin
     prefix #= prefix name =#::String
-    dimensions #= dimensions =#::List#=TODO: Removed stuff here. se history=#
+    dimensions #= dimensions =#::List
     subscripts #= subscripts =#::List
     next #= next prefix =#::ComponentPrefix
     ci_state #= to be able to at least partially fill in type information properly for DAE.VAR =#::ClassInf.SMNode

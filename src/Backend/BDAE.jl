@@ -33,13 +33,8 @@
 
 #=
 TODO:
-Change Integer -> Int here. Integer is an old artifact.
-Make sure all types here properly typed!
 Move Var s.t it is close to the struct that defines it.
 Make all datatypes here immutable. I think having VAR as a immutable struct is better.
-
-Remove VarKind types we do not use.
-
 =#
 
 """
@@ -436,7 +431,6 @@ end
 
 @Uniontype EvaluationStages begin
   @Record EVALUATION_STAGES begin
-
     dynamicEval::Bool
     algebraicEval::Bool
     zerocrossEval::Bool

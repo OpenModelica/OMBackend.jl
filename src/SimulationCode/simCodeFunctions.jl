@@ -579,8 +579,6 @@ end
 """
 # SIM.Exp delegation: BRANCH.condition / EQUATION.lhs|rhs are SIM.Exp post-migration.
 resolveConstantIfExp(exp::Exp)::Exp = toSimExp(resolveConstantIfExp(toDAEExp(exp)))
-resolveConstantIfExp(exp::Exp, simCode::SIM_CODE)::Exp =
-  toSimExp(resolveConstantIfExp(toDAEExp(exp), simCode))
 
 function resolveConstantIfExp(exp::DAE.Exp)::DAE.Exp
   @match exp begin

@@ -337,7 +337,7 @@ function createStructuralAssignments(simCode, structuralTransitions::Vector{ST})
   end
   result = quote
     structuralCallbacks = OMBackend.Runtime.AbstractStructuralChange[]
-    callbackSet = []
+    callbackSet = Any[]
     $(structuralAssignments...)
   end
   return result
