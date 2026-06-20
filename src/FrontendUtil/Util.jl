@@ -341,16 +341,28 @@ end
 """
 function traverseExpList(expLst::List{DAE.Exp}, func::Function, inArg)
   outArg = inArg
-  newExpLst = DAE.Exp[]
-  allEqual = true
+  #= Allocate the result buffer lazily; a no-op traversal returns the original list. =#
+  local newExpLst::Union{Nothing, Vector{DAE.Exp}} = nothing
+  local i = 0
   for e in expLst
+    i += 1
     (newE, outArg) = traverseExpBottomUp(e, func, outArg)
-    push!(newExpLst, newE)
-    if !referenceEq(e, newE)
-      allEqual = false
+    if newExpLst === nothing
+      if !referenceEq(e, newE)
+        newExpLst = DAE.Exp[]
+        local j = 0
+        for pe in expLst
+          j += 1
+          j < i || break
+          push!(newExpLst, pe)
+        end
+        push!(newExpLst, newE)
+      end
+    else
+      push!(newExpLst, newE)
     end
   end
-  return allEqual ? (expLst, outArg) : (list(newExpLst...), outArg)
+  return newExpLst === nothing ? (expLst, outArg) : (list(newExpLst...), outArg)
 end
 
 """
@@ -359,16 +371,28 @@ end
 """
 function traverseExpMatrix(inMatrix::List{List{DAE.Exp}}, func::Function, inArg)
   outArg = inArg
-  newRows = List{DAE.Exp}[]
-  same = true
+  #= Allocate lazily; an unchanged matrix returns the original list of rows. =#
+  local newRows::Union{Nothing, Vector{List{DAE.Exp}}} = nothing
+  local i = 0
   for row in inMatrix
+    i += 1
     (row_1, outArg) = traverseExpList(row, func, outArg)
-    push!(newRows, row_1)
-    if !referenceEq(row, row_1)
-      same = false
+    if newRows === nothing
+      if !referenceEq(row, row_1)
+        newRows = List{DAE.Exp}[]
+        local j = 0
+        for pr in inMatrix
+          j += 1
+          j < i || break
+          push!(newRows, pr)
+        end
+        push!(newRows, row_1)
+      end
+    else
+      push!(newRows, row_1)
     end
   end
-  return same ? (inMatrix, outArg) : (list(newRows...), outArg)
+  return newRows === nothing ? (inMatrix, outArg) : (list(newRows...), outArg)
 end
 
 """
@@ -521,7 +545,7 @@ end
   NOTE: The user-provided function is not allowed to fail! If you want to
   detect a failure, return NONE() in your user-provided datatype.
 """
-Base.@nospecializeinfer function traverseExpBottomUp(@nospecialize(inExp::DAE.Exp), inFunc::Function, inExtArg::T)  where {T}
+function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  where {T}
   local outExtArg::T
   local outExp::DAE.Exp
   (outExp, outExtArg) = begin
@@ -967,8 +991,8 @@ Base.@nospecializeinfer function traverseExpBottomUp(@nospecialize(inExp::DAE.Ex
 end
 
 
-function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::Type_a) ::Tuple{List{DAE.Subscript}, Type_a}
-  local outArg::Type_a
+function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::T) ::Tuple{List{DAE.Subscript}, T} where {T}
+  local outArg::T
   local outSubscript::List{DAE.Subscript}
 
   (outSubscript, outArg) = begin
@@ -976,7 +1000,7 @@ function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::
     local sub_exp_1::DAE.Exp
     local rest::List{DAE.Subscript}
     local res::List{DAE.Subscript}
-    local arg::Type_a
+    local arg::T
     @match (inSubscript, rel, iarg) begin
       ( nil(), _, arg)  => begin
         (inSubscript, arg)
@@ -1036,7 +1060,7 @@ end
 """
 
 function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::T) ::Tuple{DAE.ComponentRef, T} where {T}
-  local outArg::Type_a
+  local outArg::T
   local outCref::DAE.ComponentRef
   (outCref, outArg) = begin
     local name::String
@@ -1045,7 +1069,7 @@ function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::T) ::Tup
     local ty::DAE.Type
     local subs::List{DAE.Subscript}
     local subs_1::List{DAE.Subscript}
-    local arg::Type_a
+    local arg::T
     local ix::Int
     local instant::String
     @match (inCref, rel, iarg) begin

@@ -14,9 +14,7 @@
 
 # -------------------- traverseExpTopDown --------------------
 
-Base.@nospecializeinfer function traverseExpTopDown(@nospecialize(inExp::Exp),
-                                                    @nospecialize(visitor),
-                                                    @nospecialize(arg))
+function traverseExpTopDown(inExp::Exp, visitor::F, arg::T)::Tuple{Exp, T} where {F, T}
   (outExp, cont, outArg) = visitor(inExp, arg)
   if !cont
     return (outExp, outArg)
@@ -134,9 +132,7 @@ end
 
 # -------------------- traverseExpBottomUp --------------------
 
-Base.@nospecializeinfer function traverseExpBottomUp(@nospecialize(inExp::Exp),
-                                                     @nospecialize(visitor),
-                                                     @nospecialize(arg))
+function traverseExpBottomUp(inExp::Exp, visitor::F, arg::T)::Tuple{Exp, T} where {F, T}
   (newExp, newArg) = _traverseChildrenBottomUp(inExp, visitor, arg)
   return visitor(newExp, newArg)
 end

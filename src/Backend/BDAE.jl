@@ -182,11 +182,7 @@ using ExportAll
   - `WHEN_STMTS(condition, whenStmtLst, elsewhenPart)`:
     - `condition`: the when-condition expression.
     - `whenStmtLst`: list of `WhenOperator` statements to run on trigger.
-    - `elsewhenPart`: chained `elsewhen`. Intentionally untyped: depending
-      on the call site it can be `NONE()`, an `Option{WHEN_STMTS}`, a
-      `SOME(WHEN_EQUATION)` (as produced by `lowerWhenEquation`), or plain
-      `nothing`. Until those call sites converge, constraining the field
-      type would be a breaking change.
+    - `elsewhenPart`: chained `elsewhen`, `NONE()` or `SOME(WHEN_EQUATION)`.
 """
 @UniontypeDecl WhenEquation
 
@@ -249,10 +245,10 @@ mutable struct VAR <: Var
   varKind::VarKind
   varDirection::DAE.VarDirection
   varType::DAE.Type
-  bindExp::Option
-  arryDim::List
+  bindExp::Option{DAE.Exp}
+  arryDim::List{DAE.Dimension}
   source::DAE.ElementSource
-  values::Option
+  values::Option{DAE.VariableAttributes}
   tearingSelectOption::Option
   connectorType::DAE.ConnectorType
   unreplaceable::Bool
@@ -311,8 +307,8 @@ end
 struct SHARED
   globalKnownVars::Vector{VAR}
   localKnownVars::Vector{VAR}
-  metaModel::Option
-  flatModel::Option
+  metaModel::Option{SCode.CLASS}
+  flatModel::Option{OMFrontend.Frontend.FlatModel}
   DOCC_equations::Vector{Equation}
 end
 
@@ -459,9 +455,9 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
 
 @Uniontype Equation begin
   @Record EQUATION begin
-    lhs
-    rhs
-    source
+    lhs::DAE.Exp
+    rhs::DAE.Exp
+    source::DAE.ElementSource
     attributes::EquationAttributes
   end
 
@@ -482,9 +478,9 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
   end
 
   @Record RESIDUAL_EQUATION begin
-    exp
-    source
-    attr
+    exp::DAE.Exp
+    source::DAE.ElementSource
+    attr::EquationAttributes
   end
 
   @Record ALGORITHM begin
@@ -499,7 +495,7 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
     size::Int
     whenEquation::WhenEquation
     source::DAE.ElementSource
-    attr
+    attr::EquationAttributes
   end
 
   #= Body of an `algorithm when initial() then ... end when` clause. Distinct
@@ -509,7 +505,7 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
     size::Int
     whenEquation::WhenEquation
     source::DAE.ElementSource
-    attr
+    attr::EquationAttributes
   end
 
   @Record STRUCTURAL_WHEN_EQUATION begin
@@ -578,7 +574,7 @@ end
   @Record WHEN_STMTS begin
     condition::DAE.Exp
     whenStmtLst::List{WhenOperator}
-    elsewhenPart
+    elsewhenPart::Option{WHEN_EQUATION}
   end
 end
 

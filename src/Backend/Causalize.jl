@@ -1102,7 +1102,7 @@ end
 function _foldReductionScalar(fname::String, elems::Vector{DAE.Exp}, attr,
                               foldTy::DAE.Type)::Union{DAE.Exp, Nothing}
   isempty(elems) && return nothing
-  local acc = elems[1]
+  local acc::DAE.Exp = elems[1]
   for k in 2:length(elems)
     acc = if fname == "sum"
       DAE.BINARY(acc, DAE.ADD(foldTy), elems[k])
@@ -1133,7 +1133,7 @@ function _reducingCallArgElems(@nospecialize(arg))::Union{Vector{DAE.Exp}, Nothi
 end
 
 function unrollReductionTraverser(exp::DAE.Exp, acc)
-  local newExp = exp
+  local newExp::DAE.Exp = exp
   @match exp begin
     DAE.CALL(Absyn.IDENT(fname), args, attr) where (fname == "max" || fname == "min" ||
                                                     fname == "sum" || fname == "product") => begin

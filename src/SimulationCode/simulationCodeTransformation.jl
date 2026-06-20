@@ -590,7 +590,7 @@ function flattenNestedThenBranchIfs(ifEq::BDAE.IF_EQUATION)::BDAE.IF_EQUATION
   local conds = listArray(ifEq.conditions)
   local thens = listArray(ifEq.eqnstrue)
   local newConds = DAE.Exp[]
-  local newThens = Vector{Any}()
+  local newThens = List{BDAE.Equation}[]
   for i in 1:length(conds)
     local expanded = _expandBranchEquations(collect(BDAE.Equation, listArray(thens[i])))
     if length(expanded) == 1 && expanded[1][1] === nothing
