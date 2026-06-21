@@ -49,6 +49,40 @@
 import .MTKDump: dumpBuildDirectRHSInputs, dumpRHSExpression
 
 """
+    _buildDirectODEFunction(rhsFunc, u0, p_vec, t0; mass_matrix, sys, jacFunc, jacProto)
+
+Build the `ODEFunction` for the direct-RHS problem. When
+`OMBackend.DIRECT_RHS_TYPE_ERASE` is set the runtime-generated RHS (and the
+symbolic Jacobian) are wrapped in `FunctionWrappers` so the resulting problem
+type is constant across models; the solver then compiles its stepping / Newton
+/ linear-solve machinery once instead of once per distinct model. `u0`, `p_vec`
+and `t0` supply only the argument *types* the wrappers specialize on; their
+values are immaterial. The mass matrix, Jacobian and `sys` are attached to the
+function we build, so type erasure does not drop them.
+"""
+function _buildDirectODEFunction(rhsFunc, u0, p_vec, t0;
+                                 mass_matrix=nothing, sys=nothing,
+                                 jacFunc=nothing, jacProto=nothing)
+  if !OMBackend.DIRECT_RHS_TYPE_ERASE[]
+    local jacKw = jacFunc === nothing ? NamedTuple() : (; jac=jacFunc, jac_prototype=jacProto)
+    return mass_matrix === nothing ?
+      ModelingToolkit.ODEFunction{true}(rhsFunc; sys=sys, jacKw...) :
+      ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mass_matrix, sys=sys, jacKw...)
+  end
+  local FW = ModelingToolkit.SciMLBase.FunctionWrapperSpecialize
+  #= Multi-variant wrapper (Float64 + ForwardDiff Dual signatures) so autodiff
+     solvers stay correct; the Jacobian is never called with Duals, so a single
+     variant suffices there. =#
+  local wrappedRHS = DiffEqBase.wrapfun_iip(rhsFunc, (u0, u0, p_vec, t0))
+  local erasedKw = jacFunc === nothing ? NamedTuple() :
+    (; jac = DiffEqBase.wrapfun_jac_iip(jacFunc, (jacProto, u0, p_vec, t0)),
+       jac_prototype = jacProto)
+  return mass_matrix === nothing ?
+    ModelingToolkit.ODEFunction{true, FW}(wrappedRHS; sys=sys, erasedKw...) :
+    ModelingToolkit.ODEFunction{true, FW}(wrappedRHS; mass_matrix=mass_matrix, sys=sys, erasedKw...)
+end
+
+"""
     buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
                           allInitialValues=nothing)
 
@@ -149,8 +183,6 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
      symbolic derivative surfaces only when the function runs, not at build. =#
   local (jacFunc, jacProto) = _buildSparseJacobian(rhs_list, states, params, iv,
                                                    u0, p_vec, tspan[1])
-  local jacKwargs = jacFunc === nothing ? NamedTuple() :
-                    (; jac = jacFunc, jac_prototype = jacProto)
 
   # 4. Extract event callbacks from the reduced system and merge with custom callbacks.
   #    Our structural_simplify wrapper uses split=false, so the compiled event
@@ -164,7 +196,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   local problem
   if massMatrix isa LinearAlgebra.UniformScaling
     @debug "DirectRHS: pure ODE (identity mass matrix)"
-    local f = ModelingToolkit.ODEFunction{true}(rhsFunc; sys=reducedSystem, jacKwargs...)
+    local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
+                                      sys=reducedSystem, jacFunc=jacFunc, jacProto=jacProto)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   else
     @debug "DirectRHS: DAE with mass matrix"
@@ -172,7 +205,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     #= A sparse Jacobian prototype needs a sparse mass matrix, otherwise the
        solver's W = M - gamma*J assembly densifies or mismatches. =#
     local mmForF = jacFunc === nothing ? mm : Symbolics.SparseArrays.sparse(mm)
-    local f = ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mmForF, sys=reducedSystem, jacKwargs...)
+    local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
+                                      mass_matrix=mmForF, sys=reducedSystem,
+                                      jacFunc=jacFunc, jacProto=jacProto)
     #= Pinned indices: vars whose u0 came from a fixed=true Modelica init eq
        (after splitInitialValues). The DAE init solver must NOT modify these,
        otherwise an algebraic var pinned by `start=1, fixed=true` (e.g.
