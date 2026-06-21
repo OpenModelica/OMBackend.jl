@@ -19,6 +19,12 @@ const DUMP_ENABLED = Ref(false)
    by the generated `<name>Model(tspan)`: (problem, callbacks, ivs, _ivs_all,
    reducedSystem, tspan, pars, vars, irreducibleSyms). =#
 const BUILT           = Dict{String, Tuple}()
+#= Hash of (modelCode, build-affecting flags) for each cached build. A repeat
+   translate (e.g. overwriteCache) whose regenerated code and flags are
+   unchanged reuses the live module + cached build instead of re-eval'ing, which
+   would otherwise force redundant recompilation of the generated
+   `simulateFromBuild` / `simulate` methods on the next solve. =#
+const BUILT_HASH      = Dict{String, UInt64}()
 const REDUCED_SYSTEMS = Dict{String, Any}()
 const DUMP_PATHS      = Dict{String, String}()
 #= Pristine parameter snapshot per build: event affects mutate the problem's
@@ -63,6 +69,18 @@ end
 function _buildAndCache(modelName::String, modelCode::Expr)
   local OMB = _OMBackend()
   local cname = OMB.canonicalName(modelName)
+  #= Reuse path: identical regenerated code + build flags, a live module and a
+     cached build mean the compiled methods and the problem are still valid.
+     Re-eval'ing identical code would only invalidate `simulateFromBuild` and
+     friends, forcing a full recompile on the next solve. Flags read at build
+     time (not codegen) are folded into the hash so a flag flip still rebuilds. =#
+  local buildHash = hash((modelCode, OMB.DIRECT_RHS_GENERATION[],
+                          OMB.DIRECT_JAC_GENERATION[], OMB.DIRECT_RHS_TYPE_ERASE[]))
+  if get(BUILT_HASH, cname, UInt64(0)) == buildHash &&
+     haskey(BUILT, cname) && isdefined(OMB, Symbol(cname))
+    @info "[IMTK GEN] regenerated code unchanged; reusing compiled module + cached build" model = modelName
+    return nothing
+  end
   try
     if get(ENV, "OMJL_STASH_MODELCODE", "") != ""
       LAST_MODELCODE[] = modelCode
@@ -82,6 +100,7 @@ function _buildAndCache(modelName::String, modelCode::Expr)
       modelFn(IMTK_BUILD_TSPAN)
     end
     BUILT[cname] = res
+    BUILT_HASH[cname] = buildHash
     if res isa Tuple && length(res) >= 5
       REDUCED_SYSTEMS[cname] = res[5]
     end
