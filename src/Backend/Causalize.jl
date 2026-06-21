@@ -439,6 +439,128 @@ end
 
 
 """
+    lowerHigherOrderDerivatives(dae)
+
+Order-lower nested derivatives so SimCode only ever sees a first-order `der` of a
+plain variable: `der(der(x))` becomes `der(der_x)` plus `der_x = der(x)`
+(recursively for higher orders). A no-op unless a variable-based nested `der` is present.
+"""
+function lowerHigherOrderDerivatives(dae::BDAE.BACKEND_DAE)
+  BDAEUtil.mapEqSystems(dae, lowerHigherOrderDerivativesEqSystem)
+end
+
+function lowerHigherOrderDerivativesEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
+  local auxiliaryVars = BDAE.VAR[]
+  local auxiliaryEqs = BDAE.Equation[]
+  #= innermost cref name -> auxiliary derivative cref, so a repeated der(x) shares
+     one auxiliary state and one defining equation. =#
+  local auxiliaryByName = Dict{String, DAE.ComponentRef}()
+  local accumulator = (auxiliaryVars, auxiliaryEqs, auxiliaryByName)
+  @match syst begin
+    BDAE.EQSYSTEM(__) => begin
+      for i in 1:length(syst.orderedEqs)
+        local eq = syst.orderedEqs[i]
+        (loweredEq, _) = BDAEUtil.traverseEquationExpressions(eq, lowerNestedDerExpression, accumulator)
+        if !(eq === loweredEq)
+          @assign syst.orderedEqs[i] = loweredEq
+        end
+      end
+      append!(syst.orderedEqs, auxiliaryEqs)
+      append!(syst.orderedVars, auxiliaryVars)
+      syst
+    end
+  end
+  return syst
+end
+
+"""
+    lowerNestedDerExpression(exp, accumulator)
+
+Rewrite `der(der(...))` to `der(<auxiliary state>)`; first-order `der(x)` is left
+untouched because only a `der` over a `der` matches.
+"""
+function lowerNestedDerExpression(exp::DAE.Exp, accumulator)
+  local auxiliaryVars = accumulator[1]
+  local auxiliaryEqs = accumulator[2]
+  local auxiliaryByName = accumulator[3]
+  local result = begin
+    @match exp begin
+      DAE.CALL(Absyn.IDENT("der"), arg <| _, attr) where (_isNestedDerivative(arg)) => begin
+        local stateCref = _derivativeStateCref(arg, attr, auxiliaryVars, auxiliaryEqs, auxiliaryByName)
+        local loweredExp = DAE.CALL(Absyn.IDENT("der"),
+                                    list(DAE.CREF(stateCref, DAE.T_REAL_DEFAULT)), attr)
+        (loweredExp, false, accumulator)
+      end
+      _ => (exp, true, accumulator)
+    end
+  end
+  return result
+end
+
+#= A der() whose argument is itself a der() bottoming out in a plain cref. =#
+function _isNestedDerivative(exp::DAE.Exp)::Bool
+  return @match exp begin
+    DAE.CALL(Absyn.IDENT("der"), inner <| _, _) => _bottomsOutInCref(inner)
+    _ => false
+  end
+end
+
+function _bottomsOutInCref(exp::DAE.Exp)::Bool
+  return @match exp begin
+    DAE.CREF(_, _) => true
+    DAE.CALL(Absyn.IDENT("der"), inner <| _, _) => _bottomsOutInCref(inner)
+    _ => false
+  end
+end
+
+"""
+    _derivativeStateCref(derExp, attr, auxiliaryVars, auxiliaryEqs, auxiliaryByName)
+
+For `der(inner)`, return a cref whose value equals it, synthesising the auxiliary
+state and defining equation `aux = der(innerCref)` (lowering `inner` first).
+"""
+function _derivativeStateCref(derExp::DAE.Exp, attr,
+                              auxiliaryVars::Vector{BDAE.VAR},
+                              auxiliaryEqs::Vector{BDAE.Equation},
+                              auxiliaryByName::Dict{String, DAE.ComponentRef})::DAE.ComponentRef
+  return @match derExp begin
+    DAE.CALL(Absyn.IDENT("der"), inner <| _, _) => begin
+      local baseCref = _firstOrderArgumentCref(inner, attr, auxiliaryVars, auxiliaryEqs, auxiliaryByName)
+      local baseName = OMBackend.canonicalName(baseCref)
+      local existing = get(auxiliaryByName, baseName, nothing)
+      if existing !== nothing
+        existing
+      else
+        local auxiliaryName = "der_" * baseName
+        local auxiliaryCref = DAE.CREF_IDENT(auxiliaryName, DAE.T_REAL_DEFAULT, nil)
+        local definingRHS = DAE.CALL(Absyn.IDENT("der"),
+                                     list(DAE.CREF(baseCref, DAE.T_REAL_DEFAULT)), attr)
+        push!(auxiliaryEqs, BDAE.EQUATION(DAE.CREF(auxiliaryCref, DAE.T_REAL_DEFAULT),
+                                          definingRHS, DAE.emptyElementSource,
+                                          BDAE.EQ_ATTR_DEFAULT_UNKNOWN))
+        push!(auxiliaryVars, BDAE.VAR(DAE.CREF_IDENT(auxiliaryName, DAE.T_UNKNOWN_DEFAULT, nil),
+                                      BDAE.VARIABLE(), DAE.T_REAL_DEFAULT))
+        auxiliaryByName[baseName] = auxiliaryCref
+        auxiliaryCref
+      end
+    end
+  end
+end
+
+#= Cref c such that der(c) represents der(exp): a plain cref yields itself; a
+   nested der is lowered to an auxiliary state first. =#
+function _firstOrderArgumentCref(exp::DAE.Exp, attr,
+                                 auxiliaryVars::Vector{BDAE.VAR},
+                                 auxiliaryEqs::Vector{BDAE.Equation},
+                                 auxiliaryByName::Dict{String, DAE.ComponentRef})::DAE.ComponentRef
+  return @match exp begin
+    DAE.CREF(cref, _) => cref
+    DAE.CALL(Absyn.IDENT("der"), _, _) => _derivativeStateCref(exp, attr, auxiliaryVars, auxiliaryEqs, auxiliaryByName)
+  end
+end
+
+
+"""
   Author: johti17
 
 """
@@ -552,13 +674,7 @@ end
 Base.@nospecializeinfer function isAlreadyScalarizedCref(@nospecialize(cr::DAE.ComponentRef))::Bool
   @match cr begin
     DAE.CREF_QUAL(_, _, _, inner) => isAlreadyScalarizedCref(inner)
-    DAE.CREF_IDENT(_, _, subs) => begin
-      try
-        return !isempty(collect(subs))
-      catch
-        return false
-      end
-    end
+    DAE.CREF_IDENT(_, _, subs) => !listEmpty(subs)
     _ => false
   end
 end

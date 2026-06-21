@@ -150,8 +150,7 @@ function classifyVariables(simCode)::ClassifiedVariables
      O(V) scan of the matchOrder Vector, making classification O(V^2). matchOrder
      is not mutated in this loop. =#
   local matchOrderSet = OrderedSet{Int}(simCode.matchOrder)
-  for varName in keys(ht)
-    (idx, var) = ht[varName]
+  for (varName, (idx, var)) in ht
     local varType = var.varKind
     @match varType begin
       SimulationCode.INPUT(__) => begin

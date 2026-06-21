@@ -2905,16 +2905,7 @@ function _innermostType(cr::DAE.CREF_QUAL)
   return _innermostType(cr.componentRef)
 end
 
-function _hasDimensions(dims)::Bool
-  try
-    return !listEmpty(dims)
-  catch
-    for _ in dims
-      return true
-    end
-  end
-  return false
-end
+_hasDimensions(dims)::Bool = !isempty(dims)
 
 function _declaredDaeVarCrefType(v::DAE.VAR)::DAE.Type
   local crefTy = _innermostType(v.componentRef)

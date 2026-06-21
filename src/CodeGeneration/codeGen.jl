@@ -1262,7 +1262,7 @@ function expToJuliaExp(e::SimulationCode.EXP_CREF, context::C, varSuffix=""; var
 end
 
 function expToJuliaExp(e::SimulationCode.UNARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local o = opKindToJuliaOperator(e.op)
   quote
     $(o)($(expToJuliaExp(e.exp, context, varPrefix=varPrefix)))
   end
@@ -1270,21 +1270,21 @@ end
 function expToJuliaExp(e::SimulationCode.BINARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   local a = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
   local b = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local o = opKindToJuliaOperator(e.op)
   quote
     $o($(a), $(b))
   end
 end
 function expToJuliaExp(e::SimulationCode.LUNARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   local lhs = expToJuliaExp(e.exp, context, varPrefix=varPrefix)
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local o = opKindToJuliaOperator(e.op)
   quote
     $o($(lhs))
   end
 end
 function expToJuliaExp(e::SimulationCode.LBINARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   local l = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local o = opKindToJuliaOperator(e.op)
   local r = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
   quote
     $o($(l), $(r))
@@ -1292,7 +1292,7 @@ function expToJuliaExp(e::SimulationCode.LBINARY, context::C, varSuffix=""; varP
 end
 function expToJuliaExp(e::SimulationCode.RELATION, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   local lhs = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local o = opKindToJuliaOperator(e.op)
   local rhs = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
   quote
     $o($(lhs), $(rhs))

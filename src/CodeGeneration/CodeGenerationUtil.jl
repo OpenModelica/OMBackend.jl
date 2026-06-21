@@ -361,6 +361,29 @@ function DAE_OP_toJuliaOperator(@nospecialize(op::DAE.Operator))
     end
 end
 
+#= Direct SimCode OpKind -> Julia operator Symbol, equivalent to
+   DAE_OP_toJuliaOperator(toDAEOperator(k)) but without the throwaway
+   DAE.Operator allocation per operator node in codegen. =#
+function opKindToJuliaOperator(k::SimulationCode.OpKind)::Symbol
+  if k === SimulationCode.OP_ADD;          :+
+  elseif k === SimulationCode.OP_SUB;      :-
+  elseif k === SimulationCode.OP_MUL;      :*
+  elseif k === SimulationCode.OP_DIV;      :/
+  elseif k === SimulationCode.OP_POW;      :^
+  elseif k === SimulationCode.OP_UMINUS;   :-
+  elseif k === SimulationCode.OP_AND;      :(&)
+  elseif k === SimulationCode.OP_OR;       :(||)
+  elseif k === SimulationCode.OP_NOT;      :(!)
+  elseif k === SimulationCode.OP_LESS;     :(<)
+  elseif k === SimulationCode.OP_LESSEQ;   :(<=)
+  elseif k === SimulationCode.OP_GREATER;  :(>)
+  elseif k === SimulationCode.OP_GREATEREQ; :(>=)
+  elseif k === SimulationCode.OP_EQUAL;    :(==)
+  elseif k === SimulationCode.OP_NEQUAL;   :(!=)
+  else error("opKindToJuliaOperator: unhandled OpKind $k")
+  end
+end
+
 
 "
   TODO: Keeping it simple for now, we assume we only have one argument in the call

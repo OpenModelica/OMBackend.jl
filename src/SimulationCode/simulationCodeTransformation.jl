@@ -157,7 +157,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   local allSharedVars::Vector{BDAE.VAR} = getSharedVariablesLocalsAndGlobals(shared)
   local allBackendVars = vcat(equationSystem.orderedVars, allSharedVars)
   local simVars::Vector{SimulationCode.SIMVAR} = createAndCollectSimulationCodeVariables(allBackendVars, shared.flatModel)
-  local occVars = map((v)-> v.name, filter((v) -> isOCCVar(v), simVars))
+  local occVars = String[v.name for v in simVars if isOCCVar(v)]
   #=
     Check if the model has state variables, if not introduce a dummy state
   =#
@@ -1095,7 +1095,7 @@ an equation system. If no such data is present. Return two empty arrays
 function getSharedVariablesLocalsAndGlobals(shared::BDAE.SHARED)
   @match shared begin
     BDAE.SHARED(__) => vcat(shared.globalKnownVars, shared.localKnownVars)
-    _ => []
+    _ => BDAE.VAR[]
   end
 end
 
