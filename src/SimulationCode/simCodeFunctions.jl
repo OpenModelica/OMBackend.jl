@@ -975,9 +975,13 @@ Base.@nospecializeinfer function tryEvalScalar(@nospecialize(exp::DAE.Exp), simC
         nothing
       else
         local (name, bindExp) = bound
-        local childSeen = copy(seen)
-        push!(childSeen, name)
-        tryEvalScalar(bindExp, simCode, childSeen)
+        #= Backtracking cycle guard on a shared set avoids copying `seen` per CREF. =#
+        push!(seen, name)
+        try
+          tryEvalScalar(bindExp, simCode, seen)
+        finally
+          delete!(seen, name)
+        end
       end
     end
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
@@ -1012,9 +1016,13 @@ function _tryEvalNumeric(exp::DAE.Exp, simCode::SIM_CODE, seen::OrderedSet{Strin
         nothing
       else
         local (name, bindExp) = bound
-        local childSeen = copy(seen)
-        push!(childSeen, name)
-        _tryEvalNumeric(bindExp, simCode, childSeen)
+        #= Backtracking cycle guard on a shared set avoids copying `seen` per CREF. =#
+        push!(seen, name)
+        try
+          _tryEvalNumeric(bindExp, simCode, seen)
+        finally
+          delete!(seen, name)
+        end
       end
     end
     DAE.UNARY(DAE.UMINUS(__), inner) => begin

@@ -1355,11 +1355,11 @@ end
   Get all subscripts from a CREF, collecting from all levels.
   Returns a Vector of DAE.Subscript.
 """
-function getSubscriptsFromCref(cref::DAE.ComponentRef)::Vector
+function getSubscriptsFromCref(cref::DAE.ComponentRef)::Vector{DAE.Subscript}
   local subscripts = DAE.Subscript[]
   for c in getAllCrefsAsVector(cref)
     if !isempty(c.subscriptLst)
-      append!(subscripts, collect(c.subscriptLst))
+      append!(subscripts, c.subscriptLst)
     end
   end
   return subscripts
@@ -1370,12 +1370,13 @@ end
   E.g., for R_w[1] returns "R_w".
 """
 function getBaseNameWithoutSubscripts(cref::DAE.ComponentRef)::String
-  local crefs = getAllCrefsAsVector(cref)
-  local parts = String[]
-  for c in crefs
-    push!(parts, c.ident)
+  local buf = IOBuffer()
+  local first = true
+  for c in getAllCrefsAsVector(cref)
+    first ? (first = false) : print(buf, "_")
+    print(buf, c.ident)
   end
-  return join(parts, "_")
+  return String(take!(buf))
 end
 
 end #=End Util=#

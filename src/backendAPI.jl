@@ -630,6 +630,8 @@ function lower(frontendDAE::DAE.DAE_LIST)::BDAE.BACKEND_DAE
     @debug "[BDAE] translated; full dump is available in backend/bdae logs when backend logging is enabled"
     #= Transform ASUB expressions: der(array)[i] to der(array[i]) =#
     bDAE = Causalize.transformASUBExpressions(bDAE)
+    #= Order-lower nested derivatives der(der(x)) into first-order auxiliary states =#
+    bDAE = Causalize.lowerHigherOrderDerivatives(bDAE)
     #= Mark state variables =#
     bDAE = Causalize.detectStates(bDAE)
     @debug "[BDAE] states marked"
@@ -687,6 +689,8 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
     bDAE = Causalize.resolveIntegerVariables(bDAE)
     #= Transform ASUB expressions: der(array)[i] to der(array[i]) =#
     bDAE = Causalize.transformASUBExpressions(bDAE)
+    #= Order-lower nested derivatives der(der(x)) into first-order auxiliary states =#
+    bDAE = Causalize.lowerHigherOrderDerivatives(bDAE)
     #= Mark state variables =#
     bDAE = Causalize.detectStates(bDAE)
     @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterDetectStates.log"), BDAEUtil.stringHeading1(bDAE, "after detect states"))

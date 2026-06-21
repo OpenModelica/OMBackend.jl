@@ -445,13 +445,7 @@ Base.@nospecializeinfer function _ifexpBranchIsNonReal(@nospecialize(e::DAE.Exp)
   @match e begin
     DAE.SCONST(_) => true
     DAE.CREF(_, ty) => ty isa DAE.T_STRING
-    DAE.CALL(_, _, attrs) => begin
-      try
-        attrs.ty isa DAE.T_STRING
-      catch
-        false
-      end
-    end
+    DAE.CALL(_, _, attrs) => attrs.ty isa DAE.T_STRING
     DAE.IFEXP(_, t, el) => _ifexpBranchIsNonReal(t) || _ifexpBranchIsNonReal(el)
     _ => false
   end
@@ -537,7 +531,7 @@ function expToJuliaExpMTK(exp::SimulationCode.BINARY, simCode::SimulationCode.SI
                                 varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
   local rhs = expToJuliaExpMTK(exp.exp2, simCode;
                                 varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+  local opSym = opKindToJuliaOperator(exp.op)
   return :( $opSym($(lhs), $(rhs)) )
 end
 
@@ -545,7 +539,7 @@ function expToJuliaExpMTK(exp::SimulationCode.UNARY, simCode::SimulationCode.SIM
                           varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
   local operand = expToJuliaExpMTK(exp.exp, simCode;
                                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+  local opSym = opKindToJuliaOperator(exp.op)
   return :( $opSym($(operand)) )
 end
 
@@ -556,7 +550,7 @@ function expToJuliaExpMTK(exp::SimulationCode.LUNARY, simCode::SimulationCode.SI
   if exp.op === SimulationCode.OP_NOT
     return :( 1 - $(operand) )
   end
-  local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+  local opSym = opKindToJuliaOperator(exp.op)
   return :( $opSym($(operand)) )
 end
 
@@ -571,7 +565,7 @@ function expToJuliaExpMTK(exp::SimulationCode.LBINARY, simCode::SimulationCode.S
   elseif exp.op === SimulationCode.OP_AND
     return :( $(lhs) * $(rhs) )
   end
-  local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+  local opSym = opKindToJuliaOperator(exp.op)
   return :( $opSym($(lhs), $(rhs)) )
 end
 
@@ -581,7 +575,7 @@ function expToJuliaExpMTK(exp::SimulationCode.RELATION, simCode::SimulationCode.
                                 varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
   local rhs = expToJuliaExpMTK(exp.exp2, simCode;
                                 varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+  local opSym = opKindToJuliaOperator(exp.op)
   return quote ($opSym($(lhs), $(rhs))) end
 end
 
