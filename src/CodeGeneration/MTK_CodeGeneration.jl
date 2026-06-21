@@ -4145,7 +4145,7 @@ function decomposeEquationsInline(equations, parameterAssignments; chunkSize::In
   local constructors = quote
     $(parameterAssignments...)
     local equationConstructors::Vector{Function}
-    local equationConstructorCalls::Vector
+    local equationConstructorCalls::Vector{Function}
   end
   push!(exprs, constructors)
   local i = 0
@@ -4156,14 +4156,14 @@ function decomposeEquationsInline(equations, parameterAssignments; chunkSize::In
     if isempty(csPreamble)
       push!(exprs, quote
         function $(fName)()
-          [$(eqv...)]
+          Symbolics.Equation[$(eqv...)]
         end
       end)
     else
       push!(exprs, quote
         function $(fName)()
           $(csPreamble...)
-          [$(csEqs...)]
+          Symbolics.Equation[$(csEqs...)]
         end
       end)
     end

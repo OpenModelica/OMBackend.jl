@@ -1163,36 +1163,8 @@ function collectCrefNames!(names::OrderedSet{String}, exp::Exp)
     CALL(__) => begin for x in exp.args; collectCrefNames!(names, x) end end
     RECORD(__) => begin for x in exp.exps; collectCrefNames!(names, x) end end
     TUPLE(__) => begin for x in exp.PR; collectCrefNames!(names, x) end end
-    REDUCTION(__) => begin
-      collectCrefNames!(names, exp.body)
-      #= iterators carry DAE.ReductionIterator range/guard exps (passed through by
-         toDAEExp); collect their crefs to match the DAE collector exactly. =#
-      for it in exp.iterators
-        @match it begin
-          DAE.REDUCTIONITER(exp = rangeExp) => collectCrefNames!(names, rangeExp)
-          _ => ()
-        end
-      end
-    end
-    ASUB(__) => begin
-      if exp.exp isa EXP_CREF
-        local allConst = true
-        local sstr = ""
-        for s in exp.subs
-          @match s begin
-            ICONST(i) => (sstr *= Base.string("[", i, "]"))
-            _ => (allConst = false)
-          end
-        end
-        if allConst && !isempty(sstr)
-          push!(names, Base.string(DAE_identifierToString(toDAECref(exp.exp.cref).componentRef), sstr))
-        end
-      end
-      collectCrefNames!(names, exp.exp)
-      for s in exp.subs
-        collectCrefNames!(names, s)
-      end
-    end
+    REDUCTION(__) => collectCrefNamesForReduction(names, exp)
+    ASUB(__) => collectCrefNamesForAsub(names, exp)
     _ => ()
   end
   return names
@@ -1228,38 +1200,7 @@ function collectCrefNames!(names::OrderedSet{String}, @nospecialize(exp))
         collectCrefNames!(names, e)
       end
     end
-    DAE.ASUB(exp = e, sub = subs) => begin
-      #= When ASUB wraps a CREF with constant integer subscripts, reconstruct the
-         subscripted name (e.g. "R_T[1][1]") to match the hash table key format.
-         Without this, the BFS use-def chain is broken: collectCrefNames collects
-         the base name "R_T" but the hash table has "R_T[1][1]". =#
-      local asubHandled = false
-      @match e begin
-        DAE.CREF(cr, _) => begin
-          local baseName = DAE_identifierToString(cr)
-          local allConst = true
-          local subscriptStr = ""
-          for s in subs
-            @match s begin
-              DAE.ICONST(i) => begin subscriptStr *= Base.string("[", i, "]") end
-              _ => begin allConst = false end
-            end
-          end
-          if allConst && !isempty(subscriptStr)
-            push!(names, Base.string(baseName, subscriptStr))
-          end
-          push!(names, baseName)
-          asubHandled = true
-        end
-        _ => ()
-      end
-      if !asubHandled
-        collectCrefNames!(names, e)
-      end
-      for s in subs
-        collectCrefNames!(names, s)
-      end
-    end
+    DAE.ASUB(exp = e, sub = subs) => collectCrefNamesForDAEAsub(names, e, subs)
     DAE.RELATION(exp1 = e1, exp2 = e2) => begin
       collectCrefNames!(names, e1)
       collectCrefNames!(names, e2)
@@ -1277,6 +1218,105 @@ function collectCrefNames!(names::OrderedSet{String}, @nospecialize(exp))
       end
     end
     _ => ()
+  end
+  return nothing
+end
+
+"""
+    _simConstSubscriptSuffix(subs::Vector{Exp}) -> Union{String, Nothing}
+
+Build the `"[i][j]..."` suffix for an all-constant integer SIM subscript list.
+Returns `nothing` if any subscript is non-constant or the list is empty.
+"""
+function _simConstSubscriptSuffix(subs::Vector{Exp})::Union{String, Nothing}
+  local suffix = ""
+  for s in subs
+    local piece = @match s begin
+      ICONST(i) => Base.string("[", i, "]")
+      _ => nothing
+    end
+    piece === nothing && return nothing
+    suffix = Base.string(suffix, piece)
+  end
+  return isempty(suffix) ? nothing : suffix
+end
+
+"""
+    _daeConstSubscriptSuffix(subs) -> Union{String, Nothing}
+
+DAE-side counterpart of `_simConstSubscriptSuffix` over a `DAE.ICONST` subscript
+list. Returns `nothing` if any subscript is non-constant or the list is empty.
+"""
+function _daeConstSubscriptSuffix(@nospecialize(subs))::Union{String, Nothing}
+  local suffix = ""
+  for s in subs
+    local piece = @match s begin
+      DAE.ICONST(i) => Base.string("[", i, "]")
+      _ => nothing
+    end
+    piece === nothing && return nothing
+    suffix = Base.string(suffix, piece)
+  end
+  return isempty(suffix) ? nothing : suffix
+end
+
+"Collect cref names from a SIM `REDUCTION` body and its iterator range/guard exps."
+function collectCrefNamesForReduction(names::OrderedSet{String}, exp::REDUCTION)
+  collectCrefNames!(names, exp.body)
+  #= iterators carry DAE.ReductionIterator range/guard exps (passed through by
+     toDAEExp); collect their crefs to match the DAE collector exactly. =#
+  for it in exp.iterators
+    @match it begin
+      DAE.REDUCTIONITER(exp = rangeExp) => collectCrefNames!(names, rangeExp)
+      _ => ()
+    end
+  end
+  return names
+end
+
+"""
+    collectCrefNamesForAsub(names::OrderedSet{String}, exp::ASUB) -> names
+
+Collect cref names from a SIM `ASUB`, reconstructing the subscripted key
+(e.g. `"R_T[1][1]"`) for all-constant subscripts so the use-def chain matches
+the scalarized hash-table keys.
+"""
+function collectCrefNamesForAsub(names::OrderedSet{String}, exp::ASUB)
+  if exp.exp isa EXP_CREF
+    local suffix = _simConstSubscriptSuffix(exp.subs)
+    if suffix !== nothing
+      push!(names, Base.string(DAE_identifierToString(toDAECref(exp.exp.cref).componentRef), suffix))
+    end
+  end
+  collectCrefNames!(names, exp.exp)
+  for s in exp.subs
+    collectCrefNames!(names, s)
+  end
+  return names
+end
+
+"""
+    collectCrefNamesForDAEAsub(names::OrderedSet{String}, e, subs) -> nothing
+
+DAE-side counterpart of `collectCrefNamesForAsub`: reconstructs the subscripted
+key for a `DAE.CREF` base with all-constant subscripts, then descends into the
+base and subscript expressions.
+"""
+function collectCrefNamesForDAEAsub(names::OrderedSet{String}, @nospecialize(e), @nospecialize(subs))
+  local asubHandled = false
+  @match e begin
+    DAE.CREF(cr, _) => begin
+      local baseName = DAE_identifierToString(cr)
+      local suffix = _daeConstSubscriptSuffix(subs)
+      suffix === nothing || push!(names, Base.string(baseName, suffix))
+      push!(names, baseName)
+      asubHandled = true
+    end
+    _ => ()
+  end
+  asubHandled || collectCrefNames!(names, e)
+  for s in subs
+    collectCrefNames!(names, s)
   end
   return nothing
 end
@@ -1800,6 +1840,123 @@ function _hasExplicitFixedStart(@nospecialize(attrs))::Bool
   end
 end
 
+"`true` if `exp` is a literal `1` exponent, so `base ^ exp` stays affine in base."
+function _isUnitExponent(exp::Exp)::Bool
+  @match exp begin
+    RCONST(v) => v == 1.0
+    ICONST(v) => v == 1
+    _ => false
+  end
+end
+
+"ASUB scalar HT name for an all-constant-subscript cref base, else `nothing`."
+function _asubScalarName(exp::ASUB)::Union{String, Nothing}
+  exp.exp isa EXP_CREF || return nothing
+  local suffix = _simConstSubscriptSuffix(exp.subs)
+  suffix === nothing && return nothing
+  return Base.string(DAE_identifierToString(toDAECref(exp.exp.cref).componentRef), suffix)
+end
+
+"""
+    _simCrefScalarName(exp::Exp) -> Union{String, Nothing}
+
+Canonical scalar hash-table name for a cref-shaped `exp` (matching
+`collectCrefNames!` keys), or `nothing` when `exp` is not a cref or has no
+stable scalar name (e.g. an ASUB with non-constant subscripts).
+"""
+function _simCrefScalarName(exp::Exp)::Union{String, Nothing}
+  @match exp begin
+    EXP_CREF(__) => DAE_identifierToString(toDAECref(exp.cref).componentRef)
+    ASUB(__) => _asubScalarName(exp)
+    _ => nothing
+  end
+end
+
+"`true` if `varName` is referenced anywhere in `exp` (reuses `collectCrefNames!`)."
+function _occursAnywhere(exp::Exp, varName::AbstractString)::Bool
+  local names = OrderedSet{String}()
+  collectCrefNames!(names, exp)
+  return varName in names
+end
+
+"""
+    _powLinearity(exponent, oBase, lBase, oExp) -> (occurs, linear)
+
+Linearity of `base ^ exponent` w.r.t. the target variable, from the base's
+occurrence/linearity (`oBase`, `lBase`) and whether the exponent contains it
+(`oExp`). Only `base ^ 1` with a linear base stays affine.
+"""
+function _powLinearity(exponent::Exp, oBase::Bool, lBase::Bool, oExp::Bool)::Tuple{Bool, Bool}
+  oExp && return (true, false)
+  oBase || return (false, true)
+  return _isUnitExponent(exponent) ? (true, lBase) : (true, false)
+end
+
+"Occurrence/linearity of `varName` across a SIM `BINARY` node. Enum operators
+are compared by value (`@match` treats a bare enum name as a capture binding)."
+function _binaryLinearity(exp::BINARY, varName::AbstractString)::Tuple{Bool, Bool}
+  local (o1, l1) = _occursLinearly(exp.exp1, varName)
+  local (o2, l2) = _occursLinearly(exp.exp2, varName)
+  local op = exp.op
+  if op === OP_ADD || op === OP_SUB
+    return (o1 || o2, l1 && l2)
+  elseif op === OP_MUL
+    return (o1 || o2, l1 && l2 && !(o1 && o2))
+  elseif op === OP_DIV
+    return (o1 || o2, l1 && !o2)
+  elseif op === OP_POW
+    return _powLinearity(exp.exp2, o1, l1, o2)
+  else
+    return (o1 || o2, !(o1 || o2))
+  end
+end
+
+"Occurrence/linearity of `varName` across a SIM `IFEXP` (var in cond ⇒ nonlinear)."
+function _ifexpLinearity(exp::IFEXP, varName::AbstractString)::Tuple{Bool, Bool}
+  local (oc, _) = _occursLinearly(exp.cond, varName)
+  oc && return (true, false)
+  local (ot, lt) = _occursLinearly(exp.thenExp, varName)
+  local (oe, le) = _occursLinearly(exp.elseExp, varName)
+  return (ot || oe, lt && le)
+end
+
+"""
+    _occursLinearly(exp::Exp, varName::AbstractString) -> (occurs::Bool, linear::Bool)
+
+Whether `varName` appears in `exp`, and if so only affinely (degree ≤ 1, never
+inside a nonlinear operator or function argument). Conservative: any construct
+whose linearity cannot be established yields `linear = false`, which keeps the
+variable in the residual system (always semantically valid).
+"""
+function _occursLinearly(exp::Exp, varName::AbstractString)::Tuple{Bool, Bool}
+  local nm = _simCrefScalarName(exp)
+  nm === nothing || return (nm == varName, true)
+  @match exp begin
+    UNARY(__) || CAST(__) => _occursLinearly(exp.exp, varName)
+    BINARY(__) => _binaryLinearity(exp, varName)
+    IFEXP(__) => _ifexpLinearity(exp, varName)
+    ICONST(__) || RCONST(__) || BCONST(__) || SCONST(__) || ENUM_LITERAL(__) || WILD(__) =>
+      (false, true)
+    _ => begin
+      local occurs = _occursAnywhere(exp, varName)
+      (occurs, !occurs)
+    end
+  end
+end
+
+"""
+    _isLinearlySolvableFor(exp::Exp, varName::AbstractString) -> Bool
+
+`true` iff `varName` appears in residual `exp` and only affinely, so
+`Symbolics.solve_for(0 ~ exp, varName)` yields a valid explicit observation.
+An output-only sink variable failing this test (e.g. defined by a nonlinear
+closure) must stay in the residual system for MTK to solve numerically.
+"""
+function _isLinearlySolvableFor(exp::Exp, varName::AbstractString)::Bool
+  local (occurs, linear) = _occursLinearly(exp, varName)
+  return occurs && linear
+end
+
 """
     eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOptions)
 
@@ -1850,6 +2007,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   local eliminatedPairs = Tuple{String, Int}[]  #= (varName, eqIdx) for pairing =#
   local nSkippedNonAlg = 0
   local nSkippedUnmatched = 0
+  local nSkippedNonlinear = 0
   for eqIdx in outputOnlyEqIndices
     if !haskey(eqToMatchIdx, eqIdx)
       nSkippedUnmatched += 1
@@ -1872,6 +2030,14 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
       _ => false
     end
     if isEliminable
+      #= The eliminated pair is later reconstructed via Symbolics.solve_for, a
+         linear solver. A variable defined by an equation nonlinear in itself
+         (e.g. a holonomic loop closure) must stay in the residual system for
+         MTK to solve numerically; eliminating it would trip `islinear`. =#
+      if !_isLinearlySolvableFor(simCode.residualEquations[eqIdx].exp, vn)
+        nSkippedNonlinear += 1
+        continue
+      end
       push!(eqsToEliminate, eqIdx)
       push!(varsToRemove, vn)
       push!(eliminatedPairs, (vn, eqIdx))
@@ -2003,7 +2169,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   for varName in varsToRemove
     delete!(newHT, varName)
   end
-  @debug "[SIMCODE: $(simCode.name): eliminateNonDynamic] eliminated $(length(eqsToEliminate)) eq-var pairs, $(length(varsToRemove)) variables removed (rescued: $nRescued, skipped: $nSkippedNonAlg non-algebraic, $nSkippedUnmatched unmatched). $(length(newResEqs)) equations, $(length(newHT)) variables remain"
+  @debug "[SIMCODE: $(simCode.name): eliminateNonDynamic] eliminated $(length(eqsToEliminate)) eq-var pairs, $(length(varsToRemove)) variables removed (rescued: $nRescued, skipped: $nSkippedNonAlg non-algebraic, $nSkippedNonlinear nonlinear, $nSkippedUnmatched unmatched). $(length(newResEqs)) equations, $(length(newHT)) variables remain"
   @BACKEND_LOGGING begin
     local buf = IOBuffer()
     println(buf, "=== ELIMINATION DEBUG ===")
