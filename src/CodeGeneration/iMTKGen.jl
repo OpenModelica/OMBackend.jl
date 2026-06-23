@@ -66,17 +66,18 @@ end
 #= Eval the module, invoke `<name>Model(IMTK_BUILD_TSPAN)` (runs structural_simplify),
    and cache the resulting 9-tuple. The post-simplify System (element 5) is also
    stashed for the optional dump and external inspection via `reducedSystem`. =#
-function _buildAndCache(modelName::String, modelCode::Expr)
+function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool = false)
   local OMB = _OMBackend()
   local cname = OMB.canonicalName(modelName)
   #= Reuse path: identical regenerated code + build flags, a live module and a
      cached build mean the compiled methods and the problem are still valid.
      Re-eval'ing identical code would only invalidate `simulateFromBuild` and
      friends, forcing a full recompile on the next solve. Flags read at build
-     time (not codegen) are folded into the hash so a flag flip still rebuilds. =#
+     time (not codegen) are folded into the hash so a flag flip still rebuilds.
+     `overwriteCache` bypasses this reuse check to force a fresh rebuild. =#
   local buildHash = hash((modelCode, OMB.DIRECT_RHS_GENERATION[],
                           OMB.DIRECT_JAC_GENERATION[], OMB.DIRECT_RHS_TYPE_ERASE[]))
-  if get(BUILT_HASH, cname, UInt64(0)) == buildHash &&
+  if !overwriteCache && get(BUILT_HASH, cname, UInt64(0)) == buildHash &&
      haskey(BUILT, cname) && isdefined(OMB, Symbol(cname))
     @info "[IMTK GEN] regenerated code unchanged; reusing compiled module + cached build" model = modelName
     return nothing
@@ -164,13 +165,25 @@ function simulateIMTK(modelName::String, tspan, solver; kwargs...)
       if haskey(PRISTINE_P, cname)
         prob = OMB.Runtime.ModelingToolkit.SciMLBase.remake(prob; p = deepcopy(PRISTINE_P[cname]))
       end
-      local rebuilt = (prob, cached[2], cached[3], cached[4], cached[5],
-                       tspan, cached[7], cached[8], cached[9])
       #= Route through `mod.simulate(...; cached_build = rebuilt)` using the same
          closure form as the MTK path, so the body executes inside the model module
          and `global LATEST_REDUCED_SYSTEM = …` / `global LATEST_PROBLEM = …` are
-         visible to subsequent introspection on the module. =#
+         visible to subsequent introspection on the module.
+         Collapse the continuous callbacks HERE, inside invokelatest (a settled world,
+         the build call having returned), then remake: the FunctionWrappers built around
+         the RGF-backed MTK callbacks now resolve to the live methods (build-time collapse
+         captured a stale world -> wrong events), and the collapsed prob has the
+         model-independent erased type whose `solve` is baked into the image. =#
       return Base.invokelatest() do
+        local SB = OMB.Runtime.ModelingToolkit.SciMLBase
+        local p = prob
+        if OMB.DIRECT_RHS_TYPE_ERASE[]
+          local cb = get(p.kwargs, :callback, nothing)
+          cb === nothing ||
+            (p = SB.remake(p; callback = OMB.CodeGeneration._eraseContinuousCallbacks(cb)))
+        end
+        local rebuilt = (p, cached[2], cached[3], cached[4], cached[5],
+                         tspan, cached[7], cached[8], cached[9])
         getfield(OMB, Symbol(cname)).simulate(tspan, solver; cached_build = rebuilt, kwargs...)
       end
     catch e

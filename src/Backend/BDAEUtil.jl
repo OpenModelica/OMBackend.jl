@@ -55,7 +55,7 @@ end
 """
   Traverse and update a given structure BDAE.BDAEStructure given a traversalOperation and optional arguments
 """
-function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation::Function, args...)
+function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation, args...)
   dae = begin
     local eqs::Array{BDAE.EqSystem, 1}
     @match dae begin
@@ -73,7 +73,7 @@ function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation::Function, args.
   end
 end
 
-function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation::Function)
+function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation)
   dae = begin
     local eqs::Vector{BDAE.EQSYSTEM}
     @match dae begin
@@ -91,7 +91,7 @@ function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation::Function)
   end
 end
 
-function mapEqSystemEquations(syst::BDAE.EQSYSTEM, traversalOperation::Function)
+function mapEqSystemEquations(syst::BDAE.EQSYSTEM, traversalOperation)
   syst = begin
     local eqs::Array{BDAE.Equation,1}
     @match syst begin
@@ -106,7 +106,7 @@ function mapEqSystemEquations(syst::BDAE.EQSYSTEM, traversalOperation::Function)
   end
 end
 
-function mapEqSystemEquationsNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::Function, extArg::T)::T where {T}
+function mapEqSystemEquationsNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation, extArg::T)::T where {T}
   extArg = begin
     local eqs::Array{BDAE.Equation,1}
     @match syst begin
@@ -120,7 +120,7 @@ function mapEqSystemEquationsNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::F
   end
 end
 
-function mapEqSystemVariablesNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::Function, extArg::T)::T where {T}
+function mapEqSystemVariablesNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation, extArg::T)::T where {T}
   extArg = begin
     local varArr::Array{BDAE.Var,1}
     @match syst begin
@@ -145,7 +145,7 @@ function crefLeafType(@nospecialize(cref))
 end
 
 function _traverseComponentRef(cref::DAE.ComponentRef,
-                               traversalOperation::Function,
+                               traversalOperation,
                                extArg::T)::Tuple{DAE.ComponentRef, T} where {T}
   local exp = DAE.CREF(cref, crefLeafType(cref))
   local newExp
@@ -161,7 +161,7 @@ end
   Mutates the given equation.
 """
 function traverseEquationExpressions(eq::BDAE.Equation,
-                                     traversalOperation::Function,
+                                     traversalOperation,
                                      extArg::T)::Tuple{BDAE.Equation,T} where{T}
    (eq, extArg) = begin
      local lhs::DAE.Exp

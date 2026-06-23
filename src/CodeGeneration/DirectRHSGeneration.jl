@@ -188,6 +188,11 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   #    Our structural_simplify wrapper uses split=false, so the compiled event
   #    callbacks expect a flat parameter vector matching our p_vec format.
   local allCallbacks = _extractAndMergeEventCallbacks(reducedSystem, callbacks)
+  #= The callback is stored UN-collapsed; the erasure happens at SOLVE time
+     (simulateIMTK), in a settled world, so the FunctionWrappers it builds dispatch
+     correctly to RGF-backed MTK callbacks (build-time collapse captured a stale world
+     -> wrong events). The solve-time collapse also yields the model-independent erased
+     type whose `solve` is baked into the image. =#
 
   # 5. Construct ODEProblem, handling mass matrix for DAE systems.
   #    Attach reducedSystem via sys= so callbacks can look up state/parameter
@@ -996,6 +1001,162 @@ function _extractAndMergeEventCallbacks(reducedSystem, customCallbacks)
   end
   @debug "DirectRHS: extracted event callbacks from reduced system"
   return eventCBs
+end
+
+
+# Trivial reinit: no post-event DAE re-initialization, so the merged callback's
+# default (nothing) is behaviour-preserving.
+_isTrivialReinit(ia)::Bool = ia === nothing || ia isa ModelingToolkit.SciMLBase.NoInit
+
+#= Typed callable structs for the merged continuous callback. Typed fields and a
+   concrete struct type keep the merged condition/affect inferred (vs a closure
+   boxing its captures); the FunctionWrapper in `_eraseContinuousCallbacks` erases
+   the outer type for the image bake. =#
+struct _MergedContinuousCondition{S}
+  subs::S
+  offsets::Vector{Int}
+  nsub::Int
+end
+
+# `integrator` stays untyped: the FunctionWrapper declares it `Any` to keep the
+# wrapped callback type model-independent.
+# `out` / `u` are AbstractVector, NOT Vector: SciML's VectorContinuousCallback passes
+# `out` as a SubArray view of the rootfind buffer. A concrete `Vector{Float64}` arg (here
+# or in the FunctionWrapper signature) forces a convert/copy, so writes to `out` land in a
+# discarded copy and no crossing is ever detected.
+function (c::_MergedContinuousCondition)(out::AbstractVector{Float64}, u::AbstractVector{Float64},
+                                         t::Float64, integrator)::Nothing
+  local SB = ModelingToolkit.SciMLBase
+  for k in 1:c.nsub
+    local s = c.subs[k]
+    if s isa SB.VectorContinuousCallback
+      s.condition(view(out, (c.offsets[k] + 1):c.offsets[k + 1]), u, t, integrator)
+    else
+      out[c.offsets[k] + 1] = s.condition(u, t, integrator)
+    end
+  end
+  return nothing
+end
+
+# One struct serves both affect! and affect_neg! (selected by `neg`). The vector
+# affect signature is (integrator, componentIndex).
+struct _MergedContinuousAffect{S}
+  subs::S
+  offsets::Vector{Int}
+  lens::Vector{Int}
+  nsub::Int
+  neg::Bool
+end
+
+function (a::_MergedContinuousAffect)(integrator, gidx::Int)::Nothing
+  local SB = ModelingToolkit.SciMLBase
+  # Map the global 1-based component index to (subIndex, localIndex).
+  local k::Int = a.nsub
+  local li::Int = a.lens[a.nsub]
+  for kk in 1:a.nsub
+    if gidx <= a.offsets[kk + 1]
+      k = kk
+      li = gidx - a.offsets[kk]
+      break
+    end
+  end
+  local s = a.subs[k]
+  local aff = a.neg ? s.affect_neg! : s.affect!
+  aff === nothing && return nothing
+  s isa SB.VectorContinuousCallback ? aff(integrator, li) : aff(integrator)
+  return nothing
+end
+
+# Runs every sub-callback's `initialize` at integration start. Lets a sub carrying a
+# custom initialize (e.g. chua's DAE event) collapse WITHOUT dropping it; the merge
+# is FunctionWrapper-erased so the VCC's initialize param stays model-independent.
+struct _MergedContinuousInitialize{S}
+  subs::S
+  nsub::Int
+end
+
+function (m::_MergedContinuousInitialize)(c, u, t, integrator)::Nothing
+  for k in 1:m.nsub
+    local s = m.subs[k]
+    s.initialize(s, u, t, integrator)
+  end
+  return nothing
+end
+
+"""
+    _eraseContinuousCallbacks(cbset)
+
+Collapse the continuous callbacks of a `CallbackSet` into a single
+`VectorContinuousCallback` whose combined condition / affect! / affect_neg! are
+typed callable structs wrapped in `FunctionWrappers` (integrator typed `Any`)
+that dispatch to the original per-component callbacks by index. This removes the
+two model-specific axes of the callback type, the tuple arity (number of
+continuous callbacks) and the per-event closure types, so the `CallbackSet` type
+is constant across models and `solve` can be compiled once and baked into the
+image. Per-component event semantics are preserved exactly: each component's own
+condition, affect! and affect_neg! are called unchanged. Discrete callbacks are
+passed through.
+
+Called at SOLVE time (see `simulateIMTK`) in a settled world, so it collapses any
+callable — OM-generated closures and MTK `process_events` `CompiledCondition` /
+`FunctionalAffect` alike (the integrator never dispatches on the concrete type).
+Returns `cbset` unchanged (no collapse) when there is no continuous callback, or on
+any structural surprise: a non-`CallbackSet` argument, a continuous entry that is
+neither a scalar `ContinuousCallback` nor a `VectorContinuousCallback`, non-uniform
+`rootfind` / `save_positions` across components, or any component carrying event
+metadata a flat merge cannot represent (a custom `initialize` / `finalize`, an
+`idxs` slice, or a non-trivial reinitialization algorithm).
+"""
+function _eraseContinuousCallbacks(cbset)
+  local SB = ModelingToolkit.SciMLBase
+  cbset isa SB.CallbackSet || return cbset
+  local subs = collect(cbset.continuous_callbacks)
+  local dc = cbset.discrete_callbacks
+  isempty(subs) && return cbset
+  for s in subs
+    (s isa SB.ContinuousCallback || s isa SB.VectorContinuousCallback) || return cbset
+  end
+  #= No parentmodule check: this runs at SOLVE time (see simulateIMTK), in a settled
+     world, so MTK process_events callbacks (CompiledCondition / FunctionalAffect,
+     RGF-backed) collapse correctly too. The structural guard below is the only safety
+     bound the integrator needs (it never dispatches on the concrete callback type). =#
+  #= A flat merge is faithful only when no sub-callback carries event metadata the
+     merge cannot represent: a custom `finalize` (would be dropped), an `idxs` slice
+     (the condition would read the wrong state), or a non-trivial reinitialization
+     algorithm (post-event DAE consistency would change). A custom `initialize` IS
+     allowed: it is preserved via the merged initialize below (chua's DAE event). =#
+  for s in subs
+    (s.finalize === SB.FINALIZE_DEFAULT &&
+     s.idxs === nothing &&
+     _isTrivialReinit(s.initializealg)) || return cbset
+  end
+  #= A single VectorContinuousCallback applies one rootfind / save_positions to
+     every component, so only collapse when these already agree. =#
+  local rootfind = subs[1].rootfind
+  local savePos = subs[1].save_positions
+  for s in subs
+    (s.rootfind == rootfind && s.save_positions == savePos) || return cbset
+  end
+  local lens::Vector{Int} = Int[(s isa SB.VectorContinuousCallback) ? s.len : 1 for s in subs]
+  local offsets::Vector{Int} = cumsum(vcat(0, lens))   # offsets[k] = #components before sub k
+  local total::Int = offsets[end]
+  local nsub::Int = length(subs)
+  local condF = _MergedContinuousCondition(subs, offsets, nsub)
+  local affF = _MergedContinuousAffect(subs, offsets, lens, nsub, false)
+  local affNF = _MergedContinuousAffect(subs, offsets, lens, nsub, true)
+  local initF = _MergedContinuousInitialize(subs, nsub)
+  local FW = DiffEqBase.FunctionWrapper
+  local condW = FW{Nothing, Tuple{AbstractVector{Float64}, AbstractVector{Float64}, Float64, Any}}(condF)
+  local affW = FW{Nothing, Tuple{Any, Int}}(affF)
+  local affNW = FW{Nothing, Tuple{Any, Int}}(affNF)
+  #= Always FunctionWrapper-wrap the merged initialize (even when every sub uses the
+     default) so the VCC's initialize param is the SAME model-independent type whether or
+     not a sub carries a custom initialize -> chua and the synthetic bake share one type. =#
+  local initW = FW{Nothing, Tuple{Any, Any, Any, Any}}(initF)
+  local vcc = SB.VectorContinuousCallback(condW, affW, affNW, total;
+                                          initialize = initW,
+                                          rootfind = rootfind, save_positions = savePos)
+  return SB.CallbackSet(vcc, dc...)
 end
 
 

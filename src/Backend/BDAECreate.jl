@@ -1905,15 +1905,15 @@ Base.@nospecializeinfer function _collectDiscreteRhsCrefsFromWhenOps(ops::Vector
   local out = DAE.ComponentRef[]
   local seen = OrderedSet{String}()
   local blocked = copy(assignedLhs)
-  local ctx = (out, seen, blocked)
+  local ctx = DiscreteRhsCrefVisitor(out, seen, blocked)
   for op in ops
     @match op begin
-      BDAE.ASSIGN(_, rhs, _) => Util.traverseExpTopDown(rhs, _visitDiscreteRhsCref, ctx)
-      BDAE.NORETCALL(exp, _) => Util.traverseExpTopDown(exp, _visitDiscreteRhsCref, ctx)
+      BDAE.ASSIGN(_, rhs, _) => Util.traverseExpTopDown(rhs, ctx, nothing)
+      BDAE.NORETCALL(exp, _) => Util.traverseExpTopDown(exp, ctx, nothing)
       BDAE.ASSERT(c, m, l, _) => begin
-        Util.traverseExpTopDown(c, _visitDiscreteRhsCref, ctx)
-        Util.traverseExpTopDown(m, _visitDiscreteRhsCref, ctx)
-        Util.traverseExpTopDown(l, _visitDiscreteRhsCref, ctx)
+        Util.traverseExpTopDown(c, ctx, nothing)
+        Util.traverseExpTopDown(m, ctx, nothing)
+        Util.traverseExpTopDown(l, ctx, nothing)
       end
       _ => nothing
     end
@@ -2121,14 +2121,20 @@ Base.@nospecializeinfer function _pushDiscreteCref!(out::Vector{DAE.ComponentRef
   return nothing
 end
 
-Base.@nospecializeinfer function _visitDiscreteRhsCref(@nospecialize(exp),
-                                                       ctx::Tuple{Vector{DAE.ComponentRef}, OrderedSet{String}, OrderedSet{String}})
+# Collect discrete RHS crefs into `out` (deduped via `seen`, skipping `blocked`
+# reduction/for iterators). Typed functor replacing the threaded ctx tuple.
+struct DiscreteRhsCrefVisitor
+  out::Vector{DAE.ComponentRef}
+  seen::OrderedSet{String}
+  blocked::OrderedSet{String}
+end
+Base.@nospecializeinfer function (v::DiscreteRhsCrefVisitor)(@nospecialize(exp), arg::Nothing)
   @match exp begin
-    DAE.CREF(cr, _) => _pushDiscreteCref!(ctx[1], ctx[2], ctx[3], cr)
-    DAE.REDUCTION(_, _, iters) => _collectReductionIterNames!(ctx[3], iters)
+    DAE.CREF(cr, _) => _pushDiscreteCref!(v.out, v.seen, v.blocked, cr)
+    DAE.REDUCTION(_, _, iters) => _collectReductionIterNames!(v.blocked, iters)
     _ => nothing
   end
-  return (exp, true, ctx)
+  return (exp, true, arg)
 end
 
 Base.@nospecializeinfer function _collectReductionIterNames!(blocked::OrderedSet{String}, @nospecialize(iters))
@@ -2145,13 +2151,13 @@ Base.@nospecializeinfer function _walkDiscreteStmtsForRhsCrefs!(out::Vector{DAE.
                                                                 seen::OrderedSet{String},
                                                                 blocked::OrderedSet{String},
                                                                 @nospecialize(stmts))
-  local ctx = (out, seen, blocked)
+  local ctx = DiscreteRhsCrefVisitor(out, seen, blocked)
   for s in stmts
     @match s begin
-      DAE.STMT_ASSIGN(_, _, rhs, _) => Util.traverseExpTopDown(rhs, _visitDiscreteRhsCref, ctx)
-      DAE.STMT_ASSIGN_ARR(_, _, rhs, _) => Util.traverseExpTopDown(rhs, _visitDiscreteRhsCref, ctx)
+      DAE.STMT_ASSIGN(_, _, rhs, _) => Util.traverseExpTopDown(rhs, ctx, nothing)
+      DAE.STMT_ASSIGN_ARR(_, _, rhs, _) => Util.traverseExpTopDown(rhs, ctx, nothing)
       DAE.STMT_IF(cond, body, _, _) => begin
-        Util.traverseExpTopDown(cond, _visitDiscreteRhsCref, ctx)
+        Util.traverseExpTopDown(cond, ctx, nothing)
         _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, body)
       end
       DAE.STMT_FOR(_, _, iter, _, _, body, _) => begin
@@ -2161,7 +2167,7 @@ Base.@nospecializeinfer function _walkDiscreteStmtsForRhsCrefs!(out::Vector{DAE.
         pushed && delete!(blocked, iter)
       end
       DAE.STMT_WHILE(cond, body, _) => begin
-        Util.traverseExpTopDown(cond, _visitDiscreteRhsCref, ctx)
+        Util.traverseExpTopDown(cond, ctx, nothing)
         _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, body)
       end
       _ => nothing
