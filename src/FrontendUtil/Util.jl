@@ -16,7 +16,7 @@ const Argument = Any
   The first returning an expression, the second returning a boolean indicating if the traversal should continue
   and the last is the out argument.
 """
-Base.@nospecializeinfer function traverseExpTopDown(@nospecialize(inExp::DAE.Exp), func::Function, ext_arg::Type_a)::Tuple{DAE.Exp, Type_a}
+Base.@nospecializeinfer function traverseExpTopDown(@nospecialize(inExp::DAE.Exp), func, ext_arg::Type_a)::Tuple{DAE.Exp, Type_a}
   local outArg::Type_a
   local outExp::DAE.Exp
   local cont::Bool
@@ -25,7 +25,7 @@ Base.@nospecializeinfer function traverseExpTopDown(@nospecialize(inExp::DAE.Exp
   (outExp, outArg)
 end
 
-Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @nospecialize(inExp::DAE.Exp), func::Function, inArg::Type_a) ::Tuple{DAE.Exp, Type_a}
+Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @nospecialize(inExp::DAE.Exp), func, inArg::Type_a) ::Tuple{DAE.Exp, Type_a}
   local outArg
   local outExp::DAE.Exp
   (outExp, outArg) = begin
@@ -59,7 +59,7 @@ Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @n
     local lstexpl_1::List{List{DAE.Exp}}
     local op::DAE.Operator
     local reductionInfo::DAE.ReductionInfo
-    local rel::Function
+    local rel
     local riters::DAE.ReductionIterators
     local scalar::Bool
     local t::DAE.Type
@@ -306,7 +306,7 @@ Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @n
   (outExp, outArg)
 end
 
-function traverseExpListTopDown(expLst::List{DAE.Exp}, func::Function, inArg)
+function traverseExpListTopDown(expLst::List{DAE.Exp}, func, inArg)
   outArg = inArg
   #= Allocate the result buffer lazily: a read-only or no-op traversal leaves
      every element identity-equal, so the common case allocates nothing and
@@ -339,7 +339,7 @@ end
   Calls traverseExpBottomUp for each element of list.
   Mirrors Expression.traverseExpList from OpenModelica.
 """
-function traverseExpList(expLst::List{DAE.Exp}, func::Function, inArg)
+function traverseExpList(expLst::List{DAE.Exp}, func, inArg)
   outArg = inArg
   #= Allocate the result buffer lazily; a no-op traversal returns the original list. =#
   local newExpLst::Union{Nothing, Vector{DAE.Exp}} = nothing
@@ -369,7 +369,7 @@ end
   Helper function to traverseExpBottomUp, traverses matrix expressions.
   Mirrors Expression.traverseExpMatrix from OpenModelica.
 """
-function traverseExpMatrix(inMatrix::List{List{DAE.Exp}}, func::Function, inArg)
+function traverseExpMatrix(inMatrix::List{List{DAE.Exp}}, func, inArg)
   outArg = inArg
   #= Allocate lazily; an unchanged matrix returns the original list of rows. =#
   local newRows::Union{Nothing, Vector{List{DAE.Exp}}} = nothing
@@ -398,7 +398,7 @@ end
 """
   Traverse reduction iterators, applying the traversal function to each iterator expression.
 """
-function traverseReductionIteratorsTopDown(riters::DAE.ReductionIterators, func::Function, extArg)
+function traverseReductionIteratorsTopDown(riters::DAE.ReductionIterators, func, extArg)
   outIters = DAE.ReductionIterator[]
   outArg = extArg
   for riter in riters
@@ -419,7 +419,7 @@ function traverseReductionIteratorsTopDown(riters::DAE.ReductionIterators, func:
   return (list(outIters...), outArg)
 end
 
-Base.@nospecializeinfer function traverseExpTopDownCrefHelper(@nospecialize(inCref::DAE.ComponentRef), rel::Function, iarg::Argument) ::Tuple{DAE.ComponentRef, Argument}
+Base.@nospecializeinfer function traverseExpTopDownCrefHelper(@nospecialize(inCref::DAE.ComponentRef), rel, iarg::Argument) ::Tuple{DAE.ComponentRef, Argument}
   local outArg::Argument
   local outCref::DAE.ComponentRef
   (outCref, outArg) = begin
@@ -458,7 +458,7 @@ Base.@nospecializeinfer function traverseExpTopDownCrefHelper(@nospecialize(inCr
   (outCref, outArg)
 end
 
-function traverseExpTopDownSubs(inSubscript::List{<:DAE.Subscript}, rel::Function, iarg::Argument) ::Tuple{List{DAE.Subscript}, Argument}
+function traverseExpTopDownSubs(inSubscript::List{<:DAE.Subscript}, rel, iarg::Argument) ::Tuple{List{DAE.Subscript}, Argument}
   local allEq::Bool = true
   local arg::Argument = iarg
   local acc::Vector{DAE.Subscript}
@@ -545,7 +545,7 @@ end
   NOTE: The user-provided function is not allowed to fail! If you want to
   detect a failure, return NONE() in your user-provided datatype.
 """
-function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  where {T}
+function traverseExpBottomUp(inExp::DAE.Exp, inFunc, inExtArg::T)  where {T}
   local outExtArg::T
   local outExp::DAE.Exp
   (outExp, outExtArg) = begin
@@ -991,7 +991,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc::Function, inExtArg::T)  whe
 end
 
 
-function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel::Function, iarg::T) ::Tuple{List{DAE.Subscript}, T} where {T}
+function traverseExpSubs(inSubscript::List{DAE.Subscript}, rel, iarg::T) ::Tuple{List{DAE.Subscript}, T} where {T}
   local outArg::T
   local outSubscript::List{DAE.Subscript}
 
@@ -1059,7 +1059,7 @@ end
   Takes a function and an extra argument passed through the traversal.
 """
 
-function traverseExpCref(inCref::DAE.ComponentRef, rel::Function, iarg::T) ::Tuple{DAE.ComponentRef, T} where {T}
+function traverseExpCref(inCref::DAE.ComponentRef, rel, iarg::T) ::Tuple{DAE.ComponentRef, T} where {T}
   local outArg::T
   local outCref::DAE.ComponentRef
   (outCref, outArg) = begin

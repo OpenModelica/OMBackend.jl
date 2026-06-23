@@ -66,6 +66,15 @@ are tolerated when the binding "already has a value" (re-registration is
 idempotent) and rethrown otherwise.
 """
 function evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
+  #= Under precompile / image generation, eval'ing the model's generated Modelica functions
+     into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
+     compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
+     has already run (so its method instances are warmed for the bake), and a real runtime
+     translate registers them normally — the guard is precompile-only. Mirrors the
+     jl_generating_output guard in generateIMTKCode (iMTKGen.jl). =#
+  if ccall(:jl_generating_output, Cint, ()) != 0
+    return nothing
+  end
   for f in functions
     try
       eval(f)

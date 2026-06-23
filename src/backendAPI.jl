@@ -89,6 +89,11 @@ matrix, sparse Jacobian and initialization are attached to the `ODEFunction`
 we build ourselves, not dropped by the wrapper.
 
 Toggle with: `OMBackend.DIRECT_RHS_TYPE_ERASE[] = false` to disable.
+
+This also governs event-callback erasure: when on, `_eraseContinuousCallbacks`
+collapses the OM-generated continuous callbacks into a single, model-independent
+`VectorContinuousCallback` (MTK `process_events` callbacks are left unchanged), so
+event-ful models in the legacy when-equation class also share the problem type.
 """
 const DIRECT_RHS_TYPE_ERASE = Ref{Bool}(true)
 
@@ -1032,6 +1037,15 @@ function simulateModel(modelName::String;
       rethrow(err)
     end
   elseif MODE == IMTK_MODE
+    #= overwriteCache forces a fresh build: bypass the codeHash reuse check so the
+       cached problem is rebuilt (not just remade) before simulate. =#
+    if overwriteCache
+      try
+        IMTKGen._buildAndCache(modelName, getCompiledModel(modelName); overwriteCache = true)
+      catch err
+        @warn "[IMTK] overwriteCache rebuild failed; using existing cached build" model = modelName exception = err
+      end
+    end
     #= Reuse the build cached in the backend at translate time (no
        structural_simplify re-run); simulateIMTK falls back to module simulate. =#
     local _runDir = get(MODEL_RUN_DIRS, modelName, nothing)
