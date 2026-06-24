@@ -1876,10 +1876,11 @@ function _buildTimeEventRefreshCallbacks(allPT::Vector, ptOwners::Vector, simCod
       local retNT = Expr(:tuple, Expr(:parameters, retKws...))
       local fExpr = :((modified, observed, ctx, integrator) -> $(retNT))
       if isempty(obsKws)
-        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT)))
+        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT); skip_checks = true))
       else
         local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
-        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT); observed = $(obsNT)))
+        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT);
+                                                    observed = $(obsNT), skip_checks = true))
       end
     end
     push!(cbs, :(ModelingToolkit.SymbolicContinuousCallback(
@@ -2131,9 +2132,11 @@ function _composedIfCondAffectExpr(ifKws::Vector{Expr}, modIfKws::Vector{Expr},
   local clusterModKws = Expr[Expr(:kw, d, d) for assigns in chained for (d, _, _) in assigns]
   local modNT = Expr(:tuple, Expr(:parameters, vcat(modIfKws, clusterModKws)...))
   local obsKws = vcat(extraObsKws, Expr[Expr(:kw, k, v) for (k, v) in obsAcc])
-  isempty(obsKws) && return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT)))
+  isempty(obsKws) && return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT);
+                                                        skip_checks = true))
   local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
-  return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT); observed = $(obsNT)))
+  return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT);
+                                            observed = $(obsNT), skip_checks = true))
 end
 
 function createIfEquations(stateVariables, algebraicVariables, simCode)
@@ -2513,7 +2516,8 @@ function createIfEquation(stateVariables::Vector,
           end
           local liveFn = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, liveKws...))))
           local liveObsNT = Expr(:tuple, Expr(:parameters, liveObsKws...))
-          liveAffect = :(ModelingToolkit.ImperativeAffect($(liveFn), $(modifiedNT); observed = $(liveObsNT)))
+          liveAffect = :(ModelingToolkit.ImperativeAffect($(liveFn), $(modifiedNT);
+                                                          observed = $(liveObsNT), skip_checks = true))
         end
         #= Compose the chained cluster recomputes into both flip directions; the
            up edge holds the condition FALSE (own ifCond 0.0), the down edge TRUE. =#
@@ -2576,7 +2580,8 @@ function createIfEquation(stateVariables::Vector,
             local _zcTest = _closedB ? :(observed.zc <= 0) : :(observed.zc < 0)
             local initRetNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :($(_zcTest) ? 1.0 : 0.0))))
             local initFExpr::Expr = :((modified, observed, ctx, integrator) -> $initRetNT)
-            local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT); observed = $(initObservedNT)))
+            local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT);
+                                                                  observed = $(initObservedNT), skip_checks = true))
             cond = :(ModelingToolkit.SymbolicContinuousCallback(
               ($(mtkCond)) => $(affectTuple);
               affect_neg = $(affectNegTuple),
@@ -3397,9 +3402,9 @@ function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
       local zc = transformToMTKContinuousCondition(rel, simCode)
       push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
         (-($(zc)) ~ 0),
-        ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs));
+        ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs), skip_checks = true);
         affect_neg = nothing,
-        initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI)),
+        initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI), skip_checks = true),
         rootfind = SciMLBase.RightRootFind,
         reinitializealg = SciMLBase.NoInit())))
     end
@@ -3457,9 +3462,9 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
           local (fnI, obsI, modI) = _preMemAffectParts(assigns, simCode; atInit = true, flagModified = false)
           push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
             ($(zc) ~ 0),
-            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp));
-            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn)),
-            initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI)),
+            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp), skip_checks = true);
+            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn), skip_checks = true),
+            initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI), skip_checks = true),
             rootfind = SciMLBase.RightRootFind,
             reinitializealg = $(_fsmReinitAlg()))))
         elseif relIdx == 1 && hasInit
@@ -3471,16 +3476,16 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
           local (fnNF, obsNF, modNF) = _preMemAffectParts(assigns, simCode; flagModified = false)
           push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
             ($(zc) ~ 0),
-            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp));
-            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn)),
-            initialize = ModelingToolkit.ImperativeAffect($(fnNF), $(modNF); observed = $(obsNF)),
+            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp), skip_checks = true);
+            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn), skip_checks = true),
+            initialize = ModelingToolkit.ImperativeAffect($(fnNF), $(modNF); observed = $(obsNF), skip_checks = true),
             rootfind = SciMLBase.RightRootFind,
             reinitializealg = $(_fsmReinitAlg()))))
         else
           push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
             ($(zc) ~ 0),
-            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp));
-            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn)),
+            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp), skip_checks = true);
+            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn), skip_checks = true),
             rootfind = SciMLBase.RightRootFind,
             reinitializealg = $(_fsmReinitAlg()))))
         end
