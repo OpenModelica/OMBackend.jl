@@ -157,7 +157,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   local allSharedVars::Vector{BDAE.VAR} = getSharedVariablesLocalsAndGlobals(shared)
   local allBackendVars = vcat(equationSystem.orderedVars, allSharedVars)
   local simVars::Vector{SimulationCode.SIMVAR} = createAndCollectSimulationCodeVariables(allBackendVars, shared.flatModel)
-  local occVars = map((v)-> v.name, filter((v) -> isOCCVar(v), simVars))
+  local occVars = String[v.name for v in simVars if isOCCVar(v)]
   #=
     Check if the model has state variables, if not introduce a dummy state
   =#
@@ -372,12 +372,12 @@ function createSimCodeStructuralTransitions(structuralTransitions::Vector{ST}) w
   local transitions = StructuralTransition[]
   for st in structuralTransitions
     sst = @match st begin
-      BDAE.STRUCTURAL_TRANSISTION(__) =>
-        SimulationCode.EXPLICIT_STRUCTURAL_TRANSISTION(st.fromState,
+      BDAE.STRUCTURAL_TRANSITION(__) =>
+        SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION(st.fromState,
                                                       st.toState,
-                                                      st.transistionCondition)
+                                                      st.transitionCondition)
       BDAE.STRUCTURAL_WHEN_EQUATION(__) =>
-        SimulationCode.IMPLICIT_STRUCTURAL_TRANSISTION(st.size,
+        SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION(st.size,
                                                       SimulationCode.toWhenStmts(st.whenEquation),
                                                       st.source,
                                                       SimulationCode.toEqAttr(st.attr))
@@ -590,7 +590,7 @@ function flattenNestedThenBranchIfs(ifEq::BDAE.IF_EQUATION)::BDAE.IF_EQUATION
   local conds = listArray(ifEq.conditions)
   local thens = listArray(ifEq.eqnstrue)
   local newConds = DAE.Exp[]
-  local newThens = Vector{Any}()
+  local newThens = List{BDAE.Equation}[]
   for i in 1:length(conds)
     local expanded = _expandBranchEquations(collect(BDAE.Equation, listArray(thens[i])))
     if length(expanded) == 1 && expanded[1][1] === nothing
@@ -737,7 +737,7 @@ function allocateAndCollectSimulationEquations(equations::T,
       push!(initialWhenEquations, eq)
     elseif eqType === BDAE.IF_EQUATION
       push!(ifEquations, eq)
-    elseif eqType === BDAE.STRUCTURAL_TRANSISTION || eqType === BDAE.STRUCTURAL_WHEN_EQUATION
+    elseif eqType === BDAE.STRUCTURAL_TRANSITION || eqType === BDAE.STRUCTURAL_WHEN_EQUATION
       push!(structuralTransitions, eq)
     elseif eqType === BDAE.ALGORITHM
       _algorithmToResiduals!(regularEquations, eq)
@@ -1095,7 +1095,7 @@ an equation system. If no such data is present. Return two empty arrays
 function getSharedVariablesLocalsAndGlobals(shared::BDAE.SHARED)
   @match shared begin
     BDAE.SHARED(__) => vcat(shared.globalKnownVars, shared.localKnownVars)
-    _ => []
+    _ => BDAE.VAR[]
   end
 end
 

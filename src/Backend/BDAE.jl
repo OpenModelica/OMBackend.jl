@@ -33,13 +33,8 @@
 
 #=
 TODO:
-Change Integer -> Int here. Integer is an old artifact.
-Make sure all types here properly typed!
 Move Var s.t it is close to the struct that defines it.
 Make all datatypes here immutable. I think having VAR as a immutable struct is better.
-
-Remove VarKind types we do not use.
-
 =#
 
 """
@@ -173,7 +168,7 @@ using ExportAll
   - `BRANCH(ar, br)` — `Connections.branch(ar, br)`.
   - `STRUCTURAL_IF_EQUATION(ifEquation)` — DOCC if-equation preserved as a
     frontend `EQUATION_IF` so the runtime can replay the branch choice.
-  - `STRUCTURAL_TRANSISTION(fromState, toState, transistionCondition)` —
+  - `STRUCTURAL_TRANSITION(fromState, toState, transitionCondition)` —
     VSS transition; a structural callback is generated from the condition.
     (Name is a historical typo preserved across the codebase.)
 """
@@ -187,11 +182,7 @@ using ExportAll
   - `WHEN_STMTS(condition, whenStmtLst, elsewhenPart)`:
     - `condition`: the when-condition expression.
     - `whenStmtLst`: list of `WhenOperator` statements to run on trigger.
-    - `elsewhenPart`: chained `elsewhen`. Intentionally untyped: depending
-      on the call site it can be `NONE()`, an `Option{WHEN_STMTS}`, a
-      `SOME(WHEN_EQUATION)` (as produced by `lowerWhenEquation`), or plain
-      `nothing`. Until those call sites converge, constraining the field
-      type would be a breaking change.
+    - `elsewhenPart`: chained `elsewhen`, `NONE()` or `SOME(WHEN_EQUATION)`.
 """
 @UniontypeDecl WhenEquation
 
@@ -254,10 +245,10 @@ mutable struct VAR <: Var
   varKind::VarKind
   varDirection::DAE.VarDirection
   varType::DAE.Type
-  bindExp::Option
-  arryDim::List
+  bindExp::Option{DAE.Exp}
+  arryDim::List{DAE.Dimension}
   source::DAE.ElementSource
-  values::Option
+  values::Option{DAE.VariableAttributes}
   tearingSelectOption::Option
   connectorType::DAE.ConnectorType
   unreplaceable::Bool
@@ -316,8 +307,8 @@ end
 struct SHARED
   globalKnownVars::Vector{VAR}
   localKnownVars::Vector{VAR}
-  metaModel::Option
-  flatModel::Option
+  metaModel::Option{SCode.CLASS}
+  flatModel::Option{OMFrontend.Frontend.FlatModel}
   DOCC_equations::Vector{Equation}
 end
 
@@ -337,7 +328,7 @@ end
   end
 
   @Record STATE begin
-    index::Integer
+    index::Int
     derName::Option{DAE.ComponentRef}
     natural::Bool
   end
@@ -436,7 +427,6 @@ end
 
 @Uniontype EvaluationStages begin
   @Record EVALUATION_STAGES begin
-
     dynamicEval::Bool
     algebraicEval::Bool
     zerocrossEval::Bool
@@ -465,9 +455,9 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
 
 @Uniontype Equation begin
   @Record EQUATION begin
-    lhs
-    rhs
-    source
+    lhs::DAE.Exp
+    rhs::DAE.Exp
+    source::DAE.ElementSource
     attributes::EquationAttributes
   end
 
@@ -477,7 +467,7 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
     right::DAE.Exp
     source::DAE.ElementSource
     attr::EquationAttributes
-    recordSize::Option{Integer}
+    recordSize::Option{Int}
   end
 
   @Record SOLVED_EQUATION begin
@@ -488,13 +478,13 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
   end
 
   @Record RESIDUAL_EQUATION begin
-    exp
-    source
-    attr
+    exp::DAE.Exp
+    source::DAE.ElementSource
+    attr::EquationAttributes
   end
 
   @Record ALGORITHM begin
-    size::Integer
+    size::Int
     alg::DAE.Algorithm
     source::DAE.ElementSource
     expand::DAE.Expand
@@ -502,31 +492,31 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
   end
 
   @Record WHEN_EQUATION begin
-    size::Integer
+    size::Int
     whenEquation::WhenEquation
     source::DAE.ElementSource
-    attr
+    attr::EquationAttributes
   end
 
   #= Body of an `algorithm when initial() then ... end when` clause. Distinct
      from WHEN_EQUATION so init-time bodies stay separated from runtime
      when-equations through the pipeline. =#
   @Record INITIAL_WHEN_EQUATION begin
-    size::Integer
+    size::Int
     whenEquation::WhenEquation
     source::DAE.ElementSource
-    attr
+    attr::EquationAttributes
   end
 
   @Record STRUCTURAL_WHEN_EQUATION begin
-    size::Integer
+    size::Int
     whenEquation::WhenEquation
     source::DAE.ElementSource
     attr::EquationAttributes
   end
 
   @Record COMPLEX_EQUATION begin
-    size::Integer
+    size::Int
     left::DAE.Exp
     right::DAE.Exp
     source::DAE.ElementSource
@@ -573,10 +563,10 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
     ifEquation::OMFrontend.Frontend.EQUATION_IF
   end
 
-  @Record STRUCTURAL_TRANSISTION begin
+  @Record STRUCTURAL_TRANSITION begin
     fromState::String
     toState::String
-    transistionCondition::DAE.Exp
+    transitionCondition::DAE.Exp
   end
 end
 
@@ -584,7 +574,7 @@ end
   @Record WHEN_STMTS begin
     condition::DAE.Exp
     whenStmtLst::List{WhenOperator}
-    elsewhenPart
+    elsewhenPart::Option{WHEN_EQUATION}
   end
 end
 

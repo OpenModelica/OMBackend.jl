@@ -70,7 +70,7 @@ end
 _dimsToSim(@nospecialize(ds))::Vector{Int} = Int[_dimToInt(d) for d in ds]
 
 # Field directory (names + element STypes) from a `T_COMPLEX` varLst.
-function _complexFieldsToSim(@nospecialize(varLst))
+function _complexFieldsToSim(@nospecialize(varLst))::Tuple{Vector{String}, Vector{SType}}
   local names = String[]
   local types = SType[]
   for v in varLst

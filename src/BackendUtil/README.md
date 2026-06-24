@@ -1,3 +1,3 @@
-# A place for generic backend functions!
+# This directory contains backend utility functions.
 
 E.g GraphAlgorithms.jl

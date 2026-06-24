@@ -452,10 +452,10 @@ Base.@nospecializeinfer function ARRAY_EQUATION(@nospecialize(dims::Vector{Int64
   return ARRAY_EQUATION(dims, toSimExp(l), r, src, attr)
 end
 
-Base.@nospecializeinfer function EXPLICIT_STRUCTURAL_TRANSISTION(@nospecialize(fromState::String),
+Base.@nospecializeinfer function EXPLICIT_STRUCTURAL_TRANSITION(@nospecialize(fromState::String),
                                                                  @nospecialize(toState::String),
-                                                                 @nospecialize(transistionCondition::DAE.Exp))
-  return EXPLICIT_STRUCTURAL_TRANSISTION(fromState, toState, toSimExp(transistionCondition))
+                                                                 @nospecialize(transitionCondition::DAE.Exp))
+  return EXPLICIT_STRUCTURAL_TRANSITION(fromState, toState, toSimExp(transitionCondition))
 end
 
 # ============================================================================

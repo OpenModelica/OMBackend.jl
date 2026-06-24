@@ -45,6 +45,110 @@ import ..FrontendUtil.Util
 import DAE
 import OMBackend
 
+#= ── Traversal visitor functors ──────────────────────────────────────────────
+   Typed callable structs for the expression-traversal visitors. Each holds its
+   accumulator / captured state as concrete fields, so the traversal threads a
+   vestigial `nothing` arg and the result is read off the functor afterwards.
+   Call shape: (v::F)(exp::DAE.Exp, arg::Nothing) -> (exp, continue::Bool, arg). =#
+
+# Detect der() state crefs into a shared dict.
+struct DetectStateExpression
+  stateCrefs::Dict{DAE.ComponentRef, Bool}
+end
+function (v::DetectStateExpression)(exp::DAE.Exp, arg::Nothing)::Tuple{DAE.Exp, Bool, Nothing}
+  @match exp begin
+    DAE.CALL(Absyn.IDENT("der"), DAE.CREF(state) <| _) => (v.stateCrefs[state] = true)
+    _ => nothing
+  end
+  return (exp, true, arg)
+end
+
+# Detect parameter crefs (whose name is in `parStrs`, or any complex cref) into a dict.
+struct DetectParamExpression
+  parStrs::OrderedSet{String}
+  paramCrefs::Dict{DAE.ComponentRef, Bool}
+end
+function (v::DetectParamExpression)(exp::DAE.Exp, arg::Nothing)::Tuple{DAE.Exp, Bool, Nothing}
+  @match exp begin
+    DAE.CREF(_, DAE.T_COMPLEX(__)) => (v.paramCrefs[exp.componentRef] = true)
+    DAE.CREF(__) => ((string(exp.componentRef) in v.parStrs) && (v.paramCrefs[exp.componentRef] = true))
+    _ => nothing
+  end
+  return (exp, true, arg)
+end
+
+# Flag whether any `time` cref appears; stops descent once found.
+struct ScanForTime
+  found::Ref{Bool}
+end
+function (v::ScanForTime)(@nospecialize(exp::DAE.Exp), arg::Nothing)::Tuple{DAE.Exp, Bool, Nothing}
+  v.found[] && return (exp, false, arg)
+  @match exp begin
+    DAE.CREF(componentRef = c) => (string(c) == "time" && (v.found[] = true))
+    _ => nothing
+  end
+  return (exp, true, arg)
+end
+
+# Lift IFEXPs to auxiliary ifEq_tmp IF_EQUATIONs. timeDepOnly=false lifts every
+# IFEXP (entry path); timeDepOnly=true lifts only time-dependent IFEXPs and recurses
+# the rest (for branches of an already-lifted IFEXP). noEvent subtrees stay inline;
+# identical (cond|then|else) shapes are deduped to one tmp var.
+struct IfExpressionLifter
+  tmpVarToElement::OrderedDict{BDAE.VAR, BDAE.IF_EQUATION}
+  tick::Ref{Int}
+  dedup::Dict{String, DAE.Exp}
+  timeDepOnly::Bool
+end
+Base.@nospecializeinfer function (v::IfExpressionLifter)(@nospecialize(exp::DAE.Exp), arg::Nothing)::Tuple{DAE.Exp, Bool, Nothing}
+  local timeDep = IfExpressionLifter(v.tmpVarToElement, v.tick, v.dedup, true)
+  local (newExp, cont) = begin
+    @match exp begin
+      DAE.CALL(Absyn.IDENT("noEvent"), _, _) => (exp, false)
+      DAE.IFEXP(cond, expThen, expElse) => begin
+        if v.timeDepOnly && !_expDependsOnTime(cond)
+          #= State-dependent: keep inline (bool-product), recurse for nested
+             time-dependent IFEXPs. =#
+          local (lc, _) = Util.traverseExpTopDown(cond, timeDep, nothing)
+          local (lt, _) = Util.traverseExpTopDown(expThen, timeDep, nothing)
+          local (le, _) = Util.traverseExpTopDown(expElse, timeDep, nothing)
+          (DAE.IFEXP(lc, lt, le), false)
+        else
+          #= Lift this IFEXP. Recurse branches via the time-dep variant so nested
+             state-dependent IFEXPs keep their bool-product lowering. =#
+          local (liftedCond, _) = Util.traverseExpTopDown(cond, timeDep, nothing)
+          local (liftedThen, _) = Util.traverseExpTopDown(expThen, timeDep, nothing)
+          local (liftedElse, _) = Util.traverseExpTopDown(expElse, timeDep, nothing)
+          local key = string(liftedCond, "|", liftedThen, "|", liftedElse)
+          local existing = get(v.dedup, key, nothing)
+          if existing !== nothing
+            (existing, true)
+          else
+            local varType = DAE.T_REAL_DEFAULT
+            local varName = string("ifEq_tmp", v.tick.x)
+            v.tick.x += 1
+            local var::DAE.ComponentRef = DAE.CREF_IDENT(varName, varType, nil)
+            local varAsCREF::DAE.CREF = DAE.CREF(var, varType)
+            local emptySource = DAE.emptyElementSource
+            local attr = BDAE.EQ_ATTR_DEFAULT_UNKNOWN
+            local backendVar = BDAE.VAR(DAE.CREF_IDENT(varName, DAE.T_UNKNOWN_DEFAULT, nil),
+                                        BDAE.VARIABLE(), varType)
+            v.tmpVarToElement[backendVar] = BDAE.IF_EQUATION(list(liftedCond),
+                                                            list(list(BDAE.EQUATION(varAsCREF, liftedThen, emptySource, attr))),
+                                                            list(BDAE.EQUATION(varAsCREF, liftedElse, emptySource, attr)),
+                                                            emptySource,
+                                                            BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
+            v.dedup[key] = varAsCREF
+            (varAsCREF, true)
+          end
+        end
+      end
+      _ => (exp, true)
+    end
+  end
+  return (newExp, cont, arg)
+end
+
 
 """
     Variable can be: Variable, Discrete, Constant and Parameters
@@ -101,10 +205,11 @@ function detectStatesEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
     local vars::Vector{BDAE.VAR}
     local eqs::Vector{BDAE.Equation}
     local stateCrefs = Dict{DAE.ComponentRef, Bool}()
+    local stateVisitor = DetectStateExpression(stateCrefs)
     @match syst begin
       BDAE.EQSYSTEM(name, vars, eqs, simpleEqs, initialEqs) => begin
         for eq in eqs
-          (_, stateCrefs) = BDAEUtil.traverseEquationExpressions(eq, detectStateExpression, stateCrefs)
+          BDAEUtil.traverseEquationExpressions(eq, stateVisitor, nothing)
         end
         #= Do replacements for stateCrefs =#
         @assign syst.orderedVars = updateStates(vars, stateCrefs)
@@ -125,37 +230,7 @@ function detectParamsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
   local buffer = IOBuffer()
   @BACKEND_LOGGING write(OMBackend.logPath("backend/bdae", "allpars.log"), String(take!(buffer)))
 
-  function detectParamExpression(exp::DAE.Exp, paramCrefs::Dict{DAE.ComponentRef, Bool})
-    local cont::Bool
-    local outCrefs = paramCrefs
-    (outCrefs, cont) = begin
-      local param::DAE.ComponentRef
-      @match exp begin
-        #= Ignore complex components =#
-        DAE.CREF(c, DAE.T_COMPLEX(__)) => begin
-          outCrefs[exp.componentRef] = true
-          (outCrefs, true)
-        end
-        DAE.CREF(__) => begin
-          local cand = string(exp.componentRef)
-          if (cand in parStrs)
-            #println("Located param in the variables:" * cand)
-            #println(exp)
-            outCrefs[exp.componentRef] = true
-          end
-          (outCrefs, true)
-        end
-        DAE.IFEXP(cond, expThen, expElse) => begin
-          #fail()
-          (outCrefs, true)
-        end
-        _ => begin
-          (outCrefs, true)
-        end
-      end
-    end
-    return (exp, cont, outCrefs)
-  end
+  # detectParamExpression moved to the DetectParamExpression functor at module top.
 
   function updateParams(vars::Vector, paramCrefs::Dict{DAE.ComponentRef, Bool})
     local varArr::Vector{BDAE.VAR} = vars
@@ -182,14 +257,15 @@ function detectParamsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
     local vars::BDAE.Variables
     local eqs::Array
     local paramCrefs = Dict{DAE.ComponentRef, Bool}()
+    local paramVisitor = DetectParamExpression(parStrs, paramCrefs)
     @match syst begin
       BDAE.EQSYSTEM(name, vars, eqs, simpleEqs, initialEqs) => begin
         for eq in eqs
-          (_, paramCrefs) = BDAEUtil.traverseEquationExpressions(eq, detectParamExpression, paramCrefs)
+          BDAEUtil.traverseEquationExpressions(eq, paramVisitor, nothing)
         end
         #= Go through the initial equations =#
         for ieq in initialEqs
-          (_, paramCrefs) = BDAEUtil.traverseEquationExpressions(ieq, detectParamExpression, paramCrefs)
+          BDAEUtil.traverseEquationExpressions(ieq, paramVisitor, nothing)
         end
         #= Do replacements for paramCrefs =#
         @assign syst.orderedVars = updateParams(vars, paramCrefs)
@@ -225,7 +301,7 @@ function detectIfEquationsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
        leaving the other branch's ifCond parameter pinned at its initial
        value). =#
     local dedup = Dict{String, DAE.Exp}()
-    local tmpVarToElementAndTick = (tmpVarToElement, tick, dedup)
+    local ifLifter = IfExpressionLifter(tmpVarToElement, tick, dedup, false)
     @match syst begin
       BDAE.EQSYSTEM(__) => begin
         for i in 1:length(syst.orderedEqs)
@@ -237,8 +313,7 @@ function detectIfEquationsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
           if eq isa BDAE.WHEN_EQUATION || eq isa BDAE.INITIAL_WHEN_EQUATION
             continue
           end
-          (eq2, _) = BDAEUtil.traverseEquationExpressions(eq, replaceIfExpressionWithTmpVar,
-                                                                  tmpVarToElementAndTick)
+          (eq2, _) = BDAEUtil.traverseEquationExpressions(eq, ifLifter, nothing)
           if ! (eq === eq2)
             @assign syst.orderedEqs[i] = eq2
           end
@@ -265,151 +340,14 @@ end
 """
 function _expDependsOnTime(@nospecialize(e::DAE.Exp))::Bool
   local found = Ref{Bool}(false)
-  function _scan(@nospecialize(x::DAE.Exp), seen::Ref{Bool})
-    seen[] && return (x, false, seen)
-    @match x begin
-      DAE.CREF(componentRef = c) => begin
-        local s = string(c)
-        if s == "time"
-          seen[] = true
-        end
-        (x, true, seen)
-      end
-      _ => (x, true, seen)
-    end
-  end
-  Util.traverseExpTopDown(e, _scan, found)
+  Util.traverseExpTopDown(e, ScanForTime(found), nothing)
   return found[]
 end
 
-"""
-  Detects if expression.
-  We replace the if expression with our temporary variable.
-  These variables are assigned in newly created if equations that we add to the tmpVarToElement::Dict.
-  We create the mapping:
-  tmpVar -> equation it is assigned in
-"""
-Base.@nospecializeinfer function replaceIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{AbstractDict{BDAE.VAR, BDAE.IF_EQUATION}, Ref{Int}, Dict{String, DAE.Exp}})
-  (newExp, cont, tmpVarToElementAndTick) = begin
-    local tmpVarToElement::AbstractDict{BDAE.VAR, BDAE.IF_EQUATION} = tmpVarToElementAndTick[1]
-    local tick::Ref{Int} = tmpVarToElementAndTick[2]
-    local dedup::Dict{String, DAE.Exp} = tmpVarToElementAndTick[3]
-    @match exp begin
-      #= Per Modelica spec, `noEvent(expr)` takes relations literally and
-         triggers no events. An IFEXP inside it must stay inline (codegen emits
-         a continuous ifelse/bool-product) — lifting it to an event-driven
-         IF_EQUATION would latch the branch at the first crossing and break a
-         feedback saturation whose condition never re-crosses zero. Stop
-         descent so the whole noEvent subtree is preserved. =#
-      DAE.CALL(Absyn.IDENT("noEvent"), _, _) => (exp, false, tmpVarToElementAndTick)
-      DAE.IFEXP(cond, expThen, expElse) => begin
-        #= Recursively process the branches. Use the time-dependent-only
-           variant so that nested state-dependent IFEXPs (e.g. LimPID's
-           saturation) keep their bool-product lowering — one-shot events
-           would freeze the saturation at its first crossing. Nested
-           time-dependent IFEXPs DO get lifted so each transition produces
-           a proper SymbolicContinuousCallback. =#
-        local (liftedCond, _)  = Util.traverseExpTopDown(cond,    _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
-        local (liftedThen, _)  = Util.traverseExpTopDown(expThen, _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
-        local (liftedElse, _)  = Util.traverseExpTopDown(expElse, _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
-        #= Structural dedup: if a lifted IF_EQUATION with the same
-           (cond | then | else) already exists, reuse its CREF instead of
-           generating a duplicate. MTK drops SymbolicContinuousCallbacks
-           with byte-identical zero-crossing conditions; this dedup
-           prevents two separate ifCond parameters from depending on the
-           same event and ending up with one of them pinned. =#
-        local key = string(liftedCond, "|", liftedThen, "|", liftedElse)
-        local existing = get(dedup, key, nothing)
-        if existing !== nothing
-          (existing, true, tmpVarToElementAndTick)
-        else
-          #= Bump per IFEXP so siblings within the same residual get distinct
-             names; a single per-equation bump would collide every nested
-             IFEXP onto one symbolic var. =#
-          local varType = DAE.T_REAL_DEFAULT
-          local varName = string("ifEq_tmp", tick.x)
-          tick.x += 1
-          local var::DAE.ComponentRef = DAE.CREF_IDENT(varName, varType, nil)
-          local varAsCREF::DAE.CREF = DAE.CREF(var, varType)
-          local emptySource = DAE.emptyElementSource
-          local attr = BDAE.EQ_ATTR_DEFAULT_UNKNOWN
-          local backendVar = BDAE.VAR(DAE.CREF_IDENT(varName, DAE.T_UNKNOWN_DEFAULT, nil),
-                                      BDAE.VARIABLE(), varType)
-          tmpVarToElement[backendVar] = BDAE.IF_EQUATION(list(liftedCond),
-                                                         list(list(BDAE.EQUATION(varAsCREF, liftedThen, emptySource, attr))),
-                                                         list(BDAE.EQUATION(varAsCREF, liftedElse, emptySource, attr)),
-                                                         emptySource,
-                                                         BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
-          dedup[key] = varAsCREF
-          (varAsCREF, true, tmpVarToElementAndTick)
-        end
-      end
-      _ => begin
-        (exp, true, tmpVarToElementAndTick)
-      end
-    end
-  end
-  return (newExp, cont, tmpVarToElementAndTick)
-end
+# replaceIfExpressionWithTmpVar / _replaceTimeDepIfExpressionWithTmpVar moved to the
+# IfExpressionLifter functor at module top.
 
-"""
-  Recursive variant used inside `replaceIfExpressionWithTmpVar` for the
-  branches of an already-lifted IFEXP. Lifts only IFEXPs whose condition
-  references `time`; leaves state-dependent IFEXPs in place so codegen
-  emits a continuous bool-product (correct for non-monotonic conditions).
-  Recursion descends into the branches either way so deeper nested
-  time-dependent IFEXPs still reach the lifter.
-"""
-Base.@nospecializeinfer function _replaceTimeDepIfExpressionWithTmpVar(@nospecialize(exp::DAE.Exp), tmpVarToElementAndTick::Tuple{AbstractDict{BDAE.VAR, BDAE.IF_EQUATION}, Ref{Int}, Dict{String, DAE.Exp}})
-  (newExp, cont, tmpVarToElementAndTick) = begin
-    @match exp begin
-      #= See replaceIfExpressionWithTmpVar: never lift inside noEvent. =#
-      DAE.CALL(Absyn.IDENT("noEvent"), _, _) => (exp, false, tmpVarToElementAndTick)
-      DAE.IFEXP(cond, expThen, expElse) => begin
-        if _expDependsOnTime(cond)
-          #= Time-dependent → delegate to the always-lift path. =#
-          replaceIfExpressionWithTmpVar(exp, tmpVarToElementAndTick)
-        else
-          #= State-dependent or parameter-only → do not lift. Still recurse
-             so nested time-dependent IFEXPs below get lifted. =#
-          local (lc, _)  = Util.traverseExpTopDown(cond,    _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
-          local (lt, _)  = Util.traverseExpTopDown(expThen, _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
-          local (le, _)  = Util.traverseExpTopDown(expElse, _replaceTimeDepIfExpressionWithTmpVar, tmpVarToElementAndTick)
-          (DAE.IFEXP(lc, lt, le), false, tmpVarToElementAndTick)
-        end
-      end
-      _ => begin
-        (exp, true, tmpVarToElementAndTick)
-      end
-    end
-  end
-  return (newExp, cont, tmpVarToElementAndTick)
-end
-
-"""
-    kabdelhak:
-    Detects if a given expression is a der() call and adds the corresponding
-    cref to a hashmap
-"""
-function detectStateExpression(exp::DAE.Exp, stateCrefs::Dict{DAE.ComponentRef, Bool})
-  local cont::Bool
-  local outCrefs = stateCrefs
-  (outCrefs, cont) = begin
-    local state::DAE.ComponentRef
-    @match exp begin
-      DAE.CALL(Absyn.IDENT("der"), DAE.CREF(state) <| _ ) => begin
-        #= Add state with boolean value that does not matter,
-        it is later only BDAE.BACKEND_DAE(eqs = eqs) checked if it exists at all  =#
-        outCrefs[state] = true
-        (outCrefs, true)
-      end
-      _ => begin
-        (outCrefs, true)
-      end
-    end
-  end
-  return (exp, cont, outCrefs)
-end
+# detectStateExpression moved to the DetectStateExpression functor at module top.
 
 """
   kabdelhak:
@@ -435,6 +373,128 @@ function updateStates(vars::Vector, stateCrefs::Dict{DAE.ComponentRef, Bool})
     vars = varArr
   end
   return vars
+end
+
+
+"""
+    lowerHigherOrderDerivatives(dae)
+
+Order-lower nested derivatives so SimCode only ever sees a first-order `der` of a
+plain variable: `der(der(x))` becomes `der(der_x)` plus `der_x = der(x)`
+(recursively for higher orders). A no-op unless a variable-based nested `der` is present.
+"""
+function lowerHigherOrderDerivatives(dae::BDAE.BACKEND_DAE)
+  BDAEUtil.mapEqSystems(dae, lowerHigherOrderDerivativesEqSystem)
+end
+
+function lowerHigherOrderDerivativesEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
+  local auxiliaryVars = BDAE.VAR[]
+  local auxiliaryEqs = BDAE.Equation[]
+  #= innermost cref name -> auxiliary derivative cref, so a repeated der(x) shares
+     one auxiliary state and one defining equation. =#
+  local auxiliaryByName = Dict{String, DAE.ComponentRef}()
+  local accumulator = (auxiliaryVars, auxiliaryEqs, auxiliaryByName)
+  @match syst begin
+    BDAE.EQSYSTEM(__) => begin
+      for i in 1:length(syst.orderedEqs)
+        local eq = syst.orderedEqs[i]
+        (loweredEq, _) = BDAEUtil.traverseEquationExpressions(eq, lowerNestedDerExpression, accumulator)
+        if !(eq === loweredEq)
+          @assign syst.orderedEqs[i] = loweredEq
+        end
+      end
+      append!(syst.orderedEqs, auxiliaryEqs)
+      append!(syst.orderedVars, auxiliaryVars)
+      syst
+    end
+  end
+  return syst
+end
+
+"""
+    lowerNestedDerExpression(exp, accumulator)
+
+Rewrite `der(der(...))` to `der(<auxiliary state>)`; first-order `der(x)` is left
+untouched because only a `der` over a `der` matches.
+"""
+function lowerNestedDerExpression(exp::DAE.Exp, accumulator)
+  local auxiliaryVars = accumulator[1]
+  local auxiliaryEqs = accumulator[2]
+  local auxiliaryByName = accumulator[3]
+  local result = begin
+    @match exp begin
+      DAE.CALL(Absyn.IDENT("der"), arg <| _, attr) where (_isNestedDerivative(arg)) => begin
+        local stateCref = _derivativeStateCref(arg, attr, auxiliaryVars, auxiliaryEqs, auxiliaryByName)
+        local loweredExp = DAE.CALL(Absyn.IDENT("der"),
+                                    list(DAE.CREF(stateCref, DAE.T_REAL_DEFAULT)), attr)
+        (loweredExp, false, accumulator)
+      end
+      _ => (exp, true, accumulator)
+    end
+  end
+  return result
+end
+
+#= A der() whose argument is itself a der() bottoming out in a plain cref. =#
+function _isNestedDerivative(exp::DAE.Exp)::Bool
+  return @match exp begin
+    DAE.CALL(Absyn.IDENT("der"), inner <| _, _) => _bottomsOutInCref(inner)
+    _ => false
+  end
+end
+
+function _bottomsOutInCref(exp::DAE.Exp)::Bool
+  return @match exp begin
+    DAE.CREF(_, _) => true
+    DAE.CALL(Absyn.IDENT("der"), inner <| _, _) => _bottomsOutInCref(inner)
+    _ => false
+  end
+end
+
+"""
+    _derivativeStateCref(derExp, attr, auxiliaryVars, auxiliaryEqs, auxiliaryByName)
+
+For `der(inner)`, return a cref whose value equals it, synthesising the auxiliary
+state and defining equation `aux = der(innerCref)` (lowering `inner` first).
+"""
+function _derivativeStateCref(derExp::DAE.Exp, attr,
+                              auxiliaryVars::Vector{BDAE.VAR},
+                              auxiliaryEqs::Vector{BDAE.Equation},
+                              auxiliaryByName::Dict{String, DAE.ComponentRef})::DAE.ComponentRef
+  return @match derExp begin
+    DAE.CALL(Absyn.IDENT("der"), inner <| _, _) => begin
+      local baseCref = _firstOrderArgumentCref(inner, attr, auxiliaryVars, auxiliaryEqs, auxiliaryByName)
+      local baseName = OMBackend.canonicalName(baseCref)
+      local existing = get(auxiliaryByName, baseName, nothing)
+      if existing !== nothing
+        existing
+      else
+        local auxiliaryName = "der_" * baseName
+        local auxiliaryCref = DAE.CREF_IDENT(auxiliaryName, DAE.T_REAL_DEFAULT, nil)
+        local definingRHS = DAE.CALL(Absyn.IDENT("der"),
+                                     list(DAE.CREF(baseCref, DAE.T_REAL_DEFAULT)), attr)
+        push!(auxiliaryEqs, BDAE.EQUATION(DAE.CREF(auxiliaryCref, DAE.T_REAL_DEFAULT),
+                                          definingRHS, DAE.emptyElementSource,
+                                          BDAE.EQ_ATTR_DEFAULT_UNKNOWN))
+        push!(auxiliaryVars, BDAE.VAR(DAE.CREF_IDENT(auxiliaryName, DAE.T_UNKNOWN_DEFAULT, nil),
+                                      BDAE.VARIABLE(), DAE.T_REAL_DEFAULT))
+        auxiliaryByName[baseName] = auxiliaryCref
+        auxiliaryCref
+      end
+    end
+  end
+end
+
+#= Cref c such that der(c) represents der(exp): a plain cref yields itself; a
+   nested der is lowered to an auxiliary state first. =#
+function _firstOrderArgumentCref(exp::DAE.Exp, attr,
+                                 auxiliaryVars::Vector{BDAE.VAR},
+                                 auxiliaryEqs::Vector{BDAE.Equation},
+                                 auxiliaryByName::Dict{String, DAE.ComponentRef})::DAE.ComponentRef
+  return @match exp begin
+    DAE.CREF(cref, _) => cref
+    DAE.CALL(Absyn.IDENT("der"), _, _) => _derivativeStateCref(exp, attr, auxiliaryVars, auxiliaryEqs, auxiliaryByName)
+  end
 end
 
 
@@ -552,13 +612,7 @@ end
 Base.@nospecializeinfer function isAlreadyScalarizedCref(@nospecialize(cr::DAE.ComponentRef))::Bool
   @match cr begin
     DAE.CREF_QUAL(_, _, _, inner) => isAlreadyScalarizedCref(inner)
-    DAE.CREF_IDENT(_, _, subs) => begin
-      try
-        return !isempty(collect(subs))
-      catch
-        return false
-      end
-    end
+    DAE.CREF_IDENT(_, _, subs) => !listEmpty(subs)
     _ => false
   end
 end
@@ -878,7 +932,7 @@ end
 """
     Expand a single array equation into multiple scalar EQUATION objects.
 """
-function expandSingleArrayEquation(size::Integer, left::DAE.Exp, right::DAE.Exp,
+function expandSingleArrayEquation(size::Int, left::DAE.Exp, right::DAE.Exp,
                                     source::DAE.ElementSource, attr::BDAE.EquationAttributes)
   equations = BDAE.Equation[]
   leftFlat = flattenDAEArray(left)
@@ -1102,7 +1156,7 @@ end
 function _foldReductionScalar(fname::String, elems::Vector{DAE.Exp}, attr,
                               foldTy::DAE.Type)::Union{DAE.Exp, Nothing}
   isempty(elems) && return nothing
-  local acc = elems[1]
+  local acc::DAE.Exp = elems[1]
   for k in 2:length(elems)
     acc = if fname == "sum"
       DAE.BINARY(acc, DAE.ADD(foldTy), elems[k])
@@ -1133,7 +1187,7 @@ function _reducingCallArgElems(@nospecialize(arg))::Union{Vector{DAE.Exp}, Nothi
 end
 
 function unrollReductionTraverser(exp::DAE.Exp, acc)
-  local newExp = exp
+  local newExp::DAE.Exp = exp
   @match exp begin
     DAE.CALL(Absyn.IDENT(fname), args, attr) where (fname == "max" || fname == "min" ||
                                                     fname == "sum" || fname == "product") => begin
@@ -1371,9 +1425,9 @@ function flattenArrayCrefsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
           local v = syst.orderedVars[i]
           @match v.bindExp begin
             SOME(bindingExp) => begin
-              (newBindExp, _, _) = flattenWithPrefix(bindingExp, nothing)
-              #= Also traverse sub-expressions =#
-              (newBindExp, _) = Util.traverseExpTopDown(newBindExp, flattenWithPrefix, nothing)
+              #= traverseExpTopDown applies the func to the root first, then
+                 descends, so a separate root-only call is redundant. =#
+              (newBindExp, _) = Util.traverseExpTopDown(bindingExp, flattenWithPrefix, nothing)
               if !(bindingExp === newBindExp)
                 @assign syst.orderedVars[i].bindExp = SOME(newBindExp)
               end
@@ -1395,6 +1449,8 @@ end
   Converts [INDEX(ICONST(1)), INDEX(ICONST(2))] → "[1][2]"
 """
 function subscriptListToString(subscriptLst::List{DAE.Subscript})::String
+  #= Common case is an empty subscript list -> "" without touching IOBuffer. =#
+  listEmpty(subscriptLst) && return ""
   local buf = IOBuffer()
   for s in subscriptLst
     @match s begin

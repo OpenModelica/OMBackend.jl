@@ -14,9 +14,7 @@
 
 # -------------------- traverseExpTopDown --------------------
 
-Base.@nospecializeinfer function traverseExpTopDown(@nospecialize(inExp::Exp),
-                                                    @nospecialize(visitor),
-                                                    @nospecialize(arg))
+function traverseExpTopDown(inExp::Exp, visitor::F, arg::T)::Tuple{Exp, T} where {F, T}
   (outExp, cont, outArg) = visitor(inExp, arg)
   if !cont
     return (outExp, outArg)
@@ -81,52 +79,50 @@ function _traverseChildrenTopDown(e::IFEXP, visitor, arg)
           IFEXP(nc, nt, nl), a3)
 end
 
-# List-bearing shapes (always rebuild — referenceEq on Vector is rare)
-function _traverseChildrenTopDown(e::CALL, visitor, arg)
-  local out = Exp[]
+# List-bearing shapes: share the input vector when no element changed, so the
+# parent node is reused (matching the scalar shapes' identity-on-unchanged), and
+# allocate a fresh vector only from the first changed element onward.
+function _mapExpVec(xs::Vector, recur, visitor, arg)
+  local out = nothing
   local a = arg
-  for x in e.args
-    (nx, a) = traverseExpTopDown(x, visitor, a)
-    push!(out, nx)
+  local n = length(xs)
+  for i in 1:n
+    local x = xs[i]
+    (nx, a) = recur(x, visitor, a)
+    if out === nothing
+      if nx !== x
+        out = Vector{Exp}(undef, n)
+        for j in 1:(i - 1)
+          out[j] = xs[j]
+        end
+        out[i] = nx
+      end
+    else
+      out[i] = nx
+    end
   end
-  return (CALL(e.path, out, e.attr), a)
+  return (out === nothing ? xs : out, a)
+end
+function _traverseChildrenTopDown(e::CALL, visitor, arg)
+  (out, a) = _mapExpVec(e.args, traverseExpTopDown, visitor, arg)
+  return (out === e.args ? e : CALL(e.path, out, e.attr), a)
 end
 function _traverseChildrenTopDown(e::ARRAY_EXP, visitor, arg)
-  local out = Exp[]
-  local a = arg
-  for x in e.elements
-    (nx, a) = traverseExpTopDown(x, visitor, a)
-    push!(out, nx)
-  end
-  return (ARRAY_EXP(e.ty, e.scalar, out), a)
+  (out, a) = _mapExpVec(e.elements, traverseExpTopDown, visitor, arg)
+  return (out === e.elements ? e : ARRAY_EXP(e.ty, e.scalar, out), a)
 end
 function _traverseChildrenTopDown(e::RECORD, visitor, arg)
-  local out = Exp[]
-  local a = arg
-  for x in e.exps
-    (nx, a) = traverseExpTopDown(x, visitor, a)
-    push!(out, nx)
-  end
-  return (RECORD(e.path, out, e.fieldNames, e.ty), a)
+  (out, a) = _mapExpVec(e.exps, traverseExpTopDown, visitor, arg)
+  return (out === e.exps ? e : RECORD(e.path, out, e.fieldNames, e.ty), a)
 end
 function _traverseChildrenTopDown(e::TUPLE, visitor, arg)
-  local out = Exp[]
-  local a = arg
-  for x in e.PR
-    (nx, a) = traverseExpTopDown(x, visitor, a)
-    push!(out, nx)
-  end
-  return (TUPLE(out), a)
+  (out, a) = _mapExpVec(e.PR, traverseExpTopDown, visitor, arg)
+  return (out === e.PR ? e : TUPLE(out), a)
 end
 function _traverseChildrenTopDown(e::ASUB, visitor, arg)
   (nex, a1) = traverseExpTopDown(e.exp, visitor, arg)
-  local out = Exp[]
-  local a = a1
-  for s in e.subs
-    (ns, a) = traverseExpTopDown(s, visitor, a)
-    push!(out, ns)
-  end
-  return (ASUB(nex, out), a)
+  (out, a) = _mapExpVec(e.subs, traverseExpTopDown, visitor, a1)
+  return ((nex === e.exp && out === e.subs) ? e : ASUB(nex, out), a)
 end
 # Reduction: only the body is SimCode-recursive; info/iterators are opaque.
 function _traverseChildrenTopDown(e::REDUCTION, visitor, arg)
@@ -136,9 +132,7 @@ end
 
 # -------------------- traverseExpBottomUp --------------------
 
-Base.@nospecializeinfer function traverseExpBottomUp(@nospecialize(inExp::Exp),
-                                                     @nospecialize(visitor),
-                                                     @nospecialize(arg))
+function traverseExpBottomUp(inExp::Exp, visitor::F, arg::T)::Tuple{Exp, T} where {F, T}
   (newExp, newArg) = _traverseChildrenBottomUp(inExp, visitor, arg)
   return visitor(newExp, newArg)
 end
@@ -194,50 +188,25 @@ function _traverseChildrenBottomUp(e::IFEXP, visitor, arg)
           IFEXP(nc, nt, nl), a3)
 end
 function _traverseChildrenBottomUp(e::CALL, visitor, arg)
-  local out = Exp[]
-  local a = arg
-  for x in e.args
-    (nx, a) = traverseExpBottomUp(x, visitor, a)
-    push!(out, nx)
-  end
-  return (CALL(e.path, out, e.attr), a)
+  (out, a) = _mapExpVec(e.args, traverseExpBottomUp, visitor, arg)
+  return (out === e.args ? e : CALL(e.path, out, e.attr), a)
 end
 function _traverseChildrenBottomUp(e::ARRAY_EXP, visitor, arg)
-  local out = Exp[]
-  local a = arg
-  for x in e.elements
-    (nx, a) = traverseExpBottomUp(x, visitor, a)
-    push!(out, nx)
-  end
-  return (ARRAY_EXP(e.ty, e.scalar, out), a)
+  (out, a) = _mapExpVec(e.elements, traverseExpBottomUp, visitor, arg)
+  return (out === e.elements ? e : ARRAY_EXP(e.ty, e.scalar, out), a)
 end
 function _traverseChildrenBottomUp(e::RECORD, visitor, arg)
-  local out = Exp[]
-  local a = arg
-  for x in e.exps
-    (nx, a) = traverseExpBottomUp(x, visitor, a)
-    push!(out, nx)
-  end
-  return (RECORD(e.path, out, e.fieldNames, e.ty), a)
+  (out, a) = _mapExpVec(e.exps, traverseExpBottomUp, visitor, arg)
+  return (out === e.exps ? e : RECORD(e.path, out, e.fieldNames, e.ty), a)
 end
 function _traverseChildrenBottomUp(e::TUPLE, visitor, arg)
-  local out = Exp[]
-  local a = arg
-  for x in e.PR
-    (nx, a) = traverseExpBottomUp(x, visitor, a)
-    push!(out, nx)
-  end
-  return (TUPLE(out), a)
+  (out, a) = _mapExpVec(e.PR, traverseExpBottomUp, visitor, arg)
+  return (out === e.PR ? e : TUPLE(out), a)
 end
 function _traverseChildrenBottomUp(e::ASUB, visitor, arg)
   (nex, a1) = traverseExpBottomUp(e.exp, visitor, arg)
-  local out = Exp[]
-  local a = a1
-  for s in e.subs
-    (ns, a) = traverseExpBottomUp(s, visitor, a)
-    push!(out, ns)
-  end
-  return (ASUB(nex, out), a)
+  (out, a) = _mapExpVec(e.subs, traverseExpBottomUp, visitor, a1)
+  return ((nex === e.exp && out === e.subs) ? e : ASUB(nex, out), a)
 end
 function _traverseChildrenBottomUp(e::REDUCTION, visitor, arg)
   (nb, a) = traverseExpBottomUp(e.body, visitor, arg)

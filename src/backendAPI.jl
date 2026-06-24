@@ -77,6 +77,26 @@ Toggle with: `OMBackend.DIRECT_JAC_GENERATION[] = false` to disable.
 """
 const DIRECT_JAC_GENERATION = Ref{Bool}(true)
 
+"""
+Toggle type erasure of direct-RHS problems via `FunctionWrapperSpecialize`.
+The generated RHS (and symbolic Jacobian) are runtime-generated functions
+whose type is unique per model, so the resulting `ODEProblem` type differs
+per model and `solve` re-specializes its whole stepping/Newton/linear-solve
+machinery for every distinct model. Wrapping the inner functions in
+`FunctionWrappers` makes the problem type constant across models, so that
+machinery compiles once and is reused. Correctness is preserved: the mass
+matrix, sparse Jacobian and initialization are attached to the `ODEFunction`
+we build ourselves, not dropped by the wrapper.
+
+Toggle with: `OMBackend.DIRECT_RHS_TYPE_ERASE[] = false` to disable.
+
+This also governs event-callback erasure: when on, `_eraseContinuousCallbacks`
+collapses the OM-generated continuous callbacks into a single, model-independent
+`VectorContinuousCallback` (MTK `process_events` callbacks are left unchanged), so
+event-ful models in the legacy when-equation class also share the problem type.
+"""
+const DIRECT_RHS_TYPE_ERASE = Ref{Bool}(true)
+
 const OSMC_COPYRIGHT_HEADER = """
 #=
 * This file is part of OpenModelica.
@@ -206,7 +226,10 @@ function clearCaches!(; models::Bool=true,
                         wrappers::Bool=true,
                         extractors::Bool=true)
   cleared = String[]
-  models          && (empty!(COMPILED_MODELS_MTK);                       push!(cleared, "models"))
+  models          && (empty!(COMPILED_MODELS_MTK);
+                      empty!(IMTKGen.BUILT); empty!(IMTKGen.BUILT_HASH);
+                      empty!(IMTKGen.REDUCED_SYSTEMS); empty!(IMTKGen.PRISTINE_P);
+                      push!(cleared, "models"))
   implementations && (empty!(CodeGeneration.MODELICA_FUNCTION_IMPLS);    push!(cleared, "implementations"))
   wrappers        && (empty!(CodeGeneration.MODELICA_FUNCTION_WRAPPERS); push!(cleared, "wrappers"))
   extractors      && (empty!(CodeGeneration.ELEM_FUNC_CACHE);            push!(cleared, "extractors"))
@@ -630,6 +653,8 @@ function lower(frontendDAE::DAE.DAE_LIST)::BDAE.BACKEND_DAE
     @debug "[BDAE] translated; full dump is available in backend/bdae logs when backend logging is enabled"
     #= Transform ASUB expressions: der(array)[i] to der(array[i]) =#
     bDAE = Causalize.transformASUBExpressions(bDAE)
+    #= Order-lower nested derivatives der(der(x)) into first-order auxiliary states =#
+    bDAE = Causalize.lowerHigherOrderDerivatives(bDAE)
     #= Mark state variables =#
     bDAE = Causalize.detectStates(bDAE)
     @debug "[BDAE] states marked"
@@ -687,6 +712,8 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
     bDAE = Causalize.resolveIntegerVariables(bDAE)
     #= Transform ASUB expressions: der(array)[i] to der(array[i]) =#
     bDAE = Causalize.transformASUBExpressions(bDAE)
+    #= Order-lower nested derivatives der(der(x)) into first-order auxiliary states =#
+    bDAE = Causalize.lowerHigherOrderDerivatives(bDAE)
     #= Mark state variables =#
     bDAE = Causalize.detectStates(bDAE)
     @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterDetectStates.log"), BDAEUtil.stringHeading1(bDAE, "after detect states"))
@@ -1010,6 +1037,15 @@ function simulateModel(modelName::String;
       rethrow(err)
     end
   elseif MODE == IMTK_MODE
+    #= overwriteCache forces a fresh build: bypass the codeHash reuse check so the
+       cached problem is rebuilt (not just remade) before simulate. =#
+    if overwriteCache
+      try
+        IMTKGen._buildAndCache(modelName, getCompiledModel(modelName); overwriteCache = true)
+      catch err
+        @warn "[IMTK] overwriteCache rebuild failed; using existing cached build" model = modelName exception = err
+      end
+    end
     #= Reuse the build cached in the backend at translate time (no
        structural_simplify re-run); simulateIMTK falls back to module simulate. =#
     local _runDir = get(MODEL_RUN_DIRS, modelName, nothing)

@@ -35,14 +35,9 @@ jobs:
           - os: macos-latest
             arch: arm64
             version: '1.12'
-          # Windows is disabled while the silent test-suite stall is being
-          # debugged locally. The 90-minute job cap is hit consistently even
-          # after warm depot cache, D:-drive depot, coverage off and
-          # check_bounds=auto reduce setup + pre-test precompile to ~3
-          # minutes. The test runner then goes silent for 70+ minutes with
-          # no output before the cap, so the stall is inside the test suite
-          # itself. Re-enable once the hung @testset is identified and
-          # either fixed or skipped.
+          - os: windows-latest
+            arch: x64
+            version: '1.12'
 
     steps:
       - name: Cap precompile concurrency (macOS)
@@ -145,3 +140,77 @@ jobs:
             Commit:       ${{ github.sha }}
             Branch:       ${{ github.ref_name }}
             Matrix:       ${{ matrix.os }} / Julia ${{ matrix.version }} / ${{ matrix.arch }}
+
+  # Downstream integration gate: after the OMBackend tests pass, run the parent
+  # OM.jl test suite (runtests.jl) on Ubuntu with THIS OMBackend checkout dev'd
+  # in, so an OMBackend change that breaks the parent is caught here.
+  om-rt:
+    name: OM.jl RT - Ubuntu (downstream)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # This job builds the parent OM.jl project, not OMBackend; repoint the
+      # project so the cache action and bare `julia --project` calls key off it.
+      JULIA_PROJECT: OM.jl
+    steps:
+      # OMBackend under test: the current repo at the triggering ref, placed as a
+      # sibling so OM.jl's [sources] path ../OMBackend.jl resolves to it.
+      - name: Checkout OMBackend.jl (under test)
+        uses: actions/checkout@v4
+        with:
+          path: OMBackend.jl
+
+      # Parent OM.jl and the remaining siblings mirror OM.jl's own CI so RT runs
+      # in the same environment, with OMBackend swapped for the checkout above.
+      - { name: Checkout OM.jl,                 uses: actions/checkout@v4, with: { repository: JKRT/OM.jl,                        ref: master, path: OM.jl } }
+      - { name: Checkout Absyn.jl,              uses: actions/checkout@v4, with: { repository: OpenModelica/Absyn.jl,             ref: master, path: Absyn.jl } }
+      - { name: Checkout ArrayUtil.jl,          uses: actions/checkout@v4, with: { repository: JKRT/ArrayUtil.jl,                ref: master, path: ArrayUtil.jl } }
+      - { name: Checkout DAE.jl,                uses: actions/checkout@v4, with: { repository: JKRT/DAE.jl,                      ref: master, path: DAE.jl } }
+      - { name: Checkout DoubleEnded.jl,        uses: actions/checkout@v4, with: { repository: OpenModelica/DoubleEnded.jl,       ref: master, path: DoubleEnded.jl } }
+      - { name: Checkout ImmutableList.jl,      uses: actions/checkout@v4, with: { repository: OpenModelica/ImmutableList.jl,     ref: master, path: ImmutableList.jl } }
+      - { name: Checkout ListUtil.jl,           uses: actions/checkout@v4, with: { repository: JKRT/ListUtil.jl,                  ref: master, path: ListUtil.jl } }
+      - { name: Checkout MetaModelica.jl,       uses: actions/checkout@v4, with: { repository: OpenModelica/MetaModelica.jl,      ref: master, path: MetaModelica.jl } }
+      - { name: Checkout OMFrontend.jl,         uses: actions/checkout@v4, with: { repository: OpenModelica/OMFrontend.jl,        ref: master, path: OMFrontend.jl } }
+      - { name: Checkout OMParser.jl,           uses: actions/checkout@v4, with: { repository: OpenModelica/OMParser.jl,          ref: master, path: OMParser.jl } }
+      - { name: Checkout OMRuntimeExternalC.jl, uses: actions/checkout@v4, with: { repository: OpenModelica/OMRuntimeExternalC.jl, ref: master, path: OMRuntimeExternalC.jl } }
+      - { name: Checkout SCode.jl,              uses: actions/checkout@v4, with: { repository: OpenModelica/SCode.jl,             ref: master, path: SCode.jl } }
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+          arch: x64
+
+      - uses: julia-actions/cache@v2
+        with:
+          cache-name: om-rt
+
+      - name: Develop siblings, build native libs, precompile
+        shell: bash
+        working-directory: OM.jl
+        # Disable auto-precompile so the native-lib build runs before precompile
+        # (OMParser/OMRuntimeExternalC download shared libs in their build step).
+        env:
+          JULIA_PKG_PRECOMPILE_AUTO: '0'
+        run: |
+          julia --color=yes --project -e '
+            import Pkg
+            Pkg.Registry.add("General")
+            Pkg.Registry.add(Pkg.RegistrySpec(url="https://github.com/OpenModelica/OpenModelicaRegistry.git"))
+            siblings = [
+              "../Absyn.jl", "../ArrayUtil.jl", "../DAE.jl", "../DoubleEnded.jl",
+              "../ImmutableList.jl", "../ListUtil.jl", "../MetaModelica.jl",
+              "../OMBackend.jl", "../OMFrontend.jl", "../OMParser.jl",
+              "../OMRuntimeExternalC.jl", "../SCode.jl",
+            ]
+            Pkg.develop([Pkg.PackageSpec(path = p) for p in siblings])
+            # Test-only deps used by test/testUtils.jl but absent from OM [deps].
+            Pkg.add(["ADTypes", "Sundials", "Logging", "Test"])
+            Pkg.build(["OMParser", "OMRuntimeExternalC"]; verbose=true)
+            Pkg.resolve()
+            Pkg.precompile()'
+
+      - name: Test (OM.jl runtests)
+        shell: bash
+        working-directory: OM.jl/test     # runtests.jl guards pwd() == @__DIR__
+        run: julia --color=yes --project=.. -e 'include("runtests.jl")'

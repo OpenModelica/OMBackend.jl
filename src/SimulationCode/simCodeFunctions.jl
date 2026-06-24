@@ -579,8 +579,6 @@ end
 """
 # SIM.Exp delegation: BRANCH.condition / EQUATION.lhs|rhs are SIM.Exp post-migration.
 resolveConstantIfExp(exp::Exp)::Exp = toSimExp(resolveConstantIfExp(toDAEExp(exp)))
-resolveConstantIfExp(exp::Exp, simCode::SIM_CODE)::Exp =
-  toSimExp(resolveConstantIfExp(toDAEExp(exp), simCode))
 
 function resolveConstantIfExp(exp::DAE.Exp)::DAE.Exp
   @match exp begin
@@ -712,6 +710,94 @@ function resolveConstantIfExp(exp::DAE.Exp, simCode::SIM_CODE)::DAE.Exp
     end
     _ => exp
   end
+end
+
+#= SIM-native mirror of resolveConstantIfExp(::DAE.Exp, simCode): recurses on the
+   SimCode Exp spine so the per-residual caller (pruneConstantConditions via
+   _rewriteResidualIfExp) need not build a whole-tree DAE copy. === identity is
+   preserved so unchanged subtrees are reused (no per-node toSimExp round-trip);
+   only the small IFEXP condition round-trips through tryEvalCondition's DAE arm.
+   Arms mirror the DAE method 1:1 on SIM struct fields. =#
+function resolveConstantIfExp(exp::Exp, simCode::SIM_CODE)::Exp
+  if exp isa IFEXP
+    local resolved = tryEvalCondition(exp.cond, simCode)
+    if resolved === true
+      return resolveConstantIfExp(exp.thenExp, simCode)
+    elseif resolved === false
+      return resolveConstantIfExp(exp.elseExp, simCode)
+    end
+    local nc = resolveConstantIfExp(exp.cond, simCode)
+    local nt = resolveConstantIfExp(exp.thenExp, simCode)
+    local ne = resolveConstantIfExp(exp.elseExp, simCode)
+    return (nc === exp.cond && nt === exp.thenExp && ne === exp.elseExp) ? exp : IFEXP(nc, nt, ne)
+  elseif exp isa BINARY
+    local n1 = resolveConstantIfExp(exp.exp1, simCode)
+    local n2 = resolveConstantIfExp(exp.exp2, simCode)
+    return (n1 === exp.exp1 && n2 === exp.exp2) ? exp : BINARY(n1, exp.op, n2)
+  elseif exp isa UNARY
+    local n1 = resolveConstantIfExp(exp.exp, simCode)
+    return n1 === exp.exp ? exp : UNARY(exp.op, n1)
+  elseif exp isa LBINARY
+    local n1 = resolveConstantIfExp(exp.exp1, simCode)
+    local n2 = resolveConstantIfExp(exp.exp2, simCode)
+    return (n1 === exp.exp1 && n2 === exp.exp2) ? exp : LBINARY(n1, exp.op, n2)
+  elseif exp isa LUNARY
+    local n1 = resolveConstantIfExp(exp.exp, simCode)
+    return n1 === exp.exp ? exp : LUNARY(exp.op, n1)
+  elseif exp isa RELATION
+    local n1 = resolveConstantIfExp(exp.exp1, simCode)
+    local n2 = resolveConstantIfExp(exp.exp2, simCode)
+    return (n1 === exp.exp1 && n2 === exp.exp2) ? exp : RELATION(n1, exp.op, n2, exp.index)
+  elseif exp isa CAST
+    local n1 = resolveConstantIfExp(exp.exp, simCode)
+    return n1 === exp.exp ? exp : CAST(exp.ty, n1)
+  elseif exp isa CALL
+    #= Allocate lazily; an unchanged arg list returns the original node. =#
+    local newArgs::Union{Nothing, Vector{Exp}} = nothing
+    local i = 0
+    for arg in exp.args
+      i += 1
+      local na = resolveConstantIfExp(arg, simCode)
+      if newArgs === nothing
+        if na !== arg
+          newArgs = Exp[]
+          for j in 1:(i - 1); push!(newArgs, exp.args[j]); end
+          push!(newArgs, na)
+        end
+      else
+        push!(newArgs, na)
+      end
+    end
+    return newArgs === nothing ? exp : CALL(exp.path, newArgs, exp.attr)
+  elseif exp isa ARRAY_EXP
+    local newEls::Union{Nothing, Vector{Exp}} = nothing
+    local i = 0
+    for el in exp.elements
+      i += 1
+      local nel = resolveConstantIfExp(el, simCode)
+      if newEls === nothing
+        if nel !== el
+          newEls = Exp[]
+          for j in 1:(i - 1); push!(newEls, exp.elements[j]); end
+          push!(newEls, nel)
+        end
+      else
+        push!(newEls, nel)
+      end
+    end
+    return newEls === nothing ? exp : ARRAY_EXP(exp.ty, exp.scalar, newEls)
+  elseif exp isa ASUB
+    local n1 = resolveConstantIfExp(exp.exp, simCode)
+    local changed = n1 !== exp.exp
+    local newSubs = Exp[]
+    for sub in exp.subs
+      local ns = resolveConstantIfExp(sub, simCode)
+      changed |= ns !== sub
+      push!(newSubs, ns)
+    end
+    return changed ? ASUB(n1, newSubs) : exp
+  end
+  return exp
 end
 
 """
@@ -889,9 +975,13 @@ Base.@nospecializeinfer function tryEvalScalar(@nospecialize(exp::DAE.Exp), simC
         nothing
       else
         local (name, bindExp) = bound
-        local childSeen = copy(seen)
-        push!(childSeen, name)
-        tryEvalScalar(bindExp, simCode, childSeen)
+        #= Backtracking cycle guard on a shared set avoids copying `seen` per CREF. =#
+        push!(seen, name)
+        try
+          tryEvalScalar(bindExp, simCode, seen)
+        finally
+          delete!(seen, name)
+        end
       end
     end
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
@@ -926,9 +1016,13 @@ function _tryEvalNumeric(exp::DAE.Exp, simCode::SIM_CODE, seen::OrderedSet{Strin
         nothing
       else
         local (name, bindExp) = bound
-        local childSeen = copy(seen)
-        push!(childSeen, name)
-        _tryEvalNumeric(bindExp, simCode, childSeen)
+        #= Backtracking cycle guard on a shared set avoids copying `seen` per CREF. =#
+        push!(seen, name)
+        try
+          _tryEvalNumeric(bindExp, simCode, seen)
+        finally
+          delete!(seen, name)
+        end
       end
     end
     DAE.UNARY(DAE.UMINUS(__), inner) => begin

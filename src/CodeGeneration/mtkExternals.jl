@@ -1113,25 +1113,28 @@ function wrapWithInvokelatest(expr::Expr)
       end
       return Expr(:call, newArgs...)
     end
-    #= Recursively process arguments; return original if nothing changed =#
-    local changed = false
-    local newArgs = copy(expr.args)
+    #= Recursively process arguments; allocate a new args vector only when a
+       child actually changes, else return the original Expr unchanged. =#
+    local newArgs = nothing
     for (i, a) in enumerate(expr.args)
-      r = wrapWithInvokelatest(a)
-      newArgs[i] = r
-      changed |= r !== a
+      local r = wrapWithInvokelatest(a)
+      if r !== a
+        newArgs === nothing && (newArgs = copy(expr.args))
+        newArgs[i] = r
+      end
     end
-    return changed ? Expr(:call, newArgs...) : expr
+    return newArgs === nothing ? expr : Expr(:call, newArgs...)
   end
-  #= For all other Expr types; return original if nothing changed =#
-  local changed = false
-  local newArgs = copy(expr.args)
+  #= For all other Expr types; allocate only when a child changes. =#
+  local newArgs = nothing
   for (i, a) in enumerate(expr.args)
-    r = wrapWithInvokelatest(a)
-    newArgs[i] = r
-    changed |= r !== a
+    local r = wrapWithInvokelatest(a)
+    if r !== a
+      newArgs === nothing && (newArgs = copy(expr.args))
+      newArgs[i] = r
+    end
   end
-  return changed ? Expr(expr.head, newArgs...) : expr
+  return newArgs === nothing ? expr : Expr(expr.head, newArgs...)
 end
 
 wrapWithInvokelatest(x) = x  #= For non-Expr types, return as-is =#
@@ -1886,8 +1889,6 @@ function _demoteWideNumericsInEquations(eqs)
 end
 
 """
-  TODO:
-  Document why some parts here are commented out
   The irreducible variables scheme does not work using plain simplify.
 
   It should be noted that for some models both running tearing and structural simplification are needed.
@@ -1935,7 +1936,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
           push!(results, (path, :raw_array, expr))
         end
       end
-      local allResults = []
+      local allResults = Tuple{Int,String,Symbol,Any}[]
       for (i, eq) in enumerate(equations(sys))
         local lhsR = Pair{String,Any}[]
         local rhsR = Pair{String,Any}[]
@@ -2085,7 +2086,7 @@ function ode_order_lowering(eqs, iv, unknown_vars)
   var_order = OrderedDict{Any, Int}()
   D = Differential(iv)
   diff_eqs = Equation[]
-  diff_vars = []
+  diff_vars = Any[]
   alge_eqs = Equation[]
   for (i, eq) in enumerate(eqs)
     if !isdiffeq(eq)

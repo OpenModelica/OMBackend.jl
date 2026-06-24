@@ -743,7 +743,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     DAE.CALL(Absyn.IDENT("sample"), args, attrs) => true
     _ => false
   end
-  local isContinuousCond::Bool = isContinousCondition(wEqCondDAE, simCode)
+  local isContinuousCond::Bool = isContinuousCondition(wEqCondDAE, simCode)
   #= Table / time-driven sources: a when whose condition is purely change(time>=c)
      thresholds must fire AT those times via PresetTimeCallback — a ContinuousCallback
      rootfinding on the spiky change() value never detects the crossings. =#
@@ -760,7 +760,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     end
   end
   #= A `sample(start, period)` is a periodic clock even when its interval is a
-     parameter, which isContinousCondition mis-flags as continuous; keep all
+     parameter, which isContinuousCondition mis-flags as continuous; keep all
      samples on the periodic branch. =#
   if isContinuousCond && !isPeriodic
     local isElseIf = if wEq.elsewhenPart !== nothing
@@ -1262,7 +1262,7 @@ function expToJuliaExp(e::SimulationCode.EXP_CREF, context::C, varSuffix=""; var
 end
 
 function expToJuliaExp(e::SimulationCode.UNARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local o = opKindToJuliaOperator(e.op)
   quote
     $(o)($(expToJuliaExp(e.exp, context, varPrefix=varPrefix)))
   end
@@ -1270,21 +1270,21 @@ end
 function expToJuliaExp(e::SimulationCode.BINARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   local a = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
   local b = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local o = opKindToJuliaOperator(e.op)
   quote
     $o($(a), $(b))
   end
 end
 function expToJuliaExp(e::SimulationCode.LUNARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   local lhs = expToJuliaExp(e.exp, context, varPrefix=varPrefix)
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local o = opKindToJuliaOperator(e.op)
   quote
     $o($(lhs))
   end
 end
 function expToJuliaExp(e::SimulationCode.LBINARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   local l = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local o = opKindToJuliaOperator(e.op)
   local r = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
   quote
     $o($(l), $(r))
@@ -1292,7 +1292,7 @@ function expToJuliaExp(e::SimulationCode.LBINARY, context::C, varSuffix=""; varP
 end
 function expToJuliaExp(e::SimulationCode.RELATION, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   local lhs = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
+  local o = opKindToJuliaOperator(e.op)
   local rhs = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
   quote
     $o($(lhs), $(rhs))

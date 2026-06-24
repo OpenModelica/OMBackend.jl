@@ -256,8 +256,8 @@ function Base.string(@nospecialize(eq::BDAE.Equation))
         "INITIAL_STRUCTURAL_STATE(" * eq.initialState * ")"
       end
 
-      BDAE.STRUCTURAL_TRANSISTION(__) => begin
-        "STRUCTURAL_TRANSISTION " * eq.fromState * " -> " * eq.toState * "| if:" * string(eq.transistionCondition)
+      BDAE.STRUCTURAL_TRANSITION(__) => begin
+        "STRUCTURAL_TRANSITION " * eq.fromState * " -> " * eq.toState * "| if:" * string(eq.transitionCondition)
       end
 
       BDAE.DUMMY_EQUATION() => begin
@@ -477,7 +477,7 @@ function Base.string(@nospecialize(op::DAE.Operator))::String
 
       DAE.USERDEFINED() => "[UNDEF OP]"
 
-      _ => throw("Unkown operator")
+      _ => throw("Unknown operator")
 
     end
   end
@@ -485,7 +485,7 @@ end
 
 function Base.string(@nospecialize(exp::DAE.Exp))::String
   str = begin
-    local int::ModelicaInteger
+    local int::Int
     local real::ModelicaReal
     local bool::Bool
     local tmpStr::String
@@ -715,7 +715,7 @@ function Base.string(path::Absyn.FULLYQUALIFIED; separator = OMBackend.COMPONENT
   return separator + string(path.path; separator = separator)
 end
 
-function lstString(expLst::List{T}, seperator::String)::String where{T}
+function lstString(expLst::List{T}, separator::String)::String where{T}
   str = begin
     local e::T
     local rest::List{T}
@@ -723,7 +723,7 @@ function lstString(expLst::List{T}, seperator::String)::String where{T}
       (e <| rest) => begin
         str = string(e)
         for r in rest
-          str = str + seperator + string(r)
+          str = str + separator + string(r)
         end
         (str)
       end

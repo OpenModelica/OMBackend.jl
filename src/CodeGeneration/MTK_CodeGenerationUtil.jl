@@ -155,7 +155,7 @@ end
 """
 Transforms a DAE Condition into a MTK continuous condition.
 """
-function transformToMTKContinousCondition(cond, simCode)
+function transformToMTKContinuousCondition(cond, simCode)
   # @match patterns are DAE.* only; convert SIM-side conditions at entry.
   if cond isa SimulationCode.Exp
     cond = SimulationCode.toDAEExp(cond)
@@ -187,22 +187,22 @@ function transformToMTKContinousCondition(cond, simCode)
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      :(min($(transformToMTKContinousCondition(e1, simCode)),
-            $(transformToMTKContinousCondition(e2, simCode))))
+      :(min($(transformToMTKContinuousCondition(e1, simCode)),
+            $(transformToMTKContinuousCondition(e2, simCode))))
     end
     DAE.LBINARY(e1, DAE.AND(__), e2) => begin
-      :(max($(transformToMTKContinousCondition(e1, simCode)),
-            $(transformToMTKContinousCondition(e2, simCode))))
+      :(max($(transformToMTKContinuousCondition(e1, simCode)),
+            $(transformToMTKContinuousCondition(e2, simCode))))
     end
     #= Logical NOT: negate the inner condition =#
     DAE.LUNARY(DAE.NOT(__), e) => begin
-      :(-($(transformToMTKContinousCondition(e, simCode))))
+      :(-($(transformToMTKContinuousCondition(e, simCode))))
     end
     #= Strip noEvent wrapper and recurse =#
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
-        transformToMTKContinousCondition(innerArgs[1], simCode)
+        transformToMTKContinuousCondition(innerArgs[1], simCode)
       else
         throw("noEvent with multiple arguments not supported in condition: " * string(cond))
       end
@@ -226,7 +226,7 @@ end
 """
 Transforms a DAE Condition into a MTK continuous condition equation.
 """
-function transformToMTKContinousConditionEquation(cond, simCode)
+function transformToMTKContinuousConditionEquation(cond, simCode)
   # @match patterns are DAE.* only; convert SIM-side conditions at entry.
   if cond isa SimulationCode.Exp
     cond = SimulationCode.toDAEExp(cond)
@@ -263,22 +263,22 @@ function transformToMTKContinousConditionEquation(cond, simCode)
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      :(min($(transformToMTKContinousCondition(e1, simCode)),
-            $(transformToMTKContinousCondition(e2, simCode))) ~ 0)
+      :(min($(transformToMTKContinuousCondition(e1, simCode)),
+            $(transformToMTKContinuousCondition(e2, simCode))) ~ 0)
     end
     DAE.LBINARY(e1, DAE.AND(__), e2) => begin
-      :(max($(transformToMTKContinousCondition(e1, simCode)),
-            $(transformToMTKContinousCondition(e2, simCode))) ~ 0)
+      :(max($(transformToMTKContinuousCondition(e1, simCode)),
+            $(transformToMTKContinuousCondition(e2, simCode))) ~ 0)
     end
     #= Logical NOT: negate the inner condition =#
     DAE.LUNARY(DAE.NOT(__), e) => begin
-      :(-($(transformToMTKContinousCondition(e, simCode))) ~ 0)
+      :(-($(transformToMTKContinuousCondition(e, simCode))) ~ 0)
     end
     #= Strip noEvent wrapper and recurse =#
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
-        transformToMTKContinousConditionEquation(innerArgs[1], simCode)
+        transformToMTKContinuousConditionEquation(innerArgs[1], simCode)
       else
         throw("noEvent with multiple arguments not supported in condition: " * string(cond))
       end
@@ -445,13 +445,7 @@ Base.@nospecializeinfer function _ifexpBranchIsNonReal(@nospecialize(e::DAE.Exp)
   @match e begin
     DAE.SCONST(_) => true
     DAE.CREF(_, ty) => ty isa DAE.T_STRING
-    DAE.CALL(_, _, attrs) => begin
-      try
-        attrs.ty isa DAE.T_STRING
-      catch
-        false
-      end
-    end
+    DAE.CALL(_, _, attrs) => attrs.ty isa DAE.T_STRING
     DAE.IFEXP(_, t, el) => _ifexpBranchIsNonReal(t) || _ifexpBranchIsNonReal(el)
     _ => false
   end
@@ -496,10 +490,7 @@ expToJuliaExpMTK(exp::SimulationCode.WILD, simCode::SimulationCode.SIM_CODE;
 
 function expToJuliaExpMTK(exp::SimulationCode.ENUM_LITERAL, simCode::SimulationCode.SIM_CODE;
                           varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  return quote
-    $(LineNumberNode(@__LINE__, "$(string(exp.path)) ENUM"))
-    $(exp.index)
-  end
+  return quote $(exp.index) end
 end
 
 function expToJuliaExpMTK(exp::SimulationCode.EXP_CREF, simCode::SimulationCode.SIM_CODE;
@@ -523,10 +514,7 @@ function expToJuliaExpMTK(exp::SimulationCode.EXP_CREF, simCode::SimulationCode.
     string(nameStr, "[", join(exp.cref.subs, ","), "]")
   local htEntry = get(hashTable, lookUpStr, nothing)
   if htEntry !== nothing
-    return quote
-      $(LineNumberNode(@__LINE__, "SIM cref: $lookUpStr"))
-      $(Symbol(htEntry[2].name))
-    end
+    return quote $(Symbol(htEntry[2].name)) end
   end
   local (aliasResolved, aliasExpr) = resolveAliasedCref(lookUpStr, simCode, hashTable,
     varPrefix = varPrefix, varSuffix = varSuffix)
@@ -543,7 +531,7 @@ function expToJuliaExpMTK(exp::SimulationCode.BINARY, simCode::SimulationCode.SI
                                 varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
   local rhs = expToJuliaExpMTK(exp.exp2, simCode;
                                 varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+  local opSym = opKindToJuliaOperator(exp.op)
   return :( $opSym($(lhs), $(rhs)) )
 end
 
@@ -551,7 +539,7 @@ function expToJuliaExpMTK(exp::SimulationCode.UNARY, simCode::SimulationCode.SIM
                           varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
   local operand = expToJuliaExpMTK(exp.exp, simCode;
                                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+  local opSym = opKindToJuliaOperator(exp.op)
   return :( $opSym($(operand)) )
 end
 
@@ -562,7 +550,7 @@ function expToJuliaExpMTK(exp::SimulationCode.LUNARY, simCode::SimulationCode.SI
   if exp.op === SimulationCode.OP_NOT
     return :( 1 - $(operand) )
   end
-  local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+  local opSym = opKindToJuliaOperator(exp.op)
   return :( $opSym($(operand)) )
 end
 
@@ -577,7 +565,7 @@ function expToJuliaExpMTK(exp::SimulationCode.LBINARY, simCode::SimulationCode.S
   elseif exp.op === SimulationCode.OP_AND
     return :( $(lhs) * $(rhs) )
   end
-  local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+  local opSym = opKindToJuliaOperator(exp.op)
   return :( $opSym($(lhs), $(rhs)) )
 end
 
@@ -587,7 +575,7 @@ function expToJuliaExpMTK(exp::SimulationCode.RELATION, simCode::SimulationCode.
                                 varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
   local rhs = expToJuliaExpMTK(exp.exp2, simCode;
                                 varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local opSym = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
+  local opSym = opKindToJuliaOperator(exp.op)
   return quote ($opSym($(lhs), $(rhs))) end
 end
 

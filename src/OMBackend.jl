@@ -48,4 +48,6 @@ include("$CURRENT_DIRECTORY/CodeGeneration/iMTKGen.jl")
 include("backendUtils.jl")
 #= Finally add the API=#
 include("backendAPI.jl")
+#= Precompile workload: warm shared MTK/OrdinaryDiffEq build+solve instances. =#
+include("precompile.jl")
 end #=OMBackend=#

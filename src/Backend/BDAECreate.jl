@@ -226,9 +226,13 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   #= §17.4.4: lift discrete (Bool/Int/enum) equation-section definitions whose RHS
      is a discrete-time relation into event-driven held discretes, so the
      continuous integrator never interpolates step-valued logic. =#
+  #= Stringify each varName once; the four name-keyed sweeps below
+     (param/const, discrete-start, collision-resolve, dedup) all use the
+     default-separator string and share this vector instead of recomputing it. =#
+  local varNames = String[string(v.varName) for v in variables]
   if !isempty(equations) && !isempty(variables)
-    local _discParamConst = _collectParamOrConstNames(variables)
-    local _discStarts = _discreteStartExpLookup(variables)
+    local _discParamConst = _collectParamOrConstNames(variables, varNames)
+    local _discStarts = _discreteStartExpLookup(variables, varNames)
     local (_discEqs, _discLifted) = synthesizeWhenEquationsFromDiscreteEquations(equations, _discParamConst, _discStarts)
     if !isempty(_discLifted)
       @info "[BDAE: lifter] synthesizeWhenEquationsFromDiscreteEquations lifted $(length(_discLifted)) discrete equation(s)" lifted=collect(_discLifted)
@@ -246,14 +250,16 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   end
   #= Distinct crefs can mangle to the same flat name (a.b vs a_b); resolve
      before the name-keyed deduplication silently swallows a variable. =#
-  resolveMangledNameCollisions!(variables, equations, initialEquations)
+  resolveMangledNameCollisions!(variables, equations, initialEquations, varNames)
   #= Deduplicate variables by name (handles inner/outer duplicate emission) =#
-  variables = deduplicateVariables(variables)
+  variables = deduplicateVariables(variables, varNames)
   #= Deduplicate explicit equations =#
   equations = deduplicateEquations(equations)
   #= The set of equations might also contain a  set of "binding equations" =#
   local bindingEquations = createBindingEquations(variables)
-  equations = vcat(equations, bindingEquations)
+  if !isempty(bindingEquations)
+    equations = vcat(equations, bindingEquations)
+  end
   #= TODO Extract the simple equations =#
   local simpleEquations = BDAE.Equation[]
   return BDAE.EQSYSTEM(name, variables, equations, simpleEquations, initialEquations)
@@ -280,10 +286,11 @@ end
   unique names, rewriting every occurrence (equations, initial equations and
   bindings) so the name-keyed passes downstream stay sound.
 """
-function resolveMangledNameCollisions!(variables::Vector, equations::Vector, initialEquations::Vector)
+function resolveMangledNameCollisions!(variables::Vector, equations::Vector, initialEquations::Vector,
+                                       varNames::Vector{String} = String[string(v.varName) for v in variables])
   local idxsByMangled = OrderedDict{String, Vector{Int}}()
   for (i, v) in enumerate(variables)
-    push!(get!(() -> Int[], idxsByMangled, string(v.varName)), i)
+    push!(get!(() -> Int[], idxsByMangled, varNames[i]), i)
   end
   local taken = OrderedSet{String}(keys(idxsByMangled))
   local renames = OrderedDict{String, DAE.ComponentRef}()
@@ -315,6 +322,8 @@ function resolveMangledNameCollisions!(variables::Vector, equations::Vector, ini
       renames[dotted] = newCref
       for i in gidxs
         variables[i].varName = newCref
+        #= Keep the shared name vector in sync so downstream dedup keys correctly. =#
+        varNames[i] = string(newCref)
       end
     end
   end
@@ -358,12 +367,13 @@ end
   Deduplicate variables by their component reference name.
   Keeps the first occurrence of each uniquely-named variable.
 """
-function deduplicateVariables(variables::Vector)::Vector
+function deduplicateVariables(variables::Vector,
+                              varNames::Vector{String} = String[string(v.varName) for v in variables])::Vector
   local idxByName = Dict{String, Int}()
   local unique_vars = similar(variables, 0)
   local duplicateCount = 0
-  for v in variables
-    local varStr = string(v.varName)
+  for (i, v) in enumerate(variables)
+    local varStr = varNames[i]
     local existing = get(idxByName, varStr, 0)
     if existing != 0
       duplicateCount += 1
@@ -415,13 +425,18 @@ structuralHash(x::Vector, h::UInt) = begin
   end
   h
 end
-function structuralHash(@nospecialize(x), h::UInt)
-  T = typeof(x)
-  h = hash(T, h)
-  for i in 1:fieldcount(T)
-    h = structuralHash(getfield(x, i), h)
+#= Generic struct fold: unrolled per concrete type so each `getfield(x, i)` has a
+   concrete field type and the recursive call dispatches statically (no boxing).
+   Semantics identical to the previous runtime-loop fallback: hash the type, then
+   each field in order. =#
+@generated function structuralHash(x, h::UInt)
+  local body = Expr(:block)
+  push!(body.args, :(h = hash($x, h)))
+  for i in 1:fieldcount(x)
+    push!(body.args, :(h = structuralHash(getfield(x, $i), h)))
   end
-  h
+  push!(body.args, :(return h))
+  return body
 end
 structuralHash(@nospecialize(x)) = structuralHash(x, zero(UInt))
 
@@ -613,7 +628,7 @@ Base.@nospecializeinfer function equationToBackendEquation(@nospecialize(elem::D
           @match fromStateExp <| toStateExp <| conditionExp <| nil = expLst
           local fromStateIdent = string(fromStateExp)
           local toStateIdent = string(toStateExp)
-          BDAE.STRUCTURAL_TRANSISTION(fromStateIdent, toStateIdent, conditionExp)
+          BDAE.STRUCTURAL_TRANSITION(fromStateIdent, toStateIdent, conditionExp)
         end
         _ => begin
           #= Skip unknown NORETCALL statements (e.g. checkBoundary, assert-like calls).
@@ -942,11 +957,11 @@ function createBindingEquations(variables::Vector)
                  local elsePart = BDAE.WHEN_STMTS(BDAEUtil.invertCondition(cond) #= The else when here has the inverted condition of the first part. =#
                                                   ,list(BDAE.ASSIGN(lhs, elseExp, v.source))
                                                   ,nothing)
-                 local elseWeqPart = BDAE.WHEN_EQUATION(1, elsePart, v.source, nothing)
+                 local elseWeqPart = BDAE.WHEN_EQUATION(1, elsePart, v.source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
                  local stmts = BDAE.WHEN_STMTS(cond
                                                ,list(BDAE.ASSIGN(lhs, thenExp, v.source))
                                                ,SOME(elseWeqPart))
-                 local weq = BDAE.WHEN_EQUATION(1, stmts, v.source, nothing)
+                 local weq = BDAE.WHEN_EQUATION(1, stmts, v.source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
                  push!(bindingEqs, weq)
                end
       #= Boolean (non-ifexp), Integer or enumeration declaration binding ->
@@ -1040,7 +1055,7 @@ function synthesizeFromInitialAlgorithms(iAlgorithms)::Vector{BDAE.Equation}
       length(alg.statements),
       BDAE.WHEN_STMTS(initialCall, whenOps, NONE()),
       alg.source,
-      nothing,
+      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
     )
     _INIT_ALG_DAE_STMTS[node] = collect(daeStmts)
     push!(out, node)
@@ -1128,13 +1143,14 @@ end
    names of every entry whose `varKind` is `PARAM` or `CONST`. Iterating
    the materialized BDAE vector avoids touching the lazier frontend list
    that triggered a multi-minute stall on first call. =#
-function _collectParamOrConstNames(variables::Vector{BDAE.VAR})::OrderedSet{String}
+function _collectParamOrConstNames(variables::Vector{BDAE.VAR},
+                                   varNames::Vector{String} = String[string(v.varName) for v in variables])::OrderedSet{String}
   local names = OrderedSet{String}()
   sizehint!(names, 2 * length(variables))
-  for var in variables
+  for (i, var) in enumerate(variables)
     local k = var.varKind
     if k isa BDAE.PARAM || k isa BDAE.CONST
-      local s = string(var.varName)
+      local s = varNames[i]
       push!(names, s)
       local u = replace(s, "." => "_")
       u === s || push!(names, u)
@@ -1564,11 +1580,11 @@ Base.@nospecializeinfer function _innermostType(@nospecialize(cref))
   end
 end
 
-Base.@nospecializeinfer function _innermostSubscripts(@nospecialize(cref))::Vector
+Base.@nospecializeinfer function _innermostSubscripts(@nospecialize(cref))::Vector{DAE.Subscript}
   @match cref begin
     DAE.CREF_IDENT(_, _, subs) => collect(subs)
     DAE.CREF_QUAL(_, _, _, cr) => _innermostSubscripts(cr)
-    _ => Any[]
+    _ => DAE.Subscript[]
   end
 end
 
@@ -1663,20 +1679,21 @@ Base.@nospecializeinfer function _scalarLhsTargets(@nospecialize(lhs::DAE.CREF),
   local cr = lhs.componentRef
   local baseTy = _innermostType(cr)
   local dims = _arrayDimsFromType(baseTy)
-  isempty(dims) && return Any[(lhs, nothing, Int[])]
+  local _emptyTargets = Tuple{DAE.Exp, Union{Nothing, DAE.Exp}, Vector{Int}}[]
+  isempty(dims) && return [(lhs, nothing, Int[])]
   local rawDims = _rawArrayDims(baseTy)
 
   local subs = _innermostSubscripts(cr)
   if isempty(subs)
-    subs = Any[DAE.WHOLEDIM() for _ in dims]
+    subs = DAE.Subscript[DAE.WHOLEDIM() for _ in dims]
   elseif length(subs) < length(dims)
-    append!(subs, Any[DAE.WHOLEDIM() for _ in 1:(length(dims) - length(subs))])
+    append!(subs, DAE.Subscript[DAE.WHOLEDIM() for _ in 1:(length(dims) - length(subs))])
   end
-  length(subs) == length(dims) || return Any[]
+  length(subs) == length(dims) || return _emptyTargets
 
   local elemTy = _arrayElementType(baseTy)
-  local out = Any[]
-  function rec(pos::Int, newSubs::Vector, guard, rhsIdxs::Vector{Int})
+  local out = Tuple{DAE.Exp, Union{Nothing, DAE.Exp}, Vector{Int}}[]
+  function rec(pos::Int, newSubs::Vector{DAE.Subscript}, guard, rhsIdxs::Vector{Int})
     if pos > length(dims)
       local newCr = _replaceInnermostSubscripts(cr, newSubs)
       push!(out, (DAE.CREF(newCr, elemTy), guard, copy(rhsIdxs)))
@@ -1685,24 +1702,24 @@ Base.@nospecializeinfer function _scalarLhsTargets(@nospecialize(lhs::DAE.CREF),
     local sub = subs[pos]
     if sub isa DAE.WHOLEDIM
       for k in 1:dims[pos]
-        rec(pos + 1, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))],
-            guard, Int[rhsIdxs...; k])
+        rec(pos + 1, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))],
+            guard, Int[rhsIdxs..., k])
       end
     elseif sub isa DAE.INDEX
       local idx = sub.exp
       if idx isa DAE.ICONST || idx isa DAE.ENUM_LITERAL
-        rec(pos + 1, Any[newSubs...; DAE.INDEX(idx)], guard, rhsIdxs)
+        rec(pos + 1, DAE.Subscript[newSubs..., DAE.INDEX(idx)], guard, rhsIdxs)
       else
         for k in 1:dims[pos]
           local g = _andCondition(guard, _indexEqualsCondition(idx, k))
-          rec(pos + 1, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g, rhsIdxs)
+          rec(pos + 1, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g, rhsIdxs)
         end
       end
     else
       return
     end
   end
-  rec(1, Any[], nothing, Int[])
+  rec(1, DAE.Subscript[], nothing, Int[])
   return out
 end
 
@@ -1718,15 +1735,15 @@ Base.@nospecializeinfer function _scalarizeCrefRead(@nospecialize(cr),
   local rawDims = _rawArrayDims(baseTy)
   local subs = _innermostSubscripts(cr)
   if isempty(subs)
-    subs = Any[DAE.WHOLEDIM() for _ in dims]
+    subs = DAE.Subscript[DAE.WHOLEDIM() for _ in dims]
   elseif length(subs) < length(dims)
-    append!(subs, Any[DAE.WHOLEDIM() for _ in 1:(length(dims) - length(subs))])
+    append!(subs, DAE.Subscript[DAE.WHOLEDIM() for _ in 1:(length(dims) - length(subs))])
   end
   length(subs) == length(dims) || return fallback
 
   local elemTy = _arrayElementType(baseTy)
-  local candidates = Any[]
-  function rec(pos::Int, rhsPos::Int, newSubs::Vector, guard)
+  local candidates = Tuple{Union{Nothing, DAE.Exp}, DAE.Exp}[]
+  function rec(pos::Int, rhsPos::Int, newSubs::Vector{DAE.Subscript}, guard)
     if pos > length(dims)
       local newCr = _replaceInnermostSubscripts(cr, newSubs)
       push!(candidates, (guard, DAE.CREF(newCr, elemTy)))
@@ -1736,22 +1753,22 @@ Base.@nospecializeinfer function _scalarizeCrefRead(@nospecialize(cr),
     if sub isa DAE.WHOLEDIM
       rhsPos <= length(rhsIdxs) || return
       local k = rhsIdxs[rhsPos]
-      rec(pos + 1, rhsPos + 1, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))], guard)
+      rec(pos + 1, rhsPos + 1, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))], guard)
     elseif sub isa DAE.INDEX
       local idx = sub.exp
       if idx isa DAE.ICONST || idx isa DAE.ENUM_LITERAL
-        rec(pos + 1, rhsPos, Any[newSubs...; DAE.INDEX(idx)], guard)
+        rec(pos + 1, rhsPos, DAE.Subscript[newSubs..., DAE.INDEX(idx)], guard)
       else
         for k in 1:dims[pos]
           local g = _andCondition(guard, _indexEqualsCondition(idx, k))
-          rec(pos + 1, rhsPos, Any[newSubs...; DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g)
+          rec(pos + 1, rhsPos, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g)
         end
       end
     else
       return
     end
   end
-  rec(1, 1, Any[], nothing)
+  rec(1, 1, DAE.Subscript[], nothing)
   isempty(candidates) && return fallback
 
   local result = fallback
@@ -1888,15 +1905,15 @@ Base.@nospecializeinfer function _collectDiscreteRhsCrefsFromWhenOps(ops::Vector
   local out = DAE.ComponentRef[]
   local seen = OrderedSet{String}()
   local blocked = copy(assignedLhs)
-  local ctx = (out, seen, blocked)
+  local ctx = DiscreteRhsCrefVisitor(out, seen, blocked)
   for op in ops
     @match op begin
-      BDAE.ASSIGN(_, rhs, _) => Util.traverseExpTopDown(rhs, _visitDiscreteRhsCref, ctx)
-      BDAE.NORETCALL(exp, _) => Util.traverseExpTopDown(exp, _visitDiscreteRhsCref, ctx)
+      BDAE.ASSIGN(_, rhs, _) => Util.traverseExpTopDown(rhs, ctx, nothing)
+      BDAE.NORETCALL(exp, _) => Util.traverseExpTopDown(exp, ctx, nothing)
       BDAE.ASSERT(c, m, l, _) => begin
-        Util.traverseExpTopDown(c, _visitDiscreteRhsCref, ctx)
-        Util.traverseExpTopDown(m, _visitDiscreteRhsCref, ctx)
-        Util.traverseExpTopDown(l, _visitDiscreteRhsCref, ctx)
+        Util.traverseExpTopDown(c, ctx, nothing)
+        Util.traverseExpTopDown(m, ctx, nothing)
+        Util.traverseExpTopDown(l, ctx, nothing)
       end
       _ => nothing
     end
@@ -1932,7 +1949,7 @@ Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BD
       length(initOps),
       BDAE.WHEN_STMTS(initialCall, MetaModelica.list(initOps...), NONE()),
       source,
-      nothing,
+      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
     ))
   end
   #= Per Modelica spec §17.4.4: a non-when algorithm with discrete LHS fires
@@ -1982,7 +1999,7 @@ Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BD
       length(runOps),
       BDAE.WHEN_STMTS(cond, MetaModelica.list(runOps...), NONE()),
       source,
-      nothing,
+      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
     ))
   end
   return
@@ -2077,7 +2094,7 @@ Base.@nospecializeinfer function _liftStmtWhenToWhenEquations!(out::Vector{BDAE.
         length(initOps),
         BDAE.WHEN_STMTS(initialCall, MetaModelica.list(initOps...), NONE()),
         stmtWhen.source,
-        nothing,
+        BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
       ))
     end
   end
@@ -2104,14 +2121,20 @@ Base.@nospecializeinfer function _pushDiscreteCref!(out::Vector{DAE.ComponentRef
   return nothing
 end
 
-Base.@nospecializeinfer function _visitDiscreteRhsCref(@nospecialize(exp),
-                                                       ctx::Tuple{Vector{DAE.ComponentRef}, OrderedSet{String}, OrderedSet{String}})
+# Collect discrete RHS crefs into `out` (deduped via `seen`, skipping `blocked`
+# reduction/for iterators). Typed functor replacing the threaded ctx tuple.
+struct DiscreteRhsCrefVisitor
+  out::Vector{DAE.ComponentRef}
+  seen::OrderedSet{String}
+  blocked::OrderedSet{String}
+end
+Base.@nospecializeinfer function (v::DiscreteRhsCrefVisitor)(@nospecialize(exp), arg::Nothing)
   @match exp begin
-    DAE.CREF(cr, _) => _pushDiscreteCref!(ctx[1], ctx[2], ctx[3], cr)
-    DAE.REDUCTION(_, _, iters) => _collectReductionIterNames!(ctx[3], iters)
+    DAE.CREF(cr, _) => _pushDiscreteCref!(v.out, v.seen, v.blocked, cr)
+    DAE.REDUCTION(_, _, iters) => _collectReductionIterNames!(v.blocked, iters)
     _ => nothing
   end
-  return (exp, true, ctx)
+  return (exp, true, arg)
 end
 
 Base.@nospecializeinfer function _collectReductionIterNames!(blocked::OrderedSet{String}, @nospecialize(iters))
@@ -2128,13 +2151,13 @@ Base.@nospecializeinfer function _walkDiscreteStmtsForRhsCrefs!(out::Vector{DAE.
                                                                 seen::OrderedSet{String},
                                                                 blocked::OrderedSet{String},
                                                                 @nospecialize(stmts))
-  local ctx = (out, seen, blocked)
+  local ctx = DiscreteRhsCrefVisitor(out, seen, blocked)
   for s in stmts
     @match s begin
-      DAE.STMT_ASSIGN(_, _, rhs, _) => Util.traverseExpTopDown(rhs, _visitDiscreteRhsCref, ctx)
-      DAE.STMT_ASSIGN_ARR(_, _, rhs, _) => Util.traverseExpTopDown(rhs, _visitDiscreteRhsCref, ctx)
+      DAE.STMT_ASSIGN(_, _, rhs, _) => Util.traverseExpTopDown(rhs, ctx, nothing)
+      DAE.STMT_ASSIGN_ARR(_, _, rhs, _) => Util.traverseExpTopDown(rhs, ctx, nothing)
       DAE.STMT_IF(cond, body, _, _) => begin
-        Util.traverseExpTopDown(cond, _visitDiscreteRhsCref, ctx)
+        Util.traverseExpTopDown(cond, ctx, nothing)
         _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, body)
       end
       DAE.STMT_FOR(_, _, iter, _, _, body, _) => begin
@@ -2144,7 +2167,7 @@ Base.@nospecializeinfer function _walkDiscreteStmtsForRhsCrefs!(out::Vector{DAE.
         pushed && delete!(blocked, iter)
       end
       DAE.STMT_WHILE(cond, body, _) => begin
-        Util.traverseExpTopDown(cond, _visitDiscreteRhsCref, ctx)
+        Util.traverseExpTopDown(cond, ctx, nothing)
         _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, body)
       end
       _ => nothing
@@ -2338,9 +2361,10 @@ end
 #= Start-attribute expression for each variable that has one (Bool/Int/Real/enum).
    Used to fold `pre(member)` at initialization: Modelica §8.6.2 — before the
    first event `pre(v)` is `v.start`. =#
-Base.@nospecializeinfer function _discreteStartExpLookup(variables::Vector{BDAE.VAR})::Dict{String, DAE.Exp}
+Base.@nospecializeinfer function _discreteStartExpLookup(variables::Vector{BDAE.VAR},
+                                   varNames::Vector{String} = String[string(v.varName) for v in variables])::Dict{String, DAE.Exp}
   local d = Dict{String, DAE.Exp}()
-  for var in variables
+  for (i, var) in enumerate(variables)
     local s = @match var.values begin
       SOME(va) => @match va begin
         DAE.VAR_ATTR_BOOL(start = SOME(e)) => e
@@ -2352,7 +2376,7 @@ Base.@nospecializeinfer function _discreteStartExpLookup(variables::Vector{BDAE.
       _ => nothing
     end
     s === nothing && continue
-    d[string(var.varName)] = s
+    d[varNames[i]] = s
   end
   return d
 end
@@ -2483,13 +2507,13 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
     1,
     BDAE.WHEN_STMTS(bareInitial, MetaModelica.list(initAssigns...), NONE()),
     src0,
-    nothing,
+    BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
   ))
   push!(out, BDAE.WHEN_EQUATION(
     1,
     BDAE.WHEN_STMTS(changeCond, MetaModelica.list(runAssigns...), NONE()),
     src0,
-    nothing,
+    BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
   ))
   for (lhs, _, _) in body; push!(liftedLhs, string(lhs.componentRef)); end
   return
@@ -2577,7 +2601,7 @@ Base.@nospecializeinfer function _liftAlgIfToWhen!(out::Vector{BDAE.Equation},
             1,
             BDAE.WHEN_STMTS(cond, whenOps, NONE()),
             source,
-            nothing,
+            BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
           ))
           return true
         end
@@ -2638,7 +2662,7 @@ Base.@nospecializeinfer function _liftAlgAssignToInitialWhen!(out::Vector{BDAE.E
                         MetaModelica.list(BDAE.ASSIGN(lhs, rhs, asrc)),
                         NONE()),
         source,
-        nothing,
+        BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
       ))
       #= Plus a runtime WHEN_EQUATION for any change(rhs) trigger so the
          assign re-fires whenever a non-parameter input changes. =#
@@ -2647,7 +2671,7 @@ Base.@nospecializeinfer function _liftAlgAssignToInitialWhen!(out::Vector{BDAE.E
           1,
           BDAE.WHEN_STMTS(changeCond, whenOps, NONE()),
           source,
-          nothing,
+          BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
         ))
       end
       local lhsName::Union{String, Nothing} = try
@@ -2680,7 +2704,7 @@ function synthesizeInitialWhenFromAlgorithms(algorithms)::Vector{BDAE.Equation}
             length(frontendBody),
             BDAE.WHEN_STMTS(daeCond, whenOps, NONE()),
             stmt.source,
-            nothing,
+            BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
           )
           _INIT_ALG_DAE_STMTS[node] = collect(daeStmts)
           push!(out, node)

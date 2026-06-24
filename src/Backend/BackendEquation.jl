@@ -45,7 +45,7 @@ import ..FrontendUtil.Util
     Create an empty equation array
 """
 function emptyEqns()
-  eqns::Array = []
+  eqns = BDAE.Equation[]
   (eqns)
 end
 

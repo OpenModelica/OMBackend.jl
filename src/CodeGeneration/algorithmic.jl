@@ -29,7 +29,7 @@ function ensureAlgArrayLength!(arr::Vector, idx)
 end
 ensureAlgArrayLength!(arr, idx) = arr
 
-_algAssignedMaxIndex(idx::Integer) = Int(idx)
+_algAssignedMaxIndex(idx::Int) = Int(idx)
 _algAssignedMaxIndex(idx::AbstractUnitRange) = isempty(idx) ? 0 : Int(last(idx))
 _algAssignedMaxIndex(idx::Colon) = 0
 function _algAssignedMaxIndex(idx)
@@ -627,8 +627,196 @@ function generateStatement(stmt::DAE.STMT_NORETCALL)
 end
 
 function generateStatement(stmt::DAE.STMT_ASSIGN)
+  local scalarised = _recordAssignment(stmt.exp1, stmt.exp)
+  scalarised === nothing || return scalarised
   local rhs = expToJuliaExpAlg(stmt.exp)
   return _algAssignment(stmt.exp1, rhs)
+end
+
+"""
+    _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp) -> Union{Nothing,Expr}
+
+Scalarise a record-typed assignment onto its flattened `<base>_<field>` symbols
+(the naming `flattenRecordInput` uses), or return `nothing` when `lhsExp` is not a
+plain record cref. A record copy `lhs := rhs` becomes per-field assignments; a
+record-valued call `lhs := f(args...)` scatters the flat-tuple return.
+"""
+function _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp)::Union{Nothing, Expr}
+  local lhs = _recordCrefFields(lhsExp)
+  lhs === nothing && return nothing
+  local lhsBase = lhs[1]
+  local fieldNames = lhs[2]
+  local rhsBase = _plainCrefName(rhsExp)
+  if rhsBase !== nothing
+    return Expr(:block,
+      Expr[:($(_flatFieldSymbol(lhsBase, f)) = $(_flatFieldSymbol(rhsBase, f))) for f in fieldNames]...)
+  elseif _isFunctionCall(rhsExp)
+    local targets = Expr(:tuple, [_flatFieldSymbol(lhsBase, f) for f in fieldNames]...)
+    return Expr(:(=), targets, expToJuliaExpAlg(rhsExp))
+  end
+  return nothing
+end
+
+"""
+    _flatFieldSymbol(base::AbstractString, field::AbstractString) -> Symbol
+
+Symbol for a flattened record field, `<base><COMPONENT_SEPARATOR><field>`, matching
+the names emitted by `flattenRecordInput` for record parameters and locals.
+"""
+_flatFieldSymbol(base::AbstractString, field::AbstractString)::Symbol = Symbol(base, COMPONENT_SEPARATOR, field)
+
+"""
+    _isFunctionCall(exp::DAE.Exp) -> Bool
+
+True for a (record-valued) function-call expression.
+"""
+function _isFunctionCall(exp::DAE.Exp)::Bool
+  return @match exp begin
+    DAE.CALL(__) => true
+    _ => false
+  end
+end
+
+"""
+    _algCallArgs(argExps::List) -> Vector{Any}
+
+Expand function-call arguments, replacing each record-typed cref with its flattened
+`<base>_<field>` field symbols so a record argument is passed as its scalar fields,
+matching the callee's flattened parameter list (`flattenRecordInput`).
+"""
+function _algCallArgs(argExps::List)::Vector{Any}
+  local out = Any[]
+  for arg in argExps
+    local rec = _recordCrefFields(arg)
+    if rec === nothing
+      push!(out, expToJuliaExpAlg(arg))
+    else
+      for fieldName in rec[2]
+        push!(out, _flatFieldSymbol(rec[1], fieldName))
+      end
+    end
+  end
+  return out
+end
+
+"""
+    _recordCrefFields(exp::DAE.Exp) -> Union{Nothing,Tuple{String,Vector{String}}}
+
+`(baseIdent, fieldNames)` for a subscript-free record-typed simple CREF, else `nothing`.
+"""
+function _recordCrefFields(exp::DAE.Exp)::Union{Nothing, Tuple{String, Vector{String}}}
+  local base = _plainCrefName(exp)
+  base === nothing && return nothing
+  return @match exp begin
+    DAE.CREF(_, ty) => begin
+      local fieldNames = _recordFieldNames(ty)
+      isempty(fieldNames) ? nothing : (base, fieldNames)
+    end
+    _ => nothing
+  end
+end
+
+"""
+    _recordFieldSymbol(base::AbstractString, recordType::DAE.Type, subscripts) -> Union{Nothing,Symbol}
+
+Flat field symbol `<base>_<kth field>` when `recordType` is a record and
+`subscripts` is a single constant integer index in range; `nothing` otherwise.
+This is field access on a record, not array indexing.
+"""
+function _recordFieldSymbol(base::AbstractString, recordType::DAE.Type, subscripts)::Union{Nothing, Symbol}
+  local fieldNames = _recordFieldNames(recordType)
+  isempty(fieldNames) && return nothing
+  length(subscripts) == 1 || return nothing
+  local index = _constantIntegerIndex(first(subscripts))
+  (index === nothing || index < 1 || index > length(fieldNames)) && return nothing
+  return _flatFieldSymbol(base, fieldNames[index])
+end
+
+"""
+    _recordCrefIndexFieldSymbol(cref::DAE.ComponentRef) -> Union{Nothing,Symbol}
+
+Flat field symbol for a record cref carrying one constant-integer subscript, else `nothing`.
+"""
+function _recordCrefIndexFieldSymbol(cref::DAE.ComponentRef)::Union{Nothing, Symbol}
+  return @match cref begin
+    DAE.CREF_IDENT(ident, identType, subscripts) => _recordFieldSymbol(ident, identType, subscripts)
+    _ => nothing
+  end
+end
+
+"""
+    _recordIndexFieldSymbol(arrExp::DAE.Exp, subscripts) -> Union{Nothing,Symbol}
+
+Flat field symbol for an ASUB indexing a record cref by one constant integer, else `nothing`.
+"""
+function _recordIndexFieldSymbol(arrExp::DAE.Exp, subscripts)::Union{Nothing, Symbol}
+  local base = _plainCrefName(arrExp)
+  base === nothing && return nothing
+  return @match arrExp begin
+    DAE.CREF(_, ty) => _recordFieldSymbol(base, ty, subscripts)
+    _ => nothing
+  end
+end
+
+"""
+    _constantIntegerIndex(indexExp::DAE.Exp) -> Union{Nothing,Int}
+
+Constant integer value of an ASUB index expression (`a[k]` carries `DAE.ICONST`),
+or `nothing` if the index is not a constant integer.
+"""
+function _constantIntegerIndex(indexExp::DAE.Exp)::Union{Nothing, Int}
+  return @match indexExp begin
+    DAE.ICONST(value) => value
+    _ => nothing
+  end
+end
+
+"""
+    _constantIntegerIndex(subscript::DAE.Subscript) -> Union{Nothing,Int}
+
+Constant integer value of a subscripted-CREF subscript (`DAE.INDEX(exp)`), or
+`nothing` if it is not a constant integer index.
+"""
+function _constantIntegerIndex(subscript::DAE.Subscript)::Union{Nothing, Int}
+  return @match subscript begin
+    DAE.INDEX(indexExp) => _constantIntegerIndex(indexExp)
+    _ => nothing
+  end
+end
+
+"""
+    _recordFieldNames(ty::DAE.Type) -> Vector{String}
+
+Field names of a record type's `varLst` in declaration order; empty if `ty` is
+not a record.
+"""
+function _recordFieldNames(ty::DAE.Type)::Vector{String}
+  local names = String[]
+  @match ty begin
+    DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _) => begin
+      for field in varLst
+        @match field begin
+          DAE.TYPES_VAR(fieldName, _, _, _, _) => push!(names, fieldName)
+          _ => nothing
+        end
+      end
+    end
+    _ => nothing
+  end
+  return names
+end
+
+"""
+    _plainCrefName(exp::DAE.Exp) -> Union{String,Nothing}
+
+Identifier of a subscript-free simple CREF (the base for its flattened
+`<base>_<field>` symbols), or `nothing` for qualified/subscripted/non-CREF exps.
+"""
+function _plainCrefName(exp::DAE.Exp)::Union{String, Nothing}
+  return @match exp begin
+    DAE.CREF(DAE.CREF_IDENT(ident, _, subscripts), _) => isempty(subscripts) ? ident : nothing
+    _ => nothing
+  end
 end
 
 function generateStatement(stmt::DAE.STMT_TUPLE_ASSIGN)
@@ -654,6 +842,8 @@ Base.@nospecializeinfer function _crefToTupleTarget(@nospecialize(exp::DAE.Exp))
 end
 
 function generateStatement(stmt::DAE.STMT_ASSIGN_ARR)
+  local scalarised = _recordAssignment(stmt.lhs, stmt.exp)
+  scalarised === nothing || return scalarised
   local rhs = expToJuliaExpAlg(stmt.exp)
   return _algAssignment(stmt.lhs, rhs)
 end
@@ -867,15 +1057,24 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         end
       end
       DAE.CREF(cr, _)  => begin
-        local varName::String = SimulationCode.string(cr)
-        local allSubscripts = collect(CodeGeneration.FrontendUtil.Util.getSubscriptsFromCref(cr))
-        if !isempty(allSubscripts)
-          local baseName = first(split(varName, "["))
-          local idxExprs = map(_algIndexExpr, allSubscripts)
-          Expr(:ref, Symbol(baseName), idxExprs...)
-        else
+        # A record cref with one constant-integer subscript is field access, not
+        # array indexing; emit the flat field symbol so it matches scalarised fields.
+        local recordField = _recordCrefIndexFieldSymbol(cr)
+        if recordField !== nothing
           quote
-            $(Symbol(varName))
+            $(recordField)
+          end
+        else
+          local varName::String = SimulationCode.string(cr)
+          local allSubscripts = collect(CodeGeneration.FrontendUtil.Util.getSubscriptsFromCref(cr))
+          if !isempty(allSubscripts)
+            local baseName = first(split(varName, "["))
+            local idxExprs = map(_algIndexExpr, allSubscripts)
+            Expr(:ref, Symbol(baseName), idxExprs...)
+          else
+            quote
+              $(Symbol(varName))
+            end
           end
         end
       end
@@ -964,10 +1163,7 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         if !(attr.builtin)
           push!(expr.args, funcSym)
         end
-        local args = map(explst) do arg
-          expToJuliaExpAlg(arg)
-        end
-        append!(expr.args, args)
+        append!(expr.args, _algCallArgs(explst))
         quote
           $(expr)
         end
@@ -993,10 +1189,7 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         if utilRuntimeName === nothing && !(attr.builtin)
           push!(expr.args, funcSym)
         end
-        local args = map(expLst) do arg
-          expToJuliaExpAlg(arg)
-        end
-        append!(expr.args, args)
+        append!(expr.args, _algCallArgs(expLst))
         expr
       end
       DAE.CAST(ty, exp)  => begin
@@ -1051,9 +1244,18 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         quote $index end
       end
       DAE.ASUB(arrExp, subLst) => begin
-        local arrExpr = expToJuliaExpAlg(arrExp)
-        local subs = map(_algIndexExpr, subLst)
-        Expr(:ref, arrExpr, subs...)
+        # A record cref indexed by a constant integer is field access, not array
+        # indexing; emit the flat field symbol so it matches the scalarised fields.
+        local recordField = _recordIndexFieldSymbol(arrExp, subLst)
+        if recordField !== nothing
+          quote
+            $(recordField)
+          end
+        else
+          local arrExpr = expToJuliaExpAlg(arrExp)
+          local subs = map(_algIndexExpr, subLst)
+          Expr(:ref, arrExpr, subs...)
+        end
       end
       DAE.RECORD(path, exps, fieldNames, ty) => begin
         #= Record constructor: generate as a simple tuple =#

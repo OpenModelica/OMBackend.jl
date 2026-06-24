@@ -31,9 +31,6 @@
 
 #=
   Author: John Tinnerholm
-  TODO: Remember the state derivative scheme. What did I mean with that?
-  TODO: Make duplicate code better...
-  TODO: Cleanup in general.. keep this simple. Remove hacks as the SCiML team adds new features to MTK.
 =#
 import ..OMBackend
 import .AlgorithmicCodeGeneration
@@ -69,6 +66,15 @@ are tolerated when the binding "already has a value" (re-registration is
 idempotent) and rethrown otherwise.
 """
 function evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
+  #= Under precompile / image generation, eval'ing the model's generated Modelica functions
+     into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
+     compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
+     has already run (so its method instances are warmed for the bake), and a real runtime
+     translate registers them normally — the guard is precompile-only. Mirrors the
+     jl_generating_output guard in generateIMTKCode (iMTKGen.jl). =#
+  if ccall(:jl_generating_output, Cint, ()) != 0
+    return nothing
+  end
   for f in functions
     try
       eval(f)
@@ -149,8 +155,11 @@ function classifyVariables(simCode)::ClassifiedVariables
   local dataStructureVariables = String[]
   local statePriorityPairs     = Tuple{Symbol, Int}[]
   local ht = simCode.stringToSimVarHT
-  for varName in keys(ht)
-    (idx, var) = ht[varName]
+  #= Membership set built once: the per-variable `idx in matchOrder` below was an
+     O(V) scan of the matchOrder Vector, making classification O(V^2). matchOrder
+     is not mutated in this loop. =#
+  local matchOrderSet = OrderedSet{Int}(simCode.matchOrder)
+  for (varName, (idx, var)) in ht
     local varType = var.varKind
     @match varType begin
       SimulationCode.INPUT(__) => begin
@@ -166,7 +175,7 @@ function classifyVariables(simCode)::ClassifiedVariables
       SimulationCode.ARRAY(__) => push!(stateVariables, varName)
       SimulationCode.DISCRETE(__) => push!(discreteVariables, varName)
       SimulationCode.ALG_VARIABLE(__) => begin
-        if idx in simCode.matchOrder
+        if idx in matchOrderSet
           push!(algebraicVariables, varName)
         elseif involvedInEvent(idx, simCode)
           push!(discreteVariables, varName)
@@ -301,7 +310,7 @@ function substituteRelayAliasesInWhens(simCode, relayAliases::Dict{Symbol, Symbo
   isempty(relayAliases) && return simCode
   local wanted = OrderedSet{String}(string(k) for k in keys(relayAliases))
   local tyOf = Dict{String, DAE.Type}()
-  local collectTy = function (@nospecialize(e), acc)
+  local collectTy = function (e::DAE.Exp, acc)
     if e isa DAE.CREF
       local nm = string(e.componentRef)
       if nm in wanted && !haskey(tyOf, nm)
@@ -1146,7 +1155,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
         This means that certain algebraic variables should not be listed among the variables (These are the discrete variables).
       =#
       $(varInnerRefs)
-      allVariables = []
+      allVariables = Any[]
       #= Generate variables =#
       for constructor in variableConstructors
         vars = map(n -> (n, Symbolics.variable(n, T = Symbolics.FnType{Tuple, Real, Nothing})(t)), Base.invokelatest(constructor))
@@ -1181,21 +1190,21 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       $(decomposeParameterEquationsInline(PARAMETER_EQUATIONS))
       #= Add ifCond discrete parameter values to pars dict =#
       $(generateIfCondParamAssignments(ifCondParamPairs))
-      startEquationComponents = []
+      startEquationComponents = Any[]
       $(decomposeStartEquationsInline(INITIAL_GUESS_EQUATIONS))
       for constructor in startEquationConstructors
         push!(startEquationComponents, Base.invokelatest(constructor))
       end
       initialValues = collect(Iterators.flatten(startEquationComponents))
       #= Process the final initial guesses =#
-      startEquationComponents = []
+      startEquationComponents = Any[]
       $(decomposeStartEquationsInline(INITIAL_VALUE_EQUATIONS; functionSuffix = "Final"))
       for constructor in startEquationConstructors
         push!(startEquationComponents, Base.invokelatest(constructor))
       end
       finalInitialValues = collect(Iterators.flatten(startEquationComponents))
       #= Equations =#
-      equationComponents = []
+      equationComponents = Any[]
       $(stripBeginBlocks(decomposeEquationsInline(EQUATIONS, PARAMETER_ASSIGNMENTS)))
       for constructor in equationConstructorCalls
         push!(equationComponents, Base.invokelatest(constructor))
@@ -1867,10 +1876,11 @@ function _buildTimeEventRefreshCallbacks(allPT::Vector, ptOwners::Vector, simCod
       local retNT = Expr(:tuple, Expr(:parameters, retKws...))
       local fExpr = :((modified, observed, ctx, integrator) -> $(retNT))
       if isempty(obsKws)
-        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT)))
+        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT); skip_checks = true))
       else
         local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
-        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT); observed = $(obsNT)))
+        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT);
+                                                    observed = $(obsNT), skip_checks = true))
       end
     end
     push!(cbs, :(ModelingToolkit.SymbolicContinuousCallback(
@@ -2122,9 +2132,11 @@ function _composedIfCondAffectExpr(ifKws::Vector{Expr}, modIfKws::Vector{Expr},
   local clusterModKws = Expr[Expr(:kw, d, d) for assigns in chained for (d, _, _) in assigns]
   local modNT = Expr(:tuple, Expr(:parameters, vcat(modIfKws, clusterModKws)...))
   local obsKws = vcat(extraObsKws, Expr[Expr(:kw, k, v) for (k, v) in obsAcc])
-  isempty(obsKws) && return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT)))
+  isempty(obsKws) && return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT);
+                                                        skip_checks = true))
   local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
-  return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT); observed = $(obsNT)))
+  return :(ModelingToolkit.ImperativeAffect($(fexpr), $(modNT);
+                                            observed = $(obsNT), skip_checks = true))
 end
 
 function createIfEquations(stateVariables, algebraicVariables, simCode)
@@ -2330,7 +2342,7 @@ function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode,
   local conds = Any[]
   local closed = Bool[]
   for b in condBranches
-    push!(conds, transformToMTKContinousConditionEquation(b.condition, simCode))
+    push!(conds, transformToMTKContinuousConditionEquation(b.condition, simCode))
     push!(closed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
   end
   local valMap = nothing
@@ -2413,7 +2425,7 @@ function createIfEquation(stateVariables::Vector,
   for b in ifEq.branches
     b.identifier == -1 && continue
     try
-      local mc = transformToMTKContinousConditionEquation(b.condition, simCode)
+      local mc = transformToMTKContinuousConditionEquation(b.condition, simCode)
       push!(allZcs, _extractZeroCrossingLHS(mc))
       push!(allClosed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
     catch
@@ -2453,7 +2465,7 @@ function createIfEquation(stateVariables::Vector,
       end
       SimulationCode.BRANCH(condition, residuals, _, targets, _, _, _, _, _) => begin
         condIdx += 1
-        local mtkCond = transformToMTKContinousConditionEquation(branch.condition, simCode)
+        local mtkCond = transformToMTKContinuousConditionEquation(branch.condition, simCode)
         #= Evaluate the initial value condition; the original operator decides
            the zc == 0 boundary. Precomputed via the relay-aware fixed point. =#
         local _closedB = MTK_CodeGenerationUtil.condClosedAtBoundary(branch.condition)
@@ -2504,7 +2516,8 @@ function createIfEquation(stateVariables::Vector,
           end
           local liveFn = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, liveKws...))))
           local liveObsNT = Expr(:tuple, Expr(:parameters, liveObsKws...))
-          liveAffect = :(ModelingToolkit.ImperativeAffect($(liveFn), $(modifiedNT); observed = $(liveObsNT)))
+          liveAffect = :(ModelingToolkit.ImperativeAffect($(liveFn), $(modifiedNT);
+                                                          observed = $(liveObsNT), skip_checks = true))
         end
         #= Compose the chained cluster recomputes into both flip directions; the
            up edge holds the condition FALSE (own ifCond 0.0), the down edge TRUE. =#
@@ -2567,7 +2580,8 @@ function createIfEquation(stateVariables::Vector,
             local _zcTest = _closedB ? :(observed.zc <= 0) : :(observed.zc < 0)
             local initRetNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :($(_zcTest) ? 1.0 : 0.0))))
             local initFExpr::Expr = :((modified, observed, ctx, integrator) -> $initRetNT)
-            local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT); observed = $(initObservedNT)))
+            local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT);
+                                                                  observed = $(initObservedNT), skip_checks = true))
             cond = :(ModelingToolkit.SymbolicContinuousCallback(
               ($(mtkCond)) => $(affectTuple);
               affect_neg = $(affectNegTuple),
@@ -2746,7 +2760,7 @@ end
 #= Replace every structural occurrence of relation `rel` in `exp` with `val`. =#
 function _substRelation(@nospecialize(exp), @nospecialize(rel), val::Bool)
   local relStr = string(rel)
-  function repl(@nospecialize(e), arg)
+  function repl(e::DAE.Exp, arg)
     (string(e) == relStr) ? (DAE.BCONST(val), arg) : (e, arg)
   end
   return first(Util.traverseExpBottomUp(exp, repl, nothing))
@@ -3379,18 +3393,18 @@ function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
     isempty(modN.args[1].args) && continue
     local (fnI, obsI, modI) = _selfSchedAffectParts(weq, simCode; atInit = true)
     for rel in rels
-      #= transformToMTKContinousCondition emits `pre(nextTimeEvent) - time` for
+      #= transformToMTKContinuousCondition emits `pre(nextTimeEvent) - time` for
          `time >= pre(nextTimeEvent)`, which falls through zero as time reaches
          the event. Negate so the crossing RISES through zero exactly when the
          Modelica condition becomes true (the when's rising edge), and fire only
          on that positive edge (affect_neg = nothing). A monotone time event is
          one-directional, so a single edge is correct and avoids double-firing. =#
-      local zc = transformToMTKContinousCondition(rel, simCode)
+      local zc = transformToMTKContinuousCondition(rel, simCode)
       push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
         (-($(zc)) ~ 0),
-        ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs));
+        ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs), skip_checks = true);
         affect_neg = nothing,
-        initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI)),
+        initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI), skip_checks = true),
         rootfind = SciMLBase.RightRootFind,
         reinitializealg = SciMLBase.NoInit())))
     end
@@ -3410,7 +3424,7 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
     local isEdge = _isEdgeWhenCondition(weq.whenEquation.condition)
     local assigns = _gatherClusterAssigns(weq, simCode)
     assigns === nothing && continue
-    #= One callback per relation in the cluster. transformToMTKContinousCondition
+    #= One callback per relation in the cluster. transformToMTKContinuousCondition
        normalises zc so relation-TRUE ⟺ zc<0: the `=>` affect is the up-crossing
        (relation becomes FALSE) and affect_neg the down-crossing (relation becomes
        TRUE). Each callback rewrites the WHOLE ordered cluster with THIS relation
@@ -3425,7 +3439,7 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
     local hasInit = _condHasInitial(weq.whenEquation.condition)
     local affInit = Expr[_discreteAffectEqInit(d, r, ii, simCode) for (d, r, ii) in assigns]
     for (relIdx, rel) in enumerate(rels)
-      local zc = transformToMTKContinousCondition(rel, simCode)
+      local zc = transformToMTKContinuousCondition(rel, simCode)
       if preMem
         #= Live ImperativeAffects that commit to DISCRETE_PRE_MEM so a dt=0
            cascade across the cluster's callbacks latches. The FIRING relation
@@ -3448,9 +3462,9 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
           local (fnI, obsI, modI) = _preMemAffectParts(assigns, simCode; atInit = true, flagModified = false)
           push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
             ($(zc) ~ 0),
-            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp));
-            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn)),
-            initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI)),
+            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp), skip_checks = true);
+            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn), skip_checks = true),
+            initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI), skip_checks = true),
             rootfind = SciMLBase.RightRootFind,
             reinitializealg = $(_fsmReinitAlg()))))
         elseif relIdx == 1 && hasInit
@@ -3462,16 +3476,16 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
           local (fnNF, obsNF, modNF) = _preMemAffectParts(assigns, simCode; flagModified = false)
           push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
             ($(zc) ~ 0),
-            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp));
-            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn)),
-            initialize = ModelingToolkit.ImperativeAffect($(fnNF), $(modNF); observed = $(obsNF)),
+            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp), skip_checks = true);
+            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn), skip_checks = true),
+            initialize = ModelingToolkit.ImperativeAffect($(fnNF), $(modNF); observed = $(obsNF), skip_checks = true),
             rootfind = SciMLBase.RightRootFind,
             reinitializealg = $(_fsmReinitAlg()))))
         else
           push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
             ($(zc) ~ 0),
-            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp));
-            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn)),
+            ModelingToolkit.ImperativeAffect($(fnUp), $(modUp); observed = $(obsUp), skip_checks = true);
+            affect_neg = ModelingToolkit.ImperativeAffect($(fnDn), $(modDn); observed = $(obsDn), skip_checks = true),
             rootfind = SciMLBase.RightRootFind,
             reinitializealg = $(_fsmReinitAlg()))))
         end
@@ -3744,7 +3758,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
      ARRAY_PARAMETERs in HT so we only emit parents that actually exist. =#
   local _residualCrefs = OrderedSet{String}()
   for eq in simCode.residualEquations
-    SimulationCode.collectCrefNames!(_residualCrefs, SimulationCode.toDAEExp(eq.exp))
+    SimulationCode.collectCrefNames!(_residualCrefs, eq.exp)
   end
   for _n in _residualCrefs
     local _bracket = findfirst('[', _n)
@@ -3979,7 +3993,7 @@ end
 function createParameterArray(parameters::Vector{T1},
                               parameterAssignments::Vector{T2},
                               simCode::SIM_T) where {T1, T2, SIM_T}
-  local paramArray = []
+  local paramArray = Union{Float64, Symbol}[]
   local hT = simCode.stringToSimVarHT
   for param in parameters
     (index, simVar) = hT[param]
@@ -4013,7 +4027,7 @@ function createParameterArray(parameters::Vector{T1},
       parValue = :($(Symbol(param)))
     else
       @warn "[MTK GEN: createParameterArray] parameter $(param): no bind and non-literal start; substituting 0 in the legacy parameter array. Any event-driven read of this parameter via the aux[1] mirror will be wrong (the modern MTK path is unaffected)."
-      parValue = :(0)
+      parValue = :(0.0)
     end
     push!(paramArray, parValue)
   end
@@ -4145,7 +4159,7 @@ function decomposeEquationsInline(equations, parameterAssignments; chunkSize::In
   local constructors = quote
     $(parameterAssignments...)
     local equationConstructors::Vector{Function}
-    local equationConstructorCalls::Vector
+    local equationConstructorCalls::Vector{Function}
   end
   push!(exprs, constructors)
   local i = 0
@@ -4156,14 +4170,14 @@ function decomposeEquationsInline(equations, parameterAssignments; chunkSize::In
     if isempty(csPreamble)
       push!(exprs, quote
         function $(fName)()
-          [$(eqv...)]
+          Symbolics.Equation[$(eqv...)]
         end
       end)
     else
       push!(exprs, quote
         function $(fName)()
           $(csPreamble...)
-          [$(csEqs...)]
+          Symbolics.Equation[$(csEqs...)]
         end
       end)
     end
@@ -4289,7 +4303,7 @@ function decomposeParametersDeclaration(parVariablesSym; chunkSize = CHUNK_SIZE[
   local paramNameQuotes = [QuoteNode(s) for s in parVariablesSym]
   return quote
     $(exprs...)
-    local _allParamChunks = []
+    local _allParamChunks = Any[]
     for _fn in [$(constructorNames...)]
       push!(_allParamChunks, Base.invokelatest(_fn))
     end

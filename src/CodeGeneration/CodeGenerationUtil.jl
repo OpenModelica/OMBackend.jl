@@ -228,7 +228,7 @@ end
 Base.@nospecializeinfer function expToJL(@nospecialize(exp::DAE.Exp), simCode::SimulationCode.SIM_CODE; varPrefix="x")::String
   hashTable = simCode.stringToSimVarHT
   str = begin
-    local int::ModelicaInteger
+    local int::Int
     local real::ModelicaReal
     local bool::Bool
     local tmpStr::String
@@ -281,7 +281,6 @@ Base.@nospecializeinfer function expToJL(@nospecialize(exp::DAE.Exp), simCode::S
       DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
         (expToJL(e1, simCode, varPrefix=varPrefix) + " " + SimulationCode.string(op) + " " + expToJL(e2, simCode,varPrefix=varPrefix))
       end
-      #=TODO?=#
       DAE.IFEXP(expCond = e1, expThen = e2, expElse = e3) => begin
         "if" + expToJL(e1, simCode, varPrefix=varPrefix) + "\n" + expToJL(e2, simCode,varPrefix=varPrefix) + "else\n" + expToJL(e3, simCode,varPrefix=varPrefix) + "\nend"
       end
@@ -360,6 +359,29 @@ function DAE_OP_toJuliaOperator(@nospecialize(op::DAE.Operator))
       DAE.USERDEFINED() => throw("Unknown operator: Userdefined")
       _ => throw("Unknown operator")
     end
+end
+
+#= Direct SimCode OpKind -> Julia operator Symbol, equivalent to
+   DAE_OP_toJuliaOperator(toDAEOperator(k)) but without the throwaway
+   DAE.Operator allocation per operator node in codegen. =#
+function opKindToJuliaOperator(k::SimulationCode.OpKind)::Symbol
+  if k === SimulationCode.OP_ADD;          :+
+  elseif k === SimulationCode.OP_SUB;      :-
+  elseif k === SimulationCode.OP_MUL;      :*
+  elseif k === SimulationCode.OP_DIV;      :/
+  elseif k === SimulationCode.OP_POW;      :^
+  elseif k === SimulationCode.OP_UMINUS;   :-
+  elseif k === SimulationCode.OP_AND;      :(&)
+  elseif k === SimulationCode.OP_OR;       :(||)
+  elseif k === SimulationCode.OP_NOT;      :(!)
+  elseif k === SimulationCode.OP_LESS;     :(<)
+  elseif k === SimulationCode.OP_LESSEQ;   :(<=)
+  elseif k === SimulationCode.OP_GREATER;  :(>)
+  elseif k === SimulationCode.OP_GREATEREQ; :(>=)
+  elseif k === SimulationCode.OP_EQUAL;    :(==)
+  elseif k === SimulationCode.OP_NEQUAL;   :(!=)
+  else error("opKindToJuliaOperator: unhandled OpKind $k")
+  end
 end
 
 
@@ -503,8 +525,19 @@ function _iterativePostwalk(f, root)
         push!(todo, (a, false))
       end
     else
-      local newArgs = Any[get(newMap, a, a) for a in node.args]
-      newMap[node] = f(Expr(node.head, newArgs...))
+      #= Lazy rebuild: only allocate a new args vector + Expr when a child
+         actually changed; otherwise pass the original node to `f`. `f` is a
+         pure function of structure, so a structurally identical node yields
+         the same result -> emitted code is unchanged. =#
+      local changed = false
+      for a in node.args
+        if get(newMap, a, a) !== a
+          changed = true
+          break
+        end
+      end
+      local rebuilt = changed ? Expr(node.head, Any[get(newMap, a, a) for a in node.args]...) : node
+      newMap[node] = f(rebuilt)
     end
   end
   return get(newMap, root, root)
@@ -1106,7 +1139,7 @@ end
 """
   Returns true if there is no discrete variables in the condition.
 """
-function isContinousCondition(cond::DAE.Exp, simCode)
+function isContinuousCondition(cond::DAE.Exp, simCode)
   local allCrefs = Util.getAllCrefs(cond)
   local isContinuousCond = false
   if isone(length(allCrefs)) && string(first(allCrefs)) == "time"
@@ -1466,7 +1499,7 @@ function extractArrayDimsFromVar(v::DAE.VAR)::Expr
   end
   @match ty begin
     DAE.T_ARRAY(_, dims) => begin
-      local dimExprs = []
+      local dimExprs = Union{Int,Symbol}[]
       for d in dims
         @match d begin
           DAE.DIM_INTEGER(n) => push!(dimExprs, n)

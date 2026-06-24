@@ -30,7 +30,7 @@ Minimal SIM_CODE with an empty equation/when/if system and the given
 equations as a separate argument (e.g. `planDemotions`) and only consult
 the simcode for when-assigned / cyclic-SCC / duplicate-residual accounting.
 """
-function mockSimCode(ht = Dict{String, Tuple{Integer, SC.SimVar}}())
+function mockSimCode(ht = Dict{String, Tuple{Int, SC.SimVar}}())
   return SC.SIM_CODE("mock", ht,
     SC.RESIDUAL_EQUATION[], SC.Equation[], SC.WHEN_EQUATION[], SC.IF_EQUATION[],
     false, Int[], SC.Graphs.SimpleDiGraph(0), [], SC.StructuralTransition[], [],

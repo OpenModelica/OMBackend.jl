@@ -53,42 +53,9 @@ function convertVarArrayToBDAE_Variables(vars::Vector{BDAE.VAR})::Vector
 end
 
 """
-  Creates a flat list of equation systems.
-"""
-function createEqSystems(frontendDAE::OMFrontend.Frontend.FlatModel)::BDAE.EQSYSTEM
-  #= Create the first main equation system. =#
-  local eqSystems = BDAE.EQSYSTEM[createEqSystem(frontendDAE)]
-  for subModel in frontendDAE.structuralSubmodels
-    push!(eqSystem, createEqSystems(subModel))
-  end
-  #=
-  We will have a list of lists.
-  For code generation this does not matter.
-  Return a flat list.
-  =#
-  return [eqSystems...]
-end
-
-"""
-  Creates a single equation system
-"""
-function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
-  #= TODO Extract the simple equations =#
-  local equations = [equationToBackendEquation(eq) for eq in OMFrontend.Frontend.convertEquations(flatModel.equations)]
-  local variables = [variableToBackendVariable(var) for var in OMFrontend.Frontend.convertVariables(flatModel.variables, list())]
-  local algorithms = [alg for alg in flatModel.algorithms]
-  local iAlgorithms = [iAlg for iAlg in flatModel.initialAlgorithms]
-  local initialEquations = [equationToBackendEquation(ieq) for ieq in OMFrontend.Frontend.convertEquations(flatModel.initialEquations)]
-  eqSystems = [BDAEUtil.createEqSystem(flatModel.name, variables, equations)]
-  #= Treat structural submodels =#
-  subModels = []
-  BDAE.EQSYSTEM(vars, eqs, [])
-end
-
-"""
   Traverse and update a given structure BDAE.BDAEStructure given a traversalOperation and optional arguments
 """
-function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation::Function, args...)
+function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation, args...)
   dae = begin
     local eqs::Array{BDAE.EqSystem, 1}
     @match dae begin
@@ -106,7 +73,7 @@ function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation::Function, args.
   end
 end
 
-function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation::Function)
+function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation)
   dae = begin
     local eqs::Vector{BDAE.EQSYSTEM}
     @match dae begin
@@ -124,7 +91,7 @@ function mapEqSystems(dae::BDAE.BACKEND_DAE, traversalOperation::Function)
   end
 end
 
-function mapEqSystemEquations(syst::BDAE.EQSYSTEM, traversalOperation::Function)
+function mapEqSystemEquations(syst::BDAE.EQSYSTEM, traversalOperation)
   syst = begin
     local eqs::Array{BDAE.Equation,1}
     @match syst begin
@@ -139,7 +106,7 @@ function mapEqSystemEquations(syst::BDAE.EQSYSTEM, traversalOperation::Function)
   end
 end
 
-function mapEqSystemEquationsNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::Function, extArg)
+function mapEqSystemEquationsNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation, extArg::T)::T where {T}
   extArg = begin
     local eqs::Array{BDAE.Equation,1}
     @match syst begin
@@ -153,7 +120,7 @@ function mapEqSystemEquationsNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::F
   end
 end
 
-function mapEqSystemVariablesNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation::Function, extArg)
+function mapEqSystemVariablesNoUpdate(syst::BDAE.EQSYSTEM, traversalOperation, extArg::T)::T where {T}
   extArg = begin
     local varArr::Array{BDAE.Var,1}
     @match syst begin
@@ -177,9 +144,9 @@ function crefLeafType(@nospecialize(cref))
   end
 end
 
-function _traverseComponentRef(@nospecialize(cref::DAE.ComponentRef),
-                               traversalOperation::Function,
-                               extArg)
+function _traverseComponentRef(cref::DAE.ComponentRef,
+                               traversalOperation,
+                               extArg::T)::Tuple{DAE.ComponentRef, T} where {T}
   local exp = DAE.CREF(cref, crefLeafType(cref))
   local newExp
   (newExp, extArg) = Util.traverseExpTopDown(exp, traversalOperation, extArg)
@@ -193,9 +160,9 @@ end
   Traverse a given equation using a traversalOperation.
   Mutates the given equation.
 """
-Base.@nospecializeinfer function traverseEquationExpressions(@nospecialize(eq::BDAE.Equation),
-                                                             traversalOperation::Function,
-                                                             extArg::T)::Tuple{BDAE.Equation,T} where{T}
+function traverseEquationExpressions(eq::BDAE.Equation,
+                                     traversalOperation,
+                                     extArg::T)::Tuple{BDAE.Equation,T} where{T}
    (eq, extArg) = begin
      local lhs::DAE.Exp
      local rhs::DAE.Exp
@@ -352,10 +319,10 @@ Base.@nospecializeinfer function traverseEquationExpressions(@nospecialize(eq::B
          end
          (eq, extArg)
        end
-       BDAE.STRUCTURAL_TRANSISTION(__) => begin
-         local cond = eq.transistionCondition
+       BDAE.STRUCTURAL_TRANSITION(__) => begin
+         local cond = eq.transitionCondition
          (cond, extArg) = Util.traverseExpTopDown(cond, traversalOperation, extArg)
-         @assign eq.transistionCondition = cond
+         @assign eq.transitionCondition = cond
          (eq, extArg)
        end
        _ => begin
@@ -542,19 +509,6 @@ function detectStateExpression(exp::DAE.Exp, stateCrefs::Dict{DAE.ComponentRef, 
   return (exp, cont, outCrefs)
 end
 
-#=TODO. Did I do something stupid down below here.. ?=#
-
-function countAllUniqueVariablesInSetOfEquations(eqs::Vector{RES_EQ}, vars::Vector{VAR}) where {RES_EQ, VAR}
-  vars = OrderedSet()
-  for eq in eqs
-    varsForEq = getAllVariables(eq, vars)
-    for v in varsForEq
-      push!(vars, v)
-    end
-  end
-  return length(vars)
-end
-
 """
   Author: johti17
   input: Backend Equation, eq
@@ -568,7 +522,7 @@ function getAllVariables(eq::BDAE.RESIDUAL_EQUATION, vars::Vector{BDAE.VAR})::Ve
   (_, stateElements)  = traverseEquationExpressions(eq, detectStateExpression, stateCrefs)
   local stateElementArray = [string(cr) for cr in collect(keys(stateElements))]
   local componentReferencesNotStates = [string(cr) for cr in componentReferences]
-  variablesInEq::Vector = []
+  variablesInEq = DAE.ComponentRef[]
   for var in vars
     local vn = string(var.varName)
     if vn in componentReferencesNotStates && isVariable(var.varKind)
@@ -742,7 +696,7 @@ function isArray(cref::DAE.ComponentRef)::Bool
 end
 
 function getSubscriptAsIntArray(dims)::Array
-  local dimIndices = []
+  local dimIndices = Int[]
   for d in dims
     if ! (typeof(d) == DAE.DIM_INTEGER)
       throw("Non integers dimensions for arrays are not supported by OMBackend. Variable was $(string(v))")

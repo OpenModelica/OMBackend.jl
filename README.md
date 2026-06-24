@@ -1,4 +1,4 @@
-[![Github Action CI](https://github.com/JKRT/OMBackend.jl/workflows/CI/badge.svg)](https://github.com/JKRT/OMBackend.jl/actions) [![License: OSMC-PL](https://img.shields.io/badge/license-OSMC--PL-lightgrey.svg)](LICENSE.md)
+[![Github Action CI](https://github.com/OpenModelica/OMBackend.jl/workflows/CI/badge.svg)](https://github.com/OpenModelica/OMBackend.jl/actions) [![License: OSMC-PL](https://img.shields.io/badge/license-OSMC--PL-lightgrey.svg)](LICENSE.md)
 
 # About OMBackend.jl
 

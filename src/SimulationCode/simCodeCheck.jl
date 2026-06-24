@@ -76,6 +76,62 @@ struct CheckResult
   elapsed_s::Float64
 end
 
+#= ── Traversal visitor functors (SimCode-native traverseExpTopDown) ─────────
+   Typed callable structs replacing the per-check inline lambdas; each holds its
+   accumulator / context as concrete fields. Call shape
+   (v)(e::Exp, arg::Nothing) -> (e, continue::Bool, arg). =#
+struct CollectDerNames
+  names::OrderedSet{String}
+end
+function (v::CollectDerNames)(e::Exp, arg::Nothing)::Tuple{Exp, Bool, Nothing}
+  if e isa CALL && e.path isa Absyn.IDENT && e.path.name == "der" && !isempty(e.args)
+    _pushDerArgNames!(v.names, toDAEExp(first(e.args)))
+  end
+  return (e, true, arg)
+end
+
+struct CollectCrefNames
+  missingNames::Vector{String}
+  known::OrderedSet{String}
+end
+function (v::CollectCrefNames)(e::Exp, arg::Nothing)::Tuple{Exp, Bool, Nothing}
+  if e isa EXP_CREF
+    local nm = DAE_identifierToString(toDAECref(e.cref).componentRef)
+    !(nm in v.known) && push!(v.missingNames, nm)
+  end
+  return (e, true, arg)
+end
+
+struct FlagCanonicalExp
+  out::Vector{CheckViolation}
+  whereStr::String
+end
+function (v::FlagCanonicalExp)(e::Exp, arg::Nothing)::Tuple{Exp, Bool, Nothing}
+  if e isa EXP_CREF
+    _flagCanonicalComponentRef!(v.out, toDAECref(e.cref).componentRef, v.whereStr)
+  elseif e isa CALL
+    _flagCanonicalPath!(v.out, e.path, v.whereStr * ".call")
+  elseif e isa RECORD
+    _flagCanonicalPath!(v.out, e.path, v.whereStr * ".record")
+  end
+  return (e, true, arg)
+end
+
+struct FlagLiteralInDerPre
+  out::Vector{CheckViolation}
+  whereStr::String
+end
+function (v::FlagLiteralInDerPre)(e::Exp, arg::Nothing)::Tuple{Exp, Bool, Nothing}
+  if e isa CALL && e.path isa Absyn.IDENT && (e.path.name == "der" || e.path.name == "pre") && !isempty(e.args)
+    local lit = toDAEExp(first(e.args))
+    if _isDAEConstant(lit)
+      push!(v.out, CheckViolation(:no_literal_in_der_pre, :warn, v.whereStr,
+                                  "$(e.path.name)(literal $(typeof(lit))) reached codegen — likely upstream parameter-eval substitution"))
+    end
+  end
+  return (e, true, arg)
+end
+
 #= ── Top-level driver ──────────────────────────────────────────────── =#
 
 """
@@ -435,12 +491,7 @@ end
 
 # SIM-native twin: walk the SimCode Exp; reuse the DAE der-arg extraction via a per-node projection.
 function _collectDerFromExp!(names::OrderedSet{String}, exp::Exp)
-  traverseExpTopDown(exp, (e, _) -> begin
-    if e isa CALL && e.path isa Absyn.IDENT && e.path.name == "der" && !isempty(e.args)
-      _pushDerArgNames!(names, toDAEExp(first(e.args)))
-    end
-    (e, true, nothing)
-  end, nothing)
+  traverseExpTopDown(exp, CollectDerNames(names), nothing)
   return names
 end
 
@@ -503,15 +554,7 @@ end
 
 # SIM-native twin: walk the SimCode Exp; collect cref names via a per-cref projection.
 function _collectCrefNames!(missing::Vector{String}, exp::Exp, known::OrderedSet{String})
-  traverseExpTopDown(exp, (e, _) -> begin
-    if e isa EXP_CREF
-      local nm = DAE_identifierToString(toDAECref(e.cref).componentRef)
-      if !(nm in known)
-        push!(missing, nm)
-      end
-    end
-    (e, true, nothing)
-  end, nothing)
+  traverseExpTopDown(exp, CollectCrefNames(missing, known), nothing)
   return missing
 end
 
@@ -769,16 +812,7 @@ end
 
 # SIM-native twin: walk the SimCode Exp directly, reusing the per-node checks via a per-cref projection.
 function _flagCanonicalExp!(out::Vector{CheckViolation}, exp::Exp, where::String)
-  traverseExpTopDown(exp, (e, _) -> begin
-    if e isa EXP_CREF
-      _flagCanonicalComponentRef!(out, toDAECref(e.cref).componentRef, where)
-    elseif e isa CALL
-      _flagCanonicalPath!(out, e.path, where * ".call")
-    elseif e isa RECORD
-      _flagCanonicalPath!(out, e.path, where * ".record")
-    end
-    (e, true, nothing)
-  end, nothing)
+  traverseExpTopDown(exp, FlagCanonicalExp(out, where), nothing)
   return out
 end
 
@@ -903,16 +937,7 @@ end
 
 # SIM-native twin: walk the SimCode Exp; reuse the DAE literal check via a per-arg projection.
 function _flagLiteralInDerPre!(out::Vector{CheckViolation}, exp::Exp, where::String)
-  traverseExpTopDown(exp, (e, _) -> begin
-    if e isa CALL && e.path isa Absyn.IDENT && (e.path.name == "der" || e.path.name == "pre") && !isempty(e.args)
-      local arg = toDAEExp(first(e.args))
-      if _isDAEConstant(arg)
-        push!(out, CheckViolation(:no_literal_in_der_pre, :warn, where,
-                                  "$(e.path.name)(literal $(typeof(arg))) reached codegen — likely upstream parameter-eval substitution"))
-      end
-    end
-    (e, true, nothing)
-  end, nothing)
+  traverseExpTopDown(exp, FlagLiteralInDerPre(out, where), nothing)
   return out
 end
 
