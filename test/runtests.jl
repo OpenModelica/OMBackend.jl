@@ -265,7 +265,7 @@ import .ExampleDAEs
       0,
       BDAE.WHEN_STMTS(cond, mkNoretBody(), NONE()),
       DAE.emptyElementSource,
-      nothing,
+      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
     )
 
     @testset "bare initial() condition is extracted" begin
