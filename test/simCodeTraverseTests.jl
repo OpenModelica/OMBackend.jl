@@ -255,7 +255,7 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
     end
 
     @testset "expToJuliaExpMTK SIM-native == DAE oracle" begin
-      sc = mockSimCode(Dict{String, Tuple{Integer, SC.SimVar}}(
+      sc = mockSimCode(Dict{String, Tuple{Int, SC.SimVar}}(
         "x" => (0, SC.SIMVAR("x", SOME(0), SC.ALG_VARIABLE(0), NONE()))))
       @test e2jEqualsOracle(SC.BCONST(true), sc)
       @test e2jEqualsOracle(SC.ICONST(7), sc)
@@ -277,7 +277,7 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
     @testset "expToJuliaExpDE SIM-native == DAE oracle" begin
       # DEMode resolves STATE -> u[i], PARAMETER -> p[i], time -> t; the layout is built
       # from the mock HT's varKinds. No MSL test exercises DEMode, so this is the coverage.
-      sc = mockSimCode(Dict{String, Tuple{Integer, SC.SimVar}}(
+      sc = mockSimCode(Dict{String, Tuple{Int, SC.SimVar}}(
         "x" => (0, SC.SIMVAR("x", SOME(0), SC.STATE(), NONE())),
         "p" => (1, SC.SIMVAR("p", SOME(1), SC.PARAMETER(NONE()), NONE()))))
       layout = CG.DEGen.buildDELayout(sc)
@@ -302,7 +302,7 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
     @testset "expToJuliaExp SIM-native == DAE oracle" begin
       # generic emitter resolves STATE/ALG -> <varPrefix>[i], PARAMETER -> p[i], time -> t.
       # CALL / CAST arms need real model context (LRT-gated, as for expToJuliaExpMTK).
-      sc = mockSimCode(Dict{String, Tuple{Integer, SC.SimVar}}(
+      sc = mockSimCode(Dict{String, Tuple{Int, SC.SimVar}}(
         "x" => (0, SC.SIMVAR("x", SOME(0), SC.ALG_VARIABLE(0), NONE())),
         "p" => (1, SC.SIMVAR("p", SOME(1), SC.PARAMETER(NONE()), NONE())),
         "s" => (2, SC.SIMVAR("s", SOME(2), SC.STATE(), NONE()))))
