@@ -35,14 +35,9 @@ jobs:
           - os: macos-latest
             arch: arm64
             version: '1.12'
-          # Windows is disabled while the silent test-suite stall is being
-          # debugged locally. The 90-minute job cap is hit consistently even
-          # after warm depot cache, D:-drive depot, coverage off and
-          # check_bounds=auto reduce setup + pre-test precompile to ~3
-          # minutes. The test runner then goes silent for 70+ minutes with
-          # no output before the cap, so the stall is inside the test suite
-          # itself. Re-enable once the hung @testset is identified and
-          # either fixed or skipped.
+          - os: windows-latest
+            arch: x64
+            version: '1.12'
 
     steps:
       - name: Cap precompile concurrency (macOS)
