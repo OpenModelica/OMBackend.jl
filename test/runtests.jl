@@ -42,6 +42,16 @@
   the top-level OM.jl test suite at /test/runtests.jl.
 =#
 
+# On Windows, a failed DLL load or a segfault in external Modelica C functions
+# opens a modal Windows Error Reporting dialog. On a headless CI runner nothing
+# clicks it away, so the test process hangs until the job timeout (a silent
+# ~90 min stall). Disable those hard-error popups so such a failure crashes/errors
+# visibly in the log instead of blocking. (SEM_FAILCRITICALERRORS |
+# SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX = 0x8003.)
+@static if Sys.iswindows()
+    ccall((:SetErrorMode, "kernel32.dll"), UInt32, (UInt32,), 0x8003)
+end
+
 import Absyn
 import SCode
 import DAE
