@@ -30,6 +30,13 @@
 */ =#
 
 module OMBackend
+# Load Plots (and through it Glib's gettext runtime) BEFORE any include that pulls
+# in OMRuntimeExternalC. On Windows, OMRuntimeExternalC loads its own bundled
+# libintl-8.dll/libiconv-2.dll into the process; if that happens first, Glib's
+# libgio-2.0-0.dll later binds against the older gettext and fails to load with
+# "the specified procedure could not be found". Loading Plots first makes Glib's
+# gettext win the libintl-8.dll name, which OMRuntimeExternalC tolerates.
+import Plots
 import DAE
 using MetaModelica: @assign
 const CURRENT_DIRECTORY = @__DIR__

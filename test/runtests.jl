@@ -42,6 +42,26 @@
   the top-level OM.jl test suite at /test/runtests.jl.
 =#
 
+# On Windows, a failed DLL load or a segfault in external Modelica C functions
+# opens a modal Windows Error Reporting dialog. On a headless CI runner nothing
+# clicks it away, so the test process hangs until the job timeout (a silent
+# ~90 min stall). Disable those hard-error popups so such a failure crashes/errors
+# visibly in the log instead of blocking. (SEM_FAILCRITICALERRORS |
+# SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX = 0x8003.)
+@static if Sys.iswindows()
+    ccall((:SetErrorMode, "kernel32.dll"), UInt32, (UInt32,), 0x8003)
+end
+
+# Load Plots (and through it Glib's gettext runtime) FIRST in the test process,
+# before OMBackend — which pulls in OMRuntimeExternalC and its bundled
+# libintl-8.dll. On Windows, whichever libintl-8.dll loads first wins the name;
+# if OMRuntimeExternalC's loads first, Glib's libgio-2.0-0.dll later fails with
+# "the specified procedure could not be found". Preloading Plots here forces Glib's
+# gettext to win regardless of the package __init__ order, which (unlike the
+# in-module import in OMBackend) is not guaranteed when loading the precompiled
+# package on CI.
+import Plots
+
 import Absyn
 import SCode
 import DAE
