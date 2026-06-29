@@ -78,3 +78,4 @@ flycheck_*.el
 !/.gitattributes
 !/.gitignore
 !/.github/
+!/.CI/
