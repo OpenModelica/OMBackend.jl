@@ -1285,7 +1285,7 @@ Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospe
        already lifted to (INITIAL_)WHEN_EQUATION by the companion synth pass. =#
     local hasNonWhen = false
     for stmt in alg.statements
-      if !(stmt isa OMFrontend.Frontend.ALG_WHEN)
+      if !isvariant(stmt, OMFrontend.Frontend.ALG_WHEN)
         hasNonWhen = true
         break
       end
@@ -1461,7 +1461,7 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
        already lifted to (INITIAL_)WHEN_EQUATION by the companion synth pass. =#
     local hasNonWhen = false
     for stmt in statements
-      if !(stmt isa OMFrontend.Frontend.ALG_WHEN)
+      if !isvariant(stmt, OMFrontend.Frontend.ALG_WHEN)
         hasNonWhen = true
         break
       end
@@ -2692,7 +2692,7 @@ function synthesizeInitialWhenFromAlgorithms(algorithms)::Vector{BDAE.Equation}
   local out = BDAE.Equation[]
   for alg in algorithms
     for stmt in alg.statements
-      stmt isa OMFrontend.Frontend.ALG_WHEN || continue
+      isvariant(stmt, OMFrontend.Frontend.ALG_WHEN) || continue
       isempty(stmt.branches) && continue
       local (frontendCond, frontendBody) = stmt.branches[1]
       local daeCond = OMFrontend.Frontend.toDAE(frontendCond)
