@@ -222,8 +222,16 @@ toSimExp(e::DAE.IFEXP)::Exp =
   IFEXP(toSimExp(e.expCond), toSimExp(e.expThen), toSimExp(e.expElse))
 toSimExp(e::DAE.ARRAY)::Exp =
   ARRAY_EXP(e.ty, e.scalar, Exp[toSimExp(x) for x in e.array])
+#= Inner index expression of a DAE.Subscript (SimCode ASUB.subs is Vector{Exp};
+   WHOLEDIM carries no expression, represent it as 0). =#
+_daeSubscriptExp(s::DAE.Subscript)::DAE.Exp = @match s begin
+  DAE.INDEX(e) => e
+  DAE.SLICE(e) => e
+  DAE.WHOLE_NONEXP(e) => e
+  _ => DAE.ICONST(0)
+end
 toSimExp(e::DAE.ASUB)::Exp =
-  ASUB(toSimExp(e.exp), Exp[toSimExp(x) for x in e.sub])
+  ASUB(toSimExp(e.exp), Exp[toSimExp(_daeSubscriptExp(x)) for x in e.sub])
 toSimExp(e::DAE.TSUB)::Exp = TSUB(toSimExp(e.exp), Int(e.ix), e.ty)
 toSimExp(e::DAE.RSUB)::Exp = RSUB(toSimExp(e.exp), Int(e.ix), String(e.fieldName), e.ty)
 toSimExp(e::DAE.CAST)::Exp = CAST(e.ty, toSimExp(e.exp))
@@ -276,7 +284,8 @@ toDAEExp(e::ARRAY_EXP)::DAE.Exp =
             MetaModelica.list((toDAEExp(x) for x in e.elements)...))
 toDAEExp(e::ASUB)::DAE.Exp =
   DAE.ASUB(toDAEExp(e.exp),
-           MetaModelica.list((toDAEExp(x) for x in e.subs)...))
+           #= DAE.ASUB.sub is List{Subscript}; SimCode ASUB.subs are Exps. =#
+           MetaModelica.list((DAE.INDEX(toDAEExp(x)) for x in e.subs)...))
 toDAEExp(e::TSUB)::DAE.Exp = DAE.TSUB(toDAEExp(e.exp), e.index, toDAEType(e.ty))
 toDAEExp(e::RSUB)::DAE.Exp = DAE.RSUB(toDAEExp(e.exp), e.index, e.fieldName, toDAEType(e.ty))
 toDAEExp(e::CAST)::DAE.Exp = DAE.CAST(toDAEType(e.ty), toDAEExp(e.exp))

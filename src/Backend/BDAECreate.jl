@@ -1244,7 +1244,7 @@ Base.@nospecializeinfer function _collectAssignResidualsFromDAEStmts!(out::Vecto
             local _idxSub = DAE.INDEX(DAE.ICONST(_k))
             local _newCref = _appendSubscriptToInnermost(_baseCref, _idxSub)
             local _lhsK::DAE.Exp = DAE.CREF(_newCref, _elemTy)
-            local _rhsK::DAE.Exp = DAE.ASUB(rhs, MetaModelica.list(DAE.ICONST(_k)))
+            local _rhsK::DAE.Exp = DAE.ASUB(rhs, MetaModelica.list(DAE.INDEX(DAE.ICONST(_k))))
             #= Per-element collision: skip if this scalar element is
                already bound by another equation. =#
             local _lhsKStr = string(_newCref)
@@ -1598,9 +1598,10 @@ Base.@nospecializeinfer function _replaceInnermostSubscripts(@nospecialize(cref)
   end
 end
 
-Base.@nospecializeinfer function _iconstExpList(vals::Vector{Int})
-  local exps = DAE.Exp[DAE.ICONST(v) for v in vals]
-  return MetaModelica.list(exps...)
+#= Integer index values as DAE.INDEX subscripts (DAE.ASUB.sub is List{Subscript}). =#
+Base.@nospecializeinfer function _iconstIndexSubList(vals::Vector{Int})
+  local subs = DAE.Subscript[DAE.INDEX(DAE.ICONST(v)) for v in vals]
+  return MetaModelica.list(subs...)
 end
 
 Base.@nospecializeinfer function _andCondition(@nospecialize(a), @nospecialize(b))
@@ -1786,7 +1787,7 @@ Base.@nospecializeinfer function _scalarizeRhs(@nospecialize(rhs),
   elseif isempty(rhsIdxs)
     return rhs
   else
-    return DAE.ASUB(rhs, _iconstExpList(rhsIdxs))
+    return DAE.ASUB(rhs, _iconstIndexSubList(rhsIdxs))
   end
 end
 

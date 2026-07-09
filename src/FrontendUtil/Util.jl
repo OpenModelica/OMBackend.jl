@@ -214,10 +214,12 @@ Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @n
         (DAE.CAST(tp, e1_1), ext_arg_1)
       end
 
-      (DAE.ASUB(exp = e1, sub = expl_1), rel, ext_arg)  => begin
+      (DAE.ASUB(exp = e1, sub = asubSubs0), rel, ext_arg)  => begin
+        #= asubSubs* are fresh locals: the shared expl_1 is typed List{DAE.Exp},
+           but ASUB.sub is List{DAE.Subscript}. =#
         (e1_1, ext_arg_1) = traverseExpTopDown(e1, rel, ext_arg)
-        (expl_1, ext_arg_2) = traverseExpListTopDown(expl_1, rel, ext_arg_1)
-        (makeASUB(e1_1, expl_1), ext_arg_2)
+        (asubSubs1, ext_arg_2) = traverseSubscriptListTopDown(asubSubs0, rel, ext_arg_1)
+        (makeASUB(e1_1, asubSubs1), ext_arg_2)
       end
 
       (DAE.TSUB(e1, i, tp), rel, ext_arg)  => begin
@@ -815,13 +817,15 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc, inExtArg::T)  where {T}
         (e, ext_arg)
       end
 
-      DAE.ASUB(exp = e1, sub = expl)  => begin
+      DAE.ASUB(exp = e1, sub = asubSubs0)  => begin
+        #= Fresh locals: shared expl/expl_1 are List{DAE.Exp}; ASUB.sub is
+           List{DAE.Subscript}. =#
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
-        (expl_1, ext_arg) = traverseExpList(expl, inFunc, ext_arg)
-        e = if referenceEq(e1, e1_1) && referenceEq(expl, expl_1)
+        (asubSubs1, ext_arg) = traverseSubscriptListBottomUp(asubSubs0, inFunc, ext_arg)
+        e = if referenceEq(e1, e1_1) && referenceEq(asubSubs0, asubSubs1)
           inExp
         else
-          makeASUB(e1_1, expl_1)
+          makeASUB(e1_1, asubSubs1)
         end
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
@@ -1347,8 +1351,66 @@ end
 """
   Creates an ASUB expression from an expression and a list of subscripts.
 """
-function makeASUB(exp::DAE.Exp, sub::List{DAE.Exp})
+#= sub is left untyped: dispatch is invariant, so a homogeneous Cons{DAE.INDEX}
+   is not <: List{DAE.Subscript}; the DAE.ASUB constructor widens it via convert. =#
+function makeASUB(exp::DAE.Exp, sub)
   DAE.ASUB(exp, sub)
+end
+
+#= Traverse the inner expression of a DAE.Subscript (INDEX/SLICE/WHOLE_NONEXP
+   carry an Exp; WHOLEDIM does not), preserving identity when unchanged. =#
+function traverseSubscriptTopDown(sub::DAE.Subscript, func, arg)
+  @match sub begin
+    DAE.INDEX(e) => begin
+      (e2, a) = traverseExpTopDown(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.INDEX(e2), a)
+    end
+    DAE.SLICE(e) => begin
+      (e2, a) = traverseExpTopDown(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.SLICE(e2), a)
+    end
+    DAE.WHOLE_NONEXP(e) => begin
+      (e2, a) = traverseExpTopDown(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.WHOLE_NONEXP(e2), a)
+    end
+    _ => (sub, arg)
+  end
+end
+
+function traverseSubscriptListTopDown(subs::List{DAE.Subscript}, func, arg)
+  local outSubs = DAE.Subscript[]
+  for s in subs
+    (s2, arg) = traverseSubscriptTopDown(s, func, arg)
+    push!(outSubs, s2)
+  end
+  return (list(outSubs...), arg)
+end
+
+function traverseSubscriptBottomUp(sub::DAE.Subscript, func, arg)
+  @match sub begin
+    DAE.INDEX(e) => begin
+      (e2, a) = traverseExpBottomUp(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.INDEX(e2), a)
+    end
+    DAE.SLICE(e) => begin
+      (e2, a) = traverseExpBottomUp(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.SLICE(e2), a)
+    end
+    DAE.WHOLE_NONEXP(e) => begin
+      (e2, a) = traverseExpBottomUp(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.WHOLE_NONEXP(e2), a)
+    end
+    _ => (sub, arg)
+  end
+end
+
+function traverseSubscriptListBottomUp(subs::List{DAE.Subscript}, func, arg)
+  local outSubs = DAE.Subscript[]
+  for s in subs
+    (s2, arg) = traverseSubscriptBottomUp(s, func, arg)
+    push!(outSubs, s2)
+  end
+  return (list(outSubs...), arg)
 end
 
 """

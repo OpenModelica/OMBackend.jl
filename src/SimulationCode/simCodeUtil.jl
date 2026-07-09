@@ -1250,8 +1250,9 @@ list. Returns `nothing` if any subscript is non-constant or the list is empty.
 function _daeConstSubscriptSuffix(@nospecialize(subs))::Union{String, Nothing}
   local suffix = ""
   for s in subs
+    #= ASUB.sub is List{Subscript}; constant index is INDEX(ICONST). =#
     local piece = @match s begin
-      DAE.ICONST(i) => Base.string("[", i, "]")
+      DAE.INDEX(DAE.ICONST(i)) => Base.string("[", i, "]")
       _ => nothing
     end
     piece === nothing && return nothing
@@ -2204,7 +2205,7 @@ function buildAsubName(baseName::String, subs)::String
   buf = baseName
   for s in subs
     @match s begin
-      DAE.ICONST(i) => begin buf *= Base.string("[", i, "]") end
+      DAE.INDEX(DAE.ICONST(i)) => begin buf *= Base.string("[", i, "]") end
       _ => return ""  #= Non-constant subscript: cannot resolve statically =#
     end
   end
@@ -5390,8 +5391,14 @@ function _collectIfexpConditionCrefs!(out::OrderedSet{String}, @nospecialize(exp
     end
     DAE.ASUB(exp = e, sub = subs) => begin
       _collectIfexpConditionCrefs!(out, e)
+      #= subs are DAE.Subscript; collect from their inner expressions. =#
       for s in subs
-        _collectIfexpConditionCrefs!(out, s)
+        @match s begin
+          DAE.INDEX(se) => _collectIfexpConditionCrefs!(out, se)
+          DAE.SLICE(se) => _collectIfexpConditionCrefs!(out, se)
+          DAE.WHOLE_NONEXP(se) => _collectIfexpConditionCrefs!(out, se)
+          _ => ()
+        end
       end
     end
     DAE.CAST(exp = e1) => _collectIfexpConditionCrefs!(out, e1)
@@ -7362,7 +7369,7 @@ function substituteFoldedVar(@nospecialize(exp), foldMap::Dict{String, DAE.Exp})
           local suffix = ""
           for s in subs
             @match s begin
-              DAE.ICONST(i) => begin suffix *= Base.string("[", i, "]") end
+              DAE.INDEX(DAE.ICONST(i)) => begin suffix *= Base.string("[", i, "]") end
               _ => begin allConst = false end
             end
           end

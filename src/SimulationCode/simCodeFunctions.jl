@@ -238,7 +238,7 @@ function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN, recordFiel
           local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
           local lhsExp = DAE.CREF(flatCref, fieldTy)
           local rhsCref = DAE.CREF_IDENT(lhsName, stmt.type_, MetaModelica.nil)
-          local rhsExp = DAE.ASUB(DAE.CREF(rhsCref, stmt.type_), MetaModelica.list(DAE.ICONST(i)))
+          local rhsExp = DAE.ASUB(DAE.CREF(rhsCref, stmt.type_), MetaModelica.list(DAE.INDEX(DAE.ICONST(i))))
           push!(stmts, DAE.STMT_ASSIGN(fieldTy, lhsExp, rhsExp, stmt.source))
         end
         return stmts

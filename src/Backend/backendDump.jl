@@ -642,8 +642,9 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
          string(ty) + string(e1)
       end
 
-      DAE.ASUB(exp = e1, sub = expl)  => begin
-         string(e1) + "[" + lstString(expl, ", ") + "]"
+      DAE.ASUB(exp = e1, sub = asubSubs)  => begin
+         #= fresh local: shared expl is List{DAE.Exp}; ASUB.sub is List{Subscript}. =#
+         string(e1) + "[" + lstString(asubSubs, ", ") + "]"
       end
 
       DAE.TSUB(exp = e1, ix = int) => begin
