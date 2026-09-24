@@ -373,4 +373,10 @@ import .ExampleDAEs
   #= ── 7. Discrete-dummy demotion planning ──────────────────────── =#
   include("discreteDummyDemotionTests.jl")
 
+  #= ── 8. One event callback per relation zero set ─────────────── =#
+  include("relationZeroSetTests.jl")
+
+  #= ── 9. Event iteration within one event ─────────────────────── =#
+  include("eventIterationTests.jl")
+
 end

@@ -2753,17 +2753,67 @@ function _isEdgeWhenCondition(@nospecialize(e))::Bool
   end
 end
 
-#= Build MTK SymbolicContinuousCallbacks for the synthesised discrete-Boolean
-   whens: one callback per relation zero-crossing, whose symbolic affect rewrites
-   the held discrete unknown from its defining expression. The affect re-evaluates
-   the Boolean RHS at the (post-rootfind) event point, so it is direction-correct. =#
-#= Replace every structural occurrence of relation `rel` in `exp` with `val`. =#
-function _substRelation(@nospecialize(exp), @nospecialize(rel), val::Bool)
-  local relStr = string(rel)
+#= Replace every structural occurrence of each relation in `pins` (keys:
+   string(relation)) with its pinned value. =#
+function _substRelations(@nospecialize(exp), pins::Dict{String,Bool})
   function repl(e::DAE.Exp, arg)
-    (string(e) == relStr) ? (DAE.BCONST(val), arg) : (e, arg)
+    local v = e isa DAE.RELATION ? get(pins, string(e), nothing) : nothing
+    v === nothing ? (e, arg) : (DAE.BCONST(v), arg)
   end
   return first(Util.traverseExpBottomUp(exp, repl, nothing))
+end
+
+#= The zero set of an ordering relation: its two operands in a canonical order,
+   and whether the relation holds when the first canonical operand is the
+   larger one. `a <= b`, `a > b`, `b >= a`, `b < a` all switch where a - b
+   crosses zero. `nothing` for relations that are not orderings (==, <>). =#
+function _relationZeroSet(@nospecialize(rel))::Union{Nothing, Tuple{String, String, Bool}}
+  rel isa DAE.RELATION || return nothing
+  local greater = @match rel.operator begin
+    DAE.GREATER(__) => true
+    DAE.GREATEREQ(__) => true
+    DAE.LESS(__) => false
+    DAE.LESSEQ(__) => false
+    _ => nothing
+  end
+  greater === nothing && return nothing
+  local s1 = string(rel.exp1)
+  local s2 = string(rel.exp2)
+  return s1 <= s2 ? (s1, s2, greater) : (s2, s1, !greater)
+end
+
+#= Group relations that share a zero set, in first-occurrence order. =#
+function _groupRelationsByZeroSet(rels)::Vector{Vector{Any}}
+  local groups = Vector{Vector{Any}}()
+  local groupOf = Dict{Tuple{String,String},Int}()
+  for r in rels
+    local zs = _relationZeroSet(r)
+    if zs === nothing
+      push!(groups, Any[r])
+      continue
+    end
+    local key = (zs[1], zs[2])
+    if haskey(groupOf, key)
+      push!(groups[groupOf[key]], r)
+    else
+      push!(groups, Any[r])
+      groupOf[key] = length(groups)
+    end
+  end
+  return groups
+end
+
+#= Values of every relation in a zero-set group once `rel` has value `val`. =#
+function _zeroSetPins(group, @nospecialize(rel), val::Bool)::Dict{String,Bool}
+  local pins = Dict{String,Bool}(string(rel) => val)
+  local zs = _relationZeroSet(rel)
+  zs === nothing && return pins
+  local firstIsLarger = (val == zs[3])
+  for r in group
+    local rzs = _relationZeroSet(r)
+    rzs === nothing || (pins[string(r)] = (firstIsLarger == rzs[3]))
+  end
+  return pins
 end
 
 #= Lower a DAE boolean expression to an MTK Real (0.0/1.0). Each relation is
@@ -2835,11 +2885,12 @@ Base.@nospecializeinfer function _discreteIntToReal(@nospecialize(exp::DAE.Exp),
 end
 
 #= One affect equation `disc ~ <value>` for a lifted discrete: the triggering
-   relation `rel` is pinned to `val` (its post-crossing value). Integer/enum
-   discretes keep their multi-valued result; Boolean discretes are 0/1-clamped. =#
+   relations are pinned to their post-crossing values (`pins`, a zero-set group,
+   see _zeroSetPins). Integer/enum discretes keep their multi-valued result;
+   Boolean discretes are 0/1-clamped. =#
 Base.@nospecializeinfer function _discreteAffectEq(discSym::Symbol, @nospecialize(rhsDAE::DAE.Exp),
-                                                   @nospecialize(rel::DAE.Exp), val::Bool, isInt::Bool, simCode)
-  local pinned = _substRelation(rhsDAE, rel, val)
+                                                   pins::Dict{String,Bool}, isInt::Bool, simCode)
+  local pinned = _substRelations(rhsDAE, pins)
   if isInt
     return :($(discSym) ~ $(_discreteIntToReal(pinned, simCode)))
   end
@@ -2953,7 +3004,8 @@ end
    cluster. Such bodies are sequential FSM transitions; the equation-form
    affect solves them simultaneously, which mis-latches. Scoped to the
    mode-carrying shape; Boolean-only self-pre clusters (freewheel logic)
-   stay on the equation path, which handles them correctly. =#
+   stay on the plain path, which iterates them to a fixpoint within the
+   event (_eventIterAffectParts). =#
 function _modelHasModeFSMClusters(simCode)::Bool
   for weq in simCode.whenEquations
     _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
@@ -3005,6 +3057,18 @@ end
 const _EMPTY_MEM_SUBST = Dict{Symbol, Any}()
 const _EMPTY_REL_PINS = Dict{String, Bool}()
 
+#= An expression that _daeExpToJuliaMem cannot lower into an ImperativeAffect
+   body. The event-iteration path catches it and keeps the equation-form affects. =#
+struct _UnsupportedInAffect <: Exception
+  exp::Any
+end
+Base.showerror(io::IO, e::_UnsupportedInAffect) =
+  print(io, "_daeExpToJuliaMem: unsupported in an ImperativeAffect body: ", string(e.exp))
+
+#= Modelica event operators with no meaning inside an affect body; the generic
+   call lowering would emit an undefined Julia function for them. =#
+const _AFFECT_UNSUPPORTED_BUILTINS = ("sample", "terminal", "delay", "der", "reinit", "cardinality")
+
 #= Pinned truth value of a relation inside an affect body, or nothing. =#
 Base.@nospecializeinfer function _relPinValue(@nospecialize(exp::DAE.Exp), relPins::Dict{String,Bool})::Union{Bool, Nothing}
   (!isempty(relPins) && exp isa DAE.RELATION) || return nothing
@@ -3017,8 +3081,10 @@ end
 Base.@nospecializeinfer function _daeBoolMem(@nospecialize(exp::DAE.Exp), obsAcc::Dict{Symbol,Symbol}, simCode;
                                              initVal::Bool = false,
                                              subst::Dict{Symbol,Any} = _EMPTY_MEM_SUBST,
-                                             relPins::Dict{String,Bool} = _EMPTY_REL_PINS)
-  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins)
+                                             relPins::Dict{String,Bool} = _EMPTY_REL_PINS,
+                                             preSubst::Union{Nothing, Dict{Symbol,Any}} = nothing)
+  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins,
+                                      preSubst = preSubst)
   local pin = _relPinValue(exp, relPins)
   pin === nothing || return pin
   @match exp begin
@@ -3026,11 +3092,42 @@ Base.@nospecializeinfer function _daeBoolMem(@nospecialize(exp::DAE.Exp), obsAcc
     DAE.LUNARY(DAE.NOT(__), e) => :(!$(recb(e)))
     DAE.LBINARY(e1, DAE.AND(__), e2) => :($(recb(e1)) && $(recb(e2)))
     DAE.LBINARY(e1, DAE.OR(__), e2) => :($(recb(e1)) || $(recb(e2)))
-    DAE.RELATION(__) => _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins)
+    DAE.RELATION(__) => _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins,
+                                          preSubst = preSubst)
     DAE.CALL(Absyn.IDENT("initial"), _, _) => initVal
+    #= edge(v) = v and not pre(v); change(v) = v <> pre(v), with pre() lowered
+       like any other (pre-memory, or the event iteration's previous pass).
+       The frontend inlines `b = x > 0.2` into edge(x > 0.2): in an event
+       iteration a relation changes only at its own crossing, i.e. when this
+       callback pins it, and only in the first pass (later passes see
+       pre = the same value). =#
+    DAE.CALL(Absyn.IDENT("edge"), args, attr) => begin
+      local v = listHead(args)
+      if v isa DAE.RELATION && preSubst !== nothing
+        _relPinValue(v, relPins) === true ? :(_firstPass) : false
+      else
+        v isa DAE.CREF || throw(_UnsupportedInAffect(exp))
+        :($(recb(v)) && !$(recb(DAE.CALL(Absyn.IDENT("pre"), args, attr))))
+      end
+    end
+    DAE.CALL(Absyn.IDENT("change"), args, attr) => begin
+      local v = listHead(args)
+      local preV = DAE.CALL(Absyn.IDENT("pre"), args, attr)
+      if v isa DAE.RELATION && preSubst !== nothing
+        _relPinValue(v, relPins) === nothing ? false : :(_firstPass)
+      elseif !(v isa DAE.CREF)
+        throw(_UnsupportedInAffect(exp))
+      elseif _isBoolDiscreteName(string(v.componentRef), simCode)
+        :($(recb(v)) != $(recb(preV)))
+      else
+        local recv(@nospecialize e) = _daeExpToJuliaMem(e, obsAcc, simCode; initVal = initVal, subst = subst,
+                                                        relPins = relPins, preSubst = preSubst)
+        :($(recv(v)) != $(recv(preV)))
+      end
+    end
     DAE.IFEXP(c, t, f) => :($(recb(c)) ? $(recb(t)) : $(recb(f)))
     _ => begin
-      local v = _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal, subst = subst)
+      local v = _daeExpToJuliaMem(exp, obsAcc, simCode; initVal = initVal, subst = subst, preSubst = preSubst)
       v isa Bool ? v : :($(v) > 0.5)
     end
   end
@@ -3041,14 +3138,18 @@ end
      continuous/param cref -> observed.<name>        (collected into obsAcc)
      relation/ifelse/and/or/not/arith -> Julia control flow
    `initVal` is the value `initial()` lowers to (true in an initialize affect).
-   The triggering relation is pre-substituted by the caller, so it arrives as a
-   BCONST. =#
+   The crossing relations are pinned through `relPins`. With `preSubst` (event iteration, _eventIterAffectParts), pre(x) is
+   the local `preSubst[x]` for a cluster member and observed.x (its value at
+   the event) otherwise; DISCRETE_PRE_MEM is not used. =#
 Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), obsAcc::Dict{Symbol,Symbol}, simCode;
                                                    initVal::Bool = false,
                                                    subst::Dict{Symbol,Any} = _EMPTY_MEM_SUBST,
-                                                   relPins::Dict{String,Bool} = _EMPTY_REL_PINS)
-  rec(@nospecialize e) = _daeExpToJuliaMem(e, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins)
-  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins)
+                                                   relPins::Dict{String,Bool} = _EMPTY_REL_PINS,
+                                                   preSubst::Union{Nothing, Dict{Symbol,Any}} = nothing)
+  rec(@nospecialize e) = _daeExpToJuliaMem(e, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins,
+                                           preSubst = preSubst)
+  recb(@nospecialize e) = _daeBoolMem(e, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins,
+                                      preSubst = preSubst)
   local pin = _relPinValue(exp, relPins)
   pin === nothing || return pin
   @match exp begin
@@ -3058,10 +3159,22 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
     DAE.ENUM_LITERAL(_, idx) => Float64(idx)
     DAE.CALL(Absyn.IDENT("pre"), args, _) => begin
       local nm = string(listHead(args).componentRef)
-      local rd = :(DISCRETE_PRE_MEM[$(QuoteNode(Symbol(nm)))])
+      local key = Symbol(nm)
+      local rd = if preSubst === nothing
+        :(DISCRETE_PRE_MEM[$(QuoteNode(key))])
+      elseif haskey(preSubst, key)
+        preSubst[key]
+      else
+        obsAcc[key] = key
+        :(observed.$(key))
+      end
       _isBoolDiscreteName(nm, simCode) ? :($(rd) > 0.5) : rd
     end
     DAE.CALL(Absyn.IDENT("initial"), _, _) => initVal
+    DAE.CALL(Absyn.IDENT("edge"), _, _) || DAE.CALL(Absyn.IDENT("change"), _, _) => recb(exp)
+    DAE.CALL(Absyn.IDENT(name), _, _) where name in _AFFECT_UNSUPPORTED_BUILTINS =>
+      throw(_UnsupportedInAffect(exp))
+    DAE.CAST(_, e) => rec(e)
     DAE.RELATION(e1, op, e2) => :($(DAE_OP_toJuliaOperator(op))($(rec(e1)), $(rec(e2))))
     DAE.LUNARY(DAE.NOT(__), e) => :(!$(recb(e)))
     DAE.LBINARY(e1, DAE.AND(__), e2) => :($(recb(e1)) && $(recb(e2)))
@@ -3122,7 +3235,7 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
        (canonicalName -> underscore form), args lowered imperatively. =#
     DAE.CALL(path = p, expLst = cargs) =>
       Expr(:call, Symbol(OMBackend.canonicalName(string(p))), (rec(a) for a in cargs)...)
-    _ => error("_daeExpToJuliaMem: unsupported in pre-memory affect: $(exp)")
+    _ => throw(_UnsupportedInAffect(exp))
   end
 end
 
@@ -3228,6 +3341,109 @@ Base.@nospecializeinfer function _preMemAffectParts(assigns::Vector{Tuple{Symbol
                     $(writes...)
                     $(trace)
                     $(flag)
+                    $(retNT)
+                  end)
+  local obsNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, k, v) for (k, v) in obsAcc]...))
+  local modNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, d, d) for (d, _, _) in assigns]...))
+  return (fexpr, obsNT, modNT)
+end
+
+#= True if some member's rhs reads pre() of a cluster member, so one pass of the
+   body can leave pre(x) <> x (see _eventIterAffectParts). =#
+function _clusterReadsOwnPre(assigns::Vector{Tuple{Symbol,Any,Bool}})::Bool
+  local members = Set{String}(string(d) for (d, _, _) in assigns)
+  local found = false
+  function visit(e::DAE.Exp, arg)
+    if e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "pre"
+      local a = listHead(e.expLst)
+      a isa DAE.CREF && string(a.componentRef) in members && (found = true)
+    end
+    return (e, arg)
+  end
+  for (_, rhs, _) in assigns
+    Util.traverseExpBottomUp(rhs, visit, nothing)
+  end
+  return found
+end
+
+#= True for the condition of a when synthesized from discrete equations
+   (synthesizeWhenEquationsFromDiscreteEquations): an OR-chain of
+   `change(<relation>)`. User whens (`when change(b)`, `when x > 0`) run their
+   body once per event and must not be iterated. =#
+function _isSynthesizedChangeCondition(@nospecialize(cond))::Bool
+  local d = cond isa SimulationCode.Exp ? SimulationCode.toDAEExp(cond) : cond
+  @match d begin
+    DAE.CALL(Absyn.IDENT("change"), args, _) => listHead(args) isa DAE.RELATION
+    DAE.LBINARY(e1, DAE.OR(__), e2) => _isSynthesizedChangeCondition(e1) && _isSynthesizedChangeCondition(e2)
+    _ => false
+  end
+end
+
+#= Whether the event-iteration affect can be generated for this cluster: every
+   rhs lowers into an ImperativeAffect body. Otherwise the cluster keeps the
+   one-pass equation-form affects, which lower more expression kinds. =#
+function _eventIterLowerable(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode)::Bool
+  try
+    _eventIterAffectParts(assigns, simCode)
+    return true
+  catch e
+    e isa _UnsupportedInAffect || rethrow()
+    @info "Discrete cluster $(join(first.(assigns), ", ")) keeps one-pass event affects" reason = sprint(showerror, e)
+    return false
+  end
+end
+
+#= Upper bound on the passes of one event iteration. =#
+const _EVENT_ITERATION_MAX_PASSES = 20
+
+#= ImperativeAffect for a plain-path cluster that reads its own pre() values:
+   Modelica event iteration (§8.6). Each pass evaluates the body in order with
+   pre(x) = x after the previous pass (x at the event for the first pass) and
+   member crefs = their latest value, until a pass changes nothing. The pinned
+   relations stay pinned; the other operands are read once, at the event. An
+   equation-form affect is one pass: in the OneWayClutch the crossing to
+   w_rel <= 0 sets stuck, but `locked = pre(stuck) and not startForward`
+   needs the second pass, so without it the freewheel never locks. =#
+Base.@nospecializeinfer function _eventIterAffectParts(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode;
+                                                       relPins::Dict{String,Bool} = _EMPTY_REL_PINS)
+  local obsAcc = Dict{Symbol,Symbol}()
+  local preSyms = Dict{Symbol,Any}(d => Symbol("_pre_", d) for (d, _, _) in assigns)
+  local subst = Dict{Symbol,Any}(d => Symbol("_v_", d) for (d, _, _) in assigns)
+  local setup = Expr[]; local pass = Expr[]; local changed = Expr[]
+  local shift = Expr[]; local retKws = Expr[]
+  for (d, rhs, isInt) in assigns
+    local vsym = subst[d]; local psym = preSyms[d]
+    push!(setup, :(local $(psym) = Float64(modified.$(d))))
+    push!(setup, :(local $(vsym) = $(psym)))
+    local valExpr = isInt ?
+      :(Float64($(_daeExpToJuliaMem(rhs, obsAcc, simCode; subst = subst, relPins = relPins, preSubst = preSyms)))) :
+      :($(_daeBoolMem(rhs, obsAcc, simCode; subst = subst, relPins = relPins, preSubst = preSyms)) ? 1.0 : 0.0)
+    push!(pass, :($(vsym) = $(valExpr)))
+    push!(changed, :($(vsym) != $(psym)))
+    push!(shift, :($(psym) = $(vsym)))
+    push!(retKws, Expr(:kw, d, vsym))
+  end
+  local anyChanged = foldl((a, b) -> :($(a) || $(b)), changed)
+  local retNT = Expr(:tuple, Expr(:parameters, retKws...))
+  #= One non-convergence warning per cluster, not per generated source line. =#
+  local warnId = QuoteNode(Symbol("eventIteration_", first(assigns)[1]))
+  local fexpr = :((modified, observed, ctx, integrator) -> begin
+                    $(setup...)
+                    local _converged = false
+                    local _firstPass = true   # edge()/change() of a crossing relation
+                    for _ in 1:$(_EVENT_ITERATION_MAX_PASSES)
+                      $(pass...)
+                      if !($(anyChanged))
+                        _converged = true
+                        break
+                      end
+                      $(shift...)
+                      _firstPass = false
+                    end
+                    _converged || @warn("Event iteration did not converge", t = integrator.t,
+                                        cluster = $(QuoteNode(first.(assigns))), _id = $(warnId), maxlog = 1)
+                    #= As in _preMemAffectParts: the integrator must see the change. =#
+                    SciMLBase.u_modified!(integrator, true)
                     $(retNT)
                   end)
   local obsNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, k, v) for (k, v) in obsAcc]...))
@@ -3419,6 +3635,10 @@ function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
   return events
 end
 
+#= Build MTK SymbolicContinuousCallbacks for the synthesised discrete-Boolean
+   whens: one callback per relation zero set, whose affect rewrites the held
+   discrete unknown from its defining expression. The affect re-evaluates
+   the Boolean RHS at the (post-rootfind) event point, so it is direction-correct. =#
 function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
   local events = Expr[]
   local tableMode = _modelHasTableClusters(simCode)
@@ -3431,13 +3651,14 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
     local isEdge = _isEdgeWhenCondition(weq.whenEquation.condition)
     local assigns = _gatherClusterAssigns(weq, simCode)
     assigns === nothing && continue
-    #= One callback per relation in the cluster. transformToMTKContinuousCondition
-       normalises zc so relation-TRUE ⟺ zc<0: the `=>` affect is the up-crossing
+    #= One callback per relation zero set in the cluster (below).
+       transformToMTKContinuousCondition normalises zc so relation-TRUE ⟺ zc<0
+       for the group's first relation: the `=>` affect is the up-crossing
        (relation becomes FALSE) and affect_neg the down-crossing (relation becomes
-       TRUE). Each callback rewrites the WHOLE ordered cluster with THIS relation
-       pinned to its post-crossing value (others at their current value) so a
-       coupled FSM recomputes consistently and direction-correctly on any member
-       crossing, without the `f≈0` ambiguity. =#
+       TRUE). Each callback rewrites the WHOLE ordered cluster with THIS group's
+       relations pinned to their post-crossing values (others at their current
+       value) so a coupled FSM recomputes consistently and direction-correctly on
+       any member crossing, without the `f≈0` ambiguity. =#
     #= Initialize affect: set every discrete from its full rhs at t0. Only
        whens whose condition carries an `initial()` term (the synthesized
        lifter conditions) run their body at t0; user whens with plain
@@ -3445,17 +3666,31 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
        destroy a negative-startTime phase, friction would mis-latch). =#
     local hasInit = _condHasInitial(weq.whenEquation.condition)
     local affInit = Expr[_discreteAffectEqInit(d, r, ii, simCode) for (d, r, ii) in assigns]
-    for (relIdx, rel) in enumerate(rels)
+    #= Relations with the same zero set (`w_rel <= 0` and `w_rel > 0`) get ONE
+       callback whose crossing pins all of them. With one callback each, both sat
+       on the same root with opposite signs; where the integrator stopped exactly
+       on it they fired alternately, each pinning its own relation and reading the
+       other from the state at the root, and flipped the cluster back and forth
+       without time advancing (MSL Rotational OneWayClutchDisengaged, maxiters).
+       Rising-edge-only whens keep one callback per relation. =#
+    local groups = isEdge ? Vector{Any}[Any[r] for r in rels] : _groupRelationsByZeroSet(rels)
+    #= A synthesized cluster that reads its own pre() values iterates to a
+       fixpoint within the event (_eventIterAffectParts); the others need a
+       single pass. =#
+    local eventIteration = _isSynthesizedChangeCondition(weq.whenEquation.condition) &&
+                           _clusterReadsOwnPre(assigns) && _eventIterLowerable(assigns, simCode)
+    for (relIdx, grp) in enumerate(groups)
+      local rel = grp[1]
       local zc = transformToMTKContinuousCondition(rel, simCode)
       if preMem
         #= Live ImperativeAffects that commit to DISCRETE_PRE_MEM so a dt=0
-           cascade across the cluster's callbacks latches. The FIRING relation
-           is pinned to its post-crossing truth value per edge: root-finding
+           cascade across the cluster's callbacks latches. The FIRING relations
+           (the zero-set group) are pinned to their post-crossing truth values
+           per edge: root-finding
            can land exactly ON the root, where a strict live comparison misses
            the transition forever (a breakaway threshold reads sa == tau0_max). =#
-        local _relKey = string(rel)
-        local (fnUp, obsUp, modUp) = _preMemAffectParts(assigns, simCode; relPins = Dict{String,Bool}(_relKey => false))
-        local (fnDn, obsDn, modDn) = _preMemAffectParts(assigns, simCode; relPins = Dict{String,Bool}(_relKey => true))
+        local (fnUp, obsUp, modUp) = _preMemAffectParts(assigns, simCode; relPins = _zeroSetPins(grp, rel, false))
+        local (fnDn, obsDn, modDn) = _preMemAffectParts(assigns, simCode; relPins = _zeroSetPins(grp, rel, true))
         #= RightRootFind: fire the recompute on the far side of the v=0 crossing so
            the velocity gate is evaluated past 0 at a breakaway and the mode can
            advance to Forward/Backward instead of re-localizing Stuck at v=0
@@ -3497,13 +3732,34 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
             reinitializealg = $(_fsmReinitAlg()))))
         end
       else
-        local affFalse = Expr[_discreteAffectEq(d, r, rel, false, ii, simCode) for (d, r, ii) in assigns]
-        local affTrue  = Expr[_discreteAffectEq(d, r, rel, true,  ii, simCode) for (d, r, ii) in assigns]
-        #= The `initial()` term: only the first relation's callback carries it,
+        local pinsFalse = _zeroSetPins(grp, rel, false)
+        local pinsTrue = _zeroSetPins(grp, rel, true)
+        local affFalse = eventIteration ? Expr[] :
+          Expr[_discreteAffectEq(d, r, pinsFalse, ii, simCode) for (d, r, ii) in assigns]
+        local affTrue  = eventIteration ? Expr[] :
+          Expr[_discreteAffectEq(d, r, pinsTrue,  ii, simCode) for (d, r, ii) in assigns]
+        #= The `initial()` term: only the first group's callback carries it,
            so the discretes are set once at t0 (no double-apply), and only
            when the condition actually contains `initial()`. =#
         local _withInit = relIdx == 1 && hasInit
-        if isEdge
+        if eventIteration
+          local (fnF, obsF, modF) = _eventIterAffectParts(assigns, simCode; relPins = pinsFalse)
+          local (fnT, obsT, modT) = _eventIterAffectParts(assigns, simCode; relPins = pinsTrue)
+          local affUp = :(ModelingToolkit.ImperativeAffect($(fnF), $(modF); observed = $(obsF), skip_checks = true))
+          local affDn = :(ModelingToolkit.ImperativeAffect($(fnT), $(modT); observed = $(obsT), skip_checks = true))
+          if _withInit
+            push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(zc) ~ 0), $(affUp);
+              affect_neg = $(affDn),
+              initialize = [$(affInit...)],
+              reinitializealg = SciMLBase.NoInit())))
+          else
+            push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+              ($(zc) ~ 0), $(affUp);
+              affect_neg = $(affDn),
+              reinitializealg = SciMLBase.NoInit())))
+          end
+        elseif isEdge
           #= rising-only: run the body when the relation becomes TRUE
              (down-crossing of zc = affect_neg); no-op on the falling side. =#
           if _withInit
