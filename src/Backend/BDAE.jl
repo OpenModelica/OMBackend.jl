@@ -560,7 +560,9 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
   end
 
   @Record STRUCTURAL_IF_EQUATION begin
-    ifEquation::OMFrontend.Frontend.EQUATION_IF
+    #= Compacted NFEquation: EQUATION_IF is a constructor, NFEquationImpl the
+       concrete backing struct. The value is always an EQUATION_IF variant. =#
+    ifEquation::OMFrontend.Frontend.NFEquationImpl
   end
 
   @Record STRUCTURAL_TRANSITION begin

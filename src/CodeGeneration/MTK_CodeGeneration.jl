@@ -3106,7 +3106,14 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
        lowered through `rec` so they read observed / DISCRETE_PRE_MEM. Routes
        through `constTableLookup` (handles numeric + rounded indices). =#
     DAE.ASUB(exp = tableExp, sub = subs) => begin
-      local subCodes = collect(rec(s) for s in subs)
+      #= subs are DAE.Subscript; lower each subscript's inner index expression. =#
+      local _subExp = s -> @match s begin
+        DAE.INDEX(se) => se
+        DAE.SLICE(se) => se
+        DAE.WHOLE_NONEXP(se) => se
+        _ => DAE.ICONST(0)
+      end
+      local subCodes = collect(rec(_subExp(s)) for s in subs)
       :(OMBackend.CodeGeneration.constTableLookup($(expToJuliaExpMTK(tableExp, simCode)), $(subCodes...)))
     end
     DAE.ARRAY(__) => expToJuliaExpMTK(exp, simCode)

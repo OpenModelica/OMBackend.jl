@@ -238,7 +238,7 @@ function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN, recordFiel
           local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
           local lhsExp = DAE.CREF(flatCref, fieldTy)
           local rhsCref = DAE.CREF_IDENT(lhsName, stmt.type_, MetaModelica.nil)
-          local rhsExp = DAE.ASUB(DAE.CREF(rhsCref, stmt.type_), MetaModelica.list(DAE.ICONST(i)))
+          local rhsExp = DAE.ASUB(DAE.CREF(rhsCref, stmt.type_), MetaModelica.list(DAE.INDEX(DAE.ICONST(i))))
           push!(stmts, DAE.STMT_ASSIGN(fieldTy, lhsExp, rhsExp, stmt.source))
         end
         return stmts
@@ -698,11 +698,26 @@ function resolveConstantIfExp(exp::DAE.Exp, simCode::SIM_CODE)::DAE.Exp
       changed ? DAE.ARRAY(ty, scalar, MetaModelica.list(newArr...)) : exp
     end
     DAE.ASUB(e1, subs) => begin
+      #= subs are DAE.Subscript: recurse into each subscript's inner exp. =#
       local ne1 = resolveConstantIfExp(e1, simCode)
       local changed = ne1 !== e1
-      local newSubs = DAE.Exp[]
+      local newSubs = DAE.Subscript[]
       for sub in subs
-        local newSub = resolveConstantIfExp(sub, simCode)
+        local newSub = @match sub begin
+          DAE.INDEX(se) => begin
+            local ns = resolveConstantIfExp(se, simCode)
+            ns === se ? sub : DAE.INDEX(ns)
+          end
+          DAE.SLICE(se) => begin
+            local ns = resolveConstantIfExp(se, simCode)
+            ns === se ? sub : DAE.SLICE(ns)
+          end
+          DAE.WHOLE_NONEXP(se) => begin
+            local ns = resolveConstantIfExp(se, simCode)
+            ns === se ? sub : DAE.WHOLE_NONEXP(ns)
+          end
+          _ => sub
+        end
         changed |= newSub !== sub
         push!(newSubs, newSub)
       end

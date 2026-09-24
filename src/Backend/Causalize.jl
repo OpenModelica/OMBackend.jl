@@ -747,7 +747,7 @@ Base.@nospecializeinfer function extractBindingElement(@nospecialize(bindExp::DA
     end
     _ => begin
       #= Non-literal binding: wrap with ASUB for runtime indexing =#
-      local asubSubs = list((DAE.ICONST(indices[i]) for i in 1:N)...)
+      local asubSubs = list((DAE.INDEX(DAE.ICONST(indices[i])) for i in 1:N)...)
       return DAE.ASUB(bindExp, asubSubs)
     end
   end
@@ -906,7 +906,7 @@ function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
        array entries.) =#
     fieldName = string(baseName, subsStr, OMBackend.COMPONENT_SEPARATOR, field.name)
     fieldTy = field.ty
-    exprField = DAE.ASUB(exprSide, list(DAE.ICONST(fieldIdx)))
+    exprField = DAE.ASUB(exprSide, list(DAE.INDEX(DAE.ICONST(fieldIdx))))
     @match fieldTy begin
       DAE.T_ARRAY(elemTy, dims) => begin
         dimVec = Int[d.integer for d in dims]
@@ -915,7 +915,7 @@ function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
           subs = list((DAE.INDEX(DAE.ICONST(i)) for i in idxTuple)...)
           lhsCref = DAE.CREF_IDENT(fieldName, elemTy, subs)
           lhsExp = DAE.CREF(lhsCref, elemTy)
-          rhsExp = DAE.ASUB(exprField, list((DAE.ICONST(i) for i in idxTuple)...))
+          rhsExp = DAE.ASUB(exprField, list((DAE.INDEX(DAE.ICONST(i)) for i in idxTuple)...))
           push!(equations, BDAE.EQUATION(lhsExp, rhsExp, source, attr))
         end
       end

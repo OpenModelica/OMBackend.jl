@@ -1125,6 +1125,10 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           @match sub begin
             DAE.ICONST(i) => i
             DAE.INDEX(DAE.ICONST(i)) => i
+            #= Non-constant subscript: lower its inner index expression. =#
+            DAE.INDEX(e) => expToJuliaExpMTK(e, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+            DAE.SLICE(e) => expToJuliaExpMTK(e, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+            DAE.WHOLE_NONEXP(e) => expToJuliaExpMTK(e, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
             _ => expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
           end
         end

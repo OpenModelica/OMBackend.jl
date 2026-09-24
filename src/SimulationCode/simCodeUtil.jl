@@ -1250,8 +1250,9 @@ list. Returns `nothing` if any subscript is non-constant or the list is empty.
 function _daeConstSubscriptSuffix(@nospecialize(subs))::Union{String, Nothing}
   local suffix = ""
   for s in subs
+    #= ASUB.sub is List{Subscript}; constant index is INDEX(ICONST). =#
     local piece = @match s begin
-      DAE.ICONST(i) => Base.string("[", i, "]")
+      DAE.INDEX(DAE.ICONST(i)) => Base.string("[", i, "]")
       _ => nothing
     end
     piece === nothing && return nothing
@@ -2204,7 +2205,7 @@ function buildAsubName(baseName::String, subs)::String
   buf = baseName
   for s in subs
     @match s begin
-      DAE.ICONST(i) => begin buf *= Base.string("[", i, "]") end
+      DAE.INDEX(DAE.ICONST(i)) => begin buf *= Base.string("[", i, "]") end
       _ => return ""  #= Non-constant subscript: cannot resolve statically =#
     end
   end
@@ -5390,8 +5391,14 @@ function _collectIfexpConditionCrefs!(out::OrderedSet{String}, @nospecialize(exp
     end
     DAE.ASUB(exp = e, sub = subs) => begin
       _collectIfexpConditionCrefs!(out, e)
+      #= subs are DAE.Subscript; collect from their inner expressions. =#
       for s in subs
-        _collectIfexpConditionCrefs!(out, s)
+        @match s begin
+          DAE.INDEX(se) => _collectIfexpConditionCrefs!(out, se)
+          DAE.SLICE(se) => _collectIfexpConditionCrefs!(out, se)
+          DAE.WHOLE_NONEXP(se) => _collectIfexpConditionCrefs!(out, se)
+          _ => ()
+        end
       end
     end
     DAE.CAST(exp = e1) => _collectIfexpConditionCrefs!(out, e1)
@@ -5468,8 +5475,8 @@ function _asubCanonicalName(@nospecialize(exp))::Union{Nothing,String}
       local idxParts = String[]
       for s in subs
         local v = @match s begin
-          DAE.ICONST(i) => i
-          DAE.RCONST(r) where r == round(r) => Int(round(r))
+          DAE.INDEX(DAE.ICONST(i)) => i
+          DAE.INDEX(DAE.RCONST(r)) where r == round(r) => Int(round(r))
           _ => nothing
         end
         v === nothing && return nothing
@@ -6164,7 +6171,7 @@ function substituteAliasCref(exp::ASUB, aliasMap)
 end
 
 # SIM-native mirrors of _aliasLookupName / _hasNegatedAliasArg / _substituteAliasInBuiltinArgs.
-_subsToDAE(subs) = DAE.Exp[toDAEExp(s) for s in subs]
+_subsToDAE(subs) = DAE.Subscript[DAE.INDEX(toDAEExp(s)) for s in subs]
 _parseSubsSIM(name::String) = Exp[ICONST(parse(Int, m.captures[1])) for m in eachmatch(r"\[(\d+)\]", name)]
 
 function _aliasLookupNameSIM(@nospecialize(e))::Union{Nothing,String}
@@ -6257,17 +6264,17 @@ function _substituteAliasInBuiltinArgs(expl, aliasMap)
 end
 
 """
-    parseSubscriptsFromName(name::String)::Vector{DAE.Exp}
+    parseSubscriptsFromName(name::String)::List{DAE.Subscript}
 
-Parse subscripts from a variable name like "a[1][2]" into [DAE.ICONST(1), DAE.ICONST(2)].
+Parse subscripts from a variable name like "a[1][2]" into INDEX(ICONST) subscripts.
 Used to reconstruct ASUB subscripts for the representative variable.
 """
-function parseSubscriptsFromName(name::String)::Vector{DAE.Exp}
-  local subs = DAE.Exp[]
+function parseSubscriptsFromName(name::String)::MetaModelica.List{DAE.Subscript}
+  local subs = MetaModelica.nil
   for m in eachmatch(r"\[(\d+)\]", name)
-    push!(subs, DAE.ICONST(parse(Int, m.captures[1])))
+    subs = MetaModelica.cons(DAE.INDEX(DAE.ICONST(parse(Int, m.captures[1]))), subs)
   end
-  return subs
+  return MetaModelica.listReverse(subs)
 end
 
 """
@@ -7362,7 +7369,7 @@ function substituteFoldedVar(@nospecialize(exp), foldMap::Dict{String, DAE.Exp})
           local suffix = ""
           for s in subs
             @match s begin
-              DAE.ICONST(i) => begin suffix *= Base.string("[", i, "]") end
+              DAE.INDEX(DAE.ICONST(i)) => begin suffix *= Base.string("[", i, "]") end
               _ => begin allConst = false end
             end
           end

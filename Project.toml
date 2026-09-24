@@ -1,7 +1,7 @@
 name = "OMBackend"
 uuid = "9400bd5f-7561-42f6-8760-03756753da50"
 authors = ["John Tinnerholm <johti17@liu.se>", "Karim Abdelhak <karim.abdelhak@fh-bielefeld.de>", "AnHeuermann <andreas.heuermann@fh-bielefeld.de>"]
-version = "0.5"
+version = "0.5.1"
 
 [deps]
 Absyn = "ce2f92e2-a952-11e9-0543-8b443f216f1d"
