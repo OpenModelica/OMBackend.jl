@@ -642,9 +642,9 @@ topologies. The body is a Frontend `EQUATION_IF`, which describes the
 connector branches before BDAE lowering.
 """
 struct DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION <: StructuralTransition
-  #= Compacted NFEquation: EQUATION_IF is a constructor, EquationImpl the
+  #= Compacted NFEquation: EQUATION_IF is a constructor, NFEquationImpl the
      concrete backing struct. The value is always an EQUATION_IF variant. =#
-  ifEquation::OMFrontend.Frontend.EquationImpl
+  ifEquation::OMFrontend.Frontend.NFEquationImpl
 end
 
 """

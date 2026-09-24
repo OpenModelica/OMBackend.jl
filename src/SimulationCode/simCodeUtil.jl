@@ -5475,8 +5475,8 @@ function _asubCanonicalName(@nospecialize(exp))::Union{Nothing,String}
       local idxParts = String[]
       for s in subs
         local v = @match s begin
-          DAE.ICONST(i) => i
-          DAE.RCONST(r) where r == round(r) => Int(round(r))
+          DAE.INDEX(DAE.ICONST(i)) => i
+          DAE.INDEX(DAE.RCONST(r)) where r == round(r) => Int(round(r))
           _ => nothing
         end
         v === nothing && return nothing
@@ -6171,7 +6171,7 @@ function substituteAliasCref(exp::ASUB, aliasMap)
 end
 
 # SIM-native mirrors of _aliasLookupName / _hasNegatedAliasArg / _substituteAliasInBuiltinArgs.
-_subsToDAE(subs) = DAE.Exp[toDAEExp(s) for s in subs]
+_subsToDAE(subs) = DAE.Subscript[DAE.INDEX(toDAEExp(s)) for s in subs]
 _parseSubsSIM(name::String) = Exp[ICONST(parse(Int, m.captures[1])) for m in eachmatch(r"\[(\d+)\]", name)]
 
 function _aliasLookupNameSIM(@nospecialize(e))::Union{Nothing,String}
@@ -6264,17 +6264,17 @@ function _substituteAliasInBuiltinArgs(expl, aliasMap)
 end
 
 """
-    parseSubscriptsFromName(name::String)::Vector{DAE.Exp}
+    parseSubscriptsFromName(name::String)::List{DAE.Subscript}
 
-Parse subscripts from a variable name like "a[1][2]" into [DAE.ICONST(1), DAE.ICONST(2)].
+Parse subscripts from a variable name like "a[1][2]" into INDEX(ICONST) subscripts.
 Used to reconstruct ASUB subscripts for the representative variable.
 """
-function parseSubscriptsFromName(name::String)::Vector{DAE.Exp}
-  local subs = DAE.Exp[]
+function parseSubscriptsFromName(name::String)::MetaModelica.List{DAE.Subscript}
+  local subs = MetaModelica.nil
   for m in eachmatch(r"\[(\d+)\]", name)
-    push!(subs, DAE.ICONST(parse(Int, m.captures[1])))
+    subs = MetaModelica.cons(DAE.INDEX(DAE.ICONST(parse(Int, m.captures[1]))), subs)
   end
-  return subs
+  return MetaModelica.listReverse(subs)
 end
 
 """
