@@ -4113,7 +4113,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
 
   #= ===== Step 2: Build alias graph and find connected components via BFS ===== =#
   #= Adjacency list: varName -> [(neighborName, negated, edgeIdx)] =#
-  local adjList = Dict{String, Vector{Tuple{String, Bool, Int}}}()
+  local adjList = OrderedDict{String, Vector{Tuple{String, Bool, Int}}}()
   for (idx, (n1, n2, neg, eqIdx, _, _, _, _)) in enumerate(aliasPairs)
     if !haskey(adjList, n1)
       adjList[n1] = Tuple{String, Bool, Int}[]
@@ -4163,7 +4163,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
 
   #= ===== Step 3: Select representative per component ===== =#
   #= Build alias resolution map and alias entries =#
-  local aliasMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
+  local aliasMap = OrderedDict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
   local aliasEntries = AliasEntry[]
   local aliasEqIndices = OrderedSet{Int}()
   #= Pending attribute lifts: rep name -> merged Option{VariableAttributes}.
@@ -6490,7 +6490,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   local irreducibleSet = OrderedSet{String}(simCode.irreducibleVariables)
   local sharedVarSet   = OrderedSet{String}(simCode.sharedVariables)
 
-  local rhsGroups = Dict{String, Vector{Tuple{String, Int, DAE.ComponentRef, DAE.Type, Bool}}}()
+  local rhsGroups = OrderedDict{String, Vector{Tuple{String, Int, DAE.ComponentRef, DAE.Type, Bool}}}()
   for (i, eq) in enumerate(resEqs)
     local pair = _detectVarMinusExpr(eq.exp, ht)
     pair === nothing && continue
@@ -6501,7 +6501,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
     push!(rhsGroups[key], (n, i, cr, ty, neg))
   end
 
-  local aliasMap = Dict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
+  local aliasMap = OrderedDict{String, Tuple{String, Bool, DAE.ComponentRef, DAE.Type}}()
   local aliasEntries = AliasEntry[]
   local removeEqs = OrderedSet{Int}()
   local elimVarOrder = String[]
