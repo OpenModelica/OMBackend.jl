@@ -3912,6 +3912,10 @@ function createParameterAssignmentsMTK(parameters::Vector,
   local parameterEquations::Vector = Expr[]
   local ht = simCode.stringToSimVarHT
   for param in parameters
+    #= A tunable parameter stays the symbolic @parameters variable; a
+       parameter bound to it (`rate = 3 * k`) then lowers to a symbolic
+       expression, so changing k changes rate too. =#
+    SimulationCode.isTunableParameter(param) && continue
     (index, simVar) = ht[param]
     local simVarType = simVar.varKind
     bindExp = @match simVarType begin
@@ -3951,6 +3955,7 @@ lossTable_fileName = "NoName"
 function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local exprs::Vector{Expr} = Expr[]
   for varName in keys(simCode.stringToSimVarHT)
+    SimulationCode.isTunableParameter(varName) && continue
     (idx, simVar) = simCode.stringToSimVarHT[varName]
     local bindExp = @match simVar.varKind begin
       SimulationCode.STRING(bindExp = SOME(e)) => e
@@ -4564,6 +4569,12 @@ function decomposeParametersDeclaration(parVariablesSym; chunkSize = CHUNK_SIZE[
     push!(constructorNames, fName)
   end
   local paramNameQuotes = [QuoteNode(s) for s in parVariablesSym]
+  #= A tunable parameter is not assigned its value in the model function
+     (createParameterAssignmentsMTK skips it), so the equations refer to the
+     symbolic parameter by name. Bind it as a local from `parameters`: the
+     global made by the `eval` below is too new for this function's world. =#
+  local tunableBinds = Expr[:($(s) = parameters[$(i)]) for (i, s) in enumerate(parVariablesSym)
+                            if SimulationCode.isTunableParameter(string(s))]
   return quote
     $(exprs...)
     local _allParamChunks = Any[]
@@ -4577,6 +4588,7 @@ function decomposeParametersDeclaration(parVariablesSym; chunkSize = CHUNK_SIZE[
       push!(_paramBindBlock.args, :($name = $p))
     end
     eval(_paramBindBlock)
+    $(tunableBinds...)
   end
 end
 

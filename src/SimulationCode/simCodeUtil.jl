@@ -5027,6 +5027,9 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
      symbol -> UndefVarError at module eval. Mirrors the sibling passes
      dropObservationOnlyVariables (4391) and eliminateDeadParameters (4500). =#
   _collectFunctionBodyCrefs!(protectedNames, simCode.functions)
+  #= Tunable parameters stay (withTunableParameters); parameters whose bindings
+     depend on them do not evaluate below, so they stay too. =#
+  union!(protectedNames, TUNABLE_PARAMETERS[])
 
   #= Step 1: identify eliminable parameters via _tryEvalNumeric. =#
   for (name, htEntry) in ht

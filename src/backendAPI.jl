@@ -1007,6 +1007,10 @@ function simulateModel(modelName::String;
                        kwargs...)
   modelName = canonicalName(modelName)
   local modelCode::Expr
+  #= `parameters` (tunable parameter values for this run) is handled by the
+     IMTK path only; elsewhere it would reach `solve` as an unknown keyword. =#
+  haskey(kwargs, :parameters) && MODE != IMTK_MODE &&
+    error("simulateModel: `parameters` needs IMTK mode (the default), got $(MODE)")
   if MODE == MTK_MODE
     #= This does a redundant string conversion for now due to modeling toolkit being as is...=#
     try
@@ -1117,28 +1121,69 @@ function getMTKProblem(modelName::String;
 end
 
 """
-  Resimulates an already compiled model given a model that is already active in th environment
-  along with a set of parameters as key value pairs.
+    withTunableParameters(f, names)
+
+Run `f()` (a `translate`, or a `simulate` that compiles) with the parameters
+`names` kept as parameters of the generated model instead of being folded into
+its equations as constants, so the compiled model can be simulated again with
+other values of them. Parameters whose bindings depend on them are kept too.
+Names as in Modelica (`body.m`) or flattened (`body_m`).
+
+```julia
+OMBackend.withTunableParameters(["alpha", "beta"]) do
+  OM.translate("LotkaVolterra", "lv.mo")
+end
+```
+"""
+function withTunableParameters(f::Function, names)
+  local canon = Set{String}(canonicalName(String(n)) for n in names)
+  return Base.ScopedValues.with(f, TUNABLE_PARAMETERS => canon)
+end
+
+"""
+    isTunable(modelName, names) -> Bool
+
+Whether the compiled `modelName` (its cached build) has all `names` as
+parameters, so that `simulate(...; parameters)` can set them. False without a
+cached build, or after the model was compiled again with other tunable
+parameters.
+"""
+function isTunable(modelName::String, names)::Bool
+  local built = get(IMTKGen.BUILT, canonicalName(modelName), nothing)
+  built === nothing && return false
+  local prob = built[1]
+  return all(n -> Runtime.ModelingToolkit.is_parameter(prob, Symbol(canonicalName(string(n)))), names)
+end
+
+"""
+    pristineParameters(modelName) -> Vector or nothing
+
+The parameter vector the simulations of a compiled model start from. A
+simulation's solved problem (`sol.prob.p`) carries the vector as the event
+callbacks left it (if-condition switches flipped), so solving that problem
+again must start from this one. `nothing` without a cached build (IMTK mode
+caches it at translate time).
+"""
+function pristineParameters(modelName::String)
+  local p = get(IMTKGen.PRISTINE_P, canonicalName(modelName), nothing)
+  return p === nothing ? nothing : deepcopy(p)
+end
+
+"""
+    resimulateModel(modelName; solver, tspan, parameters = Dict(), kwargs...)
+
+Simulate an already compiled model again, without recompiling. `parameters`
+(name => value) sets parameters kept tunable at compile time
+(`withTunableParameters`); other keyword arguments go to the solver.
 """
 function resimulateModel(modelName::String;
                          solver = Rodas5(autodiff=false),
                          MODE = DEFAULT_BACKEND_MODE[],
                          tspan=(0.0, 1.0),
-                         parameters::Dict = Dict())
-  #=
-  Check if a compiled instance of the model already exists in the backend.
-  If that is the case we do not have to recompile it.
-  =#
-  try
-    modelName = canonicalName(modelName)
-    Base.invokelatest() do
-      local mod = getfield(OMBackend, Symbol(modelName))
-      mod.simulate(tspan, solver)
-    end
-  catch e
-    availModels = availableModels()
-    @error "The model $(modelName) is not compiled. Available models are: $(availModels)" exception=(e, catch_backtrace())
-  end
+                         parameters::AbstractDict = Dict(),
+                         kwargs...)
+  return simulateModel(modelName; MODE = MODE, tspan = tspan, solver = solver,
+                       (isempty(parameters) ? (;) : (; parameters = parameters))..., kwargs...)
 end
 
 "

@@ -147,8 +147,12 @@ patch it into a rebuilt tuple, and call the model module's `simulateFromBuild`.
 That delegate is the exact same post-build pipeline MTK-mode runs, so behavior
 matches MTK except for skipping the rerun of `<name>Model(tspan)`. Falls back to
 the module's own `simulate` on cache miss / unexpected failure.
+
+`parameters` (name => value pairs) sets tunable parameters
+(`withTunableParameters`) for this run, on top of the pristine values; it
+needs the cached build and never falls back.
 """
-function simulateIMTK(modelName::String, tspan, solver; kwargs...)
+function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kwargs...)
   local OMB = _OMBackend()
   local cname = OMB.canonicalName(modelName)
   #= Structural/sub-model/flat-model iMTK builds skip _buildAndCache and are not
@@ -164,6 +168,13 @@ function simulateIMTK(modelName::String, tspan, solver; kwargs...)
          have mutated the shared vector (ifCond toggles persist otherwise). =#
       if haskey(PRISTINE_P, cname)
         prob = OMB.Runtime.ModelingToolkit.SciMLBase.remake(prob; p = deepcopy(PRISTINE_P[cname]))
+      end
+      if parameters !== nothing
+        prob = _setParameterValues(prob, parameters, modelName)
+        #= A DAE's consistent initial state depends on the parameters: solve it
+           again for these values (the build solved it for the compiled ones). =#
+        local reinit = get(OMB.CodeGeneration.DAE_REINIT, OMB.Runtime.ModelingToolkit.SciMLBase.unwrapped_f(prob.f.f), nothing)
+        reinit === nothing || (prob = OMB.Runtime.ModelingToolkit.SciMLBase.remake(prob; u0 = reinit(prob.p)))
       end
       #= Route through `mod.simulate(...; cached_build = rebuilt)` using the same
          closure form as the MTK path, so the body executes inside the model module
@@ -187,14 +198,33 @@ function simulateIMTK(modelName::String, tspan, solver; kwargs...)
         getfield(OMB, Symbol(cname)).simulate(tspan, solver; cached_build = rebuilt, kwargs...)
       end
     catch e
-      #= A user interrupt must propagate, not trigger a retry of the same solve. =#
-      e isa InterruptException && rethrow()
+      #= A user interrupt must propagate, not trigger a retry of the same solve;
+         the fallback cannot apply `parameters`. =#
+      (e isa InterruptException || parameters !== nothing) && rethrow()
       @warn "[IMTK] cached-build solve failed; falling back to module simulate" model = modelName exception = e
     end
   end
+  parameters === nothing ||
+    error("simulating $(modelName) with `parameters` needs its cached build (translate it in IMTK mode)")
   return Base.invokelatest() do
     getfield(OMB, Symbol(cname)).simulate(tspan, solver; kwargs...)
   end
+end
+
+#= A copy of `prob` with the tunable parameters `parameters` (name => value;
+   Modelica or flattened names) set. =#
+function _setParameterValues(prob, parameters, modelName)
+  local OMB = _OMBackend()
+  local MTK = OMB.Runtime.ModelingToolkit
+  local out = MTK.SciMLBase.remake(prob; p = copy(prob.p))
+  for (name, value) in parameters
+    local sym = Symbol(OMB.canonicalName(string(name)))
+    MTK.is_parameter(out, sym) ||
+      throw(ArgumentError("$(name) is not a parameter of the compiled $(modelName); compile it inside " *
+                          "OMBackend.withTunableParameters to change it without recompiling"))
+    MTK.setp(out, sym)(out, value)
+  end
+  return out
 end
 
 end #= module IMTKGen =#

@@ -119,7 +119,7 @@ function _completeUnderdeterminedInit!(u0, rhsFunc, p_vec, eq_idx, var_idx, algC
   return changed
 end
 
-function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[])
+function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false)
   local n = length(u0)
   local nMM = size(mm, 1)
   local nSafe = min(n, nMM)
@@ -176,6 +176,22 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
       targets=eq_target, tol=tol, extraRes=extra_residuals, maxiter=maxiter,
       restoreIdx=vcat(pinned, discrete_pinned))
     snapEntryNoise!()
+  end
+  #= `warm`: u0 is a consistent state for nearby parameter values (a
+     re-initialization for other tunable parameter values, DAE_REINIT). A
+     plain min-norm Newton over the free variables converges from there in a
+     few steps; the cold-start phases below would first spend hundreds of
+     iterations on sets that cannot converge (algebraic-only, anchored). =#
+  if warm
+    local warmVars = [i for i in 1:n if !(i in pinnedSet) && !(i in discretePinnedSet)]
+    local u0_warm = copy(u0)
+    if !isempty(warmVars) && _solveDAEPhase!(u0_warm, rhsFunc, p_vec, eq_idx, warmVars;
+                                             targets=eq_target, maxiter=20, tol=tol,
+                                             extraRes=extra_residuals, phaseLabel="warm")
+      copyto!(u0, u0_warm)
+      completeInit!(warmVars)
+      return u0
+    end
   end
   local alg_unpinned = [i for i in alg_idx if !(i in pinnedSet)]
   local u0_phase1 = copy(u0)

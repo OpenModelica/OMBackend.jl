@@ -98,6 +98,10 @@ default to 0.0, which may cause InitialFailure for DAE systems.
 
 Returns an `ODEProblem` ready for `solve()`.
 """
+#= Re-initialization per DAE problem (keyed by its generated RHS function):
+   parameter vector -> consistent initial state. See buildDirectRHSProblem. =#
+const DAE_REINIT = IdDict{Any, Function}()
+
 function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
                                allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
                                preMem=nothing)
@@ -255,13 +259,17 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                                      resolvedParams=resolvedParams,
                                                      excludeNames=discreteNames)
     local extraResiduals = nothing
-    if symInit !== nothing
-      local (gF, dIdxs, mmS) = symInit
-      local candidate = (du, u) -> begin
-        local g = gF(u, p_vec, 0.0)
+    #= The residual rows for parameter values `pv` (a re-initialization for
+       other tunable parameter values evaluates them at those). =#
+    local residualsAt = symInit === nothing ? nothing : let (gF, dIdxs, mmS) = symInit
+      pv -> (du, u) -> begin
+        local g = gF(u, pv, 0.0)
         Float64[dIdxs[i] == 0 ? Float64(g[i]) : du[dIdxs[i]] - mmS[i] * Float64(g[i])
                 for i in 1:length(dIdxs)]
       end
+    end
+    if symInit !== nothing
+      local candidate = residualsAt(p_vec)
       local probeOk = try
         local duProbe = similar(u0)
         rhsFunc(duProbe, u0, p_vec, 0.0)
@@ -283,6 +291,19 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                   extra_residuals=extraResiduals,
                                   discrete_pinned=discretePinnedIdx)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
+    #= The same initialization for other parameter values (tunable parameters,
+       OMBackend.withTunableParameters): a run with changed parameters needs
+       the consistent initial state for them, not the one solved here. It
+       starts from this one, which is close for nearby values. =#
+    local useExtra = extraResiduals !== nothing
+    local u0Solved = copy(u0)
+    DAE_REINIT[rhsFunc] = pv -> _solveDAEInitialization!(copy(u0Solved), rhsFunc, pv, mm;
+                                                         pinned=pinnedIdx,
+                                                         derivative_targets=derivativeInitTargets,
+                                                         eqLabels=eqLabels,
+                                                         extra_residuals=useExtra ? residualsAt(pv) : nothing,
+                                                         discrete_pinned=discretePinnedIdx,
+                                                         warm=true)
   end
 
   #= After initialization pre(x) equals the committed x(t0); refresh the

@@ -1095,6 +1095,8 @@ function _boundParameterExpression(exp::DAE.Exp, simCode::SIM_CODE, seen::Ordere
   extracted === nothing && return nothing
   local name = extracted[1]
   name in seen && return nothing
+  #= A tunable parameter has no compile-time value. =#
+  isTunableParameter(name) && return nothing
   local entry = get(simCode.stringToSimVarHT, name, nothing)
   entry === nothing && return nothing
   local (_, simVar) = entry

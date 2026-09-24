@@ -9,6 +9,7 @@ using DataStructures: OrderedSet
 
 import ..@BACKEND_LOGGING
 import ..@BACKEND_PERFLOG
+import ..isTunableParameter
 
 include("BDAE.jl")
 include("BackendEquation.jl")

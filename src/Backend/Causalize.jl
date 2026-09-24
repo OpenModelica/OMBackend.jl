@@ -42,6 +42,7 @@ import ..BDAEUtil
 import ..BackendEquation
 import ..@BACKEND_LOGGING
 import ..FrontendUtil.Util
+import ..isTunableParameter
 import DAE
 import OMBackend
 
@@ -1348,6 +1349,7 @@ end
   Resolve CREF bindings to their actual values.
   When a variable's binding is a CREF pointing to another variable,
   replace it with that variable's binding. Handles chains by iterating until stable.
+  A binding to a tunable parameter (withTunableParameters) stays a reference.
 """
 function resolveCrefBindings!(orderedVars::Vector{BDAE.VAR})
   local bindingMap = Dict{String, DAE.Exp}()
@@ -1371,7 +1373,7 @@ function resolveCrefBindings!(orderedVars::Vector{BDAE.VAR})
       @match bindExp begin
         SOME(DAE.CREF(cr, _)) => begin
           (targetName, _, _) = crefToFlatName(cr)
-          local targetBinding = get(bindingMap, targetName, nothing)
+          local targetBinding = isTunableParameter(targetName) ? nothing : get(bindingMap, targetName, nothing)
           if targetBinding !== nothing
             if !(targetBinding isa DAE.CREF)
               orderedVars[i].bindExp = SOME(targetBinding)

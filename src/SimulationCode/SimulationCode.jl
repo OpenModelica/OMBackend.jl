@@ -55,6 +55,8 @@ import ..@BACKEND_LOGGING
 import ..BackendUtil.GraphAlgorithms
 import ..FrontendUtil.Util
 
+import ..OMBackend: TUNABLE_PARAMETERS, isTunableParameter
+
 include("simCodeData.jl")
 include("simCodeTraverse.jl")
 include("simCodeUtil.jl")
