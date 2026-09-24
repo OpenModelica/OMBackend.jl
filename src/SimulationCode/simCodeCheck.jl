@@ -237,7 +237,9 @@ Base.@nospecializeinfer function _walkExpChildren(visit::Function, @nospecialize
     DAE.RELATION(l, _, r, _, _) => begin visit(l); visit(r) end
     DAE.IFEXP(c, t, e)          => begin visit(c); visit(t); visit(e) end
     DAE.CAST(_, e)              => visit(e)
-    DAE.ASUB(e, subs)           => begin visit(e); for s in subs; visit(s) end end
+    #= ASUB subscripts are DAE.Subscript (INDEX/SLICE/WHOLE_NONEXP wrap an
+       expression; WHOLEDIM has none), not expressions. =#
+    DAE.ASUB(e, subs)           => begin visit(e); for s in subs; s isa DAE.WHOLEDIM || visit(s.exp) end end
     DAE.TSUB(e, _, _)           => visit(e)
     DAE.RSUB(e, _, _, _)        => visit(e)
     DAE.ARRAY(_, _, es)         => for e in es; visit(e) end

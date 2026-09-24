@@ -7288,7 +7288,9 @@ Base.@nospecializeinfer function _containsDerCallDAE(@nospecialize(exp))::Bool
     DAE.LBINARY(exp1 = e1, exp2 = e2) => _containsDerCallDAE(e1) || _containsDerCallDAE(e2)
     DAE.IFEXP(expCond = c, expThen = t, expElse = e) => _containsDerCallDAE(c) || _containsDerCallDAE(t) || _containsDerCallDAE(e)
     DAE.ARRAY(array = lst) => any(_containsDerCallDAE, lst)
-    DAE.ASUB(exp = e, sub = subs) => _containsDerCallDAE(e) || any(_containsDerCallDAE, subs)
+    #= ASUB subscripts are DAE.Subscript; WHOLEDIM has no expression. =#
+    DAE.ASUB(exp = e, sub = subs) => _containsDerCallDAE(e) ||
+      any(s -> !(s isa DAE.WHOLEDIM) && _containsDerCallDAE(s.exp), subs)
     DAE.RELATION(exp1 = e1, exp2 = e2) => _containsDerCallDAE(e1) || _containsDerCallDAE(e2)
     DAE.CAST(exp = e) => _containsDerCallDAE(e)
     DAE.TSUB(exp = e) => _containsDerCallDAE(e)
