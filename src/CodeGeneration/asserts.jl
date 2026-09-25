@@ -73,7 +73,7 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
                                          initialize = function (c, u, t, integrator)
                                            fill!(violated, false)
                                            check!(integrator, true)
-                                           DiffEqBase.u_modified!(integrator, false)
+                                           nothing
                                          end,
                                          save_positions = (false, false))
   return DiffEqBase.CallbackSet(callbacks, cb)

@@ -2065,6 +2065,82 @@ function condClosedAtBoundary(cond)::Bool
   end
 end
 
+#= Relation semantics for events (MLS 8.5, OpenModelica's relationhysteresis):
+   a relation keeps its value during integration and changes only at events;
+   its crossing function has a hysteresis relative to that value, so it is
+   never zero after initialization or after an event (FMI 3.0 3.1.1). =#
+
+#= The relations of a condition that generate events (not inside noEvent). =#
+Base.@nospecializeinfer function _eventRelations(@nospecialize(cond))::Vector{DAE.Exp}
+  cond isa SimulationCode.Exp && (cond = SimulationCode.toDAEExp(cond))
+  local out = DAE.Exp[]
+  local visit = function (e, arg)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("noEvent"), _, _) => return (e, false, arg)
+      DAE.RELATION(__) => begin
+        push!(out, e)
+        return (e, false, arg)
+      end
+      _ => return (e, true, arg)
+    end
+  end
+  Util.traverseExpTopDown(cond, visit, nothing)
+  return out
+end
+
+#= The scale of a condition's operands, `1 + max(|a|, |b|, ...)`, for the
+   hysteresis width `H * scale` (OpenModelica: max(|a|,|b|) + nominal). =#
+function _conditionScaleExpr(@nospecialize(cond), simCode)
+  local terms = Any[]
+  for rel in _eventRelations(cond)
+    push!(terms, :(abs($(expToJuliaExpMTK(rel.exp1, simCode)))))
+    push!(terms, :(abs($(expToJuliaExpMTK(rel.exp2, simCode)))))
+  end
+  isempty(terms) && return 1.0
+  return length(terms) == 1 ? :(1.0 + $(terms[1])) : :(1.0 + max($(terms...)))
+end
+
+#= The literal value of a condition (as at initialization), as a Julia Bool
+   expression over `observed.zcK`: each relation from its own crossing
+   function, `<`/`>` strict and `<=`/`>=` closed, and/or/not as such.
+   `obsKws` collects the observed crossing functions. Nothing if the
+   condition has a shape this does not cover. =#
+Base.@nospecializeinfer function _literalConditionExpr(@nospecialize(cond), simCode, obsKws::Vector{Expr})
+  cond isa SimulationCode.Exp && (cond = SimulationCode.toDAEExp(cond))
+  local rec(@nospecialize e) = _literalConditionExpr(e, simCode, obsKws)
+  local observe = function (zc)
+    local name = Symbol("zc", length(obsKws) + 1)
+    push!(obsKws, Expr(:kw, name, zc))
+    return :(observed.$(name))
+  end
+  return @match cond begin
+    DAE.RELATION(_, op, _) => begin
+      local zc = observe(transformToMTKContinuousCondition(cond, simCode))
+      (op isa DAE.LESSEQ || op isa DAE.GREATEREQ) ? :($(zc) <= 0) :
+        (op isa DAE.LESS || op isa DAE.GREATER) ? :($(zc) < 0) : nothing
+    end
+    DAE.LBINARY(e1, DAE.AND(__), e2) => begin
+      local l = rec(e1); local r = rec(e2)
+      (l === nothing || r === nothing) ? nothing : :($(l) && $(r))
+    end
+    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
+      local l = rec(e1); local r = rec(e2)
+      (l === nothing || r === nothing) ? nothing : :($(l) || $(r))
+    end
+    DAE.LUNARY(DAE.NOT(__), e) => begin
+      local inner = rec(e)
+      inner === nothing ? nothing : :(!$(inner))
+    end
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local args = collect(lst)
+      length(args) == 1 ? rec(args[1]) : nothing
+    end
+    DAE.CREF(__) => :($(observe(expToJuliaExpMTK(cond, simCode))) > 0.5)
+    DAE.BCONST(b) => b
+    _ => nothing
+  end
+end
+
 #= Symbol -> value map at t0: parameter values plus state/algebraic start
    attributes (default 0.0), overridden by early init-algorithm results.
    `explicit` collects the symbols whose value came from an actual source
@@ -2830,7 +2906,9 @@ function generateIfExpressions(branches,
      gate directly on the condition value: its own update event localises the step,
      so no `ifCond` relay parameter or continuous callback is needed (and the relay's
      start-attribute initial value, which can pick the wrong branch, is avoided). =#
-  local cond = if _allBranchConditionsDiscrete(branches, simCode)
+  local cond = if _ifConditionAllDiscreteOrParameter(branch.condition, simCode)
+    #= Per branch: an elseif chain may mix a discrete condition (changed by a
+       when, never a crossing of its own) with relations. =#
     :( $(expToJuliaExpMTK(SimulationCode.toDAEExp(branch.condition), simCode)) > 0.5 )
   else
     #= ifCond variables are discrete parameters (not ODE unknowns), so the solver

@@ -492,7 +492,24 @@ struct IfEquationComponent
      start-value map, merged as soft guesses so guarded denominators do not
      start at 0/0 in the DAE init. =#
   relayGuesses         :: Vector{Expr}
+  #= (ifCond, crossing function, scale) of each branch whose event has a
+     hysteresis: re-evaluated after every event (withRelationRefresh). =#
+  relations            :: Vector{Tuple{Symbol, Any, Any}}
 end
+IfEquationComponent(events, conditionalEquations, conditionVariables, conditionNameAndIV, pureTimeEvents,
+                    relayGuesses) =
+  IfEquationComponent(events, conditionalEquations, conditionVariables, conditionNameAndIV, pureTimeEvents,
+                      relayGuesses, Tuple{Symbol, Any, Any}[])
+
+#= The hysteresis parameter H of the event crossing functions (set per solve
+   from its reltol, as OpenModelica's tolZC = 1e-4 * relTol). =#
+const ZC_HYSTERESIS = :_zcHysteresis
+const ZC_HYSTERESIS_DEFAULT = 1.0e-7   # reltol 1e-3, DifferentialEquations' default
+#= After a branch switch the equations change: the algebraic unknowns are
+   solved again at the event with the states kept (Modelica's event
+   iteration re-solves the system; NoInit left e.g. `y = if ... then 1 else 2`
+   at its old value until the end of the next step). =#
+const _BRANCH_EVENT_REINIT = :(OMBackend.OrdinaryDiffEq.BrownFullBasicInit())
 
 """
   Generates simulation code targeting modeling toolkit.
@@ -813,6 +830,8 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
         end
       end
       # Route DAE-native solvers (e.g. Sundials.IDA, DABDF2, DFBDF) through a residual-form DAEProblem rather than the ODEProblem with mass matrix.
+      OMBackend.CodeGeneration.setZCHysteresis!($(Symbol("$(MODEL_NAME)Model_problem")), $(QuoteNode(ZC_HYSTERESIS)),
+                                                get(kwargs, :reltol, 1.0e-3))
       local _problemForSolver = if _solver isa ModelingToolkit.SciMLBase.AbstractDAEAlgorithm
         OMBackend.CodeGeneration.ode_to_dae($(Symbol("$(MODEL_NAME)Model_problem")))
       else
@@ -870,7 +889,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       end
       #= Run `when terminal()` bodies once against the final solution (gated: emitted only if the model has a terminal event). =#
       $(createTerminalBodyRunner(simCode))
-      _sol
+      OMBackend.CodeGeneration.dropPreInitializationPoint!(_sol)
     end
     function simulate(tspan = (0.0, 1.0), solver = Rodas5(); cached_build = nothing, kwargs...)
       local built = cached_build === nothing ? $(Symbol("$(MODEL_NAME)Model"))(tspan) : cached_build
@@ -995,6 +1014,14 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     local numVal = initVal ? 1.0 : 0.0
     push!(ifCondParamDecls, Expr(:(=), sym, numVal))
     push!(ifCondParamPairs, :($(sym) => $(numVal)))
+  end
+  #= Branch events with a hysteresis share the parameter H (set per solve). =#
+  local IF_RELATIONS = collect(Iterators.flatten(c.relations for c in IF_EQUATION_COMPONENTS))
+  local ifCondParamNames = copy(ifConditionalVariables)
+  if !isempty(IF_RELATIONS)
+    push!(ifCondParamDecls, Expr(:(=), ZC_HYSTERESIS, ZC_HYSTERESIS_DEFAULT))
+    push!(ifCondParamPairs, :($(ZC_HYSTERESIS) => $(ZC_HYSTERESIS_DEFAULT)))
+    push!(ifCondParamNames, ZC_HYSTERESIS)
   end
   #= Phase G — collect the symbols MTK tearing must not eliminate
      (simCode-flagged irreducibles + ifEq_tmp LHS targets + fixed-start
@@ -1149,7 +1176,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       #= Declare ifCond variables as discrete time-dependent parameters.
          These are modified by SymbolicContinuousCallback affects and are NOT
          part of the ODE state vector, so the solver never perturbs them. =#
-      $(generateDiscreteIfCondDeclaration(ifCondParamDecls, ifConditionalVariables))
+      $(generateDiscreteIfCondDeclaration(ifCondParamDecls, ifCondParamNames))
       #=
         Only variables that are present in the equation system later should be a part of the variables in the MTK system.
         This means that certain algebraic variables should not be listed among the variables (These are the discrete variables).
@@ -1299,6 +1326,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
          strategy emitters for the full rationale. =#
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
       $(emitAssertCallback(simCode))
+      $(emitRelationRefresh(IF_RELATIONS))
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreducibleSyms)
     end
   end
@@ -2462,7 +2490,7 @@ function createIfEquation(stateVariables::Vector,
   local anyRelayCondBranch::Bool =
     any(b -> b.identifier != -1 && _conditionReferencesRelayTarget(b.condition, _rT0),
         ifEq.branches)
-  local _allDiscreteConds::Bool = MTK_CodeGenerationUtil._allBranchConditionsDiscrete(ifEq.branches, simCode)
+  local relations = Tuple{Symbol, Any, Any}[]
   for branch in ifEq.branches
     i += 1
     @match branch begin
@@ -2550,10 +2578,10 @@ function createIfEquation(stateVariables::Vector,
            values (which would form a circular init dependency). =#
         local zcLhs = _extractZeroCrossingLHS(mtkCond)
         local thisSym::Symbol = allIfCondSyms[i]
-        if _allDiscreteConds
-          #= Every branch condition is discrete or a parameter: the residuals gate
-             directly on the condition (generateIfExpressions), whose own update
-             event localises the step. No crossing function, no callback. =#
+        if MTK_CodeGenerationUtil._ifConditionAllDiscreteOrParameter(branch.condition, simCode)
+          #= A discrete or parameter condition: the residuals gate directly on it
+             (generateIfExpressions), whose own update event localises the step.
+             No crossing function, no callback. =#
           push!(ivConditions, ivCond)
         elseif _ifConditionIsPureTimeEvent(branch.condition, simCode)
           #= Deterministic time event: defer to model-level refresh callbacks built
@@ -2564,6 +2592,30 @@ function createIfEquation(stateVariables::Vector,
           push!(pureTimeEvents, (thisSym, zcLhs, mtkCond, numVal))
           push!(ivConditions, ivCond)
         else
+          #= The crossing function with a hysteresis relative to the branch's
+             buffered value (MLS 8.5; OpenModelica LessZC): a TRUE relation turns
+             FALSE when zc > eps, a FALSE one TRUE when zc < -eps, eps = H*scale.
+             g is never zero after initialization or an event, so a function
+             starting at its threshold (a dead centre) or two coinciding roots
+             cannot be missed or chatter. =#
+          local scaleExpr = MTK_CodeGenerationUtil._conditionScaleExpr(branch.condition, simCode)
+          local hystCond = :((($(zcLhs)) + $(ZC_HYSTERESIS) * ($(scaleExpr)) * (1 - 2 * $(thisSym))) ~ 0)
+          push!(relations, (thisSym, zcLhs, scaleExpr))
+          #= The literal value at initialization, from the solved initial state
+             (the static value comes from start attributes). Not for conditions
+             on other lifted if-expressions: their values are not ready then. =#
+          local initAffect = nothing
+          if !_exprMentionsPrefix(zcLhs, "ifEq_tmp")
+            local litObs = Expr[]
+            local lit = MTK_CodeGenerationUtil._literalConditionExpr(branch.condition, simCode, litObs)
+            if lit !== nothing
+              local litObsNT = Expr(:tuple, Expr(:parameters, litObs...))
+              local litModNT = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, thisSym)))
+              local litRetNT = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :(($(lit)) ? 1.0 : 0.0))))
+              initAffect = :(ModelingToolkit.ImperativeAffect(((modified, observed, ctx, integrator) -> $(litRetNT)),
+                                                              $(litModNT); observed = $(litObsNT), skip_checks = true))
+            end
+          end
           local cond::Expr
           local _dupLiveZc::Bool = false
           if liveAffect !== nothing
@@ -2579,31 +2631,25 @@ function createIfEquation(stateVariables::Vector,
             #= Positional affect form, matching the pre-memory FSM events: the
                pair form does not commit an ImperativeAffect's writes. =#
             cond = :(ModelingToolkit.SymbolicContinuousCallback(
-              ($(mtkCond)),
+              ($(hystCond)),
               $(liveAffect);
               affect_neg = $(liveAffect),
+              initialize = $(liveAffect),
               rootfind = SciMLBase.RightRootFind,
               reinitializealg = SciMLBase.NoInit()
             ))
-          elseif _zcReferencesSolvableAlgebraic(zcLhs, simCode)
-            local initObservedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, :zc, zcLhs)))
-            local initModifiedNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, thisSym)))
-            local _zcTest = _closedB ? :(observed.zc <= 0) : :(observed.zc < 0)
-            local initRetNT::Expr = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :($(_zcTest) ? 1.0 : 0.0))))
-            local initFExpr::Expr = :((modified, observed, ctx, integrator) -> $initRetNT)
-            local initAffect::Expr = :(ModelingToolkit.ImperativeAffect($(initFExpr), $(initModifiedNT);
-                                                                  observed = $(initObservedNT), skip_checks = true))
+          elseif initAffect !== nothing
             cond = :(ModelingToolkit.SymbolicContinuousCallback(
-              ($(mtkCond)) => $(affectTuple);
+              ($(hystCond)) => $(affectTuple);
               affect_neg = $(affectNegTuple),
               initialize = $(initAffect),
-              reinitializealg = SciMLBase.NoInit()
+              reinitializealg = $(_BRANCH_EVENT_REINIT)
             ))
           else
             cond = :(ModelingToolkit.SymbolicContinuousCallback(
-              ($(mtkCond)) => $(affectTuple);
+              ($(hystCond)) => $(affectTuple);
               affect_neg = $(affectNegTuple),
-              reinitializealg = SciMLBase.NoInit()
+              reinitializealg = $(_BRANCH_EVENT_REINIT)
             ))
           end
           _dupLiveZc || push!(conditions, cond)
@@ -2682,7 +2728,7 @@ function createIfEquation(stateVariables::Vector,
   end
   return IfEquationComponent(conditions, ifExpressions,
                              conditionVariables, conditionVariableNames, pureTimeEvents,
-                             relayGuesses)
+                             relayGuesses, relations)
 end
 
 #= Identify a synthesised discrete-Boolean when (from
@@ -3646,6 +3692,16 @@ function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
   return events
 end
 
+#= The event iteration over the branch relations with a hysteresis
+   (relationRefresh.jl): after any event, every relation is evaluated again
+   with the hysteresis rule. =#
+function emitRelationRefresh(relations)::Expr
+  isempty(relations) && return Expr(:block)
+  local entries = [:(($(QuoteNode(sym)), $(zc), $(scale))) for (sym, zc, scale) in relations]
+  return :(callbacks = OMBackend.CodeGeneration.withRelationRefresh(callbacks, problem,
+                                                                     $(QuoteNode(ZC_HYSTERESIS)), [$(entries...)]))
+end
+
 #= The asserts of equation sections (simCode.asserts) as one callback that
    checks them after initialization and after each accepted step (asserts.jl).
    Conditions and messages are lowered like event affects: every variable is
@@ -3695,6 +3751,9 @@ Base.@nospecializeinfer function _assertMessageExpr(@nospecialize(msg::DAE.Exp),
     string(msg)
   end
 end
+
+_exprMentionsPrefix(@nospecialize(e), prefix::String) =
+  (e isa Symbol && startswith(string(e), prefix)) || (e isa Expr && any(a -> _exprMentionsPrefix(a, prefix), e.args))
 
 _exprMentions(@nospecialize(e), s::Symbol) = e === s || (e isa Expr && any(a -> _exprMentions(a, s), e.args))
 

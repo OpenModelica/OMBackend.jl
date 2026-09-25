@@ -78,6 +78,7 @@ using .MTK_CodeGenerationUtil
 include("./structuralCallbacks.jl")
 include("./DirectRHSGeneration.jl")
 include("./asserts.jl")
+include("./relationRefresh.jl")
 include("./MTK_CodeGeneration.jl")
 include("./DiscreteDummyDemotion.jl")
 
