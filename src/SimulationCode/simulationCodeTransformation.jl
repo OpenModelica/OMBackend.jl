@@ -958,6 +958,12 @@ function _inlineParamsInExp(exp::DAE.Exp, ht)::DAE.Exp
   function visit(e, acc)
     if Util.isCref(e)
       local key = string(e)
+      #= Initial algorithms run when the generated module is loaded: a tunable
+         parameter read here would keep its compiled value in every simulation. =#
+      isTunableParameter(key) &&
+        throw(ArgumentError("tunable parameter $(key) is read in an initial algorithm, which is evaluated " *
+                            "when the model is compiled, so it would keep its compiled value; leave it out of " *
+                            "withTunableParameters"))
       local entry = get(ht, key, nothing)
       if entry !== nothing
         local sv = last(entry)

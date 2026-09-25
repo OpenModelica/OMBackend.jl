@@ -33,6 +33,20 @@ const PRISTINE_P      = Dict{String, Any}()
 #= Debug hook: when OMJL_STASH_MODELCODE is set, stash the generated model Expr
    and skip Core.eval. Lets a caller inspect a model that OOMs at eval/simplify. =#
 const LAST_MODELCODE  = Ref{Any}(nothing)
+#= The tunable parameters (canonical names, `TUNABLE_PARAMETERS` at translate
+   time) each cached build was compiled with: only these can be set per run.
+   Being a parameter of the problem is not enough: a parameter referenced by a
+   start attribute stays one, but its value is compiled into the equations. =#
+const TUNABLE_SETS    = Dict{String, Set{String}}()
+
+#= Forget a model's cached build (a failed or skipped build, a translate in
+   another mode): an older build must not answer for the current one. =#
+function forgetBuild(cname::String)
+  for cache in (BUILT, BUILT_HASH, REDUCED_SYSTEMS, PRISTINE_P, TUNABLE_SETS)
+    delete!(cache, cname)
+  end
+  return nothing
+end
 
 @inline _OMBackend() = parentmodule(CodeGeneration)
 
@@ -44,6 +58,7 @@ Build the module via `generateMTKCode`, then construct the System and run
 """
 function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
   local (modelName, modelCode) = CodeGeneration.generateMTKCode(simCode)
+  local cname = _OMBackend().canonicalName(modelName)
   #= Only the standard PROGRAM_GENERATION path emits `simulateFromBuild` and
      returns the 9-tuple shape iMTK's cache assumes. Structural transitions,
      sub-models, and the flat-model path use MODEL_GENERATION's simpler
@@ -56,8 +71,10 @@ function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
   elseif !SimulationCode.hasStructuralTransitions(simCode) &&
          !SimulationCode.hasSubModels(simCode) &&
          !SimulationCode.hasFlatModel(simCode)
+    TUNABLE_SETS[cname] = copy(_OMBackend().TUNABLE_PARAMETERS[])
     _buildAndCache(modelName, modelCode)
   else
+    forgetBuild(cname)
     @info "[IMTK GEN] structural / sub-model / flat-model path; build-cache skipped (iMTK delegates to MTK simulate)" model = modelName
   end
   return (modelName, modelCode)
@@ -85,6 +102,7 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
   try
     if get(ENV, "OMJL_STASH_MODELCODE", "") != ""
       LAST_MODELCODE[] = modelCode
+      forgetBuild(cname)
       @info "[IMTK GEN] modelCode stashed; skipping Core.eval (OMJL_STASH_MODELCODE)" model = modelName
       return
     end
@@ -113,6 +131,9 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
     @info "[IMTK GEN] structural_simplify ran in backend; build cached" model = modelName
     DUMP_ENABLED[] && _dumpReduced(OMB, modelName, cname)
   catch e
+    #= No stale build: a previous build of this model (other tunable
+       parameters, an older version of it) must not answer for this one. =#
+    forgetBuild(cname)
     @warn "[IMTK GEN] in-backend build / structural_simplify failed" model = modelName exception = e
   end
   return nothing
@@ -212,14 +233,16 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
 end
 
 #= A copy of `prob` with the tunable parameters `parameters` (name => value;
-   Modelica or flattened names) set. =#
+   Modelica or flattened names, array elements as `A[2][1]` or `A[2,1]`) set. =#
 function _setParameterValues(prob, parameters, modelName)
   local OMB = _OMBackend()
   local MTK = OMB.Runtime.ModelingToolkit
   local out = MTK.SciMLBase.remake(prob; p = copy(prob.p))
+  local tunable = get(TUNABLE_SETS, OMB.canonicalName(modelName), Set{String}())
   for (name, value) in parameters
-    local sym = Symbol(OMB.canonicalName(string(name)))
-    MTK.is_parameter(out, sym) ||
+    local cn = OMB.canonicalName(OMB._elementSubscripts(string(name)))
+    local sym = Symbol(cn)
+    (OMB.isTunableParameter(cn, tunable) && MTK.is_parameter(out, sym)) ||
       throw(ArgumentError("$(name) is not a parameter of the compiled $(modelName); compile it inside " *
                           "OMBackend.withTunableParameters to change it without recompiling"))
     MTK.setp(out, sym)(out, value)

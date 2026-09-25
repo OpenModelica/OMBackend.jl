@@ -798,6 +798,8 @@ function generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)
   LAST_SIM_CODE[] = simCode
   #= Target code =#
   (modelName::String, modelCode::Expr) = CodeGeneration.generateMTKCode(simCode)
+  #= An IMTK build of this model from an earlier translate is not this one. =#
+  IMTKGen.forgetBuild(canonicalName(modelName))
   local codeHash = hash(modelCode)
   @info "[MTK GEN] generated target code" model=modelName codeHash=codeHash
   if haskey(COMPILED_MODELS_MTK, modelName)
@@ -1042,13 +1044,11 @@ function simulateModel(modelName::String;
     end
   elseif MODE == IMTK_MODE
     #= overwriteCache forces a fresh build: bypass the codeHash reuse check so the
-       cached problem is rebuilt (not just remade) before simulate. =#
+       cached problem is rebuilt (not just remade) before simulate. A failed
+       rebuild warns and forgets the cached build; simulateIMTK then falls back
+       to the module's own simulate. =#
     if overwriteCache
-      try
-        IMTKGen._buildAndCache(modelName, getCompiledModel(modelName); overwriteCache = true)
-      catch err
-        @warn "[IMTK] overwriteCache rebuild failed; using existing cached build" model = modelName exception = err
-      end
+      IMTKGen._buildAndCache(modelName, getCompiledModel(modelName); overwriteCache = true)
     end
     #= Reuse the build cached in the backend at translate time (no
        structural_simplify re-run); simulateIMTK falls back to module simulate. =#
@@ -1127,7 +1127,13 @@ Run `f()` (a `translate`, or a `simulate` that compiles) with the parameters
 `names` kept as parameters of the generated model instead of being folded into
 its equations as constants, so the compiled model can be simulated again with
 other values of them. Parameters whose bindings depend on them are kept too.
-Names as in Modelica (`body.m`) or flattened (`body_m`).
+Names as in Modelica (`body.m`) or flattened (`body_m`). An array parameter
+(`nn.W1`, also a record field `r.T` or inside an array of components
+`gs[1].g`) is kept element by element, unused elements included; its
+elements are set one by one (`nn.W1[2][1]`), and uses of the whole array
+(e.g. a function argument, which the frontend expands) follow them. A tunable
+parameter read in an initial algorithm (evaluated at compile time) is an
+error.
 
 ```julia
 OMBackend.withTunableParameters(["alpha", "beta"]) do
@@ -1136,23 +1142,42 @@ end
 ```
 """
 function withTunableParameters(f::Function, names)
-  local canon = Set{String}(canonicalName(String(n)) for n in names)
+  local canon = Set{String}(canonicalName(_elementSubscripts(String(n))) for n in names)
   return Base.ScopedValues.with(f, TUNABLE_PARAMETERS => canon)
 end
 
 """
     isTunable(modelName, names) -> Bool
 
-Whether the compiled `modelName` (its cached build) has all `names` as
-parameters, so that `simulate(...; parameters)` can set them. False without a
-cached build, or after the model was compiled again with other tunable
-parameters.
+Whether the compiled `modelName` (its cached build) was compiled with all
+`names` tunable (`withTunableParameters`; an array as a whole) and has them
+as parameters, so that `simulate(...; parameters)` can set them. False
+without a cached build, or after the model was compiled again with other
+tunable parameters.
 """
 function isTunable(modelName::String, names)::Bool
   local built = get(IMTKGen.BUILT, canonicalName(modelName), nothing)
   built === nothing && return false
   local prob = built[1]
-  return all(n -> Runtime.ModelingToolkit.is_parameter(prob, Symbol(canonicalName(string(n)))), names)
+  local tunable = get(IMTKGen.TUNABLE_SETS, canonicalName(modelName), Set{String}())
+  local isp = s -> Runtime.ModelingToolkit.is_parameter(prob, Symbol(s))
+  #= An array is a parameter through its elements (`nn_W1[1][1]`, any rank). =#
+  return all(names) do n
+    local s = canonicalName(_elementSubscripts(string(n)))
+    isTunableParameter(s, tunable) && (isp(s) || any(d -> isp(s * "[1]"^d), 1:8))
+  end
+end
+
+"""
+    eventCallbacks(modelName) -> callbacks or nothing
+
+The event callbacks of a compiled model's cached build (IMTK mode), as the
+second element of `getMTKProblem`'s result, without building the problem
+again. `nothing` without a cached build.
+"""
+function eventCallbacks(modelName::String)
+  local built = get(IMTKGen.BUILT, canonicalName(modelName), nothing)
+  return built === nothing ? nothing : built[2]
 end
 
 """

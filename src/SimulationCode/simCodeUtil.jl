@@ -4897,10 +4897,12 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
   end
 
   #= Sweep: drop any PARAMETER entry (bound or unbound) that has zero
-     references on any of the live surfaces scanned above. =#
+     references on any of the live surfaces scanned above. Tunable ones stay:
+     an unused element of a tunable array (a network output the model does
+     not use) is still part of the array the user sets and reads back. =#
   local toDrop = String[]
   for (name, (_, sv)) in ht
-    name in referenced && continue
+    (name in referenced || isTunableParameter(name)) && continue
     local isParam = @match sv.varKind begin
       PARAMETER(__) => true
       _ => false
@@ -5029,7 +5031,12 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   _collectFunctionBodyCrefs!(protectedNames, simCode.functions)
   #= Tunable parameters stay (withTunableParameters); parameters whose bindings
      depend on them do not evaluate below, so they stay too. =#
-  union!(protectedNames, TUNABLE_PARAMETERS[])
+  if !isempty(TUNABLE_PARAMETERS[])
+    union!(protectedNames, TUNABLE_PARAMETERS[])
+    for k in keys(ht)
+      isTunableParameter(k) && push!(protectedNames, k)
+    end
+  end
 
   #= Step 1: identify eliminable parameters via _tryEvalNumeric. =#
   for (name, htEntry) in ht
