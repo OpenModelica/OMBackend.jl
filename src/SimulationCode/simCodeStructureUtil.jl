@@ -139,7 +139,9 @@ Base.@nospecializeinfer function toOpKind(@nospecialize(op))::OpKind
     DAE.ADD(__) || DAE.ADD_ARR(__) || DAE.ADD_ARRAY_SCALAR(__) => OP_ADD
     DAE.SUB(__) || DAE.SUB_ARR(__) || DAE.SUB_SCALAR_ARRAY(__) => OP_SUB
     DAE.MUL(__) || DAE.MUL_ARR(__) || DAE.MUL_ARRAY_SCALAR(__) ||
-      DAE.MUL_SCALAR_PRODUCT(__) || DAE.MUL_MATRIX_PRODUCT(__) => OP_MUL
+      DAE.MUL_MATRIX_PRODUCT(__) => OP_MUL
+    #= Not scalarized when an operand is a vector-valued call. =#
+    DAE.MUL_SCALAR_PRODUCT(__) => OP_DOT
     DAE.DIV(__) || DAE.DIV_ARR(__) || DAE.DIV_ARRAY_SCALAR(__) ||
       DAE.DIV_SCALAR_ARRAY(__) => OP_DIV
     DAE.POW(__) || DAE.POW_ARR(__) || DAE.POW_ARR2(__) ||
@@ -183,6 +185,7 @@ Base.@nospecializeinfer function toDAEOperator(@nospecialize(k::OpKind), ty = DA
   elseif k === OP_GREATEREQ; DAE.GREATEREQ(DAE.T_BOOL_DEFAULT)
   elseif k === OP_EQUAL;    DAE.EQUAL(DAE.T_BOOL_DEFAULT)
   elseif k === OP_NEQUAL;   DAE.NEQUAL(DAE.T_BOOL_DEFAULT)
+  elseif k === OP_DOT;      DAE.MUL_SCALAR_PRODUCT(ty)
   else error("toDAEOperator: unhandled OpKind $k")
   end
 end

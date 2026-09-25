@@ -82,6 +82,10 @@ directly, so the operator-side type was redundant.
   OP_ADD; OP_SUB; OP_MUL; OP_DIV; OP_POW; OP_UMINUS
   OP_AND; OP_OR; OP_NOT
   OP_LESS; OP_LESSEQ; OP_GREATER; OP_GREATEREQ; OP_EQUAL; OP_NEQUAL
+  #= Scalar product of two vectors (Modelica `v1 * v2`) that the frontend
+     could not expand element by element, e.g. `e * Frames.resolve1(R, f)`
+     with a vector-valued call as an operand. =#
+  OP_DOT
 end
 
 """

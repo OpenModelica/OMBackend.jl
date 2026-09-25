@@ -846,6 +846,22 @@ function expandComplexEquations(dae::BDAE.BACKEND_DAE)
       end
     end
     system.orderedEqs = newEqs
+    #= Record equations among the initial equations too: a record-typed
+       parameter binding that becomes an initial equation (FixedRotation's
+       `R_rel_inv = Frames.from_T(transpose(R_rel.T), zeros(3))`) reached
+       SimCode unexpanded, which has no record equations. Array equations
+       stay; the initial-equation code generation handles them. =#
+    local newInitialEqs = BDAE.Equation[]
+    for eq in system.initialEqs
+      if eq isa BDAE.COMPLEX_EQUATION
+        local expanded = tryExpandRecordEquation(eq.left, eq.right, eq.source, eq.attr)
+        append!(newInitialEqs, expanded !== nothing ? expanded :
+                               expandSingleArrayEquation(eq.size, eq.left, eq.right, eq.source, eq.attr))
+      else
+        push!(newInitialEqs, eq)
+      end
+    end
+    system.initialEqs = newInitialEqs
   end
   return dae
 end

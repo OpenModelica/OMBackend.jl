@@ -1901,7 +1901,7 @@ function _binaryLinearity(exp::BINARY, varName::AbstractString)::Tuple{Bool, Boo
   local op = exp.op
   if op === OP_ADD || op === OP_SUB
     return (o1 || o2, l1 && l2)
-  elseif op === OP_MUL
+  elseif op === OP_MUL || op === OP_DOT
     return (o1 || o2, l1 && l2 && !(o1 && o2))
   elseif op === OP_DIV
     return (o1 || o2, l1 && !o2)

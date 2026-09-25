@@ -339,7 +339,8 @@ function DAE_OP_toJuliaOperator(@nospecialize(op::DAE.Operator))
       DAE.MUL_ARRAY_SCALAR() => :*
       DAE.ADD_ARRAY_SCALAR() => :+
       DAE.SUB_SCALAR_ARRAY() =>  :-
-      DAE.MUL_SCALAR_PRODUCT() => :*
+      #= Julia's `*` has no vector-vector method; also right for scalars. =#
+      DAE.MUL_SCALAR_PRODUCT() => :(OMBackend.CodeGeneration.vectorDot)
       DAE.MUL_MATRIX_PRODUCT() => :*
       DAE.DIV_ARRAY_SCALAR() => :/
       DAE.DIV_SCALAR_ARRAY() => :/
@@ -364,7 +365,7 @@ end
 #= Direct SimCode OpKind -> Julia operator Symbol, equivalent to
    DAE_OP_toJuliaOperator(toDAEOperator(k)) but without the throwaway
    DAE.Operator allocation per operator node in codegen. =#
-function opKindToJuliaOperator(k::SimulationCode.OpKind)::Symbol
+function opKindToJuliaOperator(k::SimulationCode.OpKind)::Union{Symbol, Expr}
   if k === SimulationCode.OP_ADD;          :+
   elseif k === SimulationCode.OP_SUB;      :-
   elseif k === SimulationCode.OP_MUL;      :*
@@ -380,6 +381,7 @@ function opKindToJuliaOperator(k::SimulationCode.OpKind)::Symbol
   elseif k === SimulationCode.OP_GREATEREQ; :(>=)
   elseif k === SimulationCode.OP_EQUAL;    :(==)
   elseif k === SimulationCode.OP_NEQUAL;   :(!=)
+  elseif k === SimulationCode.OP_DOT;      :(OMBackend.CodeGeneration.vectorDot)
   else error("opKindToJuliaOperator: unhandled OpKind $k")
   end
 end
