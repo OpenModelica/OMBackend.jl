@@ -1730,6 +1730,11 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
       push!(seedEqs, varNameToEq[alias.representativeName])
     end
   end
+  #= Asserts are checked during the simulation: what they read is computed. =#
+  local assertRefs = _collectAssertCrefNames!(OrderedSet{String}(), simCode.asserts)
+  for vn in assertRefs
+    haskey(varNameToEq, vn) && push!(seedEqs, varNameToEq[vn])
+  end
   #= Classify unmatched equations: seed those referencing unknowns =#
   local matchedEqs = OrderedSet{Int}()
   for (matchIdx, eqIdx) in enumerate(matchOrder)
@@ -3211,6 +3216,23 @@ function _mapList(f::Function, lst)
   return listReverse(out)
 end
 
+function _collectAssertCrefNames!(out, asserts)
+  for a in asserts
+    collectCrefNames!(out, a.condition)
+    collectCrefNames!(out, a.message)
+  end
+  return out
+end
+
+#= Asserts read the substituted variables (constants, alias representatives)
+   like the equations do, so they never refer to an eliminated unknown. =#
+function _substituteInAsserts(asserts::Vector{BDAE.ASSERT_EQUATION}, map;
+                              visitor = substituteAliasCref)::Vector{BDAE.ASSERT_EQUATION}
+  return BDAE.ASSERT_EQUATION[BDAE.ASSERT_EQUATION(first(Util.traverseExpTopDown(a.condition, visitor, map)),
+                                                   first(Util.traverseExpTopDown(a.message, visitor, map)),
+                                                   a.level, a.source) for a in asserts]
+end
+
 function _mapVectorLike(f::Function, xs)
   local out = typeof(xs)()
   for x in xs
@@ -3498,6 +3520,7 @@ function canonicalizeCrefNames(simCode::SIM_CODE;
     simCode.residualEquations = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.residualEquations)
     simCode.initialEquations = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.initialEquations)
     simCode.whenEquations = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.whenEquations)
+    simCode.asserts = _mapVectorLike(eq -> _canonicalizeEquation(eq, ctx), simCode.asserts)
     simCode.ifEquations = _mapVectorLike(ifEq -> _canonicalizeIfEquation(ifEq, ctx), simCode.ifEquations)
     simCode.structuralTransitions = _mapVectorLike(tr -> _canonicalizeStructuralTransition(tr, ctx),
                                                    simCode.structuralTransitions)
@@ -3939,6 +3962,7 @@ function propagateConstants(simCode::SIM_CODE)
     simCode.stringToSimVarHT = newHT
     simCode.ifEquations = newIfEqs
     simCode.whenEquations = newWhenEqs
+    simCode.asserts = _substituteInAsserts(simCode.asserts, constMap)
   end
   append!(simCode.eliminatedEquations, elimEqs)
   append!(simCode.eliminatedVariables, elimVarNames)
@@ -4516,6 +4540,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
     simCode.ifEquations = newIfEqs
     simCode.whenEquations = newWhenEqs
     simCode.aliasMap = mergedAliasMap
+    simCode.asserts = _substituteInAsserts(simCode.asserts, aliasMap)
   end
   #= State-state aliases collapse two STATEs marked irreducible into one.
      Drop the eliminated names from `irreducibleVariables` so MTK codegen's
@@ -4733,6 +4758,7 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   for whenEq in simCode.whenEquations
     _collectWhenCrefNames!(untouchable, whenEq.whenEquation)
   end
+  _collectAssertCrefNames!(untouchable, simCode.asserts)
   for entry in simCode.aliasMap
     push!(untouchable, entry.representativeName)
     push!(untouchable, entry.eliminatedName)
@@ -4843,6 +4869,7 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
   for whenEq in simCode.whenEquations
     _collectWhenCrefNames!(referenced, whenEq.whenEquation)
   end
+  _collectAssertCrefNames!(referenced, simCode.asserts)
   for eq in simCode.eliminatedEquations
     collectCrefNames!(referenced, eq.exp)
   end
@@ -5213,6 +5240,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     simCode.whenEquations = newWhenEquations
     simCode.eliminatedEquations = newElimEqs
     simCode.stringToSimVarHT = newHT
+    simCode.asserts = _substituteInAsserts(simCode.asserts, paramValueMap; visitor = substituteConstantParameter)
   end
   #= Do NOT append eliminated parameter names to `simCode.eliminatedVariables`.
      That list pairs with `simCode.eliminatedEquations` 1:1 and is consumed by

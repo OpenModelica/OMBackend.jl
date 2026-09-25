@@ -219,9 +219,9 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
         getfield(OMB, Symbol(cname)).simulate(tspan, solver; cached_build = rebuilt, kwargs...)
       end
     catch e
-      #= A user interrupt must propagate, not trigger a retry of the same solve;
-         the fallback cannot apply `parameters`. =#
-      (e isa InterruptException || parameters !== nothing) && rethrow()
+      #= A user interrupt or a violated Modelica assert must propagate, not
+         trigger a retry of the same solve; the fallback cannot apply `parameters`. =#
+      (e isa InterruptException || e isa OMB.CodeGeneration.ModelicaAssertionError || parameters !== nothing) && rethrow()
       @warn "[IMTK] cached-build solve failed; falling back to module simulate" model = modelName exception = e
     end
   end

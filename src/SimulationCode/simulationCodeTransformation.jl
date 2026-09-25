@@ -179,9 +179,15 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
    whenEqs::Vector{BDAE.WHEN_EQUATION},
    ifEqs::Vector{BDAE.IF_EQUATION},
    structuralTransitions::Vector{BDAE.Equation},
-   initialWhenEqs::Vector{BDAE.INITIAL_WHEN_EQUATION}) = allocateAndCollectSimulationEquations(equations,
-                                                                                               equationSystem.name,
-                                                                                               addDummyState)
+   initialWhenEqs::Vector{BDAE.INITIAL_WHEN_EQUATION},
+   asserts::Vector{BDAE.ASSERT_EQUATION}) = allocateAndCollectSimulationEquations(equations,
+                                                                                  equationSystem.name,
+                                                                                  addDummyState)
+  #= Parameters in asserts as literals (they may be eliminated later); tunable
+     ones stay references, read from the problem at run time. =#
+  asserts = BDAE.ASSERT_EQUATION[BDAE.ASSERT_EQUATION(_inlineParamsInExp(a.condition, stringToSimVarHT; keepTunable = true),
+                                                      _inlineParamsInExp(a.message, stringToSimVarHT; keepTunable = true),
+                                                      a.level, a.source) for a in asserts]
   #= Combine two sources of init-time algorithm bodies:
      (1) BDAE.INITIAL_WHEN_EQUATION nodes synthesized from `algorithm when initial()`
          clauses in BDAECreate.
@@ -318,6 +324,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
                           AliasEntry[],
                           nothing,
                           initialAlgorithms,
+                          asserts,
                           )
 end
 
@@ -727,6 +734,7 @@ function allocateAndCollectSimulationEquations(equations::T,
   initialWhenEquations = BDAE.INITIAL_WHEN_EQUATION[]
   ifEquations = BDAE.IF_EQUATION[]
   structuralTransitions = BDAE.Equation[]
+  asserts = BDAE.ASSERT_EQUATION[]
   for eq in equations
     eqType = typeof(eq)
     if eqType === BDAE.RESIDUAL_EQUATION
@@ -741,12 +749,14 @@ function allocateAndCollectSimulationEquations(equations::T,
       push!(structuralTransitions, eq)
     elseif eqType === BDAE.ALGORITHM
       _algorithmToResiduals!(regularEquations, eq)
+    elseif eqType === BDAE.ASSERT_EQUATION
+      push!(asserts, eq)
     end
   end
   if shouldAddDummyEquation
     push!(regularEquations, makeDummyResidualEquation(equationSystemName))
   end
-  return (regularEquations, whenEquations, ifEquations, structuralTransitions, initialWhenEquations)
+  return (regularEquations, whenEquations, ifEquations, structuralTransitions, initialWhenEquations, asserts)
 end
 
 #= Lower the body of a non-when `BDAE.ALGORITHM` into one
@@ -949,17 +959,20 @@ function _reconstructScalarizedArrayDAE(baseName::String, ht)::Union{DAE.Exp, No
 end
 
 # SIM.Exp delegation: round-trip to DAE.Exp until the visitor is SIM-native.
-_inlineParamsInExp(exp::Exp, ht)::Exp = toSimExp(_inlineParamsInExp(toDAEExp(exp), ht))
+_inlineParamsInExp(exp::Exp, ht; keepTunable::Bool = false)::Exp =
+  toSimExp(_inlineParamsInExp(toDAEExp(exp), ht; keepTunable = keepTunable))
 
 #= Substitute parameter CREFs with their literal bindings throughout a DAE.Exp.
    Handles PARAMETER (scalar), ARRAY_PARAMETER (direct binding), and scalarized
-   array parents (reconstructed). =#
-function _inlineParamsInExp(exp::DAE.Exp, ht)::DAE.Exp
+   array parents (reconstructed). With `keepTunable`, tunable parameters stay
+   references (read at run time) instead of being an error. =#
+function _inlineParamsInExp(exp::DAE.Exp, ht; keepTunable::Bool = false)::DAE.Exp
   function visit(e, acc)
     if Util.isCref(e)
       local key = string(e)
       #= Initial algorithms run when the generated module is loaded: a tunable
          parameter read here would keep its compiled value in every simulation. =#
+      isTunableParameter(key) && keepTunable && return (e, true, acc)
       isTunableParameter(key) &&
         throw(ArgumentError("tunable parameter $(key) is read in an initial algorithm, which is evaluated " *
                             "when the model is compiled, so it would keep its compiled value; leave it out of " *

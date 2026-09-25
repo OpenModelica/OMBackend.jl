@@ -222,6 +222,7 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
         push!(equations, ieq)
       end
     end
+    append!(equations, synthesizeAssertsFromRegularAlgorithms(algorithms))
   end
   #= §17.4.4: lift discrete (Bool/Int/enum) equation-section definitions whose RHS
      is a discrete-time relation into event-driven held discretes, so the
@@ -1517,6 +1518,25 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
        what the per-statement passes already emit. =#
   end
   return (out, liftedLhsNames)
+end
+
+#= The top-level asserts of regular algorithm sections, as assert equations:
+   checked at run time like those of equation sections. The lifters above
+   turn the assignments into equations and leave the asserts out. =#
+function synthesizeAssertsFromRegularAlgorithms(algorithms)::Vector{BDAE.Equation}
+  local out = BDAE.Equation[]
+  for alg in algorithms
+    isempty(alg.statements) && continue
+    local daeStmts = try
+      OMFrontend.Frontend.convertStatements(alg.statements)
+    catch
+      continue
+    end
+    for s in daeStmts
+      s isa DAE.STMT_ASSERT && push!(out, BDAE.ASSERT_EQUATION(s.cond, s.msg, s.level, s.source))
+    end
+  end
+  return out
 end
 
 Base.@nospecializeinfer function _isTimeCref(@nospecialize(cref))::Bool

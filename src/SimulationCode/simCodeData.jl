@@ -788,6 +788,8 @@ struct SIM_CODE{T0<:String,
   observedFilter::Union{Nothing, Vector{String}}
   "Initial-algorithm bodies lowered from `when initial() then ... end when` clauses; run once during init, never as runtime callbacks."
   initialAlgorithms::Vector{INITIAL_ALGORITHM}
+  "Asserts of equation sections and algorithms (outside when-clauses), non-tunable parameters inlined: checked at run time, after initialization and after each accepted step."
+  asserts::Vector{BDAE.ASSERT_EQUATION}
 end
 
 #= Conversion / projection machinery + DAE-wrapping boundary constructors. =#

@@ -67,7 +67,7 @@ function mockSimCode(ht)
     false, Int[], SC.Graphs.SimpleDiGraph(0), [], SC.StructuralTransition[], [],
     String[], String[], SC.Equation[], "mock", NONE(), NONE(), String[],
     SC.ModelicaFunction[], false, SC.RESIDUAL_EQUATION[], String[], SC.AliasEntry[],
-    nothing, SC.INITIAL_ALGORITHM[])
+    nothing, SC.INITIAL_ALGORITHM[], SC.BDAE.ASSERT_EQUATION[])
 end
 
 # Expr equality ignoring source-location decoration and semantically-transparent

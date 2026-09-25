@@ -1039,7 +1039,8 @@ function simulateModel(modelName::String;
       end
       _runDir === nothing ? _doSim() : withLogRunDir(_doSim, _runDir)
     catch err
-      @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
+      err isa CodeGeneration.ModelicaAssertionError ||
+        @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
       rethrow(err)
     end
   elseif MODE == IMTK_MODE
@@ -1057,7 +1058,9 @@ function simulateModel(modelName::String;
     try
       return _runDir === nothing ? _doSim() : withLogRunDir(_doSim, _runDir)
     catch err
-      @error "iMTK simulate failed" exception_type=typeof(err) mode=MODE model=modelName
+      #= A violated assert is the model's result, not a failure of the tool. =#
+      err isa CodeGeneration.ModelicaAssertionError ||
+        @error "iMTK simulate failed" exception_type=typeof(err) mode=MODE model=modelName
       rethrow(err)
     end
   elseif MODE == DEMode
@@ -1079,7 +1082,8 @@ function simulateModel(modelName::String;
         mod.simulate(tspan, solver; kwargs...)
       end
     catch err
-      @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
+      err isa CodeGeneration.ModelicaAssertionError ||
+        @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
       rethrow(err)
     end
   else

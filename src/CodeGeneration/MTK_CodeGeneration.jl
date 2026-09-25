@@ -1298,6 +1298,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
          the mass matrix. See `emitProblemConstruction` and its three
          strategy emitters for the full rationale. =#
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
+      $(emitAssertCallback(simCode))
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreducibleSyms)
     end
   end
@@ -3634,6 +3635,58 @@ function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
   end
   return events
 end
+
+#= The asserts of equation sections (simCode.asserts) as one callback that
+   checks them after initialization and after each accepted step (asserts.jl).
+   Conditions and messages are lowered like event affects: every variable is
+   read through `observed`, `time` from the integrator. An assert whose
+   expression cannot be lowered is reported and left out. =#
+function emitAssertCallback(simCode)::Expr
+  isempty(simCode.asserts) && return Expr(:block)
+  local entries = Expr[]
+  for a in simCode.asserts
+    local obsAcc = Dict{Symbol,Symbol}()
+    local cond = try
+      _daeBoolMem(a.condition, obsAcc, simCode)
+    catch err
+      @warn "[MTK GEN: asserts] an assert cannot be checked at run time; it is left out" condition = string(a.condition) exception = err
+      continue
+    end
+    local msg = _assertMessageExpr(a.message, obsAcc, simCode)
+    local timeVarying = _exprMentions(cond, :integrator) || any(keys(obsAcc)) do k
+      local e = get(simCode.stringToSimVarHT, string(k), nothing)
+      e === nothing || !(last(e).varKind isa Union{SimulationCode.PARAMETER, SimulationCode.ARRAY_PARAMETER})
+    end
+    #= Names, not the symbolic variables: a variable the compiler eliminated has
+       no binding in the generated code, but may still be observed by name. =#
+    local obsNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, k, QuoteNode(v)) for (k, v) in obsAcc]...))
+    push!(entries, :(OMBackend.CodeGeneration.ModelicaAssert($(obsNT),
+                                                             (observed, integrator) -> $(cond),
+                                                             (observed, integrator) -> $(msg),
+                                                             $(AlgorithmicCodeGeneration.isWarningAssertionLevel(a.level)), $(timeVarying),
+                                                             $(string(a.condition)))))
+  end
+  isempty(entries) && return Expr(:block)
+  return :(callbacks = OMBackend.CodeGeneration.withAssertCallback(callbacks, problem, [$(entries...)]))
+end
+
+#= An assert's message: string literals, `+` concatenation and String(x) of
+   variables; anything else is shown as the Modelica expression. =#
+Base.@nospecializeinfer function _assertMessageExpr(@nospecialize(msg::DAE.Exp), obsAcc::Dict{Symbol,Symbol}, simCode)
+  local part(@nospecialize e) = @match e begin
+    DAE.SCONST(s) => s
+    DAE.BINARY(e1, DAE.ADD(__), e2) => :(string($(part(e1)), $(part(e2))))
+    DAE.CALL(Absyn.IDENT("String"), args, _) => :(string($(_daeExpToJuliaMem(listHead(args), obsAcc, simCode))))
+    _ => :(string($(_daeExpToJuliaMem(e, obsAcc, simCode))))
+  end
+  return try
+    part(msg)
+  catch
+    string(msg)
+  end
+end
+
+_exprMentions(@nospecialize(e), s::Symbol) = e === s || (e isa Expr && any(a -> _exprMentions(a, s), e.args))
 
 #= Build MTK SymbolicContinuousCallbacks for the synthesised discrete-Boolean
    whens: one callback per relation zero set, whose affect rewrites the held

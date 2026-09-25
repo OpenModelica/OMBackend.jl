@@ -970,20 +970,26 @@ function generateStatement(stmt::DAE.ELSEIF)::Expr
   end
 end
 
+#= AssertionLevel = enumeration(warning, error): warning is literal 1, so the
+   level is matched by name. Any other level expression means error. =#
+function isWarningAssertionLevel(@nospecialize(level))::Bool
+  level isa DAE.ENUM_LITERAL || return false
+  local p = level.name
+  while !(p isa Absyn.IDENT)
+    p = p.path                    # QUALIFIED(name, path), FULLYQUALIFIED(path)
+  end
+  return p.name == "warning"
+end
+
 """
   Generates Julia code for Modelica assert statements.
-  If level is error (index 1), throws an error when condition is false.
-  If level is warning (index 2), prints a warning when condition is false.
+  AssertionLevel.error (the default) throws an error when the condition is false,
+  AssertionLevel.warning prints a warning.
 """
 function generateStatement(stmt::DAE.STMT_ASSERT)::Expr
   local condExpr = expToJuliaExpAlg(stmt.cond)
   local msgExpr = expToJuliaExpAlg(stmt.msg)
-  #= Check assertion level: error (1) or warning (2) =#
-  local level = @match stmt.level begin
-    DAE.ENUM_LITERAL(_, idx) => idx
-    _ => 1  #= Default to error =#
-  end
-  if level == 1
+  if !isWarningAssertionLevel(stmt.level)
     #= AssertionLevel.error - throw an error =#
     quote
       if !($condExpr)
