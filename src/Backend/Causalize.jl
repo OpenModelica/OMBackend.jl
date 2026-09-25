@@ -95,6 +95,28 @@ end
 # IFEXP (entry path); timeDepOnly=true lifts only time-dependent IFEXPs and recurses
 # the rest (for branches of an already-lifted IFEXP). noEvent subtrees stay inline;
 # identical (cond|then|else) shapes are deduped to one tmp var.
+#= True if every relation in a Boolean expression is inside noEvent (and there
+   is at least one noEvent): such a condition generates no events (MLS 8.5). =#
+Base.@nospecializeinfer function _relationsAllInNoEvent(@nospecialize(exp::DAE.Exp))::Bool
+  local sawNoEvent = Ref(false)
+  local bare = Ref(false)
+  local visit = function (e, arg)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("noEvent"), _, _) => begin
+        sawNoEvent[] = true
+        return (e, false, arg)
+      end
+      DAE.RELATION(__) => begin
+        bare[] = true
+        return (e, false, arg)
+      end
+      _ => return (e, true, arg)
+    end
+  end
+  Util.traverseExpTopDown(exp, visit, nothing)
+  return sawNoEvent[] && !bare[]
+end
+
 struct IfExpressionLifter
   tmpVarToElement::OrderedDict{BDAE.VAR, BDAE.IF_EQUATION}
   tick::Ref{Int}
@@ -107,7 +129,9 @@ Base.@nospecializeinfer function (v::IfExpressionLifter)(@nospecialize(exp::DAE.
     @match exp begin
       DAE.CALL(Absyn.IDENT("noEvent"), _, _) => (exp, false)
       DAE.IFEXP(cond, expThen, expElse) => begin
-        if v.timeDepOnly && !_expDependsOnTime(cond)
+        #= A condition whose relations are all inside noEvent is literal: no
+           event, so it stays inline like a state-dependent nested IFEXP. =#
+        if (v.timeDepOnly && !_expDependsOnTime(cond)) || _relationsAllInNoEvent(cond)
           #= State-dependent: keep inline (bool-product), recurse for nested
              time-dependent IFEXPs. =#
           local (lc, _) = Util.traverseExpTopDown(cond, timeDep, nothing)

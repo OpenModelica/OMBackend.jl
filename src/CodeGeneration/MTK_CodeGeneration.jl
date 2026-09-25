@@ -1828,8 +1828,9 @@ Each if equation is marked by the identifier.
 So the first will have 1 and so on.
 """
 #= Build one SymbolicContinuousCallback per deferred pure-time event. Callback K
-   fires at event K's threshold, so its affect sets ITS OWN ifCond to the known
-   post-crossing value (`numVal`, exactly what the per-branch toggle sets) and
+   fires at event K's threshold, so its affect sets ITS OWN ifCond by the
+   crossing's direction (rising zc: the condition becomes FALSE, falling: TRUE;
+   a periodic condition such as sin(time) > 0.5 crosses both ways) and
    re-derives every OTHER pure-time ifCond from its zero-crossing sign
    (`zc < 0` <=> condition TRUE). Reading the firing event's own `zc` is unusable
    because it is exactly 0 at the crossing instant; the other events are not at
@@ -1843,49 +1844,51 @@ function _buildTimeEventRefreshCallbacks(allPT::Vector, ptOwners::Vector, simCod
   local cbs = Expr[]
   for k in 1:n
     local mtkCondK = allPT[k][3]
-    local numValK = allPT[k][4]
     local obsKws = Expr[]
-    local retKws = Expr[]
     local modKws = Expr[]
+    local retKwsBy = Dict(0.0 => Expr[], 1.0 => Expr[])     # own value after a rising / falling crossing
     for j in 1:n
       local symJ = allPT[j][1]
       push!(modKws, Expr(:kw, symJ, symJ))
       if j == k
-        push!(retKws, Expr(:kw, symJ, numValK))
+        push!(retKwsBy[0.0], Expr(:kw, symJ, 0.0))
+        push!(retKwsBy[1.0], Expr(:kw, symJ, 1.0))
       else
         local zcName = Symbol("_zc", j)
         push!(obsKws, Expr(:kw, zcName, allPT[j][2]))
-        push!(retKws, Expr(:kw, symJ, :((observed.$(zcName) < 0) ? 1.0 : 0.0)))
+        local refresh = Expr(:kw, symJ, :((observed.$(zcName) < 0) ? 1.0 : 0.0))
+        push!(retKwsBy[0.0], refresh)
+        push!(retKwsBy[1.0], refresh)
       end
     end
-    #= Chain dependent pre-memory clusters into the firing event's affect: their
-       crossing functions can jump from an exact boundary here and never produce
-       the transversal crossing the standalone callbacks root-find on. =#
-    local affect = nothing
-    local chainInfo = _ifEqChainedClusters(ptOwners[k], clusters, simCode, leafAlias, algDefs)
-    if chainInfo !== nothing
-      local (chained, stale) = chainInfo
-      local obsAcc = Dict{Symbol,Symbol}()
-      local subst = _buildRelaySubst(ptOwners[k], numValK, simCode, leafAlias, algDefs, stale, obsAcc)
-      if subst !== nothing
-        affect = _composedIfCondAffectExpr(retKws, modKws, chained, simCode, subst, obsAcc;
+    local affectFor = function (ownVal::Float64)
+      local retKws = retKwsBy[ownVal]
+      #= Chain dependent pre-memory clusters into the firing event's affect: their
+         crossing functions can jump from an exact boundary here and never produce
+         the transversal crossing the standalone callbacks root-find on. =#
+      local chainInfo = _ifEqChainedClusters(ptOwners[k], clusters, simCode, leafAlias, algDefs)
+      if chainInfo !== nothing
+        local (chained, stale) = chainInfo
+        local obsAcc = Dict{Symbol,Symbol}()
+        local subst = _buildRelaySubst(ptOwners[k], ownVal, simCode, leafAlias, algDefs, stale, obsAcc)
+        if subst !== nothing
+          return _composedIfCondAffectExpr(retKws, modKws, chained, simCode, subst, obsAcc;
                                            extraObsKws = obsKws)
+        end
       end
-    end
-    if affect === nothing
       local modNT = Expr(:tuple, Expr(:parameters, modKws...))
       local retNT = Expr(:tuple, Expr(:parameters, retKws...))
       local fExpr = :((modified, observed, ctx, integrator) -> $(retNT))
       if isempty(obsKws)
-        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT); skip_checks = true))
-      else
-        local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
-        affect = :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT);
-                                                    observed = $(obsNT), skip_checks = true))
+        return :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT); skip_checks = true))
       end
+      local obsNT = Expr(:tuple, Expr(:parameters, obsKws...))
+      return :(ModelingToolkit.ImperativeAffect($(fExpr), $(modNT);
+                                                observed = $(obsNT), skip_checks = true))
     end
     push!(cbs, :(ModelingToolkit.SymbolicContinuousCallback(
-      ($(mtkCondK)) => $(affect);
+      ($(mtkCondK)) => $(affectFor(0.0));
+      affect_neg = $(affectFor(1.0)),
       reinitializealg = SciMLBase.NoInit()
     )))
   end
@@ -2459,6 +2462,7 @@ function createIfEquation(stateVariables::Vector,
   local anyRelayCondBranch::Bool =
     any(b -> b.identifier != -1 && _conditionReferencesRelayTarget(b.condition, _rT0),
         ifEq.branches)
+  local _allDiscreteConds::Bool = MTK_CodeGenerationUtil._allBranchConditionsDiscrete(ifEq.branches, simCode)
   for branch in ifEq.branches
     i += 1
     @match branch begin
@@ -2485,12 +2489,13 @@ function createIfEquation(stateVariables::Vector,
            is false->true. So the firing branch's own ifCond is set false on the
            positive edge and true on the negative edge. A single constant value
            cannot toggle a condition that crosses repeatedly (e.g. a Pulse/periodic
-           source waveform). Other branches' ifConds are left at their init value,
-           preserving the previous per-branch behaviour. =#
+           source waveform). Other branches' ifConds keep their current value:
+           the branch conditions nest first-true-wins (generateIfExpressions), so
+           each ifCond stands for its own condition only. =#
         local modifiedKws::Vector{Expr} = Expr[Expr(:kw, sym, sym) for sym in allIfCondSyms]
         local modifiedNT::Expr = Expr(:tuple, Expr(:parameters, modifiedKws...))
-        local upKws::Vector{Expr}   = Expr[Expr(:kw, sym, (j == i) ? 0.0 : invVal) for (j, sym) in enumerate(allIfCondSyms)]
-        local downKws::Vector{Expr} = Expr[Expr(:kw, sym, (j == i) ? 1.0 : invVal) for (j, sym) in enumerate(allIfCondSyms)]
+        local upKws::Vector{Expr}   = Expr[Expr(:kw, sym, (j == i) ? 0.0 : :(modified.$(sym))) for (j, sym) in enumerate(allIfCondSyms)]
+        local downKws::Vector{Expr} = Expr[Expr(:kw, sym, (j == i) ? 1.0 : :(modified.$(sym))) for (j, sym) in enumerate(allIfCondSyms)]
         local upFExpr::Expr   = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, upKws...))))
         local downFExpr::Expr = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, downKws...))))
         local affectTuple::Expr     = :(($(upFExpr), $(modifiedNT)))
@@ -2545,7 +2550,12 @@ function createIfEquation(stateVariables::Vector,
            values (which would form a circular init dependency). =#
         local zcLhs = _extractZeroCrossingLHS(mtkCond)
         local thisSym::Symbol = allIfCondSyms[i]
-        if _ifConditionIsPureTimeEvent(branch.condition, simCode)
+        if _allDiscreteConds
+          #= Every branch condition is discrete or a parameter: the residuals gate
+             directly on the condition (generateIfExpressions), whose own update
+             event localises the step. No crossing function, no callback. =#
+          push!(ivConditions, ivCond)
+        elseif _ifConditionIsPureTimeEvent(branch.condition, simCode)
           #= Deterministic time event: defer to model-level refresh callbacks built
              in createIfEquations, so two sources whose transitions coincide cannot
              drop one another's affect. `numVal` is the post-crossing ifCond value
