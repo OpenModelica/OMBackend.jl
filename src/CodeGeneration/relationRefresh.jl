@@ -11,13 +11,17 @@
    two evaluations. So after every step each buffered relation is checked
    against the state with OpenModelica's rule (a TRUE relation stays TRUE
    while zc <= eps, a FALSE one becomes TRUE when zc <= -eps), and where one
-   disagrees the event is handled in sweeps, as OpenModelica's
-   updateDiscreteSystem:
+   disagrees, or where a continuous event fired in the step, the event is
+   handled as OpenModelica's updateDiscreteSystem. The algebraic unknowns
+   are solved first (an if-equation's branch switch leaves them stale), then
+   in sweeps:
    1. every relation is evaluated on the same state;
    2. the whens on a relation that became true run their bodies, in order,
-      with pre() read from the state before the sweep; then the whens on
-      discrete conditions (a changed discrete, an algorithm section's
-      inputs), each checked just before it runs, in the order of the model;
+      with pre() read from the state before the sweep; each discrete cluster
+      (discreteClusters.jl) is solved as a mixed system with the pre()
+      values of the sweep; then the whens on discrete conditions (a changed
+      discrete, an algorithm section's inputs), each checked just before it
+      runs, in the order of the model;
    3. the algebraic unknowns are solved again, and the next sweep starts,
       until nothing changes. A chain through algebraic variables takes one
       sweep per link; a model that does not settle (chattering) is stopped
@@ -226,8 +230,8 @@ function _whenFire!(a::RelationWhenAffect, integrator, pre)
 end
 
 #= The crossing only locates the event: it is handled after the step, with
-   every other relation (the event iteration). =#
-(a::RelationWhenAffect)(integrator) = nothing
+   every other relation (the event iteration). The state is not changed. =#
+(a::RelationWhenAffect)(integrator) = (_derivativeDiscontinuity!(integrator, false); nothing)
 
 """
     relationWhenCallback(names, eval, strict, body!) -> ContinuousCallback
@@ -251,10 +255,12 @@ function relationWhenCallback(names::Vector{String}, eval, strict::Bool, body!)
   end
   #= RightRootFind: the event lands just past the root, where the rule sees
      the crossing. It saves the left limit; the event iteration saves the
-     right one. The initialize function leaves the modified flag alone (the
-     default one clears what another callback set). =#
+     right one and solves the algebraic variables (none here). The initialize
+     function leaves the modified flag alone (the default one clears what
+     another callback set). =#
   return DiffEqBase.ContinuousCallback(condition, a, a;
                                        initialize = initialize, rootfind = ModelingToolkit.SciMLBase.RightRootFind,
+                                       initializealg = ModelingToolkit.SciMLBase.NoInit(),
                                        save_positions = (true, false))
 end
 
@@ -281,21 +287,32 @@ A when on a discrete condition, checked after every step.
 discreteWhenCallback(condition, affect!) =
   DiffEqBase.DiscreteCallback(condition, DiscreteWhenAffect(condition, affect!); save_positions = (true, true))
 
-#= What the event iteration updates. =#
+#= What the event iteration updates. `reinit` solves the algebraic
+   unknowns (nothing: BrownFullBasicInit). =#
 struct EventIteration
   ifRelations::Union{Nothing, IfRelations}
   relationWhens::Vector{RelationWhenAffect}
+  clusters::Vector{DiscreteCluster}
   discreteWhens::Vector{DiscreteWhenAffect}
   limit::Int
+  reinit::Any
 end
 
 _holds(d::DiscreteWhenAffect, integrator) = d.condition(integrator.u, integrator.t, integrator)
 
-#= After a step: whether a relation disagrees with the state or a discrete
-   when's condition holds. =#
+#= Whether a continuous callback fired in the step that just ended: the
+   integrators of OrdinaryDiffEqCore and Sundials record it in
+   `event_last_time` (0 when none) before they run the discrete callbacks. =#
+_continuousEventFired(integrator) =
+  hasproperty(integrator, :event_last_time) && integrator.event_last_time != 0
+
+#= After a step: whether a continuous event fired, a relation disagrees with
+   the state, or a discrete when's condition holds. =#
 function _needsIteration(e::EventIteration, integrator)
+  _continuousEventFired(integrator) && return true
   e.ifRelations !== nothing && _inconsistent(e.ifRelations, integrator) && return true
   any(a -> _whenInconsistent(a, integrator), e.relationWhens) && return true
+  any(c -> _inconsistent(c, integrator), e.clusters) && return true
   return any(d -> _holds(d, integrator), e.discreteWhens)
 end
 
@@ -307,10 +324,18 @@ function _sweep!(e::EventIteration, integrator)
   for a in e.relationWhens
     _whenRelationUpdate!(a, integrator) && (changed = true)
   end
+  local relPre = [copy(c.rel) for c in e.clusters]
+  for c in e.clusters
+    _update!(c, integrator) && (changed = true)
+  end
   #= 2. The bodies, with pre() from the state before them. =#
   local pre = copy(integrator.u)
+  local clusterPre = [_preValues(c, _readValues(c, integrator)) for c in e.clusters]
   for a in e.relationWhens
     _whenFire!(a, integrator, pre) && (changed = true)
+  end
+  for (i, c) in enumerate(e.clusters)
+    _solveMixedSystem!(c, integrator, clusterPre[i], relPre[i], e.reinit) && (changed = true)
   end
   for d in e.discreteWhens
     _holds(d, integrator) || continue
@@ -321,10 +346,14 @@ function _sweep!(e::EventIteration, integrator)
 end
 
 function _iterate!(e::EventIteration, integrator)
+  if _continuousEventFired(integrator) && !_resolveAlgebraics!(integrator, e.reinit)
+    @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
+    return nothing
+  end
   for _ in 1:e.limit
     _sweep!(e, integrator) || return nothing
     #= Phase 3: the branches or the state changed; the algebraic unknowns follow. =#
-    if !_resolveAlgebraics!(integrator)
+    if !_resolveAlgebraics!(integrator, e.reinit)
       @error "[events] the algebraic variables could not be solved after the event at t = $(integrator.t)"
       return nothing
     end
@@ -336,26 +365,41 @@ function _iterate!(e::EventIteration, integrator)
 end
 
 #= At the start, after the event callbacks' initialize functions set every
-   relation to its literal value at the solved initial state: if an
-   if-equation relation differs from the value the initialization used, the
-   algebraic unknowns are solved again with it (the states kept). =#
+   relation to its literal value at the solved initial state: the discrete
+   clusters set theirs and run their initial bodies. If one changed a
+   discrete, or an if-equation relation differs from the value the
+   initialization used, the algebraic unknowns are solved again (the states
+   kept). =#
 function _initialize!(e::EventIteration, integrator)
+  local changed = false
+  for c in e.clusters
+    _initialize!(c, integrator) && (changed = true)
+  end
   local r = e.ifRelations
-  r === nothing && return nothing
-  _bufferValues(r.buffers, integrator) != r.compiled && _resolveAlgebraics!(integrator)
+  r !== nothing && _bufferValues(r.buffers, integrator) != r.compiled && (changed = true)
+  changed || return nothing
+  if !_resolveAlgebraics!(integrator, e.reinit)
+    @error "[events] the algebraic variables could not be solved at the start (t = $(integrator.t))"
+    return nothing
+  end
+  #= The solve moves operands: the cluster relations literal again on the
+     solved state, or they would make an event at the first step. =#
+  foreach(c -> _literalBuffers!(c, integrator), e.clusters)
   return nothing
 end
 
 #= The callbacks that stay, and the whens the iteration takes over: those on
-   a relation (their continuous callbacks stay, to locate the events) and
-   those on a discrete condition (their callbacks go). =#
+   a relation and the discrete clusters (their continuous callbacks stay, to
+   locate the events) and those on a discrete condition (their callbacks go). =#
 function _splitCallbacks(callbacks)
   local kept = Any[]
   local relationWhens = RelationWhenAffect[]
+  local clusters = DiscreteCluster[]
   local discreteWhens = DiscreteWhenAffect[]
   if callbacks isa DiffEqBase.CallbackSet
     for cb in callbacks.continuous_callbacks
       cb.affect! isa RelationWhenAffect && push!(relationWhens, cb.affect!)
+      cb.affect! isa ClusterCrossings && push!(clusters, cb.affect!.cluster)
       push!(kept, cb)
     end
     for cb in callbacks.discrete_callbacks
@@ -364,28 +408,32 @@ function _splitCallbacks(callbacks)
   elseif callbacks !== nothing
     push!(kept, callbacks)
   end
-  return (kept, relationWhens, discreteWhens)
+  return (kept, relationWhens, clusters, discreteWhens)
 end
 
 """
     withRelationRefresh(callbacks, problem, hSym, entries) -> callbacks
 
 Add the event iteration over the buffered relations: the if-equation
-relations `entries` = `(ifCond, crossing function, scale)` and the whens on
-a relation among `callbacks` (their affects are `RelationWhenAffect`s). A
-DiscreteCallback checks them after every step and, where one disagrees with
-the state, iterates as described above. `hSym` is the hysteresis parameter H.
+relations `entries` = `(ifCond, crossing function, scale)`, and the whens on
+a relation and the discrete clusters among `callbacks` (their affects are
+`RelationWhenAffect`s and `ClusterCrossings`). A DiscreteCallback checks them
+after every step and, where one disagrees with the state or a continuous
+event fired, iterates as described above. `hSym` is the hysteresis
+parameter H.
 
 The whens on discrete conditions among `callbacks` (`DiscreteWhenAffect`s)
 move into the iteration: a relation's when body can change the discrete
 they watch, and their bodies can move a relation, within one event.
 """
 function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
-  local (kept, relationWhens, discreteWhens) = _splitCallbacks(callbacks)
+  local (kept, relationWhens, clusters, discreteWhens) = _splitCallbacks(callbacks)
   local ifRelations = _ifRelations(problem, hSym, entries)
-  ifRelations === nothing && isempty(relationWhens) && return callbacks
-  local n = (ifRelations === nothing ? 0 : length(ifRelations)) + length(relationWhens) + length(discreteWhens)
-  local e = EventIteration(ifRelations, relationWhens, discreteWhens, _eventIterationLimit(n))
+  ifRelations === nothing && isempty(relationWhens) && isempty(clusters) && return callbacks
+  local n = (ifRelations === nothing ? 0 : length(ifRelations)) + length(relationWhens) + length(discreteWhens) +
+            sum((length(c.rel) + length(c.members) for c in clusters); init = 0)
+  local reinit = any(c -> c.table, clusters) ? tableClusterInitAlg() : nothing
+  local e = EventIteration(ifRelations, relationWhens, clusters, discreteWhens, _eventIterationLimit(n), reinit)
   local cb = DiffEqBase.DiscreteCallback((u, t, integrator) -> _needsIteration(e, integrator),
                                          integrator -> _iterate!(e, integrator);
                                          initialize = (c, u, t, integrator) -> _initialize!(e, integrator),
@@ -425,18 +473,18 @@ function withIntegralDiscretes(callbacks, problem, names::Vector{String})
   return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(cb, callbacks)
 end
 
-#= Solve the algebraic unknowns again, the differential states kept (a
-   pure ODE has none). A DAEFunction (DFBDF, IDA) has no mass matrix; its
-   algebraic variables are the ones `differential_vars` excludes. Whether it
-   succeeded. =#
-function _resolveAlgebraics!(integrator)
+#= Solve the algebraic unknowns again with `alg` (nothing:
+   BrownFullBasicInit), the differential states kept (a pure ODE has none).
+   A DAEFunction (DFBDF, IDA) has no mass matrix; its algebraic variables are
+   the ones `differential_vars` excludes. Whether it succeeded. =#
+function _resolveAlgebraics!(integrator, alg = nothing)
   local f = integrator.f
   if hasproperty(f, :mass_matrix)
     local mm = f.mass_matrix
     (mm isa LinearAlgebra.UniformScaling || all(!iszero, LinearAlgebra.diag(mm))) && return true
   end
-  DiffEqBase.initialize_dae!(integrator, DiffEqBase.BrownFullBasicInit())
-  DiffEqBase.u_modified!(integrator, true)
+  DiffEqBase.initialize_dae!(integrator, alg === nothing ? DiffEqBase.BrownFullBasicInit() : alg)
+  _derivativeDiscontinuity!(integrator, true)
   return integrator.sol.retcode != ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
 end
 

@@ -104,7 +104,7 @@ const DAE_REINIT = IdDict{Any, Function}()
 
 function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
                                allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
-                               preMem=nothing)
+                               liftedDiscretes=String[])
   local states = ModelingToolkit.unknowns(reducedSystem)
   local params = ModelingToolkit.parameters(reducedSystem)
   # Use full_equations to inline observed variable definitions.
@@ -228,10 +228,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        starts and must survive the free phases of the init solve. The sidecar
        only knows splitInitialValues-level keys, so the literal init-eq keys
        are unioned in here. Lifted-discrete states are excluded everywhere:
-       their initialization is owned by the t0 initialize affects, and pinning
+       the discrete clusters set them at the start (their start bodies), and pinning
        them couples Newton to relation-kink defining rows it cannot satisfy. =#
-    local discreteNames = preMem === nothing ? OrderedSet{String}() :
-                          OrderedSet{String}(string(k) for k in keys(preMem))
+    local discreteNames = OrderedSet{String}(liftedDiscretes)
     local isDiscreteKey = k -> replace(k, "(t)" => "") in discreteNames
     local pinnedKeyStrSet = OrderedSet{String}(
       k for k in union(explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues),
@@ -306,36 +305,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                                          warm=true)
   end
 
-  #= After initialization pre(x) equals the committed x(t0); refresh the
-     lifted-discrete memory from the solved initial state. =#
-  resetDiscretePreMem!(preMem, reducedSystem, u0)
-
   @debug "DirectRHS: problem constructed successfully"
   return problem
 end
-
-"""
-    resetDiscretePreMem!(preMem, reducedSystem, u0)
-
-Refresh the lifted-discrete pre() memory from an initial state vector so
-pre(x) at the first event resolves to the committed x(t0). Must run at every
-solve start: a cached build otherwise carries the previous run's final values.
-"""
-function resetDiscretePreMem!(preMem, reducedSystem, u0)
-  (preMem === nothing || u0 === nothing) && return nothing
-  local states = try
-    ModelingToolkit.unknowns(reducedSystem)
-  catch
-    return nothing
-  end
-  for (i, st) in enumerate(states)
-    i <= length(u0) || break
-    local k = Symbol(replace(string(st), "(t)" => ""))
-    haskey(preMem, k) && (preMem[k] = u0[i])
-  end
-  return nothing
-end
-
 
 #= Returns `(values, constraintKeys)`. `values` seeds u0; `constraintKeys`
    names the literal initialization-equation LHS variables: user-requested
