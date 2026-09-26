@@ -37,6 +37,28 @@ using ModelingToolkit
 using SymbolicUtils
 using DifferentialEquations
 using OrdinaryDiffEq
+import ADTypes
+
+"""
+    defaultSolver()
+
+The solver used when none is given: Rodas5P, with finite-difference
+Jacobians. Rodas5's embedded error estimate misses a right-hand side that
+depends on time explicitly: on x' = cos(39t) it took 10 steps at reltol 1e-8
+and ended far from the solution, where Rodas5P is right (SciML recommends
+Rodas5P over Rodas5). A mass-matrix system of a shape that Rosenbrock methods
+handle badly switches to [`daeFallbackSolver`](@ref).
+"""
+defaultSolver() = Rodas5P(autodiff = ADTypes.AutoFiniteDiff())
+
+"""
+    daeFallbackSolver()
+
+FBDF with finite-difference Jacobians: what the generated
+`simulateFromBuild` uses instead of a Rosenbrock method for purely algebraic
+systems and for algebraic rows of generated discrete variables.
+"""
+daeFallbackSolver() = FBDF(autodiff = ADTypes.AutoFiniteDiff())
 
 import ..CodeGeneration
 import ..Runtime
@@ -994,7 +1016,7 @@ end
    simulateModel(modelName::String;
                        MODE = DEFAULT_BACKEND_MODE[],
                        tspan = (0.0, 1.0),
-                       solver = Rodas5(),
+                       solver = defaultSolver(),
                        kwargs...)
   ```
   Simulates model interactively.
@@ -1004,7 +1026,7 @@ end
 function simulateModel(modelName::String;
                        MODE = DEFAULT_BACKEND_MODE[],
                        tspan = (0.0, 1.0),
-                       solver = Rodas5(autodiff=false),
+                       solver = defaultSolver(),
                        overwriteCache::Bool = false,
                        kwargs...)
   modelName = canonicalName(modelName)
@@ -1206,7 +1228,7 @@ Simulate an already compiled model again, without recompiling. `parameters`
 (`withTunableParameters`); other keyword arguments go to the solver.
 """
 function resimulateModel(modelName::String;
-                         solver = Rodas5(autodiff=false),
+                         solver = defaultSolver(),
                          MODE = DEFAULT_BACKEND_MODE[],
                          tspan=(0.0, 1.0),
                          parameters::AbstractDict = Dict(),

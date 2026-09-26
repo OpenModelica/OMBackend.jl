@@ -4,6 +4,7 @@ authors = ["John Tinnerholm <johti17@liu.se>", "Karim Abdelhak <karim.abdelhak@f
 version = "0.5.1"
 
 [deps]
+ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
 Absyn = "ce2f92e2-a952-11e9-0543-8b443f216f1d"
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
 DAE = "0174eeea-c361-11e9-3d0d-a9ca8048aff6"
@@ -55,6 +56,7 @@ OMRuntimeExternalC = { path = "../OMRuntimeExternalC.jl" }
 SCode = { path = "../SCode.jl" }
 
 [compat]
+ADTypes = "1"
 MetaModelica = "0.4"
 ModelingToolkit = "= 11.21.0"
 PrecompileTools = "1"

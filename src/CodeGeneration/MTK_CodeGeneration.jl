@@ -655,12 +655,12 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
                  end)
       return result
     end
-    # function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0), solver=Rodas5(autodiff=false))
+    # function $(Symbol("$(MODEL_NAME)Simulate"))(tspan = (0.0, 1.0), solver = OMBackend.defaultSolver())
     #   $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
     #   OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver)
     # end
 
-    function simulate(tspan = (0.0, 1.0), solver=Rodas5(); kwargs...)
+    function simulate(tspan = (0.0, 1.0), solver = OMBackend.defaultSolver(); kwargs...)
       $(Symbol("$(MODEL_NAME)Model_problem")) = $(Symbol("$(MODEL_NAME)Model"))(tspan)
       OMBackend.Runtime.solve($(Symbol("$(MODEL_NAME)Model_problem")), tspan, solver; kwargs...)
     end
@@ -724,7 +724,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     #= simulateFromBuild: post-build solve pipeline (init-alg, Rodas/FBDF auto-switch,
        DAE routing, InitialFailure retry, terminal events). Extracted from simulate so
        the iMTK path can drive it with a cached build; simulate behavior is unchanged. =#
-    function simulateFromBuild(built, tspan = (0.0, 1.0), solver = Rodas5();  kwargs...)
+    function simulateFromBuild(built, tspan = (0.0, 1.0), solver = OMBackend.defaultSolver(); kwargs...)
       ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreducible) = built
       global LATEST_REDUCED_SYSTEM = $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))
       global LATEST_PROBLEM = $(Symbol("$(MODEL_NAME)Model_problem"))
@@ -782,7 +782,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
           end
         end
       end
-      #= Auto-switch from Rosenbrock (default Rodas5) to FBDF for DAE shapes
+      #= Auto-switch from Rosenbrock (the default Rodas5P) to FBDF for DAE shapes
          where Rosenbrock mass-matrix stepping is known to be brittle:
          purely-algebraic systems, and mixed systems with algebraic rows for
          generated discrete variables. Brake reaches a consistent initial
@@ -811,7 +811,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
         local _mtkName = u -> replace(replace(string(u), "var\"" => ""), "\"" => "")
         if _nDiff == 0
           @info "[MTK GEN: solver] zero differential states detected, switching default $(_solverName) -> FBDF for purely-algebraic DAE"
-          _solver = FBDF(autodiff=false)
+          _solver = OMBackend.daeFallbackSolver()
         elseif _nAlg > 0 && !isempty(_discreteUnknownNames) && $(isempty(simCode.whenEquations))
           #= Only when the model has NO when-equation callbacks: event-driven
              discretes are kept consistent by their callbacks and integrate fine
@@ -826,7 +826,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
           local _hasDiscreteAlgUnknown = any(i -> _mm[i,i] == 0 && _mtkName(_unknowns[i]) in _discreteUnknownNames, 1:_nCheck)
           if _hasDiscreteAlgUnknown
             @info "[MTK GEN: solver] algebraic rows involving generated discrete variables detected in mass-matrix system; switching default $(_solverName) -> FBDF"
-            _solver = FBDF(autodiff=false)
+            _solver = OMBackend.daeFallbackSolver()
           end
         end
       end
@@ -892,7 +892,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       $(createTerminalBodyRunner(simCode))
       OMBackend.CodeGeneration.dropPreInitializationPoint!(_sol)
     end
-    function simulate(tspan = (0.0, 1.0), solver = Rodas5(); cached_build = nothing, kwargs...)
+    function simulate(tspan = (0.0, 1.0), solver = OMBackend.defaultSolver(); cached_build = nothing, kwargs...)
       local built = cached_build === nothing ? $(Symbol("$(MODEL_NAME)Model"))(tspan) : cached_build
       return simulateFromBuild(built, tspan, solver; kwargs...)
     end

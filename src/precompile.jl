@@ -1,6 +1,6 @@
 #= Warm the shared MTK + OrdinaryDiffEq method instances that every generated
    model module invokes at build/solve time (structural_simplify, the init-solve
-   ODEProblem, and the Rodas5/FBDF mass-matrix solve). The per-model module is
+   ODEProblem, and the default (Rodas5P) and FBDF mass-matrix solves). The per-model module is
    eval'd after package load and cannot be cached into the image; these shared
    callees can, which is where the first-call latency actually lives.
 
@@ -39,8 +39,8 @@ function _precompileWarmup()
                           warn_initialize_determined = false,
                           build_initializeprob = true, fully_determined = false)
   prob = ModelingToolkit.SciMLBase.remake(prob; tspan = (0.0, 2.0))
-  solve(prob, Rodas5(autodiff = false))
-  solve(prob, FBDF(autodiff = false))
+  solve(prob, defaultSolver())
+  solve(prob, daeFallbackSolver())
   return nothing
 end
 
@@ -51,8 +51,8 @@ function _precompileWarmupDirectRHS()
   local (reduced, ivs, pars) = _precompileBuildReduced()
   local callbacks = ModelingToolkit.SciMLBase.CallbackSet()
   local prob = CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), callbacks)
-  solve(prob, Rodas5(autodiff = false))
-  solve(prob, FBDF(autodiff = false))
+  solve(prob, defaultSolver())
+  solve(prob, daeFallbackSolver())
   return nothing
 end
 
@@ -97,8 +97,8 @@ end
    legacy when-equation class. =#
 function _precompileWarmupDirectRHSEventful()::Nothing
   local prob = _precompileBuildDirectRHSEventfulProblem()
-  solve(prob, Rodas5(autodiff = false))
-  solve(prob, FBDF(autodiff = false))
+  solve(prob, defaultSolver())
+  solve(prob, daeFallbackSolver())
   return nothing
 end
 
@@ -129,8 +129,8 @@ function _precompileWarmupMTKCallbackDAE()::Nothing
   local prob = CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0),
                                                     ModelingToolkit.SciMLBase.CallbackSet())
   prob = _precompileCollapseCallback(prob)
-  solve(prob, Rodas5(autodiff = false))
-  solve(prob, FBDF(autodiff = false))
+  solve(prob, defaultSolver())
+  solve(prob, daeFallbackSolver())
   return nothing
 end
 
