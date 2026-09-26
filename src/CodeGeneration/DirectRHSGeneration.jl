@@ -508,8 +508,12 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
   exprs = exprs[keep]
   derIdxs = derIdxs[keep]
   mmScales = mmScales[keep]
+  #= With CSE, as the RHS: the rows have the observed equations substituted,
+     which a multibody model (MSL fullRobot: 119 unknowns, 1809 observed
+     equations) expands to millions of terms as a tree; Julia never finishes
+     lowering such a function. =#
   local gFunc = try
-    local fExpr = Symbolics.build_function(exprs, states, params, iv; expression = Val{true})
+    local fExpr = Symbolics.build_function(exprs, states, params, iv; expression = Val{true}, cse = true)
     _exprToRTGFunction(fExpr[1])
   catch e
     @debug "DirectRHS: could not build symbolic initialization residuals" exception = e
