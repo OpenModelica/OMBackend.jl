@@ -1259,7 +1259,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       end
       function _buildInitialConstraintEqs()
         local _eqs = Symbolics.Equation[$([_substSyms(e, _ifEqRelay_aliases) for e in generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)]...),
-                                        $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, occVariables, algebraicVariables), simCode)]...)]
+                                        $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, occVariables, algebraicVariables, discreteVariables), simCode)]...)]
         $(emitInitAlgConstraintAppends(simCode)...)
         return _eqs
       end

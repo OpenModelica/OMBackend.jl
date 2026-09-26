@@ -721,6 +721,91 @@ function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64,
   end
 end
 
+const _RELATION_WHEN_EXCLUDED_CALLS = ("pre", "edge", "change", "sample", "initial", "terminal", "der",
+                                       "delay", "noEvent", "smooth", "reinit")
+
+#= A when condition that is one relation `a op b` (op one of < <= > >=) whose
+   operands call none of the operators above: (a, b, isLess, strict), or
+   nothing. =#
+function _singleRelationWhen(@nospecialize(cond))
+  @match cond begin
+    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
+      local kind = @match op begin
+        DAE.LESS(__) => (true, true)
+        DAE.LESSEQ(__) => (true, false)
+        DAE.GREATER(__) => (false, true)
+        DAE.GREATEREQ(__) => (false, false)
+        _ => nothing
+      end
+      kind === nothing && return nothing
+      local plain = Ref(true)
+      local visit = function (e, arg)
+        @match e begin
+          DAE.CALL(Absyn.IDENT(name), _, _) where (name in _RELATION_WHEN_EXCLUDED_CALLS) => begin
+            plain[] = false
+            return (e, false, arg)
+          end
+          _ => return (e, true, arg)
+        end
+      end
+      Util.traverseExpTopDown(e1, visit, nothing)
+      Util.traverseExpTopDown(e2, visit, nothing)
+      plain[] ? (e1, e2, kind[1], kind[2]) : nothing
+    end
+    _ => nothing
+  end
+end
+
+#= A when-equation on one relation (relationRefresh.jl relationWhenCallback):
+   the relation is buffered, set literally at the start, with a hysteresis,
+   and the body runs only when it becomes true. `zc` is `a - b` for < and <=,
+   `b - a` for > and >=, so the relation is true when zc < 0 (or <= 0). =#
+function _emitRelationWhen(eq, simCode, callbacks::Int, rel)
+  local wEq = eq.whenEquation
+  local (e1, e2, isLess, strict) = rel
+  local sub = DAE.SUB(DAE.T_REAL_DEFAULT)
+  local zcDAE = isLess ? DAE.BINARY(e1, sub, e2) : DAE.BINARY(e2, sub, e1)
+  local names = String[]
+  for c in listArray(Util.getAllCrefs(DAE.BINARY(e1, sub, e2)))
+    local n = string(c)
+    (n == "time" || n in names) && continue
+    local entry = get(simCode.stringToSimVarHT, n, nothing)
+    (entry === nothing || entry[2].varKind isa SimulationCode.STRING) && continue
+    push!(names, n)
+  end
+  local args = Symbol[Symbol(n) for n in names]
+  local whenStmts = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
+  quote
+    $(Symbol("cb$(callbacks)")) = let _affCache = Ref{Any}(nothing)
+      local _eval = (t, $(args...)) -> (Float64($(expToJuliaExpMTK(zcDAE, simCode))),
+                                        1.0 + max(abs(Float64($(expToJuliaExpMTK(e1, simCode)))),
+                                                  abs(Float64($(expToJuliaExpMTK(e2, simCode))))))
+      local _body! = (integrator) -> begin
+        local t = integrator.t
+        local x = integrator.u
+        local lookuptableStates
+        local lookuptableParams
+        if _affCache[] === nothing
+          local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+          lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+          lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+          _affCache[] = (lookuptableStates, lookuptableParams)
+        else
+          local cached = _affCache[]
+          lookuptableStates = cached[1]
+          lookuptableParams = cached[2]
+        end
+        $(_whenLookupBindings(bodyCrefs, simCode)...)
+        $(whenStmts...)
+        nothing
+      end
+      OMBackend.CodeGeneration.relationWhenCallback($(names), _eval, $(strict), _body!)
+    end
+  end
+end
+
 """
   This function creates a representation of a when equation in Julia.
 """
@@ -758,6 +843,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     if _pulse !== nothing && _pulse[2] > 0.0
       return _emitPulsePeriodicWhen(eq, simCode, callbacks, _pulse[1], _pulse[2])
     end
+  end
+  #= A when on one relation: buffered relation with a hysteresis (MLS 8.5). =#
+  if isContinuousCond && !isPeriodic && wEq.elsewhenPart === nothing
+    local rel = _singleRelationWhen(wEqCondDAE)
+    rel === nothing || return _emitRelationWhen(eq, simCode, callbacks, rel)
   end
   #= A `sample(start, period)` is a periodic clock even when its interval is a
      parameter, which isContinuousCondition mis-flags as continuous; keep all

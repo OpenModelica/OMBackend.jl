@@ -128,3 +128,108 @@ function dropPreInitializationPoint!(sol)
   end
   return sol
 end
+
+#= When-equations on a single relation (codeGen.jl `_emitRelationWhen`).
+   The relation keeps its value between events in a buffer (MLS 8.5), set
+   literally at the start; its crossing function is shifted by the same
+   hysteresis as the if-equation branches, relative to that value, so a
+   relation that starts at its threshold becomes true right after the start
+   and one that crosses back is seen. The when body runs only when the
+   relation becomes true (MLS 8.3.5). The operands are read by name, so they
+   may be unknowns, observed variables or parameters. =#
+
+_plainVariableName(@nospecialize(v)) = replace(string(v), "(t)" => "", "var\"" => "", "\"" => "")
+
+"""
+    namedValueFunctions(sys, names) -> Vector or nothing
+
+For each variable name (as the Modelica cref prints), a function `(u, p, t)`
+that returns its value: an unknown, an observed variable or a parameter.
+Nothing when the system lacks one of them (a variable-structure model runs
+the callbacks of every mode; a mode's callbacks see the other modes'
+systems).
+"""
+function namedValueFunctions(sys, names::Vector{String})
+  sys === nothing && return nothing
+  local byName = Dict{String, Any}()
+  for v in ModelingToolkit.unknowns(sys)
+    byName[_plainVariableName(v)] = v
+  end
+  for eq in ModelingToolkit.observed(sys)
+    byName[_plainVariableName(eq.lhs)] = eq.lhs
+  end
+  for p in ModelingToolkit.parameters(sys)
+    byName[_plainVariableName(p)] = p
+  end
+  all(n -> haskey(byName, n), names) || return nothing
+  return [ModelingToolkit.build_explicit_observed_function(sys, byName[n]) for n in names]
+end
+
+"""
+    relationWhenCallback(names, eval, strict, body!) -> ContinuousCallback
+
+A when-equation on one relation. `eval(t, values...)` returns `(zc, scale)`
+for the values of `names`: the relation is true when zc < 0 (`strict`) or
+zc <= 0, and `scale` sizes the hysteresis. `body!(integrator)` is the when
+body. After the body the relation is evaluated again (event iteration): a
+body that moves an operand (`reinit`) can make it false at once.
+"""
+function relationWhenCallback(names::Vector{String}, eval, strict::Bool, body!)
+  #= The value functions for the system they were built for; nothing while
+     the integrator's system lacks the names (another mode). =#
+  local cache = Ref{Any}((nothing, nothing))
+  local rel = Ref(false)
+  local literal = (zc) -> strict ? zc < 0 : zc <= 0
+  #= `eval` and `body!` are generated code, which a variable-structure model
+     may compile while it runs (after the solve started): call them in the
+     latest world. =#
+  local valuesAt = function (u, t, integrator, fns)
+    local p = integrator.p
+    return Base.invokelatest(eval, t, (f(u, p, t) for f in fns)...)
+  end
+  local functionsFor = function (integrator)
+    local sys = hasproperty(integrator.f, :sys) ? integrator.f.sys : nothing
+    local (cachedSys, fns) = cache[]
+    cachedSys === sys && return fns
+    fns = namedValueFunctions(sys, names)
+    cache[] = (sys, fns)
+    #= Active in this system from now on: the relation starts literal. =#
+    fns === nothing || (rel[] = literal(first(valuesAt(integrator.u, integrator.t, integrator, fns))))
+    return fns
+  end
+  local hysteresis = integrator -> 1.0e-4 * max(Float64(first(integrator.opts.reltol)), 1.0e-12)
+  local condition = function (u, t, integrator)
+    local fns = functionsFor(integrator)
+    fns === nothing && return 1.0
+    local (zc, scale) = valuesAt(u, t, integrator, fns)
+    return zc + hysteresis(integrator) * scale * (1 - 2 * rel[])
+  end
+  local updated = function (integrator, fns)
+    local (zc, scale) = valuesAt(integrator.u, integrator.t, integrator, fns)
+    local eps = hysteresis(integrator) * scale
+    return rel[] ? zc <= eps : zc <= -eps
+  end
+  local affect! = function (integrator)
+    local fns = functionsFor(integrator)
+    fns === nothing && return nothing
+    local new = updated(integrator, fns)
+    new == rel[] && return nothing
+    rel[] = new
+    if new
+      Base.invokelatest(body!, integrator)
+      rel[] = updated(integrator, fns)
+    end
+    return nothing
+  end
+  local initialize = function (c, u, t, integrator)
+    cache[] = (nothing, nothing)
+    functionsFor(integrator)
+    return nothing
+  end
+  #= RightRootFind: the event lands just past the root, where the rule above
+     sees the crossing. The initialize function leaves the modified flag
+     alone (the default one clears what another callback set). =#
+  return DiffEqBase.ContinuousCallback(condition, affect!, affect!;
+                                       initialize = initialize, rootfind = ModelingToolkit.SciMLBase.RightRootFind,
+                                       save_positions = (true, true))
+end
