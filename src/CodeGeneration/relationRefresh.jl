@@ -11,11 +11,16 @@
    zc <= eps, a FALSE one becomes TRUE when zc <= -eps (single sweep). =#
 
 #= A getter for a crossing function or scale; a constant (not symbolic) is a
-   Real that is not a Symbolics.Num. =#
+   Real that is not a Symbolics.Num. Not SII.getu: it takes an expression over
+   observed variables for a parameter-only one (GetParameterObserved), and the
+   generated function then reads the unknowns as undefined globals (the V6
+   cylinder rig, `2*v_rel` with v_rel observed). A single variable works, and
+   so does building the observed function directly. =#
 function _valueGetter(problem, @nospecialize(ex))
   local v = Symbolics.unwrap(ex)
   (v isa Real && !(v isa Symbolics.Num)) && return (integrator -> Float64(v))
-  return ModelingToolkit.SymbolicIndexingInterface.getu(problem, ex)
+  local f = ModelingToolkit.build_explicit_observed_function(problem.f.sys, v)
+  return integrator -> f(integrator.u, integrator.p, integrator.t)
 end
 
 """

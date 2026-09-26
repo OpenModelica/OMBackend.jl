@@ -1407,6 +1407,27 @@ function containsDerCall(@nospecialize(exp::DAE.Exp))::Bool
   end
 end
 
+"""
+    startValueVariableNames(simCode) -> Vector{String}
+
+The variables whose start values go into the initial-value map: the flagged
+irreducibles, then every state that is not among them. A state keeps its
+start value whether or not it is irreducible (a state MTK may reduce still
+needs one, and a structural transition model has no initialization problem
+to find it).
+"""
+function startValueVariableNames(simCode::SimulationCode.SIM_CODE)::Vector{String}
+  local names = String[vn for vn in simCode.irreducibleVariables]
+  local seen = Set{String}(names)
+  for (name, (_, simVar)) in simCode.stringToSimVarHT
+    simVar.varKind isa SimulationCode.STATE || continue
+    name in seen && continue
+    push!(names, name)
+    push!(seen, name)
+  end
+  return names
+end
+
 function hasExplicitStartValue(vars::Vector, simCode::SimulationCode.SIM_CODE)::Bool
   local ht::Dict = simCode.stringToSimVarHT
   for var in vars

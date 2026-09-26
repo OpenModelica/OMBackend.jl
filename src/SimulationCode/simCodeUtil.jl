@@ -877,11 +877,77 @@ function isOverconstrainedConnectorVariable(simVarName::String, occVariables::Ve
   return isOCCVar
 end
 
+#= The variable assigned by an if-equation whose branches all assign the same
+   single variable (`v = expression`, or its residual `v - expression`), or
+   nothing. Every if-expression lifted by Causalize's IfExpressionLifter has
+   this form (v is its ifEq_tmp temporary). =#
+function _liftedIfTarget(eq::BDAE.IF_EQUATION)
+  local lhsNames = Set{String}()
+  for eqs in Iterators.flatten((eq.eqnstrue, (eq.eqnsfalse,)))
+    for e in eqs
+      local lhs = @match e begin
+        BDAE.EQUATION(lhs = l) => l
+        BDAE.RESIDUAL_EQUATION(exp = DAE.BINARY(l, DAE.SUB(__), _)) => l
+        _ => nothing
+      end
+      lhs isa DAE.CREF || return nothing
+      push!(lhsNames, DAE_identifierToString(lhs))
+    end
+  end
+  return length(lhsNames) == 1 ? only(lhsNames) : nothing
+end
+
+_whenOperatorExps(op) = @match op begin
+  BDAE.ASSIGN(left = l, right = r) => DAE.Exp[l, r]
+  BDAE.REINIT(stateVar = v, value = e) => DAE.Exp[v, e]
+  BDAE.ASSERT(condition = c, message = m) => DAE.Exp[c, m]
+  BDAE.TERMINATE(message = m) => DAE.Exp[m]
+  BDAE.NORETCALL(exp = e) => DAE.Exp[e]
+  _ => DAE.Exp[]
+end
+
+#= The states a when-equation reads or writes (conditions and bodies, the
+   elsewhen parts included). Its callbacks index the state vector by name
+   (`x[lookuptableStates[name]]`, reinit), so these must stay unknowns. =#
+function _statesUsedByWhens(whenEqs::Vector{BDAE.WHEN_EQUATION}, stateNames::Set{String})::Vector{String}
+  local used = OrderedSet{String}()
+  local visit = function (e)
+    for cr in Util.getAllCrefs(e)
+      local nm = string(cr)
+      nm in stateNames && push!(used, nm)
+    end
+  end
+  for weq in whenEqs
+    local stmts = weq.whenEquation
+    while true
+      visit(stmts.condition)
+      for op in stmts.whenStmtLst
+        foreach(visit, _whenOperatorExps(op))
+      end
+      local next = @match stmts.elsewhenPart begin
+        SOME(ew) => ew.whenEquation
+        _ => nothing
+      end
+      next === nothing && break
+      stmts = next
+    end
+  end
+  return collect(used)
+end
+
 """
-  Get all variables that should be marked as irreducible.
+  Get all variables that should be marked as irreducible (MTK must keep them
+  as unknowns).
 OBS:
 Parameters are never added to this list.
-The known irreducibles should be state variables and variables directly involved in changes that change the model structure.
+The states are not irreducible: as in OpenModelica, the compiler chooses the
+states (index reduction, tearing), and a start value that is not fixed is a
+guess. Irreducible are:
+- for an if-equation whose branches assign one variable (every lifted
+  if-expression), that variable; for other if-equations, all their variables;
+- the states that when-equations read or write (their callbacks index the
+  state vector by name);
+- the discretes in when conditions, and THETA.
 """
 function getIrreducibleVars(ifEquations::Vector{BDAE.IF_EQUATION},
                              whenEqs::Vector{BDAE.WHEN_EQUATION},
@@ -889,16 +955,20 @@ function getIrreducibleVars(ifEquations::Vector{BDAE.IF_EQUATION},
                              ht::OrderedDict{String, Tuple{Int, SimulationCode.SimVar}})
   local irreducibles::Vector{Any} = []
   for eq in ifEquations
-    variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
-    push!(irreducibles, variablesForEq)
+    local target = _liftedIfTarget(eq)
+    if target !== nothing
+      push!(irreducibles, [target])
+    else
+      variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
+      push!(irreducibles, variablesForEq)
+    end
   end
+  local stateNames = String[BDAE_identifierToVarString(v) for v in algebraicAndStateVariables if BDAEUtil.isState(v)]
+  push!(irreducibles, _statesUsedByWhens(whenEqs, Set{String}(stateNames)))
   #=
     Parameters should not be marked as irreducible
     Remove them from the list
   =#
-  local knownIrreducibles::Vector{BDAE.VAR} = filter((v) -> BDAEUtil.isState(v) , algebraicAndStateVariables)
-  #@debug "Adding all states as irreducible variables" map(x->string(x.varName), knownIrreducibles)
-  push!(irreducibles, map(x->BDAE_identifierToVarString(x), knownIrreducibles))
   irreducibles = collect(Iterators.flatten(irreducibles))
   irreducibles = filter(irv -> irv == "time" ||
                                   (haskey(ht, irv) && !isParameter(last(ht[irv]))),
@@ -1733,6 +1803,20 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
   #= Asserts are checked during the simulation: what they read is computed. =#
   local assertRefs = _collectAssertCrefNames!(OrderedSet{String}(), simCode.asserts)
   for vn in assertRefs
+    haskey(varNameToEq, vn) && push!(seedEqs, varNameToEq[vn])
+  end
+  #= If-equations are not residual equations, so the search below does not
+     pass through them: what their conditions and branches read is computed. =#
+  local ifEqRefs = OrderedSet{String}()
+  for ifEq in simCode.ifEquations
+    for branch in ifEq.branches
+      collectCrefNames!(ifEqRefs, branch.condition)
+      for brEq in branch.residualEquations
+        collectCrefNames!(ifEqRefs, brEq.exp)
+      end
+    end
+  end
+  for vn in ifEqRefs
     haskey(varNameToEq, vn) && push!(seedEqs, varNameToEq[vn])
   end
   #= Classify unmatched equations: seed those referencing unknowns =#
@@ -4261,7 +4345,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
        Never eliminate irreducible variables (involved in events).
        Exception: state-to-state aliases inside the same component are safe to
        collapse even when both ends are flagged irreducible — `getIrreducibleVars`
-       marks every STATE as irreducible by default, which prevents two states that
+       marks the states that when-equations use as irreducible, which would prevent two states that
        are connected via algebraic-flange aliases (e.g. AIMC `aimc_inertiaRotor_phi`
        and `loadInertia_phi`) from being merged. Without merging, the residual
        `loadInertia_phi - aimc_inertiaRotor_phi = 0` survives and MTK Pantelides

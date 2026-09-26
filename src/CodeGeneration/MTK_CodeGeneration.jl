@@ -1039,13 +1039,14 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
        we MUST provide u0 defaults for all unknowns.
      This handles both constrained DAE systems (like Pendulum) and pure ODE systems
      (like MatrixVectorMult where states have no explicit start). =#
-  local anyStateHasExplicitStart = hasExplicitStartValue(simCode.irreducibleVariables, simCode)
+  local startValueVariables = startValueVariableNames(simCode)
+  local anyStateHasExplicitStart = hasExplicitStartValue(startValueVariables, simCode)
   local skipDefaultsForStates = anyStateHasExplicitStart
   #= Build default guesses for unknowns not in the heuristic-filtered u0.
      Guesses are passed to ODEProblem so the init solver has fallback values
      without overdetermining the system. =#
   local INITIAL_VALUE_EQUATIONS = unique!(createStartConditionsEquationsMTK(
-    String[vn for vn in simCode.irreducibleVariables],
+    startValueVariables,
     String[],
     simCode; skipDefaultStateStarts = skipDefaultsForStates))
   INITIAL_VALUE_EQUATIONS = vcat(DISCRETE_START_VALUES, INITIAL_VALUE_EQUATIONS)
@@ -1123,6 +1124,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      surviving relay representatives, so callback lookups hit live unknowns. =#
   simCode = substituteRelayAliasesInWhens(simCode, _ifEqRelay_aliases)
   local CALL_BACK_EQUATIONS = createCallbackCode(modelName, simCode; generateSaveFunction = false)
+  local NAMED_STATE_LOOKUPS = namedStateLookups(CALL_BACK_EQUATIONS)
   EQUATIONS = vcat(EQUATIONS,
                    DISCRETE_DUMMY_EQUATIONS,
                    CONDITIONAL_EQUATIONS)
@@ -1325,6 +1327,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
          the mass matrix. See `emitProblemConstruction` and its three
          strategy emitters for the full rationale. =#
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
+      OMBackend.CodeGeneration.checkNamedStateLookups(problem, $(NAMED_STATE_LOOKUPS))
       $(emitAssertCallback(simCode))
       $(emitRelationRefresh(IF_RELATIONS))
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreducibleSyms)
@@ -3698,8 +3701,11 @@ end
 function emitRelationRefresh(relations)::Expr
   isempty(relations) && return Expr(:block)
   local entries = [:(($(QuoteNode(sym)), $(zc), $(scale))) for (sym, zc, scale) in relations]
+  #= In the latest world, like the event list: the symbolic variables are
+     globals bound while the model is built. =#
   return :(callbacks = OMBackend.CodeGeneration.withRelationRefresh(callbacks, problem,
-                                                                     $(QuoteNode(ZC_HYSTERESIS)), [$(entries...)]))
+                                                                     $(QuoteNode(ZC_HYSTERESIS)),
+                                                                     Base.invokelatest(() -> Any[$(entries...)])))
 end
 
 #= The asserts of equation sections (simCode.asserts) as one callback that

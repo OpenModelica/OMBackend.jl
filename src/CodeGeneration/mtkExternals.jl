@@ -1248,6 +1248,20 @@ function resolveAliasInitialValue(diffState, idx::AliasEqIndex, ivMap::Dict)
   return nothing
 end
 
+#= Whether a symbolic expression has more than `cap` nodes, counted as a tree
+   (shared subexpressions count each time); stops at the cap. =#
+function _exprLargerThan(@nospecialize(ex), cap::Int)::Bool
+  local n = 0
+  local stack = Any[Symbolics.unwrap(ex)]
+  while !isempty(stack)
+    local e = pop!(stack)
+    n += 1
+    n > cap && return true
+    SymbolicUtils.iscall(e) && append!(stack, SymbolicUtils.arguments(e))
+  end
+  return false
+end
+
 function _resolveAliasFromExpr(diffState, @nospecialize(expr), varCount::Int, ivMap::Dict)
   local exprSub = Symbolics.substitute(expr, ivMap)
   #= Fast path: plain substitution. =#
@@ -1259,8 +1273,12 @@ function _resolveAliasFromExpr(diffState, @nospecialize(expr), varCount::Int, iv
        expression collapses to numeric-affine form instead of keeping spurious
        free branch variables that would block resolution. Capped to small
        equations: simplify on a large dynamics expression takes minutes and an
-       alias equation never has many variables. =#
+       alias equation never has many variables. Its size is capped too: in a
+       system with few unknowns every equation has few variables, but with the
+       observed variables substituted (full_equations) an equation can be huge,
+       and simplify then runs out of memory (the V6 cylinder rig: 8 unknowns). =#
     varCount <= 8 || return nothing
+    _exprLargerThan(exprSub, 200) && return nothing
     local exprS = Symbolics.simplify(exprSub)
     intercept = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 0))))
     sumOnePoint = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 1))))
@@ -2184,6 +2202,48 @@ function getStatesAsSymbols(daeFunc::ModelingToolkit.SciMLBase.DAEFunction)
   daeFunc.sys === nothing && return Symbol[]
   local states = ModelingToolkit.get_unknowns(daeFunc.sys)
   map(x->x.f.name, states)
+end
+
+#= The names the legacy callbacks index the state vector by
+   (`lookuptableStates[Symbol("name")]`) in generated code `ex`. =#
+function namedStateLookups(ex)::Vector{String}
+  local names = OrderedSet{String}()
+  local walk
+  walk = function (e)
+    e isa Expr || return nothing
+    local key = if e.head == :ref && length(e.args) == 2 && e.args[1] === :lookuptableStates
+      e.args[2]
+    elseif e.head == :call && length(e.args) == 3 && e.args[1] in (:getindex, getindex) && e.args[2] === :lookuptableStates
+      e.args[3]
+    else
+      nothing
+    end
+    if key isa Expr && key.head == :call && length(key.args) == 2 && key.args[1] === :Symbol && key.args[2] isa String
+      push!(names, key.args[2])
+    end
+    foreach(walk, e.args)
+    return nothing
+  end
+  walk(ex)
+  return collect(names)
+end
+
+"""
+    checkNamedStateLookups(problem, names)
+
+Warn when a variable the callbacks read from or write to the state vector by
+name is not an unknown of the simplified system: its lookup would fail when
+the callback runs.
+"""
+function checkNamedStateLookups(problem, names::Vector{String})
+  isempty(names) && return nothing
+  local f = problem.f
+  (hasproperty(f, :sys) && f.sys !== nothing) || return nothing
+  local have = Set{String}(string(s) for s in getStatesAsSymbols(f))
+  local missingNames = filter(n -> !(n in have), names)
+  isempty(missingNames) ||
+    @warn "[events] callbacks index the state vector by these names, but they are not unknowns of the simplified system" missingNames
+  return nothing
 end
 
 function getParametersAsSymbols(odeFunc::ODEFunction)
