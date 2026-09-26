@@ -1360,6 +1360,39 @@ function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
   return out
 end
 
+#= Names (as strings) of the variables initialization equations determine:
+   the left-hand side of each, and x for every derivative D(x) in them. The
+   arguments of other right-hand sides (e.g. positions passed to a branch
+   selection function) are only read. =#
+function _initializationVarStrs(initEqs)::OrderedSet{String}
+  local out = OrderedSet{String}()
+  local visit
+  visit = function (ex, isLhs::Bool)
+    local v = Symbolics.unwrap(ex)
+    SymbolicUtils.iscall(v) || (isLhs && push!(out, string(v)); return nothing)
+    local op = SymbolicUtils.operation(v)
+    if op isa ModelingToolkit.Differential
+      foreach(a -> push!(out, string(Symbolics.unwrap(a))), SymbolicUtils.arguments(v))
+      return nothing
+    end
+    #= x(t) is a call of x on t: a variable, not an expression. =#
+    if isLhs && SymbolicUtils.issym(op)
+      push!(out, string(v))
+      return nothing
+    end
+    foreach(a -> visit(a, false), SymbolicUtils.arguments(v))
+    return nothing
+  end
+  for eq in initEqs
+    try
+      visit(eq.lhs, true)
+      visit(eq.rhs, false)
+    catch
+    end
+  end
+  return out
+end
+
 "Seed guesses for reduced unknowns by name; overrides only absent or default-0.0 entries."
 function mergeSoftGuesses(reducedSystem, pairs::AbstractVector; force::Bool = false)
   isempty(pairs) && return reducedSystem
@@ -1526,8 +1559,15 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
        fails to honour drops the user's start (e.g. an event-held discrete's consumer
        state landing at 0 instead of its start). =#
     local _algCoupled = _algebraicCoupledVarStrs(reducedSystem)
+    #= Likewise a state an initialization equation determines (its left-hand
+       side, or x in D(x)): `der(x) = 0` (steady state, MSL filters) fixes x
+       through its differential equation, and pinning x at its start as well
+       over-determines the initialization (the init solve then frees every
+       variable and moves the fixed=true ones; the MSL EngineV6's crank). =#
+    local _initCoupled = _initializationVarStrs(initEqs)
     local demoted = filter(p -> !(string(p.first) in fixedTrueLhsSet) &&
-                                (string(p.first) in _algCoupled), hardInitialValues)
+                                (string(p.first) in _algCoupled || string(p.first) in _initCoupled),
+                           hardInitialValues)
     if !isempty(demoted)
       local _demotedKeys = OrderedSet(string(p.first) for p in demoted)
       hardInitialValues = filter(p -> !(string(p.first) in _demotedKeys), hardInitialValues)
