@@ -379,4 +379,7 @@ import .ExampleDAEs
   #= ── 9. Event iteration within one event ─────────────────────── =#
   include("eventIterationTests.jl")
 
+  #= ── 10. Step control for algebraic unknowns ─────────────────── =#
+  include("algebraicStepControlTests.jl")
+
 end

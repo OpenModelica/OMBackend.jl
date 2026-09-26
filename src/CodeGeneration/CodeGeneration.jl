@@ -82,6 +82,7 @@ include("./DirectRHSGeneration.jl")
 include("./asserts.jl")
 include("./discreteClusters.jl")
 include("./relationRefresh.jl")
+include("./algebraicStepControl.jl")
 include("./MTK_CodeGeneration.jl")
 include("./DiscreteDummyDemotion.jl")
 

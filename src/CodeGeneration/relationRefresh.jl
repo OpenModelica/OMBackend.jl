@@ -453,7 +453,7 @@ end
 """
     withIntegralDiscretes(callbacks, problem, names) -> callbacks
 
-Add a DiscreteCallback, first among the discrete callbacks (before the event
+Add a DiscreteCallback ahead of the other discrete callbacks (before the event
 iteration reads them), that rounds the unknowns `names` back to integers
 after a step that left round-off in them.
 """

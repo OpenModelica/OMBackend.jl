@@ -1331,6 +1331,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       callbacks = OMBackend.CodeGeneration.withIntegralDiscretes(callbacks, problem, $(integralDiscreteNames(discreteVariablesSym, simCode)))
       #= Asserts after the event iteration: they check the settled state. =#
       $(emitAssertCallback(simCode))
+      #= First among the discrete callbacks: it reads the step as the solver took it. =#
+      callbacks = OMBackend.CodeGeneration.withAlgebraicStepControl(callbacks, problem)
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreducibleSyms)
     end
   end
