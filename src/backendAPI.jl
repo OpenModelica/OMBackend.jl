@@ -38,6 +38,7 @@ using SymbolicUtils
 using DifferentialEquations
 using OrdinaryDiffEq
 import ADTypes
+import OrdinaryDiffEqBDF
 
 """
     defaultSolver()

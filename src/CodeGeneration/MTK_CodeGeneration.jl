@@ -510,7 +510,7 @@ const ZC_HYSTERESIS_DEFAULT = 1.0e-7   # reltol 1e-3, DifferentialEquations' def
    solved again at the event with the states kept (Modelica's event
    iteration re-solves the system; NoInit left e.g. `y = if ... then 1 else 2`
    at its old value until the end of the next step). =#
-const _BRANCH_EVENT_REINIT = :(OMBackend.OrdinaryDiffEq.BrownFullBasicInit())
+const _BRANCH_EVENT_REINIT = :(OMBackend.CodeGeneration.DiffEqBase.BrownFullBasicInit())
 
 """
   Generates simulation code targeting modeling toolkit.
@@ -573,7 +573,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
   code = quote
     import DAE
     import DataStructures.OrderedCollections
-    using DataStructures.OrderedCollections: OrderedSet
+    using DataStructures.OrderedCollections: OrderedSet, OrderedDict
     import SCode
     import OMBackend
     import OMBackend.CodeGeneration
@@ -706,7 +706,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     using OrdinaryDiffEq
     using Symbolics
     using OMBackend
-    using DataStructures.OrderedCollections: OrderedSet
+    using DataStructures.OrderedCollections: OrderedSet, OrderedDict
     import Setfield
     Base.Experimental.@compiler_options optimize=0 compile=min infer=false
     #= Add import to the external runtime if the generated code calls Modelica Functions =#
@@ -846,10 +846,8 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       #= Stash the exact runtime solve inputs so a manual integrator loop can
          reproduce the real event wiring (debug aid for friction/event work). =#
       global LATEST_SOLVE_TRIPLE = (_problemForSolver, _solver, callbacks)
-      #= Table-cluster models: Broyden event re-init diverges on piecewise
-         constant residuals; default to Newton-FD unless the caller chose. =#
-      local _initKw = $(_modelHasTableClusters(simCode)) && !haskey(kwargs, :initializealg) ?
-        (; initializealg = OMBackend.CodeGeneration.tableClusterInitAlg()) : (;)
+      local _initKw = OMBackend.CodeGeneration.defaultInitializeKwargs(_problemForSolver, kwargs,
+                                                                       $(_modelHasTableClusters(simCode)))
       #= pre(x) at the first event equals the committed x(t0): refresh the
          lifted-discrete memory from this run's initial state. =#
       if @isdefined(DISCRETE_PRE_MEM)
@@ -1064,9 +1062,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      so re-aliasing it to another leaf strands the lookup. Force them to be the
      relay component root. =#
   local _condDiscretes = whenConditionDiscreteSyms(simCode)
-  #= They must also survive structural_simplify as unknowns: a condition cref
-     demoted to an MTK observed is unreadable from the legacy callback. =#
-  for _s in _condDiscretes
+  #= Every discrete variable with der(v) = 0 must survive structural_simplify
+     as an unknown: events change it, and the callbacks read and write it in
+     the state vector by name. ModelingToolkit folds a state whose derivative
+     is zero into a constant unless it is irreducible (11.45 does; 11.21 kept
+     it). The condition discretes are among them. =#
+  for _s in discreteVariablesSym
     _s in irreducibleSyms || push!(irreducibleSyms, _s)
   end
   #= Parameters have no module-global symbolic binding (they live in the local
@@ -1130,6 +1131,13 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                    DISCRETE_DUMMY_EQUATIONS,
                    CONDITIONAL_EQUATIONS)
   EQUATIONS = rewriteEquations(EQUATIONS, simCode)
+  #= A state with der(v) = 0 must survive structural_simplify too: an initial
+     algorithm or initial equation sets it, and it is read by name.
+     ModelingToolkit turns such a state into a parameter unless it is
+     irreducible (11.45 does; 11.21 kept it). =#
+  for _s in zeroDerivativeSymbols(EQUATIONS)
+    _s in irreducibleSyms || push!(irreducibleSyms, _s)
+  end
   local _seenMtkEquationExprs = OrderedSet{String}()
   local _dedupedMtkEquations = Expr[]
   local _nDedupedMtkEquations = 0
@@ -1303,7 +1311,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
       #= Wrap discrete start values in a function and call with invokelatest to avoid world-age issues =#
       function _getDiscreteVars()
-        collect(values(ModelingToolkit.OrderedDict($(DISCRETE_START_VALUES...))))
+        collect(values(OrderedDict($(DISCRETE_START_VALUES...))))
       end
       local discreteVars = Base.invokelatest(_getDiscreteVars)
       eventParameters = vcat(eventParameters, discreteVars)
@@ -1330,6 +1338,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
       OMBackend.CodeGeneration.checkNamedStateLookups(problem, $(NAMED_STATE_LOOKUPS))
       $(emitRelationRefresh(IF_RELATIONS))
+      callbacks = OMBackend.CodeGeneration.withIntegralDiscretes(callbacks, problem, $(integralDiscreteNames(discreteVariablesSym, simCode)))
       #= Asserts after the event iteration: they check the settled state. =#
       $(emitAssertCallback(simCode))
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreducibleSyms)
@@ -3098,9 +3107,44 @@ end
    piecewise-constant algebraic rows need; Broyden's secant update diverges
    on them. Used as the event re-init default for table-cluster models. =#
 function tableClusterInitAlg()
-  local NL = OMBackend.OrdinaryDiffEq.OrdinaryDiffEqNonlinearSolve
-  return OMBackend.OrdinaryDiffEq.BrownFullBasicInit(1e-8,
-    NL.NewtonRaphson(; autodiff = NL.ADTypes.AutoFiniteDiff()))
+  return DiffEqBase.BrownFullBasicInit(1e-8, NonlinearSolve.NewtonRaphson(; autodiff = ADTypes.AutoFiniteDiff()))
+end
+
+#= The discrete unknowns of Integer, Boolean or enumeration type, whose
+   values must stay integral (withIntegralDiscretes). =#
+function integralDiscreteNames(discreteSyms, simCode)::Vector{String}
+  local out = String[]
+  for s in discreteSyms
+    local name = string(s)
+    haskey(simCode.stringToSimVarHT, name) || continue
+    local (_, var) = simCode.stringToSimVarHT[name]
+    local integral = @match var.attributes begin
+      SOME(DAE.VAR_ATTR_INT(__)) => true
+      SOME(DAE.VAR_ATTR_BOOL(__)) => true
+      SOME(DAE.VAR_ATTR_ENUMERATION(__)) => true
+      _ => false
+    end
+    integral && push!(out, name)
+  end
+  return out
+end
+
+"""
+    defaultInitializeKwargs(problem, kwargs, tableClusters) -> NamedTuple
+
+The DAE initialization of a solve when the caller chose none. Table-cluster
+models: Newton with finite differences (`tableClusterInitAlg`). Otherwise, for
+a problem without an initialization problem (OM.jl solves the initial values
+itself): BrownFullBasicInit at the solve's abstol, which OrdinaryDiffEq used by
+default before OrdinaryDiffEqCore 4. Since then the default only checks u0,
+and fails where OM.jl's initial values leave a residual in an algebraic
+equation (the PID models of PIDDecomposition.mo).
+"""
+function defaultInitializeKwargs(problem, kwargs, tableClusters::Bool)
+  haskey(kwargs, :initializealg) && return (;)
+  tableClusters && return (; initializealg = tableClusterInitAlg())
+  ModelingToolkit.SciMLBase.has_initializeprob(problem.f) && return (;)
+  return (; initializealg = DiffEqBase.BrownFullBasicInit(get(kwargs, :abstol, 1.0e-6)))
 end
 
 #= True if `name` is a Boolean-typed discrete (so pre(name) read from the Float
@@ -3349,7 +3393,7 @@ end
    discrete latch exactly; Brown re-solves the algebraic part so loops that
    feed the friction (motor electronics) stay consistent across a flip. =#
 _fsmReinitAlg() = get(ENV, "OMBACKEND_FSM_REINIT", "noinit") == "brown" ?
-  :(SciMLBase.BrownFullBasicInit()) : :(SciMLBase.NoInit())
+  :(OMBackend.CodeGeneration.DiffEqBase.BrownFullBasicInit()) : :(SciMLBase.NoInit())
 
 Base.@nospecializeinfer function _preMemAffectParts(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode;
                                                     atInit::Bool = false, flagModified::Bool = true,

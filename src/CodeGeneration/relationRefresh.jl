@@ -397,6 +397,34 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
   return DiffEqBase.CallbackSet(kept..., cb)
 end
 
+#= Integer, Boolean and enumeration variables hold integral values. They
+   are unknowns with der(v) = 0, and a Rosenbrock or BDF step can leave
+   round-off in them (pivoting in the linear solve mixes rows):
+   3 becomes 3.0000000000000004, and change(v) or v == 3 would see it. =#
+
+"""
+    withIntegralDiscretes(callbacks, problem, names) -> callbacks
+
+Add a DiscreteCallback, first among the discrete callbacks (before the event
+iteration reads them), that rounds the unknowns `names` back to integers
+after a step that left round-off in them.
+"""
+function withIntegralDiscretes(callbacks, problem, names::Vector{String})
+  local states = getStatesAsSymbols(problem.f)
+  local idx = Int[k for k in indexin(Symbol.(names), states) if k !== nothing]
+  isempty(idx) && return callbacks
+  local drifted = (u, t, integrator) -> any(k -> u[k] != round(u[k]), idx)
+  local round! = function (integrator)
+    for k in idx
+      integrator.u[k] = round(integrator.u[k])
+    end
+    return nothing
+  end
+  local cb = DiffEqBase.DiscreteCallback(drifted, round!; save_positions = (false, false),
+                                         initializealg = ModelingToolkit.SciMLBase.NoInit())
+  return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(cb, callbacks)
+end
+
 #= Solve the algebraic unknowns again, the differential states kept (a
    pure ODE has none). A DAEFunction (DFBDF, IDA) has no mass matrix; its
    algebraic variables are the ones `differential_vars` excludes. Whether it
@@ -407,7 +435,7 @@ function _resolveAlgebraics!(integrator)
     local mm = f.mass_matrix
     (mm isa LinearAlgebra.UniformScaling || all(!iszero, LinearAlgebra.diag(mm))) && return true
   end
-  DiffEqBase.initialize_dae!(integrator, OMBackend.OrdinaryDiffEq.BrownFullBasicInit())
+  DiffEqBase.initialize_dae!(integrator, DiffEqBase.BrownFullBasicInit())
   DiffEqBase.u_modified!(integrator, true)
   return integrator.sol.retcode != ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
 end

@@ -43,6 +43,8 @@ using DocStringExtensions
 using ModelingToolkit
 using LinearAlgebra
 import DiffEqBase
+import ADTypes
+import NonlinearSolve
 
 using ..FrontendUtil
 using ..Backend #Should maybe not be using here... since it can make certain overloads a bit tricky to follow.

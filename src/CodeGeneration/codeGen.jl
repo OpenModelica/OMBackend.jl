@@ -935,7 +935,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
         end
         $(Symbol("cb$(callbacks)")) = ContinuousCallback($(Symbol("condition$(callbacks)")),
                                                          $(Symbol("affect$(callbacks)!")),
-                                                         rootfind=true,
+                                                         rootfind = ModelingToolkit.SciMLBase.RightRootFind,
                                                          save_positions=(true, true),
                                                          affect_neg! = $(Symbol("affect$(callbacks)!")))
       end
@@ -1025,7 +1025,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       quote
         $cond
         $affect
-        #= No `affect_neg!` set: transformToZeroCrossingCondition has already
+        #= RightRootFind: the event lands just past the root, where the
+           condition has changed sign. From the left of it the next step
+           finds the same crossing again (DiffEqBase 7 no longer suppresses
+           that repeat: ElseWhenBasic looped at x = 0.3 until MaxIters).
+           No `affect_neg!` set: transformToZeroCrossingCondition has already
            encoded direction (positive→negative = trigger) so the same
            Modelica `when cond then` semantics fall on `affect!` only. Setting
            `affect_neg! = affect!` would double-fire on each oscillation
@@ -1033,7 +1037,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
            again at the same event), driving Zeno / maxiters. =#
         $(Symbol("cb$(callbacks)")) = ContinuousCallback($(Symbol("condition$(callbacks)")),
                                                          $(Symbol("affect$(callbacks)!")),
-                                                         rootfind=true, save_positions=(true, true))
+                                                         rootfind = ModelingToolkit.SciMLBase.RightRootFind, save_positions=(true, true))
         $(if wEq.elsewhenPart !== nothing
             eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 0)
           end)

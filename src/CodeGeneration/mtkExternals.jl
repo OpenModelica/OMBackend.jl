@@ -2150,9 +2150,9 @@ function ode_order_lowering(eqs, iv, unknown_vars)
     if !isdiffeq(eq)
       push!(alge_eqs, eq)
     else
-      var, maxorder = ModelingToolkit.var_from_nested_derivative(eq.lhs)
+      var, maxorder = Symbolics.var_from_nested_derivative(eq.lhs)
       maxorder > get(var_order, var, 1) && (var_order[var] = maxorder)
-      var′ = ModelingToolkit.lower_varname(var, iv, maxorder - 1)
+      var′ = Symbolics.lower_varname(var, iv, maxorder - 1)
       if ! isreal(eq.rhs) #= Modification by me. =#
         rhs′ = ModelingToolkit.diff2term_with_unit(eq.rhs, iv)
       else
@@ -2164,8 +2164,8 @@ function ode_order_lowering(eqs, iv, unknown_vars)
   end
   for (var, order) in var_order
     for o in (order - 1):-1:1
-      lvar = lower_varname(var, iv, o - 1)
-      rvar = lower_varname(var, iv, o)
+      lvar = Symbolics.lower_varname(var, iv, o - 1)
+      rvar = Symbolics.lower_varname(var, iv, o)
       push!(diff_vars, lvar)
 
       rhs = rvar
@@ -2191,7 +2191,7 @@ function dae_order_lowering(eqs, iv, unknown_vars)
     n_diffvars = 0
     for vv in vars
       isdifferential(vv) || continue
-      var, maxorder = var_from_nested_derivative(vv)
+      var, maxorder = Symbolics.var_from_nested_derivative(vv)
       isparameter(var) && continue
       n_diffvars += 1
       order = get(var_order, var, nothing)
@@ -2200,7 +2200,7 @@ function dae_order_lowering(eqs, iv, unknown_vars)
         order = 1
       end
       maxorder > order && (var_order[var] = maxorder)
-      var′ = lower_varname(var, iv, maxorder - 1)
+      var′ = Symbolics.lower_varname(var, iv, maxorder - 1)
       subs[vv] = D(var′)
       if !seen
         push!(diff_vars, var′)
@@ -2212,8 +2212,8 @@ function dae_order_lowering(eqs, iv, unknown_vars)
 
   for (var, order) in var_order
     for o in (order - 1):-1:1
-      lvar = lower_varname(var, iv, o - 1)
-      rvar = lower_varname(var, iv, o)
+      lvar = Symbolics.lower_varname(var, iv, o - 1)
+      rvar = Symbolics.lower_varname(var, iv, o)
       push!(diff_vars, lvar)
 
       rhs = rvar
