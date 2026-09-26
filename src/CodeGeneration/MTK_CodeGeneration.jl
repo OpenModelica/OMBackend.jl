@@ -493,7 +493,8 @@ struct IfEquationComponent
      start at 0/0 in the DAE init. =#
   relayGuesses         :: Vector{Expr}
   #= (ifCond, crossing function, scale) of each branch whose event has a
-     hysteresis: re-evaluated after every event (withRelationRefresh). =#
+     hysteresis: checked after every step by the event iteration
+     (withRelationRefresh). =#
   relations            :: Vector{Tuple{Symbol, Any, Any}}
 end
 IfEquationComponent(events, conditionalEquations, conditionVariables, conditionNameAndIV, pureTimeEvents,
@@ -1328,8 +1329,9 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
          strategy emitters for the full rationale. =#
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
       OMBackend.CodeGeneration.checkNamedStateLookups(problem, $(NAMED_STATE_LOOKUPS))
-      $(emitAssertCallback(simCode))
       $(emitRelationRefresh(IF_RELATIONS))
+      #= Asserts after the event iteration: they check the settled state. =#
+      $(emitAssertCallback(simCode))
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreducibleSyms)
     end
   end
@@ -3695,11 +3697,12 @@ function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
   return events
 end
 
-#= The event iteration over the branch relations with a hysteresis
-   (relationRefresh.jl): after any event, every relation is evaluated again
-   with the hysteresis rule. =#
+#= The event iteration over the buffered relations (relationRefresh.jl):
+   after every step, a relation that disagrees with the state is flipped
+   with the hysteresis rule, and so on until nothing changes. =#
 function emitRelationRefresh(relations)::Expr
-  isempty(relations) && return Expr(:block)
+  #= Emitted with no if-equation relations too: whens on a relation among
+     the callbacks are iterated as well (none of either: a no-op). =#
   local entries = [:(($(QuoteNode(sym)), $(zc), $(scale))) for (sym, zc, scale) in relations]
   #= In the latest world, like the event list: the symbolic variables are
      globals bound while the model is built. =#

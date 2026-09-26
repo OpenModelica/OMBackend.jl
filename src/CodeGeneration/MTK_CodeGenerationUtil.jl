@@ -300,6 +300,17 @@ function transformToMTKContinuousConditionEquation(cond, simCode)
 end
 
 
+#= The argument of a when body the event iteration runs (codeGen.jl
+   `_emitRelationWhen`): the state before the current sweep, indexed by
+   `lookuptableStates`. =#
+const PRE_SNAPSHOT = :__prevals
+
+#= Where `pre(v)` of a variable is read while a when body is lowered: false,
+   from `v` itself; true (within `with(PRE_FROM_SNAPSHOT => true)`), from
+   `PRE_SNAPSHOT`, so a body sees the pre() values even when an earlier body
+   of the same sweep assigned the variable. =#
+const PRE_FROM_SNAPSHOT = Base.ScopedValues.ScopedValue(false)
+
 """
   TODO: Keeping it simple for now, we assume we only have one argument in the call..
   Also the der as symbol is really ugly..
@@ -358,8 +369,13 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
         DAE.BCONST(b) => quote $b end
         _ => begin
           varName = SimulationCode.DAE_identifierToString(arg)
-          quote
-            $(Symbol(varName))
+          local entry = get(simCode.stringToSimVarHT, varName, nothing)
+          if PRE_FROM_SNAPSHOT[] && entry !== nothing && !SimulationCode.isParameter(last(entry))
+            :($(PRE_SNAPSHOT)[lookuptableStates[$(QuoteNode(Symbol(varName)))]])
+          else
+            quote
+              $(Symbol(varName))
+            end
           end
         end
       end

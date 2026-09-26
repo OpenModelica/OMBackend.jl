@@ -510,9 +510,10 @@ function _emitElsewhenThresholdTimeWhen(elseArm, simCode, ewRefSym::Symbol, thrD
         add_tstop!(integrator, integrator.t + 1E-12)
       end
     end
-    $(Symbol("cb$(callbacks)")) = DiscreteCallback($(Symbol("condition$(callbacks)")),
-                                                   $(Symbol("affect$(callbacks)!"));
-                                                   save_positions=(true, true))
+    #= A discrete when, run after its parent's (in the event iteration where
+       the model has buffered relations). =#
+    $(Symbol("cb$(callbacks)")) = OMBackend.CodeGeneration.discreteWhenCallback($(Symbol("condition$(callbacks)")),
+                                                                              $(Symbol("affect$(callbacks)!")))
   end
 end
 
@@ -774,14 +775,17 @@ function _emitRelationWhen(eq, simCode, callbacks::Int, rel)
     push!(names, n)
   end
   local args = Symbol[Symbol(n) for n in names]
-  local whenStmts = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  #= The body runs in the event iteration: pre(v) from the sweep's snapshot. =#
+  local whenStmts = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+    createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  end
   local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
   quote
     $(Symbol("cb$(callbacks)")) = let _affCache = Ref{Any}(nothing)
       local _eval = (t, $(args...)) -> (Float64($(expToJuliaExpMTK(zcDAE, simCode))),
                                         1.0 + max(abs(Float64($(expToJuliaExpMTK(e1, simCode)))),
                                                   abs(Float64($(expToJuliaExpMTK(e2, simCode))))))
-      local _body! = (integrator) -> begin
+      local _body! = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT)) -> begin
         local t = integrator.t
         local x = integrator.u
         local lookuptableStates
@@ -1125,8 +1129,10 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
        fires (e.g. INV3S-class algorithms whose synthesised condition is
        `change(iNV3S_enable)` would otherwise zero the Logic-enum input on
        every event). Build the bare-cref set so condReset only touches
-       standalone Boolean triggers, the original use case. =#
-    local _bareCrefStrs = _collectBareCrefStrings(cond)
+       standalone Boolean triggers, the original use case. From the
+       condition as written: the zero-crossing form unwraps a top-level
+       `change(k)` to `k`, which would reset k (and fire the when again). =#
+    local _bareCrefStrs = _collectBareCrefStrings(wEqCondDAE)
     #= Build condition-reset expressions: set each state cref in the condition to false =#
     local condResetExprs = map(condCrefs) do c
       local cStr = string(c)
@@ -1274,9 +1280,9 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           @debug "[CB-DC$($(callbacks)) affect] done" t=integrator.t u=copy(integrator.u)
         end
       end
-      $(Symbol("cb$(callbacks)")) = DiscreteCallback($(Symbol("condition$(callbacks)")),
-                                                     $(Symbol("affect$(callbacks)!"));
-                                                     save_positions=(true, true))
+      #= Part of the event iteration where the model has buffered relations. =#
+      $(Symbol("cb$(callbacks)")) = OMBackend.CodeGeneration.discreteWhenCallback($(Symbol("condition$(callbacks)")),
+                                                                                $(Symbol("affect$(callbacks)!")))
       $(if _ewThrDAE !== nothing
           _emitElsewhenThresholdTimeWhen(_ewArm, simCode, _ewRefSym, _ewThrDAE)
         elseif wEq.elsewhenPart !== nothing
