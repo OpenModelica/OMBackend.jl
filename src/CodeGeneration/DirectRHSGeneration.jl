@@ -1088,6 +1088,34 @@ function (a::_MergedContinuousAffect)(integrator, gidx::Int)::Nothing
   return nothing
 end
 
+#= SciMLBase 3's VectorContinuousCallback has no affect_neg!: its affect! is
+   called once per event instant with the events of all components, 0 (none),
+   +1 (upcrossing) or -1 (downcrossing). A scalar sub gets its affect! or
+   affect_neg! by the sign; a vector sub gets its slice. =#
+const _VCC_HAS_AFFECT_NEG = hasfield(ModelingToolkit.SciMLBase.VectorContinuousCallback, :affect_neg!)
+
+struct _MergedContinuousEvents{S}
+  subs::S
+  offsets::Vector{Int}
+  nsub::Int
+end
+
+function (m::_MergedContinuousEvents)(integrator, events::AbstractVector)::Nothing
+  local SB = ModelingToolkit.SciMLBase
+  for k in 1:m.nsub
+    local s = m.subs[k]
+    local slice = view(events, (m.offsets[k] + 1):m.offsets[k + 1])
+    if s isa SB.VectorContinuousCallback
+      any(!iszero, slice) && s.affect!(integrator, slice)
+    else
+      local e = slice[1]
+      local aff = e > 0 ? s.affect! : e < 0 ? s.affect_neg! : nothing
+      aff === nothing || aff(integrator)
+    end
+  end
+  return nothing
+end
+
 # Runs every sub-callback's `initialize` at integration start. Lets a sub carrying a
 # custom initialize (e.g. chua's DAE event) collapse WITHOUT dropping it; the merge
 # is FunctionWrapper-erased so the VCC's initialize param stays model-independent.
@@ -1163,20 +1191,23 @@ function _eraseContinuousCallbacks(cbset)
   local total::Int = offsets[end]
   local nsub::Int = length(subs)
   local condF = _MergedContinuousCondition(subs, offsets, nsub)
-  local affF = _MergedContinuousAffect(subs, offsets, lens, nsub, false)
-  local affNF = _MergedContinuousAffect(subs, offsets, lens, nsub, true)
   local initF = _MergedContinuousInitialize(subs, nsub)
   local FW = DiffEqBase.FunctionWrapper
   local condW = FW{Nothing, Tuple{AbstractVector{Float64}, AbstractVector{Float64}, Float64, Any}}(condF)
-  local affW = FW{Nothing, Tuple{Any, Int}}(affF)
-  local affNW = FW{Nothing, Tuple{Any, Int}}(affNF)
   #= Always FunctionWrapper-wrap the merged initialize (even when every sub uses the
      default) so the VCC's initialize param is the SAME model-independent type whether or
      not a sub carries a custom initialize -> chua and the synthetic bake share one type. =#
   local initW = FW{Nothing, Tuple{Any, Any, Any, Any}}(initF)
-  local vcc = SB.VectorContinuousCallback(condW, affW, affNW, total;
-                                          initialize = initW,
-                                          rootfind = rootfind, save_positions = savePos)
+  local vcc = if _VCC_HAS_AFFECT_NEG
+    local affW = FW{Nothing, Tuple{Any, Int}}(_MergedContinuousAffect(subs, offsets, lens, nsub, false))
+    local affNW = FW{Nothing, Tuple{Any, Int}}(_MergedContinuousAffect(subs, offsets, lens, nsub, true))
+    SB.VectorContinuousCallback(condW, affW, affNW, total;
+                                initialize = initW, rootfind = rootfind, save_positions = savePos)
+  else
+    local evW = FW{Nothing, Tuple{Any, Any}}(_MergedContinuousEvents(subs, offsets, nsub))
+    SB.VectorContinuousCallback(condW, evW, total;
+                                initialize = initW, rootfind = rootfind, save_positions = savePos)
+  end
   return SB.CallbackSet(vcc, dc...)
 end
 
