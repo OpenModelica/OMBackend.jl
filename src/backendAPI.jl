@@ -43,14 +43,22 @@ import OrdinaryDiffEqBDF
 """
     defaultSolver()
 
-The solver used when none is given: Rodas5P, with finite-difference
+The solver used when none is given: Rodas5P, with central finite-difference
 Jacobians. Rodas5's embedded error estimate misses a right-hand side that
 depends on time explicitly: on x' = cos(39t) it took 10 steps at reltol 1e-8
 and ended far from the solution, where Rodas5P is right (SciML recommends
 Rodas5P over Rodas5). A mass-matrix system of a shape that Rosenbrock methods
 handle badly switches to [`daeFallbackSolver`](@ref).
+
+A Rosenbrock method (not a W-method) needs an accurate Jacobian for its order
+and its error estimate. Where the model has no symbolic one, forward
+differences were not accurate enough: MSL HeatingRectifier accepted a step
+across a diode's conduction onset with 25 times the tolerance in its error
+(Capacitor1.v 2.5 % off), where central differences, like ForwardDiff, give
+the reference. Finite differences, not ForwardDiff: external C functions
+take no dual numbers.
 """
-defaultSolver() = Rodas5P(autodiff = ADTypes.AutoFiniteDiff())
+defaultSolver() = Rodas5P(autodiff = ADTypes.AutoFiniteDiff(fdtype = Val(:central)))
 
 """
     daeFallbackSolver()
