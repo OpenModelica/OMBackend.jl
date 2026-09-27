@@ -56,6 +56,38 @@ end
   r = Base.invokelatest(affect, (startForward = 0.0, locked = 1.0, stuck = 1.0), (sa = 0.0,), nothing, integrator)
   @test r == (startForward = 0.0, locked = 1.0, stuck = 1.0)
 
+  #= One pass (a user when's body): stuck, but not yet locked. =#
+  local (fexpr1, _, _) = CG._eventIterAffectParts(assigns, simCode; relPins = Dict(string(wle0) => true),
+                                                  iterate = false)
+  r = Base.invokelatest(Core.eval(_EventIterationEval, fexpr1), sliding, (sa = 0.0,), nothing, integrator)
+  @test r == (startForward = 0.0, locked = 0.0, stuck = 1.0)
+
+  #= initial() is what the t0 pass (initialize) says. =#
+  local initialCall = DAE.CALL(Absyn.IDENT("initial"), MetaModelica.nil, DAE.callAttrBuiltinBool)
+  local atStart = Tuple{Symbol,Any,Bool}[(:i, DAE.LBINARY(initialCall, DAE.OR(tyB), wle0), false)]
+  for (initVal, expected) in ((true, 1.0), (false, 0.0))
+    local (fx, _, _) = CG._eventIterAffectParts(atStart, simCode; initVal = initVal)
+    @test Base.invokelatest(Core.eval(_EventIterationEval, fx), (i = 0.0,), (w = 1.0,), nothing, integrator) ==
+          (i = expected,)
+  end
+
+  #= A body that reads a Boolean defined by a relation elsewhere (an ideal
+     thyristor's `fire`) reads the relation, which joins the event sources;
+     pre(fire) stays. =#
+  local s = cref("s", tyR)
+  local sLt0 = rel(s, DAE.LESS(tyR), DAE.RCONST(0.0))
+  local fireRel = rel(cref("repl", tyR), DAE.LESS(tyR), cref("timer", tyR))
+  local thyristor = Tuple{Symbol,Any,Bool}[
+    (:off, DAE.LBINARY(sLt0, DAE.OR(tyB),
+                       DAE.LBINARY(pre("off"), DAE.AND(tyB), DAE.LUNARY(DAE.NOT(tyB), cref("fire", tyB)))), false)]
+  local relationOf = Dict{String, DAE.Exp}("fire" => fireRel)
+  local (rels2, body2) = CG._inlineReadBooleanRelations(DAE.Exp[sLt0], thyristor, relationOf, simCode)
+  @test string.(rels2) == string.([sLt0, fireRel])
+  @test occursin(string(fireRel), string(body2[1][2])) && !occursin("fire", string(body2[1][2]))
+  local preOnly = Tuple{Symbol,Any,Bool}[(:off, DAE.LBINARY(sLt0, DAE.OR(tyB), pre("fire")), false)]
+  local (rels3, body3) = CG._inlineReadBooleanRelations(DAE.Exp[sLt0], preOnly, relationOf, simCode)
+  @test length(rels3) == 1 && body3 === preOnly
+
   #= Only synthesized conditions (an OR-chain of change(<relation>)) iterate;
      a user `when change(b)` runs its body once per event. =#
   local change(e) = DAE.CALL(Absyn.IDENT("change"), MetaModelica.list(e), DAE.callAttrBuiltinBool)
@@ -105,3 +137,19 @@ end
   ]
   @test !(@test_logs (:info,) CG._eventIterLowerable(sampled, simCode))
 end
+
+#= A relation whose crossing the cluster's callback located flips in the event
+   iteration's update, also where the state it reads is still inside the
+   hysteresis band (the algebraic solve at the event can leave it there);
+   without a located crossing the hysteresis rule decides. =#
+@testset "Discrete cluster: located crossings" begin
+  local CG = OMBackend.CodeGeneration
+  local c = CG.DiscreteCluster(["off"], Any[], Any[], 0, 0, [true], [false], nothing, 0, false)
+  #= Crossing function -1e-12 (inside the band H * scale = 1e-10), scale 1. =#
+  c.crossings! = (zs, u, p, t) -> (zs[1] = -1.0e-12; zs[2] = 1.0; nothing)
+  local integrator = (u = Float64[], p = nothing, t = 0.0, opts = (reltol = 1.0e-6,))
+  @test !CG._update!(c, integrator) && c.rel == [false]
+  c.crossed[1] = true
+  @test CG._update!(c, integrator) && c.rel == [true] && c.crossed == [false]
+end
+

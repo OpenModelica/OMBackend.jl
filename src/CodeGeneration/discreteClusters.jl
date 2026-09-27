@@ -56,11 +56,13 @@ mutable struct DiscreteCluster
   zs::Vector{Float64}        # the output of crossings!
   memberIndex::Vector{Int}   # each member's position in u; 0 when it is not an unknown
   rel::Vector{Bool}          # the relation buffers
+  crossed::Vector{Bool}      # the relations whose crossing the callback located, until the next update
 end
 
 DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table) =
   DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table,
-                  nothing, nothing, zeros(2 * length(strict)), Int[], fill(false, length(strict)))
+                  nothing, nothing, zeros(2 * length(strict)), Int[], fill(false, length(strict)),
+                  fill(false, length(strict)))
 
 #= SciMLBase 3 renamed u_modified! (now deprecated) to derivative_discontinuity!. =#
 const _derivativeDiscontinuity! = isdefined(ModelingToolkit.SciMLBase, :derivative_discontinuity!) ?
@@ -127,13 +129,19 @@ function _inconsistent(c::DiscreteCluster, integrator, reference::Vector{Bool} =
   return any(k -> _ruled(c, zs, k, H, reference[k]) != c.rel[k], eachindex(c.rel))
 end
 
-#= Phase 1 of a sweep: the buffers from the state. Whether one changed. =#
+#= Phase 1 of a sweep: the buffers from the state. Whether one changed. A
+   relation whose crossing the callback located changes, as in OpenModelica:
+   its shifted crossing function is zero where the rule flips it, and the
+   algebraic solve at the event can leave it just inside the hysteresis band
+   (an ideal thyristor's firing, found only at the end of the next step). A
+   state clearly on the old side flips it back in the next sweep. =#
 function _update!(c::DiscreteCluster, integrator)
   local zs = _crossingValues!(c, integrator)
   local H = _hysteresisFromTolerance(integrator)
   local changed = false
   for k in eachindex(c.rel)
-    local new = _ruled(c, zs, k, H, c.rel[k])
+    local new = c.crossed[k] ? !c.rel[k] : _ruled(c, zs, k, H, c.rel[k])
+    c.crossed[k] = false
     new == c.rel[k] && continue
     c.rel[k] = new
     changed = true
@@ -147,6 +155,7 @@ function _literalBuffers!(c::DiscreteCluster, integrator)
   for k in eachindex(c.rel)
     c.rel[k] = _literal(zs, k, c.strict[k])
   end
+  fill!(c.crossed, false)
   return nothing
 end
 
@@ -308,7 +317,14 @@ struct ClusterCrossings
   cluster::DiscreteCluster
 end
 
-(a::ClusterCrossings)(integrator, events) = (_derivativeDiscontinuity!(integrator, false); nothing)
+#= `events`: per relation 0 (no crossing) or the crossing's direction (±1). =#
+function (a::ClusterCrossings)(integrator, events)
+  for (k, d) in pairs(events)
+    d == 0 || (a.cluster.crossed[k] = true)
+  end
+  _derivativeDiscontinuity!(integrator, false)
+  return nothing
+end
 
 function _clusterCallback(c::DiscreteCluster)
   local condition = (out, u, t, integrator) -> _crossings!(out, c, u, t, integrator)

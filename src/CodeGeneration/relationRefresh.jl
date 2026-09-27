@@ -272,20 +272,30 @@ section's inputs): its condition and body, as a DiscreteCallback's. Where a
 model has buffered relations, the event iteration (`withRelationRefresh`)
 runs it, after the whens on a relation; otherwise its DiscreteCallback does.
 """
-struct DiscreteWhenAffect{C, A}
+struct DiscreteWhenAffect{C, A, I}
   condition::C               # (u, t, integrator) -> Bool
   affect!::A                 # integrator -> nothing
+  initialize!::I             # (u, t, integrator) -> nothing: its state (an edge latch) at the start
 end
 
 (d::DiscreteWhenAffect)(integrator) = d.affect!(integrator)
 
-"""
-    discreteWhenCallback(condition, affect!) -> DiscreteCallback
+const _NO_WHEN_INITIALIZE = (u, t, integrator) -> nothing
 
-A when on a discrete condition, checked after every step.
 """
-discreteWhenCallback(condition, affect!) =
-  DiffEqBase.DiscreteCallback(condition, DiscreteWhenAffect(condition, affect!); save_positions = (true, true))
+    discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE) -> DiscreteCallback
+
+A when on a discrete condition, checked after every step. `initialize!` runs at
+the start of every solve (a reinit! included).
+"""
+discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE) =
+  DiffEqBase.DiscreteCallback(condition, DiscreteWhenAffect(condition, affect!, initialize!);
+                              initialize = (c, u, t, integrator) -> begin
+                                initialize!(u, t, integrator)
+                                _derivativeDiscontinuity!(integrator, false)
+                                nothing
+                              end,
+                              save_positions = (true, true))
 
 #= What the event iteration updates. `reinit` solves the algebraic
    unknowns (nothing: BrownFullBasicInit). =#
@@ -348,6 +358,8 @@ end
 function _iterate!(e::EventIteration, integrator)
   if _continuousEventFired(integrator) && !_resolveAlgebraics!(integrator, e.reinit)
     @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
+    #= The located crossings belong to this event. =#
+    foreach(c -> fill!(c.crossed, false), e.clusters)
     return nothing
   end
   for _ in 1:e.limit
@@ -371,6 +383,13 @@ end
    initialization used, the algebraic unknowns are solved again (the states
    kept). =#
 function _initialize!(e::EventIteration, integrator)
+  _initializeRelations!(e, integrator)
+  #= The discrete whens' state (an edge latch) from the initialized state. =#
+  foreach(d -> d.initialize!(integrator.u, integrator.t, integrator), e.discreteWhens)
+  return nothing
+end
+
+function _initializeRelations!(e::EventIteration, integrator)
   local changed = false
   for c in e.clusters
     _initialize!(c, integrator) && (changed = true)

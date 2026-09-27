@@ -36,11 +36,9 @@ _elsewhenStmtLst(arm::SimulationCode.WHEN_EQUATION) = arm.whenEquation.whenStmtL
 _elsewhenStmtLst(arm) = arm.whenEquation.whenStmtLst
 
 #= Walk a DAE.Exp condition and collect the set of cref-name strings that
-   appear OUTSIDE any `change(...)` or `pre(...)` wrapper. Used by the
-   discrete-callback codegen so the auto-reset block (which zeroes
-   condition-triggers after firing — appropriate for `when boolVar then`)
-   does NOT zero observed inputs of `change(x)` / `pre(x)` (which are state
-   variables we're watching, not latched flags). =#
+   appear OUTSIDE any `change(...)` or `pre(...)` wrapper: the level-valued
+   Booleans of the condition (`when boolVar then`), for which the discrete
+   callback keeps an edge latch. =#
 Base.@nospecializeinfer function _collectBareCrefStrings(@nospecialize(cond))::OrderedSet{String}
   local out = OrderedSet{String}()
   local walk = function(e, insideObs)
@@ -1128,41 +1126,34 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
     local condCrefs = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
-    #= Crefs that appear inside `change(...)` or `pre(...)` are OBSERVED, not
-       latched boolean triggers — they must not be reset after the callback
-       fires (e.g. INV3S-class algorithms whose synthesised condition is
-       `change(iNV3S_enable)` would otherwise zero the Logic-enum input on
-       every event). Build the bare-cref set so condReset only touches
-       standalone Boolean triggers, the original use case. From the
-       condition as written: the zero-crossing form unwraps a top-level
-       `change(k)` to `k`, which would reset k (and fire the when again). =#
+    #= From the condition as written: the zero-crossing form unwraps a
+       top-level `change(k)` to `k`. =#
     local _bareCrefStrs = _collectBareCrefStrings(wEqCondDAE)
-    #= Build condition-reset expressions: set each state cref in the condition to false =#
-    local condResetExprs = map(condCrefs) do c
-      local cStr = string(c)
-      cStr in _bareCrefStrs || return :()
-      local entry = get(simCode.stringToSimVarHT, cStr, nothing)
-      if entry !== nothing && !SimulationCode.isParameter(entry[2])
-        local sym = Symbol(cStr)
-        #= AUDIT (ombackend-bug-audit-2026-06-05 #5): guard the index exactly as
-           changeInitExprs/changeUpdateExprs do. An unguarded
-           `lookuptableStates[sym]` KeyErrors when the trigger is not a state
-           unknown, and a Boolean DEFINED by a relation is observed/algebraic
-           (not in the state vector): force-clearing it would corrupt a value the
-           integrator re-derives. Only a genuine discrete STATE Boolean is
-           de-bounced here. NOTE: for a discrete-state Boolean that is also read
-           elsewhere and meant to persist true, edge de-bounce via state mutation
-           is still a shortcut; a private per-callback latch is the proper fix. =#
-        quote
-          let _idx = get(lookuptableStates, $(QuoteNode(sym)), nothing)
-            if _idx !== nothing
-              x[_idx] = false
-            end
-          end
-        end
-      else
-        :()
-      end
+    #= A condition on a Boolean (`when u`) is true for as long as u is, but the when
+       fires once, when it becomes true: an edge latch. The condition fires only
+       while the latch is clear and clears it when it reads false; the affect sets
+       it to the condition's value after the event (change() terms are false again
+       then), and the start of a solve to its value on the initialized state (a
+       Boolean true from the start is no edge). The condition only clears it: the
+       event iteration evaluates a condition twice before running the affect.
+       Setting u itself to false instead corrupted it where it is read elsewhere
+       (the MSL Timer's input, a threshold block's output, read by
+       `y = if u then time - entryTime ...`). =#
+    local useLatch = any(condCrefs) do c
+      local entry = get(simCode.stringToSimVarHT, string(c), nothing)
+      string(c) in _bareCrefStrs && entry !== nothing && !SimulationCode.isParameter(entry[2])
+    end
+    local condValue = quote
+      $(_whenLookupBindings(Util.getAllCrefs(cond), simCode)...)
+      local _r = $(expToJuliaBoolMTK(wEqCondDAE, simCode; cachedChange = true))
+      #= DiscreteCallback condition must return Bool per SciMLBase. Modelica
+         Boolean discrete states are stored as Float64 in `integrator.u`
+         (0.0/1.0), so a bare cref read returns Float64 and triggers
+         "TypeError: non-boolean (Float64) used in boolean context" in
+         SciML's callback dispatch (affects PowerConverters Thyristor
+         models). Cast via `!= 0` so any numeric cref-as-condition
+         evaluates correctly. Bool results pass through unchanged. =#
+      _r isa Bool ? _r : (_r != 0)
     end
     local changeInitExprs = map(condCrefs) do c
       local cStr = string(c)
@@ -1208,9 +1199,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     end
     quote
       $(_ewDecl)
-      let _condCache = Ref{Any}(nothing),
-          _affCache = Ref{Any}(nothing),
-          _changeCache = Ref{Any}(nothing),
+      #= Typed caches: the condition runs after every step. =#
+      let _condCache = Ref{Union{Nothing, Tuple{Dict{Symbol, Union{Nothing, Int}}, Dict{Symbol, Int}}}}(nothing),
+          _affCache = Ref{Union{Nothing, Tuple{Dict{Symbol, Int}, Dict{Symbol, Int}}}}(nothing),
+          _changeCache = Ref{Union{Nothing, Dict{Symbol, Any}}}(nothing),
+          _latch = Ref{Bool}(false),     # the edge latch
           _changeSeedValues = Dict{Symbol, Any}($(changeSeedPairs...))
         global $(Symbol("condition$(callbacks)"))
         $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
@@ -1223,9 +1216,9 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
               @debug "[CB-DC$($(callbacks)) cond] false (no state mapping)" t xs
               return false
             end
-            lookuptableStates = Dict((xs) .=> indices)
+            lookuptableStates = Dict{Symbol, Union{Nothing, Int}}((xs) .=> indices)
             local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-            lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+            lookuptableParams = Dict{Symbol, Int}(sym => i for (i, sym) in enumerate(params))
             _condCache[] = (lookuptableStates, lookuptableParams)
           else
             local cached = _condCache[]
@@ -1242,17 +1235,16 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           else
             _changePreValues = _changeCache[]
           end
-          $(_whenLookupBindings(Util.getAllCrefs(cond), simCode)...)
-          local _result = $(expToJuliaBoolMTK(wEqCondDAE, simCode; cachedChange = true))
+          local _result = $(condValue)
           @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
-          #= DiscreteCallback condition must return Bool per SciMLBase. Modelica
-             Boolean discrete states are stored as Float64 in `integrator.u`
-             (0.0/1.0), so a bare cref read returns Float64 and triggers
-             "TypeError: non-boolean (Float64) used in boolean context" in
-             SciML's callback dispatch (affects PowerConverters Thyristor
-             models). Cast via `!= 0` so any numeric cref-as-condition
-             evaluates correctly. Bool results pass through unchanged. =#
-          _result isa Bool ? _result : (_result != 0)
+          $(if useLatch
+              quote
+                _result || (_latch[] = false)
+                _result && !_latch[]
+              end
+            else
+              :(_result)
+            end)
         end
         global $(Symbol("affect$(callbacks)!"))
         $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
@@ -1264,8 +1256,8 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           if _affCache[] === nothing
             local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
             local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-            lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
-            lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+            lookuptableStates = Dict{Symbol, Int}(sym => i for (i, sym) in enumerate(states))
+            lookuptableParams = Dict{Symbol, Int}(sym => i for (i, sym) in enumerate(params))
             _affCache[] = (lookuptableStates, lookuptableParams)
           else
             local cached = _affCache[]
@@ -1280,13 +1272,22 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           local _changePreValues = _changeCache[] === nothing ? Dict{Symbol, Any}() : _changeCache[]
           _changeCache[] = _changePreValues
           $(changeUpdateExprs...)
-          $(condResetExprs...)
+          $(useLatch ? :(_latch[] = $(condValue)) : :())
           @debug "[CB-DC$($(callbacks)) affect] done" t=integrator.t u=copy(integrator.u)
         end
+        global $(Symbol("initialize$(callbacks)!"))
+        $(Symbol("initialize$(callbacks)!")) = $(useLatch ?
+          :((x, t, integrator) -> begin
+              _latch[] = false
+              _latch[] = $(Symbol("condition$(callbacks)"))(x, t, integrator)
+              nothing
+            end) :
+          :(OMBackend.CodeGeneration._NO_WHEN_INITIALIZE))
       end
       #= Part of the event iteration where the model has buffered relations. =#
       $(Symbol("cb$(callbacks)")) = OMBackend.CodeGeneration.discreteWhenCallback($(Symbol("condition$(callbacks)")),
-                                                                                $(Symbol("affect$(callbacks)!")))
+                                                                                $(Symbol("affect$(callbacks)!")),
+                                                                                $(Symbol("initialize$(callbacks)!")))
       $(if _ewThrDAE !== nothing
           _emitElsewhenThresholdTimeWhen(_ewArm, simCode, _ewRefSym, _ewThrDAE)
         elseif wEq.elsewhenPart !== nothing

@@ -2450,6 +2450,47 @@ function createIfEquation(stateVariables::Vector,
                              relayGuesses, relations)
 end
 
+#= A synthesized cluster's body can read a Boolean defined by a relation elsewhere
+   (an ideal thyristor's `fire`, the output of a comparison block). The body reads
+   the relation instead (outside pre()), and the relation joins the cluster's
+   event sources: the cluster is evaluated again when it changes, as every
+   discrete equation is at every event (MLS 8.6), with the relation pinned to its
+   value after the crossing (at the crossing itself `fire` can still read false).
+   Returns the relations and the body. =#
+function _inlineReadBooleanRelations(rels::Vector{DAE.Exp}, assigns::Vector{Tuple{Symbol,Any,Bool}},
+                                     relationOf::Dict{String, DAE.Exp}, simCode)
+  local members = Set{String}(string(d) for (d, _, _) in assigns)
+  local seen = Set{String}(string(r) for r in rels)
+  local subst = Dict{String, DAE.Exp}()
+  local rels2 = copy(rels)
+  for (_, rhs, _) in assigns, name in _crefNamesOutsidePre(rhs)
+    (name in members || haskey(subst, name)) && continue
+    local rel = get(relationOf, name, nothing)
+    #= A relation of discretes only changes at events the cluster already sees
+       (the lifter does not make such relations event sources either). =#
+    (rel === nothing || _withoutContinuousOperand(rel, simCode)) && continue
+    subst[name] = rel
+    string(rel) in seen || (push!(seen, string(rel)); push!(rels2, rel))
+  end
+  isempty(subst) && return (rels, assigns)
+  return (rels2, Tuple{Symbol,Any,Bool}[(d, Backend.BDAECreate._inlineSiblingsOutsidePre(rhs, subst), isInt)
+                                        for (d, rhs, isInt) in assigns])
+end
+
+#= The names of the crefs an expression reads outside pre(). =#
+function _crefNamesOutsidePre(@nospecialize(exp::DAE.Exp))::Set{String}
+  local names = Set{String}()
+  function f(@nospecialize(e), acc)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("pre"), _, _) => (e, false, acc)
+      DAE.CREF(cr, _) => (push!(acc, string(cr)); (e, false, acc))
+      _ => (e, true, acc)
+    end
+  end
+  Util.traverseExpTopDown(exp, f, names)
+  return names
+end
+
 #= Identify a synthesised discrete-Boolean when (from
    `synthesizeWhenEquationsFromDiscreteEquations`): its condition is `change(rel)`
    or an OR-chain of `change(rel)` over relations. Returns the relation list
@@ -2462,15 +2503,29 @@ end
    the legacy CallbackSet (which cannot read the observed `b`). =#
 function _condVarRelation(crefName::AbstractString, simCode)
   for req in simCode.residualEquations
-    req isa SimulationCode.RESIDUAL_EQUATION || continue
-    local b = req.exp
-    if b isa SimulationCode.BINARY && b.op === SimulationCode.OP_SUB &&
-       b.exp1 isa SimulationCode.EXP_CREF && b.exp2 isa SimulationCode.RELATION &&
-       string(SimulationCode.toDAEExp(b.exp1).componentRef) == crefName
-      return SimulationCode.toDAEExp(b.exp2)
-    end
+    local r = _definingRelation(req)
+    r === nothing || r[1] != crefName || return r[2]
   end
   return nothing
+end
+
+#= (name, relation) of a residual `0 ~ v - REL`, or nothing. =#
+function _definingRelation(@nospecialize(req))
+  req isa SimulationCode.RESIDUAL_EQUATION || return nothing
+  local b = req.exp
+  (b isa SimulationCode.BINARY && b.op === SimulationCode.OP_SUB &&
+   b.exp1 isa SimulationCode.EXP_CREF && b.exp2 isa SimulationCode.RELATION) || return nothing
+  return (string(SimulationCode.toDAEExp(b.exp1).componentRef), SimulationCode.toDAEExp(b.exp2))
+end
+
+#= Every Boolean defined by a relation (_condVarRelation), by name. =#
+function _condVarRelations(simCode)::Dict{String, DAE.Exp}
+  local out = Dict{String, DAE.Exp}()
+  for req in simCode.residualEquations
+    local r = _definingRelation(req)
+    r === nothing || get!(out, r[1], r[2])
+  end
+  return out
 end
 
 #= Collect the zero-crossing relations of a `change(...)`/`edge(...)` condition
@@ -3105,16 +3160,16 @@ function _isSynthesizedChangeCondition(@nospecialize(cond))::Bool
   end
 end
 
-#= Whether the event-iteration affect can be generated for this cluster: every
-   rhs lowers into an ImperativeAffect body. Otherwise the cluster keeps the
-   one-pass equation-form affects, which lower more expression kinds. =#
+#= Whether the ImperativeAffect can be generated for this cluster: every rhs
+   lowers into its body. Otherwise the cluster keeps the equation-form affects,
+   which lower more expression kinds. =#
 function _eventIterLowerable(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode)::Bool
   try
     _eventIterAffectParts(assigns, simCode)
     return true
   catch e
     e isa _UnsupportedInAffect || rethrow()
-    @info "Discrete cluster $(join(first.(assigns), ", ")) keeps one-pass event affects" reason = sprint(showerror, e)
+    @info "Discrete cluster $(join(first.(assigns), ", ")) keeps equation-form event affects" reason = sprint(showerror, e)
     return false
   end
 end
@@ -3129,9 +3184,12 @@ const _EVENT_ITERATION_MAX_PASSES = 20
    relations stay pinned; the other operands are read once, at the event. An
    equation-form affect is one pass: in the OneWayClutch the crossing to
    w_rel <= 0 sets stuck, but `locked = pre(stuck) and not startForward`
-   needs the second pass, so without it the freewheel never locks. =#
+   needs the second pass, so without it the freewheel never locks.
+   `iterate = false`: one pass (a cluster that does not read its own pre()).
+   `initVal`: the value of initial() (true in the t0 pass). =#
 Base.@nospecializeinfer function _eventIterAffectParts(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode;
-                                                       relPins::Dict{String,Bool} = _EMPTY_REL_PINS)
+                                                       relPins::Dict{String,Bool} = _EMPTY_REL_PINS,
+                                                       initVal::Bool = false, iterate::Bool = true)
   local obsAcc = Dict{Symbol,Symbol}()
   local preSyms = Dict{Symbol,Any}(d => Symbol("_pre_", d) for (d, _, _) in assigns)
   local subst = Dict{Symbol,Any}(d => Symbol("_v_", d) for (d, _, _) in assigns)
@@ -3142,32 +3200,41 @@ Base.@nospecializeinfer function _eventIterAffectParts(assigns::Vector{Tuple{Sym
     push!(setup, :(local $(psym) = Float64(modified.$(d))))
     push!(setup, :(local $(vsym) = $(psym)))
     local valExpr = isInt ?
-      :(Float64($(_daeExpToJuliaMem(rhs, obsAcc, simCode; subst = subst, relPins = relPins, preSubst = preSyms)))) :
-      :($(_daeBoolMem(rhs, obsAcc, simCode; subst = subst, relPins = relPins, preSubst = preSyms)) ? 1.0 : 0.0)
+      :(Float64($(_daeExpToJuliaMem(rhs, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins,
+                                    preSubst = preSyms)))) :
+      :($(_daeBoolMem(rhs, obsAcc, simCode; initVal = initVal, subst = subst, relPins = relPins,
+                      preSubst = preSyms)) ? 1.0 : 0.0)
     push!(pass, :($(vsym) = $(valExpr)))
     push!(changed, :($(vsym) != $(psym)))
     push!(shift, :($(psym) = $(vsym)))
     push!(retKws, Expr(:kw, d, vsym))
   end
-  local anyChanged = foldl((a, b) -> :($(a) || $(b)), changed)
   local retNT = Expr(:tuple, Expr(:parameters, retKws...))
-  #= One non-convergence warning per cluster, not per generated source line. =#
-  local warnId = QuoteNode(Symbol("eventIteration_", first(assigns)[1]))
+  local passes = if iterate
+    local anyChanged = foldl((a, b) -> :($(a) || $(b)), changed)
+    #= One non-convergence warning per cluster, not per generated source line. =#
+    local warnId = QuoteNode(Symbol("eventIteration_", first(assigns)[1]))
+    quote
+      local _converged = false
+      for _ in 1:$(_EVENT_ITERATION_MAX_PASSES)
+        $(pass...)
+        if !($(anyChanged))
+          _converged = true
+          break
+        end
+        $(shift...)
+        _firstPass = false
+      end
+      _converged || @warn("Event iteration did not converge", t = integrator.t,
+                          cluster = $(QuoteNode(first.(assigns))), _id = $(warnId), maxlog = 1)
+    end
+  else
+    Expr(:block, pass...)
+  end
   local fexpr = :((modified, observed, ctx, integrator) -> begin
                     $(setup...)
-                    local _converged = false
                     local _firstPass = true   # edge()/change() of a crossing relation
-                    for _ in 1:$(_EVENT_ITERATION_MAX_PASSES)
-                      $(pass...)
-                      if !($(anyChanged))
-                        _converged = true
-                        break
-                      end
-                      $(shift...)
-                      _firstPass = false
-                    end
-                    _converged || @warn("Event iteration did not converge", t = integrator.t,
-                                        cluster = $(QuoteNode(first.(assigns))), _id = $(warnId), maxlog = 1)
+                    $(passes)
                     #= The integrator must see the change (Rosenbrock and multistep
                        methods would otherwise keep the old discrete in their history). =#
                     SciMLBase.u_modified!(integrator, true)
@@ -3176,6 +3243,12 @@ Base.@nospecializeinfer function _eventIterAffectParts(assigns::Vector{Tuple{Sym
   local obsNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, k, v) for (k, v) in obsAcc]...))
   local modNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, d, d) for (d, _, _) in assigns]...))
   return (fexpr, obsNT, modNT)
+end
+
+#= _eventIterAffectParts as an ImperativeAffect expression. =#
+function _imperativeClusterAffect(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode; kwargs...)::Expr
+  local (fn, obs, mod) = _eventIterAffectParts(assigns, simCode; kwargs...)
+  return :(ModelingToolkit.ImperativeAffect($(fn), $(mod); observed = $(obs), skip_checks = true))
 end
 
 #= Module-level list of the discretes the discrete clusters assign
@@ -3200,7 +3273,62 @@ end
 #= Whether the model takes the discrete-cluster path, shared by every site
    that must agree (emitDiscreteClusters, the MTK events, LIFTED_DISCRETES). =#
 _usesDiscreteClusters(simCode)::Bool =
-  _discreteClustersForced() || _modelHasTableClusters(simCode) || _modelHasModeFSMClusters(simCode)
+  _discreteClustersForced() || _modelHasTableClusters(simCode) || _modelHasModeFSMClusters(simCode) ||
+  _modelHasSwitchClusters(simCode)
+
+#= True if a lifted cluster closes an algebraic loop through its own
+   equations, as the MSL's ideal diodes and thyristors: one of its relations
+   reads an algebraic unknown that only equations reading a member, or a value
+   a member selects, determine (s in `off = s < 0`, `v = s*(if off then 1 else Ron)`,
+   `i = s*(if off then Goff else 1)`). After the cluster changes, s and the
+   circuit must be solved again before its relation is read, within the event:
+   the discrete-cluster path's event iteration does that; the equation-form
+   affect's implicit solve fails on the piecewise equations, and at a
+   thyristor's firing the observed relation is read at the crossing itself.
+   A switch with an arc model is not one: its relation reads the circuit's own
+   current and voltage. =#
+function _modelHasSwitchClusters(simCode)::Bool
+  local ht = simCode.stringToSimVarHT
+  names(exps...) = (local ns = OrderedSet{String}(); foreach(e -> SimulationCode.collectCrefNames!(ns, e), exps); ns)
+  isAlgebraic(name) = haskey(ht, name) && last(ht[name]).varKind isa SimulationCode.ALG_VARIABLE
+  isUnknown(name) = haskey(ht, name) && !SimulationCode.isParameter(last(ht[name]))
+  local ifConds = [names((b.condition for b in ifEq.branches)...) for ifEq in simCode.ifEquations]
+  #= Per candidate operand: the names that make an equation the cluster's own. =#
+  local own = Dict{String, Set{String}}()
+  for weq in simCode.whenEquations
+    local rels = _extractChangeRelations(weq.whenEquation.condition, simCode)
+    rels === nothing && continue
+    local operands = [string(c) for r in rels for c in Util.getAllCrefs(r) if isAlgebraic(string(c))]
+    isempty(operands) && continue
+    local assigns = _gatherClusterAssigns(weq, simCode)
+    assigns === nothing && continue
+    #= The members, and what they select: an if-equation on a member whose
+       branches set one unknown each to parameter values (the lowered
+       `if off then Goff else 1`). =#
+    local ownNames = Set{String}(string(d) for (d, _, _) in assigns)
+    for (k, ifEq) in enumerate(simCode.ifEquations)
+      any(in(ownNames), ifConds[k]) || continue
+      for branch in ifEq.branches, eq in branch.residualEquations
+        local unknowns = filter(isUnknown, names(eq.exp))
+        length(unknowns) == 1 && union!(ownNames, unknowns)
+      end
+    end
+    foreach(op -> union!(get!(own, op, Set{String}()), ownNames), operands)
+  end
+  isempty(own) && return false
+  #= One pass over the equations (an if-equation branch's with its condition). =#
+  local read = Set{String}(); local foreign = Set{String}()
+  visit(ns) = for (op, ownNames) in own
+    op in ns || continue
+    push!(read, op)
+    any(in(ns), ownNames) || push!(foreign, op)
+  end
+  foreach(eq -> visit(names(eq.exp)), simCode.residualEquations)
+  for (k, ifEq) in enumerate(simCode.ifEquations), branch in ifEq.branches, eq in branch.residualEquations
+    visit(union(ifConds[k], names(eq.exp)))
+  end
+  return any(op -> op in read && !(op in foreign), keys(own))
+end
 
 #= Gather a synthesized when cluster's ordered (discreteSymbol, rhsDAE, isInteger)
    assignments; `nothing` when any statement is unsupported. A single-member
@@ -3493,11 +3621,15 @@ function emitDiscreteClusters(simCode)::Expr
   _usesDiscreteClusters(simCode) || return Expr(:block)
   local table = _modelHasTableClusters(simCode)
   local specs = Expr[]
+  local relationOf = _condVarRelations(simCode)
   for weq in simCode.whenEquations
     local rels = _extractChangeRelations(weq.whenEquation.condition, simCode)
     rels === nothing && continue
     local assigns = _gatherClusterAssigns(weq, simCode)
     assigns === nothing && continue
+    if _isSynthesizedChangeCondition(weq.whenEquation.condition)
+      (rels, assigns) = _inlineReadBooleanRelations(rels, assigns, relationOf, simCode)
+    end
     push!(specs, _discreteClusterSpec(weq.whenEquation.condition, rels, assigns, simCode, table))
   end
   isempty(specs) && return Expr(:block)
@@ -3538,7 +3670,6 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
        relation conditions must not (Trapezoid `T_start = time` at t0 would
        destroy a negative-startTime phase, friction would mis-latch). =#
     local hasInit = _condHasInitial(weq.whenEquation.condition)
-    local affInit = Expr[_discreteAffectEqInit(d, r, ii, simCode) for (d, r, ii) in assigns]
     #= Relations with the same zero set (`w_rel <= 0` and `w_rel > 0`) get ONE
        callback whose crossing pins all of them. With one callback each, both sat
        on the same root with opposite signs; where the integrator stopped exactly
@@ -3550,66 +3681,46 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
     #= A synthesized cluster that reads its own pre() values iterates to a
        fixpoint within the event (_eventIterAffectParts); the others need a
        single pass. =#
-    local eventIteration = _isSynthesizedChangeCondition(weq.whenEquation.condition) &&
-                           _clusterReadsOwnPre(assigns) && _eventIterLowerable(assigns, simCode)
+    local selfPre = _isSynthesizedChangeCondition(weq.whenEquation.condition) && _clusterReadsOwnPre(assigns)
+    local lowerable = (selfPre || hasInit) && _eventIterLowerable(assigns, simCode)
+    local eventIteration = selfPre && lowerable
+    #= The t0 pass is imperative wherever the body lowers. As equations,
+       ModelingToolkit solves it together with the whole algebraic system, every
+       held discrete an unknown of that solve, and at t0 that system sits on its
+       singular points (a Mean block's sqrt(y) at y = 0, a zero current's angle):
+       the solve fails (MTK's UnsolvableCallbackError). The crossings keep the
+       equation form, whose solve also moves the algebraic unknowns after a
+       switch (MSL CauerLowPassSC's switched capacitors). =#
+    local affInit = !hasInit ? nothing : lowerable ?
+      _imperativeClusterAffect(assigns, simCode; initVal = true, iterate = selfPre) :
+      :([$([_discreteAffectEqInit(d, r, ii, simCode) for (d, r, ii) in assigns]...)])
     for (relIdx, grp) in enumerate(groups)
       local rel = grp[1]
       local zc = transformToMTKContinuousCondition(rel, simCode)
       local pinsFalse = _zeroSetPins(grp, rel, false)
       local pinsTrue = _zeroSetPins(grp, rel, true)
-      local affFalse = eventIteration ? Expr[] :
-        Expr[_discreteAffectEq(d, r, pinsFalse, ii, simCode) for (d, r, ii) in assigns]
-      local affTrue  = eventIteration ? Expr[] :
-        Expr[_discreteAffectEq(d, r, pinsTrue,  ii, simCode) for (d, r, ii) in assigns]
-      #= The `initial()` term: only the first group's callback carries it,
-         so the discretes are set once at t0 (no double-apply), and only
-         when the condition actually contains `initial()`. =#
-      local _withInit = relIdx == 1 && hasInit
+      #= The `initial()` term: only the first group's callback carries it, so the
+         discretes are set once at t0 (no double-apply). =#
+      local initKw = relIdx == 1 && affInit !== nothing ? Expr[Expr(:kw, :initialize, affInit)] : Expr[]
       if eventIteration
-        local (fnF, obsF, modF) = _eventIterAffectParts(assigns, simCode; relPins = pinsFalse)
-        local (fnT, obsT, modT) = _eventIterAffectParts(assigns, simCode; relPins = pinsTrue)
-        local affUp = :(ModelingToolkit.ImperativeAffect($(fnF), $(modF); observed = $(obsF), skip_checks = true))
-        local affDn = :(ModelingToolkit.ImperativeAffect($(fnT), $(modT); observed = $(obsT), skip_checks = true))
-        if _withInit
-          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
-            ($(zc) ~ 0), $(affUp);
-            affect_neg = $(affDn),
-            initialize = [$(affInit...)],
-            reinitializealg = SciMLBase.NoInit())))
-        else
-          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
-            ($(zc) ~ 0), $(affUp);
-            affect_neg = $(affDn),
-            reinitializealg = SciMLBase.NoInit())))
-        end
-      elseif isEdge
-        #= rising-only: run the body when the relation becomes TRUE
-           (down-crossing of zc = affect_neg); no-op on the falling side. =#
-        if _withInit
-          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
-            ($(zc) ~ 0) => Any[];
-            affect_neg = [$(affTrue...)],
-            initialize = [$(affInit...)],
-            reinitializealg = SciMLBase.NoInit())))
-        else
-          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
-            ($(zc) ~ 0) => Any[];
-            affect_neg = [$(affTrue...)],
-            reinitializealg = SciMLBase.NoInit())))
-        end
+        local affUp = _imperativeClusterAffect(assigns, simCode; relPins = pinsFalse)
+        local affDn = _imperativeClusterAffect(assigns, simCode; relPins = pinsTrue)
+        push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+          ($(zc) ~ 0), $(affUp);
+          affect_neg = $(affDn),
+          $(initKw...),
+          reinitializealg = SciMLBase.NoInit())))
       else
-        if _withInit
-          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
-            ($(zc) ~ 0) => [$(affFalse...)];
-            affect_neg = [$(affTrue...)],
-            initialize = [$(affInit...)],
-            reinitializealg = SciMLBase.NoInit())))
-        else
-          push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
-            ($(zc) ~ 0) => [$(affFalse...)];
-            affect_neg = [$(affTrue...)],
-            reinitializealg = SciMLBase.NoInit())))
-        end
+        #= `edge(b)`: the body runs when the relation becomes TRUE (the
+           down-crossing of zc, affect_neg); the up-crossing does nothing. =#
+        local affFalse = isEdge ? Expr[] :
+          Expr[_discreteAffectEq(d, r, pinsFalse, ii, simCode) for (d, r, ii) in assigns]
+        local affTrue = Expr[_discreteAffectEq(d, r, pinsTrue, ii, simCode) for (d, r, ii) in assigns]
+        push!(events, :(ModelingToolkit.SymbolicContinuousCallback(
+          ($(zc) ~ 0) => $(isEdge ? :(Any[]) : :([$(affFalse...)]));
+          affect_neg = [$(affTrue...)],
+          $(initKw...),
+          reinitializealg = SciMLBase.NoInit())))
       end
     end
   end
@@ -4958,6 +5069,20 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
   end
 end
 
+#= The Boolean-typed crefs an assignment's right-hand side reads, named as
+   _collectInitAlgLhsRhsCrefs! names them. =#
+function _collectBoolRhsCrefs!(names::OrderedSet{String}, op)
+  (op isa BDAE.ASSIGN || op isa SimulationCode.ASSIGN) || return names
+  local rhs = op.right isa SimulationCode.Exp ? SimulationCode.toDAEExp(op.right) : op.right
+  Util.traverseExpBottomUp(rhs, (e, acc) -> begin
+      if e isa DAE.CREF && e.ty isa DAE.T_BOOL
+        push!(acc, SimulationCode.DAE_identifierToString(e.componentRef))
+      end
+      (e, acc)
+    end, names)
+  return names
+end
+
 """
     generateInitialAlgorithmFunction(simCode) -> Expr
 
@@ -4983,9 +5108,11 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
   end
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
+  local boolNames = OrderedSet{String}()
   for ia in simCode.initialAlgorithms
     for op in ia.statements
       _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
+      _collectBoolRhsCrefs!(boolNames, op)
     end
   end
   local renamedNames = union(lhsNames, rhsNames)
@@ -5026,11 +5153,13 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
         push!(fetches, Expr(:local, Expr(:(=), sym, :(getfield(@__MODULE__, $(QuoteNode(boundSym)))))))
         continue
       end
-      #= DISCRETE vars (Logic/enum/Boolean) are used as array indices. MTK
+      #= DISCRETE vars (Logic/enum) are used as array indices. MTK
          initialisation may leave them at 0 which BoundsErrors on 1-based
          index vectors (e.g. INV3S's UX01Conv[iNV3S_enable]). Clamp to 1 as
-         a band-aid until proper discrete-IC lowering lands. =#
-      if sv.varKind isa SimulationCode.DISCRETE
+         a band-aid until proper discrete-IC lowering lands. Not a Boolean:
+         the clamp made false true (an ideal thyristor's `fire`, so it
+         started conducting without a firing pulse). =#
+      if sv.varKind isa SimulationCode.DISCRETE && !(name in boolNames) && !_isBoolDiscreteName(name, simCode)
         local sym = Symbol(name)
         push!(fetches, Expr(:local,
           Expr(:(=), sym,
