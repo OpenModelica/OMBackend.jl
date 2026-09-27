@@ -1001,7 +1001,10 @@ end
     into a CREF_IDENT with the subscripts baked in. This ensures expanded array
     equations use scalarized variable names (var"name[i]") instead of bare symbol
     indexing (name[i]) which would fail at runtime with MTK's scalar Num variables.
-    Falls back to ASUB wrapping for non-CREF expressions.
+    Any other expression is wrapped in an ASUB: element i of an array-valued expression,
+    or field i of a record-valued one. Both sides of `Complex.'+'(pin_p.i, pin_n.i) =
+    Complex(0)` are calls, so tryExpandRecordEquation declines that equation and its
+    fields are taken this way.
 """
 Base.@nospecializeinfer function makeScalarElement(@nospecialize(exp::DAE.Exp), subscripts::Union{Cons{DAE.ICONST}, Cons{DAE.Exp}})
   @match exp begin
@@ -1010,10 +1013,7 @@ Base.@nospecializeinfer function makeScalarElement(@nospecialize(exp::DAE.Exp), 
       #= Collect existing subs into array, append new ones, convert to list once =#
       local subsArr = DAE.Subscript[s for s in existingSubs]
       for s in subscripts
-        @match s begin
-          DAE.ICONST(i) => push!(subsArr, DAE.INDEX(DAE.ICONST(i)))
-          _ => push!(subsArr, DAE.INDEX(s))
-        end
+        push!(subsArr, DAE.INDEX(s))
       end
       local allSubs = list(subsArr...)
       #= After subscripting, unwrap T_ARRAY to get the element type.
@@ -1028,7 +1028,7 @@ Base.@nospecializeinfer function makeScalarElement(@nospecialize(exp::DAE.Exp), 
       local newCref = DAE.CREF_IDENT(flatName, scalarTy, allSubs)
       DAE.CREF(newCref, scalarTy)
     end
-    _ => DAE.ASUB(exp, subscripts)
+    _ => DAE.ASUB(exp, list((DAE.INDEX(s) for s in subscripts)...))
   end
 end
 
@@ -1325,23 +1325,12 @@ function transformASUBEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
 end
 
 """
-  Simplify ASUB(ARRAY([e1, e2, ...]), [ICONST(i)]) → e_i
+  Simplify ASUB(ARRAY([e1, e2, ...]), [INDEX(ICONST(i))]) → e_i
   When subscripting into an array constructor with a constant index, return that element directly.
 """
 function simplifyASUBofARRAY(asub::DAE.Exp)::DAE.Exp
   @match asub begin
     #= ASUB with a single integer constant subscript into an ARRAY constructor =#
-    DAE.ASUB(DAE.ARRAY(array = elements), Cons(DAE.ICONST(idx), Nil())) => begin
-      #= Convert the list to an array to access by index =#
-      elemArray = collect(elements)
-      if idx >= 1 && idx <= length(elemArray)
-        return elemArray[idx]
-      else
-        @warn "ASUB index $idx out of bounds for array of length $(length(elemArray))"
-        return asub
-      end
-    end
-    #= Also handle INDEX wrapped subscripts =#
     DAE.ASUB(DAE.ARRAY(array = elements), Cons(DAE.INDEX(DAE.ICONST(idx)), Nil())) => begin
       elemArray = collect(elements)
       if idx >= 1 && idx <= length(elemArray)
