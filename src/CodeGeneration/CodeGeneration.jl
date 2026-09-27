@@ -43,6 +43,7 @@ using DocStringExtensions
 using ModelingToolkit
 using LinearAlgebra
 import DiffEqBase
+import OrdinaryDiffEq
 import ADTypes
 import NonlinearSolve
 

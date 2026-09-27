@@ -298,7 +298,7 @@ discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE) =
                               save_positions = (true, true))
 
 #= What the event iteration updates. `reinit` solves the algebraic
-   unknowns (nothing: BrownFullBasicInit). =#
+   unknowns (nothing: EventReinit). =#
 struct EventIteration
   ifRelations::Union{Nothing, IfRelations}
   relationWhens::Vector{RelationWhenAffect}
@@ -492,17 +492,62 @@ function withIntegralDiscretes(callbacks, problem, names::Vector{String})
   return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(cb, callbacks)
 end
 
-#= Solve the algebraic unknowns again with `alg` (nothing:
-   BrownFullBasicInit), the differential states kept (a pure ODE has none).
-   A DAEFunction (DFBDF, IDA) has no mass matrix; its algebraic variables are
-   the ones `differential_vars` excludes. Whether it succeeded. =#
+#= The re-solve of the algebraic unknowns at an event: BrownFullBasicInit
+   at its own tolerance (1e-10 on the residual: relations are decided on the
+   solved values; a looser one skips the solve where a switched diode's
+   equations barely change the residual, and its s keeps the wrong sign).
+   Where that is out of reach (large values, a switched Jacobian near
+   singular: a thyristor bridge's commutation stops at 4e-9 with values of
+   1e6), the result stands if it lowered the residual to within the solve's
+   abstol, as the initialization's (defaultInitializeKwargs). A type,
+   because a callback's reinitializealg is fixed when the code is
+   generated. =#
+struct EventReinit <: ModelingToolkit.SciMLBase.DAEInitializationAlgorithm end
+
+#= SciMLBase's fallback takes any algorithm for any integrator,
+   OrdinaryDiffEqCore's any for its own. =#
+DiffEqBase.initialize_dae!(integrator::ModelingToolkit.SciMLBase.DEIntegrator, ::EventReinit) =
+  _eventReinit!(integrator)
+DiffEqBase.initialize_dae!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator, ::EventReinit) =
+  _eventReinit!(integrator)
+
+function _eventReinit!(integrator)
+  local InitialFailure = ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
+  local before = integrator.sol.retcode
+  local u0 = copy(integrator.u)
+  DiffEqBase.initialize_dae!(integrator, DiffEqBase.BrownFullBasicInit())
+  (integrator.sol.retcode == InitialFailure && before != InitialFailure) || return nothing
+  local residual = _maxAlgebraicResidual(integrator, integrator.u)
+  (residual <= _solveAbstol(integrator) && residual < _maxAlgebraicResidual(integrator, u0)) || return nothing
+  @debug "[events] algebraic re-solve kept at the solve's abstol" t = integrator.t residual
+  return _restoreRetcode!(integrator, before)
+end
+
+#= The solve's absolute tolerance, the smallest of a per-component one. =#
+_solveAbstol(integrator) = (local a = integrator.opts.abstol; a isa Number ? a : minimum(a))
+
+#= The largest residual of the algebraic equations of a mass-matrix ODE at
+   u (Inf for other problems). =#
+function _maxAlgebraicResidual(integrator, u)
+  local f = integrator.f
+  local rows = _algebraicRows(f)
+  (isempty(rows) || !ModelingToolkit.SciMLBase.isinplace(f)) && return Inf
+  local r = similar(u)
+  f(r, u, integrator.p, integrator.t)
+  return maximum(k -> abs(r[k]), rows)
+end
+
+#= Solve the algebraic unknowns again with `alg` (nothing: EventReinit),
+   the differential states kept (a pure ODE has none). A DAEFunction (DFBDF,
+   IDA) has no mass matrix; its algebraic variables are the ones
+   `differential_vars` excludes. Whether it succeeded. =#
 function _resolveAlgebraics!(integrator, alg = nothing)
   local f = integrator.f
   if hasproperty(f, :mass_matrix)
     local mm = f.mass_matrix
     (mm isa LinearAlgebra.UniformScaling || all(!iszero, LinearAlgebra.diag(mm))) && return true
   end
-  DiffEqBase.initialize_dae!(integrator, alg === nothing ? DiffEqBase.BrownFullBasicInit() : alg)
+  DiffEqBase.initialize_dae!(integrator, alg === nothing ? EventReinit() : alg)
   _derivativeDiscontinuity!(integrator, true)
   return integrator.sol.retcode != ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
 end

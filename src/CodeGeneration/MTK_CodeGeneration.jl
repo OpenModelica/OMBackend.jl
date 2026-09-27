@@ -510,7 +510,7 @@ const ZC_HYSTERESIS_DEFAULT = 1.0e-7   # reltol 1e-3, DifferentialEquations' def
    solved again at the event with the states kept (Modelica's event
    iteration re-solves the system; NoInit left e.g. `y = if ... then 1 else 2`
    at its old value until the end of the next step). =#
-const _BRANCH_EVENT_REINIT = :(OMBackend.CodeGeneration.DiffEqBase.BrownFullBasicInit())
+const _BRANCH_EVENT_REINIT = :(OMBackend.CodeGeneration.EventReinit())
 
 """
   Generates simulation code targeting modeling toolkit.

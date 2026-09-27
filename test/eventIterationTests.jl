@@ -153,3 +153,20 @@ end
   @test CG._update!(c, integrator) && c.rel == [true] && c.crossed == [false]
 end
 
+#= The algebraic re-solve at an event (CodeGeneration.EventReinit): 0 = 1e8 (y^2 - 2)
+   keeps ~4e-8 on the residual after rounding, out of BrownFullBasicInit's own 1e-10
+   (as a thyristor bridge's commutation, near singular at values of 1e6); the result
+   stands within the solve's abstol, not beyond it. =#
+@testset "Event re-solve: accepted within the solve's abstol" begin
+  local CG = OMBackend.CodeGeneration
+  local SB = CG.ModelingToolkit.SciMLBase
+  local ODE = CG.OrdinaryDiffEq
+  local f!(du, u, p, t) = (du[1] = -u[1]; du[2] = 1e8 * (u[2]^2 - 2); nothing)
+  local prob = SB.ODEProblem(SB.ODEFunction(f!; mass_matrix = [1.0 0.0; 0.0 0.0]), [1.0, 1.0], (0.0, 1.0))
+  local reinit(abstol, alg) = (local i = ODE.init(prob, ODE.Rodas5P(); initializealg = SB.NoInit(), abstol = abstol);
+                               CG.DiffEqBase.initialize_dae!(i, alg); i)
+  @test reinit(1e-6, CG.DiffEqBase.BrownFullBasicInit()).sol.retcode == SB.ReturnCode.InitialFailure
+  local i = reinit(1e-6, CG.EventReinit())
+  @test i.sol.retcode == SB.ReturnCode.Default && i.u[2] ≈ sqrt(2)
+  @test reinit(1e-12, CG.EventReinit()).sol.retcode == SB.ReturnCode.InitialFailure
+end
