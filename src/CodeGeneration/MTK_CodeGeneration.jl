@@ -485,7 +485,7 @@ struct IfEquationComponent
   #= Deferred pure-time-event branches: (ifCondSym, zeroCrossingLHS, mtkConditionEq,
      postCrossingValue). `createIfEquations` builds one refresh callback per entry;
      each fires at its own threshold, sets its own ifCond to the post-crossing value,
-     and re-derives the OTHER pure-time ifConds from their zero-crossing sign so that
+     and re-derives the OTHER pure-time ifConds just after the event time so that
      coincident time events cannot drop one another's affect. =#
   pureTimeEvents       :: Vector{Tuple{Symbol, Any, Any, Float64}}
   #= `target => value` pair Exprs: the t0-selected branch RHS evaluated at the
@@ -1866,11 +1866,20 @@ So the first will have 1 and so on.
    crossing's direction (rising zc: the condition becomes FALSE, falling: TRUE;
    a periodic condition such as sin(time) > 0.5 crosses both ways) and
    re-derives every OTHER pure-time ifCond from its zero-crossing sign
-   (`zc < 0` <=> condition TRUE). Reading the firing event's own `zc` is unusable
-   because it is exactly 0 at the crossing instant; the other events are not at
-   their crossing so their sign is definite. Whichever callback fires refreshes
-   all, so coincident time events stay consistent even though MTK/DiffEq apply
-   only one affect per coincident root. =#
+   (`zc < 0` <=> condition TRUE). The events are located on the left of their
+   roots, so an event that coincides with K (the same threshold, e.g. the
+   BooleanSteps of the phases of a switch sharing startTime) still shows its
+   pre-crossing sign at t: read at t, each coincident affect reset the others
+   and only the last one stayed switched. The other conditions are therefore
+   read just after t (`_TIME_EVENT_AHEAD`): a coincident crossing is taken as
+   happened, a condition away from its crossing keeps its sign, and one that
+   only touches zero there keeps its value. A pure-time zc depends on t and
+   parameters only, so shifting t needs no derivative (mod/floor included). =#
+#= How far after an event, relative to 1 + |t|, the other pure-time conditions are read:
+   crossings closer than this coincide with the event (1e-10 s near t = 1, 1e-5 s at
+   t = 1e5). Each callback substitutes every other condition, n(n - 1) in all. =#
+const _TIME_EVENT_AHEAD = 1.0e-10
+
 function _buildTimeEventRefreshCallbacks(allPT::Vector, simCode)
   local n = length(allPT)
   local cbs = Expr[]
@@ -1887,7 +1896,8 @@ function _buildTimeEventRefreshCallbacks(allPT::Vector, simCode)
         push!(retKwsBy[1.0], Expr(:kw, symJ, 1.0))
       else
         local zcName = Symbol("_zc", j)
-        push!(obsKws, Expr(:kw, zcName, allPT[j][2]))
+        local ahead = :(t + $(_TIME_EVENT_AHEAD) * (1 + abs(t)))
+        push!(obsKws, Expr(:kw, zcName, :(Symbolics.substitute($(allPT[j][2]), Dict(t => $(ahead))))))
         local refresh = Expr(:kw, symJ, :((observed.$(zcName) < 0) ? 1.0 : 0.0))
         push!(retKwsBy[0.0], refresh)
         push!(retKwsBy[1.0], refresh)
