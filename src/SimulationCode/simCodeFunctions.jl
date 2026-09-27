@@ -134,7 +134,9 @@ function flattenRecordParametersInFunction(func::MODELICA_FUNCTION)::MODELICA_FU
     end
   end
 
-  return MODELICA_FUNCTION(func.name, flattenedInputs, flattenedOutputs, func.locals, transformedStatements)
+  local locals = isempty(recordFieldMap) ? func.locals :
+                 [_transformLocalForFlattenedRecords(l, recordFieldMap) for l in func.locals]
+  return MODELICA_FUNCTION(func.name, flattenedInputs, flattenedOutputs, locals, transformedStatements)
 end
 
 function flattenRecordParametersInFunction(func::EXTERNAL_MODELICA_FUNCTION)::EXTERNAL_MODELICA_FUNCTION
@@ -148,6 +150,10 @@ end
 """
 function flattenRecordVar(v::DAE.VAR, recordFieldMap::Dict{String, Vector{Tuple{String, DAE.Type}}})::Vector{DAE.VAR}
   local baseName = string(v.componentRef)
+  #= An array of records (`input Complex u[:]`: ty is the record, dims the array) keeps
+     its dimensions on every field: u_re[:], u_im[:]. A dimension may refer to an
+     earlier record array (`c2[size(c1, 1)]`), whose fields are already in the map. =#
+  local recordDims = _transformDimsForFlattenedRecords(v.dims, recordFieldMap)
   @match v.ty begin
     DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _) => begin
       local flattenedVars = DAE.VAR[]
@@ -162,16 +168,19 @@ function flattenRecordVar(v::DAE.VAR, recordFieldMap::Dict{String, Vector{Tuple{
               _ => MetaModelica.nil
             end
             #= Create a new DAE.VAR with flattened name and field type =#
-            local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
+            local flatIdentTy = isempty(recordDims) ? fieldTy : DAE.T_ARRAY(fieldTy, recordDims)
+            #= In a record array the VAR's dims carry every dimension; ty is the element type. =#
+            local varTy = isempty(recordDims) ? fieldTy : _elementType(fieldTy)
+            local flatCref = DAE.CREF_IDENT(flatName, flatIdentTy, MetaModelica.nil)
             local flatVar = DAE.VAR(
               flatCref,
               v.kind,
               v.direction,
               v.parallelism,
               v.protection,
-              fieldTy,
+              varTy,
               NONE(),  #= No binding for flattened fields =#
-              fieldDims,
+              listAppend(recordDims, fieldDims),
               v.connectorType,
               v.source,
               NONE(),
@@ -187,8 +196,33 @@ function flattenRecordVar(v::DAE.VAR, recordFieldMap::Dict{String, Vector{Tuple{
       recordFieldMap[baseName] = fieldInfo
       return flattenedVars
     end
-    _ => return [v]
+    #= Its dimensions or binding may read an earlier record (`indices[size(v, 1)]`). =#
+    _ => return [_transformLocalForFlattenedRecords(v, recordFieldMap)]
   end
+end
+
+_elementType(@nospecialize(ty::DAE.Type)) = ty isa DAE.T_ARRAY ? _elementType(ty.ty) : ty
+
+function _transformDimsForFlattenedRecords(dims::List, recordFieldMap::Dict)::List
+  return MetaModelica.list((_transformDimForFlattenedRecords(d, recordFieldMap) for d in dims)...)
+end
+
+function _transformDimForFlattenedRecords(@nospecialize(d::DAE.Dimension), recordFieldMap::Dict)::DAE.Dimension
+  @match d begin
+    DAE.DIM_EXP(e) => DAE.DIM_EXP(transformExpForFlattenedRecords(e, recordFieldMap))
+    _ => d
+  end
+end
+
+#= A variable whose binding or dimensions read a flattened record (`m = size(u, 1)`). =#
+function _transformLocalForFlattenedRecords(v::DAE.VAR, recordFieldMap::Dict)::DAE.VAR
+  local binding = @match v.binding begin
+    SOME(e) => SOME(transformExpForFlattenedRecords(e, recordFieldMap))
+    _ => v.binding
+  end
+  return DAE.VAR(v.componentRef, v.kind, v.direction, v.parallelism, v.protection, v.ty, binding,
+                 _transformDimsForFlattenedRecords(v.dims, recordFieldMap), v.connectorType, v.source,
+                 v.variableAttributesOption, v.comment, v.innerOuter)
 end
 
 """
@@ -204,24 +238,31 @@ function transformStatementsForFlattenedRecords(statements::Vector{DAE.Statement
 end
 
 function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN, recordFieldMap::Dict)::Vector{DAE.Statement}
-  #= Check if LHS is a flattened record variable =#
-  local lhsName = @match stmt.exp1 begin
-    DAE.CREF(DAE.CREF_IDENT(ident, _, _), _) => ident
-    _ => nothing
+  #= Check if LHS is a flattened record variable, or an element of a flattened record array =#
+  local (lhsName, lhsSubs) = @match stmt.exp1 begin
+    DAE.CREF(DAE.CREF_IDENT(ident, _, subs), _) => (ident, subs)
+    _ => (nothing, MetaModelica.nil)
   end
   #= If LHS is a record variable and RHS is a RECORD expression, expand into field assignments =#
   if lhsName !== nothing && haskey(recordFieldMap, lhsName)
+    local fieldLhs = (fieldName, fieldTy) -> DAE.CREF(DAE.CREF_IDENT(lhsName * OMBackend.COMPONENT_SEPARATOR * fieldName,
+                                                                     fieldTy, lhsSubs), fieldTy)
+    isempty(lhsSubs) || return _recordElementAssignment(stmt, lhsName, fieldLhs, recordFieldMap)
+    #= A record reference on the right (a record, or an element of a record array:
+       result := v[index]) is copied field by field. =#
+    local rhsFields = expandRecordArgForCall(stmt.exp, recordFieldMap)
+    if rhsFields !== nothing
+      return DAE.Statement[DAE.STMT_ASSIGN(fieldTy, fieldLhs(fieldName, fieldTy), rhsFields[i], stmt.source)
+                           for (i, (fieldName, fieldTy)) in enumerate(recordFieldMap[lhsName])]
+    end
     @match stmt.exp begin
       DAE.RECORD(path, exps, fieldNames, ty) => begin
         local fieldInfo = recordFieldMap[lhsName]
         local expVec = collect(exps)
         local stmts = DAE.Statement[]
         for (i, (fieldName, fieldTy)) in enumerate(fieldInfo)
-          local flatName = lhsName * OMBackend.COMPONENT_SEPARATOR * fieldName
-          local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
-          local lhsExp = DAE.CREF(flatCref, fieldTy)
           local rhsExp = transformExpForFlattenedRecords(expVec[i], recordFieldMap)
-          push!(stmts, DAE.STMT_ASSIGN(fieldTy, lhsExp, rhsExp, stmt.source))
+          push!(stmts, DAE.STMT_ASSIGN(fieldTy, fieldLhs(fieldName, fieldTy), rhsExp, stmt.source))
         end
         return stmts
       end
@@ -229,10 +270,12 @@ function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN, recordFiel
         local newExp = transformExpForFlattenedRecords(stmt.exp, recordFieldMap)
         #= RHS is not a RECORD literal but LHS is a record variable.
            Keep the original assignment to evaluate the RHS once (into a tuple),
-           then extract each field via tuple indexing. =#
+           then extract each field via tuple indexing. A whole record array is
+           scattered by codegen from the one assignment. =#
         local fieldInfo = recordFieldMap[lhsName]
         local stmts = DAE.Statement[]
         push!(stmts, DAE.STMT_ASSIGN(stmt.type_, stmt.exp1, newExp, stmt.source))
+        stmt.type_ isa DAE.T_ARRAY && return stmts
         for (i, (fieldName, fieldTy)) in enumerate(fieldInfo)
           local flatName = lhsName * OMBackend.COMPONENT_SEPARATOR * fieldName
           local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
@@ -251,10 +294,97 @@ function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN, recordFiel
   end
 end
 
+#= An element of a record array, v[i] := value: the value goes into a temporary record
+   first (a call is evaluated once and scattered by codegen), then into the field
+   elements, so a value that reads v[i] itself (a swap of fields) sees the old element. =#
+function _recordElementAssignment(stmt::DAE.STMT_ASSIGN, lhsName::String, fieldLhs, recordFieldMap::Dict)::Vector{DAE.Statement}
+  local fields = recordFieldMap[lhsName]
+  local tmpBase = "__omjl_" * lhsName
+  local tmpField = (fieldName, fieldTy) -> DAE.CREF(DAE.CREF_IDENT(tmpBase * OMBackend.COMPONENT_SEPARATOR * fieldName,
+                                                                   fieldTy, MetaModelica.nil), fieldTy)
+  local stmts = DAE.Statement[]
+  local rhsFields = expandRecordArgForCall(stmt.exp, recordFieldMap)
+  if rhsFields !== nothing
+    for (k, (fieldName, fieldTy)) in enumerate(fields)
+      push!(stmts, DAE.STMT_ASSIGN(fieldTy, tmpField(fieldName, fieldTy), rhsFields[k], stmt.source))
+    end
+  elseif stmt.exp isa DAE.RECORD
+    for (k, (fieldName, fieldTy)) in enumerate(fields)
+      push!(stmts, DAE.STMT_ASSIGN(fieldTy, tmpField(fieldName, fieldTy),
+                                   transformExpForFlattenedRecords(listGet(stmt.exp.exps, k), recordFieldMap), stmt.source))
+    end
+  else
+    local tmpCref = DAE.CREF(DAE.CREF_IDENT(tmpBase, stmt.type_, MetaModelica.nil), stmt.type_)
+    push!(stmts, DAE.STMT_ASSIGN(stmt.type_, tmpCref, transformExpForFlattenedRecords(stmt.exp, recordFieldMap), stmt.source))
+  end
+  for (fieldName, fieldTy) in fields
+    push!(stmts, DAE.STMT_ASSIGN(fieldTy, fieldLhs(fieldName, fieldTy), tmpField(fieldName, fieldTy), stmt.source))
+  end
+  return stmts
+end
+
+#= A whole record array (y := rotateAll(u, phi), result := v) keeps one statement: codegen
+   scatters the call's field arrays in one evaluation, or copies field by field
+   (_recordAssignment in CodeGeneration/algorithmic.jl). Any other value (an if-expression,
+   an array constructor) is not supported: an error, not fields left at their defaults. =#
 function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN_ARR, recordFieldMap::Dict)::Vector{DAE.Statement}
   local newLhs = transformExpForFlattenedRecords(stmt.lhs, recordFieldMap)
   local newExp = transformExpForFlattenedRecords(stmt.exp, recordFieldMap)
+  if expandRecordArgForCall(stmt.lhs, recordFieldMap) !== nothing &&
+     !(newExp isa DAE.CALL) && expandRecordArgForCall(stmt.exp, recordFieldMap) === nothing
+    error("assigning $(string(stmt.exp)) to the record array $(string(stmt.lhs)) in a function is not supported")
+  end
   return [DAE.STMT_ASSIGN_ARR(stmt.type_, newLhs, newExp, stmt.source)]
+end
+
+function transformStatementForFlattenedRecords(stmt::DAE.STMT_FOR, recordFieldMap::Dict)::Vector{DAE.Statement}
+  local body = transformStatementsForFlattenedRecords(collect(stmt.statementLst), recordFieldMap)
+  return [DAE.STMT_FOR(stmt.type_, stmt.iterIsArray, stmt.iter, stmt.index,
+                       transformExpForFlattenedRecords(stmt.range, recordFieldMap),
+                       MetaModelica.list(body...), stmt.source)]
+end
+
+function transformStatementForFlattenedRecords(stmt::DAE.STMT_WHILE, recordFieldMap::Dict)::Vector{DAE.Statement}
+  local body = transformStatementsForFlattenedRecords(collect(stmt.statementLst), recordFieldMap)
+  return [DAE.STMT_WHILE(transformExpForFlattenedRecords(stmt.exp, recordFieldMap),
+                         MetaModelica.list(body...), stmt.source)]
+end
+
+function transformStatementForFlattenedRecords(stmt::DAE.STMT_IF, recordFieldMap::Dict)::Vector{DAE.Statement}
+  local body = transformStatementsForFlattenedRecords(collect(stmt.statementLst), recordFieldMap)
+  return [DAE.STMT_IF(transformExpForFlattenedRecords(stmt.exp, recordFieldMap), MetaModelica.list(body...),
+                      _transformElseForFlattenedRecords(stmt.else_, recordFieldMap), stmt.source)]
+end
+
+function _transformElseForFlattenedRecords(@nospecialize(e::DAE.Else), recordFieldMap::Dict)::DAE.Else
+  @match e begin
+    DAE.ELSEIF(cond, stmts, rest) => DAE.ELSEIF(transformExpForFlattenedRecords(cond, recordFieldMap),
+      MetaModelica.list(transformStatementsForFlattenedRecords(collect(stmts), recordFieldMap)...),
+      _transformElseForFlattenedRecords(rest, recordFieldMap))
+    DAE.ELSE(stmts) => DAE.ELSE(MetaModelica.list(transformStatementsForFlattenedRecords(collect(stmts), recordFieldMap)...))
+    _ => e
+  end
+end
+
+function transformStatementForFlattenedRecords(stmt::DAE.STMT_NORETCALL, recordFieldMap::Dict)::Vector{DAE.Statement}
+  return [DAE.STMT_NORETCALL(transformExpForFlattenedRecords(stmt.exp, recordFieldMap), stmt.source)]
+end
+
+function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSERT, recordFieldMap::Dict)::Vector{DAE.Statement}
+  return [DAE.STMT_ASSERT(transformExpForFlattenedRecords(stmt.cond, recordFieldMap),
+                          transformExpForFlattenedRecords(stmt.msg, recordFieldMap),
+                          transformExpForFlattenedRecords(stmt.level, recordFieldMap), stmt.source)]
+end
+
+function transformStatementForFlattenedRecords(stmt::DAE.STMT_TUPLE_ASSIGN, recordFieldMap::Dict)::Vector{DAE.Statement}
+  #= A record target takes the callee's flattened field outputs: (result, index) := 'max'(v). =#
+  local targets = DAE.Exp[]
+  for e in stmt.expExpLst
+    local fields = expandRecordArgForCall(e, recordFieldMap)
+    fields === nothing ? push!(targets, transformExpForFlattenedRecords(e, recordFieldMap)) : append!(targets, fields)
+  end
+  return [DAE.STMT_TUPLE_ASSIGN(stmt.type_, MetaModelica.list(targets...),
+                                transformExpForFlattenedRecords(stmt.exp, recordFieldMap), stmt.source)]
 end
 
 Base.@nospecializeinfer function transformStatementForFlattenedRecords(@nospecialize(stmt::DAE.Statement), recordFieldMap::Dict)::Vector{DAE.Statement}
@@ -263,19 +393,20 @@ Base.@nospecializeinfer function transformStatementForFlattenedRecords(@nospecia
 end
 
 """
-  If exp is a plain CREF to a record variable in recordFieldMap, expand it into
-  a vector of field CREFs (e.g., R_rel becomes [R_rel_T, R_rel_w]).
+  If exp is a CREF to a record variable in recordFieldMap, expand it into a vector
+  of field CREFs (e.g., R_rel becomes [R_rel_T, R_rel_w]); an element of a record
+  array keeps its subscripts (u[k] becomes [u_re[k], u_im[k]]).
   Returns nothing if exp is not an expandable record reference.
 """
 Base.@nospecializeinfer function expandRecordArgForCall(@nospecialize(exp::DAE.Exp), recordFieldMap::Dict)
   @match exp begin
-    DAE.CREF(DAE.CREF_IDENT(ident, _, _), _) => begin
+    DAE.CREF(DAE.CREF_IDENT(ident, _, subs), _) => begin
       if haskey(recordFieldMap, ident)
         local fieldInfo = recordFieldMap[ident]
         local fieldExps = DAE.Exp[]
         for (fieldName, fieldTy) in fieldInfo
           local flatName = ident * OMBackend.COMPONENT_SEPARATOR * fieldName
-          local flatCref = DAE.CREF_IDENT(flatName, fieldTy, MetaModelica.nil)
+          local flatCref = DAE.CREF_IDENT(flatName, fieldTy, subs)
           push!(fieldExps, DAE.CREF(flatCref, fieldTy))
         end
         return fieldExps
@@ -296,54 +427,61 @@ function _recordFieldRefParts(cr::DAE.CREF_QUAL)
 end
 
 """
-  Transform expressions to replace record field accesses with flattened names.
+  Transform expressions to replace record field accesses with flattened names,
+  anywhere in the expression (reductions, relations, ranges, ...):
+  R.T[1,2] becomes R_T[1,2], an element's field u[k].re becomes u_re[k], the size of
+  a record array size(u, 1) becomes size(u_re, 1), and record arguments of calls
+  become their fields (expandRecordArgForCall). Only functions with record inputs or
+  outputs are traversed (the traversal does not know clock constants or MetaModelica
+  expressions).
 """
 function transformExpForFlattenedRecords(exp::DAE.Exp, recordFieldMap::Dict)::DAE.Exp
+  isempty(recordFieldMap) && return exp
+  return first(Util.traverseExpTopDown(exp, _flattenRecordRefs, recordFieldMap))
+end
+
+Base.@nospecializeinfer function _flattenRecordRefs(@nospecialize(exp::DAE.Exp), recordFieldMap::Dict)
   @match exp begin
-    #= Handle qualified CREF like R.T or R.w =#
-    DAE.CREF(DAE.CREF_QUAL(ident, identType, subscriptLst, componentRef), ty) => begin
-      #= Check if the base ident is a flattened record =#
-      if haskey(recordFieldMap, ident)
-        #= Keep the field base name and its subscripts separate. =#
-        local (innerName, fieldTy, innerSubscripts) = _recordFieldRefParts(componentRef)
-        local flatName = ident * OMBackend.COMPONENT_SEPARATOR * innerName
-        local flatCref = DAE.CREF_IDENT(flatName, fieldTy, innerSubscripts)
-        return DAE.CREF(flatCref, ty)
-      end
-      return exp
+    DAE.CREF(DAE.CREF_QUAL(ident, _, outerSubs, componentRef), ty) where {haskey(recordFieldMap, ident)} => begin
+      #= Keep the field base name; the element's subscripts come first, then the field's. =#
+      local (innerName, fieldTy, innerSubs) = _recordFieldRefParts(componentRef)
+      local flatName = ident * OMBackend.COMPONENT_SEPARATOR * innerName
+      #= Continue into the subscripts: the flat name is not a record of the map. =#
+      (DAE.CREF(DAE.CREF_IDENT(flatName, fieldTy, listAppend(outerSubs, innerSubs)), ty), true, recordFieldMap)
     end
-    #= Recursively transform binary expressions =#
-    DAE.BINARY(e1, op, e2) => begin
-      local new_e1 = transformExpForFlattenedRecords(e1, recordFieldMap)
-      local new_e2 = transformExpForFlattenedRecords(e2, recordFieldMap)
-      (new_e1 === e1 && new_e2 === e2) ? exp : DAE.BINARY(new_e1, op, new_e2)
+    DAE.SIZE(DAE.CREF(DAE.CREF_IDENT(ident, _, subs), _), sz) where {haskey(recordFieldMap, ident) &&
+                                                                     !isempty(recordFieldMap[ident]) &&
+                                                                     (isSome(sz) || !(recordFieldMap[ident][1][2] isa DAE.T_ARRAY))} => begin
+      #= The record array's dimensions come first in every field: size(u, d) is size(u_f, d);
+         size(u) needs a scalar field. =#
+      local (fieldName, fieldTy) = first(recordFieldMap[ident])
+      local fieldCref = DAE.CREF_IDENT(ident * OMBackend.COMPONENT_SEPARATOR * fieldName, fieldTy, subs)
+      (DAE.SIZE(DAE.CREF(fieldCref, fieldTy), sz), true, recordFieldMap)
     end
-    #= Recursively transform arrays =#
-    DAE.ARRAY(ty, scalar, arr) => begin
-      local newArr = map(arr) do e
-        transformExpForFlattenedRecords(e, recordFieldMap)
-      end
-      DAE.ARRAY(ty, scalar, MetaModelica.list(newArr...))
-    end
-    #= Recursively transform unary expressions =#
-    DAE.UNARY(op, e1) => begin
-      local new_e1 = transformExpForFlattenedRecords(e1, recordFieldMap)
-      new_e1 === e1 ? exp : DAE.UNARY(op, new_e1)
-    end
-    #= Recursively transform function calls, expanding record args into flattened fields =#
     DAE.CALL(path, expLst, attr) => begin
       local newArgs = DAE.Exp[]
       for e in expLst
         local expanded = expandRecordArgForCall(e, recordFieldMap)
         if expanded !== nothing
           append!(newArgs, expanded)
+          continue
+        end
+        local newE = transformExpForFlattenedRecords(e, recordFieldMap)
+        #= A record-valued call as an argument passes its fields, as at equation call
+           sites (expandRecordArgsInExp): '+'(c3, multiply(c1[i], c2[i])). The call is
+           evaluated once per field. Builtins take the record whole. =#
+        local fieldTys = attr.builtin ? nothing : _recordValueFieldTypes(newE)
+        if fieldTys === nothing
+          push!(newArgs, newE)
         else
-          push!(newArgs, transformExpForFlattenedRecords(e, recordFieldMap))
+          for (k, ty) in enumerate(fieldTys)
+            push!(newArgs, DAE.TSUB(newE, k, ty))
+          end
         end
       end
-      DAE.CALL(path, MetaModelica.list(newArgs...), attr)
+      (DAE.CALL(path, MetaModelica.list(newArgs...), attr), false, recordFieldMap)
     end
-    _ => exp
+    _ => (exp, true, recordFieldMap)
   end
 end
 
@@ -407,6 +545,11 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
     DAE.CALL(path, expLst, attr) => begin
       local newArgs = DAE.Exp[]
       for arg in expLst
+        local fieldArrays = attr.builtin ? nothing : _splitRecordArrayArg(arg)
+        if fieldArrays !== nothing
+          append!(newArgs, fieldArrays)
+          continue
+        end
         @match arg begin
           DAE.CREF(cr, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => begin
             local baseName = OMBackend.canonicalName(cr)
@@ -425,13 +568,9 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
             #= Check if the expanded argument has Complex record return type.
                If so, split it into TSUB expressions for each field, because the
                outer function wrapper expects flattened scalar arguments. =#
-            local complexFields = _getComplexReturnFields(expandedArg)
-            if complexFields !== nothing
-              for (fieldIdx, field) in enumerate(complexFields)
-                local fieldTy = @match field begin
-                  DAE.TYPES_VAR(_, _, fTy, _, _) => fTy
-                  _ => DAE.T_REAL_DEFAULT
-                end
+            local fieldTys = _recordValueFieldTypes(expandedArg)
+            if fieldTys !== nothing
+              for (fieldIdx, fieldTy) in enumerate(fieldTys)
                 push!(newArgs, DAE.TSUB(expandedArg, fieldIdx, fieldTy))
               end
             else
@@ -466,6 +605,79 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
       DAE.ARRAY(ty, scalar, MetaModelica.list(newArr...))
     end
     _ => exp
+  end
+end
+
+"""
+  An array of records passed to a function whose flattened signature takes one array
+  per field (flattenRecordVar): {u[1], u[2]} becomes {u[1]_re, u[2]_re}, {u[1]_im, u[2]_im}
+  (the scalarized names), a record-valued call element gives its field by TSUB. A reference
+  to a whole record array with fixed dimensions is split the same way. Returns nothing
+  unless the argument is such an array.
+"""
+function _splitRecordArrayArg(@nospecialize(arg::DAE.Exp))::Union{Nothing, Vector{DAE.Exp}}
+  local elems = @match arg begin
+    DAE.ARRAY(_, _, arr) => collect(arr)
+    DAE.CREF(cr, DAE.T_ARRAY(elemTy && DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), _, _), dims)) => begin
+      local n = @match collect(dims) begin
+        [DAE.DIM_INTEGER(k)] => k
+        _ => return nothing
+      end
+      local name = OMBackend.canonicalName(cr)
+      occursin('[', name) && return nothing
+      [DAE.CREF(DAE.CREF_IDENT(name, elemTy, MetaModelica.list(DAE.INDEX(DAE.ICONST(i)))), elemTy) for i in 1:n]
+    end
+    _ => return nothing
+  end
+  isempty(elems) && return nothing
+  local fields = _recordElementFields(first(elems))
+  (fields === nothing || !all(e -> _recordElementFields(e) !== nothing, elems)) && return nothing
+  #= Array-valued fields are scalarized per element in the simvars: not split here. =#
+  any(f -> f.ty isa DAE.T_ARRAY, fields) && return nothing
+  local fieldArrays = DAE.Exp[]
+  for (k, field) in enumerate(fields)
+    local (fieldName, fieldTy) = @match field begin
+      DAE.TYPES_VAR(fName, _, fTy, _, _) => (fName, fTy)
+    end
+    local parts = DAE.Exp[_recordElementField(e, k, fieldName, fieldTy) for e in elems]
+    local arrTy = DAE.T_ARRAY(fieldTy, MetaModelica.list(DAE.DIM_INTEGER(length(parts))))
+    push!(fieldArrays, DAE.ARRAY(arrTy, true, MetaModelica.list(parts...)))
+  end
+  return fieldArrays
+end
+
+#= Field k (`fieldName`) of a record element of an array argument: the scalarized name of a
+   record reference (u[1] -> u[1]_re), a TSUB of a record-valued call. =#
+Base.@nospecializeinfer function _recordElementField(@nospecialize(e::DAE.Exp), k::Int, fieldName::String,
+                                                     @nospecialize(fieldTy::DAE.Type))::DAE.Exp
+  @match e begin
+    DAE.CREF(cr, _) => DAE.CREF(DAE.CREF_IDENT(OMBackend.canonicalName(cr) * OMBackend.COMPONENT_SEPARATOR * fieldName,
+                                               fieldTy, MetaModelica.nil), fieldTy)
+    DAE.RECORD(_, exps, _, _) => expandRecordArgsInExp(listGet(exps, k))
+    _ => DAE.TSUB(expandRecordArgsInExp(e), k, fieldTy)
+  end
+end
+
+#= The fields of a record reference, literal or record-valued call; nothing for other expressions. =#
+Base.@nospecializeinfer function _recordElementFields(@nospecialize(e::DAE.Exp))
+  @match e begin
+    DAE.CREF(_, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => collect(varLst)
+    DAE.RECORD(_, _, _, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => collect(varLst)
+    _ => _getComplexReturnFields(e)
+  end
+end
+
+#= The field types of a call returning a record, or an array of records (a flattened
+   function returns one array per field, `output Complex v[:]` -> (v_re, v_im), each typed
+   as an array so that codegen takes an array tuple element); nothing otherwise. =#
+Base.@nospecializeinfer function _recordValueFieldTypes(@nospecialize(exp::DAE.Exp))::Union{Nothing, Vector{DAE.Type}}
+  @match exp begin
+    DAE.CALL(_, _, DAE.CALL_ATTR(ty = DAE.T_ARRAY(DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _), dims))) =>
+      DAE.Type[DAE.T_ARRAY(f.ty, dims) for f in varLst]
+    _ => begin
+      local fields = _getComplexReturnFields(exp)
+      fields === nothing ? nothing : DAE.Type[f.ty for f in fields]
+    end
   end
 end
 

@@ -702,14 +702,16 @@ end
 """
     _recordCrefFields(exp::DAE.Exp) -> Union{Nothing,Tuple{String,Vector{String}}}
 
-`(baseIdent, fieldNames)` for a subscript-free record-typed simple CREF, else `nothing`.
+`(baseIdent, fieldNames)` for a subscript-free simple CREF of a record or an array of records
+(whose fields are then arrays), else `nothing`.
 """
 function _recordCrefFields(exp::DAE.Exp)::Union{Nothing, Tuple{String, Vector{String}}}
   local base = _plainCrefName(exp)
   base === nothing && return nothing
   return @match exp begin
     DAE.CREF(_, ty) => begin
-      local fieldNames = _recordFieldNames(ty)
+      #= A whole array of records too: its fields are arrays (y_re, y_im). =#
+      local fieldNames = _recordFieldNames(ty isa DAE.T_ARRAY ? _arrayElementType(ty) : ty)
       isempty(fieldNames) ? nothing : (base, fieldNames)
     end
     _ => nothing
@@ -783,6 +785,9 @@ function _constantIntegerIndex(subscript::DAE.Subscript)::Union{Nothing, Int}
     _ => nothing
   end
 end
+
+#= The element type of a (nested) array type. =#
+_arrayElementType(@nospecialize(ty::DAE.Type)) = ty isa DAE.T_ARRAY ? _arrayElementType(ty.ty) : ty
 
 """
     _recordFieldNames(ty::DAE.Type) -> Vector{String}
