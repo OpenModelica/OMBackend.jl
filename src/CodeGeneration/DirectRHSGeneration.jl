@@ -98,8 +98,9 @@ default to 0.0, which may cause InitialFailure for DAE systems.
 
 Returns an `ODEProblem` ready for `solve()`.
 """
-#= Re-initialization per DAE problem (keyed by its generated RHS function):
-   parameter vector -> consistent initial state. See buildDirectRHSProblem. =#
+#= Re-initialization per problem (keyed by its generated RHS function):
+   parameter vector -> consistent initial state, the vector's
+   initialization-defined parameters assigned. See buildDirectRHSProblem. =#
 const DAE_REINIT = IdDict{Any, Function}()
 
 function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
@@ -179,6 +180,28 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                 hardInitialValues=hardInitialValues,
                                 observedEquations=observedEquations)
   local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
+  #= Parameters an initialization equation defines (fixed = false): assigned
+     from u at the initial state (in the DAE init solve, at each evaluation).
+     A row may read another assigned parameter: evaluating again settles a
+     chain. =#
+  local paramAssign = _initialParameterAssignments(reducedSystem, states, params, iv)
+  local assignedNames = paramAssign === nothing ? OrderedSet{String}() :
+    OrderedSet{String}(string(params[k]) for k in last(paramAssign))
+  local assignParams! = paramAssign === nothing ? nothing : let (pF, pIdxs) = paramAssign
+    (pv, u, t) -> begin
+      for _ in 1:length(pIdxs)
+        local vals = pF(u, pv, t)
+        local changed = false
+        for (i, k) in enumerate(pIdxs)
+          local v = Float64(vals[i])
+          changed |= !isequal(pv[k], v)
+          pv[k] = v
+        end
+        changed || break
+      end
+      nothing
+    end
+  end
 
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
   get(ENV, "OMBACKEND_INIT_TRACE", "") == "true" &&
@@ -211,6 +234,12 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     @debug "DirectRHS: pure ODE (identity mass matrix)"
     local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
                                       sys=reducedSystem, jacFunc=jacFunc, jacProto=jacProto)
+    if assignParams! !== nothing
+      assignParams!(p_vec, u0, tspan[1])
+      #= Other tunable parameter values may change them. =#
+      local u0Start = copy(u0)
+      DAE_REINIT[rhsFunc] = pv -> (assignParams!(pv, u0Start, tspan[1]); copy(u0Start))
+    end
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   else
     @debug "DirectRHS: DAE with mass matrix"
@@ -260,7 +289,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local symInit = _symbolicInitializationResiduals(reducedSystem, states, params,
                                                      ModelingToolkit.get_iv(reducedSystem), mm;
                                                      resolvedParams=resolvedParams,
-                                                     excludeNames=discreteNames)
+                                                     excludeNames=union(discreteNames, assignedNames))
     local extraResiduals = nothing
     #= The residual rows for parameter values `pv` (a re-initialization for
        other tunable parameter values evaluates them at those). =#
@@ -271,28 +300,45 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                 for i in 1:length(dIdxs)]
       end
     end
+    #= The init solve's RHS assigns the initialization-defined parameters
+       first. Their f may assert where the model's own equations only guard
+       (the MSL selectBranch asserts a regular loop position): at a trial point
+       (the entry guesses, a line-search step, a finite difference) that is a
+       non-finite residual the solve rejects, not a failed build. =#
+    local initRhs = assignParams! === nothing ? rhsFunc : (du, u, p, t) -> begin
+      try
+        assignParams!(p, u, t)
+      catch e
+        e isa InterruptException && rethrow()
+        fill!(du, NaN)
+        return nothing
+      end
+      rhsFunc(du, u, p, t)
+    end
     if symInit !== nothing
       local candidate = residualsAt(p_vec)
       local probeOk = try
         local duProbe = similar(u0)
-        rhsFunc(duProbe, u0, p_vec, 0.0)
+        initRhs(duProbe, u0, p_vec, 0.0)
         all(isfinite, candidate(duProbe, u0))
       catch
         false
       end
       if probeOk
         extraResiduals = candidate
-        @debug "DirectRHS: enforcing $(length(dIdxs)) symbolic initialization residual rows"
+        @debug "DirectRHS: enforcing $(length(symInit[2])) symbolic initialization residual rows"
       else
         @debug "DirectRHS: symbolic initialization residuals failed probe, skipping"
       end
     end
-    u0 = _solveDAEInitialization!(u0, rhsFunc, p_vec, mm;
+    u0 = _solveDAEInitialization!(u0, initRhs, p_vec, mm;
                                   pinned=pinnedIdx,
                                   derivative_targets=derivativeInitTargets,
                                   eqLabels=eqLabels,
                                   extra_residuals=extraResiduals,
                                   discrete_pinned=discretePinnedIdx)
+    #= At the solved state, at the solve's time (_solveDAEInitialization! evaluates at 0.0). =#
+    assignParams! === nothing || assignParams!(p_vec, u0, 0.0)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
     #= The same initialization for other parameter values (tunable parameters,
        OMBackend.withTunableParameters): a run with changed parameters needs
@@ -300,13 +346,17 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        starts from this one, which is close for nearby values. =#
     local useExtra = extraResiduals !== nothing
     local u0Solved = copy(u0)
-    DAE_REINIT[rhsFunc] = pv -> _solveDAEInitialization!(copy(u0Solved), rhsFunc, pv, mm;
-                                                         pinned=pinnedIdx,
-                                                         derivative_targets=derivativeInitTargets,
-                                                         eqLabels=eqLabels,
-                                                         extra_residuals=useExtra ? residualsAt(pv) : nothing,
-                                                         discrete_pinned=discretePinnedIdx,
-                                                         warm=true)
+    DAE_REINIT[rhsFunc] = pv -> begin
+      local u = _solveDAEInitialization!(copy(u0Solved), initRhs, pv, mm;
+                                         pinned=pinnedIdx,
+                                         derivative_targets=derivativeInitTargets,
+                                         eqLabels=eqLabels,
+                                         extra_residuals=useExtra ? residualsAt(pv) : nothing,
+                                         discrete_pinned=discretePinnedIdx,
+                                         warm=true)
+      assignParams! === nothing || assignParams!(pv, u, 0.0)
+      u
+    end
   end
 
   @debug "DirectRHS: problem constructed successfully"
@@ -444,9 +494,33 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
     end
   end
   isempty(exprs) && return nothing
-  #= Inline observed definitions on demand so only states, params and the iv
-     remain; the observed list is topologically ordered, so bounded repeated
-     substitution terminates. =#
+  local keep = _inlineObservedRows!(exprs, reducedSystem, states, params, iv)
+  if length(keep) < length(exprs)
+    @debug "DirectRHS: dropped $(length(exprs) - length(keep)) symbolic initialization rows (unresolvable references)"
+  end
+  isempty(keep) && return nothing
+  exprs = exprs[keep]
+  derIdxs = derIdxs[keep]
+  mmScales = mmScales[keep]
+  #= With CSE, as the RHS: the rows have the observed equations substituted,
+     which a multibody model (MSL fullRobot: 119 unknowns, 1809 observed
+     equations) expands to millions of terms as a tree; Julia never finishes
+     lowering such a function. =#
+  local gFunc = try
+    local fExpr = Symbolics.build_function(exprs, states, params, iv; expression = Val{true}, cse = true)
+    _exprToRTGFunction(fExpr[1])
+  catch e
+    @debug "DirectRHS: could not build symbolic initialization residuals" exception = e
+    return nothing
+  end
+  return (gFunc, derIdxs, mmScales)
+end
+
+#= Inline observed definitions into `exprs` on demand so only states, params
+   and the iv remain; the observed list is topologically ordered, so bounded
+   repeated substitution terminates. Returns the indices of the rows that
+   reduced to those (a row still reading der() inside an observed does not). =#
+function _inlineObservedRows!(exprs, reducedSystem, states, params, iv)::Vector{Int}
   local obsEqs = try
     ModelingToolkit.observed(reducedSystem)
   catch
@@ -470,32 +544,49 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
       exprs[i] = Symbolics.substitute(exprs[i], pending)
     end
   end
-  #= Drop rows still referencing anything else (e.g. der() inside observed). =#
-  local keep = Int[]
-  for (i, ex) in enumerate(exprs)
-    if all(v -> string(v) in allowed, Symbolics.get_variables(ex))
-      push!(keep, i)
-    end
-  end
-  if length(keep) < length(exprs)
-    @debug "DirectRHS: dropped $(length(exprs) - length(keep)) symbolic initialization rows (unresolvable references)"
-  end
-  isempty(keep) && return nothing
-  exprs = exprs[keep]
-  derIdxs = derIdxs[keep]
-  mmScales = mmScales[keep]
-  #= With CSE, as the RHS: the rows have the observed equations substituted,
-     which a multibody model (MSL fullRobot: 119 unknowns, 1809 observed
-     equations) expands to millions of terms as a tree; Julia never finishes
-     lowering such a function. =#
-  local gFunc = try
-    local fExpr = Symbolics.build_function(exprs, states, params, iv; expression = Val{true}, cse = true)
-    _exprToRTGFunction(fExpr[1])
-  catch e
-    @debug "DirectRHS: could not build symbolic initialization residuals" exception = e
+  return Int[i for (i, ex) in enumerate(exprs)
+             if all(v -> string(v) in allowed, Symbolics.get_variables(ex))]
+end
+
+#= Initialization equations `p = f(...)` for a parameter p without a value
+   (fixed = false; the MSL analytic loop joints' positiveBranch, the branch of
+   the loop's solution that the initial positions select). No unknown of the
+   init solve is p: as a residual row the solve can only meet it by moving u
+   to where f is p's default, relaxing fixed starts (or not at all, for a
+   Boolean f). The init solve assigns p = f at each evaluation instead, and p
+   keeps its value at the initial state. Returns `(pFunc, pIdxs)`, where
+   `pFunc(u, p, t)` evaluates the values of `p[pIdxs]`, or nothing. A row whose
+   f reads its own p stays a residual row. =#
+function _initialParameterAssignments(reducedSystem, states, params, iv)
+  local initEqs = try
+    ModelingToolkit.initialization_equations(reducedSystem)
+  catch
     return nothing
   end
-  return (gFunc, derIdxs, mmScales)
+  local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
+  local exprs = Any[]
+  local pIdxs = Int[]
+  for eq in initEqs
+    local k = get(paramIdx, string(eq.lhs), 0)
+    k == 0 && continue
+    push!(exprs, eq.rhs)
+    push!(pIdxs, k)
+  end
+  isempty(exprs) && return nothing
+  local keep = _inlineObservedRows!(exprs, reducedSystem, states, params, iv)
+  filter!(keep) do i
+    local own = string(params[pIdxs[i]])
+    !any(v -> string(v) == own, Symbolics.get_variables(exprs[i]))
+  end
+  isempty(keep) && return nothing
+  local pFunc = try
+    local fExpr = Symbolics.build_function(exprs[keep], states, params, iv; expression = Val{true}, cse = true)
+    _exprToRTGFunction(fExpr[1])
+  catch e
+    @debug "DirectRHS: could not build the initial parameter assignments" exception = e
+    return nothing
+  end
+  return (pFunc, pIdxs[keep])
 end
 
 
