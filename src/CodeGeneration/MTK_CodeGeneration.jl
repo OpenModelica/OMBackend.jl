@@ -3426,10 +3426,10 @@ end
 #= Build (functionExpr, observedNT, modifiedNT) for the ImperativeAffect of a
    self-scheduling time-event when. Each ASSIGN `x := rhs` is recomputed
    imperatively (rhs lowered via `_daeExpToJuliaMem`: time->integrator.t,
-   table handle->module global, external call->resolved). A companion
-   `x_preMem` (addSelfSchedulingPreMemory) captures x's value at callback entry
-   so the table residual's pre(x) reads the held segment boundary. `atInit`
-   lowers `initial()` to true for the initialize affect. =#
+   table handle->module global, external call->resolved). The table residual's
+   pre(x) lowers to x, omc's state between events: the table's left limit for
+   t >= x, the new segment after this affect. `atInit` lowers `initial()` to
+   true for the initialize affect. =#
 Base.@nospecializeinfer function _selfSchedAffectParts(weq, simCode; atInit::Bool = false)
   local obsAcc = Dict{Symbol,Symbol}()
   local stmts = Expr[]
@@ -3442,13 +3442,6 @@ Base.@nospecializeinfer function _selfSchedAffectParts(weq, simCode; atInit::Boo
     lhsDAE isa DAE.CREF || continue
     local xn = string(lhsDAE.componentRef)
     local xsym = Symbol(xn)
-    local pm = xn * "_preMem"
-    if haskey(simCode.stringToSimVarHT, pm)
-      local pmv = Symbol("_pm_", xn)
-      push!(stmts, :(local $(pmv) = modified.$(xsym)))
-      push!(retKws, Expr(:kw, Symbol(pm), pmv))
-      push!(modNames, Symbol(pm))
-    end
     local vsym = Symbol("_v_", xn)
     local rhsJ = _daeExpToJuliaMem(SimulationCode.toDAEExp(st.right), obsAcc, simCode;
                                    initVal = atInit, subst = subst)

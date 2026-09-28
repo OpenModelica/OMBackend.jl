@@ -7886,41 +7886,6 @@ function _localizeOverconstraint(simCode::SIM_CODE)
   return (unmatched, n_eqs, length(stateNames) + length(algNames))
 end
 
-#= Discrete names written by a `time >= pre(x)` self-scheduling when. =#
-function _selfSchedulingDiscreteNames(simCode::SIM_CODE)::OrderedSet{String}
-  local out = OrderedSet{String}()
-  for weq in simCode.whenEquations
-    _condHasTimeAndPre(toDAEExp(weq.whenEquation.condition)) || continue
-    local stmts = weq.whenEquation
-    while stmts isa WHEN_STMTS
-      for st in stmts.whenStmtLst
-        if st isa ASSIGN || st isa BDAE.ASSIGN
-          local le = toDAEExp(st.left)
-          le isa DAE.CREF && push!(out, string(le.componentRef))
-        end
-      end
-      stmts = stmts.elsewhenPart
-    end
-  end
-  return out
-end
-
-#= Collect self-scheduling discretes whose `pre()` is read in `e`. =#
-function _collectPreOfSelfSched!(out::OrderedSet{String}, @nospecialize(e), selfSched::OrderedSet{String})
-  local scan = function (@nospecialize(x), acc)
-    if x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name == "pre"
-      local args = listArray(x.expLst)
-      if length(args) == 1 && args[1] isa DAE.CREF
-        local nm = string(args[1].componentRef)
-        nm in selfSched && push!(out, nm)
-      end
-    end
-    return (x, true, acc)
-  end
-  Util.traverseExpTopDown(e, scan, nothing)
-  return nothing
-end
-
 #= Numeric evaluation of a DAE expression at initialization (time = 0) given an
    environment of known variable/parameter values. Returns the Float64 value, or
    `nothing` when the expression is not (yet) fully determined (a free variable, a
@@ -8153,63 +8118,6 @@ function propagateInitialValues(simCode::SIM_CODE)::SIM_CODE
   end
   @assign simCode.stringToSimVarHT = newHT
   @info "[SIMCODE: $(simCode.name): propagateInitialValues] resolved $(length(resolved)), attached $(nAttached) start value(s) (rounds=$(rounds))"
-  return simCode
-end
-
-"""
-    addSelfSchedulingPreMemory(simCode) -> SIM_CODE
-
-For a self-scheduling time-event discrete `x` (CombiTimeTable
-nextTimeEventScaled) whose `pre(x)` is read in a residual, introduce a companion
-discrete `x_preMem` and rewrite the residual `pre(x)` to it. The companion holds
-`x` from before the most recent event (the held segment's left boundary),
-captured in the self-scheduling callback affect via Pre. MTK's bare `pre(x)->x`
-lowering would otherwise collapse the table segment to `[x, x)` and read the
-upcoming segment's value.
-"""
-function addSelfSchedulingPreMemory(simCode::SIM_CODE)::SIM_CODE
-  (hasStructuralTransitions(simCode) || hasSubModels(simCode) ||
-   hasFlatModel(simCode) || hasMetaModel(simCode)) && return simCode
-  isempty(simCode.whenEquations) && return simCode
-  local selfSched = _selfSchedulingDiscreteNames(simCode)
-  isempty(selfSched) && return simCode
-  local needPre = OrderedSet{String}()
-  for eq in simCode.residualEquations
-    _collectPreOfSelfSched!(needPre, toDAEExp(eq.exp), selfSched)
-  end
-  isempty(needPre) && return simCode
-  local ht = simCode.stringToSimVarHT
-  local newHT = copy(ht)
-  local companions = Dict{String, String}()
-  for x in needPre
-    haskey(ht, x) || continue
-    local (idx, sv) = ht[x]
-    local pm = x * "_preMem"
-    companions[x] = pm
-    newHT[pm] = (idx, SIMVAR(pm, sv.index, DISCRETE(), sv.attributes))
-  end
-  isempty(companions) && return simCode
-  local _rw = function (@nospecialize(e), acc)
-    if e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "pre"
-      local args = listArray(e.expLst)
-      if length(args) == 1 && args[1] isa DAE.CREF
-        local nm = string(args[1].componentRef)
-        if haskey(companions, nm)
-          local cr = DAE.CREF_IDENT(companions[nm], args[1].ty, MetaModelica.nil)
-          return (DAE.CREF(cr, args[1].ty), false, acc)
-        end
-      end
-    end
-    return (e, true, acc)
-  end
-  local newRes = RESIDUAL_EQUATION[]
-  for eq in simCode.residualEquations
-    local (ne, _) = Util.traverseExpTopDown(toDAEExp(eq.exp), _rw, nothing)
-    push!(newRes, RESIDUAL_EQUATION(toSimExp(ne), eq.source, eq.attr))
-  end
-  @assign simCode.stringToSimVarHT = newHT
-  @assign simCode.residualEquations = newRes
-  @info "[SIMCODE: $(simCode.name): addSelfSchedulingPreMemory] companion pre-memory for $(collect(keys(companions)))"
   return simCode
 end
 

@@ -562,12 +562,6 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
         end
         SimulationCode.logSimCodePassMetrics("observedFilter", observedBefore, simCode, time() - observedT0)
         simCode = SimulationCode.cleanupTrivialResidualEquations(simCode; sourcePass = "observedFilter")
-        #= Companion pre-memory for self-scheduling time-event discretes
-           (CombiTimeTable nextTimeEventScaled): rewrite residual `pre(x)` to a
-           companion discrete the callback maintains, so the table runtime reads
-           the held segment boundary instead of the bare (current) value. =#
-        simCode = SimulationCode.runSimCodePass("addSelfSchedulingPreMemory", simCode,
-                                                SimulationCode.addSelfSchedulingPreMemory)
         #= Forward-propagate initialization values through the causalized equations
            (time=0 + params + starts -> source/ramp -> dependent flow/pressure),
            attaching resolved values as start attributes so the init solver starts
