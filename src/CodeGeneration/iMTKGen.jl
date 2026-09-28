@@ -93,7 +93,8 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
      time (not codegen) are folded into the hash so a flag flip still rebuilds.
      `overwriteCache` bypasses this reuse check to force a fresh rebuild. =#
   local buildHash = hash((modelCode, OMB.DIRECT_RHS_GENERATION[],
-                          OMB.DIRECT_JAC_GENERATION[], OMB.DIRECT_RHS_TYPE_ERASE[]))
+                          OMB.DIRECT_JAC_GENERATION[], OMB.DIRECT_JAC_TREE_NODE_LIMIT[],
+                          OMB.DIRECT_RHS_TYPE_ERASE[]))
   if !overwriteCache && get(BUILT_HASH, cname, UInt64(0)) == buildHash &&
      haskey(BUILT, cname) && isdefined(OMB, Symbol(cname))
     @info "[IMTK GEN] regenerated code unchanged; reusing compiled module + cached build" model = modelName

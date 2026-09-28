@@ -621,18 +621,48 @@ Build an in-place sparse symbolic Jacobian for the RHS so implicit solvers do
 not finite-difference one RHS column per state every step. The generated
 function is probed once at `(u0, p_vec, t0)`: an unresolved symbolic
 derivative (opaque external call) passes build_function silently and only
-throws when the function runs. Returns `(jacFunc, jacPrototype)`, or
-`(nothing, nothing)` when generation is disabled or the probe fails.
+throws when the function runs. The Jacobian is `_dagSparseJacobian`'s; where
+that has no derivative for an array construct, Symbolics' sparsejacobian is
+tried when no RHS equation's tree exceeds `DIRECT_JAC_TREE_NODE_LIMIT` nodes.
+Returns `(jacFunc, jacPrototype)`, or `(nothing, nothing)` when generation is
+disabled, no Jacobian is found, or the probe fails.
 """
 function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
   OMBackend.DIRECT_JAC_GENERATION[] || return (nothing, nothing)
   try
-    local jacSym = Symbolics.sparsejacobian(rhs_list, states)
-    local result = Symbolics.build_function(jacSym, states, params, iv;
+    local jacSym = try
+      _dagSparseJacobian(rhs_list, states)
+    catch e
+      e isa _NoDagDerivative || rethrow()
+      if !e.retry
+        @debug "DirectRHS: no derivative for $(e.what); solver will finite-difference"
+        return (nothing, nothing)
+      end
+      #= Symbolics differentiates the trees: bounded by their size. =#
+      if any(ex -> _exprLargerThan(ex, OMBackend.DIRECT_JAC_TREE_NODE_LIMIT[]), rhs_list)
+        @debug "DirectRHS: no DAG derivative ($(e.what)) and an RHS equation has more than $(OMBackend.DIRECT_JAC_TREE_NODE_LIMIT[]) tree nodes; solver will finite-difference"
+        return (nothing, nothing)
+      end
+      Symbolics.sparsejacobian(rhs_list, states)
+    end
+    #= The nonzeros as a vector: build_function applies no CSE to a sparse
+       matrix (MSL Engine1b_analytic's 12 nonzeros: over 50 million Expr
+       nodes and 10 GB; as a vector 14,123 nodes). The solver's Jacobian has
+       the prototype's structure, so they are its nzval. =#
+    local nzSym = collect(Symbolics.SparseArrays.nonzeros(jacSym))
+    local result = Symbolics.build_function(nzSym, states, params, iv;
                                             expression=Val{true}, cse=true)
-    local jacFunc = _exprToRTGFunction(_demoteWideNumericLiterals!(result[2]))
+    local nzFunc = _exprToRTGFunction(_demoteWideNumericLiterals!(result[2]))
     local jacProto = similar(jacSym, Float64)
     jacProto.nzval .= 0.0
+    local nnz0 = length(nzSym)
+    local jacFunc = (J, u, p, t) -> begin
+      local nz = Symbolics.SparseArrays.nonzeros(J)
+      #= The generated code writes by position, without bounds checks. =#
+      length(nz) == nnz0 || throw(DimensionMismatch("Jacobian with $(length(nz)) stored entries, not $(nnz0)"))
+      nzFunc(nz, u, p, t)
+      nothing
+    end
     local probe = copy(jacProto)
     jacFunc(probe, u0, p_vec, t0)
     @debug "DirectRHS: symbolic sparse Jacobian with $(length(jacProto.nzval)) structural nonzeros"
@@ -641,6 +671,135 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
     @debug "DirectRHS: symbolic Jacobian generation failed; solver will finite-difference" exception=(e, catch_backtrace())
     return (nothing, nothing)
   end
+end
+
+#= An expression _dagSparseJacobian has no derivative for. `retry`: whether
+   Symbolics' sparsejacobian may have one (array constructs, Differential,
+   Integral); a call without a derivative rule or a callable symbolic leaves
+   Symbolics with an unresolved derivative too. =#
+struct _NoDagDerivative <: Exception
+  what::String
+  retry::Bool
+end
+
+#= The sparse symbolic Jacobian of `rhs_list` with respect to `states`,
+   differentiating each expression as the DAG it is: a subexpression shared
+   by several uses (the observed equations full_equations inlines, a
+   multibody chain of frames) is differentiated once per state, and the
+   derivatives share their subexpressions the same way. Symbolics'
+   sparsejacobian differentiates the trees: MSL EngineV6_analytic's 17
+   equations are 1,943 DAG nodes but 14.6 million tree nodes, and its 17x17
+   Jacobian took 48 s and 15 GB. The structure is Symbolics'
+   (jacobian_sparsity: an entry for each state an equation reads), the rules
+   are its derivative rules (derivative_idx); throws _NoDagDerivative where
+   there is none. =#
+function _dagSparseJacobian(rhs_list, states)
+  local T = Symbolics.VartypeT
+  local stateIdx = Dict{Any, Int}(Symbolics.unwrap(s) => j for (j, s) in enumerate(states))
+  #= Whole-array uses of scalarized states would read no state here. =#
+  local arrParents = Set{Any}(SymbolicUtils.arguments(u)[1] for u in keys(stateIdx)
+                              if SymbolicUtils.iscall(u) && SymbolicUtils.operation(u) === getindex)
+  local depsMemo = IdDict{Any, BitSet}()
+  local deps = x -> begin
+    local hit = get(depsMemo, x, nothing)
+    hit === nothing || return hit
+    local j = get(stateIdx, x, 0)
+    local d = BitSet()
+    if j > 0
+      push!(d, j)
+    elseif x in arrParents
+      throw(_NoDagDerivative("array use of a scalarized state", true))
+    elseif SymbolicUtils.iscall(x)
+      for a in SymbolicUtils.arguments(x)
+        union!(d, deps(a))
+      end
+    end
+    depsMemo[x] = d
+    return d
+  end
+  #= Combined as plain terms, not with + and *: canonical sums and products
+     merge their operands' terms, copying what the DAG shares (EngineV6_analytic
+     grew to 16 GB that way too). Symbolic 0 and 1 (the rules of sign, floor,
+     comparisons) fold like numbers. =#
+  local isZero = x -> (local v = SymbolicUtils.unwrap_const(x); v isa Number && iszero(v))
+  local isOne = x -> (local v = SymbolicUtils.unwrap_const(x); v isa Number && isone(v))
+  local plus = (a, b) -> isZero(a) ? b : isZero(b) ? a : SymbolicUtils.term(+, a, b; vartype = T)
+  local times = (a, b) -> (isZero(a) || isZero(b)) ? 0 : isOne(a) ? b : isOne(b) ? a :
+                          SymbolicUtils.term(*, a, b; vartype = T)
+  local sumOf = terms -> foldl(plus, terms; init = 0)
+  local isSum = x -> SymbolicUtils.isadd(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (+))
+  local isProduct = x -> SymbolicUtils.ismul(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (*))
+  local derivative
+  derivative = (x, j, memo) -> begin
+    j in deps(x) || return 0
+    local hit = get(memo, x, nothing)
+    hit === nothing || return hit
+    local r = if get(stateIdx, x, 0) == j
+      1
+    elseif isSum(x)
+      sumOf(Any[derivative(a, j, memo) for a in SymbolicUtils.arguments(x) if j in deps(a)])
+    elseif isProduct(x)
+      local args = SymbolicUtils.arguments(x)
+      sumOf(Any[times(foldl(times, (args[k] for k in eachindex(args) if k != i); init = 1),
+                      derivative(args[i], j, memo))
+                for i in eachindex(args) if j in deps(args[i])])
+    elseif SymbolicUtils.isdiv(x)
+      local (num, den) = SymbolicUtils.arguments(x)
+      local dn = derivative(num, j, memo)
+      local dd = derivative(den, j, memo)
+      local a = isZero(dn) ? 0 : SymbolicUtils.term(/, dn, den; vartype = T)
+      local b = isZero(dd) ? 0 : SymbolicUtils.term(/, times(num, dd), SymbolicUtils.term(^, den, 2; vartype = T); vartype = T)
+      isZero(b) ? a : isZero(a) ? SymbolicUtils.term(-, b; vartype = T) : SymbolicUtils.term(-, a, b; vartype = T)
+    elseif SymbolicUtils.ispow(x) && !(j in deps(SymbolicUtils.arguments(x)[2]))
+      local (b, e) = SymbolicUtils.arguments(x)
+      local ev = SymbolicUtils.unwrap_const(e)
+      local bPow = ev isa Number ? (isone(ev - 1) ? b : SymbolicUtils.term(^, b, ev - 1; vartype = T)) :
+                   SymbolicUtils.term(^, b, SymbolicUtils.term(-, e, 1; vartype = T); vartype = T)
+      times(times(e, bPow), derivative(b, j, memo))
+    elseif SymbolicUtils.isterm(x)
+      local f = SymbolicUtils.operation(x)
+      local args = SymbolicUtils.arguments(x)
+      if f === ifelse || f === SymbolicUtils.ifelse_eager || f === SymbolicUtils.ifelse_branching
+        local dt = derivative(args[2], j, memo)
+        local df = derivative(args[3], j, memo)
+        (isZero(dt) && isZero(df)) ? 0 : SymbolicUtils.term(f, args[1], dt, df; vartype = T)
+      elseif f isa Symbolics.Differential || f isa Symbolics.Integral || f === getindex
+        throw(_NoDagDerivative(string(f), true))
+      elseif f isa SymbolicUtils.Operator
+        #= Pre, Sample, Hold, Shift: new variables, as in Symbolics. =#
+        0
+      elseif f isa SymbolicUtils.BasicSymbolic
+        throw(_NoDagDerivative(string(f), false))
+      else
+        local terms = Any[]
+        for (i, a) in enumerate(args)
+          j in deps(a) || continue
+          local rule = Symbolics.derivative_idx(x, i)
+          rule === nothing && throw(_NoDagDerivative(string(f), false))
+          isZero(rule) && continue
+          push!(terms, times(rule, derivative(a, j, memo)))
+        end
+        sumOf(terms)
+      end
+    else
+      throw(_NoDagDerivative(string(typeof(x)), true))
+    end
+    memo[x] = r
+    return r
+  end
+  local I = Int[]
+  local J = Int[]
+  local V = Symbolics.Num[]
+  local memos = [IdDict{Any, Any}() for _ in states]
+  for (i, ex) in enumerate(rhs_list)
+    local x = Symbolics.unwrap(ex)
+    for j in deps(x)
+      push!(I, i)
+      push!(J, j)
+      push!(V, Symbolics.Num(derivative(x, j, memos[j])))
+    end
+  end
+  return Symbolics.SparseArrays.sparse(I, J, V, length(rhs_list), length(states))
 end
 
 #= Symbolic simplification can fold integer parameter products into exact

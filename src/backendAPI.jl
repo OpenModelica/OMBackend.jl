@@ -109,6 +109,20 @@ Toggle with: `OMBackend.DIRECT_JAC_GENERATION[] = false` to disable.
 const DIRECT_JAC_GENERATION = Ref{Bool}(true)
 
 """
+The symbolic Jacobian (`DIRECT_JAC_GENERATION`) differentiates the RHS as a
+DAG (`_dagSparseJacobian`). Where that has no rule, Symbolics'
+sparsejacobian differentiates each equation as a tree instead, a shared
+subexpression once per use, and does so only when no RHS equation has more
+expression-tree nodes than this; otherwise the solver finite-differences. MSL
+EngineV6_analytic's 17 equations are 1,943 DAG nodes but 14.6 million tree
+nodes: its 17x17 Jacobian took Symbolics 48 s and 15 GB. Of the measured MSL
+examples only EngineV6_analytic, Engine1b_analytic and RobotR3.oneAxis have
+equations of more than 20,000 tree nodes (at least 45k); the others stay
+below 7,500 in total.
+"""
+const DIRECT_JAC_TREE_NODE_LIMIT = Ref{Int}(20_000)
+
+"""
 Toggle type erasure of direct-RHS problems via `FunctionWrapperSpecialize`.
 The generated RHS (and symbolic Jacobian) are runtime-generated functions
 whose type is unique per model, so the resulting `ODEProblem` type differs
