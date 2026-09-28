@@ -1154,7 +1154,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
        it to the condition's value after the event (change() terms are false again
        then), and the start of a solve to its value on the initialized state (a
        Boolean true from the start is no edge). The condition only clears it: the
-       event iteration evaluates a condition twice before running the affect.
+       event iteration evaluates a condition several times before running the affect.
        Setting u itself to false instead corrupted it where it is read elsewhere
        (the MSL Timer's input, a threshold block's output, read by
        `y = if u then time - entryTime ...`). =#

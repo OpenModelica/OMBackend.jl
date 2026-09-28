@@ -21,7 +21,8 @@
       (discreteClusters.jl) is solved as a mixed system with the pre()
       values of the sweep; then the whens on discrete conditions (a changed
       discrete, an algorithm section's inputs), each checked just before it
-      runs, in the order of the model;
+      runs, in the order of the model; where those change the state, the
+      relations and the bodies again, with the same pre(), until they do not;
    3. the algebraic unknowns are solved again, and the next sweep starts,
       until nothing changes. A chain through algebraic variables takes one
       sweep per link; a model that does not settle (chattering) is stopped
@@ -367,21 +368,38 @@ function _sweep!(e::EventIteration, integrator)
      sweep. =#
   local pre = copy(integrator.u)
   local clusterPre = [_preValues(c, _readValues(c, integrator)) for c in e.clusters]
-  local stale = false
-  for a in e.relationWhens
-    _whenFire!(a, integrator, pre) && (changed = true; stale = true)
-  end
-  for (i, c) in enumerate(e.clusters)
-    c.coupled && stale && (_staleResolve!(integrator, e.reinit); stale = false)
-    _solveMixedSystem!(c, integrator, clusterPre[i], relPre[i], e.reinit) || continue
-    changed = true
-    c.coupled || (stale = true)
-  end
-  stale && !isempty(e.discreteWhens) && _staleResolve!(integrator, e.reinit)
-  for d in e.discreteWhens
-    _holdsInSweep(d, integrator) || continue
-    d.affect!(integrator, pre)
-    changed = true
+  for pass in 1:e.limit
+    local stale = false
+    for a in e.relationWhens
+      _whenFire!(a, integrator, pre) && (changed = true; stale = true)
+    end
+    for (i, c) in enumerate(e.clusters)
+      c.coupled && stale && (_staleResolve!(integrator, e.reinit); stale = false)
+      _solveMixedSystem!(c, integrator, clusterPre[i], relPre[i], e.reinit) || continue
+      changed = true
+      c.coupled || (stale = true)
+    end
+    stale && !isempty(e.discreteWhens) && _staleResolve!(integrator, e.reinit)
+    local before = copy(integrator.u)
+    local fired = false
+    for d in e.discreteWhens
+      _holdsInSweep(d, integrator) || continue
+      d.affect!(integrator, pre)
+      changed = fired = true
+    end
+    (fired && !isequal(integrator.u, before)) || break
+    #= A discrete when changed a discrete: the relations and the bodies read the new
+       value in this same iteration (MLS 8.6: its equations hold together, with the same
+       pre()). StateGraph's transition has `when enableFire then t_start = time` and
+       `fire = enableFire and time >= t_start + waitTime`: fire is false where the timer
+       starts; with the old t_start it fired at once. The algebraic unknowns follow first.
+       A when with edge() or an edge latch does not fire again: its affect took the
+       values. A when that fired in an earlier pass on a value this pass corrects is not
+       undone. =#
+    _staleResolve!(integrator, e.reinit) || break
+    e.ifRelations !== nothing && _update!(e.ifRelations, integrator)
+    foreach(a -> _whenRelationUpdate!(a, integrator), e.relationWhens)
+    foreach(c -> _update!(c, integrator), e.clusters)
   end
   return changed
 end
@@ -392,8 +410,9 @@ end
    report failure. =#
 function _staleResolve!(integrator, reinit)
   local retcode = integrator.sol.retcode
-  _resolveAlgebraics!(integrator, reinit) || _restoreRetcode!(integrator, retcode)
-  return nothing
+  _resolveAlgebraics!(integrator, reinit) && return true
+  _restoreRetcode!(integrator, retcode)
+  return false
 end
 
 #= After an event that changed the equations, the next step starts small, as
