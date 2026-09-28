@@ -1644,8 +1644,11 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
     end
   end
   local _defaulted0Starts = String[]
+  #= A start demoted to a guess above is an explicit start: the 0.0 default
+     below must not replace it (a capacitor's vc(start = 10) went to 0). =#
+  local softSymStrSet = OrderedSet(string(p.first) for p in softInitialValues)
   for diffState in diffStateSet
-    if !(string(diffState) in hardSymStrSet)
+    if !(string(diffState) in hardSymStrSet) && !(string(diffState) in softSymStrSet)
       local diffStateStr = string(diffState)
       #= Only attempt alias resolution for MTK-generated derivative variables
          (e.g. Inertia_phiˍt created by order-lowering). These have the Unicode

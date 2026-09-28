@@ -181,6 +181,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
 
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
+  get(ENV, "OMBACKEND_INIT_TRACE", "") == "true" &&
+    println("[initu0] states ", states, "\n[initu0] hard starts ", finalInitialValues, "\n[initu0] guesses ", systemGuesses,
+            "\n[initu0] initialization equations ", try ModelingToolkit.initialization_equations(reducedSystem) catch; "?" end,
+            "\n[initu0] u0 ", u0)
 
   #= Symbolic sparse Jacobian; nothing when not differentiable. Built after
      u0/p_vec so the generated function can be probed once: an unresolved
