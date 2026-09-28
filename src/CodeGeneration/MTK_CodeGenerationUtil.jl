@@ -697,7 +697,8 @@ function expToJuliaExpMTK(exp::SimulationCode.RSUB, simCode::SimulationCode.SIM_
   elseif exp.fieldName == "im"
     return :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
   end
-  return :(getproperty($innerJL, $(QuoteNode(Symbol(exp.fieldName)))))
+  local ix = AlgorithmicCodeGeneration._positionalFieldIndex(SimulationCode.toDAEExp(exp.exp), exp.index)
+  return :(OMBackend.CodeGeneration._recordField($innerJL, $(QuoteNode(Symbol(exp.fieldName))), $(ix)))
 end
 
 function expToJuliaExpMTK(exp::SimulationCode.ARRAY_EXP, simCode::SimulationCode.SIM_CODE;
@@ -1500,7 +1501,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         `real` / `imag` when the inner is a Symbolics `Num` so the
         symbolic engine sees the structural complex projection rather
         than a plain `getproperty` call. =#
-      DAE.RSUB(exp = innerExp, fieldName = fname) => begin
+      DAE.RSUB(exp = innerExp, ix = ix, fieldName = fname) => begin
         local innerJL = expToJuliaExpMTK(innerExp, simCode;
                                           varPrefix=varPrefix,
                                           varSuffix=varSuffix,
@@ -1510,7 +1511,8 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         elseif fname == "im"
           :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
         else
-          :(getproperty($innerJL, $(QuoteNode(Symbol(fname)))))
+          :(OMBackend.CodeGeneration._recordField($innerJL, $(QuoteNode(Symbol(fname))),
+                                                  $(AlgorithmicCodeGeneration._positionalFieldIndex(innerExp, ix))))
         end
       end
     _ =>  throw(ErrorException("$exp not yet supported"))

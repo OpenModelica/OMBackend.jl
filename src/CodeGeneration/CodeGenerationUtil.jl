@@ -690,6 +690,12 @@ end
 @inline _recordFieldRe(x::Tuple) = x[1]
 @inline _recordFieldRe(x) = hasproperty(x, :re) ? getproperty(x, :re) : real(x)
 
+#= A record's field `name`, the `ix`th: by position in a tuple (a function returning a
+   record returns its fields in order: the MSL Media `setState_psX(...).T`), by name
+   otherwise (a record constructor's NamedTuple). =#
+@inline _recordField(x::Tuple, name::Symbol, ix::Integer) = ix >= 1 ? x[ix] : getproperty(x, name)
+@inline _recordField(x, name::Symbol, ::Integer) = getproperty(x, name)
+
 """
   Companion to `_recordFieldRe` for the imaginary part (DAE.RSUB(`im`)).
   Same `Base.Complex` reason: avoid the module-scope shadow of `Complex`.

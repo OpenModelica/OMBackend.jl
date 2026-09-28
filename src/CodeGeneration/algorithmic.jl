@@ -425,7 +425,11 @@ function generateLocals(inputs::Vector)
       end
       _ => false
     end
-    if !hasBinding
+    if !hasBinding && _funcParamIsArray(i)
+      #= `Real invMMX[size(X, 1)]` (MSL Media massToMoleFractions): an array, not the
+         scalar default of its element type. =#
+      push!(jInputs, :(local $s = $(_arrayDefault(i))))
+    elseif !hasBinding
       local defaultVal = @match i.ty begin
         DAE.T_REAL(__) => 0.0
         DAE.T_INTEGER(__) => 0
@@ -444,6 +448,20 @@ function generateLocals(inputs::Vector)
   return jInputs
 end
 
+#= A zero-filled array for an array-typed function variable, its dimensions possibly
+   depending on the inputs; an empty one where they are not known. =#
+function _arrayDefault(v::DAE.VAR)
+  local jlElemDefault = @match _funcParamElemType(v) begin
+    DAE.T_REAL(__) => :Float64
+    DAE.T_INTEGER(__) => :Int
+    DAE.T_BOOL(__) => :Bool
+    _ => :Float64
+  end
+  local dimExprs = map(_daeDimToJulia, collect(_funcParamDims(v)))
+  local unresolved = any(d -> d isa Number && d <= 0, dimExprs)
+  return !isempty(dimExprs) && !unresolved ? :(zeros($(jlElemDefault), $(dimExprs...))) : :($(jlElemDefault)[])
+end
+
 """
   Generate default-initialized local declarations for Modelica function output variables.
   In Modelica, output variables are implicitly initialized (Real=0.0, Integer=0, Bool=false).
@@ -454,19 +472,7 @@ function generateOutputDefaults(outputs::Vector)::Vector{Expr}
   for v in outputs
     local s = DAE_VAR_ToJulia(v)
     local defaultVal = if _funcParamIsArray(v)
-      local jlElemDefault = @match _funcParamElemType(v) begin
-        DAE.T_REAL(__) => :Float64
-        DAE.T_INTEGER(__) => :Int
-        DAE.T_BOOL(__) => :Bool
-        _ => :Float64
-      end
-      local dimExprs = map(_daeDimToJulia, collect(_funcParamDims(v)))
-      local unresolved = any(d -> d isa Number && d <= 0, dimExprs)
-      if !isempty(dimExprs) && !unresolved
-        :(zeros($(jlElemDefault), $(dimExprs...)))
-      else
-        :($(jlElemDefault)[])
-      end
+      _arrayDefault(v)
     else
       @match v.ty begin
         DAE.T_REAL(__) => 0.0
@@ -678,17 +684,26 @@ function _isFunctionCall(exp::DAE.Exp)::Bool
 end
 
 """
-    _algCallArgs(argExps::List) -> Vector{Any}
+    _algCallArgs(argExps::List; builtin = false) -> Vector{Any}
 
 Expand function-call arguments, replacing each record-typed cref with its flattened
-`<base>_<field>` field symbols so a record argument is passed as its scalar fields,
-matching the callee's flattened parameter list (`flattenRecordInput`).
+`<base>_<field>` field symbols and splatting any other record value, so a record argument
+is passed as its scalar fields, matching the callee's flattened parameter list
+(`flattenRecordInput`). A builtin's arguments stay whole.
 """
-function _algCallArgs(argExps::List)::Vector{Any}
+function _algCallArgs(argExps::List; builtin::Bool = false)::Vector{Any}
   local out = Any[]
   for arg in argExps
     local rec = _recordCrefFields(arg)
-    if rec === nothing
+    local valueTy = rec === nothing && !builtin ? _recordValueType(arg) : nothing
+    #= A builtin takes a record whole; a one-field record is returned bare. =#
+    if valueTy !== nothing && length(_recordFieldNames(valueTy)) > 1
+      #= A record that is not a named variable (a call's result, an element of a record
+         array) evaluates to its fields as a tuple: splatted, as the callee takes a record
+         input field by field (the MSL ReferenceAir's `rho_props_pT(p, T,
+         airBaseProp_pT(p, T))`, the ideal gases' `h_T(data[i], T, ...)`). =#
+      push!(out, Expr(:..., expToJuliaExpAlg(arg)))
+    elseif rec === nothing
       push!(out, expToJuliaExpAlg(arg))
     else
       for fieldName in rec[2]
@@ -697,6 +712,57 @@ function _algCallArgs(argExps::List)::Vector{Any}
     end
   end
   return out
+end
+
+#= The record type of `exp` where it is not a named record variable: a call returning a
+   record, a record literal (a constant the frontend folded: the ideal gas `data`), or one
+   element of an array of records (a scalar subscript per dimension); nothing otherwise. Such
+   an expression evaluates to the record's fields as a tuple. =#
+function _recordValueType(@nospecialize(exp::DAE.Exp))
+  local ty = @match exp begin
+    DAE.CALL(attr = attr) => attr.ty
+    DAE.RECORD(ty = ty) => ty
+    DAE.CREF(_, ty) => ty
+    DAE.ASUB(exp = DAE.ARRAY(ty = ty), sub = subs) => _elementTypeAt(ty, subs)
+    DAE.ASUB(exp = DAE.CREF(_, ty), sub = subs) => _elementTypeAt(ty, subs)
+    _ => nothing
+  end
+  return ty !== nothing && !isempty(_recordFieldNames(ty)) ? ty : nothing
+end
+
+#= The element type of array type `ty` subscripted by `subs`, when there is one scalar
+   subscript per dimension; nothing for a slice or a partial subscript. =#
+function _elementTypeAt(@nospecialize(ty::DAE.Type), subs::List)
+  local nDims = 0
+  local t = ty
+  while t isa DAE.T_ARRAY
+    nDims += length(collect(t.dims))
+    t = t.ty
+  end
+  local scalar = all(subs) do sub
+    sub isa DAE.INDEX && !(sub.exp isa DAE.RANGE || sub.exp isa DAE.ARRAY)
+  end
+  return scalar && length(collect(subs)) == nDims ? t : nothing
+end
+
+#= The position of field `ix` in the tuple a record-valued `exp` evaluates to, where every
+   field up to it is a scalar: a function returns a nested record's fields flattened in its
+   place, so a later field's position is not its index. -1 (read it by name) otherwise. =#
+function _positionalFieldIndex(@nospecialize(exp::DAE.Exp), ix::Integer)::Int
+  local ty = _recordValueType(exp)
+  ty === nothing && return -1
+  local fieldTypes = DAE.Type[]
+  @match ty begin
+    DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _) => begin
+      for field in varLst
+        push!(fieldTypes, field.ty)
+      end
+    end
+    _ => nothing
+  end
+  1 <= ix <= length(fieldTypes) || return -1
+  any(k -> !isempty(_recordFieldNames(fieldTypes[k])), 1:ix) && return -1
+  return ix
 end
 
 """
@@ -1174,7 +1240,7 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         if !(attr.builtin)
           push!(expr.args, funcSym)
         end
-        append!(expr.args, _algCallArgs(explst))
+        append!(expr.args, _algCallArgs(explst; builtin = attr.builtin))
         quote
           $(expr)
         end
@@ -1200,7 +1266,7 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         if utilRuntimeName === nothing && !(attr.builtin)
           push!(expr.args, funcSym)
         end
-        append!(expr.args, _algCallArgs(expLst))
+        append!(expr.args, _algCallArgs(expLst; builtin = attr.builtin))
         expr
       end
       DAE.CAST(ty, exp)  => begin
@@ -1313,14 +1379,14 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
          code never wraps values in Symbolics.Num, so we can use the same
          `_recordFieldRe` / `_recordFieldIm` helpers without a separate
          symbolic path. =#
-      DAE.RSUB(exp = innerExp, fieldName = fname) => begin
+      DAE.RSUB(exp = innerExp, ix = ix, fieldName = fname) => begin
         local innerJL = expToJuliaExpAlg(innerExp)
         if fname == "re"
           :(OMBackend.CodeGeneration._recordFieldRe($innerJL))
         elseif fname == "im"
           :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
         else
-          :(getproperty($innerJL, $(QuoteNode(Symbol(fname)))))
+          :(OMBackend.CodeGeneration._recordField($innerJL, $(QuoteNode(Symbol(fname))), $(_positionalFieldIndex(innerExp, ix))))
         end
       end
       DAE.BOX(exp = innerExp) => expToJuliaExpAlg(innerExp)
