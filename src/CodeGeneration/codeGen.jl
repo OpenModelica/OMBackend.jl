@@ -753,6 +753,10 @@ function _singleRelationWhen(@nospecialize(cond))
             plain[] = false
             return (e, false, arg)
           end
+          DAE.CALL(path, _, _) where _isDelayCall(path) => begin
+            plain[] = false
+            return (e, false, arg)
+          end
           _ => return (e, true, arg)
         end
       end

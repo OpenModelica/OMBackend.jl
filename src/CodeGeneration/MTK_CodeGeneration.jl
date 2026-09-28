@@ -792,6 +792,8 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       # Route DAE-native solvers (e.g. Sundials.IDA, DABDF2, DFBDF) through a residual-form DAEProblem rather than the ODEProblem with mass matrix.
       OMBackend.CodeGeneration.setZCHysteresis!($(Symbol("$(MODEL_NAME)Model_problem")), $(QuoteNode(ZC_HYSTERESIS)),
                                                 get(kwargs, :reltol, 1.0e-3))
+      #= The initialization reads the delay() arguments themselves, not a previous solve's history. =#
+      OMBackend.CodeGeneration.clearDelayHistories!()
       local _problemForSolver = if _solver isa ModelingToolkit.SciMLBase.AbstractDAEAlgorithm
         OMBackend.CodeGeneration.ode_to_dae($(Symbol("$(MODEL_NAME)Model_problem")))
       else
@@ -853,6 +855,8 @@ end
 """
 function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions; useDirectRHS::Bool = OMBackend.DIRECT_RHS_GENERATION[])
   RESET_CALLBACKS()
+  empty!(MTK_CodeGenerationUtil.DELAY_CALLS)
+  MTK_CodeGenerationUtil.DELAY_MODEL[] = Symbol(modelName)
 
   #= Phase A — eval generated Modelica functions and their @register_symbolic
      calls into OMBackend so subsequent codegen sees the bindings. =#
@@ -1295,10 +1299,14 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
       OMBackend.CodeGeneration.checkNamedStateLookups(problem, $(NAMED_STATE_LOOKUPS))
       $(emitDiscreteClusters(simCode))
+      callbacks = OMBackend.CodeGeneration.withDelayEvents(callbacks, $(QuoteNode(Symbol(MODEL_NAME))))
       $(emitRelationRefresh(IF_RELATIONS))
       callbacks = OMBackend.CodeGeneration.withIntegralDiscretes(callbacks, problem, $(integralDiscreteNames(discreteVariablesSym, simCode)))
       #= Asserts after the event iteration: they check the settled state. =#
       $(emitAssertCallback(simCode))
+      callbacks = OMBackend.CodeGeneration.withDelayRecords(callbacks, problem, $(QuoteNode(Symbol(MODEL_NAME))),
+                                                            Any[$([c[2] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)],
+                                                            Any[$([c[3] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)])
       #= First among the discrete callbacks: it reads the step as the solver took it. =#
       callbacks = OMBackend.CodeGeneration.withAlgebraicStepControl(callbacks, problem)
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreducibleSyms)
@@ -3085,6 +3093,7 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
     DAE.CALL(Absyn.IDENT("edge"), _, _) || DAE.CALL(Absyn.IDENT("change"), _, _) => recb(exp)
     DAE.CALL(Absyn.IDENT(name), _, _) where name in _AFFECT_UNSUPPORTED_BUILTINS =>
       throw(_UnsupportedInAffect(exp))
+    DAE.CALL(path, _, _) where _isDelayCall(path) => throw(_UnsupportedInAffect(exp))
     DAE.CAST(_, e) => rec(e)
     DAE.RELATION(e1, op, e2) => :($(DAE_OP_toJuliaOperator(op))($(rec(e1)), $(rec(e2))))
     DAE.LUNARY(DAE.NOT(__), e) => :(!$(recb(e)))

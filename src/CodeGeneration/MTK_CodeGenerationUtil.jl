@@ -310,6 +310,20 @@ function transformToMTKContinuousConditionEquation(cond, simCode)
 end
 
 
+#= The delay() calls of the model being generated (delays.jl), as (key, argument, delay time) with the
+   argument and the delay time as Julia expressions; a call's position is the index of its history, and
+   an equal call shares it. With DELAY_MODEL, the name the histories are kept under. Both reset at the
+   start of each model's (or structural mode's) generation. =#
+const DELAY_CALLS = Tuple{String, Any, Any}[]
+const DELAY_MODEL = Ref{Symbol}(:none)
+
+function _delayIndex!(key::String, x, delayTime)::Int
+  local k = findfirst(c -> first(c) == key, DELAY_CALLS)
+  k === nothing || return k
+  push!(DELAY_CALLS, (key, x, delayTime))
+  return length(DELAY_CALLS)
+end
+
 #= The argument of a when body the event iteration runs (codeGen.jl: the
    relation whens of `_emitRelationWhen`, and the discrete-when and
    elsewhen-arm affects): the state before the current sweep, indexed by
@@ -390,6 +404,14 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
           end
         end
       end
+    end
+    #= delay(x, T[, Tmax]): x's value T ago, from the model's history of x (delays.jl). =#
+    "delay" => begin
+      local args = collect(expLst)
+      local x = expToJuliaExpMTK(args[1], simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derAsSymbol)
+      local T = expToJuliaExpMTK(args[2], simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derAsSymbol)
+      local k = _delayIndex!(string(args[1]) * "|" * string(args[2]), x, T)
+      :(OMBackend.CodeGeneration.delayLookup($(QuoteNode(DELAY_MODEL[])), $k, t, $T, $x))
     end
     "initial" => begin
       #= Modelica initial() is true only during initialization (handled separately by MTK).
@@ -3036,6 +3058,12 @@ function _modelicaFunctionCallExpr(path,
                                    varSuffix = "",
                                    derSymbol = false)
   local normalizedFuncName = OMBackend.canonicalName(string(path))
+  #= OMFrontend lowers delay(x, T[, Tmax]) to OpenModelica.Internal.delay2/delay3, as OpenModelica: a
+     generated function whose body was the identity. The history-based term (delays.jl). =#
+  if normalizedFuncName in ("OpenModelica_Internal_delay2", "OpenModelica_Internal_delay3")
+    return DAECallExpressionToMTKCallExpression("delay", expLst isa List ? expLst : MetaModelica.list(expLst...), simCode, hashTable;
+                                                varPrefix = varPrefix, varSuffix = varSuffix, derAsSymbol = derSymbol)
+  end
   local lowered = lowerKnownSymbolicFunctionCall(normalizedFuncName, expLst, simCode, hashTable;
                                                 varPrefix = varPrefix,
                                                 varSuffix = varSuffix,
