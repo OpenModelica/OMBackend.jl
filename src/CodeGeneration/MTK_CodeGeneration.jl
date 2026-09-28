@@ -5156,6 +5156,22 @@ The outer try/catch returns partial results on any error; the cycle-19
 runtime `remake` path remains as a fallback for state-cref-RHS reads whose
 post-init value differs from the `start` attribute.
 """
+
+#= Modelica function calls in algorithm code are `Base.invokelatest(Name, ...)`
+   with Name bound in OMBackend.CodeGeneration (createModelicaFunctionWrapper),
+   which a function body runs in. The early initial algorithm runs in the
+   model's module, where Name is undefined: qualify it. (MSL
+   WriteRealMatrixToFile: `when initial() then success1 := writeRealMatrix(...)`
+   raised UndefVarError, swallowed, and success1..4 stayed false.) =#
+function _qualifyInvokedFunctions(ex)
+  ex isa Expr || return ex
+  local args = map(_qualifyInvokedFunctions, ex.args)
+  if ex.head === :call && length(args) >= 2 && args[1] == :(Base.invokelatest) && args[2] isa Symbol
+    args[2] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(args[2]))
+  end
+  return Expr(ex.head, args...)
+end
+
 function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)::Expr
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
@@ -5212,13 +5228,13 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
       isempty(ia.daeStatements) && continue
       local body = AlgorithmicCodeGeneration.generateStatements(ia.daeStatements)
       for s in body
-        push!(stmts, _renameAlgIdentifiers(s, renamedNames))
+        push!(stmts, _qualifyInvokedFunctions(_renameAlgIdentifiers(s, renamedNames)))
       end
     end
   else
     local seenLHS = copy(lhsNames)
     for ia in simCode.initialAlgorithms, op in ia.statements
-      push!(stmts, _initialWhenOpToJuliaEarly(op, simCode, renamedNames, seenLHS))
+      push!(stmts, _qualifyInvokedFunctions(_initialWhenOpToJuliaEarly(op, simCode, renamedNames, seenLHS)))
     end
   end
   local captures = Expr[]
