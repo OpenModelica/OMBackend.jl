@@ -38,6 +38,13 @@ const HEAD_LINE = "############################################"
 const DOUBLE_LINE = "============================================"
 const LINE = "---------------------------------------------"
 const _ARRAY_DUMP_LIMIT = 12
+#= Whether `string` abbreviates large literal arrays (below): only for dumps
+   read by people, `Base.ScopedValues.with(ABBREVIATE_ARRAY_DUMPS => true)`.
+   `string(::DAE.Exp)` is also a key: eliminateRHSEquivalentEquations groups
+   equations by it, and the Digital HalfAdder's XorTable[a, b] and
+   AndTable[a, b] both printed as `{<9×9 table>}[a, b]`: the XOR gate's output
+   became the AND gate's (FullAdder, Adder4 wrong for the whole run). =#
+const ABBREVIATE_ARRAY_DUMPS = Base.ScopedValues.ScopedValue(false)
 
 #= Abbreviate large literal arrays in dumps so constant lookup tables (e.g. the
    9x9 Logic enum tables) collapse to a `{<R×C table>}` / `{…<N elems>}` summary
@@ -50,6 +57,7 @@ function _dumpArray(expl)::String
     n == 1 && (first = e)
   end
   n == 0 && return "{}"
+  ABBREVIATE_ARRAY_DUMPS[] || return "{" * lstString(expl, ", ") * "}"
   if first isa DAE.ARRAY
     local m = 0
     for _ in first.array
@@ -615,7 +623,7 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
             end
           end
         end
-        if nRows * nCols > _ARRAY_DUMP_LIMIT
+        if ABBREVIATE_ARRAY_DUMPS[] && nRows * nCols > _ARRAY_DUMP_LIMIT
           "[MAT <" * string(nRows) * "×" * string(nCols) * " table>]"
         else
           str = "[MAT]"
