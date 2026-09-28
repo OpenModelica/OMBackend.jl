@@ -189,14 +189,12 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   end
   #= Lower the body of each regular `algorithm` section (not `when` and not
      `initial`) into one `BDAE.RESIDUAL_EQUATION` per scalar assignment,
-     but ONLY for LHSes that are not already constrained by an equation.
-     The LHS-collision guard skips connect-driven LHSes (e.g. INV3S's
-     `yy := nextstate;` where `yy` is also bound by
-     `connect(yy, inertialDelaySensitive.x)`), which would otherwise
-     over-determine MTK's structural-simplify. Models where the algorithm
-     LHS has no competing equation (the reproducer
-     `Models/AlgorithmDiscreteAssign.mo`) take the lift and gain a defining
-     residual. =#
+     but ONLY for LHSes that no other equation constrains (a competing
+     residual would over-determine MTK's structural-simplify). A connect's
+     alias `a = b` does not constrain: the MSL Digital Set source `y := x`,
+     connected to a flip-flop's inputs, takes the lift. Multi-statement
+     bodies (INV3S's `nextstate := ...; yy := nextstate;`) go through the
+     when lifter instead. =#
   #= Residual-lift for the simple `Integer out := trigger + 10` reproducer
      shape (single-statement, LHS not connect-bound). Skipped when the LHS
      would collide with another equation, when the body has multiple
@@ -1091,10 +1089,15 @@ end
    BDAE equations. Used as the "already constrained" set for the
    algorithm-residual lifter, so we do not introduce a competing residual for
    a variable that a connect-style or normal equation already binds. =#
+#= The names the equations constrain, for the algorithm residual lifter's guard. An alias `a = b`
+   between two variables (a connect) defines neither and is left out: an algorithm's lhs is defined by
+   the algorithm alone, and a connected lhs was never lifted (the MSL Digital Set source `y := x`,
+   connected to a flip-flop's inputs, left them at 0, an invalid logic value). =#
 function _collectAllCrefsInEquations(equations)::OrderedSet{String}
   local names = OrderedSet{String}()
   for eq in equations
     if eq isa BDAE.EQUATION
+      (eq.lhs isa DAE.CREF && eq.rhs isa DAE.CREF) && continue
       _pushExpCrefStrings!(names, eq.lhs); _pushExpCrefStrings!(names, eq.rhs)
     elseif eq isa BDAE.RESIDUAL_EQUATION
       _pushExpCrefStrings!(names, eq.exp)
