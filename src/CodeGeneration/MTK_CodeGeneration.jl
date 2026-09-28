@@ -4233,8 +4233,57 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
       $(Symbol(simVar.name)) = $(rhs)
     end
     push!(dsAssignments, expr)
+    #= A record's fields by their flattened names too (`Medium_data[1]_MM`): the equations
+       read the record, the eliminated observed equations its fields (the MSL ideal-gas
+       mixtures' molar masses: UndefVarError). =#
+    if bindExp isa SimulationCode.RECORD && length(bindExp.fieldNames) == length(bindExp.exps)
+      for (field, fieldExp) in zip(bindExp.fieldNames, bindExp.exps)
+        local fieldRhs = try
+          expToJuliaExpMTK(fieldExp, simCode)
+        catch
+          continue
+        end
+        local fieldSym = Symbol(simVar.name * "_" * field)
+        push!(dsAssignments, :($(fieldSym) = $(fieldRhs)))
+        #= An array field's elements by their scalarized names too (`Medium_data_alow[1]`). =#
+        if fieldExp isa SimulationCode.ARRAY_EXP
+          for k in eachindex(fieldExp.elements)
+            push!(dsAssignments, :($(Symbol("$(fieldSym)[$(k)]")) = $(fieldSym)[$(k)]))
+          end
+        end
+      end
+    end
   end
+  append!(dsAssignments, _recordArrayFieldArrays(dataStructureVariables, simCode))
   return dsAssignments
+end
+
+#= For an array of records `base[1..n]` among the data structures, each field as an array
+   `base_field = [base[1]_field, ...]`: a whole record array passed to a function goes field
+   by field (`h_T(Medium_data_name, Medium_data_MM, ...)`). =#
+function _recordArrayFieldArrays(dataStructureVariables::Vector{String}, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  local ht = simCode.stringToSimVarHT
+  local elements = OrderedDict{String, Dict{Int, Vector{String}}}()
+  for ds in dataStructureVariables
+    local m = match(r"^(.*)\[(\d+)\]$", ds)
+    m === nothing && continue
+    local bindExp = @match ht[ds][2].varKind begin
+      SimulationCode.DATA_STRUCTURE(bindExp = SOME(exp)) => exp
+      _ => nothing
+    end
+    bindExp isa SimulationCode.RECORD || continue
+    get!(elements, m.captures[1], Dict{Int, Vector{String}}())[parse(Int, m.captures[2])] = bindExp.fieldNames
+  end
+  local out = Expr[]
+  for (base, byIndex) in elements
+    local n = length(byIndex)
+    (all(i -> haskey(byIndex, i), 1:n) && allequal(values(byIndex))) || continue
+    for field in byIndex[1]
+      local parts = [Symbol("$(base)[$(i)]_$(field)") for i in 1:n]
+      push!(out, :($(Symbol(base * "_" * field)) = [$(parts...)]))
+    end
+  end
+  return out
 end
 
 """
