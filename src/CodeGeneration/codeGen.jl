@@ -822,6 +822,41 @@ function _emitRelationWhen(eq, simCode, callbacks::Int, rel)
   end
 end
 
+#= `(sample call, guard)` of a when condition that is `sample(...)` or a
+   conjunction with exactly one sample() conjunct (the guard: the other
+   conjuncts, or nothing); `(nothing, nothing)` otherwise. =#
+function _splitSampleCondition(cond)
+  local isSample = e -> e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "sample"
+  local conjuncts = Any[]
+  local collect! = nothing
+  collect! = e -> begin
+    @match e begin
+      DAE.LBINARY(exp1 = e1, operator = DAE.AND(__), exp2 = e2) => (collect!(e1); collect!(e2))
+      _ => push!(conjuncts, e)
+    end
+    nothing
+  end
+  collect!(cond)
+  local samples = filter(isSample, conjuncts)
+  length(samples) == 1 || return (nothing, nothing)
+  local rest = filter(!isSample, conjuncts)
+  any(e -> _containsSampleCall(e), rest) && return (nothing, nothing)
+  isempty(rest) && return (samples[1], nothing)
+  local guard = rest[1]
+  for e in rest[2:end]
+    guard = DAE.LBINARY(guard, DAE.AND(DAE.T_BOOL(MetaModelica.Nil())), e)
+  end
+  return (samples[1], guard)
+end
+
+_containsSampleCall(e) = any(c -> c isa DAE.CALL && c.path isa Absyn.IDENT && c.path.name == "sample",
+                             _allCalls(e))
+function _allCalls(e)
+  local out = Any[]
+  Util.traverseExpBottomUp(e, (x, acc) -> (x isa DAE.CALL && push!(out, x); (x, true, acc)), 0)
+  return out
+end
+
 """
   This function creates a representation of a when equation in Julia.
 """
@@ -840,10 +875,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     Get all component references.
     If this set is empty it means that we have a condition involving continuous time
   =#
-  local isPeriodic = @match wEqCondDAE begin
-    DAE.CALL(Absyn.IDENT("sample"), args, attrs) => true
-    _ => false
-  end
+  #= sample(start, interval), alone or and-ed with a guard (MSL PartialNoise:
+     `when generateNoise and sample(startTime, samplePeriod)`): periodic, the
+     guard read at each tick. =#
+  local (sampleCall, sampleGuard) = _splitSampleCondition(wEqCondDAE)
+  local isPeriodic = sampleCall !== nothing
   local isContinuousCond::Bool = isContinuousCondition(wEqCondDAE, simCode)
   #= Table / time-driven sources: a when whose condition is purely change(time>=c)
      thresholds must fire AT those times via PresetTimeCallback — a ContinuousCallback
@@ -1056,7 +1092,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
   elseif isPeriodic
-    @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = wEqCondDAE
+    @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = sampleCall
     @match start <| interval <| tail = args
     #= MTK-aware periodic affect: the hardcoded x[N]/p[N] indices from
        expToJuliaExp are invalid after MTK structural_simplify reorders unknowns,
@@ -1077,6 +1113,15 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     local (_dbRefreshCrefs, _dbRefreshStmts) = _collectDiscreteBoolWhenRefresh(_periodicWrittenLHS, simCode)
     local _intervalVal = SimulationCode.tryEvalNumeric(interval, simCode)
     local _dtExpr = _intervalVal === nothing ? expToJuliaExp(interval, simCode) : _intervalVal
+    #= The ticks are start + i*interval: the phase from the initial time
+       (taken as 0). =#
+    local _startVal = SimulationCode.tryEvalNumeric(start, simCode)
+    #= A start that does not evaluate here: from the initial time, as before
+       (generated code cannot read the parameters at module level). =#
+    _startVal === nothing && @debug "sample(): start $(start) not evaluated; ticks from the initial time"
+    local _phaseExpr = _startVal === nothing ? 0.0 : max(0.0, Float64(_startVal))
+    local _guardCrefs = sampleGuard === nothing ? DAE.ComponentRef[] : listArray(Util.getAllCrefs(sampleGuard))
+    local _guardExpr = sampleGuard === nothing ? true : expToJuliaExpMTK(sampleGuard, simCode)
     quote
       let _affCache = Ref{Any}(nothing)
         global $(Symbol("affect$(callbacks)!"))
@@ -1097,6 +1142,8 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
             lookuptableStates = cached[1]
             lookuptableParams = cached[2]
           end
+          $(_whenLookupBindings(_guardCrefs, simCode)...)
+          $(_guardExpr) == true || return nothing
           $(_whenLookupBindings(vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...), simCode)...)
           $(whenStatementsMTKPeriodic...)
           #= Re-derive dependent discrete-bool whens from the just-written threshold. =#
@@ -1104,8 +1151,13 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           $(_dbRefreshStmts...)
         end
       end
-      Δt = $(_dtExpr)
-      $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), Δt; save_positions = (true, true))
+      $(Symbol("sampleDt$(callbacks)")) = $(_dtExpr)
+      $(Symbol("samplePhase$(callbacks)")) = $(_phaseExpr)
+      #= Ticks at start + i*interval from the first after the initial time.
+         (omc also ticks at the initial time when start is there, and at the
+         final time: open, see the 2026-09-29 report.) =#
+      $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), $(Symbol("sampleDt$(callbacks)"));
+                                                      phase = $(Symbol("samplePhase$(callbacks)")), save_positions = (true, true))
       $(if wEq.elsewhenPart !== nothing
           eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4)
         end)
