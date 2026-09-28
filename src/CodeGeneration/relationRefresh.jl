@@ -273,7 +273,8 @@ model has buffered relations, the event iteration (`withRelationRefresh`)
 runs it, after the whens on a relation; otherwise its DiscreteCallback does.
 """
 struct DiscreteWhenAffect{C, A, I}
-  condition::C               # (u, t, integrator) -> Bool
+  condition::C               # (u, t, integrator[, follow::Bool]) -> Bool: whether it fires; where it does
+                             # not and `follow`, its change()/edge() memory takes the values
   affect!::A                 # (integrator[, pre]) -> nothing; pre(v) read from `pre` (default: u on entry)
   initialize!::I             # (u, t, integrator) -> nothing: its state (an edge latch) at the start
 end
@@ -286,10 +287,15 @@ const _NO_WHEN_INITIALIZE = (u, t, integrator) -> nothing
     discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE) -> DiscreteCallback
 
 A when on a discrete condition, checked after every step. `initialize!` runs at
-the start of every solve (a reinit! included).
+the start of every solve (a reinit! included). Its change()/edge() memory
+follows the values only after a step no other callback changed: an earlier
+callback in the same step can change a discrete without solving the algebraic
+unknowns again, and `edge(b) and c` would lose b's edge on a stale c (it fires
+a step later instead).
 """
 discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE) =
-  DiffEqBase.DiscreteCallback(condition, DiscreteWhenAffect(condition, affect!, initialize!);
+  DiffEqBase.DiscreteCallback((u, t, integrator) -> condition(u, t, integrator, !_changedThisStep(integrator)),
+                              DiscreteWhenAffect(condition, affect!, initialize!);
                               initialize = (c, u, t, integrator) -> begin
                                 initialize!(u, t, integrator)
                                 _derivativeDiscontinuity!(integrator, false)
@@ -308,7 +314,23 @@ struct EventIteration
   reinit::Any
 end
 
+#= Whether a callback changed the state in the step that just ended: a
+   continuous event, or an earlier discrete callback (the integrator's flag,
+   `derivative_discontinuity` since SciMLBase 3, `u_modified` before). =#
+_changedThisStep(integrator) =
+  _continuousEventFired(integrator) ||
+  (hasproperty(integrator, :derivative_discontinuity) && integrator.derivative_discontinuity) ||
+  (hasproperty(integrator, :u_modified) && integrator.u_modified)
+
+#= Whether the when fires; where it does not, its change()/edge() memory
+   takes the values. =#
 _holds(d::DiscreteWhenAffect, integrator) = d.condition(integrator.u, integrator.t, integrator)
+
+#= Within a sweep: the change()/edge() memory stays (the condition's
+   `_follow` false). It follows the values once the iteration settles. =#
+_holdsInSweep(d::DiscreteWhenAffect, integrator) = d.condition(integrator.u, integrator.t, integrator, false)
+
+_follow!(d::DiscreteWhenAffect, integrator) = (_holds(d, integrator); nothing)
 
 #= Whether a continuous callback fired in the step that just ended: the
    integrators of OrdinaryDiffEqCore and Sundials record it in
@@ -357,7 +379,7 @@ function _sweep!(e::EventIteration, integrator)
   end
   stale && !isempty(e.discreteWhens) && _staleResolve!(integrator, e.reinit)
   for d in e.discreteWhens
-    _holds(d, integrator) || continue
+    _holdsInSweep(d, integrator) || continue
     d.affect!(integrator, pre)
     changed = true
   end
@@ -428,6 +450,9 @@ function _iterate!(e::EventIteration, integrator, resolve::Bool = false)
   for n in 1:e.limit
     if !_sweep!(e, integrator)
       n > 1 && _restartStepSize!(integrator)
+      #= Settled: the discrete whens' change()/edge() memory takes the
+         values (pre() at the next event); none of them holds here. =#
+      foreach(d -> _follow!(d, integrator), e.discreteWhens)
       return nothing
     end
     #= Phase 3: the branches or the state changed; the algebraic unknowns follow. =#

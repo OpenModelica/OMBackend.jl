@@ -469,7 +469,8 @@ function _emitElsewhenThresholdTimeWhen(elseArm, simCode, ewRefSym::Symbol, thrD
   quote
     let _condCache = Ref{Any}(nothing), _affCache = Ref{Any}(nothing)
       global $(Symbol("condition$(callbacks)"))
-      $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+      #= `_follow` as a discrete when's (no change()/edge() memory here). =#
+      $(Symbol("condition$(callbacks)")) = (x, t, integrator, _follow::Bool = true) -> begin
         local lookuptableStates
         local lookuptableParams
         if _condCache[] === nothing
@@ -1224,7 +1225,9 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           _latch = Ref{Bool}(false),     # the edge latch
           _changeSeedValues = Dict{Symbol, Any}($(changeSeedPairs...))
         global $(Symbol("condition$(callbacks)"))
-        $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+        #= Whether the when fires. `_follow`: whether change()/edge() may take the values now,
+           where it does not fire (false within an event iteration's sweep; see below). =#
+        $(Symbol("condition$(callbacks)")) = (x, t, integrator, _follow::Bool = true) -> begin
           local lookuptableStates
           local lookuptableParams
           if _condCache[] === nothing
@@ -1247,22 +1250,20 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           if _changeCache[] === nothing
             _changePreValues = copy(_changeSeedValues)
             _changeCache[] = _changePreValues
-            if isempty(_changePreValues)
-              $(changeInitExprs...)
-            end
           else
             _changePreValues = _changeCache[]
           end
           local _result = $(condValue)
           @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
-          $(if useLatch
-              quote
-                _result || (_latch[] = false)
-                _result && !_latch[]
-              end
-            else
-              :(_result)
-            end)
+          $(useLatch ? :(_result || (_latch[] = false)) : :())
+          local _fires = $(useLatch ? :(_result && !_latch[]) : :_result)
+          #= change()/edge() compare with the values at the previous event (pre()): where the when
+             does not fire, the memory follows the values now (off turned false at 1/12 without
+             firing a `when edge(off)`, which then missed off's edge at 5/12); where it fires, its
+             affect does. Not within a sweep of the event iteration: an algebraic value the next
+             sweep solves again is stale there, and `edge(b) and c` would lose b's edge. =#
+          $(isempty(changeSeedPairs) ? :() : :(_follow && !_fires && begin $(changeInitExprs...) end))
+          _fires
         end
         global $(Symbol("affect$(callbacks)!"))
         $(Symbol("affect$(callbacks)!")) = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = copy(integrator.u)) -> begin
@@ -1293,14 +1294,25 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           $(useLatch ? :(_latch[] = $(condValue)) : :())
           @debug "[CB-DC$($(callbacks)) affect] done" t=integrator.t u=copy(integrator.u)
         end
+        #= At the start of a solve: change()/edge() compare with the initialized values (pre() at the
+           first event), not the start attributes: `when edge(off)` with off(start = true) initialized
+           false never fired (the MSL switch with arc: its arc voltage never started ramping). And the
+           edge latch from the initialized state. =#
         global $(Symbol("initialize$(callbacks)!"))
-        $(Symbol("initialize$(callbacks)!")) = $(useLatch ?
+        #= The latch implies a seed: it is used for a non-parameter cref of the condition. =#
+        $(Symbol("initialize$(callbacks)!")) = $(isempty(changeSeedPairs) ?
+          :(OMBackend.CodeGeneration._NO_WHEN_INITIALIZE) :
           :((x, t, integrator) -> begin
-              _latch[] = false
-              _latch[] = $(Symbol("condition$(callbacks)"))(x, t, integrator)
+              local _states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+              local _pre = copy(_changeSeedValues)
+              for _sym in keys(_changeSeedValues)
+                local _i = findfirst(==(_sym), _states)
+                _i === nothing || (_pre[_sym] = x[_i])
+              end
+              _changeCache[] = _pre
+              $(useLatch ? :(_latch[] = false; _latch[] = $(Symbol("condition$(callbacks)"))(x, t, integrator)) : :())
               nothing
-            end) :
-          :(OMBackend.CodeGeneration._NO_WHEN_INITIALIZE))
+            end))
       end
       #= Part of the event iteration where the model has buffered relations. =#
       $(Symbol("cb$(callbacks)")) = OMBackend.CodeGeneration.discreteWhenCallback($(Symbol("condition$(callbacks)")),
