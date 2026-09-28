@@ -4108,6 +4108,12 @@ _negateOptExp(opt) = @match opt begin
   _       => opt
 end
 
+#= Whether an optional `fixed` attribute is literally true. =#
+_fixedTrue(opt) = @match opt begin
+  SOME(DAE.BCONST(true)) => true
+  _ => false
+end
+
 #= Prefer rep's value when present; otherwise take the elim's. =#
 _orElseOpt(repField, elimField) = @match repField begin
   SOME(_) => repField
@@ -4124,6 +4130,10 @@ gaps left when the representative was chosen for its varKind (e.g. STATE) but
 the user-supplied start/fixed lived on the alias (e.g. ALG_VARIABLE
 `body2.r_0`). On a negated pairing (`a + b = 0`) `start`/`nominal` flip sign
 and `min`/`max` swap-and-flip.
+
+`start` and `fixed` go together (OMC `mergeStartFixed`): a fixed alias start
+replaces a representative's free one, set or not. When both are fixed the
+representative's start is kept.
 
 Only `VAR_ATTR_REAL` is handled — `VAR_ATTR_INT` / `VAR_ATTR_BOOL` pass
 through, since the Real path covers the dynamic-state IC residual cases.
@@ -4151,14 +4161,16 @@ function _mergeAliasAttrs(repAttr, elimAttr, negated::Bool)
     SOME(va) where (va isa DAE.VAR_ATTR_REAL) => va
     _ => DAE.emptyVarAttrReal
   end
+  #= start and fixed go together (OMC mergeStartFixed). =#
+  local elimFixedStart = _fixedTrue(elimVA.fixed) && !_fixedTrue(baseRep.fixed)
   local merged = DAE.VAR_ATTR_REAL(
     _orElseOpt(baseRep.quantity,             elimVA.quantity),
     _orElseOpt(baseRep.unit,                 elimVA.unit),
     _orElseOpt(baseRep.displayUnit,          elimVA.displayUnit),
     _orElseOpt(baseRep.min,                  elimMin),
     _orElseOpt(baseRep.max,                  elimMax),
-    _orElseOpt(baseRep.start,                elimStart),
-    _orElseOpt(baseRep.fixed,                elimVA.fixed),
+    elimFixedStart ? elimStart : _orElseOpt(baseRep.start, elimStart),
+    elimFixedStart ? elimVA.fixed : _orElseOpt(baseRep.fixed, elimVA.fixed),
     _orElseOpt(baseRep.nominal,              elimNominal),
     _orElseOpt(baseRep.stateSelectOption,    elimVA.stateSelectOption),
     _orElseOpt(baseRep.uncertainOption,      elimVA.uncertainOption),
