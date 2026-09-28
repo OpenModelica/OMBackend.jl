@@ -2245,7 +2245,8 @@ function getStatesAsSymbols(daeFunc::ModelingToolkit.SciMLBase.DAEFunction)
 end
 
 #= The names the legacy callbacks index the state vector by
-   (`lookuptableStates[Symbol("name")]`) in generated code `ex`. =#
+   (`lookuptableStates[Symbol("name")]`, or `[:name]` for a pre() read) in
+   generated code `ex`. =#
 function namedStateLookups(ex)::Vector{String}
   local names = OrderedSet{String}()
   local walk
@@ -2260,6 +2261,8 @@ function namedStateLookups(ex)::Vector{String}
     end
     if key isa Expr && key.head == :call && length(key.args) == 2 && key.args[1] === :Symbol && key.args[2] isa String
       push!(names, key.args[2])
+    elseif key isa QuoteNode && key.value isa Symbol
+      push!(names, string(key.value))
     end
     foreach(walk, e.args)
     return nothing

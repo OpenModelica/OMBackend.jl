@@ -19,7 +19,7 @@
    model, whose system changes during the solve, is not supported here. =#
 
 """
-    DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table)
+    DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled = true)
 
 A when-equation evaluated by the event iteration (see the top of the file).
 
@@ -39,6 +39,8 @@ A when-equation evaluated by the event iteration (see the top of the file).
   model, the same for all its clusters: the start body runs with initial()
   true, and the algebraic variables are solved with Newton on finite
   differences (`tableClusterInitAlg`).
+- `coupled`: whether an algebraic solve can change what it reads
+  (`_clusterCoupled`); only then its mixed system solves them after each pass.
 """
 mutable struct DiscreteCluster
   names::Vector{String}
@@ -51,6 +53,7 @@ mutable struct DiscreteCluster
   body::Any
   atStart::Int
   table::Bool
+  coupled::Bool
   values::Any                # (u, p, t) -> all reads, for the problem's system
   crossings!::Any            # (out, u, p, t): per relation its crossing function and scale
   zs::Vector{Float64}        # the output of crossings!
@@ -59,8 +62,8 @@ mutable struct DiscreteCluster
   crossed::Vector{Bool}      # the relations whose crossing the callback located, until the next update
 end
 
-DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table) =
-  DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table,
+DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled = true) =
+  DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled,
                   nothing, nothing, zeros(2 * length(strict)), Int[], fill(false, length(strict)),
                   fill(false, length(strict)))
 
@@ -121,10 +124,27 @@ function _shiftCrossings!(out, zs::Vector{Float64}, rel::Vector{Bool}, exact::Ve
   return nothing
 end
 
+#= The crossing functions at an event: an exact relation exactly on its
+   boundary takes its value just after the instant (`_TIME_EVENT_AHEAD`), as
+   an event's relations do (MLS 8.5): `sin(time) > 0.5` at pi/6 and
+   `time >= pulseStart` just after the sample are true; read at the instant
+   the first would be false again after its located crossing flipped it. =#
+function _eventCrossingValues!(c::DiscreteCluster, integrator)
+  local zs = _crossingValues!(c, integrator)
+  any(k -> c.exact[k] && iszero(zs[2k - 1]), eachindex(c.rel)) || return zs
+  local t = integrator.t
+  local ahead = similar(zs)
+  c.crossings!(ahead, integrator.u, integrator.p, t + _TIME_EVENT_AHEAD * (1 + abs(t)))
+  for k in eachindex(c.rel)
+    c.exact[k] && iszero(zs[2k - 1]) && (zs[2k - 1] = ahead[2k - 1])
+  end
+  return zs
+end
+
 #= Whether a relation disagrees with the state by the rule from `reference`
    (the buffers, or the values at the start of a pass). =#
 function _inconsistent(c::DiscreteCluster, integrator, reference::Vector{Bool} = c.rel)
-  local zs = _crossingValues!(c, integrator)
+  local zs = _eventCrossingValues!(c, integrator)
   local H = _hysteresisFromTolerance(integrator)
   return any(k -> _ruled(c, zs, k, H, reference[k]) != c.rel[k], eachindex(c.rel))
 end
@@ -136,7 +156,7 @@ end
    (an ideal thyristor's firing, found only at the end of the next step). A
    state clearly on the old side flips it back in the next sweep. =#
 function _update!(c::DiscreteCluster, integrator)
-  local zs = _crossingValues!(c, integrator)
+  local zs = _eventCrossingValues!(c, integrator)
   local H = _hysteresisFromTolerance(integrator)
   local changed = false
   for k in eachindex(c.rel)
@@ -233,7 +253,8 @@ function _solveMixedSystem!(c::DiscreteCluster, integrator, pre, relPre, reinit)
     push!(tried, _memberValues(c, integrator))
     _write!(c, integrator, values)
     changed = true
-    _resolveAlgebraics!(integrator, reinit) || return changed
+    #= Uncoupled: the event iteration solves once after the sweep. =#
+    c.coupled && (_resolveAlgebraics!(integrator, reinit) || return changed)
     local before = copy(c.rel)
     _update!(c, integrator)
     flipped .|= before .!= c.rel

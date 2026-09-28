@@ -224,22 +224,10 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
     end
     append!(equations, synthesizeAssertsFromRegularAlgorithms(algorithms))
   end
-  #= §17.4.4: lift discrete (Bool/Int/enum) equation-section definitions whose RHS
-     is a discrete-time relation into event-driven held discretes, so the
-     continuous integrator never interpolates step-valued logic. =#
   #= Stringify each varName once; the four name-keyed sweeps below
-     (param/const, discrete-start, collision-resolve, dedup) all use the
+     (collision-resolve, dedup, param/const, discrete-start) all use the
      default-separator string and share this vector instead of recomputing it. =#
   local varNames = String[string(v.varName) for v in variables]
-  if !isempty(equations) && !isempty(variables)
-    local _discParamConst = _collectParamOrConstNames(variables, varNames)
-    local _discStarts = _discreteStartExpLookup(variables, varNames)
-    local (_discEqs, _discLifted) = synthesizeWhenEquationsFromDiscreteEquations(equations, _discParamConst, _discStarts)
-    if !isempty(_discLifted)
-      @info "[BDAE: lifter] synthesizeWhenEquationsFromDiscreteEquations lifted $(length(_discLifted)) discrete equation(s)" lifted=collect(_discLifted)
-    end
-    equations = _discEqs
-  end
   local initialEquations = BDAE.Equation[]
   for ieq in OMFrontend.Frontend.convertEquations(flatModel.initialEquations)
     local iresult = equationToBackendEquation(ieq)
@@ -254,12 +242,29 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   resolveMangledNameCollisions!(variables, equations, initialEquations, varNames)
   #= Deduplicate variables by name (handles inner/outer duplicate emission) =#
   variables = deduplicateVariables(variables, varNames)
+  length(variables) == length(varNames) || (varNames = String[string(v.varName) for v in variables])
   #= Deduplicate explicit equations =#
   equations = deduplicateEquations(equations)
   #= The set of equations might also contain a  set of "binding equations" =#
   local bindingEquations = createBindingEquations(variables)
   if !isempty(bindingEquations)
     equations = vcat(equations, bindingEquations)
+  end
+  #= §17.4.4: lift discrete (Bool/Int/enum) definitions whose RHS is a
+     discrete-time relation into event-driven held discretes, so the continuous
+     integrator never interpolates step-valued logic. After the bindings: a
+     `Boolean open = time > 0.5` defines `open` as an equation does (lifted
+     before them, its relation made no event and the switch it drives never
+     opened). =#
+  if !isempty(equations) && !isempty(variables)
+    local _discParamConst = _collectParamOrConstNames(variables, varNames)
+    local _discStarts = _discreteStartExpLookup(variables, varNames)
+    local (_discEqs, _discLifted) = synthesizeWhenEquationsFromDiscreteEquations(equations, _discParamConst, _discStarts;
+                                                                               initialConstants = _initialConstants(initialEquations, _discParamConst))
+    if !isempty(_discLifted)
+      @info "[BDAE: lifter] synthesizeWhenEquationsFromDiscreteEquations lifted $(length(_discLifted)) discrete equation(s)" lifted=collect(_discLifted)
+    end
+    equations = _discEqs
   end
   #= TODO Extract the simple equations =#
   local simpleEquations = BDAE.Equation[]
@@ -2327,6 +2332,126 @@ Base.@nospecializeinfer function _discreteBoolCandidate(@nospecialize(eq::BDAE.E
   return (name = lhsName, lhs = lhs, rhs = eq.rhs, src = eq.source, eq = eq)
 end
 
+#= The rhs of an alias equation: a discrete variable, not a parameter. =#
+_isDiscreteAlias(@nospecialize(rhs), paramOrConstNames::OrderedSet{String})::Bool =
+  rhs isa DAE.CREF && !(string(rhs.componentRef) in paramOrConstNames)
+
+#= The alias sets of the discrete aliases `a = b`, in the aliases' order. =#
+function _aliasSets(aliases::Vector{Tuple{String, String}})::Vector{Vector{String}}
+  local names = OrderedSet{String}()
+  local adj = Dict{String, OrderedSet{String}}()
+  for (a, b) in aliases
+    push!(names, a); push!(names, b)
+    push!(get!(adj, a, OrderedSet{String}()), b)
+    push!(get!(adj, b, OrderedSet{String}()), a)
+  end
+  return _connectedComponents(collect(names), adj)
+end
+
+#= The initial equations that fix a variable or a pre() value to a literal or
+   a parameter (`pre(y) = pre_y_start`, the MSL Hysteresis and Pre blocks):
+   (values = name => value, pre = name => value for `pre(name) = value`). =#
+function _initialConstants(initialEquations::Vector{BDAE.Equation}, paramOrConstNames::OrderedSet{String})
+  local values = OrderedDict{String, DAE.Exp}()
+  local pre = OrderedDict{String, DAE.Exp}()
+  isValue(e) = e isa DAE.BCONST || e isa DAE.ICONST || e isa DAE.RCONST || e isa DAE.ENUM_LITERAL ||
+               (e isa DAE.CREF && string(e.componentRef) in paramOrConstNames)
+  for eq in initialEquations
+    eq isa BDAE.EQUATION || continue
+    for (a, b) in ((eq.lhs, eq.rhs), (eq.rhs, eq.lhs))
+      isValue(b) || continue
+      if a isa DAE.CREF
+        values[string(a.componentRef)] = b
+      else
+        local x = _preArgument(a)
+        x === nothing || (pre[x] = b)
+      end
+    end
+  end
+  return (values = values, pre = pre)
+end
+
+#= The name `n` of `pre(n)`, else nothing. =#
+Base.@nospecializeinfer function _preArgument(@nospecialize(e))::Union{Nothing, String}
+  @match e begin
+    DAE.CALL(Absyn.IDENT("pre"), args, _) => (local a = listHead(args); a isa DAE.CREF ? string(a.componentRef) : nothing)
+    _ => nothing
+  end
+end
+
+#= name => the name of its alias set's definition, for the sets with exactly
+   one definition among the candidates (the definition maps to itself). =#
+function _aliasDefinitions(candByName::Dict{String, Any}, aliasSets::Vector{Vector{String}})::Dict{String, String}
+  local definitionOf = Dict{String, String}()
+  for set in aliasSets
+    local defs = filter(n -> haskey(candByName, n), set)
+    length(defs) == 1 || continue
+    foreach(n -> definitionOf[n] = only(defs), set)
+  end
+  return definitionOf
+end
+
+#= Rewrite each candidate's rhs to read the definition of an alias set in
+   place of its aliases (pre() included: an alias holds at every instant), so
+   the clusters and their bodies do not depend on how the connects are
+   oriented. A set without exactly one definition among the candidates is
+   left as it is. =#
+function _readThroughAliases!(candByName::Dict{String, Any}, definitionOf::Dict{String, String})
+  isempty(definitionOf) && return candByName
+  function subst(@nospecialize(e), arg)
+    e isa DAE.CREF || return (e, arg)
+    local n = string(e.componentRef)
+    local d = get(definitionOf, n, n)
+    return (d == n ? e : DAE.CREF(candByName[d].lhs.componentRef, e.ty), arg)
+  end
+  for n in collect(keys(candByName))
+    local c = candByName[n]
+    candByName[n] = merge(c, (rhs = first(Util.traverseExpBottomUp(c.rhs, subst, nothing)),))
+  end
+  return candByName
+end
+
+#= The start lookup that folds pre() at initialization, and the names whose
+   pre() the initial equations fix (folded even outside the cluster). On the
+   rhs read through the aliases (_readThroughAliases!), so on the
+   definitions' names: a start only an alias carries is the definition's;
+   `pre(n) = v`; and pre(n) of a candidate `m = pre(n)` whose value an
+   initial equation fixes, directly or through an alias (the StateGraph
+   InitialStep: `active = true` with `active = localActive` and `localActive =
+   pre(newActive)`, newActive not lifted, starts the step active; newActive's
+   start alone left every step inactive). =#
+function _initialPreValues(startLookup::Dict{String, DAE.Exp}, candNames::Vector{String},
+                           candByName::Dict{String, Any}, aliasSets::Vector{Vector{String}},
+                           definitionOf::Dict{String, String}, initialConstants)
+  local fixed = OrderedSet{String}()
+  (isempty(aliasSets) && isempty(initialConstants.values) && isempty(initialConstants.pre)) && return (startLookup, fixed)
+  local lookup = copy(startLookup)
+  local valueOf = Dict{String, DAE.Exp}()
+  for set in aliasSets
+    local d = get(definitionOf, first(set), nothing)
+    if d !== nothing && !haskey(startLookup, d)
+      local i = findfirst(n -> haskey(startLookup, n), set)
+      i === nothing || (lookup[d] = startLookup[set[i]])
+    end
+    local j = findfirst(n -> haskey(initialConstants.values, n), set)
+    j === nothing || foreach(n -> valueOf[n] = initialConstants.values[set[j]], set)
+  end
+  for (x, v) in initialConstants.pre
+    local d = get(definitionOf, x, x)
+    lookup[d] = v
+    push!(fixed, d)
+  end
+  for n in candNames
+    local x = _preArgument(candByName[n].rhs)
+    x === nothing && continue
+    local v = get(initialConstants.values, n, get(valueOf, n, nothing))
+    v === nothing && continue
+    lookup[x] = v
+    push!(fixed, x)
+  end
+  return (lookup, fixed)
+end
+
 #= Candidate cref names referenced anywhere in `exp` (including inside pre()).
    Used to connect a cluster: two candidates are coupled if either references
    the other. =#
@@ -2402,9 +2527,10 @@ Base.@nospecializeinfer function _discreteStartExpLookup(variables::Vector{BDAE.
   return d
 end
 
-#= Fold `pre(member)` (member a lifted cluster discrete) to the member's start
-   value for the INITIAL_WHEN body. The default false matches the Boolean start
-   default; pre() of non-members is left untouched. =#
+#= Fold `pre(n)` for n in `members` (a lifted cluster's discretes, and the
+   names whose pre() the initial equations fix) to its value in `startLookup`
+   for the INITIAL_WHEN body. The default false matches the Boolean start
+   default; pre() of other names is left untouched. =#
 Base.@nospecializeinfer function _foldPreOfMembers(@nospecialize(exp::DAE.Exp), members::OrderedSet{String},
                                                    startLookup::Dict{String, DAE.Exp})
   function f(@nospecialize(e), arg)
@@ -2482,7 +2608,8 @@ end
 function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{String},
                                candByName::Dict{String, Any}, liftedLhs::OrderedSet{String},
                                startLookup::Dict{String, DAE.Exp},
-                               paramOrConstNames::OrderedSet{String})
+                               paramOrConstNames::OrderedSet{String},
+                               initialPre::OrderedSet{String})
   local order = _topoOrderCluster(cluster, candByName)
   if order === nothing
     @warn "[BDAE: lifter] cyclic discrete cluster left unlifted" cluster
@@ -2519,9 +2646,11 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
   local bareInitial = DAE.CALL(Absyn.IDENT("initial"), MetaModelica.list(), DAE.callAttrBuiltinBool)
   local changeCond = _buildChangeOrConditionFromExps(rels)
   local src0 = body[1][3]
-  #= INITIAL body: pre(member) ≡ member.start (no held value exists yet). The
-     runtime body keeps pre() — it resolves to the affect-entry held value. =#
-  local initAssigns = [BDAE.ASSIGN(lhs, _replaceInitialCall(_foldPreOfMembers(r, members, startLookup), true), s)
+  #= INITIAL body: pre(member) ≡ member.start (no held value exists yet), and
+     pre(n) that the initial equations fix. The runtime body keeps pre() — it
+     resolves to the affect-entry held value. =#
+  local folded = isempty(initialPre) ? members : union(members, initialPre)
+  local initAssigns = [BDAE.ASSIGN(lhs, _replaceInitialCall(_foldPreOfMembers(r, folded, startLookup), true), s)
                        for (lhs, r, s) in body]
   local runAssigns  = [BDAE.ASSIGN(lhs, _replaceInitialCall(r, false), s) for (lhs, r, s) in body]
   push!(out, BDAE.INITIAL_WHEN_EQUATION(
@@ -2541,7 +2670,7 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
 end
 
 """
-    synthesizeWhenEquationsFromDiscreteEquations(equations, paramOrConstNames) -> (Vector{BDAE.Equation}, OrderedSet{String})
+    synthesizeWhenEquationsFromDiscreteEquations(equations, paramOrConstNames, startLookup; initialConstants) -> (Vector{BDAE.Equation}, OrderedSet{String})
 
 Replace qualifying discrete-Boolean/Integer equation-section definitions with
 paired INITIAL_WHEN + runtime WHEN equations. Mutually-referencing definitions
@@ -2551,24 +2680,38 @@ siblings' relations, and the cluster recomputes in topological order on any
 member relation crossing. Self-gating: equations that do not qualify are returned
 unchanged, so models with no discrete-time defining equations pay only a single
 linear scan.
+`startLookup` gives the start values pre() takes at initialization, and
+`initialConstants` (`_initialConstants`) the values the initial equations fix.
 """
 function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equation},
                                                       paramOrConstNames::OrderedSet{String} = OrderedSet{String}(),
-                                                      startLookup::Dict{String, DAE.Exp} = Dict{String, DAE.Exp}())
+                                                      startLookup::Dict{String, DAE.Exp} = Dict{String, DAE.Exp}();
+                                                      initialConstants = (values = OrderedDict{String, DAE.Exp}(),
+                                                                          pre = OrderedDict{String, DAE.Exp}()))
   local out = BDAE.Equation[]
   local cands = Any[]
+  #= An alias (`a = b` between discrete variables, a connect in either
+     orientation) defines neither side: it stays an equation, for alias
+     elimination, and the definitions read through it (_readThroughAliases!).
+     Lifting it made the clusters depend on how the connects are oriented (a
+     Greater block's `y = u1 > u2` next to `y = fire` was left in the
+     continuous equations, its crossing without an event). =#
+  local aliases = Tuple{String, String}[]
   for eq in equations
     local c = _discreteBoolCandidate(eq, paramOrConstNames)
     if c === nothing
       push!(out, eq)
+    elseif _isDiscreteAlias(c.rhs, paramOrConstNames)
+      push!(out, eq)
+      push!(aliases, (c.name, string(c.rhs.componentRef)))
     else
       push!(cands, c)
     end
   end
   isempty(cands) && return (equations, OrderedSet{String}())
-  #= An LHS with more than one defining equation is a connect/alias chain, not
-     a discrete definition; lifting it through a name-keyed map would silently
-     drop all but one of its equations. Keep such equations unchanged. =#
+  #= An LHS with more than one definition is not a discrete definition;
+     lifting it through a name-keyed map would silently drop all but one of
+     its equations. Keep such equations unchanged. =#
   local lhsCount = Dict{String, Int}()
   for c in cands
     lhsCount[c.name] = get(lhsCount, c.name, 0) + 1
@@ -2584,6 +2727,11 @@ function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equ
     end
   end
   isempty(candNames) && return (equations, OrderedSet{String}())
+  local aliasSets = _aliasSets(aliases)
+  local definitionOf = _aliasDefinitions(candByName, aliasSets)
+  _readThroughAliases!(candByName, definitionOf)
+  local (initialLookup, initialPre) = _initialPreValues(startLookup, candNames, candByName, aliasSets,
+                                                        definitionOf, initialConstants)
   local candSet = OrderedSet(candNames)
   local adj = Dict{String, OrderedSet{String}}(n => OrderedSet{String}() for n in candNames)
   for n in candNames
@@ -2595,7 +2743,7 @@ function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equ
   end
   local liftedLhs = OrderedSet{String}()
   for cluster in _connectedComponents(candNames, adj)
-    _emitDiscreteCluster!(out, cluster, candByName, liftedLhs, startLookup, paramOrConstNames)
+    _emitDiscreteCluster!(out, cluster, candByName, liftedLhs, initialLookup, paramOrConstNames, initialPre)
   end
   return (out, liftedLhs)
 end

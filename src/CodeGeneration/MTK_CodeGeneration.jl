@@ -760,8 +760,8 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
         end
         #= Float-convert: Int-valued entries make remake_buffer promote a
            Float64 parameter buffer to Int64, failing on fractional entries. =#
-        local _hardFiltered = Dict(first(p) => Float64(last(p))
-                                   for p in _hardStarts if string(first(p)) in _unkNames)
+        local _hardFiltered = Dict(Base.first(p) => Float64(Base.last(p))
+                                   for p in _hardStarts if string(Base.first(p)) in _unkNames)
         if !isempty(_hardFiltered)
           try
             global LATEST_PROBLEM = ModelingToolkit.SciMLBase.remake(
@@ -782,54 +782,13 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
           end
         end
       end
-      #= Auto-switch from Rosenbrock (the default Rodas5P) to FBDF for DAE shapes
-         where Rosenbrock mass-matrix stepping is known to be brittle:
-         purely-algebraic systems, and mixed systems with algebraic rows for
-         generated discrete variables. Brake reaches a consistent initial
-         residual, but Rodas5P immediately aborts with dt_epsilon/NaN while
-         FBDF advances the same mass-matrix problem. User-chosen non-Rosenbrock
-         solvers are respected as-is. =#
-      local _solver = solver
-      local _solverName = string(nameof(typeof(solver)))
-      if startswith(_solverName, "Rodas") || startswith(_solverName, "Rosenbrock")
-        local _u0 = $(Symbol("$(MODEL_NAME)Model_problem")).u0
-        local _n = _u0 === nothing ? 0 : length(_u0)
-        local _mm = $(Symbol("$(MODEL_NAME)Model_problem")).f.mass_matrix
-        #= Event-trigger discretes (referenced in a when-condition) are latched by
-           DiscreteCallbacks and are not part of the brittle Rosenbrock mass-matrix
-           coupling the FBDF switch targets; excluding them keeps the default
-           Rosenbrock solver, which handles them without the FBDF tstop chatter. =#
-        local _discreteUnknownNames = OrderedSet{String}($(Expr(:vect, [string(varName, "(t)") for (varName, (_, simVar)) in simCode.stringToSimVarHT if simVar.varKind isa SimulationCode.DISCRETE && !(Symbol(varName) in _condDiscretes)]...)))
-        #= UniformScaling (pure ODE) supports `_mm[i,i]` as 1; explicit Matrix
-           returns the entry. Both code paths handle by indexing the diagonal.
-           When u0 is nothing (purely-algebraic MTK problem) the loop runs 0
-           times so _nDiff stays 0 — exactly the case where FBDF is wanted. =#
-        local _nDiff = count(i -> _mm[i,i] != 0, 1:_n)
-        local _nAlg = _n - _nDiff
-        #= MTK renders subscripted unknowns as var"name[i]"(t); strip the quote
-           wrapper so names compare against the simvar-derived literals. =#
-        local _mtkName = u -> replace(replace(string(u), "var\"" => ""), "\"" => "")
-        if _nDiff == 0
-          @info "[MTK GEN: solver] zero differential states detected, switching default $(_solverName) -> FBDF for purely-algebraic DAE"
-          _solver = OMBackend.daeFallbackSolver()
-        elseif _nAlg > 0 && !isempty(_discreteUnknownNames) && $(isempty(simCode.whenEquations))
-          #= Only when the model has NO when-equation callbacks: event-driven
-             discretes are kept consistent by their callbacks and integrate fine
-             with the Rosenbrock default, while FBDF's post-event
-             re-initialization collapses dt at the first event instant. =#
-          local _unknowns = try
-            ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM)
-          catch
-            Any[]
-          end
-          local _nCheck = min(_n, length(_unknowns))
-          local _hasDiscreteAlgUnknown = any(i -> _mm[i,i] == 0 && _mtkName(_unknowns[i]) in _discreteUnknownNames, 1:_nCheck)
-          if _hasDiscreteAlgUnknown
-            @info "[MTK GEN: solver] algebraic rows involving generated discrete variables detected in mass-matrix system; switching default $(_solverName) -> FBDF"
-            _solver = OMBackend.daeFallbackSolver()
-          end
-        end
-      end
+      #= Event-trigger discretes (referenced in a when-condition) are latched by
+         DiscreteCallbacks and are not part of the brittle Rosenbrock mass-matrix
+         coupling the FBDF switch targets; excluding them keeps the default
+         Rosenbrock solver, which handles them without the FBDF tstop chatter. =#
+      local _solver = OMBackend.CodeGeneration.defaultSolverFor(solver, $(Symbol("$(MODEL_NAME)Model_problem")), LATEST_REDUCED_SYSTEM,
+                                                                $(Expr(:ref, :String, [string(varName, "(t)") for (varName, (_, simVar)) in simCode.stringToSimVarHT if simVar.varKind isa SimulationCode.DISCRETE && !(Symbol(varName) in _condDiscretes)]...)),
+                                                                $(!isempty(simCode.whenEquations)))
       # Route DAE-native solvers (e.g. Sundials.IDA, DABDF2, DFBDF) through a residual-form DAEProblem rather than the ODEProblem with mass matrix.
       OMBackend.CodeGeneration.setZCHysteresis!($(Symbol("$(MODEL_NAME)Model_problem")), $(QuoteNode(ZC_HYSTERESIS)),
                                                 get(kwargs, :reltol, 1.0e-3))
@@ -1116,6 +1075,15 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   simCode = substituteRelayAliasesInWhens(simCode, _ifEqRelay_aliases)
   local CALL_BACK_EQUATIONS = createCallbackCode(modelName, simCode; generateSaveFunction = false)
   local NAMED_STATE_LOOKUPS = namedStateLookups(CALL_BACK_EQUATIONS)
+  #= The callbacks read and write these by name in the state vector, so they
+     must survive structural_simplify: an explicit algebraic a when body reads
+     (`z = w2` with `w2 = w + 1`) became observed, and the affect failed with a
+     KeyError. =#
+  local _declared = OrderedSet{Symbol}(vcat(stateVariablesSym, algebraicVariablesSym))
+  for _n in NAMED_STATE_LOOKUPS
+    local _s = Symbol(_n)
+    _s in _declared && !(_s in irreducibleSyms) && push!(irreducibleSyms, _s)
+  end
   EQUATIONS = vcat(EQUATIONS,
                    DISCRETE_DUMMY_EQUATIONS,
                    CONDITIONAL_EQUATIONS)
@@ -2413,19 +2381,29 @@ function createIfEquation(stateVariables::Vector,
       _t0ValMap = nothing
     end
   end
+  #= Branches that define different variables (a switch with an arc:
+     i = Goff*v while quenched, v = Ron*i when closed) take the residual form,
+     the whole if-equation (pairing by variable and by position must not
+     mix); the causal one put each branch's right-hand side on the first
+     branch's variable (i = Ron*i). =#
+  local branchKeys = [Set{String}(MTK_CodeGenerationUtil._causalLhsKey(last(deCausalize(r, simCode)))
+                                  for r in b.residualEquations) for b in ifEq.branches]
+  local causal = all(r -> all(ks -> MTK_CodeGenerationUtil._causalLhsKey(last(deCausalize(r, simCode))) in ks,
+                              branchKeys), resEqs)
   for resEqIdx in 1:nResEqsInTarget
     local resEq = resEqs[resEqIdx]
     local lhsExpr = last(deCausalize(resEq, simCode))
     local lhsKey = MTK_CodeGenerationUtil._causalLhsKey(lhsExpr)
     push!(ifExpressions,
-          :($(lhsExpr) ~ $(generateIfExpressions(ifEq.branches,
-                                                 target,
-                                                 resEqIdx,
-                                                 identifier,
-                                                 simCode;
-                                                 subIdentifier = 1,
-                                                 lhsKey = lhsKey))))
-    if _t0ValMap !== nothing && !isempty(selBranch.residualEquations)
+          :($(causal ? lhsExpr : 0) ~ $(generateIfExpressions(ifEq.branches,
+                                                              target,
+                                                              resEqIdx,
+                                                              identifier,
+                                                              simCode;
+                                                              subIdentifier = 1,
+                                                              lhsKey = lhsKey,
+                                                              residualForm = !causal))))
+    if causal && _t0ValMap !== nothing && !isempty(selBranch.residualEquations)
       local gv = try
         local selEq = MTK_CodeGenerationUtil._branchResidualForLhs(selBranch, lhsKey, resEqIdx, simCode)
         MTK_CodeGenerationUtil.evalCausalRHSAtT0(
@@ -2741,11 +2719,14 @@ Base.@nospecializeinfer function _discreteAffectEqInit(discSym::Symbol, @nospeci
 end
 
 #= The discrete-cluster path (discreteClusters.jl): the whens over relations
-   of coupled discretes are evaluated by the event iteration instead of MTK
-   affects. Taken for mode FSMs (friction) and table clusters (digital
-   logic), or for every such when with OMBACKEND_DISCRETE_PRE_MEMORY (the
-   variable keeps its name from the pre-memory affects this replaced). =#
-_discreteClustersForced()::Bool = lowercase(get(ENV, "OMBACKEND_DISCRETE_PRE_MEMORY", "false")) in ("true", "1", "yes")
+   of coupled discretes are evaluated by the event iteration (MLS 8.6)
+   instead of MTK affects, which have no event iteration: a pulse's sample
+   event, the whens it enables and the algebraic re-solve then happen in one
+   event. The path for every model; OMBACKEND_DISCRETE_PRE_MEMORY=false
+   keeps the MTK affects for the models without mode FSMs, table or switch
+   clusters (the variable keeps its name from the pre-memory affects this
+   replaced). =#
+_discreteClustersForced()::Bool = lowercase(get(ENV, "OMBACKEND_DISCRETE_PRE_MEMORY", "true")) in ("true", "1", "yes")
 
 #= True if the expression contains a constant-table subscript (DAE.ASUB).
    Such clusters are Newton-hostile: equation-form affects compile to an
@@ -2886,6 +2867,46 @@ function integralDiscreteNames(discreteSyms, simCode)::Vector{String}
     integral && push!(out, name)
   end
   return out
+end
+
+"""
+    defaultSolverFor(solver, problem, reducedSystem, discreteUnknownNames, hasWhens) -> solver
+
+Switch the Rosenbrock default (Rodas5P) to FBDF for the DAE shapes where
+Rosenbrock mass-matrix stepping is brittle: purely algebraic systems, and,
+in a model without when-equations, algebraic rows of generated discrete
+variables (`discreteUnknownNames`, as `name(t)`). Brake reaches a consistent
+initial residual, but Rodas5P aborts at once with dt_epsilon/NaN while FBDF
+advances the same mass-matrix problem. With when-equations the callbacks keep
+the discretes consistent, and FBDF's post-event re-initialization collapses
+dt at the first event. A solver the user chose is kept. Runs here rather than
+in the generated module, where a model variable (`count`) shadows Base.
+"""
+function defaultSolverFor(solver, problem, reducedSystem, discreteUnknownNames::Vector{String}, hasWhens::Bool)
+  local name = string(nameof(typeof(solver)))
+  (startswith(name, "Rodas") || startswith(name, "Rosenbrock")) || return solver
+  local n = problem.u0 === nothing ? 0 : length(problem.u0)
+  local mm = problem.f.mass_matrix
+  #= UniformScaling (pure ODE) reads 1 on the diagonal. =#
+  local nDiff = count(i -> mm[i, i] != 0, 1:n)
+  if nDiff == 0
+    @info "[MTK GEN: solver] zero differential states detected, switching default $(name) -> FBDF for purely-algebraic DAE"
+    return OMBackend.daeFallbackSolver()
+  end
+  (hasWhens || nDiff == n || isempty(discreteUnknownNames)) && return solver
+  local unknowns = try
+    ModelingToolkit.unknowns(reducedSystem)
+  catch
+    Any[]
+  end
+  #= MTK renders subscripted unknowns as var"name[i]"(t); strip the quotes. =#
+  mtkName(u) = replace(string(u), "var\"" => "", "\"" => "")
+  local names = Set(discreteUnknownNames)
+  if any(i -> mm[i, i] == 0 && mtkName(unknowns[i]) in names, 1:min(n, length(unknowns)))
+    @info "[MTK GEN: solver] algebraic rows involving generated discrete variables detected in mass-matrix system; switching default $(name) -> FBDF"
+    return OMBackend.daeFallbackSolver()
+  end
+  return solver
 end
 
 """
@@ -3340,15 +3361,31 @@ function _gatherClusterAssigns(weq, simCode)
     local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
     haskey(simCode.stringToSimVarHT, leftStr) || return nothing
     local (_, var) = simCode.stringToSimVarHT[leftStr]
+    #= By the attributes, else by the type of the assigned cref or value: an
+       alias elimination can make an attribute-less variable (a gate's Logic
+       input) the member that a clock's `y = if ... then '0' else '1'` sets. =#
     local isInt = @match var.attributes begin
       SOME(DAE.VAR_ATTR_INT(__)) => true
       SOME(DAE.VAR_ATTR_ENUMERATION(__)) => true
-      _ => false
+      _ => _isIntegralValued(SimulationCode.toDAEExp(st.left)) || _isIntegralValued(SimulationCode.toDAEExp(st.right))
     end
     push!(assigns, (Symbol(string(var.name)), SimulationCode.toDAEExp(st.right), isInt))
   end
   return isempty(assigns) ? nothing : assigns
 end
+
+#= Whether an expression has an Integer or enumeration value. =#
+Base.@nospecializeinfer function _isIntegralValued(@nospecialize(e))::Bool
+  @match e begin
+    DAE.CREF(_, ty) => _isIntegralType(ty)
+    DAE.ICONST(__) => true
+    DAE.ENUM_LITERAL(__) => true
+    DAE.IFEXP(_, a, b) => _isIntegralValued(a) || _isIntegralValued(b)
+    _ => false
+  end
+end
+_isIntegralType(@nospecialize(ty))::Bool =
+  ty isa DAE.T_INTEGER || ty isa DAE.T_ENUMERATION || (ty isa DAE.T_ARRAY && _isIntegralType(ty.ty))
 
 #= Collect relations comparing `time` against a `pre()` value (a self-scheduling
    time event), recursing through OR. =#
@@ -3556,6 +3593,70 @@ function _clusterPreNames(@nospecialize(cond::DAE.Exp), assigns::Vector{Tuple{Sy
   return names
 end
 
+#= The equations as a graph for _clusterCoupled: each equation's variable
+   names (an if-equation: its conditions and all its branches' equations
+   together), the equations each name occurs in, and the names a re-solve of
+   the algebraic unknowns keeps: time, parameters and when-assigned
+   discretes. Not the variables under der(): index reduction can make one
+   algebraic (a dummy derivative), and a re-solve then moves it. =#
+struct _EquationGraph
+  names::Vector{OrderedSet{String}}
+  occurs::Dict{String, Vector{Int}}
+  fixed::Set{String}
+end
+
+function _equationGraph(simCode)::_EquationGraph
+  local names = OrderedSet{String}[]
+  for eq in simCode.residualEquations
+    local ns = OrderedSet{String}()
+    SimulationCode.collectCrefNames!(ns, eq.exp)
+    push!(names, ns)
+  end
+  for ifEq in simCode.ifEquations
+    local ns = OrderedSet{String}()
+    for b in ifEq.branches
+      SimulationCode.collectCrefNames!(ns, b.condition)
+      foreach(eq -> SimulationCode.collectCrefNames!(ns, eq.exp), b.residualEquations)
+    end
+    push!(names, ns)
+  end
+  local occurs = Dict{String, Vector{Int}}()
+  for (k, ns) in enumerate(names), n in ns
+    push!(get!(occurs, n, Int[]), k)
+  end
+  local fixed = Set{String}(["time"])
+  for (n, (_, v)) in simCode.stringToSimVarHT
+    SimulationCode.isParameter(v) && push!(fixed, n)
+  end
+  union!(fixed, _collectWhenAssignedNames(simCode))
+  return _EquationGraph(names, occurs, fixed)
+end
+
+#= Whether solving the algebraic unknowns again can change what a cluster
+   reads: a read reachable from its members through the equations over the
+   names a re-solve moves. An ideal diode's `s` in `off = s < 0` is; a
+   switched-capacitor clock's `time >= pulseStart` and a constant resistance
+   are not, and such a cluster settles without a solve of its own: the event
+   iteration solves once after the sweep (CauerLowPassSC: 11 solves per clock
+   event -> 1). =#
+function _clusterCoupled(members::Vector{String}, reads::OrderedSet{String}, g::_EquationGraph)::Bool
+  local reached = Set{String}(members)
+  local frontier = copy(members)
+  local visited = falses(length(g.names))
+  while !isempty(frontier)
+    for k in get(g.occurs, pop!(frontier), Int[])
+      visited[k] && continue
+      visited[k] = true
+      for n in g.names[k]
+        (n in g.fixed || n in reached) && continue
+        push!(reached, n)
+        push!(frontier, n)
+      end
+    end
+  end
+  return any(n -> n in reached && !(n in members), reads)
+end
+
 #= One DiscreteCluster (discreteClusters.jl) for a when on the relations
    `rels` that assigns `assigns`. Every distinct relation gets a buffer;
    `==` and `<>` (a crossing function that jumps between -0.5 and 0.5) and
@@ -3563,7 +3664,8 @@ end
    lifted from discrete equations holds at every pass of an event (its
    equations do); another fires when its condition does. =#
 function _discreteClusterSpec(@nospecialize(cond), rels::Vector{DAE.Exp},
-                              assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode, table::Bool)::Expr
+                              assigns::Vector{Tuple{Symbol,Any,Bool}}, simCode, table::Bool,
+                              graph::_EquationGraph)::Expr
   local condDAE = cond isa SimulationCode.Exp ? SimulationCode.toDAEExp(cond) : cond
   local buffered = DAE.Exp[]
   for r in rels
@@ -3604,10 +3706,14 @@ function _discreteClusterSpec(@nospecialize(cond), rels::Vector{DAE.Exp},
   local strict = Bool[r.operator isa DAE.LESS || r.operator isa DAE.GREATER for r in buffered]
   local exact = Bool[_relationZeroSet(r) === nothing || _withoutContinuousOperand(r, simCode) for r in buffered]
   local atStart = !_condHasInitial(condDAE) ? 0 : (table ? 2 : 1)
-  return :(OMBackend.CodeGeneration.DiscreteCluster($(String[string(d) for (d, _, _) in assigns]),
+  local memberNames = String[string(d) for (d, _, _) in assigns]
+  local readNames = OrderedSet{String}(string(o) for o in operands)
+  foreach(r -> SimulationCode.collectCrefNames!(readNames, r), buffered)
+  local coupled = _clusterCoupled(memberNames, readNames, graph)
+  return :(OMBackend.CodeGeneration.DiscreteCluster($(memberNames),
                                                    Any[$([d for (d, _, _) in assigns]...)],
                                                    Any[$(reads...)], $(length(operands)), $(length(preNames)),
-                                                   $(strict), $(exact), $(body), $(atStart), $(table)))
+                                                   $(strict), $(exact), $(body), $(atStart), $(table), $(coupled)))
 end
 
 """
@@ -3622,6 +3728,7 @@ function emitDiscreteClusters(simCode)::Expr
   local table = _modelHasTableClusters(simCode)
   local specs = Expr[]
   local relationOf = _condVarRelations(simCode)
+  local graph = nothing
   for weq in simCode.whenEquations
     local rels = _extractChangeRelations(weq.whenEquation.condition, simCode)
     rels === nothing && continue
@@ -3630,7 +3737,8 @@ function emitDiscreteClusters(simCode)::Expr
     if _isSynthesizedChangeCondition(weq.whenEquation.condition)
       (rels, assigns) = _inlineReadBooleanRelations(rels, assigns, relationOf, simCode)
     end
-    push!(specs, _discreteClusterSpec(weq.whenEquation.condition, rels, assigns, simCode, table))
+    graph === nothing && (graph = _equationGraph(simCode))
+    push!(specs, _discreteClusterSpec(weq.whenEquation.condition, rels, assigns, simCode, table, graph))
   end
   isempty(specs) && return Expr(:block)
   #= In the latest world, like the event list: the symbolic variables are

@@ -92,10 +92,12 @@ end
   generateSaveFunction to false.
 """
 function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = true) where {N, S}
-  #= Synthesised discrete-Boolean whens (`change(rel)` conditions) are emitted as
-     MTK SymbolicContinuousCallbacks (createDiscreteBoolWhenEvents); exclude them
-     here so they are not also built into the legacy CallbackSet (which cannot
-     read MTK observed variables). =#
+  #= Synthesised discrete-Boolean whens (`change(rel)` conditions) are discrete
+     clusters of the event iteration (emitDiscreteClusters) or, with
+     OMBACKEND_DISCRETE_PRE_MEMORY=false, MTK SymbolicContinuousCallbacks
+     (createDiscreteBoolWhenEvents); exclude them here so they are not also
+     built into the legacy CallbackSet (which cannot read MTK observed
+     variables). =#
   local _legacyWhens = filter(w -> _extractChangeRelations(w.whenEquation.condition, simCode) === nothing &&
                                    isempty(_selfSchedulingTimeRels(w.whenEquation.condition)),
                               simCode.whenEquations)
@@ -459,7 +461,9 @@ end
 function _emitElsewhenThresholdTimeWhen(elseArm, simCode, ewRefSym::Symbol, thrDAE)
   ADD_CALLBACK()
   local callbacks = COUNT_CALLBACKS()
-  local whenStmts = createWhenStatementsMTK(_elsewhenStmtLst(elseArm), simCode)
+  local whenStmts = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+    createWhenStatementsMTK(_elsewhenStmtLst(elseArm), simCode)
+  end
   local thrCrefs = listArray(Util.getAllCrefs(thrDAE))
   local affBindCrefs = vcat(map(x -> getRHSVariables(x), _elsewhenStmtLst(elseArm))..., thrCrefs)
   quote
@@ -484,7 +488,7 @@ function _emitElsewhenThresholdTimeWhen(elseArm, simCode, ewRefSym::Symbol, thrD
         t >= _thr && _thr != $(ewRefSym)[]
       end
       global $(Symbol("affect$(callbacks)!"))
-      $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+      $(Symbol("affect$(callbacks)!")) = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = copy(integrator.u)) -> begin
         local t = integrator.t
         local x = integrator.u
         @debug "[CB-EW$($(callbacks)) affect] firing" t=integrator.t
@@ -649,8 +653,13 @@ end
 function _collectDiscreteBoolWhenRefresh(writtenLHS::OrderedSet{String}, simCode)
   local refreshCrefs = Any[]
   local refreshStmts = Expr[]
+  #= A discrete cluster needs none: the event iteration after the step sees
+     its relation on the written discrete flip (exact, no hysteresis) and
+     re-solves the cluster with the algebraic unknowns. =#
+  local clusters = _usesDiscreteClusters(simCode)
   for weq in simCode.whenEquations
     _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
+    clusters && _gatherClusterAssigns(weq, simCode) !== nothing && continue
     local condDAE = SimulationCode.toDAEExp(weq.whenEquation.condition)
     local condCrefs = listArray(Util.getAllCrefs(condDAE))
     any(c -> string(c) in writtenLHS, condCrefs) || continue
@@ -1101,7 +1110,12 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
        The hardcoded x[N] indices from expToJuliaExp become invalid after
        MTK structural_simplify reorders unknowns. Mirror the continuous
        callback path (above) which uses getStatesAsSymbols + lookuptable. =#
-    whenStatementsMTKDiscrete = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    #= pre(v) from a snapshot: the event iteration passes the state before its
+       sweep (the algebraic unknowns are solved again before the discrete whens
+       run, and `iAtOpen = pre(i)` read the current i). =#
+    whenStatementsMTKDiscrete = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+      createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    end
     #= An elsewhen arm `time >= thr` with a runtime-discrete threshold is a
        scheduled time event: the parent affect (which assigns the threshold)
        adds a tstop at it, and the arm itself is emitted as an edge-guarded
@@ -1247,7 +1261,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
             end)
         end
         global $(Symbol("affect$(callbacks)!"))
-        $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+        $(Symbol("affect$(callbacks)!")) = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = copy(integrator.u)) -> begin
           local t = integrator.t
           local x = integrator.u
           @debug "[CB-DC$($(callbacks)) affect] firing" t=integrator.t

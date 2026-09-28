@@ -274,7 +274,7 @@ runs it, after the whens on a relation; otherwise its DiscreteCallback does.
 """
 struct DiscreteWhenAffect{C, A, I}
   condition::C               # (u, t, integrator) -> Bool
-  affect!::A                 # integrator -> nothing
+  affect!::A                 # (integrator[, pre]) -> nothing; pre(v) read from `pre` (default: u on entry)
   initialize!::I             # (u, t, integrator) -> nothing: its state (an edge latch) at the start
 end
 
@@ -338,21 +338,65 @@ function _sweep!(e::EventIteration, integrator)
   for c in e.clusters
     _update!(c, integrator) && (changed = true)
   end
-  #= 2. The bodies, with pre() from the state before them. =#
+  #= 2. The bodies, with pre() from the state before them. A relation when's
+     discretes, or a cluster that no re-solve moves (`coupled` false, a pulse
+     switching a circuit), can move the algebraic unknowns: they are solved
+     again before a coupled cluster or a discrete when reads them in this
+     sweep. =#
   local pre = copy(integrator.u)
   local clusterPre = [_preValues(c, _readValues(c, integrator)) for c in e.clusters]
+  local stale = false
   for a in e.relationWhens
-    _whenFire!(a, integrator, pre) && (changed = true)
+    _whenFire!(a, integrator, pre) && (changed = true; stale = true)
   end
   for (i, c) in enumerate(e.clusters)
-    _solveMixedSystem!(c, integrator, clusterPre[i], relPre[i], e.reinit) && (changed = true)
+    c.coupled && stale && (_staleResolve!(integrator, e.reinit); stale = false)
+    _solveMixedSystem!(c, integrator, clusterPre[i], relPre[i], e.reinit) || continue
+    changed = true
+    c.coupled || (stale = true)
   end
+  stale && !isempty(e.discreteWhens) && _staleResolve!(integrator, e.reinit)
   for d in e.discreteWhens
     _holds(d, integrator) || continue
-    d.affect!(integrator)
+    d.affect!(integrator, pre)
     changed = true
   end
   return changed
+end
+
+#= The algebraic unknowns solved again within a sweep, for the bodies that
+   read them next. A failure is not the event's (phase 3 solves again): the
+   return code is put back, or its InitialFailure made every later solve
+   report failure. =#
+function _staleResolve!(integrator, reinit)
+  local retcode = integrator.sol.retcode
+  _resolveAlgebraics!(integrator, reinit) || _restoreRetcode!(integrator, retcode)
+  return nothing
+end
+
+#= After an event that changed the equations, the next step starts small, as
+   after a when: the derivatives can jump by orders of magnitude (an ideal
+   switch opening onto an inductor), and a step sized before the event
+   crossed the fast transient at once, its interpolation far off inside it
+   (SwitchWithArc: -4.5 A for 0.0005 A). Without algebraic rows,
+   OrdinaryDiffEq's estimate (auto_dt_reset!); with them its estimate is a
+   fixed 1e-6 s, so 1e-6 of the time span instead (as its DAE problems
+   start), if smaller than the current step. Not for a DAE problem: DFBDF
+   restarted from a smaller step ended in NaN (DAEIfReinit). =#
+_restartStepSize!(integrator) = nothing
+function _restartStepSize!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator)
+  local prob = integrator.sol.prob
+  prob isa ModelingToolkit.SciMLBase.AbstractODEProblem || return nothing
+  local mm = integrator.f.mass_matrix
+  if mm isa LinearAlgebra.UniformScaling || all(!iszero, LinearAlgebra.diag(mm))
+    ModelingToolkit.SciMLBase.auto_dt_reset!(integrator)
+    return nothing
+  end
+  local span = abs(prob.tspan[2] - prob.tspan[1])
+  local dt = min(abs(integrator.dt), 1.0e-6 * (isfinite(span) ? span : 1.0))
+  integrator.dt = integrator.tdir * dt
+  integrator.dtpropose = integrator.dt
+  return nothing
 end
 
 function _iterate!(e::EventIteration, integrator)
@@ -362,8 +406,11 @@ function _iterate!(e::EventIteration, integrator)
     foreach(c -> fill!(c.crossed, false), e.clusters)
     return nothing
   end
-  for _ in 1:e.limit
-    _sweep!(e, integrator) || return nothing
+  for n in 1:e.limit
+    if !_sweep!(e, integrator)
+      n > 1 && _restartStepSize!(integrator)
+      return nothing
+    end
     #= Phase 3: the branches or the state changed; the algebraic unknowns follow. =#
     if !_resolveAlgebraics!(integrator, e.reinit)
       @error "[events] the algebraic variables could not be solved after the event at t = $(integrator.t)"

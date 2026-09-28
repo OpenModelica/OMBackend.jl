@@ -67,11 +67,11 @@ function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode; cachedChange::
       :($opSym($lhs, $rhs))
     end
     DAE.LBINARY(exp1 = e1, operator = DAE.AND(__), exp2 = e2) =>
-      :($(expToJuliaBoolMTK(e1, simCode; cachedChange = cachedChange)) && $(expToJuliaBoolMTK(e2, simCode; cachedChange = cachedChange)))
+      :($(_boolOperandMTK(e1, simCode, cachedChange)) && $(_boolOperandMTK(e2, simCode, cachedChange)))
     DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) =>
-      :($(expToJuliaBoolMTK(e1, simCode; cachedChange = cachedChange)) || $(expToJuliaBoolMTK(e2, simCode; cachedChange = cachedChange)))
+      :($(_boolOperandMTK(e1, simCode, cachedChange)) || $(_boolOperandMTK(e2, simCode, cachedChange)))
     DAE.LUNARY(operator = DAE.NOT(__), exp = e1) =>
-      :(!($(expToJuliaBoolMTK(e1, simCode; cachedChange = cachedChange))))
+      :(!($(_boolOperandMTK(e1, simCode, cachedChange))))
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
@@ -119,6 +119,16 @@ function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode; cachedChange::
     DAE.CALL(Absyn.IDENT("terminal"), _, _) => :(false)
     _ => expToJuliaExpMTK(cond, simCode)
   end
+end
+
+#= An operand of not/and/or: a Boolean variable (or its pre()) is stored as a
+   Float64 (0.0/1.0) in the state vector, and `!active` threw a MethodError
+   (`when not active`, the StateGraph steps). =#
+function _boolOperandMTK(@nospecialize(e::DAE.Exp), simCode, cachedChange::Bool)
+  local x = expToJuliaBoolMTK(e, simCode; cachedChange = cachedChange)
+  local isBool = e isa DAE.RELATION || e isa DAE.LBINARY || e isa DAE.LUNARY || e isa DAE.BCONST ||
+                 (e isa DAE.CALL && string(e.path) in ("change", "edge", "initial", "terminal"))
+  return isBool ? x : :($x != 0)
 end
 
 #= Compile-time helper: emit the Julia expression that reads the previous
@@ -300,8 +310,9 @@ function transformToMTKContinuousConditionEquation(cond, simCode)
 end
 
 
-#= The argument of a when body the event iteration runs (codeGen.jl
-   `_emitRelationWhen`): the state before the current sweep, indexed by
+#= The argument of a when body the event iteration runs (codeGen.jl: the
+   relation whens of `_emitRelationWhen`, and the discrete-when and
+   elsewhen-arm affects): the state before the current sweep, indexed by
    `lookuptableStates`. =#
 const PRE_SNAPSHOT = :__prevals
 
@@ -2910,13 +2921,19 @@ function generateIfExpressions(branches,
                                identifier::Int,
                                simCode;
                                subIdentifier::Int = 1,
-                               lhsKey::Union{String, Nothing} = nothing)
+                               lhsKey::Union{String, Nothing} = nothing,
+                               residualForm::Bool = false)
   local branch = branches[target]
-  local selEq = lhsKey === nothing ? branch.residualEquations[resEqIdx] :
+  local selEq = (lhsKey === nothing || residualForm) ?
+                branch.residualEquations[min(resEqIdx, length(branch.residualEquations))] :
                 _branchResidualForLhs(branch, lhsKey, resEqIdx, simCode)
+  #= The branch's value: its right-hand side (causal form), or its residual
+     when the branches define different variables. =#
+  local value = _guardNonIntegerPowerBasesForEagerBranch(
+    residualForm ? expToJuliaExpMTK(SimulationCode.toDAEExp(selEq.exp), simCode) :
+                   first(deCausalize(selEq, simCode)))
   if branch.targets == -1
-    return :($(_guardNonIntegerPowerBasesForEagerBranch(
-      first(deCausalize(selEq, simCode)))))
+    return :($(value))
   end
   #= When every branch condition is discrete/parameter (e.g. an event-held Boolean),
      gate directly on the condition value: its own update event localises the step,
@@ -2931,18 +2948,17 @@ function generateIfExpressions(branches,
        never perturbs them during Jacobian computation. Exact comparison is safe. =#
     :( $(Symbol(string("ifCond", identifier, subIdentifier))) == 1 )
   end
-  local rhs = _guardNonIntegerPowerBasesForEagerBranch(
-    first(deCausalize(selEq, simCode)))
   quote
     ModelingToolkit.ifelse($(cond),
-                           $(rhs),
+                           $(value),
                            $(generateIfExpressions(branches,
                                                    branches[target].targets,
                                                    resEqIdx,
                                                    identifier,
                                                    simCode;
                                                    subIdentifier = subIdentifier + 1,
-                                                   lhsKey = lhsKey)))
+                                                   lhsKey = lhsKey,
+                                                   residualForm = residualForm)))
   end
 end
 

@@ -4027,8 +4027,16 @@ function propagateConstants(simCode::SIM_CODE)
      unknown without the equation would unbalance the system. =#
   local elimVarNames = String[]
   local keptElimEqs = RESIDUAL_EQUATION[]
+  #= A kept unknown's equation goes back with the other substitutions only:
+     with its own as well, `y - u` (y and u bound to R) reads `R - R` and no
+     longer defines u. =#
+  local keptMap = isempty(survivingRefs) ? constMap : filter(kv -> !(first(kv) in survivingRefs), constMap)
   for (varName, origEq, subEq) in elimPairs
-    if varName in survivingRefs || !haskey(newHT, varName)
+    if varName in survivingRefs
+      local (keptExp, _) = traverseExpTopDown(origEq.exp, substituteAliasCref, keptMap)
+      push!(newResEqs, typeof(origEq)(keptExp, origEq.source, origEq.attr))
+      continue
+    elseif !haskey(newHT, varName)
       push!(newResEqs, subEq)
       continue
     end
