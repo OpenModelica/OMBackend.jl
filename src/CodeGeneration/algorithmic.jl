@@ -645,7 +645,8 @@ end
 Scalarise a record-typed assignment onto its flattened `<base>_<field>` symbols
 (the naming `flattenRecordInput` uses), or return `nothing` when `lhsExp` is not a
 plain record cref. A record copy `lhs := rhs` becomes per-field assignments; a
-record-valued call `lhs := f(args...)` scatters the flat-tuple return.
+record-valued call `lhs := f(args...)`, a record literal and an if-expression choosing
+between records scatter their field tuple (a one-field record is its field).
 """
 function _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp)::Union{Nothing, Expr}
   local lhs = _recordCrefFields(lhsExp)
@@ -656,11 +657,52 @@ function _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp)::Union{Nothing, Exp
   if rhsBase !== nothing
     return Expr(:block,
       Expr[:($(_flatFieldSymbol(lhsBase, f)) = $(_flatFieldSymbol(rhsBase, f))) for f in fieldNames]...)
-  elseif _isFunctionCall(rhsExp)
-    local targets = Expr(:tuple, [_flatFieldSymbol(lhsBase, f) for f in fieldNames]...)
-    return Expr(:(=), targets, expToJuliaExpAlg(rhsExp))
+  elseif _isFunctionCall(rhsExp) ||
+         ((rhsExp isa DAE.IFEXP || rhsExp isa DAE.RECORD) && _hasNoRecordFields(lhsExp.ty))
+    #= A record literal, or an if-expression choosing between records, evaluates to the
+       fields as a tuple too (MSL MixtureGasNasa setState_pTX: `state := if ... then
+       ThermodynamicState(...) else ...` went to an unused local, and the fields stayed 0). =#
+    local targets = [_flatFieldSymbol(lhsBase, f) for f in fieldNames]
+    local rhs = _recordTupleExpr(rhsExp)
+    return length(targets) == 1 ? Expr(:(=), targets[1], rhs) : Expr(:(=), Expr(:tuple, targets...), rhs)
   end
   return nothing
+end
+
+#= A record value as its field tuple: a record variable's flattened fields (it has no
+   tuple of its own), an if-expression's branches each so, anything else as it lowers. =#
+function _recordTupleExpr(@nospecialize(exp::DAE.Exp))
+  local rec = _recordCrefFields(exp)
+  rec === nothing || return Expr(:tuple, [_flatFieldSymbol(rec[1], f) for f in rec[2]]...)
+  if exp isa DAE.IFEXP
+    return :(if $(expToJuliaExpAlg(exp.expCond)) != 0
+               $(_recordTupleExpr(exp.expThen))
+             else
+               $(_recordTupleExpr(exp.expElse))
+             end)
+  end
+  return expToJuliaExpAlg(exp)
+end
+
+#= The types of a record type's fields, in declaration order; empty for another type. =#
+function _recordFieldTypes(@nospecialize(ty::DAE.Type))::Vector{DAE.Type}
+  local types = DAE.Type[]
+  @match ty begin
+    DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _) => begin
+      for field in varLst
+        push!(types, field.ty)
+      end
+    end
+    _ => nothing
+  end
+  return types
+end
+
+#= Whether no field of record type `ty` is a record: its value's tuple is then field for
+   field (a nested record's fields are flattened in its place). =#
+function _hasNoRecordFields(@nospecialize(ty::DAE.Type))::Bool
+  local types = _recordFieldTypes(ty)
+  return !isempty(types) && all(t -> isempty(_recordFieldNames(t)), types)
 end
 
 """
@@ -751,15 +793,7 @@ end
 function _positionalFieldIndex(@nospecialize(exp::DAE.Exp), ix::Integer)::Int
   local ty = _recordValueType(exp)
   ty === nothing && return -1
-  local fieldTypes = DAE.Type[]
-  @match ty begin
-    DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _) => begin
-      for field in varLst
-        push!(fieldTypes, field.ty)
-      end
-    end
-    _ => nothing
-  end
+  local fieldTypes = _recordFieldTypes(ty)
   1 <= ix <= length(fieldTypes) || return -1
   any(k -> !isempty(_recordFieldNames(fieldTypes[k])), 1:ix) && return -1
   return ix
