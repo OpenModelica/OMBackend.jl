@@ -371,7 +371,8 @@ emitDirectRHSProblem() = :(
   problem = OMBackend.CodeGeneration.buildDirectRHSProblem(
     reducedSystem, finalInitialValues, pars, tspan, callbacks;
     allInitialValues = initialValues,
-    liftedDiscretes = (@isdefined(LIFTED_DISCRETES) ? LIFTED_DISCRETES : String[]))
+    liftedDiscretes = (@isdefined(LIFTED_DISCRETES) ? LIFTED_DISCRETES : String[]),
+    freeParameters = (@isdefined(FREE_PARAMETERS) ? FREE_PARAMETERS : String[]))
 )
 
 """
@@ -1135,6 +1136,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     #= The discretes of the discrete clusters (the direct-RHS initialization
        leaves them to the clusters' start bodies). =#
     $(liftedDiscretesDecl(simCode))
+    #= The parameters the initialization computes (fixed = false, no binding). =#
+    $(freeParametersDecl(simCode))
     #= Variable constructor function definitions at module level (outside model function)
        to avoid JIT overhead from compiling nested closures.
        Variable constructors only return symbol tuples, so they have no scope dependencies. =#
@@ -3298,6 +3301,25 @@ function liftedDiscretesDecl(simCode)::Expr
   end
   isempty(names) && return Expr(:block)
   return :(LIFTED_DISCRETES = $(names))
+end
+
+#= Module-level list of the Real parameters without a value that the
+   initialization computes (fixed = false, no binding; the MSL
+   InitSpringConstant's spring.c): the direct-RHS initialization solves them
+   next to the states. Names are the MTK parameters' (simVar.name, as in
+   createParameterEquationsMTK). Empty when there are none. =#
+function freeParametersDecl(simCode)::Expr
+  local names = String[]
+  for (_, (_, sv)) in simCode.stringToSimVarHT
+    (SimulationCode.isParameter(sv) && !SimulationCode.hasBindingExp(sv)) || continue
+    local free = @match sv.attributes begin
+      SOME(DAE.VAR_ATTR_REAL(fixed = SOME(DAE.BCONST(false)))) => true
+      _ => false
+    end
+    free && push!(names, string(sv.name))
+  end
+  isempty(names) && return Expr(:block)
+  return :(FREE_PARAMETERS = $(sort!(unique!(names))))
 end
 
 #= Whether the model takes the discrete-cluster path, shared by every site

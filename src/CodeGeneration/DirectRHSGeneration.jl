@@ -105,7 +105,8 @@ const DAE_REINIT = IdDict{Any, Function}()
 
 function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
                                allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
-                               liftedDiscretes=String[])
+                               liftedDiscretes=String[],
+                               freeParameters=String[])
   local states = ModelingToolkit.unknowns(reducedSystem)
   local params = ModelingToolkit.parameters(reducedSystem)
   # Use full_equations to inline observed variable definitions.
@@ -160,6 +161,40 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   #    Resolve parameter values first so _buildStateVector can substitute
   #    symbolic parameter references in initial conditions.
   local resolvedParams = _resolveParamValues(pars)
+  #= Parameters an initialization equation defines (fixed = false): assigned
+     from u at the initial state (in the DAE init solve, at each evaluation).
+     A row may read another assigned parameter: evaluating again settles a
+     chain. =#
+  local paramAssign = _initialParameterAssignments(reducedSystem, states, params, iv)
+  local assignedNames = paramAssign === nothing ? OrderedSet{String}() :
+    OrderedSet{String}(string(params[k]) for k in last(paramAssign))
+  #= Real parameters without a value that no initialization equation assigns
+     (FREE_PARAMETERS: fixed = false; the MSL InitSpringConstant's spring.c,
+     which a fixed rev.a = 0 determines): unknowns of the DAE init solve. =#
+  local freeIdx = Int[k for (k, p) in enumerate(params)
+                      if string(p) in freeParameters && !(string(p) in assignedNames)]
+  #= Parameters bound to an assigned or free one (spring.spring.c = spring.c)
+     follow it; _buildParamVector resolved them from its start value. =#
+  local dependents = _parameterDependents(pars, params,
+                                          union(assignedNames, OrderedSet{String}(string(params[k]) for k in freeIdx));
+                                          resolvedParams=resolvedParams)
+  isempty(setdiff(freeParameters, string.(params))) ||
+    @debug "DirectRHS: free parameters not among the system's: $(setdiff(freeParameters, string.(params)))"
+  local unknownParamNames = union(assignedNames, OrderedSet{String}(string(params[k]) for k in freeIdx),
+                                  dependents === nothing ? OrderedSet{String}() : dependents[3])
+  local follow! = dependents === nothing ? nothing : let (dF, dIdxs) = dependents
+    pv -> begin
+      local vals = dF(pv)
+      for (i, k) in enumerate(dIdxs)
+        pv[k] = Float64(vals[i])
+      end
+      nothing
+    end
+  end
+  #= The initialization constraints read those as unknowns, not as the values
+     resolved from their start values: `x = k` must hold for the solved k. =#
+  local initResolved = isempty(unknownParamNames) ? resolvedParams :
+    Dict{String, Float64}(k => v for (k, v) in resolvedParams if !(k in unknownParamNames))
   # Extract guesses from the reduced system. These are properly mapped to
   # post-simplification unknowns and provide Modelica start values for variables
   # that splitInitialValues could not map (pre-simplification names do not match).
@@ -169,7 +204,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     Dict()
   end
   local (hardInitialValues, initEqPinKeys) = _collectHardInitializationValues(
-    reducedSystem, finalInitialValues; resolvedParams=resolvedParams)
+    reducedSystem, finalInitialValues; resolvedParams=initResolved)
   local observedEquations = try
     ModelingToolkit.observed(reducedSystem)
   catch
@@ -180,13 +215,6 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                 hardInitialValues=hardInitialValues,
                                 observedEquations=observedEquations)
   local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
-  #= Parameters an initialization equation defines (fixed = false): assigned
-     from u at the initial state (in the DAE init solve, at each evaluation).
-     A row may read another assigned parameter: evaluating again settles a
-     chain. =#
-  local paramAssign = _initialParameterAssignments(reducedSystem, states, params, iv)
-  local assignedNames = paramAssign === nothing ? OrderedSet{String}() :
-    OrderedSet{String}(string(params[k]) for k in last(paramAssign))
   local assignParams! = paramAssign === nothing ? nothing : let (pF, pIdxs) = paramAssign
     (pv, u, t) -> begin
       for _ in 1:length(pIdxs)
@@ -197,6 +225,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
           changed |= !isequal(pv[k], v)
           pv[k] = v
         end
+        follow! === nothing || follow!(pv)
         changed || break
       end
       nothing
@@ -230,7 +259,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   #    names from integrator.f.sys (used by getStatesAsSymbols/getParametersAsSymbols).
   local massMatrix = ModelingToolkit.calculate_massmatrix(reducedSystem)
   local problem
-  if massMatrix isa LinearAlgebra.UniformScaling
+  #= A pure ODE with free parameters needs the init solve too: M = I. =#
+  if massMatrix isa LinearAlgebra.UniformScaling && isempty(freeIdx)
     @debug "DirectRHS: pure ODE (identity mass matrix)"
     local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
                                       sys=reducedSystem, jacFunc=jacFunc, jacProto=jacProto)
@@ -243,7 +273,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   else
     @debug "DirectRHS: DAE with mass matrix"
-    local mm = collect(massMatrix)
+    local mm = massMatrix isa LinearAlgebra.UniformScaling ?
+      Matrix{Float64}(LinearAlgebra.I, nStates, nStates) : collect(massMatrix)
     #= A sparse Jacobian prototype needs a sparse mass matrix, otherwise the
        solver's W = M - gamma*J assembly densifies or mismatches. =#
     local mmForF = jacFunc === nothing ? mm : Symbolics.SparseArrays.sparse(mm)
@@ -277,7 +308,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local discretePinnedIdx = Int[i for (i, st) in enumerate(states)
                                   if isDiscreteKey(string(st)) && string(st) in initEqPinKeys]
     local derivativeInitTargets = _derivativeInitializationTargets(
-      reducedSystem, states; resolvedParams=resolvedParams)
+      reducedSystem, states; resolvedParams=initResolved)
     local eqLabels = try
       ModelingToolkit.equations(reducedSystem)
     catch
@@ -288,7 +319,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        guesses; a throwing or non-finite evaluator must not poison Newton. =#
     local symInit = _symbolicInitializationResiduals(reducedSystem, states, params,
                                                      ModelingToolkit.get_iv(reducedSystem), mm;
-                                                     resolvedParams=resolvedParams,
+                                                     resolvedParams=initResolved,
                                                      excludeNames=union(discreteNames, assignedNames))
     local extraResiduals = nothing
     #= The residual rows for parameter values `pv` (a re-initialization for
@@ -331,7 +362,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
         @debug "DirectRHS: symbolic initialization residuals failed probe, skipping"
       end
     end
-    u0 = _solveDAEInitialization!(u0, initRhs, p_vec, mm;
+    u0 = _solveDAEInitializationFree!(u0, initRhs, p_vec, mm, freeIdx, follow!;
                                   pinned=pinnedIdx,
                                   derivative_targets=derivativeInitTargets,
                                   eqLabels=eqLabels,
@@ -347,7 +378,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local useExtra = extraResiduals !== nothing
     local u0Solved = copy(u0)
     DAE_REINIT[rhsFunc] = pv -> begin
-      local u = _solveDAEInitialization!(copy(u0Solved), initRhs, pv, mm;
+      local u = _solveDAEInitializationFree!(copy(u0Solved), initRhs, pv, mm, freeIdx, follow!;
                                          pinned=pinnedIdx,
                                          derivative_targets=derivativeInitTargets,
                                          eqLabels=eqLabels,
@@ -589,6 +620,124 @@ function _initialParameterAssignments(reducedSystem, states, params, iv)
   return (pFunc, pIdxs[keep])
 end
 
+
+#= Parameters whose binding reads `roots` (directly or through other such
+   parameters): `spring.spring.c = spring.c` for the free spring.c of the MSL
+   InitSpringConstant. _buildParamVector resolved them from the roots' start
+   values; a root the initialization changes must carry them along. Returns
+   `(depFunc, depIdxs, depNames)` with `depFunc(p)` the values of `p[depIdxs]`
+   from the roots in `p` and `depNames` every dependent (in `params` or not),
+   or nothing. A dependent that still reads a name outside `params` after
+   substitution is left out. =#
+function _parameterDependents(pars, params, roots::AbstractSet{String};
+                              resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
+  isempty(roots) && return nothing
+  local valByName = OrderedDict{String, Any}()
+  for (k, v) in pars
+    valByName[string(k)] = v isa Symbolics.Num ? Symbolics.unwrap(v) : v
+  end
+  local reads = Dict{String, Vector{String}}(
+    name => (v isa Number ? String[] : String[string(x) for x in Symbolics.get_variables(v)])
+    for (name, v) in valByName)
+  local deps = OrderedSet{String}()
+  local grew = true
+  while grew
+    grew = false
+    for name in keys(valByName)
+      (name in deps || name in roots) && continue
+      any(x -> x in roots || x in deps, reads[name]) || continue
+      push!(deps, name)
+      grew = true
+    end
+  end
+  isempty(deps) && return nothing
+  local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
+  #= Each dependent in terms of the roots and the parameters that stay: other
+     dependents substituted by their bindings (bounded, bindings are acyclic),
+     names outside `params` by their resolved values. =#
+  local byVar = Dict{Any, Any}()
+  for (k, v) in pars
+    local nm = string(k)
+    local uk = k isa Symbolics.Num ? Symbolics.unwrap(k) : k
+    if nm in deps
+      byVar[uk] = valByName[nm]
+    elseif !haskey(paramIdx, nm) && resolvedParams !== nothing && haskey(resolvedParams, nm)
+      byVar[uk] = resolvedParams[nm]
+    end
+  end
+  local depIdxs = Int[]
+  local exprs = Any[]
+  for d in deps
+    local k = get(paramIdx, d, 0)
+    k == 0 && continue
+    local ex = valByName[d]
+    for _ in 1:(length(deps) + 1)
+      local next = Symbolics.substitute(ex, byVar)
+      isequal(next, ex) && break
+      ex = next
+    end
+    if !all(v -> haskey(paramIdx, string(v)), Symbolics.get_variables(ex))
+      @debug "DirectRHS: dependent parameter $(d) reads a name outside the parameters; left at its value"
+      continue
+    end
+    push!(depIdxs, k)
+    push!(exprs, ex)
+  end
+  isempty(depIdxs) && return nothing
+  local depFunc = try
+    local fExpr = Symbolics.build_function(exprs, params; expression = Val{true})
+    local fn = _exprToRTGFunction(fExpr[1])
+    #= Probed once: a failing binding must not break every init evaluation. =#
+    fn(ones(length(params)))
+    fn
+  catch e
+    @debug "DirectRHS: could not build the dependent parameters" exception = e
+    return nothing
+  end
+  return (depFunc, depIdxs, deps)
+end
+
+#= The DAE init solve with the free parameters p[freeIdx] as unknowns: they
+   are appended to u as algebraic unknowns (zero mass-matrix rows whose
+   residuals are identically zero), so each phase may move them like a free
+   algebraic variable; `follow!(p)` updates the parameters bound to them.
+   Returns the states; p[freeIdx] keeps the solved values. =#
+function _solveDAEInitializationFree!(u0, rhs, pv, mm, freeIdx::Vector{Int}, follow!;
+                                      extra_residuals=nothing, kwargs...)
+  isempty(freeIdx) && return _solveDAEInitialization!(u0, rhs, pv, mm; extra_residuals=extra_residuals, kwargs...)
+  local n = length(u0)
+  local nq = length(freeIdx)
+  local setFree! = (p, u) -> begin
+    for (j, k) in enumerate(freeIdx)
+      p[k] = u[n + j]
+    end
+    follow! === nothing || follow!(p)
+    nothing
+  end
+  #= Copies, not views: the generated functions would compile again for
+     SubArray arguments. =#
+  local uN = similar(u0)
+  local duN = similar(u0)
+  local rhsExt = (du, u, p, t) -> begin
+    setFree!(p, u)
+    copyto!(uN, 1, u, 1, n)
+    rhs(duN, uN, p, t)
+    copyto!(du, 1, duN, 1, n)
+    fill!(view(du, (n + 1):(n + nq)), 0.0)
+    nothing
+  end
+  local extraExt = extra_residuals === nothing ? nothing : (du, u) -> begin
+    copyto!(uN, 1, u, 1, n)
+    copyto!(duN, 1, du, 1, n)
+    extra_residuals(duN, uN)
+  end
+  local mmExt = zeros(eltype(mm), n + nq, n + nq)
+  mmExt[1:n, 1:n] .= mm
+  local uExt = _solveDAEInitialization!(vcat(u0, pv[freeIdx]), rhsExt, pv, mmExt;
+                                        extra_residuals=extraExt, kwargs...)
+  setFree!(pv, uExt)
+  return uExt[1:n]
+end
 
 """
     _buildRHSExpression(rhs_list, states, params, iv)
