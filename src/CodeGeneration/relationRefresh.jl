@@ -399,8 +399,27 @@ function _restartStepSize!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEInte
   return nothing
 end
 
-function _iterate!(e::EventIteration, integrator)
-  if _continuousEventFired(integrator) && !_resolveAlgebraics!(integrator, e.reinit)
+#= An affect after which the event iteration runs: a table or time when
+   (PresetTimeCallback) sets a discrete that the clusters read, and nothing
+   else makes the iteration run at that instant (a JK flip-flop's K from a
+   table at t = 22 reached the latches only at the next clock edge, 25). The
+   iteration comes last in the callback set, so it runs in the same step. =#
+struct _PendingAffect{A}
+  affect!::A
+  pending::Base.RefValue{Bool}
+end
+
+(a::_PendingAffect)(integrator) = (a.affect!(integrator); a.pending[] = true; nothing)
+
+_markingPending(cb::DiffEqBase.DiscreteCallback, pending::Base.RefValue{Bool}) =
+  DiffEqBase.DiscreteCallback(cb.condition, _PendingAffect(cb.affect!, pending), cb.initialize, cb.finalize,
+                              cb.save_positions, cb.initializealg, cb.saved_clock_partitions,
+                              cb.initialize_save_discretes)
+
+#= `resolve`: another callback fired (_PendingAffect); the algebraic
+   unknowns follow it first, as after a continuous event. =#
+function _iterate!(e::EventIteration, integrator, resolve::Bool = false)
+  if (resolve || _continuousEventFired(integrator)) && !_resolveAlgebraics!(integrator, e.reinit)
     @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
     #= The located crossings belong to this event. =#
     foreach(c -> fill!(c.crossed, false), e.clusters)
@@ -484,9 +503,9 @@ Add the event iteration over the buffered relations: the if-equation
 relations `entries` = `(ifCond, crossing function, scale)`, and the whens on
 a relation and the discrete clusters among `callbacks` (their affects are
 `RelationWhenAffect`s and `ClusterCrossings`). A DiscreteCallback checks them
-after every step and, where one disagrees with the state or a continuous
-event fired, iterates as described above. `hSym` is the hysteresis
-parameter H.
+after every step and, where one disagrees with the state, a continuous event
+fired or another discrete callback fired (a table's time event), iterates as
+described above. `hSym` is the hysteresis parameter H.
 
 The whens on discrete conditions among `callbacks` (`DiscreteWhenAffect`s)
 move into the iteration: a relation's when body can change the discrete
@@ -500,8 +519,10 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
             sum((length(c.rel) + length(c.members) for c in clusters); init = 0)
   local reinit = any(c -> c.table, clusters) ? tableClusterInitAlg() : nothing
   local e = EventIteration(ifRelations, relationWhens, clusters, discreteWhens, _eventIterationLimit(n), reinit)
-  local cb = DiffEqBase.DiscreteCallback((u, t, integrator) -> _needsIteration(e, integrator),
-                                         integrator -> _iterate!(e, integrator);
+  local pending = Ref(false)
+  kept = Any[cb isa DiffEqBase.DiscreteCallback ? _markingPending(cb, pending) : cb for cb in kept]
+  local cb = DiffEqBase.DiscreteCallback((u, t, integrator) -> pending[] || _needsIteration(e, integrator),
+                                         integrator -> (local p = pending[]; pending[] = false; _iterate!(e, integrator, p));
                                          initialize = (c, u, t, integrator) -> _initialize!(e, integrator),
                                          #= The state after the iteration, at the event's time
                                             (the when callbacks saved the left limit). The
