@@ -145,6 +145,8 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
     return u0
   end
   if get(ENV, "OMBACKEND_INIT_TRACE", "") == "true" && eqLabels !== nothing
+    println("[initentry] ", length(u0), " unknowns, u0 = ", first(u0, 20), length(u0) > 20 ? " ..." : "",
+            ", pinned ", pinned, ", discrete pinned ", discrete_pinned)
     for (rowk, k) in enumerate(eq_idx)
       local kind = rowk <= length(alg_idx) ? "alg" : "der"
       println("[initrow] ", rowk, " (", kind, " eq ", k, ") ",
@@ -329,6 +331,39 @@ function _solveDAEPhaseAnchored!(u0, rhsFunc, p_vec, eq_idx, var_idx, anchorVals
                          phaseLabel=string(phaseLabel, "-polish"))
 end
 
+#= The Newton step of an init phase: the minimum-norm step, pinv's, which
+   also serves the underdetermined and anchored phases. Where pinv's rank
+   cutoff (eps * min(m, n) * the largest singular value) drops a direction of
+   an unanchored Jacobian with at least as many rows as columns, and the
+   Jacobian is regular once its rows and columns are scaled, the step is that
+   scaled matrix's Newton step (for more rows than columns, its row-weighted
+   least-squares step) when it descends. A badly scaled Jacobian is not a
+   singular one: an ideal diode in the wrong mode at the start has s = -8e5
+   against Ron = 1e-5; the dropped direction is the one that corrects s, the
+   step moved the if-equation's coefficient instead, the phase crept above
+   its tolerance, and a later phase moved the states to fit the wrong mode (a
+   capacitor's start value). Elsewhere the step is pinv's, bit for bit: a V6
+   engine cylinder's piston reaches its stroke limit to 1e-12, and a last-bit
+   change of the initial crank angle trips that assert. =#
+function _newtonStep(Js, ress, unanchored::Bool)
+  if unanchored && size(Js, 1) >= size(Js, 2) && !isempty(Js) && !LinearAlgebra.isdiag(Js)
+    local S = LinearAlgebra.svdvals(Js)
+    if S[end] <= eps(Float64) * minimum(size(Js)) * S[1]
+      local rowScale = [(m = maximum(abs, @view Js[i, :]); m > floatmin(Float64) ? 1 / m : 1.0) for i in 1:size(Js, 1)]
+      local Jr = rowScale .* Js
+      local colScale = [(m = maximum(abs, @view Jr[:, j]); m > floatmin(Float64) ? 1 / m : 1.0) for j in 1:size(Js, 2)]
+      local Fc = LinearAlgebra.svd(Jr .* colScale')
+      if Fc.S[end] > 1e-10 * Fc.S[1]
+        local delta = colScale .* (Fc \ (rowScale .* ress))
+        #= A descent direction for the phase's objective (ress' Js delta > 0): a
+           row-weighted least-squares step of an inconsistent system may not be. =#
+        LinearAlgebra.dot(ress, Js * delta) > 0 && return delta
+      end
+    end
+  end
+  return LinearAlgebra.pinv(Js) * ress
+end
+
 function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Float64, length(eq_idx)), maxiter=50, tol=1e-10, anchorVals=nothing, anchorWeight=1e-2, extraRes=nothing, phaseLabel::String="")
   local nVar = length(var_idx)
   local du = similar(u0)
@@ -392,7 +427,7 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
       Js = vcat(Js, anchorRows)
       ress = vcat(ress, ares)
     end
-    local delta = LinearAlgebra.pinv(Js) * ress
+    local delta = _newtonStep(Js, ress, anchorRows === nothing)
     #= The acceptance measure must match the objective the direction
        minimizes: the equilibrated least-squares norm. Raw max-norm
        acceptance on mixed-scale systems rejects every step (one huge-
