@@ -459,6 +459,11 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
                                                 SimulationCode.dropObservationOnlyVariables)
         simCode = SimulationCode.runSimCodePass("eliminateDeadParameters", simCode,
                                                 SimulationCode.eliminateDeadParameters)
+        #= Function outputs that are constants for every value of the call's
+           variables (OpenModelica's evalFunc; MSL Spice3's capacitances): before
+           eliminateFrozenStates, so derivatives they multiplied vanish. =#
+        simCode = SimulationCode.runSimCodePass("evaluateConstantFunctionOutputs", simCode,
+                                                SimulationCode.evaluateConstantFunctionOutputs)
         #= eliminateFrozenStates runs AFTER eliminateConstantParameters so that
            parameter chains like `state = param` (param bound to a literal) are
            already substituted to `state = literal` before detection. =#

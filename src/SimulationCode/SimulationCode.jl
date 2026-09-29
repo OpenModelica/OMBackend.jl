@@ -63,6 +63,7 @@ include("simCodeUtil.jl")
 include("simCodeDump.jl")
 include("simulationCodeTransformation.jl")
 include("simCodeFunctions.jl")
+include("simCodeFunctionEval.jl")
 include("simCodeCheck.jl")
 include("simCodeExpBridge.jl")
 
