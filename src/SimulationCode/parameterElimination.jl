@@ -1,18 +1,5 @@
 #= Observation-only variables, dead parameters, constant parameters. =#
 
-"""
-    eliminateDeadParameters(simCode) -> simCode
-
-Remove `PARAMETER(NONE)` simvars that are not referenced anywhere — no
-residual, no initial equation, no if-condition, no when statement, no
-DATA_STRUCTURE / parameter binding expression, no alias representative, no
-attribute (`start` / `fixed` / `min` / `max` / `nominal`), no eliminated
-equation. Such parameters cannot be observed and cannot be overridden
-meaningfully at runtime (no consumer would see the override).
-
-Skipped for sub-model / metaModel variants because cross-mode
-parameter references are not visible in the standard scan.
-"""
 #= Returns true when the SimVar's attributes carry isProtected = SOME(true). =#
 function _isProtectedSimVar(sv)::Bool
   @match sv.attributes begin
@@ -157,6 +144,19 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   return simCode
 end
 
+"""
+    eliminateDeadParameters(simCode) -> simCode
+
+Remove `PARAMETER(NONE)` simvars that are not referenced anywhere — no
+residual, no initial equation, no if-condition, no when statement, no
+DATA_STRUCTURE / parameter binding expression, no alias representative, no
+attribute (`start` / `fixed` / `min` / `max` / `nominal`), no eliminated
+equation. Such parameters cannot be observed and cannot be overridden
+meaningfully at runtime (no consumer would see the override).
+
+Skipped for sub-model / metaModel variants because cross-mode
+parameter references are not visible in the standard scan.
+"""
 function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
   if hasSubModels(simCode) || hasMetaModel(simCode)
     return simCode
@@ -267,6 +267,27 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
   return simCode
 end
 
+"""
+    eliminateConstantParameters(simCode::SIM_CODE) -> SIM_CODE
+
+Find every PARAMETER whose binding evaluates to a numeric/Bool literal,
+substitute the literal value at all use sites, and drop the parameter from
+`stringToSimVarHT`. This shrinks the parameter list MTK sees before
+`structural_simplify`, reducing per-simulate module-eval cost on large MSL
+models (where `foldParameterClosure` typically inflates the parameter count
+2x to 3x).
+
+Tier-1 only: skipped on VSS / sub-model / metaModel variants because
+a parameter eliminated here can no longer be re-bound at runtime by a
+structural transition or by recompilation. The gate matches the
+conservative envelope used by `eliminateAliasVariables`.
+
+Defensive checks:
+- Parameters that appear as representatives in `aliasMap` are NOT eliminated
+  (would orphan the alias entry).
+- A survivor scan after substitution keeps any parameter still referenced
+  somewhere the substitution missed (paranoia for unflatten CREF forms).
+"""
 function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   if hasStructuralTransitions(simCode) || hasSubModels(simCode) ||
      hasMetaModel(simCode)

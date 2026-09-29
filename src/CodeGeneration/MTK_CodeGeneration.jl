@@ -454,6 +454,65 @@ function emitProblemConstruction(useDirectRHS::Bool, skipInitializeProb::Bool)::
 end
 
 """
+    defaultSolverFor(solver, problem, reducedSystem, discreteUnknownNames, hasWhens) -> solver
+
+Switch the Rosenbrock default (Rodas5P) to FBDF for the DAE shapes where
+Rosenbrock mass-matrix stepping is brittle: purely algebraic systems, and,
+in a model without when-equations, algebraic rows of generated discrete
+variables (`discreteUnknownNames`, as `name(t)`). Brake reaches a consistent
+initial residual, but Rodas5P aborts at once with dt_epsilon/NaN while FBDF
+advances the same mass-matrix problem. With when-equations the callbacks keep
+the discretes consistent, and FBDF's post-event re-initialization collapses
+dt at the first event. A solver the user chose is kept. Runs here rather than
+in the generated module, where a model variable (`count`) shadows Base.
+"""
+function defaultSolverFor(solver, problem, reducedSystem, discreteUnknownNames::Vector{String}, hasWhens::Bool)
+  local name = string(nameof(typeof(solver)))
+  (startswith(name, "Rodas") || startswith(name, "Rosenbrock")) || return solver
+  local n = problem.u0 === nothing ? 0 : length(problem.u0)
+  local mm = problem.f.mass_matrix
+  #= UniformScaling (pure ODE) reads 1 on the diagonal. =#
+  local nDiff = count(i -> mm[i, i] != 0, 1:n)
+  if nDiff == 0
+    @info "[MTK GEN: solver] zero differential states detected, switching default $(name) -> FBDF for purely-algebraic DAE"
+    return OMBackend.daeFallbackSolver()
+  end
+  (hasWhens || nDiff == n || isempty(discreteUnknownNames)) && return solver
+  local unknowns = try
+    ModelingToolkit.unknowns(reducedSystem)
+  catch
+    Any[]
+  end
+  #= MTK renders subscripted unknowns as var"name[i]"(t); strip the quotes. =#
+  mtkName(u) = replace(string(u), "var\"" => "", "\"" => "")
+  local names = Set(discreteUnknownNames)
+  if any(i -> mm[i, i] == 0 && mtkName(unknowns[i]) in names, 1:min(n, length(unknowns)))
+    @info "[MTK GEN: solver] algebraic rows involving generated discrete variables detected in mass-matrix system; switching default $(name) -> FBDF"
+    return OMBackend.daeFallbackSolver()
+  end
+  return solver
+end
+
+"""
+    defaultInitializeKwargs(problem, kwargs, tableClusters) -> NamedTuple
+
+The DAE initialization of a solve when the caller chose none. Table-cluster
+models: Newton with finite differences (`tableClusterInitAlg`). Otherwise, for
+a problem without an initialization problem (OM.jl solves the initial values
+itself): BrownFullBasicInit at the solve's abstol, which OrdinaryDiffEq used by
+default before OrdinaryDiffEqCore 4. Since then the default only checks u0,
+and fails where OM.jl's initial values leave a residual in an algebraic
+equation (the PID models of PIDDecomposition.mo).
+"""
+function defaultInitializeKwargs(problem, kwargs, tableClusters::Bool)
+  haskey(kwargs, :initializealg) && return (;)
+  tableClusters && return (; initializealg = tableClusterInitAlg())
+  ModelingToolkit.SciMLBase.has_initializeprob(problem.f) && return (;)
+  return (; initializealg = DiffEqBase.BrownFullBasicInit(get(kwargs, :abstol, 1.0e-6)))
+end
+
+
+"""
     IfEquationComponent
 
 Codegen artifacts for one Modelica `if`-equation that has been lifted to an
@@ -1336,6 +1395,27 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   end
   return model
 end
+
+"""
+   Creates equations from the residual equations in unsorted order
+"""
+function createResidualEquationsMTK(stateVariables::Vector, algebraicVariables::Vector, equations::AbstractVector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  if isempty(equations)
+    return Expr[]
+  end
+  local eqs::Vector{Expr} = Expr[]
+  for eq in equations
+    #= eq.exp is a `SimulationCode.Exp`; the
+       `expToJuliaExpMTK(::SimulationCode.Exp, ...)` overload in
+       MTK_CodeGenerationUtil.jl walks SIM Exp natively for the
+       supported variants and delegates the rest back to the DAE
+       emitter via `toDAEExp`. =#
+    local eqExp = :(0 ~ $(expToJuliaExpMTK(eq.exp, simCode; derSymbol=false)))
+    push!(eqs, eqExp)
+  end
+    return eqs
+end
+
 
 """
     generateAliasObservedBlock(simCode)

@@ -212,14 +212,3 @@ function _traverseChildrenBottomUp(e::REDUCTION, visitor, arg)
   (nb, a) = traverseExpBottomUp(e.body, visitor, arg)
   return (nb === e.body ? e : REDUCTION(e.info, nb, e.iterators), a)
 end
-
-#= `Util.traverseExpTopDown(::DAE.Exp, func, ext_arg)` is the canonical
-   recursive descent over a `DAE.Exp` tree used by alias substitution,
-   constant folding, cref collection, etc. When the caller passes a
-   SimCode-native `Exp`, route through `toDAEExp` and convert the
-   returned expression back to `Exp` so the call site sees the same
-   in/out type. =#
-Base.@nospecializeinfer function Util.traverseExpTopDown(@nospecialize(inExp::Exp), func::Function, ext_arg)
-  local (outDAE, outArg) = Util.traverseExpTopDown(toDAEExp(inExp), func, ext_arg)
-  return (toSimExp(outDAE), outArg)
-end

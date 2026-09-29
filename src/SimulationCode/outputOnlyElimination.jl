@@ -1,3 +1,145 @@
+
+"""
+    buildBaseNameIndex(ht::OrderedDict{String, Tuple{Int, SimVar}})
+
+Build a reverse index from base variable names (without subscripts) to all
+subscripted full names in the hash table. For example, if the HT contains
+"world_x[1]" and "world_x[2]", the result maps "world_x" => ["world_x[1]", "world_x[2]"].
+This handles the ASUB case where `getAllCrefs` extracts a base CREF without subscripts.
+"""
+function buildBaseNameIndex(ht::OrderedDict{String, Tuple{Int, SimVar}})::Dict{String, Vector{String}}
+  local index = Dict{String, Vector{String}}()
+  for (varName, _) in ht
+    local bi = findfirst('[', varName)
+    local bn = bi === nothing ? varName : varName[1:(bi - 1)]
+    if bn != varName
+      if !haskey(index, bn)
+        index[bn] = String[]
+      end
+      push!(index[bn], varName)
+    end
+  end
+  return index
+end
+
+"""
+    collectEquationVarNames(exp::DAE.Exp,
+                            ht::OrderedDict{String, Tuple{Int, SimVar}},
+                            baseNameToFullNames::Dict{String, Vector{String}})
+
+Extract all variable names referenced by a DAE expression, using the robust
+`Util.getAllCrefs` traversal (via `traverseExpTopDown`). Falls back to base-name
+matching for ASUB-wrapped CREFs where subscripts are separated from the CREF.
+
+Returns a OrderedSet{String} of variable names that exist in the HT.
+"""
+function collectEquationVarNames(exp::DAE.Exp,
+                                 ht::OrderedDict{String, Tuple{Int, SimVar}},
+                                 baseNameToFullNames::Dict{String, Vector{String}})::OrderedSet{String}
+  local crefs::List{DAE.ComponentRef} = Util.getAllCrefs(exp)
+  local names = OrderedSet{String}()
+  for cr in crefs
+    local name = DAE_identifierToString(cr)
+    if haskey(ht, name)
+      push!(names, name)
+    else
+      #= Base name fallback: the CREF may come from inside an ASUB expression,
+         missing its subscripts. Match all subscripted variants conservatively. =#
+      local bi = findfirst('[', name)
+      local bn = bi === nothing ? name : name[1:(bi - 1)]
+      if bn != name && haskey(ht, bn)
+        #= The CREF itself has partial subscripts; try the full name and base =#
+        push!(names, bn)
+      end
+      local lookupKey = haskey(baseNameToFullNames, name) ? name : bn
+      if haskey(baseNameToFullNames, lookupKey)
+        for fullName in baseNameToFullNames[lookupKey]
+          push!(names, fullName)
+        end
+      end
+    end
+  end
+  return names
+end
+
+"""
+    rebuildMatchOrder(simCode::SIM_CODE)
+
+Rebuild a fresh bipartite matching from the current equations and variables.
+This is needed when the original matchOrder is stale (e.g. after const-prop
+and alias-elim have removed equations and variables).
+
+Returns `(matchOrder::Vector{Int}, nameToMatchIdx::Dict{String,Int}, matchIdxToName::Dict{Int,String})`
+where `matchOrder[varMatchIdx] = eqIdx` (0 = unmatched).
+"""
+function rebuildMatchOrder(simCode::SIM_CODE)
+  local ht = simCode.stringToSimVarHT
+  local resEqs = simCode.residualEquations
+  local nEqs = length(resEqs)
+  #= Collect unknown variables (those that participate in matching) =#
+  local nameToMatchIdx = Dict{String, Int}()
+  local matchIdxToName = Dict{Int, String}()
+  local matchIdx = 0
+  for (varName, (_idx, sv)) in ht
+    local isUnknown = @match sv.varKind begin
+      STATE(__) => true
+      STATE_DERIVATIVE(__) => true
+      ALG_VARIABLE(__) => true
+      SimulationCode.ARRAY(__) => true
+      DISCRETE(__) => true
+      _ => false
+    end
+    if isUnknown
+      matchIdx += 1
+      nameToMatchIdx[varName] = matchIdx
+      matchIdxToName[matchIdx] = varName
+    end
+  end
+  local nVars = matchIdx
+  #= Build the base name index for robust CREF extraction =#
+  local baseNameToFullNames = buildBaseNameIndex(ht)
+  #= Build bipartite adjacency: for each equation, which variable match indices does it reference? =#
+  #= Int-keyed: GraphAlgorithms.matching consumes only `.vals` positionally, so the
+     interpolated "e$(i)" string keys were pure allocation/hashing overhead. =#
+  local eqVarMapping = DataStructures.OrderedDict{Int, Vector{Int}}()
+  for eqI in 1:nEqs
+    local refs = collectEquationVarNames(toDAEExp(resEqs[eqI].exp), ht, baseNameToFullNames)
+    local indices = Int[]
+    for refName in refs
+      if haskey(nameToMatchIdx, refName)
+        push!(indices, nameToMatchIdx[refName])
+      end
+    end
+    eqVarMapping[eqI] = sort(unique(indices))
+  end
+  #= The matching algorithm requires a square system (n used for both eq loop
+     and assign array). For over-determined systems (nVars > nEqs), pad with
+     dummy empty equations so the algorithm sees a square system. The dummy
+     equations will remain unmatched. For under-determined systems (nEqs > nVars),
+     skip since we cannot produce a valid matching. =#
+  if nEqs > nVars
+    @debug "[SIMCODE: $(simCode.name): rebuildMatchOrder] under-determined system ($nEqs equations, $nVars unknowns), skipping"
+    return (Int[], nameToMatchIdx, matchIdxToName)
+  end
+  local nMatch = nVars
+  if nVars > nEqs
+    for dummyI in (nEqs + 1):nVars
+      eqVarMapping[dummyI] = Int[]
+    end
+  end
+  local matchOrder::Vector{Int}
+  try
+    local (_isSingular, mo) = GraphAlgorithms.matching(eqVarMapping, nMatch)
+    matchOrder = mo
+  catch e
+    @debug "[SIMCODE: $(simCode.name): rebuildMatchOrder] matching failed, skipping DCE" exception=(e, catch_backtrace())
+    return (Int[], nameToMatchIdx, matchIdxToName)
+  end
+  local nMatched = count(>(0), matchOrder)
+  @debug "[SIMCODE: $(simCode.name): rebuildMatchOrder] $nEqs equations, $nVars unknowns, $nMatched matched"
+  return (matchOrder, nameToMatchIdx, matchIdxToName)
+end
+
 #= Elimination of the variables that only feed outputs (eliminateNonDynamic). =#
 
 """

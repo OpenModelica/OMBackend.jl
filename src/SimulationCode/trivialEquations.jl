@@ -322,6 +322,26 @@ function pruneConstantConditions(simCode::SIM_CODE)::SIM_CODE
   return simCode
 end
 
+"""
+    removeRedundantEquations(simCode::SIM_CODE) -> SIM_CODE
+
+Post-alias-elimination over-determination reduction.
+
+After alias elimination, some residual equations may become structurally
+redundant: they mention only unknowns that are already uniquely determined
+by other equations. This produces more equations than unknowns
+(ExtraEquationsSystemException in MTK structural_simplify).
+
+This pass computes a maximum bipartite matching of residual equations to
+surviving unknowns. Equations that cannot be matched to any still-free
+unknown are algebraically implied by the matched equations (assuming the
+original Modelica model is well-posed) and are safely removed.
+
+Typical trigger: balanced 3-phase star networks where the Kirchhoff current
+law `i[1]+i[2]+i[3]=0` is a zero-sum identity implied by the three
+per-phase Ohm's law equations, but survives alias elimination as an extra
+residual.
+"""
 function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   local ht  = simCode.stringToSimVarHT
   local res = simCode.residualEquations

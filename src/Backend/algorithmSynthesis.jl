@@ -32,15 +32,6 @@ function synthesizeFromInitialAlgorithms(iAlgorithms)::Vector{BDAE.Equation}
   return out
 end
 
-"""
-    synthesizeInitialWhenFromAlgorithms(algorithms) -> Vector{BDAE.Equation}
-
-Scan flat-model algorithm sections for `algorithm when initial() then ... end when`
-statements and lift each into a `BDAE.INITIAL_WHEN_EQUATION`. Bodies are translated
-via OMFrontend's existing Statement → DAE.Statement conversion, then mapped to
-BDAE.WhenOperator entries. Compound conditions (e.g. `when (initial() or c)`) are
-intentionally skipped per Modelica spec §8/§11.
-"""
 Base.@nospecializeinfer function _pushExpCrefStrings!(names::OrderedSet{String}, @nospecialize(exp))
   exp === nothing && return
   local crefs = Util.getAllCrefs(exp)
@@ -824,6 +815,58 @@ Base.@nospecializeinfer function _buildAlgorithmBodyOps(@nospecialize(daeStmts),
   return (ops, lhsNames)
 end
 
+Base.@nospecializeinfer function _pushDiscreteCref!(out::Vector{DAE.ComponentRef},
+                                                    seen::OrderedSet{String},
+                                                    blocked::OrderedSet{String},
+                                                    @nospecialize(cref))
+  cref isa DAE.ComponentRef || return nothing
+  _isTimeCref(cref) && return nothing
+  local key = string(cref)
+  key in blocked && return nothing
+  local ty = _crefType(cref)
+  ty === nothing && return nothing
+  _isDiscreteDAEType(ty) || return nothing
+  key in seen && return nothing
+  push!(seen, key)
+  push!(out, cref)
+  return nothing
+end
+
+# Collect discrete RHS crefs into `out` (deduped via `seen`, skipping `blocked`
+# reduction/for iterators). Typed functor replacing the threaded ctx tuple.
+struct DiscreteRhsCrefVisitor
+  out::Vector{DAE.ComponentRef}
+  seen::OrderedSet{String}
+  blocked::OrderedSet{String}
+end
+Base.@nospecializeinfer function (v::DiscreteRhsCrefVisitor)(@nospecialize(exp), arg::Nothing)
+  @match exp begin
+    DAE.CREF(cr, _) => _pushDiscreteCref!(v.out, v.seen, v.blocked, cr)
+    DAE.REDUCTION(_, _, iters) => _collectReductionIterNames!(v.blocked, iters)
+    _ => nothing
+  end
+  return (exp, true, arg)
+end
+
+Base.@nospecializeinfer function _collectReductionIterNames!(blocked::OrderedSet{String}, @nospecialize(iters))
+  for it in iters
+    @match it begin
+      DAE.REDUCTIONITER(id, _, _, _) => push!(blocked, id)
+      _ => nothing
+    end
+  end
+  return nothing
+end
+
+Base.@nospecializeinfer function _makeChangeCall(@nospecialize(cref))
+  local ty = _crefType(cref)
+  local callArg = DAE.CREF(cref, ty === nothing ? DAE.T_REAL_DEFAULT : ty)
+  return DAE.CALL(Absyn.IDENT("change"),
+                  MetaModelica.list(callArg),
+                  DAE.callAttrBuiltinBool)
+end
+
+
 Base.@nospecializeinfer function _collectDiscreteRhsCrefsFromWhenOps(ops::Vector{BDAE.WhenOperator},
                                                                      assignedLhs::OrderedSet{String})
   local out = DAE.ComponentRef[]
@@ -1138,6 +1181,15 @@ Base.@nospecializeinfer function _liftAlgAssignToInitialWhen!(out::Vector{BDAE.E
   end
 end
 
+"""
+    synthesizeInitialWhenFromAlgorithms(algorithms) -> Vector{BDAE.Equation}
+
+Scan flat-model algorithm sections for `algorithm when initial() then ... end when`
+statements and lift each into a `BDAE.INITIAL_WHEN_EQUATION`. Bodies are translated
+via OMFrontend's existing Statement → DAE.Statement conversion, then mapped to
+BDAE.WhenOperator entries. Compound conditions (e.g. `when (initial() or c)`) are
+intentionally skipped per Modelica spec §8/§11.
+"""
 function synthesizeInitialWhenFromAlgorithms(algorithms)::Vector{BDAE.Equation}
   local out = BDAE.Equation[]
   for alg in algorithms

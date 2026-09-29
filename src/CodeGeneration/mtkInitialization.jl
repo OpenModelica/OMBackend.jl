@@ -1,26 +1,6 @@
 #= MTK code generation: start conditions, initial equations and algorithms, initial derivatives. =#
 
 """
-   Creates equations from the residual equations in unsorted order
-"""
-function createResidualEquationsMTK(stateVariables::Vector, algebraicVariables::Vector, equations::AbstractVector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
-  if isempty(equations)
-    return Expr[]
-  end
-  local eqs::Vector{Expr} = Expr[]
-  for eq in equations
-    #= eq.exp is a `SimulationCode.Exp`; the
-       `expToJuliaExpMTK(::SimulationCode.Exp, ...)` overload in
-       MTK_CodeGenerationUtil.jl walks SIM Exp natively for the
-       supported variants and delegates the rest back to the DAE
-       emitter via `toDAEExp`. =#
-    local eqExp = :(0 ~ $(expToJuliaExpMTK(eq.exp, simCode; derSymbol=false)))
-    push!(eqs, eqExp)
-  end
-    return eqs
-end
-
-"""
   Generates the initial value for the equations.
   Algebraics without an explicit `start =` and without `fixed = true` are
   always skipped — MTK's init solver supplies defaults.
@@ -520,6 +500,21 @@ function _initialWhenOpToJuliaEarly(wStmt, simCode::SimulationCode.SIM_CODE,
   return :( nothing )
 end
 
+#= Modelica function calls in algorithm code are `Base.invokelatest(Name, ...)`
+   with Name bound in OMBackend.CodeGeneration (createModelicaFunctionWrapper),
+   which a function body runs in. The early initial algorithm runs in the
+   model's module, where Name is undefined: qualify it. (MSL
+   WriteRealMatrixToFile: `when initial() then success1 := writeRealMatrix(...)`
+   raised UndefVarError, swallowed, and success1..4 stayed false.) =#
+function _qualifyInvokedFunctions(ex)
+  ex isa Expr || return ex
+  local args = map(_qualifyInvokedFunctions, ex.args)
+  if ex.head === :call && length(args) >= 2 && args[1] == :(Base.invokelatest) && args[2] isa Symbol
+    args[2] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(args[2]))
+  end
+  return Expr(ex.head, args...)
+end
+
 """
     generateInitialAlgorithmEarlyFunction(simCode) -> Expr
 
@@ -549,22 +544,6 @@ The outer try/catch returns partial results on any error; the runtime
 `remake` path remains as a fallback for state-cref-RHS reads whose
 post-init value differs from the `start` attribute.
 """
-
-#= Modelica function calls in algorithm code are `Base.invokelatest(Name, ...)`
-   with Name bound in OMBackend.CodeGeneration (createModelicaFunctionWrapper),
-   which a function body runs in. The early initial algorithm runs in the
-   model's module, where Name is undefined: qualify it. (MSL
-   WriteRealMatrixToFile: `when initial() then success1 := writeRealMatrix(...)`
-   raised UndefVarError, swallowed, and success1..4 stayed false.) =#
-function _qualifyInvokedFunctions(ex)
-  ex isa Expr || return ex
-  local args = map(_qualifyInvokedFunctions, ex.args)
-  if ex.head === :call && length(args) >= 2 && args[1] == :(Base.invokelatest) && args[2] isa Symbol
-    args[2] = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(args[2]))
-  end
-  return Expr(ex.head, args...)
-end
-
 function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)::Expr
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
@@ -714,7 +693,7 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
      appear as LHS still need a fetch because Julia compiles `x = if c then
      v else x end` with `x` as a function-local: the else-branch reads `x`
      before the assignment completes and throws UndefVarError. Self-referential
-     IFEXP shapes come from the algorithm lifter at BDAECreate.jl:1263 when a
+     IFEXP shapes come from the algorithm lifter (algorithmSynthesis.jl) when a
      non-when algorithm contains an if/elseif chain whose else-branches
      preserve a discrete LHS's previous value. =#
   local fetches = Expr[]

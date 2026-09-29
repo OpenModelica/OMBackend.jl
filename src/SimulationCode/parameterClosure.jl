@@ -191,6 +191,15 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
   return simCode
 end
 
+#= Cheap SIM cref-like name: only EXP_CREF / ASUB(EXP_CREF) can yield a name, so
+   gate on those and convert just that small operand -- never a complex side. =#
+_crefLikeNameSIM(e::Exp) =
+  (e isa EXP_CREF || (e isa ASUB && e.exp isa EXP_CREF)) ? extractCrefLikeName(toDAEExp(e)) : nothing
+
+#= SIM-native arm: inspect the top-level BINARY/SUB on the SimCode spine and
+   convert only the (small) cref-like operands, so non-matching residuals bail
+   with no whole-tree toDAEExp. Equivalent: a complex operand yields nothing in
+   both paths; EXP_CREF/ASUB(EXP_CREF) convert to the identical DAE name. =#
 """
     extractBinarySubLhsCrefName(exp, candidateNames)
 
@@ -202,15 +211,6 @@ Used by the fold to pre-index "defining equations": residuals that name a
 variable in their top-level subtraction. If a name appears in more than one
 such residual, MTK owns the disambiguation.
 """
-#= Cheap SIM cref-like name: only EXP_CREF / ASUB(EXP_CREF) can yield a name, so
-   gate on those and convert just that small operand -- never a complex side. =#
-_crefLikeNameSIM(e::Exp) =
-  (e isa EXP_CREF || (e isa ASUB && e.exp isa EXP_CREF)) ? extractCrefLikeName(toDAEExp(e)) : nothing
-
-#= SIM-native arm: inspect the top-level BINARY/SUB on the SimCode spine and
-   convert only the (small) cref-like operands, so non-matching residuals bail
-   with no whole-tree toDAEExp. Equivalent: a complex operand yields nothing in
-   both paths; EXP_CREF/ASUB(EXP_CREF) convert to the identical DAE name. =#
 function extractBinarySubLhsCrefName(exp::Exp, candidateNames::OrderedSet{String})
   exp isa BINARY || return nothing
   exp.op === OP_SUB || return nothing

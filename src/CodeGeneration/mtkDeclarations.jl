@@ -195,15 +195,6 @@ function decomposeStartEquationsInline(equations; functionSuffix = "", chunkSize
 end
 
 """
-  Chunks the @parameters macro call into inner functions to reduce the model
-  function body size. Each inner function calls @parameters with a subset of
-  parameter names and returns the resulting vector. Results are concatenated.
-
-  After chunking, parameter symbols are eval'd into module scope so that
-  pars Dict closures and ARRAY_PARAMETERS code can reference them by name.
-"""
-
-"""
 Generate code to declare ifCond variables as plain parameters (not time-dependent).
 These parameters are modified by SymbolicContinuousCallback affects and are NOT
 part of the ODE state vector, so the solver never perturbs them during Jacobian
@@ -243,6 +234,14 @@ function generateIfCondParamAssignments(ifCondParamPairs::Vector{Expr})
   end
 end
 
+"""
+  Chunks the @parameters macro call into inner functions to reduce the model
+  function body size. Each inner function calls @parameters with a subset of
+  parameter names and returns the resulting vector. Results are concatenated.
+
+  After chunking, parameter symbols are eval'd into module scope so that
+  pars Dict closures and ARRAY_PARAMETERS code can reference them by name.
+"""
 function decomposeParametersDeclaration(parVariablesSym; chunkSize = CHUNK_SIZE[])
   if length(parVariablesSym) <= chunkSize
     return quote

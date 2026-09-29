@@ -1,17 +1,5 @@
 #= Constant equations, pre() of constant parameters, constant propagation. =#
 
-"""
-    detectConstantEquation(exp::DAE.Exp, ht)
-
-Detect if a residual equation represents a constant propagation opportunity
-or a trivially true equation between parameters.
-
-Returns:
-  - `(:trivial, nothing)` if both sides are parameters (equation is tautological)
-  - `(:constprop, (unknownName, paramName, negated, paramCref, paramTy))` if one
-    side is an unknown and the other is a parameter
-  - `nothing` if the equation does not match any constant pattern
-"""
 #= Classify `unknown = (+/-) param` from the two extracted (name, cref, type)
    operand results. Shared by the DAE and SIM-native entry points. =#
 function _classifyConstEq(@nospecialize(r1), @nospecialize(r2), negated::Bool, ht)
@@ -48,6 +36,18 @@ end
    the matched leaf. Equivalent to the DAE path: non-cref operands fail
    extractCrefName and a WILD operand (the one non-EXP_CREF that maps to a
    DAE.CREF) fails the haskey guard. =#
+"""
+    detectConstantEquation(exp::DAE.Exp, ht)
+
+Detect if a residual equation represents a constant propagation opportunity
+or a trivially true equation between parameters.
+
+Returns:
+  - `(:trivial, nothing)` if both sides are parameters (equation is tautological)
+  - `(:constprop, (unknownName, paramName, negated, paramCref, paramTy))` if one
+    side is an unknown and the other is a parameter
+  - `nothing` if the equation does not match any constant pattern
+"""
 function detectConstantEquation(exp::Exp, ht)
   exp isa BINARY || return nothing
   (exp.op === OP_SUB || exp.op === OP_ADD) || return nothing

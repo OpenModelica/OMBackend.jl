@@ -32,3 +32,14 @@ end
 # SimCode.Exp — which surfaces as "unsupported DAE.Exp variant" warnings
 # whenever a downstream check expects a DAE.* tag. Re-add ONLY when an
 # equation field actually carries `::Exp`, never as a general bridge.
+
+#= `Util.traverseExpTopDown(::DAE.Exp, func, ext_arg)` is the canonical
+   recursive descent over a `DAE.Exp` tree used by alias substitution,
+   constant folding, cref collection, etc. When the caller passes a
+   SimCode-native `Exp`, route through `toDAEExp` and convert the
+   returned expression back to `Exp` so the call site sees the same
+   in/out type. =#
+Base.@nospecializeinfer function Util.traverseExpTopDown(@nospecialize(inExp::Exp), func::Function, ext_arg)
+  local (outDAE, outArg) = Util.traverseExpTopDown(toDAEExp(inExp), func, ext_arg)
+  return (toSimExp(outDAE), outArg)
+end

@@ -374,158 +374,6 @@ function makeDummyResidualEquation(equationSystemName::String, idx::Int = 1)
   )
 end
 
-"""
-    buildBaseNameIndex(ht::OrderedDict{String, Tuple{Int, SimVar}})
-
-Build a reverse index from base variable names (without subscripts) to all
-subscripted full names in the hash table. For example, if the HT contains
-"world_x[1]" and "world_x[2]", the result maps "world_x" => ["world_x[1]", "world_x[2]"].
-This handles the ASUB case where `getAllCrefs` extracts a base CREF without subscripts.
-"""
-function buildBaseNameIndex(ht::OrderedDict{String, Tuple{Int, SimVar}})::Dict{String, Vector{String}}
-  local index = Dict{String, Vector{String}}()
-  for (varName, _) in ht
-    local bi = findfirst('[', varName)
-    local bn = bi === nothing ? varName : varName[1:(bi - 1)]
-    if bn != varName
-      if !haskey(index, bn)
-        index[bn] = String[]
-      end
-      push!(index[bn], varName)
-    end
-  end
-  return index
-end
-
-"""
-    collectEquationVarNames(exp::DAE.Exp,
-                            ht::OrderedDict{String, Tuple{Int, SimVar}},
-                            baseNameToFullNames::Dict{String, Vector{String}})
-
-Extract all variable names referenced by a DAE expression, using the robust
-`Util.getAllCrefs` traversal (via `traverseExpTopDown`). Falls back to base-name
-matching for ASUB-wrapped CREFs where subscripts are separated from the CREF.
-
-Returns a OrderedSet{String} of variable names that exist in the HT.
-"""
-function collectEquationVarNames(exp::DAE.Exp,
-                                 ht::OrderedDict{String, Tuple{Int, SimVar}},
-                                 baseNameToFullNames::Dict{String, Vector{String}})::OrderedSet{String}
-  local crefs::List{DAE.ComponentRef} = Util.getAllCrefs(exp)
-  local names = OrderedSet{String}()
-  for cr in crefs
-    local name = DAE_identifierToString(cr)
-    if haskey(ht, name)
-      push!(names, name)
-    else
-      #= Base name fallback: the CREF may come from inside an ASUB expression,
-         missing its subscripts. Match all subscripted variants conservatively. =#
-      local bi = findfirst('[', name)
-      local bn = bi === nothing ? name : name[1:(bi - 1)]
-      if bn != name && haskey(ht, bn)
-        #= The CREF itself has partial subscripts; try the full name and base =#
-        push!(names, bn)
-      end
-      local lookupKey = haskey(baseNameToFullNames, name) ? name : bn
-      if haskey(baseNameToFullNames, lookupKey)
-        for fullName in baseNameToFullNames[lookupKey]
-          push!(names, fullName)
-        end
-      end
-    end
-  end
-  return names
-end
-
-"""
-    rebuildMatchOrder(simCode::SIM_CODE)
-
-Rebuild a fresh bipartite matching from the current equations and variables.
-This is needed when the original matchOrder is stale (e.g. after const-prop
-and alias-elim have removed equations and variables).
-
-Returns `(matchOrder::Vector{Int}, nameToMatchIdx::Dict{String,Int}, matchIdxToName::Dict{Int,String})`
-where `matchOrder[varMatchIdx] = eqIdx` (0 = unmatched).
-"""
-function rebuildMatchOrder(simCode::SIM_CODE)
-  local ht = simCode.stringToSimVarHT
-  local resEqs = simCode.residualEquations
-  local nEqs = length(resEqs)
-  #= Collect unknown variables (those that participate in matching) =#
-  local nameToMatchIdx = Dict{String, Int}()
-  local matchIdxToName = Dict{Int, String}()
-  local matchIdx = 0
-  for (varName, (_idx, sv)) in ht
-    local isUnknown = @match sv.varKind begin
-      STATE(__) => true
-      STATE_DERIVATIVE(__) => true
-      ALG_VARIABLE(__) => true
-      SimulationCode.ARRAY(__) => true
-      DISCRETE(__) => true
-      _ => false
-    end
-    if isUnknown
-      matchIdx += 1
-      nameToMatchIdx[varName] = matchIdx
-      matchIdxToName[matchIdx] = varName
-    end
-  end
-  local nVars = matchIdx
-  #= Build the base name index for robust CREF extraction =#
-  local baseNameToFullNames = buildBaseNameIndex(ht)
-  #= Build bipartite adjacency: for each equation, which variable match indices does it reference? =#
-  #= Int-keyed: GraphAlgorithms.matching consumes only `.vals` positionally, so the
-     interpolated "e$(i)" string keys were pure allocation/hashing overhead. =#
-  local eqVarMapping = DataStructures.OrderedDict{Int, Vector{Int}}()
-  for eqI in 1:nEqs
-    local refs = collectEquationVarNames(toDAEExp(resEqs[eqI].exp), ht, baseNameToFullNames)
-    local indices = Int[]
-    for refName in refs
-      if haskey(nameToMatchIdx, refName)
-        push!(indices, nameToMatchIdx[refName])
-      end
-    end
-    eqVarMapping[eqI] = sort(unique(indices))
-  end
-  #= The matching algorithm requires a square system (n used for both eq loop
-     and assign array). For over-determined systems (nVars > nEqs), pad with
-     dummy empty equations so the algorithm sees a square system. The dummy
-     equations will remain unmatched. For under-determined systems (nEqs > nVars),
-     skip since we cannot produce a valid matching. =#
-  if nEqs > nVars
-    @debug "[SIMCODE: $(simCode.name): rebuildMatchOrder] under-determined system ($nEqs equations, $nVars unknowns), skipping"
-    return (Int[], nameToMatchIdx, matchIdxToName)
-  end
-  local nMatch = nVars
-  if nVars > nEqs
-    for dummyI in (nEqs + 1):nVars
-      eqVarMapping[dummyI] = Int[]
-    end
-  end
-  local matchOrder::Vector{Int}
-  try
-    local (_isSingular, mo) = GraphAlgorithms.matching(eqVarMapping, nMatch)
-    matchOrder = mo
-  catch e
-    @debug "[SIMCODE: $(simCode.name): rebuildMatchOrder] matching failed, skipping DCE" exception=(e, catch_backtrace())
-    return (Int[], nameToMatchIdx, matchIdxToName)
-  end
-  local nMatched = count(>(0), matchOrder)
-  @debug "[SIMCODE: $(simCode.name): rebuildMatchOrder] $nEqs equations, $nVars unknowns, $nMatched matched"
-  return (matchOrder, nameToMatchIdx, matchIdxToName)
-end
-
-"""
-    identifyOutputOnlyVariables(simCode::SIM_CODE)
-
-Identify variables and equations that do not influence the dynamic states.
-Performs a backward reachability analysis from state and state-derivative equations
-through the causalized equation dependency graph.
-
-Returns `(outputOnlyVarNames::OrderedSet{String}, outputOnlyEqIndices::OrderedSet{Int})`.
-Variables in the returned set are purely "output" (they can be computed from states
-but do not feed back into any state derivative).
-"""
 #= Pure read-only cref-name collector over the SIM Exp tree. Walks the tree and
    pushes referenced names without reconstructing any nodes (unlike
    traverseExpTopDown, which rebuilds the tree and allocates). The ASUB arm
@@ -721,4 +569,204 @@ function _hasUnknownCref(exp, ht)::Bool
     end
   end
   return false
+end
+
+"""
+    extractCrefName(exp::DAE.Exp)
+
+Extract the variable name from a CREF or ASUB(CREF, ...) expression.
+Returns `(name::String, cref::DAE.ComponentRef, ty::DAE.Type)` or `nothing`
+if the expression is not a simple variable reference.
+"""
+function extractCrefName(@nospecialize(exp))
+  # SIM.EXP_CREF (post-Phase-4b when-ASSIGN LHS) → DAE.CREF so the match fires.
+  if exp isa Exp
+    exp = toDAEExp(exp)
+  end
+  @match exp begin
+    DAE.CREF(cr, ty) => begin
+      return (DAE_identifierToString(cr), cr, ty)
+    end
+    #= ASUB-wrapped CREFs are skipped for alias detection.
+       The ASUB wraps a base CREF with subscripts, but the CREF itself does not
+       carry the subscripts. Eliminating an ASUB alias would replace the base CREF
+       in all equations (affecting all subscripts), breaking the equation balance.
+       These equations are better handled by MTK structural_simplify. =#
+    _ => return nothing
+  end
+end
+
+"""
+    isUnknownVarKind(varKind::SimVarType)::Bool
+
+Check if a variable kind represents an unknown (not a parameter or constant).
+Only unknowns participate in the equation-unknown balance.
+"""
+function isUnknownVarKind(@nospecialize(varKind::SimVarType))::Bool
+  @match varKind begin
+    STATE(__) => true
+    STATE_DERIVATIVE(__) => true
+    ALG_VARIABLE(__) => true
+    ARRAY(__) => true
+    DISCRETE(__) => true
+    _ => false
+  end
+end
+
+#= For every DAE.CREF with T_COMPLEX type in the given equations, append
+   `<base>_<fieldname>` for each field of the complex record when that scalar
+   name exists in the simvar hash table. Used to protect those scalar params
+   from constant-elimination — codegen later flattens the complex CREF into
+   the scalar field symbols, which must resolve at module eval time. =#
+# Per-cref handler for complex-field protection: identical logic on a DAE.CREF
+# leaf whether reached via the SIM walk or the DAE fallback.
+function _complexCrefFields!(names::OrderedSet{String}, @nospecialize(dcref), ht)
+  @match dcref begin
+    DAE.CREF(cr, ty) => begin
+      local baseName = DAE_identifierToString(cr)
+      if ty isa DAE.T_COMPLEX
+        for field in ty.varLst
+          local fieldName = Base.string(baseName, "_", field.name)
+          if haskey(ht, fieldName)
+            push!(names, fieldName)
+          end
+        end
+      else
+        #= Fallback: any cref X whose X_re and X_im scalars exist in HT.
+           Codegen will flatten X via flattenRecordCallArg into [X_re, X_im];
+           protect both even when the cref's ty was downgraded from T_COMPLEX. =#
+        local reName = Base.string(baseName, "_re")
+        local imName = Base.string(baseName, "_im")
+        if haskey(ht, reName) && haskey(ht, imName)
+          push!(names, reName)
+          push!(names, imName)
+        end
+      end
+    end
+    _ => nothing
+  end
+  return nothing
+end
+
+# Pure read-only walk over the SIM tree; convert only cref leaves to DAE
+# (toDAEExp(EXP_CREF) gives the same DAE.CREF the whole-tree conversion would).
+# Avoids building and rebuilding a parallel DAE tree per equation.
+function _walkComplexSIM!(names::OrderedSet{String}, e::Exp, ht)
+  if e isa EXP_CREF
+    _complexCrefFields!(names, toDAEExp(e), ht)
+  elseif e isa IFEXP
+    _walkComplexSIM!(names, e.cond, ht)
+    _walkComplexSIM!(names, e.thenExp, ht)
+    _walkComplexSIM!(names, e.elseExp, ht)
+  elseif e isa BINARY || e isa LBINARY || e isa RELATION
+    _walkComplexSIM!(names, e.exp1, ht)
+    _walkComplexSIM!(names, e.exp2, ht)
+  elseif e isa UNARY || e isa LUNARY
+    _walkComplexSIM!(names, e.exp, ht)
+  elseif e isa CALL
+    for a in e.args
+      _walkComplexSIM!(names, a, ht)
+    end
+  elseif e isa ARRAY_EXP
+    for x in e.elements
+      _walkComplexSIM!(names, x, ht)
+    end
+  elseif e isa ASUB
+    _walkComplexSIM!(names, e.exp, ht)
+    for s in e.subs
+      _walkComplexSIM!(names, s, ht)
+    end
+  elseif e isa TSUB || e isa RSUB || e isa CAST
+    _walkComplexSIM!(names, e.exp, ht)
+  elseif e isa RECORD
+    for x in e.exps
+      _walkComplexSIM!(names, x, ht)
+    end
+  elseif e isa TUPLE
+    for x in e.PR
+      _walkComplexSIM!(names, x, ht)
+    end
+  elseif e isa REDUCTION
+    _walkComplexSIM!(names, e.body, ht)
+  end
+  return names
+end
+
+_complexCrefDAEVisitor(@nospecialize(exp), ctx) =
+  (_complexCrefFields!(ctx[1], exp, ctx[2]); (exp, true, ctx))
+
+function _collectComplexFieldNames!(names::OrderedSet{String}, eqs, ht)
+  for eq in eqs
+    if eq isa RESIDUAL_EQUATION
+      _walkComplexSIM!(names, eq.exp, ht)
+    elseif eq isa EQUATION
+      _walkComplexSIM!(names, eq.lhs, ht)
+      _walkComplexSIM!(names, eq.rhs, ht)
+    elseif eq isa ARRAY_EQUATION
+      _walkComplexSIM!(names, eq.left, ht)
+      _walkComplexSIM!(names, eq.right, ht)
+    elseif eq isa BDAE.RESIDUAL_EQUATION
+      #= BDAE equations carry DAE.Exp fields; fall back to the DAE traversal. =#
+      Util.traverseExpTopDown(eq.exp, _complexCrefDAEVisitor, (names, ht))
+    elseif eq isa BDAE.EQUATION
+      Util.traverseExpTopDown(eq.lhs, _complexCrefDAEVisitor, (names, ht))
+      Util.traverseExpTopDown(eq.rhs, _complexCrefDAEVisitor, (names, ht))
+    elseif eq isa BDAE.COMPLEX_EQUATION || eq isa BDAE.ARRAY_EQUATION
+      Util.traverseExpTopDown(eq.left, _complexCrefDAEVisitor, (names, ht))
+      Util.traverseExpTopDown(eq.right, _complexCrefDAEVisitor, (names, ht))
+    end
+  end
+  return names
+end
+
+"""
+Collect all CREF names from a WHEN_STMTS node (condition + statements + elsewhen).
+"""
+function _collectWhenCrefNames!(names::OrderedSet{String}, whenStmts::WHEN_STMTS)
+  collectCrefNames!(names, whenStmts.condition)
+  for stmt in whenStmts.whenStmtLst
+    if stmt isa ASSIGN
+      collectCrefNames!(names, stmt.left)
+      collectCrefNames!(names, stmt.right)
+    elseif stmt isa REINIT
+      collectCrefNames!(names, stmt.stateVar)
+      collectCrefNames!(names, stmt.value)
+    elseif stmt isa NORETCALL
+      collectCrefNames!(names, stmt.exp)
+    elseif stmt isa ASSERT
+      collectCrefNames!(names, stmt.condition)
+      collectCrefNames!(names, stmt.message)
+    end
+  end
+  if whenStmts.elsewhenPart !== nothing
+    _collectWhenCrefNames!(names, whenStmts.elsewhenPart)
+  end
+  return names
+end
+
+function _collectWhenCrefNames!(names::OrderedSet{String}, whenStmts::BDAE.WHEN_STMTS)
+  collectCrefNames!(names, whenStmts.condition)
+  for stmt in whenStmts.whenStmtLst
+    @match stmt begin
+      BDAE.ASSIGN(__) => begin
+        collectCrefNames!(names, stmt.left)
+        collectCrefNames!(names, stmt.right)
+      end
+      BDAE.REINIT(__) => begin
+        collectCrefNames!(names, stmt.stateVar)
+        collectCrefNames!(names, stmt.value)
+      end
+      BDAE.NORETCALL(__) => collectCrefNames!(names, stmt.exp)
+      BDAE.ASSERT(__) => begin
+        collectCrefNames!(names, stmt.condition)
+        collectCrefNames!(names, stmt.message)
+      end
+      _ => ()
+    end
+  end
+  @match whenStmts.elsewhenPart begin
+    SOME(elseWhenEq) => _collectWhenCrefNames!(names, elseWhenEq.whenEquation)
+    NONE() => ()
+  end
+  return nothing
 end

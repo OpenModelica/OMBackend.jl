@@ -18,48 +18,6 @@ function buildAsubName(baseName::String, subs)::String
 end
 
 """
-    extractCrefName(exp::DAE.Exp)
-
-Extract the variable name from a CREF or ASUB(CREF, ...) expression.
-Returns `(name::String, cref::DAE.ComponentRef, ty::DAE.Type)` or `nothing`
-if the expression is not a simple variable reference.
-"""
-function extractCrefName(@nospecialize(exp))
-  # SIM.EXP_CREF (post-Phase-4b when-ASSIGN LHS) → DAE.CREF so the match fires.
-  if exp isa Exp
-    exp = toDAEExp(exp)
-  end
-  @match exp begin
-    DAE.CREF(cr, ty) => begin
-      return (DAE_identifierToString(cr), cr, ty)
-    end
-    #= ASUB-wrapped CREFs are skipped for alias detection.
-       The ASUB wraps a base CREF with subscripts, but the CREF itself does not
-       carry the subscripts. Eliminating an ASUB alias would replace the base CREF
-       in all equations (affecting all subscripts), breaking the equation balance.
-       These equations are better handled by MTK structural_simplify. =#
-    _ => return nothing
-  end
-end
-
-"""
-    isUnknownVarKind(varKind::SimVarType)::Bool
-
-Check if a variable kind represents an unknown (not a parameter or constant).
-Only unknowns participate in the equation-unknown balance.
-"""
-function isUnknownVarKind(@nospecialize(varKind::SimVarType))::Bool
-  @match varKind begin
-    STATE(__) => true
-    STATE_DERIVATIVE(__) => true
-    ALG_VARIABLE(__) => true
-    ARRAY(__) => true
-    DISCRETE(__) => true
-    _ => false
-  end
-end
-
-"""
     varKindPriority(varKind::SimVarType)::Int
 
 Return priority of a variable kind for alias representative selection.
@@ -698,133 +656,6 @@ function eliminateAliasVariables(simCode::SIM_CODE)
   return simCode
 end
 
-"""
-    eliminateConstantParameters(simCode::SIM_CODE) -> SIM_CODE
-
-Find every PARAMETER whose binding evaluates to a numeric/Bool literal,
-substitute the literal value at all use sites, and drop the parameter from
-`stringToSimVarHT`. This shrinks the parameter list MTK sees before
-`structural_simplify`, reducing per-simulate module-eval cost on large MSL
-models (where `foldParameterClosure` typically inflates the parameter count
-2x to 3x).
-
-Tier-1 only: skipped on VSS / sub-model / metaModel variants because
-a parameter eliminated here can no longer be re-bound at runtime by a
-structural transition or by recompilation. The gate matches the
-conservative envelope used by `eliminateAliasVariables`.
-
-Defensive checks:
-- Parameters that appear as representatives in `aliasMap` are NOT eliminated
-  (would orphan the alias entry).
-- A survivor scan after substitution keeps any parameter still referenced
-  somewhere the substitution missed (paranoia for unflatten CREF forms).
-"""
-#= For every DAE.CREF with T_COMPLEX type in the given equations, append
-   `<base>_<fieldname>` for each field of the complex record when that scalar
-   name exists in the simvar hash table. Used to protect those scalar params
-   from constant-elimination — codegen later flattens the complex CREF into
-   the scalar field symbols, which must resolve at module eval time. =#
-# Per-cref handler for complex-field protection: identical logic on a DAE.CREF
-# leaf whether reached via the SIM walk or the DAE fallback.
-function _complexCrefFields!(names::OrderedSet{String}, @nospecialize(dcref), ht)
-  @match dcref begin
-    DAE.CREF(cr, ty) => begin
-      local baseName = DAE_identifierToString(cr)
-      if ty isa DAE.T_COMPLEX
-        for field in ty.varLst
-          local fieldName = Base.string(baseName, "_", field.name)
-          if haskey(ht, fieldName)
-            push!(names, fieldName)
-          end
-        end
-      else
-        #= Fallback: any cref X whose X_re and X_im scalars exist in HT.
-           Codegen will flatten X via flattenRecordCallArg into [X_re, X_im];
-           protect both even when the cref's ty was downgraded from T_COMPLEX. =#
-        local reName = Base.string(baseName, "_re")
-        local imName = Base.string(baseName, "_im")
-        if haskey(ht, reName) && haskey(ht, imName)
-          push!(names, reName)
-          push!(names, imName)
-        end
-      end
-    end
-    _ => nothing
-  end
-  return nothing
-end
-
-# Pure read-only walk over the SIM tree; convert only cref leaves to DAE
-# (toDAEExp(EXP_CREF) gives the same DAE.CREF the whole-tree conversion would).
-# Avoids building and rebuilding a parallel DAE tree per equation.
-function _walkComplexSIM!(names::OrderedSet{String}, e::Exp, ht)
-  if e isa EXP_CREF
-    _complexCrefFields!(names, toDAEExp(e), ht)
-  elseif e isa IFEXP
-    _walkComplexSIM!(names, e.cond, ht)
-    _walkComplexSIM!(names, e.thenExp, ht)
-    _walkComplexSIM!(names, e.elseExp, ht)
-  elseif e isa BINARY || e isa LBINARY || e isa RELATION
-    _walkComplexSIM!(names, e.exp1, ht)
-    _walkComplexSIM!(names, e.exp2, ht)
-  elseif e isa UNARY || e isa LUNARY
-    _walkComplexSIM!(names, e.exp, ht)
-  elseif e isa CALL
-    for a in e.args
-      _walkComplexSIM!(names, a, ht)
-    end
-  elseif e isa ARRAY_EXP
-    for x in e.elements
-      _walkComplexSIM!(names, x, ht)
-    end
-  elseif e isa ASUB
-    _walkComplexSIM!(names, e.exp, ht)
-    for s in e.subs
-      _walkComplexSIM!(names, s, ht)
-    end
-  elseif e isa TSUB || e isa RSUB || e isa CAST
-    _walkComplexSIM!(names, e.exp, ht)
-  elseif e isa RECORD
-    for x in e.exps
-      _walkComplexSIM!(names, x, ht)
-    end
-  elseif e isa TUPLE
-    for x in e.PR
-      _walkComplexSIM!(names, x, ht)
-    end
-  elseif e isa REDUCTION
-    _walkComplexSIM!(names, e.body, ht)
-  end
-  return names
-end
-
-_complexCrefDAEVisitor(@nospecialize(exp), ctx) =
-  (_complexCrefFields!(ctx[1], exp, ctx[2]); (exp, true, ctx))
-
-function _collectComplexFieldNames!(names::OrderedSet{String}, eqs, ht)
-  for eq in eqs
-    if eq isa RESIDUAL_EQUATION
-      _walkComplexSIM!(names, eq.exp, ht)
-    elseif eq isa EQUATION
-      _walkComplexSIM!(names, eq.lhs, ht)
-      _walkComplexSIM!(names, eq.rhs, ht)
-    elseif eq isa ARRAY_EQUATION
-      _walkComplexSIM!(names, eq.left, ht)
-      _walkComplexSIM!(names, eq.right, ht)
-    elseif eq isa BDAE.RESIDUAL_EQUATION
-      #= BDAE equations carry DAE.Exp fields; fall back to the DAE traversal. =#
-      Util.traverseExpTopDown(eq.exp, _complexCrefDAEVisitor, (names, ht))
-    elseif eq isa BDAE.EQUATION
-      Util.traverseExpTopDown(eq.lhs, _complexCrefDAEVisitor, (names, ht))
-      Util.traverseExpTopDown(eq.rhs, _complexCrefDAEVisitor, (names, ht))
-    elseif eq isa BDAE.COMPLEX_EQUATION || eq isa BDAE.ARRAY_EQUATION
-      Util.traverseExpTopDown(eq.left, _complexCrefDAEVisitor, (names, ht))
-      Util.traverseExpTopDown(eq.right, _complexCrefDAEVisitor, (names, ht))
-    end
-  end
-  return names
-end
-
 #= AUDIT (ombackend-bug-audit-2026-06-05 #9): substituteAliasCref legitimately
    wraps a NEGATED alias as UNARY(UMINUS, rep), but on an ASSIGN/REINIT target
    that is an invalid lvalue. Redistribute the sign to the value side, which is
@@ -1030,58 +861,6 @@ function _substituteAliasInInitialDAEElse(else_, aliasMap)
                  _substituteAliasInInitialDAEElse(rest, aliasMap))
     _ => else_
   end
-end
-
-"""
-Collect all CREF names from a WHEN_STMTS node (condition + statements + elsewhen).
-"""
-function _collectWhenCrefNames!(names::OrderedSet{String}, whenStmts::WHEN_STMTS)
-  collectCrefNames!(names, whenStmts.condition)
-  for stmt in whenStmts.whenStmtLst
-    if stmt isa ASSIGN
-      collectCrefNames!(names, stmt.left)
-      collectCrefNames!(names, stmt.right)
-    elseif stmt isa REINIT
-      collectCrefNames!(names, stmt.stateVar)
-      collectCrefNames!(names, stmt.value)
-    elseif stmt isa NORETCALL
-      collectCrefNames!(names, stmt.exp)
-    elseif stmt isa ASSERT
-      collectCrefNames!(names, stmt.condition)
-      collectCrefNames!(names, stmt.message)
-    end
-  end
-  if whenStmts.elsewhenPart !== nothing
-    _collectWhenCrefNames!(names, whenStmts.elsewhenPart)
-  end
-  return names
-end
-
-function _collectWhenCrefNames!(names::OrderedSet{String}, whenStmts::BDAE.WHEN_STMTS)
-  collectCrefNames!(names, whenStmts.condition)
-  for stmt in whenStmts.whenStmtLst
-    @match stmt begin
-      BDAE.ASSIGN(__) => begin
-        collectCrefNames!(names, stmt.left)
-        collectCrefNames!(names, stmt.right)
-      end
-      BDAE.REINIT(__) => begin
-        collectCrefNames!(names, stmt.stateVar)
-        collectCrefNames!(names, stmt.value)
-      end
-      BDAE.NORETCALL(__) => collectCrefNames!(names, stmt.exp)
-      BDAE.ASSERT(__) => begin
-        collectCrefNames!(names, stmt.condition)
-        collectCrefNames!(names, stmt.message)
-      end
-      _ => ()
-    end
-  end
-  @match whenStmts.elsewhenPart begin
-    SOME(elseWhenEq) => _collectWhenCrefNames!(names, elseWhenEq.whenEquation)
-    NONE() => ()
-  end
-  return nothing
 end
 
 function _collectInitialAlgorithmCrefNames!(names::OrderedSet{String}, ia::INITIAL_ALGORITHM)
@@ -1483,26 +1262,6 @@ function parseSubscriptsFromName(name::String)::MetaModelica.List{DAE.Subscript}
   return MetaModelica.listReverse(subs)
 end
 
-"""
-    removeRedundantEquations(simCode::SIM_CODE) -> SIM_CODE
-
-Post-alias-elimination over-determination reduction.
-
-After alias elimination, some residual equations may become structurally
-redundant: they mention only unknowns that are already uniquely determined
-by other equations. This produces more equations than unknowns
-(ExtraEquationsSystemException in MTK structural_simplify).
-
-This pass computes a maximum bipartite matching of residual equations to
-surviving unknowns. Equations that cannot be matched to any still-free
-unknown are algebraically implied by the matched equations (assuming the
-original Modelica model is well-posed) and are safely removed.
-
-Typical trigger: balanced 3-phase star networks where the Kirchhoff current
-law `i[1]+i[2]+i[3]=0` is a zero-sum identity implied by the three
-per-phase Ohm's law equations, but survives alias elimination as an extra
-residual.
-"""
 #= Detect residual of the form `0 = var - expr` or `0 = expr - var`
    where var is a simple unknown CREF and expr is anything more complex
    than a single CREF. Returns (name, cref, ty, exprKey) or nothing.
