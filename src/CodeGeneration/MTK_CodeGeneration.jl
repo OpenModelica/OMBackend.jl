@@ -1322,7 +1322,10 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
       OMBackend.CodeGeneration.checkNamedStateLookups(problem, $(NAMED_STATE_LOOKUPS))
       $(emitDiscreteClusters(simCode))
-      callbacks = OMBackend.CodeGeneration.withDelayEvents(callbacks, $(QuoteNode(Symbol(MODEL_NAME))))
+      #= Only with delay() calls: a callback on every model made each one a model with
+         events (OMSurrogates' UDEs refuse those). =#
+      $(isempty(MTK_CodeGenerationUtil.DELAY_CALLS) ? :() :
+        :(callbacks = OMBackend.CodeGeneration.withDelayEvents(callbacks, $(QuoteNode(Symbol(MODEL_NAME))))))
       $(emitRelationRefresh(IF_RELATIONS))
       callbacks = OMBackend.CodeGeneration.withIntegralDiscretes(callbacks, problem, $(integralDiscreteNames(discreteVariablesSym, simCode)))
       #= Asserts after the event iteration: they check the settled state. =#
