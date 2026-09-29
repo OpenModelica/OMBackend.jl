@@ -46,4 +46,14 @@ the tolerance and projects the step ends onto the algebraic equations.
   @test !control.active
   ODE.init(prob, rodas; callback = cbs)
   @test control.active
+
+  #= The algebraic block from the problem's Jacobian: a precomputed pick of
+     where jac[rows, rows] is stored (a sparse Jacobian's nonzeros, 0 for a
+     structural zero; a dense one's linear index). =#
+  local rows = [2, 3]
+  for jac in ([1.0 2 3; 4 5 6; 7 8 9], CG._SparseArrays.sparse([1.0 0 3; 0 5 0; 7 0 9]))
+    local pick = CG._jacobianPick(jac, rows)
+    local vals = CG._storedValues(jac)
+    @test reshape([idx == 0 ? 0.0 : vals[idx] for idx in pick], 2, 2) == Matrix(jac)[rows, rows]
+  end
 end

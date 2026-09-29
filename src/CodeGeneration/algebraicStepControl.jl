@@ -42,20 +42,30 @@ from event callbacks.
 mutable struct AlgebraicStepControl
   rows::Vector{Int}          # the algebraic rows, which are also the algebraic unknowns
   active::Bool               # this solve: a Rodas method, adaptive, the mass-matrix form
-  u::Any                     # a state inside the step or at its end
-  f0::Any                    # f at u
-  f1::Any                    # f with one algebraic unknown perturbed
-  g::Any                     # f[rows]
-  jac::Any                   # the full Jacobian when the problem has one (f.jac), else nothing
-  J::Any                     # d f[rows] / d u[rows] at the step's midpoint
-  lu::Any                    # its factorization, or nothing when singular
+  work::Any                  # this solve's AlgebraicWork (the state's element type), or nothing
   capDt::Float64             # the step and its error when the current run of caps began (0: no run)
   capErr::Float64
   floorErr::Float64          # an error that did not shrink with the step: errors up to twice it do not cap
 end
 
-AlgebraicStepControl(rows::Vector{Int}) =
-  AlgebraicStepControl(rows, false, nothing, nothing, nothing, nothing, nothing, nothing, nothing, 0.0, 0.0, 0.0)
+AlgebraicStepControl(rows::Vector{Int}) = AlgebraicStepControl(rows, false, nothing, 0.0, 0.0, 0.0)
+
+#= A solve's work arrays, concretely typed: the work after a step runs behind
+   one dynamic dispatch (_control!). The fields were `Any` (a dispatch per
+   access), the factorization and each solve allocated, and a sparse
+   Jacobian's algebraic block was read entry by entry with a search each
+   (item 3 of the consolidation: 77 % of the MSL AIMC_DOL's solve). =#
+struct AlgebraicWork{V<:AbstractVector, G<:AbstractVector, M<:AbstractMatrix, JC, JV}
+  u::V                       # a state inside the step or at its end
+  f0::V                      # f at u
+  f1::V                      # f with one algebraic unknown perturbed
+  g::G                       # f[rows]
+  correction::G              # a Newton correction of the algebraic unknowns
+  J::M                       # d f[rows] / d u[rows] at the step's midpoint, factorized in place
+  jac::JC                    # the full Jacobian when the problem has one (f.jac), else nothing
+  jacValues::JV              # its stored values (a sparse Jacobian's nonzeros, a dense one's elements)
+  pick::Vector{Int}          # where each entry of J (column-major) is in jacValues; 0: not stored (zero)
+end
 
 """
     isStepControl(callback) -> Bool
@@ -93,6 +103,31 @@ end
    step, no FSAL derivative. By name: the Rosenbrock methods differ in FSAL. =#
 _isRodas(alg) = startswith(string(nameof(typeof(alg))), "Rodas")
 
+const _SparseArrays = Symbolics.SparseArrays
+
+#= Where the entries of jac[rows, rows] are stored (column-major over J):
+   an index into a sparse Jacobian's nonzeros (0 where it stores none), or a
+   dense one's linear index. =#
+function _jacobianPick(jac, rows::Vector{Int})::Vector{Int}
+  local pick = Vector{Int}(undef, length(rows)^2)
+  local n = 0
+  for k in rows, r in rows
+    n += 1
+    pick[n] = _storedIndex(jac, r, k)
+  end
+  return pick
+end
+_storedIndex(jac::AbstractMatrix, r::Int, k::Int) = LinearIndices(jac)[r, k]
+function _storedIndex(jac::_SparseArrays.AbstractSparseMatrixCSC, r::Int, k::Int)
+  local rv = _SparseArrays.rowvals(jac)
+  for idx in _SparseArrays.nzrange(jac, k)
+    rv[idx] == r && return idx
+  end
+  return 0
+end
+_storedValues(jac::_SparseArrays.AbstractSparseMatrixCSC) = _SparseArrays.nonzeros(jac)
+_storedValues(jac::AbstractMatrix) = vec(jac)
+
 #= At the start of a solve: whether it applies (a Rodas method with adaptive
    steps on the mass-matrix form: a DAE solver gets the residual form), and
    work arrays of the state's element type (dual numbers under ForwardDiff). =#
@@ -103,109 +138,115 @@ function _startStepControl!(c::AlgebraicStepControl, integrator)
   c.active || return nothing
   c.capDt = 0.0; c.capErr = 0.0; c.floorErr = 0.0
   local u = integrator.u
-  c.u = similar(u); c.f0 = similar(u); c.f1 = similar(u)
-  c.g = similar(u, length(c.rows))
-  c.J = similar(u, length(c.rows), length(c.rows))
-  local jac = hasproperty(f, :jac) ? f.jac : nothing
-  c.jac = jac === nothing ? nothing :
-          (hasproperty(f, :jac_prototype) && f.jac_prototype !== nothing ? similar(f.jac_prototype, eltype(u)) :
-                                                                          similar(u, length(u), length(u)))
+  local n = length(c.rows)
+  local fjac = hasproperty(f, :jac) ? f.jac : nothing
+  local jac = fjac === nothing ? nothing :
+              (hasproperty(f, :jac_prototype) && f.jac_prototype !== nothing ? similar(f.jac_prototype, eltype(u)) :
+                                                                              similar(u, length(u), length(u)))
+  c.work = AlgebraicWork(similar(u), similar(u), similar(u), similar(u, n), similar(u, n), similar(u, n, n),
+                         jac, jac === nothing ? nothing : _storedValues(jac),
+                         jac === nothing ? Int[] : _jacobianPick(jac, c.rows))
   return nothing
 end
 
 #= The tolerance-scaled RMS norm of a correction of the algebraic unknowns at u. =#
-function _scaledNorm(c::AlgebraicStepControl, integrator, correction, u)
+function _scaledNorm(rows::Vector{Int}, integrator, correction, u)
   local abstol = integrator.opts.abstol
   local reltol = integrator.opts.reltol
   local total = zero(real(eltype(u)))
-  for (i, k) in enumerate(c.rows)
+  for (i, k) in enumerate(rows)
     local scale = (abstol isa Number ? abstol : abstol[k]) + (reltol isa Number ? reltol : reltol[k]) * abs(u[k])
     total += (correction[i] / scale)^2
   end
-  return sqrt(total / length(c.rows))
+  return sqrt(total / length(rows))
 end
 
-#= f[rows] at (c.u, t) into c.g. =#
-function _algebraicResidual!(c::AlgebraicStepControl, integrator, t)
-  integrator.f(c.f0, c.u, integrator.p, t)
-  for (i, r) in enumerate(c.rows)
-    c.g[i] = c.f0[r]
+#= f[rows] at (w.u, t) into w.g. =#
+function _algebraicResidual!(w::AlgebraicWork, rows::Vector{Int}, integrator, t)
+  integrator.f(w.f0, w.u, integrator.p, t)
+  for (i, r) in enumerate(rows)
+    w.g[i] = w.f0[r]
   end
-  return c.g
+  return w.g
 end
 
-#= d f[rows] / d u[rows] at (c.u, t) into c.J: from the problem's Jacobian
-   when it has one, else by forward differences; factorized into c.lu. =#
-function _algebraicJacobian!(c::AlgebraicStepControl, integrator, t)
+#= d f[rows] / d u[rows] at (w.u, t) into w.J: from the problem's Jacobian
+   when it has one, else by forward differences; factorized in place. The
+   factorization, or nothing when singular. =#
+function _algebraicJacobian!(w::AlgebraicWork, rows::Vector{Int}, integrator, t)
   local f = integrator.f
   local p = integrator.p
-  if c.jac !== nothing
-    f.jac(c.jac, c.u, p, t)
-    for (j, k) in enumerate(c.rows), (i, r) in enumerate(c.rows)
-      c.J[i, j] = c.jac[r, k]
+  if w.jac !== nothing
+    f.jac(w.jac, w.u, p, t)
+    local vals = w.jacValues
+    for (n, idx) in enumerate(w.pick)
+      w.J[n] = idx == 0 ? zero(eltype(w.J)) : vals[idx]
     end
   else
-    f(c.f0, c.u, p, t)
-    for (j, k) in enumerate(c.rows)
-      local uk = c.u[k]
+    f(w.f0, w.u, p, t)
+    for (j, k) in enumerate(rows)
+      local uk = w.u[k]
       local h = sqrt(eps(Float64)) * max(1.0, abs(uk))
-      c.u[k] = uk + h
-      f(c.f1, c.u, p, t)
-      c.u[k] = uk
-      for (i, r) in enumerate(c.rows)
-        c.J[i, j] = (c.f1[r] - c.f0[r]) / h
+      w.u[k] = uk + h
+      f(w.f1, w.u, p, t)
+      w.u[k] = uk
+      for (i, r) in enumerate(rows)
+        w.J[i, j] = (w.f1[r] - w.f0[r]) / h
       end
     end
   end
-  local lu = LinearAlgebra.lu(c.J; check = false)
-  c.lu = LinearAlgebra.issuccess(lu) ? lu : nothing
-  return c.lu
+  local F = LinearAlgebra.lu!(w.J; check = false)
+  return LinearAlgebra.issuccess(F) ? F : nothing
 end
 
 #= The largest error of the dense output of the algebraic unknowns at the
    check points of the last step, in the solver's error norm (1 is the
-   tolerance). Leaves the factorized Jacobian (at the midpoint) in c.lu. =#
-function _algebraicError!(c::AlgebraicStepControl, integrator)
-  c.lu = nothing
+   tolerance), and the factorized Jacobian at the midpoint (nothing when
+   singular or when the step has no length). =#
+function _algebraicError!(w::AlgebraicWork, rows::Vector{Int}, integrator)
   local t0 = integrator.tprev
   local dt = integrator.t - t0
+  local zeroErr = zero(real(eltype(w.u)))
   #= A step of no length (at a tstop) has no interpolation of its own. =#
-  abs(dt) <= 8 * eps(max(abs(t0), 1.0)) && return 0.0
-  integrator(c.u, t0 + dt / 2)
-  _algebraicJacobian!(c, integrator, t0 + dt / 2) === nothing && return 0.0   # singular: nothing to judge
-  local err = zero(real(eltype(c.u)))
+  abs(dt) <= 8 * eps(max(abs(t0), 1.0)) && return (zeroErr, nothing)
+  integrator(w.u, t0 + dt / 2)
+  local F = _algebraicJacobian!(w, rows, integrator, t0 + dt / 2)
+  F === nothing && return (zeroErr, nothing)   # singular: nothing to judge
+  local err = zeroErr
   for θ in _ALGEBRAIC_CHECK_POINTS
     local tθ = t0 + θ * dt
-    integrator(c.u, tθ)
-    err = max(err, _scaledNorm(c, integrator, c.lu \ _algebraicResidual!(c, integrator, tθ), c.u))
+    integrator(w.u, tθ)
+    LinearAlgebra.ldiv!(w.correction, F, _algebraicResidual!(w, rows, integrator, tθ))
+    err = max(err, _scaledNorm(rows, integrator, w.correction, w.u))
   end
-  return err
+  return (err, F)
 end
 
 #= Newton on the algebraic rows at the step end, differential unknowns kept.
    Kept only if it converges; the state is left as it was otherwise. =#
-function _projectStepEnd!(c::AlgebraicStepControl, integrator)
-  c.lu === nothing && return nothing
+function _projectStepEnd!(w::AlgebraicWork, rows::Vector{Int}, F, integrator)
+  F === nothing && return nothing
   local u = integrator.u
-  copyto!(c.u, u)
+  copyto!(w.u, u)
   for _ in 1:_PROJECTION_ITERATIONS
-    local correction = try
-      c.lu \ _algebraicResidual!(c, integrator, integrator.t)
+    try
+      LinearAlgebra.ldiv!(w.correction, F, _algebraicResidual!(w, rows, integrator, integrator.t))
     catch err
       #= The model's residual threw (a singular factorization is `nothing`): no projection. =#
       OMBackend._fallback(err, :algebraicProjection)
       return nothing
     end
+    local correction = w.correction
     local roundoff = true
-    for (i, k) in enumerate(c.rows)
-      c.u[k] -= correction[i]
-      roundoff &= abs(correction[i]) <= 16 * eps(max(abs(c.u[k]), 1.0))
+    for (i, k) in enumerate(rows)
+      w.u[k] -= correction[i]
+      roundoff &= abs(correction[i]) <= 16 * eps(max(abs(w.u[k]), 1.0))
     end
-    local step = _scaledNorm(c, integrator, correction, c.u)
+    local step = _scaledNorm(rows, integrator, correction, w.u)
     isfinite(step) || return nothing
     if step < _PROJECTION_TOLERANCE || roundoff
-      for k in c.rows
-        u[k] = c.u[k]
+      for k in rows
+        u[k] = w.u[k]
       end
       return nothing
     end
@@ -219,8 +260,13 @@ end
    event: the event iteration solves the algebraic unknowns then. =#
 function (c::AlgebraicStepControl)(u, t, integrator)
   (c.active && !_continuousEventFired(integrator)) || return false
+  _control!(c, c.work, integrator)
+  return false
+end
+
+function _control!(c::AlgebraicStepControl, w::AlgebraicWork, integrator)
   local dt = integrator.t - integrator.tprev
-  local err = _algebraicError!(c, integrator)
+  local (err, F) = _algebraicError!(w, c.rows, integrator)
   if isfinite(err) && err > 0
     #= An error floor: since a run of caps began the step has at least halved
        and the error has not (it falls like dt^4 where the step causes it). It
@@ -244,8 +290,8 @@ function (c::AlgebraicStepControl)(u, t, integrator)
       c.capDt = abs(dt); c.capErr = err
     end
   end
-  _projectStepEnd!(c, integrator)
-  return false
+  _projectStepEnd!(w, c.rows, F, integrator)
+  return nothing
 end
 
 """
