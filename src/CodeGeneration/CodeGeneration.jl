@@ -86,6 +86,11 @@ include("./relationRefresh.jl")
 include("./delays.jl")
 include("./algebraicStepControl.jl")
 include("./MTK_CodeGeneration.jl")
+include("./mtkInitialization.jl")
+include("./mtkIfEquations.jl")
+include("./mtkDiscreteEvents.jl")
+include("./mtkParameters.jl")
+include("./mtkDeclarations.jl")
 include("./DiscreteDummyDemotion.jl")
 
 #= The when-callback emitter (the MTK path uses it) and expToJuliaExp (the
