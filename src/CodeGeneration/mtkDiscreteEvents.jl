@@ -658,7 +658,7 @@ function freeParametersDecl(simCode)::Expr
      DiodeBridge2mPulse need. =#
   local assigned = OrderedSet{String}()
   for ieq in simCode.initialEquations
-    local sides = try equationSides(ieq) catch; nothing end
+    local sides = OMBackend._tryOr(() -> equationSides(ieq), nothing, :freeParametersEquationSides)
     sides === nothing && continue
     for side in sides
       side isa DAE.CREF && push!(assigned, string(side))
@@ -906,6 +906,7 @@ function emitAssertCallback(simCode)::Expr
     local cond = try
       _daeBoolMem(a.condition, obsAcc, simCode)
     catch err
+      OMBackend._fallback(err, :assertCondition)
       @warn "[MTK GEN: asserts] an assert cannot be checked at run time; it is left out" condition = string(a.condition) exception = err
       continue
     end
@@ -938,7 +939,8 @@ Base.@nospecializeinfer function _assertMessageExpr(@nospecialize(msg::DAE.Exp),
   end
   return try
     part(msg)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :assertMessage)
     string(msg)
   end
 end
@@ -1406,6 +1408,7 @@ function createTerminalBodyRunner(simCode::SimulationCode.SIM_CODE)
           $(perWhen...)
         end
       catch _terminalErr
+        OMBackend._fallback(_terminalErr, :terminalBody)
         @warn "when terminal() body could not be evaluated; returning the completed solution unchanged" exception = _terminalErr
       end
     end

@@ -102,7 +102,8 @@ function _ifEquationSortKey(ifEq::SimulationCode.IF_EQUATION, simCode)::String
       end
       isempty(targets) || break
     end
-  catch
+  catch _e
+    OMBackend._fallback(_e, :ifEquationSortKeyTargets)
     empty!(targets)
   end
   if isempty(targets)
@@ -110,7 +111,8 @@ function _ifEquationSortKey(ifEq::SimulationCode.IF_EQUATION, simCode)::String
       for branch in ifEq.branches
         push!(targets, string(branch.condition))
       end
-    catch
+    catch _e
+      OMBackend._fallback(_e, :ifEquationSortKeyString)
       return ""
     end
   end
@@ -122,7 +124,8 @@ function _ifConditionDependsOnTime(@nospecialize(condition))::Bool
   local refs::OrderedSet{String} = OrderedSet{String}()
   try
     SimulationCode.collectCrefNames!(refs, condition)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :ifConditionDependsOnTime)
     return false
   end
   return "time" in refs
@@ -146,7 +149,8 @@ function _ifConditionIsPureTimeEvent(@nospecialize(condition), simCode)::Bool
   local refs::OrderedSet{String} = OrderedSet{String}()
   try
     SimulationCode.collectCrefNames!(refs, condition)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :ifConditionIsPureTimeEvent)
     return false
   end
   ("time" in refs) || return false
@@ -206,7 +210,8 @@ function _conditionReferencesRelayTarget(@nospecialize(condition), rT0)::Bool
   local refs::OrderedSet{String} = OrderedSet{String}()
   try
     SimulationCode.collectCrefNames!(refs, condition)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :conditionReferencesRelayTarget)
     return false
   end
   for name in refs
@@ -237,7 +242,8 @@ function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode,
   local explicit = Set{Symbol}()
   try
     (valMap, explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :fixedPointT0ValueMap)
     valMap = nothing
   end
   local ivs = Bool[true for _ in condBranches]
@@ -265,7 +271,8 @@ function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode,
           local key = Symbol(MTK_CodeGenerationUtil._causalLhsKey(lhsE))
           local val = MTK_CodeGenerationUtil.evalCausalRHSAtT0(rhsE, mergedMap, mergedExplicit)
           val === nothing ? nothing : (key => Float64(val))
-        catch
+        catch _e
+          OMBackend._fallback(_e, :fixedPointT0Eval)
           nothing
         end
         if gv !== nothing && (!haskey(rT0, gv.first) || rT0[gv.first] != gv.second)
@@ -313,7 +320,8 @@ function createIfEquation(stateVariables::Vector,
       local mc = transformToMTKContinuousConditionEquation(b.condition, simCode)
       push!(allZcs, _extractZeroCrossingLHS(mc))
       push!(allClosed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
-    catch
+    catch _e
+      OMBackend._fallback(_e, :ifEquationZeroCrossings, impact = :result)
       empty!(allZcs)
       empty!(allClosed)
       break
@@ -545,7 +553,8 @@ function createIfEquation(stateVariables::Vector,
   if selBranch !== nothing
     try
       (_t0ValMap, _t0Explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
-    catch
+    catch _e
+      OMBackend._fallback(_e, :ifEquationT0ValueMap)
       _t0ValMap = nothing
     end
   end
@@ -576,7 +585,8 @@ function createIfEquation(stateVariables::Vector,
         local selEq = MTK_CodeGenerationUtil._branchResidualForLhs(selBranch, lhsKey, resEqIdx, simCode)
         MTK_CodeGenerationUtil.evalCausalRHSAtT0(
           first(deCausalize(selEq, simCode)), _t0ValMap, _t0Explicit)
-      catch
+      catch _e
+        OMBackend._fallback(_e, :ifEquationT0Eval)
         nothing
       end
       gv === nothing || push!(relayGuesses, :($(string(_unwrapBlockExpr(lhsExpr))) => $(gv)))

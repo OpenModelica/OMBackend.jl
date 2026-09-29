@@ -385,4 +385,7 @@ import .ExampleDAEs
   #= ── 10. Step control for algebraic unknowns ─────────────────── =#
   include("algebraicStepControlTests.jl")
 
+  #= ── 11. The error policy of fallbacks ───────────────────────── =#
+  include("errorPolicyTests.jl")
+
 end

@@ -46,6 +46,7 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
     local lhs = try
       expToJuliaExpMTK(ieqLhsDAE, simCode)
     catch err
+      OMBackend._fallback(err, :initialConstraintLhs)
       @warn "[CODEGEN: initialConstraints] failed to lower LHS; constraint dropped" lhs=ieqLhsDAE err
       continue
     end
@@ -70,6 +71,7 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
         _ => evalDAE_Expression(ieqRhsDAE, simCode)
       end
     catch err
+      OMBackend._fallback(err, :initialConstraintRhs)
       @warn "[CODEGEN: initialConstraints] failed to lower RHS; constraint dropped" rhs=ieqRhsDAE err
       continue
     end
@@ -433,12 +435,14 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
       return :( $(sym) = $(lowerAlg(wStmt.right));
          try
            ModelingToolkit.SciMLBase.setu(LATEST_PROBLEM, $(QuoteNode(sym)))(LATEST_PROBLEM, $(sym))
-         catch
+         catch _e
+           OMBackend._fallback(_e, :initialWhenSetu)
            nothing
          end;
          try
            _hard[getproperty(LATEST_REDUCED_SYSTEM, $(QuoteNode(sym)))] = $(sym)
-         catch
+         catch _e
+           OMBackend._fallback(_e, :initialWhenHardStart)
            nothing
          end;
          nothing )
@@ -610,7 +614,7 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
     end
     local algSym = Symbol("_alg_" * name)
     local qn = QuoteNode(Symbol(name))
-    push!(captures, :(try; _results[$(qn)] = Float64($(algSym)); catch; nothing; end))
+    push!(captures, :(try; _results[$(qn)] = Float64($(algSym)); catch _e; OMBackend._fallback(_e, :initAlgEarlyCapture; expect = UndefVarError); nothing; end))
   end
   return quote
     function __runInitialAlgorithmEarly!()
@@ -622,6 +626,7 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
           $(captures...)
         end
       catch _err
+        OMBackend._fallback(_err, :initAlgEarlyBody, impact = :result)
         @debug "[MTK GEN: init-alg early] body raised; partial results returned" exception=_err
       end
       return _results
@@ -734,7 +739,8 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
                   end
                   _v < 1 ? 1 : _v
                 end
-              catch
+              catch _e
+                OMBackend._fallback(_e, :initAlgGetuFetch, impact = :result)
                 1
               end))))
         continue
@@ -747,7 +753,8 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
       Expr(:(=), sym,
         :(try
             Float64(ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))(LATEST_PROBLEM))
-          catch
+          catch _e
+            OMBackend._fallback(_e, :initAlgGetuValue, impact = :result)
             0.0
           end))))
   end

@@ -208,14 +208,16 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   # that splitInitialValues could not map (pre-simplification names do not match).
   local systemGuesses = try
     ModelingToolkit.guesses(reducedSystem)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :buildDirectRHSProblem_1)
     Dict()
   end
   local (hardInitialValues, initEqPinKeys) = _collectHardInitializationValues(
     reducedSystem, finalInitialValues; resolvedParams=initResolved)
   local observedEquations = try
     ModelingToolkit.observed(reducedSystem)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :buildDirectRHSProblem_2)
     Symbolics.Equation[]
   end
   local u0 = _buildStateVector(states, finalInitialValues; resolvedParams=resolvedParams,
@@ -243,7 +245,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
   OMBackend.envSwitch("OMBACKEND_INIT_TRACE") &&
     println("[initu0] states ", states, "\n[initu0] hard starts ", finalInitialValues, "\n[initu0] guesses ", systemGuesses,
-            "\n[initu0] initialization equations ", try ModelingToolkit.initialization_equations(reducedSystem) catch; "?" end,
+            "\n[initu0] initialization equations ", OMBackend._tryOr(() -> ModelingToolkit.initialization_equations(reducedSystem), "?", :buildDirectRHSProblem_3),
             "\n[initu0] u0 ", u0)
 
   #= Symbolic sparse Jacobian; nothing when not differentiable. Built after
@@ -323,7 +325,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       reducedSystem, states; resolvedParams=initResolved)
     local eqLabels = try
       ModelingToolkit.equations(reducedSystem)
-    catch
+    catch _e
+      OMBackend._fallback(_e, :buildDirectRHSProblem_4)
       nothing
     end
     #= Signal-valued initialization equations become extra residual rows of
@@ -408,7 +411,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       try
         assignParams!(p, u, t)
       catch e
-        e isa InterruptException && rethrow()
+        OMBackend._fallback(e, :buildDirectRHSProblem_5)
         fill!(du, NaN)
         return nothing
       end
@@ -418,7 +421,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       local duProbe = similar(u0)
       initRhs(duProbe, u0, p_vec, 0.0)
       all(isfinite, rowsAt(p_vec)(duProbe, u0))
-    catch
+    catch _e
+      OMBackend._fallback(_e, :buildDirectRHSProblem_6, impact = :result)
       false
     end
     local parts = Any[]
@@ -457,7 +461,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     u0 = try
       solveFree(u0, p_vec)
     catch e
-      e isa InterruptException && rethrow()
+      OMBackend._fallback(e, :buildDirectRHSProblem_7, impact = :result)
       #= The relations at the failed solve's last point: where one differs, the
          initialization is solved again from the entry with it (the event
          iteration of the initialization, before a solution exists). =#
@@ -465,7 +469,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
         try
           solveFree(copy(uEntry), p_vec)
         catch e2
-          e2 isa InterruptException && rethrow()
+          OMBackend._fallback(e2, :buildDirectRHSProblem_8, impact = :result)
           nothing
         end : nothing
       if retried !== nothing
@@ -541,7 +545,8 @@ function _collectHardInitializationValues(reducedSystem, finalInitialValues;
   end
   local initEqs = try
     ModelingToolkit.initialization_equations(reducedSystem)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :_collectHardInitializationValues)
     return (values, constraintKeys)
   end
   for eq in initEqs
@@ -564,7 +569,8 @@ function _literalNumericValue(val)
   raw isa Number && return Float64(raw)
   raw = try
     Symbolics.value(raw)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :_literalNumericValue)
     return nothing
   end
   raw = raw isa Symbolics.Num ? Symbolics.unwrap(raw) : raw
@@ -578,7 +584,8 @@ function _derivativeInitializationTargets(reducedSystem, states;
   local targets = Pair{Int, Float64}[]
   local initEqs = try
     ModelingToolkit.initialization_equations(reducedSystem)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :_derivativeInitializationTargets)
     return targets
   end
   for eq in initEqs
@@ -611,7 +618,8 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
   OMBackend.envSwitch("OMBACKEND_INIT_SYMBOLIC_EQS") || return nothing
   local initEqs = try
     ModelingToolkit.initialization_equations(reducedSystem)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :_symbolicInitializationResiduals_1)
     return nothing
   end
   isempty(initEqs) && return nothing
@@ -668,6 +676,7 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
     local fExpr = Symbolics.build_function(exprs, states, params, iv; expression = Val{true}, cse = true)
     _exprToRTGFunction(fExpr[1])
   catch e
+    OMBackend._fallback(e, :_symbolicInitializationResiduals_2, impact = :result)
     @debug "DirectRHS: could not build symbolic initialization residuals" exception = e
     return nothing
   end
@@ -681,7 +690,8 @@ end
 function _inlineObservedRows!(exprs, reducedSystem, states, params, iv)::Vector{Int}
   local obsEqs = try
     ModelingToolkit.observed(reducedSystem)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :_inlineObservedRows!)
     Symbolics.Equation[]
   end
   local obsByStr = OrderedDict{String, Any}(string(o.lhs) => o.rhs for o in obsEqs)
@@ -718,7 +728,8 @@ end
 function _initialParameterAssignments(reducedSystem, states, params, iv)
   local initEqs = try
     ModelingToolkit.initialization_equations(reducedSystem)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :_initialParameterAssignments_1)
     return nothing
   end
   local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
@@ -741,6 +752,7 @@ function _initialParameterAssignments(reducedSystem, states, params, iv)
     local fExpr = Symbolics.build_function(exprs[keep], states, params, iv; expression = Val{true}, cse = true)
     _exprToRTGFunction(fExpr[1])
   catch e
+    OMBackend._fallback(e, :_initialParameterAssignments_2, impact = :result)
     @debug "DirectRHS: could not build the initial parameter assignments" exception = e
     return nothing
   end
@@ -818,6 +830,7 @@ function _parameterDependents(pars, params, roots::AbstractSet{String};
     fn(ones(length(params)))
     fn
   catch e
+    OMBackend._fallback(e, :_parameterDependents)
     @debug "DirectRHS: could not build the dependent parameters" exception = e
     return nothing
   end
@@ -832,7 +845,8 @@ function _observedDerivativeInitEquations(reducedSystem, states;
   local tgts = Float64[]
   local initEqs = try
     ModelingToolkit.initialization_equations(reducedSystem)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :_observedDerivativeInitEquations)
     return (exprs, tgts)
   end
   local stateStrs = Set{String}(string(st) for st in states)
@@ -873,7 +887,7 @@ function _observedDerivativeTargets(reducedSystem, states, params, iv;
     local fExpr = Symbolics.build_function(nzSym, states, params, iv; expression = Val{true}, cse = true)
     return (_exprToRTGFunction(_demoteWideNumericLiterals!(fExpr[2])), I, J, length(states), tgts)
   catch e
-    e isa InterruptException && rethrow()
+    OMBackend._fallback(e, :_observedDerivativeTargets, impact = :result)
     @warn "DirectRHS: derivative initial equations on observed variables not differentiated; left out" exception = e
     return nothing
   end
@@ -901,7 +915,7 @@ function _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, 
       rhsFunc(du, u0, p_vec, t0)
       all(i -> isfinite(dT[i]) || !isfinite(du[i]), eachindex(dT))
     catch e
-      e isa InterruptException && rethrow()
+      OMBackend._fallback(e, :_buildTimeDerivative)
       false
     end
     ok && return tg
@@ -935,7 +949,7 @@ function _explicitTimeDerivative(exprs, states, params, iv)
     local fExpr = Symbolics.build_function(col, states, params, iv; expression = Val{true}, cse = true)
     return _exprToRTGFunction(_demoteWideNumericLiterals!(fExpr[2]))
   catch e
-    e isa InterruptException && rethrow()
+    OMBackend._fallback(e, :_explicitTimeDerivative)
     @debug "DirectRHS: explicit time derivative not symbolic; a finite difference instead" exception = e
     return nothing
   end
@@ -958,7 +972,7 @@ function _algebraicDerivatives!(J, rhs, jac, ft!, mm, algIdx, difIdx, u, du, p, 
       ft!(Ft, u, p, t)
       all(isfinite, Ft)
     catch e
-      e isa InterruptException && rethrow()
+      OMBackend._fallback(e, :_algebraicDerivatives!_1)
       false
     end
     if !symbolic
@@ -975,7 +989,7 @@ function _algebraicDerivatives!(J, rhs, jac, ft!, mm, algIdx, difIdx, u, du, p, 
     local F = LinearAlgebra.lu(Jaa; check = false)
     return LinearAlgebra.issuccess(F) ? -(F \ b) : -(LinearAlgebra.qr(Matrix(Jaa), LinearAlgebra.ColumnNorm()) \ b)
   catch e
-    e isa InterruptException && rethrow()
+    OMBackend._fallback(e, :_algebraicDerivatives!_2)
     return fill(NaN, length(algIdx))
   end
 end
@@ -1001,6 +1015,7 @@ function _initialRelationLiterals(reducedSystem, params, entries)
   local f = try
     _buildObservedFunction(reducedSystem, zcs)
   catch e
+    OMBackend._fallback(e, :_initialRelationLiterals, impact = :result)
     @debug "DirectRHS: relation literals not observable; the initialization keeps the compiled ifConds" exception = e
     return nothing
   end
@@ -1045,7 +1060,7 @@ function _initialDiscreteClusters(clusters, reducedSystem, startOf::AbstractDict
                                                for r in c.reads[(c.nOperands + 1):(c.nOperands + c.nPre)]])
     end
   catch e
-    e isa InterruptException && rethrow()
+    OMBackend._fallback(e, :_initialDiscreteClusters, impact = :result)
     @debug "DirectRHS: discrete clusters not observable at initialization; not settled" exception = e
     return nothing
   end
@@ -1127,7 +1142,7 @@ function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int}
     try
       return f()
     catch e
-      e isa InterruptException && rethrow()
+      OMBackend._fallback(e, :_settleInitialDiscretes!, impact = :result)
       @debug "DirectRHS: the discrete clusters did not settle at initialization" exception = e
       return nothing
     end
@@ -1180,7 +1195,7 @@ function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5)
       ok[] || break
       u = un
     catch e
-      e isa InterruptException && rethrow()
+      OMBackend._fallback(e, :_settleInitialRelations!, impact = :result)
       err = e
       break
     end
@@ -1248,6 +1263,7 @@ function _buildRHSExpression(rhs_list, states, params, iv)
     @debug "DirectRHS: generated RHS function with CSE"
     return _demoteWideNumericLiterals!(result[2])  # in-place form
   catch e
+    OMBackend._fallback(e, :_buildRHSExpression)
     @warn "DirectRHS: CSE failed, using direct generation" exception=(e, catch_backtrace())
   end
   # Fallback without CSE
@@ -1310,6 +1326,7 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
     @debug "DirectRHS: symbolic sparse Jacobian with $(length(jacProto.nzval)) structural nonzeros"
     return (jacFunc, jacProto)
   catch e
+    OMBackend._fallback(e, :_buildSparseJacobian)
     @debug "DirectRHS: symbolic Jacobian generation failed; solver will finite-difference" exception=(e, catch_backtrace())
     return (nothing, nothing)
   end
@@ -1672,7 +1689,7 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
      the value out via Symbolics.value before falling through to the name-based
      leaf lookup, otherwise we treat literals as unknown free vars. =#
   if !SymbolicUtils.iscall(expr) && !SymbolicUtils.issym(expr)
-    local v = try; Symbolics.value(expr); catch; nothing; end
+    local v = OMBackend._tryOr(() -> Symbolics.value(expr), nothing, :_evalSymbolicFunctionCall_1)
     if v isa Number
       return Float64(v)
     end
@@ -1688,7 +1705,8 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
     end
     local result = try
       Base.invokelatest(f, numArgs...)
-    catch
+    catch _e
+      OMBackend._fallback(_e, :_evalSymbolicFunctionCall_2)
       return nothing
     end
     if result isa Number
@@ -1753,7 +1771,8 @@ function _resolveParamValues(pars)
     for (uk, uv, kStr) in symbolicByKey
       local resolved = try
         Symbolics.substitute(uv, subDict)
-      catch
+      catch _e
+        OMBackend._fallback(_e, :_resolveParamValues_1)
         uv  # substitution failed, keep original
       end
       # Unwrap Num if needed before checking for numeric
@@ -1771,7 +1790,8 @@ function _resolveParamValues(pars)
         local nameDict = Dict{Any, Any}()
         local freeVars = try
           Symbolics.get_variables(uv)
-        catch
+        catch _e
+          OMBackend._fallback(_e, :_resolveParamValues_2)
           Any[]
         end
         for fv in freeVars
@@ -1783,7 +1803,8 @@ function _resolveParamValues(pars)
         if !isempty(nameDict)
           local resolved2 = try
             Symbolics.substitute(uv, nameDict)
-          catch
+          catch _e
+            OMBackend._fallback(_e, :_resolveParamValues_3)
             uv
           end
           # Unwrap Num if needed, then check for numeric result
@@ -1799,7 +1820,8 @@ function _resolveParamValues(pars)
           # Last resort: try Symbolics.value on the substituted result
           local numVal = try
             Float64(Symbolics.value(resolved2))
-          catch
+          catch _e
+            OMBackend._fallback(_e, :_resolveParamValues_4)
             nothing
           end
           if numVal !== nothing && isfinite(numVal)
@@ -1817,7 +1839,8 @@ function _resolveParamValues(pars)
           # function was registered after this call site was compiled.
           local fnVal = try
             _evalSymbolicFunctionCall(unwrapped2, nameToNumeric)
-          catch
+          catch _e
+            OMBackend._fallback(_e, :_resolveParamValues_5)
             nothing
           end
           if fnVal !== nothing && isfinite(fnVal)
@@ -1839,7 +1862,8 @@ function _resolveParamValues(pars)
             Base.invokelatest(Core.eval, evalModule, :($sym = $v))
           end
           Float64(Base.invokelatest(Core.eval, evalModule, evalExpr))
-        catch
+        catch _e
+          OMBackend._fallback(_e, :_resolveParamValues_6)
           nothing
         end
         if evalResult !== nothing && isfinite(evalResult)
@@ -1886,6 +1910,7 @@ function _extractAndMergeEventCallbacks(reducedSystem, customCallbacks)
   try
     eventCBs = ModelingToolkit.process_events(reducedSystem; callback=customCallbacks)
   catch ex
+    OMBackend._fallback(ex, :_extractAndMergeEventCallbacks)
     @warn "DirectRHS: failed to extract event callbacks, using custom callbacks only" exception=(ex, catch_backtrace())
     return customCallbacks
   end
@@ -2104,7 +2129,8 @@ function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=
   # Constant symbolic expression (no free variables): parse its string repr
   local freeVars = try
     Symbolics.get_variables(unwrapped)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :_tryToFloat64_1)
     return nothing
   end
   if isempty(freeVars)
@@ -2130,7 +2156,7 @@ function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=
         resolved isa Number && return Float64(resolved)
         local rv = resolved isa Symbolics.Num ? Symbolics.unwrap(resolved) : resolved
         rv isa Number && return Float64(rv)
-        local vextract = try; Symbolics.value(rv); catch; nothing; end
+        local vextract = OMBackend._tryOr(() -> Symbolics.value(rv), nothing, :_tryToFloat64_2)
         vextract isa Number && return Float64(vextract)
       end
     end

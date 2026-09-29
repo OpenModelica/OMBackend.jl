@@ -480,7 +480,8 @@ function defaultSolverFor(solver, problem, reducedSystem, discreteUnknownNames::
   (hasWhens || nDiff == n || isempty(discreteUnknownNames)) && return solver
   local unknowns = try
     ModelingToolkit.unknowns(reducedSystem)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :defaultSolverFor)
     Any[]
   end
   #= MTK renders subscripted unknowns as var"name[i]"(t); strip the quotes. =#
@@ -817,7 +818,8 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
            alias-map's observed equation, so dropping them is safe. =#
         local _unkNames = try
           OrderedSet(string(u) for u in ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM))
-        catch
+        catch _e
+          OMBackend._fallback(_e, :programGenIrreducibleNames)
           OrderedSet{String}()
         end
         #= Float-convert: Int-valued entries make remake_buffer promote a
@@ -831,6 +833,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
             $(Symbol("$(MODEL_NAME)Model_problem")) = LATEST_PROBLEM
             _didRemake = true
           catch _ialgErr
+            OMBackend._fallback(_ialgErr, :initAlgRemake)
             #= The remake is redundant for variables that the
                module-load-time `__runInitialAlgorithmEarly!()` path already
                pinned via `initialization_eqs`. After MTK's init solve runs
@@ -1288,6 +1291,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       local _algResults = try
         Base.invokelatest(__runInitialAlgorithmEarly!)
       catch _err
+        OMBackend._fallback(_err, :initAlgEarlyConstraints)
         @debug "[MTK GEN: init-alg] early eval threw at constraint-build" exception=_err
         Dict{Symbol, Float64}()
       end

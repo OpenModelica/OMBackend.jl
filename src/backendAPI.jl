@@ -299,6 +299,7 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
                    returnNameMap::Bool = false)
   local previousWarnSetting = WARN_MISSING_START_VALUES[]
   local runId = createLogRunId(logRunModelName(frontendDAE))
+  resetFallbacks!()
   if warnMissingStartValues !== nothing
     warnMissingStartValues isa Bool || error("warnMissingStartValues must be Bool or nothing")
     WARN_MISSING_START_VALUES[] = warnMissingStartValues

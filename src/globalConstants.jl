@@ -41,6 +41,7 @@ const ENV_SWITCHES = Dict{String, Tuple{Bool, String}}(
   #= Kill switches =#
   "OMBACKEND_ALIAS_INDEX" => (true, "alias start values through an index of the alias equations (off: scan every equation's text)"),
   "OMBACKEND_DEMOTE_CONDTARGETS" => (true, "demote a discrete that an if-equation relay defines"),
+  "OMBACKEND_FALLBACK_ON_BUG" => (true, "observe mode of the error policy (errorPolicy.jl): a programming error in a fallback's try is logged at @error and the fallback taken (off: it propagates)"),
   "OMBACKEND_DISCRETE_PRE_MEMORY" => (true, "discrete clusters with event iteration for every model (off: MTK affects where no mode FSM, table or switch cluster needs them)"),
   "OMBACKEND_INIT_ANCHOR" => (true, "initialization phase 2 anchored to the entry guesses (the nearest root)"),
   "OMBACKEND_INIT_COMPLETE" => (true, "complete an underdetermined initialization by null-space projection"),

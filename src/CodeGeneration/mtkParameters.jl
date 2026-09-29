@@ -176,7 +176,8 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
        emission step, loading the module raises UndefVarError. =#
     local rhs = try
       expToJuliaExpMTK(bindExp, simCode)
-    catch
+    catch _e
+      OMBackend._fallback(_e, :stringParameterBinding)
       continue
     end
     push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
@@ -279,7 +280,8 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
     push!(emitted, varName)
     local rhs = try
       expToJuliaExpMTK(bindExp, simCode)
-    catch
+    catch _e
+      OMBackend._fallback(_e, :arrayParameterBinding)
       continue
     end
     push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
@@ -328,7 +330,8 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
     for (idxs, val, _) in entries
       try
         arr[idxs...] = val
-      catch
+      catch _e
+        OMBackend._fallback(_e, :arrayParameterElement)
         complete = false
         break
       end
@@ -403,7 +406,8 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
       for (field, fieldExp) in zip(bindExp.fieldNames, bindExp.exps)
         local fieldRhs = try
           expToJuliaExpMTK(fieldExp, simCode)
-        catch
+        catch _e
+          OMBackend._fallback(_e, :recordFieldBinding)
           continue
         end
         local fieldSym = Symbol(simVar.name * "_" * field)

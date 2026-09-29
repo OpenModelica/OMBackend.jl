@@ -1,0 +1,36 @@
+#= The error policy of fallbacks (src/errorPolicy.jl). =#
+using Test
+import OMBackend
+
+@testset "Error policy of fallbacks" begin
+  local site() = try; error("boom"); catch e; OMBackend._fallback(e, :testSite); :fallback; end
+  OMBackend.resetFallbacks!()
+  @testset "an expected error takes the fallback, recorded once per site" begin
+    @test site() === :fallback
+    @test site() === :fallback
+    local rows = OMBackend.fallbackSummary()
+    @test length(rows) == 1 && rows[1][1] === :testSite && rows[1][2] == 2 && rows[1][5] == false
+  end
+  @testset "interrupts always propagate" begin
+    @test_throws InterruptException (try; throw(InterruptException()); catch e; OMBackend._fallback(e, :interrupt); end)
+  end
+  @testset "a programming error: logged in observe mode, propagates without it" begin
+    local bug() = try; undefinedNameForTheTest + 1; catch e; OMBackend._fallback(e, :bugSite); :fallback; end
+    withenv("OMBACKEND_FALLBACK_ON_BUG" => "true") do
+      @test_logs (:error, r"fallback\] bugSite") match_mode = :any (@test bug() === :fallback)
+    end
+    withenv("OMBACKEND_FALLBACK_ON_BUG" => "false") do
+      @test_throws UndefVarError bug()
+    end
+    #= A site that names the type expects it. =#
+    local expected() = try; undefinedNameForTheTest + 1; catch e; OMBackend._fallback(e, :expectedSite; expect = UndefVarError); :fallback; end
+    withenv("OMBACKEND_FALLBACK_ON_BUG" => "false") do
+      @test expected() === :fallback
+    end
+  end
+  @testset "_tryOr" begin
+    @test OMBackend._tryOr(() -> error("x"), 7, :tryOrSite) == 7
+    @test OMBackend._tryOr(() -> 3, 7, :tryOrSite) == 3
+  end
+  OMBackend.resetFallbacks!()
+end

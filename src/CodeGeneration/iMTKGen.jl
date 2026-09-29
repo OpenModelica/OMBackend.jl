@@ -108,7 +108,8 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
     if OMB.envSwitch("OMJL_DUMP_IMTK_SRC")
       try
         write("/tmp/imtk_$(cname).jl", string(modelCode))
-      catch
+      catch _e
+        OMB._fallback(_e, :imtkSourceDump)
       end
     end
     Core.eval(OMB, modelCode)
@@ -124,12 +125,14 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
     end
     try
       PRISTINE_P[cname] = deepcopy(res[1].p)
-    catch
+    catch _e
+      OMB._fallback(_e, :imtkPristineParameters, impact = :result)
       delete!(PRISTINE_P, cname)
     end
     @info "[IMTK GEN] structural_simplify ran in backend; build cached" model = modelName
     DUMP_ENABLED[] && _dumpReduced(OMB, modelName, cname)
   catch e
+    OMB._fallback(e, :imtkBuild, impact = :result)
     #= No stale build: a previous build of this model (other tunable
        parameters, an older version of it) must not answer for this one. =#
     forgetBuild(cname)
@@ -146,6 +149,7 @@ function _dumpReduced(OMB, modelName::String, cname::String)
     DUMP_PATHS[cname] = path
     @info "[IMTK GEN] dumped post-simplify system" model = modelName path = path
   catch e
+    OMB._fallback(e, :imtkReducedDump)
     @warn "[IMTK GEN] reduced-system dump failed" model = modelName exception = e
   end
   return nothing
@@ -224,6 +228,7 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
       #= A user interrupt or a violated Modelica assert must propagate, not
          trigger a retry of the same solve; the fallback cannot apply `parameters`. =#
       (e isa InterruptException || e isa OMB.CodeGeneration.ModelicaAssertionError || parameters !== nothing) && rethrow()
+      OMB._fallback(e, :imtkCachedSolve, impact = :result)
       @warn "[IMTK] cached-build solve failed; falling back to module simulate" model = modelName exception = e
     end
   end
