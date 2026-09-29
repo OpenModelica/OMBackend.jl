@@ -364,6 +364,15 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
         DAE.RCONST(_) => quote 0.0 end
         DAE.ICONST(_) => quote 0 end
         DAE.BCONST(_) => quote false end
+        #= der of an expression: an initial equation der(w) = 0 whose w the
+           backend replaced by its definition. Differentiated later (the init
+           solve's derivative rows on observed expressions). =#
+        _ where (!(arg isa DAE.CREF || arg isa DAE.UNARY) && !derAsSymbol) => begin
+          local inner = expToJuliaExpMTK(arg, simCode; varPrefix = varPrefix, varSuffix = varSuffix)
+          quote
+            D($(inner))
+          end
+        end
         _ => begin
           varName = SimulationCode.DAE_identifierToString(arg)
           if derAsSymbol

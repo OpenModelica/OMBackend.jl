@@ -260,8 +260,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   #    names from integrator.f.sys (used by getStatesAsSymbols/getParametersAsSymbols).
   local massMatrix = ModelingToolkit.calculate_massmatrix(reducedSystem)
   local problem
-  #= A pure ODE with free parameters needs the init solve too: M = I. =#
-  if massMatrix isa LinearAlgebra.UniformScaling && isempty(freeIdx)
+  #= A pure ODE with free parameters, or with derivative initial equations
+     on observed variables, needs the init solve too: M = I. =#
+  if massMatrix isa LinearAlgebra.UniformScaling && isempty(freeIdx) &&
+     isempty(first(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=initResolved)))
     @debug "DirectRHS: pure ODE (identity mass matrix)"
     local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
                                       sys=reducedSystem, jacFunc=jacFunc, jacProto=jacProto)
@@ -325,13 +327,69 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local extraResiduals = nothing
     #= The residual rows for parameter values `pv` (a re-initialization for
        other tunable parameter values evaluates them at those). =#
-    local residualsAt = symInit === nothing ? nothing : let (gF, dIdxs, mmS) = symInit
+    local symRowsAt = symInit === nothing ? nothing : let (gF, dIdxs, mmS) = symInit
       pv -> (du, u) -> begin
         local g = gF(u, pv, 0.0)
         Float64[dIdxs[i] == 0 ? Float64(g[i]) : du[dIdxs[i]] - mmS[i] * Float64(g[i])
                 for i in 1:length(dIdxs)]
       end
     end
+    #= Literal derivative targets on algebraic unknowns (a zero mass-matrix
+       row): the init solve's derivative targets need a differential state, and
+       dropped them. The MSL AIMC_Initialize's `der(aimc.idq_sr) = zeros(2)`, its
+       steady state, on currents index reduction left algebraic. Their time
+       derivatives come from the differentiated algebraic rows. =#
+    local algIdx = Int[i for i in 1:size(mm, 1) if mm[i, i] == 0]
+    local difIdx = Int[i for i in 1:size(mm, 1) if mm[i, i] != 0]
+    local algDerTargets = Pair{Int, Float64}[t for t in derivativeInitTargets
+                                             if 1 <= t.first <= size(mm, 1) && mm[t.first, t.first] == 0]
+    #= Literal derivative targets on observed variables (not unknowns): the
+       MSL FundamentalWave AIMC_Initialize's der(aimc.airGap.V_msr.re) = 0.
+       der(w) = ∇w · u̇ + ∂w/∂t, u̇ the unknowns' derivatives (the algebraic
+       ones as above). =#
+    local obsDer = LinearAlgebra.isdiag(mm) ?
+      _observedDerivativeTargets(reducedSystem, states, params, ModelingToolkit.get_iv(reducedSystem);
+                                 resolvedParams=initResolved) : nothing
+    #= ż_a with the symbolic Jacobian only (finite differences of finite
+       differences are too noisy for the solve's tolerance, and n^2 RHS calls
+       per iteration), and a diagonal mass matrix (row i the equation of
+       unknown i). =#
+    local needAlg = !isempty(algDerTargets) ||
+      (obsDer !== nothing && any(j -> j <= obsDer[4] && mm[j, j] == 0, obsDer[3]))
+    if needAlg && (jacFunc === nothing || !LinearAlgebra.isdiag(mm))
+      @warn "DirectRHS: derivative initial equations on algebraic or observed variables left out (no symbolic Jacobian or a non-diagonal mass matrix)"
+      empty!(algDerTargets)
+      obsDer = nothing
+      needAlg = false
+    end
+    local ftAlg = needAlg ? _explicitTimeDerivative(rhs_list[algIdx], states, params, iv) : nothing
+    local derRowsAt = (isempty(algDerTargets) && obsDer === nothing) ? nothing : let
+      local pos = Dict(i => k for (k, i) in enumerate(algIdx))
+      local tPos = Int[pos[t.first] for t in algDerTargets]
+      local tVal = Float64[t.second for t in algDerTargets]
+      pv -> begin
+        local J = needAlg ? copy(jacProto) : nothing
+        local nz = obsDer === nothing ? Float64[] : zeros(length(obsDer[2]))
+        (du, u) -> begin
+          local zdot = needAlg ?
+            _algebraicDerivatives!(J, rhsFunc, jacFunc, ftAlg, mm, algIdx, difIdx, u, du, pv, 0.0) : Float64[]
+          local rows = zdot[tPos] .- tVal
+          obsDer === nothing && return rows
+          local (nzF, I, Jc, n, tgts) = obsDer
+          local udot = Float64[du[i] / (mm[i, i] == 0 ? 1.0 : mm[i, i]) for i in 1:n]
+          needAlg && (udot[algIdx] = zdot)
+          nzF(nz, u, pv, 0.0)
+          local obsRows = -copy(tgts)
+          for k in eachindex(I)
+            obsRows[I[k]] += nz[k] * (Jc[k] <= n ? udot[Jc[k]] : 1.0)
+          end
+          vcat(rows, obsRows)
+        end
+      end
+    end
+    #= The kinds of rows are probed apart below: a part that fails at the
+       entry guesses is left out on its own. =#
+    local residualsAt = nothing
     #= The init solve's RHS assigns the initialization-defined parameters
        first. Their f may assert where the model's own equations only guard
        (the MSL selectBranch asserts a regular loop position): at a trial point
@@ -347,21 +405,26 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       end
       rhsFunc(du, u, p, t)
     end
-    if symInit !== nothing
-      local candidate = residualsAt(p_vec)
-      local probeOk = try
-        local duProbe = similar(u0)
-        initRhs(duProbe, u0, p_vec, 0.0)
-        all(isfinite, candidate(duProbe, u0))
-      catch
-        false
-      end
-      if probeOk
-        extraResiduals = candidate
-        @debug "DirectRHS: enforcing $(length(symInit[2])) symbolic initialization residual rows"
+    local probeRows = rowsAt -> try
+      local duProbe = similar(u0)
+      initRhs(duProbe, u0, p_vec, 0.0)
+      all(isfinite, rowsAt(p_vec)(duProbe, u0))
+    catch
+      false
+    end
+    local parts = Any[]
+    for (label, rowsAt) in (("symbolic initialization", symRowsAt), ("derivative", derRowsAt))
+      rowsAt === nothing && continue
+      if probeRows(rowsAt)
+        push!(parts, rowsAt)
       else
-        @debug "DirectRHS: symbolic initialization residuals failed probe, skipping"
+        @warn "DirectRHS: $(label) initial-equation rows failed their probe at the entry guesses; left out"
       end
+    end
+    if !isempty(parts)
+      residualsAt = length(parts) == 1 ? parts[1] :
+        pv -> (local fs = [r(pv) for r in parts]; (du, u) -> reduce(vcat, [f(du, u) for f in fs]))
+      extraResiduals = residualsAt(p_vec)
     end
     u0 = _solveDAEInitializationFree!(u0, initRhs, p_vec, mm, freeIdx, follow!;
                                   pinned=pinnedIdx,
@@ -470,15 +533,10 @@ function _derivativeInitializationTargets(reducedSystem, states;
     return targets
   end
   for eq in initEqs
-    local lhsStr = string(eq.lhs)
-    startswith(lhsStr, "Differential(") || continue
-    local matchedIdx = nothing
-    for (stateStr, idx) in stateStrToIdx
-      if endswith(lhsStr, "(" * stateStr * ")")
-        matchedIdx = idx
-        break
-      end
-    end
+    local lhs = Symbolics.unwrap(eq.lhs)
+    (SymbolicUtils.iscall(lhs) && SymbolicUtils.operation(lhs) isa Symbolics.Differential) || continue
+    #= The argument itself, not a suffix of the string: D() can hold an expression. =#
+    local matchedIdx = get(stateStrToIdx, string(SymbolicUtils.arguments(lhs)[1]), nothing)
     matchedIdx === nothing && continue
     local target = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams)
     target === nothing && continue
@@ -715,6 +773,110 @@ function _parameterDependents(pars, params, roots::AbstractSet{String};
     return nothing
   end
   return (depFunc, depIdxs, deps)
+end
+
+#= The literal derivative initial equations `der(w) = c` whose w is not an
+   unknown: `(ws, cs)`. =#
+function _observedDerivativeInitEquations(reducedSystem, states;
+                                          resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
+  local exprs = Any[]
+  local tgts = Float64[]
+  local initEqs = try
+    ModelingToolkit.initialization_equations(reducedSystem)
+  catch
+    return (exprs, tgts)
+  end
+  local stateStrs = Set{String}(string(st) for st in states)
+  for eq in initEqs
+    local lhs = Symbolics.unwrap(eq.lhs)
+    (SymbolicUtils.iscall(lhs) && SymbolicUtils.operation(lhs) isa Symbolics.Differential) || continue
+    local w = SymbolicUtils.arguments(lhs)[1]
+    string(w) in stateStrs && continue
+    local c = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams)
+    c === nothing && continue
+    push!(exprs, w)
+    push!(tgts, c)
+  end
+  return (exprs, tgts)
+end
+
+#= Literal derivative initial equations `der(w) = c` on an observed w (not an
+   unknown; those are derivative targets): w inlined to the unknowns, its
+   gradient w.r.t. the unknowns and the independent variable (explicit time)
+   by the DAG differentiation, compiled as the nonzeros. Returns
+   `(nzFunc!, rows, cols, n, targets)`: row k's der(w) is
+   Σ nz * (col <= n ? u̇[col] : 1). Nothing when there are none or they
+   cannot be reduced or differentiated. =#
+function _observedDerivativeTargets(reducedSystem, states, params, iv;
+                                    resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
+  local (exprs, tgts) = _observedDerivativeInitEquations(reducedSystem, states; resolvedParams=resolvedParams)
+  isempty(exprs) && return nothing
+  local keep = _inlineObservedRows!(exprs, reducedSystem, states, params, iv)
+  length(keep) < length(exprs) &&
+    @warn "DirectRHS: $(length(exprs) - length(keep)) derivative initial equations on observed variables not reduced to the unknowns; left out"
+  isempty(keep) && return nothing
+  exprs = exprs[keep]
+  tgts = tgts[keep]
+  try
+    local Jw = _dagSparseJacobian(exprs, vcat(collect(states), [iv]))
+    local (I, J, _) = Symbolics.SparseArrays.findnz(Jw)
+    local nzSym = collect(Symbolics.SparseArrays.nonzeros(Jw))
+    local fExpr = Symbolics.build_function(nzSym, states, params, iv; expression = Val{true}, cse = true)
+    return (_exprToRTGFunction(_demoteWideNumericLiterals!(fExpr[2])), I, J, length(states), tgts)
+  catch e
+    e isa InterruptException && rethrow()
+    @warn "DirectRHS: derivative initial equations on observed variables not differentiated; left out" exception = e
+    return nothing
+  end
+end
+
+#= ∂F/∂t of the rows `exprs` (explicit time) by the DAG differentiation, as an
+   in-place `f!(out, u, p, t)`; nothing when a row has no derivative rule (a
+   time table). =#
+function _explicitTimeDerivative(exprs, states, params, iv)
+  try
+    local Jt = _dagSparseJacobian(exprs, [iv])
+    local col = Any[Jt[i, 1] for i in 1:length(exprs)]
+    local fExpr = Symbolics.build_function(col, states, params, iv; expression = Val{true}, cse = true)
+    return _exprToRTGFunction(_demoteWideNumericLiterals!(fExpr[2]))
+  catch e
+    e isa InterruptException && rethrow()
+    @debug "DirectRHS: explicit time derivative not symbolic; a finite difference instead" exception = e
+    return nothing
+  end
+end
+
+#= The time derivatives of the algebraic unknowns (zero mass-matrix rows of a
+   diagonal mass matrix) at (u, p, t): differentiating the algebraic rows
+   0 = F_a(u, t) gives J_aa ż_a = -(J_ad u̇_d + ∂F_a/∂t), with u̇_d = F_d / m_d
+   from `du` = F(u). J from the symbolic sparse Jacobian (kept sparse, written
+   into `J`), ∂F_a/∂t from `ft!` or, without it, by a second-order one-sided
+   difference (a time switch at t sees its right limit). The raw RHS with p
+   fixed: parameters are constant in time. A singular J_aa takes the
+   least-squares solution; NaN if anything throws. =#
+function _algebraicDerivatives!(J, rhs, jac, ft!, mm, algIdx, difIdx, u, du, p, t)
+  try
+    jac(J, u, p, t)
+    local Ft = Vector{Float64}(undef, length(algIdx))
+    if ft! === nothing
+      local h = cbrt(eps(Float64)) * max(1.0, abs(t))
+      local d1 = similar(du)
+      local d2 = similar(du)
+      rhs(d1, u, p, t + h)
+      rhs(d2, u, p, t + 2h)
+      Ft .= (-3 .* du[algIdx] .+ 4 .* d1[algIdx] .- d2[algIdx]) ./ (2h)
+    else
+      ft!(Ft, u, p, t)
+    end
+    local udot_d = Float64[du[i] / mm[i, i] for i in difIdx]
+    local b = J[algIdx, difIdx] * udot_d .+ Ft
+    local Jaa = J[algIdx, algIdx]
+    local F = LinearAlgebra.lu(Jaa; check = false)
+    return LinearAlgebra.issuccess(F) ? -(F \ b) : -(LinearAlgebra.qr(Matrix(Jaa), LinearAlgebra.ColumnNorm()) \ b)
+  catch e
+    e isa InterruptException && rethrow()
+    return fill(NaN, length(algIdx))
+  end
 end
 
 #= The literal values of the if-equation relations at an initial state:

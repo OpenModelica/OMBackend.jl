@@ -1372,7 +1372,9 @@ function _initializationVarStrs(initEqs)::OrderedSet{String}
     SymbolicUtils.iscall(v) || (isLhs && push!(out, string(v)); return nothing)
     local op = SymbolicUtils.operation(v)
     if op isa ModelingToolkit.Differential
-      foreach(a -> push!(out, string(Symbolics.unwrap(a))), SymbolicUtils.arguments(v))
+      #= D(x), or D(expr): an observed variable the backend replaced by its
+         definition; every variable in it. =#
+      foreach(a -> foreach(x -> push!(out, string(x)), Symbolics.get_variables(a)), SymbolicUtils.arguments(v))
       return nothing
     end
     #= x(t) is a call of x on t: a variable, not an expression. =#
