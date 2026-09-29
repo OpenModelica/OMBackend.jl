@@ -2101,6 +2101,18 @@ function _demoteWideNumericsInEquations(eqs)
   return (newEqs, changed)
 end
 
+#= Mark time as possibly zero (MTK's maybe_zeros): tearing then solves no
+   variable through a coefficient with time or sin(time) as a factor.
+   DOCCMinimal's M9 (v = (cos(time), sin(time)), v*conj(i) = 1): sin(t)*i_re =
+   cos(t)*i_im was solved as i_re = cos(t)*i_im/sin(t), 0/0 at t = 0. =#
+function _timeMayBeZero(sys::ModelingToolkit.AbstractSystem)
+  local iv = ModelingToolkit.get_iv(sys)
+  iv === nothing && return sys
+  local mayBeZero = copy(ModelingToolkit.get_maybe_zeros(sys))
+  push!(mayBeZero, Symbolics.unwrap(iv))
+  return @set sys.maybe_zeros = mayBeZero
+end
+
 """
   The irreducible variables scheme does not work using plain simplify.
 
@@ -2176,6 +2188,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   end
 
   local useSplit = get(kwargs, :split, true)
+  sys = _timeMayBeZero(sys)
   local _preSimplifySys = sys
   if OMBackend.BACKEND_LOGGING[]
     local _ss_timed = @timed ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
