@@ -322,56 +322,26 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
           evaluateConstantFunctionOutputs, foldExplicitSingleAssign,
           propagateInitialValues), no observed-equation work, the DE emitter.
         =#
-        simCode = generateSimulationCode(bDAE; mode = MTK_MODE)
-        (simCodeFunctions, externalRuntimeNeeded) = if functionList !== nothing
-          generateSimCodeFunctions(functionList)
-        else
-          (SimulationCode.ModelicaFunction[], false)
-        end
-        @assign begin
-          simCode.functions = simCodeFunctions
-          simCode.externalRuntime = externalRuntimeNeeded
-        end
-        simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
-        @assign simCode.functions = simCodeFunctions
-        #= Mirror the MTK pipeline: collapse qualified ENUM_LITERAL paths up
-           front. This is a pure string-shortening pass and is a no-op for
-           enum-free models. =#
-        simCode = SimulationCode.runSimCodePass("simplifyEnumLiteralPaths", simCode,
-                                                SimulationCode.simplifyEnumLiteralPaths)
-        simCode = SimulationCode.runSimCodePass("flattenRecordCallSites", simCode,
-                                                SimulationCode.flattenRecordCallSites)
+        simCode = _simCodeWithFunctions(bDAE, functionList)
         local nameMap = NameRewriteMap()
-        simCode = SimulationCode.runSimCodePass("canonicalizeCrefNames", simCode,
-                                                sc -> SimulationCode.canonicalizeCrefNames(sc; nameMap = nameMap))
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterCanonicalNames.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("resolveIfExpInBindings", simCode,
-                                                SimulationCode.resolveIfExpInBindings!)
-        simCode = SimulationCode.runSimCodePass("pruneConstantConditions", simCode,
-                                                SimulationCode.pruneConstantConditions)
-        simCode = SimulationCode.runSimCodePass("foldParameterClosure", simCode,
-                                                SimulationCode.foldParameterClosure)
-        simCode = SimulationCode.runSimCodePass("inlinePreOfConstantParameters", simCode,
-                                                SimulationCode.inlinePreOfConstantParameters)
-        simCode = SimulationCode.runSimCodePass("propagateConstants", simCode,
-                                                SimulationCode.propagateConstants)
-        simCode = SimulationCode.runSimCodePass("eliminateAliasVariables", simCode,
-                                                SimulationCode.eliminateAliasVariables)
-        simCode = SimulationCode.runSimCodePass("eliminateRHSEquivalentEquations", simCode,
-                                                SimulationCode.eliminateRHSEquivalentEquations)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRHSEquiv.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("removeRedundantEquations", simCode,
-                                                SimulationCode.removeRedundantEquations)
-        simCode = SimulationCode.runSimCodePass("eliminateConstantParameters", simCode,
-                                                SimulationCode.eliminateConstantParameters)
-        #= eliminateFrozenStates runs AFTER eliminateConstantParameters so that
-           parameter chains like `state = param` (param bound to a literal) are
-           already substituted to `state = literal` before we look for them. =#
-        simCode = SimulationCode.runSimCodePass("eliminateFrozenStates", simCode,
-                                                SimulationCode.eliminateFrozenStates)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFrozenStates.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("pruneConstantConditions", simCode,
-                                                SimulationCode.pruneConstantConditions)
+        simCode = _runSimCodePasses(simCode, [
+          #= A pure string-shortening pass, a no-op for enum-free models. =#
+          "simplifyEnumLiteralPaths" => SimulationCode.simplifyEnumLiteralPaths,
+          "flattenRecordCallSites" => SimulationCode.flattenRecordCallSites,
+          "canonicalizeCrefNames" => sc -> SimulationCode.canonicalizeCrefNames(sc; nameMap = nameMap),
+          "resolveIfExpInBindings" => SimulationCode.resolveIfExpInBindings!,
+          "pruneConstantConditions" => SimulationCode.pruneConstantConditions,
+          "foldParameterClosure" => SimulationCode.foldParameterClosure,
+          "inlinePreOfConstantParameters" => SimulationCode.inlinePreOfConstantParameters,
+          "propagateConstants" => SimulationCode.propagateConstants,
+          "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
+          "eliminateRHSEquivalentEquations" => SimulationCode.eliminateRHSEquivalentEquations,
+          "removeRedundantEquations" => SimulationCode.removeRedundantEquations,
+          "eliminateConstantParameters" => SimulationCode.eliminateConstantParameters,
+          #= After eliminateConstantParameters: `state = param` (param bound to a
+             literal) is `state = literal` by then. =#
+          "eliminateFrozenStates" => SimulationCode.eliminateFrozenStates,
+          "pruneConstantConditions" => SimulationCode.pruneConstantConditions])
         if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
           error("DEMode does not support structural transitions / VSS at this time. " *
                 "Re-run with mode = OMBackend.MTK_MODE.")
@@ -379,114 +349,61 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
         _checkSimCodeBeforeCodegen(simCode, checkSimCode)
         return _translationResult(generateDETargetCode(simCode), nameMap, returnNameMap)
       elseif BackendMode == MTK_MODE || BackendMode == IMTK_MODE
-        #@debug "Generate simulation code"
-        simCode = @BACKEND_PERFLOG "[backendAPI] generateSimulationCode" generateSimulationCode(bDAE; mode = MTK_MODE)
-        (simCodeFunctions, externalRuntimeNeeded) = if functionList !== nothing
-          generateSimCodeFunctions(functionList)
-        else
-          (SimulationCode.ModelicaFunction[], false)
-        end
-        @assign begin
-          simCode.functions = simCodeFunctions
-          simCode.externalRuntime = externalRuntimeNeeded
-        end
-        #= Dump before record flattening =#
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_initial.log"), SimulationCode.dumpSimCode(simCode))
-        #= Collapse qualified ENUM_LITERAL paths to leaf `Type.Literal` IDENT form. =#
-        simCode = SimulationCode.runSimCodePass("simplifyEnumLiteralPaths", simCode,
-                                                SimulationCode.simplifyEnumLiteralPaths)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterEnumSimplify.log"), SimulationCode.dumpSimCode(simCode))
-        #= Flatten record parameters in functions =#
-        simCodeFunctions = SimulationCode.flattenRecordParameters(simCodeFunctions)
-        @assign simCode.functions = simCodeFunctions
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFlattenRecordParams.log"), SimulationCode.dumpSimCode(simCode))
-        #= Flatten record arguments in equation call sites to match flattened signatures =#
-        simCode = SimulationCode.runSimCodePass("flattenRecordCallSites", simCode,
-                                                SimulationCode.flattenRecordCallSites)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFlattenRecordCallSites.log"), SimulationCode.dumpSimCode(simCode))
-        #= Canonicalize every generated name once SimCode has its final record-call shape. =#
+        simCode = _simCodeWithFunctions(bDAE, functionList)
         local nameMap = NameRewriteMap()
-        simCode = SimulationCode.runSimCodePass("canonicalizeCrefNames", simCode,
-                                                sc -> SimulationCode.canonicalizeCrefNames(sc; nameMap = nameMap))
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterCanonicalNames.log"), SimulationCode.dumpSimCode(simCode))
-        #= Resolve constant-condition IFEXPs in parameter bindings =#
-        simCode = SimulationCode.runSimCodePass("resolveIfExpInBindings", simCode,
-                                                SimulationCode.resolveIfExpInBindings!)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterResolveIfExp.log"), SimulationCode.dumpSimCode(simCode))
-        #= Prune IFEXP/IF_EQUATION conditions that became compile-time constants. =#
-        simCode = SimulationCode.runSimCodePass("pruneConstantConditions", simCode,
-                                                SimulationCode.pruneConstantConditions)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterConstantConditionPruning.log"), SimulationCode.dumpSimCode(simCode))
-        #= Constant propagation and alias elimination run AFTER record flattening
-           so that all CREF references are in their final form before substitution.
-           Running these earlier caused dangling references when flattenRecordCallSites
-           introduced new CREFs for already-eliminated variables. =#
-        #= BLT-driven parameter-closure fold runs before propagateConstants so that
-           any parameter-closure chains (e.g. KinematicPTP's seven algebraic unknowns
-           defined solely by parameter expressions) are promoted to parameters before
-           MTK sees them. This removes the Newton-init failure mode where zero guesses
-           on those unknowns produce NaN/Inf evaluations. =#
-        simCode = SimulationCode.runSimCodePass("foldParameterClosure", simCode,
-                                                SimulationCode.foldParameterClosure)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFoldClosure.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("inlinePreOfConstantParameters", simCode,
-                                                SimulationCode.inlinePreOfConstantParameters)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterInlinePreParam.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("propagateConstants", simCode,
-                                                SimulationCode.propagateConstants)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterConstantProp.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("lowerComplexOperatorRecords", simCode,
-                                                SimulationCode.lowerComplexOperatorRecords)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterComplexLowering.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("eliminateAliasVariables", simCode,
-                                                SimulationCode.eliminateAliasVariables)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterAliasElimination.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("eliminateRHSEquivalentEquations", simCode,
-                                                SimulationCode.eliminateRHSEquivalentEquations)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRHSEquiv.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("removeRedundantEquations", simCode,
-                                                SimulationCode.removeRedundantEquations)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRemoveRedundant.log"), SimulationCode.dumpSimCode(simCode))
-        #= Constant-parameter elimination shrinks the parameter list MTK sees
-           before structural_simplify. Tier-1 only: the pass internally skips
-           VSS / DOCC / sub-model variants where a parameter could be re-bound
-           at runtime. =#
-        simCode = SimulationCode.runSimCodePass("eliminateConstantParameters", simCode,
-                                                SimulationCode.eliminateConstantParameters)
-        #= Drop protected sink variables and their defining equations. Runs
-           before eliminateDeadParameters so any parameters whose only consumer
-           was a dropped sink get caught by the dead-parameter sweep. =#
-        simCode = SimulationCode.runSimCodePass("dropObservationOnlyVariables", simCode,
-                                                SimulationCode.dropObservationOnlyVariables)
-        simCode = SimulationCode.runSimCodePass("eliminateDeadParameters", simCode,
-                                                SimulationCode.eliminateDeadParameters)
-        #= Function outputs that are constants for every value of the call's
-           variables (OpenModelica's evalFunc; MSL Spice3's capacitances): before
-           eliminateFrozenStates, so derivatives they multiplied vanish. =#
-        simCode = SimulationCode.runSimCodePass("evaluateConstantFunctionOutputs", simCode,
-                                                SimulationCode.evaluateConstantFunctionOutputs)
-        #= eliminateFrozenStates runs AFTER eliminateConstantParameters so that
-           parameter chains like `state = param` (param bound to a literal) are
-           already substituted to `state = literal` before detection. =#
-        simCode = SimulationCode.runSimCodePass("eliminateFrozenStates", simCode,
-                                                SimulationCode.eliminateFrozenStates)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterFrozenStates.log"), SimulationCode.dumpSimCode(simCode))
-        #= foldExplicitSingleAssign: generalised single-defining-equation tearing.
-           Substitutes `0 = v - rhs` where v is an unprotected ALG_VARIABLE
-           uniquely defined by that residual. Guards: skips sub-models /
-           metaModel / flatModel; skips bracketed (scalarized array) names;
-           skips names already in aliasMap. Post-substitution survivor-scan
-           aborts the fold if any folded name still appears anywhere. =#
-        simCode = SimulationCode.runSimCodePass("foldExplicitSingleAssign", simCode,
-                                                SimulationCode.foldExplicitSingleAssign)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterExplicitFold.log"), SimulationCode.dumpSimCode(simCode))
-        #= Second alias-elim pass: earlier simplifiers (foldExplicitSingleAssign,
-           propagateConstants, dropObservationOnlyVariables) collapse n-term
-           connector flow sums into 2-term residuals like `a + b = 0` that the
-           first alias-elim pass could not yet see. =#
-        simCode = SimulationCode.runSimCodePass("eliminateAliasVariables", simCode,
-                                                SimulationCode.eliminateAliasVariables)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterAliasElimination2.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = _runSimCodePasses(simCode, [
+          #= Collapse qualified ENUM_LITERAL paths to leaf `Type.Literal` IDENT form. =#
+          "simplifyEnumLiteralPaths" => SimulationCode.simplifyEnumLiteralPaths,
+          #= Flatten record arguments in equation call sites to match the flattened
+             function signatures (_simCodeWithFunctions). =#
+          "flattenRecordCallSites" => SimulationCode.flattenRecordCallSites,
+          #= Canonicalize every generated name once SimCode has its final record-call shape. =#
+          "canonicalizeCrefNames" => sc -> SimulationCode.canonicalizeCrefNames(sc; nameMap = nameMap),
+          #= Resolve constant-condition IFEXPs in parameter bindings =#
+          "resolveIfExpInBindings" => SimulationCode.resolveIfExpInBindings!,
+          #= Prune IFEXP/IF_EQUATION conditions that became compile-time constants. =#
+          "pruneConstantConditions" => SimulationCode.pruneConstantConditions,
+          #= Constant propagation and alias elimination run AFTER record flattening
+             so that all CREF references are in their final form before substitution.
+             Running these earlier caused dangling references when flattenRecordCallSites
+             introduced new CREFs for already-eliminated variables.
+             The BLT-driven parameter-closure fold runs before propagateConstants so that
+             parameter-closure chains (e.g. KinematicPTP's seven algebraic unknowns
+             defined solely by parameter expressions) are parameters before MTK sees
+             them: zero guesses on those unknowns gave NaN/Inf in the Newton init. =#
+          "foldParameterClosure" => SimulationCode.foldParameterClosure,
+          "inlinePreOfConstantParameters" => SimulationCode.inlinePreOfConstantParameters,
+          "propagateConstants" => SimulationCode.propagateConstants,
+          "lowerComplexOperatorRecords" => SimulationCode.lowerComplexOperatorRecords,
+          "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
+          "eliminateRHSEquivalentEquations" => SimulationCode.eliminateRHSEquivalentEquations,
+          "removeRedundantEquations" => SimulationCode.removeRedundantEquations,
+          #= Shrinks the parameter list MTK sees before structural_simplify. The pass
+             skips VSS / DOCC / sub-model variants where a parameter could be re-bound
+             at runtime. =#
+          "eliminateConstantParameters" => SimulationCode.eliminateConstantParameters,
+          #= Drop protected sink variables and their defining equations; before
+             eliminateDeadParameters, so parameters whose only consumer was a dropped
+             sink are swept too. =#
+          "dropObservationOnlyVariables" => SimulationCode.dropObservationOnlyVariables,
+          "eliminateDeadParameters" => SimulationCode.eliminateDeadParameters,
+          #= Function outputs that are constants for every value of the call's
+             variables (OpenModelica's evalFunc; MSL Spice3's capacitances): before
+             eliminateFrozenStates, so derivatives they multiplied vanish. =#
+          "evaluateConstantFunctionOutputs" => SimulationCode.evaluateConstantFunctionOutputs,
+          #= After eliminateConstantParameters: `state = param` (param bound to a
+             literal) is `state = literal` by then. =#
+          "eliminateFrozenStates" => SimulationCode.eliminateFrozenStates,
+          #= Generalised single-defining-equation tearing: substitutes `0 = v - rhs`
+             where v is an unprotected ALG_VARIABLE uniquely defined by that residual.
+             Skips sub-models / metaModel / flatModel, bracketed (scalarized array)
+             names and names already in aliasMap; aborts the fold if a folded name
+             survives anywhere. =#
+          "foldExplicitSingleAssign" => SimulationCode.foldExplicitSingleAssign,
+          #= Second alias elimination: the simplifiers since the first
+             (foldExplicitSingleAssign, propagateConstants, dropObservationOnlyVariables)
+             collapse n-term connector flow sums into 2-term residuals like `a + b = 0`. =#
+          "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables])
         #= Second RHS-equivalence pass: the alias-elim2 above can collapse two
            equations of the form `Xi - der(s_i)` onto the same `der(s)`. The
            pass keys equations by RHS string before its own substitution
@@ -497,21 +414,16 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
            a no-op call is cheap and returns simCode unchanged. =#
         let prev = -1
           for _ in 1:6
-            simCode = SimulationCode.runSimCodePass("eliminateRHSEquivalentEquations", simCode,
-                                                    SimulationCode.eliminateRHSEquivalentEquations)
+            simCode = _runSimCodePasses(simCode, ["eliminateRHSEquivalentEquations" =>
+                                                    SimulationCode.eliminateRHSEquivalentEquations])
             local n = length(simCode.residualEquations)
             n == prev && break
             prev = n
           end
         end
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRHSEquiv2.log"), SimulationCode.dumpSimCode(simCode))
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterEliminateConstParams.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("classifyAdditionalDiscretes", simCode,
-                                                SimulationCode._classifyAdditionalDiscreteVariables)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterClassifyDiscretes.log"), SimulationCode.dumpSimCode(simCode))
-        simCode = SimulationCode.runSimCodePass("pruneConstantConditions", simCode,
-                                                SimulationCode.pruneConstantConditions)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterPostAliasConditionPruning.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = _runSimCodePasses(simCode, [
+          "classifyAdditionalDiscretes" => SimulationCode._classifyAdditionalDiscreteVariables,
+          "pruneConstantConditions" => SimulationCode.pruneConstantConditions])
         #= Output-only variable elimination runs AFTER const-prop and alias-elim,
            so that alias chains are resolved and the output-only subgraph is cleanly separated.
            A fresh matching is computed from the current equation/variable set. =#
@@ -523,10 +435,8 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
           nothing
         end
         if elimOpts !== nothing
-          @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_beforeElimination.log"), SimulationCode.dumpSimCode(simCode))
-          simCode = SimulationCode.runSimCodePass("eliminateNonDynamic", simCode,
-                                                  sc -> SimulationCode.eliminateOutputOnlyVariables(sc, elimOpts))
-          @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterElimination.log"), SimulationCode.dumpSimCode(simCode))
+          simCode = _runSimCodePasses(simCode, ["eliminateNonDynamic" =>
+                                                  sc -> SimulationCode.eliminateOutputOnlyVariables(sc, elimOpts)])
         end
         #= Observed filter: controls which alias-eliminated variables become observed equations.
            Default (nothing): skip ALL alias observed equations for fast compilation.
@@ -585,17 +495,15 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
            (time=0 + params + starts -> source/ramp -> dependent flow/pressure),
            attaching resolved values as start attributes so the init solver starts
            from a finite, consistent iterate instead of a 0.0 that divides by zero. =#
-        simCode = SimulationCode.runSimCodePass("propagateInitialValues", simCode,
-                                                SimulationCode.propagateInitialValues)
-        #= Re-derive SCCs against the residual array MTK will actually see.
-           The SCC stamp written by transformToSimCode indexes into the
-           pre-pipeline residual list and is stale after alias-elim,
-           foldExplicitSingleAssign, output-only elimination, etc. MTK
-           codegen needs accurate cycle info to extract NonlinearSystem
-           sub-blocks per cyclic SCC. =#
-        simCode = SimulationCode.runSimCodePass("recomputeStronglyConnectedComponents", simCode,
-                                                SimulationCode.recomputeStronglyConnectedComponents)
-        @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_afterRecomputeSCC.log"), SimulationCode.dumpSimCode(simCode))
+        simCode = _runSimCodePasses(simCode, [
+          "propagateInitialValues" => SimulationCode.propagateInitialValues,
+          #= Re-derive SCCs against the residual array MTK will actually see.
+             The SCC stamp written by transformToSimCode indexes into the
+             pre-pipeline residual list and is stale after alias-elim,
+             foldExplicitSingleAssign, output-only elimination, etc. MTK
+             codegen needs accurate cycle info to extract NonlinearSystem
+             sub-blocks per cyclic SCC. =#
+          "recomputeStronglyConnectedComponents" => SimulationCode.recomputeStronglyConnectedComponents])
         #= Standalone index-overconstraint diagnostic on the final SimCode (gated
            by OMBACKEND_INDEX_DIAG); inspects the differential-incidence
            localization without mutating the system. =#
@@ -621,6 +529,30 @@ end
    indices and frame-internal connector names contain `[` and are filtered
    out by default; clean identifiers like `rev_phi` / `damper_w_rel` are
    kept so the alias observed equation reaches MTK. =#
+#= SimCode of `bDAE` with its Modelica functions, their record parameters
+   flattened (the call sites follow in flattenRecordCallSites). =#
+function _simCodeWithFunctions(bDAE, functionList)::SimulationCode.SIM_CODE
+  local simCode = @BACKEND_PERFLOG "[backendAPI] generateSimulationCode" generateSimulationCode(bDAE; mode = MTK_MODE)
+  local (functions, externalRuntimeNeeded) = functionList === nothing ? (SimulationCode.ModelicaFunction[], false) :
+    generateSimCodeFunctions(functionList)
+  @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_initial.log"), SimulationCode.dumpSimCode(simCode))
+  @assign begin
+    simCode.functions = SimulationCode.flattenRecordParameters(functions)
+    simCode.externalRuntime = externalRuntimeNeeded
+  end
+  return simCode
+end
+
+#= Runs `passes` (name => pass) in order; with backend logging on, dumps the
+   SimCode after each to simCode_after_<name>.log. =#
+function _runSimCodePasses(simCode::SimulationCode.SIM_CODE, passes::Vector{<:Pair{String}})::SimulationCode.SIM_CODE
+  for (name, pass) in passes
+    simCode = SimulationCode.runSimCodePass(name, simCode, pass)
+    @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_after_$(name).log"), SimulationCode.dumpSimCode(simCode))
+  end
+  return simCode
+end
+
 function _isUserVisibleAliasName(name::AbstractString)::Bool
   occursin('[', name) && return false
   return true
@@ -881,7 +813,7 @@ end
   Caches the result in COMPILED_MODELS_DEJL so simulateModel can pick it up.
 """
 function generateDETargetCode(simCode::SimulationCode.SIM_CODE)
-  (modelName::String, modelCode::Expr) = CodeGeneration.generateDECode(simCode)
+  (modelName::String, modelCode::Expr) = CodeGeneration.DEGen.generateDECode(simCode)
   local codeHash = hash(modelCode)
   if haskey(COMPILED_MODELS_DEJL, modelName)
     local previousHash = COMPILED_MODELS_DEJL[modelName][3]
