@@ -2332,6 +2332,44 @@ function _preReadCrefs(body::Vector{Tuple{DAE.Exp, DAE.Exp, Any}})::Vector{DAE.E
   return found
 end
 
+#= Whether a variable the group reads through pre() reads a member outside
+   pre(): its own definition (a member), or another equation it is in
+   (`otherRefs()`: per name, the names each other equation reads outside
+   pre()). =#
+function _preReadsCloseLoop(held::Vector{DAE.Exp}, members::OrderedSet{String},
+                            candByName::Dict{String, Any}, otherRefs::Function)::Bool
+  for h in held
+    local n = string(h.componentRef)
+    if n in members
+      isempty(_candRefsOutsidePre(candByName[n].rhs, members)) || return true
+    else
+      any(refs -> any(m -> m in refs, members), get(otherRefs(), n, ())) && return true
+    end
+  end
+  return false
+end
+
+#= Per name, the sets of names the equations that read it outside pre()
+   read outside pre(). =#
+function _refsOutsidePreIndex(eqs::Vector{BDAE.Equation})::Dict{String, Vector{OrderedSet{String}}}
+  local index = Dict{String, Vector{OrderedSet{String}}}()
+  for eq in eqs
+    local refs = OrderedSet{String}()
+    local visit = function (@nospecialize(e), arg)
+      @match e begin
+        DAE.CALL(Absyn.IDENT("pre"), _, _) => (e, false, arg)
+        DAE.CREF(cr, _) => (push!(refs, string(cr)); (e, true, arg))
+        _ => (e, true, arg)
+      end
+    end
+    BDAEUtil.traverseEquationExpressions(eq, visit, nothing)
+    for r in refs
+      push!(get!(index, r, OrderedSet{String}[]), refs)
+    end
+  end
+  return index
+end
+
 #= The condition of a lifted cluster without relations: `change(pre(n1)) or
    change(pre(n2)) ...` over the values it follows. Not valid Modelica (the
    argument of change() is a variable), so no user when has it; the code
@@ -2646,7 +2684,8 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
                                candByName::Dict{String, Any}, liftedLhs::OrderedSet{String},
                                startLookup::Dict{String, DAE.Exp},
                                paramOrConstNames::OrderedSet{String},
-                               initialPre::OrderedSet{String})
+                               initialPre::OrderedSet{String},
+                               otherRefs::Function = () -> Dict{String, Vector{OrderedSet{String}}}())
   local order = _topoOrderCluster(cluster, candByName)
   if order === nothing
     @warn "[BDAE: lifter] cyclic discrete cluster left unlifted" cluster
@@ -2675,19 +2714,22 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
       end
     end
   end
-  #= No continuous event source. Without pre() the equations stay residuals.
-     With pre() (edge(), change()) they still define held values: pre()
-     changes only at events, where it takes the values of the previous pass
-     (MLS 8.6). As a residual pre(n) reads n: StateGraph's `localActive =
-     pre(newActive)` of a step read only through a Parallel (anyTrue and
-     allTrue are no candidates) became `localActive = newActive`, a Boolean
-     loop that stayed set by a transition whose firing the same event took
-     back (ExecutionPaths: step2 never became active). The event iteration
-     evaluates a lifted cluster at every pass of every event, so one needs
-     no relation of its own: its condition `change(pre(n)) or ...` names the
-     values it follows (_buildChangeOfPreCondition). =#
+  #= No continuous event source: the equations stay residuals, except a
+     latch. A residual reads pre(n) as n; where n reads the group back that
+     is a Boolean loop: StateGraph's `localActive = pre(newActive)` of a step
+     read only through a Parallel (anyTrue and allTrue are no candidates)
+     became `localActive = newActive`, which stayed set by a transition whose
+     firing the same event took back (ExecutionPaths: step2 never became
+     active). Such a group is lifted: pre() changes only at events, where it
+     takes the values of the previous pass (MLS 8.6), and the event iteration
+     evaluates a lifted cluster at every pass of every event, so it needs no
+     relation of its own; its condition `change(pre(n)) or ...` names the
+     values it follows (_buildChangeOfPreCondition). A group whose pre()
+     reads do not come back (MSL Digital's gates, `y = pre(auxiliary_n)`,
+     auxiliary_n from the inputs) stays residual: lifted, it changed only
+     when an event iteration ran, and the gates stayed at 'U'. =#
   local held = isempty(rels) ? _preReadCrefs(body) : DAE.Exp[]
-  if isempty(rels) && isempty(held)
+  if isempty(rels) && (isempty(held) || !_preReadsCloseLoop(held, members, candByName, otherRefs))
     for n in cluster; push!(out, candByName[n].eq); end
     return
   end
@@ -2790,8 +2832,13 @@ function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equ
     end
   end
   local liftedLhs = OrderedSet{String}()
+  #= The equations that are not candidates, indexed when a group without
+     relations first asks (_preReadsCloseLoop). =#
+  local others = copy(out)
+  local index = Ref{Union{Nothing, Dict{String, Vector{OrderedSet{String}}}}}(nothing)
+  local otherRefs = () -> (index[] === nothing && (index[] = _refsOutsidePreIndex(others)); index[])
   for cluster in _connectedComponents(candNames, adj)
-    _emitDiscreteCluster!(out, cluster, candByName, liftedLhs, initialLookup, paramOrConstNames, initialPre)
+    _emitDiscreteCluster!(out, cluster, candByName, liftedLhs, initialLookup, paramOrConstNames, initialPre, otherRefs)
   end
   return (out, liftedLhs)
 end
