@@ -3309,9 +3309,23 @@ end
    next to the states. Names are the MTK parameters' (simVar.name, as in
    createParameterEquationsMTK). Empty when there are none. =#
 function freeParametersDecl(simCode)::Expr
+  #= A parameter alone on one side of an initial equation is assigned by it
+     (at codegen, or by the init solve's assignments), not free: the MSL Mean
+     block's `t0 = time`. As a free unknown it had no determining row, and its
+     zero Jacobian column disabled the scaled Newton step the ideal diodes of
+     DiodeBridge2mPulse need. =#
+  local assigned = OrderedSet{String}()
+  for ieq in simCode.initialEquations
+    local sides = try equationSides(ieq) catch; nothing end
+    sides === nothing && continue
+    for side in sides
+      side isa DAE.CREF && push!(assigned, string(side))
+    end
+  end
   local names = String[]
-  for (_, (_, sv)) in simCode.stringToSimVarHT
+  for (key, (_, sv)) in simCode.stringToSimVarHT
     (SimulationCode.isParameter(sv) && !SimulationCode.hasBindingExp(sv)) || continue
+    key in assigned && continue
     local free = @match sv.attributes begin
       SOME(DAE.VAR_ATTR_REAL(fixed = SOME(DAE.BCONST(false)))) => true
       _ => false
