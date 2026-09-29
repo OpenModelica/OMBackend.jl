@@ -1185,22 +1185,6 @@ function replaceCref(inExp::DAE.Exp, inTpl::Tuple{<:DAE.ComponentRef, DAE.Exp}):
   (outExp, otpl)
 end
 
-function transposeNestedListAccumulator(lstlst::List{List{T}}, acc::List{List{T}})::List{List{T}} where{T}
-  local rest::List{List{T}}=nil
-  local tmpLst::List{T}
-  local tmp::T
-  @match tmpLst <| _ = lstlst
-  if listLength(tmpLst) == 0
-    for lst in lstlst
-      tmp <| lst = lst
-      tmpLst = tmp <| tmpLst
-      rest = lst <| rest
-    end
-    transposeNestedListAccumulator(listReverse(rest), tmpLst <| acc)
-  end
-  return acc
-end
-
 
 " author: lochel
   This function extracts all crefs from the input expression, except 'time'.

@@ -23,7 +23,7 @@ Builds a self-contained Julia module that defines:
 
 The emitter intentionally does NOT depend on ModelingToolkit, on
 `expToJuliaExpMTK`, or on any of the MTK helpers. It mirrors the
-SIM_CODE -> Julia mapping in the donor `codeGen.jl`
+SIM_CODE -> Julia mapping of `expToJuliaExp` in `codeGen.jl`
 =#
 
 module DEGen
@@ -83,6 +83,8 @@ function buildDELayout(simCode::SimulationCode.SIM_CODE)::DELayout
                   stateIndex, paramIndex, discreteIndex)
 end
 
+#= SimCode-Exp entry: per-variant dispatch mirrors `toDAEExp`;
+   only the EXP_CREF leaf and the operator map touch a per-node DAE projection. =#
 """
 Lower a DAE.Exp to Julia for the DE backend. Emits expressions that read
 states from `u[i]`, parameters from `p[i]`, and time from `t`. State
@@ -92,12 +94,9 @@ unsupported in user-facing code) follow the parameter slot.
 Differs from `expToJuliaExp` in `codeGen.jl` by:
   - using the DELayout integer indices instead of `simCode.stringToSimVarHT[name][1]`
   - rejecting CALL fallthrough that would silently emit unresolved Julia symbols
-  - inlining IFEXP (the donor in codeGen.jl rejects it; the audit T2.1 flagged
-    that as inconsistent. We allow it because IFEXP can survive when the if-
-    expression-to-if-equation pass leaves expressions that depend on time).
+  - inlining IFEXP: it survives where the if-expression-to-if-equation pass
+    leaves expressions that depend on time.
 """
-#= SimCode-Exp entry: per-variant dispatch mirrors `toDAEExp`;
-   only the EXP_CREF leaf and the operator map touch a per-node DAE projection. =#
 expToJuliaExpDE(e::SimulationCode.BCONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
 expToJuliaExpDE(e::SimulationCode.ICONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
 expToJuliaExpDE(e::SimulationCode.RCONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)

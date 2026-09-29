@@ -400,9 +400,9 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
              names and names already in aliasMap; aborts the fold if a folded name
              survives anywhere. =#
           "foldExplicitSingleAssign" => SimulationCode.foldExplicitSingleAssign,
-          #= Second alias elimination: the simplifiers since the first
-             (foldExplicitSingleAssign, propagateConstants, dropObservationOnlyVariables)
-             collapse n-term connector flow sums into 2-term residuals like `a + b = 0`. =#
+          #= Second alias elimination: earlier simplifiers (foldExplicitSingleAssign,
+             propagateConstants, dropObservationOnlyVariables) collapse n-term connector
+             flow sums into 2-term residuals like `a + b = 0` the first could not see. =#
           "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables])
         #= Second RHS-equivalence pass: the alias-elim2 above can collapse two
            equations of the form `Xi - der(s_i)` onto the same `der(s)`. The
@@ -524,35 +524,45 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
   end
 end
 
+#= SimCode of `bDAE` with its Modelica functions, their record parameters
+   flattened (the call sites follow in flattenRecordCallSites). =#
+function _simCodeWithFunctions(bDAE::BDAE.BACKEND_DAE, functionList)::SimulationCode.SIM_CODE
+  local simCode = @BACKEND_PERFLOG "[backendAPI] generateSimulationCode" generateSimulationCode(bDAE; mode = MTK_MODE)
+  local (functions, externalRuntimeNeeded) = functionList === nothing ? (SimulationCode.ModelicaFunction[], false) :
+    generateSimCodeFunctions(functionList)
+  @assign begin
+    simCode.functions = SimulationCode.flattenRecordParameters(functions)
+    simCode.externalRuntime = externalRuntimeNeeded
+  end
+  SIMCODE_DUMP_SEQ[] = 0
+  @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_00_initial.log"), SimulationCode.dumpSimCode(simCode))
+  return simCode
+end
+
+#= The number of the backend-logging SimCode dumps of the current translate: a
+   pass that runs twice (pruneConstantConditions, eliminateAliasVariables) keeps
+   both dumps. =#
+const SIMCODE_DUMP_SEQ = Ref(0)
+
+#= Runs `passes` (name => pass) in order; with backend logging on, dumps the
+   SimCode after each to simCode_<NN>_after_<name>.log. =#
+function _runSimCodePasses(simCode::SimulationCode.SIM_CODE, passes::Vector{<:Pair{String}})::SimulationCode.SIM_CODE
+  for (name, pass) in passes
+    simCode = SimulationCode.runSimCodePass(name, simCode, pass)
+    @BACKEND_LOGGING begin
+      SIMCODE_DUMP_SEQ[] += 1
+      debugWrite(logPath("backend/simCode", "simCode_$(lpad(SIMCODE_DUMP_SEQ[], 2, '0'))_after_$(name).log"),
+                 SimulationCode.dumpSimCode(simCode))
+    end
+  end
+  return simCode
+end
+
 #= Heuristic predicate: is the eliminated alias name something a Modelica
    user might reasonably query via `sol(t; idxs = :name)`? Scalarized array
    indices and frame-internal connector names contain `[` and are filtered
    out by default; clean identifiers like `rev_phi` / `damper_w_rel` are
    kept so the alias observed equation reaches MTK. =#
-#= SimCode of `bDAE` with its Modelica functions, their record parameters
-   flattened (the call sites follow in flattenRecordCallSites). =#
-function _simCodeWithFunctions(bDAE, functionList)::SimulationCode.SIM_CODE
-  local simCode = @BACKEND_PERFLOG "[backendAPI] generateSimulationCode" generateSimulationCode(bDAE; mode = MTK_MODE)
-  local (functions, externalRuntimeNeeded) = functionList === nothing ? (SimulationCode.ModelicaFunction[], false) :
-    generateSimCodeFunctions(functionList)
-  @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_initial.log"), SimulationCode.dumpSimCode(simCode))
-  @assign begin
-    simCode.functions = SimulationCode.flattenRecordParameters(functions)
-    simCode.externalRuntime = externalRuntimeNeeded
-  end
-  return simCode
-end
-
-#= Runs `passes` (name => pass) in order; with backend logging on, dumps the
-   SimCode after each to simCode_after_<name>.log. =#
-function _runSimCodePasses(simCode::SimulationCode.SIM_CODE, passes::Vector{<:Pair{String}})::SimulationCode.SIM_CODE
-  for (name, pass) in passes
-    simCode = SimulationCode.runSimCodePass(name, simCode, pass)
-    @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_after_$(name).log"), SimulationCode.dumpSimCode(simCode))
-  end
-  return simCode
-end
-
 function _isUserVisibleAliasName(name::AbstractString)::Bool
   occursin('[', name) && return false
   return true

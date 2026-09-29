@@ -4867,10 +4867,9 @@ function decomposeParameterEquationsInline(parameterEquations; chunkSize = CHUNK
 end
 
 """
-  Generates quoted Symbolics registration calls for externally defined functions.
-  Scalar functions use @register_symbolic.
-  Functions with array parameters that return arrays use @register_array_symbolic
-  so MTK knows the output shape and can handle getindex on the result.
+  Generates quoted Symbolics registration calls for externally defined functions:
+  @register_symbolic for the scalar ones. Functions with array parameters are not
+  registered; they run eagerly on symbolic array arguments.
 """
 function generateRegisterCallsForCallExprs(simCode;
                                             funcArgGen::Function = AlgorithmicCodeGeneration.generateSignatureForRegistration)

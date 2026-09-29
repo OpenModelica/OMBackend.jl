@@ -1,9 +1,7 @@
 #=
-  This file contains the code generation for the DifferentialEquations.jl backend.
-
-TODO:
-  Add support for if equations
-  Current approach. One separate function for each branch.
+  The when-callback emitter the MTK path uses, and expToJuliaExp (DAE.Exp and
+  SimCode Exp to Julia) for the structural callbacks and CodeGenerationUtil.
+  The direct DifferentialEquations.jl backend is DECodeGeneration.jl.
 
   Author: John Tinnerholm
 =#
@@ -139,7 +137,6 @@ function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = tru
     end
   end
 end
-
 
 
 """
@@ -1244,15 +1241,13 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
 end
 
 
+#= SimCode-Exp entry: per-variant dispatch mirrors the DAE.Exp emitter;
+   only the EXP_CREF leaf, CALL args, and CAST touch a per-node DAE projection. =#
 """
   Converts a DAE expression into a Julia expression
   $(SIGNATURES)
 The context can be any type that contains a set of residual equations.
 """
-#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp`.
-   See comment on the MTK variant. =#
-#= SimCode-Exp entry: per-variant dispatch mirrors the DAE.Exp emitter;
-   only the EXP_CREF leaf, CALL args, and CAST touch a per-node DAE projection. =#
 function expToJuliaExp(e::SimulationCode.BCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   quote $(e.value) end
 end

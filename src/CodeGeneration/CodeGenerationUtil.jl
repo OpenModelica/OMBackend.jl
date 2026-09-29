@@ -211,8 +211,6 @@ function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DA
 end
 
 
-
-
 """
  Convert DAE.Exp into a Julia string.
 """

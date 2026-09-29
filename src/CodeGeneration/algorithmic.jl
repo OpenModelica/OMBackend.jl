@@ -128,51 +128,6 @@ function hasArrayOutput(f::SimulationCode.ModelicaFunction)::Bool
   return false
 end
 
-function _statementsContainIf(stmts)::Bool
-  for s in stmts
-    if s isa DAE.STMT_IF
-      return true
-    elseif s isa DAE.STMT_FOR
-      _statementsContainIf(s.statementLst) && return true
-    elseif s isa DAE.STMT_WHILE
-      _statementsContainIf(s.statementLst) && return true
-    elseif s isa DAE.STMT_ASSIGN
-      _expContainsIfExp(s.exp) && return true
-    elseif s isa DAE.STMT_ASSIGN_ARR
-      _expContainsIfExp(s.exp) && return true
-    end
-  end
-  return false
-end
-
-Base.@nospecializeinfer function _expContainsIfExp(@nospecialize(exp::DAE.Exp))::Bool
-  @match exp begin
-    DAE.IFEXP(__) => return true
-    DAE.BINARY(exp1 = e1, exp2 = e2) => begin
-      return _expContainsIfExp(e1) || _expContainsIfExp(e2)
-    end
-    DAE.UNARY(exp = e1) => begin
-      return _expContainsIfExp(e1)
-    end
-    DAE.CALL(expLst = args) => begin
-      for a in args
-        _expContainsIfExp(a) && return true
-      end
-      return false
-    end
-    DAE.ARRAY(array = elems) => begin
-      for e in elems
-        _expContainsIfExp(e) && return true
-      end
-      return false
-    end
-    DAE.ASUB(exp = inner) => begin
-      return _expContainsIfExp(inner)
-    end
-    _ => return false
-  end
-end
-
 #= Compute the output dimensions for a single-array-output function.
    Returns a tuple of ints, e.g. (4,) for a vector or (3,3) for a matrix.
    Returns () if not applicable (multiple outputs, unknown dimensions, etc.). =#
@@ -1097,12 +1052,12 @@ function generateStatement(stmt::DAE.STMT_ASSERT)::Expr
   end
 end
 
+#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp`. =#
 """
   Maps a DAE expression to a Julia expression for algorithmic code in Modelica Functions(!).
   Since functions do not use the model HT the original name is preserved for algorithmic generation.
 For algorithmic code outside Modelica functions do not call this function.
 """
-#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp`. =#
 Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::SimulationCode.Exp))::Expr
   return expToJuliaExpAlg(SimulationCode.toDAEExp(exp))
 end

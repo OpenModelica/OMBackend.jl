@@ -88,25 +88,6 @@ function makeResidualIfEquation(eqn::BDAE.IF_EQUATION)::BDAE.IF_EQUATION
   return BDAE.IF_EQUATION(eqn.conditions, listReverse(trueEquations2), listReverse(falseEquations2), eqn.source, eqn.attr)
 end
 
-function splitIfEquationResidualTraverse(lstCond::List{DAE.Exp}, lstlstTrue::List{List{BDAE.Equation}}, lstFalse::List{BDAE.Equation}, acc::List{DAE.Exp})::List{DAE.Exp}
-  acc = begin
-      local tmpTrue::List{BDAE.Equation}
-      local restTrue::List{List{BDAE.Equation}}
-      local tmpFalse::BDAE.Equation
-      local restFalse::List{BDAE.Equation}
-      @match (lstlstTrue, lstFalse) begin
-      (nil, _) => begin
-        (acc)
-      end
-      (tmpTrue <| restTrue, tmpFalse <| restFalse) => begin
-         acc  = makeNestedIfExpressionResidual(lstCond, tmpTrue, tmpFalse) <| acc
-         splitIfEquationResidualTraverse(lstCond, restTrue, restFalse, acc)
-      end
-    end
-  end
-  return acc
-end
-
 function makeNestedIfExpressionResidual(lstCond::List{DAE.Exp}, lstTrue::List{BDAE.Equation}, eqFalse::BDAE.Equation)
   exp = begin
     local cond::DAE.Exp

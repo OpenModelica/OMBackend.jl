@@ -350,8 +350,8 @@ end
 
 
 """
- Fetches the inner identifier of a variable and converts it to a string.
-That is:
+ The identifier of a variable's name as a string: the name of an unqualified
+ one, the part after the first qualifier of a qualified one.
 """
 function getInnerIdentOfVar(var)::String
   res = @match var.varName begin
@@ -365,25 +365,6 @@ function getInnerIdentOfVar(var)::String
   return string(res)
 end
 
-
-"""
-  Fetches the last ident of a component reference
-"""
-function getIdentOfComponentReference(cr)::String
-  return begin
-    @match cr begin
-      DAE.CREF_QUAL(ident = ident, componentRef = componentRef) => begin
-        getIdentOfComponentReference(componentRef)
-      end
-      DAE.CREF_IDENT(ident) => begin
-        ident
-      end
-      DAE.CREF_ITER(ident = ident) => begin
-        throw("Case not handled")
-      end
-    end
-  end
-end
 
 "
 Returns true if simvar is  an algebraic variable
@@ -426,8 +407,6 @@ function dumpVariableEqMapping(mapping::OrderedDict, residualEquations, ifEquati
   end
   return String(take!(dump))
 end
-
-
 
 
 """

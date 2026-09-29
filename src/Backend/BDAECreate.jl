@@ -1307,39 +1307,6 @@ Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospe
   return out
 end
 
-#= Collect every CREF occurring inside a list of DAE.Statement bodies (across
-   RHS of STMT_ASSIGN / STMT_ASSIGN_ARR and inside nested STMT_IF / STMT_FOR
-   / STMT_WHILE). Used by the when-equation lifter to build the `change(...)`
-   trigger condition. =#
-Base.@nospecializeinfer function _pushExpRhsCrefs!(out::OrderedSet{Tuple{DAE.ComponentRef, DAE.Type}}, @nospecialize(exp))
-  exp === nothing && return nothing
-  for c in Util.getAllCrefs(exp)
-    local ty = _crefType(c)
-    ty === nothing && continue
-    push!(out, (c, ty))
-  end
-  return nothing
-end
-
-Base.@nospecializeinfer function _walkRhsCrefsInDAEStmts!(out::OrderedSet{Tuple{DAE.ComponentRef, DAE.Type}}, @nospecialize(stmts))
-  for s in stmts
-    @match s begin
-      DAE.STMT_ASSIGN(_, _, rhs, _) => _pushExpRhsCrefs!(out, rhs)
-      DAE.STMT_ASSIGN_ARR(_, _, rhs, _) => _pushExpRhsCrefs!(out, rhs)
-      DAE.STMT_IF(cond, body, els, _) => begin
-        _pushExpRhsCrefs!(out, cond)
-        _walkRhsCrefsInDAEStmts!(out, body)
-      end
-      DAE.STMT_FOR(_, _, _, _, _, body, _) => _walkRhsCrefsInDAEStmts!(out, body)
-      DAE.STMT_WHILE(cond, body, _) => begin
-        _pushExpRhsCrefs!(out, cond); _walkRhsCrefsInDAEStmts!(out, body)
-      end
-      _ => nothing
-    end
-  end
-  return nothing
-end
-
 #= Best-effort: extract the type carried by a `DAE.ComponentRef`. Each
    CREF_IDENT / CREF_QUAL stores its identType; CREF_ITER and WILD are not
    useful triggers. =#
@@ -2117,35 +2084,6 @@ Base.@nospecializeinfer function _collectReductionIterNames!(blocked::OrderedSet
   for it in iters
     @match it begin
       DAE.REDUCTIONITER(id, _, _, _) => push!(blocked, id)
-      _ => nothing
-    end
-  end
-  return nothing
-end
-
-Base.@nospecializeinfer function _walkDiscreteStmtsForRhsCrefs!(out::Vector{DAE.ComponentRef},
-                                                                seen::OrderedSet{String},
-                                                                blocked::OrderedSet{String},
-                                                                @nospecialize(stmts))
-  local ctx = DiscreteRhsCrefVisitor(out, seen, blocked)
-  for s in stmts
-    @match s begin
-      DAE.STMT_ASSIGN(_, _, rhs, _) => Util.traverseExpTopDown(rhs, ctx, nothing)
-      DAE.STMT_ASSIGN_ARR(_, _, rhs, _) => Util.traverseExpTopDown(rhs, ctx, nothing)
-      DAE.STMT_IF(cond, body, _, _) => begin
-        Util.traverseExpTopDown(cond, ctx, nothing)
-        _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, body)
-      end
-      DAE.STMT_FOR(_, _, iter, _, _, body, _) => begin
-        local pushed = !(iter in blocked)
-        pushed && push!(blocked, iter)
-        _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, body)
-        pushed && delete!(blocked, iter)
-      end
-      DAE.STMT_WHILE(cond, body, _) => begin
-        Util.traverseExpTopDown(cond, ctx, nothing)
-        _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, body)
-      end
       _ => nothing
     end
   end
