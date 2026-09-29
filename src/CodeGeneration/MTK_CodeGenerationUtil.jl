@@ -773,7 +773,10 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         arrName = string(exp)
         #= To make sure the variable is indexed =#
         for d in dims
-          @match DAE.DIM_INTEGER(i) = d
+          local i = @match d begin
+            DAE.DIM_INTEGER(n) => n
+            _ => OMBackend.unsupported("array dimension", d)
+          end
           lookUpStr *= string("[", i, "]")
         end
         local arrEntry = get(hashTable, lookUpStr, nothing)
@@ -936,7 +939,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                 else
                   local current = bindArray
                   for idx in subIndices
-                    @match DAE.ARRAY(__) = current
+                    current isa DAE.ARRAY || OMBackend.unsupported("a binding row that is not an array literal", current)
                     current = listGet(current.array, idx)
                   end
                   current
@@ -1006,10 +1009,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
               $(LineNumberNode(@__LINE__, "$varName, datastructure variable"))
               $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
             end
-            _ => begin
-              @error "Unsupported varKind: $(varKind)"
-              fail()
-            end
+            _ => OMBackend.unsupported("variable kind $(nameof(typeof(varKind)))", varName)
           end
         end
       end
@@ -1527,7 +1527,11 @@ function tryHandleSubscriptedArrayCref(cr::DAE.ComponentRef, hashTable, simCode;
     @match sub begin
       DAE.INDEX(DAE.ICONST(i)) => i
       DAE.ICONST(i) => i
-      _ => expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+      #= A DAE.Subscript is lowered through its expression (it was passed whole: a MethodError). =#
+      DAE.INDEX(idxExp) || DAE.SLICE(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+      DAE.WHOLEDIM(__) => :(:)
+      _ => sub isa DAE.Exp ? expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol) :
+                             OMBackend.unsupported("subscript", sub)
     end
   end
 
@@ -1546,7 +1550,7 @@ function tryHandleSubscriptedArrayCref(cr::DAE.ComponentRef, hashTable, simCode;
           #= Multi-dimensional array: navigate nested structure =#
           local current = bindArray
           for idx in subExprs
-            @match DAE.ARRAY(__) = current
+            current isa DAE.ARRAY || OMBackend.unsupported("a binding row that is not an array literal", current)
             current = listGet(current.array, idx)
           end
           current
@@ -1958,21 +1962,22 @@ function _substIterElse(@nospecialize(els), iterId::String, value::Int)
   end
 end
 
-function _execInitAlgStmts!(valMap::Dict{Symbol, Float64}, stmts)::Nothing
+#= `written` (when given) collects the names an assignment wrote. =#
+function _execInitAlgStmts!(valMap::Dict{Symbol, Float64}, stmts; written = nothing)::Nothing
   for stmt in stmts
-    _execInitAlgStmt!(valMap, stmt)
+    _execInitAlgStmt!(valMap, stmt; written)
   end
   return nothing
 end
 
-function _execInitAlgElse!(valMap::Dict{Symbol, Float64}, @nospecialize(els))::Nothing
+function _execInitAlgElse!(valMap::Dict{Symbol, Float64}, @nospecialize(els); written = nothing)::Nothing
   @match els begin
-    DAE.ELSE(__) => _execInitAlgStmts!(valMap, els.statementLst)
+    DAE.ELSE(__) => _execInitAlgStmts!(valMap, els.statementLst; written)
     DAE.ELSEIF(__) => begin
       local c = _evalDAENumeric(els.exp, valMap)
       if c !== nothing
-        c != 0.0 ? _execInitAlgStmts!(valMap, els.statementLst) :
-                   _execInitAlgElse!(valMap, els.else_)
+        c != 0.0 ? _execInitAlgStmts!(valMap, els.statementLst; written) :
+                   _execInitAlgElse!(valMap, els.else_; written)
       end
       ()
     end
@@ -1981,7 +1986,7 @@ function _execInitAlgElse!(valMap::Dict{Symbol, Float64}, @nospecialize(els))::N
   return nothing
 end
 
-function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt))::Nothing
+function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt); written = nothing)::Nothing
   @match stmt begin
     DAE.STMT_ASSIGN(__) => begin
       local nm = try
@@ -1991,7 +1996,10 @@ function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt))::
       end
       if nm !== nothing
         local v = _evalDAENumeric(stmt.exp, valMap)
-        v !== nothing && (valMap[Symbol(nm)] = v)
+        if v !== nothing
+          valMap[Symbol(nm)] = v
+          written === nothing || push!(written, Symbol(nm))
+        end
       end
       ()
     end
@@ -1999,9 +2007,9 @@ function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt))::
       local c = _evalDAENumeric(stmt.exp, valMap)
       if c !== nothing
         if c != 0.0
-          _execInitAlgStmts!(valMap, stmt.statementLst)
+          _execInitAlgStmts!(valMap, stmt.statementLst; written)
         else
-          _execInitAlgElse!(valMap, stmt.else_)
+          _execInitAlgElse!(valMap, stmt.else_; written)
         end
       end
       ()
@@ -2026,7 +2034,7 @@ function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt))::
              max(abs(startV), abs(stopV), abs(stepV)) < 2.0^62
             for iv in Int(startV):Int(stepV):Int(stopV)
               for s in stmt.statementLst
-                _execInitAlgStmt!(valMap, _substIterStmt(s, stmt.iter, iv))
+                _execInitAlgStmt!(valMap, _substIterStmt(s, stmt.iter, iv); written)
               end
             end
           end
@@ -2048,9 +2056,9 @@ end
    discrete states set imperatively in an `initial algorithm` (no `start`
    attribute) default to 0.0 when evaluating if-equation initial branches,
    picking the wrong branch. =#
-function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode)
+function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode; written = nothing)
   for ia in simCode.initialAlgorithms
-    _execInitAlgStmts!(valMap, ia.daeStatements)
+    _execInitAlgStmts!(valMap, ia.daeStatements; written)
   end
   return valMap
 end
@@ -2189,6 +2197,14 @@ function _t0Number(f)::Union{Float64, Nothing}
   return raw isa Real ? Float64(raw) : nothing
 end
 
+#= The forms evalDAEConstant evaluates: a literal, or a BINARY/LBINARY through
+   evalDAE_Expression. The t0 map asks only for those (anything else is not a
+   constant, which is the rule, not a failure). =#
+_isEvaluableConstant(@nospecialize(e))::Bool =
+  e isa Union{DAE.BCONST, DAE.ICONST, DAE.RCONST, DAE.SCONST, DAE.BINARY, DAE.LBINARY,
+              SimulationCode.BCONST, SimulationCode.ICONST, SimulationCode.RCONST, SimulationCode.SCONST,
+              SimulationCode.BINARY, SimulationCode.LBINARY}
+
 #= `sv`'s start value as a number, or nothing. =#
 function _startNumber(sv, simCode)::Union{Float64, Nothing}
   local startExp = @match sv.attributes begin
@@ -2198,7 +2214,7 @@ function _startNumber(sv, simCode)::Union{Float64, Nothing}
     end
     _ => nothing
   end
-  return startExp === nothing ? nothing : _t0Number(() -> evalDAEConstant(startExp, simCode))
+  return _isEvaluableConstant(startExp) ? _t0Number(() -> evalDAEConstant(startExp, simCode)) : nothing
 end
 
 _isFixedStart(sv)::Bool = @match sv.attributes begin
@@ -2225,7 +2241,11 @@ function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{
     local sym = Symbol(key)
     if sv.varKind isa SimulationCode.PARAMETER
       #= The binding's value, else the start value. =#
-      local pval = _t0Number(() -> evalSimCodeParameter(sv, simCode))
+      local bind = @match sv.varKind begin
+        SimulationCode.PARAMETER(SOME(b)) => b
+        _ => nothing
+      end
+      local pval = _isEvaluableConstant(bind) ? _t0Number(() -> evalDAEConstant(bind, simCode)) : nothing
       pval === nothing && (pval = _startNumber(sv, simCode))
       if pval !== nothing
         valMap[sym] = pval
@@ -2241,14 +2261,12 @@ function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{
       valMap[sym] = something(sval, 0.0)
     end
   end
-  local preSeed = copy(valMap)
-  _seedInitialAlgValues!(valMap, simCode)
-  for (k, v) in valMap
-    if !haskey(preSeed, k) || preSeed[k] != v
-      push!(explicit, k)
-      push!(trusted, k)
-    end
-  end
+  #= The names the initial algorithms assign (by name: an assignment equal to
+     the start value is an initial-algorithm result too). =#
+  local written = Set{Symbol}()
+  _seedInitialAlgValues!(valMap, simCode; written)
+  union!(explicit, written)
+  union!(trusted, written)
   #= Trusted-first sweep: deterministic consequences of trusted data override
      guess-grade start values in the map, so branch decisions never read a
      value contradicted by the fixed initial configuration. =#

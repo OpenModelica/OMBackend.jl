@@ -647,8 +647,8 @@ end
 
 
 """
-  Evaluates a simulation code parameter.
-  Fails if the function is not a parameter.
+  Evaluates a simulation code parameter's binding (evalDAEConstant).
+  UnsupportedLowering when `v` is not a bound parameter or the binding not a constant.
 """
 function evalSimCodeParameter(v::V, simCode) where V
   return @match v.varKind begin

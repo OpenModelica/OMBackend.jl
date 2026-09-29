@@ -480,7 +480,7 @@ function _collectIfCondRefresh(writtenLHS::OrderedSet{String}, simCode)
   local refreshCrefs = Any[]
   local assigns = Expr[]
   isempty(simCode.ifEquations) && return (refreshCrefs, assigns)
-  local sortedIfEqs = sort(collect(simCode.ifEquations); by = ifEq -> _ifEquationSortKey(ifEq, simCode))
+  local sortedIfEqs = _sortedIfEquations(simCode)
   for (identifier, ifEq) in enumerate(sortedIfEqs)
     local i = 0
     for branch in ifEq.branches

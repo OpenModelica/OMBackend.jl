@@ -441,10 +441,13 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
     DAE.CALL(Absyn.IDENT("abs"), args, _) => :(abs($(rec(listHead(args)))))
     DAE.CALL(Absyn.IDENT("sign"), args, _) => :(sign($(rec(listHead(args)))))
     DAE.CALL(Absyn.IDENT("sqrt"), args, _) => :(sqrt($(rec(listHead(args)))))
-    DAE.CALL(Absyn.IDENT("min"), args, _) =>
+    #= min/max of an array (one argument) is not lowered here. =#
+    DAE.CALL(Absyn.IDENT("min"), args, _) where (listLength(args) == 2) =>
       :(min($(rec(listHead(args))), $(rec(listHead(listRest(args))))))
-    DAE.CALL(Absyn.IDENT("max"), args, _) =>
+    DAE.CALL(Absyn.IDENT("max"), args, _) where (listLength(args) == 2) =>
       :(max($(rec(listHead(args))), $(rec(listHead(listRest(args))))))
+    DAE.CALL(Absyn.IDENT("min"), _, _) => throw(_UnsupportedInAffect(exp))
+    DAE.CALL(Absyn.IDENT("max"), _, _) => throw(_UnsupportedInAffect(exp))
     #= Event-control wrappers are semantic no-ops inside an affect body. =#
     DAE.CALL(Absyn.IDENT("noEvent"), args, _) => rec(listHead(args))
     DAE.CALL(Absyn.IDENT("smooth"), args, _) => rec(listHead(listRest(args)))

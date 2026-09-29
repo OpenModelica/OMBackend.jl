@@ -494,6 +494,11 @@ modelica_String(x) = string(x)
 modelica_String(x, sigDigits::Int) = string(x)
 modelica_String(x, sigDigits::Int, minLen::Int) = string(x)
 modelica_String(x, sigDigits::Int, minLen::Int, leftAdjust::Bool) = string(x)
+#= Integer, Boolean and enumeration values: String(x, minimumLength, leftJustified)
+   (MLS 3.7.2), padded with blanks. The MSL ReadRealMatrixFromFile example's
+   String(i, 0, true) had no method. =#
+modelica_String(x::Union{Integer, Bool}, minLen::Int, leftAdjust::Bool = true) =
+  leftAdjust ? rpad(string(x), minLen) : lpad(string(x), minLen)
 
 """
     modelica_homotopy(actual, simplified)

@@ -86,6 +86,11 @@ end
     @test t0Number(() -> quote x + 1 end) === nothing
     @test t0Number(() -> "a string") === nothing
     @test t0Number(() -> OMBackend.unsupported("not a constant", 1)) === nothing
+    #= Only the forms evalDAEConstant evaluates are asked for. =#
+    local evaluable = OMBackend.CodeGeneration.MTK_CodeGenerationUtil._isEvaluableConstant
+    local ty = DAE.T_REAL(MetaModelica.nil)
+    @test evaluable(DAE.RCONST(1.0)) && evaluable(DAE.BINARY(DAE.RCONST(1.0), DAE.ADD(ty), DAE.RCONST(2.0)))
+    @test !evaluable(DAE.CREF(DAE.CREF_IDENT("p", ty, MetaModelica.nil), ty)) && !evaluable(nothing)
   end
   @testset "_tryOr" begin
     @test OMBackend._tryOr(() -> error("x"), 7, :tryOrSite) == 7

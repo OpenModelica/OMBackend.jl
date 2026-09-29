@@ -388,4 +388,7 @@ import .ExampleDAEs
   #= ── 11. The error policy of fallbacks ───────────────────────── =#
   include("errorPolicyTests.jl")
 
+  #= ── 12. The Modelica builtins of generated code ─────────────── =#
+  include("modelicaBuiltinsTests.jl")
+
 end

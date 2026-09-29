@@ -71,8 +71,7 @@ So the first will have 1 and so on.
 function createIfEquations(stateVariables, algebraicVariables, simCode)
   local ifEquations = IfEquationComponent[]
   local identifier::Int
-  local sortedIfEquations = sort(collect(simCode.ifEquations);
-                                 by = ifEq -> _ifEquationSortKey(ifEq, simCode))
+  local sortedIfEquations = _sortedIfEquations(simCode)
   #= Shared relay-t0 map: targets computed by earlier if-equations feed the
      condition initial values of later ones. =#
   local relayT0 = OrderedDict{Symbol, Float64}()
@@ -91,6 +90,13 @@ function createIfEquations(stateVariables, algebraicVariables, simCode)
                                            Expr[]))
   end
   return ifEquations
+end
+
+#= The if-equations in the order of their sort keys, each key computed once
+   (`sort(by = ...)` computed it, lowering residuals, at every comparison). =#
+function _sortedIfEquations(simCode)
+  local ifEqs = collect(simCode.ifEquations)
+  return ifEqs[sortperm([_ifEquationSortKey(e, simCode) for e in ifEqs])]
 end
 
 function _ifEquationSortKey(ifEq::SimulationCode.IF_EQUATION, simCode)::String
