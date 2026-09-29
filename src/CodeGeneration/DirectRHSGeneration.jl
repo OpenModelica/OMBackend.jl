@@ -106,7 +106,8 @@ const DAE_REINIT = IdDict{Any, Function}()
 function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
                                allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
                                liftedDiscretes=String[],
-                               freeParameters=String[])
+                               freeParameters=String[],
+                               initRelations=Any[])
   local states = ModelingToolkit.unknowns(reducedSystem)
   local params = ModelingToolkit.parameters(reducedSystem)
   # Use full_equations to inline observed variable definitions.
@@ -370,12 +371,31 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                   discrete_pinned=discretePinnedIdx)
     #= At the solved state, at the solve's time (_solveDAEInitialization! evaluates at 0.0). =#
     assignParams! === nothing || assignParams!(p_vec, u0, 0.0)
+    #= The relations' literal values at the solved state select the branches
+       the initialization holds for (MLS 8.6); solved again until they settle. =#
+    local initRels = _initialRelationLiterals(reducedSystem, params, initRelations)
+    local useExtra = extraResiduals !== nothing
+    local keptIdx = vcat(pinnedIdx, discretePinnedIdx)
+    local resolveWith = (u, pv, ok) -> begin
+      local kept = u[keptIdx]
+      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
+                                              pinned=pinnedIdx,
+                                              derivative_targets=derivativeInitTargets,
+                                              eqLabels=eqLabels,
+                                              extra_residuals=useExtra ? residualsAt(pv) : nothing,
+                                              discrete_pinned=discretePinnedIdx,
+                                              converged=ok)
+      #= A solve that relaxed the fixed starts is not a settled initialization. =#
+      isapprox(un[keptIdx], kept; rtol = 1e-8, atol = 1e-10) || (ok[] = false)
+      assignParams! === nothing || assignParams!(pv, un, 0.0)
+      un
+    end
+    u0 = _settleInitialRelations!(resolveWith, u0, p_vec, initRels)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
     #= The same initialization for other parameter values (tunable parameters,
        OMBackend.withTunableParameters): a run with changed parameters needs
        the consistent initial state for them, not the one solved here. It
        starts from this one, which is close for nearby values. =#
-    local useExtra = extraResiduals !== nothing
     local u0Solved = copy(u0)
     DAE_REINIT[rhsFunc] = pv -> begin
       local u = _solveDAEInitializationFree!(copy(u0Solved), initRhs, pv, mm, freeIdx, follow!;
@@ -386,7 +406,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                          discrete_pinned=discretePinnedIdx,
                                          warm=true)
       assignParams! === nothing || assignParams!(pv, u, 0.0)
-      u
+      _settleInitialRelations!(resolveWith, u, pv, initRels)
     end
   end
 
@@ -695,6 +715,82 @@ function _parameterDependents(pars, params, roots::AbstractSet{String};
     return nothing
   end
   return (depFunc, depIdxs, deps)
+end
+
+#= The literal values of the if-equation relations at an initial state:
+   `eval!(pv, u, t)` writes 1.0/0.0 into their ifCond parameters and returns
+   whether one changed. From the codegen's entries (ifCond, observed names,
+   crossing functions, observed -> Bool); an entry whose ifCond is not a
+   parameter is left out, and when the crossing functions cannot be observed
+   there are none. Nothing when none remain. =#
+function _initialRelationLiterals(reducedSystem, params, entries)
+  isempty(entries) && return nothing
+  local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
+  local kept = Any[]
+  local zcs = Any[]
+  for (sym, names, fns, lit) in entries
+    local k = get(paramIdx, string(sym), 0)
+    k == 0 && continue
+    push!(kept, (k, names, length(zcs) + 1, length(fns), lit))
+    append!(zcs, fns)
+  end
+  isempty(kept) && return nothing
+  local f = try
+    ModelingToolkit.build_explicit_observed_function(reducedSystem, zcs)
+  catch e
+    @debug "DirectRHS: relation literals not observable; the initialization keeps the compiled ifConds" exception = e
+    return nothing
+  end
+  local eval! = (pv, u, t) -> begin
+    #= The observed function and the literals come from the model's eval:
+       called in the latest world (a re-initialization can run in an older). =#
+    local vals = Base.invokelatest(f, u, pv, t)
+    local changed = false
+    for (k, names, off, n, lit) in kept
+      local nt = NamedTuple{Tuple(names)}(Tuple(Float64(vals[off + i - 1]) for i in 1:n))
+      local v = Base.invokelatest(lit, nt) ? 1.0 : 0.0
+      changed |= pv[k] != v
+      pv[k] = v
+    end
+    changed
+  end
+  return (eval! = eval!, idxs = Int[k for (k, _...) in kept])
+end
+
+#= Initial event iteration for the if-equation relations: solved with their
+   entry values, the relations take their literal values at the solution
+   and, while one changes, the initialization is solved again (from the last
+   solution) for them. A cycle, a pass limit, a throw or a solve that does
+   not converge keeps the first solution and the entry parameters (MSL
+   EngineV6_analytic: the gas force's `v_rel < 0` was false at the entry,
+   the steady-state filter settled on the wrong torque). =#
+function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5)
+  rels === nothing && return u0
+  local pvFirst = copy(pv)
+  local uFirst = copy(u0)
+  local seen = Set{Vector{Float64}}([pv[rels.idxs]])
+  local u = u0
+  local err = nothing
+  for pass in 1:(maxPasses + 1)
+    try
+      rels.eval!(pv, u, 0.0) || return u
+      pass > maxPasses && break
+      local key = pv[rels.idxs]
+      key in seen && break
+      push!(seen, key)
+      local ok = Ref(true)
+      local un = resolve(copy(u), pv, ok)
+      ok[] || break
+      u = un
+    catch e
+      e isa InterruptException && rethrow()
+      err = e
+      break
+    end
+  end
+  @debug "DirectRHS: the relations did not settle at initialization; kept the entry branches" exception = err
+  copyto!(pv, pvFirst)
+  return uFirst
 end
 
 #= The DAE init solve with the free parameters p[freeIdx] as unknowns: they

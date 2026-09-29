@@ -196,7 +196,10 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
         #= A DAE's consistent initial state depends on the parameters: solve it
            again for these values (the build solved it for the compiled ones). =#
         local reinit = get(OMB.CodeGeneration.DAE_REINIT, OMB.Runtime.ModelingToolkit.SciMLBase.unwrapped_f(prob.f.f), nothing)
-        reinit === nothing || (prob = OMB.Runtime.ModelingToolkit.SciMLBase.remake(prob; u0 = reinit(prob.p)))
+        #= In the latest world: the re-initialization calls functions of the
+           model's eval (the RHS, the relation literals), which can be newer
+           than a caller that translated in the same call. =#
+        reinit === nothing || (prob = OMB.Runtime.ModelingToolkit.SciMLBase.remake(prob; u0 = Base.invokelatest(reinit, prob.p)))
       end
       #= Route through `mod.simulate(...; cached_build = rebuilt)` using the same
          closure form as the MTK path, so the body executes inside the model module

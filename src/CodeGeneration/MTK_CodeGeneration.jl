@@ -372,7 +372,8 @@ emitDirectRHSProblem() = :(
     reducedSystem, finalInitialValues, pars, tspan, callbacks;
     allInitialValues = initialValues,
     liftedDiscretes = (@isdefined(LIFTED_DISCRETES) ? LIFTED_DISCRETES : String[]),
-    freeParameters = (@isdefined(FREE_PARAMETERS) ? FREE_PARAMETERS : String[]))
+    freeParameters = (@isdefined(FREE_PARAMETERS) ? FREE_PARAMETERS : String[]),
+    initRelations = (@isdefined(_ifInitLiterals) ? _ifInitLiterals : Any[]))
 )
 
 """
@@ -497,11 +498,15 @@ struct IfEquationComponent
      hysteresis: checked after every step by the event iteration
      (withRelationRefresh). =#
   relations            :: Vector{Tuple{Symbol, Any, Any}}
+  #= (ifCond, observed names, observed crossing functions, observed -> Bool)
+     of the relations whose literal value the initialization settles
+     (_settleInitialRelations!): the t0 value, from the solved state. =#
+  initLiterals         :: Vector{Expr}
 end
 IfEquationComponent(events, conditionalEquations, conditionVariables, conditionNameAndIV, pureTimeEvents,
                     relayGuesses) =
   IfEquationComponent(events, conditionalEquations, conditionVariables, conditionNameAndIV, pureTimeEvents,
-                      relayGuesses, Tuple{Symbol, Any, Any}[])
+                      relayGuesses, Tuple{Symbol, Any, Any}[], Expr[])
 
 #= The hysteresis parameter H of the event crossing functions (set per solve
    from its reltol, as OpenModelica's tolZC = 1e-4 * relTol). =#
@@ -969,6 +974,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   end
   #= Branch events with a hysteresis share the parameter H (set per solve). =#
   local IF_RELATIONS = collect(Iterators.flatten(c.relations for c in IF_EQUATION_COMPONENTS))
+  local IF_INIT_LITERALS = get(ENV, "OMBACKEND_INIT_RELATIONS", "true") == "true" ?
+    collect(Iterators.flatten(c.initLiterals for c in IF_EQUATION_COMPONENTS)) : Expr[]
   local ifCondParamNames = copy(ifConditionalVariables)
   if !isempty(IF_RELATIONS)
     push!(ifCondParamDecls, Expr(:(=), ZC_HYSTERESIS, ZC_HYSTERESIS_DEFAULT))
@@ -1299,6 +1306,10 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
          structural-transition branch additionally dispatches at runtime on
          the mass matrix. See `emitProblemConstruction` and its three
          strategy emitters for the full rationale. =#
+      #= The relations the initialization settles (in the latest world, like
+         the event list: the symbolic variables are globals bound while the
+         model is built). =#
+      _ifInitLiterals = Base.invokelatest(() -> Any[$(IF_INIT_LITERALS...)])
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
       OMBackend.CodeGeneration.checkNamedStateLookups(problem, $(NAMED_STATE_LOOKUPS))
       $(emitDiscreteClusters(simCode))
@@ -2204,6 +2215,7 @@ function createIfEquation(stateVariables::Vector,
     any(b -> b.identifier != -1 && _conditionReferencesRelayTarget(b.condition, _rT0),
         ifEq.branches)
   local relations = Tuple{Symbol, Any, Any}[]
+  local initLiterals = Expr[]
   for branch in ifEq.branches
     i += 1
     @match branch begin
@@ -2303,9 +2315,13 @@ function createIfEquation(stateVariables::Vector,
              (the static value comes from start attributes). Not for conditions
              on other lifted if-expressions: their values are not ready then. =#
           local initAffect = nothing
+          local litInit = nothing
+          local litObsInit = Expr[]
           if !_exprMentionsPrefix(zcLhs, "ifEq_tmp")
             local litObs = Expr[]
             local lit = MTK_CodeGenerationUtil._literalConditionExpr(branch.condition, simCode, litObs)
+            litInit = lit
+            litObsInit = litObs
             if lit !== nothing
               local litObsNT = Expr(:tuple, Expr(:parameters, litObs...))
               local litModNT = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, thisSym)))
@@ -2337,6 +2353,15 @@ function createIfEquation(stateVariables::Vector,
               reinitializealg = SciMLBase.NoInit()
             ))
           elseif initAffect !== nothing
+            #= Settled by the initialization too (MLS 8.6: a relation takes its
+               literal value at the initial solution), unless it reads pre(),
+               an event operator or time (the init solve is at t = 0). =#
+            if !_conditionHasCall(branch.condition, ("pre", "initial", "terminal", "sample", "edge", "change", "delay")) &&
+               !_ifConditionDependsOnTime(branch.condition)
+              local obsNames = Symbol[kw.args[1] for kw in litObsInit]
+              push!(initLiterals, :(($(QuoteNode(thisSym)), $(QuoteNode(obsNames)), Any[$([kw.args[2] for kw in litObsInit]...)],
+                                     (observed -> $(litInit)))))
+            end
             cond = :(ModelingToolkit.SymbolicContinuousCallback(
               ($(hystCond)) => $(affectTuple);
               affect_neg = $(affectNegTuple),
@@ -2436,7 +2461,18 @@ function createIfEquation(stateVariables::Vector,
   end
   return IfEquationComponent(conditions, ifExpressions,
                              conditionVariables, conditionVariableNames, pureTimeEvents,
-                             relayGuesses, relations)
+                             relayGuesses, relations, initLiterals)
+end
+
+#= Whether a condition calls one of `names`. =#
+function _conditionHasCall(@nospecialize(cond), names)::Bool
+  cond isa SimulationCode.Exp && (cond = SimulationCode.toDAEExp(cond))
+  local found = Ref(false)
+  Util.traverseExpBottomUp(cond, (x, acc) -> begin
+    x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name in names && (found[] = true)
+    (x, true, acc)
+  end, 0)
+  return found[]
 end
 
 #= A synthesized cluster's body can read a Boolean defined by a relation elsewhere

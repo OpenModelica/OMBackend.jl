@@ -119,7 +119,10 @@ function _completeUnderdeterminedInit!(u0, rhsFunc, p_vec, eq_idx, var_idx, algC
   return changed
 end
 
-function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false)
+#= `converged` is set false when no phase converged (the result is then the
+   best effort the warning or the error below reports). =#
+function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
+                                  converged::Base.RefValue{Bool}=Ref(true))
   local n = length(u0)
   local nMM = size(mm, 1)
   local nSafe = min(n, nMM)
@@ -273,6 +276,7 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
   phase3_ok && completeInit!(latched_unpinned)
   phase3_ok || snapEntryNoise!()
   if !phase3_ok
+    converged[] = false
     rhsFunc(du, u0, p_vec, 0.0)
     local resids = abs.(_initResidualVec(du, u0, eq_idx, eq_target, extra_residuals))
     local final_res = maximum(resids)
