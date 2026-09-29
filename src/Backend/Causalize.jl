@@ -140,11 +140,24 @@ Base.@nospecializeinfer function (v::IfExpressionLifter)(@nospecialize(exp::DAE.
           (DAE.IFEXP(lc, lt, le), false)
         else
           #= Lift this IFEXP. Recurse branches via the time-dep variant so nested
-             state-dependent IFEXPs keep their bool-product lowering. =#
-          local (liftedCond, _) = Util.traverseExpTopDown(cond, timeDep, nothing)
-          local (liftedThen, _) = Util.traverseExpTopDown(expThen, timeDep, nothing)
-          local (liftedElse, _) = Util.traverseExpTopDown(expElse, timeDep, nothing)
-          local key = string(liftedCond, "|", liftedThen, "|", liftedElse)
+             state-dependent IFEXPs keep their bool-product lowering. An
+             elseif chain (the else branch an IFEXP whose condition makes
+             events) becomes further branches of the same if-equation: its
+             relations make events too (MLS 8.5), as an if-equation's elseif
+             does. Inline, `Hstat > Hsat` of MSL FluxTubes' H_lim switched a
+             derivative without an event and the step size collapsed on it. =#
+          local conds = DAE.Exp[]
+          local thens = DAE.Exp[]
+          local rest = expElse
+          push!(conds, first(Util.traverseExpTopDown(cond, timeDep, nothing)))
+          push!(thens, first(Util.traverseExpTopDown(expThen, timeDep, nothing)))
+          while rest isa DAE.IFEXP && !_relationsAllInNoEvent(rest.expCond)
+            push!(conds, first(Util.traverseExpTopDown(rest.expCond, timeDep, nothing)))
+            push!(thens, first(Util.traverseExpTopDown(rest.expThen, timeDep, nothing)))
+            rest = rest.expElse
+          end
+          local liftedElse = first(Util.traverseExpTopDown(rest, timeDep, nothing))
+          local key = string(join(string.(conds), "|"), "||", join(string.(thens), "|"), "||", liftedElse)
           local existing = get(v.dedup, key, nothing)
           if existing !== nothing
             (existing, true)
@@ -158,8 +171,8 @@ Base.@nospecializeinfer function (v::IfExpressionLifter)(@nospecialize(exp::DAE.
             local attr = BDAE.EQ_ATTR_DEFAULT_UNKNOWN
             local backendVar = BDAE.VAR(DAE.CREF_IDENT(varName, DAE.T_UNKNOWN_DEFAULT, nil),
                                         BDAE.VARIABLE(), varType)
-            v.tmpVarToElement[backendVar] = BDAE.IF_EQUATION(list(liftedCond),
-                                                            list(list(BDAE.EQUATION(varAsCREF, liftedThen, emptySource, attr))),
+            v.tmpVarToElement[backendVar] = BDAE.IF_EQUATION(list(conds...),
+                                                            list([list(BDAE.EQUATION(varAsCREF, t, emptySource, attr)) for t in thens]...),
                                                             list(BDAE.EQUATION(varAsCREF, liftedElse, emptySource, attr)),
                                                             emptySource,
                                                             BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
