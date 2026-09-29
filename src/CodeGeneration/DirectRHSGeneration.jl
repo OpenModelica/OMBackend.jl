@@ -437,26 +437,49 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     end
     local initDiscretes = _initialDiscreteClusters(initClusters, reducedSystem, discreteStarts)
     local keptIdx = vcat(pinnedIdx, discretePinnedIdx)
+    #= The relations' literal values select the branches the initialization
+       holds for (MLS 8.6). Codegen takes them from the start attributes; at the
+       entry point they come from the start state's observed values, which the
+       initialization keeps where it can (the MSL V6 cylinder: `x > 0.933` with
+       x = 1 - s_rel/L was true from s_rel's start 0, while the crank's
+       kinematics puts x below it; the solve held the other branch's quartic far
+       outside its range). Non-finite values keep the compiled literal. =#
+    local initRels = _initialRelationLiterals(reducedSystem, params, initRelations)
+    initRels === nothing || initRels.eval!(p_vec, u0, 0.0; finiteOnly = true)
     local uEntry = copy(u0)
     local firstErr = nothing
+    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
+                                                              pinned=pinnedIdx,
+                                                              derivative_targets=derivativeInitTargets,
+                                                              eqLabels=eqLabels,
+                                                              extra_residuals=extraResiduals,
+                                                              discrete_pinned=discretePinnedIdx)
     u0 = try
-      _solveDAEInitializationFree!(u0, initRhs, p_vec, mm, freeIdx, follow!;
-                                   pinned=pinnedIdx,
-                                   derivative_targets=derivativeInitTargets,
-                                   eqLabels=eqLabels,
-                                   extra_residuals=extraResiduals,
-                                   discrete_pinned=discretePinnedIdx)
+      solveFree(u0, p_vec)
     catch e
-      #= With discrete clusters the initialization is tried again from their start values. =#
-      (e isa InterruptException || initDiscretes === nothing) && rethrow()
-      firstErr = e
-      copy(uEntry)
+      e isa InterruptException && rethrow()
+      #= The relations at the failed solve's last point: where one differs, the
+         initialization is solved again from the entry with it (the event
+         iteration of the initialization, before a solution exists). =#
+      local retried = initRels !== nothing && initRels.eval!(p_vec, u0, 0.0; finiteOnly = true) ?
+        try
+          solveFree(copy(uEntry), p_vec)
+        catch e2
+          e2 isa InterruptException && rethrow()
+          nothing
+        end : nothing
+      if retried !== nothing
+        retried
+      else
+        #= With discrete clusters the initialization is tried again from their start values. =#
+        initDiscretes === nothing && rethrow()
+        firstErr = e
+        copy(uEntry)
+      end
     end
     #= At the solved state, at the solve's time (_solveDAEInitialization! evaluates at 0.0). =#
     assignParams! === nothing || assignParams!(p_vec, u0, 0.0)
-    #= The relations' literal values at the solved state select the branches
-       the initialization holds for (MLS 8.6); solved again until they settle. =#
-    local initRels = _initialRelationLiterals(reducedSystem, params, initRelations)
+    #= The relations' literals at the solved state; solved again until they settle. =#
     local useExtra = extraResiduals !== nothing
     local resolveWith = (u, pv, ok) -> begin
       local kept = u[keptIdx]
@@ -981,13 +1004,14 @@ function _initialRelationLiterals(reducedSystem, params, entries)
     @debug "DirectRHS: relation literals not observable; the initialization keeps the compiled ifConds" exception = e
     return nothing
   end
-  local eval! = (pv, u, t) -> begin
+  local eval! = (pv, u, t; finiteOnly::Bool = false) -> begin
     #= The observed function and the literals come from the model's eval:
        called in the latest world (a re-initialization can run in an older). =#
     local vals = Base.invokelatest(f, u, pv, t)
     local changed = false
     for (k, names, off, n, lit) in kept
       local nt = NamedTuple{Tuple(names)}(Tuple(Float64(vals[off + i - 1]) for i in 1:n))
+      finiteOnly && !all(isfinite, values(nt)) && continue
       local v = Base.invokelatest(lit, nt) ? 1.0 : 0.0
       changed |= pv[k] != v
       pv[k] = v
