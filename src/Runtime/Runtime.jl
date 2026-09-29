@@ -286,6 +286,7 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
               @BACKEND_LOGGING @info "Pulled observed value for $newSym from old $oldSymName" val
             end
           catch e
+            OMBackend._fallback(e, :vssPullObserved; impact = :result)
             @BACKEND_LOGGING @info "Failed to pull observed for $newSym" e
           end
         end
@@ -382,8 +383,9 @@ function _fill_observed_u0!(newU0::Vector{Float64},
       try
         local oldSym = getproperty(oldSys, varName)
         newU0[i] = last(solutionAtChange[oldSym])
-      catch
+      catch err
         #= Variable not observable in old system; keep the start= value. =#
+        OMBackend._fallback(err, :vssOldValue; impact = :result)
       end
     end
   end
@@ -410,7 +412,8 @@ function _isDAETransferTarget(newSystem)::Bool
     end
     local d = [mm[k, k] for k in 1:size(mm, 1)]
     return any(iszero, d)
-  catch
+  catch err
+    OMBackend._fallback(err, :vssMassMatrix)
     return false
   end
 end
@@ -449,7 +452,8 @@ function _buildTransferU0Dict(newSystem, oldSystem, integrator,
         if v isa Number && isfinite(v)
           val = Float64(v)
         end
-      catch
+      catch err
+        OMBackend._fallback(err, :vssOldObserved; impact = :result)
         val = nothing
       end
     end
@@ -457,9 +461,10 @@ function _buildTransferU0Dict(newSystem, oldSystem, integrator,
       try
         local newVar = getproperty(newSys, newSym)
         u0Dict[newVar] = val
-      catch
+      catch err
         #= Cannot resolve symbol on new sys — let the new system's
            own defaults handle it. =#
+        OMBackend._fallback(err, :vssNewSymbol; impact = :result)
       end
     end
   end
@@ -768,8 +773,9 @@ function recompilation(activeModeName,
     local stateVars = Dict{String,Float64}()
     for sym in ModelingToolkit.get_unknowns(sysAtChange)
       try
-        stateVars[string(sym.f.name)] = last(solAtChange[sym])
-      catch
+        stateVars[string(ModelingToolkit.getname(sym))] = last(solAtChange[sym])
+      catch err
+        OMBackend._fallback(err, :agentStateSnapshot; impact = :result)
       end
     end
     #= Current values of the specific parameters the agent may change =#
@@ -782,7 +788,8 @@ function recompilation(activeModeName,
         else
           currentValues[p] = last(solAtChange[sym])
         end
-      catch
+      catch err
+        OMBackend._fallback(err, :agentCurrentValues; impact = :result)
         currentValues[p] = nothing
       end
     end
@@ -794,7 +801,8 @@ function recompilation(activeModeName,
       try
         local pname = string(ModelingToolkit.getname(p))
         parameters[pname] = ModelingToolkit.SymbolicIndexingInterface.getp(sysAtChange, p)(solAtChange.prob)
-      catch
+      catch err
+        OMBackend._fallback(err, :agentParameterSnapshot; impact = :result)
       end
     end
     local agentCtx = AgentContext(stateVars, parameters, currentValues, tspan,

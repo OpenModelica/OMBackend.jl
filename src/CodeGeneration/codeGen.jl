@@ -219,11 +219,7 @@ function _timeThreshold(@nospecialize(rel), simCode)
       isCmp || return nothing
       local thr = _isTimeCref(e1) ? e2 : (_isTimeCref(e2) ? e1 : nothing)
       thr === nothing && return nothing
-      local v = try
-        SimulationCode.tryEvalNumeric(thr, simCode)
-      catch
-        nothing
-      end
+      local v = OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(thr, simCode), nothing, :timeThreshold)
       v === nothing ? nothing : Float64[Float64(v)]
     end
     _ => nothing
@@ -424,11 +420,11 @@ end
 function _timeOffsetOverPeriod(@nospecialize(e), simCode)
   @match e begin
     DAE.BINARY(exp1 = num, operator = DAE.DIV(__), exp2 = per) => begin
-      local p = try SimulationCode.tryEvalNumeric(per, simCode) catch; nothing end
+      local p = OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(per, simCode), nothing, :timePeriod)
       p === nothing && return nothing
       local s = @match num begin
         DAE.BINARY(exp1 = t, operator = DAE.SUB(__), exp2 = sExp) =>
-          (_isTimeCref(t) ? (try SimulationCode.tryEvalNumeric(sExp, simCode) catch; nothing end) : nothing)
+          (_isTimeCref(t) ? OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(sExp, simCode), nothing, :timeShift) : nothing)
         _ => (_isTimeCref(num) ? 0.0 : nothing)
       end
       s === nothing && return nothing

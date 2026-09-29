@@ -94,9 +94,11 @@ mutable struct FallbackRecord
   bug::Bool
 end
 
-#= Per site, since the last translate. =#
+#= Per site, since the last translate (under a lock: run-time sites can fire
+   from several threads, e.g. an ensemble). =#
 const FALLBACKS = Dict{Symbol, FallbackRecord}()
-resetFallbacks!() = empty!(FALLBACKS)
+const FALLBACKS_LOCK = ReentrantLock()
+resetFallbacks!() = @lock FALLBACKS_LOCK empty!(FALLBACKS)
 fallbackSummary() = sort!([(site, r.count, r.exceptionType, r.impact, r.bug) for (site, r) in FALLBACKS]; by = first)
 
 """
@@ -112,9 +114,12 @@ function _fallback(@nospecialize(e), site::Symbol; expect::Type = Union{}, only:
   local bt = catch_backtrace()
   local bug = !(e isa only) || (!(e isa expect) && isBug(e, bt))
   bug && !envSwitch("OMBACKEND_FALLBACK_ON_BUG") && rethrow()
-  local r = get!(() -> FallbackRecord(0, string(typeof(e)), impact, bug), FALLBACKS, site)
-  r.count += 1
-  if r.count == 1
+  local first = @lock FALLBACKS_LOCK begin
+    local r = get!(() -> FallbackRecord(0, string(typeof(e)), impact, bug), FALLBACKS, site)
+    r.count += 1
+    r.count == 1
+  end
+  if first
     local level = bug ? Error : impact === :result ? Info : Debug
     @logmsg level "[fallback] $(site)" impact exception = (e, bt)
   end

@@ -443,6 +443,18 @@ function collectCrefNames!(names::OrderedSet{String}, @nospecialize(exp))
       collectCrefNames!(names, e2)
     end
     DAE.CAST(exp = e) => collectCrefNames!(names, e)
+    DAE.RANGE(start = s, step = st, stop = e) => begin
+      collectCrefNames!(names, s)
+      st isa SOME && collectCrefNames!(names, st.data)
+      collectCrefNames!(names, e)
+    end
+    DAE.MATRIX(matrix = rows) => foreach(row -> foreach(x -> collectCrefNames!(names, x), row), rows)
+    DAE.TUPLE(PR = lst) => foreach(x -> collectCrefNames!(names, x), lst)
+    DAE.RECORD(exps = lst) => foreach(x -> collectCrefNames!(names, x), lst)
+    DAE.SIZE(exp = e, sz = sz) => begin
+      collectCrefNames!(names, e)
+      sz isa SOME && collectCrefNames!(names, sz.data)
+    end
     DAE.TSUB(exp = e) => collectCrefNames!(names, e)
     DAE.RSUB(exp = e) => collectCrefNames!(names, e)
     DAE.REDUCTION(expr = e, iterators = iters) => begin

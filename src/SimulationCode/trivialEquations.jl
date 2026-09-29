@@ -357,7 +357,7 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   local firstSeen = Dict{String, Int}()
   local duplicates = Int[]
   for i in 1:n_eqs
-    local key = try string(toDAEExp(res[i].exp)) catch; string(res[i].exp) end
+    local key = string(toDAEExp(res[i].exp))
     if haskey(firstSeen, key)
       push!(duplicates, i)
     else
@@ -377,7 +377,7 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   end
 
   map(duplicates) do i
-    local eqStr = try OMFrontend.Frontend.toString(res[i].exp) catch; string(res[i].exp) end
+    local eqStr = string(toDAEExp(res[i].exp))
     @info "[SIMCODE: $(simCode.name): removeRedundantEquations] removing duplicate equation [$i]: 0 = $eqStr"
   end
 

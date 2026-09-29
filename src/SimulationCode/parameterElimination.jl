@@ -600,7 +600,13 @@ function bodies.
 function _collectFunctionBodyCrefs!(out::OrderedSet{String}, functions)
   for fn in functions
     @match fn begin
-      MODELICA_FUNCTION(__) => _walkStatementsForCrefs!(out, fn.statements)
+      MODELICA_FUNCTION(__) => begin
+        #= The locals' bindings (`local s = binding`) read names too. =#
+        for v in fn.locals
+          hasproperty(v, :binding) && v.binding isa SOME && collectCrefNames!(out, v.binding.data)
+        end
+        _walkStatementsForCrefs!(out, fn.statements)
+      end
       _ => nothing
     end
   end
@@ -627,10 +633,20 @@ function _walkStatementsForCrefs!(out::OrderedSet{String}, stmts)
         _walkStatementsForCrefs!(out, s.statementLst)
         _walkElseForCrefs!(out, s.else_)
       end
-      DAE.STMT_FOR(__) => begin
+      DAE.STMT_TUPLE_ASSIGN(__) => begin
+        foreach(e -> collectCrefNames!(out, e), s.expExpLst)
+        collectCrefNames!(out, s.exp)
+      end
+      DAE.STMT_FOR(__) || DAE.STMT_PARFOR(__) => begin
         collectCrefNames!(out, s.range)
         _walkStatementsForCrefs!(out, s.statementLst)
       end
+      DAE.STMT_ASSERT(__) => begin
+        collectCrefNames!(out, s.cond)
+        collectCrefNames!(out, s.msg)
+      end
+      DAE.STMT_TERMINATE(__) => collectCrefNames!(out, s.msg)
+      DAE.STMT_FAILURE(__) => _walkStatementsForCrefs!(out, s.body)
       DAE.STMT_WHILE(__) => begin
         collectCrefNames!(out, s.exp)
         _walkStatementsForCrefs!(out, s.statementLst)

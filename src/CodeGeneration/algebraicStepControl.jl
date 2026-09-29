@@ -192,7 +192,7 @@ function _projectStepEnd!(c::AlgebraicStepControl, integrator)
     local correction = try
       c.lu \ _algebraicResidual!(c, integrator, integrator.t)
     catch err
-      #= A singular factorization: no projection. =#
+      #= The model's residual threw (a singular factorization is `nothing`): no projection. =#
       OMBackend._fallback(err, :algebraicProjection)
       return nothing
     end

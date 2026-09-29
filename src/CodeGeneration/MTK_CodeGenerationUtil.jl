@@ -1836,7 +1836,7 @@ function _evalDAENumeric(@nospecialize(e), valMap::Dict{Symbol, Float64})::Union
     DAE.ICONST(__) => Float64(e.integer)
     DAE.BCONST(__) => e.bool ? 1.0 : 0.0
     DAE.CREF(__) => begin
-      local nm = try SimulationCode.DAE_identifierToString(e.componentRef) catch; return nothing end
+      local nm = SimulationCode.DAE_identifierToString(e.componentRef)
       nm == "time" ? 0.0 : get(valMap, Symbol(nm), nothing)
     end
     DAE.UNARY(operator = DAE.UMINUS(__)) => begin
@@ -2334,8 +2334,8 @@ function evalCausalRHSAtT0(rhsExpr, valMap::Dict{Symbol, Float64},
     return nothing
   end
   _exprSymbolsExplicit(rhsExpr, explicit) || return nothing
+  local numExpr = _intifyFloatIndices(_substituteExprValues(rhsExpr, valMap))
   try
-    local numExpr = _intifyFloatIndices(_substituteExprValues(rhsExpr, valMap))
     #= Generated Modelica function bindings live in the parent CodeGeneration
        module (Phase A evals them there), not in this submodule. =#
     local result = Core.eval(parentmodule(@__MODULE__), numExpr)
@@ -2407,12 +2407,7 @@ function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, s
     end
     local envStr = Dict{String, Float64}(string(k) => valMap[k] for k in explicit if haskey(valMap, k))
     for ifEq in simCode.ifEquations
-      local br = try
-        SimulationCode._selectActiveInitBranch(ifEq, envStr)
-      catch err
-        OMBackend._fallback(err, :selectActiveInitBranch)
-        nothing
-      end
+      local br = SimulationCode._selectActiveInitBranch(ifEq, envStr)
       br === nothing && continue
       for req in br.residualEquations
         local p = mkPair(req.exp)
@@ -2440,7 +2435,7 @@ function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, s
   return
 end
 
-function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool = false, extraVals = nothing)
+function evalInitialCondition(mtkCond, simCode; closedBoundary::Bool = false, extraVals = nothing)
   #= Skip during precompile output: `eval(...)` below would mutate this
      closed module's bindings and Julia rejects that. The runtime path is
      unaffected. Fallback `true` matches the existing catch arm. =#
@@ -2448,59 +2443,43 @@ function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool =
     return true
   end
   #= Evaluate zero-crossing function at t=0 to determine initial condition.
-     Works at the Expr level: walks the mtkCond Expr tree, substitutes all
-     variable/parameter references with numeric values, then evals the result.
-     Returns true when the zero-crossing function is non-negative at t=0
-     (condition FALSE), false when negative (condition TRUE).
+     Works at the Expr level: substitutes all variable/parameter references
+     in the mtkCond Expr (form :(lhs ~ 0)) with numeric values, then evals
+     the result. Returns true when the zero-crossing function is non-negative
+     at t=0 (condition FALSE), false when negative (condition TRUE).
      The caller inverts: ifCond = !(evalInitialCondition(...)). =#
-  try
-    if simCode === nothing
-      #= No simCode: fall back to old behavior =#
-      local mtkCondE = Base.invokelatest(eval, mtkCond)
-      local lhs = mtkCondE.lhs
-      local tSym = ModelingToolkit.t_nounits
-      local v = Base.invokelatest(substitute, lhs, Dict(tSym => 0.0))
-      local numV = try Float64(v) catch; nothing end
-      if numV !== nothing
-        return closedBoundary ? numV > 0.0 : numV >= 0.0
-      end
-      return (v == 0) != false
+  local valMap = _buildT0ValueMap(simCode)
+  #= Relay-computed t0 values: condition operands that are themselves
+     if-equation targets would otherwise default to 0 here and select the
+     wrong initial branch. =#
+  if extraVals !== nothing
+    for (k, v) in extraVals
+      valMap[k] = v
     end
-    local valMap = _buildT0ValueMap(simCode)
-    #= Relay-computed t0 values: condition operands that are themselves
-       if-equation targets would otherwise default to 0 here and select the
-       wrong initial branch. =#
-    if extraVals !== nothing
-      for (k, v) in extraVals
-        valMap[k] = v
-      end
-    end
-    #= Extract LHS from the mtkCond Expr (form: :(lhs ~ 0)) =#
-    local lhsExpr = _extractZeroCrossingLHS(mtkCond)
-    #= Substitute all variable references with numeric values =#
-    local numExpr = _substituteExprValues(lhsExpr, valMap)
-    local result = eval(numExpr)
-    local numResult = if result isa Number
-      Float64(result)
-    else
-      local unwrapped = Base.invokelatest(SymbolicUtils.unwrap, result)
-      if unwrapped isa Number
-        Float64(unwrapped)
-      else
-        local valued = Base.invokelatest(Symbolics.value, result)
-        Float64(valued isa Number ? valued : 0.0)
-      end
-    end
-    #= The zero-crossing function is negative when the condition is TRUE,
-       positive when FALSE. Return true when condition is FALSE (positive),
-       because the caller inverts: ifCond = !(evalInitialCondition(...)).
-       At zc == 0 the original operator decides (closedBoundary). =#
-    return closedBoundary ? numResult > 0.0 : numResult >= 0.0
+  end
+  local numExpr = _substituteExprValues(_extractZeroCrossingLHS(mtkCond), valMap)
+  local numResult = try
+    _numberOf(eval(numExpr))
   catch e
+    #= A name without a t0 value, a Modelica function outside its domain. =#
     OMBackend._fallback(e, :evalInitialCondition; expect = Union{UndefVarError, MethodError}, impact = :result)
     @warn "evalInitialCondition: failed to evaluate, defaulting to true" exception=(e, catch_backtrace())
     return true
   end
+  #= The zero-crossing function is negative when the condition is TRUE,
+     positive when FALSE. Return true when condition is FALSE (positive),
+     because the caller inverts: ifCond = !(evalInitialCondition(...)).
+     At zc == 0 the original operator decides (closedBoundary). =#
+  return closedBoundary ? numResult > 0.0 : numResult >= 0.0
+end
+
+#= An evaluated condition value as a Float64 (a symbolic constant unwrapped; 0.0 otherwise). =#
+function _numberOf(result)::Float64
+  result isa Number && return Float64(result)
+  local unwrapped = Base.invokelatest(SymbolicUtils.unwrap, result)
+  unwrapped isa Number && return Float64(unwrapped)
+  local valued = Base.invokelatest(Symbolics.value, result)
+  return Float64(valued isa Number ? valued : 0.0)
 end
 
 """

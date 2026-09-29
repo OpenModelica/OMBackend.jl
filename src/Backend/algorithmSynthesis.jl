@@ -260,7 +260,7 @@ Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospe
       OMFrontend.Frontend.convertStatements(alg.statements)
     catch err
       #= An algorithm the frontend cannot convert is left out. =#
-      OMBackend._fallback(err, :convertAlgorithmStatements; impact = :result)
+      OMBackend._fallback(err, :convertAlgorithmResiduals; impact = :result)
       continue
     end
     #= Conservative narrowing: only lift single-statement algorithm bodies.
@@ -368,7 +368,7 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
       OMFrontend.Frontend.convertStatements(statements)
     catch err
       #= An algorithm the frontend cannot convert is left out. =#
-      OMBackend._fallback(err, :convertAlgorithmStatements; impact = :result)
+      OMBackend._fallback(err, :convertAlgorithmWhens; impact = :result)
       continue
     end
     #= Sources.Table / Step / Pulse / Clock have an unrolled body of the shape
@@ -429,7 +429,7 @@ function synthesizeAssertsFromRegularAlgorithms(algorithms)::Vector{BDAE.Equatio
       OMFrontend.Frontend.convertStatements(alg.statements)
     catch err
       #= An algorithm the frontend cannot convert is left out. =#
-      OMBackend._fallback(err, :convertAlgorithmStatements; impact = :result)
+      OMBackend._fallback(err, :convertAlgorithmAsserts; impact = :result)
       continue
     end
     for s in daeStmts

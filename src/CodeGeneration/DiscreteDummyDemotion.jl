@@ -368,8 +368,8 @@ function _collectCyclicSCCDiscretes(simCode, whenAssignedSet::OrderedSet{String}
       end
     end
   catch err
-    #= Cyclic SCC demotion skipped. =#
-    OMBackend._fallback(err, :cyclicDiscreteDemotion)
+    #= Cyclic SCC demotion skipped (the structure changes). =#
+    OMBackend._fallback(err, :cyclicDiscreteDemotion; impact = :result)
   end
   return cyclic
 end

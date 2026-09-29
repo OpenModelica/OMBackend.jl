@@ -1294,7 +1294,9 @@ function getVariableValues(sols::Vector, variables...)
       end
       try
         push!(vals, sol[vAsJLSym])
-      catch
+      catch err
+        #= A variable the solution does not keep is left out. =#
+        _fallback(err, :variableValues; impact = :result)
       end
     end
   end

@@ -132,8 +132,9 @@ function rebuildMatchOrder(simCode::SIM_CODE)
     local (_isSingular, mo) = GraphAlgorithms.matching(eqVarMapping, nMatch)
     matchOrder = mo
   catch e
-    #= Matching failed: no dead-code elimination. =#
-    OMBackend._fallback(e, :outputOnlyMatching)
+    #= Matching failed (a large system can overflow the recursive matching's
+       stack): no dead-code elimination. =#
+    e isa StackOverflowError || OMBackend._fallback(e, :outputOnlyMatching)
     return (Int[], nameToMatchIdx, matchIdxToName)
   end
   local nMatched = count(>(0), matchOrder)

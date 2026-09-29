@@ -35,7 +35,9 @@ _algAssignedMaxIndex(idx::Colon) = 0
 function _algAssignedMaxIndex(idx)
   try
     return maximum(Int, idx; init=0)
-  catch
+  catch err
+    #= Not integer indices (an InexactError): no growth. =#
+    CodeGeneration.OMBackend._fallback(err, :algAssignedMaxIndex)
     return 0
   end
 end
@@ -99,15 +101,12 @@ function isMultiDimArray(v::DAE.VAR)::Bool
     return true
   end
   #= Also check v.dims field (used for function parameters) =#
-  try
-    dimCount = 0
-    for _ in v.dims
-      dimCount += 1
-    end
-    return dimCount >= 2
-  catch
-    return false
+  hasproperty(v, :dims) || return false
+  local dimCount = 0
+  for _ in v.dims
+    dimCount += 1
   end
+  return dimCount >= 2
 end
 
 #= Check if a ModelicaFunction has any array-typed output.

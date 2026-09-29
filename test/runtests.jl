@@ -391,4 +391,7 @@ import .ExampleDAEs
   #= ── 12. The Modelica builtins of generated code ─────────────── =#
   include("modelicaBuiltinsTests.jl")
 
+  #= ── 13. The names Modelica function statements read ──────────── =#
+  include("functionBodyCrefsTests.jl")
+
 end

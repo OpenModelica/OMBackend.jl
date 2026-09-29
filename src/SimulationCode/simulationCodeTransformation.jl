@@ -687,8 +687,10 @@ function matchAndCheckStronglyConnectedComponents(eqVariableMapping,
                                                         numberOfVariablesInMapping)
   catch e
     mode == OMBackend.MTK_MODE || rethrow()
-    #= Matching failed, delegating structural analysis to ModelingToolkit =#
-    OMBackend._fallback(e, :matchingDelegatedToMTK)
+    #= Matching failed, delegating structural analysis to ModelingToolkit. The
+       matching recurses (pathFound): a large system can overflow the stack,
+       which is this fallback too, not a fatal error. =#
+    e isa StackOverflowError || OMBackend._fallback(e, :matchingDelegatedToMTK)
     return (true, Int[], MetaGraphs.MetaDiGraph(), Vector{Int}[])
   end
   #=

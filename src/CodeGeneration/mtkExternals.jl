@@ -394,6 +394,13 @@ EAGER_SYMBOLIC_EXPANSIONS[:Modelica_Math_Vectors_interpolate] = function (args..
   return (yi, 1)
 end
 
+#= What an eager evaluation of a Modelica function throws for symbolic
+   arguments: a MethodError of the implementation (an operation without a
+   symbolic method), a FieldError (a record field read from a symbolic
+   value, as in the MSL records' functions); a TypeError (a condition on a
+   symbolic value) is not a programming error anyway. =#
+const _EAGER_SYMBOLIC_FAILURE = Union{MethodError, FieldError}
+
 """
 Call a tuple-returning Modelica function and extract a specific element.
 Used by the TSUB handler in equation code generation to avoid the problem
@@ -420,7 +427,9 @@ function tupleElementCall(funcName::Symbol, ix::Int, args...)
       local preparedArgs = _prepareArgsForEagerEval(args)
       local result = Base.invokelatest(impl, preparedArgs...)
       return result[ix]
-    catch
+    catch err
+      #= Symbolic arguments: the opaque extractors below (_EAGER_SYMBOLIC_FAILURE). =#
+      OMBackend._fallback(err, :eagerFunctionElement; expect = _EAGER_SYMBOLIC_FAILURE)
     end
     #= Fallback: opaque RTG Term extractors =#
     local uwArgs = Any[unwrapForSymbolic(a) for a in args]
@@ -569,7 +578,9 @@ function tupleArrayElementCall(funcName::Symbol, tupleIdx::Int, dims::Tuple{Vara
       local result = Base.invokelatest(impl, preparedArgs...)
       local tupleElem = result[tupleIdx]
       return _ensureArrayShape(tupleElem, dims)
-    catch
+    catch err
+      #= Symbolic arguments: the opaque extractors below (_EAGER_SYMBOLIC_FAILURE). =#
+      OMBackend._fallback(err, :eagerFunctionTupleElement; expect = _EAGER_SYMBOLIC_FAILURE)
     end
     #= Fallback: opaque RTG Term extractors =#
     local uwArgs = Any[unwrapForSymbolic(a) for a in args]
@@ -625,7 +636,9 @@ function tupleArrayElementAt(funcName::Symbol, tupleIdx::Int, arrayIndices::Tupl
           return tupleElem[arrayIndices[1], arrayIndices[2]]
         end
       end
-    catch
+    catch err
+      #= Symbolic arguments: the opaque extractors below (_EAGER_SYMBOLIC_FAILURE). =#
+      OMBackend._fallback(err, :eagerFunctionMatrixElement; expect = _EAGER_SYMBOLIC_FAILURE)
     end
     #= Fallback: opaque RTG Term extractors =#
     local uwArgs = Any[unwrapForSymbolic(a) for a in args]
@@ -951,7 +964,8 @@ function _symbolicFuncDispatch(funcName::Symbol, origArgs::Vector{Any}, isArray:
       return _ensureArrayShape(result, dims)
     end
     return result
-  catch
+  catch err
+    OMBackend._fallback(err, :eagerFunctionCall; expect = _EAGER_SYMBOLIC_FAILURE)
     local uwArgs = Any[unwrapForSymbolic(a) for a in origArgs]
     if isArray && !isempty(dims)
       return createSymbolicArrayCall(MODELICA_FUNCTION_WRAPPERS[funcName], uwArgs, dims; funcName=funcName)
@@ -1994,7 +2008,8 @@ function injectObservedEquations(sys, observedEqs::Vector)
       local _icFresh = ModelingToolkit.IndexCache(updated)
       updated = Setfield.set(updated, Setfield.PropertyLens{:index_cache}(), _icFresh)
     catch _err
-      @debug "[MTK GEN: observed] index_cache rebuild skipped" exception=_err
+      #= The index_cache rebuild is skipped. =#
+      OMBackend._fallback(_err, :observedIndexCache)
     end
   end
   return updated
@@ -2214,11 +2229,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   #= Diagnostic only: full_equations expands observed eqs and can hit
      SymbolicUtils Rational{Int64} overflow on some systems. A log count must
      never abort the build, so fall back to -1 (rendered as "n/a") on failure. =#
-  local post_full_eqs = try
-    length(ModelingToolkit.full_equations(sys))
-  catch
-    -1
-  end
+  local post_full_eqs = OMBackend._tryOr(() -> length(ModelingToolkit.full_equations(sys)), -1, :fullEquationsCount)
   local post_unknowns = length(unknowns(sys))
   @info "[MTK GEN: simplify] After structural_simplify: equations=$(post_eqs), full_equations=$(post_full_eqs), unknowns=$(post_unknowns)"
   if post_eqs != post_unknowns

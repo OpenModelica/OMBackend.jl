@@ -41,9 +41,9 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
   local checks = Tuple{ModelicaAssert, Any}[]
   local byName = _variablesByName(problem)
   for a in asserts
-    local missing = [n for n in values(a.observed) if !haskey(byName, n)]
-    if !isempty(missing)
-      @warn "[asserts] $(a.text) reads a variable the simulation does not keep; it is not checked" missing
+    local absent = [n for n in values(a.observed) if !haskey(byName, n)]
+    if !isempty(absent)
+      @warn "[asserts] $(a.text) reads a variable the simulation does not keep; it is not checked" absent
       continue
     end
     local getter = isempty(a.observed) ? nothing :
