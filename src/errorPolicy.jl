@@ -18,6 +18,23 @@
 
 using Base.CoreLogging: @logmsg, Debug, Info, Error
 
+"""
+    UnsupportedLowering(what, construct)
+
+A construct that code generation does not support (an expression, a
+condition, a statement or an equation form to lower to Julia/MTK code).
+Thrown through `unsupported(what, construct)`; a catch around a lowering
+narrows to it. Never a programming error of the policy's kind: a model
+may contain such a construct.
+"""
+struct UnsupportedLowering <: Exception
+  what::String
+  construct::Any
+end
+Base.showerror(io::IO, e::UnsupportedLowering) =
+  print(io, "UnsupportedLowering: ", e.what, ": ", first(string(e.construct), 300))
+unsupported(what::AbstractString, @nospecialize(construct)) = throw(UnsupportedLowering(what, construct))
+
 isFatal(@nospecialize(e))::Bool = e isa Union{InterruptException, OutOfMemoryError, StackOverflowError}
 
 #= The modules of OMBackend's source (not the model modules evaluated into it

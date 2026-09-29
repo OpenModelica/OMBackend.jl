@@ -211,106 +211,6 @@ function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DA
 end
 
 
-"""
- Convert DAE.Exp into a Julia string.
-"""
-Base.@nospecializeinfer function expToJL(@nospecialize(exp::DAE.Exp), simCode::SimulationCode.SIM_CODE; varPrefix="x")::String
-  hashTable = simCode.stringToSimVarHT
-  str = begin
-    local int::Int
-    local real::ModelicaReal
-    local bool::Bool
-    local tmpStr::String
-    local cr::DAE.ComponentRef
-    local e1::DAE.Exp
-    local e2::DAE.Exp
-    local e3::DAE.Exp
-    local expl::List{DAE.Exp}
-    local lstexpl::List{List{DAE.Exp}}
-    @match exp begin
-      DAE.ICONST(int) => string(int)
-      DAE.RCONST(real)  => string(real)
-      DAE.SCONST(tmpStr)  => (tmpStr)
-      DAE.BCONST(bool)  => string(bool)
-      DAE.ENUM_LITERAL((Absyn.IDENT(str), int))  => str + "()" + string(int) + ")"
-      DAE.CREF(cr, _)  => begin
-        varName = SimulationCode.string(cr)
-        builtin = if varName == "time"
-          true
-        else
-          false
-        end
-        if ! builtin
-          #= If we refer to time, we simply return t instead of a concrete variable =#
-          indexAndVar = hashTable[varName]
-          varKind::SimulationCode.SimVarType = indexAndVar[2].varKind
-          @match varKind begin
-            SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
-            SimulationCode.STATE(__) => "$varPrefix[$(indexAndVar[1])] #= $varName =#"
-            SimulationCode.PARAMETER(__) => "p[$(indexAndVar[1])] #= $varName =#"
-            SimulationCode.ALG_VARIABLE(__) => "$varPrefix[$(indexAndVar[1])] #= $varName =#"
-            SimulationCode.STATE_DERIVATIVE(__) => "dx[$(indexAndVar[1])] #= der($varName) =#"
-          end
-        else #= Currently only time is a builtin variable. Time is represented as t in the generated code =#
-          "t"
-        end
-      end
-      DAE.UNARY(operator = op, exp = e1) => begin
-        ("(" + SimulationCode.string(op) + " " + expToJL(e1, simCode) + ")")
-      end
-      DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-        (expToJL(e1, simCode, varPrefix=varPrefix) + " " + SimulationCode.string(op) + " " + expToJL(e2, simCode, varPrefix=varPrefix))
-      end
-      DAE.LUNARY(operator = op, exp = e1)  => begin
-        ("(" + SimulationCode.string(op) + " " + expToJL(e1, simCode, varPrefix=varPrefix) + ")")
-      end
-      DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-        (expToJL(e1, simCode, varPrefix=varPrefix) + " " + SimulationCode.string(op) + " " + expToJL(e2, simCode, varPrefix=varPrefix))
-      end
-      DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
-        (expToJL(e1, simCode, varPrefix=varPrefix) + " " + SimulationCode.string(op) + " " + expToJL(e2, simCode,varPrefix=varPrefix))
-      end
-      DAE.IFEXP(expCond = e1, expThen = e2, expElse = e3) => begin
-        "if" + expToJL(e1, simCode, varPrefix=varPrefix) + "\n" + expToJL(e2, simCode,varPrefix=varPrefix) + "else\n" + expToJL(e3, simCode,varPrefix=varPrefix) + "\nend"
-      end
-      DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = expl)  => begin
-        #=
-          TODO: Keeping it simple for now, we assume we only have one argument in the call
-          We handle derivatives separately
-        =#
-        varName = SimulationCode.DAE_identifierToString(listHead(expl))
-        (index, type) = hashTable[varName]
-        @match tmpStr begin
-        "der" => "dx[$index]  #= der($varName) =#"
-          "pre" => begin
-            indexForVar = hashTable[varName][1]
-            "(integrator.u[$(indexForVar)])"
-          end
-          "edge" =>  begin
-             indexForVar = hashTable[varName][1]
-             string(tuple(map((x) -> expToJL(x, simCode, varPrefix=varPrefix), expl)...)...) + " && ! integrator.uprev[$(indexForVar)]"
-          end
-          _  =>  begin
-            tmpStr *= string(tuple(map((x) -> expToJL(x, simCode, varPrefix=varPrefix), expl)...)...)
-          end
-        end
-      end
-      DAE.CAST(exp = e1)  => begin
-         expToJL(e1, simCode)
-      end
-      DAE.ARRAY(DAE.T_ARRAY(DAE.T_BOOL(__)), scalar, array) => begin
-        local arrayExp = "#= Array exp=# reduce(|, ["
-        for e in array
-          arrayExp *= expToJL(e, simCode) + ","
-        end
-        arrayExp *= "])"
-      end
-      _ =>  throw(ErrorException("$exp not yet supported"))
-    end
-  end
-  return "(" + str + ")"
-end
-
 
 function DAE_OP_toJuliaOperator(@nospecialize(op::DAE.Operator))
     return @match op begin
@@ -346,8 +246,8 @@ function DAE_OP_toJuliaOperator(@nospecialize(op::DAE.Operator))
       DAE.GREATEREQ() => :(>=)
       DAE.EQUAL() => :(==)
       DAE.NEQUAL() => :(!=)
-      DAE.USERDEFINED() => throw("Unknown operator: Userdefined")
-      _ => throw("Unknown operator")
+      DAE.USERDEFINED() => OMBackend.unsupported("operator", op)
+      _ => OMBackend.unsupported("operator", op)
     end
 end
 
@@ -557,71 +457,6 @@ function makeRefExpr(sym, subscriptExpr)
   end
 end
 
-"""
-  Utility function, traverses a DAE exp. Variables are saved in the supplied variables array
-  (Note that variables here refers to parameters as well)
-"""
-function getVariablesInDAE_Exp(@nospecialize(exp::DAE.Exp), simCode::SimulationCode.SIM_CODE, variables::Set)
-  local  hashTable = simCode.stringToSimVarHT
-  local int::Int64
-  local real::Float64
-  local bool::Bool
-  local tmpStr::String
-  local cr::DAE.ComponentRef
-  local e1::DAE.Exp
-  local e2::DAE.Exp
-  local e3::DAE.Exp
-  local expl::List{DAE.Exp}
-  local lstexpl::List{List{DAE.Exp}}
-  @match exp begin
-    #= These are not variables, so we simply return what we have collected thus far. =#
-    DAE.BCONST(bool) => variables
-    DAE.ICONST(int) => variables
-    DAE.RCONST(real) => variables
-    DAE.SCONST(tmpStr) => variables
-    DAE.CREF(DAE.CREF_IDENT("time", __), _) => begin
-      push!(variables, Symbol("t"))
-    end
-    DAE.CREF(cr, _)  => begin
-      varName = SimulationCode.string(cr)
-      indexAndVar = hashTable[varName]
-      push!(variables, Symbol(varName))
-      varKind::SimulationCode.SimVarType = indexAndVar[2].varKind
-      @match varKind begin
-        SimulationCode.STATE(__) || SimulationCode.PARAMETER(__) || SimulationCode.ALG_VARIABLE(__) => begin
-          push!(variables, Symbol(varName))
-        end
-        _ => begin
-          @error "Unsupported varKind: $(varKind)"
-          throw()
-        end
-      end
-    end
-    DAE.UNARY(operator = op, exp = e1) => begin
-      getVariablesInDAE_Exp(e1, simCode, variables)
-    end
-    DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) || DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) || DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
-      getVariablesInDAE_Exp(e1, simCode, variables)
-      getVariablesInDAE_Exp(e2, simCode, variables)
-    end
-    DAE.LUNARY(operator = op, exp = e1)  => begin
-      getVariablesInDAE_Exp(e1, simCode, variables)
-    end
-    DAE.IFEXP(expCond = e1, expThen = e2, expElse = e3) => begin
-      throw(ErrorException("If expressions not allowed in backend code"))
-    end
-    #= Should not introduce anything new..  I am a idiot - John 2021=#
-    DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
-      #TODO only assumes one argument
-      getVariablesInDAE_Exp(listHead(explst), simCode, variables)
-    end
-    DAE.CAST(ty, exp)  => begin
-      getVariablesInDAE_Exp(exp, simCode, variables)
-    end
-    _ =>  throw(ErrorException("$exp not yet supported"))
-  end
-end
-
 function isCycleInSCCs(sccs)
   for sc in sccs
     if length(sc) > 1
@@ -772,10 +607,7 @@ function evalDAEConstant(daeConstant::DAE.Exp, simCode)
     DAE.LBINARY(__) => begin
       OMBackend.CodeGeneration.evalDAE_Expression(daeConstant, simCode)
     end
-    _ => begin
-      local str = string(daeConstant)
-      throw("$(str) is not a constant")
-    end
+    _ => OMBackend.unsupported("not a constant", daeConstant)
   end
 end
 
@@ -786,10 +618,7 @@ function evalDAEConstant(daeConstant::DAE.Exp)
     DAE.RCONST(real) => real
     DAE.SCONST(tmpStr) => tmpStr
     #= Try to evaluate the expression =#
-    _ => begin
-      local str = string(daeConstant)
-      throw("$(str) is not a constant")
-    end
+    _ => OMBackend.unsupported("not a constant", daeConstant)
   end
 end
 
@@ -803,7 +632,7 @@ function evalDAEConstant(c::SimulationCode.Exp, simCode)
     SimulationCode.SCONST(s) => s
     SimulationCode.BINARY(__) || SimulationCode.LBINARY(__) =>
       OMBackend.CodeGeneration.evalDAE_Expression(SimulationCode.toDAEExp(c), simCode)
-    _ => throw("$(SimulationCode.toDAEExp(c)) is not a constant")
+    _ => OMBackend.unsupported("not a constant", SimulationCode.toDAEExp(c))
   end
 end
 function evalDAEConstant(c::SimulationCode.Exp)
@@ -812,7 +641,7 @@ function evalDAEConstant(c::SimulationCode.Exp)
     SimulationCode.ICONST(i) => i
     SimulationCode.RCONST(r) => r
     SimulationCode.SCONST(s) => s
-    _ => throw("$(SimulationCode.toDAEExp(c)) is not a constant")
+    _ => OMBackend.unsupported("not a constant", SimulationCode.toDAEExp(c))
   end
 end
 
@@ -937,97 +766,6 @@ function isParametricOnlyEquation(eq, simCode::SimulationCode.SimCode)::Bool
     Util.traverseExpBottomUp(rhs, checker, 0)
   end
   return !hasStateOrAlg[]
-end
-
-function _resolveQualifiedName(expr)
-  if expr isa Symbol
-    return isdefined(Main, expr) ? getproperty(Main, expr) : nothing
-  end
-  if expr isa Expr && expr.head === :. && length(expr.args) == 2
-    local parent = _resolveQualifiedName(expr.args[1])
-    parent === nothing && return nothing
-    local sym = expr.args[2]
-    sym isa QuoteNode && (sym = sym.value)
-    sym isa Symbol || return nothing
-    return isdefined(parent, sym) ? getproperty(parent, sym) : nothing
-  end
-  return nothing
-end
-
-function _applyNumericOp(fname::Symbol, args)
-  fname === :+    && return reduce(+, args)
-  fname === :-    && return length(args) == 1 ? -args[1] : args[1] - reduce(+, args[2:end])
-  fname === :*    && return reduce(*, args)
-  fname === :/    && return args[1] / args[2]
-  fname === :^    && return args[1] ^ args[2]
-  fname === :<    && return args[1] <  args[2]
-  fname === :>    && return args[1] >  args[2]
-  fname === :<=   && return args[1] <= args[2]
-  fname === :>=   && return args[1] >= args[2]
-  fname === :(==) && return args[1] == args[2]
-  fname === :(!=) && return args[1] != args[2]
-  fname === :!    && return !args[1]
-  fname === :min  && return minimum(args)
-  fname === :max  && return maximum(args)
-  fname === :abs  && return abs(args[1])
-  fname === :sin  && return sin(args[1])
-  fname === :cos  && return cos(args[1])
-  fname === :tan  && return tan(args[1])
-  fname === :exp  && return exp(args[1])
-  fname === :log  && return log(args[1])
-  fname === :sqrt && return sqrt(args[1])
-  fname === :floor && return floor(args[1])
-  fname === :ceil  && return ceil(args[1])
-  fname === :round && return round(args[1])
-  fname === :ifelse && return args[1] ? args[2] : args[3]
-  throw(ArgumentError("_evalNumericExpr: unsupported call $(fname)"))
-end
-
-function _evalNumericExpr(expr)
-  if expr isa Number || expr isa Bool
-    return expr
-  end
-  if expr isa Symbol
-    throw(ArgumentError("_evalNumericExpr: unresolved symbol $(expr)"))
-  end
-  if !(expr isa Expr)
-    throw(ArgumentError("_evalNumericExpr: unsupported expression $(expr)"))
-  end
-  if expr.head === :call
-    local fname = expr.args[1]
-    local args = Any[_evalNumericExpr(a) for a in expr.args[2:end]]
-    if fname isa Symbol
-      return _applyNumericOp(fname, args)
-    end
-    local fn = _resolveQualifiedName(fname)
-    fn === nothing && throw(ArgumentError("_evalNumericExpr: unsupported call head $(fname)"))
-    return Base.invokelatest(fn, args...)
-  end
-  if expr.head === :&&
-    return all(_evalNumericExpr(a) for a in expr.args)
-  end
-  if expr.head === :||
-    return any(_evalNumericExpr(a) for a in expr.args)
-  end
-  if expr.head === :if || expr.head === :elseif
-    local cond = _evalNumericExpr(expr.args[1])
-    if cond !== false && cond != 0
-      return _evalNumericExpr(expr.args[2])
-    elseif length(expr.args) >= 3
-      return _evalNumericExpr(expr.args[3])
-    else
-      return nothing
-    end
-  end
-  if expr.head === :block
-    local last = nothing
-    for a in expr.args
-      a isa LineNumberNode && continue
-      last = _evalNumericExpr(a)
-    end
-    return last
-  end
-  throw(ArgumentError("_evalNumericExpr: unsupported expression head $(expr.head)"))
 end
 
 function _substituteExprValues(expr, valMap::Dict{Symbol, Float64})

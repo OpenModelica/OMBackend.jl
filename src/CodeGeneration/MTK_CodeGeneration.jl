@@ -160,10 +160,7 @@ function classifyVariables(simCode)::ClassifiedVariables
   for (varName, (idx, var)) in ht
     local varType = var.varKind
     @match varType begin
-      SimulationCode.INPUT(__) => begin
-        @error "INPUT not supported in CodeGen"
-        throw()
-      end
+      SimulationCode.INPUT(__) => unsupported("INPUT variable", varName)
       SimulationCode.STATE(__) => push!(stateVariables, varName)
       SimulationCode.PARAMETER(__) => push!(parameters, varName)
       #= String parameters are non-numeric; excluded from MTK parameter system. =#

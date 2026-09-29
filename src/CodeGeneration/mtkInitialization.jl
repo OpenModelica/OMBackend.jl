@@ -456,7 +456,7 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
     local msg = lowerAlg(wStmt.message)
     return :(@info "Modelica terminate() during init" message=$(msg))
   end
-  throw(ErrorException("_initialWhenOpToJulia: unsupported variant $(typeof(wStmt))"))
+  unsupported("initial when-statement variant", wStmt)
 end
 
 #= Translate a single `BDAE.WhenOperator` from an init-algorithm body into a

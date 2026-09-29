@@ -383,7 +383,7 @@ function createStructuralWhenStatements(whenStatements,
     elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
       throw("Reinit is not allowed in a structural when equation")
     else
-      throw("Unsupported statement in the when equation:" * string(wStmt))
+      unsupported("statement in a when equation", wStmt)
     end
   end
   return (res, recompilationOperator)

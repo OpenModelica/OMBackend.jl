@@ -1275,7 +1275,7 @@ function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
         _emitWhenTupleElementAssignMTK!(res, elem, :($rhsAccess[$i]), simCode)
       end
     end
-    _ => throw(ErrorException("createWhenStatementsMTK: unsupported tuple-LHS element $lhs"))
+    _ => unsupported("tuple-LHS element in a when statement", lhs)
   end
   return res
 end
@@ -1342,7 +1342,7 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
               end
             end)
     else
-      throw(ErrorException("createWhenStatementsMTK: unsupported when-statement variant $(wStmt)"))
+      unsupported("when-statement variant", wStmt)
     end
   end
   return res

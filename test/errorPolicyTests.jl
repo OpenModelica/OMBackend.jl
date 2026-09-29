@@ -1,6 +1,8 @@
 #= The error policy of fallbacks (src/errorPolicy.jl). =#
 using Test
 import OMBackend
+import DAE
+import MetaModelica
 
 module ErrorPolicyForeign
 struct Callable end
@@ -52,6 +54,21 @@ end
     #= An assertion: in our code is ours; ModelingToolkit's (here a foreign module's) depends on the model. =#
     @test classify(() -> OMBackend._assertForTheTest())
     @test !classify(() -> ErrorPolicyForeign.asserting())
+  end
+  @testset "UnsupportedLowering: what the lowering cannot lower" begin
+    local e = OMBackend.UnsupportedLowering("condition expression", repeat("x", 1000))
+    @test !OMBackend.isBug(e, Base.backtrace())
+    local shown = sprint(showerror, e)
+    @test startswith(shown, "UnsupportedLowering: condition expression: xxx") && length(shown) < 400
+    @test_throws OMBackend.UnsupportedLowering OMBackend.SimulationCode.DAE_identifierToString(42)
+    local ty = DAE.T_REAL(MetaModelica.nil)
+    local cref = DAE.CREF(DAE.CREF_IDENT("x", ty, MetaModelica.nil), ty)
+    @test_throws OMBackend.UnsupportedLowering OMBackend.CodeGeneration.evalDAEConstant(cref)
+    @test OMBackend.CodeGeneration.evalDAEConstant(DAE.RCONST(2.0)) == 2.0
+    #= A fallback takes it: never a programming error. =#
+    withenv("OMBACKEND_FALLBACK_ON_BUG" => nothing) do
+      @test OMBackend._tryOr(() -> OMBackend.unsupported("statement", 1), :fallback, :unsupportedSite) === :fallback
+    end
   end
   @testset "_tryOr" begin
     @test OMBackend._tryOr(() -> error("x"), 7, :tryOrSite) == 7

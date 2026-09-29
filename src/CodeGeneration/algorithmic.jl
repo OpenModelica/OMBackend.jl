@@ -566,7 +566,7 @@ function generateStatements(statements::Union{List{DAE.Statement}, Vector{DAE.St
 end
 
 Base.@nospecializeinfer function generateStatement(@nospecialize(s::DAE.Statement))
-  throw("Unsupported stmt:" * string(s))
+  CodeGeneration.unsupported("statement", s)
 end
 
 function generateStatement(stmt::DAE.STMT_NORETCALL)
@@ -1366,7 +1366,7 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
       end
       DAE.BOX(exp = innerExp) => expToJuliaExpAlg(innerExp)
       DAE.UNBOX(exp = innerExp) => expToJuliaExpAlg(innerExp)
-      _ =>  throw(ErrorException("$exp not yet supported"))
+      _ => CodeGeneration.unsupported("expression", exp)
     end
   end
   return expr

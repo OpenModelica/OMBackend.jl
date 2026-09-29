@@ -1368,7 +1368,7 @@ end
 Base.@nospecializeinfer function expToJuliaExp(@nospecialize(exp::SimulationCode.Exp),
                                                @nospecialize(context::C),
                                                varSuffix = ""; varPrefix = "x")::Expr where {C}
-  throw(ErrorException("$exp not yet supported"))
+  unsupported("expression", exp)
 end
 
 function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
@@ -1522,7 +1522,7 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
           $(generateCastExpression(ty, exp, context, varPrefix))
         end
       end
-      _ =>  throw(ErrorException("$exp not yet supported"))
+      _ => unsupported("expression", exp)
     end
   end
   return expr

@@ -214,7 +214,7 @@ function transformToMTKContinuousCondition(cond, simCode; atInitial::Bool = fals
       if length(innerArgs) == 1
         transformToMTKContinuousCondition(innerArgs[1], simCode; atInitial = atInitial)
       else
-        throw("noEvent with multiple arguments not supported in condition: " * string(cond))
+        OMBackend.unsupported("noEvent with several arguments in a condition", cond)
       end
     end
     #= initial() is true during the initialization (`atInitial`: the
@@ -230,7 +230,7 @@ function transformToMTKContinuousCondition(cond, simCode; atInitial::Bool = fals
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
     end
     _ => begin
-      throw("Unsupported condition expression in IF_EQUATION: " * string(cond))
+      OMBackend.unsupported("condition expression", cond)
     end
   end
   return res
@@ -293,7 +293,7 @@ function transformToMTKContinuousConditionEquation(cond, simCode; atInitial::Boo
       if length(innerArgs) == 1
         transformToMTKContinuousConditionEquation(innerArgs[1], simCode; atInitial = atInitial)
       else
-        throw("noEvent with multiple arguments not supported in condition: " * string(cond))
+        OMBackend.unsupported("noEvent with several arguments in a condition", cond)
       end
     end
     #= initial(): see transformToMTKContinuousCondition. =#
@@ -305,7 +305,7 @@ function transformToMTKContinuousConditionEquation(cond, simCode; atInitial::Boo
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
     end
     _ => begin
-      throw("Unsupported condition expression in IF_EQUATION: " * string(cond))
+      OMBackend.unsupported("condition expression", cond)
     end
   end
   return res
@@ -847,7 +847,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                 DAE.INDEX(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
                 DAE.SLICE(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
                 DAE.WHOLEDIM(__) => :(:)
-                _ => throw("Unsupported subscript: $sub")
+                _ => OMBackend.unsupported("subscript", sub)
               end
             end
             local baseSymbol = Symbol(varPrefix, varName, varSuffix)
@@ -981,7 +981,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           indexAndVar = hashTable[varName]
           varKind::SimulationCode.SimVarType = indexAndVar[2].varKind
           @match varKind begin
-            SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
+            SimulationCode.INPUT(__) => OMBackend.unsupported("INPUT variable", varName)
             SimulationCode.STATE(__) => quote
               $(LineNumberNode(@__LINE__, "$varName state"))
               $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
@@ -1494,7 +1494,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                                                   $(AlgorithmicCodeGeneration._positionalFieldIndex(innerExp, ix))))
         end
       end
-    _ =>  throw(ErrorException("$exp not yet supported"))
+    _ => OMBackend.unsupported("expression", exp)
     end
   end
   return expr
@@ -2515,7 +2515,7 @@ function generateCastExpressionMTK(@nospecialize(ty::DAE.Type), @nospecialize(ex
         Int.(round.($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,))))
       end
     end
-    _ => throw("Cast $ty: for exp: $exp not yet supported in codegen!")
+    _ => OMBackend.unsupported("cast to $(ty)", exp)
   end
   return expr
 end
@@ -2984,7 +2984,7 @@ function deCausalize(eq, simCode)
       (:($(expToJuliaExpMTK(exp2, simCode))), :($(expToJuliaExpMTK(exp1, simCode))))
     end
     _ => begin
-      throw("Unsupported equation:" * string(eq))
+      OMBackend.unsupported("equation", eq)
     end
   end
 end

@@ -126,7 +126,8 @@ end
    derivatives; they should be reduced to auxiliary first-order states upstream
    (order lowering) before reaching SimCode rather than erroring here. =#
 function DAE_identifierToString(exp)
-  error("DAE_identifierToString: unsupported argument of type $(typeof(exp)) with value $exp. Expected DAE.CREF, DAE.ComponentRef, or String.")
+  #= Expected DAE.CREF, DAE.ComponentRef or String (der(der(x)) reaches here). =#
+  OMBackend.unsupported("identifier", exp)
 end
 
 """
