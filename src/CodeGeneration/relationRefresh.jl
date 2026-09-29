@@ -623,16 +623,47 @@ DiffEqBase.initialize_dae!(integrator::ModelingToolkit.SciMLBase.DEIntegrator, :
 DiffEqBase.initialize_dae!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator, ::EventReinit) =
   _eventReinit!(integrator)
 
-function _eventReinit!(integrator)
+#= `alg`: BrownFullBasicInit at its own tolerance, or the table-cluster
+   models' (tableClusterInitAlg); the same fallback for both (the MSL QS
+   IMC_Transformer's switching event at t = 2 stopped at a residual within
+   the solve's abstol but above the table algorithm's 1e-8). =#
+function _eventReinit!(integrator, alg = DiffEqBase.BrownFullBasicInit())
   local InitialFailure = ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
   local before = integrator.sol.retcode
   local u0 = copy(integrator.u)
-  DiffEqBase.initialize_dae!(integrator, DiffEqBase.BrownFullBasicInit())
+  DiffEqBase.initialize_dae!(integrator, alg)
   (integrator.sol.retcode == InitialFailure && before != InitialFailure) || return nothing
   local residual = _maxAlgebraicResidual(integrator, integrator.u)
-  (residual <= _solveAbstol(integrator) && residual < _maxAlgebraicResidual(integrator, u0)) || return nothing
+  ((residual <= _solveAbstol(integrator) || _atRoundoffFloor(integrator, integrator.u)) &&
+   residual < _maxAlgebraicResidual(integrator, u0)) || return nothing
   @debug "[events] algebraic re-solve kept at the solve's abstol" t = integrator.t residual
   return _restoreRetcode!(integrator, before)
+end
+
+#= Whether every algebraic row's residual at u is within the solve's abstol
+   plus its round-off floor, 1e3 eps times the size of its terms
+   (sum_j |J_ij u_j|, from the problem's Jacobian; false without one). A
+   switched ideal element's rows carry terms of 1e11 (the MSL QS
+   IMC_Transformer's commuting switch: s = -9.1e5 against Goff = 1e-5), and
+   their residual stays near 1e-5 whatever the solver does. =#
+function _atRoundoffFloor(integrator, u)
+  local f = integrator.f
+  (hasproperty(f, :jac) && f.jac !== nothing && hasproperty(f, :jac_prototype) && f.jac_prototype !== nothing) ||
+    return false
+  local rows = _algebraicRows(f)
+  (isempty(rows) || !ModelingToolkit.SciMLBase.isinplace(f)) && return false
+  local J = similar(f.jac_prototype, eltype(u))
+  local r = similar(u)
+  try
+    f.jac(J, u, integrator.p, integrator.t)
+    f(r, u, integrator.p, integrator.t)
+  catch e
+    e isa InterruptException && rethrow()
+    return false
+  end
+  local scale = abs.(J) * abs.(u)
+  local abstol = _solveAbstol(integrator)
+  return all(k -> abs(r[k]) <= abstol + 1.0e3 * eps(Float64) * scale[k], rows)
 end
 
 #= The solve's absolute tolerance, the smallest of a per-component one. =#
@@ -659,7 +690,7 @@ function _resolveAlgebraics!(integrator, alg = nothing)
     local mm = f.mass_matrix
     (mm isa LinearAlgebra.UniformScaling || all(!iszero, LinearAlgebra.diag(mm))) && return true
   end
-  DiffEqBase.initialize_dae!(integrator, alg === nothing ? EventReinit() : alg)
+  alg === nothing ? DiffEqBase.initialize_dae!(integrator, EventReinit()) : _eventReinit!(integrator, alg)
   _derivativeDiscontinuity!(integrator, true)
   return integrator.sol.retcode != ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
 end
