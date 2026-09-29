@@ -2335,30 +2335,33 @@ end
 #= Whether a variable the group reads through pre() reads a member outside
    pre(): its own definition (a member), or another equation it is in
    (`otherRefs()`: per name, the names each other equation reads outside
-   pre()). =#
+   pre(); names under `canon`, their alias set's). A member that reads only
+   its own pre() (y = (s or pre(y)) and not r, s and r from whens) does not
+   count: the lifted when fires on the change of pre(y) alone and would miss
+   s; unlifted, the equation is solved at every event. =#
 function _preReadsCloseLoop(held::Vector{DAE.Exp}, members::OrderedSet{String},
-                            candByName::Dict{String, Any}, otherRefs::Function)::Bool
+                            candByName::Dict{String, Any}, otherRefs::Function, canon::Function)::Bool
   for h in held
-    local n = string(h.componentRef)
+    local n = canon(string(h.componentRef))
     if n in members
       isempty(_candRefsOutsidePre(candByName[n].rhs, members)) || return true
     else
-      any(refs -> any(m -> m in refs, members), get(otherRefs(), n, ())) && return true
+      any(refs -> any(m -> m in refs, members), get(otherRefs(), n, OrderedSet{String}[])) && return true
     end
   end
   return false
 end
 
 #= Per name, the sets of names the equations that read it outside pre()
-   read outside pre(). =#
-function _refsOutsidePreIndex(eqs::Vector{BDAE.Equation})::Dict{String, Vector{OrderedSet{String}}}
+   read outside pre(), all under `canon`. =#
+function _refsOutsidePreIndex(eqs::AbstractVector{BDAE.Equation}, canon::Function)::Dict{String, Vector{OrderedSet{String}}}
   local index = Dict{String, Vector{OrderedSet{String}}}()
   for eq in eqs
     local refs = OrderedSet{String}()
     local visit = function (@nospecialize(e), arg)
       @match e begin
         DAE.CALL(Absyn.IDENT("pre"), _, _) => (e, false, arg)
-        DAE.CREF(cr, _) => (push!(refs, string(cr)); (e, true, arg))
+        DAE.CREF(cr, _) => (push!(refs, canon(string(cr))); (e, true, arg))
         _ => (e, true, arg)
       end
     end
@@ -2685,7 +2688,7 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
                                startLookup::Dict{String, DAE.Exp},
                                paramOrConstNames::OrderedSet{String},
                                initialPre::OrderedSet{String},
-                               otherRefs::Function = () -> Dict{String, Vector{OrderedSet{String}}}())
+                               otherRefs::Function, canon::Function)
   local order = _topoOrderCluster(cluster, candByName)
   if order === nothing
     @warn "[BDAE: lifter] cyclic discrete cluster left unlifted" cluster
@@ -2729,7 +2732,7 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
      auxiliary_n from the inputs) stays residual: lifted, it changed only
      when an event iteration ran, and the gates stayed at 'U'. =#
   local held = isempty(rels) ? _preReadCrefs(body) : DAE.Exp[]
-  if isempty(rels) && (isempty(held) || !_preReadsCloseLoop(held, members, candByName, otherRefs))
+  if isempty(rels) && (isempty(held) || !_preReadsCloseLoop(held, members, candByName, otherRefs, canon))
     for n in cluster; push!(out, candByName[n].eq); end
     return
   end
@@ -2832,13 +2835,21 @@ function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equ
     end
   end
   local liftedLhs = OrderedSet{String}()
-  #= The equations that are not candidates, indexed when a group without
-     relations first asks (_preReadsCloseLoop). =#
-  local others = copy(out)
+  #= An alias set's name: its definition, else a fixed member. =#
+  local repOf = Dict{String, String}()
+  for set in aliasSets, n in set
+    repOf[n] = get(definitionOf, n, first(set))
+  end
+  local canon = n -> get(repOf, n, n)
+  #= The equations that are not candidates (the first `nOthers` of `out`, which
+     only grows), indexed when a group without relations first asks
+     (_preReadsCloseLoop). =#
+  local nOthers = length(out)
   local index = Ref{Union{Nothing, Dict{String, Vector{OrderedSet{String}}}}}(nothing)
-  local otherRefs = () -> (index[] === nothing && (index[] = _refsOutsidePreIndex(others)); index[])
+  local otherRefs = () -> (index[] === nothing && (index[] = _refsOutsidePreIndex(view(out, 1:nOthers), canon)); index[])
   for cluster in _connectedComponents(candNames, adj)
-    _emitDiscreteCluster!(out, cluster, candByName, liftedLhs, initialLookup, paramOrConstNames, initialPre, otherRefs)
+    _emitDiscreteCluster!(out, cluster, candByName, liftedLhs, initialLookup, paramOrConstNames, initialPre,
+                          otherRefs, canon)
   end
   return (out, liftedLhs)
 end
