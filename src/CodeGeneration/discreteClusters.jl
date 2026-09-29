@@ -75,7 +75,7 @@ const _derivativeDiscontinuity! = isdefined(ModelingToolkit.SciMLBase, :derivati
    OMBACKEND_EVENT_TRACE=true (read when an event is handled), or when this
    is set to true. =#
 const _EVENT_TRACE = Ref{Union{Nothing, Bool}}(nothing)
-_eventTrace() = something(_EVENT_TRACE[], get(ENV, "OMBACKEND_EVENT_TRACE", "false") == "true")
+_eventTrace() = something(_EVENT_TRACE[], OMBackend.envSwitch("OMBACKEND_EVENT_TRACE"))
 
 _readValues(c::DiscreteCluster, integrator) = c.values(integrator.u, integrator.p, integrator.t)
 _operands(c::DiscreteCluster, v) = view(v, 1:c.nOperands)

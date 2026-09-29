@@ -8060,7 +8060,7 @@ finds structurally-unmatched (over-constraining) equations, log them for
 inspection. Returns simCode unchanged. Gated on `OMBACKEND_INDEX_DIAG`.
 """
 function indexOverconstraintDiagnostic(simCode::SIM_CODE)::SIM_CODE
-  lowercase(get(ENV, "OMBACKEND_INDEX_DIAG", "false")) in ("true", "1", "yes") || return simCode
+  OMBackend.envSwitch("OMBACKEND_INDEX_DIAG") || return simCode
   try
     local (unmatched, ne, nhv) = _localizeOverconstraint(simCode)
     @info "[SIMCODE: $(simCode.name): indexDiag] differential-incidence localization" n_eqs=ne nHighestVars=nhv nUnmatched=length(unmatched)

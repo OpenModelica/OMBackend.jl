@@ -564,7 +564,7 @@ function planDemotions(simCode,
     if nm in aliasPinned
       push!(toDemote, dv)
     elseif nm in conditionalTargets && !(nm in whenAssignedSet) &&
-           get(ENV, "OMBACKEND_DEMOTE_CONDTARGETS", "true") == "true"
+           OMBackend.envSwitch("OMBACKEND_DEMOTE_CONDTARGETS")
       #= The discrete IS the LHS of an if-equation relay: that equation pins
          it definitionally, so the held-state dummy would over-determine. =#
       push!(toDemote, dv)

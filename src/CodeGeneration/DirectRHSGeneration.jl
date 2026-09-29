@@ -241,7 +241,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   end
 
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
-  get(ENV, "OMBACKEND_INIT_TRACE", "") == "true" &&
+  OMBackend.envSwitch("OMBACKEND_INIT_TRACE") &&
     println("[initu0] states ", states, "\n[initu0] hard starts ", finalInitialValues, "\n[initu0] guesses ", systemGuesses,
             "\n[initu0] initialization equations ", try ModelingToolkit.initialization_equations(reducedSystem) catch; "?" end,
             "\n[initu0] u0 ", u0)
@@ -585,7 +585,7 @@ end
 function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
                                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
                                           excludeNames::AbstractSet{String}=OrderedSet{String}())
-  get(ENV, "OMBACKEND_INIT_SYMBOLIC_EQS", "true") == "true" || return nothing
+  OMBackend.envSwitch("OMBACKEND_INIT_SYMBOLIC_EQS") || return nothing
   local initEqs = try
     ModelingToolkit.initialization_equations(reducedSystem)
   catch
@@ -866,7 +866,7 @@ end
    2.835 s after 1e6 steps). =#
 function _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, t0)
   #= Kill switch OMBACKEND_TGRAD=false: no tgrad (the solver differences in t itself). =#
-  get(ENV, "OMBACKEND_TGRAD", "true") == "true" || return nothing
+  OMBackend.envSwitch("OMBACKEND_TGRAD") || return nothing
   local tg = _explicitTimeDerivative(rhs_list, states, params, iv)
   if tg !== nothing
     #= At the entry guesses (before the initialization): only a row the RHS
@@ -1074,7 +1074,7 @@ end
 function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int};
                                   startPath::Bool = true, maxPasses::Int = 10)
   dc === nothing && return (u0, false)
-  local trace = get(ENV, "OMBACKEND_INIT_TRACE", "") == "true"
+  local trace = OMBackend.envSwitch("OMBACKEND_INIT_TRACE")
   local pvFirst = copy(pv)
   local memberIdx = unique!(Int[k for c in dc.clusters for k in c.memberIndex if k != 0])
   local keptAt = (u, ref) -> isapprox(u[kept], ref[kept]; rtol = 1e-6, atol = 1e-9)

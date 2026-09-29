@@ -38,12 +38,12 @@ end
 function _completeUnderdeterminedInit!(u0, rhsFunc, p_vec, eq_idx, var_idx, algCandidates, u0_entry;
                                        targets=zeros(Float64, length(eq_idx)), tol=1e-10,
                                        extraRes=nothing, maxiter=200, restoreIdx=Int[])
-  get(ENV, "OMBACKEND_INIT_COMPLETE", "true") == "true" || return false
+  OMBackend.envSwitch("OMBACKEND_INIT_COMPLETE") || return false
   isempty(var_idx) && return false
   #= Only algebraic unknowns are completion candidates; with none, the
      Jacobian and SVD below cannot produce a pick. =#
   isempty(algCandidates) && return false
-  local traceInit = get(ENV, "OMBACKEND_INIT_TRACE", "") == "true"
+  local traceInit = OMBackend.envSwitch("OMBACKEND_INIT_TRACE")
   local du = similar(u0)
   local freeVars = collect(var_idx)
   local algSet = OrderedSet(algCandidates)
@@ -186,7 +186,7 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
   if init_res < tol
     return u0
   end
-  if get(ENV, "OMBACKEND_INIT_TRACE", "") == "true" && eqLabels !== nothing
+  if OMBackend.envSwitch("OMBACKEND_INIT_TRACE") && eqLabels !== nothing
     println("[initentry] ", length(u0), " unknowns, u0 = ", first(u0, 20), length(u0) > 20 ? " ..." : "",
             ", pinned ", pinned, ", discrete pinned ", discrete_pinned)
     for (rowk, k) in enumerate(eq_idx)
@@ -250,7 +250,7 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
      algebraic eqs to be satisfied by adjusting differential vars. Pinned vars
      stay at user-requested values. Anchored to the entry guesses so an
      underdetermined manifold resolves to the nearest root. =#
-  local u0_guess = get(ENV, "OMBACKEND_INIT_ANCHOR", "true") == "true" ? copy(u0) : nothing
+  local u0_guess = OMBackend.envSwitch("OMBACKEND_INIT_ANCHOR") ? copy(u0) : nothing
   local all_unpinned = [i for i in 1:n if !(i in pinnedSet)]
   #= Latched phase: the discrete latches held at their init values along with
      the user pins. Their defining rows evaluate locally constant, so the
@@ -295,7 +295,7 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
      locally constant and the remaining system is smooth. Keeps the free
      root when the constrained polish cannot converge. =#
   if phase3_ok && !(isempty(pinned) && isempty(discrete_pinned)) &&
-     get(ENV, "OMBACKEND_INIT_REPIN", "true") == "true"
+     OMBackend.envSwitch("OMBACKEND_INIT_REPIN")
     local repinVars = latched_unpinned
     if !isempty(repinVars)
       local u0_repin = copy(u0)
@@ -413,7 +413,7 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
   local du = similar(u0)
   local anchorRows = anchorVals === nothing ? nothing :
     Matrix(LinearAlgebra.Diagonal(fill(anchorWeight, nVar)))
-  local traceInit = get(ENV, "OMBACKEND_INIT_TRACE", "") == "true"
+  local traceInit = OMBackend.envSwitch("OMBACKEND_INIT_TRACE")
   #= Fixed per-phase row equilibration, from the ENTRY Jacobian: symbolic
      elimination can emit rows whose constant coefficients reach 1e40+, so
      raw residual units make both the tolerance and any line-search measure
@@ -442,7 +442,7 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
       return false
     end
     if iter == 1
-      rowNorm = get(ENV, "OMBACKEND_INIT_ROWSCALE", "true") == "true" ?
+      rowNorm = OMBackend.envSwitch("OMBACKEND_INIT_ROWSCALE") ?
         [max(maximum(abs, @view J[i, :]), 1.0) for i in 1:nRows] : ones(nRows)
     end
     local norm_res = maximum(abs, res ./ rowNorm)

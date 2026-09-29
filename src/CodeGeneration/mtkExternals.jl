@@ -1369,7 +1369,7 @@ end
 
 function resolveAliasInitialValue(diffState, idx::AliasEqIndex, ivMap::Dict)
   local diffStr = string(diffState)
-  if get(ENV, "OMBACKEND_ALIAS_INDEX", "true") != "true"
+  if !OMBackend.envSwitch("OMBACKEND_ALIAS_INDEX")
     #= Legacy-faithful scan: every candidate equation whose text mentions the
        state, simplify uncapped. =#
     for i in 1:length(idx.exprs)

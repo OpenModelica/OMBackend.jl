@@ -978,9 +978,9 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local IF_RELATIONS = collect(Iterators.flatten(c.relations for c in IF_EQUATION_COMPONENTS))
   #= Kill switch OMBACKEND_INIT_DISCRETES=false: no initial fixpoint of the
      discrete clusters (_settleInitialDiscretes!). =#
-  local INIT_DISCRETE_CLUSTERS = get(ENV, "OMBACKEND_INIT_DISCRETES", "true") == "true" ?
+  local INIT_DISCRETE_CLUSTERS = OMBackend.envSwitch("OMBACKEND_INIT_DISCRETES") ?
     _discreteClusterSpecs(simCode) : Expr[]
-  local IF_INIT_LITERALS = get(ENV, "OMBACKEND_INIT_RELATIONS", "true") == "true" ?
+  local IF_INIT_LITERALS = OMBackend.envSwitch("OMBACKEND_INIT_RELATIONS") ?
     collect(Iterators.flatten(c.initLiterals for c in IF_EQUATION_COMPONENTS)) : Expr[]
   local ifCondParamNames = copy(ifConditionalVariables)
   if !isempty(IF_RELATIONS)
@@ -2095,7 +2095,7 @@ end
    target RHS values at t0 and feed them back; stop when the condition vector
    is stable. Mutates `rT0` so later if-equations see earlier targets. =#
 function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode, rT0)::Vector{Bool}
-  get(ENV, "OMBACKEND_RELAY_T0_FIXEDPOINT", "true") == "true" || return Bool[]
+  OMBackend.envSwitch("OMBACKEND_RELAY_T0_FIXEDPOINT") || return Bool[]
   local condBranches = [b for b in ifEq.branches if b.identifier != -1]
   local elseBranch = nothing
   for b in ifEq.branches
@@ -2151,7 +2151,7 @@ function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode,
         end
       end
     end
-    if get(ENV, "OMBACKEND_RELAY_T0_TRACE", "") == "true"
+    if OMBackend.envSwitch("OMBACKEND_RELAY_T0_TRACE")
       @info "[relayT0] round" _round newIvs rT0Changed nT0=length(rT0) rT0=collect(rT0)
     end
     if newIvs == ivs && !rT0Changed
@@ -2266,7 +2266,7 @@ function createIfEquation(stateVariables::Vector,
         local liveAffect = nothing
         if branchesWithConds > 1 && length(allZcs) == branchesWithConds &&
            anyRelayCondBranch &&
-           get(ENV, "OMBACKEND_LIVE_IFCOND_AFFECT", "true") == "true"
+           OMBackend.envSwitch("OMBACKEND_LIVE_IFCOND_AFFECT")
           local liveKws = Expr[]
           local liveObsKws = Expr[]
           for (j, sym) in enumerate(allIfCondSyms)
@@ -2797,7 +2797,7 @@ end
    keeps the MTK affects for the models without mode FSMs, table or switch
    clusters (the variable keeps its name from the pre-memory affects this
    replaced). =#
-_discreteClustersForced()::Bool = lowercase(get(ENV, "OMBACKEND_DISCRETE_PRE_MEMORY", "true")) in ("true", "1", "yes")
+_discreteClustersForced()::Bool = OMBackend.envSwitch("OMBACKEND_DISCRETE_PRE_MEMORY")
 
 #= True if the expression contains a constant-table subscript (DAE.ASUB).
    Such clusters are Newton-hostile: equation-form affects compile to an

@@ -195,7 +195,7 @@ function _whenLookupBindings(crefs, simCode)::Vector{Expr}
     entry === nothing && continue
     #= String simvars live as module-level bindings, never as state or MTK
        parameter slots; an index binding here would KeyError at runtime. =#
-    if get(ENV, "OMBACKEND_WHEN_STRING_SKIP", "true") == "true"
+    if OMBackend.envSwitch("OMBACKEND_WHEN_STRING_SKIP")
       entry[2].varKind isa SimulationCode.STRING && continue
     end
     push!(out, Expr(:(=), Symbol(string(x)), getIdxForLookupMTK(x, simCode)))

@@ -101,13 +101,13 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
     return nothing
   end
   try
-    if get(ENV, "OMJL_STASH_MODELCODE", "") != ""
+    if OMB.envSwitch("OMJL_STASH_MODELCODE")
       LAST_MODELCODE[] = modelCode
       forgetBuild(cname)
       @info "[IMTK GEN] modelCode stashed; skipping Core.eval (OMJL_STASH_MODELCODE)" model = modelName
       return
     end
-    if get(ENV, "OMJL_DUMP_IMTK_SRC", "") != ""
+    if OMB.envSwitch("OMJL_DUMP_IMTK_SRC")
       try
         write("/tmp/imtk_$(cname).jl", string(modelCode))
       catch

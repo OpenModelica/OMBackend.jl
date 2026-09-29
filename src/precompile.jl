@@ -138,7 +138,7 @@ end
   @compile_workload begin
     #= Escape hatch for fast dev precompiles; a workload failure must never break
        loading, so each is demoted to debug. =#
-    if get(ENV, "OMBACKEND_NO_PRECOMPILE_WORKLOAD", "") == ""
+    if !envSwitch("OMBACKEND_NO_PRECOMPILE_WORKLOAD")
       try
         _precompileWarmup()
       catch err
