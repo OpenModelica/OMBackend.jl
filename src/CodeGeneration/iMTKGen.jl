@@ -60,22 +60,20 @@ function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
   local (modelName, modelCode) = CodeGeneration.generateMTKCode(simCode)
   local cname = _OMBackend().canonicalName(modelName)
   #= Only the standard PROGRAM_GENERATION path emits `simulateFromBuild` and
-     returns the 9-tuple shape iMTK's cache assumes. Structural transitions,
-     sub-models, and the flat-model path use MODEL_GENERATION's simpler
-     simulate; skip _buildAndCache so iMTK falls through cleanly to the module
+     returns the 9-tuple shape iMTK's cache assumes. Structural transitions
+     and sub-models use MODEL_GENERATION's simpler simulate; skip _buildAndCache so iMTK falls through cleanly to the module
      `simulate` instead of warning loudly for every such model. Mirrors the
      condition in ODE_MODE_MTK (MTK_CodeGeneration.jl:415). =#
   if ccall(:jl_generating_output, Cint, ()) != 0
     #= Precompile/image generation: Core.eval'ing the model module into this
        closed backend module is rejected; skip the build+eval (codegen warmed). =#
   elseif !SimulationCode.hasStructuralTransitions(simCode) &&
-         !SimulationCode.hasSubModels(simCode) &&
-         !SimulationCode.hasFlatModel(simCode)
+         !SimulationCode.hasSubModels(simCode)
     TUNABLE_SETS[cname] = copy(_OMBackend().TUNABLE_PARAMETERS[])
     _buildAndCache(modelName, modelCode)
   else
     forgetBuild(cname)
-    @info "[IMTK GEN] structural / sub-model / flat-model path; build-cache skipped (iMTK delegates to MTK simulate)" model = modelName
+    @info "[IMTK GEN] structural / sub-model path; build-cache skipped (iMTK delegates to MTK simulate)" model = modelName
   end
   return (modelName, modelCode)
 end

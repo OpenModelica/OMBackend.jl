@@ -1292,10 +1292,6 @@ function expToJuliaExp(e::SimulationCode.EXP_CREF, context::C, varSuffix=""; var
       $(LineNumberNode(@__LINE__, "$varName, datastructure"))
       $(Symbol(indexAndVar[2].name))
     end
-    SimulationCode.OCC_VARIABLE(__) => quote
-      $(LineNumberNode(@__LINE__, "$varName, occ variable"))
-      $(Symbol(indexAndVar[2].name))
-    end
     SimulationCode.STRING(__) => quote
       $(LineNumberNode(@__LINE__, "$varName, string"))
       $(Symbol(indexAndVar[2].name))
@@ -1424,7 +1420,7 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
             end
             SimulationCode.STATE_DERIVATIVE(__) => :(dx$(varSuffix)[$(indexAndVar[1])] #= der($varName) =#)
             #=
-            DATA_STRUCTURE / OCC_VARIABLE / STRING: opaque / discrete-only
+            DATA_STRUCTURE / STRING: opaque / discrete-only
             variables that do not live in the integrator's continuous state
             vector. Emit by the SimVar's registered `name`, matching how
             expToJuliaExpMTK lowers the same cases. Without these arms the
@@ -1438,10 +1434,6 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
             =#
             SimulationCode.DATA_STRUCTURE(__) => quote
               $(LineNumberNode(@__LINE__, "$varName, datastructure"))
-              $(Symbol(indexAndVar[2].name))
-            end
-            SimulationCode.OCC_VARIABLE(__) => quote
-              $(LineNumberNode(@__LINE__, "$varName, occ variable"))
               $(Symbol(indexAndVar[2].name))
             end
             SimulationCode.STRING(__) => quote

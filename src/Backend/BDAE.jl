@@ -166,8 +166,6 @@ using ExportAll
   - `INITIAL_STRUCTURAL_STATE(initialState)` — records the initial mode
     name for a variable-structure system.
   - `BRANCH(ar, br)` — `Connections.branch(ar, br)`.
-  - `STRUCTURAL_IF_EQUATION(ifEquation)` — DOCC if-equation preserved as a
-    frontend `EQUATION_IF` so the runtime can replay the branch choice.
   - `STRUCTURAL_TRANSITION(fromState, toState, transitionCondition)` —
     VSS transition; a structural callback is generated from the condition.
     (Name is a historical typo preserved across the codebase.)
@@ -267,7 +265,7 @@ VAR(varName,varKind,varType) =
 """
   An independent system of equations together with its variables.
 
-  Each structural submodel (VSS branch, DOCC subsystem) becomes one
+  Each structural submodel (a VSS branch) becomes one
   `EQSYSTEM`. The `simpleEquations` field holds alias equations that have
   already been removed from the main equation list via alias elimination;
   they are kept so downstream stages can recover the original mapping.
@@ -299,17 +297,11 @@ end
   - `localKnownVars`: parameters / constants scoped to a specific submodel.
   - `metaModel`: optional reference to the surrounding meta-model; `NONE()`
     for non-VSS models.
-  - `flatModel`: optional reference to the flat model being translated.
-    Used by VSS recompilation paths.
-  - `DOCC_equations`: dynamic-if equations from the Dynamic Overconstrained
-    Connector option.
 """
 struct SHARED
   globalKnownVars::Vector{VAR}
   localKnownVars::Vector{VAR}
   metaModel::Option{SCode.CLASS}
-  flatModel::Option{OMFrontend.Frontend.FlatModel}
-  DOCC_equations::Vector{Equation}
 end
 
 """
@@ -557,12 +549,6 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
   @Record BRANCH begin
     ar::DAE.Exp
     br::DAE.Exp
-  end
-
-  @Record STRUCTURAL_IF_EQUATION begin
-    #= Compacted NFEquation: EQUATION_IF is a constructor, NFEquationImpl the
-       concrete backing struct. The value is always an EQUATION_IF variant. =#
-    ifEquation::OMFrontend.Frontend.NFEquationImpl
   end
 
   @Record STRUCTURAL_TRANSITION begin

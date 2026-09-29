@@ -998,10 +998,6 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
               $(LineNumberNode(@__LINE__, "$varName, discrete"))
               $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
             end
-            SimulationCode.OCC_VARIABLE(__) => quote
-              $(LineNumberNode(@__LINE__, "$varName, occ variable"))
-              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-            end
             SimulationCode.DATA_STRUCTURE(__) => quote
               $(LineNumberNode(@__LINE__, "$varName, datastructure variable"))
               $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))

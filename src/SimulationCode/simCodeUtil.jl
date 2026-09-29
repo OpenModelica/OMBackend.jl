@@ -6,7 +6,6 @@
    on different combinations; do not collapse into one predicate. =#
 hasStructuralTransitions(simCode)::Bool = !isempty(simCode.structuralTransitions)
 hasSubModels(simCode)::Bool = !isempty(simCode.subModels)
-hasFlatModel(simCode)::Bool = !isnothing(simCode.flatModel)
 hasMetaModel(simCode)::Bool = !isnothing(simCode.metaModel)
 
 """
@@ -338,16 +337,6 @@ function hasBindingExp(simvar::SimVar)::Bool
   end
 end
 
-"""
-Returns true if the variable is involved in a OCC chain.
-"""
-function isOCCVar(simVar::SimVar)::Bool
-  res = @match simVar.varKind begin
-    OCC_VARIABLE(__) => true
-    _ => false
-  end
-end
-
 
 """
  The identifier of a variable's name as a string: the name of an unqualified
@@ -419,16 +408,14 @@ It executes the following steps:
 3. Remaining algebraic variables will get indices starting with i+1, where i is the number of states.
 4. Parameters will get own set of indices, starting at 1.
 5. Discrete shares the index with the states and starts at #states + 1
-6. OCC Variables also shares the indices with the states and starts at #discretes + 1
-7. Data structure variables are only allowed as parameters and/or constants. They share the index with the parameters.
-The index of discretes and occ is updated after the state index is calculated.
+6. Data structure variables are only allowed as parameters and/or constants. They share the index with the parameters.
+The index of discretes is updated after the state index is calculated.
 """
 function createIndices(simulationVars::Vector{SimulationCode.SIMVAR})::OrderedDict{String, Tuple{Int, SimulationCode.SimVar}}
   local ht::OrderedDict{String, Tuple{Int, SimulationCode.SimVar}} = OrderedDict()
   local stateCounter = 0
   local parameterCounter = 0
   local discretes = SimulationCode.SIMVAR[]
-  local occVariables = SimulationCode.SIMVAR[]
   local complexVariables = SimulationCode.SIMVAR[]
   local arrayParameters = SimulationCode.SIMVAR[]
   local numberOfStates = 0
@@ -441,10 +428,6 @@ function createIndices(simulationVars::Vector{SimulationCode.SIMVAR})::OrderedDi
         push!(ht, var.name => (stateCounter, var))
         #= Adding the state derivative as well =#
         push!(ht, "der($(var.name))" => (stateCounter, stVar))
-      end
-      #= For Overconstrained connectors. =#
-      SimulationCode.OCC_VARIABLE(__) => begin
-        push!(occVariables, var)
       end
       SimulationCode.PARAMETER(__) => begin
         parameterCounter += 1
@@ -479,12 +462,7 @@ function createIndices(simulationVars::Vector{SimulationCode.SIMVAR})::OrderedDi
     discreteCounter += 1
     push!(ht, var.name => (discreteCounter, var))
   end
-  local occCounter = discreteCounter
-  for var in occVariables
-    occCounter += 1
-    push!(ht, var.name => (occCounter, var))
-  end
-  local algIndexCounter::Int = occCounter #Change 2022-09-10
+  local algIndexCounter::Int = discreteCounter
   local algSortingIdx::Int = stateCounter #This idx is used by the backend sorting algorithms
   for var in simulationVars
     @match var.varKind begin
@@ -658,121 +636,11 @@ function getIndiciesOfVariables(variables,
       push!(indicies, var.varKind.sortIdx)
     elseif isState(var)
       push!(indicies, idx)
-    elseif isOCCVar(var)
-      push!(indicies, idx)
     else
       continue
     end
   end
   return indicies
-end
-
-"""
-  Creates a OCC graph.
-  Returns the graph and the root variables.
-(This function also adds info to the model)
-"""
-function getOCCGraph(flatModel)
-  unresolvedFlatModel = OMFrontend.Frontend.FLAT_MODEL(flatModel.name,
-                                                   flatModel.variables,
-                                                   flatModel.unresolvedConnectEquations,
-                                                   flatModel.initialEquations,
-                                                   flatModel.algorithms,
-                                                   flatModel.initialAlgorithms,
-                                                   MetaModelica.nil,
-                                                   NONE(),
-                                                   flatModel.DOCC_equations,
-                                                   flatModel.unresolvedConnectEquations,
-                                                   flatModel.active_DOCC_Equations,
-                                                   flatModel.comment)
-  local name::String = unresolvedFlatModel.name
-  local conns::OMFrontend.Frontend.Connections
-  local conn_eql::List{OMFrontend.Frontend.Equation}
-  local csets::OMFrontend.Frontend.ConnectionSets.Sets
-  local csets_array::Vector{List{OMFrontend.Frontend.Connector}}
-  local ctable::OMFrontend.Frontend.CardinalityTable.Table
-  local broken::OMFrontend.Frontend.BrokenEdges = MetaModelica.nil
-  local rootEquations::Vector{OMFrontend.Frontend.Equation} = OMFrontend.Frontend.Equation[]
-  local rootReferenceVariables::Vector{Tuple} = Tuple{OMFrontend.Frontend.NFComponentRef,
-                                                      OMFrontend.Frontend.NFComponentRef}[]
-  (unresolvedFlatModel, conns) = OMFrontend.Frontend.collect(unresolvedFlatModel)
-  (unresolvedFlatModel, conns) = OMFrontend.Frontend.elaborate(unresolvedFlatModel, conns)
-  if OMFrontend.Frontend.System.getHasOverconstrainedConnectors()
-    (_, broken, graph) = OMFrontend.Frontend.handleOverconstrainedConnections(unresolvedFlatModel, conns, name)
-    (roots, _, broken) = OMFrontend.Frontend.findResultGraph(graph, name)
-    rootEquations = OMFrontend.Frontend.findRootEquations(roots, graph,
-                                                      unresolvedFlatModel.equations)
-    for re in rootEquations
-      push!(rootReferenceVariables,
-            (re.lhs, re.rhs))
-    end
-  end
-  #= Remove the broken edge from the set of edges =#
-  @assign graph.connections = arrayList(filter((x)->(!in(x, broken)), listArray(graph.connections)))
-  #= Convert the branches to regular edges =#
-  local uniqueRoots = graph.uniqueRoots
-  local definiteRoots = graph.definiteRoots
-  local potentialRoots = graph.potentialRoots
-  #= Get the roots involved in the structural change =#
-  rootVariables::List{OMFrontend.Frontend.ComponentRef} = MetaModelica.list(r for r in roots)
-  #= Create a graph that we can search. =#
-  local connectionEdges = convertFlatEdgeToEdges(graph.connections)
-  local allEdges = listAppend(connectionEdges, graph.branches)
-  local searchGraph = createSearchGraph(allEdges)
-  return (searchGraph, rootVariables, rootReferenceVariables)
-end
-
-"""
- Convert the component references to the backend representation and create an adjacency list representation.
-"""
-function createSearchGraph(allEdges)
-  local edgeSet = Dict()
-  local searchGraph = Dict{String, Vector{String}}()
-  for edge in allEdges
-    @match (e1, e2) = edge
-    local s1 = OMFrontend.Frontend.toString(e1)
-    local s2 = OMFrontend.Frontend.toString(e2)
-    edgeSet[s1] = e1
-    edgeSet[s2] = e2
-  end
-  for edge in keys(edgeSet)
-    searchGraph[edge] = String[]
-  end
-  for edge in allEdges
-    @match (e1, e2) = edge
-    local s1 = OMFrontend.Frontend.toString(e1)
-    local s2 = OMFrontend.Frontend.toString(e2)
-    push!(searchGraph[s1], s2)
-    push!(searchGraph[s2], s1)
-  end
-  return searchGraph
-end
-
-"""
-  Given a list of flat edges convert them to edges.
-"""
-function convertFlatEdgeToEdges(connections)
-  newEdges = Tuple[]
-  for connection in connections
-    @match connection begin
-      (c1, c2, _)  => begin
-        push!(newEdges, (c1, c2))
-      end
-    end
-  end
-  return arrayList(newEdges)
-end
-
-"""
- This function returns true if a backend variable is in the set of overconstrained connector variables (occVariables).
-
-TODO: the name of the theta variable is hardcoded for now
-Note that this function must be called before sorting.
-"""
-function isOverconstrainedConnectorVariable(simVarName::String, occVariables::Vector{String})
-  #= Inefficient crap, can be done better... =#
-  local isOCCVar = simVarName in occVariables
-  return isOCCVar
 end
 
 #= The variable assigned by an if-equation whose branches all assign the same
@@ -1039,7 +907,6 @@ function rebuildMatchOrder(simCode::SIM_CODE)
       STATE_DERIVATIVE(__) => true
       ALG_VARIABLE(__) => true
       SimulationCode.ARRAY(__) => true
-      OCC_VARIABLE(__) => true
       DISCRETE(__) => true
       _ => false
     end
@@ -1633,7 +1500,7 @@ Identify variables and equations that do not influence the dynamic states.
 Uses a fresh bipartite matching and robust CREF extraction via `traverseExpTopDown`.
 
 The BFS seeds from equations matched to essential variables (STATE, STATE_DERIVATIVE,
-DISCRETE, OCC, irreducible). It propagates backward through the use-def chain: for
+DISCRETE, irreducible). It propagates backward through the use-def chain: for
 each essential equation, all variables it references are marked essential, and the
 equations that PRODUCE those variables (via matchOrder) are enqueued.
 
@@ -1676,7 +1543,6 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
     local isEssentialKind = @match sv.varKind begin
       STATE(__) => true
       STATE_DERIVATIVE(__) => true
-      OCC_VARIABLE(__) => true
       DISCRETE(__) => true
       _ => false
     end
@@ -1731,7 +1597,6 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
       STATE_DERIVATIVE(__) => true
       ALG_VARIABLE(__) => true
       SimulationCode.ARRAY(__) => true
-      OCC_VARIABLE(__) => true
       DISCRETE(__) => true
       _ => false
     end
@@ -1960,10 +1825,9 @@ and `simCode.eliminatedVariables` for later reconstruction (e.g. 3D visualizatio
 Returns the modified SIM_CODE (uses @assign for immutable struct mutation).
 """
 function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOptions)
-  #= Guard: skip for VSS/multi-mode models (subModels or recompilation-based
-     metaModel/flatModel), but allow DOCC models (structuralTransitions only)
-     since they re-flatten at runtime =#
-  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+  #= Guard: skip for VSS/multi-mode models (subModels or a recompilation-based
+     metaModel); structural transitions alone are allowed. =#
+  if hasSubModels(simCode) || hasMetaModel(simCode)
     @debug "[SIMCODE: $(simCode.name): eliminateNonDynamic] skipping for VSS/multi-mode model"
     return simCode
   end
@@ -2236,7 +2100,6 @@ function isUnknownVarKind(@nospecialize(varKind::SimVarType))::Bool
     STATE_DERIVATIVE(__) => true
     ALG_VARIABLE(__) => true
     ARRAY(__) => true
-    OCC_VARIABLE(__) => true
     DISCRETE(__) => true
     _ => false
   end
@@ -2253,7 +2116,6 @@ function varKindPriority(@nospecialize(varKind::SimVarType))::Int
     STATE(__) => 100
     STATE_DERIVATIVE(__) => 90
     DISCRETE(__) => 80
-    OCC_VARIABLE(__) => 70
     ALG_VARIABLE(__) => 20
     ARRAY(__) => 10
     _ => 0
@@ -2384,12 +2246,12 @@ reclassified to `DISCRETE`. Variables that already have a non-algebraic
 kind (state, parameter, discrete, occ, array, data structure) are left
 alone.
 
-No-op for VSS / submodel / metaModel / flatModel variants where the
+No-op for VSS / submodel / metaModel variants where the
 equation set is restructured at runtime.
 """
 function _classifyAdditionalDiscreteVariables(simCode::SIM_CODE)::SIM_CODE
   if hasStructuralTransitions(simCode) || hasSubModels(simCode) ||
-     hasFlatModel(simCode) || hasMetaModel(simCode)
+     hasMetaModel(simCode)
     @debug "[SIMCODE: $(simCode.name): classifyAdditionalDiscretes] skipped (VSS/multi-mode model)"
     return simCode
   end
@@ -2492,7 +2354,7 @@ Folding turns the chain into parameter bindings that MTK resolves at
 elaboration time, so Newton never sees them.
 
 Algebraic loops (`BLTBlock.isLoop == true`) and any non-ALG unknown
-(states, derivatives, discretes, OCC, arrays) are skipped — those belong
+(states, derivatives, discretes, arrays) are skipped — those belong
 to MTK's structural_simplify.
 
 No-op for VSS / submodel simcodes, for empty residual sets, and when the
@@ -4096,10 +3958,9 @@ Skipped for VSS/structural models where eliminated variables might be needed
 in different structural modes.
 """
 function eliminateAliasVariables(simCode::SIM_CODE)
-  #= Guard: skip for VSS/multi-mode models (subModels or recompilation-based
-     metaModel/flatModel), but allow DOCC models (structuralTransitions only)
-     since they re-flatten at runtime =#
-  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+  #= Guard: skip for VSS/multi-mode models (subModels or a recompilation-based
+     metaModel); structural transitions alone are allowed. =#
+  if hasSubModels(simCode) || hasMetaModel(simCode)
     @debug "[SIMCODE: $(simCode.name): aliasElimination] skipped (VSS/multi-mode model)"
     return simCode
   end
@@ -4566,7 +4427,7 @@ substitute the literal value at all use sites, and drop the parameter from
 models (where `foldParameterClosure` typically inflates the parameter count
 2x to 3x).
 
-Tier-1 only: skipped on VSS / DOCC / sub-model / flat-model variants because
+Tier-1 only: skipped on VSS / sub-model / metaModel variants because
 a parameter eliminated here can no longer be re-bound at runtime by a
 structural transition or by recompilation. The gate matches the
 conservative envelope used by `eliminateAliasVariables`.
@@ -4693,7 +4554,7 @@ attribute (`start` / `fixed` / `min` / `max` / `nominal`), no eliminated
 equation. Such parameters cannot be observed and cannot be overridden
 meaningfully at runtime (no consumer would see the override).
 
-Skipped for sub-model / flatModel / metaModel variants because cross-mode
+Skipped for sub-model / metaModel variants because cross-mode
 parameter references are not visible in the standard scan.
 """
 #= Returns true when the SimVar's attributes carry isProtected = SOME(true). =#
@@ -4716,13 +4577,13 @@ end
    Visibility comes from the FlatModel `protected` keyword propagated through
    `_maybeMarkAttrProtected` in BDAECreate. =#
 function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
-  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+  if hasSubModels(simCode) || hasMetaModel(simCode)
     return simCode
   end
   local ht = simCode.stringToSimVarHT
 
   local isDroppableKind = sv -> @match sv.varKind begin
-    STATE(__) || STATE_DERIVATIVE(__) || DISCRETE(__) || OCC_VARIABLE(__) ||
+    STATE(__) || STATE_DERIVATIVE(__) || DISCRETE(__) ||
       INPUT(__) || PARAMETER(__) || ARRAY_PARAMETER(__) || STRING(__) ||
       DATA_STRUCTURE(__) => false
     _ => true
@@ -4841,7 +4702,7 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
 end
 
 function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
-  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+  if hasSubModels(simCode) || hasMetaModel(simCode)
     return simCode
   end
   local ht = simCode.stringToSimVarHT
@@ -4952,7 +4813,7 @@ end
 
 function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   if hasStructuralTransitions(simCode) || hasSubModels(simCode) ||
-     hasFlatModel(simCode) || hasMetaModel(simCode)
+     hasMetaModel(simCode)
     @debug "[SIMCODE: $(simCode.name): eliminateConstantParameters] skipped (VSS/recompilation/sub-model variant)"
     return simCode
   end
@@ -6522,7 +6383,7 @@ function _isStateSelectAlways(@nospecialize(sv))::Bool
 end
 
 function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
-  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+  if hasSubModels(simCode) || hasMetaModel(simCode)
     return simCode
   end
   local ht  = simCode.stringToSimVarHT
@@ -6954,8 +6815,8 @@ end
 
    STATE eligibility is what enables the `der(state) -> 0` substitution.
    ALG_VARIABLE is structurally identical for substitution (no derivative
-   to handle). DISCRETE / ARRAY / OCC_VARIABLE are excluded because they
-   carry event or connector semantics. =#
+   to handle). DISCRETE / ARRAY are excluded because they carry event or
+   subscript semantics. =#
 #= Extract a CREF together with its sign within a residual term.
    Returns (name, cref, ty, sign) where sign is +1 for bare CREF, -1 for
    UNARY(UMINUS, CREF). Also peels `* 1.0` / `/1.0` / `--` wrappers
@@ -7136,8 +6997,7 @@ _substituteFrozenState(exp::Exp, frozenMap) = (exp, true, frozenMap)
    the constant value on sol[:name].
 
    Excluded varKinds: DISCRETE (event semantics), ARRAY (subscript handling),
-   OCC_VARIABLE (over-constrained connector special cases), STATE_DERIVATIVE
-   (not a directly-pinnable form).
+   STATE_DERIVATIVE (not a directly-pinnable form).
 
    Safety: never eliminate a variable that appears in any if-branch or
    when-equation (its name is needed for event registration / callback
@@ -7151,7 +7011,7 @@ _substituteFrozenState(exp::Exp, frozenMap) = (exp, true, frozenMap)
    `var = some_param` (with param folded to a literal) are already
    substituted to `var = literal` form before detection. =#
 function eliminateFrozenStates(simCode::SIM_CODE)::SIM_CODE
-  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+  if hasSubModels(simCode) || hasMetaModel(simCode)
     return simCode
   end
   #= Iterate to convergence: substituting der(state) -> 0 can turn a related
@@ -7483,7 +7343,7 @@ Iterates to a fixed point (up to 8 rounds) so transitive chains
 (`v1 = v2 + 1; v2 = v3 + 1; v3 = literal`) collapse.
 """
 function foldExplicitSingleAssign(simCode::SIM_CODE)::SIM_CODE
-  if hasSubModels(simCode) || hasMetaModel(simCode) || hasFlatModel(simCode)
+  if hasSubModels(simCode) || hasMetaModel(simCode)
     return simCode
   end
   isempty(simCode.residualEquations) && return simCode
@@ -7944,7 +7804,7 @@ zero). Runs at the SimCode layer where every variable is still present.
 """
 function propagateInitialValues(simCode::SIM_CODE)::SIM_CODE
   (hasStructuralTransitions(simCode) || hasSubModels(simCode) ||
-   hasFlatModel(simCode) || hasMetaModel(simCode)) && return simCode
+   hasMetaModel(simCode)) && return simCode
   local ht = simCode.stringToSimVarHT
   local env = OrderedDict{String, Float64}("time" => 0.0)
   local eqExprs = DAE.Exp[]

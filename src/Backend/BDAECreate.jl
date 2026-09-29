@@ -89,7 +89,7 @@ function lower(lst::DAE.DAE_LIST)::BDAE.BACKEND_DAE
   #@debug "eqLst:" length(equationLst)
   #= We start with an array of one system =#
   eqSystems = BDAE.EQSYSTEM[BDAE.EQSYSTEM(name, variables, eqArray, BDAE.Equation[], BDAE.Equation[])]
-  outBDAE = BDAE.BACKEND_DAE(name, eqSystems, BDAE.SHARED(BDAE.VAR[], BDAE.VAR[], NONE(), NONE(), BDAE.Equation[]))
+  outBDAE = BDAE.BACKEND_DAE(name, eqSystems, BDAE.SHARED(BDAE.VAR[], BDAE.VAR[], NONE()))
 end
 
 """
@@ -101,21 +101,8 @@ end
 function lower(flatModelica::OMFrontend.Frontend.FlatModel)
   #= Creates a list of flat equation systems =#
   local eqSystems = createEqSystems(flatModelica)
-  local shared
-  if ! listEmpty(flatModelica.DOCC_equations)
-    shared = BDAE.SHARED(BDAE.VAR[],
-                         BDAE.VAR[],
-                         flatModelica.scodeProgram,
-                         SOME(flatModelica),
-                         createStructuralIfEquations(flatModelica.DOCC_equations))
-  else
-    shared = BDAE.SHARED(BDAE.VAR[],
-                         BDAE.VAR[],
-                         flatModelica.scodeProgram,
-                         NONE(),
-                         BDAE.Equation[])
-  end
-    #= The resulting backend DAE. =#
+  local shared = BDAE.SHARED(BDAE.VAR[], BDAE.VAR[], flatModelica.scodeProgram)
+  #= The resulting backend DAE. =#
   return createBackendDAE(flatModelica.name, eqSystems, shared)
 end
 
@@ -906,7 +893,6 @@ function lowerIfEquation(eq::IF_EQ) where {IF_EQ}
     trueEquations = tmpTrue <| trueEquations
   end
   (_, falseEquations, _) = splitEquationsAndVars(eq.equations3)
-  #= Check if this equation contains an Connections.branch call. DOCC case=#
   res = BDAE.IF_EQUATION(eq.condition1,
                          listReverse(trueEquations),
                          listReverse(falseEquations), #Should not really matter but I reverse just in case.
@@ -970,17 +956,6 @@ function createBindingEquations(variables::Vector)
     end
   end
   return bindingEqs
-end
-
-"""
-  Wraps the special if equation in a BDAE construct.
-"""
-function createStructuralIfEquations(ifEquations::List)
-  eqs = BDAE.Equation[]
-  for ifEq in ifEquations
-    push!(eqs, BDAE.STRUCTURAL_IF_EQUATION(ifEq))
-  end
-  return eqs
 end
 
 #= Convert a list of DAE.Statement (from converting an ALG_WHEN or

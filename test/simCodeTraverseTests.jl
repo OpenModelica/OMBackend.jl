@@ -65,7 +65,7 @@ function mockSimCode(ht)
   return SC.SIM_CODE("mock", ht,
     SC.RESIDUAL_EQUATION[], SC.Equation[], SC.WHEN_EQUATION[], SC.IF_EQUATION[],
     false, Int[], SC.Graphs.SimpleDiGraph(0), [], SC.StructuralTransition[], [],
-    String[], String[], SC.Equation[], "mock", NONE(), NONE(), String[],
+    String[], String[], SC.Equation[], "mock", NONE(), String[],
     SC.ModelicaFunction[], false, SC.RESIDUAL_EQUATION[], String[], SC.AliasEntry[],
     nothing, SC.INITIAL_ALGORITHM[], SC.BDAE.ASSERT_EQUATION[])
 end

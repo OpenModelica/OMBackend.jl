@@ -491,12 +491,6 @@ Input variable
 """
 struct  INPUT <: SimVarType end
 
-"
-  A special state variable, used for dynamic overconstrained connectors.
-  In pratice this variable is treated as state.
-"
-struct OCC_VARIABLE <: SimVarType end
-
 struct STRING <: SimVarType
   bindExp::Option{Exp}
 end
@@ -639,19 +633,6 @@ struct IMPLICIT_STRUCTURAL_TRANSITION <: StructuralTransition
 end
 
 """
-    DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION(ifEquation)
-
-DOCC if-equation preserved as a structural switch over connector
-topologies. The body is a Frontend `EQUATION_IF`, which describes the
-connector branches before BDAE lowering.
-"""
-struct DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION <: StructuralTransition
-  #= Compacted NFEquation: EQUATION_IF is a constructor, NFEquationImpl the
-     concrete backing struct. The value is always an EQUATION_IF variant. =#
-  ifEquation::OMFrontend.Frontend.NFEquationImpl
-end
-
-"""
     EliminationOptions(; reachability=true, patterns=Regex[], keepPatterns=Regex[])
 
 Options for non-dynamic variable elimination. Controls which variables and equations
@@ -770,8 +751,6 @@ struct SIM_CODE{T0<:String,
   activeModel::T13
   "The MetaModel. That is a reference from the model to a higher order representation of the model itself."
   metaModel::Option
-  "An alternate flat model. Used by structural if equations to add or remove connector statements affecting the virtual connection graph."
-  flatModel::Option
   "Irreductable variables. That is the names of variables that are involved in events such as discrete variables"
   irreducibleVariables::T12
   "Modelica functions"

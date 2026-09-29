@@ -90,50 +90,6 @@ function createStructuralCallback(simCode, simCodeStructuralTransition::Simulati
 end
 
 """
-  For dynamic overconstrained connectors.
-"""
-function createStructuralCallback(simCode,
-                                  simCodeStructuralTransition::SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION,
-                                  idx)
-  local structuralTransition = simCodeStructuralTransition
-  local callbackName = createCallbackName(structuralTransition, idx)
-  (equationsToAddOnTrue, cond) = extractTransitionEquationBody(structuralTransition)
-  #=
-  The system structure is changed when the new equations are added.
-    In this case we know how the equations look like.
-    On true the structure of the system is the one with the equations of the branch active.
-    On false that same system shall change slightly.
-  =#
-  @match SOME(flatModel) = simCode.flatModel
-  unresolvedFlatModel = createNewFlatModel(flatModel)
-  #= Note: the flat model has circular references, so we cannot print it.
-     We embed it directly into the generated callback via $-interpolation
-     so the value rides into the StructuralChangeDynamicConnection.flatModel
-     field at codegen time. The runtime then reads it from the struct field
-     instead of from a module-scope global. =#
-  quote
-    function $(Symbol(callbackName))(reducedSystem)
-      #= Represent structural change. =#
-      local stringToSimVarHT = $(simCode.stringToSimVarHT)
-      local structuralChange = OMBackend.Runtime.StructuralChangeDynamicConnection($(flatModel.name),
-                                                                                   false,
-                                                                                   $(unresolvedFlatModel),
-                                                                                   $(idx), #= Assumes specific ordering =#
-                                                                                   stringToSimVarHT,
-                                                                                   $(flatModel.active_DOCC_Equations[idx]),
-                                                                                   0.0,
-                                                                                   nothing)
-      #= The affect simply activates the structural callback informing us to generate code for a new system =#
-      $(createAffectCondPairForDOCC(cond, idx, flatModel.active_DOCC_Equations, simCode))
-      local cb = DiscreteCallback(condition,
-                                  affect!;
-                                  save_positions=(true, true))
-      return (cb, structuralChange)
-    end
-  end
-end
-
-"""
   Creates an implicit structural callback where the final state is unknown.
   These structural callback can only occur as a part of a when equation.
   The when equation might also make other changes to the variables before recompilation.
@@ -329,9 +285,6 @@ function createStructuralAssignments(simCode, structuralTransitions::Vector{ST})
       SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION(__) => begin
         push!(structuralAssignments, createStructuralAssignment(simCode, structuralTransisiton, idx))
       end
-      SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION(__) => begin
-        push!(structuralAssignments, createStructuralAssignment(simCode, structuralTransisiton, idx))
-      end
     end
     idx += 1
   end
@@ -379,18 +332,6 @@ function createStructuralAssignment(simCode, simCodeStructuralTransition::Simula
   end
 end
 
-function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION, idx::Int)
-  local structuralTransition = simCodeStructuralTransition
-  local callbackName = createCallbackName(structuralTransition, idx)
-  local integratorCallbackName = string(callbackName,  "_CALLBACK")
-  local structuralChangeStructure = string(callbackName, "_STRUCTURAL_CHANGE")
-  quote
-    ($(Symbol(integratorCallbackName)), $(Symbol(structuralChangeStructure))) = $(Symbol(callbackName))(reducedSystem)
-    push!(structuralCallbacks, $(Symbol(structuralChangeStructure)))
-    push!(callbackSet, ($(Symbol(integratorCallbackName))))
-  end
-end
-
 function createCallbackName(structuralTransisiton::SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION, idx = 0)
   return "structuralCallback" * structuralTransisiton.fromState * structuralTransisiton.toState
 end
@@ -401,10 +342,6 @@ end
 """
 function createCallbackName(structuralTransisiton::SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION, idx::Int)
   return string("structuralCallbackWhenEquation", idx)
-end
-
-function createCallbackName(structuralTransisiton::SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION, idx::Int)
-  return string("structuralCallbackDynamicConnectEquation", idx)
 end
 
 """
@@ -450,132 +387,4 @@ function createStructuralWhenStatements(whenStatements,
     end
   end
   return (res, recompilationOperator)
-end
-
-"""
-  Returns the equations and the condition
-"""
-function extractTransitionEquationBody(structuralTransition)
-  local ifEquation = structuralTransition.ifEquation
-  local structuralTransisitonAsDAE = listHead(OMFrontend.Frontend.convertEquation(ifEquation, MetaModelica.nil))
-  #= For now assumed to only allow a single statement. No else. =#
-  @assert length(structuralTransisitonAsDAE.condition1) == 1
-  @assert length(ifEquation.branches) == 1
-  local cond = listHead(structuralTransisitonAsDAE.condition1)
-  local branch = first(ifEquation.branches)
-  local bodyEquations = branch.body
-  return (bodyEquations, cond)
-end
-
-
-"""
-  Creates a flat model without the connectors expanded.
-  The equations in this model does not include active DOCC equations.
-"""
-function createNewFlatModel(flatModel)
-  local newFlatModel = OMFrontend.Frontend.FLAT_MODEL(flatModel.name,
-                                                  flatModel.variables,
-                                                  flatModel.unresolvedConnectEquations, #Why is this in two places?
-                                                  flatModel.initialEquations,
-                                                  flatModel.algorithms,
-                                                  flatModel.initialAlgorithms,
-                                                  MetaModelica.nil,
-                                                  NONE(),
-                                                  flatModel.DOCC_equations,
-                                                  flatModel.unresolvedConnectEquations,
-                                                  flatModel.active_DOCC_Equations,
-                                                  flatModel.comment)
-  return newFlatModel
-end
-
-"""
-  If equation start as active it should be removed and the condition should be reverted.
-  If we start without the equation  equations for DOCC should be added.
-"""
-function createAffectCondPairForDOCC(cond,
-                                     idx::Int,
-                                     active_DOCC_Equations::Vector{Bool},
-                                     simCode)
-  #= Extract component references from condition for MTK-aware runtime lookup.
-     After MTK structural_simplify, hardcoded x[N] indices are invalid. =#
-  local condCrefs = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
-  local condCrefSymbols = map(c -> Symbol(string(c)), condCrefs)
-  #= Build condition-variable assignment expressions: set each cref to a new boolean value =#
-  local condSetExprs = map(condCrefs) do c
-    local cStr = string(c)
-    local entry = get(simCode.stringToSimVarHT, cStr, nothing)
-    if entry !== nothing && !SimulationCode.isParameter(entry[2])
-      local sym = Symbol(cStr)
-      (falseExpr = :(x[lookuptableStates[$(QuoteNode(sym))]] = false),
-       trueExpr  = :(x[lookuptableStates[$(QuoteNode(sym))]] = true))
-    else
-      (falseExpr = :(), trueExpr = :())
-    end
-  end
-  affectCondPair = if ! active_DOCC_Equations[idx]
-    quote
-      function affect!(integrator)
-        local t = integrator.t
-        local x = integrator.u
-        local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
-        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-        local lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
-        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
-        structuralChange.structureChanged = true
-        $(map(e -> e.falseExpr, condSetExprs)...)
-        auto_dt_reset!(integrator)
-        add_tstop!(integrator, integrator.t)
-      end
-      function condition(x, t, integrator)
-        local xs = $(condCrefSymbols)
-        local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
-        if !isempty(xs) && all(isnothing, indices)
-          return false
-        end
-        local lookuptableStates = Dict((xs) .=> indices)
-        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
-        $(map(c -> Expr(Symbol("="),
-                        Symbol(string(c)),
-                        getIdxForLookupMTK(c, simCode)),
-              Util.getAllCrefs(cond))...)
-        return $(expToJuliaBoolMTK(cond, simCode))
-      end
-    end
-  else #= The equation is active at the start =#
-    quote
-      function affect!(integrator)
-        local t = integrator.t
-        local x = integrator.u
-        local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
-        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-        local lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
-        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
-        structuralChange.structureChanged = true
-        $(map(e -> e.trueExpr, condSetExprs)...)
-        #= Save state for the solve-loop recompilation path =#
-        integrator.just_hit_tstop = true
-        structuralChange.timeAtChange = integrator.t
-        structuralChange.solutionAtChange = deepcopy(integrator.sol)
-        #= Stop integration for reconfiguration =#
-        terminate!(integrator)
-      end
-      function condition(x, t, integrator)
-        local xs = $(condCrefSymbols)
-        local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
-        if !isempty(xs) && all(isnothing, indices)
-          return false
-        end
-        local lookuptableStates = Dict((xs) .=> indices)
-        local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-        local lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
-        $(map(c -> Expr(Symbol("="),
-                        Symbol(string(c)),
-                        getIdxForLookupMTK(c, simCode)),
-              Util.getAllCrefs(cond))...)
-        return !($(expToJuliaBoolMTK(cond, simCode)))
-      end
-    end
-  end
-  return affectCondPair
 end

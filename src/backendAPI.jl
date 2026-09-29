@@ -191,7 +191,7 @@ end
     Direct DifferentialEquations.jl emission. Builds an `ODEProblem` with an
     in-place RHS `f!(du, u, p, t)` that indexes `u`, `du`, and `p` by integer
     position. Bypasses ModelingToolkit entirely. Initial scope: pure ODE
-    (no algebraic constraints), no VSS / structural transitions, no DOCC.
+    (no algebraic constraints), no VSS / structural transitions.
   =#
   DEMode = 4
   #=
@@ -379,7 +379,7 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
           "eliminateRHSEquivalentEquations" => SimulationCode.eliminateRHSEquivalentEquations,
           "removeRedundantEquations" => SimulationCode.removeRedundantEquations,
           #= Shrinks the parameter list MTK sees before structural_simplify. The pass
-             skips VSS / DOCC / sub-model variants where a parameter could be re-bound
+             skips VSS / sub-model variants where a parameter could be re-bound
              at runtime. =#
           "eliminateConstantParameters" => SimulationCode.eliminateConstantParameters,
           #= Drop protected sink variables and their defining equations; before

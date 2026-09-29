@@ -156,8 +156,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   #= Fetch the different components of the model.=#
   local allSharedVars::Vector{BDAE.VAR} = getSharedVariablesLocalsAndGlobals(shared)
   local allBackendVars = vcat(equationSystem.orderedVars, allSharedVars)
-  local simVars::Vector{SimulationCode.SIMVAR} = createAndCollectSimulationCodeVariables(allBackendVars, shared.flatModel)
-  local occVars = String[v.name for v in simVars if isOCCVar(v)]
+  local simVars::Vector{SimulationCode.SIMVAR} = collectVariables(allBackendVars)
   #=
     Check if the model has state variables, if not introduce a dummy state
   =#
@@ -212,16 +211,8 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
     Gather all irreducible variables.
     NB: Should also include variables affected somehow with by a structural change.
   =#
-  local irreducibleVars::Vector{String} = vcat(occVars,
-                                                getIrreducibleVars(ifEqs,
-                                                                    whenEqs,
-                                                                    allBackendVars,
-                                                                    stringToSimVarHT))
+  local irreducibleVars::Vector{String} = getIrreducibleVars(ifEqs, whenEqs, allBackendVars, stringToSimVarHT)
   (resEqs, irreducibleVars) = handleZimmerThetaConstant(resEqs, irreducibleVars, stringToSimVarHT)
-  #= ...DOCC Handling... =#
-  if ! isempty(shared.DOCC_equations)
-    append!(structuralTransitions, shared.DOCC_equations)
-  end
   #=  Convert the structural transitions to the simcode representation. =#
   local simCodeStructuralTransitions = createSimCodeStructuralTransitions(structuralTransitions)
   #= Sorting/Matching for the set of residual equations (This is used for the start conditions) =#
@@ -316,7 +307,6 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
                           simSharedEqs,
                           initialState,
                           shared.metaModel,
-                          shared.flatModel,
                           irreducibleVars,
                           ModelicaFunction[],
                           #= Specify if external runtime should be used =# false,
@@ -389,8 +379,6 @@ function createSimCodeStructuralTransitions(structuralTransitions::Vector{ST}) w
                                                       SimulationCode.toWhenStmts(st.whenEquation),
                                                       st.source,
                                                       SimulationCode.toEqAttr(st.attr))
-      BDAE.STRUCTURAL_IF_EQUATION(__) =>
-        SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION(st.ifEquation)
     end
     push!(transitions, sst)
   end
@@ -1158,40 +1146,17 @@ function getSharedVariablesLocalsAndGlobals(shared::BDAE.SHARED)
 end
 
 """
-  This function converts the set of backend variables (bDAEVariables)
-  to a set of simulation code variables.
-If the system contains the special occ construct we mark the variables involved in the OCC relation as state variables.
-The reason being is that we do not want to optimize away these variables later.
-"""
-function createAndCollectSimulationCodeVariables(bDAEVariables::Vector{BDAE.VAR}, flatModel)
-  @match flatModel begin
-    NONE() => begin
-      collectVariables(bDAEVariables)
-    end
-    SOME(fm) => begin
-      local occVariables = collect(keys(first(getOCCGraph(fm))))
-      collectVariables(bDAEVariables; occVariables = occVariables)
-    end
-  end
-end
-
-"""
   Collect variables from array of BDAE.Var:
   Save the name and it's kind of each variable.
   Index will be set to NONE.
 """
-function collectVariables(allBackendVars::Vector{BDAE.VAR}; occVariables = String[])
+function collectVariables(allBackendVars::Vector{BDAE.VAR})
   local numberOfVars::Int = length(allBackendVars)
   local simVars::Vector = Array{SimulationCode.SimVar}(undef, numberOfVars)
   for (i, backendVar) in enumerate(allBackendVars)
     #= In the backend we use string instead of component references. =#
     local simVarName::String = BDAE_identifierToVarString(backendVar)
     local simVarKind::SimulationCode.SimVarType = BDAE_VarKindToSimCodeVarKind(backendVar)
-    simVarKind = if ! (isOverconstrainedConnectorVariable(simVarName, occVariables))
-      simVarKind
-    else
-      SimulationCode.OCC_VARIABLE()
-    end
     simVars[i] = SimulationCode.SIMVAR(simVarName, NONE(), simVarKind, backendVar.values)
   end
   return simVars

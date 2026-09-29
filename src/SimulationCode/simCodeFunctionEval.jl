@@ -552,7 +552,7 @@ capacitances).
 """
 function evaluateConstantFunctionOutputs(simCode::SIM_CODE)::SIM_CODE
   (hasStructuralTransitions(simCode) || hasSubModels(simCode) ||
-   hasFlatModel(simCode) || hasMetaModel(simCode)) && return simCode
+   hasMetaModel(simCode)) && return simCode
   local fs = Dict{String, MODELICA_FUNCTION}()
   for f in simCode.functions
     f isa MODELICA_FUNCTION && (fs[OMBackend.canonicalName(f.name)] = f)

@@ -497,7 +497,7 @@ end
 
 """
     planDemotions(simCode, equations, ifEqComponents, discreteVariables,
-                  nStateVars, nAlgebraicVars, nOccVars) -> DemotionPlan
+                  nStateVars, nAlgebraicVars) -> DemotionPlan
 
 Decide which discrete variables should be demoted from "held state" to
 "algebraic unknown". Sources used (in priority order):
@@ -524,13 +524,12 @@ function planDemotions(simCode,
                        ifEqComponents::Vector{IfEquationComponent},
                        discreteVariables::Vector{String},
                        nStateVars::Int,
-                       nAlgebraicVars::Int,
-                       nOccVars::Int)::DemotionPlan
+                       nAlgebraicVars::Int)::DemotionPlan
   #= Codegen-time over-determination count. The +length(discreteVariables)
      accounts for the (yet-to-be-filtered) dummy `der(d) ~ 0` equations. =#
   local nConditionalEqs = sum(length(c.conditionalEquations) for c in ifEqComponents; init = 0)
   local nTotalEqs = length(equations) + length(discreteVariables) + nConditionalEqs
-  local nTotalVars = nStateVars + nAlgebraicVars + length(discreteVariables) + nOccVars
+  local nTotalVars = nStateVars + nAlgebraicVars + length(discreteVariables)
   local excess = nTotalEqs - nTotalVars
 
   #= Discount duplicate residuals. =#

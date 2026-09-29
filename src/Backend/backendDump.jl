@@ -756,12 +756,6 @@ function Base.string(idx::DAE.INDEX)::String
   return str
 end
 
-function Base.string(structuralIfEquation::BDAE.STRUCTURAL_IF_EQUATION)
-  local str = "DYNAMIC_"
-  local ifEqStr = replace(OMFrontend.Frontend.toString(structuralIfEquation.ifEquation), "\\n" => "\n")
-  str *= ifEqStr * "\n"
-end
-
 
 function Base.string(stmt::DAE.STMT_ASSIGN)
   return string(stmt.exp1) * ":=" * string(stmt.exp) * "|" * string(stmt.type_)

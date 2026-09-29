@@ -157,34 +157,6 @@ mutable struct StructuralChangeAgenticRecompilation <: AbstractStructuralChange
   initialEquations::Union{String, Nothing}
 end
 
-"""
- Wrapper callback for a dynamic connection reconfiguration
-"""
-mutable struct StructuralChangeDynamicConnection <: AbstractStructuralChange
-  "The name of the next mode"
-  name::String
-  "Indicates if the structure has changed"
-  structureChanged::Bool
-  "The meta model. A flat representation of the model itself."
-  #= Would it be better to modify the SCode instead? Less code to change?=#
-  flatModel::OMFrontend.Frontend.FLAT_MODEL
-  "The index of the specific dynamic connection equation."
-  index::Int
-  """
-    The symbol table for the old model.
-    This is used to map indices of variables when the structure of the model changes
-  """
-  stringToSimVarHT
-  """
-    If equations are to be added or removed.
-  """
-  activeEquations::Bool
-  "Time at which the structural change was triggered"
-  timeAtChange::Float64
-  "Saved solution at the time of structural change"
-  solutionAtChange
-end
-
 mutable struct OM_ProblemStructural{T0 <: String, T1, T2, T3}
   "The name of the active mode"
   activeModeName::T0
@@ -386,9 +358,6 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
   return oldSols
 end
 
-#= Enable this switch to allow DOCC without unnecessary recompilation. =#
-global SHOULD_DO_REINITIALIZATION = false
-
 """
   Fill in initial conditions for new state variables that were observed (algebraic)
   in the old segment. Mutates newU0 in-place.
@@ -524,7 +493,7 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
         local _t_recomp = time()
         local newU0
         @VSS_DEBUG @info "Syms before recompilation:" getSyms(problem) integrator.u
-        (newProblem, newSymbolTable, finalInitialValues, initialValues, reducedSystem, specialCase) = recompilation(cb.name,
+        (newProblem, newSymbolTable, finalInitialValues, initialValues, reducedSystem) = recompilation(cb.name,
                                                                                                                     cb,
                                                                                                                     integrator,
                                                                                                                     tspan,
@@ -549,8 +518,7 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
         newU0 = RuntimeUtil.createNewU0(symsOfOldProblem,
                                         symsOfNewProblem,
                                         baseU0,
-                                        last(cb.solutionAtChange.u),
-                                        specialCase)
+                                        last(cb.solutionAtChange.u))
         @VSS_DEBUG @info "[solve OM_ProblemRecompilation] newU0 from createNewU0" newU0 baseU0 symsOfNewProblem symsOfOldProblem oldFinal=last(cb.solutionAtChange.u)
         #= Fill in observed variables: new state vars absent from old state vector
            are recovered from the old solution's algebraic (observed) equations. =#
@@ -769,7 +737,7 @@ function recompilation(activeModeName,
     structuralCallback.metaModel = newMetaModel
     structuralCallback.stringToSimVarHT = simulationCode.stringToSimVarHT
     #= 4.2) Assign this system to newSystem. =#
-    return (compositeProblem, simulationCode.stringToSimVarHT,finalInitialValues, initialValues, reducedSystem, false)
+    return (compositeProblem, simulationCode.stringToSimVarHT, finalInitialValues, initialValues, reducedSystem)
   end
 end
 
@@ -858,12 +826,12 @@ function recompilation(activeModeName,
                                           structuralCallback.stringToSimVarHT,
                                           integrator.t,
                                           Float64[])
-      (problem, ht_new, finalInitialValues, initialValues, reducedSystem, _) =
+      (problem, ht_new, finalInitialValues, initialValues, reducedSystem) =
         recompilation(activeModeName, scr, integrator, tspan, callbackConditions)
       structuralCallback.metaModel = scr.metaModel
       structuralCallback.stringToSimVarHT = scr.stringToSimVarHT
     end
-    return (problem, ht_new, finalInitialValues, initialValues, reducedSystem, false)
+    return (problem, ht_new, finalInitialValues, initialValues, reducedSystem)
   end
 end
 
@@ -898,136 +866,6 @@ function queryAgent(componentsToChange::Vector{String},
     return [nothing for _ in componentsToChange]
   end
 end
-
-"""
-  Structural callback for dynamic connection handling.
-  Returns (problem, symbol table, initial values, sc).
-The boolean sc (Special case indicates if the variables can be assumed to be unchanged or not).
-For the DOCC systems this can be assumed to be true.
-"""
-function recompilation(activeModeName,
-                       structuralCallback::StructuralChangeDynamicConnection,
-                       integrator_u,
-                       tspan,
-                       callbackConditions)
-  local runId = OMBackend.createLogRunId(activeModeName; suffix = "docc_recompilation")
-  return OMBackend.withLogRunDir(runId) do
-    @VSS_DEBUG @info "[recompilation DOCC] ENTER" activeModeName
-    local _t_start = time()
-    #= Fetch the flat model from the struct field (embedded at codegen time
-       in structuralCallbacks.jl). Earlier this read a module-scope global
-       OMBackend.CodeGeneration.FLAT_MODEL that was overwritten on every
-       translation, corrupting earlier callbacks. =#
-    local flatModel = structuralCallback.flatModel
-    local unresolvedConnectEquations = flatModel.unresolvedConnectEquations
-    #= Get the relevant equation =#
-    local indexOfEquation = structuralCallback.index
-    local equationIf = MetaModelica.listGet(flatModel.DOCC_equations, indexOfEquation)
-    @assert length(equationIf.branches) == 1
-    if ! structuralCallback.activeEquations
-      equationsToAdd = first(equationIf.branches).body
-      newFlatModel = RuntimeUtil.createNewFlatModel(flatModel, unresolvedConnectEquations, equationsToAdd)
-    else
-      newFlatModel = RuntimeUtil.createNewFlatModel(flatModel, indexOfEquation, unresolvedConnectEquations)
-    end
-    @VSS_DEBUG @info "[recompilation DOCC] step 1/5: new flat model built" elapsed_s=round(time()-_t_start, digits=2)
-    local simulationCode = translateToSimCode(newFlatModel, activeModeName)
-    @VSS_DEBUG @info "[recompilation DOCC] step 2/5: backend (translateToSimCode) done" elapsed_s=round(time()-_t_start, digits=2)
-    local resultingModel = translateToMTK(simulationCode, activeModeName)
-    @VSS_DEBUG @info "[recompilation DOCC] step 3/5: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
-    #println("New model generated")
-    local model = OMBackend.canonicalName(activeModeName)
-    local modelName = string(model, "Model")
-    #local result = OMBackend.modelToString(model; MTK = true, keepComments = false, keepBeginBlocks = false)
-    #println("We have a new model!\n");
-    resultingModel = OMBackend.CodeGeneration.stripComments(resultingModel)
-    resultingModel = OMBackend.CodeGeneration.stripBeginBlocks(resultingModel)
-    #= Ensure Modelica function wrapper bindings are available in Runtime scope.
-       The wrappers are created in CodeGeneration (mtkExternals.jl:317) but the
-       recompilation eval runs here in Runtime. =#
-    for (_fn, _w) in OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS
-      @eval $_fn = OMBackend.CodeGeneration.MODELICA_FUNCTION_WRAPPERS[$(QuoteNode(_fn))]
-    end
-    @eval $(resultingModel)
-    @VSS_DEBUG @info "[recompilation DOCC] step 4/5: module @eval done" modelName elapsed_s=round(time()-_t_start, digits=2)
-    @BACKEND_LOGGING OMBackend.writeStringToFile(string("modfied", modelName * ".jl"), "$resultingModel")
-    local modelCall = quote
-      $(Symbol(modelName))($(tspan))
-    end
-    (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
-    @VSS_DEBUG @info "[recompilation DOCC] step 5/5: modelCall @eval done (submodel ODEProblem built)" elapsed_s=round(time()-_t_start, digits=2)
-    #= Reconstruct composite problem: use 3-arg ODEProblem with complete u0
-       (including algebraic unknowns) and skip the initialization solver.
-       buildDefaultGuesses fills algebraic unknowns not in finalInitialValues with 0.0. =#
-    local _recompGuesses = Base.invokelatest(
-      OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
-    compositeProblem = ModelingToolkit.ODEProblem(
-      reducedSystem,
-      merge(Dict(finalInitialValues), _recompGuesses, pars),
-      tspan;
-      callback = CallbackSet(callbackConditions, callbacks),
-      warn_initialize_determined = false,
-      build_initializeprob = false,
-    )
-    @VSS_DEBUG @info "[recompilation DOCC] composite ODEProblem rebuilt" elapsed_s=round(time()-_t_start, digits=2)
-    #= Update the structural callback's symbol table for the new system =#
-    structuralCallback.stringToSimVarHT = simulationCode.stringToSimVarHT
-    return (compositeProblem,
-            simulationCode.stringToSimVarHT,
-            finalInitialValues,
-            initialValues,
-            reducedSystem,
-            true) #= specialCase=true: variables can be assumed unchanged for DOCC =#
-  end
-end
-
-"""
-  This function returns the root indices of the OCC graph.
-"""
-function returnRootIndices(activeModeName,
-                structuralCallback::StructuralChangeDynamicConnection,
-                integrator_u,
-                tspan,
-                callbackConditions)
-  local flatModel = structuralCallback.flatModel
-  (variablestoReset, rootSources) = RuntimeUtil.resolveDOOCConnections(flatModel, flatModel.name)
-  local rootVariables = keys(variablestoReset)
-  local ht = structuralCallback.stringToSimVarHT
-  rootIndices = Int[]
-  variablesToSet = Any[]
-  variablesToSetIdx = Vector{Int}[]
-  for v in rootVariables
-    indexOfRoot = first(ht[v])
-    push!(rootIndices, indexOfRoot)
-    push!(variablesToSet, values(variablestoReset[v]))
-  end
-  for variables in variablesToSet
-    tmp = Int[]
-    for v in variables
-      idx = first(ht[v])
-      push!(tmp, idx)
-    end
-    push!(variablesToSetIdx, tmp)
-  end
-  return (rootIndices, variablesToSetIdx, rootSources, variablestoReset)
-end
-
-"""
- Runs the backend.
-  Translates the flat model to Flat Modelica.
-  Generates the simulation code.
-  Creates the new model.
-Returns, a tuple of the new model and the simulation code of this model.
-"""
-function runBackend(flatModelica, classToInstantiate)
-  local bdae = OMBackend.lower(flatModelica)
-  local simulationCode = OMBackend.generateSimulationCode(bdae; mode = OMBackend.MTK_MODE)
-  simulationCode = OMBackend.SimulationCode.simplifyEnumLiteralPaths(simulationCode)
-  simulationCode = OMBackend.SimulationCode.canonicalizeCrefNames(simulationCode)
-  local newModel = OMBackend.CodeGeneration.ODE_MODE_MTK_MODEL_GENERATION(simulationCode, simulationCode.name, []; useDirectRHS = false)
-  return (newModel, simulationCode)
-end
-
 
 function translateToSimCode(flatModelica, classToInstantiate)
   local bdae = OMBackend.lower(flatModelica)
@@ -1069,14 +907,6 @@ end
 function getSyms(problem::ODEProblem)::Vector{Symbol}
   return Symbol[state.f.name for state in ModelingToolkit.get_unknowns(problem.f.sys)]
 end
-
-"""
-  Fetches  the symbolic variables from a solution
-"""
-function getSymsFromSolution(sol)::Vector{Symbol}
-  getSyms(sol.f.prob)
-end
-
 
 """
   Get a vector of indices of the variables between syms1 and syms2.

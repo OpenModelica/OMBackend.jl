@@ -117,7 +117,6 @@ struct ClassifiedVariables
   stateVariables        :: Vector{String}
   algebraicVariables    :: Vector{String}
   discreteVariables     :: Vector{String}
-  occVariables          :: Vector{String}
   parameters            :: Vector{String}
   arrayParameters       :: Vector{String}
   stateDerivatives      :: Vector{String}
@@ -148,7 +147,6 @@ function classifyVariables(simCode)::ClassifiedVariables
   local stateVariables         = String[]
   local algebraicVariables     = String[]
   local discreteVariables      = String[]
-  local occVariables           = String[]
   local parameters             = String[]
   local arrayParameters        = String[]
   local stateDerivatives       = String[]
@@ -167,7 +165,6 @@ function classifyVariables(simCode)::ClassifiedVariables
         throw()
       end
       SimulationCode.STATE(__) => push!(stateVariables, varName)
-      SimulationCode.OCC_VARIABLE(__) => push!(occVariables, varName)
       SimulationCode.PARAMETER(__) => push!(parameters, varName)
       #= String parameters are non-numeric; excluded from MTK parameter system. =#
       SimulationCode.STRING(__) => nothing
@@ -207,7 +204,6 @@ function classifyVariables(simCode)::ClassifiedVariables
       local supportsStatePriority =
         varType isa SimulationCode.STATE ||
         varType isa SimulationCode.ALG_VARIABLE ||
-        varType isa SimulationCode.OCC_VARIABLE ||
         varType isa SimulationCode.ARRAY
       if supportsStatePriority && !startswith(string(varName), "der(")
         push!(statePriorityPairs, (Symbol(varName), priority))
@@ -215,7 +211,7 @@ function classifyVariables(simCode)::ClassifiedVariables
     end
   end
   return ClassifiedVariables(stateVariables, algebraicVariables,
-                             discreteVariables, occVariables,
+                             discreteVariables,
                              parameters, arrayParameters,
                              stateDerivatives, dataStructureVariables,
                              statePriorityPairs)
@@ -237,7 +233,7 @@ end
 
 """
     collectIrreducibleSymbols(simCode, conditionalEquations,
-                              stateVariables, algebraicVariables, occVariables)
+                              stateVariables, algebraicVariables)
         -> Vector{Symbol}
 
 Build the list of variable symbols that MTK's tearing pass must NOT
@@ -256,8 +252,7 @@ not unknowns, so MTK never tries to eliminate them in the first place.
 function collectIrreducibleSymbols(simCode,
                                    conditionalEquations::Vector{Expr},
                                    stateVariables::Vector{String},
-                                   algebraicVariables::Vector{String},
-                                   occVariables::Vector{String})::Vector{Symbol}
+                                   algebraicVariables::Vector{String})::Vector{Symbol}
   #= Sort: `irreducibleVariables` is an unordered collection, and this list feeds
      structural_simplify's tearing — a non-deterministic order yields a
      non-deterministic (occasionally unsolvable) reduced system. =#
@@ -268,7 +263,7 @@ function collectIrreducibleSymbols(simCode,
       lhs isa Symbol && push!(syms, lhs)
     end
   end
-  for vn in fixedStartVarNames(vcat(stateVariables, algebraicVariables, occVariables), simCode)
+  for vn in fixedStartVarNames(vcat(stateVariables, algebraicVariables), simCode)
     local sym = Symbol(vn)
     sym in syms || push!(syms, sym)
   end
@@ -539,7 +534,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
   local MODEL_NAME = simCode.name
   #= Generate code for algorithmic Modelica =#
   (functions, functionNames) = AlgorithmicCodeGeneration.generateFunctions(simCode.functions)
-  if !SimulationCode.hasStructuralTransitions(simCode) && !SimulationCode.hasSubModels(simCode) && !SimulationCode.hasFlatModel(simCode)
+  if !SimulationCode.hasStructuralTransitions(simCode) && !SimulationCode.hasSubModels(simCode)
     #= Generate using the standard name =#
     return ODE_MODE_MTK_PROGRAM_GENERATION(simCode, simCode.name, functions)
   end
@@ -877,7 +872,6 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local stateVariables         = vars.stateVariables
   local algebraicVariables     = vars.algebraicVariables
   local discreteVariables      = vars.discreteVariables
-  local occVariables           = vars.occVariables
   local parameters             = vars.parameters
   local arrayParameters        = vars.arrayParameters
   local stateDerivatives       = vars.stateDerivatives
@@ -887,8 +881,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
 
   local performIndexReduction = simCode.isSingular
   local skipInitializeProb = SimulationCode.hasStructuralTransitions(simCode) ||
-                             SimulationCode.hasMetaModel(simCode) ||
-                             SimulationCode.hasFlatModel(simCode)
+                             SimulationCode.hasMetaModel(simCode)
   #= Solve parametric initial equations (initial equations that only involve parameters).
      This determines values for fixed=false parameters before code generation. =#
   solveParametricInitialEquations!(simCode)
@@ -902,7 +895,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   If missing from variable map error is thrown check the start condition.
   Readded discretes here....
   =#
-  local INITIAL_GUESS_EQUATIONS = createStartConditionsEquationsMTK(vcat(stateVariables, occVariables),
+  local INITIAL_GUESS_EQUATIONS = createStartConditionsEquationsMTK(stateVariables,
                                                                       algebraicVariables,
                                                                       simCode)
 
@@ -927,7 +920,6 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local algebraicVariablesSym = Symbol[:($(Symbol(v))) for v in algebraicVariables]
   local dataStructureVariablesSym = Symbol[Symbol(v) for v in dataStructureVariables]
   local stateVariablesSym = Symbol[:($(Symbol(v))) for v in stateVariables]
-  local occVariablesSym = Symbol[:($(Symbol(v))) for v in occVariables]
   local parVariablesSym = Symbol[Symbol(p) for p in parameters]
   #= Discrete-dummy demotion. Each discrete variable starts with a
      placeholder `der(d) ~ 0` so SciML has a state slot for callbacks to
@@ -945,8 +937,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local _demotionPlan = planDemotions(simCode, EQUATIONS, IF_EQUATION_COMPONENTS,
                                       discreteVariables,
                                       length(stateVariables),
-                                      length(algebraicVariables),
-                                      length(occVariables))
+                                      length(algebraicVariables))
   (DISCRETE_DUMMY_EQUATIONS, discreteVariablesSym) =
     applyDemotionPlan!(_demotionPlan, discreteVariables, DISCRETE_DUMMY_EQUATIONS,
                        discreteVariablesSym, algebraicVariablesSym)
@@ -992,8 +983,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      (simCode-flagged irreducibles + ifEq_tmp LHS targets + fixed-start
      variables). =#
   local irreducibleSyms = collectIrreducibleSymbols(simCode, CONDITIONAL_EQUATIONS,
-                                                    stateVariables, algebraicVariables,
-                                                    occVariables)
+                                                    stateVariables, algebraicVariables)
 
   #= Heuristic for initialization:
      - If any state variable has an explicit start value, assume the system has algebraic
@@ -1020,9 +1010,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     Merge equations. ifCond variables are discrete parameters so they are NOT
     included in stateVariablesSym and do NOT get der() ~ 0 equations.
   =#
-  stateVariablesSym = vcat(discreteVariablesSym,
-                           stateVariablesSym,
-                           occVariablesSym)
+  stateVariablesSym = vcat(discreteVariablesSym, stateVariablesSym)
   #= Discretes read by a callback condition must survive relay elimination under
      their own name: the generated condition indexes the state vector by that name,
      so re-aliasing it to another leaf strands the lookup. Force them to be the
@@ -1246,7 +1234,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       end
       function _buildInitialConstraintEqs()
         local _eqs = Symbolics.Equation[$([_substSyms(e, _ifEqRelay_aliases) for e in generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)]...),
-                                        $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, occVariables, algebraicVariables, discreteVariables), simCode)]...)]
+                                        $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, algebraicVariables, discreteVariables), simCode)]...)]
         $(emitInitAlgConstraintAppends(simCode)...)
         return _eqs
       end
