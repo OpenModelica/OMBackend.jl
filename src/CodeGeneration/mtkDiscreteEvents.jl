@@ -658,9 +658,8 @@ function freeParametersDecl(simCode)::Expr
      DiodeBridge2mPulse need. =#
   local assigned = OrderedSet{String}()
   for ieq in simCode.initialEquations
-    local sides = OMBackend._tryOr(() -> equationSides(ieq), nothing, :freeParametersEquationSides)
-    sides === nothing && continue
-    for side in sides
+    hasEquationSides(ieq) || continue
+    for side in equationSides(ieq)
       side isa DAE.CREF && push!(assigned, string(side))
     end
   end

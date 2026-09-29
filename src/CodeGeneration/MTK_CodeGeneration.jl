@@ -478,12 +478,7 @@ function defaultSolverFor(solver, problem, reducedSystem, discreteUnknownNames::
     return OMBackend.daeFallbackSolver()
   end
   (hasWhens || nDiff == n || isempty(discreteUnknownNames)) && return solver
-  local unknowns = try
-    ModelingToolkit.unknowns(reducedSystem)
-  catch _e
-    OMBackend._fallback(_e, :defaultSolverFor)
-    Any[]
-  end
+  local unknowns = ModelingToolkit.unknowns(reducedSystem)
   #= MTK renders subscripted unknowns as var"name[i]"(t); strip the quotes. =#
   mtkName(u) = replace(string(u), "var\"" => "", "\"" => "")
   local names = Set(discreteUnknownNames)
@@ -818,12 +813,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
            `initial algorithm` assignments initialization equations, which
            cover them; an assignment in a runtime `when initial()` body to
            such a variable has no effect. =#
-        local _unkNames = try
-          OrderedSet(string(u) for u in ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM))
-        catch _e
-          OMBackend._fallback(_e, :programGenIrreducibleNames)
-          OrderedSet{String}()
-        end
+        local _unkNames = OrderedSet(string(u) for u in ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM))
         #= Float-convert: Int-valued entries make remake_buffer promote a
            Float64 parameter buffer to Int64, failing on fractional entries. =#
         local _hardFiltered = Dict(Base.first(p) => Float64(Base.last(p))

@@ -122,12 +122,7 @@ end
 
 function _ifConditionDependsOnTime(@nospecialize(condition))::Bool
   local refs::OrderedSet{String} = OrderedSet{String}()
-  try
-    SimulationCode.collectCrefNames!(refs, condition)
-  catch _e
-    OMBackend._fallback(_e, :ifConditionDependsOnTime)
-    return false
-  end
+  SimulationCode.collectCrefNames!(refs, condition)
   return "time" in refs
 end
 
@@ -147,12 +142,7 @@ per-branch continuous callback.
 """
 function _ifConditionIsPureTimeEvent(@nospecialize(condition), simCode)::Bool
   local refs::OrderedSet{String} = OrderedSet{String}()
-  try
-    SimulationCode.collectCrefNames!(refs, condition)
-  catch _e
-    OMBackend._fallback(_e, :ifConditionIsPureTimeEvent)
-    return false
-  end
+  SimulationCode.collectCrefNames!(refs, condition)
   ("time" in refs) || return false
   local ht = simCode.stringToSimVarHT
   for name in refs
@@ -208,12 +198,7 @@ One for each conditional variable created.
 function _conditionReferencesRelayTarget(@nospecialize(condition), rT0)::Bool
   isempty(rT0) && return false
   local refs::OrderedSet{String} = OrderedSet{String}()
-  try
-    SimulationCode.collectCrefNames!(refs, condition)
-  catch _e
-    OMBackend._fallback(_e, :conditionReferencesRelayTarget)
-    return false
-  end
+  SimulationCode.collectCrefNames!(refs, condition)
   for name in refs
     haskey(rT0, Symbol(name)) && return true
   end
@@ -238,14 +223,7 @@ function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode,
     push!(conds, transformToMTKContinuousConditionEquation(b.condition, simCode; atInitial = true))
     push!(closed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
   end
-  local valMap = nothing
-  local explicit = Set{Symbol}()
-  try
-    (valMap, explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
-  catch _e
-    OMBackend._fallback(_e, :fixedPointT0ValueMap)
-    valMap = nothing
-  end
+  local (valMap, explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
   local ivs = Bool[true for _ in condBranches]
   for _round in 1:8
     local newIvs = Bool[evalInitialCondition(conds[k], simCode; closedBoundary = closed[k], extraVals = rT0)
@@ -258,7 +236,7 @@ function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode,
       end
     end
     local rT0Changed = false
-    if valMap !== nothing && sel !== nothing
+    if sel !== nothing
       local mergedMap = copy(valMap)
       local mergedExplicit = copy(explicit)
       for (k, v) in rT0
@@ -551,12 +529,7 @@ function createIfEquation(stateVariables::Vector,
   local _t0ValMap = nothing
   local _t0Explicit = Set{Symbol}()
   if selBranch !== nothing
-    try
-      (_t0ValMap, _t0Explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
-    catch _e
-      OMBackend._fallback(_e, :ifEquationT0ValueMap)
-      _t0ValMap = nothing
-    end
+    (_t0ValMap, _t0Explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
   end
   #= Branches that define different variables (a switch with an arc:
      i = Goff*v while quenched, v = Ron*i when closed) take the residual form,

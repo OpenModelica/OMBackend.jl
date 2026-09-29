@@ -206,20 +206,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   # Extract guesses from the reduced system. These are properly mapped to
   # post-simplification unknowns and provide Modelica start values for variables
   # that splitInitialValues could not map (pre-simplification names do not match).
-  local systemGuesses = try
-    ModelingToolkit.guesses(reducedSystem)
-  catch _e
-    OMBackend._fallback(_e, :buildDirectRHSProblem_1)
-    Dict()
-  end
+  local systemGuesses = ModelingToolkit.guesses(reducedSystem)
   local (hardInitialValues, initEqPinKeys) = _collectHardInitializationValues(
     reducedSystem, finalInitialValues; resolvedParams=initResolved)
-  local observedEquations = try
-    ModelingToolkit.observed(reducedSystem)
-  catch _e
-    OMBackend._fallback(_e, :buildDirectRHSProblem_2)
-    Symbolics.Equation[]
-  end
+  local observedEquations = ModelingToolkit.observed(reducedSystem)
   local u0 = _buildStateVector(states, finalInitialValues; resolvedParams=resolvedParams,
                                 systemGuesses=systemGuesses,
                                 hardInitialValues=hardInitialValues,
@@ -323,12 +313,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                   if isDiscreteKey(string(st)) && string(st) in initEqPinKeys]
     local derivativeInitTargets = _derivativeInitializationTargets(
       reducedSystem, states; resolvedParams=initResolved)
-    local eqLabels = try
-      ModelingToolkit.equations(reducedSystem)
-    catch _e
-      OMBackend._fallback(_e, :buildDirectRHSProblem_4)
-      nothing
-    end
+    local eqLabels = ModelingToolkit.equations(reducedSystem)
     #= Signal-valued initialization equations become extra residual rows of
        the init solve. Validate the generated evaluator once on the entry
        guesses; a throwing or non-finite evaluator must not poison Newton. =#
@@ -543,12 +528,7 @@ function _collectHardInitializationValues(reducedSystem, finalInitialValues;
     val === nothing && continue
     values[pair.first] = val
   end
-  local initEqs = try
-    ModelingToolkit.initialization_equations(reducedSystem)
-  catch _e
-    OMBackend._fallback(_e, :_collectHardInitializationValues)
-    return (values, constraintKeys)
-  end
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
   for eq in initEqs
     startswith(string(eq.lhs), "Differential(") && continue
     local rhsVal = _literalNumericValue(eq.rhs)
@@ -567,12 +547,7 @@ function _literalNumericValue(val)
   local raw = val
   raw = raw isa Symbolics.Num ? Symbolics.unwrap(raw) : raw
   raw isa Number && return Float64(raw)
-  raw = try
-    Symbolics.value(raw)
-  catch _e
-    OMBackend._fallback(_e, :_literalNumericValue)
-    return nothing
-  end
+  raw = Symbolics.value(raw)
   raw = raw isa Symbolics.Num ? Symbolics.unwrap(raw) : raw
   return raw isa Number ? Float64(raw) : nothing
 end
@@ -582,12 +557,7 @@ function _derivativeInitializationTargets(reducedSystem, states;
                                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
   local stateStrToIdx = Dict{String, Int}(string(st) => i for (i, st) in enumerate(states))
   local targets = Pair{Int, Float64}[]
-  local initEqs = try
-    ModelingToolkit.initialization_equations(reducedSystem)
-  catch _e
-    OMBackend._fallback(_e, :_derivativeInitializationTargets)
-    return targets
-  end
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
   for eq in initEqs
     local lhs = Symbolics.unwrap(eq.lhs)
     (SymbolicUtils.iscall(lhs) && SymbolicUtils.operation(lhs) isa Symbolics.Differential) || continue
@@ -616,12 +586,7 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
                                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
                                           excludeNames::AbstractSet{String}=OrderedSet{String}())
   OMBackend.envSwitch("OMBACKEND_INIT_SYMBOLIC_EQS") || return nothing
-  local initEqs = try
-    ModelingToolkit.initialization_equations(reducedSystem)
-  catch _e
-    OMBackend._fallback(_e, :_symbolicInitializationResiduals_1)
-    return nothing
-  end
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
   isempty(initEqs) && return nothing
   local stateStrToIdx = OrderedDict{String, Int}(string(st) => i for (i, st) in enumerate(states))
   local exprs = Any[]
@@ -688,12 +653,7 @@ end
    repeated substitution terminates. Returns the indices of the rows that
    reduced to those (a row still reading der() inside an observed does not). =#
 function _inlineObservedRows!(exprs, reducedSystem, states, params, iv)::Vector{Int}
-  local obsEqs = try
-    ModelingToolkit.observed(reducedSystem)
-  catch _e
-    OMBackend._fallback(_e, :_inlineObservedRows!)
-    Symbolics.Equation[]
-  end
+  local obsEqs = ModelingToolkit.observed(reducedSystem)
   local obsByStr = OrderedDict{String, Any}(string(o.lhs) => o.rhs for o in obsEqs)
   local allowed = OrderedSet{String}(string(st) for st in states)
   for p in params
@@ -726,12 +686,7 @@ end
    `pFunc(u, p, t)` evaluates the values of `p[pIdxs]`, or nothing. A row whose
    f reads its own p stays a residual row. =#
 function _initialParameterAssignments(reducedSystem, states, params, iv)
-  local initEqs = try
-    ModelingToolkit.initialization_equations(reducedSystem)
-  catch _e
-    OMBackend._fallback(_e, :_initialParameterAssignments_1)
-    return nothing
-  end
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
   local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
   local exprs = Any[]
   local pIdxs = Int[]
@@ -843,12 +798,7 @@ function _observedDerivativeInitEquations(reducedSystem, states;
                                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
   local exprs = Any[]
   local tgts = Float64[]
-  local initEqs = try
-    ModelingToolkit.initialization_equations(reducedSystem)
-  catch _e
-    OMBackend._fallback(_e, :_observedDerivativeInitEquations)
-    return (exprs, tgts)
-  end
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
   local stateStrs = Set{String}(string(st) for st in states)
   for eq in initEqs
     local lhs = Symbolics.unwrap(eq.lhs)
@@ -1689,7 +1639,7 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
      the value out via Symbolics.value before falling through to the name-based
      leaf lookup, otherwise we treat literals as unknown free vars. =#
   if !SymbolicUtils.iscall(expr) && !SymbolicUtils.issym(expr)
-    local v = OMBackend._tryOr(() -> Symbolics.value(expr), nothing, :_evalSymbolicFunctionCall_1)
+    local v = Symbolics.value(expr)
     if v isa Number
       return Float64(v)
     end
@@ -1706,7 +1656,8 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
     local result = try
       Base.invokelatest(f, numArgs...)
     catch _e
-      OMBackend._fallback(_e, :_evalSymbolicFunctionCall_2)
+      #= A probe with Float64 arguments: a MethodError means the function takes others. =#
+      OMBackend._fallback(_e, :_evalSymbolicFunctionCall_2; expect = MethodError)
       return nothing
     end
     if result isa Number
