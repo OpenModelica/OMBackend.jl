@@ -432,6 +432,21 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
       ress = vcat(ress, ares)
     end
     local delta = _newtonStep(Js, ress, anchorRows === nothing)
+    #= Converged at the round-off floor: the full Newton step moves the
+       variables by round-off only, so the residual cannot shrink further. An
+       ideal diode conducting V/Ron = 1e7 A leaves ~1e-9 in its rows (the MSL
+       MultiPhase Rectifier stalled at 1.863e-9 for 20 iterations). Only with
+       a residual at round-off relative to the variables (a singular
+       Jacobian's least-squares step can be tiny away from a root too), and
+       not in an anchored phase (its least-squares stationary point has a
+       zero step with the anchors pulling the residual off zero). =#
+    local uMax = max(1.0, maximum(j -> abs(u0[j]), var_idx; init = 0.0))
+    if anchorRows === nothing && norm_res <= 1.0e3 * eps(Float64) * uMax &&
+       maximum(abs, delta; init = 0.0) <= 64 * eps(Float64) * uMax
+      traceInit && println("[initphase ", phaseLabel, "] converged at the round-off floor, norm=",
+                           round(norm_res, sigdigits = 4))
+      return true
+    end
     #= The acceptance measure must match the objective the direction
        minimizes: the equilibrated least-squares norm. Raw max-norm
        acceptance on mixed-scale systems rejects every step (one huge-
