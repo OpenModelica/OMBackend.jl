@@ -1776,20 +1776,31 @@ end
   branch of the ODEProblem build skips MTK's init solver, so the init-eq alone
   would not propagate the init-algorithm value into u0.
 """
+#= The names an initial algorithm assigns and reads: from its DAE statements
+   when it has them (an `initial algorithm` section), else from its when
+   operators (the body of `when initial()` or `when {c, initial()}`). A model
+   can have both kinds: the MSL SignalPWM's sawtooth and ZeroOrderHold. =#
+function _collectInitAlgNames!(lhsNames, rhsNames, ia)
+  if isempty(ia.daeStatements)
+    for op in ia.statements
+      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
+    end
+  else
+    for s in ia.daeStatements
+      _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
+    end
+  end
+  return lhsNames
+end
+
 function emitInitAlgU0Appends(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local appends::Vector{Expr} = Expr[]
   isempty(simCode.initialAlgorithms) && return appends
   local ht::Dict = simCode.stringToSimVarHT
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
-  if any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
-    for ia in simCode.initialAlgorithms, s in ia.daeStatements
-      _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
-    end
-  else
-    for ia in simCode.initialAlgorithms, op in ia.statements
-      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
-    end
+  for ia in simCode.initialAlgorithms
+    _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
   for name in lhsNames
     haskey(ht, name) || continue
@@ -1822,14 +1833,8 @@ function emitInitAlgConstraintAppends(simCode::SimulationCode.SIM_CODE)::Vector{
   local ht::Dict = simCode.stringToSimVarHT
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
-  if any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
-    for ia in simCode.initialAlgorithms, s in ia.daeStatements
-      _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
-    end
-  else
-    for ia in simCode.initialAlgorithms, op in ia.statements
-      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
-    end
+  for ia in simCode.initialAlgorithms
+    _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
   for name in lhsNames
     haskey(ht, name) || continue
@@ -5225,15 +5230,8 @@ end
 function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)::Expr
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
-  local useDAEPath = any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
-  if useDAEPath
-    for ia in simCode.initialAlgorithms, s in ia.daeStatements
-      _collectInitAlgLhsRhsCrefsDAE!(lhsNames, rhsNames, s)
-    end
-  else
-    for ia in simCode.initialAlgorithms, op in ia.statements
-      _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
-    end
+  for ia in simCode.initialAlgorithms
+    _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
   if isempty(lhsNames) && isempty(rhsNames)
     return quote
@@ -5273,18 +5271,16 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
     push!(prefetches, :(local $(Symbol("_alg_" * name)) = 0.0))
   end
   local stmts = Expr[]
-  if useDAEPath
-    for ia in simCode.initialAlgorithms
-      isempty(ia.daeStatements) && continue
-      local body = AlgorithmicCodeGeneration.generateStatements(ia.daeStatements)
-      for s in body
+  local seenLHS = copy(lhsNames)
+  for ia in simCode.initialAlgorithms
+    if isempty(ia.daeStatements)
+      for op in ia.statements
+        push!(stmts, _qualifyInvokedFunctions(_initialWhenOpToJuliaEarly(op, simCode, renamedNames, seenLHS)))
+      end
+    else
+      for s in AlgorithmicCodeGeneration.generateStatements(ia.daeStatements)
         push!(stmts, _qualifyInvokedFunctions(_renameAlgIdentifiers(s, renamedNames)))
       end
-    end
-  else
-    local seenLHS = copy(lhsNames)
-    for ia in simCode.initialAlgorithms, op in ia.statements
-      push!(stmts, _qualifyInvokedFunctions(_initialWhenOpToJuliaEarly(op, simCode, renamedNames, seenLHS)))
     end
   end
   local captures = Expr[]
@@ -5340,13 +5336,12 @@ at SimCode construction time, so no module-scope parameter bindings are needed
 here. Returns a no-op stub when the model has no `when initial()` clauses.
 """
 function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Expr
-  #= When the DAE.Statement-based early-eval path is available, it emits
-     control-flow-correct `initialization_eqs` for every LHS. The runtime
-     `remake` here is built from the lossy WhenOperator flattening and would
-     overwrite the init-eq result with the flat-first-branch value at simulate
-     time. Emit an empty stub instead — the early path covers it. =#
-  local useDAEPath = any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms)
-  if useDAEPath
+  #= An algorithm with DAE statements: the early path emits control-flow-correct
+     `initialization_eqs` for its LHS. The runtime `remake` here is built from
+     the lossy WhenOperator flattening and would overwrite the init-eq result
+     with the flat-first-branch value at simulate time; it is left out here. =#
+  local whenAlgorithms = filter(ia -> isempty(ia.daeStatements), simCode.initialAlgorithms)
+  if isempty(whenAlgorithms)
     return quote
       function __runInitialAlgorithm!()
         return Dict{Any, Any}()
@@ -5356,7 +5351,7 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
   local boolNames = OrderedSet{String}()
-  for ia in simCode.initialAlgorithms
+  for ia in whenAlgorithms
     for op in ia.statements
       _collectInitAlgLhsRhsCrefs!(lhsNames, rhsNames, op)
       _collectBoolRhsCrefs!(boolNames, op)
@@ -5365,7 +5360,7 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
   local renamedNames = union(lhsNames, rhsNames)
   push!(renamedNames, "time")
   local stmts = Expr[]
-  for ia in simCode.initialAlgorithms
+  for ia in whenAlgorithms
     for op in ia.statements
       push!(stmts, _initialWhenOpToJulia(op, simCode, renamedNames))
     end

@@ -199,6 +199,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
     local daeStmts = get(Backend.BDAECreate._INIT_ALG_DAE_STMTS, iweq, DAE.Statement[])
     push!(initialAlgorithms, INITIAL_ALGORITHM(collect(iweq.whenEquation.whenStmtLst), daeStmts))
   end
+  whenEqs = substituteSampleTriggers(whenEqs, resEqs)
   local (whenEqsKept, extractedInitAlgs) = extractInitialWhenAlgorithms(whenEqs)
   whenEqs = whenEqsKept
   append!(initialAlgorithms, extractedInitAlgs)
@@ -855,6 +856,45 @@ function _condHasTimeAndPre(@nospecialize(cond))::Bool
   end
 end
 
+_isSampleCallDAE(@nospecialize(e))::Bool = e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "sample"
+
+"""
+    substituteSampleTriggers(whenEqs, resEqs) -> whenEqs
+
+A when condition on a Boolean defined by `b = sample(start, interval)` (the
+MSL DiscreteBlock's `sampleTrigger`, read by `when {sampleTrigger, initial()}`
+in ZeroOrderHold and Sampler) gets the sample call in place of `b`: only a
+condition with a sample() call becomes a periodic callback, `b` itself is
+false between the ticks. Only the condition's Boolean structure (the cref, an
+array, and, or) is rewritten, not an operand of pre() or a relation.
+"""
+function substituteSampleTriggers(whenEqs::Vector{BDAE.WHEN_EQUATION},
+                                  resEqs::Vector{BDAE.RESIDUAL_EQUATION})::Vector{BDAE.WHEN_EQUATION}
+  local defs = Dict{String, DAE.Exp}()
+  for eq in resEqs
+    local e = eq.exp
+    (e isa DAE.BINARY && e.operator isa DAE.SUB) || continue
+    for (a, b) in ((e.exp1, e.exp2), (e.exp2, e.exp1))
+      a isa DAE.CREF && _isSampleCallDAE(b) && (defs[string(a.componentRef)] = b)
+    end
+  end
+  isempty(defs) && return whenEqs
+  local subst = cond -> @match cond begin
+    DAE.CREF(componentRef = cr) => get(defs, string(cr), cond)
+    DAE.ARRAY(ty, scalar, lst) => DAE.ARRAY(ty, scalar, MetaModelica.list(map(subst, collect(lst))...))
+    DAE.LBINARY(a, op, b) => DAE.LBINARY(subst(a), op, subst(b))
+    _ => cond
+  end
+  local rewrite
+  rewrite = (w::BDAE.WHEN_STMTS) -> BDAE.WHEN_STMTS(subst(w.condition), w.whenStmtLst,
+    @match w.elsewhenPart begin
+      SOME(ew) => SOME(BDAE.WHEN_EQUATION(ew.size, rewrite(ew.whenEquation), ew.source, ew.attr))
+      _ => w.elsewhenPart
+    end)
+  return BDAE.WHEN_EQUATION[BDAE.WHEN_EQUATION(weq.size, rewrite(weq.whenEquation), weq.source, weq.attr)
+                            for weq in whenEqs]
+end
+
 """
     extractInitialWhenAlgorithms(whenEqs) -> (runtimeWhenEqs, initialAlgorithms)
 
@@ -873,11 +913,10 @@ function extractInitialWhenAlgorithms(whenEqs::Vector{BDAE.WHEN_EQUATION})::Tupl
     elseif _hasMixedInitialCondition(cond)
       local stmts = collect(weq.whenEquation.whenStmtLst)
       push!(initialAlgs, INITIAL_ALGORITHM(stmts))
-      #= Keep the runtime arm only for a self-scheduling `time >= pre(x)` trigger,
-         which has an MTK callback lowering; other compound-initial whens stay
-         init-only (their prior behaviour). =#
+      #= The runtime arm on the other triggers: the MSL ZeroOrderHold's
+         `when {sampleTrigger, initial()}` samples at every sampleTrigger. =#
       local runtimeCond = _stripInitialTriggers(cond)
-      if runtimeCond !== nothing && _condHasTimeAndPre(runtimeCond)
+      if runtimeCond !== nothing
         local inner = BDAE.WHEN_STMTS(runtimeCond, weq.whenEquation.whenStmtLst,
                                       weq.whenEquation.elsewhenPart)
         push!(kept, BDAE.WHEN_EQUATION(weq.size, inner, weq.source, weq.attr))
