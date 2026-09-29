@@ -2152,9 +2152,13 @@ end
    hysteresis width `H * scale` (OpenModelica: max(|a|,|b|) + nominal). =#
 function _conditionScaleExpr(@nospecialize(cond), simCode)
   local terms = Any[]
+  #= An infinite operand (the MSL Spice3 V_pulse's default pulse width and
+     period, inf, in `time >= T0 + Tfalling`) is left out: it made the
+     hysteresis infinite. =#
   for rel in _eventRelations(cond)
-    push!(terms, :(abs($(expToJuliaExpMTK(rel.exp1, simCode)))))
-    push!(terms, :(abs($(expToJuliaExpMTK(rel.exp2, simCode)))))
+    for x in (expToJuliaExpMTK(rel.exp1, simCode), expToJuliaExpMTK(rel.exp2, simCode))
+      push!(terms, :(ModelingToolkit.ifelse(abs($(x)) < 1.0e300, abs($(x)), 0.0)))
+    end
   end
   isempty(terms) && return 1.0
   return length(terms) == 1 ? :(1.0 + $(terms[1])) : :(1.0 + max($(terms...)))
@@ -2177,7 +2181,8 @@ Base.@nospecializeinfer function _literalConditionExpr(@nospecialize(cond), simC
     DAE.RELATION(_, op, _) => begin
       local zc = observe(transformToMTKContinuousCondition(cond, simCode))
       (op isa DAE.LESSEQ || op isa DAE.GREATEREQ) ? :($(zc) <= 0) :
-        (op isa DAE.LESS || op isa DAE.GREATER) ? :($(zc) < 0) : nothing
+        #= == and <> cross as 0.5 - (a == b): negative exactly when it holds. =#
+        (op isa DAE.LESS || op isa DAE.GREATER || op isa DAE.EQUAL || op isa DAE.NEQUAL) ? :($(zc) < 0) : nothing
     end
     DAE.LBINARY(e1, DAE.AND(__), e2) => begin
       local l = rec(e1); local r = rec(e2)

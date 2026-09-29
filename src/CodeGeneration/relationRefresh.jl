@@ -41,11 +41,17 @@ function _valueGetter(problem, @nospecialize(ex))
   return integrator -> f(integrator.u, integrator.p, integrator.t)
 end
 
-#= The hysteresis H for a relative tolerance (OpenModelica's tolZC). The
-   if-equation relations read it from their parameter (setZCHysteresis!
-   sets it per solve), the whens from the integrator's tolerance. =#
-_hysteresis(reltol) = 1.0e-4 * max(Float64(first(reltol)), 1.0e-12)
-_hysteresisFromTolerance(integrator) = _hysteresis(integrator.opts.reltol)
+#= The hysteresis H for a relative tolerance and a solve's time span, as
+   OpenModelica's tolZC = 1e-4 * min(stepSize, tolerance), its output step
+   the span over 500 intervals (its default): an absolute 1e-4 * reltol is
+   1e-7 at the default tolerance, the whole span of the MSL Spice3 examples,
+   and no relation on time switched before their stop time (a pulse source
+   stayed at 0 V). The if-equation relations read it from their parameter
+   (setZCHysteresis! sets it per solve), the whens from the integrator. =#
+_hysteresis(reltol, span::Real = Inf) =
+  1.0e-4 * max(min(Float64(first(reltol)), abs(Float64(span)) / 500), 1.0e-12)
+_timeSpan(tspan) = Float64(last(tspan)) - Float64(first(tspan))
+_hysteresisFromTolerance(integrator) = _hysteresis(integrator.opts.reltol, _timeSpan(integrator.sol.prob.tspan))
 
 #= A relation's value by the hysteresis rule, from its buffered value `old`:
    true when zc <= 0 (true while zc <= eps, becomes true at zc <= -eps). =#
@@ -631,7 +637,23 @@ function _eventReinit!(integrator, alg = DiffEqBase.BrownFullBasicInit())
   local InitialFailure = ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
   local before = integrator.sol.retcode
   local u0 = copy(integrator.u)
-  DiffEqBase.initialize_dae!(integrator, alg)
+  try
+    DiffEqBase.initialize_dae!(integrator, alg)
+  catch err
+    err isa InterruptException && rethrow()
+    #= A method of the default polyalgorithm can throw (NonlinearSolve's
+       MoreTrustRegion descent, `restructure(x, nothing)`, on the MSL Spice3
+       Inverter's switching MOSFETs): Newton with finite differences instead,
+       from the state before; a failure if that throws too. =#
+    copyto!(integrator.u, u0)
+    try
+      DiffEqBase.initialize_dae!(integrator, tableClusterInitAlg())
+    catch err2
+      err2 isa InterruptException && rethrow()
+      copyto!(integrator.u, u0)
+      _restoreRetcode!(integrator, InitialFailure)
+    end
+  end
   (integrator.sol.retcode == InitialFailure && before != InitialFailure) || return nothing
   local residual = _maxAlgebraicResidual(integrator, integrator.u)
   ((residual <= _solveAbstol(integrator) || _atRoundoffFloor(integrator, integrator.u)) &&
@@ -699,8 +721,8 @@ end
     setZCHysteresis!(problem, hSym, reltol)
 
 Set the hysteresis parameter H of the event crossing functions for a solve
-with relative tolerance `reltol`: H = 1e-4 * reltol (OpenModelica's tolZC).
-Nothing for a problem without it.
+with relative tolerance `reltol` over the problem's time span (`_hysteresis`,
+OpenModelica's tolZC). Nothing for a problem without it.
 """
 function setZCHysteresis!(problem, hSym::Symbol, reltol)
   local SII = ModelingToolkit.SymbolicIndexingInterface
@@ -710,7 +732,7 @@ function setZCHysteresis!(problem, hSym::Symbol, reltol)
     false
   end
   present || return problem
-  SII.setp(problem, hSym)(problem, _hysteresis(reltol))
+  SII.setp(problem, hSym)(problem, _hysteresis(reltol, _timeSpan(problem.tspan)))
   return problem
 end
 
