@@ -2871,6 +2871,11 @@ end
    the if-expression can gate directly on the held discrete value; the discrete's
    own update event localises the switch, so no ifCond relay is needed. =#
 function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::Bool
+  #= initial() is true during the initialization only: a condition with it is
+     a relation (its crossing function a constant of either sign), not a gate
+     on the runtime value, where initial() is false (MSL LimIntegrator's
+     `initial() and not limitsAtInit` never held). =#
+  _hasInitialCall(condition) && return false
   local refs::OrderedSet{String} = OrderedSet{String}()
   try
     SimulationCode.collectCrefNames!(refs, condition)
@@ -2889,6 +2894,16 @@ function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::
     end
   end
   return true
+end
+
+function _hasInitialCall(@nospecialize(condition))::Bool
+  local d = condition isa SimulationCode.Exp ? SimulationCode.toDAEExp(condition) : condition
+  local found = Ref(false)
+  Util.traverseExpBottomUp(d, (x, acc) -> begin
+    x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name == "initial" && (found[] = true)
+    (x, true, acc)
+  end, 0)
+  return found[]
 end
 
 "True when every non-else branch condition of an if-equation is discrete/parameter,

@@ -2321,7 +2321,11 @@ function createIfEquation(stateVariables::Vector,
              (generateIfExpressions), whose own update event localises the step.
              No crossing function, no callback. =#
           push!(ivConditions, ivCond)
-        elseif _ifConditionIsPureTimeEvent(branch.condition, simCode)
+        #= A condition with initial() is a relation (a constant crossing function
+           of either sign), not a pure-time event: `initial() or time > T` held
+           until T. =#
+        elseif !MTK_CodeGenerationUtil._hasInitialCall(branch.condition) &&
+               _ifConditionIsPureTimeEvent(branch.condition, simCode)
           #= Deterministic time event: defer to model-level refresh callbacks built
              in createIfEquations, so two sources whose transitions coincide cannot
              drop one another's affect. `numVal` is the post-crossing ifCond value
@@ -5149,7 +5153,8 @@ end
    relies on `initial algorithm` to seed states. =#
 #= der(x) in a runtime initial algorithm (the initial() arm of a relation
    on a derivative, MSL FluxTubes' `asc = der(Hstat) > 0`) reads the
-   derivative at the problem's initial state; there is no `der` function. =#
+   derivative from the problem (_initialDerivative); there is no `der`
+   function. =#
 function _initialDerivativeReads(ex)
   ex isa Expr || return ex
   if ex.head === :call && length(ex.args) == 2 && ex.args[1] === :der
@@ -5167,7 +5172,9 @@ function _blockValue(ex)
   return length(body) == 1 ? _blockValue(body[1]) : ex
 end
 
-#= The derivative of the variable `name` at `problem`'s initial state. =#
+#= The derivative of the variable `name` at `problem`'s start values: the
+   runtime initial algorithm runs before the solve. A discrete cluster's
+   start pass evaluates such a relation again on the solved state. =#
 function _initialDerivative(problem, name::Symbol)
   local sys = problem.f.sys
   local d = ModelingToolkit.Differential(ModelingToolkit.get_iv(sys))(getproperty(sys, name))

@@ -1179,70 +1179,93 @@ end
    der(f) for der(x), as OpenModelica differentiates it: left as D(x), index
    reduction made x a state and recovered the chain behind f backwards
    (P3 = (... - hystR)/P4, H3 from P3's atan), singular once the branch
-   saturated. Only in these equations; the model's own der(x) stay. The
-   initial equations keep D(expr), which the init solve differentiates itself
+   saturated. Only in these equations; the model's own der(x) stay. An
+   equation with a function Symbolics has no derivative rule for (a Modelica
+   function, a table lookup) stays as it is. The initial equations keep
+   D(expr), which the init solve differentiates itself
    (_observedDerivativeTargets). =#
 function expandExpressionDerivatives(eqs::AbstractVector)
-  any(eq -> _hasExpressionDerivative(eq.lhs) || _hasExpressionDerivative(eq.rhs), eqs) || return eqs
+  local touched = BitVector(_hasExpressionDerivative(eq.lhs) || _hasExpressionDerivative(eq.rhs) for eq in eqs)
+  any(touched) || return eqs
   local definitions = _explicitDefinitions(eqs)
   local memo = Dict{Any, Any}()
-  return map(eqs) do eq
-    (_hasExpressionDerivative(eq.lhs) || _hasExpressionDerivative(eq.rhs)) || return eq
-    local side = ex -> _derivativesByDefinitions(Symbolics.expand_derivatives(ex), definitions, memo, Set{Any}())
-    side(eq.lhs) ~ side(eq.rhs)
+  local side = ex -> _derivativesByDefinitions(_expandDerivatives(ex), definitions, memo, Set{Any}())
+  return map(eachindex(eqs)) do i
+    touched[i] || return eqs[i]
+    try
+      side(eqs[i].lhs) ~ side(eqs[i].rhs)
+    catch e
+      e isa InterruptException && rethrow()
+      eqs[i]
+    end
   end
 end
 
-#= x => f for the equations `x ~ f` with x a variable f neither reads nor
-   differentiates; the first one of each x. =#
+#= Symbolics' chain rule, throwing at a function without a derivative rule
+   (by default it writes D(f(u))*D(u) for it). =#
+_expandDerivatives(ex) = Symbolics.expand_derivatives(ex, false; throw_no_derivative = true)
+
+#= The Differential terms of `ex` (or of a vector or tuple of them), outermost
+   ones: get_variables keeps a Differential term whole (an Operator is atomic)
+   and, unlike a walk over `arguments`, builds no argument lists (every
+   model's equations pass through _hasExpressionDerivative). =#
+function _differentials(ex)
+  local out = OrderedSet{Any}()
+  for e in (ex isa Union{AbstractArray, Tuple} ? ex : (ex,)), v in Symbolics.get_variables(e)
+    SymbolicUtils.iscall(v) && SymbolicUtils.operation(v) isa ModelingToolkit.Differential && push!(out, v)
+  end
+  return out
+end
+
+_hasExpressionDerivative(ex) = any(v -> !_isDifferentiableUnknown(v), _differentials(ex))
+
+#= x => f for the equations `x ~ f` with x a variable: f neither reads x nor
+   differentiates, x has no other such equation and the model does not
+   differentiate x itself (a state: its D(x) is the state derivative, and
+   D(f) would make index reduction solve f for f's operands). =#
 function _explicitDefinitions(eqs)
   local out = Dict{Any, Any}()
+  local seen = Set{Any}()
+  local differentiated = Set{Any}()
+  for eq in eqs, d in _differentials((eq.lhs, eq.rhs))
+    push!(differentiated, Symbolics.unwrap(SymbolicUtils.arguments(d)[1]))
+  end
   for eq in eqs
     local x = Symbolics.unwrap(eq.lhs)
     (SymbolicUtils.iscall(x) && SymbolicUtils.issym(SymbolicUtils.operation(x))) || continue
-    haskey(out, x) && continue
+    if x in seen
+      delete!(out, x)
+      continue
+    end
+    push!(seen, x)
+    x in differentiated && continue
     local f = Symbolics.unwrap(eq.rhs)
-    (_containsDifferential(f) || any(v -> isequal(v, x), Symbolics.get_variables(f))) && continue
+    (!isempty(_differentials(f)) || any(v -> isequal(v, x), Symbolics.get_variables(f))) && continue
     out[x] = f
   end
   return out
 end
 
-function _containsDifferential(ex)
-  local v = Symbolics.unwrap(ex)
-  SymbolicUtils.iscall(v) || return false
-  SymbolicUtils.operation(v) isa ModelingToolkit.Differential && return true
-  return any(_containsDifferential, SymbolicUtils.arguments(v))
-end
-
 #= `ex` with each D(x) of an explicitly defined x replaced by the derivative
    of its definition, recursively; a D(x) inside its own chain (`open`),
    deeper than _MAX_DEFINITION_CHAIN, or whose definition Symbolics cannot
-   differentiate (a Modelica function call), stays. =#
+   differentiate, stays. The memo ignores `open`: a result a cycle left less
+   expanded is still the derivative. =#
 const _MAX_DEFINITION_CHAIN = 32
 
 function _derivativesByDefinitions(ex, definitions, memo, open::Set{Any})
-  local ds = OrderedSet{Any}()
-  local collect!
-  collect! = function (e)
-    local v = Symbolics.unwrap(e)
-    SymbolicUtils.iscall(v) || return nothing
-    SymbolicUtils.operation(v) isa ModelingToolkit.Differential && (push!(ds, v); return nothing)
-    foreach(collect!, SymbolicUtils.arguments(v))
-    return nothing
-  end
-  collect!(ex)
   local subs = Dict{Any, Any}()
-  for d in ds
+  for d in _differentials(ex)
     local x = Symbolics.unwrap(SymbolicUtils.arguments(d)[1])
     (haskey(definitions, x) && !(x in open) && length(open) < _MAX_DEFINITION_CHAIN) || continue
     local dx = get(memo, x, nothing)
     if dx === nothing
       dx = try
-        local inner = Symbolics.expand_derivatives(SymbolicUtils.operation(d)(definitions[x]))
-        _derivativesByDefinitions(inner, definitions, memo, union(open, Set{Any}([x])))
-      catch e
-        e isa InterruptException && rethrow()
+        local inner = _expandDerivatives(SymbolicUtils.operation(d)(definitions[x]))
+        local e = _derivativesByDefinitions(inner, definitions, memo, union(open, Set{Any}([x])))
+        _hasExpressionDerivative(e) ? d : e
+      catch err
+        err isa InterruptException && rethrow()
         d
       end
       memo[x] = dx
@@ -1260,13 +1283,6 @@ function _isDifferentiableUnknown(v)
   return SymbolicUtils.issym(op)
 end
 
-#= get_variables keeps a Differential term whole (an Operator is atomic) and,
-   unlike a walk over `arguments`, builds no argument lists: every model's
-   equations pass through here. =#
-_hasExpressionDerivative(ex) =
-  any(v -> SymbolicUtils.iscall(v) && SymbolicUtils.operation(v) isa ModelingToolkit.Differential &&
-           !_isDifferentiableUnknown(v), Symbolics.get_variables(ex))
-
 #= build_explicit_observed_function for reads that may hold derivatives (an
    event relation `asc = der(Hstat) > 0`, MSL FluxTubes' Tellinen
    hysteresis), which it takes only as variables of the system: D(x) of a
@@ -1279,16 +1295,7 @@ function _buildObservedFunction(sys, exprs; kwargs...)
 end
 
 function _derivativesAsSystemTerms(sys, exprs)
-  local ds = OrderedSet{Any}()
-  local collect!
-  collect! = function (ex)
-    local v = Symbolics.unwrap(ex)
-    SymbolicUtils.iscall(v) || return nothing
-    SymbolicUtils.operation(v) isa ModelingToolkit.Differential && (push!(ds, v); return nothing)
-    foreach(collect!, SymbolicUtils.arguments(v))
-    return nothing
-  end
-  exprs isa AbstractArray ? foreach(collect!, exprs) : collect!(exprs)
+  local ds = _differentials(exprs)
   isempty(ds) && return exprs
   local rhsOf = Dict{Any, Any}()
   for eq in ModelingToolkit.equations(sys)

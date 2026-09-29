@@ -153,7 +153,7 @@ function namedValueFunctions(sys, names::Vector{String})
     byName[_plainVariableName(p)] = p
   end
   all(n -> haskey(byName, n), names) || return nothing
-  return [_buildObservedFunction(sys, byName[n]) for n in names]
+  return [ModelingToolkit.build_explicit_observed_function(sys, byName[n]) for n in names]
 end
 
 """
@@ -511,22 +511,27 @@ function _initializeRelations!(e::EventIteration, integrator)
     _initialize!(c, integrator) && (changed = true)
   end
   local r = e.ifRelations
-  if r !== nothing
-    _bufferValues(r.buffers, integrator) != r.compiled && (changed = true)
-    #= A relation the initialized state puts on its other side takes that
-       value now, not after the first step: an `initial()` condition, false
-       after the initialization (its first branch was integrated for a step). =#
-    _update!(r, integrator) && (changed = true)
+  r !== nothing && _bufferValues(r.buffers, integrator) != r.compiled && (changed = true)
+  changed && !_startResolve!(e, integrator) && return nothing
+  #= Then, on the solved state, a relation it puts on its other side takes
+     that value now, not after the first step: an `initial()` condition,
+     false after the initialization (its first branch was integrated for a
+     step). =#
+  if r !== nothing && _update!(r, integrator)
+    _startResolve!(e, integrator) || return nothing
+    changed = true
   end
   changed || return nothing
-  if !_resolveAlgebraics!(integrator, e.reinit)
-    @error "[events] the algebraic variables could not be solved at the start (t = $(integrator.t))"
-    return nothing
-  end
   #= The solve moves operands: the cluster relations literal again on the
      solved state, or they would make an event at the first step. =#
   foreach(c -> _literalBuffers!(c, integrator), e.clusters)
   return nothing
+end
+
+function _startResolve!(e::EventIteration, integrator)
+  _resolveAlgebraics!(integrator, e.reinit) && return true
+  @error "[events] the algebraic variables could not be solved at the start (t = $(integrator.t))"
+  return false
 end
 
 #= The callbacks that stay, and the whens the iteration takes over: those on
