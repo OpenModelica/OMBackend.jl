@@ -95,25 +95,15 @@ end
 
 function _ifEquationSortKey(ifEq::SimulationCode.IF_EQUATION, simCode)::String
   local targets = String[]
-  try
-    for branch in ifEq.branches
-      for resEq in branch.residualEquations
-        push!(targets, string(last(deCausalize(resEq, simCode))))
-      end
-      isempty(targets) || break
+  for branch in ifEq.branches
+    for resEq in branch.residualEquations
+      push!(targets, string(last(deCausalize(resEq, simCode))))
     end
-  catch _e
-    OMBackend._fallback(_e, :ifEquationSortKeyTargets)
-    empty!(targets)
+    isempty(targets) || break
   end
   if isempty(targets)
-    try
-      for branch in ifEq.branches
-        push!(targets, string(branch.condition))
-      end
-    catch _e
-      OMBackend._fallback(_e, :ifEquationSortKeyString)
-      return ""
+    for branch in ifEq.branches
+      push!(targets, string(branch.condition))
     end
   end
   sort!(targets)
@@ -250,7 +240,7 @@ function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode,
           local val = MTK_CodeGenerationUtil.evalCausalRHSAtT0(rhsE, mergedMap, mergedExplicit)
           val === nothing ? nothing : (key => Float64(val))
         catch _e
-          OMBackend._fallback(_e, :fixedPointT0Eval)
+          OMBackend._fallback(_e, :fixedPointT0Eval; only = UnsupportedLowering)
           nothing
         end
         if gv !== nothing && (!haskey(rT0, gv.first) || rT0[gv.first] != gv.second)
@@ -294,16 +284,9 @@ function createIfEquation(stateVariables::Vector,
   local allClosed = Bool[]
   for b in ifEq.branches
     b.identifier == -1 && continue
-    try
-      local mc = transformToMTKContinuousConditionEquation(b.condition, simCode)
-      push!(allZcs, _extractZeroCrossingLHS(mc))
-      push!(allClosed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
-    catch _e
-      OMBackend._fallback(_e, :ifEquationZeroCrossings, impact = :result)
-      empty!(allZcs)
-      empty!(allClosed)
-      break
-    end
+    local mc = transformToMTKContinuousConditionEquation(b.condition, simCode)
+    push!(allZcs, _extractZeroCrossingLHS(mc))
+    push!(allClosed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
   end
   #= Collect all ifCond symbols for this if-equation.
      These are parameters modified by imperative affects. =#
@@ -559,7 +542,7 @@ function createIfEquation(stateVariables::Vector,
         MTK_CodeGenerationUtil.evalCausalRHSAtT0(
           first(deCausalize(selEq, simCode)), _t0ValMap, _t0Explicit)
       catch _e
-        OMBackend._fallback(_e, :ifEquationT0Eval)
+        OMBackend._fallback(_e, :ifEquationT0Eval; only = UnsupportedLowering)
         nothing
       end
       gv === nothing || push!(relayGuesses, :($(string(_unwrapBlockExpr(lhsExpr))) => $(gv)))

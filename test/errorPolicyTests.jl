@@ -70,6 +70,23 @@ end
       @test OMBackend._tryOr(() -> OMBackend.unsupported("statement", 1), :fallback, :unsupportedSite) === :fallback
     end
   end
+  @testset "a site that only takes a lowering failure" begin
+    local lowering(f) = try; f(); catch e; OMBackend._fallback(e, :onlySite; only = OMBackend.UnsupportedLowering); :fallback; end
+    withenv("OMBACKEND_FALLBACK_ON_BUG" => nothing) do
+      @test lowering(() -> OMBackend.unsupported("expression", 1)) === :fallback
+      @test_throws ErrorException lowering(() -> error("another failure"))
+      @test_throws KeyError lowering(() -> Dict{Int, Int}()[1])
+    end
+  end
+  @testset "t0 values of evaluated constants" begin
+    local t0Number = OMBackend.CodeGeneration.MTK_CodeGenerationUtil._t0Number
+    #= evalDAE_Expression's block around the evaluated value (a BINARY start value was lost). =#
+    @test t0Number(() -> quote 2.5 end) == 2.5
+    @test t0Number(() -> true) == 1.0
+    @test t0Number(() -> quote x + 1 end) === nothing
+    @test t0Number(() -> "a string") === nothing
+    @test t0Number(() -> OMBackend.unsupported("not a constant", 1)) === nothing
+  end
   @testset "_tryOr" begin
     @test OMBackend._tryOr(() -> error("x"), 7, :tryOrSite) == 7
     @test OMBackend._tryOr(() -> 3, 7, :tryOrSite) == 3

@@ -177,7 +177,7 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
     local rhs = try
       expToJuliaExpMTK(bindExp, simCode)
     catch _e
-      OMBackend._fallback(_e, :stringParameterBinding)
+      OMBackend._fallback(_e, :stringParameterBinding; only = UnsupportedLowering, impact = :result)
       continue
     end
     push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
@@ -281,7 +281,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
     local rhs = try
       expToJuliaExpMTK(bindExp, simCode)
     catch _e
-      OMBackend._fallback(_e, :arrayParameterBinding)
+      OMBackend._fallback(_e, :arrayParameterBinding; only = UnsupportedLowering, impact = :result)
       continue
     end
     push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
@@ -407,7 +407,7 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
         local fieldRhs = try
           expToJuliaExpMTK(fieldExp, simCode)
         catch _e
-          OMBackend._fallback(_e, :recordFieldBinding)
+          OMBackend._fallback(_e, :recordFieldBinding; only = UnsupportedLowering, impact = :result)
           continue
         end
         local fieldSym = Symbol(simVar.name * "_" * field)

@@ -2169,6 +2169,46 @@ end
 const _T0_MAP_CACHE = Ref{Tuple{UInt, Dict{Symbol, Float64}, Set{Symbol}, Vector{Pair{Symbol, Float64}}}}(
   (UInt(0), Dict{Symbol, Float64}(), Set{Symbol}(), Pair{Symbol, Float64}[]))
 
+#= The number `f()` (evalDAEConstant, evalSimCodeParameter) gives, or nothing
+   when it is not a constant. A BINARY/LBINARY comes back as evalDAE_Expression's
+   `:block` around its evaluated value (around the Expr itself when it reads a
+   variable): `Float64` of the block was a MethodError, swallowed, so such a
+   start value was lost (error policy, stage 4). =#
+function _t0Number(f)::Union{Float64, Nothing}
+  local raw = try
+    f()
+  catch err
+    OMBackend._fallback(err, :t0Number; only = OMBackend.UnsupportedLowering)
+    return nothing
+  end
+  while raw isa Expr && raw.head === :block
+    local body = filter(a -> !(a isa LineNumberNode), raw.args)
+    length(body) == 1 || return nothing
+    raw = body[1]
+  end
+  return raw isa Real ? Float64(raw) : nothing
+end
+
+#= `sv`'s start value as a number, or nothing. =#
+function _startNumber(sv, simCode)::Union{Float64, Nothing}
+  local startExp = @match sv.attributes begin
+    SOME(attr) where hasproperty(attr, :start) => @match attr.start begin
+      SOME(e) => e
+      _ => nothing
+    end
+    _ => nothing
+  end
+  return startExp === nothing ? nothing : _t0Number(() -> evalDAEConstant(startExp, simCode))
+end
+
+_isFixedStart(sv)::Bool = @match sv.attributes begin
+  SOME(attr) where hasproperty(attr, :fixed) => @match attr.fixed begin
+    SOME(DAE.BCONST(true)) => true
+    _ => false
+  end
+  _ => false
+end
+
 function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{Symbol}}
   local cached = _T0_MAP_CACHE[]
   if cached[1] === objectid(simCode)
@@ -2184,42 +2224,21 @@ function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{
   for (key, (_, sv)) in ht
     local sym = Symbol(key)
     if sv.varKind isa SimulationCode.PARAMETER
-      local pval = try
-        local raw = evalSimCodeParameter(sv, simCode)
-        if raw isa Expr
-          #= evalDAE_Expression wraps its result in a :block Expr; evaluate
-             once to unwrap before the numeric coercion. =#
-          raw = Base.invokelatest(eval, raw)
-        end
-        Float64(raw)
-      catch
-        try
-          @match SOME(attr) = sv.attributes
-          @match SOME(startExp) = attr.start
-          Float64(evalDAEConstant(startExp, simCode))
-        catch
-          nothing
-        end
-      end
+      #= The binding's value, else the start value. =#
+      local pval = _t0Number(() -> evalSimCodeParameter(sv, simCode))
+      pval === nothing && (pval = _startNumber(sv, simCode))
       if pval !== nothing
         valMap[sym] = pval
         push!(explicit, sym)
         push!(trusted, sym)
       end
     elseif SimulationCode.isStateOrAlgebraic(sv)
-      local sval = 0.0
-      try
-        @match SOME(attr) = sv.attributes
-        @match SOME(startExp) = attr.start
-        sval = Float64(evalDAEConstant(startExp, simCode))
+      local sval = _startNumber(sv, simCode)
+      if sval !== nothing
         push!(explicit, sym)
-        @match attr.fixed begin
-          SOME(DAE.BCONST(true)) => push!(trusted, sym)
-          _ => nothing
-        end
-      catch
+        _isFixedStart(sv) && push!(trusted, sym)
       end
-      valMap[sym] = sval
+      valMap[sym] = something(sval, 0.0)
     end
   end
   local preSeed = copy(valMap)
@@ -2694,21 +2713,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     freeName = freeParams[1]
     #= Get initial guess from start attribute =#
     local (_, freeSV) = ht[freeName]
-    local guess = 0.1
-    @match freeSV.attributes begin
-      SOME(attr) => begin
-        @match attr.start begin
-          SOME(startExp) => begin
-            try
-              guess = Float64(evalDAEConstant(startExp, simCode))
-            catch
-            end
-          end
-          _ => nothing
-        end
-      end
-      _ => nothing
-    end
+    local guess = something(_startNumber(freeSV, simCode), 0.1)
     #= Build residual: LHS - RHS = 0.
        Replace all bound params recursively, leave the free param as the scalar
        Newton variable. This handles alias chains like

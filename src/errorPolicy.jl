@@ -7,6 +7,8 @@
      an AssertionError of our own code) propagates, unless the site names it
      in `expect`, or the OMBACKEND_FALLBACK_ON_BUG switch (observe mode,
      default off) is on, which only logs it loudly and takes the fallback;
+   - a site that names what it `only` takes (a lowering: UnsupportedLowering)
+     treats any other error as a programming error too;
    - every other error takes the fallback, logged once per site per translate:
      @debug when only speed is at stake (impact :perf), @info when the fallback
      changes the result (impact :result: a dropped constraint, event or assert,
@@ -98,16 +100,17 @@ resetFallbacks!() = empty!(FALLBACKS)
 fallbackSummary() = sort!([(site, r.count, r.exceptionType, r.impact, r.bug) for (site, r) in FALLBACKS]; by = first)
 
 """
-    _fallback(e, site; expect = Union{}, impact = :perf)
+    _fallback(e, site; expect = Union{}, only = Any, impact = :perf)
 
 Called first in a `catch` that takes a fallback (see the policy above): rethrows
-`e` when it is fatal, or a programming error the site does not `expect` (outside
-observe mode); otherwise records and logs the fallback once per site and returns.
+`e` when it is fatal, not of the type the site `only` takes, or a programming
+error the site does not `expect` (outside observe mode); otherwise records and
+logs the fallback once per site and returns.
 """
-function _fallback(@nospecialize(e), site::Symbol; expect::Type = Union{}, impact::Symbol = :perf)
+function _fallback(@nospecialize(e), site::Symbol; expect::Type = Union{}, only::Type = Any, impact::Symbol = :perf)
   isFatal(e) && rethrow()
   local bt = catch_backtrace()
-  local bug = !(e isa expect) && isBug(e, bt)
+  local bug = !(e isa only) || (!(e isa expect) && isBug(e, bt))
   bug && !envSwitch("OMBACKEND_FALLBACK_ON_BUG") && rethrow()
   local r = get!(() -> FallbackRecord(0, string(typeof(e)), impact, bug), FALLBACKS, site)
   r.count += 1

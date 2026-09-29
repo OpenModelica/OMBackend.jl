@@ -651,9 +651,10 @@ end
   Fails if the function is not a parameter.
 """
 function evalSimCodeParameter(v::V, simCode) where V
-  @match SimulationCode.SIMVAR(name, _, SimulationCode.PARAMETER(SOME(bindExp)), _) = v
-  local val = evalDAEConstant(bindExp, simCode)
-  return val
+  return @match v.varKind begin
+    SimulationCode.PARAMETER(SOME(bindExp)) => evalDAEConstant(bindExp, simCode)
+    _ => OMBackend.unsupported("a constant value of a variable other than a bound parameter", v.name)
+  end
 end
 
 """

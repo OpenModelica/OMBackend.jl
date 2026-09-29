@@ -270,6 +270,9 @@ end
 Base.showerror(io::IO, e::_UnsupportedInAffect) =
   print(io, "_daeExpToJuliaMem: unsupported in an ImperativeAffect body: ", string(e.exp))
 
+#= What a lowering to an affect body or a run-time check throws for a construct it does not support. =#
+const LoweringFailure = Union{UnsupportedLowering, _UnsupportedInAffect}
+
 #= Modelica event operators with no meaning inside an affect body; the generic
    call lowering would emit an undefined Julia function for them. =#
 const _AFFECT_UNSUPPORTED_BUILTINS = ("sample", "terminal", "delay", "der", "reinit", "cardinality")
@@ -905,7 +908,7 @@ function emitAssertCallback(simCode)::Expr
     local cond = try
       _daeBoolMem(a.condition, obsAcc, simCode)
     catch err
-      OMBackend._fallback(err, :assertCondition)
+      OMBackend._fallback(err, :assertCondition; only = LoweringFailure, impact = :result)
       @warn "[MTK GEN: asserts] an assert cannot be checked at run time; it is left out" condition = string(a.condition) exception = err
       continue
     end
@@ -939,7 +942,7 @@ Base.@nospecializeinfer function _assertMessageExpr(@nospecialize(msg::DAE.Exp),
   return try
     part(msg)
   catch _e
-    OMBackend._fallback(_e, :assertMessage)
+    OMBackend._fallback(_e, :assertMessage; only = LoweringFailure)
     string(msg)
   end
 end

@@ -46,7 +46,7 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
     local lhs = try
       expToJuliaExpMTK(ieqLhsDAE, simCode)
     catch err
-      OMBackend._fallback(err, :initialConstraintLhs)
+      OMBackend._fallback(err, :initialConstraintLhs; only = UnsupportedLowering, impact = :result)
       @warn "[CODEGEN: initialConstraints] failed to lower LHS; constraint dropped" lhs=ieqLhsDAE err
       continue
     end
@@ -71,7 +71,7 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
         _ => evalDAE_Expression(ieqRhsDAE, simCode)
       end
     catch err
-      OMBackend._fallback(err, :initialConstraintRhs)
+      OMBackend._fallback(err, :initialConstraintRhs; only = UnsupportedLowering, impact = :result)
       @warn "[CODEGEN: initialConstraints] failed to lower RHS; constraint dropped" rhs=ieqRhsDAE err
       continue
     end
