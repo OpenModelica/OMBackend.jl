@@ -2312,6 +2312,40 @@ Base.@nospecializeinfer function _buildChangeOrConditionFromExps(rels::Vector{DA
   return acc
 end
 
+#= The variables a lifted body reads through pre(), edge() or change(), once each. =#
+function _preReadCrefs(body::Vector{Tuple{DAE.Exp, DAE.Exp, Any}})::Vector{DAE.Exp}
+  local found = DAE.Exp[]
+  local seen = OrderedSet{String}()
+  function visit(@nospecialize(e), arg)
+    if e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name in ("pre", "edge", "change")
+      local a = listHead(e.expLst)
+      if a isa DAE.CREF && !(string(a.componentRef) in seen)
+        push!(seen, string(a.componentRef))
+        push!(found, a)
+      end
+    end
+    return (e, arg)
+  end
+  for (_, r, _) in body
+    Util.traverseExpBottomUp(r, visit, nothing)
+  end
+  return found
+end
+
+#= The condition of a lifted cluster without relations: `change(pre(n1)) or
+   change(pre(n2)) ...` over the values it follows. Not valid Modelica (the
+   argument of change() is a variable), so no user when has it; the code
+   generation takes it for a cluster with no relation (_collectChangeRelations!)
+   and never evaluates it (the event iteration runs the body at every pass). =#
+function _buildChangeOfPreCondition(held::Vector{DAE.Exp})
+  local preOf(c) = DAE.CALL(Absyn.IDENT("pre"), MetaModelica.list(c), DAE.callAttrBuiltinBool)
+  local acc = _makeChangeCallExp(preOf(held[1]))
+  for i in 2:length(held)
+    acc = DAE.LBINARY(acc, DAE.OR(DAE.T_BOOL_DEFAULT), _makeChangeCallExp(preOf(held[i])))
+  end
+  return acc
+end
+
 #= A discrete (Bool/Int/enum) equation `lhs = rhs` whose RHS is a discrete-time
    expression. Returns `(name, lhs, rhs, src, eq)` or `nothing`. Unlike the
    when-emit step this does NOT require the RHS to contain a relation: a
@@ -2641,13 +2675,24 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
       end
     end
   end
-  if isempty(rels)
-    #= No continuous event source: leave as residuals. =#
+  #= No continuous event source. Without pre() the equations stay residuals.
+     With pre() (edge(), change()) they still define held values: pre()
+     changes only at events, where it takes the values of the previous pass
+     (MLS 8.6). As a residual pre(n) reads n: StateGraph's `localActive =
+     pre(newActive)` of a step read only through a Parallel (anyTrue and
+     allTrue are no candidates) became `localActive = newActive`, a Boolean
+     loop that stayed set by a transition whose firing the same event took
+     back (ExecutionPaths: step2 never became active). The event iteration
+     evaluates a lifted cluster at every pass of every event, so one needs
+     no relation of its own: its condition `change(pre(n)) or ...` names the
+     values it follows (_buildChangeOfPreCondition). =#
+  local held = isempty(rels) ? _preReadCrefs(body) : DAE.Exp[]
+  if isempty(rels) && isempty(held)
     for n in cluster; push!(out, candByName[n].eq); end
     return
   end
   local bareInitial = DAE.CALL(Absyn.IDENT("initial"), MetaModelica.list(), DAE.callAttrBuiltinBool)
-  local changeCond = _buildChangeOrConditionFromExps(rels)
+  local changeCond = isempty(rels) ? _buildChangeOfPreCondition(held) : _buildChangeOrConditionFromExps(rels)
   local src0 = body[1][3]
   #= INITIAL body: pre(member) ≡ member.start (no held value exists yet), and
      pre(n) that the initial equations fix. The runtime body keeps pre() — it

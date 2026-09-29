@@ -2598,7 +2598,8 @@ function _collectChangeRelations!(rels::Vector{DAE.Exp}, @nospecialize(e), simCo
         local rel = _condVarRelation(string(inner.componentRef), simCode)
         rel === nothing ? false : (push!(rels, rel); true)
       else
-        false
+        #= A lifted cluster without relations: no crossing to add. =#
+        _isChangeOfPre(e)
       end
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) =>
@@ -2607,11 +2608,28 @@ function _collectChangeRelations!(rels::Vector{DAE.Exp}, @nospecialize(e), simCo
   end
 end
 
+#= `change(pre(v))`: a term of the condition of a cluster the lifter made
+   without relations (BDAECreate._buildChangeOfPreCondition); invalid in
+   Modelica, so no user when has it. =#
+_isChangeOfPre(@nospecialize(e))::Bool =
+  e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "change" && _isPreRead(listHead(e.expLst))
+
+#= pre(v), also behind the sign a negated alias substitution puts in front. =#
+Base.@nospecializeinfer function _isPreRead(@nospecialize(a))::Bool
+  @match a begin
+    DAE.CALL(Absyn.IDENT("pre"), _, _) => true
+    DAE.UNARY(_, x) || DAE.LUNARY(_, x) => _isPreRead(x)
+    _ => false
+  end
+end
+
+#= The relations of a lifted when's condition (empty for a cluster without
+   relations, which only the event iteration evaluates), or nothing. =#
 function _extractChangeRelations(@nospecialize(cond), simCode)
   local dcond = cond isa SimulationCode.Exp ? SimulationCode.toDAEExp(cond) : cond
   local rels = DAE.Exp[]
   local ok = _collectChangeRelations!(rels, dcond, simCode)
-  return (ok && !isempty(rels)) ? rels : nothing
+  return ok ? rels : nothing
 end
 
 #= True when the when condition marks a synthesized (lifter) when: a literal
@@ -2841,7 +2859,9 @@ end
 function _modelHasTableClusters(simCode)::Bool
   local hasCluster = false
   for weq in simCode.whenEquations
-    if _extractChangeRelations(weq.whenEquation.condition, simCode) !== nothing
+    #= A cluster without relations (it follows pre() values) closes no loop through a table. =#
+    local rels = _extractChangeRelations(weq.whenEquation.condition, simCode)
+    if rels !== nothing && !isempty(rels)
       hasCluster = true
       break
     end
@@ -3255,7 +3275,7 @@ end
 function _isSynthesizedChangeCondition(@nospecialize(cond))::Bool
   local d = cond isa SimulationCode.Exp ? SimulationCode.toDAEExp(cond) : cond
   @match d begin
-    DAE.CALL(Absyn.IDENT("change"), args, _) => listHead(args) isa DAE.RELATION
+    DAE.CALL(Absyn.IDENT("change"), args, _) => listHead(args) isa DAE.RELATION || _isChangeOfPre(d)
     DAE.LBINARY(e1, DAE.OR(__), e2) => _isSynthesizedChangeCondition(e1) && _isSynthesizedChangeCondition(e2)
     _ => false
   end
@@ -3442,7 +3462,15 @@ end
    that must agree (emitDiscreteClusters, the MTK events, LIFTED_DISCRETES). =#
 _usesDiscreteClusters(simCode)::Bool =
   _discreteClustersForced() || _modelHasTableClusters(simCode) || _modelHasModeFSMClusters(simCode) ||
-  _modelHasSwitchClusters(simCode)
+  _modelHasSwitchClusters(simCode) || _modelHasRelationlessClusters(simCode)
+
+#= True if a lifted cluster has no relation (it follows pre() values): only
+   the event iteration evaluates it, the MTK events have no crossing for it. =#
+_modelHasRelationlessClusters(simCode)::Bool =
+  any(simCode.whenEquations) do w
+    local rels = _extractChangeRelations(w.whenEquation.condition, simCode)
+    rels !== nothing && isempty(rels)
+  end
 
 #= True if a lifted cluster closes an algebraic loop through its own
    equations, as the MSL's ideal diodes and thyristors: one of its relations
