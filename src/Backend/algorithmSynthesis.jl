@@ -1,0 +1,1167 @@
+#= BDAECreate: residuals, when-equations, asserts and initial whens synthesized from
+   algorithm sections, with the scalarization of their assignments, and the lifting of
+   statement-level whens. =#
+
+"""
+    synthesizeFromInitialAlgorithms(iAlgorithms) -> Vector{BDAE.Equation}
+
+Lift each `initial algorithm` body into a `BDAE.INITIAL_WHEN_EQUATION` with a
+synthetic `initial()` condition. The downstream pipeline already routes any
+INITIAL_WHEN_EQUATION whose condition is `initial()` through `INITIAL_ALGORITHM`
+and the `__runInitialAlgorithm!()` codegen path, so this just funnels the
+otherwise-orphaned `initial algorithm` blocks into that same path.
+"""
+function synthesizeFromInitialAlgorithms(iAlgorithms)::Vector{BDAE.Equation}
+  local out = BDAE.Equation[]
+  for alg in iAlgorithms
+    local daeStmts = OMFrontend.Frontend.convertStatements(alg.statements)
+    local whenOps = _daeStmtsToWhenOps(daeStmts)
+    isempty(whenOps) && continue
+    local initialCall = DAE.CALL(Absyn.IDENT("initial"),
+                                 MetaModelica.list(),
+                                 DAE.callAttrBuiltinBool)
+    local node = BDAE.INITIAL_WHEN_EQUATION(
+      length(alg.statements),
+      BDAE.WHEN_STMTS(initialCall, whenOps, NONE()),
+      alg.source,
+      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
+    )
+    _INIT_ALG_DAE_STMTS[node] = collect(daeStmts)
+    push!(out, node)
+  end
+  return out
+end
+
+"""
+    synthesizeInitialWhenFromAlgorithms(algorithms) -> Vector{BDAE.Equation}
+
+Scan flat-model algorithm sections for `algorithm when initial() then ... end when`
+statements and lift each into a `BDAE.INITIAL_WHEN_EQUATION`. Bodies are translated
+via OMFrontend's existing Statement → DAE.Statement conversion, then mapped to
+BDAE.WhenOperator entries. Compound conditions (e.g. `when (initial() or c)`) are
+intentionally skipped per Modelica spec §8/§11.
+"""
+Base.@nospecializeinfer function _pushExpCrefStrings!(names::OrderedSet{String}, @nospecialize(exp))
+  exp === nothing && return
+  local crefs = Util.getAllCrefs(exp)
+  for c in crefs
+    push!(names, string(c))
+  end
+  return nothing
+end
+
+#= Collect every CREF name appearing anywhere (LHS or RHS) inside a list of
+   BDAE equations. Used as the "already constrained" set for the
+   algorithm-residual lifter, so we do not introduce a competing residual for
+   a variable that a connect-style or normal equation already binds. =#
+#= The names the equations constrain, for the algorithm residual lifter's guard. An alias `a = b`
+   between two variables (a connect) defines neither and is left out: an algorithm's lhs is defined by
+   the algorithm alone, and a connected lhs was never lifted (the MSL Digital Set source `y := x`,
+   connected to a flip-flop's inputs, left them at 0, an invalid logic value). =#
+function _collectAllCrefsInEquations(equations)::OrderedSet{String}
+  local names = OrderedSet{String}()
+  for eq in equations
+    if eq isa BDAE.EQUATION
+      (eq.lhs isa DAE.CREF && eq.rhs isa DAE.CREF) && continue
+      _pushExpCrefStrings!(names, eq.lhs); _pushExpCrefStrings!(names, eq.rhs)
+    elseif eq isa BDAE.RESIDUAL_EQUATION
+      _pushExpCrefStrings!(names, eq.exp)
+    elseif eq isa BDAE.ARRAY_EQUATION
+      _pushExpCrefStrings!(names, eq.left); _pushExpCrefStrings!(names, eq.right)
+    elseif eq isa BDAE.COMPLEX_EQUATION
+      _pushExpCrefStrings!(names, eq.left); _pushExpCrefStrings!(names, eq.right)
+    elseif eq isa BDAE.SOLVED_EQUATION
+      push!(names, string(eq.componentRef))
+      _pushExpCrefStrings!(names, eq.exp)
+    end
+  end
+  return names
+end
+
+#= Walk a list of `DAE.Statement` (already converted from the frontend) and
+   collect a `BDAE.RESIDUAL_EQUATION` for every scalar assignment whose LHS
+   is not already constrained by an equation. ALG_WHEN bodies (already
+   handled by `synthesizeInitialWhenFromAlgorithms`) and unsupported
+   compound forms (FOR / IF / WHILE) are skipped — they can be lowered later
+   if needed. =#
+#= True if a DAE.Type is a Modelica discrete-time type (Boolean / Integer /
+   enumeration, or arrays thereof). Algorithm sections whose LHS is a
+   continuous Real variable have order-sensitive semantics that the simple
+   residual lifter cannot represent; restricting the lift to discrete LHSes
+   keeps the fix narrow to the cluster-A class of bugs (INV3S / Digital
+   gates / Thyristor `fire` etc.) without risking continuous-state models. =#
+Base.@nospecializeinfer function _isDiscreteDAEType(@nospecialize(ty))::Bool
+  ty isa DAE.T_INTEGER || ty isa DAE.T_BOOL || ty isa DAE.T_ENUMERATION ||
+    (ty isa DAE.T_ARRAY && _isDiscreteDAEType(ty.ty))
+end
+
+#= True only for continuous Real types — used as a NEGATIVE filter in the
+   `change(...)` trigger synthesis. Unknown / complex types fall through to
+   "not continuous" so we err on the side of generating a `change()` call
+   (over-triggering on a connector read is harmless if the underlying
+   value is discrete, which is the cluster-A case). =#
+Base.@nospecializeinfer function _isContinuousRealType(@nospecialize(ty))::Bool
+  ty isa DAE.T_REAL || (ty isa DAE.T_ARRAY && _isContinuousRealType(ty.ty))
+end
+
+#= Collect the cref-string names of every `flatModel.variables` entry whose
+   variability classification puts it in the parameter / constant family
+   (CONSTANT, STRUCTURAL_PARAMETER, PARAMETER, NON_STRUCTURAL_PARAMETER).
+   These names are forwarded to the WHEN lifter so that `change(<param>)`
+   triggers are dropped from the synthesized condition; without this the
+   lifted condition stays as `initial() OR change(<param>)` and the
+   downstream pipeline cannot recognise the equivalent `INITIAL_WHEN`
+   shape, which makes the lifted equation a runtime DiscreteCallback that
+   races with sibling data-flow callbacks at t=0. =#
+#= Walk the already-converted `Vector{BDAE.VAR}` and collect cref-string
+   names of every entry whose `varKind` is `PARAM` or `CONST`. Iterating
+   the materialized BDAE vector avoids touching the lazier frontend list
+   that triggered a multi-minute stall on first call. =#
+function _collectParamOrConstNames(variables::Vector{BDAE.VAR},
+                                   varNames::Vector{String} = String[string(v.varName) for v in variables])::OrderedSet{String}
+  local names = OrderedSet{String}()
+  sizehint!(names, 2 * length(variables))
+  for (i, var) in enumerate(variables)
+    local k = var.varKind
+    if k isa BDAE.PARAM || k isa BDAE.CONST
+      local s = varNames[i]
+      push!(names, s)
+      local u = replace(s, "." => "_")
+      u === s || push!(names, u)
+    end
+  end
+  return names
+end
+
+#= Walk to the innermost CREF_IDENT and append `sub` to its subscript list.
+   Used when scalarising an array LHS assignment — turns `comp.yy` into
+   `comp.yy[k]` for each k while preserving the qualifier chain. =#
+Base.@nospecializeinfer function _appendSubscriptToInnermost(@nospecialize(cref), @nospecialize(sub))
+  @match cref begin
+    DAE.CREF_IDENT(ident, ty, subs) => begin
+      DAE.CREF_IDENT(ident, ty, listAppend(subs, MetaModelica.list(sub)))
+    end
+    DAE.CREF_QUAL(ident, ty, subs, inner) => begin
+      DAE.CREF_QUAL(ident, ty, subs, _appendSubscriptToInnermost(inner, sub))
+    end
+    _ => cref
+  end
+end
+
+Base.@nospecializeinfer function _collectAssignResidualsFromDAEStmts!(out::Vector{BDAE.Equation},
+                                              @nospecialize(daeStmts),
+                                              @nospecialize(source),
+                                              eqLhsBoundCrefs::OrderedSet{String},
+                                              whenLifterSkipLhs::OrderedSet{String} = OrderedSet{String}())
+  for s in daeStmts
+    @match s begin
+      DAE.STMT_ASSIGN(ty, lhs, rhs, src) => begin
+        _isDiscreteDAEType(ty) || continue
+        if lhs isa DAE.CREF
+          local crStr = string(lhs.componentRef)
+          (crStr in eqLhsBoundCrefs) && continue
+          (crStr in whenLifterSkipLhs) && continue
+        end
+        push!(out, BDAE.RESIDUAL_EQUATION(
+          DAE.BINARY(lhs, DAE.SUB(DAE.T_REAL_DEFAULT), rhs),
+          src,
+          BDAE.EQ_ATTR_DEFAULT_DYNAMIC,
+        ))
+      end
+      DAE.STMT_ASSIGN_ARR(ty, lhs, rhs, src) => begin
+        _isDiscreteDAEType(ty) || continue
+        if lhs isa DAE.CREF
+          local crStr = string(lhs.componentRef)
+          (crStr in whenLifterSkipLhs) && continue
+        end
+        #= Scalarise the array assignment to per-element residuals so
+           the codegen emits constraints on the scalarised simvars
+           (`<comp>.yy[1]`, `<comp>.yy[2]`, …) rather than a bare-array
+           residual on the undeclared base symbol. The per-element
+           residual `<lhs>[k] - <rhs>[k] = 0` is built by attaching a
+           DAE.INDEX subscript to the innermost CREF_IDENT of the LHS
+           and using DAE.ASUB to index the RHS expression. =#
+        local _arrLen::Int = 0
+        @match ty begin
+          DAE.T_ARRAY(_, _dims) => begin
+            local _dVec = BDAEUtil.DAE_DimensionToIntVector(_dims)
+            _arrLen = isempty(_dVec) ? 0 : _dVec[1]
+          end
+          _ => begin _arrLen = 0 end
+        end
+        if !(lhs isa DAE.CREF) || _arrLen <= 0
+          #= Unknown shape — collision-guard against element-bound LHSes,
+             else fall back to the bare-array residual. =#
+          if lhs isa DAE.CREF
+            local crStr2 = string(lhs.componentRef)
+            (crStr2 in eqLhsBoundCrefs) && continue
+            local _be = false
+            for _bn in eqLhsBoundCrefs
+              if startswith(_bn, crStr2 * "[")
+                _be = true; break
+              end
+            end
+            _be && continue
+          end
+          push!(out, BDAE.RESIDUAL_EQUATION(
+            DAE.BINARY(lhs, DAE.SUB(DAE.T_REAL_DEFAULT), rhs),
+            src,
+            BDAE.EQ_ATTR_DEFAULT_DYNAMIC,
+          ))
+        else
+          local _baseCref = lhs.componentRef
+          local _elemTy = @match ty begin
+            DAE.T_ARRAY(et, _) => et
+            _ => ty
+          end
+          for _k in 1:_arrLen
+            local _idxSub = DAE.INDEX(DAE.ICONST(_k))
+            local _newCref = _appendSubscriptToInnermost(_baseCref, _idxSub)
+            local _lhsK::DAE.Exp = DAE.CREF(_newCref, _elemTy)
+            local _rhsK::DAE.Exp = DAE.ASUB(rhs, MetaModelica.list(DAE.INDEX(DAE.ICONST(_k))))
+            #= Per-element collision: skip if this scalar element is
+               already bound by another equation. =#
+            local _lhsKStr = string(_newCref)
+            if _lhsKStr in eqLhsBoundCrefs || _lhsKStr in whenLifterSkipLhs
+              continue
+            end
+            push!(out, BDAE.RESIDUAL_EQUATION(
+              DAE.BINARY(_lhsK, DAE.SUB(DAE.T_REAL_DEFAULT), _rhsK),
+              src,
+              BDAE.EQ_ATTR_DEFAULT_DYNAMIC,
+            ))
+          end
+        end
+      end
+      _ => nothing
+    end
+  end
+end
+
+"""
+    synthesizeResidualsFromRegularAlgorithms(algorithms, eqLhsBoundCrefs) -> Vector{BDAE.Equation}
+
+Lift each non-when, non-initial `algorithm` section into a list of
+`BDAE.RESIDUAL_EQUATION`s, one per `STMT_ASSIGN`/`STMT_ASSIGN_ARR`. Statements
+wrapped inside `ALG_WHEN` (including the `algorithm when initial()` shape)
+are skipped because `synthesizeInitialWhenFromAlgorithms` already handles
+those bodies via the WhenEquation path. An assignment is also skipped when
+the LHS cref already appears in another equation (e.g. driven by a
+`connect(...)`), to avoid introducing a competing residual that would
+over-determine the system.
+"""
+Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospecialize(algorithms),
+                                                  eqLhsBoundCrefs::OrderedSet{String} = OrderedSet{String}(),
+                                                  whenLifterSkipLhs::OrderedSet{String} = OrderedSet{String}())::Vector{BDAE.Equation}
+  local out = BDAE.Equation[]
+  for alg in algorithms
+    #= Skip whole algorithm if every top-level statement is ALG_WHEN — those are
+       already lifted to (INITIAL_)WHEN_EQUATION by the companion synth pass. =#
+    local hasNonWhen = false
+    for stmt in alg.statements
+      if !isvariant(stmt, OMFrontend.Frontend.ALG_WHEN)
+        hasNonWhen = true
+        break
+      end
+    end
+    hasNonWhen || continue
+    local daeStmts = try
+      OMFrontend.Frontend.convertStatements(alg.statements)
+    catch
+      continue
+    end
+    #= Conservative narrowing: only lift single-statement algorithm bodies.
+       Multi-statement algorithms (Modelica.Mechanics.Rotational.Examples.OneWayClutch
+       and most Modelica.Electrical.Digital gates) have order-sensitive
+       semantics that a flat residual list does not preserve, and lifting
+       them as independent residuals over-determines or imbalances MTK's
+       reduced system. Bodies with one assignment (the reproducer
+       `Models/AlgorithmDiscreteAssign.mo` shape) are safe. =#
+    local stmtCount = 0
+    for s in daeStmts
+      (s isa DAE.STMT_ASSIGN || s isa DAE.STMT_ASSIGN_ARR) || continue
+      stmtCount += 1
+    end
+    stmtCount == 1 || continue
+    _collectAssignResidualsFromDAEStmts!(out, daeStmts, alg.source, eqLhsBoundCrefs, whenLifterSkipLhs)
+  end
+  return out
+end
+
+#= Best-effort: extract the type carried by a `DAE.ComponentRef`. Each
+   CREF_IDENT / CREF_QUAL stores its identType; CREF_ITER and WILD are not
+   useful triggers. =#
+Base.@nospecializeinfer function _crefType(@nospecialize(cref))
+  @match cref begin
+    DAE.CREF_IDENT(_, ty, subs) => _typeAfterSubscripts(ty, subs)
+    DAE.CREF_QUAL(_, _, _, cr) => _crefType(cr)
+    _ => nothing
+  end
+end
+
+Base.@nospecializeinfer function _typeAfterSubscripts(@nospecialize(ty), @nospecialize(subs))
+  local out = ty
+  for sub in subs
+    if sub isa DAE.INDEX
+      out = _dropLeadingArrayDim(out)
+    end
+  end
+  return out
+end
+
+Base.@nospecializeinfer function _dropLeadingArrayDim(@nospecialize(ty))
+  if ty isa DAE.T_ARRAY
+    local dims = collect(ty.dims)
+    if length(dims) <= 1
+      return ty.ty
+    end
+    return DAE.T_ARRAY(ty.ty, MetaModelica.list(dims[2:end]...))
+  end
+  return ty
+end
+
+Base.@nospecializeinfer function _isSingleStraightDiscreteAssign(@nospecialize(daeStmts))::Bool
+  local n = 0
+  for s in daeStmts
+    @match s begin
+      DAE.STMT_ASSIGN(ty, _, _, _) => begin
+        _isDiscreteDAEType(ty) || return false
+        n += 1
+      end
+      DAE.STMT_ASSIGN_ARR(ty, _, _, _) => begin
+        _isDiscreteDAEType(ty) || return false
+        n += 1
+      end
+      _ => return false
+    end
+  end
+  return n == 1
+end
+
+"""
+    synthesizeWhenEquationsFromRegularAlgorithms(algorithms) -> Vector{BDAE.Equation}
+
+For each regular (non-when, non-initial) `algorithm` section whose top-level
+assignments all target discrete-time LHSes (Integer / Boolean / enumeration),
+synthesize a `BDAE.WHEN_EQUATION` with condition
+`initial() or change(rhs1) or change(rhs2) ...` whose body is the algorithm
+statements lowered via `_daeStmtsToWhenOps`. The RHS CREF list is
+deduplicated and filtered to discrete-typed crefs (continuous Real RHS
+references would over-trigger). The `time` cref is also filtered out — its
+"change" is the integrator stepping forward, not a discrete event.
+
+This is the Modelica-spec-correct lowering of Logic-enum algorithms like
+INV3S's `nextstate := Buf3sTable[...]; yy := nextstate;` and resolves the
+INV3S/MUX2x1/NRXFER/NXFER/BUF3S cluster-A validate failures.
+"""
+function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
+                                                      paramOrConstNames::OrderedSet{String} = OrderedSet{String}())
+  local out = BDAE.Equation[]
+  local liftedLhsNames = OrderedSet{String}()
+  for alg in algorithms
+    local statements = alg.statements
+    isempty(statements) && continue
+    #= Skip whole algorithm if every top-level statement is ALG_WHEN — those are
+       already lifted to (INITIAL_)WHEN_EQUATION by the companion synth pass. =#
+    local hasNonWhen = false
+    for stmt in statements
+      if !isvariant(stmt, OMFrontend.Frontend.ALG_WHEN)
+        hasNonWhen = true
+        break
+      end
+    end
+    hasNonWhen || continue
+    local daeStmts = try
+      OMFrontend.Frontend.convertStatements(statements)
+    catch
+      continue
+    end
+    #= Sources.Table / Step / Pulse / Clock have an unrolled body of the shape
+         y := y0;                              (single ALG_ASSIGNMENT)
+         if time >= t[1] then y := x[1]; end if;  (ALG_IF { ALG_ASSIGNMENT })
+         if time >= t[2] then y := x[2]; end if;
+         ...
+       Each ALG_IF is semantically a `when cond then body end when` — a
+       discrete callback that updates `y` when its condition crosses to
+       true. Lift each top-level ALG_IF{single ALG_ASSIGNMENT} into its own
+       BDAE.WHEN_EQUATION so MSL Digital / Analog sources emit step-hold
+       outputs at runtime. =#
+    local ifLifted = false
+    for s in daeStmts
+      _liftAlgIfToWhen!(out, s, alg.source) && (ifLifted = true)
+    end
+    #= Build ONE unified INITIAL_WHEN_EQUATION whose body is the entire
+       algorithm sequence rewritten so that each STMT_IF becomes
+       `lhs := IFEXP(cond, then-expr, lhs)`. At init time the algorithm
+       runs in source order: bare assignments fire unconditionally, and
+       conditional assignments fire iff their guard already holds at t=0.
+       This is what Modelica spec requires for `algorithm y := y0; if
+       time >= t[1] then y := x[1]; end if;` when t[1] is ≤ startTime
+       — the time-trigger boundary case that a runtime ContinuousCallback
+       cannot catch via root-finding alone. The per-STMT_IF WHEN_EQUATIONs
+       emitted above continue to handle real time-event crossings later
+       in the simulation. =#
+    if !_isSingleStraightDiscreteAssign(daeStmts)
+      _liftAlgorithmBodyToInitialWhen!(out, daeStmts, alg.source, liftedLhsNames, paramOrConstNames)
+    end
+    #= A mixed algorithm body may also contain an explicit `when/elsewhen`
+       statement (e.g. MSL InertialDelaySensitive's scheduling block). The
+       body lifter above skips STMT_WHEN; lift each into a real WHEN_EQUATION
+       so its LHS (t_next, y_auxiliary, ...) are actually assigned. =#
+    for s in daeStmts
+      if s isa DAE.STMT_WHEN
+        _liftStmtWhenToWhenEquations!(out, s, liftedLhsNames)
+      end
+    end
+    #= Per-statement lifting via `_liftAlgAssignToInitialWhen!` and
+       `_liftAlgIfToWhen!` covers every shape the cluster-A Digital examples
+       need. The legacy single-block lifter (which combined all
+       STMT_ASSIGNs into one when whose condition was the union of all RHS
+       changes) is intentionally removed because it produced a duplicate of
+       what the per-statement passes already emit. =#
+  end
+  return (out, liftedLhsNames)
+end
+
+#= The top-level asserts of regular algorithm sections, as assert equations:
+   checked at run time like those of equation sections. The lifters above
+   turn the assignments into equations and leave the asserts out. =#
+function synthesizeAssertsFromRegularAlgorithms(algorithms)::Vector{BDAE.Equation}
+  local out = BDAE.Equation[]
+  for alg in algorithms
+    isempty(alg.statements) && continue
+    local daeStmts = try
+      OMFrontend.Frontend.convertStatements(alg.statements)
+    catch
+      continue
+    end
+    for s in daeStmts
+      s isa DAE.STMT_ASSERT && push!(out, BDAE.ASSERT_EQUATION(s.cond, s.msg, s.level, s.source))
+    end
+  end
+  return out
+end
+
+Base.@nospecializeinfer function _isTimeCref(@nospecialize(cref))::Bool
+  @match cref begin
+    DAE.CREF_IDENT("time", _, _) => true
+    _ => false
+  end
+end
+
+Base.@nospecializeinfer function _arrayDimsFromType(@nospecialize(ty))::Vector{Int}
+  if ty isa DAE.T_ARRAY
+    return BDAEUtil.DAE_DimensionToIntVector(ty.dims)
+  end
+  return Int[]
+end
+
+Base.@nospecializeinfer function _rawArrayDims(@nospecialize(ty))::Vector{Any}
+  if ty isa DAE.T_ARRAY
+    return Any[d for d in ty.dims]
+  end
+  return Any[]
+end
+
+Base.@nospecializeinfer function _suffixEnumPath(@nospecialize(p), name::String)
+  @match p begin
+    Absyn.IDENT(n) => Absyn.QUALIFIED(n, Absyn.IDENT(name))
+    Absyn.QUALIFIED(n, rest) => Absyn.QUALIFIED(n, _suffixEnumPath(rest, name))
+    Absyn.FULLYQUALIFIED(rest) => Absyn.FULLYQUALIFIED(_suffixEnumPath(rest, name))
+  end
+end
+
+#= Subscript expression for the k-th element along a dimension. Enumeration
+   dimensions must use the enum literal, not the plain integer: the scalarized
+   declaration names carry enum-literal subscripts, and a numerically spelled
+   element name strands the lookup at codegen time. =#
+Base.@nospecializeinfer function _dimIndexExp(@nospecialize(dim), k::Int)
+  @match dim begin
+    DAE.DIM_ENUM(__) => begin
+      local lits = collect(dim.literals)
+      (1 <= k <= length(lits)) ?
+        DAE.ENUM_LITERAL(_suffixEnumPath(dim.enumTypeName, lits[k]), k) :
+        DAE.ICONST(k)
+    end
+    _ => DAE.ICONST(k)
+  end
+end
+
+Base.@nospecializeinfer function _arrayElementType(@nospecialize(ty))
+  local out = ty
+  while out isa DAE.T_ARRAY
+    out = out.ty
+  end
+  return out
+end
+
+Base.@nospecializeinfer function _innermostType(@nospecialize(cref))
+  @match cref begin
+    DAE.CREF_IDENT(_, ty, _) => ty
+    DAE.CREF_QUAL(_, _, _, cr) => _innermostType(cr)
+    _ => DAE.T_UNKNOWN_DEFAULT
+  end
+end
+
+Base.@nospecializeinfer function _innermostSubscripts(@nospecialize(cref))::Vector{DAE.Subscript}
+  @match cref begin
+    DAE.CREF_IDENT(_, _, subs) => collect(subs)
+    DAE.CREF_QUAL(_, _, _, cr) => _innermostSubscripts(cr)
+    _ => DAE.Subscript[]
+  end
+end
+
+Base.@nospecializeinfer function _replaceInnermostSubscripts(@nospecialize(cref),
+                                                             subs::Vector)
+  @match cref begin
+    DAE.CREF_IDENT(ident, ty, _) => DAE.CREF_IDENT(ident, ty, MetaModelica.list(subs...))
+    DAE.CREF_QUAL(ident, ty, qsubs, cr) =>
+      DAE.CREF_QUAL(ident, ty, qsubs, _replaceInnermostSubscripts(cr, subs))
+    _ => cref
+  end
+end
+
+#= Integer index values as DAE.INDEX subscripts (DAE.ASUB.sub is List{Subscript}). =#
+Base.@nospecializeinfer function _iconstIndexSubList(vals::Vector{Int})
+  local subs = DAE.Subscript[DAE.INDEX(DAE.ICONST(v)) for v in vals]
+  return MetaModelica.list(subs...)
+end
+
+Base.@nospecializeinfer function _andCondition(@nospecialize(a), @nospecialize(b))
+  a === nothing && return b
+  b === nothing && return a
+  if a isa DAE.BCONST
+    return a.bool ? b : a
+  elseif b isa DAE.BCONST
+    return b.bool ? a : b
+  end
+  return DAE.LBINARY(a, DAE.AND(DAE.T_BOOL_DEFAULT), b)
+end
+
+Base.@nospecializeinfer function _notCondition(@nospecialize(cond))
+  if cond isa DAE.BCONST
+    return DAE.BCONST(!cond.bool)
+  end
+  return DAE.LUNARY(DAE.NOT(DAE.T_BOOL_DEFAULT), cond)
+end
+
+Base.@nospecializeinfer function _indexEqualsCondition(@nospecialize(exp), value::Int)
+  return DAE.RELATION(exp,
+                      DAE.EQUAL(DAE.T_INTEGER_DEFAULT),
+                      DAE.ICONST(value),
+                      -1,
+                      NONE())
+end
+
+Base.@nospecializeinfer function _replaceInitialCall(@nospecialize(exp), initialValue::Bool)
+  function repl(@nospecialize(e), arg)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("initial"), _, _) => (DAE.BCONST(arg), arg)
+      _ => (e, arg)
+    end
+  end
+  return first(Util.traverseExpBottomUp(exp, repl, initialValue))
+end
+
+Base.@nospecializeinfer function _substituteLoopIters(@nospecialize(exp),
+                                                      iterVals::Dict{String, Int})
+  isempty(iterVals) && return exp
+  function repl(@nospecialize(e), arg)
+    @match e begin
+      DAE.CREF(DAE.CREF_IDENT(id, _, _), _) where haskey(arg, id) =>
+        (DAE.ICONST(arg[id]), arg)
+      _ => (e, arg)
+    end
+  end
+  return first(Util.traverseExpBottomUp(exp, repl, iterVals))
+end
+
+Base.@nospecializeinfer function _prepareAlgorithmExp(@nospecialize(exp),
+                                                      iterVals::Dict{String, Int},
+                                                      initialValue::Bool)
+  return _replaceInitialCall(_substituteLoopIters(exp, iterVals), initialValue)
+end
+
+Base.@nospecializeinfer function _rangeIntValues(@nospecialize(range))
+  @match range begin
+    DAE.RANGE(_, DAE.ICONST(firstVal), stepOpt, DAE.ICONST(lastVal)) => begin
+      local stepVal = 1
+      @match stepOpt begin
+        SOME(DAE.ICONST(s)) => (stepVal = s)
+        NONE() => nothing
+        _ => return nothing
+      end
+      stepVal == 0 && return nothing
+      return collect(firstVal:stepVal:lastVal)
+    end
+    _ => return nothing
+  end
+end
+
+Base.@nospecializeinfer function _scalarLhsTargets(@nospecialize(lhs::DAE.CREF),
+                                                   @nospecialize(assignTy))
+  local cr = lhs.componentRef
+  local baseTy = _innermostType(cr)
+  local dims = _arrayDimsFromType(baseTy)
+  local _emptyTargets = Tuple{DAE.Exp, Union{Nothing, DAE.Exp}, Vector{Int}}[]
+  isempty(dims) && return [(lhs, nothing, Int[])]
+  local rawDims = _rawArrayDims(baseTy)
+
+  local subs = _innermostSubscripts(cr)
+  if isempty(subs)
+    subs = DAE.Subscript[DAE.WHOLEDIM() for _ in dims]
+  elseif length(subs) < length(dims)
+    append!(subs, DAE.Subscript[DAE.WHOLEDIM() for _ in 1:(length(dims) - length(subs))])
+  end
+  length(subs) == length(dims) || return _emptyTargets
+
+  local elemTy = _arrayElementType(baseTy)
+  local out = Tuple{DAE.Exp, Union{Nothing, DAE.Exp}, Vector{Int}}[]
+  function rec(pos::Int, newSubs::Vector{DAE.Subscript}, guard, rhsIdxs::Vector{Int})
+    if pos > length(dims)
+      local newCr = _replaceInnermostSubscripts(cr, newSubs)
+      push!(out, (DAE.CREF(newCr, elemTy), guard, copy(rhsIdxs)))
+      return
+    end
+    local sub = subs[pos]
+    if sub isa DAE.WHOLEDIM
+      for k in 1:dims[pos]
+        rec(pos + 1, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))],
+            guard, Int[rhsIdxs..., k])
+      end
+    elseif sub isa DAE.INDEX
+      local idx = sub.exp
+      if idx isa DAE.ICONST || idx isa DAE.ENUM_LITERAL
+        rec(pos + 1, DAE.Subscript[newSubs..., DAE.INDEX(idx)], guard, rhsIdxs)
+      else
+        for k in 1:dims[pos]
+          local g = _andCondition(guard, _indexEqualsCondition(idx, k))
+          rec(pos + 1, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g, rhsIdxs)
+        end
+      end
+    else
+      return
+    end
+  end
+  rec(1, DAE.Subscript[], nothing, Int[])
+  return out
+end
+
+Base.@nospecializeinfer function _scalarizeCrefRead(@nospecialize(cr),
+                                                    @nospecialize(expTy),
+                                                    rhsIdxs::Vector{Int},
+                                                    @nospecialize(fallback))
+  local baseTy = _innermostType(cr)
+  local dims = _arrayDimsFromType(baseTy)
+  if isempty(dims)
+    return DAE.CREF(cr, expTy)
+  end
+  local rawDims = _rawArrayDims(baseTy)
+  local subs = _innermostSubscripts(cr)
+  if isempty(subs)
+    subs = DAE.Subscript[DAE.WHOLEDIM() for _ in dims]
+  elseif length(subs) < length(dims)
+    append!(subs, DAE.Subscript[DAE.WHOLEDIM() for _ in 1:(length(dims) - length(subs))])
+  end
+  length(subs) == length(dims) || return fallback
+
+  local elemTy = _arrayElementType(baseTy)
+  local candidates = Tuple{Union{Nothing, DAE.Exp}, DAE.Exp}[]
+  function rec(pos::Int, rhsPos::Int, newSubs::Vector{DAE.Subscript}, guard)
+    if pos > length(dims)
+      local newCr = _replaceInnermostSubscripts(cr, newSubs)
+      push!(candidates, (guard, DAE.CREF(newCr, elemTy)))
+      return
+    end
+    local sub = subs[pos]
+    if sub isa DAE.WHOLEDIM
+      rhsPos <= length(rhsIdxs) || return
+      local k = rhsIdxs[rhsPos]
+      rec(pos + 1, rhsPos + 1, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))], guard)
+    elseif sub isa DAE.INDEX
+      local idx = sub.exp
+      if idx isa DAE.ICONST || idx isa DAE.ENUM_LITERAL
+        rec(pos + 1, rhsPos, DAE.Subscript[newSubs..., DAE.INDEX(idx)], guard)
+      else
+        for k in 1:dims[pos]
+          local g = _andCondition(guard, _indexEqualsCondition(idx, k))
+          rec(pos + 1, rhsPos, DAE.Subscript[newSubs..., DAE.INDEX(_dimIndexExp(rawDims[pos], k))], g)
+        end
+      end
+    else
+      return
+    end
+  end
+  rec(1, 1, DAE.Subscript[], nothing)
+  isempty(candidates) && return fallback
+
+  local result = fallback
+  for (guard, value) in reverse(candidates)
+    result = guard === nothing ? value : DAE.IFEXP(guard, value, result)
+  end
+  return result
+end
+
+Base.@nospecializeinfer function _scalarizeRhs(@nospecialize(rhs),
+                                               rhsIdxs::Vector{Int},
+                                               @nospecialize(fallback))
+  if rhs isa DAE.CREF
+    return _scalarizeCrefRead(rhs.componentRef, rhs.ty, rhsIdxs, fallback)
+  elseif isempty(rhsIdxs)
+    return rhs
+  else
+    return DAE.ASUB(rhs, _iconstIndexSubList(rhsIdxs))
+  end
+end
+
+Base.@nospecializeinfer function _emitAlgorithmAssignOps!(ops::Vector{BDAE.WhenOperator},
+                                                          liftedLhsNames::OrderedSet{String},
+                                                          @nospecialize(lhs),
+                                                          @nospecialize(rhs),
+                                                          @nospecialize(ty),
+                                                          @nospecialize(source),
+                                                          @nospecialize(activeCond),
+                                                          iterVals::Dict{String, Int},
+                                                          initialValue::Bool,
+                                                          allowContinuous::Bool = false)::Bool
+  (allowContinuous || _isDiscreteDAEType(ty)) || return true
+  lhs = _prepareAlgorithmExp(lhs, iterVals, initialValue)
+  rhs = _prepareAlgorithmExp(rhs, iterVals, initialValue)
+  lhs isa DAE.CREF || return false
+  local targets = _scalarLhsTargets(lhs, ty)
+  isempty(targets) && return false
+  for (lhsK, lhsGuard, rhsIdxs) in targets
+    lhsK isa DAE.CREF || continue
+    local cond = _andCondition(activeCond, lhsGuard)
+    if cond isa DAE.BCONST && !cond.bool
+      continue
+    end
+    local rhsK = _scalarizeRhs(rhs, rhsIdxs, lhsK)
+    local finalRhs = cond === nothing ? rhsK : DAE.IFEXP(cond, rhsK, lhsK)
+    push!(ops, BDAE.ASSIGN(lhsK, finalRhs, source))
+    push!(liftedLhsNames, string(lhsK.componentRef))
+  end
+  return true
+end
+
+Base.@nospecializeinfer function _appendElseAlgorithmOps!(ops::Vector{BDAE.WhenOperator},
+                                                          liftedLhsNames::OrderedSet{String},
+                                                          @nospecialize(elsePart),
+                                                          @nospecialize(activeCond),
+                                                          iterVals::Dict{String, Int},
+                                                          initialValue::Bool,
+                                                          allowContinuous::Bool = false)::Bool
+  if elsePart isa DAE.NOELSE
+    return true
+  elseif elsePart isa DAE.ELSE
+    return _appendAlgorithmStmtOps!(ops, liftedLhsNames, elsePart.statementLst,
+                                    activeCond, iterVals, initialValue, allowContinuous)
+  elseif elsePart isa DAE.ELSEIF
+    local cond = _prepareAlgorithmExp(elsePart.exp, iterVals, initialValue)
+    local branchCond = _andCondition(activeCond, cond)
+    _appendAlgorithmStmtOps!(ops, liftedLhsNames, elsePart.statementLst,
+                             branchCond, iterVals, initialValue, allowContinuous) || return false
+    local restCond = _andCondition(activeCond, _notCondition(cond))
+    return _appendElseAlgorithmOps!(ops, liftedLhsNames, elsePart.else_,
+                                    restCond, iterVals, initialValue, allowContinuous)
+  end
+  return true
+end
+
+Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenOperator},
+                                                          liftedLhsNames::OrderedSet{String},
+                                                          @nospecialize(stmts),
+                                                          @nospecialize(activeCond),
+                                                          iterVals::Dict{String, Int},
+                                                          initialValue::Bool,
+                                                          allowContinuous::Bool = false)::Bool
+  for s in stmts
+    @match s begin
+      DAE.STMT_ASSIGN(ty, lhs, rhs, src) => begin
+        _emitAlgorithmAssignOps!(ops, liftedLhsNames, lhs, rhs, ty, src,
+                                 activeCond, iterVals, initialValue, allowContinuous) || return false
+      end
+      DAE.STMT_ASSIGN_ARR(ty, lhs, rhs, src) => begin
+        _emitAlgorithmAssignOps!(ops, liftedLhsNames, lhs, rhs, ty, src,
+                                 activeCond, iterVals, initialValue, allowContinuous) || return false
+      end
+      DAE.STMT_IF(cond, body, elsePart, _) => begin
+        local c = _prepareAlgorithmExp(cond, iterVals, initialValue)
+        _appendAlgorithmStmtOps!(ops, liftedLhsNames, body, _andCondition(activeCond, c),
+                                 iterVals, initialValue, allowContinuous) || return false
+        _appendElseAlgorithmOps!(ops, liftedLhsNames, elsePart,
+                                 _andCondition(activeCond, _notCondition(c)),
+                                 iterVals, initialValue, allowContinuous) || return false
+      end
+      DAE.STMT_FOR(_, _, iter, _, range, body, _) => begin
+        local r = _prepareAlgorithmExp(range, iterVals, initialValue)
+        local vals = _rangeIntValues(r)
+        vals === nothing && return false
+        for v in vals
+          local nested = copy(iterVals)
+          nested[iter] = v
+          _appendAlgorithmStmtOps!(ops, liftedLhsNames, body, activeCond,
+                                   nested, initialValue, allowContinuous) || return false
+        end
+      end
+      DAE.STMT_WHEN(__) => nothing
+      DAE.STMT_ASSERT(__) => nothing
+      DAE.STMT_NORETCALL(__) => nothing
+      _ => nothing
+    end
+  end
+  return true
+end
+
+Base.@nospecializeinfer function _buildAlgorithmBodyOps(@nospecialize(daeStmts),
+                                                        initialValue::Bool,
+                                                        allowContinuous::Bool = false)
+  local ops = BDAE.WhenOperator[]
+  local lhsNames = OrderedSet{String}()
+  local ok = _appendAlgorithmStmtOps!(ops, lhsNames, daeStmts, nothing,
+                                      Dict{String, Int}(), initialValue, allowContinuous)
+  ok || return (BDAE.WhenOperator[], OrderedSet{String}())
+  return (ops, lhsNames)
+end
+
+Base.@nospecializeinfer function _collectDiscreteRhsCrefsFromWhenOps(ops::Vector{BDAE.WhenOperator},
+                                                                     assignedLhs::OrderedSet{String})
+  local out = DAE.ComponentRef[]
+  local seen = OrderedSet{String}()
+  local blocked = copy(assignedLhs)
+  local ctx = DiscreteRhsCrefVisitor(out, seen, blocked)
+  for op in ops
+    @match op begin
+      BDAE.ASSIGN(_, rhs, _) => Util.traverseExpTopDown(rhs, ctx, nothing)
+      BDAE.NORETCALL(exp, _) => Util.traverseExpTopDown(exp, ctx, nothing)
+      BDAE.ASSERT(c, m, l, _) => begin
+        Util.traverseExpTopDown(c, ctx, nothing)
+        Util.traverseExpTopDown(m, ctx, nothing)
+        Util.traverseExpTopDown(l, ctx, nothing)
+      end
+      _ => nothing
+    end
+  end
+  return out
+end
+
+#= Lift an entire (non-when, non-initial) algorithm body into a single
+   INITIAL_WHEN_EQUATION whose body executes the algorithm sequentially at
+   init time. Each top-level STMT_ASSIGN with a discrete LHS becomes a
+   BDAE.ASSIGN(lhs, rhs); each top-level STMT_IF with `{ STMT_ASSIGN(disc, e) }`
+   body becomes a BDAE.ASSIGN(lhs, IFEXP(cond, e, lhs)) so the if-check is
+   re-evaluated at init and the assignment is conditional. Compound
+   shapes (multi-stmt if-bodies, FOR, WHILE) and continuous-LHS assigns
+   are skipped. Records every LHS that contributed an ASSIGN op into
+   `liftedLhsNames` so the residual lifter does not also emit a competing
+   residual for the same variable. =#
+Base.@nospecializeinfer function _liftAlgorithmBodyToInitialWhen!(out::Vector{BDAE.Equation},
+                                                                  daeStmts,
+                                                                  @nospecialize(source),
+                                                                  liftedLhsNames::OrderedSet{String},
+                                                                  paramOrConstNames::OrderedSet{String} = OrderedSet{String}())
+  local initOps, initLhs = _buildAlgorithmBodyOps(daeStmts, true)
+  local runOps, runLhs = _buildAlgorithmBodyOps(daeStmts, false)
+  union!(liftedLhsNames, initLhs)
+  union!(liftedLhsNames, runLhs)
+  isempty(initOps) && isempty(runOps) && return
+  local initialCall = DAE.CALL(Absyn.IDENT("initial"),
+                               MetaModelica.list(),
+                               DAE.callAttrBuiltinBool)
+  if !isempty(initOps)
+    push!(out, BDAE.INITIAL_WHEN_EQUATION(
+      length(initOps),
+      BDAE.WHEN_STMTS(initialCall, MetaModelica.list(initOps...), NONE()),
+      source,
+      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
+    ))
+  end
+  #= Per Modelica spec §17.4.4: a non-when algorithm with discrete LHS fires
+     at any event that changes its RHS inputs. The INITIAL_WHEN above sets the
+     LHS at t=0; we also need a regular WHEN_EQUATION whose condition is
+     `change(d1) OR change(d2) ... ` over every discrete cref referenced
+     in the body, so the LHS keeps tracking those inputs as they flip during
+     simulation. Without this, AlgorithmDiscreteAssign's `out := trigger + 10`
+     would stay pinned at its t=0 value (out = 13) even after `trigger`
+     becomes 7 at t=0.5. =#
+  local discRhsCrefs = _collectDiscreteRhsCrefsFromWhenOps(runOps, runLhs)
+  #= Source-style bodies (Sources.Table/Step/Pulse) have the shape
+     `y := y0; y := IFEXP(time>=t[i], x[i], y)`. Their event sources are the
+     `time>=t[i]` RELATIONS in the IFEXP conditions, not the seed cref — so also
+     trigger on `change(rel)` for every body relation with a continuous operand.
+     Without this a body whose only discrete RHS cref is the constant seed (y0)
+     gets a dead `change(<param>)` trigger and never fires. =#
+  local relTriggers = DAE.Exp[]
+  local relSeen = OrderedSet{String}()
+  for op in runOps
+    @match op begin
+      BDAE.ASSIGN(_, rhs, _) => begin
+        for r in _collectRelationsInExp(rhs)
+          _relationHasContinuousOperand(r, paramOrConstNames) || continue
+          local k = string(r)
+          k in relSeen && continue
+          push!(relSeen, k)
+          push!(relTriggers, r)
+        end
+      end
+      _ => nothing
+    end
+  end
+  local changeCalls = DAE.Exp[]
+  for cr in discRhsCrefs
+    push!(changeCalls, _makeChangeCall(cr))
+  end
+  for r in relTriggers
+    push!(changeCalls, _makeChangeCallExp(r))
+  end
+  if !isempty(runOps) && !isempty(changeCalls)
+    local cond = changeCalls[1]
+    for i in 2:length(changeCalls)
+      cond = DAE.LBINARY(cond, DAE.OR(DAE.T_BOOL_DEFAULT), changeCalls[i])
+    end
+    push!(out, BDAE.WHEN_EQUATION(
+      length(runOps),
+      BDAE.WHEN_STMTS(cond, MetaModelica.list(runOps...), NONE()),
+      source,
+      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
+    ))
+  end
+  return
+end
+
+#= Logical OR of two condition expressions with BCONST simplification, the
+   disjunctive analogue of `_andCondition`. =#
+Base.@nospecializeinfer function _orCondition(@nospecialize(a), @nospecialize(b))
+  a === nothing && return b
+  b === nothing && return a
+  if a isa DAE.BCONST
+    return a.bool ? a : b
+  elseif b isa DAE.BCONST
+    return b.bool ? b : a
+  end
+  return DAE.LBINARY(a, DAE.OR(DAE.T_BOOL_DEFAULT), b)
+end
+
+#= A `when {c1, c2, ...}` array condition means "fire when any member becomes
+   true". Return the member expressions so they can be OR-folded; a scalar
+   condition is returned as a singleton. =#
+Base.@nospecializeinfer function _whenConditionMembers(@nospecialize(exp))
+  @match exp begin
+    DAE.ARRAY(_, _, arr) => collect(arr)
+    _ => Any[exp]
+  end
+end
+
+Base.@nospecializeinfer function _expMentionsInitial(@nospecialize(exp))::Bool
+  local found = false
+  function visit(@nospecialize(e), arg)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("initial"), _, _) => (found = true)
+      _ => nothing
+    end
+    return (e, arg)
+  end
+  Util.traverseExpBottomUp(exp, visit, nothing)
+  return found
+end
+
+#= Build a runtime `BDAE.WHEN_EQUATION` (with chained elsewhen) from a
+   `DAE.STMT_WHEN` that appears inside a regular (non-when) algorithm body.
+   Every assignment in each branch body is lifted (continuous and discrete
+   alike — inside a `when` all LHS are event-updated), `if` guards become
+   IFEXP-conditional assigns, and the array condition `{c1, c2}` is OR-folded
+   to a scalar. `initial()` is substituted to `false` for the runtime arm.
+   Assigned LHS names accumulate into `allLhs`. Returns the WHEN_EQUATION or
+   `nothing` if the branch contributes no operators. =#
+Base.@nospecializeinfer function _stmtWhenToBdaeWhenEquation(@nospecialize(stmtWhen),
+                                                             allLhs::OrderedSet{String})
+  local ops, lhs = _buildAlgorithmBodyOps(stmtWhen.statementLst, false, true)
+  union!(allLhs, lhs)
+  local cond = nothing
+  for e in _whenConditionMembers(stmtWhen.exp)
+    cond = _orCondition(cond, _prepareAlgorithmExp(e, Dict{String, Int}(), false))
+  end
+  cond === nothing && (cond = DAE.BCONST(true))
+  local elseOpt = NONE()
+  @match stmtWhen.elseWhen begin
+    SOME(esw) => begin
+      if esw isa DAE.STMT_WHEN
+        local eswEq = _stmtWhenToBdaeWhenEquation(esw, allLhs)
+        eswEq !== nothing && (elseOpt = SOME(eswEq))
+      end
+    end
+    _ => nothing
+  end
+  (isempty(ops) && elseOpt === NONE()) && return nothing
+  local whenStmts = BDAE.WHEN_STMTS(cond, MetaModelica.list(ops...), elseOpt)
+  return BDAE.WHEN_EQUATION(length(ops), whenStmts, stmtWhen.source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
+end
+
+#= Lift a top-level `DAE.STMT_WHEN` from a regular algorithm body into BDAE
+   equations: an INITIAL_WHEN_EQUATION (when the first branch carries
+   `initial()`, so the scheduling state is set at t=0) plus a runtime
+   WHEN_EQUATION with the elsewhen arm. Without this a mixed algorithm body
+   (a `when/elsewhen` followed by plain assignments) loses the `when` block
+   entirely, leaving its LHS frozen at the start value. =#
+Base.@nospecializeinfer function _liftStmtWhenToWhenEquations!(out::Vector{BDAE.Equation},
+                                                               @nospecialize(stmtWhen),
+                                                               liftedLhsNames::OrderedSet{String})::Bool
+  local allLhs = OrderedSet{String}()
+  if stmtWhen.initialCall || _expMentionsInitial(stmtWhen.exp)
+    local initOps, initLhs = _buildAlgorithmBodyOps(stmtWhen.statementLst, true, true)
+    union!(allLhs, initLhs)
+    if !isempty(initOps)
+      local initialCall = DAE.CALL(Absyn.IDENT("initial"),
+                                   MetaModelica.list(),
+                                   DAE.callAttrBuiltinBool)
+      push!(out, BDAE.INITIAL_WHEN_EQUATION(
+        length(initOps),
+        BDAE.WHEN_STMTS(initialCall, MetaModelica.list(initOps...), NONE()),
+        stmtWhen.source,
+        BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
+      ))
+    end
+  end
+  local weq = _stmtWhenToBdaeWhenEquation(stmtWhen, allLhs)
+  weq !== nothing && push!(out, weq)
+  union!(liftedLhsNames, allLhs)
+  return weq !== nothing
+end
+
+
+#= If `stmt` is a top-level `STMT_IF { cond, body = [STMT_ASSIGN(disc, expr)] }`
+   (no else branch needed for sources; the assignment is idempotent and
+   monotone-time conditions sustain), synthesise a
+   `BDAE.WHEN_EQUATION` triggered by `cond` whose body assigns the discrete
+   LHS to `expr`. Returns `true` when a lift fired so the caller can record
+   that this algorithm has been (partly) handled. =#
+Base.@nospecializeinfer function _liftAlgIfToWhen!(out::Vector{BDAE.Equation},
+                                                   @nospecialize(stmt), @nospecialize(source))::Bool
+  @match stmt begin
+    DAE.STMT_IF(cond, body, _, src) => begin
+      local bodyVec = listArray(body)
+      length(bodyVec) == 1 || return false
+      local b1 = bodyVec[1]
+      @match b1 begin
+        DAE.STMT_ASSIGN(ty, lhs, rhs, asrc) => begin
+          _isDiscreteDAEType(ty) || return false
+          lhs isa DAE.CREF || return false
+          local whenOps = MetaModelica.list(BDAE.ASSIGN(lhs, rhs, asrc))
+          push!(out, BDAE.WHEN_EQUATION(
+            1,
+            BDAE.WHEN_STMTS(cond, whenOps, NONE()),
+            source,
+            BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
+          ))
+          return true
+        end
+        _ => return false
+      end
+    end
+    _ => return false
+  end
+end
+
+#= Lift a bare `STMT_ASSIGN(disc_lhs, expr)` to a `BDAE.WHEN_EQUATION` whose
+   condition is `initial() or change(rhs_crefs)`. Returns `(lifted, lhsName)`
+   where `lhsName` is the LHS cref string when lifted. The condition mirrors
+   the multi-statement WHEN lifter so callers can rely on the same semantics
+   (Modelica §17.4.4: a non-when algorithm with discrete LHS fires at events
+   when any of its inputs change). =#
+Base.@nospecializeinfer function _liftAlgAssignToInitialWhen!(out::Vector{BDAE.Equation},
+                                                              @nospecialize(stmt),
+                                                              @nospecialize(source),
+                                                              paramOrConstNames::OrderedSet{String} = OrderedSet{String}())
+  @match stmt begin
+    DAE.STMT_ASSIGN(ty, lhs, rhs, asrc) => begin
+      _isDiscreteDAEType(ty) || return (false, nothing)
+      lhs isa DAE.CREF || return (false, nothing)
+      local bareInitial::DAE.Exp = DAE.CALL(Absyn.IDENT("initial"),
+                                            MetaModelica.list(),
+                                            DAE.callAttrBuiltinBool)
+      local changeCond::Union{DAE.Exp, Nothing} = nothing
+      local rhsCrefs = OrderedSet{Tuple{DAE.ComponentRef, DAE.Type}}()
+      for c in Util.getAllCrefs(rhs)
+        local cty = _crefType(c)
+        cty === nothing && continue
+        push!(rhsCrefs, (c, cty))
+      end
+      for (cr, cty) in rhsCrefs
+        _isContinuousRealType(cty) && continue
+        cty isa DAE.T_ARRAY && continue
+        _isTimeCref(cr) && continue
+        (string(cr) in paramOrConstNames) && continue
+        local changeCall = DAE.CALL(Absyn.IDENT("change"),
+                                    MetaModelica.list(DAE.CREF(cr, cty)),
+                                    DAE.callAttrBuiltinBool)
+        changeCond = if changeCond === nothing
+          changeCall
+        else
+          DAE.LBINARY(changeCond, DAE.OR(DAE.T_BOOL_DEFAULT), changeCall)
+        end
+      end
+      local whenOps = MetaModelica.list(BDAE.ASSIGN(lhs, rhs, asrc))
+      #= Always emit an INITIAL_WHEN_EQUATION so the assign fires through the
+         `__runInitialAlgorithm!` path at t=0. The synthesised `WHEN_EQUATION`
+         with `cond = initial()` would not work because `expToJuliaBoolMTK`
+         lowers `initial()` to `false` (the runtime DiscreteCallback never
+         runs during MTK's InitializationProblem). =#
+      push!(out, BDAE.INITIAL_WHEN_EQUATION(
+        1,
+        BDAE.WHEN_STMTS(bareInitial,
+                        MetaModelica.list(BDAE.ASSIGN(lhs, rhs, asrc)),
+                        NONE()),
+        source,
+        BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
+      ))
+      #= Plus a runtime WHEN_EQUATION for any change(rhs) trigger so the
+         assign re-fires whenever a non-parameter input changes. =#
+      if changeCond !== nothing
+        push!(out, BDAE.WHEN_EQUATION(
+          1,
+          BDAE.WHEN_STMTS(changeCond, whenOps, NONE()),
+          source,
+          BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
+        ))
+      end
+      local lhsName::Union{String, Nothing} = try
+        @match lhs begin
+          DAE.CREF(cr, _) => string(cr)
+          _ => nothing
+        end
+      catch
+        nothing
+      end
+      return (true, lhsName)
+    end
+    _ => return (false, nothing)
+  end
+end
+
+function synthesizeInitialWhenFromAlgorithms(algorithms)::Vector{BDAE.Equation}
+  local out = BDAE.Equation[]
+  for alg in algorithms
+    for stmt in alg.statements
+      isvariant(stmt, OMFrontend.Frontend.ALG_WHEN) || continue
+      isempty(stmt.branches) && continue
+      local (frontendCond, frontendBody) = stmt.branches[1]
+      local daeCond = OMFrontend.Frontend.toDAE(frontendCond)
+      @match daeCond begin
+        DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
+          local daeStmts = OMFrontend.Frontend.convertStatements(frontendBody)
+          local whenOps = _daeStmtsToWhenOps(daeStmts)
+          local node = BDAE.INITIAL_WHEN_EQUATION(
+            length(frontendBody),
+            BDAE.WHEN_STMTS(daeCond, whenOps, NONE()),
+            stmt.source,
+            BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
+          )
+          _INIT_ALG_DAE_STMTS[node] = collect(daeStmts)
+          push!(out, node)
+        end
+        _ => nothing
+      end
+    end
+  end
+  return out
+end
