@@ -365,8 +365,9 @@ end
    before lowering with the algorithmic (non-MTK) translator, so no Symbolics
    bindings are needed at init time.
 
-   ASSIGN / REINIT write their RHS into `LATEST_PROBLEM` via the
-   SymbolicIndexingInterface `prob[:name] = value` setter. The function runs
+   An ASSIGN to a parameter and a REINIT write `LATEST_PROBLEM`; an ASSIGN to
+   another variable is collected in `_hard`, which simulate turns into hard
+   start values of the unknowns (`remake(prob; u0 = …)`). The function runs
    after the ODEProblem is constructed (see `simulate(...)` in the generated
    module), so LATEST_PROBLEM is in scope. Without this, the LHS state stayed
    at its default (0) — e.g. `T_start := startTime + count*period` in the
@@ -384,6 +385,8 @@ function _initialDerivativeReads(ex)
   end
   return Expr(ex.head, map(_initialDerivativeReads, ex.args)...)
 end
+
+_callsDer(ex) = ex isa Expr && ((ex.head === :call && ex.args[1] === :der) || any(_callsDer, ex.args))
 
 #= The value of a `begin #= line =# x end` the algorithm lowering wraps
    expressions in. =#
@@ -433,12 +436,6 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
       return :( $(sym) = $(lowerAlg(wStmt.right)); LATEST_PROBLEM.ps[$(QuoteNode(sym))] = $(sym); nothing )
     else
       return :( $(sym) = $(lowerAlg(wStmt.right));
-         try
-           ModelingToolkit.SciMLBase.setu(LATEST_PROBLEM, $(QuoteNode(sym)))(LATEST_PROBLEM, $(sym))
-         catch _e
-           OMBackend._fallback(_e, :initialWhenSetu)
-           nothing
-         end;
          try
            _hard[getproperty(LATEST_REDUCED_SYSTEM, $(QuoteNode(sym)))] = $(sym)
          catch _e
@@ -540,13 +537,13 @@ scope. When `daeStatements` is empty (e.g. older callers that only provide a
 
 The body is wrapped in `let time = 0.0 ... end`. Non-LHS crefs read on the
 RHS get a pre-seeded `_alg_<name>` from the SimVar's `start` attribute or
+`0.0` (a parameter: its statically folded binding); every LHS starts at
 `0.0`. After the body, each LHS final value is captured into the returned
-`Dict{Symbol, Float64}` via a per-entry try/catch (so a still-undefined
-`_alg_<name>` from a body that errored partway just skips that entry).
+`Dict{Symbol, Float64}` (an entry that is not a number is skipped).
 
-The outer try/catch returns partial results on any error; the runtime
-`remake` path remains as a fallback for state-cref-RHS reads whose
-post-init value differs from the `start` attribute.
+A body that throws returns no results (a fallback); the runtime `remake`
+path remains for state-cref-RHS reads whose post-init value differs from
+the `start` attribute.
 """
 function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)::Expr
   local lhsNames = OrderedSet{String}()
@@ -554,17 +551,17 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
   for ia in _earlyInitialAlgorithms(simCode)
     _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
-  if isempty(lhsNames) && isempty(rhsNames)
-    return quote
-      function __runInitialAlgorithmEarly!()
-        return Dict{Symbol, Float64}()
-      end
+  local noEarlyPass = quote
+    function __runInitialAlgorithmEarly!()
+      return Dict{Symbol, Float64}()
     end
   end
+  isempty(lhsNames) && isempty(rhsNames) && return noEarlyPass
   local ht = simCode.stringToSimVarHT
   local renamedNames = union(lhsNames, rhsNames)
   push!(renamedNames, "time")
   local prefetches = Expr[]
+  local unfoldedParameter = false
   for name in setdiff(rhsNames, lhsNames)
     name == "time" && continue
     haskey(ht, name) || begin
@@ -579,7 +576,11 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
         _ => nothing
       end
       if paramLit === nothing
-        @warn "Generated nothing for $(name). $(name) was $(typeof(sv.varKind))"
+        #= No static value (an array parameter, a binding that does not
+           fold): no local, so a statement that reads it throws an
+           UndefVarError, which the body's catch expects (below). The
+           statements that do not read it still give their values. =#
+        unfoldedParameter = true
         continue
       end
       push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(paramLit)))
@@ -604,6 +605,15 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
       end
     end
   end
+  #= der() reads the problem, which the early pass runs before: a body that
+     reads a derivative (a relation on one, MSL FluxTubes) is not run early.
+     Running the other statements alone would turn the values after it into
+     wrong initialization constraints. The runtime pass
+     (`__runInitialAlgorithm!`, _initialDerivativeReads) runs the bodies of
+     `when initial()`; the `initial algorithm` sections it does not run
+     (_earlyInitialAlgorithms), so a derivative read in one has no effect,
+     as before (the early body threw there). =#
+  any(_callsDer, stmts) && return noEarlyPass
   local captures = Expr[]
   for name in lhsNames
     haskey(ht, name) || continue
@@ -614,7 +624,7 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
     end
     local algSym = Symbol("_alg_" * name)
     local qn = QuoteNode(Symbol(name))
-    push!(captures, :(try; _results[$(qn)] = Float64($(algSym)); catch _e; OMBackend._fallback(_e, :initAlgEarlyCapture; expect = UndefVarError); nothing; end))
+    push!(captures, :(try; _results[$(qn)] = Float64($(algSym)); catch _e; OMBackend._fallback(_e, :initAlgEarlyCapture); nothing; end))
   end
   return quote
     function __runInitialAlgorithmEarly!()
@@ -626,8 +636,8 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
           $(captures...)
         end
       catch _err
-        OMBackend._fallback(_err, :initAlgEarlyBody, impact = :result)
-        @debug "[MTK GEN: init-alg early] body raised; partial results returned" exception=_err
+        OMBackend._fallback(_err, :initAlgEarlyBody; impact = :result,
+                            expect = $(unfoldedParameter ? :UndefVarError : :(Union{})))
       end
       return _results
     end

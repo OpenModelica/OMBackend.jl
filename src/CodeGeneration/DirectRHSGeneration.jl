@@ -1863,7 +1863,9 @@ function _resolveParamValues(pars)
           end
           Float64(Base.invokelatest(Core.eval, evalModule, evalExpr))
         catch _e
-          OMBackend._fallback(_e, :_resolveParamValues_6)
+          #= A name of the expression not resolved yet (another parameter,
+             a model function) is undefined in the fresh module. =#
+          OMBackend._fallback(_e, :_resolveParamValues_6; expect = UndefVarError)
           nothing
         end
         if evalResult !== nothing && isfinite(evalResult)

@@ -751,7 +751,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     end
   end
   local DATA_STRUCTURE_ASSIGNMENTS = createDataStructureAssignments(dataStructureVariables, simCode)
-  local model = ODE_MODE_MTK_MODEL_GENERATION(simCode, modelName, functions)
+  local model = ODE_MODE_MTK_MODEL_GENERATION(simCode, modelName, functions; earlyInitialAlgorithm = true)
   #= Qualify bare Modelica function calls in function bodies so they resolve correctly
      when the program is eval'd in OMBackend scope (backendAPI.jl) rather than CodeGeneration scope.
      Without this, implementation bodies that call other Modelica functions (e.g., normalizeWithAssert
@@ -813,9 +813,11 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
            system. Init-algorithm LHSs that get alias-eliminated post-simplify
            still resolve via `getproperty` (they survive as observed equations)
            but `remake`'s u0 validator rejects them with "present in the
-           system but … is not an unknown". The existing `setu` mutation
-           inside __runInitialAlgorithm! already propagates those via the
-           alias-map's observed equation, so dropping them is safe. =#
+           system but … is not an unknown". Their values are dropped here;
+           the early pass (`__runInitialAlgorithmEarly!`) makes the
+           `initial algorithm` assignments initialization equations, which
+           cover them; an assignment in a runtime `when initial()` body to
+           such a variable has no effect. =#
         local _unkNames = try
           OrderedSet(string(u) for u in ModelingToolkit.unknowns(LATEST_REDUCED_SYSTEM))
         catch _e
@@ -916,9 +918,18 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
 end
 
 """
-  Generates a MTK model
+  Generates a MTK model.
+
+  `earlyInitialAlgorithm`: the model reads the results of
+  `__runInitialAlgorithmEarly!`. Only ODE_MODE_MTK_PROGRAM_GENERATION's module
+  defines it (and `__runInitialAlgorithm!`); the modes of a structural model
+  and the models of a runtime recompilation (Runtime.translateToMTK) have
+  neither (one per mode would collide), so their initial algorithms do not
+  run, a limitation of those paths.
 """
-function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions; useDirectRHS::Bool = OMBackend.DIRECT_RHS_GENERATION[])
+function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelName, functions;
+                                       useDirectRHS::Bool = OMBackend.DIRECT_RHS_GENERATION[],
+                                       earlyInitialAlgorithm::Bool = false)
   RESET_CALLBACKS()
   empty!(MTK_CodeGenerationUtil.DELAY_CALLS)
   MTK_CodeGenerationUtil.DELAY_MODEL[] = Symbol(modelName)
@@ -1288,13 +1299,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
          t=0 state — the `initialValues` Pair list above is only a guess.
          Wrapped in invokelatest so symbol references resolve against the
          freshly-eval'd Symbolics bindings. =#
-      local _algResults = try
-        Base.invokelatest(__runInitialAlgorithmEarly!)
-      catch _err
-        OMBackend._fallback(_err, :initAlgEarlyConstraints)
-        @debug "[MTK GEN: init-alg] early eval threw at constraint-build" exception=_err
-        Dict{Symbol, Float64}()
-      end
+      local _algResults = $(earlyInitialAlgorithm ? :(Base.invokelatest(__runInitialAlgorithmEarly!)) : :(Dict{Symbol, Float64}()))
       function _buildInitialConstraintEqs()
         local _eqs = Symbolics.Equation[$([_substSyms(e, _ifEqRelay_aliases) for e in generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)]...),
                                         $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, algebraicVariables, discreteVariables), simCode)]...)]

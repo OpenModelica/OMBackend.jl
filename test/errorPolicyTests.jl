@@ -2,6 +2,14 @@
 using Test
 import OMBackend
 
+module ErrorPolicyForeign
+struct Callable end
+(::Callable)(x::Int) = x
+@noinline asserting() = (@assert false "foreign"; nothing)
+end
+#= An assertion in OMBackend's own code (a source module). =#
+@eval OMBackend @noinline _assertForTheTest() = (@assert false "ours"; nothing)
+
 @testset "Error policy of fallbacks" begin
   local site() = try; error("boom"); catch e; OMBackend._fallback(e, :testSite); :fallback; end
   OMBackend.resetFallbacks!()
@@ -27,6 +35,23 @@ import OMBackend
     withenv("OMBACKEND_FALLBACK_ON_BUG" => "false") do
       @test expected() === :fallback
     end
+  end
+  @testset "observe mode is off by default" begin
+    local bug() = try; undefinedNameForTheTest + 1; catch e; OMBackend._fallback(e, :defaultSite); :fallback; end
+    withenv("OMBACKEND_FALLBACK_ON_BUG" => nothing) do
+      @test_throws UndefVarError bug()
+    end
+  end
+  @testset "what counts as a programming error of OMBackend" begin
+    local classify(f) = try; f(); catch e; OMBackend.isBug(e, catch_backtrace()); end
+    #= A MethodError: of our function, of a foreign one, of a callable object. =#
+    @test classify(() -> OMBackend.envSwitch(1))
+    @test !classify(() -> sin("x"))
+    local foreign = ErrorPolicyForeign.Callable()
+    @test !classify(() -> foreign("x"))
+    #= An assertion: in our code is ours; ModelingToolkit's (here a foreign module's) depends on the model. =#
+    @test classify(() -> OMBackend._assertForTheTest())
+    @test !classify(() -> ErrorPolicyForeign.asserting())
   end
   @testset "_tryOr" begin
     @test OMBackend._tryOr(() -> error("x"), 7, :tryOrSite) == 7
