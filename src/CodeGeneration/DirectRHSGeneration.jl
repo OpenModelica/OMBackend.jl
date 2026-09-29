@@ -107,7 +107,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
                                liftedDiscretes=String[],
                                freeParameters=String[],
-                               initRelations=Any[])
+                               initRelations=Any[],
+                               initClusters=Any[],
+                               discreteStarts=Dict{String, Float64}())
   local states = ModelingToolkit.unknowns(reducedSystem)
   local params = ModelingToolkit.parameters(reducedSystem)
   # Use full_equations to inline observed variable definitions.
@@ -426,19 +428,29 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
         pv -> (local fs = [r(pv) for r in parts]; (du, u) -> reduce(vcat, [f(du, u) for f in fs]))
       extraResiduals = residualsAt(p_vec)
     end
-    u0 = _solveDAEInitializationFree!(u0, initRhs, p_vec, mm, freeIdx, follow!;
-                                  pinned=pinnedIdx,
-                                  derivative_targets=derivativeInitTargets,
-                                  eqLabels=eqLabels,
-                                  extra_residuals=extraResiduals,
-                                  discrete_pinned=discretePinnedIdx)
+    local initDiscretes = _initialDiscreteClusters(initClusters, reducedSystem, discreteStarts)
+    local keptIdx = vcat(pinnedIdx, discretePinnedIdx)
+    local uEntry = copy(u0)
+    local firstErr = nothing
+    u0 = try
+      _solveDAEInitializationFree!(u0, initRhs, p_vec, mm, freeIdx, follow!;
+                                   pinned=pinnedIdx,
+                                   derivative_targets=derivativeInitTargets,
+                                   eqLabels=eqLabels,
+                                   extra_residuals=extraResiduals,
+                                   discrete_pinned=discretePinnedIdx)
+    catch e
+      #= With discrete clusters the initialization is tried again from their start values. =#
+      (e isa InterruptException || initDiscretes === nothing) && rethrow()
+      firstErr = e
+      copy(uEntry)
+    end
     #= At the solved state, at the solve's time (_solveDAEInitialization! evaluates at 0.0). =#
     assignParams! === nothing || assignParams!(p_vec, u0, 0.0)
     #= The relations' literal values at the solved state select the branches
        the initialization holds for (MLS 8.6); solved again until they settle. =#
     local initRels = _initialRelationLiterals(reducedSystem, params, initRelations)
     local useExtra = extraResiduals !== nothing
-    local keptIdx = vcat(pinnedIdx, discretePinnedIdx)
     local resolveWith = (u, pv, ok) -> begin
       local kept = u[keptIdx]
       local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
@@ -453,6 +465,12 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       assignParams! === nothing || assignParams!(pv, un, 0.0)
       un
     end
+    #= The differential states other than the clusters' members. =#
+    local diffKept = Int[i for i in 1:size(mm, 1) if mm[i, i] != 0 &&
+                         !(initDiscretes !== nothing && any(c -> i in c.memberIndex, initDiscretes.clusters))]
+    local (uSettled, settled) = _settleInitialDiscretes!(resolveWith, u0, uEntry, p_vec, initDiscretes, diffKept)
+    firstErr === nothing || settled || throw(firstErr)
+    u0 = uSettled
     u0 = _settleInitialRelations!(resolveWith, u0, p_vec, initRels)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
     #= The same initialization for other parameter values (tunable parameters,
@@ -469,6 +487,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                          discrete_pinned=discretePinnedIdx,
                                          warm=true)
       assignParams! === nothing || assignParams!(pv, u, 0.0)
+      u = first(_settleInitialDiscretes!(resolveWith, u, u, pv, initDiscretes, diffKept; startPath = false))
       _settleInitialRelations!(resolveWith, u, pv, initRels)
     end
   end
@@ -917,6 +936,140 @@ function _initialRelationLiterals(reducedSystem, params, entries)
     changed
   end
   return (eval! = eval!, idxs = Int[k for (k, _...) in kept])
+end
+
+#= The discrete clusters at initialization, for `_settleInitialDiscretes!`:
+   the codegen's clusters (instances of their own) bound to the reduced
+   system (the problem does not exist yet), their members' start values
+   (index => value, those that evaluate) and per cluster the start values its
+   pre() reads take (MLS 8.6: pre(v) = v.start). Nothing when there are none
+   or they cannot be observed. =#
+function _initialDiscreteClusters(clusters, reducedSystem, startOf::AbstractDict{String, Float64})
+  isempty(clusters) && return nothing
+  local SII = ModelingToolkit.SymbolicIndexingInterface
+  local starts = Pair{Int, Float64}[]
+  local preStarts = Vector{Union{Nothing, Float64}}[]
+  try
+    for c in clusters
+      c.values = ModelingToolkit.build_explicit_observed_function(reducedSystem, c.reads)
+      c.crossings! = first(ModelingToolkit.build_explicit_observed_function(reducedSystem,
+                                                                            c.reads[(c.nOperands + c.nPre + 1):end];
+                                                                            return_inplace = Val(true)))
+      c.memberIndex = Int[something(SII.variable_index(reducedSystem, m), 0) for m in c.members]
+      for (n, k) in zip(c.names, c.memberIndex)
+        k == 0 || !haskey(startOf, n) || push!(starts, k => startOf[n])
+      end
+      push!(preStarts, Union{Nothing, Float64}[get(startOf, string(r), nothing)
+                                               for r in c.reads[(c.nOperands + 1):(c.nOperands + c.nPre)]])
+    end
+  catch e
+    e isa InterruptException && rethrow()
+    @debug "DirectRHS: discrete clusters not observable at initialization; not settled" exception = e
+    return nothing
+  end
+  return (clusters = clusters, starts = starts, preStarts = preStarts)
+end
+
+#= The members whose cluster body, at state u (relations literal, MLS 8.5;
+   pre() the start values, else the values in u; initial() true), gives
+   another value than u holds: index => value. Local buffers: a
+   re-initialization may run while another one does. =#
+function _initialDiscreteChanges(dc, u, pv)
+  local point = (u = u, p = pv, t = 0.0)
+  local changes = Pair{Int, Float64}[]
+  for (c, preStart) in zip(dc.clusters, dc.preStarts)
+    local v = Base.invokelatest(c.values, u, pv, 0.0)
+    local zs = similar(c.zs)
+    Base.invokelatest(c.crossings!, zs, u, pv, 0.0)
+    local rel = Bool[_literal(zs, k, c.strict[k]) for k in eachindex(c.rel)]
+    local pre = [something(s, x) for (s, x) in zip(preStart, _preValues(c, v))]
+    local vals = Base.invokelatest(c.body, point, _operands(c, v), pre, rel, copy(rel), true)
+    vals === nothing && continue
+    for (i, k) in enumerate(c.memberIndex)
+      (k == 0 || u[k] == vals[i]) && continue
+      push!(changes, k => Float64(vals[i]))
+    end
+  end
+  return changes
+end
+
+#= Initial fixpoint of the discrete clusters' mixed systems, as OpenModelica
+   solves them (MLS 8.6: a discrete equation outside a when holds at the
+   initial solution, its relations at their literal values, pre() at the
+   start values). The initial algorithm set the members from their
+   equations at the continuous start values before the solve (an ideal
+   diode's `off = s < 0` at s = 0: conducting); with a fixed inductor
+   current or capacitor voltage that entry can make the solve fail (MSL
+   HBridge_RL: 340 kA) or reach another fixpoint of the mixed system
+   (MultiPhase Rectifier: every diode conducting, 5.8e6 V).
+   When an entry member differs from its start value (`startPath`), from the
+   entry with the members at their start values: solved, the members take
+   their bodies' values at the solution, solved again until they stay.
+   Otherwise, or when that does not settle, from the first solution the same
+   way. A result is taken only if the differential states `kept` stay where
+   the solve it started from had them (OpenModelica keeps states without an
+   initial equation at their start: a diode with a free capacitor voltage
+   must not move it to reach the tie s = 0); else, and on a cycle, a pass
+   limit, a throw or a failed solve, the first solution stands and the event
+   iteration at the start settles the members as before.
+   Returns `(u, settled)`. =#
+function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int};
+                                  startPath::Bool = true, maxPasses::Int = 10)
+  dc === nothing && return (u0, false)
+  local trace = get(ENV, "OMBACKEND_INIT_TRACE", "") == "true"
+  local pvFirst = copy(pv)
+  local memberIdx = unique!(Int[k for c in dc.clusters for k in c.memberIndex if k != 0])
+  local keptAt = (u, ref) -> isapprox(u[kept], ref[kept]; rtol = 1e-6, atol = 1e-9)
+  #= From a solution `u` of the solve that started at `ref`. =#
+  local iterate = function (u, ref)
+    local changes = _initialDiscreteChanges(dc, u, pv)
+    local seen = Set{Vector{Float64}}()
+    for _ in 1:maxPasses
+      trace && println("[initdiscretes] members to change: ", changes)
+      isempty(changes) && return u
+      for (k, v) in changes
+        u[k] = v
+      end
+      local key = u[memberIdx]
+      key in seen && return nothing
+      push!(seen, key)
+      local ok = Ref(true)
+      local un = resolve(copy(u), pv, ok)
+      (ok[] && keptAt(un, ref)) || return nothing
+      u = un
+      changes = _initialDiscreteChanges(dc, u, pv)
+    end
+    return nothing
+  end
+  local attempt = function (f)
+    try
+      return f()
+    catch e
+      e isa InterruptException && rethrow()
+      @debug "DirectRHS: the discrete clusters did not settle at initialization" exception = e
+      return nothing
+    end
+  end
+  if startPath && any(kv -> uEntry[kv.first] != kv.second, dc.starts)
+    local settled = attempt() do
+      local u = copy(uEntry)
+      for (k, v) in dc.starts
+        u[k] = v
+      end
+      local ok = Ref(true)
+      local un = resolve(copy(u), pv, ok)
+      trace && println("[initdiscretes] from the start values: ", ok[] ? "solved" : "not solved",
+                       ", states kept: ", keptAt(un, u))
+      (ok[] && keptAt(un, u)) ? iterate(un, u) : nothing
+    end
+    settled === nothing || return (settled, true)
+    copyto!(pv, pvFirst)
+  end
+  local settled = attempt(() -> iterate(copy(u0), u0))
+  settled === nothing || return (settled, true)
+  trace && println("[initdiscretes] not settled; the first solution stands")
+  copyto!(pv, pvFirst)
+  return (u0, false)
 end
 
 #= Initial event iteration for the if-equation relations: solved with their

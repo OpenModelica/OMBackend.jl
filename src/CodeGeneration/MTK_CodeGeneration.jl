@@ -373,7 +373,9 @@ emitDirectRHSProblem() = :(
     allInitialValues = initialValues,
     liftedDiscretes = (@isdefined(LIFTED_DISCRETES) ? LIFTED_DISCRETES : String[]),
     freeParameters = (@isdefined(FREE_PARAMETERS) ? FREE_PARAMETERS : String[]),
-    initRelations = (@isdefined(_ifInitLiterals) ? _ifInitLiterals : Any[]))
+    initRelations = (@isdefined(_ifInitLiterals) ? _ifInitLiterals : Any[]),
+    initClusters = (@isdefined(_initDiscreteClusters) ? _initDiscreteClusters : Any[]),
+    discreteStarts = (@isdefined(LIFTED_DISCRETE_STARTS) ? LIFTED_DISCRETE_STARTS : Dict{String, Float64}()))
 )
 
 """
@@ -974,6 +976,10 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   end
   #= Branch events with a hysteresis share the parameter H (set per solve). =#
   local IF_RELATIONS = collect(Iterators.flatten(c.relations for c in IF_EQUATION_COMPONENTS))
+  #= Kill switch OMBACKEND_INIT_DISCRETES=false: no initial fixpoint of the
+     discrete clusters (_settleInitialDiscretes!). =#
+  local INIT_DISCRETE_CLUSTERS = get(ENV, "OMBACKEND_INIT_DISCRETES", "true") == "true" ?
+    _discreteClusterSpecs(simCode) : Expr[]
   local IF_INIT_LITERALS = get(ENV, "OMBACKEND_INIT_RELATIONS", "true") == "true" ?
     collect(Iterators.flatten(c.initLiterals for c in IF_EQUATION_COMPONENTS)) : Expr[]
   local ifCondParamNames = copy(ifConditionalVariables)
@@ -1310,6 +1316,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
          the event list: the symbolic variables are globals bound while the
          model is built). =#
       _ifInitLiterals = Base.invokelatest(() -> Any[$(IF_INIT_LITERALS...)])
+      #= The discrete clusters the initialization settles (instances of their own). =#
+      _initDiscreteClusters = Base.invokelatest(() -> Any[$(INIT_DISCRETE_CLUSTERS...)])
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
       OMBackend.CodeGeneration.checkNamedStateLookups(problem, $(NAMED_STATE_LOOKUPS))
       $(emitDiscreteClusters(simCode))
@@ -3337,6 +3345,29 @@ function _imperativeClusterAffect(assigns::Vector{Tuple{Symbol,Any,Bool}}, simCo
   return :(ModelingToolkit.ImperativeAffect($(fn), $(mod); observed = $(obs), skip_checks = true))
 end
 
+#= A discrete's start attribute as a number: a literal, an enumeration
+   literal (its index), or a parameter's folded binding (the MSL thyristor
+   bridges' off(start = offStart_p1)). Nothing without a start or when it
+   does not evaluate. =#
+function _discreteStartValue(sv, simCode)::Union{Float64, Nothing}
+  local start = @match sv.attributes begin
+    SOME(a) => (hasproperty(a, :start) ? a.start : NONE())
+    _ => NONE()
+  end
+  return @match start begin
+    SOME(e && DAE.CREF(__)) => begin
+      local entry = get(simCode.stringToSimVarHT, SimulationCode.string(e), nothing)
+      entry === nothing && return nothing
+      @match entry[2].varKind begin
+        SimulationCode.PARAMETER(bindExp = SOME(b)) => _foldParameterBindStatic(b, simCode)
+        _ => nothing
+      end
+    end
+    SOME(e) => _foldParameterBindStatic(e, simCode)
+    _ => nothing
+  end
+end
+
 #= Module-level list of the discretes the discrete clusters assign
    (emitDiscreteClusters): the direct-RHS initialization leaves them to the
    clusters' start bodies. Empty when the model does not take that path. =#
@@ -3353,7 +3384,18 @@ function liftedDiscretesDecl(simCode)::Expr
     end
   end
   isempty(names) && return Expr(:block)
-  return :(LIFTED_DISCRETES = $(names))
+  #= Their start values and those of the other discretes (what pre() reads at
+     initialization, MLS 8.6), for the initial fixpoint of the clusters. =#
+  local starts = Dict{String, Float64}()
+  for (_, (_, sv)) in simCode.stringToSimVarHT
+    (sv.varKind isa SimulationCode.DISCRETE || string(sv.name) in names) || continue
+    local v = _discreteStartValue(sv, simCode)
+    v === nothing || (starts[string(sv.name)] = v)
+  end
+  return quote
+    LIFTED_DISCRETES = $(names)
+    LIFTED_DISCRETE_STARTS = $(starts)
+  end
 end
 
 #= Module-level list of the Real parameters without a value that the
@@ -3815,7 +3857,18 @@ relations of coupled discretes are discrete clusters: a continuous callback each
 relations, and the event iteration (emitted after this) evaluates them.
 """
 function emitDiscreteClusters(simCode)::Expr
-  _usesDiscreteClusters(simCode) || return Expr(:block)
+  local specs = _discreteClusterSpecs(simCode)
+  isempty(specs) && return Expr(:block)
+  #= In the latest world, like the event list: the symbolic variables are
+     globals bound while the model is built. =#
+  return :(callbacks = OMBackend.CodeGeneration.withDiscreteClusters(callbacks, problem,
+                                                                      Base.invokelatest(() -> Any[$(specs...)])))
+end
+
+#= The DiscreteCluster constructions of the model's discrete clusters
+   (emitDiscreteClusters); empty when it has none. =#
+function _discreteClusterSpecs(simCode)::Vector{Expr}
+  _usesDiscreteClusters(simCode) || return Expr[]
   local table = _modelHasTableClusters(simCode)
   local specs = Expr[]
   local relationOf = _condVarRelations(simCode)
@@ -3831,11 +3884,7 @@ function emitDiscreteClusters(simCode)::Expr
     graph === nothing && (graph = _equationGraph(simCode))
     push!(specs, _discreteClusterSpec(weq.whenEquation.condition, rels, assigns, simCode, table, graph))
   end
-  isempty(specs) && return Expr(:block)
-  #= In the latest world, like the event list: the symbolic variables are
-     globals bound while the model is built. =#
-  return :(callbacks = OMBackend.CodeGeneration.withDiscreteClusters(callbacks, problem,
-                                                                      Base.invokelatest(() -> Any[$(specs...)])))
+  return specs
 end
 
 #= Build MTK SymbolicContinuousCallbacks for the synthesised discrete-Boolean
