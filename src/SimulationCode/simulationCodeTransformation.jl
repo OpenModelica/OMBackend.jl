@@ -686,12 +686,10 @@ function matchAndCheckStronglyConnectedComponents(eqVariableMapping,
     (isSingular, matchOrder) = GraphAlgorithms.matching(eqVariableMapping,
                                                         numberOfVariablesInMapping)
   catch e
-    if mode == OMBackend.MTK_MODE
-      #= Matching failed, delegating structural analysis to ModelingToolkit =#
-      return (true, Int[], MetaGraphs.MetaDiGraph(), Vector{Int}[])
-    else
-      rethrow(e)
-    end
+    mode == OMBackend.MTK_MODE || rethrow()
+    #= Matching failed, delegating structural analysis to ModelingToolkit =#
+    OMBackend._fallback(e, :matchingDelegatedToMTK)
+    return (true, Int[], MetaGraphs.MetaDiGraph(), Vector{Int}[])
   end
   #=
     Index reduction might resolve the issues with this system.

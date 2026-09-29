@@ -569,17 +569,9 @@ end
 function _whenStmtLstTargets(stmtLst, targetName::String)::Bool
   for stmt in stmtLst
     local lhsName = if stmt isa BDAE.ASSIGN || stmt isa SimulationCode.ASSIGN
-      try
-        SimulationCode.string(_asDAE(stmt.left))
-      catch
-        ""
-      end
+      SimulationCode.string(_asDAE(stmt.left))
     elseif stmt isa BDAE.REINIT || stmt isa SimulationCode.REINIT
-      try
-        SimulationCode.string(stmt.stateVar)
-      catch
-        ""
-      end
+      SimulationCode.string(stmt.stateVar)
     else
       ""
     end
@@ -859,7 +851,7 @@ function writeEqsToFile(elems::Vector{Expr}, filename)
     end
   catch e
     @error string("Failed writing the model to the file:",  filename)
-    throw(e)
+    rethrow()
   end
   println(buffer, "------------------------------------")
   println(buffer, "Statistics:")

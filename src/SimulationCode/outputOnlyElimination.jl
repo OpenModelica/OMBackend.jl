@@ -132,7 +132,8 @@ function rebuildMatchOrder(simCode::SIM_CODE)
     local (_isSingular, mo) = GraphAlgorithms.matching(eqVarMapping, nMatch)
     matchOrder = mo
   catch e
-    @debug "[SIMCODE: $(simCode.name): rebuildMatchOrder] matching failed, skipping DCE" exception=(e, catch_backtrace())
+    #= Matching failed: no dead-code elimination. =#
+    OMBackend._fallback(e, :outputOnlyMatching)
     return (Int[], nameToMatchIdx, matchIdxToName)
   end
   local nMatched = count(>(0), matchOrder)

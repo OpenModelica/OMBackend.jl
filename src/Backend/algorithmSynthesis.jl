@@ -258,7 +258,9 @@ Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospe
     hasNonWhen || continue
     local daeStmts = try
       OMFrontend.Frontend.convertStatements(alg.statements)
-    catch
+    catch err
+      #= An algorithm the frontend cannot convert is left out. =#
+      OMBackend._fallback(err, :convertAlgorithmStatements; impact = :result)
       continue
     end
     #= Conservative narrowing: only lift single-statement algorithm bodies.
@@ -364,7 +366,9 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
     hasNonWhen || continue
     local daeStmts = try
       OMFrontend.Frontend.convertStatements(statements)
-    catch
+    catch err
+      #= An algorithm the frontend cannot convert is left out. =#
+      OMBackend._fallback(err, :convertAlgorithmStatements; impact = :result)
       continue
     end
     #= Sources.Table / Step / Pulse / Clock have an unrolled body of the shape
@@ -423,7 +427,9 @@ function synthesizeAssertsFromRegularAlgorithms(algorithms)::Vector{BDAE.Equatio
     isempty(alg.statements) && continue
     local daeStmts = try
       OMFrontend.Frontend.convertStatements(alg.statements)
-    catch
+    catch err
+      #= An algorithm the frontend cannot convert is left out. =#
+      OMBackend._fallback(err, :convertAlgorithmStatements; impact = :result)
       continue
     end
     for s in daeStmts
@@ -1167,13 +1173,9 @@ Base.@nospecializeinfer function _liftAlgAssignToInitialWhen!(out::Vector{BDAE.E
           BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
         ))
       end
-      local lhsName::Union{String, Nothing} = try
-        @match lhs begin
-          DAE.CREF(cr, _) => string(cr)
-          _ => nothing
-        end
-      catch
-        nothing
+      local lhsName::Union{String, Nothing} = @match lhs begin
+        DAE.CREF(cr, _) => string(cr)
+        _ => nothing
       end
       return (true, lhsName)
     end

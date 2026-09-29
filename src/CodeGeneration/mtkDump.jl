@@ -58,7 +58,8 @@ function dumpMTKPreSimplify(@nospecialize(sys), pre_eqs::Int, pre_unknowns::Int)
         for (i, p) in enumerate(ModelingToolkit.parameters(sys))
           println(io, "  [$i] $p")
         end
-        try
+        #= ModelingToolkit 11 has no `defaults` (the catch fired on every dump). =#
+        if isdefined(ModelingToolkit, :defaults)
           local defs = ModelingToolkit.defaults(sys)
           println(io)
           println(io, "Defaults ($(length(defs))):")
@@ -66,7 +67,7 @@ function dumpMTKPreSimplify(@nospecialize(sys), pre_eqs::Int, pre_unknowns::Int)
           for (k, v) in defs
             println(io, "  $k => $v")
           end
-        catch
+        else
           println(io, "\n(defaults not available in this MTK version)")
         end
       end

@@ -1616,7 +1616,8 @@ function handleArrayExp(exp::DAE.ARRAY, simCode)
   local arrJL = if canEval
     try
       [eval(expr) for expr in elemExprs]
-    catch
+    catch err
+      OMBackend._fallback(err, :constantArrayElements; expect = Union{UndefVarError, MethodError})
       canEval = false
       []
     end
@@ -1989,11 +1990,7 @@ end
 function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt); written = nothing)::Nothing
   @match stmt begin
     DAE.STMT_ASSIGN(__) => begin
-      local nm = try
-        SimulationCode.DAE_identifierToString(stmt.exp1)
-      catch
-        nothing
-      end
+      local nm = stmt.exp1 isa DAE.CREF ? SimulationCode.DAE_identifierToString(stmt.exp1) : nothing
       if nm !== nothing
         local v = _evalDAENumeric(stmt.exp, valMap)
         if v !== nothing
@@ -2353,7 +2350,9 @@ function evalCausalRHSAtT0(rhsExpr, valMap::Dict{Symbol, Float64},
       end
     end
     return isfinite(numResult) ? numResult : nothing
-  catch
+  catch err
+    #= A name not resolved yet, a Modelica function outside its domain. =#
+    OMBackend._fallback(err, :evalCausalRHSAtT0; expect = Union{UndefVarError, MethodError})
     return nothing
   end
 end
@@ -2376,25 +2375,20 @@ function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, s
   end
   local loweredCache = IdDict{Any, Any}()
   local mkPair = function (rawExp)
-    local dae = try
-      rawExp isa DAE.Exp ? rawExp : SimulationCode.toDAEExp(rawExp)
-    catch
-      return nothing
-    end
+    local dae = rawExp isa DAE.Exp ? rawExp : SimulationCode.toDAEExp(rawExp)
     local arm = @match dae begin
       DAE.BINARY(DAE.CREF(cr, _), DAE.SUB(__), rhs) => (cr, rhs)
       _ => nothing
     end
     arm === nothing && return nothing
     local (cr, rhsDAE) = arm
-    local nm = try SimulationCode.DAE_identifierToString(cr) catch; nothing end
-    nm === nothing && return nothing
-    local tgt = Symbol(nm)
+    local tgt = Symbol(SimulationCode.DAE_identifierToString(cr))
     (tgt in explicit) && return nothing
     local rhsExpr = get!(loweredCache, rhsDAE) do
       try
         expToJuliaExpMTK(rhsDAE, simCode)
-      catch
+      catch err
+        OMBackend._fallback(err, :forwardEvalT0Lowering; only = OMBackend.UnsupportedLowering)
         :__t0_lower_failed
       end
     end
@@ -2415,7 +2409,8 @@ function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, s
     for ifEq in simCode.ifEquations
       local br = try
         SimulationCode._selectActiveInitBranch(ifEq, envStr)
-      catch
+      catch err
+        OMBackend._fallback(err, :selectActiveInitBranch)
         nothing
       end
       br === nothing && continue
@@ -2492,7 +2487,7 @@ function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool =
       if unwrapped isa Number
         Float64(unwrapped)
       else
-        local valued = try Base.invokelatest(Symbolics.value, result) catch; result end
+        local valued = Base.invokelatest(Symbolics.value, result)
         Float64(valued isa Number ? valued : 0.0)
       end
     end
@@ -2502,6 +2497,7 @@ function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool =
        At zc == 0 the original operator decides (closedBoundary). =#
     return closedBoundary ? numResult > 0.0 : numResult >= 0.0
   catch e
+    OMBackend._fallback(e, :evalInitialCondition; expect = Union{UndefVarError, MethodError}, impact = :result)
     @warn "evalInitialCondition: failed to evaluate, defaulting to true" exception=(e, catch_backtrace())
     return true
   end
@@ -2640,7 +2636,9 @@ function evalDAE_Expression(expr, simCode)::Expr
   local evaluatedJLExpr = if shouldEval[]
     try
       eval(jlExpr)
-    catch
+    catch err
+      #= Left unevaluated: it reads a name that is not a constant here. =#
+      OMBackend._fallback(err, :evalDAE_Expression; expect = Union{UndefVarError, MethodError})
       jlExpr
     end
   else
@@ -2764,6 +2762,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       local raw = eval(lhsJl)
       raw isa Symbolics.Num ? Float64(Symbolics.unwrap(raw)) : Float64(raw)
     catch err
+      OMBackend._fallback(err, :parametricInitLhs; expect = Union{UndefVarError, MethodError}, impact = :result)
       @warn "[SIMCODE: solveParametricInitialEquations] could not evaluate LHS" freeName err
       continue
     end
@@ -2789,6 +2788,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     local residualFn = try
       eval(Expr(:->, freeSymbol, Expr(:call, :-, lhsVal, rhsJl)))
     catch e
+      OMBackend._fallback(e, :parametricInitResidual; expect = Union{UndefVarError, MethodError}, impact = :result)
       @warn "[SIMCODE: solveParametricInitialEquations] could not build residual" freeName e
       continue
     end
@@ -2816,6 +2816,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
         x -= fx / dfx
       end
     catch err
+      OMBackend._fallback(err, :parametricInitNewton; expect = Union{UndefVarError, MethodError}, impact = :result)
       @warn "[SIMCODE: solveParametricInitialEquations] residual call threw, skipping" freeName err
       newtonOk = false
     end
@@ -2850,11 +2851,7 @@ function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::
      `initial() and not limitsAtInit` never held). =#
   _hasInitialCall(condition) && return false
   local refs::OrderedSet{String} = OrderedSet{String}()
-  try
-    SimulationCode.collectCrefNames!(refs, condition)
-  catch
-    return false
-  end
+  SimulationCode.collectCrefNames!(refs, condition)
   isempty(refs) && return false
   local ht = simCode.stringToSimVarHT
   for name in refs

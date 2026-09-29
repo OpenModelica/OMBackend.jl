@@ -1458,11 +1458,7 @@ end
 const _EXPLICIT_PINNED_INITIAL_VALUE_KEYS = Dict{Symbol, OrderedSet{String}}()
 
 function _pinnedSidecarKey(reducedSystem)::Symbol
-  return try
-    nameof(reducedSystem)
-  catch
-    Symbol(objectid(reducedSystem))
-  end
+  return nameof(reducedSystem)
 end
 
 function explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues)::OrderedSet{String}
@@ -1480,11 +1476,7 @@ end
    be relaxed to guesses (algebraically coupled states). =#
 function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
   local out = OrderedSet{String}()
-  local eqs = try
-    equations(sys)
-  catch
-    return out
-  end
+  local eqs = equations(sys)
   for eq in eqs
     local lhs = Symbolics.value(eq.lhs)
     local isDiff = SymbolicUtils.iscall(lhs) && (SymbolicUtils.operation(lhs) isa ModelingToolkit.Differential)
@@ -1496,11 +1488,7 @@ function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
       push!(out, string(v))
     end
   end
-  local obsEqs = try
-    observed(sys)
-  catch
-    Symbolics.Equation[]
-  end
+  local obsEqs = observed(sys)
   for eq in obsEqs
     #= An observed lhs is the eliminated variable itself; only the rhs couples. =#
     for v in Symbolics.get_variables(eq.rhs)
@@ -1536,11 +1524,8 @@ function _initializationVarStrs(initEqs)::OrderedSet{String}
     return nothing
   end
   for eq in initEqs
-    try
-      visit(eq.lhs, true)
-      visit(eq.rhs, false)
-    catch
-    end
+    visit(eq.lhs, true)
+    visit(eq.rhs, false)
   end
   return out
 end
@@ -1670,11 +1655,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
        encodes. Parameters print without the (t) suffix and stay pinnable;
        occursin also catches array elements and derivative forms whose
        printed form does not END with the suffix. =#
-    local rhsVars = try
-      Symbolics.get_variables(eq.rhs)
-    catch
-      Any[]
-    end
+    local rhsVars = Symbolics.get_variables(eq.rhs)
     any(occursin("(t)", string(v)) for v in rhsVars) && continue
     push!(fixedTrueLhsSet, string(eq.lhs))
   end

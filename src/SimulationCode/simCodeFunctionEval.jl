@@ -121,7 +121,9 @@ function _aBuiltin(name::String, args::Vector{Any})
     name == "div" && length(args) == 2 && return _aResult(div(args[1], args[2]))
     name == "mod" && length(args) == 2 && return _aResult(mod(args[1], args[2]))
     name == "rem" && length(args) == 2 && return _aResult(rem(args[1], args[2]))
-  catch
+  catch err
+    #= Outside the function's domain (a DomainError, a DivideError, an InexactError): Unknown. =#
+    OMBackend._fallback(err, :interpretBuiltin)
     return _AUNK
   end
   return _AUNK
@@ -141,7 +143,8 @@ function _aBinary(op, a, b)
     op isa DAE.MUL && return _aResult(a * b)
     op isa DAE.DIV && return _aResult(a / b)
     op isa DAE.POW && return _aResult(Float64(a)^b)
-  catch
+  catch err
+    OMBackend._fallback(err, :interpretBinary)
     return _AUNK
   end
   return _AUNK
@@ -360,8 +363,9 @@ function _aFunction(f::MODELICA_FUNCTION, args::Vector{Any}, ctx::_AEvalContext)
     _aExec!(f.statements, env, ctx)
     result = Any[_aIsArrayVar(v) ? _AUNK : get(env, _aVarName(v, env, ctx), _AUNK) for v in f.outputs]
   catch err
-    #= _ABail, or a construct the interpretation does not know: Unknown. =#
-    err isa InterruptException && rethrow()
+    #= _ABail (control flow), or a construct the interpretation does not know
+       (a MethodError of its evaluator): Unknown. =#
+    err isa _ABail || OMBackend._fallback(err, :interpretFunction; expect = MethodError)
     result = unknown
   finally
     ctx.depth -= 1
@@ -575,7 +579,7 @@ function evaluateConstantFunctionOutputs(simCode::SIM_CODE)::SIM_CODE
       foreach(flatten!, call.args)
       foreach(a -> _aArgValues!(args, toDAEExp(a), env, ctx), flat)
     catch err
-      err isa InterruptException && rethrow()
+      err isa _ABail || OMBackend._fallback(err, :interpretArguments; expect = MethodError)
       return nothing
     end
     return _aFunction(f, args, ctx)

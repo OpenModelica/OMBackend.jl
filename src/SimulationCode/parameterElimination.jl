@@ -599,59 +599,62 @@ function bodies.
 """
 function _collectFunctionBodyCrefs!(out::OrderedSet{String}, functions)
   for fn in functions
-    try
-      @match fn begin
-        MODELICA_FUNCTION(__) => _walkStatementsForCrefs!(out, fn.statements)
-        _ => nothing
-      end
-    catch
-      #= Be tolerant: a bad statement variant or unexpected field count must
-         not break the surrounding pass. Worst case is we miss a few crefs
-         and over-eliminate downstream — the survivor-scan in callers (and
-         SimCodeCheck `rule_cref_resolution`) flags that. =#
+    @match fn begin
+      MODELICA_FUNCTION(__) => _walkStatementsForCrefs!(out, fn.statements)
+      _ => nothing
     end
   end
   return out
 end
 
+#= An if statement's condition is `exp` and an array assignment's target
+   `lhs` (both were read as `exp1`: a FieldError, swallowed, so the names in
+   if conditions, elseif/else branches and array assignments were missed and
+   parameters they read could be eliminated; error policy, 2026-09-29). =#
 function _walkStatementsForCrefs!(out::OrderedSet{String}, stmts)
   for s in stmts
-    try
-      @match s begin
-        DAE.STMT_ASSIGN(__) => begin
-          collectCrefNames!(out, s.exp1)
-          collectCrefNames!(out, s.exp)
-        end
-        DAE.STMT_ASSIGN_ARR(__) => begin
-          collectCrefNames!(out, s.exp1)
-          collectCrefNames!(out, s.exp)
-        end
-        DAE.STMT_IF(__) => begin
-          collectCrefNames!(out, s.exp1)
-          _walkStatementsForCrefs!(out, s.statementLst)
-        end
-        DAE.STMT_FOR(__) => begin
-          if isdefined(s, :range)
-            collectCrefNames!(out, s.range)
-          end
-          if isdefined(s, :statementLst)
-            _walkStatementsForCrefs!(out, s.statementLst)
-          end
-        end
-        DAE.STMT_WHILE(__) => begin
-          collectCrefNames!(out, s.exp)
-          _walkStatementsForCrefs!(out, s.statementLst)
-        end
-        DAE.STMT_WHEN(__) => begin
-          collectCrefNames!(out, s.exp)
-          _walkStatementsForCrefs!(out, s.statementLst)
-        end
-        DAE.STMT_NORETCALL(__) => collectCrefNames!(out, s.exp)
-        _ => nothing
+    @match s begin
+      DAE.STMT_ASSIGN(__) => begin
+        collectCrefNames!(out, s.exp1)
+        collectCrefNames!(out, s.exp)
       end
-    catch
-      #= Skip statements with shapes we do not know about. Conservative. =#
+      DAE.STMT_ASSIGN_ARR(__) => begin
+        collectCrefNames!(out, s.lhs)
+        collectCrefNames!(out, s.exp)
+      end
+      DAE.STMT_IF(__) => begin
+        collectCrefNames!(out, s.exp)
+        _walkStatementsForCrefs!(out, s.statementLst)
+        _walkElseForCrefs!(out, s.else_)
+      end
+      DAE.STMT_FOR(__) => begin
+        collectCrefNames!(out, s.range)
+        _walkStatementsForCrefs!(out, s.statementLst)
+      end
+      DAE.STMT_WHILE(__) => begin
+        collectCrefNames!(out, s.exp)
+        _walkStatementsForCrefs!(out, s.statementLst)
+      end
+      DAE.STMT_WHEN(__) => begin
+        collectCrefNames!(out, s.exp)
+        _walkStatementsForCrefs!(out, s.statementLst)
+      end
+      DAE.STMT_NORETCALL(__) => collectCrefNames!(out, s.exp)
+      _ => nothing
     end
+  end
+  return out
+end
+
+function _walkElseForCrefs!(out::OrderedSet{String}, e)
+  @match e begin
+    DAE.ELSEIF(__) => begin
+      collectCrefNames!(out, e.exp)
+      _walkStatementsForCrefs!(out, e.statementLst)
+      _walkElseForCrefs!(out, e.else_)
+    end
+    DAE.ELSE(__) => _walkStatementsForCrefs!(out, e.statementLst)
+    _ => nothing
   end
   return out
 end

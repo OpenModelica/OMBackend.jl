@@ -72,7 +72,7 @@ function matching(dict::DataStructures.OrderedDict, n::Int)
                    A possible reason is that the system is over/underdetermined.
                    Matching will be done by later backend processing."
       @info msg
-      throw(e)
+      rethrow()
     end
     if !success
       isSingular = !success

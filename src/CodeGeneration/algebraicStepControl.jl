@@ -191,7 +191,9 @@ function _projectStepEnd!(c::AlgebraicStepControl, integrator)
   for _ in 1:_PROJECTION_ITERATIONS
     local correction = try
       c.lu \ _algebraicResidual!(c, integrator, integrator.t)
-    catch
+    catch err
+      #= A singular factorization: no projection. =#
+      OMBackend._fallback(err, :algebraicProjection)
       return nothing
     end
     local roundoff = true

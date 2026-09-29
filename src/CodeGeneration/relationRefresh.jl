@@ -88,6 +88,7 @@ function _ifRelations(problem, hSym::Symbol, entries::Vector)
                        Any[_valueGetter(problem, e[3]) for e in entries],
                        SII.getp(problem, hSym), _bufferValues(buffers, problem))
   catch err
+    OMBackend._fallback(err, :ifRelationsFromProblem; impact = :result)
     @warn "[events] the if-equation relations cannot be read from the problem; they are not iterated" exception = err
     return nothing
   end
@@ -651,7 +652,7 @@ function _eventReinit!(integrator, alg = DiffEqBase.BrownFullBasicInit())
   try
     DiffEqBase.initialize_dae!(integrator, alg)
   catch err
-    err isa InterruptException && rethrow()
+    OMBackend._fallback(err, :eventInitializeDae)
     #= A method of the default polyalgorithm can throw (NonlinearSolve's
        MoreTrustRegion descent, `restructure(x, nothing)`, on the MSL Spice3
        Inverter's switching MOSFETs): Newton with finite differences instead,
@@ -660,7 +661,7 @@ function _eventReinit!(integrator, alg = DiffEqBase.BrownFullBasicInit())
     try
       DiffEqBase.initialize_dae!(integrator, tableClusterInitAlg())
     catch err2
-      err2 isa InterruptException && rethrow()
+      OMBackend._fallback(err2, :eventInitializeDaeNewton; impact = :result)
       copyto!(integrator.u, u0)
       _restoreRetcode!(integrator, InitialFailure)
     end
@@ -691,7 +692,7 @@ function _atRoundoffFloor(integrator, u)
     f.jac(J, u, integrator.p, integrator.t)
     f(r, u, integrator.p, integrator.t)
   catch e
-    e isa InterruptException && rethrow()
+    OMBackend._fallback(e, :roundoffFloorJacobian)
     return false
   end
   local scale = abs.(J) * abs.(u)
@@ -739,7 +740,9 @@ function setZCHysteresis!(problem, hSym::Symbol, reltol)
   local SII = ModelingToolkit.SymbolicIndexingInterface
   local present = try
     SII.parameter_index(problem, hSym) !== nothing
-  catch
+  catch err
+    #= A problem without symbolic indexing (no system). =#
+    OMBackend._fallback(err, :zcHysteresisIndex)
     false
   end
   present || return problem

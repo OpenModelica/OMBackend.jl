@@ -43,6 +43,7 @@ import ..BDAE
 import ..BDAEUtil
 import ..FrontendUtil.Util
 import ..@BACKEND_PERFLOG
+import ...OMBackend
 import Absyn
 import DAE
 import OMFrontend

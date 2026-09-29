@@ -809,12 +809,9 @@ function generateIMTKTargetCode(simCode::SimulationCode.SIM_CODE)
 end
 
 function getCompiledModel(modelName)
-  try
-    return COMPILED_MODELS_MTK[modelName][1]
-  catch e
-    @error "Model: $(modelName) is not compiled. Available models are: $(availableModels())"
-    throw(e)
-  end
+  haskey(COMPILED_MODELS_MTK, modelName) ||
+    error("Model $(modelName) is not compiled (OMBackend.translate first). $(availableModels())")
+  return COMPILED_MODELS_MTK[modelName][1]
 end
 
 """
@@ -845,13 +842,9 @@ function modelWasCompiledAgain(modelName)
 end
 
 function getCompiledModelDE(modelName)
-  try
-    return COMPILED_MODELS_DEJL[modelName][1]
-  catch e
-    local available = join(keys(COMPILED_MODELS_DEJL), ", ")
-    @error "DE-mode model: $(modelName) is not compiled. Available DE-mode models: $(available)"
-    throw(e)
-  end
+  haskey(COMPILED_MODELS_DEJL, modelName) ||
+    error("DE-mode model $(modelName) is not compiled. Available DE-mode models: $(join(keys(COMPILED_MODELS_DEJL), ", "))")
+  return COMPILED_MODELS_DEJL[modelName][1]
 end
 
 modelWasCompiledAgainDE(modelName) = COMPILED_MODELS_DEJL[modelName][2]
@@ -916,33 +909,29 @@ end
  Converts a given backend model to a string
 """
 function modelToString(modelName::String; MTK = true, keepComments = true, keepBeginBlocks = true)
-  try
-    local model::Expr
-    model = getCompiledModel(modelName)
-    strippedModel = "$model"
-    #= Remove all the redundant blocks from the model =#
-    if keepComments == false
-      strippedModel = CodeGeneration.stripComments(model)
-    end
-    if keepBeginBlocks == false
-      strippedModel = CodeGeneration.stripBeginBlocks(model)
-    end
-    local modelStr::String = "$strippedModel"
-    local formattedResults
-    try
-      formattedResults = JuliaFormatter.format_text(modelStr;
-                                                    remove_extra_newlines = true,
-                                                    indent = 4,
-                                                    margin = 200,
-                                                    always_use_return = true)
-    catch e
-      @warn "Julia Formatter failed to format the output results due to $(e)"
-      formattedResults = modelStr
-    end
-    return formattedResults
-  catch e
-    @error "Model: $(modelName) is not compiled.\n Available models are: $(availableModels())" exception=(e, catch_backtrace())
+  local model::Expr = getCompiledModel(modelName)
+  strippedModel = "$model"
+  #= Remove all the redundant blocks from the model =#
+  if keepComments == false
+    strippedModel = CodeGeneration.stripComments(model)
   end
+  if keepBeginBlocks == false
+    strippedModel = CodeGeneration.stripBeginBlocks(model)
+  end
+  local modelStr::String = "$strippedModel"
+  local formattedResults
+  try
+    formattedResults = JuliaFormatter.format_text(modelStr;
+                                                  remove_extra_newlines = true,
+                                                  indent = 4,
+                                                  margin = 200,
+                                                  always_use_return = true)
+  catch e
+    isFatal(e) && rethrow()
+    @warn "Julia Formatter failed to format the output results due to $(e)"
+    formattedResults = modelStr
+  end
+  return formattedResults
 end
 
 
@@ -989,13 +978,8 @@ function simulateModel(modelName::String;
     error("simulateModel: `parameters` needs IMTK mode (the default), got $(MODE)")
   if MODE == MTK_MODE
     #= This does a redundant string conversion for now due to modeling toolkit being as is...=#
-    try
-      modelCode = getCompiledModel(modelName)
-    catch err
-      println("Failed to simulate model.")
-      println("Available models are:")
-      availableModels()
-    end
+    #= An uncompiled model is an error here (it went on to an UndefVarError of modelCode). =#
+    modelCode = getCompiledModel(modelName)
     try
       #= Only re-eval if the module does not exist yet or the code changed =#
       local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) || modelWasCompiledAgain(modelName)
@@ -1081,12 +1065,7 @@ function getMTKProblem(modelName::String;
                        tspan = (0.0, 1.0),
                        overwriteCache::Bool = false)
   modelName = canonicalName(modelName)
-  local modelCode::Expr
-  try
-    modelCode = getCompiledModel(modelName)
-  catch err
-    error("Model $(modelName) is not compiled. Call OMBackend.translate first. Available: $(availableModels())")
-  end
+  local modelCode::Expr = getCompiledModel(modelName)
   local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) || modelWasCompiledAgain(modelName)
   if needsEval
     @eval $modelCode

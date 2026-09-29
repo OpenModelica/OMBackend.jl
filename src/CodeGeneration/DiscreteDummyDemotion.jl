@@ -368,7 +368,8 @@ function _collectCyclicSCCDiscretes(simCode, whenAssignedSet::OrderedSet{String}
       end
     end
   catch err
-    @debug "[MTK GEN: discrete] cyclic SCC demotion skipped" exception=(err, catch_backtrace())
+    #= Cyclic SCC demotion skipped. =#
+    OMBackend._fallback(err, :cyclicDiscreteDemotion)
   end
   return cyclic
 end

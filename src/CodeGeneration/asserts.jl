@@ -41,13 +41,13 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
   local checks = Tuple{ModelicaAssert, Any}[]
   local byName = _variablesByName(problem)
   for a in asserts
-    local getter = try
-      isempty(a.observed) ? nothing :
-        ModelingToolkit.SymbolicIndexingInterface.getu(problem, [byName[n] for n in values(a.observed)])
-    catch err
-      @warn "[asserts] $(a.text) reads a variable the simulation does not keep; it is not checked" exception = err
+    local missing = [n for n in values(a.observed) if !haskey(byName, n)]
+    if !isempty(missing)
+      @warn "[asserts] $(a.text) reads a variable the simulation does not keep; it is not checked" missing
       continue
     end
+    local getter = isempty(a.observed) ? nothing :
+      ModelingToolkit.SymbolicIndexingInterface.getu(problem, [byName[n] for n in values(a.observed)])
     push!(checks, (a, getter))
   end
   isempty(checks) && return callbacks
@@ -83,11 +83,7 @@ end
    variables) and parameters. =#
 function _variablesByName(problem)
   local byName = Dict{Symbol, Any}()
-  local sys = try
-    problem.f.sys
-  catch
-    return byName
-  end
+  local sys = hasproperty(problem.f, :sys) ? problem.f.sys : nothing
   sys === nothing && return byName
   for v in Iterators.flatten((ModelingToolkit.parameters(sys), (eq.lhs for eq in ModelingToolkit.observed(sys)),
                               ModelingToolkit.unknowns(sys)))
@@ -118,7 +114,9 @@ function _violationTime(a::ModelicaAssert, getter, integrator)
       (mid <= lo || mid >= hi) && break
       holds(mid) ? (lo = mid) : (hi = mid)
     end
-  catch
+  catch err
+    #= The interpolation or the condition failed inside the step: its end. =#
+    OMBackend._fallback(err, :assertViolationTime)
     return integrator.t
   end
   return hi
