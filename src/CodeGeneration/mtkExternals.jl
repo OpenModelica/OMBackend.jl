@@ -397,9 +397,11 @@ end
 #= What an eager evaluation of a Modelica function throws for symbolic
    arguments: a MethodError of the implementation (an operation without a
    symbolic method), a FieldError (a record field read from a symbolic
-   value, as in the MSL records' functions); a TypeError (a condition on a
-   symbolic value) is not a programming error anyway. =#
-const _EAGER_SYMBOLIC_FAILURE = Union{MethodError, FieldError}
+   value, as in the MSL records' functions), an UndefVarError (the MSL
+   QuasiStatic machines' Complex functions: `v` undefined in the model
+   module, open); a TypeError (a condition on a symbolic value) is not a
+   programming error anyway. The opaque extractors then take over. =#
+const _EAGER_SYMBOLIC_FAILURE = Union{MethodError, FieldError, UndefVarError}
 
 """
 Call a tuple-returning Modelica function and extract a specific element.
