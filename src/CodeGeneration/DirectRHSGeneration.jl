@@ -865,6 +865,8 @@ end
    the algebraic step control chased until maxiters (SMEE_DOL stopped at
    2.835 s after 1e6 steps). =#
 function _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, t0)
+  #= Kill switch OMBACKEND_TGRAD=false: no tgrad (the solver differences in t itself). =#
+  get(ENV, "OMBACKEND_TGRAD", "true") == "true" || return nothing
   local tg = _explicitTimeDerivative(rhs_list, states, params, iv)
   if tg !== nothing
     #= At the entry guesses (before the initialization): only a row the RHS
