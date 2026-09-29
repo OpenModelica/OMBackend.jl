@@ -57,17 +57,19 @@ symbolic Jacobian) are wrapped in `FunctionWrappers` so the resulting problem
 type is constant across models; the solver then compiles its stepping / Newton
 / linear-solve machinery once instead of once per distinct model. `u0`, `p_vec`
 and `t0` supply only the argument *types* the wrappers specialize on; their
-values are immaterial. The mass matrix, Jacobian and `sys` are attached to the
-function we build, so type erasure does not drop them.
+values are immaterial. The mass matrix, Jacobian, time derivative `tgradFunc`
+and `sys` are attached to the function we build, so type erasure does not drop
+them.
 """
 function _buildDirectODEFunction(rhsFunc, u0, p_vec, t0;
                                  mass_matrix=nothing, sys=nothing,
-                                 jacFunc=nothing, jacProto=nothing)
+                                 jacFunc=nothing, jacProto=nothing, tgradFunc=nothing)
   if !OMBackend.DIRECT_RHS_TYPE_ERASE[]
     local jacKw = jacFunc === nothing ? NamedTuple() : (; jac=jacFunc, jac_prototype=jacProto)
+    local tgradKw = tgradFunc === nothing ? NamedTuple() : (; tgrad=tgradFunc)
     return mass_matrix === nothing ?
-      ModelingToolkit.ODEFunction{true}(rhsFunc; sys=sys, jacKw...) :
-      ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mass_matrix, sys=sys, jacKw...)
+      ModelingToolkit.ODEFunction{true}(rhsFunc; sys=sys, jacKw..., tgradKw...) :
+      ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mass_matrix, sys=sys, jacKw..., tgradKw...)
   end
   local FW = ModelingToolkit.SciMLBase.FunctionWrapperSpecialize
   #= Multi-variant wrapper (Float64 + ForwardDiff Dual signatures) so autodiff
@@ -77,6 +79,9 @@ function _buildDirectODEFunction(rhsFunc, u0, p_vec, t0;
   local erasedKw = jacFunc === nothing ? NamedTuple() :
     (; jac = DiffEqBase.wrapfun_jac_iip(jacFunc, (jacProto, u0, p_vec, t0)),
        jac_prototype = jacProto)
+  #= Every direct-RHS problem has a tgrad (_buildTimeDerivative): one erased type. =#
+  tgradFunc === nothing ||
+    (erasedKw = (; erasedKw..., tgrad = DiffEqBase.wrapfun_jac_iip(tgradFunc, (u0, u0, p_vec, t0))))
   return mass_matrix === nothing ?
     ModelingToolkit.ODEFunction{true, FW}(wrappedRHS; sys=sys, erasedKw...) :
     ModelingToolkit.ODEFunction{true, FW}(wrappedRHS; mass_matrix=mass_matrix, sys=sys, erasedKw...)
@@ -246,6 +251,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
      symbolic derivative surfaces only when the function runs, not at build. =#
   local (jacFunc, jacProto) = _buildSparseJacobian(rhs_list, states, params, iv,
                                                    u0, p_vec, tspan[1])
+  local tgradFunc = _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, tspan[1])
 
   # 4. Extract event callbacks from the reduced system and merge with custom callbacks.
   #    Our structural_simplify wrapper uses split=false, so the compiled event
@@ -268,7 +274,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
      isempty(first(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=initResolved)))
     @debug "DirectRHS: pure ODE (identity mass matrix)"
     local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
-                                      sys=reducedSystem, jacFunc=jacFunc, jacProto=jacProto)
+                                      sys=reducedSystem, jacFunc=jacFunc, jacProto=jacProto,
+                                      tgradFunc=tgradFunc)
     if assignParams! !== nothing
       assignParams!(p_vec, u0, tspan[1])
       #= Other tunable parameter values may change them. =#
@@ -285,7 +292,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local mmForF = jacFunc === nothing ? mm : Symbolics.SparseArrays.sparse(mm)
     local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
                                       mass_matrix=mmForF, sys=reducedSystem,
-                                      jacFunc=jacFunc, jacProto=jacProto)
+                                      jacFunc=jacFunc, jacProto=jacProto, tgradFunc=tgradFunc)
     #= Pinned indices: vars whose u0 came from a fixed=true Modelica init eq
        (after splitInitialValues). The DAE init solver must NOT modify these,
        otherwise an algebraic var pinned by `start=1, fixed=true` (e.g.
@@ -849,13 +856,57 @@ function _observedDerivativeTargets(reducedSystem, states, params, iv;
   end
 end
 
+#= The RHS's explicit time derivative ∂F/∂t (states and parameters fixed),
+   the tgrad of the problem: by the DAG differentiation when every row has a
+   derivative rule and it evaluates finite at the entry, else by a central
+   difference (as the solver's own). Rosenbrock methods need it in each step;
+   their finite difference in t has a step growing with t, and its error in
+   the MSL SMEE machines' 50 Hz sources (~0.2 V/s at t = 2.8) set a floor
+   the algebraic step control chased until maxiters (SMEE_DOL stopped at
+   2.835 s after 1e6 steps). =#
+function _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, t0)
+  local tg = _explicitTimeDerivative(rhs_list, states, params, iv)
+  if tg !== nothing
+    #= At the entry guesses (before the initialization): only a row the RHS
+       evaluates finite may not come out non-finite. =#
+    local ok = try
+      local dT = similar(u0)
+      local du = similar(u0)
+      Base.invokelatest(tg, dT, u0, p_vec, t0)
+      rhsFunc(du, u0, p_vec, t0)
+      all(i -> isfinite(dT[i]) || !isfinite(du[i]), eachindex(dT))
+    catch e
+      e isa InterruptException && rethrow()
+      false
+    end
+    ok && return tg
+    @debug "DirectRHS: the symbolic time derivative does not evaluate at the entry; a finite difference instead"
+  else
+    @debug "DirectRHS: no symbolic time derivative; a finite difference instead"
+  end
+  return (dT, u, p, t) -> begin
+    local h = cbrt(eps(Float64)) * max(1.0, abs(t))
+    local f2 = similar(dT)
+    rhsFunc(dT, u, p, t + h)
+    rhsFunc(f2, u, p, t - h)
+    @. dT = (dT - f2) / (2h)
+    nothing
+  end
+end
+
+#= The time derivative of rows that do not read t. =#
+_zeroTimeDerivative(dT, u, p, t) = (fill!(dT, 0); nothing)
+
 #= ∂F/∂t of the rows `exprs` (explicit time) by the DAG differentiation, as an
    in-place `f!(out, u, p, t)`; nothing when a row has no derivative rule (a
    time table). =#
 function _explicitTimeDerivative(exprs, states, params, iv)
   try
-    local Jt = _dagSparseJacobian(exprs, [iv])
-    local col = Any[Jt[i, 1] for i in 1:length(exprs)]
+    #= The states as variables (x(t) would otherwise be a function of t), only t's column. =#
+    local n = length(states)
+    local Jt = _dagSparseJacobian(exprs, vcat(collect(states), [iv]); columns = BitSet((n + 1,)))
+    Symbolics.SparseArrays.nnz(Jt) == 0 && return _zeroTimeDerivative
+    local col = Any[Jt[i, n + 1] for i in 1:length(exprs)]
     local fExpr = Symbolics.build_function(col, states, params, iv; expression = Val{true}, cse = true)
     return _exprToRTGFunction(_demoteWideNumericLiterals!(fExpr[2]))
   catch e
@@ -869,23 +920,29 @@ end
    diagonal mass matrix) at (u, p, t): differentiating the algebraic rows
    0 = F_a(u, t) gives J_aa ż_a = -(J_ad u̇_d + ∂F_a/∂t), with u̇_d = F_d / m_d
    from `du` = F(u). J from the symbolic sparse Jacobian (kept sparse, written
-   into `J`), ∂F_a/∂t from `ft!` or, without it, by a second-order one-sided
-   difference (a time switch at t sees its right limit). The raw RHS with p
+   into `J`), ∂F_a/∂t from `ft!` or, without it (or when it throws or is not
+   finite), by a second-order one-sided difference (a time switch at t sees
+   its right limit there). The raw RHS with p
    fixed: parameters are constant in time. A singular J_aa takes the
    least-squares solution; NaN if anything throws. =#
 function _algebraicDerivatives!(J, rhs, jac, ft!, mm, algIdx, difIdx, u, du, p, t)
   try
     jac(J, u, p, t)
     local Ft = Vector{Float64}(undef, length(algIdx))
-    if ft! === nothing
+    local symbolic = ft! !== nothing && try
+      ft!(Ft, u, p, t)
+      all(isfinite, Ft)
+    catch e
+      e isa InterruptException && rethrow()
+      false
+    end
+    if !symbolic
       local h = cbrt(eps(Float64)) * max(1.0, abs(t))
       local d1 = similar(du)
       local d2 = similar(du)
       rhs(d1, u, p, t + h)
       rhs(d2, u, p, t + 2h)
       Ft .= (-3 .* du[algIdx] .+ 4 .* d1[algIdx] .- d2[algIdx]) ./ (2h)
-    else
-      ft!(Ft, u, p, t)
     end
     local udot_d = Float64[du[i] / mm[i, i] for i in difIdx]
     local b = J[algIdx, difIdx] * udot_d .+ Ft
@@ -1253,7 +1310,7 @@ end
    (jacobian_sparsity: an entry for each state an equation reads), the rules
    are its derivative rules (derivative_idx); throws _NoDagDerivative where
    there is none. =#
-function _dagSparseJacobian(rhs_list, states)
+function _dagSparseJacobian(rhs_list, states; columns::Union{Nothing, AbstractSet{Int}} = nothing)
   local T = Symbolics.VartypeT
   local stateIdx = Dict{Any, Int}(Symbolics.unwrap(s) => j for (j, s) in enumerate(states))
   #= Whole-array uses of scalarized states would read no state here. =#
@@ -1354,6 +1411,7 @@ function _dagSparseJacobian(rhs_list, states)
   for (i, ex) in enumerate(rhs_list)
     local x = Symbolics.unwrap(ex)
     for j in deps(x)
+      columns === nothing || j in columns || continue
       push!(I, i)
       push!(J, j)
       push!(V, Symbolics.Num(derivative(x, j, memos[j])))
