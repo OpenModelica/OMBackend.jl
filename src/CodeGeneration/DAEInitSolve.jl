@@ -119,6 +119,40 @@ function _completeUnderdeterminedInit!(u0, rhsFunc, p_vec, eq_idx, var_idx, algC
   return changed
 end
 
+#= A free unknown guessed at exactly 0 can make a residual row non-finite
+   at the entry (MSL QS FluxTubes GeneralLeakage: `0 = -7e-6 + 0.3/G_m`, G_m
+   without a start value), and then no phase can start. Those guesses become
+   1: all together, else one at a time where it lowers the number of
+   non-finite rows. Only at such an entry, which no phase could solve from.
+   Whether a guess changed. =#
+function _nudgeZeroGuesses!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residuals, fixed)
+  local du = similar(u0)
+  local nonFinite = u -> (rhsFunc(du, u, p_vec, 0.0);
+                          count(!isfinite, _initResidualVec(du, u, eq_idx, eq_target, extra_residuals)))
+  local candidates = [i for i in eachindex(u0) if iszero(u0[i]) && !(i in fixed)]
+  isempty(candidates) && return false
+  local bad = nonFinite(u0)
+  local u = copy(u0)
+  u[candidates] .= 1.0
+  if nonFinite(u) == 0
+    copyto!(u0, u)
+    return true
+  end
+  local changed = false
+  for i in candidates
+    u0[i] = 1.0
+    local b = nonFinite(u0)
+    if b < bad
+      bad = b
+      changed = true
+      bad == 0 && break
+    else
+      u0[i] = 0.0
+    end
+  end
+  return changed
+end
+
 #= `converged` is set false when no phase converged (the result is then the
    best effort the warning or the error below reports). =#
 function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
@@ -143,6 +177,11 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
   local du = similar(u0)
   rhsFunc(du, u0, p_vec, 0.0)
   local init_res_vec = _initResidualVec(du, u0, eq_idx, eq_target, extra_residuals)
+  if !all(isfinite, init_res_vec) &&
+     _nudgeZeroGuesses!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residuals, union(pinned, discrete_pinned))
+    rhsFunc(du, u0, p_vec, 0.0)
+    init_res_vec = _initResidualVec(du, u0, eq_idx, eq_target, extra_residuals)
+  end
   local init_res = isempty(init_res_vec) ? 0.0 : maximum(abs, init_res_vec)
   if init_res < tol
     return u0
