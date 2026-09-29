@@ -579,6 +579,14 @@ function generateExternalOutputAllocations(outputs::Vector)::Vector{Expr}
   return decls
 end
 
+#= A Modelica Integer (or Boolean) array for a C `int*`: rounded, since an
+   Integer held in the Float64 state vector can be an ulp off after a solver
+   step (the MSL noise generators' xorshift states, 1.3705433889999998e9 for
+   1370543389: `convert` threw InexactError in ActuatorWithNoise). =#
+_roundToCint(x::AbstractArray{Cint}) = x
+_roundToCint(x::AbstractArray) = map(v -> v isa Integer ? Cint(v) : round(Cint, v), x)
+_roundToCint(x) = x
+
 function generateExternalInputConversions(inputs::Vector)::Vector{Expr}
   local conversions = Expr[]
   for v in inputs
@@ -587,7 +595,8 @@ function generateExternalInputConversions(inputs::Vector)::Vector{Expr}
       local jlElemType = _ccallElemType(_funcParamElemType(v))
       local nDims = length(collect(_funcParamDims(v)))
       local containerTy = nDims >= 2 ? :(Matrix{$jlElemType}) : :(Vector{$jlElemType})
-      push!(conversions, :($s = convert($containerTy, $s)))
+      local value = jlElemType === :Cint ? :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration._roundToCint($s)) : s
+      push!(conversions, :($s = convert($containerTy, $value)))
     end
   end
   return conversions
