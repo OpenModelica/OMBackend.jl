@@ -693,42 +693,32 @@ The topmost model of a system consisting of several sub models lacks:
   - Information if it is singular or not.
 This information is instead contained for each of the structural submodels, where one model is active at the time.
 """
-struct SIM_CODE{T0<:String,
-                T1<:AbstractDict{String, Tuple{Int, SimVar}},
-                T2<:Vector{RESIDUAL_EQUATION},
+#= Type parameters only where the field's type varies (the name table's
+   dictionary, the initial equations, the graph, the components, the
+   submodels); the others were parameters constrained to one concrete type. =#
+struct SIM_CODE{T1<:AbstractDict{String, Tuple{Int, SimVar}},
                 T22,
-                T4<:Vector{WHEN_EQUATION},
-                #=
-                  If equations are represented via a vector of possible branches in which the code can operate.
-                  Similar to basic blocks
-                =#
-                T5<:Vector{IF_EQUATION},
-                T6<:Bool,
-                T7<:Vector{Int},
                 T8<:Graphs.AbstractGraph,
                 T9<:Vector,
-                T10 <: Vector{StructuralTransition},
-                T11 <: Vector,
-                T12 <: Vector{String},
-                T13 <: String} <: SimCode
-  name::T0
+                T11<:Vector} <: SimCode
+  name::String
   "Mapping of names to the corresponding variable"
   stringToSimVarHT::T1
   "Different equations stored within simulation code"
-  residualEquations::T2
+  residualEquations::Vector{RESIDUAL_EQUATION}
   "The Initial equations"
   initialEquations::T22
   "When equations"
-  whenEquations::T4
+  whenEquations::Vector{WHEN_EQUATION}
   "If Equations (Simulation code branches). Each branch contains a condition a set of residual equations and a set of targets"
-  ifEquations::T5
+  ifEquations::Vector{IF_EQUATION}
   "True if the system that we are solving is singular"
-  isSingular::T6
+  isSingular::Bool
   "
    The match order:
    Result of assign array, e.g array(j) = equation_i
   "
-  matchOrder::T7
+  matchOrder::Vector{Int}
     "
     The merged graph. E.g digraph constructed from matching info.
     The indices are the same as above and they are shared.
@@ -738,21 +728,21 @@ struct SIM_CODE{T0<:String,
   " The reverse topological sort of the equation-graph "
   stronglyConnectedComponents::T9
   "Contains all structural transitions"
-  structuralTransitions::T10
+  structuralTransitions::Vector{StructuralTransition}
   "Structural submodels"
   subModels::T11
   " Variables that different submodels have in common"
-  sharedVariables::T12
+  sharedVariables::Vector{String}
   "Top variables"
-  topVariables::T12
+  topVariables::Vector{String}
   "Shared equations. These are equations shared between structural submodels. These are required to be residuals."
   sharedEquations::Vector{Equation}
   "Initial model"
-  activeModel::T13
+  activeModel::String
   "The MetaModel. That is a reference from the model to a higher order representation of the model itself."
   metaModel::Option
   "Irreductable variables. That is the names of variables that are involved in events such as discrete variables"
-  irreducibleVariables::T12
+  irreducibleVariables::Vector{String}
   "Modelica functions"
   functions::Vector{ModelicaFunction}
   "Specify if an external Modelica runtime is needed or not. Used for build in functions"

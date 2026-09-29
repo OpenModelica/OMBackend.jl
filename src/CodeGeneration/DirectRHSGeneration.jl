@@ -994,15 +994,11 @@ end
    or they cannot be observed. =#
 function _initialDiscreteClusters(clusters, reducedSystem, startOf::AbstractDict{String, Float64})
   isempty(clusters) && return nothing
-  local SII = ModelingToolkit.SymbolicIndexingInterface
   local starts = Pair{Int, Float64}[]
   local preStarts = Vector{Union{Nothing, Float64}}[]
   try
     for c in clusters
-      c.values = _buildObservedFunction(reducedSystem, c.reads)
-      c.crossings! = first(_buildObservedFunction(reducedSystem, c.reads[(c.nOperands + c.nPre + 1):end];
-                                                  return_inplace = Val(true)))
-      c.memberIndex = Int[something(SII.variable_index(reducedSystem, m), 0) for m in c.members]
+      _bindToSystem!(c, reducedSystem)
       for (n, k) in zip(c.names, c.memberIndex)
         k == 0 || !haskey(startOf, n) || push!(starts, k => startOf[n])
       end

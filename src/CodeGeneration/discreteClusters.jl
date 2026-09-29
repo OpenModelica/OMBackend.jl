@@ -96,13 +96,20 @@ function _ruled(c::DiscreteCluster, zs, k::Int, H, old::Bool)
   return _hysteresisRule(zs[2k - 1], H * zs[2k], old)
 end
 
-#= The functions for the problem's system. =#
-function _bind!(c::DiscreteCluster, problem)
+#= The functions for a system (the problem's, or the reduced system before
+   the problem exists): the reads, the crossing functions in place, the
+   members' indices. =#
+function _bindToSystem!(c::DiscreteCluster, sys)
   local SII = ModelingToolkit.SymbolicIndexingInterface
-  local sys = problem.f.sys
   c.values = _buildObservedFunction(sys, c.reads)
   c.crossings! = first(_buildObservedFunction(sys, c.reads[(c.nOperands + c.nPre + 1):end]; return_inplace = Val(true)))
   c.memberIndex = Int[something(SII.variable_index(sys, m), 0) for m in c.members]
+  return c
+end
+
+#= The functions for the problem's system. =#
+function _bind!(c::DiscreteCluster, problem)
+  _bindToSystem!(c, problem.f.sys)
   for (name, k) in zip(c.names, c.memberIndex)
     k == 0 && @warn "[events] the discrete $name is not an unknown of the system; its when cannot change it"
   end

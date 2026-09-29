@@ -256,9 +256,19 @@ function relationWhenCallback(names::Vector{String}, eval, strict::Bool, body!)
     local (zc, scale) = _whenValues(a, u, t, integrator)
     return zc + _hysteresisFromTolerance(integrator) * scale * (1 - 2 * a.rel)
   end
+  #= A new solve: the relation starts literal again. The value functions are
+     kept for the same system (they were built again at every solve: one
+     generated function per name, per when, as OMSurrogates solves a build
+     over and over). =#
   local initialize = function (c, u, t, integrator)
-    a.sys = :unresolved; a.fns = nothing
-    _whenFunctions(a, integrator)
+    local sys = hasproperty(integrator.f, :sys) ? integrator.f.sys : nothing
+    if a.sys === sys && a.fns !== nothing
+      a.rel = _whenLiteral(a, integrator.u, integrator.t, integrator)
+      a.last = a.rel
+    else
+      a.sys = :unresolved; a.fns = nothing
+      _whenFunctions(a, integrator)
+    end
     return nothing
   end
   #= RightRootFind: the event lands just past the root, where the rule sees

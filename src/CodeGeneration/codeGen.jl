@@ -89,7 +89,7 @@ end
   This function can be disabled by setting the named argument
   generateSaveFunction to false.
 """
-function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = true) where {N, S}
+function createCallbackCode(modelName, simCode; generateSaveFunction = true)
   #= Synthesised discrete-Boolean whens (`change(rel)` conditions) are discrete
      clusters of the event iteration (emitDiscreteClusters) or, with
      OMBACKEND_DISCRETE_PRE_MEMORY=false, MTK SymbolicContinuousCallbacks
@@ -1244,20 +1244,20 @@ end
   $(SIGNATURES)
 The context can be any type that contains a set of residual equations.
 """
-function expToJuliaExp(e::SimulationCode.BCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.BCONST, context, varSuffix=""; varPrefix="x")::Expr
   quote $(e.value) end
 end
-function expToJuliaExp(e::SimulationCode.ICONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.ICONST, context, varSuffix=""; varPrefix="x")::Expr
   quote $(e.value) end
 end
-function expToJuliaExp(e::SimulationCode.RCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.RCONST, context, varSuffix=""; varPrefix="x")::Expr
   quote $(e.value) end
 end
-function expToJuliaExp(e::SimulationCode.SCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.SCONST, context, varSuffix=""; varPrefix="x")::Expr
   quote $(e.value) end
 end
 
-function expToJuliaExp(e::SimulationCode.EXP_CREF, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.EXP_CREF, context, varSuffix=""; varPrefix="x")::Expr
   local hashTable = context.stringToSimVarHT
   local varName = SimulationCode.string(SimulationCode.toDAECref(e.cref).componentRef)
   if varName == "time"
@@ -1295,13 +1295,13 @@ function expToJuliaExp(e::SimulationCode.EXP_CREF, context::C, varSuffix=""; var
   end
 end
 
-function expToJuliaExp(e::SimulationCode.UNARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.UNARY, context, varSuffix=""; varPrefix="x")::Expr
   local o = opKindToJuliaOperator(e.op)
   quote
     $(o)($(expToJuliaExp(e.exp, context, varPrefix=varPrefix)))
   end
 end
-function expToJuliaExp(e::SimulationCode.BINARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.BINARY, context, varSuffix=""; varPrefix="x")::Expr
   local a = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
   local b = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
   local o = opKindToJuliaOperator(e.op)
@@ -1309,14 +1309,14 @@ function expToJuliaExp(e::SimulationCode.BINARY, context::C, varSuffix=""; varPr
     $o($(a), $(b))
   end
 end
-function expToJuliaExp(e::SimulationCode.LUNARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.LUNARY, context, varSuffix=""; varPrefix="x")::Expr
   local lhs = expToJuliaExp(e.exp, context, varPrefix=varPrefix)
   local o = opKindToJuliaOperator(e.op)
   quote
     $o($(lhs))
   end
 end
-function expToJuliaExp(e::SimulationCode.LBINARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.LBINARY, context, varSuffix=""; varPrefix="x")::Expr
   local l = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
   local o = opKindToJuliaOperator(e.op)
   local r = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
@@ -1324,7 +1324,7 @@ function expToJuliaExp(e::SimulationCode.LBINARY, context::C, varSuffix=""; varP
     $o($(l), $(r))
   end
 end
-function expToJuliaExp(e::SimulationCode.RELATION, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.RELATION, context, varSuffix=""; varPrefix="x")::Expr
   local lhs = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
   local o = opKindToJuliaOperator(e.op)
   local rhs = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
@@ -1332,13 +1332,13 @@ function expToJuliaExp(e::SimulationCode.RELATION, context::C, varSuffix=""; var
     $o($(lhs), $(rhs))
   end
 end
-function expToJuliaExp(e::SimulationCode.IFEXP, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.IFEXP, context, varSuffix=""; varPrefix="x")::Expr
   local condJL = expToJuliaExp(e.cond, context, varPrefix=varPrefix)
   local thenJL = expToJuliaExp(e.thenExp, context, varPrefix=varPrefix)
   local elseJL = expToJuliaExp(e.elseExp, context, varPrefix=varPrefix)
   :(ifelse($(condJL), $(thenJL), $(elseJL)))
 end
-function expToJuliaExp(e::SimulationCode.CALL, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.CALL, context, varSuffix=""; varPrefix="x")::Expr
   local hashTable = context.stringToSimVarHT
   @match e.path begin
     Absyn.IDENT(nm) => begin
@@ -1356,18 +1356,18 @@ function expToJuliaExp(e::SimulationCode.CALL, context::C, varSuffix=""; varPref
     end
   end
 end
-function expToJuliaExp(e::SimulationCode.CAST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.CAST, context, varSuffix=""; varPrefix="x")::Expr
   quote
     $(generateCastExpression(SimulationCode.toDAEType(e.ty), SimulationCode.toDAEExp(e.exp), context, varPrefix))
   end
 end
 Base.@nospecializeinfer function expToJuliaExp(@nospecialize(exp::SimulationCode.Exp),
-                                               @nospecialize(context::C),
-                                               varSuffix = ""; varPrefix = "x")::Expr where {C}
+                                               @nospecialize(context),
+                                               varSuffix = ""; varPrefix = "x")::Expr
   unsupported("expression", exp)
 end
 
-function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(exp::DAE.Exp, context, varSuffix=""; varPrefix="x")::Expr
   hashTable = context.stringToSimVarHT
   local expr::Expr = begin
     local int::Int64
