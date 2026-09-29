@@ -165,7 +165,7 @@ end
 """
 Transforms a DAE Condition into a MTK continuous condition.
 """
-function transformToMTKContinuousCondition(cond, simCode)
+function transformToMTKContinuousCondition(cond, simCode; atInitial::Bool = false)
   # @match patterns are DAE.* only; convert SIM-side conditions at entry.
   if cond isa SimulationCode.Exp
     cond = SimulationCode.toDAEExp(cond)
@@ -197,30 +197,33 @@ function transformToMTKContinuousCondition(cond, simCode)
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      :(min($(transformToMTKContinuousCondition(e1, simCode)),
-            $(transformToMTKContinuousCondition(e2, simCode))))
+      :(min($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
+            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))))
     end
     DAE.LBINARY(e1, DAE.AND(__), e2) => begin
-      :(max($(transformToMTKContinuousCondition(e1, simCode)),
-            $(transformToMTKContinuousCondition(e2, simCode))))
+      :(max($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
+            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))))
     end
     #= Logical NOT: negate the inner condition =#
     DAE.LUNARY(DAE.NOT(__), e) => begin
-      :(-($(transformToMTKContinuousCondition(e, simCode))))
+      :(-($(transformToMTKContinuousCondition(e, simCode; atInitial = atInitial))))
     end
     #= Strip noEvent wrapper and recurse =#
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
-        transformToMTKContinuousCondition(innerArgs[1], simCode)
+        transformToMTKContinuousCondition(innerArgs[1], simCode; atInitial = atInitial)
       else
         throw("noEvent with multiple arguments not supported in condition: " * string(cond))
       end
     end
-    #= initial() is true only during initialization (handled by MTK InitializationProblem).
-       In continuous equations it never triggers, so return constant negative. =#
+    #= initial() is true during the initialization (`atInitial`: the
+       condition's initial value) and false after it: a constant crossing
+       function, negative (true) or positive (false). The event iteration's
+       start re-evaluation reads the runtime one (MSL FluxTubes' Tellinen
+       hysteresis stayed in its `if initial()` branch, k = 0.01, dHyst = 0). =#
     DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
-      :(-1)
+      atInitial ? :(-1) : :(1)
     end
     #= General function call as boolean condition: same polarity rule. =#
     DAE.CALL(__) => begin
@@ -236,7 +239,7 @@ end
 """
 Transforms a DAE Condition into a MTK continuous condition equation.
 """
-function transformToMTKContinuousConditionEquation(cond, simCode)
+function transformToMTKContinuousConditionEquation(cond, simCode; atInitial::Bool = false)
   # @match patterns are DAE.* only; convert SIM-side conditions at entry.
   if cond isa SimulationCode.Exp
     cond = SimulationCode.toDAEExp(cond)
@@ -273,30 +276,29 @@ function transformToMTKContinuousConditionEquation(cond, simCode)
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      :(min($(transformToMTKContinuousCondition(e1, simCode)),
-            $(transformToMTKContinuousCondition(e2, simCode))) ~ 0)
+      :(min($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
+            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))) ~ 0)
     end
     DAE.LBINARY(e1, DAE.AND(__), e2) => begin
-      :(max($(transformToMTKContinuousCondition(e1, simCode)),
-            $(transformToMTKContinuousCondition(e2, simCode))) ~ 0)
+      :(max($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
+            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))) ~ 0)
     end
     #= Logical NOT: negate the inner condition =#
     DAE.LUNARY(DAE.NOT(__), e) => begin
-      :(-($(transformToMTKContinuousCondition(e, simCode))) ~ 0)
+      :(-($(transformToMTKContinuousCondition(e, simCode; atInitial = atInitial))) ~ 0)
     end
     #= Strip noEvent wrapper and recurse =#
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
-        transformToMTKContinuousConditionEquation(innerArgs[1], simCode)
+        transformToMTKContinuousConditionEquation(innerArgs[1], simCode; atInitial = atInitial)
       else
         throw("noEvent with multiple arguments not supported in condition: " * string(cond))
       end
     end
-    #= initial() is true only during initialization (handled by MTK InitializationProblem).
-       In continuous equations it never triggers, so return constant negative equation. =#
+    #= initial(): see transformToMTKContinuousCondition. =#
     DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
-      :(-1 ~ 0)
+      atInitial ? :(-1 ~ 0) : :(1 ~ 0)
     end
     #= General function call as boolean condition: same polarity rule as above. =#
     DAE.CALL(__) => begin

@@ -100,9 +100,8 @@ end
 function _bind!(c::DiscreteCluster, problem)
   local SII = ModelingToolkit.SymbolicIndexingInterface
   local sys = problem.f.sys
-  c.values = ModelingToolkit.build_explicit_observed_function(sys, c.reads)
-  c.crossings! = first(ModelingToolkit.build_explicit_observed_function(sys, c.reads[(c.nOperands + c.nPre + 1):end];
-                                                                        return_inplace = Val(true)))
+  c.values = _buildObservedFunction(sys, c.reads)
+  c.crossings! = first(_buildObservedFunction(sys, c.reads[(c.nOperands + c.nPre + 1):end]; return_inplace = Val(true)))
   c.memberIndex = Int[something(SII.variable_index(sys, m), 0) for m in c.members]
   for (name, k) in zip(c.names, c.memberIndex)
     k == 0 && @warn "[events] the discrete $name is not an unknown of the system; its when cannot change it"

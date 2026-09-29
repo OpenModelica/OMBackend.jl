@@ -976,7 +976,7 @@ function _initialRelationLiterals(reducedSystem, params, entries)
   end
   isempty(kept) && return nothing
   local f = try
-    ModelingToolkit.build_explicit_observed_function(reducedSystem, zcs)
+    _buildObservedFunction(reducedSystem, zcs)
   catch e
     @debug "DirectRHS: relation literals not observable; the initialization keeps the compiled ifConds" exception = e
     return nothing
@@ -1010,10 +1010,9 @@ function _initialDiscreteClusters(clusters, reducedSystem, startOf::AbstractDict
   local preStarts = Vector{Union{Nothing, Float64}}[]
   try
     for c in clusters
-      c.values = ModelingToolkit.build_explicit_observed_function(reducedSystem, c.reads)
-      c.crossings! = first(ModelingToolkit.build_explicit_observed_function(reducedSystem,
-                                                                            c.reads[(c.nOperands + c.nPre + 1):end];
-                                                                            return_inplace = Val(true)))
+      c.values = _buildObservedFunction(reducedSystem, c.reads)
+      c.crossings! = first(_buildObservedFunction(reducedSystem, c.reads[(c.nOperands + c.nPre + 1):end];
+                                                  return_inplace = Val(true)))
       c.memberIndex = Int[something(SII.variable_index(reducedSystem, m), 0) for m in c.members]
       for (n, k) in zip(c.names, c.memberIndex)
         k == 0 || !haskey(startOf, n) || push!(starts, k => startOf[n])
@@ -2085,8 +2084,13 @@ function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=
     return nothing
   end
   if isempty(freeVars)
-    local f = tryparse(Float64, string(val))
+    local str = string(val)
+    local f = tryparse(Float64, str)
     f !== nothing && return f
+    #= A Boolean start value (MSL FluxTubes' asc(start = true)): a symbolic
+       constant true that became 0.0, false. =#
+    local b = tryparse(Bool, str)
+    b !== nothing && return Float64(b)
   end
   if resolvedParams !== nothing
     # Direct name lookup (handles bare parameter references)

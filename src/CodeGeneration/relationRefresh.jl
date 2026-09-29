@@ -37,7 +37,7 @@
 function _valueGetter(problem, @nospecialize(ex))
   local v = Symbolics.unwrap(ex)
   (v isa Real && !(v isa Symbolics.Num)) && return (integrator -> Float64(v))
-  local f = ModelingToolkit.build_explicit_observed_function(problem.f.sys, v)
+  local f = _buildObservedFunction(problem.f.sys, v)
   return integrator -> f(integrator.u, integrator.p, integrator.t)
 end
 
@@ -153,7 +153,7 @@ function namedValueFunctions(sys, names::Vector{String})
     byName[_plainVariableName(p)] = p
   end
   all(n -> haskey(byName, n), names) || return nothing
-  return [ModelingToolkit.build_explicit_observed_function(sys, byName[n]) for n in names]
+  return [_buildObservedFunction(sys, byName[n]) for n in names]
 end
 
 """
@@ -511,7 +511,13 @@ function _initializeRelations!(e::EventIteration, integrator)
     _initialize!(c, integrator) && (changed = true)
   end
   local r = e.ifRelations
-  r !== nothing && _bufferValues(r.buffers, integrator) != r.compiled && (changed = true)
+  if r !== nothing
+    _bufferValues(r.buffers, integrator) != r.compiled && (changed = true)
+    #= A relation the initialized state puts on its other side takes that
+       value now, not after the first step: an `initial()` condition, false
+       after the initialization (its first branch was integrated for a step). =#
+    _update!(r, integrator) && (changed = true)
+  end
   changed || return nothing
   if !_resolveAlgebraics!(integrator, e.reinit)
     @error "[events] the algebraic variables could not be solved at the start (t = $(integrator.t))"

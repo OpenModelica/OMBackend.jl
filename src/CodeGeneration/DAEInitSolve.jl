@@ -280,12 +280,7 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
     rhsFunc(du, u0, p_vec, 0.0)
     local resids = abs.(_initResidualVec(du, u0, eq_idx, eq_target, extra_residuals))
     local final_res = maximum(resids)
-    if !isfinite(final_res)
-      @error "DAE init: residual is non-finite ($final_res); ICs unverified, integrator may NaN."
-    elseif final_res >= failure_threshold
-      local order = sortperm(resids; rev = true)
-      local worst = order[1:min(5, length(order))]
-      local detail = join((begin
+    local rowsDetail = rows -> join((begin
         local label
         if w <= length(eq_idx)
           local k = eq_idx[w]
@@ -296,8 +291,14 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
           label = string("initialization eq row ", w - length(eq_idx))
         end
         string(label, " residual ", round(resids[w], sigdigits = 4))
-      end for w in worst), "\n  ")
-      error("DAE init: residual $(round(final_res, sigdigits=4)) exceeds threshold $(failure_threshold); refusing inconsistent ICs. Worst:\n  $(detail)")
+      end for w in rows), "\n  ")
+    if !isfinite(final_res)
+      local bad = findall(!isfinite, resids)
+      @error "DAE init: residual is non-finite ($final_res); ICs unverified, integrator may NaN. Rows:\n  " *
+             rowsDetail(bad[1:min(5, length(bad))])
+    elseif final_res >= failure_threshold
+      local order = sortperm(resids; rev = true)
+      error("DAE init: residual $(round(final_res, sigdigits=4)) exceeds threshold $(failure_threshold); refusing inconsistent ICs. Worst:\n  $(rowsDetail(order[1:min(5, length(order))]))")
     else
       @warn "DAE init: did not fully converge (residual $(round(final_res, sigdigits=4)) < threshold $(failure_threshold)); proceeding."
     end

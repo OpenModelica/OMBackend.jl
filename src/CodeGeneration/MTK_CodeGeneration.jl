@@ -1226,6 +1226,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       end
       eqs = collect(Iterators.flatten(equationComponents))
       eqs = Base.invokelatest(OMBackend.CodeGeneration.filterConstantEquations, eqs)
+      eqs = Base.invokelatest(OMBackend.CodeGeneration.expandExpressionDerivatives, eqs)
       #= System(eqs, ...) requires eqs::Vector{Equation}; an equation-free model yields an untyped empty vector. =#
       eqs = convert(Vector{Symbolics.Equation}, eqs)
       #= Events and observed equations =#
@@ -2129,7 +2130,7 @@ function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode,
   local conds = Any[]
   local closed = Bool[]
   for b in condBranches
-    push!(conds, transformToMTKContinuousConditionEquation(b.condition, simCode))
+    push!(conds, transformToMTKContinuousConditionEquation(b.condition, simCode; atInitial = true))
     push!(closed, MTK_CodeGenerationUtil.condClosedAtBoundary(b.condition))
   end
   local valMap = nothing
@@ -2253,7 +2254,9 @@ function createIfEquation(stateVariables::Vector,
            the zc == 0 boundary. Precomputed via the relay-aware fixed point. =#
         local _closedB = MTK_CodeGenerationUtil.condClosedAtBoundary(branch.condition)
         local ivCond = condIdx <= length(ivPre) ? ivPre[condIdx] :
-                       evalInitialCondition(mtkCond, simCode; closedBoundary = _closedB, extraVals = _rT0)
+                       evalInitialCondition(transformToMTKContinuousConditionEquation(branch.condition, simCode;
+                                                                                      atInitial = true),
+                                            simCode; closedBoundary = _closedB, extraVals = _rT0)
         local numVal = ivCond ? 1.0 : 0.0
         local invVal = ivCond ? 0.0 : 1.0
         #= Build ImperativeAffect: function returns a NamedTuple of new values.
@@ -5144,13 +5147,41 @@ end
    at its default (0) — e.g. `T_start := startTime + count*period` in the
    trapezoid signal source was silently dropped, breaking every model that
    relies on `initial algorithm` to seed states. =#
+#= der(x) in a runtime initial algorithm (the initial() arm of a relation
+   on a derivative, MSL FluxTubes' `asc = der(Hstat) > 0`) reads the
+   derivative at the problem's initial state; there is no `der` function. =#
+function _initialDerivativeReads(ex)
+  ex isa Expr || return ex
+  if ex.head === :call && length(ex.args) == 2 && ex.args[1] === :der
+    local x = _blockValue(ex.args[2])
+    x isa Symbol && return :(OMBackend.CodeGeneration._initialDerivative(LATEST_PROBLEM, $(QuoteNode(x))))
+  end
+  return Expr(ex.head, map(_initialDerivativeReads, ex.args)...)
+end
+
+#= The value of a `begin #= line =# x end` the algorithm lowering wraps
+   expressions in. =#
+function _blockValue(ex)
+  (ex isa Expr && ex.head === :block) || return ex
+  local body = filter(a -> !(a isa LineNumberNode), ex.args)
+  return length(body) == 1 ? _blockValue(body[1]) : ex
+end
+
+#= The derivative of the variable `name` at `problem`'s initial state. =#
+function _initialDerivative(problem, name::Symbol)
+  local sys = problem.f.sys
+  local d = ModelingToolkit.Differential(ModelingToolkit.get_iv(sys))(getproperty(sys, name))
+  local f = _buildObservedFunction(sys, d)
+  return Float64(f(problem.u0, problem.p, first(problem.tspan)))
+end
+
 function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
                                renamedNames::OrderedSet{String} = OrderedSet{String}())
   local sub = e -> _substituteBoundParameters(e, simCode)
-  local lowerAlg = e -> _renameAlgIdentifiers(
+  local lowerAlg = e -> _initialDerivativeReads(_renameAlgIdentifiers(
     _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))),
     renamedNames,
-    "")
+    ""))
   local crefName = cr -> SimulationCode.DAE_identifierToString(cr)
   if wStmt isa BDAE.NORETCALL || wStmt isa SimulationCode.NORETCALL
     return :( $(lowerAlg(wStmt.exp)); nothing )
