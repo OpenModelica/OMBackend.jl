@@ -467,22 +467,6 @@ function deduplicateEquations(equations::Vector)::Vector
   return unique_eqs
 end
 
-function convertVariableIntoBDAEVariable(var::OMFrontend.Frontend.Variable)
-  elem = OMFrontend.Frontend.convertVariable(var, OMFrontend.Frontend.VARIABLE_CONVERSION_SETTINGS(true, false, true))
-  BDAE.VAR(elem.componentRef,
-           BDAEUtil.DAE_VarKind_to_BDAE_VarKind(elem.kind),
-           elem.direction,
-           elem.ty,
-           elem.binding,
-           elem.dims,
-           elem.source,
-           _maybeMarkAttrProtected(elem.variableAttributesOption, elem.protection),
-           NONE(), #=Tearing=#
-           elem.connectorType,
-           false #=We do not know if we can replace or not yet=#
-           )
-end
-
 #= Carry the DAE.VAR `protection` flag onto the variable attribute Option so
    the SimCode-layer `dropObservationOnlyVariables` pass can pick it up. =#
 function _maybeMarkAttrProtected(vattr, protection)
@@ -1356,12 +1340,6 @@ Base.@nospecializeinfer function _walkRhsCrefsInDAEStmts!(out::OrderedSet{Tuple{
   return nothing
 end
 
-function _collectRhsCrefsInDAEStmts(daeStmts)::OrderedSet{Tuple{DAE.ComponentRef, DAE.Type}}
-  local out = OrderedSet{Tuple{DAE.ComponentRef, DAE.Type}}()
-  _walkRhsCrefsInDAEStmts!(out, daeStmts)
-  return out
-end
-
 #= Best-effort: extract the type carried by a `DAE.ComponentRef`. Each
    CREF_IDENT / CREF_QUAL stores its identType; CREF_ITER and WILD are not
    useful triggers. =#
@@ -1392,37 +1370,6 @@ Base.@nospecializeinfer function _dropLeadingArrayDim(@nospecialize(ty))
     return DAE.T_ARRAY(ty.ty, MetaModelica.list(dims[2:end]...))
   end
   return ty
-end
-
-#= True if all top-level STMT_ASSIGN / STMT_ASSIGN_ARR LHSes in `daeStmts`
-   have a discrete Modelica type (Integer / Boolean / enumeration, or arrays
-   thereof). Statements that are not assignments contribute nothing. Per
-   Modelica spec §17.4.4 this is the gating condition for lifting the
-   algorithm body into a when-equation; algorithms with any Real LHS keep
-   continuous semantics and are routed to the residual lifter (if at all). =#
-function _allAssignsDiscreteLhs(daeStmts)::Bool
-  local sawAssign = false
-  for s in daeStmts
-    @match s begin
-      DAE.STMT_ASSIGN(ty, _, _, _) => begin
-        sawAssign = true
-        _isDiscreteDAEType(ty) || return false
-      end
-      DAE.STMT_ASSIGN_ARR(ty, _, _, _) => begin
-        sawAssign = true
-        _isDiscreteDAEType(ty) || return false
-      end
-      _ => nothing
-    end
-  end
-  return sawAssign
-end
-
-#= Build the `BDAE.WhenOperator` list from a list of `DAE.Statement` items
-   that come from a non-when `algorithm` body. Reuses `_daeStmtsToWhenOps`
-   for the underlying assignment / noretcall / reinit lowering. =#
-function _algStmtsToWhenOpsDiscrete(daeStmts)
-  return _daeStmtsToWhenOps(daeStmts)
 end
 
 Base.@nospecializeinfer function _isSingleStraightDiscreteAssign(@nospecialize(daeStmts))::Bool
@@ -2205,29 +2152,12 @@ Base.@nospecializeinfer function _walkDiscreteStmtsForRhsCrefs!(out::Vector{DAE.
   return nothing
 end
 
-Base.@nospecializeinfer function _collectDiscreteRhsCrefs(@nospecialize(daeStmts))::Vector{DAE.ComponentRef}
-  local out = DAE.ComponentRef[]
-  local seen = OrderedSet{String}()
-  local blocked = OrderedSet{String}()
-  _walkDiscreteStmtsForRhsCrefs!(out, seen, blocked, daeStmts)
-  return out
-end
-
 Base.@nospecializeinfer function _makeChangeCall(@nospecialize(cref))
   local ty = _crefType(cref)
   local callArg = DAE.CREF(cref, ty === nothing ? DAE.T_REAL_DEFAULT : ty)
   return DAE.CALL(Absyn.IDENT("change"),
                   MetaModelica.list(callArg),
                   DAE.callAttrBuiltinBool)
-end
-
-Base.@nospecializeinfer function _buildChangeOrCondition(crefs::Vector{DAE.ComponentRef})
-  isempty(crefs) && return DAE.BCONST(false)
-  local acc = _makeChangeCall(crefs[1])
-  for i in 2:length(crefs)
-    acc = DAE.LBINARY(acc, DAE.OR(DAE.T_BOOL_DEFAULT), _makeChangeCall(crefs[i]))
-  end
-  return acc
 end
 
 #= §17.4.4 equation-section lift. A discrete (Bool/Int/enum) variable defined by

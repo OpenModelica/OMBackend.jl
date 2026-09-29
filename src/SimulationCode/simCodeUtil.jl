@@ -348,20 +348,10 @@ function isOCCVar(simVar::SimVar)::Bool
   end
 end
 
-"""
-  Fetches the last identifier of a variable.
-That is:
-getLastIdentOfVar(Foo.Bar.x) => x
-"""
-function getLastIdentOfVar(var)::String
-  getIdentOfComponentReference(var.varName)
-end
-
 
 """
  Fetches the inner identifier of a variable and converts it to a string.
 That is:
-getLastIdentOfVar(Foo.Bar.x) => "Bar_x"
 """
 function getInnerIdentOfVar(var)::String
   res = @match var.varName begin
@@ -437,64 +427,6 @@ function dumpVariableEqMapping(mapping::OrderedDict, residualEquations, ifEquati
   return String(take!(dump))
 end
 
-"""
-input digraph
-input variablesHT
-  cref -> variable information dictionary.
-output
-  An array of labels for a directed graph g.
-"""
-function makeLabels(digraph, matchOrder, variablesHT)
-  variableIndexToName::OrderedDict = makeIndexVarNameDict(matchOrder, variablesHT)
-  labels = String[]
-  for i in 1:length(matchOrder)
-    try
-      variableIdx = MetaGraphs.get_prop(digraph, i, :vID)
-      equationIdx = matchOrder[variableIdx]
-      idxToName = variableIndexToName[variableIdx]
-      push!(labels, "e$(equationIdx)|$(idxToName)|index_$(i)")
-    catch #= For instance the case when a vertex v does not have a prop =#
-      idxToName = variableIndexToName[i]
-      push!(labels, "e$(NONE)|$(idxToName)|index_$(i)")
-    end
-  end
-  return labels
-end
-
-
-"""
-  idx -> var-name.
-  Supply matching order and a ht.
-"""
-function makeIndexVarNameDict(matchOrder, variablesHT)::DataStructures.OrderedDict
-  local unknownVariables = filter((x) -> isVariableOrState(x[2].varKind), collect(values(variablesHT)))
-  variableIndexToName::DataStructures.OrderedDict = DataStructures.OrderedDict()
-  for v in unknownVariables
-    variableIndexToName[v[1]] = v[2].name
-  end
-  return variableIndexToName
-end
-
-"""
-  idx -> var-name.
-  Supply matching order and a ht.
-"""
-function makeIndexVarNameUnorderedDict(matchOrder, variablesHT)::Dict
-  local unknownVariables = filter((x) -> isVariableOrState(x[2].varKind), collect(values(variablesHT)))
-  variableIndexToName::Dict = DataStructures.OrderedDict()
-  for v in unknownVariables
-    variableIndexToName[v[1]] = v[2].name
-  end
-  return variableIndexToName
-end
-
-function isVariableOrState(type::SimVarType)
-  return @match type begin
-    ALG_VARIABLE(__) => true
-    STATE(__) => true
-    _ => false
-  end
-end
 
 
 
@@ -754,19 +686,6 @@ function getIndiciesOfVariables(variables,
     end
   end
   return indicies
-end
-
-"""
-  Returns the residual equation a specific variable is solved in.
-  We search for this equation among the residuals in the context.
-  The context should be either the top level simcode or a specific branch of some if equation.
-"""
-function getEquationSolvedIn(variable::V, context::C) where {V, C}
-  local ht = context.stringToSimVarHT
-  local variableIdx = ht[variable][1]
-  local equationIdx = context.matchOrder[variableIdx]
-  #= Return the equation at this specific index =#
-  return context.residualEquations[equationIdx]
 end
 
 """

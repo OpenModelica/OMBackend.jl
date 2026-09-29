@@ -52,7 +52,7 @@ const CONST_TABLE_LOOKUP_HEAD = :constTableLookup
 """
     evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
 
-Phase A of `ODE_MODE_MTK_MODEL_GENERATION`: `eval` each generated Modelica
+For `ODE_MODE_MTK_MODEL_GENERATION`: `eval` each generated Modelica
 function body in OMBackend, then `eval` the `@register_symbolic` calls that
 make Symbolics aware of them.
 
@@ -128,7 +128,7 @@ end
 """
     classifyVariables(simCode) -> ClassifiedVariables
 
-Phase B of `ODE_MODE_MTK_MODEL_GENERATION`: walk `simCode.stringToSimVarHT`
+For `ODE_MODE_MTK_MODEL_GENERATION`: walk `simCode.stringToSimVarHT`
 once and bucket each variable by its `varKind`. `ALG_VARIABLE` has the
 most subtle fall-through:
 
@@ -777,7 +777,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
             $(Symbol("$(MODEL_NAME)Model_problem")) = LATEST_PROBLEM
             _didRemake = true
           catch _ialgErr
-            #= The cycle-19 remake is now redundant for variables that the
+            #= The remake is redundant for variables that the
                module-load-time `__runInitialAlgorithmEarly!()` path already
                pinned via `initialization_eqs`. After MTK's init solve runs
                those constraints, alias elimination can prune the symbolic
@@ -825,7 +825,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       #= If the init-alg-remake'd problem produced InitialFailure (MTK could
          not reconcile init-alg hard-start u0 with the algebraic constraints),
          fall back to the un-remake'd problem so the solver can pick any
-         consistent u0. This matches pre-cycle-19 behavior for models where
+         consistent u0. This is the behaviour without the remake for models where
          the init-alg LHS values would be silently overwritten by MTK's init
          solver anyway (e.g. KinematicPTPHandwritten — algebraic-only model
          whose init-alg assignments conflict with algebraic equations). =#
@@ -866,11 +866,11 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   empty!(MTK_CodeGenerationUtil.DELAY_CALLS)
   MTK_CodeGenerationUtil.DELAY_MODEL[] = Symbol(modelName)
 
-  #= Phase A — eval generated Modelica functions and their @register_symbolic
+  #= Eval the generated Modelica functions and their @register_symbolic
      calls into OMBackend so subsequent codegen sees the bindings. =#
   evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
 
-  #= Phase B — bucket each simvar by varKind (state / algebraic / discrete
+  #= Bucket each simvar by varKind (state / algebraic / discrete
      / parameter / array / occ / data-structure / state-derivative) and
      extract StateSelect priority pairs. =#
   local vars = classifyVariables(simCode)
@@ -929,7 +929,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local stateVariablesSym = Symbol[:($(Symbol(v))) for v in stateVariables]
   local occVariablesSym = Symbol[:($(Symbol(v))) for v in occVariables]
   local parVariablesSym = Symbol[Symbol(p) for p in parameters]
-  #= Phase 6: discrete-dummy demotion. Each discrete variable starts with a
+  #= Discrete-dummy demotion. Each discrete variable starts with a
      placeholder `der(d) ~ 0` so SciML has a state slot for callbacks to
      write into. When a residual equation already pins `d` definitionally
      (alias, ifelse, comparison, integer cast, ifEq_tmp target, pairwise
@@ -950,7 +950,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   (DISCRETE_DUMMY_EQUATIONS, discreteVariablesSym) =
     applyDemotionPlan!(_demotionPlan, discreteVariables, DISCRETE_DUMMY_EQUATIONS,
                        discreteVariablesSym, algebraicVariablesSym)
-  #= Phase F — flatten the per-if-equation components into one event-decl
+  #= Flatten the per-if-equation components into one event-decl
      Expr (wrapped in invokelatest because event exprs reference Symbolics
      bindings only created later inside the model function), plus three
      flat lists used by downstream phases. =#
@@ -988,7 +988,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     push!(ifCondParamPairs, :($(ZC_HYSTERESIS) => $(ZC_HYSTERESIS_DEFAULT)))
     push!(ifCondParamNames, ZC_HYSTERESIS)
   end
-  #= Phase G — collect the symbols MTK tearing must not eliminate
+  #= Collect the symbols MTK tearing must not eliminate
      (simCode-flagged irreducibles + ifEq_tmp LHS targets + fixed-start
      variables). =#
   local irreducibleSyms = collectIrreducibleSymbols(simCode, CONDITIONAL_EQUATIONS,
@@ -1505,7 +1505,7 @@ function createResidualEquationsMTK(stateVariables::Vector, algebraicVariables::
   end
   local eqs::Vector{Expr} = Expr[]
   for eq in equations
-    #= eq.exp is `SimulationCode.Exp` post Phase 4b field migration; the
+    #= eq.exp is a `SimulationCode.Exp`; the
        `expToJuliaExpMTK(::SimulationCode.Exp, ...)` overload in
        MTK_CodeGenerationUtil.jl walks SIM Exp natively for the
        supported variants and delegates the rest back to the DAE
@@ -2032,34 +2032,6 @@ function _ifConditionIsPureTimeEvent(@nospecialize(condition), simCode)::Bool
     (entry[2].varKind isa SimulationCode.PARAMETER) || return false
   end
   return true
-end
-
-"""
-True when the zero-crossing Expr references a non-lifted algebraic variable
-(one whose static `evalInitialCondition` value defaults to 0). Lifted helper
-names (`ifEq_tmp*`, `ifCond*`) are excluded so an init affect never observes
-another lifted value and forms a circular init dependency.
-"""
-function _zcReferencesSolvableAlgebraic(@nospecialize(zcExpr), simCode)::Bool
-  local ht = simCode.stringToSimVarHT
-  local stack = Any[zcExpr]
-  while !isempty(stack)
-    local node = pop!(stack)
-    if node isa Symbol
-      local key = string(node)
-      if !startswith(key, "ifEq_tmp") && !startswith(key, "ifCond") && haskey(ht, key)
-        local (_, sv) = ht[key]
-        if SimulationCode.isAlgebraic(sv)
-          return true
-        end
-      end
-    elseif node isa Expr
-      for a in node.args
-        push!(stack, a)
-      end
-    end
-  end
-  return false
 end
 
 """
@@ -4895,53 +4867,6 @@ function decomposeParameterEquationsInline(parameterEquations; chunkSize = CHUNK
 end
 
 """
-  Generate @register_array_symbolic expression for a function with array parameters.
-"""
-function generateArrayRegisterExpr(f::SimulationCode.ModelicaFunction, funcArgGen::Function)::Expr
-  local sb = Symbol(f.name)
-
-  #= Build typed argument list for array registration =#
-  local argExprs = Expr[]
-  for v in f.inputs
-    local varName = Symbol(string(v.componentRef))
-    if isArrayType(v)
-      push!(argExprs, :($varName::AbstractArray))
-    else
-      push!(argExprs, :($varName::Real))
-    end
-  end
-
-  #= Build the call signature =#
-  local callExpr = if length(argExprs) == 0
-    Expr(:call, sb)
-  elseif length(argExprs) == 1
-    Expr(:call, sb, argExprs[1])
-  else
-    Expr(:call, sb, argExprs...)
-  end
-
-  #= Determine output size and eltype =#
-  #= For now, assume first output determines the result characteristics =#
-  local sizeExpr = :()
-  local eltypeExpr = :(Symbolics.Num)  #= Use Symbolics.Num for proper type compatibility =#
-
-  if !isempty(f.outputs)
-    local firstOutput = first(f.outputs)
-    if isArrayType(firstOutput)
-      sizeExpr = extractArrayDimsFromVar(firstOutput)
-    end
-  end
-
-  #= Generate the @register_array_symbolic call =#
-  quote
-    Symbolics.@register_array_symbolic $callExpr begin
-      size = $sizeExpr
-      eltype = $eltypeExpr
-    end
-  end
-end
-
-"""
   Generates quoted Symbolics registration calls for externally defined functions.
   Scalar functions use @register_symbolic.
   Functions with array parameters that return arrays use @register_array_symbolic
@@ -5336,8 +5261,8 @@ RHS get a pre-seeded `_alg_<name>` from the SimVar's `start` attribute or
 `Dict{Symbol, Float64}` via a per-entry try/catch (so a still-undefined
 `_alg_<name>` from a body that errored partway just skips that entry).
 
-The outer try/catch returns partial results on any error; the cycle-19
-runtime `remake` path remains as a fallback for state-cref-RHS reads whose
+The outer try/catch returns partial results on any error; the runtime
+`remake` path remains as a fallback for state-cref-RHS reads whose
 post-init value differs from the `start` attribute.
 """
 

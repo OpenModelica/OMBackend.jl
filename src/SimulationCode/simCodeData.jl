@@ -61,7 +61,7 @@ SimCref(name::AbstractString, subs::AbstractVector{<:Int}) =
 SimCref(sym::Symbol, subs::AbstractVector{<:Int}) =
   SimCref(sym, Int[s for s in subs])
 
-#= ---- Expression hierarchy (additive, no migration yet) ----
+#= ---- Expression hierarchy (the SimCode passes are part way through moving to it) ----
 
    SimCode-native `Exp` AST. DAE.Exp carries a lot of frontend-only
    information that SimCode never reads (type-checked subscripts,

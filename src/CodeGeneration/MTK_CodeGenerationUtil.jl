@@ -458,34 +458,6 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
 end
 
 """
-Transforms:
-  <name>[<index>] -> <name>_index
-"""
-function arrayToSymbolicVariable(arrayRepr::Expr)::Expr
-  _iterativePostwalk(arrayRepr) do x
-    MacroTools.@capture(x, T_[index_]) || return x
-    local newVar = Symbol("$(T)_$(index)")
-    return newVar
-  end
-end
-
-"""
-Transforms:
-  <name>_index -> <name>[index]
-Uses direct Expr construction instead of string interpolation + Meta.parse.
-"""
-const pattern = r".*_[0-9]+"
-function symbolicVariableToArrayRef(e::Expr)::Expr
-  _iterativePostwalk(e) do x
-    x isa Symbol || return x
-    local sstr = String(x)
-    match(pattern, sstr) === nothing && return x
-    local parts = split(sstr, "_")
-    return Expr(:ref, Symbol(parts[1]), parse(Int, parts[2]))
-  end
-end
-
-"""
   _ifexpBranchIsNonReal(e::DAE.Exp) -> Bool
 
 Conservative type sniff used by the IFEXP lowering: returns `true` when the
@@ -511,7 +483,7 @@ Base.@nospecializeinfer function _ifexpBranchIsNonReal(@nospecialize(e::DAE.Exp)
   end
 end
 
-#= SimCode-Exp entry (Phase 4b): codegen consumes `SimulationCode.Exp`
+#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp`
    directly. The body below mirrors the `::DAE.Exp` version's dispatch
    shape but operates on SIM Exp variants:
 
@@ -1530,26 +1502,6 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
     end
   end
   return expr
-end
-
-"""
-Extract integer array dimensions from a DAE.Type, or nothing if not an array type.
-Used by the TSUB handler to detect when a tuple element is an array.
-"""
-function _extractTsubArrayDims(ty)
-  @match ty begin
-    DAE.T_ARRAY(_, dims) => begin
-      local intDims = Int[]
-      for d in dims
-        @match d begin
-          DAE.DIM_INTEGER(n) => push!(intDims, n)
-          _ => return nothing
-        end
-      end
-      return Tuple(intDims)
-    end
-    _ => return nothing
-  end
 end
 
 """

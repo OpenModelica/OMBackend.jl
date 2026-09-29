@@ -85,10 +85,6 @@ function stringHeading2(i::Any, heading::String)::String
   str = heading2(heading) + "\n" + string(i)
 end
 
-function stringHeading3(i::Any, heading::String)::String
-  str = heading3(heading) + string(i)
-end
-
 function heading1(heading::String)::String
   str = HEAD_LINE + "\n" + heading + "\n" + HEAD_LINE + "\n\n"
 end

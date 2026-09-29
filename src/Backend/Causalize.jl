@@ -537,35 +537,6 @@ end
 
 
 """
-  Author: johti17
-
-"""
-function updateArrayCrefs(vars::BDAE.Variables, arrayCrefs::Dict{DAE.ComponentRef, Bool})
-  vars = begin
-    @match vars begin
-      BDAE.VARIABLES(varArr) => begin
-        for i in 1:arrayLength(varArr)
-          varArr[i] = begin
-            local cref::DAE.ComponentRef
-            local var::BDAE.Var
-            @match varArr[i] begin
-              var && BDAE.VAR(varName = cref) where (haskey(arrayCrefs, cref)) => begin
-                var
-              end
-              _ => begin
-                varArr[i]
-              end
-            end
-          end
-        end
-        @assign vars.varArr = varArr
-        (vars)
-      end
-    end
-  end
-end
-
-"""
     kabdelhak:
     Residualize every equation in each system of the dae by subtracting the rhs
     from the lhs.
@@ -1607,11 +1578,6 @@ function resolveIntegerVariables(dae::BDAE.BACKEND_DAE)
     _resolveIntVarsInSystem!(system)
   end
   return dae
-end
-
-function _isIntegerVarType(varType)
-  varType isa DAE.T_INTEGER ||
-    (varType isa DAE.T_ARRAY && varType.ty isa DAE.T_INTEGER)
 end
 
 #= Discrete-parameter-like variable types: Integer, Enumeration (e.g.

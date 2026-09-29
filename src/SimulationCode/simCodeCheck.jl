@@ -328,22 +328,6 @@ function rule_balanced(simCode::SIM_CODE)::Vector{CheckViolation}
 end
 push!(RULES, rule_balanced)
 
-function _countUnknowns(simCode::SIM_CODE)::Int
-  local eliminated = OrderedSet(simCode.eliminatedVariables)
-  local n = 0
-  for (_, (_, v)) in simCode.stringToSimVarHT
-    if v.name in eliminated
-      continue
-    end
-    #= STATE_DERIVATIVE is tracked but not independent, so it does not count
-       toward unknowns even though `isUnknownVarKind` returns true for it. =#
-    if isUnknownVarKind(v.varKind) && !(v.varKind isa STATE_DERIVATIVE)
-      n += 1
-    end
-  end
-  return n
-end
-
 #= ── Rule: alias consistency ──────────────────────────────────────── =#
 
 """

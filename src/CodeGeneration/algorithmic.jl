@@ -128,29 +128,6 @@ function hasArrayOutput(f::SimulationCode.ModelicaFunction)::Bool
   return false
 end
 
-#= Check if a function body contains conditionals that would fail with symbolic args.
-   This includes STMT_IF statements and IFEXP (ternary if-expressions) in assignment RHS.
-   Only these functions need the symbolic Term dispatch; pure-arithmetic functions
-   work fine when called directly with symbolic values.
-   Checks recursively inside for-loops and other compound statements. =#
-function hasIfStatements(func::SimulationCode.ModelicaFunction)::Bool
-  if !(func isa SimulationCode.MODELICA_FUNCTION)
-    return false
-  end
-  local stmts = func.statements
-  local locals = func.locals
-  _statementsContainIf(stmts) && return true
-  for v in locals
-    @match v.binding begin
-      SOME(bindingExp) => begin
-        _expContainsIfExp(bindingExp) && return true
-      end
-      _ => nothing
-    end
-  end
-  return false
-end
-
 function _statementsContainIf(stmts)::Bool
   for s in stmts
     if s isa DAE.STMT_IF
@@ -1125,7 +1102,7 @@ end
   Since functions do not use the model HT the original name is preserved for algorithmic generation.
 For algorithmic code outside Modelica functions do not call this function.
 """
-#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp` (Phase 4b API). =#
+#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp`. =#
 Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::SimulationCode.Exp))::Expr
   return expToJuliaExpAlg(SimulationCode.toDAEExp(exp))
 end

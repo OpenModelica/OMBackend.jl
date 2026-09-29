@@ -212,15 +212,6 @@ end
 
 
 
-"""
-  Flattens a vector of expressions.
-"""
-function flattenExprs(eqs::Vector{Expr})
-  quote
-    $(eqs...)
-  end
-end
-
 
 """
  Convert DAE.Exp into a Julia string.
@@ -640,15 +631,6 @@ function isCycleInSCCs(sccs)
     end
   end
   return false
-end
-
-function getCycleInSCCs(sccs)
-  for sc in sccs
-    if length(sc) > 1
-      return sc
-    end
-  end
-  return []
 end
 
 """
@@ -1518,33 +1500,6 @@ function hasArrayParameters(f::SimulationCode.ModelicaFunction)::Bool
     end
   end
   return false
-end
-
-function extractArrayDimsFromVar(v::DAE.VAR)::Expr
-  local ty = @match v.componentRef begin
-    DAE.CREF_IDENT(_, identType, _) => identType
-    DAE.CREF_QUAL(_, identType, _, _) => identType
-    _ => v.ty
-  end
-  @match ty begin
-    DAE.T_ARRAY(_, dims) => begin
-      local dimExprs = Union{Int,Symbol}[]
-      for d in dims
-        @match d begin
-          DAE.DIM_INTEGER(n) => push!(dimExprs, n)
-          DAE.DIM_UNKNOWN(__) => push!(dimExprs, :n)
-          DAE.DIM_EXP(__) => push!(dimExprs, :n)
-          _ => push!(dimExprs, :n)
-        end
-      end
-      if length(dimExprs) == 1
-        :(($(dimExprs[1]),))
-      else
-        Expr(:tuple, dimExprs...)
-      end
-    end
-    _ => :()
-  end
 end
 
 function collectCalledFunctionNames!(names::OrderedSet{String}, @nospecialize(exp::DAE.Exp))

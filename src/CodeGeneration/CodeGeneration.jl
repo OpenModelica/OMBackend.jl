@@ -88,7 +88,8 @@ include("./algebraicStepControl.jl")
 include("./MTK_CodeGeneration.jl")
 include("./DiscreteDummyDemotion.jl")
 
-#= Pure DifferentialEquations.jl code generation (legacy/donor) =#
+#= The when-callback emitter (the MTK path uses it) and the older direct
+   DifferentialEquations.jl code generation =#
 include("./codeGen.jl")
 
 #= Direct DifferentialEquations.jl code generation (DEMode, fresh emitter) =#

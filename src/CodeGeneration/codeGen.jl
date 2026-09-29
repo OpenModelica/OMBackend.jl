@@ -140,111 +140,7 @@ function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = tru
   end
 end
 
-function createParameterCode(modelName, parameters, stateVariables, algVariables, simCode)::Expr
-  local PARAMETER_EQUATIONS = createParameterEquations(parameters, simCode)
-  quote
-    function $(Symbol("$(modelName)ParameterVars"))()
-      local aux = Array{Array{Float64}}(undef, 2)
-      local p = Array{Float64}(undef, $(arrayLength(parameters)))
-      local reals = Array{Float64}(undef, $(arrayLength(stateVariables) + arrayLength(algVariables)))
-      aux[1] = p
-      aux[2] = reals
-      $(PARAMETER_EQUATIONS...)
-      return aux
-    end
-  end
-end
 
-"""
-  Creates equation code from the set of residual equations and a supplied set of variables.
-  This is the method used for the solver.
-  $(SIGNATURES)
-"""
-function createSolverCode(functionName::Symbol,
-                          auxFuncSymbol::Symbol,
-                          variables::Vector{V},
-                          residuals::Vector{R},
-                          ifEquations::Vector{IF_EQ},
-                          simCode::SimulationCode.SIM_CODE;
-                          eqLhsName, eqRhsName)::Expr where {V, R, IF_EQ}
-  local UPDATE_VECTOR = createRealToStateVariableMapping(variables, simCode)
-  #= Creates the equations =#
-  local EQUATIONS = createEquations(variables, residuals, simCode; eqLhsName = eqLhsName, eqRhsName)
-  local IF_EQUATIONS = createEquations(variables, ifEquations, simCode; eqLhsName = eqLhsName, eqRhsName = eqRhsName)
-  local modelName = simCode.name
-  quote
-    function $(functionName)(res, dx, x, aux, t)
-      $(auxFuncSymbol)(res, dx, x, aux, t)
-      local p = aux[1]
-      local reals = aux[2]
-      $(EQUATIONS...)
-      $(IF_EQUATIONS...)
-      $(UPDATE_VECTOR...)
-    end
-  end
-end
-
-"""
-  This method creates a runnable for a linear/non-linear system of equations.
-  That is a system that does not contain differential equations
-"""
-function createLinearRunnable(modelName::String, simCode::SimulationCode.SIM_CODE)
-  quote
-    import NonlinearSolve
-    function $(Symbol("$(modelName)Simulate"))(tspan = (0.0, 1.0))
-      $(LineNumberNode((@__LINE__), "Auxilary variables"))
-      local aux = $(Symbol("$(modelName)ParameterVars"))()
-      (x0, dx0) =$(Symbol("$(modelName)StartConditions"))(aux, tspan[1])
-      local differential_vars = $(Symbol("$(modelName)DifferentialVars"))()
-      #= Pass the residual equations =#
-      local problem = NonlinearProblem($(Symbol("$(modelName)DAE_equations")), dx0, x0,
-                                       tspan, aux, differential_vars=differential_vars,
-                                       callback=$(Symbol("$(modelName)CallbackSet"))(aux))
-      #= Solve with IDA =#
-      local solution = Runtime.solve(problem::NonlinearProblem, IDA())
-      #= Convert into OM compatible format =#
-      local savedSol = map(collect, $(Symbol("saved_values_$(modelName)")).saveval)
-      local t = [savedSol[i][1] for i in 1:length(savedSol)]
-      local vars = [savedSol[i][2] for i in 1:length(savedSol)]
-      local T = eltype(eltype(vars))
-      local N = length(aux[2])
-      local nsolution = DAESolution{Float64,N,typeof(vars),Nothing, Nothing, Nothing, typeof(t),
-                                    typeof(problem),typeof(solution.alg),
-                                    typeof(solution.interp),typeof(solution.destats)}(
-                                      vars, nothing, nothing, nothing, t, problem, solution.alg,
-                                      solution.interp, solution.dense, 0, solution.destats, solution.retcode)
-      ht = $(SimulationCode.makeIndexVarNameUnorderedDict(simCode.matchOrder, simCode.stringToSimVarHT))
-      omSolution = OMBackend.Runtime.OMSolution(nsolution, ht)
-      return omSolution
-    end
-  end
-end
-
-
-
-"""
-  This function creates the update equations for the auxiliary variables.
-  The set of auxiliary variables is the set of variables of other types than state variables.
-  That is booleans integers and algebraic variables.
-TODO:
-  Currently only being done for the algebraic variables.
-"""
-function createAuxEquationCode(algVariables::Array{V},
-                               simCode::SimulationCode.SIM_CODE
-                               ;arrayName)::Array{Expr} where {V}
-  #= Sorted equations for the algebraic variables. =#
-  local auxEquations::Array{Expr} = []
-  auxEquations = vcat(createSortedEquations([algVariables...], simCode; arrayName = "reals"))
-  return auxEquations
-end
-
-function createStateMarkings(algVariables::Array, stateVariables::Array, simCode::SimulationCode.SIM_CODE)::Array{Bool}
-  local stateMarkings::Array = [false for i in 1:length(stateVariables) + length(algVariables)]
-  for sName in stateVariables
-    stateMarkings[simCode.stringToSimVarHT[sName][1]] = true
-  end
-  return stateMarkings
-end
 
 """
   Creates the save-callback.
@@ -275,15 +171,6 @@ function returnCallbackSet()::Array
   return cbs
 end
 
-function createRealToStateVariableMapping(stateVariables::Array, simCode::SimulationCode.SIM_CODE; toFrom::Tuple=("reals", "x"))::Array{Expr}
-  local daeStateUpdateVector::Vector{Expr} = Expr[]
-  for svName in stateVariables
-    local varIdx = simCode.stringToSimVarHT[svName][1]
-    push!(daeStateUpdateVector, :($(Symbol(toFrom[1]))[$varIdx] = $(Symbol(toFrom[2]))[$varIdx]))
-  end
-  return daeStateUpdateVector
-end
-
 """
  Create a set for all equations.
 """
@@ -294,29 +181,6 @@ function createEquations(equations::Vector{T}, simCode::SimulationCode.SIM_CODE)
     push!(eqs, eqJL)
   end
   return eqs
-end
-
-"""
-  Create equations for the parameters.
-"""
-function createParameterEquations(parameters::Array, simCode::SimulationCode.SimCode)
-  local parameterEquations::Vector{Expr} = Expr[]
-  local hT = simCode.stringToSimVarHT
-  for param in parameters
-    (index, simVar) = hT[param]
-    local simVarType::SimulationCode.SimVarType = simVar.varKind
-    bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => SimulationCode.toDAEExp(exp)
-      _ => throw(ErrorException("Unknown SimulationCode.SimVarType for parameter."))
-    end
-    push!(parameterEquations,
-          quote
-          $(LineNumberNode(@__LINE__, "$param"))
-          p[$index] = $(expToJuliaExp(bindExp, simCode))
-          end
-          )
-  end
-  return parameterEquations
 end
 
 
@@ -1385,9 +1249,9 @@ end
   $(SIGNATURES)
 The context can be any type that contains a set of residual equations.
 """
-#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp` (Phase 4b API).
+#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp`.
    See comment on the MTK variant. =#
-#= SimCode-Exp entry (Phase 4b API): per-variant dispatch mirrors the DAE.Exp emitter;
+#= SimCode-Exp entry: per-variant dispatch mirrors the DAE.Exp emitter;
    only the EXP_CREF leaf, CALL args, and CAST touch a per-node DAE projection. =#
 function expToJuliaExp(e::SimulationCode.BCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
   quote $(e.value) end
@@ -1677,49 +1541,3 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
   return expr
 end
 
-
-"""
-  Generates the start conditions.
-  All variables default to zero if they are not specified by the user.
-"""
-function getStartConditions(vars::Array, condName::String, simCode::SimulationCode.SimCode)::Expr
-  local startExprs::Array{Expr} = []
-  local residuals = simCode.residualEquations
-  local ht::Dict = simCode.stringToSimVarHT
-  if length(vars) == 0
-    return quote
-    end
-  end
-  for var in vars
-    (index, simVar) = ht[var]
-    local simVarType = simVar.varKind
-    local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
-    if simVar.attributes == nothing
-      continue
-    end
-    () = @match optAttributes begin
-      SOME(attributes) => begin
-        () = @match (attributes.start, attributes.fixed) begin
-          (SOME(start), SOME(fixed)) || (SOME(start), _)  => begin
-            @debug "Start value is:" start
-            push!(startExprs,
-                  quote
-                  $(LineNumberNode(@__LINE__, "$var"))
-                  $(Symbol("$condName"))[$index] = $(expToJuliaExp(start, simCode))
-                  end)
-            ()
-          end
-          (NONE(), SOME(fixed)) => begin
-            push!(startExprs, :($(condName)[$(index)] = 0.0))
-            ()
-          end
-          (_, _) => ()
-        end
-      end
-      NONE() => ()
-    end
-  end
-  return quote
-    $(startExprs...)
-  end
-end

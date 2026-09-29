@@ -142,25 +142,6 @@ function merge(matchOrder::Vector, graph::OrderedDict)::MetaGraphs.MetaDiGraph
   return g
 end
 
-"""
-  Dumps the properties of a given MetaDiGraph.
-"""
-function dumpGraphProperties(g::MetaGraphs.MetaDiGraph)
-  local nVertices = Graphs.vertices(g).stop
-  local str = "Meta properties of the graph:\n"
-  for i in 1:nVertices
-    str *= "Properties: $(MetaGraphs.props(g, i))\n"
-  end
-  return str
-end
-
-"""
-  Topological sort
-"""
-function topological_sort(g::Graphs.AbstractGraph)::Vector
-  Graphs.topological_sort_by_dfs(g)
-end
-
 function stronglyConnectedComponents(g::Graphs.AbstractGraph)::Vector
   Graphs.strongly_connected_components_kosaraju(g)
 end
@@ -315,19 +296,6 @@ function blt(digraph::MetaGraphs.MetaDiGraph, matchOrder::Vector{Int})::Vector{B
     blocks[outIdx] = BLTBlock(sort(scc), sort(vars), length(scc) > 1)
   end
   return blocks
-end
-
-"""
-  Human-readable dump of a BLT decomposition for debugging and log output.
-"""
-function dumpBLT(blocks::Vector{BLTBlock})::String
-  local io = IOBuffer()
-  println(io, "BLT decomposition: $(length(blocks)) block(s)")
-  for (i, b) in enumerate(blocks)
-    local kind = b.isLoop ? "LOOP(size=$(length(b.eqs)))" : "SCALAR"
-    println(io, "  [$i] $kind  eqs=$(b.eqs)  vars=$(b.vars)")
-  end
-  return String(take!(io))
 end
 
 end #= GraphAlgorithms =#

@@ -96,7 +96,7 @@ Differs from `expToJuliaExp` in `codeGen.jl` by:
     that as inconsistent. We allow it because IFEXP can survive when the if-
     expression-to-if-equation pass leaves expressions that depend on time).
 """
-#= SimCode-Exp entry (Phase 4b API): per-variant dispatch mirrors `toDAEExp`;
+#= SimCode-Exp entry: per-variant dispatch mirrors `toDAEExp`;
    only the EXP_CREF leaf and the operator map touch a per-node DAE projection. =#
 expToJuliaExpDE(e::SimulationCode.BCONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
 expToJuliaExpDE(e::SimulationCode.ICONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)

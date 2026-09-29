@@ -87,6 +87,11 @@ function _buildDirectODEFunction(rhsFunc, u0, p_vec, t0;
     ModelingToolkit.ODEFunction{true, FW}(wrappedRHS; mass_matrix=mass_matrix, sys=sys, erasedKw...)
 end
 
+#= Re-initialization per problem (keyed by its generated RHS function):
+   parameter vector -> consistent initial state, the vector's
+   initialization-defined parameters assigned. See buildDirectRHSProblem. =#
+const DAE_REINIT = IdDict{Any, Function}()
+
 """
     buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
                           allInitialValues=nothing)
@@ -103,11 +108,6 @@ default to 0.0, which may cause InitialFailure for DAE systems.
 
 Returns an `ODEProblem` ready for `solve()`.
 """
-#= Re-initialization per problem (keyed by its generated RHS function):
-   parameter vector -> consistent initial state, the vector's
-   initialization-defined parameters assigned. See buildDirectRHSProblem. =#
-const DAE_REINIT = IdDict{Any, Function}()
-
 function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
                                allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
                                liftedDiscretes=String[],

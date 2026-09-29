@@ -477,13 +477,6 @@ function isDiscrete(kind::BDAE.VarKind)
   return res
 end
 
-function isWhenEquation(eq::BDAE.Equation)
-  @match eq begin
-    BDAE.WHEN_EQUATION(__) => true
-    _ => false
-  end
-end
-
 """
     kabdelhak:
     Detects if a given expression is a der() call and adds the corresponding
@@ -674,18 +667,6 @@ function getAllVariables(eq::BDAE.WHEN_EQUATION, @nospecialize(vars))
   return map(x -> string(x), crefs)
 end
 
-"""
-  Author:johti17
-  input: Backend Equation, eq
-  input: All existing variables
-  output All variable in that specific equation except the state variables
-"""
-function getAllVariablesExceptStates(eq::BDAE.IF_EQUATION, vars::Vector{BDAE.VAR})::Vector{DAE.ComponentRef}
-  local allVarNames = getAllVariables(eq, vars)
-  local stateNames = OrderedSet(string(v.varName) for v in vars if isState(v))
-  return filter(v -> !(v in stateNames), allVarNames)
-end
-
 function isArray(cref::DAE.ComponentRef)::Bool
   @match cref begin
     DAE.OPTIMICA_ATTR_INST_CREF(__) || DAE.WILD(__) => false
@@ -693,18 +674,6 @@ function isArray(cref::DAE.ComponentRef)::Bool
       typeof(cref.identType) == DAE.T_ARRAY
     end
   end
-end
-
-function getSubscriptAsIntArray(dims)::Array
-  local dimIndices = Int[]
-  for d in dims
-    if ! (typeof(d) == DAE.DIM_INTEGER)
-      throw("Non integers dimensions for arrays are not supported by OMBackend. Variable was $(string(v))")
-    else
-      push!(dimIndices, d.integer)
-    end
-  end
-  return dimIndices
 end
 
 
@@ -721,21 +690,6 @@ function invertCondition(cond::DAE.Exp)
     end
     _ => throw("Tried to invert unsupported backend condition:" * string(cond) * "type was: " * string(typeof(cond)))
   end
-end
-
-"""
-  Maps a backend equation to a backend when equation.
-"""
-function eqToWhenOperator(eq::BDAE.Equation)
-  res = @match eq begin
-    BDAE.EQUATION(lhs, rhs, source, attributes) => begin
-      BDAE.ASSIGN(lhs, rhs, source)
-    end
-    _ => begin
-      throw(string("Conversion from ", string(eq), " Not supported", "Type was: ", typeof(eq)))
-    end
-  end
-  return res
 end
 
 function DAE_DimensionToIntVector(dims::Cons{<:DAE.Dimension})::Vector{Int}

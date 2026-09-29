@@ -317,9 +317,10 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
         error("DAE-mode is deprecated.")
       elseif BackendMode == DEMode
         #=
-          Direct DifferentialEquations.jl path. Mirrors the MTK pipeline up
-          through propagateConstants/aliasElim, but skips MTK-specific
-          observed-equation work and dispatches to the DE emitter.
+          Direct DifferentialEquations.jl path: a subset of the MTK path's
+          SimCode passes (not, e.g., lowerComplexOperatorRecords,
+          evaluateConstantFunctionOutputs, foldExplicitSingleAssign,
+          propagateInitialValues), no observed-equation work, the DE emitter.
         =#
         simCode = generateSimulationCode(bDAE; mode = MTK_MODE)
         (simCodeFunctions, externalRuntimeNeeded) = if functionList !== nothing
@@ -543,8 +544,7 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
              dropped before codegen, so `sol(t; idxs = lookup[\"rev_phi\"])`
              raises KeyError in tests that query the eliminated name.
              A "user-visible" name is heuristic: no `[` (no scalarized array
-             subscript) and not a known auto-gen prefix. The bracket guard
-             catches the vast majority of MultiBody internals (Engine1a's
+             subscript). The bracket guard catches the vast majority of MultiBody internals (Engine1a's
              876 aliases collapse to a small handful) while preserving the
              named Modelica vars that user code can reasonably query. =#
           if !isempty(simCode.aliasMap)
@@ -814,19 +814,6 @@ end
 function generateSimCodeFunctions(functions::List{OMFrontend.Frontend.M_FUNCTION})
   local simCodeFunctions = SimulationCode.generateSimCodeFunctions(functions)
   return simCodeFunctions
-end
-
-"""
-  Generates code interfacing DifferentialEquations.jl
-  The resulting code is saved in a dictionary which contains functions that were simulated
-  this session. Returns the generated modelName and corresponding generated code
-"""
-function generateTargetCode(simCode::SimulationCode.SIM_CODE)
-  #= Target code =#
-  (modelName::String, modelCode::Expr) = CodeGeneration.generateCode(simCode)
-  @debug "[CODEGEN] generated target code" model=modelName codeHash=hash(modelCode)
-  COMPILED_MODELS[modelName] = modelCode
-  return (modelName, modelCode)
 end
 
 #= Final SimCode of the most recent codegen, for interactive inspection. =#

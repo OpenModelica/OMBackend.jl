@@ -1185,10 +1185,6 @@ function replaceCref(inExp::DAE.Exp, inTpl::Tuple{<:DAE.ComponentRef, DAE.Exp}):
   (outExp, otpl)
 end
 
-function transposeNestedList(lstlst::List{List{T}})::List{List{T}} where{T}
-  transposeNestedListAccumulator(lstlst, nil)
-end
-
 function transposeNestedListAccumulator(lstlst::List{List{T}}, acc::List{List{T}})::List{List{T}} where{T}
   local rest::List{List{T}}=nil
   local tmpLst::List{T}
@@ -1256,33 +1252,6 @@ function isConstantExp(exp::DAE.Exp)::Bool
     DAE.ARRAY(array = elems) => all(isConstantExp, elems)
     _ => false
   end
-end
-
-function isEvaluatedConst(inExp::DAE.Exp) ::Bool
-  local outBoolean::Bool
-  outBoolean = begin
-    @match inExp begin
-      DAE.ICONST(__)  => begin
-        true
-      end
-      DAE.RCONST(__)  => begin
-        true
-      end
-      DAE.BCONST(__)  => begin
-        true
-      end
-      DAE.SCONST(__)  => begin
-        true
-      end
-      DAE.ENUM_LITERAL(__)  => begin
-        true
-      end
-      _  => begin
-        false
-      end
-    end
-  end
-  outBoolean
 end
 
 function getAllCrefsAsVector(cref::DAE.CREF_IDENT, crefs)

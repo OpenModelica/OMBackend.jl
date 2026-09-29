@@ -42,15 +42,6 @@ import ..FrontendUtil.Util
 
 """
     kabdelhak:
-    Create an empty equation array
-"""
-function emptyEqns()
-  eqns = BDAE.Equation[]
-  (eqns)
-end
-
-"""
-    kabdelhak:
     Transform a single equation to residual form by subtracting the rhs from
     the lhs
 """
@@ -95,20 +86,6 @@ function makeResidualIfEquation(eqn::BDAE.IF_EQUATION)::BDAE.IF_EQUATION
     falseEquations2 = makeResidualEquation(eq) <| falseEquations2
   end
   return BDAE.IF_EQUATION(eqn.conditions, listReverse(trueEquations2), listReverse(falseEquations2), eqn.source, eqn.attr)
-end
-
-"""
-   kabdelhak:
-   Splits an if equation in multiple equations containing if expressions.
-   INTENDED?: Currently requires correct ordering of branch equations
-"""
-function splitIfEquationResidual(eqn::BDAE.Equation)::List{BDAE.Equation}
-  residualEqs::List{BDAE.Equation}=nil
-  residualExps = splitIfEquationResidualTraverse(eqn.conditions, Util.transposeNestedList(eqn.eqnstrue), eqn.eqnsfalse, nil)
-  for exp in residualExps
-    residualEqs = BDAE.RESIDUAL_EQUATION(exp, eqn.source, eqn.attr) <| residualEqs
-  end
-  return residualEqs
 end
 
 function splitIfEquationResidualTraverse(lstCond::List{DAE.Exp}, lstlstTrue::List{List{BDAE.Equation}}, lstFalse::List{BDAE.Equation}, acc::List{DAE.Exp})::List{DAE.Exp}
