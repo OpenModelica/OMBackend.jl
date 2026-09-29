@@ -147,7 +147,8 @@ end
   local c = CG.DiscreteCluster(["off"], Any[], Any[], 0, 0, [true], [false], nothing, 0, false)
   #= Crossing function -1e-12 (inside the band H * scale = 1e-10), scale 1. =#
   c.crossings! = (zs, u, p, t) -> (zs[1] = -1.0e-12; zs[2] = 1.0; nothing)
-  local integrator = (u = Float64[], p = nothing, t = 0.0, opts = (reltol = 1.0e-6,))
+  local integrator = (u = Float64[], p = nothing, t = 0.0, opts = (reltol = 1.0e-6,),
+                      sol = (prob = (tspan = (0.0, 1.0),),))
   @test !CG._update!(c, integrator) && c.rel == [false]
   c.crossed[1] = true
   @test CG._update!(c, integrator) && c.rel == [true] && c.crossed == [false]

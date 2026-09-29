@@ -305,13 +305,16 @@ import .ExampleDAEs
       @test isempty(inits)
     end
 
-    @testset "array {initial(), other} is extracted" begin
+    @testset "array {initial(), other}: an initial algorithm and a when on the other" begin
+      #= The when fires at the initialization and whenever `other` becomes true
+         (MLS 8.3.5; the MSL ZeroOrderHold's `when {sampleTrigger, initial()}`). =#
       local arrCond = DAE.ARRAY(DAE.T_BOOL(nil), false,
                                 list(initialCall, nonInitialCref))
       local input = BDAE.WHEN_EQUATION[mkWhenEq(arrCond)]
       local (kept, inits) = SC.extractInitialWhenAlgorithms(input)
-      @test isempty(kept)
       @test length(inits) == 1
+      @test length(kept) == 1
+      @test kept[1].whenEquation.condition == nonInitialCref
     end
 
     @testset "mixed input partitions correctly" begin
