@@ -47,6 +47,7 @@ const ENV_SWITCHES = Dict{String, Tuple{Bool, String}}(
   "OMBACKEND_INIT_DISCRETES" => (true, "initial fixpoint of the discrete clusters"),
   "OMBACKEND_INIT_RELATIONS" => (true, "initial values of the if-equations' relation literals"),
   "OMBACKEND_INIT_REPIN" => (true, "re-pin the pinned and latched variables after the free initialization phase"),
+  "OMBACKEND_MODULE_COMPILE_MIN" => (true, "the generated model module compiles with optimize=0 compile=min infer=false (off: default compilation; longer build)"),
   "OMBACKEND_INIT_ROWSCALE" => (true, "row scaling of the initialization Newton Jacobian"),
   "OMBACKEND_INIT_SYMBOLIC_EQS" => (true, "symbolic initialization residuals of the reduced system"),
   "OMBACKEND_LIVE_IFCOND_AFFECT" => (true, "live affects for chains of if-equation relays"),

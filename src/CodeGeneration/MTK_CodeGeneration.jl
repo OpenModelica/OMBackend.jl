@@ -576,6 +576,12 @@ function generateMTKCode(simCode::SimulationCode.SIM_CODE)
   ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
 end
 
+#= The generated model module compiles with optimize=0 compile=min infer=false
+   (a short build); OMBACKEND_MODULE_COMPILE_MIN off: default compilation, to
+   measure what the per-step closures of the module cost interpreted. =#
+_moduleCompilerOptions() = OMBackend.envSwitch("OMBACKEND_MODULE_COMPILE_MIN") ?
+  :(Base.Experimental.@compiler_options optimize=0 compile=min infer=false) : nothing
+
 """
   The entry point of MTK code generation.
   Either calls ODE_MODE_MTK_PROGRAM_GENERATION
@@ -636,7 +642,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     using ModelingToolkit
     using DifferentialEquations
     using DiffEqCallbacks
-    Base.Experimental.@compiler_options optimize=0 compile=min infer=false
+    $(_moduleCompilerOptions())
     $(createStringParameterAssignments(simCode)...)
     $(createArrayParameterPrelude(simCode)...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
@@ -763,7 +769,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     using OMBackend
     using DataStructures.OrderedCollections: OrderedSet, OrderedDict
     import Setfield
-    Base.Experimental.@compiler_options optimize=0 compile=min infer=false
+    $(_moduleCompilerOptions())
     #= Add import to the external runtime if the generated code calls Modelica Functions =#
     $(if simCode.externalRuntime
         generateExternalRuntimeImport()
