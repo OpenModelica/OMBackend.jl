@@ -1793,13 +1793,25 @@ function _collectInitAlgNames!(lhsNames, rhsNames, ia)
   return lhsNames
 end
 
+#= The initial algorithms the early pass (`__runInitialAlgorithmEarly!`)
+   evaluates; its results become start values and initialization constraints
+   of the system. In a model with an `initial algorithm` section only those:
+   the bodies of `when initial()` / `when {c, initial()}` run in the runtime
+   pass (`__runInitialAlgorithm!`) there, as before both kinds were
+   supported together. In the early pass their values (switch controls of
+   the MSL QS IMC_Transformer) became hard initial conditions of the reduced
+   system and its switching event at t = 2 failed. =#
+_earlyInitialAlgorithms(simCode) =
+  any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms) ?
+    filter(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms) : simCode.initialAlgorithms
+
 function emitInitAlgU0Appends(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local appends::Vector{Expr} = Expr[]
   isempty(simCode.initialAlgorithms) && return appends
   local ht::Dict = simCode.stringToSimVarHT
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
-  for ia in simCode.initialAlgorithms
+  for ia in _earlyInitialAlgorithms(simCode)
     _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
   for name in lhsNames
@@ -1833,7 +1845,7 @@ function emitInitAlgConstraintAppends(simCode::SimulationCode.SIM_CODE)::Vector{
   local ht::Dict = simCode.stringToSimVarHT
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
-  for ia in simCode.initialAlgorithms
+  for ia in _earlyInitialAlgorithms(simCode)
     _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
   for name in lhsNames
@@ -5230,7 +5242,7 @@ end
 function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)::Expr
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
-  for ia in simCode.initialAlgorithms
+  for ia in _earlyInitialAlgorithms(simCode)
     _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
   if isempty(lhsNames) && isempty(rhsNames)
@@ -5272,7 +5284,7 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
   end
   local stmts = Expr[]
   local seenLHS = copy(lhsNames)
-  for ia in simCode.initialAlgorithms
+  for ia in _earlyInitialAlgorithms(simCode)
     if isempty(ia.daeStatements)
       for op in ia.statements
         push!(stmts, _qualifyInvokedFunctions(_initialWhenOpToJuliaEarly(op, simCode, renamedNames, seenLHS)))
