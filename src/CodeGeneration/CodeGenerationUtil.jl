@@ -890,10 +890,6 @@ Return (lhs, rhs) for any BDAE equation shape.
 
 Any other shape throws; the caller should have screened those out.
 """
-hasEquationSides(eq)::Bool =
-  eq isa Union{BDAE.EQUATION, SimulationCode.EQUATION, BDAE.COMPLEX_EQUATION, BDAE.ARRAY_EQUATION,
-               SimulationCode.ARRAY_EQUATION, BDAE.RESIDUAL_EQUATION, SimulationCode.RESIDUAL_EQUATION}
-
 function equationSides(eq)::Tuple{DAE.Exp, DAE.Exp}
   if eq isa BDAE.EQUATION || eq isa SimulationCode.EQUATION
     return (SimulationCode.toDAEExp(eq.lhs), SimulationCode.toDAEExp(eq.rhs))
@@ -907,6 +903,11 @@ function equationSides(eq)::Tuple{DAE.Exp, DAE.Exp}
   error("equationSides: no (lhs, rhs) for $(typeof(eq)); " *
         "caller should filter to EQUATION / COMPLEX_EQUATION / ARRAY_EQUATION / RESIDUAL_EQUATION.")
 end
+
+#= The equations `equationSides` takes. =#
+hasEquationSides(eq)::Bool =
+  eq isa Union{BDAE.EQUATION, SimulationCode.EQUATION, BDAE.COMPLEX_EQUATION, BDAE.ARRAY_EQUATION,
+               SimulationCode.ARRAY_EQUATION, BDAE.RESIDUAL_EQUATION, SimulationCode.RESIDUAL_EQUATION}
 
 """
     isParametricOnlyEquation(eq, simCode) -> Bool

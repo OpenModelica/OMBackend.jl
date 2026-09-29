@@ -1892,7 +1892,7 @@ function _evalDAENumeric(@nospecialize(e), valMap::Dict{Symbol, Float64})::Union
         local b = _evalDAENumeric(argv[2], valMap); b === nothing && return nothing
         return fn == "min" ? min(a, b) : max(a, b)
       end
-      fn == "integer" ? Float64(floor(Int, a)) :
+      fn == "integer" ? (isfinite(a) ? floor(a) : nothing) :
       fn == "floor"   ? floor(a) :
       fn == "ceil"    ? ceil(a) :
       fn == "abs"     ? abs(a) :
@@ -2020,8 +2020,10 @@ function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt))::
             end
             _ => ()
           end
+          #= Int() of a bound beyond Int64 throws an InexactError (review, 2026-09-29). =#
           if startV !== nothing && stopV !== nothing && isfinite(stepV) && stepV != 0.0 &&
-             isinteger(startV) && isinteger(stopV) && isinteger(stepV)
+             isinteger(startV) && isinteger(stopV) && isinteger(stepV) &&
+             max(abs(startV), abs(stopV), abs(stepV)) < 2.0^62
             for iv in Int(startV):Int(stepV):Int(stopV)
               for s in stmt.statementLst
                 _execInitAlgStmt!(valMap, _substIterStmt(s, stmt.iter, iv))

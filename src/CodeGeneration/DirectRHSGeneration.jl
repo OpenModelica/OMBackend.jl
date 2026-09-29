@@ -235,7 +235,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
   OMBackend.envSwitch("OMBACKEND_INIT_TRACE") &&
     println("[initu0] states ", states, "\n[initu0] hard starts ", finalInitialValues, "\n[initu0] guesses ", systemGuesses,
-            "\n[initu0] initialization equations ", OMBackend._tryOr(() -> ModelingToolkit.initialization_equations(reducedSystem), "?", :buildDirectRHSProblem_3),
+            "\n[initu0] initialization equations ", ModelingToolkit.initialization_equations(reducedSystem),
             "\n[initu0] u0 ", u0)
 
   #= Symbolic sparse Jacobian; nothing when not differentiable. Built after
@@ -1656,8 +1656,7 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
     local result = try
       Base.invokelatest(f, numArgs...)
     catch _e
-      #= A probe with Float64 arguments: a MethodError means the function takes others. =#
-      OMBackend._fallback(_e, :_evalSymbolicFunctionCall_2; expect = MethodError)
+      OMBackend._fallback(_e, :_evalSymbolicFunctionCall_2)
       return nothing
     end
     if result isa Number
@@ -2109,7 +2108,7 @@ function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=
         resolved isa Number && return Float64(resolved)
         local rv = resolved isa Symbolics.Num ? Symbolics.unwrap(resolved) : resolved
         rv isa Number && return Float64(rv)
-        local vextract = OMBackend._tryOr(() -> Symbolics.value(rv), nothing, :_tryToFloat64_2)
+        local vextract = Symbolics.value(rv)
         vextract isa Number && return Float64(vextract)
       end
     end
