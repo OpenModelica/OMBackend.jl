@@ -1327,9 +1327,11 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       callbacks = OMBackend.CodeGeneration.withIntegralDiscretes(callbacks, problem, $(integralDiscreteNames(discreteVariablesSym, simCode)))
       #= Asserts after the event iteration: they check the settled state. =#
       $(emitAssertCallback(simCode))
+      #= In the latest world, as the lists above: the arguments read the model's
+         variables, bound by eval in this function (MSL Digital FullAdder). =#
       callbacks = OMBackend.CodeGeneration.withDelayRecords(callbacks, problem, $(QuoteNode(Symbol(MODEL_NAME))),
-                                                            Any[$([c[2] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)],
-                                                            Any[$([c[3] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)])
+                    Base.invokelatest(() -> Any[$([c[2] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)]),
+                    Base.invokelatest(() -> Any[$([c[3] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)]))
       #= First among the discrete callbacks: it reads the step as the solver took it. =#
       callbacks = OMBackend.CodeGeneration.withAlgebraicStepControl(callbacks, problem)
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreducibleSyms)

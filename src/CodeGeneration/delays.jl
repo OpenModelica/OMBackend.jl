@@ -138,7 +138,6 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
   local sys = problem.f.sys
   local argumentValues = ModelingToolkit.build_explicit_observed_function(sys, args)
   local delayTimeValues = ModelingToolkit.build_explicit_observed_function(sys, delayTimes)
-  local tEnd = problem.tspan[2]
   local now(integrator) = Base.invokelatest(argumentValues, integrator.u, integrator.p, integrator.t)
   #= The start values once every other callback's initialization (the clusters' start bodies) has run:
      the last callback's. =#
@@ -168,7 +167,10 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
       push!(h.t, t); push!(h.v, x)
       T === nothing && (T = Base.invokelatest(delayTimeValues, u, integrator.p, t))
       local tDue = t + Float64(T[k])
-      (tDue > t && integrator.tdir * (tEnd - tDue) >= 0) || continue
+      #= The solve's end, not the build's: a cached build is made for a short span and solved for the
+         model's (MSL Digital FullAdder: jumps due after the build's end were dropped, its gates fell
+         back to 'U'). =#
+      (tDue > t && integrator.tdir * (last(integrator.sol.prob.tspan) - tDue) >= 0) || continue
       push!(h.due, tDue)
       ModelingToolkit.SciMLBase.add_tstop!(integrator, tDue)
     end
