@@ -49,10 +49,13 @@ mutable struct AlgebraicStepControl
   jac::Any                   # the full Jacobian when the problem has one (f.jac), else nothing
   J::Any                     # d f[rows] / d u[rows] at the step's midpoint
   lu::Any                    # its factorization, or nothing when singular
+  capDt::Float64             # the step and its error when the current run of caps began (0: no run)
+  capErr::Float64
+  floorErr::Float64          # an error that did not shrink with the step: errors up to twice it do not cap
 end
 
 AlgebraicStepControl(rows::Vector{Int}) =
-  AlgebraicStepControl(rows, false, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+  AlgebraicStepControl(rows, false, nothing, nothing, nothing, nothing, nothing, nothing, nothing, 0.0, 0.0, 0.0)
 
 """
     isStepControl(callback) -> Bool
@@ -98,6 +101,7 @@ function _startStepControl!(c::AlgebraicStepControl, integrator)
   c.active = f !== nothing && hasproperty(integrator, :alg) && _isRodas(integrator.alg) &&
              integrator.opts.adaptive && _algebraicRows(f) == c.rows
   c.active || return nothing
+  c.capDt = 0.0; c.capErr = 0.0; c.floorErr = 0.0
   local u = integrator.u
   c.u = similar(u); c.f0 = similar(u); c.f1 = similar(u)
   c.g = similar(u, length(c.rows))
@@ -216,10 +220,27 @@ function (c::AlgebraicStepControl)(u, t, integrator)
   local dt = integrator.t - integrator.tprev
   local err = _algebraicError!(c, integrator)
   if isfinite(err) && err > 0
-    local (lo, hi) = _ALGEBRAIC_STEP_FACTORS
-    local factor = clamp(0.9 * err^(-1 / _ALGEBRAIC_ERROR_ORDER), lo, hi)
-    local cap = abs(dt) * factor
-    cap < abs(integrator.dtpropose) && ModelingToolkit.SciMLBase.set_proposed_dt!(integrator, sign(dt) * cap)
+    #= An error floor: since a run of caps began the step has at least halved
+       and the error has not (it falls like dt^4 where the step causes it). It
+       does not come from the step (the MSL SMPM_Braking's dummy derivative
+       row: 1.7e-5 at every step size), and capping on it would shrink the
+       step until maxiters. =#
+    c.capErr > 0 && abs(dt) <= 0.5 * c.capDt && err >= 0.5 * c.capErr && (c.floorErr = max(c.floorErr, err))
+    local capped = false
+    if err > 2 * c.floorErr
+      local (lo, hi) = _ALGEBRAIC_STEP_FACTORS
+      local factor = clamp(0.9 * err^(-1 / _ALGEBRAIC_ERROR_ORDER), lo, hi)
+      local cap = abs(dt) * factor
+      if cap < abs(integrator.dtpropose)
+        ModelingToolkit.SciMLBase.set_proposed_dt!(integrator, sign(dt) * cap)
+        capped = true
+      end
+    end
+    if !capped
+      c.capDt = 0.0; c.capErr = 0.0
+    elseif c.capErr == 0
+      c.capDt = abs(dt); c.capErr = err
+    end
   end
   _projectStepEnd!(c, integrator)
   return false
