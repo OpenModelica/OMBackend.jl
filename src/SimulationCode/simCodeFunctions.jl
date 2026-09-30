@@ -436,13 +436,26 @@ end
   anywhere in the expression (reductions, relations, ranges, ...):
   R.T[1,2] becomes R_T[1,2], an element's field u[k].re becomes u_re[k], the size of
   a record array size(u, 1) becomes size(u_re, 1), and record arguments of calls
-  become their fields (expandRecordArgForCall). Only functions with record inputs or
-  outputs are traversed (the traversal does not know clock constants or MetaModelica
-  expressions).
+  become their fields (expandRecordArgForCall). In a function without record inputs or
+  outputs only an expression with a call that has a record-valued argument is
+  traversed: the callee takes the record's fields (MSL Water IF97's
+  T_props_ph(p, h, waterBaseProp_ph(p, h, phase, region)) inside T_ph; passed whole,
+  its wrapper was called with 3 of its 18 arguments and the process crashed).
 """
 function transformExpForFlattenedRecords(exp::DAE.Exp, recordFieldMap::Dict)::DAE.Exp
-  isempty(recordFieldMap) && return exp
+  isempty(recordFieldMap) && !_hasRecordValuedCallArgument(exp) && return exp
   return first(Util.traverseExpTopDown(exp, _flattenRecordRefs, recordFieldMap))
+end
+
+function _hasRecordValuedCallArgument(exp::DAE.Exp)::Bool
+  local found = Ref(false)
+  Util.traverseExpTopDown(exp, (e, acc) -> begin
+      if e isa DAE.CALL && !e.attr.builtin && any(a -> _recordValueFieldTypes(a) !== nothing, e.expLst)
+        found[] = true
+      end
+      (e, !found[], acc)
+    end, nothing)
+  return found[]
 end
 
 Base.@nospecializeinfer function _flattenRecordRefs(@nospecialize(exp::DAE.Exp), recordFieldMap::Dict)
