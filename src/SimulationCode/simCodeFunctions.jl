@@ -531,6 +531,18 @@ function flattenRecordCallSites(simCode)
     end
   end
   @assign simCode.residualEquations = newResEqs
+  #= And in the when-equations: a later pass must see the record fields they
+     read (MSL Water: medium.phase's discrete equation, lifted into a when, calls
+     bubbleEnthalpy(medium.sat); foldExplicitSingleAssign saw only medium_sat and
+     folded medium_sat_Tsat away, which the when still read). =#
+  @assign simCode.whenEquations = WHEN_EQUATION[WHEN_EQUATION(w.size, _expandRecordArgsInWhen(w.whenEquation), w.source, w.attr)
+                                                for w in simCode.whenEquations]
+  #= And the initial algorithms (the same when's initial part: the early pass
+     binds the names its statements read). =#
+  @assign simCode.initialAlgorithms = INITIAL_ALGORITHM[
+    INITIAL_ALGORITHM(WhenOperator[_expandRecordArgsInWhenOp(op) for op in ia.statements],
+                      DAE.Statement[mapDAEStatementExps(expandRecordArgsInExp, s) for s in ia.daeStatements])
+    for ia in simCode.initialAlgorithms]
   #= Expand record arguments in parameter and array-parameter binding expressions =#
   local ht = simCode.stringToSimVarHT
   for (name, (idx, simVar)) in ht
@@ -554,6 +566,24 @@ function flattenRecordCallSites(simCode)
   end
   return simCode
 end
+
+function _expandRecordArgsInSimExp(e::Exp)::Exp
+  local d = toDAEExp(e)
+  local n = expandRecordArgsInExp(d)
+  return n === d ? e : toSimExp(n)
+end
+
+function _expandRecordArgsInWhen(w::WHEN_STMTS)::WHEN_STMTS
+  return WHEN_STMTS(_expandRecordArgsInSimExp(w.condition),
+                    WhenOperator[_expandRecordArgsInWhenOp(s) for s in w.whenStmtLst],
+                    w.elsewhenPart === nothing ? nothing : _expandRecordArgsInWhen(w.elsewhenPart))
+end
+
+_expandRecordArgsInWhenOp(s::ASSIGN) = ASSIGN(s.left, _expandRecordArgsInSimExp(s.right), s.source)
+_expandRecordArgsInWhenOp(s::REINIT) = REINIT(s.stateVar, _expandRecordArgsInSimExp(s.value), s.source)
+_expandRecordArgsInWhenOp(s::NORETCALL) = NORETCALL(_expandRecordArgsInSimExp(s.exp), s.source)
+_expandRecordArgsInWhenOp(s::ASSERT) = ASSERT(_expandRecordArgsInSimExp(s.condition), s.message, s.level, s.source)
+_expandRecordArgsInWhenOp(@nospecialize(s::WhenOperator)) = s
 
 """
   Recursively traverse an expression and expand record arguments inside CALL nodes.
@@ -612,6 +642,26 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
     DAE.UNARY(op, e1) => begin
       local new_e1 = expandRecordArgsInExp(e1)
       new_e1 === e1 ? exp : DAE.UNARY(op, new_e1)
+    end
+    #= Relations and logical operators too: a call inside a condition
+       (MSL Water: medium.h < bubbleEnthalpy(medium.sat) or ...). =#
+    DAE.RELATION(e1, op, e2, idx, opt) => begin
+      local new_e1 = expandRecordArgsInExp(e1)
+      local new_e2 = expandRecordArgsInExp(e2)
+      (new_e1 === e1 && new_e2 === e2) ? exp : DAE.RELATION(new_e1, op, new_e2, idx, opt)
+    end
+    DAE.LBINARY(e1, op, e2) => begin
+      local new_e1 = expandRecordArgsInExp(e1)
+      local new_e2 = expandRecordArgsInExp(e2)
+      (new_e1 === e1 && new_e2 === e2) ? exp : DAE.LBINARY(new_e1, op, new_e2)
+    end
+    DAE.LUNARY(op, e1) => begin
+      local new_e1 = expandRecordArgsInExp(e1)
+      new_e1 === e1 ? exp : DAE.LUNARY(op, new_e1)
+    end
+    DAE.CAST(ty, e1) => begin
+      local new_e1 = expandRecordArgsInExp(e1)
+      new_e1 === e1 ? exp : DAE.CAST(ty, new_e1)
     end
     DAE.ASUB(innerExp, subscripts) => begin
       local newInner = expandRecordArgsInExp(innerExp)
