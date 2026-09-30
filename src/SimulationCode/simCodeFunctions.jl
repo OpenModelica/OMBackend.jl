@@ -68,9 +68,10 @@ function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{
       str = OMFrontend.Frontend.IOStream_M.string(s)
       #=This should really really not be done by string splitting magic... =#
       local libInfo = first(split(str, "annotation"))
-      libInfo = replace(libInfo, "external \"C\"" => "")
+      local language = occursin("external \"FORTRAN 77\"", libInfo) ? "FORTRAN 77" : "C"
+      libInfo = replace(libInfo, "external \"C\"" => "", "external \"FORTRAN 77\"" => "")
       libInfo = replace(libInfo, "'" => "")
-      push!(functions, EXTERNAL_MODELICA_FUNCTION(n, inputs, outputs, libInfo))
+      push!(functions, EXTERNAL_MODELICA_FUNCTION(n, inputs, outputs, locals, language, libInfo))
     end
   end
   return (functions, externalFunctionsUsed)

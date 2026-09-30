@@ -620,7 +620,8 @@ function _canonicalizeFunction(f::EXTERNAL_MODELICA_FUNCTION, ctx::_CanonicalNam
   return EXTERNAL_MODELICA_FUNCTION(canonicalFunctionName,
                                     _mapVectorLike(v -> _canonicalizeDaeVar(v, functionCtx), f.inputs),
                                     _mapVectorLike(v -> _canonicalizeDaeVar(v, functionCtx), f.outputs),
-                                    f.libInfo)
+                                    _mapVectorLike(v -> _canonicalizeDaeVar(v, functionCtx), f.locals),
+                                    f.language, f.libInfo)
 end
 
 function _canonicalizeFunction(f::ModelicaFunction, ctx::_CanonicalNameContext)

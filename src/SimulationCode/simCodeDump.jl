@@ -405,7 +405,10 @@ function string(f::EXTERNAL_MODELICA_FUNCTION)
   for arg in f.outputs
     println(buffer, " " * string(arg))
   end
-  println(buffer, "calling externally defined function: " * f.libInfo)
+  for arg in f.locals
+    println(buffer, " protected " * string(arg))
+  end
+  println(buffer, "calling externally defined function (" * f.language * "): " * f.libInfo)
   println(buffer, "end " * f.name)
   return String(take!(buffer))
 end

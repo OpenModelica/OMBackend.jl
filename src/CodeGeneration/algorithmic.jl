@@ -238,16 +238,17 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         end
       end
       SimulationCode.EXTERNAL_MODELICA_FUNCTION(__) => begin
-        local extCall = Meta.parse(func.libInfo)
-        extCall = namespaceifyExternalFunction(extCall)
-        #= Allocate ccall-mutable buffers for every output, convert array inputs
-           to the right C element type, then dereference Refs in the return. =#
-        local extInputConversions = generateExternalInputConversions(func.inputs)
-        local extOutputAllocs = generateExternalOutputAllocations(func.outputs)
-        local returnExpr = generateExternalReturnExpr(func.outputs)
-
-        #= Build the anonymous function expression manually =#
-        local funcBody = Expr(:block, extInputConversions..., extOutputAllocs..., extCall, returnExpr)
+        local funcBody = if func.language == "FORTRAN 77"
+          _fortranExternalBody(func)
+        else
+          local extCall = namespaceifyExternalFunction(Meta.parse(func.libInfo))
+          #= Allocate ccall-mutable buffers for every output, convert array inputs
+             to the right C element type, then dereference Refs in the return. =#
+          local extInputConversions = generateExternalInputConversions(func.inputs)
+          local extOutputAllocs = generateExternalOutputAllocations(func.outputs)
+          local returnExpr = generateExternalReturnExpr(func.outputs)
+          Expr(:block, extInputConversions..., extOutputAllocs..., extCall, returnExpr)
+        end
         local anonFunc = if nArgs == 0
           Expr(:->, Expr(:tuple), funcBody)
         elseif inputsJL isa Tuple
@@ -328,8 +329,9 @@ function generateLocals(inputs::Vector)
        generate local s = <bindingExpr> instead of just local s =#
     local hasBinding = @match i.binding begin
       SOME(bindingExp) => begin
+        #= An array as a copy: `Real Awork[n, n] = A` is written into, `A` not. =#
         local bindExpr = expToJuliaExpAlg(bindingExp)
-        push!(jInputs, :(local $s = $bindExpr))
+        push!(jInputs, :(local $s = $(_funcParamIsArray(i) ? :(copy($bindExpr)) : bindExpr)))
         true
       end
       _ => false
@@ -380,6 +382,13 @@ function generateOutputDefaults(outputs::Vector)::Vector{Expr}
   local decls = Expr[]
   for v in outputs
     local s = DAE_VAR_ToJulia(v)
+    #= An output with a binding starts at it (`output Real x[n] = b`), an array
+       as a copy: the body or a FORTRAN 77 routine writes into it, not into `b`. =#
+    if v.binding isa SOME
+      local bindExpr = expToJuliaExpAlg(v.binding.data)
+      push!(decls, :(local $s = $(_funcParamIsArray(v) ? :(copy($bindExpr)) : bindExpr)))
+      continue
+    end
     local defaultVal = if _funcParamIsArray(v)
       _arrayDefault(v)
     else
@@ -509,6 +518,86 @@ function generateExternalInputConversions(inputs::Vector)::Vector{Expr}
     end
   end
   return conversions
+end
+
+#= An external "FORTRAN 77" function (Modelica.Math.Matrices.LAPACK): its
+   locals and outputs initialized from their bindings (Awork = A, x = b), the
+   routine of Julia's LAPACK called with every argument by reference (arrays as
+   fresh Float64/Int64 copies it may overwrite, scalars in Refs read back after
+   the call, a character with its hidden length last, as gfortran passes it),
+   and the outputs returned. =#
+function _fortranExternalBody(func)::Expr
+  local call = Meta.parse(func.libInfo)
+  if call isa Expr && call.head === :toplevel && length(call.args) == 1
+    call = call.args[1]
+  end
+  local (resultVar, callExpr) = call isa Expr && call.head === :(=) ? (call.args[1], call.args[2]) : (nothing, call)
+  (callExpr isa Expr && callExpr.head === :call && callExpr.args[1] isa Symbol) ||
+    OMBackend.unsupported("an external FORTRAN 77 call", func.libInfo)
+  local routine = callExpr.args[1]
+  local vars = Dict{Symbol, DAE.VAR}()
+  for v in Iterators.flatten((func.inputs, func.outputs, func.locals))
+    vars[Symbol(DAE_VAR_ToJulia(v))] = v
+  end
+  local prep = Expr[]; local types = Any[]; local args = Any[]; local readBack = Expr[]
+  local hiddenLengths = Any[]
+  local refs = Dict{Symbol, Symbol}()
+  for a in callExpr.args[2:end]
+    if a isa String
+      push!(types, :(Ref{UInt8})); push!(args, UInt8(first(a)))
+      push!(hiddenLengths, 1)
+    elseif a isa Integer
+      push!(types, :(Ref{Int64})); push!(args, Int64(a))
+    elseif a isa AbstractFloat
+      push!(types, :(Ref{Float64})); push!(args, Float64(a))
+    elseif a isa Symbol && haskey(vars, a)
+      local v = vars[a]
+      local elem = _funcParamIsArray(v) ? _funcParamElemType(v) : v.ty
+      if elem isa DAE.T_STRING
+        _funcParamIsArray(v) && OMBackend.unsupported("a FORTRAN 77 character array", a)
+        push!(types, :(Ref{UInt8})); push!(args, :(UInt8(first($a))))
+        push!(hiddenLengths, 1)
+        continue
+      end
+      local jlType = elem isa DAE.T_REAL ? :Float64 : :Int64
+      if _funcParamIsArray(v)
+        haskey(refs, a) || (refs[a] = a; push!(prep, :($a = Array{$jlType}($a))))
+        push!(types, :(Ptr{$jlType})); push!(args, a)
+      else
+        local r = get!(refs, a) do
+          local r = Symbol("_ref_", a)
+          push!(prep, :(local $r = Ref{$jlType}($a)))
+          push!(readBack, elem isa DAE.T_BOOL ? :($a = $r[] != 0) :
+                          elem isa DAE.T_REAL ? :($a = $r[]) : :($a = Int($r[])))
+          r
+        end
+        push!(types, :(Ref{$jlType})); push!(args, r)
+      end
+    else
+      OMBackend.unsupported("a FORTRAN 77 argument", a)
+    end
+  end
+  append!(types, fill(:Clong, length(hiddenLengths))); append!(args, hiddenLengths)
+  local resultType = resultVar === nothing ? :Cvoid :
+    (vars[resultVar].ty isa DAE.T_REAL ? :Float64 : :Int64)
+  local ccallExpr = Expr(:call, :ccall,
+                         :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.lapackFunction($(QuoteNode(routine)))),
+                         resultType, Expr(:tuple, types...), args...)
+  local callStmt = resultVar === nothing ? ccallExpr : :($resultVar = $ccallExpr)
+  local outputs = [Symbol(DAE_VAR_ToJulia(v)) for v in func.outputs]
+  local returnExpr = length(outputs) == 1 ? outputs[1] : Expr(:tuple, outputs...)
+  return Expr(:block, generateArrayConversions(func.inputs)..., generateOutputDefaults(func.outputs)...,
+              generateLocals(func.locals)..., prep..., callStmt, readBack..., returnExpr)
+end
+
+#= The routine `name` of Julia's LAPACK: libblastrampoline's ILP64 interface
+   (`dgesv_64_`, 64-bit integers). =#
+const LAPACK_POINTERS = Dict{Symbol, Ptr{Cvoid}}()
+function lapackFunction(name::Symbol)::Ptr{Cvoid}
+  return get!(LAPACK_POINTERS, name) do
+    local lib = Base.Libc.Libdl.dlopen(LinearAlgebra.BLAS.libblastrampoline)
+    Base.Libc.Libdl.dlsym(lib, Symbol(name, "_64_"))
+  end
 end
 
 function generateExternalReturnExpr(outputs::Vector)

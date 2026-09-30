@@ -9,10 +9,15 @@ struct MODELICA_FUNCTION <: ModelicaFunction
   statements::Vector{DAE.Statement}
 end
 
+#= `language` is the external declaration's, "C" or "FORTRAN 77" (LAPACK);
+   `libInfo` its call, `f(args)` or `y = f(args)`, whose arguments name the
+   inputs, outputs and (protected) locals. =#
 struct EXTERNAL_MODELICA_FUNCTION <: ModelicaFunction
   name::String
   inputs::Vector
   outputs::Vector
+  locals::Vector
+  language::String
   libInfo::String
 end
 
