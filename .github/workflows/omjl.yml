@@ -24,3 +24,6 @@ jobs:
     uses: JKRT/OM.jl/.github/workflows/omjl-ci.yml@master
     with:
       package: OMBackend
+      # The 1.13 line (pushes to 1.13, pull requests into it) is tested on Julia 1.13;
+      # master on 1.12 and 1.13.
+      julia-versions: ${{ (github.ref_name == '1.13' || github.base_ref == '1.13') && '["1.13"]' || '["1.12", "1.13"]' }}
