@@ -110,6 +110,24 @@ function createArrayParametersMTK(arrayParameters::Vector, simCode::SimulationCo
   return exprs
 end
 
+#= The binding the model function assigns a parameter (createParameterAssignmentsMTK),
+   or nothing. A tunable parameter stays the symbolic @parameters variable: a parameter
+   bound to it (`rate = 3 * k`) then lowers to a symbolic expression, so changing k
+   changes rate too. One without a binding (a free parameter, fixed = false) is
+   computed by the initialization. =#
+function _assignedBinding(param, ht)
+  SimulationCode.isTunableParameter(param) && return nothing
+  return @match ht[param][2].varKind begin
+    SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
+    _ => nothing
+  end
+end
+
+#= The parameters the model function assigns no value: the equations and the other
+   parameters' bindings refer to them by name, as the symbolic parameters. =#
+unassignedParameters(parameters::Vector, simCode::SimulationCode.SIM_CODE)::Set{Symbol} =
+  Set{Symbol}(Symbol(p) for p in parameters if _assignedBinding(p, simCode.stringToSimVarHT) === nothing)
+
 """
   Creates parameters assignments *(:=) on a MTK parameters compatible format.
 """
@@ -118,19 +136,9 @@ function createParameterAssignmentsMTK(parameters::Vector,
   local parameterEquations::Vector = Expr[]
   local ht = simCode.stringToSimVarHT
   for param in parameters
-    #= A tunable parameter stays the symbolic @parameters variable; a
-       parameter bound to it (`rate = 3 * k`) then lowers to a symbolic
-       expression, so changing k changes rate too. =#
-    SimulationCode.isTunableParameter(param) && continue
+    bindExp = _assignedBinding(param, ht)
+    bindExp === nothing && continue
     (index, simVar) = ht[param]
-    local simVarType = simVar.varKind
-    bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
-      SimulationCode.PARAMETER(__) =>  begin
-        continue
-      end
-      _ => continue
-    end
     #= Solution for https://github.com/SciML/ModelingToolkit.jl/issues/991 =#
     #TODO: Is this workaround still relevant? John 2023-02-22
     expr =  if isIntOrBool(bindExp)

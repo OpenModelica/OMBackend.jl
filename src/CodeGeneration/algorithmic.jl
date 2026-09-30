@@ -76,10 +76,14 @@ function _algAssignmentPreallocation(@nospecialize(lhs))
   end
 end
 
+#= The lowered left-hand side indexes the array `name`: a scalarized element
+   (signalPWM[3].sawtooth.count lowered to one name) has no array to grow. =#
+_indexesArray(lhs, name) = lhs isa Expr && lhs.head === :ref && _unwrapSubscriptExpr(lhs.args[1]) === name
+
 function _algAssignment(@nospecialize(lhsExp), rhs::Expr)
   local lhs = _unwrapSubscriptExpr(expToJuliaExpAlg(lhsExp))
   local prealloc = _algAssignmentPreallocation(lhsExp)
-  if prealloc === nothing
+  if prealloc === nothing || !_indexesArray(lhs, prealloc.args[2])
     return :($lhs = $rhs)
   else
     return quote

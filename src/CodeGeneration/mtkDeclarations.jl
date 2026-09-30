@@ -241,8 +241,9 @@ end
 
   After chunking, parameter symbols are eval'd into module scope so that
   pars Dict closures and ARRAY_PARAMETERS code can reference them by name.
+  `unassigned` (unassignedParameters) are also bound as locals.
 """
-function decomposeParametersDeclaration(parVariablesSym; chunkSize = CHUNK_SIZE[])
+function decomposeParametersDeclaration(parVariablesSym; unassigned::Set{Symbol}, chunkSize = CHUNK_SIZE[])
   if length(parVariablesSym) <= chunkSize
     return quote
       parameters = ModelingToolkit.@parameters begin
@@ -266,12 +267,14 @@ function decomposeParametersDeclaration(parVariablesSym; chunkSize = CHUNK_SIZE[
     push!(constructorNames, fName)
   end
   local paramNameQuotes = [QuoteNode(s) for s in parVariablesSym]
-  #= A tunable parameter is not assigned its value in the model function
-     (createParameterAssignmentsMTK skips it), so the equations refer to the
-     symbolic parameter by name. Bind it as a local from `parameters`: the
-     global made by the `eval` below is too new for this function's world. =#
-  local tunableBinds = Expr[:($(s) = parameters[$(i)]) for (i, s) in enumerate(parVariablesSym)
-                            if SimulationCode.isTunableParameter(string(s))]
+  #= A parameter the model function assigns no value (createParameterAssignmentsMTK
+     skips it: a tunable one, or one without a binding such as a free parameter the
+     initialization computes) is referred to by name as the symbolic parameter, by
+     the equations and by other parameters' bindings. Bind it as a local from
+     `parameters`: the global made by the `eval` below is too new for this
+     function's world (UndefVarError: the MSL InitSpringConstant's
+     `spring_spring_c = spring_c`). =#
+  local localBinds = Expr[:($(s) = parameters[$(i)]) for (i, s) in enumerate(parVariablesSym) if s in unassigned]
   return quote
     $(exprs...)
     local _allParamChunks = Any[]
@@ -285,7 +288,7 @@ function decomposeParametersDeclaration(parVariablesSym; chunkSize = CHUNK_SIZE[
       push!(_paramBindBlock.args, :($name = $p))
     end
     eval(_paramBindBlock)
-    $(tunableBinds...)
+    $(localBinds...)
   end
 end
 

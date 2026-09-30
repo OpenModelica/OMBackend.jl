@@ -550,6 +550,11 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
           append!(newArgs, fieldArrays)
           continue
         end
+        local ifFields = arg isa DAE.IFEXP && _isRecordShaped(arg) ? _recordIfExpFields(arg) : nothing
+        if ifFields !== nothing
+          append!(newArgs, ifFields)
+          continue
+        end
         @match arg begin
           DAE.CREF(cr, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => begin
             local baseName = OMBackend.canonicalName(cr)
@@ -605,6 +610,42 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
       DAE.ARRAY(ty, scalar, MetaModelica.list(newArr...))
     end
     _ => exp
+  end
+end
+
+#= A record-valued if-expression argument, field by field: if c then a else b
+   passes if c then a_f else b_f for each field f (the ComplexBlocks'
+   if useConjugateInput1 then conj(u1) else u1). nothing unless both branches
+   are records of the same fields: a record reference or a record-valued call. =#
+function _recordIfExpFields(exp::DAE.IFEXP)::Union{Nothing, Vector{DAE.Exp}}
+  local a = _recordFields(exp.expThen); a === nothing && return nothing
+  local b = _recordFields(exp.expElse)
+  (b === nothing || length(a) != length(b)) && return nothing
+  local c = expandRecordArgsInExp(exp.expCond)
+  return DAE.Exp[DAE.IFEXP(c, a[k], b[k]) for k in eachindex(a)]
+end
+
+#= An if-expression between record references or record-valued calls (checked
+   before anything is expanded: most if-expression arguments are Real). =#
+_isRecordShaped(@nospecialize(e::DAE.Exp))::Bool = @match e begin
+  DAE.IFEXP(_, t, f) => _isRecordShaped(t) && _isRecordShaped(f)
+  DAE.CREF(_, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), _, _)) => true
+  DAE.CALL(attr = DAE.CALL_ATTR(ty = DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), _, _))) => true
+  _ => false
+end
+
+Base.@nospecializeinfer function _recordFields(@nospecialize(exp::DAE.Exp))::Union{Nothing, Vector{DAE.Exp}}
+  @match exp begin
+    DAE.CREF(cr, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => begin
+      local baseName = OMBackend.canonicalName(cr)
+      return DAE.Exp[buildFieldArgExp(baseName * OMBackend.COMPONENT_SEPARATOR * f.name, f.ty) for f in varLst]
+    end
+    DAE.IFEXP(__) => return _recordIfExpFields(exp)
+    _ => begin
+      local expanded = expandRecordArgsInExp(exp)
+      local fieldTys = _recordValueFieldTypes(expanded)
+      return fieldTys === nothing ? nothing : DAE.Exp[DAE.TSUB(expanded, k, ty) for (k, ty) in enumerate(fieldTys)]
+    end
   end
 end
 

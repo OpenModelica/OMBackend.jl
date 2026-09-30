@@ -1212,7 +1212,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     function $(Symbol(MODEL_NAME * "Model"))(tspan = (0.0, 1.0))
       ModelingToolkit.@independent_variables t
       D = ModelingToolkit.Differential(t)
-      $(decomposeParametersDeclaration(parVariablesSym))
+      $(decomposeParametersDeclaration(parVariablesSym; unassigned = unassignedParameters(parameters, simCode)))
       #= Create array parameters with proper dimensions =#
       $(ARRAY_PARAMETERS...)
       #= Declare ifCond variables as discrete time-dependent parameters.

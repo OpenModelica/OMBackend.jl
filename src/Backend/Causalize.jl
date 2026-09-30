@@ -117,6 +117,15 @@ Base.@nospecializeinfer function _relationsAllInNoEvent(@nospecialize(exp::DAE.E
   return sawNoEvent[] && !bare[]
 end
 
+#= A record value (the ComplexBlocks' if useConjugateInput1 then conj(u1) else u1). =#
+_isRecordValued(@nospecialize(e::DAE.Exp))::Bool = @match e begin
+  DAE.CREF(_, DAE.T_COMPLEX(__)) => true
+  DAE.CALL(attr = DAE.CALL_ATTR(ty = DAE.T_COMPLEX(__))) => true
+  DAE.RECORD(__) => true
+  DAE.IFEXP(_, t, f) => _isRecordValued(t) || _isRecordValued(f)
+  _ => false
+end
+
 struct IfExpressionLifter
   tmpVarToElement::OrderedDict{BDAE.VAR, BDAE.IF_EQUATION}
   tick::Ref{Int}
@@ -131,9 +140,13 @@ Base.@nospecializeinfer function (v::IfExpressionLifter)(@nospecialize(exp::DAE.
       DAE.IFEXP(cond, expThen, expElse) => begin
         #= A condition whose relations are all inside noEvent is literal: no
            event, so it stays inline like a state-dependent nested IFEXP. =#
-        if (v.timeDepOnly && !_expDependsOnTime(cond)) || _relationsAllInNoEvent(cond)
+        if (v.timeDepOnly && !_expDependsOnTime(cond)) || _relationsAllInNoEvent(cond) ||
+           _isRecordValued(expThen) || _isRecordValued(expElse)
           #= State-dependent: keep inline (bool-product), recurse for nested
-             time-dependent IFEXPs. =#
+             time-dependent IFEXPs. A record value stays inline too: the
+             temporary is a Real; call sites split it field by field
+             (expandRecordArgsInExp). Its relations then make no events
+             (lifting it field by field would). =#
           local (lc, _) = Util.traverseExpTopDown(cond, timeDep, nothing)
           local (lt, _) = Util.traverseExpTopDown(expThen, timeDep, nothing)
           local (le, _) = Util.traverseExpTopDown(expElse, timeDep, nothing)
@@ -1430,7 +1443,7 @@ function flattenArrayCrefsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
         #= Transform equations =#
         for i in 1:length(syst.orderedEqs)
           local eq = syst.orderedEqs[i]
-          (eq2, _) = BDAEUtil.traverseEquationExpressions(eq, flattenWithPrefix, nothing)
+          (eq2, _) = BDAEUtil.traverseEquationExpressions(eq, flattenWithPrefix, IteratorScope(eq))
           if !(eq === eq2)
             @assign syst.orderedEqs[i] = eq2
           end
@@ -1442,7 +1455,7 @@ function flattenArrayCrefsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
             SOME(bindingExp) => begin
               #= traverseExpTopDown applies the func to the root first, then
                  descends, so a separate root-only call is redundant. =#
-              (newBindExp, _) = Util.traverseExpTopDown(bindingExp, flattenWithPrefix, nothing)
+              (newBindExp, _) = Util.traverseExpTopDown(bindingExp, flattenWithPrefix, IteratorScope(bindingExp))
               if !(bindingExp === newBindExp)
                 @assign syst.orderedVars[i].bindExp = SOME(newBindExp)
               end
@@ -1554,9 +1567,14 @@ function flattenArrayCrefInExp(exp::DAE.Exp, acc, prefix::String="")
         hasArraySubs = hasFinalArrayWithSubscripts(cr)
         if hasArraySubs
           (flatName, elementType, finalSubscripts) = crefToFlatName(cr, prefix)
-          newCref = DAE.CREF_IDENT(flatName, elementType, finalSubscripts)
-          newExp = DAE.CREF(newCref, elementType)
-          (newExp, true, acc)
+          local n = runtimeIndexedLength(cr, acc)
+          if n > 0
+            (runtimeIndexChoice(flatName, elementType, listHead(finalSubscripts).exp, n), true, acc)
+          else
+            newCref = DAE.CREF_IDENT(flatName, elementType, finalSubscripts)
+            newExp = DAE.CREF(newCref, elementType)
+            (newExp, true, acc)
+          end
         else
           (exp, true, acc)
         end
@@ -1565,6 +1583,64 @@ function flattenArrayCrefInExp(exp::DAE.Exp, acc, prefix::String="")
     end
   end
   return (newExp, cont, acc)
+end
+
+#= The reduction iterators of one equation or binding, collected when a run-time
+   subscript first needs them. =#
+mutable struct IteratorScope
+  const root::Any
+  names::Union{Nothing, Set{String}}
+end
+IteratorScope(root) = IteratorScope(root, nothing)
+
+function iteratorNames(scope::IteratorScope)::Set{String}
+  if scope.names === nothing
+    local names = Set{String}()
+    local visit = (e, acc) -> begin
+      e isa DAE.REDUCTION && foreach(it -> push!(acc, it.id), e.iterators)
+      (e, true, acc)
+    end
+    scope.root isa DAE.Exp ? Util.traverseExpTopDown(scope.root, visit, names) :
+                             BDAEUtil.traverseEquationExpressions(scope.root, visit, names)
+    scope.names = names
+  end
+  return scope.names
+end
+
+#= The length of the vector a cref selects one element of by a variable known
+   only at run time (MultiSwitch's expr[firstActiveIndex]); 0 for any other
+   cref. The vector's elements are separate variables after scalarization. The
+   index is a component reference, read once per comparison of the choice; not
+   an iterator (x[j] in sum(... for j in 1:n) is unrolled with j by
+   unrollConstantReductions). =#
+function runtimeIndexedLength(cref::DAE.ComponentRef, scope)::Int
+  while cref isa DAE.CREF_QUAL
+    cref = cref.componentRef
+  end
+  cref isa DAE.CREF_IDENT || return 0
+  local subs = cref.subscriptLst
+  (listLength(subs) == 1 && listHead(subs) isa DAE.INDEX && listHead(subs).exp isa DAE.CREF) || return 0
+  local index = listHead(subs).exp.componentRef
+  if index isa DAE.CREF_IDENT
+    (scope isa IteratorScope && !(index.ident in iteratorNames(scope))) || return 0
+  end
+  local ty = cref.identType
+  (ty isa DAE.T_ARRAY && listLength(ty.dims) == 1 && listHead(ty.dims) isa DAE.DIM_INTEGER) || return 0
+  return max(0, Int(listHead(ty.dims).integer))
+end
+
+#= if i == 1 then a[1] elseif ... else a[n], each element flattened as a constant
+   subscript is, so alias elimination and code generation resolve it. An index
+   outside 1:n (an error in Modelica) selects a[n]; MultiSwitch reads the choice
+   only when firstActiveIndex > 0. =#
+function runtimeIndexChoice(flatName::String, elementType::DAE.Type, index::DAE.Exp, n::Int)::DAE.Exp
+  element(i) = DAE.CREF(DAE.CREF_IDENT(flatName, elementType, MetaModelica.list(DAE.INDEX(DAE.ICONST(i)))), elementType)
+  local choice::DAE.Exp = element(n)
+  for i in n-1:-1:1
+    choice = DAE.IFEXP(DAE.RELATION(index, DAE.EQUAL(DAE.T_INTEGER_DEFAULT), DAE.ICONST(i), -1, NONE()),
+                       element(i), choice)
+  end
+  return choice
 end
 
 """

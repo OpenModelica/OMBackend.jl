@@ -144,6 +144,29 @@ const MODELICA_UTILITIES_TO_RUNTIME_C = Dict{String, Symbol}(
   "Modelica_Math_Random_Utilities_impureRandomInteger"    => :Modelica_Math_Random_Utilities_impureRandomInteger,
 )
 
+"""
+    RuntimeCCall(f)(args...)
+
+A call of the OMRuntimeExternalC function `f` from an equation or a parameter binding. A
+symbolic argument (a parameter while the model is built: `id = initializeImpureRandom(globalSeed)`)
+gives an opaque term that MTK evaluates once the parameters have values. Those values arrive as
+Float64, so integral ones are passed as Integers, which the C side's Integer arguments take, and
+a Bool as an Integer (`caseSensitive`). The functions of MODELICA_UTILITIES_TO_RUNTIME_C take
+Integers and Strings only; one with a Real argument would need this conversion narrowed.
+"""
+struct RuntimeCCall{F} <: Function
+  f::F
+end
+function (c::RuntimeCCall)(args...)
+  if any(a -> a isa Symbolics.Num || a isa Symbolics.SymbolicUtils.BasicSymbolic, args)
+    return CodeGeneration.makeSymbolicTerm(c, Any[Symbolics.unwrap(a) for a in args])
+  end
+  return c.f(map(_integralAsInt, args)...)
+end
+_integralAsInt(x::AbstractFloat) = isinteger(x) && abs(x) <= maxintfloat(Float64) ? Int(x) : x
+_integralAsInt(x::Bool) = Int(x)
+_integralAsInt(x) = x
+
 
 #= ============================================================================
    Mathematical functions (scalar)

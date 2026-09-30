@@ -3071,7 +3071,7 @@ function _modelicaFunctionCallExpr(path,
   local runtimeName = get(AlgorithmicCodeGeneration.MODELICA_UTILITIES_TO_RUNTIME_C,
                           normalizedFuncName, nothing)
   local callee = if runtimeName !== nothing
-    Expr(:., :OMRuntimeExternalC, QuoteNode(runtimeName))
+    :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.RuntimeCCall($(Expr(:., :OMRuntimeExternalC, QuoteNode(runtimeName)))))
   else
     Symbol(normalizedFuncName)
   end
