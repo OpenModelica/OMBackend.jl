@@ -310,32 +310,6 @@ function flattenRecordInput(v::DAE.VAR)::Vector{Symbol}
   end
 end
 
-"""
-`generateSignatureForRegistration(inputs::Vector{DAE.VAR})`
-This function generates the input signature for calls to Symbolics.register.
-Record inputs are flattened into individual field parameters to match the
-generated function signature from generateIOL/flattenRecordInput.
-"""
-function generateSignatureForRegistration(inputs::Vector{DAE.VAR})
-  local jInputs = Expr[]
-  for i in inputs
-    @match i.ty begin
-      DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), _, _) => begin
-        #= Flatten record into individual field parameters =#
-        local flattenedSymbols = flattenRecordInput(i)
-        for s in flattenedSymbols
-          push!(jInputs, Expr(:(::), s, :(Any)))
-        end
-      end
-      _ => begin
-        local s = DAE_VAR_ToJulia(i)
-        push!(jInputs, Expr(:(::), s, :(Any)))
-      end
-    end
-  end
-  return jInputs
-end
-
 function generateLocals(inputs::Vector)
   local jInputs = Expr[]
   for i in inputs

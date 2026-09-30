@@ -1222,20 +1222,6 @@ function isArrayType(v::DAE.VAR)::Bool
   end
 end
 
-function hasArrayParameters(f::SimulationCode.ModelicaFunction)::Bool
-  for v in f.inputs
-    if isArrayType(v)
-      return true
-    end
-  end
-  for v in f.outputs
-    if isArrayType(v)
-      return true
-    end
-  end
-  return false
-end
-
 function collectCalledFunctionNames!(names::OrderedSet{String}, @nospecialize(exp::DAE.Exp))
   @match exp begin
     DAE.CALL(path = path, expLst = explst) => begin

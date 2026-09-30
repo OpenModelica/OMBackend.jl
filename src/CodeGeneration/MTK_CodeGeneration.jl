@@ -50,22 +50,24 @@ const IFELSE_HEAD             = :ifelse
 const CONST_TABLE_LOOKUP_HEAD = :constTableLookup
 
 """
-    evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
+    evalGeneratedFunctions!(modelName, functions, simCode)
 
 For `ODE_MODE_MTK_MODEL_GENERATION`: `eval` each generated Modelica
-function body in OMBackend, then `eval` the `@register_symbolic` calls that
-make Symbolics aware of them.
+function body in OMBackend. Each binds the function's name to its wrapper
+(createModelicaFunctionWrapper), which makes a term of a call with a
+symbolic argument; nothing is registered with Symbolics. (A
+`@register_symbolic` of the bound name failed, "already has a value", after
+expanding 3^n methods for n arguments: 25 GB for a Fluid function with its
+records flattened.)
 
 The eval must happen here (not at simulate time) because subsequent codegen
 phases need the function bindings to exist when they construct symbolic
 equation expressions.
 
 On function-eval failure, the offending generated source is dumped to
-`/tmp/om_bad_function.jl` and the error rethrown. Register-call failures
-are tolerated when the binding "already has a value" (re-registration is
-idempotent) and rethrown otherwise.
+`/tmp/om_bad_function.jl` and the error rethrown.
 """
-function evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
+function evalGeneratedFunctions!(modelName, functions, simCode)
   #= Under precompile / image generation, eval'ing the model's generated Modelica functions
      into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
      compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
@@ -91,14 +93,6 @@ function evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
         @error "Generated function eval failed, also failed to dump" modelName error=sprint(showerror, e) ioErr
       end
       rethrow(e)
-    end
-  end
-  local registrationCalls = generateRegisterCallsForCallExprs(simCode; funcArgGen = AlgorithmicCodeGeneration.generateIOL)
-  for regCall in registrationCalls
-    try
-      eval(regCall)
-    catch e
-      contains(string(e), "already has a value") || rethrow(e)
     end
   end
   return nothing
@@ -778,7 +772,6 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
     $(createStringParameterAssignments(simCode)...)
     $(createArrayParameterPrelude(simCode)...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
-    $(generateRegisterCallsForCallExprs(simCode)...)
     $(generateInitialAlgorithmEarlyFunction(simCode))
     $(generateInitialAlgorithmFunction(simCode))
     $(model)
@@ -929,7 +922,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
 
   #= Eval the generated Modelica functions and their @register_symbolic
      calls into OMBackend so subsequent codegen sees the bindings. =#
-  evalGeneratedFunctionsAndRegister!(modelName, functions, simCode)
+  evalGeneratedFunctions!(modelName, functions, simCode)
 
   #= Bucket each simvar by varKind (state / algebraic / discrete
      / parameter / array / occ / data-structure / state-derivative) and

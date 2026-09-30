@@ -328,43 +328,6 @@ function decomposeParameterEquationsInline(parameterEquations; chunkSize = CHUNK
 end
 
 """
-  Generates quoted Symbolics registration calls for externally defined functions:
-  @register_symbolic for the scalar ones. Functions with array parameters are not
-  registered; they run eagerly on symbolic array arguments.
-"""
-function generateRegisterCallsForCallExprs(simCode;
-                                            funcArgGen::Function = AlgorithmicCodeGeneration.generateSignatureForRegistration)
-  local rFs = Expr[]
-  local calledFunctions = collectCalledFunctionNames!(OrderedSet{String}(), simCode)
-  for f in simCode.functions
-    if !(f.name in calledFunctions)
-      continue
-    end
-    if hasArrayParameters(f)
-      #= Functions with array parameters are not registered. =#
-      #= They execute eagerly with symbolic array arguments. =#
-      continue
-    else
-      #= Use @register_symbolic for scalar functions =#
-      local sb = Symbol(f.name)
-      local args = funcArgGen(convert(Vector{DAE.VAR}, f.inputs))
-      local nArgs = length(args)
-      local cExpr = if nArgs == 1
-        Expr(:call, sb, first(args))
-      elseif nArgs == 0
-        Expr(:call, sb)
-      else
-        Expr(:call, sb, tuple(args...)...)
-      end
-      #= Delay evaluation of the register expression until we know the call. =#
-      sbRegister = :((Symbolics.@register_symbolic($(cExpr))))
-      push!(rFs, sbRegister)
-    end
-  end
-  return rFs
-end
-
-"""
   Optionally generate an import statement to OMRuntimeExternalC
 """
 function generateExternalRuntimeImport()::Expr
