@@ -337,21 +337,25 @@ function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSIGN_ARR, record
   return [DAE.STMT_ASSIGN_ARR(stmt.type_, newLhs, newExp, stmt.source)]
 end
 
+#= A body's statement list as a Vector{DAE.Statement}: collect of an empty list is a
+   Vector{Any} (an empty loop or branch body; MSL Fluid's AST_BatchPlant). =#
+_statementVector(statementLst)::Vector{DAE.Statement} = DAE.Statement[s for s in statementLst]
+
 function transformStatementForFlattenedRecords(stmt::DAE.STMT_FOR, recordFieldMap::Dict)::Vector{DAE.Statement}
-  local body = transformStatementsForFlattenedRecords(collect(stmt.statementLst), recordFieldMap)
+  local body = transformStatementsForFlattenedRecords(_statementVector(stmt.statementLst), recordFieldMap)
   return [DAE.STMT_FOR(stmt.type_, stmt.iterIsArray, stmt.iter, stmt.index,
                        transformExpForFlattenedRecords(stmt.range, recordFieldMap),
                        MetaModelica.list(body...), stmt.source)]
 end
 
 function transformStatementForFlattenedRecords(stmt::DAE.STMT_WHILE, recordFieldMap::Dict)::Vector{DAE.Statement}
-  local body = transformStatementsForFlattenedRecords(collect(stmt.statementLst), recordFieldMap)
+  local body = transformStatementsForFlattenedRecords(_statementVector(stmt.statementLst), recordFieldMap)
   return [DAE.STMT_WHILE(transformExpForFlattenedRecords(stmt.exp, recordFieldMap),
                          MetaModelica.list(body...), stmt.source)]
 end
 
 function transformStatementForFlattenedRecords(stmt::DAE.STMT_IF, recordFieldMap::Dict)::Vector{DAE.Statement}
-  local body = transformStatementsForFlattenedRecords(collect(stmt.statementLst), recordFieldMap)
+  local body = transformStatementsForFlattenedRecords(_statementVector(stmt.statementLst), recordFieldMap)
   return [DAE.STMT_IF(transformExpForFlattenedRecords(stmt.exp, recordFieldMap), MetaModelica.list(body...),
                       _transformElseForFlattenedRecords(stmt.else_, recordFieldMap), stmt.source)]
 end
@@ -359,9 +363,9 @@ end
 function _transformElseForFlattenedRecords(@nospecialize(e::DAE.Else), recordFieldMap::Dict)::DAE.Else
   @match e begin
     DAE.ELSEIF(cond, stmts, rest) => DAE.ELSEIF(transformExpForFlattenedRecords(cond, recordFieldMap),
-      MetaModelica.list(transformStatementsForFlattenedRecords(collect(stmts), recordFieldMap)...),
+      MetaModelica.list(transformStatementsForFlattenedRecords(_statementVector(stmts), recordFieldMap)...),
       _transformElseForFlattenedRecords(rest, recordFieldMap))
-    DAE.ELSE(stmts) => DAE.ELSE(MetaModelica.list(transformStatementsForFlattenedRecords(collect(stmts), recordFieldMap)...))
+    DAE.ELSE(stmts) => DAE.ELSE(MetaModelica.list(transformStatementsForFlattenedRecords(_statementVector(stmts), recordFieldMap)...))
     _ => e
   end
 end
