@@ -615,7 +615,7 @@ function eliminateAliasVariables(simCode::SIM_CODE)
           DAE.BINARY(uvExp, DAE.ADD(DAE.T_REAL_DEFAULT), repExp) :
           DAE.BINARY(uvExp, DAE.SUB(DAE.T_REAL_DEFAULT), repExp)
         push!(pairedElimVarNames, uv)
-        push!(pairedElimEqs, BDAE.RESIDUAL_EQUATION(synExp, DAE.emptyElementSource, BDAE.EQ_ATTR_DEFAULT_DYNAMIC))
+        push!(pairedElimEqs, RESIDUAL_EQUATION(synExp))
       end
     end
   end

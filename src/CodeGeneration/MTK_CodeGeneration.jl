@@ -1191,6 +1191,11 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
   local modelPrefix = "_" * MODEL_NAME * "_"
   local (varOuterDefs, varInnerRefs) = decomposeVariables(
     stateVariablesSym, algebraicVariablesSym; modelPrefix = modelPrefix)
+  #= StateSelect priorities of the declared variables only: one dropped since the
+     classification has no binding to set metadata on (UndefVarError: MSL Fluid
+     TanksWithOverflow's lowerTank_V, stateSelect = never). =#
+  local _declaredVariables = OrderedSet{Symbol}(vcat(stateVariablesSym, algebraicVariablesSym))
+  statePriorityPairs = filter(p -> first(p) in _declaredVariables, statePriorityPairs)
   model = quote
     $(CALL_BACK_EQUATIONS)
     #= The discretes of the discrete clusters (the direct-RHS initialization

@@ -592,11 +592,9 @@ function evalDAEConstant(daeConstant::DAE.Exp, simCode)
     DAE.ICONST(int) => int
     DAE.RCONST(real) => real
     DAE.SCONST(tmpStr) => tmpStr
-    #= Try to evaluate the expression =#
-    DAE.BINARY(__) => begin
-      OMBackend.CodeGeneration.evalDAE_Expression(daeConstant, simCode)
-    end
-    DAE.LBINARY(__) => begin
+    #= Try to evaluate the expression: operators and calls of constants (MSL
+       Fluid's tanks: a parameter bound to max(1.0, 1e-15)). =#
+    DAE.BINARY(__) || DAE.LBINARY(__) || DAE.UNARY(__) || DAE.CALL(__) => begin
       OMBackend.CodeGeneration.evalDAE_Expression(daeConstant, simCode)
     end
     _ => OMBackend.unsupported("not a constant", daeConstant)
@@ -622,7 +620,7 @@ function evalDAEConstant(c::SimulationCode.Exp, simCode)
     SimulationCode.ICONST(i) => i
     SimulationCode.RCONST(r) => r
     SimulationCode.SCONST(s) => s
-    SimulationCode.BINARY(__) || SimulationCode.LBINARY(__) =>
+    SimulationCode.BINARY(__) || SimulationCode.LBINARY(__) || SimulationCode.UNARY(__) || SimulationCode.CALL(__) =>
       OMBackend.CodeGeneration.evalDAE_Expression(SimulationCode.toDAEExp(c), simCode)
     _ => OMBackend.unsupported("not a constant", SimulationCode.toDAEExp(c))
   end
