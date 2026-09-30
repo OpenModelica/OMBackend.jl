@@ -114,10 +114,12 @@ function _refName(@nospecialize(e))
   return nothing
 end
 
-#= `0 ~ const + ref` or `0 ~ ref - const` or `0 ~ -ref`. Returns the
-   pinned cref name, or nothing. =#
+#= `0 ~ const + ref` or `0 ~ ref - const` or `0 ~ -ref` or `0 ~ ref` (a
+   discrete set to zero: MSL Media's state.phase = setState_phX(...).phase,
+   the function's constant output 0). Returns the pinned cref name, or nothing. =#
 function _matchAlias(@nospecialize(rhs))
   rhs = _unwrap(rhs)
+  rhs isa Symbol && return string(rhs)
   rhs isa Expr || return nothing
   if rhs.head === :call && length(rhs.args) == 3
     local op = rhs.args[1]
@@ -444,6 +446,10 @@ function _residualDefinedDiscretes(equations::Vector{Expr}, discreteSet::Ordered
     if eq isa Expr && eq.head === :call && length(eq.args) == 3 &&
        eq.args[1] === :~ && eq.args[2] == 0
       local rhs = _unwrap(eq.args[3])
+      if rhs isa Symbol
+        string(rhs) in discreteSet && push!(defined, string(rhs))
+        continue
+      end
       rhs isa Expr || continue
       if rhs.head === :call && length(rhs.args) == 3 && (rhs.args[1] === :- || rhs.args[1] === :+)
         for operand in (rhs.args[2], rhs.args[3])
