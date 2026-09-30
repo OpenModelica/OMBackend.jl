@@ -459,6 +459,12 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
   unsupported("initial when-statement variant", wStmt)
 end
 
+#= The early pass runs at initialization: initial() is true (a body that reads
+   it, MSL Fluid PumpingSystem: UndefVarError `initial`). =#
+_initialIsTrue(@nospecialize(e)) = first(Util.traverseExpBottomUp(e, (x, acc) -> begin
+    (x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name == "initial") ? (DAE.BCONST(true), acc) : (x, acc)
+  end, nothing))
+
 #= Translate a single `BDAE.WhenOperator` from an init-algorithm body into a
    Julia statement suitable for the procedural body of
    `__runInitialAlgorithmEarly!`. ASSIGN emits `_alg_<lhs> = <rhs>` (with
@@ -467,7 +473,7 @@ end
    than to module-level Symbolics bindings of the same name. =#
 function _initialWhenOpToJuliaEarly(wStmt, simCode::SimulationCode.SIM_CODE,
                                     renamedNames::OrderedSet{String}, seenLHS::OrderedSet{String})
-  local sub = e -> _substituteBoundParameters(e, simCode)
+  local sub = e -> _substituteBoundParameters(_initialIsTrue(e), simCode)
   local lowerAlg = e -> _renameAlgIdentifiers(
     _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))),
     renamedNames)

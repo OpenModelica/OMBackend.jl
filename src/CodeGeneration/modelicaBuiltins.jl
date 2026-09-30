@@ -91,6 +91,10 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
   "product"   => :modelica_product,
   "min"       => :modelica_min,
   "max"       => :modelica_max,
+  #= The frontend's positiveMax of a stream connection (inStream with three or
+     more connectors, NFConnectEquations.makePositiveMaxCall): max(flow, eps),
+     as OpenModelica's runtime (MSL Fluid AST_BatchPlant). =#
+  "OMCPositiveMax" => :modelica_max,
 
   #= --- Array shape/query --- =#
   "size"      => :modelica_size,

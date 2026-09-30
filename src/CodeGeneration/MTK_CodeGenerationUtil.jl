@@ -768,6 +768,10 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       Note that the array is added as <name>[<size>] in the HT during the simcode phase.
       Hence, the dimensionality must be added before lookup in the ht.
       =#
+      #= A zero-size array has no variables (MSL Fluid's Xi_outflow[Medium.nXi],
+         nXi = 0 for a single substance, passed to setState_phX): an empty array
+         of its shape. =#
+      DAE.CREF(cr, DAE.T_ARRAY(ty, dims)) where _isZeroSizeArray(dims) => _emptyArrayExpr(ty, dims)
       DAE.CREF(cr, DAE.T_ARRAY(ty, dims)) => begin
         lookUpStr = string(exp)
         arrName = string(exp)
@@ -1498,6 +1502,14 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
     end
   end
   return expr
+end
+
+_isZeroSizeArray(dims)::Bool = any(d -> d isa DAE.DIM_INTEGER && d.integer == 0, dims)
+
+function _emptyArrayExpr(ty::DAE.Type, dims)::Expr
+  local elType = ty isa DAE.T_INTEGER ? :Int : ty isa DAE.T_BOOL ? :Bool : :Float64
+  local sizes = [d isa DAE.DIM_INTEGER ? Int(d.integer) : 0 for d in dims]
+  return :(zeros($elType, $(sizes...)))
 end
 
 """
