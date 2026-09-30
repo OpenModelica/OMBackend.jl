@@ -331,7 +331,7 @@ function generateLocals(inputs::Vector)
       SOME(bindingExp) => begin
         #= An array as a copy: `Real Awork[n, n] = A` is written into, `A` not. =#
         local bindExpr = expToJuliaExpAlg(bindingExp)
-        push!(jInputs, :(local $s = $(_funcParamIsArray(i) ? :(copy($bindExpr)) : bindExpr)))
+        push!(jInputs, :(local $s = $(_funcParamIsArray(i) ? :(Base.copy($bindExpr)) : bindExpr)))
         true
       end
       _ => false
@@ -386,7 +386,7 @@ function generateOutputDefaults(outputs::Vector)::Vector{Expr}
        as a copy: the body or a FORTRAN 77 routine writes into it, not into `b`. =#
     if v.binding isa SOME
       local bindExpr = expToJuliaExpAlg(v.binding.data)
-      push!(decls, :(local $s = $(_funcParamIsArray(v) ? :(copy($bindExpr)) : bindExpr)))
+      push!(decls, :(local $s = $(_funcParamIsArray(v) ? :(Base.copy($bindExpr)) : bindExpr)))
       continue
     end
     local defaultVal = if _funcParamIsArray(v)
@@ -1102,10 +1102,12 @@ function generateStatement(stmt::DAE.STMT_ASSERT)::Expr
   local condExpr = expToJuliaExpAlg(stmt.cond)
   local msgExpr = expToJuliaExpAlg(stmt.msg)
   if !isWarningAssertionLevel(stmt.level)
-    #= AssertionLevel.error - throw an error =#
+    #= AssertionLevel.error - throw an error. Base.error: a Modelica local may be
+       called `error` (MSL Water IF97's `Integer error` flag of the inverse
+       iterations: "objects of type Int64 are not callable"). =#
     quote
       if !($condExpr)
-        error($msgExpr)
+        Base.error($msgExpr)
       end
     end
   else
