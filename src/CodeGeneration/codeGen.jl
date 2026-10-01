@@ -1007,6 +1007,10 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
        (generated code cannot read the parameters at module level). =#
     _startVal === nothing && @debug "sample(): start $(start) not evaluated; ticks from the initial time"
     local _phaseExpr = _startVal === nothing ? 0.0 : max(0.0, Float64(_startVal))
+    #= A start at the initial time ticks there too, after initialization (omc,
+       Dymola): MSL RealFFT1's `when sample(0, Ts)` samples y(0) into its FFT
+       buffer. The initial time taken as 0, as for the phase. =#
+    local _initialTick = _startVal !== nothing && iszero(Float64(_startVal))
     local _guardCrefs = sampleGuard === nothing ? DAE.ComponentRef[] : listArray(Util.getAllCrefs(sampleGuard))
     local _guardExpr = sampleGuard === nothing ? true : expToJuliaExpMTK(sampleGuard, simCode)
     quote
@@ -1040,11 +1044,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
       $(Symbol("sampleDt$(callbacks)")) = $(_dtExpr)
       $(Symbol("samplePhase$(callbacks)")) = $(_phaseExpr)
-      #= Ticks at start + i*interval from the first after the initial time.
-         (omc also ticks at the initial time when start is there, and at the
-         final time: open, see the 2026-09-29 report.) =#
+      #= Ticks at start + i*interval, the initial time included. (omc also
+         ticks at the final time: open, see the 2026-09-29 report.) =#
       $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), $(Symbol("sampleDt$(callbacks)"));
-                                                      phase = $(Symbol("samplePhase$(callbacks)")), save_positions = (true, true))
+                                                      phase = $(Symbol("samplePhase$(callbacks)")),
+                                                      initial_affect = $(_initialTick), save_positions = (true, true))
       $(if wEq.elsewhenPart !== nothing
           eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4)
         end)
