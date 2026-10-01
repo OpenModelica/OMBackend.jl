@@ -311,24 +311,87 @@ function emitInitAlgU0Appends(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   for ia in _earlyInitialAlgorithms(simCode)
     _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
-  for name in lhsNames
-    haskey(ht, name) || continue
-    local (_, sv) = ht[name]
-    if sv.varKind isa SimulationCode.PARAMETER ||
-       sv.varKind isa SimulationCode.ARRAY_PARAMETER
-      continue
-    end
-    local qn = QuoteNode(Symbol(name))
+  for (_, el, _) in _initAlgTargets(lhsNames, ht, _initAlgIterators(simCode))
+    local qn = QuoteNode(Symbol(el))
     #= Replace (not append) any existing start-attribute entry so a lifted
        discrete with both a start value and an init-algorithm value does not
        leave a duplicate key in the u0 pair list (which drops other entries
        during splitInitialValues). =#
     push!(appends, :(if haskey(_algResults, $(qn))
-                       filter!(_p -> !isequal(_p.first, $(Symbol(name))), fiv)
-                       push!(fiv, $(Symbol(name)) => _algResults[$(qn)])
+                       filter!(_p -> !isequal(_p.first, $(Symbol(el))), fiv)
+                       push!(fiv, $(Symbol(el)) => _algResults[$(qn)])
                      end))
   end
   return appends
+end
+
+#= A variable's start value in the early pass: its start attribute, a literal
+   or an expression that evaluates (`start = x0`, a parameter); else 0.0. =#
+function _initAlgStartValue(sv, simCode)::Float64
+  local attrs = sv.attributes
+  attrs isa SOME || return 0.0
+  hasproperty(attrs.data, :start) && attrs.data.start isa SOME || return 0.0
+  local v = OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(attrs.data.start.data, simCode), nothing, :initAlgStart)
+  return v isa Real ? Float64(v) : _readStartAttributeAsLiteral(sv)
+end
+
+#= The non-parameter variables that the assignments to `lhsNames` set, as
+   (assigned name, variable, index into the assigned value): the name itself
+   (index nothing), or for an array its scalarized elements name[k] present
+   in the table (`x := {1, 2, 3}`; 2-D names x[1][2] are not matched). A for
+   loop's iterator (`iterators`, also among the assigned names) is no
+   variable, even where an array of its name is. =#
+function _initAlgTargets(lhsNames, ht, iterators = Set{String}())::Vector{Tuple{String, String, Union{Nothing, Int}}}
+  local out = Tuple{String, String, Union{Nothing, Int}}[]
+  for name in lhsNames
+    local elems = if haskey(ht, name)
+      Tuple{String, Union{Nothing, Int}}[(name, nothing)]
+    elseif name in iterators
+      Tuple{String, Union{Nothing, Int}}[]
+    else
+      local prefix = string(name, "[")
+      local idx = Int[]
+      for key in keys(ht)
+        (startswith(key, prefix) && endswith(key, "]")) || continue
+        local k = tryparse(Int, SubString(key, ncodeunits(prefix) + 1, prevind(key, lastindex(key))))
+        k === nothing || push!(idx, k)
+      end
+      Tuple{String, Union{Nothing, Int}}[(string(name, "[", k, "]"), k) for k in sort!(idx)]
+    end
+    for (el, k) in elems
+      local sv = ht[el][2]
+      (sv.varKind isa SimulationCode.PARAMETER || sv.varKind isa SimulationCode.ARRAY_PARAMETER) && continue
+      push!(out, (name, el, k))
+    end
+  end
+  return out
+end
+
+#= The iterators of the for loops of the early initial algorithms. =#
+function _initAlgIterators(simCode)::Set{String}
+  local out = Set{String}()
+  local walk! = nothing
+  walk! = stmts -> foreach(stmts) do s
+    @match s begin
+      DAE.STMT_FOR(_, _, iter, _, _, body, _) => (push!(out, iter); walk!(body))
+      DAE.STMT_PARFOR(_, _, iter, _, _, body, _, _) => (push!(out, iter); walk!(body))
+      DAE.STMT_IF(_, body, else_, _) => (walk!(body); _walkElse!(walk!, else_))
+      DAE.STMT_WHILE(_, body, _) => walk!(body)
+      _ => nothing
+    end
+  end
+  for ia in _earlyInitialAlgorithms(simCode)
+    walk!(ia.daeStatements)
+  end
+  return out
+end
+
+function _walkElse!(walk!, else_)
+  @match else_ begin
+    DAE.ELSEIF(_, stmts, rest) => (walk!(stmts); _walkElse!(walk!, rest))
+    DAE.ELSE(stmts) => walk!(stmts)
+    _ => nothing
+  end
 end
 
 """
@@ -345,16 +408,10 @@ function emitInitAlgConstraintAppends(simCode::SimulationCode.SIM_CODE)::Vector{
   for ia in _earlyInitialAlgorithms(simCode)
     _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
-  for name in lhsNames
-    haskey(ht, name) || continue
-    local (_, sv) = ht[name]
-    if sv.varKind isa SimulationCode.PARAMETER ||
-       sv.varKind isa SimulationCode.ARRAY_PARAMETER
-      continue
-    end
-    local qn = QuoteNode(Symbol(name))
+  for (_, el, _) in _initAlgTargets(lhsNames, ht, _initAlgIterators(simCode))
+    local qn = QuoteNode(Symbol(el))
     push!(appends, :(haskey(_algResults, $(qn)) &&
-                     push!(_eqs, $(Symbol(name)) ~ _algResults[$(qn)])))
+                     push!(_eqs, $(Symbol(el)) ~ _algResults[$(qn)])))
   end
   return appends
 end
@@ -595,8 +652,23 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
     local lit = _readStartAttributeAsLiteral(sv)
     push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(lit)))
   end
+  #= An assigned variable starts at its start value: read before it is
+     assigned, and what an untaken branch leaves (an initial algorithm
+     determines all its left-hand sides). An array, the vector of its
+     elements' starts. =#
+  local iterators = _initAlgIterators(simCode)
   for name in lhsNames
-    push!(prefetches, :(local $(Symbol("_alg_" * name)) = 0.0))
+    local start = if haskey(ht, name)
+      _initAlgStartValue(ht[name][2], simCode)
+    else
+      local elems = _initAlgTargets([name], ht, iterators)
+      local starts = zeros(isempty(elems) ? 0 : maximum(last, elems))
+      for (_, el, k) in elems
+        starts[k] = _initAlgStartValue(ht[el][2], simCode)
+      end
+      isempty(elems) ? 0.0 : Expr(:vect, starts...)
+    end
+    push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(start)))
   end
   local stmts = Expr[]
   local seenLHS = copy(lhsNames)
@@ -621,16 +693,10 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
      as before (the early body threw there). =#
   any(_callsDer, stmts) && return noEarlyPass
   local captures = Expr[]
-  for name in lhsNames
-    haskey(ht, name) || continue
-    local sv = ht[name][2]
-    if sv.varKind isa SimulationCode.PARAMETER ||
-       sv.varKind isa SimulationCode.ARRAY_PARAMETER
-      continue
-    end
+  for (name, el, k) in _initAlgTargets(lhsNames, ht, iterators)
     local algSym = Symbol("_alg_" * name)
-    local qn = QuoteNode(Symbol(name))
-    push!(captures, :(try; _results[$(qn)] = Float64($(algSym)); catch _e; OMBackend._fallback(_e, :initAlgEarlyCapture); nothing; end))
+    local qn = QuoteNode(Symbol(el))
+    push!(captures, :(try; _results[$(qn)] = Float64($(k === nothing ? algSym : :($(algSym)[$(k)]))); catch _e; OMBackend._fallback(_e, :initAlgEarlyCapture); nothing; end))
   end
   return quote
     function __runInitialAlgorithmEarly!()

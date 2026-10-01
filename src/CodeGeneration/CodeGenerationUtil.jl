@@ -1402,6 +1402,12 @@ function _renameAlgIdentifiers(expr, names::OrderedSet{String}, prefix::String)
     s == "time" && return expr
     return s in names ? Symbol(prefix * s) : expr
   elseif expr isa Expr
+    #= The growth guard of an array whose elements are locals of their own
+       here (x[1] := 1.0 is var"_alg_x[1]" = 1.0): no array to grow. =#
+    if expr.head === :call && length(expr.args) >= 2 && expr.args[2] isa Symbol &&
+       endswith(string(expr.args[1]), "ensureAlgArrayLength!") && !(string(expr.args[2]) in names)
+      return nothing
+    end
     if expr.head === :ref
       local refName = _literalRefName(expr)
       if refName !== nothing && refName in names
