@@ -462,6 +462,7 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
       local subCodes = collect(rec(_subExp(s)) for s in subs)
       :(OMBackend.CodeGeneration.constTableLookup($(expToJuliaExpMTK(tableExp, simCode)), $(subCodes...)))
     end
+    DAE.SCONST(str) => str
     DAE.ARRAY(__) => expToJuliaExpMTK(exp, simCode)
     #= External / qualified Modelica function (e.g. CombiTimeTable
        Internal.getNextTimeEvent): mirror the residual's name resolution
@@ -934,7 +935,9 @@ function emitAssertCallback(simCode)::Expr
   for a in simCode.asserts
     local obsAcc = Dict{Symbol,Symbol}()
     local cond = try
-      _daeBoolMem(a.condition, obsAcc, simCode)
+      #= A call equation for its effects (BDAECreate): run it, it holds. =#
+      _isEffectCall(a.condition) ? :($(_effectCallExpr(a.condition, obsAcc, simCode)); true) :
+                                   _daeBoolMem(a.condition, obsAcc, simCode)
     catch err
       OMBackend._fallback(err, :assertCondition; only = LoweringFailure, impact = :result)
       @warn "[MTK GEN: asserts] an assert cannot be checked at run time; it is left out" condition = string(a.condition) exception = err
@@ -956,6 +959,30 @@ function emitAssertCallback(simCode)::Expr
   end
   isempty(entries) && return Expr(:block)
   return :(callbacks = OMBackend.CodeGeneration.withAssertCallback(callbacks, problem, [$(entries...)]))
+end
+
+_isEffectCall(@nospecialize(e))::Bool = e isa DAE.CALL && e.attr.ty isa DAE.T_NORETCALL
+
+#= A call for its effects, its arguments read as values: a String as it is,
+   a Boolean decoded from the arithmetic encoding, an array element by
+   element (a literal one too: its elements may be variables). =#
+function _effectCallExpr(call::DAE.CALL, obsAcc::Dict{Symbol,Symbol}, simCode)
+  local arg(@nospecialize a) = @match a begin
+    DAE.SCONST(str) => str
+    DAE.ARRAY(_, _, es) => Expr(:vect, (arg(e) for e in es)...)
+    _ where _isBooleanExp(a) => _daeBoolMem(a, obsAcc, simCode)
+    _ => _daeExpToJuliaMem(a, obsAcc, simCode)
+  end
+  return Expr(:call, Symbol(OMBackend.canonicalName(string(call.path))), (arg(a) for a in call.expLst)...)
+end
+
+Base.@nospecializeinfer function _isBooleanExp(@nospecialize(e))::Bool
+  @match e begin
+    DAE.BCONST(__) || DAE.RELATION(__) || DAE.LBINARY(__) || DAE.LUNARY(__) => true
+    DAE.CREF(_, ty) => ty isa DAE.T_BOOL
+    DAE.CALL(attr = attr) => attr.ty isa DAE.T_BOOL
+    _ => false
+  end
 end
 
 #= An assert's message: string literals, `+` concatenation and String(x) of

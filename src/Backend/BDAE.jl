@@ -161,8 +161,9 @@ using ExportAll
     the else branch.
   - `FOR_EQUATION(iter, start, stop, body, source, attr)` — ranged loop
     equation. No frontend path currently emits it.
-  - `DUMMY_EQUATION` — placeholder used when a NORETCALL cannot be lowered.
-  - `ASSERT_EQUATION(condition, message, level, source)`.
+  - `ASSERT_EQUATION(condition, message, level, source)`. A call equation
+    for its effects is one too, its condition the call (type T_NORETCALL):
+    it runs where the asserts are checked.
   - `INITIAL_STRUCTURAL_STATE(initialState)` — records the initial mode
     name for a variable-structure system.
   - `BRANCH(ar, br)` — `Connections.branch(ar, br)`.
@@ -530,9 +531,6 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
     body::Equation
     source::DAE.ElementSource
     attr::EquationAttributes
-  end
-
-  @Record DUMMY_EQUATION begin
   end
 
   @Record ASSERT_EQUATION begin

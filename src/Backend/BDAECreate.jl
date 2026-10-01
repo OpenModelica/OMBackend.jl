@@ -593,12 +593,11 @@ Base.@nospecializeinfer function equationToBackendEquation(@nospecialize(elem::D
     DAE.COMP(__) => begin
       throw("Components not directly allowed in equation sections")
     end
-    DAE.NORETCALL(DAE.CALL(path, expLst)) => begin
-      #=
-      Currently there are two options here.
-      Either we have an initialStructuralState
-      or we have some transition between structural states.
-      =#
+    DAE.NORETCALL(call, source) where call isa DAE.CALL => begin
+      #= A structural state, a transition between structural states, or a
+         call for its effects. =#
+      local path = call.path
+      local expLst = call.expLst
       res = @match path begin
         Absyn.IDENT("initialStructuralState") => begin
           BDAE.INITIAL_STRUCTURAL_STATE(string(listHead(expLst)))
@@ -609,14 +608,14 @@ Base.@nospecializeinfer function equationToBackendEquation(@nospecialize(elem::D
           local toStateIdent = string(toStateExp)
           BDAE.STRUCTURAL_TRANSITION(fromStateIdent, toStateIdent, conditionExp)
         end
-        _ => begin
-          #= Skip unknown NORETCALL statements (e.g. checkBoundary, assert-like calls).
-             These are validation calls that do not contribute to the equation system.
-             Drop `maxlog` so every unique skipped call is visible — silently discarding
-             unknown semantics is how real bugs hide. =#
-          @warn "Skipping unknown NORETCALL (frontend emitted a call whose semantics the backend does not handle; treating as dummy). If this call has side effects or constraints, it will not be preserved." path
-          BDAE.DUMMY_EQUATION()
-        end
+        #= A call of a Modelica function for its effects (MSL Fluid's
+           checkBoundary: asserts on the medium; a print) runs where the
+           asserts are checked, after the initialization and after each step
+           (emitAssertCallback). As an assert its condition is the call, which
+           has no value (T_NORETCALL). It was dropped (a DUMMY_EQUATION). =#
+        _ where !call.attr.builtin =>
+          BDAE.ASSERT_EQUATION(call, DAE.SCONST(string(path)), DAE.ASSERTIONLEVEL_ERROR, source)
+        _ => OMBackend.unsupported("this builtin call as an equation", call)
       end
       res
     end

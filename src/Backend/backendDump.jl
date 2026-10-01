@@ -264,10 +264,6 @@ function Base.string(@nospecialize(eq::BDAE.Equation))
         "STRUCTURAL_TRANSITION " * eq.fromState * " -> " * eq.toState * "| if:" * string(eq.transitionCondition)
       end
 
-      BDAE.DUMMY_EQUATION() => begin
-        "DUMMY_EQUATION"
-      end
-
       BDAE.ASSERT_EQUATION(condition, message, _, _) => begin
         "ASSERT_EQUATION(condition = $(string(condition)), message = \"$(string(message))\")"
       end
