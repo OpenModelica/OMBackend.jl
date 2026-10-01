@@ -411,13 +411,17 @@ end
    each threshold so a stepped output (e.g. a Digital Table) lands on its sample times. =#
 function _emitPresetTimeWhen(eq, simCode, callbacks::Int, thresholds::Vector{Float64})
   local wEq = eq.whenEquation
-  local whenStmts = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  #= pre(v) from a snapshot on entry: an earlier statement's new value is not pre(v). =#
+  local whenStmts = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+    createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  end
   local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
   local times = sort(unique(filter(>(0.0), thresholds)))
   quote
     let _affCache = Ref{Any}(nothing)
       global $(Symbol("affect$(callbacks)!"))
       $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+        local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = copy(integrator.u)
         local t = integrator.t
         local x = integrator.u
         local lookuptableStates
@@ -551,7 +555,10 @@ function _collectDiscreteBoolWhenRefresh(writtenLHS::OrderedSet{String}, simCode
     local condDAE = SimulationCode.toDAEExp(weq.whenEquation.condition)
     local condCrefs = listArray(Util.getAllCrefs(condDAE))
     any(c -> string(c) in writtenLHS, condCrefs) || continue
-    append!(refreshStmts, createWhenStatementsMTK(weq.whenEquation.whenStmtLst, simCode))
+    #= pre(v) from the periodic affect's snapshot (the values before the tick). =#
+    append!(refreshStmts, Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+      createWhenStatementsMTK(weq.whenEquation.whenStmtLst, simCode)
+    end)
     append!(refreshCrefs, condCrefs)
     for st in collect(weq.whenEquation.whenStmtLst)
       (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
@@ -572,7 +579,10 @@ end
 function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64, period::Float64)
   local wEq = eq.whenEquation
   local _firstEdge = startTime + (floor(-startTime / period) + 1.0) * period
-  local whenStmts = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  #= pre(v) from a snapshot on entry, as the periodic sample() path. =#
+  local whenStmts = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+    createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  end
   local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
   local writtenLHS = OrderedSet{String}()
   for wStmt in wEq.whenStmtLst
@@ -587,6 +597,7 @@ function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64,
       global $(Symbol("affect$(callbacks)!"))
       $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
         OMBackend.CodeGeneration._isPeriodicTick(integrator, $(_firstEdge), $(period)) || return nothing
+        local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = copy(integrator.u)
         local t = integrator.t
         local x = integrator.u
         local lookuptableStates
@@ -823,8 +834,10 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       #= Use MTK-aware runtime symbol lookup for the elseif continuous path.
          The hardcoded x[N] indices from expToJuliaExp become invalid after
          MTK structural_simplify reorders unknowns. =#
-      local whenStatementsMTKIf = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
-      local whenStatementsMTKElse = createWhenStatementsMTK(_elsewhenStmtLst(elsePart), simCode)
+      #= pre(v) from a snapshot on entry (an earlier statement's new value is not pre(v)). =#
+      local (whenStatementsMTKIf, whenStatementsMTKElse) = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+        (createWhenStatementsMTK(wEq.whenStmtLst, simCode), createWhenStatementsMTK(_elsewhenStmtLst(elsePart), simCode))
+      end
       local condCrefsElseIf = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
       quote
         let _condCache = Ref{Any}(nothing)
@@ -854,6 +867,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
         let _affCache = Ref{Any}(nothing)
           global $(Symbol("affect$(callbacks)!"))
           $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+            local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = copy(integrator.u)
             local t = integrator.t + integrator.dt
             local x = integrator.u
             local lookuptableStates
@@ -894,7 +908,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
                                                          affect_neg! = $(Symbol("affect$(callbacks)!")))
       end
     else #= No elseif =#
-      whenStatementsMTK  = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+      #= pre(v) from a snapshot on entry: `b = not pre(c); k = if pre(c) ...`
+         with c = b read b's new value (k = 20, OpenModelica 10). =#
+      whenStatementsMTK = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+        createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+      end
       local cond = quote
         let _condCache = Ref{Any}(nothing)
           global $(Symbol("condition$(callbacks)"))
@@ -936,6 +954,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
         let _affCache = Ref{Any}(nothing)
           global $(Symbol("affect$(callbacks)!"))
           $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+            local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = copy(integrator.u)
             local t = integrator.t + integrator.dt
             local x = integrator.u
             @debug "[CB-CC$($(callbacks)) affect] firing" t=integrator.t
@@ -1004,7 +1023,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
        expToJuliaExp are invalid after MTK structural_simplify reorders unknowns,
        so resolve the interval to a literal Δt and write state via
        getStatesAsSymbols + lookuptable, mirroring the discrete branch. =#
-    local whenStatementsMTKPeriodic = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    #= pre(v) from a snapshot on entry: a body reading pre(c) after setting its
+       alias b (`b = not pre(c); k = if pre(c) ...`) read the new value. =#
+    local whenStatementsMTKPeriodic = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+      createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    end
     #= Refresh discrete-bool whens whose condition reads a discrete this periodic
        body writes (e.g. BooleanPulse `y` reads the re-sampled `pulseStart`): their
        own continuous callbacks cannot catch the threshold jump, so re-derive them
@@ -1047,6 +1070,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
         $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
           OMBackend.CodeGeneration._isPeriodicTick(integrator, $(Symbol("samplePhase$(callbacks)")),
                                                    $(Symbol("sampleDt$(callbacks)"))) || return nothing
+          local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = copy(integrator.u)
           local t = integrator.t
           local x = integrator.u
           local p = integrator.p
