@@ -871,15 +871,75 @@ function createWhenOperators(elementLst::List{DAE.Element},lst::List{BDAE.WhenOp
         acc = BDAE.NORETCALL(e1, source) <| lst
         createWhenOperators(rest, acc)
       end
-      #= MAYBE MORE CASES NEEDED =#
+      DAE.EQUEQUATION(cr1 = c1, cr2 = c2, source = source) <| rest => begin
+        acc = BDAE.ASSIGN(DAE.CREF(c1, BDAEUtil.crefLeafType(c1)), DAE.CREF(c2, BDAEUtil.crefLeafType(c2)), source) <| lst
+        createWhenOperators(rest, acc)
+      end
+      DAE.IF_EQUATION(condition1 = conds, equations2 = branches, equations3 = elseBranch, source = source) <| rest => begin
+        createWhenOperators(rest, _ifEquationWhenOperators(conds, branches, elseBranch, source, lst))
+      end
       nil => begin
         (lst)
       end
-      _ <| rest => begin
-        createWhenOperators(rest, lst)
+      #= An array, record or for equation in a when (ARRAY_EQUATION,
+         COMPLEX_EQUATION, FOR_EQUATION): dropping it left its variables
+         unassigned at the event. =#
+      e <| _ => OMBackend.unsupported("this equation in a when-equation", e)
+    end
+  end
+end
+
+#= An if-equation in a when-equation (MLS 8.3.5: every branch assigns the same
+   variables): one assignment per variable of `if c1 then e1 elseif ... else en`,
+   a branch without one keeping the value; a reinit likewise, a branch without
+   one reinitializing the state to itself; an assert under the branch's
+   condition. A call for its side effects is not run (as in a when algorithm). =#
+function _ifEquationWhenOperators(conds, branches, elseBranch, source, lst::List{BDAE.WhenOperator})::List{BDAE.WhenOperator}
+  local branchOps = [listArray(createWhenOperators(b, nil)) for b in vcat(collect(branches), [elseBranch])]
+  local guards = Any[]
+  local before = nothing
+  for c in conds
+    push!(guards, before === nothing ? c : DAE.LBINARY(before, DAE.AND(DAE.T_BOOL_DEFAULT), c))
+    local notC = DAE.LUNARY(DAE.NOT(DAE.T_BOOL_DEFAULT), c)
+    before = before === nothing ? notC : DAE.LBINARY(before, DAE.AND(DAE.T_BOOL_DEFAULT), notC)
+  end
+  push!(guards, before === nothing ? DAE.BCONST(true) : before)
+  #= The value of each assigned variable (or reinitialized state) per branch. =#
+  local targets = OrderedDict{String, Tuple{Symbol, DAE.Exp}}()
+  local values = [Dict{String, DAE.Exp}() for _ in branchOps]
+  local asserts = BDAE.WhenOperator[]
+  for (k, ops) in enumerate(branchOps)
+    for op in ops
+      @match op begin
+        BDAE.ASSIGN(left, right, _) => begin
+          targets[string(left)] = (:assign, left)
+          values[k][string(left)] = right
+        end
+        BDAE.REINIT(stateVar, value, _) => begin
+          targets["reinit " * string(stateVar)] = (:reinit, stateVar)
+          values[k]["reinit " * string(stateVar)] = value
+        end
+        BDAE.ASSERT(c, m, l, s) => push!(asserts, BDAE.ASSERT(DAE.LBINARY(DAE.LUNARY(DAE.NOT(DAE.T_BOOL_DEFAULT), guards[k]),
+                                                                           DAE.OR(DAE.T_BOOL_DEFAULT), c), m, l, s))
+        BDAE.NORETCALL(__) => nothing
+        _ => OMBackend.unsupported("this equation in an if-equation in a when-equation", op)
       end
     end
   end
+  local ifOps = BDAE.WhenOperator[]
+  for (key, (kind, target)) in targets
+    local value = get(values[end], key, target)
+    for k in (length(branchOps) - 1):-1:1
+      value = DAE.IFEXP(collect(conds)[k], get(values[k], key, target), value)
+    end
+    push!(ifOps, kind === :assign ? BDAE.ASSIGN(target, value, source) : BDAE.REINIT(target, value, source))
+  end
+  #= In the order written, the asserts after the assignments (they check the
+     new values); `lst` is built back to front. =#
+  for op in Iterators.reverse(vcat(ifOps, asserts))
+    lst = op <| lst
+  end
+  return lst
 end
 
 """
