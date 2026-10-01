@@ -526,6 +526,12 @@ modelica_String(x, sigDigits::Int, minLen::Int, leftAdjust::Bool) = string(x)
    String(i, 0, true) had no method. =#
 modelica_String(x::Union{Integer, Bool}, minLen::Int, leftAdjust::Bool = true) =
   leftAdjust ? rpad(string(x), minLen) : lpad(string(x), minLen)
+#= The same form for an Integer read from the integrator, where it is a Float64
+   (a when body's `assert(n < 3, "n reached " + String(n))`). =#
+modelica_String(x::AbstractFloat, minLen::Int, leftAdjust::Bool) =
+  modelica_String(isinteger(x) ? Int(x) : string(x), minLen, leftAdjust)
+modelica_String(x::AbstractString, minLen::Int, leftAdjust::Bool) =
+  leftAdjust ? rpad(x, minLen) : lpad(x, minLen)
 
 """
     modelica_homotopy(actual, simplified)
