@@ -1205,6 +1205,7 @@ function _discreteClusterSpec(@nospecialize(cond), rels::Vector{DAE.Exp},
   end
   local strict = Bool[r.operator isa DAE.LESS || r.operator isa DAE.GREATER for r in buffered]
   local exact = Bool[_relationZeroSet(r) === nothing || _withoutContinuousOperand(r, simCode) for r in buffered]
+  local eventOnly = Bool[_withoutContinuousOperand(r, simCode) && !_expMentionsTime(r) for r in buffered]
   local atStart = !_condHasInitial(condDAE) ? 0 : (table ? 2 : 1)
   local memberNames = String[string(d) for (d, _, _) in assigns]
   local readNames = OrderedSet{String}(string(o) for o in operands)
@@ -1213,7 +1214,8 @@ function _discreteClusterSpec(@nospecialize(cond), rels::Vector{DAE.Exp},
   return :(OMBackend.CodeGeneration.DiscreteCluster($(memberNames),
                                                    Any[$([d for (d, _, _) in assigns]...)],
                                                    Any[$(reads...)], $(length(operands)), $(length(preNames)),
-                                                   $(strict), $(exact), $(body), $(atStart), $(table), $(coupled)))
+                                                   $(strict), $(exact), $(body), $(atStart), $(table), $(coupled),
+                                                   $(eventOnly)))
 end
 
 """

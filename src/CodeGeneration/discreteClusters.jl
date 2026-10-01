@@ -19,7 +19,8 @@
    model, whose system changes during the solve, is not supported here. =#
 
 """
-    DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled = true)
+    DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled = true,
+                    eventOnly = fill(false, length(strict)))
 
 A when-equation evaluated by the event iteration (see the top of the file).
 
@@ -41,6 +42,11 @@ A when-equation evaluated by the event iteration (see the top of the file).
   differences (`tableClusterInitAlg`).
 - `coupled`: whether an algebraic solve can change what it reads
   (`_clusterCoupled`); only then its mixed system solves them after each pass.
+- `eventOnly`: per relation, whether it reads neither a continuous-time
+  variable nor time: it changes only at events, where the event iteration
+  evaluates it, and its crossing is not located. Located, an Integer's
+  round-off within a step (3.0000000000000004, a Rosenbrock step mixes rows)
+  flipped `mod(n, 2) == 1` and back: an edge() of it fired at every step.
 """
 mutable struct DiscreteCluster
   names::Vector{String}
@@ -54,6 +60,7 @@ mutable struct DiscreteCluster
   atStart::Int
   table::Bool
   coupled::Bool
+  eventOnly::Vector{Bool}
   values::Any                # (u, p, t) -> all reads, for the problem's system
   crossings!::Any            # (out, u, p, t): per relation its crossing function and scale
   zs::Vector{Float64}        # the output of crossings!
@@ -62,8 +69,9 @@ mutable struct DiscreteCluster
   crossed::Vector{Bool}      # the relations whose crossing the callback located, until the next update
 end
 
-DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled = true) =
-  DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled,
+DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled = true,
+                eventOnly = fill(false, length(strict))) =
+  DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled, eventOnly,
                   nothing, nothing, zeros(2 * length(strict)), Int[], fill(false, length(strict)),
                   fill(false, length(strict)))
 
@@ -119,13 +127,15 @@ end
 #= The crossing functions, shifted by the hysteresis relative to the buffers.
    Called at every condition evaluation: the typed loop is behind a barrier. =#
 function _crossings!(out, c::DiscreteCluster, u, t, integrator)
-  _shiftCrossings!(out, _crossingValues!(c, u, integrator.p, t), c.rel, c.exact, _hysteresisFromTolerance(integrator))
+  _shiftCrossings!(out, _crossingValues!(c, u, integrator.p, t), c.rel, c.exact, c.eventOnly,
+                   _hysteresisFromTolerance(integrator))
   return nothing
 end
 
-function _shiftCrossings!(out, zs::Vector{Float64}, rel::Vector{Bool}, exact::Vector{Bool}, H::Float64)
+function _shiftCrossings!(out, zs::Vector{Float64}, rel::Vector{Bool}, exact::Vector{Bool}, eventOnly::Vector{Bool},
+                          H::Float64)
   for k in eachindex(rel)
-    out[k] = exact[k] ? zs[2k - 1] : zs[2k - 1] + H * zs[2k] * (1 - 2 * rel[k])
+    out[k] = eventOnly[k] ? 1.0 : exact[k] ? zs[2k - 1] : zs[2k - 1] + H * zs[2k] * (1 - 2 * rel[k])
   end
   return nothing
 end
