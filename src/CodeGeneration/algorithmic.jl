@@ -1463,6 +1463,7 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         for iter in iterators
           @match iter begin
             DAE.REDUCTIONITER(id, rangeExp, guardExp, _) => begin
+              guardExp === nothing || CodeGeneration.unsupported("a reduction iterator with a guard", exp)
               local rangeExpr = expToJuliaExpAlg(rangeExp)
               push!(iterExprs, Expr(:(=), Symbol(id), rangeExpr))
             end

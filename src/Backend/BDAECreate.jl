@@ -1013,9 +1013,15 @@ function createBindingEquations(variables::Vector)
                  local eq =  BDAE.EQUATION(lhs, bindExp, v.source, BDAE.NO_ATTRIBUTES())
                  push!(bindingEqs, eq)
                end
-      _ => begin
-        continue
-      end
+      #= A discrete Real bound to an expression: not Modelica (omc: "variable is
+         discrete, but does not appear on the LHS of a when-statement"); dropped
+         before. =#
+      BDAE.VAR(vName, BDAE.DISCRETE(), _, DAE.T_REAL(__), SOME(_), _, _, _, _, _) =>
+        OMBackend.unsupported("a discrete Real variable with a declaration binding", vName)
+      #= Parameters and constants (their bindings are their values), variables
+         without a binding, Strings (createStringParameterAssignments); array and
+         record bindings are equations already (the frontend's flattening). =#
+      _ => continue
     end
   end
   return bindingEqs
