@@ -589,6 +589,7 @@ function _derivativeInitializationTargets(reducedSystem, states;
   for eq in initEqs
     local lhs = Symbolics.unwrap(eq.lhs)
     (SymbolicUtils.iscall(lhs) && SymbolicUtils.operation(lhs) isa Symbolics.Differential) || continue
+    _requireFirstOrder(lhs, eq)
     #= The argument itself, not a suffix of the string: D() can hold an expression. =#
     local matchedIdx = get(stateStrToIdx, string(SymbolicUtils.arguments(lhs)[1]), nothing)
     matchedIdx === nothing && continue
@@ -620,20 +621,41 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
   local exprs = Any[]
   local derIdxs = Int[]
   local mmScales = Float64[]
+  #= A derivative a row reads (`der(x) = der(y)`) by its equation: left in, the
+     row did not reduce to states and was dropped (x(0) = 0, OpenModelica 1). =#
+  local systemEqs = nothing
+  local withDerivatives = e -> begin
+    _hasDerivative(Symbolics.unwrap(e)) || return e
+    systemEqs === nothing && (systemEqs = ModelingToolkit.full_equations(reducedSystem))
+    #= An observed variable's definition inside D() (`D(2y)`): 2 D(y) first. =#
+    local ex = try
+      Symbolics.expand_derivatives(e)
+    catch err
+      OMBackend._fallback(err, :initExpandDerivatives; impact = :result)
+      e
+    end
+    local r = substituteDerivatives(ex, systemEqs)
+    r === nothing ? ex : r
+  end
   for eq in initEqs
     local lhsStr = string(eq.lhs)
     if startswith(lhsStr, "Differential(")
+      _requireFirstOrder(Symbolics.unwrap(eq.lhs), eq)
       #= Literal derivative rows are handled as derivative_targets. =#
       _tryToFloat64(eq.rhs; resolvedParams=resolvedParams) === nothing || continue
-      local matchedIdx = nothing
-      for (stateStr, idx) in stateStrToIdx
-        if endswith(lhsStr, "(" * stateStr * ")")
-          matchedIdx = idx
-          break
-        end
+      local matchedIdx = get(stateStrToIdx, string(SymbolicUtils.arguments(Symbolics.unwrap(eq.lhs))[1]), nothing)
+      #= der() of an observed variable (its definition inside D()) or of an
+         algebraic unknown: a row of its own, the derivatives expanded and
+         substituted (it was skipped without a word: `der(v) = x - 1` with
+         v = 2y left x(0) = 0, OpenModelica -1). One that does not reduce is
+         reported below. =#
+      if matchedIdx === nothing || iszero(mm[matchedIdx, matchedIdx])
+        push!(exprs, withDerivatives(eq.lhs - eq.rhs))
+        push!(derIdxs, 0)
+        push!(mmScales, 1.0)
+        continue
       end
-      matchedIdx === nothing && continue
-      push!(exprs, eq.rhs)
+      push!(exprs, withDerivatives(eq.rhs))
       push!(derIdxs, matchedIdx)
       push!(mmScales, Float64(mm[matchedIdx, matchedIdx]))
     else
@@ -647,16 +669,19 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
       if rhsVal !== nothing && haskey(stateStrToIdx, lhsStr)
         continue
       end
-      push!(exprs, eq.lhs - eq.rhs)
+      push!(exprs, withDerivatives(eq.lhs - eq.rhs))
       push!(derIdxs, 0)
       push!(mmScales, 1.0)
     end
   end
   isempty(exprs) && return nothing
   local keep = _inlineObservedRows!(exprs, reducedSystem, states, params, iv)
-  if length(keep) < length(exprs)
-    @debug "DirectRHS: dropped $(length(exprs) - length(keep)) symbolic initialization rows (unresolvable references)"
-  end
+  #= An initialization equation left out gives a wrong initial state: refused
+     (a derivative of an algebraic unknown, `der(x) = der(z)`; the MSL
+     ControlledTanks' pre(reset) row, which does not validate either). =#
+  length(keep) < length(exprs) &&
+    OMBackend.unsupported("initialization equations that do not reduce to the states and parameters",
+                          join((string(exprs[i]) for i in setdiff(eachindex(exprs), keep)), "; "))
   isempty(keep) && return nothing
   exprs = exprs[keep]
   derIdxs = derIdxs[keep]
@@ -831,6 +856,7 @@ function _observedDerivativeInitEquations(reducedSystem, states;
   for eq in initEqs
     local lhs = Symbolics.unwrap(eq.lhs)
     (SymbolicUtils.iscall(lhs) && SymbolicUtils.operation(lhs) isa Symbolics.Differential) || continue
+    _requireFirstOrder(lhs, eq)
     local w = SymbolicUtils.arguments(lhs)[1]
     string(w) in stateStrs && continue
     local c = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams)
@@ -2184,6 +2210,16 @@ function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=
     end
   end
   isempty(freeVars) && (local folded = _evalConstantTerm(unwrapped); folded isa Number) && return Float64(folded)
+  return nothing
+end
+
+#= An initialization equation on der(der(x)) (Differential(t, 2)) was taken as
+   one on der(x): its order is not checked where the state is matched.
+   Refused, as OpenModelica does. =#
+function _requireFirstOrder(@nospecialize(lhs), eq)
+  local op = SymbolicUtils.operation(lhs)
+  local order = hasproperty(op, :order) ? getproperty(op, :order) : 1
+  order == 1 || OMBackend.unsupported("an initial equation on a derivative of order $(order)", string(eq))
   return nothing
 end
 

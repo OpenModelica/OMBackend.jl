@@ -1533,10 +1533,31 @@ end
    the left-hand side of each, and x for every derivative D(x) in them. The
    arguments of other right-hand sides (e.g. positions passed to a branch
    selection function) are only read. =#
-function _initializationVarStrs(initEqs)::OrderedSet{String}
+#= The left sides of the initialization equations that fix a value (a literal
+   or parameter right side). A signal-valued one (its rhs references a
+   time-dependent variable, unknown or observed) determines its lhs through
+   the init solve's residual rows; marking the lhs fixed would hold it at a
+   stale numeric guess that fights the very equation it encodes. Parameters
+   print without the (t) suffix and stay pinnable; occursin also catches array
+   elements and derivative forms whose printed form does not END with it. =#
+function _fixedTrueLhsStrs(initEqs)::OrderedSet{String}
+  local out = OrderedSet{String}()
+  for eq in initEqs
+    local rhsVars = Symbolics.get_variables(eq.rhs)
+    any(occursin("(t)", string(v)) for v in rhsVars) && continue
+    push!(out, string(eq.lhs))
+  end
+  return out
+end
+
+#= With `reads`, the variables a right side reads too: an initialization
+   equation determines them as much as its left side (`der(v) = x - 1` fixes
+   x; pinned at its start, the init solve moved the fixed v instead). =#
+function _initializationVarStrs(initEqs; reads::Bool = false)::OrderedSet{String}
   local out = OrderedSet{String}()
   local visit
-  visit = function (ex, isLhs::Bool)
+  visit = function (ex, isLhs0::Bool)
+    local isLhs = isLhs0 || reads
     local v = Symbolics.unwrap(ex)
     SymbolicUtils.iscall(v) || (isLhs && push!(out, string(v)); return nothing)
     local op = SymbolicUtils.operation(v)
@@ -1547,11 +1568,12 @@ function _initializationVarStrs(initEqs)::OrderedSet{String}
       return nothing
     end
     #= x(t) is a call of x on t: a variable, not an expression. =#
-    if isLhs && SymbolicUtils.issym(op)
-      push!(out, string(v))
+    if SymbolicUtils.issym(op)
+      isLhs && push!(out, string(v))
       return nothing
     end
-    foreach(a -> visit(a, false), SymbolicUtils.arguments(v))
+    #= An expression on the left (`x + y = 1`) determines every variable in it. =#
+    foreach(a -> visit(a, isLhs), SymbolicUtils.arguments(v))
     return nothing
   end
   for eq in initEqs
@@ -1624,8 +1646,19 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
   #= Identity mass matrix means pure ODE: all states are differential =#
   if massMatrix isa LinearAlgebra.UniformScaling
     @debug "[MTK GEN: init] ODEProblem: pure ODE (identity mass matrix), $(length(finalInitialValues)) hard u0, $(length(reducedUnks)) unknowns"
-    _EXPLICIT_PINNED_INITIAL_VALUE_KEYS[_pinnedSidecarKey(reducedSystem)] =
-      OrderedSet(string(p.first) for p in finalInitialValues)
+    #= The starts stay u0; as pins (the init solve's fixed values, where it
+       runs: _hasSolvedInitializationRows) only the fixed ones, as in a DAE.
+       A non-fixed start an initialization equation determines was pinned:
+       the init solve then freed every variable and moved the fixed ones
+       (`x = 2y + 1` with y fixed at 2: y = 0, OpenModelica 2). =#
+    local pinnedKeys = OrderedSet(string(p.first) for p in finalInitialValues)
+    local odeInitEqs = ModelingToolkit.initialization_equations(reducedSystem)
+    if !isempty(odeInitEqs)
+      local fixedLhs = _fixedTrueLhsStrs(odeInitEqs)
+      local initCoupled = _initializationVarStrs(odeInitEqs; reads = true)
+      filter!(k -> k in fixedLhs || !(k in initCoupled), pinnedKeys)
+    end
+    _EXPLICIT_PINNED_INITIAL_VALUE_KEYS[_pinnedSidecarKey(reducedSystem)] = pinnedKeys
     return (reducedSystem, finalInitialValues)
   end
   #= DAE system: classify states by mass matrix diagonal =#
@@ -1677,19 +1710,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
      fixed=true set. Vars whose start landed in finalInitialValues but whose lhs
      is not in this set are non-fixed defaults — relax them to guesses so the
      algebraic constraints can solve consistently with the user's hard pins. =#
-  local fixedTrueLhsSet = OrderedSet{String}()
-  for eq in initEqs
-    #= A signal-valued initialization equation (rhs references any
-       time-dependent variable, unknown or observed) determines its lhs
-       through the init solve's residual rows; marking the lhs fixed would
-       hold it at a stale numeric guess that fights the very equation it
-       encodes. Parameters print without the (t) suffix and stay pinnable;
-       occursin also catches array elements and derivative forms whose
-       printed form does not END with the suffix. =#
-    local rhsVars = Symbolics.get_variables(eq.rhs)
-    any(occursin("(t)", string(v)) for v in rhsVars) && continue
-    push!(fixedTrueLhsSet, string(eq.lhs))
-  end
+  local fixedTrueLhsSet = _fixedTrueLhsStrs(initEqs)
   if hasInitConstraints
     local hardKeyStrSet = OrderedSet(string(p.first) for p in hardInitialValues)
     local reducedUnkStrSet = OrderedSet(string(u) for u in reducedUnks)
@@ -1728,7 +1749,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
        through its differential equation, and pinning x at its start as well
        over-determines the initialization (the init solve then frees every
        variable and moves the fixed=true ones; the MSL EngineV6's crank). =#
-    local _initCoupled = _initializationVarStrs(initEqs)
+    local _initCoupled = _initializationVarStrs(initEqs; reads = true)
     local demoted = filter(p -> !(string(p.first) in fixedTrueLhsSet) &&
                                 (string(p.first) in _algCoupled || string(p.first) in _initCoupled),
                            hardInitialValues)
