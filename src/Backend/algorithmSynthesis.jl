@@ -243,7 +243,8 @@ over-determine the system.
 """
 Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospecialize(algorithms),
                                                   eqLhsBoundCrefs::OrderedSet{String} = OrderedSet{String}(),
-                                                  whenLifterSkipLhs::OrderedSet{String} = OrderedSet{String}())::Vector{BDAE.Equation}
+                                                  whenLifterSkipLhs::OrderedSet{String} = OrderedSet{String}();
+                                                  realStarts::Dict{String, DAE.Exp} = Dict{String, DAE.Exp}())::Vector{BDAE.Equation}
   local out = BDAE.Equation[]
   for alg in algorithms
     #= Skip whole algorithm if every top-level statement is ALG_WHEN — those are
@@ -263,7 +264,7 @@ Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospe
       OMBackend._fallback(err, :convertAlgorithmResiduals; impact = :result)
       continue
     end
-    _reportRealAssignments(daeStmts)
+    append!(out, _realAssignmentEquations(daeStmts, alg.source, realStarts, whenLifterSkipLhs))
     #= Conservative narrowing: only lift single-statement algorithm bodies.
        Multi-statement algorithms (Modelica.Mechanics.Rotational.Examples.OneWayClutch
        and most Modelica.Electrical.Digital gates) have order-sensitive
@@ -283,15 +284,181 @@ Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospe
 end
 
 #= The Real variables an algorithm section assigns outside its when
-   statements are not lowered (every path above takes Integer, Boolean and
-   enumeration targets only): they are left without an equation. Reported as
-   a fallback that changes the result. =#
+   statements, as equations (MLS 11.1.2: the section runs as a whole, in
+   order). The statements run symbolically (_AlgorithmRun): each assignment's
+   value, its reads of variables assigned before replaced by their values at
+   that point, becomes the variable's value; a variable the section assigns
+   only later reads its start value (a discrete one pre()). Each Real variable
+   gets `v = <its value at the end>`, a record variable the record equation;
+   an assert is checked on the values at its point. The Integer, Boolean and
+   enumeration targets stay the when lifter's. Every path above took discrete
+   targets only: the Real ones were left without an equation. =#
+function _realAssignmentEquations(@nospecialize(daeStmts), @nospecialize(source),
+                                  realStarts::Dict{String, DAE.Exp},
+                                  whenLifted::OrderedSet{String})::Vector{BDAE.Equation}
+  local stmts = DAE.Statement[s for s in daeStmts if !(s isa DAE.STMT_WHEN)]
+  _lowersRealTargets(stmts) || (_reportRealAssignments(stmts); return BDAE.Equation[])
+  local (ops, assigned) = _buildAlgorithmBodyOps(stmts, false, true; where = "an algorithm section with Real targets")
+  local run = _AlgorithmRun(assigned, realStarts)
+  local targets = OrderedDict{String, DAE.Exp}()
+  local out = BDAE.Equation[]
+  for op in ops
+    if op isa BDAE.ASSIGN
+      local name = string(op.left.componentRef)
+      name in run.readAsVariable &&
+        OMBackend.unsupported("an algorithm section assigning $(name) after reading it in der(), edge() or change()", op.left)
+      run.values[name] = _algorithmValue(op.right, run)
+      targets[name] = op.left
+    elseif op isa BDAE.ASSERT
+      push!(out, BDAE.ASSERT_EQUATION(_algorithmValue(op.condition, run), _algorithmValue(op.message, run),
+                                      op.level, op.source))
+    else
+      OMBackend.unsupported("this statement in an algorithm section with Real targets", op)
+    end
+  end
+  for (name, lhs) in targets
+    if _isContinuousRealType(lhs.ty)
+      name in whenLifted &&
+        OMBackend.unsupported("a Real variable an algorithm section assigns both in a when and outside one", lhs)
+      push!(out, BDAE.RESIDUAL_EQUATION(DAE.BINARY(lhs, DAE.SUB(DAE.T_REAL_DEFAULT), run.values[name]),
+                                        source, BDAE.EQ_ATTR_DEFAULT_DYNAMIC))
+    elseif _isRecordType(lhs.ty)
+      local eqs = equationToBackendEquation(DAE.COMPLEX_EQUATION(lhs, run.values[name], source))
+      eqs isa Vector ? append!(out, eqs) : push!(out, eqs)
+    end
+  end
+  return out
+end
+
+#= Whether _realAssignmentEquations lowers a section's statements (its whens
+   left out): it has Real or record targets, and no initial() (the ops replace
+   it by a constant: such a section is reported, not lowered). =#
+_lowersRealTargets(@nospecialize(stmts))::Bool =
+  !isempty(_collectRealTargets!(String[], stmts)) && !any(_statementMentionsInitial, stmts)
+
+#= An algorithm section run symbolically: the values of the variables assigned
+   so far; every scalar name it assigns and the names of their wholes (`x` of
+   `x[2]`, `r` of `r.a`); the variables read in der(), edge() or change(),
+   whose argument is the variable itself. =#
+struct _AlgorithmRun
+  values::Dict{String, DAE.Exp}
+  assigned::OrderedSet{String}
+  wholes::Set{String}
+  realStarts::Dict{String, DAE.Exp}
+  readAsVariable::Set{String}
+end
+
+function _AlgorithmRun(assigned::OrderedSet{String}, realStarts::Dict{String, DAE.Exp})
+  local wholes = Set{String}()
+  for name in assigned, i in eachindex(name)
+    name[i] in ('[', '.') && push!(wholes, name[1:prevind(name, i)])
+  end
+  return _AlgorithmRun(Dict{String, DAE.Exp}(), assigned, wholes, realStarts, Set{String}())
+end
+
+#= Above this many nodes a value is not built: a conditional assignment that
+   reads its own variable (`if v[i] > m then m := v[i]`) doubles it each time. =#
+const _ALGORITHM_VALUE_NODE_LIMIT = 10_000
+
+#= `e` with the section's variables read as their values so far: assigned
+   before, the value; assigned only later, the start value (Real) or pre()
+   (discrete). Inside pre() a variable is the value before the event; inside
+   der(), edge() and change() the variable itself, which its equation defines
+   (its value at the end: refused if it is assigned again later). =#
+function _algorithmValue(@nospecialize(e), run::_AlgorithmRun)
+  local visit = (x, arg) -> begin
+    if x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name in ("pre", "der", "edge", "change")
+      x.path.name == "pre" && return (x, false, arg)
+      for c in Util.getAllCrefs(x)
+        local n = string(c)
+        n in run.assigned || continue
+        haskey(run.values, n) ||
+          OMBackend.unsupported("$(x.path.name)() of a variable before the algorithm section assigns it", x)
+        push!(run.readAsVariable, n)
+      end
+      return (x, false, arg)
+    end
+    x isa DAE.CREF || return (x, true, arg)
+    local cr = _foldConstantSubscripts(x.componentRef)
+    local name = string(cr)
+    haskey(run.values, name) && return (run.values[name], false, arg)
+    if name in run.assigned
+      _isContinuousRealType(x.ty) && return (get(run.realStarts, name, DAE.RCONST(0.0)), false, arg)
+      local attr = DAE.CALL_ATTR(x.ty, false, true, false, false, DAE.NO_INLINE(), DAE.NO_TAIL())
+      return (DAE.CALL(Absyn.IDENT("pre"), MetaModelica.list(DAE.CREF(cr, x.ty)), attr), false, arg)
+    end
+    name in run.wholes &&
+      OMBackend.unsupported("a read of a whole array or record that an algorithm section assigns part by part", x)
+    #= x[j]: one of the elements the section assigns, chosen by the index. =#
+    local base = first(split(name, '['))
+    if base != name && base in run.wholes && any(s -> !(s isa DAE.INDEX && s.exp isa DAE.ICONST), _innermostSubscripts(cr))
+      local elements = _scalarizeCrefRead(cr, x.ty, Int[], x)
+      elements isa DAE.IFEXP || OMBackend.unsupported("this read of an array an algorithm section assigns", x)
+      return (_elementValues(elements, x, run), false, arg)
+    end
+    return (x, true, arg)
+  end
+  local value = first(Util.traverseExpTopDown(e, visit, nothing))
+  _expLargerThan(value, _ALGORITHM_VALUE_NODE_LIMIT) &&
+    OMBackend.unsupported("an algorithm section whose values exceed $(_ALGORITHM_VALUE_NODE_LIMIT) nodes as equations", e)
+  return value
+end
+
+#= The if-chain over the elements a read `x[j]` may be, each element (and
+   guard) read as its value; the chain's last else, `x[j]` itself, as it is. =#
+function _elementValues(@nospecialize(chain), @nospecialize(read), run::_AlgorithmRun)
+  chain === read && return read
+  return DAE.IFEXP(_algorithmValue(chain.expCond, run), _algorithmValue(chain.expThen, run),
+                   _elementValues(chain.expElse, read, run))
+end
+
+#= The innermost subscripts of `cr` folded where they are integer constants
+   (`x[2 - 1]` after a loop's iterator was replaced is `x[1]`). =#
+function _foldConstantSubscripts(@nospecialize(cr))
+  local subs = _innermostSubscripts(cr)
+  any(s -> s isa DAE.INDEX && !(s.exp isa DAE.ICONST) && _foldInteger(s.exp) !== nothing, subs) || return cr
+  local folded = DAE.Subscript[(s isa DAE.INDEX && _foldInteger(s.exp) !== nothing) ? DAE.INDEX(DAE.ICONST(_foldInteger(s.exp))) : s
+                               for s in subs]
+  return _replaceInnermostSubscripts(cr, folded)
+end
+
+Base.@nospecializeinfer function _foldInteger(@nospecialize(e))::Union{Int, Nothing}
+  @match e begin
+    DAE.ICONST(i) => i
+    DAE.UNARY(DAE.UMINUS(__), a) => (local v = _foldInteger(a); v === nothing ? nothing : -v)
+    DAE.BINARY(a, op, b) => begin
+      local (va, vb) = (_foldInteger(a), _foldInteger(b))
+      (va === nothing || vb === nothing) && return nothing
+      op isa DAE.ADD ? va + vb : op isa DAE.SUB ? va - vb : op isa DAE.MUL ? va * vb : nothing
+    end
+    _ => nothing
+  end
+end
+
+#= Whether a DAE expression has more than `cap` nodes, counted as a tree. =#
+function _expLargerThan(@nospecialize(e), cap::Int)::Bool
+  local n = 0
+  Util.traverseExpTopDown(e, (x, arg) -> (n += 1; (x, n <= cap, arg)), nothing)
+  return n > cap
+end
+
+_isRecordType(@nospecialize(ty))::Bool = ty isa DAE.T_COMPLEX && ty.complexClassType isa DAE.ClassInf.RECORD
+_isRealOrRecordType(@nospecialize(ty))::Bool = _isContinuousRealType(ty) || _isRecordType(ty)
+
+function _statementMentionsInitial(@nospecialize(stmt))::Bool
+  local found = false
+  Util.mapDAEStatementExps(e -> (found |= _expMentionsInitial(e); e), stmt)
+  return found
+end
+
+#= An algorithm section whose Real targets are not lowered: reported as a
+   fallback that changes the result. =#
 function _reportRealAssignments(@nospecialize(daeStmts))
   local targets = String[]
   _collectRealTargets!(targets, daeStmts)
   isempty(targets) && return nothing
   try
-    OMBackend.unsupported("an assignment to a Real variable outside a when in an algorithm section (not lowered)", join(targets, ", "))
+    OMBackend.unsupported("an algorithm section reading initial() with Real targets outside a when (not lowered)", join(targets, ", "))
   catch err
     OMBackend._fallback(err, :algorithmRealAssign; only = OMBackend.UnsupportedLowering, impact = :result)
   end
@@ -301,10 +468,10 @@ end
 Base.@nospecializeinfer function _collectRealTargets!(targets::Vector{String}, @nospecialize(daeStmts))
   for s in daeStmts
     @match s begin
-      DAE.STMT_ASSIGN(ty, lhs, _, _) => _isContinuousRealType(ty) && push!(targets, string(lhs))
-      DAE.STMT_ASSIGN_ARR(ty, lhs, _, _) => _isContinuousRealType(ty) && push!(targets, string(lhs))
+      DAE.STMT_ASSIGN(ty, lhs, _, _) => _isRealOrRecordType(ty) && push!(targets, string(lhs))
+      DAE.STMT_ASSIGN_ARR(ty, lhs, _, _) => _isRealOrRecordType(ty) && push!(targets, string(lhs))
       DAE.STMT_TUPLE_ASSIGN(_, lhs, _, _) => for t in lhs
-        (t isa DAE.CREF && _isContinuousRealType(t.ty)) && push!(targets, string(t))
+        (t isa DAE.CREF && _isRealOrRecordType(t.ty)) && push!(targets, string(t))
       end
       DAE.STMT_IF(_, body, else_, _) => begin
         _collectRealTargets!(targets, body)
@@ -503,6 +670,9 @@ function synthesizeAssertsFromRegularAlgorithms(algorithms)::Vector{BDAE.Equatio
       OMBackend._fallback(err, :convertAlgorithmAsserts; impact = :result)
       continue
     end
+    #= A section with Real targets checks its asserts where they stand
+       (_realAssignmentEquations). =#
+    _lowersRealTargets(DAE.Statement[s for s in daeStmts if !(s isa DAE.STMT_WHEN)]) && continue
     for s in daeStmts
       s isa DAE.STMT_ASSERT && push!(out, BDAE.ASSERT_EQUATION(s.cond, s.msg, s.level, s.source))
     end
@@ -818,20 +988,21 @@ Base.@nospecializeinfer function _appendElseAlgorithmOps!(ops::Vector{BDAE.WhenO
                                                           @nospecialize(activeCond),
                                                           iterVals::Dict{String, Int},
                                                           initialValue::Bool,
-                                                          allowContinuous::Bool = false)::Bool
+                                                          allowContinuous::Bool = false;
+                                                          where::String = "a when body")::Bool
   if elsePart isa DAE.NOELSE
     return true
   elseif elsePart isa DAE.ELSE
     return _appendAlgorithmStmtOps!(ops, liftedLhsNames, elsePart.statementLst,
-                                    activeCond, iterVals, initialValue, allowContinuous)
+                                    activeCond, iterVals, initialValue, allowContinuous; where = where)
   elseif elsePart isa DAE.ELSEIF
     local cond = _prepareAlgorithmExp(elsePart.exp, iterVals, initialValue)
     local branchCond = _andCondition(activeCond, cond)
     _appendAlgorithmStmtOps!(ops, liftedLhsNames, elsePart.statementLst,
-                             branchCond, iterVals, initialValue, allowContinuous) || return false
+                             branchCond, iterVals, initialValue, allowContinuous; where = where) || return false
     local restCond = _andCondition(activeCond, _notCondition(cond))
     return _appendElseAlgorithmOps!(ops, liftedLhsNames, elsePart.else_,
-                                    restCond, iterVals, initialValue, allowContinuous)
+                                    restCond, iterVals, initialValue, allowContinuous; where = where)
   end
   return true
 end
@@ -842,7 +1013,8 @@ Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenO
                                                           @nospecialize(activeCond),
                                                           iterVals::Dict{String, Int},
                                                           initialValue::Bool,
-                                                          allowContinuous::Bool = false)::Bool
+                                                          allowContinuous::Bool = false;
+                                                          where::String = "a when body")::Bool
   for s in stmts
     @match s begin
       DAE.STMT_ASSIGN(ty, lhs, rhs, src) => begin
@@ -856,10 +1028,10 @@ Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenO
       DAE.STMT_IF(cond, body, elsePart, _) => begin
         local c = _prepareAlgorithmExp(cond, iterVals, initialValue)
         _appendAlgorithmStmtOps!(ops, liftedLhsNames, body, _andCondition(activeCond, c),
-                                 iterVals, initialValue, allowContinuous) || return false
+                                 iterVals, initialValue, allowContinuous; where = where) || return false
         _appendElseAlgorithmOps!(ops, liftedLhsNames, elsePart,
                                  _andCondition(activeCond, _notCondition(c)),
-                                 iterVals, initialValue, allowContinuous) || return false
+                                 iterVals, initialValue, allowContinuous; where = where) || return false
       end
       DAE.STMT_FOR(_, _, iter, _, range, body, _) => begin
         local r = _prepareAlgorithmExp(range, iterVals, initialValue)
@@ -869,7 +1041,7 @@ Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenO
           local nested = copy(iterVals)
           nested[iter] = v
           _appendAlgorithmStmtOps!(ops, liftedLhsNames, body, activeCond,
-                                   nested, initialValue, allowContinuous) || return false
+                                   nested, initialValue, allowContinuous; where = where) || return false
         end
       end
       #= (a, b, ...) := f(...) (MSL TimeTable's when: (a, b, nextEventScaled,
@@ -901,14 +1073,14 @@ Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenO
            runtime arm). =#
         if allowContinuous && !(activeCond isa DAE.BCONST && !activeCond.bool)
           (activeCond === nothing || activeCond isa DAE.BCONST) ||
-            OMBackend.unsupported("terminate() under a condition in a when body", s)
+            OMBackend.unsupported("terminate() under a condition in $(where)", s)
           push!(ops, BDAE.TERMINATE(_prepareAlgorithmExp(msg, iterVals, initialValue), src))
         end
       end
       #= A call for its side effects (a print, a file): no variable depends on it.
          Not run. =#
       DAE.STMT_NORETCALL(__) => nothing
-      _ => (allowContinuous && OMBackend.unsupported("this statement in a when body", s))
+      _ => (allowContinuous && OMBackend.unsupported("this statement in $(where)", s))
     end
   end
   return true
@@ -963,16 +1135,17 @@ end
 
 Base.@nospecializeinfer function _buildAlgorithmBodyOps(@nospecialize(daeStmts),
                                                         initialValue::Bool,
-                                                        allowContinuous::Bool = false)
+                                                        allowContinuous::Bool = false;
+                                                        where::String = "a when body")
   local ops = BDAE.WhenOperator[]
   local lhsNames = OrderedSet{String}()
   local ok = _appendAlgorithmStmtOps!(ops, lhsNames, daeStmts, nothing,
-                                      Dict{String, Int}(), initialValue, allowContinuous)
+                                      Dict{String, Int}(), initialValue, allowContinuous; where = where)
   #= A when body (allowContinuous) that cannot be lowered would drop its when:
      a for loop over a non-constant range, an assignment to a slice or to an
      expression. A regular body is lifted only where it can be. =#
   ok || allowContinuous &&
-    OMBackend.unsupported("a when body with a for loop over a non-constant range, or an assignment to a slice or an expression", daeStmts)
+    OMBackend.unsupported("$(where) with a for loop over a non-constant range, or an assignment to a slice or an expression", daeStmts)
   ok || return (BDAE.WhenOperator[], OrderedSet{String}())
   return (ops, lhsNames)
 end

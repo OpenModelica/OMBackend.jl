@@ -196,7 +196,8 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
     end
     _whenLifterSkipLhs = _whenLiftedLhs
     @BACKEND_PERFLOG "[BDAE: lifter] synthesizeResidualsFromRegularAlgorithms" begin
-      for ieq in synthesizeResidualsFromRegularAlgorithms(algorithms, _eqLhsBoundCrefs, _whenLifterSkipLhs)
+      for ieq in synthesizeResidualsFromRegularAlgorithms(algorithms, _eqLhsBoundCrefs, _whenLifterSkipLhs;
+                                                          realStarts = _realStartValues(variables))
         push!(equations, ieq)
       end
     end
@@ -460,6 +461,18 @@ function _maybeMarkAttrProtected(vattr, protection, @nospecialize(ty))
   local va = vattr isa SOME ? vattr.data : _emptyVarAttr(ty)
   @assign va.isProtected = SOME(true)
   return SOME(va)
+end
+
+#= The start values of the Real variables that have one: where an algorithm
+   section's Real targets start (MLS 11.1.2). =#
+function _realStartValues(variables::Vector{BDAE.VAR})::Dict{String, DAE.Exp}
+  local out = Dict{String, DAE.Exp}()
+  for v in variables
+    local attrs = v.values
+    (attrs isa SOME && attrs.data isa DAE.VAR_ATTR_REAL && attrs.data.start isa SOME) || continue
+    out[string(v.varName)] = attrs.data.start.data
+  end
+  return out
 end
 
 #= The empty attributes of a variable of type `ty` (of an array: of its elements). =#
