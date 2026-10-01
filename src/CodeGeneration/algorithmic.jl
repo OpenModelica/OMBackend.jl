@@ -1446,12 +1446,15 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
           end
         end
         @match reductionInfo.path begin
-          Absyn.IDENT("array") => Expr(:comprehension, bodyExpr, iterExprs...)
+          #= {e for i in u, j in v}: the last iterator is the first dimension
+             (MLS 10.4.1.2, size [size(v), size(u)]); a Julia comprehension's
+             first iterator is. It came out transposed. =#
+          Absyn.IDENT("array") => Expr(:comprehension, bodyExpr, reverse(iterExprs)...)
           Absyn.IDENT("sum") => :(sum($(Expr(:generator, bodyExpr, iterExprs...))))
           Absyn.IDENT("product") => :(prod($(Expr(:generator, bodyExpr, iterExprs...))))
           Absyn.IDENT("min") => :(minimum($(Expr(:generator, bodyExpr, iterExprs...))))
           Absyn.IDENT("max") => :(maximum($(Expr(:generator, bodyExpr, iterExprs...))))
-          _ => Expr(:comprehension, bodyExpr, iterExprs...)
+          _ => CodeGeneration.unsupported("the reduction $(reductionInfo.path)", exp)
         end
       end
       DAE.TSUB(tupleExp, ix, _) => begin

@@ -1323,8 +1323,9 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         #= Handle different reduction types =#
         @match reductionInfo.path begin
           Absyn.IDENT("array") => begin
-            #= Array comprehension: [expr for i in range] =#
-            Expr(:comprehension, bodyExpr, iterExprs...)
+            #= {e for i in u, j in v}: the last iterator is the first dimension
+               (MLS 10.4.1.2); a Julia comprehension's first iterator is. =#
+            Expr(:comprehension, bodyExpr, reverse(iterExprs)...)
           end
           Absyn.IDENT("sum") => begin
             #= Sum reduction: sum(expr for i in range) =#
@@ -1344,10 +1345,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             local genExpr = Expr(:generator, bodyExpr, iterExprs...)
             :(maximum($genExpr))
           end
-          _ => begin
-            #= Default: treat as array comprehension =#
-            Expr(:comprehension, bodyExpr, iterExprs...)
-          end
+          _ => OMBackend.unsupported("the reduction $(reductionInfo.path)", exp)
         end
       end
       DAE.RANGE(_, startExp, NONE(), stopExp) => begin

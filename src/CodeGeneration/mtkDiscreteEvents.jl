@@ -1289,6 +1289,18 @@ function createDiscreteBoolWhenEvents(simCode)::Vector{Expr}
   return events
 end
 
+#= The target of field `f` of a record target of a tuple assignment: the
+   field's variable (`r_f`), or an omitted output's. =#
+function _recordFieldTarget(@nospecialize(target), f::String)
+  local d = target isa SimulationCode.Exp ? SimulationCode.toDAEExp(target) : target
+  (d isa DAE.CREF && d.componentRef isa DAE.WILD) && return d
+  d isa DAE.CREF || unsupported("this record target of a tuple assignment in a when", target)
+  local name = OMBackend.canonicalName(string(SimulationCode.string(d), ".", f))
+  return DAE.CREF(DAE.CREF_IDENT(name, DAE.T_REAL_DEFAULT, MetaModelica.nil), DAE.T_REAL_DEFAULT)
+end
+
+#= A target missing from the variable table would be bound as a local of the
+   affect, its value lost. =#
 function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
                                           rhsAccess, simCode::SimulationCode.SIM_CODE)
   @match lhs begin
@@ -1296,10 +1308,7 @@ function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
     DAE.CREF(__) => begin
       local name = SimulationCode.string(lhs)
       local entry = get(simCode.stringToSimVarHT, name, nothing)
-      if entry === nothing
-        push!(res, :($(Symbol(name)) = $rhsAccess))
-        return res
-      end
+      entry === nothing && unsupported("a tuple target in a when that is no variable", lhs)
       local (_, var) = entry
       push!(res, quote
               idx = lookuptableStates[Symbol($(string(var.name)))]
@@ -1316,10 +1325,7 @@ function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
     SimulationCode.EXP_CREF(cref, _) => begin
       local name = string(cref)
       local entry = get(simCode.stringToSimVarHT, name, nothing)
-      if entry === nothing
-        push!(res, :($(Symbol(name)) = $rhsAccess))
-        return res
-      end
+      entry === nothing && unsupported("a tuple target in a when that is no variable", lhs)
       local (_, var) = entry
       push!(res, quote
               idx = lookuptableStates[Symbol($(string(var.name)))]
@@ -1352,10 +1358,23 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
         local rhsExpr = expToJuliaExpMTK(wStmt.right, simCode;
                                          varPrefix = varPrefix, varSuffix = varSuffix)
         push!(res, :(local $tupSym = $rhsExpr))
-        local i = 0
-        for elem in wStmt.left.PR
-          i += 1
-          _emitWhenTupleElementAssignMTK!(res, elem, :($tupSym[$i]), simCode)
+        #= A generated function returns a record output as its fields in place:
+           a record target takes them into its fields' variables, an omitted
+           one skips them (each target after a record took a field before). =#
+        local rhsTy = SimulationCode.toDAEExp(wStmt.right)
+        local outputTypes = rhsTy isa DAE.CALL && rhsTy.attr.ty isa DAE.T_TUPLE ? collect(rhsTy.attr.ty.types) : nothing
+        local pos = 0
+        for (k, elem) in enumerate(wStmt.left.PR)
+          local fields = outputTypes === nothing ? String[] : AlgorithmicCodeGeneration._recordFieldNames(outputTypes[k])
+          if isempty(fields)
+            pos += 1
+            _emitWhenTupleElementAssignMTK!(res, elem, :($tupSym[$pos]), simCode)
+          else
+            for f in fields
+              pos += 1
+              _emitWhenTupleElementAssignMTK!(res, _recordFieldTarget(elem, f), :($tupSym[$pos]), simCode)
+            end
+          end
         end
       else
         # SimulationCode.ASSIGN.left is ::Exp post-migration; HT keys are DAE-stringified.

@@ -1091,16 +1091,35 @@ end
    before it have assigned their targets, so a target f reads (outside pre())
    goes last and f sees its old value in every element: `(s, y) := step(s, u)`
    gave y the step from the new s. A second such target, or one assigned
-   element by element (an array, a record), cannot be last: not supported. =#
+   element by element (an array, a record), cannot be last: not supported.
+   A generated f returns a record output as its fields in place: a record
+   target is one assignment per field, and f's elements are counted so
+   (each target after a record took a field of it). =#
 function _tupleAssignElements(@nospecialize(targets), @nospecialize(rhs))::Vector{Tuple{DAE.Exp, DAE.Exp}}
   local read = _crefNamesOutsidePre(rhs)
   local plain = Tuple{DAE.Exp, DAE.Exp}[]
   local readBack = Tuple{DAE.Exp, DAE.Exp}[]
+  local outputTypes = rhs isa DAE.CALL && rhs.attr.ty isa DAE.T_TUPLE ? collect(rhs.attr.ty.types) : nothing
+  local pos = 0
+  local elements = Tuple{DAE.Exp, DAE.Exp}[]
   for (k, target) in enumerate(targets)
     target isa DAE.CREF ||
       OMBackend.unsupported("a tuple assignment to a target that is not a variable", target)
-    target.componentRef isa DAE.WILD && continue
-    local element = (target, DAE.TSUB(rhs, k, target.ty))
+    local outTy = outputTypes === nothing ? target.ty : outputTypes[k]
+    if _isRecordType(outTy)
+      for field in outTy.varLst
+        pos += 1
+        _isRecordType(field.ty) && OMBackend.unsupported("a tuple assignment of a record output with record fields", rhs)
+        target.componentRef isa DAE.WILD ||
+          push!(elements, (BDAEUtil.appendFieldToCref(target, field.name, field.ty), DAE.TSUB(rhs, pos, field.ty)))
+      end
+    else
+      pos += 1
+      target.componentRef isa DAE.WILD || push!(elements, (target, DAE.TSUB(rhs, pos, target.ty)))
+    end
+  end
+  for element in elements
+    local target = first(element)
     local name = string(target.componentRef)
     if any(r -> _crefNamesOverlap(r, name), read)
       (target.ty isa DAE.T_ARRAY || target.ty isa DAE.T_COMPLEX) &&
