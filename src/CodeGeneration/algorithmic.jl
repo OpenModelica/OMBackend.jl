@@ -263,7 +263,8 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
           local extInputConversions = generateExternalInputConversions(func.inputs)
           local extOutputAllocs = generateExternalOutputAllocations(func.outputs)
           local returnExpr = generateExternalReturnExpr(func.outputs)
-          Expr(:block, extInputConversions..., extOutputAllocs..., extCall, returnExpr)
+          #= The protected locals the call passes (MSL realFFT_raw's work array). =#
+          Expr(:block, extInputConversions..., extOutputAllocs..., generateLocals(func.locals)..., extCall, returnExpr)
         end
         local anonFunc = if nArgs == 0
           Expr(:->, Expr(:tuple), funcBody)
