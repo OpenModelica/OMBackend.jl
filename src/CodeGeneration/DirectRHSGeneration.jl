@@ -1871,6 +1871,28 @@ function _extractAndMergeEventCallbacks(reducedSystem, customCallbacks)
 end
 
 
+"""
+    withProblemCallbacks(problem, buildCallbacks, callbacks) -> problem
+
+`problem` with the model's final event callbacks `callbacks`, ahead of them the
+events of the MTK system it was built with (its callbacks other than those of
+`buildCallbacks`, the set it was built from). A solve uses the problem's alone:
+solve() merges `problem.kwargs[:callback]` with the callbacks it is given, so a
+callback in both would run twice. The structural (VSS) paths build their
+problems from the build's callbacks, which stay the full set.
+"""
+function withProblemCallbacks(problem, buildCallbacks, callbacks)
+  local built = Base.IdSet{Any}(_callbackList(buildCallbacks))
+  local own = filter(c -> !(c in built), _callbackList(get(problem.kwargs, :callback, nothing)))
+  #= Lazily: a remake of an MTK problem with trivial initialization would
+     otherwise run it now, at build time, instead of in the solve. =#
+  return ModelingToolkit.SciMLBase.remake(problem; callback = DiffEqBase.CallbackSet(own..., _callbackList(callbacks)...),
+                                          lazy_initialization = true)
+end
+_callbackList(::Nothing) = Any[]
+_callbackList(cb::DiffEqBase.CallbackSet) = Any[cb.continuous_callbacks..., cb.discrete_callbacks...]
+_callbackList(cb::ModelingToolkit.SciMLBase.DECallback) = Any[cb]
+
 # Trivial reinit: no post-event DAE re-initialization, so the merged callback's
 # default (nothing) is behaviour-preserving.
 _isTrivialReinit(ia)::Bool = ia === nothing || ia isa ModelingToolkit.SciMLBase.NoInit

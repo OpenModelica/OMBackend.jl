@@ -1130,7 +1130,9 @@ end
 
 The event callbacks of a compiled model's cached build (IMTK mode), as the
 second element of `getMTKProblem`'s result, without building the problem
-again. `nothing` without a cached build.
+again. The problem carries them as well (`prob.kwargs[:callback]`, after any
+events of the MTK system), and a solve uses the problem's. `nothing` without a
+cached build.
 """
 function eventCallbacks(modelName::String)
   local built = get(IMTKGen.BUILT, canonicalName(modelName), nothing)

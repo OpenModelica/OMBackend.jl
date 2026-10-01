@@ -852,21 +852,15 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       else
         $(Symbol("$(MODEL_NAME)Model_problem"))
       end
-      #= Pass callbacks at solve time. MTK's ODEProblem(callback=...) kwarg
-         silently drops ContinuousCallback objects (only the DiscreteCallback
-         init survives), so when-clause root-find callbacks never fire when
-         routed through the prob. solve() merges with prob.kwargs[:callback]
-         so MTK's init still runs in addition to our callbacks. =#
+      #= The problem carries the model's callbacks (withProblemCallbacks); a
+         `callback` among kwargs is merged with them by solve(). =#
       #= Stash the exact runtime solve inputs so a manual integrator loop can
-         reproduce the real event wiring (debug aid for friction/event work). =#
-      global LATEST_SOLVE_TRIPLE = (_problemForSolver, _solver, callbacks)
+         reproduce the real event wiring (debug aid for friction/event work):
+         `init(t[1], t[2])`, the callbacks are the problem's. =#
+      global LATEST_SOLVE_TRIPLE = (_problemForSolver, _solver, nothing)
       local _initKw = OMBackend.CodeGeneration.defaultInitializeKwargs(_problemForSolver, kwargs,
                                                                        $(_modelHasTableClusters(simCode)))
-      local _sol = if haskey(kwargs, :callback)
-        solve(_problemForSolver, _solver; kwargs..., _initKw...)
-      else
-        solve(_problemForSolver, _solver; callback=callbacks, kwargs..., _initKw...)
-      end
+      local _sol = solve(_problemForSolver, _solver; kwargs..., _initKw...)
       #= If the init-alg-remake'd problem produced InitialFailure (MTK could
          not reconcile init-alg hard-start u0 with the algebraic constraints),
          fall back to the un-remake'd problem so the solver can pick any
@@ -883,11 +877,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
         else
           _origProblem
         end
-        _sol = if haskey(kwargs, :callback)
-          solve(_fallbackProb, _solver; kwargs..., _initKw...)
-        else
-          solve(_fallbackProb, _solver; callback=callbacks, kwargs..., _initKw...)
-        end
+        _sol = solve(_fallbackProb, _solver; kwargs..., _initKw...)
       end
       #= Run `when terminal()` bodies once against the final solution (gated: emitted only if the model has a terminal event). =#
       $(createTerminalBodyRunner(simCode))
@@ -1366,6 +1356,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       _ifInitLiterals = Base.invokelatest(() -> Any[$(IF_INIT_LITERALS...)])
       #= The discrete clusters the initialization settles (instances of their own). =#
       _initDiscreteClusters = Base.invokelatest(() -> Any[$(INIT_DISCRETE_CLUSTERS...)])
+      #= The set the problem is built with (withProblemCallbacks replaces it). =#
+      local _buildCallbacks = callbacks
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
       OMBackend.CodeGeneration.checkNamedStateLookups(problem, $(NAMED_STATE_LOOKUPS))
       $(emitDiscreteClusters(simCode))
@@ -1384,6 +1376,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
                     Base.invokelatest(() -> Any[$([c[3] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)]))
       #= First among the discrete callbacks: it reads the step as the solver took it. =#
       callbacks = OMBackend.CodeGeneration.withAlgebraicStepControl(callbacks, problem)
+      #= The problem carries them all: a solve uses the problem's. =#
+      problem = OMBackend.CodeGeneration.withProblemCallbacks(problem, _buildCallbacks, callbacks)
       return (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars, irreducibleSyms)
     end
   end
