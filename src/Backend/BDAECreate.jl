@@ -800,10 +800,12 @@ function lowerWhenEquation(eq::DAE.WHEN_EQUATION)::BDAE.Equation
   else
     NONE()
   end
+  #= initial() outside the initial forms (dropInitialDisjuncts). =#
+  local condition = dropInitialDisjuncts(eq.condition)
   whenEquation = if isSome(elseOption)
-    BDAE.WHEN_STMTS(eq.condition, whenOperatorLst, elseOption)
+    BDAE.WHEN_STMTS(condition, whenOperatorLst, elseOption)
   else
-    BDAE.WHEN_STMTS(eq.condition, whenOperatorLst, NONE())
+    BDAE.WHEN_STMTS(condition, whenOperatorLst, NONE())
   end
   result = if !containsRecompilation
     BDAE.WHEN_EQUATION(1, whenEquation, eq.source, BDAE.EQ_ATTR_DEFAULT_UNKNOWN)

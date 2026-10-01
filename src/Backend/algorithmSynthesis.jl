@@ -1364,6 +1364,31 @@ end
 
 _isInitialCall(@nospecialize(e)) = e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "initial"
 
+#= MLS 8.6: a when is active at the initialization only in the forms `when
+   initial()` and `when {..., initial(), ...}`. =#
+_isInitialWhenCondition(@nospecialize(cond)) =
+  _isInitialCall(cond) || (cond isa DAE.ARRAY && any(_isInitialCall, cond.array))
+
+#= Elsewhere initial() is true only at the initialization, where the when is not
+   active, and false after it: an initial() disjunct of an `or` is dropped
+   (`when initial() or x > 0.6` fires at x's crossing only, as OpenModelica; its
+   crossing function was `0 - (x > 0.6)`, 0 then -1, and never fired). =#
+function dropInitialDisjuncts(@nospecialize(cond))
+  _isInitialCall(cond) && return cond
+  cond isa DAE.ARRAY &&
+    return DAE.ARRAY(cond.ty, cond.scalar, MetaModelica.list((_isInitialCall(e) ? e : _withoutInitialDisjunct(e) for e in cond.array)...))
+  return _withoutInitialDisjunct(cond)
+end
+
+function _withoutInitialDisjunct(@nospecialize(e))
+  e isa DAE.LBINARY && e.operator isa DAE.OR || return e
+  local l = _withoutInitialDisjunct(e.exp1)
+  local r = _withoutInitialDisjunct(e.exp2)
+  _isInitialCall(l) && return r
+  _isInitialCall(r) && return l
+  return DAE.LBINARY(l, e.operator, r)
+end
+
 #= Build a runtime `BDAE.WHEN_EQUATION` (with chained elsewhen) from a
    `DAE.STMT_WHEN` that appears inside a regular (non-when) algorithm body.
    Every assignment in each branch body is lifted (continuous and discrete
@@ -1417,7 +1442,7 @@ Base.@nospecializeinfer function _liftStmtWhenToWhenEquations!(out::Vector{BDAE.
                                                                @nospecialize(stmtWhen),
                                                                liftedLhsNames::OrderedSet{String})::Bool
   local allLhs = OrderedSet{String}()
-  if stmtWhen.initialCall || _expMentionsInitial(stmtWhen.exp)
+  if stmtWhen.initialCall || _isInitialWhenCondition(stmtWhen.exp)
     #= An initial arm the lifter cannot lower stays empty, as before: a first
        branch `when initial()` is synthesizeInitialWhenFromAlgorithms' (it runs
        the DAE statements). =#
