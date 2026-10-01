@@ -250,9 +250,11 @@ function getStartConditionsMTK(vars::Vector, simCode::SimulationCode.SIM_CODE; s
 end
 
 """
-  Emit `lhs ~ rhs` constraint Equations for state vars with `fixed=true` and an
-  explicit `start`. Goes into `initialization_eqs` so MTK pins them at t=0
-  rather than treating them as soft `guesses` the iteration may override.
+  Emit `lhs ~ rhs` constraint Equations for state vars with `fixed=true` and a
+  `start` (0 where it has none: the default start, MLS 4.9.1). Goes into
+  `initialization_eqs` so MTK pins them at t=0 rather than treating them as soft
+  `guesses` the iteration may override. A `v(fixed = true)` without a start was
+  left out: v = xa + 1 started at 1, not 0 (OpenModelica: xa(0) = -1).
 """
 function getFixedStartConstraintsMTK(vars::Vector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local result::Vector{Expr} = Expr[]
@@ -267,6 +269,7 @@ function getFixedStartConstraintsMTK(vars::Vector, simCode::SimulationCode.SIM_C
     local startExp = @match optAttributes begin
       SOME(attributes) => @match (attributes.start, attributes.fixed) begin
         (SOME(s), SOME(DAE.BCONST(true))) => s
+        (NONE(), SOME(DAE.BCONST(true))) => DAE.RCONST(0.0)
         _ => nothing
       end
       _ => nothing

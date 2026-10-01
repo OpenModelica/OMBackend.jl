@@ -1186,9 +1186,10 @@ function fixedStartVarNames(vars::Vector, simCode::SimulationCode.SIM_CODE)::Vec
   for var in vars
     haskey(ht, var) || continue
     (_, simVar) = ht[var]
+    #= Without a start too: the default start 0 is fixed (MLS 4.9.1). =#
     local matched = @match simVar.attributes begin
-      SOME(attributes) => @match (attributes.start, attributes.fixed) begin
-        (SOME(_), SOME(DAE.BCONST(true))) => true
+      SOME(attributes) => @match attributes.fixed begin
+        SOME(DAE.BCONST(true)) => true
         _ => false
       end
       _ => false

@@ -326,21 +326,16 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
   return (outputOnlyVarNames, outputOnlyEqIndices, eqRefs)
 end
 
-#= True when the variable's attributes carry an explicit `fixed = true` AND
-   an explicit `start = ...` value. Used to rescue variables from elimination
-   passes that would otherwise drop the user-pinned initial condition. =#
-function _hasExplicitFixedStart(@nospecialize(attrs))::Bool
+#= True when the variable's attributes carry `fixed = true`: its start, or the
+   default start 0 without one (MLS 4.9.1), is an initial equation. Used to
+   rescue variables from elimination passes that would otherwise drop the
+   user-pinned initial condition (`v(fixed = true)` with `v = xa + 1` was
+   folded away: xa(0) = 0, OpenModelica -1). =#
+function _hasFixedStart(@nospecialize(attrs))::Bool
   return @match attrs begin
-    SOME(va) where (va isa DAE.VAR_ATTR_REAL) => begin
-      local fixedTrue = @match va.fixed begin
-        SOME(DAE.BCONST(true)) => true
-        _ => false
-      end
-      local hasStart = @match va.start begin
-        SOME(_) => true
-        _ => false
-      end
-      fixedTrue && hasStart
+    SOME(va) where (va isa DAE.VAR_ATTR_REAL) => @match va.fixed begin
+      SOME(DAE.BCONST(true)) => true
+      _ => false
     end
     _ => false
   end
@@ -631,14 +626,14 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     if referencedBySurvivor
       push!(rescuedVars, vn)
     end
-    #= Rescue variables carrying `fixed=true` with an explicit start value.
+    #= Rescue variables carrying `fixed=true` (a start, or the default one).
        These are user-pinned initial conditions (e.g. `wMechanical(fixed=true,
        start=w0)`); eliminating them strips the constraint and MTK's init
        solver lands on the algebraic default (typically 0). DCPM_Cooling,
        DCPM_QuasiStationary, DCPM_withLosses regress on this exact pattern. =#
     if !referencedBySurvivor && haskey(ht, vn)
       local (_, _sv) = ht[vn]
-      if _hasExplicitFixedStart(_sv.attributes)
+      if _hasFixedStart(_sv.attributes)
         push!(rescuedVars, vn)
       end
     end
