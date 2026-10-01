@@ -394,4 +394,7 @@ import .ExampleDAEs
   #= ── 13. The names Modelica function statements read ──────────── =#
   include("functionBodyCrefsTests.jl")
 
+  #= ── 14. Calls of generated functions have the function's arity ─ =#
+  include("functionArityTests.jl")
+
 end

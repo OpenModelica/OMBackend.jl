@@ -41,6 +41,20 @@ const MODELICA_FUNCTION_IMPLS = Dict{Symbol, Function}()
 #= Global dictionary to store RTG wrappers for each function =#
 const MODELICA_FUNCTION_WRAPPERS = Dict{Symbol, Any}()
 
+#= A Modelica function's wrapper (createModelicaFunctionWrapper): its
+   RuntimeGeneratedFunction behind a method of the function's arity. An RGF
+   binds its arguments unchecked, so a call with fewer read past the argument
+   tuple and crashed the process (MSL Water IF97, 2026-09-30); here a wrong
+   argument count is a MethodError. =#
+struct ModelicaFunctionWrapper{N, F} <: Function
+  name::Symbol
+  rgf::F
+end
+ModelicaFunctionWrapper{N}(name::Symbol, rgf::F) where {N, F} = ModelicaFunctionWrapper{N, F}(name, rgf)
+(w::ModelicaFunctionWrapper{N})(args::Vararg{Any, N}) where {N} = w.rgf(args...)
+Base.nameof(w::ModelicaFunctionWrapper) = w.name
+Base.show(io::IO, w::ModelicaFunctionWrapper) = print(io, w.name)
+
 #= Cache for per-element extractor functions.
    Key: (funcName::Symbol, indices::Tuple{Vararg{Int}}, nArgs::Int)
    Value: the created function object
@@ -321,15 +335,16 @@ function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}},
   return f
 end
 
-# OMBackend always wraps Modelica-function impls in RTG callables that return
-# Real (or tuples of Real, but extractor RGFs project a single Real). Pin the
+# OMBackend always wraps Modelica-function impls in RTG callables (a function's
+# own behind a ModelicaFunctionWrapper) that return Real (or tuples of Real, but
+# extractor RGFs project a single Real). Pin the
 # symtype here so any SymbolicUtils path that hits _promote_symtype on an RTG
 # (e.g. hashcons-cached Terms, internal rewrites, default safe_ctors.jl Term
 # construction) yields Real instead of Any. Without this, an Any-typed Term
 # can be cached and later returned even when makeSymbolicTerm passes
 # `type = Real` explicitly, poisoning subsequent sums and breaking
 # `-(::SymReal, ::SymReal)` in MTK alias_elimination.
-SymbolicUtils._promote_symtype(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, args) = Real
+SymbolicUtils._promote_symtype(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper}, args) = Real
 SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 
 # Same reason for shape. Scalar-returning extractor RGFs must be reported as
@@ -338,7 +353,7 @@ SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 # mismatch in MTK's substitution rebuild path (terminterface.jl `maketerm` for
 # `+`/`-`). Without this, a wrapper whose body returns a Modelica vector can
 # poison a sum with shape `Unknown(2)`.
-SymbolicUtils.promote_shape(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper}, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 SymbolicUtils.promote_shape(::typeof(floor), args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 SymbolicUtils.promote_shape(::typeof(floor), arg::SymbolicUtils.Unknown) = SymbolicUtils.ShapeVecT()
 
@@ -1050,7 +1065,7 @@ function createModelicaFunctionWrapper(funcName::Symbol, nArgs::Int, arrayFuncti
      RuntimeGeneratedFunction context (e.g., MTK equation evaluation). =#
   local body = _buildWrapperBody(funcName, nArgs, arrayFunction, outputDims)
   local rtg = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
-  MODELICA_FUNCTION_WRAPPERS[funcName] = rtg
+  MODELICA_FUNCTION_WRAPPERS[funcName] = ModelicaFunctionWrapper{nArgs}(funcName, rtg)
   if arrayFunction && !isempty(outputDims)
     precreateElementExtractors(funcName, nArgs, outputDims)
   end
