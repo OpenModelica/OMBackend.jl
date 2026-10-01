@@ -770,6 +770,10 @@ is passed as its scalar fields, matching the callee's flattened parameter list
 function _algCallArgs(argExps::List; builtin::Bool = false)::Vector{Any}
   local out = Any[]
   for arg in argExps
+    #= A record without fields (MSL Media's f_nonlinear_Data()) is no argument:
+       the callee's flattened inputs have none for it. Passed as an empty value,
+       every later argument was shifted (a MethodError of the wrapper's arity). =#
+    (!builtin && _isEmptyRecordValue(arg)) && continue
     local rec = _recordCrefFields(arg)
     local valueTy = rec === nothing && !builtin ? _recordValueType(arg) : nothing
     #= A builtin takes a record whole; a one-field record is returned bare. =#
@@ -788,6 +792,16 @@ function _algCallArgs(argExps::List; builtin::Bool = false)::Vector{Any}
     end
   end
   return out
+end
+
+function _isEmptyRecordValue(@nospecialize(exp::DAE.Exp))::Bool
+  local ty = @match exp begin
+    DAE.CALL(attr = attr) => attr.ty
+    DAE.RECORD(ty = ty) => ty
+    DAE.CREF(_, ty) => ty
+    _ => nothing
+  end
+  return ty isa DAE.T_COMPLEX && ty.complexClassType isa DAE.ClassInf.RECORD && isempty(ty.varLst)
 end
 
 #= The record type of `exp` where it is not a named record variable: a call returning a
