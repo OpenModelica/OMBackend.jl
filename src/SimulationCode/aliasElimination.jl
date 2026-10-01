@@ -119,6 +119,41 @@ _orElseOpt(repField, elimField) = @match repField begin
   _       => elimField
 end
 
+#= The same for an Integer, Boolean or enumeration alias: its start and fixed
+   (with min and max). They were dropped: `k(start = 3, fixed = true)` with
+   `k2 = k` read 0 until k's first event (OpenModelica 3). A negated Boolean
+   alias takes `not start`; an enumeration cannot be negated. =#
+function _mergeDiscreteAliasAttrs(repAttr, elimVA, negated::Bool)
+  elimVA isa Union{DAE.VAR_ATTR_INT, DAE.VAR_ATTR_BOOL, DAE.VAR_ATTR_ENUMERATION} || return repAttr
+  negated && elimVA isa DAE.VAR_ATTR_ENUMERATION && return repAttr
+  local base = @match repAttr begin
+    SOME(va) where (typeof(va) == typeof(elimVA)) => va
+    _ => elimVA
+  end
+  local hasRep = base !== elimVA
+  local elimStart = !negated ? elimVA.start : elimVA isa DAE.VAR_ATTR_BOOL ? _notOptExp(elimVA.start) : _negateOptExp(elimVA.start)
+  local elimFixedStart = _fixedTrue(elimVA.fixed) && !(hasRep && _fixedTrue(base.fixed))
+  local start = elimFixedStart ? elimStart : hasRep ? _orElseOpt(base.start, elimStart) : elimStart
+  local fixed = elimFixedStart ? elimVA.fixed : hasRep ? _orElseOpt(base.fixed, elimVA.fixed) : elimVA.fixed
+  base isa DAE.VAR_ATTR_BOOL &&
+    return SOME(DAE.VAR_ATTR_BOOL(base.quantity, start, fixed, base.equationBound, base.isProtected, base.finalPrefix,
+                                  base.startOrigin))
+  local (elimMin, elimMax) = negated ? (_negateOptExp(elimVA.max), _negateOptExp(elimVA.min)) : (elimVA.min, elimVA.max)
+  local min = hasRep ? _orElseOpt(base.min, elimMin) : elimMin
+  local max = hasRep ? _orElseOpt(base.max, elimMax) : elimMax
+  base isa DAE.VAR_ATTR_INT &&
+    return SOME(DAE.VAR_ATTR_INT(base.quantity, min, max, start, fixed, base.uncertainOption, base.distributionOption,
+                                 base.equationBound, base.isProtected, base.finalPrefix, base.startOrigin))
+  return SOME(DAE.VAR_ATTR_ENUMERATION(base.quantity, min, max, start, fixed, base.equationBound, base.isProtected,
+                                      base.finalPrefix, base.startOrigin))
+end
+
+_notOptExp(opt) = @match opt begin
+  SOME(DAE.BCONST(b)) => SOME(DAE.BCONST(!b))
+  SOME(e) => SOME(DAE.LUNARY(DAE.NOT(DAE.T_BOOL_DEFAULT), e))
+  _ => opt
+end
+
 """
     _mergeAliasAttrs(repAttr, elimAttr, negated)
 
@@ -143,7 +178,7 @@ function _mergeAliasAttrs(repAttr, elimAttr, negated::Bool)
     _        => nothing
   end
   elimVA === nothing && return repAttr
-  isa(elimVA, DAE.VAR_ATTR_REAL) || return repAttr
+  isa(elimVA, DAE.VAR_ATTR_REAL) || return _mergeDiscreteAliasAttrs(repAttr, elimVA, negated)
   local elimStart   = elimVA.start
   local elimMin     = elimVA.min
   local elimMax     = elimVA.max
