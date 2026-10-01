@@ -1499,7 +1499,17 @@ function _buildStateVector(states, finalInitialValues;
   local hardValueMap = Dict{Any, Float64}()
   for pair in finalInitialValues
     local keyStr = string(pair.first)
-    local val = _toFloat64(pair.second; resolvedParams=resolvedParams)
+    #= A fixed start (finalInitialValues). One that reads other unknowns (`y = 2x`)
+       is solved by the initialization (_hasSolvedInitializationRows): 0.0 is its
+       placeholder. One that reads none and cannot be evaluated is refused, not
+       0.0 (a guess may be). =#
+    local val = _tryToFloat64(pair.second; resolvedParams=resolvedParams)
+    if val === nothing
+      _readsUnknowns(pair.second, resolvedParams) ||
+        OMBackend.unsupported("a start value that cannot be evaluated", "$(keyStr) = $(pair.second)")
+      @warn "DirectRHS: a start value reads other variables; 0.0 until the initialization solves it" key = keyStr val = pair.second
+      val = 0.0
+    end
     hardValueMap[pair.first] = val
     if haskey(stateStrToIdx, keyStr)
       u0[stateStrToIdx[keyStr]] = val
@@ -2166,8 +2176,68 @@ function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=
         rv isa Number && return Float64(rv)
         local vextract = Symbolics.value(rv)
         vextract isa Number && return Float64(vextract)
+        #= A call the substitution does not fold (`floor(2.7)` of the start
+           `integer(p27)`: the fixed state started at 0.0). =#
+        local folded = _evalConstantTerm(rv)
+        folded isa Number && return Float64(folded)
       end
     end
   end
+  isempty(freeVars) && (local folded = _evalConstantTerm(unwrapped); folded isa Number) && return Float64(folded)
   return nothing
+end
+
+"""
+    substituteDerivatives(expr, eqs)
+
+`expr` with each derivative `D(x)` replaced by the right side of its explicit
+equation `D(x) ~ f` among `eqs`; nothing when a derivative has none.
+"""
+function substituteDerivatives(expr, eqs)
+  local SU = Symbolics.SymbolicUtils
+  local subs = Dict{Any, Any}()
+  for eq in eqs
+    local l = Symbolics.unwrap(eq.lhs)
+    SU.iscall(l) && SU.operation(l) isa Symbolics.Differential && (subs[l] = eq.rhs)
+  end
+  local r = isempty(subs) ? expr : Symbolics.substitute(expr, subs)
+  return _hasDerivative(Symbolics.unwrap(r)) ? nothing : r
+end
+
+function _hasDerivative(@nospecialize(x))::Bool
+  local SU = Symbolics.SymbolicUtils
+  SU.iscall(x) || return false
+  SU.operation(x) isa Symbolics.Differential && return true
+  return any(_hasDerivative, SU.arguments(x))
+end
+
+#= Whether a value reads a variable that is neither time nor a resolved parameter. =#
+function _readsUnknowns(@nospecialize(val), resolvedParams)::Bool
+  local u = val isa Symbolics.Num ? Symbolics.unwrap(val) : val
+  u isa Number && return false
+  local vars = try
+    Symbolics.get_variables(u)
+  catch e
+    OMBackend._fallback(e, :_readsUnknowns)
+    return true
+  end
+  return any(v -> string(v) != "t" && (resolvedParams === nothing || !haskey(resolvedParams, string(v))), vars)
+end
+
+#= A symbolic term without variables, evaluated by applying its operations to
+   its evaluated arguments; nothing where it has a variable. =#
+function _evalConstantTerm(@nospecialize(x))
+  local u = x isa Symbolics.Num ? Symbolics.unwrap(x) : x
+  u isa Number && return u
+  local v = Symbolics.value(u)
+  v isa Number && return v
+  Symbolics.SymbolicUtils.iscall(u) || return nothing
+  local args = Any[_evalConstantTerm(a) for a in Symbolics.SymbolicUtils.arguments(u)]
+  any(a -> a === nothing, args) && return nothing
+  return try
+    Symbolics.SymbolicUtils.operation(u)(args...)
+  catch e
+    OMBackend._fallback(e, :_evalConstantTerm)
+    nothing
+  end
 end

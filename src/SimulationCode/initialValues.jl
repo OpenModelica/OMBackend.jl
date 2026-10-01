@@ -61,7 +61,7 @@ Base.@nospecializeinfer function _evalDAECallInit(fn::String, a::Vector, env::Ab
   elseif fn == "sign"; return Float64(sign(v1))
   elseif fn == "floor"; return floor(v1)
   elseif fn == "ceil"; return ceil(v1)
-  elseif fn == "integer"; return Float64(round(v1))
+  elseif fn == "integer"; return floor(v1)   # the largest integer not greater (MLS 3.7.1.1)
   elseif fn == "sin"; return sin(v1)
   elseif fn == "cos"; return cos(v1)
   elseif fn == "tan"; return tan(v1)
