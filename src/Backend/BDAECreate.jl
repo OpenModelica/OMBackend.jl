@@ -48,16 +48,8 @@ import Absyn
 import DAE
 import OMFrontend
 
-#= Side-channel from `synthesizeFromInitialAlgorithms` /
-   `synthesizeInitialWhenFromAlgorithms` to `SimulationCode`'s
-   `INITIAL_ALGORITHM` construction. Keyed by the produced
-   `BDAE.INITIAL_WHEN_EQUATION` wrapper (object identity), value is the
-   original DAE.Statement list before it was flattened to a WhenOperator list
-   by `_daeStmtsToWhenOps`. Cleared at the start of each `createEqSystem`
-   call so the dict tracks only the current model's init-algorithm bodies.
-   `IdDict` because the keys are mutable Julia structs whose equality is
-   identity-based at this layer. =#
-const _INIT_ALG_DAE_STMTS = IdDict{Any, Vector{DAE.Statement}}()
+#= The DAE statements of initial algorithms: BDAEUtil.INIT_ALG_DAE_STMTS. =#
+import ..BDAEUtil: saveInitialAlgorithmStatements!, initialAlgorithmStatements, rekeyInitialAlgorithmStatements!
 
 """
   This function translates a DAE, which is the result from instantiating a
@@ -144,7 +136,7 @@ end
 function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
   local name = flatModel.name
   @info "[BDAE: createEqSystem] start" name
-  empty!(_INIT_ALG_DAE_STMTS)
+  empty!(BDAEUtil.INIT_ALG_DAE_STMTS)
   local equations = BDAE.Equation[]
   for eq in OMFrontend.Frontend.convertEquations(flatModel.equations)
     local result = equationToBackendEquation(eq)
@@ -338,11 +330,16 @@ function resolveMangledNameCollisions!(variables::Vector, equations::Vector, ini
     end
     return (res, true, arg)
   end
-  for i in 1:length(equations)
-    (equations[i], _) = BDAEUtil.traverseEquationExpressions(equations[i], rewrite, 0)
-  end
-  for i in 1:length(initialEquations)
-    (initialEquations[i], _) = BDAEUtil.traverseEquationExpressions(initialEquations[i], rewrite, 0)
+  #= An initial algorithm's DAE statements are renamed too (the traversal
+     re-keyed them to the rebuilt node; a condition or a range is not among
+     its flattened ops, so the node can be unchanged while they are not). =#
+  local renameExp = e -> first(Util.traverseExpTopDown(e, rewrite, 0))
+  for eqs in (equations, initialEquations), i in 1:length(eqs)
+    local old = eqs[i]
+    (eqs[i], _) = BDAEUtil.traverseEquationExpressions(old, rewrite, 0)
+    local stmts = initialAlgorithmStatements(eqs[i])
+    isempty(stmts) ||
+      rekeyInitialAlgorithmStatements!(eqs[i], eqs[i], DAE.Statement[Util.mapDAEStatementExps(renameExp, s; targets = true) for s in stmts])
   end
   for v in variables
     local b = v.bindExp
@@ -1036,7 +1033,7 @@ function _appendStmtsToOps!(ops::Vector, daeStmts)
       DAE.STMT_ASSIGN(_, e1, e, src) => push!(ops, BDAE.ASSIGN(e1, e, src))
       #= (a, b, ...) := f(...): each target its element of f's result. These
          ops name what the algorithm assigns; the generated code runs the
-         algorithm's DAE statements (_INIT_ALG_DAE_STMTS), which call f once. =#
+         algorithm's DAE statements (BDAEUtil.INIT_ALG_DAE_STMTS), which call f once. =#
       DAE.STMT_TUPLE_ASSIGN(_, targets, e, src) => begin
         for (k, target) in enumerate(targets)
           (target isa DAE.CREF && !(target.componentRef isa DAE.WILD)) || continue

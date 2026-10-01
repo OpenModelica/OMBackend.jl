@@ -26,7 +26,7 @@ function synthesizeFromInitialAlgorithms(iAlgorithms)::Vector{BDAE.Equation}
       alg.source,
       BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
     )
-    _INIT_ALG_DAE_STMTS[node] = collect(daeStmts)
+    saveInitialAlgorithmStatements!(node, collect(daeStmts))
     push!(out, node)
   end
   return out
@@ -1331,7 +1331,7 @@ function synthesizeInitialWhenFromAlgorithms(algorithms)::Vector{BDAE.Equation}
             stmt.source,
             BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
           )
-          _INIT_ALG_DAE_STMTS[node] = collect(daeStmts)
+          saveInitialAlgorithmStatements!(node, collect(daeStmts))
           push!(out, node)
         end
         _ => nothing

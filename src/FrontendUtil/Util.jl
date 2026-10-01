@@ -1394,4 +1394,48 @@ function getBaseNameWithoutSubscripts(cref::DAE.ComponentRef)::String
   return String(take!(buf))
 end
 
+
+#= `stmt` with `f` applied to its expressions, recursing into the bodies of
+   compound statements (STMT_IF / STMT_FOR / STMT_WHILE / STMT_PARFOR); with
+   `targets`, to the targets it assigns too (a rename). Statements with no
+   expressions pass through. =#
+function mapDAEStatementExps(f, stmt; targets::Bool = false)
+  local g = targets ? f : identity
+  local body = stmts -> MetaModelica.list((mapDAEStatementExps(f, s; targets = targets) for s in stmts)...)
+  return @match stmt begin
+    DAE.STMT_ASSIGN(ty, e1, e, src) =>
+      DAE.STMT_ASSIGN(ty, g(e1), f(e), src)
+    DAE.STMT_TUPLE_ASSIGN(ty, lhsList, e, src) =>
+      DAE.STMT_TUPLE_ASSIGN(ty, targets ? MetaModelica.list((f(l) for l in lhsList)...) : lhsList, f(e), src)
+    DAE.STMT_ASSIGN_ARR(ty, lhs, e, src) =>
+      DAE.STMT_ASSIGN_ARR(ty, g(lhs), f(e), src)
+    DAE.STMT_NORETCALL(e, src) =>
+      DAE.STMT_NORETCALL(f(e), src)
+    DAE.STMT_ASSERT(c, m, l, src) =>
+      DAE.STMT_ASSERT(f(c), f(m), f(l), src)
+    DAE.STMT_TERMINATE(m, src) =>
+      DAE.STMT_TERMINATE(f(m), src)
+    DAE.STMT_IF(cond, stmts, else_, src) =>
+      DAE.STMT_IF(f(cond), body(stmts), _mapDAEElseExps(f, else_, targets), src)
+    DAE.STMT_FOR(ty, isArr, iter, idx, range, stmts, src) =>
+      DAE.STMT_FOR(ty, isArr, iter, idx, f(range), body(stmts), src)
+    DAE.STMT_PARFOR(ty, isArr, iter, idx, range, stmts, prl, src) =>
+      DAE.STMT_PARFOR(ty, isArr, iter, idx, f(range), body(stmts), prl, src)
+    DAE.STMT_WHILE(cond, stmts, src) =>
+      DAE.STMT_WHILE(f(cond), body(stmts), src)
+    DAE.STMT_REINIT(varExp, value, src) =>
+      DAE.STMT_REINIT(g(varExp), f(value), src)
+    _ => stmt
+  end
+end
+
+function _mapDAEElseExps(f, else_, targets::Bool)
+  local body = stmts -> MetaModelica.list((mapDAEStatementExps(f, s; targets = targets) for s in stmts)...)
+  return @match else_ begin
+    DAE.ELSE(stmts) => DAE.ELSE(body(stmts))
+    DAE.ELSEIF(cond, stmts, rest) => DAE.ELSEIF(f(cond), body(stmts), _mapDAEElseExps(f, rest, targets))
+    _ => else_
+  end
+end
+
 end #=End Util=#

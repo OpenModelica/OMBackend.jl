@@ -196,7 +196,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
          §8/§11. =#
   local initialAlgorithms = INITIAL_ALGORITHM[]
   for iweq in initialWhenEqs
-    local daeStmts = get(Backend.BDAECreate._INIT_ALG_DAE_STMTS, iweq, DAE.Statement[])
+    local daeStmts = Backend.BDAEUtil.initialAlgorithmStatements(iweq)
     push!(initialAlgorithms, INITIAL_ALGORITHM(collect(iweq.whenEquation.whenStmtLst), daeStmts))
   end
   whenEqs = substituteSampleTriggers(whenEqs, resEqs)
@@ -1088,51 +1088,7 @@ end
 
 #= Parameter CREFs substituted with their literal bindings inside a `DAE.Statement`,
    as `_inlineParamsInWhenOp` does for the parallel `WhenOperator` form. =#
-_inlineParamsInDAEStmt(stmt, ht) = mapDAEStatementExps(e -> _inlineParamsInExp(e, ht), stmt)
-
-#= `stmt` with `f` applied to its expressions (not to the targets it assigns),
-   recursing into the bodies of compound statements (STMT_IF / STMT_FOR /
-   STMT_WHILE / STMT_PARFOR). Statements with no expressions pass through. =#
-function mapDAEStatementExps(f, stmt)
-  return @match stmt begin
-    DAE.STMT_ASSIGN(ty, e1, e, src) =>
-      DAE.STMT_ASSIGN(ty, e1, f(e), src)
-    DAE.STMT_TUPLE_ASSIGN(ty, lhsList, e, src) =>
-      DAE.STMT_TUPLE_ASSIGN(ty, lhsList, f(e), src)
-    DAE.STMT_ASSIGN_ARR(ty, lhs, e, src) =>
-      DAE.STMT_ASSIGN_ARR(ty, lhs, f(e), src)
-    DAE.STMT_NORETCALL(e, src) =>
-      DAE.STMT_NORETCALL(f(e), src)
-    DAE.STMT_ASSERT(c, m, l, src) =>
-      DAE.STMT_ASSERT(f(c), f(m), f(l), src)
-    DAE.STMT_TERMINATE(m, src) =>
-      DAE.STMT_TERMINATE(f(m), src)
-    DAE.STMT_IF(cond, stmts, else_, src) =>
-      DAE.STMT_IF(f(cond), MetaModelica.list((mapDAEStatementExps(f, s) for s in stmts)...),
-                  _mapDAEElseExps(f, else_), src)
-    DAE.STMT_FOR(ty, isArr, iter, idx, range, body, src) =>
-      DAE.STMT_FOR(ty, isArr, iter, idx, f(range),
-                   MetaModelica.list((mapDAEStatementExps(f, s) for s in body)...), src)
-    DAE.STMT_PARFOR(ty, isArr, iter, idx, range, body, prl, src) =>
-      DAE.STMT_PARFOR(ty, isArr, iter, idx, f(range),
-                      MetaModelica.list((mapDAEStatementExps(f, s) for s in body)...), prl, src)
-    DAE.STMT_WHILE(cond, body, src) =>
-      DAE.STMT_WHILE(f(cond), MetaModelica.list((mapDAEStatementExps(f, s) for s in body)...), src)
-    DAE.STMT_REINIT(varExp, value, src) =>
-      DAE.STMT_REINIT(varExp, f(value), src)
-    _ => stmt
-  end
-end
-
-function _mapDAEElseExps(f, else_)
-  return @match else_ begin
-    DAE.ELSE(stmts) => DAE.ELSE(MetaModelica.list((mapDAEStatementExps(f, s) for s in stmts)...))
-    DAE.ELSEIF(cond, stmts, rest) =>
-      DAE.ELSEIF(f(cond), MetaModelica.list((mapDAEStatementExps(f, s) for s in stmts)...),
-                 _mapDAEElseExps(f, rest))
-    _ => else_
-  end
-end
+_inlineParamsInDAEStmt(stmt, ht) = Util.mapDAEStatementExps(e -> _inlineParamsInExp(e, ht), stmt)
 
 """
 Returns the shared global and local variable for the shared data in

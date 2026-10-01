@@ -541,7 +541,7 @@ function flattenRecordCallSites(simCode)
      binds the names its statements read). =#
   @assign simCode.initialAlgorithms = INITIAL_ALGORITHM[
     INITIAL_ALGORITHM(WhenOperator[_expandRecordArgsInWhenOp(op) for op in ia.statements],
-                      DAE.Statement[mapDAEStatementExps(expandRecordArgsInExp, s) for s in ia.daeStatements])
+                      DAE.Statement[Util.mapDAEStatementExps(expandRecordArgsInExp, s) for s in ia.daeStatements])
     for ia in simCode.initialAlgorithms]
   #= Expand record arguments in parameter and array-parameter binding expressions =#
   local ht = simCode.stringToSimVarHT
