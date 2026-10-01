@@ -168,6 +168,10 @@ lossTable_fileName = "NoName"
 """
 function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local exprs::Vector{Expr} = Expr[]
+  #= Variables the SimCode passes eliminated (aliases, folded equations): no
+     longer in the table, and not bound at module level either. =#
+  local eliminated = union(OrderedSet{String}(simCode.eliminatedVariables),
+                           OrderedSet{String}(a.eliminatedName for a in simCode.aliasMap))
   for varName in keys(simCode.stringToSimVarHT)
     SimulationCode.isTunableParameter(varName) && continue
     (idx, simVar) = simCode.stringToSimVarHT[varName]
@@ -177,6 +181,23 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
       _ => nothing
     end
     bindExp === nothing && continue
+    #= A String kind is a String parameter, but also a String variable: one
+       reading time or a variable changes during the simulation, assigned here
+       once (`t` undefined at module level). A String it reads is checked on
+       its own. =#
+    if simVar.varKind isa SimulationCode.STRING
+      local d = SimulationCode.toDAEExp(bindExp)
+      local varying = _expMentionsTime(d) || any(Util.getAllCrefs(d)) do c
+        local e = get(simCode.stringToSimVarHT, string(c), nothing)
+        e !== nothing && last(e).varKind isa Union{SimulationCode.STATE, SimulationCode.STATE_DERIVATIVE,
+                                                   SimulationCode.ALG_VARIABLE, SimulationCode.DISCRETE,
+                                                   SimulationCode.INPUT, SimulationCode.ARRAY}
+      end
+      varying && OMBackend.unsupported("a String variable that changes during the simulation", varName)
+      local gone = [string(c) for c in Util.getAllCrefs(d) if string(c) in eliminated]
+      isempty(gone) || OMBackend.unsupported("a String variable that reads an eliminated variable",
+                                             varName * ": " * join(gone, ", "))
+    end
     #= Only emit literal bindings at module level. Computed defaults / cross-
        parameter refs cannot be safely lowered before MTK builds `pars`. The
        DATA_STRUCTURE_ASSIGNMENTS at module top reference these names (e.g.
