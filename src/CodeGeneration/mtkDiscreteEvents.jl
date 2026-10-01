@@ -754,13 +754,22 @@ function _modelHasSwitchClusters(simCode)::Bool
   return any(op -> op in read && !(op in foreign), keys(own))
 end
 
+_isWhenAssert(@nospecialize(st)) = st isa BDAE.ASSERT || st isa SimulationCode.ASSERT
+
+#= The discrete-cluster and self-scheduling lowerings run only the
+   assignments of a when body: its asserts are not checked there (reported). =#
+_uncheckedWhenAssert(@nospecialize(st)) =
+  @warn "[MTK GEN: when] an assert in a when on a buffered relation or a self-scheduling time when is not checked" condition = string(SimulationCode.toDAEExp(st.condition))
+
 #= Gather a synthesized when cluster's ordered (discreteSymbol, rhsDAE, isInteger)
    assignments; `nothing` when any statement is unsupported. A single-member
    cluster has one entry; a coupled FSM cluster has the body in topological order. =#
 function _gatherClusterAssigns(weq, simCode)
   local assigns = Tuple{Symbol, Any, Bool}[]
   for st in collect(weq.whenEquation.whenStmtLst)
-    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || return nothing
+    _isWhenAssert(st) && (_uncheckedWhenAssert(st); continue)
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) ||
+      unsupported("this statement in a when on a buffered relation (a discrete cluster)", st)
     local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
     haskey(simCode.stringToSimVarHT, leftStr) || return nothing
     local (_, var) = simCode.stringToSimVarHT[leftStr]
@@ -831,7 +840,9 @@ Base.@nospecializeinfer function _selfSchedAffectParts(weq, simCode; atInit::Boo
   local modNames = Symbol[]
   local subst = Dict{Symbol,Any}()
   for st in collect(weq.whenEquation.whenStmtLst)
-    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+    _isWhenAssert(st) && (atInit || _uncheckedWhenAssert(st); continue)
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) ||
+      unsupported("this statement in a self-scheduling time when", st)
     local lhsDAE = SimulationCode.toDAEExp(st.left)
     lhsDAE isa DAE.CREF || continue
     local xn = string(lhsDAE.componentRef)
@@ -1345,9 +1356,19 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
                                          varPrefix = varPrefix, varSuffix = varSuffix)
       local msgExpr = expToJuliaExpMTK(wStmt.message, simCode;
                                         varPrefix = varPrefix, varSuffix = varSuffix)
+      #= AssertionLevel.error stops the simulation, as an equation's assert
+         does (asserts.jl); warning reports it. =#
+      local violated = if AlgorithmicCodeGeneration.isWarningAssertionLevel(SimulationCode.toDAEExp(wStmt.level))
+        :(@warn string("Assertion violated at time ", integrator.t, ": ", $(msgExpr)))
+      else
+        :(throw(OMBackend.CodeGeneration.ModelicaAssertionError(integrator.t, string($(msgExpr)),
+                                                                 $(string(SimulationCode.toDAEExp(wStmt.condition))))))
+      end
+      #= The lowering encodes and/or/not arithmetically: a number, not a Bool. =#
       push!(res, quote
-              if !($(condExpr))
-                @warn "Modelica assert()" message=$(msgExpr)
+              local _holds = $(condExpr)
+              if !(_holds isa Bool ? _holds : _holds != 0)
+                $(violated)
               end
             end)
     else

@@ -476,6 +476,8 @@ _markingPending(cb::DiffEqBase.DiscreteCallback, pending::Base.RefValue{Bool}) =
 
 #= `resolve`: another callback fired (_PendingAffect); the algebraic
    unknowns follow it first, as after a continuous event. =#
+_terminated(integrator) = integrator.sol.retcode == ModelingToolkit.SciMLBase.ReturnCode.Terminated
+
 function _iterate!(e::EventIteration, integrator, resolve::Bool = false)
   if (resolve || _continuousEventFired(integrator)) && !_resolveAlgebraics!(integrator, e.reinit)
     @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
@@ -484,7 +486,11 @@ function _iterate!(e::EventIteration, integrator, resolve::Bool = false)
     return nothing
   end
   for n in 1:e.limit
-    if !_sweep!(e, integrator)
+    local changed = _sweep!(e, integrator)
+    #= A body ran terminate(): the solve ends at this event (no tstops left to
+       restart a step against). =#
+    _terminated(integrator) && return nothing
+    if !changed
       n > 1 && _restartStepSize!(integrator)
       #= Settled: the discrete whens' change()/edge() memory takes the
          values (pre() at the next event); none of them holds here. =#

@@ -836,10 +836,31 @@ Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenO
                                    activeCond, iterVals, initialValue, allowContinuous) || return false
         end
       end
+      #= Nested whens are not Modelica; the top-level ones are lifted on their own. =#
       DAE.STMT_WHEN(__) => nothing
-      DAE.STMT_ASSERT(__) => nothing
+      #= An assert in a when body (`allowContinuous`: the when lifter) is checked
+         where the body runs, under its conditions: `not guard or c`. In a regular
+         algorithm the top-level asserts are synthesizeAssertsFromRegularAlgorithms'. =#
+      DAE.STMT_ASSERT(c, msg, level, src) => begin
+        if allowContinuous
+          local cond = _prepareAlgorithmExp(c, iterVals, initialValue)
+          activeCond === nothing || (cond = _orCondition(_notCondition(activeCond), cond))
+          push!(ops, BDAE.ASSERT(cond, _prepareAlgorithmExp(msg, iterVals, initialValue), level, src))
+        end
+      end
+      DAE.STMT_TERMINATE(msg, src) => begin
+        #= Under a constant guard: always or never (`if initial()` in the
+           runtime arm). =#
+        if allowContinuous && !(activeCond isa DAE.BCONST && !activeCond.bool)
+          (activeCond === nothing || activeCond isa DAE.BCONST) ||
+            OMBackend.unsupported("terminate() under a condition in a when body", s)
+          push!(ops, BDAE.TERMINATE(_prepareAlgorithmExp(msg, iterVals, initialValue), src))
+        end
+      end
+      #= A call for its side effects (a print, a file): no variable depends on it.
+         Not run. =#
       DAE.STMT_NORETCALL(__) => nothing
-      _ => nothing
+      _ => (allowContinuous && OMBackend.unsupported("this statement in a when body", s))
     end
   end
   return true
@@ -899,6 +920,11 @@ Base.@nospecializeinfer function _buildAlgorithmBodyOps(@nospecialize(daeStmts),
   local lhsNames = OrderedSet{String}()
   local ok = _appendAlgorithmStmtOps!(ops, lhsNames, daeStmts, nothing,
                                       Dict{String, Int}(), initialValue, allowContinuous)
+  #= A when body (allowContinuous) that cannot be lowered would drop its when:
+     a for loop over a non-constant range, an assignment to a slice or to an
+     expression. A regular body is lifted only where it can be. =#
+  ok || allowContinuous &&
+    OMBackend.unsupported("a when body with a for loop over a non-constant range, or an assignment to a slice or an expression", daeStmts)
   ok || return (BDAE.WhenOperator[], OrderedSet{String}())
   return (ops, lhsNames)
 end
@@ -1108,13 +1134,16 @@ _isInitialCall(@nospecialize(e)) = e isa DAE.CALL && e.path isa Absyn.IDENT && e
    `nothing` if the branch contributes no operators. =#
 Base.@nospecializeinfer function _stmtWhenToBdaeWhenEquation(@nospecialize(stmtWhen),
                                                              allLhs::OrderedSet{String})
-  local ops, lhs = _buildAlgorithmBodyOps(stmtWhen.statementLst, false, true)
-  union!(allLhs, lhs)
   local cond = nothing
   for e in _whenConditionMembers(stmtWhen.exp)
     cond = _orCondition(cond, _prepareAlgorithmExp(e, Dict{String, Int}(), false))
   end
   cond === nothing && (cond = DAE.BCONST(true))
+  #= A branch that never runs here (`when initial()`: false after the start)
+     contributes nothing; its body is the initial lowering's. =#
+  local (ops, lhs) = cond isa DAE.BCONST && !cond.bool ? (BDAE.WhenOperator[], OrderedSet{String}()) :
+                     _buildAlgorithmBodyOps(stmtWhen.statementLst, false, true)
+  union!(allLhs, lhs)
   local elseOpt = NONE()
   @match stmtWhen.elseWhen begin
     SOME(esw) => begin
@@ -1141,7 +1170,15 @@ Base.@nospecializeinfer function _liftStmtWhenToWhenEquations!(out::Vector{BDAE.
                                                                liftedLhsNames::OrderedSet{String})::Bool
   local allLhs = OrderedSet{String}()
   if stmtWhen.initialCall || _expMentionsInitial(stmtWhen.exp)
-    local initOps, initLhs = _buildAlgorithmBodyOps(stmtWhen.statementLst, true, true)
+    #= An initial arm the lifter cannot lower stays empty, as before: a first
+       branch `when initial()` is synthesizeInitialWhenFromAlgorithms' (it runs
+       the DAE statements). =#
+    local (initOps, initLhs) = try
+      _buildAlgorithmBodyOps(stmtWhen.statementLst, true, true)
+    catch err
+      err isa OMBackend.UnsupportedLowering || rethrow()
+      (BDAE.WhenOperator[], OrderedSet{String}())
+    end
     union!(allLhs, initLhs)
     if !isempty(initOps)
       local initialCall = DAE.CALL(Absyn.IDENT("initial"),
