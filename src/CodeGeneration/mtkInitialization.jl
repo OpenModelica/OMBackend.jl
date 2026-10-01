@@ -38,7 +38,9 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
       @debug "[MTK GEN: initialConstraints] skipping $(typeof(ieq)) (record/array constraints not yet lowered to scalar `~` form)"
       continue
     end
-    if isParametricOnlyEquation(ieq, simCode)
+    #= Solved at the build (solveParametricInitialEquations!), unless a
+       parameter of it is still unbound: then the initialization solves it. =#
+    if isParametricOnlyEquation(ieq, simCode) && !_readsUnboundParameter(ieq, simCode)
       continue
     end
     local ieqLhsDAE = SimulationCode.toDAEExp(ieq.lhs)
@@ -78,6 +80,18 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
     push!(result, :($lhs ~ $rhs))
   end
   return result
+end
+
+#= Whether an equation reads a parameter without a binding (a fixed=false one
+   the build did not solve). =#
+function _readsUnboundParameter(ieq, simCode::SimulationCode.SIM_CODE)::Bool
+  local ht = simCode.stringToSimVarHT
+  return any(equationSides(ieq)) do side
+    any(Util.getAllCrefs(side)) do c
+      local entry = get(ht, string(c), nothing)
+      entry !== nothing && SimulationCode.isParameter(last(entry)) && !SimulationCode.hasBindingExp(last(entry))
+    end
+  end
 end
 
 """
@@ -298,9 +312,91 @@ end
    supported together. In the early pass their values (switch controls of
    the MSL QS IMC_Transformer) became hard initial conditions of the reduced
    system and its switching event at t = 2 failed. =#
-_earlyInitialAlgorithms(simCode) =
-  any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms) ?
+#= What the build evaluated at time 0, for a simulation from another start
+   time. The parametric initial equations it solved that read `time` are
+   refused (MSL Blocks.Math.Mean's t0 = time gave 0 with any start time); one
+   reading an unbound parameter is solved by the initialization, at the start
+   time. The early initial algorithms run again at the start time, refused
+   only where a value differs (a Pulse's count is the same over its first
+   period). Nothing when there is neither. =#
+function _startTimeGuard(simCode::SimulationCode.SimCode)
+  local what = String[]
+  for ieq in simCode.initialEquations
+    (isParametricOnlyEquation(ieq, simCode) && !_readsUnboundParameter(ieq, simCode)) || continue
+    local sides = equationSides(ieq)
+    any(_expMentionsTime, sides) && append!(what, (string(c) for side in sides for c in Util.getAllCrefs(side) if string(c) != "time"))
+  end
+  #= Start values reading time: the build's u0, for time 0. =#
+  for (name, (_, sv)) in simCode.stringToSimVarHT
+    local start = @match sv.attributes begin
+      SOME(a) where hasproperty(a, :start) => a.start
+      _ => nothing
+    end
+    start isa SOME && _expMentionsTime(start.data isa SimulationCode.Exp ? SimulationCode.toDAEExp(start.data) : start.data) &&
+      push!(what, name * "'s start value")
+  end
+  local equationGuard = isempty(what) ? :() :
+    :(tspan[1] == 0 || OMBackend.unsupported($(string("a start time other than 0 (", join(unique(what), ", "),
+                                                      " evaluated at the build, for time 0)")), tspan[1]))
+  #= The ticks of a sample() or a Pulse's period count from the start time
+     (PeriodicCallback's phase): sample(0, 0.25) from 0.1 ticked at 0.1, 0.35. =#
+  local periodicGuard = !_hasPeriodicWhen(simCode) ? :() :
+    :(tspan[1] == 0 || OMBackend.unsupported("a start time other than 0 with sample() or a periodic source (ticks counted from the start time)", tspan[1]))
+  local algorithmGuard = isempty(_earlyInitialAlgorithms(simCode)) ? :() :
+    :(tspan[1] == 0 ||
+      isequal(Base.invokelatest(__runInitialAlgorithmEarly!, 0.0), Base.invokelatest(__runInitialAlgorithmEarly!, Float64(tspan[1]))) ||
+      OMBackend.unsupported("a start time other than 0 (initial algorithm values evaluated at the build, for time 0, that differ)", tspan[1]))
+  return quote
+    $(equationGuard)
+    $(periodicGuard)
+    $(algorithmGuard)
+  end
+end
+
+#= Whether a when (an elsewhen arm too) is lowered to a PeriodicCallback. =#
+function _hasPeriodicWhen(simCode)::Bool
+  local periodic = function (arm)
+    local cond = SimulationCode.toDAEExp(_elsewhenCondition(arm))
+    _containsSampleCall(cond) || _pulsePeriodicSpec(cond, simCode) !== nothing
+  end
+  return any(simCode.whenEquations) do weq
+    local arm = weq
+    while arm !== nothing
+      periodic(arm) && return true
+      arm = _elsewhenInner(arm isa SimulationCode.WHEN_STMTS ? arm.elsewhenPart : arm.whenEquation.elsewhenPart)
+    end
+    false
+  end
+end
+
+_expMentionsTime(@nospecialize(e)) = last(Util.traverseExpTopDown(e, (x, found) ->
+  (x, !found, found || (x isa DAE.CREF && x.componentRef isa DAE.CREF_IDENT && x.componentRef.ident == "time")), false))
+
+#= The initial algorithms the early pass runs: the sections with DAE
+   statements (else the ops of `when initial()`), less those reading a
+   derivative: der() reads the problem, which the early pass runs before. An
+   `initial algorithm` section reading one is refused
+   (generateInitialAlgorithmEarlyFunction); the ops of `when initial()` the
+   runtime pass runs (_initialDerivativeReads). =#
+function _earlyInitialAlgorithms(simCode)
+  local sections = any(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms) ?
     filter(ia -> !isempty(ia.daeStatements), simCode.initialAlgorithms) : simCode.initialAlgorithms
+  return any(_readsDerivative, sections) ? filter(!_readsDerivative, sections) : sections
+end
+
+function _readsDerivative(ia)::Bool
+  local found = false
+  local look = e -> begin
+    local d = e isa SimulationCode.Exp ? SimulationCode.toDAEExp(e) : e
+    d isa DAE.Exp && (found |= containsDerCall(d))
+    e
+  end
+  foreach(s -> Util.mapDAEStatementExps(look, s), ia.daeStatements)
+  for op in ia.statements, fld in (:right, :condition, :exp, :value, :message)
+    hasproperty(op, fld) && look(getproperty(op, fld))
+  end
+  return found
+end
 
 function emitInitAlgU0Appends(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local appends::Vector{Expr} = Expr[]
@@ -341,7 +437,7 @@ end
    in the table (`x := {1, 2, 3}`; 2-D names x[1][2] are not matched). A for
    loop's iterator (`iterators`, also among the assigned names) is no
    variable, even where an array of its name is. =#
-function _initAlgTargets(lhsNames, ht, iterators = Set{String}())::Vector{Tuple{String, String, Union{Nothing, Int}}}
+function _initAlgTargets(lhsNames, ht, iterators = Set{String}(); parameters::Bool = false)::Vector{Tuple{String, String, Union{Nothing, Int}}}
   local out = Tuple{String, String, Union{Nothing, Int}}[]
   for name in lhsNames
     local elems = if haskey(ht, name)
@@ -360,7 +456,10 @@ function _initAlgTargets(lhsNames, ht, iterators = Set{String}())::Vector{Tuple{
     end
     for (el, k) in elems
       local sv = ht[el][2]
-      (sv.varKind isa SimulationCode.PARAMETER || sv.varKind isa SimulationCode.ARRAY_PARAMETER) && continue
+      parameters || !(sv.varKind isa SimulationCode.PARAMETER || sv.varKind isa SimulationCode.ARRAY_PARAMETER) || continue
+      #= Captured as one number (none in MSL 3.2.3: 14 initial algorithms). =#
+      sv.varKind isa SimulationCode.ARRAY_PARAMETER &&
+        OMBackend.unsupported("an initial algorithm assigning an array parameter", name)
       push!(out, (name, el, k))
     end
   end
@@ -408,7 +507,7 @@ function emitInitAlgConstraintAppends(simCode::SimulationCode.SIM_CODE)::Vector{
   for ia in _earlyInitialAlgorithms(simCode)
     _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
-  for (_, el, _) in _initAlgTargets(lhsNames, ht, _initAlgIterators(simCode))
+  for (_, el, _) in _initAlgTargets(lhsNames, ht, _initAlgIterators(simCode); parameters = true)
     local qn = QuoteNode(Symbol(el))
     push!(appends, :(haskey(_algResults, $(qn)) &&
                      push!(_eqs, $(Symbol(el)) ~ _algResults[$(qn)])))
@@ -463,9 +562,25 @@ function _initialDerivative(problem, name::Symbol)
   return Float64(f(problem.u0, problem.p, first(problem.tspan)))
 end
 
+#= pre(v) at the initialization: v's start value (MLS 3.7.3). The runtime pass
+   runs a `when initial()` body after the early pass, which set v already:
+   `n = pre(n) + 1` gave 2. =#
+function _preAtInitialization(@nospecialize(e), simCode)
+  local d = e isa SimulationCode.Exp ? SimulationCode.toDAEExp(e) : e
+  d isa DAE.Exp || return e
+  local (out, _) = Util.traverseExpBottomUp(d, (x, acc) -> begin
+      if x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name == "pre" && listHead(x.expLst) isa DAE.CREF
+        local entry = get(simCode.stringToSimVarHT, string(listHead(x.expLst).componentRef), nothing)
+        entry === nothing || (x = DAE.RCONST(_readStartAttributeAsLiteral(last(entry))))
+      end
+      (x, acc)
+    end, nothing)
+  return out
+end
+
 function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
                                renamedNames::OrderedSet{String} = OrderedSet{String}())
-  local sub = e -> _substituteBoundParameters(e, simCode)
+  local sub = e -> _substituteBoundParameters(_preAtInitialization(e, simCode), simCode)
   local lowerAlg = e -> _initialDerivativeReads(_renameAlgIdentifiers(
     _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))),
     renamedNames,
@@ -589,7 +704,7 @@ end
 """
     generateInitialAlgorithmEarlyFunction(simCode) -> Expr
 
-Emit `function __runInitialAlgorithmEarly!() -> Dict{Symbol, Float64}` that
+Emit `function __runInitialAlgorithmEarly!(t0 = 0.0) -> Dict{Symbol, Float64}` that
 executes the `initial algorithm` bodies procedurally at module-load time
 (Modelica §11.4: statements run sequentially, the LHS final value becomes the
 variable's initial value).
@@ -605,10 +720,11 @@ scope. When `daeStatements` is empty (e.g. older callers that only provide a
 `Vector{BDAE.WhenOperator}`), the legacy flat-WhenOperator translator
 `_initialWhenOpToJuliaEarly` is used as a fallback.
 
-The body is wrapped in `let time = 0.0 ... end`. Non-LHS crefs read on the
+The body is wrapped in `let time = t0 ... end` (the build runs it for time 0,
+_startTimeGuard again for the start time). Non-LHS crefs read on the
 RHS get a pre-seeded `_alg_<name>` from the SimVar's `start` attribute or
 `0.0` (a parameter: its statically folded binding); every LHS starts at
-`0.0`. After the body, each LHS final value is captured into the returned
+its start value. After the body, each LHS final value is captured into the returned
 `Dict{Symbol, Float64}` (an entry that is not a number is skipped).
 
 A body that throws returns no results (a fallback); the runtime `remake`
@@ -616,13 +732,17 @@ path remains for state-cref-RHS reads whose post-init value differs from
 the `start` attribute.
 """
 function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)::Expr
+  #= der() reads the problem, which the early pass runs before (none in MSL
+     3.2.3; skipped, its targets kept their start values). =#
+  local readsDer = count(ia -> !isempty(ia.daeStatements) && _readsDerivative(ia), simCode.initialAlgorithms)
+  readsDer > 0 && OMBackend.unsupported("an initial algorithm reading der()", readsDer)
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
   for ia in _earlyInitialAlgorithms(simCode)
     _collectInitAlgNames!(lhsNames, rhsNames, ia)
   end
   local noEarlyPass = quote
-    function __runInitialAlgorithmEarly!()
+    function __runInitialAlgorithmEarly!(t0::Float64 = 0.0)
       return Dict{Symbol, Float64}()
     end
   end
@@ -656,8 +776,8 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
       push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(paramLit)))
       continue
     end
-    local lit = _readStartAttributeAsLiteral(sv)
-    push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(lit)))
+    #= Its start value, evaluated: a parameter (`x(start = x0)`) was read as 0.0. =#
+    push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(_initAlgStartValue(sv, simCode))))
   end
   #= An assigned variable starts at its start value: read before it is
      assigned, and what an untaken branch leaves (an initial algorithm
@@ -690,26 +810,21 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
       end
     end
   end
-  #= der() reads the problem, which the early pass runs before: a body that
-     reads a derivative (a relation on one, MSL FluxTubes) is not run early.
-     Running the other statements alone would turn the values after it into
-     wrong initialization constraints. The runtime pass
-     (`__runInitialAlgorithm!`, _initialDerivativeReads) runs the bodies of
-     `when initial()`; the `initial algorithm` sections it does not run
-     (_earlyInitialAlgorithms), so a derivative read in one has no effect,
-     as before (the early body threw there). =#
+  #= A safety net: _earlyInitialAlgorithms leaves out the sections reading a
+     derivative (der() reads the problem, which the early pass runs before;
+     the other statements alone would make wrong initialization constraints). =#
   any(_callsDer, stmts) && return noEarlyPass
   local captures = Expr[]
-  for (name, el, k) in _initAlgTargets(lhsNames, ht, iterators)
+  for (name, el, k) in _initAlgTargets(lhsNames, ht, iterators; parameters = true)
     local algSym = Symbol("_alg_" * name)
     local qn = QuoteNode(Symbol(el))
     push!(captures, :(try; _results[$(qn)] = Float64($(k === nothing ? algSym : :($(algSym)[$(k)]))); catch _e; OMBackend._fallback(_e, :initAlgEarlyCapture); nothing; end))
   end
   return quote
-    function __runInitialAlgorithmEarly!()
+    function __runInitialAlgorithmEarly!(t0::Float64 = 0.0)
       local _results = Dict{Symbol, Float64}()
       try
-        let time = 0.0
+        let time = t0
           $(prefetches...)
           $(stmts...)
           $(captures...)
@@ -740,7 +855,7 @@ end
 """
     generateInitialAlgorithmFunction(simCode) -> Expr
 
-Emit a `function __runInitialAlgorithm!() ... end` whose body executes once
+Emit a `function __runInitialAlgorithm!(t0 = 0.0) ... end` whose body executes once
 during initialization, lowered from `simCode.initialAlgorithms`. Parameter
 literals are already baked into the body by `inlineParamsInInitialAlgorithms`
 at SimCode construction time, so no module-scope parameter bindings are needed
@@ -754,7 +869,7 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
   local whenAlgorithms = filter(ia -> isempty(ia.daeStatements), simCode.initialAlgorithms)
   if isempty(whenAlgorithms)
     return quote
-      function __runInitialAlgorithm!()
+      function __runInitialAlgorithm!(t0::Float64 = 0.0)
         return Dict{Any, Any}()
       end
     end
@@ -778,7 +893,7 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
   end
   if isempty(stmts)
     return quote
-      function __runInitialAlgorithm!()
+      function __runInitialAlgorithm!(t0::Float64 = 0.0)
         return Dict{Any, Any}()
       end
     end
@@ -848,18 +963,18 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
           end))))
   end
   #= Shadow `Base.time` (a UNIX-time function) with the local Modelica `time`
-     value, which is 0 at simulation init. Without this, init-algorithm bodies
+     value, the start time (t0). Without this, init-algorithm bodies
      that reference `time` (e.g. trapezoid sources' `count := integer((time -
      startTime) / period)`) generate `time - <Float64>` and hit MethodError
      because `Base.time` is a function, not a number. =#
   return quote
-    function __runInitialAlgorithm!()
+    function __runInitialAlgorithm!(t0::Float64 = 0.0)
       #= `_hard` collects (symbolic_var => value) pairs for each ASSIGN to a
          non-parameter variable. simulate() passes it to `remake(prob; u0=…,
          initializealg=NoInit())` so MTK treats the init-algorithm-computed
          values as hard initial conditions (Modelica §11.2), not guesses. =#
       local _hard = Dict{Any, Any}()
-      let time = 0.0
+      let time = t0
         $(fetches...)
         $(stmts...)
       end

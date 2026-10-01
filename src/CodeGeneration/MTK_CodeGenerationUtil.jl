@@ -795,8 +795,17 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             @warn "expToJuliaExpMTK: resolved alias-eliminated T_ARRAY variable via fallback" lookUpStr
             aliasExpr
           else
-            #= Variable not in hash table (may have been eliminated), using direct reference =#
-            quote $(Symbol(string(varPrefix, arrName, varSuffix))) end
+            #= Not a variable of its own (its elements were eliminated): the array
+               of its elements, each lowered as a subscripted reference. The bare
+               name was undefined (MSL Engine1b_analytic's frame_im.R.T passed to
+               selectBranch in an initial equation). =#
+            local sizes = Int[d.integer for d in dims]   #= DIM_INTEGER: checked above =#
+            length(sizes) <= 2 || OMBackend.unsupported("an array of more than two dimensions without variables", arrName)
+            local elem = idx -> expToJuliaExpMTK(
+              DAE.CREF(DAE.CREF_IDENT(arrName, ty, MetaModelica.list((DAE.INDEX(DAE.ICONST(i)) for i in idx)...)), ty),
+              simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+            length(sizes) == 1 ? Expr(:vect, (elem((i,)) for i in 1:sizes[1])...) :
+              Expr(:vcat, (Expr(:row, (elem((i, j)) for j in 1:sizes[2])...) for i in 1:sizes[1])...)
           end
         end
       end
@@ -2638,6 +2647,10 @@ function evalDAE_Expression(expr, simCode)::Expr
   return quote $(evaluatedJLExpr) end
 end
 
+#= `e` with `time` read as 0.0, the start time of the build. =#
+_timeAtBuildStart(@nospecialize(e)) = first(Util.traverseExpBottomUp(e, (x, acc) ->
+  (x isa DAE.CREF && x.componentRef isa DAE.CREF_IDENT && x.componentRef.ident == "time" ? DAE.RCONST(0.0) : x, acc), nothing))
+
 """
     solveParametricInitialEquations!(simCode)
 
@@ -2710,7 +2723,11 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       end
       (exp, true, acc)
     end
-    local ieqLhs, ieqRhs = equationSides(ieq)
+    #= At the build the start time is 0 (`t0 = time`, MSL Blocks.Math.Mean;
+       simulateFromBuild refuses another start time for such a model,
+       _startTimeGuard): `time` could not be evaluated, and the parameter kept
+       its start value. =#
+    local ieqLhs, ieqRhs = map(_timeAtBuildStart, equationSides(ieq))
     Util.traverseExpBottomUp(ieqLhs, findFree, 0)
     Util.traverseExpBottomUp(ieqRhs, findFree, 0)
     unique!(freeParams)
@@ -2793,6 +2810,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     local eps = 1e-10
     local maxIter = 100
     local newtonOk = true
+    local lastStep = Inf
     try
       for _ in 1:maxIter
         local fx = Base.invokelatest(residualFn, x)
@@ -2804,12 +2822,21 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
         if abs(dfx) < 1e-15
           break
         end
-        x -= fx / dfx
+        lastStep = fx / dfx
+        x -= lastStep
       end
     catch err
       OMBackend._fallback(err, :parametricInitNewton; expect = Union{UndefVarError, MethodError}, impact = :result)
       @warn "[SIMCODE: solveParametricInitialEquations] residual call threw, skipping" freeName err
       newtonOk = false
+    end
+    #= Converged: a small residual, or a small last step (the rounding of
+       `0 = 1e9*G - 2e9` is about 4e-7). Otherwise the parameter stays unbound,
+       for the initialization (generateInitialEquationsAsConstraints takes an
+       equation reading one). =#
+    newtonOk = newtonOk && let fx = try Base.invokelatest(residualFn, x) catch; NaN end
+      isfinite(x) && isfinite(fx) &&
+        (abs(fx) <= 1e-8 * max(1.0, abs(lhsVal)) || abs(lastStep) <= 1e-10 * max(1.0, abs(x)))
     end
     if !newtonOk
       continue

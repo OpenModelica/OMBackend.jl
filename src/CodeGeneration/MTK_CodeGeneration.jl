@@ -779,6 +779,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
        DAE routing, InitialFailure retry, terminal events). Extracted from simulate so
        the iMTK path can drive it with a cached build; simulate behavior is unchanged. =#
     function simulateFromBuild(built, tspan = (0.0, 1.0), solver = OMBackend.defaultSolver(); kwargs...)
+      $(_startTimeGuard(simCode))
       ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreducible) = built
       global LATEST_REDUCED_SYSTEM = $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))
       global LATEST_PROBLEM = $(Symbol("$(MODEL_NAME)Model_problem"))
@@ -788,7 +789,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
          bodies reference. Calling the function directly resolves those names
          in the older compile-time world and throws
          `UndefVarError: ... binding may be too new`. =#
-      local _hardStarts = Base.invokelatest(__runInitialAlgorithm!)
+      local _hardStarts = Base.invokelatest(__runInitialAlgorithm!, Float64(tspan[1]))
       #= Stash the un-remake'd problem so the solve() fallback below can
          retry without enforced init-alg u0 if MTK's init system finds the
          hard-start values infeasible against the algebraic constraints. =#

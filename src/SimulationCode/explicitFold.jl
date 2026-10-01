@@ -237,6 +237,9 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
     name in aliasNames && continue
     local (_, sv) = ht[name]
     _isAlgebraicVarKind(sv.varKind) || continue
+    #= A fixed start is an initial equation of the variable: folded away, it
+       was lost (`v(start = 3, fixed = true)` with `v = x + 1` left x(0) = 0). =#
+    _hasExplicitFixedStart(sv.attributes) && continue
     _containsDerCallDAE(rhs) && continue
     local rhsNames = OrderedSet{String}()
     collectCrefNames!(rhsNames, rhs)

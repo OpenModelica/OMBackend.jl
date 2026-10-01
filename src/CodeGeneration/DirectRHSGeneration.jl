@@ -168,7 +168,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   # 3. Build u0 and parameter vectors in the correct ordering.
   #    Resolve parameter values first so _buildStateVector can substitute
   #    symbolic parameter references in initial conditions.
-  local resolvedParams = _resolveParamValues(pars)
+  local resolvedParams = _resolveParamValues(pars; used = Set{String}(string.(params)))
   #= Parameters an initialization equation defines (fixed = false): assigned
      from u at the initial state (in the DAE init solve, at each evaluation).
      A row may read another assigned parameter: evaluating again settles a
@@ -260,10 +260,12 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   #    names from integrator.f.sys (used by getStatesAsSymbols/getParametersAsSymbols).
   local massMatrix = ModelingToolkit.calculate_massmatrix(reducedSystem)
   local problem
-  #= A pure ODE with free parameters, or with derivative initial equations
-     on observed variables, needs the init solve too: M = I. =#
+  #= A pure ODE with free parameters, with derivative initial equations, or
+     with ones whose value is not a number (`y = 2*x`), needs the init solve
+     too: M = I. Without it they were left out (u0 the start values). =#
   if massMatrix isa LinearAlgebra.UniformScaling && isempty(freeIdx) &&
-     isempty(first(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=initResolved)))
+     isempty(first(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=initResolved))) &&
+     !_hasSolvedInitializationRows(reducedSystem; resolvedParams=initResolved)
     @debug "DirectRHS: pure ODE (identity mass matrix)"
     local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
                                       sys=reducedSystem, jacFunc=jacFunc, jacProto=jacProto,
@@ -353,12 +355,11 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        unknown i). =#
     local needAlg = !isempty(algDerTargets) ||
       (obsDer !== nothing && any(j -> j <= obsDer[4] && mm[j, j] == 0, obsDer[3]))
-    if needAlg && (jacFunc === nothing || !LinearAlgebra.isdiag(mm))
-      @warn "DirectRHS: derivative initial equations on algebraic or observed variables left out (no symbolic Jacobian or a non-diagonal mass matrix)"
-      empty!(algDerTargets)
-      obsDer = nothing
-      needAlg = false
-    end
+    #= They were left out with a warning (MSL Fluid MomentumBalanceFittings,
+       HeatExchangerSimulation, which then failed at the simulation anyway). =#
+    needAlg && (jacFunc === nothing || !LinearAlgebra.isdiag(mm)) &&
+      OMBackend.unsupported("derivative initial equations on algebraic or observed variables without a symbolic Jacobian or with a non-diagonal mass matrix",
+                            length(algDerTargets))
     local ftAlg = needAlg ? _explicitTimeDerivative(rhs_list[algIdx], states, params, iv) : nothing
     local derRowsAt = (isempty(algDerTargets) && obsDer === nothing) ? nothing : let
       local pos = Dict(i => k for (k, i) in enumerate(algIdx))
@@ -413,11 +414,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local parts = Any[]
     for (label, rowsAt) in (("symbolic initialization", symRowsAt), ("derivative", derRowsAt))
       rowsAt === nothing && continue
-      if probeRows(rowsAt)
-        push!(parts, rowsAt)
-      else
-        @warn "DirectRHS: $(label) initial-equation rows failed their probe at the entry guesses; left out"
-      end
+      #= A part not finite at the entry guesses was left out with a warning
+         (MSL AIMC_withLosses, which then failed anyway). =#
+      probeRows(rowsAt) || OMBackend.unsupported("$(label) initial-equation rows not finite at the entry guesses", label)
+      push!(parts, rowsAt)
     end
     if !isempty(parts)
       residualsAt = length(parts) == 1 ? parts[1] :
@@ -542,6 +542,19 @@ function _collectHardInitializationValues(reducedSystem, finalInitialValues;
   return (values, constraintKeys)
 end
 
+
+#= Whether an initialization equation needs a solve: one that is not a start
+   value `x = v`, a variable of the system and a number (a derivative row,
+   `y = 2*x`, `2*x = 4`). =#
+function _hasSolvedInitializationRows(reducedSystem; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)::Bool
+  local variables = Set{String}(string(v) for v in Iterators.flatten((ModelingToolkit.unknowns(reducedSystem),
+                                                                      ModelingToolkit.parameters(reducedSystem),
+                                                                      (o.lhs for o in ModelingToolkit.observed(reducedSystem)))))
+  return any(ModelingToolkit.initialization_equations(reducedSystem)) do eq
+    startswith(string(eq.lhs), "Differential(") || !(string(eq.lhs) in variables) ||
+      _tryToFloat64(eq.rhs; resolvedParams=resolvedParams) === nothing
+  end
+end
 
 function _literalNumericValue(val)
   local raw = val
@@ -1585,7 +1598,7 @@ function _buildParamVector(params, pars; resolvedParams::Union{Dict{String,Float
 
   # Resolve parameter values by iterative substitution (reuse if already done)
   if resolvedParams === nothing
-    resolvedParams = _resolveParamValues(pars)
+    resolvedParams = _resolveParamValues(pars; used = Set{String}(string.(params)))
   end
 
   local matched = 0
@@ -1670,13 +1683,14 @@ end
 
 
 """
-    _resolveParamValues(pars)
+    _resolveParamValues(pars; used = nothing)
 
 Resolve parameter values by iteratively substituting known numeric values
 into symbolic parameter expressions. Returns a Dict{String, Float64}
-mapping parameter names to their numeric values.
+mapping parameter names to their numeric values. One of `used` (the system's
+parameters, by name; all when nothing) that does not resolve is refused.
 """
-function _resolveParamValues(pars)
+function _resolveParamValues(pars; used::Union{Nothing, Set{String}} = nothing)
   # Separate numeric and symbolic parameter values
   local numericByStr = Dict{String, Float64}()
   local symbolicByKey = Vector{Tuple{Any, Any, String}}()  # (unwrapped_key, unwrapped_val, str_key)
@@ -1831,14 +1845,12 @@ function _resolveParamValues(pars)
     @debug "DirectRHS: resolved $(newlyResolved) more params in iteration $(iteration) ($(length(remaining)) remaining)"
   end
 
-  if !isempty(symbolicByKey)
-    local unresolvedNames = [kStr for (_, _, kStr) in symbolicByKey]
-    local unresolvedVals = [string(uv) for (_, uv, _) in symbolicByKey]
-    @warn "DirectRHS: $(length(symbolicByKey)) parameters could not be resolved to numeric values, defaulting to 0.0" unresolvedNames unresolvedVals
-    for (_, _, kStr) in symbolicByKey
-      numericByStr[kStr] = 0.0
-    end
-  end
+  #= A parameter of the system (`used`) without a (finite) number would be 0.0
+     in the simulation: refused. =#
+  local unresolved = filter(e -> used === nothing || e[3] in used, symbolicByKey)
+  isempty(unresolved) ||
+    OMBackend.unsupported("parameters that do not resolve to finite numbers",
+                          join(("$(kStr) = $(uv)" for (_, uv, kStr) in unresolved), ", "))
 
   return numericByStr
 end
@@ -2102,6 +2114,13 @@ function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=
   catch _e
     OMBackend._fallback(_e, :_tryToFloat64_1)
     return nothing
+  end
+  #= A start value reading time: the build's start time, 0 (u0 is built once;
+     _startTimeGuard refuses another start time). It was 0.0 with a warning. =#
+  local timeVars = filter(v -> string(v) == "t", freeVars)
+  if !isempty(timeVars)
+    return _tryToFloat64(Symbolics.substitute(unwrapped, Dict{Any, Any}(v => 0.0 for v in timeVars));
+                         resolvedParams = resolvedParams)
   end
   if isempty(freeVars)
     local str = string(val)
