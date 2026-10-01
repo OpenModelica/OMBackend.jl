@@ -237,6 +237,7 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
      opened). =#
   if !isempty(equations) && !isempty(variables)
     local _discParamConst = _collectParamOrConstNames(variables, varNames)
+    booleanizeWhenRelations!(equations, variables, varNames, _discParamConst)
     local _discStarts = _discreteStartExpLookup(variables, varNames)
     local (_discEqs, _discLifted) = synthesizeWhenEquationsFromDiscreteEquations(equations, _discParamConst, _discStarts;
                                                                                initialConstants = _initialConstants(initialEquations, _discParamConst))

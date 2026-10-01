@@ -83,6 +83,112 @@ Base.@nospecializeinfer function _buildChangeOrConditionFromExps(rels::Vector{DA
   return acc
 end
 
+#= A when-condition that combines relations (`x > 0.3 and y > 0.5`, `x < 0.2 or
+   x > 0.6`, `not x > 0.5`) fires when the combination becomes true, its
+   relations read at their crossings (MLS 8.5). The callbacks have a crossing
+   for one relation: a combination became `e1 - e2`, with missed and spurious
+   firings. Each relation of such a condition with a continuous operand becomes
+   a Boolean variable defined by it (`__whenConditionK = x > 0.3`): the lift
+   below gives the relation its crossing, and the when is on Booleans, fired on
+   an edge. A single relation (or-ed with initial()) keeps its own lowering, a
+   buffered relation. Left alone: conditions with sample() or terminal(), and
+   relations calling pre(), edge() or change() (self-scheduling time whens).
+   A vector of triggers `{c1, c2}` fires at each element's rising edge (the
+   OR of edge(ck), simulationCodeTransformation _vectorTrigger): an element
+   that is not a Boolean variable becomes one defined by it (edge() of a
+   relation or of `not u` read the current value, and a vector on relations
+   went to the discrete clusters, which wrote a Real target as 0/1). =#
+function booleanizeWhenRelations!(equations::Vector{BDAE.Equation}, variables::Vector{BDAE.VAR},
+                                  varNames::Vector{String}, paramOrConstNames::OrderedSet{String})
+  any(eq -> eq isa BDAE.WHEN_EQUATION && _anyWhenArm(_needsConditionBooleans, eq), equations) || return nothing
+  local taken = Set{String}(varNames)
+  local count = 0
+  local define = function (e)
+    local name = ""
+    while true
+      count += 1
+      name = "__whenCondition$(count)"
+      name in taken || break
+    end
+    push!(taken, name)
+    local cref = DAE.CREF_IDENT(name, DAE.T_BOOL_DEFAULT, nil)
+    push!(variables, BDAE.VAR(cref, BDAE.DISCRETE(), DAE.T_BOOL_DEFAULT))
+    push!(varNames, name)
+    local lhs = DAE.CREF(cref, DAE.T_BOOL_DEFAULT)
+    push!(equations, BDAE.EQUATION(lhs, e, DAE.emptyElementSource, BDAE.NO_ATTRIBUTES()))
+    return lhs
+  end
+  local rewrite = nothing
+  rewrite = function (e)
+    @match e begin
+      DAE.LBINARY(e1, op, e2) => DAE.LBINARY(rewrite(e1), op, rewrite(e2))
+      DAE.LUNARY(op, e1) => DAE.LUNARY(op, rewrite(e1))
+      DAE.RELATION(__) where (_relationHasContinuousOperand(e, paramOrConstNames) &&
+                              !_callsAnyOf(e, ("pre", "edge", "change"))) => define(e)
+      _ => e
+    end
+  end
+  local rewriteCondition = function (cond)
+    cond isa DAE.ARRAY &&
+      return DAE.ARRAY(cond.ty, cond.scalar, MetaModelica.list((_isTriggerAtom(e) ? e : define(e) for e in cond.array)...))
+    return _isCompoundWhenCondition(cond) ? rewrite(cond) : cond
+  end
+  local rewriteWhen = nothing
+  rewriteWhen = function (weq::BDAE.WHEN_EQUATION)
+    local w = weq.whenEquation
+    local elsewhen = w.elsewhenPart === nothing ? nothing : SOME(rewriteWhen(w.elsewhenPart.data))
+    return BDAE.WHEN_EQUATION(weq.size, BDAE.WHEN_STMTS(rewriteCondition(w.condition), w.whenStmtLst, elsewhen),
+                              weq.source, weq.attr)
+  end
+  for i in eachindex(equations)
+    equations[i] isa BDAE.WHEN_EQUATION && (equations[i] = rewriteWhen(equations[i]))
+  end
+  return nothing
+end
+
+#= Whether a when-condition gets Boolean variables: a compound one, or a vector
+   with an element that is not a trigger itself. =#
+_needsConditionBooleans(@nospecialize(cond))::Bool =
+  cond isa DAE.ARRAY ? !all(_isTriggerAtom, cond.array) : _isCompoundWhenCondition(cond)
+
+#= An element of a vector of triggers kept as it is: a Boolean variable, a
+   constant, initial(), sample(), and an expression reading pre(), edge() or
+   change() (the MSL tables' self-scheduling `time >= pre(nextTimeEvent)`). =#
+_isTriggerAtom(@nospecialize(e))::Bool =
+  e isa DAE.CREF || e isa DAE.BCONST || (e isa DAE.CALL && e.path isa Absyn.IDENT &&
+                                         e.path.name in ("initial", "sample")) ||
+  _callsAnyOf(e, ("pre", "edge", "change"))
+
+#= Whether any arm (the when or an elsewhen) satisfies pred. =#
+function _anyWhenArm(pred, weq::BDAE.WHEN_EQUATION)::Bool
+  pred(weq.whenEquation.condition) && return true
+  local e = weq.whenEquation.elsewhenPart
+  return e !== nothing && _anyWhenArm(pred, e.data)
+end
+
+#= A when-condition combining relations: an and/or/not, an initial() disjunct
+   aside, without sample() or terminal(). =#
+function _isCompoundWhenCondition(@nospecialize(cond))::Bool
+  _callsAnyOf(cond, ("sample", "terminal")) && return false
+  local core = cond
+  while core isa DAE.LBINARY && core.operator isa DAE.OR
+    if _isInitialCall(core.exp1)
+      core = core.exp2
+    elseif _isInitialCall(core.exp2)
+      core = core.exp1
+    else
+      break
+    end
+  end
+  return core isa DAE.LBINARY || core isa DAE.LUNARY
+end
+
+function _callsAnyOf(@nospecialize(exp), names)::Bool
+  local found = false
+  Util.traverseExpBottomUp(exp, (e, arg) -> (e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name in names && (found = true); (e, arg)), nothing)
+  return found
+end
+
 #= The variables a lifted body reads through pre(), edge() or change(), once each. =#
 function _preReadCrefs(body::Vector{Tuple{DAE.Exp, DAE.Exp, Any}})::Vector{DAE.Exp}
   local found = DAE.Exp[]

@@ -758,7 +758,7 @@ _isWhenAssert(@nospecialize(st)) = st isa BDAE.ASSERT || st isa SimulationCode.A
 _uncheckedWhenAssert(@nospecialize(st)) =
   @warn "[MTK GEN: when] an assert in a when on a buffered relation or a self-scheduling time when is not checked" condition = string(SimulationCode.toDAEExp(st.condition))
 
-#= Gather a synthesized when cluster's ordered (discreteSymbol, rhsDAE, isInteger)
+#= Gather a synthesized when cluster's ordered (discreteSymbol, rhsDAE, isNumeric)
    assignments; `nothing` when it assigns nothing. A single-member cluster has
    one entry; a coupled FSM cluster has the body in topological order. The
    cluster paths are the only ones for such a when (createCallbackCode), so
@@ -775,13 +775,17 @@ function _gatherClusterAssigns(weq, simCode)
     haskey(simCode.stringToSimVarHT, leftStr) ||
       unsupported("an assignment to a non-variable in a when on a buffered relation (a discrete cluster)", st)
     local (_, var) = simCode.stringToSimVarHT[leftStr]
-    #= By the attributes, else by the type of the assigned cref or value: an
-       alias elimination can make an attribute-less variable (a gate's Logic
-       input) the member that a clock's `y = if ... then '0' else '1'` sets. =#
+    #= Numeric (else Boolean) by the attributes, else by the type of the
+       assigned cref or value: an alias elimination can make an attribute-less
+       variable (a gate's Logic input) the member that a clock's `y = if ...
+       then '0' else '1'` sets. A Real target was written as 0/1. =#
+    local leftDAE = SimulationCode.toDAEExp(st.left)
     local isInt = @match var.attributes begin
       SOME(DAE.VAR_ATTR_INT(__)) => true
       SOME(DAE.VAR_ATTR_ENUMERATION(__)) => true
-      _ => _isIntegralValued(SimulationCode.toDAEExp(st.left)) || _isIntegralValued(SimulationCode.toDAEExp(st.right))
+      SOME(DAE.VAR_ATTR_REAL(__)) => true
+      _ => _isIntegralValued(leftDAE) || _isIntegralValued(SimulationCode.toDAEExp(st.right)) ||
+        (leftDAE isa DAE.CREF && leftDAE.ty isa DAE.T_REAL)
     end
     push!(assigns, (Symbol(string(var.name)), SimulationCode.toDAEExp(st.right), isInt))
   end

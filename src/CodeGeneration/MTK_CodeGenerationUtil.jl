@@ -150,11 +150,13 @@ function _preValueLookup(@nospecialize(arg::DAE.Exp), simCode; cachedChange::Boo
       end
       #= States and discretes both live on the integrator's state vector;
          the surrounding callback codegen has populated `lookuptableStates`
-         with `Symbol(name) => index`. =#
+         with `Symbol(name) => index`. Read through the integrator: the
+         affect binds the model's variables by name, and one named `x`
+         replaced the state vector `x` (a BoundsError). =#
       if cachedChange
         return :(get(_changePreValues,
                      Symbol($(string(sv.name))),
-                     x[lookuptableStates[Symbol($(string(sv.name)))]]))
+                     integrator.u[lookuptableStates[Symbol($(string(sv.name)))]]))
       end
       :(integrator.uprev[lookuptableStates[Symbol($(string(sv.name)))]])
     end

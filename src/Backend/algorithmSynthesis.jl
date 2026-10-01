@@ -1368,17 +1368,25 @@ _isInitialCall(@nospecialize(e)) = e isa DAE.CALL && e.path isa Absyn.IDENT && e
    `DAE.STMT_WHEN` that appears inside a regular (non-when) algorithm body.
    Every assignment in each branch body is lifted (continuous and discrete
    alike — inside a `when` all LHS are event-updated), `if` guards become
-   IFEXP-conditional assigns, and the array condition `{c1, c2}` is OR-folded
-   to a scalar. `initial()` is substituted to `false` for the runtime arm.
+   IFEXP-conditional assigns, and an array condition `{c1, c2}` stays one.
+   `initial()` is substituted to `false` for the runtime arm.
    Assigned LHS names accumulate into `allLhs`. Returns the WHEN_EQUATION or
    `nothing` if the branch contributes no operators. =#
 Base.@nospecializeinfer function _stmtWhenToBdaeWhenEquation(@nospecialize(stmtWhen),
                                                              allLhs::OrderedSet{String})
-  local cond = nothing
-  for e in _whenConditionMembers(stmtWhen.exp)
-    cond = _orCondition(cond, _prepareAlgorithmExp(e, Dict{String, Int}(), false))
+  #= A vector `{c1, c2}` stays one (each element's edge fires it, the shared
+     fold in simulationCodeTransformation); OR-folded, it fired on the OR's
+     edge only. initial() is false here: no trigger. =#
+  local members = Any[_prepareAlgorithmExp(e, Dict{String, Int}(), false) for e in _whenConditionMembers(stmtWhen.exp)]
+  filter!(m -> !(m isa DAE.BCONST && !m.bool), members)
+  local cond = if isempty(members)
+    DAE.BCONST(false)
+  elseif length(members) == 1 || !(stmtWhen.exp isa DAE.ARRAY)
+    foldl(_orCondition, members)
+  else
+    DAE.ARRAY(DAE.T_ARRAY(DAE.T_BOOL_DEFAULT, MetaModelica.list(DAE.DIM_INTEGER(length(members)))), false,
+              MetaModelica.list(members...))
   end
-  cond === nothing && (cond = DAE.BCONST(true))
   #= A branch that never runs here (`when initial()`: false after the start)
      contributes nothing; its body is the initial lowering's. =#
   local (ops, lhs) = cond isa DAE.BCONST && !cond.bool ? (BDAE.WhenOperator[], OrderedSet{String}()) :

@@ -817,17 +817,39 @@ function _hasMixedInitialCondition(cond::DAE.Exp)::Bool
 end
 
 #= Drop the `initial()` triggers from an array-form condition, returning the
-   residual runtime trigger: the lone relation if one remains, otherwise an
-   OR-chain over the survivors. =#
+   residual runtime trigger (_vectorTrigger), or nothing. =#
 function _stripInitialTriggers(cond::DAE.Exp)::Union{DAE.Exp, Nothing}
   @match cond begin
     DAE.ARRAY(_, _, lst) => begin
       local rest = filter(e -> !_isPureInitialCondition(e), collect(lst))
-      isempty(rest) ? nothing :
-        foldl((a, b) -> DAE.LBINARY(a, DAE.OR(DAE.T_BOOL_DEFAULT), b), rest)
+      isempty(rest) ? nothing : _vectorTrigger(rest)
     end
     _ => cond
   end
+end
+
+#= A vector of triggers `{c1, ..., cn}` as one condition. The when fires at
+   each element's own rising edge (MLS 8.3.5), so with several elements each
+   is `edge(c)` (an event call, sample() or change(), as it is): `c1 or c2`
+   rises once while c1 stays true, and the array itself, never folded, was
+   always true (MSL MathInteger.TriggeredAdd's `{trigger, local_reset}` ran
+   its body after every step). One element is itself. =#
+function _vectorTrigger(elements::Vector)::DAE.Exp
+  length(elements) == 1 && return only(elements)
+  local edgeOf = e -> (e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name in ("sample", "change", "edge")) ? e :
+    DAE.CALL(Absyn.IDENT("edge"), MetaModelica.list(e), DAE.callAttrBuiltinBool)
+  return foldl((a, b) -> DAE.LBINARY(a, DAE.OR(DAE.T_BOOL_DEFAULT), b), map(edgeOf, elements))
+end
+
+#= A when-equation with its vector conditions (the elsewhens' too) as single ones. =#
+function _foldVectorTriggers(weq::BDAE.WHEN_EQUATION)::BDAE.WHEN_EQUATION
+  local w = weq.whenEquation
+  local cond = w.condition isa DAE.ARRAY ? _vectorTrigger(collect(w.condition.array)) : w.condition
+  local elsewhen = @match w.elsewhenPart begin
+    SOME(e) => SOME(_foldVectorTriggers(e))
+    _ => w.elsewhenPart
+  end
+  return BDAE.WHEN_EQUATION(weq.size, BDAE.WHEN_STMTS(cond, w.whenStmtLst, elsewhen), weq.source, weq.attr)
 end
 
 _isSampleCallDAE(@nospecialize(e))::Bool = e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "sample"
@@ -879,26 +901,33 @@ keeps a runtime when carrying the non-initial triggers. Others pass through.
 function extractInitialWhenAlgorithms(whenEqs::Vector{BDAE.WHEN_EQUATION})::Tuple{Vector{BDAE.WHEN_EQUATION}, Vector{INITIAL_ALGORITHM}}
   local kept = BDAE.WHEN_EQUATION[]
   local initialAlgs = INITIAL_ALGORITHM[]
-  for weq in whenEqs
+  local visit = nothing
+  #= `afterInitial`: an elsewhen arm of a pure `when initial()`, which takes the
+     initialization: the arm's initial() never fires (it ran at the start too). =#
+  visit = function (weq::BDAE.WHEN_EQUATION; afterInitial::Bool = false)
     local cond = weq.whenEquation.condition
     if _isPureInitialCondition(cond)
-      local stmts = collect(weq.whenEquation.whenStmtLst)
-      push!(initialAlgs, INITIAL_ALGORITHM(stmts))
+      afterInitial || push!(initialAlgs, INITIAL_ALGORITHM(collect(weq.whenEquation.whenStmtLst)))
+      #= initial() is false after initialization: the elsewhen arms are the
+         runtime when (`when initial() then .. elsewhen c then ..`). =#
+      local elsewhen = weq.whenEquation.elsewhenPart
+      elsewhen === nothing || visit(elsewhen.data; afterInitial = true)
     elseif _hasMixedInitialCondition(cond)
       local stmts = collect(weq.whenEquation.whenStmtLst)
-      push!(initialAlgs, INITIAL_ALGORITHM(stmts))
+      afterInitial || push!(initialAlgs, INITIAL_ALGORITHM(stmts))
       #= The runtime arm on the other triggers: the MSL ZeroOrderHold's
          `when {sampleTrigger, initial()}` samples at every sampleTrigger. =#
       local runtimeCond = _stripInitialTriggers(cond)
       if runtimeCond !== nothing
         local inner = BDAE.WHEN_STMTS(runtimeCond, weq.whenEquation.whenStmtLst,
                                       weq.whenEquation.elsewhenPart)
-        push!(kept, BDAE.WHEN_EQUATION(weq.size, inner, weq.source, weq.attr))
+        push!(kept, _foldVectorTriggers(BDAE.WHEN_EQUATION(weq.size, inner, weq.source, weq.attr)))
       end
     else
-      push!(kept, weq)
+      push!(kept, _foldVectorTriggers(weq))
     end
   end
+  foreach(visit, whenEqs)
   return (kept, initialAlgs)
 end
 
