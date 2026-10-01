@@ -2547,16 +2547,17 @@ end
 # TODO: unify cref resolution into one function consulting both the SimCode
 # (state / numeric-param lookup tables) and the module-level bindings (String
 # parameters, data structures), so callers need not special-case the latter.
-function getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode)
-  local crefAsStr = string(x)
+getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode) = getIdxForLookupMTK(string(x), simCode)
+
+function getIdxForLookupMTK(crefAsStr::String, simCode)
   if crefAsStr == "time"
     return :t
   end
   @match _, simVar = simCode.stringToSimVarHT[crefAsStr]
   if !(SimulationCode.isParameter(simVar))
-    Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(string(x))))))
+    Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(crefAsStr)))))
   else
-    Expr(:call, getindex, :p, Expr(:call, :getindex, :lookuptableParams, :(Symbol($(string(x))))))
+    Expr(:call, getindex, :p, Expr(:call, :getindex, :lookuptableParams, :(Symbol($(crefAsStr)))))
   end
 end
 

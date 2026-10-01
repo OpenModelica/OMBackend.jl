@@ -346,6 +346,10 @@ references would over-trigger). The `time` cref is also filtered out — its
 This is the Modelica-spec-correct lowering of Logic-enum algorithms like
 INV3S's `nextstate := Buf3sTable[...]; yy := nextstate;` and resolves the
 INV3S/MUX2x1/NRXFER/NXFER/BUF3S cluster-A validate failures.
+
+An algorithm of `when` statements only is lifted too, each statement to its
+WHEN_EQUATION(s) (a `when sample(...)`; after a first branch `when initial()`,
+which `synthesizeInitialWhenFromAlgorithms` lifts, its `elsewhen` arms).
 """
 function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
                                                       paramOrConstNames::OrderedSet{String} = OrderedSet{String}())
@@ -354,8 +358,6 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
   for alg in algorithms
     local statements = alg.statements
     isempty(statements) && continue
-    #= Skip whole algorithm if every top-level statement is ALG_WHEN — those are
-       already lifted to (INITIAL_)WHEN_EQUATION by the companion synth pass. =#
     local hasNonWhen = false
     for stmt in statements
       if !isvariant(stmt, OMFrontend.Frontend.ALG_WHEN)
@@ -363,12 +365,33 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
         break
       end
     end
-    hasNonWhen || continue
     local daeStmts = try
       OMFrontend.Frontend.convertStatements(statements)
     catch err
       #= An algorithm the frontend cannot convert is left out. =#
       OMBackend._fallback(err, :convertAlgorithmWhens; impact = :result)
+      continue
+    end
+    #= An algorithm of whens only: the companion pass
+       (synthesizeInitialWhenFromAlgorithms) lifts a first branch that is
+       `when initial()`; the rest is lifted here, or it was lost: a when on
+       another condition (a sample, a time relation) and the elsewhen arms
+       after `when initial()` (MSL GenerateRandomNumbers' samples). =#
+    if !hasNonWhen
+      for s in daeStmts
+        s isa DAE.STMT_WHEN || continue
+        if _isInitialCall(s.exp)
+          @match s.elseWhen begin
+            SOME(esw) => begin
+              local weq = _stmtWhenToBdaeWhenEquation(esw, liftedLhsNames)
+              weq !== nothing && push!(out, weq)
+            end
+            _ => nothing
+          end
+        else
+          _liftStmtWhenToWhenEquations!(out, s, liftedLhsNames)
+        end
+      end
       continue
     end
     #= Sources.Table / Step / Pulse / Clock have an unrolled body of the shape
@@ -1072,6 +1095,8 @@ Base.@nospecializeinfer function _expMentionsInitial(@nospecialize(exp))::Bool
   Util.traverseExpBottomUp(exp, visit, nothing)
   return found
 end
+
+_isInitialCall(@nospecialize(e)) = e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "initial"
 
 #= Build a runtime `BDAE.WHEN_EQUATION` (with chained elsewhen) from a
    `DAE.STMT_WHEN` that appears inside a regular (non-when) algorithm body.

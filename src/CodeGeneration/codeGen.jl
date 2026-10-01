@@ -181,21 +181,51 @@ function createEquations(equations::Vector{T}, simCode::SimulationCode.SIM_CODE)
 end
 
 
+#= The lookups of the variables name[1], name[2], ... (none when name[1] is
+   not a variable). =#
+function _scalarizedElementLookups(name::String, simCode)::Vector{Any}
+  local elems = Any[]
+  local key = string(name, "[1]")
+  while haskey(simCode.stringToSimVarHT, key)
+    push!(elems, getIdxForLookupMTK(key, simCode))
+    key = string(name, "[", length(elems) + 1, "]")
+  end
+  return elems
+end
+
+#= The names the when callbacks bind themselves: a variable binding of the
+   same name would replace them. =#
+const _WHEN_CALLBACK_LOCALS = ("x", "p", "t", "integrator", "lookuptableStates", "lookuptableParams")
+
 #= Build `name = <state/param lookup index>` pre-bindings for the crefs a when
-   callback reads. Skips crefs absent from the simvar table: those are inlined
-   constants (e.g. a logic ResetMap[i] element) that expToJulia emits as literals,
-   so requesting a state/param index for them would KeyError in getIdxForLookupMTK. =#
+   callback reads, one per name. A cref absent from the simvar table is an
+   inlined constant (e.g. a logic ResetMap[i] element) that expToJulia emits as
+   a literal, and gets none (a state/param index for it would KeyError in
+   getIdxForLookupMTK), unless it is a whole array of variables: then the
+   vector of their values (MSL GenerateRandomNumbers' when reads pre(state64),
+   a discrete Integer[2]). =#
 function _whenLookupBindings(crefs, simCode)::Vector{Expr}
   local out = Expr[]
+  local seen = Set{String}()
   for x in collect(map(identity, crefs))
-    local entry = get(simCode.stringToSimVarHT, string(x), nothing)
-    entry === nothing && continue
+    local name = string(x)
+    name in seen && continue
+    push!(seen, name)
+    local entry = get(simCode.stringToSimVarHT, name, nothing)
+    if entry === nothing
+      local elems = _scalarizedElementLookups(name, simCode)
+      isempty(elems) && continue
+      name in _WHEN_CALLBACK_LOCALS &&
+        OMBackend.unsupported("a when reading the whole array $(name) (a name the event callback uses itself)", x)
+      push!(out, Expr(:(=), Symbol(name), Expr(:vect, elems...)))
+      continue
+    end
     #= String simvars live as module-level bindings, never as state or MTK
        parameter slots; an index binding here would KeyError at runtime. =#
     if OMBackend.envSwitch("OMBACKEND_WHEN_STRING_SKIP")
       entry[2].varKind isa SimulationCode.STRING && continue
     end
-    push!(out, Expr(:(=), Symbol(string(x)), getIdxForLookupMTK(x, simCode)))
+    push!(out, Expr(:(=), Symbol(name), getIdxForLookupMTK(x, simCode)))
   end
   return out
 end
