@@ -256,6 +256,7 @@ end
    generation takes it for a cluster with no relation (_collectChangeRelations!)
    and never evaluates it (the event iteration runs the body at every pass). =#
 function _buildChangeOfPreCondition(held::Vector{DAE.Exp})
+  isempty(held) && OMBackend.unsupported("a discrete cluster without relations or variables it follows", "")
   local preOf(c) = DAE.CALL(Absyn.IDENT("pre"), MetaModelica.list(c), DAE.callAttrBuiltinBool)
   local acc = _makeChangeCallExp(preOf(held[1]))
   for i in 2:length(held)
@@ -445,10 +446,15 @@ end
 #= Replace every bare (outside-pre) occurrence of a sibling cref with its
    already-inlined RHS. pre(sibling) is left untouched so it keeps reading the
    pre-event held value. =#
+#= Not inside edge() or change() either: they read pre() of their argument,
+   which must stay a variable (`edge(trig.y)` inlined to `edge(sample(...))`
+   left no variable to follow, and `edge(b > 0.5)` could not be lowered: the
+   MSL Edge and Change blocks were refused). The body is in topological order:
+   edge(v) of a sibling reads its new value and its pre(). =#
 Base.@nospecializeinfer function _inlineSiblingsOutsidePre(@nospecialize(exp::DAE.Exp), subst::Dict{String, DAE.Exp})
   function f(@nospecialize(e), arg)
     @match e begin
-      DAE.CALL(Absyn.IDENT("pre"), _, _) => (e, false, arg)
+      DAE.CALL(Absyn.IDENT(n), _, _) where n in ("pre", "edge", "change") => (e, false, arg)
       DAE.CREF(cr, _) => begin
         local nm = string(cr)
         haskey(subst, nm) ? (subst[nm], false, arg) : (e, true, arg)
@@ -609,7 +615,12 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
      auxiliary_n from the inputs) stays residual: lifted, it changed only
      when an event iteration ran, and the gates stayed at 'U'. =#
   local held = isempty(rels) ? _preReadCrefs(body) : DAE.Exp[]
-  if isempty(rels) && (isempty(held) || !_preReadsCloseLoop(held, members, candByName, otherRefs, canon))
+  #= A residual has no change() or edge(): `ch = change(k)` was false throughout
+     (a `when ch` never fired; OpenModelica: true at k's events). Lifted, the
+     event iteration evaluates it at every pass: true at k's event, false at the
+     next pass. =#
+  local eventCalls = isempty(rels) && any(b -> _callsAnyOf(b[2], ("edge", "change")), body)
+  if isempty(rels) && !eventCalls && (isempty(held) || !_preReadsCloseLoop(held, members, candByName, otherRefs, canon))
     for n in cluster; push!(out, candByName[n].eq); end
     return
   end
