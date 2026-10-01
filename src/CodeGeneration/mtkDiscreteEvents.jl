@@ -472,6 +472,9 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
        (canonicalName -> underscore form), args lowered imperatively. =#
     DAE.CALL(path = p, expLst = cargs) =>
       Expr(:call, Symbol(OMBackend.canonicalName(string(p))), (rec(a) for a in cargs)...)
+    #= An element of a multi-output call (a tuple assignment split per target:
+       MSL TimeTable's (a, b, ...) := getInterpolationCoefficients(...)). =#
+    DAE.TSUB(e, ix, _) => :(getindex($(rec(e)), $(ix)))
     _ => throw(_UnsupportedInAffect(exp))
   end
 end

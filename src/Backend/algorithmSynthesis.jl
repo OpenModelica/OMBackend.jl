@@ -801,6 +801,18 @@ Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenO
                                    nested, initialValue, allowContinuous) || return false
         end
       end
+      #= (a, b, ...) := f(...) (MSL TimeTable's when: (a, b, nextEventScaled,
+         last) := getInterpolationCoefficients(...); dropped, the table output
+         had no definition). f runs once per target: an impure f is not
+         supported. =#
+      DAE.STMT_TUPLE_ASSIGN(_, targets, rhs, src) => begin
+        (rhs isa DAE.CALL && rhs.attr.isImpure) &&
+          OMBackend.unsupported("a tuple assignment from an impure function", rhs)
+        for (target, element) in _tupleAssignElements(targets, rhs)
+          _emitAlgorithmAssignOps!(ops, liftedLhsNames, target, element, target.ty, src,
+                                   activeCond, iterVals, initialValue, allowContinuous) || return false
+        end
+      end
       DAE.STMT_WHEN(__) => nothing
       DAE.STMT_ASSERT(__) => nothing
       DAE.STMT_NORETCALL(__) => nothing
@@ -808,6 +820,53 @@ Base.@nospecializeinfer function _appendAlgorithmStmtOps!(ops::Vector{BDAE.WhenO
     end
   end
   return true
+end
+
+#= `(a, b, ...) := f(...)` as one assignment per target of its element of f's
+   result, in the order they run. Each evaluates f again after the ones
+   before it have assigned their targets, so a target f reads (outside pre())
+   goes last and f sees its old value in every element: `(s, y) := step(s, u)`
+   gave y the step from the new s. A second such target, or one assigned
+   element by element (an array, a record), cannot be last: not supported. =#
+function _tupleAssignElements(@nospecialize(targets), @nospecialize(rhs))::Vector{Tuple{DAE.Exp, DAE.Exp}}
+  local read = _crefNamesOutsidePre(rhs)
+  local plain = Tuple{DAE.Exp, DAE.Exp}[]
+  local readBack = Tuple{DAE.Exp, DAE.Exp}[]
+  for (k, target) in enumerate(targets)
+    target isa DAE.CREF ||
+      OMBackend.unsupported("a tuple assignment to a target that is not a variable", target)
+    target.componentRef isa DAE.WILD && continue
+    local element = (target, DAE.TSUB(rhs, k, target.ty))
+    local name = string(target.componentRef)
+    if any(r -> _crefNamesOverlap(r, name), read)
+      (target.ty isa DAE.T_ARRAY || target.ty isa DAE.T_COMPLEX) &&
+        OMBackend.unsupported("a tuple assignment whose function reads the array or record target $(name)", rhs)
+      push!(readBack, element)
+    else
+      push!(plain, element)
+    end
+  end
+  length(readBack) > 1 && OMBackend.unsupported("a tuple assignment whose function reads two of its targets", rhs)
+  return vcat(plain, readBack)
+end
+
+#= The names of the crefs e reads, those inside pre() (the value before the
+   event) left out. =#
+function _crefNamesOutsidePre(@nospecialize(e))::Vector{String}
+  local visit = (x, acc) -> begin
+    (x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name == "pre") && return (x, false, acc)
+    x isa DAE.CREF && push!(acc, string(x.componentRef))
+    return (x, true, acc)
+  end
+  return last(Util.traverseExpTopDown(e, visit, String[]))
+end
+
+#= Whether a and b name the same variable or one a part of the other
+   (`buf` and `buf[2]`, `r` and `r.x`). =#
+function _crefNamesOverlap(a::String, b::String)::Bool
+  local (short, long) = length(a) <= length(b) ? (a, b) : (b, a)
+  startswith(long, short) || return false
+  return length(long) == length(short) || long[nextind(long, lastindex(short))] in ('[', '.')
 end
 
 Base.@nospecializeinfer function _buildAlgorithmBodyOps(@nospecialize(daeStmts),

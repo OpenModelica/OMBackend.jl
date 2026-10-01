@@ -974,6 +974,15 @@ function _appendStmtsToOps!(ops::Vector, daeStmts)
   for s in daeStmts
     @match s begin
       DAE.STMT_ASSIGN(_, e1, e, src) => push!(ops, BDAE.ASSIGN(e1, e, src))
+      #= (a, b, ...) := f(...): each target its element of f's result. These
+         ops name what the algorithm assigns; the generated code runs the
+         algorithm's DAE statements (_INIT_ALG_DAE_STMTS), which call f once. =#
+      DAE.STMT_TUPLE_ASSIGN(_, targets, e, src) => begin
+        for (k, target) in enumerate(targets)
+          (target isa DAE.CREF && !(target.componentRef isa DAE.WILD)) || continue
+          push!(ops, BDAE.ASSIGN(target, DAE.TSUB(e, k, target.ty), src))
+        end
+      end
       DAE.STMT_NORETCALL(exp, src) => push!(ops, BDAE.NORETCALL(exp, src))
       DAE.STMT_ASSERT(c, m, l, src) => push!(ops, BDAE.ASSERT(c, m, l, src))
       DAE.STMT_TERMINATE(m, src) => push!(ops, BDAE.TERMINATE(m, src))
