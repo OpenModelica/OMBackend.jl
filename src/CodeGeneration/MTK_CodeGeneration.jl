@@ -233,7 +233,7 @@ eliminate. Sources:
 1. `simCode.irreducibleVariables` — names the SimCode pass already flagged.
 2. The LHS of every `ifEq_tmpN ~ ifelse(...)` conditional equation —
    if MTK eliminates the LHS, the if-equation lowering breaks.
-3. Variables with `fixed = true` and an explicit start value — the init
+3. Variables with `fixed = true` (a start, or the default one) — the init
    constraint emitted by `getFixedStartConstraintsMTK` must land on a
    surviving unknown, so the symbol cannot be torn.
 
@@ -1542,13 +1542,12 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE,
      a UndefVarError at module eval time (observed in DCEE_Start/DCPM_Start,
      where `wMechanical` is referenced by sibling eliminated equations). =#
   local allElimSymbols = Symbol[Symbol(v) for v in elimVars]
-  #= Skip generating the observed equation (solve_for + push) for pairs whose
-     residual contains a der() call. The solved form would be
-     `elimVar ~ Differential(t)(x)`, which MTK rejects when it later builds
-     the initialization system via the iv-less 3-arg
-     `System(eqs, vars, ps)` constructor (validate_operator fails with
-     OperatorIndepvarMismatchError). These eliminated variables are state
-     derivatives whose values are already exposed by MTK's solution object. =#
+  #= A residual with a der() call: solved as `elimVar ~ Differential(t)(x)`
+     it is rejected when MTK builds the initialization system with the iv-less
+     3-arg `System(eqs, vars, ps)` constructor (validate_operator:
+     OperatorIndepvarMismatchError). der(x) is replaced by the right side of
+     x's explicit equation (substituteDerivatives); without one the variable
+     is left out. =#
   #= Names already emitted by `generateAliasObservedBlock` from `aliasMap`
      have a direct `elim ~ rep` observed equation. Re-deriving the same
      observation here via `solve_for(0 ~ residual, elim)` is redundant and
@@ -1560,16 +1559,24 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE,
   local solveBodyExprs = Expr[]
   for i in _eliminatedDependencyOrder(elimVars, elimEqs)
     local varName = elimVars[i]
-    if containsDerCall(SimulationCode.toDAEExp(elimEqs[i].exp))
-      continue
-    end
-    if varName in aliasNames
-      continue
-    end
+    varName in aliasNames && continue
     local elimSym = Symbol(varName)
     local residualExpr = expToJuliaExpMTK(elimEqs[i].exp, simCode; derSymbol = false)
     if !isempty(relayAliases)
       residualExpr = _substSyms(residualExpr, relayAliases)
+    end
+    if containsDerCall(SimulationCode.toDAEExp(elimEqs[i].exp))
+      #= `a = der(x)`: der(x) by its explicit equation `D(x) ~ f` (the system's
+         equations, `eqs`). It was left out: `a` was in no result (an
+         acceleration sensor's output, OpenModelica has it). Without such an
+         equation, as before: left out. =#
+      push!(solveBodyExprs, quote
+        local _elimResidual = OMBackend.CodeGeneration.substituteDerivatives($(residualExpr), eqs)
+        if _elimResidual !== nothing
+          push!(_elimObsEqs, $(elimSym) ~ Symbolics.solve_for(0 ~ _elimResidual, $(elimSym)))
+        end
+      end)
+      continue
     end
     push!(solveBodyExprs, quote
       local _elimResidual = $(residualExpr)
@@ -1591,7 +1598,7 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE,
     eval(_elimBatch)
     #= Solve residuals and create observed equations. Wrapped in a function
        + invokelatest to handle world-age from the preceding eval. Variables
-       whose residual contained a der() are skipped here but still have
+       whose der() has no explicit equation are skipped here but still have
        bindings above, so any sibling residual referencing them resolves. =#
     function _solveEliminatedObserved()
       local _elimObsEqs = Symbolics.Equation[]
