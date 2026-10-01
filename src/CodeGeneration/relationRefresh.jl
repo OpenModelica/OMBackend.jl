@@ -599,7 +599,9 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
   kept = Any[cb isa DiffEqBase.DiscreteCallback ? _markingPending(cb, pending) : cb for cb in kept]
   local cb = DiffEqBase.DiscreteCallback((u, t, integrator) -> pending[] || _needsIteration(e, integrator),
                                          integrator -> (local p = pending[]; pending[] = false; _iterate!(e, integrator, p));
-                                         initialize = (c, u, t, integrator) -> _initialize!(e, integrator),
+                                         #= A solve that ended in an exception can have left
+                                            `pending` set: a spurious iteration in the next. =#
+                                         initialize = (c, u, t, integrator) -> (pending[] = false; _initialize!(e, integrator)),
                                          #= The state after the iteration, at the event's time
                                             (the when callbacks saved the left limit). The
                                             iteration solves the algebraic variables itself. =#
