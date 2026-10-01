@@ -690,11 +690,15 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     println(buf, "=== END DEBUG ===")
     OMBackend.debugWrite(OMBackend.logPath("backend/simCode", "elimination_debug.log"), String(take!(buf)))
   end
+  #= Added to the pairs earlier passes eliminated (the explicit fold, frozen
+     states): replaced, those variables lost their observed equations and
+     could not be read from the solution (codegen orders the observed
+     equations by what they read: _eliminatedDependencyOrder). =#
   @assign begin
     simCode.residualEquations = newResEqs
     simCode.stringToSimVarHT = newHT
-    simCode.eliminatedEquations = elimPairedEqs
-    simCode.eliminatedVariables = elimPairedVars
+    simCode.eliminatedEquations = vcat(simCode.eliminatedEquations, elimPairedEqs)
+    simCode.eliminatedVariables = vcat(simCode.eliminatedVariables, elimPairedVars)
   end
   return simCode
 end

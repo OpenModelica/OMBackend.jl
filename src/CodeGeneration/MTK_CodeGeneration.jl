@@ -1487,6 +1487,45 @@ function generateAliasObservedBlock(simCode::SimulationCode.SIM_CODE,
   end
 end
 
+#= The eliminated pairs in an order where each equation comes after the
+   eliminated variables it reads (the observed equations are evaluated in
+   order). The passes append their pairs one after another, and an earlier
+   pair can read a later one's variable (the fold's `total` reading the
+   output-only `v[2]`, a name of the second alias pass). Depth first, with a
+   stack (a long chain); a cycle is broken where the search entered it. =#
+function _eliminatedDependencyOrder(elimVars::Vector{String}, elimEqs::Vector)::Vector{Int}
+  local position = Dict(v => i for (i, v) in enumerate(elimVars))
+  local reads = map(elimEqs) do eq
+    local names = OrderedSet{String}()
+    SimulationCode.collectCrefNames!(names, eq.exp)
+    Int[position[n] for n in names if haskey(position, n)]
+  end
+  local order = Int[]
+  local state = zeros(Int8, length(elimVars))  #= 0 new, 1 on the stack, 2 placed =#
+  local stack = Tuple{Int, Int}[]               #= (pair, its next read) =#
+  for root in eachindex(elimVars)
+    state[root] == 0 || continue
+    state[root] = 1
+    push!(stack, (root, 1))
+    while !isempty(stack)
+      local (i, k) = stack[end]
+      if k <= length(reads[i])
+        stack[end] = (i, k + 1)
+        local j = reads[i][k]
+        if state[j] == 0
+          state[j] = 1
+          push!(stack, (j, 1))
+        end
+      else
+        pop!(stack)
+        state[i] = 2
+        push!(order, i)
+      end
+    end
+  end
+  return order
+end
+
 function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE,
                                          relayAliases::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
   if isempty(simCode.eliminatedVariables)
@@ -1518,7 +1557,8 @@ function generateEliminatedObservedBlock(simCode::SimulationCode.SIM_CODE,
   local aliasNames = OrderedSet{String}(entry.eliminatedName for entry in simCode.aliasMap)
   union!(aliasNames, string.(keys(relayAliases)))
   local solveBodyExprs = Expr[]
-  for (i, varName) in enumerate(elimVars)
+  for i in _eliminatedDependencyOrder(elimVars, elimEqs)
+    local varName = elimVars[i]
     if containsDerCall(SimulationCode.toDAEExp(elimEqs[i].exp))
       continue
     end

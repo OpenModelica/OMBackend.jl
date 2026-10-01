@@ -650,8 +650,17 @@ function eliminateAliasVariables(simCode::SIM_CODE)
      a name that no longer exists in `stringToSimVarHT`. =#
   local elimVarSet = OrderedSet{String}(elimVarNames)
   @assign simCode.irreducibleVariables = filter(n -> !(n in elimVarSet), simCode.irreducibleVariables)
+  #= The earlier eliminated equations (an output-only or a fold pair) can read
+     names eliminated here: substituted, as eliminateRHSEquivalentEquations
+     does (codegen otherwise resolves them through aliasMap, one scan and a
+     warning per read). =#
+  local elimEqs = simCode.eliminatedEquations
+  for i in eachindex(elimEqs)
+    local (newExp, _) = traverseExpTopDown(elimEqs[i].exp, substituteAliasCref, aliasMap)
+    elimEqs[i] = typeof(elimEqs[i])(newExp, elimEqs[i].source, elimEqs[i].attr)
+  end
   #= Append eliminated equations/variables to the existing lists =#
-  append!(simCode.eliminatedEquations, pairedElimEqs)
+  append!(elimEqs, pairedElimEqs)
   append!(simCode.eliminatedVariables, pairedElimVarNames)
   return simCode
 end
