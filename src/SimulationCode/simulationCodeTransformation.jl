@@ -386,6 +386,11 @@ function createSimCodeStructuralTransitions(structuralTransitions::Vector{ST}) w
   return transitions
 end
 
+#= A branch without equations: none, or if-equations without any (left by
+   the assert hoisting). =#
+_holdsNoEquations(body)::Bool =
+  all(eq -> eq isa BDAE.IF_EQUATION && all(_holdsNoEquations, eq.eqnstrue) && _holdsNoEquations(eq.eqnsfalse), body)
+
 """
   Given a set of BDAE IF_EQUATIONS.
   Constructs the set of simulation-code if-equations.
@@ -415,6 +420,14 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
       end
     end
     local conditions = BDAE_ifEquation.conditions
+    #= No else: no equations either (their numbers must match; the asserts
+       were hoisted in BDAECreate), so nothing to lower. It was a `break`,
+       which dropped every if-equation after this one. =#
+    if listEmpty(BDAE_ifEquation.eqnsfalse)
+      all(_holdsNoEquations, BDAE_ifEquation.eqnstrue) ||
+        OMBackend.unsupported("an if-equation without else whose branches have equations", toSimExp(listHead(conditions)))
+      continue
+    end
     local condition
     local equations
     local target
@@ -477,10 +490,6 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
       The condition for the else branch to be inactive is active
       if all preceding branches failed to evaluate to true.
     =#
-    #= Check if we have an else if not we are done.=#
-    if listEmpty(BDAE_ifEquation.eqnsfalse)
-      break
-    end
     condition = SCONST("ELSE_BRANCH")
     #= Same defensive filtering as the eqnstrue path above. =#
     local rawElseBranch = listArray(BDAE_ifEquation.eqnsfalse)

@@ -506,9 +506,16 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
     local sym = Symbol(name)
     return :( $(sym) = $(lowerAlg(wStmt.value)); LATEST_PROBLEM[$(QuoteNode(sym))] = $(sym); nothing )
   elseif wStmt isa BDAE.ASSERT || wStmt isa SimulationCode.ASSERT
+    #= On the initialization's values: AssertionLevel.error stops the
+       simulation, as an equation's assert does (it only warned). =#
     local cond = lowerAlg(wStmt.condition)
     local msg = lowerAlg(wStmt.message)
-    return :(if !($cond); @warn "Modelica assert() during init" message=$(msg); end)
+    local level = wStmt.level isa SimulationCode.Exp ? SimulationCode.toDAEExp(wStmt.level) : wStmt.level
+    local condText = string(wStmt.condition isa SimulationCode.Exp ? SimulationCode.toDAEExp(wStmt.condition) : wStmt.condition)
+    local violated = AlgorithmicCodeGeneration.isWarningAssertionLevel(level) ?
+      :(@warn string("Assertion violated at the initialization: ", $(msg))) :
+      :(throw(OMBackend.CodeGeneration.ModelicaAssertionError(LATEST_PROBLEM.tspan[1], string($(msg)), $(condText))))
+    return :(if !($cond); $(violated); end; nothing)
   elseif wStmt isa BDAE.TERMINATE || wStmt isa SimulationCode.TERMINATE
     local msg = lowerAlg(wStmt.message)
     return :(@info "Modelica terminate() during init" message=$(msg))

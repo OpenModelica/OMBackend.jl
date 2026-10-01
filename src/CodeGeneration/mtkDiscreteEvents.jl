@@ -934,10 +934,8 @@ function emitAssertCallback(simCode)::Expr
   local entries = Expr[]
   for a in simCode.asserts
     local obsAcc = Dict{Symbol,Symbol}()
-    local cond = try
-      #= A call equation for its effects (BDAECreate): run it, it holds. =#
-      _isEffectCall(a.condition) ? :($(_effectCallExpr(a.condition, obsAcc, simCode)); true) :
-                                   _daeBoolMem(a.condition, obsAcc, simCode)
+    local (cond, crossings) = try
+      (_assertConditionExpr(a.condition, obsAcc, simCode), _assertCrossingExprs(a.condition, obsAcc, simCode))
     catch err
       OMBackend._fallback(err, :assertCondition; only = LoweringFailure, impact = :result)
       @warn "[MTK GEN: asserts] an assert cannot be checked at run time; it is left out" condition = string(a.condition) exception = err
@@ -955,13 +953,52 @@ function emitAssertCallback(simCode)::Expr
                                                              (observed, integrator) -> $(cond),
                                                              (observed, integrator) -> $(msg),
                                                              $(AlgorithmicCodeGeneration.isWarningAssertionLevel(a.level)), $(timeVarying),
-                                                             $(string(a.condition)))))
+                                                             $(string(a.condition)),
+                                                             $(Expr(:tuple, (:((observed, integrator) -> $(c)) for c in crossings)...)))))
   end
   isempty(entries) && return Expr(:block)
   return :(callbacks = OMBackend.CodeGeneration.withAssertCallback(callbacks, problem, [$(entries...)]))
 end
 
 _isEffectCall(@nospecialize(e))::Bool = e isa DAE.CALL && e.attr.ty isa DAE.T_NORETCALL
+
+#= The crossings of an assert condition's ordering relations on numbers
+   (`a - b`), where the condition can change within a step (asserts.jl). One
+   is 1.0 where the condition's short-circuit does not reach its relation
+   (`x <= 0 or sqrt(x) < 2`: sqrt(x) of a negative threw). Not under noEvent(),
+   nor inside another expression (a call's argument, a reduction). =#
+function _assertCrossingExprs(@nospecialize(cond), obsAcc::Dict{Symbol,Symbol}, simCode)::Vector{Any}
+  local out = Any[]
+  local both = (r, c) -> r === true ? c : :($(r) && $(c))
+  local walk = nothing
+  walk = function (@nospecialize(e), reached)
+    if e isa DAE.LBINARY && e.operator isa Union{DAE.AND, DAE.OR}
+      walk(e.exp1, reached)
+      local lhs = _daeBoolMem(e.exp1, obsAcc, simCode)
+      walk(e.exp2, both(reached, e.operator isa DAE.AND ? lhs : :(!$(lhs))))
+    elseif e isa DAE.LUNARY
+      walk(e.exp, reached)
+    elseif e isa DAE.IFEXP
+      walk(e.expCond, reached)
+      local c = _daeBoolMem(e.expCond, obsAcc, simCode)
+      walk(e.expThen, both(reached, c))
+      walk(e.expElse, both(reached, :(!$(c))))
+    elseif e isa DAE.RELATION && e.operator isa Union{DAE.LESS, DAE.LESSEQ, DAE.GREATER, DAE.GREATEREQ} &&
+           !(e.operator.ty isa Union{DAE.T_STRING, DAE.T_BOOL})
+      local zc = :(Float64($(_daeExpToJuliaMem(e.exp1, obsAcc, simCode))) - Float64($(_daeExpToJuliaMem(e.exp2, obsAcc, simCode))))
+      push!(out, reached === true ? zc : :($(reached) ? $(zc) : 1.0))
+    end
+    nothing
+  end
+  walk(cond, true)
+  return out
+end
+
+#= An assert's condition; a call equation for its effects (BDAECreate) runs and holds. =#
+function _assertConditionExpr(@nospecialize(cond), obsAcc::Dict{Symbol,Symbol}, simCode)
+  _isEffectCall(cond) && return :($(_effectCallExpr(cond, obsAcc, simCode)); true)
+  return _daeBoolMem(cond, obsAcc, simCode)
+end
 
 #= A call for its effects, its arguments read as values: a String as it is,
    a Boolean decoded from the arithmetic encoding, an array element by

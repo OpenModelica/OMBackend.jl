@@ -1,11 +1,12 @@
 #= Modelica asserts of equation sections and algorithms (outside when-clauses).
 
-   Checked like OpenModelica does: after initialization and after every
-   accepted step, not inside the right-hand side, where rejected trial steps
-   may leave the region the assert guards. An assert that reads only
-   parameters is checked once, after initialization. AssertionLevel.error
-   stops the simulation with a ModelicaAssertionError; AssertionLevel.warning
-   warns once each time the condition becomes false. =#
+   Checked like OpenModelica does: after initialization, after every accepted
+   step and where a relation of the condition crosses (a relation is an event,
+   MLS 3.8.4), not inside the right-hand side, where rejected trial steps may
+   leave the region the assert guards. An assert that reads only parameters is
+   checked once, after initialization. AssertionLevel.error stops the
+   simulation with a ModelicaAssertionError; AssertionLevel.warning warns once
+   each time the condition becomes false. =#
 
 """
     ModelicaAssertionError(time, message, condition)
@@ -23,14 +24,17 @@ Base.showerror(io::IO, e::ModelicaAssertionError) =
   print(io, "ModelicaAssertionError: assertion violated at time ", e.time, ": ", e.message, "\n  condition: ", e.condition)
 
 #= One generated assert: the variables it reads (local name => variable name),
-   the condition and message as functions of those values and the integrator. =#
-struct ModelicaAssert{O <: NamedTuple, C, M}
+   the condition and message as functions of those values and the integrator,
+   and a crossing function per relation of the condition (`a - b` for `a < b`,
+   1.0 where the condition does not reach it; a tuple). =#
+struct ModelicaAssert{O <: NamedTuple, C, M, Z}
   observed::O
   condition::C
   message::M
   warning::Bool
   timeVarying::Bool
   text::String
+  crossings::Z
 end
 
 #= The asserts as one DiscreteCallback, added to `callbacks`. The variables are
@@ -52,31 +56,97 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
   end
   isempty(checks) && return callbacks
   local violated = falses(length(checks))
-  local check! = function (integrator, all::Bool)
-    for (i, (a, getter)) in enumerate(checks)
-      (all || a.timeVarying) || continue
-      if a.condition(_assertValues(a, getter, integrator), integrator)
-        violated[i] = false
-      elseif !(a.warning && violated[i])
-        #= Where in the step it failed, and the message there. =#
-        local τ = all ? integrator.t : _violationTime(a, getter, integrator)
-        local src = τ == integrator.t ? integrator : _stateAt(integrator, τ)
-        local msg = string(a.message(_assertValues(a, getter, src), (t = τ,)))
-        a.warning || throw(ModelicaAssertionError(τ, msg, a.text))
-        @warn "Assertion violated at time $(τ): $(msg)" condition = a.text
+  local report = function (a, getter, integrator, τ)
+    local src = τ == integrator.t ? integrator : _stateAt(integrator, τ)
+    local msg = string(a.message(_assertValues(a, getter, src), (t = τ,)))
+    a.warning || throw(ModelicaAssertionError(τ, msg, a.text))
+    @warn "Assertion violated at time $(τ): $(msg)" condition = a.text
+  end
+  #= A failure just past a crossing, decided at the next check: a relation that
+     touches its boundary (a piston at its top dead center, s_rel = L, MSL
+     Engine1b_analytic) is past it by rounding there and holds again; one that
+     crosses fails halfway to the next check too (reported at the crossing). =#
+  local pending = fill(NaN, length(checks))
+  #= At a step end (`all`: after the initialization, every assert) or at a
+     crossing (the solver's state just past it). A failure at a step end whose
+     relations are crossings came with the step's event: there. =#
+  local checkOne! = function (integrator, i, all::Bool, atCrossing::Bool)
+    local (a, getter) = checks[i]
+    local τp = pending[i]
+    if !isnan(τp) && integrator.t > τp
+      pending[i] = NaN
+      local τm = (τp + integrator.t) / 2
+      local (src, at) = integrator.tprev <= τm ? (_stateAt(integrator, τm), (t = τm,)) : (integrator, integrator)
+      if !a.condition(_assertValues(a, getter, src), at) && !(a.warning && violated[i])
+        report(a, getter, integrator, τp)
         violated[i] = true
+        return nothing
       end
+    end
+    if a.condition(_assertValues(a, getter, integrator), integrator)
+      violated[i] = false
+    elseif !all && (atCrossing || integrator.t == τp)
+      pending[i] = integrator.t
+    elseif !(a.warning && violated[i])
+      local τ = all || !isempty(a.crossings) ? integrator.t : _violationTime(a, getter, integrator)
+      report(a, getter, integrator, τ)
+      violated[i] = true
+    end
+    nothing
+  end
+  local check! = function (integrator, all::Bool)
+    for (i, (a, _)) in enumerate(checks)
+      (all || a.timeVarying) && checkOne!(integrator, i, all, false)
     end
     return false
   end
   local cb = DiffEqBase.DiscreteCallback((u, t, integrator) -> check!(integrator, false), integrator -> nothing;
                                          initialize = function (c, u, t, integrator)
                                            fill!(violated, false)
+                                           fill!(pending, NaN)
                                            check!(integrator, true)
                                            nothing
                                          end,
+                                         #= A failure still pending at the end: decided on the final state. =#
+                                         finalize = function (c, u, t, integrator)
+                                           for (i, (a, getter)) in enumerate(checks)
+                                             isnan(pending[i]) && continue
+                                             a.condition(_assertValues(a, getter, integrator), integrator) ||
+                                               report(a, getter, integrator, pending[i])
+                                             pending[i] = NaN
+                                           end
+                                           nothing
+                                         end,
                                          save_positions = (false, false))
-  return DiffEqBase.CallbackSet(callbacks, cb)
+  #= The relations of the time-varying asserts as crossings, without an
+     effect on the state: a violation that started and ended within a step was
+     missed (x in [0.4, 0.5) between the events at 0.2 and 0.5). The solver
+     finds them on the step's own path, before an event changes the state. =#
+  local crossing = Tuple{Int, Int}[(i, k) for (i, (a, _)) in enumerate(checks) if a.timeVarying for k in eachindex(a.crossings)]
+  isempty(crossing) && return DiffEqBase.CallbackSet(callbacks, cb)
+  local crossingCondition = function (out, u, t, integrator)
+    local src = ModelingToolkit.SymbolicIndexingInterface.ProblemState(; u = u, p = integrator.p, t = t)
+    local j = 0
+    for (a, getter) in checks
+      (a.timeVarying && !isempty(a.crossings)) || continue
+      local values = _assertValues(a, getter, src)
+      for f in a.crossings
+        out[j += 1] = f(values, (t = t,))
+      end
+    end
+    nothing
+  end
+  #= The crossing's index, or (other DiffEqBase versions) the directions of
+     every crossing at this time, 0 for the others. =#
+  local crossingAffect! = function (integrator, which)
+    local fired = which isa Integer ? [which] : [j for (j, d) in enumerate(which) if d != 0]
+    foreach(i -> checkOne!(integrator, i, false, true), unique(first(crossing[j]) for j in fired))
+    DiffEqBase.u_modified!(integrator, false)
+  end
+  local zc = DiffEqBase.VectorContinuousCallback(crossingCondition, crossingAffect!, length(crossing);
+                                                 rootfind = ModelingToolkit.SciMLBase.RightRootFind,
+                                                 save_positions = (false, false))
+  return DiffEqBase.CallbackSet(callbacks, zc, cb)
 end
 
 #= The problem's variables by name: states, observed (eliminated and alias

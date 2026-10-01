@@ -165,6 +165,9 @@ end
    record fields can arrive as integer literals). =#
 _aBool(v) = v isa Bool ? v : (v isa Real ? v != 0 : _AUNK)
 
+#= AssertionLevel.warning (AlgorithmicCodeGeneration.isWarningAssertionLevel). =#
+_isWarningLevel(@nospecialize(level))::Bool = level isa DAE.ENUM_LITERAL && endswith(string(level.name), "warning")
+
 #= The abstract value of a scalar DAE exp in env (a whole array or record,
    and anything not followed, is Unknown). =#
 function _aEval(@nospecialize(e), env::Dict{String, Any}, ctx::_AEvalContext)
@@ -518,8 +521,21 @@ function _aExec!(stmts, env::Dict{String, Any}, ctx::_AEvalContext)
         _aExec!(s.statementLst, env, ctx)
       end
     elseif s isa DAE.STMT_ASSERT
-      #= Dropped with the folded call, as OpenModelica's evalFunc does. =#
-      nothing
+      #= Dropped with the folded call where it holds on the constants. Where it
+         fails, an error-level assert keeps the call unfolded, so that it runs
+         (folded, it was a value), and a warning is reported here, once; where
+         the condition is not known, the call is kept (it was folded). =#
+      local holds = try
+        _aBool(_aEval(s.cond, env, ctx))
+      catch e
+        e isa _ABail || rethrow()
+        nothing
+      end
+      if holds === false && _isWarningLevel(s.level)
+        @warn "an assert (level warning) fails in a call folded at the build" message = string(s.msg)
+      elseif holds !== true
+        throw(_ABail())
+      end
     else
       #= while, return, break, a call for its side effects, terminate,
          reinit, ...: not followed. =#

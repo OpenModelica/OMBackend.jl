@@ -554,6 +554,29 @@ function flattenRecordCallSites(simCode)
     INITIAL_ALGORITHM(WhenOperator[_expandRecordArgsInWhenOp(op) for op in ia.statements],
                       DAE.Statement[Util.mapDAEStatementExps(expandRecordArgsInExp, s) for s in ia.daeStatements])
     for ia in simCode.initialAlgorithms]
+  #= And the asserts: passed whole, a record read a name the simulation does
+     not keep, and the assert was not checked (MSL Machines'
+     brushVoltageDrop(brushParameters, ...), Media's bubbleEnthalpy(medium.sat)). =#
+  @assign simCode.asserts = BDAE.ASSERT_EQUATION[
+    BDAE.ASSERT_EQUATION(expandRecordArgsInExp(a.condition), expandRecordArgsInExp(a.message), a.level, a.source)
+    for a in simCode.asserts]
+  #= And the initial equations: a record argument was passed whole, its
+     fields' names undefined in the initialization (MSL JointRRP's
+     `e_im = resolve2(frame_im.R, ...)`, solved there since a parametric
+     equation reading an unbound parameter goes to the initialization). =#
+  local newInitEqs = typeof(simCode.initialEquations)()
+  for eq in simCode.initialEquations
+    push!(newInitEqs, if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
+      typeof(eq)(expandRecordArgsInExp(toDAEExp(eq.exp)), eq.source, eq.attr)
+    elseif eq isa BDAE.EQUATION
+      BDAE.EQUATION(expandRecordArgsInExp(toDAEExp(eq.lhs)), expandRecordArgsInExp(toDAEExp(eq.rhs)), eq.source, eq.attributes)
+    elseif eq isa EQUATION
+      EQUATION(expandRecordArgsInExp(toDAEExp(eq.lhs)), expandRecordArgsInExp(toDAEExp(eq.rhs)), eq.source, eq.attr)
+    else
+      eq
+    end)
+  end
+  @assign simCode.initialEquations = newInitEqs
   #= Expand record arguments in parameter and array-parameter binding expressions =#
   local ht = simCode.stringToSimVarHT
   for (name, (idx, simVar)) in ht

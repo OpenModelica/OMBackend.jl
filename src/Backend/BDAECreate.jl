@@ -245,9 +245,67 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
     end
     equations = _discEqs
   end
+  equations = _hoistIfEquationAsserts(equations)
   #= TODO Extract the simple equations =#
   local simpleEquations = BDAE.Equation[]
   return BDAE.EQSYSTEM(name, variables, equations, simpleEquations, initialEquations)
+end
+
+#= The asserts in the branches of if-equations, as top-level asserts under the
+   branch's condition (`not guard or c`): the if-equation lowering takes
+   residual equations only and left them out with a warning (MSL Fluid's
+   AST_BatchPlant). =#
+function _hoistIfEquationAsserts(equations::Vector)::Vector
+  any(_hasBranchAssert, equations) || return equations
+  local out = BDAE.Equation[]
+  local asserts = BDAE.Equation[]
+  for eq in equations
+    push!(out, _hasBranchAssert(eq) ? _hoistBranchAsserts!(asserts, eq, nothing) : eq)
+  end
+  return vcat(out, asserts)
+end
+
+_hasBranchAssert(@nospecialize(eq))::Bool =
+  eq isa BDAE.IF_EQUATION &&
+  any(b -> any(e -> e isa BDAE.ASSERT_EQUATION || _hasBranchAssert(e), b), Iterators.flatten((eq.eqnstrue, (eq.eqnsfalse,))))
+
+function _hoistBranchAsserts!(asserts::Vector, ifEq::BDAE.IF_EQUATION, @nospecialize(outerGuard))::BDAE.IF_EQUATION
+  local none = nothing  #= no branch before this one was taken =#
+  local trueEquations::List{List{BDAE.Equation}} = nil
+  for (cond, body) in zip(ifEq.conditions, ifEq.eqnstrue)
+    local guard = _andCondition(outerGuard, _andCondition(none, cond))
+    trueEquations = _equationList(_takeBranchAsserts!(asserts, body, guard)) <| trueEquations
+    none = _andCondition(none, _notCondition(cond))
+  end
+  local falseEquations = _equationList(_takeBranchAsserts!(asserts, ifEq.eqnsfalse, _andCondition(outerGuard, none)))
+  return BDAE.IF_EQUATION(ifEq.conditions, listReverse(trueEquations), falseEquations, ifEq.source, ifEq.attr)
+end
+
+function _equationList(eqs::Vector{BDAE.Equation})::List{BDAE.Equation}
+  local out::List{BDAE.Equation} = nil
+  for eq in Iterators.reverse(eqs)
+    out = eq <| out
+  end
+  return out
+end
+
+#= A branch's equations without its asserts, which go to `asserts` under `guard`. =#
+function _takeBranchAsserts!(asserts::Vector, body, @nospecialize(guard))::Vector{BDAE.Equation}
+  local kept = BDAE.Equation[]
+  for eq in body
+    if eq isa BDAE.ASSERT_EQUATION
+      #= A call for its effects (an assert of its own: _assertConditionExpr) does
+         not reach here: the conversion refuses one in a branch. =#
+      eq.condition isa DAE.CALL && eq.condition.attr.ty isa DAE.T_NORETCALL &&
+        OMBackend.unsupported("a call for its effects in a branch of an if-equation", eq.condition)
+      push!(asserts, BDAE.ASSERT_EQUATION(_orCondition(_notCondition(guard), eq.condition), eq.message, eq.level, eq.source))
+    elseif eq isa BDAE.IF_EQUATION
+      push!(kept, _hoistBranchAsserts!(asserts, eq, guard))
+    else
+      push!(kept, eq)
+    end
+  end
+  return kept
 end
 
 function _crefDepth(cref::DAE.ComponentRef)::Int
