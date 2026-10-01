@@ -386,6 +386,24 @@ function createSimCodeStructuralTransitions(structuralTransitions::Vector{ST}) w
   return transitions
 end
 
+#= The operators of a when body for an initial algorithm, a tuple assignment
+   `(a, b) = f(x)` as one assignment per target (as the algorithm form): the
+   initial-algorithm passes take a variable on the left only, and evaluated
+   and dropped the tuple (a, b = 0, OpenModelica 4, 6). =#
+function _tupleAssignsSplit(ops)::Vector{BDAE.WhenOperator}
+  local out = BDAE.WhenOperator[]
+  for op in ops
+    if op isa BDAE.ASSIGN && op.left isa DAE.TUPLE
+      for (target, value) in Backend.BDAECreate._tupleAssignElements(collect(op.left.PR), op.right)
+        push!(out, BDAE.ASSIGN(target, value, op.source))
+      end
+    else
+      push!(out, op)
+    end
+  end
+  return out
+end
+
 #= A branch without equations: none, or if-equations without any (left by
    the assert hoisting). =#
 _holdsNoEquations(body)::Bool =
@@ -907,14 +925,13 @@ function extractInitialWhenAlgorithms(whenEqs::Vector{BDAE.WHEN_EQUATION})::Tupl
   visit = function (weq::BDAE.WHEN_EQUATION; afterInitial::Bool = false)
     local cond = weq.whenEquation.condition
     if _isPureInitialCondition(cond)
-      afterInitial || push!(initialAlgs, INITIAL_ALGORITHM(collect(weq.whenEquation.whenStmtLst)))
+      afterInitial || push!(initialAlgs, INITIAL_ALGORITHM(_tupleAssignsSplit(weq.whenEquation.whenStmtLst)))
       #= initial() is false after initialization: the elsewhen arms are the
          runtime when (`when initial() then .. elsewhen c then ..`). =#
       local elsewhen = weq.whenEquation.elsewhenPart
       elsewhen === nothing || visit(elsewhen.data; afterInitial = true)
     elseif _hasMixedInitialCondition(cond)
-      local stmts = collect(weq.whenEquation.whenStmtLst)
-      afterInitial || push!(initialAlgs, INITIAL_ALGORITHM(stmts))
+      afterInitial || push!(initialAlgs, INITIAL_ALGORITHM(_tupleAssignsSplit(weq.whenEquation.whenStmtLst)))
       #= The runtime arm on the other triggers: the MSL ZeroOrderHold's
          `when {sampleTrigger, initial()}` samples at every sampleTrigger. =#
       local runtimeCond = _stripInitialTriggers(cond)
