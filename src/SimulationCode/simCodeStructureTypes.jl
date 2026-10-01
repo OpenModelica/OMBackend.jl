@@ -45,10 +45,11 @@ struct TYPE_COMPLEX <: SType
   fieldTypes::Vector{SType}
 end
 
-"Enumeration type. The backend only checks `isa TYPE_ENUM` (the category) — an
-enum type's path/literals are never read off the type (the literal identity lives
-on the `ENUM_LITERAL` Exp) — so this is a marker."
-struct TYPE_ENUM <: SType end
+"Enumeration type: the category, and its literals' names (String of an
+enumeration value names its literal; a tuple, so equal types are `===`)."
+struct TYPE_ENUM <: SType
+  names::Tuple{Vararg{String}}
+end
 
 "Array of `elementType` with integer `dims` (`-1` = unknown/flexible dimension)."
 struct TYPE_ARRAY <: SType
@@ -95,7 +96,7 @@ Base.@nospecializeinfer function toSimType(@nospecialize(ty))::SType
     DAE.T_INTEGER(__) => TYPE_INTEGER()
     DAE.T_BOOL(__)    => TYPE_BOOL()
     DAE.T_STRING(__)  => TYPE_STRING()
-    DAE.T_ENUMERATION(__) => TYPE_ENUM()
+    DAE.T_ENUMERATION(names = ns) => TYPE_ENUM(Tuple(String[n for n in ns]))
     DAE.T_ARRAY(ty = et, dims = ds) => TYPE_ARRAY(toSimType(et), _dimsToSim(ds))
     DAE.T_COMPLEX(cc, vl, _) => begin
       local (ns, ts) = _complexFieldsToSim(vl)
@@ -133,10 +134,11 @@ toDAEType(t::TYPE_COMPLEX)::DAE.Type =
                                                  toDAEType(t.fieldTypes[i]), DAE.UNBOUND(), NONE())
                                    for i in 1:length(t.fieldNames))...),
                 NONE())
-#= path/names are never read off an enum type (only `isa T_ENUMERATION` is),
-   so reconstruct a placeholder that preserves the category for round-trips. =#
-toDAEType(::TYPE_ENUM)::DAE.Type =
-  DAE.T_ENUMERATION(NONE(), Absyn.IDENT("ENUM"), MetaModelica.nil, MetaModelica.nil, MetaModelica.nil)
+#= The path is never read off an enum type: a placeholder. The names are
+   (String of an enumeration value). =#
+toDAEType(t::TYPE_ENUM)::DAE.Type =
+  DAE.T_ENUMERATION(NONE(), Absyn.IDENT("ENUM"), isempty(t.names) ? MetaModelica.nil : MetaModelica.list(t.names...),
+                    MetaModelica.nil, MetaModelica.nil)
 toDAEType(t::TYPE_ARRAY)::DAE.Type =
   DAE.T_ARRAY(toDAEType(t.elementType), _dimsToDAE(t.dims))
 toDAEType(t::TYPE_TUPLE)::DAE.Type =

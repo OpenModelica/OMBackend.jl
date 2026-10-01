@@ -335,6 +335,10 @@ function DAECallExpressionToJuliaCallExpression(pathStr::String, expLst::List, s
     "Integer" => begin
       OMBackend.CodeGeneration.expToJuliaExp(listHead(expLst), simCode, varPrefix=varPrefix)
     end
+    #= Values read from the integrator are Float64s: String takes their types
+       from the expressions. =#
+    "String" => AlgorithmicCodeGeneration.modelicaStringCall(
+      collect(expLst), x -> OMBackend.CodeGeneration.expToJuliaExp(x, simCode, varPrefix=varPrefix))
     _  =>  begin
       argPart = tuple(map((x) -> OMBackend.CodeGeneration.expToJuliaExp(x, simCode, varPrefix=varPrefix), expLst)...)
       #= Mirror DAECallExpressionToMTKCallExpression: route Modelica built-ins

@@ -41,8 +41,8 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
   "mod"       => :modelica_mod,
   "rem"       => :modelica_rem,
 
-  #= --- String formatting --- =#
-  "String"    => :modelica_String,
+  #= String formatting: modelicaStringCall, which takes the argument types from
+     the expressions (the values can arrive as Float64s). =#
 
   #= --- Trigonometric --- =#
   "sin"       => :modelica_sin,
@@ -506,35 +506,91 @@ modelica_delay(expr, delayTime) = expr
 modelica_delay(expr, delayTime, delayMax) = expr
 
 """
-    modelica_String(x[, sigDigits, padding, leftAdjust])
-    modelica_String(x[, minLen, leftAdjust])
+    modelica_String(r::Real, significantDigits, minimumLength, leftJustified)
+    modelica_String(x::Integer, minimumLength, leftJustified)
+    modelica_String(r::Real, format)
 
-Modelica: `String(x, ...)` converts a value to its formatted string form.
-The signature has several variants for Real / Integer / Boolean / Enumeration
-inputs with optional formatting controls. We map all variants to a single
-helper so the per-model module sees a defined function rather than the
-raw Julia `String` constructor (which only accepts byte vectors / pointers
-and rejects `String(::Float64, ::Int64, ::Int64, ::Bool)` etc.).
-
-Returns Julia's `string(x)` representation. Padding / leftAdjust / sigDigits
-are accepted but ignored; the result is sufficient for any downstream use
-that just consumes the digits (e.g. table-name suffixes in Media examples).
+Modelica's `String` (MLS 3.7.2), formatted as OpenModelica does (C's printf,
+its runtime's modelica_string.c): a Real with `significantDigits` significant
+digits (`%.*g`); an Integer or a Boolean (`true`, `false`); at least
+`minimumLength` characters, padded with blanks on the right if
+`leftJustified`, else on the left; or a Real in a C format without its `%`
+(`"8.3f"`: conversion f, e, E, g or G). The frontend fills in the defaults:
+a generated call has every argument (modelicaStringCall, which also gives an
+enumeration value as its literal's name).
 """
-modelica_String(x) = string(x)
-modelica_String(x, sigDigits::Int) = string(x)
-modelica_String(x, sigDigits::Int, minLen::Int) = string(x)
-modelica_String(x, sigDigits::Int, minLen::Int, leftAdjust::Bool) = string(x)
-#= Integer, Boolean and enumeration values: String(x, minimumLength, leftJustified)
-   (MLS 3.7.2), padded with blanks. The MSL ReadRealMatrixFromFile example's
-   String(i, 0, true) had no method. =#
-modelica_String(x::Union{Integer, Bool}, minLen::Int, leftAdjust::Bool = true) =
-  leftAdjust ? rpad(string(x), minLen) : lpad(string(x), minLen)
-#= The same form for an Integer read from the integrator, where it is a Float64
-   (a when body's `assert(n < 3, "n reached " + String(n))`). =#
-modelica_String(x::AbstractFloat, minLen::Int, leftAdjust::Bool) =
-  modelica_String(isinteger(x) ? Int(x) : string(x), minLen, leftAdjust)
-modelica_String(x::AbstractString, minLen::Int, leftAdjust::Bool) =
-  leftAdjust ? rpad(x, minLen) : lpad(x, minLen)
+modelica_String(x::Real, significantDigits::Integer, minimumLength::Integer, leftJustified::Bool) =
+  _cFormat(leftJustified ? "%-*.*g" : "%*.*g", Float64(x); width = minimumLength, precision = significantDigits)
+modelica_String(x::Integer, minimumLength::Integer, leftJustified::Bool) =
+  modelica_String(x isa Bool ? (x ? "true" : "false") : string(x), minimumLength, leftJustified)
+#= An enumeration literal's name. =#
+modelica_String(x::AbstractString, minimumLength::Integer, leftJustified::Bool) =
+  leftJustified ? rpad(x, minimumLength) : lpad(x, minimumLength)
+function modelica_String(x::Real, format::AbstractString)
+  occursin(r"^[#0 +-]*[0-9]*(\.[0-9]*)?[feEgG]$", format) ||
+    throw(ArgumentError("String(r, format = \"$(format)\"): not a format of a Real (flags, width, precision, then f, e, E, g or G)"))
+  return _cFormat("%" * format, Float64(x))
+end
+
+#= C's snprintf of one double, after the width and precision of a `*.*` format. =#
+function _cFormat(fmt::String, x::Float64; width::Union{Integer, Nothing} = nothing, precision::Integer = 0)
+  local n = width === nothing ?
+    @ccall(snprintf(C_NULL::Ptr{UInt8}, 0::Csize_t, fmt::Cstring; x::Cdouble)::Cint) :
+    @ccall(snprintf(C_NULL::Ptr{UInt8}, 0::Csize_t, fmt::Cstring; Cint(width)::Cint, Cint(precision)::Cint, x::Cdouble)::Cint)
+  local buf = Vector{UInt8}(undef, n + 1)
+  width === nothing ?
+    @ccall(snprintf(buf::Ptr{UInt8}, (n + 1)::Csize_t, fmt::Cstring; x::Cdouble)::Cint) :
+    @ccall(snprintf(buf::Ptr{UInt8}, (n + 1)::Csize_t, fmt::Cstring; Cint(width)::Cint, Cint(precision)::Cint, x::Cdouble)::Cint)
+  return String(resize!(buf, n))
+end
+
+#= A call of Modelica's String with the arguments the frontend fills in, each
+   lowered by `lower`: (r, significantDigits, minimumLength, leftJustified),
+   (x, minimumLength, leftJustified) of an Integer, Boolean or enumeration
+   value, or (r, format). Where the integrator holds the values they are
+   Float64s: Integer arguments are rounded, Boolean ones compared with 0, and
+   an enumeration value is its literal's name. =#
+function modelicaStringCall(args::AbstractVector, lower)::Expr
+  local S = :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_String)
+  local int = e -> :(round(Int, $(lower(e))))
+  local bool = e -> :($(lower(e)) != 0)
+  local n = length(args)
+  n == 4 && return Expr(:call, S, lower(args[1]), int(args[2]), int(args[3]), bool(args[4]))
+  n == 2 && return Expr(:call, S, lower(args[1]), lower(args[2]))
+  n == 3 || CodeGeneration.unsupported("String with $(n) arguments", join(string.(args), ", "))
+  local x = args[1]
+  local ty = _daeValueType(x)
+  local value = if x isa DAE.ENUM_LITERAL
+    _lastIdent(x.name)
+  elseif ty isa DAE.T_ENUMERATION && !isempty(ty.names)
+    :($(Tuple(collect(String, ty.names)))[round(Int, $(lower(x)))])
+  elseif ty isa DAE.T_BOOL
+    bool(x)
+  elseif ty isa DAE.T_INTEGER
+    int(x)
+  else
+    CodeGeneration.unsupported("String of a value whose type the expression does not give", string(x))
+  end
+  return Expr(:call, S, value, int(args[2]), bool(args[3]))
+end
+
+#= The type of a DAE expression's value, where the expression carries it. =#
+Base.@nospecializeinfer function _daeValueType(@nospecialize(e))
+  @match e begin
+    DAE.ICONST(__) => DAE.T_INTEGER_DEFAULT
+    DAE.RCONST(__) => DAE.T_REAL_DEFAULT
+    DAE.BCONST(__) || DAE.RELATION(__) || DAE.LBINARY(__) || DAE.LUNARY(__) => DAE.T_BOOL_DEFAULT
+    DAE.CREF(_, ty) => ty
+    DAE.CALL(attr = attr) => attr.ty
+    DAE.CAST(ty, _) => ty
+    DAE.BINARY(_, op, _) => hasproperty(op, :ty) ? op.ty : nothing
+    DAE.UNARY(op, _) => hasproperty(op, :ty) ? op.ty : nothing
+    DAE.IFEXP(_, a, _) => _daeValueType(a)
+    _ => nothing
+  end
+end
+
+_lastIdent(p::Absyn.Path)::String = p isa Absyn.IDENT ? p.name : _lastIdent(p.path)
 
 """
     modelica_homotopy(actual, simplified)

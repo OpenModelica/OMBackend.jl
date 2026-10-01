@@ -447,6 +447,9 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
     "Integer" => begin
       expToJuliaExpMTK(listHead(expLst), simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derAsSymbol)
     end
+    #= A String parameter's binding (createStringParameterAssignments): the
+       argument types from the expressions, not from the values. =#
+    "String" => AlgorithmicCodeGeneration.modelicaStringCall(collect(expLst), x -> expToJuliaExpMTK(x, simCode))
     _  =>  begin
       argPart = tuple(map((x) -> expToJuliaExpMTK(x, simCode), expLst)...)
       #= Check if this is a Modelica built-in with a dedicated Julia implementation =#

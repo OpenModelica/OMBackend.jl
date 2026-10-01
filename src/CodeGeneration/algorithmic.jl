@@ -1332,6 +1332,10 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
            held value; unwrap to the argument, as the MTK expression path does. =#
         expToJuliaExpAlg(first(explst))
       end
+      #= An enumeration value is an Integer here: String takes the literal names
+         from the argument's type. =#
+      DAE.CALL(path = Absyn.IDENT("String"), expLst = explst, attr = attr) where attr.builtin =>
+        modelicaStringCall(collect(explst), expToJuliaExpAlg)
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst, attr = attr)  => begin
         local funcSym = Symbol(tmpStr)
         #= Use Base.invokelatest for non-builtin functions to avoid world-age issues =#

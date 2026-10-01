@@ -464,6 +464,10 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
     end
     DAE.SCONST(str) => str
     DAE.ARRAY(__) => expToJuliaExpMTK(exp, simCode)
+    #= Modelica's String: Julia's String has no such method (an assert
+       message, MSL Media), and the values arrive as numbers. =#
+    DAE.CALL(path = Absyn.IDENT("String"), expLst = cargs, attr = attr) where attr.builtin =>
+      AlgorithmicCodeGeneration.modelicaStringCall(collect(cargs), rec)
     #= External / qualified Modelica function (e.g. CombiTimeTable
        Internal.getNextTimeEvent): mirror the residual's name resolution
        (canonicalName -> underscore form), args lowered imperatively. =#
@@ -1032,16 +1036,24 @@ Base.@nospecializeinfer function _assertMessageExpr(@nospecialize(msg::DAE.Exp),
   local part(@nospecialize e) = @match e begin
     DAE.SCONST(s) => s
     DAE.BINARY(e1, DAE.ADD(__), e2) => :(string($(part(e1)), $(part(e2))))
-    DAE.CALL(Absyn.IDENT("String"), args, _) => :(string($(_daeExpToJuliaMem(listHead(args), obsAcc, simCode))))
+    #= A String parameter is a module-level binding (createStringParameterAssignments),
+       not a variable of the simulation: read through `observed`, the assert was
+       left out as reading a variable the simulation does not keep. =#
+    DAE.CREF(cr, _) where _isStringBinding(string(cr), simCode) =>
+      Symbol(last(simCode.stringToSimVarHT[string(cr)]).name)
     _ => :(string($(_daeExpToJuliaMem(e, obsAcc, simCode))))
   end
   return try
     part(msg)
   catch _e
-    OMBackend._fallback(_e, :assertMessage; only = LoweringFailure)
+    #= The assert is still checked; its message is the Modelica text. =#
+    OMBackend._fallback(_e, :assertMessage; only = LoweringFailure, impact = :result)
     string(msg)
   end
 end
+
+_isStringBinding(name::String, simCode)::Bool =
+  (local e = get(simCode.stringToSimVarHT, name, nothing); e !== nothing && last(e).varKind isa SimulationCode.STRING)
 
 _exprMentionsPrefix(@nospecialize(e), prefix::String) =
   (e isa Symbol && startswith(string(e), prefix)) || (e isa Expr && any(a -> _exprMentionsPrefix(a, prefix), e.args))
