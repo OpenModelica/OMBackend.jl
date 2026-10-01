@@ -484,8 +484,10 @@ function _sweep!(e::EventIteration, integrator, firstSweep::Bool)
   local clusterPre = [_preValues(c, c.values(pre, integrator.p, integrator.t)) for c in e.clusters]
   for pass in 1:e.limit
     local stale = false
+    local passStart = copy(integrator.u)
+    local relationFired = false
     for a in e.relationWhens
-      _whenFire!(a, integrator, pre) && (changed = true; stale = true)
+      _whenFire!(a, integrator, pre) && (changed = true; stale = true; relationFired = true)
     end
     for (i, c) in enumerate(e.clusters)
       c.coupled && stale && (_staleResolve!(integrator, e.reinit); stale = false)
@@ -501,10 +503,11 @@ function _sweep!(e::EventIteration, integrator, firstSweep::Bool)
       d.affect!(integrator, pre)
       changed = fired = true
     end
-    (fired && !isequal(integrator.u, before)) || break
-    #= A discrete when changed a discrete: the relations and the bodies read the new
-       value in this same iteration (MLS 8.6: its equations hold together, with the same
-       pre()). StateGraph's transition has `when enableFire then t_start = time` and
+    ((fired && !isequal(integrator.u, before)) || (relationFired && !isequal(integrator.u, passStart))) || break
+    #= A discrete when (or a when on a relation) changed a discrete: the relations and the
+       bodies read the new value in this same iteration (MLS 8.6: its equations hold
+       together, with the same pre(); `when x > 0.5 then d = 1` and `when x + d > 1.2
+       then y = pre(d)`: y = 0, not the 1 of the next sweep). StateGraph's transition has `when enableFire then t_start = time` and
        `fire = enableFire and time >= t_start + waitTime`: fire is false where the timer
        starts; with the old t_start it fired at once. The algebraic unknowns follow first.
        A when with edge() or an edge latch does not fire again: its affect took the
@@ -635,12 +638,35 @@ end
    initialization used, the algebraic unknowns are solved again (the states
    kept). =#
 function _initialize!(e::EventIteration, integrator)
-  #= A solve started again from the same time (reinit!) does not read the last one's. =#
-  _endInstant!(integrator)
+  #= An affect that ran at the start before this (a sample(0, ...) tick:
+     PeriodicCallback's initial_affect) recorded the state before it. The
+     discrete whens' state (an edge latch) is that state's, and the iteration
+     runs at the start: a when the tick triggers fires there (`when sample(0,
+     0.5) then n = pre(n) + 1` and `when n > 0 then m = pre(n) * 10`: m = 0 from
+     the start, OpenModelica; the latch took n = 1, and the when never fired). =#
+  local before = _instantStateAtStart(integrator)
+  #= Only the values the tick changed: the clusters initialize theirs below
+     (a pulse true from the start is no edge). =#
+  local moved = before === nothing ? Int[] : Int[k for k in eachindex(before) if !isequal(before[k], integrator.u[k])]
   _initializeRelations!(e, integrator)
-  #= The discrete whens' state (an edge latch) from the initialized state. =#
-  foreach(d -> d.initialize!(integrator.u, integrator.t, integrator), e.discreteWhens)
+  local start = integrator.u
+  if !isempty(moved)
+    start = copy(integrator.u)
+    start[moved] = before[moved]
+    _INSTANT_PRE[integrator].u = start
+  end
+  foreach(d -> d.initialize!(start, integrator.t, integrator), e.discreteWhens)
+  isempty(moved) ? _endInstant!(integrator) : _iterate!(e, integrator, true)
   return nothing
+end
+
+#= The holder's state if an affect recorded it at the start of this solve. A
+   holder of an earlier solve from the same time (reinit!) is not read: it
+   was dropped when that solve's iteration ended, or its time is another. =#
+function _instantStateAtStart(integrator)
+  ismutable(integrator) || return nothing
+  local h = get(_INSTANT_PRE, integrator, nothing)
+  return h === nothing || h.t != integrator.t ? nothing : h.u
 end
 
 function _initializeRelations!(e::EventIteration, integrator)
