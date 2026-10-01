@@ -1043,23 +1043,26 @@ function _appendStmtsToOps!(ops::Vector, daeStmts)
       DAE.STMT_NORETCALL(exp, src) => push!(ops, BDAE.NORETCALL(exp, src))
       DAE.STMT_ASSERT(c, m, l, src) => push!(ops, BDAE.ASSERT(c, m, l, src))
       DAE.STMT_TERMINATE(m, src) => push!(ops, BDAE.TERMINATE(m, src))
-      DAE.STMT_REINIT(varExp, value, src) => begin
-        @match varExp begin
-          DAE.CREF(cr, _) => push!(ops, BDAE.REINIT(cr, value, src))
-          _ => nothing
-        end
-      end
-      #= Flatten the body of a FOR / IF / WHILE into the same op list. This is
-         a simplification — sequential semantics of the body are preserved
-         (operators run in order) but the loop/branch structure is lost. For
-         `initial algorithm` bodies that only contain straight-line code over
-         scalar variables this is adequate; bodies that depend on iteration
-         variables (DAE.STMT_FOR) need full lowering, which can be added later. =#
+      DAE.STMT_ASSIGN_ARR(_, lhs, e, src) => push!(ops, BDAE.ASSIGN(lhs, e, src))
+      DAE.STMT_REINIT(varExp, value, src) => varExp isa DAE.CREF && push!(ops, BDAE.REINIT(varExp, value, src))
+      #= The bodies of a FOR / PARFOR / IF (every branch) / WHILE, flattened:
+         the ops name what the algorithm assigns; the generated code runs its
+         DAE statements (BDAEUtil.INIT_ALG_DAE_STMTS), which keep the structure. =#
       DAE.STMT_FOR(_, _, _, _, _, body, _) => _appendStmtsToOps!(ops, body)
-      DAE.STMT_IF(_, tb, _, _) => _appendStmtsToOps!(ops, tb)
+      DAE.STMT_PARFOR(_, _, _, _, _, body, _, _) => _appendStmtsToOps!(ops, body)
+      DAE.STMT_IF(_, tb, else_, _) => (_appendStmtsToOps!(ops, tb); _appendElseStmtsToOps!(ops, else_))
       DAE.STMT_WHILE(_, body, _) => _appendStmtsToOps!(ops, body)
+      #= return, break, continue: nothing assigned. =#
       _ => nothing
     end
+  end
+end
+
+function _appendElseStmtsToOps!(ops::Vector, else_)
+  @match else_ begin
+    DAE.ELSEIF(_, stmts, rest) => (_appendStmtsToOps!(ops, stmts); _appendElseStmtsToOps!(ops, rest))
+    DAE.ELSE(stmts) => _appendStmtsToOps!(ops, stmts)
+    _ => nothing
   end
 end
 

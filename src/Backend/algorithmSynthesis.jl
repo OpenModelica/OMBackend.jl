@@ -15,8 +15,8 @@ function synthesizeFromInitialAlgorithms(iAlgorithms)::Vector{BDAE.Equation}
   local out = BDAE.Equation[]
   for alg in iAlgorithms
     local daeStmts = OMFrontend.Frontend.convertStatements(alg.statements)
+    isempty(daeStmts) && continue
     local whenOps = _daeStmtsToWhenOps(daeStmts)
-    isempty(whenOps) && continue
     local initialCall = DAE.CALL(Absyn.IDENT("initial"),
                                  MetaModelica.list(),
                                  DAE.callAttrBuiltinBool)
@@ -379,18 +379,7 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
        after `when initial()` (MSL GenerateRandomNumbers' samples). =#
     if !hasNonWhen
       for s in daeStmts
-        s isa DAE.STMT_WHEN || continue
-        if _isInitialCall(s.exp)
-          @match s.elseWhen begin
-            SOME(esw) => begin
-              local weq = _stmtWhenToBdaeWhenEquation(esw, liftedLhsNames)
-              weq !== nothing && push!(out, weq)
-            end
-            _ => nothing
-          end
-        else
-          _liftStmtWhenToWhenEquations!(out, s, liftedLhsNames)
-        end
+        s isa DAE.STMT_WHEN && _liftAlgorithmWhenStatement!(out, s, liftedLhsNames)
       end
       continue
     end
@@ -427,9 +416,7 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
        body lifter above skips STMT_WHEN; lift each into a real WHEN_EQUATION
        so its LHS (t_next, y_auxiliary, ...) are actually assigned. =#
     for s in daeStmts
-      if s isa DAE.STMT_WHEN
-        _liftStmtWhenToWhenEquations!(out, s, liftedLhsNames)
-      end
+      s isa DAE.STMT_WHEN && _liftAlgorithmWhenStatement!(out, s, liftedLhsNames)
     end
     #= Per-statement lifting via `_liftAlgAssignToInitialWhen!` and
        `_liftAlgIfToWhen!` covers every shape the cluster-A Digital examples
@@ -439,6 +426,25 @@ function synthesizeWhenEquationsFromRegularAlgorithms(algorithms,
        what the per-statement passes already emit. =#
   end
   return (out, liftedLhsNames)
+end
+
+#= A top-level when statement of an algorithm. A first branch `when initial()`
+   is synthesizeInitialWhenFromAlgorithms' (it runs the DAE statements): here
+   only its elsewhen arms (lifted twice before, its init arm a second node of
+   the same source). Any other when entirely. =#
+function _liftAlgorithmWhenStatement!(out::Vector{BDAE.Equation}, @nospecialize(s), liftedLhsNames::OrderedSet{String})
+  if _isInitialCall(s.exp)
+    @match s.elseWhen begin
+      SOME(esw) => begin
+        local weq = _stmtWhenToBdaeWhenEquation(esw, liftedLhsNames)
+        weq !== nothing && push!(out, weq)
+      end
+      _ => nothing
+    end
+  else
+    _liftStmtWhenToWhenEquations!(out, s, liftedLhsNames)
+  end
+  return nothing
 end
 
 #= The top-level asserts of regular algorithm sections, as assert equations:
