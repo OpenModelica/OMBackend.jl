@@ -190,10 +190,13 @@ modelica_integer(x) = floor(x)
    Our codegen lowers enum CREFs to integer indices and ENUM_LITERAL to its
    `index` field, so this is the identity at the Julia level. =#
 modelica_Integer(x) = x
+#= Truncated toward zero (MLS 3.7.1: div(-7, 2) = -3), as Base.div; a symbolic
+   quotient through sign and floor (it was floor: -4). =#
 modelica_div(x, y) = div(x, y)
-modelica_div(x::Symbolics.Num, y) = floor(x / y)
-modelica_div(x, y::Symbolics.Num) = floor(x / y)
-modelica_div(x::Symbolics.Num, y::Symbolics.Num) = floor(x / y)
+modelica_div(x::Symbolics.Num, y) = _truncSymbolic(x / y)
+modelica_div(x, y::Symbolics.Num) = _truncSymbolic(x / y)
+modelica_div(x::Symbolics.Num, y::Symbolics.Num) = _truncSymbolic(x / y)
+_truncSymbolic(q) = sign(q) * floor(abs(q))
 modelica_mod(x, y) = mod(x, y)
 modelica_rem(x, y) = rem(x, y)
 

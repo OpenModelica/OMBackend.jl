@@ -100,8 +100,9 @@ function flattenRecordParametersInFunction(func::MODELICA_FUNCTION)::MODELICA_FU
   end
 
   #= Flatten outputs =#
+  local inputNames = Set{String}(string(i.componentRef) for i in func.inputs)
   for output in func.outputs
-    flattenedVars = flattenRecordVar(output, recordFieldMap)
+    flattenedVars = flattenRecordVar(output, recordFieldMap; inputNames = inputNames)
     append!(flattenedOutputs, flattenedVars)
   end
 
@@ -149,7 +150,8 @@ end
   Flatten a single variable. If it's a record type, returns multiple variables for each field.
   Otherwise returns the original variable in a vector.
 """
-function flattenRecordVar(v::DAE.VAR, recordFieldMap::Dict{String, Vector{Tuple{String, DAE.Type}}})::Vector{DAE.VAR}
+function flattenRecordVar(v::DAE.VAR, recordFieldMap::Dict{String, Vector{Tuple{String, DAE.Type}}};
+                          inputNames::Set{String} = Set{String}())::Vector{DAE.VAR}
   local baseName = string(v.componentRef)
   #= An array of records (`input Complex u[:]`: ty is the record, dims the array) keeps
      its dimensions on every field: u_re[:], u_im[:]. A dimension may refer to an
@@ -159,7 +161,8 @@ function flattenRecordVar(v::DAE.VAR, recordFieldMap::Dict{String, Vector{Tuple{
     DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _) => begin
       local flattenedVars = DAE.VAR[]
       local fieldInfo = Tuple{String, DAE.Type}[]
-      for field in varLst
+      local fieldNames = String[f.name for f in varLst]
+      for (fieldIndex, field) in enumerate(varLst)
         @match field begin
           DAE.TYPES_VAR(fieldName, _, fieldTy, _, _) => begin
             local flatName = baseName * OMBackend.COMPONENT_SEPARATOR * fieldName
@@ -180,7 +183,7 @@ function flattenRecordVar(v::DAE.VAR, recordFieldMap::Dict{String, Vector{Tuple{
               v.parallelism,
               v.protection,
               varTy,
-              NONE(),  #= No binding for flattened fields =#
+              v.direction isa DAE.OUTPUT ? _outputFieldBinding(v, fieldIndex, field, fieldNames, inputNames, recordFieldMap) : NONE(),
               listAppend(recordDims, fieldDims),
               v.connectorType,
               v.source,
@@ -203,6 +206,44 @@ function flattenRecordVar(v::DAE.VAR, recordFieldMap::Dict{String, Vector{Tuple{
 end
 
 _elementType(@nospecialize(ty::DAE.Type)) = ty isa DAE.T_ARRAY ? _elementType(ty.ty) : ty
+
+#= Where a field of a record output starts (MLS 12.4.4: an output starts at its
+   binding): the record's binding (a constructor's argument for the field, else
+   the field of it), else the field's binding: a modifier of the output, read
+   in the function (`output Complex result(re = re)`: the input re), or a
+   default of the record, its references to other fields renamed to theirs.
+   The fields had none: an output field the body does not assign was 0.0
+   (`record R Real b = 2;` gave r.b = 0). =#
+function _outputFieldBinding(v::DAE.VAR, fieldIndex::Int, field::DAE.TYPES_VAR, fieldNames::Vector{String},
+                             inputNames::Set{String}, recordFieldMap::Dict)
+  if v.binding isa SOME
+    local e = transformExpForFlattenedRecords(v.binding.data, recordFieldMap)
+    local parts = if e isa DAE.RECORD
+      collect(e.exps)
+    elseif e isa DAE.CALL && _isConstructorCall(e)
+      collect(e.expLst)
+    else
+      nothing
+    end
+    return parts !== nothing && length(parts) == length(fieldNames) ? SOME(parts[fieldIndex]) :
+      SOME(DAE.RSUB(e, fieldIndex, field.name, field.ty))
+  end
+  field.binding isa DAE.EQBOUND || return NONE()
+  local base = string(v.componentRef)
+  local (renamed, _) = Util.traverseExpBottomUp(field.binding.exp, (x, acc) -> begin
+      if x isa DAE.CREF && x.componentRef isa DAE.CREF_IDENT && x.componentRef.ident in fieldNames &&
+         !(x.componentRef.ident in inputNames)
+        x = DAE.CREF(DAE.CREF_IDENT(base * OMBackend.COMPONENT_SEPARATOR * x.componentRef.ident, x.ty, MetaModelica.nil), x.ty)
+      end
+      (x, acc)
+    end, nothing)
+  return SOME(transformExpForFlattenedRecords(renamed, recordFieldMap))
+end
+
+#= A call of a record's constructor: its arguments are the fields. =#
+_isConstructorCall(e::DAE.CALL)::Bool =
+  e.attr.ty isa DAE.T_COMPLEX && e.attr.ty.complexClassType isa DAE.ClassInf.RECORD &&
+  string(e.attr.ty.complexClassType.path) == string(e.path)
 
 function _transformDimsForFlattenedRecords(dims::List, recordFieldMap::Dict)::List
   return MetaModelica.list((_transformDimForFlattenedRecords(d, recordFieldMap) for d in dims)...)

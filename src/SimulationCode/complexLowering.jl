@@ -146,16 +146,25 @@ function _complexProjection(@nospecialize(exp))::Union{Nothing, Exp}
        (re, im[, extra]) args. Resolve (re, im) from whichever form. =#
     if (fn == "'abs'" || fn == "abs" || fn == "arg")
       local re, im
+      local phi0 = nothing
       if length(exp.args) >= 2 && _complexParts(exp.args[1]) === nothing
         re = _lowerComplexExp(exp.args[1]); im = _lowerComplexExp(exp.args[2])
+        length(exp.args) >= 3 && (phi0 = _lowerComplexExp(exp.args[3]))
       elseif length(exp.args) >= 1
         local p = _complexParts(exp.args[1]); p === nothing && return nothing
         re = p[1]; im = p[2]
+        length(exp.args) >= 2 && (phi0 = _lowerComplexExp(exp.args[2]))
       else
         return nothing
       end
       if fn == "arg"
-        return CALL(Absyn.IDENT("atan2"), Exp[im, re], exp.attr)
+        local w = CALL(Absyn.IDENT("atan2"), Exp[im, re], exp.attr)
+        (phi0 === nothing || (phi0 isa RCONST && iszero(phi0.value)) || (phi0 isa ICONST && iszero(phi0.value))) && return w
+        #= arg(c, phi0) in (phi0 - pi, phi0 + pi]: MSL Math.atan3, w + 2pi*integer((pi + phi0 - w)/(2pi)).
+           phi0 was dropped (arg(c, 3) gave -2.36 for 3.93). =#
+        local twoPi = RCONST(2pi)
+        local n = CALL(Absyn.IDENT("integer"), Exp[BINARY(_addE(RCONST(Float64(pi)), _subE(phi0, w)), OP_DIV, twoPi)], exp.attr)
+        return _addE(w, _mulE(twoPi, n))
       else
         return BINARY(_addE(BINARY(re, OP_POW, RCONST(2.0)),
                             BINARY(im, OP_POW, RCONST(2.0))), OP_POW, RCONST(0.5))

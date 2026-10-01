@@ -651,8 +651,11 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
          "[TSUB]" + string(e1) + "(" + string(int) + ")"
       end
 
-      DAE.RSUB(exp = e1)  => begin
-        "[RSUB]" + string(e1)
+      #= With the field: this string is an equality key (the alias detection's
+         RHS equivalence, the if-expression lifter's dedup), and r.a and r.b
+         of one record expression had one. =#
+      DAE.RSUB(exp = e1, fieldName = fname)  => begin
+        "[RSUB]" + string(e1) + "." + fname
       end
 
       DAE.SIZE(exp = e1, sz = NONE())  => begin
@@ -667,8 +670,10 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
        "[CODE]"
      end
 
-     DAE.REDUCTION(expr = e1) => begin
-       "[REDUCTION]" + string(e1)
+     #= With the kind and the iterators (an equality key, as RSUB). =#
+     DAE.REDUCTION(reductionInfo = info, expr = e1, iterators = iters) => begin
+       "[REDUCTION " + string(info.path) + "]" + string(e1) + " for " +
+         join((it.id + " in " + string(it.exp) for it in iters), ", ")
      end
 
      DAE.EMPTY(__)  => begin

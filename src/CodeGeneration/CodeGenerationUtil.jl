@@ -223,16 +223,19 @@ function DAE_OP_toJuliaOperator(@nospecialize(op::DAE.Operator))
       DAE.UMINUS_ARR() => :-
       DAE.ADD_ARR() => :+
       DAE.SUB_ARR() => :-
-      DAE.MUL_ARR() => :*
-      DAE.DIV_ARR() => :/
+      #= Element-wise, broadcast (the same on scalars): `*` and `/` were a matrix
+         product and a right division on matrices (function bodies), and an
+         array with a scalar or a scalar with an array had no method. =#
+      DAE.MUL_ARR() => Symbol(".*")
+      DAE.DIV_ARR() => Symbol("./")
       DAE.MUL_ARRAY_SCALAR() => :*
-      DAE.ADD_ARRAY_SCALAR() => :+
-      DAE.SUB_SCALAR_ARRAY() =>  :-
+      DAE.ADD_ARRAY_SCALAR() => Symbol(".+")
+      DAE.SUB_SCALAR_ARRAY() => Symbol(".-")
       #= Julia's `*` has no vector-vector method; also right for scalars. =#
       DAE.MUL_SCALAR_PRODUCT() => :(OMBackend.CodeGeneration.vectorDot)
       DAE.MUL_MATRIX_PRODUCT() => :*
       DAE.DIV_ARRAY_SCALAR() => :/
-      DAE.DIV_SCALAR_ARRAY() => :/
+      DAE.DIV_SCALAR_ARRAY() => Symbol("./")
       DAE.POW_ARRAY_SCALAR() => Symbol(".^")
       DAE.POW_SCALAR_ARRAY() => Symbol(".^")
       DAE.POW_ARR() => :^

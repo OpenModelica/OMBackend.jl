@@ -1163,23 +1163,16 @@ function _expandReductionElems(bodyExp::DAE.Exp, iterators)::Union{Vector{DAE.Ex
     end
     _ => return nothing
   end
-  local startVal::Int = 0
-  local stepVal::Int = 1
-  local stopVal::Int = 0
-  @match rangeExp begin
-    DAE.RANGE(_, DAE.ICONST(s), NONE(), DAE.ICONST(e)) => begin
-      startVal = s
-      stopVal = e
-    end
-    DAE.RANGE(_, DAE.ICONST(s), SOME(DAE.ICONST(st)), DAE.ICONST(e)) => begin
-      startVal = s
-      stepVal = st
-      stopVal = e
-    end
-    _ => return nothing
+  local values = @match rangeExp begin
+    DAE.RANGE(_, DAE.ICONST(s), NONE(), DAE.ICONST(e)) => s:e
+    DAE.RANGE(_, DAE.ICONST(s), SOME(DAE.ICONST(st)), DAE.ICONST(e)) => st == 0 ? nothing : s:st:e
+    #= An array of Integer literals (`for i in {1, 3}`): it was left unexpanded,
+       its iterator an unresolved name. =#
+    DAE.ARRAY(_, _, es) where all(e -> e isa DAE.ICONST, es) => Int[e.integer for e in es]
+    _ => nothing
   end
-  stepVal == 0 && return nothing
-  return DAE.Exp[substituteIteratorInExp(bodyExp, iterId, i) for i in startVal:stepVal:stopVal]
+  values === nothing && return nothing
+  return DAE.Exp[substituteIteratorInExp(bodyExp, iterId, i) for i in values]
 end
 
 function _callAttrType(@nospecialize(attr))

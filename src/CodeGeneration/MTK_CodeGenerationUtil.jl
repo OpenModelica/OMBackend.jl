@@ -368,6 +368,13 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
         DAE.RCONST(_) => quote 0.0 end
         DAE.ICONST(_) => quote 0 end
         DAE.BCONST(_) => quote false end
+        #= der(-x) = -der(x): the name was taken through the minus (x grew for
+           der(-x) = 1). =#
+        DAE.UNARY(DAE.UMINUS(__), inner) => begin
+          local d = DAECallExpressionToMTKCallExpression("der", Cons(inner, MetaModelica.nil), simCode, ht;
+                                                         varPrefix=varPrefix, varSuffix=varSuffix, derAsSymbol=derAsSymbol)
+          :(-($(d)))
+        end
         #= der of an expression: an initial equation der(w) = 0 whose w the
            backend replaced by its definition. Differentiated later (the init
            solve's derivative rows on observed expressions). =#

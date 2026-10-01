@@ -351,13 +351,19 @@ function _aFunction(f::MODELICA_FUNCTION, args::Vector{Any}, ctx::_AEvalContext)
       end
     end
     for v in f.outputs
-      #= As the generated code (generateOutputDefaults): outputs start at
-         0.0 / 0 / false, their bindings are not used. =#
+      #= As the generated code (generateOutputDefaults): an output starts at its
+         binding, else at 0.0 / 0 / false. The binding was not used: an output
+         the body does not assign folded to 0, also on unknown inputs
+         (`f(time)`, MSL Media). =#
       _aIsArrayVar(v) && continue
       local name = _aVarName(v, env, ctx)
-      v.ty isa DAE.T_REAL && (env[name] = 0.0)
-      v.ty isa DAE.T_INTEGER && (env[name] = 0)
-      v.ty isa DAE.T_BOOL && (env[name] = false)
+      if v.binding isa SOME
+        env[name] = _aEval(v.binding.data, env, ctx)
+      else
+        v.ty isa DAE.T_REAL && (env[name] = 0.0)
+        v.ty isa DAE.T_INTEGER && (env[name] = 0)
+        v.ty isa DAE.T_BOOL && (env[name] = false)
+      end
     end
     for v in f.locals
       (_aIsArrayVar(v) || !(v.binding isa SOME)) && continue
