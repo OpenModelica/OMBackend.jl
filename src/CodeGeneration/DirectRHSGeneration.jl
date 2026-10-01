@@ -146,28 +146,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
           "this is typically a residual issue from MTK structural_simplify.")
   end
 
-  # Handle empty systems (0 unknowns after structural_simplify).
-  # Use a dummy 1-element state so the ODE solver does not reject an empty range.
-  if nStates == 0
-    @debug "DirectRHS: empty system (0 unknowns), building trivial dummy problem"
-    local emptyRHS = (du, u, p, t) -> (du[1] = 0.0)
-    local f0 = ModelingToolkit.ODEFunction{true}(emptyRHS)
-    return ModelingToolkit.ODEProblem{true}(f0, [0.0], tspan, Float64[]; callback=callbacks)
-  end
-
-  # 1. Build the RHS function expression from symbolic equations
-  local rhs_list = [eq.rhs for eq in eqs]
-  local f_ip_expr = _buildRHSExpression(rhs_list, states, params, iv)
-
-  # Dump the actual generated RHS expression — see MTKDump.
-  dumpRHSExpression(rhs_list, f_ip_expr)
-
-  # 2. Create world-age-safe function via RuntimeGeneratedFunction
-  local rhsFunc = _exprToRTGFunction(f_ip_expr)
-
-  # 3. Build u0 and parameter vectors in the correct ordering.
-  #    Resolve parameter values first so _buildStateVector can substitute
-  #    symbolic parameter references in initial conditions.
+  # Resolve parameter values first: _buildStateVector substitutes symbolic
+  # parameter references in initial conditions, and an empty system needs
+  # only them.
   local resolvedParams = _resolveParamValues(pars; used = Set{String}(string.(params)))
   #= Parameters an initialization equation defines (fixed = false): assigned
      from u at the initial state (in the DAE init solve, at each evaluation).
@@ -199,22 +180,6 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       nothing
     end
   end
-  #= The initialization constraints read those as unknowns, not as the values
-     resolved from their start values: `x = k` must hold for the solved k. =#
-  local initResolved = isempty(unknownParamNames) ? resolvedParams :
-    Dict{String, Float64}(k => v for (k, v) in resolvedParams if !(k in unknownParamNames))
-  # Extract guesses from the reduced system. These are properly mapped to
-  # post-simplification unknowns and provide Modelica start values for variables
-  # that splitInitialValues could not map (pre-simplification names do not match).
-  local systemGuesses = ModelingToolkit.guesses(reducedSystem)
-  local (hardInitialValues, initEqPinKeys) = _collectHardInitializationValues(
-    reducedSystem, finalInitialValues; resolvedParams=initResolved)
-  local observedEquations = ModelingToolkit.observed(reducedSystem)
-  local u0 = _buildStateVector(states, finalInitialValues; resolvedParams=resolvedParams,
-                                systemGuesses=systemGuesses,
-                                hardInitialValues=hardInitialValues,
-                                observedEquations=observedEquations)
-  local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
   local assignParams! = paramAssign === nothing ? nothing : let (pF, pIdxs) = paramAssign
     (pv, u, t) -> begin
       for _ in 1:length(pIdxs)
@@ -231,6 +196,56 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       nothing
     end
   end
+
+  #= An empty system (0 unknowns after structural_simplify): a dummy 1-element
+     state, so the ODE solver does not reject an empty range, with the system
+     and its parameter values: its observed variables are the whole result (MSL
+     Media Inverse_sine, IdealGasH2O, Utilities' readRealParameterModel), and
+     without `sys` no signal could be read from the solution. Its events and
+     initial parameter assignments as for any system; a free parameter is an
+     unknown of the init solve, which it does not run. =#
+  if nStates == 0
+    @debug "DirectRHS: empty system (0 unknowns), building trivial dummy problem"
+    isempty(freeIdx) || OMBackend.unsupported("free parameters (fixed = false) of a system without states",
+                                              join((string(params[k]) for k in freeIdx), ", "))
+    local emptyRHS = (du, u, p, t) -> (du[1] = 0.0)
+    local f0 = ModelingToolkit.ODEFunction{true}(emptyRHS; sys = reducedSystem)
+    local p0 = _buildParamVector(params, pars; resolvedParams=resolvedParams)
+    if assignParams! !== nothing
+      assignParams!(p0, Float64[], tspan[1])
+      DAE_REINIT[emptyRHS] = pv -> (assignParams!(pv, Float64[], tspan[1]); [0.0])
+    end
+    return ModelingToolkit.ODEProblem{true}(f0, [0.0], tspan, p0;
+                                            callback=_extractAndMergeEventCallbacks(reducedSystem, callbacks))
+  end
+
+  # 1. Build the RHS function expression from symbolic equations
+  local rhs_list = [eq.rhs for eq in eqs]
+  local f_ip_expr = _buildRHSExpression(rhs_list, states, params, iv)
+
+  # Dump the actual generated RHS expression — see MTKDump.
+  dumpRHSExpression(rhs_list, f_ip_expr)
+
+  # 2. Create world-age-safe function via RuntimeGeneratedFunction
+  local rhsFunc = _exprToRTGFunction(f_ip_expr)
+
+  # 3. Build u0 and parameter vectors in the correct ordering.
+  #= The initialization constraints read those as unknowns, not as the values
+     resolved from their start values: `x = k` must hold for the solved k. =#
+  local initResolved = isempty(unknownParamNames) ? resolvedParams :
+    Dict{String, Float64}(k => v for (k, v) in resolvedParams if !(k in unknownParamNames))
+  # Extract guesses from the reduced system. These are properly mapped to
+  # post-simplification unknowns and provide Modelica start values for variables
+  # that splitInitialValues could not map (pre-simplification names do not match).
+  local systemGuesses = ModelingToolkit.guesses(reducedSystem)
+  local (hardInitialValues, initEqPinKeys) = _collectHardInitializationValues(
+    reducedSystem, finalInitialValues; resolvedParams=initResolved)
+  local observedEquations = ModelingToolkit.observed(reducedSystem)
+  local u0 = _buildStateVector(states, finalInitialValues; resolvedParams=resolvedParams,
+                                systemGuesses=systemGuesses,
+                                hardInitialValues=hardInitialValues,
+                                observedEquations=observedEquations)
+  local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
 
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
   OMBackend.envSwitch("OMBACKEND_INIT_TRACE") &&
@@ -1870,8 +1885,12 @@ function _extractAndMergeEventCallbacks(reducedSystem, customCallbacks)
   try
     eventCBs = ModelingToolkit.process_events(reducedSystem; callback=customCallbacks)
   catch ex
+    #= Without the system's own events (if-equation relations, whens) the
+       result is wrong (it went on with the custom callbacks only, a warning:
+       MSL CauerLowPassSC on 2026-09-27; none in the 425 models now). =#
+    isempty(ModelingToolkit.continuous_events(reducedSystem)) && isempty(ModelingToolkit.discrete_events(reducedSystem)) ||
+      OMBackend.unsupported("events of the reduced system that process_events cannot build", sprint(showerror, ex))
     OMBackend._fallback(ex, :_extractAndMergeEventCallbacks)
-    @warn "DirectRHS: failed to extract event callbacks, using custom callbacks only" exception=(ex, catch_backtrace())
     return customCallbacks
   end
   if eventCBs === nothing
