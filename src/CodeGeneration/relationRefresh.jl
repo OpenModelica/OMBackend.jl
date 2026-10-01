@@ -586,7 +586,11 @@ they watch, and their bodies can move a relation, within one event.
 function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
   local (kept, relationWhens, clusters, discreteWhens) = _splitCallbacks(callbacks)
   local ifRelations = _ifRelations(problem, hSym, entries)
-  ifRelations === nothing && isempty(relationWhens) && isempty(clusters) && return callbacks
+  #= Discrete whens alone are iterated too: one can read an algebraic unknown that
+     another callback in the same step made stale (a source switching a logic
+     gate's inputs, MSL Digital Adder4), and only the iteration solves them again
+     before it reads them. =#
+  ifRelations === nothing && isempty(relationWhens) && isempty(clusters) && isempty(discreteWhens) && return callbacks
   local n = (ifRelations === nothing ? 0 : length(ifRelations)) + length(relationWhens) + length(discreteWhens) +
             sum((length(c.rel) + length(c.members) for c in clusters); init = 0)
   local reinit = any(c -> c.table, clusters) ? tableClusterInitAlg() : nothing
