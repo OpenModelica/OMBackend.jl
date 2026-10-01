@@ -1445,6 +1445,7 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
       (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]
       push!(res, quote
               idx = lookuptableStates[Symbol($(string(var.name)))]
+              OMBackend.CodeGeneration.noteReinit!(integrator, idx)
               integrator.u[idx] = $(expToJuliaExpMTK(wStmt.value,
                                                      simCode; varPrefix = varPrefix, varSuffix = varSuffix))
             end)

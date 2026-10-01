@@ -372,25 +372,116 @@ function _needsIteration(e::EventIteration, integrator)
   return any(d -> _holds(d, integrator), e.discreteWhens)
 end
 
-#= Phases 1 and 2 of a sweep (see the top of the file). Whether anything
-   changed. =#
-function _sweep!(e::EventIteration, integrator)
-  #= 1. Every relation on this state. =#
-  local changed = e.ifRelations !== nothing && _update!(e.ifRelations, integrator)
-  for a in e.relationWhens
-    _whenRelationUpdate!(a, integrator) && (changed = true)
+#= pre() at an event instant (MLS 3.7.5, 8.6): the values before it. Every
+   affect at that time and the first sweep of the event iteration read them:
+   OpenModelica's first iteration evaluates its sorted equations with one
+   pre(), so a when that another when's change triggers at the same instant
+   fires in it with the values before the instant (`when sample(0.5, 1) then
+   n = pre(n) + 1` and `when n > 0 then m = pre(n) * 10`: m = 0; each affect's
+   own snapshot gave 10). A later sweep is a later iteration: pre() is the
+   state before it. Per integrator, recorded by the first affect at a new time
+   and dropped when the iteration settles. A reinit() takes effect after the
+   first iteration (OpenModelica, needToIterate): in the first sweep the
+   relations see the reinitialized states at their values before the instant,
+   and a when on such a relation fires in the next sweep, where pre() is the
+   state after the reinit (`when sample(0.5, 1) then reinit(x, 0)` and `when
+   x < 0.1 then y = pre(x)`: y = 0); a when on a discrete the same body sets
+   fires in the first, with pre() before the instant (y = pre(x) = 1.5). =#
+mutable struct _InstantPre
+  t::Float64
+  u::Any
+  reinitialized::Vector{Int}   # the states a reinit() wrote at this instant
+end
+
+const _INSTANT_PRE = WeakKeyDict{Any, _InstantPre}()
+
+"""
+    instantPre(integrator)
+
+The state before the current event instant, for pre() in an affect: recorded
+by the first affect at a new time. Read only.
+"""
+function instantPre(integrator)
+  ismutable(integrator) || return copy(integrator.u)
+  local h = get!(() -> _InstantPre(NaN, nothing, Int[]), _INSTANT_PRE, integrator)
+  if h.t != integrator.t
+    h.t = integrator.t
+    h.u = copy(integrator.u)
+    empty!(h.reinitialized)
   end
+  return h.u
+end
+
+"""
+    noteReinit!(integrator, k)
+
+A reinit() of the state `k` at this instant, before it writes it (see `instantPre`).
+"""
+function noteReinit!(integrator, k::Int)
+  ismutable(integrator) || return nothing
+  instantPre(integrator)
+  push!(_INSTANT_PRE[integrator].reinitialized, k)
+  return nothing
+end
+
+#= The states a reinit() wrote at this instant after the first `since` (a
+   sweep hides those of the instant until it began: a reinit() in its own
+   bodies is seen in the next sweep). =#
+function _reinitializedSince(integrator, since::Int)::Vector{Int}
+  ismutable(integrator) || return Int[]
+  local h = get(_INSTANT_PRE, integrator, nothing)
+  (h === nothing || h.t != integrator.t || length(h.reinitialized) <= since) && return Int[]
+  return unique(h.reinitialized[(since + 1):end])
+end
+
+_reinitializedCount(integrator) =
+  ismutable(integrator) ? (local h = get(_INSTANT_PRE, integrator, nothing); h === nothing ? 0 : length(h.reinitialized)) : 0
+
+#= `f()` with the states `hidden` at their values in `pre` (the reinitialized
+   ones in the first sweep), put back after. =#
+function _hidingReinit(f, integrator, pre, hidden::Vector{Int})
+  isempty(hidden) && return f()
+  local now = integrator.u[hidden]
+  integrator.u[hidden] = pre[hidden]
+  try
+    return f()
+  finally
+    integrator.u[hidden] = now
+  end
+end
+
+function _endInstant!(integrator)
+  ismutable(integrator) || return nothing
+  local h = get(_INSTANT_PRE, integrator, nothing)
+  h === nothing || (h.t = NaN; h.u = nothing)
+  return nothing
+end
+
+#= Phases 1 and 2 of a sweep (see the top of the file); the first of an
+   instant reads pre() from the state before it (instantPre). Whether
+   anything changed. =#
+function _sweep!(e::EventIteration, integrator, firstSweep::Bool)
+  local pre = firstSweep ? instantPre(integrator) : copy(integrator.u)
   local relPre = [copy(c.rel) for c in e.clusters]
-  for c in e.clusters
-    _update!(c, integrator) && (changed = true)
+  #= The first sweep hides every reinit() of the instant, a later one those of its own bodies. =#
+  local since = firstSweep ? 0 : _reinitializedCount(integrator)
+  #= 1. Every relation on this state. =#
+  local changed = _hidingReinit(integrator, pre, _reinitializedSince(integrator, since)) do
+    local ch = e.ifRelations !== nothing && _update!(e.ifRelations, integrator)
+    for a in e.relationWhens
+      _whenRelationUpdate!(a, integrator) && (ch = true)
+    end
+    for c in e.clusters
+      _update!(c, integrator) && (ch = true)
+    end
+    ch
   end
   #= 2. The bodies, with pre() from the state before them. A relation when's
      discretes, or a cluster that no re-solve moves (`coupled` false, a pulse
      switching a circuit), can move the algebraic unknowns: they are solved
      again before a coupled cluster or a discrete when reads them in this
      sweep. =#
-  local pre = copy(integrator.u)
-  local clusterPre = [_preValues(c, _readValues(c, integrator)) for c in e.clusters]
+  local clusterPre = [_preValues(c, c.values(pre, integrator.p, integrator.t)) for c in e.clusters]
   for pass in 1:e.limit
     local stale = false
     for a in e.relationWhens
@@ -420,9 +511,11 @@ function _sweep!(e::EventIteration, integrator)
        values. A when that fired in an earlier pass on a value this pass corrects is not
        undone. =#
     _staleResolve!(integrator, e.reinit) || break
-    e.ifRelations !== nothing && _update!(e.ifRelations, integrator)
-    foreach(a -> _whenRelationUpdate!(a, integrator), e.relationWhens)
-    foreach(c -> _update!(c, integrator), e.clusters)
+    _hidingReinit(integrator, pre, _reinitializedSince(integrator, since)) do
+      e.ifRelations !== nothing && _update!(e.ifRelations, integrator)
+      foreach(a -> _whenRelationUpdate!(a, integrator), e.relationWhens)
+      foreach(c -> _update!(c, integrator), e.clusters)
+    end
   end
   return changed
 end
@@ -485,19 +578,39 @@ _markingPending(cb::DiffEqBase.DiscreteCallback, pending::Base.RefValue{Bool}) =
 _terminated(integrator) = integrator.sol.retcode == ModelingToolkit.SciMLBase.ReturnCode.Terminated
 
 function _iterate!(e::EventIteration, integrator, resolve::Bool = false)
+  #= The left limit, before the algebraic unknowns follow another callback's
+     change; whether the callbacks before the iteration changed the state. =#
+  try
+    _iterateInstant!(e, integrator, resolve, !isequal(instantPre(integrator), integrator.u))
+  finally
+    _endInstant!(integrator)
+  end
+  return nothing
+end
+
+function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected::Bool)
   if (resolve || _continuousEventFired(integrator)) && !_resolveAlgebraics!(integrator, e.reinit)
     @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
     #= The located crossings belong to this event. =#
     foreach(c -> fill!(c.crossed, false), e.clusters)
     return nothing
   end
+  local forced = 0
   for n in 1:e.limit
-    local changed = _sweep!(e, integrator)
+    local changed = _sweep!(e, integrator, n == 1)
     #= A body ran terminate(): the solve ends at this event (no tstops left to
        restart a step against). =#
     _terminated(integrator) && return nothing
+    #= The first sweep read pre() from before the instant, and a callback before
+       it changed the state: the next iteration reads pre() from the state now
+       (OpenModelica iterates while a value differs from its pre()). A gate's
+       `y = pre(auxiliary_n)` moves one gate per iteration (MSL Digital). =#
+    if !changed && n == 1 && affected
+      forced = 1
+      continue
+    end
     if !changed
-      n > 1 && _restartStepSize!(integrator)
+      n - forced > 1 && _restartStepSize!(integrator)
       #= Settled: the discrete whens' change()/edge() memory takes the
          values (pre() at the next event); none of them holds here. =#
       foreach(d -> _follow!(d, integrator), e.discreteWhens)
@@ -522,6 +635,8 @@ end
    initialization used, the algebraic unknowns are solved again (the states
    kept). =#
 function _initialize!(e::EventIteration, integrator)
+  #= A solve started again from the same time (reinit!) does not read the last one's. =#
+  _endInstant!(integrator)
   _initializeRelations!(e, integrator)
   #= The discrete whens' state (an edge latch) from the initialized state. =#
   foreach(d -> d.initialize!(integrator.u, integrator.t, integrator), e.discreteWhens)
