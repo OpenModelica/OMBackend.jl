@@ -159,6 +159,22 @@ function computeArrayOutputDims(f::SimulationCode.ModelicaFunction)::Tuple{Varar
   end
 end
 
+#= An Integer input is an Int in the function: read from the integrator (a
+   discrete's value) it arrives as a Float64 (MSL TimeTable's `last`, a table
+   index in getInterpolationCoefficients: "invalid index: 2.0"). A symbolic
+   argument is left as it is. =#
+function generateIntegerInputConversions(inputs::Vector)::Vector{Expr}
+  local conversions = Expr[]
+  for v in inputs
+    (_funcParamIsArray(v) || !(v.ty isa DAE.T_INTEGER)) && continue
+    local s = DAE_VAR_ToJulia(v)
+    push!(conversions, :($s = OMBackend.CodeGeneration.AlgorithmicCodeGeneration._integerInput($s)))
+  end
+  return conversions
+end
+_integerInput(x::AbstractFloat) = isinteger(x) ? Int(x) : x
+_integerInput(x) = x
+
 #= Generate ensureArray conversion statements for multi-dimensional array parameters. =#
 function generateArrayConversions(inputs::Vector)::Vector{Expr}
   conversions = Expr[]
@@ -210,7 +226,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
       SimulationCode.MODELICA_FUNCTION(__) => begin
         local locals = generateLocals(func.locals)
         local outputDefaults = generateOutputDefaults(func.outputs)
-        local arrayConversions = generateArrayConversions(func.inputs)
+        local inputConversions = vcat(generateArrayConversions(func.inputs), generateIntegerInputConversions(func.inputs))
         local returnExpr = if length(outputs) > 1
           Expr(:tuple, outputs...)
         elseif length(outputs) == 1
@@ -221,7 +237,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         _CURRENT_RETURN_EXPR[] = returnExpr
         local statements = generateStatements(func.statements)
         #= Build the anonymous function expression manually to avoid parsing issues =#
-        local funcBody = Expr(:block, arrayConversions..., outputDefaults..., locals..., statements..., :(return $(returnExpr)))
+        local funcBody = Expr(:block, inputConversions..., outputDefaults..., locals..., statements..., :(return $(returnExpr)))
         local anonFunc = if nArgs == 0
           Expr(:->, Expr(:tuple), funcBody)
         elseif inputsJL isa Tuple
