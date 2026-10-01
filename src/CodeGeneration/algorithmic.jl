@@ -442,10 +442,16 @@ the ccall, since the caller may legitimately pass `Vector{Int64}` and Julia's
 ccall will not silently widen the pointer cast.
 =#
 
+#= The size of a dimension of a function variable; `[:]` starts empty and
+   grows as it is assigned (ensureAlgArrayLength!). A Boolean dimension
+   (indexed by false and true) is not supported: an ArgumentError at the
+   first index before. =#
 _daeDimToJulia(d) = @match d begin
   DAE.DIM_INTEGER(int) => int
   DAE.DIM_EXP(exp) => expToJuliaExpAlg(exp)
-  _ => 0
+  DAE.DIM_ENUM(size = n) => n
+  DAE.DIM_UNKNOWN(__) => 0
+  _ => CodeGeneration.unsupported("this array dimension of a function variable", d)
 end
 
 function _ccallElemType(elemTy)
@@ -1362,7 +1368,10 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
           DAE.T_REAL(__) => :(float($innerExpr))
           DAE.T_INTEGER(__) => :(Int(round($innerExpr)))
           DAE.T_BOOL(__) => :(Bool($innerExpr))
-          _ => innerExpr  #= For other types, just return the inner expression =#
+          #= The frontend casts to Real only (typeCast): an Integer array to a
+             Real one. Left uncast, `y := m; y[1] := 1.5` failed (InexactError). =#
+          DAE.T_ARRAY(__) where _arrayElementType(ty) isa DAE.T_REAL => :(float.($innerExpr))
+          _ => CodeGeneration.unsupported("a cast to $(ty)", exp)
         end
       end
       DAE.ARRAY(ty, scalar, expl) => begin
