@@ -670,7 +670,8 @@ Scalarise a record-typed assignment onto its flattened `<base>_<field>` symbols
 (the naming `flattenRecordInput` uses), or return `nothing` when `lhsExp` is not a
 plain record cref. A record copy `lhs := rhs` becomes per-field assignments; a
 record-valued call `lhs := f(args...)`, a record literal and an if-expression choosing
-between records scatter their field tuple (a one-field record is its field).
+between records scatter their field tuple (a one-field record is its field). Any
+other value of a record is refused.
 """
 function _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp)::Union{Nothing, Expr}
   local lhs = _recordCrefFields(lhsExp)
@@ -690,7 +691,10 @@ function _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp)::Union{Nothing, Exp
     local rhs = _recordTupleExpr(rhsExp)
     return length(targets) == 1 ? Expr(:(=), targets[1], rhs) : Expr(:(=), Expr(:tuple, targets...), rhs)
   end
-  return nothing
+  #= Assigned whole, the record's name would be bound and its fields, which
+     are what is read, kept: an element of a tuple, a field or an element of
+     another record, a literal with record fields. =#
+  CodeGeneration.unsupported("a record assignment from this expression", rhsExp)
 end
 
 #= A record value as its field tuple: a record variable's flattened fields (it has no
@@ -948,26 +952,48 @@ function _plainCrefName(exp::DAE.Exp)::Union{String, Nothing}
   end
 end
 
+#= `(a, , b) := f(...)` as a Julia destructuring `(a, _, b) = f(...)`. A
+   generated function returns a record output as its fields in place
+   (generateIOL), so a record target takes them into its flattened field
+   symbols and an omitted record output skips one `_` per field. A target that
+   is no plain name (`v[2]`, `eigenvalues[:, 1]`, a record's field) takes its
+   element through a temporary and an ordinary assignment. =#
 function generateStatement(stmt::DAE.STMT_TUPLE_ASSIGN)
-  #= Emit a proper Julia tuple destructuring `(a, _, b) = rhs`.
-     The old code did `Symbol(string(expExpLst))`, producing a single
-     identifier like `var"(a, _, b)"` that is never actually bound —
-     silently wrong on multi-return function calls. Mapping each CREF
-     to its identifier gives a real tuple-assign. =#
-  local lhsSyms = map(_crefToTupleTarget, collect(stmt.expExpLst))
-  local rhs = expToJuliaExpAlg(stmt.exp)
-  return Expr(:(=), Expr(:tuple, lhsSyms...), rhs)
+  local outputTypes = stmt.type_ isa DAE.T_TUPLE ? collect(stmt.type_.types) : nothing
+  outputTypes === nothing || length(outputTypes) >= listLength(stmt.expExpLst) ||
+    CodeGeneration.unsupported("a tuple assignment with more targets than outputs", stmt)
+  local targets = Any[]
+  local stores = Expr[]
+  for (k, target) in enumerate(stmt.expExpLst)
+    local fields = outputTypes === nothing ? String[] : _recordFieldNames(outputTypes[k])
+    if !isempty(fields)
+      _hasNoRecordFields(outputTypes[k]) ||
+        CodeGeneration.unsupported("a tuple assignment of a record output with record fields", stmt)
+      append!(targets, _recordTupleTargets(target, fields, stmt))
+    elseif target isa DAE.CREF && target.componentRef isa DAE.WILD
+      push!(targets, :_)
+    elseif !(target isa DAE.CREF) || _recordCrefFields(target) !== nothing
+      CodeGeneration.unsupported("this target of a tuple assignment", target)
+    elseif _plainCrefName(target) !== nothing
+      push!(targets, Symbol(_plainCrefName(target)))
+    else
+      local tmp = Symbol("#tupleTarget", k)  #= no Modelica name has a '#' =#
+      push!(targets, tmp)
+      push!(stores, _algAssignment(target, Expr(:block, tmp)))
+    end
+  end
+  local assignment = Expr(:(=), Expr(:tuple, targets...), expToJuliaExpAlg(stmt.exp))
+  return isempty(stores) ? assignment : Expr(:block, assignment, stores...)
 end
 
-#= Translate a single target expression inside a tuple-assign LHS to a
-   Julia symbol suitable for `Expr(:tuple, …)`. =#
-Base.@nospecializeinfer function _crefToTupleTarget(@nospecialize(exp::DAE.Exp))
-  @match exp begin
-    DAE.CREF(DAE.WILD(), _) => :_
-    DAE.CREF(DAE.CREF_IDENT(ident, _, _), _) => Symbol(ident)
-    DAE.CREF(cr, _) => Symbol(SimulationCode.string(cr))
-    _ => Symbol(string(exp))
-  end
+#= The targets of a record output's fields: an omitted output's `_`s, a plain
+   record name's flattened field symbols. =#
+function _recordTupleTargets(@nospecialize(target::DAE.Exp), fields::Vector{String}, stmt)::Vector{Symbol}
+  target isa DAE.CREF && target.componentRef isa DAE.WILD && return fill(:_, length(fields))
+  local rec = _recordCrefFields(target)
+  (rec === nothing || rec[2] != fields) &&
+    CodeGeneration.unsupported("this record target of a tuple assignment", stmt)
+  return Symbol[_flatFieldSymbol(rec[1], f) for f in fields]
 end
 
 function generateStatement(stmt::DAE.STMT_ASSIGN_ARR)

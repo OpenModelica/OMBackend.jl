@@ -704,7 +704,8 @@ function Base.string(ty::DAE.Type)::String
     DAE.T_ARRAY(__) => "(array of $(string(ty.ty))) "
     DAE.T_ENUMERATION(__) => "(enumeration) "
     DAE.T_COMPLEX(__) => "(complex type) "
-    _ => "$(ty)"
+    #= Not "$(ty)": interpolation calls this method again (a T_TUPLE overflowed the stack). =#
+    _ => sprint(show, ty)
   end
 end
 

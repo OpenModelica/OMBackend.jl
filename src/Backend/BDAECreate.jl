@@ -453,32 +453,25 @@ function deduplicateEquations(equations::Vector)::Vector
 end
 
 #= Carry the DAE.VAR `protection` flag onto the variable attribute Option so
-   the SimCode-layer `dropObservationOnlyVariables` pass can pick it up. =#
-function _maybeMarkAttrProtected(vattr, protection)
-  @match protection begin
-    DAE.PROTECTED(__) => _markAttrProtected(vattr)
-    _ => vattr
-  end
+   the SimCode-layer `dropObservationOnlyVariables` pass can pick it up. A
+   variable without attributes gets the empty ones of its type `ty`. =#
+function _maybeMarkAttrProtected(vattr, protection, @nospecialize(ty))
+  protection isa DAE.PROTECTED || return vattr
+  local va = vattr isa SOME ? vattr.data : _emptyVarAttr(ty)
+  @assign va.isProtected = SOME(true)
+  return SOME(va)
 end
 
-function _markAttrProtected(vattr)
-  local protOpt = SOME(true)
-  @match vattr begin
-    SOME(va) where va isa DAE.VAR_ATTR_REAL => SOME(DAE.VAR_ATTR_REAL(
-        va.quantity, va.unit, va.displayUnit, va.min, va.max, va.start,
-        va.fixed, va.nominal, va.stateSelectOption, va.uncertainOption,
-        va.distributionOption, va.equationBound, protOpt, va.finalPrefix,
-        va.startOrigin))
-    SOME(va) where va isa DAE.VAR_ATTR_INT => SOME(DAE.VAR_ATTR_INT(
-        va.quantity, va.min, va.max, va.start, va.fixed, va.uncertainOption,
-        va.distributionOption, va.equationBound, protOpt, va.finalPrefix,
-        va.startOrigin))
-    SOME(va) where va isa DAE.VAR_ATTR_BOOL => SOME(DAE.VAR_ATTR_BOOL(
-        va.quantity, va.start, va.fixed, va.equationBound, protOpt,
-        va.finalPrefix, va.startOrigin))
-    _ => SOME(DAE.VAR_ATTR_REAL(NONE(), NONE(), NONE(), NONE(), NONE(),
-        NONE(), NONE(), NONE(), NONE(), NONE(), NONE(), NONE(), protOpt,
-        NONE(), NONE()))
+#= The empty attributes of a variable of type `ty` (of an array: of its elements). =#
+function _emptyVarAttr(@nospecialize(ty))::DAE.VariableAttributes
+  @match ty begin
+    DAE.T_ARRAY(ty = elementTy) => _emptyVarAttr(elementTy)
+    DAE.T_INTEGER(__) => DAE.emptyVarAttrInt
+    DAE.T_BOOL(__) => DAE.emptyVarAttrBool
+    DAE.T_STRING(__) => DAE.emptyVarAttrString
+    DAE.T_ENUMERATION(__) => DAE.emptyVarAttrEnum
+    DAE.T_CLOCK(__) => DAE.emptyVarAttrClock
+    _ => DAE.emptyVarAttrReal
   end
 end
 
@@ -506,7 +499,7 @@ function splitEquationsAndVars(elementLst::List{DAE.Element})::Tuple{List, List,
           elem.binding,
           elem.dims,
           elem.source,
-          _maybeMarkAttrProtected(elem.variableAttributesOption, elem.protection),
+          _maybeMarkAttrProtected(elem.variableAttributesOption, elem.protection, elem.ty),
           NONE(), #=Tearing=#
           elem.connectorType,
           false #=We do not know if we can replace or not yet=#
@@ -712,7 +705,7 @@ function variableToBackendVariable(elem::DAE.Element)
       elem.binding,
       elem.dims,
       elem.source,
-      _maybeMarkAttrProtected(elem.variableAttributesOption, elem.protection),
+      _maybeMarkAttrProtected(elem.variableAttributesOption, elem.protection, elem.ty),
       NONE(), #=Tearing=#
       elem.connectorType,
       false #=We do not know if we can replace or not yet=#)

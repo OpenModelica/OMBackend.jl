@@ -382,13 +382,24 @@ function transformStatementForFlattenedRecords(stmt::DAE.STMT_ASSERT, recordFiel
 end
 
 function transformStatementForFlattenedRecords(stmt::DAE.STMT_TUPLE_ASSIGN, recordFieldMap::Dict)::Vector{DAE.Statement}
-  #= A record target takes the callee's flattened field outputs: (result, index) := 'max'(v). =#
+  #= A record target takes the callee's flattened field outputs: (result, index) := 'max'(v).
+     The tuple type lists the fields' types in the record's place: one type per
+     target, as codegen reads them. =#
+  local outputTypes = stmt.type_ isa DAE.T_TUPLE ? collect(stmt.type_.types) : nothing
   local targets = DAE.Exp[]
-  for e in stmt.expExpLst
+  local types = DAE.Type[]
+  for (k, e) in enumerate(stmt.expExpLst)
     local fields = expandRecordArgForCall(e, recordFieldMap)
-    fields === nothing ? push!(targets, transformExpForFlattenedRecords(e, recordFieldMap)) : append!(targets, fields)
+    if fields === nothing
+      push!(targets, transformExpForFlattenedRecords(e, recordFieldMap))
+      outputTypes === nothing || push!(types, outputTypes[k])
+    else
+      append!(targets, fields)
+      append!(types, (f.ty for f in fields))
+    end
   end
-  return [DAE.STMT_TUPLE_ASSIGN(stmt.type_, MetaModelica.list(targets...),
+  local type_ = outputTypes === nothing ? stmt.type_ : DAE.T_TUPLE(MetaModelica.list(types...), NONE())
+  return [DAE.STMT_TUPLE_ASSIGN(type_, MetaModelica.list(targets...),
                                 transformExpForFlattenedRecords(stmt.exp, recordFieldMap), stmt.source)]
 end
 

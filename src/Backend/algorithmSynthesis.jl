@@ -263,6 +263,7 @@ Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospe
       OMBackend._fallback(err, :convertAlgorithmResiduals; impact = :result)
       continue
     end
+    _reportRealAssignments(daeStmts)
     #= Conservative narrowing: only lift single-statement algorithm bodies.
        Multi-statement algorithms (Modelica.Mechanics.Rotational.Examples.OneWayClutch
        and most Modelica.Electrical.Digital gates) have order-sensitive
@@ -279,6 +280,47 @@ Base.@nospecializeinfer function synthesizeResidualsFromRegularAlgorithms(@nospe
     _collectAssignResidualsFromDAEStmts!(out, daeStmts, alg.source, eqLhsBoundCrefs, whenLifterSkipLhs)
   end
   return out
+end
+
+#= The Real variables an algorithm section assigns outside its when
+   statements are not lowered (every path above takes Integer, Boolean and
+   enumeration targets only): they are left without an equation. Reported as
+   a fallback that changes the result. =#
+function _reportRealAssignments(@nospecialize(daeStmts))
+  local targets = String[]
+  _collectRealTargets!(targets, daeStmts)
+  isempty(targets) && return nothing
+  try
+    OMBackend.unsupported("an assignment to a Real variable outside a when in an algorithm section (not lowered)", join(targets, ", "))
+  catch err
+    OMBackend._fallback(err, :algorithmRealAssign; only = OMBackend.UnsupportedLowering, impact = :result)
+  end
+  return nothing
+end
+
+Base.@nospecializeinfer function _collectRealTargets!(targets::Vector{String}, @nospecialize(daeStmts))
+  for s in daeStmts
+    @match s begin
+      DAE.STMT_ASSIGN(ty, lhs, _, _) => _isContinuousRealType(ty) && push!(targets, string(lhs))
+      DAE.STMT_ASSIGN_ARR(ty, lhs, _, _) => _isContinuousRealType(ty) && push!(targets, string(lhs))
+      DAE.STMT_TUPLE_ASSIGN(_, lhs, _, _) => for t in lhs
+        (t isa DAE.CREF && _isContinuousRealType(t.ty)) && push!(targets, string(t))
+      end
+      DAE.STMT_IF(_, body, else_, _) => begin
+        _collectRealTargets!(targets, body)
+        while !(else_ isa DAE.NOELSE)
+          _collectRealTargets!(targets, else_.statementLst)
+          else_ isa DAE.ELSEIF || break
+          else_ = else_.else_
+        end
+      end
+      DAE.STMT_FOR(statementLst = body) => _collectRealTargets!(targets, body)
+      DAE.STMT_WHILE(statementLst = body) => _collectRealTargets!(targets, body)
+      #= A when statement's body is lowered with its when. =#
+      _ => nothing
+    end
+  end
+  return targets
 end
 
 #= Best-effort: extract the type carried by a `DAE.ComponentRef`. Each

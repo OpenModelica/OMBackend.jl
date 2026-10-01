@@ -149,6 +149,8 @@ end
 
 function _canonicalizeCrefExp(@nospecialize(exp), ctx::_CanonicalNameContext)
   @match exp begin
+    #= An omitted output of a tuple assignment stays one (not a variable `_`). =#
+    DAE.CREF(DAE.WILD(), _) => (exp, false, ctx)
     DAE.CREF(cr, ty) => begin
       return (DAE.CREF(_canonicalizeComponentRef(cr, ty, ctx), ty), false, ctx)
     end

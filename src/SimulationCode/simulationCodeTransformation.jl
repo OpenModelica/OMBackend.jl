@@ -821,30 +821,6 @@ function _stripInitialTriggers(cond::DAE.Exp)::Union{DAE.Exp, Nothing}
   end
 end
 
-_isTimeCrefDAE(@nospecialize(e))::Bool = @match e begin
-  DAE.CREF(componentRef = cr) => string(cr) == "time"
-  _ => false
-end
-
-_isPreCallDAE(@nospecialize(e))::Bool = @match e begin
-  DAE.CALL(Absyn.IDENT("pre"), _, _) => true
-  _ => false
-end
-
-#= True when the condition self-schedules off `time` and a `pre()` value: a
-   `time <relop> pre(x)` relation, or an OR-chain containing one. The
-   CombiTimeTable time event `time >= pre(nextTimeEvent)` is this shape; such
-   whens reach MTK via createSelfSchedulingTimeWhenEvents. =#
-function _condHasTimeAndPre(@nospecialize(cond))::Bool
-  @match cond begin
-    DAE.RELATION(exp1 = e1, exp2 = e2) =>
-      (_isTimeCrefDAE(e1) || _isTimeCrefDAE(e2)) && (_isPreCallDAE(e1) || _isPreCallDAE(e2))
-    DAE.LBINARY(exp1 = a, operator = DAE.OR(__), exp2 = b) =>
-      (_condHasTimeAndPre(a) || _condHasTimeAndPre(b))
-    _ => false
-  end
-end
-
 _isSampleCallDAE(@nospecialize(e))::Bool = e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "sample"
 
 """

@@ -97,7 +97,7 @@ function createCallbackCode(modelName, simCode; generateSaveFunction = true)
      built into the legacy CallbackSet (which cannot read MTK observed
      variables). =#
   local _legacyWhens = filter(w -> _extractChangeRelations(w.whenEquation.condition, simCode) === nothing &&
-                                   isempty(_selfSchedulingTimeRels(w.whenEquation.condition)),
+                                   isempty(_selfSchedulingTimeRels(w)),
                               simCode.whenEquations)
   local WHEN_EQUATIONS = createEquations(_legacyWhens,  simCode)
   #=

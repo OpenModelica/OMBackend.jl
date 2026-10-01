@@ -456,13 +456,9 @@ Base.@nospecializeinfer function _daeExpToJuliaMem(@nospecialize(exp::DAE.Exp), 
        lowered through `rec` so they read observed values. Routes
        through `constTableLookup` (handles numeric + rounded indices). =#
     DAE.ASUB(exp = tableExp, sub = subs) => begin
-      #= subs are DAE.Subscript; lower each subscript's inner index expression. =#
-      local _subExp = s -> @match s begin
-        DAE.INDEX(se) => se
-        DAE.SLICE(se) => se
-        DAE.WHOLE_NONEXP(se) => se
-        _ => DAE.ICONST(0)
-      end
+      #= One element: each subscript an index. A slice or a whole dimension
+         (`t[:, k]`, which read row 1) is the equation form's. =#
+      local _subExp = s -> s isa DAE.INDEX ? s.exp : throw(_UnsupportedInAffect(exp))
       local subCodes = collect(rec(_subExp(s)) for s in subs)
       :(OMBackend.CodeGeneration.constTableLookup($(expToJuliaExpMTK(tableExp, simCode)), $(subCodes...)))
     end
@@ -762,16 +758,21 @@ _uncheckedWhenAssert(@nospecialize(st)) =
   @warn "[MTK GEN: when] an assert in a when on a buffered relation or a self-scheduling time when is not checked" condition = string(SimulationCode.toDAEExp(st.condition))
 
 #= Gather a synthesized when cluster's ordered (discreteSymbol, rhsDAE, isInteger)
-   assignments; `nothing` when any statement is unsupported. A single-member
-   cluster has one entry; a coupled FSM cluster has the body in topological order. =#
+   assignments; `nothing` when it assigns nothing. A single-member cluster has
+   one entry; a coupled FSM cluster has the body in topological order. The
+   cluster paths are the only ones for such a when (createCallbackCode), so
+   what they cannot run is refused. =#
 function _gatherClusterAssigns(weq, simCode)
+  weq.whenEquation.elsewhenPart === nothing ||
+    unsupported("an elsewhen of a when on a buffered relation (a discrete cluster)", weq.whenEquation.condition)
   local assigns = Tuple{Symbol, Any, Bool}[]
   for st in collect(weq.whenEquation.whenStmtLst)
     _isWhenAssert(st) && (_uncheckedWhenAssert(st); continue)
     (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) ||
       unsupported("this statement in a when on a buffered relation (a discrete cluster)", st)
     local leftStr = SimulationCode.string(SimulationCode.toDAEExp(st.left))
-    haskey(simCode.stringToSimVarHT, leftStr) || return nothing
+    haskey(simCode.stringToSimVarHT, leftStr) ||
+      unsupported("an assignment to a non-variable in a when on a buffered relation (a discrete cluster)", st)
     local (_, var) = simCode.stringToSimVarHT[leftStr]
     #= By the attributes, else by the type of the assigned cref or value: an
        alias elimination can make an attribute-less variable (a gate's Logic
@@ -799,30 +800,36 @@ end
 _isIntegralType(@nospecialize(ty))::Bool =
   ty isa DAE.T_INTEGER || ty isa DAE.T_ENUMERATION || (ty isa DAE.T_ARRAY && _isIntegralType(ty.ty))
 
-#= Collect relations comparing `time` against a `pre()` value (a self-scheduling
-   time event), recursing through OR. =#
-function _collectSelfSchedRels!(rels::Vector{DAE.Exp}, @nospecialize(e))
+#= Collect the relations comparing `time` against a `pre()` value (a
+   self-scheduling time event) of an OR-chain. False when a disjunct is neither
+   such a relation nor initial(): its trigger would be lost. =#
+function _collectSelfSchedRels!(rels::Vector{DAE.Exp}, @nospecialize(e))::Bool
   @match e begin
-    DAE.RELATION(exp1 = e1, exp2 = e2) => begin
-      if (_isTimeCref(e1) || _isTimeCref(e2)) && (_isPreCref(e1) || _isPreCref(e2))
-        push!(rels, e)
-      end
-      nothing
-    end
+    DAE.RELATION(exp1 = e1, exp2 = e2) where ((_isTimeCref(e1) || _isTimeCref(e2)) && (_isPreCref(e1) || _isPreCref(e2))) =>
+      (push!(rels, e); true)
     DAE.LBINARY(exp1 = a, operator = DAE.OR(__), exp2 = b) => begin
-      _collectSelfSchedRels!(rels, a)
-      _collectSelfSchedRels!(rels, b)
-      nothing
+      local okA = _collectSelfSchedRels!(rels, a)
+      local okB = _collectSelfSchedRels!(rels, b)
+      okA && okB
     end
-    _ => nothing
+    DAE.CALL(Absyn.IDENT("initial"), _, _) => true
+    _ => false
   end
-  return nothing
 end
 
-function _selfSchedulingTimeRels(@nospecialize(cond))
+#= The relations of a self-scheduling time when (the time tables' `when {time
+   >= pre(nextEvent), initial()}`, its initial() split off into an initial
+   algorithm): the `time ⋚ pre(x)` relations of its condition. Another trigger
+   (lost before: this lowering took the when) or an elsewhen is refused: the
+   general path cannot evaluate such a condition either. =#
+function _selfSchedulingTimeRels(weq)::Vector{DAE.Exp}
+  local cond = weq.whenEquation.condition
   local d = cond isa SimulationCode.Exp ? SimulationCode.toDAEExp(cond) : cond
   local rels = DAE.Exp[]
-  _collectSelfSchedRels!(rels, d)
+  local onlyThese = _collectSelfSchedRels!(rels, d)
+  isempty(rels) && return rels
+  onlyThese || unsupported("a self-scheduling time when with another trigger", d)
+  weq.whenEquation.elsewhenPart === nothing || unsupported("an elsewhen of a self-scheduling time when", d)
   return rels
 end
 
@@ -844,7 +851,7 @@ Base.@nospecializeinfer function _selfSchedAffectParts(weq, simCode; atInit::Boo
     (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) ||
       unsupported("this statement in a self-scheduling time when", st)
     local lhsDAE = SimulationCode.toDAEExp(st.left)
-    lhsDAE isa DAE.CREF || continue
+    lhsDAE isa DAE.CREF || unsupported("this assignment in a self-scheduling time when", st)
     local xn = string(lhsDAE.componentRef)
     local xsym = Symbol(xn)
     local vsym = Symbol("_v_", xn)
@@ -873,12 +880,16 @@ end
 function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
   local events = Expr[]
   for weq in simCode.whenEquations
-    local rels = _selfSchedulingTimeRels(weq.whenEquation.condition)
+    local rels = _selfSchedulingTimeRels(weq)
     isempty(rels) && continue
     local (fn, obs, modN) = _selfSchedAffectParts(weq, simCode; atInit = false)
     isempty(modN.args[1].args) && continue
+    #= At the start the body runs once, for the time tables' initial() (split
+       off upstream, so a when without one runs then too: open). Again at the
+       real start time: their initial algorithm runs at time 0. =#
     local (fnI, obsI, modI) = _selfSchedAffectParts(weq, simCode; atInit = true)
-    for rel in rels
+    local initAffect = :(ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI), skip_checks = true))
+    for (k, rel) in enumerate(rels)
       #= transformToMTKContinuousCondition emits `pre(nextTimeEvent) - time` for
          `time >= pre(nextTimeEvent)`, which falls through zero as time reaches
          the event. Negate so the crossing RISES through zero exactly when the
@@ -890,7 +901,7 @@ function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
         (-($(zc)) ~ 0),
         ModelingToolkit.ImperativeAffect($(fn), $(modN); observed = $(obs), skip_checks = true);
         affect_neg = nothing,
-        initialize = ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI), skip_checks = true),
+        initialize = $(k == 1 ? initAffect : nothing),
         rootfind = SciMLBase.RightRootFind,
         reinitializealg = SciMLBase.NoInit())))
     end
