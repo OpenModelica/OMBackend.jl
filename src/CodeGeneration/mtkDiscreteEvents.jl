@@ -848,7 +848,7 @@ end
    table handle->module global, external call->resolved). The table residual's
    pre(x) lowers to x, omc's state between events: the table's left limit for
    t >= x, the new segment after this affect. `atInit` lowers `initial()` to
-   true for the initialize affect. =#
+   true for the run at the start of a solve. =#
 Base.@nospecializeinfer function _selfSchedAffectParts(weq, simCode; atInit::Bool = false)
   local obsAcc = Dict{Symbol,Symbol}()
   local stmts = Expr[]
@@ -872,7 +872,11 @@ Base.@nospecializeinfer function _selfSchedAffectParts(weq, simCode; atInit::Boo
     subst[xsym] = vsym
   end
   local retNT = Expr(:tuple, Expr(:parameters, retKws...))
+  #= The state before the instant, before the affect writes (pre() of what it
+     sets, read by a when it triggers at the same instant: `e = edge(b)` with b
+     set here stayed false). =#
   local fexpr = :((modified, observed, ctx, integrator) -> begin
+                    $(atInit ? :() : :(OMBackend.CodeGeneration.instantPre(integrator)))
                     $(stmts...)
                     $(retNT)
                   end)
@@ -886,18 +890,52 @@ end
    ImperativeAffect re-runs the body (updates only integrator.u, never an
    AffectSystem, so it does not pull the table-fed continuous network into an
    unsolvable callback). =#
+#= Whether a self-scheduling when's body reads no pre() of a variable it sets:
+   run again at a fixed time it gives the same values. =#
+function _selfSchedIdempotent(weq)::Bool
+  local assigned = Set{String}()
+  local stmts = collect(weq.whenEquation.whenStmtLst)
+  for st in stmts
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+    local lhs = SimulationCode.toDAEExp(st.left)
+    lhs isa DAE.CREF && push!(assigned, string(lhs.componentRef))
+  end
+  for st in stmts
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+    local readsPre = false
+    Util.traverseExpBottomUp(SimulationCode.toDAEExp(st.right), (e, arg) -> begin
+      if e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "pre"
+        local a = listHead(e.expLst)
+        a isa DAE.CREF && string(a.componentRef) in assigned && (readsPre = true)
+      end
+      (e, arg)
+    end, nothing)
+    readsPre && return false
+  end
+  return true
+end
+
 function createSelfSchedulingTimeWhenEvents(simCode)::Vector{Expr}
   local events = Expr[]
   for weq in simCode.whenEquations
     local rels = _selfSchedulingTimeRels(weq)
     isempty(rels) && continue
-    local (fn, obs, modN) = _selfSchedAffectParts(weq, simCode; atInit = false)
+    local (fn, obs, modN) = _selfSchedAffectParts(weq, simCode)
     isempty(modN.args[1].args) && continue
-    #= At the start the body runs once, for the time tables' initial() (split
-       off upstream, so a when without one runs then too: open). Again at the
-       real start time: their initial algorithm runs at time 0. =#
-    local (fnI, obsI, modI) = _selfSchedAffectParts(weq, simCode; atInit = true)
-    local initAffect = :(ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI), skip_checks = true))
+    #= A when with initial() (the time tables' `{time >= pre(nextTimeEvent),
+       initial()}`) runs in the initial algorithm; at the start of every solve
+       again only where that is idempotent (its body reads no pre() of what it
+       sets): a solve of the problem itself (remake) skips the initial
+       algorithm, and the table's C object kept its end state (z(1) = 2.77,
+       OpenModelica 2.47). Not a counter (`n = pre(n) + 1` ran twice: n = 2,
+       OpenModelica 1), and not a when without initial() (it ran at the
+       start; OpenModelica: first at its time). =#
+    local initAffect = if weq.attr.alsoInitial && _selfSchedIdempotent(weq)
+      local (fnI, obsI, modI) = _selfSchedAffectParts(weq, simCode; atInit = true)
+      :(ModelingToolkit.ImperativeAffect($(fnI), $(modI); observed = $(obsI), skip_checks = true))
+    else
+      nothing
+    end
     for (k, rel) in enumerate(rels)
       #= transformToMTKContinuousCondition emits `pre(nextTimeEvent) - time` for
          `time >= pre(nextTimeEvent)`, which falls through zero as time reaches

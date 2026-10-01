@@ -416,6 +416,12 @@ end
   @Record UNKNOWN_EQUATION_KIND begin
 
   end
+
+  #= The runtime arm of a when whose condition had initial() too (`when {c,
+     initial()}`): its initial() was split off into an initial algorithm. =#
+  @Record ALSO_INITIAL_EQUATION begin
+
+  end
 end
 
 @Uniontype EvaluationStages begin

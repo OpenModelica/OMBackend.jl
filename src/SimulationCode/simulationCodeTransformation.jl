@@ -938,7 +938,9 @@ function extractInitialWhenAlgorithms(whenEqs::Vector{BDAE.WHEN_EQUATION})::Tupl
       if runtimeCond !== nothing
         local inner = BDAE.WHEN_STMTS(runtimeCond, weq.whenEquation.whenStmtLst,
                                       weq.whenEquation.elsewhenPart)
-        push!(kept, _foldVectorTriggers(BDAE.WHEN_EQUATION(weq.size, inner, weq.source, weq.attr)))
+        #= Marked: a self-scheduling time when also runs at the start of a solve. =#
+        local attr = BDAE.EQUATION_ATTRIBUTES(false, BDAE.ALSO_INITIAL_EQUATION(), BDAE.defaultEvalStages)
+        push!(kept, _foldVectorTriggers(BDAE.WHEN_EQUATION(weq.size, inner, weq.source, attr)))
       end
     else
       push!(kept, _foldVectorTriggers(weq))

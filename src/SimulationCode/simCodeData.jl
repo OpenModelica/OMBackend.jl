@@ -264,9 +264,12 @@ reduction).
 """
 struct EQ_ATTR
   differentiated::Bool
+  #= A when's runtime arm whose condition had initial() too (BDAE.ALSO_INITIAL_EQUATION). =#
+  alsoInitial::Bool
 end
 
-EQ_ATTR(; differentiated::Bool = false) = EQ_ATTR(differentiated)
+EQ_ATTR(differentiated::Bool) = EQ_ATTR(differentiated, false)
+EQ_ATTR(; differentiated::Bool = false, alsoInitial::Bool = false) = EQ_ATTR(differentiated, alsoInitial)
 
 const EQ_ATTR_DEFAULT = EQ_ATTR(false)
 

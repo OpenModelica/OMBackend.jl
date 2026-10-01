@@ -486,7 +486,7 @@ Project a `BDAE.EquationAttributes` to the bits SimCode keeps.
 """
 function toEqAttr(@nospecialize(bdaeAttr))::EQ_ATTR
   @match bdaeAttr begin
-    BDAE.EQUATION_ATTRIBUTES(differentiated = d) => EQ_ATTR(d)
+    BDAE.EQUATION_ATTRIBUTES(differentiated = d, kind = k) => EQ_ATTR(d, k isa BDAE.ALSO_INITIAL_EQUATION)
     _ => EQ_ATTR_DEFAULT
   end
 end
