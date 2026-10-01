@@ -143,6 +143,13 @@ systems).
 """
 function namedValueFunctions(sys, names::Vector{String})
   sys === nothing && return nothing
+  local byName = _variablesByPlainName(sys)
+  all(n -> haskey(byName, n), names) || return nothing
+  return [ModelingToolkit.build_explicit_observed_function(sys, byName[n]) for n in names]
+end
+
+#= The system's unknowns, observed variables and parameters by plain name. =#
+function _variablesByPlainName(sys)::Dict{String, Any}
   local byName = Dict{String, Any}()
   for v in ModelingToolkit.unknowns(sys)
     byName[_plainVariableName(v)] = v
@@ -153,8 +160,7 @@ function namedValueFunctions(sys, names::Vector{String})
   for p in ModelingToolkit.parameters(sys)
     byName[_plainVariableName(p)] = p
   end
-  all(n -> haskey(byName, n), names) || return nothing
-  return [ModelingToolkit.build_explicit_observed_function(sys, byName[n]) for n in names]
+  return byName
 end
 
 """
@@ -591,6 +597,17 @@ they watch, and their bodies can move a relation, within one event.
 """
 function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
   local (kept, relationWhens, clusters, discreteWhens) = _splitCallbacks(callbacks)
+  #= A when whose operands the model's own system lacks never fired, without
+     a word. (At run time the other modes of a variable-structure model run
+     with systems that lack them: there such a when waits, _whenFunctions.) =#
+  local ownSys = hasproperty(problem.f, :sys) ? problem.f.sys : nothing
+  if ownSys !== nothing && !isempty(relationWhens)
+    local byName = _variablesByPlainName(ownSys)
+    for a in relationWhens
+      local absent = filter(n -> !haskey(byName, n), a.names)
+      isempty(absent) || OMBackend.unsupported("a when on a relation whose operands the system does not keep", join(absent, ", "))
+    end
+  end
   local ifRelations = _ifRelations(problem, hSym, entries)
   #= Discrete whens alone are iterated too: one can read an algebraic unknown that
      another callback in the same step made stale (a source switching a logic
