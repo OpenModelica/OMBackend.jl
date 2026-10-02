@@ -41,17 +41,6 @@ SymbolicUtils = "d1185830-fcd6-423d-90d6-eec64667417b"
 Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
 Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 
-[sources]
-Absyn = {path = "/Users/jtinnerholm/Projects/OM.jl/Absyn.jl"}
-DAE = {path = "/Users/jtinnerholm/Projects/OM.jl/DAE.jl"}
-ImmutableList = {path = "/Users/jtinnerholm/Projects/OM.jl/ImmutableList.jl"}
-ListUtil = {path = "/Users/jtinnerholm/Projects/OM.jl/ListUtil.jl"}
-MetaModelica = {path = "/Users/jtinnerholm/Projects/OM.jl/MetaModelica.jl"}
-OMFrontend = {path = "/Users/jtinnerholm/Projects/OM.jl/OMFrontend.jl"}
-OMParser = {path = "/Users/jtinnerholm/Projects/OM.jl/OMParser.jl"}
-OMRuntimeExternalC = {path = "/Users/jtinnerholm/Projects/OM.jl/OMRuntimeExternalC.jl"}
-SCode = {path = "/Users/jtinnerholm/Projects/OM.jl/SCode.jl"}
-
 [compat]
 ADTypes = "1"
 Absyn = "1.3.5"
