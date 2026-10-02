@@ -148,7 +148,10 @@ import .ExampleDAEs
         println("root_codegen=", isfile(joinpath(ENV["OMJL_LOG_DIR"], "backend", "codeGen", "equationFirstStageCodeGen.log")))
         println("run_codegen=", all(dir -> isfile(joinpath(ENV["OMJL_LOG_DIR"], dir, "backend", "codeGen", "equationFirstStageCodeGen.log")), runDirs))
         """
-        local output = read(`$(Base.julia_cmd()) --startup-file=no --project=$(repoRoot) -e $script`, String)
+        #= The test environment, which has OMBackend's dependencies: the package's own
+           project is not instantiated where its siblings are developed into a
+           temporary environment (OM.jl's ci/test-package.jl, since [sources] is gone). =#
+        local output = read(`$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script`, String)
         @test occursin("same_module=true", output)
         @test occursin("run_count=2", output)
         @test occursin("root_codegen=false", output)
