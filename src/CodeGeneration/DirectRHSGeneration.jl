@@ -112,6 +112,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
                                liftedDiscretes=String[],
                                freeParameters=String[],
+                               userPins=String[],
                                initRelations=Any[],
                                initClusters=Any[],
                                discreteStarts=Dict{String, Float64}())
@@ -316,7 +317,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        the discrete clusters set them at the start (their start bodies), and pinning
        them couples Newton to relation-kink defining rows it cannot satisfy. =#
     local discreteNames = OrderedSet{String}(liftedDiscretes)
-    local isDiscreteKey = k -> replace(k, "(t)" => "") in discreteNames
+    #= Plain names: an array element prints as `var"off[2]"(t)`. =#
+    local isDiscreteKey = k -> _plainVariableName(k) in discreteNames
     local pinnedKeyStrSet = OrderedSet{String}(
       k for k in union(explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues),
                        initEqPinKeys)
@@ -506,6 +508,38 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     firstErr === nothing || settled || throw(firstErr)
     u0 = uSettled
     u0 = _settleInitialRelations!(resolveWith, u0, p_vec, initRels)
+    #= A user's fixed value (a fixed start, a literal initial equation) the
+       initialization moved: its phase that frees every variable found a root
+       only without it (`x(start = 1, fixed = true)` with an initial equation
+       that wants another x: x = 0.48, `v(fixed = true)` with `v = xa^2 + 1`:
+       v = 1). OpenModelica refuses such a model. =#
+    if !isempty(userPins)
+      local userPinSet = Set{String}(userPins)
+      #= A pin whose value reads a parameter the initialization computes (free,
+         assigned by an initial equation, or bound to one of those) entered with
+         that parameter's start, a placeholder: not the user's value. =#
+      local pinValues = Dict{String, Any}(_plainVariableName(p.first) => p.second for p in finalInitialValues)
+      for eq in ModelingToolkit.initialization_equations(reducedSystem)
+        pinValues[_plainVariableName(eq.lhs)] = eq.rhs
+      end
+      local readsComputed = name -> begin
+        local val = get(pinValues, name, nothing)
+        val === nothing && return false
+        local vars = try
+          Symbolics.get_variables(Symbolics.unwrap(val))
+        catch e
+          OMBackend._fallback(e, :userPinReads)
+          return true
+        end
+        any(v -> _plainVariableName(v) in unknownParamNames, vars)
+      end
+      local moved = Int[i for i in pinnedIdx if (local nm = _plainVariableName(states[i]); nm in userPinSet) &&
+                                             !readsComputed(nm) &&
+                                             !isapprox(u0[i], uEntry[i]; rtol = 1e-8, atol = 1e-10)]
+      isempty(moved) ||
+        OMBackend.unsupported("fixed start values or initial equations that the initialization cannot hold",
+                              join(("$(states[i]) = $(u0[i]) (fixed $(uEntry[i]))" for i in first(moved, 5)), ", "))
+    end
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
     #= The same initialization for other parameter values (tunable parameters,
        OMBackend.withTunableParameters): a run with changed parameters needs
@@ -660,7 +694,7 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
       push!(mmScales, Float64(mm[matchedIdx, matchedIdx]))
     else
       #= Lifted-discrete rows belong to the t0 initialize affects. =#
-      replace(lhsStr, "(t)" => "") in excludeNames && continue
+      _plainVariableName(lhsStr) in excludeNames && continue
       #= Literal algebraic rows are pinned hard values, but only a state can
          be pinned: a literal row on an observed variable (an acceleration-
          zero condition, for example) must be enforced as a residual row. =#

@@ -687,6 +687,63 @@ function freeParametersDecl(simCode)::Expr
   return :(FREE_PARAMETERS = $(sort!(unique!(names))))
 end
 
+#= Module-level list of the user's fixed values (USER_PINS): the continuous
+   Real variables with fixed = true (their start, or the default one) and the
+   left sides of initial equations `v = literal or parameter`, named as the
+   MTK unknowns (simVar.name; a relayed variable by its if-equation
+   temporary). Not discretes: fixed = true there is `pre(v) = start` (MLS 8.6),
+   which may move at the start. The direct-RHS initialization refuses a result
+   that moved one (buildDirectRHSProblem). Empty when there are none. =#
+function userPinsDecl(simCode, relayAliases::AbstractDict)::Expr
+  local names = OrderedSet{String}()
+  local rename = n -> string(get(relayAliases, Symbol(n), Symbol(n)))
+  #= The literal value a fixed start gives (0 without a start), by name. =#
+  local fixedLiteral = Dict{String, Float64}()
+  for (_, (_, sv)) in simCode.stringToSimVarHT
+    sv.varKind isa Union{SimulationCode.STATE, SimulationCode.ALG_VARIABLE} || continue
+    local fixed = @match sv.attributes begin
+      SOME(DAE.VAR_ATTR_REAL(fixed = SOME(DAE.BCONST(true)))) => true
+      _ => false
+    end
+    fixed || continue
+    push!(names, rename(sv.name))
+    local startVal = @match sv.attributes begin
+      SOME(DAE.VAR_ATTR_REAL(start = SOME(DAE.RCONST(r)))) => Float64(r)
+      SOME(DAE.VAR_ATTR_REAL(start = SOME(DAE.ICONST(i)))) => Float64(i)
+      SOME(DAE.VAR_ATTR_REAL(start = NONE())) => 0.0
+      _ => nothing
+    end
+    startVal === nothing || (fixedLiteral[string(sv.name)] = startVal)
+  end
+  local plain = x -> begin
+    while x isa Expr && x.head === :block
+      local args = filter(a -> !(a isa LineNumberNode), x.args)
+      length(args) == 1 || return x
+      x = only(args)
+    end
+    x
+  end
+  for e in generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)
+    (e isa Expr && e.head === :call && length(e.args) == 3 && e.args[1] === :~) || continue
+    local lhs = plain(e.args[2]); local rhs = plain(e.args[3])
+    lhs isa Symbol || continue
+    local entry = get(simCode.stringToSimVarHT, string(lhs), nothing)
+    entry === nothing || last(entry).varKind isa Union{SimulationCode.STATE, SimulationCode.ALG_VARIABLE} || continue
+    local rhsEntry = rhs isa Symbol ? get(simCode.stringToSimVarHT, string(rhs), nothing) : nothing
+    (rhs isa Number || (rhsEntry !== nothing && SimulationCode.isParameter(last(rhsEntry)))) || continue
+    #= A fixed start and an initial equation that give one variable two values
+       (`x(start = 1, fixed = true)` and `x = 2`): the initialization took the
+       equation's without a word; OpenModelica refuses it. =#
+    local startVal = get(fixedLiteral, string(lhs), nothing)
+    (rhs isa Number && startVal !== nothing && !isapprox(Float64(rhs), startVal; rtol = 1e-12, atol = 1e-12)) &&
+      CodeGeneration.unsupported("a fixed start and an initial equation that give a variable different values",
+                                 "$(lhs): start $(startVal), initial equation $(rhs)")
+    push!(names, rename(lhs))
+  end
+  isempty(names) && return Expr(:block)
+  return :(USER_PINS = $(sort!(collect(names))))
+end
+
 #= Whether the model takes the discrete-cluster path, shared by every site
    that must agree (emitDiscreteClusters, the MTK events, LIFTED_DISCRETES). =#
 _usesDiscreteClusters(simCode)::Bool =

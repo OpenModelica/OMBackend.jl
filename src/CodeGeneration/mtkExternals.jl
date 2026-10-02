@@ -1588,16 +1588,16 @@ function mergeSoftGuesses(reducedSystem, pairs::AbstractVector; force::Bool = fa
   isempty(pairs) && return reducedSystem
   local unkByStr = Dict{String, Any}()
   for u in unknowns(reducedSystem)
-    unkByStr[replace(string(u), "(t)" => "")] = u
+    unkByStr[_plainVariableName(u)] = u
   end
   local gs = Dict{Any, Any}(ModelingToolkit.guesses(reducedSystem))
   local changed = false
   for p in pairs
-    local nm = replace(String(first(p)), "(t)" => "")
+    local nm = _plainVariableName(String(first(p)))
     haskey(unkByStr, nm) || continue
     local cur = nothing
     for (k, v) in gs
-      if replace(string(k), "(t)" => "") == nm
+      if _plainVariableName(k) == nm
         cur = v
         break
       end
