@@ -845,8 +845,12 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
       push!(derIdxs, matchedIdx)
       push!(mmScales, Float64(mm[matchedIdx, matchedIdx]))
     else
-      #= Lifted-discrete rows belong to the t0 initialize affects. =#
-      _plainVariableName(lhsStr) in excludeNames && continue
+      #= Lifted-discrete rows belong to the t0 initialize affects. By the
+         printed name, as it was: an array element (`var"jointRRP_e_im[1]"`,
+         an assigned parameter) stays a residual row too. Matched by the plain
+         name (B16), the MSL V6 cylinder's top dead centre passed the GasForce
+         assert's 1e-12 margin (s_rel = L + 1.4e-12). =#
+      replace(lhsStr, "(t)" => "") in excludeNames && continue
       #= Literal algebraic rows are pinned hard values, but only a state can
          be pinned: a literal row on an observed variable (an acceleration-
          zero condition, for example) must be enforced as a residual row. =#
