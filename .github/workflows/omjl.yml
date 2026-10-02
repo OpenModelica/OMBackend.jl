@@ -1,7 +1,7 @@
 name: OM.jl integration
 
 # Tests this package against the other OM.jl packages at the matching branch
-# and runs OM.jl's test suite with it, on Julia 1.12 and 1.13, so that a change
+# and runs OM.jl's test suite with it, on Julia 1.13, so that a change
 # here cannot break OM.jl unnoticed. The workflow lives in JKRT/OM.jl:
 # .github/workflows/omjl-ci.yml.
 on:
@@ -24,6 +24,4 @@ jobs:
     uses: JKRT/OM.jl/.github/workflows/omjl-ci.yml@master
     with:
       package: OMBackend
-      # The 1.13 line (pushes to 1.13, pull requests into it) is tested on Julia 1.13;
-      # master on 1.12 and 1.13.
-      julia-versions: ${{ (github.ref_name == '1.13' || github.base_ref == '1.13') && '["1.13"]' || '["1.12", "1.13"]' }}
+      julia-versions: '["1.13"]'  # OM.jl's packages require Julia 1.13

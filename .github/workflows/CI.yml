@@ -32,13 +32,13 @@ jobs:
         include:
           - os: ubuntu-latest
             arch: x64
-            version: '1.12'
+            version: '1.13'
           - os: macos-latest
             arch: arm64
-            version: '1.12'
+            version: '1.13'
           - os: windows-latest
             arch: x64
-            version: '1.12'
+            version: '1.13'
 
     steps:
       - name: Cap precompile concurrency (macOS)
