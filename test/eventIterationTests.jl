@@ -157,7 +157,10 @@ end
 #= The algebraic re-solve at an event (CodeGeneration.EventReinit): 0 = 1e8 (y^2 - 2)
    keeps ~4e-8 on the residual after rounding, out of BrownFullBasicInit's own 1e-10
    (as a thyristor bridge's commutation, near singular at values of 1e6); the result
-   stands within the solve's abstol, not beyond it. =#
+   stands within the solve's abstol, and beyond it where y itself is within the
+   solve's tolerance (a Newton correction of 1e-16: `_withinSolveTolerance`, MSL
+   DifferenceAmplifier's ramp end). A re-solve that did not converge does not stand:
+   0 = y^2 + 1 has no real solution. =#
 @testset "Event re-solve: accepted within the solve's abstol" begin
   local CG = OMBackend.CodeGeneration
   local SB = CG.ModelingToolkit.SciMLBase
@@ -169,5 +172,11 @@ end
   @test reinit(1e-6, CG.DiffEqBase.BrownFullBasicInit()).sol.retcode == SB.ReturnCode.InitialFailure
   local i = reinit(1e-6, CG.EventReinit())
   @test i.sol.retcode == SB.ReturnCode.Default && i.u[2] ≈ sqrt(2)
-  @test reinit(1e-12, CG.EventReinit()).sol.retcode == SB.ReturnCode.InitialFailure
+  local i12 = reinit(1e-12, CG.EventReinit())
+  @test i12.sol.retcode == SB.ReturnCode.Default && i12.u[2] ≈ sqrt(2)
+  local g!(du, u, p, t) = (du[1] = -u[1]; du[2] = u[2]^2 + 1; nothing)
+  local none = SB.ODEProblem(SB.ODEFunction(g!; mass_matrix = [1.0 0.0; 0.0 0.0]), [1.0, 1.0], (0.0, 1.0))
+  local j = ODE.init(none, ODE.Rodas5P(); initializealg = SB.NoInit())
+  CG.DiffEqBase.initialize_dae!(j, CG.EventReinit())
+  @test j.sol.retcode == SB.ReturnCode.InitialFailure
 end
