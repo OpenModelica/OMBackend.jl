@@ -940,10 +940,11 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
      This determines values for fixed=false parameters before code generation. =#
   solveParametricInitialEquations!(simCode)
   #= Create equations for variables not in a loop + parameters and stuff=#
-  local EQUATIONS = createResidualEquationsMTK(stateVariables,
-                                               algebraicVariables,
-                                               simCode.residualEquations,
-                                               simCode::SimulationCode.SIM_CODE)
+  #= homotopy() as the blend in the continuous equations (HOMOTOPY_BLEND). =#
+  local usesHomotopy = _usesHomotopy(simCode)
+  local EQUATIONS = Base.ScopedValues.with(HOMOTOPY_BLEND => usesHomotopy) do
+    createResidualEquationsMTK(stateVariables, algebraicVariables, simCode.residualEquations, simCode)
+  end
   @BACKEND_LOGGING writeEqsToFile(EQUATIONS, OMBackend.logPath("backend/codeGen", "equationFirstStageCodeGen.log"))
   #=
   If missing from variable map error is thrown check the start condition.
@@ -1032,6 +1033,11 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     push!(ifCondParamDecls, Expr(:(=), ZC_HYSTERESIS, ZC_HYSTERESIS_DEFAULT))
     push!(ifCondParamPairs, :($(ZC_HYSTERESIS) => $(ZC_HYSTERESIS_DEFAULT)))
     push!(ifCondParamNames, ZC_HYSTERESIS)
+  end
+  if usesHomotopy
+    push!(ifCondParamDecls, Expr(:(=), HOMOTOPY_LAMBDA, 1.0))
+    push!(ifCondParamPairs, :($(HOMOTOPY_LAMBDA) => 1.0))
+    push!(ifCondParamNames, HOMOTOPY_LAMBDA)
   end
   #= Collect the symbols MTK tearing must not eliminate
      (simCode-flagged irreducibles + ifEq_tmp LHS targets + fixed-start
@@ -1291,7 +1297,9 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
          freshly-eval'd Symbolics bindings. =#
       local _algResults = $(earlyInitialAlgorithm ? :(Base.invokelatest(__runInitialAlgorithmEarly!)) : :(Dict{Symbol, Float64}()))
       function _buildInitialConstraintEqs()
-        local _eqs = Symbolics.Equation[$([_substSyms(e, _ifEqRelay_aliases) for e in generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)]...),
+        local _eqs = Symbolics.Equation[$([_substSyms(e, _ifEqRelay_aliases) for e in Base.ScopedValues.with(HOMOTOPY_BLEND => usesHomotopy) do
+                                             generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)
+                                           end]...),
                                         $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, algebraicVariables, discreteVariables), simCode)]...)]
         $(emitInitAlgConstraintAppends(simCode)...)
         return _eqs

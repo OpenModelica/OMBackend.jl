@@ -600,6 +600,11 @@ We return the actual expression (lambda=1 case).
 """
 modelica_homotopy(actual, simplified) = actual
 
+#= In the equations, with the homotopy parameter λ: the actual expression at
+   λ = 1 (the simplified one is not used there, and may be anything), the
+   blend λ actual + (1 - λ) simplified below it. =#
+modelica_homotopy(actual, simplified, λ) = ifelse(λ >= 1, actual, λ * actual + (1 - λ) * simplified)
+
 """
     modelica_semiLinear(x, k_pos, k_neg)
 

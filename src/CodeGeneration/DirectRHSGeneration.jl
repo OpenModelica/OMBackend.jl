@@ -221,6 +221,14 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
 
   # 1. Build the RHS function expression from symbolic equations
   local rhs_list = [eq.rhs for eq in eqs]
+  #= A model with homotopy(): the simulation's RHS at λ = 1, where the blend
+     is the actual expression (the simplified one folds away); only the
+     initialization's (`rhsInitFunc`) reads λ. The simplified expression was
+     evaluated at every step otherwise (an assert in it stopped a run). =#
+  local homotopyIdx = findfirst(p -> string(p) == string(HOMOTOPY_LAMBDA), params)
+  local rhs_init = rhs_list
+  homotopyIdx === nothing ||
+    (rhs_list = [Symbolics.substitute(r, Dict(params[homotopyIdx] => 1.0)) for r in rhs_list])
   local f_ip_expr = _buildRHSExpression(rhs_list, states, params, iv)
 
   # Dump the actual generated RHS expression — see MTKDump.
@@ -228,6 +236,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
 
   # 2. Create world-age-safe function via RuntimeGeneratedFunction
   local rhsFunc = _exprToRTGFunction(f_ip_expr)
+  local rhsInitFunc = homotopyIdx === nothing ? rhsFunc :
+    _exprToRTGFunction(_buildRHSExpression(rhs_init, states, params, iv))
 
   # 3. Build u0 and parameter vectors in the correct ordering.
   #= The initialization constraints read those as unknowns, not as the values
@@ -419,7 +429,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        (the MSL selectBranch asserts a regular loop position): at a trial point
        (the entry guesses, a line-search step, a finite difference) that is a
        non-finite residual the solve rejects, not a failed build. =#
-    local initRhs = assignParams! === nothing ? rhsFunc : (du, u, p, t) -> begin
+    local initRhs = assignParams! === nothing ? rhsInitFunc : (du, u, p, t) -> begin
       try
         assignParams!(p, u, t)
       catch e
@@ -427,7 +437,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
         fill!(du, NaN)
         return nothing
       end
-      rhsFunc(du, u, p, t)
+      rhsInitFunc(du, u, p, t)
     end
     local probeRows = rowsAt -> try
       local duProbe = similar(u0)
@@ -469,8 +479,13 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                                               eqLabels=eqLabels,
                                                               extra_residuals=extraResiduals,
                                                               discrete_pinned=discretePinnedIdx)
+    #= A model with homotopy(): from its simplified expressions to the actual ones. =#
+    local refreshRelations! = initRels === nothing ? nothing :
+      (uh, pvh) -> initRels.eval!(pvh, uh, 0.0; finiteOnly = true)
+    local solveInit = homotopyIdx === nothing ? solveFree :
+      (u, pv) -> _homotopyContinuation(solveFree, u, pv, homotopyIdx; refresh! = refreshRelations!)
     u0 = try
-      solveFree(u0, p_vec)
+      solveInit(u0, p_vec)
     catch e
       OMBackend._fallback(e, :buildDirectRHSProblem_7, impact = :result)
       #= The relations at the failed solve's last point: where one differs, the
@@ -478,7 +493,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
          iteration of the initialization, before a solution exists). =#
       local retried = initRels !== nothing && initRels.eval!(p_vec, u0, 0.0; finiteOnly = true) ?
         try
-          solveFree(copy(uEntry), p_vec)
+          solveInit(copy(uEntry), p_vec)
         catch e2
           OMBackend._fallback(e2, :buildDirectRHSProblem_8, impact = :result)
           nothing
@@ -517,7 +532,14 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     #= The differential states other than the clusters' members. =#
     local diffKept = Int[i for i in 1:size(mm, 1) if mm[i, i] != 0 &&
                          !(initDiscretes !== nothing && any(c -> i in c.memberIndex, initDiscretes.clusters))]
-    local (uSettled, settled) = _settleInitialDiscretes!(resolveWith, u0, uEntry, p_vec, initDiscretes, diffKept)
+    #= The start path of the clusters solves from the entry: through the
+       continuation too (it took the actual expressions' root, -0.347 for
+       CubicRoot with an ideal diode beside it). =#
+    local startSolve = homotopyIdx === nothing ? resolveWith :
+      (u, pv, ok) -> _homotopyContinuation((a, b) -> resolveWith(a, b, Ref(true)), u, pv, homotopyIdx;
+                                           refresh! = refreshRelations!, finalSolve = (a, b) -> resolveWith(a, b, ok))
+    local (uSettled, settled) = _settleInitialDiscretes!(resolveWith, u0, uEntry, p_vec, initDiscretes, diffKept;
+                                                         startSolve = startSolve)
     firstErr === nothing || settled || throw(firstErr)
     u0 = uSettled
     u0 = _settleInitialRelations!(resolveWith, u0, p_vec, initRels)
@@ -587,13 +609,18 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       end
       targetsNow[] = targets
       try
-        u = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
+        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!;
                                          pinned=pinnedIdx,
                                          derivative_targets=targets,
                                          eqLabels=eqLabels,
-                                         extra_residuals=useExtra ? residualsAt(pv) : nothing,
+                                         extra_residuals=useExtra ? residualsAt(pp) : nothing,
                                          discrete_pinned=discretePinnedIdx,
-                                         warm=true)
+                                         warm=homotopyIdx === nothing)
+        #= A model with homotopy(): the continuation from the run's entry, as
+           OpenModelica's `-override` run does; warm from this solution it kept
+           the compiled run's root (x = 1.879 for s = -2, OpenModelica -1.532). =#
+        u = homotopyIdx === nothing ? solveRun(u, pv) :
+          _homotopyContinuation(solveRun, copy(entry), pv, homotopyIdx; refresh! = refreshRelations!)
         assignParams! === nothing || assignParams!(pv, u, 0.0)
         u = first(_settleInitialDiscretes!(resolveWith, u, u, pv, initDiscretes, diffKept; startPath = false))
         u = _settleInitialRelations!(resolveWith, u, pv, initRels)
@@ -608,6 +635,35 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
 
   @debug "DirectRHS: problem constructed successfully"
   return problem
+end
+
+#= The initialization of a model with homotopy() (MLS 3.7.4.4), as
+   OpenModelica's default for such a model: solved at λ = 0 (the simplified
+   expressions), then from each solution at λ = 1/3, 2/3 and 1 (the actual
+   ones), λ the parameter `pv[k]`. `refresh!(u, pv)` sets the relations'
+   literals at each step's solution: kept at the entry's, the limiters of
+   MSL SignalGenerator's op-amps stayed linear and the path returned to the
+   unstable equilibrium (OpenModelica: saturated, -15 V). The direct solve
+   from `u` when a step throws; λ is 1 afterwards either way. =#
+function _homotopyContinuation(solve, u, pv, k::Int; refresh! = nothing, finalSolve = solve)
+  local uh = copy(u)
+  local pvBefore = copy(pv)
+  try
+    for λ in (0.0, 1 / 3, 2 / 3)
+      pv[k] = λ
+      uh = solve(uh, pv)
+      refresh! === nothing || refresh!(uh, pv)
+    end
+  catch e
+    OMBackend._fallback(e, :homotopyContinuation, impact = :result)
+    @warn "DirectRHS: the homotopy continuation failed; the initialization starts from the actual expressions" exception = e
+    uh = copy(u)
+    #= The relations' literals and free parameters as before the steps. =#
+    copyto!(pv, pvBefore)
+  finally
+    pv[k] = 1.0
+  end
+  return finalSolve(uh, pv)
 end
 
 #= Returns `(values, constraintKeys)`. `values` seeds u0; `constraintKeys`
@@ -1307,7 +1363,7 @@ end
    iteration at the start settles the members as before.
    Returns `(u, settled)`. =#
 function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int};
-                                  startPath::Bool = true, maxPasses::Int = 10)
+                                  startPath::Bool = true, maxPasses::Int = 10, startSolve = resolve)
   dc === nothing && return (u0, false)
   local trace = OMBackend.envSwitch("OMBACKEND_INIT_TRACE")
   local pvFirst = copy(pv)
@@ -1350,7 +1406,7 @@ function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int}
         u[k] = v
       end
       local ok = Ref(true)
-      local un = resolve(copy(u), pv, ok)
+      local un = startSolve(copy(u), pv, ok)
       trace && println("[initdiscretes] from the start values: ", ok[] ? "solved" : "not solved",
                        ", states kept: ", keptAt(un, u))
       (ok[] && keptAt(un, u)) ? iterate(un, u) : nothing

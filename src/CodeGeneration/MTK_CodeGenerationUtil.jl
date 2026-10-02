@@ -333,6 +333,18 @@ end
    elsewhen-arm affects): the state before the current sweep, indexed by
    `lookuptableStates`. =#
 const PRE_SNAPSHOT = :__prevals
+#= The homotopy parameter λ (homotopy(actual, simplified), MLS 3.7.4.4):
+   1 in a simulation; the initialization of a model with homotopy() goes from
+   0 (the simplified expressions) to 1 (`_homotopyContinuation`), as
+   OpenModelica's default does. =#
+const HOMOTOPY_LAMBDA = :_homotopyLambda
+#= Whether homotopy() is lowered as the blend in λ: in the continuous
+   equations and the initialization equations only (ODE_MODE_MTK_MODEL_GENERATION),
+   where λ is a parameter and the continuation acts. Elsewhere (when bodies and
+   conditions, relations, if-equation branches, bindings, observed equations)
+   the actual expression: the blend read an undefined λ there (an
+   UndefVarError at the first event), and λ is 1 after the initialization. =#
+const HOMOTOPY_BLEND = Base.ScopedValues.ScopedValue(false)
 
 #= Where `pre(v)` of a variable is read while a when body is lowered: false,
    from `v` itself; true (within `with(PRE_FROM_SNAPSHOT => true)`), from
@@ -444,6 +456,19 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
        codegen already lowers enum CREFs to integer indices and ENUM_LITERAL to
        its `index` field, so the cast is the identity at the Julia level. Without
        this arm the splice emits `Integer(::Num)` which has no method. =#
+    #= homotopy(actual, simplified): a blend in the homotopy parameter λ (1
+       in a simulation), for the initialization's continuation from the
+       simplified expressions (MLS 3.7.4.4; OpenModelica's default for a
+       model with homotopy). It was the actual expression only: the
+       initialization found a root the simplified ones do not lead to (CubicRoot:
+       x = -0.347, OpenModelica 1.879). =#
+    "homotopy" => begin
+      local lower = e -> expToJuliaExpMTK(e, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derAsSymbol)
+      local a = lower(listHead(expLst))
+      HOMOTOPY_BLEND[] ?
+        :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_homotopy($(a), $(lower(listHead(listRest(expLst)))), $(HOMOTOPY_LAMBDA))) :
+        a
+    end
     "Integer" => begin
       expToJuliaExpMTK(listHead(expLst), simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derAsSymbol)
     end

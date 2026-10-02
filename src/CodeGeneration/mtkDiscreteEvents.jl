@@ -777,6 +777,21 @@ function tunableParametersDecl()::Expr
   return :(TUNABLE_NAMES = $(names))
 end
 
+#= Whether a continuous or initialization equation of the model calls
+   homotopy() (where it is the blend, HOMOTOPY_BLEND): it then gets the
+   homotopy parameter (HOMOTOPY_LAMBDA). By the printed equations (a call
+   prints as `homotopy(`); a function of another name ending in it only adds
+   an unused parameter and the continuation's steps. =#
+function _usesHomotopy(simCode)::Bool
+  local rx = r"(^|[^A-Za-z0-9_])homotopy\("
+  local has = e -> occursin(rx, string(e isa SimulationCode.Exp ? SimulationCode.toDAEExp(e) : e))
+  any(eq -> has(eq.exp), simCode.residualEquations) && return true
+  for ieq in simCode.initialEquations
+    hasEquationSides(ieq) && any(has, equationSides(ieq)) && return true
+  end
+  return false
+end
+
 #= Whether the model takes the discrete-cluster path, shared by every site
    that must agree (emitDiscreteClusters, the MTK events, LIFTED_DISCRETES). =#
 _usesDiscreteClusters(simCode)::Bool =
