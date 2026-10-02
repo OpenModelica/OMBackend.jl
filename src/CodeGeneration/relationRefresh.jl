@@ -121,6 +121,58 @@ function _update!(r::IfRelations, integrator)
   return changed
 end
 
+#= The if-equation relations switched back and forth in the event iteration:
+   a comparator with positive feedback (MSL SignalGenerator) has its linear
+   branch's solution at the unstable midpoint, where the relation flips back,
+   and the saturated one it left. OpenModelica solves the loop with the live
+   if-expression and lands on the other saturated side. Here the combinations
+   of the literals, the fewest changes first (at most `maxRelations`
+   relations), until one holds at its own solution: the algebraic unknowns
+   solved for it, every relation evaluates to its literal there (with
+   `clear`, beyond its hysteresis band too). Whether one was found; the
+   literals and the state are then that solution's, else as before. A failed
+   solve's return code is put back. =#
+function _consistentIfRelations!(r::IfRelations, integrator, reinit; maxRelations::Int = 10, clear::Bool = false)
+  local base = _bufferValues(r.buffers, integrator)
+  local n = length(base)
+  (n == 0 || n > maxRelations) && return false
+  local u0 = copy(integrator.u)
+  local retcode = integrator.sol.retcode
+  local setAll! = lits -> foreach(k -> r.setBuffer[k](integrator, lits[k] ? 1.0 : 0.0), 1:n)
+  local current = Bool[v > 0.5 for v in base]
+  local clearly = (k, lit) -> _ruled(r, integrator, k, !lit) == lit
+  #= With `clear`, a combination that holds clearly where it is stays: the
+     instant was only iterated again (several callbacks at one time). =#
+  clear && all(k -> clearly(k, current[k]), 1:n) && return false
+  local zc0 = Float64[r.crossing[k](integrator) for k in 1:n]
+  #= Every relation holds. With `clear`, beyond its hysteresis band too, but
+     for one the solve does not move (its crossing as at the start: an
+     independent relation at its threshold, which holds either way), which
+     keeps its literal. =#
+  local holds = cand -> begin
+    all(k -> _ruled(r, integrator, k, cand[k]) == cand[k], 1:n) || return false
+    clear || return true
+    all(1:n) do k
+      local static = isapprox(r.crossing[k](integrator), zc0[k]; rtol = 1e-12, atol = 1e-14)
+      static ? cand[k] == current[k] : clearly(k, cand[k])
+    end
+  end
+  #= Bit k of `flips` changes relation k; 0 is the combination that did not settle. =#
+  for flips in sort!(collect(1:(2^n - 1)); by = count_ones)
+    local cand = Bool[xor(current[k], isodd(flips >> (k - 1))) for k in 1:n]
+    setAll!(cand)
+    copyto!(integrator.u, u0)
+    if _resolveAlgebraics!(integrator, reinit)
+      holds(cand) && return true
+    else
+      _restoreRetcode!(integrator, retcode)
+    end
+  end
+  setAll!(current)
+  copyto!(integrator.u, u0)
+  return false
+end
+
 #= When-equations on a single relation (codeGen.jl `_emitRelationWhen`).
    The relation keeps its value between events in a buffer (MLS 8.5), set
    literally at the start; its crossing function is shifted by the same
@@ -336,6 +388,9 @@ struct EventIteration
   discreteWhens::Vector{DiscreteWhenAffect}
   limit::Int
   reinit::Any
+  #= The last instant iterated and how often in a row (the integrator stuck
+     at one time: `_iterateInstant!`). =#
+  instant::Base.RefValue{Tuple{Float64, Int}}
 end
 
 #= Whether a callback changed the state in the step that just ended: a
@@ -591,12 +646,28 @@ function _iterate!(e::EventIteration, integrator, resolve::Bool = false)
   return nothing
 end
 
-function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected::Bool)
+function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected::Bool; retried::Bool = false)
+  #= The selections of the if-relations' literals below only where nothing
+     else runs in the iteration: a when or a cluster body fired at every pass
+     of a cycle and every repeat of the instant (a when on the comparator's
+     relation counted 347 switches, OpenModelica 20). Such a model stops as
+     before. =#
+  local r = isempty(e.relationWhens) && isempty(e.discreteWhens) && isempty(e.clusters) ? e.ifRelations : nothing
   if (resolve || _continuousEventFired(integrator)) && !_resolveAlgebraics!(integrator, e.reinit)
     @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
     #= The located crossings belong to this event. =#
     foreach(c -> fill!(c.crossed, false), e.clusters)
     return nothing
+  end
+  #= The same instant again and again (a comparator with positive feedback at
+     its fold, MSL SignalGenerator's fifth switch: the linear branch settled
+     where it meets the saturated one, and its crossing fired at once): the
+     if-relations' combination that holds clearly, beyond the hysteresis. =#
+  if !retried && r !== nothing
+    local (lastT, count) = e.instant[]
+    e.instant[] = integrator.t == lastT ? (lastT, count + 1) : (integrator.t, 1)
+    last(e.instant[]) >= 3 && _consistentIfRelations!(r, integrator, e.reinit; clear = true) &&
+      return _iterateInstant!(e, integrator, false, affected; retried = true)
   end
   local forced = 0
   for n in 1:e.limit
@@ -625,6 +696,13 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
       return nothing
     end
   end
+  #= The if-equation relations may switch back and forth where the loop has
+     a solution on another branch (a comparator with positive feedback): one
+     that holds at its own solution, then the iteration from there. Every
+     relation may change: the other side of a comparator (its upper limit)
+     did not move in the cycle. =#
+  !retried && r !== nothing && _consistentIfRelations!(r, integrator, e.reinit) &&
+    return _iterateInstant!(e, integrator, false, affected; retried = true)
   @error "[events] the event iteration did not settle in $(e.limit) sweeps at t = $(integrator.t) " *
          "(relations switching back and forth: a chattering model); the simulation stops"
   ModelingToolkit.SciMLBase.terminate!(integrator, ModelingToolkit.SciMLBase.ReturnCode.Failure)
@@ -648,6 +726,8 @@ function _initialize!(e::EventIteration, integrator)
   #= Only the values the tick changed: the clusters initialize theirs below
      (a pulse true from the start is no edge). =#
   local moved = before === nothing ? Int[] : Int[k for k in eachindex(before) if !isequal(before[k], integrator.u[k])]
+  #= A new solve (a re-simulation reuses the callbacks): no instant repeated yet. =#
+  e.instant[] = (NaN, 0)
   _initializeRelations!(e, integrator)
   local start = integrator.u
   if !isempty(moved)
@@ -758,7 +838,8 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
   local n = (ifRelations === nothing ? 0 : length(ifRelations)) + length(relationWhens) + length(discreteWhens) +
             sum((length(c.rel) + length(c.members) for c in clusters); init = 0)
   local reinit = any(c -> c.table, clusters) ? tableClusterInitAlg() : nothing
-  local e = EventIteration(ifRelations, relationWhens, clusters, discreteWhens, _eventIterationLimit(n), reinit)
+  local e = EventIteration(ifRelations, relationWhens, clusters, discreteWhens, _eventIterationLimit(n), reinit,
+                           Ref((NaN, 0)))
   local pending = Ref(false)
   kept = Any[cb isa DiffEqBase.DiscreteCallback ? _markingPending(cb, pending) : cb for cb in kept]
   local cb = DiffEqBase.DiscreteCallback((u, t, integrator) -> pending[] || _needsIteration(e, integrator),
