@@ -801,6 +801,21 @@ function _splitCallbacks(callbacks)
   return (kept, relationWhens, clusters, discreteWhens)
 end
 
+#= A mass-matrix problem with algebraic unknowns and continuous events of its
+   own (MTK's: an if-equation's pure time events, NoInit): the event iteration
+   solves its algebraic unknowns again after such an event too, after the
+   step-end recorder took the left limit (withDelayRecords). Without the
+   iteration nothing did, but the merged continuous callback's re-solve with
+   the integrator's algorithm (DirectRHSGeneration.jl `_mergeableReinit`),
+   inside the callback: there delay() recorded no jump, and where that re-solve
+   is gone, the unknowns kept their old values until the next step's end (a
+   `time > 1.5` branch read by delay() recorded a ramp over the step). =#
+function _eventsOnAlgebraicUnknowns(problem)
+  isempty(_algebraicRows(problem.f)) && return false
+  local own = get(problem.kwargs, :callback, nothing)
+  return own isa DiffEqBase.CallbackSet && !isempty(own.continuous_callbacks)
+end
+
 """
     withRelationRefresh(callbacks, problem, hSym, entries) -> callbacks
 
@@ -834,7 +849,8 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
      another callback in the same step made stale (a source switching a logic
      gate's inputs, MSL Digital Adder4), and only the iteration solves them again
      before it reads them. =#
-  ifRelations === nothing && isempty(relationWhens) && isempty(clusters) && isempty(discreteWhens) && return callbacks
+  ifRelations === nothing && isempty(relationWhens) && isempty(clusters) && isempty(discreteWhens) &&
+    !_eventsOnAlgebraicUnknowns(problem) && return callbacks
   local n = (ifRelations === nothing ? 0 : length(ifRelations)) + length(relationWhens) + length(discreteWhens) +
             sum((length(c.rel) + length(c.members) for c in clusters); init = 0)
   local reinit = any(c -> c.table, clusters) ? tableClusterInitAlg() : nothing
@@ -889,10 +905,13 @@ end
    equations barely change the residual, and its s keeps the wrong sign).
    Where that is out of reach (large values, a switched Jacobian near
    singular: a thyristor bridge's commutation stops at 4e-9 with values of
-   1e6), the result stands if it lowered the residual to within the solve's
-   abstol, as the initialization's (defaultInitializeKwargs). A type,
-   because a callback's reinitializealg is fixed when the code is
-   generated. =#
+   1e6), the result stands if it did not raise the residual and the
+   residual is within the solve's abstol, as the initialization's
+   (defaultInitializeKwargs), or at its round-off floor, or the unknowns are
+   within the solve's tolerance (`_withinSolveTolerance`). Not raised: a
+   second re-solve at the same event (after the move to the event time,
+   after the affect) starts where the first stopped. A type, because a
+   callback's reinitializealg is fixed when the code is generated. =#
 struct EventReinit <: ModelingToolkit.SciMLBase.DAEInitializationAlgorithm end
 
 #= SciMLBase's fallback takes any algorithm for any integrator,
@@ -929,9 +948,10 @@ function _eventReinit!(integrator, alg = DiffEqBase.BrownFullBasicInit())
   end
   (integrator.sol.retcode == InitialFailure && before != InitialFailure) || return nothing
   local residual = _maxAlgebraicResidual(integrator, integrator.u)
-  ((residual <= _solveAbstol(integrator) || _atRoundoffFloor(integrator, integrator.u)) &&
-   residual < _maxAlgebraicResidual(integrator, u0)) || return nothing
-  @debug "[events] algebraic re-solve kept at the solve's abstol" t = integrator.t residual
+  ((residual <= _solveAbstol(integrator) || _atRoundoffFloor(integrator, integrator.u) ||
+    _withinSolveTolerance(integrator, integrator.u)) &&
+   residual <= _maxAlgebraicResidual(integrator, u0)) || return nothing
+  @debug "[events] algebraic re-solve kept within the solve's tolerance" t = integrator.t residual
   return _restoreRetcode!(integrator, before)
 end
 
@@ -959,6 +979,28 @@ function _atRoundoffFloor(integrator, u)
   local scale = abs.(J) * abs.(u)
   local abstol = _solveAbstol(integrator)
   return all(k -> abs(r[k]) <= abstol + 1.0e3 * eps(Float64) * scale[k], rows)
+end
+
+#= Whether one more Newton correction of the algebraic unknowns at u (the
+   differential ones kept) is within the solve's tolerance: in the solver's
+   error norm (algebraicStepControl.jl `_scaledNorm`, 1 is the tolerance), the
+   norm the integrator's own Newton iteration converges in. A Jacobian too
+   ill-conditioned for the re-solve's 1e-10 can leave the unknowns there all
+   the same: MSL DifferenceAmplifier at its ramp's end, the transistors'
+   der(vbc) at 1e9 (condition 7e26), the residual stalls at 1e-4 with a
+   correction of 0.08 (RMS, as the integrator's norm; 0.22 at most). =#
+function _withinSolveTolerance(integrator, u)
+  local f = integrator.f
+  local rows = _algebraicRows(f)
+  (isempty(rows) || !ModelingToolkit.SciMLBase.isinplace(f)) && return false
+  local n = length(rows)
+  local w = AlgebraicWork(copy(u), similar(u), similar(u), similar(u, n), similar(u, n), similar(u, n, n),
+                          nothing, nothing, Int[])
+  local F = _algebraicJacobian!(w, rows, integrator, integrator.t)
+  F === nothing && return false
+  _algebraicResidual!(w, rows, integrator, integrator.t)
+  LinearAlgebra.ldiv!(w.correction, F, w.g)
+  return _scaledNorm(rows, integrator, w.correction, u) <= 1
 end
 
 #= The solve's absolute tolerance, the smallest of a per-component one. =#

@@ -400,4 +400,13 @@ import .ExampleDAEs
   #= ── 15. Calls of generated functions have the function's arity ─ =#
   include("functionArityTests.jl")
 
+  #= ── 16. Generated functions hash the same in every process ───── =#
+  include("deterministicHashTests.jl")
+
+  #= ── 17. Merged continuous callbacks keep their re-initialization =#
+  include("eventCallbackMergeTests.jl")
+
+  #= ── 18. Solve keyword arguments with an abstol per unknown ────── =#
+  include("solveKwargsTests.jl")
+
 end

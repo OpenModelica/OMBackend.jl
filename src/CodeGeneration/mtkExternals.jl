@@ -55,6 +55,20 @@ ModelicaFunctionWrapper{N}(name::Symbol, rgf::F) where {N, F} = ModelicaFunction
 Base.nameof(w::ModelicaFunctionWrapper) = w.name
 Base.show(io::IO, w::ModelicaFunctionWrapper) = print(io, w.name)
 
+#= The same hash in every process for the functions of this module's terms
+   (the wrappers above and the element extractors below). By default a
+   RuntimeGeneratedFunction hashes by the address of its body Expr, and so
+   does a wrapper holding one: the hash of every term calling a Modelica
+   function changed from one process to the next, and with it the order of
+   MTK's dictionaries, its alias choices and the summation order of the
+   generated code. A stiff model at a loose tolerance went from Success to
+   Unstable or InitialFailure by process (MSL DifferenceAmplifier with QNDF
+   at 1e-2, 4 of 52 verify runs). An RGF's type holds a hash of its body's
+   content (`id`), so the type identifies the function. =#
+const _RGF_TAG = getfield(@__MODULE__, Symbol("#_RGF_ModTag"))
+Base.hash(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{<:Any, _RGF_TAG, _RGF_TAG}, h::UInt) = hash(typeof(f), h)
+Base.hash(w::ModelicaFunctionWrapper, h::UInt) = hash(typeof(w), hash(w.name, h))
+
 #= Cache for per-element extractor functions.
    Key: (funcName::Symbol, indices::Tuple{Vararg{Int}}, nArgs::Int)
    Value: the created function object
@@ -871,6 +885,9 @@ Vararg subscripts to support both vectors and N-dimensional arrays.
 struct ConstTableLookupFn{A <: AbstractArray}
   table::A
 end
+#= By its table's content: the default hashed the table's address, which
+   differs by process (see `_RGF_TAG`). =#
+Base.hash(f::ConstTableLookupFn, h::UInt) = hash(f.table, hash(:ConstTableLookupFn, h))
 
 #= Primal value of a table index. A constant table lookup is piecewise-constant
    in its (discrete/enum) index, so an autodiff `Dual` index must collapse to its

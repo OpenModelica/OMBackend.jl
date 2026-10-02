@@ -2233,9 +2233,17 @@ _callbackList(::Nothing) = Any[]
 _callbackList(cb::DiffEqBase.CallbackSet) = Any[cb.continuous_callbacks..., cb.discrete_callbacks...]
 _callbackList(cb::ModelingToolkit.SciMLBase.DECallback) = Any[cb]
 
-# Trivial reinit: no post-event DAE re-initialization, so the merged callback's
-# default (nothing) is behaviour-preserving.
-_isTrivialReinit(ia)::Bool = ia === nothing || ia isa ModelingToolkit.SciMLBase.NoInit
+#= The re-initializations a merged callback can carry for all its components:
+   NoInit (the state as the affect left it) or nothing (the integrator's own,
+   BrownFullBasicInit for a DAE: defaultInitializeKwargs). They differ, and
+   OrdinaryDiffEqCore applies it at every event of the callback, also where it
+   only moves to the event time (`change_t_via_interpolation!`). The merge
+   created the callback with nothing for components that asked NoInit (MTK's
+   events): a full re-solve at each event, at the solve's abstol, and MSL
+   DifferenceAmplifier stopped with InitialFailure at its ramp's end.
+   EventReinit (a branch event's re-solve of the algebraic unknowns) has no
+   state either, so a callback carrying it is as model-independent. =#
+_mergeableReinit(ia)::Bool = ia === nothing || ia isa ModelingToolkit.SciMLBase.NoInit || ia isa EventReinit
 
 #= Typed callable structs for the merged continuous callback. Typed fields and a
    concrete struct type keep the merged condition/affect inferred (vs a closure
@@ -2362,7 +2370,8 @@ any structural surprise: a non-`CallbackSet` argument, a continuous entry that i
 neither a scalar `ContinuousCallback` nor a `VectorContinuousCallback`, non-uniform
 `rootfind` / `save_positions` across components, or any component carrying event
 metadata a flat merge cannot represent (a custom `initialize` / `finalize`, an
-`idxs` slice, or a non-trivial reinitialization algorithm).
+`idxs` slice, or a re-initialization other than nothing, NoInit or EventReinit, or not the
+same for all components).
 """
 function _eraseContinuousCallbacks(cbset)
   local SB = ModelingToolkit.SciMLBase
@@ -2379,13 +2388,16 @@ function _eraseContinuousCallbacks(cbset)
      bound the integrator needs (it never dispatches on the concrete callback type). =#
   #= A flat merge is faithful only when no sub-callback carries event metadata the
      merge cannot represent: a custom `finalize` (would be dropped), an `idxs` slice
-     (the condition would read the wrong state), or a non-trivial reinitialization
-     algorithm (post-event DAE consistency would change). A custom `initialize` IS
+     (the condition would read the wrong state), or a re-initialization the merged
+     callback cannot carry for all of them (`_mergeableReinit`, and the same for
+     all: post-event DAE consistency would change). A custom `initialize` IS
      allowed: it is preserved via the merged initialize below (chua's DAE event). =#
+  local reinit = subs[1].initializealg
   for s in subs
     (s.finalize === SB.FINALIZE_DEFAULT &&
      s.idxs === nothing &&
-     _isTrivialReinit(s.initializealg)) || return cbset
+     _mergeableReinit(s.initializealg) &&
+     typeof(s.initializealg) == typeof(reinit)) || return cbset
   end
   #= A single VectorContinuousCallback applies one rootfind / save_positions to
      every component, so only collapse when these already agree. =#
@@ -2410,11 +2422,13 @@ function _eraseContinuousCallbacks(cbset)
     local affW = FW{Nothing, Tuple{Any, Int}}(_MergedContinuousAffect(subs, offsets, lens, nsub, false))
     local affNW = FW{Nothing, Tuple{Any, Int}}(_MergedContinuousAffect(subs, offsets, lens, nsub, true))
     SB.VectorContinuousCallback(condW, affW, affNW, total;
-                                initialize = initW, rootfind = rootfind, save_positions = savePos)
+                                initialize = initW, rootfind = rootfind, save_positions = savePos,
+                                initializealg = reinit)
   else
     local evW = FW{Nothing, Tuple{Any, Any}}(_MergedContinuousEvents(subs, offsets, nsub))
     SB.VectorContinuousCallback(condW, evW, total;
-                                initialize = initW, rootfind = rootfind, save_positions = savePos)
+                                initialize = initW, rootfind = rootfind, save_positions = savePos,
+                                initializealg = reinit)
   end
   return SB.CallbackSet(vcc, dc...)
 end

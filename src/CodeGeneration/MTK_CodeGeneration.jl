@@ -499,7 +499,41 @@ function defaultInitializeKwargs(problem, kwargs, tableClusters::Bool)
   haskey(kwargs, :initializealg) && return (;)
   tableClusters && return (; initializealg = tableClusterInitAlg())
   ModelingToolkit.SciMLBase.has_initializeprob(problem.f) && return (;)
-  return (; initializealg = DiffEqBase.BrownFullBasicInit(get(kwargs, :abstol, 1.0e-6)))
+  #= A caller's abstol per unknown: NonlinearSolve takes a scalar (a vector
+     was a MethodError in its termination check). =#
+  local abstol = get(kwargs, :abstol, 1.0e-6)
+  return (; initializealg = DiffEqBase.BrownFullBasicInit(abstol isa Number ? abstol : minimum(abstol)))
+end
+
+"""
+    defaultToleranceKwargs(problem, kwargs) -> NamedTuple
+
+The absolute tolerance per unknown of a mass-matrix problem whose algebraic
+unknowns include derivatives (`xˍt`: MTK's dummy derivatives from index
+reduction): Inf for those, so the error control leaves them out, and the
+solve's abstol (1e-6 by default) for the others. Nothing when the caller gave
+an abstol per unknown, or for a problem without such unknowns.
+
+A dummy derivative follows its state's derivative, which the error control of
+the states already bounds; OpenModelica's ODE mode integrates the states only.
+Controlled, it held the steps of MSL DifferenceAmplifier at 1e-11 s while
+V1's 0.2 GHz sine moved the transistors' der(vbc) by 1e9 V/s, until the solve
+stopped near 2e-6 s (MaxIters or Unstable); left out, it runs to 1 s in
+6000 steps and ends at OpenModelica's values. A derivative that is a state
+(`xˍt` after order lowering, a mass-matrix row of 1) stays controlled.
+"""
+function defaultToleranceKwargs(problem, kwargs)
+  local abstol = get(kwargs, :abstol, 1.0e-6)
+  abstol isa Number || return (;)
+  local rows = _algebraicRows(problem.f)
+  isempty(rows) && return (;)
+  local names = string.(getStatesAsSymbols(problem.f))
+  length(names) == length(problem.u0) || return (;)
+  local derivatives = Int[k for k in rows if occursin("ˍt", names[k])]
+  isempty(derivatives) && return (;)
+  local perUnknown = fill(Float64(abstol), length(problem.u0))
+  perUnknown[derivatives] .= Inf
+  return (; abstol = perUnknown)
 end
 
 
@@ -865,7 +899,8 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       global LATEST_SOLVE_TRIPLE = (_problemForSolver, _solver, nothing)
       local _initKw = OMBackend.CodeGeneration.defaultInitializeKwargs(_problemForSolver, kwargs,
                                                                        $(_modelHasTableClusters(simCode)))
-      local _sol = solve(_problemForSolver, _solver; kwargs..., _initKw...)
+      local _tolKw = OMBackend.CodeGeneration.defaultToleranceKwargs(_problemForSolver, kwargs)
+      local _sol = solve(_problemForSolver, _solver; kwargs..., _initKw..., _tolKw...)
       #= If the init-alg-remake'd problem produced InitialFailure (MTK could
          not reconcile init-alg hard-start u0 with the algebraic constraints),
          fall back to the un-remake'd problem so the solver can pick any
@@ -882,7 +917,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
         else
           _origProblem
         end
-        _sol = solve(_fallbackProb, _solver; kwargs..., _initKw...)
+        _sol = solve(_fallbackProb, _solver; kwargs..., _initKw..., _tolKw...)
       end
       #= Run `when terminal()` bodies once against the final solution (gated: emitted only if the model has a terminal event). =#
       $(createTerminalBodyRunner(simCode))
