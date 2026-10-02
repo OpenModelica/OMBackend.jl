@@ -1,11 +1,9 @@
 name = "OMBackend"
 uuid = "9400bd5f-7561-42f6-8760-03756753da50"
-authors = ["John Tinnerholm <johti17@liu.se>", "Karim Abdelhak <karim.abdelhak@fh-bielefeld.de>", "AnHeuermann <andreas.heuermann@fh-bielefeld.de>"]
 version = "0.5.1"
+authors = ["John Tinnerholm <johti17@liu.se>", "Karim Abdelhak <karim.abdelhak@fh-bielefeld.de>", "AnHeuermann <andreas.heuermann@fh-bielefeld.de>"]
 
 [deps]
-NonlinearSolve = "8913a72c-1f9b-4ce2-8d82-65094dcecaec"
-OrdinaryDiffEqBDF = "6ad6398a-0878-4a85-9266-38940aa047c8"
 ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
 Absyn = "ce2f92e2-a952-11e9-0543-8b443f216f1d"
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
@@ -22,12 +20,17 @@ Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
 ImmutableList = "4a558cac-c1ed-11e9-20da-3584bcd8709a"
 JuliaFormatter = "98e50ef6-434e-11e9-1051-2b60c6c9e899"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+ListUtil = "b2a72b7e-c1ef-11e9-3a87-6ddc5900c366"
 MacroTools = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
 MetaGraphs = "626554b9-1ddb-594c-aa3c-2596fe9399a5"
 MetaModelica = "9d7f2a79-07b5-5542-8b19-c0100dda6b06"
 ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
+NonlinearSolve = "8913a72c-1f9b-4ce2-8d82-65094dcecaec"
 OMFrontend = "b10394b5-f439-4073-a0c5-e09cb00cf46c"
 OMParser = "11f87224-cae7-4e99-a924-e50d12f62c59"
+OMRuntimeExternalC = "ada38df0-e20e-11ed-02f3-2b4b19c1ec8a"
+OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
+OrdinaryDiffEqBDF = "6ad6398a-0878-4a85-9266-38940aa047c8"
 Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
@@ -37,40 +40,32 @@ Sundials = "c3572dad-4567-51f8-b174-8c6c989267f4"
 SymbolicUtils = "d1185830-fcd6-423d-90d6-eec64667417b"
 Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
 Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
-ListUtil="b2a72b7e-c1ef-11e9-3a87-6ddc5900c366"
-OMRuntimeExternalC = "ada38df0-e20e-11ed-02f3-2b4b19c1ec8a"
-OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 
-# All OM.jl subpackages live in-tree as sibling directories. Point Pkg at the
-# local checkouts so resolve uses the working copies instead of whatever happens
-# to be cached in the General registry. OMRuntimeExternalC in particular is not
-# registered at all. Bumping a subpackage version only requires editing the
-# sibling's Project.toml - these pointers stay the same.
 [sources]
-Absyn = { path = "../Absyn.jl" }
-DAE = { path = "../DAE.jl" }
-ImmutableList = { path = "../ImmutableList.jl" }
-ListUtil = { path = "../ListUtil.jl" }
-MetaModelica = { path = "../MetaModelica.jl" }
-OMFrontend = { path = "../OMFrontend.jl" }
-OMParser = { path = "../OMParser.jl" }
-OMRuntimeExternalC = { path = "../OMRuntimeExternalC.jl" }
-SCode = { path = "../SCode.jl" }
+Absyn = {path = "/Users/jtinnerholm/Projects/OM.jl/Absyn.jl"}
+DAE = {path = "/Users/jtinnerholm/Projects/OM.jl/DAE.jl"}
+ImmutableList = {path = "/Users/jtinnerholm/Projects/OM.jl/ImmutableList.jl"}
+ListUtil = {path = "/Users/jtinnerholm/Projects/OM.jl/ListUtil.jl"}
+MetaModelica = {path = "/Users/jtinnerholm/Projects/OM.jl/MetaModelica.jl"}
+OMFrontend = {path = "/Users/jtinnerholm/Projects/OM.jl/OMFrontend.jl"}
+OMParser = {path = "/Users/jtinnerholm/Projects/OM.jl/OMParser.jl"}
+OMRuntimeExternalC = {path = "/Users/jtinnerholm/Projects/OM.jl/OMRuntimeExternalC.jl"}
+SCode = {path = "/Users/jtinnerholm/Projects/OM.jl/SCode.jl"}
 
 [compat]
 ADTypes = "1"
-NonlinearSolve = "4"
-MetaModelica = "0.4.2"
-ModelingToolkit = "11.21"
-PrecompileTools = "1"
-julia = "1.13"
 Absyn = "1.3.5"
 DAE = "1.2.0"
 ImmutableList = "0.4.2"
+MetaModelica = "0.4.2"
+ModelingToolkit = "11.21"
+NonlinearSolve = "4"
 OMFrontend = "1.3.1"
 OMParser = "0.2.1"
 OMRuntimeExternalC = "0.3.3"
+PrecompileTools = "1"
 SCode = "1.2.0"
+julia = "1.13"
 
 [extras]
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"

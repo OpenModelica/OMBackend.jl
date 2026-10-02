@@ -7,8 +7,9 @@ push!(LOAD_PATH, "@v#.#", "@stdlib")
 using Pkg
 
 # The runtime dependency set is already declared in Project.toml and resolved
-# by Pkg.instantiate, so we do not re-add packages here. The OM siblings live
-# in [sources] as local paths. The only thing the build step still owns is
+# by Pkg.instantiate, so we do not re-add packages here. The OM siblings come
+# from the registry, or are developed from local checkouts (OM.jl's ci/
+# scripts, this package's CI). The only thing the build step still owns is
 # triggering the native build steps of OMParser and OMFrontend so that their
 # generated artifacts are present before the first `using OMBackend`.
 

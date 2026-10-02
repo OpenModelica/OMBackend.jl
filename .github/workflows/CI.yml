@@ -51,10 +51,12 @@ jobs:
         with:
           path: OMBackend.jl
 
-      # Siblings are consumed via Project.toml's [sources] block. The shared
-      # action checks them out at the branch that matches this change (the PR
-      # branch if the sibling has it, else the PR base branch, e.g. 1.13, else
-      # master) from the OpenModelica repositories.
+      # The shared action checks the siblings out at the branch that matches
+      # this change (the PR branch if the sibling has it, else the PR base
+      # branch, e.g. 1.13, else master) from the OpenModelica repositories;
+      # the step after Julia's setup develops them into the project (the
+      # registered package has no [sources], so the registry's versions are
+      # not what is tested).
       - name: Checkout sibling OM*.jl packages
         uses: JKRT/OM.jl/.github/actions/checkout-siblings@master
         with:
@@ -81,6 +83,14 @@ jobs:
           import Pkg
           Pkg.Registry.add("General")
           Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
+
+      - name: Develop the sibling checkouts
+        shell: julia --color=yes --project=OMBackend.jl {0}
+        run: |
+          import Pkg
+          Pkg.develop([Pkg.PackageSpec(path = p) for p in
+                       ("Absyn.jl", "DAE.jl", "ImmutableList.jl", "ListUtil.jl", "MetaModelica.jl",
+                        "OMFrontend.jl", "OMParser.jl", "OMRuntimeExternalC.jl", "SCode.jl")])
 
       - name: Instantiate and build
         uses: julia-actions/julia-buildpkg@v1
