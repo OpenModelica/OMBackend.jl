@@ -274,6 +274,7 @@ function clearCaches!(; models::Bool=true,
   models          && (empty!(COMPILED_MODELS_MTK);
                       empty!(IMTKGen.BUILT); empty!(IMTKGen.BUILT_HASH);
                       empty!(IMTKGen.REDUCED_SYSTEMS); empty!(IMTKGen.PRISTINE_P);
+                      empty!(CodeGeneration.DAE_REINIT);
                       push!(cleared, "models"))
   implementations && (empty!(CodeGeneration.MODELICA_FUNCTION_IMPLS);    push!(cleared, "implementations"))
   wrappers        && (empty!(CodeGeneration.MODELICA_FUNCTION_WRAPPERS); push!(cleared, "wrappers"))

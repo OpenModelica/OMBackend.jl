@@ -42,9 +42,21 @@ const TUNABLE_SETS    = Dict{String, Set{String}}()
 #= Forget a model's cached build (a failed or skipped build, a translate in
    another mode): an older build must not answer for the current one. =#
 function forgetBuild(cname::String)
+  _forgetReinit(cname)
   for cache in (BUILT, BUILT_HASH, REDUCED_SYSTEMS, PRISTINE_P, TUNABLE_SETS)
     delete!(cache, cname)
   end
+  return nothing
+end
+
+#= The re-initialization registered for a cached build's problem
+   (CodeGeneration.DAE_REINIT, keyed by its reduced system): its closure holds
+   the build's data, kept for the whole session when only the build was
+   forgotten. =#
+function _forgetReinit(cname::String)
+  local built = get(BUILT, cname, nothing)
+  (built isa Tuple && !isempty(built)) || return nothing
+  delete!(_OMBackend().CodeGeneration.DAE_REINIT, built[1].f.sys)
   return nothing
 end
 
@@ -112,6 +124,9 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
         OMB._fallback(_e, :imtkSourceDump)
       end
     end
+    #= The previous build's re-initialization goes with it (a failed build
+       forgets it as well, below). =#
+    _forgetReinit(cname)
     Core.eval(OMB, modelCode)
     local res = Base.invokelatest() do
       local mod = getfield(OMB, Symbol(modelName))
@@ -197,7 +212,7 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
         prob = _setParameterValues(prob, parameters, modelName)
         #= A DAE's consistent initial state depends on the parameters: solve it
            again for these values (the build solved it for the compiled ones). =#
-        local reinit = get(OMB.CodeGeneration.DAE_REINIT, OMB.Runtime.ModelingToolkit.SciMLBase.unwrapped_f(prob.f.f), nothing)
+        local reinit = get(OMB.CodeGeneration.DAE_REINIT, prob.f.sys, nothing)
         #= In the latest world: the re-initialization calls functions of the
            model's eval (the RHS, the relation literals), which can be newer
            than a caller that translated in the same call. =#

@@ -87,9 +87,12 @@ function _buildDirectODEFunction(rhsFunc, u0, p_vec, t0;
     ModelingToolkit.ODEFunction{true, FW}(wrappedRHS; mass_matrix=mass_matrix, sys=sys, erasedKw...)
 end
 
-#= Re-initialization per problem (keyed by its generated RHS function):
-   parameter vector -> consistent initial state, the vector's
-   initialization-defined parameters assigned. See buildDirectRHSProblem. =#
+#= Re-initialization per problem (keyed by its reduced system, `prob.f.sys`,
+   one per build): parameter vector -> consistent initial state, the vector's
+   initialization-defined parameters assigned. See buildDirectRHSProblem. It
+   was keyed by the generated RHS, which two models of the same equations
+   share (one RuntimeGeneratedFunction per code): the last build's answered
+   for both. =#
 const DAE_REINIT = IdDict{Any, Function}()
 
 """
@@ -112,7 +115,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
                                liftedDiscretes=String[],
                                freeParameters=String[],
+                               assignedParameters=String[],
                                userPins=String[],
+                               discreteVariables=String[],
+                               tunableParameters=String[],
                                initRelations=Any[],
                                initClusters=Any[],
                                discreteStarts=Dict{String, Float64}())
@@ -155,7 +161,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
      from u at the initial state (in the DAE init solve, at each evaluation).
      A row may read another assigned parameter: evaluating again settles a
      chain. =#
-  local paramAssign = _initialParameterAssignments(reducedSystem, states, params, iv)
+  local paramAssign = _initialParameterAssignments(reducedSystem, states, params, iv;
+                                                   assignable = Set{String}(assignedParameters))
   local assignedNames = paramAssign === nothing ? OrderedSet{String}() :
     OrderedSet{String}(string(params[k]) for k in last(paramAssign))
   #= Real parameters without a value that no initialization equation assigns
@@ -172,15 +179,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     @debug "DirectRHS: free parameters not among the system's: $(setdiff(freeParameters, string.(params)))"
   local unknownParamNames = union(assignedNames, OrderedSet{String}(string(params[k]) for k in freeIdx),
                                   dependents === nothing ? OrderedSet{String}() : dependents[3])
-  local follow! = dependents === nothing ? nothing : let (dF, dIdxs) = dependents
-    pv -> begin
-      local vals = dF(pv)
-      for (i, k) in enumerate(dIdxs)
-        pv[k] = Float64(vals[i])
-      end
-      nothing
-    end
-  end
+  local follow! = _dependentsWriter(dependents)
   local assignParams! = paramAssign === nothing ? nothing : let (pF, pIdxs) = paramAssign
     (pv, u, t) -> begin
       for _ in 1:length(pIdxs)
@@ -214,7 +213,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local p0 = _buildParamVector(params, pars; resolvedParams=resolvedParams)
     if assignParams! !== nothing
       assignParams!(p0, Float64[], tspan[1])
-      DAE_REINIT[emptyRHS] = pv -> (assignParams!(pv, Float64[], tspan[1]); [0.0])
+      DAE_REINIT[reducedSystem] = pv -> (assignParams!(pv, Float64[], tspan[1]); [0.0])
     end
     return ModelingToolkit.ODEProblem{true}(f0, [0.0], tspan, p0;
                                             callback=_extractAndMergeEventCallbacks(reducedSystem, callbacks))
@@ -239,14 +238,21 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   # post-simplification unknowns and provide Modelica start values for variables
   # that splitInitialValues could not map (pre-simplification names do not match).
   local systemGuesses = ModelingToolkit.guesses(reducedSystem)
+  #= Two initialization values for one variable are refused, except for a
+     discrete's (its fixed start is pre(v) = start). =#
+  local valuesMayDiffer = union(Set{String}(discreteVariables), Set{String}(liftedDiscretes))
   local (hardInitialValues, initEqPinKeys) = _collectHardInitializationValues(
-    reducedSystem, finalInitialValues; resolvedParams=initResolved)
+    reducedSystem, finalInitialValues; resolvedParams=initResolved, valuesMayDiffer=valuesMayDiffer)
   local observedEquations = ModelingToolkit.observed(reducedSystem)
   local u0 = _buildStateVector(states, finalInitialValues; resolvedParams=resolvedParams,
                                 systemGuesses=systemGuesses,
                                 hardInitialValues=hardInitialValues,
                                 observedEquations=observedEquations)
   local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
+  #= A run with other tunable parameter values (DAE_REINIT, below). =#
+  local (resolvedAt, entryAt, followTunable!) =
+    _runEntry(reducedSystem; states, params, pars, finalInitialValues, systemGuesses, resolvedParams,
+              unknownParamNames, valuesMayDiffer, observedEquations, uStart = copy(u0), tunableParameters)
 
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
   OMBackend.envSwitch("OMBACKEND_INIT_TRACE") &&
@@ -286,11 +292,14 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
                                       sys=reducedSystem, jacFunc=jacFunc, jacProto=jacProto,
                                       tgradFunc=tgradFunc)
-    if assignParams! !== nothing
-      assignParams!(p_vec, u0, tspan[1])
-      #= Other tunable parameter values may change them. =#
-      local u0Start = copy(u0)
-      DAE_REINIT[rhsFunc] = pv -> (assignParams!(pv, u0Start, tspan[1]); copy(u0Start))
+    assignParams! === nothing || assignParams!(p_vec, u0, tspan[1])
+    #= Other tunable parameter values may change the start values and the
+       parameters the initialization assigns. =#
+    DAE_REINIT[reducedSystem] = pv -> begin
+      followTunable!(pv)
+      local u = entryAt(resolvedAt(pv))
+      assignParams! === nothing || assignParams!(pv, u, tspan[1])
+      u
     end
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   else
@@ -487,11 +496,15 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     assignParams! === nothing || assignParams!(p_vec, u0, 0.0)
     #= The relations' literals at the solved state; solved again until they settle. =#
     local useExtra = extraResiduals !== nothing
+    #= The derivative targets of the solve in progress: a run with other
+       tunable values sets its own (DAE_REINIT); its settles re-solved with
+       the compiled ones (`der(x) = p` with a relation that flips: x = 2, omc 5). =#
+    local targetsNow = Ref(derivativeInitTargets)
     local resolveWith = (u, pv, ok) -> begin
       local kept = u[keptIdx]
       local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
                                               pinned=pinnedIdx,
-                                              derivative_targets=derivativeInitTargets,
+                                              derivative_targets=targetsNow[],
                                               eqLabels=eqLabels,
                                               extra_residuals=useExtra ? residualsAt(pv) : nothing,
                                               discrete_pinned=discretePinnedIdx,
@@ -513,6 +526,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        only without it (`x(start = 1, fixed = true)` with an initial equation
        that wants another x: x = 0.48, `v(fixed = true)` with `v = xa^2 + 1`:
        v = 1). OpenModelica refuses such a model. =#
+    local userPinIdx = Int[]
     if !isempty(userPins)
       local userPinSet = Set{String}(userPins)
       #= A pin whose value reads a parameter the initialization computes (free,
@@ -533,30 +547,62 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
         end
         any(v -> _plainVariableName(v) in unknownParamNames, vars)
       end
-      local moved = Int[i for i in pinnedIdx if (local nm = _plainVariableName(states[i]); nm in userPinSet) &&
-                                             !readsComputed(nm) &&
-                                             !isapprox(u0[i], uEntry[i]; rtol = 1e-8, atol = 1e-10)]
+      userPinIdx = Int[i for i in pinnedIdx if (local nm = _plainVariableName(states[i]); nm in userPinSet) &&
+                                          !readsComputed(nm)]
+    end
+    local checkUserPins = (u, uIn) -> begin
+      local moved = Int[i for i in userPinIdx if !isapprox(u[i], uIn[i]; rtol = 1e-8, atol = 1e-10)]
       isempty(moved) ||
         OMBackend.unsupported("fixed start values or initial equations that the initialization cannot hold",
-                              join(("$(states[i]) = $(u0[i]) (fixed $(uEntry[i]))" for i in first(moved, 5)), ", "))
+                              join(("$(states[i]) = $(u[i]) (fixed $(uIn[i]))" for i in first(moved, 5)), ", "))
     end
+    checkUserPins(u0, uEntry)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
     #= The same initialization for other parameter values (tunable parameters,
        OMBackend.withTunableParameters): a run with changed parameters needs
        the consistent initial state for them, not the one solved here. It
        starts from this one, which is close for nearby values. =#
     local u0Solved = copy(u0)
-    DAE_REINIT[rhsFunc] = pv -> begin
-      local u = _solveDAEInitializationFree!(copy(u0Solved), initRhs, pv, mm, freeIdx, follow!;
+    local obsTargets = last(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=initResolved))
+    DAE_REINIT[reducedSystem] = pv -> begin
+      followTunable!(pv)
+      local r = resolvedAt(pv)
+      #= The entries the values change (a fixed start p, `x = p`) start from
+         their new entry values, the others from this solution. =#
+      local entry = entryAt(r)
+      local u = copy(u0Solved)
+      for i in eachindex(u)
+        entry[i] != uEntry[i] && (u[i] = entry[i])
+      end
+      #= The derivative targets read them too (`der(x) = p` kept x for p = 2).
+         Those on algebraic or observed variables are inside the residual
+         functions built above: a change there is refused. =#
+      local targets = derivativeInitTargets
+      if r !== nothing
+        targets = _derivativeInitializationTargets(reducedSystem, states; resolvedParams=r.initResolved)
+        (Pair{Int, Float64}[t for t in targets if 1 <= t.first <= size(mm, 1) && mm[t.first, t.first] == 0] == algDerTargets &&
+         last(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=r.initResolved)) == obsTargets) ||
+          OMBackend.unsupported("other tunable parameter values in a derivative initial equation on an algebraic or observed variable",
+                                join(r.changed, ", "))
+      end
+      targetsNow[] = targets
+      try
+        u = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
                                          pinned=pinnedIdx,
-                                         derivative_targets=derivativeInitTargets,
+                                         derivative_targets=targets,
                                          eqLabels=eqLabels,
                                          extra_residuals=useExtra ? residualsAt(pv) : nothing,
                                          discrete_pinned=discretePinnedIdx,
                                          warm=true)
-      assignParams! === nothing || assignParams!(pv, u, 0.0)
-      u = first(_settleInitialDiscretes!(resolveWith, u, u, pv, initDiscretes, diffKept; startPath = false))
-      _settleInitialRelations!(resolveWith, u, pv, initRels)
+        assignParams! === nothing || assignParams!(pv, u, 0.0)
+        u = first(_settleInitialDiscretes!(resolveWith, u, u, pv, initDiscretes, diffKept; startPath = false))
+        u = _settleInitialRelations!(resolveWith, u, pv, initRels)
+      finally
+        targetsNow[] = derivativeInitTargets
+      end
+      #= OpenModelica fails such a run (`-override`), as it refuses such a model. =#
+      checkUserPins(u, entry)
+      u
     end
   end
 
@@ -569,7 +615,8 @@ end
    constraints that must stay pinned through the free phases of the init
    solve regardless of what splitInitialValues demoted to guesses. =#
 function _collectHardInitializationValues(reducedSystem, finalInitialValues;
-                                          resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
+                                          resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
+                                          valuesMayDiffer::Union{AbstractSet{String},Nothing}=nothing)
   local values = Dict{Any, Float64}()
   local constraintKeys = OrderedSet{String}()
   for pair in finalInitialValues
@@ -578,6 +625,11 @@ function _collectHardInitializationValues(reducedSystem, finalInitialValues;
     values[pair.first] = val
   end
   local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
+  #= Two of them that give one variable different values (an initial
+     algorithm's x := 2 and `initial equation y = 3` with y = x): the last one
+     was taken without a word; OpenModelica refuses the inconsistent system.
+     Checked when `valuesMayDiffer` is given, but not for the names in it. =#
+  local equationValues = Dict{String, Float64}()
   for eq in initEqs
     startswith(string(eq.lhs), "Differential(") && continue
     local rhsVal = _literalNumericValue(eq.rhs)
@@ -585,12 +637,112 @@ function _collectHardInitializationValues(reducedSystem, finalInitialValues;
       rhsVal = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams)
     end
     rhsVal === nothing && continue
+    local key = string(eq.lhs)
+    local earlier = get(equationValues, key, nothing)
+    (valuesMayDiffer === nothing || earlier === nothing || _plainVariableName(key) in valuesMayDiffer ||
+     isapprox(earlier, rhsVal; rtol = 1e-10, atol = 1e-12)) ||
+      OMBackend.unsupported("initialization equations that give a variable two values",
+                            "$(_plainVariableName(key)) = $(earlier) and $(rhsVal)")
+    equationValues[key] = rhsVal
     values[eq.lhs] = rhsVal
-    push!(constraintKeys, string(eq.lhs))
+    push!(constraintKeys, key)
   end
   return (values, constraintKeys)
 end
 
+
+#= What a run with other tunable parameter values needs (DAE_REINIT,
+   OMBackend.withTunableParameters; OpenModelica's `-override`), as
+   `(resolvedAt, entryAt, followTunable!)`:
+   - `followTunable!(pv)` sets the parameters bound to tunable ones
+     (`q = 2 * p`, an MTK parameter whose value the run does not set) from
+     their bindings. Stale, a relation-when read q's compiled value.
+   - `resolvedAt(pv)` is nothing when no parameter the entry state reads
+     changed, else `(resolved, initResolved, changed)`: the parameter values
+     as the build resolved them, with the run's. Only the parameters the
+     symbolic start values, guesses and initialization equations read, and
+     those their bindings read, are resolved again (all 140 of the MSL
+     DoublePendulum's took 0.2 s a run).
+   - `entryAt(r)` is the entry state for them, evaluated as the build's
+     (`uStart`): `x(start = p, fixed = true)` and `initial equation x = p`
+     kept x(0) = 1 for p = 2. The parameters the initialization computes keep
+     their start values. =#
+function _runEntry(reducedSystem; states, params, pars, finalInitialValues, systemGuesses, resolvedParams,
+                   unknownParamNames, valuesMayDiffer, observedEquations, uStart, tunableParameters)
+  local paramNames = String[string(p) for p in params]
+  local tunableSet = Set{String}(tunableParameters)
+  local roots = OrderedSet{String}(nm for nm in paramNames
+                                   if !(nm in unknownParamNames) &&
+                                      OMBackend.isTunableParameter(_plainVariableName(nm), tunableSet))
+  local followTunable! = something(_dependentsWriter(isempty(roots) ? nothing :
+                                                      _parameterDependents(pars, params, roots; resolvedParams=resolvedParams)),
+                                   pv -> nothing)
+  local parsByName = Dict{String, Any}(string(k) => v for (k, v) in pars)
+  local entryParams = _entryParameters(Iterators.flatten(((p.second for p in finalInitialValues),
+                                                          (eq.rhs for eq in ModelingToolkit.initialization_equations(reducedSystem)),
+                                                          (last(p) for p in systemGuesses))), parsByName)
+  #= The run sets values; a bound parameter's comes from its binding (above). =#
+  local valueIdx = Pair{String, Int}[nm => k for (k, nm) in enumerate(paramNames)
+                                     if nm in entryParams && !(nm in unknownParamNames) &&
+                                        _tryToFloat64(get(parsByName, nm, nothing)) !== nothing]
+  local entryPars = Tuple{Any, Any, String}[(k, v, string(k)) for (k, v) in pars if string(k) in entryParams]
+  local used = Set{String}(paramNames)
+  local resolvedAt = pv -> begin
+    local changed = Dict{String, Float64}(nm => Float64(pv[k]) for (nm, k) in valueIdx
+                                          if Float64(pv[k]) != get(resolvedParams, nm, nothing))
+    isempty(changed) && return nothing
+    local parsAt = Dict{Any, Any}(k => get(changed, nm, v) for (k, v, nm) in entryPars)
+    local resolved = merge(resolvedParams, _resolveParamValues(parsAt; used = used))
+    local initResolved = isempty(unknownParamNames) ? resolved :
+      Dict{String, Float64}(k => v for (k, v) in resolved if !(k in unknownParamNames))
+    (resolved = resolved, initResolved = initResolved, changed = sort!(collect(keys(changed))))
+  end
+  local observedStrs = String[string(eq) for eq in observedEquations]
+  local entryAt = r -> r === nothing ? copy(uStart) :
+    _buildStateVector(states, finalInitialValues; resolvedParams=r.resolved, systemGuesses=systemGuesses,
+                      hardInitialValues=first(_collectHardInitializationValues(reducedSystem, finalInitialValues;
+                                                                               resolvedParams=r.initResolved,
+                                                                               valuesMayDiffer=valuesMayDiffer)),
+                      observedEquations=observedEquations, observedStrs=observedStrs)
+  return (resolvedAt, entryAt, followTunable!)
+end
+
+#= `pv -> nothing` writing the dependents' values into `pv`, for a
+   `_parameterDependents` result; nothing for nothing. =#
+function _dependentsWriter(dependents)
+  dependents === nothing && return nothing
+  local (dF, dIdxs) = dependents
+  return pv -> begin
+    local vals = dF(pv)
+    for (i, k) in enumerate(dIdxs)
+      pv[k] = Float64(vals[i])
+    end
+    nothing
+  end
+end
+
+#= The parameters `values` read that are in `parsByName`, and those their
+   bindings read. A value whose variables cannot be listed makes every
+   parameter one (the entry is then evaluated again for any change). =#
+function _entryParameters(values, parsByName::AbstractDict{String})::OrderedSet{String}
+  local out = OrderedSet{String}()
+  local pending = Any[v for v in values if _tryToFloat64(v) === nothing]
+  while !isempty(pending)
+    local vars = try
+      Symbolics.get_variables(Symbolics.unwrap(pop!(pending)))
+    catch e
+      OMBackend._fallback(e, :entryParameters, impact = :result)
+      return OrderedSet{String}(keys(parsByName))
+    end
+    for x in vars
+      local nm = string(x)
+      (nm in out || !haskey(parsByName, nm)) && continue
+      push!(out, nm)
+      push!(pending, parsByName[nm])
+    end
+  end
+  return out
+end
 
 #= Whether an initialization equation needs a solve: one that is not a start
    value `x = v`, a variable of the system and a number (a derivative row,
@@ -772,12 +924,16 @@ end
    keeps its value at the initial state. Returns `(pFunc, pIdxs)`, where
    `pFunc(u, p, t)` evaluates the values of `p[pIdxs]`, or nothing. A row whose
    f reads its own p stays a residual row. =#
-function _initialParameterAssignments(reducedSystem, states, params, iv)
+function _initialParameterAssignments(reducedSystem, states, params, iv; assignable::AbstractSet{String})
   local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
   local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
   local exprs = Any[]
   local pIdxs = Int[]
   for eq in initEqs
+    #= Only a parameter without a value (ASSIGNED_PARAMETERS): a bound or
+       tunable one on the left is a residual row. By the plain name: an array
+       element prints as `var"jointRRP_e_im[1]"` (the MSL analytic loops). =#
+    _plainVariableName(eq.lhs) in assignable || continue
     local k = get(paramIdx, string(eq.lhs), 0)
     k == 0 && continue
     push!(exprs, eq.rhs)
@@ -872,7 +1028,9 @@ function _parameterDependents(pars, params, roots::AbstractSet{String};
     fn(ones(length(params)))
     fn
   catch e
-    OMBackend._fallback(e, :_parameterDependents)
+    #= The dependents then keep their compiled values (a free parameter's,
+       a tunable run's): a result, not only speed. =#
+    OMBackend._fallback(e, :_parameterDependents, impact = :result)
     @debug "DirectRHS: could not build the dependent parameters" exception = e
     return nothing
   end
@@ -1548,7 +1706,8 @@ function _buildStateVector(states, finalInitialValues;
                            resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
                            systemGuesses=nothing,
                            hardInitialValues=nothing,
-                           observedEquations=nothing)
+                           observedEquations=nothing,
+                           observedStrs=nothing)
   local nStates = length(states)
   local u0 = zeros(Float64, nStates)
   local stateStrToIdx = Dict{String, Int}()
@@ -1589,7 +1748,8 @@ function _buildStateVector(states, finalInitialValues;
   local aliasMatched = 0
   if observedEquations !== nothing && !isempty(observedEquations)
     aliasMatched = _propagateObservedAliasInitialValues!(
-      u0, states, matchedSet, hardValueMap, observedEquations)
+      u0, states, matchedSet, hardValueMap, observedEquations;
+      equationStrs = something(observedStrs, String[string(eq) for eq in observedEquations]))
   end
   # Fill unmatched states from system guesses (post-simplification variable space).
   # These provide Modelica start values for algebraic variables whose pre-simplification
@@ -1611,9 +1771,12 @@ function _buildStateVector(states, finalInitialValues;
 end
 
 
+#= `equationStrs`: the equations' strings, once, not per state and round
+   (`string` of an equation is 5-10 us, and the scan was 97 % of an entry
+   state's cost, a tunable run's too). =#
 function _propagateObservedAliasInitialValues!(u0, states, matchedSet::OrderedSet{String},
                                                hardValueMap::Dict{Any, Float64},
-                                               observedEquations)
+                                               observedEquations; equationStrs::AbstractVector{String})
   local aliasMatched = 0
   local progressed = true
   while progressed
@@ -1621,7 +1784,7 @@ function _propagateObservedAliasInitialValues!(u0, states, matchedSet::OrderedSe
     for (i, st) in enumerate(states)
       local stStr = string(st)
       stStr in matchedSet && continue
-      local resolved = _resolveObservedAffineInitialValue(st, observedEquations, hardValueMap)
+      local resolved = _resolveObservedAffineInitialValue(st, observedEquations, hardValueMap, equationStrs)
       resolved === nothing && continue
       u0[i] = resolved
       hardValueMap[st] = resolved
@@ -1634,12 +1797,14 @@ function _propagateObservedAliasInitialValues!(u0, states, matchedSet::OrderedSe
 end
 
 
-function _resolveObservedAffineInitialValue(target, observedEquations, hardValueMap::Dict{Any, Float64})
+function _resolveObservedAffineInitialValue(target, observedEquations, hardValueMap::Dict{Any, Float64},
+                                            equationStrs::AbstractVector{String} = String[string(eq) for eq in observedEquations])
   local targetStr = string(target)
-  for eq in observedEquations
-    contains(string(eq), targetStr) || continue
-    local knownValues = Dict{Any, Any}(k => v for (k, v) in hardValueMap
-                                      if string(k) != targetStr)
+  local knownValues = nothing
+  for (eq, eqStr) in zip(observedEquations, equationStrs)
+    contains(eqStr, targetStr) || continue
+    knownValues === nothing &&
+      (knownValues = Dict{Any, Any}(k => v for (k, v) in hardValueMap if string(k) != targetStr))
     local resolved = _resolveAffineInitialValue(target, eq, knownValues)
     resolved === nothing || return resolved
   end
@@ -1767,6 +1932,18 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
 end
 
 
+#= The number `v` holds, or nothing. SymbolicUtils keeps a constant as a
+   Const term: `Num(1.0)` unwraps to one, not to a Number, so a test for a
+   Number missed every constant (each was resolved by substitution, 0.6 s for
+   the MSL DoublePendulum's 140 parameters). =#
+function _constantNumber(v)
+  local u = v isa Symbolics.Num ? Symbolics.unwrap(v) : v
+  u isa Number && return u
+  u isa Symbolics.SymbolicUtils.BasicSymbolic || return nothing
+  local c = Symbolics.SymbolicUtils.unwrap_const(u)
+  return c isa Number ? c : nothing
+end
+
 """
     _resolveParamValues(pars; used = nothing)
 
@@ -1782,12 +1959,12 @@ function _resolveParamValues(pars; used::Union{Nothing, Set{String}} = nothing)
 
   for (k, v) in pars
     local kStr = string(k)
-    local uv = v isa Symbolics.Num ? Symbolics.unwrap(v) : v
-    if uv isa Number
-      numericByStr[kStr] = Float64(uv)
+    local cv = _constantNumber(v)
+    if cv !== nothing
+      numericByStr[kStr] = Float64(cv)
     else
       local uk = k isa Symbolics.Num ? Symbolics.unwrap(k) : k
-      push!(symbolicByKey, (uk, uv, kStr))
+      push!(symbolicByKey, (uk, v isa Symbolics.Num ? Symbolics.unwrap(v) : v, kStr))
     end
   end
 
@@ -1822,8 +1999,9 @@ function _resolveParamValues(pars; used::Union{Nothing, Set{String}} = nothing)
       end
       # Unwrap Num if needed before checking for numeric
       local unwrapped = resolved isa Symbolics.Num ? Symbolics.unwrap(resolved) : resolved
-      if unwrapped isa Number
-        local fval = Float64(unwrapped)
+      local cval = _constantNumber(unwrapped)
+      if cval !== nothing
+        local fval = Float64(cval)
         numericByStr[kStr] = fval
         nameToNumeric[kStr] = fval
         subDict[uk] = fval
@@ -1854,8 +2032,9 @@ function _resolveParamValues(pars; used::Union{Nothing, Set{String}} = nothing)
           end
           # Unwrap Num if needed, then check for numeric result
           local unwrapped2 = resolved2 isa Symbolics.Num ? Symbolics.unwrap(resolved2) : resolved2
-          if unwrapped2 isa Number
-            local fval2 = Float64(unwrapped2)
+          local cval2 = _constantNumber(unwrapped2)
+          if cval2 !== nothing
+            local fval2 = Float64(cval2)
             numericByStr[kStr] = fval2
             nameToNumeric[kStr] = fval2
             subDict[uk] = fval2
@@ -2195,8 +2374,9 @@ function _toFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=not
 end
 
 function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)::Union{Float64, Nothing}
+  local cv = _constantNumber(val)
+  cv === nothing || return Float64(cv)
   local unwrapped = val isa Symbolics.Num ? Symbolics.unwrap(val) : val
-  unwrapped isa Number && return Float64(unwrapped)
   # Constant symbolic expression (no free variables): parse its string repr
   local freeVars = try
     Symbolics.get_variables(unwrapped)
@@ -2231,9 +2411,9 @@ function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=
                                      if haskey(resolvedParams, string(fv)))
       if !isempty(subDict)
         local resolved = Symbolics.substitute(unwrapped, subDict)
-        resolved isa Number && return Float64(resolved)
+        local cval = _constantNumber(resolved)
+        cval === nothing || return Float64(cval)
         local rv = resolved isa Symbolics.Num ? Symbolics.unwrap(resolved) : resolved
-        rv isa Number && return Float64(rv)
         local vextract = Symbolics.value(rv)
         vextract isa Number && return Float64(vextract)
         #= A call the substitution does not fold (`floor(2.7)` of the start

@@ -53,25 +53,7 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
       continue
     end
     local rhs = try
-      @match ieqRhsDAE begin
-        DAE.CREF(DAE.CREF_IDENT("time", _, _), _) => expToJuliaExpMTK(ieqRhsDAE, simCode)
-        DAE.CREF(__) => begin
-          local crefAsStr = string(ieqRhsDAE)
-          if haskey(simCode.stringToSimVarHT, crefAsStr)
-            local simCodeVar = last(simCode.stringToSimVarHT[crefAsStr])
-            if SimulationCode.isStateOrAlgebraic(simCodeVar)
-              expToJuliaExpMTK(ieqRhsDAE, simCode)
-            elseif SimulationCode.hasBindingExp(simCodeVar)
-              evalSimCodeParameter(simCodeVar, simCode)
-            else
-              expToJuliaExpMTK(ieqRhsDAE, simCode)
-            end
-          else
-            expToJuliaExpMTK(ieqRhsDAE, simCode)
-          end
-        end
-        _ => evalDAE_Expression(ieqRhsDAE, simCode)
-      end
+      _initialEquationRhs(ieqRhsDAE, simCode)
     catch err
       OMBackend._fallback(err, :initialConstraintRhs; only = UnsupportedLowering, impact = :result)
       @warn "[CODEGEN: initialConstraints] failed to lower RHS; constraint dropped" rhs=ieqRhsDAE err
@@ -80,6 +62,30 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
     push!(result, :($lhs ~ $rhs))
   end
   return result
+end
+
+#= The right side of an initial equation, lowered (both of its forms:
+   generateInitialEquationsAsConstraints, generateInitialEquations). `time`
+   (the independent variable, in no table: MSL ControlledTanks' `v = time`),
+   an unknown and a parameter without a binding stay references; a bound
+   parameter and an expression are evaluated at the build, except where they
+   read a tunable parameter, directly or through a binding: `x = p` and
+   `x = q` with q = 2 * p kept x(0) for every p. =#
+function _initialEquationRhs(rhs, simCode::SimulationCode.SIM_CODE)
+  return @match rhs begin
+    DAE.CREF(DAE.CREF_IDENT("time", _, _), _) => expToJuliaExpMTK(rhs, simCode)
+    DAE.CREF(__) => begin
+      local entry = get(simCode.stringToSimVarHT, string(rhs), nothing)
+      if entry === nothing || SimulationCode.isStateOrAlgebraic(last(entry)) || !SimulationCode.hasBindingExp(last(entry))
+        expToJuliaExpMTK(rhs, simCode)
+      elseif _readsTunableParameter(rhs, simCode)
+        evalDAE_Expression(rhs, simCode; keepTunable = true)
+      else
+        evalSimCodeParameter(last(entry), simCode)
+      end
+    end
+    _ => evalDAE_Expression(rhs, simCode; keepTunable = true)
+  end
 end
 
 #= Whether an equation reads a parameter without a binding (a fixed=false one
@@ -113,36 +119,7 @@ function generateInitialEquations(initialEqs, simCode::SimulationCode.SIM_CODE; 
     local ieqRhsDAE = SimulationCode.toDAEExp(ieq.rhs)
     #= LHS will typically be a variable. Don't have to be though.. =#
     lhs = expToJuliaExpMTK(ieqLhsDAE, simCode)
-    rhs = @match ieqRhsDAE begin
-      #= `time` is the independent variable and never appears in
-         stringToSimVarHT. Route it directly through expToJuliaExpMTK
-         which emits the Julia symbol `t` for it. Without this guard
-         the generic DAE.CREF arm below indexes the HT with key
-         `"time"` and throws KeyError. Surfaced by models like
-         Modelica.Fluid.Examples.ControlledTankSystem.ControlledTanks
-         whose initial equations contain `<var> = time`. =#
-      DAE.CREF(DAE.CREF_IDENT("time", _, _), _) => begin
-        expToJuliaExpMTK(ieqRhsDAE, simCode)
-      end
-      DAE.CREF(__) => begin
-        #= Evaluate the right hand side at this point =#
-        local crefAsStr = string(ieqRhsDAE)
-        local simCodeVar = last(simCode.stringToSimVarHT[crefAsStr])
-        local res = if SimulationCode.isStateOrAlgebraic(simCodeVar)
-          expToJuliaExpMTK(ieqRhsDAE, simCode)
-        elseif SimulationCode.hasBindingExp(simCodeVar)
-          evalSimCodeParameter(simCodeVar, simCode)
-        else
-          #= Parameter without binding (fixed=false): leave as symbol =#
-          expToJuliaExpMTK(ieqRhsDAE, simCode)
-        end
-      end
-      #= For more complicated expressions, we do local constant folding. =#
-      _ => begin
-        res = evalDAE_Expression(ieqRhsDAE, simCode)
-        res
-      end
-    end
+    rhs = _initialEquationRhs(ieqRhsDAE, simCode)
     if parameterAssignment
       push!(initialEqsExps,
             quote
@@ -426,6 +403,34 @@ end
 
 #= A variable's start value in the early pass: its start attribute, a literal
    or an expression that evaluates (`start = x0`, a parameter); else 0.0. =#
+#= The value an initial algorithm section reads for the fixed variable `name`:
+   its start (0 without one, MLS 4.9.1), evaluated at the build. A start that
+   does not evaluate there (a Modelica function's call) is refused, and one
+   that reads a tunable parameter is an error as a direct read is (the pass
+   runs once, at the build): both were read as 0.0 (y0 := x + 1 gave 1 for
+   `x(start = twice(p), fixed = true)`, OpenModelica 3). =#
+function _fixedStartForInitialAlgorithm(name::String, sv, simCode)::Float64
+  local attrs = sv.attributes
+  (attrs isa SOME && hasproperty(attrs.data, :start) && attrs.data.start isa SOME) || return 0.0
+  local start = attrs.data.start.data
+  local startDAE = start isa SimulationCode.Exp ? SimulationCode.toDAEExp(start) : start
+  _readsTunableParameter(startDAE, simCode) &&
+    throw(ArgumentError("the start value of $(name), read by an initial algorithm, reads a tunable parameter; " *
+                        "the initial algorithm is evaluated when the model is compiled, so it would keep its compiled value"))
+  local v = OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(startDAE, simCode), nothing, :initAlgStart)
+  v isa Real && return Float64(v)
+  local folded = _foldParameterBindStatic(start, simCode)
+  folded === nothing || return folded
+  #= Calls and if-expressions (`sqrt(p) + exp(0 * p)`, `if p > 0 then 2 else 3`). =#
+  local evaluated = OMBackend._tryOr(() -> evalDAE_Expression(startDAE, simCode), nothing, :initAlgStartEval)
+  local parts = evaluated isa Expr && evaluated.head === :block ?
+    filter(a -> !(a isa LineNumberNode), evaluated.args) : Any[evaluated]
+  local value = isempty(parts) ? nothing : last(parts)
+  value isa Real ||
+    OMBackend.unsupported("an initial algorithm reading a fixed variable whose start does not evaluate at the build", name)
+  return Float64(value)
+end
+
 function _initAlgStartValue(sv, simCode)::Float64
   local attrs = sv.attributes
   attrs isa SOME || return 0.0
@@ -620,9 +625,7 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
          nothing )
     end
   elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
-    local name = crefName(wStmt.stateVar)
-    local sym = Symbol(name)
-    return :( $(sym) = $(lowerAlg(wStmt.value)); LATEST_PROBLEM[$(QuoteNode(sym))] = $(sym); nothing )
+    _refuseInitialReinit(wStmt)
   elseif wStmt isa BDAE.ASSERT || wStmt isa SimulationCode.ASSERT
     #= On the initialization's values: AssertionLevel.error stops the
        simulation, as an equation's assert does (it only warned). =#
@@ -685,9 +688,18 @@ function _initialWhenOpToJuliaEarly(wStmt, simCode::SimulationCode.SIM_CODE,
   elseif wStmt isa BDAE.TERMINATE || wStmt isa SimulationCode.TERMINATE
     local msg = lowerAlg(wStmt.message)
     return :(@info "Modelica terminate() during init (early)" message=$(msg))
+  elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
+    _refuseInitialReinit(wStmt)
   end
-  return :( nothing )
+  #= A block, not the symbol `nothing` (the statements are an Expr vector:
+     a reinit here was a MethodError). =#
+  return Expr(:block, :nothing)
 end
+
+#= reinit in a `when initial()` body: OpenModelica ignores it (x keeps its
+   start), the early pass failed, the runtime pass set it. None in MSL 3.2.3. =#
+_refuseInitialReinit(wStmt) =
+  OMBackend.unsupported("reinit in a when initial() body", SimulationCode.DAE_identifierToString(wStmt.stateVar))
 
 #= Modelica function calls in algorithm code are `Base.invokelatest(Name, ...)`
    with Name bound in OMBackend.CodeGeneration (createModelicaFunctionWrapper),
@@ -741,8 +753,12 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
   readsDer > 0 && OMBackend.unsupported("an initial algorithm reading der()", readsDer)
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()
+  #= What the `initial algorithm` sections read (not the `when initial()`
+     bodies, which the pass runs where a model has no such section). =#
+  local sectionReads = OrderedSet{String}()
   for ia in _earlyInitialAlgorithms(simCode)
     _collectInitAlgNames!(lhsNames, rhsNames, ia)
+    isempty(ia.daeStatements) || _collectInitAlgNames!(OrderedSet{String}(), sectionReads, ia)
   end
   local noEarlyPass = quote
     function __runInitialAlgorithmEarly!(t0::Float64 = 0.0)
@@ -757,7 +773,13 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
   local unfoldedParameter = false
   for name in setdiff(rhsNames, lhsNames)
     name == "time" && continue
+    #= A name the backend eliminated (folded by constant propagation, an
+       alias, an RHS-equivalent variable) was read as 0.0: `s := sum(v)` gave
+       0 and `r := w2 + 1` 1 (OpenModelica 12 and 2). None in MSL 3.2.3, whose
+       initial algorithms read parameters and time. =#
+    local inSection = name in sectionReads
     haskey(ht, name) || begin
+      inSection && OMBackend.unsupported("an initial algorithm reading a variable the backend eliminated", name)
       push!(prefetches, :(local $(Symbol("_alg_" * name)) = 0.0))
       continue
     end
@@ -769,6 +791,11 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
         _ => nothing
       end
       if paramLit === nothing
+        #= A parameter the initialization computes (fixed = false, no
+           binding): the section's results were dropped with the expected
+           UndefVarError below (`s := k + 1`, k = x: s = 0, OpenModelica 4). =#
+        inSection && sv.varKind isa SimulationCode.PARAMETER && !SimulationCode.hasBindingExp(sv) &&
+          OMBackend.unsupported("an initial algorithm reading a parameter the initialization computes", name)
         #= No static value (an array parameter, a binding that does not
            fold): no local, so a statement that reads it throws an
            UndefVarError, which the body's catch expects (below). The
@@ -779,8 +806,31 @@ function generateInitialAlgorithmEarlyFunction(simCode::SimulationCode.SIM_CODE)
       push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(paramLit)))
       continue
     end
-    #= Its start value, evaluated: a parameter (`x(start = x0)`) was read as 0.0. =#
-    push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(_initAlgStartValue(sv, simCode))))
+    #= A String parameter (the MSL TraceSubstances sensors' `substanceName`;
+       ReadRealMatrixFromFile's `file = loadResource(...)`): its literal, or
+       the module-level value its binding gives (createStringParameterAssignments,
+       as the runtime pass reads it). It was read as its start, 0.0. =#
+    if sv.varKind isa SimulationCode.STRING
+      local value = @match sv.varKind begin
+        SimulationCode.STRING(bindExp = SOME(b)) =>
+          (local d = SimulationCode.toDAEExp(b); d isa DAE.SCONST ? d.string : Symbol(sv.name))
+        _ => nothing
+      end
+      value === nothing && OMBackend.unsupported("an initial algorithm reading a String without a value", name)
+      push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(value)))
+      continue
+    end
+    #= A variable the initialization determines: the pass runs before it, and
+       its start value is no value (`q := z + 1` with `initial equation z = 5`
+       gave 1, OpenModelica 6). A fixed one has its start value. =#
+    inSection || begin
+      #= Its start value, evaluated: a parameter (`x(start = x0)`) was read as 0.0. =#
+      push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(_initAlgStartValue(sv, simCode))))
+      continue
+    end
+    _isFixedStart(sv) ||
+      OMBackend.unsupported("an initial algorithm reading a variable the initialization determines", name)
+    push!(prefetches, :(local $(Symbol("_alg_" * name)) = $(_fixedStartForInitialAlgorithm(name, sv, simCode))))
   end
   #= An assigned variable starts at its start value: read before it is
      assigned, and what an untaken branch leaves (an initial algorithm
@@ -924,46 +974,50 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
         push!(fetches, Expr(:local, Expr(:(=), sym, :(getfield(@__MODULE__, $(QuoteNode(boundSym)))))))
         continue
       end
-      #= DISCRETE vars (Logic/enum) are used as array indices. MTK
-         initialisation may leave them at 0 which BoundsErrors on 1-based
-         index vectors (e.g. INV3S's UX01Conv[iNV3S_enable]). Clamp to 1 as
-         a band-aid until proper discrete-IC lowering lands. Not a Boolean:
-         the clamp made false true (an ideal thyristor's `fire`, so it
-         started conducting without a firing pulse). =#
+      #= A discrete Real as it is, an Integer as an Int. An enumeration
+         (Logic), or a discrete whose attributes do not say (the MSL Digital
+         examples' Logic signals), is an array index: MTK's initialization may
+         leave it at 0, which BoundsErrors on 1-based index vectors (INV3S's
+         UX01Conv[iNV3S_enable]; NXFER), so it is clamped to 1. Every discrete
+         was rounded and clamped (`n = m + 5`, m = -2: n = 6, OpenModelica 3;
+         a discrete Real 0.3 read as 1). Not a Boolean: the clamp made false
+         true (an ideal thyristor's `fire`). One the problem does not have
+         stays unassigned, as below (it was 1). =#
       if sv.varKind isa SimulationCode.DISCRETE && !(name in boolNames) && !_isBoolDiscreteName(name, simCode)
         local sym = Symbol(name)
-        push!(fetches, Expr(:local,
-          Expr(:(=), sym,
-            :(try
-                let _g = ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))
-                  local _raw = _g(LATEST_PROBLEM)
-                  local _v = if _raw isa Integer
-                    Int(_raw)
-                  elseif _raw isa Real
-                    Int(round(Float64(_raw)))
-                  else
-                    1
-                  end
-                  _v < 1 ? 1 : _v
-                end
-              catch _e
-                OMBackend._fallback(_e, :initAlgGetuFetch, impact = :result)
-                1
-              end))))
+        local value = @match sv.attributes begin
+          SOME(DAE.VAR_ATTR_REAL(__)) => :(Float64(_raw))
+          SOME(DAE.VAR_ATTR_INT(__)) => :(Int(round(Float64(_raw))))
+          _ => :(max(1, Int(round(Float64(_raw)))))
+        end
+        push!(fetches, quote
+          local $(sym)
+          try
+            local _raw = ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))(LATEST_PROBLEM)
+            $(sym) = $(value)
+          catch _e
+            OMBackend._fallback(_e, :initAlgGetuFetch)
+            push!(_unfetched, $(QuoteNode(sym)))
+          end
+        end)
         continue
       end
     end
     #= Non-discrete SimVars (Real states, alg vars) and local algorithm
-       temporaries not in the HT: fetch as Float64, no index clamp. =#
+       temporaries not in the HT: fetch as Float64, no index clamp. One the
+       problem does not have stays unassigned: a temporary is assigned before
+       it is read, and a read of a variable the backend eliminated is refused
+       below (it was 0.0: `s = sum(v)` of a folded v gave 0, OpenModelica 12). =#
     local sym = Symbol(name)
-    push!(fetches, Expr(:local,
-      Expr(:(=), sym,
-        :(try
-            Float64(ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))(LATEST_PROBLEM))
-          catch _e
-            OMBackend._fallback(_e, :initAlgGetuValue, impact = :result)
-            0.0
-          end))))
+    push!(fetches, quote
+      local $(sym)
+      try
+        $(sym) = Float64(ModelingToolkit.SciMLBase.getu(LATEST_PROBLEM, $(QuoteNode(sym)))(LATEST_PROBLEM))
+      catch _e
+        OMBackend._fallback(_e, :initAlgGetuValue)
+        push!(_unfetched, $(QuoteNode(sym)))
+      end
+    end)
   end
   #= Shadow `Base.time` (a UNIX-time function) with the local Modelica `time`
      value, the start time (t0). Without this, init-algorithm bodies
@@ -977,9 +1031,16 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
          initializealg=NoInit())` so MTK treats the init-algorithm-computed
          values as hard initial conditions (Modelica §11.2), not guesses. =#
       local _hard = Dict{Any, Any}()
+      local _unfetched = Symbol[]
       let time = t0
         $(fetches...)
-        $(stmts...)
+        try
+          $(stmts...)
+        catch _e
+          (_e isa UndefVarError && _e.var in _unfetched) &&
+            OMBackend.unsupported("a when initial() body reading a variable that is not in the solved system", _e.var)
+          rethrow()
+        end
       end
       return _hard
     end

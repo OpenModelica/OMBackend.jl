@@ -180,6 +180,10 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
       SimulationCode.PARAMETER(bindExp = SOME(e)) where _isLiteralBind(e) => e
       _ => nothing
     end
+    #= A String variable set by an equation (`s = if time > 0.5 then "ab"
+       else "abc"`) was assigned nowhere: an UndefVarError at module load. =#
+    bindExp === nothing && simVar.varKind isa SimulationCode.STRING &&
+      OMBackend.unsupported("a String variable set by an equation", varName)
     bindExp === nothing && continue
     #= A String kind is a String parameter, but also a String variable: one
        reading time or a variable changes during the simulation, assigned here

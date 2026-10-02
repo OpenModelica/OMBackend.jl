@@ -326,6 +326,24 @@ function identifyOutputOnlyVariables(simCode::SIM_CODE,
   return (outputOnlyVarNames, outputOnlyEqIndices, eqRefs)
 end
 
+#= Whether an eliminated variable `vn` is still read: by a residual equation
+   that stays (or one reading its array's base name), a when-equation, an
+   initial equation, or a Complex parent that stays (its `_re`/`_im` fields,
+   which codegen looks up by symbol). The variables carrying `fixed = true`
+   (their start, or the default one) are rescued as well (by the caller):
+   user-pinned initial conditions (DCPM_Cooling's `wMechanical(fixed = true,
+   start = w0)`), which elimination stripped (MTK's init then landed on 0). =#
+function _referencedBySurvivor(vn::String, varNameToRefEqs, eqsToEliminate, whenRefNames, initRefNames,
+                               complexRefNames)::Bool
+  local bi = findfirst('[', vn)
+  local baseName = bi === nothing ? vn : vn[1:(bi - 1)]
+  for name in (baseName == vn ? (vn,) : (vn, baseName))
+    haskey(varNameToRefEqs, name) || continue
+    any(i -> !(i in eqsToEliminate), varNameToRefEqs[name]) && return true
+  end
+  return vn in whenRefNames || vn in initRefNames || vn in complexRefNames
+end
+
 #= True when the variable's attributes carry `fixed = true`: its start, or the
    default start 0 without one (MLS 4.9.1), is an initial equation. Used to
    rescue variables from elimination passes that would otherwise drop the
@@ -590,67 +608,39 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   for eq in simCode.eliminatedEquations
     _collectComplexFieldNames!(complexRefNames, [eq], ht)
   end
+  #= Variables an initial equation reads are rescued like when-equation
+     reads: eliminated, `initial equation z = b` (b = a + 1, a = 2x) read an
+     undefined b (UndefVarError at module eval; OpenModelica z = 3). =#
+  local initRefNames = OrderedSet{String}()
+  for ieq in simCode.initialEquations
+    if ieq isa BDAE.RESIDUAL_EQUATION || ieq isa RESIDUAL_EQUATION
+      collectCrefNames!(initRefNames, ieq.exp)
+    elseif ieq isa BDAE.EQUATION || ieq isa EQUATION
+      collectCrefNames!(initRefNames, ieq.lhs)
+      collectCrefNames!(initRefNames, ieq.rhs)
+    end
+  end
+  #= Until nothing more is rescued: a rescued variable keeps its equation,
+     and what that equation reads must stay as well (b's `b = a + 1` reads a). =#
   local rescuedVars = OrderedSet{String}()
-  for vn in varsToRemove
-    local referencedBySurvivor = false
-    #= Check residual equations =#
-    if haskey(varNameToRefEqs, vn)
-      for refEqIdx in varNameToRefEqs[vn]
-        if !(refEqIdx in eqsToEliminate)
-          referencedBySurvivor = true
-          break
-        end
-      end
-    end
-    #= Also check base name =#
-    if !referencedBySurvivor
-      local bi = findfirst('[', vn)
-      local bn = bi === nothing ? vn : vn[1:(bi - 1)]
-      if bn != vn && haskey(varNameToRefEqs, bn)
-        for refEqIdx in varNameToRefEqs[bn]
-          if !(refEqIdx in eqsToEliminate)
-            referencedBySurvivor = true
-            break
-          end
-        end
-      end
-    end
-    #= Check when-equations =#
-    if !referencedBySurvivor && vn in whenRefNames
-      referencedBySurvivor = true
-    end
-    #= Check Complex `_re`/`_im` parent survival =#
-    if !referencedBySurvivor && vn in complexRefNames
-      referencedBySurvivor = true
-    end
-    if referencedBySurvivor
-      push!(rescuedVars, vn)
-    end
-    #= Rescue variables carrying `fixed=true` (a start, or the default one).
-       These are user-pinned initial conditions (e.g. `wMechanical(fixed=true,
-       start=w0)`); eliminating them strips the constraint and MTK's init
-       solver lands on the algebraic default (typically 0). DCPM_Cooling,
-       DCPM_QuasiStationary, DCPM_withLosses regress on this exact pattern. =#
-    if !referencedBySurvivor && haskey(ht, vn)
-      local (_, _sv) = ht[vn]
-      if _hasFixedStart(_sv.attributes)
+  local rescuedMore = true
+  while rescuedMore
+    rescuedMore = false
+    for vn in varsToRemove
+      vn in rescuedVars && continue
+      if _referencedBySurvivor(vn, varNameToRefEqs, eqsToEliminate, whenRefNames, initRefNames, complexRefNames) ||
+         (haskey(ht, vn) && _hasFixedStart(ht[vn][2].attributes))
         push!(rescuedVars, vn)
+        rescuedMore = true
+        if haskey(nameToMatchIdx, vn)
+          local rescuedEqIdx = matchOrder[nameToMatchIdx[vn]]
+          rescuedEqIdx > 0 && delete!(eqsToEliminate, rescuedEqIdx)
+        end
       end
     end
   end
   local nRescued = length(rescuedVars)
-  if !isempty(rescuedVars)
-    for vn in rescuedVars
-      delete!(varsToRemove, vn)
-      if haskey(nameToMatchIdx, vn)
-        local rescuedMIdx = nameToMatchIdx[vn]
-        local rescuedEqIdx = matchOrder[rescuedMIdx]
-        if rescuedEqIdx > 0
-          delete!(eqsToEliminate, rescuedEqIdx)
-        end
-      end
-    end
-  end
+  setdiff!(varsToRemove, rescuedVars)
   #= Filter residualEquations: remove eliminated equations =#
   local newResEqs = RESIDUAL_EQUATION[]
   sizehint!(newResEqs, length(resEqs) - length(eqsToEliminate))

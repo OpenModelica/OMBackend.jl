@@ -661,30 +661,40 @@ end
    next to the states. Names are the MTK parameters' (simVar.name, as in
    createParameterEquationsMTK). Empty when there are none. =#
 function freeParametersDecl(simCode)::Expr
-  #= A parameter alone on one side of an initial equation is assigned by it
-     (at codegen, or by the init solve's assignments), not free: the MSL Mean
-     block's `t0 = time`. As a free unknown it had no determining row, and its
-     zero Jacobian column disabled the scaled Newton step the ideal diodes of
-     DiodeBridge2mPulse need. =#
+  #= A parameter alone on the left of an initial equation is assigned by it
+     (at codegen, or by the init solve's assignments, which take the left
+     side), not free: the MSL Mean block's `t0 = time`. As a free unknown it
+     had no determining row, and its zero Jacobian column disabled the scaled
+     Newton step the ideal diodes of DiodeBridge2mPulse need. Alone on the
+     right (`x = q`) nothing assigns it: left out here too, q kept its start
+     and both of its equations were broken. =#
   local assigned = OrderedSet{String}()
   for ieq in simCode.initialEquations
     hasEquationSides(ieq) || continue
-    for side in equationSides(ieq)
-      side isa DAE.CREF && push!(assigned, string(side))
-    end
+    local lhs = first(equationSides(ieq))
+    lhs isa DAE.CREF && push!(assigned, string(lhs))
   end
   local names = String[]
+  #= The ones the initialization assigns (ASSIGNED_PARAMETERS): only these,
+     never a bound or tunable parameter alone on the left (`p = 2 * q`: p
+     was overwritten with 2q, and q never solved). =#
+  local assignedNames = String[]
   for (key, (_, sv)) in simCode.stringToSimVarHT
     (SimulationCode.isParameter(sv) && !SimulationCode.hasBindingExp(sv)) || continue
-    key in assigned && continue
+    if key in assigned
+      push!(assignedNames, string(sv.name))
+      continue
+    end
     local free = @match sv.attributes begin
       SOME(DAE.VAR_ATTR_REAL(fixed = SOME(DAE.BCONST(false)))) => true
       _ => false
     end
     free && push!(names, string(sv.name))
   end
-  isempty(names) && return Expr(:block)
-  return :(FREE_PARAMETERS = $(sort!(unique!(names))))
+  local decls = Expr[]
+  isempty(names) || push!(decls, :(FREE_PARAMETERS = $(sort!(unique!(names)))))
+  isempty(assignedNames) || push!(decls, :(ASSIGNED_PARAMETERS = $(sort!(unique!(assignedNames)))))
+  return Expr(:block, decls...)
 end
 
 #= Module-level list of the user's fixed values (USER_PINS): the continuous
@@ -730,6 +740,9 @@ function userPinsDecl(simCode, relayAliases::AbstractDict)::Expr
     local entry = get(simCode.stringToSimVarHT, string(lhs), nothing)
     entry === nothing || last(entry).varKind isa Union{SimulationCode.STATE, SimulationCode.ALG_VARIABLE} || continue
     local rhsEntry = rhs isa Symbol ? get(simCode.stringToSimVarHT, string(rhs), nothing) : nothing
+    #= A parameter right side (a tunable one stays a reference) is a pin too;
+       a conflict with a fixed start is then checked at the build and per run
+       (DirectRHSGeneration's _collectHardInitializationValues), here only a literal's. =#
     (rhs isa Number || (rhsEntry !== nothing && SimulationCode.isParameter(last(rhsEntry)))) || continue
     #= A fixed start and an initial equation that give one variable two values
        (`x(start = 1, fixed = true)` and `x = 2`): the initialization took the
@@ -742,6 +755,26 @@ function userPinsDecl(simCode, relayAliases::AbstractDict)::Expr
   end
   isempty(names) && return Expr(:block)
   return :(USER_PINS = $(sort!(collect(names))))
+end
+
+#= Module-level list of the discrete variables (DISCRETE_VARIABLES): their
+   fixed start is `pre(v) = start` (MLS 8.6), and an initialization equation
+   `v ~ start` beside `v ~ value` (a when initial() body) is no conflict
+   (_collectHardInitializationValues). Empty when there are none. =#
+function discreteVariablesDecl(simCode)::Expr
+  local names = sort!([string(sv.name) for (_, (_, sv)) in simCode.stringToSimVarHT if SimulationCode.isDiscrete(sv)])
+  isempty(names) && return Expr(:block)
+  return :(DISCRETE_VARIABLES = $(names))
+end
+
+#= Module-level list of the tunable parameters (TUNABLE_NAMES,
+   withTunableParameters) the model was compiled with, for the runs with
+   other values of them (DirectRHSGeneration's _runEntry). Empty when there
+   are none. =#
+function tunableParametersDecl()::Expr
+  local names = sort!(collect(OMBackend.TUNABLE_PARAMETERS[]))
+  isempty(names) && return Expr(:block)
+  return :(TUNABLE_NAMES = $(names))
 end
 
 #= Whether the model takes the discrete-cluster path, shared by every site

@@ -145,6 +145,10 @@ variable appearing affinely (the rest evaluating numerically, including `exp` /
 attribute so the init solver starts from a consistent, finite iterate instead of
 defaulting to 0.0 (which makes source-driven flow/pressure networks divide by
 zero). Runs at the SimCode layer where every variable is still present.
+A tunable parameter (withTunableParameters) is seeded with its compiled value
+too: a fixed variable without a start whose value comes from it (`v(fixed =
+true)`, `v = xa^2 + c`) holds that value in a run with other values, as with
+OpenModelica's `-override`, not as in a compile at the run's values.
 """
 function propagateInitialValues(simCode::SIM_CODE)::SIM_CODE
   (hasStructuralTransitions(simCode) || hasSubModels(simCode) ||

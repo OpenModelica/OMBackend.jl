@@ -656,15 +656,22 @@ end
 
 """
  Evalutates the components in a DAE expression (Currently if the components are parameters)
+ With `keepTunable`, a tunable parameter (withTunableParameters) stays a
+ reference, read at run time, and the expression is not evaluated.
 """
 function _substituteBoundParameters(exp, simCode;
                                     skipNames::OrderedSet{String}=OrderedSet{String}(),
                                     shouldEval::Base.RefValue{Bool}=Ref(true),
-                                    seen::OrderedSet{String}=OrderedSet{String}())
+                                    seen::OrderedSet{String}=OrderedSet{String}(),
+                                    keepTunable::Bool=false)
   function replaceParameterVariable(exp, ht)
     if Util.isCref(exp)
       local key = string(exp)
       if key in skipNames
+        return (exp, true, ht)
+      end
+      if keepTunable && OMBackend.isTunableParameter(key)
+        shouldEval[] = false
         return (exp, true, ht)
       end
       local entry = get(simCode.stringToSimVarHT, key, nothing)
@@ -690,7 +697,8 @@ function _substituteBoundParameters(exp, simCode;
           local resolved = _substituteBoundParameters(bindExp, simCode;
                                                       skipNames=skipNames,
                                                       shouldEval=shouldEval,
-                                                      seen=seen)
+                                                      seen=seen,
+                                                      keepTunable=keepTunable)
           delete!(seen, key)
           return (resolved, true, ht)
         else

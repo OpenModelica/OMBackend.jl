@@ -517,6 +517,12 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
         local (nb, _) = traverseExpTopDown(b, substituteConstantParameter, paramValueMap)
         nb === b ? sv.varKind : ARRAY_PARAMETER(dims, SOME(nb))
       end
+      #= A String's binding too: it is evaluated at module level, where an
+         eliminated parameter is no name (`name = String(k)`: UndefVarError). =#
+      STRING(SOME(b)) => begin
+        local (nb, _) = traverseExpTopDown(b, substituteConstantParameter, paramValueMap)
+        nb === b ? sv.varKind : STRING(SOME(nb))
+      end
       _ => sv.varKind
     end
     if newKind !== sv.varKind

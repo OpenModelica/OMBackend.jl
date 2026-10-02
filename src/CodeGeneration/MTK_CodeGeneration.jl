@@ -359,7 +359,10 @@ emitDirectRHSProblem() = :(
     allInitialValues = initialValues,
     liftedDiscretes = (@isdefined(LIFTED_DISCRETES) ? LIFTED_DISCRETES : String[]),
     freeParameters = (@isdefined(FREE_PARAMETERS) ? FREE_PARAMETERS : String[]),
+    assignedParameters = (@isdefined(ASSIGNED_PARAMETERS) ? ASSIGNED_PARAMETERS : String[]),
     userPins = (@isdefined(USER_PINS) ? USER_PINS : String[]),
+    discreteVariables = (@isdefined(DISCRETE_VARIABLES) ? DISCRETE_VARIABLES : String[]),
+    tunableParameters = (@isdefined(TUNABLE_NAMES) ? TUNABLE_NAMES : String[]),
     initRelations = (@isdefined(_ifInitLiterals) ? _ifInitLiterals : Any[]),
     initClusters = (@isdefined(_initDiscreteClusters) ? _initDiscreteClusters : Any[]),
     discreteStarts = (@isdefined(LIFTED_DISCRETE_STARTS) ? LIFTED_DISCRETE_STARTS : Dict{String, Float64}()))
@@ -1197,6 +1200,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
     $(freeParametersDecl(simCode))
     #= The user's fixed values, which the initialization must hold. =#
     $(userPinsDecl(simCode, _ifEqRelay_aliases))
+    $(discreteVariablesDecl(simCode))
+    $(tunableParametersDecl())
     #= Variable constructor function definitions at module level (outside model function)
        to avoid JIT overhead from compiling nested closures.
        Variable constructors only return symbol tuples, so they have no scope dependencies. =#

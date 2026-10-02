@@ -2637,13 +2637,14 @@ function subscriptsToExpr(subscripts, simCode; varPrefix="", varSuffix="", derSy
   end
 end
 
-function evalDAE_Expression(expr, simCode)::Expr
+function evalDAE_Expression(expr, simCode; keepTunable::Bool = false)::Expr
   local shouldEval = Ref(true)
   #= Replaces all known bound parameters in the DAE expression. This must be
      recursive: parameter aliases such as `actualGlobalSeed = globalSeed_seed`
      otherwise leave a bare `globalSeed_seed` in the generated Julia expression
-     even after `globalSeed_seed` itself has been solved from an initial equation. =#
-  local daeExp = _substituteBoundParameters(expr, simCode; shouldEval=shouldEval)
+     even after `globalSeed_seed` itself has been solved from an initial equation.
+     With `keepTunable`, tunable parameters stay references (_substituteBoundParameters). =#
+  local daeExp = _substituteBoundParameters(expr, simCode; shouldEval=shouldEval, keepTunable=keepTunable)
   local jlExpr = expToJuliaExpMTK(daeExp, simCode)
   local evaluatedJLExpr = if shouldEval[]
     try
@@ -2657,6 +2658,14 @@ function evalDAE_Expression(expr, simCode)::Expr
     jlExpr
   end
   return quote $(evaluatedJLExpr) end
+end
+
+#= Whether `exp` reads a tunable parameter (withTunableParameters), directly or
+   through the bindings of the parameters it reads. =#
+function _readsTunableParameter(exp, simCode)::Bool
+  isempty(OMBackend.TUNABLE_PARAMETERS[]) && return false
+  local resolved = _substituteBoundParameters(exp, simCode; keepTunable = true)
+  return any(c -> OMBackend.isTunableParameter(string(c)), Util.getAllCrefs(resolved))
 end
 
 #= `e` with `time` read as 0.0, the start time of the build. =#
@@ -2747,6 +2756,24 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       continue
     end
     freeName = freeParams[1]
+    #= A tunable parameter is set at run time: solved here, the free one kept
+       its compiled value in every run (`q = 2 * p`). Alone on a side it is
+       bound to the other side (`p = q`, `2 * p = q`), and follows p as a
+       bound parameter does; otherwise it stays unbound and the
+       initialization computes it for the run's values (`q * q = p`). As an
+       unbound parameter alone on the right it was assigned nowhere: q = 0. =#
+    if any(side -> _readsTunableParameter(side, simCode), (ieqLhs, ieqRhs))
+      local isFree = e -> e isa DAE.CREF && string(e) == freeName
+      local other = isFree(ieqLhs) ? ieqRhs : isFree(ieqRhs) ? ieqLhs : nothing
+      if other !== nothing && !containsCref(other, freeName)
+        local (idx, oldSV) = ht[freeName]
+        ht[freeName] = (idx, SimulationCode.SIMVAR(oldSV.name, oldSV.index,
+                                                   SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(other))), oldSV.attributes))
+        push!(solvedNames, freeName)
+        solvedThisPass = true
+      end
+      continue
+    end
     #= Get initial guess from start attribute =#
     local (_, freeSV) = ht[freeName]
     local guess = something(_startNumber(freeSV, simCode), 0.1)
