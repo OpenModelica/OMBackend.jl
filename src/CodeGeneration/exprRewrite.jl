@@ -309,6 +309,40 @@ function residualToExplicit(eq_expr::Expr)
     end
 end
 
+#= The number an expression of numeric literals and + - * / evaluates to,
+   or nothing. The emitters wrap literals in blocks with line numbers. =#
+function _numericLiteralValue(@nospecialize(ex))
+    ex = _unwrapBlock(ex)
+    ex isa Real && return ex
+    (ex isa Expr && ex.head === :call && length(ex.args) >= 2 && ex.args[1] in (:+, :-, :*, :/)) || return nothing
+    local args = Any[_numericLiteralValue(a) for a in ex.args[2:end]]
+    any(isnothing, args) && return nothing
+    local op = ex.args[1] === :+ ? (+) : ex.args[1] === :- ? (-) : ex.args[1] === :* ? (*) : (/)
+    return op(args...)
+end
+
+"""
+    zeroDerivativeSymbols(equations) -> Vector{Symbol}
+
+The variables of the equations `D(v) ~ c` whose right-hand side is a numeric
+zero: `der(v) = 0` in the model, after `moveDerivativeToLHS` (which leaves
+`-((0 - 0.0)) / ((1 - 0.0) - (0 - 0.0))`). Such a v changes only where an
+initial algorithm, an initial equation or an event sets it.
+"""
+function zeroDerivativeSymbols(equations)::Vector{Symbol}
+    local out = Symbol[]
+    for eq in equations
+        local e = _unwrapBlock(eq)
+        (e isa Expr && e.head === :call && length(e.args) == 3 && e.args[1] === :~) || continue
+        local lhs = e.args[2]
+        (lhs isa Expr && lhs.head === :call && length(lhs.args) == 2 && lhs.args[1] in (:D, :der) &&
+         lhs.args[2] isa Symbol) || continue
+        local v = _numericLiteralValue(_unwrapBlock(e.args[3]))
+        (v !== nothing && iszero(v)) && push!(out, lhs.args[2])
+    end
+    return out
+end
+
 """
 Expr-level replacement for `rewriteEquations`. Returns Vector{Expr}.
 """

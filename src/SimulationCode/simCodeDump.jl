@@ -51,7 +51,6 @@ function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = simCode
   local arrayParameters = Tuple{String, Int}[]
   local discreteVariables = String[]
   local dsVariables = String[]
-  local occVariables = String[]
   local parameters = String[]
   local stateVariables = String[]
   for varName in keys(simCode.stringToSimVarHT)
@@ -67,7 +66,6 @@ function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = simCode
       SimulationCode.ARRAY_PARAMETER(__) => push!(arrayParameters, (varName, prod(varType.dimensions)))
       SimulationCode.ARRAY(__) => push!(arrayVariables, (varName, prod(varType.dimensions)))
       SimulationCode.DISCRETE(__) => push!(discreteVariables, varName)
-      SimulationCode.OCC_VARIABLE(__) => push!(occVariables, varName)
       SimulationCode.DATA_STRUCTURE(__) => push!(dsVariables, varName)
     end
   end
@@ -92,7 +90,7 @@ function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = simCode
     end
   end
   local nResidual = length(simCode.residualEquations)
-  local unknownsScalar = length(stateVariables) + length(algVariables) + arrayScalars + length(discreteVariables) + length(occVariables)
+  local unknownsScalar = length(stateVariables) + length(algVariables) + arrayScalars + length(discreteVariables)
   #= Directly-defined unknowns: each residual / active if-branch equation defines one,
      each when-assignment defines one discrete. The remainder are discretes MTK pins
      with a der(d)~0 dummy, so the system balances iff that remainder is in [0, #discrete]. =#
@@ -102,7 +100,7 @@ function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = simCode
   println(buffer, "SUMMARY vars | state=", length(stateVariables), " alg=", length(algVariables),
           " array=", length(arrayVariables), "(scalars=", arrayScalars, ") discrete=", length(discreteVariables),
           " param=", length(parameters), " arrayParam=", length(arrayParameters), "(scalars=", arrayParamScalars, ")",
-          " occ=", length(occVariables), " ds=", length(dsVariables))
+          " ds=", length(dsVariables))
   println(buffer, "SUMMARY eqs | residual=", nResidual,
           " ifBranchEqs=", ifBranchEqs, " whenAssignedDiscretes=", length(whenAssigned),
           " (ifEqs=", length(simCode.ifEquations), " whenEqs=", length(simCode.whenEquations),
@@ -136,7 +134,6 @@ function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = simCode
     dumpVarSection(buffer, "Array Variables", map(first, arrayVariables), simCode)
   end
   dumpVarSection(buffer, "Discrete Variables", discreteVariables, simCode)
-  dumpVarSection(buffer, "OCC Variables", occVariables, simCode)
   dumpVarSection(buffer, "Data Structure Variables", dsVariables, simCode)
   println(buffer, BDAEUtil.LINE)
 
@@ -211,14 +208,13 @@ function dumpSimCode(simCode::SimulationCode.SIM_CODE, heading::String = simCode
   nArrayElems = isempty(arrayVariables) ? 0 : sum(map(last, arrayVariables))
   nIfEqs = sum(length(first(ifEq.branches).residualEquations) for ifEq in simCode.ifEquations; init=0)
   nWhenEqs = sum(length(wEq.whenEquation.whenStmtLst) for wEq in simCode.whenEquations; init=0)
-  nTotalVars = length(algAndState) + length(discreteVariables) + length(occVariables) + nArrayElems
+  nTotalVars = length(algAndState) + length(discreteVariables) + nArrayElems
   nTotalEqs = length(simCode.residualEquations) + nIfEqs + nWhenEqs
   println(buffer, "  Variables:  ", nTotalVars, " total")
   println(buffer, "    State:      ", length(stateVariables))
   println(buffer, "    Algebraic:  ", length(algVariables))
   println(buffer, "    Array:      ", nArrayElems)
   println(buffer, "    Discrete:   ", length(discreteVariables))
-  println(buffer, "    OCC:        ", length(occVariables))
   println(buffer, "  Equations:  ", nTotalEqs, " total")
   println(buffer, "    Residual:   ", length(simCode.residualEquations))
   println(buffer, "    If:         ", nIfEqs)
@@ -320,7 +316,6 @@ function dumpSimVarKind(vk::SimVarType)::String
     SimulationCode.STATE(__) => ""
     SimulationCode.ALG_VARIABLE(__) => ""
     SimulationCode.DISCRETE(__) => ""
-    SimulationCode.OCC_VARIABLE(__) => ""
     SimulationCode.STRING(__) => " :: String"
     SimulationCode.PARAMETER(bindExp) => begin
       binding = dumpBindExp(bindExp)
@@ -395,10 +390,6 @@ function string(ifEq::IF_EQUATION)
   return res
 end
 
-function Base.string(ieq::SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION)
-  "STRUCTURAL_DOCC_IF_EQUATION: " * string(ieq.ifEquation) * "\n"
-end
-
 function string(st::IMPLICIT_STRUCTURAL_TRANSITION)
   "STRUCTURAL_WHEN_EQUATION:\n" * string(st.whenEquation)
 end
@@ -418,7 +409,10 @@ function string(f::EXTERNAL_MODELICA_FUNCTION)
   for arg in f.outputs
     println(buffer, " " * string(arg))
   end
-  println(buffer, "calling externally defined function: " * f.libInfo)
+  for arg in f.locals
+    println(buffer, " protected " * string(arg))
+  end
+  println(buffer, "calling externally defined function (" * f.language * "): " * f.libInfo)
   println(buffer, "end " * f.name)
   return String(take!(buffer))
 end

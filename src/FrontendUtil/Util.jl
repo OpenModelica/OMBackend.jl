@@ -249,10 +249,12 @@ Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @n
         (DAE.CAST(tp, e1_1), ext_arg_1)
       end
 
-      (DAE.ASUB(exp = e1, sub = expl_1), rel, ext_arg)  => begin
+      (DAE.ASUB(exp = e1, sub = asubSubs0), rel, ext_arg)  => begin
+        #= asubSubs* are fresh locals: the shared expl_1 is typed List{DAE.Exp},
+           but ASUB.sub is List{DAE.Subscript}. =#
         (e1_1, ext_arg_1) = traverseExpTopDown(e1, rel, ext_arg)
-        (expl_1, ext_arg_2) = traverseExpListTopDown(expl_1, rel, ext_arg_1)
-        (makeASUB(e1_1, expl_1), ext_arg_2)
+        (asubSubs1, ext_arg_2) = traverseSubscriptListTopDown(asubSubs0, rel, ext_arg_1)
+        (makeASUB(e1_1, asubSubs1), ext_arg_2)
       end
 
       (DAE.TSUB(e1, i, tp), rel, ext_arg)  => begin
@@ -850,13 +852,15 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc, inExtArg::T)  where {T}
         (e, ext_arg)
       end
 
-      DAE.ASUB(exp = e1, sub = expl)  => begin
+      DAE.ASUB(exp = e1, sub = asubSubs0)  => begin
+        #= Fresh locals: shared expl/expl_1 are List{DAE.Exp}; ASUB.sub is
+           List{DAE.Subscript}. =#
         (e1_1, ext_arg) = traverseExpBottomUp(e1, inFunc, inExtArg)
-        (expl_1, ext_arg) = traverseExpList(expl, inFunc, ext_arg)
-        e = if referenceEq(e1, e1_1) && referenceEq(expl, expl_1)
+        (asubSubs1, ext_arg) = traverseSubscriptListBottomUp(asubSubs0, inFunc, ext_arg)
+        e = if referenceEq(e1, e1_1) && referenceEq(asubSubs0, asubSubs1)
           inExp
         else
-          makeASUB(e1_1, expl_1)
+          makeASUB(e1_1, asubSubs1)
         end
         (e, ext_arg) = inFunc(e, ext_arg)
         (e, ext_arg)
@@ -1216,26 +1220,6 @@ function replaceCref(inExp::DAE.Exp, inTpl::Tuple{<:DAE.ComponentRef, DAE.Exp}):
   (outExp, otpl)
 end
 
-function transposeNestedList(lstlst::List{List{T}})::List{List{T}} where{T}
-  transposeNestedListAccumulator(lstlst, nil)
-end
-
-function transposeNestedListAccumulator(lstlst::List{List{T}}, acc::List{List{T}})::List{List{T}} where{T}
-  local rest::List{List{T}}=nil
-  local tmpLst::List{T}
-  local tmp::T
-  @match tmpLst <| _ = lstlst
-  if listLength(tmpLst) == 0
-    for lst in lstlst
-      tmp <| lst = lst
-      tmpLst = tmp <| tmpLst
-      rest = lst <| rest
-    end
-    transposeNestedListAccumulator(listReverse(rest), tmpLst <| acc)
-  end
-  return acc
-end
-
 
 " author: lochel
   This function extracts all crefs from the input expression, except 'time'.
@@ -1287,33 +1271,6 @@ function isConstantExp(exp::DAE.Exp)::Bool
     DAE.ARRAY(array = elems) => all(isConstantExp, elems)
     _ => false
   end
-end
-
-function isEvaluatedConst(inExp::DAE.Exp) ::Bool
-  local outBoolean::Bool
-  outBoolean = begin
-    @match inExp begin
-      DAE.ICONST(__)  => begin
-        true
-      end
-      DAE.RCONST(__)  => begin
-        true
-      end
-      DAE.BCONST(__)  => begin
-        true
-      end
-      DAE.SCONST(__)  => begin
-        true
-      end
-      DAE.ENUM_LITERAL(__)  => begin
-        true
-      end
-      _  => begin
-        false
-      end
-    end
-  end
-  outBoolean
 end
 
 function getAllCrefsAsVector(cref::DAE.CREF_IDENT, crefs)
@@ -1382,8 +1339,66 @@ end
 """
   Creates an ASUB expression from an expression and a list of subscripts.
 """
-function makeASUB(exp::DAE.Exp, sub::List{DAE.Exp})
+#= sub is left untyped: dispatch is invariant, so a homogeneous Cons{DAE.INDEX}
+   is not <: List{DAE.Subscript}; the DAE.ASUB constructor widens it via convert. =#
+function makeASUB(exp::DAE.Exp, sub)
   DAE.ASUB(exp, sub)
+end
+
+#= Traverse the inner expression of a DAE.Subscript (INDEX/SLICE/WHOLE_NONEXP
+   carry an Exp; WHOLEDIM does not), preserving identity when unchanged. =#
+function traverseSubscriptTopDown(sub::DAE.Subscript, func, arg)
+  @match sub begin
+    DAE.INDEX(e) => begin
+      (e2, a) = traverseExpTopDown(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.INDEX(e2), a)
+    end
+    DAE.SLICE(e) => begin
+      (e2, a) = traverseExpTopDown(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.SLICE(e2), a)
+    end
+    DAE.WHOLE_NONEXP(e) => begin
+      (e2, a) = traverseExpTopDown(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.WHOLE_NONEXP(e2), a)
+    end
+    _ => (sub, arg)
+  end
+end
+
+function traverseSubscriptListTopDown(subs::List{DAE.Subscript}, func, arg)
+  local outSubs = DAE.Subscript[]
+  for s in subs
+    (s2, arg) = traverseSubscriptTopDown(s, func, arg)
+    push!(outSubs, s2)
+  end
+  return (list(outSubs...), arg)
+end
+
+function traverseSubscriptBottomUp(sub::DAE.Subscript, func, arg)
+  @match sub begin
+    DAE.INDEX(e) => begin
+      (e2, a) = traverseExpBottomUp(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.INDEX(e2), a)
+    end
+    DAE.SLICE(e) => begin
+      (e2, a) = traverseExpBottomUp(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.SLICE(e2), a)
+    end
+    DAE.WHOLE_NONEXP(e) => begin
+      (e2, a) = traverseExpBottomUp(e, func, arg)
+      (referenceEq(e, e2) ? sub : DAE.WHOLE_NONEXP(e2), a)
+    end
+    _ => (sub, arg)
+  end
+end
+
+function traverseSubscriptListBottomUp(subs::List{DAE.Subscript}, func, arg)
+  local outSubs = DAE.Subscript[]
+  for s in subs
+    (s2, arg) = traverseSubscriptBottomUp(s, func, arg)
+    push!(outSubs, s2)
+  end
+  return (list(outSubs...), arg)
 end
 
 """
@@ -1412,6 +1427,50 @@ function getBaseNameWithoutSubscripts(cref::DAE.ComponentRef)::String
     print(buf, c.ident)
   end
   return String(take!(buf))
+end
+
+
+#= `stmt` with `f` applied to its expressions, recursing into the bodies of
+   compound statements (STMT_IF / STMT_FOR / STMT_WHILE / STMT_PARFOR); with
+   `targets`, to the targets it assigns too (a rename). Statements with no
+   expressions pass through. =#
+function mapDAEStatementExps(f, stmt; targets::Bool = false)
+  local g = targets ? f : identity
+  local body = stmts -> MetaModelica.list((mapDAEStatementExps(f, s; targets = targets) for s in stmts)...)
+  return @match stmt begin
+    DAE.STMT_ASSIGN(ty, e1, e, src) =>
+      DAE.STMT_ASSIGN(ty, g(e1), f(e), src)
+    DAE.STMT_TUPLE_ASSIGN(ty, lhsList, e, src) =>
+      DAE.STMT_TUPLE_ASSIGN(ty, targets ? MetaModelica.list((f(l) for l in lhsList)...) : lhsList, f(e), src)
+    DAE.STMT_ASSIGN_ARR(ty, lhs, e, src) =>
+      DAE.STMT_ASSIGN_ARR(ty, g(lhs), f(e), src)
+    DAE.STMT_NORETCALL(e, src) =>
+      DAE.STMT_NORETCALL(f(e), src)
+    DAE.STMT_ASSERT(c, m, l, src) =>
+      DAE.STMT_ASSERT(f(c), f(m), f(l), src)
+    DAE.STMT_TERMINATE(m, src) =>
+      DAE.STMT_TERMINATE(f(m), src)
+    DAE.STMT_IF(cond, stmts, else_, src) =>
+      DAE.STMT_IF(f(cond), body(stmts), _mapDAEElseExps(f, else_, targets), src)
+    DAE.STMT_FOR(ty, isArr, iter, idx, range, stmts, src) =>
+      DAE.STMT_FOR(ty, isArr, iter, idx, f(range), body(stmts), src)
+    DAE.STMT_PARFOR(ty, isArr, iter, idx, range, stmts, prl, src) =>
+      DAE.STMT_PARFOR(ty, isArr, iter, idx, f(range), body(stmts), prl, src)
+    DAE.STMT_WHILE(cond, stmts, src) =>
+      DAE.STMT_WHILE(f(cond), body(stmts), src)
+    DAE.STMT_REINIT(varExp, value, src) =>
+      DAE.STMT_REINIT(g(varExp), f(value), src)
+    _ => stmt
+  end
+end
+
+function _mapDAEElseExps(f, else_, targets::Bool)
+  local body = stmts -> MetaModelica.list((mapDAEStatementExps(f, s; targets = targets) for s in stmts)...)
+  return @match else_ begin
+    DAE.ELSE(stmts) => DAE.ELSE(body(stmts))
+    DAE.ELSEIF(cond, stmts, rest) => DAE.ELSEIF(f(cond), body(stmts), _mapDAEElseExps(f, rest, targets))
+    _ => else_
+  end
 end
 
 end #=End Util=#

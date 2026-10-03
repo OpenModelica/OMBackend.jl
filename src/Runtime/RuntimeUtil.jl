@@ -36,21 +36,17 @@
 module RuntimeUtil
 
 import Absyn
-using DataStructures: OrderedSet
 import DifferentialEquations
 import DifferentialEquations.ReturnCode
 import DAE
-import ListUtil
 import ModelingToolkit
 import OMBackend
 import OMBackend.@BACKEND_LOGGING
-import OMBackend.SimulationCode
 
 import OMFrontend
 import OMFrontend.Frontend
 import OMFrontend.Frontend.AbsynUtil
 import OMFrontend.Frontend.SCodeUtil
-import OMFrontend.Frontend.Util
 
 import SCode
 
@@ -215,25 +211,17 @@ createNewU0(symsOfOldProblem::Vector{Symbol},
                      symsOfNewProblem::Vector{Symbol},
                      newHT,
                      initialValues,
-                     uVec,
-                     specialCase)
+                     uVec)
 ```
   This function maps variables between two models during a structural change with recompilation.
   It returns a new vector of u₀ variables to initialize the new model.
   We do so by assigning the old values when the structural change occurred for all variables
   that occurred in the model before the structural change.
-TODO:
-Remove the special case.
-The reason for it is in some examples the containing model changes name whereas in others it does not.
-Furthermore, the way indices are handled needs to be fixed since the index after reduction in MTK is not the same as
-the index in the simulation code stage of the backend.
-For now we return the array for the special case with dynamic overconstrained connectors.
 """
 function createNewU0(symsOfOldProblem::Vector{Symbol},
                      symsOfNewProblem::Vector{Symbol},
                      initialValues,
-                     uVec,
-                     specialCase)
+                     uVec)
   #=TODO: It was assumed to only be real variable not discretes, which might have other indices? =#
   # @info "Status length of both problems" begin
   #   length(symsOfOldProblem) length(symsOfNewProblem)
@@ -246,10 +234,6 @@ function createNewU0(symsOfOldProblem::Vector{Symbol},
   local variableNamesNewProblem = RuntimeUtil.convertSymbolsToStrings(symsOfNewProblem)
   #@info "variableNamesOldProblem" variableNamesOldProblem
   #@info "variableNamesNewProblem" variableNamesNewProblem
-  #= In the special case all the indices are the same as they where before the transformation. =#
-  if  specialCase
-    return uVec
-  end
   # strip only the leading submodel prefix (first underscore-segment);
   # greedy ".*_" would collapse distinct names sharing a final identifier
   local variableNamesWithoutPrefixesOP = String[replace(k, r"^[^_]*_" => "")
@@ -279,309 +263,7 @@ function createNewU0(symsOfOldProblem::Vector{Symbol},
   return newU0
 end
 
-"""
-  Gets the index from an entry to the symbol table
-"""
-function getIdxFromEntry(entry::Tuple)::Int
-  first(entry)
-end
 
-
-"""
-  Creates a new flat model.
-  This model either has the equation specified in the if or these equations are to be added to the model
-  when this condition is true.
-  The name of this model
-"""
-function createNewFlatModel(flatModel,
-                            unresolvedEquations,
-                            newEquations)
-  local newFlatModel =
-    OMFrontend.Frontend.FLAT_MODEL(flatModel.name,
-                               flatModel.variables,
-                               flatModel.equations,
-                               flatModel.initialEquations,
-                               flatModel.algorithms,
-                               flatModel.initialAlgorithms,
-                               MetaModelica.nil,
-                               NONE(),
-                               MetaModelica.nil,
-                               MetaModelica.nil,
-                               Bool[], #= TODO: This equation might need to be changed. =#
-                               flatModel.comment)
-  @assign newFlatModel.equations = listAppend(unresolvedEquations, newEquations)
-  # println("Unresolved System:")
-  # println("********************************************************************")
-  # for e in newFlatModel.equations
-  #   println(OMFrontend.Frontend.toString(e))
-  # end
-  # println("********************************************************************")
-  #=
-    1. Reresolve the connect equations.
-    2. Perform constant evaluation.
-    3. Run the simplification pass.
-  =#
-  newFlatModel = OMFrontend.Frontend.resolveConnections(newFlatModel, newFlatModel.name)
-  newFlatModel = OMFrontend.Frontend.evaluate(newFlatModel)
-  newFlatModel = OMFrontend.Frontend.simplifyFlatModel(newFlatModel)
-  # println("Final System")
-  # @debug "Length of final system:" length(newFlatModel.equations)
-  # println("********************************************************************")
-  # for e in newFlatModel.equations
-  #   println(OMFrontend.Frontend.toString(e))
-  # end
-  # println("********************************************************************")
-  return newFlatModel
-end
-
-"""
-  Creates a new flat model with a set of connection equation removed.
-  Note that the flat model passed to this function does not have any active equations.
-  This means that this flat model is a new flat model with the unbreakable branches removed.
-"""
-function createNewFlatModel(flatModel,
-                            idx::Int,
-                            unresolvedEquations)
-  local aDoccs = flatModel.active_DOCC_Equations
-  aDoccs[idx] = false
-  local newFlatModel =
-    OMFrontend.Frontend.FLAT_MODEL(flatModel.name,
-                               flatModel.variables,
-                               flatModel.unresolvedConnectEquations,
-                               flatModel.initialEquations,
-                               flatModel.algorithms,
-                               flatModel.initialAlgorithms,
-                               MetaModelica.nil,
-                               NONE(),
-                               flatModel.DOCC_equations,
-                               flatModel.unresolvedConnectEquations,
-                               aDoccs,
-                               flatModel.comment)
-  local variablestoReset = resolveDOOCConnections(flatModel, flatModel.name)
-  #=
-    1. Reresolve the connect equations.
-    2. Perform constant evaluation.
-    3. Run the simplification pass.
-  =#
-  newFlatModel = OMFrontend.Frontend.resolveConnections(newFlatModel, newFlatModel.name)
-  newFlatModel = OMFrontend.Frontend.evaluate(newFlatModel)
-  newFlatModel = OMFrontend.Frontend.simplifyFlatModel(newFlatModel)
-  return newFlatModel
-end
-
-"""
-  Resolves the system at the time of the structural change.
-"""
-function resolveDOOCConnections(flatModel, name)
-  #= Get the relevant OCC graph =#
-  local (searchGraph, rootVariables, rootEquations) = SimulationCode.getOCCGraph(flatModel)
-  local pathsForRoots = Dict{String, Vector{String}}()
-  for rv in rootVariables
-    p = findPath(searchGraph, rv)
-    pathsForRoots[OMFrontend.Frontend.toString(rv)] = p
-  end
-  for key in keys(pathsForRoots)
-    vars = pathsForRoots[key]
-  end
-  local rootSources = Dict{String, String}()
-  #= These are the equations for which the chain starts =#
-  for (lhs, rhs) in rootEquations
-    rootSources[OMFrontend.Frontend.toString(lhs)] = OMFrontend.Frontend.toString(rhs)
-  end
-  return (pathsForRoots, rootSources)
-end
-
-"""
-Author:johti17
-Iterative DFS:
-  Finds the path for a root variable passed as inV (in Vertices)
-"""
-function findPath(g::Dict{String, Vector{String}}, inV)
-  local v = OMFrontend.Frontend.toString(inV)
-  local S = String[]
-  local discovered = String[]
-  local seen = OrderedSet{String}()
-  push!(S, v)
-  while !isempty(S)
-    local v = pop!(S)
-    if !(v in seen)
-      push!(seen, v)
-      push!(discovered, v)
-      neighbours = g[v]
-      for n in neighbours
-        push!(S, n)
-      end
-    end
-  end
-  return discovered[2:end]
-end
-
-"""
-Temporary function.
-Evaluates a discrete events
-Assuming one variable and one event that is changed.
-TODO: Generalize later
-"""
-function evalDiscreteEvents(discreteEvents, u, t, system)
-  local events = Tuple{Int, Bool, Bool}[]
-  for de in discreteEvents
-    push!(events, evalDiscreteEvent(de, u, t, system))
-  end
-  events = filter((x) -> last(x), events)
-  return events
-end
-
-"""
-TODO:
-Refactor this function
-"""
-function evalDiscreteEvent(discreteEvent, u, time, system)
-  @assert(length(discreteEvent.affects ) == 1, "Only length one of discrete affects supported")
-  #@info "New iteration\n\n\n\n"
-  local affect = first(discreteEvent.affects)
-  local condition = discreteEvent.condition
-  local args = condition.arguments
-  local operator = condition.f
-  local stateVars = ModelingToolkit.states(system)
-  local lhs = first(args)
-  local rhs = last(args)
-  local lhsIdx::Int = 0
-  local rhsIdx::Int = 0
-  local isChanged = false
-  local varDeps = Int[]
-  #Assuming a ! for this case
-  local shouldApplyNegation = false
-  if length(args) == 1
-    lhs = first(first(args).arguments)
-    rhs = last(first(args).arguments)
-    shouldApplyNegation = true
-    operator = first(args).f
-  end
-  if typeof(lhs) != Float64 && string(lhs) != string(system.iv)
-    lhsIdx = findfirst((x)->x==1, indexin(stateVars, [lhs]))
-  end
-  if typeof(rhs) != Float64 && string(rhs) != string(system.iv)
-    rhsIdx = findfirst((x)->x==1, indexin(stateVars, [rhs]))
-  end
-  rhsValue = if rhsIdx != 0
-    varDeps = getVariableEqDepedenceViaIdx(rhsIdx, system)
-    #@info "varDeps rhs" varDeps
-    rootIdx = getRootEquation(varDeps)
-    getConstantValueOfEq(rootIdx, system)
-  elseif string(rhs) == string(system.iv)
-    time
-  else
-    rhs
-  end
-  lhsValue = if lhsIdx != 0
-    varDeps = getVariableEqDepedenceViaIdx(lhsIdx, system)
-    #@info "varDeps lhs" varDeps
-    #@info "root eq" getRootEquation(varDeps)
-    rootIdx = getRootEquation(varDeps)
-    getConstantValueOfEq(rootIdx, system)
-  elseif string(lhs) == string(system.iv)
-    time
-  else
-    lhs
-  end
-  local affectIdx = findfirst((x)->x==1, indexin(stateVars, [affect.lhs]))
-  local affectNewValue = affect.rhs
-  #@info "lhs value was" lhsValue
-  #@info "rhs value was" rhsValue
-  if shouldApplyNegation
-    if operator(lhsValue, rhsValue) == false
-      #@info operator(lhsValue, rhsValue)
-      #= Also assuming here that the lhs is a variable and the rhs is a value =#
-      #@info "Branch 1 Value was changed" discreteEvent.condition.f
-      isChanged = true
-    end
-  else
-    if operator(lhsValue, rhsValue)
-      isChanged = true
-    end
-  end
-  return (affectIdx, affect.rhs, isChanged)
-end
-
-"""
- Given a variable index, returns the equations that the variable at this index is dependent on.
-  That is, equations in which this variable is referenced.
-"""
-function getVariableEqDepedenceViaIdx(idx::Int, system)
-  #= Get all equation dependencies for the current system =#
-  local equationDependencies = ModelingToolkit.equation_dependencies(OMBackend.Runtime.REDUCED_SYSTEM)
-  local vars = ModelingToolkit.states(OMBackend.Runtime.REDUCED_SYSTEM)
-  local totalDependencies = Int[]
-  #= Go through each equation =#
-  for (equationIndex, equationDep) in enumerate(equationDependencies)
-    #= Skip equations without dependencies =#
-    if isempty(equationDep)
-      continue
-    end
-    #=
-      If the equation dependency is not empty
-      Check if it depends on our variable
-    =#
-    if first(indexin([vars[idx]], equationDep)) !== nothing
-      #=
-      In this case we know that this equation is a dependency of the supplied variable.
-      Add this equation as a possible dependency to totalDependencies
-      =#
-      push!(totalDependencies, equationIndex)
-    end
-  end
-  #= We now have all indices of the variables our equation depends on =#
-  return totalDependencies
-end
-
-"""
-  Get the top level equation if such equation exist for a given set of equations
-  Note that if the supplied equation is not solved at the top level, this function returns 0
-"""
-function getRootEquation(equationIndices; usedEqIndices = OrderedSet())::Int
-  local G = ModelingToolkit.asgraph(OMBackend.Runtime.REDUCED_SYSTEM)
-  local variableIdxToEquationIdx = G.badjlist
-  local equationIdxToVariableIdx = G.fadjlist
-  local idx = 0
-  #= Shallow search. See if we can find the right equation directly =#
-  for idx in equationIndices
-    #= This equation does only depend on one variable. We are done =#
-    if length(equationIdxToVariableIdx[idx]) == 1
-      #= Then it is solved in this particular equation =#
-      return idx
-    end
-    push!(usedEqIndices, idx)
-  end
-  for eqIdx in equationIndices
-    for vIdx in equationIdxToVariableIdx[eqIdx]
-      newEqIndices = filter((x) -> !(x in usedEqIndices), variableIdxToEquationIdx[vIdx])
-      if isempty(newEqIndices)
-        continue
-      end
-      idx = getRootEquation(newEqIndices; usedEqIndices = usedEqIndices)
-    end
-  end
-  return idx
-end
-
-"""
-Gets the constant value of an equation if such exist.
-Throws an error otherwise
-"""
-function getConstantValueOfEq(eqIdx::Int, system)::Float64
-  local equations = ModelingToolkit.equations(system)
-  local equation = equations[eqIdx]
-  @assert typeof(equation.lhs) != Number || typeof(equation.rhs) != Number "One side (lhs/rhs )needs to be a constant float"
-  if equation.lhs isa Number
-    return equation.lhs
-  end
-  return equation.rhs
-end
-
-
-function getCallbackSet(problem)
-  last(last(problem.kwargs))
-end
 
 """
 ```
@@ -593,38 +275,12 @@ function isReturnCodeSuccess(integrator)
   integrator.sol.retcode == ReturnCode.Success
 end
 
-"""
-```
-isReturnCodeDefault(integrator)
-```
-Returns true if the current return code of the supplied integrator argument is `Default`.
-"""
-function isReturnCodeDefault(integrator)
-  integrator.sol.retcode == ReturnCode.Default
-end
-
-function getObserved(integrator)
-  return [oEq.lhs for oEq in ModelingToolkit.observed(integrator.f.sys)]
-end
-
 function getUnknowns(integrator)
   return [u for u in ModelingToolkit.unknowns(integrator.f.sys)]
 end
 
-function getObservedAsStrings(integrator)
-  local oStrs = String[string(o.f.name) for o in getObserved(integrator)]
-end
-
-function getUnknownsAsStrings(integrator)
-  local oStrs = String[string(o.f.name) for o in getUnknowns(integrator)]
-end
-
 function getUnknownsAsStringsNoPrefix(integrator)
   local oStrs = String[join(split(string(o.f.name), "_")[2:end], "_") for o in getUnknowns(integrator)]
-end
-
-function getObservedAsStringsNoPrefix(integrator)
-  local oStrs = String[join(split(string(o.f.name), "_")[2:end], "_") for o in getObserved(integrator)]
 end
 
 function _resolveObservedValue(integrator, os)
@@ -654,10 +310,6 @@ function _resolvableObservedPairs(integrator)
   return pairs
 end
 
-function createLookupTableForObserved(integrator)
-  return Dict{String, Float64}(_resolvableObservedPairs(integrator))
-end
-
 function createLookupTable(integrator)
   local unknownNames = getUnknownsAsStringsNoPrefix(integrator)
   local unknownVals = getValuesForUnknowns(integrator)
@@ -670,15 +322,6 @@ function createLookupTable(integrator)
     end
   end
   return d
-end
-
-function getPrefix(integrator)
-  local u = first(ModelingToolkit.unknowns(integrator.f.sys))
-  return first(split(string(u.f.name), "_"))
-end
-
-function getValuesForObserved(integrator)
-  return Float64[v for (_, v) in _resolvableObservedPairs(integrator)]
 end
 
 function getValuesForUnknowns(integrator)

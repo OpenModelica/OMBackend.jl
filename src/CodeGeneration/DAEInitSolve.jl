@@ -73,12 +73,12 @@ end
 function _completeUnderdeterminedInit!(u0, rhsFunc, p_vec, eq_idx, var_idx, algCandidates, u0_entry;
                                        targets=zeros(Float64, length(eq_idx)), tol=1e-10,
                                        extraRes=nothing, maxiter=200, restoreIdx=Int[])
-  get(ENV, "OMBACKEND_INIT_COMPLETE", "true") == "true" || return false
+  OMBackend.envSwitch("OMBACKEND_INIT_COMPLETE") || return false
   isempty(var_idx) && return false
   #= Only algebraic unknowns are completion candidates; with none, the
      Jacobian and SVD below cannot produce a pick. =#
   isempty(algCandidates) && return false
-  local traceInit = get(ENV, "OMBACKEND_INIT_TRACE", "") == "true"
+  local traceInit = OMBackend.envSwitch("OMBACKEND_INIT_TRACE")
   local du = similar(u0)
   local freeVars = collect(var_idx)
   local algSet = OrderedSet(algCandidates)
@@ -154,7 +154,44 @@ function _completeUnderdeterminedInit!(u0, rhsFunc, p_vec, eq_idx, var_idx, algC
   return changed
 end
 
-function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[])
+#= A free unknown guessed at exactly 0 can make a residual row non-finite
+   at the entry (MSL QS FluxTubes GeneralLeakage: `0 = -7e-6 + 0.3/G_m`, G_m
+   without a start value), and then no phase can start. Those guesses become
+   1: all together, else one at a time where it lowers the number of
+   non-finite rows. Only at such an entry, which no phase could solve from.
+   Whether a guess changed. =#
+function _nudgeZeroGuesses!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residuals, fixed)
+  local du = similar(u0)
+  local nonFinite = u -> (rhsFunc(du, u, p_vec, 0.0);
+                          count(!isfinite, _initResidualVec(du, u, eq_idx, eq_target, extra_residuals)))
+  local candidates = [i for i in eachindex(u0) if iszero(u0[i]) && !(i in fixed)]
+  isempty(candidates) && return false
+  local bad = nonFinite(u0)
+  local u = copy(u0)
+  u[candidates] .= 1.0
+  if nonFinite(u) == 0
+    copyto!(u0, u)
+    return true
+  end
+  local changed = false
+  for i in candidates
+    u0[i] = 1.0
+    local b = nonFinite(u0)
+    if b < bad
+      bad = b
+      changed = true
+      bad == 0 && break
+    else
+      u0[i] = 0.0
+    end
+  end
+  return changed
+end
+
+#= `converged` is set false when no phase converged (the result is then the
+   best effort the warning or the error below reports). =#
+function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
+                                  converged::Base.RefValue{Bool}=Ref(true))
   local n = length(u0)
   local nMM = size(mm, 1)
   local nSafe = min(n, nMM)
@@ -175,11 +212,18 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
   local du = similar(u0)
   rhsFunc(du, u0, p_vec, 0.0)
   local init_res_vec = _initResidualVec(du, u0, eq_idx, eq_target, extra_residuals)
+  if !all(isfinite, init_res_vec) &&
+     _nudgeZeroGuesses!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residuals, union(pinned, discrete_pinned))
+    rhsFunc(du, u0, p_vec, 0.0)
+    init_res_vec = _initResidualVec(du, u0, eq_idx, eq_target, extra_residuals)
+  end
   local init_res = isempty(init_res_vec) ? 0.0 : maximum(abs, init_res_vec)
   if init_res < tol
     return u0
   end
-  if get(ENV, "OMBACKEND_INIT_TRACE", "") == "true" && eqLabels !== nothing
+  if OMBackend.envSwitch("OMBACKEND_INIT_TRACE") && eqLabels !== nothing
+    println("[initentry] ", length(u0), " unknowns, u0 = ", first(u0, 20), length(u0) > 20 ? " ..." : "",
+            ", pinned ", pinned, ", discrete pinned ", discrete_pinned)
     for (rowk, k) in enumerate(eq_idx)
       local kind = rowk <= length(alg_idx) ? "alg" : "der"
       println("[initrow] ", rowk, " (", kind, " eq ", k, ") ",
@@ -212,6 +256,22 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
       restoreIdx=vcat(pinned, discrete_pinned))
     snapEntryNoise!()
   end
+  #= `warm`: u0 is a consistent state for nearby parameter values (a
+     re-initialization for other tunable parameter values, DAE_REINIT). A
+     plain min-norm Newton over the free variables converges from there in a
+     few steps; the cold-start phases below would first spend hundreds of
+     iterations on sets that cannot converge (algebraic-only, anchored). =#
+  if warm
+    local warmVars = [i for i in 1:n if !(i in pinnedSet) && !(i in discretePinnedSet)]
+    local u0_warm = copy(u0)
+    if !isempty(warmVars) && _solveDAEPhase!(u0_warm, rhsFunc, p_vec, eq_idx, warmVars;
+                                             targets=eq_target, maxiter=20, tol=tol,
+                                             extraRes=extra_residuals, phaseLabel="warm")
+      copyto!(u0, u0_warm)
+      completeInit!(warmVars)
+      return u0
+    end
+  end
   local alg_unpinned = [i for i in alg_idx if !(i in pinnedSet)]
   local u0_phase1 = copy(u0)
   if !isempty(alg_unpinned) && _solveDAEPhase!(u0_phase1, rhsFunc, p_vec, eq_idx, alg_unpinned;
@@ -225,7 +285,7 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
      algebraic eqs to be satisfied by adjusting differential vars. Pinned vars
      stay at user-requested values. Anchored to the entry guesses so an
      underdetermined manifold resolves to the nearest root. =#
-  local u0_guess = get(ENV, "OMBACKEND_INIT_ANCHOR", "true") == "true" ? copy(u0) : nothing
+  local u0_guess = OMBackend.envSwitch("OMBACKEND_INIT_ANCHOR") ? copy(u0) : nothing
   local all_unpinned = [i for i in 1:n if !(i in pinnedSet)]
   #= Latched phase: the discrete latches held at their init values along with
      the user pins. Their defining rows evaluate locally constant, so the
@@ -270,7 +330,7 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
      locally constant and the remaining system is smooth. Keeps the free
      root when the constrained polish cannot converge. =#
   if phase3_ok && !(isempty(pinned) && isempty(discrete_pinned)) &&
-     get(ENV, "OMBACKEND_INIT_REPIN", "true") == "true"
+     OMBackend.envSwitch("OMBACKEND_INIT_REPIN")
     local repinVars = latched_unpinned
     if !isempty(repinVars)
       local u0_repin = copy(u0)
@@ -290,15 +350,11 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
   phase3_ok && completeInit!(latched_unpinned)
   phase3_ok || snapEntryNoise!()
   if !phase3_ok
+    converged[] = false
     rhsFunc(du, u0, p_vec, 0.0)
     local resids = abs.(_initResidualVec(du, u0, eq_idx, eq_target, extra_residuals))
     local final_res = maximum(resids)
-    if !isfinite(final_res)
-      @error "DAE init: residual is non-finite ($final_res); ICs unverified, integrator may NaN."
-    elseif final_res >= failure_threshold
-      local order = sortperm(resids; rev = true)
-      local worst = order[1:min(5, length(order))]
-      local detail = join((begin
+    local rowsDetail = rows -> join((begin
         local label
         if w <= length(eq_idx)
           local k = eq_idx[w]
@@ -309,8 +365,14 @@ function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10
           label = string("initialization eq row ", w - length(eq_idx))
         end
         string(label, " residual ", round(resids[w], sigdigits = 4))
-      end for w in worst), "\n  ")
-      error("DAE init: residual $(round(final_res, sigdigits=4)) exceeds threshold $(failure_threshold); refusing inconsistent ICs. Worst:\n  $(detail)")
+      end for w in rows), "\n  ")
+    if !isfinite(final_res)
+      local bad = findall(!isfinite, resids)
+      @error "DAE init: residual is non-finite ($final_res); ICs unverified, integrator may NaN. Rows:\n  " *
+             rowsDetail(bad[1:min(5, length(bad))])
+    elseif final_res >= failure_threshold
+      local order = sortperm(resids; rev = true)
+      error("DAE init: residual $(round(final_res, sigdigits=4)) exceeds threshold $(failure_threshold); refusing inconsistent ICs. Worst:\n  $(rowsDetail(order[1:min(5, length(order))]))")
     else
       @warn "DAE init: did not fully converge (residual $(round(final_res, sigdigits=4)) < threshold $(failure_threshold)); proceeding."
     end
@@ -348,12 +410,45 @@ function _solveDAEPhaseAnchored!(u0, rhsFunc, p_vec, eq_idx, var_idx, anchorVals
                          phaseLabel=string(phaseLabel, "-polish"))
 end
 
+#= The Newton step of an init phase: the minimum-norm step, pinv's, which
+   also serves the underdetermined and anchored phases. Where pinv's rank
+   cutoff (eps * min(m, n) * the largest singular value) drops a direction of
+   an unanchored Jacobian with at least as many rows as columns, and the
+   Jacobian is regular once its rows and columns are scaled, the step is that
+   scaled matrix's Newton step (for more rows than columns, its row-weighted
+   least-squares step) when it descends. A badly scaled Jacobian is not a
+   singular one: an ideal diode in the wrong mode at the start has s = -8e5
+   against Ron = 1e-5; the dropped direction is the one that corrects s, the
+   step moved the if-equation's coefficient instead, the phase crept above
+   its tolerance, and a later phase moved the states to fit the wrong mode (a
+   capacitor's start value). Elsewhere the step is pinv's, bit for bit: a V6
+   engine cylinder's piston reaches its stroke limit to 1e-12, and a last-bit
+   change of the initial crank angle trips that assert. =#
+function _newtonStep(Js, ress, unanchored::Bool)
+  if unanchored && size(Js, 1) >= size(Js, 2) && !isempty(Js) && !LinearAlgebra.isdiag(Js)
+    local S = LinearAlgebra.svdvals(Js)
+    if S[end] <= eps(Float64) * minimum(size(Js)) * S[1]
+      local rowScale = [(m = maximum(abs, @view Js[i, :]); m > floatmin(Float64) ? 1 / m : 1.0) for i in 1:size(Js, 1)]
+      local Jr = rowScale .* Js
+      local colScale = [(m = maximum(abs, @view Jr[:, j]); m > floatmin(Float64) ? 1 / m : 1.0) for j in 1:size(Js, 2)]
+      local Fc = LinearAlgebra.svd(Jr .* colScale')
+      if Fc.S[end] > 1e-10 * Fc.S[1]
+        local delta = colScale .* (Fc \ (rowScale .* ress))
+        #= A descent direction for the phase's objective (ress' Js delta > 0): a
+           row-weighted least-squares step of an inconsistent system may not be. =#
+        LinearAlgebra.dot(ress, Js * delta) > 0 && return delta
+      end
+    end
+  end
+  return LinearAlgebra.pinv(Js) * ress
+end
+
 function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Float64, length(eq_idx)), maxiter=50, tol=1e-10, anchorVals=nothing, anchorWeight=1e-2, extraRes=nothing, phaseLabel::String="")
   local nVar = length(var_idx)
   local du = similar(u0)
   local anchorRows = anchorVals === nothing ? nothing :
     Matrix(LinearAlgebra.Diagonal(fill(anchorWeight, nVar)))
-  local traceInit = get(ENV, "OMBACKEND_INIT_TRACE", "") == "true"
+  local traceInit = OMBackend.envSwitch("OMBACKEND_INIT_TRACE")
   #= Fixed per-phase row equilibration, from the ENTRY Jacobian: symbolic
      elimination can emit rows whose constant coefficients reach 1e40+, so
      raw residual units make both the tolerance and any line-search measure
@@ -382,7 +477,7 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
       return false
     end
     if iter == 1
-      rowNorm = get(ENV, "OMBACKEND_INIT_ROWSCALE", "true") == "true" ?
+      rowNorm = OMBackend.envSwitch("OMBACKEND_INIT_ROWSCALE") ?
         [max(maximum(abs, @view J[i, :]), 1.0) for i in 1:nRows] : ones(nRows)
     end
     local norm_res = maximum(abs, res ./ rowNorm)
@@ -411,7 +506,22 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
       Js = vcat(Js, anchorRows)
       ress = vcat(ress, ares)
     end
-    local delta = LinearAlgebra.pinv(Js) * ress
+    local delta = _newtonStep(Js, ress, anchorRows === nothing)
+    #= Converged at the round-off floor: the full Newton step moves the
+       variables by round-off only, so the residual cannot shrink further. An
+       ideal diode conducting V/Ron = 1e7 A leaves ~1e-9 in its rows (the MSL
+       MultiPhase Rectifier stalled at 1.863e-9 for 20 iterations). Only with
+       a residual at round-off relative to the variables (a singular
+       Jacobian's least-squares step can be tiny away from a root too), and
+       not in an anchored phase (its least-squares stationary point has a
+       zero step with the anchors pulling the residual off zero). =#
+    local uMax = max(1.0, maximum(j -> abs(u0[j]), var_idx; init = 0.0))
+    if anchorRows === nothing && norm_res <= 1.0e3 * eps(Float64) * uMax &&
+       maximum(abs, delta; init = 0.0) <= 64 * eps(Float64) * uMax
+      traceInit && println("[initphase ", phaseLabel, "] converged at the round-off floor, norm=",
+                           round(norm_res, sigdigits = 4))
+      return true
+    end
     #= The acceptance measure must match the objective the direction
        minimizes: the equilibrated least-squares norm. Raw max-norm
        acceptance on mixed-scale systems rejects every step (one huge-

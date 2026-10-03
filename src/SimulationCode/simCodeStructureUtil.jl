@@ -174,7 +174,9 @@ Base.@nospecializeinfer function toOpKind(@nospecialize(op))::OpKind
     DAE.ADD(__) || DAE.ADD_ARR(__) || DAE.ADD_ARRAY_SCALAR(__) => OP_ADD
     DAE.SUB(__) || DAE.SUB_ARR(__) || DAE.SUB_SCALAR_ARRAY(__) => OP_SUB
     DAE.MUL(__) || DAE.MUL_ARR(__) || DAE.MUL_ARRAY_SCALAR(__) ||
-      DAE.MUL_SCALAR_PRODUCT(__) || DAE.MUL_MATRIX_PRODUCT(__) => OP_MUL
+      DAE.MUL_MATRIX_PRODUCT(__) => OP_MUL
+    #= Not scalarized when an operand is a vector-valued call. =#
+    DAE.MUL_SCALAR_PRODUCT(__) => OP_DOT
     DAE.DIV(__) || DAE.DIV_ARR(__) || DAE.DIV_ARRAY_SCALAR(__) ||
       DAE.DIV_SCALAR_ARRAY(__) => OP_DIV
     DAE.POW(__) || DAE.POW_ARR(__) || DAE.POW_ARR2(__) ||
@@ -218,6 +220,7 @@ Base.@nospecializeinfer function toDAEOperator(@nospecialize(k::OpKind), ty = DA
   elseif k === OP_GREATEREQ; DAE.GREATEREQ(DAE.T_BOOL_DEFAULT)
   elseif k === OP_EQUAL;    DAE.EQUAL(DAE.T_BOOL_DEFAULT)
   elseif k === OP_NEQUAL;   DAE.NEQUAL(DAE.T_BOOL_DEFAULT)
+  elseif k === OP_DOT;      DAE.MUL_SCALAR_PRODUCT(ty)
   else error("toDAEOperator: unhandled OpKind $k")
   end
 end
@@ -257,8 +260,16 @@ toSimExp(e::DAE.IFEXP)::Exp =
   IFEXP(toSimExp(e.expCond), toSimExp(e.expThen), toSimExp(e.expElse))
 toSimExp(e::DAE.ARRAY)::Exp =
   ARRAY_EXP(e.ty, e.scalar, Exp[toSimExp(x) for x in e.array])
+#= Inner index expression of a DAE.Subscript (SimCode ASUB.subs is Vector{Exp};
+   WHOLEDIM carries no expression, represent it as 0). =#
+_daeSubscriptExp(s::DAE.Subscript)::DAE.Exp = @match s begin
+  DAE.INDEX(e) => e
+  DAE.SLICE(e) => e
+  DAE.WHOLE_NONEXP(e) => e
+  _ => DAE.ICONST(0)
+end
 toSimExp(e::DAE.ASUB)::Exp =
-  ASUB(toSimExp(e.exp), Exp[toSimExp(x) for x in e.sub])
+  ASUB(toSimExp(e.exp), Exp[toSimExp(_daeSubscriptExp(x)) for x in e.sub])
 toSimExp(e::DAE.TSUB)::Exp = TSUB(toSimExp(e.exp), Int(e.ix), e.ty)
 toSimExp(e::DAE.RSUB)::Exp = RSUB(toSimExp(e.exp), Int(e.ix), String(e.fieldName), e.ty)
 toSimExp(e::DAE.CAST)::Exp = CAST(e.ty, toSimExp(e.exp))
@@ -311,7 +322,8 @@ toDAEExp(e::ARRAY_EXP)::DAE.Exp =
             MetaModelica.list((toDAEExp(x) for x in e.elements)...))
 toDAEExp(e::ASUB)::DAE.Exp =
   DAE.ASUB(toDAEExp(e.exp),
-           MetaModelica.list((toDAEExp(x) for x in e.subs)...))
+           #= DAE.ASUB.sub is List{Subscript}; SimCode ASUB.subs are Exps. =#
+           MetaModelica.list((DAE.INDEX(toDAEExp(x)) for x in e.subs)...))
 toDAEExp(e::TSUB)::DAE.Exp = DAE.TSUB(toDAEExp(e.exp), e.index, toDAEType(e.ty))
 toDAEExp(e::RSUB)::DAE.Exp = DAE.RSUB(toDAEExp(e.exp), e.index, e.fieldName, toDAEType(e.ty))
 toDAEExp(e::CAST)::DAE.Exp = DAE.CAST(toDAEType(e.ty), toDAEExp(e.exp))
@@ -509,7 +521,7 @@ Project a `BDAE.EquationAttributes` to the bits SimCode keeps.
 """
 function toEqAttr(@nospecialize(bdaeAttr))::EQ_ATTR
   @match bdaeAttr begin
-    BDAE.EQUATION_ATTRIBUTES(differentiated = d) => EQ_ATTR(d)
+    BDAE.EQUATION_ATTRIBUTES(differentiated = d, kind = k) => EQ_ATTR(d, k isa BDAE.ALSO_INITIAL_EQUATION)
     _ => EQ_ATTR_DEFAULT
   end
 end

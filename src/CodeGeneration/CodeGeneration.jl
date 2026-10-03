@@ -46,6 +46,9 @@ using DocStringExtensions
 using ModelingToolkit
 using LinearAlgebra
 import DiffEqBase
+import OrdinaryDiffEq
+import ADTypes
+import NonlinearSolve
 
 using ..FrontendUtil
 using ..Backend #Should maybe not be using here... since it can make certain overloads a bit tricky to follow.
@@ -53,6 +56,7 @@ using ..SimulationCode
 
 import ..Backend.BDAE
 import ..@BACKEND_LOGGING
+import ..unsupported, ..UnsupportedLowering
 import ..COMPONENT_SEPARATOR
 
 import Absyn
@@ -80,10 +84,22 @@ include("./MTK_CodeGenerationUtil.jl")
 using .MTK_CodeGenerationUtil
 include("./structuralCallbacks.jl")
 include("./DirectRHSGeneration.jl")
+include("./asserts.jl")
+include("./discreteClusters.jl")
+include("./relationRefresh.jl")
+include("./delays.jl")
+include("./algebraicStepControl.jl")
 include("./MTK_CodeGeneration.jl")
+include("./mtkInitialization.jl")
+include("./mtkIfEquations.jl")
+include("./mtkRelations.jl")
+include("./mtkDiscreteEvents.jl")
+include("./mtkParameters.jl")
+include("./mtkDeclarations.jl")
 include("./DiscreteDummyDemotion.jl")
 
-#= Pure DifferentialEquations.jl code generation (legacy/donor) =#
+#= The when-callback emitter (the MTK path uses it) and expToJuliaExp (the
+   structural callbacks, CodeGenerationUtil) =#
 include("./codeGen.jl")
 
 #= Direct DifferentialEquations.jl code generation (DEMode, fresh emitter) =#

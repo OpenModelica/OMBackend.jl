@@ -46,6 +46,7 @@ import ..BDAEUtil
 import ..BackendEquation
 import ..@BACKEND_LOGGING
 import ..FrontendUtil.Util
+import ..isTunableParameter
 import DAE
 import OMBackend
 
@@ -98,6 +99,37 @@ end
 # IFEXP (entry path); timeDepOnly=true lifts only time-dependent IFEXPs and recurses
 # the rest (for branches of an already-lifted IFEXP). noEvent subtrees stay inline;
 # identical (cond|then|else) shapes are deduped to one tmp var.
+#= True if every relation in a Boolean expression is inside noEvent (and there
+   is at least one noEvent): such a condition generates no events (MLS 8.5). =#
+Base.@nospecializeinfer function _relationsAllInNoEvent(@nospecialize(exp::DAE.Exp))::Bool
+  local sawNoEvent = Ref(false)
+  local bare = Ref(false)
+  local visit = function (e, arg)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("noEvent"), _, _) => begin
+        sawNoEvent[] = true
+        return (e, false, arg)
+      end
+      DAE.RELATION(__) => begin
+        bare[] = true
+        return (e, false, arg)
+      end
+      _ => return (e, true, arg)
+    end
+  end
+  Util.traverseExpTopDown(exp, visit, nothing)
+  return sawNoEvent[] && !bare[]
+end
+
+#= A record value (the ComplexBlocks' if useConjugateInput1 then conj(u1) else u1). =#
+_isRecordValued(@nospecialize(e::DAE.Exp))::Bool = @match e begin
+  DAE.CREF(_, DAE.T_COMPLEX(__)) => true
+  DAE.CALL(attr = DAE.CALL_ATTR(ty = DAE.T_COMPLEX(__))) => true
+  DAE.RECORD(__) => true
+  DAE.IFEXP(_, t, f) => _isRecordValued(t) || _isRecordValued(f)
+  _ => false
+end
+
 struct IfExpressionLifter
   tmpVarToElement::OrderedDict{BDAE.VAR, BDAE.IF_EQUATION}
   tick::Ref{Int}
@@ -110,20 +142,39 @@ Base.@nospecializeinfer function (v::IfExpressionLifter)(@nospecialize(exp::DAE.
     @match exp begin
       DAE.CALL(Absyn.IDENT("noEvent"), _, _) => (exp, false)
       DAE.IFEXP(cond, expThen, expElse) => begin
-        if v.timeDepOnly && !_expDependsOnTime(cond)
+        #= A condition whose relations are all inside noEvent is literal: no
+           event, so it stays inline like a state-dependent nested IFEXP. =#
+        if (v.timeDepOnly && !_expDependsOnTime(cond)) || _relationsAllInNoEvent(cond) ||
+           _isRecordValued(expThen) || _isRecordValued(expElse)
           #= State-dependent: keep inline (bool-product), recurse for nested
-             time-dependent IFEXPs. =#
+             time-dependent IFEXPs. A record value stays inline too: the
+             temporary is a Real; call sites split it field by field
+             (expandRecordArgsInExp). Its relations then make no events
+             (lifting it field by field would). =#
           local (lc, _) = Util.traverseExpTopDown(cond, timeDep, nothing)
           local (lt, _) = Util.traverseExpTopDown(expThen, timeDep, nothing)
           local (le, _) = Util.traverseExpTopDown(expElse, timeDep, nothing)
           (DAE.IFEXP(lc, lt, le), false)
         else
           #= Lift this IFEXP. Recurse branches via the time-dep variant so nested
-             state-dependent IFEXPs keep their bool-product lowering. =#
-          local (liftedCond, _) = Util.traverseExpTopDown(cond, timeDep, nothing)
-          local (liftedThen, _) = Util.traverseExpTopDown(expThen, timeDep, nothing)
-          local (liftedElse, _) = Util.traverseExpTopDown(expElse, timeDep, nothing)
-          local key = string(liftedCond, "|", liftedThen, "|", liftedElse)
+             state-dependent IFEXPs keep their bool-product lowering. An
+             elseif chain (the else branch an IFEXP whose condition makes
+             events) becomes further branches of the same if-equation: its
+             relations make events too (MLS 8.5), as an if-equation's elseif
+             does. Inline, `Hstat > Hsat` of MSL FluxTubes' H_lim switched a
+             derivative without an event and the step size collapsed on it. =#
+          local conds = DAE.Exp[]
+          local thens = DAE.Exp[]
+          local rest = expElse
+          push!(conds, first(Util.traverseExpTopDown(cond, timeDep, nothing)))
+          push!(thens, first(Util.traverseExpTopDown(expThen, timeDep, nothing)))
+          while rest isa DAE.IFEXP && !_relationsAllInNoEvent(rest.expCond)
+            push!(conds, first(Util.traverseExpTopDown(rest.expCond, timeDep, nothing)))
+            push!(thens, first(Util.traverseExpTopDown(rest.expThen, timeDep, nothing)))
+            rest = rest.expElse
+          end
+          local liftedElse = first(Util.traverseExpTopDown(rest, timeDep, nothing))
+          local key = string(join(string.(conds), "|"), "||", join(string.(thens), "|"), "||", liftedElse)
           local existing = get(v.dedup, key, nothing)
           if existing !== nothing
             (existing, true)
@@ -137,8 +188,8 @@ Base.@nospecializeinfer function (v::IfExpressionLifter)(@nospecialize(exp::DAE.
             local attr = BDAE.EQ_ATTR_DEFAULT_UNKNOWN
             local backendVar = BDAE.VAR(DAE.CREF_IDENT(varName, DAE.T_UNKNOWN_DEFAULT, nil),
                                         BDAE.VARIABLE(), varType)
-            v.tmpVarToElement[backendVar] = BDAE.IF_EQUATION(list(liftedCond),
-                                                            list(list(BDAE.EQUATION(varAsCREF, liftedThen, emptySource, attr))),
+            v.tmpVarToElement[backendVar] = BDAE.IF_EQUATION(list(conds...),
+                                                            list([list(BDAE.EQUATION(varAsCREF, t, emptySource, attr)) for t in thens]...),
                                                             list(BDAE.EQUATION(varAsCREF, liftedElse, emptySource, attr)),
                                                             emptySource,
                                                             BDAE.EQ_ATTR_DEFAULT_UNKNOWN)
@@ -503,35 +554,6 @@ end
 
 
 """
-  Author: johti17
-
-"""
-function updateArrayCrefs(vars::BDAE.Variables, arrayCrefs::Dict{DAE.ComponentRef, Bool})
-  vars = begin
-    @match vars begin
-      BDAE.VARIABLES(varArr) => begin
-        for i in 1:arrayLength(varArr)
-          varArr[i] = begin
-            local cref::DAE.ComponentRef
-            local var::BDAE.Var
-            @match varArr[i] begin
-              var && BDAE.VAR(varName = cref) where (haskey(arrayCrefs, cref)) => begin
-                var
-              end
-              _ => begin
-                varArr[i]
-              end
-            end
-          end
-        end
-        @assign vars.varArr = varArr
-        (vars)
-      end
-    end
-  end
-end
-
-"""
     kabdelhak:
     Residualize every equation in each system of the dae by subtracting the rhs
     from the lhs.
@@ -751,7 +773,7 @@ Base.@nospecializeinfer function extractBindingElement(@nospecialize(bindExp::DA
     end
     _ => begin
       #= Non-literal binding: wrap with ASUB for runtime indexing =#
-      local asubSubs = list((DAE.ICONST(indices[i]) for i in 1:N)...)
+      local asubSubs = list((DAE.INDEX(DAE.ICONST(indices[i])) for i in 1:N)...)
       return DAE.ASUB(bindExp, asubSubs)
     end
   end
@@ -849,6 +871,22 @@ function expandComplexEquations(dae::BDAE.BACKEND_DAE)
       end
     end
     system.orderedEqs = newEqs
+    #= Record equations among the initial equations too: a record-typed
+       parameter binding that becomes an initial equation (FixedRotation's
+       `R_rel_inv = Frames.from_T(transpose(R_rel.T), zeros(3))`) reached
+       SimCode unexpanded, which has no record equations. Array equations
+       stay; the initial-equation code generation handles them. =#
+    local newInitialEqs = BDAE.Equation[]
+    for eq in system.initialEqs
+      if eq isa BDAE.COMPLEX_EQUATION
+        local expanded = tryExpandRecordEquation(eq.left, eq.right, eq.source, eq.attr)
+        append!(newInitialEqs, expanded !== nothing ? expanded :
+                               expandSingleArrayEquation(eq.size, eq.left, eq.right, eq.source, eq.attr))
+      else
+        push!(newInitialEqs, eq)
+      end
+    end
+    system.initialEqs = newInitialEqs
   end
   return dae
 end
@@ -910,7 +948,7 @@ function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
        array entries.) =#
     fieldName = string(baseName, subsStr, OMBackend.COMPONENT_SEPARATOR, field.name)
     fieldTy = field.ty
-    exprField = DAE.ASUB(exprSide, list(DAE.ICONST(fieldIdx)))
+    exprField = DAE.ASUB(exprSide, list(DAE.INDEX(DAE.ICONST(fieldIdx))))
     @match fieldTy begin
       DAE.T_ARRAY(elemTy, dims) => begin
         dimVec = Int[d.integer for d in dims]
@@ -919,7 +957,7 @@ function tryExpandRecordEquation(left::DAE.Exp, right::DAE.Exp,
           subs = list((DAE.INDEX(DAE.ICONST(i)) for i in idxTuple)...)
           lhsCref = DAE.CREF_IDENT(fieldName, elemTy, subs)
           lhsExp = DAE.CREF(lhsCref, elemTy)
-          rhsExp = DAE.ASUB(exprField, list((DAE.ICONST(i) for i in idxTuple)...))
+          rhsExp = DAE.ASUB(exprField, list((DAE.INDEX(DAE.ICONST(i)) for i in idxTuple)...))
           push!(equations, BDAE.EQUATION(lhsExp, rhsExp, source, attr))
         end
       end
@@ -964,7 +1002,10 @@ end
     into a CREF_IDENT with the subscripts baked in. This ensures expanded array
     equations use scalarized variable names (var"name[i]") instead of bare symbol
     indexing (name[i]) which would fail at runtime with MTK's scalar Num variables.
-    Falls back to ASUB wrapping for non-CREF expressions.
+    Any other expression is wrapped in an ASUB: element i of an array-valued expression,
+    or field i of a record-valued one. Both sides of `Complex.'+'(pin_p.i, pin_n.i) =
+    Complex(0)` are calls, so tryExpandRecordEquation declines that equation and its
+    fields are taken this way.
 """
 Base.@nospecializeinfer function makeScalarElement(@nospecialize(exp::DAE.Exp), subscripts::Union{Cons{DAE.ICONST}, Cons{DAE.Exp}})
   @match exp begin
@@ -973,10 +1014,7 @@ Base.@nospecializeinfer function makeScalarElement(@nospecialize(exp::DAE.Exp), 
       #= Collect existing subs into array, append new ones, convert to list once =#
       local subsArr = DAE.Subscript[s for s in existingSubs]
       for s in subscripts
-        @match s begin
-          DAE.ICONST(i) => push!(subsArr, DAE.INDEX(DAE.ICONST(i)))
-          _ => push!(subsArr, DAE.INDEX(s))
-        end
+        push!(subsArr, DAE.INDEX(s))
       end
       local allSubs = list(subsArr...)
       #= After subscripting, unwrap T_ARRAY to get the element type.
@@ -991,7 +1029,7 @@ Base.@nospecializeinfer function makeScalarElement(@nospecialize(exp::DAE.Exp), 
       local newCref = DAE.CREF_IDENT(flatName, scalarTy, allSubs)
       DAE.CREF(newCref, scalarTy)
     end
-    _ => DAE.ASUB(exp, subscripts)
+    _ => DAE.ASUB(exp, list((DAE.INDEX(s) for s in subscripts)...))
   end
 end
 
@@ -1129,23 +1167,16 @@ function _expandReductionElems(bodyExp::DAE.Exp, iterators)::Union{Vector{DAE.Ex
     end
     _ => return nothing
   end
-  local startVal::Int = 0
-  local stepVal::Int = 1
-  local stopVal::Int = 0
-  @match rangeExp begin
-    DAE.RANGE(_, DAE.ICONST(s), NONE(), DAE.ICONST(e)) => begin
-      startVal = s
-      stopVal = e
-    end
-    DAE.RANGE(_, DAE.ICONST(s), SOME(DAE.ICONST(st)), DAE.ICONST(e)) => begin
-      startVal = s
-      stepVal = st
-      stopVal = e
-    end
-    _ => return nothing
+  local values = @match rangeExp begin
+    DAE.RANGE(_, DAE.ICONST(s), NONE(), DAE.ICONST(e)) => s:e
+    DAE.RANGE(_, DAE.ICONST(s), SOME(DAE.ICONST(st)), DAE.ICONST(e)) => st == 0 ? nothing : s:st:e
+    #= An array of Integer literals (`for i in {1, 3}`): it was left unexpanded,
+       its iterator an unresolved name. =#
+    DAE.ARRAY(_, _, es) where all(e -> e isa DAE.ICONST, es) => Int[e.integer for e in es]
+    _ => nothing
   end
-  stepVal == 0 && return nothing
-  return DAE.Exp[substituteIteratorInExp(bodyExp, iterId, i) for i in startVal:stepVal:stopVal]
+  values === nothing && return nothing
+  return DAE.Exp[substituteIteratorInExp(bodyExp, iterId, i) for i in values]
 end
 
 function _callAttrType(@nospecialize(attr))
@@ -1288,23 +1319,12 @@ function transformASUBEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
 end
 
 """
-  Simplify ASUB(ARRAY([e1, e2, ...]), [ICONST(i)]) → e_i
+  Simplify ASUB(ARRAY([e1, e2, ...]), [INDEX(ICONST(i))]) → e_i
   When subscripting into an array constructor with a constant index, return that element directly.
 """
 function simplifyASUBofARRAY(asub::DAE.Exp)::DAE.Exp
   @match asub begin
     #= ASUB with a single integer constant subscript into an ARRAY constructor =#
-    DAE.ASUB(DAE.ARRAY(array = elements), Cons(DAE.ICONST(idx), Nil())) => begin
-      #= Convert the list to an array to access by index =#
-      elemArray = collect(elements)
-      if idx >= 1 && idx <= length(elemArray)
-        return elemArray[idx]
-      else
-        @warn "ASUB index $idx out of bounds for array of length $(length(elemArray))"
-        return asub
-      end
-    end
-    #= Also handle INDEX wrapped subscripts =#
     DAE.ASUB(DAE.ARRAY(array = elements), Cons(DAE.INDEX(DAE.ICONST(idx)), Nil())) => begin
       elemArray = collect(elements)
       if idx >= 1 && idx <= length(elemArray)
@@ -1352,6 +1372,7 @@ end
   Resolve CREF bindings to their actual values.
   When a variable's binding is a CREF pointing to another variable,
   replace it with that variable's binding. Handles chains by iterating until stable.
+  A binding to a tunable parameter (withTunableParameters) stays a reference.
 """
 function resolveCrefBindings!(orderedVars::Vector{BDAE.VAR})
   local bindingMap = Dict{String, DAE.Exp}()
@@ -1375,7 +1396,7 @@ function resolveCrefBindings!(orderedVars::Vector{BDAE.VAR})
       @match bindExp begin
         SOME(DAE.CREF(cr, _)) => begin
           (targetName, _, _) = crefToFlatName(cr)
-          local targetBinding = get(bindingMap, targetName, nothing)
+          local targetBinding = isTunableParameter(targetName) ? nothing : get(bindingMap, targetName, nothing)
           if targetBinding !== nothing
             if !(targetBinding isa DAE.CREF)
               orderedVars[i].bindExp = SOME(targetBinding)
@@ -1419,7 +1440,7 @@ function flattenArrayCrefsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
         #= Transform equations =#
         for i in 1:length(syst.orderedEqs)
           local eq = syst.orderedEqs[i]
-          (eq2, _) = BDAEUtil.traverseEquationExpressions(eq, flattenWithPrefix, nothing)
+          (eq2, _) = BDAEUtil.traverseEquationExpressions(eq, flattenWithPrefix, IteratorScope(eq))
           if !(eq === eq2)
             @assign syst.orderedEqs[i] = eq2
           end
@@ -1431,7 +1452,7 @@ function flattenArrayCrefsEqSystem(syst::BDAE.EQSYSTEM)::BDAE.EQSYSTEM
             SOME(bindingExp) => begin
               #= traverseExpTopDown applies the func to the root first, then
                  descends, so a separate root-only call is redundant. =#
-              (newBindExp, _) = Util.traverseExpTopDown(bindingExp, flattenWithPrefix, nothing)
+              (newBindExp, _) = Util.traverseExpTopDown(bindingExp, flattenWithPrefix, IteratorScope(bindingExp))
               if !(bindingExp === newBindExp)
                 @assign syst.orderedVars[i].bindExp = SOME(newBindExp)
               end
@@ -1543,9 +1564,14 @@ function flattenArrayCrefInExp(exp::DAE.Exp, acc, prefix::String="")
         hasArraySubs = hasFinalArrayWithSubscripts(cr)
         if hasArraySubs
           (flatName, elementType, finalSubscripts) = crefToFlatName(cr, prefix)
-          newCref = DAE.CREF_IDENT(flatName, elementType, finalSubscripts)
-          newExp = DAE.CREF(newCref, elementType)
-          (newExp, true, acc)
+          local n = runtimeIndexedLength(cr, acc)
+          if n > 0
+            (runtimeIndexChoice(flatName, elementType, listHead(finalSubscripts).exp, n), true, acc)
+          else
+            newCref = DAE.CREF_IDENT(flatName, elementType, finalSubscripts)
+            newExp = DAE.CREF(newCref, elementType)
+            (newExp, true, acc)
+          end
         else
           (exp, true, acc)
         end
@@ -1554,6 +1580,64 @@ function flattenArrayCrefInExp(exp::DAE.Exp, acc, prefix::String="")
     end
   end
   return (newExp, cont, acc)
+end
+
+#= The reduction iterators of one equation or binding, collected when a run-time
+   subscript first needs them. =#
+mutable struct IteratorScope
+  const root::Any
+  names::Union{Nothing, Set{String}}
+end
+IteratorScope(root) = IteratorScope(root, nothing)
+
+function iteratorNames(scope::IteratorScope)::Set{String}
+  if scope.names === nothing
+    local names = Set{String}()
+    local visit = (e, acc) -> begin
+      e isa DAE.REDUCTION && foreach(it -> push!(acc, it.id), e.iterators)
+      (e, true, acc)
+    end
+    scope.root isa DAE.Exp ? Util.traverseExpTopDown(scope.root, visit, names) :
+                             BDAEUtil.traverseEquationExpressions(scope.root, visit, names)
+    scope.names = names
+  end
+  return scope.names
+end
+
+#= The length of the vector a cref selects one element of by a variable known
+   only at run time (MultiSwitch's expr[firstActiveIndex]); 0 for any other
+   cref. The vector's elements are separate variables after scalarization. The
+   index is a component reference, read once per comparison of the choice; not
+   an iterator (x[j] in sum(... for j in 1:n) is unrolled with j by
+   unrollConstantReductions). =#
+function runtimeIndexedLength(cref::DAE.ComponentRef, scope)::Int
+  while cref isa DAE.CREF_QUAL
+    cref = cref.componentRef
+  end
+  cref isa DAE.CREF_IDENT || return 0
+  local subs = cref.subscriptLst
+  (listLength(subs) == 1 && listHead(subs) isa DAE.INDEX && listHead(subs).exp isa DAE.CREF) || return 0
+  local index = listHead(subs).exp.componentRef
+  if index isa DAE.CREF_IDENT
+    (scope isa IteratorScope && !(index.ident in iteratorNames(scope))) || return 0
+  end
+  local ty = cref.identType
+  (ty isa DAE.T_ARRAY && listLength(ty.dims) == 1 && listHead(ty.dims) isa DAE.DIM_INTEGER) || return 0
+  return max(0, Int(listHead(ty.dims).integer))
+end
+
+#= if i == 1 then a[1] elseif ... else a[n], each element flattened as a constant
+   subscript is, so alias elimination and code generation resolve it. An index
+   outside 1:n (an error in Modelica) selects a[n]; MultiSwitch reads the choice
+   only when firstActiveIndex > 0. =#
+function runtimeIndexChoice(flatName::String, elementType::DAE.Type, index::DAE.Exp, n::Int)::DAE.Exp
+  element(i) = DAE.CREF(DAE.CREF_IDENT(flatName, elementType, MetaModelica.list(DAE.INDEX(DAE.ICONST(i)))), elementType)
+  local choice::DAE.Exp = element(n)
+  for i in n-1:-1:1
+    choice = DAE.IFEXP(DAE.RELATION(index, DAE.EQUAL(DAE.T_INTEGER_DEFAULT), DAE.ICONST(i), -1, NONE()),
+                       element(i), choice)
+  end
+  return choice
 end
 
 """
@@ -1567,11 +1651,6 @@ function resolveIntegerVariables(dae::BDAE.BACKEND_DAE)
     _resolveIntVarsInSystem!(system)
   end
   return dae
-end
-
-function _isIntegerVarType(varType)
-  varType isa DAE.T_INTEGER ||
-    (varType isa DAE.T_ARRAY && varType.ty isa DAE.T_INTEGER)
 end
 
 #= Discrete-parameter-like variable types: Integer, Enumeration (e.g.

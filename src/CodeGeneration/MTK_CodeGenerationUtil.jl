@@ -89,11 +89,11 @@ function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode; cachedChange::
       :($opSym($lhs, $rhs))
     end
     DAE.LBINARY(exp1 = e1, operator = DAE.AND(__), exp2 = e2) =>
-      :($(expToJuliaBoolMTK(e1, simCode; cachedChange = cachedChange)) && $(expToJuliaBoolMTK(e2, simCode; cachedChange = cachedChange)))
+      :($(_boolOperandMTK(e1, simCode, cachedChange)) && $(_boolOperandMTK(e2, simCode, cachedChange)))
     DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) =>
-      :($(expToJuliaBoolMTK(e1, simCode; cachedChange = cachedChange)) || $(expToJuliaBoolMTK(e2, simCode; cachedChange = cachedChange)))
+      :($(_boolOperandMTK(e1, simCode, cachedChange)) || $(_boolOperandMTK(e2, simCode, cachedChange)))
     DAE.LUNARY(operator = DAE.NOT(__), exp = e1) =>
-      :(!($(expToJuliaBoolMTK(e1, simCode; cachedChange = cachedChange))))
+      :(!($(_boolOperandMTK(e1, simCode, cachedChange))))
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
@@ -143,6 +143,16 @@ function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode; cachedChange::
   end
 end
 
+#= An operand of not/and/or: a Boolean variable (or its pre()) is stored as a
+   Float64 (0.0/1.0) in the state vector, and `!active` threw a MethodError
+   (`when not active`, the StateGraph steps). =#
+function _boolOperandMTK(@nospecialize(e::DAE.Exp), simCode, cachedChange::Bool)
+  local x = expToJuliaBoolMTK(e, simCode; cachedChange = cachedChange)
+  local isBool = e isa DAE.RELATION || e isa DAE.LBINARY || e isa DAE.LUNARY || e isa DAE.BCONST ||
+                 (e isa DAE.CALL && string(e.path) in ("change", "edge", "initial", "terminal"))
+  return isBool ? x : :($x != 0)
+end
+
 #= Compile-time helper: emit the Julia expression that reads the previous
    value of a CREF from the discrete callback's `integrator.uprev` /
    parameter table. Falls back to `expToJuliaExpMTK` (which gives the
@@ -162,11 +172,13 @@ function _preValueLookup(@nospecialize(arg::DAE.Exp), simCode; cachedChange::Boo
       end
       #= States and discretes both live on the integrator's state vector;
          the surrounding callback codegen has populated `lookuptableStates`
-         with `Symbol(name) => index`. =#
+         with `Symbol(name) => index`. Read through the integrator: the
+         affect binds the model's variables by name, and one named `x`
+         replaced the state vector `x` (a BoundsError). =#
       if cachedChange
         return :(get(_changePreValues,
                      Symbol($(string(sv.name))),
-                     x[lookuptableStates[Symbol($(string(sv.name)))]]))
+                     integrator.u[lookuptableStates[Symbol($(string(sv.name)))]]))
       end
       :(integrator.uprev[lookuptableStates[Symbol($(string(sv.name)))]])
     end
@@ -177,7 +189,7 @@ end
 """
 Transforms a DAE Condition into a MTK continuous condition.
 """
-function transformToMTKContinuousCondition(cond, simCode)
+function transformToMTKContinuousCondition(cond, simCode; atInitial::Bool = false)
   # @match patterns are DAE.* only; convert SIM-side conditions at entry.
   if cond isa SimulationCode.Exp
     cond = SimulationCode.toDAEExp(cond)
@@ -209,37 +221,40 @@ function transformToMTKContinuousCondition(cond, simCode)
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      :(min($(transformToMTKContinuousCondition(e1, simCode)),
-            $(transformToMTKContinuousCondition(e2, simCode))))
+      :(min($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
+            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))))
     end
     DAE.LBINARY(e1, DAE.AND(__), e2) => begin
-      :(max($(transformToMTKContinuousCondition(e1, simCode)),
-            $(transformToMTKContinuousCondition(e2, simCode))))
+      :(max($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
+            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))))
     end
     #= Logical NOT: negate the inner condition =#
     DAE.LUNARY(DAE.NOT(__), e) => begin
-      :(-($(transformToMTKContinuousCondition(e, simCode))))
+      :(-($(transformToMTKContinuousCondition(e, simCode; atInitial = atInitial))))
     end
     #= Strip noEvent wrapper and recurse =#
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
-        transformToMTKContinuousCondition(innerArgs[1], simCode)
+        transformToMTKContinuousCondition(innerArgs[1], simCode; atInitial = atInitial)
       else
-        throw("noEvent with multiple arguments not supported in condition: " * string(cond))
+        OMBackend.unsupported("noEvent with several arguments in a condition", cond)
       end
     end
-    #= initial() is true only during initialization (handled by MTK InitializationProblem).
-       In continuous equations it never triggers, so return constant negative. =#
+    #= initial() is true during the initialization (`atInitial`: the
+       condition's initial value) and false after it: a constant crossing
+       function, negative (true) or positive (false). The event iteration's
+       start re-evaluation reads the runtime one (MSL FluxTubes' Tellinen
+       hysteresis stayed in its `if initial()` branch, k = 0.01, dHyst = 0). =#
     DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
-      :(-1)
+      atInitial ? :(-1) : :(1)
     end
     #= General function call as boolean condition: same polarity rule. =#
     DAE.CALL(__) => begin
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
     end
     _ => begin
-      throw("Unsupported condition expression in IF_EQUATION: " * string(cond))
+      OMBackend.unsupported("condition expression", cond)
     end
   end
   return res
@@ -248,7 +263,7 @@ end
 """
 Transforms a DAE Condition into a MTK continuous condition equation.
 """
-function transformToMTKContinuousConditionEquation(cond, simCode)
+function transformToMTKContinuousConditionEquation(cond, simCode; atInitial::Bool = false)
   # @match patterns are DAE.* only; convert SIM-side conditions at entry.
   if cond isa SimulationCode.Exp
     cond = SimulationCode.toDAEExp(cond)
@@ -285,42 +300,79 @@ function transformToMTKContinuousConditionEquation(cond, simCode)
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
     end
     DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      :(min($(transformToMTKContinuousCondition(e1, simCode)),
-            $(transformToMTKContinuousCondition(e2, simCode))) ~ 0)
+      :(min($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
+            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))) ~ 0)
     end
     DAE.LBINARY(e1, DAE.AND(__), e2) => begin
-      :(max($(transformToMTKContinuousCondition(e1, simCode)),
-            $(transformToMTKContinuousCondition(e2, simCode))) ~ 0)
+      :(max($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
+            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))) ~ 0)
     end
     #= Logical NOT: negate the inner condition =#
     DAE.LUNARY(DAE.NOT(__), e) => begin
-      :(-($(transformToMTKContinuousCondition(e, simCode))) ~ 0)
+      :(-($(transformToMTKContinuousCondition(e, simCode; atInitial = atInitial))) ~ 0)
     end
     #= Strip noEvent wrapper and recurse =#
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
-        transformToMTKContinuousConditionEquation(innerArgs[1], simCode)
+        transformToMTKContinuousConditionEquation(innerArgs[1], simCode; atInitial = atInitial)
       else
-        throw("noEvent with multiple arguments not supported in condition: " * string(cond))
+        OMBackend.unsupported("noEvent with several arguments in a condition", cond)
       end
     end
-    #= initial() is true only during initialization (handled by MTK InitializationProblem).
-       In continuous equations it never triggers, so return constant negative equation. =#
+    #= initial(): see transformToMTKContinuousCondition. =#
     DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
-      :(-1 ~ 0)
+      atInitial ? :(-1 ~ 0) : :(1 ~ 0)
     end
     #= General function call as boolean condition: same polarity rule as above. =#
     DAE.CALL(__) => begin
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
     end
     _ => begin
-      throw("Unsupported condition expression in IF_EQUATION: " * string(cond))
+      OMBackend.unsupported("condition expression", cond)
     end
   end
   return res
 end
 
+
+#= The delay() calls of the model being generated (delays.jl), as (key, argument, delay time) with the
+   argument and the delay time as Julia expressions; a call's position is the index of its history, and
+   an equal call shares it. With DELAY_MODEL, the name the histories are kept under. Both reset at the
+   start of each model's (or structural mode's) generation. =#
+const DELAY_CALLS = Tuple{String, Any, Any}[]
+const DELAY_MODEL = Ref{Symbol}(:none)
+
+function _delayIndex!(key::String, x, delayTime)::Int
+  local k = findfirst(c -> first(c) == key, DELAY_CALLS)
+  k === nothing || return k
+  push!(DELAY_CALLS, (key, x, delayTime))
+  return length(DELAY_CALLS)
+end
+
+#= The argument of a when body the event iteration runs (codeGen.jl: the
+   relation whens of `_emitRelationWhen`, and the discrete-when and
+   elsewhen-arm affects): the state before the current sweep, indexed by
+   `lookuptableStates`. =#
+const PRE_SNAPSHOT = :__prevals
+#= The homotopy parameter λ (homotopy(actual, simplified), MLS 3.7.4.4):
+   1 in a simulation; the initialization of a model with homotopy() goes from
+   0 (the simplified expressions) to 1 (`_homotopyContinuation`), as
+   OpenModelica's default does. =#
+const HOMOTOPY_LAMBDA = :_homotopyLambda
+#= Whether homotopy() is lowered as the blend in λ: in the continuous
+   equations and the initialization equations only (ODE_MODE_MTK_MODEL_GENERATION),
+   where λ is a parameter and the continuation acts. Elsewhere (when bodies and
+   conditions, relations, if-equation branches, bindings, observed equations)
+   the actual expression: the blend read an undefined λ there (an
+   UndefVarError at the first event), and λ is 1 after the initialization. =#
+const HOMOTOPY_BLEND = Base.ScopedValues.ScopedValue(false)
+
+#= Where `pre(v)` of a variable is read while a when body is lowered: false,
+   from `v` itself; true (within `with(PRE_FROM_SNAPSHOT => true)`), from
+   `PRE_SNAPSHOT`, so a body sees the pre() values even when an earlier body
+   of the same sweep assigned the variable. =#
+const PRE_FROM_SNAPSHOT = Base.ScopedValues.ScopedValue(false)
 
 """
   TODO: Keeping it simple for now, we assume we only have one argument in the call..
@@ -350,6 +402,22 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
         DAE.RCONST(_) => quote 0.0 end
         DAE.ICONST(_) => quote 0 end
         DAE.BCONST(_) => quote false end
+        #= der(-x) = -der(x): the name was taken through the minus (x grew for
+           der(-x) = 1). =#
+        DAE.UNARY(DAE.UMINUS(__), inner) => begin
+          local d = DAECallExpressionToMTKCallExpression("der", Cons(inner, MetaModelica.nil), simCode, ht;
+                                                         varPrefix=varPrefix, varSuffix=varSuffix, derAsSymbol=derAsSymbol)
+          :(-($(d)))
+        end
+        #= der of an expression: an initial equation der(w) = 0 whose w the
+           backend replaced by its definition. Differentiated later (the init
+           solve's derivative rows on observed expressions). =#
+        _ where (!(arg isa DAE.CREF || arg isa DAE.UNARY) && !derAsSymbol) => begin
+          local inner = expToJuliaExpMTK(arg, simCode; varPrefix = varPrefix, varSuffix = varSuffix)
+          quote
+            D($(inner))
+          end
+        end
         _ => begin
           varName = SimulationCode.DAE_identifierToString(arg)
           if derAsSymbol
@@ -380,11 +448,24 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
         DAE.BCONST(b) => quote $b end
         _ => begin
           varName = SimulationCode.DAE_identifierToString(arg)
-          quote
-            $(Symbol(varName))
+          local entry = get(simCode.stringToSimVarHT, varName, nothing)
+          if PRE_FROM_SNAPSHOT[] && entry !== nothing && !SimulationCode.isParameter(last(entry))
+            :($(PRE_SNAPSHOT)[lookuptableStates[$(QuoteNode(Symbol(varName)))]])
+          else
+            quote
+              $(Symbol(varName))
+            end
           end
         end
       end
+    end
+    #= delay(x, T[, Tmax]): x's value T ago, from the model's history of x (delays.jl). =#
+    "delay" => begin
+      local args = collect(expLst)
+      local x = expToJuliaExpMTK(args[1], simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derAsSymbol)
+      local T = expToJuliaExpMTK(args[2], simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derAsSymbol)
+      local k = _delayIndex!(string(args[1]) * "|" * string(args[2]), x, T)
+      :(OMBackend.CodeGeneration.delayLookup($(QuoteNode(DELAY_MODEL[])), $k, t, $T, $x))
     end
     "initial" => begin
       #= Modelica initial() is true only during initialization (handled separately by MTK).
@@ -397,9 +478,25 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
        codegen already lowers enum CREFs to integer indices and ENUM_LITERAL to
        its `index` field, so the cast is the identity at the Julia level. Without
        this arm the splice emits `Integer(::Num)` which has no method. =#
+    #= homotopy(actual, simplified): a blend in the homotopy parameter λ (1
+       in a simulation), for the initialization's continuation from the
+       simplified expressions (MLS 3.7.4.4; OpenModelica's default for a
+       model with homotopy). It was the actual expression only: the
+       initialization found a root the simplified ones do not lead to (CubicRoot:
+       x = -0.347, OpenModelica 1.879). =#
+    "homotopy" => begin
+      local lower = e -> expToJuliaExpMTK(e, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derAsSymbol)
+      local a = lower(listHead(expLst))
+      HOMOTOPY_BLEND[] ?
+        :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_homotopy($(a), $(lower(listHead(listRest(expLst)))), $(HOMOTOPY_LAMBDA))) :
+        a
+    end
     "Integer" => begin
       expToJuliaExpMTK(listHead(expLst), simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derAsSymbol)
     end
+    #= A String parameter's binding (createStringParameterAssignments): the
+       argument types from the expressions, not from the values. =#
+    "String" => AlgorithmicCodeGeneration.modelicaStringCall(collect(expLst), x -> expToJuliaExpMTK(x, simCode))
     _  =>  begin
       argPart = tuple(map((x) -> expToJuliaExpMTK(x, simCode), expLst)...)
       #= Check if this is a Modelica built-in with a dedicated Julia implementation =#
@@ -416,34 +513,6 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
         end
       end
     end
-  end
-end
-
-"""
-Transforms:
-  <name>[<index>] -> <name>_index
-"""
-function arrayToSymbolicVariable(arrayRepr::Expr)::Expr
-  _iterativePostwalk(arrayRepr) do x
-    MacroTools.@capture(x, T_[index_]) || return x
-    local newVar = Symbol("$(T)_$(index)")
-    return newVar
-  end
-end
-
-"""
-Transforms:
-  <name>_index -> <name>[index]
-Uses direct Expr construction instead of string interpolation + Meta.parse.
-"""
-const pattern = r".*_[0-9]+"
-function symbolicVariableToArrayRef(e::Expr)::Expr
-  _iterativePostwalk(e) do x
-    x isa Symbol || return x
-    local sstr = String(x)
-    match(pattern, sstr) === nothing && return x
-    local parts = split(sstr, "_")
-    return Expr(:ref, Symbol(parts[1]), parse(Int, parts[2]))
   end
 end
 
@@ -473,7 +542,7 @@ Base.@nospecializeinfer function _ifexpBranchIsNonReal(@nospecialize(e::DAE.Exp)
   end
 end
 
-#= SimCode-Exp entry (Phase 4b): codegen consumes `SimulationCode.Exp`
+#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp`
    directly. The body below mirrors the `::DAE.Exp` version's dispatch
    shape but operates on SIM Exp variants:
 
@@ -670,7 +739,8 @@ function expToJuliaExpMTK(exp::SimulationCode.RSUB, simCode::SimulationCode.SIM_
   elseif exp.fieldName == "im"
     return :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
   end
-  return :(getproperty($innerJL, $(QuoteNode(Symbol(exp.fieldName)))))
+  local ix = AlgorithmicCodeGeneration._positionalFieldIndex(SimulationCode.toDAEExp(exp.exp), exp.index)
+  return :(OMBackend.CodeGeneration._recordField($innerJL, $(QuoteNode(Symbol(exp.fieldName))), $(ix)))
 end
 
 function expToJuliaExpMTK(exp::SimulationCode.ARRAY_EXP, simCode::SimulationCode.SIM_CODE;
@@ -757,12 +827,19 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
       Note that the array is added as <name>[<size>] in the HT during the simcode phase.
       Hence, the dimensionality must be added before lookup in the ht.
       =#
+      #= A zero-size array has no variables (MSL Fluid's Xi_outflow[Medium.nXi],
+         nXi = 0 for a single substance, passed to setState_phX): an empty array
+         of its shape. =#
+      DAE.CREF(cr, DAE.T_ARRAY(ty, dims)) where _isZeroSizeArray(dims) => _emptyArrayExpr(ty, dims)
       DAE.CREF(cr, DAE.T_ARRAY(ty, dims)) => begin
         lookUpStr = string(exp)
         arrName = string(exp)
         #= To make sure the variable is indexed =#
         for d in dims
-          @match DAE.DIM_INTEGER(i) = d
+          local i = @match d begin
+            DAE.DIM_INTEGER(n) => n
+            _ => OMBackend.unsupported("array dimension", d)
+          end
           lookUpStr *= string("[", i, "]")
         end
         local arrEntry = get(hashTable, lookUpStr, nothing)
@@ -777,8 +854,17 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             @warn "expToJuliaExpMTK: resolved alias-eliminated T_ARRAY variable via fallback" lookUpStr
             aliasExpr
           else
-            #= Variable not in hash table (may have been eliminated), using direct reference =#
-            quote $(Symbol(string(varPrefix, arrName, varSuffix))) end
+            #= Not a variable of its own (its elements were eliminated): the array
+               of its elements, each lowered as a subscripted reference. The bare
+               name was undefined (MSL Engine1b_analytic's frame_im.R.T passed to
+               selectBranch in an initial equation). =#
+            local sizes = Int[d.integer for d in dims]   #= DIM_INTEGER: checked above =#
+            length(sizes) <= 2 || OMBackend.unsupported("an array of more than two dimensions without variables", arrName)
+            local elem = idx -> expToJuliaExpMTK(
+              DAE.CREF(DAE.CREF_IDENT(arrName, ty, MetaModelica.list((DAE.INDEX(DAE.ICONST(i)) for i in idx)...)), ty),
+              simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
+            length(sizes) == 1 ? Expr(:vect, (elem((i,)) for i in 1:sizes[1])...) :
+              Expr(:vcat, (Expr(:row, (elem((i, j)) for j in 1:sizes[2])...) for i in 1:sizes[1])...)
           end
         end
       end
@@ -836,7 +922,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                 DAE.INDEX(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
                 DAE.SLICE(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
                 DAE.WHOLEDIM(__) => :(:)
-                _ => throw("Unsupported subscript: $sub")
+                _ => OMBackend.unsupported("subscript", sub)
               end
             end
             local baseSymbol = Symbol(varPrefix, varName, varSuffix)
@@ -925,7 +1011,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                 else
                   local current = bindArray
                   for idx in subIndices
-                    @match DAE.ARRAY(__) = current
+                    current isa DAE.ARRAY || OMBackend.unsupported("a binding row that is not an array literal", current)
                     current = listGet(current.array, idx)
                   end
                   current
@@ -970,7 +1056,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           indexAndVar = hashTable[varName]
           varKind::SimulationCode.SimVarType = indexAndVar[2].varKind
           @match varKind begin
-            SimulationCode.INPUT(__) => @error "INPUT not supported in CodeGen"
+            SimulationCode.INPUT(__) => OMBackend.unsupported("INPUT variable", varName)
             SimulationCode.STATE(__) => quote
               $(LineNumberNode(@__LINE__, "$varName state"))
               $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
@@ -987,10 +1073,6 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
               $(LineNumberNode(@__LINE__, "$varName, discrete"))
               $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
             end
-            SimulationCode.OCC_VARIABLE(__) => quote
-              $(LineNumberNode(@__LINE__, "$varName, occ variable"))
-              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-            end
             SimulationCode.DATA_STRUCTURE(__) => quote
               $(LineNumberNode(@__LINE__, "$varName, datastructure variable"))
               $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
@@ -999,10 +1081,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
               $(LineNumberNode(@__LINE__, "$varName, datastructure variable"))
               $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
             end
-            _ => begin
-              @error "Unsupported varKind: $(varKind)"
-              fail()
-            end
+            _ => OMBackend.unsupported("variable kind $(nameof(typeof(varKind)))", varName)
           end
         end
       end
@@ -1147,6 +1226,10 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           @match sub begin
             DAE.ICONST(i) => i
             DAE.INDEX(DAE.ICONST(i)) => i
+            #= Non-constant subscript: lower its inner index expression. =#
+            DAE.INDEX(e) => expToJuliaExpMTK(e, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+            DAE.SLICE(e) => expToJuliaExpMTK(e, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+            DAE.WHOLE_NONEXP(e) => expToJuliaExpMTK(e, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
             _ => expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
           end
         end
@@ -1300,6 +1383,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         for iter in iterators
           @match iter begin
             DAE.REDUCTIONITER(id, rangeExp, guardExp, _) => begin
+              guardExp === nothing || OMBackend.unsupported("a reduction iterator with a guard", exp)
               local rangeExpr = expToJuliaExpMTK(rangeExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
               push!(iterExprs, Expr(:(=), Symbol(id), rangeExpr))
             end
@@ -1308,8 +1392,9 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         #= Handle different reduction types =#
         @match reductionInfo.path begin
           Absyn.IDENT("array") => begin
-            #= Array comprehension: [expr for i in range] =#
-            Expr(:comprehension, bodyExpr, iterExprs...)
+            #= {e for i in u, j in v}: the last iterator is the first dimension
+               (MLS 10.4.1.2); a Julia comprehension's first iterator is. =#
+            Expr(:comprehension, bodyExpr, reverse(iterExprs)...)
           end
           Absyn.IDENT("sum") => begin
             #= Sum reduction: sum(expr for i in range) =#
@@ -1329,10 +1414,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
             local genExpr = Expr(:generator, bodyExpr, iterExprs...)
             :(maximum($genExpr))
           end
-          _ => begin
-            #= Default: treat as array comprehension =#
-            Expr(:comprehension, bodyExpr, iterExprs...)
-          end
+          _ => OMBackend.unsupported("the reduction $(reductionInfo.path)", exp)
         end
       end
       DAE.RANGE(_, startExp, NONE(), stopExp) => begin
@@ -1469,7 +1551,7 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         `real` / `imag` when the inner is a Symbolics `Num` so the
         symbolic engine sees the structural complex projection rather
         than a plain `getproperty` call. =#
-      DAE.RSUB(exp = innerExp, fieldName = fname) => begin
+      DAE.RSUB(exp = innerExp, ix = ix, fieldName = fname) => begin
         local innerJL = expToJuliaExpMTK(innerExp, simCode;
                                           varPrefix=varPrefix,
                                           varSuffix=varSuffix,
@@ -1479,33 +1561,22 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
         elseif fname == "im"
           :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
         else
-          :(getproperty($innerJL, $(QuoteNode(Symbol(fname)))))
+          :(OMBackend.CodeGeneration._recordField($innerJL, $(QuoteNode(Symbol(fname))),
+                                                  $(AlgorithmicCodeGeneration._positionalFieldIndex(innerExp, ix))))
         end
       end
-    _ =>  throw(ErrorException("$exp not yet supported"))
+    _ => OMBackend.unsupported("expression", exp)
     end
   end
   return expr
 end
 
-"""
-Extract integer array dimensions from a DAE.Type, or nothing if not an array type.
-Used by the TSUB handler to detect when a tuple element is an array.
-"""
-function _extractTsubArrayDims(ty)
-  @match ty begin
-    DAE.T_ARRAY(_, dims) => begin
-      local intDims = Int[]
-      for d in dims
-        @match d begin
-          DAE.DIM_INTEGER(n) => push!(intDims, n)
-          _ => return nothing
-        end
-      end
-      return Tuple(intDims)
-    end
-    _ => return nothing
-  end
+_isZeroSizeArray(dims)::Bool = any(d -> d isa DAE.DIM_INTEGER && d.integer == 0, dims)
+
+function _emptyArrayExpr(ty::DAE.Type, dims)::Expr
+  local elType = ty isa DAE.T_INTEGER ? :Int : ty isa DAE.T_BOOL ? :Bool : :Float64
+  local sizes = [d isa DAE.DIM_INTEGER ? Int(d.integer) : 0 for d in dims]
+  return :(zeros($elType, $(sizes...)))
 end
 
 """
@@ -1535,7 +1606,11 @@ function tryHandleSubscriptedArrayCref(cr::DAE.ComponentRef, hashTable, simCode;
     @match sub begin
       DAE.INDEX(DAE.ICONST(i)) => i
       DAE.ICONST(i) => i
-      _ => expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+      #= A DAE.Subscript is lowered through its expression (it was passed whole: a MethodError). =#
+      DAE.INDEX(idxExp) || DAE.SLICE(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
+      DAE.WHOLEDIM(__) => :(:)
+      _ => sub isa DAE.Exp ? expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol) :
+                             OMBackend.unsupported("subscript", sub)
     end
   end
 
@@ -1554,7 +1629,7 @@ function tryHandleSubscriptedArrayCref(cr::DAE.ComponentRef, hashTable, simCode;
           #= Multi-dimensional array: navigate nested structure =#
           local current = bindArray
           for idx in subExprs
-            @match DAE.ARRAY(__) = current
+            current isa DAE.ARRAY || OMBackend.unsupported("a binding row that is not an array literal", current)
             current = listGet(current.array, idx)
           end
           current
@@ -1620,7 +1695,8 @@ function handleArrayExp(exp::DAE.ARRAY, simCode)
   local arrJL = if canEval
     try
       [eval(expr) for expr in elemExprs]
-    catch
+    catch err
+      OMBackend._fallback(err, :constantArrayElements; expect = Union{UndefVarError, MethodError})
       canEval = false
       []
     end
@@ -1839,7 +1915,7 @@ function _evalDAENumeric(@nospecialize(e), valMap::Dict{Symbol, Float64})::Union
     DAE.ICONST(__) => Float64(e.integer)
     DAE.BCONST(__) => e.bool ? 1.0 : 0.0
     DAE.CREF(__) => begin
-      local nm = try SimulationCode.DAE_identifierToString(e.componentRef) catch; return nothing end
+      local nm = SimulationCode.DAE_identifierToString(e.componentRef)
       nm == "time" ? 0.0 : get(valMap, Symbol(nm), nothing)
     end
     DAE.UNARY(operator = DAE.UMINUS(__)) => begin
@@ -1900,7 +1976,7 @@ function _evalDAENumeric(@nospecialize(e), valMap::Dict{Symbol, Float64})::Union
         local b = _evalDAENumeric(argv[2], valMap); b === nothing && return nothing
         return fn == "min" ? min(a, b) : max(a, b)
       end
-      fn == "integer" ? Float64(floor(Int, a)) :
+      fn == "integer" ? (isfinite(a) ? floor(a) : nothing) :
       fn == "floor"   ? floor(a) :
       fn == "ceil"    ? ceil(a) :
       fn == "abs"     ? abs(a) :
@@ -1966,21 +2042,22 @@ function _substIterElse(@nospecialize(els), iterId::String, value::Int)
   end
 end
 
-function _execInitAlgStmts!(valMap::Dict{Symbol, Float64}, stmts)::Nothing
+#= `written` (when given) collects the names an assignment wrote. =#
+function _execInitAlgStmts!(valMap::Dict{Symbol, Float64}, stmts; written = nothing)::Nothing
   for stmt in stmts
-    _execInitAlgStmt!(valMap, stmt)
+    _execInitAlgStmt!(valMap, stmt; written)
   end
   return nothing
 end
 
-function _execInitAlgElse!(valMap::Dict{Symbol, Float64}, @nospecialize(els))::Nothing
+function _execInitAlgElse!(valMap::Dict{Symbol, Float64}, @nospecialize(els); written = nothing)::Nothing
   @match els begin
-    DAE.ELSE(__) => _execInitAlgStmts!(valMap, els.statementLst)
+    DAE.ELSE(__) => _execInitAlgStmts!(valMap, els.statementLst; written)
     DAE.ELSEIF(__) => begin
       local c = _evalDAENumeric(els.exp, valMap)
       if c !== nothing
-        c != 0.0 ? _execInitAlgStmts!(valMap, els.statementLst) :
-                   _execInitAlgElse!(valMap, els.else_)
+        c != 0.0 ? _execInitAlgStmts!(valMap, els.statementLst; written) :
+                   _execInitAlgElse!(valMap, els.else_; written)
       end
       ()
     end
@@ -1989,17 +2066,16 @@ function _execInitAlgElse!(valMap::Dict{Symbol, Float64}, @nospecialize(els))::N
   return nothing
 end
 
-function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt))::Nothing
+function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt); written = nothing)::Nothing
   @match stmt begin
     DAE.STMT_ASSIGN(__) => begin
-      local nm = try
-        SimulationCode.DAE_identifierToString(stmt.exp1)
-      catch
-        nothing
-      end
+      local nm = stmt.exp1 isa DAE.CREF ? SimulationCode.DAE_identifierToString(stmt.exp1) : nothing
       if nm !== nothing
         local v = _evalDAENumeric(stmt.exp, valMap)
-        v !== nothing && (valMap[Symbol(nm)] = v)
+        if v !== nothing
+          valMap[Symbol(nm)] = v
+          written === nothing || push!(written, Symbol(nm))
+        end
       end
       ()
     end
@@ -2007,9 +2083,9 @@ function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt))::
       local c = _evalDAENumeric(stmt.exp, valMap)
       if c !== nothing
         if c != 0.0
-          _execInitAlgStmts!(valMap, stmt.statementLst)
+          _execInitAlgStmts!(valMap, stmt.statementLst; written)
         else
-          _execInitAlgElse!(valMap, stmt.else_)
+          _execInitAlgElse!(valMap, stmt.else_; written)
         end
       end
       ()
@@ -2028,11 +2104,13 @@ function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt))::
             end
             _ => ()
           end
+          #= Int() of a bound beyond Int64 throws an InexactError (review, 2026-09-29). =#
           if startV !== nothing && stopV !== nothing && isfinite(stepV) && stepV != 0.0 &&
-             isinteger(startV) && isinteger(stopV) && isinteger(stepV)
+             isinteger(startV) && isinteger(stopV) && isinteger(stepV) &&
+             max(abs(startV), abs(stopV), abs(stepV)) < 2.0^62
             for iv in Int(startV):Int(stepV):Int(stopV)
               for s in stmt.statementLst
-                _execInitAlgStmt!(valMap, _substIterStmt(s, stmt.iter, iv))
+                _execInitAlgStmt!(valMap, _substIterStmt(s, stmt.iter, iv); written)
               end
             end
           end
@@ -2054,9 +2132,9 @@ end
    discrete states set imperatively in an `initial algorithm` (no `start`
    attribute) default to 0.0 when evaluating if-equation initial branches,
    picking the wrong branch. =#
-function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode)
+function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode; written = nothing)
   for ia in simCode.initialAlgorithms
-    _execInitAlgStmts!(valMap, ia.daeStatements)
+    _execInitAlgStmts!(valMap, ia.daeStatements; written)
   end
   return valMap
 end
@@ -2083,6 +2161,87 @@ function condClosedAtBoundary(cond)::Bool
   end
 end
 
+#= Relation semantics for events (MLS 8.5, OpenModelica's relationhysteresis):
+   a relation keeps its value during integration and changes only at events;
+   its crossing function has a hysteresis relative to that value, so it is
+   never zero after initialization or after an event (FMI 3.0 3.1.1). =#
+
+#= The relations of a condition that generate events (not inside noEvent). =#
+Base.@nospecializeinfer function _eventRelations(@nospecialize(cond))::Vector{DAE.Exp}
+  cond isa SimulationCode.Exp && (cond = SimulationCode.toDAEExp(cond))
+  local out = DAE.Exp[]
+  local visit = function (e, arg)
+    @match e begin
+      DAE.CALL(Absyn.IDENT("noEvent"), _, _) => return (e, false, arg)
+      DAE.RELATION(__) => begin
+        push!(out, e)
+        return (e, false, arg)
+      end
+      _ => return (e, true, arg)
+    end
+  end
+  Util.traverseExpTopDown(cond, visit, nothing)
+  return out
+end
+
+#= The scale of a condition's operands, `1 + max(|a|, |b|, ...)`, for the
+   hysteresis width `H * scale` (OpenModelica: max(|a|,|b|) + nominal). =#
+function _conditionScaleExpr(@nospecialize(cond), simCode)
+  local terms = Any[]
+  #= An infinite operand (the MSL Spice3 V_pulse's default pulse width and
+     period, inf, in `time >= T0 + Tfalling`) is left out: it made the
+     hysteresis infinite. =#
+  for rel in _eventRelations(cond)
+    for x in (expToJuliaExpMTK(rel.exp1, simCode), expToJuliaExpMTK(rel.exp2, simCode))
+      push!(terms, :(ModelingToolkit.ifelse(abs($(x)) < 1.0e300, abs($(x)), 0.0)))
+    end
+  end
+  isempty(terms) && return 1.0
+  return length(terms) == 1 ? :(1.0 + $(terms[1])) : :(1.0 + max($(terms...)))
+end
+
+#= The literal value of a condition (as at initialization), as a Julia Bool
+   expression over `observed.zcK`: each relation from its own crossing
+   function, `<`/`>` strict and `<=`/`>=` closed, and/or/not as such.
+   `obsKws` collects the observed crossing functions. Nothing if the
+   condition has a shape this does not cover. =#
+Base.@nospecializeinfer function _literalConditionExpr(@nospecialize(cond), simCode, obsKws::Vector{Expr})
+  cond isa SimulationCode.Exp && (cond = SimulationCode.toDAEExp(cond))
+  local rec(@nospecialize e) = _literalConditionExpr(e, simCode, obsKws)
+  local observe = function (zc)
+    local name = Symbol("zc", length(obsKws) + 1)
+    push!(obsKws, Expr(:kw, name, zc))
+    return :(observed.$(name))
+  end
+  return @match cond begin
+    DAE.RELATION(_, op, _) => begin
+      local zc = observe(transformToMTKContinuousCondition(cond, simCode))
+      (op isa DAE.LESSEQ || op isa DAE.GREATEREQ) ? :($(zc) <= 0) :
+        #= == and <> cross as 0.5 - (a == b): negative exactly when it holds. =#
+        (op isa DAE.LESS || op isa DAE.GREATER || op isa DAE.EQUAL || op isa DAE.NEQUAL) ? :($(zc) < 0) : nothing
+    end
+    DAE.LBINARY(e1, DAE.AND(__), e2) => begin
+      local l = rec(e1); local r = rec(e2)
+      (l === nothing || r === nothing) ? nothing : :($(l) && $(r))
+    end
+    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
+      local l = rec(e1); local r = rec(e2)
+      (l === nothing || r === nothing) ? nothing : :($(l) || $(r))
+    end
+    DAE.LUNARY(DAE.NOT(__), e) => begin
+      local inner = rec(e)
+      inner === nothing ? nothing : :(!$(inner))
+    end
+    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
+      local args = collect(lst)
+      length(args) == 1 ? rec(args[1]) : nothing
+    end
+    DAE.CREF(__) => :($(observe(expToJuliaExpMTK(cond, simCode))) > 0.5)
+    DAE.BCONST(b) => b
+    _ => nothing
+  end
+end
+
 #= Symbol -> value map at t0: parameter values plus state/algebraic start
    attributes (default 0.0), overridden by early init-algorithm results.
    `explicit` collects the symbols whose value came from an actual source
@@ -2093,6 +2252,54 @@ end
    Fields: (simCode id, valMap, explicit, trusted-derived pairs). =#
 const _T0_MAP_CACHE = Ref{Tuple{UInt, Dict{Symbol, Float64}, Set{Symbol}, Vector{Pair{Symbol, Float64}}}}(
   (UInt(0), Dict{Symbol, Float64}(), Set{Symbol}(), Pair{Symbol, Float64}[]))
+
+#= The number `f()` (evalDAEConstant, evalSimCodeParameter) gives, or nothing
+   when it is not a constant. A BINARY/LBINARY comes back as evalDAE_Expression's
+   `:block` around its evaluated value (around the Expr itself when it reads a
+   variable): `Float64` of the block was a MethodError, swallowed, so such a
+   start value was lost (error policy, stage 4). =#
+function _t0Number(f)::Union{Float64, Nothing}
+  local raw = try
+    f()
+  catch err
+    OMBackend._fallback(err, :t0Number; only = OMBackend.UnsupportedLowering)
+    return nothing
+  end
+  while raw isa Expr && raw.head === :block
+    local body = filter(a -> !(a isa LineNumberNode), raw.args)
+    length(body) == 1 || return nothing
+    raw = body[1]
+  end
+  return raw isa Real ? Float64(raw) : nothing
+end
+
+#= The forms evalDAEConstant evaluates: a literal, or a BINARY/LBINARY through
+   evalDAE_Expression. The t0 map asks only for those (anything else is not a
+   constant, which is the rule, not a failure). =#
+_isEvaluableConstant(@nospecialize(e))::Bool =
+  e isa Union{DAE.BCONST, DAE.ICONST, DAE.RCONST, DAE.SCONST, DAE.BINARY, DAE.LBINARY,
+              SimulationCode.BCONST, SimulationCode.ICONST, SimulationCode.RCONST, SimulationCode.SCONST,
+              SimulationCode.BINARY, SimulationCode.LBINARY}
+
+#= `sv`'s start value as a number, or nothing. =#
+function _startNumber(sv, simCode)::Union{Float64, Nothing}
+  local startExp = @match sv.attributes begin
+    SOME(attr) where hasproperty(attr, :start) => @match attr.start begin
+      SOME(e) => e
+      _ => nothing
+    end
+    _ => nothing
+  end
+  return _isEvaluableConstant(startExp) ? _t0Number(() -> evalDAEConstant(startExp, simCode)) : nothing
+end
+
+_isFixedStart(sv)::Bool = @match sv.attributes begin
+  SOME(attr) where hasproperty(attr, :fixed) => @match attr.fixed begin
+    SOME(DAE.BCONST(true)) => true
+    _ => false
+  end
+  _ => false
+end
 
 function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{Symbol}}
   local cached = _T0_MAP_CACHE[]
@@ -2109,52 +2316,33 @@ function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{
   for (key, (_, sv)) in ht
     local sym = Symbol(key)
     if sv.varKind isa SimulationCode.PARAMETER
-      local pval = try
-        local raw = evalSimCodeParameter(sv, simCode)
-        if raw isa Expr
-          #= evalDAE_Expression wraps its result in a :block Expr; evaluate
-             once to unwrap before the numeric coercion. =#
-          raw = Base.invokelatest(eval, raw)
-        end
-        Float64(raw)
-      catch
-        try
-          @match SOME(attr) = sv.attributes
-          @match SOME(startExp) = attr.start
-          Float64(evalDAEConstant(startExp, simCode))
-        catch
-          nothing
-        end
+      #= The binding's value, else the start value. =#
+      local bind = @match sv.varKind begin
+        SimulationCode.PARAMETER(SOME(b)) => b
+        _ => nothing
       end
+      local pval = _isEvaluableConstant(bind) ? _t0Number(() -> evalDAEConstant(bind, simCode)) : nothing
+      pval === nothing && (pval = _startNumber(sv, simCode))
       if pval !== nothing
         valMap[sym] = pval
         push!(explicit, sym)
         push!(trusted, sym)
       end
     elseif SimulationCode.isStateOrAlgebraic(sv)
-      local sval = 0.0
-      try
-        @match SOME(attr) = sv.attributes
-        @match SOME(startExp) = attr.start
-        sval = Float64(evalDAEConstant(startExp, simCode))
+      local sval = _startNumber(sv, simCode)
+      if sval !== nothing
         push!(explicit, sym)
-        @match attr.fixed begin
-          SOME(DAE.BCONST(true)) => push!(trusted, sym)
-          _ => nothing
-        end
-      catch
+        _isFixedStart(sv) && push!(trusted, sym)
       end
-      valMap[sym] = sval
+      valMap[sym] = something(sval, 0.0)
     end
   end
-  local preSeed = copy(valMap)
-  _seedInitialAlgValues!(valMap, simCode)
-  for (k, v) in valMap
-    if !haskey(preSeed, k) || preSeed[k] != v
-      push!(explicit, k)
-      push!(trusted, k)
-    end
-  end
+  #= The names the initial algorithms assign (by name: an assignment equal to
+     the start value is an initial-algorithm result too). =#
+  local written = Set{Symbol}()
+  _seedInitialAlgValues!(valMap, simCode; written)
+  union!(explicit, written)
+  union!(trusted, written)
   #= Trusted-first sweep: deterministic consequences of trusted data override
      guess-grade start values in the map, so branch decisions never read a
      value contradicted by the fixed initial configuration. =#
@@ -2225,8 +2413,8 @@ function evalCausalRHSAtT0(rhsExpr, valMap::Dict{Symbol, Float64},
     return nothing
   end
   _exprSymbolsExplicit(rhsExpr, explicit) || return nothing
+  local numExpr = _intifyFloatIndices(_substituteExprValues(rhsExpr, valMap))
   try
-    local numExpr = _intifyFloatIndices(_substituteExprValues(rhsExpr, valMap))
     #= Generated Modelica function bindings live in the parent CodeGeneration
        module (Phase A evals them there), not in this submodule. =#
     local result = Core.eval(parentmodule(@__MODULE__), numExpr)
@@ -2241,7 +2429,9 @@ function evalCausalRHSAtT0(rhsExpr, valMap::Dict{Symbol, Float64},
       end
     end
     return isfinite(numResult) ? numResult : nothing
-  catch
+  catch err
+    #= A name not resolved yet, a Modelica function outside its domain. =#
+    OMBackend._fallback(err, :evalCausalRHSAtT0; expect = Union{UndefVarError, MethodError})
     return nothing
   end
 end
@@ -2264,25 +2454,20 @@ function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, s
   end
   local loweredCache = IdDict{Any, Any}()
   local mkPair = function (rawExp)
-    local dae = try
-      rawExp isa DAE.Exp ? rawExp : SimulationCode.toDAEExp(rawExp)
-    catch
-      return nothing
-    end
+    local dae = rawExp isa DAE.Exp ? rawExp : SimulationCode.toDAEExp(rawExp)
     local arm = @match dae begin
       DAE.BINARY(DAE.CREF(cr, _), DAE.SUB(__), rhs) => (cr, rhs)
       _ => nothing
     end
     arm === nothing && return nothing
     local (cr, rhsDAE) = arm
-    local nm = try SimulationCode.DAE_identifierToString(cr) catch; nothing end
-    nm === nothing && return nothing
-    local tgt = Symbol(nm)
+    local tgt = Symbol(SimulationCode.DAE_identifierToString(cr))
     (tgt in explicit) && return nothing
     local rhsExpr = get!(loweredCache, rhsDAE) do
       try
         expToJuliaExpMTK(rhsDAE, simCode)
-      catch
+      catch err
+        OMBackend._fallback(err, :forwardEvalT0Lowering; only = OMBackend.UnsupportedLowering)
         :__t0_lower_failed
       end
     end
@@ -2301,11 +2486,7 @@ function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, s
     end
     local envStr = Dict{String, Float64}(string(k) => valMap[k] for k in explicit if haskey(valMap, k))
     for ifEq in simCode.ifEquations
-      local br = try
-        SimulationCode._selectActiveInitBranch(ifEq, envStr)
-      catch
-        nothing
-      end
+      local br = SimulationCode._selectActiveInitBranch(ifEq, envStr)
       br === nothing && continue
       for req in br.residualEquations
         local p = mkPair(req.exp)
@@ -2333,7 +2514,7 @@ function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, s
   return
 end
 
-function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool = false, extraVals = nothing)
+function evalInitialCondition(mtkCond, simCode; closedBoundary::Bool = false, extraVals = nothing)
   #= Skip during precompile output: `eval(...)` below would mutate this
      closed module's bindings and Julia rejects that. The runtime path is
      unaffected. Fallback `true` matches the existing catch arm. =#
@@ -2341,58 +2522,43 @@ function evalInitialCondition(mtkCond, simCode = nothing; closedBoundary::Bool =
     return true
   end
   #= Evaluate zero-crossing function at t=0 to determine initial condition.
-     Works at the Expr level: walks the mtkCond Expr tree, substitutes all
-     variable/parameter references with numeric values, then evals the result.
-     Returns true when the zero-crossing function is non-negative at t=0
-     (condition FALSE), false when negative (condition TRUE).
+     Works at the Expr level: substitutes all variable/parameter references
+     in the mtkCond Expr (form :(lhs ~ 0)) with numeric values, then evals
+     the result. Returns true when the zero-crossing function is non-negative
+     at t=0 (condition FALSE), false when negative (condition TRUE).
      The caller inverts: ifCond = !(evalInitialCondition(...)). =#
-  try
-    if simCode === nothing
-      #= No simCode: fall back to old behavior =#
-      local mtkCondE = Base.invokelatest(eval, mtkCond)
-      local lhs = mtkCondE.lhs
-      local tSym = ModelingToolkit.t_nounits
-      local v = Base.invokelatest(substitute, lhs, Dict(tSym => 0.0))
-      local numV = try Float64(v) catch; nothing end
-      if numV !== nothing
-        return closedBoundary ? numV > 0.0 : numV >= 0.0
-      end
-      return (v == 0) != false
+  local valMap = _buildT0ValueMap(simCode)
+  #= Relay-computed t0 values: condition operands that are themselves
+     if-equation targets would otherwise default to 0 here and select the
+     wrong initial branch. =#
+  if extraVals !== nothing
+    for (k, v) in extraVals
+      valMap[k] = v
     end
-    local valMap = _buildT0ValueMap(simCode)
-    #= Relay-computed t0 values: condition operands that are themselves
-       if-equation targets would otherwise default to 0 here and select the
-       wrong initial branch. =#
-    if extraVals !== nothing
-      for (k, v) in extraVals
-        valMap[k] = v
-      end
-    end
-    #= Extract LHS from the mtkCond Expr (form: :(lhs ~ 0)) =#
-    local lhsExpr = _extractZeroCrossingLHS(mtkCond)
-    #= Substitute all variable references with numeric values =#
-    local numExpr = _substituteExprValues(lhsExpr, valMap)
-    local result = eval(numExpr)
-    local numResult = if result isa Number
-      Float64(result)
-    else
-      local unwrapped = Base.invokelatest(SymbolicUtils.unwrap, result)
-      if unwrapped isa Number
-        Float64(unwrapped)
-      else
-        local valued = try Base.invokelatest(Symbolics.value, result) catch; result end
-        Float64(valued isa Number ? valued : 0.0)
-      end
-    end
-    #= The zero-crossing function is negative when the condition is TRUE,
-       positive when FALSE. Return true when condition is FALSE (positive),
-       because the caller inverts: ifCond = !(evalInitialCondition(...)).
-       At zc == 0 the original operator decides (closedBoundary). =#
-    return closedBoundary ? numResult > 0.0 : numResult >= 0.0
+  end
+  local numExpr = _substituteExprValues(_extractZeroCrossingLHS(mtkCond), valMap)
+  local numResult = try
+    _numberOf(eval(numExpr))
   catch e
+    #= A name without a t0 value, a Modelica function outside its domain. =#
+    OMBackend._fallback(e, :evalInitialCondition; expect = Union{UndefVarError, MethodError}, impact = :result)
     @warn "evalInitialCondition: failed to evaluate, defaulting to true" exception=(e, catch_backtrace())
     return true
   end
+  #= The zero-crossing function is negative when the condition is TRUE,
+     positive when FALSE. Return true when condition is FALSE (positive),
+     because the caller inverts: ifCond = !(evalInitialCondition(...)).
+     At zc == 0 the original operator decides (closedBoundary). =#
+  return closedBoundary ? numResult > 0.0 : numResult >= 0.0
+end
+
+#= An evaluated condition value as a Float64 (a symbolic constant unwrapped; 0.0 otherwise). =#
+function _numberOf(result)::Float64
+  result isa Number && return Float64(result)
+  local unwrapped = Base.invokelatest(SymbolicUtils.unwrap, result)
+  unwrapped isa Number && return Float64(unwrapped)
+  local valued = Base.invokelatest(Symbolics.value, result)
+  return Float64(valued isa Number ? valued : 0.0)
 end
 
 """
@@ -2440,7 +2606,7 @@ function generateCastExpressionMTK(@nospecialize(ty::DAE.Type), @nospecialize(ex
         Int.(round.($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,))))
       end
     end
-    _ => throw("Cast $ty: for exp: $exp not yet supported in codegen!")
+    _ => OMBackend.unsupported("cast to $(ty)", exp)
   end
   return expr
 end
@@ -2448,16 +2614,17 @@ end
 # TODO: unify cref resolution into one function consulting both the SimCode
 # (state / numeric-param lookup tables) and the module-level bindings (String
 # parameters, data structures), so callers need not special-case the latter.
-function getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode)
-  local crefAsStr = string(x)
+getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode) = getIdxForLookupMTK(string(x), simCode)
+
+function getIdxForLookupMTK(crefAsStr::String, simCode)
   if crefAsStr == "time"
     return :t
   end
   @match _, simVar = simCode.stringToSimVarHT[crefAsStr]
   if !(SimulationCode.isParameter(simVar))
-    Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(string(x))))))
+    Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(crefAsStr)))))
   else
-    Expr(:call, getindex, :p, Expr(:call, :getindex, :lookuptableParams, :(Symbol($(string(x))))))
+    Expr(:call, getindex, :p, Expr(:call, :getindex, :lookuptableParams, :(Symbol($(crefAsStr)))))
   end
 end
 
@@ -2517,18 +2684,21 @@ function subscriptsToExpr(subscripts, simCode; varPrefix="", varSuffix="", derSy
   end
 end
 
-function evalDAE_Expression(expr, simCode)::Expr
+function evalDAE_Expression(expr, simCode; keepTunable::Bool = false)::Expr
   local shouldEval = Ref(true)
   #= Replaces all known bound parameters in the DAE expression. This must be
      recursive: parameter aliases such as `actualGlobalSeed = globalSeed_seed`
      otherwise leave a bare `globalSeed_seed` in the generated Julia expression
-     even after `globalSeed_seed` itself has been solved from an initial equation. =#
-  local daeExp = _substituteBoundParameters(expr, simCode; shouldEval=shouldEval)
+     even after `globalSeed_seed` itself has been solved from an initial equation.
+     With `keepTunable`, tunable parameters stay references (_substituteBoundParameters). =#
+  local daeExp = _substituteBoundParameters(expr, simCode; shouldEval=shouldEval, keepTunable=keepTunable)
   local jlExpr = expToJuliaExpMTK(daeExp, simCode)
   local evaluatedJLExpr = if shouldEval[]
     try
       eval(jlExpr)
-    catch
+    catch err
+      #= Left unevaluated: it reads a name that is not a constant here. =#
+      OMBackend._fallback(err, :evalDAE_Expression; expect = Union{UndefVarError, MethodError})
       jlExpr
     end
   else
@@ -2536,6 +2706,18 @@ function evalDAE_Expression(expr, simCode)::Expr
   end
   return quote $(evaluatedJLExpr) end
 end
+
+#= Whether `exp` reads a tunable parameter (withTunableParameters), directly or
+   through the bindings of the parameters it reads. =#
+function _readsTunableParameter(exp, simCode)::Bool
+  isempty(OMBackend.TUNABLE_PARAMETERS[]) && return false
+  local resolved = _substituteBoundParameters(exp, simCode; keepTunable = true)
+  return any(c -> OMBackend.isTunableParameter(string(c)), Util.getAllCrefs(resolved))
+end
+
+#= `e` with `time` read as 0.0, the start time of the build. =#
+_timeAtBuildStart(@nospecialize(e)) = first(Util.traverseExpBottomUp(e, (x, acc) ->
+  (x isa DAE.CREF && x.componentRef isa DAE.CREF_IDENT && x.componentRef.ident == "time" ? DAE.RCONST(0.0) : x, acc), nothing))
 
 """
     solveParametricInitialEquations!(simCode)
@@ -2609,7 +2791,11 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       end
       (exp, true, acc)
     end
-    local ieqLhs, ieqRhs = equationSides(ieq)
+    #= At the build the start time is 0 (`t0 = time`, MSL Blocks.Math.Mean;
+       simulateFromBuild refuses another start time for such a model,
+       _startTimeGuard): `time` could not be evaluated, and the parameter kept
+       its start value. =#
+    local ieqLhs, ieqRhs = map(_timeAtBuildStart, equationSides(ieq))
     Util.traverseExpBottomUp(ieqLhs, findFree, 0)
     Util.traverseExpBottomUp(ieqRhs, findFree, 0)
     unique!(freeParams)
@@ -2617,23 +2803,27 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       continue
     end
     freeName = freeParams[1]
+    #= A tunable parameter is set at run time: solved here, the free one kept
+       its compiled value in every run (`q = 2 * p`). Alone on a side it is
+       bound to the other side (`p = q`, `2 * p = q`), and follows p as a
+       bound parameter does; otherwise it stays unbound and the
+       initialization computes it for the run's values (`q * q = p`). As an
+       unbound parameter alone on the right it was assigned nowhere: q = 0. =#
+    if any(side -> _readsTunableParameter(side, simCode), (ieqLhs, ieqRhs))
+      local isFree = e -> e isa DAE.CREF && string(e) == freeName
+      local other = isFree(ieqLhs) ? ieqRhs : isFree(ieqRhs) ? ieqLhs : nothing
+      if other !== nothing && !containsCref(other, freeName)
+        local (idx, oldSV) = ht[freeName]
+        ht[freeName] = (idx, SimulationCode.SIMVAR(oldSV.name, oldSV.index,
+                                                   SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(other))), oldSV.attributes))
+        push!(solvedNames, freeName)
+        solvedThisPass = true
+      end
+      continue
+    end
     #= Get initial guess from start attribute =#
     local (_, freeSV) = ht[freeName]
-    local guess = 0.1
-    @match freeSV.attributes begin
-      SOME(attr) => begin
-        @match attr.start begin
-          SOME(startExp) => begin
-            try
-              guess = Float64(evalDAEConstant(startExp, simCode))
-            catch
-            end
-          end
-          _ => nothing
-        end
-      end
-      _ => nothing
-    end
+    local guess = something(_startNumber(freeSV, simCode), 0.1)
     #= Build residual: LHS - RHS = 0.
        Replace all bound params recursively, leave the free param as the scalar
        Newton variable. This handles alias chains like
@@ -2666,6 +2856,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
       local raw = eval(lhsJl)
       raw isa Symbolics.Num ? Float64(Symbolics.unwrap(raw)) : Float64(raw)
     catch err
+      OMBackend._fallback(err, :parametricInitLhs; expect = Union{UndefVarError, MethodError}, impact = :result)
       @warn "[SIMCODE: solveParametricInitialEquations] could not evaluate LHS" freeName err
       continue
     end
@@ -2691,6 +2882,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     local residualFn = try
       eval(Expr(:->, freeSymbol, Expr(:call, :-, lhsVal, rhsJl)))
     catch e
+      OMBackend._fallback(e, :parametricInitResidual; expect = Union{UndefVarError, MethodError}, impact = :result)
       @warn "[SIMCODE: solveParametricInitialEquations] could not build residual" freeName e
       continue
     end
@@ -2704,6 +2896,7 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     local eps = 1e-10
     local maxIter = 100
     local newtonOk = true
+    local lastStep = Inf
     try
       for _ in 1:maxIter
         local fx = Base.invokelatest(residualFn, x)
@@ -2715,11 +2908,21 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
         if abs(dfx) < 1e-15
           break
         end
-        x -= fx / dfx
+        lastStep = fx / dfx
+        x -= lastStep
       end
     catch err
+      OMBackend._fallback(err, :parametricInitNewton; expect = Union{UndefVarError, MethodError}, impact = :result)
       @warn "[SIMCODE: solveParametricInitialEquations] residual call threw, skipping" freeName err
       newtonOk = false
+    end
+    #= Converged: a small residual, or a small last step (the rounding of
+       `0 = 1e9*G - 2e9` is about 4e-7). Otherwise the parameter stays unbound,
+       for the initialization (generateInitialEquationsAsConstraints takes an
+       equation reading one). =#
+    newtonOk = newtonOk && let fx = try Base.invokelatest(residualFn, x) catch; NaN end
+      isfinite(x) && isfinite(fx) &&
+        (abs(fx) <= 1e-8 * max(1.0, abs(lhsVal)) || abs(lastStep) <= 1e-10 * max(1.0, abs(x)))
     end
     if !newtonOk
       continue
@@ -2746,12 +2949,13 @@ end
    the if-expression can gate directly on the held discrete value; the discrete's
    own update event localises the switch, so no ifCond relay is needed. =#
 function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::Bool
+  #= initial() is true during the initialization only: a condition with it is
+     a relation (its crossing function a constant of either sign), not a gate
+     on the runtime value, where initial() is false (MSL LimIntegrator's
+     `initial() and not limitsAtInit` never held). =#
+  _hasInitialCall(condition) && return false
   local refs::OrderedSet{String} = OrderedSet{String}()
-  try
-    SimulationCode.collectCrefNames!(refs, condition)
-  catch
-    return false
-  end
+  SimulationCode.collectCrefNames!(refs, condition)
   isempty(refs) && return false
   local ht = simCode.stringToSimVarHT
   for name in refs
@@ -2764,6 +2968,16 @@ function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::
     end
   end
   return true
+end
+
+function _hasInitialCall(@nospecialize(condition))::Bool
+  local d = condition isa SimulationCode.Exp ? SimulationCode.toDAEExp(condition) : condition
+  local found = Ref(false)
+  Util.traverseExpBottomUp(d, (x, acc) -> begin
+    x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name == "initial" && (found[] = true)
+    (x, true, acc)
+  end, 0)
+  return found[]
 end
 
 "True when every non-else branch condition of an if-equation is discrete/parameter,
@@ -2836,37 +3050,44 @@ function generateIfExpressions(branches,
                                identifier::Int,
                                simCode;
                                subIdentifier::Int = 1,
-                               lhsKey::Union{String, Nothing} = nothing)
+                               lhsKey::Union{String, Nothing} = nothing,
+                               residualForm::Bool = false)
   local branch = branches[target]
-  local selEq = lhsKey === nothing ? branch.residualEquations[resEqIdx] :
+  local selEq = (lhsKey === nothing || residualForm) ?
+                branch.residualEquations[min(resEqIdx, length(branch.residualEquations))] :
                 _branchResidualForLhs(branch, lhsKey, resEqIdx, simCode)
+  #= The branch's value: its right-hand side (causal form), or its residual
+     when the branches define different variables. =#
+  local value = _guardNonIntegerPowerBasesForEagerBranch(
+    residualForm ? expToJuliaExpMTK(SimulationCode.toDAEExp(selEq.exp), simCode) :
+                   first(deCausalize(selEq, simCode)))
   if branch.targets == -1
-    return :($(_guardNonIntegerPowerBasesForEagerBranch(
-      first(deCausalize(selEq, simCode)))))
+    return :($(value))
   end
   #= When every branch condition is discrete/parameter (e.g. an event-held Boolean),
      gate directly on the condition value: its own update event localises the step,
      so no `ifCond` relay parameter or continuous callback is needed (and the relay's
      start-attribute initial value, which can pick the wrong branch, is avoided). =#
-  local cond = if _allBranchConditionsDiscrete(branches, simCode)
+  local cond = if _ifConditionAllDiscreteOrParameter(branch.condition, simCode)
+    #= Per branch: an elseif chain may mix a discrete condition (changed by a
+       when, never a crossing of its own) with relations. =#
     :( $(expToJuliaExpMTK(SimulationCode.toDAEExp(branch.condition), simCode)) > 0.5 )
   else
     #= ifCond variables are discrete parameters (not ODE unknowns), so the solver
        never perturbs them during Jacobian computation. Exact comparison is safe. =#
     :( $(Symbol(string("ifCond", identifier, subIdentifier))) == 1 )
   end
-  local rhs = _guardNonIntegerPowerBasesForEagerBranch(
-    first(deCausalize(selEq, simCode)))
   quote
     ModelingToolkit.ifelse($(cond),
-                           $(rhs),
+                           $(value),
                            $(generateIfExpressions(branches,
                                                    branches[target].targets,
                                                    resEqIdx,
                                                    identifier,
                                                    simCode;
                                                    subIdentifier = subIdentifier + 1,
-                                                   lhsKey = lhsKey)))
+                                                   lhsKey = lhsKey,
+                                                   residualForm = residualForm)))
   end
 end
 
@@ -2887,7 +3108,7 @@ function deCausalize(eq, simCode)
       (:($(expToJuliaExpMTK(exp2, simCode))), :($(expToJuliaExpMTK(exp1, simCode))))
     end
     _ => begin
-      throw("Unsupported equation:" * string(eq))
+      OMBackend.unsupported("equation", eq)
     end
   end
 end
@@ -2944,6 +3165,12 @@ function _modelicaFunctionCallExpr(path,
                                    varSuffix = "",
                                    derSymbol = false)
   local normalizedFuncName = OMBackend.canonicalName(string(path))
+  #= OMFrontend lowers delay(x, T[, Tmax]) to OpenModelica.Internal.delay2/delay3, as OpenModelica: a
+     generated function whose body was the identity. The history-based term (delays.jl). =#
+  if normalizedFuncName in ("OpenModelica_Internal_delay2", "OpenModelica_Internal_delay3")
+    return DAECallExpressionToMTKCallExpression("delay", expLst isa List ? expLst : MetaModelica.list(expLst...), simCode, hashTable;
+                                                varPrefix = varPrefix, varSuffix = varSuffix, derAsSymbol = derSymbol)
+  end
   local lowered = lowerKnownSymbolicFunctionCall(normalizedFuncName, expLst, simCode, hashTable;
                                                 varPrefix = varPrefix,
                                                 varSuffix = varSuffix,
@@ -2969,7 +3196,7 @@ function _modelicaFunctionCallExpr(path,
   local runtimeName = get(AlgorithmicCodeGeneration.MODELICA_UTILITIES_TO_RUNTIME_C,
                           normalizedFuncName, nothing)
   local callee = if runtimeName !== nothing
-    Expr(:., :OMRuntimeExternalC, QuoteNode(runtimeName))
+    :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.RuntimeCCall($(Expr(:., :OMRuntimeExternalC, QuoteNode(runtimeName)))))
   else
     Symbol(normalizedFuncName)
   end

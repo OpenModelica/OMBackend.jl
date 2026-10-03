@@ -70,7 +70,9 @@ _algAssignedMaxIndex(idx::Colon) = 0
 function _algAssignedMaxIndex(idx)
   try
     return maximum(Int, idx; init=0)
-  catch
+  catch err
+    #= Not integer indices (an InexactError): no growth. =#
+    CodeGeneration.OMBackend._fallback(err, :algAssignedMaxIndex)
     return 0
   end
 end
@@ -109,10 +111,14 @@ function _algAssignmentPreallocation(@nospecialize(lhs))
   end
 end
 
+#= The lowered left-hand side indexes the array `name`: a scalarized element
+   (signalPWM[3].sawtooth.count lowered to one name) has no array to grow. =#
+_indexesArray(lhs, name) = lhs isa Expr && lhs.head === :ref && _unwrapSubscriptExpr(lhs.args[1]) === name
+
 function _algAssignment(@nospecialize(lhsExp), rhs::Expr)
   local lhs = _unwrapSubscriptExpr(expToJuliaExpAlg(lhsExp))
   local prealloc = _algAssignmentPreallocation(lhsExp)
-  if prealloc === nothing
+  if prealloc === nothing || !_indexesArray(lhs, prealloc.args[2])
     return :($lhs = $rhs)
   else
     return quote
@@ -134,15 +140,12 @@ function isMultiDimArray(v::DAE.VAR)::Bool
     return true
   end
   #= Also check v.dims field (used for function parameters) =#
-  try
-    dimCount = 0
-    for _ in v.dims
-      dimCount += 1
-    end
-    return dimCount >= 2
-  catch
-    return false
+  hasproperty(v, :dims) || return false
+  local dimCount = 0
+  for _ in v.dims
+    dimCount += 1
   end
+  return dimCount >= 2
 end
 
 #= Check if a ModelicaFunction has any array-typed output.
@@ -161,74 +164,6 @@ function hasArrayOutput(f::SimulationCode.ModelicaFunction)::Bool
     end
   end
   return false
-end
-
-#= Check if a function body contains conditionals that would fail with symbolic args.
-   This includes STMT_IF statements and IFEXP (ternary if-expressions) in assignment RHS.
-   Only these functions need the symbolic Term dispatch; pure-arithmetic functions
-   work fine when called directly with symbolic values.
-   Checks recursively inside for-loops and other compound statements. =#
-function hasIfStatements(func::SimulationCode.ModelicaFunction)::Bool
-  if !(func isa SimulationCode.MODELICA_FUNCTION)
-    return false
-  end
-  local stmts = func.statements
-  local locals = func.locals
-  _statementsContainIf(stmts) && return true
-  for v in locals
-    @match v.binding begin
-      SOME(bindingExp) => begin
-        _expContainsIfExp(bindingExp) && return true
-      end
-      _ => nothing
-    end
-  end
-  return false
-end
-
-function _statementsContainIf(stmts)::Bool
-  for s in stmts
-    if s isa DAE.STMT_IF
-      return true
-    elseif s isa DAE.STMT_FOR
-      _statementsContainIf(s.statementLst) && return true
-    elseif s isa DAE.STMT_WHILE
-      _statementsContainIf(s.statementLst) && return true
-    elseif s isa DAE.STMT_ASSIGN
-      _expContainsIfExp(s.exp) && return true
-    elseif s isa DAE.STMT_ASSIGN_ARR
-      _expContainsIfExp(s.exp) && return true
-    end
-  end
-  return false
-end
-
-Base.@nospecializeinfer function _expContainsIfExp(@nospecialize(exp::DAE.Exp))::Bool
-  @match exp begin
-    DAE.IFEXP(__) => return true
-    DAE.BINARY(exp1 = e1, exp2 = e2) => begin
-      return _expContainsIfExp(e1) || _expContainsIfExp(e2)
-    end
-    DAE.UNARY(exp = e1) => begin
-      return _expContainsIfExp(e1)
-    end
-    DAE.CALL(expLst = args) => begin
-      for a in args
-        _expContainsIfExp(a) && return true
-      end
-      return false
-    end
-    DAE.ARRAY(array = elems) => begin
-      for e in elems
-        _expContainsIfExp(e) && return true
-      end
-      return false
-    end
-    DAE.ASUB(exp = inner) => begin
-      return _expContainsIfExp(inner)
-    end
-    _ => return false
-  end
 end
 
 #= Compute the output dimensions for a single-array-output function.
@@ -258,6 +193,22 @@ function computeArrayOutputDims(f::SimulationCode.ModelicaFunction)::Tuple{Varar
     _ => return ()
   end
 end
+
+#= An Integer input is an Int in the function: read from the integrator (a
+   discrete's value) it arrives as a Float64 (MSL TimeTable's `last`, a table
+   index in getInterpolationCoefficients: "invalid index: 2.0"). A symbolic
+   argument is left as it is. =#
+function generateIntegerInputConversions(inputs::Vector)::Vector{Expr}
+  local conversions = Expr[]
+  for v in inputs
+    (_funcParamIsArray(v) || !(v.ty isa DAE.T_INTEGER)) && continue
+    local s = DAE_VAR_ToJulia(v)
+    push!(conversions, :($s = OMBackend.CodeGeneration.AlgorithmicCodeGeneration._integerInput($s)))
+  end
+  return conversions
+end
+_integerInput(x::AbstractFloat) = isinteger(x) ? Int(x) : x
+_integerInput(x) = x
 
 #= Generate ensureArray conversion statements for multi-dimensional array parameters. =#
 function generateArrayConversions(inputs::Vector)::Vector{Expr}
@@ -310,7 +261,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
       SimulationCode.MODELICA_FUNCTION(__) => begin
         local locals = generateLocals(func.locals)
         local outputDefaults = generateOutputDefaults(func.outputs)
-        local arrayConversions = generateArrayConversions(func.inputs)
+        local inputConversions = vcat(generateArrayConversions(func.inputs), generateIntegerInputConversions(func.inputs))
         local returnExpr = if length(outputs) > 1
           Expr(:tuple, outputs...)
         elseif length(outputs) == 1
@@ -321,7 +272,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         _CURRENT_RETURN_EXPR[] = returnExpr
         local statements = generateStatements(func.statements)
         #= Build the anonymous function expression manually to avoid parsing issues =#
-        local funcBody = Expr(:block, arrayConversions..., outputDefaults..., locals..., statements..., :(return $(returnExpr)))
+        local funcBody = Expr(:block, inputConversions..., outputDefaults..., locals..., statements..., :(return $(returnExpr)))
         local anonFunc = if nArgs == 0
           Expr(:->, Expr(:tuple), funcBody)
         elseif inputsJL isa Tuple
@@ -338,16 +289,18 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         end
       end
       SimulationCode.EXTERNAL_MODELICA_FUNCTION(__) => begin
-        local extCall = Meta.parse(func.libInfo)
-        extCall = namespaceifyExternalFunction(extCall)
-        #= Allocate ccall-mutable buffers for every output, convert array inputs
-           to the right C element type, then dereference Refs in the return. =#
-        local extInputConversions = generateExternalInputConversions(func.inputs)
-        local extOutputAllocs = generateExternalOutputAllocations(func.outputs)
-        local returnExpr = generateExternalReturnExpr(func.outputs)
-
-        #= Build the anonymous function expression manually =#
-        local funcBody = Expr(:block, extInputConversions..., extOutputAllocs..., extCall, returnExpr)
+        local funcBody = if func.language == "FORTRAN 77"
+          _fortranExternalBody(func)
+        else
+          local extCall = namespaceifyExternalFunction(Meta.parse(func.libInfo))
+          #= Allocate ccall-mutable buffers for every output, convert array inputs
+             to the right C element type, then dereference Refs in the return. =#
+          local extInputConversions = generateExternalInputConversions(func.inputs)
+          local extOutputAllocs = generateExternalOutputAllocations(func.outputs)
+          local returnExpr = generateExternalReturnExpr(func.outputs)
+          #= The protected locals the call passes (MSL realFFT_raw's work array). =#
+          Expr(:block, extInputConversions..., extOutputAllocs..., generateLocals(func.locals)..., extCall, returnExpr)
+        end
         local anonFunc = if nArgs == 0
           Expr(:->, Expr(:tuple), funcBody)
         elseif inputsJL isa Tuple
@@ -410,32 +363,6 @@ function flattenRecordInput(v::DAE.VAR)::Vector{Symbol}
   end
 end
 
-"""
-`generateSignatureForRegistration(inputs::Vector{DAE.VAR})`
-This function generates the input signature for calls to Symbolics.register.
-Record inputs are flattened into individual field parameters to match the
-generated function signature from generateIOL/flattenRecordInput.
-"""
-function generateSignatureForRegistration(inputs::Vector{DAE.VAR})
-  local jInputs = Expr[]
-  for i in inputs
-    @match i.ty begin
-      DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), _, _) => begin
-        #= Flatten record into individual field parameters =#
-        local flattenedSymbols = flattenRecordInput(i)
-        for s in flattenedSymbols
-          push!(jInputs, Expr(:(::), s, :(Any)))
-        end
-      end
-      _ => begin
-        local s = DAE_VAR_ToJulia(i)
-        push!(jInputs, Expr(:(::), s, :(Any)))
-      end
-    end
-  end
-  return jInputs
-end
-
 function generateLocals(inputs::Vector)
   local jInputs = Expr[]
   for i in inputs
@@ -454,13 +381,18 @@ function generateLocals(inputs::Vector)
        generate local s = <bindingExpr> instead of just local s =#
     local hasBinding = @match i.binding begin
       SOME(bindingExp) => begin
+        #= An array as a copy: `Real Awork[n, n] = A` is written into, `A` not. =#
         local bindExpr = expToJuliaExpAlg(bindingExp)
-        push!(jInputs, :(local $s = $bindExpr))
+        push!(jInputs, :(local $s = $(_funcParamIsArray(i) ? :(Base.copy($bindExpr)) : bindExpr)))
         true
       end
       _ => false
     end
-    if !hasBinding
+    if !hasBinding && _funcParamIsArray(i)
+      #= `Real invMMX[size(X, 1)]` (MSL Media massToMoleFractions): an array, not the
+         scalar default of its element type. =#
+      push!(jInputs, :(local $s = $(_arrayDefault(i))))
+    elseif !hasBinding
       local defaultVal = @match i.ty begin
         DAE.T_REAL(__) => 0.0
         DAE.T_INTEGER(__) => 0
@@ -479,6 +411,20 @@ function generateLocals(inputs::Vector)
   return jInputs
 end
 
+#= A zero-filled array for an array-typed function variable, its dimensions possibly
+   depending on the inputs; an empty one where they are not known. =#
+function _arrayDefault(v::DAE.VAR)
+  local jlElemDefault = @match _funcParamElemType(v) begin
+    DAE.T_REAL(__) => :Float64
+    DAE.T_INTEGER(__) => :Int
+    DAE.T_BOOL(__) => :Bool
+    _ => :Float64
+  end
+  local dimExprs = map(_daeDimToJulia, collect(_funcParamDims(v)))
+  local unresolved = any(d -> d isa Number && d <= 0, dimExprs)
+  return !isempty(dimExprs) && !unresolved ? :(zeros($(jlElemDefault), $(dimExprs...))) : :($(jlElemDefault)[])
+end
+
 """
   Generate default-initialized local declarations for Modelica function output variables.
   In Modelica, output variables are implicitly initialized (Real=0.0, Integer=0, Bool=false).
@@ -488,20 +434,15 @@ function generateOutputDefaults(outputs::Vector)::Vector{Expr}
   local decls = Expr[]
   for v in outputs
     local s = DAE_VAR_ToJulia(v)
+    #= An output with a binding starts at it (`output Real x[n] = b`), an array
+       as a copy: the body or a FORTRAN 77 routine writes into it, not into `b`. =#
+    if v.binding isa SOME
+      local bindExpr = expToJuliaExpAlg(v.binding.data)
+      push!(decls, :(local $s = $(_funcParamIsArray(v) ? :(Base.copy($bindExpr)) : bindExpr)))
+      continue
+    end
     local defaultVal = if _funcParamIsArray(v)
-      local jlElemDefault = @match _funcParamElemType(v) begin
-        DAE.T_REAL(__) => :Float64
-        DAE.T_INTEGER(__) => :Int
-        DAE.T_BOOL(__) => :Bool
-        _ => :Float64
-      end
-      local dimExprs = map(_daeDimToJulia, collect(_funcParamDims(v)))
-      local unresolved = any(d -> d isa Number && d <= 0, dimExprs)
-      if !isempty(dimExprs) && !unresolved
-        :(zeros($(jlElemDefault), $(dimExprs...)))
-      else
-        :($(jlElemDefault)[])
-      end
+      _arrayDefault(v)
     else
       @match v.ty begin
         DAE.T_REAL(__) => 0.0
@@ -536,10 +477,16 @@ the ccall, since the caller may legitimately pass `Vector{Int64}` and Julia's
 ccall will not silently widen the pointer cast.
 =#
 
+#= The size of a dimension of a function variable; `[:]` starts empty and
+   grows as it is assigned (ensureAlgArrayLength!). A Boolean dimension
+   (indexed by false and true) is not supported: an ArgumentError at the
+   first index before. =#
 _daeDimToJulia(d) = @match d begin
   DAE.DIM_INTEGER(int) => int
   DAE.DIM_EXP(exp) => expToJuliaExpAlg(exp)
-  _ => 0
+  DAE.DIM_ENUM(size = n) => n
+  DAE.DIM_UNKNOWN(__) => 0
+  _ => CodeGeneration.unsupported("this array dimension of a function variable", d)
 end
 
 function _ccallElemType(elemTy)
@@ -608,6 +555,14 @@ function generateExternalOutputAllocations(outputs::Vector)::Vector{Expr}
   return decls
 end
 
+#= A Modelica Integer (or Boolean) array for a C `int*`: rounded, since an
+   Integer held in the Float64 state vector can be an ulp off after a solver
+   step (the MSL noise generators' xorshift states, 1.3705433889999998e9 for
+   1370543389: `convert` threw InexactError in ActuatorWithNoise). =#
+_roundToCint(x::AbstractArray{Cint}) = x
+_roundToCint(x::AbstractArray) = map(v -> v isa Integer ? Cint(v) : round(Cint, v), x)
+_roundToCint(x) = x
+
 function generateExternalInputConversions(inputs::Vector)::Vector{Expr}
   local conversions = Expr[]
   for v in inputs
@@ -616,10 +571,91 @@ function generateExternalInputConversions(inputs::Vector)::Vector{Expr}
       local jlElemType = _ccallElemType(_funcParamElemType(v))
       local nDims = length(collect(_funcParamDims(v)))
       local containerTy = nDims >= 2 ? :(Matrix{$jlElemType}) : :(Vector{$jlElemType})
-      push!(conversions, :($s = convert($containerTy, $s)))
+      local value = jlElemType === :Cint ? :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration._roundToCint($s)) : s
+      push!(conversions, :($s = convert($containerTy, $value)))
     end
   end
   return conversions
+end
+
+#= An external "FORTRAN 77" function (Modelica.Math.Matrices.LAPACK): its
+   locals and outputs initialized from their bindings (Awork = A, x = b), the
+   routine of Julia's LAPACK called with every argument by reference (arrays as
+   fresh Float64/Int64 copies it may overwrite, scalars in Refs read back after
+   the call, a character with its hidden length last, as gfortran passes it),
+   and the outputs returned. =#
+function _fortranExternalBody(func)::Expr
+  local call = Meta.parse(func.libInfo)
+  if call isa Expr && call.head === :toplevel && length(call.args) == 1
+    call = call.args[1]
+  end
+  local (resultVar, callExpr) = call isa Expr && call.head === :(=) ? (call.args[1], call.args[2]) : (nothing, call)
+  (callExpr isa Expr && callExpr.head === :call && callExpr.args[1] isa Symbol) ||
+    OMBackend.unsupported("an external FORTRAN 77 call", func.libInfo)
+  local routine = callExpr.args[1]
+  local vars = Dict{Symbol, DAE.VAR}()
+  for v in Iterators.flatten((func.inputs, func.outputs, func.locals))
+    vars[Symbol(DAE_VAR_ToJulia(v))] = v
+  end
+  local prep = Expr[]; local types = Any[]; local args = Any[]; local readBack = Expr[]
+  local hiddenLengths = Any[]
+  local refs = Dict{Symbol, Symbol}()
+  for a in callExpr.args[2:end]
+    if a isa String
+      push!(types, :(Ref{UInt8})); push!(args, UInt8(first(a)))
+      push!(hiddenLengths, 1)
+    elseif a isa Integer
+      push!(types, :(Ref{Int64})); push!(args, Int64(a))
+    elseif a isa AbstractFloat
+      push!(types, :(Ref{Float64})); push!(args, Float64(a))
+    elseif a isa Symbol && haskey(vars, a)
+      local v = vars[a]
+      local elem = _funcParamIsArray(v) ? _funcParamElemType(v) : v.ty
+      if elem isa DAE.T_STRING
+        _funcParamIsArray(v) && OMBackend.unsupported("a FORTRAN 77 character array", a)
+        push!(types, :(Ref{UInt8})); push!(args, :(UInt8(first($a))))
+        push!(hiddenLengths, 1)
+        continue
+      end
+      local jlType = elem isa DAE.T_REAL ? :Float64 : :Int64
+      if _funcParamIsArray(v)
+        haskey(refs, a) || (refs[a] = a; push!(prep, :($a = Array{$jlType}($a))))
+        push!(types, :(Ptr{$jlType})); push!(args, a)
+      else
+        local r = get!(refs, a) do
+          local r = Symbol("_ref_", a)
+          push!(prep, :(local $r = Ref{$jlType}($a)))
+          push!(readBack, elem isa DAE.T_BOOL ? :($a = $r[] != 0) :
+                          elem isa DAE.T_REAL ? :($a = $r[]) : :($a = Int($r[])))
+          r
+        end
+        push!(types, :(Ref{$jlType})); push!(args, r)
+      end
+    else
+      OMBackend.unsupported("a FORTRAN 77 argument", a)
+    end
+  end
+  append!(types, fill(:Clong, length(hiddenLengths))); append!(args, hiddenLengths)
+  local resultType = resultVar === nothing ? :Cvoid :
+    (vars[resultVar].ty isa DAE.T_REAL ? :Float64 : :Int64)
+  local ccallExpr = Expr(:call, :ccall,
+                         :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.lapackFunction($(QuoteNode(routine)))),
+                         resultType, Expr(:tuple, types...), args...)
+  local callStmt = resultVar === nothing ? ccallExpr : :($resultVar = $ccallExpr)
+  local outputs = [Symbol(DAE_VAR_ToJulia(v)) for v in func.outputs]
+  local returnExpr = length(outputs) == 1 ? outputs[1] : Expr(:tuple, outputs...)
+  return Expr(:block, generateArrayConversions(func.inputs)..., generateOutputDefaults(func.outputs)...,
+              generateLocals(func.locals)..., prep..., callStmt, readBack..., returnExpr)
+end
+
+#= The routine `name` of Julia's LAPACK: libblastrampoline's ILP64 interface
+   (`dgesv_64_`, 64-bit integers). =#
+const LAPACK_POINTERS = Dict{Symbol, Ptr{Cvoid}}()
+function lapackFunction(name::Symbol)::Ptr{Cvoid}
+  return get!(LAPACK_POINTERS, name) do
+    local lib = Base.Libc.Libdl.dlopen(LinearAlgebra.BLAS.libblastrampoline)
+    Base.Libc.Libdl.dlsym(lib, Symbol(name, "_64_"))
+  end
 end
 
 function generateExternalReturnExpr(outputs::Vector)
@@ -654,7 +690,7 @@ function generateStatements(statements::Union{List{DAE.Statement}, Vector{DAE.St
 end
 
 Base.@nospecializeinfer function generateStatement(@nospecialize(s::DAE.Statement))
-  throw("Unsupported stmt:" * string(s))
+  CodeGeneration.unsupported("statement", s)
 end
 
 function generateStatement(stmt::DAE.STMT_NORETCALL)
@@ -674,7 +710,9 @@ end
 Scalarise a record-typed assignment onto its flattened `<base>_<field>` symbols
 (the naming `flattenRecordInput` uses), or return `nothing` when `lhsExp` is not a
 plain record cref. A record copy `lhs := rhs` becomes per-field assignments; a
-record-valued call `lhs := f(args...)` scatters the flat-tuple return.
+record-valued call `lhs := f(args...)`, a record literal and an if-expression choosing
+between records scatter their field tuple (a one-field record is its field). Any
+other value of a record is refused.
 """
 function _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp)::Union{Nothing, Expr}
   local lhs = _recordCrefFields(lhsExp)
@@ -685,11 +723,55 @@ function _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp)::Union{Nothing, Exp
   if rhsBase !== nothing
     return Expr(:block,
       Expr[:($(_flatFieldSymbol(lhsBase, f)) = $(_flatFieldSymbol(rhsBase, f))) for f in fieldNames]...)
-  elseif _isFunctionCall(rhsExp)
-    local targets = Expr(:tuple, [_flatFieldSymbol(lhsBase, f) for f in fieldNames]...)
-    return Expr(:(=), targets, expToJuliaExpAlg(rhsExp))
+  elseif _isFunctionCall(rhsExp) ||
+         ((rhsExp isa DAE.IFEXP || rhsExp isa DAE.RECORD) && _hasNoRecordFields(lhsExp.ty))
+    #= A record literal, or an if-expression choosing between records, evaluates to the
+       fields as a tuple too (MSL MixtureGasNasa setState_pTX: `state := if ... then
+       ThermodynamicState(...) else ...` went to an unused local, and the fields stayed 0). =#
+    local targets = [_flatFieldSymbol(lhsBase, f) for f in fieldNames]
+    local rhs = _recordTupleExpr(rhsExp)
+    return length(targets) == 1 ? Expr(:(=), targets[1], rhs) : Expr(:(=), Expr(:tuple, targets...), rhs)
   end
-  return nothing
+  #= Assigned whole, the record's name would be bound and its fields, which
+     are what is read, kept: an element of a tuple, a field or an element of
+     another record, a literal with record fields. =#
+  CodeGeneration.unsupported("a record assignment from this expression", rhsExp)
+end
+
+#= A record value as its field tuple: a record variable's flattened fields (it has no
+   tuple of its own), an if-expression's branches each so, anything else as it lowers. =#
+function _recordTupleExpr(@nospecialize(exp::DAE.Exp))
+  local rec = _recordCrefFields(exp)
+  rec === nothing || return Expr(:tuple, [_flatFieldSymbol(rec[1], f) for f in rec[2]]...)
+  if exp isa DAE.IFEXP
+    return :(if $(expToJuliaExpAlg(exp.expCond)) != 0
+               $(_recordTupleExpr(exp.expThen))
+             else
+               $(_recordTupleExpr(exp.expElse))
+             end)
+  end
+  return expToJuliaExpAlg(exp)
+end
+
+#= The types of a record type's fields, in declaration order; empty for another type. =#
+function _recordFieldTypes(@nospecialize(ty::DAE.Type))::Vector{DAE.Type}
+  local types = DAE.Type[]
+  @match ty begin
+    DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _) => begin
+      for field in varLst
+        push!(types, field.ty)
+      end
+    end
+    _ => nothing
+  end
+  return types
+end
+
+#= Whether no field of record type `ty` is a record: its value's tuple is then field for
+   field (a nested record's fields are flattened in its place). =#
+function _hasNoRecordFields(@nospecialize(ty::DAE.Type))::Bool
+  local types = _recordFieldTypes(ty)
+  return !isempty(types) && all(t -> isempty(_recordFieldNames(t)), types)
 end
 
 """
@@ -713,17 +795,30 @@ function _isFunctionCall(exp::DAE.Exp)::Bool
 end
 
 """
-    _algCallArgs(argExps::List) -> Vector{Any}
+    _algCallArgs(argExps::List; builtin = false) -> Vector{Any}
 
 Expand function-call arguments, replacing each record-typed cref with its flattened
-`<base>_<field>` field symbols so a record argument is passed as its scalar fields,
-matching the callee's flattened parameter list (`flattenRecordInput`).
+`<base>_<field>` field symbols and splatting any other record value, so a record argument
+is passed as its scalar fields, matching the callee's flattened parameter list
+(`flattenRecordInput`). A builtin's arguments stay whole.
 """
-function _algCallArgs(argExps::List)::Vector{Any}
+function _algCallArgs(argExps::List; builtin::Bool = false)::Vector{Any}
   local out = Any[]
   for arg in argExps
+    #= A record without fields (MSL Media's f_nonlinear_Data()) is no argument:
+       the callee's flattened inputs have none for it. Passed as an empty value,
+       every later argument was shifted (a MethodError of the wrapper's arity). =#
+    (!builtin && _isEmptyRecordValue(arg)) && continue
     local rec = _recordCrefFields(arg)
-    if rec === nothing
+    local valueTy = rec === nothing && !builtin ? _recordValueType(arg) : nothing
+    #= A builtin takes a record whole; a one-field record is returned bare. =#
+    if valueTy !== nothing && length(_recordFieldNames(valueTy)) > 1
+      #= A record that is not a named variable (a call's result, an element of a record
+         array) evaluates to its fields as a tuple: splatted, as the callee takes a record
+         input field by field (the MSL ReferenceAir's `rho_props_pT(p, T,
+         airBaseProp_pT(p, T))`, the ideal gases' `h_T(data[i], T, ...)`). =#
+      push!(out, Expr(:..., expToJuliaExpAlg(arg)))
+    elseif rec === nothing
       push!(out, expToJuliaExpAlg(arg))
     else
       for fieldName in rec[2]
@@ -734,17 +829,72 @@ function _algCallArgs(argExps::List)::Vector{Any}
   return out
 end
 
+function _isEmptyRecordValue(@nospecialize(exp::DAE.Exp))::Bool
+  local ty = @match exp begin
+    DAE.CALL(attr = attr) => attr.ty
+    DAE.RECORD(ty = ty) => ty
+    DAE.CREF(_, ty) => ty
+    _ => nothing
+  end
+  return ty isa DAE.T_COMPLEX && ty.complexClassType isa DAE.ClassInf.RECORD && isempty(ty.varLst)
+end
+
+#= The record type of `exp` where it is not a named record variable: a call returning a
+   record, a record literal (a constant the frontend folded: the ideal gas `data`), or one
+   element of an array of records (a scalar subscript per dimension); nothing otherwise. Such
+   an expression evaluates to the record's fields as a tuple. =#
+function _recordValueType(@nospecialize(exp::DAE.Exp))
+  local ty = @match exp begin
+    DAE.CALL(attr = attr) => attr.ty
+    DAE.RECORD(ty = ty) => ty
+    DAE.CREF(_, ty) => ty
+    DAE.ASUB(exp = DAE.ARRAY(ty = ty), sub = subs) => _elementTypeAt(ty, subs)
+    DAE.ASUB(exp = DAE.CREF(_, ty), sub = subs) => _elementTypeAt(ty, subs)
+    _ => nothing
+  end
+  return ty !== nothing && !isempty(_recordFieldNames(ty)) ? ty : nothing
+end
+
+#= The element type of array type `ty` subscripted by `subs`, when there is one scalar
+   subscript per dimension; nothing for a slice or a partial subscript. =#
+function _elementTypeAt(@nospecialize(ty::DAE.Type), subs::List)
+  local nDims = 0
+  local t = ty
+  while t isa DAE.T_ARRAY
+    nDims += length(collect(t.dims))
+    t = t.ty
+  end
+  local scalar = all(subs) do sub
+    sub isa DAE.INDEX && !(sub.exp isa DAE.RANGE || sub.exp isa DAE.ARRAY)
+  end
+  return scalar && length(collect(subs)) == nDims ? t : nothing
+end
+
+#= The position of field `ix` in the tuple a record-valued `exp` evaluates to, where every
+   field up to it is a scalar: a function returns a nested record's fields flattened in its
+   place, so a later field's position is not its index. -1 (read it by name) otherwise. =#
+function _positionalFieldIndex(@nospecialize(exp::DAE.Exp), ix::Integer)::Int
+  local ty = _recordValueType(exp)
+  ty === nothing && return -1
+  local fieldTypes = _recordFieldTypes(ty)
+  1 <= ix <= length(fieldTypes) || return -1
+  any(k -> !isempty(_recordFieldNames(fieldTypes[k])), 1:ix) && return -1
+  return ix
+end
+
 """
     _recordCrefFields(exp::DAE.Exp) -> Union{Nothing,Tuple{String,Vector{String}}}
 
-`(baseIdent, fieldNames)` for a subscript-free record-typed simple CREF, else `nothing`.
+`(baseIdent, fieldNames)` for a subscript-free simple CREF of a record or an array of records
+(whose fields are then arrays), else `nothing`.
 """
 function _recordCrefFields(exp::DAE.Exp)::Union{Nothing, Tuple{String, Vector{String}}}
   local base = _plainCrefName(exp)
   base === nothing && return nothing
   return @match exp begin
     DAE.CREF(_, ty) => begin
-      local fieldNames = _recordFieldNames(ty)
+      #= A whole array of records too: its fields are arrays (y_re, y_im). =#
+      local fieldNames = _recordFieldNames(ty isa DAE.T_ARRAY ? _arrayElementType(ty) : ty)
       isempty(fieldNames) ? nothing : (base, fieldNames)
     end
     _ => nothing
@@ -819,6 +969,9 @@ function _constantIntegerIndex(subscript::DAE.Subscript)::Union{Nothing, Int}
   end
 end
 
+#= The element type of a (nested) array type. =#
+_arrayElementType(@nospecialize(ty::DAE.Type)) = ty isa DAE.T_ARRAY ? _arrayElementType(ty.ty) : ty
+
 """
     _recordFieldNames(ty::DAE.Type) -> Vector{String}
 
@@ -854,26 +1007,48 @@ function _plainCrefName(exp::DAE.Exp)::Union{String, Nothing}
   end
 end
 
+#= `(a, , b) := f(...)` as a Julia destructuring `(a, _, b) = f(...)`. A
+   generated function returns a record output as its fields in place
+   (generateIOL), so a record target takes them into its flattened field
+   symbols and an omitted record output skips one `_` per field. A target that
+   is no plain name (`v[2]`, `eigenvalues[:, 1]`, a record's field) takes its
+   element through a temporary and an ordinary assignment. =#
 function generateStatement(stmt::DAE.STMT_TUPLE_ASSIGN)
-  #= Emit a proper Julia tuple destructuring `(a, _, b) = rhs`.
-     The old code did `Symbol(string(expExpLst))`, producing a single
-     identifier like `var"(a, _, b)"` that is never actually bound —
-     silently wrong on multi-return function calls. Mapping each CREF
-     to its identifier gives a real tuple-assign. =#
-  local lhsSyms = map(_crefToTupleTarget, collect(stmt.expExpLst))
-  local rhs = expToJuliaExpAlg(stmt.exp)
-  return Expr(:(=), Expr(:tuple, lhsSyms...), rhs)
+  local outputTypes = stmt.type_ isa DAE.T_TUPLE ? collect(stmt.type_.types) : nothing
+  outputTypes === nothing || length(outputTypes) >= listLength(stmt.expExpLst) ||
+    CodeGeneration.unsupported("a tuple assignment with more targets than outputs", stmt)
+  local targets = Any[]
+  local stores = Expr[]
+  for (k, target) in enumerate(stmt.expExpLst)
+    local fields = outputTypes === nothing ? String[] : _recordFieldNames(outputTypes[k])
+    if !isempty(fields)
+      _hasNoRecordFields(outputTypes[k]) ||
+        CodeGeneration.unsupported("a tuple assignment of a record output with record fields", stmt)
+      append!(targets, _recordTupleTargets(target, fields, stmt))
+    elseif target isa DAE.CREF && target.componentRef isa DAE.WILD
+      push!(targets, :_)
+    elseif !(target isa DAE.CREF) || _recordCrefFields(target) !== nothing
+      CodeGeneration.unsupported("this target of a tuple assignment", target)
+    elseif _plainCrefName(target) !== nothing
+      push!(targets, Symbol(_plainCrefName(target)))
+    else
+      local tmp = Symbol("#tupleTarget", k)  #= no Modelica name has a '#' =#
+      push!(targets, tmp)
+      push!(stores, _algAssignment(target, Expr(:block, tmp)))
+    end
+  end
+  local assignment = Expr(:(=), Expr(:tuple, targets...), expToJuliaExpAlg(stmt.exp))
+  return isempty(stores) ? assignment : Expr(:block, assignment, stores...)
 end
 
-#= Translate a single target expression inside a tuple-assign LHS to a
-   Julia symbol suitable for `Expr(:tuple, …)`. =#
-Base.@nospecializeinfer function _crefToTupleTarget(@nospecialize(exp::DAE.Exp))
-  @match exp begin
-    DAE.CREF(DAE.WILD(), _) => :_
-    DAE.CREF(DAE.CREF_IDENT(ident, _, _), _) => Symbol(ident)
-    DAE.CREF(cr, _) => Symbol(SimulationCode.string(cr))
-    _ => Symbol(string(exp))
-  end
+#= The targets of a record output's fields: an omitted output's `_`s, a plain
+   record name's flattened field symbols. =#
+function _recordTupleTargets(@nospecialize(target::DAE.Exp), fields::Vector{String}, stmt)::Vector{Symbol}
+  target isa DAE.CREF && target.componentRef isa DAE.WILD && return fill(:_, length(fields))
+  local rec = _recordCrefFields(target)
+  (rec === nothing || rec[2] != fields) &&
+    CodeGeneration.unsupported("this record target of a tuple assignment", stmt)
+  return Symbol[_flatFieldSymbol(rec[1], f) for f in fields]
 end
 
 function generateStatement(stmt::DAE.STMT_ASSIGN_ARR)
@@ -1005,24 +1180,32 @@ function generateStatement(stmt::DAE.ELSEIF)::Expr
   end
 end
 
+#= AssertionLevel = enumeration(warning, error): warning is literal 1, so the
+   level is matched by name. Any other level expression means error. =#
+function isWarningAssertionLevel(@nospecialize(level))::Bool
+  level isa DAE.ENUM_LITERAL || return false
+  local p = level.name
+  while !(p isa Absyn.IDENT)
+    p = p.path                    # QUALIFIED(name, path), FULLYQUALIFIED(path)
+  end
+  return p.name == "warning"
+end
+
 """
   Generates Julia code for Modelica assert statements.
-  If level is error (index 1), throws an error when condition is false.
-  If level is warning (index 2), prints a warning when condition is false.
+  AssertionLevel.error (the default) throws an error when the condition is false,
+  AssertionLevel.warning prints a warning.
 """
 function generateStatement(stmt::DAE.STMT_ASSERT)::Expr
   local condExpr = expToJuliaExpAlg(stmt.cond)
   local msgExpr = expToJuliaExpAlg(stmt.msg)
-  #= Check assertion level: error (1) or warning (2) =#
-  local level = @match stmt.level begin
-    DAE.ENUM_LITERAL(_, idx) => idx
-    _ => 1  #= Default to error =#
-  end
-  if level == 1
-    #= AssertionLevel.error - throw an error =#
+  if !isWarningAssertionLevel(stmt.level)
+    #= AssertionLevel.error - throw an error. Base.error: a Modelica local may be
+       called `error` (MSL Water IF97's `Integer error` flag of the inverse
+       iterations: "objects of type Int64 are not callable"). =#
     quote
       if !($condExpr)
-        error($msgExpr)
+        Base.error($msgExpr)
       end
     end
   else
@@ -1035,12 +1218,12 @@ function generateStatement(stmt::DAE.STMT_ASSERT)::Expr
   end
 end
 
+#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp`. =#
 """
   Maps a DAE expression to a Julia expression for algorithmic code in Modelica Functions(!).
   Since functions do not use the model HT the original name is preserved for algorithmic generation.
 For algorithmic code outside Modelica functions do not call this function.
 """
-#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp` (Phase 4b API). =#
 Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::SimulationCode.Exp))::Expr
   return expToJuliaExpAlg(SimulationCode.toDAEExp(exp))
 end
@@ -1184,6 +1367,10 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
            held value; unwrap to the argument, as the MTK expression path does. =#
         expToJuliaExpAlg(first(explst))
       end
+      #= An enumeration value is an Integer here: String takes the literal names
+         from the argument's type. =#
+      DAE.CALL(path = Absyn.IDENT("String"), expLst = explst, attr = attr) where attr.builtin =>
+        modelicaStringCall(collect(explst), expToJuliaExpAlg)
       DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst, attr = attr)  => begin
         local funcSym = Symbol(tmpStr)
         #= Use Base.invokelatest for non-builtin functions to avoid world-age issues =#
@@ -1198,7 +1385,7 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         if !(attr.builtin)
           push!(expr.args, funcSym)
         end
-        append!(expr.args, _algCallArgs(explst))
+        append!(expr.args, _algCallArgs(explst; builtin = attr.builtin))
         quote
           $(expr)
         end
@@ -1224,7 +1411,7 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         if utilRuntimeName === nothing && !(attr.builtin)
           push!(expr.args, funcSym)
         end
-        append!(expr.args, _algCallArgs(expLst))
+        append!(expr.args, _algCallArgs(expLst; builtin = attr.builtin))
         expr
       end
       DAE.CAST(ty, exp)  => begin
@@ -1234,7 +1421,10 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
           DAE.T_REAL(__) => :(float($innerExpr))
           DAE.T_INTEGER(__) => :(Int(round($innerExpr)))
           DAE.T_BOOL(__) => :(Bool($innerExpr))
-          _ => innerExpr  #= For other types, just return the inner expression =#
+          #= The frontend casts to Real only (typeCast): an Integer array to a
+             Real one. Left uncast, `y := m; y[1] := 1.5` failed (InexactError). =#
+          DAE.T_ARRAY(__) where _arrayElementType(ty) isa DAE.T_REAL => :(float.($innerExpr))
+          _ => CodeGeneration.unsupported("a cast to $(ty)", exp)
         end
       end
       DAE.ARRAY(ty, scalar, expl) => begin
@@ -1312,18 +1502,22 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         for iter in iterators
           @match iter begin
             DAE.REDUCTIONITER(id, rangeExp, guardExp, _) => begin
+              guardExp === nothing || CodeGeneration.unsupported("a reduction iterator with a guard", exp)
               local rangeExpr = expToJuliaExpAlg(rangeExp)
               push!(iterExprs, Expr(:(=), Symbol(id), rangeExpr))
             end
           end
         end
         @match reductionInfo.path begin
-          Absyn.IDENT("array") => Expr(:comprehension, bodyExpr, iterExprs...)
+          #= {e for i in u, j in v}: the last iterator is the first dimension
+             (MLS 10.4.1.2, size [size(v), size(u)]); a Julia comprehension's
+             first iterator is. It came out transposed. =#
+          Absyn.IDENT("array") => Expr(:comprehension, bodyExpr, reverse(iterExprs)...)
           Absyn.IDENT("sum") => :(sum($(Expr(:generator, bodyExpr, iterExprs...))))
           Absyn.IDENT("product") => :(prod($(Expr(:generator, bodyExpr, iterExprs...))))
           Absyn.IDENT("min") => :(minimum($(Expr(:generator, bodyExpr, iterExprs...))))
           Absyn.IDENT("max") => :(maximum($(Expr(:generator, bodyExpr, iterExprs...))))
-          _ => Expr(:comprehension, bodyExpr, iterExprs...)
+          _ => CodeGeneration.unsupported("the reduction $(reductionInfo.path)", exp)
         end
       end
       DAE.TSUB(tupleExp, ix, _) => begin
@@ -1337,19 +1531,19 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
          code never wraps values in Symbolics.Num, so we can use the same
          `_recordFieldRe` / `_recordFieldIm` helpers without a separate
          symbolic path. =#
-      DAE.RSUB(exp = innerExp, fieldName = fname) => begin
+      DAE.RSUB(exp = innerExp, ix = ix, fieldName = fname) => begin
         local innerJL = expToJuliaExpAlg(innerExp)
         if fname == "re"
           :(OMBackend.CodeGeneration._recordFieldRe($innerJL))
         elseif fname == "im"
           :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
         else
-          :(getproperty($innerJL, $(QuoteNode(Symbol(fname)))))
+          :(OMBackend.CodeGeneration._recordField($innerJL, $(QuoteNode(Symbol(fname))), $(_positionalFieldIndex(innerExp, ix))))
         end
       end
       DAE.BOX(exp = innerExp) => expToJuliaExpAlg(innerExp)
       DAE.UNBOX(exp = innerExp) => expToJuliaExpAlg(innerExp)
-      _ =>  throw(ErrorException("$exp not yet supported"))
+      _ => CodeGeneration.unsupported("expression", exp)
     end
   end
   return expr

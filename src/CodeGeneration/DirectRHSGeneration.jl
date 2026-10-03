@@ -61,17 +61,19 @@ symbolic Jacobian) are wrapped in `FunctionWrappers` so the resulting problem
 type is constant across models; the solver then compiles its stepping / Newton
 / linear-solve machinery once instead of once per distinct model. `u0`, `p_vec`
 and `t0` supply only the argument *types* the wrappers specialize on; their
-values are immaterial. The mass matrix, Jacobian and `sys` are attached to the
-function we build, so type erasure does not drop them.
+values are immaterial. The mass matrix, Jacobian, time derivative `tgradFunc`
+and `sys` are attached to the function we build, so type erasure does not drop
+them.
 """
 function _buildDirectODEFunction(rhsFunc, u0, p_vec, t0;
                                  mass_matrix=nothing, sys=nothing,
-                                 jacFunc=nothing, jacProto=nothing)
+                                 jacFunc=nothing, jacProto=nothing, tgradFunc=nothing)
   if !OMBackend.DIRECT_RHS_TYPE_ERASE[]
     local jacKw = jacFunc === nothing ? NamedTuple() : (; jac=jacFunc, jac_prototype=jacProto)
+    local tgradKw = tgradFunc === nothing ? NamedTuple() : (; tgrad=tgradFunc)
     return mass_matrix === nothing ?
-      ModelingToolkit.ODEFunction{true}(rhsFunc; sys=sys, jacKw...) :
-      ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mass_matrix, sys=sys, jacKw...)
+      ModelingToolkit.ODEFunction{true}(rhsFunc; sys=sys, jacKw..., tgradKw...) :
+      ModelingToolkit.ODEFunction{true}(rhsFunc; mass_matrix=mass_matrix, sys=sys, jacKw..., tgradKw...)
   end
   local FW = ModelingToolkit.SciMLBase.FunctionWrapperSpecialize
   #= Multi-variant wrapper (Float64 + ForwardDiff Dual signatures) so autodiff
@@ -81,10 +83,21 @@ function _buildDirectODEFunction(rhsFunc, u0, p_vec, t0;
   local erasedKw = jacFunc === nothing ? NamedTuple() :
     (; jac = DiffEqBase.wrapfun_jac_iip(jacFunc, (jacProto, u0, p_vec, t0)),
        jac_prototype = jacProto)
+  #= Every direct-RHS problem has a tgrad (_buildTimeDerivative): one erased type. =#
+  tgradFunc === nothing ||
+    (erasedKw = (; erasedKw..., tgrad = DiffEqBase.wrapfun_jac_iip(tgradFunc, (u0, u0, p_vec, t0))))
   return mass_matrix === nothing ?
     ModelingToolkit.ODEFunction{true, FW}(wrappedRHS; sys=sys, erasedKw...) :
     ModelingToolkit.ODEFunction{true, FW}(wrappedRHS; mass_matrix=mass_matrix, sys=sys, erasedKw...)
 end
+
+#= Re-initialization per problem (keyed by its reduced system, `prob.f.sys`,
+   one per build): parameter vector -> consistent initial state, the vector's
+   initialization-defined parameters assigned. See buildDirectRHSProblem. It
+   was keyed by the generated RHS, which two models of the same equations
+   share (one RuntimeGeneratedFunction per code): the last build's answered
+   for both. =#
+const DAE_REINIT = IdDict{Any, Function}()
 
 """
     buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
@@ -104,7 +117,15 @@ Returns an `ODEProblem` ready for `solve()`.
 """
 function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
                                allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
-                               preMem=nothing)
+                               liftedDiscretes=String[],
+                               freeParameters=String[],
+                               assignedParameters=String[],
+                               userPins=String[],
+                               discreteVariables=String[],
+                               tunableParameters=String[],
+                               initRelations=Any[],
+                               initClusters=Any[],
+                               discreteStarts=Dict{String, Float64}())
   local states = ModelingToolkit.unknowns(reducedSystem)
   local params = ModelingToolkit.parameters(reducedSystem)
   # Use full_equations to inline observed variable definitions.
@@ -136,17 +157,82 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
           "this is typically a residual issue from MTK structural_simplify.")
   end
 
-  # Handle empty systems (0 unknowns after structural_simplify).
-  # Use a dummy 1-element state so the ODE solver does not reject an empty range.
+  # Resolve parameter values first: _buildStateVector substitutes symbolic
+  # parameter references in initial conditions, and an empty system needs
+  # only them.
+  local resolvedParams = _resolveParamValues(pars; used = Set{String}(string.(params)))
+  #= Parameters an initialization equation defines (fixed = false): assigned
+     from u at the initial state (in the DAE init solve, at each evaluation).
+     A row may read another assigned parameter: evaluating again settles a
+     chain. =#
+  local paramAssign = _initialParameterAssignments(reducedSystem, states, params, iv;
+                                                   assignable = Set{String}(assignedParameters))
+  local assignedNames = paramAssign === nothing ? OrderedSet{String}() :
+    OrderedSet{String}(string(params[k]) for k in last(paramAssign))
+  #= Real parameters without a value that no initialization equation assigns
+     (FREE_PARAMETERS: fixed = false; the MSL InitSpringConstant's spring.c,
+     which a fixed rev.a = 0 determines): unknowns of the DAE init solve. =#
+  local freeIdx = Int[k for (k, p) in enumerate(params)
+                      if string(p) in freeParameters && !(string(p) in assignedNames)]
+  #= Parameters bound to an assigned or free one (spring.spring.c = spring.c)
+     follow it; _buildParamVector resolved them from its start value. =#
+  local dependents = _parameterDependents(pars, params,
+                                          union(assignedNames, OrderedSet{String}(string(params[k]) for k in freeIdx));
+                                          resolvedParams=resolvedParams)
+  isempty(setdiff(freeParameters, string.(params))) ||
+    @debug "DirectRHS: free parameters not among the system's: $(setdiff(freeParameters, string.(params)))"
+  local unknownParamNames = union(assignedNames, OrderedSet{String}(string(params[k]) for k in freeIdx),
+                                  dependents === nothing ? OrderedSet{String}() : dependents[3])
+  local follow! = _dependentsWriter(dependents)
+  local assignParams! = paramAssign === nothing ? nothing : let (pF, pIdxs) = paramAssign
+    (pv, u, t) -> begin
+      for _ in 1:length(pIdxs)
+        local vals = pF(u, pv, t)
+        local changed = false
+        for (i, k) in enumerate(pIdxs)
+          local v = Float64(vals[i])
+          changed |= !isequal(pv[k], v)
+          pv[k] = v
+        end
+        follow! === nothing || follow!(pv)
+        changed || break
+      end
+      nothing
+    end
+  end
+
+  #= An empty system (0 unknowns after structural_simplify): a dummy 1-element
+     state, so the ODE solver does not reject an empty range, with the system
+     and its parameter values: its observed variables are the whole result (MSL
+     Media Inverse_sine, IdealGasH2O, Utilities' readRealParameterModel), and
+     without `sys` no signal could be read from the solution. Its events and
+     initial parameter assignments as for any system; a free parameter is an
+     unknown of the init solve, which it does not run. =#
   if nStates == 0
     @debug "DirectRHS: empty system (0 unknowns), building trivial dummy problem"
+    isempty(freeIdx) || OMBackend.unsupported("free parameters (fixed = false) of a system without states",
+                                              join((string(params[k]) for k in freeIdx), ", "))
     local emptyRHS = (du, u, p, t) -> (du[1] = 0.0)
-    local f0 = ModelingToolkit.ODEFunction{true}(emptyRHS)
-    return ModelingToolkit.ODEProblem{true}(f0, [0.0], tspan, Float64[]; callback=callbacks)
+    local f0 = ModelingToolkit.ODEFunction{true}(emptyRHS; sys = reducedSystem)
+    local p0 = _buildParamVector(params, pars; resolvedParams=resolvedParams)
+    if assignParams! !== nothing
+      assignParams!(p0, Float64[], tspan[1])
+      DAE_REINIT[reducedSystem] = pv -> (assignParams!(pv, Float64[], tspan[1]); [0.0])
+    end
+    return ModelingToolkit.ODEProblem{true}(f0, [0.0], tspan, p0;
+                                            callback=_extractAndMergeEventCallbacks(reducedSystem, callbacks))
   end
 
   # 1. Build the RHS function expression from symbolic equations
   local rhs_list = [eq.rhs for eq in eqs]
+  #= A model with homotopy(): the simulation's RHS at λ = 1, where the blend
+     is the actual expression (the simplified one folds away); only the
+     initialization's (`rhsInitFunc`) reads λ. The simplified expression was
+     evaluated at every step otherwise (an assert in it stopped a run). =#
+  local homotopyIdx = findfirst(p -> string(p) == string(HOMOTOPY_LAMBDA), params)
+  local rhs_init = rhs_list
+  homotopyIdx === nothing ||
+    (rhs_list = [Symbolics.substitute(r, Dict(params[homotopyIdx] => 1.0)) for r in rhs_list])
   local f_ip_expr = _buildRHSExpression(rhs_list, states, params, iv)
 
   # Dump the actual generated RHS expression — see MTKDump.
@@ -154,39 +240,46 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
 
   # 2. Create world-age-safe function via RuntimeGeneratedFunction
   local rhsFunc = _exprToRTGFunction(f_ip_expr)
+  local rhsInitFunc = homotopyIdx === nothing ? rhsFunc :
+    _exprToRTGFunction(_buildRHSExpression(rhs_init, states, params, iv))
 
   # 3. Build u0 and parameter vectors in the correct ordering.
-  #    Resolve parameter values first so _buildStateVector can substitute
-  #    symbolic parameter references in initial conditions.
-  local resolvedParams = _resolveParamValues(pars)
+  #= The initialization constraints read those as unknowns, not as the values
+     resolved from their start values: `x = k` must hold for the solved k. =#
+  local initResolved = isempty(unknownParamNames) ? resolvedParams :
+    Dict{String, Float64}(k => v for (k, v) in resolvedParams if !(k in unknownParamNames))
   # Extract guesses from the reduced system. These are properly mapped to
   # post-simplification unknowns and provide Modelica start values for variables
   # that splitInitialValues could not map (pre-simplification names do not match).
-  local systemGuesses = try
-    ModelingToolkit.guesses(reducedSystem)
-  catch
-    Dict()
-  end
+  local systemGuesses = ModelingToolkit.guesses(reducedSystem)
+  #= Two initialization values for one variable are refused, except for a
+     discrete's (its fixed start is pre(v) = start). =#
+  local valuesMayDiffer = union(Set{String}(discreteVariables), Set{String}(liftedDiscretes))
   local (hardInitialValues, initEqPinKeys) = _collectHardInitializationValues(
-    reducedSystem, finalInitialValues; resolvedParams=resolvedParams)
-  local observedEquations = try
-    ModelingToolkit.observed(reducedSystem)
-  catch
-    Symbolics.Equation[]
-  end
+    reducedSystem, finalInitialValues; resolvedParams=initResolved, valuesMayDiffer=valuesMayDiffer)
+  local observedEquations = ModelingToolkit.observed(reducedSystem)
   local u0 = _buildStateVector(states, finalInitialValues; resolvedParams=resolvedParams,
                                 systemGuesses=systemGuesses,
                                 hardInitialValues=hardInitialValues,
                                 observedEquations=observedEquations)
   local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
+  #= A run with other tunable parameter values (DAE_REINIT, below). =#
+  local (resolvedAt, entryAt, followTunable!) =
+    _runEntry(reducedSystem; states, params, pars, finalInitialValues, systemGuesses, resolvedParams,
+              unknownParamNames, valuesMayDiffer, observedEquations, uStart = copy(u0), tunableParameters)
 
   @debug "DirectRHS: u0 has $(count(!iszero, u0))/$(nStates) nonzero, p has $(count(!iszero, p_vec))/$(nParams) nonzero"
+  OMBackend.envSwitch("OMBACKEND_INIT_TRACE") &&
+    println("[initu0] states ", states, "\n[initu0] hard starts ", finalInitialValues, "\n[initu0] guesses ", systemGuesses,
+            "\n[initu0] initialization equations ", ModelingToolkit.initialization_equations(reducedSystem),
+            "\n[initu0] u0 ", u0)
 
   #= Symbolic sparse Jacobian; nothing when not differentiable. Built after
      u0/p_vec so the generated function can be probed once: an unresolved
      symbolic derivative surfaces only when the function runs, not at build. =#
   local (jacFunc, jacProto) = _buildSparseJacobian(rhs_list, states, params, iv,
                                                    u0, p_vec, tspan[1])
+  local tgradFunc = _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, tspan[1])
 
   # 4. Extract event callbacks from the reduced system and merge with custom callbacks.
   #    Our structural_simplify wrapper uses split=false, so the compiled event
@@ -203,20 +296,36 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   #    names from integrator.f.sys (used by getStatesAsSymbols/getParametersAsSymbols).
   local massMatrix = ModelingToolkit.calculate_massmatrix(reducedSystem)
   local problem
-  if massMatrix isa LinearAlgebra.UniformScaling
+  #= A pure ODE with free parameters, with derivative initial equations, or
+     with ones whose value is not a number (`y = 2*x`), needs the init solve
+     too: M = I. Without it they were left out (u0 the start values). =#
+  if massMatrix isa LinearAlgebra.UniformScaling && isempty(freeIdx) &&
+     isempty(first(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=initResolved))) &&
+     !_hasSolvedInitializationRows(reducedSystem; resolvedParams=initResolved)
     @debug "DirectRHS: pure ODE (identity mass matrix)"
     local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
-                                      sys=reducedSystem, jacFunc=jacFunc, jacProto=jacProto)
+                                      sys=reducedSystem, jacFunc=jacFunc, jacProto=jacProto,
+                                      tgradFunc=tgradFunc)
+    assignParams! === nothing || assignParams!(p_vec, u0, tspan[1])
+    #= Other tunable parameter values may change the start values and the
+       parameters the initialization assigns. =#
+    DAE_REINIT[reducedSystem] = pv -> begin
+      followTunable!(pv)
+      local u = entryAt(resolvedAt(pv))
+      assignParams! === nothing || assignParams!(pv, u, tspan[1])
+      u
+    end
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   else
     @debug "DirectRHS: DAE with mass matrix"
-    local mm = collect(massMatrix)
+    local mm = massMatrix isa LinearAlgebra.UniformScaling ?
+      Matrix{Float64}(LinearAlgebra.I, nStates, nStates) : collect(massMatrix)
     #= A sparse Jacobian prototype needs a sparse mass matrix, otherwise the
        solver's W = M - gamma*J assembly densifies or mismatches. =#
     local mmForF = jacFunc === nothing ? mm : Symbolics.SparseArrays.sparse(mm)
     local f = _buildDirectODEFunction(rhsFunc, u0, p_vec, tspan[1];
                                       mass_matrix=mmForF, sys=reducedSystem,
-                                      jacFunc=jacFunc, jacProto=jacProto)
+                                      jacFunc=jacFunc, jacProto=jacProto, tgradFunc=tgradFunc)
     #= Pinned indices: vars whose u0 came from a fixed=true Modelica init eq
        (after splitInitialValues). The DAE init solver must NOT modify these,
        otherwise an algebraic var pinned by `start=1, fixed=true` (e.g.
@@ -228,11 +337,11 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        starts and must survive the free phases of the init solve. The sidecar
        only knows splitInitialValues-level keys, so the literal init-eq keys
        are unioned in here. Lifted-discrete states are excluded everywhere:
-       their initialization is owned by the t0 initialize affects, and pinning
+       the discrete clusters set them at the start (their start bodies), and pinning
        them couples Newton to relation-kink defining rows it cannot satisfy. =#
-    local discreteNames = preMem === nothing ? OrderedSet{String}() :
-                          OrderedSet{String}(string(k) for k in keys(preMem))
-    local isDiscreteKey = k -> replace(k, "(t)" => "") in discreteNames
+    local discreteNames = OrderedSet{String}(liftedDiscretes)
+    #= Plain names: an array element prints as `var"off[2]"(t)`. =#
+    local isDiscreteKey = k -> _plainVariableName(k) in discreteNames
     local pinnedKeyStrSet = OrderedSet{String}(
       k for k in union(explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues),
                        initEqPinKeys)
@@ -245,87 +354,329 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local discretePinnedIdx = Int[i for (i, st) in enumerate(states)
                                   if isDiscreteKey(string(st)) && string(st) in initEqPinKeys]
     local derivativeInitTargets = _derivativeInitializationTargets(
-      reducedSystem, states; resolvedParams=resolvedParams)
-    local eqLabels = try
-      ModelingToolkit.equations(reducedSystem)
-    catch
-      nothing
-    end
+      reducedSystem, states; resolvedParams=initResolved)
+    local eqLabels = ModelingToolkit.equations(reducedSystem)
     #= Signal-valued initialization equations become extra residual rows of
        the init solve. Validate the generated evaluator once on the entry
        guesses; a throwing or non-finite evaluator must not poison Newton. =#
     local symInit = _symbolicInitializationResiduals(reducedSystem, states, params,
                                                      ModelingToolkit.get_iv(reducedSystem), mm;
-                                                     resolvedParams=resolvedParams,
-                                                     excludeNames=discreteNames)
+                                                     resolvedParams=initResolved,
+                                                     excludeNames=union(discreteNames, assignedNames))
     local extraResiduals = nothing
-    if symInit !== nothing
-      local (gF, dIdxs, mmS) = symInit
-      local candidate = (du, u) -> begin
-        local g = gF(u, p_vec, 0.0)
+    #= The residual rows for parameter values `pv` (a re-initialization for
+       other tunable parameter values evaluates them at those). =#
+    local symRowsAt = symInit === nothing ? nothing : let (gF, dIdxs, mmS) = symInit
+      pv -> (du, u) -> begin
+        local g = gF(u, pv, 0.0)
         Float64[dIdxs[i] == 0 ? Float64(g[i]) : du[dIdxs[i]] - mmS[i] * Float64(g[i])
                 for i in 1:length(dIdxs)]
       end
-      local probeOk = try
-        local duProbe = similar(u0)
-        rhsFunc(duProbe, u0, p_vec, 0.0)
-        all(isfinite, candidate(duProbe, u0))
-      catch
-        false
-      end
-      if probeOk
-        extraResiduals = candidate
-        @debug "DirectRHS: enforcing $(length(dIdxs)) symbolic initialization residual rows"
-      else
-        @debug "DirectRHS: symbolic initialization residuals failed probe, skipping"
+    end
+    #= Literal derivative targets on algebraic unknowns (a zero mass-matrix
+       row): the init solve's derivative targets need a differential state, and
+       dropped them. The MSL AIMC_Initialize's `der(aimc.idq_sr) = zeros(2)`, its
+       steady state, on currents index reduction left algebraic. Their time
+       derivatives come from the differentiated algebraic rows. =#
+    local algIdx = Int[i for i in 1:size(mm, 1) if mm[i, i] == 0]
+    local difIdx = Int[i for i in 1:size(mm, 1) if mm[i, i] != 0]
+    local algDerTargets = Pair{Int, Float64}[t for t in derivativeInitTargets
+                                             if 1 <= t.first <= size(mm, 1) && mm[t.first, t.first] == 0]
+    #= Literal derivative targets on observed variables (not unknowns): the
+       MSL FundamentalWave AIMC_Initialize's der(aimc.airGap.V_msr.re) = 0.
+       der(w) = ∇w · u̇ + ∂w/∂t, u̇ the unknowns' derivatives (the algebraic
+       ones as above). =#
+    local obsDer = LinearAlgebra.isdiag(mm) ?
+      _observedDerivativeTargets(reducedSystem, states, params, ModelingToolkit.get_iv(reducedSystem);
+                                 resolvedParams=initResolved) : nothing
+    #= ż_a with the symbolic Jacobian only (finite differences of finite
+       differences are too noisy for the solve's tolerance, and n^2 RHS calls
+       per iteration), and a diagonal mass matrix (row i the equation of
+       unknown i). =#
+    local needAlg = !isempty(algDerTargets) ||
+      (obsDer !== nothing && any(j -> j <= obsDer[4] && mm[j, j] == 0, obsDer[3]))
+    #= They were left out with a warning (MSL Fluid MomentumBalanceFittings,
+       HeatExchangerSimulation, which then failed at the simulation anyway). =#
+    needAlg && (jacFunc === nothing || !LinearAlgebra.isdiag(mm)) &&
+      OMBackend.unsupported("derivative initial equations on algebraic or observed variables without a symbolic Jacobian or with a non-diagonal mass matrix",
+                            length(algDerTargets))
+    local ftAlg = needAlg ? _explicitTimeDerivative(rhs_list[algIdx], states, params, iv) : nothing
+    local derRowsAt = (isempty(algDerTargets) && obsDer === nothing) ? nothing : let
+      local pos = Dict(i => k for (k, i) in enumerate(algIdx))
+      local tPos = Int[pos[t.first] for t in algDerTargets]
+      local tVal = Float64[t.second for t in algDerTargets]
+      pv -> begin
+        local J = needAlg ? copy(jacProto) : nothing
+        local nz = obsDer === nothing ? Float64[] : zeros(length(obsDer[2]))
+        (du, u) -> begin
+          local zdot = needAlg ?
+            _algebraicDerivatives!(J, rhsFunc, jacFunc, ftAlg, mm, algIdx, difIdx, u, du, pv, 0.0) : Float64[]
+          local rows = zdot[tPos] .- tVal
+          obsDer === nothing && return rows
+          local (nzF, I, Jc, n, tgts) = obsDer
+          local udot = Float64[du[i] / (mm[i, i] == 0 ? 1.0 : mm[i, i]) for i in 1:n]
+          needAlg && (udot[algIdx] = zdot)
+          nzF(nz, u, pv, 0.0)
+          local obsRows = -copy(tgts)
+          for k in eachindex(I)
+            obsRows[I[k]] += nz[k] * (Jc[k] <= n ? udot[Jc[k]] : 1.0)
+          end
+          vcat(rows, obsRows)
+        end
       end
     end
-    u0 = _solveDAEInitialization!(u0, rhsFunc, p_vec, mm;
-                                  pinned=pinnedIdx,
-                                  derivative_targets=derivativeInitTargets,
-                                  eqLabels=eqLabels,
-                                  extra_residuals=extraResiduals,
-                                  discrete_pinned=discretePinnedIdx)
+    #= The kinds of rows are probed apart below: a part that fails at the
+       entry guesses is left out on its own. =#
+    local residualsAt = nothing
+    #= The init solve's RHS assigns the initialization-defined parameters
+       first. Their f may assert where the model's own equations only guard
+       (the MSL selectBranch asserts a regular loop position): at a trial point
+       (the entry guesses, a line-search step, a finite difference) that is a
+       non-finite residual the solve rejects, not a failed build. =#
+    local initRhs = assignParams! === nothing ? rhsInitFunc : (du, u, p, t) -> begin
+      try
+        assignParams!(p, u, t)
+      catch e
+        OMBackend._fallback(e, :buildDirectRHSProblem_5)
+        fill!(du, NaN)
+        return nothing
+      end
+      rhsInitFunc(du, u, p, t)
+    end
+    local probeRows = rowsAt -> try
+      local duProbe = similar(u0)
+      initRhs(duProbe, u0, p_vec, 0.0)
+      all(isfinite, rowsAt(p_vec)(duProbe, u0))
+    catch _e
+      OMBackend._fallback(_e, :buildDirectRHSProblem_6, impact = :result)
+      false
+    end
+    local parts = Any[]
+    for (label, rowsAt) in (("symbolic initialization", symRowsAt), ("derivative", derRowsAt))
+      rowsAt === nothing && continue
+      #= A part not finite at the entry guesses was left out with a warning
+         (MSL AIMC_withLosses, which then failed anyway). =#
+      probeRows(rowsAt) || OMBackend.unsupported("$(label) initial-equation rows not finite at the entry guesses", label)
+      push!(parts, rowsAt)
+    end
+    if !isempty(parts)
+      residualsAt = length(parts) == 1 ? parts[1] :
+        pv -> (local fs = [r(pv) for r in parts]; (du, u) -> reduce(vcat, [f(du, u) for f in fs]))
+      extraResiduals = residualsAt(p_vec)
+    end
+    local initDiscretes = _initialDiscreteClusters(initClusters, reducedSystem, discreteStarts)
+    local keptIdx = vcat(pinnedIdx, discretePinnedIdx)
+    #= The relations' literal values select the branches the initialization
+       holds for (MLS 8.6). Codegen takes them from the start attributes; at the
+       entry point they come from the start state's observed values, which the
+       initialization keeps where it can (the MSL V6 cylinder: `x > 0.933` with
+       x = 1 - s_rel/L was true from s_rel's start 0, while the crank's
+       kinematics puts x below it; the solve held the other branch's quartic far
+       outside its range). Non-finite values keep the compiled literal. =#
+    local initRels = _initialRelationLiterals(reducedSystem, params, initRelations)
+    initRels === nothing || initRels.eval!(p_vec, u0, 0.0; finiteOnly = true)
+    local uEntry = copy(u0)
+    local firstErr = nothing
+    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
+                                                              pinned=pinnedIdx,
+                                                              derivative_targets=derivativeInitTargets,
+                                                              eqLabels=eqLabels,
+                                                              extra_residuals=extraResiduals,
+                                                              discrete_pinned=discretePinnedIdx)
+    #= A model with homotopy(): from its simplified expressions to the actual ones. =#
+    local refreshRelations! = initRels === nothing ? nothing :
+      (uh, pvh) -> initRels.eval!(pvh, uh, 0.0; finiteOnly = true)
+    local solveInit = homotopyIdx === nothing ? solveFree :
+      (u, pv) -> _homotopyContinuation(solveFree, u, pv, homotopyIdx; refresh! = refreshRelations!)
+    u0 = try
+      solveInit(u0, p_vec)
+    catch e
+      OMBackend._fallback(e, :buildDirectRHSProblem_7, impact = :result)
+      #= The relations at the failed solve's last point: where one differs, the
+         initialization is solved again from the entry with it (the event
+         iteration of the initialization, before a solution exists). =#
+      local retried = initRels !== nothing && initRels.eval!(p_vec, u0, 0.0; finiteOnly = true) ?
+        try
+          solveInit(copy(uEntry), p_vec)
+        catch e2
+          OMBackend._fallback(e2, :buildDirectRHSProblem_8, impact = :result)
+          nothing
+        end : nothing
+      if retried !== nothing
+        retried
+      else
+        #= With discrete clusters the initialization is tried again from their start values. =#
+        initDiscretes === nothing && rethrow()
+        firstErr = e
+        copy(uEntry)
+      end
+    end
+    #= At the solved state, at the solve's time (_solveDAEInitialization! evaluates at 0.0). =#
+    assignParams! === nothing || assignParams!(p_vec, u0, 0.0)
+    #= The relations' literals at the solved state; solved again until they settle. =#
+    local useExtra = extraResiduals !== nothing
+    #= The derivative targets of the solve in progress: a run with other
+       tunable values sets its own (DAE_REINIT); its settles re-solved with
+       the compiled ones (`der(x) = p` with a relation that flips: x = 2, omc 5). =#
+    local targetsNow = Ref(derivativeInitTargets)
+    local resolveWith = (u, pv, ok) -> begin
+      local kept = u[keptIdx]
+      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
+                                              pinned=pinnedIdx,
+                                              derivative_targets=targetsNow[],
+                                              eqLabels=eqLabels,
+                                              extra_residuals=useExtra ? residualsAt(pv) : nothing,
+                                              discrete_pinned=discretePinnedIdx,
+                                              converged=ok)
+      #= A solve that relaxed the fixed starts is not a settled initialization. =#
+      isapprox(un[keptIdx], kept; rtol = 1e-8, atol = 1e-10) || (ok[] = false)
+      assignParams! === nothing || assignParams!(pv, un, 0.0)
+      un
+    end
+    #= The differential states other than the clusters' members. =#
+    local diffKept = Int[i for i in 1:size(mm, 1) if mm[i, i] != 0 &&
+                         !(initDiscretes !== nothing && any(c -> i in c.memberIndex, initDiscretes.clusters))]
+    #= The start path of the clusters solves from the entry: through the
+       continuation too (it took the actual expressions' root, -0.347 for
+       CubicRoot with an ideal diode beside it). =#
+    local startSolve = homotopyIdx === nothing ? resolveWith :
+      (u, pv, ok) -> _homotopyContinuation((a, b) -> resolveWith(a, b, Ref(true)), u, pv, homotopyIdx;
+                                           refresh! = refreshRelations!, finalSolve = (a, b) -> resolveWith(a, b, ok))
+    local (uSettled, settled) = _settleInitialDiscretes!(resolveWith, u0, uEntry, p_vec, initDiscretes, diffKept;
+                                                         startSolve = startSolve)
+    firstErr === nothing || settled || throw(firstErr)
+    u0 = uSettled
+    u0 = _settleInitialRelations!(resolveWith, u0, p_vec, initRels)
+    #= A user's fixed value (a fixed start, a literal initial equation) the
+       initialization moved: its phase that frees every variable found a root
+       only without it (`x(start = 1, fixed = true)` with an initial equation
+       that wants another x: x = 0.48, `v(fixed = true)` with `v = xa^2 + 1`:
+       v = 1). OpenModelica refuses such a model. =#
+    local userPinIdx = Int[]
+    if !isempty(userPins)
+      local userPinSet = Set{String}(userPins)
+      #= A pin whose value reads a parameter the initialization computes (free,
+         assigned by an initial equation, or bound to one of those) entered with
+         that parameter's start, a placeholder: not the user's value. =#
+      local pinValues = Dict{String, Any}(_plainVariableName(p.first) => p.second for p in finalInitialValues)
+      for eq in ModelingToolkit.initialization_equations(reducedSystem)
+        pinValues[_plainVariableName(eq.lhs)] = eq.rhs
+      end
+      local readsComputed = name -> begin
+        local val = get(pinValues, name, nothing)
+        val === nothing && return false
+        local vars = try
+          Symbolics.get_variables(Symbolics.unwrap(val))
+        catch e
+          OMBackend._fallback(e, :userPinReads)
+          return true
+        end
+        any(v -> _plainVariableName(v) in unknownParamNames, vars)
+      end
+      userPinIdx = Int[i for i in pinnedIdx if (local nm = _plainVariableName(states[i]); nm in userPinSet) &&
+                                          !readsComputed(nm)]
+    end
+    local checkUserPins = (u, uIn) -> begin
+      local moved = Int[i for i in userPinIdx if !isapprox(u[i], uIn[i]; rtol = 1e-8, atol = 1e-10)]
+      isempty(moved) ||
+        OMBackend.unsupported("fixed start values or initial equations that the initialization cannot hold",
+                              join(("$(states[i]) = $(u[i]) (fixed $(uIn[i]))" for i in first(moved, 5)), ", "))
+    end
+    checkUserPins(u0, uEntry)
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
+    #= The same initialization for other parameter values (tunable parameters,
+       OMBackend.withTunableParameters): a run with changed parameters needs
+       the consistent initial state for them, not the one solved here. It
+       starts from this one, which is close for nearby values. =#
+    local u0Solved = copy(u0)
+    local obsTargets = last(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=initResolved))
+    DAE_REINIT[reducedSystem] = pv -> begin
+      followTunable!(pv)
+      local r = resolvedAt(pv)
+      #= The entries the values change (a fixed start p, `x = p`) start from
+         their new entry values, the others from this solution. =#
+      local entry = entryAt(r)
+      local u = copy(u0Solved)
+      for i in eachindex(u)
+        entry[i] != uEntry[i] && (u[i] = entry[i])
+      end
+      #= The derivative targets read them too (`der(x) = p` kept x for p = 2).
+         Those on algebraic or observed variables are inside the residual
+         functions built above: a change there is refused. =#
+      local targets = derivativeInitTargets
+      if r !== nothing
+        targets = _derivativeInitializationTargets(reducedSystem, states; resolvedParams=r.initResolved)
+        (Pair{Int, Float64}[t for t in targets if 1 <= t.first <= size(mm, 1) && mm[t.first, t.first] == 0] == algDerTargets &&
+         last(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=r.initResolved)) == obsTargets) ||
+          OMBackend.unsupported("other tunable parameter values in a derivative initial equation on an algebraic or observed variable",
+                                join(r.changed, ", "))
+      end
+      targetsNow[] = targets
+      try
+        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!;
+                                         pinned=pinnedIdx,
+                                         derivative_targets=targets,
+                                         eqLabels=eqLabels,
+                                         extra_residuals=useExtra ? residualsAt(pp) : nothing,
+                                         discrete_pinned=discretePinnedIdx,
+                                         warm=homotopyIdx === nothing)
+        #= A model with homotopy(): the continuation from the run's entry, as
+           OpenModelica's `-override` run does; warm from this solution it kept
+           the compiled run's root (x = 1.879 for s = -2, OpenModelica -1.532). =#
+        u = homotopyIdx === nothing ? solveRun(u, pv) :
+          _homotopyContinuation(solveRun, copy(entry), pv, homotopyIdx; refresh! = refreshRelations!)
+        assignParams! === nothing || assignParams!(pv, u, 0.0)
+        u = first(_settleInitialDiscretes!(resolveWith, u, u, pv, initDiscretes, diffKept; startPath = false))
+        u = _settleInitialRelations!(resolveWith, u, pv, initRels)
+      finally
+        targetsNow[] = derivativeInitTargets
+      end
+      #= OpenModelica fails such a run (`-override`), as it refuses such a model. =#
+      checkUserPins(u, entry)
+      u
+    end
   end
-
-  #= After initialization pre(x) equals the committed x(t0); refresh the
-     lifted-discrete memory from the solved initial state. =#
-  resetDiscretePreMem!(preMem, reducedSystem, u0)
 
   @debug "DirectRHS: problem constructed successfully"
   return problem
 end
 
-"""
-    resetDiscretePreMem!(preMem, reducedSystem, u0)
-
-Refresh the lifted-discrete pre() memory from an initial state vector so
-pre(x) at the first event resolves to the committed x(t0). Must run at every
-solve start: a cached build otherwise carries the previous run's final values.
-"""
-function resetDiscretePreMem!(preMem, reducedSystem, u0)
-  (preMem === nothing || u0 === nothing) && return nothing
-  local states = try
-    ModelingToolkit.unknowns(reducedSystem)
-  catch
-    return nothing
+#= The initialization of a model with homotopy() (MLS 3.7.4.4), as
+   OpenModelica's default for such a model: solved at λ = 0 (the simplified
+   expressions), then from each solution at λ = 1/3, 2/3 and 1 (the actual
+   ones), λ the parameter `pv[k]`. `refresh!(u, pv)` sets the relations'
+   literals at each step's solution: kept at the entry's, the limiters of
+   MSL SignalGenerator's op-amps stayed linear and the path returned to the
+   unstable equilibrium (OpenModelica: saturated, -15 V). The direct solve
+   from `u` when a step throws; λ is 1 afterwards either way. =#
+function _homotopyContinuation(solve, u, pv, k::Int; refresh! = nothing, finalSolve = solve)
+  local uh = copy(u)
+  local pvBefore = copy(pv)
+  try
+    for λ in (0.0, 1 / 3, 2 / 3)
+      pv[k] = λ
+      uh = solve(uh, pv)
+      refresh! === nothing || refresh!(uh, pv)
+    end
+  catch e
+    OMBackend._fallback(e, :homotopyContinuation, impact = :result)
+    @warn "DirectRHS: the homotopy continuation failed; the initialization starts from the actual expressions" exception = e
+    uh = copy(u)
+    #= The relations' literals and free parameters as before the steps. =#
+    copyto!(pv, pvBefore)
+  finally
+    pv[k] = 1.0
   end
-  for (i, st) in enumerate(states)
-    i <= length(u0) || break
-    local k = Symbol(replace(string(st), "(t)" => ""))
-    haskey(preMem, k) && (preMem[k] = u0[i])
-  end
-  return nothing
+  return finalSolve(uh, pv)
 end
-
 
 #= Returns `(values, constraintKeys)`. `values` seeds u0; `constraintKeys`
    names the literal initialization-equation LHS variables: user-requested
    constraints that must stay pinned through the free phases of the init
    solve regardless of what splitInitialValues demoted to guesses. =#
 function _collectHardInitializationValues(reducedSystem, finalInitialValues;
-                                          resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
+                                          resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
+                                          valuesMayDiffer::Union{AbstractSet{String},Nothing}=nothing)
   local values = Dict{Any, Float64}()
   local constraintKeys = OrderedSet{String}()
   for pair in finalInitialValues
@@ -333,11 +684,12 @@ function _collectHardInitializationValues(reducedSystem, finalInitialValues;
     val === nothing && continue
     values[pair.first] = val
   end
-  local initEqs = try
-    ModelingToolkit.initialization_equations(reducedSystem)
-  catch
-    return (values, constraintKeys)
-  end
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
+  #= Two of them that give one variable different values (an initial
+     algorithm's x := 2 and `initial equation y = 3` with y = x): the last one
+     was taken without a word; OpenModelica refuses the inconsistent system.
+     Checked when `valuesMayDiffer` is given, but not for the names in it. =#
+  local equationValues = Dict{String, Float64}()
   for eq in initEqs
     startswith(string(eq.lhs), "Differential(") && continue
     local rhsVal = _literalNumericValue(eq.rhs)
@@ -345,22 +697,131 @@ function _collectHardInitializationValues(reducedSystem, finalInitialValues;
       rhsVal = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams)
     end
     rhsVal === nothing && continue
+    local key = string(eq.lhs)
+    local earlier = get(equationValues, key, nothing)
+    (valuesMayDiffer === nothing || earlier === nothing || _plainVariableName(key) in valuesMayDiffer ||
+     isapprox(earlier, rhsVal; rtol = 1e-10, atol = 1e-12)) ||
+      OMBackend.unsupported("initialization equations that give a variable two values",
+                            "$(_plainVariableName(key)) = $(earlier) and $(rhsVal)")
+    equationValues[key] = rhsVal
     values[eq.lhs] = rhsVal
-    push!(constraintKeys, string(eq.lhs))
+    push!(constraintKeys, key)
   end
   return (values, constraintKeys)
 end
 
 
+#= What a run with other tunable parameter values needs (DAE_REINIT,
+   OMBackend.withTunableParameters; OpenModelica's `-override`), as
+   `(resolvedAt, entryAt, followTunable!)`:
+   - `followTunable!(pv)` sets the parameters bound to tunable ones
+     (`q = 2 * p`, an MTK parameter whose value the run does not set) from
+     their bindings. Stale, a relation-when read q's compiled value.
+   - `resolvedAt(pv)` is nothing when no parameter the entry state reads
+     changed, else `(resolved, initResolved, changed)`: the parameter values
+     as the build resolved them, with the run's. Only the parameters the
+     symbolic start values, guesses and initialization equations read, and
+     those their bindings read, are resolved again (all 140 of the MSL
+     DoublePendulum's took 0.2 s a run).
+   - `entryAt(r)` is the entry state for them, evaluated as the build's
+     (`uStart`): `x(start = p, fixed = true)` and `initial equation x = p`
+     kept x(0) = 1 for p = 2. The parameters the initialization computes keep
+     their start values. =#
+function _runEntry(reducedSystem; states, params, pars, finalInitialValues, systemGuesses, resolvedParams,
+                   unknownParamNames, valuesMayDiffer, observedEquations, uStart, tunableParameters)
+  local paramNames = String[string(p) for p in params]
+  local tunableSet = Set{String}(tunableParameters)
+  local roots = OrderedSet{String}(nm for nm in paramNames
+                                   if !(nm in unknownParamNames) &&
+                                      OMBackend.isTunableParameter(_plainVariableName(nm), tunableSet))
+  local followTunable! = something(_dependentsWriter(isempty(roots) ? nothing :
+                                                      _parameterDependents(pars, params, roots; resolvedParams=resolvedParams)),
+                                   pv -> nothing)
+  local parsByName = Dict{String, Any}(string(k) => v for (k, v) in pars)
+  local entryParams = _entryParameters(Iterators.flatten(((p.second for p in finalInitialValues),
+                                                          (eq.rhs for eq in ModelingToolkit.initialization_equations(reducedSystem)),
+                                                          (last(p) for p in systemGuesses))), parsByName)
+  #= The run sets values; a bound parameter's comes from its binding (above). =#
+  local valueIdx = Pair{String, Int}[nm => k for (k, nm) in enumerate(paramNames)
+                                     if nm in entryParams && !(nm in unknownParamNames) &&
+                                        _tryToFloat64(get(parsByName, nm, nothing)) !== nothing]
+  local entryPars = Tuple{Any, Any, String}[(k, v, string(k)) for (k, v) in pars if string(k) in entryParams]
+  local used = Set{String}(paramNames)
+  local resolvedAt = pv -> begin
+    local changed = Dict{String, Float64}(nm => Float64(pv[k]) for (nm, k) in valueIdx
+                                          if Float64(pv[k]) != get(resolvedParams, nm, nothing))
+    isempty(changed) && return nothing
+    local parsAt = Dict{Any, Any}(k => get(changed, nm, v) for (k, v, nm) in entryPars)
+    local resolved = merge(resolvedParams, _resolveParamValues(parsAt; used = used))
+    local initResolved = isempty(unknownParamNames) ? resolved :
+      Dict{String, Float64}(k => v for (k, v) in resolved if !(k in unknownParamNames))
+    (resolved = resolved, initResolved = initResolved, changed = sort!(collect(keys(changed))))
+  end
+  local observedStrs = String[string(eq) for eq in observedEquations]
+  local entryAt = r -> r === nothing ? copy(uStart) :
+    _buildStateVector(states, finalInitialValues; resolvedParams=r.resolved, systemGuesses=systemGuesses,
+                      hardInitialValues=first(_collectHardInitializationValues(reducedSystem, finalInitialValues;
+                                                                               resolvedParams=r.initResolved,
+                                                                               valuesMayDiffer=valuesMayDiffer)),
+                      observedEquations=observedEquations, observedStrs=observedStrs)
+  return (resolvedAt, entryAt, followTunable!)
+end
+
+#= `pv -> nothing` writing the dependents' values into `pv`, for a
+   `_parameterDependents` result; nothing for nothing. =#
+function _dependentsWriter(dependents)
+  dependents === nothing && return nothing
+  local (dF, dIdxs) = dependents
+  return pv -> begin
+    local vals = dF(pv)
+    for (i, k) in enumerate(dIdxs)
+      pv[k] = Float64(vals[i])
+    end
+    nothing
+  end
+end
+
+#= The parameters `values` read that are in `parsByName`, and those their
+   bindings read. A value whose variables cannot be listed makes every
+   parameter one (the entry is then evaluated again for any change). =#
+function _entryParameters(values, parsByName::AbstractDict{String})::OrderedSet{String}
+  local out = OrderedSet{String}()
+  local pending = Any[v for v in values if _tryToFloat64(v) === nothing]
+  while !isempty(pending)
+    local vars = try
+      Symbolics.get_variables(Symbolics.unwrap(pop!(pending)))
+    catch e
+      OMBackend._fallback(e, :entryParameters, impact = :result)
+      return OrderedSet{String}(keys(parsByName))
+    end
+    for x in vars
+      local nm = string(x)
+      (nm in out || !haskey(parsByName, nm)) && continue
+      push!(out, nm)
+      push!(pending, parsByName[nm])
+    end
+  end
+  return out
+end
+
+#= Whether an initialization equation needs a solve: one that is not a start
+   value `x = v`, a variable of the system and a number (a derivative row,
+   `y = 2*x`, `2*x = 4`). =#
+function _hasSolvedInitializationRows(reducedSystem; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)::Bool
+  local variables = Set{String}(string(v) for v in Iterators.flatten((ModelingToolkit.unknowns(reducedSystem),
+                                                                      ModelingToolkit.parameters(reducedSystem),
+                                                                      (o.lhs for o in ModelingToolkit.observed(reducedSystem)))))
+  return any(ModelingToolkit.initialization_equations(reducedSystem)) do eq
+    startswith(string(eq.lhs), "Differential(") || !(string(eq.lhs) in variables) ||
+      _tryToFloat64(eq.rhs; resolvedParams=resolvedParams) === nothing
+  end
+end
+
 function _literalNumericValue(val)
   local raw = val
   raw = raw isa Symbolics.Num ? Symbolics.unwrap(raw) : raw
   raw isa Number && return Float64(raw)
-  raw = try
-    Symbolics.value(raw)
-  catch
-    return nothing
-  end
+  raw = Symbolics.value(raw)
   raw = raw isa Symbolics.Num ? Symbolics.unwrap(raw) : raw
   return raw isa Number ? Float64(raw) : nothing
 end
@@ -370,21 +831,13 @@ function _derivativeInitializationTargets(reducedSystem, states;
                                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
   local stateStrToIdx = Dict{String, Int}(string(st) => i for (i, st) in enumerate(states))
   local targets = Pair{Int, Float64}[]
-  local initEqs = try
-    ModelingToolkit.initialization_equations(reducedSystem)
-  catch
-    return targets
-  end
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
   for eq in initEqs
-    local lhsStr = string(eq.lhs)
-    startswith(lhsStr, "Differential(") || continue
-    local matchedIdx = nothing
-    for (stateStr, idx) in stateStrToIdx
-      if endswith(lhsStr, "(" * stateStr * ")")
-        matchedIdx = idx
-        break
-      end
-    end
+    local lhs = Symbolics.unwrap(eq.lhs)
+    (SymbolicUtils.iscall(lhs) && SymbolicUtils.operation(lhs) isa Symbolics.Differential) || continue
+    _requireFirstOrder(lhs, eq)
+    #= The argument itself, not a suffix of the string: D() can hold an expression. =#
+    local matchedIdx = get(stateStrToIdx, string(SymbolicUtils.arguments(lhs)[1]), nothing)
     matchedIdx === nothing && continue
     local target = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams)
     target === nothing && continue
@@ -407,35 +860,56 @@ end
 function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
                                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
                                           excludeNames::AbstractSet{String}=OrderedSet{String}())
-  get(ENV, "OMBACKEND_INIT_SYMBOLIC_EQS", "true") == "true" || return nothing
-  local initEqs = try
-    ModelingToolkit.initialization_equations(reducedSystem)
-  catch
-    return nothing
-  end
+  OMBackend.envSwitch("OMBACKEND_INIT_SYMBOLIC_EQS") || return nothing
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
   isempty(initEqs) && return nothing
   local stateStrToIdx = OrderedDict{String, Int}(string(st) => i for (i, st) in enumerate(states))
   local exprs = Any[]
   local derIdxs = Int[]
   local mmScales = Float64[]
+  #= A derivative a row reads (`der(x) = der(y)`) by its equation: left in, the
+     row did not reduce to states and was dropped (x(0) = 0, OpenModelica 1). =#
+  local systemEqs = nothing
+  local withDerivatives = e -> begin
+    _hasDerivative(Symbolics.unwrap(e)) || return e
+    systemEqs === nothing && (systemEqs = ModelingToolkit.full_equations(reducedSystem))
+    #= An observed variable's definition inside D() (`D(2y)`): 2 D(y) first. =#
+    local ex = try
+      Symbolics.expand_derivatives(e)
+    catch err
+      OMBackend._fallback(err, :initExpandDerivatives; impact = :result)
+      e
+    end
+    local r = substituteDerivatives(ex, systemEqs)
+    r === nothing ? ex : r
+  end
   for eq in initEqs
     local lhsStr = string(eq.lhs)
     if startswith(lhsStr, "Differential(")
+      _requireFirstOrder(Symbolics.unwrap(eq.lhs), eq)
       #= Literal derivative rows are handled as derivative_targets. =#
       _tryToFloat64(eq.rhs; resolvedParams=resolvedParams) === nothing || continue
-      local matchedIdx = nothing
-      for (stateStr, idx) in stateStrToIdx
-        if endswith(lhsStr, "(" * stateStr * ")")
-          matchedIdx = idx
-          break
-        end
+      local matchedIdx = get(stateStrToIdx, string(SymbolicUtils.arguments(Symbolics.unwrap(eq.lhs))[1]), nothing)
+      #= der() of an observed variable (its definition inside D()) or of an
+         algebraic unknown: a row of its own, the derivatives expanded and
+         substituted (it was skipped without a word: `der(v) = x - 1` with
+         v = 2y left x(0) = 0, OpenModelica -1). One that does not reduce is
+         reported below. =#
+      if matchedIdx === nothing || iszero(mm[matchedIdx, matchedIdx])
+        push!(exprs, withDerivatives(eq.lhs - eq.rhs))
+        push!(derIdxs, 0)
+        push!(mmScales, 1.0)
+        continue
       end
-      matchedIdx === nothing && continue
-      push!(exprs, eq.rhs)
+      push!(exprs, withDerivatives(eq.rhs))
       push!(derIdxs, matchedIdx)
       push!(mmScales, Float64(mm[matchedIdx, matchedIdx]))
     else
-      #= Lifted-discrete rows belong to the t0 initialize affects. =#
+      #= Lifted-discrete rows belong to the t0 initialize affects. By the
+         printed name, as it was: an array element (`var"jointRRP_e_im[1]"`,
+         an assigned parameter) stays a residual row too. Matched by the plain
+         name (B16), the MSL V6 cylinder's top dead centre passed the GasForce
+         assert's 1e-12 margin (s_rel = L + 1.4e-12). =#
       replace(lhsStr, "(t)" => "") in excludeNames && continue
       #= Literal algebraic rows are pinned hard values, but only a state can
          be pinned: a literal row on an observed variable (an acceleration-
@@ -445,20 +919,44 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
       if rhsVal !== nothing && haskey(stateStrToIdx, lhsStr)
         continue
       end
-      push!(exprs, eq.lhs - eq.rhs)
+      push!(exprs, withDerivatives(eq.lhs - eq.rhs))
       push!(derIdxs, 0)
       push!(mmScales, 1.0)
     end
   end
   isempty(exprs) && return nothing
-  #= Inline observed definitions on demand so only states, params and the iv
-     remain; the observed list is topologically ordered, so bounded repeated
-     substitution terminates. =#
-  local obsEqs = try
-    ModelingToolkit.observed(reducedSystem)
-  catch
-    Symbolics.Equation[]
+  local keep = _inlineObservedRows!(exprs, reducedSystem, states, params, iv)
+  #= An initialization equation left out gives a wrong initial state: refused
+     (a derivative of an algebraic unknown, `der(x) = der(z)`; the MSL
+     ControlledTanks' pre(reset) row, which does not validate either). =#
+  length(keep) < length(exprs) &&
+    OMBackend.unsupported("initialization equations that do not reduce to the states and parameters",
+                          join((string(exprs[i]) for i in setdiff(eachindex(exprs), keep)), "; "))
+  isempty(keep) && return nothing
+  exprs = exprs[keep]
+  derIdxs = derIdxs[keep]
+  mmScales = mmScales[keep]
+  #= With CSE, as the RHS: the rows have the observed equations substituted,
+     which a multibody model (MSL fullRobot: 119 unknowns, 1809 observed
+     equations) expands to millions of terms as a tree; Julia never finishes
+     lowering such a function. =#
+  local gFunc = try
+    local fExpr = Symbolics.build_function(exprs, states, params, iv; expression = Val{true}, cse = true)
+    _exprToRTGFunction(fExpr[1])
+  catch e
+    OMBackend._fallback(e, :_symbolicInitializationResiduals_2, impact = :result)
+    @debug "DirectRHS: could not build symbolic initialization residuals" exception = e
+    return nothing
   end
+  return (gFunc, derIdxs, mmScales)
+end
+
+#= Inline observed definitions into `exprs` on demand so only states, params
+   and the iv remain; the observed list is topologically ordered, so bounded
+   repeated substitution terminates. Returns the indices of the rows that
+   reduced to those (a row still reading der() inside an observed does not). =#
+function _inlineObservedRows!(exprs, reducedSystem, states, params, iv)::Vector{Int}
+  local obsEqs = ModelingToolkit.observed(reducedSystem)
   local obsByStr = OrderedDict{String, Any}(string(o.lhs) => o.rhs for o in obsEqs)
   local allowed = OrderedSet{String}(string(st) for st in states)
   for p in params
@@ -477,30 +975,533 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
       exprs[i] = Symbolics.substitute(exprs[i], pending)
     end
   end
-  #= Drop rows still referencing anything else (e.g. der() inside observed). =#
-  local keep = Int[]
-  for (i, ex) in enumerate(exprs)
-    if all(v -> string(v) in allowed, Symbolics.get_variables(ex))
-      push!(keep, i)
-    end
-  end
-  if length(keep) < length(exprs)
-    @debug "DirectRHS: dropped $(length(exprs) - length(keep)) symbolic initialization rows (unresolvable references)"
-  end
-  isempty(keep) && return nothing
-  exprs = exprs[keep]
-  derIdxs = derIdxs[keep]
-  mmScales = mmScales[keep]
-  local gFunc = try
-    local fExpr = Symbolics.build_function(exprs, states, params, iv; expression = Val{true})
-    _exprToRTGFunction(fExpr[1])
-  catch e
-    @debug "DirectRHS: could not build symbolic initialization residuals" exception = e
-    return nothing
-  end
-  return (gFunc, derIdxs, mmScales)
+  return Int[i for (i, ex) in enumerate(exprs)
+             if all(v -> string(v) in allowed, Symbolics.get_variables(ex))]
 end
 
+#= Initialization equations `p = f(...)` for a parameter p without a value
+   (fixed = false; the MSL analytic loop joints' positiveBranch, the branch of
+   the loop's solution that the initial positions select). No unknown of the
+   init solve is p: as a residual row the solve can only meet it by moving u
+   to where f is p's default, relaxing fixed starts (or not at all, for a
+   Boolean f). The init solve assigns p = f at each evaluation instead, and p
+   keeps its value at the initial state. Returns `(pFunc, pIdxs)`, where
+   `pFunc(u, p, t)` evaluates the values of `p[pIdxs]`, or nothing. A row whose
+   f reads its own p stays a residual row. =#
+function _initialParameterAssignments(reducedSystem, states, params, iv; assignable::AbstractSet{String})
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
+  local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
+  local exprs = Any[]
+  local pIdxs = Int[]
+  for eq in initEqs
+    #= Only a parameter without a value (ASSIGNED_PARAMETERS): a bound or
+       tunable one on the left is a residual row. By the plain name: an array
+       element prints as `var"jointRRP_e_im[1]"` (the MSL analytic loops). =#
+    _plainVariableName(eq.lhs) in assignable || continue
+    local k = get(paramIdx, string(eq.lhs), 0)
+    k == 0 && continue
+    push!(exprs, eq.rhs)
+    push!(pIdxs, k)
+  end
+  isempty(exprs) && return nothing
+  local keep = _inlineObservedRows!(exprs, reducedSystem, states, params, iv)
+  filter!(keep) do i
+    local own = string(params[pIdxs[i]])
+    !any(v -> string(v) == own, Symbolics.get_variables(exprs[i]))
+  end
+  isempty(keep) && return nothing
+  local pFunc = try
+    local fExpr = Symbolics.build_function(exprs[keep], states, params, iv; expression = Val{true}, cse = true)
+    _exprToRTGFunction(fExpr[1])
+  catch e
+    OMBackend._fallback(e, :_initialParameterAssignments_2, impact = :result)
+    @debug "DirectRHS: could not build the initial parameter assignments" exception = e
+    return nothing
+  end
+  return (pFunc, pIdxs[keep])
+end
+
+
+#= Parameters whose binding reads `roots` (directly or through other such
+   parameters): `spring.spring.c = spring.c` for the free spring.c of the MSL
+   InitSpringConstant. _buildParamVector resolved them from the roots' start
+   values; a root the initialization changes must carry them along. Returns
+   `(depFunc, depIdxs, depNames)` with `depFunc(p)` the values of `p[depIdxs]`
+   from the roots in `p` and `depNames` every dependent (in `params` or not),
+   or nothing. A dependent that still reads a name outside `params` after
+   substitution is left out. =#
+function _parameterDependents(pars, params, roots::AbstractSet{String};
+                              resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
+  isempty(roots) && return nothing
+  local valByName = OrderedDict{String, Any}()
+  for (k, v) in pars
+    valByName[string(k)] = v isa Symbolics.Num ? Symbolics.unwrap(v) : v
+  end
+  local reads = Dict{String, Vector{String}}(
+    name => (v isa Number ? String[] : String[string(x) for x in Symbolics.get_variables(v)])
+    for (name, v) in valByName)
+  local deps = OrderedSet{String}()
+  local grew = true
+  while grew
+    grew = false
+    for name in keys(valByName)
+      (name in deps || name in roots) && continue
+      any(x -> x in roots || x in deps, reads[name]) || continue
+      push!(deps, name)
+      grew = true
+    end
+  end
+  isempty(deps) && return nothing
+  local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
+  #= Each dependent in terms of the roots and the parameters that stay: other
+     dependents substituted by their bindings (bounded, bindings are acyclic),
+     names outside `params` by their resolved values. =#
+  local byVar = Dict{Any, Any}()
+  for (k, v) in pars
+    local nm = string(k)
+    local uk = k isa Symbolics.Num ? Symbolics.unwrap(k) : k
+    if nm in deps
+      byVar[uk] = valByName[nm]
+    elseif !haskey(paramIdx, nm) && resolvedParams !== nothing && haskey(resolvedParams, nm)
+      byVar[uk] = resolvedParams[nm]
+    end
+  end
+  local depIdxs = Int[]
+  local exprs = Any[]
+  for d in deps
+    local k = get(paramIdx, d, 0)
+    k == 0 && continue
+    local ex = valByName[d]
+    for _ in 1:(length(deps) + 1)
+      local next = Symbolics.substitute(ex, byVar)
+      isequal(next, ex) && break
+      ex = next
+    end
+    if !all(v -> haskey(paramIdx, string(v)), Symbolics.get_variables(ex))
+      @debug "DirectRHS: dependent parameter $(d) reads a name outside the parameters; left at its value"
+      continue
+    end
+    push!(depIdxs, k)
+    push!(exprs, ex)
+  end
+  isempty(depIdxs) && return nothing
+  local depFunc = try
+    local fExpr = Symbolics.build_function(exprs, params; expression = Val{true})
+    local fn = _exprToRTGFunction(fExpr[1])
+    #= Probed once: a failing binding must not break every init evaluation. =#
+    fn(ones(length(params)))
+    fn
+  catch e
+    #= The dependents then keep their compiled values (a free parameter's,
+       a tunable run's): a result, not only speed. =#
+    OMBackend._fallback(e, :_parameterDependents, impact = :result)
+    @debug "DirectRHS: could not build the dependent parameters" exception = e
+    return nothing
+  end
+  return (depFunc, depIdxs, deps)
+end
+
+#= The literal derivative initial equations `der(w) = c` whose w is not an
+   unknown: `(ws, cs)`. =#
+function _observedDerivativeInitEquations(reducedSystem, states;
+                                          resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
+  local exprs = Any[]
+  local tgts = Float64[]
+  local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
+  local stateStrs = Set{String}(string(st) for st in states)
+  for eq in initEqs
+    local lhs = Symbolics.unwrap(eq.lhs)
+    (SymbolicUtils.iscall(lhs) && SymbolicUtils.operation(lhs) isa Symbolics.Differential) || continue
+    _requireFirstOrder(lhs, eq)
+    local w = SymbolicUtils.arguments(lhs)[1]
+    string(w) in stateStrs && continue
+    local c = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams)
+    c === nothing && continue
+    push!(exprs, w)
+    push!(tgts, c)
+  end
+  return (exprs, tgts)
+end
+
+#= Literal derivative initial equations `der(w) = c` on an observed w (not an
+   unknown; those are derivative targets): w inlined to the unknowns, its
+   gradient w.r.t. the unknowns and the independent variable (explicit time)
+   by the DAG differentiation, compiled as the nonzeros. Returns
+   `(nzFunc!, rows, cols, n, targets)`: row k's der(w) is
+   Σ nz * (col <= n ? u̇[col] : 1). Nothing when there are none or they
+   cannot be reduced or differentiated. =#
+function _observedDerivativeTargets(reducedSystem, states, params, iv;
+                                    resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
+  local (exprs, tgts) = _observedDerivativeInitEquations(reducedSystem, states; resolvedParams=resolvedParams)
+  isempty(exprs) && return nothing
+  local keep = _inlineObservedRows!(exprs, reducedSystem, states, params, iv)
+  length(keep) < length(exprs) &&
+    @warn "DirectRHS: $(length(exprs) - length(keep)) derivative initial equations on observed variables not reduced to the unknowns; left out"
+  isempty(keep) && return nothing
+  exprs = exprs[keep]
+  tgts = tgts[keep]
+  try
+    local Jw = _dagSparseJacobian(exprs, vcat(collect(states), [iv]))
+    local (I, J, _) = Symbolics.SparseArrays.findnz(Jw)
+    local nzSym = collect(Symbolics.SparseArrays.nonzeros(Jw))
+    local fExpr = Symbolics.build_function(nzSym, states, params, iv; expression = Val{true}, cse = true)
+    return (_exprToRTGFunction(_demoteWideNumericLiterals!(fExpr[2])), I, J, length(states), tgts)
+  catch e
+    OMBackend._fallback(e, :_observedDerivativeTargets, impact = :result)
+    @warn "DirectRHS: derivative initial equations on observed variables not differentiated; left out" exception = e
+    return nothing
+  end
+end
+
+#= The RHS's explicit time derivative ∂F/∂t (states and parameters fixed),
+   the tgrad of the problem: by the DAG differentiation when every row has a
+   derivative rule and it evaluates finite at the entry, else by a central
+   difference (as the solver's own). Rosenbrock methods need it in each step;
+   their finite difference in t has a step growing with t, and its error in
+   the MSL SMEE machines' 50 Hz sources (~0.2 V/s at t = 2.8) set a floor
+   the algebraic step control chased until maxiters (SMEE_DOL stopped at
+   2.835 s after 1e6 steps). =#
+function _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, t0)
+  #= Kill switch OMBACKEND_TGRAD=false: no tgrad (the solver differences in t itself). =#
+  OMBackend.envSwitch("OMBACKEND_TGRAD") || return nothing
+  local tg = _explicitTimeDerivative(rhs_list, states, params, iv)
+  if tg !== nothing
+    #= At the entry guesses (before the initialization): only a row the RHS
+       evaluates finite may not come out non-finite. =#
+    local ok = try
+      local dT = similar(u0)
+      local du = similar(u0)
+      Base.invokelatest(tg, dT, u0, p_vec, t0)
+      rhsFunc(du, u0, p_vec, t0)
+      all(i -> isfinite(dT[i]) || !isfinite(du[i]), eachindex(dT))
+    catch e
+      OMBackend._fallback(e, :_buildTimeDerivative)
+      false
+    end
+    ok && return tg
+    @debug "DirectRHS: the symbolic time derivative does not evaluate at the entry; a finite difference instead"
+  else
+    @debug "DirectRHS: no symbolic time derivative; a finite difference instead"
+  end
+  return (dT, u, p, t) -> begin
+    local h = cbrt(eps(Float64)) * max(1.0, abs(t))
+    local f2 = similar(dT)
+    rhsFunc(dT, u, p, t + h)
+    rhsFunc(f2, u, p, t - h)
+    @. dT = (dT - f2) / (2h)
+    nothing
+  end
+end
+
+#= The time derivative of rows that do not read t. =#
+_zeroTimeDerivative(dT, u, p, t) = (fill!(dT, 0); nothing)
+
+#= ∂F/∂t of the rows `exprs` (explicit time) by the DAG differentiation, as an
+   in-place `f!(out, u, p, t)`; nothing when a row has no derivative rule (a
+   time table). =#
+function _explicitTimeDerivative(exprs, states, params, iv)
+  try
+    #= The states as variables (x(t) would otherwise be a function of t), only t's column. =#
+    local n = length(states)
+    local Jt = _dagSparseJacobian(exprs, vcat(collect(states), [iv]); columns = BitSet((n + 1,)))
+    Symbolics.SparseArrays.nnz(Jt) == 0 && return _zeroTimeDerivative
+    local col = Any[Jt[i, n + 1] for i in 1:length(exprs)]
+    local fExpr = Symbolics.build_function(col, states, params, iv; expression = Val{true}, cse = true)
+    return _exprToRTGFunction(_demoteWideNumericLiterals!(fExpr[2]))
+  catch e
+    OMBackend._fallback(e, :_explicitTimeDerivative)
+    @debug "DirectRHS: explicit time derivative not symbolic; a finite difference instead" exception = e
+    return nothing
+  end
+end
+
+#= The time derivatives of the algebraic unknowns (zero mass-matrix rows of a
+   diagonal mass matrix) at (u, p, t): differentiating the algebraic rows
+   0 = F_a(u, t) gives J_aa ż_a = -(J_ad u̇_d + ∂F_a/∂t), with u̇_d = F_d / m_d
+   from `du` = F(u). J from the symbolic sparse Jacobian (kept sparse, written
+   into `J`), ∂F_a/∂t from `ft!` or, without it (or when it throws or is not
+   finite), by a second-order one-sided difference (a time switch at t sees
+   its right limit there). The raw RHS with p
+   fixed: parameters are constant in time. A singular J_aa takes the
+   least-squares solution; NaN if anything throws. =#
+function _algebraicDerivatives!(J, rhs, jac, ft!, mm, algIdx, difIdx, u, du, p, t)
+  try
+    jac(J, u, p, t)
+    local Ft = Vector{Float64}(undef, length(algIdx))
+    local symbolic = ft! !== nothing && try
+      ft!(Ft, u, p, t)
+      all(isfinite, Ft)
+    catch e
+      OMBackend._fallback(e, :_algebraicDerivatives!_1)
+      false
+    end
+    if !symbolic
+      local h = cbrt(eps(Float64)) * max(1.0, abs(t))
+      local d1 = similar(du)
+      local d2 = similar(du)
+      rhs(d1, u, p, t + h)
+      rhs(d2, u, p, t + 2h)
+      Ft .= (-3 .* du[algIdx] .+ 4 .* d1[algIdx] .- d2[algIdx]) ./ (2h)
+    end
+    local udot_d = Float64[du[i] / mm[i, i] for i in difIdx]
+    local b = J[algIdx, difIdx] * udot_d .+ Ft
+    local Jaa = J[algIdx, algIdx]
+    local F = LinearAlgebra.lu(Jaa; check = false)
+    return LinearAlgebra.issuccess(F) ? -(F \ b) : -(LinearAlgebra.qr(Matrix(Jaa), LinearAlgebra.ColumnNorm()) \ b)
+  catch e
+    OMBackend._fallback(e, :_algebraicDerivatives!_2)
+    return fill(NaN, length(algIdx))
+  end
+end
+
+#= The literal values of the if-equation relations at an initial state:
+   `eval!(pv, u, t)` writes 1.0/0.0 into their ifCond parameters and returns
+   whether one changed. From the codegen's entries (ifCond, observed names,
+   crossing functions, observed -> Bool); an entry whose ifCond is not a
+   parameter is left out, and when the crossing functions cannot be observed
+   there are none. Nothing when none remain. =#
+function _initialRelationLiterals(reducedSystem, params, entries)
+  isempty(entries) && return nothing
+  local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
+  local kept = Any[]
+  local zcs = Any[]
+  for (sym, names, fns, lit) in entries
+    local k = get(paramIdx, string(sym), 0)
+    k == 0 && continue
+    push!(kept, (k, names, length(zcs) + 1, length(fns), lit))
+    append!(zcs, fns)
+  end
+  isempty(kept) && return nothing
+  local f = try
+    _buildObservedFunction(reducedSystem, zcs)
+  catch e
+    OMBackend._fallback(e, :_initialRelationLiterals, impact = :result)
+    @debug "DirectRHS: relation literals not observable; the initialization keeps the compiled ifConds" exception = e
+    return nothing
+  end
+  local eval! = (pv, u, t; finiteOnly::Bool = false) -> begin
+    #= The observed function and the literals come from the model's eval:
+       called in the latest world (a re-initialization can run in an older). =#
+    local vals = Base.invokelatest(f, u, pv, t)
+    local changed = false
+    for (k, names, off, n, lit) in kept
+      local nt = NamedTuple{Tuple(names)}(Tuple(Float64(vals[off + i - 1]) for i in 1:n))
+      finiteOnly && !all(isfinite, values(nt)) && continue
+      local v = Base.invokelatest(lit, nt) ? 1.0 : 0.0
+      changed |= pv[k] != v
+      pv[k] = v
+    end
+    changed
+  end
+  return (eval! = eval!, idxs = Int[k for (k, _...) in kept])
+end
+
+#= The discrete clusters at initialization, for `_settleInitialDiscretes!`:
+   the codegen's clusters (instances of their own) bound to the reduced
+   system (the problem does not exist yet), their members' start values
+   (index => value, those that evaluate) and per cluster the start values its
+   pre() reads take (MLS 8.6: pre(v) = v.start). Nothing when there are none
+   or they cannot be observed. =#
+function _initialDiscreteClusters(clusters, reducedSystem, startOf::AbstractDict{String, Float64})
+  isempty(clusters) && return nothing
+  local starts = Pair{Int, Float64}[]
+  local preStarts = Vector{Union{Nothing, Float64}}[]
+  try
+    for c in clusters
+      _bindToSystem!(c, reducedSystem)
+      for (n, k) in zip(c.names, c.memberIndex)
+        k == 0 || !haskey(startOf, n) || push!(starts, k => startOf[n])
+      end
+      push!(preStarts, Union{Nothing, Float64}[get(startOf, string(r), nothing)
+                                               for r in c.reads[(c.nOperands + 1):(c.nOperands + c.nPre)]])
+    end
+  catch e
+    OMBackend._fallback(e, :_initialDiscreteClusters, impact = :result)
+    @debug "DirectRHS: discrete clusters not observable at initialization; not settled" exception = e
+    return nothing
+  end
+  return (clusters = clusters, starts = starts, preStarts = preStarts)
+end
+
+#= The members whose cluster body, at state u (relations literal, MLS 8.5;
+   pre() the start values, else the values in u; initial() true), gives
+   another value than u holds: index => value. Local buffers: a
+   re-initialization may run while another one does. =#
+function _initialDiscreteChanges(dc, u, pv)
+  local point = (u = u, p = pv, t = 0.0)
+  local changes = Pair{Int, Float64}[]
+  for (c, preStart) in zip(dc.clusters, dc.preStarts)
+    local v = Base.invokelatest(c.values, u, pv, 0.0)
+    local zs = similar(c.zs)
+    Base.invokelatest(c.crossings!, zs, u, pv, 0.0)
+    local rel = Bool[_literal(zs, k, c.strict[k]) for k in eachindex(c.rel)]
+    local pre = [something(s, x) for (s, x) in zip(preStart, _preValues(c, v))]
+    local vals = Base.invokelatest(c.body, point, _operands(c, v), pre, rel, copy(rel), true)
+    vals === nothing && continue
+    for (i, k) in enumerate(c.memberIndex)
+      (k == 0 || u[k] == vals[i]) && continue
+      push!(changes, k => Float64(vals[i]))
+    end
+  end
+  return changes
+end
+
+#= Initial fixpoint of the discrete clusters' mixed systems, as OpenModelica
+   solves them (MLS 8.6: a discrete equation outside a when holds at the
+   initial solution, its relations at their literal values, pre() at the
+   start values). The initial algorithm set the members from their
+   equations at the continuous start values before the solve (an ideal
+   diode's `off = s < 0` at s = 0: conducting); with a fixed inductor
+   current or capacitor voltage that entry can make the solve fail (MSL
+   HBridge_RL: 340 kA) or reach another fixpoint of the mixed system
+   (MultiPhase Rectifier: every diode conducting, 5.8e6 V).
+   When an entry member differs from its start value (`startPath`), from the
+   entry with the members at their start values: solved, the members take
+   their bodies' values at the solution, solved again until they stay.
+   Otherwise, or when that does not settle, from the first solution the same
+   way. A result is taken only if the differential states `kept` stay where
+   the solve it started from had them (OpenModelica keeps states without an
+   initial equation at their start: a diode with a free capacitor voltage
+   must not move it to reach the tie s = 0); else, and on a cycle, a pass
+   limit, a throw or a failed solve, the first solution stands and the event
+   iteration at the start settles the members as before.
+   Returns `(u, settled)`. =#
+function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int};
+                                  startPath::Bool = true, maxPasses::Int = 10, startSolve = resolve)
+  dc === nothing && return (u0, false)
+  local trace = OMBackend.envSwitch("OMBACKEND_INIT_TRACE")
+  local pvFirst = copy(pv)
+  local memberIdx = unique!(Int[k for c in dc.clusters for k in c.memberIndex if k != 0])
+  local keptAt = (u, ref) -> isapprox(u[kept], ref[kept]; rtol = 1e-6, atol = 1e-9)
+  #= From a solution `u` of the solve that started at `ref`. =#
+  local iterate = function (u, ref)
+    local changes = _initialDiscreteChanges(dc, u, pv)
+    local seen = Set{Vector{Float64}}()
+    for _ in 1:maxPasses
+      trace && println("[initdiscretes] members to change: ", changes)
+      isempty(changes) && return u
+      for (k, v) in changes
+        u[k] = v
+      end
+      local key = u[memberIdx]
+      key in seen && return nothing
+      push!(seen, key)
+      local ok = Ref(true)
+      local un = resolve(copy(u), pv, ok)
+      (ok[] && keptAt(un, ref)) || return nothing
+      u = un
+      changes = _initialDiscreteChanges(dc, u, pv)
+    end
+    return nothing
+  end
+  local attempt = function (f)
+    try
+      return f()
+    catch e
+      OMBackend._fallback(e, :_settleInitialDiscretes!, impact = :result)
+      @debug "DirectRHS: the discrete clusters did not settle at initialization" exception = e
+      return nothing
+    end
+  end
+  if startPath && any(kv -> uEntry[kv.first] != kv.second, dc.starts)
+    local settled = attempt() do
+      local u = copy(uEntry)
+      for (k, v) in dc.starts
+        u[k] = v
+      end
+      local ok = Ref(true)
+      local un = startSolve(copy(u), pv, ok)
+      trace && println("[initdiscretes] from the start values: ", ok[] ? "solved" : "not solved",
+                       ", states kept: ", keptAt(un, u))
+      (ok[] && keptAt(un, u)) ? iterate(un, u) : nothing
+    end
+    settled === nothing || return (settled, true)
+    copyto!(pv, pvFirst)
+  end
+  local settled = attempt(() -> iterate(copy(u0), u0))
+  settled === nothing || return (settled, true)
+  trace && println("[initdiscretes] not settled; the first solution stands")
+  copyto!(pv, pvFirst)
+  return (u0, false)
+end
+
+#= Initial event iteration for the if-equation relations: solved with their
+   entry values, the relations take their literal values at the solution
+   and, while one changes, the initialization is solved again (from the last
+   solution) for them. A cycle, a pass limit, a throw or a solve that does
+   not converge keeps the first solution and the entry parameters (MSL
+   EngineV6_analytic: the gas force's `v_rel < 0` was false at the entry,
+   the steady-state filter settled on the wrong torque). =#
+function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5)
+  rels === nothing && return u0
+  local pvFirst = copy(pv)
+  local uFirst = copy(u0)
+  local seen = Set{Vector{Float64}}([pv[rels.idxs]])
+  local u = u0
+  local err = nothing
+  for pass in 1:(maxPasses + 1)
+    try
+      rels.eval!(pv, u, 0.0) || return u
+      pass > maxPasses && break
+      local key = pv[rels.idxs]
+      key in seen && break
+      push!(seen, key)
+      local ok = Ref(true)
+      local un = resolve(copy(u), pv, ok)
+      ok[] || break
+      u = un
+    catch e
+      OMBackend._fallback(e, :_settleInitialRelations!, impact = :result)
+      err = e
+      break
+    end
+  end
+  @debug "DirectRHS: the relations did not settle at initialization; kept the entry branches" exception = err
+  copyto!(pv, pvFirst)
+  return uFirst
+end
+
+#= The DAE init solve with the free parameters p[freeIdx] as unknowns: they
+   are appended to u as algebraic unknowns (zero mass-matrix rows whose
+   residuals are identically zero), so each phase may move them like a free
+   algebraic variable; `follow!(p)` updates the parameters bound to them.
+   Returns the states; p[freeIdx] keeps the solved values. =#
+function _solveDAEInitializationFree!(u0, rhs, pv, mm, freeIdx::Vector{Int}, follow!;
+                                      extra_residuals=nothing, kwargs...)
+  isempty(freeIdx) && return _solveDAEInitialization!(u0, rhs, pv, mm; extra_residuals=extra_residuals, kwargs...)
+  local n = length(u0)
+  local nq = length(freeIdx)
+  local setFree! = (p, u) -> begin
+    for (j, k) in enumerate(freeIdx)
+      p[k] = u[n + j]
+    end
+    follow! === nothing || follow!(p)
+    nothing
+  end
+  #= Copies, not views: the generated functions would compile again for
+     SubArray arguments. =#
+  local uN = similar(u0)
+  local duN = similar(u0)
+  local rhsExt = (du, u, p, t) -> begin
+    setFree!(p, u)
+    copyto!(uN, 1, u, 1, n)
+    rhs(duN, uN, p, t)
+    copyto!(du, 1, duN, 1, n)
+    fill!(view(du, (n + 1):(n + nq)), 0.0)
+    nothing
+  end
+  local extraExt = extra_residuals === nothing ? nothing : (du, u) -> begin
+    copyto!(uN, 1, u, 1, n)
+    copyto!(duN, 1, du, 1, n)
+    extra_residuals(duN, uN)
+  end
+  local mmExt = zeros(eltype(mm), n + nq, n + nq)
+  mmExt[1:n, 1:n] .= mm
+  local uExt = _solveDAEInitialization!(vcat(u0, pv[freeIdx]), rhsExt, pv, mmExt;
+                                        extra_residuals=extraExt, kwargs...)
+  setFree!(pv, uExt)
+  return uExt[1:n]
+end
 
 """
     _buildRHSExpression(rhs_list, states, params, iv)
@@ -518,6 +1519,7 @@ function _buildRHSExpression(rhs_list, states, params, iv)
     @debug "DirectRHS: generated RHS function with CSE"
     return _demoteWideNumericLiterals!(result[2])  # in-place form
   catch e
+    OMBackend._fallback(e, :_buildRHSExpression)
     @warn "DirectRHS: CSE failed, using direct generation" exception=(e, catch_backtrace())
   end
   # Fallback without CSE
@@ -533,26 +1535,187 @@ Build an in-place sparse symbolic Jacobian for the RHS so implicit solvers do
 not finite-difference one RHS column per state every step. The generated
 function is probed once at `(u0, p_vec, t0)`: an unresolved symbolic
 derivative (opaque external call) passes build_function silently and only
-throws when the function runs. Returns `(jacFunc, jacPrototype)`, or
-`(nothing, nothing)` when generation is disabled or the probe fails.
+throws when the function runs. The Jacobian is `_dagSparseJacobian`'s; where
+that has no derivative for an array construct, Symbolics' sparsejacobian is
+tried when no RHS equation's tree exceeds `DIRECT_JAC_TREE_NODE_LIMIT` nodes.
+Returns `(jacFunc, jacPrototype)`, or `(nothing, nothing)` when generation is
+disabled, no Jacobian is found, or the probe fails.
 """
 function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
   OMBackend.DIRECT_JAC_GENERATION[] || return (nothing, nothing)
   try
-    local jacSym = Symbolics.sparsejacobian(rhs_list, states)
-    local result = Symbolics.build_function(jacSym, states, params, iv;
+    local jacSym = try
+      _dagSparseJacobian(rhs_list, states)
+    catch e
+      e isa _NoDagDerivative || rethrow()
+      if !e.retry
+        @debug "DirectRHS: no derivative for $(e.what); solver will finite-difference"
+        return (nothing, nothing)
+      end
+      #= Symbolics differentiates the trees: bounded by their size. =#
+      if any(ex -> _exprLargerThan(ex, OMBackend.DIRECT_JAC_TREE_NODE_LIMIT[]), rhs_list)
+        @debug "DirectRHS: no DAG derivative ($(e.what)) and an RHS equation has more than $(OMBackend.DIRECT_JAC_TREE_NODE_LIMIT[]) tree nodes; solver will finite-difference"
+        return (nothing, nothing)
+      end
+      Symbolics.sparsejacobian(rhs_list, states)
+    end
+    #= The nonzeros as a vector: build_function applies no CSE to a sparse
+       matrix (MSL Engine1b_analytic's 12 nonzeros: over 50 million Expr
+       nodes and 10 GB; as a vector 14,123 nodes). The solver's Jacobian has
+       the prototype's structure, so they are its nzval. =#
+    local nzSym = collect(Symbolics.SparseArrays.nonzeros(jacSym))
+    local result = Symbolics.build_function(nzSym, states, params, iv;
                                             expression=Val{true}, cse=true)
-    local jacFunc = _exprToRTGFunction(_demoteWideNumericLiterals!(result[2]))
+    local nzFunc = _exprToRTGFunction(_demoteWideNumericLiterals!(result[2]))
     local jacProto = similar(jacSym, Float64)
     jacProto.nzval .= 0.0
+    local nnz0 = length(nzSym)
+    local jacFunc = (J, u, p, t) -> begin
+      local nz = Symbolics.SparseArrays.nonzeros(J)
+      #= The generated code writes by position, without bounds checks. =#
+      length(nz) == nnz0 || throw(DimensionMismatch("Jacobian with $(length(nz)) stored entries, not $(nnz0)"))
+      nzFunc(nz, u, p, t)
+      nothing
+    end
     local probe = copy(jacProto)
     jacFunc(probe, u0, p_vec, t0)
     @debug "DirectRHS: symbolic sparse Jacobian with $(length(jacProto.nzval)) structural nonzeros"
     return (jacFunc, jacProto)
   catch e
+    OMBackend._fallback(e, :_buildSparseJacobian)
     @debug "DirectRHS: symbolic Jacobian generation failed; solver will finite-difference" exception=(e, catch_backtrace())
     return (nothing, nothing)
   end
+end
+
+#= An expression _dagSparseJacobian has no derivative for. `retry`: whether
+   Symbolics' sparsejacobian may have one (array constructs, Differential,
+   Integral); a call without a derivative rule or a callable symbolic leaves
+   Symbolics with an unresolved derivative too. =#
+struct _NoDagDerivative <: Exception
+  what::String
+  retry::Bool
+end
+
+#= The sparse symbolic Jacobian of `rhs_list` with respect to `states`,
+   differentiating each expression as the DAG it is: a subexpression shared
+   by several uses (the observed equations full_equations inlines, a
+   multibody chain of frames) is differentiated once per state, and the
+   derivatives share their subexpressions the same way. Symbolics'
+   sparsejacobian differentiates the trees: MSL EngineV6_analytic's 17
+   equations are 1,943 DAG nodes but 14.6 million tree nodes, and its 17x17
+   Jacobian took 48 s and 15 GB. The structure is Symbolics'
+   (jacobian_sparsity: an entry for each state an equation reads), the rules
+   are its derivative rules (derivative_idx); throws _NoDagDerivative where
+   there is none. =#
+function _dagSparseJacobian(rhs_list, states; columns::Union{Nothing, AbstractSet{Int}} = nothing)
+  local T = Symbolics.VartypeT
+  local stateIdx = Dict{Any, Int}(Symbolics.unwrap(s) => j for (j, s) in enumerate(states))
+  #= Whole-array uses of scalarized states would read no state here. =#
+  local arrParents = Set{Any}(SymbolicUtils.arguments(u)[1] for u in keys(stateIdx)
+                              if SymbolicUtils.iscall(u) && SymbolicUtils.operation(u) === getindex)
+  local depsMemo = IdDict{Any, BitSet}()
+  local deps = x -> begin
+    local hit = get(depsMemo, x, nothing)
+    hit === nothing || return hit
+    local j = get(stateIdx, x, 0)
+    local d = BitSet()
+    if j > 0
+      push!(d, j)
+    elseif x in arrParents
+      throw(_NoDagDerivative("array use of a scalarized state", true))
+    elseif SymbolicUtils.iscall(x)
+      for a in SymbolicUtils.arguments(x)
+        union!(d, deps(a))
+      end
+    end
+    depsMemo[x] = d
+    return d
+  end
+  #= Combined as plain terms, not with + and *: canonical sums and products
+     merge their operands' terms, copying what the DAG shares (EngineV6_analytic
+     grew to 16 GB that way too). Symbolic 0 and 1 (the rules of sign, floor,
+     comparisons) fold like numbers. =#
+  local isZero = x -> (local v = SymbolicUtils.unwrap_const(x); v isa Number && iszero(v))
+  local isOne = x -> (local v = SymbolicUtils.unwrap_const(x); v isa Number && isone(v))
+  local plus = (a, b) -> isZero(a) ? b : isZero(b) ? a : SymbolicUtils.term(+, a, b; vartype = T)
+  local times = (a, b) -> (isZero(a) || isZero(b)) ? 0 : isOne(a) ? b : isOne(b) ? a :
+                          SymbolicUtils.term(*, a, b; vartype = T)
+  local sumOf = terms -> foldl(plus, terms; init = 0)
+  local isSum = x -> SymbolicUtils.isadd(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (+))
+  local isProduct = x -> SymbolicUtils.ismul(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (*))
+  local derivative
+  derivative = (x, j, memo) -> begin
+    j in deps(x) || return 0
+    local hit = get(memo, x, nothing)
+    hit === nothing || return hit
+    local r = if get(stateIdx, x, 0) == j
+      1
+    elseif isSum(x)
+      sumOf(Any[derivative(a, j, memo) for a in SymbolicUtils.arguments(x) if j in deps(a)])
+    elseif isProduct(x)
+      local args = SymbolicUtils.arguments(x)
+      sumOf(Any[times(foldl(times, (args[k] for k in eachindex(args) if k != i); init = 1),
+                      derivative(args[i], j, memo))
+                for i in eachindex(args) if j in deps(args[i])])
+    elseif SymbolicUtils.isdiv(x)
+      local (num, den) = SymbolicUtils.arguments(x)
+      local dn = derivative(num, j, memo)
+      local dd = derivative(den, j, memo)
+      local a = isZero(dn) ? 0 : SymbolicUtils.term(/, dn, den; vartype = T)
+      local b = isZero(dd) ? 0 : SymbolicUtils.term(/, times(num, dd), SymbolicUtils.term(^, den, 2; vartype = T); vartype = T)
+      isZero(b) ? a : isZero(a) ? SymbolicUtils.term(-, b; vartype = T) : SymbolicUtils.term(-, a, b; vartype = T)
+    elseif SymbolicUtils.ispow(x) && !(j in deps(SymbolicUtils.arguments(x)[2]))
+      local (b, e) = SymbolicUtils.arguments(x)
+      local ev = SymbolicUtils.unwrap_const(e)
+      local bPow = ev isa Number ? (isone(ev - 1) ? b : SymbolicUtils.term(^, b, ev - 1; vartype = T)) :
+                   SymbolicUtils.term(^, b, SymbolicUtils.term(-, e, 1; vartype = T); vartype = T)
+      times(times(e, bPow), derivative(b, j, memo))
+    elseif SymbolicUtils.isterm(x)
+      local f = SymbolicUtils.operation(x)
+      local args = SymbolicUtils.arguments(x)
+      if f === ifelse || f === SymbolicUtils.ifelse_eager || f === SymbolicUtils.ifelse_branching
+        local dt = derivative(args[2], j, memo)
+        local df = derivative(args[3], j, memo)
+        (isZero(dt) && isZero(df)) ? 0 : SymbolicUtils.term(f, args[1], dt, df; vartype = T)
+      elseif f isa Symbolics.Differential || f isa Symbolics.Integral || f === getindex
+        throw(_NoDagDerivative(string(f), true))
+      elseif f isa SymbolicUtils.Operator
+        #= Pre, Sample, Hold, Shift: new variables, as in Symbolics. =#
+        0
+      elseif f isa SymbolicUtils.BasicSymbolic
+        throw(_NoDagDerivative(string(f), false))
+      else
+        local terms = Any[]
+        for (i, a) in enumerate(args)
+          j in deps(a) || continue
+          local rule = Symbolics.derivative_idx(x, i)
+          rule === nothing && throw(_NoDagDerivative(string(f), false))
+          isZero(rule) && continue
+          push!(terms, times(rule, derivative(a, j, memo)))
+        end
+        sumOf(terms)
+      end
+    else
+      throw(_NoDagDerivative(string(typeof(x)), true))
+    end
+    memo[x] = r
+    return r
+  end
+  local I = Int[]
+  local J = Int[]
+  local V = Symbolics.Num[]
+  local memos = [IdDict{Any, Any}() for _ in states]
+  for (i, ex) in enumerate(rhs_list)
+    local x = Symbolics.unwrap(ex)
+    for j in deps(x)
+      columns === nothing || j in columns || continue
+      push!(I, i)
+      push!(J, j)
+      push!(V, Symbolics.Num(derivative(x, j, memos[j])))
+    end
+  end
+  return Symbolics.SparseArrays.sparse(I, J, V, length(rhs_list), length(states))
 end
 
 #= Symbolic simplification can fold integer parameter products into exact
@@ -607,7 +1770,8 @@ function _buildStateVector(states, finalInitialValues;
                            resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
                            systemGuesses=nothing,
                            hardInitialValues=nothing,
-                           observedEquations=nothing)
+                           observedEquations=nothing,
+                           observedStrs=nothing)
   local nStates = length(states)
   local u0 = zeros(Float64, nStates)
   local stateStrToIdx = Dict{String, Int}()
@@ -618,7 +1782,17 @@ function _buildStateVector(states, finalInitialValues;
   local hardValueMap = Dict{Any, Float64}()
   for pair in finalInitialValues
     local keyStr = string(pair.first)
-    local val = _toFloat64(pair.second; resolvedParams=resolvedParams)
+    #= A fixed start (finalInitialValues). One that reads other unknowns (`y = 2x`)
+       is solved by the initialization (_hasSolvedInitializationRows): 0.0 is its
+       placeholder. One that reads none and cannot be evaluated is refused, not
+       0.0 (a guess may be). =#
+    local val = _tryToFloat64(pair.second; resolvedParams=resolvedParams)
+    if val === nothing
+      _readsUnknowns(pair.second, resolvedParams) ||
+        OMBackend.unsupported("a start value that cannot be evaluated", "$(keyStr) = $(pair.second)")
+      @warn "DirectRHS: a start value reads other variables; 0.0 until the initialization solves it" key = keyStr val = pair.second
+      val = 0.0
+    end
     hardValueMap[pair.first] = val
     if haskey(stateStrToIdx, keyStr)
       u0[stateStrToIdx[keyStr]] = val
@@ -638,7 +1812,8 @@ function _buildStateVector(states, finalInitialValues;
   local aliasMatched = 0
   if observedEquations !== nothing && !isempty(observedEquations)
     aliasMatched = _propagateObservedAliasInitialValues!(
-      u0, states, matchedSet, hardValueMap, observedEquations)
+      u0, states, matchedSet, hardValueMap, observedEquations;
+      equationStrs = something(observedStrs, String[string(eq) for eq in observedEquations]))
   end
   # Fill unmatched states from system guesses (post-simplification variable space).
   # These provide Modelica start values for algebraic variables whose pre-simplification
@@ -660,9 +1835,12 @@ function _buildStateVector(states, finalInitialValues;
 end
 
 
+#= `equationStrs`: the equations' strings, once, not per state and round
+   (`string` of an equation is 5-10 us, and the scan was 97 % of an entry
+   state's cost, a tunable run's too). =#
 function _propagateObservedAliasInitialValues!(u0, states, matchedSet::OrderedSet{String},
                                                hardValueMap::Dict{Any, Float64},
-                                               observedEquations)
+                                               observedEquations; equationStrs::AbstractVector{String})
   local aliasMatched = 0
   local progressed = true
   while progressed
@@ -670,7 +1848,7 @@ function _propagateObservedAliasInitialValues!(u0, states, matchedSet::OrderedSe
     for (i, st) in enumerate(states)
       local stStr = string(st)
       stStr in matchedSet && continue
-      local resolved = _resolveObservedAffineInitialValue(st, observedEquations, hardValueMap)
+      local resolved = _resolveObservedAffineInitialValue(st, observedEquations, hardValueMap, equationStrs)
       resolved === nothing && continue
       u0[i] = resolved
       hardValueMap[st] = resolved
@@ -683,12 +1861,14 @@ function _propagateObservedAliasInitialValues!(u0, states, matchedSet::OrderedSe
 end
 
 
-function _resolveObservedAffineInitialValue(target, observedEquations, hardValueMap::Dict{Any, Float64})
+function _resolveObservedAffineInitialValue(target, observedEquations, hardValueMap::Dict{Any, Float64},
+                                            equationStrs::AbstractVector{String} = String[string(eq) for eq in observedEquations])
   local targetStr = string(target)
-  for eq in observedEquations
-    contains(string(eq), targetStr) || continue
-    local knownValues = Dict{Any, Any}(k => v for (k, v) in hardValueMap
-                                      if string(k) != targetStr)
+  local knownValues = nothing
+  for (eq, eqStr) in zip(observedEquations, equationStrs)
+    contains(eqStr, targetStr) || continue
+    knownValues === nothing &&
+      (knownValues = Dict{Any, Any}(k => v for (k, v) in hardValueMap if string(k) != targetStr))
     local resolved = _resolveAffineInitialValue(target, eq, knownValues)
     resolved === nothing || return resolved
   end
@@ -732,7 +1912,7 @@ function _buildParamVector(params, pars; resolvedParams::Union{Dict{String,Float
 
   # Resolve parameter values by iterative substitution (reuse if already done)
   if resolvedParams === nothing
-    resolvedParams = _resolveParamValues(pars)
+    resolvedParams = _resolveParamValues(pars; used = Set{String}(string.(params)))
   end
 
   local matched = 0
@@ -782,7 +1962,7 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
      the value out via Symbolics.value before falling through to the name-based
      leaf lookup, otherwise we treat literals as unknown free vars. =#
   if !SymbolicUtils.iscall(expr) && !SymbolicUtils.issym(expr)
-    local v = try; Symbolics.value(expr); catch; nothing; end
+    local v = Symbolics.value(expr)
     if v isa Number
       return Float64(v)
     end
@@ -798,7 +1978,8 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
     end
     local result = try
       Base.invokelatest(f, numArgs...)
-    catch
+    catch _e
+      OMBackend._fallback(_e, :_evalSymbolicFunctionCall_2)
       return nothing
     end
     if result isa Number
@@ -815,26 +1996,39 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
 end
 
 
+#= The number `v` holds, or nothing. SymbolicUtils keeps a constant as a
+   Const term: `Num(1.0)` unwraps to one, not to a Number, so a test for a
+   Number missed every constant (each was resolved by substitution, 0.6 s for
+   the MSL DoublePendulum's 140 parameters). =#
+function _constantNumber(v)
+  local u = v isa Symbolics.Num ? Symbolics.unwrap(v) : v
+  u isa Number && return u
+  u isa Symbolics.SymbolicUtils.BasicSymbolic || return nothing
+  local c = Symbolics.SymbolicUtils.unwrap_const(u)
+  return c isa Number ? c : nothing
+end
+
 """
-    _resolveParamValues(pars)
+    _resolveParamValues(pars; used = nothing)
 
 Resolve parameter values by iteratively substituting known numeric values
 into symbolic parameter expressions. Returns a Dict{String, Float64}
-mapping parameter names to their numeric values.
+mapping parameter names to their numeric values. One of `used` (the system's
+parameters, by name; all when nothing) that does not resolve is refused.
 """
-function _resolveParamValues(pars)
+function _resolveParamValues(pars; used::Union{Nothing, Set{String}} = nothing)
   # Separate numeric and symbolic parameter values
   local numericByStr = Dict{String, Float64}()
   local symbolicByKey = Vector{Tuple{Any, Any, String}}()  # (unwrapped_key, unwrapped_val, str_key)
 
   for (k, v) in pars
     local kStr = string(k)
-    local uv = v isa Symbolics.Num ? Symbolics.unwrap(v) : v
-    if uv isa Number
-      numericByStr[kStr] = Float64(uv)
+    local cv = _constantNumber(v)
+    if cv !== nothing
+      numericByStr[kStr] = Float64(cv)
     else
       local uk = k isa Symbolics.Num ? Symbolics.unwrap(k) : k
-      push!(symbolicByKey, (uk, uv, kStr))
+      push!(symbolicByKey, (uk, v isa Symbolics.Num ? Symbolics.unwrap(v) : v, kStr))
     end
   end
 
@@ -863,13 +2057,15 @@ function _resolveParamValues(pars)
     for (uk, uv, kStr) in symbolicByKey
       local resolved = try
         Symbolics.substitute(uv, subDict)
-      catch
+      catch _e
+        OMBackend._fallback(_e, :_resolveParamValues_1)
         uv  # substitution failed, keep original
       end
       # Unwrap Num if needed before checking for numeric
       local unwrapped = resolved isa Symbolics.Num ? Symbolics.unwrap(resolved) : resolved
-      if unwrapped isa Number
-        local fval = Float64(unwrapped)
+      local cval = _constantNumber(unwrapped)
+      if cval !== nothing
+        local fval = Float64(cval)
         numericByStr[kStr] = fval
         nameToNumeric[kStr] = fval
         subDict[uk] = fval
@@ -881,7 +2077,8 @@ function _resolveParamValues(pars)
         local nameDict = Dict{Any, Any}()
         local freeVars = try
           Symbolics.get_variables(uv)
-        catch
+        catch _e
+          OMBackend._fallback(_e, :_resolveParamValues_2)
           Any[]
         end
         for fv in freeVars
@@ -893,13 +2090,15 @@ function _resolveParamValues(pars)
         if !isempty(nameDict)
           local resolved2 = try
             Symbolics.substitute(uv, nameDict)
-          catch
+          catch _e
+            OMBackend._fallback(_e, :_resolveParamValues_3)
             uv
           end
           # Unwrap Num if needed, then check for numeric result
           local unwrapped2 = resolved2 isa Symbolics.Num ? Symbolics.unwrap(resolved2) : resolved2
-          if unwrapped2 isa Number
-            local fval2 = Float64(unwrapped2)
+          local cval2 = _constantNumber(unwrapped2)
+          if cval2 !== nothing
+            local fval2 = Float64(cval2)
             numericByStr[kStr] = fval2
             nameToNumeric[kStr] = fval2
             subDict[uk] = fval2
@@ -909,7 +2108,8 @@ function _resolveParamValues(pars)
           # Last resort: try Symbolics.value on the substituted result
           local numVal = try
             Float64(Symbolics.value(resolved2))
-          catch
+          catch _e
+            OMBackend._fallback(_e, :_resolveParamValues_4)
             nothing
           end
           if numVal !== nothing && isfinite(numVal)
@@ -927,7 +2127,8 @@ function _resolveParamValues(pars)
           # function was registered after this call site was compiled.
           local fnVal = try
             _evalSymbolicFunctionCall(unwrapped2, nameToNumeric)
-          catch
+          catch _e
+            OMBackend._fallback(_e, :_resolveParamValues_5)
             nothing
           end
           if fnVal !== nothing && isfinite(fnVal)
@@ -949,7 +2150,10 @@ function _resolveParamValues(pars)
             Base.invokelatest(Core.eval, evalModule, :($sym = $v))
           end
           Float64(Base.invokelatest(Core.eval, evalModule, evalExpr))
-        catch
+        catch _e
+          #= A name of the expression not resolved yet (another parameter,
+             a model function) is undefined in the fresh module. =#
+          OMBackend._fallback(_e, :_resolveParamValues_6; expect = UndefVarError)
           nothing
         end
         if evalResult !== nothing && isfinite(evalResult)
@@ -969,14 +2173,12 @@ function _resolveParamValues(pars)
     @debug "DirectRHS: resolved $(newlyResolved) more params in iteration $(iteration) ($(length(remaining)) remaining)"
   end
 
-  if !isempty(symbolicByKey)
-    local unresolvedNames = [kStr for (_, _, kStr) in symbolicByKey]
-    local unresolvedVals = [string(uv) for (_, uv, _) in symbolicByKey]
-    @warn "DirectRHS: $(length(symbolicByKey)) parameters could not be resolved to numeric values, defaulting to 0.0" unresolvedNames unresolvedVals
-    for (_, _, kStr) in symbolicByKey
-      numericByStr[kStr] = 0.0
-    end
-  end
+  #= A parameter of the system (`used`) without a (finite) number would be 0.0
+     in the simulation: refused. =#
+  local unresolved = filter(e -> used === nothing || e[3] in used, symbolicByKey)
+  isempty(unresolved) ||
+    OMBackend.unsupported("parameters that do not resolve to finite numbers",
+                          join(("$(kStr) = $(uv)" for (_, uv, kStr) in unresolved), ", "))
 
   return numericByStr
 end
@@ -996,7 +2198,12 @@ function _extractAndMergeEventCallbacks(reducedSystem, customCallbacks)
   try
     eventCBs = ModelingToolkit.process_events(reducedSystem; callback=customCallbacks)
   catch ex
-    @warn "DirectRHS: failed to extract event callbacks, using custom callbacks only" exception=(ex, catch_backtrace())
+    #= Without the system's own events (if-equation relations, whens) the
+       result is wrong (it went on with the custom callbacks only, a warning:
+       MSL CauerLowPassSC on 2026-09-27; none in the 425 models now). =#
+    isempty(ModelingToolkit.continuous_events(reducedSystem)) && isempty(ModelingToolkit.discrete_events(reducedSystem)) ||
+      OMBackend.unsupported("events of the reduced system that process_events cannot build", sprint(showerror, ex))
+    OMBackend._fallback(ex, :_extractAndMergeEventCallbacks)
     return customCallbacks
   end
   if eventCBs === nothing
@@ -1008,9 +2215,39 @@ function _extractAndMergeEventCallbacks(reducedSystem, customCallbacks)
 end
 
 
-# Trivial reinit: no post-event DAE re-initialization, so the merged callback's
-# default (nothing) is behaviour-preserving.
-_isTrivialReinit(ia)::Bool = ia === nothing || ia isa ModelingToolkit.SciMLBase.NoInit
+"""
+    withProblemCallbacks(problem, buildCallbacks, callbacks) -> problem
+
+`problem` with the model's final event callbacks `callbacks`, ahead of them the
+events of the MTK system it was built with (its callbacks other than those of
+`buildCallbacks`, the set it was built from). A solve uses the problem's alone:
+solve() merges `problem.kwargs[:callback]` with the callbacks it is given, so a
+callback in both would run twice. The structural (VSS) paths build their
+problems from the build's callbacks, which stay the full set.
+"""
+function withProblemCallbacks(problem, buildCallbacks, callbacks)
+  local built = Base.IdSet{Any}(_callbackList(buildCallbacks))
+  local own = filter(c -> !(c in built), _callbackList(get(problem.kwargs, :callback, nothing)))
+  #= Lazily: a remake of an MTK problem with trivial initialization would
+     otherwise run it now, at build time, instead of in the solve. =#
+  return ModelingToolkit.SciMLBase.remake(problem; callback = DiffEqBase.CallbackSet(own..., _callbackList(callbacks)...),
+                                          lazy_initialization = true)
+end
+_callbackList(::Nothing) = Any[]
+_callbackList(cb::DiffEqBase.CallbackSet) = Any[cb.continuous_callbacks..., cb.discrete_callbacks...]
+_callbackList(cb::ModelingToolkit.SciMLBase.DECallback) = Any[cb]
+
+#= The re-initializations a merged callback can carry for all its components:
+   NoInit (the state as the affect left it) or nothing (the integrator's own,
+   BrownFullBasicInit for a DAE: defaultInitializeKwargs). They differ, and
+   OrdinaryDiffEqCore applies it at every event of the callback, also where it
+   only moves to the event time (`change_t_via_interpolation!`). The merge
+   created the callback with nothing for components that asked NoInit (MTK's
+   events): a full re-solve at each event, at the solve's abstol, and MSL
+   DifferenceAmplifier stopped with InitialFailure at its ramp's end.
+   EventReinit (a branch event's re-solve of the algebraic unknowns) has no
+   state either, so a callback carrying it is as model-independent. =#
+_mergeableReinit(ia)::Bool = ia === nothing || ia isa ModelingToolkit.SciMLBase.NoInit || ia isa EventReinit
 
 #= Typed callable structs for the merged continuous callback. Typed fields and a
    concrete struct type keep the merged condition/affect inferred (vs a closure
@@ -1071,6 +2308,34 @@ function (a::_MergedContinuousAffect)(integrator, gidx::Int)::Nothing
   return nothing
 end
 
+#= SciMLBase 3's VectorContinuousCallback has no affect_neg!: its affect! is
+   called once per event instant with the events of all components, 0 (none),
+   +1 (upcrossing) or -1 (downcrossing). A scalar sub gets its affect! or
+   affect_neg! by the sign; a vector sub gets its slice. =#
+const _VCC_HAS_AFFECT_NEG = hasfield(ModelingToolkit.SciMLBase.VectorContinuousCallback, :affect_neg!)
+
+struct _MergedContinuousEvents{S}
+  subs::S
+  offsets::Vector{Int}
+  nsub::Int
+end
+
+function (m::_MergedContinuousEvents)(integrator, events::AbstractVector)::Nothing
+  local SB = ModelingToolkit.SciMLBase
+  for k in 1:m.nsub
+    local s = m.subs[k]
+    local slice = view(events, (m.offsets[k] + 1):m.offsets[k + 1])
+    if s isa SB.VectorContinuousCallback
+      any(!iszero, slice) && s.affect!(integrator, slice)
+    else
+      local e = slice[1]
+      local aff = e > 0 ? s.affect! : e < 0 ? s.affect_neg! : nothing
+      aff === nothing || aff(integrator)
+    end
+  end
+  return nothing
+end
+
 # Runs every sub-callback's `initialize` at integration start. Lets a sub carrying a
 # custom initialize (e.g. chua's DAE event) collapse WITHOUT dropping it; the merge
 # is FunctionWrapper-erased so the VCC's initialize param stays model-independent.
@@ -1109,7 +2374,8 @@ any structural surprise: a non-`CallbackSet` argument, a continuous entry that i
 neither a scalar `ContinuousCallback` nor a `VectorContinuousCallback`, non-uniform
 `rootfind` / `save_positions` across components, or any component carrying event
 metadata a flat merge cannot represent (a custom `initialize` / `finalize`, an
-`idxs` slice, or a non-trivial reinitialization algorithm).
+`idxs` slice, or a re-initialization other than nothing, NoInit or EventReinit, or not the
+same for all components).
 """
 function _eraseContinuousCallbacks(cbset)
   local SB = ModelingToolkit.SciMLBase
@@ -1126,13 +2392,16 @@ function _eraseContinuousCallbacks(cbset)
      bound the integrator needs (it never dispatches on the concrete callback type). =#
   #= A flat merge is faithful only when no sub-callback carries event metadata the
      merge cannot represent: a custom `finalize` (would be dropped), an `idxs` slice
-     (the condition would read the wrong state), or a non-trivial reinitialization
-     algorithm (post-event DAE consistency would change). A custom `initialize` IS
+     (the condition would read the wrong state), or a re-initialization the merged
+     callback cannot carry for all of them (`_mergeableReinit`, and the same for
+     all: post-event DAE consistency would change). A custom `initialize` IS
      allowed: it is preserved via the merged initialize below (chua's DAE event). =#
+  local reinit = subs[1].initializealg
   for s in subs
     (s.finalize === SB.FINALIZE_DEFAULT &&
      s.idxs === nothing &&
-     _isTrivialReinit(s.initializealg)) || return cbset
+     _mergeableReinit(s.initializealg) &&
+     typeof(s.initializealg) == typeof(reinit)) || return cbset
   end
   #= A single VectorContinuousCallback applies one rootfind / save_positions to
      every component, so only collapse when these already agree. =#
@@ -1146,20 +2415,25 @@ function _eraseContinuousCallbacks(cbset)
   local total::Int = offsets[end]
   local nsub::Int = length(subs)
   local condF = _MergedContinuousCondition(subs, offsets, nsub)
-  local affF = _MergedContinuousAffect(subs, offsets, lens, nsub, false)
-  local affNF = _MergedContinuousAffect(subs, offsets, lens, nsub, true)
   local initF = _MergedContinuousInitialize(subs, nsub)
   local FW = DiffEqBase.FunctionWrapper
   local condW = FW{Nothing, Tuple{AbstractVector{Float64}, AbstractVector{Float64}, Float64, Any}}(condF)
-  local affW = FW{Nothing, Tuple{Any, Int}}(affF)
-  local affNW = FW{Nothing, Tuple{Any, Int}}(affNF)
   #= Always FunctionWrapper-wrap the merged initialize (even when every sub uses the
      default) so the VCC's initialize param is the SAME model-independent type whether or
      not a sub carries a custom initialize -> chua and the synthetic bake share one type. =#
   local initW = FW{Nothing, Tuple{Any, Any, Any, Any}}(initF)
-  local vcc = SB.VectorContinuousCallback(condW, affW, affNW, total;
-                                          initialize = initW,
-                                          rootfind = rootfind, save_positions = savePos)
+  local vcc = if _VCC_HAS_AFFECT_NEG
+    local affW = FW{Nothing, Tuple{Any, Int}}(_MergedContinuousAffect(subs, offsets, lens, nsub, false))
+    local affNW = FW{Nothing, Tuple{Any, Int}}(_MergedContinuousAffect(subs, offsets, lens, nsub, true))
+    SB.VectorContinuousCallback(condW, affW, affNW, total;
+                                initialize = initW, rootfind = rootfind, save_positions = savePos,
+                                initializealg = reinit)
+  else
+    local evW = FW{Nothing, Tuple{Any, Any}}(_MergedContinuousEvents(subs, offsets, nsub))
+    SB.VectorContinuousCallback(condW, evW, total;
+                                initialize = initW, rootfind = rootfind, save_positions = savePos,
+                                initializealg = reinit)
+  end
   return SB.CallbackSet(vcc, dc...)
 end
 
@@ -1178,17 +2452,31 @@ function _toFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=not
 end
 
 function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)::Union{Float64, Nothing}
+  local cv = _constantNumber(val)
+  cv === nothing || return Float64(cv)
   local unwrapped = val isa Symbolics.Num ? Symbolics.unwrap(val) : val
-  unwrapped isa Number && return Float64(unwrapped)
   # Constant symbolic expression (no free variables): parse its string repr
   local freeVars = try
     Symbolics.get_variables(unwrapped)
-  catch
+  catch _e
+    OMBackend._fallback(_e, :_tryToFloat64_1)
     return nothing
   end
+  #= A start value reading time: the build's start time, 0 (u0 is built once;
+     _startTimeGuard refuses another start time). It was 0.0 with a warning. =#
+  local timeVars = filter(v -> string(v) == "t", freeVars)
+  if !isempty(timeVars)
+    return _tryToFloat64(Symbolics.substitute(unwrapped, Dict{Any, Any}(v => 0.0 for v in timeVars));
+                         resolvedParams = resolvedParams)
+  end
   if isempty(freeVars)
-    local f = tryparse(Float64, string(val))
+    local str = string(val)
+    local f = tryparse(Float64, str)
     f !== nothing && return f
+    #= A Boolean start value (MSL FluxTubes' asc(start = true)): a symbolic
+       constant true that became 0.0, false. =#
+    local b = tryparse(Bool, str)
+    b !== nothing && return Float64(b)
   end
   if resolvedParams !== nothing
     # Direct name lookup (handles bare parameter references)
@@ -1201,13 +2489,83 @@ function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=
                                      if haskey(resolvedParams, string(fv)))
       if !isempty(subDict)
         local resolved = Symbolics.substitute(unwrapped, subDict)
-        resolved isa Number && return Float64(resolved)
+        local cval = _constantNumber(resolved)
+        cval === nothing || return Float64(cval)
         local rv = resolved isa Symbolics.Num ? Symbolics.unwrap(resolved) : resolved
-        rv isa Number && return Float64(rv)
-        local vextract = try; Symbolics.value(rv); catch; nothing; end
+        local vextract = Symbolics.value(rv)
         vextract isa Number && return Float64(vextract)
+        #= A call the substitution does not fold (`floor(2.7)` of the start
+           `integer(p27)`: the fixed state started at 0.0). =#
+        local folded = _evalConstantTerm(rv)
+        folded isa Number && return Float64(folded)
       end
     end
   end
+  isempty(freeVars) && (local folded = _evalConstantTerm(unwrapped); folded isa Number) && return Float64(folded)
   return nothing
+end
+
+#= An initialization equation on der(der(x)) (Differential(t, 2)) was taken as
+   one on der(x): its order is not checked where the state is matched.
+   Refused, as OpenModelica does. =#
+function _requireFirstOrder(@nospecialize(lhs), eq)
+  local op = SymbolicUtils.operation(lhs)
+  local order = hasproperty(op, :order) ? getproperty(op, :order) : 1
+  order == 1 || OMBackend.unsupported("an initial equation on a derivative of order $(order)", string(eq))
+  return nothing
+end
+
+"""
+    substituteDerivatives(expr, eqs)
+
+`expr` with each derivative `D(x)` replaced by the right side of its explicit
+equation `D(x) ~ f` among `eqs`; nothing when a derivative has none.
+"""
+function substituteDerivatives(expr, eqs)
+  local SU = Symbolics.SymbolicUtils
+  local subs = Dict{Any, Any}()
+  for eq in eqs
+    local l = Symbolics.unwrap(eq.lhs)
+    SU.iscall(l) && SU.operation(l) isa Symbolics.Differential && (subs[l] = eq.rhs)
+  end
+  local r = isempty(subs) ? expr : Symbolics.substitute(expr, subs)
+  return _hasDerivative(Symbolics.unwrap(r)) ? nothing : r
+end
+
+function _hasDerivative(@nospecialize(x))::Bool
+  local SU = Symbolics.SymbolicUtils
+  SU.iscall(x) || return false
+  SU.operation(x) isa Symbolics.Differential && return true
+  return any(_hasDerivative, SU.arguments(x))
+end
+
+#= Whether a value reads a variable that is neither time nor a resolved parameter. =#
+function _readsUnknowns(@nospecialize(val), resolvedParams)::Bool
+  local u = val isa Symbolics.Num ? Symbolics.unwrap(val) : val
+  u isa Number && return false
+  local vars = try
+    Symbolics.get_variables(u)
+  catch e
+    OMBackend._fallback(e, :_readsUnknowns)
+    return true
+  end
+  return any(v -> string(v) != "t" && (resolvedParams === nothing || !haskey(resolvedParams, string(v))), vars)
+end
+
+#= A symbolic term without variables, evaluated by applying its operations to
+   its evaluated arguments; nothing where it has a variable. =#
+function _evalConstantTerm(@nospecialize(x))
+  local u = x isa Symbolics.Num ? Symbolics.unwrap(x) : x
+  u isa Number && return u
+  local v = Symbolics.value(u)
+  v isa Number && return v
+  Symbolics.SymbolicUtils.iscall(u) || return nothing
+  local args = Any[_evalConstantTerm(a) for a in Symbolics.SymbolicUtils.arguments(u)]
+  any(a -> a === nothing, args) && return nothing
+  return try
+    Symbolics.SymbolicUtils.operation(u)(args...)
+  catch e
+    OMBackend._fallback(e, :_evalConstantTerm)
+    nothing
+  end
 end

@@ -46,6 +46,7 @@ using MetaModelica: @assign
 const CURRENT_DIRECTORY = @__DIR__
 include("$CURRENT_DIRECTORY/util.jl")
 include("$CURRENT_DIRECTORY/globalConstants.jl")
+include("$CURRENT_DIRECTORY/errorPolicy.jl")
 export PLOT_PACKAGE_GRAPH
 include("$CURRENT_DIRECTORY/FrontendUtil/FrontendUtil.jl")
 include("$CURRENT_DIRECTORY/BackendUtil/BackendUtil.jl")
@@ -59,6 +60,8 @@ include("$CURRENT_DIRECTORY/CodeGeneration/iMTKGen.jl")
 include("backendUtils.jl")
 #= Finally add the API=#
 include("backendAPI.jl")
+#= The modules of the source, for the error policy's programming errors. =#
+_collectSourceModules!(@__MODULE__)
 #= Precompile workload: warm shared MTK/OrdinaryDiffEq build+solve instances. =#
 include("precompile.jl")
 end #=OMBackend=#

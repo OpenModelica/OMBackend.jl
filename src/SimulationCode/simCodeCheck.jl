@@ -272,7 +272,9 @@ Base.@nospecializeinfer function _walkExpChildren(visit::Function, @nospecialize
     DAE.RELATION(l, _, r, _, _) => begin visit(l); visit(r) end
     DAE.IFEXP(c, t, e)          => begin visit(c); visit(t); visit(e) end
     DAE.CAST(_, e)              => visit(e)
-    DAE.ASUB(e, subs)           => begin visit(e); for s in subs; visit(s) end end
+    #= ASUB subscripts are DAE.Subscript (INDEX/SLICE/WHOLE_NONEXP wrap an
+       expression; WHOLEDIM has none), not expressions. =#
+    DAE.ASUB(e, subs)           => begin visit(e); for s in subs; s isa DAE.WHOLEDIM || visit(s.exp) end end
     DAE.TSUB(e, _, _)           => visit(e)
     DAE.RSUB(e, _, _, _)        => visit(e)
     DAE.ARRAY(_, _, es)         => for e in es; visit(e) end
@@ -360,22 +362,6 @@ function rule_balanced(simCode::SIM_CODE)::Vector{CheckViolation}
   return out
 end
 push!(RULES, rule_balanced)
-
-function _countUnknowns(simCode::SIM_CODE)::Int
-  local eliminated = OrderedSet(simCode.eliminatedVariables)
-  local n = 0
-  for (_, (_, v)) in simCode.stringToSimVarHT
-    if v.name in eliminated
-      continue
-    end
-    #= STATE_DERIVATIVE is tracked but not independent, so it does not count
-       toward unknowns even though `isUnknownVarKind` returns true for it. =#
-    if isUnknownVarKind(v.varKind) && !(v.varKind isa STATE_DERIVATIVE)
-      n += 1
-    end
-  end
-  return n
-end
 
 #= ── Rule: alias consistency ──────────────────────────────────────── =#
 

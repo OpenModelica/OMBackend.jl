@@ -136,10 +136,12 @@ function _refName(@nospecialize(e))
   return nothing
 end
 
-#= `0 ~ const + ref` or `0 ~ ref - const` or `0 ~ -ref`. Returns the
-   pinned cref name, or nothing. =#
+#= `0 ~ const + ref` or `0 ~ ref - const` or `0 ~ -ref` or `0 ~ ref` (a
+   discrete set to zero: MSL Media's state.phase = setState_phX(...).phase,
+   the function's constant output 0). Returns the pinned cref name, or nothing. =#
 function _matchAlias(@nospecialize(rhs))
   rhs = _unwrap(rhs)
+  rhs isa Symbol && return string(rhs)
   rhs isa Expr || return nothing
   if rhs.head === :call && length(rhs.args) == 3
     local op = rhs.args[1]
@@ -390,7 +392,8 @@ function _collectCyclicSCCDiscretes(simCode, whenAssignedSet::OrderedSet{String}
       end
     end
   catch err
-    @debug "[MTK GEN: discrete] cyclic SCC demotion skipped" exception=(err, catch_backtrace())
+    #= Cyclic SCC demotion skipped (the structure changes). =#
+    OMBackend._fallback(err, :cyclicDiscreteDemotion; impact = :result)
   end
   return cyclic
 end
@@ -465,6 +468,10 @@ function _residualDefinedDiscretes(equations::Vector{Expr}, discreteSet::Ordered
     if eq isa Expr && eq.head === :call && length(eq.args) == 3 &&
        eq.args[1] === :~ && eq.args[2] == 0
       local rhs = _unwrap(eq.args[3])
+      if rhs isa Symbol
+        string(rhs) in discreteSet && push!(defined, string(rhs))
+        continue
+      end
       rhs isa Expr || continue
       if rhs.head === :call && length(rhs.args) == 3 && (rhs.args[1] === :- || rhs.args[1] === :+)
         for operand in (rhs.args[2], rhs.args[3])
@@ -519,7 +526,7 @@ end
 
 """
     planDemotions(simCode, equations, ifEqComponents, discreteVariables,
-                  nStateVars, nAlgebraicVars, nOccVars) -> DemotionPlan
+                  nStateVars, nAlgebraicVars) -> DemotionPlan
 
 Decide which discrete variables should be demoted from "held state" to
 "algebraic unknown". Sources used (in priority order):
@@ -546,13 +553,12 @@ function planDemotions(simCode,
                        ifEqComponents::Vector{IfEquationComponent},
                        discreteVariables::Vector{String},
                        nStateVars::Int,
-                       nAlgebraicVars::Int,
-                       nOccVars::Int)::DemotionPlan
+                       nAlgebraicVars::Int)::DemotionPlan
   #= Codegen-time over-determination count. The +length(discreteVariables)
      accounts for the (yet-to-be-filtered) dummy `der(d) ~ 0` equations. =#
   local nConditionalEqs = sum(length(c.conditionalEquations) for c in ifEqComponents; init = 0)
   local nTotalEqs = length(equations) + length(discreteVariables) + nConditionalEqs
-  local nTotalVars = nStateVars + nAlgebraicVars + length(discreteVariables) + nOccVars
+  local nTotalVars = nStateVars + nAlgebraicVars + length(discreteVariables)
   local excess = nTotalEqs - nTotalVars
 
   #= Discount duplicate residuals. =#
@@ -586,7 +592,7 @@ function planDemotions(simCode,
     if nm in aliasPinned
       push!(toDemote, dv)
     elseif nm in conditionalTargets && !(nm in whenAssignedSet) &&
-           get(ENV, "OMBACKEND_DEMOTE_CONDTARGETS", "true") == "true"
+           OMBackend.envSwitch("OMBACKEND_DEMOTE_CONDTARGETS")
       #= The discrete IS the LHS of an if-equation relay: that equation pins
          it definitionally, so the held-state dummy would over-determine. =#
       push!(toDemote, dv)
