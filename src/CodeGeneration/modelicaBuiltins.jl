@@ -12,6 +12,7 @@
 =#
 
 import LinearAlgebra
+import Printf
 import Symbolics
 
 #= ============================================================================
@@ -532,16 +533,13 @@ function modelica_String(x::Real, format::AbstractString)
   return _cFormat("%" * format, Float64(x))
 end
 
-#= C's snprintf of one double, after the width and precision of a `*.*` format. =#
+#= C's printf of one double, after the width and precision of a `*.*` format,
+   through Julia's Printf (the same conversions, as C): Windows exports no
+   snprintf symbol (the Universal CRT defines it inline), and the ccall failed
+   there ("could not load symbol", 2026-10-03). =#
 function _cFormat(fmt::String, x::Float64; width::Union{Integer, Nothing} = nothing, precision::Integer = 0)
-  local n = width === nothing ?
-    @ccall(snprintf(C_NULL::Ptr{UInt8}, 0::Csize_t, fmt::Cstring; x::Cdouble)::Cint) :
-    @ccall(snprintf(C_NULL::Ptr{UInt8}, 0::Csize_t, fmt::Cstring; Cint(width)::Cint, Cint(precision)::Cint, x::Cdouble)::Cint)
-  local buf = Vector{UInt8}(undef, n + 1)
-  width === nothing ?
-    @ccall(snprintf(buf::Ptr{UInt8}, (n + 1)::Csize_t, fmt::Cstring; x::Cdouble)::Cint) :
-    @ccall(snprintf(buf::Ptr{UInt8}, (n + 1)::Csize_t, fmt::Cstring; Cint(width)::Cint, Cint(precision)::Cint, x::Cdouble)::Cint)
-  return String(resize!(buf, n))
+  width === nothing || (fmt = replace(fmt, "*.*" => string(width, ".", precision)))
+  return Printf.format(Printf.Format(fmt), x)
 end
 
 #= A call of Modelica's String with the arguments the frontend fills in, each
