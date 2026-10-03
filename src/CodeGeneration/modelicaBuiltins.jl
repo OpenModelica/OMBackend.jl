@@ -41,8 +41,8 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
   "mod"       => :modelica_mod,
   "rem"       => :modelica_rem,
 
-  #= --- String formatting --- =#
-  "String"    => :modelica_String,
+  #= String formatting: modelicaStringCall, which takes the argument types from
+     the expressions (the values can arrive as Float64s). =#
 
   #= --- Trigonometric --- =#
   "sin"       => :modelica_sin,
@@ -91,6 +91,10 @@ const MODELICA_BUILTIN_FUNCTIONS = Dict{String, Symbol}(
   "product"   => :modelica_product,
   "min"       => :modelica_min,
   "max"       => :modelica_max,
+  #= The frontend's positiveMax of a stream connection (inStream with three or
+     more connectors, NFConnectEquations.makePositiveMaxCall): max(flow, eps),
+     as OpenModelica's runtime (MSL Fluid AST_BatchPlant). =#
+  "OMCPositiveMax" => :modelica_max,
 
   #= --- Array shape/query --- =#
   "size"      => :modelica_size,
@@ -144,6 +148,29 @@ const MODELICA_UTILITIES_TO_RUNTIME_C = Dict{String, Symbol}(
   "Modelica_Math_Random_Utilities_impureRandomInteger"    => :Modelica_Math_Random_Utilities_impureRandomInteger,
 )
 
+"""
+    RuntimeCCall(f)(args...)
+
+A call of the OMRuntimeExternalC function `f` from an equation or a parameter binding. A
+symbolic argument (a parameter while the model is built: `id = initializeImpureRandom(globalSeed)`)
+gives an opaque term that MTK evaluates once the parameters have values. Those values arrive as
+Float64, so integral ones are passed as Integers, which the C side's Integer arguments take, and
+a Bool as an Integer (`caseSensitive`). The functions of MODELICA_UTILITIES_TO_RUNTIME_C take
+Integers and Strings only; one with a Real argument would need this conversion narrowed.
+"""
+struct RuntimeCCall{F} <: Function
+  f::F
+end
+function (c::RuntimeCCall)(args...)
+  if any(a -> a isa Symbolics.Num || a isa Symbolics.SymbolicUtils.BasicSymbolic, args)
+    return CodeGeneration.makeSymbolicTerm(c, Any[Symbolics.unwrap(a) for a in args])
+  end
+  return c.f(map(_integralAsInt, args)...)
+end
+_integralAsInt(x::AbstractFloat) = isinteger(x) && abs(x) <= maxintfloat(Float64) ? Int(x) : x
+_integralAsInt(x::Bool) = Int(x)
+_integralAsInt(x) = x
+
 
 #= ============================================================================
    Mathematical functions (scalar)
@@ -163,10 +190,13 @@ modelica_integer(x) = floor(x)
    Our codegen lowers enum CREFs to integer indices and ENUM_LITERAL to its
    `index` field, so this is the identity at the Julia level. =#
 modelica_Integer(x) = x
+#= Truncated toward zero (MLS 3.7.1: div(-7, 2) = -3), as Base.div; a symbolic
+   quotient through sign and floor (it was floor: -4). =#
 modelica_div(x, y) = div(x, y)
-modelica_div(x::Symbolics.Num, y) = floor(x / y)
-modelica_div(x, y::Symbolics.Num) = floor(x / y)
-modelica_div(x::Symbolics.Num, y::Symbolics.Num) = floor(x / y)
+modelica_div(x::Symbolics.Num, y) = _truncSymbolic(x / y)
+modelica_div(x, y::Symbolics.Num) = _truncSymbolic(x / y)
+modelica_div(x::Symbolics.Num, y::Symbolics.Num) = _truncSymbolic(x / y)
+_truncSymbolic(q) = sign(q) * floor(abs(q))
 modelica_mod(x, y) = mod(x, y)
 modelica_rem(x, y) = rem(x, y)
 
@@ -476,24 +506,91 @@ modelica_delay(expr, delayTime) = expr
 modelica_delay(expr, delayTime, delayMax) = expr
 
 """
-    modelica_String(x[, sigDigits, padding, leftAdjust])
-    modelica_String(x[, minLen, leftAdjust])
+    modelica_String(r::Real, significantDigits, minimumLength, leftJustified)
+    modelica_String(x::Integer, minimumLength, leftJustified)
+    modelica_String(r::Real, format)
 
-Modelica: `String(x, ...)` converts a value to its formatted string form.
-The signature has several variants for Real / Integer / Boolean / Enumeration
-inputs with optional formatting controls. We map all variants to a single
-helper so the per-model module sees a defined function rather than the
-raw Julia `String` constructor (which only accepts byte vectors / pointers
-and rejects `String(::Float64, ::Int64, ::Int64, ::Bool)` etc.).
-
-Returns Julia's `string(x)` representation. Padding / leftAdjust / sigDigits
-are accepted but ignored; the result is sufficient for any downstream use
-that just consumes the digits (e.g. table-name suffixes in Media examples).
+Modelica's `String` (MLS 3.7.2), formatted as OpenModelica does (C's printf,
+its runtime's modelica_string.c): a Real with `significantDigits` significant
+digits (`%.*g`); an Integer or a Boolean (`true`, `false`); at least
+`minimumLength` characters, padded with blanks on the right if
+`leftJustified`, else on the left; or a Real in a C format without its `%`
+(`"8.3f"`: conversion f, e, E, g or G). The frontend fills in the defaults:
+a generated call has every argument (modelicaStringCall, which also gives an
+enumeration value as its literal's name).
 """
-modelica_String(x) = string(x)
-modelica_String(x, sigDigits::Int) = string(x)
-modelica_String(x, sigDigits::Int, minLen::Int) = string(x)
-modelica_String(x, sigDigits::Int, minLen::Int, leftAdjust::Bool) = string(x)
+modelica_String(x::Real, significantDigits::Integer, minimumLength::Integer, leftJustified::Bool) =
+  _cFormat(leftJustified ? "%-*.*g" : "%*.*g", Float64(x); width = minimumLength, precision = significantDigits)
+modelica_String(x::Integer, minimumLength::Integer, leftJustified::Bool) =
+  modelica_String(x isa Bool ? (x ? "true" : "false") : string(x), minimumLength, leftJustified)
+#= An enumeration literal's name. =#
+modelica_String(x::AbstractString, minimumLength::Integer, leftJustified::Bool) =
+  leftJustified ? rpad(x, minimumLength) : lpad(x, minimumLength)
+function modelica_String(x::Real, format::AbstractString)
+  occursin(r"^[#0 +-]*[0-9]*(\.[0-9]*)?[feEgG]$", format) ||
+    throw(ArgumentError("String(r, format = \"$(format)\"): not a format of a Real (flags, width, precision, then f, e, E, g or G)"))
+  return _cFormat("%" * format, Float64(x))
+end
+
+#= C's snprintf of one double, after the width and precision of a `*.*` format. =#
+function _cFormat(fmt::String, x::Float64; width::Union{Integer, Nothing} = nothing, precision::Integer = 0)
+  local n = width === nothing ?
+    @ccall(snprintf(C_NULL::Ptr{UInt8}, 0::Csize_t, fmt::Cstring; x::Cdouble)::Cint) :
+    @ccall(snprintf(C_NULL::Ptr{UInt8}, 0::Csize_t, fmt::Cstring; Cint(width)::Cint, Cint(precision)::Cint, x::Cdouble)::Cint)
+  local buf = Vector{UInt8}(undef, n + 1)
+  width === nothing ?
+    @ccall(snprintf(buf::Ptr{UInt8}, (n + 1)::Csize_t, fmt::Cstring; x::Cdouble)::Cint) :
+    @ccall(snprintf(buf::Ptr{UInt8}, (n + 1)::Csize_t, fmt::Cstring; Cint(width)::Cint, Cint(precision)::Cint, x::Cdouble)::Cint)
+  return String(resize!(buf, n))
+end
+
+#= A call of Modelica's String with the arguments the frontend fills in, each
+   lowered by `lower`: (r, significantDigits, minimumLength, leftJustified),
+   (x, minimumLength, leftJustified) of an Integer, Boolean or enumeration
+   value, or (r, format). Where the integrator holds the values they are
+   Float64s: Integer arguments are rounded, Boolean ones compared with 0, and
+   an enumeration value is its literal's name. =#
+function modelicaStringCall(args::AbstractVector, lower)::Expr
+  local S = :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_String)
+  local int = e -> :(round(Int, $(lower(e))))
+  local bool = e -> :($(lower(e)) != 0)
+  local n = length(args)
+  n == 4 && return Expr(:call, S, lower(args[1]), int(args[2]), int(args[3]), bool(args[4]))
+  n == 2 && return Expr(:call, S, lower(args[1]), lower(args[2]))
+  n == 3 || CodeGeneration.unsupported("String with $(n) arguments", join(string.(args), ", "))
+  local x = args[1]
+  local ty = _daeValueType(x)
+  local value = if x isa DAE.ENUM_LITERAL
+    _lastIdent(x.name)
+  elseif ty isa DAE.T_ENUMERATION && !isempty(ty.names)
+    :($(Tuple(collect(String, ty.names)))[round(Int, $(lower(x)))])
+  elseif ty isa DAE.T_BOOL
+    bool(x)
+  elseif ty isa DAE.T_INTEGER
+    int(x)
+  else
+    CodeGeneration.unsupported("String of a value whose type the expression does not give", string(x))
+  end
+  return Expr(:call, S, value, int(args[2]), bool(args[3]))
+end
+
+#= The type of a DAE expression's value, where the expression carries it. =#
+Base.@nospecializeinfer function _daeValueType(@nospecialize(e))
+  @match e begin
+    DAE.ICONST(__) => DAE.T_INTEGER_DEFAULT
+    DAE.RCONST(__) => DAE.T_REAL_DEFAULT
+    DAE.BCONST(__) || DAE.RELATION(__) || DAE.LBINARY(__) || DAE.LUNARY(__) => DAE.T_BOOL_DEFAULT
+    DAE.CREF(_, ty) => ty
+    DAE.CALL(attr = attr) => attr.ty
+    DAE.CAST(ty, _) => ty
+    DAE.BINARY(_, op, _) => hasproperty(op, :ty) ? op.ty : nothing
+    DAE.UNARY(op, _) => hasproperty(op, :ty) ? op.ty : nothing
+    DAE.IFEXP(_, a, _) => _daeValueType(a)
+    _ => nothing
+  end
+end
+
+_lastIdent(p::Absyn.Path)::String = p isa Absyn.IDENT ? p.name : _lastIdent(p.path)
 
 """
     modelica_homotopy(actual, simplified)
@@ -502,6 +599,11 @@ Modelica: homotopy(actual, simplified) for initialization.
 We return the actual expression (lambda=1 case).
 """
 modelica_homotopy(actual, simplified) = actual
+
+#= In the equations, with the homotopy parameter λ: the actual expression at
+   λ = 1 (the simplified one is not used there, and may be anything), the
+   blend λ actual + (1 - λ) simplified below it. =#
+modelica_homotopy(actual, simplified, λ) = ifelse(λ >= 1, actual, λ * actual + (1 - λ) * simplified)
 
 """
     modelica_semiLinear(x, k_pos, k_neg)

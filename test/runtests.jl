@@ -148,7 +148,10 @@ import .ExampleDAEs
         println("root_codegen=", isfile(joinpath(ENV["OMJL_LOG_DIR"], "backend", "codeGen", "equationFirstStageCodeGen.log")))
         println("run_codegen=", all(dir -> isfile(joinpath(ENV["OMJL_LOG_DIR"], dir, "backend", "codeGen", "equationFirstStageCodeGen.log")), runDirs))
         """
-        local output = read(`$(Base.julia_cmd()) --startup-file=no --project=$(repoRoot) -e $script`, String)
+        #= The test environment, which has OMBackend's dependencies: the package's own
+           project is not instantiated where its siblings are developed into a
+           temporary environment (OM.jl's ci/test-package.jl, since [sources] is gone). =#
+        local output = read(`$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script`, String)
         @test occursin("same_module=true", output)
         @test occursin("run_count=2", output)
         @test occursin("root_codegen=false", output)
@@ -305,13 +308,16 @@ import .ExampleDAEs
       @test isempty(inits)
     end
 
-    @testset "array {initial(), other} is extracted" begin
+    @testset "array {initial(), other}: an initial algorithm and a when on the other" begin
+      #= The when fires at the initialization and whenever `other` becomes true
+         (MLS 8.3.5; the MSL ZeroOrderHold's `when {sampleTrigger, initial()}`). =#
       local arrCond = DAE.ARRAY(DAE.T_BOOL(nil), false,
                                 list(initialCall, nonInitialCref))
       local input = BDAE.WHEN_EQUATION[mkWhenEq(arrCond)]
       local (kept, inits) = SC.extractInitialWhenAlgorithms(input)
-      @test isempty(kept)
       @test length(inits) == 1
+      @test length(kept) == 1
+      @test kept[1].whenEquation.condition == nonInitialCref
     end
 
     @testset "mixed input partitions correctly" begin
@@ -372,5 +378,38 @@ import .ExampleDAEs
 
   #= ── 7. Discrete-dummy demotion planning ──────────────────────── =#
   include("discreteDummyDemotionTests.jl")
+
+  #= ── 8. One event callback per relation zero set ─────────────── =#
+  include("relationZeroSetTests.jl")
+
+  #= ── 9. Event iteration within one event ─────────────────────── =#
+  include("eventIterationTests.jl")
+
+  #= ── 10. Step control for algebraic unknowns ─────────────────── =#
+  include("algebraicStepControlTests.jl")
+
+  #= ── 11. The error policy of fallbacks ───────────────────────── =#
+  include("errorPolicyTests.jl")
+
+  #= ── 12. The Modelica builtins of generated code ─────────────── =#
+  include("modelicaBuiltinsTests.jl")
+
+  #= ── 13. The names Modelica function statements read ──────────── =#
+  include("functionBodyCrefsTests.jl")
+
+  #= ── 14. Protected variables keep their attributes ────────────── =#
+  include("protectedAttributesTests.jl")
+
+  #= ── 15. Calls of generated functions have the function's arity ─ =#
+  include("functionArityTests.jl")
+
+  #= ── 16. Generated functions hash the same in every process ───── =#
+  include("deterministicHashTests.jl")
+
+  #= ── 17. Merged continuous callbacks keep their re-initialization =#
+  include("eventCallbackMergeTests.jl")
+
+  #= ── 18. Solve keyword arguments with an abstol per unknown ────── =#
+  include("solveKwargsTests.jl")
 
 end

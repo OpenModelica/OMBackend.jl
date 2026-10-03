@@ -55,12 +55,30 @@ import ..@BACKEND_LOGGING
 import ..BackendUtil.GraphAlgorithms
 import ..FrontendUtil.Util
 
+import ..OMBackend: TUNABLE_PARAMETERS, isTunableParameter
+
 include("simCodeData.jl")
 include("simCodeTraverse.jl")
-include("simCodeUtil.jl")
+include("simCodePasses.jl")
+include("complexLowering.jl")
+include("simVarQueries.jl")
+include("simCodeGraphs.jl")
+include("trivialEquations.jl")
+include("outputOnlyElimination.jl")
+include("aliasElimination.jl")
+include("constantPropagation.jl")
+include("discreteClassification.jl")
+include("parameterClosure.jl")
+include("canonicalNames.jl")
+include("parameterElimination.jl")
+include("frozenStates.jl")
+include("explicitFold.jl")
+include("simCodeDiagnostics.jl")
+include("initialValues.jl")
 include("simCodeDump.jl")
 include("simulationCodeTransformation.jl")
 include("simCodeFunctions.jl")
+include("simCodeFunctionEval.jl")
 include("simCodeCheck.jl")
 include("simCodeExpBridge.jl")
 

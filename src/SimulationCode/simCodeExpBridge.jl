@@ -1,30 +1,17 @@
-#= Phase 4 SimCode-Exp infrastructure (additive).
+#= Boundary helpers between SimCode's own `Exp` (simCodeData.jl) and
+   DAE.Exp; the SimCode passes are part way through moving to `Exp`.
 
-   The SimCode-native `Exp` hierarchy is defined in `simCodeData.jl`.
-   This file holds the only public boundary helpers:
+   - `convert(DAE.Exp, ::Exp)` (toDAEExp), for DAE.Exp consumers that
+     convert explicitly. Julia converts only on field assignment and
+     explicit calls, so each codegen consumer of `Exp` has its own
+     `::SimulationCode.Exp` method instead (codeGen.jl,
+     MTK_CodeGenerationUtil.jl, algorithmic.jl, DECodeGeneration.jl).
+   - Util's DAE traversals on `Exp`, through toDAEExp.
+   - No `convert(Exp, ::DAE.Exp)`: see below.
 
-   - `Base.convert(::Type{Exp}, ::DAE.Exp)` so the auto-generated outer
-     constructors of any equation struct whose `exp` field is still
-     typed `::DAE.Exp` keep accepting bare DAE.Exp values from BDAE
-     producers without explicit cast.
-
-   - `Base.convert(::Type{DAE.Exp}, ::Exp)` so a SimCode-native `Exp`
-     can be passed to legacy DAE.Exp consumers via explicit
-     `convert(DAE.Exp, e)` (Julia does NOT auto-trip convert at
-     function dispatch boundaries, only at struct-field assignment
-     and explicit convert calls — that is the reason every codegen
-     consumer that wants to keep working with SIM Exp gets a native
-     `::SimulationCode.Exp` overload instead of relying on convert).
-
-   The previous attempt at a per-helper SIM-Exp delegating overload
-   per `::DAE.Exp` consumer (via `toDAEExp`) was abandoned: round-
-   tripping every expression through `DAE.Exp` re-runs frontend-grade
-   walks and slowed `OM.translate` to a crawl during precompile.
-   The correct path is native SIM-Exp emit functions
-   (`expToJulia*(::SimulationCode.Exp, …)` overloads with bodies that
-   walk SIM Exp directly). Those overloads live in their respective
-   codegen files; see `codeGen.jl`, `MTK_CodeGenerationUtil.jl`,
-   `algorithmic.jl`, `DECodeGeneration.jl`. =#
+   Delegating every `Exp` consumer to its DAE.Exp twin through toDAEExp was
+   tried and abandoned: the round trips slowed OM.translate to a crawl
+   during precompile. =#
 
 Base.@nospecializeinfer function Base.convert(::Type{DAE.Exp}, @nospecialize(e::Exp))
   return toDAEExp(e)
@@ -45,3 +32,14 @@ end
 # SimCode.Exp — which surfaces as "unsupported DAE.Exp variant" warnings
 # whenever a downstream check expects a DAE.* tag. Re-add ONLY when an
 # equation field actually carries `::Exp`, never as a general bridge.
+
+#= `Util.traverseExpTopDown(::DAE.Exp, func, ext_arg)` is the canonical
+   recursive descent over a `DAE.Exp` tree used by alias substitution,
+   constant folding, cref collection, etc. When the caller passes a
+   SimCode-native `Exp`, route through `toDAEExp` and convert the
+   returned expression back to `Exp` so the call site sees the same
+   in/out type. =#
+Base.@nospecializeinfer function Util.traverseExpTopDown(@nospecialize(inExp::Exp), func::Function, ext_arg)
+  local (outDAE, outArg) = Util.traverseExpTopDown(toDAEExp(inExp), func, ext_arg)
+  return (toSimExp(outDAE), outArg)
+end

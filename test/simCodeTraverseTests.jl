@@ -65,9 +65,9 @@ function mockSimCode(ht)
   return SC.SIM_CODE("mock", ht,
     SC.RESIDUAL_EQUATION[], SC.Equation[], SC.WHEN_EQUATION[], SC.IF_EQUATION[],
     false, Int[], SC.Graphs.SimpleDiGraph(0), [], SC.StructuralTransition[], [],
-    String[], String[], SC.Equation[], "mock", NONE(), NONE(), String[],
+    String[], String[], SC.Equation[], "mock", NONE(), String[],
     SC.ModelicaFunction[], false, SC.RESIDUAL_EQUATION[], String[], SC.AliasEntry[],
-    nothing, SC.INITIAL_ALGORITHM[])
+    nothing, SC.INITIAL_ALGORITHM[], SC.BDAE.ASSERT_EQUATION[])
 end
 
 # Expr equality ignoring source-location decoration and semantically-transparent
@@ -392,7 +392,8 @@ simCall(fn, args...) = SC.toSimExp(daeCall(fn, args...))
       @test tyRoundtrips(SC.TYPE_BOOL())
       @test tyRoundtrips(SC.TYPE_STRING())
       @test tyRoundtrips(SC.TYPE_UNKNOWN())
-      @test tyRoundtrips(SC.TYPE_ENUM())
+      @test tyRoundtrips(SC.TYPE_ENUM(("one", "two")))      # the literal names (String of a value)
+      @test tyRoundtrips(SC.TYPE_ENUM(()))
       @test tyRoundtrips(SC.TYPE_ARRAY(SC.TYPE_REAL(), [3]))
       @test tyRoundtrips(SC.TYPE_ARRAY(SC.TYPE_INTEGER(), [-1]))     # unknown dim
       @test tyRoundtrips(SC.TYPE_TUPLE([SC.TYPE_REAL(), SC.TYPE_BOOL()]))

@@ -61,7 +61,7 @@ SimCref(name::AbstractString, subs::AbstractVector{<:Int}) =
 SimCref(sym::Symbol, subs::AbstractVector{<:Int}) =
   SimCref(sym, Int[s for s in subs])
 
-#= ---- Expression hierarchy (additive, no migration yet) ----
+#= ---- Expression hierarchy (the SimCode passes are part way through moving to it) ----
 
    SimCode-native `Exp` AST. DAE.Exp carries a lot of frontend-only
    information that SimCode never reads (type-checked subscripts,
@@ -82,6 +82,10 @@ directly, so the operator-side type was redundant.
   OP_ADD; OP_SUB; OP_MUL; OP_DIV; OP_POW; OP_UMINUS
   OP_AND; OP_OR; OP_NOT
   OP_LESS; OP_LESSEQ; OP_GREATER; OP_GREATEREQ; OP_EQUAL; OP_NEQUAL
+  #= Scalar product of two vectors (Modelica `v1 * v2`) that the frontend
+     could not expand element by element, e.g. `e * Frames.resolve1(R, f)`
+     with a vector-valued call as an operand. =#
+  OP_DOT
 end
 
 """
@@ -260,9 +264,12 @@ reduction).
 """
 struct EQ_ATTR
   differentiated::Bool
+  #= A when's runtime arm whose condition had initial() too (BDAE.ALSO_INITIAL_EQUATION). =#
+  alsoInitial::Bool
 end
 
-EQ_ATTR(; differentiated::Bool = false) = EQ_ATTR(differentiated)
+EQ_ATTR(differentiated::Bool) = EQ_ATTR(differentiated, false)
+EQ_ATTR(; differentiated::Bool = false, alsoInitial::Bool = false) = EQ_ATTR(differentiated, alsoInitial)
 
 const EQ_ATTR_DEFAULT = EQ_ATTR(false)
 
@@ -487,12 +494,6 @@ Input variable
 """
 struct  INPUT <: SimVarType end
 
-"
-  A special state variable, used for dynamic overconstrained connectors.
-  In pratice this variable is treated as state.
-"
-struct OCC_VARIABLE <: SimVarType end
-
 struct STRING <: SimVarType
   bindExp::Option{Exp}
 end
@@ -635,17 +636,6 @@ struct IMPLICIT_STRUCTURAL_TRANSITION <: StructuralTransition
 end
 
 """
-    DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION(ifEquation)
-
-DOCC if-equation preserved as a structural switch over connector
-topologies. The body is a Frontend `EQUATION_IF`, which describes the
-connector branches before BDAE lowering.
-"""
-struct DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION <: StructuralTransition
-  ifEquation::OMFrontend.Frontend.EQUATION_IF
-end
-
-"""
     EliminationOptions(; reachability=true, patterns=Regex[], keepPatterns=Regex[])
 
 Options for non-dynamic variable elimination. Controls which variables and equations
@@ -706,42 +696,32 @@ The topmost model of a system consisting of several sub models lacks:
   - Information if it is singular or not.
 This information is instead contained for each of the structural submodels, where one model is active at the time.
 """
-struct SIM_CODE{T0<:String,
-                T1<:AbstractDict{String, Tuple{Int, SimVar}},
-                T2<:Vector{RESIDUAL_EQUATION},
+#= Type parameters only where the field's type varies (the name table's
+   dictionary, the initial equations, the graph, the components, the
+   submodels); the others were parameters constrained to one concrete type. =#
+struct SIM_CODE{T1<:AbstractDict{String, Tuple{Int, SimVar}},
                 T22,
-                T4<:Vector{WHEN_EQUATION},
-                #=
-                  If equations are represented via a vector of possible branches in which the code can operate.
-                  Similar to basic blocks
-                =#
-                T5<:Vector{IF_EQUATION},
-                T6<:Bool,
-                T7<:Vector{Int},
                 T8<:Graphs.AbstractGraph,
                 T9<:Vector,
-                T10 <: Vector{StructuralTransition},
-                T11 <: Vector,
-                T12 <: Vector{String},
-                T13 <: String} <: SimCode
-  name::T0
+                T11<:Vector} <: SimCode
+  name::String
   "Mapping of names to the corresponding variable"
   stringToSimVarHT::T1
   "Different equations stored within simulation code"
-  residualEquations::T2
+  residualEquations::Vector{RESIDUAL_EQUATION}
   "The Initial equations"
   initialEquations::T22
   "When equations"
-  whenEquations::T4
+  whenEquations::Vector{WHEN_EQUATION}
   "If Equations (Simulation code branches). Each branch contains a condition a set of residual equations and a set of targets"
-  ifEquations::T5
+  ifEquations::Vector{IF_EQUATION}
   "True if the system that we are solving is singular"
-  isSingular::T6
+  isSingular::Bool
   "
    The match order:
    Result of assign array, e.g array(j) = equation_i
   "
-  matchOrder::T7
+  matchOrder::Vector{Int}
     "
     The merged graph. E.g digraph constructed from matching info.
     The indices are the same as above and they are shared.
@@ -751,23 +731,21 @@ struct SIM_CODE{T0<:String,
   " The reverse topological sort of the equation-graph "
   stronglyConnectedComponents::T9
   "Contains all structural transitions"
-  structuralTransitions::T10
+  structuralTransitions::Vector{StructuralTransition}
   "Structural submodels"
   subModels::T11
   " Variables that different submodels have in common"
-  sharedVariables::T12
+  sharedVariables::Vector{String}
   "Top variables"
-  topVariables::T12
+  topVariables::Vector{String}
   "Shared equations. These are equations shared between structural submodels. These are required to be residuals."
   sharedEquations::Vector{Equation}
   "Initial model"
-  activeModel::T13
+  activeModel::String
   "The MetaModel. That is a reference from the model to a higher order representation of the model itself."
   metaModel::Option
-  "An alternate flat model. Used by structural if equations to add or remove connector statements affecting the virtual connection graph."
-  flatModel::Option
   "Irreductable variables. That is the names of variables that are involved in events such as discrete variables"
-  irreducibleVariables::T12
+  irreducibleVariables::Vector{String}
   "Modelica functions"
   functions::Vector{ModelicaFunction}
   "Specify if an external Modelica runtime is needed or not. Used for build in functions"
@@ -782,6 +760,8 @@ struct SIM_CODE{T0<:String,
   observedFilter::Union{Nothing, Vector{String}}
   "Initial-algorithm bodies lowered from `when initial() then ... end when` clauses; run once during init, never as runtime callbacks."
   initialAlgorithms::Vector{INITIAL_ALGORITHM}
+  "Asserts of equation sections and algorithms (outside when-clauses), non-tunable parameters inlined: checked at run time, after initialization and after each accepted step."
+  asserts::Vector{BDAE.ASSERT_EQUATION}
 end
 
 #= Conversion / projection machinery + DAE-wrapping boundary constructors. =#

@@ -33,6 +33,32 @@ const PRISTINE_P      = Dict{String, Any}()
 #= Debug hook: when OMJL_STASH_MODELCODE is set, stash the generated model Expr
    and skip Core.eval. Lets a caller inspect a model that OOMs at eval/simplify. =#
 const LAST_MODELCODE  = Ref{Any}(nothing)
+#= The tunable parameters (canonical names, `TUNABLE_PARAMETERS` at translate
+   time) each cached build was compiled with: only these can be set per run.
+   Being a parameter of the problem is not enough: a parameter referenced by a
+   start attribute stays one, but its value is compiled into the equations. =#
+const TUNABLE_SETS    = Dict{String, Set{String}}()
+
+#= Forget a model's cached build (a failed or skipped build, a translate in
+   another mode): an older build must not answer for the current one. =#
+function forgetBuild(cname::String)
+  _forgetReinit(cname)
+  for cache in (BUILT, BUILT_HASH, REDUCED_SYSTEMS, PRISTINE_P, TUNABLE_SETS)
+    delete!(cache, cname)
+  end
+  return nothing
+end
+
+#= The re-initialization registered for a cached build's problem
+   (CodeGeneration.DAE_REINIT, keyed by its reduced system): its closure holds
+   the build's data, kept for the whole session when only the build was
+   forgotten. =#
+function _forgetReinit(cname::String)
+  local built = get(BUILT, cname, nothing)
+  (built isa Tuple && !isempty(built)) || return nothing
+  delete!(_OMBackend().CodeGeneration.DAE_REINIT, built[1].f.sys)
+  return nothing
+end
 
 @inline _OMBackend() = parentmodule(CodeGeneration)
 
@@ -44,21 +70,22 @@ Build the module via `generateMTKCode`, then construct the System and run
 """
 function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
   local (modelName, modelCode) = CodeGeneration.generateMTKCode(simCode)
+  local cname = _OMBackend().canonicalName(modelName)
   #= Only the standard PROGRAM_GENERATION path emits `simulateFromBuild` and
-     returns the 9-tuple shape iMTK's cache assumes. Structural transitions,
-     sub-models, and the flat-model path use MODEL_GENERATION's simpler
-     simulate; skip _buildAndCache so iMTK falls through cleanly to the module
+     returns the 9-tuple shape iMTK's cache assumes. Structural transitions
+     and sub-models use MODEL_GENERATION's simpler simulate; skip _buildAndCache so iMTK falls through cleanly to the module
      `simulate` instead of warning loudly for every such model. Mirrors the
      condition in ODE_MODE_MTK (MTK_CodeGeneration.jl:415). =#
   if ccall(:jl_generating_output, Cint, ()) != 0
     #= Precompile/image generation: Core.eval'ing the model module into this
        closed backend module is rejected; skip the build+eval (codegen warmed). =#
   elseif !SimulationCode.hasStructuralTransitions(simCode) &&
-         !SimulationCode.hasSubModels(simCode) &&
-         !SimulationCode.hasFlatModel(simCode)
+         !SimulationCode.hasSubModels(simCode)
+    TUNABLE_SETS[cname] = copy(_OMBackend().TUNABLE_PARAMETERS[])
     _buildAndCache(modelName, modelCode)
   else
-    @info "[IMTK GEN] structural / sub-model / flat-model path; build-cache skipped (iMTK delegates to MTK simulate)" model = modelName
+    forgetBuild(cname)
+    @info "[IMTK GEN] structural / sub-model path; build-cache skipped (iMTK delegates to MTK simulate)" model = modelName
   end
   return (modelName, modelCode)
 end
@@ -76,24 +103,30 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
      time (not codegen) are folded into the hash so a flag flip still rebuilds.
      `overwriteCache` bypasses this reuse check to force a fresh rebuild. =#
   local buildHash = hash((modelCode, OMB.DIRECT_RHS_GENERATION[],
-                          OMB.DIRECT_JAC_GENERATION[], OMB.DIRECT_RHS_TYPE_ERASE[]))
+                          OMB.DIRECT_JAC_GENERATION[], OMB.DIRECT_JAC_TREE_NODE_LIMIT[],
+                          OMB.DIRECT_RHS_TYPE_ERASE[]))
   if !overwriteCache && get(BUILT_HASH, cname, UInt64(0)) == buildHash &&
      haskey(BUILT, cname) && isdefined(OMB, Symbol(cname))
     @info "[IMTK GEN] regenerated code unchanged; reusing compiled module + cached build" model = modelName
     return nothing
   end
   try
-    if get(ENV, "OMJL_STASH_MODELCODE", "") != ""
+    if OMB.envSwitch("OMJL_STASH_MODELCODE")
       LAST_MODELCODE[] = modelCode
+      forgetBuild(cname)
       @info "[IMTK GEN] modelCode stashed; skipping Core.eval (OMJL_STASH_MODELCODE)" model = modelName
       return
     end
-    if get(ENV, "OMJL_DUMP_IMTK_SRC", "") != ""
+    if OMB.envSwitch("OMJL_DUMP_IMTK_SRC")
       try
         write("/tmp/imtk_$(cname).jl", string(modelCode))
-      catch
+      catch _e
+        OMB._fallback(_e, :imtkSourceDump)
       end
     end
+    #= The previous build's re-initialization goes with it (a failed build
+       forgets it as well, below). =#
+    _forgetReinit(cname)
     Core.eval(OMB, modelCode)
     local res = Base.invokelatest() do
       local mod = getfield(OMB, Symbol(modelName))
@@ -107,12 +140,17 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
     end
     try
       PRISTINE_P[cname] = deepcopy(res[1].p)
-    catch
+    catch _e
+      OMB._fallback(_e, :imtkPristineParameters, impact = :result)
       delete!(PRISTINE_P, cname)
     end
     @info "[IMTK GEN] structural_simplify ran in backend; build cached" model = modelName
     DUMP_ENABLED[] && _dumpReduced(OMB, modelName, cname)
   catch e
+    OMB._fallback(e, :imtkBuild, impact = :result)
+    #= No stale build: a previous build of this model (other tunable
+       parameters, an older version of it) must not answer for this one. =#
+    forgetBuild(cname)
     @warn "[IMTK GEN] in-backend build / structural_simplify failed" model = modelName exception = e
   end
   return nothing
@@ -126,6 +164,7 @@ function _dumpReduced(OMB, modelName::String, cname::String)
     DUMP_PATHS[cname] = path
     @info "[IMTK GEN] dumped post-simplify system" model = modelName path = path
   catch e
+    OMB._fallback(e, :imtkReducedDump)
     @warn "[IMTK GEN] reduced-system dump failed" model = modelName exception = e
   end
   return nothing
@@ -147,8 +186,12 @@ patch it into a rebuilt tuple, and call the model module's `simulateFromBuild`.
 That delegate is the exact same post-build pipeline MTK-mode runs, so behavior
 matches MTK except for skipping the rerun of `<name>Model(tspan)`. Falls back to
 the module's own `simulate` on cache miss / unexpected failure.
+
+`parameters` (name => value pairs) sets tunable parameters
+(`withTunableParameters`) for this run, on top of the pristine values; it
+needs the cached build and never falls back.
 """
-function simulateIMTK(modelName::String, tspan, solver; kwargs...)
+function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kwargs...)
   local OMB = _OMBackend()
   local cname = OMB.canonicalName(modelName)
   #= Structural/sub-model/flat-model iMTK builds skip _buildAndCache and are not
@@ -164,6 +207,16 @@ function simulateIMTK(modelName::String, tspan, solver; kwargs...)
          have mutated the shared vector (ifCond toggles persist otherwise). =#
       if haskey(PRISTINE_P, cname)
         prob = OMB.Runtime.ModelingToolkit.SciMLBase.remake(prob; p = deepcopy(PRISTINE_P[cname]))
+      end
+      if parameters !== nothing
+        prob = _setParameterValues(prob, parameters, modelName)
+        #= A DAE's consistent initial state depends on the parameters: solve it
+           again for these values (the build solved it for the compiled ones). =#
+        local reinit = get(OMB.CodeGeneration.DAE_REINIT, prob.f.sys, nothing)
+        #= In the latest world: the re-initialization calls functions of the
+           model's eval (the RHS, the relation literals), which can be newer
+           than a caller that translated in the same call. =#
+        reinit === nothing || (prob = OMB.Runtime.ModelingToolkit.SciMLBase.remake(prob; u0 = Base.invokelatest(reinit, prob.p)))
       end
       #= Route through `mod.simulate(...; cached_build = rebuilt)` using the same
          closure form as the MTK path, so the body executes inside the model module
@@ -187,14 +240,36 @@ function simulateIMTK(modelName::String, tspan, solver; kwargs...)
         getfield(OMB, Symbol(cname)).simulate(tspan, solver; cached_build = rebuilt, kwargs...)
       end
     catch e
-      #= A user interrupt must propagate, not trigger a retry of the same solve. =#
-      e isa InterruptException && rethrow()
+      #= A user interrupt or a violated Modelica assert must propagate, not
+         trigger a retry of the same solve; the fallback cannot apply `parameters`. =#
+      (e isa InterruptException || e isa OMB.CodeGeneration.ModelicaAssertionError || parameters !== nothing) && rethrow()
+      OMB._fallback(e, :imtkCachedSolve, impact = :result)
       @warn "[IMTK] cached-build solve failed; falling back to module simulate" model = modelName exception = e
     end
   end
+  parameters === nothing ||
+    error("simulating $(modelName) with `parameters` needs its cached build (translate it in IMTK mode)")
   return Base.invokelatest() do
     getfield(OMB, Symbol(cname)).simulate(tspan, solver; kwargs...)
   end
+end
+
+#= A copy of `prob` with the tunable parameters `parameters` (name => value;
+   Modelica or flattened names, array elements as `A[2][1]` or `A[2,1]`) set. =#
+function _setParameterValues(prob, parameters, modelName)
+  local OMB = _OMBackend()
+  local MTK = OMB.Runtime.ModelingToolkit
+  local out = MTK.SciMLBase.remake(prob; p = copy(prob.p))
+  local tunable = get(TUNABLE_SETS, OMB.canonicalName(modelName), Set{String}())
+  for (name, value) in parameters
+    local cn = OMB.canonicalName(OMB._elementSubscripts(string(name)))
+    local sym = Symbol(cn)
+    (OMB.isTunableParameter(cn, tunable) && MTK.is_parameter(out, sym)) ||
+      throw(ArgumentError("$(name) is not a parameter of the compiled $(modelName); compile it inside " *
+                          "OMBackend.withTunableParameters to change it without recompiling"))
+    MTK.setp(out, sym)(out, value)
+  end
+  return out
 end
 
 end #= module IMTKGen =#

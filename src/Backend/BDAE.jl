@@ -161,13 +161,12 @@ using ExportAll
     the else branch.
   - `FOR_EQUATION(iter, start, stop, body, source, attr)` — ranged loop
     equation. No frontend path currently emits it.
-  - `DUMMY_EQUATION` — placeholder used when a NORETCALL cannot be lowered.
-  - `ASSERT_EQUATION(condition, message, level, source)`.
+  - `ASSERT_EQUATION(condition, message, level, source)`. A call equation
+    for its effects is one too, its condition the call (type T_NORETCALL):
+    it runs where the asserts are checked.
   - `INITIAL_STRUCTURAL_STATE(initialState)` — records the initial mode
     name for a variable-structure system.
   - `BRANCH(ar, br)` — `Connections.branch(ar, br)`.
-  - `STRUCTURAL_IF_EQUATION(ifEquation)` — DOCC if-equation preserved as a
-    frontend `EQUATION_IF` so the runtime can replay the branch choice.
   - `STRUCTURAL_TRANSITION(fromState, toState, transitionCondition)` —
     VSS transition; a structural callback is generated from the condition.
     (Name is a historical typo preserved across the codebase.)
@@ -267,7 +266,7 @@ VAR(varName,varKind,varType) =
 """
   An independent system of equations together with its variables.
 
-  Each structural submodel (VSS branch, DOCC subsystem) becomes one
+  Each structural submodel (a VSS branch) becomes one
   `EQSYSTEM`. The `simpleEquations` field holds alias equations that have
   already been removed from the main equation list via alias elimination;
   they are kept so downstream stages can recover the original mapping.
@@ -299,17 +298,11 @@ end
   - `localKnownVars`: parameters / constants scoped to a specific submodel.
   - `metaModel`: optional reference to the surrounding meta-model; `NONE()`
     for non-VSS models.
-  - `flatModel`: optional reference to the flat model being translated.
-    Used by VSS recompilation paths.
-  - `DOCC_equations`: dynamic-if equations from the Dynamic Overconstrained
-    Connector option.
 """
 struct SHARED
   globalKnownVars::Vector{VAR}
   localKnownVars::Vector{VAR}
   metaModel::Option{SCode.CLASS}
-  flatModel::Option{OMFrontend.Frontend.FlatModel}
-  DOCC_equations::Vector{Equation}
 end
 
 """
@@ -421,6 +414,12 @@ end
   end
 
   @Record UNKNOWN_EQUATION_KIND begin
+
+  end
+
+  #= The runtime arm of a when whose condition had initial() too (`when {c,
+     initial()}`): its initial() was split off into an initial algorithm. =#
+  @Record ALSO_INITIAL_EQUATION begin
 
   end
 end
@@ -540,9 +539,6 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
     attr::EquationAttributes
   end
 
-  @Record DUMMY_EQUATION begin
-  end
-
   @Record ASSERT_EQUATION begin
     condition::DAE.Exp
     message::DAE.Exp
@@ -557,10 +553,6 @@ const EQ_ATTR_DEFAULT_UNKNOWN = EQUATION_ATTRIBUTES(false, UNKNOWN_EQUATION_KIND
   @Record BRANCH begin
     ar::DAE.Exp
     br::DAE.Exp
-  end
-
-  @Record STRUCTURAL_IF_EQUATION begin
-    ifEquation::OMFrontend.Frontend.EQUATION_IF
   end
 
   @Record STRUCTURAL_TRANSITION begin

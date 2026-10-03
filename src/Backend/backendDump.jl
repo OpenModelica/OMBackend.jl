@@ -38,6 +38,13 @@ const HEAD_LINE = "############################################"
 const DOUBLE_LINE = "============================================"
 const LINE = "---------------------------------------------"
 const _ARRAY_DUMP_LIMIT = 12
+#= Whether `string` abbreviates large literal arrays (below): only for dumps
+   read by people, `Base.ScopedValues.with(ABBREVIATE_ARRAY_DUMPS => true)`.
+   `string(::DAE.Exp)` is also a key: eliminateRHSEquivalentEquations groups
+   equations by it, and the Digital HalfAdder's XorTable[a, b] and
+   AndTable[a, b] both printed as `{<9×9 table>}[a, b]`: the XOR gate's output
+   became the AND gate's (FullAdder, Adder4 wrong for the whole run). =#
+const ABBREVIATE_ARRAY_DUMPS = Base.ScopedValues.ScopedValue(false)
 
 #= Abbreviate large literal arrays in dumps so constant lookup tables (e.g. the
    9x9 Logic enum tables) collapse to a `{<R×C table>}` / `{…<N elems>}` summary
@@ -50,6 +57,7 @@ function _dumpArray(expl)::String
     n == 1 && (first = e)
   end
   n == 0 && return "{}"
+  ABBREVIATE_ARRAY_DUMPS[] || return "{" * lstString(expl, ", ") * "}"
   if first isa DAE.ARRAY
     local m = 0
     for _ in first.array
@@ -75,10 +83,6 @@ end
 
 function stringHeading2(i::Any, heading::String)::String
   str = heading2(heading) + "\n" + string(i)
-end
-
-function stringHeading3(i::Any, heading::String)::String
-  str = heading3(heading) + string(i)
 end
 
 function heading1(heading::String)::String
@@ -258,10 +262,6 @@ function Base.string(@nospecialize(eq::BDAE.Equation))
 
       BDAE.STRUCTURAL_TRANSITION(__) => begin
         "STRUCTURAL_TRANSITION " * eq.fromState * " -> " * eq.toState * "| if:" * string(eq.transitionCondition)
-      end
-
-      BDAE.DUMMY_EQUATION() => begin
-        "DUMMY_EQUATION"
       end
 
       BDAE.ASSERT_EQUATION(condition, message, _, _) => begin
@@ -615,7 +615,7 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
             end
           end
         end
-        if nRows * nCols > _ARRAY_DUMP_LIMIT
+        if ABBREVIATE_ARRAY_DUMPS[] && nRows * nCols > _ARRAY_DUMP_LIMIT
           "[MAT <" * string(nRows) * "×" * string(nCols) * " table>]"
         else
           str = "[MAT]"
@@ -642,16 +642,20 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
          string(ty) + string(e1)
       end
 
-      DAE.ASUB(exp = e1, sub = expl)  => begin
-         string(e1) + "[" + lstString(expl, ", ") + "]"
+      DAE.ASUB(exp = e1, sub = asubSubs)  => begin
+         #= fresh local: shared expl is List{DAE.Exp}; ASUB.sub is List{Subscript}. =#
+         string(e1) + "[" + lstString(asubSubs, ", ") + "]"
       end
 
       DAE.TSUB(exp = e1, ix = int) => begin
          "[TSUB]" + string(e1) + "(" + string(int) + ")"
       end
 
-      DAE.RSUB(exp = e1)  => begin
-        "[RSUB]" + string(e1)
+      #= With the field: this string is an equality key (the alias detection's
+         RHS equivalence, the if-expression lifter's dedup), and r.a and r.b
+         of one record expression had one. =#
+      DAE.RSUB(exp = e1, fieldName = fname)  => begin
+        "[RSUB]" + string(e1) + "." + fname
       end
 
       DAE.SIZE(exp = e1, sz = NONE())  => begin
@@ -666,8 +670,10 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
        "[CODE]"
      end
 
-     DAE.REDUCTION(expr = e1) => begin
-       "[REDUCTION]" + string(e1)
+     #= With the kind and the iterators (an equality key, as RSUB). =#
+     DAE.REDUCTION(reductionInfo = info, expr = e1, iterators = iters) => begin
+       "[REDUCTION " + string(info.path) + "]" + string(e1) + " for " +
+         join((it.id + " in " + string(it.exp) for it in iters), ", ")
      end
 
      DAE.EMPTY(__)  => begin
@@ -699,7 +705,8 @@ function Base.string(ty::DAE.Type)::String
     DAE.T_ARRAY(__) => "(array of $(string(ty.ty))) "
     DAE.T_ENUMERATION(__) => "(enumeration) "
     DAE.T_COMPLEX(__) => "(complex type) "
-    _ => "$(ty)"
+    #= Not "$(ty)": interpolation calls this method again (a T_TUPLE overflowed the stack). =#
+    _ => sprint(show, ty)
   end
 end
 
@@ -749,12 +756,6 @@ end
 function Base.string(idx::DAE.INDEX)::String
   local str = string(idx.exp)
   return str
-end
-
-function Base.string(structuralIfEquation::BDAE.STRUCTURAL_IF_EQUATION)
-  local str = "DYNAMIC_"
-  local ifEqStr = replace(OMFrontend.Frontend.toString(structuralIfEquation.ifEquation), "\\n" => "\n")
-  str *= ifEqStr * "\n"
 end
 
 

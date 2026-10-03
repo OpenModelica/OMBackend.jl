@@ -41,6 +41,34 @@ const MODELICA_FUNCTION_IMPLS = Dict{Symbol, Function}()
 #= Global dictionary to store RTG wrappers for each function =#
 const MODELICA_FUNCTION_WRAPPERS = Dict{Symbol, Any}()
 
+#= A Modelica function's wrapper (createModelicaFunctionWrapper): its
+   RuntimeGeneratedFunction behind a method of the function's arity. An RGF
+   binds its arguments unchecked, so a call with fewer read past the argument
+   tuple and crashed the process (MSL Water IF97, 2026-09-30); here a wrong
+   argument count is a MethodError. =#
+struct ModelicaFunctionWrapper{N, F} <: Function
+  name::Symbol
+  rgf::F
+end
+ModelicaFunctionWrapper{N}(name::Symbol, rgf::F) where {N, F} = ModelicaFunctionWrapper{N, F}(name, rgf)
+(w::ModelicaFunctionWrapper{N})(args::Vararg{Any, N}) where {N} = w.rgf(args...)
+Base.nameof(w::ModelicaFunctionWrapper) = w.name
+Base.show(io::IO, w::ModelicaFunctionWrapper) = print(io, w.name)
+
+#= The same hash in every process for the functions of this module's terms
+   (the wrappers above and the element extractors below). By default a
+   RuntimeGeneratedFunction hashes by the address of its body Expr, and so
+   does a wrapper holding one: the hash of every term calling a Modelica
+   function changed from one process to the next, and with it the order of
+   MTK's dictionaries, its alias choices and the summation order of the
+   generated code. A stiff model at a loose tolerance went from Success to
+   Unstable or InitialFailure by process (MSL DifferenceAmplifier with QNDF
+   at 1e-2, 4 of 52 verify runs). An RGF's type holds a hash of its body's
+   content (`id`), so the type identifies the function. =#
+const _RGF_TAG = getfield(@__MODULE__, Symbol("#_RGF_ModTag"))
+Base.hash(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{<:Any, _RGF_TAG, _RGF_TAG}, h::UInt) = hash(typeof(f), h)
+Base.hash(w::ModelicaFunctionWrapper, h::UInt) = hash(typeof(w), hash(w.name, h))
+
 #= Cache for per-element extractor functions.
    Key: (funcName::Symbol, indices::Tuple{Vararg{Int}}, nArgs::Int)
    Value: the created function object
@@ -321,15 +349,16 @@ function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}},
   return f
 end
 
-# OMBackend always wraps Modelica-function impls in RTG callables that return
-# Real (or tuples of Real, but extractor RGFs project a single Real). Pin the
+# OMBackend always wraps Modelica-function impls in RTG callables (a function's
+# own behind a ModelicaFunctionWrapper) that return Real (or tuples of Real, but
+# extractor RGFs project a single Real). Pin the
 # symtype here so any SymbolicUtils path that hits _promote_symtype on an RTG
 # (e.g. hashcons-cached Terms, internal rewrites, default safe_ctors.jl Term
 # construction) yields Real instead of Any. Without this, an Any-typed Term
 # can be cached and later returned even when makeSymbolicTerm passes
 # `type = Real` explicitly, poisoning subsequent sums and breaking
 # `-(::SymReal, ::SymReal)` in MTK alias_elimination.
-SymbolicUtils._promote_symtype(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, args) = Real
+SymbolicUtils._promote_symtype(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper}, args) = Real
 SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 
 # Same reason for shape. Scalar-returning extractor RGFs must be reported as
@@ -338,7 +367,7 @@ SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 # mismatch in MTK's substitution rebuild path (terminterface.jl `maketerm` for
 # `+`/`-`). Without this, a wrapper whose body returns a Modelica vector can
 # poison a sum with shape `Unknown(2)`.
-SymbolicUtils.promote_shape(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper}, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 SymbolicUtils.promote_shape(::typeof(floor), args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 SymbolicUtils.promote_shape(::typeof(floor), arg::SymbolicUtils.Unknown) = SymbolicUtils.ShapeVecT()
 
@@ -394,6 +423,15 @@ EAGER_SYMBOLIC_EXPANSIONS[:Modelica_Math_Vectors_interpolate] = function (args..
   return (yi, 1)
 end
 
+#= What an eager evaluation of a Modelica function throws for symbolic
+   arguments: a MethodError of the implementation (an operation without a
+   symbolic method), a FieldError (a record field read from a symbolic
+   value, as in the MSL records' functions), an UndefVarError (the MSL
+   QuasiStatic machines' Complex functions: `v` undefined in the model
+   module, open); a TypeError (a condition on a symbolic value) is not a
+   programming error anyway. The opaque extractors then take over. =#
+const _EAGER_SYMBOLIC_FAILURE = Union{MethodError, FieldError, UndefVarError}
+
 """
 Call a tuple-returning Modelica function and extract a specific element.
 Used by the TSUB handler in equation code generation to avoid the problem
@@ -420,7 +458,9 @@ function tupleElementCall(funcName::Symbol, ix::Int, args...)
       local preparedArgs = _prepareArgsForEagerEval(args)
       local result = Base.invokelatest(impl, preparedArgs...)
       return result[ix]
-    catch
+    catch err
+      #= Symbolic arguments: the opaque extractors below (_EAGER_SYMBOLIC_FAILURE). =#
+      OMBackend._fallback(err, :eagerFunctionElement; expect = _EAGER_SYMBOLIC_FAILURE)
     end
     #= Fallback: opaque RTG Term extractors =#
     local uwArgs = Any[unwrapForSymbolic(a) for a in args]
@@ -569,7 +609,9 @@ function tupleArrayElementCall(funcName::Symbol, tupleIdx::Int, dims::Tuple{Vara
       local result = Base.invokelatest(impl, preparedArgs...)
       local tupleElem = result[tupleIdx]
       return _ensureArrayShape(tupleElem, dims)
-    catch
+    catch err
+      #= Symbolic arguments: the opaque extractors below (_EAGER_SYMBOLIC_FAILURE). =#
+      OMBackend._fallback(err, :eagerFunctionTupleElement; expect = _EAGER_SYMBOLIC_FAILURE)
     end
     #= Fallback: opaque RTG Term extractors =#
     local uwArgs = Any[unwrapForSymbolic(a) for a in args]
@@ -625,7 +667,9 @@ function tupleArrayElementAt(funcName::Symbol, tupleIdx::Int, arrayIndices::Tupl
           return tupleElem[arrayIndices[1], arrayIndices[2]]
         end
       end
-    catch
+    catch err
+      #= Symbolic arguments: the opaque extractors below (_EAGER_SYMBOLIC_FAILURE). =#
+      OMBackend._fallback(err, :eagerFunctionMatrixElement; expect = _EAGER_SYMBOLIC_FAILURE)
     end
     #= Fallback: opaque RTG Term extractors =#
     local uwArgs = Any[unwrapForSymbolic(a) for a in args]
@@ -841,6 +885,9 @@ Vararg subscripts to support both vectors and N-dimensional arrays.
 struct ConstTableLookupFn{A <: AbstractArray}
   table::A
 end
+#= By its table's content: the default hashed the table's address, which
+   differs by process (see `_RGF_TAG`). =#
+Base.hash(f::ConstTableLookupFn, h::UInt) = hash(f.table, hash(:ConstTableLookupFn, h))
 
 #= Primal value of a table index. A constant table lookup is piecewise-constant
    in its (discrete/enum) index, so an autodiff `Dual` index must collapse to its
@@ -951,7 +998,8 @@ function _symbolicFuncDispatch(funcName::Symbol, origArgs::Vector{Any}, isArray:
       return _ensureArrayShape(result, dims)
     end
     return result
-  catch
+  catch err
+    OMBackend._fallback(err, :eagerFunctionCall; expect = _EAGER_SYMBOLIC_FAILURE)
     local uwArgs = Any[unwrapForSymbolic(a) for a in origArgs]
     if isArray && !isempty(dims)
       return createSymbolicArrayCall(MODELICA_FUNCTION_WRAPPERS[funcName], uwArgs, dims; funcName=funcName)
@@ -1034,7 +1082,7 @@ function createModelicaFunctionWrapper(funcName::Symbol, nArgs::Int, arrayFuncti
      RuntimeGeneratedFunction context (e.g., MTK equation evaluation). =#
   local body = _buildWrapperBody(funcName, nArgs, arrayFunction, outputDims)
   local rtg = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
-  MODELICA_FUNCTION_WRAPPERS[funcName] = rtg
+  MODELICA_FUNCTION_WRAPPERS[funcName] = ModelicaFunctionWrapper{nArgs}(funcName, rtg)
   if arrayFunction && !isempty(outputDims)
     precreateElementExtractors(funcName, nArgs, outputDims)
   end
@@ -1172,6 +1220,156 @@ function filterConstantEquations(eqs::AbstractVector)
   return filtered
 end
 
+#= der(<expression>) in the continuous equations by the chain rule, down to
+   derivatives of variables (MSL FluxTubes' Tellinen hysteresis:
+   `dHyst = der(hystR - mu0*Hstat)`): MTK takes a Differential only of an
+   unknown. A variable an equation `x ~ f` defines explicitly (hystR) has
+   der(f) for der(x), as OpenModelica differentiates it: left as D(x), index
+   reduction made x a state and recovered the chain behind f backwards
+   (P3 = (... - hystR)/P4, H3 from P3's atan), singular once the branch
+   saturated. Only in these equations; the model's own der(x) stay. An
+   equation with a function Symbolics has no derivative rule for (a Modelica
+   function, a table lookup) stays as it is. The initial equations keep
+   D(expr), which the init solve differentiates itself
+   (_observedDerivativeTargets). =#
+function expandExpressionDerivatives(eqs::AbstractVector)
+  local touched = BitVector(_hasExpressionDerivative(eq.lhs) || _hasExpressionDerivative(eq.rhs) for eq in eqs)
+  any(touched) || return eqs
+  local definitions = _explicitDefinitions(eqs)
+  local memo = Dict{Any, Any}()
+  local side = ex -> _derivativesByDefinitions(_expandDerivatives(ex), definitions, memo, Set{Any}())
+  return map(eachindex(eqs)) do i
+    touched[i] || return eqs[i]
+    try
+      side(eqs[i].lhs) ~ side(eqs[i].rhs)
+    catch e
+      e isa InterruptException && rethrow()
+      eqs[i]
+    end
+  end
+end
+
+#= Symbolics' chain rule, throwing at a function without a derivative rule
+   (by default it writes D(f(u))*D(u) for it). =#
+_expandDerivatives(ex) = Symbolics.expand_derivatives(ex, false; throw_no_derivative = true)
+
+#= The Differential terms of `ex` (or of a vector or tuple of them), outermost
+   ones: get_variables keeps a Differential term whole (an Operator is atomic)
+   and, unlike a walk over `arguments`, builds no argument lists (every
+   model's equations pass through _hasExpressionDerivative). =#
+function _differentials(ex)
+  local out = OrderedSet{Any}()
+  for e in (ex isa Union{AbstractArray, Tuple} ? ex : (ex,)), v in Symbolics.get_variables(e)
+    SymbolicUtils.iscall(v) && SymbolicUtils.operation(v) isa ModelingToolkit.Differential && push!(out, v)
+  end
+  return out
+end
+
+_hasExpressionDerivative(ex) = any(v -> !_isDifferentiableUnknown(v), _differentials(ex))
+
+#= x => f for the equations `x ~ f` with x a variable: f neither reads x nor
+   differentiates, x has no other such equation and the model does not
+   differentiate x itself (a state: its D(x) is the state derivative, and
+   D(f) would make index reduction solve f for f's operands). =#
+function _explicitDefinitions(eqs)
+  local out = Dict{Any, Any}()
+  local seen = Set{Any}()
+  local differentiated = Set{Any}()
+  for eq in eqs, d in _differentials((eq.lhs, eq.rhs))
+    push!(differentiated, Symbolics.unwrap(SymbolicUtils.arguments(d)[1]))
+  end
+  for eq in eqs
+    local x = Symbolics.unwrap(eq.lhs)
+    (SymbolicUtils.iscall(x) && SymbolicUtils.issym(SymbolicUtils.operation(x))) || continue
+    if x in seen
+      delete!(out, x)
+      continue
+    end
+    push!(seen, x)
+    x in differentiated && continue
+    local f = Symbolics.unwrap(eq.rhs)
+    (!isempty(_differentials(f)) || any(v -> isequal(v, x), Symbolics.get_variables(f))) && continue
+    out[x] = f
+  end
+  return out
+end
+
+#= `ex` with each D(x) of an explicitly defined x replaced by the derivative
+   of its definition, recursively; a D(x) inside its own chain (`open`),
+   deeper than _MAX_DEFINITION_CHAIN, or whose definition Symbolics cannot
+   differentiate, stays. The memo ignores `open`: a result a cycle left less
+   expanded is still the derivative. =#
+const _MAX_DEFINITION_CHAIN = 32
+
+function _derivativesByDefinitions(ex, definitions, memo, open::Set{Any})
+  local subs = Dict{Any, Any}()
+  for d in _differentials(ex)
+    local x = Symbolics.unwrap(SymbolicUtils.arguments(d)[1])
+    (haskey(definitions, x) && !(x in open) && length(open) < _MAX_DEFINITION_CHAIN) || continue
+    local dx = get(memo, x, nothing)
+    if dx === nothing
+      dx = try
+        local inner = _expandDerivatives(SymbolicUtils.operation(d)(definitions[x]))
+        local e = _derivativesByDefinitions(inner, definitions, memo, union(open, Set{Any}([x])))
+        _hasExpressionDerivative(e) ? d : e
+      catch err
+        err isa InterruptException && rethrow()
+        d
+      end
+      memo[x] = dx
+    end
+    subs[d] = dx
+  end
+  return isempty(subs) ? ex : Symbolics.substitute(ex, subs)
+end
+
+#= A variable x(t), or a derivative of one (D(D(x))): what MTK differentiates. =#
+function _isDifferentiableUnknown(v)
+  SymbolicUtils.iscall(v) || return SymbolicUtils.issym(v)
+  local op = SymbolicUtils.operation(v)
+  op isa ModelingToolkit.Differential && return _isDifferentiableUnknown(Symbolics.unwrap(SymbolicUtils.arguments(v)[1]))
+  return SymbolicUtils.issym(op)
+end
+
+#= build_explicit_observed_function for reads that may hold derivatives (an
+   event relation `asc = der(Hstat) > 0`, MSL FluxTubes' Tellinen
+   hysteresis), which it takes only as variables of the system: D(x) of a
+   differential unknown becomes the right-hand side of its equation, any
+   other D(x) the derivative variable index reduction made for x (xˍt, an
+   unknown or observed). A D(x) the system has neither for is left (the
+   build then fails as before). =#
+function _buildObservedFunction(sys, exprs; kwargs...)
+  return ModelingToolkit.build_explicit_observed_function(sys, _derivativesAsSystemTerms(sys, exprs); kwargs...)
+end
+
+function _derivativesAsSystemTerms(sys, exprs)
+  local ds = _differentials(exprs)
+  isempty(ds) && return exprs
+  local rhsOf = Dict{Any, Any}()
+  for eq in ModelingToolkit.equations(sys)
+    local l = Symbolics.unwrap(eq.lhs)
+    SymbolicUtils.iscall(l) && SymbolicUtils.operation(l) isa ModelingToolkit.Differential && (rhsOf[l] = eq.rhs)
+  end
+  local byName = Dict{Symbol, Any}()
+  for x in ModelingToolkit.unknowns(sys)
+    byName[ModelingToolkit.getname(x)] = x
+  end
+  for eq in ModelingToolkit.observed(sys)
+    byName[ModelingToolkit.getname(eq.lhs)] = eq.lhs
+  end
+  local subs = Dict{Any, Any}()
+  for d in ds
+    if haskey(rhsOf, d)
+      subs[d] = rhsOf[d]
+    else
+      local term = get(byName, ModelingToolkit.getname(Symbolics.diff2term(d)), nothing)
+      term === nothing || (subs[d] = term)
+    end
+  end
+  isempty(subs) && return exprs
+  return exprs isa AbstractArray ? Any[Symbolics.substitute(e, subs) for e in exprs] : Symbolics.substitute(exprs, subs)
+end
+
 """
     resolveAliasInitialValue(diffState, fullEqs, ivMap)
 
@@ -1219,7 +1417,7 @@ end
 
 function resolveAliasInitialValue(diffState, idx::AliasEqIndex, ivMap::Dict)
   local diffStr = string(diffState)
-  if get(ENV, "OMBACKEND_ALIAS_INDEX", "true") != "true"
+  if !OMBackend.envSwitch("OMBACKEND_ALIAS_INDEX")
     #= Legacy-faithful scan: every candidate equation whose text mentions the
        state, simplify uncapped. =#
     for i in 1:length(idx.exprs)
@@ -1248,6 +1446,20 @@ function resolveAliasInitialValue(diffState, idx::AliasEqIndex, ivMap::Dict)
   return nothing
 end
 
+#= Whether a symbolic expression has more than `cap` nodes, counted as a tree
+   (shared subexpressions count each time); stops at the cap. =#
+function _exprLargerThan(@nospecialize(ex), cap::Int)::Bool
+  local n = 0
+  local stack = Any[Symbolics.unwrap(ex)]
+  while !isempty(stack)
+    local e = pop!(stack)
+    n += 1
+    n > cap && return true
+    SymbolicUtils.iscall(e) && append!(stack, SymbolicUtils.arguments(e))
+  end
+  return false
+end
+
 function _resolveAliasFromExpr(diffState, @nospecialize(expr), varCount::Int, ivMap::Dict)
   local exprSub = Symbolics.substitute(expr, ivMap)
   #= Fast path: plain substitution. =#
@@ -1259,8 +1471,12 @@ function _resolveAliasFromExpr(diffState, @nospecialize(expr), varCount::Int, iv
        expression collapses to numeric-affine form instead of keeping spurious
        free branch variables that would block resolution. Capped to small
        equations: simplify on a large dynamics expression takes minutes and an
-       alias equation never has many variables. =#
+       alias equation never has many variables. Its size is capped too: in a
+       system with few unknowns every equation has few variables, but with the
+       observed variables substituted (full_equations) an equation can be huge,
+       and simplify then runs out of memory (the V6 cylinder rig: 8 unknowns). =#
     varCount <= 8 || return nothing
+    _exprLargerThan(exprSub, 200) && return nothing
     local exprS = Symbolics.simplify(exprSub)
     intercept = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 0))))
     sumOnePoint = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 1))))
@@ -1290,11 +1506,7 @@ end
 const _EXPLICIT_PINNED_INITIAL_VALUE_KEYS = Dict{Symbol, OrderedSet{String}}()
 
 function _pinnedSidecarKey(reducedSystem)::Symbol
-  return try
-    nameof(reducedSystem)
-  catch
-    Symbol(objectid(reducedSystem))
-  end
+  return nameof(reducedSystem)
 end
 
 function explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues)::OrderedSet{String}
@@ -1312,11 +1524,7 @@ end
    be relaxed to guesses (algebraically coupled states). =#
 function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
   local out = OrderedSet{String}()
-  local eqs = try
-    equations(sys)
-  catch
-    return out
-  end
+  local eqs = equations(sys)
   for eq in eqs
     local lhs = Symbolics.value(eq.lhs)
     local isDiff = SymbolicUtils.iscall(lhs) && (SymbolicUtils.operation(lhs) isa ModelingToolkit.Differential)
@@ -1328,11 +1536,7 @@ function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
       push!(out, string(v))
     end
   end
-  local obsEqs = try
-    observed(sys)
-  catch
-    Symbolics.Equation[]
-  end
+  local obsEqs = observed(sys)
   for eq in obsEqs
     #= An observed lhs is the eliminated variable itself; only the rhs couples. =#
     for v in Symbolics.get_variables(eq.rhs)
@@ -1342,21 +1546,75 @@ function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
   return out
 end
 
+#= Names (as strings) of the variables initialization equations determine:
+   the left-hand side of each, and x for every derivative D(x) in them. The
+   arguments of other right-hand sides (e.g. positions passed to a branch
+   selection function) are only read. =#
+#= The left sides of the initialization equations that fix a value (a literal
+   or parameter right side). A signal-valued one (its rhs references a
+   time-dependent variable, unknown or observed) determines its lhs through
+   the init solve's residual rows; marking the lhs fixed would hold it at a
+   stale numeric guess that fights the very equation it encodes. Parameters
+   print without the (t) suffix and stay pinnable; occursin also catches array
+   elements and derivative forms whose printed form does not END with it. =#
+function _fixedTrueLhsStrs(initEqs)::OrderedSet{String}
+  local out = OrderedSet{String}()
+  for eq in initEqs
+    local rhsVars = Symbolics.get_variables(eq.rhs)
+    any(occursin("(t)", string(v)) for v in rhsVars) && continue
+    push!(out, string(eq.lhs))
+  end
+  return out
+end
+
+#= With `reads`, the variables a right side reads too: an initialization
+   equation determines them as much as its left side (`der(v) = x - 1` fixes
+   x; pinned at its start, the init solve moved the fixed v instead). =#
+function _initializationVarStrs(initEqs; reads::Bool = false)::OrderedSet{String}
+  local out = OrderedSet{String}()
+  local visit
+  visit = function (ex, isLhs0::Bool)
+    local isLhs = isLhs0 || reads
+    local v = Symbolics.unwrap(ex)
+    SymbolicUtils.iscall(v) || (isLhs && push!(out, string(v)); return nothing)
+    local op = SymbolicUtils.operation(v)
+    if op isa ModelingToolkit.Differential
+      #= D(x), or D(expr): an observed variable the backend replaced by its
+         definition; every variable in it. =#
+      foreach(a -> foreach(x -> push!(out, string(x)), Symbolics.get_variables(a)), SymbolicUtils.arguments(v))
+      return nothing
+    end
+    #= x(t) is a call of x on t: a variable, not an expression. =#
+    if SymbolicUtils.issym(op)
+      isLhs && push!(out, string(v))
+      return nothing
+    end
+    #= An expression on the left (`x + y = 1`) determines every variable in it. =#
+    foreach(a -> visit(a, isLhs), SymbolicUtils.arguments(v))
+    return nothing
+  end
+  for eq in initEqs
+    visit(eq.lhs, true)
+    visit(eq.rhs, false)
+  end
+  return out
+end
+
 "Seed guesses for reduced unknowns by name; overrides only absent or default-0.0 entries."
 function mergeSoftGuesses(reducedSystem, pairs::AbstractVector; force::Bool = false)
   isempty(pairs) && return reducedSystem
   local unkByStr = Dict{String, Any}()
   for u in unknowns(reducedSystem)
-    unkByStr[replace(string(u), "(t)" => "")] = u
+    unkByStr[_plainVariableName(u)] = u
   end
   local gs = Dict{Any, Any}(ModelingToolkit.guesses(reducedSystem))
   local changed = false
   for p in pairs
-    local nm = replace(String(first(p)), "(t)" => "")
+    local nm = _plainVariableName(String(first(p)))
     haskey(unkByStr, nm) || continue
     local cur = nothing
     for (k, v) in gs
-      if replace(string(k), "(t)" => "") == nm
+      if _plainVariableName(k) == nm
         cur = v
         break
       end
@@ -1405,8 +1663,19 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
   #= Identity mass matrix means pure ODE: all states are differential =#
   if massMatrix isa LinearAlgebra.UniformScaling
     @debug "[MTK GEN: init] ODEProblem: pure ODE (identity mass matrix), $(length(finalInitialValues)) hard u0, $(length(reducedUnks)) unknowns"
-    _EXPLICIT_PINNED_INITIAL_VALUE_KEYS[_pinnedSidecarKey(reducedSystem)] =
-      OrderedSet(string(p.first) for p in finalInitialValues)
+    #= The starts stay u0; as pins (the init solve's fixed values, where it
+       runs: _hasSolvedInitializationRows) only the fixed ones, as in a DAE.
+       A non-fixed start an initialization equation determines was pinned:
+       the init solve then freed every variable and moved the fixed ones
+       (`x = 2y + 1` with y fixed at 2: y = 0, OpenModelica 2). =#
+    local pinnedKeys = OrderedSet(string(p.first) for p in finalInitialValues)
+    local odeInitEqs = ModelingToolkit.initialization_equations(reducedSystem)
+    if !isempty(odeInitEqs)
+      local fixedLhs = _fixedTrueLhsStrs(odeInitEqs)
+      local initCoupled = _initializationVarStrs(odeInitEqs; reads = true)
+      filter!(k -> k in fixedLhs || !(k in initCoupled), pinnedKeys)
+    end
+    _EXPLICIT_PINNED_INITIAL_VALUE_KEYS[_pinnedSidecarKey(reducedSystem)] = pinnedKeys
     return (reducedSystem, finalInitialValues)
   end
   #= DAE system: classify states by mass matrix diagonal =#
@@ -1458,23 +1727,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
      fixed=true set. Vars whose start landed in finalInitialValues but whose lhs
      is not in this set are non-fixed defaults — relax them to guesses so the
      algebraic constraints can solve consistently with the user's hard pins. =#
-  local fixedTrueLhsSet = OrderedSet{String}()
-  for eq in initEqs
-    #= A signal-valued initialization equation (rhs references any
-       time-dependent variable, unknown or observed) determines its lhs
-       through the init solve's residual rows; marking the lhs fixed would
-       hold it at a stale numeric guess that fights the very equation it
-       encodes. Parameters print without the (t) suffix and stay pinnable;
-       occursin also catches array elements and derivative forms whose
-       printed form does not END with the suffix. =#
-    local rhsVars = try
-      Symbolics.get_variables(eq.rhs)
-    catch
-      Any[]
-    end
-    any(occursin("(t)", string(v)) for v in rhsVars) && continue
-    push!(fixedTrueLhsSet, string(eq.lhs))
-  end
+  local fixedTrueLhsSet = _fixedTrueLhsStrs(initEqs)
   if hasInitConstraints
     local hardKeyStrSet = OrderedSet(string(p.first) for p in hardInitialValues)
     local reducedUnkStrSet = OrderedSet(string(u) for u in reducedUnks)
@@ -1508,8 +1761,15 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
        fails to honour drops the user's start (e.g. an event-held discrete's consumer
        state landing at 0 instead of its start). =#
     local _algCoupled = _algebraicCoupledVarStrs(reducedSystem)
+    #= Likewise a state an initialization equation determines (its left-hand
+       side, or x in D(x)): `der(x) = 0` (steady state, MSL filters) fixes x
+       through its differential equation, and pinning x at its start as well
+       over-determines the initialization (the init solve then frees every
+       variable and moves the fixed=true ones; the MSL EngineV6's crank). =#
+    local _initCoupled = _initializationVarStrs(initEqs; reads = true)
     local demoted = filter(p -> !(string(p.first) in fixedTrueLhsSet) &&
-                                (string(p.first) in _algCoupled), hardInitialValues)
+                                (string(p.first) in _algCoupled || string(p.first) in _initCoupled),
+                           hardInitialValues)
     if !isempty(demoted)
       local _demotedKeys = OrderedSet(string(p.first) for p in demoted)
       hardInitialValues = filter(p -> !(string(p.first) in _demotedKeys), hardInitialValues)
@@ -1586,8 +1846,11 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
     end
   end
   local _defaulted0Starts = String[]
+  #= A start demoted to a guess above is an explicit start: the 0.0 default
+     below must not replace it (a capacitor's vc(start = 10) went to 0). =#
+  local softSymStrSet = OrderedSet(string(p.first) for p in softInitialValues)
   for diffState in diffStateSet
-    if !(string(diffState) in hardSymStrSet)
+    if !(string(diffState) in hardSymStrSet) && !(string(diffState) in softSymStrSet)
       local diffStateStr = string(diffState)
       #= Only attempt alias resolution for MTK-generated derivative variables
          (e.g. Inertia_phiˍt created by order-lowering). These have the Unicode
@@ -1800,7 +2063,8 @@ function injectObservedEquations(sys, observedEqs::Vector)
       local _icFresh = ModelingToolkit.IndexCache(updated)
       updated = Setfield.set(updated, Setfield.PropertyLens{:index_cache}(), _icFresh)
     catch _err
-      @debug "[MTK GEN: observed] index_cache rebuild skipped" exception=_err
+      #= The index_cache rebuild is skipped. =#
+      OMBackend._fallback(_err, :observedIndexCache)
     end
   end
   return updated
@@ -1888,6 +2152,18 @@ function _demoteWideNumericsInEquations(eqs)
   return (newEqs, changed)
 end
 
+#= Mark time as possibly zero (MTK's maybe_zeros): tearing then solves no
+   variable through a coefficient with time or sin(time) as a factor.
+   DOCCMinimal's M9 (v = (cos(time), sin(time)), v*conj(i) = 1): sin(t)*i_re =
+   cos(t)*i_im was solved as i_re = cos(t)*i_im/sin(t), 0/0 at t = 0. =#
+function _timeMayBeZero(sys::ModelingToolkit.AbstractSystem)
+  local iv = ModelingToolkit.get_iv(sys)
+  iv === nothing && return sys
+  local mayBeZero = copy(ModelingToolkit.get_maybe_zeros(sys))
+  push!(mayBeZero, Symbolics.unwrap(iv))
+  return @set sys.maybe_zeros = mayBeZero
+end
+
 """
   The irreducible variables scheme does not work using plain simplify.
 
@@ -1963,6 +2239,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   end
 
   local useSplit = get(kwargs, :split, true)
+  sys = _timeMayBeZero(sys)
   local _preSimplifySys = sys
   if OMBackend.BACKEND_LOGGING[]
     local _ss_timed = @timed ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
@@ -2007,11 +2284,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   #= Diagnostic only: full_equations expands observed eqs and can hit
      SymbolicUtils Rational{Int64} overflow on some systems. A log count must
      never abort the build, so fall back to -1 (rendered as "n/a") on failure. =#
-  local post_full_eqs = try
-    length(ModelingToolkit.full_equations(sys))
-  catch
-    -1
-  end
+  local post_full_eqs = OMBackend._tryOr(() -> length(ModelingToolkit.full_equations(sys)), -1, :fullEquationsCount)
   local post_unknowns = length(unknowns(sys))
   @info "[MTK GEN: simplify] After structural_simplify: equations=$(post_eqs), full_equations=$(post_full_eqs), unknowns=$(post_unknowns)"
   if post_eqs != post_unknowns
@@ -2092,9 +2365,9 @@ function ode_order_lowering(eqs, iv, unknown_vars)
     if !isdiffeq(eq)
       push!(alge_eqs, eq)
     else
-      var, maxorder = ModelingToolkit.var_from_nested_derivative(eq.lhs)
+      var, maxorder = Symbolics.var_from_nested_derivative(eq.lhs)
       maxorder > get(var_order, var, 1) && (var_order[var] = maxorder)
-      var′ = ModelingToolkit.lower_varname(var, iv, maxorder - 1)
+      var′ = Symbolics.lower_varname(var, iv, maxorder - 1)
       if ! isreal(eq.rhs) #= Modification by me. =#
         rhs′ = ModelingToolkit.diff2term_with_unit(eq.rhs, iv)
       else
@@ -2106,8 +2379,8 @@ function ode_order_lowering(eqs, iv, unknown_vars)
   end
   for (var, order) in var_order
     for o in (order - 1):-1:1
-      lvar = lower_varname(var, iv, o - 1)
-      rvar = lower_varname(var, iv, o)
+      lvar = Symbolics.lower_varname(var, iv, o - 1)
+      rvar = Symbolics.lower_varname(var, iv, o)
       push!(diff_vars, lvar)
 
       rhs = rvar
@@ -2133,7 +2406,7 @@ function dae_order_lowering(eqs, iv, unknown_vars)
     n_diffvars = 0
     for vv in vars
       isdifferential(vv) || continue
-      var, maxorder = var_from_nested_derivative(vv)
+      var, maxorder = Symbolics.var_from_nested_derivative(vv)
       isparameter(var) && continue
       n_diffvars += 1
       order = get(var_order, var, nothing)
@@ -2142,7 +2415,7 @@ function dae_order_lowering(eqs, iv, unknown_vars)
         order = 1
       end
       maxorder > order && (var_order[var] = maxorder)
-      var′ = lower_varname(var, iv, maxorder - 1)
+      var′ = Symbolics.lower_varname(var, iv, maxorder - 1)
       subs[vv] = D(var′)
       if !seen
         push!(diff_vars, var′)
@@ -2154,8 +2427,8 @@ function dae_order_lowering(eqs, iv, unknown_vars)
 
   for (var, order) in var_order
     for o in (order - 1):-1:1
-      lvar = lower_varname(var, iv, o - 1)
-      rvar = lower_varname(var, iv, o)
+      lvar = Symbolics.lower_varname(var, iv, o - 1)
+      rvar = Symbolics.lower_varname(var, iv, o)
       push!(diff_vars, lvar)
 
       rhs = rvar
@@ -2168,12 +2441,6 @@ function dae_order_lowering(eqs, iv, unknown_vars)
           vcat(collect(diff_vars), setdiff(unknown_vars, diff_vars)))
 end
 
-function getStatesAsSymbolicVariables(odeFunc::ODEFunction)
-  #= A hand-built RHS closure has no attached MTK system (.sys === nothing) and thus no symbolic states. =#
-  odeFunc.sys === nothing && return SymbolicUtils.BasicSymbolic[]
-  return ModelingToolkit.get_unknowns(odeFunc.sys)
-end
-
 function getStatesAsSymbols(odeFunc::ODEFunction)
   odeFunc.sys === nothing && return Symbol[]
   local states = ModelingToolkit.get_unknowns(odeFunc.sys)
@@ -2184,6 +2451,51 @@ function getStatesAsSymbols(daeFunc::ModelingToolkit.SciMLBase.DAEFunction)
   daeFunc.sys === nothing && return Symbol[]
   local states = ModelingToolkit.get_unknowns(daeFunc.sys)
   map(x->x.f.name, states)
+end
+
+#= The names the legacy callbacks index the state vector by
+   (`lookuptableStates[Symbol("name")]`, or `[:name]` for a pre() read) in
+   generated code `ex`. =#
+function namedStateLookups(ex)::Vector{String}
+  local names = OrderedSet{String}()
+  local walk
+  walk = function (e)
+    e isa Expr || return nothing
+    local key = if e.head == :ref && length(e.args) == 2 && e.args[1] === :lookuptableStates
+      e.args[2]
+    elseif e.head == :call && length(e.args) == 3 && e.args[1] in (:getindex, getindex) && e.args[2] === :lookuptableStates
+      e.args[3]
+    else
+      nothing
+    end
+    if key isa Expr && key.head == :call && length(key.args) == 2 && key.args[1] === :Symbol && key.args[2] isa String
+      push!(names, key.args[2])
+    elseif key isa QuoteNode && key.value isa Symbol
+      push!(names, string(key.value))
+    end
+    foreach(walk, e.args)
+    return nothing
+  end
+  walk(ex)
+  return collect(names)
+end
+
+"""
+    checkNamedStateLookups(problem, names)
+
+Warn when a variable the callbacks read from or write to the state vector by
+name is not an unknown of the simplified system: its lookup would fail when
+the callback runs.
+"""
+function checkNamedStateLookups(problem, names::Vector{String})
+  isempty(names) && return nothing
+  local f = problem.f
+  (hasproperty(f, :sys) && f.sys !== nothing) || return nothing
+  local have = Set{String}(string(s) for s in getStatesAsSymbols(f))
+  local missingNames = filter(n -> !(n in have), names)
+  isempty(missingNames) ||
+    @warn "[events] callbacks index the state vector by these names, but they are not unknowns of the simplified system" missingNames
+  return nothing
 end
 
 function getParametersAsSymbols(odeFunc::ODEFunction)
@@ -2204,11 +2516,6 @@ function getParametersAsSymbols(daeFunc::ModelingToolkit.SciMLBase.DAEFunction)
     local uw = SymbolicUtils.unwrap(x)
     hasproperty(uw, :name) ? uw.name : uw.f.name
   end
-end
-
-function getSymsAsStrings(odeFunc::ODEFunction)
-  local unknowns = ModelingToolkit.parameters(odeFunc.sys)
-  return map(string, unknowns)
 end
 
 """

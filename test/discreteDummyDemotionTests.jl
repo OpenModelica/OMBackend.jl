@@ -23,7 +23,7 @@ const _CG = OMBackend.CodeGeneration
   local sc = BackendTestMocks.mockSimCode()
 
   local plan = _CG.planDemotions(sc, equations, ifEqComponents,
-                                 discreteVariables, 0, 0, 0)
+                                 discreteVariables, 0, 0)
 
   @testset "input-only discrete is not demoted" begin
     @test !("dInput" in plan.toDemote)

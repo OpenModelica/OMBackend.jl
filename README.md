@@ -8,7 +8,7 @@ that can be simulated with DifferentialEquations.jl and ModelingToolkit.jl.
 
 # Requirements
 
-* Julia 1.12
+* Julia 1.13
 * Git
 * A checkout of the sibling OM*.jl packages next to this repository (see below)
 

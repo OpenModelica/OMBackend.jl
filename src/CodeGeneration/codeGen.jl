@@ -1,9 +1,7 @@
 #=
-  This file contains the code generation for the DifferentialEquations.jl backend.
-
-TODO:
-  Add support for if equations
-  Current approach. One separate function for each branch.
+  The when-callback emitter the MTK path uses, and expToJuliaExp (DAE.Exp and
+  SimCode Exp to Julia) for the structural callbacks and CodeGenerationUtil.
+  The direct DifferentialEquations.jl backend is DECodeGeneration.jl.
 
   Author: John Tinnerholm
 =#
@@ -36,11 +34,9 @@ _elsewhenStmtLst(arm::SimulationCode.WHEN_EQUATION) = arm.whenEquation.whenStmtL
 _elsewhenStmtLst(arm) = arm.whenEquation.whenStmtLst
 
 #= Walk a DAE.Exp condition and collect the set of cref-name strings that
-   appear OUTSIDE any `change(...)` or `pre(...)` wrapper. Used by the
-   discrete-callback codegen so the auto-reset block (which zeroes
-   condition-triggers after firing — appropriate for `when boolVar then`)
-   does NOT zero observed inputs of `change(x)` / `pre(x)` (which are state
-   variables we're watching, not latched flags). =#
+   appear OUTSIDE any `change(...)` or `pre(...)` wrapper: the level-valued
+   Booleans of the condition (`when boolVar then`), for which the discrete
+   callback keeps an edge latch. =#
 Base.@nospecializeinfer function _collectBareCrefStrings(@nospecialize(cond))::OrderedSet{String}
   local out = OrderedSet{String}()
   local walk = function(e, insideObs)
@@ -93,13 +89,15 @@ end
   This function can be disabled by setting the named argument
   generateSaveFunction to false.
 """
-function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = true) where {N, S}
-  #= Synthesised discrete-Boolean whens (`change(rel)` conditions) are emitted as
-     MTK SymbolicContinuousCallbacks (createDiscreteBoolWhenEvents); exclude them
-     here so they are not also built into the legacy CallbackSet (which cannot
-     read MTK observed variables). =#
+function createCallbackCode(modelName, simCode; generateSaveFunction = true)
+  #= Synthesised discrete-Boolean whens (`change(rel)` conditions) are discrete
+     clusters of the event iteration (emitDiscreteClusters) or, with
+     OMBACKEND_DISCRETE_PRE_MEMORY=false, MTK SymbolicContinuousCallbacks
+     (createDiscreteBoolWhenEvents); exclude them here so they are not also
+     built into the legacy CallbackSet (which cannot read MTK observed
+     variables). =#
   local _legacyWhens = filter(w -> _extractChangeRelations(w.whenEquation.condition, simCode) === nothing &&
-                                   isempty(_selfSchedulingTimeRels(w.whenEquation.condition)),
+                                   isempty(_selfSchedulingTimeRels(w)),
                               simCode.whenEquations)
   local WHEN_EQUATIONS = createEquations(_legacyWhens,  simCode)
   #=
@@ -140,111 +138,6 @@ function createCallbackCode(modelName::N, simCode::S; generateSaveFunction = tru
   end
 end
 
-function createParameterCode(modelName, parameters, stateVariables, algVariables, simCode)::Expr
-  local PARAMETER_EQUATIONS = createParameterEquations(parameters, simCode)
-  quote
-    function $(Symbol("$(modelName)ParameterVars"))()
-      local aux = Array{Array{Float64}}(undef, 2)
-      local p = Array{Float64}(undef, $(arrayLength(parameters)))
-      local reals = Array{Float64}(undef, $(arrayLength(stateVariables) + arrayLength(algVariables)))
-      aux[1] = p
-      aux[2] = reals
-      $(PARAMETER_EQUATIONS...)
-      return aux
-    end
-  end
-end
-
-"""
-  Creates equation code from the set of residual equations and a supplied set of variables.
-  This is the method used for the solver.
-  $(SIGNATURES)
-"""
-function createSolverCode(functionName::Symbol,
-                          auxFuncSymbol::Symbol,
-                          variables::Vector{V},
-                          residuals::Vector{R},
-                          ifEquations::Vector{IF_EQ},
-                          simCode::SimulationCode.SIM_CODE;
-                          eqLhsName, eqRhsName)::Expr where {V, R, IF_EQ}
-  local UPDATE_VECTOR = createRealToStateVariableMapping(variables, simCode)
-  #= Creates the equations =#
-  local EQUATIONS = createEquations(variables, residuals, simCode; eqLhsName = eqLhsName, eqRhsName)
-  local IF_EQUATIONS = createEquations(variables, ifEquations, simCode; eqLhsName = eqLhsName, eqRhsName = eqRhsName)
-  local modelName = simCode.name
-  quote
-    function $(functionName)(res, dx, x, aux, t)
-      $(auxFuncSymbol)(res, dx, x, aux, t)
-      local p = aux[1]
-      local reals = aux[2]
-      $(EQUATIONS...)
-      $(IF_EQUATIONS...)
-      $(UPDATE_VECTOR...)
-    end
-  end
-end
-
-"""
-  This method creates a runnable for a linear/non-linear system of equations.
-  That is a system that does not contain differential equations
-"""
-function createLinearRunnable(modelName::String, simCode::SimulationCode.SIM_CODE)
-  quote
-    import NonlinearSolve
-    function $(Symbol("$(modelName)Simulate"))(tspan = (0.0, 1.0))
-      $(LineNumberNode((@__LINE__), "Auxilary variables"))
-      local aux = $(Symbol("$(modelName)ParameterVars"))()
-      (x0, dx0) =$(Symbol("$(modelName)StartConditions"))(aux, tspan[1])
-      local differential_vars = $(Symbol("$(modelName)DifferentialVars"))()
-      #= Pass the residual equations =#
-      local problem = NonlinearProblem($(Symbol("$(modelName)DAE_equations")), dx0, x0,
-                                       tspan, aux, differential_vars=differential_vars,
-                                       callback=$(Symbol("$(modelName)CallbackSet"))(aux))
-      #= Solve with IDA =#
-      local solution = Runtime.solve(problem::NonlinearProblem, IDA())
-      #= Convert into OM compatible format =#
-      local savedSol = map(collect, $(Symbol("saved_values_$(modelName)")).saveval)
-      local t = [savedSol[i][1] for i in 1:length(savedSol)]
-      local vars = [savedSol[i][2] for i in 1:length(savedSol)]
-      local T = eltype(eltype(vars))
-      local N = length(aux[2])
-      local nsolution = DAESolution{Float64,N,typeof(vars),Nothing, Nothing, Nothing, typeof(t),
-                                    typeof(problem),typeof(solution.alg),
-                                    typeof(solution.interp),typeof(solution.destats)}(
-                                      vars, nothing, nothing, nothing, t, problem, solution.alg,
-                                      solution.interp, solution.dense, 0, solution.destats, solution.retcode)
-      ht = $(SimulationCode.makeIndexVarNameUnorderedDict(simCode.matchOrder, simCode.stringToSimVarHT))
-      omSolution = OMBackend.Runtime.OMSolution(nsolution, ht)
-      return omSolution
-    end
-  end
-end
-
-
-
-"""
-  This function creates the update equations for the auxiliary variables.
-  The set of auxiliary variables is the set of variables of other types than state variables.
-  That is booleans integers and algebraic variables.
-TODO:
-  Currently only being done for the algebraic variables.
-"""
-function createAuxEquationCode(algVariables::Array{V},
-                               simCode::SimulationCode.SIM_CODE
-                               ;arrayName)::Array{Expr} where {V}
-  #= Sorted equations for the algebraic variables. =#
-  local auxEquations::Array{Expr} = []
-  auxEquations = vcat(createSortedEquations([algVariables...], simCode; arrayName = "reals"))
-  return auxEquations
-end
-
-function createStateMarkings(algVariables::Array, stateVariables::Array, simCode::SimulationCode.SIM_CODE)::Array{Bool}
-  local stateMarkings::Array = [false for i in 1:length(stateVariables) + length(algVariables)]
-  for sName in stateVariables
-    stateMarkings[simCode.stringToSimVarHT[sName][1]] = true
-  end
-  return stateMarkings
-end
 
 """
   Creates the save-callback.
@@ -275,15 +168,6 @@ function returnCallbackSet()::Array
   return cbs
 end
 
-function createRealToStateVariableMapping(stateVariables::Array, simCode::SimulationCode.SIM_CODE; toFrom::Tuple=("reals", "x"))::Array{Expr}
-  local daeStateUpdateVector::Vector{Expr} = Expr[]
-  for svName in stateVariables
-    local varIdx = simCode.stringToSimVarHT[svName][1]
-    push!(daeStateUpdateVector, :($(Symbol(toFrom[1]))[$varIdx] = $(Symbol(toFrom[2]))[$varIdx]))
-  end
-  return daeStateUpdateVector
-end
-
 """
  Create a set for all equations.
 """
@@ -296,45 +180,52 @@ function createEquations(equations::Vector{T}, simCode::SimulationCode.SIM_CODE)
   return eqs
 end
 
-"""
-  Create equations for the parameters.
-"""
-function createParameterEquations(parameters::Array, simCode::SimulationCode.SimCode)
-  local parameterEquations::Vector{Expr} = Expr[]
-  local hT = simCode.stringToSimVarHT
-  for param in parameters
-    (index, simVar) = hT[param]
-    local simVarType::SimulationCode.SimVarType = simVar.varKind
-    bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => SimulationCode.toDAEExp(exp)
-      _ => throw(ErrorException("Unknown SimulationCode.SimVarType for parameter."))
-    end
-    push!(parameterEquations,
-          quote
-          $(LineNumberNode(@__LINE__, "$param"))
-          p[$index] = $(expToJuliaExp(bindExp, simCode))
-          end
-          )
+
+#= The lookups of the variables name[1], name[2], ... (none when name[1] is
+   not a variable). =#
+function _scalarizedElementLookups(name::String, simCode)::Vector{Any}
+  local elems = Any[]
+  local key = string(name, "[1]")
+  while haskey(simCode.stringToSimVarHT, key)
+    push!(elems, getIdxForLookupMTK(key, simCode))
+    key = string(name, "[", length(elems) + 1, "]")
   end
-  return parameterEquations
+  return elems
 end
 
+#= The names the when callbacks bind themselves: a variable binding of the
+   same name would replace them. =#
+const _WHEN_CALLBACK_LOCALS = ("x", "p", "t", "integrator", "lookuptableStates", "lookuptableParams")
 
 #= Build `name = <state/param lookup index>` pre-bindings for the crefs a when
-   callback reads. Skips crefs absent from the simvar table: those are inlined
-   constants (e.g. a logic ResetMap[i] element) that expToJulia emits as literals,
-   so requesting a state/param index for them would KeyError in getIdxForLookupMTK. =#
+   callback reads, one per name. A cref absent from the simvar table is an
+   inlined constant (e.g. a logic ResetMap[i] element) that expToJulia emits as
+   a literal, and gets none (a state/param index for it would KeyError in
+   getIdxForLookupMTK), unless it is a whole array of variables: then the
+   vector of their values (MSL GenerateRandomNumbers' when reads pre(state64),
+   a discrete Integer[2]). =#
 function _whenLookupBindings(crefs, simCode)::Vector{Expr}
   local out = Expr[]
+  local seen = Set{String}()
   for x in collect(map(identity, crefs))
-    local entry = get(simCode.stringToSimVarHT, string(x), nothing)
-    entry === nothing && continue
+    local name = string(x)
+    name in seen && continue
+    push!(seen, name)
+    local entry = get(simCode.stringToSimVarHT, name, nothing)
+    if entry === nothing
+      local elems = _scalarizedElementLookups(name, simCode)
+      isempty(elems) && continue
+      name in _WHEN_CALLBACK_LOCALS &&
+        OMBackend.unsupported("a when reading the whole array $(name) (a name the event callback uses itself)", x)
+      push!(out, Expr(:(=), Symbol(name), Expr(:vect, elems...)))
+      continue
+    end
     #= String simvars live as module-level bindings, never as state or MTK
        parameter slots; an index binding here would KeyError at runtime. =#
-    if get(ENV, "OMBACKEND_WHEN_STRING_SKIP", "true") == "true"
+    if OMBackend.envSwitch("OMBACKEND_WHEN_STRING_SKIP")
       entry[2].varKind isa SimulationCode.STRING && continue
     end
-    push!(out, Expr(:(=), Symbol(string(x)), getIdxForLookupMTK(x, simCode)))
+    push!(out, Expr(:(=), Symbol(name), getIdxForLookupMTK(x, simCode)))
   end
   return out
 end
@@ -358,11 +249,7 @@ function _timeThreshold(@nospecialize(rel), simCode)
       isCmp || return nothing
       local thr = _isTimeCref(e1) ? e2 : (_isTimeCref(e2) ? e1 : nothing)
       thr === nothing && return nothing
-      local v = try
-        SimulationCode.tryEvalNumeric(thr, simCode)
-      catch
-        nothing
-      end
+      local v = OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(thr, simCode), nothing, :timeThreshold)
       v === nothing ? nothing : Float64[Float64(v)]
     end
     _ => nothing
@@ -461,13 +348,16 @@ end
 function _emitElsewhenThresholdTimeWhen(elseArm, simCode, ewRefSym::Symbol, thrDAE)
   ADD_CALLBACK()
   local callbacks = COUNT_CALLBACKS()
-  local whenStmts = createWhenStatementsMTK(_elsewhenStmtLst(elseArm), simCode)
+  local whenStmts = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+    createWhenStatementsMTK(_elsewhenStmtLst(elseArm), simCode)
+  end
   local thrCrefs = listArray(Util.getAllCrefs(thrDAE))
   local affBindCrefs = vcat(map(x -> getRHSVariables(x), _elsewhenStmtLst(elseArm))..., thrCrefs)
   quote
     let _condCache = Ref{Any}(nothing), _affCache = Ref{Any}(nothing)
       global $(Symbol("condition$(callbacks)"))
-      $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+      #= `_follow` as a discrete when's (no change()/edge() memory here). =#
+      $(Symbol("condition$(callbacks)")) = (x, t, integrator, _follow::Bool = true) -> begin
         local lookuptableStates
         local lookuptableParams
         if _condCache[] === nothing
@@ -486,7 +376,7 @@ function _emitElsewhenThresholdTimeWhen(elseArm, simCode, ewRefSym::Symbol, thrD
         t >= _thr && _thr != $(ewRefSym)[]
       end
       global $(Symbol("affect$(callbacks)!"))
-      $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+      $(Symbol("affect$(callbacks)!")) = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)) -> begin
         local t = integrator.t
         local x = integrator.u
         @debug "[CB-EW$($(callbacks)) affect] firing" t=integrator.t
@@ -510,9 +400,10 @@ function _emitElsewhenThresholdTimeWhen(elseArm, simCode, ewRefSym::Symbol, thrD
         add_tstop!(integrator, integrator.t + 1E-12)
       end
     end
-    $(Symbol("cb$(callbacks)")) = DiscreteCallback($(Symbol("condition$(callbacks)")),
-                                                   $(Symbol("affect$(callbacks)!"));
-                                                   save_positions=(true, true))
+    #= A discrete when, run after its parent's (in the event iteration where
+       the model has buffered relations). =#
+    $(Symbol("cb$(callbacks)")) = OMBackend.CodeGeneration.discreteWhenCallback($(Symbol("condition$(callbacks)")),
+                                                                              $(Symbol("affect$(callbacks)!")))
   end
 end
 
@@ -520,13 +411,17 @@ end
    each threshold so a stepped output (e.g. a Digital Table) lands on its sample times. =#
 function _emitPresetTimeWhen(eq, simCode, callbacks::Int, thresholds::Vector{Float64})
   local wEq = eq.whenEquation
-  local whenStmts = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  #= pre(v) from the state before the instant (instantPre): an earlier statement's new value is not pre(v). =#
+  local whenStmts = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+    createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  end
   local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
   local times = sort(unique(filter(>(0.0), thresholds)))
   quote
     let _affCache = Ref{Any}(nothing)
       global $(Symbol("affect$(callbacks)!"))
       $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+        local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)
         local t = integrator.t
         local x = integrator.u
         local lookuptableStates
@@ -559,11 +454,11 @@ end
 function _timeOffsetOverPeriod(@nospecialize(e), simCode)
   @match e begin
     DAE.BINARY(exp1 = num, operator = DAE.DIV(__), exp2 = per) => begin
-      local p = try SimulationCode.tryEvalNumeric(per, simCode) catch; nothing end
+      local p = OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(per, simCode), nothing, :timePeriod)
       p === nothing && return nothing
       local s = @match num begin
         DAE.BINARY(exp1 = t, operator = DAE.SUB(__), exp2 = sExp) =>
-          (_isTimeCref(t) ? (try SimulationCode.tryEvalNumeric(sExp, simCode) catch; nothing end) : nothing)
+          (_isTimeCref(t) ? OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(sExp, simCode), nothing, :timeShift) : nothing)
         _ => (_isTimeCref(num) ? 0.0 : nothing)
       end
       s === nothing && return nothing
@@ -615,7 +510,7 @@ function _collectIfCondRefresh(writtenLHS::OrderedSet{String}, simCode)
   local refreshCrefs = Any[]
   local assigns = Expr[]
   isempty(simCode.ifEquations) && return (refreshCrefs, assigns)
-  local sortedIfEqs = sort(collect(simCode.ifEquations); by = ifEq -> _ifEquationSortKey(ifEq, simCode))
+  local sortedIfEqs = _sortedIfEquations(simCode)
   for (identifier, ifEq) in enumerate(sortedIfEqs)
     local i = 0
     for branch in ifEq.branches
@@ -650,12 +545,20 @@ end
 function _collectDiscreteBoolWhenRefresh(writtenLHS::OrderedSet{String}, simCode)
   local refreshCrefs = Any[]
   local refreshStmts = Expr[]
+  #= A discrete cluster needs none: the event iteration after the step sees
+     its relation on the written discrete flip (exact, no hysteresis) and
+     re-solves the cluster with the algebraic unknowns. =#
+  local clusters = _usesDiscreteClusters(simCode)
   for weq in simCode.whenEquations
     _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
+    clusters && _gatherClusterAssigns(weq, simCode) !== nothing && continue
     local condDAE = SimulationCode.toDAEExp(weq.whenEquation.condition)
     local condCrefs = listArray(Util.getAllCrefs(condDAE))
     any(c -> string(c) in writtenLHS, condCrefs) || continue
-    append!(refreshStmts, createWhenStatementsMTK(weq.whenEquation.whenStmtLst, simCode))
+    #= pre(v) from the periodic affect's snapshot (the values before the tick). =#
+    append!(refreshStmts, Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+      createWhenStatementsMTK(weq.whenEquation.whenStmtLst, simCode)
+    end)
     append!(refreshCrefs, condCrefs)
     for st in collect(weq.whenEquation.whenStmtLst)
       (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
@@ -676,7 +579,10 @@ end
 function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64, period::Float64)
   local wEq = eq.whenEquation
   local _firstEdge = startTime + (floor(-startTime / period) + 1.0) * period
-  local whenStmts = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  #= pre(v) from the state before the instant (instantPre), as the periodic sample() path. =#
+  local whenStmts = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+    createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  end
   local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
   local writtenLHS = OrderedSet{String}()
   for wStmt in wEq.whenStmtLst
@@ -690,6 +596,8 @@ function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64,
     let _affCache = Ref{Any}(nothing)
       global $(Symbol("affect$(callbacks)!"))
       $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+        OMBackend.CodeGeneration._isPeriodicTick(integrator, $(_firstEdge), $(period)) || return nothing
+        local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)
         local t = integrator.t
         local x = integrator.u
         local lookuptableStates
@@ -717,8 +625,146 @@ function _emitPulsePeriodicWhen(eq, simCode, callbacks::Int, startTime::Float64,
        increases, and an initial_affect body run would overwrite the
        init-algorithm phase (T_start := 0) of negative-startTime sources. =#
     $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), $(period);
-                                                   phase = $(_firstEdge), initial_affect = false)
+                                                   phase = $(_firstEdge), initial_affect = false,
+                                                   final_affect = true)
   end
+end
+
+const _RELATION_WHEN_EXCLUDED_CALLS = ("pre", "edge", "change", "sample", "initial", "terminal", "der",
+                                       "delay", "noEvent", "smooth", "reinit")
+
+#= A when condition that is one relation `a op b` (op one of < <= > >=) whose
+   operands call none of the operators above: (a, b, isLess, strict), or
+   nothing. =#
+function _singleRelationWhen(@nospecialize(cond))
+  @match cond begin
+    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
+      local kind = @match op begin
+        DAE.LESS(__) => (true, true)
+        DAE.LESSEQ(__) => (true, false)
+        DAE.GREATER(__) => (false, true)
+        DAE.GREATEREQ(__) => (false, false)
+        _ => nothing
+      end
+      kind === nothing && return nothing
+      local plain = Ref(true)
+      local visit = function (e, arg)
+        @match e begin
+          DAE.CALL(Absyn.IDENT(name), _, _) where (name in _RELATION_WHEN_EXCLUDED_CALLS) => begin
+            plain[] = false
+            return (e, false, arg)
+          end
+          DAE.CALL(path, _, _) where _isDelayCall(path) => begin
+            plain[] = false
+            return (e, false, arg)
+          end
+          _ => return (e, true, arg)
+        end
+      end
+      Util.traverseExpTopDown(e1, visit, nothing)
+      Util.traverseExpTopDown(e2, visit, nothing)
+      plain[] ? (e1, e2, kind[1], kind[2]) : nothing
+    end
+    _ => nothing
+  end
+end
+
+#= A when-equation on one relation (relationRefresh.jl relationWhenCallback):
+   the relation is buffered, set literally at the start, with a hysteresis,
+   and the body runs only when it becomes true. `zc` is `a - b` for < and <=,
+   `b - a` for > and >=, so the relation is true when zc < 0 (or <= 0). =#
+function _emitRelationWhen(eq, simCode, callbacks::Int, rel)
+  local wEq = eq.whenEquation
+  local (e1, e2, isLess, strict) = rel
+  local sub = DAE.SUB(DAE.T_REAL_DEFAULT)
+  local zcDAE = isLess ? DAE.BINARY(e1, sub, e2) : DAE.BINARY(e2, sub, e1)
+  local names = String[]
+  for c in listArray(Util.getAllCrefs(DAE.BINARY(e1, sub, e2)))
+    local n = string(c)
+    (n == "time" || n in names) && continue
+    local entry = get(simCode.stringToSimVarHT, n, nothing)
+    (entry === nothing || entry[2].varKind isa SimulationCode.STRING) && continue
+    push!(names, n)
+  end
+  local args = Symbol[Symbol(n) for n in names]
+  #= The body runs in the event iteration: pre(v) from the sweep's snapshot. =#
+  local whenStmts = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+    createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+  end
+  local bodyCrefs = vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...)
+  quote
+    $(Symbol("cb$(callbacks)")) = let _affCache = Ref{Any}(nothing)
+      local _eval = (t, $(args...)) -> (Float64($(expToJuliaExpMTK(zcDAE, simCode))),
+                                        1.0 + max(abs(Float64($(expToJuliaExpMTK(e1, simCode)))),
+                                                  abs(Float64($(expToJuliaExpMTK(e2, simCode))))))
+      local _body! = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT)) -> begin
+        local t = integrator.t
+        local x = integrator.u
+        local lookuptableStates
+        local lookuptableParams
+        if _affCache[] === nothing
+          local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
+          lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
+          lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+          _affCache[] = (lookuptableStates, lookuptableParams)
+        else
+          local cached = _affCache[]
+          lookuptableStates = cached[1]
+          lookuptableParams = cached[2]
+        end
+        $(_whenLookupBindings(bodyCrefs, simCode)...)
+        $(whenStmts...)
+        nothing
+      end
+      OMBackend.CodeGeneration.relationWhenCallback($(names), _eval, $(strict), _body!)
+    end
+  end
+end
+
+#= Whether the time is a tick of a PeriodicCallback, t0 + phase + k*period.
+   With final_affect the callback also runs when the integration ends: a tick
+   there runs (omc samples at the stop time too: n(1) = 6 for ticks at 0.5,
+   ..., 1.0; the callback left out the final time), any other end not. =#
+function _isPeriodicTick(integrator, phase, period)::Bool
+  local n = (integrator.t - first(integrator.sol.prob.tspan) - phase) / period
+  return n >= -1e-9 && abs(n - round(n)) <= 1e-9 * max(1.0, abs(n))
+end
+
+#= `(sample call, guard)` of a when condition that is `sample(...)` or a
+   conjunction with exactly one sample() conjunct (the guard: the other
+   conjuncts, or nothing); `(nothing, nothing)` otherwise. =#
+function _splitSampleCondition(cond)
+  local isSample = e -> e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "sample"
+  local conjuncts = Any[]
+  local collect! = nothing
+  collect! = e -> begin
+    @match e begin
+      DAE.LBINARY(exp1 = e1, operator = DAE.AND(__), exp2 = e2) => (collect!(e1); collect!(e2))
+      _ => push!(conjuncts, e)
+    end
+    nothing
+  end
+  collect!(cond)
+  local samples = filter(isSample, conjuncts)
+  length(samples) == 1 || return (nothing, nothing)
+  local rest = filter(!isSample, conjuncts)
+  any(e -> _containsSampleCall(e), rest) && return (nothing, nothing)
+  isempty(rest) && return (samples[1], nothing)
+  local guard = rest[1]
+  for e in rest[2:end]
+    guard = DAE.LBINARY(guard, DAE.AND(DAE.T_BOOL(MetaModelica.Nil())), e)
+  end
+  return (samples[1], guard)
+end
+
+_containsSampleCall(e) = _containsCallTo(e, "sample")
+_containsCallTo(e, name::String) = any(c -> _isCallNamed(c, name), _allCalls(e))
+_isCallNamed(@nospecialize(e), name::String) = e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == name
+function _allCalls(e)
+  local out = Any[]
+  Util.traverseExpBottomUp(e, (x, acc) -> (x isa DAE.CALL && push!(out, x); (x, true, acc)), 0)
+  return out
 end
 
 """
@@ -739,10 +785,18 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     Get all component references.
     If this set is empty it means that we have a condition involving continuous time
   =#
-  local isPeriodic = @match wEqCondDAE begin
-    DAE.CALL(Absyn.IDENT("sample"), args, attrs) => true
-    _ => false
-  end
+  #= sample(start, interval), alone or and-ed with a guard (MSL PartialNoise:
+     `when generateNoise and sample(startTime, samplePeriod)`): periodic, the
+     guard read at each tick. =#
+  local (sampleCall, sampleGuard) = _splitSampleCondition(wEqCondDAE)
+  #= Lowered elsewhere: a sample() alone or and-ed with a guard, terminal()
+     alone (after the solve). Not in MSL 3.2.3; sample() read false, terminal()
+     undefined: never fired. =#
+  sampleCall === nothing && _containsSampleCall(wEqCondDAE) &&
+    unsupported("sample() under or/not, or two sample() calls, in a when-condition", wEqCondDAE)
+  _containsCallTo(wEqCondDAE, "terminal") && !_isCallNamed(wEqCondDAE, "terminal") &&
+    unsupported("terminal() with another trigger in a when-condition", wEqCondDAE)
+  local isPeriodic = sampleCall !== nothing
   local isContinuousCond::Bool = isContinuousCondition(wEqCondDAE, simCode)
   #= Table / time-driven sources: a when whose condition is purely change(time>=c)
      thresholds must fire AT those times via PresetTimeCallback — a ContinuousCallback
@@ -758,6 +812,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     if _pulse !== nothing && _pulse[2] > 0.0
       return _emitPulsePeriodicWhen(eq, simCode, callbacks, _pulse[1], _pulse[2])
     end
+  end
+  #= A when on one relation: buffered relation with a hysteresis (MLS 8.5). =#
+  if isContinuousCond && !isPeriodic && wEq.elsewhenPart === nothing
+    local rel = _singleRelationWhen(wEqCondDAE)
+    rel === nothing || return _emitRelationWhen(eq, simCode, callbacks, rel)
   end
   #= A `sample(start, period)` is a periodic clock even when its interval is a
      parameter, which isContinuousCondition mis-flags as continuous; keep all
@@ -775,8 +834,10 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       #= Use MTK-aware runtime symbol lookup for the elseif continuous path.
          The hardcoded x[N] indices from expToJuliaExp become invalid after
          MTK structural_simplify reorders unknowns. =#
-      local whenStatementsMTKIf = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
-      local whenStatementsMTKElse = createWhenStatementsMTK(_elsewhenStmtLst(elsePart), simCode)
+      #= pre(v) from the state before the instant (instantPre) (an earlier statement's new value is not pre(v)). =#
+      local (whenStatementsMTKIf, whenStatementsMTKElse) = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+        (createWhenStatementsMTK(wEq.whenStmtLst, simCode), createWhenStatementsMTK(_elsewhenStmtLst(elsePart), simCode))
+      end
       local condCrefsElseIf = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
       quote
         let _condCache = Ref{Any}(nothing)
@@ -806,6 +867,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
         let _affCache = Ref{Any}(nothing)
           global $(Symbol("affect$(callbacks)!"))
           $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+            local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)
             local t = integrator.t + integrator.dt
             local x = integrator.u
             local lookuptableStates
@@ -841,12 +903,16 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
         end
         $(Symbol("cb$(callbacks)")) = ContinuousCallback($(Symbol("condition$(callbacks)")),
                                                          $(Symbol("affect$(callbacks)!")),
-                                                         rootfind=true,
+                                                         rootfind = ModelingToolkit.SciMLBase.RightRootFind,
                                                          save_positions=(true, true),
                                                          affect_neg! = $(Symbol("affect$(callbacks)!")))
       end
     else #= No elseif =#
-      whenStatementsMTK  = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+      #= pre(v) from the state before the instant (instantPre): `b = not pre(c); k = if pre(c) ...`
+         with c = b read b's new value (k = 20, OpenModelica 10). =#
+      whenStatementsMTK = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+        createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+      end
       local cond = quote
         let _condCache = Ref{Any}(nothing)
           global $(Symbol("condition$(callbacks)"))
@@ -888,6 +954,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
         let _affCache = Ref{Any}(nothing)
           global $(Symbol("affect$(callbacks)!"))
           $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+            local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)
             local t = integrator.t + integrator.dt
             local x = integrator.u
             @debug "[CB-CC$($(callbacks)) affect] firing" t=integrator.t
@@ -931,7 +998,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       quote
         $cond
         $affect
-        #= No `affect_neg!` set: transformToZeroCrossingCondition has already
+        #= RightRootFind: the event lands just past the root, where the
+           condition has changed sign. From the left of it the next step
+           finds the same crossing again (DiffEqBase 7 no longer suppresses
+           that repeat: ElseWhenBasic looped at x = 0.3 until MaxIters).
+           No `affect_neg!` set: transformToZeroCrossingCondition has already
            encoded direction (positive→negative = trigger) so the same
            Modelica `when cond then` semantics fall on `affect!` only. Setting
            `affect_neg! = affect!` would double-fire on each oscillation
@@ -939,20 +1010,24 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
            again at the same event), driving Zeno / maxiters. =#
         $(Symbol("cb$(callbacks)")) = ContinuousCallback($(Symbol("condition$(callbacks)")),
                                                          $(Symbol("affect$(callbacks)!")),
-                                                         rootfind=true, save_positions=(true, true))
+                                                         rootfind = ModelingToolkit.SciMLBase.RightRootFind, save_positions=(true, true))
         $(if wEq.elsewhenPart !== nothing
             eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 0)
           end)
       end
     end
   elseif isPeriodic
-    @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = wEqCondDAE
+    @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = sampleCall
     @match start <| interval <| tail = args
     #= MTK-aware periodic affect: the hardcoded x[N]/p[N] indices from
        expToJuliaExp are invalid after MTK structural_simplify reorders unknowns,
        so resolve the interval to a literal Δt and write state via
        getStatesAsSymbols + lookuptable, mirroring the discrete branch. =#
-    local whenStatementsMTKPeriodic = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    #= pre(v) from the state before the instant (instantPre): a body reading pre(c) after setting its
+       alias b (`b = not pre(c); k = if pre(c) ...`) read the new value. =#
+    local whenStatementsMTKPeriodic = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+      createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    end
     #= Refresh discrete-bool whens whose condition reads a discrete this periodic
        body writes (e.g. BooleanPulse `y` reads the re-sampled `pulseStart`): their
        own continuous callbacks cannot catch the threshold jump, so re-derive them
@@ -967,10 +1042,35 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     local (_dbRefreshCrefs, _dbRefreshStmts) = _collectDiscreteBoolWhenRefresh(_periodicWrittenLHS, simCode)
     local _intervalVal = SimulationCode.tryEvalNumeric(interval, simCode)
     local _dtExpr = _intervalVal === nothing ? expToJuliaExp(interval, simCode) : _intervalVal
+    #= The ticks are start + i*interval, i = 0, 1, ...: the phase is the first
+       one from the initial time (taken as 0). A start not known here was taken
+       as 0 (generated code cannot read the parameters at module level), a
+       negative one as 0 too (sample(-0.15, 0.25) ticked at 0.25, not 0.1). =#
+    local _startVal = SimulationCode.tryEvalNumeric(start, simCode)
+    _startVal === nothing && unsupported("a sample() start not known at the build", start)
+    local _firstTick = Float64(_startVal)
+    if _firstTick < 0
+      _intervalVal === nothing && unsupported("a negative sample() start with an interval not known at the build", sampleCall)
+      _firstTick += ceil(-_firstTick / Float64(_intervalVal)) * Float64(_intervalVal)
+      #= Rounding: sample(-0.9, 0.3) gave -1.1e-16, a negative phase (an
+         ArgumentError) and no tick at 0. =#
+      abs(_firstTick) <= 8 * eps(max(1.0, abs(Float64(_intervalVal)))) && (_firstTick = 0.0)
+      _firstTick = max(0.0, _firstTick)
+    end
+    local _phaseExpr = _firstTick
+    #= A tick at the initial time is taken too, after initialization (omc,
+       Dymola): MSL RealFFT1's `when sample(0, Ts)` samples y(0) into its FFT
+       buffer. =#
+    local _initialTick = iszero(_firstTick)
+    local _guardCrefs = sampleGuard === nothing ? DAE.ComponentRef[] : listArray(Util.getAllCrefs(sampleGuard))
+    local _guardExpr = sampleGuard === nothing ? true : expToJuliaExpMTK(sampleGuard, simCode)
     quote
       let _affCache = Ref{Any}(nothing)
         global $(Symbol("affect$(callbacks)!"))
         $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+          OMBackend.CodeGeneration._isPeriodicTick(integrator, $(Symbol("samplePhase$(callbacks)")),
+                                                   $(Symbol("sampleDt$(callbacks)"))) || return nothing
+          local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)
           local t = integrator.t
           local x = integrator.u
           local p = integrator.p
@@ -987,6 +1087,8 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
             lookuptableStates = cached[1]
             lookuptableParams = cached[2]
           end
+          $(_whenLookupBindings(_guardCrefs, simCode)...)
+          $(_guardExpr) == true || return nothing
           $(_whenLookupBindings(vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...), simCode)...)
           $(whenStatementsMTKPeriodic...)
           #= Re-derive dependent discrete-bool whens from the just-written threshold. =#
@@ -994,8 +1096,14 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           $(_dbRefreshStmts...)
         end
       end
-      Δt = $(_dtExpr)
-      $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), Δt; save_positions = (true, true))
+      $(Symbol("sampleDt$(callbacks)")) = $(_dtExpr)
+      $(Symbol("samplePhase$(callbacks)")) = $(_phaseExpr)
+      #= Ticks at start + i*interval, the initial and the final time included
+         (_isPeriodicTick). =#
+      $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), $(Symbol("sampleDt$(callbacks)"));
+                                                      phase = $(Symbol("samplePhase$(callbacks)")),
+                                                      initial_affect = $(_initialTick), final_affect = true,
+                                                      save_positions = (true, true))
       $(if wEq.elsewhenPart !== nothing
           eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4)
         end)
@@ -1005,7 +1113,12 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
        The hardcoded x[N] indices from expToJuliaExp become invalid after
        MTK structural_simplify reorders unknowns. Mirror the continuous
        callback path (above) which uses getStatesAsSymbols + lookuptable. =#
-    whenStatementsMTKDiscrete = createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    #= pre(v) from a snapshot: the event iteration passes the state before its
+       sweep (the algebraic unknowns are solved again before the discrete whens
+       run, and `iAtOpen = pre(i)` read the current i). =#
+    whenStatementsMTKDiscrete = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
+      createWhenStatementsMTK(wEq.whenStmtLst, simCode)
+    end
     #= An elsewhen arm `time >= thr` with a runtime-discrete threshold is a
        scheduled time event: the parent affect (which assigns the threshold)
        adds a tstop at it, and the arm itself is emitted as an edge-guarded
@@ -1030,39 +1143,34 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
     local condCrefs = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
-    #= Crefs that appear inside `change(...)` or `pre(...)` are OBSERVED, not
-       latched boolean triggers — they must not be reset after the callback
-       fires (e.g. INV3S-class algorithms whose synthesised condition is
-       `change(iNV3S_enable)` would otherwise zero the Logic-enum input on
-       every event). Build the bare-cref set so condReset only touches
-       standalone Boolean triggers, the original use case. =#
-    local _bareCrefStrs = _collectBareCrefStrings(cond)
-    #= Build condition-reset expressions: set each state cref in the condition to false =#
-    local condResetExprs = map(condCrefs) do c
-      local cStr = string(c)
-      cStr in _bareCrefStrs || return :()
-      local entry = get(simCode.stringToSimVarHT, cStr, nothing)
-      if entry !== nothing && !SimulationCode.isParameter(entry[2])
-        local sym = Symbol(cStr)
-        #= AUDIT (ombackend-bug-audit-2026-06-05 #5): guard the index exactly as
-           changeInitExprs/changeUpdateExprs do. An unguarded
-           `lookuptableStates[sym]` KeyErrors when the trigger is not a state
-           unknown, and a Boolean DEFINED by a relation is observed/algebraic
-           (not in the state vector): force-clearing it would corrupt a value the
-           integrator re-derives. Only a genuine discrete STATE Boolean is
-           de-bounced here. NOTE: for a discrete-state Boolean that is also read
-           elsewhere and meant to persist true, edge de-bounce via state mutation
-           is still a shortcut; a private per-callback latch is the proper fix. =#
-        quote
-          let _idx = get(lookuptableStates, $(QuoteNode(sym)), nothing)
-            if _idx !== nothing
-              x[_idx] = false
-            end
-          end
-        end
-      else
-        :()
-      end
+    #= From the condition as written: the zero-crossing form unwraps a
+       top-level `change(k)` to `k`. =#
+    local _bareCrefStrs = _collectBareCrefStrings(wEqCondDAE)
+    #= A condition on a Boolean (`when u`) is true for as long as u is, but the when
+       fires once, when it becomes true: an edge latch. The condition fires only
+       while the latch is clear and clears it when it reads false; the affect sets
+       it to the condition's value after the event (change() terms are false again
+       then), and the start of a solve to its value on the initialized state (a
+       Boolean true from the start is no edge). The condition only clears it: the
+       event iteration evaluates a condition several times before running the affect.
+       Setting u itself to false instead corrupted it where it is read elsewhere
+       (the MSL Timer's input, a threshold block's output, read by
+       `y = if u then time - entryTime ...`). =#
+    local useLatch = any(condCrefs) do c
+      local entry = get(simCode.stringToSimVarHT, string(c), nothing)
+      string(c) in _bareCrefStrs && entry !== nothing && !SimulationCode.isParameter(entry[2])
+    end
+    local condValue = quote
+      $(_whenLookupBindings(Util.getAllCrefs(cond), simCode)...)
+      local _r = $(expToJuliaBoolMTK(wEqCondDAE, simCode; cachedChange = true))
+      #= DiscreteCallback condition must return Bool per SciMLBase. Modelica
+         Boolean discrete states are stored as Float64 in `integrator.u`
+         (0.0/1.0), so a bare cref read returns Float64 and triggers
+         "TypeError: non-boolean (Float64) used in boolean context" in
+         SciML's callback dispatch (affects PowerConverters Thyristor
+         models). Cast via `!= 0` so any numeric cref-as-condition
+         evaluates correctly. Bool results pass through unchanged. =#
+      _r isa Bool ? _r : (_r != 0)
     end
     local changeInitExprs = map(condCrefs) do c
       local cStr = string(c)
@@ -1108,12 +1216,16 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     end
     quote
       $(_ewDecl)
-      let _condCache = Ref{Any}(nothing),
-          _affCache = Ref{Any}(nothing),
-          _changeCache = Ref{Any}(nothing),
+      #= Typed caches: the condition runs after every step. =#
+      let _condCache = Ref{Union{Nothing, Tuple{Dict{Symbol, Union{Nothing, Int}}, Dict{Symbol, Int}}}}(nothing),
+          _affCache = Ref{Union{Nothing, Tuple{Dict{Symbol, Int}, Dict{Symbol, Int}}}}(nothing),
+          _changeCache = Ref{Union{Nothing, Dict{Symbol, Any}}}(nothing),
+          _latch = Ref{Bool}(false),     # the edge latch
           _changeSeedValues = Dict{Symbol, Any}($(changeSeedPairs...))
         global $(Symbol("condition$(callbacks)"))
-        $(Symbol("condition$(callbacks)")) = (x, t, integrator) -> begin
+        #= Whether the when fires. `_follow`: whether change()/edge() may take the values now,
+           where it does not fire (false within an event iteration's sweep; see below). =#
+        $(Symbol("condition$(callbacks)")) = (x, t, integrator, _follow::Bool = true) -> begin
           local lookuptableStates
           local lookuptableParams
           if _condCache[] === nothing
@@ -1123,9 +1235,9 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
               @debug "[CB-DC$($(callbacks)) cond] false (no state mapping)" t xs
               return false
             end
-            lookuptableStates = Dict((xs) .=> indices)
+            lookuptableStates = Dict{Symbol, Union{Nothing, Int}}((xs) .=> indices)
             local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-            lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+            lookuptableParams = Dict{Symbol, Int}(sym => i for (i, sym) in enumerate(params))
             _condCache[] = (lookuptableStates, lookuptableParams)
           else
             local cached = _condCache[]
@@ -1136,26 +1248,23 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           if _changeCache[] === nothing
             _changePreValues = copy(_changeSeedValues)
             _changeCache[] = _changePreValues
-            if isempty(_changePreValues)
-              $(changeInitExprs...)
-            end
           else
             _changePreValues = _changeCache[]
           end
-          $(_whenLookupBindings(Util.getAllCrefs(cond), simCode)...)
-          local _result = $(expToJuliaBoolMTK(wEqCondDAE, simCode; cachedChange = true))
+          local _result = $(condValue)
           @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
-          #= DiscreteCallback condition must return Bool per SciMLBase. Modelica
-             Boolean discrete states are stored as Float64 in `integrator.u`
-             (0.0/1.0), so a bare cref read returns Float64 and triggers
-             "TypeError: non-boolean (Float64) used in boolean context" in
-             SciML's callback dispatch (affects PowerConverters Thyristor
-             models). Cast via `!= 0` so any numeric cref-as-condition
-             evaluates correctly. Bool results pass through unchanged. =#
-          _result isa Bool ? _result : (_result != 0)
+          $(useLatch ? :(_result || (_latch[] = false)) : :())
+          local _fires = $(useLatch ? :(_result && !_latch[]) : :_result)
+          #= change()/edge() compare with the values at the previous event (pre()): where the when
+             does not fire, the memory follows the values now (off turned false at 1/12 without
+             firing a `when edge(off)`, which then missed off's edge at 5/12); where it fires, its
+             affect does. Not within a sweep of the event iteration: an algebraic value the next
+             sweep solves again is stale there, and `edge(b) and c` would lose b's edge. =#
+          $(isempty(changeSeedPairs) ? :() : :(_follow && !_fires && begin $(changeInitExprs...) end))
+          _fires
         end
         global $(Symbol("affect$(callbacks)!"))
-        $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
+        $(Symbol("affect$(callbacks)!")) = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)) -> begin
           local t = integrator.t
           local x = integrator.u
           @debug "[CB-DC$($(callbacks)) affect] firing" t=integrator.t
@@ -1164,8 +1273,8 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           if _affCache[] === nothing
             local states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
             local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-            lookuptableStates = Dict(sym => i for (i, sym) in enumerate(states))
-            lookuptableParams = Dict(sym => i for (i, sym) in enumerate(params))
+            lookuptableStates = Dict{Symbol, Int}(sym => i for (i, sym) in enumerate(states))
+            lookuptableParams = Dict{Symbol, Int}(sym => i for (i, sym) in enumerate(params))
             _affCache[] = (lookuptableStates, lookuptableParams)
           else
             local cached = _affCache[]
@@ -1180,13 +1289,35 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           local _changePreValues = _changeCache[] === nothing ? Dict{Symbol, Any}() : _changeCache[]
           _changeCache[] = _changePreValues
           $(changeUpdateExprs...)
-          $(condResetExprs...)
+          #= On the state vector: the body bound the model's variables by name
+             (a variable `x` replaced the state vector `x`: a BoundsError). =#
+          $(useLatch ? :(_latch[] = let x = integrator.u; $(condValue) end) : :())
           @debug "[CB-DC$($(callbacks)) affect] done" t=integrator.t u=copy(integrator.u)
         end
+        #= At the start of a solve: change()/edge() compare with the initialized values (pre() at the
+           first event), not the start attributes: `when edge(off)` with off(start = true) initialized
+           false never fired (the MSL switch with arc: its arc voltage never started ramping). And the
+           edge latch from the initialized state. =#
+        global $(Symbol("initialize$(callbacks)!"))
+        #= The latch implies a seed: it is used for a non-parameter cref of the condition. =#
+        $(Symbol("initialize$(callbacks)!")) = $(isempty(changeSeedPairs) ?
+          :(OMBackend.CodeGeneration._NO_WHEN_INITIALIZE) :
+          :((x, t, integrator) -> begin
+              local _states = OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f)
+              local _pre = copy(_changeSeedValues)
+              for _sym in keys(_changeSeedValues)
+                local _i = findfirst(==(_sym), _states)
+                _i === nothing || (_pre[_sym] = x[_i])
+              end
+              _changeCache[] = _pre
+              $(useLatch ? :(_latch[] = false; _latch[] = $(Symbol("condition$(callbacks)"))(x, t, integrator)) : :())
+              nothing
+            end))
       end
-      $(Symbol("cb$(callbacks)")) = DiscreteCallback($(Symbol("condition$(callbacks)")),
-                                                     $(Symbol("affect$(callbacks)!"));
-                                                     save_positions=(true, true))
+      #= Part of the event iteration where the model has buffered relations. =#
+      $(Symbol("cb$(callbacks)")) = OMBackend.CodeGeneration.discreteWhenCallback($(Symbol("condition$(callbacks)")),
+                                                                                $(Symbol("affect$(callbacks)!")),
+                                                                                $(Symbol("initialize$(callbacks)!")))
       $(if _ewThrDAE !== nothing
           _emitElsewhenThresholdTimeWhen(_ewArm, simCode, _ewRefSym, _ewThrDAE)
         elseif wEq.elsewhenPart !== nothing
@@ -1197,29 +1328,27 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
 end
 
 
+#= SimCode-Exp entry: per-variant dispatch mirrors the DAE.Exp emitter;
+   only the EXP_CREF leaf, CALL args, and CAST touch a per-node DAE projection. =#
 """
   Converts a DAE expression into a Julia expression
   $(SIGNATURES)
 The context can be any type that contains a set of residual equations.
 """
-#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp` (Phase 4b API).
-   See comment on the MTK variant. =#
-#= SimCode-Exp entry (Phase 4b API): per-variant dispatch mirrors the DAE.Exp emitter;
-   only the EXP_CREF leaf, CALL args, and CAST touch a per-node DAE projection. =#
-function expToJuliaExp(e::SimulationCode.BCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.BCONST, context, varSuffix=""; varPrefix="x")::Expr
   quote $(e.value) end
 end
-function expToJuliaExp(e::SimulationCode.ICONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.ICONST, context, varSuffix=""; varPrefix="x")::Expr
   quote $(e.value) end
 end
-function expToJuliaExp(e::SimulationCode.RCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.RCONST, context, varSuffix=""; varPrefix="x")::Expr
   quote $(e.value) end
 end
-function expToJuliaExp(e::SimulationCode.SCONST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.SCONST, context, varSuffix=""; varPrefix="x")::Expr
   quote $(e.value) end
 end
 
-function expToJuliaExp(e::SimulationCode.EXP_CREF, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.EXP_CREF, context, varSuffix=""; varPrefix="x")::Expr
   local hashTable = context.stringToSimVarHT
   local varName = SimulationCode.string(SimulationCode.toDAECref(e.cref).componentRef)
   if varName == "time"
@@ -1250,10 +1379,6 @@ function expToJuliaExp(e::SimulationCode.EXP_CREF, context::C, varSuffix=""; var
       $(LineNumberNode(@__LINE__, "$varName, datastructure"))
       $(Symbol(indexAndVar[2].name))
     end
-    SimulationCode.OCC_VARIABLE(__) => quote
-      $(LineNumberNode(@__LINE__, "$varName, occ variable"))
-      $(Symbol(indexAndVar[2].name))
-    end
     SimulationCode.STRING(__) => quote
       $(LineNumberNode(@__LINE__, "$varName, string"))
       $(Symbol(indexAndVar[2].name))
@@ -1261,13 +1386,13 @@ function expToJuliaExp(e::SimulationCode.EXP_CREF, context::C, varSuffix=""; var
   end
 end
 
-function expToJuliaExp(e::SimulationCode.UNARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.UNARY, context, varSuffix=""; varPrefix="x")::Expr
   local o = opKindToJuliaOperator(e.op)
   quote
     $(o)($(expToJuliaExp(e.exp, context, varPrefix=varPrefix)))
   end
 end
-function expToJuliaExp(e::SimulationCode.BINARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.BINARY, context, varSuffix=""; varPrefix="x")::Expr
   local a = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
   local b = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
   local o = opKindToJuliaOperator(e.op)
@@ -1275,14 +1400,14 @@ function expToJuliaExp(e::SimulationCode.BINARY, context::C, varSuffix=""; varPr
     $o($(a), $(b))
   end
 end
-function expToJuliaExp(e::SimulationCode.LUNARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.LUNARY, context, varSuffix=""; varPrefix="x")::Expr
   local lhs = expToJuliaExp(e.exp, context, varPrefix=varPrefix)
   local o = opKindToJuliaOperator(e.op)
   quote
     $o($(lhs))
   end
 end
-function expToJuliaExp(e::SimulationCode.LBINARY, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.LBINARY, context, varSuffix=""; varPrefix="x")::Expr
   local l = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
   local o = opKindToJuliaOperator(e.op)
   local r = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
@@ -1290,7 +1415,7 @@ function expToJuliaExp(e::SimulationCode.LBINARY, context::C, varSuffix=""; varP
     $o($(l), $(r))
   end
 end
-function expToJuliaExp(e::SimulationCode.RELATION, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.RELATION, context, varSuffix=""; varPrefix="x")::Expr
   local lhs = expToJuliaExp(e.exp1, context, varPrefix=varPrefix)
   local o = opKindToJuliaOperator(e.op)
   local rhs = expToJuliaExp(e.exp2, context, varPrefix=varPrefix)
@@ -1298,13 +1423,13 @@ function expToJuliaExp(e::SimulationCode.RELATION, context::C, varSuffix=""; var
     $o($(lhs), $(rhs))
   end
 end
-function expToJuliaExp(e::SimulationCode.IFEXP, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.IFEXP, context, varSuffix=""; varPrefix="x")::Expr
   local condJL = expToJuliaExp(e.cond, context, varPrefix=varPrefix)
   local thenJL = expToJuliaExp(e.thenExp, context, varPrefix=varPrefix)
   local elseJL = expToJuliaExp(e.elseExp, context, varPrefix=varPrefix)
   :(ifelse($(condJL), $(thenJL), $(elseJL)))
 end
-function expToJuliaExp(e::SimulationCode.CALL, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.CALL, context, varSuffix=""; varPrefix="x")::Expr
   local hashTable = context.stringToSimVarHT
   @match e.path begin
     Absyn.IDENT(nm) => begin
@@ -1322,18 +1447,18 @@ function expToJuliaExp(e::SimulationCode.CALL, context::C, varSuffix=""; varPref
     end
   end
 end
-function expToJuliaExp(e::SimulationCode.CAST, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(e::SimulationCode.CAST, context, varSuffix=""; varPrefix="x")::Expr
   quote
     $(generateCastExpression(SimulationCode.toDAEType(e.ty), SimulationCode.toDAEExp(e.exp), context, varPrefix))
   end
 end
 Base.@nospecializeinfer function expToJuliaExp(@nospecialize(exp::SimulationCode.Exp),
-                                               @nospecialize(context::C),
-                                               varSuffix = ""; varPrefix = "x")::Expr where {C}
-  throw(ErrorException("$exp not yet supported"))
+                                               @nospecialize(context),
+                                               varSuffix = ""; varPrefix = "x")::Expr
+  unsupported("expression", exp)
 end
 
-function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::Expr where {C}
+function expToJuliaExp(exp::DAE.Exp, context, varSuffix=""; varPrefix="x")::Expr
   hashTable = context.stringToSimVarHT
   local expr::Expr = begin
     local int::Int64
@@ -1382,7 +1507,7 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
             end
             SimulationCode.STATE_DERIVATIVE(__) => :(dx$(varSuffix)[$(indexAndVar[1])] #= der($varName) =#)
             #=
-            DATA_STRUCTURE / OCC_VARIABLE / STRING: opaque / discrete-only
+            DATA_STRUCTURE / STRING: opaque / discrete-only
             variables that do not live in the integrator's continuous state
             vector. Emit by the SimVar's registered `name`, matching how
             expToJuliaExpMTK lowers the same cases. Without these arms the
@@ -1396,10 +1521,6 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
             =#
             SimulationCode.DATA_STRUCTURE(__) => quote
               $(LineNumberNode(@__LINE__, "$varName, datastructure"))
-              $(Symbol(indexAndVar[2].name))
-            end
-            SimulationCode.OCC_VARIABLE(__) => quote
-              $(LineNumberNode(@__LINE__, "$varName, occ variable"))
               $(Symbol(indexAndVar[2].name))
             end
             SimulationCode.STRING(__) => quote
@@ -1488,55 +1609,9 @@ function expToJuliaExp(exp::DAE.Exp, context::C, varSuffix=""; varPrefix="x")::E
           $(generateCastExpression(ty, exp, context, varPrefix))
         end
       end
-      _ =>  throw(ErrorException("$exp not yet supported"))
+      _ => unsupported("expression", exp)
     end
   end
   return expr
 end
 
-
-"""
-  Generates the start conditions.
-  All variables default to zero if they are not specified by the user.
-"""
-function getStartConditions(vars::Array, condName::String, simCode::SimulationCode.SimCode)::Expr
-  local startExprs::Array{Expr} = []
-  local residuals = simCode.residualEquations
-  local ht::Dict = simCode.stringToSimVarHT
-  if length(vars) == 0
-    return quote
-    end
-  end
-  for var in vars
-    (index, simVar) = ht[var]
-    local simVarType = simVar.varKind
-    local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
-    if simVar.attributes == nothing
-      continue
-    end
-    () = @match optAttributes begin
-      SOME(attributes) => begin
-        () = @match (attributes.start, attributes.fixed) begin
-          (SOME(start), SOME(fixed)) || (SOME(start), _)  => begin
-            @debug "Start value is:" start
-            push!(startExprs,
-                  quote
-                  $(LineNumberNode(@__LINE__, "$var"))
-                  $(Symbol("$condName"))[$index] = $(expToJuliaExp(start, simCode))
-                  end)
-            ()
-          end
-          (NONE(), SOME(fixed)) => begin
-            push!(startExprs, :($(condName)[$(index)] = 0.0))
-            ()
-          end
-          (_, _) => ()
-        end
-      end
-      NONE() => ()
-    end
-  end
-  return quote
-    $(startExprs...)
-  end
-end

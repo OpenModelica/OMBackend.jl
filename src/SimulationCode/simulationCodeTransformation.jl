@@ -126,7 +126,8 @@ end
    derivatives; they should be reduced to auxiliary first-order states upstream
    (order lowering) before reaching SimCode rather than erroring here. =#
 function DAE_identifierToString(exp)
-  error("DAE_identifierToString: unsupported argument of type $(typeof(exp)) with value $exp. Expected DAE.CREF, DAE.ComponentRef, or String.")
+  #= Expected DAE.CREF, DAE.ComponentRef or String (der(der(x)) reaches here). =#
+  OMBackend.unsupported("identifier", exp)
 end
 
 """
@@ -156,8 +157,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   #= Fetch the different components of the model.=#
   local allSharedVars::Vector{BDAE.VAR} = getSharedVariablesLocalsAndGlobals(shared)
   local allBackendVars = vcat(equationSystem.orderedVars, allSharedVars)
-  local simVars::Vector{SimulationCode.SIMVAR} = createAndCollectSimulationCodeVariables(allBackendVars, shared.flatModel)
-  local occVars = String[v.name for v in simVars if isOCCVar(v)]
+  local simVars::Vector{SimulationCode.SIMVAR} = collectVariables(allBackendVars)
   #=
     Check if the model has state variables, if not introduce a dummy state
   =#
@@ -179,9 +179,15 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
    whenEqs::Vector{BDAE.WHEN_EQUATION},
    ifEqs::Vector{BDAE.IF_EQUATION},
    structuralTransitions::Vector{BDAE.Equation},
-   initialWhenEqs::Vector{BDAE.INITIAL_WHEN_EQUATION}) = allocateAndCollectSimulationEquations(equations,
-                                                                                               equationSystem.name,
-                                                                                               addDummyState)
+   initialWhenEqs::Vector{BDAE.INITIAL_WHEN_EQUATION},
+   asserts::Vector{BDAE.ASSERT_EQUATION}) = allocateAndCollectSimulationEquations(equations,
+                                                                                  equationSystem.name,
+                                                                                  addDummyState)
+  #= Parameters in asserts as literals (they may be eliminated later); tunable
+     ones stay references, read from the problem at run time. =#
+  asserts = BDAE.ASSERT_EQUATION[BDAE.ASSERT_EQUATION(_inlineParamsInExp(a.condition, stringToSimVarHT; keepTunable = true),
+                                                      _inlineParamsInExp(a.message, stringToSimVarHT; keepTunable = true),
+                                                      a.level, a.source) for a in asserts]
   #= Combine two sources of init-time algorithm bodies:
      (1) BDAE.INITIAL_WHEN_EQUATION nodes synthesized from `algorithm when initial()`
          clauses in BDAECreate.
@@ -190,9 +196,10 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
          §8/§11. =#
   local initialAlgorithms = INITIAL_ALGORITHM[]
   for iweq in initialWhenEqs
-    local daeStmts = get(Backend.BDAECreate._INIT_ALG_DAE_STMTS, iweq, DAE.Statement[])
+    local daeStmts = Backend.BDAEUtil.initialAlgorithmStatements(iweq)
     push!(initialAlgorithms, INITIAL_ALGORITHM(collect(iweq.whenEquation.whenStmtLst), daeStmts))
   end
+  whenEqs = substituteSampleTriggers(whenEqs, resEqs)
   local (whenEqsKept, extractedInitAlgs) = extractInitialWhenAlgorithms(whenEqs)
   whenEqs = whenEqsKept
   append!(initialAlgorithms, extractedInitAlgs)
@@ -205,16 +212,8 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
     Gather all irreducible variables.
     NB: Should also include variables affected somehow with by a structural change.
   =#
-  local irreducibleVars::Vector{String} = vcat(occVars,
-                                                getIrreducibleVars(ifEqs,
-                                                                    whenEqs,
-                                                                    allBackendVars,
-                                                                    stringToSimVarHT))
+  local irreducibleVars::Vector{String} = getIrreducibleVars(ifEqs, whenEqs, allBackendVars, stringToSimVarHT)
   (resEqs, irreducibleVars) = handleZimmerThetaConstant(resEqs, irreducibleVars, stringToSimVarHT)
-  #= ...DOCC Handling... =#
-  if ! isempty(shared.DOCC_equations)
-    append!(structuralTransitions, shared.DOCC_equations)
-  end
   #=  Convert the structural transitions to the simcode representation. =#
   local simCodeStructuralTransitions = createSimCodeStructuralTransitions(structuralTransitions)
   #= Sorting/Matching for the set of residual equations (This is used for the start conditions) =#
@@ -309,7 +308,6 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
                           simSharedEqs,
                           initialState,
                           shared.metaModel,
-                          shared.flatModel,
                           irreducibleVars,
                           ModelicaFunction[],
                           #= Specify if external runtime should be used =# false,
@@ -318,6 +316,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
                           AliasEntry[],
                           nothing,
                           initialAlgorithms,
+                          asserts,
                           )
 end
 
@@ -381,13 +380,34 @@ function createSimCodeStructuralTransitions(structuralTransitions::Vector{ST}) w
                                                       SimulationCode.toWhenStmts(st.whenEquation),
                                                       st.source,
                                                       SimulationCode.toEqAttr(st.attr))
-      BDAE.STRUCTURAL_IF_EQUATION(__) =>
-        SimulationCode.DYNAMIC_OVERCONSTRAINED_CONNECTOR_EQUATION(st.ifEquation)
     end
     push!(transitions, sst)
   end
   return transitions
 end
+
+#= The operators of a when body for an initial algorithm, a tuple assignment
+   `(a, b) = f(x)` as one assignment per target (as the algorithm form): the
+   initial-algorithm passes take a variable on the left only, and evaluated
+   and dropped the tuple (a, b = 0, OpenModelica 4, 6). =#
+function _tupleAssignsSplit(ops)::Vector{BDAE.WhenOperator}
+  local out = BDAE.WhenOperator[]
+  for op in ops
+    if op isa BDAE.ASSIGN && op.left isa DAE.TUPLE
+      for (target, value) in Backend.BDAECreate._tupleAssignElements(collect(op.left.PR), op.right)
+        push!(out, BDAE.ASSIGN(target, value, op.source))
+      end
+    else
+      push!(out, op)
+    end
+  end
+  return out
+end
+
+#= A branch without equations: none, or if-equations without any (left by
+   the assert hoisting). =#
+_holdsNoEquations(body)::Bool =
+  all(eq -> eq isa BDAE.IF_EQUATION && all(_holdsNoEquations, eq.eqnstrue) && _holdsNoEquations(eq.eqnsfalse), body)
 
 """
   Given a set of BDAE IF_EQUATIONS.
@@ -418,6 +438,14 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
       end
     end
     local conditions = BDAE_ifEquation.conditions
+    #= No else: no equations either (their numbers must match; the asserts
+       were hoisted in BDAECreate), so nothing to lower. It was a `break`,
+       which dropped every if-equation after this one. =#
+    if listEmpty(BDAE_ifEquation.eqnsfalse)
+      all(_holdsNoEquations, BDAE_ifEquation.eqnstrue) ||
+        OMBackend.unsupported("an if-equation without else whose branches have equations", toSimExp(listHead(conditions)))
+      continue
+    end
     local condition
     local equations
     local target
@@ -480,10 +508,6 @@ function constructSimCodeIFEquations(ifEquations::Vector{BDAE.IF_EQUATION},
       The condition for the else branch to be inactive is active
       if all preceding branches failed to evaluate to true.
     =#
-    #= Check if we have an else if not we are done.=#
-    if listEmpty(BDAE_ifEquation.eqnsfalse)
-      break
-    end
     condition = SCONST("ELSE_BRANCH")
     #= Same defensive filtering as the eqnstrue path above. =#
     local rawElseBranch = listArray(BDAE_ifEquation.eqnsfalse)
@@ -689,12 +713,12 @@ function matchAndCheckStronglyConnectedComponents(eqVariableMapping,
     (isSingular, matchOrder) = GraphAlgorithms.matching(eqVariableMapping,
                                                         numberOfVariablesInMapping)
   catch e
-    if mode == OMBackend.MTK_MODE
-      #= Matching failed, delegating structural analysis to ModelingToolkit =#
-      return (true, Int[], MetaGraphs.MetaDiGraph(), Vector{Int}[])
-    else
-      rethrow(e)
-    end
+    mode == OMBackend.MTK_MODE || rethrow()
+    #= Matching failed, delegating structural analysis to ModelingToolkit. The
+       matching recurses (pathFound): a large system can overflow the stack,
+       which is this fallback too, not a fatal error. =#
+    e isa StackOverflowError || OMBackend._fallback(e, :matchingDelegatedToMTK)
+    return (true, Int[], MetaGraphs.MetaDiGraph(), Vector{Int}[])
   end
   #=
     Index reduction might resolve the issues with this system.
@@ -727,6 +751,7 @@ function allocateAndCollectSimulationEquations(equations::T,
   initialWhenEquations = BDAE.INITIAL_WHEN_EQUATION[]
   ifEquations = BDAE.IF_EQUATION[]
   structuralTransitions = BDAE.Equation[]
+  asserts = BDAE.ASSERT_EQUATION[]
   for eq in equations
     eqType = typeof(eq)
     if eqType === BDAE.RESIDUAL_EQUATION
@@ -741,12 +766,14 @@ function allocateAndCollectSimulationEquations(equations::T,
       push!(structuralTransitions, eq)
     elseif eqType === BDAE.ALGORITHM
       _algorithmToResiduals!(regularEquations, eq)
+    elseif eqType === BDAE.ASSERT_EQUATION
+      push!(asserts, eq)
     end
   end
   if shouldAddDummyEquation
     push!(regularEquations, makeDummyResidualEquation(equationSystemName))
   end
-  return (regularEquations, whenEquations, ifEquations, structuralTransitions, initialWhenEquations)
+  return (regularEquations, whenEquations, ifEquations, structuralTransitions, initialWhenEquations, asserts)
 end
 
 #= Lower the body of a non-when `BDAE.ALGORITHM` into one
@@ -808,41 +835,78 @@ function _hasMixedInitialCondition(cond::DAE.Exp)::Bool
 end
 
 #= Drop the `initial()` triggers from an array-form condition, returning the
-   residual runtime trigger: the lone relation if one remains, otherwise an
-   OR-chain over the survivors. =#
+   residual runtime trigger (_vectorTrigger), or nothing. =#
 function _stripInitialTriggers(cond::DAE.Exp)::Union{DAE.Exp, Nothing}
   @match cond begin
     DAE.ARRAY(_, _, lst) => begin
       local rest = filter(e -> !_isPureInitialCondition(e), collect(lst))
-      isempty(rest) ? nothing :
-        foldl((a, b) -> DAE.LBINARY(a, DAE.OR(DAE.T_BOOL_DEFAULT), b), rest)
+      isempty(rest) ? nothing : _vectorTrigger(rest)
     end
     _ => cond
   end
 end
 
-_isTimeCrefDAE(@nospecialize(e))::Bool = @match e begin
-  DAE.CREF(componentRef = cr) => string(cr) == "time"
-  _ => false
+#= A vector of triggers `{c1, ..., cn}` as one condition. The when fires at
+   each element's own rising edge (MLS 8.3.5), so with several elements each
+   is `edge(c)` (an event call, sample() or change(), as it is): `c1 or c2`
+   rises once while c1 stays true, and the array itself, never folded, was
+   always true (MSL MathInteger.TriggeredAdd's `{trigger, local_reset}` ran
+   its body after every step). One element is itself. =#
+function _vectorTrigger(elements::Vector)::DAE.Exp
+  length(elements) == 1 && return only(elements)
+  local edgeOf = e -> (e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name in ("sample", "change", "edge")) ? e :
+    DAE.CALL(Absyn.IDENT("edge"), MetaModelica.list(e), DAE.callAttrBuiltinBool)
+  return foldl((a, b) -> DAE.LBINARY(a, DAE.OR(DAE.T_BOOL_DEFAULT), b), map(edgeOf, elements))
 end
 
-_isPreCallDAE(@nospecialize(e))::Bool = @match e begin
-  DAE.CALL(Absyn.IDENT("pre"), _, _) => true
-  _ => false
-end
-
-#= True when the condition self-schedules off `time` and a `pre()` value: a
-   `time <relop> pre(x)` relation, or an OR-chain containing one. The
-   CombiTimeTable time event `time >= pre(nextTimeEvent)` is this shape; such
-   whens reach MTK via createSelfSchedulingTimeWhenEvents. =#
-function _condHasTimeAndPre(@nospecialize(cond))::Bool
-  @match cond begin
-    DAE.RELATION(exp1 = e1, exp2 = e2) =>
-      (_isTimeCrefDAE(e1) || _isTimeCrefDAE(e2)) && (_isPreCallDAE(e1) || _isPreCallDAE(e2))
-    DAE.LBINARY(exp1 = a, operator = DAE.OR(__), exp2 = b) =>
-      (_condHasTimeAndPre(a) || _condHasTimeAndPre(b))
-    _ => false
+#= A when-equation with its vector conditions (the elsewhens' too) as single ones. =#
+function _foldVectorTriggers(weq::BDAE.WHEN_EQUATION)::BDAE.WHEN_EQUATION
+  local w = weq.whenEquation
+  local cond = w.condition isa DAE.ARRAY ? _vectorTrigger(collect(w.condition.array)) : w.condition
+  local elsewhen = @match w.elsewhenPart begin
+    SOME(e) => SOME(_foldVectorTriggers(e))
+    _ => w.elsewhenPart
   end
+  return BDAE.WHEN_EQUATION(weq.size, BDAE.WHEN_STMTS(cond, w.whenStmtLst, elsewhen), weq.source, weq.attr)
+end
+
+_isSampleCallDAE(@nospecialize(e))::Bool = e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "sample"
+
+"""
+    substituteSampleTriggers(whenEqs, resEqs) -> whenEqs
+
+A when condition on a Boolean defined by `b = sample(start, interval)` (the
+MSL DiscreteBlock's `sampleTrigger`, read by `when {sampleTrigger, initial()}`
+in ZeroOrderHold and Sampler) gets the sample call in place of `b`: only a
+condition with a sample() call becomes a periodic callback, `b` itself is
+false between the ticks. Only the condition's Boolean structure (the cref, an
+array, and, or) is rewritten, not an operand of pre() or a relation.
+"""
+function substituteSampleTriggers(whenEqs::Vector{BDAE.WHEN_EQUATION},
+                                  resEqs::Vector{BDAE.RESIDUAL_EQUATION})::Vector{BDAE.WHEN_EQUATION}
+  local defs = Dict{String, DAE.Exp}()
+  for eq in resEqs
+    local e = eq.exp
+    (e isa DAE.BINARY && e.operator isa DAE.SUB) || continue
+    for (a, b) in ((e.exp1, e.exp2), (e.exp2, e.exp1))
+      a isa DAE.CREF && _isSampleCallDAE(b) && (defs[string(a.componentRef)] = b)
+    end
+  end
+  isempty(defs) && return whenEqs
+  local subst = cond -> @match cond begin
+    DAE.CREF(componentRef = cr) => get(defs, string(cr), cond)
+    DAE.ARRAY(ty, scalar, lst) => DAE.ARRAY(ty, scalar, MetaModelica.list(map(subst, collect(lst))...))
+    DAE.LBINARY(a, op, b) => DAE.LBINARY(subst(a), op, subst(b))
+    _ => cond
+  end
+  local rewrite
+  rewrite = (w::BDAE.WHEN_STMTS) -> BDAE.WHEN_STMTS(subst(w.condition), w.whenStmtLst,
+    @match w.elsewhenPart begin
+      SOME(ew) => SOME(BDAE.WHEN_EQUATION(ew.size, rewrite(ew.whenEquation), ew.source, ew.attr))
+      _ => w.elsewhenPart
+    end)
+  return BDAE.WHEN_EQUATION[BDAE.WHEN_EQUATION(weq.size, rewrite(weq.whenEquation), weq.source, weq.attr)
+                            for weq in whenEqs]
 end
 
 """
@@ -855,27 +919,34 @@ keeps a runtime when carrying the non-initial triggers. Others pass through.
 function extractInitialWhenAlgorithms(whenEqs::Vector{BDAE.WHEN_EQUATION})::Tuple{Vector{BDAE.WHEN_EQUATION}, Vector{INITIAL_ALGORITHM}}
   local kept = BDAE.WHEN_EQUATION[]
   local initialAlgs = INITIAL_ALGORITHM[]
-  for weq in whenEqs
+  local visit = nothing
+  #= `afterInitial`: an elsewhen arm of a pure `when initial()`, which takes the
+     initialization: the arm's initial() never fires (it ran at the start too). =#
+  visit = function (weq::BDAE.WHEN_EQUATION; afterInitial::Bool = false)
     local cond = weq.whenEquation.condition
     if _isPureInitialCondition(cond)
-      local stmts = collect(weq.whenEquation.whenStmtLst)
-      push!(initialAlgs, INITIAL_ALGORITHM(stmts))
+      afterInitial || push!(initialAlgs, INITIAL_ALGORITHM(_tupleAssignsSplit(weq.whenEquation.whenStmtLst)))
+      #= initial() is false after initialization: the elsewhen arms are the
+         runtime when (`when initial() then .. elsewhen c then ..`). =#
+      local elsewhen = weq.whenEquation.elsewhenPart
+      elsewhen === nothing || visit(elsewhen.data; afterInitial = true)
     elseif _hasMixedInitialCondition(cond)
-      local stmts = collect(weq.whenEquation.whenStmtLst)
-      push!(initialAlgs, INITIAL_ALGORITHM(stmts))
-      #= Keep the runtime arm only for a self-scheduling `time >= pre(x)` trigger,
-         which has an MTK callback lowering; other compound-initial whens stay
-         init-only (their prior behaviour). =#
+      afterInitial || push!(initialAlgs, INITIAL_ALGORITHM(_tupleAssignsSplit(weq.whenEquation.whenStmtLst)))
+      #= The runtime arm on the other triggers: the MSL ZeroOrderHold's
+         `when {sampleTrigger, initial()}` samples at every sampleTrigger. =#
       local runtimeCond = _stripInitialTriggers(cond)
-      if runtimeCond !== nothing && _condHasTimeAndPre(runtimeCond)
+      if runtimeCond !== nothing
         local inner = BDAE.WHEN_STMTS(runtimeCond, weq.whenEquation.whenStmtLst,
                                       weq.whenEquation.elsewhenPart)
-        push!(kept, BDAE.WHEN_EQUATION(weq.size, inner, weq.source, weq.attr))
+        #= Marked: a self-scheduling time when also runs at the start of a solve. =#
+        local attr = BDAE.EQUATION_ATTRIBUTES(false, BDAE.ALSO_INITIAL_EQUATION(), BDAE.defaultEvalStages)
+        push!(kept, _foldVectorTriggers(BDAE.WHEN_EQUATION(weq.size, inner, weq.source, attr)))
       end
     else
-      push!(kept, weq)
+      push!(kept, _foldVectorTriggers(weq))
     end
   end
+  foreach(visit, whenEqs)
   return (kept, initialAlgs)
 end
 
@@ -949,15 +1020,24 @@ function _reconstructScalarizedArrayDAE(baseName::String, ht)::Union{DAE.Exp, No
 end
 
 # SIM.Exp delegation: round-trip to DAE.Exp until the visitor is SIM-native.
-_inlineParamsInExp(exp::Exp, ht)::Exp = toSimExp(_inlineParamsInExp(toDAEExp(exp), ht))
+_inlineParamsInExp(exp::Exp, ht; keepTunable::Bool = false)::Exp =
+  toSimExp(_inlineParamsInExp(toDAEExp(exp), ht; keepTunable = keepTunable))
 
 #= Substitute parameter CREFs with their literal bindings throughout a DAE.Exp.
    Handles PARAMETER (scalar), ARRAY_PARAMETER (direct binding), and scalarized
-   array parents (reconstructed). =#
-function _inlineParamsInExp(exp::DAE.Exp, ht)::DAE.Exp
+   array parents (reconstructed). With `keepTunable`, tunable parameters stay
+   references (read at run time) instead of being an error. =#
+function _inlineParamsInExp(exp::DAE.Exp, ht; keepTunable::Bool = false)::DAE.Exp
   function visit(e, acc)
     if Util.isCref(e)
       local key = string(e)
+      #= Initial algorithms run when the generated module is loaded: a tunable
+         parameter read here would keep its compiled value in every simulation. =#
+      isTunableParameter(key) && keepTunable && return (e, true, acc)
+      isTunableParameter(key) &&
+        throw(ArgumentError("tunable parameter $(key) is read in an initial algorithm, which is evaluated " *
+                            "when the model is compiled, so it would keep its compiled value; leave it out of " *
+                            "withTunableParameters"))
       local entry = get(ht, key, nothing)
       if entry !== nothing
         local sv = last(entry)
@@ -1039,54 +1119,9 @@ function inlineParamsInInitialAlgorithms(initialAlgs::Vector{INITIAL_ALGORITHM},
   return result
 end
 
-#= Recursively substitute parameter CREFs with their literal bindings inside a
-   `DAE.Statement`. Mirrors `_inlineParamsInWhenOp` for the parallel DAE.Statement
-   representation carried by `INITIAL_ALGORITHM.daeStatements`. Compound
-   statements (STMT_IF / STMT_FOR / STMT_WHILE / STMT_PARFOR) recurse into their
-   bodies. Statements with no scalar expressions pass through. =#
-function _inlineParamsInDAEStmt(stmt, ht)
-  return @match stmt begin
-    DAE.STMT_ASSIGN(ty, e1, e, src) =>
-      DAE.STMT_ASSIGN(ty, e1, _inlineParamsInExp(e, ht), src)
-    DAE.STMT_TUPLE_ASSIGN(ty, lhsList, e, src) =>
-      DAE.STMT_TUPLE_ASSIGN(ty, lhsList, _inlineParamsInExp(e, ht), src)
-    DAE.STMT_ASSIGN_ARR(ty, lhs, e, src) =>
-      DAE.STMT_ASSIGN_ARR(ty, lhs, _inlineParamsInExp(e, ht), src)
-    DAE.STMT_NORETCALL(e, src) =>
-      DAE.STMT_NORETCALL(_inlineParamsInExp(e, ht), src)
-    DAE.STMT_ASSERT(c, m, l, src) =>
-      DAE.STMT_ASSERT(_inlineParamsInExp(c, ht), _inlineParamsInExp(m, ht), _inlineParamsInExp(l, ht), src)
-    DAE.STMT_TERMINATE(m, src) =>
-      DAE.STMT_TERMINATE(_inlineParamsInExp(m, ht), src)
-    DAE.STMT_IF(cond, stmts, else_, src) =>
-      DAE.STMT_IF(_inlineParamsInExp(cond, ht),
-                  MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in stmts)...),
-                  _inlineParamsInDAEElse(else_, ht), src)
-    DAE.STMT_FOR(ty, isArr, iter, idx, range, body, src) =>
-      DAE.STMT_FOR(ty, isArr, iter, idx, _inlineParamsInExp(range, ht),
-                   MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in body)...), src)
-    DAE.STMT_PARFOR(ty, isArr, iter, idx, range, body, prl, src) =>
-      DAE.STMT_PARFOR(ty, isArr, iter, idx, _inlineParamsInExp(range, ht),
-                      MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in body)...), prl, src)
-    DAE.STMT_WHILE(cond, body, src) =>
-      DAE.STMT_WHILE(_inlineParamsInExp(cond, ht),
-                     MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in body)...), src)
-    DAE.STMT_REINIT(varExp, value, src) =>
-      DAE.STMT_REINIT(varExp, _inlineParamsInExp(value, ht), src)
-    _ => stmt
-  end
-end
-
-function _inlineParamsInDAEElse(else_, ht)
-  return @match else_ begin
-    DAE.ELSE(stmts) => DAE.ELSE(MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in stmts)...))
-    DAE.ELSEIF(cond, stmts, rest) =>
-      DAE.ELSEIF(_inlineParamsInExp(cond, ht),
-                 MetaModelica.list((_inlineParamsInDAEStmt(s, ht) for s in stmts)...),
-                 _inlineParamsInDAEElse(rest, ht))
-    _ => else_
-  end
-end
+#= Parameter CREFs substituted with their literal bindings inside a `DAE.Statement`,
+   as `_inlineParamsInWhenOp` does for the parallel `WhenOperator` form. =#
+_inlineParamsInDAEStmt(stmt, ht) = Util.mapDAEStatementExps(e -> _inlineParamsInExp(e, ht), stmt)
 
 """
 Returns the shared global and local variable for the shared data in
@@ -1100,40 +1135,17 @@ function getSharedVariablesLocalsAndGlobals(shared::BDAE.SHARED)
 end
 
 """
-  This function converts the set of backend variables (bDAEVariables)
-  to a set of simulation code variables.
-If the system contains the special occ construct we mark the variables involved in the OCC relation as state variables.
-The reason being is that we do not want to optimize away these variables later.
-"""
-function createAndCollectSimulationCodeVariables(bDAEVariables::Vector{BDAE.VAR}, flatModel)
-  @match flatModel begin
-    NONE() => begin
-      collectVariables(bDAEVariables)
-    end
-    SOME(fm) => begin
-      local occVariables = collect(keys(first(getOCCGraph(fm))))
-      collectVariables(bDAEVariables; occVariables = occVariables)
-    end
-  end
-end
-
-"""
   Collect variables from array of BDAE.Var:
   Save the name and it's kind of each variable.
   Index will be set to NONE.
 """
-function collectVariables(allBackendVars::Vector{BDAE.VAR}; occVariables = String[])
+function collectVariables(allBackendVars::Vector{BDAE.VAR})
   local numberOfVars::Int = length(allBackendVars)
   local simVars::Vector = Array{SimulationCode.SimVar}(undef, numberOfVars)
   for (i, backendVar) in enumerate(allBackendVars)
     #= In the backend we use string instead of component references. =#
     local simVarName::String = BDAE_identifierToVarString(backendVar)
     local simVarKind::SimulationCode.SimVarType = BDAE_VarKindToSimCodeVarKind(backendVar)
-    simVarKind = if ! (isOverconstrainedConnectorVariable(simVarName, occVariables))
-      simVarKind
-    else
-      SimulationCode.OCC_VARIABLE()
-    end
     simVars[i] = SimulationCode.SIMVAR(simVarName, NONE(), simVarKind, backendVar.values)
   end
   return simVars
