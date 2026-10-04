@@ -1055,15 +1055,18 @@ function simulateModel(modelName::String;
 end
 
 """
-    getMTKProblem(modelName; tspan=(0.0, 1.0), overwriteCache=false)
+    getMTKProblem(modelName; tspan=(0.0, 1.0), overwriteCache=false) -> Tuple
 
-Return the MTK ODEProblem for an already-translated model without solving it.
-Call `OM.translate` first, then use this to inspect the problem.
+Build the problem of an already-translated model without solving it. Call
+`OM.translate` first. Returns the tuple of the generated model function; its
+first two elements are the `ODEProblem` and the model's event callbacks,
+which a solve needs too.
 
 # Example
 ```julia
 OM.translate("Modelica.Mechanics.MultiBody.Examples.Elementary.Pendulum")
-prob = OMBackend.getMTKProblem("Modelica.Mechanics.MultiBody.Examples.Elementary.Pendulum")
+prob, callbacks = OMBackend.getMTKProblem("Modelica.Mechanics.MultiBody.Examples.Elementary.Pendulum")
+sol = solve(prob, Rodas5P(); callback = callbacks)
 ```
 """
 function getMTKProblem(modelName::String;
