@@ -1,0 +1,9 @@
+# Files excluded from the OSMC-PL 1.8 license-header check.
+# Format: gitignore-style paths/globs relative to the repo root.
+# Use this list for genuinely foreign-licensed or vendored code that must NOT
+# carry the OSMC-PL header.
+
+# Vendored, slightly-modified ModelingToolkit.jl code under the MIT "Expat"
+# License (Copyright (c) 2018-25 Christopher Rackauckas, Julia Computing).
+# Keeping its upstream MIT header; must not be stamped with OSMC-PL.
+src/CodeGeneration/mtkExternals.jl

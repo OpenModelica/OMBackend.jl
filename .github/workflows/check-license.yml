@@ -1,0 +1,23 @@
+name: Check License Headers
+
+on:
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  check-license:
+    name: Julia license headers
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check OSMC-PL 1.8 license header present in src
+        run: |
+          python3 .CI/scripts/check_julia_license.py --summary src
