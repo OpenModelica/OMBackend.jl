@@ -104,4 +104,76 @@ package ArrayPath
     end for;
     assert(time < 0.5, "time limit");
   end Guarded;
+  model InitSteady
+    parameter Real u = 2;
+    Real x;
+    Real y(start = 1, fixed = true);
+  initial equation
+    der(x) = 0;
+  equation
+    der(x) = -x + u + 0.1 * y;
+    der(y) = -y;
+  end InitSteady;
+
+  model SampleZOH
+    Real x(start = 0, fixed = true);
+    discrete Real u(start = 1);
+    discrete Integer k(start = 0);
+  equation
+    der(x) = -x + u;
+    when sample(0.1, 0.2) then
+      u = -pre(u);
+      k = pre(k) + 1;
+    end when;
+  end SampleZOH;
+
+  model StaticIf
+    parameter Integer n = 5;
+    Real x[n](start = {if i == 1 then 1.0 else 0.0 for i in 1:n}, each fixed = true);
+    Real s;
+    Real sl;
+  equation
+    for i in 1:n loop
+      if i == 1 then
+        der(x[i]) = -x[i];
+      else
+        der(x[i]) = x[i - 1] - x[i];
+      end if;
+    end for;
+    s = sum(x);
+    sl = semiLinear(x[1] - 0.5, 2.0, 0.5);
+  end StaticIf;
+
+  model DiscreteEq
+    Boolean b;
+    Integer m;
+    Real x(start = 1, fixed = true);
+    parameter Real A[2, 2] = [-1, 0.5; 0, -2];
+    Real z[2](each start = 1, each fixed = true);
+  equation
+    b = x > 0.5;
+    m = if b then 1 else 2;
+    der(x) = if b then -1 else -0.1 * m;
+    der(z) = A * z;
+  end DiscreteEq;
+
+  model AlgInitial
+    discrete Real t0(start = -1);
+    Real x(start = 0, fixed = true);
+    Real z;
+    discrete Integer n(start = 0);
+  algorithm
+    when initial() then
+      t0 := time + 0.25;
+    end when;
+    z := 0;
+    for i in 1:3 loop
+      z := z + i * x;
+    end for;
+    when x > 0.5 then
+      n := pre(n) + 1;
+    end when;
+  equation
+    der(x) = 1 + t0;
+  end AlgInitial;
 end ArrayPath;

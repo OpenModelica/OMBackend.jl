@@ -78,6 +78,17 @@ end
     @test OMBackend.simulateModel(name; tspan = (0.0, 0.4)).retcode == ReturnCode.Success
   end
 
+  @testset "Initialization, sample, static if, discrete equations, algorithms" begin
+    for (m, names, T) in (("ArrayPath.InitSteady", ["x", "y"], 1.0),
+                          ("ArrayPath.SampleZOH", ["x", "u", "k"], 1.0),
+                          ("ArrayPath.StaticIf", ["x[1]", "x[5]", "s", "sl"], 2.0),
+                          ("ArrayPath.DiscreteEq", ["x", "m", "z[1]", "z[2]"], 2.0),
+                          ("ArrayPath.AlgInitial", ["x", "t0", "z", "n"], 1.0))
+      local (s, a, _) = _bothWays(m, names; tspan = (0.0, T))
+      @test maximum(abs.(s .- a)) < 1e-5
+    end
+  end
+
   @testset "Outside the scope: scalarized as before" begin
     local name = _arrayPathTranslate("ArrayPath.AlgebraicLoop"; scalarized = false)
     @test !_arrayPathTaken(name)
