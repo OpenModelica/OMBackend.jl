@@ -173,6 +173,26 @@ function _precompileWarmupMTKCallbackDAE()::Nothing
   return nothing
 end
 
+#= Bakes the array path's solve into the image (CodeGeneration.ArrayODEGen modules: an RHS
+   the solve wraps, a sparse Jacobian pattern, an ArraySystem, an ArrayModelParameters).
+   Every array model without events shares these types, so its first solve in a fresh
+   session reuses this one. =#
+function _precompileArrayRHS!(du, u, p, t)
+  du .= -u
+  return nothing
+end
+
+function _precompileWarmupArrayPath()::Nothing
+  local AG = CodeGeneration.ArrayODEGen
+  local p = AG.ArrayModelParameters(Float64[], Bool[], Float64[], Float64[], Bool[], zeros(2),
+                                    Tuple{Float64, Vector{Float64}}[], OMBackend)
+  local sys = AG.ArraySystem(Dict{Symbol, Int}(), Symbol[], Dict{Symbol, Tuple{Symbol, Int}}(), OMBackend)
+  local jac = CodeGeneration.Symbolics.SparseArrays.sparse([1, 2], [1, 2], ones(2), 2, 2)
+  local f = ODEFunction(_precompileArrayRHS!; jac_prototype = jac, sys = sys)
+  solve(ODEProblem(f, [1.0, 2.0], (0.0, 1.0), p), defaultSolver(); callback = nothing)
+  return nothing
+end
+
 @setup_workload begin
   @compile_workload begin
     #= Escape hatch for fast dev precompiles. A workload failure must never break
@@ -198,6 +218,11 @@ end
         _precompileWarmupMTKCallbackDAE()
       catch err
         @warn "[OMBackend] MTK-callback DAE precompile warmup skipped" exception = (err, catch_backtrace())
+      end
+      try
+        _precompileWarmupArrayPath()
+      catch err
+        @warn "[OMBackend] array-path precompile warmup skipped" exception = (err, catch_backtrace())
       end
     end
   end

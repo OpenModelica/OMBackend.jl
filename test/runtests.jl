@@ -412,4 +412,7 @@ import .ExampleDAEs
   #= ── 18. Solve keyword arguments with an abstol per unknown ────── =#
   include("solveKwargsTests.jl")
 
+  #= ── 19. Array-preserving code generation (no-scalarize models) ─ =#
+  include("arrayPathTests.jl")
+
 end

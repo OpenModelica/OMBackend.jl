@@ -243,6 +243,18 @@ DEJL (DifferentialEquations.jl) models that have been compiled one time.
 """
 const COMPILED_MODELS_DEJL = Dict{String, Tuple{Expr, Bool, UInt64}}()
 
+"""
+Array-preserving code generation for flat models translated with `scalarized = false`
+(experimental): an explicit ODE whose equations are `der(x) = e`, `der(x[i]) = e` or for-loops
+of these gets a DifferentialEquations.jl module that keeps the loops (CodeGeneration.ArrayODEGen);
+other models are scalarized at the backend entry as before. Toggle with
+`OMBackend.ARRAY_ODE_GENERATION[] = false`.
+"""
+const ARRAY_ODE_GENERATION = Ref{Bool}(true)
+
+#= The models whose current translation is an array ODE module (simulated as DE-mode modules). =#
+const ARRAY_ODE_MODELS = Set{String}()
+
 # Per-model log-run directory captured at translate (`lower`) time. Looked up
 # at simulate time by `simulateModel` so any dumps emitted during the
 # post-MTK / `buildDirectRHSProblem` / `_solveDAEInitialization!` codegen
@@ -301,7 +313,8 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
                    eliminateNonDynamic::Union{Nothing, Bool, SimulationCode.EliminationOptions} = nothing,
                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
                    checkSimCode::Bool = true,
-                   returnNameMap::Bool = false)
+                   returnNameMap::Bool = false,
+                   scalarized::Bool = true)
   local previousWarnSetting = WARN_MISSING_START_VALUES[]
   local runId = createLogRunId(logRunModelName(frontendDAE))
   resetFallbacks!()
@@ -310,6 +323,11 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
     WARN_MISSING_START_VALUES[] = warnMissingStartValues
   end
   try
+    frontendDAE isa OMFrontend.Frontend.FlatModel && delete!(ARRAY_ODE_MODELS, canonicalName(frontendDAE.name))
+    if frontendDAE isa OMFrontend.Frontend.FlatModel && !scalarized && ARRAY_ODE_GENERATION[]
+      local arrayResult = @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(frontendDAE)
+      arrayResult === nothing || return arrayResult
+    end
     return withLogRunDir(runId) do
       #= Dump the flat model with functions as it arrives from the frontend =#
       @BACKEND_LOGGING if frontendDAE isa OMFrontend.Frontend.FlatModel
@@ -317,7 +335,8 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
         debugWrite(logPath("backend/simCode", "frontend_initialModel.log"),
           replace(OMFrontend.Frontend.toFlatString(frontendDAE, fLst), "\\n" => "\n"))
       end
-      local bDAE = @BACKEND_PERFLOG "[backendAPI] lower" lower(frontendDAE)
+      local bDAE = @BACKEND_PERFLOG "[backendAPI] lower" (frontendDAE isa OMFrontend.Frontend.FlatModel ?
+                                                          lower(frontendDAE; scalarized) : lower(frontendDAE))
       local simCode
       if BackendMode == DAE_MODE
         error("DAE-mode is deprecated.")
@@ -673,7 +692,12 @@ end
 """
   Transforms given FlatModelica to backend DAE-IR (BDAE-IR).
 """
-function lower(fm::OMFrontend.Frontend.FLAT_MODEL)
+#= `scalarized = false`: the flat model was flattened with arrays kept (OM's
+   `scalarize = false`); it is scalarized here first, the backend takes scalars. =#
+function lower(fm::OMFrontend.Frontend.FLAT_MODEL; scalarized::Bool = true)
+  if !scalarized
+    fm = @BACKEND_PERFLOG "[backendAPI] scalarizeKeptArrays" OMFrontend.Frontend.scalarizeKeptArrays(fm)
+  end
   local modelName = logRunModelName(fm)
   local runId = createLogRunId(modelName)
   MODEL_RUN_DIRS[canonicalName(modelName)] = runId
@@ -839,6 +863,23 @@ function generateDETargetCode(simCode::SimulationCode.SIM_CODE)
   return (modelName, modelCode)
 end
 
+#= The array ODE module of a no-scalarize flat model (ARRAY_ODE_GENERATION), cached as a
+   DE-mode model; nothing (and an @info with the reason) for a model outside its scope. =#
+function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel)
+  local modelName = canonicalName(fm.name)
+  local (name, modelCode) = CodeGeneration.ArrayODEGen.generateArrayODECode(fm, modelName)
+  if name === nothing
+    @info "[backendAPI] array ODE path not taken for $(modelName): $(modelCode); scalarizing"
+    return nothing
+  end
+  local codeHash = hash(modelCode)
+  local changed = haskey(COMPILED_MODELS_DEJL, modelName) ? COMPILED_MODELS_DEJL[modelName][3] != codeHash :
+                                                           isdefined(OMBackend, Symbol(modelName))
+  COMPILED_MODELS_DEJL[modelName] = (modelCode, changed, codeHash)
+  push!(ARRAY_ODE_MODELS, modelName)
+  return (modelName, modelCode)
+end
+
 """
   Returns true if the model was compiled again
 """
@@ -853,6 +894,14 @@ function getCompiledModelDE(modelName)
 end
 
 modelWasCompiledAgainDE(modelName) = COMPILED_MODELS_DEJL[modelName][2]
+
+#= The DE-mode module of `modelName` evaluated: later calls reuse it until it changes. =#
+function _evalModelDE(modelName::String, modelCode::Expr)
+  @eval $modelCode
+  local (code, _, h) = COMPILED_MODELS_DEJL[modelName]
+  COMPILED_MODELS_DEJL[modelName] = (code, false, h)
+  return nothing
+end
 
 """
 
@@ -977,9 +1026,11 @@ function simulateModel(modelName::String;
                        kwargs...)
   modelName = canonicalName(modelName)
   local modelCode::Expr
+  #= A model translated by the array ODE path is a DE-mode module. =#
+  modelName in ARRAY_ODE_MODELS && (MODE = DEMode)
   #= `parameters` (tunable parameter values for this run) is handled by the
      IMTK path only; elsewhere it would reach `solve` as an unknown keyword. =#
-  haskey(kwargs, :parameters) && MODE != IMTK_MODE &&
+  haskey(kwargs, :parameters) && MODE != IMTK_MODE && !(modelName in ARRAY_ODE_MODELS) &&
     error("simulateModel: `parameters` needs IMTK mode (the default), got $(MODE)")
   if MODE == MTK_MODE
     #= This does a redundant string conversion for now due to modeling toolkit being as is...=#
@@ -1038,7 +1089,7 @@ function simulateModel(modelName::String;
     try
       local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) || modelWasCompiledAgainDE(modelName)
       if needsEval
-        @eval $modelCode
+        _evalModelDE(modelName, modelCode)
       end
       Base.invokelatest() do
         local mod = getfield(OMBackend, Symbol(modelName))
@@ -1073,10 +1124,12 @@ function getMTKProblem(modelName::String;
                        tspan = (0.0, 1.0),
                        overwriteCache::Bool = false)
   modelName = canonicalName(modelName)
-  local modelCode::Expr = getCompiledModel(modelName)
-  local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) || modelWasCompiledAgain(modelName)
+  local arrayModel = modelName in ARRAY_ODE_MODELS
+  local modelCode::Expr = arrayModel ? getCompiledModelDE(modelName) : getCompiledModel(modelName)
+  local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) ||
+    (arrayModel ? modelWasCompiledAgainDE(modelName) : modelWasCompiledAgain(modelName))
   if needsEval
-    @eval $modelCode
+    arrayModel ? _evalModelDE(modelName, modelCode) : @eval($modelCode)
   end
   Base.invokelatest() do
     local mod = getfield(OMBackend, Symbol(modelName))
@@ -1253,6 +1306,11 @@ OM.OMBackend.getVariableValues(sol, "x")
 ```
 """
 function getVariableValues(sol::ODESolution, varName::String)
+  if sol.prob.p isa CodeGeneration.ArrayODEGen.ArrayModelParameters
+    local vals = CodeGeneration.ArrayODEGen.variableValues(sol, varName)
+    vals === nothing && @warn "Did not locate a variable named '$(varName)' in the model"
+    return vals
+  end
 
   varAsJLSym = if varName != "time"
     canonicalSymbol(varName)
