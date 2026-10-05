@@ -2177,9 +2177,16 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     end
 
     #= The algebraic variables at a state (u, t). =#
+    #= The algebraic variables at a point (u, t) of a solution: relations evaluated there and
+       the discrete values of that time (from the event log), on a copy of the discrete state
+       (after a solve p holds its final values). =#
     function algebraics(u, p, t)
       local a = similar(u, $nAlg)
-      equations!(similar(u), a, u, p, t, nothing, false)
+      local times = first.(p.dlog)
+      local d = isempty(times) ? copy(p.d) : copy(p.dlog[max(1, searchsortedlast(times, t))][2])
+      local q = $(paramsType)(p.values, copy(p.rel), d, copy(d), copy(p.wcond), copy(p.sampleActive),
+                              [false], [false], copy(p.upre), p.dlog, p.model)
+      equations!(similar(u), a, u, q, t, nothing, true)
       return a
     end
 

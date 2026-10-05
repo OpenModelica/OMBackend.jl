@@ -863,13 +863,26 @@ function generateDETargetCode(simCode::SimulationCode.SIM_CODE)
   return (modelName, modelCode)
 end
 
+"""
+    translateArrays(flatModel) -> (modelName, code) or nothing
+
+The array-preserving translation of a flat model with arrays kept (from the frontend's
+`scalarize = false`), or `nothing` when the model is outside its scope (the reason is
+logged). OM falls back to the scalarizing flatten and `translate` then.
+"""
+function translateArrays(fm::OMFrontend.Frontend.FlatModel)
+  delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
+  ARRAY_ODE_GENERATION[] || return nothing
+  return @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(fm)
+end
+
 #= The array ODE module of a no-scalarize flat model (ARRAY_ODE_GENERATION), cached as a
    DE-mode model; nothing (and an @info with the reason) for a model outside its scope. =#
 function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel)
   local modelName = canonicalName(fm.name)
   local (name, modelCode) = CodeGeneration.ArrayODEGen.generateArrayODECode(fm, modelName)
   if name === nothing
-    @info "[backendAPI] array ODE path not taken for $(modelName): $(modelCode); scalarizing"
+    @info "[backendAPI] array ODE path not taken for $(modelName): $(modelCode)"
     return nothing
   end
   local codeHash = hash(modelCode)
