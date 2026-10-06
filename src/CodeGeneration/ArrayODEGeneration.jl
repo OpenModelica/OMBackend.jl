@@ -202,6 +202,13 @@ SII.default_values(::ArraySystem) = Dict()
   return rel[k]
 end
 
+#= false (the default): the array path takes continuous models only (no events, asserts,
+   initial equations or fixed starts on non-states); their event and initialization semantics
+   are those of OMBackend's ModelingToolkit path, which other models fall back to. true: also
+   events (relations, when, sample, initial()), asserts and initialization (experimental: the
+   event semantics differ from the MTK path's in places). =#
+const FULL = Ref(false)
+
 #= Sizes of the last generated model (classes, instances, batches = loops, ...), for diagnostics. =#
 const LAST_STATS = Ref{Any}(nothing)
 
@@ -469,7 +476,7 @@ function _startValues(v::F.Variable, n::Int)::Vector{Float64}
 end
 
 #= The fixed attribute of a variable's elements, row-major (default false). =#
-function _fixedValues(v::F.Variable, n::Int)::Vector{Bool}
+function _fixedValues(v::F.Variable, n::Int; default::Bool = false)::Vector{Bool}
   for (an, ab) in v.typeAttributes
     if an == "fixed"
       local f = _evalBinding(ab, v, "fixed")
@@ -478,7 +485,7 @@ function _fixedValues(v::F.Variable, n::Int)::Vector{Bool}
       return vals
     end
   end
-  return fill(false, n)
+  return fill(default, n)
 end
 
 #= ---------------------------------------------------------------- frontend expressions to IR =#
@@ -1772,6 +1779,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
   local stateNamesOrdered = String[]; local algNamesOrdered = String[]
   local u0 = Float64[]; local d0 = Float64[]; local discreteNamesOrdered = String[]; local a0 = Float64[]
   local fixedMask = Bool[]
+  local fixedNonStates = String[]
   for v in fm.variables
     local nm = _crefName(v.name)
     F.hasKnownSize(v.ty) || ns("$(nm) of unknown size")
@@ -1788,11 +1796,13 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       append!(fixedMask, _fixedValues(v, n))
       append!(stateNamesOrdered, _elementNames(v))
     elseif var <= F.Variability.NON_STRUCTURAL_PARAMETER
+      any(!, _fixedValues(v, n; default = true)) && ns("parameter $(nm) with fixed = false (determined by initialization)")
       g.vars[nm] = VarInfo(:param, dims, perPart, 0, _vtypeOrOther(v), v)
     elseif var == F.Variability.CONTINUOUS
       g.vars[nm] = VarInfo(:alg, dims, perPart, g.nAlg, :real, v)
       g.nAlg += n
       append!(a0, _startValues(v, n))
+      any(_fixedValues(v, n)) && push!(fixedNonStates, nm)
       append!(algNamesOrdered, _elementNames(v))
     else
       g.vars[nm] = VarInfo(:discrete, dims, perPart, g.nDiscrete, _vtype(v), v)
@@ -1825,6 +1835,21 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     size(dom, 2) == 0 && continue
     push!(g.classes, EqClass(lhs, rhs, nd, dom, ctx.nrel[], string(nm, " = ", _str(F.getTypedExp(v.binding)))))
   end
+  (FULL[] || isempty(fm.initialEquations)) || ns("initial equations (OMBackend.ARRAY_PATH_FULL)")
+  (FULL[] || isempty(fixedNonStates)) || ns("fixed start on non-state $(fixedNonStates[1]) (OMBackend.ARRAY_PATH_FULL)")
+  for nm in fixedNonStates
+    #= fixed = true on a variable that is no state: the initial equation v = start =#
+    local info = g.vars[nm]
+    local v = info.var
+    local n = isempty(info.dims) ? 1 : prod(info.dims)
+    local fx = _fixedValues(v, n); local st = _startValues(v, n)
+    local k = 0
+    for t in (isempty(info.dims) ? [()] : vec([reverse(t) for t in Iterators.product(reverse([1:d for d in info.dims])...)]))
+      k += 1
+      fx[k] || continue
+      push!(g.initClasses, EqClass(Ref(nm, IR[Lit(i) for i in t], false), Lit(st[k]), 0, NO_SLOTS, 0, "$(nm) = start"))
+    end
+  end
   for eq in fm.initialEquations
     _addEquation!(g, eq, String[], NO_SLOTS; initial = true)
   end
@@ -1843,6 +1868,13 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     for k in 1:(isempty(info.dims) ? 1 : prod(info.dims))
       g.discUnknown[info.offset + k] = (nU += 1)
     end
+  end
+  if !FULL[]
+    isempty(g.whens) || ns("when-equations (OMBackend.ARRAY_PATH_FULL)")
+    isempty(g.asserts) && isempty(g.assertTexts) || ns("asserts (OMBackend.ARRAY_PATH_FULL)")
+    any(c -> c.nrel > 0, g.classes) && ns("relations on continuous variables: events (OMBackend.ARRAY_PATH_FULL)")
+    any(a -> a.nrel > 0 || a.nwhen > 0, g.algs) && ns("events in an algorithm (OMBackend.ARRAY_PATH_FULL)")
+    g.usesInitial && ns("initial() (OMBackend.ARRAY_PATH_FULL)")
   end
   local el = _elements(g)
   local matchRow = _match(el, nU)

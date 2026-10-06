@@ -252,6 +252,13 @@ other models are scalarized at the backend entry as before. Toggle with
 """
 const ARRAY_ODE_GENERATION = Ref{Bool}(true)
 
+"""
+`true`: the array-preserving code generation also takes models with events (relations,
+when, sample, initial()), asserts and initial equations (experimental). `false` (the default):
+those go the ModelingToolkit path, whose event and initialization semantics they keep.
+"""
+const ARRAY_PATH_FULL = CodeGeneration.ArrayODEGen.FULL
+
 #= The models whose current translation is an array ODE module (simulated as DE-mode modules). =#
 const ARRAY_ODE_MODELS = Set{String}()
 
@@ -873,6 +880,10 @@ logged). OM falls back to the scalarizing flatten and `translate` then.
 function translateArrays(fm::OMFrontend.Frontend.FlatModel)
   delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
   ARRAY_ODE_GENERATION[] || return nothing
+  if !isempty(TUNABLE_PARAMETERS[])
+    @info "[backendAPI] array ODE path not taken for $(canonicalName(fm.name)): withTunableParameters (the ModelingToolkit path's tunable sets)"
+    return nothing
+  end
   return @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(fm)
 end
 
@@ -885,10 +896,8 @@ function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel)
     @info "[backendAPI] array ODE path not taken for $(modelName): $(modelCode)"
     return nothing
   end
-  local codeHash = hash(modelCode)
-  local changed = haskey(COMPILED_MODELS_DEJL, modelName) ? COMPILED_MODELS_DEJL[modelName][3] != codeHash :
-                                                           isdefined(OMBackend, Symbol(modelName))
-  COMPILED_MODELS_DEJL[modelName] = (modelCode, changed, codeHash)
+  #= evaluated again at the next simulate: a module of this name may be another path's =#
+  COMPILED_MODELS_DEJL[modelName] = (modelCode, true, hash(modelCode))
   push!(ARRAY_ODE_MODELS, modelName)
   return (modelName, modelCode)
 end

@@ -62,6 +62,12 @@ end
     @test_throws Exception OMBackend.resimulateModel(name; tspan = (0.0, 1.0), parameters = Dict("n" => 4))
   end
 
+  @testset "Events go the ModelingToolkit path by default" begin
+    local name = _arrayPathTranslate("ArrayPath.BouncingBalls"; scalarized = false)
+    @test !_arrayPathTaken(name)
+  end
+
+  OMBackend.ARRAY_PATH_FULL[] = true
   @testset "Events: when-equations in a loop, relations" begin
     local names = ["h[1]", "v[1]", "h[5]", "v[5]", "bounces[1]", "bounces[5]"]
     local (s, a, _) = _bothWays("ArrayPath.BouncingBalls", names; tspan = (0.0, 1.5))
@@ -88,6 +94,8 @@ end
       @test maximum(abs.(s .- a)) < 1e-5
     end
   end
+
+  OMBackend.ARRAY_PATH_FULL[] = false
 
   @testset "Outside the scope: scalarized as before" begin
     local name = _arrayPathTranslate("ArrayPath.AlgebraicLoop"; scalarized = false)
