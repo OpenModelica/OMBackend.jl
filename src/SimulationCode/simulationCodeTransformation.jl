@@ -51,6 +51,11 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_COMPLEX(__)) => begin
       SimulationCode.DATA_STRUCTURE(SimulationCode._toSimBindExp(backendVar.bindExp))
     end
+    #= An external object declared without parameter (Buildings' Spawn adapters, schedules,
+       plotters): constructed once from its binding, like a parameter's. =#
+    (_, DAE.T_COMPLEX(complexClassType = DAE.ClassInf.EXTERNAL_OBJ(__))) => begin
+      SimulationCode.DATA_STRUCTURE(SimulationCode._toSimBindExp(backendVar.bindExp))
+    end
     #= Backend constants must be emitted as module-level bindings because generated
        parameter/default expressions may reference them directly by name. =#
     (BDAE.PARAM(__), DAE.T_REAL(__) || DAE.T_BOOL(__) || DAE.T_INTEGER(__)) => begin
