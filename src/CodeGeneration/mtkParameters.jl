@@ -203,6 +203,7 @@ lossTable_fileName = "NoName"
 """
 function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local exprs::Vector{Expr} = Expr[]
+  local emitted = Set{String}()
   #= Variables the SimCode passes eliminated (aliases, folded equations): no
      longer in the table, and not bound at module level either. =#
   local eliminated = union(OrderedSet{String}(simCode.eliminatedVariables),
@@ -249,8 +250,49 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
       continue
     end
     push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
+    push!(emitted, varName)
   end
+  append!(exprs, _dataStructureParameterPrelude(simCode, emitted))
   return exprs
+end
+
+#= Parameters with a computed binding that a DATA_STRUCTURE's binding reads (MSL 4.1
+   CombiTimeTable's isCsvExt from its file name, an argument of the table's constructor):
+   at module level as well, each after what it reads; a parameter that reads anything
+   else (a variable, an array or another data structure) is left as it was. =#
+function _dataStructureParameterPrelude(simCode::SimulationCode.SIM_CODE, emitted::Set{String})::Vector{Expr}
+  local ht = simCode.stringToSimVarHT
+  local out = Expr[]
+  local visiting = Set{String}()
+  #= at module level the model's functions are CodeGeneration's (qualifyModelicaFunctions!) =#
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
+  local emit!
+  emit! = function (nm::String)
+    nm in emitted && return true
+    nm in visiting && return false
+    local e = get(ht, nm, nothing)
+    e === nothing && return false
+    local sv = last(e)
+    (sv.varKind isa SimulationCode.PARAMETER && !SimulationCode.isTunableParameter(nm)) || return false
+    local b = sv.varKind.bindExp
+    b isa SOME || return false
+    push!(visiting, nm)
+    local ok = all(c -> emit!(string(c)), Util.getAllCrefs(SimulationCode.toDAEExp(b.data)))
+    local rhs = ok ? (try expToJuliaExpMTK(b.data, simCode) catch; nothing end) : nothing
+    delete!(visiting, nm)
+    rhs === nothing && return false
+    rhs isa Expr && !isempty(funcNames) && qualifyModelicaFunctions!(rhs, funcNames)
+    push!(out, :($(Symbol(sv.name)) = $(rhs)))
+    push!(emitted, nm)
+    return true
+  end
+  for (_, (_, sv)) in ht
+    sv.varKind isa SimulationCode.DATA_STRUCTURE || continue
+    local b = sv.varKind.bindExp
+    b isa SOME || continue
+    foreach(c -> emit!(string(c)), Util.getAllCrefs(SimulationCode.toDAEExp(b.data)))
+  end
+  return out
 end
 
 #= Emit ARRAY_PARAMETER bindings at module top so that DATA_STRUCTURE
