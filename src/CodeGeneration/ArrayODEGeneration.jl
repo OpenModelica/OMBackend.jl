@@ -506,6 +506,8 @@ function _literalValue(e::F.Expression)
     return Bool(e.value)
   elseif e isa F.ENUM_LITERAL_EXPRESSION
     return e.index
+  elseif e isa F.STRING_EXPRESSION
+    return String(e.value)
   elseif e isa F.CAST_EXPRESSION
     return _literalValue(e.exp)
   elseif e isa F.ARRAY_EXPRESSION
@@ -998,6 +1000,18 @@ end
 _crossDomain(d::Matrix{Int}, ranges::Vector{Vector{Int}}) = foldl(_crossDomain, ranges; init = d)
 
 #= The value of an expression that depends only on slots and parameters, at a domain column. =#
+#= sample() of an equation as the sample slot of the when wi that schedules its instants. =#
+function _sampleSlots(x::IR, wi::Int)::IR
+  x isa Op && x.op == :sample && return Op(:sampleof, IR[Lit(wi), x.args[3]])
+  x isa Op && return Op(x.op, IR[_sampleSlots(a, wi) for a in x.args])
+  x isa Rel && return Rel(x.op, _sampleSlots(x.lhs, wi), _sampleSlots(x.rhs, wi), x.id)
+  x isa EvFn && return EvFn(x.kind, _sampleSlots(x.arg, wi), x.id)
+  return x
+end
+
+#= The first sample slot of when wi: the slots are numbered when by when, instance by instance. =#
+_whenSampleBase(g, wi::Int) = sum((g.whens[k].nsample * size(g.whens[k].domain, 2) for k in 1:(wi - 1)); init = 0)
+
 #= Whether x reads only literals, iterators and parameters (no variable, no time). =#
 function _parametersOnly(g::Gen, x::IR)::Bool
   (x isa Lit || x isa Slot) && return true
@@ -1091,8 +1105,15 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
     local ctx = Ctx(iters, collect((nIter + 1):(nIter + length(edims))), Base.RefValue(0), true)
     local dom = _crossDomain(idom, [collect(1:d) for d in edims])
     size(dom, 2) == 0 && return
-    push!(g.initClasses, EqClass(toIR(g, eq.lhs, ctx), toIR(g, eq.rhs, ctx), size(dom, 1), dom, 0,
-                                 _str(eq)))
+    local ilhs = toIR(g, eq.lhs, ctx); local irhs = toIR(g, eq.rhs, ctx)
+    #= d = expr for a discrete variable (CDL Discrete: y = y_start): the initial value, assigned
+       after the initialization's solve like an initial algorithm's (it is no unknown of it) =#
+    if isempty(edims) && ilhs isa Ref && !ilhs.der && g.vars[ilhs.name].kind == :discrete &&
+       !any(r -> r.name == ilhs.name, accesses!(Ref[], irhs))
+      push!(g.initAlgs, AlgClass(Stmt[SAssign(ilhs, irhs)], nIter, idom, 0, 0, _str(eq)))
+      return
+    end
+    push!(g.initClasses, EqClass(ilhs, irhs, size(dom, 1), dom, 0, _str(eq)))
     return
   end
   if F.isvariant(eq, F.EQUATION_WHEN)
@@ -1119,7 +1140,23 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
   local ctx = Ctx(iters, collect((nIter + 1):(nIter + length(edims))))
   local lhs = toIR(g, eq.lhs, ctx)
   local rhs = toIR(g, eq.rhs, ctx)
-  ctx.nsam[] == 0 || ns("sample outside a when-condition")
+  if ctx.nsam[] > 0
+    #= sampleTrigger = sample(t0, samplePeriod) (CDL Discrete): true at the instants only. A
+       when without a body schedules the instants; the equation reads its sample slots. =#
+    isempty(edims) || ns("sample outside a when-condition, in an array equation")
+    local samples = IR[]
+    local collect! = function (x)
+      x isa Op && x.op == :sample && push!(samples, x)
+      x isa Op && foreach(collect!, x.args)
+      x isa Rel && (collect!(x.lhs); collect!(x.rhs))
+      x isa EvFn && collect!(x.arg)
+    end
+    collect!(lhs); collect!(rhs)
+    push!(g.whens, WhenClass(length(samples) == 1 ? samples[1] : Op(:||, samples), Tuple{Symbol, Ref, IR}[], [1],
+                             nIter, idom, 0, ctx.nsam[], "sample() of " * _str(eq)))
+    local wi = length(g.whens)
+    lhs = _sampleSlots(lhs, wi); rhs = _sampleSlots(rhs, wi)
+  end
   local dom = _crossDomain(idom, [collect(1:d) for d in edims])
   size(dom, 2) == 0 && return
   push!(g.classes, EqClass(lhs, rhs, size(dom, 1), dom, ctx.nrel[], _str(eq)))
@@ -1923,7 +1960,13 @@ function jl(g::Gen, x::IR)
     local info = g.vars[x.name]
     local idx = Any[jl(g, s) for s in x.subs]
     if info.kind == :param
-      info.vtype == :other && ns("parameter $(x.name) of a type the array path does not pass")
+      if info.vtype == :other
+        #= A String parameter (CDL Utilities.Assert's message): its value, as a literal. =#
+        F.isString(F.arrayElementType(info.var.ty)) || ns("parameter $(x.name) of a type the array path does not pass")
+        local sv = _evalBinding(info.var.binding, info.var, "parameter")
+        (sv isa AbstractString || sv isa AbstractArray{<:AbstractString}) || ns("parameter $(x.name): no String value")
+        return isempty(idx) ? sv : Expr(:ref, sv, idx...)
+      end
       local v = _paramValue!(g, x.name)
       v isa AbstractArray && return _discreteRead(info, Expr(:ref, g.paramSyms[x.name], idx...))
       return g.paramSyms[x.name]
@@ -1955,6 +1998,10 @@ function jl(g::Gen, x::IR)
     x.op == :&& && return Expr(:&&, args...)
     x.op == :|| && return Expr(:||, args...)
     x.op == :sample && return :(p.sampleActive[$(g.sampleBase) + (_col - 1) * $(g.sampleCount) + $(x.args[3].v)])
+    if x.op == :sampleof
+      local wi = x.args[1].v
+      return :(p.sampleActive[$(_whenSampleBase(g, wi)) + (_col - 1) * $(g.whens[wi].nsample) + $(x.args[2].v)])
+    end
     x.op == :initial && return :(p.initPhase[1])
     x.op == :String && return Expr(:call, _modelicaString, args...)
     x.op == :fcall && return Expr(:call, args...)
