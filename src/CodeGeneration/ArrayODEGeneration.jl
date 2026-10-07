@@ -55,14 +55,20 @@ generated code grows with the number of equation classes, not with the array siz
      as data), parameters and start values evaluated by the frontend once and passed as
      data (all parameters tunable; bindings that read a changed parameter are computed
      again), the Jacobian's sparsity pattern from the element dependencies.
-  5. Events: a relation on continuous variables is a zero crossing whose value stays fixed
-     between events; when-equations (also in loops) assign discrete variables or reinit
-     states; at an event, relations and when-conditions are evaluated again until nothing
-     changes (event iteration), pre() being the values before the event.
+  5. Events, as OpenModelica (and OMBackend's MTK path, relationRefresh.jl): a relation on
+     continuous variables keeps its value between events, its crossing function shifted by a
+     hysteresis; the event-generating functions (integer, floor, ceil, div, mod, rem) the
+     same; when-equations and when-statements (also in loops, vector conditions) assign
+     discrete variables or reinit states; at an event, sweeps with pre() fixed until nothing
+     changes, reinit() applied after each sweep; sample() ticks as preset times; asserts
+     reported where their condition fails.
+  6. Initialization: the initial equations and fixed starts over the free states and the
+     fixed = false parameters (NonlinearSolve, relations fixed per solve until they settle),
+     then the initial algorithms.
 
 Not (yet) handled, reported with the reason so the caller scalarizes as before: algebraic
-loops, systems needing index reduction, if-equations, elsewhen, sample/initial()/edge/change,
-event-generating functions (div, mod, floor, ...), initial equations, algorithms, asserts.
+loops, systems needing index reduction, calls of Modelica functions, record variables,
+elsewhen in when-equations, array slices.
 =#
 module ArrayODEGen
 
@@ -88,9 +94,20 @@ struct ArrayModelParameters
   initPhase::Vector{Bool}      #= [true] while initializing: initial() =#
   checking::Vector{Bool}       #= [true] while asserts in algorithms are checked =#
   upre::Vector{Float64}
+  ureinit::Vector{Float64}     #= the state reinit() sets in a sweep, applied at its end =#
+  wnew::Vector{Bool}           #= when-conditions of the current pass, before the bodies run =#
   dlog::Vector{Tuple{Float64, Vector{Float64}}}   #= discrete values from each event on =#
+  evv::Vector{Float64}         #= values of the event-generating functions (_evfn), by relation number =#
+  hyst::Vector{Float64}        #= [H]: the relations' hysteresis (_rel); 0 (literal relations) while initializing =#
+  tend::Vector{Float64}        #= [stop time]: a solution read there gives the final values (_dlogIndex) =#
   model::Module
 end
+
+#= The entry of the discrete log for time t: at an event instant the values before it (the left
+   limit, as the states' interpolation and OpenModelica's result files), at the stop time the
+   final ones; `right` takes the values after an event instant (the second of a saved pair). =#
+_dlogIndex(times, t, tend, right::Bool = false) =
+  (right || t >= tend) ? max(1, searchsortedlast(times, t)) : max(1, searchsortedfirst(times, t) - 1)
 
 const _OMBACKEND = parentmodule(parentmodule(@__MODULE__))
 
@@ -121,11 +138,13 @@ function _variableValues(sol, name::String)
   local i = get(m.STATE_INDEX, key, 0)
   i > 0 && return [u[i] for u in sol.u]
   local j = get(m.ALGEBRAIC_INDEX, key, 0)
-  j > 0 && return [m.algebraics(u, p, t)[j] for (u, t) in zip(sol.u, sol.t)]
+  j > 0 && return [m.algebraics(sol.u[i], p, sol.t[i], i > 1 && sol.t[i - 1] == sol.t[i])[j] for i in eachindex(sol.t)]
   local k = get(m.DISCRETE_INDEX, key, 0)
   if k > 0 && !isempty(p.dlog)
     local times = first.(p.dlog)
-    return [p.dlog[max(1, searchsortedlast(times, t))][2][k] for t in sol.t]
+    #= an event saves its instant twice: before (left limit), then after =#
+    local after(i) = i > 1 && sol.t[i - 1] == sol.t[i]
+    return [p.dlog[_dlogIndex(times, sol.t[i], p.tend[1], after(i))][2][k] for i in eachindex(sol.t)]
   end
   return nothing
 end
@@ -186,7 +205,7 @@ function SII.observed(sys::ArraySystem, x)
   end
   return (u, p, t) -> begin
     local times = first.(p.dlog)
-    isempty(times) ? NaN : p.dlog[max(1, searchsortedlast(times, t))][2][i]
+    isempty(times) ? NaN : p.dlog[_dlogIndex(times, t, p.tend[1])][2][i]
   end
 end
 SII.observed(sys::ArraySystem, x::ArrayVar) = invoke(SII.observed, Tuple{ArraySystem, Any}, sys, x)
@@ -194,20 +213,56 @@ SII.all_variable_symbols(sys::ArraySystem) = vcat(getfield(sys, :stateSyms), col
 SII.all_symbols(sys::ArraySystem) = vcat(SII.all_variable_symbols(sys), :t)
 SII.default_values(::ArraySystem) = Dict()
 
-#= A relation of the model: its crossing function goes to z (when given), its value is
-   updated in mode, and between events it keeps its value. =#
-@inline function _rel(z, rel::Vector{Bool}, mode::Bool, k::Int, x, y, op)
-  z === nothing || (z[k] = x - y)
-  mode && (rel[k] = op(x, y))
-  return rel[k]
+#= A relation of the model (MLS 8.5, OpenModelica's relationhysteresis, as the MTK path's
+   relationRefresh.jl): it keeps its value p.rel[k] between events and changes only in mode
+   (an event). zc <= 0 where it is true; its crossing function, into z when given, is shifted
+   by eps = H * (1 + max(|x|, |y|)) away from its value, so the root lands where the new value
+   is clear: a true relation stays true while zc <= eps, a false one becomes true at zc <= -eps.
+   With H = 0 (initialization) it is evaluated literally. =#
+_finiteAbs(x) = (local v = abs(x); v < 1.0e300 ? v : 0.0)
+@inline function _rel(z, p, mode::Bool, k::Int, x, y, op)
+  local H = p.hyst[1]
+  local zc = (op === (>) || op === (>=)) ? y - x : x - y
+  local old = p.rel[k]
+  local eps = H * (1 + max(_finiteAbs(x), _finiteAbs(y)))
+  z === nothing || (z[k] = old ? zc - eps : zc + eps)
+  mode && (p.rel[k] = H == 0 ? op(x, y) : old ? zc <= eps : zc <= -eps)
+  return p.rel[k]
 end
 
-#= false (the default): the array path takes continuous models only (no events, asserts,
-   initial equations or fixed starts on non-states); their event and initialization semantics
-   are those of OMBackend's ModelingToolkit path, which other models fall back to. true: also
-   events (relations, when, sample, initial()), asserts and initialization (experimental: the
-   event semantics differ from the MTK path's in places). =#
-const FULL = Ref(false)
+#= An event-generating function (integer, floor, ceil, div, mod, rem; MLS 3.7.2): its value
+   v = floor/ceil/trunc(q) changes only at events (in mode), and then (as a relation, _rel)
+   only where q has left the interval that keeps v by more than the hysteresis eps: the state
+   just before an event (an interpolation a hair past the boundary) keeps the old value. Two
+   crossing functions bound that interval: z[k] crosses where q passes its upper end, z[k + 1]
+   its lower end. At the initialization (H = 0) the value is literal. =#
+_evInterval(kind::Symbol, v) = kind === :floor ? (v, v + 1) : kind === :ceil ? (v - 1, v) :
+                               v > 0 ? (v, v + 1) : v < 0 ? (v - 1, v) : (-1.0, 1.0)
+@inline function _evfn(z, p, mode::Bool, k::Int, kind::Symbol, q)
+  local v = p.evv[k]
+  local eps = p.hyst[1] * (1 + _finiteAbs(q))
+  local (lo, hi) = _evInterval(kind, v)
+  if mode && (p.hyst[1] == 0 || q - hi - eps >= 0 || q - lo + eps < 0)
+    v = p.evv[k] = Float64(kind === :floor ? floor(q) : kind === :ceil ? ceil(q) : trunc(q))
+    (lo, hi) = _evInterval(kind, v)
+  end
+  if z !== nothing
+    z[k] = q - hi - eps
+    z[k + 1] = q - lo + eps
+  end
+  return v
+end
+
+#= The hysteresis H for a solve, as the MTK path (relationRefresh.jl _hysteresis): OpenModelica's
+   tolZC = 1e-4 * min(reltol, span / 500). =#
+_hysteresis(integrator) = 1.0e-4 * max(min(Float64(first(integrator.opts.reltol)),
+                                           abs(Float64(integrator.sol.prob.tspan[2] - integrator.sol.prob.tspan[1])) / 500), 1.0e-12)
+
+#= true (the default): the array path takes events (relations with OpenModelica's hysteresis,
+   when, sample, initial(), event iteration in sweeps), asserts and initialization too. false:
+   continuous models only (no events, asserts, initial equations or fixed starts on non-states);
+   the others go to OMBackend's ModelingToolkit path. =#
+const FULL = Ref(true)
 
 #= Sizes of the last generated model (classes, instances, batches = loops, ...), for diagnostics. =#
 const LAST_STATS = Ref{Any}(nothing)
@@ -266,6 +321,13 @@ struct Op <: IR
   op::Symbol
   args::Vector{IR}
 end
+#= An event-generating function floor/ceil/trunc of q (_evfn); id and id + 1 are its crossing
+   slots in the relation numbering of its template. =#
+struct EvFn <: IR
+  kind::Symbol
+  arg::IR
+  id::Int
+end
 
 irKey(x::Lit) = x.v isa AbstractArray ? string("arr", objectid(x.v)) : repr(x.v)
 irKey(x::Slot) = string("\$", x.k)
@@ -274,6 +336,7 @@ irKey(x::Ref) = string(x.der ? "der(" : "", x.name, "[", join(irKey.(x.subs), ",
 irKey(x::Pre) = string("pre(", irKey(x.ref), ")")
 irKey(x::Rel) = string("rel", x.id, x.op, "(", irKey(x.lhs), ",", irKey(x.rhs), ")")
 irKey(x::Op) = string(x.op, "(", join(irKey.(x.args), ","), ")")
+irKey(x::EvFn) = string("ev", x.id, x.kind, "(", irKey(x.arg), ")")
 
 #= The variable accesses of an expression, in a fixed order (not those inside subscripts,
    not pre values). =#
@@ -287,11 +350,14 @@ function accesses!(acc::Vector{Ref}, x::IR)
   elseif x isa Rel
     accesses!(acc, x.lhs)
     accesses!(acc, x.rhs)
+  elseif x isa EvFn
+    accesses!(acc, x.arg)
   end
   return acc
 end
 
 _nRel(x::IR) = x isa Rel ? max(x.id, _nRel(x.lhs), _nRel(x.rhs)) :
+               x isa EvFn ? max(x.id + 1, _nRel(x.arg)) :
                x isa Op ? maximum(_nRel, x.args; init = 0) : 0
 
 #= ---------------------------------------------------------------- variables, classes =#
@@ -344,13 +410,14 @@ struct SWhile <: Stmt
   body::Vector{Stmt}
 end
 #= A when-statement: each branch has its condition value in wcond (ids within the template). =#
-struct SWhen <: Stmt
+struct SWhen <: Stmt   #= branches (condition, body); ids: a condition slot per element of each branch =#
   branches::Vector{Tuple{IR, Vector{Stmt}}}
-  ids::Vector{Int}
+  ids::Vector{Vector{Int}}
 end
 struct SAssert <: Stmt
   cond::IR
   k::Int   #= in ASSERTS =#
+  msg::IR  #= the message, evaluated when the assert fails =#
 end
 struct SBreak <: Stmt end
 
@@ -372,6 +439,7 @@ struct AssertClass
   domain::Matrix{Int}
   condition::String
   message::String
+  msg::IR
 end
 
 mutable struct Gen
@@ -395,6 +463,8 @@ mutable struct Gen
   tmpSlot::Int              #= temporary slots (expanded reductions, products): -1, -2, ... =#
   usesInitial::Bool
   discUnknown::Dict{Int, Int}  #= discrete element (offset) computed by an equation -> unknown id =#
+  initAlgs::Vector{AlgClass}   #= initial algorithms (run once at the initialization) =#
+  freeParams::Vector{String}   #= parameters with fixed = false: unknowns of the initialization =#
 end
 
 struct Ctx
@@ -457,10 +527,18 @@ end
 function _paramValue!(g::Gen, name::String)
   haskey(g.params, name) && return g.params[name]
   local info = g.vars[name]
-  local val = _evalBinding(info.var.binding, info.var, "parameter")
+  local val = name in g.freeParams ? _freeParamStart(info.var) : _evalBinding(info.var.binding, info.var, "parameter")
   g.params[name] = val
   g.paramSyms[name] = Symbol("P_", replace(name, r"[^A-Za-z0-9_]" => "_"))
   return val
+end
+
+#= A parameter with fixed = false starts (the initialization's guess) from its start value. =#
+function _freeParamStart(v::F.Variable)
+  local dims = F.isArray(v.ty) ? [F.size(d) for d in F.arrayDims(v.ty)] : Int[]
+  local st = _startValues(v, isempty(dims) ? 1 : prod(dims))
+  isempty(dims) && return st[1]
+  return permutedims(reshape(st, reverse(dims)...), length(dims):-1:1)   #= row-major start values =#
 end
 
 #= Start values of a variable, row-major. =#
@@ -495,6 +573,11 @@ const MATH_BUILTINS = Dict("sin" => :sin, "cos" => :cos, "tan" => :tan, "asin" =
                            "log" => :log, "log10" => :log10, "sqrt" => :sqrt, "abs" => :abs,
                            "sinh" => :sinh, "cosh" => :cosh, "tanh" => :tanh,
                            "min" => :min, "max" => :max, "sign" => :sign)
+#= String(...) of Modelica, as the MTK path formats it (resolved when called: that module
+   may load after this one) =#
+_modelicaString(args...) = _OMBACKEND.CodeGeneration.AlgorithmicCodeGeneration.modelica_String(args...)
+
+const MATH_WRAPPED = ("sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "exp", "log", "log10")
 
 function _binaryOp(op)::Symbol
   O = F.Op
@@ -523,12 +606,29 @@ function _continuous(g::Gen, x::IR)::Bool
   x isa Ref && return g.vars[x.name].kind in (:state, :alg) || any(s -> _continuous(g, s), x.subs)
   x isa Op && return any(a -> _continuous(g, a), x.args)
   x isa Rel && return true
-  return false
+  return false   #= an EvFn is constant between events =#
+end
+
+#= A Boolean-valued expression (whatever type the call's argument was given: String(n > 3)). =#
+_booleanExp(@nospecialize(e)) = e isa F.CAST_EXPRESSION ? _booleanExp(e.exp) :
+  (e isa F.RELATION_EXPRESSION || e isa F.LBINARY_EXPRESSION || e isa F.LUNARY_EXPRESSION || e isa F.BOOLEAN_EXPRESSION)
+
+#= An assert's message as an expression (String(x, ...) formatted as OpenModelica does);
+   its text where the array path cannot evaluate it. =#
+function _messageIR(g::Gen, @nospecialize(m::F.Expression), ctx::Ctx)::IR
+  try
+    return toIR(g, m, _with(ctx; noEvent = true))
+  catch err
+    err isa NotSupported || rethrow(err)
+    return Lit(_str(m))
+  end
 end
 
 function toIR(g::Gen, @nospecialize(e::F.Expression), ctx::Ctx)::IR
   if e isa F.REAL_EXPRESSION || e isa F.INTEGER_EXPRESSION || e isa F.BOOLEAN_EXPRESSION || e isa F.ENUM_LITERAL_EXPRESSION
     return Lit(_literalValue(e))
+  elseif e isa F.STRING_EXPRESSION
+    return Lit(String(e.value))
   elseif e isa F.CAST_EXPRESSION
     return toIR(g, e.exp, ctx)
   elseif e isa F.CREF_EXPRESSION
@@ -540,6 +640,8 @@ function toIR(g::Gen, @nospecialize(e::F.Expression), ctx::Ctx)::IR
     local O = F.Op
     e.operator.op in (O.SCALAR_PRODUCT, O.MUL_MATRIX_VECTOR, O.MUL_VECTOR_MATRIX, O.MATRIX_PRODUCT) &&
       return _productIR(g, e, ctx)
+    #= a + b of Strings: concatenation =#
+    F.isString(F.typeOf(e)) && return Op(:string, IR[toIR(g, e.exp1, ctx), toIR(g, e.exp2, ctx)])
     return Op(_binaryOp(e.operator.op), IR[toIR(g, e.exp1, ctx), toIR(g, e.exp2, ctx)])
   elseif e isa F.LUNARY_EXPRESSION
     e.operator.op == F.Op.NOT || ns("logical operator")
@@ -619,8 +721,36 @@ function _callIR(g::Gen, e::F.CALL_EXPRESSION, ctx::Ctx)::IR
     return Op(:if, IR[Op(:>=, IR[x, Lit(0.0)]), Op(:*, IR[x, toIR(g, args[2], ctx)]), Op(:*, IR[x, toIR(g, args[3], ctx)])])
   elseif fname in ("sum", "product") || (fname in ("min", "max") && length(args) == 1)
     return _reductionIR(g, fname, args[1], ctx)
+  elseif fname == "String"
+    #= String(r, significantDigits, minimumLength, leftJustified), String(r, format),
+       String(i|b|e, minimumLength, leftJustified): OpenModelica's formatting (modelica_String) =#
+    local xs = IR[toIR(g, a, ctx) for a in args]
+    local ty = F.typeOf(args[1])
+    length(xs) == 2 && return Op(:String, xs)
+    length(xs) == 4 && return Op(:String, IR[xs[1], Op(:Int, IR[xs[2]]), Op(:Int, IR[xs[3]]), Op(:Bool, IR[xs[4]])])
+    length(xs) == 3 || ns("String with $(length(xs)) arguments")
+    local v = F.isEnumeration(ty) ? Op(:index, IR[Lit(Tuple(String[String(l) for l in ty.literals])), Op(:Int, IR[xs[1]])]) :
+              (F.isBoolean(ty) || _booleanExp(args[1])) ? Op(:Bool, IR[xs[1]]) :
+              F.isInteger(ty) ? Op(:Int, IR[xs[1]]) : ns("String of " * _str(args[1]))
+    return Op(:String, IR[v, Op(:Int, IR[xs[2]]), Op(:Bool, IR[xs[3]])])
+  elseif fname in ("integer", "floor", "ceil", "div", "mod", "rem")
+    #= event-generating (MLS 3.7.2) unless under noEvent or of discrete arguments:
+       mod(x, y) = x - floor(x / y) * y, rem(x, y) = x - div(x, y) * y =#
+    local xs = IR[toIR(g, a, ctx) for a in args]
+    local q = length(xs) == 2 ? Op(:/, IR[xs[1], xs[2]]) : xs[1]
+    local kind = fname in ("integer", "floor", "mod") ? :floor : fname == "ceil" ? :ceil : :trunc
+    local v = if ctx.noEvent || !_continuous(g, q)
+      Op(kind, IR[q])
+    else
+      ctx.nrel[] += 2
+      EvFn(kind, q, ctx.nrel[] - 1)
+    end
+    fname in ("mod", "rem") || return v
+    return Op(:-, IR[xs[1], Op(:*, IR[v, xs[2]])])
   end
-  local jf = get(MATH_BUILTINS, fname, nothing)
+  #= Modelica.Math's elementary functions are the built-in ones (external "builtin") =#
+  local jf = startswith(fname, "Modelica.Math.") && fname[15:end] in MATH_WRAPPED ?
+    MATH_BUILTINS[fname[15:end]] : get(MATH_BUILTINS, fname, nothing)
   jf === nothing && ns("function $(fname)")
   return Op(jf, IR[toIR(g, a, ctx) for a in args])
 end
@@ -715,6 +845,8 @@ function _substSlots(x::IR, vals::Dict{Int, Int})::IR
     return Pre(_substSlots(x.ref, vals))
   elseif x isa Rel
     return Rel(x.op, _substSlots(x.lhs, vals), _substSlots(x.rhs, vals), x.id)
+  elseif x isa EvFn
+    return EvFn(x.kind, _substSlots(x.arg, vals), x.id)
   elseif x isa Op
     local args = IR[_substSlots(a, vals) for a in x.args]
     #= {a, b, c}[2] is b =#
@@ -885,7 +1017,7 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
   if F.isvariant(eq, F.EQUATION_ASSERT)
     local ctx = Ctx(iters, Int[], Base.RefValue(0), true)
     push!(g.asserts, AssertClass(toIR(g, eq.condition, ctx), occursin("warning", _str(eq.level)),
-                                 nIter, idom, _str(eq.condition), _str(eq.message)))
+                                 nIter, idom, _str(eq.condition), _str(eq.message), _messageIR(g, eq.message, ctx)))
     return
   end
   (F.isvariant(eq, F.EQUATION_EQUALITY) || F.isvariant(eq, F.EQUATION_ARRAY_EQUALITY)) ||
@@ -905,7 +1037,7 @@ function _addWhen!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{Stri
   local br = eq.branches[1]
   F.isvariant(br, F.EQUATION_BRANCH) || ns("when branch")
   local ctx = Ctx(Dict(n => k for (k, n) in enumerate(iterNames)), Int[])
-  local cond = toIR(g, br.condition, ctx)
+  local cond = _whenCondition(g, br.condition, ctx)
   local body = Tuple{Symbol, Ref, IR}[]
   for b in br.body
     if F.isvariant(b, F.EQUATION_REINIT)
@@ -922,6 +1054,21 @@ function _addWhen!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{Stri
   end
   push!(g.whens, WhenClass(cond, body, length(iterNames), idom, ctx.nrel[], ctx.nsam[], _str(eq)))
 end
+
+#= initial() activates a when at the initialization only as its condition (MLS 8.6, as
+   OpenModelica): inside an expression (initial() or x > 0.6) it is false. =#
+_topLevelInitial(x::IR) = (x isa Op && x.op == :initial) ? x : _noInitial(x)
+
+#= A when-condition: a Boolean expression, or a vector of them (when {c1, c2}: Op(:vect),
+   each element with its own condition slot and edge; initial() counts as an element). =#
+function _whenCondition(g::Gen, @nospecialize(c::F.Expression), ctx::Ctx)::IR
+  c isa F.ARRAY_EXPRESSION || return _topLevelInitial(toIR(g, c, ctx))
+  return Op(:vect, IR[_topLevelInitial(toIR(g, el, ctx)) for el in c.elements])
+end
+
+#= The condition elements of a when (one for a scalar condition). =#
+_condElements(c::IR)::Vector{IR} = (c isa Op && c.op == :vect) ? c.args : IR[c]
+_noInitial(x::IR) = !(x isa Op) ? x : x.op == :initial ? Lit(false) : Op(x.op, IR[_noInitial(a) for a in x.args])
 
 #= An algorithm section: statements to IR. A vectorized algorithm (one for-loop over a $
    iterator, from a component array) keeps the loop as the class domain. =#
@@ -943,6 +1090,41 @@ function _addAlgorithm!(g::Gen, alg)
   push!(g.algs, AlgClass(body, length(iterNames), idom, ctx.nrel[], nwhen[], _str(alg.statements[1])))
 end
 
+#= An initial algorithm: run once at the initialization, after the free states are solved and
+   before the first event iteration, without events (its relations and event-generating
+   functions literal). It may assign discrete variables (and assert); initial equations may not
+   read what it assigns. =#
+function _addInitialAlgorithm!(g::Gen, alg)
+  local stmts = collect(alg.statements)
+  local iterNames = String[]
+  local idom = NO_SLOTS
+  while length(stmts) == 1 && F.isvariant(stmts[1], F.ALG_FOR) && startswith(F.name(stmts[1].iterator), "\$")
+    local values = _loopValues(F.Util.getOption(stmts[1].range))
+    isempty(values) && return
+    push!(iterNames, F.name(stmts[1].iterator))
+    idom = _crossDomain(idom, values)
+    stmts = collect(stmts[1].body)
+  end
+  local ctx = Ctx(Dict(n => k for (k, n) in enumerate(iterNames)), Int[], Base.RefValue(0), true)
+  local nwhen = Base.RefValue(0)
+  local body = Stmt[_stmtIR(g, st, ctx, nwhen) for st in stmts]
+  (nwhen[] == 0 && ctx.nsam[] == 0) || ns("when or sample in an initial algorithm")
+  _initAlgTargets(g, body)
+  push!(g.initAlgs, AlgClass(body, length(iterNames), idom, 0, 0, _str(alg.statements[1])))
+end
+
+function _initAlgTargets(g::Gen, stmts::Vector{Stmt})
+  for st in stmts
+    if st isa SAssign
+      g.vars[st.target.name].kind == :discrete || ns("initial algorithm assigns $(st.target.name), not a discrete variable")
+    elseif st isa SIf
+      foreach(b -> _initAlgTargets(g, b[2]), st.branches)
+    elseif st isa SFor || st isa SWhile
+      _initAlgTargets(g, st.body)
+    end
+  end
+end
+
 function _stmtIR(g::Gen, @nospecialize(st), ctx::Ctx, nwhen::Base.RefValue{Int})::Stmt
   if F.isvariant(st, F.ALG_ASSIGNMENT)
     (st.lhs isa F.CREF_EXPRESSION && !F.isArray(st.ty)) || ns("assignment " * _str(st))
@@ -960,15 +1142,16 @@ function _stmtIR(g::Gen, @nospecialize(st), ctx::Ctx, nwhen::Base.RefValue{Int})
     return SWhile(toIR(g, st.condition, _with(ctx; noEvent = true)), Stmt[_stmtIR(g, b, ctx, nwhen) for b in st.body])
   elseif F.isvariant(st, F.ALG_WHEN)
     local branches = Tuple{IR, Vector{Stmt}}[]
-    local ids = Int[]
+    local ids = Vector{Int}[]
     for (c, body) in st.branches
-      push!(ids, (nwhen[] += 1))
-      push!(branches, (toIR(g, c, ctx), Stmt[_stmtIR(g, b, ctx, nwhen) for b in body]))
+      local cond = _whenCondition(g, c, ctx)
+      push!(ids, [(nwhen[] += 1) for _ in _condElements(cond)])
+      push!(branches, (cond, Stmt[_stmtIR(g, b, ctx, nwhen) for b in body]))
     end
     return SWhen(branches, ids)
   elseif F.isvariant(st, F.ALG_ASSERT)
     push!(g.assertTexts, (_str(st.condition), _str(st.message), occursin("warning", _str(st.level))))
-    return SAssert(toIR(g, st.condition, _with(ctx; noEvent = true)), length(g.assertTexts))
+    return SAssert(toIR(g, st.condition, _with(ctx; noEvent = true)), length(g.assertTexts), _messageIR(g, st.message, ctx))
   elseif F.isvariant(st, F.ALG_BREAK)
     return SBreak()
   end
@@ -1018,6 +1201,8 @@ function _abstracted(x::IR, vals::Vector{Int})::IR
   elseif x isa Rel
     local l = _abstracted(x.lhs, vals)
     return Rel(x.op, l, _abstracted(x.rhs, vals), x.id)
+  elseif x isa EvFn
+    return EvFn(x.kind, _abstracted(x.arg, vals), x.id)
   elseif x isa Op
     return Op(x.op, IR[_abstracted(a, vals) for a in x.args])
   end
@@ -1140,6 +1325,8 @@ function _algAccesses!(g::Gen, stmts::Vector{Stmt}, env::Dict{Int, Int}, d::Matr
       foreach(readIR!, x.args)
     elseif x isa Rel
       readIR!(x.lhs); readIR!(x.rhs)
+    elseif x isa EvFn
+      readIR!(x.arg)
     end
   end
   for st in stmts
@@ -1411,7 +1598,10 @@ end
    states no initial equation reaches keep their start values (as omc). Returns the matched
    states, the residual code and the number of residuals. =#
 function _initialization(g::Gen, deps, producer, fixedMask::Vector{Bool})
-  isempty(g.initClasses) && return (Int[], Any[], 0)
+  isempty(g.initClasses) && return (Int[], Any[], 0, Tuple{String, Int}[])
+  #= a free parameter element (name, column-major index) is unknown g.nStates + k =#
+  local freeCols = Tuple{String, Int}[]
+  local freeCol = Dict{Tuple{String, Int}, Int}()
   deps === nothing && ns("initialization of a model with a large dependency pattern")
   #= candidate free states per initial equation instance =#
   local rows = Vector{Vector{Int}}()
@@ -1423,7 +1613,15 @@ function _initialization(g::Gen, deps, producer, fixedMask::Vector{Bool})
       local cand = Set{Int}()
       for r in acc
         local info = g.vars[r.name]
-        info.kind == :param && continue
+        if info.kind == :param
+          r.name in g.freeParams || continue
+          local pidx = Int[_evalInt(g, s, c.domain, j) for s in r.subs]
+          local lin = isempty(info.dims) ? 1 : LinearIndices(Tuple(info.dims))[pidx...]
+          local key = (r.name, lin)
+          haskey(freeCol, key) || (push!(freeCols, key); freeCol[key] = length(freeCols))
+          push!(cand, g.nStates + freeCol[key])
+          continue
+        end
         local idx = Int[_evalInt(g, s, c.domain, j) for s in r.subs]
         local off = info.offset + _elementOffset(info, idx, r.name) + 1
         if info.kind == :state && !r.der
@@ -1437,7 +1635,7 @@ function _initialization(g::Gen, deps, producer, fixedMask::Vector{Bool})
           r.der && push!(cand, off)
         end
       end
-      push!(rows, sort!([k for k in cand if !fixedMask[k]]))
+      push!(rows, sort!([k for k in cand if k > g.nStates || !fixedMask[k]]))
     end
     g.relBase = 0; g.relCount = 0
     local assign = :(res[$base + _col] = $(jl(g, c.lhs)) - $(jl(g, c.rhs)))
@@ -1463,7 +1661,7 @@ function _initialization(g::Gen, deps, producer, fixedMask::Vector{Bool})
     end
     augment(r0) || ns("initialization over-determined (an initial equation without a free state)")
   end
-  return (matchRow, body, length(rows))
+  return (matchRow, body, length(rows), freeCols)
 end
 
 #= ---------------------------------------------------------------- solving =#
@@ -1561,7 +1759,10 @@ function jl(g::Gen, x::IR)
     return jl(g, x.ref)   #= pre of a parameter =#
   elseif x isa Rel
     local k = :($(g.relBase) + (_col - 1) * $(g.relCount) + $(x.id))
-    return :($(_rel)(z, p.rel, mode, $k, $(jl(g, x.lhs)), $(jl(g, x.rhs)), $(x.op)))
+    return :($(_rel)(z, p, mode, $k, $(jl(g, x.lhs)), $(jl(g, x.rhs)), $(x.op)))
+  elseif x isa EvFn
+    local k = :($(g.relBase) + (_col - 1) * $(g.relCount) + $(x.id))
+    return :($(_evfn)(z, p, mode, $k, $(QuoteNode(x.kind)), $(jl(g, x.arg))))
   elseif x isa Op
     local args = Any[jl(g, a) for a in x.args]
     x.op == :neg && return :(-$(args[1]))
@@ -1572,6 +1773,9 @@ function jl(g::Gen, x::IR)
     x.op == :|| && return Expr(:||, args...)
     x.op == :sample && return :(p.sampleActive[$(g.sampleBase) + (_col - 1) * $(g.sampleCount) + $(x.args[3].v)])
     x.op == :initial && return :(p.initPhase[1])
+    x.op == :String && return Expr(:call, _modelicaString, args...)
+    x.op == :Int && return :(round(Int, $(args[1])))
+    x.op == :Bool && return :(($(args[1])) != 0)
     return Expr(:call, x.op, args...)
   end
   error("IR")
@@ -1579,7 +1783,7 @@ end
 
 #= Statement code of an algorithm; when-statements use wcond from `condBase` (nwhen per
    instance) and run their bodies only when fire (event iteration). =#
-function _stmtCode(g::Gen, stmts::Vector{Stmt}, condBase::Int, nwhen::Int)::Vector{Any}
+function _stmtCode(g::Gen, stmts::Vector{Stmt}, condBase::Int, nwhen::Int; inWhen::Bool = false)::Vector{Any}
   local out = Any[]
   for st in stmts
     if st isa SAssign
@@ -1590,7 +1794,7 @@ function _stmtCode(g::Gen, stmts::Vector{Stmt}, condBase::Int, nwhen::Int)::Vect
     elseif st isa SIf
       local ex = nothing
       for (c, body) in reverse(st.branches)
-        local blk = Expr(:block, _stmtCode(g, body, condBase, nwhen)...)
+        local blk = Expr(:block, _stmtCode(g, body, condBase, nwhen; inWhen)...)
         if ex === nothing && c isa Lit && c.v == true
           ex = blk
         else
@@ -1602,26 +1806,30 @@ function _stmtCode(g::Gen, stmts::Vector{Stmt}, condBase::Int, nwhen::Int)::Vect
       local sym = jl(g, Slot(st.slot))
       local r = st.range
       local rng = length(r) > 1 && all(diff(r) .== 1) ? :($(r[1]):$(r[end])) : r
-      push!(out, :(for $sym in $rng; $(_stmtCode(g, st.body, condBase, nwhen)...); end))
+      push!(out, :(for $sym in $rng; $(_stmtCode(g, st.body, condBase, nwhen; inWhen)...); end))
     elseif st isa SWhile
-      push!(out, :(while $(jl(g, st.cond)); $(_stmtCode(g, st.body, condBase, nwhen)...); end))
+      push!(out, :(while $(jl(g, st.cond)); $(_stmtCode(g, st.body, condBase, nwhen; inWhen)...); end))
     elseif st isa SWhen
-      local cs = [gensym("wc") for _ in st.branches]
-      local ks = [:($condBase + (_col - 1) * $nwhen + $id) for id in st.ids]
-      for ((c, _), v) in zip(st.branches, cs)
-        push!(out, :(local $v = $(jl(g, c))))
+      #= per branch, a value and a slot per condition element; a branch fires when one of its
+         elements became true (against the value at the start of the sweep) =#
+      local cs = [[gensym("wc") for _ in _condElements(c)] for (c, _) in st.branches]
+      local ks = [[:($condBase + (_col - 1) * $nwhen + $id) for id in ids] for ids in st.ids]
+      for (i, (c, _)) in enumerate(st.branches), (e, v) in zip(_condElements(c), cs[i])
+        push!(out, :(local $v = $(jl(g, e))))
       end
       local ex = nothing
       for i in length(st.branches):-1:1
-        local blk = Expr(:block, _stmtCode(g, st.branches[i][2], condBase, nwhen)..., :(_fired = true))
-        local cond = :($(cs[i]) && !p.wcond[$(ks[i])])
+        local blk = Expr(:block, _stmtCode(g, st.branches[i][2], condBase, nwhen; inWhen = true)..., :(_fired = true))
+        local cond = foldl((x, y) -> :($x || $y), [:($v && !p.wcond[$k]) for (v, k) in zip(cs[i], ks[i])])
         ex = ex === nothing ? Expr(:if, cond, blk) : Expr(:elseif, cond, blk, ex)
       end
       ex = Expr(:if, ex.args...)
       push!(out, :(fire && $ex))
-      push!(out, :(mode && $(Expr(:block, [:(p.wcond[$k] = $v) for (k, v) in zip(ks, cs)]...))))
+      push!(out, :(mode && $(Expr(:block, [:(p.wnew[$k] = $v) for (kk, vv) in zip(ks, cs) for (k, v) in zip(kk, vv)]...))))
     elseif st isa SAssert
-      push!(out, :(p.checking[1] && !($(jl(g, st.cond))) && _assertFailed(p, $(st.k), ($(st.k), _col), t)))
+      #= checked with the other asserts after each step; in a when body, when the body runs =#
+      local failed = :(!($(jl(g, st.cond))) && _assertFailed(p, $(st.k), ($(st.k), _col), t, $(jl(g, st.msg))))
+      push!(out, inWhen ? failed : :(p.checking[1] && $failed))
     elseif st isa SBreak
       push!(out, :(break))
     end
@@ -1759,7 +1967,7 @@ function _vtype(v::F.Variable)::Symbol
 end
 
 function _generate(fm::F.FlatModel, modelName::String)::Expr
-  isempty(fm.initialAlgorithms) || ns("initial algorithms")
+  (FULL[] || isempty(fm.initialAlgorithms)) || ns("initial algorithms (OMBackend.ARRAY_PATH_FULL)")
   #= States: the variables under der(). =#
   local stateNames = Set{String}()
   local collectDer = function (e, acc)
@@ -1775,7 +1983,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
   end
   local g = Gen(Dict{String, VarInfo}(), 0, 0, 0, Dict{String, Any}(), Dict{String, Symbol}(), Set{String}(),
                 EqClass[], EqClass[], AlgClass[], Tuple{String, String, Bool}[], WhenClass[], AssertClass[], 0, 0, 0, 0,
-                -1000, false, Dict{Int, Int}())
+                -1000, false, Dict{Int, Int}(), AlgClass[], String[])
   local stateNamesOrdered = String[]; local algNamesOrdered = String[]
   local u0 = Float64[]; local d0 = Float64[]; local discreteNamesOrdered = String[]; local a0 = Float64[]
   local fixedMask = Bool[]
@@ -1796,7 +2004,13 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       append!(fixedMask, _fixedValues(v, n))
       append!(stateNamesOrdered, _elementNames(v))
     elseif var <= F.Variability.NON_STRUCTURAL_PARAMETER
-      any(!, _fixedValues(v, n; default = true)) && ns("parameter $(nm) with fixed = false (determined by initialization)")
+      local fx = _fixedValues(v, n; default = true)
+      if any(!, fx)
+        FULL[] || ns("parameter $(nm) with fixed = false (OMBackend.ARRAY_PATH_FULL)")
+        all(!, fx) || ns("parameter $(nm) with fixed = false on some elements")
+        F.isBound(v.binding) && ns("parameter $(nm) with fixed = false and a binding")
+        push!(g.freeParams, nm)
+      end
       g.vars[nm] = VarInfo(:param, dims, perPart, 0, _vtypeOrOther(v), v)
     elseif var == F.Variability.CONTINUOUS
       g.vars[nm] = VarInfo(:alg, dims, perPart, g.nAlg, :real, v)
@@ -1856,6 +2070,9 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
   for alg in fm.algorithms
     _addAlgorithm!(g, alg)
   end
+  for alg in fm.initialAlgorithms
+    _addInitialAlgorithm!(g, alg)
+  end
   g.classes = _reroll(g.classes)
   #= Every discrete variable is assigned in a when-equation. =#
   #= Discrete variables not assigned in a when-equation are computed by equations: unknowns
@@ -1881,7 +2098,26 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
   local (batches, pos, producer) = _schedule(el, matchRow, nU)
   local deps = _stateDeps(el, matchRow, batches, producer)
   local pattern = _jacobianPattern(el, matchRow, deps, g.nStates)
-  local (initUnknowns, initBody, nInit) = _initialization(g, deps, producer, fixedMask)
+  local (initUnknowns, initBody, nInit, freeCols) = _initialization(g, deps, producer, fixedMask)
+  #= initial algorithms: code, and what they assign (initial equations may not read it) =#
+  local initAlgOuts = Set{String}()
+  local collectOuts! = function (stmts)
+    for st in stmts
+      st isa SAssign && push!(initAlgOuts, st.target.name)
+      st isa SIf && foreach(b -> collectOuts!(b[2]), st.branches)
+      (st isa SFor || st isa SWhile) && collectOuts!(st.body)
+    end
+  end
+  foreach(ia -> collectOuts!(ia.body), g.initAlgs)
+  for c in g.initClasses, r in accesses!(accesses!(Ref[], c.lhs), c.rhs)
+    r.name in initAlgOuts && ns("initial equation reads $(r.name), which an initial algorithm assigns")
+  end
+  g.relBase = 0; g.relCount = 0
+  local initAlgBody = Any[]
+  for ia in g.initAlgs
+    local blk = Expr(:block, _stmtCode(g, ia.body, 0, 0)...)
+    push!(initAlgBody, ia.nslots == 0 ? Expr(:let, :(_col = 1), blk) : _loopCode(ia.nslots, ia.domain, collect(1:size(ia.domain, 2)), blk))
+  end
   #= Relation numbering: per class (then per when) a block of nrel x instances. =#
   local relBases = Int[]; local nRelTotal = 0
   for c in g.classes
@@ -1893,7 +2129,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     push!(whenRelBases, nRelTotal)
     nRelTotal += w.nrel * size(w.domain, 2)
     push!(whenCondBases, nWhenInst)
-    nWhenInst += size(w.domain, 2)
+    nWhenInst += length(_condElements(w.cond)) * size(w.domain, 2)
   end
   local algRelBases = Int[]; local algCondBases = Int[]
   for a in g.algs
@@ -1912,8 +2148,33 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       u <= g.nStates + g.nAlg ? push!(algOuts[ai][el.col[r]], u - g.nStates) : push!(algDOuts[ai][el.col[r]], discOf[u])
     end
   end
-  #= Code: one loop per batch. =#
-  local body = Any[]
+  #= The instances the state derivatives need (backwards from the rows that solve for a
+     derivative, through the algebraic unknowns they read; discrete values are read from the
+     discrete buffer, set at events): the right-hand side computes only these (the MTK path
+     likewise leaves outputs to the observed functions: acos(u) of an output was evaluated
+     a hair outside its domain by the solver's finite-difference time gradient). =#
+  local needed = falses(length(el.class))
+  local stack = Int[r for r in eachindex(el.class) if 0 < matchRow[r] <= g.nStates]
+  foreach(r -> (needed[r] = true), stack)
+  while !isempty(stack)
+    local r = pop!(stack)
+    for i in el.uptr[r]:(el.uptr[r + 1] - 1)
+      local u = el.uid[i]
+      (u > g.nStates + g.nAlg || u == matchRow[r] || u in el.outs[r]) && continue
+      local q = producer[u]
+      (q > 0 && !needed[q]) || continue
+      needed[q] = true
+      push!(stack, q)
+    end
+  end
+  #= Code: one loop per batch (rhsBody: the needed columns only). =#
+  local body = Any[]; local rhsBody = Any[]
+  local emit! = function (nslots, domain, batch, code)
+    push!(body, nslots == 0 ? Expr(:let, :(_col = 1), code) : _loopCode(nslots, domain, [el.col[r] for r in batch], code))
+    local need = [r for r in batch if needed[r]]
+    isempty(need) && return
+    push!(rhsBody, nslots == 0 ? Expr(:let, :(_col = 1), copy(code)) : _loopCode(nslots, domain, [el.col[r] for r in need], copy(code)))
+  end
   local solved = Dict{Tuple{Int, Int}, Tuple{Ref, IR}}()
   for ((ci, p), batch) in batches
     if ci < 0
@@ -1926,8 +2187,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
         :(for _o in $(algOuts[ai])[_col]; a[_o] = $(a0)[_o]; end),
         :(for _o in $(algDOuts[ai])[_col]; p.d[_o] = p.dpre[_o]; end)]
       append!(stmts, _stmtCode(g, alg.body, algCondBases[ai], alg.nwhen))
-      local blk = Expr(:block, stmts...)
-      push!(body, alg.nslots == 0 ? Expr(:let, :(_col = 1), blk) : _loopCode(alg.nslots, alg.domain, [el.col[r] for r in batch], blk))
+      emit!(alg.nslots, alg.domain, batch, Expr(:block, stmts...))
       continue
     end
     local c = g.classes[ci]
@@ -1937,10 +2197,10 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     local assign = tinfo.kind == :discrete ?
       :(p.d[$(_linear(tinfo, Any[jl(g, s) for s in target.subs]))] = Float64($(jl(g, value)))) :
       :($(jl(g, target)) = $(jl(g, value)))
-    push!(body, c.nslots == 0 ? Expr(:let, :(_col = 1), assign) : _loopCode(c.nslots, c.domain, [el.col[r] for r in batch], assign))
+    emit!(c.nslots, c.domain, batch, assign)
   end
   #= When-equations: each instance fires when its condition becomes true. =#
-  local whenBody = Any[]
+  local whenBody = Any[]; local whenConds = Any[]
   local sampleStart = Float64[]; local sampleInterval = Float64[]
   for (wi, w) in enumerate(g.whens)
     g.relBase = whenRelBases[wi]; g.relCount = w.nrel
@@ -1951,6 +2211,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
         x isa Op && x.op == :sample && (samples[x.args[3].v] = x)
         x isa Op && foreach(collect!, x.args)
         x isa Rel && (collect!(x.lhs); collect!(x.rhs))
+        x isa EvFn && collect!(x.arg)
       end
       collect!(w.cond)
       for j in 1:size(w.domain, 2), id in 1:w.nsample
@@ -1964,20 +2225,22 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       local info = g.vars[target.name]
       local idx = Any[jl(g, s) for s in target.subs]
       if kind == :reinit
-        push!(stmts, :(u[$(_linear(info, idx))] = $(jl(g, value))))
+        push!(stmts, :(p.ureinit[$(_linear(info, idx))] = $(jl(g, value))))
       else
         push!(stmts, :(p.d[$(_linear(info, idx))] = Float64($(jl(g, value)))))
       end
     end
-    local k = :($(whenCondBases[wi]) + _col)
+    local elems = _condElements(w.cond)
+    local ks = [:($(whenCondBases[wi]) + (_col - 1) * $(length(elems)) + $j) for j in eachindex(elems)]
+    local cond = Expr(:block, [:(p.wnew[$k] = $(jl(g, e))) for (k, e) in zip(ks, elems)]...)
+    local rise = foldl((x, y) -> :($x || $y), [:(p.wnew[$k] && !p.wcond[$k]) for k in ks])
     local inst = quote
-      local _c = $(jl(g, w.cond))
-      if fire && _c && !p.wcond[$k]
+      if fire && ($rise)
         $(stmts...)
         _fired = true
       end
-      mode && (p.wcond[$k] = _c)
     end
+    push!(whenConds, w.nslots == 0 ? Expr(:let, :(_col = 1), cond) : _loopCode(w.nslots, w.domain, collect(1:size(w.domain, 2)), cond))
     push!(whenBody, w.nslots == 0 ? Expr(:let, :(_col = 1), inst) : _loopCode(w.nslots, w.domain, collect(1:size(w.domain, 2)), inst))
   end
   #= Asserts: each instance checked at the start and after every step. =#
@@ -1988,7 +2251,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     push!(assertTexts, (a.condition, a.message, a.warning))
     local base = nAssertInst
     local k = length(assertTexts)
-    local inst = :(($(jl(g, a.cond))) || _assertFailed(p, $k, $base + _col, t))
+    local inst = :(($(jl(g, a.cond))) || _assertFailed(p, $k, $base + _col, t, $(jl(g, a.msg))))
     push!(assertBody, a.nslots == 0 ? Expr(:let, :(_col = 1), inst) : _loopCode(a.nslots, a.domain, collect(1:size(a.domain, 2)), inst))
     nAssertInst += size(a.domain, 2)
   end
@@ -2011,6 +2274,16 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     layoutOf[nm] = (poff, len)
     poff += len
   end
+  for nm in g.freeParams
+    nm in g.structural && ns("parameter $(nm) with fixed = false used structurally")
+    haskey(layoutOf, nm) || continue
+  end
+  for (sym, deps, _) in rules
+    any(d -> d in Symbol[g.paramSyms[f] for f in g.freeParams if haskey(g.paramSyms, f)], deps) &&
+      ns("a parameter binding depends on a parameter with fixed = false")
+  end
+  local initStates = Int[k for k in initUnknowns if k <= g.nStates]
+  local initParams = Int[layoutOf[freeCols[k - g.nStates][1]][1] + freeCols[k - g.nStates][2] for k in initUnknowns if k > g.nStates]
   local paramLocals = Any[]
   for nm in usedParams
     local info = g.vars[nm]
@@ -2070,7 +2343,8 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     const PARAMETER_RULES = Any[$(ruleExprs...)]
     const U0 = $(u0)
     #= initialization: the states the initial equations determine (one per residual) =#
-    const INIT_UNKNOWNS = $(initUnknowns)
+    const INIT_UNKNOWNS = $(initStates)
+    const INIT_PARAMS = $(initParams)   #= fixed = false parameters: positions in p.values =#
     const N_INIT = $(nInit)
     const D0 = $(d0)
     const N_RELATIONS = $(nRelTotal)
@@ -2137,12 +2411,16 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       return _fired
     end
 
-    #= The when-equations: conditions (crossing functions into z), bodies of those whose
-       condition became true when fire; returns whether one fired. =#
+    #= The when-equations: all conditions first (into p.wnew, crossing functions into z), then,
+       when fire, the bodies of those whose condition is true and was false at the start of the
+       sweep (p.wcond, pre() of the condition), in order (OpenModelica's order: a when on a
+       variable another body sets fires in the next pass, after the equations); reinit() goes
+       to p.ureinit (eventIteration! applies it after the sweep). Returns whether one fired. =#
     function whens!(du, a, u, p, t, z, mode::Bool, fire::Bool)
       $(paramLocals...)
       local _fired = false
       @inbounds begin
+        $(whenConds...)
         $(whenBody...)
       end
       return _fired
@@ -2151,11 +2429,47 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     const ASSERTS = $(assertTexts)
     const WARNED = Set{Any}()
 
-    function _assertFailed(p, k::Int, instance, t)
-      local (condition, message, warning) = ASSERTS[k]
+    #= PROBE: _violated! looks for a violation without reporting it =#
+    const PROBE = Ref(false)
+    const VIOLATED = Ref(false)
+
+    function _assertFailed(p, k::Int, instance, t, message)
+      local (condition, _, warning) = ASSERTS[k]
+      if PROBE[]
+        (warning && instance in WARNED) || (VIOLATED[] = true)
+        return true
+      end
       warning || throw($(ModelicaAssertionError)(Float64(t), message, condition))
       instance in WARNED || (push!(WARNED, instance); @warn string("Assertion violated at time ", t, ": ", message) condition)
       return true
+    end
+
+    #= Whether an assert is violated at (u, t) (a warning reported already does not count). =#
+    function _violated!(u, p, t)
+      PROBE[] = true; VIOLATED[] = false
+      try
+        checkAsserts(u, p, t)
+      finally
+        PROBE[] = false
+      end
+      return VIOLATED[]
+    end
+
+    #= After a step: an assert violated at its end is reported at the first violating time in
+       the step (bisection on the step's interpolation), as the MTK path reports the crossing. =#
+    function _assertStep(u, t, integrator)
+      local p = integrator.p
+      _violated!(u, p, t) || return false
+      local lo = integrator.tprev; local hi = t
+      if hi > lo
+        for _ in 1:100
+          local mid = (lo + hi) / 2
+          _violated!(integrator(mid), p, mid) ? (hi = mid) : (lo = mid)
+          hi - lo <= 1.0e-12 * max(1.0, abs(hi)) && break
+        end
+      end
+      checkAsserts(hi == t ? u : integrator(hi), p, hi)
+      return false
     end
 
     function checkAsserts(u, p, t)
@@ -2182,29 +2496,82 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       return nothing
     end
 
-    #= The initial state: the free states the initial equations determine, solved for them. =#
+    #= The initial state: the free states (and fixed = false parameters, into p.values) the
+       initial equations determine, solved for them. =#
     function initialize(u0, p, t)
+      local nS = length(INIT_UNKNOWNS)
+      local u = copy(u0)
+      local du = similar(u); local a = similar(u, $nAlg)
+      local setUnknowns! = function (uu, z)
+        uu[INIT_UNKNOWNS] .= view(z, 1:nS)
+        p.values[INIT_PARAMS] .= view(z, (nS + 1):length(z))
+        return uu
+      end
+      #= the relations keep their values during a solve =#
       local residual = function (res, z, _)
-        local u = similar(z, length(u0))
-        u .= u0
-        u[INIT_UNKNOWNS] .= z
-        local du = similar(u); local a = similar(u, $nAlg)
-        equations!(du, a, u, p, t, nothing, true)
-        initialResiduals!(res, du, a, u, p, t)
+        local uz = similar(z, length(u0))
+        uz .= u0
+        setUnknowns!(uz, z)
+        local duz = similar(uz); local az = similar(uz, $nAlg)
+        equations!(duz, az, uz, p, t, nothing, false)
+        initialResiduals!(res, duz, az, uz, p, t)
         return nothing
       end
-      local prob = NonlinearSolve.NonlinearProblem(NonlinearSolve.NonlinearFunction(residual), u0[INIT_UNKNOWNS])
-      local sol = NonlinearSolve.solve(prob, NonlinearSolve.NewtonRaphson(autodiff = ADTypes.AutoFiniteDiff());
-                                       abstol = 1e-10, reltol = 1e-10)
-      DifferentialEquations.SciMLBase.successful_retcode(sol) ||
-        error(string("array model: initialization failed (", sol.retcode, ")"))
-      local u = copy(u0)
-      u[INIT_UNKNOWNS] .= sol.u
+      #= MLS 8.6, as the MTK path: the relations at the guess, a solve with them, then at the
+         solution again, until they settle (a branch the solved state selects); relations that
+         cycle (no consistent branch) keep the first solution =#
+      local z = vcat(u0[INIT_UNKNOWNS], p.values[INIT_PARAMS])
+      local first = nothing
+      local seen = Tuple{Vector{Bool}, Vector{Float64}}[]
+      for _ in 1:20
+        equations!(du, a, setUnknowns!(u, z), p, t, nothing, true)
+        local rel0 = copy(p.rel); local e0 = copy(p.evv)
+        if (rel0, e0) in seen
+          equations!(du, a, setUnknowns!(u, first), p, t, nothing, true)
+          return u
+        end
+        push!(seen, (rel0, e0))
+        local prob = NonlinearSolve.NonlinearProblem(NonlinearSolve.NonlinearFunction(residual), z)
+        local sol = NonlinearSolve.solve(prob, NonlinearSolve.NewtonRaphson(autodiff = ADTypes.AutoFiniteDiff());
+                                         abstol = 1e-10, reltol = 1e-10)
+        #= no solution: refused as the MTK path refuses it (OpenModelica fails there too) =#
+        DifferentialEquations.SciMLBase.successful_retcode(sol) ||
+          $(_OMBACKEND.unsupported)("fixed start values or initial equations that the initialization cannot hold",
+                                    string("the initial system (", sol.retcode, ")"))
+        z = copy(sol.u)
+        first === nothing && (first = copy(z))
+        equations!(du, a, setUnknowns!(u, z), p, t, nothing, true)
+        (p.rel == rel0 && p.evv == e0) && return u
+      end
+      equations!(du, a, setUnknowns!(u, first), p, t, nothing, true)
       return u
     end
 
+    #= The initial algorithms, once at the start (asserts checked); the algebraic variables
+       they read from the equations at the initial state. =#
+    function initialAlgorithms!(u, p, t)
+      $(paramLocals...)
+      local du = similar(u); local a = similar(u, $nAlg)
+      equations!(du, a, u, p, t, nothing, true)
+      local z = nothing; local mode = true; local fire = false; local _fired = false
+      p.checking[1] = true
+      try
+        @inbounds begin
+          $(initAlgBody...)
+        end
+      finally
+        p.checking[1] = false
+      end
+      return nothing
+    end
+
+    #= The right-hand side: only what the state derivatives need (relations keep their values). =#
     function RHS!(du, u, p, t)
-      equations!(du, similar(u, $nAlg), u, p, t, nothing, false)
+      $(paramLocals...)
+      local a = similar(u, $nAlg); local z = nothing; local mode = false; local fire = false; local _fired = false
+      @inbounds begin
+        $(rhsBody...)
+      end
       return nothing
     end
 
@@ -2212,30 +2579,58 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     #= The algebraic variables at a point (u, t) of a solution: relations evaluated there and
        the discrete values of that time (from the event log), on a copy of the discrete state
        (after a solve p holds its final values). =#
-    function algebraics(u, p, t)
+    function algebraics(u, p, t, right::Bool = false)
       local a = similar(u, $nAlg)
       local times = first.(p.dlog)
-      local d = isempty(times) ? copy(p.d) : copy(p.dlog[max(1, searchsortedlast(times, t))][2])
+      local d = isempty(times) ? copy(p.d) : copy(p.dlog[$(_dlogIndex)(times, t, p.tend[1], right)][2])
       local q = $(paramsType)(p.values, copy(p.rel), d, copy(d), copy(p.wcond), copy(p.sampleActive),
-                              [false], [false], copy(p.upre), p.dlog, p.model)
+                              [false], [false], copy(p.upre), copy(p.ureinit), copy(p.wnew), p.dlog, copy(p.evv), copy(p.hyst), copy(p.tend), p.model)
       equations!(similar(u), a, u, q, t, nothing, true)
       return a
     end
 
-    #= Event iteration at (u, t): relations and when-conditions evaluated again, fired whens
-       applied, until nothing changes. pre() reads the values from before the event. =#
+    #= Event iteration at (u, t), in sweeps as OpenModelica's updateDiscreteSystem (and the MTK
+       path, relationRefresh.jl): within a sweep pre() keeps the values from before it, and the
+       relations, equations and fired when bodies are evaluated again until they settle (an
+       equation reading a variable a when body just set: ch = change(k)); a sweep that changed
+       a discrete value starts the next one from the new values, until one changes nothing. =#
     function eventIteration!(u, p, t, fire::Bool)
       local du = similar(u); local a = similar(u, $nAlg)
-      p.upre .= u
-      p.dpre .= p.d
       for _ in 1:50
-        local relBefore = copy(p.rel); local dBefore = copy(p.d)
-        local fired = equations!(du, a, u, p, t, nothing, true, fire)
-        fired = whens!(du, a, u, p, t, nothing, true, fire) || fired
-        (fired || relBefore != p.rel || dBefore != p.d) || return nothing
-        p.dpre .= p.d
+        p.dpre .= p.d; p.upre .= u; p.ureinit .= u
+        #= passes with the same pre() until nothing changes (a fired body runs in each: with
+           pre() fixed it gives the same values) =#
+        local settled = false
+        for _ in 1:50
+          local relBefore = copy(p.rel); local dBefore = copy(p.d)
+          local rBefore = copy(p.ureinit); local wBefore = copy(p.wnew); local eBefore = copy(p.evv)
+          equations!(du, a, u, p, t, nothing, true, fire)
+          whens!(du, a, u, p, t, nothing, true, fire)
+          settled = relBefore == p.rel && dBefore == p.d && rBefore == p.ureinit && wBefore == p.wnew &&
+                    eBefore == p.evv
+          settled && break
+        end
+        settled || return false
+        #= reinit() takes effect after the sweep; the next one reads it (and pre() of it), and
+           the conditions' values become pre() of the conditions =#
+        #= (at the initialization, as OpenModelica, reinit() has no effect) =#
+        local moved = !p.initPhase[1] && p.ureinit != u
+        moved && (u .= p.ureinit)
+        local switched = p.wnew != p.wcond
+        p.wcond .= p.wnew
+        (moved || switched || p.d != p.dpre) || return true
       end
-      error(string("array model: event iteration did not converge at t = ", t))
+      return false
+    end
+
+    #= The event iteration at an event during the solve: a model that does not settle
+       (relations switching back and forth) stops the simulation, as OpenModelica. =#
+    function _eventAt!(integrator)
+      eventIteration!(integrator.u, integrator.p, integrator.t, true) && return true
+      @error string("[events] the event iteration did not settle at t = ", integrator.t,
+                    " (relations switching back and forth: a chattering model); the simulation stops")
+      DifferentialEquations.SciMLBase.terminate!(integrator, DifferentialEquations.SciMLBase.ReturnCode.Failure)
+      return false
     end
 
     function conditions!(out, u, t, integrator)
@@ -2243,6 +2638,12 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       local du = similar(u); local a = similar(u, $nAlg)
       equations!(du, a, u, p, t, out, false)
       whens!(du, a, u, p, t, out, false, false)
+      return nothing
+    end
+
+    #= at the start of a solve: the relations' hysteresis for its tolerance and span =#
+    function _startHysteresis!(c, u, t, integrator)
+      integrator.p.hyst[1] = $(_hysteresis)(integrator)
       return nothing
     end
 
@@ -2262,7 +2663,8 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       local du = similar(ul); local a = similar(ul, $nAlg)
       equations!(du, a, ul, p, tl, nothing, true)
       whens!(du, a, ul, p, tl, nothing, true, false)
-      eventIteration!(integrator.u, p, t, true)
+      p.wcond .= p.wnew
+      _eventAt!(integrator)
       _logDiscretes!(p, t)
       DifferentialEquations.u_modified!(integrator, true)
       return nothing
@@ -2276,11 +2678,12 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
         local k = round((t - SAMPLE_START[id]) / SAMPLE_INTERVAL[id])
         p.sampleActive[id] = k >= 0 && abs(t - (SAMPLE_START[id] + k * SAMPLE_INTERVAL[id])) <= 1e-9 * max(1.0, abs(t))
       end
-      eventIteration!(u, p, t, true)
+      _eventAt!(integrator)
       fill!(p.sampleActive, false)
       local du = similar(u); local a = similar(u, $nAlg)
       equations!(du, a, u, p, t, nothing, true)
       whens!(du, a, u, p, t, nothing, true, false)
+      p.wcond .= p.wnew
       _logDiscretes!(p, t)
       DifferentialEquations.u_modified!(integrator, true)
       return nothing
@@ -2290,9 +2693,13 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       local times = Float64[]
       for (st, dt) in zip(SAMPLE_START, SAMPLE_INTERVAL)
         dt > 0 || error("array model: sample interval must be positive")
-        local k = max(0, ceil((tspan[1] - st) / dt))
-        while st + k * dt <= tspan[2]
-          push!(times, st + k * dt)
+        #= a tick within round-off of the start or stop time is at it (sample(-0.9, 0.3): 0) =#
+        local tol(x) = 1.0e-9 * max(1.0, abs(x))
+        local k = max(0, ceil((tspan[1] - st - tol(tspan[1])) / dt))
+        while st + k * dt <= tspan[2] + tol(tspan[2])
+          local tk = st + k * dt
+          push!(times, abs(tk - tspan[1]) <= tol(tspan[1]) ? Float64(tspan[1]) :
+                       abs(tk - tspan[2]) <= tol(tspan[2]) ? Float64(tspan[2]) : tk)
           k += 1
         end
       end
@@ -2300,7 +2707,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     end
 
     function affect!(integrator)
-      eventIteration!(integrator.u, integrator.p, integrator.t, true)
+      _eventAt!(integrator)
       _logDiscretes!(integrator.p, integrator.t)
       DifferentialEquations.u_modified!(integrator, true)
       return nothing
@@ -2311,12 +2718,12 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
        no sign change the root finder sees; it is caught here, at the end of the step. =#
     function relationsChanged(u, t, integrator)
       local p = integrator.p
-      local rel0 = copy(p.rel); local w0 = copy(p.wcond)
+      local rel0 = copy(p.rel); local w0 = copy(p.wcond); local e0 = copy(p.evv)
       local du = similar(u); local a = similar(u, $nAlg)
       equations!(du, a, u, p, t, nothing, true)
       whens!(du, a, u, p, t, nothing, true, false)
-      local changed = rel0 != p.rel
-      p.rel .= rel0; p.wcond .= w0
+      local changed = rel0 != p.rel || e0 != p.evv
+      p.rel .= rel0; p.wcond .= w0; p.evv .= e0
       return changed
     end
 
@@ -2324,32 +2731,37 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     function $(Symbol(modelName, "Model"))(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}())
       local p = $(paramsType)(flatParameters(isempty(parameters) ? PARAMS : parameterValues(parameters)),
                               zeros(Bool, N_RELATIONS), copy(D0), copy(D0), zeros(Bool, N_WHENS),
-                              zeros(Bool, length(SAMPLE_START)), [false], [false], copy(U0),
-                              Tuple{Float64, Vector{Float64}}[], @__MODULE__)
+                              zeros(Bool, length(SAMPLE_START)), [false], [false], copy(U0), copy(U0),
+                              zeros(Bool, N_WHENS), Tuple{Float64, Vector{Float64}}[], zeros(N_RELATIONS), [0.0], [Float64(tspan[2])], @__MODULE__)
       local u0 = copy(U0)
       N_INIT > 0 && (u0 = initialize(u0, p, tspan[1]))
+      $(isempty(initAlgBody) ? nothing : :(initialAlgorithms!(u0, p, tspan[1])))
       #= relations and when-conditions at the start (no when fires there) =#
-      (N_RELATIONS > 0 || N_WHENS > 0) && eventIteration!(u0, p, tspan[1], false)
+      (N_RELATIONS > 0 || N_WHENS > 0) && (eventIteration!(u0, p, tspan[1], false) ||
+                                           error("array model: the initial relations do not settle"))
       if USES_INITIAL
         #= when initial(): fire during initialization, then initial() is false again =#
         p.initPhase[1] = true
-        eventIteration!(u0, p, tspan[1], true)
+        eventIteration!(u0, p, tspan[1], true) || error("array model: the initial events do not settle")
         p.initPhase[1] = false
         local du = similar(u0); local a = similar(u0, $nAlg)
         equations!(du, a, u0, p, tspan[1], nothing, true)
         whens!(du, a, u0, p, tspan[1], nothing, true, false)
+        p.wcond .= p.wnew
       end
       _logDiscretes!(p, tspan[1])
       local f = ODEFunction(RHS!; jac_prototype = $jacProto, sys = $(ArraySystem)(@__MODULE__))
       #= RightRootFind: the event lands just past the root, where the relation has its new value. =#
       local cbs = Any[]
+      #= the relations were set literally above; from the solve on they have the hysteresis =#
       N_RELATIONS > 0 && push!(cbs, VectorContinuousCallback(conditions!, affectCrossing!, N_RELATIONS;
-                                                             rootfind = DifferentialEquations.SciMLBase.RightRootFind),
+                                                             rootfind = DifferentialEquations.SciMLBase.RightRootFind,
+                                                             initialize = _startHysteresis!),
                                     DiscreteCallback(relationsChanged, affect!; save_positions = (false, false)))
       isempty(SAMPLE_START) || push!(cbs, DiffEqCallbacks.PresetTimeCallback(sampleTimes(tspan), affectSample!))
       if !isempty(ASSERTS)
         empty!(WARNED)
-        push!(cbs, DiscreteCallback((u, t, integrator) -> checkAsserts(u, integrator.p, t), integrator -> nothing;
+        push!(cbs, DiscreteCallback(_assertStep, integrator -> nothing;
                                     initialize = (c, u, t, integrator) -> checkAsserts(u, integrator.p, t),
                                     save_positions = (false, false)))
       end

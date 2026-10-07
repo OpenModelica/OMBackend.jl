@@ -62,12 +62,15 @@ end
     @test_throws Exception OMBackend.resimulateModel(name; tspan = (0.0, 1.0), parameters = Dict("n" => 4))
   end
 
-  @testset "Events go the ModelingToolkit path by default" begin
-    local name = _arrayPathTranslate("ArrayPath.BouncingBalls"; scalarized = false)
-    @test !_arrayPathTaken(name)
+  @testset "ARRAY_PATH_FULL = false: events go the ModelingToolkit path" begin
+    OMBackend.ARRAY_PATH_FULL[] = false
+    try
+      @test !_arrayPathTaken(_arrayPathTranslate("ArrayPath.BouncingBalls"; scalarized = false))
+    finally
+      OMBackend.ARRAY_PATH_FULL[] = true
+    end
   end
 
-  OMBackend.ARRAY_PATH_FULL[] = true
   @testset "Events: when-equations in a loop, relations" begin
     local names = ["h[1]", "v[1]", "h[5]", "v[5]", "bounces[1]", "bounces[5]"]
     local (s, a, _) = _bothWays("ArrayPath.BouncingBalls", names; tspan = (0.0, 1.5))
@@ -95,7 +98,40 @@ end
     end
   end
 
-  OMBackend.ARRAY_PATH_FULL[] = false
+  @testset "Event functions, vector when-conditions, fixed = false parameters, initial algorithms" begin
+    #= at 0.95: floor(2.375), mod(0.95, 0.3), div(2.85, 1), integer(4x) rose at 0.25, 0.5, 0.75
+       (not against the scalarized path: its when on integer(4x) > pre(n) fails, a BoundsError) =#
+    local name = _arrayPathTranslate("ArrayPath.EventFunctions"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local ev = OMBackend.simulateModel(name; tspan = (0.0, 0.95))
+    @test _values(ev, ["y[1]", "y[2]", "y[3]", "n"]) ≈ [2.0, 0.05, 2.0, 3.0] atol = 1e-6
+    #= the events: floor(2.5x) steps at 0.4 and 0.8, n at 0.25, 0.5, 0.75 =#
+    @test [ev(t; idxs = Symbol("y[1]")) for t in (0.39, 0.41, 0.79, 0.81)] == [0.0, 1.0, 1.0, 2.0]
+    @test [ev(t; idxs = :n) for t in (0.24, 0.26, 0.74, 0.76)] == [0.0, 1.0, 2.0, 3.0]
+    #= initial() fires at the start, then each element when it becomes true =#
+    local (_, v, _) = _bothWays("ArrayPath.VectorWhen", ["n", "tl"])
+    @test v ≈ [3.0, 0.6] atol = 1e-6
+    #= t0 = 0, k = x(0) / 2 = 1 =#
+    local (s3, a3, _) = _bothWays("ArrayPath.FreeParam", ["x"])
+    @test a3[1] ≈ 2 * exp(-1.0) rtol = 1e-5
+    @test maximum(abs.(s3 .- a3)) < 1e-5
+    local (s4, a4, _) = _bothWays("ArrayPath.InitAlgPulse", ["count", "T_start", "y"])
+    @test maximum(abs.(s4 .- a4)) < 1e-6
+    @test a4[1:2] ≈ [6.0, 0.9] atol = 1e-6
+  end
+
+  @testset "An assert's message and time" begin
+    local name = _arrayPathTranslate("ArrayPath.AssertMessage"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local err = try
+      OMBackend.simulateModel(name; tspan = (0.0, 1.0)); nothing
+    catch e
+      e
+    end
+    @test err isa OMBackend.CodeGeneration.ModelicaAssertionError
+    @test err.time ≈ 0.5 atol = 1e-6
+    @test startswith(err.message, "x reached 0.5")
+  end
 
   @testset "Outside the scope: scalarized as before" begin
     local name = _arrayPathTranslate("ArrayPath.AlgebraicLoop"; scalarized = false)

@@ -176,4 +176,60 @@ package ArrayPath
   equation
     der(x) = 1 + t0;
   end AlgInitial;
+  model EventFunctions "integer, floor, mod and div generate events"
+    Real x(start = 0, fixed = true);
+    Real y[3];
+    discrete Integer n(start = 0, fixed = true);
+  equation
+    der(x) = 1;
+    y[1] = floor(2.5 * x);
+    y[2] = mod(x, 0.3);
+    y[3] = div(3 * x, 1);
+    when integer(4 * x) > pre(n) then
+      n = pre(n) + 1;
+    end when;
+  end EventFunctions;
+  model VectorWhen "when {c1, c2, initial()}: fires when one of them becomes true"
+    Real x(start = 0, fixed = true);
+    discrete Integer n(start = 0, fixed = true);
+    discrete Real tl(start = -1, fixed = true);
+  equation
+    der(x) = 1;
+    when {x > 0.3, x > 0.6, initial()} then
+      n = pre(n) + 1;
+      tl = time;
+    end when;
+  end VectorWhen;
+  model FreeParam "parameters with fixed = false, determined by initial equations"
+    parameter Real t0(fixed = false);
+    parameter Real k(fixed = false, start = 3);
+    Real x(start = 2, fixed = true);
+  initial equation
+    t0 = time;
+    2 * k = x;
+  equation
+    der(x) = -k * x + t0;
+  end FreeParam;
+  model InitAlgPulse "an initial algorithm sets discrete values (as MSL's Pulse)"
+    parameter Real period = 0.25;
+    parameter Real startTime = -0.6;
+    discrete Integer count;
+    discrete Real T_start;
+    Real y;
+  initial algorithm
+    count := integer((time - startTime) / period);
+    T_start := startTime + count * period;
+  equation
+    when integer((time - startTime) / period) > pre(count) then
+      count = pre(count) + 1;
+      T_start = time;
+    end when;
+    y = if time < T_start + 0.1 then 1 else 0;
+  end InitAlgPulse;
+  model AssertMessage "an assert's message with String(), reported where the condition fails"
+    Real x(start = 0, fixed = true);
+  equation
+    der(x) = 1;
+    assert(x < 0.5, "x reached " + String(x, 6, 0, true));
+  end AssertMessage;
 end ArrayPath;
