@@ -149,7 +149,16 @@ end
     @test _values(sol, ["v[1]", "v[3]", "n", "w[2]"]) ≈ [r / sqrt(14.0), 3r / sqrt(14.0), r, 4r / sqrt(14.0)] rtol = 1e-5
   end
 
-  @testset "An assert's message and time" begin
+  @testset "elsewhen, calls without a result, asserts in when bodies" begin
+    local name = _arrayPathTranslate("ArrayPath.ElseWhen"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = @test_logs (:warn, r"n reached 11") match_mode = :any OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    #= x > 0.3: the first branch; x > 0.6 (the first condition still true): the second =#
+    @test [sol(t; idxs = :n) for t in (0.2, 0.4, 0.7)] == [0.0, 1.0, 11.0]
+    @test sol(1.0; idxs = :m) == 1.0
+  end
+
+    @testset "An assert's message and time" begin
     local name = _arrayPathTranslate("ArrayPath.AssertMessage"; scalarized = false)
     @test _arrayPathTaken(name)
     local err = try

@@ -314,4 +314,29 @@ package ArrayPath
     w = scaled(v, 2);
     der(v) = -w / n;
   end Functions;
+  function check "a call without a result: asserts its argument"
+    input Real x;
+  algorithm
+    assert(x < 10, "x too large: " + String(x));
+  end check;
+  model ElseWhen "when ... elsewhen; calls without a result in an equation and an algorithm; an assert in a when body"
+    Real x(start = 0, fixed = true);
+    discrete Integer n(start = 0, fixed = true);
+    discrete Integer m(start = 0, fixed = true);
+  equation
+    der(x) = 1;
+    when x > 0.3 then
+      n = pre(n) + 1;
+      m = pre(m);
+    elsewhen x > 0.6 then
+      n = pre(n) + 10;
+      m = pre(m) + 1;
+    end when;
+    when x > 0.8 then
+      assert(n < 5, "n reached " + String(n), AssertionLevel.warning);
+    end when;
+    check(x);
+  algorithm
+    check(2 * x);
+  end ElseWhen;
 end ArrayPath;

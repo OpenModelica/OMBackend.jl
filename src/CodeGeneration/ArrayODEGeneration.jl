@@ -382,8 +382,9 @@ end
 
 #= A when-equation over a domain: its condition and body (discrete assignments, reinits). =#
 struct WhenClass
-  cond::IR
-  body::Vector{Tuple{Symbol, Ref, IR}}   #= (:assign or :reinit, target, value) =#
+  cond::IR                               #= Op(:elsewhen, conditions) for when ... elsewhen =#
+  body::Vector{Tuple{Symbol, Ref, IR}}   #= (:assign, :reinit or :call (a statement), target, value) =#
+  starts::Vector{Int}                    #= where each branch's body begins =#
   nslots::Int
   domain::Matrix{Int}
   nrel::Int
@@ -413,6 +414,9 @@ end
 struct SWhen <: Stmt   #= branches (condition, body); ids: a condition slot per element of each branch =#
   branches::Vector{Tuple{IR, Vector{Stmt}}}
   ids::Vector{Vector{Int}}
+end
+struct SCall <: Stmt   #= a call without a result (a check, a table's validation) =#
+  call::IR
 end
 struct SAssert <: Stmt
   cond::IR
@@ -1057,6 +1061,13 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
     end
     return
   end
+  if F.isvariant(eq, F.EQUATION_NORETCALL)
+    #= a call without a result (Modelica.Fluid.Utilities.checkBoundary): run with the asserts =#
+    local cctx = Ctx(iters, Int[], Base.RefValue(0), true)
+    push!(initial ? g.initAsserts : g.asserts,
+          AssertClass(Op(:seq, IR[toIR(g, eq.exp, cctx), Lit(true)]), false, nIter, idom, _str(eq), "", Lit("")))
+    return
+  end
   if initial && F.isvariant(eq, F.EQUATION_ASSERT)
     #= checked once, after the initialization =#
     local actx = Ctx(iters, Int[], Base.RefValue(0), true)
@@ -1167,31 +1178,44 @@ function _tupleAssignments(g::Gen, @nospecialize(lhs), call::IR, ctx::Ctx)::Vect
 end
 
 function _addWhen!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{String}, idom::Matrix{Int})
-  length(eq.branches) == 1 || ns("elsewhen")
-  local br = eq.branches[1]
-  F.isvariant(br, F.EQUATION_BRANCH) || ns("when branch")
   local ctx = Ctx(Dict(n => k for (k, n) in enumerate(iterNames)), Int[])
-  local cond = _whenCondition(g, br.condition, ctx)
+  local conds = IR[]
   local body = Tuple{Symbol, Ref, IR}[]
-  for b in br.body
-    if F.isvariant(b, F.EQUATION_REINIT)
-      local target = toIR(g, b.cref, ctx)
-      (target isa Ref && g.vars[target.name].kind == :state) || ns("reinit of a non-state")
-      push!(body, (:reinit, target, toIR(g, b.reinitExp, ctx)))
-    elseif F.isvariant(b, F.EQUATION_EQUALITY) && b.lhs isa F.TUPLE_EXPRESSION
-      for st in _tupleAssignments(g, b.lhs, toIR(g, b.rhs, ctx), ctx)
-        g.vars[st.target.name].kind == :discrete || ns("when assigns a non-discrete variable")
-        push!(body, (:assign, st.target, st.value))
+  local starts = Int[]
+  local noTarget = Ref("", IR[], false)
+  for br in eq.branches
+    F.isvariant(br, F.EQUATION_BRANCH) || ns("when branch")
+    push!(conds, _whenCondition(g, br.condition, ctx))
+    push!(starts, length(body) + 1)
+    for b in br.body
+      if F.isvariant(b, F.EQUATION_REINIT)
+        local target = toIR(g, b.cref, ctx)
+        (target isa Ref && g.vars[target.name].kind == :state) || ns("reinit of a non-state")
+        push!(body, (:reinit, target, toIR(g, b.reinitExp, ctx)))
+      elseif F.isvariant(b, F.EQUATION_EQUALITY) && b.lhs isa F.TUPLE_EXPRESSION
+        for st in _tupleAssignments(g, b.lhs, toIR(g, b.rhs, ctx), ctx)
+          g.vars[st.target.name].kind == :discrete || ns("when assigns a non-discrete variable")
+          push!(body, (:assign, st.target, st.value))
+        end
+      elseif F.isvariant(b, F.EQUATION_EQUALITY) && b.lhs isa F.CREF_EXPRESSION && !F.isArray(b.ty)
+        local target = toIR(g, b.lhs, ctx)
+        (target isa Ref && g.vars[target.name].kind == :discrete) || ns("when assigns a non-discrete variable")
+        push!(body, (:assign, target, toIR(g, b.rhs, ctx)))
+      elseif F.isvariant(b, F.EQUATION_ASSERT)
+        #= checked when the body runs =#
+        push!(g.assertTexts, (_str(b.condition), _str(b.message), occursin("warning", _str(b.level))))
+        local actx = _with(ctx; noEvent = true)
+        push!(body, (:call, noTarget, Op(:assertcall, IR[toIR(g, b.condition, actx), _messageIR(g, b.message, actx),
+                                                            Lit(length(g.assertTexts))])))
+      elseif F.isvariant(b, F.EQUATION_NORETCALL)
+        push!(body, (:call, noTarget, toIR(g, b.exp, _with(ctx; noEvent = true))))
+      else
+        ns("when body equation " * first(_str(b), 120))
       end
-    elseif F.isvariant(b, F.EQUATION_EQUALITY) && b.lhs isa F.CREF_EXPRESSION && !F.isArray(b.ty)
-      local target = toIR(g, b.lhs, ctx)
-      (target isa Ref && g.vars[target.name].kind == :discrete) || ns("when assigns a non-discrete variable")
-      push!(body, (:assign, target, toIR(g, b.rhs, ctx)))
-    else
-      ns("when body equation " * first(_str(b), 120))
-    end
   end
-  push!(g.whens, WhenClass(cond, body, length(iterNames), idom, ctx.nrel[], ctx.nsam[], _str(eq)))
+  end
+  local cond = length(conds) == 1 ? conds[1] : Op(:elsewhen, conds)
+  push!(g.whens, WhenClass(cond, body, starts, length(iterNames), idom, ctx.nrel[], ctx.nsam[], _str(eq)))
 end
 
 #= initial() activates a when at the initialization only as its condition (MLS 8.6, as
@@ -1206,7 +1230,8 @@ function _whenCondition(g::Gen, @nospecialize(c::F.Expression), ctx::Ctx)::IR
 end
 
 #= The condition elements of a when (one for a scalar condition). =#
-_condElements(c::IR)::Vector{IR} = (c isa Op && c.op == :vect) ? c.args : IR[c]
+_condElements(c::IR)::Vector{IR} = (c isa Op && c.op == :elsewhen) ? IR[e for b in c.args for e in _condElements(b)] :
+                                   (c isa Op && c.op == :vect) ? c.args : IR[c]
 _noInitial(x::IR) = !(x isa Op) ? x : x.op == :initial ? Lit(false) : Op(x.op, IR[_noInitial(a) for a in x.args])
 
 #= An algorithm section: statements to IR. A vectorized algorithm (one for-loop over a $
@@ -1265,6 +1290,9 @@ function _initAlgTargets(g::Gen, stmts::Vector{Stmt})
 end
 
 function _stmtIR(g::Gen, @nospecialize(st), ctx::Ctx, nwhen::Base.RefValue{Int})::Stmt
+  if F.isvariant(st, F.ALG_NORETCALL)
+    return SCall(toIR(g, st.exp, ctx))
+  end
   if F.isvariant(st, F.ALG_ASSIGNMENT) && st.lhs isa F.TUPLE_EXPRESSION
     return SIf([(Lit(true), _tupleAssignments(g, st.lhs, toIR(g, st.rhs, ctx), ctx))])
   end
@@ -1496,6 +1524,8 @@ function _algAccesses!(g::Gen, stmts::Vector{Stmt}, env::Dict{Int, Int}, d::Matr
       _algAccesses!(g, st.body, env, d, col, outs, ins, sids)
     elseif st isa SAssert
       readIR!(st.cond)
+    elseif st isa SCall
+      readIR!(st.call)
     end
   end
 end
@@ -1917,6 +1947,8 @@ function jl(g::Gen, x::IR)
     x.op == :initial && return :(p.initPhase[1])
     x.op == :String && return Expr(:call, _modelicaString, args...)
     x.op == :fcall && return Expr(:call, args...)
+    x.op == :assertcall && return :(($(args[1])) || _assertFailed(p, $(args[3]), ($(args[3]), _col), t, $(args[2])))
+    x.op == :seq && return Expr(:block, args...)
     x.op == :arrayval && return length(args[1]) == 1 ? Expr(:vect, args[2:end]...) :
                                 :(reshape($(Expr(:vect, args[2:end]...)), $(args[1]...)))
     x.op == :Int && return :(round(Int, $(args[1])))
@@ -1975,6 +2007,8 @@ function _stmtCode(g::Gen, stmts::Vector{Stmt}, condBase::Int, nwhen::Int; inWhe
       #= checked with the other asserts after each step; in a when body, when the body runs =#
       local failed = :(!($(jl(g, st.cond))) && _assertFailed(p, $(st.k), ($(st.k), _col), t, $(jl(g, st.msg))))
       push!(out, inWhen ? failed : :(p.checking[1] && $failed))
+    elseif st isa SCall
+      push!(out, jl(g, st.call))
     elseif st isa SBreak
       push!(out, :(break))
     end
@@ -2403,25 +2437,38 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
         push!(sampleInterval, Float64(_evalStatic(g, sx.args[2], w.domain, j)))
       end
     end
-    local stmts = Any[]
-    for (kind, target, value) in w.body
+    local branchConds = (w.cond isa Op && w.cond.op == :elsewhen) ? w.cond.args : IR[w.cond]
+    local stmtsOf = [Any[] for _ in branchConds]
+    for (i, (kind, target, value)) in enumerate(w.body)
+      local b = findlast(st -> st <= i, w.starts)
+      if kind == :call
+        push!(stmtsOf[b], jl(g, value))
+        continue
+      end
       local info = g.vars[target.name]
       local idx = Any[jl(g, s) for s in target.subs]
       if kind == :reinit
-        push!(stmts, :(p.ureinit[$(_linear(info, idx))] = $(jl(g, value))))
+        push!(stmtsOf[b], :(p.ureinit[$(_linear(info, idx))] = $(jl(g, value))))
       else
-        push!(stmts, :(p.d[$(_linear(info, idx))] = Float64($(jl(g, value)))))
+        push!(stmtsOf[b], :(p.d[$(_linear(info, idx))] = Float64($(jl(g, value)))))
       end
     end
     local elems = _condElements(w.cond)
     local ks = [:($(whenCondBases[wi]) + (_col - 1) * $(length(elems)) + $j) for j in eachindex(elems)]
     local cond = Expr(:block, [:(p.wnew[$k] = $(jl(g, e))) for (k, e) in zip(ks, elems)]...)
-    local rise = foldl((x, y) -> :($x || $y), [:(p.wnew[$k] && !p.wcond[$k]) for k in ks])
-    local inst = quote
-      if fire && ($rise)
-        $(stmts...)
-        _fired = true
-      end
+    #= when c1 then ... elsewhen c2 then ...: the first branch whose condition rose =#
+    local inst = nothing
+    local pos = 1
+    local rises = Any[]
+    for bc in branchConds
+      local n = length(_condElements(bc))
+      push!(rises, foldl((x, y) -> :($x || $y), [:(p.wnew[$k] && !p.wcond[$k]) for k in ks[pos:(pos + n - 1)]]))
+      pos += n
+    end
+    for b in length(branchConds):-1:1
+      local blk = Expr(:block, stmtsOf[b]..., :(_fired = true))
+      inst = inst === nothing ? Expr(:if, :(fire && ($(rises[b]))), blk) :
+                                Expr(b == 1 ? :if : :elseif, :(fire && ($(rises[b]))), blk, inst)
     end
     push!(whenConds, w.nslots == 0 ? Expr(:let, :(_col = 1), cond) : _loopCode(w.nslots, w.domain, collect(1:size(w.domain, 2)), cond))
     push!(whenBody, w.nslots == 0 ? Expr(:let, :(_col = 1), inst) : _loopCode(w.nslots, w.domain, collect(1:size(w.domain, 2)), inst))
