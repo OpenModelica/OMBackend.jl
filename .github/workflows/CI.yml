@@ -26,6 +26,9 @@ jobs:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      # the nightly failure mail needs both mail secrets (not set: GitHub's own notification)
+      MAIL_CONFIGURED: ${{ secrets.MAIL_USERNAME != '' && secrets.MAIL_PASSWORD != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -122,13 +125,16 @@ jobs:
       - name: Upload coverage to Codecov
         if: runner.os == 'Linux'
         uses: codecov/codecov-action@v4
+        # an upload problem (Codecov's service or network) must not fail the tests
+        continue-on-error: true
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
       - name: Email maintainer on nightly failure
-        if: ${{ failure() && github.event_name == 'schedule' }}
+        if: ${{ failure() && github.event_name == 'schedule' && env.MAIL_CONFIGURED == 'true' }}
+        continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
