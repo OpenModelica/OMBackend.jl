@@ -1214,7 +1214,20 @@ function _tupleAssignments(g::Gen, @nospecialize(lhs), call::IR, ctx::Ctx)::Vect
   local out = Stmt[]
   for (i, e) in enumerate(lhs.elements)
     (e isa F.CREF_EXPRESSION && F.isvariant(e.cref, F.COMPONENT_REF_WILD)) && continue
-    (e isa F.CREF_EXPRESSION && !F.isArray(F.typeOf(e))) || ns("tuple target " * _str(e))
+    e isa F.CREF_EXPRESSION || ns("tuple target " * _str(e))
+    if F.isArray(F.typeOf(e))
+      #= a whole array ((r, state) = random(pre(state)): Buildings.Occupants): element by
+         element from that output (the call per element: Modelica functions are pure) =#
+      local name = _crefName(e.cref)
+      local info = get(g.vars, name, nothing)
+      (info !== nothing && info.kind in (:alg, :discrete) && !isempty(info.dims) &&
+       all(p -> isempty(collect(p.subscripts)), _partsRootFirst(e.cref))) || ns("tuple target " * _str(e))
+      for t in Iterators.product((1:d for d in info.dims)...)
+        local subs = IR[Lit(k) for k in t]
+        push!(out, SAssign(Ref(name, subs, false), Op(:index, IR[Op(:index, IR[call, Lit(i)]), subs...])))
+      end
+      continue
+    end
     local target = toIR(g, e, ctx)
     (target isa Ref && g.vars[target.name].kind in (:alg, :discrete)) || ns("tuple target " * _str(e))
     push!(out, SAssign(target, Op(:index, IR[call, Lit(i)])))
@@ -2642,6 +2655,8 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
     import NonlinearSolve
     import ADTypes
     import DiffEqCallbacks
+    #= the MTK path's function code names it (algorithmic.jl: an output array's growth) =#
+    const OMBackend = $(_OMBACKEND)
 
     $(functionDefs...)
     const STATE_NAMES = $(stateNamesOrdered)
