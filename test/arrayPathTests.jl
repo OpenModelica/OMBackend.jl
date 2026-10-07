@@ -135,6 +135,20 @@ end
     @test startswith(err.message, "k must be positive, k = -1")
   end
 
+  @testset "Modelica functions" begin
+    #= the model's functions as Julia functions of the module (the MTK path's code
+       generation); (p, q) = f(x) as an algorithm node (the MTK path fails on it) =#
+    local name = _arrayPathTranslate("ArrayPath.Functions"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    @test sol.retcode == ReturnCode.Success
+    local x = exp(-1.0)
+    @test _values(sol, ["x", "y", "z", "p", "q"]) ≈ [x, 2x, 3x + 1, x^2, -x] rtol = 1e-5
+    #= v' = -2 v / |v|: the direction stays, |v| = sqrt(14) - 2t =#
+    local r = sqrt(14.0) - 2.0
+    @test _values(sol, ["v[1]", "v[3]", "n", "w[2]"]) ≈ [r / sqrt(14.0), 3r / sqrt(14.0), r, 4r / sqrt(14.0)] rtol = 1e-5
+  end
+
   @testset "An assert's message and time" begin
     local name = _arrayPathTranslate("ArrayPath.AssertMessage"; scalarized = false)
     @test _arrayPathTaken(name)

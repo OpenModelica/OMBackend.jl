@@ -332,7 +332,7 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
   try
     frontendDAE isa OMFrontend.Frontend.FlatModel && delete!(ARRAY_ODE_MODELS, canonicalName(frontendDAE.name))
     if frontendDAE isa OMFrontend.Frontend.FlatModel && !scalarized && ARRAY_ODE_GENERATION[]
-      local arrayResult = @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(frontendDAE)
+      local arrayResult = @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(frontendDAE; functionList)
       arrayResult === nothing || return arrayResult
     end
     return withLogRunDir(runId) do
@@ -882,21 +882,21 @@ The array-preserving translation of a flat model with arrays kept (from the fron
 `scalarize = false`), or `nothing` when the model is outside its scope (the reason is
 logged). OM falls back to the scalarizing flatten and `translate` then.
 """
-function translateArrays(fm::OMFrontend.Frontend.FlatModel)
+function translateArrays(fm::OMFrontend.Frontend.FlatModel; functionList = nothing)
   delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
   ARRAY_ODE_GENERATION[] || return nothing
   if !isempty(TUNABLE_PARAMETERS[])
     @info "[backendAPI] array ODE path not taken for $(canonicalName(fm.name)): withTunableParameters (the ModelingToolkit path's tunable sets)"
     return nothing
   end
-  return @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(fm)
+  return @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(fm; functionList)
 end
 
 #= The array ODE module of a no-scalarize flat model (ARRAY_ODE_GENERATION), cached as a
    DE-mode model; nothing (and an @info with the reason) for a model outside its scope. =#
-function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel)
+function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel; functionList = nothing)
   local modelName = canonicalName(fm.name)
-  local (name, modelCode) = CodeGeneration.ArrayODEGen.generateArrayODECode(fm, modelName)
+  local (name, modelCode) = CodeGeneration.ArrayODEGen.generateArrayODECode(fm, modelName; functions = functionList)
   if name === nothing
     @info "[backendAPI] array ODE path not taken for $(modelName): $(modelCode)"
     return nothing

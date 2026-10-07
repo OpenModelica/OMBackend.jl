@@ -259,4 +259,59 @@ package ArrayPath
   equation
     der(x) = k * x;
   end InitialAssert;
+  function twoSlopes "a step with two slopes (not inlined: an algorithm with an if)"
+    input Real x;
+    input Real k;
+    output Real y;
+  protected
+    Real s;
+  algorithm
+    s := if x > 0 then 1 else 0.5;
+    y := s * k * x;
+  end twoSlopes;
+  function shifted "calls twoSlopes"
+    input Real x;
+    output Real y;
+  algorithm
+    y := twoSlopes(x, 3) + 1;
+  end shifted;
+  function squareAndNegate "two outputs"
+    input Real x;
+    output Real a;
+    output Real b;
+  algorithm
+    a := x ^ 2;
+    b := -x;
+  end squareAndNegate;
+  function norm2 "an array argument"
+    input Real v[:];
+    output Real y;
+  algorithm
+    y := sqrt(v * v);
+  end norm2;
+  function scaled "an array result"
+    input Real v[3];
+    input Real k;
+    output Real w[3];
+  algorithm
+    w := k * v;
+  end scaled;
+  model Functions "Modelica functions in the equations: scalar, nested, two outputs, array argument and result"
+    Real x(start = 1, fixed = true);
+    Real y;
+    Real z;
+    Real p;
+    Real q;
+    Real v[3](start = {1, 2, 3}, each fixed = true);
+    Real n;
+    Real w[3];
+  equation
+    y = twoSlopes(x, 2);
+    z = shifted(x);
+    (p, q) = squareAndNegate(x);
+    der(x) = q;
+    n = norm2(v);
+    w = scaled(v, 2);
+    der(v) = -w / n;
+  end Functions;
 end ArrayPath;

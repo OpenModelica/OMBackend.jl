@@ -466,6 +466,7 @@ mutable struct Gen
   initAlgs::Vector{AlgClass}   #= initial algorithms (run once at the initialization) =#
   freeParams::Vector{String}   #= parameters with fixed = false: unknowns of the initialization =#
   initAsserts::Vector{AssertClass}   #= asserts of initial equations: checked once after the initialization =#
+  functions::Dict{String, Int}  #= the model's Modelica functions (Julia name: dots as _) -> number of outputs =#
 end
 
 struct Ctx
@@ -628,8 +629,13 @@ end
 function toIR(g::Gen, @nospecialize(e::F.Expression), ctx::Ctx)::IR
   if e isa F.REAL_EXPRESSION || e isa F.INTEGER_EXPRESSION || e isa F.BOOLEAN_EXPRESSION || e isa F.ENUM_LITERAL_EXPRESSION
     return Lit(_literalValue(e))
+  elseif e isa F.BINDING_EXP
+    #= a binding the frontend propagated (into an argument): its expression =#
+    return toIR(g, F.getBindingExp(e), ctx)
   elseif e isa F.STRING_EXPRESSION
     return Lit(String(e.value))
+  elseif e isa F.TUPLE_ELEMENT_EXPRESSION
+    return Op(:index, IR[toIR(g, e.tupleExp, ctx), Lit(e.index)])
   elseif e isa F.CAST_EXPRESSION
     return toIR(g, e.exp, ctx)
   elseif e isa F.CREF_EXPRESSION
@@ -749,11 +755,62 @@ function _callIR(g::Gen, e::F.CALL_EXPRESSION, ctx::Ctx)::IR
     fname in ("mod", "rem") || return v
     return Op(:-, IR[xs[1], Op(:*, IR[v, xs[2]])])
   end
+  #= a Modelica function of the model (_functionDefinitions): its outputs as a tuple if more
+     than one (the frontend picks one with a TUPLE_ELEMENT_EXPRESSION) =#
+  local jn = replace(fname, "." => "_")
+  if haskey(g.functions, jn)
+    local xs = IR[]
+    for a in args
+      F.isRecord(F.typeOf(a)) && ns("function $(fname) with a record argument")
+      push!(xs, F.isArray(F.typeOf(a)) ? _arrayValueIR(g, a, ctx) : toIR(g, a, _with(ctx; elem = Int[])))
+    end
+    local call = Op(:fcall, IR[Lit(Symbol(jn)), xs...])
+    #= an array result in an element-wise context: the element =#
+    if F.isArray(F.typeOf(e))
+      local nd = F.dimensionCount(F.typeOf(e))
+      length(ctx.elem) == nd || ns("array result of $(fname) outside an element-wise context")
+      return Op(:index, IR[call, (Slot(k) for k in ctx.elem)...])
+    end
+    return call
+  end
+  #= array built-ins in an element-wise context: the element =#
+  if F.isArray(F.typeOf(e)) && fname in ("fill", "zeros", "ones", "identity", "transpose")
+    local nd = F.dimensionCount(F.typeOf(e))
+    length(ctx.elem) == nd || ns("$(fname) outside an element-wise context")
+    fname == "fill" && (F.isArray(F.typeOf(args[1])) ? ns("fill of an array") : return toIR(g, args[1], _with(ctx; elem = Int[])))
+    fname == "zeros" && return Lit(0.0)
+    fname == "ones" && return Lit(1.0)
+    fname == "identity" && return Op(:if, IR[Op(:(==), IR[Slot(ctx.elem[1]), Slot(ctx.elem[2])]), Lit(1.0), Lit(0.0)])
+    return toIR(g, args[1], _with(ctx; elem = reverse(ctx.elem)))
+  end
+  if fname == "size" && length(args) == 2
+    #= size(a, k) of a known size =#
+    local ty = F.typeOf(args[1])
+    (F.isArray(ty) && F.hasKnownSize(ty)) || ns("size of " * _str(args[1]))
+    local k = _literalValue(_evalFrontend(args[2]))
+    return Lit([F.size(d) for d in F.arrayDims(ty)][k])
+  end
   #= Modelica.Math's elementary functions are the built-in ones (external "builtin") =#
   local jf = startswith(fname, "Modelica.Math.") && fname[15:end] in MATH_WRAPPED ?
     MATH_BUILTINS[fname[15:end]] : get(MATH_BUILTINS, fname, nothing)
   jf === nothing && ns("function $(fname)")
   return Op(jf, IR[toIR(g, a, ctx) for a in args])
+end
+
+#= An array value (a function's array argument): its elements written out (as a reduction's
+   terms), column-major, reshaped to its dimensions. =#
+function _arrayValueIR(g::Gen, @nospecialize(e::F.Expression), ctx::Ctx)::IR
+  local ty = F.typeOf(e)
+  F.hasKnownSize(ty) || ns("array argument of unknown size " * _str(e))
+  local dims = [F.size(d) for d in F.arrayDims(ty)]
+  prod(dims) <= MAX_REDUCTION_TERMS || ns("array argument of $(prod(dims)) elements")
+  local tmp = Int[(g.tmpSlot -= 1) for _ in dims]
+  local body = toIR(g, e, _with(ctx; elem = tmp))
+  local elems = IR[]
+  for t in Iterators.product((1:d for d in dims)...)   #= column-major: the first index fastest =#
+    push!(elems, _substSlots(body, Dict(tmp[k] => t[k] for k in eachindex(tmp))))
+  end
+  return Op(:arrayval, IR[Lit(Tuple(dims)), elems...])
 end
 
 #= sum/product/min/max of an array of known (small) size: the terms written out. =#
@@ -1029,6 +1086,14 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
                                  nIter, idom, _str(eq.condition), _str(eq.message), _messageIR(g, eq.message, ctx)))
     return
   end
+  if F.isvariant(eq, F.EQUATION_EQUALITY) && eq.lhs isa F.TUPLE_EXPRESSION
+    #= (a, b) = f(x): an algorithm node assigning each target its output =#
+    local ctx = Ctx(iters, Int[])
+    local call = toIR(g, eq.rhs, ctx)
+    ctx.nsam[] == 0 || ns("sample outside a when-condition")
+    push!(g.algs, AlgClass(_tupleAssignments(g, eq.lhs, call, ctx), nIter, idom, ctx.nrel[], 0, _str(eq)))
+    return
+  end
   (F.isvariant(eq, F.EQUATION_EQUALITY) || F.isvariant(eq, F.EQUATION_ARRAY_EQUALITY)) ||
     ns("equation " * first(_str(eq), 200))
   local edims = F.isArray(eq.ty) ? [F.size(d) for d in F.arrayDims(eq.ty)] : Int[]
@@ -1088,6 +1153,19 @@ function _addDynamicIf!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector
   end
 end
 
+#= (a, _, c) = call: an assignment of each (non-wildcard) target from its output. =#
+function _tupleAssignments(g::Gen, @nospecialize(lhs), call::IR, ctx::Ctx)::Vector{Stmt}
+  local out = Stmt[]
+  for (i, e) in enumerate(lhs.elements)
+    (e isa F.CREF_EXPRESSION && F.isvariant(e.cref, F.COMPONENT_REF_WILD)) && continue
+    (e isa F.CREF_EXPRESSION && !F.isArray(F.typeOf(e))) || ns("tuple target " * _str(e))
+    local target = toIR(g, e, ctx)
+    (target isa Ref && g.vars[target.name].kind in (:alg, :discrete)) || ns("tuple target " * _str(e))
+    push!(out, SAssign(target, Op(:index, IR[call, Lit(i)])))
+  end
+  return out
+end
+
 function _addWhen!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{String}, idom::Matrix{Int})
   length(eq.branches) == 1 || ns("elsewhen")
   local br = eq.branches[1]
@@ -1100,6 +1178,11 @@ function _addWhen!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{Stri
       local target = toIR(g, b.cref, ctx)
       (target isa Ref && g.vars[target.name].kind == :state) || ns("reinit of a non-state")
       push!(body, (:reinit, target, toIR(g, b.reinitExp, ctx)))
+    elseif F.isvariant(b, F.EQUATION_EQUALITY) && b.lhs isa F.TUPLE_EXPRESSION
+      for st in _tupleAssignments(g, b.lhs, toIR(g, b.rhs, ctx), ctx)
+        g.vars[st.target.name].kind == :discrete || ns("when assigns a non-discrete variable")
+        push!(body, (:assign, st.target, st.value))
+      end
     elseif F.isvariant(b, F.EQUATION_EQUALITY) && b.lhs isa F.CREF_EXPRESSION && !F.isArray(b.ty)
       local target = toIR(g, b.lhs, ctx)
       (target isa Ref && g.vars[target.name].kind == :discrete) || ns("when assigns a non-discrete variable")
@@ -1182,6 +1265,9 @@ function _initAlgTargets(g::Gen, stmts::Vector{Stmt})
 end
 
 function _stmtIR(g::Gen, @nospecialize(st), ctx::Ctx, nwhen::Base.RefValue{Int})::Stmt
+  if F.isvariant(st, F.ALG_ASSIGNMENT) && st.lhs isa F.TUPLE_EXPRESSION
+    return SIf([(Lit(true), _tupleAssignments(g, st.lhs, toIR(g, st.rhs, ctx), ctx))])
+  end
   if F.isvariant(st, F.ALG_ASSIGNMENT)
     (st.lhs isa F.CREF_EXPRESSION && !F.isArray(st.ty)) || ns("assignment " * _str(st))
     local target = toIR(g, st.lhs, ctx)
@@ -1830,6 +1916,9 @@ function jl(g::Gen, x::IR)
     x.op == :sample && return :(p.sampleActive[$(g.sampleBase) + (_col - 1) * $(g.sampleCount) + $(x.args[3].v)])
     x.op == :initial && return :(p.initPhase[1])
     x.op == :String && return Expr(:call, _modelicaString, args...)
+    x.op == :fcall && return Expr(:call, args...)
+    x.op == :arrayval && return length(args[1]) == 1 ? Expr(:vect, args[2:end]...) :
+                                :(reshape($(Expr(:vect, args[2:end]...)), $(args[1]...)))
     x.op == :Int && return :(round(Int, $(args[1])))
     x.op == :Bool && return :(($(args[1])) != 0)
     return Expr(:call, x.op, args...)
@@ -1998,9 +2087,9 @@ end
 The array-preserving module of a no-scalarize flat model, or `nothing` and the reason the
 model is outside the supported scope.
 """
-function generateArrayODECode(fm::F.FlatModel, modelName::String)
+function generateArrayODECode(fm::F.FlatModel, modelName::String; functions = nothing)
   try
-    return (modelName, _generate(fm, modelName))
+    return (modelName, _generate(fm, modelName; functions = functions))
   catch err
     err isa NotSupported || rethrow(err)
     return (nothing, err.msg)
@@ -2022,7 +2111,45 @@ function _vtype(v::F.Variable)::Symbol
   ns("variable type of $(_str(v.name))")
 end
 
-function _generate(fm::F.FlatModel, modelName::String)::Expr
+#= The model's Modelica functions as Julia functions of the module (the MTK path's code
+   generation: SimulationCode.generateSimCodeFunctions, AlgorithmicCodeGeneration.generateFunctions),
+   each a module constant named as the frontend's function list names it (dots as _), so the
+   equations and the functions' calls of each other find it. Returns (definitions, outputs). =#
+function _functionDefinitions(functions)
+  local defs = Any[]; local outs = Dict{String, Int}()
+  (functions === nothing || isempty(functions)) && return (defs, outs)
+  local SC = _OMBACKEND.SimulationCode
+  local (mfs, _) = try
+    SC.generateSimCodeFunctions(functions)
+  catch err
+    ns("the model's functions: " * first(sprint(showerror, err), 160))
+  end
+  mfs = SC.flattenRecordParameters(mfs)
+  local (exprs, names) = try
+    _OMBACKEND.CodeGeneration.AlgorithmicCodeGeneration.generateFunctions(mfs)
+  catch err
+    ns("the model's functions: " * first(sprint(showerror, err), 160))
+  end
+  for (mf, ex, nm) in zip(mfs, exprs, names)
+    local impl = nothing
+    local find = function (x)
+      x isa Expr || return
+      if x.head == :(=) && x.args[1] isa Expr && x.args[1].head == :ref && x.args[1].args[end] == QuoteNode(Symbol(nm))
+        impl = x.args[2]
+      else
+        foreach(find, x.args)
+      end
+    end
+    find(ex)
+    impl === nothing && ns("the code of function $(nm)")
+    push!(defs, :(const $(Symbol(nm)) = $impl))
+    outs[nm] = length(mf.outputs)
+  end
+  return (defs, outs)
+end
+
+function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Expr
+  local (functionDefs, functionOutputs) = _functionDefinitions(functions)
   (FULL[] || isempty(fm.initialAlgorithms)) || ns("initial algorithms (OMBackend.ARRAY_PATH_FULL)")
   #= States: the variables under der(). =#
   local stateNames = Set{String}()
@@ -2039,7 +2166,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
   end
   local g = Gen(Dict{String, VarInfo}(), 0, 0, 0, Dict{String, Any}(), Dict{String, Symbol}(), Set{String}(),
                 EqClass[], EqClass[], AlgClass[], Tuple{String, String, Bool}[], WhenClass[], AssertClass[], 0, 0, 0, 0,
-                -1000, false, Dict{Int, Int}(), AlgClass[], String[], AssertClass[])
+                -1000, false, Dict{Int, Int}(), AlgClass[], String[], AssertClass[], functionOutputs)
   local stateNamesOrdered = String[]; local algNamesOrdered = String[]
   local u0 = Float64[]; local d0 = Float64[]; local discreteNamesOrdered = String[]; local a0 = Float64[]
   local fixedMask = Bool[]
@@ -2392,6 +2519,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     import ADTypes
     import DiffEqCallbacks
 
+    $(functionDefs...)
     const STATE_NAMES = $(stateNamesOrdered)
     const ALGEBRAIC_NAMES = $(algNamesOrdered)
     const DISCRETE_NAMES = $(discreteNamesOrdered)
