@@ -998,6 +998,14 @@ end
 _crossDomain(d::Matrix{Int}, ranges::Vector{Vector{Int}}) = foldl(_crossDomain, ranges; init = d)
 
 #= The value of an expression that depends only on slots and parameters, at a domain column. =#
+#= Whether x reads only literals, iterators and parameters (no variable, no time). =#
+function _parametersOnly(g::Gen, x::IR)::Bool
+  (x isa Lit || x isa Slot) && return true
+  x isa Ref && return g.vars[x.name].kind == :param && !x.der && all(s -> _parametersOnly(g, s), x.subs)
+  x isa Op && return !(x.op in (:sample, :initial)) && all(a -> _parametersOnly(g, a), x.args)
+  return false
+end
+
 function _evalStatic(g::Gen, x::IR, d::Matrix{Int}, col::Int)
   if x isa Lit
     return x.v
@@ -1280,7 +1288,8 @@ end
 function _initAlgTargets(g::Gen, stmts::Vector{Stmt})
   for st in stmts
     if st isa SAssign
-      g.vars[st.target.name].kind == :discrete || ns("initial algorithm assigns $(st.target.name), not a discrete variable")
+      (g.vars[st.target.name].kind == :discrete || st.target.name in g.freeParams) ||
+        ns("initial algorithm assigns $(st.target.name), not a discrete variable or a parameter with fixed = false")
     elseif st isa SIf
       foreach(b -> _initAlgTargets(g, b[2]), st.branches)
     elseif st isa SFor || st isa SWhile
@@ -1299,7 +1308,9 @@ function _stmtIR(g::Gen, @nospecialize(st), ctx::Ctx, nwhen::Base.RefValue{Int})
   if F.isvariant(st, F.ALG_ASSIGNMENT)
     (st.lhs isa F.CREF_EXPRESSION && !F.isArray(st.ty)) || ns("assignment " * _str(st))
     local target = toIR(g, st.lhs, ctx)
-    (target isa Ref && g.vars[target.name].kind in (:alg, :discrete)) || ns("assignment to " * _str(st.lhs))
+    #= a parameter with fixed = false: an initial algorithm computes it (_initAlgTargets) =#
+    (target isa Ref && (g.vars[target.name].kind in (:alg, :discrete) || target.name in g.freeParams)) ||
+      ns("assignment to " * _str(st.lhs))
     return SAssign(target, toIR(g, st.rhs, ctx))
   elseif F.isvariant(st, F.ALG_IF)
     return SIf([(toIR(g, c, ctx), Stmt[_stmtIR(g, b, ctx, nwhen) for b in body]) for (c, body) in st.branches])
@@ -1966,6 +1977,13 @@ function _stmtCode(g::Gen, stmts::Vector{Stmt}, condBase::Int, nwhen::Int; inWhe
     if st isa SAssign
       local info = g.vars[st.target.name]
       local idx = Any[jl(g, s) for s in st.target.subs]
+      if info.kind == :param
+        #= a parameter with fixed = false, in an initial algorithm: its local (a view of
+           p.values for an array; a scalar is written back after the algorithms) =#
+        local sym = (_paramValue!(g, st.target.name); g.paramSyms[st.target.name])
+        push!(out, isempty(idx) ? :($sym = $(jl(g, st.value))) : :($sym[$(idx...)] = $(jl(g, st.value))))
+        continue
+      end
       push!(out, info.kind == :discrete ? :(p.d[$(_linear(info, idx))] = Float64($(jl(g, st.value)))) :
                                           :(a[$(_linear(info, idx))] = $(jl(g, st.value))))
     elseif st isa SIf
@@ -2418,10 +2436,13 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
   end
   #= When-equations: each instance fires when its condition becomes true. =#
   local whenBody = Any[]; local whenConds = Any[]
-  local sampleStart = Float64[]; local sampleInterval = Float64[]
+  #= sample(start, interval): per instance, code for its start and interval from the parameters,
+     run after the initialization (a start may be a parameter with fixed = false that an initial
+     algorithm computes: CDL Logical.Sources.Pulse) =#
+  local sampleSchedule = Any[]
   for (wi, w) in enumerate(g.whens)
     g.relBase = whenRelBases[wi]; g.relCount = w.nrel
-    g.sampleBase = length(sampleStart); g.sampleCount = w.nsample
+    g.sampleBase = length(sampleSchedule); g.sampleCount = w.nsample
     if w.nsample > 0
       local samples = Dict{Int, Op}()
       local collect! = function (x)
@@ -2433,8 +2454,13 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
       collect!(w.cond)
       for j in 1:size(w.domain, 2), id in 1:w.nsample
         local sx = samples[id]
-        push!(sampleStart, Float64(_evalStatic(g, sx.args[1], w.domain, j)))
-        push!(sampleInterval, Float64(_evalStatic(g, sx.args[2], w.domain, j)))
+        (_parametersOnly(g, sx.args[1]) && _parametersOnly(g, sx.args[2])) ||
+          ns("sample() with a start or interval that is not a parameter expression")
+        local k = length(sampleSchedule) + 1
+        local slots = [:($(jl(g, Slot(r))) = $(w.domain[r, j])) for r in 1:size(w.domain, 1)]
+        push!(sampleSchedule, Expr(:let, Expr(:block, slots...),
+                                   :(SAMPLE_START[$k] = Float64($(jl(g, sx.args[1])));
+                                     SAMPLE_INTERVAL[$k] = Float64($(jl(g, sx.args[2]))))))
       end
     end
     local branchConds = (w.cond isa Op && w.cond.op == :elsewhen) ? w.cond.args : IR[w.cond]
@@ -2523,6 +2549,10 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
   end
   local initStates = Int[k for k in initUnknowns if k <= g.nStates]
   local initParams = Int[layoutOf[freeCols[k - g.nStates][1]][1] + freeCols[k - g.nStates][2] for k in initUnknowns if k > g.nStates]
+  #= the scalar parameters the initial algorithms computed, from their locals to p.values =#
+  local initAlgWriteBack = Any[:(p.values[$(layoutOf[nm][1] + 1)] = $(g.paramSyms[nm]))
+                               for nm in sort!(collect(initAlgOuts))
+                               if nm in g.freeParams && haskey(layoutOf, nm) && !(g.params[nm] isa AbstractArray)]
   local paramLocals = Any[]
   for nm in usedParams
     local info = g.vars[nm]
@@ -2589,8 +2619,9 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
     const D0 = $(d0)
     const N_RELATIONS = $(nRelTotal)
     const USES_INITIAL = $(g.usesInitial)
-    const SAMPLE_START = $(sampleStart)
-    const SAMPLE_INTERVAL = $(sampleInterval)
+    #= set by sampleSchedule! after the initialization =#
+    const SAMPLE_START = zeros($(length(sampleSchedule)))
+    const SAMPLE_INTERVAL = zeros($(length(sampleSchedule)))
     const N_WHENS = $(nWhenInst)
 
     #= The parameter values with `overrides` (Modelica names of parameters or of their
@@ -2810,9 +2841,17 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
         @inbounds begin
           $(initAlgBody...)
         end
+        $(initAlgWriteBack...)
       finally
         p.checking[1] = false
       end
+      return nothing
+    end
+
+    #= The sample() starts and intervals from the parameter values (after the initialization). =#
+    function sampleSchedule!(p)
+      $(paramLocals...)
+      $(sampleSchedule...)
       return nothing
     end
 
@@ -2991,6 +3030,7 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
       local u0 = copy(U0)
       N_INIT > 0 && (u0 = initialize(u0, p, tspan[1]))
       $(isempty(initAlgBody) ? nothing : :(initialAlgorithms!(u0, p, tspan[1])))
+      isempty(SAMPLE_START) || sampleSchedule!(p)
       #= relations and when-conditions at the start (no when fires there) =#
       (N_RELATIONS > 0 || N_WHENS > 0) && (eventIteration!(u0, p, tspan[1], false) ||
                                            error("array model: the initial relations do not settle"))

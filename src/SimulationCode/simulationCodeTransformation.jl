@@ -187,6 +187,19 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
    asserts::Vector{BDAE.ASSERT_EQUATION}) = allocateAndCollectSimulationEquations(equations,
                                                                                   equationSystem.name,
                                                                                   addDummyState)
+  #= An initial equation's assert (a call for its effects among them: MSL Fluid's
+     checkBoundary) joins them: one on parameters is checked once, at the
+     initialization, as Modelica has it; one on variables would be checked during
+     the simulation as well. =#
+  for a in equationSystem.initialEqs
+    a isa BDAE.ASSERT_EQUATION || continue
+    for nm in _collectAssertCrefNames!(OrderedSet{String}(), [a])
+      local e = get(stringToSimVarHT, nm, nothing)
+      (e === nothing || isParameter(last(e))) ||
+        OMBackend.unsupported("an assert in an initial equation on a variable", a.condition)
+    end
+    push!(asserts, a)
+  end
   #= Parameters in asserts as literals (they may be eliminated later); tunable
      ones stay references, read from the problem at run time. =#
   asserts = BDAE.ASSERT_EQUATION[BDAE.ASSERT_EQUATION(_inlineParamsInExp(a.condition, stringToSimVarHT; keepTunable = true),
@@ -289,7 +302,8 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
      types that have already migrated. =#
   local simResEqs = SimulationCode.RESIDUAL_EQUATION[SimulationCode.toSim(r) for r in resEqs]
   local simWhenEqs = SimulationCode.WHEN_EQUATION[SimulationCode.toSim(w) for w in whenEqs]
-  local simInitialEqs = SimulationCode.Equation[SimulationCode.toSim(e) for e in equationSystem.initialEqs]
+  local simInitialEqs = SimulationCode.Equation[SimulationCode.toSim(e) for e in equationSystem.initialEqs
+                                                if !(e isa BDAE.ASSERT_EQUATION)]
   local simSharedEqs = if !isempty(auxEquationSystems)
     SimulationCode.Equation[SimulationCode.toSim(e) for e in vcat(resEqs, whenEqs, ifEqs)]
   else
