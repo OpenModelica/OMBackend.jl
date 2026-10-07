@@ -75,10 +75,30 @@ function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{
       local language = occursin("external \"FORTRAN 77\"", libInfo) ? "FORTRAN 77" : "C"
       libInfo = replace(libInfo, "external \"C\"" => "", "external \"FORTRAN 77\"" => "")
       libInfo = replace(libInfo, "'" => "")
+      local annIdx = findfirst("annotation", str)
+      annIdx === nothing || _registerExternalAnnotation!(libInfo, str[first(annIdx):end])
       push!(functions, EXTERNAL_MODELICA_FUNCTION(n, inputs, outputs, locals, language, libInfo))
     end
   end
   return (functions, externalFunctionsUsed)
+end
+
+#= An external function's annotation (Include, IncludeDirectory, Library) by the name of
+   the function it calls, for the code generation of a C function OMRuntimeExternalC does
+   not have (CodeGeneration: externalC.jl). =#
+const EXTERNAL_C_ANNOTATIONS = Dict{Symbol, String}()
+
+function _registerExternalAnnotation!(libInfo::AbstractString, annotation::AbstractString)
+  local call = try
+    Meta.parse(libInfo)
+  catch
+    return nothing
+  end
+  call isa Expr && call.head === :toplevel && length(call.args) == 1 && (call = call.args[1])
+  call isa Expr && call.head === :(=) && (call = call.args[2])
+  (call isa Expr && call.head === :call && call.args[1] isa Symbol) || return nothing
+  EXTERNAL_C_ANNOTATIONS[call.args[1]] = String(annotation)
+  return nothing
 end
 
 """

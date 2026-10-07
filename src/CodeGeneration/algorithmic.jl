@@ -292,6 +292,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
         local funcBody = if func.language == "FORTRAN 77"
           _fortranExternalBody(func)
         else
+          ensureExternalC!(func)
           local extCall = namespaceifyExternalFunction(Meta.parse(func.libInfo))
           #= Allocate ccall-mutable buffers for every output, convert array inputs
              to the right C element type, then dereference Refs in the return. =#
@@ -1564,6 +1565,10 @@ end
   generated closure rather than relying on OMRuntimeExternalC being in scope
   at runtime.
 """
+#= An external function: OMRuntimeExternalC's, or one compiled from its Include (externalC.jl). =#
+_externalFunction(name::Symbol) =
+  isdefined(externalCModule(), name) ? getfield(externalCModule(), name) : getfield(OMRuntimeExternalC, name)
+
 Base.@nospecializeinfer function namespaceifyExternalFunction(@nospecialize(expr::Expr))
   #= Meta.parse may wrap in :toplevel -- unwrap it =#
   if expr.head == :toplevel && length(expr.args) == 1 && expr.args[1] isa Expr
@@ -1572,14 +1577,14 @@ Base.@nospecializeinfer function namespaceifyExternalFunction(@nospecialize(expr
   res = if expr.head == :(=)
     local callExpr = last(expr.args)
     @match Expr(:call, [funcName, y...,z]) = callExpr
-    local resolvedFunc = getfield(OMRuntimeExternalC, funcName)
+    local resolvedFunc = _externalFunction(funcName)
     exp = Expr(:call, resolvedFunc, y..., z)
     expr.args[2] = exp
     expr
   else #Otherwise a side effect call or a call that returns directly.
     @assert expr.head === :call "Invalid call passed to namespaceifyExternalFunction"
     @match Expr(:call, [funcName, y...,z]) = expr
-    local resolvedFunc = getfield(OMRuntimeExternalC, funcName)
+    local resolvedFunc = _externalFunction(funcName)
     Expr(:call, resolvedFunc, y..., z)
   end
   return res
