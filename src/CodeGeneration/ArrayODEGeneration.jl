@@ -96,7 +96,7 @@ struct ArrayModelParameters
   upre::Vector{Float64}
   ureinit::Vector{Float64}     #= the state reinit() sets in a sweep, applied at its end =#
   wnew::Vector{Bool}           #= when-conditions of the current pass, before the bodies run =#
-  dlog::Vector{Tuple{Float64, Vector{Float64}}}   #= discrete values from each event on =#
+  dlog::Vector{Tuple{Float64, Vector{Float64}}}   #= from each event on: discrete values, then relations and event-function values =#
   evv::Vector{Float64}         #= values of the event-generating functions (_evfn), by relation number =#
   hyst::Vector{Float64}        #= [H]: the relations' hysteresis (_rel); 0 (literal relations) while initializing =#
   tend::Vector{Float64}        #= [stop time]: a solution read there gives the final values (_dlogIndex) =#
@@ -465,6 +465,7 @@ mutable struct Gen
   discUnknown::Dict{Int, Int}  #= discrete element (offset) computed by an equation -> unknown id =#
   initAlgs::Vector{AlgClass}   #= initial algorithms (run once at the initialization) =#
   freeParams::Vector{String}   #= parameters with fixed = false: unknowns of the initialization =#
+  initAsserts::Vector{AssertClass}   #= asserts of initial equations: checked once after the initialization =#
 end
 
 struct Ctx
@@ -985,6 +986,7 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
       F.isvariant(br, F.EQUATION_BRANCH) || ns("if-equation branch")
       push!(conds, toIR(g, br.condition, ctx))
     end
+    all(c -> _isStatic(g, c), conds) || return _addDynamicIf!(g, eq, iterNames, idom; initial = initial)
     local groups = [Int[] for _ in eq.branches]
     for j in 1:size(idom, 2)
       local k = findfirst(c -> _evalStatic(g, c, idom, j) == true, conds)
@@ -996,6 +998,13 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
         _addEquation!(g, b, iterNames, idom[:, cols]; initial = initial)
       end
     end
+    return
+  end
+  if initial && F.isvariant(eq, F.EQUATION_ASSERT)
+    #= checked once, after the initialization =#
+    local actx = Ctx(iters, Int[], Base.RefValue(0), true)
+    push!(g.initAsserts, AssertClass(toIR(g, eq.condition, actx), occursin("warning", _str(eq.level)),
+                                     nIter, idom, _str(eq.condition), _str(eq.message), _messageIR(g, eq.message, actx)))
     return
   end
   if initial
@@ -1030,6 +1039,53 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
   local dom = _crossDomain(idom, [collect(1:d) for d in edims])
   size(dom, 2) == 0 && return
   push!(g.classes, EqClass(lhs, rhs, size(dom, 1), dom, ctx.nrel[], _str(eq)))
+end
+
+#= Whether a condition depends on loop indices and parameters only. =#
+_isStatic(g::Gen, x::IR)::Bool =
+  x isa Lit || x isa Slot ||
+  (x isa Ref && !x.der && g.vars[x.name].kind == :param && all(s -> _isStatic(g, s), x.subs)) ||
+  (x isa Op && !(x.op in (:initial, :sample)) && all(a -> _isStatic(g, a), x.args))
+
+#= An if-equation on variable conditions whose branches (with an else) each give the same
+   variables as v = e: one equation per variable, v = if c1 then e1 elseif ... else en (as
+   omc's if-equation to if-expression); its relations generate events. =#
+function _addDynamicIf!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{String}, idom::Matrix{Int};
+                        initial::Bool = false)
+  local iters = Dict(n => k for (k, n) in enumerate(iterNames))
+  local nIter = length(iterNames)
+  local branches = collect(eq.branches)
+  local last = branches[end].condition
+  (last isa F.BOOLEAN_EXPRESSION && last.value) || ns("if-equation on a variable condition without else")
+  local keyed = Vector{Dict{String, Any}}()
+  for br in branches
+    local d = Dict{String, Any}()
+    for b in br.body
+      (F.isvariant(b, F.EQUATION_EQUALITY) || F.isvariant(b, F.EQUATION_ARRAY_EQUALITY)) && b.lhs isa F.CREF_EXPRESSION ||
+        ns("if-equation on a variable condition: branch equation " * first(_str(b), 120))
+      local k = _str(b.lhs)
+      haskey(d, k) && ns("if-equation on a variable condition: two equations for " * k)
+      d[k] = b
+    end
+    push!(keyed, d)
+  end
+  all(d -> Set(keys(d)) == Set(keys(keyed[1])), keyed) ||
+    ns("if-equation on a variable condition: branches give different variables")
+  for k in sort!(collect(keys(keyed[1])))
+    local first = keyed[1][k]
+    local edims = F.isArray(first.ty) ? [F.size(d) for d in F.arrayDims(first.ty)] : Int[]
+    local ctx = Ctx(iters, collect((nIter + 1):(nIter + length(edims))), Base.RefValue(0), initial)
+    local lhs = toIR(g, first.lhs, ctx)
+    local rhs = toIR(g, keyed[end][k].rhs, ctx)
+    for i in (length(branches) - 1):-1:1
+      rhs = Op(:if, IR[toIR(g, branches[i].condition, _with(ctx; elem = Int[])), toIR(g, keyed[i][k].rhs, ctx), rhs])
+    end
+    ctx.nsam[] == 0 || ns("sample outside a when-condition")
+    local dom = _crossDomain(idom, [collect(1:d) for d in edims])
+    size(dom, 2) == 0 && continue
+    push!(initial ? g.initClasses : g.classes,
+          EqClass(lhs, rhs, size(dom, 1), dom, initial ? 0 : ctx.nrel[], string(k, " = if ... (", _str(eq.branches[1].condition), ")")))
+  end
 end
 
 function _addWhen!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{String}, idom::Matrix{Int})
@@ -1983,7 +2039,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
   end
   local g = Gen(Dict{String, VarInfo}(), 0, 0, 0, Dict{String, Any}(), Dict{String, Symbol}(), Set{String}(),
                 EqClass[], EqClass[], AlgClass[], Tuple{String, String, Bool}[], WhenClass[], AssertClass[], 0, 0, 0, 0,
-                -1000, false, Dict{Int, Int}(), AlgClass[], String[])
+                -1000, false, Dict{Int, Int}(), AlgClass[], String[], AssertClass[])
   local stateNamesOrdered = String[]; local algNamesOrdered = String[]
   local u0 = Float64[]; local d0 = Float64[]; local discreteNamesOrdered = String[]; local a0 = Float64[]
   local fixedMask = Bool[]
@@ -2253,6 +2309,15 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     local k = length(assertTexts)
     local inst = :(($(jl(g, a.cond))) || _assertFailed(p, $k, $base + _col, t, $(jl(g, a.msg))))
     push!(assertBody, a.nslots == 0 ? Expr(:let, :(_col = 1), inst) : _loopCode(a.nslots, a.domain, collect(1:size(a.domain, 2)), inst))
+    nAssertInst += size(a.domain, 2)
+  end
+  local initAssertBody = Any[]
+  for a in g.initAsserts
+    push!(assertTexts, (a.condition, a.message, a.warning))
+    local base = nAssertInst
+    local k = length(assertTexts)
+    local inst = :(($(jl(g, a.cond))) || _assertFailed(p, $k, $base + _col, t, $(jl(g, a.msg))))
+    push!(initAssertBody, a.nslots == 0 ? Expr(:let, :(_col = 1), inst) : _loopCode(a.nslots, a.domain, collect(1:size(a.domain, 2)), inst))
     nAssertInst += size(a.domain, 2)
   end
   LAST_STATS[] = (classes = length(g.classes), whens = length(g.whens), asserts = length(g.asserts), instances = length(el.class), batches = length(batches),
@@ -2547,6 +2612,17 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       return u
     end
 
+    #= The asserts of the initial equations, once after the initialization. =#
+    function checkInitialAsserts(u, p, t)
+      local du = similar(u); local a = similar(u, $nAlg)
+      equations!(du, a, u, p, t, nothing, false)
+      $(paramLocals...)
+      @inbounds begin
+        $(initAssertBody...)
+      end
+      return nothing
+    end
+
     #= The initial algorithms, once at the start (asserts checked); the algebraic variables
        they read from the equations at the initial state. =#
     function initialAlgorithms!(u, p, t)
@@ -2575,17 +2651,20 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
       return nothing
     end
 
-    #= The algebraic variables at a state (u, t). =#
-    #= The algebraic variables at a point (u, t) of a solution: relations evaluated there and
-       the discrete values of that time (from the event log), on a copy of the discrete state
-       (after a solve p holds its final values). =#
+    #= The algebraic variables at a point (u, t) of a solution: the discrete, relation and
+       event-function values of that time from the event log (after a solve p holds the final
+       ones), on a copy of the discrete state. =#
     function algebraics(u, p, t, right::Bool = false)
       local a = similar(u, $nAlg)
       local times = first.(p.dlog)
-      local d = isempty(times) ? copy(p.d) : copy(p.dlog[$(_dlogIndex)(times, t, p.tend[1], right)][2])
-      local q = $(paramsType)(p.values, copy(p.rel), d, copy(d), copy(p.wcond), copy(p.sampleActive),
-                              [false], [false], copy(p.upre), copy(p.ureinit), copy(p.wnew), p.dlog, copy(p.evv), copy(p.hyst), copy(p.tend), p.model)
-      equations!(similar(u), a, u, q, t, nothing, true)
+      local entry = isempty(times) ? vcat(p.d, Float64.(p.rel), p.evv) : p.dlog[$(_dlogIndex)(times, t, p.tend[1], right)][2]
+      local nD = length(p.d); local nR = length(p.rel)
+      local d = entry[1:nD]
+      local rel = entry[(nD + 1):(nD + nR)] .!= 0
+      local evv = entry[(nD + nR + 1):end]
+      local q = $(paramsType)(p.values, rel, d, copy(d), copy(p.wcond), copy(p.sampleActive),
+                              [false], [false], copy(p.upre), copy(p.ureinit), copy(p.wnew), p.dlog, evv, copy(p.hyst), copy(p.tend), p.model)
+      equations!(similar(u), a, u, q, t, nothing, false)
       return a
     end
 
@@ -2648,7 +2727,8 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
     end
 
     function _logDiscretes!(p, t)
-      (isempty(p.dlog) || p.dlog[end][2] != p.d) && push!(p.dlog, (t, copy(p.d)))
+      local entry = vcat(p.d, Float64.(p.rel), p.evv)
+      (isempty(p.dlog) || p.dlog[end][2] != entry) && push!(p.dlog, (t, entry))
       return nothing
     end
 
@@ -2750,6 +2830,7 @@ function _generate(fm::F.FlatModel, modelName::String)::Expr
         p.wcond .= p.wnew
       end
       _logDiscretes!(p, tspan[1])
+      $(isempty(initAssertBody) ? nothing : :(checkInitialAsserts(u0, p, tspan[1])))
       local f = ODEFunction(RHS!; jac_prototype = $jacProto, sys = $(ArraySystem)(@__MODULE__))
       #= RightRootFind: the event lands just past the root, where the relation has its new value. =#
       local cbs = Any[]

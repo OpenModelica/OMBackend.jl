@@ -120,6 +120,21 @@ end
     @test a4[1:2] ≈ [6.0, 0.9] atol = 1e-6
   end
 
+  @testset "If-equations on variable conditions, asserts of initial equations" begin
+    local (s, v, sol) = _bothWays("ArrayPath.IfDynamic", ["y", "z", "w"])
+    @test maximum(abs.(s .- v)) < 1e-6
+    @test [sol(t; idxs = :y) for t in (0.1, 0.3, 0.7)] == [2.0, 3.0, 1.0]
+    local name = _arrayPathTranslate("ArrayPath.InitialAssert"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local err = try
+      OMBackend.simulateModel(name; tspan = (0.0, 1.0)); nothing
+    catch e
+      e
+    end
+    @test err isa OMBackend.CodeGeneration.ModelicaAssertionError && err.time == 0.0
+    @test startswith(err.message, "k must be positive, k = -1")
+  end
+
   @testset "An assert's message and time" begin
     local name = _arrayPathTranslate("ArrayPath.AssertMessage"; scalarized = false)
     @test _arrayPathTaken(name)

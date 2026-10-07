@@ -844,6 +844,11 @@ function generateIMTKTargetCode(simCode::SimulationCode.SIM_CODE)
   return (modelName, modelCode)
 end
 
+#= The generated code of a model for writing it out: the array path's module for an array
+   model, else the MTK path's code. =#
+_writtenModel(modelName) = modelName in ARRAY_ODE_MODELS && haskey(COMPILED_MODELS_DEJL, modelName) ?
+  COMPILED_MODELS_DEJL[modelName][1] : getCompiledModel(modelName)
+
 function getCompiledModel(modelName)
   haskey(COMPILED_MODELS_MTK, modelName) ||
     error("Model $(modelName) is not compiled (OMBackend.translate first). $(availableModels())")
@@ -933,7 +938,7 @@ writeModelToFile(modelName::String, filePath::String; keepComments = true, keepB
   Writes a model to file by default the file is formatted and comments are kept.
 """
 function writeModelToFile(modelName::String, filePath::String; keepComments = true, keepBeginBlocks = true)
-  model = getCompiledModel(modelName)
+  model = _writtenModel(modelName)
   try
     mAsStr = modelToString(modelName; MTK = true,
                            keepComments = keepComments,
@@ -985,7 +990,7 @@ end
  Converts a given backend model to a string
 """
 function modelToString(modelName::String; MTK = true, keepComments = true, keepBeginBlocks = true)
-  local model::Expr = getCompiledModel(modelName)
+  local model::Expr = _writtenModel(modelName)
   strippedModel = "$model"
   #= Remove all the redundant blocks from the model =#
   if keepComments == false

@@ -232,4 +232,31 @@ package ArrayPath
     der(x) = 1;
     assert(x < 0.5, "x reached " + String(x, 6, 0, true));
   end AssertMessage;
+  model IfDynamic "an if-equation on a relation of the state: y and z switch branch at x = 0.5"
+    Real x(start = 0, fixed = true);
+    Real y;
+    Real z;
+    Real w(start = 0, fixed = true);
+  equation
+    der(x) = 1;
+    if x > 0.5 then
+      y = 1;
+      z = x;
+    elseif x > 0.2 then
+      z = 2 * x;
+      y = 3;
+    else
+      y = 2;
+      z = -x;
+    end if;
+    der(w) = y + z;
+  end IfDynamic;
+  model InitialAssert "an assert among the initial equations: checked once at the start"
+    parameter Real k = -1;
+    Real x(start = 1, fixed = true);
+  initial equation
+    assert(k > 0, "k must be positive, k = " + String(k));
+  equation
+    der(x) = k * x;
+  end InitialAssert;
 end ArrayPath;
