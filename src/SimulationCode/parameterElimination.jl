@@ -538,10 +538,11 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     push!(newElimEqs, typeof(eq)(newExp, eq.source, eq.attr))
   end
 
-  # substitute into surviving PARAMETER and ARRAY_PARAMETER bindings
+  # substitute into the PARAMETER and ARRAY_PARAMETER bindings: the candidates' too, as a
+  # candidate still referenced (a survivor, step 5) stays, and its binding read eliminated
+  # parameters (Buildings' Airflow.Multizone: zonFlo.rho_default = zonFlo.sta_default.p*1.2/101325)
   local newHT = copy(ht)
   for (name, htEntry) in ht
-    haskey(paramValueMap, name) && continue
     local (idx, sv) = htEntry
     local newKind = @match sv.varKind begin
       PARAMETER(SOME(b)) => begin
