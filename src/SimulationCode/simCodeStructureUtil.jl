@@ -247,7 +247,24 @@ toSimExp(e::DAE.BCONST)::Exp = BCONST(e.bool)
 toSimExp(e::DAE.SCONST)::Exp = SCONST(e.string)
 toSimExp(e::DAE.ENUM_LITERAL)::Exp = ENUM_LITERAL(e.name, Int(e.index))
 toSimExp(e::DAE.CREF)::Exp =
-  e.componentRef isa DAE.WILD ? WILD() : EXP_CREF(SimCref(e.componentRef), e.ty)
+  e.componentRef isa DAE.WILD ? WILD() :
+  _hasVariableIndex(e.componentRef) ? _variableIndexAsub(e) : EXP_CREF(SimCref(e.componentRef), e.ty)
+
+#= A subscript of an iterator or other expression (`dp[i + 1]` in an array
+   comprehension: Buildings' Movers haveMinimumDecrease): SimCref keeps integer
+   subscripts only, the cref became the whole array. As an ASUB of the array. =#
+function _hasVariableIndex(@nospecialize(cref::DAE.ComponentRef))::Bool
+  cref isa DAE.CREF_IDENT || return false
+  local subs = collect(cref.subscriptLst)
+  return !isempty(subs) && all(s -> s isa DAE.INDEX, subs) &&
+         any(s -> !(s.exp isa DAE.ICONST || s.exp isa DAE.ENUM_LITERAL), subs)
+end
+
+function _variableIndexAsub(e::DAE.CREF)::Exp
+  local cref = e.componentRef
+  local base = EXP_CREF(SimCref(Symbol(cref.ident), Int[]), cref.identType)
+  return ASUB(base, Exp[toSimExp(s.exp) for s in cref.subscriptLst])
+end
 toSimExp(e::DAE.BINARY)::Exp =
   BINARY(toSimExp(e.exp1), toOpKind(e.operator), toSimExp(e.exp2))
 toSimExp(e::DAE.UNARY)::Exp = UNARY(toOpKind(e.operator), toSimExp(e.exp))
