@@ -242,6 +242,9 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
      longer in the table, and not bound at module level either. =#
   local eliminated = union(OrderedSet{String}(simCode.eliminatedVariables),
                            OrderedSet{String}(a.eliminatedName for a in simCode.aliasMap))
+  #= at module level the model's functions are CodeGeneration's (Buildings' ShaGFunction:
+     a String parameter bound to a function's SHA) =#
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
   for varName in keys(simCode.stringToSimVarHT)
     SimulationCode.isTunableParameter(varName) && continue
     (idx, simVar) = simCode.stringToSimVarHT[varName]
@@ -283,6 +286,7 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
       OMBackend._fallback(_e, :stringParameterBinding; only = UnsupportedLowering, impact = :result)
       continue
     end
+    rhs isa Expr && !isempty(funcNames) && qualifyModelicaFunctions!(rhs, funcNames)
     push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
     push!(emitted, varName)
   end
