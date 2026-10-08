@@ -506,6 +506,57 @@ function _timeOffsetOverPeriod(@nospecialize(e), simCode)
   end
 end
 
+#= MSL 4.1's Pulse: `time >= (pre(count) + 1)*period + startTime`, a time event (4.0 had
+   `integer((time - startTime)/period) > pre(count)`). The threshold, affine in pre(count),
+   at counts 0, 1 and 2 gives (startTime, period), or nothing. As a generic when the pulse
+   lost the end of most periods: the relation `time < T_start + T_width` jumped with T_start
+   (the 4.0 path refreshes it, _collectIfCondRefresh). =#
+function _affinePreThreshold(@nospecialize(thr::DAE.Exp), simCode::SimulationCode.SIM_CODE)
+  local name = Ref("")
+  local f = Float64[]
+  for k in 0:2
+    local s = _substitutePre(thr, Float64(k), name)
+    s === nothing && return nothing
+    local v = OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(s, simCode), nothing, :pulseThreshold)
+    v === nothing && return nothing
+    push!(f, Float64(v))
+  end
+  isempty(name[]) && return nothing
+  local period = f[2] - f[1]
+  (period > 0 && isapprox(f[3] - f[2], period; rtol = 1e-12)) || return nothing
+  return (f[1] - period, period)
+end
+
+#= `e` with its pre(v) calls, all of one v (its name into `name`), replaced by the literal k;
+   nothing for an expression other than arithmetic of crefs and literals. =#
+function _substitutePre(@nospecialize(e::DAE.Exp), k::Float64, name::Base.RefValue{String})
+  return @match e begin
+    DAE.CALL(Absyn.IDENT("pre"), args, _) => begin
+      local a = listArray(args)
+      (length(a) == 1 && a[1] isa DAE.CREF) || return nothing
+      local nm = string(a[1])
+      (isempty(name[]) || name[] == nm) || return nothing
+      name[] = nm
+      DAE.RCONST(k)
+    end
+    DAE.BINARY(exp1 = a, operator = op, exp2 = b) => begin
+      local sa = _substitutePre(a, k, name)
+      local sb = sa === nothing ? nothing : _substitutePre(b, k, name)
+      sb === nothing ? nothing : DAE.BINARY(sa, op, sb)
+    end
+    DAE.UNARY(operator = op, exp = a) => begin
+      local sa = _substitutePre(a, k, name)
+      sa === nothing ? nothing : DAE.UNARY(op, sa)
+    end
+    DAE.CAST(ty = ty, exp = a) => begin
+      local sa = _substitutePre(a, k, name)
+      sa === nothing ? nothing : DAE.CAST(ty, sa)
+    end
+    DAE.CREF(__) || DAE.RCONST(__) || DAE.ICONST(__) => e
+    _ => nothing
+  end
+end
+
 #= Detect the Modelica Source.Pulse / SignalSource periodic when-condition
    `integer((time - startTime)/period) <relop> pre(counter)`. Returns
    (startTime, period) or nothing. Such a condition is a periodic clock — it
@@ -523,6 +574,7 @@ function _pulsePeriodicSpec(@nospecialize(cond), simCode)
         _ => false
       end
       isGt || return nothing
+      _isTimeCref(e1) && return _affinePreThreshold(e2, simCode)
       _isPreCref(e2) || return nothing
       @match e1 begin
         DAE.CALL(Absyn.IDENT("integer"), arglst, _) => begin
