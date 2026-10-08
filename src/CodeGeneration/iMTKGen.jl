@@ -235,18 +235,20 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
     Core.eval(OMB, OMB.getCompiledModel(cname))
   end
   #= The cached build is initialized at the build's start time: another start time
-     builds again (its remake only moved tspan, and the simulation started from the
-     initial state at 0: Buildings' DerivativeCheck examples from -1). =#
+     builds again, then the same pipeline (its remake only moved tspan, and the
+     simulation started from the initial state at 0: Buildings' DerivativeCheck
+     examples from -1). =#
   local sameStart = haskey(BUILT, cname) && Float64(tspan[1]) == Float64(BUILT[cname][6][1])
   sameStart || parameters === nothing ||
     error("simulating $(modelName) with `parameters` from another start time than its build's")
-  if sameStart
+  if haskey(BUILT, cname)
     try
-      local cached = BUILT[cname]
+      local cached = sameStart ? BUILT[cname] :
+        Base.invokelatest(getfield(getfield(OMB, Symbol(cname)), Symbol(cname, "Model")), tspan)
       local prob   = OMB.Runtime.ModelingToolkit.SciMLBase.remake(cached[1]; tspan = tspan)
       #= Restore the build-time parameter values: a previous run's affects may
          have mutated the shared vector (ifCond toggles persist otherwise). =#
-      if haskey(PRISTINE_P, cname)
+      if sameStart && haskey(PRISTINE_P, cname)
         prob = OMB.Runtime.ModelingToolkit.SciMLBase.remake(prob; p = deepcopy(PRISTINE_P[cname]))
       end
       if parameters !== nothing
