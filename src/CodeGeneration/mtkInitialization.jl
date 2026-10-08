@@ -372,7 +372,8 @@ end
 function _hasPeriodicWhen(simCode)::Bool
   local periodic = function (arm)
     local cond = SimulationCode.toDAEExp(_elsewhenCondition(arm))
-    _containsSampleCall(cond) || _pulsePeriodicSpec(cond, simCode) !== nothing
+    local stmts = arm isa SimulationCode.WHEN_STMTS ? arm.whenStmtLst : arm.whenEquation.whenStmtLst
+    _containsSampleCall(cond) || _pulsePeriodicSpec(cond, simCode, stmts) !== nothing
   end
   return any(simCode.whenEquations) do weq
     local arm = weq

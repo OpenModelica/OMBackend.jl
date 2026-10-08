@@ -508,10 +508,13 @@ end
 
 #= MSL 4.1's Pulse: `time >= (pre(count) + 1)*period + startTime`, a time event (4.0 had
    `integer((time - startTime)/period) > pre(count)`). The threshold, affine in pre(count),
-   at counts 0, 1 and 2 gives (startTime, period), or nothing. As a generic when the pulse
-   lost the end of most periods: the relation `time < T_start + T_width` jumped with T_start
-   (the 4.0 path refreshes it, _collectIfCondRefresh). =#
-function _affinePreThreshold(@nospecialize(thr::DAE.Exp), simCode::SimulationCode.SIM_CODE)
+   at counts 0, 1 and 2 gives (startTime, period), or nothing; the when must count it up by
+   one (`count = pre(count) + 1`: `t = pre(t) + dt` under `time >= pre(t)` is no such clock).
+   As a generic when the pulse lost the end of most periods: the relation
+   `time < T_start + T_width` jumped with T_start (the 4.0 path refreshes it,
+   _collectIfCondRefresh). =#
+function _affinePreThreshold(@nospecialize(thr::DAE.Exp), simCode::SimulationCode.SIM_CODE,
+                             stmts::Union{AbstractVector, List})
   local name = Ref("")
   local f = Float64[]
   for k in 0:2
@@ -521,10 +524,31 @@ function _affinePreThreshold(@nospecialize(thr::DAE.Exp), simCode::SimulationCod
     v === nothing && return nothing
     push!(f, Float64(v))
   end
-  isempty(name[]) && return nothing
+  (isempty(name[]) || !_countsUpByOne(stmts, name[], simCode)) && return nothing
   local period = f[2] - f[1]
   (period > 0 && isapprox(f[3] - f[2], period; rtol = 1e-12)) || return nothing
   return (f[1] - period, period)
+end
+
+#= Whether the statements assign `name = pre(name) + 1`. =#
+function _countsUpByOne(stmts::Union{AbstractVector, List}, name::String, simCode::SimulationCode.SIM_CODE)::Bool
+  for st in stmts
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+    local lhs = st.left isa DAE.Exp ? st.left : SimulationCode.toDAEExp(st.left)
+    string(lhs) == name || continue
+    local rhs = st.right isa DAE.Exp ? st.right : SimulationCode.toDAEExp(st.right)
+    local values = Float64[]
+    for k in (0.0, 5.0)
+      local own = Ref("")
+      local s = _substitutePre(rhs, k, own)
+      (s === nothing || own[] != name) && return false
+      local v = OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(s, simCode), nothing, :pulseCount)
+      v === nothing && return false
+      push!(values, Float64(v))
+    end
+    return values == [1.0, 6.0]
+  end
+  return false
 end
 
 #= `e` with its pre(v) calls, all of one v (its name into `name`), replaced by the literal k;
@@ -565,7 +589,8 @@ end
    a piecewise-constant 0/1 the rootfinder cannot reliably catch, so the
    pulse counter / T_start freeze (Blocks.Sources.Pulse and machines driven
    by it). =#
-function _pulsePeriodicSpec(@nospecialize(cond), simCode)
+#= `stmts`: the when's statements (SimCode's or BDAE's). =#
+function _pulsePeriodicSpec(@nospecialize(cond), simCode, stmts::Union{AbstractVector, List})
   @match cond begin
     DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
       local isGt = @match op begin
@@ -574,7 +599,7 @@ function _pulsePeriodicSpec(@nospecialize(cond), simCode)
         _ => false
       end
       isGt || return nothing
-      _isTimeCref(e1) && return _affinePreThreshold(e2, simCode)
+      _isTimeCref(e1) && return _affinePreThreshold(e2, simCode, stmts)
       _isPreCref(e2) || return nothing
       @match e1 begin
         DAE.CALL(Absyn.IDENT("integer"), arglst, _) => begin
@@ -898,7 +923,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
     end
     #= Source.Pulse periodic clock `integer((time-startTime)/period) > pre(count)`:
        fire AT the period boundaries via PeriodicCallback. =#
-    local _pulse = _pulsePeriodicSpec(wEqCondDAE, simCode)
+    local _pulse = _pulsePeriodicSpec(wEqCondDAE, simCode, wEq.whenStmtLst)
     if _pulse !== nothing && _pulse[2] > 0.0
       return _emitPulsePeriodicWhen(eq, simCode, callbacks, _pulse[1], _pulse[2])
     end
