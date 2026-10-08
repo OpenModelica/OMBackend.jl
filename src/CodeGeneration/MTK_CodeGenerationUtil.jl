@@ -1706,7 +1706,10 @@ function handleArrayExp(exp::DAE.ARRAY, simCode)
   if canEval
     #= All elements are constants, return pre-computed array =#
     if dimSize >= 2
-      arr = Matrix(transpose(stack(arrJL)))
+      #= rows of rows: stacked along the first dimension (a three-dimensional literal's
+         rows are matrices, and transpose has no method for the stack: Buildings'
+         Borefields TemporalSuperposition) =#
+      arr = ndims(first(arrJL)) >= 2 ? stack(arrJL; dims = 1) : Matrix(transpose(stack(arrJL)))
       quote
         $(arr)
       end
@@ -1748,7 +1751,9 @@ function handleArrayExp(exp::DAE.ARRAY, simCode)
       else
         #= Fallback: rows are not plain arrays =#
         quote
-          Matrix(transpose(stack([$(elemExprs...)])))
+          let rows = [$(elemExprs...)]
+            ndims(first(rows)) >= 2 ? stack(rows; dims = 1) : Matrix(transpose(stack(rows)))
+          end
         end
       end
     else
