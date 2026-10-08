@@ -631,6 +631,11 @@ function flattenRecordCallSites(simCode)
      folded medium_sat_Tsat away, which the when still read). =#
   @assign simCode.whenEquations = WHEN_EQUATION[WHEN_EQUATION(w.size, _expandRecordArgsInWhen(w.whenEquation), w.source, w.attr)
                                                 for w in simCode.whenEquations]
+  #= And the if-equations' branches: a branch whose parameter condition holds
+     becomes top-level residuals (pruneConstantConditions) that passed the record
+     whole (Buildings' Movers: pressure(per = pCur2, ...) under curve == 2). =#
+  @assign simCode.ifEquations = IF_EQUATION[IF_EQUATION(BRANCH[_expandRecordArgsInBranch(b) for b in ifEq.branches])
+                                            for ifEq in simCode.ifEquations]
   #= And the initial algorithms (the same when's initial part: the early pass
      binds the names its statements read). =#
   @assign simCode.initialAlgorithms = INITIAL_ALGORITHM[
@@ -682,6 +687,17 @@ function flattenRecordCallSites(simCode)
     end
   end
   return simCode
+end
+
+function _expandRecordArgsInBranch(b::BRANCH)::BRANCH
+  local newResiduals = RESIDUAL_EQUATION[]
+  for eq in b.residualEquations
+    local d = toDAEExp(eq.exp)
+    local n = expandRecordArgsInExp(d)
+    push!(newResiduals, n === d ? eq : typeof(eq)(n, eq.source, eq.attr))
+  end
+  return BRANCH(b.identifier == ELSE_BRANCH ? b.condition : _expandRecordArgsInSimExp(b.condition), newResiduals,
+                b.identifier, b.targets, b.isSingular, b.matchOrder, b.equationGraph, b.sccs, b.stringToSimVarHT)
 end
 
 function _expandRecordArgsInSimExp(e::Exp)::Exp
@@ -1451,6 +1467,17 @@ Base.@nospecializeinfer function tryEvalScalar(@nospecialize(exp::DAE.Exp), simC
       end
     end
     DAE.CAST(_, e1) => tryEvalScalar(e1, simCode, seen)
+    #= A Boolean or the branch of an if: a parameter bound to a comparison
+       (Buildings' Movers: haveVMax = abs(per.pressure.dp[nOri]) < eps) or to an
+       if-expression on one (curve = if haveVMax and haveDPMax then 1 else 2) =#
+    DAE.RELATION(__) => _tryEvalCondition(exp, simCode, seen)
+    DAE.LBINARY(__) => _tryEvalCondition(exp, simCode, seen)
+    DAE.LUNARY(__) => _tryEvalCondition(exp, simCode, seen)
+    DAE.IFEXP(c, t, e) => begin
+      local cVal = _tryEvalCondition(c, simCode, seen)
+      cVal === true ? tryEvalScalar(t, simCode, seen) :
+      cVal === false ? tryEvalScalar(e, simCode, seen) : nothing
+    end
     _ => begin
       local numeric = _tryEvalNumeric(exp, simCode, seen)
       numeric === nothing ? nothing : numeric
@@ -1522,6 +1549,14 @@ function _tryEvalNumeric(exp::DAE.Exp, simCode::SIM_CODE, seen::OrderedSet{Strin
       local v1 = _tryEvalNumeric(e1, simCode, seen)
       local v2 = _tryEvalNumeric(e2, simCode, seen)
       (v1 !== nothing && v2 !== nothing && v2 != 0.0) ? v1 / v2 : nothing
+    end
+    #= Buildings' Movers: kRes = dpMax/V_flow_max*delta^2/10, read by the pressure
+       curve's array parameters (computed at the module's top, where a scalar
+       parameter is no name) =#
+    DAE.BINARY(e1, DAE.POW(__), e2) => begin
+      local v1 = _tryEvalNumeric(e1, simCode, seen)
+      local v2 = _tryEvalNumeric(e2, simCode, seen)
+      (v1 !== nothing && v2 !== nothing && (v1 > 0.0 || isinteger(v2) && (v1 != 0.0 || v2 >= 0.0))) ? v1 ^ v2 : nothing
     end
     DAE.CAST(_, e1) => _tryEvalNumeric(e1, simCode, seen)
     _ => nothing
