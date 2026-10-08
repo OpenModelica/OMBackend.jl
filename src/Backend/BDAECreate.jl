@@ -252,6 +252,9 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
     equations = _discEqs
   end
   equations = _hoistIfEquationAsserts(equations)
+  #= An initial if-equation's too (a call for its effects in a branch: Buildings' Movers
+     print the minimum-decrease warning under `not haveMinimumDecrease`). =#
+  initialEquations = _hoistIfEquationAsserts(initialEquations)
   #= TODO Extract the simple equations =#
   local simpleEquations = BDAE.Equation[]
   return BDAE.EQSYSTEM(name, variables, equations, simpleEquations, initialEquations)
@@ -266,10 +269,15 @@ function _hoistIfEquationAsserts(equations::Vector)::Vector
   local out = BDAE.Equation[]
   local asserts = BDAE.Equation[]
   for eq in equations
-    push!(out, _hasBranchAssert(eq) ? _hoistBranchAsserts!(asserts, eq, nothing) : eq)
+    local h = _hasBranchAssert(eq) ? _hoistBranchAsserts!(asserts, eq, nothing) : eq
+    #= an if-equation of asserts only: nothing is left of it =#
+    _isEmptyIfEquation(h) || push!(out, h)
   end
   return vcat(out, asserts)
 end
+
+_isEmptyIfEquation(@nospecialize(eq))::Bool =
+  eq isa BDAE.IF_EQUATION && all(listEmpty, eq.eqnstrue) && listEmpty(eq.eqnsfalse)
 
 _hasBranchAssert(@nospecialize(eq))::Bool =
   eq isa BDAE.IF_EQUATION &&
@@ -300,13 +308,17 @@ function _takeBranchAsserts!(asserts::Vector, body, @nospecialize(guard))::Vecto
   local kept = BDAE.Equation[]
   for eq in body
     if eq isa BDAE.ASSERT_EQUATION
-      #= A call for its effects (an assert of its own: _assertConditionExpr) does
-         not reach here: the conversion refuses one in a branch. =#
-      eq.condition isa DAE.CALL && eq.condition.attr.ty isa DAE.T_NORETCALL &&
-        OMBackend.unsupported("a call for its effects in a branch of an if-equation", eq.condition)
+      #= A call for its effects (an assert of its own: _assertConditionExpr) is made
+         under the branch's condition: `if guard then call else true` (a guarded
+         effect call: _isGuardedEffectCall). It was refused. =#
+      if eq.condition isa DAE.CALL && eq.condition.attr.ty isa DAE.T_NORETCALL
+        push!(asserts, BDAE.ASSERT_EQUATION(DAE.IFEXP(guard, eq.condition, DAE.BCONST(true)), eq.message, eq.level, eq.source))
+        continue
+      end
       push!(asserts, BDAE.ASSERT_EQUATION(_orCondition(_notCondition(guard), eq.condition), eq.message, eq.level, eq.source))
     elseif eq isa BDAE.IF_EQUATION
-      push!(kept, _hoistBranchAsserts!(asserts, eq, guard))
+      local h = _hoistBranchAsserts!(asserts, eq, guard)
+      _isEmptyIfEquation(h) || push!(kept, h)
     else
       push!(kept, eq)
     end
@@ -609,6 +621,12 @@ function splitEquationsAndVars(elementLst::List{DAE.Element})::Tuple{List, List,
         DAE.NORETCALL(DAE.CALL(Absyn.IDENT("branch"), args)) => begin
           @match arg1 <| arg2 <| nil = args
           equationLst = BDAE.BRANCH(arg1, arg2) <| equationLst
+        end
+        #= A call of a Modelica function for its effects in an if-equation's branch: an
+           assert of its own, as equationToBackendEquation makes one (it was an
+           "Unsupported equation"). =#
+        DAE.NORETCALL(call, source) where (call isa DAE.CALL && !call.attr.builtin) => begin
+          equationLst = BDAE.ASSERT_EQUATION(call, DAE.SCONST(string(call.path)), DAE.ASSERTIONLEVEL_ERROR, source) <| equationLst
         end
         DAE.RECONFIGURE_EQUATION(__) => begin
           equationLst = lowerReconfigureEquation(elem) <| equationLst

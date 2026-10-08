@@ -1183,6 +1183,13 @@ end
 #= An assert's condition; a call equation for its effects (BDAECreate) runs and holds. =#
 function _assertConditionExpr(@nospecialize(cond), obsAcc::Dict{Symbol,Symbol}, simCode)
   _isEffectCall(cond) && return :($(_effectCallExpr(cond, obsAcc, simCode)); true)
+  #= one in an if-equation's branch, `if guard then call else true` (BDAECreate): made
+     when the guard holds =#
+  if cond isa DAE.IFEXP && _isEffectCall(cond.expThen)
+    return :((if $(_daeBoolMem(cond.expCond, obsAcc, simCode))
+                $(_effectCallExpr(cond.expThen, obsAcc, simCode))
+              end); true)
+  end
   return _daeBoolMem(cond, obsAcc, simCode)
 end
 

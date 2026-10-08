@@ -201,6 +201,13 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   local initialAssertAlgorithms = INITIAL_ALGORITHM[]
   for a in equationSystem.initialEqs
     a isa BDAE.ASSERT_EQUATION || continue
+    #= A call for its effects in an initial if-equation's branch, `if guard then call
+       else true` (BDAECreate): made once, when the guard holds (Buildings' Movers print
+       the minimum-decrease warning). =#
+    if a.condition isa DAE.IFEXP && a.condition.expThen isa DAE.CALL && a.condition.expThen.attr.ty isa DAE.T_NORETCALL
+      push!(initialAssertAlgorithms, INITIAL_ALGORITHM([BDAE.NORETCALL(a.condition, a.source)]))
+      continue
+    end
     local onVariables = any(_collectAssertCrefNames!(OrderedSet{String}(), [a])) do nm
       local e = get(stringToSimVarHT, nm, nothing)
       e !== nothing && !isParameter(last(e))
