@@ -586,6 +586,57 @@ function _aExec!(stmts, env::Dict{String, Any}, ctx::_AEvalContext)
   return nothing
 end
 
+#= The initial algorithms interpreted at the start time 0 (the build's, as for the sample()
+   ticks), with the values of the parameters that have one: what they assign. CDL's samplers and
+   pulses set their sample start so, a free parameter: `t0 := round(integer(time/period)*period +
+   mod(shift, period), n = 6)`. An algorithm the interpretation does not follow (a while, an
+   assert that does not hold, ...) assigns nothing. Memoized for the model being generated (by
+   identity and name: no model is kept alive). =#
+const _INIT_ALG_ENV = Ref{Any}(nothing)
+function _initialAlgorithmEnvironment(simCode::SIM_CODE)::Tuple{Dict{String, Any}, _AEvalContext}
+  local cached = _INIT_ALG_ENV[]
+  cached !== nothing && cached[1] == (objectid(simCode), simCode.name) && return (cached[2], cached[3])
+  local fs = Dict{String, MODELICA_FUNCTION}()
+  for f in simCode.functions
+    f isa MODELICA_FUNCTION && (fs[OMBackend.canonicalName(f.name)] = f)
+  end
+  local ctx = _AEvalContext(fs, Dict{Any, Any}(), 0, 0)
+  local env = Dict{String, Any}("time" => 0.0)
+  for (k, (_, sv)) in simCode.stringToSimVarHT
+    (sv.varKind isa PARAMETER && sv.varKind.bindExp isa SOME) || continue
+    local v = OMBackend._tryOr(() -> tryEvalNumeric(toDAEExp(sv.varKind.bindExp.data), simCode), nothing,
+                               :initialAlgorithmParameter)
+    v === nothing || (env[k] = v)
+  end
+  for ia in simCode.initialAlgorithms
+    local trial = copy(env)
+    ctx.steps = 0
+    ctx.depth = 0
+    try
+      _aExec!(ia.daeStatements, trial, ctx)
+      env = trial
+    catch err
+      err isa _ABail || OMBackend._fallback(err, :initialAlgorithmInterpretation; expect = MethodError)
+    end
+  end
+  _INIT_ALG_ENV[] = ((objectid(simCode), simCode.name), env, ctx)
+  return (env, ctx)
+end
+
+#= The value of `e` after the initial algorithms (_initialAlgorithmEnvironment), or nothing. =#
+function valueAfterInitialAlgorithms(e::DAE.Exp, simCode::SIM_CODE)::Union{Float64, Nothing}
+  isempty(simCode.initialAlgorithms) && return nothing
+  local (env, ctx) = _initialAlgorithmEnvironment(simCode)
+  ctx.steps = 0
+  local v = try
+    _aEval(e, env, ctx)
+  catch err
+    err isa _ABail || OMBackend._fallback(err, :initialAlgorithmValue; expect = MethodError)
+    nothing
+  end
+  return (v isa Real && !(v isa Bool) && isfinite(v)) ? Float64(v) : nothing
+end
+
 #= The literal of a constant output of declared type ty, or nothing. =#
 function _aLiteral(v, @nospecialize(ty))::Union{Exp, Nothing}
   if ty isa DAE.T_REAL

@@ -1162,6 +1162,8 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
        as 0 (generated code cannot read the parameters at module level), a
        negative one as 0 too (sample(-0.15, 0.25) ticked at 0.25, not 0.1). =#
     local _startVal = SimulationCode.tryEvalNumeric(start, simCode)
+    #= one an initial algorithm assigns (CDL's samplers and pulses: t0) =#
+    _startVal === nothing && (_startVal = SimulationCode.valueAfterInitialAlgorithms(start, simCode))
     _startVal === nothing && unsupported("a sample() start not known at the build", start)
     local _firstTick = Float64(_startVal)
     if _firstTick < 0
