@@ -702,6 +702,9 @@ function _callIR(g::Gen, e::F.CALL_EXPRESSION, ctx::Ctx)::IR
   F.isvariant(call, F.TYPED_CALL) || ns("call " * _str(e))
   local fname = F.AbsynUtil.pathString(F.name(call.fn))
   local args = collect(call.arguments)
+  #= delay() reads its argument's history: the ModelingToolkit path's (delays.jl). It was
+     the function bodies' builtin, delay(x, d) = x (OM.jl's DelayChain: no delay). =#
+  fname in ("delay", "OpenModelica.Internal.delay2", "OpenModelica.Internal.delay3") && ns("delay()")
   if fname == "der"
     args[1] isa F.CREF_EXPRESSION || ns("der of an expression: " * _str(e))
     return _crefIR(g, args[1], ctx, true)
@@ -2227,6 +2230,14 @@ end
    generation: SimulationCode.generateSimCodeFunctions, AlgorithmicCodeGeneration.generateFunctions),
    each a module constant named as the frontend's function list names it (dots as _), so the
    equations and the functions' calls of each other find it. Returns (definitions, outputs). =#
+#= Whether generated code raises an error (a function's assert: Base.error). =#
+function _containsErrorCall(@nospecialize(x))::Bool
+  x isa AbstractVector && return any(_containsErrorCall, x)
+  x isa Expr || return false
+  x.head == :call && (x.args[1] == :error || x.args[1] == :(Base.error)) && return true
+  return any(_containsErrorCall, x.args)
+end
+
 function _functionDefinitions(functions)
   local defs = Any[]; local outs = Dict{String, Int}()
   (functions === nothing || isempty(functions)) && return (defs, outs)
@@ -2760,6 +2771,10 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
     end
 
     const ASSERTS = $(assertTexts)
+    #= A model function with an assert: the equations are evaluated after each step as for
+       the model's asserts (a call only an algebraic variable reads was never made: OM.jl's
+       AssertTests.ConstantCall, positiveTwice(-1.0)). =#
+    const FUNCTION_ASSERTS = $(_containsErrorCall(functionDefs))
     const WARNED = Set{Any}()
 
     #= PROBE: _violated! looks for a violation without reporting it =#
@@ -3117,7 +3132,7 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
                                                              initialize = _startHysteresis!),
                                     DiscreteCallback(relationsChanged, affect!; save_positions = (false, false)))
       isempty(SAMPLE_START) || push!(cbs, DiffEqCallbacks.PresetTimeCallback(sampleTimes(tspan), affectSample!))
-      if !isempty(ASSERTS)
+      if !isempty(ASSERTS) || FUNCTION_ASSERTS
         empty!(WARNED)
         push!(cbs, DiscreteCallback(_assertStep, integrator -> nothing;
                                     initialize = (c, u, t, integrator) -> checkAsserts(u, integrator.p, t),
