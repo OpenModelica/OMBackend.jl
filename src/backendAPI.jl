@@ -905,6 +905,9 @@ function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel; functionL
   end
   #= evaluated again at the next simulate: a module of this name may be another path's =#
   COMPILED_MODELS_DEJL[modelName] = (modelCode, true, hash(modelCode))
+  #= and the ModelingToolkit path's build goes: its module is replaced, and its code (the same
+     for a model without arrays) would reuse the build at its next translate =#
+  IMTKGen.forgetBuild(modelName)
   push!(ARRAY_ODE_MODELS, modelName)
   return (modelName, modelCode)
 end
