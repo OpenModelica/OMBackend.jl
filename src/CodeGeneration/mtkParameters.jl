@@ -35,6 +35,40 @@
 
 #= MTK code generation: parameter equations, arrays, assignments and data structures. =#
 
+#= A parameter binding in Julia (createParameterEquationsMTK, createParameterAssignmentsMTK).
+   An element of the result of a call with literal arguments, `p[i, j] = f(...)[i, j]` (an
+   array parameter scalarized), reads one evaluation of the call: `_parameterCalls`, a local
+   of the model function, by the call's code. Every element called it (Buildings'
+   TemperatureResponseMatrix: 152 calls of an impure function that computes a g-function
+   and writes a file, 15 s each); a binding is evaluated once. =#
+#= `bindExp`: a SimCode binding, or a DAE start value (a parameter without a binding). =#
+function _parameterBindingExpr(bindExp::Union{SimulationCode.Exp, DAE.Exp}, simCode::SimulationCode.SIM_CODE)
+  local e = expToJuliaExpMTK(bindExp, simCode)
+  (bindExp isa SimulationCode.Exp && _isLiteralCallElement(bindExp)) || return e
+  #= the indexing, inside the quote blocks of the translation =#
+  local ref = e
+  while ref isa Expr && ref.head === :block
+    local stmts = filter(a -> !(a isa LineNumberNode), ref.args)
+    length(stmts) == 1 || return e
+    ref = only(stmts)
+  end
+  (ref isa Expr && ref.head === :ref && ref.args[1] isa Expr) || return e
+  local callExpr = ref.args[1]
+  ref.args[1] = :(get!(() -> $callExpr, _parameterCalls, $(hash(string(callExpr)))))
+  return e
+end
+
+#= f(...)[i, ...] with literal arguments and subscripts. =#
+_isLiteralCallElement(e::SimulationCode.Exp)::Bool =
+  e isa SimulationCode.ASUB && e.exp isa SimulationCode.CALL && all(_isLiteralSimExp, e.exp.args) &&
+  all(s -> s isa SimulationCode.ICONST, e.subs)
+
+_isLiteralSimExp(e::SimulationCode.Exp)::Bool =
+  e isa Union{SimulationCode.ICONST, SimulationCode.RCONST, SimulationCode.SCONST, SimulationCode.BCONST,
+              SimulationCode.ENUM_LITERAL} ||
+  (e isa SimulationCode.UNARY && _isLiteralSimExp(e.exp)) ||
+  (e isa SimulationCode.ARRAY_EXP && all(_isLiteralSimExp, e.elements))
+
 """
   `createParameterEquationsMTK(parameters::Vector, type, simCode::SimulationCode.SIM_CODE)`
     The Type specifies what kind of parameter equation a call to this function should yield.
@@ -85,10 +119,10 @@ function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode
     expr = if isIntOrBool(bindExp)
       quote
         $(LineNumberNode(@__LINE__, "$param eq"))
-        Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap(float($((expToJuliaExpMTK(bindExp, simCode)))))
+        Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap(float($(_parameterBindingExpr(bindExp, simCode))))
       end
     else
-        :(Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap($(expToJuliaExpMTK(bindExp, simCode))))
+        :(Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap($(_parameterBindingExpr(bindExp, simCode))))
     end
       # expr = quote
       #   $(LineNumberNode(@__LINE__, "$param eq"))
@@ -179,12 +213,12 @@ function createParameterAssignmentsMTK(parameters::Vector,
     expr =  if isIntOrBool(bindExp)
       quote
         $(LineNumberNode(@__LINE__, "$param eq"))
-        $(Symbol(simVar.name)) = float($((expToJuliaExpMTK(bindExp, simCode))))
+        $(Symbol(simVar.name)) = float($(_parameterBindingExpr(bindExp, simCode)))
       end
     else
       quote
         $(LineNumberNode(@__LINE__, "$param eq"))
-        $(Symbol(simVar.name)) = $(expToJuliaExpMTK(bindExp, simCode))
+        $(Symbol(simVar.name)) = $(_parameterBindingExpr(bindExp, simCode))
       end
     end
     push!(parameterEquations, expr)
