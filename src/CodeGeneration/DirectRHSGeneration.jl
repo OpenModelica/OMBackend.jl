@@ -281,8 +281,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
      its own arguments. Without them the solver finite-differenced the states, by their
      magnitude, past a flow function's regularization (Buildings' Airflow.Multizone
      powerLaw05 around dp = 0 at pressures of 1e5 Pa: 47,225 steps for 36). =#
-  local (jacFunc, jacProto) = withNumericPartials(() -> _buildSparseJacobian(rhs_list, states, params, iv,
-                                                                             u0, p_vec, tspan[1]))
+  local (symJac, jacProto) = withNumericPartials(() -> _buildSparseJacobian(rhs_list, states, params, iv,
+                                                                            u0, p_vec, tspan[1]))
+  local jacFunc = symJac === nothing ? nothing : _finiteJacobian(symJac, rhsFunc)
   local tgradFunc = withNumericPartials(() -> _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc,
                                                                    u0, p_vec, tspan[1]))
 
@@ -1593,6 +1594,33 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
     OMBackend._fallback(e, :_buildSparseJacobian)
     @debug "DirectRHS: symbolic Jacobian generation failed; solver will finite-difference" exception=(e, catch_backtrace())
     return (nothing, nothing)
+  end
+end
+
+#= The symbolic Jacobian, and where it is not finite at a point (its formula overflows:
+   d/dv 2/(1 + exp(-k*v)) is Inf/Inf at k*v = -702, MSL AIMC_Conveyor's smooth sign; Buildings'
+   Carnot COP at the start) those columns by central differences of the right-hand side: the
+   step was NaN, the solver Unstable. With the numeric partials the symbolic Jacobian is built
+   for more models; before, a call without a derivative rule sent the whole Jacobian to the
+   solver's finite differences, which hid it. =#
+function _finiteJacobian(symJac::Function, rhsFunc::Function)::Function
+  return (J, u, p, t) -> begin
+    symJac(J, u, p, t)
+    local nz = Symbolics.SparseArrays.nonzeros(J)
+    all(isfinite, nz) && return nothing
+    local rows = Symbolics.SparseArrays.rowvals(J)
+    local up = similar(u); local duPlus = similar(u); local duMinus = similar(u)
+    for j in axes(J, 2)
+      local r = Symbolics.SparseArrays.nzrange(J, j)
+      any(k -> !isfinite(nz[k]), r) || continue
+      local h = cbrt(eps(Float64)) * max(1.0, abs(u[j]))
+      copyto!(up, u); up[j] += h; rhsFunc(duPlus, up, p, t)
+      copyto!(up, u); up[j] -= h; rhsFunc(duMinus, up, p, t)
+      for k in r
+        nz[k] = (duPlus[rows[k]] - duMinus[rows[k]]) / (2h)
+      end
+    end
+    return nothing
   end
 end
 
