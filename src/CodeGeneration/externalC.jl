@@ -77,6 +77,9 @@ function _cScalarType(@nospecialize(ty))
   ty isa DAE.T_REAL && return :Cdouble
   (ty isa DAE.T_INTEGER || ty isa DAE.T_BOOL || ty isa DAE.T_ENUMERATION) && return :Cint
   ty isa DAE.T_STRING && return :Cstring
+  #= an external object (its constructor's result, the other functions' argument): the
+     C pointer (Buildings' weeklyScheduleInit, initArray, fileWriterInit) =#
+  ty isa DAE.T_COMPLEX && ty.complexClassType isa DAE.ClassInf.EXTERNAL_OBJ && return :(Ptr{Cvoid})
   return nothing
 end
 
