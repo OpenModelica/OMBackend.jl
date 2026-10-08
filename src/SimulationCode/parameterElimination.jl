@@ -773,7 +773,7 @@ function _collectIfexpConditionCrefs!(out::OrderedSet{String}, exp::Exp)
     _collectIfexpConditionCrefs!(out, exp.exp2)
   elseif exp isa UNARY || exp isa LUNARY
     _collectIfexpConditionCrefs!(out, exp.exp)
-  elseif exp isa CALL
+  elseif exp isa CALL || exp isa PARTEVALFUNCTION
     for a in exp.args
       _collectIfexpConditionCrefs!(out, a)
     end

@@ -303,6 +303,9 @@ toSimExp(e::DAE.TUPLE)::Exp =
   TUPLE(Exp[toSimExp(x) for x in e.PR])
 toSimExp(e::DAE.REDUCTION)::Exp =
   REDUCTION(e.reductionInfo, toSimExp(e.expr), e.iterators)
+#= The bound arguments come boxed (the frontend boxes a function pointer's arguments): their values. =#
+toSimExp(e::DAE.PARTEVALFUNCTION)::Exp =
+  PARTEVALFUNCTION(e.path, Exp[toSimExp(x isa DAE.BOX ? x.exp : x) for x in e.expList], e.ty, e.origType)
 
 """
     toDAEExp(e::Exp) -> DAE.Exp
@@ -352,6 +355,8 @@ toDAEExp(e::CALL)::DAE.Exp =
   DAE.CALL(e.path,
            MetaModelica.list((toDAEExp(x) for x in e.args)...),
            e.attr)
+toDAEExp(e::PARTEVALFUNCTION)::DAE.Exp =
+  DAE.PARTEVALFUNCTION(e.path, MetaModelica.list((toDAEExp(x) for x in e.args)...), e.ty, e.origType)
 toDAEExp(e::RECORD)::DAE.Exp =
   DAE.RECORD(e.path,
              MetaModelica.list((toDAEExp(x) for x in e.exps)...),

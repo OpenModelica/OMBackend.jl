@@ -1203,6 +1203,14 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           $(generateCastExpressionMTK(ty, exp, simCode, varPrefix))
         end
       end
+      #= a function argument with bound arguments: a closure calling the function's wrapper
+         (symbolic arguments make a term, numeric ones a value) =#
+      DAE.PARTEVALFUNCTION(path, expList, ty, origType) => begin
+        local callee = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(Symbol(OMBackend.canonicalName(string(path)))))
+        AlgorithmicCodeGeneration._partialApplicationExpr(callee,
+          Any[expToJuliaExpMTK(e, simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol) for e in expList],
+          ty, origType)
+      end
       #= For enumeration we just take the value of the index. =#
       DAE.ENUM_LITERAL(path, index) => begin
         quote

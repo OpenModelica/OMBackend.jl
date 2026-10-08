@@ -1445,6 +1445,14 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         append!(expr.args, _algCallArgs(expLst; builtin = attr.builtin))
         expr
       end
+      #= a function argument with bound arguments: a closure, calling the function as a call
+         in a function body does =#
+      DAE.PARTEVALFUNCTION(path, expList, ty, origType) => begin
+        local fnSym = Symbol(CodeGeneration.OMBackend.canonicalName(string(path)))
+        local closure = _partialApplicationExpr(:(Base.invokelatest), Any[expToJuliaExpAlg(e) for e in expList], ty, origType)
+        insert!(closure.args[2].args, 2, fnSym)
+        closure
+      end
       DAE.CAST(ty, exp)  => begin
         #= Type cast expression =#
         local innerExpr = expToJuliaExpAlg(exp)
@@ -1598,6 +1606,39 @@ end
 #= An external function: OMRuntimeExternalC's, or one compiled from its Include (externalC.jl). =#
 _externalFunction(name::Symbol) =
   isdefined(externalCModule(), name) ? getfield(externalCModule(), name) : getfield(OMRuntimeExternalC, name)
+
+#= `function f(b = e, ...)`, an argument of a function that takes a function (Buildings'
+   Borefields: quadratureLobatto of an integrand): a closure over the bound arguments, its
+   own arguments the inputs the partial application still has (`ty`; `origType` has all of
+   them, the bound arguments come in their order: OMFrontend's DAE conversion), calling
+   `callee` with every input in place. =#
+function _partialApplicationExpr(callee::Union{Symbol, Expr}, boundArgs::Vector{Any}, @nospecialize(partialType::DAE.Type),
+                                 @nospecialize(fullType::DAE.Type))::Expr
+  local ty = _functionType(partialType); local origType = _functionType(fullType)
+  (ty isa DAE.T_FUNCTION && origType isa DAE.T_FUNCTION) ||
+    CodeGeneration.unsupported("a partial application of this type", fullType)
+  local free = Set{String}(a.name for a in ty.funcArg)
+  local params = Symbol[]; local callArgs = Any[]; local k = 0
+  for a in origType.funcArg
+    #= a record input is flattened field by field in the callee (flattenRecordInput) =#
+    local aty = a.ty isa DAE.T_METABOXED ? a.ty.ty : a.ty
+    aty isa DAE.T_COMPLEX && CodeGeneration.unsupported("a partial application of a function with a record input", a.name)
+    if a.name in free
+      local s = Symbol("#pa#", a.name)
+      push!(params, s); push!(callArgs, s)
+    else
+      k += 1
+      k <= length(boundArgs) || CodeGeneration.unsupported("a partial application's bound arguments", origType)
+      push!(callArgs, boundArgs[k])
+    end
+  end
+  k == length(boundArgs) || CodeGeneration.unsupported("a partial application's bound arguments", origType)
+  return Expr(:->, Expr(:tuple, params...), Expr(:call, callee, callArgs...))
+end
+
+#= The function type of a function reference (the frontend's types of a partial application). =#
+_functionType(@nospecialize(t::DAE.Type)) =
+  t isa DAE.T_FUNCTION_REFERENCE_VAR || t isa DAE.T_FUNCTION_REFERENCE_FUNC ? t.functionType : t
 
 #= A C function's arguments: an external object as its pointer (CodeGeneration._externalPtr). =#
 _externalPtrArgs(args::AbstractVector)::Vector{Any} =

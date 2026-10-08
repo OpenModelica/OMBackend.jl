@@ -433,6 +433,7 @@ function collectCrefNames!(names::OrderedSet{String}, exp::Exp)
     end
     ARRAY_EXP(__) => begin for x in exp.elements; collectCrefNames!(names, x) end end
     CALL(__) => begin for x in exp.args; collectCrefNames!(names, x) end end
+    PARTEVALFUNCTION(__) => begin for x in exp.args; collectCrefNames!(names, x) end end
     RECORD(__) => begin for x in exp.exps; collectCrefNames!(names, x) end end
     TUPLE(__) => begin for x in exp.PR; collectCrefNames!(names, x) end end
     REDUCTION(__) => collectCrefNamesForReduction(names, exp)
@@ -710,7 +711,7 @@ function _walkComplexSIM!(names::OrderedSet{String}, e::Exp, ht)
     _walkComplexSIM!(names, e.exp2, ht)
   elseif e isa UNARY || e isa LUNARY
     _walkComplexSIM!(names, e.exp, ht)
-  elseif e isa CALL
+  elseif e isa CALL || e isa PARTEVALFUNCTION
     for a in e.args
       _walkComplexSIM!(names, a, ht)
     end

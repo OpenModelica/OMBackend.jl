@@ -142,6 +142,10 @@ function _traverseChildrenTopDown(e::CALL, visitor, arg)
   (out, a) = _mapExpVec(e.args, traverseExpTopDown, visitor, arg)
   return (out === e.args ? e : CALL(e.path, out, e.attr), a)
 end
+function _traverseChildrenTopDown(e::PARTEVALFUNCTION, visitor, arg)
+  (out, a) = _mapExpVec(e.args, traverseExpTopDown, visitor, arg)
+  return (out === e.args ? e : PARTEVALFUNCTION(e.path, out, e.ty, e.origType), a)
+end
 function _traverseChildrenTopDown(e::ARRAY_EXP, visitor, arg)
   (out, a) = _mapExpVec(e.elements, traverseExpTopDown, visitor, arg)
   return (out === e.elements ? e : ARRAY_EXP(e.ty, e.scalar, out), a)
@@ -225,6 +229,10 @@ end
 function _traverseChildrenBottomUp(e::CALL, visitor, arg)
   (out, a) = _mapExpVec(e.args, traverseExpBottomUp, visitor, arg)
   return (out === e.args ? e : CALL(e.path, out, e.attr), a)
+end
+function _traverseChildrenBottomUp(e::PARTEVALFUNCTION, visitor, arg)
+  (out, a) = _mapExpVec(e.args, traverseExpBottomUp, visitor, arg)
+  return (out === e.args ? e : PARTEVALFUNCTION(e.path, out, e.ty, e.origType), a)
 end
 function _traverseChildrenBottomUp(e::ARRAY_EXP, visitor, arg)
   (out, a) = _mapExpVec(e.elements, traverseExpBottomUp, visitor, arg)

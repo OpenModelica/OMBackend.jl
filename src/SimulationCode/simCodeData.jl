@@ -280,6 +280,18 @@ struct REDUCTION <: Exp
   iterators::Any
 end
 
+"Partial application `function f(b = e)`, an argument of a function that takes a function
+(Buildings' Borefields: quadratureLobatto of an integrand): `args` the bound arguments, in
+the function's input order (SimCode-recursive). `ty` (the remaining inputs) and `origType`
+(all of them) are the DAE function types, kept for the round trip; the code generation
+places the arguments by them."
+struct PARTEVALFUNCTION <: Exp
+  path::Absyn.Path
+  args::Vector{Exp}
+  ty::DAE.Type
+  origType::DAE.Type
+end
+
 #= ---- Equation hierarchy ----
 
    SimCode-native equation types. The goal is to give SimCode its own

@@ -167,6 +167,10 @@ function _canonicalizeCrefExpSIM(@nospecialize(exp), ctx::_CanonicalNameContext)
     local cp = OMBackend.canonicalName(exp.path)
     _recordNameRewrite!(ctx, _originalPathName(exp.path), cp)
     return (CALL(Absyn.IDENT(cp), exp.args, exp.attr), true, ctx)
+  elseif exp isa PARTEVALFUNCTION
+    local cp = OMBackend.canonicalName(exp.path)
+    _recordNameRewrite!(ctx, _originalPathName(exp.path), cp)
+    return (PARTEVALFUNCTION(Absyn.IDENT(cp), exp.args, exp.ty, exp.origType), true, ctx)
   elseif exp isa RECORD
     local cp = OMBackend.canonicalName(exp.path)
     _recordNameRewrite!(ctx, _originalPathName(exp.path), cp)
