@@ -1603,9 +1603,12 @@ end
   generated closure rather than relying on OMRuntimeExternalC being in scope
   at runtime.
 """
-#= An external function: OMRuntimeExternalC's, or one compiled from its Include (externalC.jl). =#
+#= An external function: OMRuntimeExternalC's, or one ensureExternalC! defined (externalC.jl),
+   read by invokelatest: defined in this world (an older world's read of a newer binding is
+   deprecated, an error in later Julia versions). =#
 _externalFunction(name::Symbol) =
-  isdefined(externalCModule(), name) ? getfield(externalCModule(), name) : getfield(OMRuntimeExternalC, name)
+  isdefined(externalCModule(), name) ? Base.invokelatest(getglobal, externalCModule(), name) :
+                                       getfield(OMRuntimeExternalC, name)
 
 #= `function f(b = e, ...)`, an argument of a function that takes a function (Buildings'
    Borefields: quadratureLobatto of an integrand): a closure over the bound arguments, its
@@ -1649,18 +1652,16 @@ Base.@nospecializeinfer function namespaceifyExternalFunction(@nospecialize(expr
   if expr.head == :toplevel && length(expr.args) == 1 && expr.args[1] isa Expr
     expr = expr.args[1]
   end
+  #= any number of arguments: MSL's getPid has none (pid = ModelicaInternal_getpid()) =#
   res = if expr.head == :(=)
     local callExpr = last(expr.args)
-    @match Expr(:call, [funcName, y...,z]) = callExpr
-    local resolvedFunc = _externalFunction(funcName)
-    exp = Expr(:call, resolvedFunc, _externalPtrArgs(y)..., _externalPtrArgs([z])...)
-    expr.args[2] = exp
+    @match Expr(:call, [funcName, args...]) = callExpr
+    expr.args[2] = Expr(:call, _externalFunction(funcName), _externalPtrArgs(args)...)
     expr
   else #Otherwise a side effect call or a call that returns directly.
     @assert expr.head === :call "Invalid call passed to namespaceifyExternalFunction"
-    @match Expr(:call, [funcName, y...,z]) = expr
-    local resolvedFunc = _externalFunction(funcName)
-    Expr(:call, resolvedFunc, _externalPtrArgs(y)..., _externalPtrArgs([z])...)
+    @match Expr(:call, [funcName, args...]) = expr
+    Expr(:call, _externalFunction(funcName), _externalPtrArgs(args)...)
   end
   return res
 end

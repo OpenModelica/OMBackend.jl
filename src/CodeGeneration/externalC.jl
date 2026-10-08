@@ -5,7 +5,8 @@
    name that ccalls it (in externalCModule()), with the C types of the Modelica declaration. The generated call
    then goes the way of the other external functions (namespaceifyExternalFunction).
    ModelicaError and the other utility functions resolve at load time from
-   OMRuntimeExternalC's libModelicaCallbacks (loaded RTLD_GLOBAL). =#
+   OMRuntimeExternalC's libModelicaCallbacks (loaded RTLD_GLOBAL). A function that a library
+   OMRuntimeExternalC ships defines (its Library annotation) is called there, not compiled. =#
 
 #= The string values of every key = "..." (or key = {"...", ...}) in an annotation (the
    flat annotation has the default IncludeDirectory before the declared one). =#
@@ -84,12 +85,30 @@ function _cScalarType(@nospecialize(ty::DAE.Type))
   return nothing
 end
 
+#= The library OMRuntimeExternalC ships under a name of the Library annotation, when it
+   defines the function: OMRuntimeExternalC has no Julia function for every C function of
+   its libraries (MSL's ModelicaInternal_mkdir, in libModelicaExternalC; its Include,
+   ModelicaInternal.h, only declares it). =#
+function _shippedLibraryDefining(ann::AbstractString, cname::Symbol)::Union{String, Nothing}
+  local installed = OMRuntimeExternalC.installedLibPath
+  installed === nothing && return nothing
+  local ext = Sys.iswindows() ? ".dll" : Sys.isapple() ? ".dylib" : ".so"
+  for name in _annotationStrings(ann, "Library")
+    local lib = joinpath(dirname(installed), "lib" * name * ext)
+    isfile(lib) || continue
+    local handle = Base.Libc.Libdl.dlopen(lib, Base.Libc.Libdl.RTLD_GLOBAL | Base.Libc.Libdl.RTLD_LAZY; throw_error = false)
+    handle === nothing && continue
+    Base.Libc.Libdl.dlsym(handle, cname; throw_error = false) === nothing || return lib
+  end
+  return nothing
+end
+
 """
     ensureExternalC!(func)
 
 For an external "C" function (SimulationCode.EXTERNAL_MODELICA_FUNCTION) whose C function
-OMRuntimeExternalC does not have and whose annotation has an Include: compile the code and
-define the function in OMRuntimeExternalC.
+OMRuntimeExternalC has no Julia function for: one that ccalls it in the library of its Library
+annotation that OMRuntimeExternalC ships, or else compiled from the code of its Include.
 """
 function ensureExternalC!(func::SimulationCode.EXTERNAL_MODELICA_FUNCTION)
   local call = Meta.parse(func.libInfo)
@@ -99,17 +118,20 @@ function ensureExternalC!(func::SimulationCode.EXTERNAL_MODELICA_FUNCTION)
   local cname = callExpr.args[1]
   (isdefined(OMRuntimeExternalC, cname) || isdefined(externalCModule(), cname)) && return nothing
   local ann = get(SimulationCode.EXTERNAL_C_ANNOTATIONS, cname, "")
-  local includes = _annotationStrings(ann, "Include")
-  isempty(includes) && return nothing
-  #= the default IncludeDirectory (modelica://Lib/Resources/Include) of a library not loaded,
-     or one that does not exist, is no directory =#
-  local dirs = String[]
-  for d in _annotationStrings(ann, "IncludeDirectory")
-    local path = CodeGeneration.OMBackend._tryOr(() -> SimulationCode.OMFrontend.resolveModelicaURI(d), nothing,
-                                                 :externalCIncludeDirectory; only = ErrorException)
-    path !== nothing && isdir(path) && push!(dirs, path)
+  local lib = _shippedLibraryDefining(ann, cname)
+  if lib === nothing
+    local includes = _annotationStrings(ann, "Include")
+    isempty(includes) && return nothing
+    #= the default IncludeDirectory (modelica://Lib/Resources/Include) of a library not loaded,
+       or one that does not exist, is no directory =#
+    local dirs = String[]
+    for d in _annotationStrings(ann, "IncludeDirectory")
+      local path = CodeGeneration.OMBackend._tryOr(() -> SimulationCode.OMFrontend.resolveModelicaURI(d), nothing,
+                                                   :externalCIncludeDirectory; only = ErrorException)
+      path !== nothing && isdir(path) && push!(dirs, path)
+    end
+    lib = _compileIncludeLibrary(join(includes, "\n"), dirs)
   end
-  local lib = _compileIncludeLibrary(join(includes, "\n"), dirs)
   local vars = Dict{Symbol, DAE.VAR}()
   for v in Iterators.flatten((func.inputs, func.outputs, func.locals))
     vars[Symbol(DAE_VAR_ToJulia(v))] = v
