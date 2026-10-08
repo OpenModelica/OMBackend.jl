@@ -2638,6 +2638,37 @@ end
 
 _isSimCodeFunctionPath(path::Absyn.Path, simCode)::Bool = _isSimCodeFunctionName(string(path), simCode)
 
+#= An element of a named array of records by subscripts that are not literals (`data[i]` in a
+   reduction: the ideal gases' `h_T(data[i], T, ...)`, MSL Media mixtures): that element of
+   each field array, `data_MM[i]` (the module-level arrays of _recordArrayFieldArrays). With
+   the subscript dropped (before toSimExp kept it), the whole field arrays were passed. Empty
+   otherwise. =#
+function _recordArrayElementCallArgs(arg::DAE.Exp, simCode::SimulationCode.SIM_CODE;
+                                     varPrefix::String = "", varSuffix::String = "", derSymbol::Bool = false)::Vector{Any}
+  (arg isa DAE.ASUB && arg.exp isa DAE.CREF) || return Any[]
+  local elemTy = arg.exp.ty
+  local nDims = 0
+  while elemTy isa DAE.T_ARRAY
+    nDims += length(collect(elemTy.dims))
+    elemTy = elemTy.ty
+  end
+  (elemTy isa DAE.T_COMPLEX && elemTy.complexClassType isa DAE.ClassInf.RECORD) || return Any[]
+  local subs = collect(arg.sub)
+  #= the base's type is the array's, or the element's (toSimExp of a subscripted cref types
+     the base by its identifier's type) =#
+  (nDims == 0 || length(subs) == nDims) || return Any[]
+  local base = SimulationCode.string(arg.exp.componentRef)
+  occursin('[', base) && return Any[]
+  #= an ASUB's subscripts: expressions, or INDEX subscripts (a slice is not an element) =#
+  local idx = Any[]
+  for sub in subs
+    local e = sub isa DAE.INDEX ? sub.exp : sub
+    (e isa DAE.Exp && !(e isa DAE.RANGE || e isa DAE.ARRAY)) || return Any[]
+    push!(idx, expToJuliaExpMTK(e, simCode; varPrefix, varSuffix, derSymbol))
+  end
+  return Any[Expr(:ref, Symbol(base * COMPONENT_SEPARATOR * f.name), idx...) for f in elemTy.varLst]
+end
+
 function _modelicaFunctionCallArgs(expLst,
                                    simCode,
                                    hashTable;
@@ -2651,6 +2682,11 @@ function _modelicaFunctionCallArgs(expLst,
                                                                varSuffix = varSuffix)
     if !isempty(flattenedArgs)
       append!(args, flattenedArgs)
+      continue
+    end
+    local elementFields = _recordArrayElementCallArgs(arg, simCode; varPrefix, varSuffix, derSymbol)
+    if !isempty(elementFields)
+      append!(args, elementFields)
       continue
     end
 

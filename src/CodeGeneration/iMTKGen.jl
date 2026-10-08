@@ -189,17 +189,14 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
       modelFn(_buildTspan())
     end
     #= A derivative of a call without a derivative annotation that the index reduction
-       needs: once more with the numeric partials (CodeGeneration.NUMERIC_PARTIALS). =#
+       needs: once more with the numeric partials (CodeGeneration.NUMERIC_PARTIALS). By the
+       error's type: its text is Markdown wrapped at 80 columns, and "Define a derivative"
+       broke across lines after a long call (Buildings' DerivativeCheck examples). =#
     local res = try
       build()
     catch e
-      occursin("Define a derivative", sprint(showerror, e)) || rethrow()
-      OMB.CodeGeneration.NUMERIC_PARTIALS[] = true
-      try
-        build()
-      finally
-        OMB.CodeGeneration.NUMERIC_PARTIALS[] = false
-      end
+      e isa OMB.CodeGeneration.Symbolics.DerivativeNotDefinedError || rethrow()
+      OMB.CodeGeneration.withNumericPartials(build)
     end
     BUILT[cname] = res
     BUILT_HASH[cname] = buildHash

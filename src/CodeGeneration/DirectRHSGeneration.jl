@@ -277,9 +277,14 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   #= Symbolic sparse Jacobian; nothing when not differentiable. Built after
      u0/p_vec so the generated function can be probed once: an unresolved
      symbolic derivative surfaces only when the function runs, not at build. =#
-  local (jacFunc, jacProto) = _buildSparseJacobian(rhs_list, states, params, iv,
-                                                   u0, p_vec, tspan[1])
-  local tgradFunc = _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, tspan[1])
+  #= With the numeric partials: a call without a derivative annotation is differentiated in
+     its own arguments. Without them the solver finite-differenced the states, by their
+     magnitude, past a flow function's regularization (Buildings' Airflow.Multizone
+     powerLaw05 around dp = 0 at pressures of 1e5 Pa: 47,225 steps for 36). =#
+  local (jacFunc, jacProto) = withNumericPartials(() -> _buildSparseJacobian(rhs_list, states, params, iv,
+                                                                             u0, p_vec, tspan[1]))
+  local tgradFunc = withNumericPartials(() -> _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc,
+                                                                   u0, p_vec, tspan[1]))
 
   # 4. Extract event callbacks from the reduced system and merge with custom callbacks.
   #    Our structural_simplify wrapper uses split=false, so the compiled event

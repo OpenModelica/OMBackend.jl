@@ -89,10 +89,28 @@ function Symbolics.derivative_rule(w::ModelicaFunctionWrapper{N}, ::Val{N},
   return r isa SymbolicUtils.BasicSymbolic ? r : Symbolics.SConst(r)
 end
 
-#= The partials below for a build that failed without them (iMTKGen._buildAndCache): a
-   rule for every call let ModelingToolkit differentiate calls it otherwise leaves alone,
-   central differences in the index reduction (MSL AIMC_Conveyor: Unstable at 10 s). =#
+#= The partials below in the index reduction only for a build that failed without them
+   (iMTKGen._buildAndCache): a rule for every call let ModelingToolkit differentiate calls it
+   otherwise leaves alone, central differences in the index reduction (MSL AIMC_Conveyor:
+   Unstable at 10 s). The Jacobian and the time derivative always have them
+   (DirectRHSGeneration). =#
 const NUMERIC_PARTIALS = Ref(false)
+
+"""
+    withNumericPartials(f)
+
+Run `f()` with the numeric partials of calls without a derivative annotation, restoring
+the previous setting afterwards.
+"""
+function withNumericPartials(f::Function)
+  local previous = NUMERIC_PARTIALS[]
+  NUMERIC_PARTIALS[] = true
+  try
+    return f()
+  finally
+    NUMERIC_PARTIALS[] = previous
+  end
+end
 
 #= The partial derivative of a function call that stays a term and has no derivative
    annotation (an if-statement on an input: Buildings' smoothExponential, Media property
