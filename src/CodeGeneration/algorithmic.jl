@@ -286,6 +286,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
           OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(normalizedName))), $(nArgs), $(isArrayFunc), $(outputDims))
           #= Store the implementation in the dictionary =#
           OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(Symbol(normalizedName)))] = $(anonFunc)
+          $(_functionDerivativeRuleExpr(func, functions))
         end
       end
       SimulationCode.EXTERNAL_MODELICA_FUNCTION(__) => begin
@@ -315,6 +316,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
           OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(normalizedName))), $(nArgs), $(isArrayFunc), $(outputDims))
           #= Store the implementation in the dictionary =#
           OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(Symbol(normalizedName)))] = $(anonFunc)
+          $(_functionDerivativeRuleExpr(func, functions))
         end
       end
     end
@@ -322,6 +324,26 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
     push!(names, normalizedName)
   end
   return jFuncs, names
+end
+
+#= The derivative rule of `func`'s derivative annotation (SimulationCode.FUNCTION_DERIVATIVES,
+   CodeGeneration.FUNCTION_DERIVATIVE_RULES): the derivative function and, in order, the
+   inputs whose derivatives it takes (the Real ones without zeroDerivative/noDerivative).
+   Scalar inputs only: flattened records move the positions. =#
+function _functionDerivativeRuleExpr(func, functions)
+  local d = get(SimulationCode.FUNCTION_DERIVATIVES, func.name, nothing)
+  d === nothing && return nothing
+  local (derName, excluded, nInputs) = d
+  length(func.inputs) == nInputs || return nothing
+  local withDer = Int[]
+  for (i, v) in enumerate(func.inputs)
+    (_funcParamIsArray(v) || v.ty isa DAE.T_COMPLEX) && return nothing
+    v.ty isa DAE.T_REAL && !(i in excluded) && push!(withDer, i)
+  end
+  local k = findfirst(g -> g.name == derName, functions)
+  (k === nothing || length(functions[k].inputs) != nInputs + length(withDer)) && return nothing
+  return :(OMBackend.CodeGeneration.FUNCTION_DERIVATIVE_RULES[$(QuoteNode(Symbol(func.name)))] =
+           ($(QuoteNode(Symbol(derName))), $(withDer)))
 end
 
 function generateIOL(inputs::Vector)::Vector{Symbol}

@@ -49,6 +49,9 @@ function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{
   local externalFunctionsUsed = false
   for f in functionList
     local n = string(f.path)
+    for d in f.derivatives
+      _registerFunctionDerivative!(n, d, length(f.inputs))
+    end
     local inputs = map(f.inputs) do input
       OMFrontend.Frontend.convertFunctionParam(input)
     end
@@ -81,6 +84,21 @@ function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{
     end
   end
   return (functions, externalFunctionsUsed)
+end
+
+#= A function's derivative annotation of order 1, by the function's name: the derivative
+   function's name, the inputs that have no derivative input in it (zeroDerivative,
+   noDerivative) and the function's number of inputs. For the derivative rules of the MTK
+   path (CodeGeneration: generateFunctions). =#
+const FUNCTION_DERIVATIVES = Dict{String, Tuple{String, Vector{Int}, Int}}()
+
+function _registerFunctionDerivative!(n::String, d, nInputs::Int)
+  (d.order isa OMFrontend.Frontend.INTEGER_EXPRESSION && d.order.value == 1) || return nothing
+  local fns = OMFrontend.Frontend.getCachedFuncs(d.derivativeFn)
+  isempty(fns) && return nothing
+  FUNCTION_DERIVATIVES[n] = (string(OMFrontend.Frontend.name(first(fns))),
+                             Int[c[1] for c in d.conditions], nInputs)
+  return nothing
 end
 
 #= An external function's annotation (Include, IncludeDirectory, Library) by the name of

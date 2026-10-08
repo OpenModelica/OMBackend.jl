@@ -69,6 +69,65 @@ const _RGF_TAG = getfield(@__MODULE__, Symbol("#_RGF_ModTag"))
 Base.hash(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{<:Any, _RGF_TAG, _RGF_TAG}, h::UInt) = hash(typeof(f), h)
 Base.hash(w::ModelicaFunctionWrapper, h::UInt) = hash(typeof(w), hash(w.name, h))
 
+#= der() of a call of a function with a derivative annotation that stays a term (an
+   if-statement on its input: Buildings' equalPercentage, DerivativeCheck): the partial
+   derivative by an input is the derivative function with that input's derivative 1 and the
+   others' 0 (the derivative function is linear in them); 0 by an input without one
+   (zeroDerivative, noDerivative, not Real). Name => (derivative function, the inputs whose
+   derivatives it takes), set by the generated functions (generateFunctions). =#
+const FUNCTION_DERIVATIVE_RULES = Dict{Symbol, Tuple{Symbol, Vector{Int}}}()
+
+function Symbolics.derivative_rule(w::ModelicaFunctionWrapper{N}, ::Val{N},
+                                   args::SymbolicUtils.ROArgsT{Symbolics.VartypeT}, ::Val{I}) where {N, I}
+  local rule = get(FUNCTION_DERIVATIVE_RULES, w.name, nothing)
+  local dw = rule === nothing ? nothing : get(MODELICA_FUNCTION_WRAPPERS, rule[1], nothing)
+  dw === nothing && return _partialTerm(ModelicaFunctionPartial{N, 1}(w.name, (I,)), args)
+  local withDer = rule[2]
+  local k = findfirst(==(I), withDer)
+  k === nothing && return Symbolics.SConst(0)
+  local r = Symbolics.unwrap(dw(args..., ntuple(j -> j == k ? 1.0 : 0.0, length(withDer))...))
+  return r isa SymbolicUtils.BasicSymbolic ? r : Symbolics.SConst(r)
+end
+
+#= The partial derivative of a function call that stays a term and has no derivative
+   annotation (an if-statement on an input: Buildings' smoothExponential, Media property
+   functions; the derivative function of an annotation, for second derivatives): the
+   function's implementation by central differences at run time (external C functions too),
+   by the inputs `idx` in turn. Its own partials nest. =#
+struct ModelicaFunctionPartial{N, K} <: Function
+  name::Symbol
+  idx::NTuple{K, Int}
+end
+Base.nameof(p::ModelicaFunctionPartial) = Symbol(p.name, "_d", Base.join(p.idx, "_"))
+Base.show(io::IO, p::ModelicaFunctionPartial) = print(io, nameof(p))
+Base.hash(p::ModelicaFunctionPartial, h::UInt) = hash(p.idx, hash(p.name, hash(:ModelicaFunctionPartial, h)))
+
+function (p::ModelicaFunctionPartial{N, K})(args::Vararg{Any, N}) where {N, K}
+  any(a -> a isa Symbolics.Num || a isa SymbolicUtils.BasicSymbolic, args) &&
+    return _partialTerm(p, Any[Symbolics.unwrap(a) for a in args])
+  return _centralPartial(MODELICA_FUNCTION_IMPLS[p.name], args, p.idx, eps(Float64)^(1 / (K + 2)))
+end
+
+function _centralPartial(impl, args::Tuple, idx::Tuple, rel::Float64)::Float64
+  if isempty(idx)
+    local r = Base.invokelatest(impl, args...)
+    return Float64(r isa Tuple ? first(r) : r)
+  end
+  local i = last(idx)
+  local x = Float64(args[i])
+  local h = rel * max(1.0, abs(x))
+  local up = _centralPartial(impl, Base.setindex(args, x + h, i), Base.front(idx), rel)
+  local dn = _centralPartial(impl, Base.setindex(args, x - h, i), Base.front(idx), rel)
+  return (up - dn) / (2h)
+end
+
+_partialTerm(p, args) = SymbolicUtils.Term{SymbolicUtils.SymReal}(p, collect(Any, args); type = Real)
+
+function Symbolics.derivative_rule(p::ModelicaFunctionPartial{N, K}, ::Val{N},
+                                   args::SymbolicUtils.ROArgsT{Symbolics.VartypeT}, ::Val{I}) where {N, K, I}
+  return _partialTerm(ModelicaFunctionPartial{N, K + 1}(p.name, (p.idx..., I)), args)
+end
+
 #= Cache for per-element extractor functions.
    Key: (funcName::Symbol, indices::Tuple{Vararg{Int}}, nArgs::Int)
    Value: the created function object
@@ -358,7 +417,7 @@ end
 # can be cached and later returned even when makeSymbolicTerm passes
 # `type = Real` explicitly, poisoning subsequent sums and breaking
 # `-(::SymReal, ::SymReal)` in MTK alias_elimination.
-SymbolicUtils._promote_symtype(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper}, args) = Real
+SymbolicUtils._promote_symtype(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial}, args) = Real
 SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 
 # Same reason for shape. Scalar-returning extractor RGFs must be reported as
@@ -367,7 +426,7 @@ SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 # mismatch in MTK's substitution rebuild path (terminterface.jl `maketerm` for
 # `+`/`-`). Without this, a wrapper whose body returns a Modelica vector can
 # poison a sum with shape `Unknown(2)`.
-SymbolicUtils.promote_shape(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper}, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial}, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 SymbolicUtils.promote_shape(::typeof(floor), args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 SymbolicUtils.promote_shape(::typeof(floor), arg::SymbolicUtils.Unknown) = SymbolicUtils.ShapeVecT()
 
