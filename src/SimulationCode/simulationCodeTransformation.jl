@@ -193,17 +193,25 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
                                                                                   equationSystem.name,
                                                                                   addDummyState)
   #= An initial equation's assert (a call for its effects among them: MSL Fluid's
-     checkBoundary) joins them: one on parameters is checked once, at the
-     initialization, as Modelica has it; one on variables would be checked during
-     the simulation as well. =#
+     checkBoundary) is checked once, at the initialization, as Modelica has it. One on
+     parameters joins the asserts (constant, it holds after); one on variables runs in
+     the initialization's `when initial()` pass, on the initialization's values (it
+     would be checked during the simulation as well with the asserts; it was refused:
+     every Modelica.Fluid source's checkBoundary of X_in_internal). =#
+  local initialAssertAlgorithms = INITIAL_ALGORITHM[]
   for a in equationSystem.initialEqs
     a isa BDAE.ASSERT_EQUATION || continue
-    for nm in _collectAssertCrefNames!(OrderedSet{String}(), [a])
+    local onVariables = any(_collectAssertCrefNames!(OrderedSet{String}(), [a])) do nm
       local e = get(stringToSimVarHT, nm, nothing)
-      (e === nothing || isParameter(last(e))) ||
-        OMBackend.unsupported("an assert in an initial equation on a variable", a.condition)
+      e !== nothing && !isParameter(last(e))
     end
-    push!(asserts, a)
+    if !onVariables
+      push!(asserts, a)
+    elseif a.condition isa DAE.CALL && a.condition.attr.ty isa DAE.T_NORETCALL
+      push!(initialAssertAlgorithms, INITIAL_ALGORITHM([BDAE.NORETCALL(a.condition, a.source)]))
+    else
+      push!(initialAssertAlgorithms, INITIAL_ALGORITHM([BDAE.ASSERT(a.condition, a.message, a.level, a.source)]))
+    end
   end
   #= Parameters in asserts as literals (they may be eliminated later); tunable
      ones stay references, read from the problem at run time. =#
@@ -225,6 +233,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   local (whenEqsKept, extractedInitAlgs) = extractInitialWhenAlgorithms(whenEqs)
   whenEqs = whenEqsKept
   append!(initialAlgorithms, extractedInitAlgs)
+  append!(initialAlgorithms, initialAssertAlgorithms)
   #= Inline parameter literals into init bodies NOW, while the HT still has the
      scalarized array-parameter entries. Later passes (const-prop, alias-elim,
      output-only elim) drop those entries because they have no consumer in the

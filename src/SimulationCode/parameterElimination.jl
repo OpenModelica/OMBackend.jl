@@ -623,6 +623,11 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     simCode.eliminatedEquations = newElimEqs
     simCode.stringToSimVarHT = newHT
     simCode.asserts = _substituteInAsserts(simCode.asserts, paramValueMap; visitor = substituteConstantParameter)
+    #= The `when initial()` bodies too (a Modelica.Fluid source's checkBoundary of
+       X_in_internal, a parameter after foldParameterClosure): a read of an eliminated
+       parameter was refused. =#
+    simCode.initialAlgorithms = _substituteAliasInInitialAlgorithms(simCode.initialAlgorithms, paramValueMap;
+                                                                    visitor = substituteConstantParameter)
   end
   #= Do NOT append eliminated parameter names to `simCode.eliminatedVariables`.
      That list pairs with `simCode.eliminatedEquations` 1:1 and is consumed by

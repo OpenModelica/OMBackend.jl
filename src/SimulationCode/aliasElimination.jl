@@ -841,88 +841,91 @@ function _substituteAliasInElseWhen(elseWhenEq, aliasMap)
   return elseWhenEq
 end
 
-function _substituteAliasInInitialAlgorithms(initialAlgs::Vector{INITIAL_ALGORITHM}, aliasMap)::Vector{INITIAL_ALGORITHM}
+#= `visitor` substitutes (substituteAliasCref; substituteConstantParameter for the
+   eliminated parameters' values). =#
+function _substituteAliasInInitialAlgorithms(initialAlgs::Vector{INITIAL_ALGORITHM}, aliasMap;
+                                             visitor = substituteAliasCref)::Vector{INITIAL_ALGORITHM}
   local result = INITIAL_ALGORITHM[]
   sizehint!(result, length(initialAlgs))
   for ia in initialAlgs
-    local newOps = [_substituteAliasInInitialWhenOp(op, aliasMap) for op in ia.statements]
-    local newDae = [_substituteAliasInInitialDAEStmt(stmt, aliasMap) for stmt in ia.daeStatements]
+    local newOps = [_substituteAliasInInitialWhenOp(op, aliasMap; visitor) for op in ia.statements]
+    local newDae = [_substituteAliasInInitialDAEStmt(stmt, aliasMap; visitor) for stmt in ia.daeStatements]
     push!(result, INITIAL_ALGORITHM(newOps, newDae))
   end
   return result
 end
 
-function _substituteAliasInInitialWhenOp(stmt, aliasMap)
+function _substituteAliasInInitialWhenOp(stmt, aliasMap; visitor = substituteAliasCref)
   if stmt isa ASSIGN
-    local (newL, _) = traverseExpTopDown(stmt.left, substituteAliasCref, aliasMap)
-    local (newR, _) = traverseExpTopDown(stmt.right, substituteAliasCref, aliasMap)
+    local (newL, _) = traverseExpTopDown(stmt.left, visitor, aliasMap)
+    local (newR, _) = traverseExpTopDown(stmt.right, visitor, aliasMap)
     local (fL, fR) = _redistributeNegatedAliasLhsSim(newL, newR)
     return ASSIGN(fL, fR, stmt.source)
   elseif stmt isa REINIT
-    local (newSV, _) = traverseExpTopDown(stmt.stateVar, substituteAliasCref, aliasMap)
-    local (newVal, _) = traverseExpTopDown(stmt.value, substituteAliasCref, aliasMap)
+    local (newSV, _) = traverseExpTopDown(stmt.stateVar, visitor, aliasMap)
+    local (newVal, _) = traverseExpTopDown(stmt.value, visitor, aliasMap)
     local (fSV, fVal) = _redistributeNegatedAliasLhsSim(newSV, newVal)
     return REINIT(fSV, fVal, stmt.source)
   elseif stmt isa NORETCALL
-    local (newExp, _) = traverseExpTopDown(stmt.exp, substituteAliasCref, aliasMap)
+    local (newExp, _) = traverseExpTopDown(stmt.exp, visitor, aliasMap)
     return NORETCALL(newExp, stmt.source)
   elseif stmt isa ASSERT
-    local (newC, _) = traverseExpTopDown(stmt.condition, substituteAliasCref, aliasMap)
-    local (newM, _) = traverseExpTopDown(stmt.message, substituteAliasCref, aliasMap)
-    local (newL, _) = traverseExpTopDown(stmt.level, substituteAliasCref, aliasMap)
+    local (newC, _) = traverseExpTopDown(stmt.condition, visitor, aliasMap)
+    local (newM, _) = traverseExpTopDown(stmt.message, visitor, aliasMap)
+    local (newL, _) = traverseExpTopDown(stmt.level, visitor, aliasMap)
     return ASSERT(newC, newM, newL, stmt.source)
   elseif stmt isa TERMINATE
-    local (newM, _) = traverseExpTopDown(stmt.message, substituteAliasCref, aliasMap)
+    local (newM, _) = traverseExpTopDown(stmt.message, visitor, aliasMap)
     return TERMINATE(newM, stmt.source)
   end
   return stmt
 end
 
-function _substituteAliasInInitialDAEStmt(stmt, aliasMap)
+function _substituteAliasInInitialDAEStmt(stmt, aliasMap; visitor = substituteAliasCref)
   return @match stmt begin
     DAE.STMT_ASSIGN(ty, e1, e, src) => begin
-      local (newL, _) = Util.traverseExpTopDown(e1, substituteAliasCref, aliasMap)
-      local (newR, _) = Util.traverseExpTopDown(e, substituteAliasCref, aliasMap)
+      local (newL, _) = Util.traverseExpTopDown(e1, visitor, aliasMap)
+      local (newR, _) = Util.traverseExpTopDown(e, visitor, aliasMap)
       local (fL, fR) = _redistributeNegatedAliasLhs(newL, newR)
       DAE.STMT_ASSIGN(ty, fL, fR, src)
     end
     DAE.STMT_TUPLE_ASSIGN(ty, lhsList, e, src) => begin
-      local newLhs = MetaModelica.list((first(Util.traverseExpTopDown(lhs, substituteAliasCref, aliasMap)) for lhs in lhsList)...)
-      local (newR, _) = Util.traverseExpTopDown(e, substituteAliasCref, aliasMap)
+      local newLhs = MetaModelica.list((first(Util.traverseExpTopDown(lhs, visitor, aliasMap)) for lhs in lhsList)...)
+      local (newR, _) = Util.traverseExpTopDown(e, visitor, aliasMap)
       DAE.STMT_TUPLE_ASSIGN(ty, newLhs, newR, src)
     end
     DAE.STMT_ASSIGN_ARR(ty, lhs, e, src) => begin
-      local (newL, _) = Util.traverseExpTopDown(lhs, substituteAliasCref, aliasMap)
-      local (newR, _) = Util.traverseExpTopDown(e, substituteAliasCref, aliasMap)
+      local (newL, _) = Util.traverseExpTopDown(lhs, visitor, aliasMap)
+      local (newR, _) = Util.traverseExpTopDown(e, visitor, aliasMap)
       local (fL, fR) = _redistributeNegatedAliasLhs(newL, newR)
       DAE.STMT_ASSIGN_ARR(ty, fL, fR, src)
     end
     DAE.STMT_NORETCALL(e, src) =>
-      DAE.STMT_NORETCALL(first(Util.traverseExpTopDown(e, substituteAliasCref, aliasMap)), src)
+      DAE.STMT_NORETCALL(first(Util.traverseExpTopDown(e, visitor, aliasMap)), src)
     DAE.STMT_ASSERT(c, m, l, src) =>
-      DAE.STMT_ASSERT(first(Util.traverseExpTopDown(c, substituteAliasCref, aliasMap)),
-                      first(Util.traverseExpTopDown(m, substituteAliasCref, aliasMap)),
-                      first(Util.traverseExpTopDown(l, substituteAliasCref, aliasMap)), src)
+      DAE.STMT_ASSERT(first(Util.traverseExpTopDown(c, visitor, aliasMap)),
+                      first(Util.traverseExpTopDown(m, visitor, aliasMap)),
+                      first(Util.traverseExpTopDown(l, visitor, aliasMap)), src)
     DAE.STMT_TERMINATE(m, src) =>
-      DAE.STMT_TERMINATE(first(Util.traverseExpTopDown(m, substituteAliasCref, aliasMap)), src)
+      DAE.STMT_TERMINATE(first(Util.traverseExpTopDown(m, visitor, aliasMap)), src)
     DAE.STMT_IF(cond, stmts, else_, src) =>
-      DAE.STMT_IF(first(Util.traverseExpTopDown(cond, substituteAliasCref, aliasMap)),
-                  MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in stmts)...),
-                  _substituteAliasInInitialDAEElse(else_, aliasMap), src)
+      DAE.STMT_IF(first(Util.traverseExpTopDown(cond, visitor, aliasMap)),
+                  MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap; visitor) for s in stmts)...),
+                  _substituteAliasInInitialDAEElse(else_, aliasMap; visitor), src)
     DAE.STMT_FOR(ty, isArr, iter, idx, range, body, src) =>
       DAE.STMT_FOR(ty, isArr, iter, idx,
-                   first(Util.traverseExpTopDown(range, substituteAliasCref, aliasMap)),
-                   MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in body)...), src)
+                   first(Util.traverseExpTopDown(range, visitor, aliasMap)),
+                   MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap; visitor) for s in body)...), src)
     DAE.STMT_PARFOR(ty, isArr, iter, idx, range, body, prl, src) =>
       DAE.STMT_PARFOR(ty, isArr, iter, idx,
-                      first(Util.traverseExpTopDown(range, substituteAliasCref, aliasMap)),
-                      MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in body)...), prl, src)
+                      first(Util.traverseExpTopDown(range, visitor, aliasMap)),
+                      MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap; visitor) for s in body)...), prl, src)
     DAE.STMT_WHILE(cond, body, src) =>
-      DAE.STMT_WHILE(first(Util.traverseExpTopDown(cond, substituteAliasCref, aliasMap)),
-                     MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in body)...), src)
+      DAE.STMT_WHILE(first(Util.traverseExpTopDown(cond, visitor, aliasMap)),
+                     MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap; visitor) for s in body)...), src)
     DAE.STMT_REINIT(varExp, value, src) => begin
-      local (newSV, _) = Util.traverseExpTopDown(varExp, substituteAliasCref, aliasMap)
-      local (newVal, _) = Util.traverseExpTopDown(value, substituteAliasCref, aliasMap)
+      local (newSV, _) = Util.traverseExpTopDown(varExp, visitor, aliasMap)
+      local (newVal, _) = Util.traverseExpTopDown(value, visitor, aliasMap)
       local (fSV, fVal) = _redistributeNegatedAliasLhs(newSV, newVal)
       DAE.STMT_REINIT(fSV, fVal, src)
     end
@@ -930,14 +933,14 @@ function _substituteAliasInInitialDAEStmt(stmt, aliasMap)
   end
 end
 
-function _substituteAliasInInitialDAEElse(else_, aliasMap)
+function _substituteAliasInInitialDAEElse(else_, aliasMap; visitor = substituteAliasCref)
   return @match else_ begin
     DAE.ELSE(stmts) =>
-      DAE.ELSE(MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in stmts)...))
+      DAE.ELSE(MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap; visitor) for s in stmts)...))
     DAE.ELSEIF(cond, stmts, rest) =>
-      DAE.ELSEIF(first(Util.traverseExpTopDown(cond, substituteAliasCref, aliasMap)),
-                 MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap) for s in stmts)...),
-                 _substituteAliasInInitialDAEElse(rest, aliasMap))
+      DAE.ELSEIF(first(Util.traverseExpTopDown(cond, visitor, aliasMap)),
+                 MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap; visitor) for s in stmts)...),
+                 _substituteAliasInInitialDAEElse(rest, aliasMap; visitor))
     _ => else_
   end
 end

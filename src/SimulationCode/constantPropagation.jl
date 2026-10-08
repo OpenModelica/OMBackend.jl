@@ -450,6 +450,9 @@ function propagateConstants(simCode::SIM_CODE)
     simCode.ifEquations = newIfEqs
     simCode.whenEquations = newWhenEqs
     simCode.asserts = _substituteInAsserts(simCode.asserts, constMap)
+    #= The `when initial()` bodies too (a Modelica.Fluid source's checkBoundary of
+       X_in_internal = X: a read of an eliminated variable, refused). =#
+    simCode.initialAlgorithms = _substituteAliasInInitialAlgorithms(simCode.initialAlgorithms, constMap)
   end
   append!(simCode.eliminatedEquations, elimEqs)
   append!(simCode.eliminatedVariables, elimVarNames)
