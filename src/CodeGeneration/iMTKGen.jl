@@ -163,10 +163,23 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
        forgets it as well, below). =#
     _forgetReinit(cname)
     Core.eval(OMB, modelCode)
-    local res = Base.invokelatest() do
+    local build = () -> Base.invokelatest() do
       local mod = getfield(OMB, Symbol(modelName))
       local modelFn = getfield(mod, Symbol(string(modelName, "Model")))
       modelFn(IMTK_BUILD_TSPAN)
+    end
+    #= A derivative of a call without a derivative annotation that the index reduction
+       needs: once more with the numeric partials (CodeGeneration.NUMERIC_PARTIALS). =#
+    local res = try
+      build()
+    catch e
+      occursin("Define a derivative", sprint(showerror, e)) || rethrow()
+      OMB.CodeGeneration.NUMERIC_PARTIALS[] = true
+      try
+        build()
+      finally
+        OMB.CodeGeneration.NUMERIC_PARTIALS[] = false
+      end
     end
     BUILT[cname] = res
     BUILT_HASH[cname] = buildHash

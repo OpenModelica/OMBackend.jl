@@ -81,13 +81,18 @@ function Symbolics.derivative_rule(w::ModelicaFunctionWrapper{N}, ::Val{N},
                                    args::SymbolicUtils.ROArgsT{Symbolics.VartypeT}, ::Val{I}) where {N, I}
   local rule = get(FUNCTION_DERIVATIVE_RULES, w.name, nothing)
   local dw = rule === nothing ? nothing : get(MODELICA_FUNCTION_WRAPPERS, rule[1], nothing)
-  dw === nothing && return _partialTerm(ModelicaFunctionPartial{N, 1}(w.name, (I,)), args)
+  dw === nothing && return NUMERIC_PARTIALS[] ? _partialTerm(ModelicaFunctionPartial{N, 1}(w.name, (I,)), args) : nothing
   local withDer = rule[2]
   local k = findfirst(==(I), withDer)
   k === nothing && return Symbolics.SConst(0)
   local r = Symbolics.unwrap(dw(args..., ntuple(j -> j == k ? 1.0 : 0.0, length(withDer))...))
   return r isa SymbolicUtils.BasicSymbolic ? r : Symbolics.SConst(r)
 end
+
+#= The partials below for a build that failed without them (iMTKGen._buildAndCache): a
+   rule for every call let ModelingToolkit differentiate calls it otherwise leaves alone,
+   central differences in the index reduction (MSL AIMC_Conveyor: Unstable at 10 s). =#
+const NUMERIC_PARTIALS = Ref(false)
 
 #= The partial derivative of a function call that stays a term and has no derivative
    annotation (an if-statement on an input: Buildings' smoothExponential, Media property
