@@ -2267,7 +2267,10 @@ function _functionDefinitions(functions)
     local impl = nothing
     local find = function (x)
       x isa Expr || return
-      if x.head == :(=) && x.args[1] isa Expr && x.args[1].head == :ref && x.args[1].args[end] == QuoteNode(Symbol(nm))
+      #= MODELICA_FUNCTION_IMPLS[:name] = impl (FUNCTION_DERIVATIVE_RULES[:name] = (derivative,
+         inputs) is one too: the rule became the function, "Tuple not callable") =#
+      if x.head == :(=) && x.args[1] isa Expr && x.args[1].head == :ref && x.args[1].args[end] == QuoteNode(Symbol(nm)) &&
+         endswith(string(x.args[1].args[1]), "MODELICA_FUNCTION_IMPLS")
         impl = x.args[2]
       else
         foreach(find, x.args)
