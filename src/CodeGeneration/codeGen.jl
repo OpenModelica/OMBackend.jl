@@ -260,6 +260,9 @@ function _whenLookupBindings(crefs, simCode)::Vector{Expr}
     if OMBackend.envSwitch("OMBACKEND_WHEN_STRING_SKIP")
       entry[2].varKind isa SimulationCode.STRING && continue
     end
+    #= A data structure (an external object: Buildings' borehole ExtendableArray) is a
+       module-level binding too (createDataStructureAssignments). =#
+    entry[2].varKind isa SimulationCode.DATA_STRUCTURE && continue
     push!(out, Expr(:(=), Symbol(name), getIdxForLookupMTK(x, simCode)))
   end
   return out
