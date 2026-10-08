@@ -264,12 +264,15 @@ function _dataStructureParameterPrelude(simCode::SimulationCode.SIM_CODE, emitte
   local ht = simCode.stringToSimVarHT
   local out = Expr[]
   local visiting = Set{String}()
+  #= a parameter that cannot be computed at module level (it reads a variable, or its binding
+     does not lower): not tried again from each parameter that reads it =#
+  local failed = Set{String}()
   #= at module level the model's functions are CodeGeneration's (qualifyModelicaFunctions!) =#
   local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
   local emit!
   emit! = function (nm::String)
     nm in emitted && return true
-    nm in visiting && return false
+    (nm in visiting || nm in failed) && return false
     local e = get(ht, nm, nothing)
     e === nothing && return false
     local sv = last(e)
@@ -278,9 +281,10 @@ function _dataStructureParameterPrelude(simCode::SimulationCode.SIM_CODE, emitte
     b isa SOME || return false
     push!(visiting, nm)
     local ok = all(c -> emit!(string(c)), Util.getAllCrefs(SimulationCode.toDAEExp(b.data)))
-    local rhs = ok ? (try expToJuliaExpMTK(b.data, simCode) catch; nothing end) : nothing
+    local rhs = ok ? OMBackend._tryOr(() -> expToJuliaExpMTK(b.data, simCode), nothing, :dataStructureParameterPrelude;
+                                     only = UnsupportedLowering, impact = :result) : nothing
     delete!(visiting, nm)
-    rhs === nothing && return false
+    rhs === nothing && (push!(failed, nm); return false)
     rhs isa Expr && !isempty(funcNames) && qualifyModelicaFunctions!(rhs, funcNames)
     push!(out, :($(Symbol(sv.name)) = $(rhs)))
     push!(emitted, nm)

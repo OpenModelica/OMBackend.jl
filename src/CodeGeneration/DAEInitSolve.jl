@@ -193,10 +193,11 @@ end
 
 #= `converged` is set false when no phase converged (the result is then the
    best effort the warning or the error below reports). =#
-function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
+function _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
                                   converged::Base.RefValue{Bool}=Ref(true), t0::Float64=0.0)
-  #= The residuals at the start time t0: the phases below evaluate at their time 0. =#
-  t0 == 0.0 || (rhsFunc = let f = rhsFunc; (du, u, p, t) -> f(du, u, p, t + t0); end)
+  #= The residuals at the start time t0: the phases below evaluate at their time 0. Assigned
+     once (closures below capture it: a reassigned argument would be boxed). =#
+  local rhsFunc = t0 == 0.0 ? rhsAt0 : (du, u, p, t) -> rhsAt0(du, u, p, t + t0)
   local n = length(u0)
   local nMM = size(mm, 1)
   local nSafe = min(n, nMM)

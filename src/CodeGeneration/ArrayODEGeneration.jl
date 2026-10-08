@@ -1012,7 +1012,6 @@ end
 
 _crossDomain(d::Matrix{Int}, ranges::Vector{Vector{Int}}) = foldl(_crossDomain, ranges; init = d)
 
-#= The value of an expression that depends only on slots and parameters, at a domain column. =#
 #= sample() of an equation as the sample slot of the when wi that schedules its instants. =#
 function _sampleSlots(x::IR, wi::Int)::IR
   x isa Op && x.op == :sample && return Op(:sampleof, IR[Lit(wi), x.args[3]])
@@ -1023,7 +1022,7 @@ function _sampleSlots(x::IR, wi::Int)::IR
 end
 
 #= The first sample slot of when wi: the slots are numbered when by when, instance by instance. =#
-_whenSampleBase(g, wi::Int) = sum((g.whens[k].nsample * size(g.whens[k].domain, 2) for k in 1:(wi - 1)); init = 0)
+_whenSampleBase(g::Gen, wi::Int) = sum((g.whens[k].nsample * size(g.whens[k].domain, 2) for k in 1:(wi - 1)); init = 0)
 
 #= Whether x reads only literals, iterators and parameters (no variable, no time). =#
 function _parametersOnly(g::Gen, x::IR)::Bool
@@ -1033,6 +1032,7 @@ function _parametersOnly(g::Gen, x::IR)::Bool
   return false
 end
 
+#= The value of an expression that depends only on slots and parameters, at a domain column. =#
 function _evalStatic(g::Gen, x::IR, d::Matrix{Int}, col::Int)
   if x isa Lit
     return x.v
@@ -1158,7 +1158,7 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
        when without a body schedules the instants; the equation reads its sample slots. =#
     isempty(edims) || ns("sample outside a when-condition, in an array equation")
     local samples = IR[]
-    local collect! = function (x)
+    local collect! = function (x::IR)
       x isa Op && x.op == :sample && push!(samples, x)
       x isa Op && foreach(collect!, x.args)
       x isa Rel && (collect!(x.lhs); collect!(x.rhs))
@@ -1222,29 +1222,33 @@ function _addDynamicIf!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector
   end
 end
 
-#= (a, _, c) = call: an assignment of each (non-wildcard) target from its output. =#
+#= (a, _, c) = call: the call once, into a temporary, and an assignment of each
+   (non-wildcard) target from its output (the call was made per target, and per element of
+   an array target). =#
 function _tupleAssignments(g::Gen, @nospecialize(lhs), call::IR, ctx::Ctx)::Vector{Stmt}
   local out = Stmt[]
+  local res = Slot(g.tmpSlot -= 1)
   for (i, e) in enumerate(lhs.elements)
     (e isa F.CREF_EXPRESSION && F.isvariant(e.cref, F.COMPONENT_REF_WILD)) && continue
     e isa F.CREF_EXPRESSION || ns("tuple target " * _str(e))
     if F.isArray(F.typeOf(e))
       #= a whole array ((r, state) = random(pre(state)): Buildings.Occupants): element by
-         element from that output (the call per element: Modelica functions are pure) =#
+         element from that output =#
       local name = _crefName(e.cref)
       local info = get(g.vars, name, nothing)
       (info !== nothing && info.kind in (:alg, :discrete) && !isempty(info.dims) &&
        all(p -> isempty(collect(p.subscripts)), _partsRootFirst(e.cref))) || ns("tuple target " * _str(e))
       for t in Iterators.product((1:d for d in info.dims)...)
         local subs = IR[Lit(k) for k in t]
-        push!(out, SAssign(Ref(name, subs, false), Op(:index, IR[Op(:index, IR[call, Lit(i)]), subs...])))
+        push!(out, SAssign(Ref(name, subs, false), Op(:index, IR[Op(:index, IR[res, Lit(i)]), subs...])))
       end
       continue
     end
     local target = toIR(g, e, ctx)
     (target isa Ref && g.vars[target.name].kind in (:alg, :discrete)) || ns("tuple target " * _str(e))
-    push!(out, SAssign(target, Op(:index, IR[call, Lit(i)])))
+    push!(out, SAssign(target, Op(:index, IR[res, Lit(i)])))
   end
+  isempty(out) || pushfirst!(out, SCall(Op(:setlocal, IR[res, call])))
   return out
 end
 
@@ -1265,6 +1269,7 @@ function _addWhen!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{Stri
         push!(body, (:reinit, target, toIR(g, b.reinitExp, ctx)))
       elseif F.isvariant(b, F.EQUATION_EQUALITY) && b.lhs isa F.TUPLE_EXPRESSION
         for st in _tupleAssignments(g, b.lhs, toIR(g, b.rhs, ctx), ctx)
+          st isa SCall && (push!(body, (:call, noTarget, st.call)); continue)
           g.vars[st.target.name].kind == :discrete || ns("when assigns a non-discrete variable")
           push!(body, (:assign, st.target, st.value))
         end
@@ -2031,6 +2036,8 @@ function jl(g::Gen, x::IR)
     x.op == :initial && return :(p.initPhase[1])
     x.op == :String && return Expr(:call, _modelicaString, args...)
     x.op == :fcall && return Expr(:call, args...)
+    #= a temporary's value (a tuple equation's call: _tupleAssignments) =#
+    x.op == :setlocal && return Expr(:(=), args...)
     x.op == :assertcall && return :(($(args[1])) || _assertFailed(p, $(args[3]), ($(args[3]), _col), t, $(args[2])))
     x.op == :seq && return Expr(:block, args...)
     x.op == :arrayval && return length(args[1]) == 1 ? Expr(:vect, args[2:end]...) :
@@ -2236,10 +2243,6 @@ function _vtype(v::F.Variable)::Symbol
   ns("variable type of $(_str(v.name))")
 end
 
-#= The model's Modelica functions as Julia functions of the module (the MTK path's code
-   generation: SimulationCode.generateSimCodeFunctions, AlgorithmicCodeGeneration.generateFunctions),
-   each a module constant named as the frontend's function list names it (dots as _), so the
-   equations and the functions' calls of each other find it. Returns (definitions, outputs). =#
 #= Whether generated code raises an error (a function's assert: Base.error). =#
 function _containsErrorCall(@nospecialize(x))::Bool
   x isa AbstractVector && return any(_containsErrorCall, x)
@@ -2248,6 +2251,10 @@ function _containsErrorCall(@nospecialize(x))::Bool
   return any(_containsErrorCall, x.args)
 end
 
+#= The model's Modelica functions as Julia functions of the module (the MTK path's code
+   generation: SimulationCode.generateSimCodeFunctions, AlgorithmicCodeGeneration.generateFunctions),
+   each a module constant named as the frontend's function list names it (dots as _), so the
+   equations and the functions' calls of each other find it. Returns (definitions, outputs). =#
 function _functionDefinitions(functions)
   local defs = Any[]; local outs = Dict{String, Int}()
   (functions === nothing || isempty(functions)) && return (defs, outs)

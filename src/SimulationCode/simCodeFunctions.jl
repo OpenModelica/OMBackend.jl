@@ -92,7 +92,7 @@ end
    path (CodeGeneration: generateFunctions). =#
 const FUNCTION_DERIVATIVES = Dict{String, Tuple{String, Vector{Int}, Int}}()
 
-function _registerFunctionDerivative!(n::String, d, nInputs::Int)
+function _registerFunctionDerivative!(n::String, d::OMFrontend.Frontend.NFFunctionDerivative, nInputs::Int)
   (d.order isa OMFrontend.Frontend.INTEGER_EXPRESSION && d.order.value == 1) || return nothing
   local fns = OMFrontend.Frontend.getCachedFuncs(d.derivativeFn)
   isempty(fns) && return nothing
@@ -107,11 +107,8 @@ end
 const EXTERNAL_C_ANNOTATIONS = Dict{Symbol, String}()
 
 function _registerExternalAnnotation!(libInfo::AbstractString, annotation::AbstractString)
-  local call = try
-    Meta.parse(libInfo)
-  catch
-    return nothing
-  end
+  #= not parsed (raise = false): an :error or :incomplete expression, refused below =#
+  local call = Meta.parse(libInfo; raise = false)
   call isa Expr && call.head === :toplevel && length(call.args) == 1 && (call = call.args[1])
   call isa Expr && call.head === :(=) && (call = call.args[2])
   (call isa Expr && call.head === :call && call.args[1] isa Symbol) || return nothing

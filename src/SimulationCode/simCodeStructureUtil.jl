@@ -255,9 +255,13 @@ toSimExp(e::DAE.CREF)::Exp =
    subscripts only, the cref became the whole array. As an ASUB of the array. =#
 function _hasVariableIndex(@nospecialize(cref::DAE.ComponentRef))::Bool
   cref isa DAE.CREF_IDENT || return false
-  local subs = collect(cref.subscriptLst)
-  return !isempty(subs) && all(s -> s isa DAE.INDEX, subs) &&
-         any(s -> !(s.exp isa DAE.ICONST || s.exp isa DAE.ENUM_LITERAL), subs)
+  #= every cref of every conversion comes here: the list walked, not collected =#
+  local variable = false
+  for s in cref.subscriptLst
+    s isa DAE.INDEX || return false
+    (s.exp isa DAE.ICONST || s.exp isa DAE.ENUM_LITERAL) || (variable = true)
+  end
+  return variable
 end
 
 function _variableIndexAsub(e::DAE.CREF)::Exp

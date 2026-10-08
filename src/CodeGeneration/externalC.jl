@@ -64,7 +64,8 @@ function _compileIncludeLibrary(code::String, dirs::Vector{String})::String
   local cmd = `cc -shared -fPIC -O1 -w $undefinedFlag $incs -o $tmp $src`
   try
     run(pipeline(cmd; stdout = devnull, stderr = joinpath(dir, "src" * key * ".log")))
-  catch
+  catch e
+    e isa ProcessFailedException || rethrow()
     CodeGeneration.unsupported("an external C function whose Include code does not compile (" *
                           joinpath(dir, "src" * key * ".log") * ")", first(code, 200))
   end
@@ -73,7 +74,7 @@ function _compileIncludeLibrary(code::String, dirs::Vector{String})::String
 end
 
 #= The C type of a Modelica scalar type (DAE). =#
-function _cScalarType(@nospecialize(ty))
+function _cScalarType(@nospecialize(ty::DAE.Type))
   ty isa DAE.T_REAL && return :Cdouble
   (ty isa DAE.T_INTEGER || ty isa DAE.T_BOOL || ty isa DAE.T_ENUMERATION) && return :Cint
   ty isa DAE.T_STRING && return :Cstring
@@ -90,7 +91,7 @@ For an external "C" function (SimulationCode.EXTERNAL_MODELICA_FUNCTION) whose C
 OMRuntimeExternalC does not have and whose annotation has an Include: compile the code and
 define the function in OMRuntimeExternalC.
 """
-function ensureExternalC!(func)
+function ensureExternalC!(func::SimulationCode.EXTERNAL_MODELICA_FUNCTION)
   local call = Meta.parse(func.libInfo)
   call isa Expr && call.head === :toplevel && length(call.args) == 1 && (call = call.args[1])
   local (resultVar, callExpr) = call isa Expr && call.head === :(=) ? (call.args[1], call.args[2]) : (nothing, call)
@@ -104,11 +105,8 @@ function ensureExternalC!(func)
      or one that does not exist, is no directory =#
   local dirs = String[]
   for d in _annotationStrings(ann, "IncludeDirectory")
-    local path = try
-      SimulationCode.OMFrontend.resolveModelicaURI(d)
-    catch
-      nothing
-    end
+    local path = CodeGeneration.OMBackend._tryOr(() -> SimulationCode.OMFrontend.resolveModelicaURI(d), nothing,
+                                                 :externalCIncludeDirectory; only = ErrorException)
     path !== nothing && isdir(path) && push!(dirs, path)
   end
   local lib = _compileIncludeLibrary(join(includes, "\n"), dirs)

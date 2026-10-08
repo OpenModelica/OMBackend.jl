@@ -843,8 +843,8 @@ end
 
 #= `visitor` substitutes (substituteAliasCref; substituteConstantParameter for the
    eliminated parameters' values). =#
-function _substituteAliasInInitialAlgorithms(initialAlgs::Vector{INITIAL_ALGORITHM}, aliasMap;
-                                             visitor = substituteAliasCref)::Vector{INITIAL_ALGORITHM}
+function _substituteAliasInInitialAlgorithms(initialAlgs::Vector{INITIAL_ALGORITHM}, aliasMap::AbstractDict{String};
+                                             visitor::Function = substituteAliasCref)::Vector{INITIAL_ALGORITHM}
   local result = INITIAL_ALGORITHM[]
   sizehint!(result, length(initialAlgs))
   for ia in initialAlgs
@@ -855,7 +855,7 @@ function _substituteAliasInInitialAlgorithms(initialAlgs::Vector{INITIAL_ALGORIT
   return result
 end
 
-function _substituteAliasInInitialWhenOp(stmt, aliasMap; visitor = substituteAliasCref)
+function _substituteAliasInInitialWhenOp(stmt::WhenOperator, aliasMap::AbstractDict{String}; visitor::Function = substituteAliasCref)
   if stmt isa ASSIGN
     local (newL, _) = traverseExpTopDown(stmt.left, visitor, aliasMap)
     local (newR, _) = traverseExpTopDown(stmt.right, visitor, aliasMap)
@@ -881,7 +881,7 @@ function _substituteAliasInInitialWhenOp(stmt, aliasMap; visitor = substituteAli
   return stmt
 end
 
-function _substituteAliasInInitialDAEStmt(stmt, aliasMap; visitor = substituteAliasCref)
+function _substituteAliasInInitialDAEStmt(stmt::DAE.Statement, aliasMap::AbstractDict{String}; visitor::Function = substituteAliasCref)
   return @match stmt begin
     DAE.STMT_ASSIGN(ty, e1, e, src) => begin
       local (newL, _) = Util.traverseExpTopDown(e1, visitor, aliasMap)
@@ -933,7 +933,7 @@ function _substituteAliasInInitialDAEStmt(stmt, aliasMap; visitor = substituteAl
   end
 end
 
-function _substituteAliasInInitialDAEElse(else_, aliasMap; visitor = substituteAliasCref)
+function _substituteAliasInInitialDAEElse(else_::DAE.Else, aliasMap::AbstractDict{String}; visitor::Function = substituteAliasCref)
   return @match else_ begin
     DAE.ELSE(stmts) =>
       DAE.ELSE(MetaModelica.list((_substituteAliasInInitialDAEStmt(s, aliasMap; visitor) for s in stmts)...))

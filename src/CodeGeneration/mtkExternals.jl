@@ -126,7 +126,7 @@ function _centralPartial(impl, args::Tuple, idx::Tuple, rel::Float64)::Float64
   return (up - dn) / (2h)
 end
 
-_partialTerm(p, args) = SymbolicUtils.Term{SymbolicUtils.SymReal}(p, collect(Any, args); type = Real)
+_partialTerm(p::ModelicaFunctionPartial, args::AbstractVector) = SymbolicUtils.Term{SymbolicUtils.SymReal}(p, collect(Any, args); type = Real)
 
 function Symbolics.derivative_rule(p::ModelicaFunctionPartial{N, K}, ::Val{N},
                                    args::SymbolicUtils.ROArgsT{Symbolics.VartypeT}, ::Val{I}) where {N, K, I}

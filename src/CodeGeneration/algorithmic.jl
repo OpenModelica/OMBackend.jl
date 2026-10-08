@@ -336,7 +336,7 @@ end
    CodeGeneration.FUNCTION_DERIVATIVE_RULES): the derivative function and, in order, the
    inputs whose derivatives it takes (the Real ones without zeroDerivative/noDerivative).
    Scalar inputs only: flattened records move the positions. =#
-function _functionDerivativeRuleExpr(func, functions)
+function _functionDerivativeRuleExpr(func::SimulationCode.ModelicaFunction, functions::Vector{SimulationCode.ModelicaFunction})
   local d = get(SimulationCode.FUNCTION_DERIVATIVES, func.name, nothing)
   d === nothing && return nothing
   local (derName, excluded, nInputs) = d

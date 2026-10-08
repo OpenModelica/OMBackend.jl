@@ -228,8 +228,9 @@ end
 
 #= An initial if-equation whose conditions the build evaluates is the equations
    of its branch (Buildings' Movers: if curve == 1 then preDer1 = ... on a
-   parameter curve); one it does not stays an if-equation. =#
-function _pushInitialEquation!(out, @nospecialize(eq), simCode::SIM_CODE)
+   parameter curve); one it does not stays an if-equation. `eq` is any initial equation
+   (BDAE or SimCode). =#
+function _pushInitialEquation!(out::AbstractVector, @nospecialize(eq), simCode::SIM_CODE)
   if !(eq isa INLINE_IF_EQUATION)
     push!(out, _rewriteInitialIfExp(eq, simCode))
     return out

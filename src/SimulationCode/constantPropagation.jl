@@ -165,6 +165,27 @@ function inlinePreOfConstantParameters(simCode::SIM_CODE)::SIM_CODE
   return simCode
 end
 
+#= The substitution of the unknowns bound to a parameter or constant, with der() of one 0
+   (a traversal visitor: `exp` is any DAE or SimCode expression):
+   der(param) kept a state of that derivative from being one of zero derivative
+   (Buildings' WaterDerivativeCheck: cpCod = Medium.cp_const, der(cpCod) = der(cpSym)), and
+   ModelingToolkit made that state a parameter, without its initial equation. =#
+function _substituteConstCref(exp::CALL, constMap::AbstractDict{String})
+  if exp.path isa Absyn.IDENT && exp.path.name == "der" && length(exp.args) == 1 && exp.args[1] isa EXP_CREF &&
+     haskey(constMap, DAE_identifierToString(toDAECref(exp.args[1].cref).componentRef))
+    return (RCONST(0.0), false, constMap)
+  end
+  return substituteAliasCref(exp, constMap)
+end
+
+function _substituteConstCref(@nospecialize(exp), constMap::AbstractDict{String})
+  if exp isa DAE.CALL && exp.path isa Absyn.IDENT && exp.path.name == "der" && !listEmpty(exp.expLst) &&
+     listHead(exp.expLst) isa DAE.CREF && haskey(constMap, DAE_identifierToString(listHead(exp.expLst).componentRef))
+    return (DAE.RCONST(0.0), false, constMap)
+  end
+  return substituteAliasCref(exp, constMap)
+end
+
 """
     propagateConstants(simCode::SIM_CODE)::SIM_CODE
 
@@ -179,26 +200,6 @@ Preserves equation-unknown balance: each constant propagation removes 1 equation
 and 1 unknown. Trivial equation removal only removes equations that have no
 unknowns (no balance impact).
 """
-#= The substitution of the unknowns bound to a parameter or constant, with der() of one 0:
-   der(param) kept a state of that derivative from being one of zero derivative
-   (Buildings' WaterDerivativeCheck: cpCod = Medium.cp_const, der(cpCod) = der(cpSym)), and
-   ModelingToolkit made that state a parameter, without its initial equation. =#
-function _substituteConstCref(exp::CALL, constMap)
-  if exp.path isa Absyn.IDENT && exp.path.name == "der" && length(exp.args) == 1 && exp.args[1] isa EXP_CREF &&
-     haskey(constMap, DAE_identifierToString(toDAECref(exp.args[1].cref).componentRef))
-    return (RCONST(0.0), false, constMap)
-  end
-  return substituteAliasCref(exp, constMap)
-end
-
-function _substituteConstCref(@nospecialize(exp), constMap)
-  if exp isa DAE.CALL && exp.path isa Absyn.IDENT && exp.path.name == "der" && !listEmpty(exp.expLst) &&
-     listHead(exp.expLst) isa DAE.CREF && haskey(constMap, DAE_identifierToString(listHead(exp.expLst).componentRef))
-    return (DAE.RCONST(0.0), false, constMap)
-  end
-  return substituteAliasCref(exp, constMap)
-end
-
 function propagateConstants(simCode::SIM_CODE)
   #= Guard: skip for VSS or multi-mode models =#
   if hasStructuralTransitions(simCode) || hasSubModels(simCode)

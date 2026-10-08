@@ -44,8 +44,27 @@ module IMTKGen
 import ..CodeGeneration
 import ..SimulationCode
 
-#= Build tspan is arbitrary; simulateIMTK remakes the cached problem for its tspan. =#
-const IMTK_BUILD_TSPAN = (0.0, 1.0)
+#= The build's start time: the initialization is solved at it, and simulateIMTK remakes the
+   cached problem for a tspan from that start (another start builds again). OM.simulate
+   builds at its startTime (withBuildStart): built at 0, a simulation from another start
+   built twice, and again at each run. =#
+const IMTK_BUILD_START = Ref(0.0)
+_buildTspan() = (IMTK_BUILD_START[], IMTK_BUILD_START[] + 1.0)
+
+"""
+    withBuildStart(f, t0)
+
+Run `f()` with the iMTK builds at start time `t0`, restoring the previous start afterwards.
+"""
+function withBuildStart(f::Function, t0::Real)
+  local previous = IMTK_BUILD_START[]
+  IMTK_BUILD_START[] = Float64(t0)
+  try
+    return f()
+  finally
+    IMTK_BUILD_START[] = previous
+  end
+end
 
 #= Optional: dump the post-simplify System to backend/imtk/ when enabled. =#
 const DUMP_ENABLED = Ref(false)
@@ -125,7 +144,7 @@ function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
   return (modelName, modelCode)
 end
 
-#= Eval the module, invoke `<name>Model(IMTK_BUILD_TSPAN)` (runs structural_simplify),
+#= Eval the module, invoke `<name>Model(_buildTspan())` (runs structural_simplify),
    and cache the resulting 9-tuple. The post-simplify System (element 5) is also
    stashed for the optional dump and external inspection via `reducedSystem`. =#
 function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool = false)
@@ -135,9 +154,10 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
      cached build mean the compiled methods and the problem are still valid.
      Re-eval'ing identical code would only invalidate `simulateFromBuild` and
      friends, forcing a full recompile on the next solve. Flags read at build
-     time (not codegen) are folded into the hash so a flag flip still rebuilds.
+     time (not codegen) and the start time are folded into the hash so a flag
+     flip or another start still rebuilds.
      `overwriteCache` bypasses this reuse check to force a fresh rebuild. =#
-  local buildHash = hash((modelCode, OMB.DIRECT_RHS_GENERATION[],
+  local buildHash = hash((modelCode, IMTK_BUILD_START[], OMB.DIRECT_RHS_GENERATION[],
                           OMB.DIRECT_JAC_GENERATION[], OMB.DIRECT_JAC_TREE_NODE_LIMIT[],
                           OMB.DIRECT_RHS_TYPE_ERASE[]))
   if !overwriteCache && get(BUILT_HASH, cname, UInt64(0)) == buildHash &&
@@ -166,7 +186,7 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
     local build = () -> Base.invokelatest() do
       local mod = getfield(OMB, Symbol(modelName))
       local modelFn = getfield(mod, Symbol(string(modelName, "Model")))
-      modelFn(IMTK_BUILD_TSPAN)
+      modelFn(_buildTspan())
     end
     #= A derivative of a call without a derivative annotation that the index reduction
        needs: once more with the numeric partials (CodeGeneration.NUMERIC_PARTIALS). =#
