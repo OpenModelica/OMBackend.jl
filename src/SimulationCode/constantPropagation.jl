@@ -179,6 +179,26 @@ Preserves equation-unknown balance: each constant propagation removes 1 equation
 and 1 unknown. Trivial equation removal only removes equations that have no
 unknowns (no balance impact).
 """
+#= The substitution of the unknowns bound to a parameter or constant, with der() of one 0:
+   der(param) kept a state of that derivative from being one of zero derivative
+   (Buildings' WaterDerivativeCheck: cpCod = Medium.cp_const, der(cpCod) = der(cpSym)), and
+   ModelingToolkit made that state a parameter, without its initial equation. =#
+function _substituteConstCref(exp::CALL, constMap)
+  if exp.path isa Absyn.IDENT && exp.path.name == "der" && length(exp.args) == 1 && exp.args[1] isa EXP_CREF &&
+     haskey(constMap, DAE_identifierToString(toDAECref(exp.args[1].cref).componentRef))
+    return (RCONST(0.0), false, constMap)
+  end
+  return substituteAliasCref(exp, constMap)
+end
+
+function _substituteConstCref(@nospecialize(exp), constMap)
+  if exp isa DAE.CALL && exp.path isa Absyn.IDENT && exp.path.name == "der" && !listEmpty(exp.expLst) &&
+     listHead(exp.expLst) isa DAE.CREF && haskey(constMap, DAE_identifierToString(listHead(exp.expLst).componentRef))
+    return (DAE.RCONST(0.0), false, constMap)
+  end
+  return substituteAliasCref(exp, constMap)
+end
+
 function propagateConstants(simCode::SIM_CODE)
   #= Guard: skip for VSS or multi-mode models =#
   if hasStructuralTransitions(simCode) || hasSubModels(simCode)
@@ -264,7 +284,7 @@ function propagateConstants(simCode::SIM_CODE)
          so that chained constant patterns are revealed in the next iteration =#
       local updatedEqs = RESIDUAL_EQUATION[]
       for (i, eq) in enumerate(resEqs)
-        local (newExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
+        local (newExp, _) = traverseExpTopDown(eq.exp, _substituteConstCref, constMap)
         push!(updatedEqs, typeof(eq)(newExp, eq.source, eq.attr))
       end
       resEqs = updatedEqs
@@ -299,11 +319,11 @@ function propagateConstants(simCode::SIM_CODE)
   for (i, eq) in enumerate(simCode.residualEquations)
     if i in allRemoved
       if i in constEqIndices && haskey(eqIdxToUnknown, i)
-        local (subExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
+        local (subExp, _) = traverseExpTopDown(eq.exp, _substituteConstCref, constMap)
         push!(elimPairs, (eqIdxToUnknown[i], eq, typeof(eq)(subExp, eq.source, eq.attr)))
       end
     else
-      local (newExp, _) = traverseExpTopDown(eq.exp, substituteAliasCref, constMap)
+      local (newExp, _) = traverseExpTopDown(eq.exp, _substituteConstCref, constMap)
       collectCrefNames!(allRefNames, newExp)
       push!(newResEqs, typeof(eq)(newExp, eq.source, eq.attr))
     end
@@ -316,11 +336,11 @@ function propagateConstants(simCode::SIM_CODE)
     for branch in ifEq.branches
       local newBranchEqs = RESIDUAL_EQUATION[]
       for brEq in branch.residualEquations
-        local (newBrExp, _) = traverseExpTopDown(brEq.exp, substituteAliasCref, constMap)
+        local (newBrExp, _) = traverseExpTopDown(brEq.exp, _substituteConstCref, constMap)
         collectCrefNames!(allRefNames, newBrExp)
         push!(newBranchEqs, typeof(brEq)(newBrExp, brEq.source, brEq.attr))
       end
-      local (newCond, _) = traverseExpTopDown(branch.condition, substituteAliasCref, constMap)
+      local (newCond, _) = traverseExpTopDown(branch.condition, _substituteConstCref, constMap)
       push!(newBranches, BRANCH(newCond, newBranchEqs,
                                 branch.identifier, branch.targets, branch.isSingular,
                                 branch.matchOrder, branch.equationGraph, branch.sccs,
@@ -338,7 +358,7 @@ function propagateConstants(simCode::SIM_CODE)
   local newWhenEqs = WHEN_EQUATION[]
   for whenEq in simCode.whenEquations
     local innerWhen = whenEq.whenEquation
-    local (newCond, _) = traverseExpTopDown(innerWhen.condition, substituteAliasCref, constMap)
+    local (newCond, _) = traverseExpTopDown(innerWhen.condition, _substituteConstCref, constMap)
     @assign innerWhen.condition = toSimExp(newCond)
     @assign whenEq.whenEquation = innerWhen
     push!(newWhenEqs, whenEq)
@@ -348,18 +368,18 @@ function propagateConstants(simCode::SIM_CODE)
   local newInitEqs = typeof(simCode.initialEquations)()
   for initEq in simCode.initialEquations
     if initEq isa BDAE.RESIDUAL_EQUATION || initEq isa RESIDUAL_EQUATION
-      local (newInitExp, _) = Util.traverseExpTopDown(toDAEExp(initEq.exp), substituteAliasCref, constMap)
+      local (newInitExp, _) = Util.traverseExpTopDown(toDAEExp(initEq.exp), _substituteConstCref, constMap)
       collectCrefNames!(allRefNames, newInitExp)
       push!(newInitEqs, typeof(initEq)(newInitExp, initEq.source, initEq.attr))
     elseif initEq isa BDAE.EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteAliasCref, constMap)
-      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteAliasCref, constMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), _substituteConstCref, constMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), _substituteConstCref, constMap)
       collectCrefNames!(allRefNames, newLhs)
       collectCrefNames!(allRefNames, newRhs)
       push!(newInitEqs, BDAE.EQUATION(newLhs, newRhs, initEq.source, initEq.attributes))
     elseif initEq isa EQUATION
-      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), substituteAliasCref, constMap)
-      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), substituteAliasCref, constMap)
+      local (newLhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.lhs), _substituteConstCref, constMap)
+      local (newRhs, _) = Util.traverseExpTopDown(toDAEExp(initEq.rhs), _substituteConstCref, constMap)
       collectCrefNames!(allRefNames, newLhs)
       collectCrefNames!(allRefNames, newRhs)
       push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
@@ -408,7 +428,7 @@ function propagateConstants(simCode::SIM_CODE)
   local keptMap = isempty(survivingRefs) ? constMap : filter(kv -> !(first(kv) in survivingRefs), constMap)
   for (varName, origEq, subEq) in elimPairs
     if varName in survivingRefs
-      local (keptExp, _) = traverseExpTopDown(origEq.exp, substituteAliasCref, keptMap)
+      local (keptExp, _) = traverseExpTopDown(origEq.exp, _substituteConstCref, keptMap)
       push!(newResEqs, typeof(origEq)(keptExp, origEq.source, origEq.attr))
       continue
     elseif !haskey(newHT, varName)
