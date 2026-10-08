@@ -2317,6 +2317,9 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
   for v in fm.variables
     local nm = _crefName(v.name)
     F.hasKnownSize(v.ty) || ns("$(nm) of unknown size")
+    #= its value a C pointer, no Float64 (Buildings' ExtendableArray in the borehole
+       examples); the MTK path holds it as a data structure =#
+    F.isExternalObject(F.arrayElementType(v.ty)) && ns("the external object $(nm)")
     local dims = F.isArray(v.ty) ? [F.size(d) for d in F.arrayDims(v.ty)] : Int[]
     local nparts = length(_partsRootFirst(v.name))
     local perPart = isempty(dims) ? zeros(Int, nparts) :
