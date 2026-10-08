@@ -873,6 +873,51 @@ function _splitSampleCondition(cond)
   return (samples[1], guard)
 end
 
+#= The sample() calls of a condition that is only sample()s or-ed, or nothing. =#
+function _sampleDisjuncts(@nospecialize(cond))::Union{Vector{Any}, Nothing}
+  local out = Any[]
+  local collect! = nothing
+  collect! = e -> begin
+    @match e begin
+      DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) => (collect!(e1) && collect!(e2))
+      DAE.CALL(path = Absyn.IDENT("sample")) => (push!(out, e); true)
+      _ => false
+    end
+  end
+  return (collect!(cond) && length(out) > 1) ? out : nothing
+end
+
+#= (interval, phase, a tick at the initial time) of `sample(start, interval)`. =#
+function _sampleClock(@nospecialize(sampleCall::DAE.Exp), simCode::SimulationCode.SIM_CODE)::Tuple{Any, Float64, Bool}
+  @match DAE.CALL(Absyn.IDENT("sample"), args, _) = sampleCall
+  @match start <| interval <| _ = args
+  local _intervalVal = SimulationCode.tryEvalNumeric(interval, simCode)
+  local _dtExpr = _intervalVal === nothing ? expToJuliaExp(interval, simCode) : _intervalVal
+  #= The ticks are start + i*interval, i = 0, 1, ...: the phase is the first
+     one from the initial time (taken as 0). A start not known here was taken
+     as 0 (generated code cannot read the parameters at module level), a
+     negative one as 0 too (sample(-0.15, 0.25) ticked at 0.25, not 0.1). =#
+  local _startVal = SimulationCode.tryEvalNumeric(start, simCode)
+  #= one an initial algorithm assigns (CDL's samplers and pulses: t0) =#
+  _startVal === nothing && (_startVal = SimulationCode.valueAtBuildStart(start, simCode))
+  _startVal === nothing && unsupported("a sample() start not known at the build", start)
+  local _firstTick = Float64(_startVal)
+  if _firstTick < 0
+    _intervalVal === nothing && unsupported("a negative sample() start with an interval not known at the build", sampleCall)
+    _firstTick += ceil(-_firstTick / Float64(_intervalVal)) * Float64(_intervalVal)
+    #= Rounding: sample(-0.9, 0.3) gave -1.1e-16, a negative phase (an
+       ArgumentError) and no tick at 0. =#
+    abs(_firstTick) <= 8 * eps(max(1.0, abs(Float64(_intervalVal)))) && (_firstTick = 0.0)
+    _firstTick = max(0.0, _firstTick)
+  end
+  local _phaseExpr = _firstTick
+  #= A tick at the initial time is taken too, after initialization (omc,
+     Dymola): MSL RealFFT1's `when sample(0, Ts)` samples y(0) into its FFT
+     buffer. =#
+  local _initialTick = iszero(_firstTick)
+  return (_dtExpr, _phaseExpr, _initialTick)
+end
+
 _containsSampleCall(e) = _containsCallTo(e, "sample")
 _containsCallTo(e, name::String) = any(c -> _isCallNamed(c, name), _allCalls(e))
 _isCallNamed(@nospecialize(e), name::String) = e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == name
@@ -904,14 +949,17 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
      `when generateNoise and sample(startTime, samplePeriod)`): periodic, the
      guard read at each tick. =#
   local (sampleCall, sampleGuard) = _splitSampleCondition(wEqCondDAE)
+  #= or-ed sample()s alone (CDL's Boolean and Integer TimeTable: `when {sample(t0 +
+     timeStamps[1], period), sample(t0 + timeStamps[2], period), ...}`): a clock each, one body. =#
+  local sampleCalls = sampleCall !== nothing ? Any[sampleCall] : _sampleDisjuncts(wEqCondDAE)
   #= Lowered elsewhere: a sample() alone or and-ed with a guard, terminal()
      alone (after the solve). Not in MSL 3.2.3; sample() read false, terminal()
      undefined: never fired. =#
-  sampleCall === nothing && _containsSampleCall(wEqCondDAE) &&
-    unsupported("sample() under or/not, or two sample() calls, in a when-condition", wEqCondDAE)
+  sampleCalls === nothing && _containsSampleCall(wEqCondDAE) &&
+    unsupported("sample() under not, or or-ed with another condition, in a when-condition", wEqCondDAE)
   _containsCallTo(wEqCondDAE, "terminal") && !_isCallNamed(wEqCondDAE, "terminal") &&
     unsupported("terminal() with another trigger in a when-condition", wEqCondDAE)
-  local isPeriodic = sampleCall !== nothing
+  local isPeriodic = sampleCalls !== nothing
   local isContinuousCond::Bool = isContinuousCondition(wEqCondDAE, simCode)
   #= Table / time-driven sources: a when whose condition is purely change(time>=c)
      thresholds must fire AT those times via PresetTimeCallback — a ContinuousCallback
@@ -1132,8 +1180,6 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
   elseif isPeriodic
-    @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = sampleCall
-    @match start <| interval <| tail = args
     #= MTK-aware periodic affect: the hardcoded x[N]/p[N] indices from
        expToJuliaExp are invalid after MTK structural_simplify reorders unknowns,
        so resolve the interval to a literal Δt and write state via
@@ -1155,38 +1201,24 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
     local (_dbRefreshCrefs, _dbRefreshStmts) = _collectDiscreteBoolWhenRefresh(_periodicWrittenLHS, simCode)
-    local _intervalVal = SimulationCode.tryEvalNumeric(interval, simCode)
-    local _dtExpr = _intervalVal === nothing ? expToJuliaExp(interval, simCode) : _intervalVal
-    #= The ticks are start + i*interval, i = 0, 1, ...: the phase is the first
-       one from the initial time (taken as 0). A start not known here was taken
-       as 0 (generated code cannot read the parameters at module level), a
-       negative one as 0 too (sample(-0.15, 0.25) ticked at 0.25, not 0.1). =#
-    local _startVal = SimulationCode.tryEvalNumeric(start, simCode)
-    #= one an initial algorithm assigns (CDL's samplers and pulses: t0) =#
-    _startVal === nothing && (_startVal = SimulationCode.valueAtBuildStart(start, simCode))
-    _startVal === nothing && unsupported("a sample() start not known at the build", start)
-    local _firstTick = Float64(_startVal)
-    if _firstTick < 0
-      _intervalVal === nothing && unsupported("a negative sample() start with an interval not known at the build", sampleCall)
-      _firstTick += ceil(-_firstTick / Float64(_intervalVal)) * Float64(_intervalVal)
-      #= Rounding: sample(-0.9, 0.3) gave -1.1e-16, a negative phase (an
-         ArgumentError) and no tick at 0. =#
-      abs(_firstTick) <= 8 * eps(max(1.0, abs(Float64(_intervalVal)))) && (_firstTick = 0.0)
-      _firstTick = max(0.0, _firstTick)
-    end
-    local _phaseExpr = _firstTick
-    #= A tick at the initial time is taken too, after initialization (omc,
-       Dymola): MSL RealFFT1's `when sample(0, Ts)` samples y(0) into its FFT
-       buffer. =#
-    local _initialTick = iszero(_firstTick)
+    #= (interval, phase, a tick at the initial time) of each clock =#
+    local _clocks = [_sampleClock(c, simCode) for c in sampleCalls]
     local _guardCrefs = sampleGuard === nothing ? DAE.ComponentRef[] : listArray(Util.getAllCrefs(sampleGuard))
     local _guardExpr = sampleGuard === nothing ? true : expToJuliaExpMTK(sampleGuard, simCode)
     quote
-      let _affCache = Ref{Any}(nothing)
+      let _affCache = Ref{Any}(nothing), _lastTick = Ref(NaN)
         global $(Symbol("affect$(callbacks)!"))
         $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
-          OMBackend.CodeGeneration._isPeriodicTick(integrator, $(Symbol("samplePhase$(callbacks)")),
-                                                   $(Symbol("sampleDt$(callbacks)"))) || return nothing
+          $(length(_clocks) == 1 ?
+            :(OMBackend.CodeGeneration._isPeriodicTick(integrator, $(Symbol("samplePhase$(callbacks)")),
+                                                       $(Symbol("sampleDt$(callbacks)"))) || return nothing) :
+            quote
+              any(c -> OMBackend.CodeGeneration._isPeriodicTick(integrator, c[2], c[1]), $(Symbol("sampleClocks$(callbacks)"))) ||
+                return nothing
+              #= two clocks on one instant: the body once =#
+              _lastTick[] == integrator.t && return nothing
+              _lastTick[] = integrator.t
+            end)
           local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)
           local t = integrator.t
           local x = integrator.u
@@ -1213,14 +1245,19 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           $(_dbRefreshStmts...)
         end
       end
-      $(Symbol("sampleDt$(callbacks)")) = $(_dtExpr)
-      $(Symbol("samplePhase$(callbacks)")) = $(_phaseExpr)
+      $(Symbol("sampleDt$(callbacks)")) = $(_clocks[1][1])
+      $(Symbol("samplePhase$(callbacks)")) = $(_clocks[1][2])
+      $(Symbol("sampleClocks$(callbacks)")) = Any[$([:(($(c[1]), $(c[2]))) for c in _clocks]...)]
       #= Ticks at start + i*interval, the initial and the final time included
          (_isPeriodicTick). =#
-      $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), $(Symbol("sampleDt$(callbacks)"));
-                                                      phase = $(Symbol("samplePhase$(callbacks)")),
-                                                      initial_affect = $(_initialTick), final_affect = true,
-                                                      save_positions = (true, true))
+      $(Symbol("cb$(callbacks)")) = $(length(_clocks) == 1 ?
+        :(PeriodicCallback($(Symbol("affect$(callbacks)!")), $(Symbol("sampleDt$(callbacks)"));
+                           phase = $(Symbol("samplePhase$(callbacks)")),
+                           initial_affect = $(_clocks[1][3]), final_affect = true,
+                           save_positions = (true, true))) :
+        Expr(:call, :CallbackSet, [:(PeriodicCallback($(Symbol("affect$(callbacks)!")), $(c[1]);
+                                                        phase = $(c[2]), initial_affect = $(c[3]), final_affect = true,
+                                                        save_positions = (true, true))) for c in _clocks]...))
       $(if wEq.elsewhenPart !== nothing
           eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4)
         end)
