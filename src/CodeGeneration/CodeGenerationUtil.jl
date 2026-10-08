@@ -755,6 +755,8 @@ Check if an initial equation only involves parameters (no state/algebraic variab
 Such equations determine parameter values and should not be treated as initial conditions.
 """
 function isParametricOnlyEquation(eq, simCode::SimulationCode.SimCode)::Bool
+  #= an if-equation (INLINE_IF_EQUATION: CDL SunRiseSet, the hydronic networks) has no sides =#
+  hasEquationSides(eq) || return false
   ht = simCode.stringToSimVarHT
   hasStateOrAlg = Ref(false)
   function checker(exp, acc)

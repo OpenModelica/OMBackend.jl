@@ -135,6 +135,18 @@ function _readsUnboundParameter(ieq, simCode::SimulationCode.SIM_CODE)::Bool
   end
 end
 
+#= Whether `e` reads a state, an algebraic or a discrete variable, or one the passes eliminated
+   (in no table). =#
+function _readsUnknown(e::DAE.Exp, simCode::SimulationCode.SIM_CODE)::Bool
+  local ht = simCode.stringToSimVarHT
+  return any(Util.getAllCrefs(e)) do c
+    local name = string(c)
+    local entry = get(ht, name, nothing)
+    entry === nothing ? name != "time" :
+      (SimulationCode.isStateOrAlgebraic(last(entry)) || SimulationCode.isDiscrete(last(entry)))
+  end
+end
+
 """
   Generates initial equations.
   Currently unsorted unless they are sorted before being passed to the simulation code phase.
@@ -152,6 +164,11 @@ function generateInitialEquations(initialEqs, simCode::SimulationCode.SIM_CODE; 
     end
     local ieqLhsDAE = SimulationCode.toDAEExp(ieq.lhs)
     local ieqRhsDAE = SimulationCode.toDAEExp(ieq.rhs)
+    #= A guess only from what the build knows: an expression reading an unknown is no value
+       here (an eliminated one is not even defined: the lowered initial if-equation of CDL
+       SunRiseSet reads cosHou); the equation stays a constraint. A plain unknown is its
+       variable. =#
+    !(ieqRhsDAE isa DAE.CREF) && _readsUnknown(ieqRhsDAE, simCode) && continue
     #= LHS will typically be a variable. Don't have to be though.. =#
     lhs = expToJuliaExpMTK(ieqLhsDAE, simCode)
     rhs = _initialEquationRhs(ieqRhsDAE, simCode)

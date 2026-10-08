@@ -655,3 +655,39 @@ function toBDAE(eq::RESIDUAL_EQUATION)
                              BDAE.UNKNOWN_EQUATION_KIND(),
                              BDAE.defaultEvalStages))
 end
+
+#= An if-equation among the initial equations (CDL SunRiseSet: `if cosHou < -1 then
+   nextSunSet = f(...) - 86400; else nextSunSet = f(...); end if`): one equation per position
+   of its branches, `v = if c1 then e1 elseif ... else en` where every branch assigns the same v
+   there, else `0 = if c1 then l1 - r1 ...`. Its branches the same number of plain equations
+   (MLS 8.3.4: in a non-parameter condition they must have it); others are left as they are. =#
+function lowerInitialIfEquations!(simCode::SIM_CODE)::Nothing
+  any(e -> e isa INLINE_IF_EQUATION, simCode.initialEquations) || return nothing
+  local out = Equation[]
+  for eq in simCode.initialEquations
+    local lowered = eq isa INLINE_IF_EQUATION ? _lowerIfEquation(eq) : nothing
+    lowered === nothing ? push!(out, eq) : append!(out, lowered)
+  end
+  empty!(simCode.initialEquations)
+  append!(simCode.initialEquations, out)
+  return nothing
+end
+
+function _lowerIfEquation(eq::INLINE_IF_EQUATION)::Union{Vector{Equation}, Nothing}
+  local branches = vcat(eq.branchesTrue, [eq.branchElse])
+  local n = length(first(branches))
+  (n > 0 && all(b -> length(b) == n && all(e -> e isa EQUATION, b), branches)) || return nothing
+  local lhsName = e -> string(toDAEExp(e.lhs))
+  local lowered = Equation[]
+  for k in 1:n
+    local ks = EQUATION[b[k] for b in branches]
+    local sameLhs = ks[1].lhs isa EXP_CREF && all(e -> lhsName(e) == lhsName(ks[1]), ks)
+    local value = e -> sameLhs ? e.rhs : BINARY(e.lhs, OP_SUB, e.rhs)
+    local exp = value(ks[end])
+    for j in length(eq.conditions):-1:1
+      exp = IFEXP(eq.conditions[j], value(ks[j]), exp)
+    end
+    push!(lowered, EQUATION(sameLhs ? ks[1].lhs : RCONST(0.0), exp, eq.source, eq.attr))
+  end
+  return lowered
+end
