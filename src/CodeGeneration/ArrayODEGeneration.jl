@@ -641,7 +641,14 @@ function toIR(g::Gen, @nospecialize(e::F.Expression), ctx::Ctx)::IR
   elseif e isa F.STRING_EXPRESSION
     return Lit(String(e.value))
   elseif e isa F.TUPLE_ELEMENT_EXPRESSION
-    return Op(:index, IR[toIR(g, e.tupleExp, ctx), Lit(e.index)])
+    #= the output, and in an element-wise context its element (Buildings' SignalRanker,
+       y = Vectors.sort(u): the first output, a vector, was assigned to y[k]) =#
+    local out = Op(:index, IR[toIR(g, e.tupleExp, _with(ctx; elem = Int[])), Lit(e.index)])
+    if F.isArray(F.typeOf(e)) && !isempty(ctx.elem)
+      length(ctx.elem) == F.dimensionCount(F.typeOf(e)) || ns("an array output outside an element-wise context")
+      return Op(:index, IR[out, (Slot(k) for k in ctx.elem)...])
+    end
+    return out
   elseif e isa F.CAST_EXPRESSION
     return toIR(g, e.exp, ctx)
   elseif e isa F.CREF_EXPRESSION
@@ -774,6 +781,9 @@ function _callIR(g::Gen, e::F.CALL_EXPRESSION, ctx::Ctx)::IR
       push!(xs, F.isArray(F.typeOf(a)) ? _arrayValueIR(g, a, ctx) : toIR(g, a, _with(ctx; elem = Int[])))
     end
     local call = Op(:fcall, IR[Lit(Symbol(jn)), xs...])
+    #= a function of more outputs typed as its first (no tuple element around it: Buildings'
+       SignalRanker, `y = Modelica.Math.Vectors.sort(u)`): that output, not the tuple =#
+    g.functions[jn] > 1 && !F.isvariant(F.typeOf(e), F.TYPE_TUPLE) && (call = Op(:index, IR[call, Lit(1)]))
     #= an array result in an element-wise context: the element =#
     if F.isArray(F.typeOf(e))
       local nd = F.dimensionCount(F.typeOf(e))

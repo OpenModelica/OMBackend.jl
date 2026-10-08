@@ -115,8 +115,14 @@ end
    (signalPWM[3].sawtooth.count lowered to one name) has no array to grow. =#
 _indexesArray(lhs, name) = lhs isa Expr && lhs.head === :ref && _unwrapSubscriptExpr(lhs.args[1]) === name
 
+#= A range (`a:b`, `a:s:b`). =#
+_isRangeExpr(@nospecialize(x)) = x isa Expr && x.head === :call && !isempty(x.args) && x.args[1] === :(:)
+
 function _algAssignment(@nospecialize(lhsExp), rhs::Expr)
   local lhs = _unwrapSubscriptExpr(expToJuliaExpAlg(lhsExp))
+  #= A range assigned: a Vector, its elements assigned after (MSL Vectors.sort's
+     `indices := 1:size(v, 1)`: setindex! on a UnitRange; Buildings' SignalRanker). =#
+  _isRangeExpr(rhs) && (rhs = :(collect($rhs)))
   local prealloc = _algAssignmentPreallocation(lhsExp)
   if prealloc === nothing || !_indexesArray(lhs, prealloc.args[2])
     return :($lhs = $rhs)
@@ -406,7 +412,7 @@ function generateLocals(inputs::Vector)
       SOME(bindingExp) => begin
         #= An array as a copy: `Real Awork[n, n] = A` is written into, `A` not. =#
         local bindExpr = expToJuliaExpAlg(bindingExp)
-        push!(jInputs, :(local $s = $(_funcParamIsArray(i) ? :(Base.copy($bindExpr)) : bindExpr)))
+        push!(jInputs, :(local $s = $(_funcParamIsArray(i) ? :(collect($bindExpr)) : bindExpr)))
         true
       end
       _ => false
@@ -458,10 +464,12 @@ function generateOutputDefaults(outputs::Vector)::Vector{Expr}
   for v in outputs
     local s = DAE_VAR_ToJulia(v)
     #= An output with a binding starts at it (`output Real x[n] = b`), an array
-       as a copy: the body or a FORTRAN 77 routine writes into it, not into `b`. =#
+       as a copy: the body or a FORTRAN 77 routine writes into it, not into `b`. A
+       Vector: a range's copy was a range (MSL Vectors.sort's `indices = 1:size(v, 1)`,
+       setindex! on a UnitRange: Buildings' SignalRanker). =#
     if v.binding isa SOME
       local bindExpr = expToJuliaExpAlg(v.binding.data)
-      push!(decls, :(local $s = $(_funcParamIsArray(v) ? :(Base.copy($bindExpr)) : bindExpr)))
+      push!(decls, :(local $s = $(_funcParamIsArray(v) ? :(collect($bindExpr)) : bindExpr)))
       continue
     end
     local defaultVal = if _funcParamIsArray(v)
