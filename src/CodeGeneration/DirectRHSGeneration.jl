@@ -1597,12 +1597,14 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
   end
 end
 
-#= The symbolic Jacobian, and where it is not finite at a point (its formula overflows:
+#= The symbolic Jacobian, and where an entry is not finite at a point (its formula overflows:
    d/dv 2/(1 + exp(-k*v)) is Inf/Inf at k*v = -702, MSL AIMC_Conveyor's smooth sign; Buildings'
-   Carnot COP at the start) those columns by central differences of the right-hand side: the
-   step was NaN, the solver Unstable. With the numeric partials the symbolic Jacobian is built
-   for more models; before, a call without a derivative rule sent the whole Jacobian to the
-   solver's finite differences, which hid it. =#
+   Carnot COP at the start) that entry by differences of the right-hand side: the step was NaN,
+   the solver Unstable. Central differences, one-sided where a side leaves the right-hand
+   side's domain (|dT|^n at dT = 0: Buildings' borehole HexInternalElement), the symbolic entry
+   where neither is finite. With the numeric partials the symbolic Jacobian is built for more
+   models; before, a call without a derivative rule sent the whole Jacobian to the solver's
+   finite differences, which hid it. =#
 function _finiteJacobian(symJac::Function, rhsFunc::Function)::Function
   return (J, u, p, t) -> begin
     symJac(J, u, p, t)
@@ -1610,6 +1612,7 @@ function _finiteJacobian(symJac::Function, rhsFunc::Function)::Function
     all(isfinite, nz) && return nothing
     local rows = Symbolics.SparseArrays.rowvals(J)
     local up = similar(u); local duPlus = similar(u); local duMinus = similar(u)
+    local du0 = nothing
     for j in axes(J, 2)
       local r = Symbolics.SparseArrays.nzrange(J, j)
       any(k -> !isfinite(nz[k]), r) || continue
@@ -1617,7 +1620,15 @@ function _finiteJacobian(symJac::Function, rhsFunc::Function)::Function
       copyto!(up, u); up[j] += h; rhsFunc(duPlus, up, p, t)
       copyto!(up, u); up[j] -= h; rhsFunc(duMinus, up, p, t)
       for k in r
-        nz[k] = (duPlus[rows[k]] - duMinus[rows[k]]) / (2h)
+        isfinite(nz[k]) && continue
+        local i = rows[k]
+        local d = (duPlus[i] - duMinus[i]) / (2h)
+        if !isfinite(d)
+          du0 === nothing && (du0 = similar(u); rhsFunc(du0, u, p, t))
+          d = (duPlus[i] - du0[i]) / h
+          isfinite(d) || (d = (du0[i] - duMinus[i]) / h)
+        end
+        isfinite(d) && (nz[k] = d)
       end
     end
     return nothing
