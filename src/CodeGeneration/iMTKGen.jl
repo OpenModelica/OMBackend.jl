@@ -234,7 +234,13 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
   if !isdefined(OMB, Symbol(cname))
     Core.eval(OMB, OMB.getCompiledModel(cname))
   end
-  if haskey(BUILT, cname)
+  #= The cached build is initialized at the build's start time: another start time
+     builds again (its remake only moved tspan, and the simulation started from the
+     initial state at 0: Buildings' DerivativeCheck examples from -1). =#
+  local sameStart = haskey(BUILT, cname) && Float64(tspan[1]) == Float64(BUILT[cname][6][1])
+  sameStart || parameters === nothing ||
+    error("simulating $(modelName) with `parameters` from another start time than its build's")
+  if sameStart
     try
       local cached = BUILT[cname]
       local prob   = OMB.Runtime.ModelingToolkit.SciMLBase.remake(cached[1]; tspan = tspan)

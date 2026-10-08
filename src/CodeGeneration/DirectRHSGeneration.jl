@@ -318,6 +318,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   else
     @debug "DirectRHS: DAE with mass matrix"
+    #= The initialization at the start time (it evaluated at 0 for any start time:
+       Buildings' DerivativeCheck examples from -1 initialized to the values at 0). =#
+    local t0 = Float64(tspan[1])
     local mm = massMatrix isa LinearAlgebra.UniformScaling ?
       Matrix{Float64}(LinearAlgebra.I, nStates, nStates) : collect(massMatrix)
     #= A sparse Jacobian prototype needs a sparse mass matrix, otherwise the
@@ -368,7 +371,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        other tunable parameter values evaluates them at those). =#
     local symRowsAt = symInit === nothing ? nothing : let (gF, dIdxs, mmS) = symInit
       pv -> (du, u) -> begin
-        local g = gF(u, pv, 0.0)
+        local g = gF(u, pv, t0)
         Float64[dIdxs[i] == 0 ? Float64(g[i]) : du[dIdxs[i]] - mmS[i] * Float64(g[i])
                 for i in 1:length(dIdxs)]
       end
@@ -410,13 +413,13 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
         local nz = obsDer === nothing ? Float64[] : zeros(length(obsDer[2]))
         (du, u) -> begin
           local zdot = needAlg ?
-            _algebraicDerivatives!(J, rhsFunc, jacFunc, ftAlg, mm, algIdx, difIdx, u, du, pv, 0.0) : Float64[]
+            _algebraicDerivatives!(J, rhsFunc, jacFunc, ftAlg, mm, algIdx, difIdx, u, du, pv, t0) : Float64[]
           local rows = zdot[tPos] .- tVal
           obsDer === nothing && return rows
           local (nzF, I, Jc, n, tgts) = obsDer
           local udot = Float64[du[i] / (mm[i, i] == 0 ? 1.0 : mm[i, i]) for i in 1:n]
           needAlg && (udot[algIdx] = zdot)
-          nzF(nz, u, pv, 0.0)
+          nzF(nz, u, pv, t0)
           local obsRows = -copy(tgts)
           for k in eachindex(I)
             obsRows[I[k]] += nz[k] * (Jc[k] <= n ? udot[Jc[k]] : 1.0)
@@ -445,7 +448,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     end
     local probeRows = rowsAt -> try
       local duProbe = similar(u0)
-      initRhs(duProbe, u0, p_vec, 0.0)
+      initRhs(duProbe, u0, p_vec, t0)
       all(isfinite, rowsAt(p_vec)(duProbe, u0))
     catch _e
       OMBackend._fallback(_e, :buildDirectRHSProblem_6, impact = :result)
@@ -474,10 +477,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        kinematics puts x below it; the solve held the other branch's quartic far
        outside its range). Non-finite values keep the compiled literal. =#
     local initRels = _initialRelationLiterals(reducedSystem, params, initRelations)
-    initRels === nothing || initRels.eval!(p_vec, u0, 0.0; finiteOnly = true)
+    initRels === nothing || initRels.eval!(p_vec, u0, t0; finiteOnly = true)
     local uEntry = copy(u0)
     local firstErr = nothing
-    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
+    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0,
                                                               pinned=pinnedIdx,
                                                               derivative_targets=derivativeInitTargets,
                                                               eqLabels=eqLabels,
@@ -485,7 +488,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                                               discrete_pinned=discretePinnedIdx)
     #= A model with homotopy(): from its simplified expressions to the actual ones. =#
     local refreshRelations! = initRels === nothing ? nothing :
-      (uh, pvh) -> initRels.eval!(pvh, uh, 0.0; finiteOnly = true)
+      (uh, pvh) -> initRels.eval!(pvh, uh, t0; finiteOnly = true)
     local solveInit = homotopyIdx === nothing ? solveFree :
       (u, pv) -> _homotopyContinuation(solveFree, u, pv, homotopyIdx; refresh! = refreshRelations!)
     u0 = try
@@ -495,7 +498,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       #= The relations at the failed solve's last point: where one differs, the
          initialization is solved again from the entry with it (the event
          iteration of the initialization, before a solution exists). =#
-      local retried = initRels !== nothing && initRels.eval!(p_vec, u0, 0.0; finiteOnly = true) ?
+      local retried = initRels !== nothing && initRels.eval!(p_vec, u0, t0; finiteOnly = true) ?
         try
           solveInit(copy(uEntry), p_vec)
         catch e2
@@ -511,8 +514,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
         copy(uEntry)
       end
     end
-    #= At the solved state, at the solve's time (_solveDAEInitialization! evaluates at 0.0). =#
-    assignParams! === nothing || assignParams!(p_vec, u0, 0.0)
+    #= At the solved state, at the solve's time (the start time). =#
+    assignParams! === nothing || assignParams!(p_vec, u0, t0)
     #= The relations' literals at the solved state; solved again until they settle. =#
     local useExtra = extraResiduals !== nothing
     #= The derivative targets of the solve in progress: a run with other
@@ -521,7 +524,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local targetsNow = Ref(derivativeInitTargets)
     local resolveWith = (u, pv, ok) -> begin
       local kept = u[keptIdx]
-      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
+      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0,
                                               pinned=pinnedIdx,
                                               derivative_targets=targetsNow[],
                                               eqLabels=eqLabels,
@@ -530,7 +533,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                               converged=ok)
       #= A solve that relaxed the fixed starts is not a settled initialization. =#
       isapprox(un[keptIdx], kept; rtol = 1e-8, atol = 1e-10) || (ok[] = false)
-      assignParams! === nothing || assignParams!(pv, un, 0.0)
+      assignParams! === nothing || assignParams!(pv, un, t0)
       un
     end
     #= The differential states other than the clusters' members. =#
@@ -542,11 +545,11 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local startSolve = homotopyIdx === nothing ? resolveWith :
       (u, pv, ok) -> _homotopyContinuation((a, b) -> resolveWith(a, b, Ref(true)), u, pv, homotopyIdx;
                                            refresh! = refreshRelations!, finalSolve = (a, b) -> resolveWith(a, b, ok))
-    local (uSettled, settled) = _settleInitialDiscretes!(resolveWith, u0, uEntry, p_vec, initDiscretes, diffKept;
+    local (uSettled, settled) = _settleInitialDiscretes!(resolveWith, u0, uEntry, p_vec, initDiscretes, diffKept; t0 = t0,
                                                          startSolve = startSolve)
     firstErr === nothing || settled || throw(firstErr)
     u0 = uSettled
-    u0 = _settleInitialRelations!(resolveWith, u0, p_vec, initRels)
+    u0 = _settleInitialRelations!(resolveWith, u0, p_vec, initRels; t0 = t0)
     #= A user's fixed value (a fixed start, a literal initial equation) the
        initialization moved: its phase that frees every variable found a root
        only without it (`x(start = 1, fixed = true)` with an initial equation
@@ -613,7 +616,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       end
       targetsNow[] = targets
       try
-        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!;
+        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; t0 = t0,
                                          pinned=pinnedIdx,
                                          derivative_targets=targets,
                                          eqLabels=eqLabels,
@@ -625,9 +628,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
            the compiled run's root (x = 1.879 for s = -2, OpenModelica -1.532). =#
         u = homotopyIdx === nothing ? solveRun(u, pv) :
           _homotopyContinuation(solveRun, copy(entry), pv, homotopyIdx; refresh! = refreshRelations!)
-        assignParams! === nothing || assignParams!(pv, u, 0.0)
-        u = first(_settleInitialDiscretes!(resolveWith, u, u, pv, initDiscretes, diffKept; startPath = false))
-        u = _settleInitialRelations!(resolveWith, u, pv, initRels)
+        assignParams! === nothing || assignParams!(pv, u, t0)
+        u = first(_settleInitialDiscretes!(resolveWith, u, u, pv, initDiscretes, diffKept; startPath = false, t0 = t0))
+        u = _settleInitialRelations!(resolveWith, u, pv, initRels; t0 = t0)
       finally
         targetsNow[] = derivativeInitTargets
       end
@@ -1327,13 +1330,13 @@ end
    pre() the start values, else the values in u; initial() true), gives
    another value than u holds: index => value. Local buffers: a
    re-initialization may run while another one does. =#
-function _initialDiscreteChanges(dc, u, pv)
-  local point = (u = u, p = pv, t = 0.0)
+function _initialDiscreteChanges(dc, u, pv, t0::Float64 = 0.0)
+  local point = (u = u, p = pv, t = t0)
   local changes = Pair{Int, Float64}[]
   for (c, preStart) in zip(dc.clusters, dc.preStarts)
-    local v = Base.invokelatest(c.values, u, pv, 0.0)
+    local v = Base.invokelatest(c.values, u, pv, t0)
     local zs = similar(c.zs)
-    Base.invokelatest(c.crossings!, zs, u, pv, 0.0)
+    Base.invokelatest(c.crossings!, zs, u, pv, t0)
     local rel = Bool[_literal(zs, k, c.strict[k]) for k in eachindex(c.rel)]
     local pre = [something(s, x) for (s, x) in zip(preStart, _preValues(c, v))]
     local vals = Base.invokelatest(c.body, point, _operands(c, v), pre, rel, copy(rel), true)
@@ -1367,7 +1370,7 @@ end
    iteration at the start settles the members as before.
    Returns `(u, settled)`. =#
 function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int};
-                                  startPath::Bool = true, maxPasses::Int = 10, startSolve = resolve)
+                                  startPath::Bool = true, maxPasses::Int = 10, startSolve = resolve, t0::Float64 = 0.0)
   dc === nothing && return (u0, false)
   local trace = OMBackend.envSwitch("OMBACKEND_INIT_TRACE")
   local pvFirst = copy(pv)
@@ -1375,7 +1378,7 @@ function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int}
   local keptAt = (u, ref) -> isapprox(u[kept], ref[kept]; rtol = 1e-6, atol = 1e-9)
   #= From a solution `u` of the solve that started at `ref`. =#
   local iterate = function (u, ref)
-    local changes = _initialDiscreteChanges(dc, u, pv)
+    local changes = _initialDiscreteChanges(dc, u, pv, t0)
     local seen = Set{Vector{Float64}}()
     for _ in 1:maxPasses
       trace && println("[initdiscretes] members to change: ", changes)
@@ -1390,7 +1393,7 @@ function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int}
       local un = resolve(copy(u), pv, ok)
       (ok[] && keptAt(un, ref)) || return nothing
       u = un
-      changes = _initialDiscreteChanges(dc, u, pv)
+      changes = _initialDiscreteChanges(dc, u, pv, t0)
     end
     return nothing
   end
@@ -1432,7 +1435,7 @@ end
    not converge keeps the first solution and the entry parameters (MSL
    EngineV6_analytic: the gas force's `v_rel < 0` was false at the entry,
    the steady-state filter settled on the wrong torque). =#
-function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5)
+function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5, t0::Float64 = 0.0)
   rels === nothing && return u0
   local pvFirst = copy(pv)
   local uFirst = copy(u0)
@@ -1441,7 +1444,7 @@ function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5)
   local err = nothing
   for pass in 1:(maxPasses + 1)
     try
-      rels.eval!(pv, u, 0.0) || return u
+      rels.eval!(pv, u, t0) || return u
       pass > maxPasses && break
       local key = pv[rels.idxs]
       key in seen && break
