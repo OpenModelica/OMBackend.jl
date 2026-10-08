@@ -2900,14 +2900,20 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     if !lhsEvalOk[]
       continue
     end
-    local lhsJl = expToJuliaExpMTK(lhsSubst, simCode)
-    local lhsVal = try
-      local raw = eval(lhsJl)
-      raw isa Symbolics.Num ? Float64(Symbolics.unwrap(raw)) : Float64(raw)
-    catch err
-      OMBackend._fallback(err, :parametricInitLhs; expect = Union{UndefVarError, MethodError}, impact = :result)
-      @warn "[SIMCODE: solveParametricInitialEquations] could not evaluate LHS" freeName err
-      continue
+    #= Interpreted first: it calls the model's functions, which the generated code does not
+       have yet (CDL's TimeTable: t0 = round(integer(time/timeRange)*timeRange, 6), read by
+       its table's startTime at module level). =#
+    local lhsVal = SimulationCode.valueAtBuildStart(lhsSubst, simCode)
+    if lhsVal === nothing
+      local lhsJl = expToJuliaExpMTK(lhsSubst, simCode)
+      lhsVal = try
+        local raw = eval(lhsJl)
+        raw isa Symbolics.Num ? Float64(Symbolics.unwrap(raw)) : Float64(raw)
+      catch err
+        OMBackend._fallback(err, :parametricInitLhs; expect = Union{UndefVarError, MethodError}, impact = :result)
+        @warn "[SIMCODE: solveParametricInitialEquations] could not evaluate LHS" freeName err
+        continue
+      end
     end
     #= Common case: a free parameter aliases a bound parameter/literal directly,
        e.g. `globalSeed_seed = globalSeed_fixedSeed`. Avoid Newton here; it

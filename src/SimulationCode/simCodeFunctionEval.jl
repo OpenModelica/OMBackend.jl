@@ -623,9 +623,10 @@ function _initialAlgorithmEnvironment(simCode::SIM_CODE)::Tuple{Dict{String, Any
   return (env, ctx)
 end
 
-#= The value of `e` after the initial algorithms (_initialAlgorithmEnvironment), or nothing. =#
-function valueAfterInitialAlgorithms(e::DAE.Exp, simCode::SIM_CODE)::Union{Float64, Nothing}
-  isempty(simCode.initialAlgorithms) && return nothing
+#= The value of `e` at the start time 0 from the parameters' values and what the initial
+   algorithms assign (_initialAlgorithmEnvironment), calls of the model's functions
+   interpreted; or nothing. =#
+function valueAtBuildStart(e::DAE.Exp, simCode::SIM_CODE)::Union{Float64, Nothing}
   local (env, ctx) = _initialAlgorithmEnvironment(simCode)
   ctx.steps = 0
   local v = try
