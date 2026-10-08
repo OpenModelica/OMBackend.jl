@@ -56,9 +56,12 @@ function _fdInitResidualJacobian(rhsFunc, p_vec, u0, eq_idx, targets, extraRes, 
   local du_pert = similar(u0)
   for (jcol, jstate) in enumerate(var_idx)
     local u_pert = copy(u0)
-    u_pert[jstate] += eps_fd
+    #= Relative to the value: 1e-7 vanished in 8.1e9 (Buildings' PowerLinearized, T4 = T^4),
+       a zero column, and Newton never moved. =#
+    u_pert[jstate] += eps_fd * max(1.0, abs(u0[jstate]))
+    local h = u_pert[jstate] - u0[jstate]
     rhsFunc(du_pert, u_pert, p_vec, 0.0)
-    J[:, jcol] = (_initResidualVec(du_pert, u_pert, eq_idx, targets, extraRes) .- res) ./ eps_fd
+    J[:, jcol] = (_initResidualVec(du_pert, u_pert, eq_idx, targets, extraRes) .- res) ./ h
   end
   return J
 end
