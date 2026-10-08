@@ -1599,6 +1599,10 @@ end
 _externalFunction(name::Symbol) =
   isdefined(externalCModule(), name) ? getfield(externalCModule(), name) : getfield(OMRuntimeExternalC, name)
 
+#= A C function's arguments: an external object as its pointer (CodeGeneration._externalPtr). =#
+_externalPtrArgs(args::AbstractVector)::Vector{Any} =
+  Any[:(OMBackend.CodeGeneration._externalPtr($a)) for a in args]
+
 Base.@nospecializeinfer function namespaceifyExternalFunction(@nospecialize(expr::Expr))
   #= Meta.parse may wrap in :toplevel -- unwrap it =#
   if expr.head == :toplevel && length(expr.args) == 1 && expr.args[1] isa Expr
@@ -1608,14 +1612,14 @@ Base.@nospecializeinfer function namespaceifyExternalFunction(@nospecialize(expr
     local callExpr = last(expr.args)
     @match Expr(:call, [funcName, y...,z]) = callExpr
     local resolvedFunc = _externalFunction(funcName)
-    exp = Expr(:call, resolvedFunc, y..., z)
+    exp = Expr(:call, resolvedFunc, _externalPtrArgs(y)..., _externalPtrArgs([z])...)
     expr.args[2] = exp
     expr
   else #Otherwise a side effect call or a call that returns directly.
     @assert expr.head === :call "Invalid call passed to namespaceifyExternalFunction"
     @match Expr(:call, [funcName, y...,z]) = expr
     local resolvedFunc = _externalFunction(funcName)
-    Expr(:call, resolvedFunc, y..., z)
+    Expr(:call, resolvedFunc, _externalPtrArgs(y)..., _externalPtrArgs([z])...)
   end
   return res
 end

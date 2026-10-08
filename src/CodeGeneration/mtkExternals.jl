@@ -66,6 +66,28 @@ Base.show(io::IO, w::ModelicaFunctionWrapper) = print(io, w.name)
    at 1e-2, 4 of 52 verify runs). An RGF's type holds a hash of its body's
    content (`id`), so the type identifies the function. =#
 const _RGF_TAG = getfield(@__MODULE__, Symbol("#_RGF_ModTag"))
+
+#= An external object (a C pointer: a table, an Include code's object) as the model's data
+   structures hold it: hashed by its name. A raw Ptr hashes by its address, new in every
+   build, so the order of the terms reading it, and with it the rounding of the generated
+   code, changed from build to build (Buildings' CHPs ElectricalFollowing: an if-condition at
+   ~0 at the start, 1 build in 5 simulated). A C function gets the pointer
+   (namespaceifyExternalFunction: _externalPtr). =#
+struct ExternalObjectRef
+  name::Symbol
+  ptr::Ptr{Cvoid}
+end
+Base.hash(r::ExternalObjectRef, h::UInt) = hash(r.name, hash(:ExternalObjectRef, h))
+Base.:(==)(a::ExternalObjectRef, b::ExternalObjectRef) = a.name == b.name && a.ptr == b.ptr
+Base.show(io::IO, r::ExternalObjectRef) = print(io, "ExternalObjectRef(", repr(r.name), ")")
+
+#= A data structure's value at module level: an external object as its ExternalObjectRef,
+   anything else (a record) as it is. =#
+_externalObjectRef(name::Symbol, @nospecialize(value)) = value isa Ptr ? ExternalObjectRef(name, value) : value
+
+#= The argument of a C function: the pointer of an external object (agnostic otherwise). =#
+_externalPtr(@nospecialize(x)) = x
+_externalPtr(r::ExternalObjectRef) = r.ptr
 Base.hash(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{<:Any, _RGF_TAG, _RGF_TAG}, h::UInt) = hash(typeof(f), h)
 Base.hash(w::ModelicaFunctionWrapper, h::UInt) = hash(typeof(w), hash(w.name, h))
 

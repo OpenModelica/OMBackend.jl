@@ -508,9 +508,10 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
     if rhs isa Expr
       qualifyModelicaFunctions!(rhs, funcNames)
     end
+    #= an external object by its name in the terms that read it (ExternalObjectRef) =#
     expr = quote
       $(LineNumberNode(@__LINE__, "$ds eq"))
-      $(Symbol(simVar.name)) = $(rhs)
+      $(Symbol(simVar.name)) = OMBackend.CodeGeneration._externalObjectRef($(QuoteNode(Symbol(simVar.name))), $(rhs))
     end
     push!(dsAssignments, expr)
     #= A record's fields by their flattened names too (`Medium_data[1]_MM`): the equations
