@@ -1551,8 +1551,8 @@ function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
       entry === nothing && unsupported("a tuple target in a when that is no variable", lhs)
       local (_, var) = entry
       push!(res, quote
-              idx = lookuptableStates[Symbol($(string(var.name)))]
-              integrator.u[idx] = $rhsAccess
+              $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(string(var.name)))]
+              integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)] = $rhsAccess
             end)
     end
     DAE.ARRAY(_, _, elements) => begin
@@ -1568,8 +1568,8 @@ function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
       entry === nothing && unsupported("a tuple target in a when that is no variable", lhs)
       local (_, var) = entry
       push!(res, quote
-              idx = lookuptableStates[Symbol($(string(var.name)))]
-              integrator.u[idx] = $rhsAccess
+              $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(string(var.name)))]
+              integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)] = $rhsAccess
             end)
     end
     SimulationCode.ARRAY_EXP(_, _, elements) => begin
@@ -1623,17 +1623,17 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
         local lhsSym = Symbol(string(var.name))
         local rhsE = expToJuliaExpMTK(wStmt.right, simCode; varPrefix = varPrefix, varSuffix = varSuffix)
         push!(res, quote
-                idx = lookuptableStates[Symbol($(string(var.name)))]
-                integrator.u[idx] = $(rhsE)
-                $(lhsSym) = integrator.u[idx]
+                $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(string(var.name)))]
+                integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)] = $(rhsE)
+                $(lhsSym) = integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)]
               end)
       end
     elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
       (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]
       push!(res, quote
-              idx = lookuptableStates[Symbol($(string(var.name)))]
-              OMBackend.CodeGeneration.noteReinit!(integrator, idx)
-              integrator.u[idx] = $(expToJuliaExpMTK(wStmt.value,
+              $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(string(var.name)))]
+              OMBackend.CodeGeneration.noteReinit!(integrator, $(MTK_CodeGenerationUtil.STATE_INDEX))
+              integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)] = $(expToJuliaExpMTK(wStmt.value,
                                                      simCode; varPrefix = varPrefix, varSuffix = varSuffix))
             end)
     elseif wStmt isa BDAE.TERMINATE || wStmt isa SimulationCode.TERMINATE

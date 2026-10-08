@@ -355,6 +355,10 @@ end
    elsewhen-arm affects): the state before the current sweep, indexed by
    `lookuptableStates`. =#
 const PRE_SNAPSHOT = :__prevals
+#= The state index a when assignment writes through (`integrator.u[i]`): a
+   reserved name, the body binds the model's variables by their own names (a
+   discrete `idx` indexing a table, BuildingsRepro.ParameterArrayByDiscreteIndex). =#
+const STATE_INDEX = :__stateIdx
 #= The homotopy parameter λ (homotopy(actual, simplified), MLS 3.7.4.4):
    1 in a simulation; the initialization of a model with homotopy() goes from
    0 (the simplified expressions) to 1 (`_homotopyContinuation`), as
@@ -584,6 +588,59 @@ function expToJuliaExpMTK(exp::SimulationCode.ENUM_LITERAL, simCode::SimulationC
   return quote $(exp.index) end
 end
 
+#= A subscript as the flattened names write it (`2`, `idx`). =#
+_subscriptText(@nospecialize(s))::String =
+  s isa DAE.ICONST ? string(s.integer) : s isa DAE.INDEX ? _subscriptText(s.exp) : string(s)
+
+#= `base[idx][2]`, a flattened name whose subscript is a variable (the array crefs the backend
+   flattened: CDL's Integer TimeTable `y[:] = val[idx, :]`, idx a discrete; its elements kept,
+   _referenceDynamicallyIndexed!): the lookup of the table of base's elements, all known at the
+   build (the dimensions from the names in the table), indexed at run time; nothing otherwise. =#
+function _dynamicSubscriptLookup(name::String, simCode::SimulationCode.SIM_CODE)::Union{Expr, Nothing}
+  local m = match(r"^([^\[\]]+)((?:\[[^\[\]]+\])+)$", name)
+  m === nothing && return nothing
+  local base = String(m.captures[1])
+  local subs = String[String(x.captures[1]) for x in eachmatch(r"\[([^\[\]]+)\]", m.captures[2])]
+  all(s -> tryparse(Int, s) !== nothing, subs) && return nothing
+  local ht = simCode.stringToSimVarHT
+  local index = Any[]
+  for s in subs
+    local i = tryparse(Int, s)
+    if i !== nothing
+      push!(index, i)
+    else
+      local entry = get(ht, s, nothing)
+      entry === nothing && return nothing
+      push!(index, Symbol(last(entry).name))
+    end
+  end
+  #= the extent of each dimension: the elements along it from 1 =#
+  local key = (d, k) -> base * join("[" * string(j == d ? k : 1) * "]" for j in eachindex(subs))
+  local dims = Int[]
+  for d in eachindex(subs)
+    local n = 0
+    while haskey(ht, key(d, n + 1))
+      n += 1
+    end
+    n == 0 && return nothing
+    push!(dims, n)
+  end
+  local table = Array{Float64}(undef, dims...)
+  for I in CartesianIndices(table)
+    local entry = get(ht, base * join("[" * string(i) * "]" for i in Tuple(I)), nothing)
+    entry === nothing && return nothing
+    local kind = last(entry).varKind
+    (kind isa SimulationCode.PARAMETER && kind.bindExp isa SOME) || return nothing
+    local b = kind.bindExp.data
+    local v = SimulationCode.tryEvalNumeric(SimulationCode.toDAEExp(b), simCode)
+    #= `integer(table[...][i, j])`: evaluated as the initial values are =#
+    v === nothing && (v = _t0Number(() -> evalDAEConstant(b, simCode)))
+    v === nothing && return nothing
+    table[I] = v
+  end
+  return :(OMBackend.CodeGeneration.constTableLookup($(table), $(index...)))
+end
+
 function expToJuliaExpMTK(exp::SimulationCode.EXP_CREF, simCode::SimulationCode.SIM_CODE;
                           varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
   #= SimCref is flat post-Causalize.flattenArrayCrefs, so the CREF_QUAL hierarchy
@@ -613,6 +670,8 @@ function expToJuliaExpMTK(exp::SimulationCode.EXP_CREF, simCode::SimulationCode.
     @warn "expToJuliaExpMTK[SIM]: resolved alias-eliminated cref via fallback" lookUpStr
     return aliasExpr
   end
+  local dynamic = _dynamicSubscriptLookup(lookUpStr, simCode)
+  dynamic !== nothing && return dynamic
   return quote $(Symbol(string(varPrefix, lookUpStr, varSuffix))) end
 end
 
@@ -925,8 +984,15 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                 _ => OMBackend.unsupported("subscript", sub)
               end
             end
-            local baseSymbol = Symbol(varPrefix, varName, varSuffix)
-            Expr(:ref, baseSymbol, subExprs...)
+            #= a parameter array known at the build: its table (_dynamicSubscriptLookup) =#
+            local flatName = varName * join("[" * (s isa DAE.INDEX ? _subscriptText(s) : "?") * "]" for s in subscriptLst)
+            local dynamic = _dynamicSubscriptLookup(flatName, simCode)
+            if dynamic !== nothing
+              dynamic
+            else
+              local baseSymbol = Symbol(varPrefix, varName, varSuffix)
+              Expr(:ref, baseSymbol, subExprs...)
+            end
           end
         end
       end
@@ -1048,8 +1114,10 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
               @warn "expToJuliaExpMTK: resolved alias-eliminated bare CREF via fallback" varName
               aliasEx
             else
-              #= Variable not in hash table, using direct reference =#
-              quote $(Symbol(string(varPrefix, varName, varSuffix))) end
+              #= Variable not in hash table, using direct reference; a flattened name
+                 with a variable subscript, a lookup of its known table =#
+              local dynamic = _dynamicSubscriptLookup(varName, simCode)
+              dynamic !== nothing ? dynamic : quote $(Symbol(string(varPrefix, varName, varSuffix))) end
             end
           end
         else
@@ -1242,11 +1310,18 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           end
         end
         local allConstSubs = all(s -> s isa Integer, subExprs)
+        #= A parameter array known at the build by a variable subscript (CDL's Integer
+           TimeTable: val[idx, j] in a when): its table (_dynamicSubscriptLookup). =#
+        local _dynTable = (!allConstSubs && innerExp isa DAE.CREF) ?
+          _dynamicSubscriptLookup(SimulationCode.DAE_identifierToString(innerExp.componentRef) *
+                                  join("[" * _subscriptText(s) * "]" for s in subscripts), simCode) : nothing
         #= When the inner expression is a bare CREF (no subscripts on the CREF itself)
            and all ASUB subscripts are constant, try scalarized variable lookup.
            This handles record field array equations like frame_b.R.T[1,1] = frame_a.R.T[1,1]
            where the frontend flattened to ASUB(CREF("R_T"), [1,1]) instead of CREF("R_T", subs=[1,1]). =#
-        if allConstSubs
+        if _dynTable !== nothing
+          _dynTable
+        elseif allConstSubs
           #= First, detect nested ASUB(ASUB(CALL(qualified_path, args), [tupleIx]), [subExprs...])
              where the inner ASUB extracts a tuple element that is an array.
              This covers BOTH 1D access [i] and multi-D access [i, j, ...].

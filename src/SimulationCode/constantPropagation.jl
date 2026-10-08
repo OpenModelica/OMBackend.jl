@@ -384,6 +384,14 @@ function propagateConstants(simCode::SIM_CODE)
       collectCrefNames!(allRefNames, newLhs)
       collectCrefNames!(allRefNames, newRhs)
       push!(newInitEqs, EQUATION(newLhs, newRhs, initEq.source, initEq.attr))
+    elseif initEq isa ARRAY_EQUATION
+      #= `y[:] = val[idx, :]` (a dynamic subscript keeps it whole): passed through, its
+         references were not counted and the constants it reads went (CDL's TimeTables) =#
+      local (newLeft, _) = Util.traverseExpTopDown(toDAEExp(initEq.left), _substituteConstCref, constMap)
+      local (newRight, _) = Util.traverseExpTopDown(toDAEExp(initEq.right), _substituteConstCref, constMap)
+      collectCrefNames!(allRefNames, newLeft)
+      collectCrefNames!(allRefNames, newRight)
+      push!(newInitEqs, ARRAY_EQUATION(initEq.dimSize, newLeft, newRight, initEq.source, initEq.attr))
     else
       push!(newInitEqs, initEq)
     end

@@ -80,14 +80,7 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
 
   #= "Untouchable" surfaces — any var referenced from these must stay. =#
   local untouchable = OrderedSet{String}()
-  for eq in simCode.initialEquations
-    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(untouchable, eq.exp)
-    elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(untouchable, eq.lhs)
-      collectCrefNames!(untouchable, eq.rhs)
-    end
-  end
+  _collectInitialEquationCrefs!(untouchable, simCode.initialEquations)
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
       collectCrefNames!(untouchable, branch.condition)
@@ -204,14 +197,7 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
   for eq in simCode.residualEquations
     collectCrefNames!(referenced, eq.exp)
   end
-  for eq in simCode.initialEquations
-    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(referenced, eq.exp)
-    elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(referenced, eq.lhs)
-      collectCrefNames!(referenced, eq.rhs)
-    end
-  end
+  _collectInitialEquationCrefs!(referenced, simCode.initialEquations)
   for ifEq in simCode.ifEquations
     for branch in ifEq.branches
       collectCrefNames!(referenced, branch.condition)
@@ -277,6 +263,7 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
     end
   end
 
+  _referenceDynamicallyIndexed!(referenced, ht)
   #= Sweep: drop any PARAMETER entry (bound or unbound) that has zero
      references on any of the live surfaces scanned above. Tunable ones stay:
      an unused element of a tunable array (a network output the model does
@@ -363,14 +350,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   for whenEq in simCode.whenEquations
     _collectWhenConditionCrefs!(protectedNames, whenEq.whenEquation)
   end
-  for eq in simCode.initialEquations
-    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(protectedNames, eq.exp)
-    elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(protectedNames, eq.lhs)
-      collectCrefNames!(protectedNames, eq.rhs)
-    end
-  end
+  _collectInitialEquationCrefs!(protectedNames, simCode.initialEquations)
   #= IFEXP conditions inside residual equations and parameter bindings. =#
   for eq in simCode.residualEquations
     _collectIfexpConditionCrefs!(protectedNames, eq.exp)
@@ -431,6 +411,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
      symbol -> UndefVarError at module eval. Mirrors the sibling passes
      dropObservationOnlyVariables (4391) and eliminateDeadParameters (4500). =#
   _collectFunctionBodyCrefs!(protectedNames, simCode.functions)
+  _referenceDynamicallyIndexed!(protectedNames, ht)
   #= Tunable parameters stay (withTunableParameters); parameters whose bindings
      depend on them do not evaluate below, so they stay too. =#
   if !isempty(TUNABLE_PARAMETERS[])
@@ -572,14 +553,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   for eq in newResiduals
     collectCrefNames!(survivorCheck, eq.exp)
   end
-  for eq in newInitials
-    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
-      collectCrefNames!(survivorCheck, eq.exp)
-    elseif eq isa BDAE.EQUATION || eq isa EQUATION
-      collectCrefNames!(survivorCheck, eq.lhs)
-      collectCrefNames!(survivorCheck, eq.rhs)
-    end
-  end
+  _collectInitialEquationCrefs!(survivorCheck, newInitials)
   for ifEq in newIfEquations
     for branch in ifEq.branches
       for brEq in branch.residualEquations
@@ -636,6 +610,46 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
      into equations and have no residual to reconstruct, so adding them breaks
      the parallel-array invariant. =#
   return simCode
+end
+
+#= The names the initial equations read: an array equation's too (`y[:] = val[idx, :]`, an
+   array the dynamic subscript keeps whole: its elements were dropped as unread). =#
+function _collectInitialEquationCrefs!(names::OrderedSet{String}, eqs::AbstractVector)::OrderedSet{String}
+  for eq in eqs
+    if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
+      collectCrefNames!(names, eq.exp)
+    elseif eq isa BDAE.EQUATION || eq isa EQUATION
+      collectCrefNames!(names, eq.lhs)
+      collectCrefNames!(names, eq.rhs)
+    elseif eq isa ARRAY_EQUATION
+      collectCrefNames!(names, eq.left)
+      collectCrefNames!(names, eq.right)
+    end
+  end
+  return names
+end
+
+#= A name read with a variable subscript references every element of its array: none is
+   named, and the code generation looks them up (a constant table, indexed at run time). CDL's
+   Integer TimeTable `y[:] = val[idx, :]`, idx a discrete: `val[idx][2]` (a cref the backend
+   flattened) or the whole array `val` (`val[idx, 2]` an ASUB of it). =#
+function _referenceDynamicallyIndexed!(names::OrderedSet{String}, ht::AbstractDict)::OrderedSet{String}
+  local bases = Set{String}()
+  for name in names
+    if !occursin('[', name)
+      haskey(ht, name) || push!(bases, name)
+      continue
+    end
+    local m = match(r"^([^\[\]]+)\[", name)
+    (m !== nothing && occursin(r"\[[^\]0-9][^\]]*\]", name)) || continue
+    push!(bases, String(m.captures[1]))
+  end
+  isempty(bases) && return names
+  for k in keys(ht)
+    local i = findfirst('[', k)
+    i !== nothing && k[1:i-1] in bases && push!(names, k)
+  end
+  return names
 end
 
 """
