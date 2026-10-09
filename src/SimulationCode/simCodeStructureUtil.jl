@@ -673,6 +673,60 @@ function lowerInitialIfEquations!(simCode::SIM_CODE)::Nothing
   return nothing
 end
 
+#= `(a, b) = f(...)` among the initial equations, its targets variables: one equation for each
+   element of each target, the call's output by TSUB (an array output's element by ASUB of it).
+   Buildings' occupant windows, `(ran, state) = Xorshift1024star.random(initialState(localSeed,
+   globalSeed))`, ran a discrete and state an Integer array: the lowering had no tuple left side.
+   A pure call, once per element. A target that is a parameter (a free one,
+   _bindTupleOfFreeParameters!) leaves the equation as it is. =#
+function splitTupleInitialEquations!(simCode::SIM_CODE)::Nothing
+  local out = Equation[]
+  local changed = false
+  for eq in simCode.initialEquations
+    local split = eq isa EQUATION ? _splitTupleEquation(eq, simCode) : nothing
+    if split === nothing
+      push!(out, eq)
+    else
+      append!(out, split)
+      changed = true
+    end
+  end
+  changed || return nothing
+  empty!(simCode.initialEquations)
+  append!(simCode.initialEquations, out)
+  return nothing
+end
+
+function _splitTupleEquation(eq::EQUATION, simCode::SIM_CODE)::Union{Vector{Equation}, Nothing}
+  local lhs = toDAEExp(eq.lhs)
+  local rhs = toDAEExp(eq.rhs)
+  (lhs isa DAE.TUPLE && rhs isa DAE.CALL && !rhs.attr.isImpure && rhs.attr.ty isa DAE.T_TUPLE) || return nothing
+  local types = collect(rhs.attr.ty.types)
+  local targets = collect(lhs.PR)
+  length(types) >= length(targets) || return nothing
+  local isVariable = e -> begin
+    local entry = get(simCode.stringToSimVarHT, string(e), nothing)
+    e isa DAE.CREF && entry !== nothing && !isParameter(last(entry))
+  end
+  local eqs = Equation[]
+  for (k, target) in enumerate(targets)
+    target isa DAE.CREF && target.componentRef isa DAE.WILD && continue
+    local output = DAE.TSUB(rhs, k, types[k])
+    if target isa DAE.ARRAY
+      local elems = collect(target.array)
+      all(isVariable, elems) || return nothing
+      for (i, el) in enumerate(elems)
+        push!(eqs, EQUATION(toSimExp(el), toSimExp(DAE.ASUB(output, MetaModelica.list(DAE.INDEX(DAE.ICONST(i))))), eq.source, eq.attr))
+      end
+    elseif isVariable(target)
+      push!(eqs, EQUATION(toSimExp(target), toSimExp(output), eq.source, eq.attr))
+    else
+      return nothing
+    end
+  end
+  return eqs
+end
+
 function _lowerIfEquation(eq::INLINE_IF_EQUATION)::Union{Vector{Equation}, Nothing}
   local branches = vcat(eq.branchesTrue, [eq.branchElse])
   local n = length(first(branches))

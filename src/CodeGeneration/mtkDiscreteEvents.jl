@@ -1550,9 +1550,13 @@ function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
       local entry = get(simCode.stringToSimVarHT, name, nothing)
       entry === nothing && unsupported("a tuple target in a when that is no variable", lhs)
       local (_, var) = entry
+      #= and the body's local of it, as an assignment's: a later statement read the value from
+         before (Buildings' occupant windows, `(ran, state) = random(pre(state)); on = ran < p`
+         decided on the previous sample's number). =#
       push!(res, quote
               $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(string(var.name)))]
               integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)] = $rhsAccess
+              $(Symbol(string(var.name))) = integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)]
             end)
     end
     DAE.ARRAY(_, _, elements) => begin
@@ -1570,6 +1574,7 @@ function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
       push!(res, quote
               $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(string(var.name)))]
               integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)] = $rhsAccess
+              $(Symbol(string(var.name))) = integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)]
             end)
     end
     SimulationCode.ARRAY_EXP(_, _, elements) => begin

@@ -562,6 +562,7 @@ function _simCodeWithFunctions(bDAE::BDAE.BACKEND_DAE, functionList)::Simulation
   local simCode = @BACKEND_PERFLOG "[backendAPI] generateSimulationCode" generateSimulationCode(bDAE; mode = MTK_MODE)
   #= before the passes: they read the equations' sides =#
   SimulationCode.lowerInitialIfEquations!(simCode)
+  SimulationCode.splitTupleInitialEquations!(simCode)
   local (functions, externalRuntimeNeeded) = functionList === nothing ? (SimulationCode.ModelicaFunction[], false) :
     generateSimCodeFunctions(functionList)
   @assign begin
