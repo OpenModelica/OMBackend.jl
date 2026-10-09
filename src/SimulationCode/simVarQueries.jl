@@ -572,13 +572,21 @@ the scalarized hash-table keys.
    passes keep every element of such an array (_referenceDynamicallyIndexed!). =#
 const DYNAMIC_SUBSCRIPT_MARK = "[?]"
 
+#= Whether an expression reads a variable (a subscript that is not a literal). The DAE method
+   of collectCrefNames! returns nothing, not the set. =#
+function _readsCref(@nospecialize(e))::Bool
+  local found = OrderedSet{String}()
+  collectCrefNames!(found, e)
+  return !isempty(found)
+end
+
 function collectCrefNamesForAsub(names::OrderedSet{String}, exp::ASUB)
   if exp.exp isa EXP_CREF
     local suffix = _simConstSubscriptSuffix(exp.subs)
     local base = DAE_identifierToString(toDAECref(exp.exp.cref).componentRef)
     if suffix !== nothing
       push!(names, Base.string(base, suffix))
-    elseif any(s -> !isempty(collectCrefNames!(OrderedSet{String}(), s)), exp.subs)
+    elseif any(s -> _readsCref(s), exp.subs)
       push!(names, Base.string(base, DYNAMIC_SUBSCRIPT_MARK))
     end
   end
@@ -603,7 +611,7 @@ function collectCrefNamesForDAEAsub(names::OrderedSet{String}, @nospecialize(e),
       local baseName = DAE_identifierToString(cr)
       local suffix = _daeConstSubscriptSuffix(subs)
       suffix === nothing || push!(names, Base.string(baseName, suffix))
-      suffix === nothing && any(s -> s isa DAE.INDEX && !isempty(collectCrefNames!(OrderedSet{String}(), s.exp)), subs) &&
+      suffix === nothing && any(s -> s isa DAE.INDEX && _readsCref(s.exp), subs) &&
         push!(names, Base.string(baseName, DYNAMIC_SUBSCRIPT_MARK))
       push!(names, baseName)
       asubHandled = true
