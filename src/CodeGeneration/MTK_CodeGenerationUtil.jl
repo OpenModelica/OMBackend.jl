@@ -2843,6 +2843,32 @@ end
 _timeAtBuildStart(@nospecialize(e)) = first(Util.traverseExpBottomUp(e, (x, acc) ->
   (x isa DAE.CREF && x.componentRef isa DAE.CREF_IDENT && x.componentRef.ident == "time" ? DAE.RCONST(0.0) : x, acc), nothing))
 
+#= `(p1, p2, ...) = f(...)`, every free parameter of the equation alone on the left and none in
+   the call (Buildings' borehole resistances: `(x, Rgb, Rgg, RCondGro) = internalResistancesOneUTube(...)`,
+   in HexInternalElement with states, in its validations without): each p_k bound to the call's
+   k-th output, its value at the build where the call interprets with the parameters' values,
+   else the output's expression (its symbolic term did not fold with a String argument, the
+   instance name). Not an impure f (one call for each output). =#
+function _bindTupleOfFreeParameters!(lhs::DAE.Exp, rhs::DAE.Exp, freeParams::Vector{String},
+                                     simCode::SimulationCode.SimCode)::Bool
+  (lhs isa DAE.TUPLE && rhs isa DAE.CALL && !rhs.attr.isImpure && rhs.attr.ty isa DAE.T_TUPLE) || return false
+  local targets = collect(lhs.PR)
+  local names = String[string(e) for e in targets if e isa DAE.CREF]
+  (length(names) == length(targets) && issetequal(names, freeParams)) || return false
+  any(c -> string(c) in names, Util.getAllCrefs(rhs)) && return false
+  local types = collect(rhs.attr.ty.types)
+  length(types) >= length(targets) || return false
+  local ht = simCode.stringToSimVarHT
+  for (k, name) in enumerate(names)
+    local (idx, sv) = ht[name]
+    local element = DAE.TSUB(rhs, k, types[k])
+    local value = types[k] isa DAE.T_REAL ? SimulationCode.valueAtBuildStart(element, simCode) : nothing
+    local binding = SimulationCode.toSimExp(value === nothing ? element : DAE.RCONST(value))
+    ht[name] = (idx, SimulationCode.SIMVAR(sv.name, sv.index, SimulationCode.PARAMETER(SOME(binding)), sv.attributes))
+  end
+  return true
+end
+
 """
     solveParametricInitialEquations!(simCode)
 
@@ -2923,6 +2949,11 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     Util.traverseExpBottomUp(ieqLhs, findFree, 0)
     Util.traverseExpBottomUp(ieqRhs, findFree, 0)
     unique!(freeParams)
+    if _bindTupleOfFreeParameters!(ieqLhs, ieqRhs, freeParams, simCode)
+      append!(solvedNames, freeParams)
+      solvedThisPass = true
+      continue
+    end
     if length(freeParams) != 1
       continue
     end

@@ -1995,51 +1995,41 @@ so callers must treat `nothing` here as "not resolvable through this
 path" and fall back to the next strategy.
 """
 function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
-  if expr isa Number
-    return Float64(expr)
-  end
-  if expr isa Symbolics.Num
-    expr = Symbolics.unwrap(expr)
-  end
-  if !(expr isa SymbolicUtils.BasicSymbolic)
-    return nothing
-  end
-  #= Symbolic numeric Const (e.g. literal 500.0 or pre-folded 0.0015) appears
-     as a non-call, non-sym BasicSymbolic with a `Float64`/`Int` `symtype`. Pull
-     the value out via Symbolics.value before falling through to the name-based
-     leaf lookup, otherwise we treat literals as unknown free vars. =#
+  local v = _symbolicCallValue(expr, nameToNumeric)
+  return (v isa Real && !(v isa Bool)) ? Float64(v) : nothing
+end
+
+#= A value of _evalSymbolicFunctionCall's walk: a constant as it is (a Boolean or a String
+   argument of a Modelica function, `use_Rb` and the instance name of Buildings' borehole
+   resistance functions: made Float64, or dropped, the call was not evaluated), a parameter by
+   its number, a call by its result; nothing when a leaf is unknown. =#
+function _symbolicCallValue(expr, nameToNumeric::Dict{String, Float64})
+  expr isa Union{Number, AbstractString} && return expr
+  expr isa Symbolics.Num && (expr = Symbolics.unwrap(expr))
+  expr isa SymbolicUtils.BasicSymbolic || return nothing
+  #= A constant (a literal 500.0, a pre-folded 0.0015, false, a String) is a non-call,
+     non-sym BasicSymbolic: its value, not a free variable looked up by name. =#
   if !SymbolicUtils.iscall(expr) && !SymbolicUtils.issym(expr)
     local v = Symbolics.value(expr)
-    if v isa Number
-      return Float64(v)
-    end
+    return v isa Union{Number, AbstractString} ? v : nothing
   end
   if SymbolicUtils.iscall(expr)
-    local f = SymbolicUtils.operation(expr)
-    local rawArgs = SymbolicUtils.arguments(expr)
-    local numArgs = Vector{Float64}(undef, length(rawArgs))
-    for (i, a) in enumerate(rawArgs)
-      local av = _evalSymbolicFunctionCall(a, nameToNumeric)
+    local args = Any[]
+    for a in SymbolicUtils.arguments(expr)
+      local av = _symbolicCallValue(a, nameToNumeric)
       av === nothing && return nothing
-      numArgs[i] = av
+      push!(args, av)
     end
     local result = try
-      Base.invokelatest(f, numArgs...)
+      Base.invokelatest(SymbolicUtils.operation(expr), args...)
     catch _e
       OMBackend._fallback(_e, :_evalSymbolicFunctionCall_2)
       return nothing
     end
-    if result isa Number
-      return Float64(result)
-    end
-    return nothing
+    return result isa Number ? result : nothing
   end
   #= Leaf symbolic (free variable): look up by string name. =#
-  local nm = string(expr)
-  if haskey(nameToNumeric, nm)
-    return nameToNumeric[nm]
-  end
-  return nothing
+  return get(nameToNumeric, string(expr), nothing)
 end
 
 
