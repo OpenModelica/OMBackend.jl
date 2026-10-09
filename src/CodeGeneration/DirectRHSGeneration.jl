@@ -2041,7 +2041,9 @@ path" and fall back to the next strategy.
 """
 function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
   local v = _symbolicCallValue(expr, nameToNumeric)
-  return (v isa Real && !(v isa Bool)) ? Float64(v) : nothing
+  #= A Boolean parameter's value as 0/1 (`canRepeatWeatherFile = abs(mod(lenWea, 3.1536e7)) <
+     0.01`, Buildings' ISO13790 zones). =#
+  return v isa Real ? Float64(v) : nothing
 end
 
 #= A value of _evalSymbolicFunctionCall's walk: a constant as it is (a Boolean or a String
