@@ -1724,7 +1724,7 @@ function createTerminalBodyRunner(simCode::SimulationCode.SIM_CODE)
          body we cannot evaluate (e.g. an unsupported external call) warns rather
          than discarding the result. =#
       try
-        let integrator = (u = _sol.u[end], t = _sol.t[end], f = _sol.prob.f, dt = 0.0, ps = _sol.prob.ps),
+        let integrator = (u = _sol.u[end], t = _sol.t[end], f = _sol.prob.f, dt = 0.0, p = _sol.prob.p, ps = _sol.prob.ps),
             x = _sol.u[end],
             t = _sol.t[end],
             p = _sol.prob.p,

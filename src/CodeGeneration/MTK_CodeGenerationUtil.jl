@@ -2704,6 +2704,10 @@ end
 # parameters, data structures), so callers need not special-case the latter.
 getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode) = getIdxForLookupMTK(string(x), simCode)
 
+#= In a callback's condition or affect: a state from `x`, a parameter from the integrator's
+   parameters. A `p` in scope was the callback set's, the event parameters as symbols (the
+   condition a Num: Buildings' weather data readers, `canRepeatWeatherFile - (modTimAux >
+   tNext)`), where the condition did not bind its own. =#
 function getIdxForLookupMTK(crefAsStr::String, simCode)
   if crefAsStr == "time"
     return :t
@@ -2712,7 +2716,7 @@ function getIdxForLookupMTK(crefAsStr::String, simCode)
   if !(SimulationCode.isParameter(simVar))
     Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(crefAsStr)))))
   else
-    Expr(:call, getindex, :p, Expr(:call, :getindex, :lookuptableParams, :(Symbol($(crefAsStr)))))
+    Expr(:call, getindex, :(integrator.p), Expr(:call, :getindex, :lookuptableParams, :(Symbol($(crefAsStr)))))
   end
 end
 
