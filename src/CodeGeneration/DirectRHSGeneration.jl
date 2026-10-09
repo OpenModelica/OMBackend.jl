@@ -263,6 +263,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                 hardInitialValues=hardInitialValues,
                                 observedEquations=observedEquations)
   local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
+  _evaluateDiscreteInitialRows!(u0, reducedSystem, states, params, p_vec, Float64(tspan[1]), valuesMayDiffer)
   #= A run with other tunable parameter values (DAE_REINIT, below). =#
   local (resolvedAt, entryAt, followTunable!) =
     _runEntry(reducedSystem; states, params, pars, finalInitialValues, systemGuesses, resolvedParams,
@@ -677,6 +678,50 @@ function _homotopyContinuation(solve, u, pv, k::Int; refresh! = nothing, finalSo
     pv[k] = 1.0
   end
   return finalSolve(uh, pv)
+end
+
+#= Initialization equations of discretes that read the signals (an observed variable, another
+   state): the init solve leaves the discretes out, and only the rows with a literal or a
+   parameter value were pinned (_collectHardInitializationValues); the others were dropped.
+   Buildings' PartialConvertTime, `k = integer(modTimAux/lenWea) + 1; tNext = k*lenWea`:
+   tNext stayed 0, the weather file's time a year ahead. Evaluated on the entry state at t0,
+   again until none changes (tNext reads k). =#
+function _evaluateDiscreteInitialRows!(u0::Vector{Float64}, reducedSystem, states, params, p_vec::Vector{Float64},
+                                       t0::Float64, discreteNames::AbstractSet{String})::Vector{Float64}
+  local stateIdx = Dict{String, Int}(string(st) => i for (i, st) in enumerate(states))
+  local idxs = Int[]
+  local exprs = Any[]
+  for eq in ModelingToolkit.initialization_equations(reducedSystem)
+    local key = string(eq.lhs)
+    startswith(key, "Differential(") && continue
+    local i = get(stateIdx, key, nothing)
+    (i !== nothing && _plainVariableName(key) in discreteNames) || continue
+    _literalNumericValue(eq.rhs) === nothing || continue
+    push!(idxs, i)
+    push!(exprs, eq.rhs)
+  end
+  isempty(exprs) && return u0
+  local iv = ModelingToolkit.get_iv(reducedSystem)
+  local keep = _inlineObservedRows!(exprs, reducedSystem, states, params, iv)
+  isempty(keep) && return u0
+  local rows = try
+    _exprToRTGFunction(Symbolics.build_function(exprs[keep], states, params, iv; expression = Val{true})[1])
+  catch e
+    OMBackend._fallback(e, :discreteInitialRows; impact = :result)
+    return u0
+  end
+  for _ in 1:(length(keep) + 1)
+    local values = Base.invokelatest(rows, u0, p_vec, t0)
+    local changed = false
+    for (j, r) in enumerate(keep)
+      local v = Float64(values[j])
+      (isfinite(v) && u0[idxs[r]] != v) || continue
+      u0[idxs[r]] = v
+      changed = true
+    end
+    changed || break
+  end
+  return u0
 end
 
 #= Returns `(values, constraintKeys)`. `values` seeds u0; `constraintKeys`
