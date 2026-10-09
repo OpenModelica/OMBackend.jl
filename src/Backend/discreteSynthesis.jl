@@ -323,6 +323,29 @@ Base.@nospecializeinfer function _discreteBoolCandidate(@nospecialize(eq::BDAE.E
   return (name = lhsName, lhs = lhs, rhs = eq.rhs, src = eq.source, eq = eq)
 end
 
+#= `sample(...)`, or a conjunction with one sample() conjunct and no other sample()
+   (Buildings' plotters: `sampleTrigger = active and sample(t0, samplePeriod)`). =#
+function _isSampleTriggerExp(@nospecialize(e::DAE.Exp))::Bool
+  local isSample = x -> x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name == "sample"
+  local conjuncts = DAE.Exp[]
+  local collect! = nothing
+  collect! = x -> (x isa DAE.LBINARY && x.operator isa DAE.AND) ? (collect!(x.exp1); collect!(x.exp2)) : push!(conjuncts, x)
+  collect!(e)
+  return count(isSample, conjuncts) == 1 && !any(c -> !isSample(c) && _callsAnyOf(c, ("sample",)), conjuncts)
+end
+
+#= Per name, how many equations other than when-equations mention it. =#
+function _readsOutsideWhens(eqs::AbstractVector{BDAE.Equation})::Dict{String, Int}
+  local counts = Dict{String, Int}()
+  for eq in eqs
+    eq isa BDAE.WHEN_EQUATION && continue
+    local refs = OrderedSet{String}()
+    BDAEUtil.traverseEquationExpressions(eq, (e, arg) -> (e isa DAE.CREF && push!(refs, string(e.componentRef)); (e, true, arg)), nothing)
+    foreach(r -> counts[r] = get(counts, r, 0) + 1, refs)
+  end
+  return counts
+end
+
 #= The rhs of an alias equation: a discrete variable, not a parameter. =#
 _isDiscreteAlias(@nospecialize(rhs), paramOrConstNames::OrderedSet{String})::Bool =
   rhs isa DAE.CREF && !(string(rhs.componentRef) in paramOrConstNames)
@@ -713,9 +736,17 @@ function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equ
      Greater block's `y = u1 > u2` next to `y = fire` was left in the
      continuous equations, its crossing without an event). =#
   local aliases = Tuple{String, String}[]
+  local reads = Ref{Union{Nothing, Dict{String, Int}}}(nothing)
+  local readCount = name -> get(reads[] === nothing ? (reads[] = _readsOutsideWhens(equations)) : reads[], name, 0)
   for eq in equations
     local c = _discreteBoolCandidate(eq, paramOrConstNames)
     if c === nothing
+      push!(out, eq)
+    elseif _isSampleTriggerExp(c.rhs) && readCount(c.name) <= 1
+      #= A sample trigger only when-equations read (Buildings' plotters: `sampleTrigger =
+         active and sample(t0, samplePeriod); when sampleTrigger`): it stays, and
+         substituteSampleTriggers puts it into the whens. Lifted, it was recomputed at its
+         relations' changes only and missed every tick. =#
       push!(out, eq)
     elseif _isDiscreteAlias(c.rhs, paramOrConstNames)
       push!(out, eq)

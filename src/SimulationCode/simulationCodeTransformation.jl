@@ -916,7 +916,8 @@ _isSampleCallDAE(@nospecialize(e))::Bool = e isa DAE.CALL && e.path isa Absyn.ID
 
 A when condition on a Boolean defined by `b = sample(start, interval)` (the
 MSL DiscreteBlock's `sampleTrigger`, read by `when {sampleTrigger, initial()}`
-in ZeroOrderHold and Sampler) gets the sample call in place of `b`: only a
+in ZeroOrderHold and Sampler), or by a guard and-ed with one (Buildings'
+plotters), gets the definition in place of `b`: only a
 condition with a sample() call becomes a periodic callback, `b` itself is
 false between the ticks. Only the condition's Boolean structure (the cref, an
 array, and, or) is rewritten, not an operand of pre() or a relation. The
@@ -929,7 +930,7 @@ function substituteSampleTriggers(whenEqs::Vector{BDAE.WHEN_EQUATION},
     local e = eq.exp
     (e isa DAE.BINARY && e.operator isa DAE.SUB) || continue
     for (a, b) in ((e.exp1, e.exp2), (e.exp2, e.exp1))
-      a isa DAE.CREF && _isSampleCallDAE(b) && (defs[string(a.componentRef)] = b)
+      a isa DAE.CREF && Backend.BDAECreate._isSampleTriggerExp(b) && (defs[string(a.componentRef)] = b)
     end
   end
   isempty(defs) && return whenEqs
