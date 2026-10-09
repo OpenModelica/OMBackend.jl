@@ -567,11 +567,19 @@ Collect cref names from a SIM `ASUB`, reconstructing the subscripted key
 (e.g. `"R_T[1][1]"`) for all-constant subscripts so the use-def chain matches
 the scalarized hash-table keys.
 """
+#= The name an array read with a variable subscript is collected under besides its base:
+   `val[?]` (CDL's TimeTable `val[idx, :]`, idx a discrete), no element named; the parameter
+   passes keep every element of such an array (_referenceDynamicallyIndexed!). =#
+const DYNAMIC_SUBSCRIPT_MARK = "[?]"
+
 function collectCrefNamesForAsub(names::OrderedSet{String}, exp::ASUB)
   if exp.exp isa EXP_CREF
     local suffix = _simConstSubscriptSuffix(exp.subs)
+    local base = DAE_identifierToString(toDAECref(exp.exp.cref).componentRef)
     if suffix !== nothing
-      push!(names, Base.string(DAE_identifierToString(toDAECref(exp.exp.cref).componentRef), suffix))
+      push!(names, Base.string(base, suffix))
+    elseif any(s -> !isempty(collectCrefNames!(OrderedSet{String}(), s)), exp.subs)
+      push!(names, Base.string(base, DYNAMIC_SUBSCRIPT_MARK))
     end
   end
   collectCrefNames!(names, exp.exp)
@@ -595,6 +603,8 @@ function collectCrefNamesForDAEAsub(names::OrderedSet{String}, @nospecialize(e),
       local baseName = DAE_identifierToString(cr)
       local suffix = _daeConstSubscriptSuffix(subs)
       suffix === nothing || push!(names, Base.string(baseName, suffix))
+      suffix === nothing && any(s -> s isa DAE.INDEX && !isempty(collectCrefNames!(OrderedSet{String}(), s.exp)), subs) &&
+        push!(names, Base.string(baseName, DYNAMIC_SUBSCRIPT_MARK))
       push!(names, baseName)
       asubHandled = true
     end

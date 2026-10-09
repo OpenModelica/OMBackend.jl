@@ -632,14 +632,11 @@ end
 #= A name read with a variable subscript references every element of its array: none is
    named, and the code generation looks them up (a constant table, indexed at run time). CDL's
    Integer TimeTable `y[:] = val[idx, :]`, idx a discrete: `val[idx][2]` (a cref the backend
-   flattened) or the whole array `val` (`val[idx, 2]` an ASUB of it). =#
+   flattened) or `val[?]` (`val[idx, 2]` an ASUB of the whole array, DYNAMIC_SUBSCRIPT_MARK).
+   Not a whole array read as such (`solve(A, b)`): its constant elements fold into a literal. =#
 function _referenceDynamicallyIndexed!(names::OrderedSet{String}, ht::AbstractDict)::OrderedSet{String}
   local bases = Set{String}()
   for name in names
-    if !occursin('[', name)
-      haskey(ht, name) || push!(bases, name)
-      continue
-    end
     local m = match(r"^([^\[\]]+)\[", name)
     (m !== nothing && occursin(r"\[[^\]0-9][^\]]*\]", name)) || continue
     push!(bases, String(m.captures[1]))
