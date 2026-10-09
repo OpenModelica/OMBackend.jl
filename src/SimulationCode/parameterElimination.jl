@@ -411,6 +411,17 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
      symbol -> UndefVarError at module eval. Mirrors the sibling passes
      dropObservationOnlyVariables (4391) and eliminateDeadParameters (4500). =#
   _collectFunctionBodyCrefs!(protectedNames, simCode.functions)
+  #= An equation's read by a subscript that is not a literal (a record array's field by a
+     discrete index, `uacp[stage]_UAcp`: Buildings' DX coils): the elements stay, read as a
+     table (_dynamicSubscriptLookup). =#
+  local equationReads = OrderedSet{String}()
+  foreach(eq -> collectCrefNames!(equationReads, eq.exp), simCode.residualEquations)
+  for ifEq in simCode.ifEquations, branch in ifEq.branches
+    foreach(eq -> collectCrefNames!(equationReads, eq.exp), branch.residualEquations)
+  end
+  for name in equationReads
+    occursin(r"\[[^\]0-9][^\]]*\]", name) && push!(protectedNames, name)
+  end
   _referenceDynamicallyIndexed!(protectedNames, ht)
   #= Tunable parameters stay (withTunableParameters); parameters whose bindings
      depend on them do not evaluate below, so they stay too. =#

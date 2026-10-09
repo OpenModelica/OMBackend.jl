@@ -137,10 +137,15 @@ end
 function (v::CollectCrefNames)(e::Exp, arg::Nothing)::Tuple{Exp, Bool, Nothing}
   if e isa EXP_CREF
     local nm = DAE_identifierToString(toDAECref(e.cref).componentRef)
-    !(nm in v.known) && push!(v.missingNames, nm)
+    !(nm in v.known) && !(_firstElementName(nm) in v.known) && push!(v.missingNames, nm)
   end
   return (e, true, arg)
 end
+
+#= A name with subscripts that are not literals (`uacp[stage]_UAcp`, a record array's field by a
+   discrete index), its first element (`uacp[1]_UAcp`): code generation reads the elements as a
+   table (_dynamicSubscriptLookup). Otherwise the name. =#
+_firstElementName(nm::String)::String = replace(nm, r"\[[^\[\]0-9][^\[\]]*\]" => "[1]")
 
 #= The names an equation binds for its references: the iterators of its reductions, and the
    arrays of records whose elements it reads by a subscript that is not a literal (`data[i]`,

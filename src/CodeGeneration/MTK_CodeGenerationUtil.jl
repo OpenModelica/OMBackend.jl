@@ -605,9 +605,12 @@ _subscriptText(@nospecialize(s))::String =
    _referenceDynamicallyIndexed!): the lookup of the table of base's elements, all known at the
    build (the dimensions from the names in the table), indexed at run time; nothing otherwise. =#
 function _dynamicSubscriptLookup(name::String, simCode::SimulationCode.SIM_CODE)::Union{Expr, Nothing}
-  local m = match(r"^([^\[\]]+)((?:\[[^\[\]]+\])+)$", name)
+  #= a record array's field after the subscripts (`uacp[stage]_UAcp`, Buildings' DX coils):
+     literal subscripts only there =#
+  local m = match(r"^([^\[\]]+)((?:\[[^\[\]]+\])+)((?:[^\[\]]|\[[0-9]+\])*)$", name)
   m === nothing && return nothing
   local base = String(m.captures[1])
+  local suffix = String(m.captures[3])
   local subs = String[String(x.captures[1]) for x in eachmatch(r"\[([^\[\]]+)\]", m.captures[2])]
   all(s -> tryparse(Int, s) !== nothing, subs) && return nothing
   local ht = simCode.stringToSimVarHT
@@ -623,7 +626,7 @@ function _dynamicSubscriptLookup(name::String, simCode::SimulationCode.SIM_CODE)
     end
   end
   #= the extent of each dimension: the elements along it from 1 =#
-  local key = (d, k) -> base * join("[" * string(j == d ? k : 1) * "]" for j in eachindex(subs))
+  local key = (d, k) -> base * join("[" * string(j == d ? k : 1) * "]" for j in eachindex(subs)) * suffix
   local dims = Int[]
   for d in eachindex(subs)
     local n = 0
@@ -633,9 +636,33 @@ function _dynamicSubscriptLookup(name::String, simCode::SimulationCode.SIM_CODE)
     n == 0 && return nothing
     push!(dims, n)
   end
+  local table = _buildTimeTable(base, suffix, dims, simCode)
+  table === nothing || return :(OMBackend.CodeGeneration.constTableLookup($(table), $(index...)))
+  #= Elements not known at the build (`fixed = false` parameters the initialization computes,
+     variables: Buildings' DX coils' `uacp[stage].UAcp`), one subscript a variable: the element
+     the index selects, among their variables =#
+  local dynamic = findall(s -> tryparse(Int, s) === nothing, subs)
+  length(dynamic) == 1 || return nothing
+  local d = only(dynamic)
+  local symbols = Symbol[]
+  for k in 1:dims[d]
+    local entry = get(ht, base * join("[" * (j == d ? string(k) : subs[j]) * "]" for j in eachindex(subs)) * suffix, nothing)
+    entry === nothing && return nothing
+    push!(symbols, Symbol(last(entry).name))
+  end
+  local chain = symbols[end]
+  for k in (length(symbols) - 1):-1:1
+    chain = :(ifelse($(index[d]) == $(k), $(symbols[k]), $(chain)))
+  end
+  return quote $(chain) end
+end
+
+#= The values of the elements `base[i][j]...suffix`, all known at the build, or nothing. =#
+function _buildTimeTable(base::String, suffix::String, dims::Vector{Int}, simCode::SimulationCode.SIM_CODE)::Union{Array{Float64}, Nothing}
+  local ht = simCode.stringToSimVarHT
   local table = Array{Float64}(undef, dims...)
   for I in CartesianIndices(table)
-    local entry = get(ht, base * join("[" * string(i) * "]" for i in Tuple(I)), nothing)
+    local entry = get(ht, base * join("[" * string(i) * "]" for i in Tuple(I)) * suffix, nothing)
     entry === nothing && return nothing
     local kind = last(entry).varKind
     (kind isa SimulationCode.PARAMETER && kind.bindExp isa SOME) || return nothing
@@ -646,7 +673,7 @@ function _dynamicSubscriptLookup(name::String, simCode::SimulationCode.SIM_CODE)
     v === nothing && return nothing
     table[I] = v
   end
-  return :(OMBackend.CodeGeneration.constTableLookup($(table), $(index...)))
+  return table
 end
 
 function expToJuliaExpMTK(exp::SimulationCode.EXP_CREF, simCode::SimulationCode.SIM_CODE;
