@@ -176,9 +176,11 @@ function _zeroCrossingOperand(@nospecialize(e::DAE.Exp))::DAE.Exp
                     DAE.BINARY(DAE.RCONST(2.0), DAE.MUL(DAE.T_REAL_DEFAULT), e))
 end
 
-#= The larger (GREATER) or the smaller (LESS) of two zero-crossing functions. =#
+#= The larger (GREATER) or the smaller (LESS) of two zero-crossing functions: max() or min().
+   An if-expression on their relation held each operand twice, and a condition nesting and/or
+   grew exponentially (MSL Digital's registers: the build did not end). =#
 _zeroCrossingExtreme(f1::DAE.Exp, op::DAE.Operator, f2::DAE.Exp)::DAE.Exp =
-  DAE.IFEXP(DAE.RELATION(f1, op, f2, -1, NONE()), f1, f2)
+  DAE.CALL(Absyn.IDENT(op isa DAE.GREATER ? "max" : "min"), MetaModelica.list(f1, f2), DAE.callAttrBuiltinReal)
 
 function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DAE.Exp))::DAE.Exp
   local _intRW = _zcRewriteIntegerRel(conditonalExpression)
