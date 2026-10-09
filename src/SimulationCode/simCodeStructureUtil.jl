@@ -294,6 +294,20 @@ toSimExp(e::DAE.ASUB)::Exp =
 toSimExp(e::DAE.TSUB)::Exp = TSUB(toSimExp(e.exp), Int(e.ix), e.ty)
 toSimExp(e::DAE.RSUB)::Exp = RSUB(toSimExp(e.exp), Int(e.ix), String(e.fieldName), e.ty)
 toSimExp(e::DAE.CAST)::Exp = CAST(e.ty, toSimExp(e.exp))
+#= size(a, k) left in a parameter binding (Buildings' borefield data: nBor = size(cooBor, 1)):
+   that dimension's size where the array's type knows it, else a call of the builtin size. =#
+function toSimExp(e::DAE.SIZE)::Exp
+  local ty = e.exp isa DAE.CREF ? e.exp.ty : e.exp isa DAE.ARRAY ? e.exp.ty : nothing
+  if e.sz isa SOME && e.sz.data isa DAE.ICONST && ty isa DAE.T_ARRAY
+    local k = Int(e.sz.data.integer)
+    local dims = Base.collect(ty.dims)
+    if 1 <= k <= length(dims) && dims[k] isa DAE.DIM_INTEGER
+      return ICONST(Int(dims[k].integer))
+    end
+  end
+  local args = e.sz isa SOME ? Exp[toSimExp(e.exp), toSimExp(e.sz.data)] : Exp[toSimExp(e.exp)]
+  return CALL(Absyn.IDENT("size"), args, DAE.callAttrBuiltinInteger)
+end
 toSimExp(e::DAE.CALL)::Exp =
   CALL(e.path, Exp[toSimExp(a) for a in e.expLst], e.attr)
 toSimExp(e::DAE.RECORD)::Exp =
