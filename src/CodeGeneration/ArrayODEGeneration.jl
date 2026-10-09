@@ -3072,7 +3072,16 @@ function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Exp
         local k = round((t - SAMPLE_START[id]) / SAMPLE_INTERVAL[id])
         p.sampleActive[id] = k >= 0 && abs(t - (SAMPLE_START[id] + k * SAMPLE_INTERVAL[id])) <= 1e-9 * max(1.0, abs(t))
       end
-      _eventAt!(integrator)
+      #= the relations literal at the instant (H = 0): one whose crossing function is 0 there (a
+         threshold the tick reaches, `time >= pulseStart + 0.2` at 1) changes with it, as
+         OpenModelica takes that state event together with the time event =#
+      local _hyst = p.hyst[1]
+      p.hyst[1] = 0.0
+      try
+        _eventAt!(integrator)
+      finally
+        p.hyst[1] = _hyst
+      end
       fill!(p.sampleActive, false)
       local du = similar(u); local a = similar(u, $nAlg)
       equations!(du, a, u, p, t, nothing, true)
