@@ -919,7 +919,8 @@ MSL DiscreteBlock's `sampleTrigger`, read by `when {sampleTrigger, initial()}`
 in ZeroOrderHold and Sampler) gets the sample call in place of `b`: only a
 condition with a sample() call becomes a periodic callback, `b` itself is
 false between the ticks. Only the condition's Boolean structure (the cref, an
-array, and, or) is rewritten, not an operand of pre() or a relation.
+array, and, or) is rewritten, not an operand of pre() or a relation. The
+bodies' reads of `b` get it too.
 """
 function substituteSampleTriggers(whenEqs::Vector{BDAE.WHEN_EQUATION},
                                   resEqs::Vector{BDAE.RESIDUAL_EQUATION})::Vector{BDAE.WHEN_EQUATION}
@@ -938,8 +939,23 @@ function substituteSampleTriggers(whenEqs::Vector{BDAE.WHEN_EQUATION},
     DAE.LBINARY(a, op, b) => DAE.LBINARY(subst(a), op, subst(b))
     _ => cond
   end
+  #= In the bodies the reads of `b` too, not under pre(), edge() or change(): true at
+     the ticks only (MTK_CodeGenerationUtil's "sample"), as the occupant lighting's
+     `if sampleTrigger then` at `when {occ, sampleTrigger}` asks; `b` itself is false. =#
+  local inBodyVisit = (x, arg) -> @match x begin
+    DAE.CALL(path = Absyn.IDENT(n)) where (n in ("pre", "edge", "change")) => (x, false, arg)
+    DAE.CREF(componentRef = cr) => (get(defs, string(cr), x), false, arg)
+    _ => (x, true, arg)
+  end
+  local inBody = e -> Base.first(Util.traverseExpTopDown(e, inBodyVisit, 0))
+  local bodyOp = op -> @match op begin
+    BDAE.ASSIGN(left, right, source) => BDAE.ASSIGN(left, inBody(right), source)
+    BDAE.REINIT(stateVar, value, source) => BDAE.REINIT(stateVar, inBody(value), source)
+    BDAE.ASSERT(condition, message, level, source) => BDAE.ASSERT(inBody(condition), message, level, source)
+    _ => op
+  end
   local rewrite
-  rewrite = (w::BDAE.WHEN_STMTS) -> BDAE.WHEN_STMTS(subst(w.condition), w.whenStmtLst,
+  rewrite = (w::BDAE.WHEN_STMTS) -> BDAE.WHEN_STMTS(subst(w.condition), MetaModelica.list(map(bodyOp, collect(w.whenStmtLst))...),
     @match w.elsewhenPart begin
       SOME(ew) => SOME(BDAE.WHEN_EQUATION(ew.size, rewrite(ew.whenEquation), ew.source, ew.attr))
       _ => w.elsewhenPart

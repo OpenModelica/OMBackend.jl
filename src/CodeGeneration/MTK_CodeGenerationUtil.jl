@@ -498,6 +498,14 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
     "Integer" => begin
       expToJuliaExpMTK(listHead(expLst), simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derAsSymbol)
     end
+    #= sample(start, interval) read in a when body (lowered with PRE_FROM_SNAPSHOT):
+       whether the instant is a tick, as the occupant lighting's `if sampleTrigger`
+       at `when {occ, sampleTrigger}` asks. Elsewhere false (modelica_sample), the
+       time between the ticks. =#
+    "sample" where PRE_FROM_SNAPSHOT[] => begin
+      local (start, interval) = map(x -> expToJuliaExpMTK(x, simCode), collect(expLst))
+      :(OMBackend.CodeGeneration._isSampleInstant(integrator.t, $(start), $(interval)))
+    end
     #= A String parameter's binding (createStringParameterAssignments): the
        argument types from the expressions, not from the values. =#
     "String" => AlgorithmicCodeGeneration.modelicaStringCall(collect(expLst), x -> expToJuliaExpMTK(x, simCode))

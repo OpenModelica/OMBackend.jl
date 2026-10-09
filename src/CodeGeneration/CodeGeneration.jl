@@ -46,6 +46,7 @@ using DocStringExtensions
 using ModelingToolkit
 using LinearAlgebra
 import DiffEqBase
+import DiffEqCallbacks
 import OrdinaryDiffEq
 import ADTypes
 import NonlinearSolve

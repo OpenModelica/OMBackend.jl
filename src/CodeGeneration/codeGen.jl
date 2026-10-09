@@ -846,6 +846,12 @@ function _isPeriodicTick(integrator, phase, period)::Bool
   return n >= -1e-9 && abs(n - round(n)) <= 1e-9 * max(1.0, abs(n))
 end
 
+#= Whether `t` is a tick of sample(start, interval): start + k*interval, k = 0, 1, ... =#
+function _isSampleInstant(t::Real, start::Real, interval::Real)::Bool
+  local n = (t - start) / interval
+  return n >= -1e-9 && abs(n - round(n)) <= 1e-9 * max(1.0, abs(n))
+end
+
 #= `(sample call, guard)` of a when condition that is `sample(...)` or a
    conjunction with exactly one sample() conjunct (the guard: the other
    conjuncts, or nothing); `(nothing, nothing)` otherwise. =#
@@ -885,6 +891,44 @@ function _sampleDisjuncts(@nospecialize(cond))::Union{Vector{Any}, Nothing}
     end
   end
   return (collect!(cond) && length(out) > 1) ? out : nothing
+end
+
+#= `(sample calls, the other disjuncts or-ed)` of a condition that or-s sample()s
+   with other triggers, none of them under a sample() (Buildings' occupant
+   lighting: `when {occ, sampleTrigger}`, edge(occ) or sample(t0, samplePeriod)),
+   or nothing. =#
+function _sampleOrOthers(@nospecialize(cond::DAE.Exp))::Union{Tuple{Vector{Any}, DAE.Exp}, Nothing}
+  local samples = Any[]
+  local others = Any[]
+  local collect! = nothing
+  collect! = e -> @match e begin
+    DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) => (collect!(e1); collect!(e2))
+    DAE.CALL(path = Absyn.IDENT("sample")) => push!(samples, e)
+    _ => push!(others, e)
+  end
+  collect!(cond)
+  (isempty(samples) || isempty(others) || any(_containsSampleCall, others)) && return nothing
+  return (samples, foldl((a, b) -> DAE.LBINARY(a, DAE.OR(DAE.T_BOOL_DEFAULT), b), others))
+end
+
+#= The ticks of the sample()s of a when that or-s them with other triggers
+   (`clocks`: (interval, phase, a tick at the initial time) each). A tick marks
+   its instant in `tickAt`: the event iteration, which runs after the instant's
+   other ticks, then runs the when once (`affect!` takes the tick). At the start
+   of a solve no iteration follows: there the tick runs `affect!` itself. The
+   end of a solve is a tick only where a clock ticks. =#
+function _sampleTickCallback(tickAt::Base.RefValue{Float64}, affect!::Function, clocks::Vector)
+  local ticks = map(clocks) do (dt, phase, initialTick)
+    local tick! = integrator -> begin
+      _isPeriodicTick(integrator, phase, dt) || return nothing
+      tickAt[] = integrator.t
+      integrator.t == first(integrator.sol.prob.tspan) && affect!(integrator)
+      return nothing
+    end
+    DiffEqCallbacks.PeriodicCallback(tick!, dt; phase = phase, initial_affect = initialTick, final_affect = true,
+                                     save_positions = (false, false))
+  end
+  return DiffEqBase.CallbackSet(ticks...)
 end
 
 #= (interval, phase, a tick at the initial time) of `sample(start, interval)`. =#
@@ -952,19 +996,32 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
   #= or-ed sample()s alone (CDL's Boolean and Integer TimeTable: `when {sample(t0 +
      timeStamps[1], period), sample(t0 + timeStamps[2], period), ...}`): a clock each, one body. =#
   local sampleCalls = sampleCall !== nothing ? Any[sampleCall] : _sampleDisjuncts(wEqCondDAE)
+  #= sample()s or-ed with other triggers (Buildings' occupant lighting: `when
+     {occ, sampleTrigger}`): a when on the others or a tick of theirs
+     (_sampleTickCallback), on a discrete condition. =#
+  local tickCalls = nothing
+  if sampleCalls === nothing
+    local mixed = _sampleOrOthers(wEqCondDAE)
+    if mixed !== nothing
+      (tickCalls, wEqCondDAE) = mixed
+      cond = transformToZeroCrossingCondition(wEqCondDAE)
+    end
+  end
   #= Lowered elsewhere: a sample() alone or and-ed with a guard, terminal()
      alone (after the solve). Not in MSL 3.2.3; sample() read false, terminal()
      undefined: never fired. =#
   sampleCalls === nothing && _containsSampleCall(wEqCondDAE) &&
-    unsupported("sample() under not, or or-ed with another condition, in a when-condition", wEqCondDAE)
+    unsupported("sample() under not, and-ed with another sample(), or and-ed within an or, in a when-condition", wEqCondDAE)
   _containsCallTo(wEqCondDAE, "terminal") && !_isCallNamed(wEqCondDAE, "terminal") &&
     unsupported("terminal() with another trigger in a when-condition", wEqCondDAE)
   local isPeriodic = sampleCalls !== nothing
   local isContinuousCond::Bool = isContinuousCondition(wEqCondDAE, simCode)
+  tickCalls !== nothing && isContinuousCond &&
+    unsupported("sample() or-ed with a continuous-time condition in a when-condition", wEqCondDAE)
   #= Table / time-driven sources: a when whose condition is purely change(time>=c)
      thresholds must fire AT those times via PresetTimeCallback — a ContinuousCallback
      rootfinding on the spiky change() value never detects the crossings. =#
-  if !isPeriodic
+  if !isPeriodic && tickCalls === nothing
     local _thr = _collectTimeThresholds(wEqCondDAE, simCode)
     if _thr !== nothing && !isempty(_thr)
       return _emitPresetTimeWhen(eq, simCode, callbacks, _thr)
@@ -1297,6 +1354,12 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
     local condCrefs = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
+    #= The ticks of or-ed sample()s (_sampleTickCallback): the when fires at a
+       tick it has not taken, once at an instant. =#
+    local tickCb = tickCalls === nothing ? 0 : ADD_CALLBACK()
+    local tickNow = :(_tickAt[] == integrator.t && _tickTaken[] != integrator.t)
+    local tickClocks = tickCalls === nothing ? Expr[] :
+      [:(($(c[1]), $(c[2]), $(c[3]))) for c in (_sampleClock(s, simCode) for s in tickCalls)]
     #= From the condition as written: the zero-crossing form unwraps a
        top-level `change(k)` to `k`. =#
     local _bareCrefStrs = _collectBareCrefStrings(wEqCondDAE)
@@ -1375,6 +1438,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           _affCache = Ref{Union{Nothing, Tuple{Dict{Symbol, Int}, Dict{Symbol, Int}}}}(nothing),
           _changeCache = Ref{Union{Nothing, Dict{Symbol, Any}}}(nothing),
           _latch = Ref{Bool}(false),     # the edge latch
+          $((tickCalls === nothing ? () : (:(_tickAt = Ref(NaN)), :(_tickTaken = Ref(NaN))))...)
           _changeSeedValues = Dict{Symbol, Any}($(changeSeedPairs...))
         global $(Symbol("condition$(callbacks)"))
         #= Whether the when fires. `_follow`: whether change()/edge() may take the values now,
@@ -1408,7 +1472,9 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           local _result = $(condValue)
           @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
           $(useLatch ? :(_result || (_latch[] = false)) : :())
-          local _fires = $(useLatch ? :(_result && !_latch[]) : :_result)
+          local _fires = $(let f = useLatch ? :(_result && !_latch[]) : :_result
+                             tickCalls === nothing ? f : :($f || $tickNow)
+                           end)
           #= change()/edge() compare with the values at the previous event (pre()): where the when
              does not fire, the memory follows the values now (off turned false at 1/12 without
              firing a `when edge(off)`, which then missed off's edge at 5/12); where it fires, its
@@ -1422,6 +1488,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           local t = integrator.t
           local x = integrator.u
           @debug "[CB-DC$($(callbacks)) affect] firing" t=integrator.t
+          $(tickCalls === nothing ? :() : :(_tickAt[] == integrator.t && (_tickTaken[] = integrator.t)))
           local lookuptableStates
           local lookuptableParams
           if _affCache[] === nothing
@@ -1467,6 +1534,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
               $(useLatch ? :(_latch[] = false; _latch[] = $(Symbol("condition$(callbacks)"))(x, t, integrator)) : :())
               nothing
             end))
+        $(tickCalls === nothing ? :() : quote
+            global $(Symbol("cb$(tickCb)"))
+            $(Symbol("cb$(tickCb)")) = OMBackend.CodeGeneration._sampleTickCallback(_tickAt, $(Symbol("affect$(callbacks)!")),
+                                                                                   Any[$(tickClocks...)])
+          end)
       end
       #= Part of the event iteration where the model has buffered relations. =#
       $(Symbol("cb$(callbacks)")) = OMBackend.CodeGeneration.discreteWhenCallback($(Symbol("condition$(callbacks)")),
