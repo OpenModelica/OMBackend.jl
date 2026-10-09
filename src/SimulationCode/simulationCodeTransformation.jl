@@ -1075,6 +1075,44 @@ function _reconstructScalarizedArrayDAE(baseName::String, ht)::Union{DAE.Exp, No
   return nothing
 end
 
+#= A cref with one subscript that is not a literal (a for loop's iterator: Buildings' DX
+   coils' `datCoi.sta[i].nomVal.Q_flow_nominal`, the plotters' `legend[i]`) whose elements
+   1, 2, ... are in the table: the array of the elements, subscripted by it. =#
+function _elementsBySubscriptDAE(e::DAE.CREF, ht::AbstractDict)::Union{DAE.Exp, Nothing}
+  local dynamic = DAE.Exp[]
+  local subsOf = cr -> @match cr begin
+    DAE.CREF_QUAL(subscriptLst = subs) => subs
+    DAE.CREF_IDENT(subscriptLst = subs) => subs
+    _ => MetaModelica.nil
+  end
+  local cr = e.componentRef
+  while cr isa DAE.CREF_QUAL || cr isa DAE.CREF_IDENT
+    for sub in subsOf(cr)
+      sub isa DAE.INDEX && !(sub.exp isa DAE.ICONST) && push!(dynamic, sub.exp)
+    end
+    cr = cr isa DAE.CREF_QUAL ? cr.componentRef : nothing
+  end
+  length(dynamic) == 1 || return nothing
+  local index = only(dynamic)
+  local subsWith = (subs, k) -> MetaModelica.list((sub isa DAE.INDEX && sub.exp === index ? DAE.INDEX(DAE.ICONST(k)) : sub for sub in subs)...)
+  local withK = nothing
+  withK = (cr, k) -> @match cr begin
+    DAE.CREF_QUAL(id, ty, subs, rest) => DAE.CREF_QUAL(id, ty, subsWith(subs, k), withK(rest, k))
+    DAE.CREF_IDENT(id, ty, subs) => DAE.CREF_IDENT(id, ty, subsWith(subs, k))
+    _ => cr
+  end
+  local elements = DAE.Exp[]
+  while true
+    local el = DAE.CREF(withK(e.componentRef, length(elements) + 1), e.ty)
+    haskey(ht, string(el)) || break
+    push!(elements, el)
+  end
+  isempty(elements) && return nothing
+  local arrayTy = DAE.T_ARRAY(e.ty, MetaModelica.list(DAE.DIM_INTEGER(length(elements))))
+  return DAE.ASUB(DAE.ARRAY(arrayTy, true, MetaModelica.list(elements...)), MetaModelica.list(DAE.INDEX(index)))
+end
+_elementsBySubscriptDAE(@nospecialize(e::DAE.Exp), ht::AbstractDict) = nothing
+
 # SIM.Exp delegation: round-trip to DAE.Exp until the visitor is SIM-native.
 _inlineParamsInExp(exp::Exp, ht; keepTunable::Bool = false)::Exp =
   toSimExp(_inlineParamsInExp(toDAEExp(exp), ht; keepTunable = keepTunable))
@@ -1106,7 +1144,7 @@ function _inlineParamsInExp(exp::DAE.Exp, ht; keepTunable::Bool = false)::DAE.Ex
           return (be, true, acc)
         end
       else
-        local recons = _reconstructScalarizedArrayDAE(key, ht)
+        local recons = something(_reconstructScalarizedArrayDAE(key, ht), _elementsBySubscriptDAE(e, ht), Some(nothing))
         if recons !== nothing
           return (recons, true, acc)
         end
