@@ -77,6 +77,11 @@ import ..CALL
 import ..RECORD
 import ..traverseExpTopDown
 import ..toDAECref
+import ..REDUCTION
+import ..ASUB
+import ..SType
+import ..TYPE_COMPLEX
+import ..TYPE_ARRAY
 
 using MetaModelica
 
@@ -132,10 +137,36 @@ end
 function (v::CollectCrefNames)(e::Exp, arg::Nothing)::Tuple{Exp, Bool, Nothing}
   if e isa EXP_CREF
     local nm = DAE_identifierToString(toDAECref(e.cref).componentRef)
-    !(nm in v.known) && push!(v.missingNames, nm)
+    !(nm in v.known) && !(_firstElementName(nm) in v.known) && push!(v.missingNames, nm)
   end
   return (e, true, arg)
 end
+
+#= A name with subscripts that are not literals (`uacp[stage]_UAcp`, a record array's field by a
+   discrete index), its first element (`uacp[1]_UAcp`): code generation reads the elements as a
+   table (_dynamicSubscriptLookup). Otherwise the name. =#
+_firstElementName(nm::String)::String = replace(nm, r"\[[^\[\]0-9][^\[\]]*\]" => "[1]")
+
+#= The names an equation binds for its references: the iterators of its reductions, and the
+   arrays of records whose elements it reads by a subscript that is not a literal (`data[i]`,
+   toSimExp keeps the subscript: code generation reads the element's fields from the field
+   arrays of the scalarized elements `data[1]`, ...). =#
+struct CollectBoundNames
+  bound::OrderedSet{String}
+  known::OrderedSet{String}
+end
+function (v::CollectBoundNames)(e::Exp, arg::Nothing)::Tuple{Exp, Bool, Nothing}
+  if e isa REDUCTION
+    foreach(it -> it isa DAE.REDUCTIONITER && push!(v.bound, it.id), e.iterators)
+  elseif e isa ASUB && e.exp isa EXP_CREF && _isRecordSType(e.exp.ty)
+    local nm = DAE_identifierToString(toDAECref(e.exp.cref).componentRef)
+    (nm * "[1]") in v.known && push!(v.bound, nm)
+  end
+  return (e, true, arg)
+end
+
+_isRecordSType(t::SType)::Bool =
+  (t isa TYPE_COMPLEX && t.isRecord) || (t isa TYPE_ARRAY && _isRecordSType(t.elementType))
 
 struct FlagCanonicalExp
   out::Vector{CheckViolation}
@@ -548,7 +579,9 @@ function rule_cref_resolution(simCode::SIM_CODE)::Vector{CheckViolation}
   union!(known, BUILTIN_CREFS)
   for (i, eq) in enumerate(simCode.residualEquations)
     local missingNames = String[]
-    _collectCrefNames!(missingNames, eq.exp, known)
+    local bound = OrderedSet{String}()
+    eq.exp isa Exp && traverseExpTopDown(eq.exp, CollectBoundNames(bound, known), nothing)
+    _collectCrefNames!(missingNames, eq.exp, isempty(bound) ? known : union(known, bound))
     for nm in missingNames
       push!(out, CheckViolation(:cref_resolution, :error,
                                 "residualEquations[$i]",

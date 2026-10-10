@@ -433,6 +433,7 @@ function collectCrefNames!(names::OrderedSet{String}, exp::Exp)
     end
     ARRAY_EXP(__) => begin for x in exp.elements; collectCrefNames!(names, x) end end
     CALL(__) => begin for x in exp.args; collectCrefNames!(names, x) end end
+    PARTEVALFUNCTION(__) => begin for x in exp.args; collectCrefNames!(names, x) end end
     RECORD(__) => begin for x in exp.exps; collectCrefNames!(names, x) end end
     TUPLE(__) => begin for x in exp.PR; collectCrefNames!(names, x) end end
     REDUCTION(__) => collectCrefNamesForReduction(names, exp)
@@ -566,11 +567,27 @@ Collect cref names from a SIM `ASUB`, reconstructing the subscripted key
 (e.g. `"R_T[1][1]"`) for all-constant subscripts so the use-def chain matches
 the scalarized hash-table keys.
 """
+#= The name an array read with a variable subscript is collected under besides its base:
+   `val[?]` (CDL's TimeTable `val[idx, :]`, idx a discrete), no element named; the parameter
+   passes keep every element of such an array (_referenceDynamicallyIndexed!). =#
+const DYNAMIC_SUBSCRIPT_MARK = "[?]"
+
+#= Whether an expression reads a variable (a subscript that is not a literal). The DAE method
+   of collectCrefNames! returns nothing, not the set. =#
+function _readsCref(@nospecialize(e))::Bool
+  local found = OrderedSet{String}()
+  collectCrefNames!(found, e)
+  return !isempty(found)
+end
+
 function collectCrefNamesForAsub(names::OrderedSet{String}, exp::ASUB)
   if exp.exp isa EXP_CREF
     local suffix = _simConstSubscriptSuffix(exp.subs)
+    local base = DAE_identifierToString(toDAECref(exp.exp.cref).componentRef)
     if suffix !== nothing
-      push!(names, Base.string(DAE_identifierToString(toDAECref(exp.exp.cref).componentRef), suffix))
+      push!(names, Base.string(base, suffix))
+    elseif any(s -> _readsCref(s), exp.subs)
+      push!(names, Base.string(base, DYNAMIC_SUBSCRIPT_MARK))
     end
   end
   collectCrefNames!(names, exp.exp)
@@ -594,6 +611,8 @@ function collectCrefNamesForDAEAsub(names::OrderedSet{String}, @nospecialize(e),
       local baseName = DAE_identifierToString(cr)
       local suffix = _daeConstSubscriptSuffix(subs)
       suffix === nothing || push!(names, Base.string(baseName, suffix))
+      suffix === nothing && any(s -> s isa DAE.INDEX && _readsCref(s.exp), subs) &&
+        push!(names, Base.string(baseName, DYNAMIC_SUBSCRIPT_MARK))
       push!(names, baseName)
       asubHandled = true
     end
@@ -710,7 +729,7 @@ function _walkComplexSIM!(names::OrderedSet{String}, e::Exp, ht)
     _walkComplexSIM!(names, e.exp2, ht)
   elseif e isa UNARY || e isa LUNARY
     _walkComplexSIM!(names, e.exp, ht)
-  elseif e isa CALL
+  elseif e isa CALL || e isa PARTEVALFUNCTION
     for a in e.args
       _walkComplexSIM!(names, a, ht)
     end

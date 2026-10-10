@@ -49,6 +49,9 @@ function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{
   local externalFunctionsUsed = false
   for f in functionList
     local n = string(f.path)
+    for d in f.derivatives
+      _registerFunctionDerivative!(n, d, length(f.inputs))
+    end
     local inputs = map(f.inputs) do input
       OMFrontend.Frontend.convertFunctionParam(input)
     end
@@ -75,10 +78,42 @@ function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{
       local language = occursin("external \"FORTRAN 77\"", libInfo) ? "FORTRAN 77" : "C"
       libInfo = replace(libInfo, "external \"C\"" => "", "external \"FORTRAN 77\"" => "")
       libInfo = replace(libInfo, "'" => "")
+      local annIdx = findfirst("annotation", str)
+      annIdx === nothing || _registerExternalAnnotation!(libInfo, str[first(annIdx):end])
       push!(functions, EXTERNAL_MODELICA_FUNCTION(n, inputs, outputs, locals, language, libInfo))
     end
   end
   return (functions, externalFunctionsUsed)
+end
+
+#= A function's derivative annotation of order 1, by the function's name: the derivative
+   function's name, the inputs that have no derivative input in it (zeroDerivative,
+   noDerivative) and the function's number of inputs. For the derivative rules of the MTK
+   path (CodeGeneration: generateFunctions). =#
+const FUNCTION_DERIVATIVES = Dict{String, Tuple{String, Vector{Int}, Int}}()
+
+function _registerFunctionDerivative!(n::String, d::OMFrontend.Frontend.NFFunctionDerivative, nInputs::Int)
+  (d.order isa OMFrontend.Frontend.INTEGER_EXPRESSION && d.order.value == 1) || return nothing
+  local fns = OMFrontend.Frontend.getCachedFuncs(d.derivativeFn)
+  isempty(fns) && return nothing
+  FUNCTION_DERIVATIVES[n] = (string(OMFrontend.Frontend.name(first(fns))),
+                             Int[c[1] for c in d.conditions], nInputs)
+  return nothing
+end
+
+#= An external function's annotation (Include, IncludeDirectory, Library) by the name of
+   the function it calls, for the code generation of a C function OMRuntimeExternalC does
+   not have (CodeGeneration: externalC.jl). =#
+const EXTERNAL_C_ANNOTATIONS = Dict{Symbol, String}()
+
+function _registerExternalAnnotation!(libInfo::AbstractString, annotation::AbstractString)
+  #= not parsed (raise = false): an :error or :incomplete expression, refused below =#
+  local call = Meta.parse(libInfo; raise = false)
+  call isa Expr && call.head === :toplevel && length(call.args) == 1 && (call = call.args[1])
+  call isa Expr && call.head === :(=) && (call = call.args[2])
+  (call isa Expr && call.head === :call && call.args[1] isa Symbol) || return nothing
+  EXTERNAL_C_ANNOTATIONS[call.args[1]] = String(annotation)
+  return nothing
 end
 
 """
@@ -593,6 +628,11 @@ function flattenRecordCallSites(simCode)
      folded medium_sat_Tsat away, which the when still read). =#
   @assign simCode.whenEquations = WHEN_EQUATION[WHEN_EQUATION(w.size, _expandRecordArgsInWhen(w.whenEquation), w.source, w.attr)
                                                 for w in simCode.whenEquations]
+  #= And the if-equations' branches: a branch whose parameter condition holds
+     becomes top-level residuals (pruneConstantConditions) that passed the record
+     whole (Buildings' Movers: pressure(per = pCur2, ...) under curve == 2). =#
+  @assign simCode.ifEquations = IF_EQUATION[IF_EQUATION(BRANCH[_expandRecordArgsInBranch(b) for b in ifEq.branches])
+                                            for ifEq in simCode.ifEquations]
   #= And the initial algorithms (the same when's initial part: the early pass
      binds the names its statements read). =#
   @assign simCode.initialAlgorithms = INITIAL_ALGORITHM[
@@ -644,6 +684,17 @@ function flattenRecordCallSites(simCode)
     end
   end
   return simCode
+end
+
+function _expandRecordArgsInBranch(b::BRANCH)::BRANCH
+  local newResiduals = RESIDUAL_EQUATION[]
+  for eq in b.residualEquations
+    local d = toDAEExp(eq.exp)
+    local n = expandRecordArgsInExp(d)
+    push!(newResiduals, n === d ? eq : typeof(eq)(n, eq.source, eq.attr))
+  end
+  return BRANCH(b.identifier == ELSE_BRANCH ? b.condition : _expandRecordArgsInSimExp(b.condition), newResiduals,
+                b.identifier, b.targets, b.isSingular, b.matchOrder, b.equationGraph, b.sccs, b.stringToSimVarHT)
 end
 
 function _expandRecordArgsInSimExp(e::Exp)::Exp
@@ -1413,6 +1464,17 @@ Base.@nospecializeinfer function tryEvalScalar(@nospecialize(exp::DAE.Exp), simC
       end
     end
     DAE.CAST(_, e1) => tryEvalScalar(e1, simCode, seen)
+    #= A Boolean or the branch of an if: a parameter bound to a comparison
+       (Buildings' Movers: haveVMax = abs(per.pressure.dp[nOri]) < eps) or to an
+       if-expression on one (curve = if haveVMax and haveDPMax then 1 else 2) =#
+    DAE.RELATION(__) => _tryEvalCondition(exp, simCode, seen)
+    DAE.LBINARY(__) => _tryEvalCondition(exp, simCode, seen)
+    DAE.LUNARY(__) => _tryEvalCondition(exp, simCode, seen)
+    DAE.IFEXP(c, t, e) => begin
+      local cVal = _tryEvalCondition(c, simCode, seen)
+      cVal === true ? tryEvalScalar(t, simCode, seen) :
+      cVal === false ? tryEvalScalar(e, simCode, seen) : nothing
+    end
     _ => begin
       local numeric = _tryEvalNumeric(exp, simCode, seen)
       numeric === nothing ? nothing : numeric
@@ -1484,6 +1546,14 @@ function _tryEvalNumeric(exp::DAE.Exp, simCode::SIM_CODE, seen::OrderedSet{Strin
       local v1 = _tryEvalNumeric(e1, simCode, seen)
       local v2 = _tryEvalNumeric(e2, simCode, seen)
       (v1 !== nothing && v2 !== nothing && v2 != 0.0) ? v1 / v2 : nothing
+    end
+    #= Buildings' Movers: kRes = dpMax/V_flow_max*delta^2/10, read by the pressure
+       curve's array parameters (computed at the module's top, where a scalar
+       parameter is no name) =#
+    DAE.BINARY(e1, DAE.POW(__), e2) => begin
+      local v1 = _tryEvalNumeric(e1, simCode, seen)
+      local v2 = _tryEvalNumeric(e2, simCode, seen)
+      (v1 !== nothing && v2 !== nothing && (v1 > 0.0 || isinteger(v2) && (v1 != 0.0 || v2 >= 0.0))) ? v1 ^ v2 : nothing
     end
     DAE.CAST(_, e1) => _tryEvalNumeric(e1, simCode, seen)
     _ => nothing

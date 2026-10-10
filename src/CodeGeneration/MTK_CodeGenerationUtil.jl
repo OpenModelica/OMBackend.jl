@@ -355,6 +355,10 @@ end
    elsewhen-arm affects): the state before the current sweep, indexed by
    `lookuptableStates`. =#
 const PRE_SNAPSHOT = :__prevals
+#= The state index a when assignment writes through (`integrator.u[i]`): a
+   reserved name, the body binds the model's variables by their own names (a
+   discrete `idx` indexing a table, BuildingsRepro.ParameterArrayByDiscreteIndex). =#
+const STATE_INDEX = :__stateIdx
 #= The homotopy parameter λ (homotopy(actual, simplified), MLS 3.7.4.4):
    1 in a simulation; the initialization of a model with homotopy() goes from
    0 (the simplified expressions) to 1 (`_homotopyContinuation`), as
@@ -494,6 +498,14 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
     "Integer" => begin
       expToJuliaExpMTK(listHead(expLst), simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derAsSymbol)
     end
+    #= sample(start, interval) read in a when body (lowered with PRE_FROM_SNAPSHOT):
+       whether the instant is a tick, as the occupant lighting's `if sampleTrigger`
+       at `when {occ, sampleTrigger}` asks. Elsewhere false (modelica_sample), the
+       time between the ticks. =#
+    "sample" where PRE_FROM_SNAPSHOT[] => begin
+      local (start, interval) = map(x -> expToJuliaExpMTK(x, simCode), collect(expLst))
+      :(OMBackend.CodeGeneration._isSampleInstant(integrator.t, $(start), $(interval)))
+    end
     #= A String parameter's binding (createStringParameterAssignments): the
        argument types from the expressions, not from the values. =#
     "String" => AlgorithmicCodeGeneration.modelicaStringCall(collect(expLst), x -> expToJuliaExpMTK(x, simCode))
@@ -584,6 +596,86 @@ function expToJuliaExpMTK(exp::SimulationCode.ENUM_LITERAL, simCode::SimulationC
   return quote $(exp.index) end
 end
 
+#= A subscript as the flattened names write it (`2`, `idx`). =#
+_subscriptText(@nospecialize(s))::String =
+  s isa DAE.ICONST ? string(s.integer) : s isa DAE.INDEX ? _subscriptText(s.exp) : string(s)
+
+#= `base[idx][2]`, a flattened name whose subscript is a variable (the array crefs the backend
+   flattened: CDL's Integer TimeTable `y[:] = val[idx, :]`, idx a discrete; its elements kept,
+   _referenceDynamicallyIndexed!): the lookup of the table of base's elements, all known at the
+   build (the dimensions from the names in the table), indexed at run time; nothing otherwise. =#
+function _dynamicSubscriptLookup(name::String, simCode::SimulationCode.SIM_CODE)::Union{Expr, Nothing}
+  #= a record array's field after the subscripts (`uacp[stage]_UAcp`, Buildings' DX coils):
+     literal subscripts only there =#
+  local m = match(r"^([^\[\]]+)((?:\[[^\[\]]+\])+)((?:[^\[\]]|\[[0-9]+\])*)$", name)
+  m === nothing && return nothing
+  local base = String(m.captures[1])
+  local suffix = String(m.captures[3])
+  local subs = String[String(x.captures[1]) for x in eachmatch(r"\[([^\[\]]+)\]", m.captures[2])]
+  all(s -> tryparse(Int, s) !== nothing, subs) && return nothing
+  local ht = simCode.stringToSimVarHT
+  local index = Any[]
+  for s in subs
+    local i = tryparse(Int, s)
+    if i !== nothing
+      push!(index, i)
+    else
+      local entry = get(ht, s, nothing)
+      entry === nothing && return nothing
+      push!(index, Symbol(last(entry).name))
+    end
+  end
+  #= the extent of each dimension: the elements along it from 1 =#
+  local key = (d, k) -> base * join("[" * string(j == d ? k : 1) * "]" for j in eachindex(subs)) * suffix
+  local dims = Int[]
+  for d in eachindex(subs)
+    local n = 0
+    while haskey(ht, key(d, n + 1))
+      n += 1
+    end
+    n == 0 && return nothing
+    push!(dims, n)
+  end
+  local table = _buildTimeTable(base, suffix, dims, simCode)
+  table === nothing || return :(OMBackend.CodeGeneration.constTableLookup($(table), $(index...)))
+  #= Elements not known at the build (`fixed = false` parameters the initialization computes,
+     variables: Buildings' DX coils' `uacp[stage].UAcp`), one subscript a variable: the element
+     the index selects, among their variables =#
+  local dynamic = findall(s -> tryparse(Int, s) === nothing, subs)
+  length(dynamic) == 1 || return nothing
+  local d = only(dynamic)
+  local symbols = Symbol[]
+  for k in 1:dims[d]
+    local entry = get(ht, base * join("[" * (j == d ? string(k) : subs[j]) * "]" for j in eachindex(subs)) * suffix, nothing)
+    entry === nothing && return nothing
+    push!(symbols, Symbol(last(entry).name))
+  end
+  local chain = symbols[end]
+  for k in (length(symbols) - 1):-1:1
+    chain = :(ifelse($(index[d]) == $(k), $(symbols[k]), $(chain)))
+  end
+  return quote $(chain) end
+end
+
+#= The values of the elements `base[i][j]...suffix`, all known at the build, or nothing. =#
+function _buildTimeTable(base::String, suffix::String, dims::Vector{Int}, simCode::SimulationCode.SIM_CODE)::Union{Array{Float64}, Nothing}
+  local ht = simCode.stringToSimVarHT
+  local table = Array{Float64}(undef, dims...)
+  for I in CartesianIndices(table)
+    local entry = get(ht, base * join("[" * string(i) * "]" for i in Tuple(I)) * suffix, nothing)
+    entry === nothing && return nothing
+    local kind = last(entry).varKind
+    (kind isa SimulationCode.PARAMETER && kind.bindExp isa SOME) || return nothing
+    local b = kind.bindExp.data
+    local v = SimulationCode.tryEvalNumeric(SimulationCode.toDAEExp(b), simCode)
+    #= `integer(table[...][i, j])`: evaluated as the initial values are =#
+    v === nothing && (v = _t0Number(() -> evalDAEConstant(b, simCode)))
+    v === nothing && return nothing
+    table[I] = v
+  end
+  return table
+end
+
 function expToJuliaExpMTK(exp::SimulationCode.EXP_CREF, simCode::SimulationCode.SIM_CODE;
                           varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
   #= SimCref is flat post-Causalize.flattenArrayCrefs, so the CREF_QUAL hierarchy
@@ -613,6 +705,8 @@ function expToJuliaExpMTK(exp::SimulationCode.EXP_CREF, simCode::SimulationCode.
     @warn "expToJuliaExpMTK[SIM]: resolved alias-eliminated cref via fallback" lookUpStr
     return aliasExpr
   end
+  local dynamic = _dynamicSubscriptLookup(lookUpStr, simCode)
+  dynamic !== nothing && return dynamic
   return quote $(Symbol(string(varPrefix, lookUpStr, varSuffix))) end
 end
 
@@ -925,8 +1019,15 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                 _ => OMBackend.unsupported("subscript", sub)
               end
             end
-            local baseSymbol = Symbol(varPrefix, varName, varSuffix)
-            Expr(:ref, baseSymbol, subExprs...)
+            #= a parameter array known at the build: its table (_dynamicSubscriptLookup) =#
+            local flatName = varName * join("[" * (s isa DAE.INDEX ? _subscriptText(s) : "?") * "]" for s in subscriptLst)
+            local dynamic = _dynamicSubscriptLookup(flatName, simCode)
+            if dynamic !== nothing
+              dynamic
+            else
+              local baseSymbol = Symbol(varPrefix, varName, varSuffix)
+              Expr(:ref, baseSymbol, subExprs...)
+            end
           end
         end
       end
@@ -1048,8 +1149,10 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
               @warn "expToJuliaExpMTK: resolved alias-eliminated bare CREF via fallback" varName
               aliasEx
             else
-              #= Variable not in hash table, using direct reference =#
-              quote $(Symbol(string(varPrefix, varName, varSuffix))) end
+              #= Variable not in hash table, using direct reference; a flattened name
+                 with a variable subscript, a lookup of its known table =#
+              local dynamic = _dynamicSubscriptLookup(varName, simCode)
+              dynamic !== nothing ? dynamic : quote $(Symbol(string(varPrefix, varName, varSuffix))) end
             end
           end
         else
@@ -1203,6 +1306,14 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           $(generateCastExpressionMTK(ty, exp, simCode, varPrefix))
         end
       end
+      #= a function argument with bound arguments: a closure calling the function's wrapper
+         (symbolic arguments make a term, numeric ones a value) =#
+      DAE.PARTEVALFUNCTION(path, expList, ty, origType) => begin
+        local callee = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(Symbol(OMBackend.canonicalName(string(path)))))
+        AlgorithmicCodeGeneration._partialApplicationExpr(callee,
+          Any[expToJuliaExpMTK(e, simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol) for e in expList],
+          ty, origType)
+      end
       #= For enumeration we just take the value of the index. =#
       DAE.ENUM_LITERAL(path, index) => begin
         quote
@@ -1234,11 +1345,18 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           end
         end
         local allConstSubs = all(s -> s isa Integer, subExprs)
+        #= A parameter array known at the build by a variable subscript (CDL's Integer
+           TimeTable: val[idx, j] in a when): its table (_dynamicSubscriptLookup). =#
+        local _dynTable = (!allConstSubs && innerExp isa DAE.CREF) ?
+          _dynamicSubscriptLookup(SimulationCode.DAE_identifierToString(innerExp.componentRef) *
+                                  join("[" * _subscriptText(s) * "]" for s in subscripts), simCode) : nothing
         #= When the inner expression is a bare CREF (no subscripts on the CREF itself)
            and all ASUB subscripts are constant, try scalarized variable lookup.
            This handles record field array equations like frame_b.R.T[1,1] = frame_a.R.T[1,1]
            where the frontend flattened to ASUB(CREF("R_T"), [1,1]) instead of CREF("R_T", subs=[1,1]). =#
-        if allConstSubs
+        if _dynTable !== nothing
+          _dynTable
+        elseif allConstSubs
           #= First, detect nested ASUB(ASUB(CALL(qualified_path, args), [tupleIx]), [subExprs...])
              where the inner ASUB extracts a tuple element that is an array.
              This covers BOTH 1D access [i] and multi-D access [i, j, ...].
@@ -1706,7 +1824,10 @@ function handleArrayExp(exp::DAE.ARRAY, simCode)
   if canEval
     #= All elements are constants, return pre-computed array =#
     if dimSize >= 2
-      arr = Matrix(transpose(stack(arrJL)))
+      #= rows of rows: stacked along the first dimension (a three-dimensional literal's
+         rows are matrices, and transpose has no method for the stack: Buildings'
+         Borefields TemporalSuperposition) =#
+      arr = ndims(first(arrJL)) >= 2 ? stack(arrJL; dims = 1) : Matrix(transpose(stack(arrJL)))
       quote
         $(arr)
       end
@@ -1748,7 +1869,9 @@ function handleArrayExp(exp::DAE.ARRAY, simCode)
       else
         #= Fallback: rows are not plain arrays =#
         quote
-          Matrix(transpose(stack([$(elemExprs...)])))
+          let rows = [$(elemExprs...)]
+            ndims(first(rows)) >= 2 ? stack(rows; dims = 1) : Matrix(transpose(stack(rows)))
+          end
         end
       end
     else
@@ -2616,6 +2739,10 @@ end
 # parameters, data structures), so callers need not special-case the latter.
 getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode) = getIdxForLookupMTK(string(x), simCode)
 
+#= In a callback's condition or affect: a state from `x`, a parameter from the integrator's
+   parameters. A `p` in scope was the callback set's, the event parameters as symbols (the
+   condition a Num: Buildings' weather data readers, `canRepeatWeatherFile - (modTimAux >
+   tNext)`), where the condition did not bind its own. =#
 function getIdxForLookupMTK(crefAsStr::String, simCode)
   if crefAsStr == "time"
     return :t
@@ -2624,7 +2751,7 @@ function getIdxForLookupMTK(crefAsStr::String, simCode)
   if !(SimulationCode.isParameter(simVar))
     Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(crefAsStr)))))
   else
-    Expr(:call, getindex, :p, Expr(:call, :getindex, :lookuptableParams, :(Symbol($(crefAsStr)))))
+    Expr(:call, getindex, :(integrator.p), Expr(:call, :getindex, :lookuptableParams, :(Symbol($(crefAsStr)))))
   end
 end
 
@@ -2632,6 +2759,37 @@ end
 #= Helpers that depend on the MTK lowering (expToJuliaExpMTK / ModelingToolkit.ifelse / Symbolics) =#
 
 _isSimCodeFunctionPath(path::Absyn.Path, simCode)::Bool = _isSimCodeFunctionName(string(path), simCode)
+
+#= An element of a named array of records by subscripts that are not literals (`data[i]` in a
+   reduction: the ideal gases' `h_T(data[i], T, ...)`, MSL Media mixtures): that element of
+   each field array, `data_MM[i]` (the module-level arrays of _recordArrayFieldArrays). With
+   the subscript dropped (before toSimExp kept it), the whole field arrays were passed. Empty
+   otherwise. =#
+function _recordArrayElementCallArgs(arg::DAE.Exp, simCode::SimulationCode.SIM_CODE;
+                                     varPrefix::String = "", varSuffix::String = "", derSymbol::Bool = false)::Vector{Any}
+  (arg isa DAE.ASUB && arg.exp isa DAE.CREF) || return Any[]
+  local elemTy = arg.exp.ty
+  local nDims = 0
+  while elemTy isa DAE.T_ARRAY
+    nDims += length(collect(elemTy.dims))
+    elemTy = elemTy.ty
+  end
+  (elemTy isa DAE.T_COMPLEX && elemTy.complexClassType isa DAE.ClassInf.RECORD) || return Any[]
+  local subs = collect(arg.sub)
+  #= the base's type is the array's, or the element's (toSimExp of a subscripted cref types
+     the base by its identifier's type) =#
+  (nDims == 0 || length(subs) == nDims) || return Any[]
+  local base = SimulationCode.string(arg.exp.componentRef)
+  occursin('[', base) && return Any[]
+  #= an ASUB's subscripts: expressions, or INDEX subscripts (a slice is not an element) =#
+  local idx = Any[]
+  for sub in subs
+    local e = sub isa DAE.INDEX ? sub.exp : sub
+    (e isa DAE.Exp && !(e isa DAE.RANGE || e isa DAE.ARRAY)) || return Any[]
+    push!(idx, expToJuliaExpMTK(e, simCode; varPrefix, varSuffix, derSymbol))
+  end
+  return Any[Expr(:ref, Symbol(base * COMPONENT_SEPARATOR * f.name), idx...) for f in elemTy.varLst]
+end
 
 function _modelicaFunctionCallArgs(expLst,
                                    simCode,
@@ -2646,6 +2804,11 @@ function _modelicaFunctionCallArgs(expLst,
                                                                varSuffix = varSuffix)
     if !isempty(flattenedArgs)
       append!(args, flattenedArgs)
+      continue
+    end
+    local elementFields = _recordArrayElementCallArgs(arg, simCode; varPrefix, varSuffix, derSymbol)
+    if !isempty(elementFields)
+      append!(args, elementFields)
       continue
     end
 
@@ -2718,6 +2881,32 @@ end
 #= `e` with `time` read as 0.0, the start time of the build. =#
 _timeAtBuildStart(@nospecialize(e)) = first(Util.traverseExpBottomUp(e, (x, acc) ->
   (x isa DAE.CREF && x.componentRef isa DAE.CREF_IDENT && x.componentRef.ident == "time" ? DAE.RCONST(0.0) : x, acc), nothing))
+
+#= `(p1, p2, ...) = f(...)`, every free parameter of the equation alone on the left and none in
+   the call (Buildings' borehole resistances: `(x, Rgb, Rgg, RCondGro) = internalResistancesOneUTube(...)`,
+   in HexInternalElement with states, in its validations without): each p_k bound to the call's
+   k-th output, its value at the build where the call interprets with the parameters' values,
+   else the output's expression (its symbolic term did not fold with a String argument, the
+   instance name). Not an impure f (one call for each output). =#
+function _bindTupleOfFreeParameters!(lhs::DAE.Exp, rhs::DAE.Exp, freeParams::Vector{String},
+                                     simCode::SimulationCode.SimCode)::Bool
+  (lhs isa DAE.TUPLE && rhs isa DAE.CALL && !rhs.attr.isImpure && rhs.attr.ty isa DAE.T_TUPLE) || return false
+  local targets = collect(lhs.PR)
+  local names = String[string(e) for e in targets if e isa DAE.CREF]
+  (length(names) == length(targets) && issetequal(names, freeParams)) || return false
+  any(c -> string(c) in names, Util.getAllCrefs(rhs)) && return false
+  local types = collect(rhs.attr.ty.types)
+  length(types) >= length(targets) || return false
+  local ht = simCode.stringToSimVarHT
+  for (k, name) in enumerate(names)
+    local (idx, sv) = ht[name]
+    local element = DAE.TSUB(rhs, k, types[k])
+    local value = types[k] isa DAE.T_REAL ? SimulationCode.valueAtBuildStart(element, simCode) : nothing
+    local binding = SimulationCode.toSimExp(value === nothing ? element : DAE.RCONST(value))
+    ht[name] = (idx, SimulationCode.SIMVAR(sv.name, sv.index, SimulationCode.PARAMETER(SOME(binding)), sv.attributes))
+  end
+  return true
+end
 
 """
     solveParametricInitialEquations!(simCode)
@@ -2799,6 +2988,11 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     Util.traverseExpBottomUp(ieqLhs, findFree, 0)
     Util.traverseExpBottomUp(ieqRhs, findFree, 0)
     unique!(freeParams)
+    if _bindTupleOfFreeParameters!(ieqLhs, ieqRhs, freeParams, simCode)
+      append!(solvedNames, freeParams)
+      solvedThisPass = true
+      continue
+    end
     if length(freeParams) != 1
       continue
     end
@@ -2851,14 +3045,20 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     if !lhsEvalOk[]
       continue
     end
-    local lhsJl = expToJuliaExpMTK(lhsSubst, simCode)
-    local lhsVal = try
-      local raw = eval(lhsJl)
-      raw isa Symbolics.Num ? Float64(Symbolics.unwrap(raw)) : Float64(raw)
-    catch err
-      OMBackend._fallback(err, :parametricInitLhs; expect = Union{UndefVarError, MethodError}, impact = :result)
-      @warn "[SIMCODE: solveParametricInitialEquations] could not evaluate LHS" freeName err
-      continue
+    #= Interpreted first: it calls the model's functions, which the generated code does not
+       have yet (CDL's TimeTable: t0 = round(integer(time/timeRange)*timeRange, 6), read by
+       its table's startTime at module level). =#
+    local lhsVal = SimulationCode.valueAtBuildStart(lhsSubst, simCode)
+    if lhsVal === nothing
+      local lhsJl = expToJuliaExpMTK(lhsSubst, simCode)
+      lhsVal = try
+        local raw = eval(lhsJl)
+        raw isa Symbolics.Num ? Float64(Symbolics.unwrap(raw)) : Float64(raw)
+      catch err
+        OMBackend._fallback(err, :parametricInitLhs; expect = Union{UndefVarError, MethodError}, impact = :result)
+        @warn "[SIMCODE: solveParametricInitialEquations] could not evaluate LHS" freeName err
+        continue
+      end
     end
     #= Common case: a free parameter aliases a bound parameter/literal directly,
        e.g. `globalSeed_seed = globalSeed_fixedSeed`. Avoid Newton here; it

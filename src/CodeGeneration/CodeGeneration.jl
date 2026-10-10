@@ -46,6 +46,7 @@ using DocStringExtensions
 using ModelingToolkit
 using LinearAlgebra
 import DiffEqBase
+import DiffEqCallbacks
 import OrdinaryDiffEq
 import ADTypes
 import NonlinearSolve
@@ -104,5 +105,8 @@ include("./codeGen.jl")
 
 #= Direct DifferentialEquations.jl code generation (DEMode, fresh emitter) =#
 include("./DECodeGeneration.jl")
+
+#= Array-preserving explicit-ODE code generation (no-scalarize flat models, experimental) =#
+include("./ArrayODEGeneration.jl")
 
 end #= End CodeGeneration=#

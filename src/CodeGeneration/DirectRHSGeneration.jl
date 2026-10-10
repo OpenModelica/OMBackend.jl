@@ -263,6 +263,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                 hardInitialValues=hardInitialValues,
                                 observedEquations=observedEquations)
   local p_vec = _buildParamVector(params, pars; resolvedParams=resolvedParams)
+  _evaluateDiscreteInitialRows!(u0, reducedSystem, states, params, p_vec, Float64(tspan[1]), valuesMayDiffer)
   #= A run with other tunable parameter values (DAE_REINIT, below). =#
   local (resolvedAt, entryAt, followTunable!) =
     _runEntry(reducedSystem; states, params, pars, finalInitialValues, systemGuesses, resolvedParams,
@@ -277,9 +278,15 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   #= Symbolic sparse Jacobian; nothing when not differentiable. Built after
      u0/p_vec so the generated function can be probed once: an unresolved
      symbolic derivative surfaces only when the function runs, not at build. =#
-  local (jacFunc, jacProto) = _buildSparseJacobian(rhs_list, states, params, iv,
-                                                   u0, p_vec, tspan[1])
-  local tgradFunc = _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, tspan[1])
+  #= With the numeric partials: a call without a derivative annotation is differentiated in
+     its own arguments. Without them the solver finite-differenced the states, by their
+     magnitude, past a flow function's regularization (Buildings' Airflow.Multizone
+     powerLaw05 around dp = 0 at pressures of 1e5 Pa: 47,225 steps for 36). =#
+  local (symJac, jacProto) = withNumericPartials(() -> _buildSparseJacobian(rhs_list, states, params, iv,
+                                                                            u0, p_vec, tspan[1]))
+  local jacFunc = symJac === nothing ? nothing : _finiteJacobian(symJac, rhsFunc)
+  local tgradFunc = withNumericPartials(() -> _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc,
+                                                                   u0, p_vec, tspan[1]))
 
   # 4. Extract event callbacks from the reduced system and merge with custom callbacks.
   #    Our structural_simplify wrapper uses split=false, so the compiled event
@@ -318,6 +325,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     problem = ModelingToolkit.ODEProblem{true}(f, u0, tspan, p_vec; callback=allCallbacks)
   else
     @debug "DirectRHS: DAE with mass matrix"
+    #= The initialization at the start time (it evaluated at 0 for any start time:
+       Buildings' DerivativeCheck examples from -1 initialized to the values at 0). =#
+    local t0 = Float64(tspan[1])
     local mm = massMatrix isa LinearAlgebra.UniformScaling ?
       Matrix{Float64}(LinearAlgebra.I, nStates, nStates) : collect(massMatrix)
     #= A sparse Jacobian prototype needs a sparse mass matrix, otherwise the
@@ -368,7 +378,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        other tunable parameter values evaluates them at those). =#
     local symRowsAt = symInit === nothing ? nothing : let (gF, dIdxs, mmS) = symInit
       pv -> (du, u) -> begin
-        local g = gF(u, pv, 0.0)
+        local g = gF(u, pv, t0)
         Float64[dIdxs[i] == 0 ? Float64(g[i]) : du[dIdxs[i]] - mmS[i] * Float64(g[i])
                 for i in 1:length(dIdxs)]
       end
@@ -410,13 +420,13 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
         local nz = obsDer === nothing ? Float64[] : zeros(length(obsDer[2]))
         (du, u) -> begin
           local zdot = needAlg ?
-            _algebraicDerivatives!(J, rhsFunc, jacFunc, ftAlg, mm, algIdx, difIdx, u, du, pv, 0.0) : Float64[]
+            _algebraicDerivatives!(J, rhsFunc, jacFunc, ftAlg, mm, algIdx, difIdx, u, du, pv, t0) : Float64[]
           local rows = zdot[tPos] .- tVal
           obsDer === nothing && return rows
           local (nzF, I, Jc, n, tgts) = obsDer
           local udot = Float64[du[i] / (mm[i, i] == 0 ? 1.0 : mm[i, i]) for i in 1:n]
           needAlg && (udot[algIdx] = zdot)
-          nzF(nz, u, pv, 0.0)
+          nzF(nz, u, pv, t0)
           local obsRows = -copy(tgts)
           for k in eachindex(I)
             obsRows[I[k]] += nz[k] * (Jc[k] <= n ? udot[Jc[k]] : 1.0)
@@ -445,7 +455,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     end
     local probeRows = rowsAt -> try
       local duProbe = similar(u0)
-      initRhs(duProbe, u0, p_vec, 0.0)
+      initRhs(duProbe, u0, p_vec, t0)
       all(isfinite, rowsAt(p_vec)(duProbe, u0))
     catch _e
       OMBackend._fallback(_e, :buildDirectRHSProblem_6, impact = :result)
@@ -474,10 +484,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
        kinematics puts x below it; the solve held the other branch's quartic far
        outside its range). Non-finite values keep the compiled literal. =#
     local initRels = _initialRelationLiterals(reducedSystem, params, initRelations)
-    initRels === nothing || initRels.eval!(p_vec, u0, 0.0; finiteOnly = true)
+    initRels === nothing || initRels.eval!(p_vec, u0, t0; finiteOnly = true)
     local uEntry = copy(u0)
     local firstErr = nothing
-    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
+    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0,
                                                               pinned=pinnedIdx,
                                                               derivative_targets=derivativeInitTargets,
                                                               eqLabels=eqLabels,
@@ -485,7 +495,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                                               discrete_pinned=discretePinnedIdx)
     #= A model with homotopy(): from its simplified expressions to the actual ones. =#
     local refreshRelations! = initRels === nothing ? nothing :
-      (uh, pvh) -> initRels.eval!(pvh, uh, 0.0; finiteOnly = true)
+      (uh, pvh) -> initRels.eval!(pvh, uh, t0; finiteOnly = true)
     local solveInit = homotopyIdx === nothing ? solveFree :
       (u, pv) -> _homotopyContinuation(solveFree, u, pv, homotopyIdx; refresh! = refreshRelations!)
     u0 = try
@@ -495,7 +505,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       #= The relations at the failed solve's last point: where one differs, the
          initialization is solved again from the entry with it (the event
          iteration of the initialization, before a solution exists). =#
-      local retried = initRels !== nothing && initRels.eval!(p_vec, u0, 0.0; finiteOnly = true) ?
+      local retried = initRels !== nothing && initRels.eval!(p_vec, u0, t0; finiteOnly = true) ?
         try
           solveInit(copy(uEntry), p_vec)
         catch e2
@@ -511,8 +521,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
         copy(uEntry)
       end
     end
-    #= At the solved state, at the solve's time (_solveDAEInitialization! evaluates at 0.0). =#
-    assignParams! === nothing || assignParams!(p_vec, u0, 0.0)
+    #= At the solved state, at the solve's time (the start time). =#
+    assignParams! === nothing || assignParams!(p_vec, u0, t0)
     #= The relations' literals at the solved state; solved again until they settle. =#
     local useExtra = extraResiduals !== nothing
     #= The derivative targets of the solve in progress: a run with other
@@ -521,7 +531,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local targetsNow = Ref(derivativeInitTargets)
     local resolveWith = (u, pv, ok) -> begin
       local kept = u[keptIdx]
-      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!;
+      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0,
                                               pinned=pinnedIdx,
                                               derivative_targets=targetsNow[],
                                               eqLabels=eqLabels,
@@ -530,7 +540,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
                                               converged=ok)
       #= A solve that relaxed the fixed starts is not a settled initialization. =#
       isapprox(un[keptIdx], kept; rtol = 1e-8, atol = 1e-10) || (ok[] = false)
-      assignParams! === nothing || assignParams!(pv, un, 0.0)
+      assignParams! === nothing || assignParams!(pv, un, t0)
       un
     end
     #= The differential states other than the clusters' members. =#
@@ -542,11 +552,11 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local startSolve = homotopyIdx === nothing ? resolveWith :
       (u, pv, ok) -> _homotopyContinuation((a, b) -> resolveWith(a, b, Ref(true)), u, pv, homotopyIdx;
                                            refresh! = refreshRelations!, finalSolve = (a, b) -> resolveWith(a, b, ok))
-    local (uSettled, settled) = _settleInitialDiscretes!(resolveWith, u0, uEntry, p_vec, initDiscretes, diffKept;
+    local (uSettled, settled) = _settleInitialDiscretes!(resolveWith, u0, uEntry, p_vec, initDiscretes, diffKept; t0 = t0,
                                                          startSolve = startSolve)
     firstErr === nothing || settled || throw(firstErr)
     u0 = uSettled
-    u0 = _settleInitialRelations!(resolveWith, u0, p_vec, initRels)
+    u0 = _settleInitialRelations!(resolveWith, u0, p_vec, initRels; t0 = t0)
     #= A user's fixed value (a fixed start, a literal initial equation) the
        initialization moved: its phase that frees every variable found a root
        only without it (`x(start = 1, fixed = true)` with an initial equation
@@ -613,7 +623,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       end
       targetsNow[] = targets
       try
-        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!;
+        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; t0 = t0,
                                          pinned=pinnedIdx,
                                          derivative_targets=targets,
                                          eqLabels=eqLabels,
@@ -625,9 +635,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
            the compiled run's root (x = 1.879 for s = -2, OpenModelica -1.532). =#
         u = homotopyIdx === nothing ? solveRun(u, pv) :
           _homotopyContinuation(solveRun, copy(entry), pv, homotopyIdx; refresh! = refreshRelations!)
-        assignParams! === nothing || assignParams!(pv, u, 0.0)
-        u = first(_settleInitialDiscretes!(resolveWith, u, u, pv, initDiscretes, diffKept; startPath = false))
-        u = _settleInitialRelations!(resolveWith, u, pv, initRels)
+        assignParams! === nothing || assignParams!(pv, u, t0)
+        u = first(_settleInitialDiscretes!(resolveWith, u, u, pv, initDiscretes, diffKept; startPath = false, t0 = t0))
+        u = _settleInitialRelations!(resolveWith, u, pv, initRels; t0 = t0)
       finally
         targetsNow[] = derivativeInitTargets
       end
@@ -668,6 +678,50 @@ function _homotopyContinuation(solve, u, pv, k::Int; refresh! = nothing, finalSo
     pv[k] = 1.0
   end
   return finalSolve(uh, pv)
+end
+
+#= Initialization equations of discretes that read the signals (an observed variable, another
+   state): the init solve leaves the discretes out, and only the rows with a literal or a
+   parameter value were pinned (_collectHardInitializationValues); the others were dropped.
+   Buildings' PartialConvertTime, `k = integer(modTimAux/lenWea) + 1; tNext = k*lenWea`:
+   tNext stayed 0, the weather file's time a year ahead. Evaluated on the entry state at t0,
+   again until none changes (tNext reads k). =#
+function _evaluateDiscreteInitialRows!(u0::Vector{Float64}, reducedSystem, states, params, p_vec::Vector{Float64},
+                                       t0::Float64, discreteNames::AbstractSet{String})::Vector{Float64}
+  local stateIdx = Dict{String, Int}(string(st) => i for (i, st) in enumerate(states))
+  local idxs = Int[]
+  local exprs = Any[]
+  for eq in ModelingToolkit.initialization_equations(reducedSystem)
+    local key = string(eq.lhs)
+    startswith(key, "Differential(") && continue
+    local i = get(stateIdx, key, nothing)
+    (i !== nothing && _plainVariableName(key) in discreteNames) || continue
+    _literalNumericValue(eq.rhs) === nothing || continue
+    push!(idxs, i)
+    push!(exprs, eq.rhs)
+  end
+  isempty(exprs) && return u0
+  local iv = ModelingToolkit.get_iv(reducedSystem)
+  local keep = _inlineObservedRows!(exprs, reducedSystem, states, params, iv)
+  isempty(keep) && return u0
+  local rows = try
+    _exprToRTGFunction(Symbolics.build_function(exprs[keep], states, params, iv; expression = Val{true})[1])
+  catch e
+    OMBackend._fallback(e, :discreteInitialRows; impact = :result)
+    return u0
+  end
+  for _ in 1:(length(keep) + 1)
+    local values = Base.invokelatest(rows, u0, p_vec, t0)
+    local changed = false
+    for (j, r) in enumerate(keep)
+      local v = Float64(values[j])
+      (isfinite(v) && u0[idxs[r]] != v) || continue
+      u0[idxs[r]] = v
+      changed = true
+    end
+    changed || break
+  end
+  return u0
 end
 
 #= Returns `(values, constraintKeys)`. `values` seeds u0; `constraintKeys`
@@ -1327,13 +1381,13 @@ end
    pre() the start values, else the values in u; initial() true), gives
    another value than u holds: index => value. Local buffers: a
    re-initialization may run while another one does. =#
-function _initialDiscreteChanges(dc, u, pv)
-  local point = (u = u, p = pv, t = 0.0)
+function _initialDiscreteChanges(dc, u, pv, t0::Float64 = 0.0)
+  local point = (u = u, p = pv, t = t0)
   local changes = Pair{Int, Float64}[]
   for (c, preStart) in zip(dc.clusters, dc.preStarts)
-    local v = Base.invokelatest(c.values, u, pv, 0.0)
+    local v = Base.invokelatest(c.values, u, pv, t0)
     local zs = similar(c.zs)
-    Base.invokelatest(c.crossings!, zs, u, pv, 0.0)
+    Base.invokelatest(c.crossings!, zs, u, pv, t0)
     local rel = Bool[_literal(zs, k, c.strict[k]) for k in eachindex(c.rel)]
     local pre = [something(s, x) for (s, x) in zip(preStart, _preValues(c, v))]
     local vals = Base.invokelatest(c.body, point, _operands(c, v), pre, rel, copy(rel), true)
@@ -1367,7 +1421,7 @@ end
    iteration at the start settles the members as before.
    Returns `(u, settled)`. =#
 function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int};
-                                  startPath::Bool = true, maxPasses::Int = 10, startSolve = resolve)
+                                  startPath::Bool = true, maxPasses::Int = 10, startSolve = resolve, t0::Float64 = 0.0)
   dc === nothing && return (u0, false)
   local trace = OMBackend.envSwitch("OMBACKEND_INIT_TRACE")
   local pvFirst = copy(pv)
@@ -1375,7 +1429,7 @@ function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int}
   local keptAt = (u, ref) -> isapprox(u[kept], ref[kept]; rtol = 1e-6, atol = 1e-9)
   #= From a solution `u` of the solve that started at `ref`. =#
   local iterate = function (u, ref)
-    local changes = _initialDiscreteChanges(dc, u, pv)
+    local changes = _initialDiscreteChanges(dc, u, pv, t0)
     local seen = Set{Vector{Float64}}()
     for _ in 1:maxPasses
       trace && println("[initdiscretes] members to change: ", changes)
@@ -1390,7 +1444,7 @@ function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int}
       local un = resolve(copy(u), pv, ok)
       (ok[] && keptAt(un, ref)) || return nothing
       u = un
-      changes = _initialDiscreteChanges(dc, u, pv)
+      changes = _initialDiscreteChanges(dc, u, pv, t0)
     end
     return nothing
   end
@@ -1432,7 +1486,7 @@ end
    not converge keeps the first solution and the entry parameters (MSL
    EngineV6_analytic: the gas force's `v_rel < 0` was false at the entry,
    the steady-state filter settled on the wrong torque). =#
-function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5)
+function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5, t0::Float64 = 0.0)
   rels === nothing && return u0
   local pvFirst = copy(pv)
   local uFirst = copy(u0)
@@ -1441,7 +1495,7 @@ function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5)
   local err = nothing
   for pass in 1:(maxPasses + 1)
     try
-      rels.eval!(pv, u, 0.0) || return u
+      rels.eval!(pv, u, t0) || return u
       pass > maxPasses && break
       local key = pv[rels.idxs]
       key in seen && break
@@ -1585,6 +1639,44 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
     OMBackend._fallback(e, :_buildSparseJacobian)
     @debug "DirectRHS: symbolic Jacobian generation failed; solver will finite-difference" exception=(e, catch_backtrace())
     return (nothing, nothing)
+  end
+end
+
+#= The symbolic Jacobian, and where an entry is not finite at a point (its formula overflows:
+   d/dv 2/(1 + exp(-k*v)) is Inf/Inf at k*v = -702, MSL AIMC_Conveyor's smooth sign; Buildings'
+   Carnot COP at the start) that entry by differences of the right-hand side: the step was NaN,
+   the solver Unstable. Central differences, one-sided where a side leaves the right-hand
+   side's domain (|dT|^n at dT = 0: Buildings' borehole HexInternalElement), the symbolic entry
+   where neither is finite. With the numeric partials the symbolic Jacobian is built for more
+   models; before, a call without a derivative rule sent the whole Jacobian to the solver's
+   finite differences, which hid it. =#
+function _finiteJacobian(symJac::Function, rhsFunc::Function)::Function
+  return (J, u, p, t) -> begin
+    symJac(J, u, p, t)
+    local nz = Symbolics.SparseArrays.nonzeros(J)
+    all(isfinite, nz) && return nothing
+    local rows = Symbolics.SparseArrays.rowvals(J)
+    local up = similar(u); local duPlus = similar(u); local duMinus = similar(u)
+    local du0 = nothing
+    for j in axes(J, 2)
+      local r = Symbolics.SparseArrays.nzrange(J, j)
+      any(k -> !isfinite(nz[k]), r) || continue
+      local h = cbrt(eps(Float64)) * max(1.0, abs(u[j]))
+      copyto!(up, u); up[j] += h; rhsFunc(duPlus, up, p, t)
+      copyto!(up, u); up[j] -= h; rhsFunc(duMinus, up, p, t)
+      for k in r
+        isfinite(nz[k]) && continue
+        local i = rows[k]
+        local d = (duPlus[i] - duMinus[i]) / (2h)
+        if !isfinite(d)
+          du0 === nothing && (du0 = similar(u); rhsFunc(du0, u, p, t))
+          d = (duPlus[i] - du0[i]) / h
+          isfinite(d) || (d = (du0[i] - duMinus[i]) / h)
+        end
+        isfinite(d) && (nz[k] = d)
+      end
+    end
+    return nothing
   end
 end
 
@@ -1948,51 +2040,43 @@ so callers must treat `nothing` here as "not resolvable through this
 path" and fall back to the next strategy.
 """
 function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
-  if expr isa Number
-    return Float64(expr)
-  end
-  if expr isa Symbolics.Num
-    expr = Symbolics.unwrap(expr)
-  end
-  if !(expr isa SymbolicUtils.BasicSymbolic)
-    return nothing
-  end
-  #= Symbolic numeric Const (e.g. literal 500.0 or pre-folded 0.0015) appears
-     as a non-call, non-sym BasicSymbolic with a `Float64`/`Int` `symtype`. Pull
-     the value out via Symbolics.value before falling through to the name-based
-     leaf lookup, otherwise we treat literals as unknown free vars. =#
+  local v = _symbolicCallValue(expr, nameToNumeric)
+  #= A Boolean parameter's value as 0/1 (`canRepeatWeatherFile = abs(mod(lenWea, 3.1536e7)) <
+     0.01`, Buildings' ISO13790 zones). =#
+  return v isa Real ? Float64(v) : nothing
+end
+
+#= A value of _evalSymbolicFunctionCall's walk: a constant as it is (a Boolean or a String
+   argument of a Modelica function, `use_Rb` and the instance name of Buildings' borehole
+   resistance functions: made Float64, or dropped, the call was not evaluated), a parameter by
+   its number, a call by its result; nothing when a leaf is unknown. =#
+function _symbolicCallValue(expr, nameToNumeric::Dict{String, Float64})
+  expr isa Union{Number, AbstractString} && return expr
+  expr isa Symbolics.Num && (expr = Symbolics.unwrap(expr))
+  expr isa SymbolicUtils.BasicSymbolic || return nothing
+  #= A constant (a literal 500.0, a pre-folded 0.0015, false, a String) is a non-call,
+     non-sym BasicSymbolic: its value, not a free variable looked up by name. =#
   if !SymbolicUtils.iscall(expr) && !SymbolicUtils.issym(expr)
     local v = Symbolics.value(expr)
-    if v isa Number
-      return Float64(v)
-    end
+    return v isa Union{Number, AbstractString} ? v : nothing
   end
   if SymbolicUtils.iscall(expr)
-    local f = SymbolicUtils.operation(expr)
-    local rawArgs = SymbolicUtils.arguments(expr)
-    local numArgs = Vector{Float64}(undef, length(rawArgs))
-    for (i, a) in enumerate(rawArgs)
-      local av = _evalSymbolicFunctionCall(a, nameToNumeric)
+    local args = Any[]
+    for a in SymbolicUtils.arguments(expr)
+      local av = _symbolicCallValue(a, nameToNumeric)
       av === nothing && return nothing
-      numArgs[i] = av
+      push!(args, av)
     end
     local result = try
-      Base.invokelatest(f, numArgs...)
+      Base.invokelatest(SymbolicUtils.operation(expr), args...)
     catch _e
       OMBackend._fallback(_e, :_evalSymbolicFunctionCall_2)
       return nothing
     end
-    if result isa Number
-      return Float64(result)
-    end
-    return nothing
+    return result isa Number ? result : nothing
   end
   #= Leaf symbolic (free variable): look up by string name. =#
-  local nm = string(expr)
-  if haskey(nameToNumeric, nm)
-    return nameToNumeric[nm]
-  end
-  return nothing
+  return get(nameToNumeric, string(expr), nothing)
 end
 
 

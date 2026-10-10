@@ -166,6 +166,22 @@ function _zcRewriteIntegerRel(@nospecialize(cond::DAE.Exp))
   end
 end
 
+#= An operand of a logical operator in a zero-crossing condition: a relation (or a logical
+   expression of them) its zero-crossing function, a Boolean value (a parameter, a discrete)
+   1 - 2b, -1 where true. =#
+function _zeroCrossingOperand(@nospecialize(e::DAE.Exp))::DAE.Exp
+  (e isa DAE.RELATION || e isa DAE.LBINARY || e isa DAE.LUNARY ||
+   (e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "change")) && return transformToZeroCrossingCondition(e)
+  return DAE.BINARY(DAE.RCONST(1.0), DAE.SUB(DAE.T_REAL_DEFAULT),
+                    DAE.BINARY(DAE.RCONST(2.0), DAE.MUL(DAE.T_REAL_DEFAULT), e))
+end
+
+#= The larger (GREATER) or the smaller (LESS) of two zero-crossing functions: max() or min().
+   An if-expression on their relation held each operand twice, and a condition nesting and/or
+   grew exponentially (MSL Digital's registers: the build did not end). =#
+_zeroCrossingExtreme(f1::DAE.Exp, op::DAE.Operator, f2::DAE.Exp)::DAE.Exp =
+  DAE.CALL(Absyn.IDENT(op isa DAE.GREATER ? "max" : "min"), MetaModelica.list(f1, f2), DAE.callAttrBuiltinReal)
+
 function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DAE.Exp))::DAE.Exp
   local _intRW = _zcRewriteIntegerRel(conditonalExpression)
   _intRW !== nothing && return _intRW
@@ -197,6 +213,20 @@ function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DA
     end
     DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
       DAE.BINARY(e1, DAE.SUB(DAE.T_REAL_DEFAULT), e2)
+    end
+    #= Logical operators on the operands' zero-crossing functions (true where negative):
+       `not` negates, `and` is true where both are (their maximum), `or` where either is
+       (their minimum). `a - b` of the operands themselves did not change sign: Buildings'
+       weather data readers' `canRepeatWeatherFile and modTimAux > pre(tNext)` was
+       `canRepeat - (modTimAux > tNext)`, 1 then 0, and the file's time never wrapped. =#
+    DAE.LUNARY(operator = DAE.NOT(__), exp = e1) => begin
+      DAE.UNARY(DAE.UMINUS(DAE.T_REAL_DEFAULT), _zeroCrossingOperand(e1))
+    end
+    DAE.LBINARY(exp1 = e1, operator = DAE.AND(__), exp2 = e2) => begin
+      _zeroCrossingExtreme(_zeroCrossingOperand(e1), DAE.GREATER(DAE.T_REAL_DEFAULT), _zeroCrossingOperand(e2))
+    end
+    DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) => begin
+      _zeroCrossingExtreme(_zeroCrossingOperand(e1), DAE.LESS(DAE.T_REAL_DEFAULT), _zeroCrossingOperand(e2))
     end
     DAE.LUNARY(operator = op, exp = e1)  => begin
       DAE.UNARY(DAE.SUB(DAE.T_REAL_DEFAULT), e1)
@@ -755,6 +785,8 @@ Check if an initial equation only involves parameters (no state/algebraic variab
 Such equations determine parameter values and should not be treated as initial conditions.
 """
 function isParametricOnlyEquation(eq, simCode::SimulationCode.SimCode)::Bool
+  #= an if-equation (INLINE_IF_EQUATION: CDL SunRiseSet, the hydronic networks) has no sides =#
+  hasEquationSides(eq) || return false
   ht = simCode.stringToSimVarHT
   hasStateOrAlg = Ref(false)
   function checker(exp, acc)

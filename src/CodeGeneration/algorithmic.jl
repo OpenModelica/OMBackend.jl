@@ -115,8 +115,14 @@ end
    (signalPWM[3].sawtooth.count lowered to one name) has no array to grow. =#
 _indexesArray(lhs, name) = lhs isa Expr && lhs.head === :ref && _unwrapSubscriptExpr(lhs.args[1]) === name
 
+#= A range (`a:b`, `a:s:b`). =#
+_isRangeExpr(@nospecialize(x)) = x isa Expr && x.head === :call && !isempty(x.args) && x.args[1] === :(:)
+
 function _algAssignment(@nospecialize(lhsExp), rhs::Expr)
   local lhs = _unwrapSubscriptExpr(expToJuliaExpAlg(lhsExp))
+  #= A range assigned: a Vector, its elements assigned after (MSL Vectors.sort's
+     `indices := 1:size(v, 1)`: setindex! on a UnitRange; Buildings' SignalRanker). =#
+  _isRangeExpr(rhs) && (rhs = :(collect($rhs)))
   local prealloc = _algAssignmentPreallocation(lhsExp)
   if prealloc === nothing || !_indexesArray(lhs, prealloc.args[2])
     return :($lhs = $rhs)
@@ -286,12 +292,14 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
           OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(normalizedName))), $(nArgs), $(isArrayFunc), $(outputDims))
           #= Store the implementation in the dictionary =#
           OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(Symbol(normalizedName)))] = $(anonFunc)
+          $(_functionDerivativeRuleExpr(func, functions))
         end
       end
       SimulationCode.EXTERNAL_MODELICA_FUNCTION(__) => begin
         local funcBody = if func.language == "FORTRAN 77"
           _fortranExternalBody(func)
         else
+          ensureExternalC!(func)
           local extCall = namespaceifyExternalFunction(Meta.parse(func.libInfo))
           #= Allocate ccall-mutable buffers for every output, convert array inputs
              to the right C element type, then dereference Refs in the return. =#
@@ -314,6 +322,7 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
           OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(normalizedName))), $(nArgs), $(isArrayFunc), $(outputDims))
           #= Store the implementation in the dictionary =#
           OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(Symbol(normalizedName)))] = $(anonFunc)
+          $(_functionDerivativeRuleExpr(func, functions))
         end
       end
     end
@@ -321,6 +330,26 @@ function generateFunctions(functions::Vector{SimulationCode.ModelicaFunction})::
     push!(names, normalizedName)
   end
   return jFuncs, names
+end
+
+#= The derivative rule of `func`'s derivative annotation (SimulationCode.FUNCTION_DERIVATIVES,
+   CodeGeneration.FUNCTION_DERIVATIVE_RULES): the derivative function and, in order, the
+   inputs whose derivatives it takes (the Real ones without zeroDerivative/noDerivative).
+   Scalar inputs only: flattened records move the positions. =#
+function _functionDerivativeRuleExpr(func::SimulationCode.ModelicaFunction, functions::Vector{SimulationCode.ModelicaFunction})
+  local d = get(SimulationCode.FUNCTION_DERIVATIVES, func.name, nothing)
+  d === nothing && return nothing
+  local (derName, excluded, nInputs) = d
+  length(func.inputs) == nInputs || return nothing
+  local withDer = Int[]
+  for (i, v) in enumerate(func.inputs)
+    (_funcParamIsArray(v) || v.ty isa DAE.T_COMPLEX) && return nothing
+    v.ty isa DAE.T_REAL && !(i in excluded) && push!(withDer, i)
+  end
+  local k = findfirst(g -> g.name == derName, functions)
+  (k === nothing || length(functions[k].inputs) != nInputs + length(withDer)) && return nothing
+  return :(OMBackend.CodeGeneration.FUNCTION_DERIVATIVE_RULES[$(QuoteNode(Symbol(func.name)))] =
+           ($(QuoteNode(Symbol(derName))), $(withDer)))
 end
 
 function generateIOL(inputs::Vector)::Vector{Symbol}
@@ -383,7 +412,7 @@ function generateLocals(inputs::Vector)
       SOME(bindingExp) => begin
         #= An array as a copy: `Real Awork[n, n] = A` is written into, `A` not. =#
         local bindExpr = expToJuliaExpAlg(bindingExp)
-        push!(jInputs, :(local $s = $(_funcParamIsArray(i) ? :(Base.copy($bindExpr)) : bindExpr)))
+        push!(jInputs, :(local $s = $(_funcParamIsArray(i) ? :(collect($bindExpr)) : bindExpr)))
         true
       end
       _ => false
@@ -435,10 +464,12 @@ function generateOutputDefaults(outputs::Vector)::Vector{Expr}
   for v in outputs
     local s = DAE_VAR_ToJulia(v)
     #= An output with a binding starts at it (`output Real x[n] = b`), an array
-       as a copy: the body or a FORTRAN 77 routine writes into it, not into `b`. =#
+       as a copy: the body or a FORTRAN 77 routine writes into it, not into `b`. A
+       Vector: a range's copy was a range (MSL Vectors.sort's `indices = 1:size(v, 1)`,
+       setindex! on a UnitRange: Buildings' SignalRanker). =#
     if v.binding isa SOME
       local bindExpr = expToJuliaExpAlg(v.binding.data)
-      push!(decls, :(local $s = $(_funcParamIsArray(v) ? :(Base.copy($bindExpr)) : bindExpr)))
+      push!(decls, :(local $s = $(_funcParamIsArray(v) ? :(collect($bindExpr)) : bindExpr)))
       continue
     end
     local defaultVal = if _funcParamIsArray(v)
@@ -700,9 +731,22 @@ end
 function generateStatement(stmt::DAE.STMT_ASSIGN)
   local scalarised = _recordAssignment(stmt.exp1, stmt.exp)
   scalarised === nothing || return scalarised
-  local rhs = expToJuliaExpAlg(stmt.exp)
+  local rhs = _algValue(stmt.exp)
   return _algAssignment(stmt.exp1, rhs)
 end
+
+#= The value an assignment stores: an array variable read whole as a copy, as the bindings
+   are (Modelica assigns values). `PRea := PRea_new` bound both names to one array, and the
+   writes into PRea_new[m, k] changed PRea: Buildings' multipoleFluidTemperature saw no change
+   after its first iteration and stopped (the borehole resistances 3 % off, TwoUTube's
+   capacity location 0 for 0.21). =#
+function _algValue(@nospecialize(exp::DAE.Exp))::Expr
+  local rhs = expToJuliaExpAlg(exp)
+  return _isWholeArrayVariable(exp) ? :(collect($rhs)) : rhs
+end
+
+_isWholeArrayVariable(@nospecialize(exp::DAE.Exp))::Bool = exp isa DAE.CREF && exp.ty isa DAE.T_ARRAY &&
+  isempty(collect(CodeGeneration.FrontendUtil.Util.getSubscriptsFromCref(exp.componentRef)))
 
 """
     _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp) -> Union{Nothing,Expr}
@@ -802,9 +846,28 @@ Expand function-call arguments, replacing each record-typed cref with its flatte
 is passed as its scalar fields, matching the callee's flattened parameter list
 (`flattenRecordInput`). A builtin's arguments stay whole.
 """
-function _algCallArgs(argExps::List; builtin::Bool = false)::Vector{Any}
+function _algCallArgs(argExps::List; builtin::Bool = false, shared::Vector{Expr} = Expr[])::Vector{Any}
   local out = Any[]
+  #= The fields of a record-valued call passed as several arguments (TSUBs of the same call,
+     expandRecordArgsInExp: a Complex operand `(z1 - z2)^k` as its re and im): the call once,
+     bound in `shared`, each argument its element. Evaluated per field, the call ran twice at
+     each level of nesting: Buildings' multipoleFmk, ten levels of Complex operators, 1.9 s
+     and 200 MB a call. =#
+  local fieldReads = IdDict{DAE.Exp, Int}()
   for arg in argExps
+    arg isa DAE.TSUB && arg.exp isa DAE.CALL && (fieldReads[arg.exp] = get(fieldReads, arg.exp, 0) + 1)
+  end
+  local boundCalls = IdDict{DAE.Exp, Symbol}()
+  for arg in argExps
+    if arg isa DAE.TSUB && arg.exp isa DAE.CALL && fieldReads[arg.exp] > 1
+      local fields = get!(boundCalls, arg.exp) do
+        local sym = gensym(:fields)
+        push!(shared, :($sym = $(expToJuliaExpAlg(arg.exp))))
+        sym
+      end
+      push!(out, :($fields[$(arg.ix)]))
+      continue
+    end
     #= A record without fields (MSL Media's f_nonlinear_Data()) is no argument:
        the callee's flattened inputs have none for it. Passed as an empty value,
        every later argument was shifted (a MethodError of the wrapper's arity). =#
@@ -1054,7 +1117,7 @@ end
 function generateStatement(stmt::DAE.STMT_ASSIGN_ARR)
   local scalarised = _recordAssignment(stmt.lhs, stmt.exp)
   scalarised === nothing || return scalarised
-  local rhs = expToJuliaExpAlg(stmt.exp)
+  local rhs = _algValue(stmt.exp)
   return _algAssignment(stmt.lhs, rhs)
 end
 
@@ -1385,10 +1448,11 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         if !(attr.builtin)
           push!(expr.args, funcSym)
         end
-        append!(expr.args, _algCallArgs(explst; builtin = attr.builtin))
-        quote
+        local shared = Expr[]
+        append!(expr.args, _algCallArgs(explst; builtin = attr.builtin, shared = shared))
+        isempty(shared) ? quote
           $(expr)
-        end
+        end : Expr(:let, Expr(:block, shared...), expr)
       end
       DAE.CALL(path, expLst, attr) => begin
         local funcName = string(path)
@@ -1411,8 +1475,17 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
         if utilRuntimeName === nothing && !(attr.builtin)
           push!(expr.args, funcSym)
         end
-        append!(expr.args, _algCallArgs(expLst; builtin = attr.builtin))
-        expr
+        local shared = Expr[]
+        append!(expr.args, _algCallArgs(expLst; builtin = attr.builtin, shared = shared))
+        isempty(shared) ? expr : Expr(:let, Expr(:block, shared...), expr)
+      end
+      #= a function argument with bound arguments: a closure, calling the function as a call
+         in a function body does =#
+      DAE.PARTEVALFUNCTION(path, expList, ty, origType) => begin
+        local fnSym = Symbol(CodeGeneration.OMBackend.canonicalName(string(path)))
+        local closure = _partialApplicationExpr(:(Base.invokelatest), Any[expToJuliaExpAlg(e) for e in expList], ty, origType)
+        insert!(closure.args[2].args, 2, fnSym)
+        closure
       end
       DAE.CAST(ty, exp)  => begin
         #= Type cast expression =#
@@ -1564,23 +1637,65 @@ end
   generated closure rather than relying on OMRuntimeExternalC being in scope
   at runtime.
 """
+#= An external function: OMRuntimeExternalC's, or one ensureExternalC! defined (externalC.jl),
+   read by invokelatest: defined in this world (an older world's read of a newer binding is
+   deprecated, an error in later Julia versions). =#
+_externalFunction(name::Symbol) =
+  isdefined(externalCModule(), name) ? Base.invokelatest(getglobal, externalCModule(), name) :
+                                       getfield(OMRuntimeExternalC, name)
+
+#= `function f(b = e, ...)`, an argument of a function that takes a function (Buildings'
+   Borefields: quadratureLobatto of an integrand): a closure over the bound arguments, its
+   own arguments the inputs the partial application still has (`ty`; `origType` has all of
+   them, the bound arguments come in their order: OMFrontend's DAE conversion), calling
+   `callee` with every input in place. =#
+function _partialApplicationExpr(callee::Union{Symbol, Expr}, boundArgs::Vector{Any}, @nospecialize(partialType::DAE.Type),
+                                 @nospecialize(fullType::DAE.Type))::Expr
+  local ty = _functionType(partialType); local origType = _functionType(fullType)
+  (ty isa DAE.T_FUNCTION && origType isa DAE.T_FUNCTION) ||
+    CodeGeneration.unsupported("a partial application of this type", fullType)
+  local free = Set{String}(a.name for a in ty.funcArg)
+  local params = Symbol[]; local callArgs = Any[]; local k = 0
+  for a in origType.funcArg
+    #= a record input is flattened field by field in the callee (flattenRecordInput) =#
+    local aty = a.ty isa DAE.T_METABOXED ? a.ty.ty : a.ty
+    aty isa DAE.T_COMPLEX && CodeGeneration.unsupported("a partial application of a function with a record input", a.name)
+    if a.name in free
+      local s = Symbol("#pa#", a.name)
+      push!(params, s); push!(callArgs, s)
+    else
+      k += 1
+      k <= length(boundArgs) || CodeGeneration.unsupported("a partial application's bound arguments", origType)
+      push!(callArgs, boundArgs[k])
+    end
+  end
+  k == length(boundArgs) || CodeGeneration.unsupported("a partial application's bound arguments", origType)
+  return Expr(:->, Expr(:tuple, params...), Expr(:call, callee, callArgs...))
+end
+
+#= The function type of a function reference (the frontend's types of a partial application). =#
+_functionType(@nospecialize(t::DAE.Type)) =
+  t isa DAE.T_FUNCTION_REFERENCE_VAR || t isa DAE.T_FUNCTION_REFERENCE_FUNC ? t.functionType : t
+
+#= A C function's arguments: an external object as its pointer (CodeGeneration._externalPtr). =#
+_externalPtrArgs(args::AbstractVector)::Vector{Any} =
+  Any[:(OMBackend.CodeGeneration._externalPtr($a)) for a in args]
+
 Base.@nospecializeinfer function namespaceifyExternalFunction(@nospecialize(expr::Expr))
   #= Meta.parse may wrap in :toplevel -- unwrap it =#
   if expr.head == :toplevel && length(expr.args) == 1 && expr.args[1] isa Expr
     expr = expr.args[1]
   end
+  #= any number of arguments: MSL's getPid has none (pid = ModelicaInternal_getpid()) =#
   res = if expr.head == :(=)
     local callExpr = last(expr.args)
-    @match Expr(:call, [funcName, y...,z]) = callExpr
-    local resolvedFunc = getfield(OMRuntimeExternalC, funcName)
-    exp = Expr(:call, resolvedFunc, y..., z)
-    expr.args[2] = exp
+    @match Expr(:call, [funcName, args...]) = callExpr
+    expr.args[2] = Expr(:call, _externalFunction(funcName), _externalPtrArgs(args)...)
     expr
   else #Otherwise a side effect call or a call that returns directly.
     @assert expr.head === :call "Invalid call passed to namespaceifyExternalFunction"
-    @match Expr(:call, [funcName, y...,z]) = expr
-    local resolvedFunc = getfield(OMRuntimeExternalC, funcName)
-    Expr(:call, resolvedFunc, y..., z)
+    @match Expr(:call, [funcName, args...]) = expr
+    Expr(:call, _externalFunction(funcName), _externalPtrArgs(args)...)
   end
   return res
 end

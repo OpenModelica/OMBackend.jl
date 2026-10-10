@@ -43,4 +43,5 @@ import OMRuntimeExternalC
 using MetaModelica
 include("modelicaBuiltins.jl")
 include("algorithmic.jl")
+include("externalC.jl")
 end #AlgorithmicCodeGeneration

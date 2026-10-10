@@ -1183,6 +1183,13 @@ end
 #= An assert's condition; a call equation for its effects (BDAECreate) runs and holds. =#
 function _assertConditionExpr(@nospecialize(cond), obsAcc::Dict{Symbol,Symbol}, simCode)
   _isEffectCall(cond) && return :($(_effectCallExpr(cond, obsAcc, simCode)); true)
+  #= one in an if-equation's branch, `if guard then call else true` (BDAECreate): made
+     when the guard holds =#
+  if cond isa DAE.IFEXP && _isEffectCall(cond.expThen)
+    return :((if $(_daeBoolMem(cond.expCond, obsAcc, simCode))
+                $(_effectCallExpr(cond.expThen, obsAcc, simCode))
+              end); true)
+  end
   return _daeBoolMem(cond, obsAcc, simCode)
 end
 
@@ -1543,9 +1550,13 @@ function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
       local entry = get(simCode.stringToSimVarHT, name, nothing)
       entry === nothing && unsupported("a tuple target in a when that is no variable", lhs)
       local (_, var) = entry
+      #= and the body's local of it, as an assignment's: a later statement read the value from
+         before (Buildings' occupant windows, `(ran, state) = random(pre(state)); on = ran < p`
+         decided on the previous sample's number). =#
       push!(res, quote
-              idx = lookuptableStates[Symbol($(string(var.name)))]
-              integrator.u[idx] = $rhsAccess
+              $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(string(var.name)))]
+              integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)] = $rhsAccess
+              $(Symbol(string(var.name))) = integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)]
             end)
     end
     DAE.ARRAY(_, _, elements) => begin
@@ -1561,8 +1572,9 @@ function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs,
       entry === nothing && unsupported("a tuple target in a when that is no variable", lhs)
       local (_, var) = entry
       push!(res, quote
-              idx = lookuptableStates[Symbol($(string(var.name)))]
-              integrator.u[idx] = $rhsAccess
+              $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(string(var.name)))]
+              integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)] = $rhsAccess
+              $(Symbol(string(var.name))) = integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)]
             end)
     end
     SimulationCode.ARRAY_EXP(_, _, elements) => begin
@@ -1616,17 +1628,17 @@ function createWhenStatementsMTK(whenStatements, simCode::SimulationCode.SIM_COD
         local lhsSym = Symbol(string(var.name))
         local rhsE = expToJuliaExpMTK(wStmt.right, simCode; varPrefix = varPrefix, varSuffix = varSuffix)
         push!(res, quote
-                idx = lookuptableStates[Symbol($(string(var.name)))]
-                integrator.u[idx] = $(rhsE)
-                $(lhsSym) = integrator.u[idx]
+                $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(string(var.name)))]
+                integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)] = $(rhsE)
+                $(lhsSym) = integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)]
               end)
       end
     elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
       (index, var) = simCode.stringToSimVarHT[SimulationCode.string(wStmt.stateVar)]
       push!(res, quote
-              idx = lookuptableStates[Symbol($(string(var.name)))]
-              OMBackend.CodeGeneration.noteReinit!(integrator, idx)
-              integrator.u[idx] = $(expToJuliaExpMTK(wStmt.value,
+              $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(string(var.name)))]
+              OMBackend.CodeGeneration.noteReinit!(integrator, $(MTK_CodeGenerationUtil.STATE_INDEX))
+              integrator.u[$(MTK_CodeGenerationUtil.STATE_INDEX)] = $(expToJuliaExpMTK(wStmt.value,
                                                      simCode; varPrefix = varPrefix, varSuffix = varSuffix))
             end)
     elseif wStmt isa BDAE.TERMINATE || wStmt isa SimulationCode.TERMINATE
@@ -1717,7 +1729,7 @@ function createTerminalBodyRunner(simCode::SimulationCode.SIM_CODE)
          body we cannot evaluate (e.g. an unsupported external call) warns rather
          than discarding the result. =#
       try
-        let integrator = (u = _sol.u[end], t = _sol.t[end], f = _sol.prob.f, dt = 0.0, ps = _sol.prob.ps),
+        let integrator = (u = _sol.u[end], t = _sol.t[end], f = _sol.prob.f, dt = 0.0, p = _sol.prob.p, ps = _sol.prob.ps),
             x = _sol.u[end],
             t = _sol.t[end],
             p = _sol.prob.p,

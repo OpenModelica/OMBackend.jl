@@ -247,7 +247,28 @@ toSimExp(e::DAE.BCONST)::Exp = BCONST(e.bool)
 toSimExp(e::DAE.SCONST)::Exp = SCONST(e.string)
 toSimExp(e::DAE.ENUM_LITERAL)::Exp = ENUM_LITERAL(e.name, Int(e.index))
 toSimExp(e::DAE.CREF)::Exp =
-  e.componentRef isa DAE.WILD ? WILD() : EXP_CREF(SimCref(e.componentRef), e.ty)
+  e.componentRef isa DAE.WILD ? WILD() :
+  _hasVariableIndex(e.componentRef) ? _variableIndexAsub(e) : EXP_CREF(SimCref(e.componentRef), e.ty)
+
+#= A subscript of an iterator or other expression (`dp[i + 1]` in an array
+   comprehension: Buildings' Movers haveMinimumDecrease): SimCref keeps integer
+   subscripts only, the cref became the whole array. As an ASUB of the array. =#
+function _hasVariableIndex(@nospecialize(cref::DAE.ComponentRef))::Bool
+  cref isa DAE.CREF_IDENT || return false
+  #= every cref of every conversion comes here: the list walked, not collected =#
+  local variable = false
+  for s in cref.subscriptLst
+    s isa DAE.INDEX || return false
+    (s.exp isa DAE.ICONST || s.exp isa DAE.ENUM_LITERAL) || (variable = true)
+  end
+  return variable
+end
+
+function _variableIndexAsub(e::DAE.CREF)::Exp
+  local cref = e.componentRef
+  local base = EXP_CREF(SimCref(Symbol(cref.ident), Int[]), cref.identType)
+  return ASUB(base, Exp[toSimExp(s.exp) for s in cref.subscriptLst])
+end
 toSimExp(e::DAE.BINARY)::Exp =
   BINARY(toSimExp(e.exp1), toOpKind(e.operator), toSimExp(e.exp2))
 toSimExp(e::DAE.UNARY)::Exp = UNARY(toOpKind(e.operator), toSimExp(e.exp))
@@ -273,6 +294,20 @@ toSimExp(e::DAE.ASUB)::Exp =
 toSimExp(e::DAE.TSUB)::Exp = TSUB(toSimExp(e.exp), Int(e.ix), e.ty)
 toSimExp(e::DAE.RSUB)::Exp = RSUB(toSimExp(e.exp), Int(e.ix), String(e.fieldName), e.ty)
 toSimExp(e::DAE.CAST)::Exp = CAST(e.ty, toSimExp(e.exp))
+#= size(a, k) left in a parameter binding (Buildings' borefield data: nBor = size(cooBor, 1)):
+   that dimension's size where the array's type knows it, else a call of the builtin size. =#
+function toSimExp(e::DAE.SIZE)::Exp
+  local ty = e.exp isa DAE.CREF ? e.exp.ty : e.exp isa DAE.ARRAY ? e.exp.ty : nothing
+  if e.sz isa SOME && e.sz.data isa DAE.ICONST && ty isa DAE.T_ARRAY
+    local k = Int(e.sz.data.integer)
+    local dims = Base.collect(ty.dims)
+    if 1 <= k <= length(dims) && dims[k] isa DAE.DIM_INTEGER
+      return ICONST(Int(dims[k].integer))
+    end
+  end
+  local args = e.sz isa SOME ? Exp[toSimExp(e.exp), toSimExp(e.sz.data)] : Exp[toSimExp(e.exp)]
+  return CALL(Absyn.IDENT("size"), args, DAE.callAttrBuiltinInteger)
+end
 toSimExp(e::DAE.CALL)::Exp =
   CALL(e.path, Exp[toSimExp(a) for a in e.expLst], e.attr)
 toSimExp(e::DAE.RECORD)::Exp =
@@ -282,6 +317,9 @@ toSimExp(e::DAE.TUPLE)::Exp =
   TUPLE(Exp[toSimExp(x) for x in e.PR])
 toSimExp(e::DAE.REDUCTION)::Exp =
   REDUCTION(e.reductionInfo, toSimExp(e.expr), e.iterators)
+#= The bound arguments come boxed (the frontend boxes a function pointer's arguments): their values. =#
+toSimExp(e::DAE.PARTEVALFUNCTION)::Exp =
+  PARTEVALFUNCTION(e.path, Exp[toSimExp(x isa DAE.BOX ? x.exp : x) for x in e.expList], e.ty, e.origType)
 
 """
     toDAEExp(e::Exp) -> DAE.Exp
@@ -331,6 +369,8 @@ toDAEExp(e::CALL)::DAE.Exp =
   DAE.CALL(e.path,
            MetaModelica.list((toDAEExp(x) for x in e.args)...),
            e.attr)
+toDAEExp(e::PARTEVALFUNCTION)::DAE.Exp =
+  DAE.PARTEVALFUNCTION(e.path, MetaModelica.list((toDAEExp(x) for x in e.args)...), e.ty, e.origType)
 toDAEExp(e::RECORD)::DAE.Exp =
   DAE.RECORD(e.path,
              MetaModelica.list((toDAEExp(x) for x in e.exps)...),
@@ -628,4 +668,94 @@ function toBDAE(eq::RESIDUAL_EQUATION)
     BDAE.EQUATION_ATTRIBUTES(eq.attr.differentiated,
                              BDAE.UNKNOWN_EQUATION_KIND(),
                              BDAE.defaultEvalStages))
+end
+
+#= An if-equation among the initial equations (CDL SunRiseSet: `if cosHou < -1 then
+   nextSunSet = f(...) - 86400; else nextSunSet = f(...); end if`): one equation per position
+   of its branches, `v = if c1 then e1 elseif ... else en` where every branch assigns the same v
+   there, else `0 = if c1 then l1 - r1 ...`. Its branches the same number of plain equations
+   (MLS 8.3.4: in a non-parameter condition they must have it); others are left as they are. =#
+function lowerInitialIfEquations!(simCode::SIM_CODE)::Nothing
+  any(e -> e isa INLINE_IF_EQUATION, simCode.initialEquations) || return nothing
+  local out = Equation[]
+  for eq in simCode.initialEquations
+    local lowered = eq isa INLINE_IF_EQUATION ? _lowerIfEquation(eq) : nothing
+    lowered === nothing ? push!(out, eq) : append!(out, lowered)
+  end
+  empty!(simCode.initialEquations)
+  append!(simCode.initialEquations, out)
+  return nothing
+end
+
+#= `(a, b) = f(...)` among the initial equations, its targets variables: one equation for each
+   element of each target, the call's output by TSUB (an array output's element by ASUB of it).
+   Buildings' occupant windows, `(ran, state) = Xorshift1024star.random(initialState(localSeed,
+   globalSeed))`, ran a discrete and state an Integer array: the lowering had no tuple left side.
+   A pure call, once per element. A target that is a parameter (a free one,
+   _bindTupleOfFreeParameters!) leaves the equation as it is. =#
+function splitTupleInitialEquations!(simCode::SIM_CODE)::Nothing
+  local out = Equation[]
+  local changed = false
+  for eq in simCode.initialEquations
+    local split = eq isa EQUATION ? _splitTupleEquation(eq, simCode) : nothing
+    if split === nothing
+      push!(out, eq)
+    else
+      append!(out, split)
+      changed = true
+    end
+  end
+  changed || return nothing
+  empty!(simCode.initialEquations)
+  append!(simCode.initialEquations, out)
+  return nothing
+end
+
+function _splitTupleEquation(eq::EQUATION, simCode::SIM_CODE)::Union{Vector{Equation}, Nothing}
+  local lhs = toDAEExp(eq.lhs)
+  local rhs = toDAEExp(eq.rhs)
+  (lhs isa DAE.TUPLE && rhs isa DAE.CALL && !rhs.attr.isImpure && rhs.attr.ty isa DAE.T_TUPLE) || return nothing
+  local types = collect(rhs.attr.ty.types)
+  local targets = collect(lhs.PR)
+  length(types) >= length(targets) || return nothing
+  local isVariable = e -> begin
+    local entry = get(simCode.stringToSimVarHT, string(e), nothing)
+    e isa DAE.CREF && entry !== nothing && !isParameter(last(entry))
+  end
+  local eqs = Equation[]
+  for (k, target) in enumerate(targets)
+    target isa DAE.CREF && target.componentRef isa DAE.WILD && continue
+    local output = DAE.TSUB(rhs, k, types[k])
+    if target isa DAE.ARRAY
+      local elems = collect(target.array)
+      all(isVariable, elems) || return nothing
+      for (i, el) in enumerate(elems)
+        push!(eqs, EQUATION(toSimExp(el), toSimExp(DAE.ASUB(output, MetaModelica.list(DAE.INDEX(DAE.ICONST(i))))), eq.source, eq.attr))
+      end
+    elseif isVariable(target)
+      push!(eqs, EQUATION(toSimExp(target), toSimExp(output), eq.source, eq.attr))
+    else
+      return nothing
+    end
+  end
+  return eqs
+end
+
+function _lowerIfEquation(eq::INLINE_IF_EQUATION)::Union{Vector{Equation}, Nothing}
+  local branches = vcat(eq.branchesTrue, [eq.branchElse])
+  local n = length(first(branches))
+  (n > 0 && all(b -> length(b) == n && all(e -> e isa EQUATION, b), branches)) || return nothing
+  local lhsName = e -> string(toDAEExp(e.lhs))
+  local lowered = Equation[]
+  for k in 1:n
+    local ks = EQUATION[b[k] for b in branches]
+    local sameLhs = ks[1].lhs isa EXP_CREF && all(e -> lhsName(e) == lhsName(ks[1]), ks)
+    local value = e -> sameLhs ? e.rhs : BINARY(e.lhs, OP_SUB, e.rhs)
+    local exp = value(ks[end])
+    for j in length(eq.conditions):-1:1
+      exp = IFEXP(eq.conditions[j], value(ks[j]), exp)
+    end
+    push!(lowered, EQUATION(sameLhs ? ks[1].lhs : RCONST(0.0), exp, eq.source, eq.attr))
+  end
+  return lowered
 end

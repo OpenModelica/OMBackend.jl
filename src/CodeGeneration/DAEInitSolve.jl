@@ -56,9 +56,12 @@ function _fdInitResidualJacobian(rhsFunc, p_vec, u0, eq_idx, targets, extraRes, 
   local du_pert = similar(u0)
   for (jcol, jstate) in enumerate(var_idx)
     local u_pert = copy(u0)
-    u_pert[jstate] += eps_fd
+    #= Relative to the value: 1e-7 vanished in 8.1e9 (Buildings' PowerLinearized, T4 = T^4),
+       a zero column, and Newton never moved. =#
+    u_pert[jstate] += eps_fd * max(1.0, abs(u0[jstate]))
+    local h = u_pert[jstate] - u0[jstate]
     rhsFunc(du_pert, u_pert, p_vec, 0.0)
-    J[:, jcol] = (_initResidualVec(du_pert, u_pert, eq_idx, targets, extraRes) .- res) ./ eps_fd
+    J[:, jcol] = (_initResidualVec(du_pert, u_pert, eq_idx, targets, extraRes) .- res) ./ h
   end
   return J
 end
@@ -190,8 +193,11 @@ end
 
 #= `converged` is set false when no phase converged (the result is then the
    best effort the warning or the error below reports). =#
-function _solveDAEInitialization!(u0, rhsFunc, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
-                                  converged::Base.RefValue{Bool}=Ref(true))
+function _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
+                                  converged::Base.RefValue{Bool}=Ref(true), t0::Float64=0.0)
+  #= The residuals at the start time t0: the phases below evaluate at their time 0. Assigned
+     once (closures below capture it: a reassigned argument would be boxed). =#
+  local rhsFunc = t0 == 0.0 ? rhsAt0 : (du, u, p, t) -> rhsAt0(du, u, p, t + t0)
   local n = length(u0)
   local nMM = size(mm, 1)
   local nSafe = min(n, nMM)

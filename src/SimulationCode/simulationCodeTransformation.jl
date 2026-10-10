@@ -51,6 +51,11 @@ function BDAE_VarKindToSimCodeVarKind(backendVar::BDAE.VAR)::SimulationCode.SimV
     (BDAE.PARAM(__) || BDAE.CONST(__), DAE.T_COMPLEX(__)) => begin
       SimulationCode.DATA_STRUCTURE(SimulationCode._toSimBindExp(backendVar.bindExp))
     end
+    #= An external object declared without parameter (Buildings' Spawn adapters, schedules,
+       plotters): constructed once from its binding, like a parameter's. =#
+    (_, DAE.T_COMPLEX(complexClassType = DAE.ClassInf.EXTERNAL_OBJ(__))) => begin
+      SimulationCode.DATA_STRUCTURE(SimulationCode._toSimBindExp(backendVar.bindExp))
+    end
     #= Backend constants must be emitted as module-level bindings because generated
        parameter/default expressions may reference them directly by name. =#
     (BDAE.PARAM(__), DAE.T_REAL(__) || DAE.T_BOOL(__) || DAE.T_INTEGER(__)) => begin
@@ -187,6 +192,34 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
    asserts::Vector{BDAE.ASSERT_EQUATION}) = allocateAndCollectSimulationEquations(equations,
                                                                                   equationSystem.name,
                                                                                   addDummyState)
+  #= An initial equation's assert (a call for its effects among them: MSL Fluid's
+     checkBoundary) is checked once, at the initialization, as Modelica has it. One on
+     parameters joins the asserts (constant, it holds after); one on variables runs in
+     the initialization's `when initial()` pass, on the initialization's values (it
+     would be checked during the simulation as well with the asserts; it was refused:
+     every Modelica.Fluid source's checkBoundary of X_in_internal). =#
+  local initialAssertAlgorithms = INITIAL_ALGORITHM[]
+  for a in equationSystem.initialEqs
+    a isa BDAE.ASSERT_EQUATION || continue
+    #= A call for its effects in an initial if-equation's branch, `if guard then call
+       else true` (BDAECreate): made once, when the guard holds (Buildings' Movers print
+       the minimum-decrease warning). =#
+    if a.condition isa DAE.IFEXP && a.condition.expThen isa DAE.CALL && a.condition.expThen.attr.ty isa DAE.T_NORETCALL
+      push!(initialAssertAlgorithms, INITIAL_ALGORITHM([BDAE.NORETCALL(a.condition, a.source)]))
+      continue
+    end
+    local onVariables = any(_collectAssertCrefNames!(OrderedSet{String}(), [a])) do nm
+      local e = get(stringToSimVarHT, nm, nothing)
+      e !== nothing && !isParameter(last(e))
+    end
+    if !onVariables
+      push!(asserts, a)
+    elseif a.condition isa DAE.CALL && a.condition.attr.ty isa DAE.T_NORETCALL
+      push!(initialAssertAlgorithms, INITIAL_ALGORITHM([BDAE.NORETCALL(a.condition, a.source)]))
+    else
+      push!(initialAssertAlgorithms, INITIAL_ALGORITHM([BDAE.ASSERT(a.condition, a.message, a.level, a.source)]))
+    end
+  end
   #= Parameters in asserts as literals (they may be eliminated later); tunable
      ones stay references, read from the problem at run time. =#
   asserts = BDAE.ASSERT_EQUATION[BDAE.ASSERT_EQUATION(_inlineParamsInExp(a.condition, stringToSimVarHT; keepTunable = true),
@@ -207,6 +240,7 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
   local (whenEqsKept, extractedInitAlgs) = extractInitialWhenAlgorithms(whenEqs)
   whenEqs = whenEqsKept
   append!(initialAlgorithms, extractedInitAlgs)
+  append!(initialAlgorithms, initialAssertAlgorithms)
   #= Inline parameter literals into init bodies NOW, while the HT still has the
      scalarized array-parameter entries. Later passes (const-prop, alias-elim,
      output-only elim) drop those entries because they have no consumer in the
@@ -289,7 +323,8 @@ function transformToSimCode(equationSystems::Vector{BDAE.EQSYSTEM}, shared; mode
      types that have already migrated. =#
   local simResEqs = SimulationCode.RESIDUAL_EQUATION[SimulationCode.toSim(r) for r in resEqs]
   local simWhenEqs = SimulationCode.WHEN_EQUATION[SimulationCode.toSim(w) for w in whenEqs]
-  local simInitialEqs = SimulationCode.Equation[SimulationCode.toSim(e) for e in equationSystem.initialEqs]
+  local simInitialEqs = SimulationCode.Equation[SimulationCode.toSim(e) for e in equationSystem.initialEqs
+                                                if !(e isa BDAE.ASSERT_EQUATION)]
   local simSharedEqs = if !isempty(auxEquationSystems)
     SimulationCode.Equation[SimulationCode.toSim(e) for e in vcat(resEqs, whenEqs, ifEqs)]
   else
@@ -881,10 +916,12 @@ _isSampleCallDAE(@nospecialize(e))::Bool = e isa DAE.CALL && e.path isa Absyn.ID
 
 A when condition on a Boolean defined by `b = sample(start, interval)` (the
 MSL DiscreteBlock's `sampleTrigger`, read by `when {sampleTrigger, initial()}`
-in ZeroOrderHold and Sampler) gets the sample call in place of `b`: only a
+in ZeroOrderHold and Sampler), or by a guard and-ed with one (Buildings'
+plotters), gets the definition in place of `b`: only a
 condition with a sample() call becomes a periodic callback, `b` itself is
 false between the ticks. Only the condition's Boolean structure (the cref, an
-array, and, or) is rewritten, not an operand of pre() or a relation.
+array, and, or) is rewritten, not an operand of pre() or a relation. The
+bodies' reads of `b` get it too.
 """
 function substituteSampleTriggers(whenEqs::Vector{BDAE.WHEN_EQUATION},
                                   resEqs::Vector{BDAE.RESIDUAL_EQUATION})::Vector{BDAE.WHEN_EQUATION}
@@ -893,7 +930,7 @@ function substituteSampleTriggers(whenEqs::Vector{BDAE.WHEN_EQUATION},
     local e = eq.exp
     (e isa DAE.BINARY && e.operator isa DAE.SUB) || continue
     for (a, b) in ((e.exp1, e.exp2), (e.exp2, e.exp1))
-      a isa DAE.CREF && _isSampleCallDAE(b) && (defs[string(a.componentRef)] = b)
+      a isa DAE.CREF && Backend.BDAECreate._isSampleTriggerExp(b) && (defs[string(a.componentRef)] = b)
     end
   end
   isempty(defs) && return whenEqs
@@ -903,8 +940,23 @@ function substituteSampleTriggers(whenEqs::Vector{BDAE.WHEN_EQUATION},
     DAE.LBINARY(a, op, b) => DAE.LBINARY(subst(a), op, subst(b))
     _ => cond
   end
+  #= In the bodies the reads of `b` too, not under pre(), edge() or change(): true at
+     the ticks only (MTK_CodeGenerationUtil's "sample"), as the occupant lighting's
+     `if sampleTrigger then` at `when {occ, sampleTrigger}` asks; `b` itself is false. =#
+  local inBodyVisit = (x, arg) -> @match x begin
+    DAE.CALL(path = Absyn.IDENT(n)) where (n in ("pre", "edge", "change")) => (x, false, arg)
+    DAE.CREF(componentRef = cr) => (get(defs, string(cr), x), false, arg)
+    _ => (x, true, arg)
+  end
+  local inBody = e -> Base.first(Util.traverseExpTopDown(e, inBodyVisit, 0))
+  local bodyOp = op -> @match op begin
+    BDAE.ASSIGN(left, right, source) => BDAE.ASSIGN(left, inBody(right), source)
+    BDAE.REINIT(stateVar, value, source) => BDAE.REINIT(stateVar, inBody(value), source)
+    BDAE.ASSERT(condition, message, level, source) => BDAE.ASSERT(inBody(condition), message, level, source)
+    _ => op
+  end
   local rewrite
-  rewrite = (w::BDAE.WHEN_STMTS) -> BDAE.WHEN_STMTS(subst(w.condition), w.whenStmtLst,
+  rewrite = (w::BDAE.WHEN_STMTS) -> BDAE.WHEN_STMTS(subst(w.condition), MetaModelica.list(map(bodyOp, collect(w.whenStmtLst))...),
     @match w.elsewhenPart begin
       SOME(ew) => SOME(BDAE.WHEN_EQUATION(ew.size, rewrite(ew.whenEquation), ew.source, ew.attr))
       _ => w.elsewhenPart
@@ -1023,6 +1075,44 @@ function _reconstructScalarizedArrayDAE(baseName::String, ht)::Union{DAE.Exp, No
   return nothing
 end
 
+#= A cref with one subscript that is not a literal (a for loop's iterator: Buildings' DX
+   coils' `datCoi.sta[i].nomVal.Q_flow_nominal`, the plotters' `legend[i]`) whose elements
+   1, 2, ... are in the table: the array of the elements, subscripted by it. =#
+function _elementsBySubscriptDAE(e::DAE.CREF, ht::AbstractDict)::Union{DAE.Exp, Nothing}
+  local dynamic = DAE.Exp[]
+  local subsOf = cr -> @match cr begin
+    DAE.CREF_QUAL(subscriptLst = subs) => subs
+    DAE.CREF_IDENT(subscriptLst = subs) => subs
+    _ => MetaModelica.nil
+  end
+  local cr = e.componentRef
+  while cr isa DAE.CREF_QUAL || cr isa DAE.CREF_IDENT
+    for sub in subsOf(cr)
+      sub isa DAE.INDEX && !(sub.exp isa DAE.ICONST) && push!(dynamic, sub.exp)
+    end
+    cr = cr isa DAE.CREF_QUAL ? cr.componentRef : nothing
+  end
+  length(dynamic) == 1 || return nothing
+  local index = only(dynamic)
+  local subsWith = (subs, k) -> MetaModelica.list((sub isa DAE.INDEX && sub.exp === index ? DAE.INDEX(DAE.ICONST(k)) : sub for sub in subs)...)
+  local withK = nothing
+  withK = (cr, k) -> @match cr begin
+    DAE.CREF_QUAL(id, ty, subs, rest) => DAE.CREF_QUAL(id, ty, subsWith(subs, k), withK(rest, k))
+    DAE.CREF_IDENT(id, ty, subs) => DAE.CREF_IDENT(id, ty, subsWith(subs, k))
+    _ => cr
+  end
+  local elements = DAE.Exp[]
+  while true
+    local el = DAE.CREF(withK(e.componentRef, length(elements) + 1), e.ty)
+    haskey(ht, string(el)) || break
+    push!(elements, el)
+  end
+  isempty(elements) && return nothing
+  local arrayTy = DAE.T_ARRAY(e.ty, MetaModelica.list(DAE.DIM_INTEGER(length(elements))))
+  return DAE.ASUB(DAE.ARRAY(arrayTy, true, MetaModelica.list(elements...)), MetaModelica.list(DAE.INDEX(index)))
+end
+_elementsBySubscriptDAE(@nospecialize(e::DAE.Exp), ht::AbstractDict) = nothing
+
 # SIM.Exp delegation: round-trip to DAE.Exp until the visitor is SIM-native.
 _inlineParamsInExp(exp::Exp, ht; keepTunable::Bool = false)::Exp =
   toSimExp(_inlineParamsInExp(toDAEExp(exp), ht; keepTunable = keepTunable))
@@ -1054,7 +1144,7 @@ function _inlineParamsInExp(exp::DAE.Exp, ht; keepTunable::Bool = false)::DAE.Ex
           return (be, true, acc)
         end
       else
-        local recons = _reconstructScalarizedArrayDAE(key, ht)
+        local recons = something(_reconstructScalarizedArrayDAE(key, ht), _elementsBySubscriptDAE(e, ht), Some(nothing))
         if recons !== nothing
           return (recons, true, acc)
         end

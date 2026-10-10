@@ -350,6 +350,10 @@ function modelica_transpose(A)
     return permutedims(A)
   elseif A isa AbstractVector
     return permutedims(A)
+  elseif A isa AbstractArray && ndims(A) > 2
+    #= MLS 10.3.3: the first two dimensions swapped (Buildings' Borefields
+       TemporalSuperposition: transpose of a 3-dimensional array) =#
+    return permutedims(A, (2, 1, 3:ndims(A)...))
   else
     return Base.transpose(A)
   end

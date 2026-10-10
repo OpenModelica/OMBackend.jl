@@ -1297,6 +1297,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SimulationCode.SIM_CODE, modelNa
       # re-fetch decorated Nums from module scope (eval rebinds names but
       # local vars still holds pre-eval references)
       vars = [Base.invokelatest(getfield, @__MODULE__, sym) for (sym, _) in vars]
+      #= The calls the parameter bindings share (_parameterBindingExpr). =#
+      local _parameterCalls = Dict{UInt, Any}()
       #= Initial values for the continuous system. =#
       $(decomposeParameterEquationsInline(PARAMETER_EQUATIONS))
       #= Add ifCond discrete parameter values to pars dict =#

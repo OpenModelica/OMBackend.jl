@@ -260,6 +260,9 @@ function _whenLookupBindings(crefs, simCode)::Vector{Expr}
     if OMBackend.envSwitch("OMBACKEND_WHEN_STRING_SKIP")
       entry[2].varKind isa SimulationCode.STRING && continue
     end
+    #= A data structure (an external object: Buildings' borehole ExtendableArray) is a
+       module-level binding too (createDataStructureAssignments). =#
+    entry[2].varKind isa SimulationCode.DATA_STRUCTURE && continue
     push!(out, Expr(:(=), Symbol(name), getIdxForLookupMTK(x, simCode)))
   end
   return out
@@ -503,6 +506,81 @@ function _timeOffsetOverPeriod(@nospecialize(e), simCode)
   end
 end
 
+#= MSL 4.1's Pulse: `time >= (pre(count) + 1)*period + startTime`, a time event (4.0 had
+   `integer((time - startTime)/period) > pre(count)`). The threshold, affine in pre(count),
+   at counts 0, 1 and 2 gives (startTime, period), or nothing; the when must count it up by
+   one (`count = pre(count) + 1`: `t = pre(t) + dt` under `time >= pre(t)` is no such clock).
+   As a generic when the pulse lost the end of most periods: the relation
+   `time < T_start + T_width` jumped with T_start (the 4.0 path refreshes it,
+   _collectIfCondRefresh). =#
+function _affinePreThreshold(@nospecialize(thr::DAE.Exp), simCode::SimulationCode.SIM_CODE,
+                             stmts::Union{AbstractVector, List})
+  local name = Ref("")
+  local f = Float64[]
+  for k in 0:2
+    local s = _substitutePre(thr, Float64(k), name)
+    s === nothing && return nothing
+    local v = OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(s, simCode), nothing, :pulseThreshold)
+    v === nothing && return nothing
+    push!(f, Float64(v))
+  end
+  (isempty(name[]) || !_countsUpByOne(stmts, name[], simCode)) && return nothing
+  local period = f[2] - f[1]
+  (period > 0 && isapprox(f[3] - f[2], period; rtol = 1e-12)) || return nothing
+  return (f[1] - period, period)
+end
+
+#= Whether the statements assign `name = pre(name) + 1`. =#
+function _countsUpByOne(stmts::Union{AbstractVector, List}, name::String, simCode::SimulationCode.SIM_CODE)::Bool
+  for st in stmts
+    (st isa SimulationCode.ASSIGN || st isa BDAE.ASSIGN) || continue
+    local lhs = st.left isa DAE.Exp ? st.left : SimulationCode.toDAEExp(st.left)
+    string(lhs) == name || continue
+    local rhs = st.right isa DAE.Exp ? st.right : SimulationCode.toDAEExp(st.right)
+    local values = Float64[]
+    for k in (0.0, 5.0)
+      local own = Ref("")
+      local s = _substitutePre(rhs, k, own)
+      (s === nothing || own[] != name) && return false
+      local v = OMBackend._tryOr(() -> SimulationCode.tryEvalNumeric(s, simCode), nothing, :pulseCount)
+      v === nothing && return false
+      push!(values, Float64(v))
+    end
+    return values == [1.0, 6.0]
+  end
+  return false
+end
+
+#= `e` with its pre(v) calls, all of one v (its name into `name`), replaced by the literal k;
+   nothing for an expression other than arithmetic of crefs and literals. =#
+function _substitutePre(@nospecialize(e::DAE.Exp), k::Float64, name::Base.RefValue{String})
+  return @match e begin
+    DAE.CALL(Absyn.IDENT("pre"), args, _) => begin
+      local a = listArray(args)
+      (length(a) == 1 && a[1] isa DAE.CREF) || return nothing
+      local nm = string(a[1])
+      (isempty(name[]) || name[] == nm) || return nothing
+      name[] = nm
+      DAE.RCONST(k)
+    end
+    DAE.BINARY(exp1 = a, operator = op, exp2 = b) => begin
+      local sa = _substitutePre(a, k, name)
+      local sb = sa === nothing ? nothing : _substitutePre(b, k, name)
+      sb === nothing ? nothing : DAE.BINARY(sa, op, sb)
+    end
+    DAE.UNARY(operator = op, exp = a) => begin
+      local sa = _substitutePre(a, k, name)
+      sa === nothing ? nothing : DAE.UNARY(op, sa)
+    end
+    DAE.CAST(ty = ty, exp = a) => begin
+      local sa = _substitutePre(a, k, name)
+      sa === nothing ? nothing : DAE.CAST(ty, sa)
+    end
+    DAE.CREF(__) || DAE.RCONST(__) || DAE.ICONST(__) => e
+    _ => nothing
+  end
+end
+
 #= Detect the Modelica Source.Pulse / SignalSource periodic when-condition
    `integer((time - startTime)/period) <relop> pre(counter)`. Returns
    (startTime, period) or nothing. Such a condition is a periodic clock — it
@@ -511,7 +589,8 @@ end
    a piecewise-constant 0/1 the rootfinder cannot reliably catch, so the
    pulse counter / T_start freeze (Blocks.Sources.Pulse and machines driven
    by it). =#
-function _pulsePeriodicSpec(@nospecialize(cond), simCode)
+#= `stmts`: the when's statements (SimCode's or BDAE's). =#
+function _pulsePeriodicSpec(@nospecialize(cond), simCode, stmts::Union{AbstractVector, List})
   @match cond begin
     DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
       local isGt = @match op begin
@@ -520,6 +599,7 @@ function _pulsePeriodicSpec(@nospecialize(cond), simCode)
         _ => false
       end
       isGt || return nothing
+      _isTimeCref(e1) && return _affinePreThreshold(e2, simCode, stmts)
       _isPreCref(e2) || return nothing
       @match e1 begin
         DAE.CALL(Absyn.IDENT("integer"), arglst, _) => begin
@@ -766,6 +846,12 @@ function _isPeriodicTick(integrator, phase, period)::Bool
   return n >= -1e-9 && abs(n - round(n)) <= 1e-9 * max(1.0, abs(n))
 end
 
+#= Whether `t` is a tick of sample(start, interval): start + k*interval, k = 0, 1, ... =#
+function _isSampleInstant(t::Real, start::Real, interval::Real)::Bool
+  local n = (t - start) / interval
+  return n >= -1e-9 && abs(n - round(n)) <= 1e-9 * max(1.0, abs(n))
+end
+
 #= `(sample call, guard)` of a when condition that is `sample(...)` or a
    conjunction with exactly one sample() conjunct (the guard: the other
    conjuncts, or nothing); `(nothing, nothing)` otherwise. =#
@@ -791,6 +877,89 @@ function _splitSampleCondition(cond)
     guard = DAE.LBINARY(guard, DAE.AND(DAE.T_BOOL(MetaModelica.Nil())), e)
   end
   return (samples[1], guard)
+end
+
+#= The sample() calls of a condition that is only sample()s or-ed, or nothing. =#
+function _sampleDisjuncts(@nospecialize(cond))::Union{Vector{Any}, Nothing}
+  local out = Any[]
+  local collect! = nothing
+  collect! = e -> begin
+    @match e begin
+      DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) => (collect!(e1) && collect!(e2))
+      DAE.CALL(path = Absyn.IDENT("sample")) => (push!(out, e); true)
+      _ => false
+    end
+  end
+  return (collect!(cond) && length(out) > 1) ? out : nothing
+end
+
+#= `(sample calls, the other disjuncts or-ed)` of a condition that or-s sample()s
+   with other triggers, none of them under a sample() (Buildings' occupant
+   lighting: `when {occ, sampleTrigger}`, edge(occ) or sample(t0, samplePeriod)),
+   or nothing. =#
+function _sampleOrOthers(@nospecialize(cond::DAE.Exp))::Union{Tuple{Vector{Any}, DAE.Exp}, Nothing}
+  local samples = Any[]
+  local others = Any[]
+  local collect! = nothing
+  collect! = e -> @match e begin
+    DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) => (collect!(e1); collect!(e2))
+    DAE.CALL(path = Absyn.IDENT("sample")) => push!(samples, e)
+    _ => push!(others, e)
+  end
+  collect!(cond)
+  (isempty(samples) || isempty(others) || any(_containsSampleCall, others)) && return nothing
+  return (samples, foldl((a, b) -> DAE.LBINARY(a, DAE.OR(DAE.T_BOOL_DEFAULT), b), others))
+end
+
+#= The ticks of the sample()s of a when that or-s them with other triggers
+   (`clocks`: (interval, phase, a tick at the initial time) each). A tick marks
+   its instant in `tickAt`: the event iteration, which runs after the instant's
+   other ticks, then runs the when once (`affect!` takes the tick). At the start
+   of a solve no iteration follows: there the tick runs `affect!` itself. The
+   end of a solve is a tick only where a clock ticks. =#
+function _sampleTickCallback(tickAt::Base.RefValue{Float64}, affect!::Function, clocks::Vector)
+  local ticks = map(clocks) do (dt, phase, initialTick)
+    local tick! = integrator -> begin
+      _isPeriodicTick(integrator, phase, dt) || return nothing
+      tickAt[] = integrator.t
+      integrator.t == first(integrator.sol.prob.tspan) && affect!(integrator)
+      return nothing
+    end
+    DiffEqCallbacks.PeriodicCallback(tick!, dt; phase = phase, initial_affect = initialTick, final_affect = true,
+                                     save_positions = (false, false))
+  end
+  return DiffEqBase.CallbackSet(ticks...)
+end
+
+#= (interval, phase, a tick at the initial time) of `sample(start, interval)`. =#
+function _sampleClock(@nospecialize(sampleCall::DAE.Exp), simCode::SimulationCode.SIM_CODE)::Tuple{Any, Float64, Bool}
+  @match DAE.CALL(Absyn.IDENT("sample"), args, _) = sampleCall
+  @match start <| interval <| _ = args
+  local _intervalVal = SimulationCode.tryEvalNumeric(interval, simCode)
+  local _dtExpr = _intervalVal === nothing ? expToJuliaExp(interval, simCode) : _intervalVal
+  #= The ticks are start + i*interval, i = 0, 1, ...: the phase is the first
+     one from the initial time (taken as 0). A start not known here was taken
+     as 0 (generated code cannot read the parameters at module level), a
+     negative one as 0 too (sample(-0.15, 0.25) ticked at 0.25, not 0.1). =#
+  local _startVal = SimulationCode.tryEvalNumeric(start, simCode)
+  #= one an initial algorithm assigns (CDL's samplers and pulses: t0) =#
+  _startVal === nothing && (_startVal = SimulationCode.valueAtBuildStart(start, simCode))
+  _startVal === nothing && unsupported("a sample() start not known at the build", start)
+  local _firstTick = Float64(_startVal)
+  if _firstTick < 0
+    _intervalVal === nothing && unsupported("a negative sample() start with an interval not known at the build", sampleCall)
+    _firstTick += ceil(-_firstTick / Float64(_intervalVal)) * Float64(_intervalVal)
+    #= Rounding: sample(-0.9, 0.3) gave -1.1e-16, a negative phase (an
+       ArgumentError) and no tick at 0. =#
+    abs(_firstTick) <= 8 * eps(max(1.0, abs(Float64(_intervalVal)))) && (_firstTick = 0.0)
+    _firstTick = max(0.0, _firstTick)
+  end
+  local _phaseExpr = _firstTick
+  #= A tick at the initial time is taken too, after initialization (omc,
+     Dymola): MSL RealFFT1's `when sample(0, Ts)` samples y(0) into its FFT
+     buffer. =#
+  local _initialTick = iszero(_firstTick)
+  return (_dtExpr, _phaseExpr, _initialTick)
 end
 
 _containsSampleCall(e) = _containsCallTo(e, "sample")
@@ -824,26 +993,42 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
      `when generateNoise and sample(startTime, samplePeriod)`): periodic, the
      guard read at each tick. =#
   local (sampleCall, sampleGuard) = _splitSampleCondition(wEqCondDAE)
+  #= or-ed sample()s alone (CDL's Boolean and Integer TimeTable: `when {sample(t0 +
+     timeStamps[1], period), sample(t0 + timeStamps[2], period), ...}`): a clock each, one body. =#
+  local sampleCalls = sampleCall !== nothing ? Any[sampleCall] : _sampleDisjuncts(wEqCondDAE)
+  #= sample()s or-ed with other triggers (Buildings' occupant lighting: `when
+     {occ, sampleTrigger}`): a when on the others or a tick of theirs
+     (_sampleTickCallback), on a discrete condition. =#
+  local tickCalls = nothing
+  if sampleCalls === nothing
+    local mixed = _sampleOrOthers(wEqCondDAE)
+    if mixed !== nothing
+      (tickCalls, wEqCondDAE) = mixed
+      cond = transformToZeroCrossingCondition(wEqCondDAE)
+    end
+  end
   #= Lowered elsewhere: a sample() alone or and-ed with a guard, terminal()
      alone (after the solve). Not in MSL 3.2.3; sample() read false, terminal()
      undefined: never fired. =#
-  sampleCall === nothing && _containsSampleCall(wEqCondDAE) &&
-    unsupported("sample() under or/not, or two sample() calls, in a when-condition", wEqCondDAE)
+  sampleCalls === nothing && _containsSampleCall(wEqCondDAE) &&
+    unsupported("sample() under not, and-ed with another sample(), or and-ed within an or, in a when-condition", wEqCondDAE)
   _containsCallTo(wEqCondDAE, "terminal") && !_isCallNamed(wEqCondDAE, "terminal") &&
     unsupported("terminal() with another trigger in a when-condition", wEqCondDAE)
-  local isPeriodic = sampleCall !== nothing
+  local isPeriodic = sampleCalls !== nothing
   local isContinuousCond::Bool = isContinuousCondition(wEqCondDAE, simCode)
+  tickCalls !== nothing && isContinuousCond &&
+    unsupported("sample() or-ed with a continuous-time condition in a when-condition", wEqCondDAE)
   #= Table / time-driven sources: a when whose condition is purely change(time>=c)
      thresholds must fire AT those times via PresetTimeCallback — a ContinuousCallback
      rootfinding on the spiky change() value never detects the crossings. =#
-  if !isPeriodic
+  if !isPeriodic && tickCalls === nothing
     local _thr = _collectTimeThresholds(wEqCondDAE, simCode)
     if _thr !== nothing && !isempty(_thr)
       return _emitPresetTimeWhen(eq, simCode, callbacks, _thr)
     end
     #= Source.Pulse periodic clock `integer((time-startTime)/period) > pre(count)`:
        fire AT the period boundaries via PeriodicCallback. =#
-    local _pulse = _pulsePeriodicSpec(wEqCondDAE, simCode)
+    local _pulse = _pulsePeriodicSpec(wEqCondDAE, simCode, wEq.whenStmtLst)
     if _pulse !== nothing && _pulse[2] > 0.0
       return _emitPulsePeriodicWhen(eq, simCode, callbacks, _pulse[1], _pulse[2])
     end
@@ -1052,8 +1237,6 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
   elseif isPeriodic
-    @match DAE.CALL(Absyn.IDENT("sample"), args, attrs) = sampleCall
-    @match start <| interval <| tail = args
     #= MTK-aware periodic affect: the hardcoded x[N]/p[N] indices from
        expToJuliaExp are invalid after MTK structural_simplify reorders unknowns,
        so resolve the interval to a literal Δt and write state via
@@ -1075,36 +1258,24 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
     local (_dbRefreshCrefs, _dbRefreshStmts) = _collectDiscreteBoolWhenRefresh(_periodicWrittenLHS, simCode)
-    local _intervalVal = SimulationCode.tryEvalNumeric(interval, simCode)
-    local _dtExpr = _intervalVal === nothing ? expToJuliaExp(interval, simCode) : _intervalVal
-    #= The ticks are start + i*interval, i = 0, 1, ...: the phase is the first
-       one from the initial time (taken as 0). A start not known here was taken
-       as 0 (generated code cannot read the parameters at module level), a
-       negative one as 0 too (sample(-0.15, 0.25) ticked at 0.25, not 0.1). =#
-    local _startVal = SimulationCode.tryEvalNumeric(start, simCode)
-    _startVal === nothing && unsupported("a sample() start not known at the build", start)
-    local _firstTick = Float64(_startVal)
-    if _firstTick < 0
-      _intervalVal === nothing && unsupported("a negative sample() start with an interval not known at the build", sampleCall)
-      _firstTick += ceil(-_firstTick / Float64(_intervalVal)) * Float64(_intervalVal)
-      #= Rounding: sample(-0.9, 0.3) gave -1.1e-16, a negative phase (an
-         ArgumentError) and no tick at 0. =#
-      abs(_firstTick) <= 8 * eps(max(1.0, abs(Float64(_intervalVal)))) && (_firstTick = 0.0)
-      _firstTick = max(0.0, _firstTick)
-    end
-    local _phaseExpr = _firstTick
-    #= A tick at the initial time is taken too, after initialization (omc,
-       Dymola): MSL RealFFT1's `when sample(0, Ts)` samples y(0) into its FFT
-       buffer. =#
-    local _initialTick = iszero(_firstTick)
+    #= (interval, phase, a tick at the initial time) of each clock =#
+    local _clocks = [_sampleClock(c, simCode) for c in sampleCalls]
     local _guardCrefs = sampleGuard === nothing ? DAE.ComponentRef[] : listArray(Util.getAllCrefs(sampleGuard))
     local _guardExpr = sampleGuard === nothing ? true : expToJuliaExpMTK(sampleGuard, simCode)
     quote
-      let _affCache = Ref{Any}(nothing)
+      let _affCache = Ref{Any}(nothing), _lastTick = Ref(NaN)
         global $(Symbol("affect$(callbacks)!"))
         $(Symbol("affect$(callbacks)!")) = (integrator) -> begin
-          OMBackend.CodeGeneration._isPeriodicTick(integrator, $(Symbol("samplePhase$(callbacks)")),
-                                                   $(Symbol("sampleDt$(callbacks)"))) || return nothing
+          $(length(_clocks) == 1 ?
+            :(OMBackend.CodeGeneration._isPeriodicTick(integrator, $(Symbol("samplePhase$(callbacks)")),
+                                                       $(Symbol("sampleDt$(callbacks)"))) || return nothing) :
+            quote
+              any(c -> OMBackend.CodeGeneration._isPeriodicTick(integrator, c[2], c[1]), $(Symbol("sampleClocks$(callbacks)"))) ||
+                return nothing
+              #= two clocks on one instant: the body once =#
+              _lastTick[] == integrator.t && return nothing
+              _lastTick[] = integrator.t
+            end)
           local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)
           local t = integrator.t
           local x = integrator.u
@@ -1131,14 +1302,19 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           $(_dbRefreshStmts...)
         end
       end
-      $(Symbol("sampleDt$(callbacks)")) = $(_dtExpr)
-      $(Symbol("samplePhase$(callbacks)")) = $(_phaseExpr)
+      $(Symbol("sampleDt$(callbacks)")) = $(_clocks[1][1])
+      $(Symbol("samplePhase$(callbacks)")) = $(_clocks[1][2])
+      $(Symbol("sampleClocks$(callbacks)")) = Any[$([:(($(c[1]), $(c[2]))) for c in _clocks]...)]
       #= Ticks at start + i*interval, the initial and the final time included
          (_isPeriodicTick). =#
-      $(Symbol("cb$(callbacks)")) = PeriodicCallback($(Symbol("affect$(callbacks)!")), $(Symbol("sampleDt$(callbacks)"));
-                                                      phase = $(Symbol("samplePhase$(callbacks)")),
-                                                      initial_affect = $(_initialTick), final_affect = true,
-                                                      save_positions = (true, true))
+      $(Symbol("cb$(callbacks)")) = $(length(_clocks) == 1 ?
+        :(PeriodicCallback($(Symbol("affect$(callbacks)!")), $(Symbol("sampleDt$(callbacks)"));
+                           phase = $(Symbol("samplePhase$(callbacks)")),
+                           initial_affect = $(_clocks[1][3]), final_affect = true,
+                           save_positions = (true, true))) :
+        Expr(:call, :CallbackSet, [:(PeriodicCallback($(Symbol("affect$(callbacks)!")), $(c[1]);
+                                                        phase = $(c[2]), initial_affect = $(c[3]), final_affect = true,
+                                                        save_positions = (true, true))) for c in _clocks]...))
       $(if wEq.elsewhenPart !== nothing
           eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4)
         end)
@@ -1178,6 +1354,12 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
       end
     end
     local condCrefs = filter(c -> string(c) != "time", listArray(Util.getAllCrefs(cond)))
+    #= The ticks of or-ed sample()s (_sampleTickCallback): the when fires at a
+       tick it has not taken, once at an instant. =#
+    local tickCb = tickCalls === nothing ? 0 : ADD_CALLBACK()
+    local tickNow = :(_tickAt[] == integrator.t && _tickTaken[] != integrator.t)
+    local tickClocks = tickCalls === nothing ? Expr[] :
+      [:(($(c[1]), $(c[2]), $(c[3]))) for c in (_sampleClock(s, simCode) for s in tickCalls)]
     #= From the condition as written: the zero-crossing form unwraps a
        top-level `change(k)` to `k`. =#
     local _bareCrefStrs = _collectBareCrefStrings(wEqCondDAE)
@@ -1256,6 +1438,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           _affCache = Ref{Union{Nothing, Tuple{Dict{Symbol, Int}, Dict{Symbol, Int}}}}(nothing),
           _changeCache = Ref{Union{Nothing, Dict{Symbol, Any}}}(nothing),
           _latch = Ref{Bool}(false),     # the edge latch
+          $((tickCalls === nothing ? () : (:(_tickAt = Ref(NaN)), :(_tickTaken = Ref(NaN))))...)
           _changeSeedValues = Dict{Symbol, Any}($(changeSeedPairs...))
         global $(Symbol("condition$(callbacks)"))
         #= Whether the when fires. `_follow`: whether change()/edge() may take the values now,
@@ -1289,7 +1472,9 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           local _result = $(condValue)
           @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
           $(useLatch ? :(_result || (_latch[] = false)) : :())
-          local _fires = $(useLatch ? :(_result && !_latch[]) : :_result)
+          local _fires = $(let f = useLatch ? :(_result && !_latch[]) : :_result
+                             tickCalls === nothing ? f : :($f || $tickNow)
+                           end)
           #= change()/edge() compare with the values at the previous event (pre()): where the when
              does not fire, the memory follows the values now (off turned false at 1/12 without
              firing a `when edge(off)`, which then missed off's edge at 5/12); where it fires, its
@@ -1303,6 +1488,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           local t = integrator.t
           local x = integrator.u
           @debug "[CB-DC$($(callbacks)) affect] firing" t=integrator.t
+          $(tickCalls === nothing ? :() : :(_tickAt[] == integrator.t && (_tickTaken[] = integrator.t)))
           local lookuptableStates
           local lookuptableParams
           if _affCache[] === nothing
@@ -1348,6 +1534,11 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
               $(useLatch ? :(_latch[] = false; _latch[] = $(Symbol("condition$(callbacks)"))(x, t, integrator)) : :())
               nothing
             end))
+        $(tickCalls === nothing ? :() : quote
+            global $(Symbol("cb$(tickCb)"))
+            $(Symbol("cb$(tickCb)")) = OMBackend.CodeGeneration._sampleTickCallback(_tickAt, $(Symbol("affect$(callbacks)!")),
+                                                                                   Any[$(tickClocks...)])
+          end)
       end
       #= Part of the event iteration where the model has buffered relations. =#
       $(Symbol("cb$(callbacks)")) = OMBackend.CodeGeneration.discreteWhenCallback($(Symbol("condition$(callbacks)")),

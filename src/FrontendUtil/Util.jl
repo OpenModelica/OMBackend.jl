@@ -456,6 +456,33 @@ function traverseReductionIteratorsTopDown(riters::DAE.ReductionIterators, func,
   return (list(outIters...), outArg)
 end
 
+"""
+  Traverse reduction iterators bottom-up, applying the traversal function to each iterator expression.
+  Returns the input list when nothing changed.
+"""
+function traverseReductionIterators(riters::DAE.ReductionIterators, func, extArg)
+  local outIters = DAE.ReductionIterator[]
+  local outArg = extArg
+  local changed = false
+  for riter in riters
+    @match riter begin
+      DAE.REDUCTIONITER(id, exp, guardExp, ty) => begin
+        (exp2, outArg) = traverseExpBottomUp(exp, func, outArg)
+        guardExp2 = @match guardExp begin
+          SOME(g) => begin
+            (g2, outArg) = traverseExpBottomUp(g, func, outArg)
+            referenceEq(g, g2) ? guardExp : SOME(g2)
+          end
+          NONE() => guardExp
+        end
+        changed = changed || !(referenceEq(exp, exp2) && referenceEq(guardExp, guardExp2))
+        push!(outIters, DAE.REDUCTIONITER(id, exp2, guardExp2, ty))
+      end
+    end
+  end
+  return (changed ? list(outIters...) : riters, outArg)
+end
+
 Base.@nospecializeinfer function traverseExpTopDownCrefHelper(@nospecialize(inCref::DAE.ComponentRef), rel, iarg::Argument) ::Tuple{DAE.ComponentRef, Argument}
   local outArg::Argument
   local outCref::DAE.ComponentRef

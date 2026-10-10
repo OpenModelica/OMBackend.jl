@@ -35,6 +35,40 @@
 
 #= MTK code generation: parameter equations, arrays, assignments and data structures. =#
 
+#= A parameter binding in Julia (createParameterEquationsMTK, createParameterAssignmentsMTK).
+   An element of the result of a call with literal arguments, `p[i, j] = f(...)[i, j]` (an
+   array parameter scalarized), reads one evaluation of the call: `_parameterCalls`, a local
+   of the model function, by the call's code. Every element called it (Buildings'
+   TemperatureResponseMatrix: 152 calls of an impure function that computes a g-function
+   and writes a file, 15 s each); a binding is evaluated once. =#
+#= `bindExp`: a SimCode binding, or a DAE start value (a parameter without a binding). =#
+function _parameterBindingExpr(bindExp::Union{SimulationCode.Exp, DAE.Exp}, simCode::SimulationCode.SIM_CODE)
+  local e = expToJuliaExpMTK(bindExp, simCode)
+  (bindExp isa SimulationCode.Exp && _isLiteralCallElement(bindExp)) || return e
+  #= the indexing, inside the quote blocks of the translation =#
+  local ref = e
+  while ref isa Expr && ref.head === :block
+    local stmts = filter(a -> !(a isa LineNumberNode), ref.args)
+    length(stmts) == 1 || return e
+    ref = only(stmts)
+  end
+  (ref isa Expr && ref.head === :ref && ref.args[1] isa Expr) || return e
+  local callExpr = ref.args[1]
+  ref.args[1] = :(get!(() -> $callExpr, _parameterCalls, $(hash(string(callExpr)))))
+  return e
+end
+
+#= f(...)[i, ...] with literal arguments and subscripts. =#
+_isLiteralCallElement(e::SimulationCode.Exp)::Bool =
+  e isa SimulationCode.ASUB && e.exp isa SimulationCode.CALL && all(_isLiteralSimExp, e.exp.args) &&
+  all(s -> s isa SimulationCode.ICONST, e.subs)
+
+_isLiteralSimExp(e::SimulationCode.Exp)::Bool =
+  e isa Union{SimulationCode.ICONST, SimulationCode.RCONST, SimulationCode.SCONST, SimulationCode.BCONST,
+              SimulationCode.ENUM_LITERAL} ||
+  (e isa SimulationCode.UNARY && _isLiteralSimExp(e.exp)) ||
+  (e isa SimulationCode.ARRAY_EXP && all(_isLiteralSimExp, e.elements))
+
 """
   `createParameterEquationsMTK(parameters::Vector, type, simCode::SimulationCode.SIM_CODE)`
     The Type specifies what kind of parameter equation a call to this function should yield.
@@ -85,10 +119,10 @@ function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode
     expr = if isIntOrBool(bindExp)
       quote
         $(LineNumberNode(@__LINE__, "$param eq"))
-        Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap(float($((expToJuliaExpMTK(bindExp, simCode)))))
+        Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap(float($(_parameterBindingExpr(bindExp, simCode))))
       end
     else
-        :(Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap($(expToJuliaExpMTK(bindExp, simCode))))
+        :(Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap($(_parameterBindingExpr(bindExp, simCode))))
     end
       # expr = quote
       #   $(LineNumberNode(@__LINE__, "$param eq"))
@@ -179,12 +213,12 @@ function createParameterAssignmentsMTK(parameters::Vector,
     expr =  if isIntOrBool(bindExp)
       quote
         $(LineNumberNode(@__LINE__, "$param eq"))
-        $(Symbol(simVar.name)) = float($((expToJuliaExpMTK(bindExp, simCode))))
+        $(Symbol(simVar.name)) = float($(_parameterBindingExpr(bindExp, simCode)))
       end
     else
       quote
         $(LineNumberNode(@__LINE__, "$param eq"))
-        $(Symbol(simVar.name)) = $(expToJuliaExpMTK(bindExp, simCode))
+        $(Symbol(simVar.name)) = $(_parameterBindingExpr(bindExp, simCode))
       end
     end
     push!(parameterEquations, expr)
@@ -203,10 +237,14 @@ lossTable_fileName = "NoName"
 """
 function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
   local exprs::Vector{Expr} = Expr[]
+  local emitted = Set{String}()
   #= Variables the SimCode passes eliminated (aliases, folded equations): no
      longer in the table, and not bound at module level either. =#
   local eliminated = union(OrderedSet{String}(simCode.eliminatedVariables),
                            OrderedSet{String}(a.eliminatedName for a in simCode.aliasMap))
+  #= at module level the model's functions are CodeGeneration's (Buildings' ShaGFunction:
+     a String parameter bound to a function's SHA) =#
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
   for varName in keys(simCode.stringToSimVarHT)
     SimulationCode.isTunableParameter(varName) && continue
     (idx, simVar) = simCode.stringToSimVarHT[varName]
@@ -248,9 +286,55 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
       OMBackend._fallback(_e, :stringParameterBinding; only = UnsupportedLowering, impact = :result)
       continue
     end
+    rhs isa Expr && !isempty(funcNames) && qualifyModelicaFunctions!(rhs, funcNames)
     push!(exprs, :( $(Symbol(simVar.name)) = $(rhs) ))
+    push!(emitted, varName)
   end
+  append!(exprs, _dataStructureParameterPrelude(simCode, emitted))
   return exprs
+end
+
+#= Parameters with a computed binding that a DATA_STRUCTURE's binding reads (MSL 4.1
+   CombiTimeTable's isCsvExt from its file name, an argument of the table's constructor):
+   at module level as well, each after what it reads; a parameter that reads anything
+   else (a variable, an array or another data structure) is left as it was. =#
+function _dataStructureParameterPrelude(simCode::SimulationCode.SIM_CODE, emitted::Set{String})::Vector{Expr}
+  local ht = simCode.stringToSimVarHT
+  local out = Expr[]
+  local visiting = Set{String}()
+  #= a parameter that cannot be computed at module level (it reads a variable, or its binding
+     does not lower): not tried again from each parameter that reads it =#
+  local failed = Set{String}()
+  #= at module level the model's functions are CodeGeneration's (qualifyModelicaFunctions!) =#
+  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
+  local emit!
+  emit! = function (nm::String)
+    nm in emitted && return true
+    (nm in visiting || nm in failed) && return false
+    local e = get(ht, nm, nothing)
+    e === nothing && return false
+    local sv = last(e)
+    (sv.varKind isa SimulationCode.PARAMETER && !SimulationCode.isTunableParameter(nm)) || return false
+    local b = sv.varKind.bindExp
+    b isa SOME || return false
+    push!(visiting, nm)
+    local ok = all(c -> emit!(string(c)), Util.getAllCrefs(SimulationCode.toDAEExp(b.data)))
+    local rhs = ok ? OMBackend._tryOr(() -> expToJuliaExpMTK(b.data, simCode), nothing, :dataStructureParameterPrelude;
+                                     only = UnsupportedLowering, impact = :result) : nothing
+    delete!(visiting, nm)
+    rhs === nothing && (push!(failed, nm); return false)
+    rhs isa Expr && !isempty(funcNames) && qualifyModelicaFunctions!(rhs, funcNames)
+    push!(out, :($(Symbol(sv.name)) = $(rhs)))
+    push!(emitted, nm)
+    return true
+  end
+  for (_, (_, sv)) in ht
+    sv.varKind isa SimulationCode.DATA_STRUCTURE || continue
+    local b = sv.varKind.bindExp
+    b isa SOME || continue
+    foreach(c -> emit!(string(c)), Util.getAllCrefs(SimulationCode.toDAEExp(b.data)))
+  end
+  return out
 end
 
 #= Emit ARRAY_PARAMETER bindings at module top so that DATA_STRUCTURE
@@ -462,9 +546,10 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
     if rhs isa Expr
       qualifyModelicaFunctions!(rhs, funcNames)
     end
+    #= an external object by its name in the terms that read it (ExternalObjectRef) =#
     expr = quote
       $(LineNumberNode(@__LINE__, "$ds eq"))
-      $(Symbol(simVar.name)) = $(rhs)
+      $(Symbol(simVar.name)) = OMBackend.CodeGeneration._externalObjectRef($(QuoteNode(Symbol(simVar.name))), $(rhs))
     end
     push!(dsAssignments, expr)
     #= A record's fields by their flattened names too (`Medium_data[1]_MM`): the equations
