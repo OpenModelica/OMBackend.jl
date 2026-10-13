@@ -87,8 +87,9 @@ function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode
       SimulationCode.PARAMETER(__) => begin
         local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
         @match optAttributes begin
+          #= Its start, a literal or an expression of other parameters (MSL 4.1.0's
+             lightning examples: a start that reads another parameter was refused). =#
           SOME(attr) where attr.start isa SOME => begin
-            @assert !(attr.start.data isa DAE.CREF) "Non-numeric start attributes are not currently supported"
             @match SOME(startVal) = attr.start
             startVal
           end
@@ -456,6 +457,10 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
       SimulationCode.PARAMETER(SOME(SimulationCode.RCONST(r))) => r
       SimulationCode.PARAMETER(SOME(SimulationCode.ICONST(i))) => i
       SimulationCode.PARAMETER(SOME(SimulationCode.BCONST(b))) => b
+      #= An element bound to an expression of parameters, its value at the build (MSL
+         4 BearingFriction's ExternalCombiTable1D(table = tau_pos) with RobotR3's
+         tau_pos = [0, Rv0 / unitTorque; ...]: the table was undefined). =#
+      SimulationCode.PARAMETER(SOME(e)) => SimulationCode.valueAtBuildStart(SimulationCode.toDAEExp(e), simCode)
       _ => nothing
     end
     val === nothing && continue
