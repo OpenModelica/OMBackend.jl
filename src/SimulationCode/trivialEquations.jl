@@ -497,17 +497,25 @@ function simplifySemiLinear(simCode::SIM_CODE)::SIM_CODE
 end
 
 #= (y, x, sa, sb) of the residual `y - semiLinear(x, sa, sb)` or `semiLinear(x, sa, sb) - y`
-   with y a variable, else nothing. =#
+   with y a variable, else nothing. A negated y is turned round, as
+   -semiLinear(x, sa, sb) = semiLinear(-x, sb, sa): alias elimination writes a port's
+   H_flow as the other port's negated (`-A = semiLinear(V, s1, s2)` beside
+   `A = semiLinear(-V, s0, s1)`, MSL FluidHeatFlow's massless pump between ambients). =#
 Base.@nospecializeinfer function _semiLinearEquation(@nospecialize(exp::DAE.Exp))::Union{Nothing, NTuple{4, DAE.Exp}}
   exp isa DAE.BINARY && exp.operator isa DAE.SUB || return nothing
   for (y, c) in ((exp.exp1, exp.exp2), (exp.exp2, exp.exp1))
-    y isa DAE.CREF || continue
     (c isa DAE.CALL && c.path isa Absyn.IDENT && c.path.name == "semiLinear") || continue
     local args = collect(c.expLst)
-    length(args) == 3 && return (y, args[1], args[2], args[3])
+    length(args) == 3 || continue
+    y isa DAE.CREF && return (y, args[1], args[2], args[3])
+    (y isa DAE.UNARY && y.operator isa DAE.UMINUS && y.exp isa DAE.CREF) &&
+      return (y.exp, _negated(args[1]), args[3], args[2])
   end
   return nothing
 end
+
+_negated(@nospecialize(e::DAE.Exp))::DAE.Exp =
+  e isa DAE.UNARY && e.operator isa DAE.UMINUS ? e.exp : DAE.UNARY(DAE.UMINUS(DAE.T_REAL_DEFAULT), e)
 
 #= The equations of one y and x in chain order, sa -> s1 -> ... -> sb (each one's second
    slope the next one's first), every intermediate slope a variable, every equation in the
@@ -521,7 +529,7 @@ function _semiLinearChain(eqs::Vector{Tuple{Int, DAE.Exp, DAE.Exp, DAE.Exp, DAE.
   local sbs = Set{String}(string(e[5]) for e in eqs)
   local starts = [k for (k, e) in enumerate(eqs) if !(string(e[4]) in sbs)]
   length(starts) == 1 || return nothing
-  local chain = [eqs[only(starts)]]
+  local chain = Tuple{Int, DAE.Exp, DAE.Exp, DAE.Exp, DAE.Exp}[eqs[only(starts)]]
   while length(chain) < length(eqs)
     local next = get(bySa, string(last(chain)[5]), 0)
     next == 0 && return nothing

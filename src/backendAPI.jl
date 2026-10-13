@@ -438,7 +438,10 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
           #= Second alias elimination: earlier simplifiers (foldExplicitSingleAssign,
              propagateConstants, dropObservationOnlyVariables) collapse n-term connector
              flow sums into 2-term residuals like `a + b = 0` the first could not see. =#
-          "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables])
+          "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
+          #= Chains of semiLinear equations the second alias elimination joined (MSL
+             FluidHeatFlow's massless pump: its port's H_flow became the ambient's). =#
+          "simplifySemiLinear" => SimulationCode.simplifySemiLinear])
         #= Second RHS-equivalence pass: the alias-elim2 above can collapse two
            equations of the form `Xi - der(s_i)` onto the same `der(s)`. The
            pass keys equations by RHS string before its own substitution
