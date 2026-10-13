@@ -188,25 +188,27 @@ end
 
 """
 Transforms a DAE Condition into a MTK continuous condition.
+
+`normalized`: each relation's difference divided by its own scale, `1 + max(|a|, |b|)`
+(`_operandScaleExpr`), so that where min/max combine several relations a hysteresis is
+relative to each one's operands (OpenModelica's per-relation hysteresis).
 """
-function transformToMTKContinuousCondition(cond, simCode; atInitial::Bool = false)
+function transformToMTKContinuousCondition(cond, simCode; atInitial::Bool = false, normalized::Bool = false)
   # @match patterns are DAE.* only; convert SIM-side conditions at entry.
   if cond isa SimulationCode.Exp
     cond = SimulationCode.toDAEExp(cond)
   end
+  local difference = function (a::DAE.Exp, b::DAE.Exp)
+    local ja = expToJuliaExpMTK(a, simCode); local jb = expToJuliaExpMTK(b, simCode)
+    normalized || return :($(ja) - $(jb))
+    return :(($(ja) - $(jb)) / $(_operandScaleExpr(Any[ja, jb])))
+  end
+  local sub = c -> transformToMTKContinuousCondition(c, simCode; atInitial = atInitial, normalized = normalized)
   res = @match cond begin
-    DAE.RELATION(e1, DAE.LESS(__), e2) => begin
-      :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)))
-    end
-    DAE.RELATION(e1, DAE.LESSEQ(__), e2) => begin
-      :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)))
-    end
-    DAE.RELATION(e1, DAE.GREATER(__), e2) => begin
-      :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)))
-    end
-    DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => begin
-      :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)))
-    end
+    DAE.RELATION(e1, DAE.LESS(__), e2) => difference(e1, e2)
+    DAE.RELATION(e1, DAE.LESSEQ(__), e2) => difference(e1, e2)
+    DAE.RELATION(e1, DAE.GREATER(__), e2) => difference(e2, e1)
+    DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => difference(e2, e1)
     #= Boolean-valued sub-conditions: encode `b` (true=1, false=0) such that the
        result is *negative* when the original condition is TRUE — the convention
        used by min/max for OR/AND composition and by evalInitialCondition. The
@@ -220,23 +222,15 @@ function transformToMTKContinuousCondition(cond, simCode; atInitial::Bool = fals
     DAE.CREF(__) => begin
       :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
     end
-    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      :(min($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
-            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))))
-    end
-    DAE.LBINARY(e1, DAE.AND(__), e2) => begin
-      :(max($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
-            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))))
-    end
+    DAE.LBINARY(e1, DAE.OR(__), e2) => :(min($(sub(e1)), $(sub(e2))))
+    DAE.LBINARY(e1, DAE.AND(__), e2) => :(max($(sub(e1)), $(sub(e2))))
     #= Logical NOT: negate the inner condition =#
-    DAE.LUNARY(DAE.NOT(__), e) => begin
-      :(-($(transformToMTKContinuousCondition(e, simCode; atInitial = atInitial))))
-    end
+    DAE.LUNARY(DAE.NOT(__), e) => :(-($(sub(e))))
     #= Strip noEvent wrapper and recurse =#
     DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
       local innerArgs = collect(lst)
       if length(innerArgs) == 1
-        transformToMTKContinuousCondition(innerArgs[1], simCode; atInitial = atInitial)
+        sub(innerArgs[1])
       else
         OMBackend.unsupported("noEvent with several arguments in a condition", cond)
       end
@@ -2334,11 +2328,15 @@ function _conditionScaleExpr(@nospecialize(cond), simCode)
      period, inf, in `time >= T0 + Tfalling`) is left out: it made the
      hysteresis infinite. =#
   for rel in _eventRelations(cond)
-    for x in (expToJuliaExpMTK(rel.exp1, simCode), expToJuliaExpMTK(rel.exp2, simCode))
-      push!(terms, :(ModelingToolkit.ifelse(abs($(x)) < 1.0e300, abs($(x)), 0.0)))
-    end
+    push!(terms, expToJuliaExpMTK(rel.exp1, simCode), expToJuliaExpMTK(rel.exp2, simCode))
   end
   isempty(terms) && return 1.0
+  return _operandScaleExpr(terms)
+end
+
+#= `1 + max(|x|, ...)` of lowered operands, an infinite one left out (above). =#
+function _operandScaleExpr(xs::Vector{Any})
+  local terms = Any[:(ModelingToolkit.ifelse(abs($(x)) < 1.0e300, abs($(x)), 0.0)) for x in xs]
   return length(terms) == 1 ? :(1.0 + $(terms[1])) : :(1.0 + max($(terms...)))
 end
 

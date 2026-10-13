@@ -450,9 +450,18 @@ function createIfEquation(stateVariables::Vector,
              g is never zero after initialization or an event, so a function
              starting at its threshold (a dead centre) or two coinciding roots
              cannot be missed or chatter. =#
+          #= Several relations: each crossing on its own scale (normalized), as each has its
+             own hysteresis in OpenModelica. One scale for all made it relative to the largest
+             operand: MSL Spice3 V_pulse's `(time < TD or counter2 == 0) or time >= T0 +
+             Tfalling` with Tfalling = 1e60 kept `time < TD` true after TD. =#
+          local zcHyst = zcLhs
           local scaleExpr = MTK_CodeGenerationUtil._conditionScaleExpr(branch.condition, simCode)
-          local hystCond = :((($(zcLhs)) + $(ZC_HYSTERESIS) * ($(scaleExpr)) * (1 - 2 * $(thisSym))) ~ 0)
-          push!(relations, (thisSym, zcLhs, scaleExpr))
+          if length(MTK_CodeGenerationUtil._eventRelations(branch.condition)) > 1
+            zcHyst = MTK_CodeGenerationUtil.transformToMTKContinuousCondition(branch.condition, simCode; normalized = true)
+            scaleExpr = 1.0
+          end
+          local hystCond = :((($(zcHyst)) + $(ZC_HYSTERESIS) * ($(scaleExpr)) * (1 - 2 * $(thisSym))) ~ 0)
+          push!(relations, (thisSym, zcHyst, scaleExpr))
           #= The literal value at initialization, from the solved initial state
              (the static value comes from start attributes). Not for conditions
              on other lifted if-expressions: their values are not ready then. =#
