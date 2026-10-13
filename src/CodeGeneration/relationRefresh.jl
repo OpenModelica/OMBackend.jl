@@ -633,13 +633,23 @@ end
    fixed 1e-6 s, so 1e-6 of the time span instead (as its DAE problems
    start), if smaller than the current step. Not for a DAE problem: DFBDF
    restarted from a smaller step ended in NaN (DAEIfReinit). =#
+#= OrdinaryDiffEq's initial step estimate after an event (auto_dt_reset!). It reads the next
+   tstop: at an event on the last one there is none left (MSL 4 RobotR3: a BoundsError in
+   first_tstop), and no step to size either. =#
+function _autoDtReset!(integrator)
+  local tstops = integrator.opts.tstops
+  isempty(tstops) && return nothing
+  ModelingToolkit.SciMLBase.auto_dt_reset!(integrator)
+  return nothing
+end
+
 _restartStepSize!(integrator) = nothing
 function _restartStepSize!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator)
   local prob = integrator.sol.prob
   prob isa ModelingToolkit.SciMLBase.AbstractODEProblem || return nothing
   local mm = integrator.f.mass_matrix
   if mm isa LinearAlgebra.UniformScaling || all(!iszero, LinearAlgebra.diag(mm))
-    ModelingToolkit.SciMLBase.auto_dt_reset!(integrator)
+    _autoDtReset!(integrator)
     return nothing
   end
   local span = abs(prob.tspan[2] - prob.tspan[1])

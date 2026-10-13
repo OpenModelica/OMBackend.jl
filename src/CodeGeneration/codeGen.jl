@@ -434,7 +434,7 @@ function _emitElsewhenThresholdTimeWhen(elseArm, simCode, ewRefSym::Symbol, thrD
         $(_whenLookupBindings(affBindCrefs, simCode)...)
         $(ewRefSym)[] = Float64($(expToJuliaExpMTK(thrDAE, simCode)))
         $(whenStmts...)
-        auto_dt_reset!(integrator)
+        OMBackend.CodeGeneration._autoDtReset!(integrator)
         add_tstop!(integrator, integrator.t + 1E-12)
       end
     end
@@ -1505,7 +1505,7 @@ function eqToJulia(eq::Union{BDAE.WHEN_EQUATION, SimulationCode.WHEN_EQUATION}, 
           $(_whenLookupBindings(vcat(map(x -> getRHSVariables(x), wEq.whenStmtLst)...), simCode)...)
           $(whenStatementsMTKDiscrete...)
           $(_ewSchedule)
-          auto_dt_reset!(integrator)
+          OMBackend.CodeGeneration._autoDtReset!(integrator)
           add_tstop!(integrator, integrator.t + 1E-12)
           local _changePreValues = _changeCache[] === nothing ? Dict{Symbol, Any}() : _changeCache[]
           _changeCache[] = _changePreValues
