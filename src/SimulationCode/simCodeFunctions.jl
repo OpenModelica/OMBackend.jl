@@ -59,7 +59,9 @@ function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{
       OMFrontend.Frontend.convertFunctionParam(output)
     end
     local locals = map(f.locals) do l
-      OMFrontend.Frontend.convertFunctionParam(l)
+      #= read first: the conversion replaces a record's class by its DAE type =#
+      local fieldBindings = _fieldBindings(l)
+      _withFieldBindings(OMFrontend.Frontend.convertFunctionParam(l), fieldBindings)
     end
     if ! OMFrontend.Frontend.isExternal(f)
       local body::Vector{OMFrontend.Frontend.Statement} = OMFrontend.Frontend.getBody(f)
@@ -84,6 +86,35 @@ function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{
     end
   end
   return (functions, externalFunctionsUsed)
+end
+
+#= A record-typed local whose type carries its fields' bindings as written in the record
+   instance, which CodeGeneration's _recordLocal sets the fields from. The converted type
+   has them with the scope prefix stripped (NFConvertDAE.makeTypeRecordVar), so a field
+   default reading another field (`Real b = 2 * a`) read whatever `a` is in the function;
+   with the prefix it is the local's own field (`w.a`, generated as `w_a`). =#
+function _withFieldBindings(v::DAE.VAR, fieldBindings::Dict{String, DAE.Binding})::DAE.VAR
+  (isempty(fieldBindings) || !(v.ty isa DAE.T_COMPLEX)) && return v
+  local vars = DAE.Var[haskey(fieldBindings, tv.name) ?
+    DAE.TYPES_VAR(tv.name, tv.attributes, tv.ty, fieldBindings[tv.name], tv.bind_from_outside, tv.constOfForIteratorRange) :
+    tv for tv in v.ty.varLst]
+  @assign v.ty = DAE.T_COMPLEX(v.ty.complexClassType, arrayList(vars), v.ty.equalityConstraint, v.ty.usedExternally)
+  return v
+end
+
+#= The bindings of a record-typed function variable's fields, with their scope prefix, by
+   field name; empty for another variable. =#
+function _fieldBindings(node::OMFrontend.Frontend.InstNode)::Dict{String, DAE.Binding}
+  local F = OMFrontend.Frontend
+  local bindings = Dict{String, DAE.Binding}()
+  local ty = F.getType(F.component(node))
+  F.isvariant(ty, F.TYPE_COMPLEX) || return bindings
+  local cls = F.getClass(ty.cls)
+  (cls isa F.INSTANCED_CLASS && cls.restriction isa F.RESTRICTION_RECORD) || return bindings
+  for c in F.getComponents(cls.elements)
+    bindings[F.name(c)] = F.toDAE(F.getBinding(F.component(c)))
+  end
+  return bindings
 end
 
 #= A function's derivative annotation of order 1, by the function's name: the derivative

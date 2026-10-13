@@ -400,9 +400,7 @@ function generateLocals(inputs::Vector)
        (e.g. expToJuliaExpAlg's CREF_QUAL site). =#
     local flat = flattenRecordInput(i)
     if !isempty(flat)
-      for fs in flat
-        push!(jInputs, Expr(:local, fs))
-      end
+      append!(jInputs, _recordLocal(i, flat))
       continue
     end
     local s = DAE_VAR_ToJulia(i)
@@ -438,6 +436,29 @@ function generateLocals(inputs::Vector)
     end
   end
   return jInputs
+end
+
+#= A record-typed local as its per-field locals (`flat`, flattenRecordInput's symbols),
+   set as omc's C code sets a record variable: from its binding (`Sat s = Sat(p, 0)`),
+   else each field from its own binding, the modifiers and defaults the record type
+   carries (`SaturationProperties sat(psat = p, Tsat = 0)`: MSL R134a's getPhase_ph read
+   sat_psat unset; SimulationCode's _withFieldBindings gives a default reading another
+   field as that field). A field without one, or of a record type, stays unset, and so
+   does an array of records (its fields would be arrays: not lowered yet). =#
+function _recordLocal(v::DAE.VAR, flat::Vector{Symbol})::Vector{Expr}
+  local decls = Expr[Expr(:local, fs) for fs in flat]
+  _funcParamIsArray(v) && return decls
+  @match v.binding begin
+    SOME(bindingExp) => begin
+      local assign = _recordAssignment(DAE.CREF(v.componentRef, v.ty), bindingExp)
+      assign === nothing || push!(decls, assign)
+    end
+    _ => for (fs, field) in zip(flat, v.ty.varLst)
+      (field.binding isa DAE.EQBOUND && !(field.ty isa DAE.T_COMPLEX)) || continue
+      push!(decls, :($fs = $(expToJuliaExpAlg(field.binding.exp))))
+    end
+  end
+  return decls
 end
 
 #= A zero-filled array for an array-typed function variable, its dimensions possibly
