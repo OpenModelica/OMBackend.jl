@@ -3159,6 +3159,88 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     @debug "[SIMCODE: solveParametricInitialEquations] pass $pass solved $(length(solvedNames)) more parameter(s)" solvedNames
   end
   end #= while fixed-point =#
+  _solveCoupledParametricInitialEquations!(simCode)
+end
+
+#= The parametric initial equations left, of several free parameters each, solved together
+   where they are as many as their free parameters (MSL 4 SMPM_ResistiveBraking: the
+   steady-state currents idq_sr from two coupled equations; one at a time they were not
+   solved, and the free parameters kept their start values, 0). Not where one reads a
+   tunable parameter (its run's value is not known here) or the solve does not converge:
+   those stay unbound, as before. =#
+function _solveCoupledParametricInitialEquations!(simCode::SimulationCode.SimCode)
+  local ht = simCode.stringToSimVarHT
+  local isFreeParam = key -> begin
+    local entry = get(ht, key, nothing)
+    entry !== nothing && SimulationCode.isParameter(last(entry)) && !SimulationCode.hasBindingExp(last(entry))
+  end
+  local sides = Tuple{DAE.Exp, DAE.Exp}[]
+  local free = OrderedSet{String}()
+  for ieq in simCode.initialEquations
+    isParametricOnlyEquation(ieq, simCode) || continue
+    local (lhs, rhs) = map(_timeAtBuildStart, equationSides(ieq))
+    local names = OrderedSet{String}()
+    for side in (lhs, rhs)
+      Util.traverseExpBottomUp(side, (e, acc) -> begin
+        Util.isCref(e) && isFreeParam(string(e)) && push!(names, string(e))
+        (e, true, acc)
+      end, 0)
+    end
+    length(names) >= 2 || continue
+    any(side -> _readsTunableParameter(side, simCode), (lhs, rhs)) && return nothing
+    push!(sides, (lhs, rhs)); union!(free, names)
+  end
+  (isempty(sides) || length(sides) != length(free)) && return nothing
+  local names = collect(free)
+  local residuals = Any[]
+  for (lhs, rhs) in sides
+    local ok = Ref(true)
+    local l = _substituteBoundParameters(lhs, simCode; skipNames = free, shouldEval = ok)
+    local r = _substituteBoundParameters(rhs, simCode; skipNames = free, shouldEval = ok)
+    ok[] || return nothing
+    push!(residuals, :($(expToJuliaExpMTK(l, simCode)) - $(expToJuliaExpMTK(r, simCode))))
+  end
+  local residualFn = try
+    eval(Expr(:->, Expr(:tuple, Symbol.(names)...), Expr(:vect, residuals...)))
+  catch err
+    OMBackend._fallback(err, :coupledParametricInitResidual; expect = Union{UndefVarError, MethodError}, impact = :result)
+    return nothing
+  end
+  local f = x -> Float64.(Base.invokelatest(residualFn, x...))
+  local x = Float64[something(_startNumber(last(ht[n]), simCode), 0.0) for n in names]
+  local n = length(x)
+  local converged = false
+  try
+    for _ in 1:50
+      local fx = f(x)
+      all(isfinite, fx) || break
+      if maximum(abs, fx) <= 1e-10 * max(1.0, maximum(abs, x))
+        converged = true
+        break
+      end
+      local J = Matrix{Float64}(undef, n, n)
+      for k in 1:n
+        local h = max(abs(x[k]) * 1e-7, 1e-9)
+        local xp = copy(x); xp[k] += h
+        local xm = copy(x); xm[k] -= h
+        J[:, k] = (f(xp) .- f(xm)) ./ (2h)
+      end
+      local step = J \ fx
+      all(isfinite, step) || break
+      x .-= step
+    end
+  catch err
+    OMBackend._fallback(err, :coupledParametricInitNewton; expect = Union{UndefVarError, MethodError, LinearAlgebra.SingularException}, impact = :result)
+    return nothing
+  end
+  converged || return nothing
+  for (k, name) in enumerate(names)
+    local (idx, oldSV) = ht[name]
+    ht[name] = (idx, SimulationCode.SIMVAR(oldSV.name, oldSV.index,
+                                           SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(DAE.RCONST(x[k])))), oldSV.attributes))
+  end
+  @debug "[SIMCODE: solveParametricInitialEquations] solved $(n) coupled free parameters" names x
+  return nothing
 end
 
 #= True when every variable reference in `condition` is a DISCRETE simvar, a

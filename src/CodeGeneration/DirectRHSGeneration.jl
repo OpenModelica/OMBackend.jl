@@ -746,6 +746,9 @@ function _collectHardInitializationValues(reducedSystem, finalInitialValues;
   local equationValues = Dict{String, Float64}()
   for eq in initEqs
     startswith(string(eq.lhs), "Differential(") && continue
+    #= A residual `0 ~ f(...)` gives no variable a value (MSL 4 SMPM_ResistiveBraking: two for
+       its free parameters idq_sr, read as two values of a variable named 0.0). =#
+    _literalNumericValue(eq.lhs) === nothing || continue
     local rhsVal = _literalNumericValue(eq.rhs)
     if rhsVal === nothing
       rhsVal = _tryToFloat64(eq.rhs; resolvedParams=resolvedParams)
