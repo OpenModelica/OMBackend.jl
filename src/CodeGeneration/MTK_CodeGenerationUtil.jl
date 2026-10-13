@@ -1413,15 +1413,13 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
           elseif scalarizedResult !== nothing
             scalarizedResult
           elseif length(subExprs) == 1 && first(subExprs) isa Integer
-            #= Check for multi-output Modelica function call: ASUB(CALL(qualified_path, args), [ix]).
-               Array-returning functions are not multi-output tuple calls; they
-               must use normal indexing on the returned array. This matters for
-               Modelica.Math.Random.Generators.Xorshift128plus.initialState,
-               whose return type is Integer[4]. =#
+            #= An element of a Modelica function call's result: ASUB(CALL(qualified_path, args), [ix]),
+               an output of a multi-output function or an element of an array-returning one
+               (Modelica.Math.Random.Generators.Xorshift128plus.initialState, Integer[4]): the
+               result indexed, for numbers. With symbolic arguments (a parameter binding: MSL
+               PlanarLoops_analytic's normalizeWithAssert(n)[2]) an array whose size follows the
+               arguments is one opaque term, so the element is a term of its own. =#
             local _asubCallResult = @match innerExp begin
-              DAE.CALL(path, expLst, DAE.CALL_ATTR(ty=DAE.T_ARRAY(__))) where {_isSimCodeFunctionPath(path, simCode)} => begin
-                nothing
-              end
               DAE.CALL(path, expLst) where {_isSimCodeFunctionPath(path, simCode)} => begin
                 local callFuncName = Symbol(OMBackend.canonicalName(string(path)))
                 local fnQuote = QuoteNode(callFuncName)
