@@ -426,3 +426,80 @@ function _foldExplicitSingleAssignOnePass(simCode::SIM_CODE,
   append!(simCode.eliminatedEquations, elimEqOrder)
   return (simCode, length(foldMap))
 end
+
+"""
+    orientReciprocalEquations(simCode::SIM_CODE) -> SIM_CODE
+
+`x = 1/y`, x and y algebraic unknowns and y in no other equation, as `y = 1/x`: y is the
+variable that equation determines, and now explicitly (omc solves `1/y = x` for y). As
+`x = 1/y` foldExplicitSingleAssign put `1/y` into x's other equations, which then determined
+y nonlinearly, and the initialization's Newton for y diverged from its start (MSL FluxTubes'
+LeakageWithCoefficient: `R_m = 1/G_m`, QuadraticCoreAirgap's residual 7e6).
+"""
+function orientReciprocalEquations(simCode::SIM_CODE)::SIM_CODE
+  (hasSubModels(simCode) || hasMetaModel(simCode)) && return simCode
+  isempty(simCode.residualEquations) && return simCode
+  local ht = simCode.stringToSimVarHT
+  #= y in an if- or when-equation, an initial equation or an eliminated one: not reoriented. =#
+  local excluded = _computeFrozenProtectedNames(simCode)
+  for initEq in simCode.initialEquations, f in (:exp, :lhs, :rhs)
+    hasproperty(initEq, f) && collectCrefNames!(excluded, getproperty(initEq, f))
+  end
+  for eq in simCode.eliminatedEquations
+    collectCrefNames!(excluded, eq.exp)
+  end
+  local uses = Dict{String, Int}()
+  for eq in simCode.residualEquations
+    local names = OrderedSet{String}()
+    collectCrefNames!(names, eq.exp)
+    for n in names
+      uses[n] = get(uses, n, 0) + 1
+    end
+  end
+  local oriented = 0
+  local newResEqs = RESIDUAL_EQUATION[]
+  sizehint!(newResEqs, length(simCode.residualEquations))
+  for eq in simCode.residualEquations
+    local exp = _reciprocalOrientation(eq.exp, ht, uses, excluded)
+    if exp === nothing
+      push!(newResEqs, eq)
+    else
+      push!(newResEqs, typeof(eq)(exp, eq.source, eq.attr))
+      oriented += 1
+    end
+  end
+  oriented == 0 && return simCode
+  @debug "[SIMCODE: $(simCode.name): orientReciprocalEquations] $(oriented) equations as y = 1/x"
+  @assign simCode.residualEquations = newResEqs
+  return simCode
+end
+
+#= `1/y`: the reciprocal of a variable reference; its reference, or nothing. =#
+function _reciprocalOf(e::Exp)::Union{Nothing, Exp}
+  e isa BINARY && e.op === OP_DIV || return nothing
+  (e.exp1 isa RCONST && e.exp1.value == 1.0) || (e.exp1 isa ICONST && e.exp1.value == 1) || return nothing
+  return _simCrefName(e.exp2) === nothing ? nothing : e.exp2
+end
+
+#= `x - 1/y` or `1/y - x` as `y - 1/x` where both are scalar algebraic unknowns without a
+   fixed start, y in this equation only and in no excluded one; nothing otherwise. =#
+function _reciprocalOrientation(exp::Exp, ht, uses::Dict{String, Int}, excluded::OrderedSet{String})::Union{Nothing, Exp}
+  exp isa BINARY && exp.op === OP_SUB || return nothing
+  local yRef = _reciprocalOf(exp.exp2); local xRef = exp.exp1
+  if yRef === nothing
+    yRef = _reciprocalOf(exp.exp1); xRef = exp.exp2
+  end
+  yRef === nothing && return nothing
+  local x = _simCrefName(xRef); local y = _simCrefName(yRef)
+  (x === nothing || y === nothing) && return nothing
+  local (xn, yn) = (x[1], y[1])
+  xn == yn && return nothing
+  for n in (xn, yn)
+    (haskey(ht, n) && !occursin('[', n)) || return nothing
+    local (_, sv) = ht[n]
+    (_isAlgebraicVarKind(sv.varKind) && !_hasFixedStart(sv.attributes)) || return nothing
+  end
+  get(uses, yn, 0) == 1 || return nothing
+  yn in excluded && return nothing
+  return BINARY(yRef, OP_SUB, BINARY(RCONST(1.0), OP_DIV, xRef))
+end

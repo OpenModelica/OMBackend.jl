@@ -433,7 +433,8 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
              where v is an unprotected ALG_VARIABLE uniquely defined by that residual.
              Skips sub-models / metaModel / flatModel, bracketed (scalarized array)
              names and names already in aliasMap; aborts the fold if a folded name
-             survives anywhere. =#
+             survives anywhere. `x = 1/y` with y in no other equation first as `y = 1/x`. =#
+          "orientReciprocalEquations" => SimulationCode.orientReciprocalEquations,
           "foldExplicitSingleAssign" => SimulationCode.foldExplicitSingleAssign,
           #= Second alias elimination: earlier simplifiers (foldExplicitSingleAssign,
              propagateConstants, dropObservationOnlyVariables) collapse n-term connector
