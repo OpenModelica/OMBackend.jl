@@ -48,12 +48,14 @@
   - Vector{Vector{Vector{T}}} -> Array{T,3} (3D)
   - etc.
   If already a proper Array or not a nested vector, return as-is.
+  The generated code converts the inner literals first: a vector of matrices is stacked
+  too (MSL Digital's MUX2x1Table[4, 4, 4] was a Vector{Matrix}: a BoundsError at [1, 3, 1]).
 
   This is needed because Modelica arrays may be stored as nested vectors
   but Julia requires proper Array types for multi-dimensional indexing A[i,j,k].
 """
 function ensureArray(x)
-  if x isa Vector && !isempty(x) && first(x) isa Vector
+  if x isa Vector && !isempty(x) && first(x) isa AbstractArray
     #= Recursively convert inner vectors first =#
     converted = [ensureArray(v) for v in x]
     #= Stack along first dimension - builds the array row by row =#
