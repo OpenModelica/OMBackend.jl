@@ -47,11 +47,14 @@ Handle concrete non variable arguments.
 function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{Vector{ModelicaFunction}, Bool}
   local functions = ModelicaFunction[]
   local externalFunctionsUsed = false
+  local inlineNames = Set{String}()
   for f in functionList
     local n = string(f.path)
     for d in f.derivatives
       _registerFunctionDerivative!(n, d, length(f.inputs))
     end
+    #= Inline = true (EARLY_INLINE in the frontend's mapping) =#
+    (f.attributes.inline isa DAE.EARLY_INLINE || f.attributes.inline isa DAE.NORM_INLINE) && push!(inlineNames, n)
     local inputs = map(f.inputs) do input
       OMFrontend.Frontend.convertFunctionParam(input)
     end
@@ -85,7 +88,66 @@ function generateSimCodeFunctions(functionList::List{FRONTEND_FUNCTION})::Tuple{
       push!(functions, EXTERNAL_MODELICA_FUNCTION(n, inputs, outputs, locals, language, libInfo))
     end
   end
+  _inlineDerivatives!(functions, inlineNames)
   return (functions, externalFunctionsUsed)
+end
+
+_inlineDerivativeName(n::String)::String = n * "__inlineDer"
+
+#= A derivative for an `Inline = true` function without a derivative annotation whose body is
+   `y := g(a1, ..., an)`, g with one: g's derivative function at the same arguments, as
+   OpenModelica inlines f before the index reduction (MSL IF97's rho_ph(p, h, phase, region)
+   := rho_props_ph(p, h, waterBaseProp_ph(...)), rho_props_ph's derivative rho_ph_der: Fluid's
+   MeasuringTemperature had no derivative of rho_ph). The synthesized function takes f's inputs
+   and a derivative for each Real one; an argument of g that takes a derivative must be one of
+   f's inputs or a literal. =#
+function _inlineDerivatives!(functions::Vector{ModelicaFunction}, inlineNames::Set{String})::Nothing
+  for f in copy(functions)
+    (f isa MODELICA_FUNCTION && f.name in inlineNames) || continue
+    local existing = get(FUNCTION_DERIVATIVES, f.name, nothing)
+    (existing === nothing || existing[1] == _inlineDerivativeName(f.name)) || continue
+    local synthesized = _inlineDerivative(f, functions)
+    synthesized === nothing && continue
+    push!(functions, synthesized)
+    FUNCTION_DERIVATIVES[f.name] = (synthesized.name, Int[], length(f.inputs))
+  end
+  return nothing
+end
+
+function _inlineDerivative(f::MODELICA_FUNCTION, functions::Vector{ModelicaFunction})::Union{Nothing, MODELICA_FUNCTION}
+  (length(f.outputs) == 1 && only(f.outputs).ty isa DAE.T_REAL && length(f.statements) == 1) || return nothing
+  all(v -> (v.ty isa DAE.T_REAL || v.ty isa DAE.T_INTEGER || v.ty isa DAE.T_BOOL) && isempty(v.dims), f.inputs) || return nothing
+  local stmt = only(f.statements)
+  (stmt isa DAE.STMT_ASSIGN && stmt.exp isa DAE.CALL) || return nothing
+  local call = stmt.exp
+  local gName = string(call.path)
+  local gd = get(FUNCTION_DERIVATIVES, gName, nothing)
+  gd === nothing && return nothing
+  local (gDerName, gExcluded, gN) = gd
+  local gArgs = collect(call.expLst)
+  local gk = findfirst(h -> h.name == gName, functions)
+  (gk === nothing || length(gArgs) != gN || length(functions[gk].inputs) != gN) && return nothing
+  local derOf = Dict{String, DAE.Exp}()
+  local derInputs = DAE.VAR[]
+  for v in f.inputs
+    v.ty isa DAE.T_REAL || continue
+    local cr = DAE.CREF_IDENT(string(v.componentRef) * "__der", DAE.T_REAL_DEFAULT, MetaModelica.nil)
+    push!(derInputs, @set v.componentRef = cr)
+    derOf[string(v.componentRef)] = DAE.CREF(cr, DAE.T_REAL_DEFAULT)
+  end
+  local derArgs = DAE.Exp[]
+  for (i, v) in enumerate(functions[gk].inputs)
+    (v.ty isa DAE.T_REAL && !(i in gExcluded)) || continue
+    local a = gArgs[i]
+    local d = a isa DAE.CREF ? get(derOf, string(a.componentRef), nothing) :
+              (a isa DAE.RCONST || a isa DAE.ICONST) ? DAE.RCONST(0.0) : nothing
+    d === nothing && return nothing
+    push!(derArgs, d)
+  end
+  local out = only(f.outputs)
+  local derCall = DAE.CALL(Absyn.IDENT(gDerName), MetaModelica.list(gArgs..., derArgs...), call.attr)
+  local body = DAE.Statement[DAE.STMT_ASSIGN(out.ty, DAE.CREF(out.componentRef, out.ty), derCall, stmt.source)]
+  return MODELICA_FUNCTION(_inlineDerivativeName(f.name), vcat(f.inputs, derInputs), [out], DAE.VAR[], body)
 end
 
 #= A record-typed local whose type carries its fields' bindings as written in the record
