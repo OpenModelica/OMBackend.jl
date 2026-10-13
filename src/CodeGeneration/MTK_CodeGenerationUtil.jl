@@ -463,6 +463,20 @@ function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
         end
       end
     end
+    #= noEvent(if c then a else b) on Real branches: only the branch c chooses (Symbolics'
+       ifelse evaluates and differentiates that one). The arithmetic lowering of if-expressions,
+       c*a + (1 - c)*b, turned a NaN of the other branch into the result: MSL ContinuousMean's
+       der(mu) = noEvent(if time >= t_0 + t_eps then (u - mu)/(time - t_0) else 0) was NaN at
+       t_0 (the Noise examples: Unstable at the first step). noEvent is how a model guards a
+       branch that is not defined where it is not chosen. =#
+    "noEvent" where (length(expLst) == 1 && listHead(expLst) isa DAE.IFEXP &&
+                     !(listHead(expLst).expCond isa DAE.BCONST) &&
+                     !_ifexpBranchIsNonReal(listHead(expLst).expThen) &&
+                     !_ifexpBranchIsNonReal(listHead(expLst).expElse)) => begin
+      local ie = listHead(expLst)
+      local lower = e -> expToJuliaExpMTK(e, simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derAsSymbol)
+      :(ifelse(OMBackend.CodeGeneration.MTK_CodeGenerationUtil._noEventCondition($(lower(ie.expCond))), $(lower(ie.expThen)), $(lower(ie.expElse))))
+    end
     #= delay(x, T[, Tmax]): x's value T ago, from the model's history of x (delays.jl). =#
     "delay" => begin
       local args = collect(expLst)
@@ -553,6 +567,13 @@ Base.@nospecializeinfer function _ifexpBranchIsNonReal(@nospecialize(e::DAE.Exp)
     _ => false
   end
 end
+
+#= The condition of a noEvent if-expression as ifelse takes it: a Bool, or a symbolic Bool. A
+   Boolean the backend holds as a Real (0 or 1: MSL ElastoGap's `contact`) is true above 1/2. =#
+_noEventCondition(c::Bool)::Bool = c
+_noEventCondition(c::Number)::Bool = !iszero(c)
+_noEventCondition(c::Symbolics.Num) = SymbolicUtils.symtype(Symbolics.unwrap(c)) <: Bool ? c : c > 0.5
+_noEventCondition(c::SymbolicUtils.BasicSymbolic) = SymbolicUtils.symtype(c) <: Bool ? c : c > 0.5
 
 #= SimCode-Exp entry: codegen consumes `SimulationCode.Exp`
    directly. The body below mirrors the `::DAE.Exp` version's dispatch
