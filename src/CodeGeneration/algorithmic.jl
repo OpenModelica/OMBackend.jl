@@ -1584,7 +1584,16 @@ Base.@nospecializeinfer function expToJuliaExpAlg(@nospecialize(exp::DAE.Exp))::
          in a function body does =#
       DAE.PARTEVALFUNCTION(path, expList, ty, origType) => begin
         local fnSym = Symbol(CodeGeneration.OMBackend.canonicalName(string(path)))
-        local closure = _partialApplicationExpr(:(Base.invokelatest), Any[expToJuliaExpAlg(e) for e in expList], ty, origType)
+        #= A bound record argument by its fields, as the callee takes it (flattenRecordInput):
+           MSL 4 Inverse_sh_T's `function f_nonlinear(data = ..., ...)`. =#
+        local bound = Any[]
+        for b in expList
+          #= the frontend boxes a bound argument (toSimExp unboxes it on the equation path) =#
+          local e = b isa DAE.BOX ? b.exp : b
+          push!(bound, (_recordCrefFields(e) !== nothing || _recordValueType(e) !== nothing) ?
+                       Expr(:..., _recordTupleExpr(e)) : expToJuliaExpAlg(e))
+        end
+        local closure = _partialApplicationExpr(:(Base.invokelatest), bound, ty, origType; boundRecordsSplatted = true)
         insert!(closure.args[2].args, 2, fnSym)
         closure
       end
@@ -1751,16 +1760,19 @@ _externalFunction(name::Symbol) =
    them, the bound arguments come in their order: OMFrontend's DAE conversion), calling
    `callee` with every input in place. =#
 function _partialApplicationExpr(callee::Union{Symbol, Expr}, boundArgs::Vector{Any}, @nospecialize(partialType::DAE.Type),
-                                 @nospecialize(fullType::DAE.Type))::Expr
+                                 @nospecialize(fullType::DAE.Type); boundRecordsSplatted::Bool = false)::Expr
   local ty = _functionType(partialType); local origType = _functionType(fullType)
   (ty isa DAE.T_FUNCTION && origType isa DAE.T_FUNCTION) ||
     CodeGeneration.unsupported("a partial application of this type", fullType)
   local free = Set{String}(a.name for a in ty.funcArg)
   local params = Symbol[]; local callArgs = Any[]; local k = 0
   for a in origType.funcArg
-    #= a record input is flattened field by field in the callee (flattenRecordInput) =#
+    #= a record input is flattened field by field in the callee (flattenRecordInput): a bound
+       one comes as its splatted fields (boundRecordsSplatted), a free one would need a
+       parameter per field =#
     local aty = a.ty isa DAE.T_METABOXED ? a.ty.ty : a.ty
-    aty isa DAE.T_COMPLEX && CodeGeneration.unsupported("a partial application of a function with a record input", a.name)
+    aty isa DAE.T_COMPLEX && (a.name in free || !boundRecordsSplatted) &&
+      CodeGeneration.unsupported("a partial application of a function with a record input", a.name)
     if a.name in free
       local s = Symbol("#pa#", a.name)
       push!(params, s); push!(callArgs, s)
