@@ -641,7 +641,8 @@ end
 
 function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
                                renamedNames::OrderedSet{String} = OrderedSet{String}())
-  local sub = e -> _substituteBoundParameters(_preAtInitialization(e, simCode), simCode)
+  #= At initialization initial() is true, as in the early pass (_initialIsTrue). =#
+  local sub = e -> _substituteBoundParameters(_preAtInitialization(_initialIsTrue(e), simCode), simCode)
   local lowerAlg = e -> _initialDerivativeReads(_renameAlgIdentifiers(
     _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))),
     renamedNames,
@@ -697,8 +698,8 @@ function _initialWhenOpToJulia(wStmt, simCode::SimulationCode.SIM_CODE,
   unsupported("initial when-statement variant", wStmt)
 end
 
-#= The early pass runs at initialization: initial() is true (a body that reads
-   it, MSL Fluid PumpingSystem: UndefVarError `initial`). =#
+#= Both initialization passes run at initialization: initial() is true (a body that
+   reads it, MSL Fluid PumpingSystem's TriggeredTrapezoid: UndefVarError `initial`). =#
 _initialIsTrue(@nospecialize(e)) = first(Util.traverseExpBottomUp(e, (x, acc) -> begin
     (x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name == "initial") ? (DAE.BCONST(true), acc) : (x, acc)
   end, nothing))
@@ -1019,6 +1020,21 @@ function generateInitialAlgorithmFunction(simCode::SimulationCode.SIM_CODE)::Exp
     if haskey(ht, name)
       sv = ht[name][2]
       if sv.varKind isa SimulationCode.PARAMETER || sv.varKind isa SimulationCode.ARRAY_PARAMETER
+        #= A parameter without a binding (fixed = false, set by the initialization: MSL 4
+           DCPowerSupply's vLim from its initial algorithm) is no module global: its value
+           is the problem's. =#
+        if sv.varKind isa SimulationCode.PARAMETER && !(sv.varKind.bindExp isa SOME)
+          local psym = Symbol(name)
+          push!(fetches, quote
+            local $(psym)
+            try
+              $(psym) = LATEST_PROBLEM.ps[$(QuoteNode(psym))]
+            catch _e
+              OMBackend._fallback(_e, :initAlgGetpValue)
+              push!(_unfetched, $(QuoteNode(psym)))
+            end
+          end)
+        end
         continue
       end
       if sv.varKind isa SimulationCode.DATA_STRUCTURE || sv.varKind isa SimulationCode.STRING
