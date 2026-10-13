@@ -996,14 +996,35 @@ function extractInitialWhenAlgorithms(whenEqs::Vector{BDAE.WHEN_EQUATION})::Tupl
                                       weq.whenEquation.elsewhenPart)
         #= Marked: a self-scheduling time when also runs at the start of a solve. =#
         local attr = BDAE.EQUATION_ATTRIBUTES(false, BDAE.ALSO_INITIAL_EQUATION(), BDAE.defaultEvalStages)
-        push!(kept, _foldVectorTriggers(BDAE.WHEN_EQUATION(weq.size, inner, weq.source, attr)))
+        append!(kept, map(_foldVectorTriggers, _splitTerminalTrigger(BDAE.WHEN_EQUATION(weq.size, inner, weq.source, attr))))
       end
     else
-      push!(kept, _foldVectorTriggers(weq))
+      append!(kept, map(_foldVectorTriggers, _splitTerminalTrigger(weq)))
     end
   end
   foreach(visit, whenEqs)
   return (kept, initialAlgs)
+end
+
+#= `when {c1, ..., terminal()}` as `when {c1, ...}` and `when terminal()` with the same
+   body: a vector trigger fires at any element's rising edge, and a terminal() when runs
+   after the solve (CodeGeneration's createTerminalBodyRunner). The MSL 4 Blocks'
+   ContinuousSignalExtrema `when {u <= x, u >= x, terminal()}` read an undefined
+   `terminal`. A when with elsewhen arms stays as it is. =#
+function _splitTerminalTrigger(weq::BDAE.WHEN_EQUATION)::Vector{BDAE.WHEN_EQUATION}
+  local w = weq.whenEquation
+  (w.condition isa DAE.ARRAY && !(w.elsewhenPart isa SOME)) || return [weq]
+  local isTerminal = e -> e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "terminal"
+  local elements = collect(w.condition.array)
+  local others = filter(!isTerminal, elements)
+  length(others) == length(elements) && return [weq]
+  local terminalWhen = BDAE.WHEN_EQUATION(weq.size, BDAE.WHEN_STMTS(first(filter(isTerminal, elements)), w.whenStmtLst, w.elsewhenPart),
+                                          weq.source, weq.attr)
+  isempty(others) && return [terminalWhen]
+  local cond = length(others) == 1 ? only(others) :
+    DAE.ARRAY(DAE.T_ARRAY(DAE.T_BOOL_DEFAULT, MetaModelica.list(DAE.DIM_INTEGER(length(others)))), w.condition.scalar,
+              MetaModelica.list(others...))
+  return [BDAE.WHEN_EQUATION(weq.size, BDAE.WHEN_STMTS(cond, w.whenStmtLst, w.elsewhenPart), weq.source, weq.attr), terminalWhen]
 end
 
 #= Parse a scalarized cref key like "A[1][2]" into ("A", [1,2]).

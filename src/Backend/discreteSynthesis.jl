@@ -187,11 +187,12 @@ _needsConditionBooleans(@nospecialize(cond))::Bool =
   cond isa DAE.ARRAY ? !all(_isTriggerAtom, cond.array) : _isCompoundWhenCondition(cond)
 
 #= An element of a vector of triggers kept as it is: a Boolean variable, a
-   constant, initial(), sample(), and an expression reading pre(), edge() or
-   change() (the MSL tables' self-scheduling `time >= pre(nextTimeEvent)`). =#
+   constant, initial(), sample(), terminal() (split off into a when of its own,
+   simulationCodeTransformation's _splitTerminalTrigger) and an expression reading
+   pre(), edge() or change() (the MSL tables' self-scheduling `time >= pre(nextTimeEvent)`). =#
 _isTriggerAtom(@nospecialize(e))::Bool =
   e isa DAE.CREF || e isa DAE.BCONST || (e isa DAE.CALL && e.path isa Absyn.IDENT &&
-                                         e.path.name in ("initial", "sample")) ||
+                                         e.path.name in ("initial", "sample", "terminal")) ||
   _callsAnyOf(e, ("pre", "edge", "change"))
 
 #= Whether any arm (the when or an elsewhen) satisfies pred. =#
