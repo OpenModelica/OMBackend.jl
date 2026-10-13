@@ -122,6 +122,12 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
       violated[i] = false
     elseif !all && (atCrossing || integrator.t == τp)
       pending[i] = integrator.t
+    elseif all && a.timeVarying && isnan(τp) && _atAssertBoundary(a, getter, integrator)
+      #= The initialization's state at a boundary a relation touches, past it by rounding
+         (MSL TanksWithEmptyingPipe1: level_start = height = 2, the level computed from the
+         mass 2 + 4e-16, `level <= height` failed, or not, by run): decided at the next check,
+         as a crossing. Further from the boundary it is reported at once. =#
+      pending[i] = integrator.t
     elseif !(a.warning && violated[i])
       local τ = all || !isempty(a.crossings) ? integrator.t : _violationTime(a, getter, integrator)
       report(a, getter, integrator, τ)
@@ -199,6 +205,13 @@ end
 
 _assertValues(a::ModelicaAssert, getter, src) =
   getter === nothing ? NamedTuple() : NamedTuple{keys(a.observed)}(Tuple(getter(src)))
+
+#= Whether a relation of the assert is at its boundary up to rounding: its crossing function
+   within 1e-9 of zero at the integrator's state. =#
+function _atAssertBoundary(a::ModelicaAssert, getter, integrator)::Bool
+  local values = _assertValues(a, getter, integrator)
+  return any(f -> abs(Float64(f(values, (t = integrator.t,)))) <= 1e-9, a.crossings)
+end
 
 #= The solution at τ within the last step, as a value provider for the getters. =#
 _stateAt(integrator, τ) =
