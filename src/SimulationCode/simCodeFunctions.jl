@@ -639,6 +639,24 @@ end
   are expanded into individual field arguments matching the flattened function
   signatures.
 """
+#= `(a, b, ...) = f(...)` as one residual per target, `a - f(...)[1]`, ...: the code generation
+   of the scalarized path has no tuple residuals (`(r_a, y2) - g(time)`, a MethodError; the
+   array path splits them itself). A record output is counted by its fields, as the targets
+   are (expandRecordArgsInExp) and a generated f returns it. Nothing for another shape. =#
+function _splitTupleResidual(@nospecialize(exp::DAE.Exp))::Union{Nothing, Vector{DAE.Exp}}
+  (exp isa DAE.BINARY && exp.operator isa DAE.SUB && exp.exp1 isa DAE.TUPLE && exp.exp2 isa DAE.CALL) || return nothing
+  local call = exp.exp2
+  (!call.attr.isImpure && call.attr.ty isa DAE.T_TUPLE) || return nothing
+  local out = DAE.Exp[]
+  for (k, target) in enumerate(exp.exp1.PR)
+    target isa DAE.CREF || return nothing
+    target.componentRef isa DAE.WILD && continue
+    (target.ty isa DAE.T_ARRAY || target.ty isa DAE.T_COMPLEX) && return nothing
+    push!(out, DAE.BINARY(target, DAE.SUB(target.ty), DAE.TSUB(call, k, target.ty)))
+  end
+  return out
+end
+
 function flattenRecordCallSites(simCode)
   #= Typed-eltype Vector to satisfy `Vector{RESIDUAL_EQUATION}` field under `infer=false`. =#
   local newResEqs = RESIDUAL_EQUATION[]
@@ -647,7 +665,12 @@ function flattenRecordCallSites(simCode)
     if eq isa BDAE.RESIDUAL_EQUATION || eq isa RESIDUAL_EQUATION
       local expDAE = toDAEExp(eq.exp)
       local newExp = expandRecordArgsInExp(expDAE)
-      push!(newResEqs, newExp === expDAE ? eq : typeof(eq)(newExp, eq.source, eq.attr))
+      local split = _splitTupleResidual(newExp)
+      if split === nothing
+        push!(newResEqs, newExp === expDAE ? eq : typeof(eq)(newExp, eq.source, eq.attr))
+      else
+        append!(newResEqs, [typeof(eq)(e, eq.source, eq.attr) for e in split])
+      end
     else
       push!(newResEqs, eq)
     end
@@ -777,6 +800,10 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
               end
             end
           end
+          #= A record literal (a record parameter folded to its value: MSL Spice3's
+             Model(m_dTemp = ...)) is its fields too; passed whole, the function got a
+             NamedTuple where it reads a field. =#
+          DAE.RECORD(_, exps, _, _) => append!(newArgs, DAE.Exp[expandRecordArgsInExp(e) for e in exps])
           _ => begin
             local expandedArg = expandRecordArgsInExp(arg)
             #= Check if the expanded argument has Complex record return type.
@@ -837,6 +864,25 @@ function expandRecordArgsInExp(exp::DAE.Exp)::DAE.Exp
     DAE.ARRAY(ty, scalar, arr) => begin
       local newArr = map(expandRecordArgsInExp, arr)
       DAE.ARRAY(ty, scalar, MetaModelica.list(newArr...))
+    end
+    #= A tuple equation's record element is its fields, as the callee returns them
+       ((D1.cc, D1.m_dCap) = diodeNoBypassCode(...) in MSL Spice3: D1_cc did not resolve). =#
+    DAE.TUPLE(elements) => begin
+      local newEls = DAE.Exp[]
+      local changed = false
+      for el in elements
+        @match el begin
+          DAE.CREF(cr, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => begin
+            local baseName = OMBackend.canonicalName(cr)
+            for field in varLst
+              push!(newEls, buildFieldArgExp(baseName * OMBackend.COMPONENT_SEPARATOR * field.name, field.ty))
+            end
+            changed = true
+          end
+          _ => push!(newEls, el)
+        end
+      end
+      changed ? DAE.TUPLE(MetaModelica.list(newEls...)) : exp
     end
     _ => exp
   end
