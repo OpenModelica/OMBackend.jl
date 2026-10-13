@@ -200,20 +200,23 @@ function computeArrayOutputDims(f::SimulationCode.ModelicaFunction)::Tuple{Varar
   end
 end
 
-#= An Integer input is an Int in the function: read from the integrator (a
-   discrete's value) it arrives as a Float64 (MSL TimeTable's `last`, a table
-   index in getInterpolationCoefficients: "invalid index: 2.0"). A symbolic
-   argument is left as it is. =#
+#= An Integer or enumeration input is an Int in the function, an array of them an Int array:
+   read from the integrator (a discrete's value) it arrives as a Float64 (MSL TimeTable's
+   `last`, a table index in getInterpolationCoefficients: "invalid index: 2.0"; Digital's
+   Logic values indexing its tables in RAM: "invalid index: 1.0"). A symbolic argument is
+   left as it is. =#
 function generateIntegerInputConversions(inputs::Vector)::Vector{Expr}
   local conversions = Expr[]
   for v in inputs
-    (_funcParamIsArray(v) || !(v.ty isa DAE.T_INTEGER)) && continue
+    local elem = _funcParamIsArray(v) ? _funcParamElemType(v) : v.ty
+    (elem isa DAE.T_INTEGER || elem isa DAE.T_ENUMERATION) || continue
     local s = DAE_VAR_ToJulia(v)
     push!(conversions, :($s = OMBackend.CodeGeneration.AlgorithmicCodeGeneration._integerInput($s)))
   end
   return conversions
 end
 _integerInput(x::AbstractFloat) = isinteger(x) ? Int(x) : x
+_integerInput(x::AbstractArray{<:AbstractFloat}) = all(isinteger, x) ? Int.(x) : x
 _integerInput(x) = x
 
 #= Generate ensureArray conversion statements for multi-dimensional array parameters. =#
