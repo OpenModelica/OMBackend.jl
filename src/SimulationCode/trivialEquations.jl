@@ -446,3 +446,89 @@ function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   end
   return simCode
 end
+
+"""
+    simplifySemiLinear(simCode::SIM_CODE) -> SIM_CODE
+
+MLS 3.7.2.5, rule 1: the equations `y = semiLinear(x, sa, s1)`, `y = semiLinear(x, s1, s2)`,
+..., `y = semiLinear(x, sN, sb)` of one `y` and `x` (after alias elimination) become
+`s1 = if x >= 0 then sa else sb`, `s2 = s1`, ..., `sN = sN-1` and `y = semiLinear(x, sa, sb)`.
+At `x = 0` the equations hold for any `s1`; the rule picks the meaningful solution, as
+OpenModelica's simplifysemiLinear does. MSL Media's test models connect a ShortPipe to a
+FixedAmbient so, and their zero flow at the start had no solution for the enthalpy
+between them (Unstable at the first step).
+"""
+function simplifySemiLinear(simCode::SIM_CODE)::SIM_CODE
+  local res = simCode.residualEquations
+  #= "y|x" => the equations y = semiLinear(x, sa, sb): (index, y, x, sa, sb) =#
+  local groups = OrderedDict{String, Vector{Tuple{Int, DAE.Exp, DAE.Exp, DAE.Exp, DAE.Exp}}}()
+  for (i, r) in enumerate(res)
+    local m = _semiLinearEquation(toDAEExp(r.exp))
+    m === nothing && continue
+    push!(get!(groups, string(m[1]) * "|" * string(m[2]), Tuple{Int, DAE.Exp, DAE.Exp, DAE.Exp, DAE.Exp}[]),
+          (i, m...))
+  end
+  local newRes = copy(res)
+  local nChains = 0
+  for (_, eqs) in groups
+    length(eqs) >= 2 || continue
+    local chain = _semiLinearChain(eqs)
+    chain === nothing && continue
+    local (_, y, x, _, _) = first(eqs)
+    local nodes = DAE.Exp[chain[1][4]; [e[5] for e in chain]]
+    local (sa, sb) = (first(nodes), last(nodes))
+    local cond = DAE.RELATION(x, DAE.GREATEREQ(DAE.T_REAL_DEFAULT), DAE.RCONST(0.0), -1, NONE())
+    local sub = (a, b) -> DAE.BINARY(a, DAE.SUB(DAE.T_REAL_DEFAULT), b)
+    local n = length(chain)
+    newRes[chain[1][1]] = RESIDUAL_EQUATION(sub(nodes[2], DAE.IFEXP(cond, sa, sb));
+                                            source = res[chain[1][1]].source, attr = res[chain[1][1]].attr)
+    for k in 2:n-1
+      newRes[chain[k][1]] = RESIDUAL_EQUATION(sub(nodes[k + 1], nodes[k]);
+                                              source = res[chain[k][1]].source, attr = res[chain[k][1]].attr)
+    end
+    local call = DAE.CALL(Absyn.IDENT("semiLinear"), MetaModelica.list(x, sa, sb), DAE.callAttrBuiltinReal)
+    newRes[chain[n][1]] = RESIDUAL_EQUATION(sub(y, call); source = res[chain[n][1]].source, attr = res[chain[n][1]].attr)
+    nChains += 1
+  end
+  nChains == 0 && return simCode
+  @info "[SIMCODE: $(simCode.name): simplifySemiLinear] $(nChains) chain(s) of semiLinear equations rewritten (MLS 3.7.2.5)"
+  @assign simCode.residualEquations = newRes
+  return simCode
+end
+
+#= (y, x, sa, sb) of the residual `y - semiLinear(x, sa, sb)` or `semiLinear(x, sa, sb) - y`
+   with y a variable, else nothing. =#
+Base.@nospecializeinfer function _semiLinearEquation(@nospecialize(exp::DAE.Exp))::Union{Nothing, NTuple{4, DAE.Exp}}
+  exp isa DAE.BINARY && exp.operator isa DAE.SUB || return nothing
+  for (y, c) in ((exp.exp1, exp.exp2), (exp.exp2, exp.exp1))
+    y isa DAE.CREF || continue
+    (c isa DAE.CALL && c.path isa Absyn.IDENT && c.path.name == "semiLinear") || continue
+    local args = collect(c.expLst)
+    length(args) == 3 && return (y, args[1], args[2], args[3])
+  end
+  return nothing
+end
+
+#= The equations of one y and x in chain order, sa -> s1 -> ... -> sb (each one's second
+   slope the next one's first), every intermediate slope a variable, every equation in the
+   chain once; nothing for another shape. =#
+function _semiLinearChain(eqs::Vector{Tuple{Int, DAE.Exp, DAE.Exp, DAE.Exp, DAE.Exp}})
+  local bySa = Dict{String, Int}()
+  for (k, e) in enumerate(eqs)
+    haskey(bySa, string(e[4])) && return nothing
+    bySa[string(e[4])] = k
+  end
+  local sbs = Set{String}(string(e[5]) for e in eqs)
+  local starts = [k for (k, e) in enumerate(eqs) if !(string(e[4]) in sbs)]
+  length(starts) == 1 || return nothing
+  local chain = [eqs[only(starts)]]
+  while length(chain) < length(eqs)
+    local next = get(bySa, string(last(chain)[5]), 0)
+    next == 0 && return nothing
+    last(chain)[5] isa DAE.CREF || return nothing
+    push!(chain, eqs[next])
+  end
+  #= The last slope is sb: no equation goes on from it. =#
+  haskey(bySa, string(last(chain)[5])) && return nothing
+  return chain
+end

@@ -368,6 +368,7 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
           "propagateConstants" => SimulationCode.propagateConstants,
           "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
           "eliminateRHSEquivalentEquations" => SimulationCode.eliminateRHSEquivalentEquations,
+          "simplifySemiLinear" => SimulationCode.simplifySemiLinear,
           "removeRedundantEquations" => SimulationCode.removeRedundantEquations,
           "eliminateConstantParameters" => SimulationCode.eliminateConstantParameters,
           #= After eliminateConstantParameters: `state = param` (param bound to a
@@ -409,6 +410,8 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
           "lowerComplexOperatorRecords" => SimulationCode.lowerComplexOperatorRecords,
           "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
           "eliminateRHSEquivalentEquations" => SimulationCode.eliminateRHSEquivalentEquations,
+          #= MLS 3.7.2.5's rule for chains of semiLinear equations: needs the aliases resolved. =#
+          "simplifySemiLinear" => SimulationCode.simplifySemiLinear,
           "removeRedundantEquations" => SimulationCode.removeRedundantEquations,
           #= Shrinks the parameter list MTK sees before structural_simplify. The pass
              skips VSS / sub-model variants where a parameter could be re-bound
