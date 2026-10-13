@@ -446,8 +446,8 @@ end
    field as that field). A field without one, or of a record type, stays unset, and so
    does an array of records (its fields would be arrays: not lowered yet). =#
 function _recordLocal(v::DAE.VAR, flat::Vector{Symbol})::Vector{Expr}
+  _funcParamIsArray(v) && return _recordArrayLocal(v, flat)
   local decls = Expr[Expr(:local, fs) for fs in flat]
-  _funcParamIsArray(v) && return decls
   @match v.binding begin
     SOME(bindingExp) => begin
       local assign = _recordAssignment(DAE.CREF(v.componentRef, v.ty), bindingExp)
@@ -459,6 +459,48 @@ function _recordLocal(v::DAE.VAR, flat::Vector{Symbol})::Vector{Expr}
     end
   end
   return decls
+end
+
+#= An array of records as a local (MSL ReferenceAir's Ice09 Gibbs function: `MyComplex[3]
+   r_2 = {MyComplex(...), ...}`, `MyComplex o[12]`): each field an array of the local's
+   dimensions (r_2_re, r_2_im), from a binding by the records' fields, else zero-filled
+   for the elements the body assigns. A field of a record or array type, or dimensions
+   not known here, leave it as before: declared only. =#
+function _recordArrayLocal(v::DAE.VAR, flat::Vector{Symbol})::Vector{Expr}
+  local decls = Expr[Expr(:local, fs) for fs in flat]
+  local elemTy = _funcParamElemType(v)
+  elemTy isa DAE.T_COMPLEX || return decls
+  local fieldTys = _recordFieldTypes(elemTy)
+  length(fieldTys) == length(flat) || return decls
+  all(t -> t isa DAE.T_REAL || t isa DAE.T_INTEGER || t isa DAE.T_BOOL, fieldTys) || return decls
+  local dimExprs = map(_daeDimToJulia, collect(_funcParamDims(v)))
+  (isempty(dimExprs) || any(d -> d isa Number && d <= 0, dimExprs)) && return decls
+  local jlTy = t -> t isa DAE.T_INTEGER ? :Int : t isa DAE.T_BOOL ? :Bool : :Float64
+  local elements = @match v.binding begin
+    SOME(DAE.ARRAY(_, _, arr)) => collect(arr)
+    _ => nothing
+  end
+  local byField = elements === nothing ? nothing : _recordArrayBindingFields(elements, length(flat))
+  for (k, fs) in enumerate(flat)
+    push!(decls, byField === nothing ? :($fs = zeros($(jlTy(fieldTys[k])), $(dimExprs...))) :
+                                        :($fs = $(jlTy(fieldTys[k]))[$(byField[k]...)]))
+  end
+  return decls
+end
+
+#= The elements of a one-dimensional array of record literals by field (the k-th entry: field
+   k of each element, lowered); nothing for another binding. =#
+function _recordArrayBindingFields(elements::Vector, nFields::Int)::Union{Nothing, Vector{Vector{Any}}}
+  local out = [Any[] for _ in 1:nFields]
+  for e in elements
+    e isa DAE.RECORD || return nothing
+    local exps = collect(e.exps)
+    length(exps) == nFields || return nothing
+    for k in 1:nFields
+      push!(out[k], expToJuliaExpAlg(exps[k]))
+    end
+  end
+  return out
 end
 
 #= A zero-filled array for an array-typed function variable, its dimensions possibly
@@ -781,9 +823,23 @@ other value of a record is refused.
 """
 function _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp)::Union{Nothing, Expr}
   local lhs = _recordCrefFields(lhsExp)
+  #= An element of an array of records on either side (`r2 := r_2[1]`, `o[1] := f(...)`):
+     field by field, each field array indexed alike. =#
+  local lhsElement = lhs === nothing ? _recordElementFieldExps(lhsExp) : nothing
+  if lhsElement !== nothing
+    local targets = Any[expToJuliaExpAlg(f) for f in lhsElement]
+    local rhsFields = _recordElementFieldExps(rhsExp)
+    local rhsTuple = rhsFields !== nothing ? Expr(:tuple, Any[expToJuliaExpAlg(f) for f in rhsFields]...) :
+                     _recordTupleExpr(rhsExp)
+    return length(targets) == 1 ? Expr(:(=), targets[1], rhsTuple) : Expr(:(=), Expr(:tuple, targets...), rhsTuple)
+  end
   lhs === nothing && return nothing
   local lhsBase = lhs[1]
   local fieldNames = lhs[2]
+  local rhsElement = _recordElementFieldExps(rhsExp)
+  if rhsElement !== nothing && length(rhsElement) == length(fieldNames)
+    return Expr(:block, Expr[:($(_flatFieldSymbol(lhsBase, f)) = $(expToJuliaExpAlg(e))) for (f, e) in zip(fieldNames, rhsElement)]...)
+  end
   local rhsBase = _plainCrefName(rhsExp)
   if rhsBase !== nothing
     return Expr(:block,
@@ -803,11 +859,28 @@ function _recordAssignment(lhsExp::DAE.Exp, rhsExp::DAE.Exp)::Union{Nothing, Exp
   CodeGeneration.unsupported("a record assignment from this expression", rhsExp)
 end
 
+#= The fields of an element of an array of records, `u[k]`, as `u_re[k]`, `u_im[k]` (the
+   flattened field arrays, indexed alike); nothing for another expression. Scalar fields only. =#
+function _recordElementFieldExps(@nospecialize(exp::DAE.Exp))::Union{Nothing, Vector{DAE.Exp}}
+  exp isa DAE.CREF && exp.componentRef isa DAE.CREF_IDENT || return nothing
+  local subs = exp.componentRef.subscriptLst
+  isempty(subs) && return nothing
+  local names = _recordFieldNames(exp.ty)
+  isempty(names) && return nothing
+  local types = _recordFieldTypes(exp.ty)
+  all(t -> !(t isa DAE.T_ARRAY) && isempty(_recordFieldNames(t)), types) || return nothing
+  return DAE.Exp[DAE.CREF(DAE.CREF_IDENT(string(_flatFieldSymbol(exp.componentRef.ident, n)), t, subs), t)
+                 for (n, t) in zip(names, types)]
+end
+
 #= A record value as its field tuple: a record variable's flattened fields (it has no
-   tuple of its own), an if-expression's branches each so, anything else as it lowers. =#
+   tuple of its own), an element of an array of records its fields' elements, an
+   if-expression's branches each so, anything else as it lowers. =#
 function _recordTupleExpr(@nospecialize(exp::DAE.Exp))
   local rec = _recordCrefFields(exp)
   rec === nothing || return Expr(:tuple, [_flatFieldSymbol(rec[1], f) for f in rec[2]]...)
+  local element = _recordElementFieldExps(exp)
+  element === nothing || return Expr(:tuple, Any[expToJuliaExpAlg(f) for f in element]...)
   if exp isa DAE.IFEXP
     return :(if $(expToJuliaExpAlg(exp.expCond)) != 0
                $(_recordTupleExpr(exp.expThen))
@@ -893,6 +966,13 @@ function _algCallArgs(argExps::List; builtin::Bool = false, shared::Vector{Expr}
        the callee's flattened inputs have none for it. Passed as an empty value,
        every later argument was shifted (a MethodError of the wrapper's arity). =#
     (!builtin && _isEmptyRecordValue(arg)) && continue
+    #= An element of a local array of records, `r[k]`: its fields' elements, r_re[k], r_im[k]
+       (the local's fields are arrays: _recordArrayLocal). =#
+    local element = builtin ? nothing : _recordElementFieldExps(arg)
+    if element !== nothing
+      append!(out, Any[expToJuliaExpAlg(f) for f in element])
+      continue
+    end
     local rec = _recordCrefFields(arg)
     local valueTy = rec === nothing && !builtin ? _recordValueType(arg) : nothing
     #= A builtin takes a record whole; a one-field record is returned bare. =#

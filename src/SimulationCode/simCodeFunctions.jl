@@ -158,6 +158,17 @@ end
 """
   Flatten record parameters in a single function.
 """
+#= The (field, type) pairs of a local array of records with scalar fields; nothing for
+   another local. =#
+function _localRecordArrayFields(v::DAE.VAR)::Union{Nothing, Vector{Tuple{String, DAE.Type}}}
+  local elemTy = v.ty isa DAE.T_ARRAY ? _elementType(v.ty) : v.ty
+  (elemTy isa DAE.T_COMPLEX && elemTy.complexClassType isa DAE.ClassInf.RECORD) || return nothing
+  (v.ty isa DAE.T_ARRAY || !isempty(v.dims)) || return nothing
+  local fields = Tuple{String, DAE.Type}[(f.name, f.ty) for f in elemTy.varLst]
+  (isempty(fields) || any(f -> f[2] isa DAE.T_ARRAY || f[2] isa DAE.T_COMPLEX, fields)) && return nothing
+  return fields
+end
+
 function flattenRecordParametersInFunction(func::MODELICA_FUNCTION)::MODELICA_FUNCTION
   local flattenedInputs = DAE.VAR[]
   local flattenedOutputs = DAE.VAR[]
@@ -174,6 +185,15 @@ function flattenRecordParametersInFunction(func::MODELICA_FUNCTION)::MODELICA_FU
   for output in func.outputs
     flattenedVars = flattenRecordVar(output, recordFieldMap; inputNames = inputNames)
     append!(flattenedOutputs, flattenedVars)
+  end
+
+  #= A local array of records too (MSL ReferenceAir's Ice09 Gibbs function: `MyComplex[3]
+     r_2`, `MyComplex o[12]`): its element reads, field reads (o[1].re) and element writes
+     go to the field arrays CodeGeneration's _recordArrayLocal declares. Not a scalar
+     record local: generateLocals and the assignments' codegen take those. =#
+  for l in func.locals
+    local fields = _localRecordArrayFields(l)
+    fields === nothing || (recordFieldMap[string(l.componentRef)] = fields)
   end
 
   #= Transform statements to use flattened names =#
