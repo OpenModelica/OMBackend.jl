@@ -1433,8 +1433,12 @@ function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
                (Modelica.Math.Random.Generators.Xorshift128plus.initialState, Integer[4]): the
                result indexed, for numbers. With symbolic arguments (a parameter binding: MSL
                PlanarLoops_analytic's normalizeWithAssert(n)[2]) an array whose size follows the
-               arguments is one opaque term, so the element is a term of its own. =#
+               arguments is one opaque term, so the element is a term of its own. With literal
+               arguments the indexing stays: the result is numbers, and a parameter binding's
+               call is then evaluated once for all its elements (_parameterBindingExpr). =#
             local _asubCallResult = @match innerExp begin
+              DAE.CALL(path, expLst, DAE.CALL_ATTR(ty = DAE.T_ARRAY(__))) where {_isSimCodeFunctionPath(path, simCode) &&
+                                                                                   all(_isLiteralDAEExp, expLst)} => nothing
               DAE.CALL(path, expLst) where {_isSimCodeFunctionPath(path, simCode)} => begin
                 local callFuncName = Symbol(OMBackend.canonicalName(string(path)))
                 local fnQuote = QuoteNode(callFuncName)
@@ -2332,6 +2336,16 @@ function _conditionScaleExpr(@nospecialize(cond), simCode)
   end
   isempty(terms) && return 1.0
   return _operandScaleExpr(terms)
+end
+
+#= A literal: a constant, its negation, an array of them. =#
+Base.@nospecializeinfer function _isLiteralDAEExp(@nospecialize(e::DAE.Exp))::Bool
+  @match e begin
+    DAE.ICONST(__) || DAE.RCONST(__) || DAE.SCONST(__) || DAE.BCONST(__) || DAE.ENUM_LITERAL(__) => true
+    DAE.UNARY(exp = x) => _isLiteralDAEExp(x)
+    DAE.ARRAY(array = xs) => all(_isLiteralDAEExp, xs)
+    _ => false
+  end
 end
 
 #= `1 + max(|x|, ...)` of lowered operands, an infinite one left out (above). =#
