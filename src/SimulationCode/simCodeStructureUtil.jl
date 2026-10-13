@@ -742,7 +742,22 @@ function _splitTupleEquation(eq::EQUATION, simCode::SIM_CODE)::Union{Vector{Equa
 end
 
 function _lowerIfEquation(eq::INLINE_IF_EQUATION)::Union{Vector{Equation}, Nothing}
-  local branches = vcat(eq.branchesTrue, [eq.branchElse])
+  #= An if-equation nested in a branch first (MSL 4 PowerConverters' SoftStarter:
+     `if start then (if vRef < 1 then mode = Up else mode = On) else ...`). =#
+  local branches = Vector{Equation}[]
+  for b in vcat(eq.branchesTrue, [eq.branchElse])
+    local flat = Equation[]
+    for e in b
+      if e isa INLINE_IF_EQUATION
+        local inner = _lowerIfEquation(e)
+        inner === nothing && return nothing
+        append!(flat, inner)
+      else
+        push!(flat, e)
+      end
+    end
+    push!(branches, flat)
+  end
   local n = length(first(branches))
   (n > 0 && all(b -> length(b) == n && all(e -> e isa EQUATION, b), branches)) || return nothing
   local lhsName = e -> string(toDAEExp(e.lhs))
