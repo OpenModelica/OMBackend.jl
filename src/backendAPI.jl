@@ -383,6 +383,9 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
         return _translationResult(generateDETargetCode(simCode), nameMap, returnNameMap)
       elseif BackendMode == MTK_MODE || BackendMode == IMTK_MODE
         simCode = _simCodeWithFunctions(bDAE, functionList)
+        #= The variables a validation asks for, known to the parameter eliminations
+           (SimulationCode._requestedNames); the filter itself is applied after the passes. =#
+        observedFilter === nothing || (@assign simCode.observedFilter = _observedFilterStrings(observedFilter))
         local nameMap = NameRewriteMap()
         simCode = _runSimCodePasses(simCode, [
           #= Collapse qualified ENUM_LITERAL paths to leaf `Type.Literal` IDENT form. =#
@@ -511,11 +514,7 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
             @assign simCode.aliasMap = kept
           end
         else
-          local filterStrings = if observedFilter isa Vector{Regex}
-            [p.pattern for p in observedFilter]
-          else
-            observedFilter
-          end
+          local filterStrings = _observedFilterStrings(observedFilter)
           @assign simCode.observedFilter = filterStrings
           #= Filter alias map entries to keep only matching patterns =#
           if !isempty(simCode.aliasMap)
@@ -1476,3 +1475,7 @@ function MTK_evaluateAllObserved(sol, obs_eqs, modelName::String)
   end
   return result
 end
+
+#= An observedFilter's patterns as strings. =#
+_observedFilterStrings(f::Vector{Regex})::Vector{String} = String[p.pattern for p in f]
+_observedFilterStrings(f::Vector{String})::Vector{String} = f

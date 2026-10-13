@@ -185,6 +185,20 @@ meaningfully at runtime (no consumer would see the override).
 Skipped for sub-model / metaModel variants because cross-mode
 parameter references are not visible in the standard scan.
 """
+#= The variables the observedFilter asks for (a validation's reference signals): kept by the
+   parameter eliminations, so that a parameter, or a variable bound to parameters, can be read
+   from the solution (MSL readRealParameterModel's J, ShowTransferFunction's const.y). =#
+function _requestedNames(simCode::SIM_CODE)::OrderedSet{String}
+  local names = OrderedSet{String}()
+  local patterns = simCode.observedFilter
+  (patterns === nothing || isempty(patterns)) && return names
+  local regexes = Regex[Regex(p) for p in patterns]
+  for n in keys(simCode.stringToSimVarHT)
+    any(r -> occursin(r, n), regexes) && push!(names, n)
+  end
+  return names
+end
+
 function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
   if hasSubModels(simCode) || hasMetaModel(simCode)
     return simCode
@@ -218,6 +232,7 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
     push!(referenced, entry.eliminatedName)
   end
   _collectAttributeCrefs!(referenced, ht)
+  union!(referenced, _requestedNames(simCode))
   #= Walk every statement body inside `simCode.functions` (Modelica user
      functions) and collect referenced crefs. Without this, a parameter
      consumed only from a function body looks dead to the scan and gets
@@ -351,6 +366,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     _collectWhenConditionCrefs!(protectedNames, whenEq.whenEquation)
   end
   _collectInitialEquationCrefs!(protectedNames, simCode.initialEquations)
+  union!(protectedNames, _requestedNames(simCode))
   #= IFEXP conditions inside residual equations and parameter bindings. =#
   for eq in simCode.residualEquations
     _collectIfexpConditionCrefs!(protectedNames, eq.exp)
