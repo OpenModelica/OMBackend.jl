@@ -397,170 +397,8 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
         _checkSimCodeBeforeCodegen(simCode, checkSimCode)
         return _translationResult(generateDETargetCode(simCode), nameMap, returnNameMap)
       elseif BackendMode == MTK_MODE || BackendMode == IMTK_MODE
-        simCode = _simCodeWithFunctions(bDAE, functionList)
-        #= The variables a validation asks for, known to the parameter eliminations
-           (SimulationCode._requestedNames); the filter itself is applied after the passes. =#
-        observedFilter === nothing || (@assign simCode.observedFilter = _observedFilterStrings(observedFilter))
         local nameMap = NameRewriteMap()
-        simCode = _runSimCodePasses(simCode, [
-          #= Collapse qualified ENUM_LITERAL paths to leaf `Type.Literal` IDENT form. =#
-          "simplifyEnumLiteralPaths" => SimulationCode.simplifyEnumLiteralPaths,
-          #= Flatten record arguments in equation call sites to match the flattened
-             function signatures (_simCodeWithFunctions). =#
-          "flattenRecordCallSites" => SimulationCode.flattenRecordCallSites,
-          #= Canonicalize every generated name once SimCode has its final record-call shape. =#
-          "canonicalizeCrefNames" => sc -> SimulationCode.canonicalizeCrefNames(sc; nameMap = nameMap),
-          #= Resolve constant-condition IFEXPs in parameter bindings =#
-          "resolveIfExpInBindings" => SimulationCode.resolveIfExpInBindings!,
-          #= Prune IFEXP/IF_EQUATION conditions that became compile-time constants. =#
-          "pruneConstantConditions" => SimulationCode.pruneConstantConditions,
-          #= Constant propagation and alias elimination run AFTER record flattening
-             so that all CREF references are in their final form before substitution.
-             Running these earlier caused dangling references when flattenRecordCallSites
-             introduced new CREFs for already-eliminated variables.
-             The BLT-driven parameter-closure fold runs before propagateConstants so that
-             parameter-closure chains (e.g. KinematicPTP's seven algebraic unknowns
-             defined solely by parameter expressions) are parameters before MTK sees
-             them: zero guesses on those unknowns gave NaN/Inf in the Newton init. =#
-          "foldParameterClosure" => SimulationCode.foldParameterClosure,
-          "inlinePreOfConstantParameters" => SimulationCode.inlinePreOfConstantParameters,
-          "propagateConstants" => SimulationCode.propagateConstants,
-          "lowerComplexOperatorRecords" => SimulationCode.lowerComplexOperatorRecords,
-          "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
-          "eliminateRHSEquivalentEquations" => SimulationCode.eliminateRHSEquivalentEquations,
-          #= MLS 3.7.2.5's rule for chains of semiLinear equations: needs the aliases resolved. =#
-          "simplifySemiLinear" => SimulationCode.simplifySemiLinear,
-          "removeRedundantEquations" => SimulationCode.removeRedundantEquations,
-          #= Shrinks the parameter list MTK sees before structural_simplify. The pass
-             skips VSS / sub-model variants where a parameter could be re-bound
-             at runtime. =#
-          "eliminateConstantParameters" => SimulationCode.eliminateConstantParameters,
-          #= Drop protected sink variables and their defining equations; before
-             eliminateDeadParameters, so parameters whose only consumer was a dropped
-             sink are swept too. =#
-          "dropObservationOnlyVariables" => SimulationCode.dropObservationOnlyVariables,
-          "eliminateDeadParameters" => SimulationCode.eliminateDeadParameters,
-          #= Function outputs that are constants for every value of the call's
-             variables (OpenModelica's evalFunc; MSL Spice3's capacitances): before
-             eliminateFrozenStates, so derivatives they multiplied vanish. =#
-          "evaluateConstantFunctionOutputs" => SimulationCode.evaluateConstantFunctionOutputs,
-          #= After eliminateConstantParameters: `state = param` (param bound to a
-             literal) is `state = literal` by then. =#
-          "eliminateFrozenStates" => SimulationCode.eliminateFrozenStates,
-          #= Generalised single-defining-equation tearing: substitutes `0 = v - rhs`
-             where v is an unprotected ALG_VARIABLE uniquely defined by that residual.
-             Skips sub-models / metaModel / flatModel, bracketed (scalarized array)
-             names and names already in aliasMap; aborts the fold if a folded name
-             survives anywhere. `x = 1/y` with y in no other equation first as `y = 1/x`. =#
-          "orientReciprocalEquations" => SimulationCode.orientReciprocalEquations,
-          "foldExplicitSingleAssign" => SimulationCode.foldExplicitSingleAssign,
-          #= Second alias elimination: earlier simplifiers (foldExplicitSingleAssign,
-             propagateConstants, dropObservationOnlyVariables) collapse n-term connector
-             flow sums into 2-term residuals like `a + b = 0` the first could not see. =#
-          "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
-          #= Chains of semiLinear equations the second alias elimination joined (MSL
-             FluidHeatFlow's massless pump: its port's H_flow became the ambient's). =#
-          "simplifySemiLinear" => SimulationCode.simplifySemiLinear])
-        #= Second RHS-equivalence pass: the alias-elim2 above can collapse two
-           equations of the form `Xi - der(s_i)` onto the same `der(s)`. The
-           pass keys equations by RHS string before its own substitution
-           propagates, so a single iteration can leave equivalent pairs
-           ungrouped when one pair must fold first to expose another's key
-           (e.g. mass1_v → brake_v before ifEq_tmp1 ↔ ifEq_tmp2 becomes
-           visible via the now-shared der(brake_v)). Iterate to fixed point;
-           a no-op call is cheap and returns simCode unchanged. =#
-        let prev = -1
-          for _ in 1:6
-            simCode = _runSimCodePasses(simCode, ["eliminateRHSEquivalentEquations" =>
-                                                    SimulationCode.eliminateRHSEquivalentEquations])
-            local n = length(simCode.residualEquations)
-            n == prev && break
-            prev = n
-          end
-        end
-        simCode = _runSimCodePasses(simCode, [
-          "classifyAdditionalDiscretes" => SimulationCode._classifyAdditionalDiscreteVariables,
-          "pruneConstantConditions" => SimulationCode.pruneConstantConditions])
-        #= Output-only variable elimination runs AFTER const-prop and alias-elim,
-           so that alias chains are resolved and the output-only subgraph is cleanly separated.
-           A fresh matching is computed from the current equation/variable set. =#
-        local elimOpts = if eliminateNonDynamic === true
-          SimulationCode.EliminationOptions()
-        elseif eliminateNonDynamic isa SimulationCode.EliminationOptions
-          eliminateNonDynamic
-        else
-          nothing
-        end
-        if elimOpts !== nothing
-          simCode = _runSimCodePasses(simCode, ["eliminateNonDynamic" =>
-                                                  sc -> SimulationCode.eliminateOutputOnlyVariables(sc, elimOpts)])
-        end
-        #= Observed filter: controls which alias-eliminated variables become observed equations.
-           Default (nothing): skip ALL alias observed equations for fast compilation.
-           With filter patterns: keep only matching aliases as observed. =#
-        local observedBefore = SimulationCode.simCodeMetrics(simCode)
-        local observedT0 = time()
-        if observedFilter === nothing
-          #= Default: drop alias-map entries whose eliminated name is an
-             internal/auto-generated cref (scalarized array indices like
-             `R_T[1][2]`, frame-internal `frame_a_t[3]`, etc.) but KEEP
-             entries whose eliminated name is a user-visible Modelica
-             identifier. Without this, state-state aliases produced by
-             OMBackend's alias-elim passes (e.g. `rev_phi ~ damper_phi_rel`
-             from the Revolute joint flange constraint) get silently
-             dropped before codegen, so `sol(t; idxs = lookup[\"rev_phi\"])`
-             raises KeyError in tests that query the eliminated name.
-             A "user-visible" name is heuristic: no `[` (no scalarized array
-             subscript). The bracket guard catches the vast majority of MultiBody internals (Engine1a's
-             876 aliases collapse to a small handful) while preserving the
-             named Modelica vars that user code can reasonably query. =#
-          if !isempty(simCode.aliasMap)
-            local originalCount = length(simCode.aliasMap)
-            local kept = filter(simCode.aliasMap) do entry
-              #= Drop dangling aliases whose representative has itself been
-                 eliminated from the SimVar HT (e.g. FrozenStateConstraint:
-                 `a → F` survives in aliasMap after `F` is removed by
-                 eliminateFrozenStates; emitting `a ~ F` then raises
-                 UndefVarError at the eval that binds alias names). =#
-              _isUserVisibleAliasName(entry.eliminatedName) &&
-                haskey(simCode.stringToSimVarHT, entry.representativeName)
-            end
-            @debug "[SIMCODE: observedFilter] kept $(length(kept)) of $originalCount user-visible alias observed equations (default filter)"
-            @assign simCode.aliasMap = kept
-          end
-        else
-          local filterStrings = _observedFilterStrings(observedFilter)
-          @assign simCode.observedFilter = filterStrings
-          #= Filter alias map entries to keep only matching patterns =#
-          if !isempty(simCode.aliasMap)
-            local originalCount = length(simCode.aliasMap)
-            local patterns = [Regex(p) for p in filterStrings]
-            local filteredMap = filter(simCode.aliasMap) do entry
-              any(p -> occursin(p, entry.eliminatedName), patterns)
-            end
-            @assign simCode.aliasMap = filteredMap
-            @debug "[SIMCODE: observedFilter] kept $(length(filteredMap)) of $originalCount alias observed equations"
-          end
-        end
-        SimulationCode.logSimCodePassMetrics("observedFilter", observedBefore, simCode, time() - observedT0)
-        simCode = SimulationCode.cleanupTrivialResidualEquations(simCode; sourcePass = "observedFilter")
-        #= Forward-propagate initialization values through the causalized equations
-           (time=0 + params + starts -> source/ramp -> dependent flow/pressure),
-           attaching resolved values as start attributes so the init solver starts
-           from a finite, consistent iterate instead of a 0.0 that divides by zero. =#
-        simCode = _runSimCodePasses(simCode, [
-          "propagateInitialValues" => SimulationCode.propagateInitialValues,
-          #= Re-derive SCCs against the residual array MTK will actually see.
-             The SCC stamp written by transformToSimCode indexes into the
-             pre-pipeline residual list and is stale after alias-elim,
-             foldExplicitSingleAssign, output-only elimination, etc. MTK
-             codegen needs accurate cycle info to extract NonlinearSystem
-             sub-blocks per cyclic SCC. =#
-          "recomputeStronglyConnectedComponents" => SimulationCode.recomputeStronglyConnectedComponents])
-        #= Standalone index-overconstraint diagnostic on the final SimCode (gated
-           by OMBACKEND_INDEX_DIAG); inspects the differential-incidence
-           localization without mutating the system. =#
-        simCode = SimulationCode.indexOverconstraintDiagnostic(simCode)
+        simCode = mtkSimCode(bDAE, functionList; eliminateNonDynamic, observedFilter, nameMap)
         _checkSimCodeBeforeCodegen(simCode, checkSimCode)
         local _genCode = if BackendMode == IMTK_MODE
           @BACKEND_PERFLOG "[backendAPI] generateIMTKTargetCode" generateIMTKTargetCode(simCode)
@@ -575,6 +413,185 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
   finally
     WARN_MISSING_START_VALUES[] = previousWarnSetting
   end
+end
+
+"""
+    mtkSimCode(bDAE::BDAE.BACKEND_DAE, functionList; eliminateNonDynamic = nothing,
+               observedFilter = nothing, nameMap = NameRewriteMap()) -> SimulationCode.SIM_CODE
+
+The SimCode the MTK and IMTK paths generate code from: `bDAE` with its Modelica functions through
+the SimCode passes. A translate's, and that of a model recompiled during its simulation
+(Runtime.translateToSimCode: with only four of the passes, a MultiBody model's redundant
+equation stayed and the recompiled system was unbalanced).
+"""
+function mtkSimCode(bDAE::BDAE.BACKEND_DAE, functionList::Union{Nothing, List};
+                    eliminateNonDynamic::Union{Nothing, Bool, SimulationCode.EliminationOptions} = nothing,
+                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
+                    nameMap::NameRewriteMap = NameRewriteMap())::SimulationCode.SIM_CODE
+  local simCode = _simCodeWithFunctions(bDAE, functionList)
+  #= The variables a validation asks for, known to the parameter eliminations
+     (SimulationCode._requestedNames); the filter itself is applied after the passes. =#
+  observedFilter === nothing || (@assign simCode.observedFilter = _observedFilterStrings(observedFilter))
+  simCode = _runSimCodePasses(simCode, [
+    #= Collapse qualified ENUM_LITERAL paths to leaf `Type.Literal` IDENT form. =#
+    "simplifyEnumLiteralPaths" => SimulationCode.simplifyEnumLiteralPaths,
+    #= Flatten record arguments in equation call sites to match the flattened
+       function signatures (_simCodeWithFunctions). =#
+    "flattenRecordCallSites" => SimulationCode.flattenRecordCallSites,
+    #= Canonicalize every generated name once SimCode has its final record-call shape. =#
+    "canonicalizeCrefNames" => sc -> SimulationCode.canonicalizeCrefNames(sc; nameMap = nameMap),
+    #= Resolve constant-condition IFEXPs in parameter bindings =#
+    "resolveIfExpInBindings" => SimulationCode.resolveIfExpInBindings!,
+    #= Prune IFEXP/IF_EQUATION conditions that became compile-time constants. =#
+    "pruneConstantConditions" => SimulationCode.pruneConstantConditions,
+    #= Constant propagation and alias elimination run AFTER record flattening
+       so that all CREF references are in their final form before substitution.
+       Running these earlier caused dangling references when flattenRecordCallSites
+       introduced new CREFs for already-eliminated variables.
+       The BLT-driven parameter-closure fold runs before propagateConstants so that
+       parameter-closure chains (e.g. KinematicPTP's seven algebraic unknowns
+       defined solely by parameter expressions) are parameters before MTK sees
+       them: zero guesses on those unknowns gave NaN/Inf in the Newton init. =#
+    "foldParameterClosure" => SimulationCode.foldParameterClosure,
+    "inlinePreOfConstantParameters" => SimulationCode.inlinePreOfConstantParameters,
+    "propagateConstants" => SimulationCode.propagateConstants,
+    "lowerComplexOperatorRecords" => SimulationCode.lowerComplexOperatorRecords,
+    "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
+    "eliminateRHSEquivalentEquations" => SimulationCode.eliminateRHSEquivalentEquations,
+    #= MLS 3.7.2.5's rule for chains of semiLinear equations: needs the aliases resolved. =#
+    "simplifySemiLinear" => SimulationCode.simplifySemiLinear,
+    "removeRedundantEquations" => SimulationCode.removeRedundantEquations,
+    #= Shrinks the parameter list MTK sees before structural_simplify. The pass
+       skips VSS / sub-model variants where a parameter could be re-bound
+       at runtime. =#
+    "eliminateConstantParameters" => SimulationCode.eliminateConstantParameters,
+    #= Drop protected sink variables and their defining equations; before
+       eliminateDeadParameters, so parameters whose only consumer was a dropped
+       sink are swept too. =#
+    "dropObservationOnlyVariables" => SimulationCode.dropObservationOnlyVariables,
+    "eliminateDeadParameters" => SimulationCode.eliminateDeadParameters,
+    #= Function outputs that are constants for every value of the call's
+       variables (OpenModelica's evalFunc; MSL Spice3's capacitances): before
+       eliminateFrozenStates, so derivatives they multiplied vanish. =#
+    "evaluateConstantFunctionOutputs" => SimulationCode.evaluateConstantFunctionOutputs,
+    #= After eliminateConstantParameters: `state = param` (param bound to a
+       literal) is `state = literal` by then. =#
+    "eliminateFrozenStates" => SimulationCode.eliminateFrozenStates,
+    #= Generalised single-defining-equation tearing: substitutes `0 = v - rhs`
+       where v is an unprotected ALG_VARIABLE uniquely defined by that residual.
+       Skips sub-models / metaModel / flatModel, bracketed (scalarized array)
+       names and names already in aliasMap; aborts the fold if a folded name
+       survives anywhere. `x = 1/y` with y in no other equation first as `y = 1/x`. =#
+    "orientReciprocalEquations" => SimulationCode.orientReciprocalEquations,
+    "foldExplicitSingleAssign" => SimulationCode.foldExplicitSingleAssign,
+    #= Second alias elimination: earlier simplifiers (foldExplicitSingleAssign,
+       propagateConstants, dropObservationOnlyVariables) collapse n-term connector
+       flow sums into 2-term residuals like `a + b = 0` the first could not see. =#
+    "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
+    #= Chains of semiLinear equations the second alias elimination joined (MSL
+       FluidHeatFlow's massless pump: its port's H_flow became the ambient's). =#
+    "simplifySemiLinear" => SimulationCode.simplifySemiLinear])
+  #= Second RHS-equivalence pass: the alias-elim2 above can collapse two
+     equations of the form `Xi - der(s_i)` onto the same `der(s)`. The
+     pass keys equations by RHS string before its own substitution
+     propagates, so a single iteration can leave equivalent pairs
+     ungrouped when one pair must fold first to expose another's key
+     (e.g. mass1_v → brake_v before ifEq_tmp1 ↔ ifEq_tmp2 becomes
+     visible via the now-shared der(brake_v)). Iterate to fixed point;
+     a no-op call is cheap and returns simCode unchanged. =#
+  let prev = -1
+    for _ in 1:6
+      simCode = _runSimCodePasses(simCode, ["eliminateRHSEquivalentEquations" =>
+                                              SimulationCode.eliminateRHSEquivalentEquations])
+      local n = length(simCode.residualEquations)
+      n == prev && break
+      prev = n
+    end
+  end
+  simCode = _runSimCodePasses(simCode, [
+    "classifyAdditionalDiscretes" => SimulationCode._classifyAdditionalDiscreteVariables,
+    "pruneConstantConditions" => SimulationCode.pruneConstantConditions])
+  #= Output-only variable elimination runs AFTER const-prop and alias-elim,
+     so that alias chains are resolved and the output-only subgraph is cleanly separated.
+     A fresh matching is computed from the current equation/variable set. =#
+  local elimOpts = if eliminateNonDynamic === true
+    SimulationCode.EliminationOptions()
+  elseif eliminateNonDynamic isa SimulationCode.EliminationOptions
+    eliminateNonDynamic
+  else
+    nothing
+  end
+  if elimOpts !== nothing
+    simCode = _runSimCodePasses(simCode, ["eliminateNonDynamic" =>
+                                            sc -> SimulationCode.eliminateOutputOnlyVariables(sc, elimOpts)])
+  end
+  #= Observed filter: controls which alias-eliminated variables become observed equations.
+     Default (nothing): skip ALL alias observed equations for fast compilation.
+     With filter patterns: keep only matching aliases as observed. =#
+  local observedBefore = SimulationCode.simCodeMetrics(simCode)
+  local observedT0 = time()
+  if observedFilter === nothing
+    #= Default: drop alias-map entries whose eliminated name is an
+       internal/auto-generated cref (scalarized array indices like
+       `R_T[1][2]`, frame-internal `frame_a_t[3]`, etc.) but KEEP
+       entries whose eliminated name is a user-visible Modelica
+       identifier. Without this, state-state aliases produced by
+       OMBackend's alias-elim passes (e.g. `rev_phi ~ damper_phi_rel`
+       from the Revolute joint flange constraint) get silently
+       dropped before codegen, so `sol(t; idxs = lookup[\"rev_phi\"])`
+       raises KeyError in tests that query the eliminated name.
+       A "user-visible" name is heuristic: no `[` (no scalarized array
+       subscript). The bracket guard catches the vast majority of MultiBody internals (Engine1a's
+       876 aliases collapse to a small handful) while preserving the
+       named Modelica vars that user code can reasonably query. =#
+    if !isempty(simCode.aliasMap)
+      local originalCount = length(simCode.aliasMap)
+      local kept = filter(simCode.aliasMap) do entry
+        #= Drop dangling aliases whose representative has itself been
+           eliminated from the SimVar HT (e.g. FrozenStateConstraint:
+           `a → F` survives in aliasMap after `F` is removed by
+           eliminateFrozenStates; emitting `a ~ F` then raises
+           UndefVarError at the eval that binds alias names). =#
+        _isUserVisibleAliasName(entry.eliminatedName) &&
+          haskey(simCode.stringToSimVarHT, entry.representativeName)
+      end
+      @debug "[SIMCODE: observedFilter] kept $(length(kept)) of $originalCount user-visible alias observed equations (default filter)"
+      @assign simCode.aliasMap = kept
+    end
+  else
+    local filterStrings = _observedFilterStrings(observedFilter)
+    @assign simCode.observedFilter = filterStrings
+    #= Filter alias map entries to keep only matching patterns =#
+    if !isempty(simCode.aliasMap)
+      local originalCount = length(simCode.aliasMap)
+      local patterns = [Regex(p) for p in filterStrings]
+      local filteredMap = filter(simCode.aliasMap) do entry
+        any(p -> occursin(p, entry.eliminatedName), patterns)
+      end
+      @assign simCode.aliasMap = filteredMap
+      @debug "[SIMCODE: observedFilter] kept $(length(filteredMap)) of $originalCount alias observed equations"
+    end
+  end
+  SimulationCode.logSimCodePassMetrics("observedFilter", observedBefore, simCode, time() - observedT0)
+  simCode = SimulationCode.cleanupTrivialResidualEquations(simCode; sourcePass = "observedFilter")
+  #= Forward-propagate initialization values through the causalized equations
+     (time=0 + params + starts -> source/ramp -> dependent flow/pressure),
+     attaching resolved values as start attributes so the init solver starts
+     from a finite, consistent iterate instead of a 0.0 that divides by zero. =#
+  simCode = _runSimCodePasses(simCode, [
+    "propagateInitialValues" => SimulationCode.propagateInitialValues,
+    #= Re-derive SCCs against the residual array MTK will actually see.
+       The SCC stamp written by transformToSimCode indexes into the
+       pre-pipeline residual list and is stale after alias-elim,
+       foldExplicitSingleAssign, output-only elimination, etc. MTK
+       codegen needs accurate cycle info to extract NonlinearSystem
+       sub-blocks per cyclic SCC. =#
+    "recomputeStronglyConnectedComponents" => SimulationCode.recomputeStronglyConnectedComponents])
+  #= Standalone index-overconstraint diagnostic on the final SimCode (gated
+     by OMBACKEND_INDEX_DIAG); inspects the differential-incidence
+     localization without mutating the system. =#
+  simCode = SimulationCode.indexOverconstraintDiagnostic(simCode)
+  return simCode
 end
 
 #= SimCode of `bDAE` with its Modelica functions, their record parameters
