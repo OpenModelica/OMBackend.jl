@@ -279,10 +279,6 @@ function getUnknowns(integrator)
   return [u for u in ModelingToolkit.unknowns(integrator.f.sys)]
 end
 
-function getUnknownsAsStringsNoPrefix(integrator)
-  local oStrs = String[join(split(string(o.f.name), "_")[2:end], "_") for o in getUnknowns(integrator)]
-end
-
 function _resolveObservedValue(integrator, os)
   local raw = integrator.sol[os]
   if raw isa AbstractArray
@@ -302,26 +298,26 @@ function _resolvableObservedPairs(integrator)
       e isa InterruptException && rethrow()
       nothing
     end
-    if v !== nothing
-      local name = join(split(string(os.f.name), "_")[2:end], "_")
-      push!(pairs, (name, v))
-    end
+    v === nothing || push!(pairs, (string(os.f.name), v))
   end
   return pairs
 end
 
-function createLookupTable(integrator)
-  local unknownNames = getUnknownsAsStringsNoPrefix(integrator)
-  local unknownVals = getValuesForUnknowns(integrator)
-  local d = Dict{String, Float64}(zip(unknownNames, unknownVals))
+"""
+    createLookupTable(integrator) -> Dict{String, Float64}
+
+The values at the change of the integrator's unknowns, and of its observed variables that
+resolve, by name: a recompilation instantiates the same model, whose variables have the same
+names. The first `_` segment of every name was stripped before: different components' variables
+became one (`body_frame_a_f`, `revolute_frame_a_f`), a name without `_` the empty one.
+"""
+function createLookupTable(integrator)::Dict{String, Float64}
+  local values = Dict{String, Float64}(zip((string(u.f.name) for u in getUnknowns(integrator)),
+                                           getValuesForUnknowns(integrator)))
   for (name, v) in _resolvableObservedPairs(integrator)
-    if haskey(d, name)
-      @warn "createLookupTable: observed name `$name` collides with an unknown of the same name after prefix stripping; keeping the unknown's value."
-    else
-      d[name] = v
-    end
+    get!(values, name, v)
   end
-  return d
+  return values
 end
 
 function getValuesForUnknowns(integrator)
@@ -331,24 +327,44 @@ function getValuesForUnknowns(integrator)
 end
 
 """
-updateObservedVariables in the simCode
+    updateInitialConditions!(simCode, integrator) -> Nothing
+
+The start values of the recompiled model's Real variables: their values at the change
+(createLookupTable), by name, with their other attributes, not fixed (the new problem starts
+from the state at the change: createNewU0, NoInit). A variable without one takes the value of
+the old variable of its name without the component (`bouncingBall_y` the pendulum's
+`pendulum_y`, a dynamic transition), fixed, when only one old variable has that name. Matching
+every variable that way, fixed and its attributes replaced, made a MultiBody model's recompiled
+system unbalanced (`body_frame_a_f` took `revolute_frame_a_f`'s value).
 """
-function updateInitialConditions!(simCode, integrator)
-  LT = createLookupTable(integrator)
-  local vNSys = String[join(split(vs, "_")[2:end], "_") for (i, vs) in enumerate(keys(simCode.stringToSimVarHT))]
-  indices = indexin(keys(LT), vNSys)
-  local simCode_LT = simCode.stringToSimVarHT
-  for (i, name) in enumerate(keys(LT))
-    local indexInNewSys = indices[i]
-    if indexInNewSys !== nothing
-      (idx, vToChange) = simCode_LT.vals[indexInNewSys]
-      # `start` kwarg of `DAE.makeRealAttribute` is typed `Option{Float64}`
-      # (= `Union{Nothing, SOME{Float64}}`), not raw `Float64`. Without the
-      # SOME wrapper, the call fails with `TypeError: in keyword argument start, ...`.
-      vToChange = @assign vToChange.attributes = SOME(DAE.makeRealAttribute(;start=SOME(LT[name]), fixed=true))
-      simCode_LT.vals[indexInNewSys] = (idx, vToChange)
-    end
+function updateInitialConditions!(simCode, integrator)::Nothing
+  local values = createLookupTable(integrator)
+  #= the old values by the name without the component; nothing when two old variables share it =#
+  local byLocalName = Dict{String, Union{Nothing, Float64}}()
+  for (name, v) in values
+    local local_ = _withoutComponent(name)
+    isempty(local_) && continue
+    byLocalName[local_] = haskey(byLocalName, local_) ? nothing : v
   end
+  local ht = simCode.stringToSimVarHT
+  for (name, (idx, simVar)) in ht
+    local attributes0 = simVar.attributes
+    (attributes0 === nothing || attributes0.data isa DAE.VAR_ATTR_REAL) || continue
+    local exact = get(values, name, nothing)
+    local attributes = if exact !== nothing
+      OMBackend.SimulationCode._withStartValue(attributes0, exact)
+    else
+      local other = get(byLocalName, _withoutComponent(name), nothing)
+      other === nothing && continue
+      SOME(DAE.makeRealAttribute(; start = SOME(other), fixed = true))
+    end
+    @assign simVar.attributes = attributes
+    ht[name] = (idx, simVar)
+  end
+  return nothing
 end
+
+#= A flattened name without its first component (`pendulum_y` -> `y`; "" for `x`). =#
+_withoutComponent(name::String)::String = join(split(name, "_")[2:end], "_")
 
 end #= module =#
