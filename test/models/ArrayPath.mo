@@ -230,7 +230,7 @@ package ArrayPath
     Real x(start = 0, fixed = true);
   equation
     der(x) = 1;
-    assert(x < 0.5, "x reached " + String(x, 6, 0, true));
+    assert(x < 0.5, "x reached " + String(x, significantDigits = 6, minimumLength = 0, leftJustified = true));
   end AssertMessage;
   model IfDynamic "an if-equation on a relation of the state: y and z switch branch at x = 0.5"
     Real x(start = 0, fixed = true);
