@@ -494,34 +494,25 @@ function clockEquations!(ctx::ClockContext, eqs::Vector{BDAE.Equation}, scans::V
 end
 
 """
-    partitionClocks(bdae::BDAE.BACKEND_DAE) -> BDAE.BACKEND_DAE
+    isKnown(v::BDAE.VAR) -> Bool
 
-`bdae` without its clock variables, clock equations and clocked partitions, which are in its
-`clocked` field (BDAE.ClockedPartitioning); `bdae` itself for a model without clocks. Run on the
-lowered model, before the passes of the continuous system.
+Whether `v` is a parameter, a constant or an external object: not a partition's variable.
 """
-function partitionClocks(bdae::BDAE.BACKEND_DAE)::BDAE.BACKEND_DAE
-  local sys = first(bdae.eqs)
-  local known = v -> v.varKind isa Union{BDAE.PARAM, BDAE.CONST, BDAE.EXTOBJ}
-  local clockVars = Set{String}(string(v.varName) for v in sys.orderedVars if v.varType isa DAE.T_CLOCK)
-  local unknowns = Set{String}(string(v.varName) for v in sys.orderedVars if !known(v) && !(v.varType isa DAE.T_CLOCK))
-  local eqs = BDAE.Equation[eq for eq in sys.orderedEqs]
-  local scans = EquationScan[scanEquation(eq, unknowns, clockVars) for eq in eqs]
-  (isempty(clockVars) && !any(s -> isClocked(s) || !isempty(s.held), scans)) && return bdae
-  length(bdae.eqs) == 1 || OMBackend.unsupported("clocks in a model with structural modes", bdae.name)
-  local parameters = Dict{String, BDAE.VAR}(string(v.varName) => v for v in sys.orderedVars if known(v))
-  for v in vcat(bdae.shared.globalKnownVars, bdae.shared.localKnownVars)
-    parameters[string(v.varName)] = v
-  end
-  local ctx = ClockContext(UnionFind(), Dict{String, DAE.Exp}(), Dict{String, ResolvedClock}(), Set{String}(),
-                           DAE.ClockKind[], parameters, IdDict{DAE.ClockKind, Tuple{DAE.ClockKind, Rational{Int}}}())
-  local isClockEq = clockEquations!(ctx, eqs, scans, clockVars, sys.orderedVars)
-  #= the partitions: variables connected by an equation's own variables; a base partition also
-     by its sub-clock operators =#
+isKnown(v::BDAE.VAR)::Bool = v.varKind isa Union{BDAE.PARAM, BDAE.CONST, BDAE.EXTOBJ}
+
+"""
+    subPartitions(scans::Vector{EquationScan}, isClockEq::Vector{Bool}, unknowns::Set{String}) -> (sub, base, representative)
+
+The partitions: variables connected by an equation's own variables (`sub`); a base partition also
+by its sub-clock operators (`base`). `representative[i]` is a variable of equation i's
+partition, `nothing` for a clock equation or one without variables.
+"""
+function subPartitions(scans::Vector{EquationScan}, isClockEq::Vector{Bool},
+                       unknowns::Set{String})::Tuple{UnionFind, UnionFind, Vector{Union{Nothing, String}}}
   local sub = UnionFind()
   local base = UnionFind()
   foreach(v -> (find!(sub, v); find!(base, v)), unknowns)
-  local representative = Vector{Union{Nothing, String}}(nothing, length(eqs))
+  local representative = Vector{Union{Nothing, String}}(nothing, length(scans))
   for (i, s) in enumerate(scans)
     (isClockEq[i] || isempty(s.own)) && continue
     local own = sort!(collect(s.own))
@@ -534,18 +525,73 @@ function partitionClocks(bdae::BDAE.BACKEND_DAE)::BDAE.BACKEND_DAE
     end
     representative[i] = own[1]
   end
-  #= clocked sub-partitions: an equation sampling, using previous/interval/firstTick or a
-     sub-clock operator; the variables held or sub-sampled =#
+  return (sub, base, representative)
+end
+
+"""
+    clockedSubPartitions(scans::Vector{EquationScan}, representative::Vector{Union{Nothing, String}}, sub::UnionFind) -> Set{String}
+
+The clocked sub-partitions, by their representatives in `sub`: an equation's that samples, uses
+previous, interval or firstTick or a sub-clock operator; the variables held or sub-sampled.
+"""
+function clockedSubPartitions(scans::Vector{EquationScan}, representative::Vector{Union{Nothing, String}},
+                              sub::UnionFind)::Set{String}
   local clocked = Set{String}()
   for (i, s) in enumerate(scans)
-    isClocked(s) && representative[i] === nothing && !isClockEq[i] &&
-      OMBackend.unsupported("a clocked equation without variables", eqs[i])
     isClocked(s) && representative[i] !== nothing && push!(clocked, find!(sub, representative[i]))
     foreach(v -> push!(clocked, find!(sub, v)), s.held)
     for link in s.links, v in link.vars
       push!(clocked, find!(sub, v))
     end
   end
+  return clocked
+end
+
+"""
+    clockedVariables(variables::Vector{BDAE.VAR}, eqs::Vector{BDAE.Equation}) -> Set{String}
+
+The variables of the clocked partitions (MLS 16.7), before the clocks are resolved; empty for a
+model without clocks. For the discrete synthesis: a clocked equation is evaluated at its
+clock's ticks, not at its relations' changes.
+"""
+function clockedVariables(variables::Vector{BDAE.VAR}, eqs::Vector{BDAE.Equation})::Set{String}
+  local clockVars = Set{String}(string(v.varName) for v in variables if v.varType isa DAE.T_CLOCK)
+  local unknowns = Set{String}(string(v.varName) for v in variables if !isKnown(v) && !(v.varType isa DAE.T_CLOCK))
+  local scans = EquationScan[scanEquation(eq, unknowns, clockVars) for eq in eqs]
+  (isempty(clockVars) && !any(s -> isClocked(s) || !isempty(s.held), scans)) && return Set{String}()
+  local (sub, _, representative) = subPartitions(scans, fill(false, length(eqs)), unknowns)
+  local clocked = clockedSubPartitions(scans, representative, sub)
+  return Set{String}(v for v in unknowns if find!(sub, v) in clocked)
+end
+
+"""
+    partitionClocks(bdae::BDAE.BACKEND_DAE) -> BDAE.BACKEND_DAE
+
+`bdae` without its clock variables, clock equations and clocked partitions, which are in its
+`clocked` field (BDAE.ClockedPartitioning); `bdae` itself for a model without clocks. Run on the
+lowered model, before the passes of the continuous system.
+"""
+function partitionClocks(bdae::BDAE.BACKEND_DAE)::BDAE.BACKEND_DAE
+  local sys = first(bdae.eqs)
+  local clockVars = Set{String}(string(v.varName) for v in sys.orderedVars if v.varType isa DAE.T_CLOCK)
+  local unknowns = Set{String}(string(v.varName) for v in sys.orderedVars if !isKnown(v) && !(v.varType isa DAE.T_CLOCK))
+  local eqs = BDAE.Equation[eq for eq in sys.orderedEqs]
+  local scans = EquationScan[scanEquation(eq, unknowns, clockVars) for eq in eqs]
+  (isempty(clockVars) && !any(s -> isClocked(s) || !isempty(s.held), scans)) && return bdae
+  length(bdae.eqs) == 1 || OMBackend.unsupported("clocks in a model with structural modes", bdae.name)
+  local parameters = Dict{String, BDAE.VAR}(string(v.varName) => v for v in sys.orderedVars if isKnown(v))
+  for v in vcat(bdae.shared.globalKnownVars, bdae.shared.localKnownVars)
+    parameters[string(v.varName)] = v
+  end
+  local ctx = ClockContext(UnionFind(), Dict{String, DAE.Exp}(), Dict{String, ResolvedClock}(), Set{String}(),
+                           DAE.ClockKind[], parameters, IdDict{DAE.ClockKind, Tuple{DAE.ClockKind, Rational{Int}}}())
+  local isClockEq = clockEquations!(ctx, eqs, scans, clockVars, sys.orderedVars)
+  local (sub, base, representative) = subPartitions(scans, isClockEq, unknowns)
+  for (i, s) in enumerate(scans)
+    isClocked(s) && representative[i] === nothing && !isClockEq[i] &&
+      OMBackend.unsupported("a clocked equation without variables", eqs[i])
+  end
+  local clocked = clockedSubPartitions(scans, representative, sub)
   isempty(clocked) && return bdae_withoutClocks(bdae, sys, clockVars, isClockEq)
   #= clock inference: the explicit clocks of the partitions' samples, through their sub-clock
      operators to the other partitions of their base partition (MLS 16.7.4) =#

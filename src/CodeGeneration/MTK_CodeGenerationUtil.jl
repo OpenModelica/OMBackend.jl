@@ -548,6 +548,8 @@ Detects:
 - `DAE.CREF` whose `ty` is `DAE.T_STRING` — String parameters / variables
 - `DAE.CALL` whose `attr.ty` is `DAE.T_STRING` — String-returning functions
 - Nested `DAE.IFEXP` — recurse into both branches
+- `DAE.TUPLE` and a `DAE.CALL` of several outputs — a tuple (a guarded multi-output call
+  of a sub-clocked partition: `if active then random(pre(state)) else (pre(y), pre(state))`)
 
 Used to decide whether to emit `ifelse(cond, then, else)` (works for any type)
 or the MTK-friendlier arithmetic form (Real only).
@@ -556,8 +558,9 @@ Base.@nospecializeinfer function _ifexpBranchIsNonReal(@nospecialize(e::DAE.Exp)
   @match e begin
     DAE.SCONST(_) => true
     DAE.CREF(_, ty) => ty isa DAE.T_STRING
-    DAE.CALL(_, _, attrs) => attrs.ty isa DAE.T_STRING
+    DAE.CALL(_, _, attrs) => attrs.ty isa Union{DAE.T_STRING, DAE.T_TUPLE}
     DAE.IFEXP(_, t, el) => _ifexpBranchIsNonReal(t) || _ifexpBranchIsNonReal(el)
+    DAE.TUPLE(_) => true
     _ => false
   end
 end

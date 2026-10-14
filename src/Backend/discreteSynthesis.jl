@@ -710,7 +710,7 @@ function _emitDiscreteCluster!(out::Vector{BDAE.Equation}, cluster::Vector{Strin
 end
 
 """
-    synthesizeWhenEquationsFromDiscreteEquations(equations, paramOrConstNames, startLookup; initialConstants) -> (Vector{BDAE.Equation}, OrderedSet{String})
+    synthesizeWhenEquationsFromDiscreteEquations(equations, paramOrConstNames, startLookup; initialConstants, variables) -> (Vector{BDAE.Equation}, OrderedSet{String})
 
 Replace qualifying discrete-Boolean/Integer equation-section definitions with
 paired INITIAL_WHEN + runtime WHEN equations. Mutually-referencing definitions
@@ -722,12 +722,15 @@ unchanged, so models with no discrete-time defining equations pay only a single
 linear scan.
 `startLookup` gives the start values pre() takes at initialization, and
 `initialConstants` (`_initialConstants`) the values the initial equations fix.
+A definition of a clocked partition's variable (`variables`, ClockPartitioning.clockedVariables)
+stays: it is evaluated at its clock's ticks, not at its relations' changes (MLS 16).
 """
 function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equation},
                                                       paramOrConstNames::OrderedSet{String} = OrderedSet{String}(),
                                                       startLookup::Dict{String, DAE.Exp} = Dict{String, DAE.Exp}();
                                                       initialConstants = (values = OrderedDict{String, DAE.Exp}(),
-                                                                          pre = OrderedDict{String, DAE.Exp}()))
+                                                                          pre = OrderedDict{String, DAE.Exp}()),
+                                                      variables::Vector{BDAE.VAR} = BDAE.VAR[])
   local out = BDAE.Equation[]
   local cands = Any[]
   #= An alias (`a = b` between discrete variables, a connect in either
@@ -757,6 +760,14 @@ function synthesizeWhenEquationsFromDiscreteEquations(equations::Vector{BDAE.Equ
     end
   end
   isempty(cands) && return (equations, OrderedSet{String}())
+  #= A clocked partition's definition stays for ClockedLowering: lifted, MSL Clocked's
+     BooleanSignals.Sample1 sampled `sample(step.y, Clock())` at the step's change only =#
+  local clocked = ClockPartitioning.clockedVariables(variables, equations)
+  if !isempty(clocked)
+    foreach(c -> c.name in clocked && push!(out, c.eq), cands)
+    filter!(c -> !(c.name in clocked), cands)
+    isempty(cands) && return (equations, OrderedSet{String}())
+  end
   #= An LHS with more than one definition is not a discrete definition;
      lifting it through a name-keyed map would silently drop all but one of
      its equations. Keep such equations unchanged. =#

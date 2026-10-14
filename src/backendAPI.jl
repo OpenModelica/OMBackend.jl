@@ -80,6 +80,7 @@ import .Backend.BDAECreate
 import .Backend.BDAEUtil
 import .Backend.Causalize
 import .Backend.ClockPartitioning
+import .Backend.ClockedLowering
 import .SimulationCode
 
 import Base.Meta
@@ -771,6 +772,8 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL; scalarized::Bool = true)
     bDAE = ClockPartitioning.partitionClocks(bDAE)
     @BACKEND_LOGGING isempty(bDAE.clocked.partitions) ||
       debugWrite(logPath("backend/bdae", "bdae_clockedPartitions.log"), ClockPartitioning.describe(bDAE.clocked))
+    #= and as when-clauses of the continuous system, one per base clock =#
+    bDAE = ClockedLowering.lowerClockedPartitions(bDAE)
     @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_initial.log"), BDAEUtil.stringHeading1(bDAE, "initial BDAE"))
     #= Dump the actual DAE.Exp structure to a file for analysis =#
     @BACKEND_LOGGING begin
@@ -865,7 +868,7 @@ The clocked partitions of a flat model and their base clocks (Backend.ClockParti
 inspection: `ClockPartitioning.describe` prints them.
 """
 function clockedPartitioning(fm::OMFrontend.Frontend.FLAT_MODEL)::BDAE.ClockedPartitioning
-  return lower(fm).clocked
+  return ClockPartitioning.partitionClocks(BDAECreate.lower(FrontendUtil.handleBuiltin(fm))).clocked
 end
 
 """

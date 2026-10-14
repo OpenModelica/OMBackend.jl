@@ -49,10 +49,12 @@ import ..isTunableParameter
 include("BDAE.jl")
 include("BackendEquation.jl")
 include("BDAEUtil.jl")
+#= before BDAECreate: its discrete synthesis leaves the clocked equations alone =#
+include("clockPartitioning.jl")
 include("BDAECreate.jl")
 include("Causalize.jl")
-include("clockPartitioning.jl")
+include("clockedLowering.jl")
 
-export BDAE, BDAECreate, BackendEquation, BDAEUtil, Causalize, ClockPartitioning, BackendDAEExp
+export BDAE, BDAECreate, BackendEquation, BDAEUtil, Causalize, ClockPartitioning, ClockedLowering, BackendDAEExp
 
 end

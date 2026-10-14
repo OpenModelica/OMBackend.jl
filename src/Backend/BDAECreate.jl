@@ -46,6 +46,7 @@ using DataStructures: OrderedDict, OrderedSet
 
 import ..BDAE
 import ..BDAEUtil
+import ..ClockPartitioning
 import ..FrontendUtil.Util
 import ..@BACKEND_PERFLOG
 import ...OMBackend
@@ -245,7 +246,8 @@ function createEqSystem(flatModel::OMFrontend.Frontend.FlatModel)
     booleanizeWhenRelations!(equations, variables, varNames, _discParamConst)
     local _discStarts = _discreteStartExpLookup(variables, varNames)
     local (_discEqs, _discLifted) = synthesizeWhenEquationsFromDiscreteEquations(equations, _discParamConst, _discStarts;
-                                                                               initialConstants = _initialConstants(initialEquations, _discParamConst))
+                                                                               initialConstants = _initialConstants(initialEquations, _discParamConst),
+                                                                               variables = variables)
     if !isempty(_discLifted)
       @info "[BDAE: lifter] synthesizeWhenEquationsFromDiscreteEquations lifted $(length(_discLifted)) discrete equation(s)" lifted=collect(_discLifted)
     end
