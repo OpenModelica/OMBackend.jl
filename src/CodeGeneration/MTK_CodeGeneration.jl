@@ -904,6 +904,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
       local _initKw = OMBackend.CodeGeneration.defaultInitializeKwargs(_problemForSolver, kwargs,
                                                                        $(_modelHasTableClusters(simCode)))
       local _tolKw = OMBackend.CodeGeneration.defaultToleranceKwargs(_problemForSolver, kwargs)
+      OMBackend.CodeGeneration._resetRHSError!()
       local _sol = solve(_problemForSolver, _solver; kwargs..., _initKw..., _tolKw...)
       #= If the init-alg-remake'd problem produced InitialFailure (MTK could
          not reconcile init-alg hard-start u0 with the algebraic constraints),
@@ -923,6 +924,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SimulationCode.SIM_CODE, model
         end
         _sol = solve(_fallbackProb, _solver; kwargs..., _initKw..., _tolKw...)
       end
+      OMBackend.CodeGeneration._rethrowRHSError(_sol)
       #= Run `when terminal()` bodies once against the final solution (gated: emitted only if the model has a terminal event). =#
       $(createTerminalBodyRunner(simCode))
       OMBackend.CodeGeneration.dropPreInitializationPoint!(_sol)

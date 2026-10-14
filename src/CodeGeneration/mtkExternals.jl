@@ -161,9 +161,25 @@ function _centralPartial(impl, args::Tuple, idx::Tuple, rel::Float64)::Float64
   local i = last(idx)
   local x = Float64(args[i])
   local h = rel * max(1.0, abs(x))
-  local up = _centralPartial(impl, Base.setindex(args, x + h, i), Base.front(idx), rel)
-  local dn = _centralPartial(impl, Base.setindex(args, x - h, i), Base.front(idx), rel)
-  return (up - dn) / (2h)
+  local up = _sidePartial(impl, Base.setindex(args, x + h, i), Base.front(idx), rel)
+  local dn = _sidePartial(impl, Base.setindex(args, x - h, i), Base.front(idx), rel)
+  (up isa Float64 && dn isa Float64) && return (up - dn) / (2h)
+  #= One side outside the function's domain (its assert or error at x - h: a region check at
+     a boundary the state is at, the MSL StepRejection pattern of IF97's): one-sided from x. =#
+  local mid = _centralPartial(impl, args, Base.front(idx), rel)
+  up isa Float64 && return (up - mid) / h
+  dn isa Float64 && return (mid - dn) / h
+  throw(up)
+end
+
+#= A partial at one side, or the error of a function evaluation there (_RHS_STEP_ERRORS). =#
+function _sidePartial(impl, args::Tuple, idx::Tuple, rel::Float64)
+  try
+    return _centralPartial(impl, args, idx, rel)
+  catch err
+    err isa _RHS_STEP_ERRORS || rethrow()
+    return err
+  end
 end
 
 _partialTerm(p::ModelicaFunctionPartial, args::AbstractVector) = SymbolicUtils.Term{SymbolicUtils.SymReal}(p, collect(Any, args); type = Real)

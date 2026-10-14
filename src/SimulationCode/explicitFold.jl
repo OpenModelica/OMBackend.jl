@@ -483,7 +483,8 @@ end
 
 #= `x - 1/y` or `1/y - x` as `y - 1/x` where both are scalar algebraic unknowns without a
    fixed start, y in this equation only and in no excluded one; nothing otherwise. =#
-function _reciprocalOrientation(exp::Exp, ht, uses::Dict{String, Int}, excluded::OrderedSet{String})::Union{Nothing, Exp}
+function _reciprocalOrientation(exp::Exp, ht::AbstractDict{String, Tuple{Int, SimVar}}, uses::Dict{String, Int},
+                                excluded::OrderedSet{String})::Union{Nothing, Exp}
   exp isa BINARY && exp.op === OP_SUB || return nothing
   local yRef = _reciprocalOf(exp.exp2); local xRef = exp.exp1
   if yRef === nothing
