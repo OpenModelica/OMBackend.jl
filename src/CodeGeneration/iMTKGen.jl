@@ -100,6 +100,9 @@ function forgetBuild(cname::String)
   for cache in (BUILT, BUILT_HASH, REDUCED_SYSTEMS, PRISTINE_P, TUNABLE_SETS)
     delete!(cache, cname)
   end
+  #= and its external objects (tables): kept, every translate of the model left its tables
+     allocated for the rest of the session =#
+  _OMBackend().CodeGeneration.freeExternalObjects!(cname)
   return nothing
 end
 

@@ -67,33 +67,115 @@ Base.show(io::IO, w::ModelicaFunctionWrapper) = print(io, w.name)
    content (`id`), so the type identifies the function. =#
 const _RGF_TAG = getfield(@__MODULE__, Symbol("#_RGF_ModTag"))
 
-#= An external object (a C pointer: a table, an Include code's object) as the model's data
-   structures hold it: hashed by its name. A raw Ptr hashes by its address, new in every
-   build, so the order of the terms reading it, and with it the rounding of the generated
-   code, changed from build to build (Buildings' CHPs ElectricalFollowing: an if-condition at
-   ~0 at the start, 1 build in 5 simulated). A C function gets the pointer
-   (namespaceifyExternalFunction: _externalPtr). =#
+"""
+    ExternalObjectHandle
+
+The C object behind an external object (a table, an Include code's object), owned by the
+build of one model: freed with it by the class's destructor (`freeExternalObjects!`). Every
+`ExternalObjectRef` of the object shares it, so a reference that outlives its build (a
+solution kept across a rebuild of its model) finds the object freed instead of passing freed
+memory to C. Not shared between builds or models: an MSL table keeps the state of the
+simulation reading it (its search index and time events).
+"""
+mutable struct ExternalObjectHandle
+  id::Int
+  ptr::Ptr{Cvoid}
+  destructor::Union{Function, Nothing}
+  model::String
+  alive::Bool
+end
+
+#= The handles' serial numbers: an object's identity in printed code and equality. Its
+   address is not one: a freed table's memory goes to the next table allocated. =#
+const EXTERNAL_OBJECT_COUNT = Threads.Atomic{Int}(0)
+
+#= The external objects of each model's build (canonical model name => its handles), freed
+   when the build goes (forgetBuild: a new translate, a failed build; clearCaches!). Written at
+   the build and when freeing, under the lock. =#
+const EXTERNAL_OBJECTS = Dict{String, Vector{ExternalObjectHandle}}()
+const EXTERNAL_OBJECTS_LOCK = ReentrantLock()
+
+#= An external object as the model's data structures hold it: hashed by its name. A raw Ptr
+   hashes by its address, new in every build, so the order of the terms reading it, and with
+   it the rounding of the generated code, changed from build to build (Buildings' CHPs
+   ElectricalFollowing: an if-condition at ~0 at the start, 1 build in 5 simulated). A C
+   function gets the pointer (namespaceifyExternalFunction: _externalPtr). =#
 struct ExternalObjectRef
   name::Symbol
   ptr::Ptr{Cvoid}
+  handle::ExternalObjectHandle
 end
 Base.hash(r::ExternalObjectRef, h::UInt) = hash(r.name, hash(:ExternalObjectRef, h))
-Base.:(==)(a::ExternalObjectRef, b::ExternalObjectRef) = a.name == b.name && a.ptr == b.ptr
-#= Printed with its pointer: a RuntimeGeneratedFunction's id is the SHA1 of its body's printed
-   leaves, and its cache is global, so two builds whose generated functions differ only in the
-   object (two models with a table `tab`, or a rebuild with other table data) got the first
-   build's function and read its table (OM.jl buildingsReproTests: TableStartOfInitialEquation
-   after TableInit3 read TableInit3's). The name comes first, so a model's terms keep their
-   order. =#
-Base.show(io::IO, r::ExternalObjectRef) = print(io, "ExternalObjectRef(", repr(r.name), ", 0x", string(UInt(r.ptr); base = 16), ")")
+Base.:(==)(a::ExternalObjectRef, b::ExternalObjectRef) = a.name == b.name && a.handle === b.handle
+#= Printed with its serial number: a RuntimeGeneratedFunction's id is the SHA1 of its body's
+   printed leaves, and its cache is global, so two builds whose generated functions differ only
+   in the object (two models with a table `tab`, or a rebuild with other table data) got the
+   first build's function and read its table (OM.jl buildingsReproTests: TableStartOfInitialEquation
+   after TableInit3 read TableInit3's). Not by its address: since objects are freed, a new table
+   can take a freed one's address, and the rebuild got the freed table's function. The name
+   comes first, so a model's terms keep their order. =#
+Base.show(io::IO, r::ExternalObjectRef) = print(io, "ExternalObjectRef(", repr(r.name), ", ", r.handle.id, ")")
 
-#= A data structure's value at module level: an external object as its ExternalObjectRef,
-   anything else (a record) as it is. =#
-_externalObjectRef(name::Symbol, @nospecialize(value)) = value isa Ptr ? ExternalObjectRef(name, value) : value
+"""
+    _externalObjectRef(name::Symbol, value, destructor::Symbol, model::String)
+
+A data structure's value at module level: an external object as its `ExternalObjectRef`,
+registered under `model` with the implementation of its class's `destructor` (nothing when the
+build has none), anything else (a record) as it is.
+"""
+function _externalObjectRef(name::Symbol, @nospecialize(value), destructor::Symbol, model::String)
+  value isa Ptr || return value
+  local handle = ExternalObjectHandle(Threads.atomic_add!(EXTERNAL_OBJECT_COUNT, 1) + 1, value,
+                                      get(MODELICA_FUNCTION_IMPLS, destructor, nothing), model, true)
+  lock(EXTERNAL_OBJECTS_LOCK) do
+    push!(get!(Vector{ExternalObjectHandle}, EXTERNAL_OBJECTS, model), handle)
+  end
+  return ExternalObjectRef(name, value, handle)
+end
 
 #= The argument of a C function: the pointer of an external object (agnostic otherwise). =#
 _externalPtr(@nospecialize(x)) = x
-_externalPtr(r::ExternalObjectRef) = r.ptr
+_externalPtr(r::ExternalObjectRef) = r.handle.alive ? r.ptr : _freedExternalObject(r)
+
+@noinline _freedExternalObject(r::ExternalObjectRef) =
+  error("the external object $(r.name) of $(r.handle.model) was freed with the build it belonged to " *
+        "(the model was translated again or the caches were cleared): simulate the model again")
+
+"""
+    freeExternalObjects!(model::String) -> Int
+
+Frees the external objects of `model`'s build (canonical name) by their destructors and returns
+how many. A reference to one of them then throws instead of reaching C.
+"""
+function freeExternalObjects!(model::String)::Int
+  local handles = lock(EXTERNAL_OBJECTS_LOCK) do
+    pop!(EXTERNAL_OBJECTS, model, ExternalObjectHandle[])
+  end
+  foreach(_freeExternalObject!, handles)
+  return length(handles)
+end
+
+"""
+    freeAllExternalObjects!() -> Int
+
+Frees the external objects of every model's build (clearCaches!) and returns how many.
+"""
+function freeAllExternalObjects!()::Int
+  local models = lock(() -> collect(keys(EXTERNAL_OBJECTS)), EXTERNAL_OBJECTS_LOCK)
+  return sum(freeExternalObjects!, models; init = 0)
+end
+
+function _freeExternalObject!(h::ExternalObjectHandle)::Nothing
+  h.alive || return nothing
+  h.alive = false
+  h.destructor === nothing && return nothing
+  try
+    Base.invokelatest(h.destructor, h.ptr)
+  catch e
+    OMBackend._fallback(e, :externalObjectDestructor, impact = :result)
+  end
+  return nothing
+end
 Base.hash(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{<:Any, _RGF_TAG, _RGF_TAG}, h::UInt) = hash(typeof(f), h)
 Base.hash(w::ModelicaFunctionWrapper, h::UInt) = hash(typeof(w), hash(w.name, h))
 

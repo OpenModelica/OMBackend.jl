@@ -284,7 +284,8 @@ end
 Clear persistent caches. By default all caches are cleared.
 Use keyword arguments to selectively clear individual caches.
 
-- `models`: compiled MTK model ASTs
+- `models`: compiled MTK model ASTs, the cached builds and their external objects (tables),
+  which their destructors free
 - `implementations`: Modelica function implementations
 - `wrappers`: RTG wrapper functions for symbolic dispatch
 - `extractors`: per-element array extractor functions
@@ -294,7 +295,8 @@ function clearCaches!(; models::Bool=true,
                         wrappers::Bool=true,
                         extractors::Bool=true)
   cleared = String[]
-  models          && (empty!(COMPILED_MODELS_MTK);
+  models          && (CodeGeneration.freeAllExternalObjects!();
+                      empty!(COMPILED_MODELS_MTK);
                       empty!(IMTKGen.BUILT); empty!(IMTKGen.BUILT_HASH);
                       empty!(IMTKGen.REDUCED_SYSTEMS); empty!(IMTKGen.PRISTINE_P);
                       empty!(CodeGeneration.DAE_REINIT);
@@ -303,6 +305,19 @@ function clearCaches!(; models::Bool=true,
   wrappers        && (empty!(CodeGeneration.MODELICA_FUNCTION_WRAPPERS); push!(cleared, "wrappers"))
   extractors      && (empty!(CodeGeneration.ELEM_FUNC_CACHE);            push!(cleared, "extractors"))
   return cleared
+end
+
+"""
+    forgetModel(modelName::String) -> Nothing
+
+Drops the cached build of one model and frees its external objects (tables) by their
+destructors. For a long run over many models (a coverage worker): without it every model's
+build and tables stay for the whole session. A solution of the model that reads one of its
+tables afterwards throws; simulate the model again for a new one.
+"""
+function forgetModel(modelName::String)::Nothing
+  IMTKGen.forgetBuild(canonicalName(modelName))
+  return nothing
 end
 
 """

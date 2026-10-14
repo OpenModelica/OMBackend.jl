@@ -551,10 +551,14 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
     if rhs isa Expr
       qualifyModelicaFunctions!(rhs, funcNames)
     end
-    #= an external object by its name in the terms that read it (ExternalObjectRef) =#
+    #= an external object by its name in the terms that read it (ExternalObjectRef), owned by
+       this model's build and freed with it by its class's destructor =#
+    local callee = bindExp isa SimulationCode.CALL ? OMBackend.canonicalName(string(bindExp.path)) : ""
+    local destructor = endswith(callee, "_constructor") ? Symbol(replace(callee, r"_constructor$" => "_destructor")) : Symbol("")
     expr = quote
       $(LineNumberNode(@__LINE__, "$ds eq"))
-      $(Symbol(simVar.name)) = OMBackend.CodeGeneration._externalObjectRef($(QuoteNode(Symbol(simVar.name))), $(rhs))
+      $(Symbol(simVar.name)) = OMBackend.CodeGeneration._externalObjectRef($(QuoteNode(Symbol(simVar.name))), $(rhs),
+                                                                        $(QuoteNode(destructor)), $(OMBackend.canonicalName(simCode.name)))
     end
     push!(dsAssignments, expr)
     #= A record's fields by their flattened names too (`Medium_data[1]_MM`): the equations
