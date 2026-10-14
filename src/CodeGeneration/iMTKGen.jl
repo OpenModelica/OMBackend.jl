@@ -187,6 +187,13 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
     _forgetReinit(cname)
     OMB.CodeGeneration.freeExternalObjects!(cname)
     Core.eval(OMB, modelCode)
+    #= A structural model (overwriteCache) has no build to cache: its module's simulate builds
+       the active mode's problem (no simulateFromBuild). Building it here as well cost a full
+       build, and its problem failed to go into BUILT. =#
+    if !Base.invokelatest(() -> isdefined(getglobal(OMB, Symbol(modelName)), :simulateFromBuild))
+      haskey(OMB.COMPILED_MODELS_MTK, cname) && OMB.modelEvaluated!(cname)
+      return nothing
+    end
     local build = () -> Base.invokelatest() do
       local mod = getfield(OMB, Symbol(modelName))
       local modelFn = getfield(mod, Symbol(string(modelName, "Model")))
