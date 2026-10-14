@@ -58,6 +58,10 @@ end
 Base.showerror(io::IO, e::ModelicaAssertionError) =
   print(io, "ModelicaAssertionError: assertion violated at time ", e.time, ": ", e.message, "\n  condition: ", e.condition)
 
+#= The errors of a Modelica function that reject a step instead of ending the run
+   (_StepRejectingRHS, _sidePartial). =#
+const _RHS_STEP_ERRORS = Union{ErrorException, DomainError, ModelicaAssertionError}
+
 #= One generated assert: the variables it reads (local name => variable name),
    the condition and message as functions of those values and the integrator,
    and a crossing function per relation of the condition (`a - b` for `a < b`,

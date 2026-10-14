@@ -59,7 +59,7 @@ import .MTKDump: dumpBuildDirectRHSInputs, dumpRHSExpression
    crossing). If the solve fails anyway, the last such error is thrown (_rethrowRHSError), so a
    persistent one ends the run as before. =#
 const LAST_RHS_ERROR = Ref{Any}(nothing)
-const _RHS_STEP_ERRORS = Union{ErrorException, DomainError, ModelicaAssertionError}
+#= _RHS_STEP_ERRORS: asserts.jl, after ModelicaAssertionError (included after this file). =#
 struct _StepRejectingRHS{F} <: Function
   f::F
 end
