@@ -212,7 +212,7 @@ _assertValues(a::ModelicaAssert, getter, src) =
 
 #= Whether a relation of the assert is at its boundary up to rounding: its crossing function
    within 1e-9 of zero at the integrator's state. =#
-function _atAssertBoundary(a::ModelicaAssert, getter, integrator)::Bool
+function _atAssertBoundary(a::ModelicaAssert, getter, integrator::ModelingToolkit.SciMLBase.DEIntegrator)::Bool
   local values = _assertValues(a, getter, integrator)
   return any(f -> abs(Float64(f(values, (t = integrator.t,)))) <= 1e-9, a.crossings)
 end

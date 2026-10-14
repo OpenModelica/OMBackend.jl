@@ -76,7 +76,7 @@ function (r::_StepRejectingRHS)(du, u, p, t)
   return nothing
 end
 _resetRHSError!() = (LAST_RHS_ERROR[] = nothing; nothing)
-function _rethrowRHSError(sol)
+function _rethrowRHSError(sol::ModelingToolkit.SciMLBase.AbstractODESolution)
   local err = LAST_RHS_ERROR[]
   LAST_RHS_ERROR[] = nothing
   (err === nothing || ModelingToolkit.SciMLBase.successful_retcode(sol.retcode)) || throw(err)

@@ -179,7 +179,7 @@ function _centralPartial(impl, args::Tuple, idx::Tuple, rel::Float64)::Float64
 end
 
 #= A partial at one side, or the error of a function evaluation there (_RHS_STEP_ERRORS). =#
-function _sidePartial(impl, args::Tuple, idx::Tuple, rel::Float64)
+function _sidePartial(impl, args::Tuple, idx::Tuple, rel::Float64)::Union{Float64, Exception}
   try
     return _centralPartial(impl, args, idx, rel)
   catch err
