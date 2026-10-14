@@ -683,16 +683,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
   #= Append top level variables to the common variables =#
   #= END =#
   code = quote
-    import DAE
-    import DataStructures.OrderedCollections
-    using DataStructures.OrderedCollections: OrderedSet, OrderedDict
-    import SCode
-    import OMBackend
-    import OMBackend.CodeGeneration
-    import Setfield
-    using ModelingToolkit
-    using DifferentialEquations
-    using DiffEqCallbacks
+    $(_modeModuleImports())
     $(_moduleCompilerOptions())
     $(createStringParameterAssignments(simCode)...)
     $(createArrayParameterPrelude(simCode)...)
@@ -780,6 +771,52 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
   end
   local moduleExpr = Expr(:module, true, Symbol(MODEL_NAME), stripBeginBlocks(code))
   return (MODEL_NAME, moduleExpr)
+end
+
+"""
+    _modeModuleImports() -> Expr
+
+The imports of the module of a structural model (ODE_MODE_MTK) and of a recompiled model
+(recompiledModelModule), whose code is ODE_MODE_MTK_MODEL_GENERATION's.
+"""
+function _modeModuleImports()::Expr
+  return quote
+    import DAE
+    import DataStructures.OrderedCollections
+    using DataStructures.OrderedCollections: OrderedSet, OrderedDict
+    import SCode
+    import OMBackend
+    import OMBackend.CodeGeneration
+    import Setfield
+    using ModelingToolkit
+    using DifferentialEquations
+    using DiffEqCallbacks
+  end
+end
+
+"""
+    recompiledModelModule(simCode::SimulationCode.SIM_CODE, owner::String) -> Expr
+
+The module `Recompiled` of a model recompiled during its simulation (Runtime.recompilation), to
+evaluate in the model's module: its functions, the parameters and data structures (tables) its
+code reads at module level, the tables owned by the build of the model `owner` and freed with
+it, and `<name>Model`. Evaluated in the Runtime module the code had none of them (an
+UndefVarError of the first function or table).
+"""
+function recompiledModelModule(simCode::SimulationCode.SIM_CODE, owner::String)::Expr
+  local (functions, _) = AlgorithmicCodeGeneration.generateFunctions(simCode.functions)
+  local model = ODE_MODE_MTK_MODEL_GENERATION(simCode, simCode.name, functions; useDirectRHS = false)
+  local dataStructureNames = String[name for (name, (_, var)) in simCode.stringToSimVarHT
+                                    if var.varKind isa SimulationCode.DATA_STRUCTURE]
+  local code = quote
+    $(_modeModuleImports())
+    $(_moduleCompilerOptions())
+    $(createStringParameterAssignments(simCode)...)
+    $(createArrayParameterPrelude(simCode)...)
+    $(createDataStructureAssignments(dataStructureNames, simCode; owner = owner)...)
+    $(model)
+  end
+  return Expr(:module, true, :Recompiled, stripBeginBlocks(code))
 end
 
 """

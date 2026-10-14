@@ -710,23 +710,26 @@ function recompilation(activeModeName,
     @VSS_DEBUG @info "[RECOMPILATION] step 2/7: SCode mutated" elapsed_s=round(time()-_t_start, digits=2)
     local classToInstantiate = modelicaActiveModeName
     #= 3) Call the frontend + the backend + JIT compile Julia code in memory =#
-    local flatModelica = first(OMFrontend.instantiateSCodeToFM(classToInstantiate, newProgram))
+    local (flatModelica, functionCache) = OMFrontend.instantiateSCodeToFM(classToInstantiate, newProgram)
     @VSS_DEBUG @info "[RECOMPILATION] step 3/7: frontend (instantiateSCodeToFM) done" elapsed_s=round(time()-_t_start, digits=2)
     #= 3.1 Run the backend =#
-    local simulationCode = translateToSimCode(flatModelica, activeModeName)
+    local simulationCode = translateToSimCode(flatModelica, OMFrontend.cacheToFunctionList(functionCache))
     @VSS_DEBUG @info "[RECOMPILATION] step 4/7: backend (translateToSimCode) done" elapsed_s=round(time()-_t_start, digits=2)
     #= 3.2 Adjust variables and special parameters =#
     RuntimeUtil.updateInitialConditions!(simulationCode, integrator)
-    local resultingModel = translateToMTK(simulationCode, activeModeName)
+    #= the model's: the recompiled model's module is in its module, its build owns the tables =#
+    local owner = OMBackend.canonicalName(activeModeName)
+    local resultingModel = translateToMTK(simulationCode, owner)
     @VSS_DEBUG @info "[RECOMPILATION] step 5/7: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
     #= 4.0 Revaulate the model=#
-    local modelName = string(OMBackend.canonicalName(activeModeName), "Model")
-    @eval $(resultingModel)
+    local modelName = string(owner, "Model")
+    local ownerModule = Base.invokelatest(getglobal, OMBackend, Symbol(owner))
+    Core.eval(ownerModule, resultingModel)
     @VSS_DEBUG @info "[RECOMPILATION] step 6/7: module @eval done" modelName elapsed_s=round(time()-_t_start, digits=2)
-    modelCall = quote
-      $(Symbol(modelName))($(tspan))
-    end
-    (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) = @eval $(modelCall)
+    local recompiled = Base.invokelatest(getglobal, ownerModule, :Recompiled)
+    local modelFunction = Base.invokelatest(getglobal, recompiled, Symbol(modelName))
+    (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) =
+      Base.invokelatest(modelFunction, tspan)
     @VSS_DEBUG @info "[RECOMPILATION] step 7/7: modelCall @eval done (submodel ODEProblem built)" elapsed_s=round(time()-_t_start, digits=2)
     # NoInit prevents MTK from re-running init NLS on within-mode reinit
     # events; the recompilation handler already supplies a consistent newU0
@@ -879,15 +882,28 @@ function queryAgent(componentsToChange::Vector{String},
   end
 end
 
-function translateToSimCode(flatModelica, classToInstantiate)
+"""
+    translateToSimCode(flatModelica::OMFrontend.Frontend.FlatModel, functionList::List) -> SIM_CODE
+
+The SimCode of a recompiled model with its functions (`functionList`, the frontend's), their
+record parameters flattened with the call sites, as at a translate.
+"""
+function translateToSimCode(flatModelica::OMFrontend.Frontend.FlatModel, functionList::List)::OMBackend.SimulationCode.SIM_CODE
   local bdae = OMBackend.lower(flatModelica)
-  local simulationCode = OMBackend.generateSimulationCode(bdae; mode = OMBackend.MTK_MODE)
+  local simulationCode = OMBackend._simCodeWithFunctions(bdae, functionList)
   simulationCode = OMBackend.SimulationCode.simplifyEnumLiteralPaths(simulationCode)
+  simulationCode = OMBackend.SimulationCode.flattenRecordCallSites(simulationCode)
   simulationCode = OMBackend.SimulationCode.canonicalizeCrefNames(simulationCode)
   return simulationCode
 end
 
-function translateToMTK(simulationCode, classToInstantiate)
+"""
+    translateToMTK(simulationCode::SIM_CODE, owner::String) -> Expr
+
+The module of a recompiled model (CodeGeneration.recompiledModelModule): its tables are owned by
+the build of the model `owner`.
+"""
+function translateToMTK(simulationCode::OMBackend.SimulationCode.SIM_CODE, owner::String)::Expr
   local checkResult = OMBackend.SimulationCode.SimCodeCheck.check(simulationCode)
   local canonicalErrors = filter(v -> v.rule === :canonical_cref_names && v.severity === :error,
                                  checkResult.violations)
@@ -895,8 +911,7 @@ function translateToMTK(simulationCode, classToInstantiate)
     local details = join([string(v.where, ": ", v.detail) for v in canonicalErrors], "\n")
     error("SimCode still contains non-canonical names before runtime code generation:\n" * details)
   end
-  local newModel = OMBackend.CodeGeneration.ODE_MODE_MTK_MODEL_GENERATION(simulationCode, simulationCode.name, []; useDirectRHS = false)
-  return newModel
+  return OMBackend.CodeGeneration.recompiledModelModule(simulationCode, owner)
 end
 
 """
