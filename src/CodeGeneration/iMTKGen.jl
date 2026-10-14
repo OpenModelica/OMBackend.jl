@@ -183,8 +183,9 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
       end
     end
     #= The previous build's re-initialization goes with it (a failed build
-       forgets it as well, below). =#
+       forgets it as well, below), and the replaced module's external objects. =#
     _forgetReinit(cname)
+    OMB.CodeGeneration.freeExternalObjects!(cname)
     Core.eval(OMB, modelCode)
     local build = () -> Base.invokelatest() do
       local mod = getfield(OMB, Symbol(modelName))
@@ -263,9 +264,12 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
   local OMB = _OMBackend()
   local cname = OMB.canonicalName(modelName)
   #= Structural/sub-model/flat-model iMTK builds skip _buildAndCache and are not
-     eval'd at translate; eval on first simulate if absent (mirrors MTK_MODE). =#
-  if !isdefined(OMB, Symbol(cname))
+     eval'd at translate; eval on the first simulate after the translate (mirrors MTK_MODE):
+     the previous translate's module answered with its code, and its tables were freed. =#
+  if !isdefined(OMB, Symbol(cname)) || OMB.modelWasCompiledAgain(cname)
+    forgetBuild(cname)
     Core.eval(OMB, OMB.getCompiledModel(cname))
+    OMB.modelEvaluated!(cname)
   end
   #= The cached build is initialized at the build's start time: another start time
      builds again, then the same pipeline (its remake only moved tspan, and the

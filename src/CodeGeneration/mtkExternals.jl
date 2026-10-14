@@ -90,8 +90,8 @@ end
 const EXTERNAL_OBJECT_COUNT = Threads.Atomic{Int}(0)
 
 #= The external objects of each model's build (canonical model name => its handles), freed
-   when the build goes (forgetBuild: a new translate, a failed build; clearCaches!). Written at
-   the build and when freeing, under the lock. =#
+   when the build goes (forgetBuild: a new translate, a failed build, the module evaluated
+   again; clearCaches!). Written at the build and when freeing, under the lock. =#
 const EXTERNAL_OBJECTS = Dict{String, Vector{ExternalObjectHandle}}()
 const EXTERNAL_OBJECTS_LOCK = ReentrantLock()
 
@@ -139,7 +139,8 @@ _externalPtr(r::ExternalObjectRef) = r.handle.alive ? r.ptr : _freedExternalObje
 
 @noinline _freedExternalObject(r::ExternalObjectRef) =
   error("the external object $(r.name) of $(r.handle.model) was freed with the build it belonged to " *
-        "(the model was translated again or the caches were cleared): simulate the model again")
+        "(the model was translated or its module evaluated again, or the caches were cleared): " *
+        "simulate the model again")
 
 """
     freeExternalObjects!(model::String) -> Int

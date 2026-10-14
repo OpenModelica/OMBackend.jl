@@ -665,6 +665,21 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     end
   end
   local DATA_STRUCTURE_ASSIGNMENTS = createDataStructureAssignments(_dsVarNames, simCode)
+  #= and the modes' (their variables are theirs, a mode's table was undefined), after the
+     parameters they read: owned by the model's build, freed with it. A top-level one is in
+     every mode too: assigned once. =#
+  local MODE_DATA_STRUCTURE_PRELUDES = Expr[]
+  local _assigned = Set{String}(_dsVarNames)
+  for mode in simCode.subModels
+    local modeNames = String[]
+    for (varName, (_, var)) in mode.stringToSimVarHT
+      var.varKind isa SimulationCode.DATA_STRUCTURE && !(varName in _assigned) && push!(modeNames, varName)
+    end
+    isempty(modeNames) && continue
+    union!(_assigned, modeNames)
+    append!(MODE_DATA_STRUCTURE_PRELUDES, createStringParameterAssignments(mode), createArrayParameterPrelude(mode))
+    append!(DATA_STRUCTURE_ASSIGNMENTS, createDataStructureAssignments(modeNames, mode; owner = simCode.name))
+  end
   #= Append top level variables to the common variables =#
   #= END =#
   code = quote
@@ -681,6 +696,7 @@ function ODE_MODE_MTK(simCode::SimulationCode.SIM_CODE)
     $(_moduleCompilerOptions())
     $(createStringParameterAssignments(simCode)...)
     $(createArrayParameterPrelude(simCode)...)
+    $(MODE_DATA_STRUCTURE_PRELUDES...)
     $(DATA_STRUCTURE_ASSIGNMENTS...)
     $(structuralModes...)
     $(structuralCallbacks...)

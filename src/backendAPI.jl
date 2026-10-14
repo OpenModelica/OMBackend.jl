@@ -586,9 +586,18 @@ function _simCodeWithFunctions(bDAE::BDAE.BACKEND_DAE, functionList)::Simulation
   SimulationCode.splitTupleInitialEquations!(simCode)
   local (functions, externalRuntimeNeeded) = functionList === nothing ? (SimulationCode.ModelicaFunction[], false) :
     generateSimCodeFunctions(functionList)
+  local modelFunctions = SimulationCode.flattenRecordParameters(functions)
   @assign begin
-    simCode.functions = SimulationCode.flattenRecordParameters(functions)
+    simCode.functions = modelFunctions
     simCode.externalRuntime = externalRuntimeNeeded
+  end
+  #= The modes of a structural model call the model's functions: a mode's code qualifies the
+     calls by its own list (an empty one left every call an UndefVarError in the module). =#
+  local modes = simCode.subModels
+  for i in eachindex(modes)
+    local mode = modes[i]
+    @assign mode.functions = modelFunctions
+    modes[i] = mode
   end
   SIMCODE_DUMP_SEQ[] = 0
   @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_00_initial.log"), SimulationCode.dumpSimCode(simCode))
@@ -860,11 +869,14 @@ function generateIMTKTargetCode(simCode::SimulationCode.SIM_CODE)
   LAST_SIM_CODE[] = simCode
   #= IMTKGen.generateIMTKCode evals the (current) module while building, so the
      loaded module is already fresh: record changeDetected = false so a later
-     MTK-mode simulate on this model does not needlessly re-eval the module. =#
+     MTK-mode simulate on this model does not needlessly re-eval the module. A
+     structural model's module is evaluated at its first simulate (simulateIMTK):
+     changed until then. =#
   (modelName::String, modelCode::Expr) = IMTKGen.generateIMTKCode(simCode)
   local codeHash = hash(modelCode)
   @info "[IMTK GEN] generated target code" model=modelName codeHash=codeHash
-  COMPILED_MODELS_MTK[modelName] = (modelCode, false, codeHash)
+  local structural = SimulationCode.hasStructuralTransitions(simCode) || SimulationCode.hasSubModels(simCode)
+  COMPILED_MODELS_MTK[modelName] = (modelCode, structural, codeHash)
   return (modelName, modelCode)
 end
 
@@ -939,6 +951,18 @@ end
 """
 function modelWasCompiledAgain(modelName)
   return COMPILED_MODELS_MTK[modelName][2]
+end
+
+"""
+    modelEvaluated!(modelName::String) -> Nothing
+
+The module of `modelName` was evaluated from its latest code: `modelWasCompiledAgain` is false
+until a translate changes the code.
+"""
+function modelEvaluated!(modelName::String)::Nothing
+  local (code, _, h) = COMPILED_MODELS_MTK[modelName]
+  COMPILED_MODELS_MTK[modelName] = (code, false, h)
+  return nothing
 end
 
 function getCompiledModelDE(modelName)
@@ -1094,6 +1118,8 @@ function simulateModel(modelName::String;
       #= Only re-eval if the module does not exist yet or the code changed =#
       local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) || modelWasCompiledAgain(modelName)
       if needsEval
+        #= the replaced module's build and external objects go with it =#
+        IMTKGen.forgetBuild(modelName)
         @eval $modelCode
       end
       #= Run in latest world age to see the just-eval'd module. Push the
@@ -1183,6 +1209,8 @@ function getMTKProblem(modelName::String;
   local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) ||
     (arrayModel ? modelWasCompiledAgainDE(modelName) : modelWasCompiledAgain(modelName))
   if needsEval
+    #= the replaced module's build and external objects go with it =#
+    arrayModel || IMTKGen.forgetBuild(modelName)
     arrayModel ? _evalModelDE(modelName, modelCode) : @eval($modelCode)
   end
   Base.invokelatest() do

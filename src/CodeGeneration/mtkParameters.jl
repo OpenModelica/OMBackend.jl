@@ -527,7 +527,15 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
   return exprs
 end
 
-function createDataStructureAssignments(dataStructureVariables::Vector{String}, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+"""
+    createDataStructureAssignments(dataStructureVariables, simCode; owner = simCode.name) -> Vector{Expr}
+
+The module-level assignments of the data structures (records, external objects) named in
+`dataStructureVariables`; an external object is registered under the model `owner`, whose build
+frees it (a structural mode's are its model's).
+"""
+function createDataStructureAssignments(dataStructureVariables::Vector{String}, simCode::SimulationCode.SIM_CODE;
+                                        owner::String = simCode.name)::Vector{Expr}
   local dsAssignments::Vector = Expr[]
   local ht = simCode.stringToSimVarHT
   #= Same Modelica-function name set used by rewriteEquations: needed to qualify
@@ -558,7 +566,7 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
     expr = quote
       $(LineNumberNode(@__LINE__, "$ds eq"))
       $(Symbol(simVar.name)) = OMBackend.CodeGeneration._externalObjectRef($(QuoteNode(Symbol(simVar.name))), $(rhs),
-                                                                        $(QuoteNode(destructor)), $(OMBackend.canonicalName(simCode.name)))
+                                                                        $(QuoteNode(destructor)), $(OMBackend.canonicalName(owner)))
     end
     push!(dsAssignments, expr)
     #= A record's fields by their flattened names too (`Medium_data[1]_MM`): the equations
