@@ -706,8 +706,16 @@ function freeParametersDecl(simCode)::Expr
   local assigned = OrderedSet{String}()
   for ieq in simCode.initialEquations
     hasEquationSides(ieq) || continue
-    local lhs = first(equationSides(ieq))
-    lhs isa DAE.CREF && push!(assigned, string(lhs))
+    local (lhs, rhs) = equationSides(ieq)
+    if lhs isa DAE.CREF
+      push!(assigned, string(lhs))
+    else
+      #= The variables of a tuple equation, each equal to the call's output (MSL Filter's
+         `({r[1], r[2]}, _, _, _) = roots.lowPass(cr, ...)`: free, r was 0, a solution of
+         the filter's steady state `0 = r*(x - u)`). =#
+      local targets = MTK_CodeGenerationUtil._tupleEquationTargets(lhs, rhs)
+      targets === nothing || foreach(t -> push!(assigned, string(first(t))), targets)
+    end
   end
   local names = String[]
   #= The ones the initialization assigns (ASSIGNED_PARAMETERS): only these,

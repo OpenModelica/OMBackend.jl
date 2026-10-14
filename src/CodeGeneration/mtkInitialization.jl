@@ -80,6 +80,22 @@ function generateInitialEquationsAsConstraints(initialEqs, simCode::SimulationCo
     end
     local ieqLhsDAE = SimulationCode.toDAEExp(ieq.lhs)
     local ieqRhsDAE = SimulationCode.toDAEExp(ieq.rhs)
+    #= A tuple equation of a call the build did not solve: one constraint per variable of the
+       left side, its output (MSL Filter's `({r[1], r[2]}, _, _, _) = roots.lowPass(cr, ...)`
+       with cr computed by the initialization; dropped, r kept 0 and the filter's states did
+       not move). =#
+    local targets = MTK_CodeGenerationUtil._tupleEquationTargets(ieqLhsDAE, ieqRhsDAE)
+    if targets !== nothing
+      for (target, element, _) in targets
+        try
+          push!(result, :($(expToJuliaExpMTK(target, simCode)) ~ $(_initialEquationRhs(element, simCode))))
+        catch err
+          OMBackend._fallback(err, :initialConstraintTuple; only = UnsupportedLowering, impact = :result)
+          @warn "[CODEGEN: initialConstraints] failed to lower a tuple element; constraint dropped" target err
+        end
+      end
+      continue
+    end
     local lhs = try
       expToJuliaExpMTK(ieqLhsDAE, simCode)
     catch err

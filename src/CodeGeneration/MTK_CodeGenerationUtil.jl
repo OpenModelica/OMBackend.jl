@@ -2913,26 +2913,55 @@ end
 _timeAtBuildStart(@nospecialize(e)) = first(Util.traverseExpBottomUp(e, (x, acc) ->
   (x isa DAE.CREF && x.componentRef isa DAE.CREF_IDENT && x.componentRef.ident == "time" ? DAE.RCONST(0.0) : x, acc), nothing))
 
+"""
+    _tupleEquationTargets(lhs::DAE.Exp, rhs::DAE.Exp) -> Union{Nothing, Vector{Tuple{DAE.Exp, DAE.Exp, DAE.Type}}}
+
+The targets of a tuple equation `(t1, t2, ...) = f(...)` of a pure call: per variable of the
+left side, (its reference, the call's output or output element it equals, that one's type). A
+wildcard has none; an array of references takes the output's elements (MSL
+Blocks.Continuous.Filter: `({r[1], r[2]}, _, _, _) = roots.lowPass(cr, ...)`). `nothing` for
+another left side.
+"""
+function _tupleEquationTargets(lhs::DAE.Exp, rhs::DAE.Exp)::Union{Nothing, Vector{Tuple{DAE.Exp, DAE.Exp, DAE.Type}}}
+  (lhs isa DAE.TUPLE && rhs isa DAE.CALL && !rhs.attr.isImpure && rhs.attr.ty isa DAE.T_TUPLE) || return nothing
+  local targets = collect(lhs.PR)
+  local types = collect(rhs.attr.ty.types)
+  length(types) >= length(targets) || return nothing
+  local out = Tuple{DAE.Exp, DAE.Exp, DAE.Type}[]
+  for (k, t) in enumerate(targets)
+    if t isa DAE.CREF
+      t.componentRef isa DAE.WILD || push!(out, (t, DAE.TSUB(rhs, k, types[k]), types[k]))
+    elseif t isa DAE.ARRAY && types[k] isa DAE.T_ARRAY &&
+           all(e -> e isa DAE.CREF && !(e.componentRef isa DAE.WILD), t.array)
+      for (j, e) in enumerate(t.array)
+        push!(out, (e, DAE.ASUB(DAE.TSUB(rhs, k, types[k]), MetaModelica.list(DAE.INDEX(DAE.ICONST(j)))), types[k].ty))
+      end
+    else
+      return nothing
+    end
+  end
+  return out
+end
+
 #= `(p1, p2, ...) = f(...)`, every free parameter of the equation alone on the left and none in
    the call (Buildings' borehole resistances: `(x, Rgb, Rgg, RCondGro) = internalResistancesOneUTube(...)`,
    in HexInternalElement with states, in its validations without): each p_k bound to the call's
-   k-th output, its value at the build where the call interprets with the parameters' values,
-   else the output's expression (its symbolic term did not fold with a String argument, the
-   instance name). Not an impure f (one call for each output). =#
+   k-th output (or output element: _tupleEquationTargets), its value at the build where the call
+   interprets with the parameters' values, else the output's expression (its symbolic term did
+   not fold with a String argument, the instance name). Not an impure f (one call for each
+   output). =#
 function _bindTupleOfFreeParameters!(lhs::DAE.Exp, rhs::DAE.Exp, freeParams::Vector{String},
                                      simCode::SimulationCode.SimCode)::Bool
-  (lhs isa DAE.TUPLE && rhs isa DAE.CALL && !rhs.attr.isImpure && rhs.attr.ty isa DAE.T_TUPLE) || return false
-  local targets = collect(lhs.PR)
-  local names = String[string(e) for e in targets if e isa DAE.CREF]
-  (length(names) == length(targets) && issetequal(names, freeParams)) || return false
+  local targets = _tupleEquationTargets(lhs, rhs)
+  targets === nothing && return false
+  local binds = Tuple{String, DAE.Exp, DAE.Type}[(string(t), e, ty) for (t, e, ty) in targets]
+  local names = String[first(b) for b in binds]
+  (!isempty(names) && allunique(names) && issetequal(names, freeParams)) || return false
   any(c -> string(c) in names, Util.getAllCrefs(rhs)) && return false
-  local types = collect(rhs.attr.ty.types)
-  length(types) >= length(targets) || return false
   local ht = simCode.stringToSimVarHT
-  for (k, name) in enumerate(names)
+  for (name, element, ty) in binds
     local (idx, sv) = ht[name]
-    local element = DAE.TSUB(rhs, k, types[k])
-    local value = types[k] isa DAE.T_REAL ? SimulationCode.valueAtBuildStart(element, simCode) : nothing
+    local value = ty isa DAE.T_REAL ? SimulationCode.valueAtBuildStart(element, simCode) : nothing
     local binding = SimulationCode.toSimExp(value === nothing ? element : DAE.RCONST(value))
     ht[name] = (idx, SimulationCode.SIMVAR(sv.name, sv.index, SimulationCode.PARAMETER(SOME(binding)), sv.attributes))
   end
