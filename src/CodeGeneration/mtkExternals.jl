@@ -79,7 +79,13 @@ struct ExternalObjectRef
 end
 Base.hash(r::ExternalObjectRef, h::UInt) = hash(r.name, hash(:ExternalObjectRef, h))
 Base.:(==)(a::ExternalObjectRef, b::ExternalObjectRef) = a.name == b.name && a.ptr == b.ptr
-Base.show(io::IO, r::ExternalObjectRef) = print(io, "ExternalObjectRef(", repr(r.name), ")")
+#= Printed with its pointer: a RuntimeGeneratedFunction's id is the SHA1 of its body's printed
+   leaves, and its cache is global, so two builds whose generated functions differ only in the
+   object (two models with a table `tab`, or a rebuild with other table data) got the first
+   build's function and read its table (OM.jl buildingsReproTests: TableStartOfInitialEquation
+   after TableInit3 read TableInit3's). The name comes first, so a model's terms keep their
+   order. =#
+Base.show(io::IO, r::ExternalObjectRef) = print(io, "ExternalObjectRef(", repr(r.name), ", 0x", string(UInt(r.ptr); base = 16), ")")
 
 #= A data structure's value at module level: an external object as its ExternalObjectRef,
    anything else (a record) as it is. =#
