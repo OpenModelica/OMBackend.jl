@@ -2374,6 +2374,46 @@ function _timeMayBeZero(sys::ModelingToolkit.AbstractSystem)
 end
 
 """
+    _ifConditionReaders(reduced::ModelingToolkit.AbstractSystem, original::ModelingToolkit.AbstractSystem) -> Vector{Any}
+
+The unknowns of `original` that `reduced` made observed variables reading an if-equation's
+condition parameter (`ifCond…`), directly or through other observed variables.
+"""
+function _ifConditionReaders(reduced::ModelingToolkit.AbstractSystem, original::ModelingToolkit.AbstractSystem)::Vector{Any}
+  local conditions = Set{Any}(Symbolics.unwrap(p) for p in ModelingToolkit.parameters(original)
+                              if startswith(string(p), "ifCond"))
+  isempty(conditions) && return Any[]
+  local readers = Set{Any}()
+  local changed = true
+  while changed
+    changed = false
+    for eq in ModelingToolkit.observed(reduced)
+      local lhs = Symbolics.unwrap(eq.lhs)
+      lhs in readers && continue
+      if any(v -> v in conditions || v in readers, Symbolics.get_variables(eq.rhs))
+        push!(readers, lhs)
+        changed = true
+      end
+    end
+  end
+  isempty(readers) && return Any[]
+  return Any[Symbolics.unwrap(u) for u in ModelingToolkit.unknowns(original)
+             if Symbolics.unwrap(u) in readers && !ModelingToolkit.isirreducible(u)]
+end
+
+"""
+    _withIrreducible(sys::ModelingToolkit.AbstractSystem, vars::Vector{Any}) -> ModelingToolkit.AbstractSystem
+
+`sys` with `vars` irreducible: structural_simplify keeps them unknowns.
+"""
+function _withIrreducible(sys::ModelingToolkit.AbstractSystem, vars::Vector{Any})::ModelingToolkit.AbstractSystem
+  local marked = Dict{Any, Any}(v => SymbolicUtils.setmetadata(v, ModelingToolkit.VariableIrreducible, true) for v in vars)
+  @set! sys.eqs = Symbolics.Equation[Symbolics.substitute(eq, marked) for eq in ModelingToolkit.get_eqs(sys)]
+  @set! sys.unknowns = Any[get(marked, Symbolics.unwrap(u), u) for u in ModelingToolkit.get_unknowns(sys)]
+  return sys
+end
+
+"""
   The irreducible variables scheme does not work using plain simplify.
 
   It should be noted that for some models both running tearing and structural simplification are needed.
@@ -2450,6 +2490,8 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   local useSplit = get(kwargs, :split, true)
   sys = _timeMayBeZero(sys)
   local _preSimplifySys = sys
+  #= the system the accepted reduction came from: the relaxed one after a retry below =#
+  local _simplifiedFrom = sys
   if OMBackend.BACKEND_LOGGING[]
     local _ss_timed = @timed ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
     sys = _ss_timed.value
@@ -2472,7 +2514,31 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
       if retried !== nothing && length(equations(retried)) == length(unknowns(retried))
         @info "[MTK GEN: simplify] recovered structural balance by neutralizing $(nNeutralized) soft state-priority hint(s)"
         sys = retried
+        _simplifiedFrom = relaxedSys
       end
+    end
+  end
+  #= An observed variable that reads an if-equation's condition parameter (ifCond…) is
+     evaluated from the solution with the parameters' final values: it read the last branch at
+     every time. MSL 4's KinematicPTP: sd = der(s) of an if-equation's s, index-reduced to
+     ifelse(ifCond…, …), was 0 throughout, and q its end value (CascadeControlledDrive). Such a
+     variable stays an unknown, which the solver computes with the parameters of each time. =#
+  local readers = _ifConditionReaders(sys, _simplifiedFrom)
+  if !isempty(readers)
+    local marked = _withIrreducible(_simplifiedFrom, readers)
+    #= a refinement: when MTK cannot reduce the marked system, the first reduction stays =#
+    local again = try
+      ModelingToolkit.structural_simplify(marked; simplify = simplify, split = useSplit)
+    catch e
+      OMBackend._fallback(e, :structural_simplify_ifConditionReaders; expect = Exception, impact = :result)
+      nothing
+    end
+    #= accepted when balanced with the same differential states: the readers become algebraic
+       unknowns, nothing else =#
+    local nDiff = r -> count(eq -> ModelingToolkit.isdiffeq(eq), equations(r))
+    if again !== nothing && length(equations(again)) == length(unknowns(again)) && nDiff(again) == nDiff(sys)
+      @info "[MTK GEN: simplify] kept $(length(readers)) variable(s) reading if-equation conditions as unknowns" readers = string.(readers)
+      sys = again
     end
   end
   try
