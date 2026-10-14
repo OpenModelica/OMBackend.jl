@@ -79,6 +79,7 @@ import .Backend.BDAE
 import .Backend.BDAECreate
 import .Backend.BDAEUtil
 import .Backend.Causalize
+import .Backend.ClockPartitioning
 import .SimulationCode
 
 import Base.Meta
@@ -359,6 +360,10 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
       end
       local bDAE = @BACKEND_PERFLOG "[backendAPI] lower" (frontendDAE isa OMFrontend.Frontend.FlatModel ?
                                                           lower(frontendDAE; scalarized) : lower(frontendDAE))
+      #= Clocked partitions are partitioned (ClockPartitioning), not generated yet =#
+      isempty(bDAE.clocked.partitions) ||
+        unsupported("clocked partitions (synchronous Modelica, MLS 16): no code generation for them yet",
+                    ClockPartitioning.describe(bDAE.clocked))
       local simCode
       if BackendMode == DAE_MODE
         error("DAE-mode is deprecated.")
@@ -761,6 +766,11 @@ function lower(fm::OMFrontend.Frontend.FLAT_MODEL; scalarized::Bool = true)
   local lowerWork = function()
     local preprocessedFM = FrontendUtil.handleBuiltin(fm)
     local bDAE = BDAECreate.lower(preprocessedFM)
+    #= The clocked partitions out of the continuous system, before its passes (synchronous
+       Modelica, MLS 16) =#
+    bDAE = ClockPartitioning.partitionClocks(bDAE)
+    @BACKEND_LOGGING isempty(bDAE.clocked.partitions) ||
+      debugWrite(logPath("backend/bdae", "bdae_clockedPartitions.log"), ClockPartitioning.describe(bDAE.clocked))
     @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_initial.log"), BDAEUtil.stringHeading1(bDAE, "initial BDAE"))
     #= Dump the actual DAE.Exp structure to a file for analysis =#
     @BACKEND_LOGGING begin
@@ -847,6 +857,16 @@ end
 
 #= Final SimCode of the most recent codegen, for interactive inspection. =#
 const LAST_SIM_CODE = Ref{Any}(nothing)
+
+"""
+    clockedPartitioning(fm::OMFrontend.Frontend.FLAT_MODEL) -> Backend.BDAE.ClockedPartitioning
+
+The clocked partitions of a flat model and their base clocks (Backend.ClockPartitioning), for
+inspection: `ClockPartitioning.describe` prints them.
+"""
+function clockedPartitioning(fm::OMFrontend.Frontend.FLAT_MODEL)::BDAE.ClockedPartitioning
+  return lower(fm).clocked
+end
 
 """
 `generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)`

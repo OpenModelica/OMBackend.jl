@@ -487,6 +487,23 @@ function Base.string(@nospecialize(op::DAE.Operator))::String
   end
 end
 
+"""
+    Base.string(clk::DAE.ClockKind) -> String
+
+A clock as its Clock constructor in Modelica: `Clock(20, 1000)`, `Clock(0.1)`, `Clock(c, 0.0)`,
+`Clock()` (inferred).
+"""
+function Base.string(clk::DAE.ClockKind)::String
+  local args = @match clk begin
+    DAE.INFERRED_CLOCK(__) => ""
+    DAE.INTEGER_CLOCK(intervalCounter = e1, resolution = e2) => Base.string(e1) * ", " * Base.string(e2)
+    DAE.REAL_CLOCK(interval = e1) => Base.string(e1)
+    DAE.BOOLEAN_CLOCK(condition = e1, startInterval = e2) => Base.string(e1) * ", " * Base.string(e2)
+    DAE.SOLVER_CLOCK(c = e1, solverMethod = e2) => Base.string(e1) * ", " * Base.string(e2)
+  end
+  return "Clock(" * args * ")"
+end
+
 function Base.string(@nospecialize(exp::DAE.Exp))::String
   str = begin
     local int::Int
@@ -516,6 +533,8 @@ function Base.string(@nospecialize(exp::DAE.Exp))::String
       DAE.BCONST(bool)  => begin
         Base.string(bool)
       end
+
+      DAE.CLKCONST(clk) => Base.string(clk)
 
       DAE.ENUM_LITERAL(name = Absyn.IDENT(str), index = int) => begin
         str * "(" * Base.string(int) * ")"

@@ -51,7 +51,8 @@ include("BackendEquation.jl")
 include("BDAEUtil.jl")
 include("BDAECreate.jl")
 include("Causalize.jl")
+include("clockPartitioning.jl")
 
-export BDAE, BDAECreate, BackendEquation, BDAEUtil, Causalize, BackendDAEExp
+export BDAE, BDAECreate, BackendEquation, BDAEUtil, Causalize, ClockPartitioning, BackendDAEExp
 
 end

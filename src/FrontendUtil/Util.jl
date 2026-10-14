@@ -44,6 +44,40 @@ const Type_a = Any
 const Argument = Any
 
 """
+    traverseExpClk(clk::DAE.ClockKind, traversal::Function, func, arg) -> (DAE.ClockKind, arg)
+
+A clock's expressions (its interval, resolution, condition, ...) through `traversal(exp, func,
+arg)`, the traversal of the expression the clock is in: traverseExpBottomUp or
+traverseExpTopDown (omc Expression.traverseExpClk). The traversal and its function are passed,
+not a closure: a closure in those traversals' matches boxed the variables it captured in the
+whole function (a process's first translate compiled 8 times longer).
+"""
+function traverseExpClk(clk::DAE.ClockKind, traversal::Function, func, arg::Type_a)::Tuple{DAE.ClockKind, Type_a}
+  return @match clk begin
+    DAE.INTEGER_CLOCK(intervalCounter = e1, resolution = e2) => begin
+      local (f1, a1) = traversal(e1, func, arg)
+      local (f2, a2) = traversal(e2, func, a1)
+      ((referenceEq(e1, f1) && referenceEq(e2, f2)) ? clk : DAE.INTEGER_CLOCK(f1, f2), a2)
+    end
+    DAE.REAL_CLOCK(interval = e1) => begin
+      local (f1, a1) = traversal(e1, func, arg)
+      (referenceEq(e1, f1) ? clk : DAE.REAL_CLOCK(f1), a1)
+    end
+    DAE.BOOLEAN_CLOCK(condition = e1, startInterval = e2) => begin
+      local (f1, a1) = traversal(e1, func, arg)
+      local (f2, a2) = traversal(e2, func, a1)
+      ((referenceEq(e1, f1) && referenceEq(e2, f2)) ? clk : DAE.BOOLEAN_CLOCK(f1, f2), a2)
+    end
+    DAE.SOLVER_CLOCK(c = e1, solverMethod = e2) => begin
+      local (f1, a1) = traversal(e1, func, arg)
+      local (f2, a2) = traversal(e2, func, a1)
+      ((referenceEq(e1, f1) && referenceEq(e2, f2)) ? clk : DAE.SOLVER_CLOCK(f1, f2), a2)
+    end
+    DAE.INFERRED_CLOCK(__) => (clk, arg)
+  end
+end
+
+"""
   Traverses an expression top down.
   The traversal function is expected to be on the following format
   function <name>(exp, dictionary).
@@ -123,6 +157,11 @@ Base.@nospecializeinfer function traverseExpTopDown1(continueTraversal::Bool, @n
 
       (DAE.ENUM_LITERAL(__), _, ext_arg)  => begin
         (inExp, ext_arg)
+      end
+
+      (DAE.CLKCONST(clk), rel, ext_arg)  => begin
+        local (clk_1, ext_arg_1) = traverseExpClk(clk, traverseExpTopDown, rel, ext_arg)
+        (referenceEq(clk, clk_1) ? inExp : DAE.CLKCONST(clk_1), ext_arg_1)
       end
 
       (DAE.CREF(cr, tp), rel, ext_arg)  => begin
@@ -680,7 +719,7 @@ function traverseExpBottomUp(inExp::DAE.Exp, inFunc, inExtArg::T)  where {T}
       end
 
       DAE.CLKCONST(clk)  => begin
-        (clk1, ext_arg) = traverseExpClk(clk, inFunc, inExtArg)
+        (clk1, ext_arg) = traverseExpClk(clk, traverseExpBottomUp, inFunc, inExtArg)
         e = if referenceEq(clk1, clk)
           inExp
         else

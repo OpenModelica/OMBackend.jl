@@ -310,15 +310,59 @@ struct SHARED
 end
 
 """
+    SubClock
+
+A clock derived from a base clock (MLS 16.5: subSample, superSample, shiftSample, backSample):
+it ticks at the base clock's `shift + k * factor` intervals, k = 0, 1, ... (for an event clock,
+base ticks). `solverMethod` is the method of a solver clock (`Clock(c, solverMethod)`).
+"""
+struct SubClock
+  factor::Rational{Int}
+  shift::Rational{Int}
+  solverMethod::Union{Nothing, String}
+end
+
+"""
+    ClockedPartition
+
+A clocked sub-partition (MLS 16.7): the variables and equations evaluated at the ticks of one
+sub-clock of the base clock `baseClock` (an index into `ClockedPartitioning.baseClocks`). Its
+`sample(u, ...)` read continuous variables at a tick; `hold` of its variables in the continuous
+system reads their value at the last tick.
+"""
+struct ClockedPartition
+  baseClock::Int
+  subClock::SubClock
+  vars::Vector{VAR}
+  eqs::Vector{Equation}
+  initialEqs::Vector{Equation}
+end
+
+"""
+    ClockedPartitioning
+
+The clocked partitions of a model and its base clocks, each the `DAE.ClockKind` of the Clock
+constructor it is (rational, real, event); empty for a model without clocks.
+"""
+struct ClockedPartitioning
+  baseClocks::Vector{DAE.ClockKind}
+  partitions::Vector{ClockedPartition}
+end
+ClockedPartitioning() = ClockedPartitioning(DAE.ClockKind[], ClockedPartition[])
+
+"""
   Top-level lowered DAE container: one or more `EQSYSTEM`s plus `SHARED`
   knowledge. This is what the causalization pipeline consumes and what the
-  code generator translates into an MTK `ODESystem`.
+  code generator translates into an MTK `ODESystem`. `clocked`: the clocked
+  partitions (Backend.ClockPartitioning), out of the equation systems.
 """
 mutable struct BACKEND_DAE
   name::String
   eqs::Vector{EQSYSTEM}
   shared::SHARED
+  clocked::ClockedPartitioning
 end
+BACKEND_DAE(name::String, eqs::Vector{EQSYSTEM}, shared::SHARED) = BACKEND_DAE(name, eqs, shared, ClockedPartitioning())
 
 @Uniontype VarKind begin
   @Record VARIABLE begin
