@@ -747,15 +747,90 @@ function structuralCall(eq)::Union{Nothing, Tuple{Symbol, Vector{Any}}}
   return (name, collect(eq.exp.call.arguments))
 end
 
+#= ==================================================================================== =#
+#= Functions                                                                            =#
+#= ==================================================================================== =#
+
+"""
+    lowerFunctions(functions)
+
+The functions the model calls (the frontend's list, in its order) in OMJLIR.
+"""
+lowerFunctions(functions)::Vector{IR.ModelicaFunction} = IR.ModelicaFunction[lowerFunction(f) for f in functions]
+
+"""
+    lowerFunction(fn)
+
+A function in OMJLIR: its variables, its algorithm or its external clause, its derivative
+annotations of order 1 (the inputs zeroDerivative or noDerivative exclude by position), its
+prefixes.
+"""
+function lowerFunction(fn::F.M_FUNCTION)::IR.ModelicaFunction
+  local external = F.isExternal(fn) ? lowerExternal(fn) : nothing
+  local body = external === nothing ? lowerStatements(F.getBody(fn)) : IR.Statement[]
+  local derivatives = IR.FunctionDerivative[]
+  for d in fn.derivatives
+    (isvariant(d.order, F.INTEGER_EXPRESSION) && d.order.value == 1) || continue
+    local fns = F.getCachedFuncs(d.derivativeFn)
+    isempty(fns) && continue
+    push!(derivatives, IR.FunctionDerivative(pathName(F.name(first(fns))), 1, Int[c[1] for c in d.conditions]))
+  end
+  local inline = nameof(typeof(fn.attributes.inline)) in (:EARLY_INLINE, :NORM_INLINE)
+  return IR.ModelicaFunction(pathName(fn.path), functionVariables(fn.inputs), functionVariables(fn.outputs),
+                             functionVariables(fn.locals), body, external, derivatives, F.isImpure(fn), inline,
+                             IR.NO_SOURCE)
+end
+
+functionVariables(nodes)::Vector{IR.FunctionVariable} = IR.FunctionVariable[functionVariable(n) for n in nodes]
+
+"""
+    functionVariable(node)
+
+A function's variable: its name, type, binding, and for a record instance its fields'
+bindings (the instance's modifiers and the record's defaults).
+"""
+function functionVariable(node)::IR.FunctionVariable
+  local comp = F.component(node)
+  local ty = F.getType(comp)
+  local fieldBindings = Pair{Symbol, IR.Expression}[]
+  if isvariant(ty, F.TYPE_COMPLEX)
+    local cls = F.getClass(ty.cls)
+    if cls isa F.INSTANCED_CLASS && cls.restriction isa F.RESTRICTION_RECORD
+      for c in F.getComponents(cls.elements)
+        local b = lowerBinding(F.getBinding(F.component(c)))
+        b === nothing || push!(fieldBindings, Symbol(F.name(c)) => b)
+      end
+    end
+  end
+  return IR.FunctionVariable(Symbol(F.name(node)), lowerType(ty), lowerBinding(comp.binding), fieldBindings)
+end
+
+"""
+    lowerExternal(fn)
+
+An external function's clause: the external function's name, language, arguments and
+output, and its annotation as the flat model writes it (with the default
+`LibraryDirectory` and `IncludeDirectory` of the library).
+"""
+function lowerExternal(fn::F.M_FUNCTION)::IR.ExternalDeclaration
+  local sections = F.getSections(F.getClass(fn.node))
+  local output = F.isEmpty(sections.outputRef) ? nothing : lowerCref(sections.outputRef)
+  local s = F.IOStream_M.create("external", F.IOStream_M.LIST())
+  local flat = F.IOStream_M.string(F.toFlatStream(sections, fn.path, s; inFunction = true))
+  local at = findfirst("annotation", flat)
+  return IR.ExternalDeclaration(sections.name, sections.language, lowerExps(collect(sections.args)), output,
+                                at === nothing ? "" : flat[first(at):end])
+end
+
 """
     lowerFlatModel(fm)
 
 The OMJLIR model of the frontend's flat model `fm`: its variables, its continuous-time
 partition (equations, algorithms, initial equations and algorithms), its structural modes
-(the structural submodels), states and transitions. The functions are added by
-`lowerFunctions`.
+(the structural submodels), states and transitions; and the functions of `functions` (the
+frontend's function list).
 """
-function lowerFlatModel(fm)::IR.Model
+function lowerFlatModel(fm; functions = ())::IR.Model
   local variables = lowerVariables(fm)
   local initialMode = nothing
   local transitions = IR.StructuralTransition[]
@@ -779,7 +854,7 @@ function lowerFlatModel(fm)::IR.Model
                                                sub.initialAlgorithms)))
   end
   return IR.Model(fm.name, variables, IR.Partition[system], IR.Partition[], IR.ClockKind[],
-                  Dict{Symbol, IR.ModelicaFunction}(), initialMode, modes, transitions, fm.scodeProgram)
+                  lowerFunctions(functions), initialMode, modes, transitions, fm.scodeProgram)
 end
 
 end # module LowerFlatModel

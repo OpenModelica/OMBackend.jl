@@ -78,9 +78,11 @@ function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.P
                                     if !(eq isa IR.ASSERT_EQUATION)]
   initialEquations = splitTupleInitialEquations(lowerInitialIfEquations(initialEquations), ht)
   local transitions = StructuralTransition[lowerStructuralTransition(names, w) for w in eqs.structural]
+  local functions = simFunctions(model.functions)
   return SIM_CODE(String(codeName(Symbol(model.name))), ht, residuals, initialEquations, whenEquations, simIfEquations,
                   isSingular, matchOrder, digraph, sccs, transitions, SIM_CODE[], String[], String[], Equation[],
-                  String(codeName(Symbol(something(model.initialMode, model.name)))), model.frontendModel, irreducibles, ModelicaFunction[], false,
+                  String(codeName(Symbol(something(model.initialMode, model.name)))), model.frontendModel, irreducibles,
+                  functions, any(f -> f isa EXTERNAL_MODELICA_FUNCTION, functions),
                   RESIDUAL_EQUATION[], String[], AliasEntry[], nothing, initialAlgorithms, asserts)
 end
 

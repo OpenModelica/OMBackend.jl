@@ -674,52 +674,77 @@ end
 #= ==================================================================================== =#
 
 """
-    FunctionVariable(name, ty, default)
+    FunctionVariable(name, ty, dimensions, default, fieldDefaults)
 
-An input, output or protected variable of a function: its name, type and default value
-(`nothing` for none).
+An input, output or protected variable of a function: its name; its type (an array's
+TYPE_ARRAY, a size an expression gives -1); an array's dimensions as expressions, for its
+allocation (`ICONST(n)`, an expression of the inputs `size(u, 1)`, `ICONST(0)` for `:`); its
+default value (`nothing` for none); for a record instance its fields' defaults (the
+instance's modifiers, the record's), by field.
 """
-struct FunctionVariable
+struct FunctionVariable <: Node
   name::String
   ty::SType
+  dimensions::Vector{Exp}
   default::Union{Nothing, Exp}
+  fieldDefaults::Vector{Pair{String, Exp}}
+end
+
+"""
+    FunctionDerivative(name, excludedInputs, nInputs)
+
+A function's derivative annotation of order 1 (MLS 12.7.1): the derivative function, the
+inputs (by position) without a derivative input in it (zeroDerivative, noDerivative), the
+function's number of inputs (as declared, before its records are flattened).
+"""
+struct FunctionDerivative <: Node
+  name::String
+  excludedInputs::Vector{Int}
+  nInputs::Int
 end
 
 "A function the model calls."
 abstract type ModelicaFunction end
 
-"A Modelica function: its variables and its algorithm."
+"""
+    MODELICA_FUNCTION(name, inputs, outputs, locals, statements, derivative)
+
+A Modelica function: its variables (a record input or output as its fields'), its algorithm,
+its derivative annotation (`nothing` for none).
+"""
 struct MODELICA_FUNCTION <: ModelicaFunction
   name::String
   inputs::Vector{FunctionVariable}
   outputs::Vector{FunctionVariable}
   locals::Vector{FunctionVariable}
   statements::Vector{Statement}
+  derivative::Union{Nothing, FunctionDerivative}
 end
 
 """
-    ExternalCall(name, language, arguments, output, libraries, includes)
+    ExternalCall(name, language, arguments, output, annotation)
 
 The external clause of a function: the external function's name and language (`"C"`,
 `"FORTRAN 77"`), its arguments (in the function's variables), the variable receiving its
-result (`nothing` for a void function), the libraries and include files.
+result (`nothing` for a void function), the clause's annotation as the flat model writes it
+(`Include`, `IncludeDirectory`, `Library`, `LibraryDirectory`; empty for none).
 """
-struct ExternalCall
+struct ExternalCall <: Node
   name::String
   language::String
   arguments::Vector{Exp}
-  output::Union{Nothing, SimCref}
-  libraries::Vector{String}
-  includes::Vector{String}
+  output::Union{Nothing, Exp}
+  annotation::String
 end
 
-"An external function: its variables and its external call."
+"An external function: its variables, its external call, its derivative annotation."
 struct EXTERNAL_MODELICA_FUNCTION <: ModelicaFunction
   name::String
   inputs::Vector{FunctionVariable}
   outputs::Vector{FunctionVariable}
   locals::Vector{FunctionVariable}
   external::ExternalCall
+  derivative::Union{Nothing, FunctionDerivative}
 end
 
 """

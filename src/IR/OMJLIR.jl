@@ -1015,32 +1015,48 @@ end
 #= ==================================================================================== =#
 
 """
-    ExternalDeclaration(name, language, arguments, output, libraries, includes)
+    ExternalDeclaration(name, language, arguments, output, annotation)
 
-The external clause of a function (MLS 12.9): the external function's name and language,
-its arguments, the variable receiving its result (`nothing` for a void function), and the
-libraries and include files of the annotations.
+The external clause of a function (MLS 12.9): the external function's name and language
+(`"C"`, `"FORTRAN 77"`), its arguments (in the function's variables), the variable receiving
+its result (`nothing` for a void function), and the clause's annotation (`Include`,
+`IncludeDirectory`, `Library`, ... as written, MLS 12.9.4; empty for none).
 """
 struct ExternalDeclaration <: Node
   name::String
   language::String
   arguments::Vector{Expression}
   output::Union{Nothing, ComponentRef}
-  libraries::Vector{String}
-  includes::Vector{String}
+  annotation::String
 end
 
 """
-    FunctionDerivative(derivative, order, zeroDerivative, noDerivative)
+    FunctionVariable(name, ty, binding, fieldBindings)
+
+An input, output or protected variable of a function: its name, its type (an array's
+dimensions may be expressions of the inputs, `size(u, 1)`), its binding (an input's or
+output's default, a protected variable's value), and for one of a record type the bindings
+of its fields as the instance has them (its modifiers, the record's defaults; one reading
+another field reads the variable's own: `w.a`).
+"""
+struct FunctionVariable <: Node
+  name::Symbol
+  ty::ModelicaType
+  binding::Union{Nothing, Expression}
+  fieldBindings::Vector{Pair{Symbol, Expression}}
+end
+
+"""
+    FunctionDerivative(derivative, order, excludedInputs)
 
 An annotation derivative (MLS 12.7.1): the function computing the derivative of order
-`order`, and the inputs given by zeroDerivative and noDerivative.
+`order`, and the inputs (by position) zeroDerivative or noDerivative exclude (the derivative
+function has no derivative input for them).
 """
 struct FunctionDerivative <: Node
   derivative::Symbol
   order::Int
-  zeroDerivative::Vector{Symbol}
-  noDerivative::Vector{Symbol}
+  excludedInputs::Vector{Int}
 end
 
 """
@@ -1049,13 +1065,13 @@ end
 
 A function the model calls: its inputs, outputs and protected variables in declaration
 order, its algorithm (empty for an external function), its external clause, its derivative
-annotations and its prefixes.
+annotations and its prefixes (`inline`: Inline = true).
 """
 struct ModelicaFunction
   name::Symbol
-  inputs::Vector{Variable}
-  outputs::Vector{Variable}
-  locals::Vector{Variable}
+  inputs::Vector{FunctionVariable}
+  outputs::Vector{FunctionVariable}
+  locals::Vector{FunctionVariable}
   body::Vector{Statement}
   external::Union{Nothing, ExternalDeclaration}
   derivatives::Vector{FunctionDerivative}
@@ -1187,7 +1203,7 @@ A model in OMJLIR (NB's BackendDAE MAIN):
   the system is split into independent subsystems.
 - `clocked`: the clocked partitions (MLS 16.7), after clock partitioning.
 - `baseClocks`: the base clocks the clocked partitions tick with (`baseClock` indexes it).
-- `functions`: the functions the model calls, by name.
+- `functions`: the functions the model calls, in the frontend's order.
 - `initialMode`, `modes`, `transitions`: OM.jl's structural modes, if the model has them.
 - `frontendModel`: what the frontend needs to translate the model again at a structural
   change; the backend does not look into it.
@@ -1198,7 +1214,7 @@ struct Model
   continuous::Vector{Partition}
   clocked::Vector{Partition}
   baseClocks::Vector{ClockKind}
-  functions::Dict{Symbol, ModelicaFunction}
+  functions::Vector{ModelicaFunction}
   initialMode::Union{Nothing, String}
   modes::Vector{StructuralMode}
   transitions::Vector{StructuralTransition}

@@ -59,5 +59,6 @@ include("lowerVariables.jl")
 include("lowerModel.jl")
 include("lowerStructure.jl")
 include("recordCallSites.jl")
+include("lowerFunctions.jl")
 
 end # module SimCode
