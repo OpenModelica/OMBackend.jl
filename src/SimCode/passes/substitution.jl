@@ -29,9 +29,9 @@ negatedIf(e::Exp, negate::Bool)::Exp = negate ? UNARY(OP_UMINUS, e) : e
 `e` with the variables of `replacements` replaced, top-down (a replacement is not visited
 again): a reference, or an element read by literal subscripts (`x[1]`), by its replacement;
 an array of `replacements` read by subscripts as its replacement subscripted; `der(x)` by
-`der` of its replacement, negated outside (`der(-y)` as `-der(y)`), by `0.0` if the
-replacement is time-invariant; `pre(x)` (`previous(x)`) by that of its replacement, negated
-outside.
+`der` of its replacement (of an expression: the call `der(e)`), negated outside (`der(-y)` as
+`-der(y)`), by `0.0` if the replacement is time-invariant; `pre(x)` (`previous(x)`) by that of
+its replacement, negated outside (of a constant, by the constant).
 """
 function substitute(e::Exp, replacements::Replacements)::Exp
   isempty(replacements) && return e
@@ -72,13 +72,19 @@ function substituted(e::DER, rs::Replacements)::Union{Nothing, Exp}
   local r = get(rs, crefName(e.cref), nothing)
   r === nothing && return nothing
   r.timeInvariant && return RCONST(0.0)
-  return negatedIf(DER(replacementCref(r)), r.negated)
+  r.ref isa EXP_CREF || return negatedIf(CALL(:der, Exp[r.ref], TYPE_REAL(), CALL_BUILTIN), r.negated)
+  return negatedIf(DER(r.ref.cref), r.negated)
 end
 
 function substituted(e::PRE, rs::Replacements)::Union{Nothing, Exp}
   local r = get(rs, crefName(e.cref), nothing)
   r === nothing && return nothing
-  return negatedIf(PRE(replacementCref(r), e.ty), r.negated)
+  if !(r.ref isa EXP_CREF)
+    #= pre() of a constant is the constant =#
+    r.timeInvariant && return replacementExp(r)
+    return negatedIf(CALL(:pre, Exp[r.ref], e.ty, CALL_BUILTIN), r.negated)
+  end
+  return negatedIf(PRE(r.ref.cref, e.ty), r.negated)
 end
 
 "The variable reference of a replacement (the argument of a `der` or `pre` that read the replaced one)."

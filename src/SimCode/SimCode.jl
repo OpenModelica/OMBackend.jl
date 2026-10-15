@@ -69,6 +69,9 @@ include("passes/constantPropagation.jl")
 include("passes/complexRecords.jl")
 include("passes/aliasElimination.jl")
 include("passes/parameterElimination.jl")
+include("passes/functionEvaluation.jl")
+include("passes/frozenStates.jl")
+include("passes/explicitFold.jl")
 include("passes/runner.jl")
 
 end # module SimCode
