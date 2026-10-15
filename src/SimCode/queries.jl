@@ -136,3 +136,30 @@ function whenCrefNames!(names::OrderedSet{String}, w::WHEN_STMTS)::OrderedSet{St
   w.elsewhenPart === nothing || whenCrefNames!(names, w.elsewhenPart)
   return names
 end
+
+"""
+    statementCrefNames!(names, body)
+
+The references of statements: their expressions' (an assert's level too), a reinit's state,
+of the nested statements.
+"""
+function statementCrefNames!(names::OrderedSet{String}, body::Vector{Statement})::OrderedSet{String}
+  for s in body
+    statementCrefNames!(names, s)
+  end
+  return names
+end
+
+statementCrefNames!(names::OrderedSet{String}, s::ASSIGN) = (crefNames!(names, s.left); crefNames!(names, s.right))
+statementCrefNames!(names::OrderedSet{String}, s::REINIT) = (push!(names, crefName(s.stateVar)); crefNames!(names, s.value))
+statementCrefNames!(names::OrderedSet{String}, s::NORETCALL) = crefNames!(names, s.exp)
+statementCrefNames!(names::OrderedSet{String}, s::ASSERT) =
+  (crefNames!(names, s.condition); crefNames!(names, s.message); crefNames!(names, s.level))
+statementCrefNames!(names::OrderedSet{String}, s::TERMINATE) = crefNames!(names, s.message)
+statementCrefNames!(names::OrderedSet{String}, s::Union{IF, WHEN}) =
+  (foreach(b -> (crefNames!(names, b.condition); statementCrefNames!(names, b.body)), s.branches);
+   s isa IF && statementCrefNames!(names, s.elseBody); names)
+statementCrefNames!(names::OrderedSet{String}, s::FOR) = (crefNames!(names, s.iterator.range); statementCrefNames!(names, s.body))
+statementCrefNames!(names::OrderedSet{String}, s::WHILE) = (crefNames!(names, s.condition); statementCrefNames!(names, s.body))
+statementCrefNames!(names::OrderedSet{String}, s::RECOMPILATION) = crefNames!(names, s.newValue)
+statementCrefNames!(names::OrderedSet{String}, ::Statement) = names

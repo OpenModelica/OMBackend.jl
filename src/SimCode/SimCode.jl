@@ -66,6 +66,8 @@ include("passes/trivialEquations.jl")
 include("passes/substitution.jl")
 include("passes/parameterClosure.jl")
 include("passes/constantPropagation.jl")
+include("passes/complexRecords.jl")
+include("passes/aliasElimination.jl")
 include("passes/runner.jl")
 
 end # module SimCode

@@ -14,8 +14,8 @@ struct Replacement
   timeInvariant::Bool
 end
 
-"The replacements of the eliminated variables, by name."
-const Replacements = Dict{String, Replacement}
+"The replacements of the eliminated variables, by name, in the order they were eliminated."
+const Replacements = OrderedDict{String, Replacement}
 
 "The reference `r` replaces a variable by, negated if `r` is."
 replacementExp(r::Replacement)::Exp = r.negated ? UNARY(OP_UMINUS, r.ref) : r.ref
