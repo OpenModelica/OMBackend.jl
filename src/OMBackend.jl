@@ -48,6 +48,8 @@ include("$CURRENT_DIRECTORY/util.jl")
 include("$CURRENT_DIRECTORY/globalConstants.jl")
 include("$CURRENT_DIRECTORY/errorPolicy.jl")
 export PLOT_PACKAGE_GRAPH
+include("$CURRENT_DIRECTORY/IR/OMJLIR.jl")
+include("$CURRENT_DIRECTORY/Backend/lowerFlatModel.jl")
 include("$CURRENT_DIRECTORY/FrontendUtil/FrontendUtil.jl")
 include("$CURRENT_DIRECTORY/BackendUtil/BackendUtil.jl")
 include("$CURRENT_DIRECTORY/Backend/Backend.jl")
