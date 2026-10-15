@@ -203,10 +203,18 @@ struct T_NORETCALL <: ModelicaType end
 "A type the backend does not know (yet)."
 struct T_UNKNOWN <: ModelicaType end
 
-"A dimension of known size; Boolean and enumeration dimensions have the number of values."
+"A dimension of known size."
 struct DIM_SIZE <: Dimension
   size::Int
 end
+
+"A dimension indexed by the literals of an enumeration: `Real x[E]`."
+struct DIM_ENUM <: Dimension
+  ty::T_ENUMERATION
+end
+
+"A dimension indexed by `false`, `true`: `Real x[Boolean]`."
+struct DIM_BOOLEAN <: Dimension end
 
 "A dimension whose size is an expression (a parameter not evaluated)."
 struct DIM_EXP <: Dimension
@@ -220,10 +228,16 @@ struct DIM_UNKNOWN <: Dimension end
 #= Component references and subscripts                                                  =#
 #= ==================================================================================== =#
 
-"One part of a component reference: a name and its subscripts (`b[2]` of `a.b[2].c`)."
+"""
+    CrefPart(name, subscripts, ty)
+
+One part of a component reference: a name, its subscripts (`b[2]` of `a.b[2].c`) and the type
+of the component it names, before the subscripts (`Real[3]` of `b`).
+"""
 struct CrefPart <: Node
   name::Symbol
   subscripts::Vector{Subscript}
+  ty::ModelicaType
 end
 
 """
@@ -246,7 +260,7 @@ struct ComponentRef <: Node
   ComponentRef(parts::Vector{CrefPart}) = new(parts, flatName(parts))
 end
 
-ComponentRef(name::Symbol) = ComponentRef(CrefPart[CrefPart(name, Subscript[])])
+ComponentRef(name::Symbol, ty::ModelicaType = T_UNKNOWN()) = ComponentRef(CrefPart[CrefPart(name, Subscript[], ty)])
 
 Base.:(==)(a::ComponentRef, b::ComponentRef)::Bool = a.name === b.name
 Base.hash(c::ComponentRef, h::UInt)::UInt = hash(c.name, h)
@@ -261,7 +275,7 @@ hasSubscripts(c::ComponentRef)::Bool = any(p -> !isempty(p.subscripts), c.parts)
 function variableName(c::ComponentRef, isVariable::F)::Symbol where {F}
   isVariable(c.name) && return c.name
   isempty(c.parts[end].subscripts) && return c.name
-  return flatName(CrefPart[c.parts[1:end - 1]..., CrefPart(c.parts[end].name, Subscript[])])
+  return flatName(CrefPart[c.parts[1:end - 1]..., CrefPart(c.parts[end].name, Subscript[], c.parts[end].ty)])
 end
 
 "Subscript by an index expression: `x[i]`."
@@ -750,10 +764,12 @@ mutable struct FOR_EQUATION <: Equation
 end
 
 """
-A when-equation's role: a regular one, or OM.jl's structural transition (its body changes the
-model's structure: `recompilation`, `agentic_recompilation`).
+A when-equation's role: a regular one; an initial one the passes made (an initial algorithm,
+the initial arm of a lifted algorithm or discrete cluster: the initialization runs them before
+the model's own `when initial()` equations); OM.jl's structural transition (its body changes
+the model's structure: `recompilation`, `agentic_recompilation`).
 """
-@enum WhenKind REGULAR_WHEN STRUCTURAL_WHEN
+@enum WhenKind REGULAR_WHEN INITIAL_WHEN STRUCTURAL_WHEN
 
 """
     WHEN_EQUATION(branches, kind, source, attributes)
@@ -871,14 +887,16 @@ const NO_ATTRIBUTES = VariableAttributes(nothing, nothing, nothing, nothing, not
                                          nothing, nothing, nothing)
 
 """
-    Variable(name, ty, kind, binding, attributes, direction, isProtected, connector, source, origin)
+    Variable(cref, ty, kind, binding, attributes, direction, isProtected, connector, source, origin)
 
-A variable of the model. Mutable: the passes change a variable's kind, binding or
-attributes in place, and every reference to it sees the change. `origin`: `:model` for one of
-the flat model, else the pass that introduced it (NB's auxiliaries: `\$DER.x`, a when-condition's
-variable, an if-expression's temporary).
+A variable of the model: its reference (its parts, each with its subscripts and type, as the
+flat model names it) and its flat name `name` (`cref.name`, by which it is looked up). Mutable:
+the passes change a variable's kind, binding or attributes in place, and every reference to it
+sees the change. `origin`: `:model` for one of the flat model, else the pass that introduced it
+(NB's auxiliaries: `\$DER.x`, a when-condition's variable, an if-expression's temporary).
 """
 mutable struct Variable
+  const cref::ComponentRef
   const name::Symbol
   ty::ModelicaType
   kind::VariableKind
@@ -889,7 +907,17 @@ mutable struct Variable
   connector::ConnectorKind
   source::Source
   const origin::Symbol
+  Variable(cref::ComponentRef, ty::ModelicaType, kind::VariableKind, binding::Union{Nothing, Expression},
+           attributes::VariableAttributes, direction::Direction, isProtected::Bool, connector::ConnectorKind,
+           source::Source, origin::Symbol) =
+    new(cref, cref.name, ty, kind, binding, attributes, direction, isProtected, connector, source, origin)
 end
+
+"A variable the backend makes, of one part `name`."
+Variable(name::Symbol, ty::ModelicaType, kind::VariableKind, binding::Union{Nothing, Expression},
+         attributes::VariableAttributes, direction::Direction, isProtected::Bool, connector::ConnectorKind,
+         source::Source, origin::Symbol) =
+  Variable(ComponentRef(name, ty), ty, kind, binding, attributes, direction, isProtected, connector, source, origin)
 
 """
     VariableSet()
@@ -1182,6 +1210,24 @@ _typeOf(e::SIZE)::ModelicaType =
   e.dimension === nothing ? T_ARRAY(T_INTEGER(), Dimension[DIM_UNKNOWN()]) : T_INTEGER()
 _typeOf(e::Expression)::ModelicaType = e.ty
 
+"The number of indices of a dimension; `nothing` for one of unknown size."
+dimensionSize(d::DIM_SIZE)::Union{Nothing, Int} = d.size
+dimensionSize(d::DIM_ENUM)::Union{Nothing, Int} = length(d.ty.literals)
+dimensionSize(::DIM_BOOLEAN)::Union{Nothing, Int} = 2
+dimensionSize(::Union{DIM_EXP, DIM_UNKNOWN})::Union{Nothing, Int} = nothing
+
+"""
+    dimensionIndex(d, k)
+
+The `k`-th index of the dimension `d` as a subscript expression: `k`, the `k`-th literal of
+an enumeration, `false`/`true`.
+"""
+function dimensionIndex(d::Dimension, k::Int)::Expression
+  d isa DIM_ENUM && return ENUM_LITERAL(d.ty, d.ty.literals[k], k)
+  d isa DIM_BOOLEAN && return BOOLEAN(k == 2)
+  return INTEGER(k)
+end
+
 "The element type of an array type; a scalar type itself."
 elementType(ty::T_ARRAY)::ModelicaType = ty.elementType
 elementType(ty::ModelicaType)::ModelicaType = ty
@@ -1198,71 +1244,87 @@ isScalar(ty::ModelicaType)::Bool = !(ty isa T_ARRAY)
 #= ==================================================================================== =#
 
 """
+    mapChildren(g, e)
+
+`e` with `g` applied to each of its direct subexpressions (the subscripts' expressions, the
+iterators' ranges and the clocks' arguments included), one level.
+"""
+mapChildren(g::G, e::Union{INTEGER, REAL, BOOLEAN, STRING, ENUM_LITERAL, WILD}) where {G} = e
+mapChildren(g::G, e::CLOCK) where {G} = CLOCK(_mapClock(g, e.kind))
+mapChildren(g::G, e::CREF) where {G} = CREF(_mapCrefChildren(g, e.cref), e.ty)
+mapChildren(g::G, e::ARRAY) where {G} = ARRAY(_mapAll(g, e.elements), e.ty)
+mapChildren(g::G, e::RANGE) where {G} =
+  RANGE(g(e.start), e.step === nothing ? nothing : g(e.step), g(e.stop), e.ty)
+mapChildren(g::G, e::TUPLE) where {G} = TUPLE(_mapAll(g, e.elements), e.ty)
+mapChildren(g::G, e::RECORD) where {G} = RECORD(_mapAll(g, e.elements), e.ty)
+mapChildren(g::G, e::CALL) where {G} = CALL(e.name, _mapAll(g, e.arguments), e.ty, e.attributes)
+mapChildren(g::G, e::ARRAY_CONSTRUCTOR) where {G} = ARRAY_CONSTRUCTOR(g(e.body), _mapIterators(g, e.iterators), e.ty)
+mapChildren(g::G, e::REDUCTION) where {G} = REDUCTION(e.reducer, g(e.body), _mapIterators(g, e.iterators), e.ty)
+mapChildren(g::G, e::PARTIAL_APPLICATION) where {G} =
+  PARTIAL_APPLICATION(e.name, _mapAll(g, e.arguments), e.argumentNames, e.ty)
+mapChildren(g::G, e::SIZE) where {G} = SIZE(g(e.exp), e.dimension === nothing ? nothing : g(e.dimension))
+mapChildren(g::G, e::BINARY) where {G} = BINARY(g(e.exp1), e.op, g(e.exp2), e.ty)
+mapChildren(g::G, e::UNARY) where {G} = UNARY(e.op, g(e.exp), e.ty)
+mapChildren(g::G, e::LBINARY) where {G} = LBINARY(g(e.exp1), e.op, g(e.exp2))
+mapChildren(g::G, e::LUNARY) where {G} = LUNARY(e.op, g(e.exp))
+mapChildren(g::G, e::RELATION) where {G} = RELATION(g(e.exp1), e.op, g(e.exp2), e.index)
+mapChildren(g::G, e::IF_EXPRESSION) where {G} = IF_EXPRESSION(g(e.condition), g(e.thenExp), g(e.elseExp), e.ty)
+mapChildren(g::G, e::CAST) where {G} = CAST(g(e.exp), e.ty)
+mapChildren(g::G, e::SUBSCRIPTED) where {G} = SUBSCRIPTED(g(e.exp), _mapSubscripts(g, e.subscripts), e.ty)
+mapChildren(g::G, e::TUPLE_ELEMENT) where {G} = TUPLE_ELEMENT(g(e.exp), e.index, e.ty)
+mapChildren(g::G, e::RECORD_ELEMENT) where {G} = RECORD_ELEMENT(g(e.exp), e.index, e.field, e.ty)
+
+_mapAll(g::G, es::Vector{Expression}) where {G} = Expression[g(e) for e in es]
+_mapIterators(g::G, its::Vector{Iterator}) where {G} = Iterator[Iterator(it.name, g(it.range)) for it in its]
+_mapSubscripts(g::G, subs::Vector{Subscript}) where {G} = Subscript[_mapSubscript(g, s) for s in subs]
+_mapSubscript(g::G, s::INDEX) where {G} = INDEX(g(s.exp))
+_mapSubscript(g::G, s::SLICE) where {G} = SLICE(g(s.exp))
+_mapSubscript(g::G, s::WHOLE) where {G} = s
+
+function _mapCrefChildren(g::G, cref::ComponentRef)::ComponentRef where {G}
+  hasSubscripts(cref) || return cref
+  return ComponentRef(CrefPart[CrefPart(p.name, _mapSubscripts(g, p.subscripts), p.ty) for p in cref.parts])
+end
+
+_mapClock(g::G, k::INFERRED_CLOCK) where {G} = k
+_mapClock(g::G, k::INTEGER_CLOCK) where {G} = INTEGER_CLOCK(g(k.intervalCounter), g(k.resolution))
+_mapClock(g::G, k::REAL_CLOCK) where {G} = REAL_CLOCK(g(k.interval))
+_mapClock(g::G, k::BOOLEAN_CLOCK) where {G} = BOOLEAN_CLOCK(g(k.condition), g(k.startInterval))
+_mapClock(g::G, k::SOLVER_CLOCK) where {G} = SOLVER_CLOCK(g(k.clock), g(k.solverMethod))
+
+"`mapExp` of `f` as a callable, for `mapChildren`."
+struct _BottomUp{F}
+  f::F
+end
+(m::_BottomUp)(e::Expression) = mapExp(m.f, e)
+
+"""
     mapExp(f, e)
 
 `e` with every subexpression `s` replaced by `f(s)`, bottom-up: `f` sees a node whose
-children are already mapped. Types and the subscripts' expressions are mapped too.
+children are already mapped. The subscripts' expressions are mapped too.
 """
-function mapExp(f::F, e::Expression)::Expression where {F}
-  return f(_mapChildren(f, e))
+mapExp(f::F, e::Expression) where {F} = f(mapChildren(_BottomUp(f), e))
+
+"`mapExpTopDown` of `f` as a callable, for `mapChildren`."
+struct _TopDown{F}
+  f::F
+end
+(m::_TopDown)(e::Expression) = mapExpTopDown(m.f, e)
+
+"""
+    mapExpTopDown(f, e)
+
+`e` mapped top-down: `f(e)` is `(e2, descend)`; `e2` replaces `e`, and its children are mapped
+in turn if `descend` (a replacement that is final, a value substituted for a variable, is not).
+"""
+function mapExpTopDown(f::F, e::Expression) where {F}
+  local (r, descend) = f(e)
+  return descend ? mapChildren(_TopDown(f), r) : r
 end
 
-_mapChildren(f::F, e::INTEGER) where {F} = e
-_mapChildren(f::F, e::REAL) where {F} = e
-_mapChildren(f::F, e::BOOLEAN) where {F} = e
-_mapChildren(f::F, e::STRING) where {F} = e
-_mapChildren(f::F, e::ENUM_LITERAL) where {F} = e
-_mapChildren(f::F, e::WILD) where {F} = e
-_mapChildren(f::F, e::CLOCK) where {F} = CLOCK(_mapClock(f, e.kind))
-_mapChildren(f::F, e::CREF) where {F} = CREF(mapCref(f, e.cref), e.ty)
-_mapChildren(f::F, e::ARRAY) where {F} = ARRAY(_mapAll(f, e.elements), e.ty)
-_mapChildren(f::F, e::RANGE) where {F} =
-  RANGE(mapExp(f, e.start), e.step === nothing ? nothing : mapExp(f, e.step), mapExp(f, e.stop), e.ty)
-_mapChildren(f::F, e::TUPLE) where {F} = TUPLE(_mapAll(f, e.elements), e.ty)
-_mapChildren(f::F, e::RECORD) where {F} = RECORD(_mapAll(f, e.elements), e.ty)
-_mapChildren(f::F, e::CALL) where {F} = CALL(e.name, _mapAll(f, e.arguments), e.ty, e.attributes)
-_mapChildren(f::F, e::ARRAY_CONSTRUCTOR) where {F} =
-  ARRAY_CONSTRUCTOR(mapExp(f, e.body), _mapIterators(f, e.iterators), e.ty)
-_mapChildren(f::F, e::REDUCTION) where {F} =
-  REDUCTION(e.reducer, mapExp(f, e.body), _mapIterators(f, e.iterators), e.ty)
-_mapChildren(f::F, e::PARTIAL_APPLICATION) where {F} =
-  PARTIAL_APPLICATION(e.name, _mapAll(f, e.arguments), e.argumentNames, e.ty)
-_mapChildren(f::F, e::SIZE) where {F} =
-  SIZE(mapExp(f, e.exp), e.dimension === nothing ? nothing : mapExp(f, e.dimension))
-_mapChildren(f::F, e::BINARY) where {F} = BINARY(mapExp(f, e.exp1), e.op, mapExp(f, e.exp2), e.ty)
-_mapChildren(f::F, e::UNARY) where {F} = UNARY(e.op, mapExp(f, e.exp), e.ty)
-_mapChildren(f::F, e::LBINARY) where {F} = LBINARY(mapExp(f, e.exp1), e.op, mapExp(f, e.exp2))
-_mapChildren(f::F, e::LUNARY) where {F} = LUNARY(e.op, mapExp(f, e.exp))
-_mapChildren(f::F, e::RELATION) where {F} = RELATION(mapExp(f, e.exp1), e.op, mapExp(f, e.exp2), e.index)
-_mapChildren(f::F, e::IF_EXPRESSION) where {F} =
-  IF_EXPRESSION(mapExp(f, e.condition), mapExp(f, e.thenExp), mapExp(f, e.elseExp), e.ty)
-_mapChildren(f::F, e::CAST) where {F} = CAST(mapExp(f, e.exp), e.ty)
-_mapChildren(f::F, e::SUBSCRIPTED) where {F} =
-  SUBSCRIPTED(mapExp(f, e.exp), _mapSubscripts(f, e.subscripts), e.ty)
-_mapChildren(f::F, e::TUPLE_ELEMENT) where {F} = TUPLE_ELEMENT(mapExp(f, e.exp), e.index, e.ty)
-_mapChildren(f::F, e::RECORD_ELEMENT) where {F} =
-  RECORD_ELEMENT(mapExp(f, e.exp), e.index, e.field, e.ty)
-
-_mapAll(f::F, es::Vector{Expression}) where {F} = Expression[mapExp(f, e) for e in es]
-_mapIterators(f::F, its::Vector{Iterator}) where {F} =
-  Iterator[Iterator(it.name, mapExp(f, it.range)) for it in its]
-
-"`cref` with `f` mapped over its subscripts' expressions."
-function mapCref(f::F, cref::ComponentRef)::ComponentRef where {F}
-  hasSubscripts(cref) || return cref
-  return ComponentRef(CrefPart[CrefPart(p.name, _mapSubscripts(f, p.subscripts)) for p in cref.parts])
-end
-
-_mapSubscripts(f::F, subs::Vector{Subscript}) where {F} = Subscript[_mapSubscript(f, s) for s in subs]
-_mapSubscript(f::F, s::INDEX) where {F} = INDEX(mapExp(f, s.exp))
-_mapSubscript(f::F, s::SLICE) where {F} = SLICE(mapExp(f, s.exp))
-_mapSubscript(f::F, s::WHOLE) where {F} = s
-
-_mapClock(f::F, k::INFERRED_CLOCK) where {F} = k
-_mapClock(f::F, k::INTEGER_CLOCK) where {F} = INTEGER_CLOCK(mapExp(f, k.intervalCounter), mapExp(f, k.resolution))
-_mapClock(f::F, k::REAL_CLOCK) where {F} = REAL_CLOCK(mapExp(f, k.interval))
-_mapClock(f::F, k::BOOLEAN_CLOCK) where {F} = BOOLEAN_CLOCK(mapExp(f, k.condition), mapExp(f, k.startInterval))
-_mapClock(f::F, k::SOLVER_CLOCK) where {F} = SOLVER_CLOCK(mapExp(f, k.clock), mapExp(f, k.solverMethod))
+"`cref` with `f` mapped (as by `mapExp`) over its subscripts' expressions."
+mapCref(f::F, cref::ComponentRef) where {F} = _mapCrefChildren(_BottomUp(f), cref)
 
 """
     foreachExp(f, e)
@@ -1336,6 +1398,135 @@ _clockChildren!(out::Vector{Expression}, k::REAL_CLOCK) = push!(out, k.interval)
 _clockChildren!(out::Vector{Expression}, k::BOOLEAN_CLOCK) = push!(out, k.condition, k.startInterval)
 _clockChildren!(out::Vector{Expression}, k::SOLVER_CLOCK) = push!(out, k.clock, k.solverMethod)
 
+#= Statements and equations =#
+
+"""
+    mapStatement(f, s)
+
+`s` with `f` mapped (as by `mapExp`) over all its expressions, its targets and the subscripts
+of its references included.
+"""
+mapStatement(f::F, s::ASSIGNMENT) where {F} = ASSIGNMENT(mapExp(f, s.lhs), mapExp(f, s.rhs), s.source)
+mapStatement(f::F, s::IF_STATEMENT) where {F} =
+  IF_STATEMENT(StatementBranch[_mapBranch(f, b) for b in s.branches], mapStatements(f, s.elseBody), s.source)
+mapStatement(f::F, s::FOR_STATEMENT) where {F} =
+  FOR_STATEMENT(Iterator(s.iterator.name, mapExp(f, s.iterator.range)), mapStatements(f, s.body), s.source)
+mapStatement(f::F, s::WHILE_STATEMENT) where {F} = WHILE_STATEMENT(mapExp(f, s.condition), mapStatements(f, s.body), s.source)
+mapStatement(f::F, s::WHEN_STATEMENT) where {F} = WHEN_STATEMENT(WhenBranch[mapWhenBranch(f, b) for b in s.branches], s.source)
+mapStatement(f::F, s::ASSERT) where {F} = ASSERT(mapExp(f, s.condition), mapExp(f, s.message), mapExp(f, s.level), s.source)
+mapStatement(f::F, s::TERMINATE) where {F} = TERMINATE(mapExp(f, s.message), s.source)
+mapStatement(f::F, s::REINIT) where {F} = REINIT(mapCref(f, s.state), mapExp(f, s.value), s.source)
+mapStatement(f::F, s::NORETCALL) where {F} = NORETCALL(mapExp(f, s.call), s.source)
+mapStatement(f::F, s::Union{RETURN, BREAK}) where {F} = s
+mapStatement(f::F, s::RECOMPILATION) where {F} = RECOMPILATION(mapCref(f, s.component), mapExp(f, s.newValue))
+mapStatement(f::F, s::AGENTIC_RECOMPILATION) where {F} =
+  AGENTIC_RECOMPILATION(ComponentRef[mapCref(f, c) for c in s.components], s.prompt, s.initialEquations)
+
+mapStatements(f::F, stmts::Vector{Statement}) where {F} = Statement[mapStatement(f, s) for s in stmts]
+_mapBranch(f::F, b::StatementBranch) where {F} = StatementBranch(mapExp(f, b.condition), mapStatements(f, b.body))
+
+"A when-branch with `f` mapped over its triggers and its statements."
+mapWhenBranch(f::F, b::WhenBranch) where {F} =
+  WhenBranch(Expression[mapExp(f, t) for t in b.triggers], b.atInitial, b.atTerminal, mapStatements(f, b.body))
+
+"""
+    mapEquation!(f, eq)
+
+`eq` with `f` mapped (as by `mapExp`) over all its expressions, in place (equations are
+entities); the equations of its branches and bodies too. Returns `eq`.
+"""
+function mapEquation!(f::F, eq::Union{SCALAR_EQUATION, ARRAY_EQUATION, RECORD_EQUATION})::Equation where {F}
+  eq.lhs = mapExp(f, eq.lhs)
+  eq.rhs = mapExp(f, eq.rhs)
+  return eq
+end
+function mapEquation!(f::F, eq::ALGORITHM)::Equation where {F}
+  eq.statements = mapStatements(f, eq.statements)
+  eq.outputs = ComponentRef[mapCref(f, c) for c in eq.outputs]
+  return eq
+end
+function mapEquation!(f::F, eq::IF_EQUATION)::Equation where {F}
+  for b in eq.branches
+    foreach(e -> mapEquation!(f, e), b.equations)
+  end
+  eq.branches = EquationBranch[EquationBranch(mapExp(f, b.condition), b.equations) for b in eq.branches]
+  foreach(e -> mapEquation!(f, e), eq.elseEquations)
+  return eq
+end
+function mapEquation!(f::F, eq::FOR_EQUATION)::Equation where {F}
+  eq.iterator = Iterator(eq.iterator.name, mapExp(f, eq.iterator.range))
+  foreach(e -> mapEquation!(f, e), eq.body)
+  return eq
+end
+function mapEquation!(f::F, eq::WHEN_EQUATION)::Equation where {F}
+  eq.branches = WhenBranch[mapWhenBranch(f, b) for b in eq.branches]
+  return eq
+end
+function mapEquation!(f::F, eq::ASSERT_EQUATION)::Equation where {F}
+  eq.condition = mapExp(f, eq.condition)
+  eq.message = mapExp(f, eq.message)
+  eq.level = mapExp(f, eq.level)
+  return eq
+end
+
+"""
+    foreachRootExp(f, x::Union{Statement, Equation})
+
+Call `f` on each root expression of a statement or an equation (its sides, conditions,
+triggers, ranges, arguments) and of the equations and statements in it, without descending
+into the expressions: for a visitor that decides itself where to descend.
+"""
+foreachRootExp(f::F, s::ASSIGNMENT) where {F} = (f(s.lhs); f(s.rhs); nothing)
+function foreachRootExp(f::F, s::Union{IF_STATEMENT, WHEN_STATEMENT}) where {F}
+  for b in s.branches
+    b isa WhenBranch ? foreach(f, b.triggers) : f(b.condition)
+    foreach(x -> foreachRootExp(f, x), b.body)
+  end
+  s isa IF_STATEMENT && foreach(x -> foreachRootExp(f, x), s.elseBody)
+  return nothing
+end
+foreachRootExp(f::F, s::FOR_STATEMENT) where {F} = (f(s.iterator.range); foreach(x -> foreachRootExp(f, x), s.body))
+foreachRootExp(f::F, s::WHILE_STATEMENT) where {F} = (f(s.condition); foreach(x -> foreachRootExp(f, x), s.body))
+foreachRootExp(f::F, s::ASSERT) where {F} = (f(s.condition); f(s.message); f(s.level); nothing)
+foreachRootExp(f::F, s::TERMINATE) where {F} = (f(s.message); nothing)
+foreachRootExp(f::F, s::REINIT) where {F} = (f(CREF(s.state, T_REAL())); f(s.value); nothing)
+foreachRootExp(f::F, s::NORETCALL) where {F} = (f(s.call); nothing)
+foreachRootExp(f::F, s::Union{RETURN, BREAK, AGENTIC_RECOMPILATION}) where {F} = nothing
+foreachRootExp(f::F, s::RECOMPILATION) where {F} = (f(s.newValue); nothing)
+foreachRootExp(f::F, eq::Union{SCALAR_EQUATION, ARRAY_EQUATION, RECORD_EQUATION}) where {F} = (f(eq.lhs); f(eq.rhs); nothing)
+foreachRootExp(f::F, eq::ALGORITHM) where {F} = foreach(s -> foreachRootExp(f, s), eq.statements)
+function foreachRootExp(f::F, eq::IF_EQUATION) where {F}
+  for b in eq.branches
+    f(b.condition)
+    foreach(e -> foreachRootExp(f, e), b.equations)
+  end
+  foreach(e -> foreachRootExp(f, e), eq.elseEquations)
+  return nothing
+end
+foreachRootExp(f::F, eq::FOR_EQUATION) where {F} = (f(eq.iterator.range); foreach(e -> foreachRootExp(f, e), eq.body))
+function foreachRootExp(f::F, eq::WHEN_EQUATION) where {F}
+  for b in eq.branches
+    foreach(f, b.triggers)
+    foreach(s -> foreachRootExp(f, s), b.body)
+  end
+  return nothing
+end
+foreachRootExp(f::F, eq::ASSERT_EQUATION) where {F} = (f(eq.condition); f(eq.message); f(eq.level); nothing)
+
+"`foreachExp` of `f` as a callable."
+struct _Visit{F}
+  f::F
+end
+(v::_Visit)(e::Expression) = foreachExp(v.f, e)
+
+"""
+    foreachExp(f, x::Union{Statement, Equation})
+
+Call `f` on every expression of a statement or an equation (and of the equations and
+statements in it), each top-down.
+"""
+foreachExp(f::F, x::Union{Statement, Equation}) where {F} = foreachRootExp(_Visit(f), x)
+
 "The component references in `e`, in the order of a top-down traversal, with duplicates."
 function crefsOf(e::Expression)::Vector{ComponentRef}
   local out = ComponentRef[]
@@ -1395,6 +1586,8 @@ _print(io::IO, t::T_FUNCTION) = print(io, "function ", t.name)
 _print(io::IO, ::T_NORETCALL) = print(io, "()")
 _print(io::IO, ::T_UNKNOWN) = print(io, "unknown")
 _print(io::IO, d::DIM_SIZE) = print(io, d.size)
+_print(io::IO, d::DIM_ENUM) = print(io, d.ty.name)
+_print(io::IO, ::DIM_BOOLEAN) = print(io, "Boolean")
 _print(io::IO, d::DIM_EXP) = _print(io, d.exp)
 _print(io::IO, ::DIM_UNKNOWN) = print(io, ":")
 

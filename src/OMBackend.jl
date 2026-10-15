@@ -50,6 +50,7 @@ include("$CURRENT_DIRECTORY/errorPolicy.jl")
 export PLOT_PACKAGE_GRAPH
 include("$CURRENT_DIRECTORY/IR/OMJLIR.jl")
 include("$CURRENT_DIRECTORY/Backend/lowerFlatModel.jl")
+include("$CURRENT_DIRECTORY/Backend/passes/Passes.jl")
 include("$CURRENT_DIRECTORY/SimCode/SimCode.jl")
 include("$CURRENT_DIRECTORY/FrontendUtil/FrontendUtil.jl")
 include("$CURRENT_DIRECTORY/BackendUtil/BackendUtil.jl")

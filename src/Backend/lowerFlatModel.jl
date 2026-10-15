@@ -63,6 +63,7 @@ import MetaModelica
 import MetaModelica: isvariant
 import OMFrontend
 import ..OMJLIR
+import ..unsupported
 
 const F = OMFrontend.Frontend
 const IR = OMJLIR
@@ -130,11 +131,11 @@ function functionType(fn::F.M_Function)::IR.T_FUNCTION
   return IR.T_FUNCTION(pathName(F.nameConsiderBuiltin(fn)), inputs, outputs)
 end
 
-"An OMJLIR dimension; Boolean and enumeration dimensions have the number of their values."
+"An OMJLIR dimension."
 function lowerDimension(d)::IR.Dimension
   isvariant(d, F.DIMENSION_INTEGER) && return IR.DIM_SIZE(d.size)
-  isvariant(d, F.DIMENSION_BOOLEAN) && return IR.DIM_SIZE(2)
-  isvariant(d, F.DIMENSION_ENUM) && return IR.DIM_SIZE(length(d.enumType.literals))
+  isvariant(d, F.DIMENSION_BOOLEAN) && return IR.DIM_BOOLEAN()
+  isvariant(d, F.DIMENSION_ENUM) && return IR.DIM_ENUM(enumerationType(d.enumType))
   isvariant(d, F.DIMENSION_EXP) && return IR.DIM_EXP(lowerExp(d.exp))
   return IR.DIM_UNKNOWN()
 end
@@ -154,7 +155,8 @@ end
 function crefParts(cref)::Vector{IR.CrefPart}
   local parts = IR.CrefPart[]
   while isvariant(cref, F.COMPONENT_REF_CREF)
-    push!(parts, IR.CrefPart(Symbol(F.name(cref.node)), IR.Subscript[lowerSubscript(s) for s in cref.subscripts]))
+    push!(parts, IR.CrefPart(Symbol(F.name(cref.node)), IR.Subscript[lowerSubscript(s) for s in cref.subscripts],
+                             lowerType(cref.ty)))
     cref = cref.restCref
   end
   return reverse!(parts)
@@ -285,11 +287,25 @@ lowerClock(k::F.SOLVER_CLOCK)::IR.ClockKind =
 
 lowerStatements(stmts)::Vector{IR.Statement} = IR.Statement[lowerStatement(s) for s in stmts]
 
+"""
+    lowerAssignment(lhs, rhs, source)
+
+An assignment, a tuple's as the frontend's DAE conversion made it: `() := f(x)` the call as a
+statement, `(a) := f(x)` the assignment of the call's first output.
+"""
+function lowerAssignment(lhs::IR.Expression, rhs::IR.Expression, source::IR.Source)::IR.Statement
+  lhs isa IR.TUPLE || return IR.ASSIGNMENT(lhs, rhs, source)
+  isempty(lhs.elements) && return IR.NORETCALL(rhs, source)
+  length(lhs.elements) == 1 &&
+    return IR.ASSIGNMENT(lhs.elements[1], IR.TUPLE_ELEMENT(rhs, 1, IR.typeOf(lhs.elements[1])), source)
+  return IR.ASSIGNMENT(lhs, rhs, source)
+end
+
 "The OMJLIR statement of the frontend statement `s`."
 function lowerStatement(s)::IR.Statement
   local source = lowerElementSource(s.source)
   if isvariant(s, F.ALG_ASSIGNMENT)
-    return IR.ASSIGNMENT(lowerExp(s.lhs), lowerExp(s.rhs), source)
+    return lowerAssignment(lowerExp(s.lhs), lowerExp(s.rhs), source)
   elseif isvariant(s, F.ALG_IF)
     local branches = IR.StatementBranch[]
     local elseBody = IR.Statement[]
@@ -309,7 +325,7 @@ function lowerStatement(s)::IR.Statement
   elseif isvariant(s, F.ALG_WHILE)
     return IR.WHILE_STATEMENT(lowerExp(s.condition), lowerStatements(s.body), source)
   elseif isvariant(s, F.ALG_WHEN)
-    return IR.WHEN_STATEMENT(IR.WhenBranch[whenBranch(lowerExp(c), lowerStatements(b))
+    return IR.WHEN_STATEMENT(IR.WhenBranch[whenBranch(lowerExp(c), lowerStatements(b); dropInitialDisjuncts = false)
                                            for (c, b) in s.branches], source)
   elseif isvariant(s, F.ALG_ASSERT)
     return IR.ASSERT(lowerExp(s.condition), lowerExp(s.message), lowerExp(s.level), source)
@@ -376,16 +392,32 @@ function lowerEquation(eq)::Union{Nothing, IR.Equation}
   elseif isvariant(eq, F.EQUATION_ASSERT)
     return IR.ASSERT_EQUATION(lowerExp(eq.condition), lowerExp(eq.message), lowerExp(eq.level), source)
   elseif isvariant(eq, F.EQUATION_TERMINATE)
-    return IR.ALGORITHM(IR.Statement[IR.TERMINATE(lowerExp(eq.message), source)], IR.ComponentRef[], source, ATTRIBUTES)
+    unsupported("terminate() in an equation section outside a when-equation", F.toString(eq))
   elseif isvariant(eq, F.EQUATION_REINIT)
-    error("OMJLIR lowering: reinit outside a when-equation (MLS 8.3.6)")
+    unsupported("reinit() outside a when-equation (MLS 8.3.6)", F.toString(eq))
   elseif isvariant(eq, F.EQUATION_NORETCALL)
-    return IR.ALGORITHM(IR.Statement[IR.NORETCALL(lowerExp(eq.exp), source)], IR.ComponentRef[], source, ATTRIBUTES)
+    return callEquation(lowerExp(eq.exp), source)
   elseif isvariant(eq, F.EQUATION_RECONFIGURE)
     return lowerReconfigureEquation(eq, source)
   end
   #= EQUATION_CONNECT: the frontend's connection handling removed them =#
   return nothing
+end
+
+"`AssertionLevel.error`."
+const ASSERTION_ERROR = IR.ENUM_LITERAL(IR.T_ENUMERATION(:AssertionLevel, [:error, :warning]), :error, 1)
+
+"""
+    callEquation(call, source)
+
+A call of a Modelica function for its effects in an equation section (MSL Fluid's
+checkBoundary, a print): an assert whose condition is the call, run where the asserts are
+checked (after the initialization and after each step), its message the function's name (as
+the previous backend had it). A built-in's call is not supported.
+"""
+function callEquation(call::IR.Expression, source::IR.Source)::IR.Equation
+  (call isa IR.CALL && !call.attributes.builtin) || unsupported("this builtin call as an equation", IR.toString(call))
+  return IR.ASSERT_EQUATION(call, IR.STRING(replace(String(call.name), "." => "_")), ASSERTION_ERROR, source)
 end
 
 "The number of scalar equations of a record equation: of a record type, its fields."
@@ -413,19 +445,20 @@ function lowerIfEquation(eq, source::IR.Source)::IR.IF_EQUATION
 end
 
 """
-    whenBranch(condition, body)
+    whenBranch(condition, body; dropInitialDisjuncts = true)
 
 A when-branch of the condition `condition` (MLS 8.6): `initial()` and `terminal()` as members
 of a vector condition are the branch's activity at the initialization and at the end, the
-other members its triggers. An `initial()` disjunct of `or` is dropped: it is true only at the
-initialization, where the when is not active, and false after (`when initial() or x > 0.6`
-fires at x's crossing only, as in OpenModelica).
+other members its triggers. In a when-equation an `initial()` disjunct of `or` is dropped: it
+is true only at the initialization, where the when is not active, and false after (`when
+initial() or x > 0.6` fires at x's crossing only, as in OpenModelica). A when-statement's
+condition keeps it (the algorithm lifting reads it as false, as the previous backend did).
 """
-function whenBranch(condition::IR.Expression, body::Vector{IR.Statement})::IR.WhenBranch
+function whenBranch(condition::IR.Expression, body::Vector{IR.Statement}; dropInitialDisjuncts::Bool = true)::IR.WhenBranch
   local triggers = IR.Expression[]
   local (atInitial, atTerminal) = (false, false)
   for member in (condition isa IR.ARRAY ? condition.elements : IR.Expression[condition])
-    local m = withoutInitialDisjunct(member)
+    local m = dropInitialDisjuncts ? withoutInitialDisjunct(member) : member
     if IR.isBuiltinCall(m, :initial)
       atInitial = true
     elseif IR.isBuiltinCall(m, :terminal)
@@ -623,10 +656,10 @@ end
 
 "The OMJLIR variable of the frontend variable `v`."
 function lowerVariable(v)::IR.Variable
-  local name = lowerCref(v.name).name
+  local cref = lowerCref(v.name)
   local ty = lowerType(v.ty)
   local a = v.attributes
-  return IR.Variable(name, ty, variableKind(a.variability, ty), lowerBinding(v.binding),
+  return IR.Variable(cref, ty, variableKind(a.variability, ty), lowerBinding(v.binding),
                      lowerAttributes(v.typeAttributes), lowerDirection(a.direction),
                      v.visibility == F.Visibility.PROTECTED, lowerConnector(a.connectorType), lowerSource(v.info),
                      :model)
