@@ -252,6 +252,30 @@ function _liftedIfTarget(eq::BDAE.IF_EQUATION)
   return length(lhsNames) == 1 ? only(lhsNames) : nothing
 end
 
+"""
+    _ifEquationTargets(eq::BDAE.IF_EQUATION) -> Vector{String}
+
+The variables an if-equation's branches assign (the left sides of their equations), the
+branches of nested if-equations included.
+"""
+function _ifEquationTargets(eq::BDAE.IF_EQUATION)::Vector{String}
+  local names = String[]
+  for eqs in Iterators.flatten((eq.eqnstrue, (eq.eqnsfalse,))), e in eqs
+    if e isa BDAE.IF_EQUATION
+      append!(names, _ifEquationTargets(e))
+      continue
+    end
+    #= an equation's left side, or a residual's `lhs - rhs` (as _liftedIfTarget) =#
+    local lhs = @match e begin
+      BDAE.EQUATION(lhs = l) => l
+      BDAE.RESIDUAL_EQUATION(exp = DAE.BINARY(l, DAE.SUB(__), _)) => l
+      _ => nothing
+    end
+    lhs isa DAE.CREF && push!(names, DAE_identifierToString(lhs))
+  end
+  return names
+end
+
 _whenOperatorExps(op) = @match op begin
   BDAE.ASSIGN(left = l, right = r) => DAE.Exp[l, r]
   BDAE.REINIT(stateVar = v, value = e) => DAE.Exp[v, e]
@@ -316,6 +340,11 @@ function getIrreducibleVars(ifEquations::Vector{BDAE.IF_EQUATION},
     else
       variablesForEq = Backend.BDAEUtil.getAllVariables(eq, algebraicAndStateVariables)
       push!(irreducibles, variablesForEq)
+      #= and what its branches assign, nested if-equations included: getAllVariables leaves out a
+         state outside der(), and a state an if-equation defines (MSL 4 KinematicPTP's s, with
+         sd = der(s)) became an observed ifelse of the condition parameters, read back from the
+         solution with their final values (CascadeControlledDrive.Continuous: q and PI.y) =#
+      push!(irreducibles, _ifEquationTargets(eq))
     end
   end
   local stateNames = String[BDAE_identifierToVarString(v) for v in algebraicAndStateVariables if BDAEUtil.isState(v)]

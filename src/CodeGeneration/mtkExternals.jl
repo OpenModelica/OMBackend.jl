@@ -2376,27 +2376,36 @@ end
 """
     _ifConditionReaders(reduced::ModelingToolkit.AbstractSystem, original::ModelingToolkit.AbstractSystem) -> Vector{Any}
 
-The unknowns of `original` that `reduced` made observed variables reading an if-equation's
-condition parameter (`ifCond…`), directly or through other observed variables.
+The unknowns of `original` that `reduced` made observed variables reading a derivative index
+reduction created (MTK's `xˍt`) of an if-equation's condition parameters (`ifCond…`):
+`sd = der(s)` of an if-equation's `s` became `sd ~ sˍt` with `sˍt ~ ifelse(ifCond…, …)`. Only
+these direct readers: the variables computed from them read them from the solution. Kept as
+unknowns too, the 3.2.3 RobotR3.fullRobot's 107 path-planning, motor and controller variables
+moved its friction modes' switching off the reference (event conditions read interpolated
+algebraic unknowns).
 """
 function _ifConditionReaders(reduced::ModelingToolkit.AbstractSystem, original::ModelingToolkit.AbstractSystem)::Vector{Any}
   local conditions = Set{Any}(Symbolics.unwrap(p) for p in ModelingToolkit.parameters(original)
                               if startswith(string(p), "ifCond"))
   isempty(conditions) && return Any[]
-  local readers = Set{Any}()
+  local observed = ModelingToolkit.observed(reduced)
+  #= the derivatives index reduction created that read a condition, directly or through each other =#
+  local derivatives = Set{Any}()
   local changed = true
   while changed
     changed = false
-    for eq in ModelingToolkit.observed(reduced)
+    for eq in observed
       local lhs = Symbolics.unwrap(eq.lhs)
-      lhs in readers && continue
-      if any(v -> v in conditions || v in readers, Symbolics.get_variables(eq.rhs))
-        push!(readers, lhs)
+      (lhs in derivatives || !occursin("ˍt", string(lhs))) && continue
+      if any(v -> v in conditions || v in derivatives, Symbolics.get_variables(eq.rhs))
+        push!(derivatives, lhs)
         changed = true
       end
     end
   end
-  isempty(readers) && return Any[]
+  isempty(derivatives) && return Any[]
+  local readers = Set{Any}(Symbolics.unwrap(eq.lhs) for eq in observed
+                           if any(v -> v in derivatives, Symbolics.get_variables(eq.rhs)))
   return Any[Symbolics.unwrap(u) for u in ModelingToolkit.unknowns(original)
              if Symbolics.unwrap(u) in readers && !ModelingToolkit.isirreducible(u)]
 end
@@ -2522,7 +2531,9 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
      evaluated from the solution with the parameters' final values: it read the last branch at
      every time. MSL 4's KinematicPTP: sd = der(s) of an if-equation's s, index-reduced to
      ifelse(ifCond…, …), was 0 throughout, and q its end value (CascadeControlledDrive). Such a
-     variable stays an unknown, which the solver computes with the parameters of each time. =#
+     derivative's readers stay unknowns, which the solver computes with the parameters of each
+     time (_ifConditionReaders). The general fix is a history of the condition parameters for the
+     read-back. =#
   local readers = _ifConditionReaders(sys, _simplifiedFrom)
   if !isempty(readers)
     local marked = _withIrreducible(_simplifiedFrom, readers)
