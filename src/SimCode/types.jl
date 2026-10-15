@@ -38,6 +38,33 @@
    by the lowering from OMJLIR (fromOMJLIR.jl), so the code generators read only these. =#
 
 #= ==================================================================================== =#
+#= Values                                                                               =#
+#= ==================================================================================== =#
+
+"""
+Root of SimCode's immutable values that compare structurally (`==`, `hash`): types,
+expressions, statements, variables and their parts.
+"""
+abstract type Node end
+
+"Fields compared one by one: the values are trees of vectors, strings and symbols."
+function Base.:(==)(a::T, b::T)::Bool where {T <: Node}
+  for f in fieldnames(T)
+    getfield(a, f) == getfield(b, f) || return false
+  end
+  return true
+end
+Base.:(==)(::Node, ::Node)::Bool = false
+
+function Base.hash(a::T, h::UInt)::UInt where {T <: Node}
+  local r = hash(T, h)
+  for f in fieldnames(T)
+    r = hash(getfield(a, f), r)
+  end
+  return r
+end
+
+#= ==================================================================================== =#
 #= Sources                                                                              =#
 #= ==================================================================================== =#
 
@@ -47,7 +74,7 @@
 Where an equation or a statement comes from in the Modelica source, for the messages of the
 generated code. `NO_SOURCE` for one the backend creates.
 """
-struct Source
+struct Source <: Node
   file::String
   line::Int
 end
@@ -64,7 +91,7 @@ const NO_SOURCE = Source("", 0)
 The type of an expression: its category (`isa TYPE_REAL`, `isa TYPE_ARRAY`, ...), an array's
 element type and integer dimensions, a record's fields.
 """
-abstract type SType end
+abstract type SType <: Node end
 
 "Scalar `Real`."
 struct TYPE_REAL <: SType end
@@ -166,7 +193,7 @@ not to be moved or evaluated at compile time), or a function value (a functional
 @enum CallKind CALL_BUILTIN CALL_FUNCTION CALL_IMPURE_FUNCTION CALL_FUNCTION_VALUE
 
 "A SimCode expression."
-abstract type Exp end
+abstract type Exp <: Node end
 
 "An `Integer` literal."
 struct ICONST <: Exp
@@ -324,7 +351,7 @@ struct TUPLE <: Exp
 end
 
 "An iterator of a reduction or an array constructor: `name in range`."
-struct Iterator
+struct Iterator <: Node
   name::Symbol
   range::Exp
 end
@@ -363,7 +390,7 @@ end
 A statement of an algorithm, a function body, a when-equation's body or an initial
 algorithm.
 """
-abstract type Statement end
+abstract type Statement <: Node end
 
 "`left := right`; `left` a variable, a subscripted one, or a `TUPLE` of them."
 struct ASSIGN <: Statement
@@ -373,7 +400,7 @@ struct ASSIGN <: Statement
 end
 
 "A condition and the statements executed when it holds."
-struct Branch
+struct Branch <: Node
   condition::Exp
   body::Vector{Statement}
 end
@@ -465,7 +492,7 @@ end
 `differentiated`: the equation is the derivative of another (index reduction). `alsoInitial`:
 a when-equation's runtime arm whose condition had `initial()` too.
 """
-struct EQ_ATTR
+struct EQ_ATTR <: Node
   differentiated::Bool
   alsoInitial::Bool
 end
@@ -512,7 +539,7 @@ end
 A when-clause: its condition, the statements of its body, the `elsewhen` part (`nothing` for
 none).
 """
-struct WHEN_STMTS
+struct WHEN_STMTS <: Node
   condition::Exp
   body::Vector{Statement}
   elsewhenPart::Union{Nothing, WHEN_STMTS}
@@ -559,7 +586,7 @@ end
 #= ==================================================================================== =#
 
 "The category of a simulation variable."
-abstract type SimVarType end
+abstract type SimVarType <: Node end
 
 "A state."
 struct STATE <: SimVarType end
@@ -617,7 +644,7 @@ struct DISCRETE <: SimVarType end
 A variable's built-in attributes the code generators read: an expression for each one given,
 `nothing` for one not; `isProtected` for a protected variable.
 """
-struct SimVarAttributes
+struct SimVarAttributes <: Node
   start::Union{Nothing, Exp}
   fixed::Union{Nothing, Exp}
   nominal::Union{Nothing, Exp}
@@ -635,7 +662,7 @@ const NO_ATTRIBUTES = SimVarAttributes(nothing, nothing, nothing, nothing, nothi
 
 "A simulation variable: its name, index (0-based, per category; `nothing` before indexing),
 category and attributes."
-struct SIMVAR
+struct SIMVAR <: Node
   name::String
   index::Union{Nothing, Int}
   varKind::SimVarType

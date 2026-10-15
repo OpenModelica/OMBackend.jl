@@ -536,7 +536,7 @@ contributes nothing. `nothing` if no branch has statements.
 function whenEquationOf(branches::Vector{IR.WhenBranch}, source::IR.Source, lifted::Set{Symbol})::Union{Nothing, IR.WHEN_EQUATION}
   local out = IR.WhenBranch[]
   for b in branches
-    local triggers = IR.Expression[t for t in b.triggers]
+    local triggers = IR.Expression[replaceInitial(t, false) for t in b.triggers]
     local runs = !isempty(triggers) || b.atTerminal
     local (ops, assigned) = runs ? bodyStatements(b.body, BodyLowering(false, true, "a when body")) : (IR.Statement[], Symbol[])
     union!(lifted, assigned)
@@ -827,7 +827,10 @@ function realAssignmentEquations(stmts::Vector{IR.Statement}, source::IR.Source,
       name in whenLifted && unsupported("a Real variable an algorithm section assigns both in a when and outside one", lhs)
       push!(out, IR.SCALAR_EQUATION(lhs, run.values[name], lhs.ty, source, DYNAMIC))
     elseif lhs.ty isa IR.T_RECORD
-      append!(out, recordEquations(lhs, run.values[name], source))
+      #= as a record equation of the flat model: one of a call stays whole =#
+      local value = run.values[name]
+      value isa IR.CALL ? push!(out, IR.RECORD_EQUATION(lhs, value, lhs.ty, length(lhs.ty.fields), source, IR.DEFAULT_ATTRIBUTES)) :
+                          append!(out, recordEquations(lhs, value, source))
     end
   end
   return out

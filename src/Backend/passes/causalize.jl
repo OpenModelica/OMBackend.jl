@@ -714,7 +714,7 @@ function fieldEquations(eq::IR.RECORD_EQUATION)::Union{Nothing, Vector{IR.Equati
   r === nothing && return nothing
   local out = IR.Equation[]
   for (k, field) in enumerate(r.ty.fields)
-    local value = IR.RECORD_ELEMENT(e, k, field.name, field.ty)
+    local value = fieldByIndex(e, k)
     local fieldRef = IR.CrefPart[r.cref.parts..., IR.CrefPart(field.name, IR.Subscript[], field.ty)]
     if field.ty isa IR.T_ARRAY
       for i in CartesianIndices(Tuple(something(IR.dimensionSize(d), 0) for d in field.ty.dimensions))
@@ -791,12 +791,19 @@ function elementOf(e::IR.Expression, index::Vector{Int})::IR.Expression
     return IR.CREF(IR.ComponentRef(parts), ty)
   end
   local recordTy = IR.typeOf(e)
-  if recordTy isa IR.T_RECORD && length(index) == 1 && index[1] <= length(recordTy.fields)
-    local field = recordTy.fields[index[1]]
-    return IR.RECORD_ELEMENT(e, index[1], field.name, field.ty)
-  end
+  (recordTy isa IR.T_RECORD && length(index) == 1 && index[1] <= length(recordTy.fields)) && return fieldByIndex(e, index[1])
   return IR.SUBSCRIPTED(e, subs, ty)
 end
+
+"""
+    fieldByIndex(e, k)
+
+The `k`-th field of the record expression `e` as `e[k]`: the previous backend's form of the
+fields of an expanded record equation, which the code generation reads (a call's result is
+indexed by field).
+"""
+fieldByIndex(e::IR.Expression, k::Int)::IR.Expression =
+  IR.SUBSCRIPTED(e, IR.Subscript[IR.INDEX(IR.INTEGER(k))], (IR.typeOf(e)::IR.T_RECORD).fields[k].ty)
 
 "The type of an element `n` subscripts into the type `ty`: its dimensions after the first `n`."
 function elementTypeOf(ty::IR.ModelicaType, n::Int)::IR.ModelicaType

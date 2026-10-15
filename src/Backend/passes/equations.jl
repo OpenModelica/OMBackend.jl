@@ -133,7 +133,7 @@ function addBindingEquations!(variables::IR.VariableSet, partition::IR.Partition
     v.binding === nothing && continue
     local continuous = v.kind isa Union{IR.STATE, IR.ALGEBRAIC}
     local discrete = continuous || v.kind isa IR.DISCRETE
-    local lhs = IR.CREF(IR.ComponentRef(v.name, v.ty), v.ty)
+    local lhs = IR.CREF(v.cref, v.ty)
     if continuous && v.ty isa IR.T_REAL
       push!(partition.equations, IR.SCALAR_EQUATION(lhs, v.binding, v.ty, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
     elseif discrete && v.ty isa IR.T_BOOLEAN && v.binding isa IR.IF_EXPRESSION

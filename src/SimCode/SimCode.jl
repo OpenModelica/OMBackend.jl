@@ -45,7 +45,19 @@ module SimCode
 
 import DataStructures: OrderedDict, OrderedSet
 import Graphs
+import MetaGraphs
+import ..BackendUtil.GraphAlgorithms
+import ..OMJLIR
+import ..Passes: legacyName, isSampleTrigger, isBuiltinCallOf, tupleAssignElements, initialCall, builtinCall, edgeCall
+import ..unsupported, .._fallback, ..isTunableParameter
+const IR = OMJLIR
 
 include("types.jl")
+include("traverse.jl")
+include("lowerExpressions.jl")
+include("lowerVariables.jl")
+include("lowerModel.jl")
+include("lowerStructure.jl")
+include("recordCallSites.jl")
 
 end # module SimCode
