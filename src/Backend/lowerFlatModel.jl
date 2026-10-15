@@ -50,7 +50,8 @@ The order of the equations is the order the previous backend (BDAE, through the 
 DAE conversion) had, so that the code generated from OMJLIR is the code generated before:
 the equations and the initial equations of the flat model in reverse; the equations of an
 if-equation's branches and of a when-equation's body in their order, the else-branch's in
-reverse. The variables are in their order.
+reverse. The variables are in their order. An array equation `lhs = rhs` is `rhs = lhs`, the
+previous backend's orientation (the residuals of its elements are `rhs[i] - lhs[i]`).
 
 Component references keep the frontend's parts, each name with its subscripts: `a[2].b` (a
 variable of a scalarized array of records), `x[i]` (in a loop, before the passes substitute
@@ -111,11 +112,15 @@ end
 enumerationType(ty::F.NFType)::IR.T_ENUMERATION =
   IR.T_ENUMERATION(pathName(ty.typePath), Symbol[Symbol(l) for l in ty.literals])
 
-"A record type with its fields, or an external object class (MLS 12.9.7)."
+"""
+A record type with its fields, an external object class (MLS 12.9.7), or the class of a
+model, block or connector component (a part of a component reference).
+"""
 function complexType(ty::F.NFType)::IR.ModelicaType
   local cls = ty.cls
   local name = pathName(F.scopePath(cls; includeRoot = true))
   isvariant(ty.complexTy, F.COMPLEX_EXTERNAL_OBJECT) && return IR.T_EXTERNAL_OBJECT(name)
+  isvariant(ty.complexTy, F.COMPLEX_RECORD) || return IR.T_CLASS(name)
   local fields = IR.Field[]
   for c in F.getComponents(F.getClass(cls).elements)
     F.isOnlyOuter(c) && continue
@@ -372,7 +377,8 @@ function lowerEquation(eq)::Union{Nothing, IR.Equation}
     local lhs = lowerExp(eq.lhs)
     local rhs = lowerExp(eq.rhs)
     F.isComplex(eq.ty) && return IR.RECORD_EQUATION(lhs, rhs, ty, recordSize(ty), source, ATTRIBUTES)
-    ty isa IR.T_ARRAY && return IR.ARRAY_EQUATION(lhs, rhs, ty, source, ATTRIBUTES)
+    #= `rhs = lhs`: see the module's documentation =#
+    ty isa IR.T_ARRAY && return IR.ARRAY_EQUATION(rhs, lhs, ty, source, ATTRIBUTES)
     return IR.SCALAR_EQUATION(lhs, rhs, ty, source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_CREF_EQUALITY)
     #= A connection's equality, as the frontend's DAE conversion made it: a + (-b) = 0 =#

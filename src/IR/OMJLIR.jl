@@ -185,6 +185,16 @@ struct T_EXTERNAL_OBJECT <: ModelicaType
   name::Symbol
 end
 
+"""
+    T_CLASS(name)
+
+The type of a component of a model, block or connector class: of a part of a component
+reference (`body.frame_a.r_0`'s `body` and `frame_a`), never of a value.
+"""
+struct T_CLASS <: ModelicaType
+  name::Symbol
+end
+
 "The type of a call to a function with several outputs."
 struct T_TUPLE <: ModelicaType
   types::Vector{ModelicaType}
@@ -960,7 +970,14 @@ function Base.push!(set::VariableSet, v::Variable)::VariableSet
   return set
 end
 
-"Remove the variables for which `f` holds, keeping the order of the others."
+"Remove all the variables."
+function Base.empty!(set::VariableSet)::VariableSet
+  empty!(set.variables)
+  empty!(set.index)
+  return set
+end
+
+"Keep the variables for which `f` holds, in their order."
 function Base.filter!(f::F, set::VariableSet)::VariableSet where {F}
   filter!(f, set.variables)
   empty!(set.index)
@@ -1580,7 +1597,7 @@ _print(io::IO, t::T_ENUMERATION) = print(io, t.name)
 _print(io::IO, t::T_ARRAY) = (_print(io, t.elementType); print(io, "["); _printJoined(io, t.dimensions); print(io, "]"))
 _print(io::IO, f::Field) = (_print(io, f.ty); print(io, " ", f.name))
 _print(io::IO, t::T_RECORD) = print(io, t.name)
-_print(io::IO, t::T_EXTERNAL_OBJECT) = print(io, t.name)
+_print(io::IO, t::Union{T_EXTERNAL_OBJECT, T_CLASS}) = print(io, t.name)
 _print(io::IO, t::T_TUPLE) = (print(io, "("); _printJoined(io, t.types); print(io, ")"))
 _print(io::IO, t::T_FUNCTION) = print(io, "function ", t.name)
 _print(io::IO, ::T_NORETCALL) = print(io, "()")

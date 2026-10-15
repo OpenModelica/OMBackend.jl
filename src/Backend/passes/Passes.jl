@@ -44,6 +44,7 @@ module Passes
 
 import ..OMJLIR
 import ..unsupported, .._fallback, ..UnsupportedLowering
+import ..isTunableParameter
 const IR = OMJLIR
 
 include("util.jl")
@@ -54,11 +55,12 @@ include("discrete.jl")
 include("clocks.jl")
 include("clockedLowering.jl")
 include("derivatives.jl")
+include("causalize.jl")
 
 """
 The passes, in order: name => pass. The first group is the previous backend's BDAECreate (the
 lowering's transformations), then clock partitioning and the clocked lowering, then its
-Causalize passes.
+Causalize passes (the derivative variables in the place of its detection of the states).
 """
 const PIPELINE = Pair{String, Base.Function}[
   "removeSmooth" => removeSmooth!,
@@ -71,7 +73,16 @@ const PIPELINE = Pair{String, Base.Function}[
   "hoistIfEquationAsserts" => hoistIfEquationAsserts!,
   "partitionClocks" => partitionClocks!,
   "lowerClockedPartitions" => lowerClockedPartitions!,
+  "resolveIntegerVariables" => resolveIntegerVariables!,
+  "moveSubscriptsIntoDer" => moveSubscriptsIntoDer!,
+  "lowerHigherOrderDerivatives" => lowerHigherOrderDerivatives!,
   "introduceDerivatives" => introduceDerivatives!,
+  "chooseRuntimeIndices" => chooseRuntimeIndices!,
+  "resolveBindingReferences" => resolveBindingReferences!,
+  "liftIfExpressions" => liftIfExpressions!,
+  "expandRecordFieldArrays" => expandRecordFieldArrays!,
+  "expandEquations" => expandEquations!,
+  "unrollConstantReductions" => unrollConstantReductions!,
 ]
 
 """
