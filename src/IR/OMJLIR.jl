@@ -220,19 +220,49 @@ struct DIM_UNKNOWN <: Dimension end
 #= Component references and subscripts                                                  =#
 #= ==================================================================================== =#
 
-"""
-    ComponentRef(name, subscripts)
-    ComponentRef(name)
-
-A reference to a variable: the variable's flat name and the subscripts selecting elements of
-an array variable (`x[i, 2]`); none for a whole variable.
-"""
-struct ComponentRef <: Node
+"One part of a component reference: a name and its subscripts (`b[2]` of `a.b[2].c`)."
+struct CrefPart <: Node
   name::Symbol
   subscripts::Vector{Subscript}
 end
 
-ComponentRef(name::Symbol) = ComponentRef(name, Subscript[])
+"""
+    ComponentRef(parts)
+    ComponentRef(name)
+
+A reference to a variable, `a.b[2].c`: its parts, the outermost first, and its flat `name`,
+the parts joined with their subscripts (`x[1,2]`, `E.one` for an enumeration literal, an
+expression as written: `x[i]`). A variable's name is the flat name of its reference (a
+scalarized array's element `x[2]` is a variable of its own); a reference `x[i]` to an array
+variable `x` is the variable subscripted (`variableName`).
+
+Two references are equal when their names are: the parts are for the passes that rewrite
+subscripts (an algorithm's loop over a scalarized array reads `x[i]`, then `x[2]`).
+`ComponentRef(name)` is a reference of one part, for the names the backend makes (`\$DER.x`).
+"""
+struct ComponentRef <: Node
+  parts::Vector{CrefPart}
+  name::Symbol
+  ComponentRef(parts::Vector{CrefPart}) = new(parts, flatName(parts))
+end
+
+ComponentRef(name::Symbol) = ComponentRef(CrefPart[CrefPart(name, Subscript[])])
+
+Base.:(==)(a::ComponentRef, b::ComponentRef)::Bool = a.name === b.name
+Base.hash(c::ComponentRef, h::UInt)::UInt = hash(c.name, h)
+
+"The subscripts of the last part: those of an array variable's reference."
+subscripts(c::ComponentRef)::Vector{Subscript} = c.parts[end].subscripts
+
+"Whether `c` has a subscript in any part."
+hasSubscripts(c::ComponentRef)::Bool = any(p -> !isempty(p.subscripts), c.parts)
+
+"The name of the variable `c` references: its own, or without the last part's subscripts."
+function variableName(c::ComponentRef, isVariable::F)::Symbol where {F}
+  isVariable(c.name) && return c.name
+  isempty(c.parts[end].subscripts) && return c.name
+  return flatName(CrefPart[c.parts[1:end - 1]..., CrefPart(c.parts[end].name, Subscript[])])
+end
 
 "Subscript by an index expression: `x[i]`."
 struct INDEX <: Subscript
@@ -1219,8 +1249,8 @@ _mapIterators(f::F, its::Vector{Iterator}) where {F} =
 
 "`cref` with `f` mapped over its subscripts' expressions."
 function mapCref(f::F, cref::ComponentRef)::ComponentRef where {F}
-  isempty(cref.subscripts) && return cref
-  return ComponentRef(cref.name, _mapSubscripts(f, cref.subscripts))
+  hasSubscripts(cref) || return cref
+  return ComponentRef(CrefPart[CrefPart(p.name, _mapSubscripts(f, p.subscripts)) for p in cref.parts])
 end
 
 _mapSubscripts(f::F, subs::Vector{Subscript}) where {F} = Subscript[_mapSubscript(f, s) for s in subs]
@@ -1269,7 +1299,12 @@ end
 
 _children!(out::Vector{Expression}, ::Union{INTEGER, REAL, BOOLEAN, STRING, ENUM_LITERAL, WILD}) = out
 _children!(out::Vector{Expression}, e::CLOCK) = _clockChildren!(out, e.kind)
-_children!(out::Vector{Expression}, e::CREF) = _subscriptChildren!(out, e.cref.subscripts)
+function _children!(out::Vector{Expression}, e::CREF)
+  for p in e.cref.parts
+    _subscriptChildren!(out, p.subscripts)
+  end
+  return out
+end
 _children!(out::Vector{Expression}, e::Union{ARRAY, TUPLE, RECORD}) = append!(out, e.elements)
 _children!(out::Vector{Expression}, e::RANGE) =
   e.step === nothing ? push!(out, e.start, e.stop) : push!(out, e.start, e.step, e.stop)
@@ -1367,14 +1402,36 @@ _print(io::IO, s::INDEX) = _print(io, s.exp)
 _print(io::IO, s::SLICE) = _print(io, s.exp)
 _print(io::IO, ::WHOLE) = print(io, ":")
 
-function _print(io::IO, cref::ComponentRef)
-  print(io, cref.name)
-  if !isempty(cref.subscripts)
-    print(io, "[")
-    _printJoined(io, cref.subscripts)
-    print(io, "]")
+_print(io::IO, cref::ComponentRef) = print(io, cref.name)
+_print(io::IO, p::CrefPart) = print(io, flatName(CrefPart[p]))
+
+"""
+    flatName(parts)
+
+The flat name of a reference's parts: the names joined by `.`, each with its subscripts in
+brackets separated by `,`; a literal index as its value (`2`, `true`, `E.one`), another
+expression as written.
+"""
+function flatName(parts::Vector{CrefPart})::Symbol
+  length(parts) == 1 && isempty(parts[1].subscripts) && return parts[1].name
+  local io = IOBuffer()
+  for (i, p) in enumerate(parts)
+    i > 1 && print(io, '.')
+    print(io, p.name)
+    isempty(p.subscripts) && continue
+    print(io, '[')
+    for (j, sub) in enumerate(p.subscripts)
+      j > 1 && print(io, ',')
+      _printSubscriptInName(io, sub)
+    end
+    print(io, ']')
   end
+  return Symbol(String(take!(io)))
 end
+
+_printSubscriptInName(io::IO, s::INDEX) =
+  s.exp isa INTEGER ? print(io, s.exp.value) : s.exp isa BOOLEAN ? print(io, s.exp.value) : _print(io, s.exp)
+_printSubscriptInName(io::IO, s::Subscript) = _print(io, s)
 
 _print(io::IO, e::INTEGER) = print(io, e.value)
 _print(io::IO, e::REAL) = print(io, e.value)

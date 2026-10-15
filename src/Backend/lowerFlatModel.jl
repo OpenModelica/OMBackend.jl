@@ -52,10 +52,9 @@ the equations and the initial equations of the flat model in reverse; the equati
 if-equation's branches and of a when-equation's body in their order, the else-branch's in
 reverse. The variables are in their order.
 
-Component references: a reference to a variable of the model is its flat name with the
-subscripts that are not part of the name (an element `x[2]` of a scalarized array is a
-variable of its own, `x[i]` of an array variable `x` is `x` subscripted). In a function, a
-reference to a field of a record is a RECORD_ELEMENT of the record.
+Component references keep the frontend's parts, each name with its subscripts: `a[2].b` (a
+variable of a scalarized array of records), `x[i]` (in a loop, before the passes substitute
+the iterator), `r.x[2]` (a record's field in a function).
 """
 module LowerFlatModel
 
@@ -69,24 +68,6 @@ const F = OMFrontend.Frontend
 const IR = OMJLIR
 
 export lowerFlatModel
-
-"""
-    Scope(variables, iterators)
-
-What a component reference can name where an expression is lowered: the variables (of the
-model, or the inputs, outputs and locals of a function) and the iterators of the enclosing
-for-loops, array constructors and reductions. `inFunction`: references to records are not
-split into field variables.
-"""
-struct Scope
-  variables::Set{Symbol}
-  iterators::Vector{Symbol}
-  inFunction::Bool
-end
-
-"`scope` with `name` as an iterator."
-withIterator(scope::Scope, name::Symbol)::Scope =
-  Scope(scope.variables, vcat(scope.iterators, name), scope.inFunction)
 
 #= ==================================================================================== =#
 #= Names and sources                                                                    =#
@@ -154,13 +135,13 @@ function lowerDimension(d)::IR.Dimension
   isvariant(d, F.DIMENSION_INTEGER) && return IR.DIM_SIZE(d.size)
   isvariant(d, F.DIMENSION_BOOLEAN) && return IR.DIM_SIZE(2)
   isvariant(d, F.DIMENSION_ENUM) && return IR.DIM_SIZE(length(d.enumType.literals))
-  isvariant(d, F.DIMENSION_EXP) && return IR.DIM_EXP(lowerExp(d.exp, Scope(Set{Symbol}(), Symbol[], false)))
+  isvariant(d, F.DIMENSION_EXP) && return IR.DIM_EXP(lowerExp(d.exp))
   return IR.DIM_UNKNOWN()
 end
 
-function lowerSubscript(s, scope::Scope)::IR.Subscript
-  s isa F.SUBSCRIPT_INDEX && return IR.INDEX(lowerExp(s.index, scope))
-  s isa F.SUBSCRIPT_SLICE && return IR.SLICE(lowerExp(s.slice, scope))
+function lowerSubscript(s)::IR.Subscript
+  s isa F.SUBSCRIPT_INDEX && return IR.INDEX(lowerExp(s.index))
+  s isa F.SUBSCRIPT_SLICE && return IR.SLICE(lowerExp(s.slice))
   s isa F.SUBSCRIPT_WHOLE && return IR.WHOLE()
   error("OMJLIR lowering: subscript $(F.toString(s)) of an untyped or split form")
 end
@@ -170,111 +151,21 @@ end
 #= ==================================================================================== =#
 
 "The parts of the frontend component reference `cref`, the outermost first."
-function crefParts(cref)::Vector{Any}
-  local parts = Any[]
+function crefParts(cref)::Vector{IR.CrefPart}
+  local parts = IR.CrefPart[]
   while isvariant(cref, F.COMPONENT_REF_CREF)
-    push!(parts, cref)
+    push!(parts, IR.CrefPart(Symbol(F.name(cref.node)), IR.Subscript[lowerSubscript(s) for s in cref.subscripts]))
     cref = cref.restCref
   end
   return reverse!(parts)
 end
 
-"The name of a subscript in a variable's name: a literal index (`2`, `true`, `E.one`)."
-function subscriptName(s)::Union{Nothing, String}
-  s isa F.SUBSCRIPT_INDEX || return nothing
-  local e = s.index
-  e isa F.INTEGER_EXPRESSION && return string(e.value)
-  e isa F.BOOLEAN_EXPRESSION && return string(e.value)
-  e isa F.ENUM_LITERAL_EXPRESSION && return string(F.AbsynUtil.pathString(e.ty.typePath), ".", e.name)
-  return nothing
-end
+"The OMJLIR reference of the frontend component reference `cref`."
+lowerCref(cref)::IR.ComponentRef = IR.ComponentRef(crefParts(cref))
 
-"""
-    crefName(parts; withSubscripts)
-
-The flat name of the parts `a.b[2].c`; without its subscripts `a.b.c`. `nothing` if a
-subscript to be named is not a literal.
-"""
-function crefName(parts::Vector{Any}; withSubscripts::Bool)::Union{Nothing, Symbol}
-  local io = IOBuffer()
-  for (i, p) in enumerate(parts)
-    i > 1 && print(io, '.')
-    print(io, F.name(p.node))
-    if withSubscripts && !isempty(p.subscripts)
-      print(io, '[')
-      for (j, s) in enumerate(p.subscripts)
-        local n = subscriptName(s)
-        n === nothing && return nothing
-        j > 1 && print(io, ',')
-        print(io, n)
-      end
-      print(io, ']')
-    end
-  end
-  return Symbol(String(take!(io)))
-end
-
-"""
-    lowerCrefExp(cref, ty, scope)
-
-A reference to a variable: of the model, by its flat name, with the subscripts that are not
-part of it; of a function, the variable subscripted and then its record fields.
-"""
-function lowerCrefExp(cref, ty::IR.ModelicaType, scope::Scope)::IR.Expression
-  isvariant(cref, F.COMPONENT_REF_WILD) && return IR.WILD()
-  local parts = crefParts(cref)
-  scope.inFunction && return functionCref(parts, ty, scope)
-  #= An element of a scalarized array, a scalar, an iterator, `time`: a name =#
-  local full = crefName(parts; withSubscripts = true)
-  if full !== nothing && (full in scope.variables || full in scope.iterators || isempty(scope.variables))
-    return IR.CREF(IR.ComponentRef(full), ty)
-  end
-  #= An array variable subscripted (a field of an array of records `r[i].v`: the field's
-     array variable `r.v`, subscripted) =#
-  local base = crefName(parts; withSubscripts = false)
-  local subs = IR.Subscript[lowerSubscript(s, scope) for p in parts for s in p.subscripts]
-  base in scope.variables && return IR.CREF(IR.ComponentRef(base, subs), ty)
-  #= Not a variable of the model: a built-in variable (time) or a name the frontend left
-     (an enumeration type, a function), by its name as written =#
-  return full !== nothing ? IR.CREF(IR.ComponentRef(full), ty) : IR.CREF(IR.ComponentRef(base, subs), ty)
-end
-
-"""
-A reference in a function: its variable, subscripted, then the record fields after it, each
-subscripted (`r[i].x[2]`). A part's type is its component's, before its subscripts.
-"""
-function functionCref(parts::Vector{Any}, ty::IR.ModelicaType, scope::Scope)::IR.Expression
-  local exp::IR.Expression = IR.WILD()
-  for (i, p) in enumerate(parts)
-    local subs = IR.Subscript[lowerSubscript(s, scope) for s in p.subscripts]
-    local partTy = lowerType(p.ty)
-    local resultTy = i == length(parts) ? ty : afterSubscripts(partTy, subs)
-    if i == 1
-      exp = IR.CREF(IR.ComponentRef(Symbol(F.name(p.node)), subs), resultTy)
-      continue
-    end
-    local field = Symbol(F.name(p.node))
-    local recTy = IR.typeOf(exp)
-    local index = recTy isa IR.T_RECORD ? something(findfirst(f -> f.name === field, recTy.fields), 0) : 0
-    exp = IR.RECORD_ELEMENT(exp, index, field, isempty(subs) ? resultTy : partTy)
-    isempty(subs) || (exp = IR.SUBSCRIPTED(exp, subs, resultTy))
-  end
-  return exp
-end
-
-"The type of a value of type `ty` subscripted by `subs`: an index removes its dimension."
-function afterSubscripts(ty::IR.ModelicaType, subs::Vector{IR.Subscript})::IR.ModelicaType
-  (ty isa IR.T_ARRAY && !isempty(subs)) || return ty
-  local dims = IR.Dimension[d for (k, d) in enumerate(ty.dimensions) if k > length(subs) || !(subs[k] isa IR.INDEX)]
-  return isempty(dims) ? ty.elementType : IR.T_ARRAY(ty.elementType, dims)
-end
-
-"The component reference of a `reinit` target or an assignment's left-hand side."
-function lowerCref(cref, scope::Scope)::IR.ComponentRef
-  local e = lowerCrefExp(cref, lowerType(cref.ty), scope)
-  e isa IR.CREF || error("OMJLIR lowering: $(F.toString(cref)) is not a reference to a variable")
-  return e.cref
-end
+"A reference to a variable as an expression: `_` for the frontend's wildcard."
+lowerCrefExp(cref, ty::IR.ModelicaType)::IR.Expression =
+  isvariant(cref, F.COMPONENT_REF_WILD) ? IR.WILD() : IR.CREF(lowerCref(cref), ty)
 
 #= ==================================================================================== =#
 #= Expressions                                                                          =#
@@ -297,146 +188,137 @@ end
 
 typeOfExp(e)::IR.ModelicaType = lowerType(F.typeOf(e))
 
-lowerExps(es, scope::Scope)::Vector{IR.Expression} = IR.Expression[lowerExp(e, scope) for e in es]
+lowerExps(es)::Vector{IR.Expression} = IR.Expression[lowerExp(e) for e in es]
 
 "An optional expression (a MetaModelica `Option`): lowered, or `nothing`."
-lowerOptExp(o, scope::Scope)::Union{Nothing, IR.Expression} =
-  o isa MetaModelica.SOME ? lowerExp(o.data, scope) : nothing
+lowerOptExp(o)::Union{Nothing, IR.Expression} =
+  o isa MetaModelica.SOME ? lowerExp(o.data) : nothing
 
 "The OMJLIR expression of the frontend expression `e`."
-lowerExp(e::F.INTEGER_EXPRESSION, scope::Scope)::IR.Expression = IR.INTEGER(e.value)
-lowerExp(e::F.REAL_EXPRESSION, scope::Scope)::IR.Expression = IR.REAL(e.value)
-lowerExp(e::F.STRING_EXPRESSION, scope::Scope)::IR.Expression = IR.STRING(e.value)
-lowerExp(e::F.BOOLEAN_EXPRESSION, scope::Scope)::IR.Expression = IR.BOOLEAN(e.value)
-lowerExp(e::F.ENUM_LITERAL_EXPRESSION, scope::Scope)::IR.Expression =
+lowerExp(e::F.INTEGER_EXPRESSION)::IR.Expression = IR.INTEGER(e.value)
+lowerExp(e::F.REAL_EXPRESSION)::IR.Expression = IR.REAL(e.value)
+lowerExp(e::F.STRING_EXPRESSION)::IR.Expression = IR.STRING(e.value)
+lowerExp(e::F.BOOLEAN_EXPRESSION)::IR.Expression = IR.BOOLEAN(e.value)
+lowerExp(e::F.ENUM_LITERAL_EXPRESSION)::IR.Expression =
   IR.ENUM_LITERAL(enumerationType(e.ty), Symbol(e.name), e.index)
-lowerExp(e::F.CLKCONST_EXPRESSION, scope::Scope)::IR.Expression = IR.CLOCK(lowerClock(e.clk, scope))
-lowerExp(e::F.CREF_EXPRESSION, scope::Scope)::IR.Expression = lowerCrefExp(e.cref, lowerType(e.ty), scope)
-lowerExp(e::F.TYPENAME_EXPRESSION, scope::Scope)::IR.Expression = lowerExp(F.expandTypename(e.ty), scope)
-lowerExp(e::F.ARRAY_EXPRESSION, scope::Scope)::IR.Expression = IR.ARRAY(lowerExps(e.elements, scope), lowerType(e.ty))
-function lowerExp(e::F.MATRIX_EXPRESSION, scope::Scope)::IR.Expression
+lowerExp(e::F.CLKCONST_EXPRESSION)::IR.Expression = IR.CLOCK(lowerClock(e.clk))
+lowerExp(e::F.CREF_EXPRESSION)::IR.Expression = lowerCrefExp(e.cref, lowerType(e.ty))
+lowerExp(e::F.TYPENAME_EXPRESSION)::IR.Expression = lowerExp(F.expandTypename(e.ty))
+lowerExp(e::F.ARRAY_EXPRESSION)::IR.Expression = IR.ARRAY(lowerExps(e.elements), lowerType(e.ty))
+function lowerExp(e::F.MATRIX_EXPRESSION)::IR.Expression
   local ty = typeOfExp(e)::IR.T_ARRAY
   local rowTy = IR.T_ARRAY(ty.elementType, ty.dimensions[2:end])
-  return IR.ARRAY(IR.Expression[IR.ARRAY(lowerExps(row, scope), rowTy) for row in e.elements], ty)
+  return IR.ARRAY(IR.Expression[IR.ARRAY(lowerExps(row), rowTy) for row in e.elements], ty)
 end
-lowerExp(e::F.RECORD_EXPRESSION, scope::Scope)::IR.Expression = IR.RECORD(lowerExps(e.elements, scope), lowerType(e.ty))
-lowerExp(e::F.RANGE_EXPRESSION, scope::Scope)::IR.Expression =
-  IR.RANGE(lowerExp(e.start, scope), lowerOptExp(e.step, scope), lowerExp(e.stop, scope), lowerType(e.ty))
-lowerExp(e::F.TUPLE_EXPRESSION, scope::Scope)::IR.Expression = IR.TUPLE(lowerExps(e.elements, scope), lowerType(e.ty))
-lowerExp(e::F.CALL_EXPRESSION, scope::Scope)::IR.Expression = lowerCall(e.call, scope)
-lowerExp(e::F.SIZE_EXPRESSION, scope::Scope)::IR.Expression = IR.SIZE(lowerExp(e.exp, scope), lowerOptExp(e.dimIndex, scope))
-lowerExp(e::F.BINARY_EXPRESSION, scope::Scope)::IR.Expression =
-  IR.BINARY(lowerExp(e.exp1, scope), lowerOp(e.operator), lowerExp(e.exp2, scope), lowerType(e.operator.ty))
-lowerExp(e::F.UNARY_EXPRESSION, scope::Scope)::IR.Expression =
-  IR.UNARY(lowerOp(e.operator), lowerExp(e.exp, scope), lowerType(e.operator.ty))
-lowerExp(e::F.LBINARY_EXPRESSION, scope::Scope)::IR.Expression =
-  IR.LBINARY(lowerExp(e.exp1, scope), lowerOp(e.operator), lowerExp(e.exp2, scope))
-lowerExp(e::F.LUNARY_EXPRESSION, scope::Scope)::IR.Expression = IR.LUNARY(lowerOp(e.operator), lowerExp(e.exp, scope))
-lowerExp(e::F.RELATION_EXPRESSION, scope::Scope)::IR.Expression =
-  IR.RELATION(lowerExp(e.exp1, scope), lowerOp(e.operator), lowerExp(e.exp2, scope), 0)
-lowerExp(e::F.IF_EXPRESSION, scope::Scope)::IR.Expression =
-  IR.IF_EXPRESSION(lowerExp(e.condition, scope), lowerExp(e.trueBranch, scope), lowerExp(e.falseBranch, scope), typeOfExp(e))
-lowerExp(e::F.CAST_EXPRESSION, scope::Scope)::IR.Expression = IR.CAST(lowerExp(e.exp, scope), lowerType(e.ty))
-lowerExp(e::F.SUBSCRIPTED_EXP_EXPRESSION, scope::Scope)::IR.Expression =
-  IR.SUBSCRIPTED(lowerExp(e.exp, scope), IR.Subscript[lowerSubscript(s, scope) for s in e.subscripts], lowerType(e.ty))
-lowerExp(e::F.TUPLE_ELEMENT_EXPRESSION, scope::Scope)::IR.Expression =
-  IR.TUPLE_ELEMENT(lowerExp(e.tupleExp, scope), e.index, lowerType(e.ty))
-lowerExp(e::F.RECORD_ELEMENT_EXPRESSION, scope::Scope)::IR.Expression =
-  IR.RECORD_ELEMENT(lowerExp(e.recordExp, scope), e.index, Symbol(e.fieldName), lowerType(e.ty))
-function lowerExp(e::F.PARTIAL_FUNCTION_APPLICATION_EXPRESSION, scope::Scope)::IR.Expression
+lowerExp(e::F.RECORD_EXPRESSION)::IR.Expression = IR.RECORD(lowerExps(e.elements), lowerType(e.ty))
+lowerExp(e::F.RANGE_EXPRESSION)::IR.Expression =
+  IR.RANGE(lowerExp(e.start), lowerOptExp(e.step), lowerExp(e.stop), lowerType(e.ty))
+lowerExp(e::F.TUPLE_EXPRESSION)::IR.Expression = IR.TUPLE(lowerExps(e.elements), lowerType(e.ty))
+lowerExp(e::F.CALL_EXPRESSION)::IR.Expression = lowerCall(e.call)
+lowerExp(e::F.SIZE_EXPRESSION)::IR.Expression = IR.SIZE(lowerExp(e.exp), lowerOptExp(e.dimIndex))
+lowerExp(e::F.BINARY_EXPRESSION)::IR.Expression =
+  IR.BINARY(lowerExp(e.exp1), lowerOp(e.operator), lowerExp(e.exp2), lowerType(e.operator.ty))
+lowerExp(e::F.UNARY_EXPRESSION)::IR.Expression =
+  IR.UNARY(lowerOp(e.operator), lowerExp(e.exp), lowerType(e.operator.ty))
+lowerExp(e::F.LBINARY_EXPRESSION)::IR.Expression =
+  IR.LBINARY(lowerExp(e.exp1), lowerOp(e.operator), lowerExp(e.exp2))
+lowerExp(e::F.LUNARY_EXPRESSION)::IR.Expression = IR.LUNARY(lowerOp(e.operator), lowerExp(e.exp))
+lowerExp(e::F.RELATION_EXPRESSION)::IR.Expression =
+  IR.RELATION(lowerExp(e.exp1), lowerOp(e.operator), lowerExp(e.exp2), 0)
+lowerExp(e::F.IF_EXPRESSION)::IR.Expression =
+  IR.IF_EXPRESSION(lowerExp(e.condition), lowerExp(e.trueBranch), lowerExp(e.falseBranch), typeOfExp(e))
+lowerExp(e::F.CAST_EXPRESSION)::IR.Expression = IR.CAST(lowerExp(e.exp), lowerType(e.ty))
+lowerExp(e::F.SUBSCRIPTED_EXP_EXPRESSION)::IR.Expression =
+  IR.SUBSCRIPTED(lowerExp(e.exp), IR.Subscript[lowerSubscript(s) for s in e.subscripts], lowerType(e.ty))
+lowerExp(e::F.TUPLE_ELEMENT_EXPRESSION)::IR.Expression =
+  IR.TUPLE_ELEMENT(lowerExp(e.tupleExp), e.index, lowerType(e.ty))
+lowerExp(e::F.RECORD_ELEMENT_EXPRESSION)::IR.Expression =
+  IR.RECORD_ELEMENT(lowerExp(e.recordExp), e.index, Symbol(e.fieldName), lowerType(e.ty))
+function lowerExp(e::F.PARTIAL_FUNCTION_APPLICATION_EXPRESSION)::IR.Expression
   local fn = F.typeRefCache(e.fn)[1]
-  return IR.PARTIAL_APPLICATION(pathName(F.nameConsiderBuiltin(fn)), lowerExps(e.args, scope),
+  return IR.PARTIAL_APPLICATION(pathName(F.nameConsiderBuiltin(fn)), lowerExps(e.args),
                                 Symbol[Symbol(n) for n in e.argNames], lowerType(e.ty))
 end
-lowerExp(e::F.BINDING_EXP, scope::Scope)::IR.Expression = lowerExp(e.exp, scope)
+lowerExp(e::F.BINDING_EXP)::IR.Expression = lowerExp(e.exp)
 #= Boxing (of a function's polymorphic or functional arguments) has no meaning in Julia, where
    every value is a value: the code generation always took the boxed expression itself. =#
-lowerExp(e::F.BOX_EXPRESSION, scope::Scope)::IR.Expression = lowerExp(e.exp, scope)
-lowerExp(e::F.UNBOX_EXPRESSION, scope::Scope)::IR.Expression = lowerExp(e.exp, scope)
-lowerExp(e::F.MUTABLE_EXPRESSION, scope::Scope)::IR.Expression = lowerExp(F.P_Pointer.access(e.exp), scope)
-lowerExp(e::F.NFExpression, scope::Scope)::IR.Expression =
+lowerExp(e::F.BOX_EXPRESSION)::IR.Expression = lowerExp(e.exp)
+lowerExp(e::F.UNBOX_EXPRESSION)::IR.Expression = lowerExp(e.exp)
+lowerExp(e::F.MUTABLE_EXPRESSION)::IR.Expression = lowerExp(F.P_Pointer.access(e.exp))
+lowerExp(e::F.NFExpression)::IR.Expression =
   error("OMJLIR lowering: the expression $(F.toString(e)) ($(nameof(typeof(e)))) has no OMJLIR form")
 
 "`inline`: the frontend's inline types that inline the function."
 const INLINE_TYPES = (:NORM_INLINE, :BUILTIN_EARLY_INLINE, :EARLY_INLINE)
 
-function lowerCall(call, scope::Scope)::IR.Expression
+function lowerCall(call)::IR.Expression
   if isvariant(call, F.TYPED_CALL)
     local a = call.attributes
     local attributes = IR.CallAttributes(a.builtin, a.isImpure, nameof(typeof(a.inlineType)) in INLINE_TYPES)
-    return IR.CALL(pathName(F.nameConsiderBuiltin(call.fn)), lowerExps(call.arguments, scope),
+    return IR.CALL(pathName(F.nameConsiderBuiltin(call.fn)), lowerExps(call.arguments),
                    lowerType(call.ty), attributes)
   elseif isvariant(call, F.TYPED_ARRAY_CONSTRUCTOR)
-    local (iterators, inner) = lowerIterators(call.iters, scope)
-    return IR.ARRAY_CONSTRUCTOR(lowerExp(call.exp, inner), iterators, lowerType(call.ty))
+    return IR.ARRAY_CONSTRUCTOR(lowerExp(call.exp), lowerIterators(call.iters), lowerType(call.ty))
   elseif isvariant(call, F.TYPED_REDUCTION)
-    local (iterators, inner) = lowerIterators(call.iters, scope)
-    return IR.REDUCTION(pathName(F.nameConsiderBuiltin(call.fn)), lowerExp(call.exp, inner), iterators, lowerType(call.ty))
+    return IR.REDUCTION(pathName(F.nameConsiderBuiltin(call.fn)), lowerExp(call.exp), lowerIterators(call.iters),
+                        lowerType(call.ty))
   end
   error("OMJLIR lowering: an untyped call")
 end
 
-"The iterators of an array constructor or a reduction, and the scope of its body."
-function lowerIterators(iters, scope::Scope)::Tuple{Vector{IR.Iterator}, Scope}
-  local iterators = IR.Iterator[]
-  local inner = scope
-  for (node, range) in iters
-    local name = Symbol(F.name(node))
-    push!(iterators, IR.Iterator(name, lowerExp(range, inner)))
-    inner = withIterator(inner, name)
-  end
-  return (iterators, inner)
-end
+"The iterators of an array constructor or a reduction."
+lowerIterators(iters)::Vector{IR.Iterator} =
+  IR.Iterator[IR.Iterator(Symbol(F.name(node)), lowerExp(range)) for (node, range) in iters]
 
-lowerClock(k::F.INFERRED_CLOCK, scope::Scope)::IR.ClockKind = IR.INFERRED_CLOCK()
-lowerClock(k::F.INTEGER_CLOCK, scope::Scope)::IR.ClockKind =
-  IR.INTEGER_CLOCK(lowerExp(k.intervalCounter, scope), lowerExp(k.resolution, scope))
-lowerClock(k::F.REAL_CLOCK, scope::Scope)::IR.ClockKind = IR.REAL_CLOCK(lowerExp(k.interval, scope))
-lowerClock(k::F.BOOLEAN_CLOCK, scope::Scope)::IR.ClockKind =
-  IR.BOOLEAN_CLOCK(lowerExp(k.condition, scope), lowerExp(k.startInterval, scope))
-lowerClock(k::F.SOLVER_CLOCK, scope::Scope)::IR.ClockKind =
-  IR.SOLVER_CLOCK(lowerExp(k.c, scope), lowerExp(k.solverMethod, scope))
+lowerClock(k::F.INFERRED_CLOCK)::IR.ClockKind = IR.INFERRED_CLOCK()
+lowerClock(k::F.INTEGER_CLOCK)::IR.ClockKind =
+  IR.INTEGER_CLOCK(lowerExp(k.intervalCounter), lowerExp(k.resolution))
+lowerClock(k::F.REAL_CLOCK)::IR.ClockKind = IR.REAL_CLOCK(lowerExp(k.interval))
+lowerClock(k::F.BOOLEAN_CLOCK)::IR.ClockKind =
+  IR.BOOLEAN_CLOCK(lowerExp(k.condition), lowerExp(k.startInterval))
+lowerClock(k::F.SOLVER_CLOCK)::IR.ClockKind =
+  IR.SOLVER_CLOCK(lowerExp(k.c), lowerExp(k.solverMethod))
 
 #= ==================================================================================== =#
 #= Statements                                                                           =#
 #= ==================================================================================== =#
 
-lowerStatements(stmts, scope::Scope)::Vector{IR.Statement} = IR.Statement[lowerStatement(s, scope) for s in stmts]
+lowerStatements(stmts)::Vector{IR.Statement} = IR.Statement[lowerStatement(s) for s in stmts]
 
 "The OMJLIR statement of the frontend statement `s`."
-function lowerStatement(s, scope::Scope)::IR.Statement
+function lowerStatement(s)::IR.Statement
   local source = lowerElementSource(s.source)
   if isvariant(s, F.ALG_ASSIGNMENT)
-    return IR.ASSIGNMENT(lowerExp(s.lhs, scope), lowerExp(s.rhs, scope), source)
+    return IR.ASSIGNMENT(lowerExp(s.lhs), lowerExp(s.rhs), source)
   elseif isvariant(s, F.ALG_IF)
     local branches = IR.StatementBranch[]
     local elseBody = IR.Statement[]
     for (k, (cond, body)) in enumerate(s.branches)
       if k == length(s.branches) && F.isTrue(cond)
-        elseBody = lowerStatements(body, scope)
+        elseBody = lowerStatements(body)
       else
-        push!(branches, IR.StatementBranch(lowerExp(cond, scope), lowerStatements(body, scope)))
+        push!(branches, IR.StatementBranch(lowerExp(cond), lowerStatements(body)))
       end
     end
     return IR.IF_STATEMENT(branches, elseBody, source)
   elseif isvariant(s, F.ALG_FOR)
     local name = Symbol(F.name(s.iterator))
     MetaModelica.isSome(s.range) || error("OMJLIR lowering: a for-statement without a range")
-    local iterator = IR.Iterator(name, lowerExp(s.range.data, scope))
-    return IR.FOR_STATEMENT(iterator, lowerStatements(s.body, withIterator(scope, name)), source)
+    local iterator = IR.Iterator(name, lowerExp(s.range.data))
+    return IR.FOR_STATEMENT(iterator, lowerStatements(s.body), source)
   elseif isvariant(s, F.ALG_WHILE)
-    return IR.WHILE_STATEMENT(lowerExp(s.condition, scope), lowerStatements(s.body, scope), source)
+    return IR.WHILE_STATEMENT(lowerExp(s.condition), lowerStatements(s.body), source)
   elseif isvariant(s, F.ALG_WHEN)
-    return IR.WHEN_STATEMENT(IR.WhenBranch[whenBranch(lowerExp(c, scope), lowerStatements(b, scope))
+    return IR.WHEN_STATEMENT(IR.WhenBranch[whenBranch(lowerExp(c), lowerStatements(b))
                                            for (c, b) in s.branches], source)
   elseif isvariant(s, F.ALG_ASSERT)
-    return IR.ASSERT(lowerExp(s.condition, scope), lowerExp(s.message, scope), lowerExp(s.level, scope), source)
+    return IR.ASSERT(lowerExp(s.condition), lowerExp(s.message), lowerExp(s.level), source)
   elseif isvariant(s, F.ALG_TERMINATE)
-    return IR.TERMINATE(lowerExp(s.message, scope), source)
+    return IR.TERMINATE(lowerExp(s.message), source)
   elseif isvariant(s, F.ALG_REINIT)
-    return IR.REINIT(lowerCref(F.toCref(s.cref), scope), lowerExp(s.reinitExp, scope), source)
+    return IR.REINIT(lowerCref(F.toCref(s.cref)), lowerExp(s.reinitExp), source)
   elseif isvariant(s, F.ALG_NORETCALL)
-    return IR.NORETCALL(lowerExp(s.exp, scope), source)
+    return IR.NORETCALL(lowerExp(s.exp), source)
   elseif isvariant(s, F.ALG_RETURN)
     return IR.RETURN(source)
   elseif isvariant(s, F.ALG_BREAK)
@@ -450,15 +332,15 @@ end
 #= ==================================================================================== =#
 
 """
-    lowerEquations(eqs, scope; reversed)
+    lowerEquations(eqs; reversed)
 
 The equations `eqs`, in reverse for the top-level, initial and else-branch equations (the
 previous backend's order, see the module's documentation).
 """
-function lowerEquations(eqs, scope::Scope; reversed::Bool)::Vector{IR.Equation}
+function lowerEquations(eqs; reversed::Bool)::Vector{IR.Equation}
   local out = IR.Equation[]
   for eq in (reversed ? Iterators.reverse(eqs) : eqs)
-    local lowered = lowerEquation(eq, scope)
+    local lowered = lowerEquation(eq)
     lowered === nothing || push!(out, lowered)
   end
   return out
@@ -467,40 +349,40 @@ end
 const ATTRIBUTES = IR.DEFAULT_ATTRIBUTES
 
 "The OMJLIR equation of the frontend equation `eq`; `nothing` for a connect equation."
-function lowerEquation(eq, scope::Scope)::Union{Nothing, IR.Equation}
+function lowerEquation(eq)::Union{Nothing, IR.Equation}
   local source = lowerElementSource(eq.source)
   if isvariant(eq, F.EQUATION_EQUALITY) || isvariant(eq, F.EQUATION_ARRAY_EQUALITY)
     local ty = lowerType(eq.ty)
-    local lhs = lowerExp(eq.lhs, scope)
-    local rhs = lowerExp(eq.rhs, scope)
+    local lhs = lowerExp(eq.lhs)
+    local rhs = lowerExp(eq.rhs)
     F.isComplex(eq.ty) && return IR.RECORD_EQUATION(lhs, rhs, ty, recordSize(ty), source, ATTRIBUTES)
     ty isa IR.T_ARRAY && return IR.ARRAY_EQUATION(lhs, rhs, ty, source, ATTRIBUTES)
     return IR.SCALAR_EQUATION(lhs, rhs, ty, source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_CREF_EQUALITY)
     #= A connection's equality, as the frontend's DAE conversion made it: a + (-b) = 0 =#
     local ty = lowerType(eq.lhs.ty)
-    local a = IR.CREF(lowerCref(eq.lhs, scope), ty)
-    local b = IR.CREF(lowerCref(eq.rhs, scope), ty)
+    local a = IR.CREF(lowerCref(eq.lhs), ty)
+    local b = IR.CREF(lowerCref(eq.rhs), ty)
     return IR.SCALAR_EQUATION(IR.BINARY(a, IR.ADD, IR.UNARY(IR.UMINUS, b, ty), ty), IR.REAL(0.0), ty, source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_FOR)
     local name = Symbol(F.name(eq.iterator))
     MetaModelica.isSome(eq.range) || error("OMJLIR lowering: a for-equation without a range")
-    local iterator = IR.Iterator(name, lowerExp(eq.range.data, scope))
-    return IR.FOR_EQUATION(iterator, lowerEquations(eq.body, withIterator(scope, name); reversed = true), source, ATTRIBUTES)
+    local iterator = IR.Iterator(name, lowerExp(eq.range.data))
+    return IR.FOR_EQUATION(iterator, lowerEquations(eq.body; reversed = true), source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_IF)
-    return lowerIfEquation(eq, source, scope)
+    return lowerIfEquation(eq, source)
   elseif isvariant(eq, F.EQUATION_WHEN)
-    return lowerWhenEquation(eq, source, scope)
+    return lowerWhenEquation(eq, source)
   elseif isvariant(eq, F.EQUATION_ASSERT)
-    return IR.ASSERT_EQUATION(lowerExp(eq.condition, scope), lowerExp(eq.message, scope), lowerExp(eq.level, scope), source)
+    return IR.ASSERT_EQUATION(lowerExp(eq.condition), lowerExp(eq.message), lowerExp(eq.level), source)
   elseif isvariant(eq, F.EQUATION_TERMINATE)
-    return IR.ALGORITHM(IR.Statement[IR.TERMINATE(lowerExp(eq.message, scope), source)], IR.ComponentRef[], source, ATTRIBUTES)
+    return IR.ALGORITHM(IR.Statement[IR.TERMINATE(lowerExp(eq.message), source)], IR.ComponentRef[], source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_REINIT)
     error("OMJLIR lowering: reinit outside a when-equation (MLS 8.3.6)")
   elseif isvariant(eq, F.EQUATION_NORETCALL)
-    return IR.ALGORITHM(IR.Statement[IR.NORETCALL(lowerExp(eq.exp, scope), source)], IR.ComponentRef[], source, ATTRIBUTES)
+    return IR.ALGORITHM(IR.Statement[IR.NORETCALL(lowerExp(eq.exp), source)], IR.ComponentRef[], source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_RECONFIGURE)
-    return lowerReconfigureEquation(eq, source, scope)
+    return lowerReconfigureEquation(eq, source)
   end
   #= EQUATION_CONNECT: the frontend's connection handling removed them =#
   return nothing
@@ -516,15 +398,15 @@ recordSize(ty::IR.ModelicaType)::Int = 1
 An if-equation: the branches in order, a last branch of condition `true` as the else-branch
 (as the frontend's DAE conversion did).
 """
-function lowerIfEquation(eq, source::IR.Source, scope::Scope)::IR.IF_EQUATION
+function lowerIfEquation(eq, source::IR.Source)::IR.IF_EQUATION
   local branches = IR.EquationBranch[]
   local elseEquations = IR.Equation[]
   for (k, b) in enumerate(eq.branches)
     isvariant(b, F.EQUATION_BRANCH) || error("OMJLIR lowering: an if-equation's branch the frontend did not type")
     if k == length(eq.branches) && F.isTrue(b.condition)
-      elseEquations = lowerEquations(b.body, scope; reversed = true)
+      elseEquations = lowerEquations(b.body; reversed = true)
     else
-      push!(branches, IR.EquationBranch(lowerExp(b.condition, scope), lowerEquations(b.body, scope; reversed = false)))
+      push!(branches, IR.EquationBranch(lowerExp(b.condition), lowerEquations(b.body; reversed = false)))
     end
   end
   return IR.IF_EQUATION(branches, elseEquations, source, ATTRIBUTES)
@@ -570,41 +452,41 @@ A when-equation: each branch's triggers and its equations as statements (an equa
 assignment, an if-equation an if-statement). One with a structural change (`recompilation`)
 is a structural when-equation.
 """
-function lowerWhenEquation(eq, source::IR.Source, scope::Scope)::IR.WHEN_EQUATION
+function lowerWhenEquation(eq, source::IR.Source)::IR.WHEN_EQUATION
   local branches = IR.WhenBranch[]
   for b in eq.branches
-    push!(branches, whenBranch(lowerExp(b.condition, scope), whenStatements(b.body, scope)))
+    push!(branches, whenBranch(lowerExp(b.condition), whenStatements(b.body)))
   end
   local structural = any(br -> any(s -> s isa IR.RECOMPILATION || s isa IR.AGENTIC_RECOMPILATION, br.body), branches)
   return IR.WHEN_EQUATION(branches, structural ? IR.STRUCTURAL_WHEN : IR.REGULAR_WHEN, source, ATTRIBUTES)
 end
 
 "The equations of a when-equation's branch, or of an if-equation in it, as statements."
-function whenStatements(eqs, scope::Scope)::Vector{IR.Statement}
+function whenStatements(eqs)::Vector{IR.Statement}
   local out = IR.Statement[]
   for eq in eqs
     local source = lowerElementSource(eq.source)
     if isvariant(eq, F.EQUATION_EQUALITY) || isvariant(eq, F.EQUATION_ARRAY_EQUALITY)
-      push!(out, IR.ASSIGNMENT(lowerExp(eq.lhs, scope), lowerExp(eq.rhs, scope), source))
+      push!(out, IR.ASSIGNMENT(lowerExp(eq.lhs), lowerExp(eq.rhs), source))
     elseif isvariant(eq, F.EQUATION_CREF_EQUALITY)
       local ty = lowerType(eq.lhs.ty)
-      push!(out, IR.ASSIGNMENT(IR.CREF(lowerCref(eq.lhs, scope), ty), IR.CREF(lowerCref(eq.rhs, scope), ty), source))
+      push!(out, IR.ASSIGNMENT(IR.CREF(lowerCref(eq.lhs), ty), IR.CREF(lowerCref(eq.rhs), ty), source))
     elseif isvariant(eq, F.EQUATION_REINIT)
-      push!(out, IR.REINIT(lowerCref(F.toCref(eq.cref), scope), lowerExp(eq.reinitExp, scope), source))
+      push!(out, IR.REINIT(lowerCref(F.toCref(eq.cref)), lowerExp(eq.reinitExp), source))
     elseif isvariant(eq, F.EQUATION_ASSERT)
-      push!(out, IR.ASSERT(lowerExp(eq.condition, scope), lowerExp(eq.message, scope), lowerExp(eq.level, scope), source))
+      push!(out, IR.ASSERT(lowerExp(eq.condition), lowerExp(eq.message), lowerExp(eq.level), source))
     elseif isvariant(eq, F.EQUATION_TERMINATE)
-      push!(out, IR.TERMINATE(lowerExp(eq.message, scope), source))
+      push!(out, IR.TERMINATE(lowerExp(eq.message), source))
     elseif isvariant(eq, F.EQUATION_NORETCALL)
-      push!(out, noretcallStatement(eq.exp, source, scope))
+      push!(out, noretcallStatement(eq.exp, source))
     elseif isvariant(eq, F.EQUATION_IF)
       local branches = IR.StatementBranch[]
       local elseBody = IR.Statement[]
       for (k, b) in enumerate(eq.branches)
         if k == length(eq.branches) && F.isTrue(b.condition)
-          elseBody = whenStatements(b.body, scope)
+          elseBody = whenStatements(b.body)
         else
-          push!(branches, IR.StatementBranch(lowerExp(b.condition, scope), whenStatements(b.body, scope)))
+          push!(branches, IR.StatementBranch(lowerExp(b.condition), whenStatements(b.body)))
         end
       end
       push!(out, IR.IF_STATEMENT(branches, elseBody, source))
@@ -620,8 +502,8 @@ end
 A call without outputs in a when-equation: OM.jl's structural changes `recompilation(c, v)`
 and `agentic_recompilation(c...)`, or a call for its effects.
 """
-function noretcallStatement(call, source::IR.Source, scope::Scope)::IR.Statement
-  local e = lowerExp(call, scope)
+function noretcallStatement(call, source::IR.Source)::IR.Statement
+  local e = lowerExp(call)
   if e isa IR.CALL && e.name === :recompilation
     local (c, v) = e.arguments
     c isa IR.CREF || error("OMJLIR lowering: recompilation of $(IR.toString(c)), not a component")
@@ -636,8 +518,8 @@ end
 OM.jl's reconfigure equation: a structural when-equation whose change an agent decides,
 with the variables it may change, its prompt and the initial equations for the new model.
 """
-function lowerReconfigureEquation(eq, source::IR.Source, scope::Scope)::IR.WHEN_EQUATION
-  local condition = lowerExp(eq.whenConditions[1], scope)
+function lowerReconfigureEquation(eq, source::IR.Source)::IR.WHEN_EQUATION
+  local condition = lowerExp(eq.whenConditions[1])
   local components = IR.ComponentRef[IR.ComponentRef(Symbol(n)) for n in reconfigureVariableNames(eq.variables)]
   local prompt = MetaModelica.isSome(eq.prompt) ? promptString(eq.prompt.data) : nothing
   local initialEquations = MetaModelica.isSome(eq.initialEquations) ? serializeInitialEquations(eq.initialEquations.data) : nothing
@@ -708,9 +590,9 @@ function lowerConnector(cty::Integer)::IR.ConnectorKind
 end
 
 "A binding's expression: of a typed or flattened binding; `nothing` for one evaluated or none."
-function lowerBinding(b, scope::Scope)::Union{Nothing, IR.Expression}
+function lowerBinding(b)::Union{Nothing, IR.Expression}
   (isvariant(b, F.TYPED_BINDING) || isvariant(b, F.FLAT_BINDING)) || return nothing
-  return lowerExp(b.bindingExp, scope)
+  return lowerExp(b.bindingExp)
 end
 
 const STATE_SELECTS = Dict("never" => IR.NEVER, "avoid" => IR.AVOID, "default" => IR.DEFAULT,
@@ -727,12 +609,12 @@ function lowerStateSelect(b)::Union{Nothing, IR.StateSelect}
 end
 
 "The built-in attributes of a variable (MLS 4.8), from the frontend's type attributes."
-function lowerAttributes(typeAttributes, scope::Scope)::IR.VariableAttributes
+function lowerAttributes(typeAttributes)::IR.VariableAttributes
   isempty(typeAttributes) && return IR.NO_ATTRIBUTES
   local values = Dict{String, Any}()
   for (name, b) in typeAttributes
     values[name] = name == "stateSelect" ? lowerStateSelect(b) :
-                   name == "unbounded" ? nothing : lowerExp(F.getTypedExp(b), scope)
+                   name == "unbounded" ? nothing : lowerExp(F.getTypedExp(b))
   end
   local get_(n) = get(values, n, nothing)
   return IR.VariableAttributes(get_("start"), get_("fixed"), get_("nominal"), get_("min"), get_("max"),
@@ -740,13 +622,12 @@ function lowerAttributes(typeAttributes, scope::Scope)::IR.VariableAttributes
 end
 
 "The OMJLIR variable of the frontend variable `v`."
-function lowerVariable(v, scope::Scope)::IR.Variable
-  local name = crefName(crefParts(v.name); withSubscripts = true)
-  name === nothing && error("OMJLIR lowering: the variable $(F.toString(v.name)) has a subscript that is not a literal")
+function lowerVariable(v)::IR.Variable
+  local name = lowerCref(v.name).name
   local ty = lowerType(v.ty)
   local a = v.attributes
-  return IR.Variable(name, ty, variableKind(a.variability, ty), lowerBinding(v.binding, scope),
-                     lowerAttributes(v.typeAttributes, scope), lowerDirection(a.direction),
+  return IR.Variable(name, ty, variableKind(a.variability, ty), lowerBinding(v.binding),
+                     lowerAttributes(v.typeAttributes), lowerDirection(a.direction),
                      v.visibility == F.Visibility.PROTECTED, lowerConnector(a.connectorType), lowerSource(v.info),
                      :model)
 end
@@ -756,10 +637,10 @@ end
 #= ==================================================================================== =#
 
 "The algorithm sections as ALGORITHM equations, their assigned variables their outputs."
-function lowerAlgorithms(algorithms, scope::Scope)::Vector{IR.Equation}
+function lowerAlgorithms(algorithms)::Vector{IR.Equation}
   local out = IR.Equation[]
   for alg in algorithms
-    local statements = lowerStatements(alg.statements, scope)
+    local statements = lowerStatements(alg.statements)
     push!(out, IR.ALGORITHM(statements, assignedCrefs(statements), lowerElementSource(alg.source), ATTRIBUTES))
   end
   return out
@@ -780,32 +661,25 @@ function assignedCrefs(statements::Vector{IR.Statement})::Vector{IR.ComponentRef
 end
 
 """
-    lowerSystem(equations, initialEquations, algorithms, initialAlgorithms, scope)
+    lowerSystem(equations, initialEquations, algorithms, initialAlgorithms)
 
 A continuous-time partition: the equations, then the algorithm sections; the initial
 equations, then the initial algorithm sections.
 """
-function lowerSystem(eqs, initialEqs, algorithms, initialAlgorithms, scope::Scope)::IR.Partition
-  local equations = lowerEquations(eqs, scope; reversed = true)
-  append!(equations, lowerAlgorithms(algorithms, scope))
-  local initialEquations = lowerEquations(initialEqs, scope; reversed = true)
-  append!(initialEquations, lowerAlgorithms(initialAlgorithms, scope))
+function lowerSystem(eqs, initialEqs, algorithms, initialAlgorithms)::IR.Partition
+  local equations = lowerEquations(eqs; reversed = true)
+  append!(equations, lowerAlgorithms(algorithms))
+  local initialEquations = lowerEquations(initialEqs; reversed = true)
+  append!(initialEquations, lowerAlgorithms(initialAlgorithms))
   local unknowns = Symbol[]
   return IR.Partition(1, IR.CONTINUOUS_PARTITION(), unknowns, equations, initialEquations)
 end
 
-"The variables of a flat model, and the scope of its expressions."
-function lowerVariables(fm)::Tuple{IR.VariableSet, Scope}
-  local names = Set{Symbol}()
-  for v in fm.variables
-    local n = crefName(crefParts(v.name); withSubscripts = true)
-    n === nothing || push!(names, n)
-  end
-  push!(names, :time)
-  local scope = Scope(names, Symbol[], false)
+"The variables of a flat model."
+function lowerVariables(fm)::IR.VariableSet
   local variables = IR.VariableSet()
   for v in fm.variables
-    local lowered = lowerVariable(v, scope)
+    local lowered = lowerVariable(v)
     #= The frontend emits an inner/outer component's variable twice (the previous backend
        kept the first, or the one with a start or fixed attribute) =#
     if haskey(variables, lowered.name)
@@ -817,7 +691,7 @@ function lowerVariables(fm)::Tuple{IR.VariableSet, Scope}
     end
     push!(variables, lowered)
   end
-  return (variables, scope)
+  return variables
 end
 
 """
@@ -843,7 +717,7 @@ partition (equations, algorithms, initial equations and algorithms), its structu
 `lowerFunctions`.
 """
 function lowerFlatModel(fm)::IR.Model
-  local (variables, scope) = lowerVariables(fm)
+  local variables = lowerVariables(fm)
   local initialMode = nothing
   local transitions = IR.StructuralTransition[]
   local equations = F.NFEquationImpl[]
@@ -855,16 +729,15 @@ function lowerFlatModel(fm)::IR.Model
       initialMode = F.toString(sc[2][1])
     else
       local (from, to, condition) = sc[2]
-      push!(transitions, IR.StructuralTransition(F.toString(from), F.toString(to), lowerExp(condition, scope)))
+      push!(transitions, IR.StructuralTransition(F.toString(from), F.toString(to), lowerExp(condition)))
     end
   end
-  local system = lowerSystem(equations, fm.initialEquations, fm.algorithms, fm.initialAlgorithms, scope)
+  local system = lowerSystem(equations, fm.initialEquations, fm.algorithms, fm.initialAlgorithms)
   local modes = IR.StructuralMode[]
   for sub in fm.structuralSubmodels
-    local (subVariables, subScope) = lowerVariables(sub)
-    push!(modes, IR.StructuralMode(sub.name, subVariables,
+    push!(modes, IR.StructuralMode(sub.name, lowerVariables(sub),
                                    lowerSystem(sub.equations, sub.initialEquations, sub.algorithms,
-                                               sub.initialAlgorithms, subScope)))
+                                               sub.initialAlgorithms)))
   end
   return IR.Model(fm.name, variables, IR.Partition[system], IR.Partition[], IR.ClockKind[],
                   Dict{Symbol, IR.ModelicaFunction}(), initialMode, modes, transitions, fm.scodeProgram)
