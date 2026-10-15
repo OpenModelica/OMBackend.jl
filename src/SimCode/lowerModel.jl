@@ -56,7 +56,8 @@ end
 function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.Partition)::SIM_CODE
   local vars = IR.Variable[v for v in variables if !(v.kind isa IR.STATE_DER)]
   local names = systemNames(vars, model.name)
-  local simVars = SIMVAR[SIMVAR(simName(names, v.cref), nothing, simVarKind(v, names), simVarAttributes(v, names)) for v in vars]
+  local simVars = SIMVAR[SIMVAR(simName(names, v.cref), nothing, simVarKind(v, names), simVarAttributes(v, names),
+                                simType(IR.elementType(v.ty))) for v in vars]
   local ht = createIndices(simVars)
   local eqs = classifyEquations(partition.equations)
   local initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(simStatements(names, w.branches[1].body)) for w in eqs.initialWhens]

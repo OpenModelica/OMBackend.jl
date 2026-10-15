@@ -64,27 +64,13 @@ function flattenRecordCallSites(simCode::SIM_CODE)::SIM_CODE
   for (name, (index, sv)) in ht
     local k = sv.varKind
     if k isa PARAMETER && k.bindExp !== nothing
-      ht[name] = (index, SIMVAR(sv.name, sv.index, PARAMETER(x(k.bindExp)), sv.attributes))
+      ht[name] = (index, withKind(sv, PARAMETER(x(k.bindExp))))
     elseif k isa ARRAY_PARAMETER && k.bindExp !== nothing
-      ht[name] = (index, SIMVAR(sv.name, sv.index, ARRAY_PARAMETER(k.dimensions, x(k.bindExp)), sv.attributes))
+      ht[name] = (index, withKind(sv, ARRAY_PARAMETER(k.dimensions, x(k.bindExp))))
     end
   end
-  return withEquations(simCode; residuals, whens, ifs, initialAlgorithms, asserts, initialEquations)
-end
-
-"""
-    withEquations(simCode; residuals, whens, ifs, initialAlgorithms, asserts, initialEquations)
-
-`simCode` with the given equations in place of its own.
-"""
-function withEquations(sc::SIM_CODE; residuals = sc.residualEquations, whens = sc.whenEquations, ifs = sc.ifEquations,
-                       initialAlgorithms = sc.initialAlgorithms, asserts = sc.asserts,
-                       initialEquations = sc.initialEquations)::SIM_CODE
-  return SIM_CODE(sc.name, sc.stringToSimVarHT, residuals, initialEquations, whens, ifs, sc.isSingular, sc.matchOrder,
-                  sc.equationGraph, sc.stronglyConnectedComponents, sc.structuralTransitions, sc.subModels,
-                  sc.sharedVariables, sc.topVariables, sc.sharedEquations, sc.activeModel, sc.frontendModel,
-                  sc.irreducibleVariables, sc.functions, sc.externalRuntime, sc.eliminatedEquations,
-                  sc.eliminatedVariables, sc.aliasMap, sc.observedFilter, initialAlgorithms, asserts)
+  return update(simCode; residualEquations = residuals, whenEquations = whens, ifEquations = ifs, initialAlgorithms, asserts,
+         initialEquations)
 end
 
 "A when-clause with its condition's and its statements' record arguments flattened (an assignment's value, a reinit's, a call, an assert's condition)."

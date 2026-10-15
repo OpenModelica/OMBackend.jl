@@ -161,3 +161,130 @@ const DYNAMIC_SUBSCRIPT_MARK = "[?]"
 
 "A reference's name: its symbol, with its Integer subscripts (`A[1][2]`)."
 crefName(c::SimCref)::String = isempty(c.subs) ? String(c.sym) : string(c.sym, join(("[$(i)]" for i in c.subs)))
+
+#= ==================================================================================== =#
+#= Traversals with an accumulator (the passes')                                         =#
+#= ==================================================================================== =#
+
+"""
+    traverseExpTopDown(e, visitor, arg)
+
+`e` traversed top-down by `visitor(x, arg) -> (newX, descend, newArg)`: `newX` replaces `x`,
+its children are traversed in turn if `descend`; `arg` is threaded through. A node whose
+children did not change is returned itself (`===`).
+"""
+function traverseExpTopDown(e::Exp, visitor::F, arg::T)::Tuple{Exp, T} where {F, T}
+  local (out, descend, a) = visitor(e, arg)
+  descend || return (out, a)
+  return traverseChildren(out, (x, acc) -> traverseExpTopDown(x, visitor, acc), a)
+end
+
+"""
+    traverseExpBottomUp(e, visitor, arg)
+
+`e` traversed bottom-up by `visitor(x, arg) -> (newX, newArg)`: `x`'s children are traversed
+first.
+"""
+function traverseExpBottomUp(e::Exp, visitor::F, arg::T)::Tuple{Exp, T} where {F, T}
+  local (out, a) = traverseChildren(e, (x, acc) -> traverseExpBottomUp(x, visitor, acc), arg)
+  return visitor(out, a)
+end
+
+"""
+    traverseChildren(e, recur, arg)
+
+`e` with `recur(child, arg) -> (newChild, newArg)` applied to its children in order (a
+reduction's iterator ranges after its body), itself if none changed.
+"""
+traverseChildren(e::Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, EXP_CREF, DER, PRE, WILD}, recur::R, arg) where {R} = (e, arg)
+function traverseChildren(e::Union{UNARY, LUNARY}, recur::R, arg) where {R}
+  local (x, a) = recur(e.exp, arg)
+  return (x === e.exp ? e : typeof(e)(e.op, x), a)
+end
+function traverseChildren(e::CAST, recur::R, arg) where {R}
+  local (x, a) = recur(e.exp, arg)
+  return (x === e.exp ? e : CAST(e.ty, x), a)
+end
+function traverseChildren(e::TSUB, recur::R, arg) where {R}
+  local (x, a) = recur(e.exp, arg)
+  return (x === e.exp ? e : TSUB(x, e.index, e.ty), a)
+end
+function traverseChildren(e::RSUB, recur::R, arg) where {R}
+  local (x, a) = recur(e.exp, arg)
+  return (x === e.exp ? e : RSUB(x, e.index, e.fieldName, e.ty), a)
+end
+function traverseChildren(e::Union{BINARY, LBINARY}, recur::R, arg) where {R}
+  local (x1, a1) = recur(e.exp1, arg)
+  local (x2, a2) = recur(e.exp2, a1)
+  return ((x1 === e.exp1 && x2 === e.exp2) ? e : typeof(e)(x1, e.op, x2), a2)
+end
+function traverseChildren(e::RELATION, recur::R, arg) where {R}
+  local (x1, a1) = recur(e.exp1, arg)
+  local (x2, a2) = recur(e.exp2, a1)
+  return ((x1 === e.exp1 && x2 === e.exp2) ? e : RELATION(x1, e.op, x2, e.index), a2)
+end
+function traverseChildren(e::IFEXP, recur::R, arg) where {R}
+  local (c, a1) = recur(e.cond, arg)
+  local (t, a2) = recur(e.thenExp, a1)
+  local (f, a3) = recur(e.elseExp, a2)
+  return ((c === e.cond && t === e.thenExp && f === e.elseExp) ? e : IFEXP(c, t, f), a3)
+end
+function traverseChildren(e::RANGE, recur::R, arg) where {R}
+  local (s, a1) = recur(e.start, arg)
+  local (st, a2) = e.step === nothing ? (nothing, a1) : recur(e.step, a1)
+  local (sp, a3) = recur(e.stop, a2)
+  return ((s === e.start && st === e.step && sp === e.stop) ? e : RANGE(e.ty, s, st, sp), a3)
+end
+function traverseChildren(e::CALL, recur::R, arg) where {R}
+  local (xs, a) = traverseVector(e.args, recur, arg)
+  return (xs === e.args ? e : CALL(e.name, xs, e.ty, e.kind), a)
+end
+function traverseChildren(e::PARTEVALFUNCTION, recur::R, arg) where {R}
+  local (xs, a) = traverseVector(e.args, recur, arg)
+  return (xs === e.args ? e : PARTEVALFUNCTION(e.name, xs, e.argNames, e.ty), a)
+end
+function traverseChildren(e::ARRAY_EXP, recur::R, arg) where {R}
+  local (xs, a) = traverseVector(e.elements, recur, arg)
+  return (xs === e.elements ? e : ARRAY_EXP(e.ty, e.scalar, xs), a)
+end
+function traverseChildren(e::RECORD, recur::R, arg) where {R}
+  local (xs, a) = traverseVector(e.exps, recur, arg)
+  return (xs === e.exps ? e : RECORD(e.name, xs, e.fieldNames, e.ty), a)
+end
+function traverseChildren(e::TUPLE, recur::R, arg) where {R}
+  local (xs, a) = traverseVector(e.elements, recur, arg)
+  return (xs === e.elements ? e : TUPLE(xs), a)
+end
+function traverseChildren(e::ASUB, recur::R, arg) where {R}
+  local (x, a1) = recur(e.exp, arg)
+  local (xs, a) = traverseVector(e.subs, recur, a1)
+  return ((x === e.exp && xs === e.subs) ? e : ASUB(x, xs), a)
+end
+function traverseChildren(e::REDUCTION, recur::R, arg) where {R}
+  local (b, a) = recur(e.body, arg)
+  local changed = b !== e.body
+  local its = Iterator[]
+  for it in e.iterators
+    local (r, a2) = recur(it.range, a)
+    a = a2
+    changed |= r !== it.range
+    push!(its, r === it.range ? it : Iterator(it.name, r))
+  end
+  return (changed ? REDUCTION(e.reducer, b, its, e.ty) : e, a)
+end
+
+"The elements traversed by `recur` in order; the vector itself if none changed."
+function traverseVector(xs::Vector{Exp}, recur::R, arg) where {R}
+  local out = nothing
+  local a = arg
+  for (i, x) in enumerate(xs)
+    local (y, a2) = recur(x, a)
+    a = a2
+    if out === nothing && y !== x
+      out = Vector{Exp}(undef, length(xs))
+      copyto!(out, 1, xs, 1, i - 1)
+    end
+    out === nothing || (out[i] = y)
+  end
+  return (out === nothing ? xs : out, a)
+end

@@ -111,9 +111,9 @@ function createIndices(simVars::Vector{SIMVAR})::OrderedDict{String, Tuple{Int, 
     local k = v.varKind
     if k isa STATE
       stateCounter += 1
-      local state = SIMVAR(v.name, stateCounter, k, v.attributes)
+      local state = withIndex(v, stateCounter)
       ht[v.name] = (stateCounter, state)
-      ht["der($(v.name))"] = (stateCounter, SIMVAR(v.name, stateCounter, STATE_DERIVATIVE(v.name), v.attributes))
+      ht["der($(v.name))"] = (stateCounter, withIndex(v, stateCounter, STATE_DERIVATIVE(v.name)))
     elseif k isa Union{PARAMETER, DATA_STRUCTURE}
       parameterCounter += 1
       ht[v.name] = (parameterCounter, v)
@@ -126,7 +126,7 @@ function createIndices(simVars::Vector{SIMVAR})::OrderedDict{String, Tuple{Int, 
   local counter = parameterCounter
   for v in arrayParameters
     counter += 1
-    ht[v.name] = (counter, SIMVAR(v.name, counter, v.varKind, v.attributes))
+    ht[v.name] = (counter, withIndex(v, counter))
   end
   local discreteCounter = stateCounter
   for v in discretes
@@ -139,7 +139,7 @@ function createIndices(simVars::Vector{SIMVAR})::OrderedDict{String, Tuple{Int, 
     index += 1
     sortIndex += 1
     local kind = v.varKind isa ALG_VARIABLE ? ALG_VARIABLE(sortIndex) : v.varKind
-    ht[v.name] = (index, SIMVAR(v.name, index, kind, v.attributes))
+    ht[v.name] = (index, withIndex(v, index, kind))
   end
   return ht
 end

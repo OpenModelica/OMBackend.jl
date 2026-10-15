@@ -660,13 +660,19 @@ end
 const NO_ATTRIBUTES = SimVarAttributes(nothing, nothing, nothing, nothing, nothing, nothing, nothing,
                                        nothing, nothing, false)
 
-"A simulation variable: its name, index (0-based, per category; `nothing` before indexing),
-category and attributes."
+"""
+    SIMVAR(name, index, varKind, attributes, elementType)
+
+A simulation variable: its name, index (1-based, per category; `nothing` before indexing),
+category, attributes, and the type of its scalars (of an array variable, of its elements):
+what the code generators read to declare an Integer, Boolean or enumeration variable.
+"""
 struct SIMVAR <: Node
   name::String
   index::Union{Nothing, Int}
   varKind::SimVarType
   attributes::SimVarAttributes
+  elementType::SType
 end
 
 #= ==================================================================================== =#
@@ -869,4 +875,16 @@ struct SIM_CODE{T8 <: Graphs.AbstractGraph}
   observedFilter::Union{Nothing, Vector{String}}
   initialAlgorithms::Vector{INITIAL_ALGORITHM}
   asserts::Vector{ASSERT_EQUATION}
+end
+
+"""
+    update(simCode; fields...)
+
+`simCode` with the fields named in `fields` replaced: `update(sc; residualEquations = eqs)`.
+"""
+function update(sc::SIM_CODE; fields...)::SIM_CODE
+  for name in keys(fields)
+    hasfield(SIM_CODE, name) || throw(ArgumentError("SIM_CODE has no field $name"))
+  end
+  return SIM_CODE((get(fields, f, getfield(sc, f)) for f in fieldnames(SIM_CODE))...)
 end

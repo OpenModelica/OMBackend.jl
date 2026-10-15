@@ -98,7 +98,7 @@ function addThetaResidual!(residuals::Vector{RESIDUAL_EQUATION}, irreducibles::V
   push!(residuals, RESIDUAL_EQUATION(BINARY(EXP_CREF(SimCref(Symbol(theta)), TYPE_REAL()), OP_SUB, RCONST(1.0)),
                                      NO_SOURCE, EQ_ATTR_DEFAULT))
   local (index, sv) = ht[theta]
-  ht[theta] = (index, SIMVAR(sv.name, sv.index, ALG_VARIABLE(0), sv.attributes))
+  ht[theta] = (index, withKind(sv, ALG_VARIABLE(0)))
   return nothing
 end
 

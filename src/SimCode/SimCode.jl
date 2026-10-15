@@ -49,7 +49,7 @@ import MetaGraphs
 import ..BackendUtil.GraphAlgorithms
 import ..OMJLIR
 import ..Passes: legacyName, isSampleTrigger, isBuiltinCallOf, tupleAssignElements, initialCall, builtinCall, edgeCall
-import ..unsupported, .._fallback, ..isTunableParameter
+import ..unsupported, .._fallback, ..isTunableParameter, ..BACKEND_PERFLOG
 const IR = OMJLIR
 
 include("types.jl")
@@ -60,5 +60,12 @@ include("lowerModel.jl")
 include("lowerStructure.jl")
 include("recordCallSites.jl")
 include("lowerFunctions.jl")
+include("queries.jl")
+include("passes/evaluation.jl")
+include("passes/trivialEquations.jl")
+include("passes/substitution.jl")
+include("passes/parameterClosure.jl")
+include("passes/constantPropagation.jl")
+include("passes/runner.jl")
 
 end # module SimCode
