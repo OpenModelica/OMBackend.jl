@@ -22,8 +22,6 @@ aliasClass(::TYPE_ENUM)::Symbol = :enum
 aliasClass(t::TYPE_ARRAY)::Symbol = aliasClass(t.elementType)
 aliasClass(::SType)::Symbol = :other
 
-isZeroLiteral(e::Exp)::Bool = (e isa RCONST && e.value == 0.0) || (e isa ICONST && e.value == 0)
-
 "`e` without trailing `- 0` and `+ 0` (a connection's `(a + b) - 0.0`)."
 function withoutZeroTerms(e::Exp)::Exp
   while e isa BINARY && (e.op === OP_SUB || e.op === OP_ADD) && isZeroLiteral(e.exp2)
