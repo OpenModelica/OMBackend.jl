@@ -221,9 +221,9 @@ simIterators(names::Names, its::Vector{IR.Iterator})::Vector{Iterator} =
 
 callKind(a::IR.CallAttributes)::CallKind = a.builtin ? CALL_BUILTIN : a.impure ? CALL_IMPURE_FUNCTION : CALL_FUNCTION
 
-"A subscript's expression (`:` as 0)."
+"A subscript's expression (`:` as WHOLE_DIMENSION)."
 subscriptExp(names::Names, s::Union{IR.INDEX, IR.SLICE})::Exp = simExp(names, s.exp)
-subscriptExp(::Names, ::IR.WHOLE)::Exp = ICONST(0)
+subscriptExp(::Names, ::IR.WHOLE)::Exp = WHOLE_DIMENSION()
 
 #= ==================================================================================== =#
 #= References                                                                           =#
@@ -234,8 +234,8 @@ subscriptExp(::Names, ::IR.WHOLE)::Exp = ICONST(0)
 
 A reference of type `ty`: a simulation variable by its name; the derivative variable
 `\$DER.x` as `der(x)`; an element of an array known as a whole as the array's reference with
-the element's Integer subscripts (with subscripts that are expressions as the array
-subscripted: an iterator's element in a reduction); one whose single subscript that is not a
+the element's Integer subscripts (with a subscript that is an expression, a slice or `:`, as
+the array subscripted: an iterator's element in a reduction, `p[2:n + 1]`); one whose single subscript that is not a
 literal, on a part before the last, selects among variables (a loop's iterator: Buildings' DX
 coils' `sta[i].nomVal`) as the array of their references, subscripted; another reference by
 its flat name.
@@ -250,13 +250,12 @@ function simCrefExp(names::Names, cref::IR.ComponentRef, ty::IR.ModelicaType)::E
   if isempty(last.subscripts) && !(base in names.known)
     return something(variablesBySubscript(names, cref, ty), Some(EXP_CREF(SimCref(Symbol(full)), simType(ty))))
   end
-  if any(s -> s isa IR.INDEX && !(s.exp isa Union{IR.INTEGER, IR.ENUM_LITERAL}), last.subscripts) &&
-     all(s -> s isa IR.INDEX, last.subscripts)
-    return ASUB(EXP_CREF(SimCref(Symbol(base)), simType(last.ty)), Exp[subscriptExp(names, s) for s in last.subscripts])
+  if all(s -> s isa IR.INDEX && s.exp isa IR.INTEGER, last.subscripts)
+    return EXP_CREF(SimCref(Symbol(base), Int[s.exp.value for s in last.subscripts]), simType(ty))
   end
-  any(s -> s isa IR.INDEX && s.exp isa IR.ENUM_LITERAL, last.subscripts) && return EXP_CREF(SimCref(Symbol(full)), simType(ty))
-  local subs = Int[s.exp.value for s in last.subscripts if s isa IR.INDEX && s.exp isa IR.INTEGER]
-  return EXP_CREF(SimCref(Symbol(base), subs), simType(ty))
+  all(s -> s isa IR.INDEX && s.exp isa Union{IR.INTEGER, IR.ENUM_LITERAL}, last.subscripts) &&
+    return EXP_CREF(SimCref(Symbol(full)), simType(ty))
+  return ASUB(EXP_CREF(SimCref(Symbol(base)), simType(last.ty)), Exp[subscriptExp(names, s) for s in last.subscripts])
 end
 
 "The SimCref of a reference (a variable's name)."

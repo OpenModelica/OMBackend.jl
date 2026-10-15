@@ -40,7 +40,7 @@
 
 The direct subexpressions of `e` (a reduction's iterator ranges included).
 """
-children(::Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, EXP_CREF, DER, PRE, WILD})::Vector{Exp} = Exp[]
+children(::Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, EXP_CREF, DER, PRE, WILD, WHOLE_DIMENSION})::Vector{Exp} = Exp[]
 children(e::Union{BINARY, LBINARY, RELATION})::Vector{Exp} = Exp[e.exp1, e.exp2]
 children(e::Union{UNARY, LUNARY, CAST, TSUB, RSUB})::Vector{Exp} = Exp[e.exp]
 children(e::IFEXP)::Vector{Exp} = Exp[e.cond, e.thenExp, e.elseExp]
@@ -57,7 +57,7 @@ children(e::REDUCTION)::Vector{Exp} = Exp[e.body, (it.range for it in e.iterator
 
 `e` with `g` applied to each of its direct subexpressions, one level.
 """
-mapChildren(g::G, e::Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, EXP_CREF, DER, PRE, WILD}) where {G} = e
+mapChildren(g::G, e::Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, EXP_CREF, DER, PRE, WILD, WHOLE_DIMENSION}) where {G} = e
 mapChildren(g::G, e::BINARY) where {G} = BINARY(g(e.exp1), e.op, g(e.exp2))
 mapChildren(g::G, e::LBINARY) where {G} = LBINARY(g(e.exp1), e.op, g(e.exp2))
 mapChildren(g::G, e::RELATION) where {G} = RELATION(g(e.exp1), e.op, g(e.exp2), e.index)
@@ -110,20 +110,30 @@ function anyExp(p::F, e::Exp)::Bool where {F}
   return any(c -> anyExp(p, c), children(e))
 end
 
+"""
+    mapStatementExps(g, s)
+
+`s` with each of its expressions `e` (of nested statements too) replaced by `g(e)`, whole;
+the targets of `reinit` and of OM.jl's structural changes kept.
+"""
+mapStatementExps(g::G, s::ASSIGN) where {G} = ASSIGN(g(s.left), g(s.right), s.source)
+mapStatementExps(g::G, s::IF) where {G} =
+  IF(Branch[Branch(g(b.condition), mapStatementExps(g, b.body)) for b in s.branches], mapStatementExps(g, s.elseBody), s.source)
+mapStatementExps(g::G, s::FOR) where {G} = FOR(Iterator(s.iterator.name, g(s.iterator.range)), mapStatementExps(g, s.body), s.source)
+mapStatementExps(g::G, s::WHILE) where {G} = WHILE(g(s.condition), mapStatementExps(g, s.body), s.source)
+mapStatementExps(g::G, s::WHEN) where {G} =
+  WHEN(Branch[Branch(g(b.condition), mapStatementExps(g, b.body)) for b in s.branches], s.source)
+mapStatementExps(g::G, s::ASSERT) where {G} = ASSERT(g(s.condition), g(s.message), g(s.level), s.source)
+mapStatementExps(g::G, s::TERMINATE) where {G} = TERMINATE(g(s.message), s.source)
+mapStatementExps(g::G, s::REINIT) where {G} = REINIT(s.stateVar, g(s.value), s.source)
+mapStatementExps(g::G, s::NORETCALL) where {G} = NORETCALL(g(s.exp), s.source)
+mapStatementExps(g::G, s::RECOMPILATION) where {G} = RECOMPILATION(s.componentToChange, g(s.newValue))
+mapStatementExps(g::G, s::Union{RETURN, BREAK, AGENTIC_RECOMPILATION}) where {G} = s
+
+mapStatementExps(g::G, body::Vector{Statement}) where {G} = Statement[mapStatementExps(g, s) for s in body]
+
 "`s` with `f` mapped (as by `mapExp`) over its expressions; the targets of `reinit` and of OM.jl's structural changes kept."
-mapStatement(f::F, s::ASSIGN) where {F} = ASSIGN(mapExp(f, s.left), mapExp(f, s.right), s.source)
-mapStatement(f::F, s::IF) where {F} =
-  IF(Branch[Branch(mapExp(f, b.condition), mapStatements(f, b.body)) for b in s.branches], mapStatements(f, s.elseBody), s.source)
-mapStatement(f::F, s::FOR) where {F} = FOR(Iterator(s.iterator.name, mapExp(f, s.iterator.range)), mapStatements(f, s.body), s.source)
-mapStatement(f::F, s::WHILE) where {F} = WHILE(mapExp(f, s.condition), mapStatements(f, s.body), s.source)
-mapStatement(f::F, s::WHEN) where {F} =
-  WHEN(Branch[Branch(mapExp(f, b.condition), mapStatements(f, b.body)) for b in s.branches], s.source)
-mapStatement(f::F, s::ASSERT) where {F} = ASSERT(mapExp(f, s.condition), mapExp(f, s.message), mapExp(f, s.level), s.source)
-mapStatement(f::F, s::TERMINATE) where {F} = TERMINATE(mapExp(f, s.message), s.source)
-mapStatement(f::F, s::REINIT) where {F} = REINIT(s.stateVar, mapExp(f, s.value), s.source)
-mapStatement(f::F, s::NORETCALL) where {F} = NORETCALL(mapExp(f, s.exp), s.source)
-mapStatement(f::F, s::RECOMPILATION) where {F} = RECOMPILATION(s.componentToChange, mapExp(f, s.newValue))
-mapStatement(f::F, s::Union{RETURN, BREAK, AGENTIC_RECOMPILATION}) where {F} = s
+mapStatement(f::F, s::Statement) where {F} = mapStatementExps(e -> mapExp(f, e), s)
 
 mapStatements(f::F, body::Vector{Statement}) where {F} = Statement[mapStatement(f, s) for s in body]
 
@@ -196,7 +206,7 @@ end
 `e` with `recur(child, arg) -> (newChild, newArg)` applied to its children in order (a
 reduction's iterator ranges after its body), itself if none changed.
 """
-traverseChildren(e::Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, EXP_CREF, DER, PRE, WILD}, recur::R, arg) where {R} = (e, arg)
+traverseChildren(e::Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, EXP_CREF, DER, PRE, WILD, WHOLE_DIMENSION}, recur::R, arg) where {R} = (e, arg)
 function traverseChildren(e::Union{UNARY, LUNARY}, recur::R, arg) where {R}
   local (x, a) = recur(e.exp, arg)
   return (x === e.exp ? e : typeof(e)(e.op, x), a)

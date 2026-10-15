@@ -241,6 +241,9 @@ end
 "The discarded output in a tuple assignment: `(a, _) = f(x)`."
 struct WILD <: Exp end
 
+"The subscript `:`: every element of its dimension (`A[1, :]`)."
+struct WHOLE_DIMENSION <: Exp end
+
 "`exp1 op exp2` for an arithmetic `op`."
 struct BINARY <: Exp
   exp1::Exp

@@ -86,7 +86,7 @@ For each reference of a record type in the equations, the names of its fields' v
 (`r_f`; of a reference whose `r_re` and `r_im` are variables, those): the code generation
 flattens a record reference into its fields, which must stay.
 """
-function complexFieldNames!(names::OrderedSet{String}, equations, ht::HT)::OrderedSet{String}
+function complexFieldNames!(names::OrderedSet{String}, equations::AbstractVector{<:Equation}, ht::HT)::OrderedSet{String}
   local visit = x -> begin
     x isa EXP_CREF || return
     local base = crefName(x.cref)
