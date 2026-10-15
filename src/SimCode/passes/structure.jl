@@ -1,0 +1,102 @@
+#= The structure of the final residual system: its strongly connected components, the index
+   over-constraint diagnostic. =#
+
+"""
+    augmentMatching!(i, incidence, columnOf, rowOf, seen)
+
+Whether an augmenting path from row `i` matches it to one of its `incidence[i]` columns (not
+in `seen`), re-matching the rows on the path.
+"""
+function augmentMatching!(i::Int, incidence::Vector{OrderedSet{String}}, columnOf::Vector{String},
+                          rowOf::Dict{String, Int}, seen::OrderedSet{String})::Bool
+  for c in incidence[i]
+    c in seen && continue
+    push!(seen, c)
+    if !haskey(rowOf, c) || augmentMatching!(rowOf[c], incidence, columnOf, rowOf, seen)
+      rowOf[c] = i
+      columnOf[i] = c
+      return true
+    end
+  end
+  return false
+end
+
+"A maximum matching of the rows of `incidence` to their columns: each row's column (`\"\"` for none), each column's row."
+function maximumMatching(incidence::Vector{OrderedSet{String}})::Tuple{Vector{String}, Dict{String, Int}}
+  local columnOf = fill("", length(incidence))
+  local rowOf = Dict{String, Int}()
+  for i in eachindex(incidence)
+    augmentMatching!(i, incidence, columnOf, rowOf, OrderedSet{String}())
+  end
+  return (columnOf, rowOf)
+end
+
+"""
+    recomputeStronglyConnectedComponents(simCode)
+
+The strongly connected components of the final residuals (those of the causalization index
+the residuals before the passes): the residuals matched to the unknowns they read, an edge
+from a residual to the one that solves an unknown it reads. MTK's code generation extracts a
+nonlinear system per cyclic component. Nothing for a model with modes.
+"""
+function recomputeStronglyConnectedComponents(simCode::SIM_CODE)::SIM_CODE
+  hasSubModels(simCode) && return simCode
+  local residuals = simCode.residualEquations
+  isempty(residuals) && return update(simCode; stronglyConnectedComponents = Vector{Int}[])
+  local unknowns = OrderedSet{String}(k for (k, (_, v)) in simCode.stringToSimVarHT if isUnknownVarKind(v.varKind))
+  local incidence = OrderedSet{String}[intersect(crefNames!(OrderedSet{String}(), eq.exp), unknowns) for eq in residuals]
+  local (_, rowOf) = maximumMatching(incidence)
+  local g = MetaGraphs.MetaDiGraph(length(residuals))
+  for (i, names) in enumerate(incidence), v in names
+    local j = get(rowOf, v, 0)
+    (j > 0 && j != i) && Graphs.add_edge!(g, i, j)
+  end
+  return update(simCode; stronglyConnectedComponents = Vector{Int}[Vector{Int}(c) for c in GraphAlgorithms.stronglyConnectedComponents(g)])
+end
+
+"The names `e` reads differentiated (`der(x)`) and plainly, apart."
+function differentialNames!(differentiated::OrderedSet{String}, plain::OrderedSet{String}, e::Exp)::Nothing
+  if e isa DER
+    push!(differentiated, crefName(e.cref))
+  elseif e isa CALL && e.name === :der
+    foreach(a -> crefNames!(differentiated, a), e.args)
+  elseif e isa EXP_CREF
+    push!(plain, crefName(e.cref))
+  else
+    foreach(c -> differentialNames!(differentiated, plain, c), children(e))
+  end
+  return nothing
+end
+
+"""
+    indexOverconstraintDiagnostic(simCode)
+
+With `OMBACKEND_INDEX_DIAG` set: the residuals a matching to their highest derivatives (`der(x)`
+of a state, `y` of an algebraic variable) leaves unmatched, the over-constraining ones,
+logged. `simCode` unchanged.
+"""
+function indexOverconstraintDiagnostic(simCode::SIM_CODE)::SIM_CODE
+  envSwitch("OMBACKEND_INDEX_DIAG") || return simCode
+  local ht = simCode.stringToSimVarHT
+  local states = Set{String}(k for (k, (_, v)) in ht if isUnknownVarKind(v.varKind) && isState(v))
+  local algebraic = Set{String}(k for (k, (_, v)) in ht if isUnknownVarKind(v.varKind) && !isState(v))
+  local incidence = OrderedSet{String}[]
+  for eq in simCode.residualEquations
+    local (d, p) = (OrderedSet{String}(), OrderedSet{String}())
+    differentialNames!(d, p, eq.exp)
+    local columns = OrderedSet{String}()
+    for n in d
+      n in states && push!(columns, "der_" * n)
+      n in algebraic && push!(columns, n)
+    end
+    foreach(n -> n in algebraic && push!(columns, n), p)
+    push!(incidence, columns)
+  end
+  local (columnOf, _) = maximumMatching(incidence)
+  local unmatched = findall(isempty, columnOf)
+  @info "[SIMCODE: $(simCode.name): indexDiag] differential-incidence localization" n_eqs = length(incidence) nHighestVars = length(states) + length(algebraic) nUnmatched = length(unmatched)
+  for i in unmatched
+    @info "[SIMCODE: $(simCode.name): indexDiag] unmatched [$i]" equation = simCode.residualEquations[i]
+  end
+  return simCode
+end
