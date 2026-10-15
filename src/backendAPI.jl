@@ -245,6 +245,29 @@ DEJL (DifferentialEquations.jl) models that have been compiled one time.
 """
 const COMPILED_MODELS_DEJL = Dict{String, Tuple{Expr, Bool, UInt64}}()
 
+"How many times each model's code was dumped in this process (`dumpGeneratedCode`)."
+const CODE_DUMP_COUNT = Dict{String, Int}()
+const CODE_DUMP_LOCK = ReentrantLock()
+
+"""
+    dumpGeneratedCode(modelName, code)
+
+With `OMBACKEND_CODE_DUMP_DIR` set, write the generated module to
+`<dir>/<modelName>-<n>.jl`, `n` counting the translations of the model in this
+process: the reference corpus for comparing the code generation before and after
+a backend change.
+"""
+function dumpGeneratedCode(modelName::String, code::Expr)::Nothing
+  local dir = get(ENV, "OMBACKEND_CODE_DUMP_DIR", "")
+  isempty(dir) && return nothing
+  lock(CODE_DUMP_LOCK) do
+    local n = CODE_DUMP_COUNT[modelName] = get(CODE_DUMP_COUNT, modelName, 0) + 1
+    mkpath(dir)
+    write(joinpath(dir, "$(modelName)-$(n).jl"), string(code))
+  end
+  return nothing
+end
+
 """
 Array-preserving code generation for flat models translated with `scalarized = false`
 (experimental): an explicit ODE whose equations are `der(x) = e`, `der(x[i]) = e` or for-loops
@@ -658,6 +681,7 @@ end
 
 function _translationResult(result::Tuple{String, Expr}, nameMap::NameRewriteMap,
                             returnNameMap::Bool)
+  dumpGeneratedCode(result[1], result[2])
   if returnNameMap
     return (result[1], result[2], nameMap)
   end
@@ -977,6 +1001,7 @@ function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel; functionL
     @info "[backendAPI] array ODE path not taken for $(modelName): $(modelCode)"
     return nothing
   end
+  dumpGeneratedCode(modelName, modelCode)
   #= evaluated again at the next simulate: a module of this name may be another path's =#
   COMPILED_MODELS_DEJL[modelName] = (modelCode, true, hash(modelCode))
   #= and the ModelingToolkit path's build goes: its module is replaced, and its code (the same
