@@ -75,6 +75,8 @@ include("passes/explicitFold.jl")
 include("passes/discretes.jl")
 include("passes/initialValues.jl")
 include("passes/structure.jl")
+include("passes/outputOnly.jl")
 include("passes/runner.jl")
+include("passes/pipeline.jl")
 
 end # module SimCode
