@@ -528,6 +528,21 @@ struct StatementBranch <: Node
   body::Vector{Statement}
 end
 
+"""
+    WhenBranch(triggers, atInitial, atTerminal, body)
+
+A branch of a when-equation or a when-statement (MLS 8.3.5, 8.6): the conditions whose rising
+edges fire it (`[c]` for `when c`, `[c1, c2]` for `when {c1, c2}`), whether it is also active
+at the initialization (`when initial()`, `when {..., initial(), ...}`) and at the end of the
+simulation (`terminal()`), and its statements. `when initial()` has no triggers.
+"""
+struct WhenBranch <: Node
+  triggers::Vector{Expression}
+  atInitial::Bool
+  atTerminal::Bool
+  body::Vector{Statement}
+end
+
 "`if ... elseif ... else ... end if`: the branches in order, then the else-statements."
 struct IF_STATEMENT <: Statement
   branches::Vector{StatementBranch}
@@ -551,7 +566,7 @@ end
 
 "`when ... elsewhen ... end when` in an algorithm: the branches in order."
 struct WHEN_STATEMENT <: Statement
-  branches::Vector{StatementBranch}
+  branches::Vector{WhenBranch}
   source::Source
 end
 
@@ -705,23 +720,19 @@ mutable struct FOR_EQUATION <: Equation
 end
 
 """
-How a when-equation is evaluated: at the events of its conditions, at initialization only
-(`when initial()` in an initial equation section), or as an OM.jl structural transition.
+A when-equation's role: a regular one, or OM.jl's structural transition (its body changes the
+model's structure: `recompilation`, `agentic_recompilation`).
 """
-@enum WhenKind begin
-  REGULAR_WHEN
-  INITIAL_WHEN
-  STRUCTURAL_WHEN
-end
+@enum WhenKind REGULAR_WHEN STRUCTURAL_WHEN
 
 """
     WHEN_EQUATION(branches, kind, source, attributes)
 
-`when ... elsewhen ... end when`: the branches in order, each a condition and the statements
-(assignments, `reinit`, `assert`, `terminate`, calls) executed at its events.
+`when ... elsewhen ... end when`: the branches in order, each with its triggers and the
+statements (assignments, `reinit`, `assert`, `terminate`, calls) executed at its events.
 """
 mutable struct WHEN_EQUATION <: Equation
-  branches::Vector{StatementBranch}
+  branches::Vector{WhenBranch}
   kind::WhenKind
   source::Source
   attributes::EquationAttributes
@@ -830,10 +841,12 @@ const NO_ATTRIBUTES = VariableAttributes(nothing, nothing, nothing, nothing, not
                                          nothing, nothing, nothing)
 
 """
-    Variable(name, ty, kind, binding, attributes, direction, isProtected, connector, source)
+    Variable(name, ty, kind, binding, attributes, direction, isProtected, connector, source, origin)
 
 A variable of the model. Mutable: the passes change a variable's kind, binding or
-attributes in place, and every reference to it sees the change.
+attributes in place, and every reference to it sees the change. `origin`: `:model` for one of
+the flat model, else the pass that introduced it (NB's auxiliaries: `\$DER.x`, a when-condition's
+variable, an if-expression's temporary).
 """
 mutable struct Variable
   const name::Symbol
@@ -845,6 +858,7 @@ mutable struct Variable
   isProtected::Bool
   connector::ConnectorKind
   source::Source
+  const origin::Symbol
 end
 
 """
@@ -1454,6 +1468,29 @@ function _printBranches(io::IO, keyword::String, elseKeyword::String, branches::
     _printStatements(io, b.body, indent * "  ")
   end
 end
+
+"A when-branch's condition as written: its triggers, `initial()` and `terminal()` among them."
+function _printWhenCondition(io::IO, b::WhenBranch)
+  local members = Any[b.triggers...]
+  b.atInitial && push!(members, "initial()")
+  b.atTerminal && push!(members, "terminal()")
+  length(members) == 1 && return (members[1] isa String ? print(io, members[1]) : _print(io, members[1]))
+  print(io, "{")
+  for (i, m) in enumerate(members)
+    i > 1 && print(io, ", ")
+    m isa String ? print(io, m) : _print(io, m)
+  end
+  print(io, "}")
+end
+
+function _printWhenBranches(io::IO, branches::Vector{WhenBranch}, indent::String)
+  for (i, b) in enumerate(branches)
+    print(io, i == 1 ? "when" : indent * "elsewhen", " ")
+    _printWhenCondition(io, b)
+    print(io, " then\n")
+    _printStatements(io, b.body, indent * "  ")
+  end
+end
 function _print(io::IO, s::IF_STATEMENT, indent::String)
   _printBranches(io, "if", "elseif", s.branches, indent)
   if !isempty(s.elseBody)
@@ -1477,7 +1514,7 @@ function _print(io::IO, s::WHILE_STATEMENT, indent::String)
   print(io, indent, "end while")
 end
 _print(io::IO, s::WHEN_STATEMENT, indent::String) =
-  (_printBranches(io, "when", "elsewhen", s.branches, indent); print(io, indent, "end when"))
+  (_printWhenBranches(io, s.branches, indent); print(io, indent, "end when"))
 _print(io::IO, s::ASSERT, ::String) =
   (print(io, "assert("); _printJoined(io, Expression[s.condition, s.message, s.level]); print(io, ")"))
 _print(io::IO, s::TERMINATE, ::String) = (print(io, "terminate("); _print(io, s.message); print(io, ")"))
@@ -1489,7 +1526,8 @@ _print(io::IO, s::RECOMPILATION, ::String) = (print(io, "recompilation("); _prin
 _print(io::IO, s::AGENTIC_RECOMPILATION, ::String) =
   (print(io, "agenticRecompilation("); _printJoined(io, s.components); print(io, ")"))
 
-_print(io::IO, b::StatementBranch) = _printBranches(io, "when", "elsewhen", [b], "")
+_print(io::IO, b::StatementBranch) = _printBranches(io, "if", "elseif", [b], "")
+_print(io::IO, b::WhenBranch) = _printWhenBranches(io, [b], "")
 _print(io::IO, b::EquationBranch) = (print(io, "if "); _print(io, b.condition); print(io, " then ..."))
 
 function _printEquations(io::IO, eqs::Vector{Equation}, indent::String)
@@ -1530,7 +1568,7 @@ function _print(io::IO, eq::FOR_EQUATION, indent::String)
 end
 function _print(io::IO, eq::WHEN_EQUATION, indent::String)
   eq.kind === REGULAR_WHEN || print(io, "/*", eq.kind, "*/ ")
-  _printBranches(io, "when", "elsewhen", eq.branches, indent)
+  _printWhenBranches(io, eq.branches, indent)
   print(io, indent, "end when")
 end
 _print(io::IO, eq::ASSERT_EQUATION, ::String) =
@@ -1571,6 +1609,7 @@ function _print(io::IO, v::Variable)
   print(io, "] ")
   _print(io, v.ty)
   print(io, " ", v.name)
+  v.origin === :model || print(io, " /*", v.origin, "*/")
   v.attributes == NO_ATTRIBUTES || (print(io, "("); _print(io, v.attributes); print(io, ")"))
   v.binding === nothing || (print(io, " = "); _print(io, v.binding))
 end

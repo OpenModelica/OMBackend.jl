@@ -427,8 +427,8 @@ function lowerStatement(s, scope::Scope)::IR.Statement
   elseif isvariant(s, F.ALG_WHILE)
     return IR.WHILE_STATEMENT(lowerExp(s.condition, scope), lowerStatements(s.body, scope), source)
   elseif isvariant(s, F.ALG_WHEN)
-    return IR.WHEN_STATEMENT(IR.StatementBranch[IR.StatementBranch(lowerExp(c, scope), lowerStatements(b, scope))
-                                                for (c, b) in s.branches], source)
+    return IR.WHEN_STATEMENT(IR.WhenBranch[whenBranch(lowerExp(c, scope), lowerStatements(b, scope))
+                                           for (c, b) in s.branches], source)
   elseif isvariant(s, F.ALG_ASSERT)
     return IR.ASSERT(lowerExp(s.condition, scope), lowerExp(s.message, scope), lowerExp(s.level, scope), source)
   elseif isvariant(s, F.ALG_TERMINATE)
@@ -531,14 +531,49 @@ function lowerIfEquation(eq, source::IR.Source, scope::Scope)::IR.IF_EQUATION
 end
 
 """
-A when-equation: each branch's condition and its equations as statements (an equality an
+    whenBranch(condition, body)
+
+A when-branch of the condition `condition` (MLS 8.6): `initial()` and `terminal()` as members
+of a vector condition are the branch's activity at the initialization and at the end, the
+other members its triggers. An `initial()` disjunct of `or` is dropped: it is true only at the
+initialization, where the when is not active, and false after (`when initial() or x > 0.6`
+fires at x's crossing only, as in OpenModelica).
+"""
+function whenBranch(condition::IR.Expression, body::Vector{IR.Statement})::IR.WhenBranch
+  local triggers = IR.Expression[]
+  local (atInitial, atTerminal) = (false, false)
+  for member in (condition isa IR.ARRAY ? condition.elements : IR.Expression[condition])
+    local m = withoutInitialDisjunct(member)
+    if IR.isBuiltinCall(m, :initial)
+      atInitial = true
+    elseif IR.isBuiltinCall(m, :terminal)
+      atTerminal = true
+    else
+      push!(triggers, m)
+    end
+  end
+  return IR.WhenBranch(triggers, atInitial, atTerminal, body)
+end
+
+"`e` without its `initial()` disjuncts (of `or`)."
+function withoutInitialDisjunct(e::IR.Expression)::IR.Expression
+  (e isa IR.LBINARY && e.op === IR.OR) || return e
+  local l = withoutInitialDisjunct(e.exp1)
+  local r = withoutInitialDisjunct(e.exp2)
+  IR.isBuiltinCall(l, :initial) && return r
+  IR.isBuiltinCall(r, :initial) && return l
+  return IR.LBINARY(l, e.op, r)
+end
+
+"""
+A when-equation: each branch's triggers and its equations as statements (an equality an
 assignment, an if-equation an if-statement). One with a structural change (`recompilation`)
 is a structural when-equation.
 """
 function lowerWhenEquation(eq, source::IR.Source, scope::Scope)::IR.WHEN_EQUATION
-  local branches = IR.StatementBranch[]
+  local branches = IR.WhenBranch[]
   for b in eq.branches
-    push!(branches, IR.StatementBranch(lowerExp(b.condition, scope), whenStatements(b.body, scope)))
+    push!(branches, whenBranch(lowerExp(b.condition, scope), whenStatements(b.body, scope)))
   end
   local structural = any(br -> any(s -> s isa IR.RECOMPILATION || s isa IR.AGENTIC_RECOMPILATION, br.body), branches)
   return IR.WHEN_EQUATION(branches, structural ? IR.STRUCTURAL_WHEN : IR.REGULAR_WHEN, source, ATTRIBUTES)
@@ -607,7 +642,7 @@ function lowerReconfigureEquation(eq, source::IR.Source, scope::Scope)::IR.WHEN_
   local prompt = MetaModelica.isSome(eq.prompt) ? promptString(eq.prompt.data) : nothing
   local initialEquations = MetaModelica.isSome(eq.initialEquations) ? serializeInitialEquations(eq.initialEquations.data) : nothing
   local body = IR.Statement[IR.AGENTIC_RECOMPILATION(components, prompt, initialEquations)]
-  return IR.WHEN_EQUATION([IR.StatementBranch(condition, body)], IR.STRUCTURAL_WHEN, source, ATTRIBUTES)
+  return IR.WHEN_EQUATION([whenBranch(condition, body)], IR.STRUCTURAL_WHEN, source, ATTRIBUTES)
 end
 
 "The prompt of a reconfigure equation: a string literal."
@@ -712,7 +747,8 @@ function lowerVariable(v, scope::Scope)::IR.Variable
   local a = v.attributes
   return IR.Variable(name, ty, variableKind(a.variability, ty), lowerBinding(v.binding, scope),
                      lowerAttributes(v.typeAttributes, scope), lowerDirection(a.direction),
-                     v.visibility == F.Visibility.PROTECTED, lowerConnector(a.connectorType), lowerSource(v.info))
+                     v.visibility == F.Visibility.PROTECTED, lowerConnector(a.connectorType), lowerSource(v.info),
+                     :model)
 end
 
 #= ==================================================================================== =#
