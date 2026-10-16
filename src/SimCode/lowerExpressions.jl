@@ -47,12 +47,14 @@ The simulation names of a model's references: a reference's flat name (`a.b[1,2]
 variable `a_b`) a new one (`a_b_1`): the least qualified keeps the name. `known` are the
 names of the simulation variables (with `der(x)` of the states and the built-in `time`,
 `pi`, `e`): a reference to an element of an array known as a whole is the array's, subscripted.
-`stateOf` maps a derivative variable `\$DER.x` to its state `x`.
+`stateOf` maps a derivative variable `\$DER.x` to its state `x`. `scalars` are the known names
+of variables that are not arrays.
 """
 struct Names
   renamed::Dict{Symbol, String}
   known::Set{String}
   stateOf::Dict{Symbol, IR.ComponentRef}
+  scalars::Set{String}
 end
 
 """
@@ -249,19 +251,30 @@ A reference of type `ty`: a simulation variable by its name; the derivative vari
 the element's Integer subscripts (with a subscript that is an expression, a slice or `:`, as
 the array subscripted: an iterator's element in a reduction, `p[2:n + 1]`); one whose single subscript that is not a
 literal, on a part before the last, selects among variables (a loop's iterator: Buildings' DX
-coils' `sta[i].nomVal`) as the array of their references, subscripted; another reference by
-its flat name.
+coils' `sta[i].nomVal`, `sta[iSta].perCur.capFunT[6]` in an initial algorithm) as the array of
+their references, subscripted; a scalar subscripted by ones as the scalar; another reference
+by its flat name.
 """
 function simCrefExp(names::Names, cref::IR.ComponentRef, ty::IR.ModelicaType)::Exp
   local state = get(names.stateOf, cref.name, nothing)
   state === nothing || return DER(SimCref(Symbol(simName(names, state))))
   local full = simName(names, cref)
   full in names.known && return EXP_CREF(SimCref(Symbol(full)), simType(ty))
+  if any(p -> any(s -> !(s isa IR.INDEX && s.exp isa Union{IR.INTEGER, IR.ENUM_LITERAL}), p.subscripts),
+         @view cref.parts[1:end-1])
+    local selected = variablesBySubscript(names, cref, ty)
+    selected === nothing || return selected
+  end
   local last = cref.parts[end]
   local base = simName(names, IR.ComponentRef(IR.CrefPart[cref.parts[1:end-1]..., IR.CrefPart(last.name, IR.Subscript[], last.ty)]))
   if isempty(last.subscripts) && !(base in names.known)
     return something(variablesBySubscript(names, cref, ty), Some(EXP_CREF(SimCref(Symbol(full)), simType(ty))))
   end
+  #= a scalar subscripted by ones is the scalar: the frontend's equations of expandable
+     connectors' scalar signals (`bus2.y1[1] = two.bus.y1[1]`, Buildings' Templates) =#
+  (base in names.scalars && all(p -> isempty(p.subscripts), @view cref.parts[1:end-1]) &&
+   all(s -> s isa IR.INDEX && s.exp isa IR.INTEGER && s.exp.value == 1, last.subscripts)) &&
+    return EXP_CREF(SimCref(Symbol(base)), simType(ty))
   if all(s -> s isa IR.INDEX && s.exp isa IR.INTEGER, last.subscripts)
     return EXP_CREF(SimCref(Symbol(base), Int[s.exp.value for s in last.subscripts]), simType(ty))
   end

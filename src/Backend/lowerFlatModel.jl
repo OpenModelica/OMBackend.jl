@@ -120,19 +120,29 @@ enumerationType(ty::F.NFType)::IR.T_ENUMERATION =
 
 """
 A record type with its fields, an external object class (MLS 12.9.7), or the class of a
-model, block or connector component (a part of a component reference).
+model, block or connector component (a part of a component reference). A record that a
+field's dimension reads again (`a[size(r.b, 1)]` in a function on `r`: Buildings' cooling
+towers, Movers, HydronicConfigurations) is there without its fields: lowering them again
+recursed without end.
 """
 function complexType(ty::F.NFType)::IR.ModelicaType
   local cls = ty.cls
   local name = pathName(F.scopePath(cls; includeRoot = true))
   isvariant(ty.complexTy, F.COMPLEX_EXTERNAL_OBJECT) && return IR.T_EXTERNAL_OBJECT(name)
   isvariant(ty.complexTy, F.COMPLEX_RECORD) || return IR.T_CLASS(name)
-  local fields = IR.Field[]
-  for c in F.getComponents(F.getClass(cls).elements)
-    F.isOnlyOuter(c) && continue
-    push!(fields, IR.Field(Symbol(F.name(c)), lowerType(F.getType(F.component(c)))))
+  local inProgress = get!(() -> Set{Symbol}(), task_local_storage(), :omjlir_records_lowering)::Set{Symbol}
+  name in inProgress && return IR.T_RECORD(name, IR.Field[])
+  push!(inProgress, name)
+  try
+    local fields = IR.Field[]
+    for c in F.getComponents(F.getClass(cls).elements)
+      F.isOnlyOuter(c) && continue
+      push!(fields, IR.Field(Symbol(F.name(c)), lowerType(F.getType(F.component(c)))))
+    end
+    return IR.T_RECORD(name, fields)
+  finally
+    delete!(inProgress, name)
   end
-  return IR.T_RECORD(name, fields)
 end
 
 "The type of a function value: its name, its inputs' and its outputs' types."
@@ -215,7 +225,22 @@ lowerExp(e::F.BOOLEAN_EXPRESSION)::IR.Expression = IR.BOOLEAN(e.value)
 lowerExp(e::F.ENUM_LITERAL_EXPRESSION)::IR.Expression =
   IR.ENUM_LITERAL(enumerationType(e.ty), Symbol(e.name), e.index)
 lowerExp(e::F.CLKCONST_EXPRESSION)::IR.Expression = IR.CLOCK(lowerClock(e.clk))
-lowerExp(e::F.CREF_EXPRESSION)::IR.Expression = lowerCrefExp(e.cref, lowerType(e.ty))
+"""
+    lowerExp(e::F.CREF_EXPRESSION)
+
+A reference of its expression's type; of a scalar element, the element's type: NF's
+scalarization of kept arrays leaves an element with the array's type (Buildings' fluid ports,
+`vol.ports[1].Xi_outflow[1]` of type `Real[1]`, which the code generation expanded as an
+array: `[vol_ports[1]_Xi_outflow[1][1]]`).
+"""
+function lowerExp(e::F.CREF_EXPRESSION)::IR.Expression
+  local ty = lowerType(e.ty)
+  if ty isa IR.T_ARRAY && isvariant(e.cref, F.COMPONENT_REF_CREF)
+    local element = lowerType(F.getSubscriptedType(e.cref))
+    isScalarType(element) && (ty = element)
+  end
+  return lowerCrefExp(e.cref, ty)
+end
 lowerExp(e::F.TYPENAME_EXPRESSION)::IR.Expression = lowerExp(F.expandTypename(e.ty))
 lowerExp(e::F.ARRAY_EXPRESSION)::IR.Expression = IR.ARRAY(lowerExps(e.elements), lowerType(e.ty))
 function lowerExp(e::F.MATRIX_EXPRESSION)::IR.Expression
@@ -232,13 +257,15 @@ lowerExp(e::F.SIZE_EXPRESSION)::IR.Expression = IR.SIZE(lowerExp(e.exp), lowerOp
 """
 A binary operation. The frontend's scalarization keeps an array operator on the elements it
 subscripts (`crossAreas[1] * lengths[1] * nParallel` an array times a scalar, of type
-`Real[2]`): of two scalar operands the scalar operator, of the element type.
+`Real[2]`), and the array's type on a scalar operator (a stream connection's
+`vol.steBal.port_a.Xi_outflow[1] + -vol.ports[1].Xi_outflow[1]` of type `Real[1]`): of two
+scalar operands the scalar operator, of the element type. A negation of a scalar likewise.
 """
 function lowerExp(e::F.BINARY_EXPRESSION)::IR.Expression
   local (a, b) = (lowerExp(e.exp1), lowerExp(e.exp2))
   local (op, ty) = (lowerOp(e.operator), lowerType(e.operator.ty))
-  if isScalarType(IR.typeOf(a)) && isScalarType(IR.typeOf(b)) && haskey(SCALAR_OPS, op)
-    (op, ty) = (SCALAR_OPS[op], IR.elementType(ty))
+  if isScalarType(IR.typeOf(a)) && isScalarType(IR.typeOf(b))
+    (op, ty) = (get(SCALAR_OPS, op, op), IR.elementType(ty))
   end
   return IR.BINARY(a, op, b, ty)
 end
@@ -253,8 +280,11 @@ const SCALAR_OPS = Dict{IR.Op, IR.Op}(
 
 "A type of a scalar value (not an array, a record or an unknown type)."
 isScalarType(ty::IR.ModelicaType)::Bool = ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION}
-lowerExp(e::F.UNARY_EXPRESSION)::IR.Expression =
-  IR.UNARY(lowerOp(e.operator), lowerExp(e.exp), lowerType(e.operator.ty))
+function lowerExp(e::F.UNARY_EXPRESSION)::IR.Expression
+  local a = lowerExp(e.exp)
+  local ty = lowerType(e.operator.ty)
+  return IR.UNARY(lowerOp(e.operator), a, isScalarType(IR.typeOf(a)) ? IR.elementType(ty) : ty)
+end
 lowerExp(e::F.LBINARY_EXPRESSION)::IR.Expression =
   IR.LBINARY(lowerExp(e.exp1), lowerOp(e.operator), lowerExp(e.exp2))
 lowerExp(e::F.LUNARY_EXPRESSION)::IR.Expression = IR.LUNARY(lowerOp(e.operator), lowerExp(e.exp))
@@ -410,8 +440,10 @@ function lowerEquation(eq::F.Equation)::Union{Nothing, IR.Equation}
     ty isa IR.T_ARRAY && return IR.ARRAY_EQUATION(rhs, lhs, ty, source, ATTRIBUTES)
     return IR.SCALAR_EQUATION(lhs, rhs, ty, source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_CREF_EQUALITY)
-    #= A connection's equality, as the frontend's DAE conversion made it: a + (-b) = 0 =#
-    local ty = lowerType(eq.lhs.ty)
+    #= A connection's equality, as the frontend's DAE conversion made it: a + (-b) = 0, of the
+       type of `a` with its subscripts (the reference's own is its last part's declared one:
+       `vol.ports[1].Xi_outflow[1]` of a scalarized kept array would be `Real[1]`) =#
+    local ty = lowerType(F.getSubscriptedType(eq.lhs))
     local a = IR.CREF(lowerCref(eq.lhs), ty)
     local b = IR.CREF(lowerCref(eq.rhs), ty)
     return IR.SCALAR_EQUATION(IR.BINARY(a, IR.ADD, IR.UNARY(IR.UMINUS, b, ty), ty), IR.REAL(0.0), ty, source, ATTRIBUTES)

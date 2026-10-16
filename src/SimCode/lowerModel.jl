@@ -150,7 +150,7 @@ end
 
 The simulation names of the variables `vars` (collisions renamed; a variable named `t`, MTK's
 independent variable, as `<model>V_t`) and the names known as variables: theirs, `der(x)` of
-the states, `time`, `pi`, `e`.
+the states, `time`, `pi`, `e`; those of the variables that are not arrays.
 """
 function systemNames(vars::Vector{IR.Variable}, modelName::String)::Names
   local stateOf = Dict{Symbol, IR.ComponentRef}()
@@ -164,10 +164,11 @@ function systemNames(vars::Vector{IR.Variable}, modelName::String)::Names
       @warn "Variable name t clash with builtin symbol in MTK. Variable renamed $(renamed[v.name])"
     end
   end
-  local names = Names(renamed, Set{String}(), stateOf)
+  local names = Names(renamed, Set{String}(), stateOf, Set{String}())
   for v in vars
     local n = simName(names, v.cref)
     push!(names.known, n)
+    v.ty isa IR.T_ARRAY || push!(names.scalars, n)
     v.kind isa IR.STATE && push!(names.known, "der($(n))")
   end
   push!(names.known, "time", "pi", "e")

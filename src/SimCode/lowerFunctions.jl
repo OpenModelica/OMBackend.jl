@@ -94,7 +94,7 @@ end
 function functionNames(fn::IR.ModelicaFunction)::Names
   local known = Set{String}(["time", "pi", "e"])
   foreach(v -> push!(known, String(v.name)), Iterators.flatten((fn.inputs, fn.outputs, fn.locals)))
-  return Names(Dict{Symbol, String}(), known, Dict{Symbol, IR.ComponentRef}())
+  return Names(Dict{Symbol, String}(), known, Dict{Symbol, IR.ComponentRef}(), Set{String}())
 end
 
 function simFunctionVariable(names::Names, v::IR.FunctionVariable)::FunctionVariable
