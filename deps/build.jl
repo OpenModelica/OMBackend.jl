@@ -10,12 +10,10 @@ using Pkg
 # by Pkg.instantiate, so we do not re-add packages here. The OM siblings come
 # from the registry, or are developed from local checkouts (OM.jl's ci/
 # scripts, this package's CI). The only thing the build step still owns is
-# triggering the native build steps of OMParser and OMFrontend so that their
-# generated artifacts are present before the first `using OMBackend`.
+# triggering the native build steps of OMFrontend and its dependencies (OMParser)
+# so that their generated artifacts are present before the first `using OMBackend`.
 
-for pkg in ("OMParser", "OMFrontend")
-    @info "OMBackend: building $pkg"
-    Pkg.build(pkg; verbose = true)
-end
+@info "OMBackend: building OMFrontend and its dependencies"
+Pkg.build("OMFrontend"; verbose = true)
 
 @info("OMBackend: finished build script")

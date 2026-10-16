@@ -23,7 +23,7 @@ relevant ones are:
 * DifferentialEquations.jl, OrdinaryDiffEq.jl, DiffEqBase.jl, DiffEqCallbacks.jl, Sundials.jl
 * ModelingToolkit.jl, Symbolics.jl, SymbolicUtils.jl
 * Graphs.jl, MetaGraphs.jl, DataStructures.jl, MacroTools.jl, Setfield.jl
-* Plots.jl, GR.jl, CSV.jl, Tables.jl
+* Plots.jl
 * ExportAll.jl, DocStringExtensions.jl, JuliaFormatter.jl
 
 The OMJL ecosystem packages are consumed as in-tree siblings via
