@@ -116,7 +116,10 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
       pending[i] = NaN
       local τm = (τp + integrator.t) / 2
       local (src, at) = integrator.tprev <= τm ? (_stateAt(integrator, τm), (t = τm,)) : (integrator, integrator)
-      if !a.condition(_assertValues(a, getter, src), at) && !(a.warning && violated[i])
+      #= Halfway still at the boundary up to rounding (a crossing just after an initialization
+         at it: the level drained by 1e-14) is no failure: the state now decides. =#
+      if !a.condition(_assertValues(a, getter, src), at) && !(a.warning && violated[i]) &&
+         !_atAssertBoundary(a, getter, src, Float64(at.t))
         report(a, getter, integrator, τp)
         violated[i] = true
         return nothing
@@ -126,7 +129,7 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
       violated[i] = false
     elseif !all && (atCrossing || integrator.t == τp)
       pending[i] = integrator.t
-    elseif all && a.timeVarying && isnan(τp) && _atAssertBoundary(a, getter, integrator)
+    elseif all && a.timeVarying && isnan(τp) && _atAssertBoundary(a, getter, integrator, integrator.t)
       #= The initialization's state at a boundary a relation touches, past it by rounding
          (MSL TanksWithEmptyingPipe1: level_start = height = 2, the level computed from the
          mass 2 + 4e-16, `level <= height` failed, or not, by run): decided at the next check,
@@ -211,10 +214,10 @@ _assertValues(a::ModelicaAssert, getter, src) =
   getter === nothing ? NamedTuple() : NamedTuple{keys(a.observed)}(Tuple(getter(src)))
 
 #= Whether a relation of the assert is at its boundary up to rounding: its crossing function
-   within 1e-9 of zero at the integrator's state. =#
-function _atAssertBoundary(a::ModelicaAssert, getter, integrator::ModelingToolkit.SciMLBase.DEIntegrator)::Bool
-  local values = _assertValues(a, getter, integrator)
-  return any(f -> abs(Float64(f(values, (t = integrator.t,)))) <= 1e-9, a.crossings)
+   within 1e-9 of zero at the state `src` (the integrator's, the solution's at `t`). =#
+function _atAssertBoundary(a::ModelicaAssert, getter, src, t::Float64)::Bool
+  local values = _assertValues(a, getter, src)
+  return any(f -> abs(Float64(f(values, (t = t,)))) <= 1e-9, a.crossings)
 end
 
 #= The solution at τ within the last step, as a value provider for the getters. =#

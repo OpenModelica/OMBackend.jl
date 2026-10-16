@@ -148,10 +148,10 @@ function generateArrayConversions(inputs::Vector{SC.FunctionVariable})::Vector{E
   return conversions
 end
 
-#= A record-typed variable's fields as their flattened symbols, `<name>_<field>`; empty for
-   another variable. =#
+#= A record-typed variable's fields (an array of records': its elements') as their flattened
+   symbols, `<name>_<field>`; empty for another variable. =#
 function flattenRecordInput(v::SC.FunctionVariable)::Vector{Symbol}
-  local fields = _recordFieldNames(v.ty)
+  local fields = _recordFieldNames(_funcParamElemType(v))
   return Symbol[Symbol(v.name, COMPONENT_SEPARATOR, f) for f in fields]
 end
 
@@ -689,18 +689,17 @@ _flatFieldSymbol(base::AbstractString, field::AbstractString)::Symbol = Symbol(b
 
 A call's arguments: a record variable as its flattened field symbols, any other record value
 splatted (its field tuple), so a record argument is passed as the callee's flattened inputs
-take it; a builtin's arguments whole. The fields of a record-valued call read several times
-(TSUBs of one call: a Complex operand `(z1 - z2)^k` as its re and im) are the call once, bound
-in `shared`: per field, the call ran twice at each level of nesting (Buildings' multipoleFmk,
-ten levels of Complex operators, 1.9 s and 200 MB a call).
+take it; a builtin's arguments whole. The fields of a call read several times (TSUBs of one
+call, equal ones: a call returning an array of records as one array per field) are the call
+once, bound in `shared`.
 """
 function _algCallArgs(argExps::Vector{SC.Exp}; builtin::Bool = false, shared::Vector{Expr} = Expr[])::Vector{Any}
   local out = Any[]
-  local fieldReads = IdDict{SC.Exp, Int}()
+  local fieldReads = Dict{SC.Exp, Int}()
   for arg in argExps
     arg isa SC.TSUB && arg.exp isa SC.CALL && (fieldReads[arg.exp] = get(fieldReads, arg.exp, 0) + 1)
   end
-  local boundCalls = IdDict{SC.Exp, Symbol}()
+  local boundCalls = Dict{SC.Exp, Symbol}()
   for arg in argExps
     if arg isa SC.TSUB && arg.exp isa SC.CALL && fieldReads[arg.exp] > 1
       local fields = get!(boundCalls, arg.exp) do

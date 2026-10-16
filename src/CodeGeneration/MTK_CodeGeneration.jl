@@ -689,7 +689,7 @@ function ODE_MODE_MTK(simCode::SC.SIM_CODE)
       Note the difference between the two here.
       In the case of recompilation we will get fresh callbacks updated to the new structure of the final code.
       =#
-      result = $(if simCode.metaModel == nothing
+      result = $(if simCode.frontendModel === nothing
                    :(OMBackend.Runtime.OM_ProblemStructural($(activeModelName),
                                                             compositeProblem,
                                                             structuralCallbacks,

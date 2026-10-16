@@ -829,9 +829,10 @@ end
 The OMJLIR model of the frontend's flat model `fm`: its variables, its continuous-time
 partition (equations, algorithms, initial equations and algorithms), its structural modes
 (the structural submodels), states and transitions; and the functions of `functions` (the
-frontend's function list).
+frontend's function list). The frontend model to translate again at a structural change
+is the SCode class the frontend kept for a model with recompilations (`nothing` for another).
 """
-function lowerFlatModel(fm; functions = ())::IR.Model
+function lowerFlatModel(fm::F.FlatModel; functions = ())::IR.Model
   local variables = lowerVariables(fm)
   local initialMode = nothing
   local transitions = IR.StructuralTransition[]
@@ -855,7 +856,8 @@ function lowerFlatModel(fm; functions = ())::IR.Model
                                                sub.initialAlgorithms)))
   end
   return IR.Model(fm.name, variables, IR.Partition[system], IR.Partition[], IR.ClockKind[],
-                  lowerFunctions(functions), initialMode, modes, transitions, fm.scodeProgram)
+                  lowerFunctions(functions), initialMode, modes, transitions,
+                  fm.scodeProgram === nothing ? nothing : fm.scodeProgram.data)
 end
 
 end # module LowerFlatModel

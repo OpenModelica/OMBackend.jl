@@ -1321,7 +1321,7 @@ end
 
 #= A target of a tuple assignment in a when: a variable, an array of them, or `_`. A target
    missing from the variable table would be bound as a local of the affect, its value lost. =#
-function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs::SC.Exp, rhsAccess, simCode::SC.SIM_CODE)::Vector{Expr}
+function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs::SC.Exp, rhsAccess::Union{Symbol, Expr}, simCode::SC.SIM_CODE)::Vector{Expr}
   if lhs isa SC.WILD
     return res
   elseif lhs isa SC.EXP_CREF

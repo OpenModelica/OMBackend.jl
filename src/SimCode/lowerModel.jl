@@ -45,15 +45,73 @@ initial algorithms), its if-equations with their branches' structure, the initia
 the asserts, the matching and the strongly connected components of the residual system.
 """
 function fromOMJLIR(model::IR.Model)::SIM_CODE
-  isempty(model.modes) || unsupported("a model with structural modes in the SimCode lowering", model.name)
-  return lowerSystem(model, model.variables, model.continuous[1])
+  isempty(model.modes) && return lowerSystem(model, model.variables, model.continuous[1])
+  return lowerStructuralModes(model)
+end
+
+#= ==================================================================================== =#
+#= Structural modes                                                                     =#
+#= ==================================================================================== =#
+
+"""
+    lowerStructuralModes(model)
+
+The simulation code of a model with structural modes: its top level (its variables, its
+equations, every mode has them; its explicit transitions and the mode it starts in) with one
+simulation code per mode, the mode's variables and system with the top level's. The variables
+shared, whose values a transition carries over: those every mode has, by their names in the
+mode (`x` of `firstMode.x` and `secondMode.x`), and the top level's.
+"""
+function lowerStructuralModes(model::IR.Model)::SIM_CODE
+  local top = model.continuous[1]
+  any(eq -> eq isa IR.IF_EQUATION, top.equations) &&
+    unsupported("an if-equation at the top level of a model with structural modes", model.name)
+  local functions = simFunctions(model.functions)
+  local subModels = SIM_CODE[]
+  for mode in model.modes
+    local variables = IR.VariableSet(vcat(collect(mode.variables), collect(model.variables)))
+    local system = IR.Partition(mode.system.index, mode.system.association, vcat(mode.system.unknowns, top.unknowns),
+                                vcat(mode.system.equations, top.equations),
+                                vcat(mode.system.initialEquations, top.initialEquations))
+    push!(subModels, lowerSystem(model, variables, system; name = mode.name, functions))
+  end
+  local simCode = lowerSystem(model, model.variables, top; functions)
+  local names = systemNames(IR.Variable[v for v in model.variables if !(v.kind isa IR.STATE_DER)], model.name)
+  local transitions = StructuralTransition[EXPLICIT_STRUCTURAL_TRANSITION(t.from, t.to, simExp(names, t.condition))
+                                           for t in model.transitions]
+  local topVariables = String[simName(names, v.cref) for v in model.variables if !(v.kind isa IR.STATE_DER)]
+  return update(simCode; subModels, structuralTransitions = vcat(transitions, simCode.structuralTransitions),
+                sharedVariables = sharedModeVariables(model), topVariables,
+                sharedEquations = Equation[simCode.residualEquations..., simCode.whenEquations...])
+end
+
+"""
+    sharedModeVariables(model)
+
+The variables of a model with structural modes a transition carries over: the names in their
+mode (the reference without its first part, the mode's) of the states and algebraic variables
+every mode has, then the top level's states, algebraic and discrete variables by theirs
+(without the first part of a component's: `battery.U` as `U`).
+"""
+function sharedModeVariables(model::IR.Model)::Vector{String}
+  local inMode = v::IR.Variable -> length(v.cref.parts) > 1 ? join((String(p.name) for p in v.cref.parts[2:end]), ".") : String(v.cref.parts[1].name)
+  local perMode = [String[inMode(v) for v in mode.variables if v.kind isa Union{IR.STATE, IR.ALGEBRAIC}] for mode in model.modes]
+  local common = isempty(perMode) ? String[] : intersect(perMode...)
+  return vcat(common, String[inMode(v) for v in model.variables if v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.DISCRETE}])
 end
 
 #= ==================================================================================== =#
 #= The system                                                                           =#
 #= ==================================================================================== =#
 
-function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.Partition)::SIM_CODE
+"""
+    lowerSystem(model, variables, partition; name = model.name, functions)
+
+The simulation code of the system `partition` of the variables `variables`, named `name` (a
+structural mode's), with the functions `functions` (the model's).
+"""
+function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.Partition; name::String = model.name,
+                     functions::Vector{ModelicaFunction} = simFunctions(model.functions))::SIM_CODE
   local vars = IR.Variable[v for v in variables if !(v.kind isa IR.STATE_DER)]
   local names = systemNames(vars, model.name)
   local simVars = SIMVAR[SIMVAR(simName(names, v.cref), nothing, simVarKind(v, names), simVarAttributes(v, names),
@@ -80,8 +138,7 @@ function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.P
                                     if !(eq isa IR.ASSERT_EQUATION)]
   initialEquations = splitTupleInitialEquations(lowerInitialIfEquations(initialEquations), ht)
   local transitions = StructuralTransition[lowerStructuralTransition(names, w) for w in eqs.structural]
-  local functions = simFunctions(model.functions)
-  return SIM_CODE(String(codeName(Symbol(model.name))), ht, residuals, initialEquations, whenEquations, simIfEquations,
+  return SIM_CODE(String(codeName(Symbol(name))), ht, residuals, initialEquations, whenEquations, simIfEquations,
                   isSingular, matchOrder, digraph, sccs, transitions, SIM_CODE[], String[], String[], Equation[],
                   String(codeName(Symbol(something(model.initialMode, model.name)))), model.frontendModel, irreducibles,
                   functions, any(f -> f isa EXTERNAL_MODELICA_FUNCTION, functions),

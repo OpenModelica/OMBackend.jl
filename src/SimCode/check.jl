@@ -82,15 +82,15 @@ baseName(name::AbstractString)::String = String(first(split(name, '['; limit = 2
 """
     checkBalanced(simCode)
 
-The unknowns the residuals read (not eliminated; a discrete with its implicit `der(d) = 0`) as
-many as the residuals: else the system is under- or overdetermined and MTK's
-structural_simplify fails or makes a degenerate one. Not for a model with structural modes, if-
-or when-equations (they give residuals of their own).
+The unknowns the residuals read (not eliminated; a state for its derivative, read or under
+der(); a discrete with its implicit `der(d) = 0`) as many as the residuals: else the system is
+under- or overdetermined and MTK's structural_simplify fails or makes a degenerate one. Not for
+a model with structural modes, if- or when-equations (they give residuals of their own).
 """
 function checkBalanced(simCode::SIM_CODE)::Vector{CheckViolation}
   (hasSubModels(simCode) || !isempty(simCode.ifEquations) || !isempty(simCode.whenEquations)) && return CheckViolation[]
   local read = OrderedSet{String}()
-  foreach(eq -> foreachExp(e -> e isa EXP_CREF && push!(read, crefName(e.cref)), eq.exp), simCode.residualEquations)
+  foreach(eq -> foreachExp(e -> e isa Union{EXP_CREF, DER, PRE} && push!(read, crefName(e.cref)), eq.exp), simCode.residualEquations)
   local eliminated = OrderedSet(simCode.eliminatedVariables)
   local nUnknown = 0
   local nDiscrete = 0

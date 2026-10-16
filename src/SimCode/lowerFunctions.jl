@@ -316,8 +316,12 @@ end
 """
     expandedArguments(call, fields)
 
-A call's arguments with a flattened record as its fields, and a record-valued call as its
-fields by TUPLE_ELEMENT (evaluated once per field; a built-in takes the record whole).
+A call's arguments with a flattened record as its fields, and a call returning an array of
+records as its fields by TUPLE_ELEMENT (one array per field; a built-in takes the records
+whole). A call returning a record of scalar or array fields stays one argument: its value is
+the record's fields, which the code generation spreads, evaluated once (by TUPLE_ELEMENT, a
+call nested in a call's argument ran twice at each level: Buildings' multipoleFmk, ten levels
+of Complex operators).
 """
 function expandedArguments(call::IR.CALL, fields::RecordFields)::Vector{IR.Expression}
   local out = IR.Expression[]
@@ -328,11 +332,15 @@ function expandedArguments(call::IR.CALL, fields::RecordFields)::Vector{IR.Expre
       continue
     end
     local e = flattenedExpression(a, fields)
-    local types = call.attributes.builtin ? nothing : recordValueFieldTypes(e)
+    local types = call.attributes.builtin || spreadsAsArgument(e) ? nothing : recordValueFieldTypes(e)
     types === nothing ? push!(out, e) : append!(out, IR.Expression[IR.TUPLE_ELEMENT(e, k, t) for (k, t) in enumerate(types)])
   end
   return out
 end
+
+"A call returning a record without record fields: an argument its fields as a tuple, spread."
+spreadsAsArgument(e::IR.Expression)::Bool =
+  e isa IR.CALL && e.ty isa IR.T_RECORD && !any(f -> recordTypeOf(f.ty) !== nothing, e.ty.fields)
 
 "A flattened record's reference (an element of a record array keeps its subscripts) as its fields' references; `nothing` for another expression."
 function recordFieldReferences(e::IR.Expression, fields::RecordFields)::Union{Nothing, Vector{IR.Expression}}

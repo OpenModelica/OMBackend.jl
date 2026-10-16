@@ -86,13 +86,17 @@ const PIPELINE = Pair{String, Base.Function}[
 ]
 
 """
-    runPasses!(model)
+    runPasses!(model; through = nothing)
 
-`model` through the passes of `PIPELINE`, in order.
+`model` through the passes of `PIPELINE`, in order; with `through`, up to and including the
+pass of that name (the model as that pass leaves it: `through = "partitionClocks"`, its
+clocked partitions).
 """
-function runPasses!(model::IR.Model)::IR.Model
-  for (_, pass) in PIPELINE
+function runPasses!(model::IR.Model; through::Union{Nothing, String} = nothing)::IR.Model
+  (through === nothing || any(p -> p.first == through, PIPELINE)) || throw(ArgumentError("no pass named $(through)"))
+  for (name, pass) in PIPELINE
     model = pass(model)
+    name == through && break
   end
   return model
 end

@@ -43,7 +43,7 @@ The calls of the simulation code with their record arguments as the records' fie
 (`expandRecordArguments`), in the residuals, the when-equations, the if-equations' branches,
 the initial algorithms, the asserts, the initial equations and the parameters' bindings; a
 tuple residual `(a, b) - f(...)` as one residual per target, `a - f(...)[1]`, ... (the code
-generation has no tuple residuals).
+generation has no tuple residuals). Of the structural modes too.
 """
 function flattenRecordCallSites(simCode::SIM_CODE)::SIM_CODE
   local ht = simCode.stringToSimVarHT
@@ -70,7 +70,7 @@ function flattenRecordCallSites(simCode::SIM_CODE)::SIM_CODE
     end
   end
   return update(simCode; residualEquations = residuals, whenEquations = whens, ifEquations = ifs, initialAlgorithms, asserts,
-         initialEquations)
+         initialEquations, subModels = SIM_CODE[flattenRecordCallSites(m) for m in simCode.subModels])
 end
 
 "A when-clause with its condition's and its statements' record arguments flattened (an assignment's value, a reinit's, a call, an assert's condition)."
