@@ -295,7 +295,15 @@ function _affectBool(e::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CO
   end
   e isa SC.IFEXP && return :($(recb(e.cond)) ? $(recb(e.thenExp)) : $(recb(e.elseExp)))
   local v = _affectValue(e, obsAcc, simCode; initVal, subst, preSubst, relPre)
-  return v isa Bool ? v : :($(v) > 0.5)
+  #= pre() of a Boolean discrete comes back as a Bool already (`_pre[1] > 0.5`) =#
+  return v isa Bool || _isBoolPreRead(e, simCode) ? v : :($(v) > 0.5)
+end
+
+"Whether `e` is pre() of a Boolean discrete (`_affectValue` reads it as a Bool)."
+function _isBoolPreRead(e::SC.Exp, simCode::SC.SIM_CODE)::Bool
+  (e isa SC.PRE || SC.isBuiltin(e, :pre)) || return false
+  local nm = _preReadName(e)
+  return nm !== nothing && _isBoolDiscreteName(nm, simCode)
 end
 
 """
