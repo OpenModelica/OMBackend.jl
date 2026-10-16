@@ -243,8 +243,9 @@ lowerExp(e::F.RECORD_ELEMENT_EXPRESSION)::IR.Expression =
   IR.RECORD_ELEMENT(lowerExp(e.recordExp), e.index, Symbol(e.fieldName), lowerType(e.ty))
 function lowerExp(e::F.PARTIAL_FUNCTION_APPLICATION_EXPRESSION)::IR.Expression
   local fn = F.typeRefCache(e.fn)[1]
+  local inputs = Pair{Symbol, IR.ModelicaType}[Symbol(F.name(n)) => lowerType(F.getType(n)) for n in fn.inputs]
   return IR.PARTIAL_APPLICATION(pathName(F.nameConsiderBuiltin(fn)), lowerExps(e.args),
-                                Symbol[Symbol(n) for n in e.argNames], lowerType(e.ty))
+                                Symbol[Symbol(n) for n in e.argNames], inputs, lowerType(e.ty))
 end
 lowerExp(e::F.BINDING_EXP)::IR.Expression = lowerExp(e.exp)
 #= Boxing (of a function's polymorphic or functional arguments) has no meaning in Julia, where

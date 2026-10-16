@@ -297,46 +297,16 @@ function _isKnownBooleanAllTrueFunction(normalizedFuncName::String)::Bool
          normalizedFuncName == "Modelica_Math_BooleanVectors_allTrue"
 end
 
-function _booleanVectorTerms(expLst,
-                             simCode,
-                             hashTable;
-                             varPrefix = "",
-                             varSuffix = "",
-                             derSymbol = false)
-  local nArgs = 0
-  local onlyArg = nothing
-  for arg in expLst
-    nArgs += 1
-    onlyArg = arg
-  end
-  nArgs == 1 || return nothing
-
-  local terms = Any[]
-  @match onlyArg begin
-    DAE.ARRAY(_, _, array) => begin
-      for e in array
-        push!(terms, expToJuliaExpMTK(e, simCode;
-                                      varPrefix = varPrefix,
-                                      varSuffix = varSuffix,
-                                      derSymbol = derSymbol))
-      end
-    end
-    _ => return nothing
-  end
-
-  return terms
+#= The lowered elements of the one argument of a Boolean reduction, an array literal; nothing
+   for another argument. =#
+function _booleanVectorTerms(args::Vector{SC.Exp}, simCode::SC.SIM_CODE)::Union{Nothing, Vector{Expr}}
+  (length(args) == 1 && only(args) isa SC.ARRAY_EXP) || return nothing
+  return Expr[expToJuliaExpMTK(e, simCode) for e in only(args).elements]
 end
 
-function _booleanAnyTrueCallExpr(expLst,
-                                 simCode,
-                                 hashTable;
-                                 varPrefix = "",
-                                 varSuffix = "",
-                                 derSymbol = false)
-  local terms = _booleanVectorTerms(expLst, simCode, hashTable;
-                                    varPrefix = varPrefix,
-                                    varSuffix = varSuffix,
-                                    derSymbol = derSymbol)
+#= `anyTrue(b)`: `1 - (1 - b1) * (1 - b2) ...`. =#
+function _booleanAnyTrueCallExpr(args::Vector{SC.Exp}, simCode::SC.SIM_CODE)
+  local terms = _booleanVectorTerms(args, simCode)
   terms === nothing && return nothing
   isempty(terms) && return :(0)
   local result = :(1 - $(terms[1]))
@@ -346,16 +316,9 @@ function _booleanAnyTrueCallExpr(expLst,
   return :(1 - $result)
 end
 
-function _booleanAllTrueCallExpr(expLst,
-                                 simCode,
-                                 hashTable;
-                                 varPrefix = "",
-                                 varSuffix = "",
-                                 derSymbol = false)
-  local terms = _booleanVectorTerms(expLst, simCode, hashTable;
-                                    varPrefix = varPrefix,
-                                    varSuffix = varSuffix,
-                                    derSymbol = derSymbol)
+#= `allTrue(b)`: `b1 * b2 ...`. =#
+function _booleanAllTrueCallExpr(args::Vector{SC.Exp}, simCode::SC.SIM_CODE)
+  local terms = _booleanVectorTerms(args, simCode)
   terms === nothing && return nothing
   isempty(terms) && return :(1)
   local result = terms[1]
@@ -366,30 +329,16 @@ function _booleanAllTrueCallExpr(expLst,
 end
 
 """
-Lower known Modelica function calls that have a stable symbolic equivalent.
+    lowerKnownSymbolicFunctionCall(normalizedFuncName, args, simCode)
 
-This keeps simple Boolean reductions out of the opaque RuntimeGeneratedFunction
-path. MTK can rebuild opaque terms with `symtype=Any` during alias elimination,
-which later trips SymbolicUtils arithmetic in linear-coefficient extraction.
+A call of a function with a stable symbolic equivalent (the Boolean reductions anyTrue and
+allTrue), lowered as it; `nothing` for another. It keeps them out of the opaque
+RuntimeGeneratedFunction path: MTK can rebuild opaque terms with `symtype=Any` during alias
+elimination, which later trips SymbolicUtils arithmetic in linear-coefficient extraction.
 """
-function lowerKnownSymbolicFunctionCall(normalizedFuncName::String,
-                                        expLst,
-                                        simCode,
-                                        hashTable;
-                                        varPrefix = "",
-                                        varSuffix = "",
-                                        derSymbol = false)
-  if _isKnownBooleanAnyTrueFunction(normalizedFuncName)
-    return _booleanAnyTrueCallExpr(expLst, simCode, hashTable;
-                                  varPrefix = varPrefix,
-                                  varSuffix = varSuffix,
-                                  derSymbol = derSymbol)
-  elseif _isKnownBooleanAllTrueFunction(normalizedFuncName)
-    return _booleanAllTrueCallExpr(expLst, simCode, hashTable;
-                                  varPrefix = varPrefix,
-                                  varSuffix = varSuffix,
-                                  derSymbol = derSymbol)
-  end
+function lowerKnownSymbolicFunctionCall(normalizedFuncName::String, args::Vector{SC.Exp}, simCode::SC.SIM_CODE)
+  _isKnownBooleanAnyTrueFunction(normalizedFuncName) && return _booleanAnyTrueCallExpr(args, simCode)
+  _isKnownBooleanAllTrueFunction(normalizedFuncName) && return _booleanAllTrueCallExpr(args, simCode)
   return nothing
 end
 

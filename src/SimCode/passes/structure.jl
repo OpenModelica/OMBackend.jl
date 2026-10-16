@@ -32,26 +32,36 @@ function maximumMatching(incidence::Vector{OrderedSet{String}})::Tuple{Vector{St
 end
 
 """
-    recomputeStronglyConnectedComponents(simCode)
+    residualComponents(simCode)
 
-The strongly connected components of the final residuals (those of the causalization index
-the residuals before the passes): the residuals matched to the unknowns they read, an edge
-from a residual to the one that solves an unknown it reads. MTK's code generation extracts a
-nonlinear system per cyclic component. Nothing for a model with modes.
+The strongly connected components of the residuals and the unknown each residual is matched
+to (`""` for none): the residuals matched to the unknowns they read, an edge from a residual to
+the one that solves an unknown it reads.
 """
-function recomputeStronglyConnectedComponents(simCode::SIM_CODE)::SIM_CODE
-  hasSubModels(simCode) && return simCode
+function residualComponents(simCode::SIM_CODE)::Tuple{Vector{Vector{Int}}, Vector{String}}
   local residuals = simCode.residualEquations
-  isempty(residuals) && return update(simCode; stronglyConnectedComponents = Vector{Int}[])
+  isempty(residuals) && return (Vector{Int}[], String[])
   local unknowns = OrderedSet{String}(k for (k, (_, v)) in simCode.stringToSimVarHT if isUnknownVarKind(v.varKind))
   local incidence = OrderedSet{String}[intersect(crefNames!(OrderedSet{String}(), eq.exp), unknowns) for eq in residuals]
-  local (_, rowOf) = maximumMatching(incidence)
+  local (columnOf, rowOf) = maximumMatching(incidence)
   local g = MetaGraphs.MetaDiGraph(length(residuals))
   for (i, names) in enumerate(incidence), v in names
     local j = get(rowOf, v, 0)
     (j > 0 && j != i) && Graphs.add_edge!(g, i, j)
   end
-  return update(simCode; stronglyConnectedComponents = Vector{Int}[Vector{Int}(c) for c in GraphAlgorithms.stronglyConnectedComponents(g)])
+  return (Vector{Int}[Vector{Int}(c) for c in GraphAlgorithms.stronglyConnectedComponents(g)], columnOf)
+end
+
+"""
+    recomputeStronglyConnectedComponents(simCode)
+
+The strongly connected components of the final residuals (`residualComponents`; those of the
+causalization index the residuals before the passes). MTK's code generation extracts a
+nonlinear system per cyclic component. Nothing for a model with modes.
+"""
+function recomputeStronglyConnectedComponents(simCode::SIM_CODE)::SIM_CODE
+  hasSubModels(simCode) && return simCode
+  return update(simCode; stronglyConnectedComponents = first(residualComponents(simCode)))
 end
 
 "The names `e` reads differentiated (`der(x)`) and plainly, apart."

@@ -103,6 +103,8 @@ struct TYPE_BOOL <: SType end
 struct TYPE_STRING <: SType end
 "A type the code generators need not know (the inputs of generic built-in functions)."
 struct TYPE_UNKNOWN <: SType end
+"The type of a call of a function without outputs (a call for its effects)."
+struct TYPE_NORETCALL <: SType end
 
 """
     TYPE_COMPLEX(isRecord, fieldNames, fieldTypes)
@@ -373,15 +375,17 @@ struct REDUCTION <: Exp
 end
 
 """
-    PARTEVALFUNCTION(name, args, argNames, ty)
+    PARTEVALFUNCTION(name, args, argNames, inputs, ty)
 
 `function name(argNames[i] = args[i], ...)`: a function value with some inputs bound, of type
-`ty` (the inputs not bound).
+`ty` (the inputs not bound); `inputs` are all the function's inputs as declared (records not
+flattened), by name and type.
 """
 struct PARTEVALFUNCTION <: Exp
   name::Symbol
   args::Vector{Exp}
   argNames::Vector{Symbol}
+  inputs::Vector{Pair{Symbol, SType}}
   ty::TYPE_FUNCTION
 end
 
@@ -757,13 +761,16 @@ struct EXTERNAL_MODELICA_FUNCTION <: ModelicaFunction
 end
 
 """
-    INITIAL_ALGORITHM(statements)
+    INITIAL_ALGORITHM(statements, section)
 
-An `initial algorithm` section or the body of `when initial()`: run once, at the
-initialization (MLS 11.4).
+Statements run once, at the initialization (MLS 11.4): an `initial algorithm` section or an
+algorithm's `when initial()` body (`section`: the initialization's first pass runs them, their
+results start values of the system), or the `initial()` arm of a when-equation, of a lifted
+algorithm or discrete cluster.
 """
 struct INITIAL_ALGORITHM
   statements::Vector{Statement}
+  section::Bool
 end
 
 #= ==================================================================================== =#

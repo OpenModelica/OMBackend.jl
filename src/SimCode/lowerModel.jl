@@ -60,14 +60,15 @@ function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.P
                                 simType(IR.elementType(v.ty))) for v in vars]
   local ht = createIndices(simVars)
   local eqs = classifyEquations(partition.equations)
-  local initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(simStatements(names, w.branches[1].body)) for w in eqs.initialWhens]
+  local initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(simStatements(names, w.branches[1].body), w.kind === IR.INITIAL_SECTION)
+                                              for w in eqs.initialWhens]
   local whens = substituteSampleTriggers(eqs.whens, partition.equations)
   local (runtimeWhens, initialBodies) = extractInitialWhenAlgorithms(whens)
-  append!(initialAlgorithms, INITIAL_ALGORITHM[INITIAL_ALGORITHM(simStatements(names, b)) for b in initialBodies])
+  append!(initialAlgorithms, INITIAL_ALGORITHM[INITIAL_ALGORITHM(simStatements(names, b), false) for b in initialBodies])
   local residuals = RESIDUAL_EQUATION[residual(names, eq) for eq in eqs.residuals]
   local (asserts, initialAssertAlgorithms) = lowerAsserts(names, ht, eqs.asserts, partition.initialEquations)
   append!(initialAlgorithms, initialAssertAlgorithms)
-  initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(mapStatements(e -> inlineParameters(e, ht), a.statements))
+  initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(mapStatements(e -> inlineParameters(e, ht), a.statements), a.section)
                                         for a in initialAlgorithms]
   local whenEquations = WHEN_EQUATION[lowerWhen(names, w) for w in runtimeWhens]
   local irreducibles = irreducibleVariables(names, eqs.ifs, whenEquations, vars, ht)
@@ -144,7 +145,7 @@ function classifyEquations(equations::Vector{IR.Equation})::ClassifiedEquations
     if eq isa IR.SCALAR_EQUATION
       push!(c.residuals, eq)
     elseif eq isa IR.WHEN_EQUATION
-      push!(eq.kind === IR.REGULAR_WHEN ? c.whens : eq.kind === IR.INITIAL_WHEN ? c.initialWhens : c.structural, eq)
+      push!(eq.kind === IR.REGULAR_WHEN ? c.whens : eq.kind in (IR.INITIAL_WHEN, IR.INITIAL_SECTION) ? c.initialWhens : c.structural, eq)
     elseif eq isa IR.IF_EQUATION
       push!(c.ifs, residualOrder(eq))
     elseif eq isa IR.ASSERT_EQUATION
@@ -309,7 +310,7 @@ function lowerAsserts(names::Names, ht::OrderedDict{String, Tuple{Int, SIMVAR}},
     eq isa IR.ASSERT_EQUATION || continue
     local a = simAssert(names, eq)
     if a.condition isa IFEXP && a.condition.thenExp isa CALL && isNoReturnCall(eq.condition.thenExp)
-      push!(initial, INITIAL_ALGORITHM(Statement[NORETCALL(a.condition, a.source)]))
+      push!(initial, INITIAL_ALGORITHM(Statement[NORETCALL(a.condition, a.source)], false))
       continue
     end
     local onVariables = any(n -> (local entry = get(ht, n, nothing); entry !== nothing && !(last(entry).varKind isa PARAMETER)),
@@ -317,9 +318,9 @@ function lowerAsserts(names::Names, ht::OrderedDict{String, Tuple{Int, SIMVAR}},
     if !onVariables
       push!(out, a)
     elseif a.condition isa CALL && isNoReturnCall(eq.condition)
-      push!(initial, INITIAL_ALGORITHM(Statement[NORETCALL(a.condition, a.source)]))
+      push!(initial, INITIAL_ALGORITHM(Statement[NORETCALL(a.condition, a.source)], false))
     else
-      push!(initial, INITIAL_ALGORITHM(Statement[ASSERT(a.condition, a.message, a.level, a.source)]))
+      push!(initial, INITIAL_ALGORITHM(Statement[ASSERT(a.condition, a.message, a.level, a.source)], false))
     end
   end
   local inline = e -> inlineParameters(e, ht; keepTunable = true)

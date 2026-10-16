@@ -58,7 +58,7 @@ import Symbolics
 """
     MODELICA_BUILTIN_FUNCTIONS
 
-Maps Modelica built-in function names (as they appear in DAE.CALL paths)
+Maps Modelica built-in function names (as SimCode calls name them)
 to qualified Julia function references in OMBackend.CodeGeneration scope.
 
 The code generator looks up function names here before falling through
@@ -587,47 +587,29 @@ end
    value, or (r, format). Where the integrator holds the values they are
    Float64s: Integer arguments are rounded, Boolean ones compared with 0, and
    an enumeration value is its literal's name. =#
-function modelicaStringCall(args::AbstractVector, lower)::Expr
+function modelicaStringCall(args::Vector{SimCode.Exp}, lower)::Expr
   local S = :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_String)
   local int = e -> :(round(Int, $(lower(e))))
   local bool = e -> :($(lower(e)) != 0)
   local n = length(args)
   n == 4 && return Expr(:call, S, lower(args[1]), int(args[2]), int(args[3]), bool(args[4]))
   n == 2 && return Expr(:call, S, lower(args[1]), lower(args[2]))
-  n == 3 || CodeGeneration.unsupported("String with $(n) arguments", join(string.(args), ", "))
+  n == 3 || CodeGeneration.unsupported("String with $(n) arguments", args)
   local x = args[1]
-  local ty = _daeValueType(x)
-  local value = if x isa DAE.ENUM_LITERAL
-    _lastIdent(x.name)
-  elseif ty isa DAE.T_ENUMERATION && !isempty(ty.names)
-    :($(Tuple(collect(String, ty.names)))[round(Int, $(lower(x)))])
-  elseif ty isa DAE.T_BOOL
+  local ty = SimCode.typeOf(x)
+  local value = if x isa SimCode.ENUM_LITERAL
+    String(last(split(String(x.name), '.')))
+  elseif ty isa SimCode.TYPE_ENUM && !isempty(ty.names)
+    :($(ty.names)[round(Int, $(lower(x)))])
+  elseif ty isa SimCode.TYPE_BOOL
     bool(x)
-  elseif ty isa DAE.T_INTEGER
+  elseif ty isa SimCode.TYPE_INTEGER
     int(x)
   else
-    CodeGeneration.unsupported("String of a value whose type the expression does not give", string(x))
+    CodeGeneration.unsupported("String of a value whose type the expression does not give", x)
   end
   return Expr(:call, S, value, int(args[2]), bool(args[3]))
 end
-
-#= The type of a DAE expression's value, where the expression carries it. =#
-Base.@nospecializeinfer function _daeValueType(@nospecialize(e))
-  @match e begin
-    DAE.ICONST(__) => DAE.T_INTEGER_DEFAULT
-    DAE.RCONST(__) => DAE.T_REAL_DEFAULT
-    DAE.BCONST(__) || DAE.RELATION(__) || DAE.LBINARY(__) || DAE.LUNARY(__) => DAE.T_BOOL_DEFAULT
-    DAE.CREF(_, ty) => ty
-    DAE.CALL(attr = attr) => attr.ty
-    DAE.CAST(ty, _) => ty
-    DAE.BINARY(_, op, _) => hasproperty(op, :ty) ? op.ty : nothing
-    DAE.UNARY(op, _) => hasproperty(op, :ty) ? op.ty : nothing
-    DAE.IFEXP(_, a, _) => _daeValueType(a)
-    _ => nothing
-  end
-end
-
-_lastIdent(p::Absyn.Path)::String = p isa Absyn.IDENT ? p.name : _lastIdent(p.path)
 
 """
     modelica_homotopy(actual, simplified)

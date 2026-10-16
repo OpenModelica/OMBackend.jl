@@ -81,9 +81,12 @@ function liftAlgorithms!(variables::IR.VariableSet, partition::IR.Partition)::No
   return nothing
 end
 
-"A when-equation active at the initialization only, with the statements `body`."
-initialWhen(body::Vector{IR.Statement}, source::IR.Source)::IR.WHEN_EQUATION =
-  IR.WHEN_EQUATION([IR.WhenBranch(IR.Expression[], true, false, body)], IR.INITIAL_WHEN, source, IR.DEFAULT_ATTRIBUTES)
+"""
+A when-equation active at the initialization only, with the statements `body`: of `kind`
+INITIAL_SECTION for an initial algorithm section's or an algorithm's `when initial()`.
+"""
+initialWhen(body::Vector{IR.Statement}, source::IR.Source; kind::IR.WhenKind = IR.INITIAL_WHEN)::IR.WHEN_EQUATION =
+  IR.WHEN_EQUATION([IR.WhenBranch(IR.Expression[], true, false, body)], kind, source, IR.DEFAULT_ATTRIBUTES)
 
 """
 The bodies of the top-level `when initial()` statements of algorithm sections (a first
@@ -95,14 +98,14 @@ function initialWhensOfAlgorithms(algorithms::Vector{IR.ALGORITHM})::Vector{IR.E
     s isa IR.WHEN_STATEMENT || continue
     local b = s.branches[1]
     (b.atInitial && isempty(b.triggers) && !b.atTerminal) || continue
-    push!(out, initialWhen(b.body, s.source))
+    push!(out, initialWhen(b.body, s.source; kind = IR.INITIAL_SECTION))
   end
   return out
 end
 
 "The initial algorithm sections (those with statements) as initial when-equations."
 initialAlgorithmWhens(algorithms::Vector{IR.ALGORITHM})::Vector{IR.Equation} =
-  IR.Equation[initialWhen(alg.statements, alg.source) for alg in algorithms if !isempty(alg.statements)]
+  IR.Equation[initialWhen(alg.statements, alg.source; kind = IR.INITIAL_SECTION) for alg in algorithms if !isempty(alg.statements)]
 
 """
     constrainedNames(equations)

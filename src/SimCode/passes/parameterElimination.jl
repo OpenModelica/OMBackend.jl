@@ -316,7 +316,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   return update(simCode; residualEquations = residuals, initialEquations, ifEquations, whenEquations, stringToSimVarHT = newHT,
                 eliminatedEquations = RESIDUAL_EQUATION[RESIDUAL_EQUATION(x(eq.exp), eq.source, eq.attr) for eq in simCode.eliminatedEquations],
                 asserts = ASSERT_EQUATION[ASSERT_EQUATION(x(a.condition), x(a.message), a.level, a.source) for a in simCode.asserts],
-                initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(mapStatementExps(x, a.statements)) for a in simCode.initialAlgorithms])
+                initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(mapStatementExps(x, a.statements), a.section) for a in simCode.initialAlgorithms])
 end
 
 "An initial residual or equation with the parameters of `values` replaced; another kept."

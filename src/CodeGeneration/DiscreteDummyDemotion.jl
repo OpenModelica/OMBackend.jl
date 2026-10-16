@@ -340,43 +340,19 @@ end
 #= Build the set of cref names that any when-equation writes to. Discrete
    vars in this set MUST keep their `der(d) ~ 0` dummy — the callback
    needs the state slot. =#
-function _collectWhenAssignedNames(simCode)::OrderedSet{String}
+function _collectWhenAssignedNames(simCode::SC.SIM_CODE)::OrderedSet{String}
   local names = OrderedSet{String}()
-  for whenEq in simCode.whenEquations
-    SimulationCode._collectWhenAssignTargets!(names, whenEq.whenEquation)
-  end
+  foreach(w -> SC.whenTargets!(names, w.whenEquation), simCode.whenEquations)
   return names
-end
-
-#= Collect the cref name from a leaf cref expression. =#
-function _collectCrefsInExp!(names::OrderedSet{String}, e::SimulationCode.EXP_CREF)
-  local r = SimulationCode.extractCrefName(e)
-  r !== nothing && push!(names, r[1])
-  return nothing
-end
-
-#= Recurse into the Exp-typed fields of any other SimCode expression. =#
-function _collectCrefsInExp!(names::OrderedSet{String}, @nospecialize(e::SimulationCode.Exp))
-  for fn in fieldnames(typeof(e))
-    local v = getfield(e, fn)
-    if v isa SimulationCode.Exp
-      _collectCrefsInExp!(names, v)
-    elseif v isa AbstractVector
-      for x in v
-        x isa SimulationCode.Exp && _collectCrefsInExp!(names, x)
-      end
-    end
-  end
-  return nothing
 end
 
 #= Discrete vars that participate in a recomputed cyclic residual SCC.
    Treating them as held states adds an equation on top of the loop
    equations — keep them algebraic and let MTK tear the loop. =#
-function _collectCyclicSCCDiscretes(simCode, whenAssignedSet::OrderedSet{String})::OrderedSet{String}
+function _collectCyclicSCCDiscretes(simCode::SC.SIM_CODE, whenAssignedSet::OrderedSet{String})::OrderedSet{String}
   local cyclic = OrderedSet{String}()
   try
-    local (sccs, eqToVar) = SimulationCode._recomputeSCCsFromSimCode(simCode)
+    local (sccs, eqToVar) = SC.residualComponents(simCode)
     for scc in sccs
       length(scc) > 1 || continue
       for eqIdx in scc
@@ -386,7 +362,7 @@ function _collectCyclicSCCDiscretes(simCode, whenAssignedSet::OrderedSet{String}
         varName in whenAssignedSet && continue
         local entry = get(simCode.stringToSimVarHT, varName, nothing)
         entry === nothing && continue
-        if entry[2].varKind isa SimulationCode.DISCRETE
+        if entry[2].varKind isa SC.DISCRETE
           push!(cyclic, varName)
         end
       end
@@ -507,7 +483,7 @@ end
 #= Count duplicate residual equations (modulo line-number decoration and
    pre-rewrite form). Duplicates are dropped by MTK at simplify time, so
    the codegen-time over-determination count must discount them. =#
-function _countDuplicateResiduals(equations::Vector{Expr}, simCode)
+function _countDuplicateResiduals(equations::Vector{Expr}, simCode::SC.SIM_CODE)
   local seen = OrderedSet{String}()
   local nDup = 0
   local dupKeys = String[]
@@ -548,7 +524,7 @@ count, and comparison-defined demotions are reclaimed first when they
 exist (since the comparison pattern coincides with StateGraph edge
 pulses, which should stay held).
 """
-function planDemotions(simCode,
+function planDemotions(simCode::SC.SIM_CODE,
                        equations::Vector{Expr},
                        ifEqComponents::Vector{IfEquationComponent},
                        discreteVariables::Vector{String},

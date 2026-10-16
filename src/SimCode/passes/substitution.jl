@@ -149,7 +149,7 @@ substitute(eq::ARRAY_EQUATION, rs::Replacements)::Equation =
   ARRAY_EQUATION(eq.dimSize, substitute(eq.left, rs), substitute(eq.right, rs), eq.source, eq.attr)
 substitute(a::ASSERT_EQUATION, rs::Replacements)::ASSERT_EQUATION =
   ASSERT_EQUATION(substitute(a.condition, rs), substitute(a.message, rs), a.level, a.source)
-substitute(a::INITIAL_ALGORITHM, rs::Replacements)::INITIAL_ALGORITHM = INITIAL_ALGORITHM(substitute(a.statements, rs))
+substitute(a::INITIAL_ALGORITHM, rs::Replacements)::INITIAL_ALGORITHM = INITIAL_ALGORITHM(substitute(a.statements, rs), a.section)
 
 "An initial equation substituted: a residual, an equation, an array equation; another kept."
 substituteInitial(eq::Union{RESIDUAL_EQUATION, EQUATION, ARRAY_EQUATION}, rs::Replacements)::Equation = substitute(eq, rs)

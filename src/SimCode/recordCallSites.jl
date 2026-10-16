@@ -57,7 +57,7 @@ function flattenRecordCallSites(simCode::SIM_CODE)::SIM_CODE
   end
   local whens = WHEN_EQUATION[WHEN_EQUATION(whenRecordArguments(w.whenEquation, x), w.source, w.attr) for w in simCode.whenEquations]
   local ifs = IF_EQUATION[IF_EQUATION(BRANCH[branchRecordArguments(b, x) for b in ifEq.branches]) for ifEq in simCode.ifEquations]
-  local initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(Statement[mapValues(x, s) for s in a.statements])
+  local initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(Statement[mapValues(x, s) for s in a.statements], a.section)
                                               for a in simCode.initialAlgorithms]
   local asserts = ASSERT_EQUATION[ASSERT_EQUATION(x(a.condition), x(a.message), a.level, a.source) for a in simCode.asserts]
   local initialEquations = Equation[initialRecordArguments(eq, x) for eq in simCode.initialEquations]

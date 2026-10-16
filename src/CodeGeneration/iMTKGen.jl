@@ -42,7 +42,8 @@
 module IMTKGen
 
 import ..CodeGeneration
-import ..SimulationCode
+import ..SimCode
+const SC = SimCode
 
 #= The build's start time: the initialization is solved at it, and simulateIMTK remakes the
    cached problem for a tspan from that start (another start builds again). OM.simulate
@@ -125,7 +126,7 @@ end
 Build the module via `generateMTKCode`, then construct the System and run
 `structural_simplify` in the backend, caching the build for reuse at simulate.
 """
-function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
+function generateIMTKCode(simCode::SC.SIM_CODE)
   local (modelName, modelCode) = CodeGeneration.generateMTKCode(simCode)
   local cname = _OMBackend().canonicalName(modelName)
   #= Only the standard PROGRAM_GENERATION path emits `simulateFromBuild` and
@@ -136,8 +137,8 @@ function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
   if ccall(:jl_generating_output, Cint, ()) != 0
     #= Precompile/image generation: Core.eval'ing the model module into this
        closed backend module is rejected; skip the build+eval (codegen warmed). =#
-  elseif !SimulationCode.hasStructuralTransitions(simCode) &&
-         !SimulationCode.hasSubModels(simCode)
+  elseif !SC.hasStructuralTransitions(simCode) &&
+         !SC.hasSubModels(simCode)
     TUNABLE_SETS[cname] = copy(_OMBackend().TUNABLE_PARAMETERS[])
     _buildAndCache(modelName, modelCode)
   else

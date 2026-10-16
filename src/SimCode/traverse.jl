@@ -71,7 +71,7 @@ mapChildren(g::G, e::ARRAY_EXP) where {G} = ARRAY_EXP(e.ty, e.scalar, Exp[g(x) f
 mapChildren(g::G, e::RANGE) where {G} = RANGE(e.ty, g(e.start), e.step === nothing ? nothing : g(e.step), g(e.stop))
 mapChildren(g::G, e::ASUB) where {G} = ASUB(g(e.exp), Exp[g(x) for x in e.subs])
 mapChildren(g::G, e::CALL) where {G} = CALL(e.name, Exp[g(x) for x in e.args], e.ty, e.kind)
-mapChildren(g::G, e::PARTEVALFUNCTION) where {G} = PARTEVALFUNCTION(e.name, Exp[g(x) for x in e.args], e.argNames, e.ty)
+mapChildren(g::G, e::PARTEVALFUNCTION) where {G} = PARTEVALFUNCTION(e.name, Exp[g(x) for x in e.args], e.argNames, e.inputs, e.ty)
 mapChildren(g::G, e::RECORD) where {G} = RECORD(e.name, Exp[g(x) for x in e.exps], e.fieldNames, e.ty)
 mapChildren(g::G, e::TUPLE) where {G} = TUPLE(Exp[g(x) for x in e.elements])
 mapChildren(g::G, e::REDUCTION) where {G} =
@@ -251,7 +251,7 @@ function traverseChildren(e::CALL, recur::R, arg) where {R}
 end
 function traverseChildren(e::PARTEVALFUNCTION, recur::R, arg) where {R}
   local (xs, a) = traverseVector(e.args, recur, arg)
-  return (xs === e.args ? e : PARTEVALFUNCTION(e.name, xs, e.argNames, e.ty), a)
+  return (xs === e.args ? e : PARTEVALFUNCTION(e.name, xs, e.argNames, e.inputs, e.ty), a)
 end
 function traverseChildren(e::ARRAY_EXP, recur::R, arg) where {R}
   local (xs, a) = traverseVector(e.elements, recur, arg)

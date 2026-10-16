@@ -442,15 +442,17 @@ struct REDUCTION <: Expression
 end
 
 """
-    PARTIAL_APPLICATION(name, arguments, argumentNames, ty)
+    PARTIAL_APPLICATION(name, arguments, argumentNames, inputs, ty)
 
 `function name(argumentNames[i] = arguments[i], ...)`: a function value with some inputs
-bound (MLS 12.4.2.1), of type `ty` (the inputs not bound).
+bound (MLS 12.4.2.1), of type `ty` (the inputs not bound); `inputs` are all the function's
+inputs as declared, by name and type (where the bound ones are).
 """
 struct PARTIAL_APPLICATION <: Expression
   name::Symbol
   arguments::Vector{Expression}
   argumentNames::Vector{Symbol}
+  inputs::Vector{Pair{Symbol, ModelicaType}}
   ty::T_FUNCTION
 end
 
@@ -774,12 +776,14 @@ mutable struct FOR_EQUATION <: Equation
 end
 
 """
-A when-equation's role: a regular one; an initial one the passes made (an initial algorithm,
-the initial arm of a lifted algorithm or discrete cluster: the initialization runs them before
-the model's own `when initial()` equations); OM.jl's structural transition (its body changes
-the model's structure: `recompilation`, `agentic_recompilation`).
+A when-equation's role: a regular one; an initial one the passes made: an initial algorithm
+section or an algorithm's `when initial()` body (`INITIAL_SECTION`: the initialization's first
+pass runs them, before the system is solved), the initial arm of a lifted algorithm or discrete
+cluster (`INITIAL_WHEN`); the initialization runs both before the model's own `when initial()`
+equations; OM.jl's structural transition (its body changes the model's structure:
+`recompilation`, `agentic_recompilation`).
 """
-@enum WhenKind REGULAR_WHEN INITIAL_WHEN STRUCTURAL_WHEN
+@enum WhenKind REGULAR_WHEN INITIAL_WHEN INITIAL_SECTION STRUCTURAL_WHEN
 
 """
     WHEN_EQUATION(branches, kind, source, attributes)
@@ -1294,7 +1298,7 @@ mapChildren(g::G, e::CALL) where {G} = CALL(e.name, _mapAll(g, e.arguments), e.t
 mapChildren(g::G, e::ARRAY_CONSTRUCTOR) where {G} = ARRAY_CONSTRUCTOR(g(e.body), _mapIterators(g, e.iterators), e.ty)
 mapChildren(g::G, e::REDUCTION) where {G} = REDUCTION(e.reducer, g(e.body), _mapIterators(g, e.iterators), e.ty)
 mapChildren(g::G, e::PARTIAL_APPLICATION) where {G} =
-  PARTIAL_APPLICATION(e.name, _mapAll(g, e.arguments), e.argumentNames, e.ty)
+  PARTIAL_APPLICATION(e.name, _mapAll(g, e.arguments), e.argumentNames, e.inputs, e.ty)
 mapChildren(g::G, e::SIZE) where {G} = SIZE(g(e.exp), e.dimension === nothing ? nothing : g(e.dimension))
 mapChildren(g::G, e::BINARY) where {G} = BINARY(g(e.exp1), e.op, g(e.exp2), e.ty)
 mapChildren(g::G, e::UNARY) where {G} = UNARY(e.op, g(e.exp), e.ty)

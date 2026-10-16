@@ -129,7 +129,8 @@ simType(t::IR.T_RECORD)::SType =
 simType(::Union{IR.T_CLASS, IR.T_EXTERNAL_OBJECT})::SType = TYPE_COMPLEX(false, String[], SType[])
 simType(t::IR.T_TUPLE)::SType = TYPE_TUPLE(SType[simType(x) for x in t.types])
 simType(t::IR.T_FUNCTION)::SType = TYPE_FUNCTION(SType[simType(x) for x in t.inputs], SType[simType(x) for x in t.outputs])
-simType(::Union{IR.T_CLOCK, IR.T_NORETCALL, IR.T_UNKNOWN})::SType = TYPE_UNKNOWN()
+simType(::IR.T_NORETCALL)::SType = TYPE_NORETCALL()
+simType(::Union{IR.T_CLOCK, IR.T_UNKNOWN})::SType = TYPE_UNKNOWN()
 
 #= ==================================================================================== =#
 #= Operators                                                                            =#
@@ -150,6 +151,16 @@ const OPERATORS = Dict{IR.Op, OpKind}(
   IR.EQUAL => OP_EQUAL, IR.NEQUAL => OP_NEQUAL)
 
 simOp(op::IR.Op)::OpKind = OPERATORS[op]
+
+"The element-wise kinds of the arithmetic operators, for array operands (the previous backend's `*_ARR`)."
+const ELEMENTWISE = Dict{OpKind, OpKind}(OP_ADD => OP_ADD_EW, OP_SUB => OP_SUB_EW, OP_MUL => OP_MUL_EW,
+                                         OP_DIV => OP_DIV_EW, OP_POW => OP_POW_EW)
+
+"The kind of a binary operator of type `ty`: `+ - * / ^` of arrays element-wise."
+function simOp(op::IR.Op, ty::IR.ModelicaType)::OpKind
+  local k = simOp(op)
+  return ty isa IR.T_ARRAY ? get(ELEMENTWISE, k, k) : k
+end
 
 #= ==================================================================================== =#
 #= Expressions                                                                          =#
@@ -181,8 +192,9 @@ simExp(names::Names, e::IR.ARRAY_CONSTRUCTOR)::Exp =
 simExp(names::Names, e::IR.REDUCTION)::Exp =
   REDUCTION(e.reducer, simExp(names, e.body), simIterators(names, e.iterators), simType(e.ty))
 simExp(names::Names, e::IR.PARTIAL_APPLICATION)::Exp =
-  PARTEVALFUNCTION(codeName(e.name), simExps(names, e.arguments), e.argumentNames, simType(e.ty)::TYPE_FUNCTION)
-simExp(names::Names, e::IR.BINARY)::Exp = BINARY(simExp(names, e.exp1), simOp(e.op), simExp(names, e.exp2))
+  PARTEVALFUNCTION(codeName(e.name), simExps(names, e.arguments), e.argumentNames,
+                   Pair{Symbol, SType}[n => simType(t) for (n, t) in e.inputs], simType(e.ty)::TYPE_FUNCTION)
+simExp(names::Names, e::IR.BINARY)::Exp = BINARY(simExp(names, e.exp1), simOp(e.op, e.ty), simExp(names, e.exp2))
 simExp(names::Names, e::IR.UNARY)::Exp = UNARY(simOp(e.op), simExp(names, e.exp))
 simExp(names::Names, e::IR.LBINARY)::Exp = LBINARY(simExp(names, e.exp1), simOp(e.op), simExp(names, e.exp2))
 simExp(names::Names, e::IR.LUNARY)::Exp = LUNARY(simOp(e.op), simExp(names, e.exp))

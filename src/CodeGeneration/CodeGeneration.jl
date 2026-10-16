@@ -37,10 +37,6 @@ module CodeGeneration
 
 import DataStructures
 using DataStructures: OrderedDict, OrderedSet
-import ..FrontendUtil.Util
-using MetaModelica
-#= This was also introduced in the data structure package. We need to be explicit in which one we use.=#
-using MetaModelica: Cons
 using Setfield
 using DocStringExtensions
 using ModelingToolkit
@@ -51,20 +47,14 @@ import OrdinaryDiffEq
 import ADTypes
 import NonlinearSolve
 
-using ..FrontendUtil
-using ..Backend #Should maybe not be using here... since it can make certain overloads a bit tricky to follow.
-using ..SimulationCode
+import ..SimCode
+const SC = SimCode
 
-import ..Backend.BDAE
 import ..@BACKEND_LOGGING
 import ..unsupported, ..UnsupportedLowering
 import ..COMPONENT_SEPARATOR
 
-import Absyn
-import DAE
-import MetaGraphs
 import OMFrontend
-import OMParser
 import Symbolics
 import Symbolics.RuntimeGeneratedFunctions
 import SymbolicUtils

@@ -163,3 +163,51 @@ statementCrefNames!(names::OrderedSet{String}, s::FOR) = (crefNames!(names, s.it
 statementCrefNames!(names::OrderedSet{String}, s::WHILE) = (crefNames!(names, s.condition); statementCrefNames!(names, s.body))
 statementCrefNames!(names::OrderedSet{String}, s::RECOMPILATION) = crefNames!(names, s.newValue)
 statementCrefNames!(names::OrderedSet{String}, ::Statement) = names
+
+#= ==================================================================================== =#
+#= The types of expressions                                                             =#
+#= ==================================================================================== =#
+
+"""
+    typeOf(e)
+
+The type of the expression `e`: a literal's, a reference's, a call's and the other typed
+nodes' own; arithmetic Integer of Integer operands, else Real (a division and a power Real),
+an array of the array operand's dimensions; a relation and a logical expression Boolean; an
+if-expression its branch's; an array element its array's element type.
+"""
+typeOf(::ICONST)::SType = TYPE_INTEGER()
+typeOf(::RCONST)::SType = TYPE_REAL()
+typeOf(::BCONST)::SType = TYPE_BOOL()
+typeOf(::SCONST)::SType = TYPE_STRING()
+typeOf(::ENUM_LITERAL)::SType = TYPE_ENUM(())
+typeOf(::DER)::SType = TYPE_REAL()
+typeOf(::Union{WILD, WHOLE_DIMENSION})::SType = TYPE_UNKNOWN()
+typeOf(e::Union{EXP_CREF, PRE, CALL, CAST, RSUB, TSUB, RECORD, ARRAY_EXP, RANGE, REDUCTION, PARTEVALFUNCTION})::SType = e.ty
+typeOf(::Union{RELATION, LBINARY, LUNARY})::SType = TYPE_BOOL()
+typeOf(e::UNARY)::SType = typeOf(e.exp)
+typeOf(e::IFEXP)::SType = typeOf(e.thenExp)
+typeOf(e::TUPLE)::SType = TYPE_TUPLE(SType[typeOf(x) for x in e.elements])
+
+function typeOf(e::BINARY)::SType
+  local (t1, t2) = (typeOf(e.exp1), typeOf(e.exp2))
+  e.op === OP_SCALAR_PRODUCT && return scalarType(t1)
+  local array = t1 isa TYPE_ARRAY ? t1 : t2 isa TYPE_ARRAY ? t2 : nothing
+  local element = e.op in (OP_DIV, OP_DIV_EW, OP_DIV_SCALAR_ARRAY, OP_DIV_ARRAY_SCALAR, OP_POW, OP_POW_EW,
+                           OP_POW_SCALAR_ARRAY, OP_POW_ARRAY_SCALAR, OP_POW_MATRIX) ? TYPE_REAL() :
+    (scalarType(t1) isa TYPE_INTEGER && scalarType(t2) isa TYPE_INTEGER) ? TYPE_INTEGER() : TYPE_REAL()
+  array === nothing && return element
+  return TYPE_ARRAY(element, array.dims)
+end
+
+function typeOf(e::ASUB)::SType
+  local t = typeOf(e.exp)
+  t isa TYPE_ARRAY || return t
+  local kept = Int[d for (k, d) in enumerate(t.dims) if k > length(e.subs) ||
+                   e.subs[k] isa WHOLE_DIMENSION || typeOf(e.subs[k]) isa TYPE_ARRAY]
+  return isempty(kept) ? t.elementType : TYPE_ARRAY(t.elementType, kept)
+end
+
+"The scalar type of `t` (of an array, its element type)."
+scalarType(t::TYPE_ARRAY)::SType = t.elementType
+scalarType(t::SType)::SType = t

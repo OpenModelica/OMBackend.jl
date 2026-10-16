@@ -52,7 +52,7 @@ time at the jump.
 =#
 
 #= A delay() call as OMFrontend passes it on: OpenModelica.Internal.delay2/delay3 (or a bare delay). =#
-_isDelayCall(@nospecialize(path)) = string(path) in ("OpenModelica.Internal.delay2", "OpenModelica.Internal.delay3", "delay")
+_isDelayCall(e::SC.Exp)::Bool = e isa SC.CALL && e.name in (:OpenModelica_Internal_delay2, :OpenModelica_Internal_delay3, :delay)
 
 mutable struct DelayHistory
   t::Vector{Float64}

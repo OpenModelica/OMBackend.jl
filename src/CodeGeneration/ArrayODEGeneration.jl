@@ -2252,19 +2252,17 @@ function _containsErrorCall(@nospecialize(x))::Bool
 end
 
 #= The model's Modelica functions as Julia functions of the module (the MTK path's code
-   generation: SimulationCode.generateSimCodeFunctions, AlgorithmicCodeGeneration.generateFunctions),
+   generation: AlgorithmicCodeGeneration.generateFunctions),
    each a module constant named as the frontend's function list names it (dots as _), so the
    equations and the functions' calls of each other find it. Returns (definitions, outputs). =#
 function _functionDefinitions(functions)
   local defs = Any[]; local outs = Dict{String, Int}()
   (functions === nothing || isempty(functions)) && return (defs, outs)
-  local SC = _OMBACKEND.SimulationCode
-  local (mfs, _) = try
-    SC.generateSimCodeFunctions(functions)
+  local mfs = try
+    _OMBACKEND.SimCode.simFunctions(_OMBACKEND.LowerFlatModel.lowerFunctions(functions))
   catch err
     ns("the model's functions: " * first(sprint(showerror, err), 160))
   end
-  mfs = SC.flattenRecordParameters(mfs)
   local (exprs, names) = try
     _OMBACKEND.CodeGeneration.AlgorithmicCodeGeneration.generateFunctions(mfs)
   catch err

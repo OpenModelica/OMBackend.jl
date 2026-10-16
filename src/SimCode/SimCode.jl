@@ -54,6 +54,7 @@ const IR = OMJLIR
 
 include("types.jl")
 include("traverse.jl")
+include("print.jl")
 include("lowerExpressions.jl")
 include("lowerVariables.jl")
 include("lowerModel.jl")
@@ -78,5 +79,6 @@ include("passes/structure.jl")
 include("passes/outputOnly.jl")
 include("passes/runner.jl")
 include("passes/pipeline.jl")
+include("check.jl")
 
 end # module SimCode
