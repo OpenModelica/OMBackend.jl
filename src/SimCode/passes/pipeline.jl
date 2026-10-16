@@ -14,11 +14,12 @@ end
 The simulation code the MTK and IMTK code generators take, of the OMJLIR model `model` (after
 its passes): lowered (`fromOMJLIR`), its record call sites flattened, through the SimCode
 passes: the parameters' if-bindings and constant conditions resolved, parameter closures
-folded, constants propagated (after `pre()` of parameters inlined), Complex operator records
-lowered, aliases and equations of equal right-hand sides eliminated, semiLinear chains
-simplified, redundant residuals removed, constant and dead parameters and observation-only
-variables dropped, constant function outputs evaluated, frozen states eliminated, reciprocal
-equations oriented and explicit assignments folded, aliases eliminated again (the folds join
+folded, constants propagated (after `pre()` of parameters inlined), the states without der()
+demoted, Complex operator records lowered, aliases and equations of equal right-hand sides
+eliminated, semiLinear chains simplified, redundant residuals removed, constant and dead
+parameters and observation-only variables dropped, constant function outputs evaluated, frozen
+states eliminated (the states without der() then demoted again: a frozen factor drops
+`0 * der(x)`), reciprocal equations oriented and explicit assignments folded, aliases eliminated again (the folds join
 flow sums), the right-hand-side equivalence to a fixed point (at most 6 rounds), the discretes
 of when-equations classified, the output-only variables eliminated (`eliminateNonDynamic`),
 the alias observations filtered (`observedFilter`, else the user-visible names: no `[`), the
@@ -34,6 +35,7 @@ function simulationCode(model::IR.Model; observedFilter::Union{Nothing, Vector{S
     "foldParameterClosure" => foldParameterClosure,
     "inlinePreOfConstantParameters" => inlinePreOfConstantParameters,
     "propagateConstants" => propagateConstants,
+    "demoteDeadStates" => demoteDeadStates,
     "lowerComplexOperatorRecords" => lowerComplexOperatorRecords,
     "eliminateAliasVariables" => eliminateAliasVariables,
     "eliminateRHSEquivalentEquations" => eliminateRHSEquivalentEquations,
@@ -44,6 +46,7 @@ function simulationCode(model::IR.Model; observedFilter::Union{Nothing, Vector{S
     "eliminateDeadParameters" => eliminateDeadParameters,
     "evaluateConstantFunctionOutputs" => evaluateConstantFunctionOutputs,
     "eliminateFrozenStates" => eliminateFrozenStates,
+    "demoteDeadStates" => demoteDeadStates,
     "orientReciprocalEquations" => orientReciprocalEquations,
     "foldExplicitSingleAssign" => foldExplicitSingleAssign,
     "eliminateAliasVariables" => eliminateAliasVariables,
@@ -101,11 +104,13 @@ function deSimulationCode(model::IR.Model)::SIM_CODE
     "foldParameterClosure" => foldParameterClosure,
     "inlinePreOfConstantParameters" => inlinePreOfConstantParameters,
     "propagateConstants" => propagateConstants,
+    "demoteDeadStates" => demoteDeadStates,
     "eliminateAliasVariables" => eliminateAliasVariables,
     "eliminateRHSEquivalentEquations" => eliminateRHSEquivalentEquations,
     "simplifySemiLinear" => simplifySemiLinear,
     "removeRedundantEquations" => removeRedundantEquations,
     "eliminateConstantParameters" => eliminateConstantParameters,
     "eliminateFrozenStates" => eliminateFrozenStates,
+    "demoteDeadStates" => demoteDeadStates,
     "pruneConstantConditions" => pruneConstantConditions])
 end

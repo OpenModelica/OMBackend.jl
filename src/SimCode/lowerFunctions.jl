@@ -137,8 +137,9 @@ The derivative of an `Inline = true` function `f` whose body is `y := g(a1, ...,
 a derivative annotation: `g`'s derivative function at the same arguments, as OpenModelica
 inlines `f` before the index reduction (MSL IF97's `rho_ph(p, h, phase, region) :=
 rho_props_ph(p, h, waterBaseProp_ph(...))`). It takes `f`'s inputs and a derivative for each
-Real one; an argument of `g` that takes a derivative must be one of `f`'s inputs or a literal.
-`nothing` for another function.
+Real one; `g`'s arguments are its declared inputs (a record-valued call one, spread at the code
+generation): a Real one that takes a derivative must be one of `f`'s inputs or a literal, another
+one (IF97's auxiliary record) one `g`'s annotation excludes. `nothing` for another function.
 """
 function inlineDerivative(f::MODELICA_FUNCTION, functions::Vector{ModelicaFunction})::Union{Nothing, MODELICA_FUNCTION}
   (length(f.outputs) == 1 && only(f.outputs).ty isa TYPE_REAL && length(f.statements) == 1) || return nothing
@@ -151,7 +152,9 @@ function inlineDerivative(f::MODELICA_FUNCTION, functions::Vector{ModelicaFuncti
   local g = functions[gk]
   (g isa MODELICA_FUNCTION && g.derivative !== nothing) || return nothing
   local gd = g.derivative
-  (length(call.args) == gd.nInputs && length(g.inputs) == gd.nInputs) || return nothing
+  #= the arguments by g's declared inputs (a record-valued call is one, spread over the record's
+     fields), the positions gd counts and excludes by =#
+  length(call.args) == gd.nInputs || return nothing
   local derOf = Dict{String, Exp}()
   local derInputs = FunctionVariable[]
   for v in f.inputs
@@ -160,9 +163,11 @@ function inlineDerivative(f::MODELICA_FUNCTION, functions::Vector{ModelicaFuncti
     derOf[v.name] = EXP_CREF(SimCref(Symbol(v.name, "__der")), TYPE_REAL())
   end
   local derArgs = Exp[]
-  for (i, v) in enumerate(g.inputs)
-    (v.ty isa TYPE_REAL && !(i in gd.excludedInputs)) || continue
-    local a = call.args[i]
+  for (i, a) in enumerate(call.args)
+    i in gd.excludedInputs && continue
+    local ty = typeOf(a)
+    ty isa Union{TYPE_INTEGER, TYPE_BOOL, TYPE_ENUM, TYPE_STRING} && continue
+    ty isa TYPE_REAL || return nothing
     local d = a isa EXP_CREF ? get(derOf, crefName(a.cref), nothing) : a isa Union{RCONST, ICONST} ? RCONST(0.0) : nothing
     d === nothing && return nothing
     push!(derArgs, d)

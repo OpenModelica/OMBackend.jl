@@ -170,12 +170,13 @@ function tryEvalNumeric(e::Exp, simCode::SIM_CODE, seen::OrderedSet{String})::Un
   return nothing
 end
 
-"`v1 op v2` for `+ - * /` (a division by zero does not evaluate)."
+"`v1 op v2` for `+ - * /` (a division by zero does not evaluate, another operator neither)."
 function arithmetic(v1::Float64, op::OpKind, v2::Float64)::Union{Float64, Nothing}
   op === OP_ADD && return v1 + v2
   op === OP_SUB && return v1 - v2
   op === OP_MUL && return v1 * v2
-  return v2 == 0.0 ? nothing : v1 / v2
+  op === OP_DIV && return v2 == 0.0 ? nothing : v1 / v2
+  return nothing
 end
 
 """

@@ -76,9 +76,6 @@ function report(io::IO, r::CheckResult; prefix::AbstractString = "", modelName::
   return nothing
 end
 
-"A name without its subscripts (`a[1][2]`: `a`)."
-baseName(name::AbstractString)::String = String(first(split(name, '['; limit = 2)))
-
 """
     checkBalanced(simCode)
 
@@ -142,32 +139,8 @@ A state is under der() somewhere (a residual, an eliminated or initial equation,
 a when-equation; an array element's by its array): else MTK eliminates it silently or the
 system is overdetermined.
 """
-function checkDeadStates(simCode::SIM_CODE)::Vector{CheckViolation}
-  local derived = OrderedSet{String}()
-  local visit = e::Exp -> foreachExp(e) do x
-    x isa DER && push!(derived, crefName(x.cref))
-    (isBuiltin(x, :der) && first(x.args) isa EXP_CREF) && push!(derived, crefName(first(x.args).cref))
-  end
-  foreach(eq -> visit(eq.exp), simCode.residualEquations)
-  foreach(eq -> visit(eq.exp), simCode.eliminatedEquations)
-  foreach(eq -> foreach(visit, equationExps(eq)), simCode.initialEquations)
-  for ifEq in simCode.ifEquations, b in ifEq.branches
-    visit(b.condition)
-    foreach(eq -> visit(eq.exp), b.residualEquations)
-  end
-  for w in simCode.whenEquations
-    local stmts = w.whenEquation
-    while stmts !== nothing
-      visit(stmts.condition)
-      foreach(s -> mapStatementExps(e -> (visit(e); e), s), stmts.body)
-      stmts = stmts.elsewhenPart
-    end
-  end
-  local derivedBases = OrderedSet(baseName(n) for n in derived)
-  return CheckViolation[CheckViolation(:dead_state, :warn, v.name, "STATE variable has no der() reference")
-                        for (_, (_, v)) in simCode.stringToSimVarHT
-                        if v.varKind isa STATE && !(v.name in derived) && !(baseName(v.name) in derivedBases)]
-end
+checkDeadStates(simCode::SIM_CODE)::Vector{CheckViolation} =
+  CheckViolation[CheckViolation(:dead_state, :warn, name, "STATE variable has no der() reference") for name in deadStateNames(simCode)]
 
 """
     checkReferenceResolution(simCode)

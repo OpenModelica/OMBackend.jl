@@ -222,6 +222,33 @@ function getStartConditionsMTK(vars::Vector, simCode::SC.SIM_CODE; skipDefaultSt
 end
 
 """
+    equationDefinedDiscreteNames(simCode)
+
+The discretes an equation defines, not a when-equation: a residual's top-level operand (`d -
+rhs`, `rhs + d`, `-d`, `d`), or one lifted into a when-equation on the change of the relations
+it reads (`liftedDiscreteNames`).
+"""
+function equationDefinedDiscreteNames(simCode::SC.SIM_CODE)::Set{String}
+  local ht = simCode.stringToSimVarHT
+  local discreteName = function (e::SC.Exp)
+    e isa SC.EXP_CREF || return nothing
+    local entry = get(ht, SC.crefName(e.cref), nothing)
+    return entry !== nothing && last(entry).varKind isa SC.DISCRETE ? SC.crefName(e.cref) : nothing
+  end
+  local defined = Set{String}(liftedDiscreteNames(simCode))
+  for eq in simCode.residualEquations
+    local e = eq.exp
+    local operands = e isa SC.BINARY && e.op in (SC.OP_SUB, SC.OP_ADD) ? (e.exp1, e.exp2) :
+                     e isa SC.UNARY && e.op === SC.OP_UMINUS ? (e.exp,) : (e,)
+    for o in operands
+      local nm = discreteName(o)
+      nm === nothing || push!(defined, nm)
+    end
+  end
+  return defined
+end
+
+"""
   Emit `lhs ~ rhs` constraint Equations for state vars with `fixed=true` and a
   `start` (0 where it has none: the default start, MLS 4.9.1). Goes into
   `initialization_eqs` so MTK pins them at t=0 rather than treating them as soft
@@ -231,9 +258,14 @@ end
 function getFixedStartConstraintsMTK(vars::Vector, simCode::SC.SIM_CODE)::Vector{Expr}
   local result = Expr[]
   local ht = simCode.stringToSimVarHT
+  #= a discrete an equation defines: its fixed start is its pre() at the initialization (MLS
+     8.6), its value the equation's (MSL OpenTank's ports_m_flow_out(each start = true, each
+     fixed = true) = false: v = true overdetermined the tank) =#
+  local defined = equationDefinedDiscreteNames(simCode)
   for var in vars
     local simVar = last(ht[var])
     simVar.attributes.fixed == SC.BCONST(true) || continue
+    simVar.name in defined && continue
     local startExp = something(simVar.attributes.start, SC.RCONST(0.0))
     push!(result, :($(Symbol(simVar.name)) ~ $(expToJuliaExpMTK(startExp, simCode))))
   end

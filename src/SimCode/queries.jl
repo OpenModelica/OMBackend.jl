@@ -137,6 +137,59 @@ function whenCrefNames!(names::OrderedSet{String}, w::WHEN_STMTS)::OrderedSet{St
   return names
 end
 
+"A name without its subscripts (`a[1][2]`: `a`)."
+baseName(name::AbstractString)::String = String(first(split(name, '['; limit = 2)))
+
+"""
+    derivedStateNames(simCode)
+
+The variables under der() (a residual, an eliminated or initial equation, an if-branch, a
+when-equation, an initial algorithm, an assert) and those a reinit() sets: the states with
+dynamics.
+"""
+function derivedStateNames(simCode::SIM_CODE)::OrderedSet{String}
+  local derived = OrderedSet{String}()
+  local visit = e::Exp -> foreachExp(e) do x
+    x isa DER && push!(derived, crefName(x.cref))
+    (isBuiltin(x, :der) && first(x.args) isa EXP_CREF) && push!(derived, crefName(first(x.args).cref))
+  end
+  local visitStatement = s::Statement -> begin
+    s isa REINIT && push!(derived, crefName(s.stateVar))
+    mapStatementExps(e -> (visit(e); e), s)
+  end
+  foreach(eq -> visit(eq.exp), simCode.residualEquations)
+  foreach(eq -> visit(eq.exp), simCode.eliminatedEquations)
+  foreach(eq -> foreach(visit, equationExps(eq)), simCode.initialEquations)
+  for ifEq in simCode.ifEquations, b in ifEq.branches
+    visit(b.condition)
+    foreach(eq -> visit(eq.exp), b.residualEquations)
+  end
+  for w in simCode.whenEquations
+    local stmts = w.whenEquation
+    while stmts !== nothing
+      visit(stmts.condition)
+      foreach(visitStatement, stmts.body)
+      stmts = stmts.elsewhenPart
+    end
+  end
+  foreach(a -> foreach(visitStatement, a.statements), simCode.initialAlgorithms)
+  foreach(a -> (visit(a.condition); visit(a.message)), simCode.asserts)
+  return derived
+end
+
+"""
+    deadStateNames(simCode)
+
+The states without dynamics: none of `derivedStateNames` (an array element's by its array's
+name too).
+"""
+function deadStateNames(simCode::SIM_CODE)::Vector{String}
+  local derived = derivedStateNames(simCode)
+  local derivedBases = Set{String}(baseName(n) for n in derived)
+  return String[v.name for (_, (_, v)) in simCode.stringToSimVarHT
+                if v.varKind isa STATE && !(v.name in derived) && !(baseName(v.name) in derivedBases)]
+end
+
 """
     statementCrefNames!(names, body)
 

@@ -523,12 +523,14 @@ function _discreteStartValue(sv::SC.SIMVAR, simCode::SC.SIM_CODE)::Union{Float64
   return _foldParameterBindStatic(k.bindExp, simCode)
 end
 
-#= Module-level list of the discretes the discrete clusters assign (emitDiscreteClusters): the
-   direct-RHS initialization leaves them to the clusters' start bodies; with their start values
-   and those of the other discretes (what pre() reads at the initialization, MLS 8.6), for the
-   initial fixpoint of the clusters. Empty when the model does not take that path. =#
-function liftedDiscretesDecl(simCode::SC.SIM_CODE)::Expr
-  _usesDiscreteClusters(simCode) || return Expr(:block)
+"""
+    liftedDiscreteNames(simCode)
+
+The discretes an equation defines at every instant (`b = x > 0.2`, `y = pre(y) and ...`), lifted
+into when-equations on the change of the relations they read: the variables those
+when-equations assign. Their values at the initialization are their equations' too.
+"""
+function liftedDiscreteNames(simCode::SC.SIM_CODE)::Vector{String}
   local names = String[]
   for weq in simCode.whenEquations
     _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
@@ -539,6 +541,16 @@ function liftedDiscretesDecl(simCode::SC.SIM_CODE)::Expr
       entry === nothing || push!(names, last(entry).name)
     end
   end
+  return names
+end
+
+#= Module-level list of the discretes the discrete clusters assign (emitDiscreteClusters): the
+   direct-RHS initialization leaves them to the clusters' start bodies; with their start values
+   and those of the other discretes (what pre() reads at the initialization, MLS 8.6), for the
+   initial fixpoint of the clusters. Empty when the model does not take that path. =#
+function liftedDiscretesDecl(simCode::SC.SIM_CODE)::Expr
+  _usesDiscreteClusters(simCode) || return Expr(:block)
+  local names = liftedDiscreteNames(simCode)
   isempty(names) && return Expr(:block)
   local starts = Dict{String, Float64}()
   for (_, (_, sv)) in simCode.stringToSimVarHT

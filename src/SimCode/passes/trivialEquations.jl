@@ -298,7 +298,7 @@ function semiLinearChain(eqs::Vector{Tuple{Int, Exp, Exp, Exp, Exp}})::Union{Not
   local sbs = Set{Exp}(e[5] for e in eqs)
   local starts = [k for (k, e) in enumerate(eqs) if !(e[4] in sbs)]
   length(starts) == 1 || return nothing
-  local chain = [eqs[only(starts)]]
+  local chain = Tuple{Int, Exp, Exp, Exp, Exp}[eqs[only(starts)]]
   while length(chain) < length(eqs)
     local next = get(bySa, last(chain)[5], 0)
     (next == 0 || !(last(chain)[5] isa EXP_CREF)) && return nothing

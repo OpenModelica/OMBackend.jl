@@ -181,7 +181,8 @@ function eliminateFrozenOnce(simCode::SIM_CODE, kept::OrderedSet{String})::Union
   local removed = Set{Int}(i for (_, i) in values(frozen))
   local fold = eq::RESIDUAL_EQUATION -> RESIDUAL_EQUATION(foldNumeric(substitute(eq.exp, rs)), eq.source, eq.attr)
   local newHT = copy(ht)
-  foreach(n -> delete!(newHT, n), keys(frozen))
+  #= a frozen state's der() is 0 everywhere (the replacement is time-invariant): its entry goes too =#
+  foreach(n -> (last(ht[n]).varKind isa STATE && delete!(newHT, "der($(n))"); delete!(newHT, n)), keys(frozen))
   local eliminated = sort(collect(keys(frozen)))
   return update(simCode;
                 residualEquations = RESIDUAL_EQUATION[fold(eq) for (i, eq) in enumerate(residuals) if !(i in removed)],
@@ -199,3 +200,27 @@ frozenInitial(eq::RESIDUAL_EQUATION, rs::Replacements)::Equation = RESIDUAL_EQUA
 frozenInitial(eq::EQUATION, rs::Replacements)::Equation =
   EQUATION(foldNumeric(substitute(eq.lhs, rs)), foldNumeric(substitute(eq.rhs, rs)), eq.source, eq.attr)
 frozenInitial(eq::Equation, ::Replacements)::Equation = eq
+
+"""
+    demoteDeadStates(simCode)
+
+The states no der() reads any more (`deadStateNames`: a fold of `0 * der(x)`, MSL
+FundamentalWave's eddy-current core, whose loss `Q_flow = c * V_m * der(Phi)` goes with the
+frozen `V_m = 0` and `Q_flow = 0` when its conductance G is 0) as algebraic variables,
+their derivatives dropped: a state without dynamics is an alias or an algebraic variable for the
+later passes (as a state MTK integrated it as a free unknown: SMPM_Braking took 44k steps and
+failed). Nothing for a model with modes or translated again at its structural changes.
+"""
+function demoteDeadStates(simCode::SIM_CODE)::SIM_CODE
+  (hasSubModels(simCode) || hasFrontendModel(simCode)) && return simCode
+  local dead = deadStateNames(simCode)
+  isempty(dead) && return simCode
+  local newHT = copy(simCode.stringToSimVarHT)
+  for name in dead
+    local (index, v) = newHT[name]
+    newHT[name] = (index, withKind(v, ALG_VARIABLE(index)))
+    delete!(newHT, "der($(name))")
+  end
+  @debug "[SIMCODE: $(simCode.name): demoteDeadStates] $(dead)"
+  return update(simCode; stringToSimVarHT = newHT)
+end

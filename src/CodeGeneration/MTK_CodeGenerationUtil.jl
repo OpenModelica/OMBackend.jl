@@ -1912,9 +1912,9 @@ end
 
 The structural simplification of `firstOrderSystem` into `reducedSystem`; with an observed
 filter, the observed equations kept those whose variable a pattern matches, with the observed
-variables they read and the system's equations read. With ENABLE_BACKEND_LOGGING, the system
-before is dumped to `backend/codeGen/preStructuralSimplify.log` (the path taken at codegen time,
-in the model's run directory).
+variables they read and the system's and the initialization equations read. With
+ENABLE_BACKEND_LOGGING, the system before is dumped to `backend/codeGen/preStructuralSimplify.log`
+(the path taken at codegen time, in the model's run directory).
 """
 function performStructuralSimplify(simplify::Bool; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
                                    split::Bool = !OMBackend.DIRECT_RHS_GENERATION[])::Expr
@@ -1939,9 +1939,13 @@ function performStructuralSimplify(simplify::Bool; observedFilter::Union{Nothing
     local _keepNames = OrderedSet{String}()
     local _stack = String[string(eq.lhs) for eq in _allObs
                           if any(p -> occursin(p, string(eq.lhs)), _obsPatterns)]
-    #= Also seed from observed vars referenced by the system equations: the
-       residual / init build_function references them, so their defs must survive. =#
-    for _seq in ModelingToolkit.equations(reducedSystem)
+    #= Also seed from observed vars referenced by the system equations and the
+       initialization equations: the residual / init build_function references them
+       (the initialization rows are inlined to the states through the observed
+       equations: MSL IMC_YD's rotorCage.electroMagneticConverter.V_m = Complex(0, 0)),
+       so their defs must survive. =#
+    for _seq in Iterators.flatten((ModelingToolkit.equations(reducedSystem),
+                                   ModelingToolkit.initialization_equations(reducedSystem)))
       for _side in (_seq.lhs, _seq.rhs)
         for _v in Symbolics.get_variables(_side)
           local _vn = string(_v)

@@ -229,8 +229,30 @@ lowerExp(e::F.RANGE_EXPRESSION)::IR.Expression =
 lowerExp(e::F.TUPLE_EXPRESSION)::IR.Expression = IR.TUPLE(lowerExps(e.elements), lowerType(e.ty))
 lowerExp(e::F.CALL_EXPRESSION)::IR.Expression = lowerCall(e.call)
 lowerExp(e::F.SIZE_EXPRESSION)::IR.Expression = IR.SIZE(lowerExp(e.exp), lowerOptExp(e.dimIndex))
-lowerExp(e::F.BINARY_EXPRESSION)::IR.Expression =
-  IR.BINARY(lowerExp(e.exp1), lowerOp(e.operator), lowerExp(e.exp2), lowerType(e.operator.ty))
+"""
+A binary operation. The frontend's scalarization keeps an array operator on the elements it
+subscripts (`crossAreas[1] * lengths[1] * nParallel` an array times a scalar, of type
+`Real[2]`): of two scalar operands the scalar operator, of the element type.
+"""
+function lowerExp(e::F.BINARY_EXPRESSION)::IR.Expression
+  local (a, b) = (lowerExp(e.exp1), lowerExp(e.exp2))
+  local (op, ty) = (lowerOp(e.operator), lowerType(e.operator.ty))
+  if isScalarType(IR.typeOf(a)) && isScalarType(IR.typeOf(b)) && haskey(SCALAR_OPS, op)
+    (op, ty) = (SCALAR_OPS[op], IR.elementType(ty))
+  end
+  return IR.BINARY(a, op, b, ty)
+end
+
+"The scalar operators of the element-wise and scalar-array ones."
+const SCALAR_OPS = Dict{IR.Op, IR.Op}(
+  IR.ADD_EW => IR.ADD, IR.ADD_SCALAR_ARRAY => IR.ADD, IR.ADD_ARRAY_SCALAR => IR.ADD,
+  IR.SUB_EW => IR.SUB, IR.SUB_SCALAR_ARRAY => IR.SUB, IR.SUB_ARRAY_SCALAR => IR.SUB,
+  IR.MUL_EW => IR.MUL, IR.MUL_SCALAR_ARRAY => IR.MUL, IR.MUL_ARRAY_SCALAR => IR.MUL,
+  IR.DIV_EW => IR.DIV, IR.DIV_SCALAR_ARRAY => IR.DIV, IR.DIV_ARRAY_SCALAR => IR.DIV,
+  IR.POW_EW => IR.POW, IR.POW_SCALAR_ARRAY => IR.POW, IR.POW_ARRAY_SCALAR => IR.POW)
+
+"A type of a scalar value (not an array, a record or an unknown type)."
+isScalarType(ty::IR.ModelicaType)::Bool = ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION}
 lowerExp(e::F.UNARY_EXPRESSION)::IR.Expression =
   IR.UNARY(lowerOp(e.operator), lowerExp(e.exp), lowerType(e.operator.ty))
 lowerExp(e::F.LBINARY_EXPRESSION)::IR.Expression =

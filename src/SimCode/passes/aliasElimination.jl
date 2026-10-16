@@ -222,20 +222,14 @@ function eliminateAliasVariables(simCode::SIM_CODE)::SIM_CODE
   isempty(stillRead) || @debug "[SIMCODE: $(simCode.name): eliminateAliasVariables] eliminated variables still read, kept" stillRead
   local newHT = copy(ht)
   local eliminated = String[n for n in keys(replacements) if !(n in stillRead)]
-  foreach(n -> delete!(newHT, n), eliminated)
+  foreach(n -> deleteEliminated!(newHT, ht, n, representativeOf[n]), eliminated)
   for (name, attributes) in mergedAttributes
     haskey(newHT, name) || continue
     local (index, v) = newHT[name]
     attributes == v.attributes || (newHT[name] = (index, SIMVAR(v.name, v.index, v.varKind, attributes, v.elementType)))
   end
   local (observedVariables, observedEquations) = observationPairs(eliminated, pairs, removed, residuals, replacements, refs)
-  local aliasMap = copy(simCode.aliasMap)
-  local known = Set{String}(e.eliminatedName for e in aliasMap)
-  for e in entries
-    (e.eliminatedName in stillRead || e.eliminatedName in known) && continue
-    push!(aliasMap, e)
-    push!(known, e.eliminatedName)
-  end
+  local aliasMap = withAliases(simCode.aliasMap, filter(e -> !(e.eliminatedName in stillRead), entries))
   local eliminatedSet = Set{String}(eliminated)
   return update(simCode; residualEquations = newResiduals, initialEquations, initialAlgorithms, stringToSimVarHT = newHT,
                 ifEquations, whenEquations, aliasMap, asserts = ASSERT_EQUATION[substitute(a, replacements) for a in simCode.asserts],
@@ -243,6 +237,44 @@ function eliminateAliasVariables(simCode::SIM_CODE)::SIM_CODE
                 eliminatedEquations = vcat(RESIDUAL_EQUATION[substitute(eq, replacements) for eq in simCode.eliminatedEquations],
                                            observedEquations),
                 eliminatedVariables = vcat(simCode.eliminatedVariables, observedVariables))
+end
+
+"""
+    deleteEliminated!(newHT, ht, name, representative)
+
+The eliminated variable `name` deleted from `newHT`; of a state aliased to a state, its
+derivative too (the substitution reads the representative's).
+"""
+function deleteEliminated!(newHT::HT, ht::HT, name::String, representative::String)::Nothing
+  delete!(newHT, name)
+  last(ht[name]).varKind isa STATE && last(ht[representative]).varKind isa STATE && delete!(newHT, "der($(name))")
+  return nothing
+end
+
+"""
+    withAliases(aliasMap, entries)
+
+The alias map `aliasMap` with the aliases `entries` of a pass added (a name aliased already
+keeps its alias): an alias whose representative the pass eliminated points to that one's
+representative instead, the negations composed, so that a representative stays a variable
+(`checkAliasConsistency`; MSL SMPM_Braking: inertiaLoad.phi, an alias of the rotor's phi, which
+the second alias elimination eliminates for the stray load's phi).
+"""
+function withAliases(aliasMap::Vector{AliasEntry}, entries::Vector{AliasEntry})::Vector{AliasEntry}
+  local entryOf = Dict{String, AliasEntry}(e.eliminatedName => e for e in entries)
+  local out = AliasEntry[]
+  local known = Set{String}()
+  for e in aliasMap
+    local r = get(entryOf, e.representativeName, nothing)
+    push!(out, r === nothing ? e : AliasEntry(e.eliminatedName, r.representativeName, xor(e.negated, r.negated)))
+    push!(known, e.eliminatedName)
+  end
+  for e in entries
+    e.eliminatedName in known && continue
+    push!(out, e)
+    push!(known, e.eliminatedName)
+  end
+  return out
 end
 
 """
@@ -464,7 +496,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   isempty(replacements) && return simCode
   @debug "[SIMCODE: $(simCode.name): eliminateRHSEquivalentEquations] $(length(replacements)) variables aliased by equal right-hand sides"
   local newHT = copy(ht)
-  foreach(n -> delete!(newHT, n), keys(replacements))
+  foreach(e -> deleteEliminated!(newHT, ht, e.eliminatedName, e.representativeName), entries)
   for (name, attributes) in mergedAttributes
     haskey(newHT, name) || continue
     local (index, v) = newHT[name]
@@ -481,7 +513,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
                 asserts = ASSERT_EQUATION[substitute(a, replacements) for a in simCode.asserts],
                 stringToSimVarHT = newHT,
                 irreducibleVariables = filter(n -> !(n in eliminatedSet), simCode.irreducibleVariables),
-                aliasMap = vcat(simCode.aliasMap, entries),
+                aliasMap = withAliases(simCode.aliasMap, entries),
                 eliminatedVariables = vcat(simCode.eliminatedVariables, eliminated),
                 eliminatedEquations = vcat(RESIDUAL_EQUATION[substitute(eq, replacements) for eq in simCode.eliminatedEquations],
                                            eliminatedEquations))
