@@ -41,8 +41,6 @@ module OMBackend
 # "the specified procedure could not be found". Loading Plots first makes Glib's
 # gettext win the libintl-8.dll name, which OMRuntimeExternalC tolerates.
 import Plots
-import DAE
-using MetaModelica: @assign
 const CURRENT_DIRECTORY = @__DIR__
 include("$CURRENT_DIRECTORY/util.jl")
 include("$CURRENT_DIRECTORY/globalConstants.jl")
@@ -53,9 +51,6 @@ include("$CURRENT_DIRECTORY/IR/OMJLIR.jl")
 include("$CURRENT_DIRECTORY/Backend/lowerFlatModel.jl")
 include("$CURRENT_DIRECTORY/Backend/passes/Passes.jl")
 include("$CURRENT_DIRECTORY/SimCode/SimCode.jl")
-include("$CURRENT_DIRECTORY/FrontendUtil/FrontendUtil.jl")
-include("$CURRENT_DIRECTORY/Backend/Backend.jl")
-include("$CURRENT_DIRECTORY/SimulationCode/SimulationCode.jl")
 include("$CURRENT_DIRECTORY/Runtime/Runtime.jl")
 include("$CURRENT_DIRECTORY/CodeGeneration/CodeGeneration.jl")
 #= In-backend MTK path (System construction + structural_simplify at translate

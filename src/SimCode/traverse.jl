@@ -141,7 +141,7 @@ mapStatements(f::F, body::Vector{Statement}) where {F} = Statement[mapStatement(
     crefNames!(names, e)
 
 The names of the variables `e` reads, in order: a reference's name (with its subscripts,
-`x[1]` of an array element), a derivative's `der(x)` and its state's, a `pre(x)`'s variable;
+`x[1]` of an array element), a derivative's state's, a `pre(x)`'s variable;
 an array read by literal subscripts also as its element (`R_T[1][2]`), by a subscript that
 reads a variable as `R_T[?]` (`DYNAMIC_SUBSCRIPT_MARK`).
 """

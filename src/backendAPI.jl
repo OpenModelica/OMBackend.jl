@@ -76,6 +76,7 @@ import ..CodeGeneration
 import ..Runtime
 import .OMJLIR
 import .LowerFlatModel
+import .LowerFlatModel: FunctionList
 import .Passes
 import .SimCode
 
@@ -186,8 +187,6 @@ function warnMissingStartValues(enabled::Bool)
 end
 
 @enum BackendMode begin
-  DAE_MODE = 1
-  ODE_MODE = 2 #Currently not in operation
   MTK_MODE = 3
   #=
     Direct DifferentialEquations.jl emission. Builds an `ODEProblem` with an
@@ -286,7 +285,7 @@ const ARRAY_ODE_MODELS = Set{String}()
 # Per-model log-run directory captured at translate (`lower`) time. Looked up
 # at simulate time by `simulateModel` so any dumps emitted during the
 # post-MTK / `buildDirectRHSProblem` / `_solveDAEInitialization!` codegen
-# paths land in the same per-model run directory as the BDAE/simCode logs,
+# paths land in the same per-model run directory as the OMJLIR/simCode logs,
 # not the session root. Keyed by canonical model name.
 const MODEL_RUN_DIRS = Dict{String, String}()
 
@@ -348,7 +347,7 @@ passes (SimCode.simulationCode; SimCode.deSimulationCode for DEMode), checked
 this path where it is outside its scope.
 """
 function translate(fm::OMFrontend.Frontend.FlatModel;
-                   functionList = nothing,
+                   functionList::Union{Nothing, FunctionList} = nothing,
                    BackendMode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
                    warnMissingStartValues::Union{Nothing, Bool} = nothing,
                    eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
@@ -372,9 +371,7 @@ function translate(fm::OMFrontend.Frontend.FlatModel;
       @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "frontend_initialModel.log"),
         replace(OMFrontend.Frontend.toFlatString(fm, functionList === nothing ? MetaModelica.nil : functionList), "\\n" => "\n"))
       local model = @BACKEND_PERFLOG "[backendAPI] lower" omjlirModel(fm; functionList, scalarized)
-      if BackendMode == DAE_MODE
-        error("DAE-mode is deprecated.")
-      elseif BackendMode == DEMode
+      if BackendMode == DEMode
         #= Direct DifferentialEquations.jl path: a subset of the MTK path's SimCode passes (not,
            e.g., the Complex lowering, the function evaluation, the folds, the initial values),
            no observed-equation work, the DE emitter. =#
@@ -408,9 +405,10 @@ through the passes (Passes.PIPELINE): what the simulation code is lowered from. 
 with arrays kept (`scalarized = false`, OM's `scalarize = false`) is scalarized first: the
 backend takes scalars.
 """
-function omjlirModel(fm::OMFrontend.Frontend.FlatModel; functionList = nothing, scalarized::Bool = true)::OMJLIR.Model
+function omjlirModel(fm::OMFrontend.Frontend.FlatModel; functionList::Union{Nothing, FunctionList} = nothing,
+                     scalarized::Bool = true)::OMJLIR.Model
   scalarized || (fm = @BACKEND_PERFLOG "[backendAPI] scalarizeKeptArrays" OMFrontend.Frontend.scalarizeKeptArrays(fm))
-  local model = LowerFlatModel.lowerFlatModel(fm; functions = functionList === nothing ? () : functionList)
+  local model = LowerFlatModel.lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
   return Passes.runPasses!(model)
 end
 
@@ -541,7 +539,7 @@ The array-preserving translation of a flat model with arrays kept (from the fron
 `scalarize = false`), or `nothing` when the model is outside its scope (the reason is
 logged). OM falls back to the scalarizing flatten and `translate` then.
 """
-function translateArrays(fm::OMFrontend.Frontend.FlatModel; functionList = nothing)
+function translateArrays(fm::OMFrontend.Frontend.FlatModel; functionList::Union{Nothing, FunctionList} = nothing)
   delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
   ARRAY_ODE_GENERATION[] || return nothing
   if !isempty(TUNABLE_PARAMETERS[])
@@ -553,7 +551,7 @@ end
 
 #= The array ODE module of a no-scalarize flat model (ARRAY_ODE_GENERATION), cached as a
    DE-mode model; nothing (and an @info with the reason) for a model outside its scope. =#
-function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel; functionList = nothing)
+function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel; functionList::Union{Nothing, FunctionList} = nothing)
   local modelName = canonicalName(fm.name)
   local (name, modelCode) = CodeGeneration.ArrayODEGen.generateArrayODECode(fm, modelName; functions = functionList)
   if name === nothing

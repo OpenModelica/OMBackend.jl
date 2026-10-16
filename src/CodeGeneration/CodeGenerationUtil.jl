@@ -633,7 +633,7 @@ function replaceVars(sym::Symbol; kwargs...)
          so generate u[idx] instead of integrator[:sym] to correctly detect sign changes. =#
       if get(kwargs, :useIndexedU, false)
         local idx = first(htEntry)
-        #= useMTKIdx: use runtime MTK variable ordering instead of BDAE index.
+        #= useMTKIdx: use runtime MTK variable ordering instead of the SimCode index.
            MTK may reorder unknowns (e.g., algebraic vars before differential),
            so _mtk_idx (built from unknowns(reducedSystem)) gives the correct u position. =#
         if get(kwargs, :useMTKIdx, false)

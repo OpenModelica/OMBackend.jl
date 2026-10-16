@@ -727,7 +727,6 @@ The imports of the module of a structural model (ODE_MODE_MTK) and of a recompil
 """
 function _modeModuleImports()::Expr
   return quote
-    import DAE
     import DataStructures.OrderedCollections
     using DataStructures.OrderedCollections: OrderedSet, OrderedDict
     import SCode

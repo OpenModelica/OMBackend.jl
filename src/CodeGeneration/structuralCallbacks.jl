@@ -178,7 +178,7 @@ function createStructuralCallback(simCode::SC.SIM_CODE, structuralTransition::SC
     quote
       function $(Symbol(callbackName))(reducedSystem, pars)
         #= Build a name→MTK-index map so condition functions use the correct u[i].
-           MTK may reorder unknowns relative to the BDAE state indices. =#
+           MTK may reorder unknowns relative to the SimCode state indices. =#
         local _mtk_idx = Dict{String, Int}(
           split(string(v), "(")[1] => i
           for (i, v) in enumerate(ModelingToolkit.unknowns(reducedSystem)))

@@ -12,31 +12,35 @@ module _EventIterationEval
   end
 end
 
+isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "backendTestMocks.jl"))
+
 @testset "Event iteration" begin
   local CG = OMBackend.CodeGeneration
-  local tyR = DAE.T_REAL_DEFAULT
-  local tyB = DAE.T_BOOL_DEFAULT
-  local cref(n, ty) = DAE.CREF(DAE.CREF_IDENT(n, ty, MetaModelica.nil), ty)
-  local pre(n) = DAE.CALL(Absyn.IDENT("pre"), MetaModelica.list(cref(n, tyB)), DAE.callAttrBuiltinBool)
-  local rel(a, op, b) = DAE.RELATION(a, op, b, -1, NONE())
-  local w = cref("w", tyR)
-  local sa = cref("sa", tyR)
-  local wle0 = rel(w, DAE.LESSEQ(tyR), DAE.RCONST(0.0))
+  local SC = OMBackend.SimCode
+  local B = SC.TYPE_BOOL()
+  local cref(n, ty = SC.TYPE_REAL()) = SC.EXP_CREF(SC.SimCref(Symbol(n)), ty)
+  local pre(n) = SC.PRE(SC.SimCref(Symbol(n)), B)
+  local builtin(name, args...) = SC.CALL(name, SC.Exp[args...], B, SC.CALL_BUILTIN)
+  local rel(a, op, b) = SC.RELATION(a, op, b, -1)
+  local and(a, b) = SC.LBINARY(a, SC.OP_AND, b)
+  local or(a, b) = SC.LBINARY(a, SC.OP_OR, b)
+  local w = cref("w")
+  local sa = cref("sa")
+  local wle0 = rel(w, SC.OP_LESSEQ, SC.RCONST(0.0))
   #= startForward = pre(stuck) and sa > 1; locked = pre(stuck) and not startForward;
      stuck = locked or w <= 0 =#
-  local assigns = Tuple{Symbol,Any,Bool}[
-    (:startForward, DAE.LBINARY(pre("stuck"), DAE.AND(tyB), rel(sa, DAE.GREATER(tyR), DAE.RCONST(1.0))), false),
-    (:locked, DAE.LBINARY(pre("stuck"), DAE.AND(tyB), DAE.LUNARY(DAE.NOT(tyB), cref("startForward", tyB))), false),
-    (:stuck, DAE.LBINARY(cref("locked", tyB), DAE.OR(tyB), wle0), false),
+  local assigns = Tuple{Symbol, SC.Exp, Bool}[
+    (:startForward, and(pre("stuck"), rel(sa, SC.OP_GREATER, SC.RCONST(1.0))), false),
+    (:locked, and(pre("stuck"), SC.LUNARY(SC.OP_NOT, cref("startForward", B))), false),
+    (:stuck, or(cref("locked", B), wle0), false),
   ]
-  #= No SimVar table needed: every name is looked up as a plain cref. =#
-  local simCode = (; stringToSimVarHT = Dict{String,Any}())
+  #= No variables needed: every name is looked up as a plain reference. =#
+  local simCode = BackendTestMocks.mockSimCode()
 
   @test CG._clusterReadsOwnPre(assigns)
   @test !CG._clusterReadsOwnPre(assigns[3:3])
 
-  local (fexpr, obsNT, modNT) = CG._eventIterAffectParts(assigns, simCode;
-                                                        relPins = Dict(string(wle0) => true))
+  local (fexpr, obsNT, modNT) = CG._eventIterAffectParts(assigns, simCode; relPins = Dict{SC.Exp, Bool}(wle0 => true))
   @test Set(a.args[1] for a in obsNT.args[1].args) == Set([:sa])
   @test Set(a.args[1] for a in modNT.args[1].args) == Set([:startForward, :locked, :stuck])
   local affect = Core.eval(_EventIterationEval, fexpr)
@@ -57,14 +61,13 @@ end
   @test r == (startForward = 0.0, locked = 1.0, stuck = 1.0)
 
   #= One pass (a user when's body): stuck, but not yet locked. =#
-  local (fexpr1, _, _) = CG._eventIterAffectParts(assigns, simCode; relPins = Dict(string(wle0) => true),
+  local (fexpr1, _, _) = CG._eventIterAffectParts(assigns, simCode; relPins = Dict{SC.Exp, Bool}(wle0 => true),
                                                   iterate = false)
   r = Base.invokelatest(Core.eval(_EventIterationEval, fexpr1), sliding, (sa = 0.0,), nothing, integrator)
   @test r == (startForward = 0.0, locked = 0.0, stuck = 1.0)
 
   #= initial() is what the t0 pass (initialize) says. =#
-  local initialCall = DAE.CALL(Absyn.IDENT("initial"), MetaModelica.nil, DAE.callAttrBuiltinBool)
-  local atStart = Tuple{Symbol,Any,Bool}[(:i, DAE.LBINARY(initialCall, DAE.OR(tyB), wle0), false)]
+  local atStart = Tuple{Symbol, SC.Exp, Bool}[(:i, or(builtin(:initial), wle0), false)]
   for (initVal, expected) in ((true, 1.0), (false, 0.0))
     local (fx, _, _) = CG._eventIterAffectParts(atStart, simCode; initVal = initVal)
     @test Base.invokelatest(Core.eval(_EventIterationEval, fx), (i = 0.0,), (w = 1.0,), nothing, integrator) ==
@@ -74,66 +77,57 @@ end
   #= A body that reads a Boolean defined by a relation elsewhere (an ideal
      thyristor's `fire`) reads the relation, which joins the event sources;
      pre(fire) stays. =#
-  local s = cref("s", tyR)
-  local sLt0 = rel(s, DAE.LESS(tyR), DAE.RCONST(0.0))
-  local fireRel = rel(cref("repl", tyR), DAE.LESS(tyR), cref("timer", tyR))
-  local thyristor = Tuple{Symbol,Any,Bool}[
-    (:off, DAE.LBINARY(sLt0, DAE.OR(tyB),
-                       DAE.LBINARY(pre("off"), DAE.AND(tyB), DAE.LUNARY(DAE.NOT(tyB), cref("fire", tyB)))), false)]
-  local relationOf = Dict{String, DAE.Exp}("fire" => fireRel)
-  local (rels2, body2) = CG._inlineReadBooleanRelations(DAE.Exp[sLt0], thyristor, relationOf, simCode)
-  @test string.(rels2) == string.([sLt0, fireRel])
-  @test occursin(string(fireRel), string(body2[1][2])) && !occursin("fire", string(body2[1][2]))
-  local preOnly = Tuple{Symbol,Any,Bool}[(:off, DAE.LBINARY(sLt0, DAE.OR(tyB), pre("fire")), false)]
-  local (rels3, body3) = CG._inlineReadBooleanRelations(DAE.Exp[sLt0], preOnly, relationOf, simCode)
+  local sLt0 = rel(cref("s"), SC.OP_LESS, SC.RCONST(0.0))
+  local fireRel = rel(cref("repl"), SC.OP_LESS, cref("timer"))
+  local thyristor = Tuple{Symbol, SC.Exp, Bool}[
+    (:off, or(sLt0, and(pre("off"), SC.LUNARY(SC.OP_NOT, cref("fire", B)))), false)]
+  local relationOf = Dict{String, SC.RELATION}("fire" => fireRel)
+  local (rels2, body2) = CG._inlineReadBooleanRelations(SC.RELATION[sLt0], thyristor, relationOf, simCode)
+  @test rels2 == SC.RELATION[sLt0, fireRel]
+  @test SC.anyExp(==(fireRel), body2[1][2]) && !SC.anyExp(e -> e == cref("fire", B), body2[1][2])
+  local preOnly = Tuple{Symbol, SC.Exp, Bool}[(:off, or(sLt0, pre("fire")), false)]
+  local (rels3, body3) = CG._inlineReadBooleanRelations(SC.RELATION[sLt0], preOnly, relationOf, simCode)
   @test length(rels3) == 1 && body3 === preOnly
 
   #= Only synthesized conditions (an OR-chain of change(<relation>)) iterate;
      a user `when change(b)` runs its body once per event. =#
-  local change(e) = DAE.CALL(Absyn.IDENT("change"), MetaModelica.list(e), DAE.callAttrBuiltinBool)
-  local sagt1 = rel(sa, DAE.GREATER(tyR), DAE.RCONST(1.0))
-  @test CG._isSynthesizedChangeCondition(DAE.LBINARY(change(wle0), DAE.OR(tyB), change(sagt1)))
-  @test !CG._isSynthesizedChangeCondition(change(cref("b", tyB)))
+  local sagt1 = rel(sa, SC.OP_GREATER, SC.RCONST(1.0))
+  @test CG._isSynthesizedChangeCondition(or(builtin(:change, wle0), builtin(:change, sagt1)))
+  @test !CG._isSynthesizedChangeCondition(builtin(:change, cref("b", B)))
   @test !CG._isSynthesizedChangeCondition(wle0)
 
   #= Casts and edge() lower; y latches when b rises (b = x > 0.2,
      y = edge(b) or pre(y) and x > 0.1 with the Integer k cast to Real). =#
-  local x = cref("x", tyR)
-  local xgt = rel(x, DAE.GREATER(tyR), DAE.CAST(tyR, cref("k", DAE.T_INTEGER_DEFAULT)))
-  local edgeB = DAE.CALL(Absyn.IDENT("edge"), MetaModelica.list(cref("b", tyB)), DAE.callAttrBuiltinBool)
-  local latch = Tuple{Symbol,Any,Bool}[
+  local x = cref("x")
+  local xgt = rel(x, SC.OP_GREATER, SC.CAST(SC.TYPE_REAL(), cref("k", SC.TYPE_INTEGER())))
+  local latch = Tuple{Symbol, SC.Exp, Bool}[
     (:b, xgt, false),
-    (:y, DAE.LBINARY(edgeB, DAE.OR(tyB),
-                     DAE.LBINARY(pre("y"), DAE.AND(tyB), rel(x, DAE.GREATER(tyR), DAE.RCONST(0.1)))), false),
+    (:y, or(builtin(:edge, cref("b", B)), and(pre("y"), rel(x, SC.OP_GREATER, SC.RCONST(0.1)))), false),
   ]
   @test CG._eventIterLowerable(latch, simCode)
-  local (fexpr2, _, _) = CG._eventIterAffectParts(latch, simCode; relPins = Dict(string(xgt) => true))
+  local (fexpr2, _, _) = CG._eventIterAffectParts(latch, simCode; relPins = Dict{SC.Exp, Bool}(xgt => true))
   local latchAffect = Core.eval(_EventIterationEval, fexpr2)
   r = Base.invokelatest(latchAffect, (b = 0.0, y = 0.0), (x = 0.2, k = 0.0), nothing, integrator)
   @test r == (b = 1.0, y = 1.0)
 
   #= The frontend inlines b = x > 0.2 into edge(x > 0.2): the relation rises
      at this crossing, so edge() holds in the first pass only, and y latches. =#
-  local xgt2 = rel(x, DAE.GREATER(tyR), DAE.RCONST(0.2))
-  local edgeRel = DAE.CALL(Absyn.IDENT("edge"), MetaModelica.list(xgt2), DAE.callAttrBuiltinBool)
-  local inlined = Tuple{Symbol,Any,Bool}[
-    (:y, DAE.LBINARY(edgeRel, DAE.OR(tyB),
-                     DAE.LBINARY(pre("y"), DAE.AND(tyB), rel(x, DAE.GREATER(tyR), DAE.RCONST(0.1)))), false),
+  local xgt2 = rel(x, SC.OP_GREATER, SC.RCONST(0.2))
+  local inlined = Tuple{Symbol, SC.Exp, Bool}[
+    (:y, or(builtin(:edge, xgt2), and(pre("y"), rel(x, SC.OP_GREATER, SC.RCONST(0.1)))), false),
   ]
-  local (fexpr3, _, _) = CG._eventIterAffectParts(inlined, simCode; relPins = Dict(string(xgt2) => true))
+  local (fexpr3, _, _) = CG._eventIterAffectParts(inlined, simCode; relPins = Dict{SC.Exp, Bool}(xgt2 => true))
   r = Base.invokelatest(Core.eval(_EventIterationEval, fexpr3), (y = 0.0,), (x = 0.2,), nothing, integrator)
   @test r == (y = 1.0,)
   #= Falling through 0.2 is no edge; y holds while x > 0.1. =#
-  local (fexpr4, _, _) = CG._eventIterAffectParts(inlined, simCode; relPins = Dict(string(xgt2) => false))
+  local (fexpr4, _, _) = CG._eventIterAffectParts(inlined, simCode; relPins = Dict{SC.Exp, Bool}(xgt2 => false))
   local fall = Core.eval(_EventIterationEval, fexpr4)
   @test Base.invokelatest(fall, (y = 1.0,), (x = 0.2,), nothing, integrator) == (y = 1.0,)
   @test Base.invokelatest(fall, (y = 0.0,), (x = 0.2,), nothing, integrator) == (y = 0.0,)
 
   #= An event operator that has no affect lowering keeps the one-pass affects. =#
-  local sampled = Tuple{Symbol,Any,Bool}[
-    (:s, DAE.LBINARY(pre("s"), DAE.OR(tyB),
-                     DAE.CALL(Absyn.IDENT("sample"), MetaModelica.list(DAE.RCONST(0.0), DAE.RCONST(1.0)),
-                              DAE.callAttrBuiltinBool)), false),
+  local sampled = Tuple{Symbol, SC.Exp, Bool}[
+    (:s, or(pre("s"), builtin(:sample, SC.RCONST(0.0), SC.RCONST(1.0))), false),
   ]
   @test !(@test_logs (:info,) CG._eventIterLowerable(sampled, simCode))
 end

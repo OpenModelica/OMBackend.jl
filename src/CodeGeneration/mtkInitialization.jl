@@ -484,6 +484,11 @@ function emitInitAlgConstraintAppends(simCode::SC.SIM_CODE)::Vector{Expr}
   return appends
 end
 
+#= der(x) as the builtin call der(x), which the algorithmic translator emits as a call (a
+   function has no derivatives): _initialDerivativeReads reads its value from the problem. =#
+_derAsCall(e::SC.Exp)::SC.Exp =
+  SC.mapExp(x -> x isa SC.DER ? SC.CALL(:der, SC.Exp[SC.EXP_CREF(x.cref, SC.TYPE_REAL())], SC.TYPE_REAL(), SC.CALL_BUILTIN) : x, e)
+
 #= der(x) in a runtime initial algorithm (the initial() arm of a relation on a derivative,
    MSL FluxTubes' `asc = der(Hstat) > 0`) reads the derivative from the problem
    (_initialDerivative); there is no `der` function. =#
@@ -543,7 +548,7 @@ _initialIsTrue(e::SC.Exp)::SC.Exp = SC.mapExp(x -> SC.isBuiltin(x, :initial) ? S
    states. An assert of level error stops the simulation, as an equation's does (on the
    initialization's values). =#
 function _initialWhenOpToJulia(wStmt::SC.Statement, simCode::SC.SIM_CODE, renamedNames::OrderedSet{String} = OrderedSet{String}())
-  local sub = e::SC.Exp -> _substituteBoundParameters(_preAtInitialization(_initialIsTrue(e), simCode), simCode)
+  local sub = e::SC.Exp -> _substituteBoundParameters(_preAtInitialization(_initialIsTrue(_derAsCall(e)), simCode), simCode)
   local lowerAlg = e::SC.Exp -> _initialDerivativeReads(_renameAlgIdentifiers(
     _resolveModelicaCallTargets(AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e))), renamedNames, ""))
   if wStmt isa SC.NORETCALL

@@ -75,6 +75,7 @@ module ArrayODEGen
 import OMFrontend
 import ModelingToolkit
 import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError
+import ...LowerFlatModel: FunctionList
 
 const SII = ModelingToolkit.SymbolicIndexingInterface
 
@@ -2219,7 +2220,7 @@ end
 The array-preserving module of a no-scalarize flat model, or `nothing` and the reason the
 model is outside the supported scope.
 """
-function generateArrayODECode(fm::F.FlatModel, modelName::String; functions = nothing)
+function generateArrayODECode(fm::F.FlatModel, modelName::String; functions::Union{Nothing, FunctionList} = nothing)
   try
     return (modelName, _generate(fm, modelName; functions = functions))
   catch err
@@ -2255,7 +2256,7 @@ end
    generation: AlgorithmicCodeGeneration.generateFunctions),
    each a module constant named as the frontend's function list names it (dots as _), so the
    equations and the functions' calls of each other find it. Returns (definitions, outputs). =#
-function _functionDefinitions(functions)
+function _functionDefinitions(functions::Union{Nothing, FunctionList})
   local defs = Any[]; local outs = Dict{String, Int}()
   (functions === nothing || isempty(functions)) && return (defs, outs)
   local mfs = try
@@ -2289,7 +2290,7 @@ function _functionDefinitions(functions)
   return (defs, outs)
 end
 
-function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Expr
+function _generate(fm::F.FlatModel, modelName::String; functions::Union{Nothing, FunctionList} = nothing)::Expr
   local (functionDefs, functionOutputs) = _functionDefinitions(functions)
   (FULL[] || isempty(fm.initialAlgorithms)) || ns("initial algorithms (OMBackend.ARRAY_PATH_FULL)")
   #= States: the variables under der(). =#

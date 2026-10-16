@@ -69,20 +69,26 @@ import ..unsupported
 const F = OMFrontend.Frontend
 const IR = OMJLIR
 
-export lowerFlatModel
+export lowerFlatModel, FunctionList
+
+"The frontend's list of the functions a model calls (OMFrontend.cacheToFunctionList)."
+const FunctionList = MetaModelica.List{F.M_FUNCTION}
 
 #= ==================================================================================== =#
 #= Names and sources                                                                    =#
 #= ==================================================================================== =#
 
 "The dotted name of a class or function path."
-pathName(path)::Symbol = Symbol(F.AbsynUtil.pathString(path))
+pathName(path::Absyn.Path)::Symbol = Symbol(F.AbsynUtil.pathString(path))
 
 "The location in the Modelica source, from a frontend `SourceInfo`."
-lowerSource(info)::IR.Source = IR.Source(info.fileName, info.lineNumberStart, info.columnNumberStart)
+lowerSource(info::MetaModelica.SourceInfo)::IR.Source = IR.Source(info.fileName, info.lineNumberStart, info.columnNumberStart)
+
+"The frontend's element source of an equation or a statement (its location)."
+const ElementSource = fieldtype(F.NFEquationImpl, :source)
 
 "The location of an equation or a statement, from the frontend's element source."
-lowerElementSource(source)::IR.Source = lowerSource(source.info)
+lowerElementSource(source::ElementSource)::IR.Source = lowerSource(source.info)
 
 #= ==================================================================================== =#
 #= Types, dimensions and subscripts                                                     =#
@@ -137,7 +143,7 @@ function functionType(fn::F.M_Function)::IR.T_FUNCTION
 end
 
 "An OMJLIR dimension."
-function lowerDimension(d)::IR.Dimension
+function lowerDimension(d::F.Dimension)::IR.Dimension
   isvariant(d, F.DIMENSION_INTEGER) && return IR.DIM_SIZE(d.size)
   isvariant(d, F.DIMENSION_BOOLEAN) && return IR.DIM_BOOLEAN()
   isvariant(d, F.DIMENSION_ENUM) && return IR.DIM_ENUM(enumerationType(d.enumType))
@@ -145,7 +151,7 @@ function lowerDimension(d)::IR.Dimension
   return IR.DIM_UNKNOWN()
 end
 
-function lowerSubscript(s)::IR.Subscript
+function lowerSubscript(s::F.Subscript)::IR.Subscript
   s isa F.SUBSCRIPT_INDEX && return IR.INDEX(lowerExp(s.index))
   s isa F.SUBSCRIPT_SLICE && return IR.SLICE(lowerExp(s.slice))
   s isa F.SUBSCRIPT_WHOLE && return IR.WHOLE()
@@ -157,7 +163,7 @@ end
 #= ==================================================================================== =#
 
 "The parts of the frontend component reference `cref`, the outermost first."
-function crefParts(cref)::Vector{IR.CrefPart}
+function crefParts(cref::F.ComponentRef)::Vector{IR.CrefPart}
   local parts = IR.CrefPart[]
   while isvariant(cref, F.COMPONENT_REF_CREF)
     push!(parts, IR.CrefPart(Symbol(F.name(cref.node)), IR.Subscript[lowerSubscript(s) for s in cref.subscripts],
@@ -187,7 +193,7 @@ const OPS = let ops = Dict{Int, IR.Op}()
   ops
 end
 
-function lowerOp(operator)::IR.Op
+function lowerOp(operator::F.Operator)::IR.Op
   local op = get(OPS, Int(operator.op), nothing)
   op === nothing && error("OMJLIR lowering: a user-defined operator the frontend did not resolve")
   return op
@@ -259,7 +265,7 @@ lowerExp(e::F.NFExpression)::IR.Expression =
 "`inline`: the frontend's inline types that inline the function."
 const INLINE_TYPES = (:NORM_INLINE, :BUILTIN_EARLY_INLINE, :EARLY_INLINE)
 
-function lowerCall(call)::IR.Expression
+function lowerCall(call::F.Call)::IR.Expression
   if isvariant(call, F.TYPED_CALL)
     local a = call.attributes
     local attributes = IR.CallAttributes(a.builtin, a.isImpure, nameof(typeof(a.inlineType)) in INLINE_TYPES)
@@ -308,7 +314,7 @@ function lowerAssignment(lhs::IR.Expression, rhs::IR.Expression, source::IR.Sour
 end
 
 "The OMJLIR statement of the frontend statement `s`."
-function lowerStatement(s)::IR.Statement
+function lowerStatement(s::F.Statement)::IR.Statement
   local source = lowerElementSource(s.source)
   if isvariant(s, F.ALG_ASSIGNMENT)
     return lowerAssignment(lowerExp(s.lhs), lowerExp(s.rhs), source)
@@ -359,7 +365,7 @@ end
 The equations `eqs`, in reverse for the top-level, initial and else-branch equations (the
 previous backend's order, see the module's documentation).
 """
-function lowerEquations(eqs; reversed::Bool)::Vector{IR.Equation}
+function lowerEquations(eqs::Vector{F.Equation}; reversed::Bool)::Vector{IR.Equation}
   local out = IR.Equation[]
   for eq in (reversed ? Iterators.reverse(eqs) : eqs)
     local lowered = lowerEquation(eq)
@@ -371,7 +377,7 @@ end
 const ATTRIBUTES = IR.DEFAULT_ATTRIBUTES
 
 "The OMJLIR equation of the frontend equation `eq`; `nothing` for a connect equation."
-function lowerEquation(eq)::Union{Nothing, IR.Equation}
+function lowerEquation(eq::F.Equation)::Union{Nothing, IR.Equation}
   local source = lowerElementSource(eq.source)
   if isvariant(eq, F.EQUATION_EQUALITY) || isvariant(eq, F.EQUATION_ARRAY_EQUALITY)
     local ty = lowerType(eq.ty)
@@ -437,7 +443,7 @@ recordSize(ty::IR.ModelicaType)::Int = 1
 An if-equation: the branches in order, a last branch of condition `true` as the else-branch
 (as the frontend's DAE conversion did).
 """
-function lowerIfEquation(eq, source::IR.Source)::IR.IF_EQUATION
+function lowerIfEquation(eq::F.Equation, source::IR.Source)::IR.IF_EQUATION
   local branches = IR.EquationBranch[]
   local elseEquations = IR.Equation[]
   for (k, b) in enumerate(eq.branches)
@@ -492,7 +498,7 @@ A when-equation: each branch's triggers and its equations as statements (an equa
 assignment, an if-equation an if-statement). One with a structural change (`recompilation`)
 is a structural when-equation.
 """
-function lowerWhenEquation(eq, source::IR.Source)::IR.WHEN_EQUATION
+function lowerWhenEquation(eq::F.Equation, source::IR.Source)::IR.WHEN_EQUATION
   local branches = IR.WhenBranch[]
   for b in eq.branches
     push!(branches, whenBranch(lowerExp(b.condition), whenStatements(b.body)))
@@ -502,7 +508,7 @@ function lowerWhenEquation(eq, source::IR.Source)::IR.WHEN_EQUATION
 end
 
 "The equations of a when-equation's branch, or of an if-equation in it, as statements."
-function whenStatements(eqs)::Vector{IR.Statement}
+function whenStatements(eqs::Vector{F.Equation})::Vector{IR.Statement}
   local out = IR.Statement[]
   for eq in eqs
     local source = lowerElementSource(eq.source)
@@ -542,7 +548,7 @@ end
 A call without outputs in a when-equation: OM.jl's structural changes `recompilation(c, v)`
 and `agentic_recompilation(c...)`, or a call for its effects.
 """
-function noretcallStatement(call, source::IR.Source)::IR.Statement
+function noretcallStatement(call::F.Expression, source::IR.Source)::IR.Statement
   local e = lowerExp(call)
   if e isa IR.CALL && e.name === :recompilation
     local (c, v) = e.arguments
@@ -558,7 +564,7 @@ end
 OM.jl's reconfigure equation: a structural when-equation whose change an agent decides,
 with the variables it may change, its prompt and the initial equations for the new model.
 """
-function lowerReconfigureEquation(eq, source::IR.Source)::IR.WHEN_EQUATION
+function lowerReconfigureEquation(eq::F.Equation, source::IR.Source)::IR.WHEN_EQUATION
   local condition = lowerExp(eq.whenConditions[1])
   local components = IR.ComponentRef[IR.ComponentRef(Symbol(n)) for n in reconfigureVariableNames(eq.variables)]
   local prompt = MetaModelica.isSome(eq.prompt) ? promptString(eq.prompt.data) : nothing
@@ -568,13 +574,13 @@ function lowerReconfigureEquation(eq, source::IR.Source)::IR.WHEN_EQUATION
 end
 
 "The prompt of a reconfigure equation: a string literal."
-function promptString(e)::String
+function promptString(e::F.Expression)::String
   e isa F.STRING_EXPRESSION || error("OMJLIR lowering: the prompt of a reconfigure equation is not a string literal")
   return e.value
 end
 
 "The names of the variables a reconfigure equation declares (Absyn element items)."
-function reconfigureVariableNames(items)::Vector{String}
+function reconfigureVariableNames(items::MetaModelica.List{Absyn.ElementItem})::Vector{String}
   local names = String[]
   for item in items
     for c in item.element.specification.components
@@ -588,7 +594,7 @@ end
 The initial equations of a reconfigure equation (Absyn) as Modelica text, for the agent:
 `assert(cond, msg)` calls with their arguments, the others as the parser prints them.
 """
-function serializeInitialEquations(items)::String
+function serializeInitialEquations(items::MetaModelica.List{Absyn.EquationItem})::String
   local parts = String[]
   for item in items
     local eq = item.equation_
@@ -630,7 +636,7 @@ function lowerConnector(cty::Integer)::IR.ConnectorKind
 end
 
 "A binding's expression: of a typed or flattened binding; `nothing` for one evaluated or none."
-function lowerBinding(b)::Union{Nothing, IR.Expression}
+function lowerBinding(b::F.Binding)::Union{Nothing, IR.Expression}
   (isvariant(b, F.TYPED_BINDING) || isvariant(b, F.FLAT_BINDING)) || return nothing
   return lowerExp(b.bindingExp)
 end
@@ -639,7 +645,7 @@ const STATE_SELECTS = Dict("never" => IR.NEVER, "avoid" => IR.AVOID, "default" =
                            "prefer" => IR.PREFER, "always" => IR.ALWAYS)
 
 "StateSelect: a literal of the enumeration; `nothing` for another expression (a parameter)."
-function lowerStateSelect(b)::Union{Nothing, IR.StateSelect}
+function lowerStateSelect(b::F.Binding)::Union{Nothing, IR.StateSelect}
   local e = F.getBindingExp(F.getTypedExp(b))
   local member = e isa F.ENUM_LITERAL_EXPRESSION ? e.name :
                  e isa F.CREF_EXPRESSION && isvariant(e.cref, F.COMPONENT_REF_CREF) ? F.name(e.cref.node) : ""
@@ -649,7 +655,7 @@ function lowerStateSelect(b)::Union{Nothing, IR.StateSelect}
 end
 
 "The built-in attributes of a variable (MLS 4.8), from the frontend's type attributes."
-function lowerAttributes(typeAttributes)::IR.VariableAttributes
+function lowerAttributes(typeAttributes::Vector{Tuple{String, F.Binding}})::IR.VariableAttributes
   isempty(typeAttributes) && return IR.NO_ATTRIBUTES
   local values = Dict{String, Any}()
   for (name, b) in typeAttributes
@@ -662,7 +668,7 @@ function lowerAttributes(typeAttributes)::IR.VariableAttributes
 end
 
 "The OMJLIR variable of the frontend variable `v`."
-function lowerVariable(v)::IR.Variable
+function lowerVariable(v::F.Variable)::IR.Variable
   local cref = lowerCref(v.name)
   local ty = lowerType(v.ty)
   local a = v.attributes
@@ -677,7 +683,7 @@ end
 #= ==================================================================================== =#
 
 "The algorithm sections as ALGORITHM equations, their assigned variables their outputs."
-function lowerAlgorithms(algorithms)::Vector{IR.Equation}
+function lowerAlgorithms(algorithms::Vector{F.Algorithm})::Vector{IR.Equation}
   local out = IR.Equation[]
   for alg in algorithms
     local statements = lowerStatements(alg.statements)
@@ -706,7 +712,8 @@ end
 A continuous-time partition: the equations, then the algorithm sections; the initial
 equations, then the initial algorithm sections.
 """
-function lowerSystem(eqs, initialEqs, algorithms, initialAlgorithms)::IR.Partition
+function lowerSystem(eqs::Vector{F.Equation}, initialEqs::Vector{F.Equation}, algorithms::Vector{F.Algorithm},
+                     initialAlgorithms::Vector{F.Algorithm})::IR.Partition
   local equations = lowerEquations(eqs; reversed = true)
   append!(equations, lowerAlgorithms(algorithms))
   local initialEquations = lowerEquations(initialEqs; reversed = true)
@@ -716,7 +723,7 @@ function lowerSystem(eqs, initialEqs, algorithms, initialAlgorithms)::IR.Partiti
 end
 
 "The variables of a flat model."
-function lowerVariables(fm)::IR.VariableSet
+function lowerVariables(fm::F.FlatModel)::IR.VariableSet
   local variables = IR.VariableSet()
   for v in fm.variables
     local lowered = lowerVariable(v)
@@ -741,7 +748,7 @@ OM.jl's structural states and transitions, `initialStructuralState(s)` and
 `structuralTransition(from, to, condition)` in the equation section: their arguments, or
 `nothing` for another equation.
 """
-function structuralCall(eq)::Union{Nothing, Tuple{Symbol, Vector{Any}}}
+function structuralCall(eq::F.Equation)::Union{Nothing, Tuple{Symbol, Vector{Any}}}
   isvariant(eq, F.EQUATION_NORETCALL) && eq.exp isa F.CALL_EXPRESSION && isvariant(eq.exp.call, F.TYPED_CALL) || return nothing
   local name = Symbol(F.AbsynUtil.pathString(F.nameConsiderBuiltin(eq.exp.call.fn)))
   name in (:initialStructuralState, :structuralTransition) || return nothing
@@ -757,7 +764,8 @@ end
 
 The functions the model calls (the frontend's list, in its order) in OMJLIR.
 """
-lowerFunctions(functions)::Vector{IR.ModelicaFunction} = IR.ModelicaFunction[lowerFunction(f) for f in functions]
+lowerFunctions(functions::FunctionList)::Vector{IR.ModelicaFunction} =
+  IR.ModelicaFunction[lowerFunction(f) for f in functions]
 
 """
     lowerFunction(fn)
@@ -790,7 +798,7 @@ functionVariables(nodes)::Vector{IR.FunctionVariable} = IR.FunctionVariable[func
 A function's variable: its name, type, binding, and for a record instance its fields'
 bindings (the instance's modifiers and the record's defaults).
 """
-function functionVariable(node)::IR.FunctionVariable
+function functionVariable(node::F.InstNode)::IR.FunctionVariable
   local comp = F.component(node)
   local ty = F.getType(comp)
   local fieldBindings = Pair{Symbol, IR.Expression}[]
@@ -832,7 +840,7 @@ partition (equations, algorithms, initial equations and algorithms), its structu
 frontend's function list). The frontend model to translate again at a structural change
 is the SCode class the frontend kept for a model with recompilations (`nothing` for another).
 """
-function lowerFlatModel(fm::F.FlatModel; functions = ())::IR.Model
+function lowerFlatModel(fm::F.FlatModel; functions::FunctionList = MetaModelica.nil)::IR.Model
   local variables = lowerVariables(fm)
   local initialMode = nothing
   local transitions = IR.StructuralTransition[]
