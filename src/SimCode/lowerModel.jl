@@ -381,7 +381,7 @@ function lowerAsserts(names::Names, ht::OrderedDict{String, Tuple{Int, SIMVAR}},
       push!(initial, INITIAL_ALGORITHM(Statement[ASSERT(a.condition, a.message, a.level, a.source)], false))
     end
   end
-  local inline = e -> inlineParameters(e, ht; keepTunable = true)
+  local inline = e -> inlineParameters(e, ht; keepTunable = true, keepCalls = true)
   out = ASSERT_EQUATION[ASSERT_EQUATION(inline(a.condition), inline(a.message), a.level, a.source) for a in out]
   return (out, initial)
 end
@@ -398,9 +398,13 @@ isNoReturnCall(e::IR.Expression)::Bool = e isa IR.CALL && e.ty isa IR.T_NORETCAL
 another): the initial algorithms run when the generated module is loaded, the asserts read
 parameters the passes may eliminate. An element of an array parameter scalarized into its
 elements is the array of the elements' bindings. A tunable parameter is an error in an initial
-algorithm (it would keep its compiled value), a reference with `keepTunable`.
+algorithm (it would keep its compiled value), a reference with `keepTunable`. With `keepCalls`
+(the asserts), a parameter bound to a call of a function stays a reference, its value computed
+once: inlined, a time-varying assert's crossing called it at every evaluation (Buildings'
+weather data, `getTimeSpanTMY3(filNam, "tab1")` reading the weather file, 40 ms a call).
 """
-function inlineParameters(e::Exp, ht::OrderedDict{String, Tuple{Int, SIMVAR}}; keepTunable::Bool = false)::Exp
+function inlineParameters(e::Exp, ht::OrderedDict{String, Tuple{Int, SIMVAR}}; keepTunable::Bool = false,
+                          keepCalls::Bool = false)::Exp
   local visit = x -> begin
     local name = x isa EXP_CREF ? crefName(x.cref) : nothing
     name === nothing && return x
@@ -413,9 +417,9 @@ function inlineParameters(e::Exp, ht::OrderedDict{String, Tuple{Int, SIMVAR}}; k
     local entry = get(ht, name, nothing)
     if entry !== nothing
       local k = last(entry).varKind
-      k isa PARAMETER && k.bindExp !== nothing && return k.bindExp
-      k isa ARRAY_PARAMETER && k.bindExp !== nothing && return k.bindExp
-      return x
+      local bind = k isa Union{PARAMETER, ARRAY_PARAMETER} ? k.bindExp : nothing
+      (bind === nothing || (keepCalls && anyExp(y -> y isa CALL && y.kind !== CALL_BUILTIN, bind))) && return x
+      return bind
     end
     return something(scalarizedArrayParameter(name, ht), Some(x))
   end
