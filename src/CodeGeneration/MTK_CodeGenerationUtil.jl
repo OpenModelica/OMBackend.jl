@@ -1207,13 +1207,24 @@ end
 
 _execInitAlgStmt!(::Dict{Symbol, Float64}, ::SC.Statement, ::Union{Nothing, Set{Symbol}})::Nothing = nothing
 
-#= `valMap` with the values the initial algorithms assign at t0 (trapezoid `count`,
-   `T_start`), in statement order. Without them a discrete set imperatively in an `initial
-   algorithm` (no `start` attribute) was 0.0 where the initial branches of if-equations are
-   chosen: the wrong branch. =#
+"""
+    _seedInitialAlgValues!(valMap, simCode, written = nothing)
+
+`valMap` with the values the initial algorithm sections (`section`: an `initial algorithm`, an
+algorithm's `when initial()`) assign at t0 (trapezoid `count`, `T_start`), in statement order.
+Without them a discrete set imperatively in an `initial algorithm` (no `start` attribute) was
+0.0 where the initial branches of if-equations are chosen: the wrong branch. Not the `initial()`
+arms of when-equations and discrete clusters: the DAE initialization starts their discretes at
+their start values and the clusters settle them after it, so the branches must read those (as
+the old pipeline did: only its sections had DAE statements); seeded, MSL 4.1.0 IMC_YD's main
+switches started open in the branches and closed in the initialization, which then failed and
+moved the logical delays' tSwitch.
+"""
 function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode::SC.SIM_CODE,
                                 written::Union{Nothing, Set{Symbol}} = nothing)::Dict{Symbol, Float64}
-  foreach(ia -> _execInitAlgStmts!(valMap, ia.statements, written), simCode.initialAlgorithms)
+  for ia in simCode.initialAlgorithms
+    ia.section && _execInitAlgStmts!(valMap, ia.statements, written)
+  end
   return valMap
 end
 
