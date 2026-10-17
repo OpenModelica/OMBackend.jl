@@ -5,7 +5,7 @@
 OMBackend.jl is one component of OMJL, the Modelica compiler infrastructure
 for Julia. It lowers the flat model produced by OMFrontend.jl to its own
 intermediate representation, OMJLIR (`src/IR`), runs its passes there
-(`src/Backend/passes`), generates the simulation code (`src/SimCode`) and from
+(`src/Backend/Passes`), generates the simulation code (`src/SimCode`) and from
 it a system that can be simulated with DifferentialEquations.jl and
 ModelingToolkit.jl (`src/CodeGeneration`).
 

@@ -8,7 +8,7 @@ import OMBackend
 import OMFrontend
 
 @testset "Protected variables keep their attributes" begin
-  local file = joinpath(@__DIR__, "models", "ProtectedAttributes.mo")
+  local file = joinpath(@__DIR__, "Models", "ProtectedAttributes.mo")
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("ProtectedAttributes", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   local model = OMBackend.omjlirModel(fm; functionList = OMFrontend.cacheToFunctionList(cache))
   local IR = OMBackend.OMJLIR

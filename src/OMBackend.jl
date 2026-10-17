@@ -49,7 +49,7 @@ export PLOT_PACKAGE_GRAPH
 include("$CURRENT_DIRECTORY/BackendUtil/BackendUtil.jl")
 include("$CURRENT_DIRECTORY/IR/OMJLIR.jl")
 include("$CURRENT_DIRECTORY/Backend/lowerFlatModel.jl")
-include("$CURRENT_DIRECTORY/Backend/passes/Passes.jl")
+include("$CURRENT_DIRECTORY/Backend/Passes/Passes.jl")
 include("$CURRENT_DIRECTORY/SimCode/SimCode.jl")
 include("$CURRENT_DIRECTORY/Runtime/Runtime.jl")
 include("$CURRENT_DIRECTORY/CodeGeneration/CodeGeneration.jl")
