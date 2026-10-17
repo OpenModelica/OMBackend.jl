@@ -34,9 +34,9 @@
 #=
   OMBackend unit tests.
 
-  These tests exercise the backend pipeline using hand-crafted DAE IR
-  constructs. The ExampleDAE module provides the IR as a stable contract
-  for the DAE.DAE_LIST input format.
+  These tests exercise the backend pipeline on the example models of
+  examples/Examples.mo, flattened by OMFrontend (ExampleModels), and on
+  hand-built OMJLIR and SimCode values.
 
   For full integration tests (frontend + backend + simulation), see
   the top-level OM.jl test suite at /test/runtests.jl.
@@ -62,19 +62,14 @@ end
 # package on CI.
 import Plots
 
-import Absyn
-import SCode
-import DAE
-using MetaModelica
-import OMParser
 import OMFrontend
 using OMBackend
 using Test
 using Dates
 using DifferentialEquations: ReturnCode
 
-include("../examples/ExampleDAEs.jl")
-import .ExampleDAEs
+include("../examples/ExampleModels.jl")
+import .ExampleModels
 
 @testset "OMBackend" begin
 
@@ -137,13 +132,14 @@ import .ExampleDAEs
         ENV["OMJL_LOG_DIR"] = $(repr(tmp))
         cd($(repr(repoRoot)))
         include("src/OMBackend.jl")
-        include("examples/ExampleDAEs.jl")
-        using .ExampleDAEs
+        include("examples/ExampleModels.jl")
+        using .ExampleModels
         println("same_module=", OMBackend === OMBackend.CodeGeneration.OMBackend)
-        OMBackend.translate(ExampleDAEs.helloWorld_DAE; BackendMode = OMBackend.MTK_MODE)
+        (fm, functions) = ExampleModels.flatModel("HelloWorld")
+        OMBackend.translate(fm; functionList = functions, BackendMode = OMBackend.MTK_MODE)
         sleep(1)
-        OMBackend.translate(ExampleDAEs.helloWorld_DAE; BackendMode = OMBackend.MTK_MODE)
-        runDirs = sort(filter(name -> startswith(name, "HelloWorld_"), readdir(ENV["OMJL_LOG_DIR"])))
+        OMBackend.translate(fm; functionList = functions, BackendMode = OMBackend.MTK_MODE)
+        runDirs = sort(filter(name -> startswith(name, "Examples_HelloWorld_"), readdir(ENV["OMJL_LOG_DIR"])))
         println("run_count=", length(runDirs))
         println("root_codegen=", isfile(joinpath(ENV["OMJL_LOG_DIR"], "backend", "codeGen", "equationFirstStageCodeGen.log")))
         println("run_codegen=", all(dir -> isfile(joinpath(ENV["OMJL_LOG_DIR"], dir, "backend", "codeGen", "equationFirstStageCodeGen.log")), runDirs))
@@ -211,99 +207,61 @@ import .ExampleDAEs
     end
   end
 
-  #= ── 2. Lowering (DAE IR -> BDAE IR) ──────────────────────────── =#
+  #= ── 2. Lowering (flat model -> OMJLIR) ─────────────────────────── =#
+
+  #= The OMJLIR model of an example, through the passes; the flat model and functions. =#
+  local lowered = name -> begin
+    local (fm, functions) = ExampleModels.flatModel(name)
+    OMBackend.omjlirModel(fm; functionList = functions)
+  end
 
   @testset "Lowering" begin
-    @testset "HelloWorld" begin
-      bDAE = OMBackend.lower(ExampleDAEs.helloWorld_DAE)
-      eqSys = first(bDAE.eqs)
-      @test length(eqSys.orderedEqs) >= 1
-      @test length(eqSys.orderedVars) >= 1
-    end
-
-    @testset "LotkaVolterra" begin
-      bDAE = OMBackend.lower(ExampleDAEs.lotkaVolterra_DAE)
-      eqSys = first(bDAE.eqs)
-      @test length(eqSys.orderedEqs) >= 2
-    end
-
-    @testset "VanDerPol" begin
-      bDAE = OMBackend.lower(ExampleDAEs.vanDerPol_DAE)
-      eqSys = first(bDAE.eqs)
-      @test length(eqSys.orderedEqs) >= 2
-    end
-
-    @testset "SimpleMech" begin
-      bDAE = OMBackend.lower(ExampleDAEs.simpleMech_DAE)
-      eqSys = first(bDAE.eqs)
-      @test length(eqSys.orderedEqs) >= 4
-    end
-
-    @testset "SimpleCircuit" begin
-      bDAE = OMBackend.lower(ExampleDAEs.simpleCircuit_DAE)
-      eqSys = first(bDAE.eqs)
-      @test length(eqSys.orderedEqs) >= 6
+    for (name, nEquations) in (("HelloWorld", 1), ("LotkaVolterra", 2), ("VanDerPol", 2),
+                               ("SimpleMechanicalSystem", 4), ("SimpleCircuit", 6))
+      @testset "$name" begin
+        local model = lowered(name)
+        @test length(only(model.continuous).equations) >= nEquations
+        @test length(model.variables) >= 1
+      end
     end
   end
 
-  #= ── 3. Translation (DAE IR -> MTK code) ──────────────────────── =#
+  #= ── 3. Translation (flat model -> MTK code) ─────────────────────── =#
 
   @testset "Translation" begin
     OMBackend.clearCaches!()
-
-    @testset "HelloWorld translates" begin
-      (name, code) = OMBackend.translate(ExampleDAEs.helloWorld_DAE;
-                                          BackendMode=OMBackend.MTK_MODE)
-      @test name == "HelloWorld"
-      @test code isa Expr
-    end
-
-    @testset "LotkaVolterra translates" begin
-      (name, code) = OMBackend.translate(ExampleDAEs.lotkaVolterra_DAE;
-                                          BackendMode=OMBackend.MTK_MODE)
-      @test name == "LotkaVolterra"
-      @test code isa Expr
-    end
-
-    @testset "VanDerPol translates" begin
-      (name, code) = OMBackend.translate(ExampleDAEs.vanDerPol_DAE;
-                                          BackendMode=OMBackend.MTK_MODE)
-      @test name == "VanDerPol"
-      @test code isa Expr
+    for name in ("HelloWorld", "LotkaVolterra", "VanDerPol")
+      @testset "$name translates" begin
+        local (fm, functions) = ExampleModels.flatModel(name)
+        local (modelName, code) = OMBackend.translate(fm; functionList = functions, BackendMode = OMBackend.MTK_MODE)
+        @test modelName == "Examples_" * name
+        @test code isa Expr
+      end
     end
   end
 
   #= ── 4. SimCode partition: when initial() → INITIAL_ALGORITHM ── =#
 
   @testset "extractInitialWhenAlgorithms" begin
-    local SC = OMBackend.SimulationCode
-    local BDAE = OMBackend.Backend.BDAE
-    local callAttrBool = DAE.CALL_ATTR(DAE.T_BOOL(nil), false, true, false, false,
-                                       DAE.NO_INLINE(), DAE.NO_TAIL())
-    local initialCall = DAE.CALL(Absyn.IDENT("initial"), nil, callAttrBool)
-    local nonInitialCref = DAE.CREF(DAE.CREF_IDENT("trigger", DAE.T_BOOL(nil), nil),
-                                    DAE.T_BOOL(nil))
-    local mkNoretBody = () -> list(BDAE.NORETCALL(DAE.RCONST(0.0), DAE.emptyElementSource))
-    local mkWhenEq = cond -> BDAE.WHEN_EQUATION(
-      0,
-      BDAE.WHEN_STMTS(cond, mkNoretBody(), NONE()),
-      DAE.emptyElementSource,
-      BDAE.EQ_ATTR_DEFAULT_UNKNOWN,
-    )
+    local IR = OMBackend.OMJLIR
+    local SC = OMBackend.SimCode
+    local trigger = IR.CREF(IR.ComponentRef(:trigger, IR.T_BOOLEAN()), IR.T_BOOLEAN())
+    local body = () -> IR.Statement[IR.NORETCALL(IR.CALL(:print, IR.Expression[IR.STRING("x")], IR.T_NORETCALL(), IR.BUILTIN_CALL),
+                                                 IR.NO_SOURCE)]
+    #= a when-equation of one branch: its triggers, and whether initial() is among them =#
+    local mkWhen = (triggers, atInitial) -> IR.WHEN_EQUATION([IR.WhenBranch(triggers, atInitial, false, body())],
+                                                             IR.REGULAR_WHEN, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES)
 
     @testset "bare initial() condition is extracted" begin
-      local input = BDAE.WHEN_EQUATION[mkWhenEq(initialCall)]
-      local (kept, inits) = SC.extractInitialWhenAlgorithms(input)
+      local (kept, inits) = SC.extractInitialWhenAlgorithms(IR.WHEN_EQUATION[mkWhen(IR.Expression[], true)])
       @test isempty(kept)
       @test length(inits) == 1
-      @test inits[1] isa SC.INITIAL_ALGORITHM
-      @test length(inits[1].statements) == 1
-      @test inits[1].statements[1] isa SC.NORETCALL
+      @test length(inits[1]) == 1
+      @test inits[1][1] isa IR.NORETCALL
     end
 
     @testset "non-initial when is kept" begin
-      local input = BDAE.WHEN_EQUATION[mkWhenEq(nonInitialCref)]
-      local (kept, inits) = SC.extractInitialWhenAlgorithms(input)
+      local (kept, inits) = SC.extractInitialWhenAlgorithms(IR.WHEN_EQUATION[mkWhen(IR.Expression[trigger], false)])
       @test length(kept) == 1
       @test isempty(inits)
     end
@@ -311,28 +269,23 @@ import .ExampleDAEs
     @testset "array {initial(), other}: an initial algorithm and a when on the other" begin
       #= The when fires at the initialization and whenever `other` becomes true
          (MLS 8.3.5; the MSL ZeroOrderHold's `when {sampleTrigger, initial()}`). =#
-      local arrCond = DAE.ARRAY(DAE.T_BOOL(nil), false,
-                                list(initialCall, nonInitialCref))
-      local input = BDAE.WHEN_EQUATION[mkWhenEq(arrCond)]
-      local (kept, inits) = SC.extractInitialWhenAlgorithms(input)
+      local (kept, inits) = SC.extractInitialWhenAlgorithms(IR.WHEN_EQUATION[mkWhen(IR.Expression[trigger], true)])
       @test length(inits) == 1
       @test length(kept) == 1
-      @test kept[1].whenEquation.condition == nonInitialCref
+      @test kept[1].branches[1].triggers == IR.Expression[trigger]
+      @test kept[1].alsoInitial
     end
 
     @testset "mixed input partitions correctly" begin
-      local input = BDAE.WHEN_EQUATION[
-        mkWhenEq(initialCall),
-        mkWhenEq(nonInitialCref),
-        mkWhenEq(initialCall),
-      ]
+      local input = IR.WHEN_EQUATION[mkWhen(IR.Expression[], true), mkWhen(IR.Expression[trigger], false),
+                                     mkWhen(IR.Expression[], true)]
       local (kept, inits) = SC.extractInitialWhenAlgorithms(input)
       @test length(kept) == 1
       @test length(inits) == 2
     end
 
     @testset "empty input gives empty outputs" begin
-      local (kept, inits) = SC.extractInitialWhenAlgorithms(BDAE.WHEN_EQUATION[])
+      local (kept, inits) = SC.extractInitialWhenAlgorithms(IR.WHEN_EQUATION[])
       @test isempty(kept)
       @test isempty(inits)
     end
@@ -342,34 +295,25 @@ import .ExampleDAEs
 
   @testset "Simulation" begin
     OMBackend.clearCaches!()
+    local simulated = name -> begin
+      local (fm, functions) = ExampleModels.flatModel(name)
+      OMBackend.translate(fm; functionList = functions, BackendMode = OMBackend.MTK_MODE)
+      OMBackend.simulateModel("Examples_" * name; MODE = OMBackend.MTK_MODE, tspan = (0.0, 1.0))
+    end
 
     @testset "HelloWorld: der(x) = -a*x" begin
-      OMBackend.translate(ExampleDAEs.helloWorld_DAE;
-                          BackendMode=OMBackend.MTK_MODE)
-      sol = OMBackend.simulateModel("HelloWorld";
-                                     MODE=OMBackend.MTK_MODE,
-                                     tspan=(0.0, 1.0))
+      local sol = simulated("HelloWorld")
       @test sol.retcode == ReturnCode.Success
       # Analytical: x(t) = exp(-t), so x(1) = exp(-1)
       @test isapprox(last(sol.u)[1], exp(-1.0); atol=1e-4)
     end
 
     @testset "LotkaVolterra simulates" begin
-      OMBackend.translate(ExampleDAEs.lotkaVolterra_DAE;
-                          BackendMode=OMBackend.MTK_MODE)
-      sol = OMBackend.simulateModel("LotkaVolterra";
-                                     MODE=OMBackend.MTK_MODE,
-                                     tspan=(0.0, 1.0))
-      @test sol.retcode == ReturnCode.Success
+      @test simulated("LotkaVolterra").retcode == ReturnCode.Success
     end
 
     @testset "VanDerPol simulates" begin
-      OMBackend.translate(ExampleDAEs.vanDerPol_DAE;
-                          BackendMode=OMBackend.MTK_MODE)
-      sol = OMBackend.simulateModel("VanDerPol";
-                                     MODE=OMBackend.MTK_MODE,
-                                     tspan=(0.0, 1.0))
-      @test sol.retcode == ReturnCode.Success
+      @test simulated("VanDerPol").retcode == ReturnCode.Success
     end
   end
 
@@ -414,5 +358,25 @@ import .ExampleDAEs
 
   #= ── 19. Array-preserving code generation (no-scalarize models) ─ =#
   include("arrayPathTests.jl")
+
+  #= ── 20. The initialization's one-unknown rows ──────────────────── =#
+  include("initializationCausalRowsTests.jl")
+
+  #= ── 21. The backend reads the frontend's flat model only ──────── =#
+  @testset "No DAE in the backend" begin
+    #= The frontend's DAE, the previous backend's BDAE and its SimulationCode are gone: the
+       backend lowers the flat model to OMJLIR. No source reads them (prose may name them). =#
+    local src = normpath(joinpath(@__DIR__, "..", "src"))
+    local reads = r"\bDAE\.[A-Za-z]|(import|using)\s+(\.\.)?(DAE|BDAE|SimulationCode|FrontendUtil)\b|\b(BDAE|SimulationCode|FrontendUtil)\.[A-Za-z]"
+    local found = String[]
+    for (root, _, files) in walkdir(src), f in files
+      endswith(f, ".jl") || continue
+      for (i, line) in enumerate(eachline(joinpath(root, f)))
+        occursin(reads, line) && push!(found, string(relpath(joinpath(root, f), src), ":", i, ": ", strip(line)))
+      end
+    end
+    @test isempty(found)
+    isempty(found) || foreach(println, found)
+  end
 
 end

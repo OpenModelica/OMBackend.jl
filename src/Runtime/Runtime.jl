@@ -43,11 +43,10 @@ import .RuntimeUtil
 import Absyn
 import SCode
 import OMBackend
-import OMBackend.SimulationCode
+import OMBackend.SimCode
 import ..@BACKEND_LOGGING
 import ..@VSS_DEBUG
 import OMFrontend
-import DAE
 
 import ModelingToolkit
 
@@ -326,6 +325,7 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
             dispatchedToDAEInit = true
             @VSS_DEBUG @info "VSS transfer: re-ran MTK DAE init" n_inherited=length(u0Dict) u_after=integrator.u
           catch err
+            OMBackend._fallback(err, :vssTransferDAEInit; impact = :result)
             @VSS_DEBUG @info "VSS transfer DAE-init path failed; falling back to vector u0" err
             dispatchedToDAEInit = false
           end
@@ -748,8 +748,7 @@ function recompilation(activeModeName,
     @VSS_DEBUG @info "[RECOMPILATION] composite ODEProblem rebuilt" elapsed_s=round(time()-_t_start, digits=2)
     #=4) Changed System=#
     #= 4.1 Update the structural callback with the new situation =#
-    @match SOME(newMetaModel) = simulationCode.metaModel
-    structuralCallback.metaModel = newMetaModel
+    structuralCallback.metaModel = simulationCode.frontendModel
     structuralCallback.stringToSimVarHT = simulationCode.stringToSimVarHT
     #= 4.2) Assign this system to newSystem. =#
     return (compositeProblem, simulationCode.stringToSimVarHT, finalInitialValues, initialValues, reducedSystem)
@@ -886,14 +885,14 @@ function queryAgent(componentsToChange::Vector{String},
 end
 
 """
-    translateToSimCode(flatModelica::OMFrontend.Frontend.FlatModel, functionList::List) -> SIM_CODE
+    translateToSimCode(flatModelica, functionList) -> SIM_CODE
 
-The SimCode of a recompiled model with its functions (`functionList`, the frontend's), through
-the SimCode passes of a translate (OMBackend.mtkSimCode).
+The SimCode of a recompiled model with its functions (`functionList`, the frontend's), as a
+translate's (OMBackend.omjlirModel, OMBackend.mtkSimCode).
 """
-function translateToSimCode(flatModelica::OMFrontend.Frontend.FlatModel, functionList::List)::OMBackend.SimulationCode.SIM_CODE
-  return OMBackend.mtkSimCode(OMBackend.lower(flatModelica), functionList)
-end
+translateToSimCode(flatModelica::OMFrontend.Frontend.FlatModel,
+                   functionList::Union{Nothing, OMBackend.LowerFlatModel.FunctionList})::OMBackend.SimCode.SIM_CODE =
+  OMBackend.mtkSimCode(OMBackend.omjlirModel(flatModelica; functionList))
 
 """
     translateToMTK(simulationCode::SIM_CODE, owner::String) -> Expr
@@ -901,8 +900,8 @@ end
 The module of a recompiled model (CodeGeneration.recompiledModelModule): its tables are owned by
 the build of the model `owner`.
 """
-function translateToMTK(simulationCode::OMBackend.SimulationCode.SIM_CODE, owner::String)::Expr
-  local checkResult = OMBackend.SimulationCode.SimCodeCheck.check(simulationCode)
+function translateToMTK(simulationCode::OMBackend.SimCode.SIM_CODE, owner::String)::Expr
+  local checkResult = OMBackend.SimCode.check(simulationCode)
   local canonicalErrors = filter(v -> v.rule === :canonical_cref_names && v.severity === :error,
                                  checkResult.violations)
   if !isempty(canonicalErrors)

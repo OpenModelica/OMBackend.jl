@@ -1,0 +1,300 @@
+#= /*
+* This file is part of OpenModelica.
+*
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+* c/o Linköpings universitet, Department of Computer and Information Science,
+* SE-58183 Linköping, Sweden.
+*
+* All rights reserved.
+*
+* THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+* THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+* ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+* RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+* VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+*
+* The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+* Public License (OSMC-PL) are obtained from OSMC, either from the above
+* address, from the URLs:
+* http://www.openmodelica.org or
+* https://github.com/OpenModelica/ or
+* http://www.ida.liu.se/projects/OpenModelica,
+* and in the OpenModelica distribution.
+*
+* GNU AGPL version 3 is obtained from:
+* https://www.gnu.org/licenses/licenses.html#GPL
+*
+* This program is distributed WITHOUT ANY WARRANTY; without
+* even the implied warranty of MERCHANTABILITY or FITNESS
+* FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+* IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+*
+* See the full OSMC Public License conditions for more details.
+*
+*/ =#
+
+#= Traversal of SimCode expressions and statements. =#
+
+"""
+    children(e)
+
+The direct subexpressions of `e` (a reduction's iterator ranges included).
+"""
+children(::Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, EXP_CREF, DER, PRE, WILD, WHOLE_DIMENSION})::Vector{Exp} = Exp[]
+children(e::Union{BINARY, LBINARY, RELATION})::Vector{Exp} = Exp[e.exp1, e.exp2]
+children(e::Union{UNARY, LUNARY, CAST, TSUB, RSUB})::Vector{Exp} = Exp[e.exp]
+children(e::IFEXP)::Vector{Exp} = Exp[e.cond, e.thenExp, e.elseExp]
+children(e::ARRAY_EXP)::Vector{Exp} = copy(e.elements)
+children(e::RANGE)::Vector{Exp} = e.step === nothing ? Exp[e.start, e.stop] : Exp[e.start, e.step, e.stop]
+children(e::ASUB)::Vector{Exp} = Exp[e.exp, e.subs...]
+children(e::Union{CALL, PARTEVALFUNCTION})::Vector{Exp} = copy(e.args)
+children(e::RECORD)::Vector{Exp} = copy(e.exps)
+children(e::TUPLE)::Vector{Exp} = copy(e.elements)
+children(e::REDUCTION)::Vector{Exp} = Exp[e.body, (it.range for it in e.iterators)...]
+
+"""
+    mapChildren(g, e)
+
+`e` with `g` applied to each of its direct subexpressions, one level.
+"""
+mapChildren(g::G, e::Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, EXP_CREF, DER, PRE, WILD, WHOLE_DIMENSION}) where {G} = e
+mapChildren(g::G, e::BINARY) where {G} = BINARY(g(e.exp1), e.op, g(e.exp2))
+mapChildren(g::G, e::LBINARY) where {G} = LBINARY(g(e.exp1), e.op, g(e.exp2))
+mapChildren(g::G, e::RELATION) where {G} = RELATION(g(e.exp1), e.op, g(e.exp2), e.index)
+mapChildren(g::G, e::UNARY) where {G} = UNARY(e.op, g(e.exp))
+mapChildren(g::G, e::LUNARY) where {G} = LUNARY(e.op, g(e.exp))
+mapChildren(g::G, e::CAST) where {G} = CAST(e.ty, g(e.exp))
+mapChildren(g::G, e::TSUB) where {G} = TSUB(g(e.exp), e.index, e.ty)
+mapChildren(g::G, e::RSUB) where {G} = RSUB(g(e.exp), e.index, e.fieldName, e.ty)
+mapChildren(g::G, e::IFEXP) where {G} = IFEXP(g(e.cond), g(e.thenExp), g(e.elseExp))
+mapChildren(g::G, e::ARRAY_EXP) where {G} = ARRAY_EXP(e.ty, e.scalar, Exp[g(x) for x in e.elements])
+mapChildren(g::G, e::RANGE) where {G} = RANGE(e.ty, g(e.start), e.step === nothing ? nothing : g(e.step), g(e.stop))
+mapChildren(g::G, e::ASUB) where {G} = ASUB(g(e.exp), Exp[g(x) for x in e.subs])
+mapChildren(g::G, e::CALL) where {G} = CALL(e.name, Exp[g(x) for x in e.args], e.ty, e.kind)
+mapChildren(g::G, e::PARTEVALFUNCTION) where {G} = PARTEVALFUNCTION(e.name, Exp[g(x) for x in e.args], e.argNames, e.inputs, e.ty)
+mapChildren(g::G, e::RECORD) where {G} = RECORD(e.name, Exp[g(x) for x in e.exps], e.fieldNames, e.ty)
+mapChildren(g::G, e::TUPLE) where {G} = TUPLE(Exp[g(x) for x in e.elements])
+mapChildren(g::G, e::REDUCTION) where {G} =
+  REDUCTION(e.reducer, g(e.body), Iterator[Iterator(it.name, g(it.range)) for it in e.iterators], e.ty)
+
+"`mapExp` of `f` as a callable, for `mapChildren`."
+struct _BottomUp{F}
+  f::F
+end
+(m::_BottomUp)(e::Exp) = mapExp(m.f, e)
+
+"""
+    mapExp(f, e)
+
+`e` with every subexpression `s` replaced by `f(s)`, bottom-up: `f` sees a node whose children
+are already mapped.
+"""
+mapExp(f::F, e::Exp) where {F} = f(mapChildren(_BottomUp(f), e))
+
+"""
+    foreachExp(f, e)
+
+Call `f` on `e` and on every subexpression, top-down.
+"""
+function foreachExp(f::F, e::Exp)::Nothing where {F}
+  f(e)
+  for c in children(e)
+    foreachExp(f, c)
+  end
+  return nothing
+end
+
+"Whether `p` holds for `e` or one of its subexpressions."
+function anyExp(p::F, e::Exp)::Bool where {F}
+  p(e) && return true
+  return any(c -> anyExp(p, c), children(e))
+end
+
+"""
+    mapStatementExps(g, s)
+
+`s` with each of its expressions `e` (of nested statements too) replaced by `g(e)`, whole;
+the targets of `reinit` and of OM.jl's structural changes kept.
+"""
+mapStatementExps(g::G, s::ASSIGN) where {G} = ASSIGN(g(s.left), g(s.right), s.source)
+mapStatementExps(g::G, s::IF) where {G} =
+  IF(Branch[Branch(g(b.condition), mapStatementExps(g, b.body)) for b in s.branches], mapStatementExps(g, s.elseBody), s.source)
+mapStatementExps(g::G, s::FOR) where {G} = FOR(Iterator(s.iterator.name, g(s.iterator.range)), mapStatementExps(g, s.body), s.source)
+mapStatementExps(g::G, s::WHILE) where {G} = WHILE(g(s.condition), mapStatementExps(g, s.body), s.source)
+mapStatementExps(g::G, s::WHEN) where {G} =
+  WHEN(Branch[Branch(g(b.condition), mapStatementExps(g, b.body)) for b in s.branches], s.source)
+mapStatementExps(g::G, s::ASSERT) where {G} = ASSERT(g(s.condition), g(s.message), g(s.level), s.source)
+mapStatementExps(g::G, s::TERMINATE) where {G} = TERMINATE(g(s.message), s.source)
+mapStatementExps(g::G, s::REINIT) where {G} = REINIT(s.stateVar, g(s.value), s.source)
+mapStatementExps(g::G, s::NORETCALL) where {G} = NORETCALL(g(s.exp), s.source)
+mapStatementExps(g::G, s::RECOMPILATION) where {G} = RECOMPILATION(s.componentToChange, g(s.newValue))
+mapStatementExps(g::G, s::Union{RETURN, BREAK, AGENTIC_RECOMPILATION}) where {G} = s
+
+mapStatementExps(g::G, body::Vector{Statement}) where {G} = Statement[mapStatementExps(g, s) for s in body]
+
+"`s` with `f` mapped (as by `mapExp`) over its expressions; the targets of `reinit` and of OM.jl's structural changes kept."
+mapStatement(f::F, s::Statement) where {F} = mapStatementExps(e -> mapExp(f, e), s)
+
+mapStatements(f::F, body::Vector{Statement}) where {F} = Statement[mapStatement(f, s) for s in body]
+
+"""
+    crefNames!(names, e)
+
+The names of the variables `e` reads, in order: a reference's name (with its subscripts,
+`x[1]` of an array element), a derivative's state's, a `pre(x)`'s variable;
+an array read by literal subscripts also as its element (`R_T[1][2]`), by a subscript that
+reads a variable as `R_T[?]` (`DYNAMIC_SUBSCRIPT_MARK`).
+"""
+function crefNames!(names::OrderedSet{String}, e::Exp)::OrderedSet{String}
+  if e isa EXP_CREF
+    push!(names, crefName(e.cref))
+  elseif e isa DER
+    push!(names, crefName(e.cref))
+  elseif e isa PRE
+    push!(names, crefName(e.cref))
+  elseif e isa ASUB && e.exp isa EXP_CREF
+    local base = crefName(e.exp.cref)
+    if all(s -> s isa ICONST, e.subs)
+      push!(names, string(base, join(("[$(s.value)]" for s in e.subs))))
+    elseif any(s -> anyExp(x -> x isa Union{EXP_CREF, DER, PRE}, s), e.subs)
+      push!(names, string(base, DYNAMIC_SUBSCRIPT_MARK))
+    end
+  end
+  for c in children(e)
+    crefNames!(names, c)
+  end
+  return names
+end
+
+"The name an array read with a subscript that reads a variable is known by (no element is named)."
+const DYNAMIC_SUBSCRIPT_MARK = "[?]"
+
+"A reference's name: its symbol, with its Integer subscripts (`A[1][2]`)."
+crefName(c::SimCref)::String = isempty(c.subs) ? String(c.sym) : string(c.sym, join(("[$(i)]" for i in c.subs)))
+
+#= ==================================================================================== =#
+#= Traversals with an accumulator (the passes')                                         =#
+#= ==================================================================================== =#
+
+"""
+    traverseExpTopDown(e, visitor, arg)
+
+`e` traversed top-down by `visitor(x, arg) -> (newX, descend, newArg)`: `newX` replaces `x`,
+its children are traversed in turn if `descend`; `arg` is threaded through. A node whose
+children did not change is returned itself (`===`).
+"""
+function traverseExpTopDown(e::Exp, visitor::F, arg::T)::Tuple{Exp, T} where {F, T}
+  local (out, descend, a) = visitor(e, arg)
+  descend || return (out, a)
+  return traverseChildren(out, (x, acc) -> traverseExpTopDown(x, visitor, acc), a)
+end
+
+"""
+    traverseExpBottomUp(e, visitor, arg)
+
+`e` traversed bottom-up by `visitor(x, arg) -> (newX, newArg)`: `x`'s children are traversed
+first.
+"""
+function traverseExpBottomUp(e::Exp, visitor::F, arg::T)::Tuple{Exp, T} where {F, T}
+  local (out, a) = traverseChildren(e, (x, acc) -> traverseExpBottomUp(x, visitor, acc), arg)
+  return visitor(out, a)
+end
+
+"""
+    traverseChildren(e, recur, arg)
+
+`e` with `recur(child, arg) -> (newChild, newArg)` applied to its children in order (a
+reduction's iterator ranges after its body), itself if none changed.
+"""
+traverseChildren(e::Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, EXP_CREF, DER, PRE, WILD, WHOLE_DIMENSION}, recur::R, arg) where {R} = (e, arg)
+function traverseChildren(e::Union{UNARY, LUNARY}, recur::R, arg) where {R}
+  local (x, a) = recur(e.exp, arg)
+  return (x === e.exp ? e : typeof(e)(e.op, x), a)
+end
+function traverseChildren(e::CAST, recur::R, arg) where {R}
+  local (x, a) = recur(e.exp, arg)
+  return (x === e.exp ? e : CAST(e.ty, x), a)
+end
+function traverseChildren(e::TSUB, recur::R, arg) where {R}
+  local (x, a) = recur(e.exp, arg)
+  return (x === e.exp ? e : TSUB(x, e.index, e.ty), a)
+end
+function traverseChildren(e::RSUB, recur::R, arg) where {R}
+  local (x, a) = recur(e.exp, arg)
+  return (x === e.exp ? e : RSUB(x, e.index, e.fieldName, e.ty), a)
+end
+function traverseChildren(e::Union{BINARY, LBINARY}, recur::R, arg) where {R}
+  local (x1, a1) = recur(e.exp1, arg)
+  local (x2, a2) = recur(e.exp2, a1)
+  return ((x1 === e.exp1 && x2 === e.exp2) ? e : typeof(e)(x1, e.op, x2), a2)
+end
+function traverseChildren(e::RELATION, recur::R, arg) where {R}
+  local (x1, a1) = recur(e.exp1, arg)
+  local (x2, a2) = recur(e.exp2, a1)
+  return ((x1 === e.exp1 && x2 === e.exp2) ? e : RELATION(x1, e.op, x2, e.index), a2)
+end
+function traverseChildren(e::IFEXP, recur::R, arg) where {R}
+  local (c, a1) = recur(e.cond, arg)
+  local (t, a2) = recur(e.thenExp, a1)
+  local (f, a3) = recur(e.elseExp, a2)
+  return ((c === e.cond && t === e.thenExp && f === e.elseExp) ? e : IFEXP(c, t, f), a3)
+end
+function traverseChildren(e::RANGE, recur::R, arg) where {R}
+  local (s, a1) = recur(e.start, arg)
+  local (st, a2) = e.step === nothing ? (nothing, a1) : recur(e.step, a1)
+  local (sp, a3) = recur(e.stop, a2)
+  return ((s === e.start && st === e.step && sp === e.stop) ? e : RANGE(e.ty, s, st, sp), a3)
+end
+function traverseChildren(e::CALL, recur::R, arg) where {R}
+  local (xs, a) = traverseVector(e.args, recur, arg)
+  return (xs === e.args ? e : CALL(e.name, xs, e.ty, e.kind), a)
+end
+function traverseChildren(e::PARTEVALFUNCTION, recur::R, arg) where {R}
+  local (xs, a) = traverseVector(e.args, recur, arg)
+  return (xs === e.args ? e : PARTEVALFUNCTION(e.name, xs, e.argNames, e.inputs, e.ty), a)
+end
+function traverseChildren(e::ARRAY_EXP, recur::R, arg) where {R}
+  local (xs, a) = traverseVector(e.elements, recur, arg)
+  return (xs === e.elements ? e : ARRAY_EXP(e.ty, e.scalar, xs), a)
+end
+function traverseChildren(e::RECORD, recur::R, arg) where {R}
+  local (xs, a) = traverseVector(e.exps, recur, arg)
+  return (xs === e.exps ? e : RECORD(e.name, xs, e.fieldNames, e.ty), a)
+end
+function traverseChildren(e::TUPLE, recur::R, arg) where {R}
+  local (xs, a) = traverseVector(e.elements, recur, arg)
+  return (xs === e.elements ? e : TUPLE(xs), a)
+end
+function traverseChildren(e::ASUB, recur::R, arg) where {R}
+  local (x, a1) = recur(e.exp, arg)
+  local (xs, a) = traverseVector(e.subs, recur, a1)
+  return ((x === e.exp && xs === e.subs) ? e : ASUB(x, xs), a)
+end
+function traverseChildren(e::REDUCTION, recur::R, arg) where {R}
+  local (b, a) = recur(e.body, arg)
+  local changed = b !== e.body
+  local its = Iterator[]
+  for it in e.iterators
+    local (r, a2) = recur(it.range, a)
+    a = a2
+    changed |= r !== it.range
+    push!(its, r === it.range ? it : Iterator(it.name, r))
+  end
+  return (changed ? REDUCTION(e.reducer, b, its, e.ty) : e, a)
+end
+
+"The elements traversed by `recur` in order; the vector itself if none changed."
+function traverseVector(xs::Vector{Exp}, recur::R, arg) where {R}
+  local out = nothing
+  local a = arg
+  for (i, x) in enumerate(xs)
+    local (y, a2) = recur(x, a)
+    a = a2
+    if out === nothing && y !== x
+      out = Vector{Exp}(undef, length(xs))
+      copyto!(out, 1, xs, 1, i - 1)
+    end
+    out === nothing || (out[i] = y)
+  end
+  return (out === nothing ? xs : out, a)
+end

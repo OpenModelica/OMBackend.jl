@@ -107,13 +107,15 @@ struct ExternalObjectRef
 end
 Base.hash(r::ExternalObjectRef, h::UInt) = hash(r.name, hash(:ExternalObjectRef, h))
 Base.:(==)(a::ExternalObjectRef, b::ExternalObjectRef) = a.name == b.name && a.handle === b.handle
-#= Printed with its serial number: a RuntimeGeneratedFunction's id is the SHA1 of its body's
-   printed leaves, and its cache is global, so two builds whose generated functions differ only
-   in the object (two models with a table `tab`, or a rebuild with other table data) got the
-   first build's function and read its table (OM.jl buildingsReproTests: TableStartOfInitialEquation
-   after TableInit3 read TableInit3's). Not by its address: since objects are freed, a new table
-   can take a freed one's address, and the rebuild got the freed table's function. The name
-   comes first, so a model's terms keep their order. =#
+"""
+Printed with its serial number: a RuntimeGeneratedFunction's id is the SHA1 of its body's
+printed leaves, and its cache is global, so two builds whose generated functions differ only
+in the object (two models with a table `tab`, or a rebuild with other table data) got the
+first build's function and read its table (OM.jl buildingsReproTests: TableStartOfInitialEquation
+after TableInit3 read TableInit3's). Not by its address: since objects are freed, a new table
+can take a freed one's address, and the rebuild got the freed table's function. The name
+comes first, so a model's terms keep their order.
+"""
 Base.show(io::IO, r::ExternalObjectRef) = print(io, "ExternalObjectRef(", repr(r.name), ", ", r.handle.id, ")")
 
 """
@@ -133,7 +135,9 @@ function _externalObjectRef(name::Symbol, @nospecialize(value), destructor::Symb
   return ExternalObjectRef(name, value, handle)
 end
 
-#= The argument of a C function: the pointer of an external object (agnostic otherwise). =#
+"""
+The argument of a C function: the pointer of an external object (agnostic otherwise).
+"""
 _externalPtr(@nospecialize(x)) = x
 _externalPtr(r::ExternalObjectRef) = r.handle.alive ? r.ptr : _freedExternalObject(r)
 
@@ -261,7 +265,9 @@ function _centralPartial(impl, args::Tuple, idx::Tuple, rel::Float64)::Float64
   throw(up)
 end
 
-#= A partial at one side, or the error of a function evaluation there (_RHS_STEP_ERRORS). =#
+"""
+A partial at one side, or the error of a function evaluation there (_RHS_STEP_ERRORS).
+"""
 function _sidePartial(impl, args::Tuple, idx::Tuple, rel::Float64)::Union{Float64, Exception}
   try
     return _centralPartial(impl, args, idx, rel)
@@ -297,46 +303,20 @@ function _isKnownBooleanAllTrueFunction(normalizedFuncName::String)::Bool
          normalizedFuncName == "Modelica_Math_BooleanVectors_allTrue"
 end
 
-function _booleanVectorTerms(expLst,
-                             simCode,
-                             hashTable;
-                             varPrefix = "",
-                             varSuffix = "",
-                             derSymbol = false)
-  local nArgs = 0
-  local onlyArg = nothing
-  for arg in expLst
-    nArgs += 1
-    onlyArg = arg
-  end
-  nArgs == 1 || return nothing
-
-  local terms = Any[]
-  @match onlyArg begin
-    DAE.ARRAY(_, _, array) => begin
-      for e in array
-        push!(terms, expToJuliaExpMTK(e, simCode;
-                                      varPrefix = varPrefix,
-                                      varSuffix = varSuffix,
-                                      derSymbol = derSymbol))
-      end
-    end
-    _ => return nothing
-  end
-
-  return terms
+"""
+The lowered elements of the one argument of a Boolean reduction, an array literal; nothing
+for another argument.
+"""
+function _booleanVectorTerms(args::Vector{SC.Exp}, simCode::SC.SIM_CODE)::Union{Nothing, Vector{Expr}}
+  (length(args) == 1 && only(args) isa SC.ARRAY_EXP) || return nothing
+  return Expr[expToJuliaExpMTK(e, simCode) for e in only(args).elements]
 end
 
-function _booleanAnyTrueCallExpr(expLst,
-                                 simCode,
-                                 hashTable;
-                                 varPrefix = "",
-                                 varSuffix = "",
-                                 derSymbol = false)
-  local terms = _booleanVectorTerms(expLst, simCode, hashTable;
-                                    varPrefix = varPrefix,
-                                    varSuffix = varSuffix,
-                                    derSymbol = derSymbol)
+"""
+`anyTrue(b)`: `1 - (1 - b1) * (1 - b2) ...`.
+"""
+function _booleanAnyTrueCallExpr(args::Vector{SC.Exp}, simCode::SC.SIM_CODE)
+  local terms = _booleanVectorTerms(args, simCode)
   terms === nothing && return nothing
   isempty(terms) && return :(0)
   local result = :(1 - $(terms[1]))
@@ -346,16 +326,11 @@ function _booleanAnyTrueCallExpr(expLst,
   return :(1 - $result)
 end
 
-function _booleanAllTrueCallExpr(expLst,
-                                 simCode,
-                                 hashTable;
-                                 varPrefix = "",
-                                 varSuffix = "",
-                                 derSymbol = false)
-  local terms = _booleanVectorTerms(expLst, simCode, hashTable;
-                                    varPrefix = varPrefix,
-                                    varSuffix = varSuffix,
-                                    derSymbol = derSymbol)
+"""
+`allTrue(b)`: `b1 * b2 ...`.
+"""
+function _booleanAllTrueCallExpr(args::Vector{SC.Exp}, simCode::SC.SIM_CODE)
+  local terms = _booleanVectorTerms(args, simCode)
   terms === nothing && return nothing
   isempty(terms) && return :(1)
   local result = terms[1]
@@ -366,30 +341,16 @@ function _booleanAllTrueCallExpr(expLst,
 end
 
 """
-Lower known Modelica function calls that have a stable symbolic equivalent.
+    lowerKnownSymbolicFunctionCall(normalizedFuncName, args, simCode)
 
-This keeps simple Boolean reductions out of the opaque RuntimeGeneratedFunction
-path. MTK can rebuild opaque terms with `symtype=Any` during alias elimination,
-which later trips SymbolicUtils arithmetic in linear-coefficient extraction.
+A call of a function with a stable symbolic equivalent (the Boolean reductions anyTrue and
+allTrue), lowered as it; `nothing` for another. It keeps them out of the opaque
+RuntimeGeneratedFunction path: MTK can rebuild opaque terms with `symtype=Any` during alias
+elimination, which later trips SymbolicUtils arithmetic in linear-coefficient extraction.
 """
-function lowerKnownSymbolicFunctionCall(normalizedFuncName::String,
-                                        expLst,
-                                        simCode,
-                                        hashTable;
-                                        varPrefix = "",
-                                        varSuffix = "",
-                                        derSymbol = false)
-  if _isKnownBooleanAnyTrueFunction(normalizedFuncName)
-    return _booleanAnyTrueCallExpr(expLst, simCode, hashTable;
-                                  varPrefix = varPrefix,
-                                  varSuffix = varSuffix,
-                                  derSymbol = derSymbol)
-  elseif _isKnownBooleanAllTrueFunction(normalizedFuncName)
-    return _booleanAllTrueCallExpr(expLst, simCode, hashTable;
-                                  varPrefix = varPrefix,
-                                  varSuffix = varSuffix,
-                                  derSymbol = derSymbol)
-  end
+function lowerKnownSymbolicFunctionCall(normalizedFuncName::String, args::Vector{SC.Exp}, simCode::SC.SIM_CODE)
+  _isKnownBooleanAnyTrueFunction(normalizedFuncName) && return _booleanAnyTrueCallExpr(args, simCode)
+  _isKnownBooleanAllTrueFunction(normalizedFuncName) && return _booleanAllTrueCallExpr(args, simCode)
   return nothing
 end
 
@@ -1094,16 +1055,20 @@ Vararg subscripts to support both vectors and N-dimensional arrays.
 struct ConstTableLookupFn{A <: AbstractArray}
   table::A
 end
-#= By its table's content: the default hashed the table's address, which
-   differs by process (see `_RGF_TAG`). =#
+"""
+By its table's content: the default hashed the table's address, which
+differs by process (see `_RGF_TAG`).
+"""
 Base.hash(f::ConstTableLookupFn, h::UInt) = hash(f.table, hash(:ConstTableLookupFn, h))
 
-#= Primal value of a table index. A constant table lookup is piecewise-constant
-   in its (discrete/enum) index, so an autodiff `Dual` index must collapse to its
-   primal before rounding to an integer: this both avoids `Float64(::Dual)` in the
-   nonlinear-solve Jacobian and gives the lookup an identically-zero derivative
-   w.r.t. the index (the returned table entry carries no partials). Dependency-free
-   so OMBackend need not depend on ForwardDiff; `Dual` exposes a `.value` field. =#
+"""
+Primal value of a table index. A constant table lookup is piecewise-constant
+in its (discrete/enum) index, so an autodiff `Dual` index must collapse to its
+primal before rounding to an integer: this both avoids `Float64(::Dual)` in the
+nonlinear-solve Jacobian and gives the lookup an identically-zero derivative
+w.r.t. the index (the returned table entry carries no partials). Dependency-free
+so OMBackend need not depend on ForwardDiff; `Dual` exposes a `.value` field.
+"""
 function _primalValue(@nospecialize(v))
   v isa Integer && return v
   v isa AbstractFloat && return v
@@ -1120,9 +1085,11 @@ function (c::ConstTableLookupFn)(rt_idxs...)
   return c.table[resolved...]
 end
 SymbolicUtils.promote_symtype(::ConstTableLookupFn, args...) = Real
-#= maketerm RE-INFERS shape too, not just symtype; the generic fallback yields
-   Unknown, which trips `promote_shape(==, Unknown, scalar)` once the rebuilt term
-   lands in a relational during substitute/full_equations. The lookup is scalar. =#
+"""
+maketerm RE-INFERS shape too, not just symtype; the generic fallback yields
+Unknown, which trips `promote_shape(==, Unknown, scalar)` once the rebuilt term
+lands in a relational during substitute/full_equations. The lookup is scalar.
+"""
 SymbolicUtils.promote_shape(::ConstTableLookupFn, szs::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 
 function constTableLookup(table::AbstractArray, idxs...)
@@ -1134,18 +1101,20 @@ function constTableLookup(table::AbstractArray, idxs...)
   end
 end
 
-#= Clamp the resolved table index to the valid range [1, size(table, k)].
-   During DAE initialization the integer / enum simvars that index into
-   constant tables are still at their default 0.0 (Float64 unknown
-   storage) until the `start` attributes are applied. Without clamping,
-   a `constTableLookup` invoked during the init Newton solve hits a
-   BoundsError at index 0. Treating an out-of-range index as the first
-   row/column (typically the "Unknown" / "U" entry in MSL Digital
-   tables) is consistent with Modelica §17.4.4 (uninitialised discretes
-   are treated as their start values, and the init solver is allowed to
-   probe the residual with provisional values that have not yet been
-   pinned). Once init completes the indices are valid and clamping is
-   a no-op. =#
+"""
+Clamp the resolved table index to the valid range [1, size(table, k)].
+During DAE initialization the integer / enum simvars that index into
+constant tables are still at their default 0.0 (Float64 unknown
+storage) until the `start` attributes are applied. Without clamping,
+a `constTableLookup` invoked during the init Newton solve hits a
+BoundsError at index 0. Treating an out-of-range index as the first
+row/column (typically the "Unknown" / "U" entry in MSL Digital
+tables) is consistent with Modelica §17.4.4 (uninitialised discretes
+are treated as their start values, and the init solver is allowed to
+probe the residual with provisional values that have not yet been
+pinned). Once init completes the indices are valid and clamping is
+a no-op.
+"""
 function _toIndex(v)
   if v isa Integer
     return Int(v)
@@ -1429,18 +1398,20 @@ function filterConstantEquations(eqs::AbstractVector)
   return filtered
 end
 
-#= der(<expression>) in the continuous equations by the chain rule, down to
-   derivatives of variables (MSL FluxTubes' Tellinen hysteresis:
-   `dHyst = der(hystR - mu0*Hstat)`): MTK takes a Differential only of an
-   unknown. A variable an equation `x ~ f` defines explicitly (hystR) has
-   der(f) for der(x), as OpenModelica differentiates it: left as D(x), index
-   reduction made x a state and recovered the chain behind f backwards
-   (P3 = (... - hystR)/P4, H3 from P3's atan), singular once the branch
-   saturated. Only in these equations; the model's own der(x) stay. An
-   equation with a function Symbolics has no derivative rule for (a Modelica
-   function, a table lookup) stays as it is. The initial equations keep
-   D(expr), which the init solve differentiates itself
-   (_observedDerivativeTargets). =#
+"""
+der(<expression>) in the continuous equations by the chain rule, down to
+derivatives of variables (MSL FluxTubes' Tellinen hysteresis:
+`dHyst = der(hystR - mu0*Hstat)`): MTK takes a Differential only of an
+unknown. A variable an equation `x ~ f` defines explicitly (hystR) has
+der(f) for der(x), as OpenModelica differentiates it: left as D(x), index
+reduction made x a state and recovered the chain behind f backwards
+(P3 = (... - hystR)/P4, H3 from P3's atan), singular once the branch
+saturated. Only in these equations; the model's own der(x) stay. An
+equation with a function Symbolics has no derivative rule for (a Modelica
+function, a table lookup) stays as it is. The initial equations keep
+D(expr), which the init solve differentiates itself
+(_observedDerivativeTargets).
+"""
 function expandExpressionDerivatives(eqs::AbstractVector)
   local touched = BitVector(_hasExpressionDerivative(eq.lhs) || _hasExpressionDerivative(eq.rhs) for eq in eqs)
   any(touched) || return eqs
@@ -1458,14 +1429,18 @@ function expandExpressionDerivatives(eqs::AbstractVector)
   end
 end
 
-#= Symbolics' chain rule, throwing at a function without a derivative rule
-   (by default it writes D(f(u))*D(u) for it). =#
+"""
+Symbolics' chain rule, throwing at a function without a derivative rule
+(by default it writes D(f(u))*D(u) for it).
+"""
 _expandDerivatives(ex) = Symbolics.expand_derivatives(ex, false; throw_no_derivative = true)
 
-#= The Differential terms of `ex` (or of a vector or tuple of them), outermost
-   ones: get_variables keeps a Differential term whole (an Operator is atomic)
-   and, unlike a walk over `arguments`, builds no argument lists (every
-   model's equations pass through _hasExpressionDerivative). =#
+"""
+The Differential terms of `ex` (or of a vector or tuple of them), outermost
+ones: get_variables keeps a Differential term whole (an Operator is atomic)
+and, unlike a walk over `arguments`, builds no argument lists (every
+model's equations pass through _hasExpressionDerivative).
+"""
 function _differentials(ex)
   local out = OrderedSet{Any}()
   for e in (ex isa Union{AbstractArray, Tuple} ? ex : (ex,)), v in Symbolics.get_variables(e)
@@ -1476,10 +1451,12 @@ end
 
 _hasExpressionDerivative(ex) = any(v -> !_isDifferentiableUnknown(v), _differentials(ex))
 
-#= x => f for the equations `x ~ f` with x a variable: f neither reads x nor
-   differentiates, x has no other such equation and the model does not
-   differentiate x itself (a state: its D(x) is the state derivative, and
-   D(f) would make index reduction solve f for f's operands). =#
+"""
+x => f for the equations `x ~ f` with x a variable: f neither reads x nor
+differentiates, x has no other such equation and the model does not
+differentiate x itself (a state: its D(x) is the state derivative, and
+D(f) would make index reduction solve f for f's operands).
+"""
 function _explicitDefinitions(eqs)
   local out = Dict{Any, Any}()
   local seen = Set{Any}()
@@ -1532,7 +1509,9 @@ function _derivativesByDefinitions(ex, definitions, memo, open::Set{Any})
   return isempty(subs) ? ex : Symbolics.substitute(ex, subs)
 end
 
-#= A variable x(t), or a derivative of one (D(D(x))): what MTK differentiates. =#
+"""
+A variable x(t), or a derivative of one (D(D(x))): what MTK differentiates.
+"""
 function _isDifferentiableUnknown(v)
   SymbolicUtils.iscall(v) || return SymbolicUtils.issym(v)
   local op = SymbolicUtils.operation(v)
@@ -1540,13 +1519,15 @@ function _isDifferentiableUnknown(v)
   return SymbolicUtils.issym(op)
 end
 
-#= build_explicit_observed_function for reads that may hold derivatives (an
-   event relation `asc = der(Hstat) > 0`, MSL FluxTubes' Tellinen
-   hysteresis), which it takes only as variables of the system: D(x) of a
-   differential unknown becomes the right-hand side of its equation, any
-   other D(x) the derivative variable index reduction made for x (xˍt, an
-   unknown or observed). A D(x) the system has neither for is left (the
-   build then fails as before). =#
+"""
+build_explicit_observed_function for reads that may hold derivatives (an
+event relation `asc = der(Hstat) > 0`, MSL FluxTubes' Tellinen
+hysteresis), which it takes only as variables of the system: D(x) of a
+differential unknown becomes the right-hand side of its equation, any
+other D(x) the derivative variable index reduction made for x (xˍt, an
+unknown or observed). A D(x) the system has neither for is left (the
+build then fails as before).
+"""
 function _buildObservedFunction(sys, exprs; kwargs...)
   return ModelingToolkit.build_explicit_observed_function(sys, _derivativesAsSystemTerms(sys, exprs); kwargs...)
 end
@@ -1655,8 +1636,10 @@ function resolveAliasInitialValue(diffState, idx::AliasEqIndex, ivMap::Dict)
   return nothing
 end
 
-#= Whether a symbolic expression has more than `cap` nodes, counted as a tree
-   (shared subexpressions count each time); stops at the cap. =#
+"""
+Whether a symbolic expression has more than `cap` nodes, counted as a tree
+(shared subexpressions count each time); stops at the cap.
+"""
 function _exprLargerThan(@nospecialize(ex), cap::Int)::Bool
   local n = 0
   local stack = Any[Symbolics.unwrap(ex)]
@@ -1723,14 +1706,16 @@ function explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues)::Order
              _EXPLICIT_PINNED_INITIAL_VALUE_KEYS, _pinnedSidecarKey(reducedSystem))
 end
 
-#= Names (as strings) of variables that appear in an algebraic (non-differential)
-   equation of `sys`, including observed equations: structural_simplify moves
-   eliminated algebraic constraints to observed, so a state coupled only through
-   them is still algebraically coupled. A differential equation `D(x) ~ rhs` is
-   skipped: the state `x`'s initial condition is free unless it is also
-   constrained by an algebraic equation. Used by splitInitialValues to decide
-   which non-fixed starts are safe to keep as hard u0 (uncoupled states) vs must
-   be relaxed to guesses (algebraically coupled states). =#
+"""
+Names (as strings) of variables that appear in an algebraic (non-differential)
+equation of `sys`, including observed equations: structural_simplify moves
+eliminated algebraic constraints to observed, so a state coupled only through
+them is still algebraically coupled. A differential equation `D(x) ~ rhs` is
+skipped: the state `x`'s initial condition is free unless it is also
+constrained by an algebraic equation. Used by splitInitialValues to decide
+which non-fixed starts are safe to keep as hard u0 (uncoupled states) vs must
+be relaxed to guesses (algebraically coupled states).
+"""
 function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
   local out = OrderedSet{String}()
   local eqs = equations(sys)
@@ -1759,13 +1744,15 @@ end
    the left-hand side of each, and x for every derivative D(x) in them. The
    arguments of other right-hand sides (e.g. positions passed to a branch
    selection function) are only read. =#
-#= The left sides of the initialization equations that fix a value (a literal
-   or parameter right side). A signal-valued one (its rhs references a
-   time-dependent variable, unknown or observed) determines its lhs through
-   the init solve's residual rows; marking the lhs fixed would hold it at a
-   stale numeric guess that fights the very equation it encodes. Parameters
-   print without the (t) suffix and stay pinnable; occursin also catches array
-   elements and derivative forms whose printed form does not END with it. =#
+"""
+The left sides of the initialization equations that fix a value (a literal
+or parameter right side). A signal-valued one (its rhs references a
+time-dependent variable, unknown or observed) determines its lhs through
+the init solve's residual rows; marking the lhs fixed would hold it at a
+stale numeric guess that fights the very equation it encodes. Parameters
+print without the (t) suffix and stay pinnable; occursin also catches array
+elements and derivative forms whose printed form does not END with it.
+"""
 function _fixedTrueLhsStrs(initEqs)::OrderedSet{String}
   local out = OrderedSet{String}()
   for eq in initEqs
@@ -1776,9 +1763,11 @@ function _fixedTrueLhsStrs(initEqs)::OrderedSet{String}
   return out
 end
 
-#= With `reads`, the variables a right side reads too: an initialization
-   equation determines them as much as its left side (`der(v) = x - 1` fixes
-   x; pinned at its start, the init solve moved the fixed v instead). =#
+"""
+With `reads`, the variables a right side reads too: an initialization
+equation determines them as much as its left side (`der(v) = x - 1` fixes
+x; pinned at its start, the init solve moved the fixed v instead).
+"""
 function _initializationVarStrs(initEqs; reads::Bool = false)::OrderedSet{String}
   local out = OrderedSet{String}()
   local visit
@@ -2279,15 +2268,17 @@ function injectObservedEquations(sys, observedEqs::Vector)
   return updated
 end
 
-#= StateSelect.prefer / avoid lower to soft (|priority| <= 2) VariableStatePriority
-   hints. They are advisory; StateSelect.always / never (|priority| = 10) are hard.
-   When a soft hint forces MTK index reduction into a structurally singular reduced
-   system, neutralizing it to the default (0) lets MTK pick a feasible state set.
-   Returns the count of neutralized unknowns and a freshly-constructed System that
-   carries the neutralized unknowns. The state priority that MTK honours is read
-   from the unknowns vector passed to the constructor, so the system must be rebuilt
-   through `System(...)` (mutating the field via `@set`/`substitute` is a no-op:
-   `setmetadata` leaves variables `isequal`, so MTK keeps the original priority). =#
+"""
+StateSelect.prefer / avoid lower to soft (|priority| <= 2) VariableStatePriority
+hints. They are advisory; StateSelect.always / never (|priority| = 10) are hard.
+When a soft hint forces MTK index reduction into a structurally singular reduced
+system, neutralizing it to the default (0) lets MTK pick a feasible state set.
+Returns the count of neutralized unknowns and a freshly-constructed System that
+carries the neutralized unknowns. The state priority that MTK honours is read
+from the unknowns vector passed to the constructor, so the system must be rebuilt
+through `System(...)` (mutating the field via `@set`/`substitute` is a no-op:
+`setmetadata` leaves variables `isequal`, so MTK keeps the original priority).
+"""
 function neutralizeSoftStatePriority(sys::ModelingToolkit.AbstractSystem)
   local n = 0
   local newUnknowns = map(ModelingToolkit.get_unknowns(sys)) do u
@@ -2361,10 +2352,12 @@ function _demoteWideNumericsInEquations(eqs)
   return (newEqs, changed)
 end
 
-#= Mark time as possibly zero (MTK's maybe_zeros): tearing then solves no
-   variable through a coefficient with time or sin(time) as a factor.
-   DOCCMinimal's M9 (v = (cos(time), sin(time)), v*conj(i) = 1): sin(t)*i_re =
-   cos(t)*i_im was solved as i_re = cos(t)*i_im/sin(t), 0/0 at t = 0. =#
+"""
+Mark time as possibly zero (MTK's maybe_zeros): tearing then solves no
+variable through a coefficient with time or sin(time) as a factor.
+DOCCMinimal's M9 (v = (cos(time), sin(time)), v*conj(i) = 1): sin(t)*i_re =
+cos(t)*i_im was solved as i_re = cos(t)*i_im/sin(t), 0/0 at t = 0.
+"""
 function _timeMayBeZero(sys::ModelingToolkit.AbstractSystem)
   local iv = ModelingToolkit.get_iv(sys)
   iv === nothing && return sys
@@ -2502,11 +2495,11 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   #= the system the accepted reduction came from: the relaxed one after a retry below =#
   local _simplifiedFrom = sys
   if OMBackend.BACKEND_LOGGING[]
-    local _ss_timed = @timed ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
+    local _ss_timed = @timed ModelingToolkit.mtkcompile(sys; simplify = simplify, split = useSplit)
     sys = _ss_timed.value
     @debug "[MTK GEN: simplify] structural_simplify took $(_ss_timed.time)s, $(round(_ss_timed.bytes / 1e9, digits=2)) GiB"
   else
-    sys = ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
+    sys = ModelingToolkit.mtkcompile(sys; simplify = simplify, split = useSplit)
   end
   #= A structurally singular reduction (equations != unknowns) can be caused by a
      soft StateSelect hint conflicting with a constraint MTK index-reduces. Retry
@@ -2515,7 +2508,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
     local (nNeutralized, relaxedSys) = neutralizeSoftStatePriority(_preSimplifySys)
     if nNeutralized > 0
       local retried = try
-        ModelingToolkit.structural_simplify(relaxedSys; simplify = simplify, split = useSplit)
+        ModelingToolkit.mtkcompile(relaxedSys; simplify = simplify, split = useSplit)
       catch e
         @warn "[MTK GEN: simplify] retry without soft state-priority hints threw" exception = (e, catch_backtrace())
         nothing
@@ -2539,7 +2532,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
     local marked = _withIrreducible(_simplifiedFrom, readers)
     #= a refinement: when MTK cannot reduce the marked system, the first reduction stays =#
     local again = try
-      ModelingToolkit.structural_simplify(marked; simplify = simplify, split = useSplit)
+      ModelingToolkit.mtkcompile(marked; simplify = simplify, split = useSplit)
     catch e
       OMBackend._fallback(e, :structural_simplify_ifConditionReaders; expect = Exception, impact = :result)
       nothing
@@ -2739,9 +2732,11 @@ function getStatesAsSymbols(daeFunc::ModelingToolkit.SciMLBase.DAEFunction)
   map(x->x.f.name, states)
 end
 
-#= The names the legacy callbacks index the state vector by
-   (`lookuptableStates[Symbol("name")]`, or `[:name]` for a pre() read) in
-   generated code `ex`. =#
+"""
+The names the legacy callbacks index the state vector by
+(`lookuptableStates[Symbol("name")]`, or `[:name]` for a pre() read) in
+generated code `ex`.
+"""
 function namedStateLookups(ex)::Vector{String}
   local names = OrderedSet{String}()
   local walk

@@ -58,7 +58,7 @@ import Symbolics
 """
     MODELICA_BUILTIN_FUNCTIONS
 
-Maps Modelica built-in function names (as they appear in DAE.CALL paths)
+Maps Modelica built-in function names (as SimCode calls name them)
 to qualified Julia function references in OMBackend.CodeGeneration scope.
 
 The code generator looks up function names here before falling through
@@ -222,12 +222,16 @@ modelica_integer(x::Symbolics.Num) =
 modelica_integer(x::Number) = floor(Int, x)
 modelica_integer(x) = floor(x)
 
-#= Modelica `Integer(enum_value)` returns the 1-based index of an enum literal.
-   Our codegen lowers enum CREFs to integer indices and ENUM_LITERAL to its
-   `index` field, so this is the identity at the Julia level. =#
+"""
+Modelica `Integer(enum_value)` returns the 1-based index of an enum literal.
+Our codegen lowers enum CREFs to integer indices and ENUM_LITERAL to its
+`index` field, so this is the identity at the Julia level.
+"""
 modelica_Integer(x) = x
-#= Truncated toward zero (MLS 3.7.1: div(-7, 2) = -3), as Base.div; a symbolic
-   quotient through sign and floor (it was floor: -4). =#
+"""
+Truncated toward zero (MLS 3.7.1: div(-7, 2) = -3), as Base.div; a symbolic
+quotient through sign and floor (it was floor: -4).
+"""
 modelica_div(x, y) = div(x, y)
 modelica_div(x::Symbolics.Num, y) = _truncSymbolic(x / y)
 modelica_div(x, y::Symbolics.Num) = _truncSymbolic(x / y)
@@ -374,11 +378,15 @@ Julia: LinearAlgebra.cross(x, y).
 """
 modelica_cross(x, y) = LinearAlgebra.cross(collect(x), collect(y))
 
-#= Euclidean norm mirroring MSL Modelica.Math.Vectors.length(v) = sqrt(v*v). =#
+"""
+Euclidean norm mirroring MSL Modelica.Math.Vectors.length(v) = sqrt(v*v).
+"""
 modelica_vectors_length(v::AbstractVector) = sqrt(sum(x -> x * x, v))
 modelica_vectors_length(v::Number) = abs(v)
 
-#= MSL Modelica.Math.isEqual(s1, s2, eps=0) = abs(s1-s2) <= eps. =#
+"""
+MSL Modelica.Math.isEqual(s1, s2, eps=0) = abs(s1-s2) <= eps.
+"""
 modelica_math_isEqual(s1, s2, eps = 0.0) = abs(s1 - s2) <= eps
 
 """
@@ -428,7 +436,9 @@ end
 modelica_sum(a) = sum(a)
 modelica_product(a) = prod(a)
 
-#= min/max: Modelica overloads these for both scalars and arrays =#
+"""
+min/max: Modelica overloads these for both scalars and arrays
+"""
 modelica_min(a) = minimum(a)
 modelica_min(a, b) = min(a, b)
 modelica_max(a) = maximum(a)
@@ -563,7 +573,9 @@ modelica_String(x::Real, significantDigits::Integer, minimumLength::Integer, lef
   _cFormat(leftJustified ? "%-*.*g" : "%*.*g", Float64(x); width = minimumLength, precision = significantDigits)
 modelica_String(x::Integer, minimumLength::Integer, leftJustified::Bool) =
   modelica_String(x isa Bool ? (x ? "true" : "false") : string(x), minimumLength, leftJustified)
-#= An enumeration literal's name. =#
+"""
+An enumeration literal's name.
+"""
 modelica_String(x::AbstractString, minimumLength::Integer, leftJustified::Bool) =
   leftJustified ? rpad(x, minimumLength) : lpad(x, minimumLength)
 function modelica_String(x::Real, format::AbstractString)
@@ -572,62 +584,48 @@ function modelica_String(x::Real, format::AbstractString)
   return _cFormat("%" * format, Float64(x))
 end
 
-#= C's printf of one double, after the width and precision of a `*.*` format,
-   through Julia's Printf (the same conversions, as C): Windows exports no
-   snprintf symbol (the Universal CRT defines it inline), and the ccall failed
-   there ("could not load symbol", 2026-10-03). =#
+"""
+C's printf of one double, after the width and precision of a `*.*` format,
+through Julia's Printf (the same conversions, as C): Windows exports no
+snprintf symbol (the Universal CRT defines it inline), and the ccall failed
+there ("could not load symbol", 2026-10-03).
+"""
 function _cFormat(fmt::String, x::Float64; width::Union{Integer, Nothing} = nothing, precision::Integer = 0)
   width === nothing || (fmt = replace(fmt, "*.*" => string(width, ".", precision)))
   return Printf.format(Printf.Format(fmt), x)
 end
 
-#= A call of Modelica's String with the arguments the frontend fills in, each
-   lowered by `lower`: (r, significantDigits, minimumLength, leftJustified),
-   (x, minimumLength, leftJustified) of an Integer, Boolean or enumeration
-   value, or (r, format). Where the integrator holds the values they are
-   Float64s: Integer arguments are rounded, Boolean ones compared with 0, and
-   an enumeration value is its literal's name. =#
-function modelicaStringCall(args::AbstractVector, lower)::Expr
+"""
+A call of Modelica's String with the arguments the frontend fills in, each
+lowered by `lower`: (r, significantDigits, minimumLength, leftJustified),
+(x, minimumLength, leftJustified) of an Integer, Boolean or enumeration
+value, or (r, format). Where the integrator holds the values they are
+Float64s: Integer arguments are rounded, Boolean ones compared with 0, and
+an enumeration value is its literal's name.
+"""
+function modelicaStringCall(args::Vector{SimCode.Exp}, lower)::Expr
   local S = :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_String)
   local int = e -> :(round(Int, $(lower(e))))
   local bool = e -> :($(lower(e)) != 0)
   local n = length(args)
   n == 4 && return Expr(:call, S, lower(args[1]), int(args[2]), int(args[3]), bool(args[4]))
   n == 2 && return Expr(:call, S, lower(args[1]), lower(args[2]))
-  n == 3 || CodeGeneration.unsupported("String with $(n) arguments", join(string.(args), ", "))
+  n == 3 || CodeGeneration.unsupported("String with $(n) arguments", args)
   local x = args[1]
-  local ty = _daeValueType(x)
-  local value = if x isa DAE.ENUM_LITERAL
-    _lastIdent(x.name)
-  elseif ty isa DAE.T_ENUMERATION && !isempty(ty.names)
-    :($(Tuple(collect(String, ty.names)))[round(Int, $(lower(x)))])
-  elseif ty isa DAE.T_BOOL
+  local ty = SimCode.typeOf(x)
+  local value = if x isa SimCode.ENUM_LITERAL
+    String(last(split(String(x.name), '.')))
+  elseif ty isa SimCode.TYPE_ENUM && !isempty(ty.names)
+    :($(ty.names)[round(Int, $(lower(x)))])
+  elseif ty isa SimCode.TYPE_BOOL
     bool(x)
-  elseif ty isa DAE.T_INTEGER
+  elseif ty isa SimCode.TYPE_INTEGER
     int(x)
   else
-    CodeGeneration.unsupported("String of a value whose type the expression does not give", string(x))
+    CodeGeneration.unsupported("String of a value whose type the expression does not give", x)
   end
   return Expr(:call, S, value, int(args[2]), bool(args[3]))
 end
-
-#= The type of a DAE expression's value, where the expression carries it. =#
-Base.@nospecializeinfer function _daeValueType(@nospecialize(e))
-  @match e begin
-    DAE.ICONST(__) => DAE.T_INTEGER_DEFAULT
-    DAE.RCONST(__) => DAE.T_REAL_DEFAULT
-    DAE.BCONST(__) || DAE.RELATION(__) || DAE.LBINARY(__) || DAE.LUNARY(__) => DAE.T_BOOL_DEFAULT
-    DAE.CREF(_, ty) => ty
-    DAE.CALL(attr = attr) => attr.ty
-    DAE.CAST(ty, _) => ty
-    DAE.BINARY(_, op, _) => hasproperty(op, :ty) ? op.ty : nothing
-    DAE.UNARY(op, _) => hasproperty(op, :ty) ? op.ty : nothing
-    DAE.IFEXP(_, a, _) => _daeValueType(a)
-    _ => nothing
-  end
-end
-
-_lastIdent(p::Absyn.Path)::String = p isa Absyn.IDENT ? p.name : _lastIdent(p.path)
 
 """
     modelica_homotopy(actual, simplified)
@@ -637,9 +635,11 @@ We return the actual expression (lambda=1 case).
 """
 modelica_homotopy(actual, simplified) = actual
 
-#= In the equations, with the homotopy parameter λ: the actual expression at
-   λ = 1 (the simplified one is not used there, and may be anything), the
-   blend λ actual + (1 - λ) simplified below it. =#
+"""
+In the equations, with the homotopy parameter λ: the actual expression at
+λ = 1 (the simplified one is not used there, and may be anything), the
+blend λ actual + (1 - λ) simplified below it.
+"""
 modelica_homotopy(actual, simplified, λ) = ifelse(λ >= 1, actual, λ * actual + (1 - λ) * simplified)
 
 """

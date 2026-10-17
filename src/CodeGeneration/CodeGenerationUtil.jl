@@ -41,34 +41,21 @@ module CodeGenerationUtil
 import DataStructures
 using DataStructures: OrderedSet
 import MacroTools
-using MetaModelica
-using MetaModelica: Cons
-using Setfield
-using DocStringExtensions
 using ModelingToolkit
 using LinearAlgebra
 
-using ...FrontendUtil
-import ...FrontendUtil.Util
-using ...Backend
-import ...Backend.BDAE
-using ...SimulationCode
-
+import ...SimCode
 import ...OMBackend
 import ..AlgorithmicCodeGeneration
 import ...@BACKEND_LOGGING
 import ...COMPONENT_SEPARATOR
 
-import Absyn
-import DAE
-import MetaGraphs
-import OMFrontend
-import OMParser
 import Symbolics
 import Symbolics.RuntimeGeneratedFunctions
 import SymbolicUtils
 import OMRuntimeExternalC
 
+const SC = SimCode
 
 """
 Return string containing the OSMC copyright stuff.
@@ -109,292 +96,151 @@ function copyrightString()
 end
 
 
+#= ==================================================================================== =#
+#= Zero-crossing functions                                                              =#
+#= ==================================================================================== =#
+
+realBinary(a::SC.Exp, op::SC.OpKind, b::SC.Exp)::SC.Exp = SC.BINARY(a, op, b)
+realCall(name::Symbol, args::SC.Exp...)::SC.Exp = SC.CALL(name, SC.Exp[args...], SC.TYPE_REAL(), SC.CALL_BUILTIN)
+
 """
-johti17
-    Transform a condition into a zero crossing function.
-    For instance y < 10 -> y - 10
-TODO:
-    Assumes a Real-Expression.
-    Also assume that relation expressions are written as <= That is we go from positive
-    to negative..
-    Fix this.
+integer(X) is a step (often cast to Real); a continuous zero-crossing on it never triggers,
+so `when integer(X) <> Y` froze (Modelica.Blocks.Sources.Pulse): the argument X of an
+integer() call (under a cast), else nothing.
 """
-#= integer(X) is a step (often CAST to real); a continuous zero-crossing on it never
-   triggers, so `when integer(X) ⋛ Y` freezes (e.g. Modelica.Blocks.Sources.Pulse).
-   Unwrap an optional CAST and return the integer() argument, else nothing. =#
-function _zcIntArg(@nospecialize(e::DAE.Exp))
-  local inner = @match e begin
-    DAE.CAST(exp = c) => c
-    _ => e
-  end
-  @match inner begin
-    DAE.CALL(path = Absyn.IDENT("integer"), expLst = args) => listHead(args)
-    _ => nothing
-  end
+function _zcIntArg(e::SC.Exp)::Union{Nothing, SC.Exp}
+  local inner = e isa SC.CAST ? e.exp : e
+  return SC.isBuiltin(inner, :integer) && length(inner.args) == 1 ? inner.args[1] : nothing
 end
 
-#= Rewrite a relation with an integer() operand to a smooth zero-crossing on X:
-   floor(X) ⋛ Y ⟺ X ⋛ Y±1 for integer-valued Y. Returns the zero-crossing or nothing. =#
-function _zcRewriteIntegerRel(@nospecialize(cond::DAE.Exp))
-  @match cond begin
-    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
-      local x1 = _zcIntArg(e1)
-      local x2 = _zcIntArg(e2)
-      (x1 === nothing && x2 === nothing) && return nothing
-      local one = DAE.RCONST(1.0)
-      local S = DAE.SUB(DAE.T_REAL_DEFAULT)
-      local A = DAE.ADD(DAE.T_REAL_DEFAULT)
-      if x1 !== nothing
-        @match op begin
-          DAE.GREATER(__)   => DAE.BINARY(DAE.BINARY(e2, A, one), S, x1)
-          DAE.GREATEREQ(__) => DAE.BINARY(e2, S, x1)
-          DAE.LESS(__)      => DAE.BINARY(x1, S, e2)
-          DAE.LESSEQ(__)    => DAE.BINARY(x1, S, DAE.BINARY(e2, A, one))
-          _ => nothing
-        end
-      else
-        @match op begin
-          DAE.LESS(__)      => DAE.BINARY(DAE.BINARY(e1, A, one), S, x2)
-          DAE.LESSEQ(__)    => DAE.BINARY(e1, S, x2)
-          DAE.GREATER(__)   => DAE.BINARY(x2, S, e1)
-          DAE.GREATEREQ(__) => DAE.BINARY(x2, S, DAE.BINARY(e1, A, one))
-          _ => nothing
-        end
-      end
-    end
-    _ => nothing
+"""
+A relation with an integer() operand as a smooth zero-crossing on X: floor(X) >= Y is
+X >= Y for an integer-valued Y, floor(X) > Y is X >= Y + 1; `nothing` for another
+condition.
+"""
+function _zcRewriteIntegerRel(cond::SC.Exp)::Union{Nothing, SC.Exp}
+  cond isa SC.RELATION || return nothing
+  local (e1, op, e2) = (cond.exp1, cond.op, cond.exp2)
+  local (x1, x2) = (_zcIntArg(e1), _zcIntArg(e2))
+  (x1 === nothing && x2 === nothing) && return nothing
+  local one = SC.RCONST(1.0)
+  local S = (a, b) -> realBinary(a, SC.OP_SUB, b)
+  local A = (a, b) -> realBinary(a, SC.OP_ADD, b)
+  if x1 !== nothing
+    op === SC.OP_GREATER && return S(A(e2, one), x1)
+    op === SC.OP_GREATEREQ && return S(e2, x1)
+    op === SC.OP_LESS && return S(x1, e2)
+    op === SC.OP_LESSEQ && return S(x1, A(e2, one))
+  else
+    op === SC.OP_LESS && return S(A(e1, one), x2)
+    op === SC.OP_LESSEQ && return S(e1, x2)
+    op === SC.OP_GREATER && return S(x2, e1)
+    op === SC.OP_GREATEREQ && return S(x2, A(e1, one))
   end
+  return nothing
 end
 
-#= An operand of a logical operator in a zero-crossing condition: a relation (or a logical
-   expression of them) its zero-crossing function, a Boolean value (a parameter, a discrete)
-   1 - 2b, -1 where true. =#
-function _zeroCrossingOperand(@nospecialize(e::DAE.Exp))::DAE.Exp
-  (e isa DAE.RELATION || e isa DAE.LBINARY || e isa DAE.LUNARY ||
-   (e isa DAE.CALL && e.path isa Absyn.IDENT && e.path.name == "change")) && return transformToZeroCrossingCondition(e)
-  return DAE.BINARY(DAE.RCONST(1.0), DAE.SUB(DAE.T_REAL_DEFAULT),
-                    DAE.BINARY(DAE.RCONST(2.0), DAE.MUL(DAE.T_REAL_DEFAULT), e))
+"""
+An operand of a logical operator in a zero-crossing condition: a relation (or a logical
+expression of them) its zero-crossing function, a Boolean value (a parameter, a discrete)
+1 - 2b, -1 where true.
+"""
+function _zeroCrossingOperand(e::SC.Exp)::SC.Exp
+  (e isa Union{SC.RELATION, SC.LBINARY, SC.LUNARY} || SC.isBuiltin(e, :change)) && return transformToZeroCrossingCondition(e)
+  return realBinary(SC.RCONST(1.0), SC.OP_SUB, realBinary(SC.RCONST(2.0), SC.OP_MUL, e))
 end
 
-#= The larger (GREATER) or the smaller (LESS) of two zero-crossing functions: max() or min().
-   An if-expression on their relation held each operand twice, and a condition nesting and/or
-   grew exponentially (MSL Digital's registers: the build did not end). =#
-_zeroCrossingExtreme(f1::DAE.Exp, op::DAE.Operator, f2::DAE.Exp)::DAE.Exp =
-  DAE.CALL(Absyn.IDENT(op isa DAE.GREATER ? "max" : "min"), MetaModelica.list(f1, f2), DAE.callAttrBuiltinReal)
+"""
+    transformToZeroCrossingCondition(cond)
 
-function transformToZeroCrossingCondition(@nospecialize(conditonalExpression::DAE.Exp))::DAE.Exp
-  local _intRW = _zcRewriteIntegerRel(conditonalExpression)
-  _intRW !== nothing && return _intRW
-  #= Build a Real-valued zero-crossing function f such that the Modelica
-     condition becomes true exactly when f goes from positive to negative
-     (the SciML `affect!` direction). For `<` / `<=` we use `e1 - e2` so the
-     condition becomes true when e1 falls below e2. For `>` / `>=` we swap to
-     `e2 - e1` so the same affect! direction matches an upcrossing of e1
-     above e2. This lets the caller pass `affect_neg! = nothing` and avoid
-     double-firing when e1 oscillates around e2 (classic bouncing-ball Zeno
-     pattern). =#
-  res = @match conditonalExpression begin
-    DAE.RELATION(exp1 = e1, operator = DAE.LESS(__), exp2 = e2) => begin
-      DAE.BINARY(e1, DAE.SUB(DAE.T_REAL_DEFAULT), e2)
-    end
-    DAE.RELATION(exp1 = e1, operator = DAE.LESSEQ(__), exp2 = e2) => begin
-      DAE.BINARY(e1, DAE.SUB(DAE.T_REAL_DEFAULT), e2)
-    end
-    DAE.RELATION(exp1 = e1, operator = DAE.GREATER(__), exp2 = e2) => begin
-      DAE.BINARY(e2, DAE.SUB(DAE.T_REAL_DEFAULT), e1)
-    end
-    DAE.RELATION(exp1 = e1, operator = DAE.GREATEREQ(__), exp2 = e2) => begin
-      DAE.BINARY(e2, DAE.SUB(DAE.T_REAL_DEFAULT), e1)
-    end
-    #= `change(rel)` fires when the relation flips: its zero-crossing is the
-       relation's own zero-crossing function. Unwrap and recurse. =#
-    DAE.CALL(path = Absyn.IDENT("change"), expLst = args) => begin
-      transformToZeroCrossingCondition(listHead(args))
-    end
-    DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-      DAE.BINARY(e1, DAE.SUB(DAE.T_REAL_DEFAULT), e2)
-    end
-    #= Logical operators on the operands' zero-crossing functions (true where negative):
-       `not` negates, `and` is true where both are (their maximum), `or` where either is
-       (their minimum). `a - b` of the operands themselves did not change sign: Buildings'
-       weather data readers' `canRepeatWeatherFile and modTimAux > pre(tNext)` was
-       `canRepeat - (modTimAux > tNext)`, 1 then 0, and the file's time never wrapped. =#
-    DAE.LUNARY(operator = DAE.NOT(__), exp = e1) => begin
-      DAE.UNARY(DAE.UMINUS(DAE.T_REAL_DEFAULT), _zeroCrossingOperand(e1))
-    end
-    DAE.LBINARY(exp1 = e1, operator = DAE.AND(__), exp2 = e2) => begin
-      _zeroCrossingExtreme(_zeroCrossingOperand(e1), DAE.GREATER(DAE.T_REAL_DEFAULT), _zeroCrossingOperand(e2))
-    end
-    DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) => begin
-      _zeroCrossingExtreme(_zeroCrossingOperand(e1), DAE.LESS(DAE.T_REAL_DEFAULT), _zeroCrossingOperand(e2))
-    end
-    DAE.LUNARY(operator = op, exp = e1)  => begin
-      DAE.UNARY(DAE.SUB(DAE.T_REAL_DEFAULT), e1)
-    end
-    DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-      DAE.BINARY(e1, DAE.SUB(DAE.T_REAL_DEFAULT), e2)
-    end
-    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
-      DAE.BINARY(e1, DAE.SUB(DAE.T_REAL_DEFAULT), e2)
-    end
-    _ => begin
-      conditonalExpression
-    end
+A zero-crossing function `f` of a condition, true where `f` goes from positive to negative
+(the direction of SciML's `affect!`): `e1 - e2` of `<` and `<=` (true when e1 falls below e2),
+`e2 - e1` of `>` and `>=` (an upcrossing of e1 above e2), so that the caller passes
+`affect_neg! = nothing` and a value oscillating around the other does not fire twice (the
+bouncing ball's Zeno pattern). A relation with integer() operands on its argument; `change(r)`
+the relation's; `not` negated, `and` the maximum (true where both are), `or` the minimum (true
+where either is): `a - b` of the operands themselves did not change sign (Buildings' weather
+data readers' `canRepeatWeatherFile and modTimAux > pre(tNext)`). The larger or smaller of two
+by max() or min(): an if-expression held each operand twice, and a nesting grew exponentially
+(MSL Digital's registers).
+"""
+function transformToZeroCrossingCondition(cond::SC.Exp)::SC.Exp
+  local rewritten = _zcRewriteIntegerRel(cond)
+  rewritten === nothing || return rewritten
+  if cond isa SC.RELATION
+    cond.op in (SC.OP_GREATER, SC.OP_GREATEREQ) && return realBinary(cond.exp2, SC.OP_SUB, cond.exp1)
+    return realBinary(cond.exp1, SC.OP_SUB, cond.exp2)
+  elseif SC.isBuiltin(cond, :change)
+    return transformToZeroCrossingCondition(first(cond.args))
+  elseif cond isa SC.BINARY
+    return realBinary(cond.exp1, SC.OP_SUB, cond.exp2)
+  elseif cond isa SC.LUNARY && cond.op === SC.OP_NOT
+    return SC.UNARY(SC.OP_UMINUS, _zeroCrossingOperand(cond.exp))
+  elseif cond isa SC.LBINARY && cond.op === SC.OP_AND
+    return realCall(:max, _zeroCrossingOperand(cond.exp1), _zeroCrossingOperand(cond.exp2))
+  elseif cond isa SC.LBINARY && cond.op === SC.OP_OR
+    return realCall(:min, _zeroCrossingOperand(cond.exp1), _zeroCrossingOperand(cond.exp2))
   end
-  return res
+  return cond
 end
 
+#= ==================================================================================== =#
+#= Operators                                                                            =#
+#= ==================================================================================== =#
 
+"""
+    opKindToJuliaOperator(k)
 
-function DAE_OP_toJuliaOperator(@nospecialize(op::DAE.Operator))
-    return @match op begin
-      DAE.ADD() => :+
-      DAE.SUB() => :-
-      DAE.MUL() => :*
-      DAE.DIV() => :/
-      DAE.POW() => :^
-      DAE.UMINUS() =>  :-
-      DAE.UMINUS_ARR() => :-
-      DAE.ADD_ARR() => :+
-      DAE.SUB_ARR() => :-
-      #= Element-wise, broadcast (the same on scalars): `*` and `/` were a matrix
-         product and a right division on matrices (function bodies), and an
-         array with a scalar or a scalar with an array had no method. =#
-      DAE.MUL_ARR() => Symbol(".*")
-      DAE.DIV_ARR() => Symbol("./")
-      DAE.MUL_ARRAY_SCALAR() => :*
-      DAE.ADD_ARRAY_SCALAR() => Symbol(".+")
-      DAE.SUB_SCALAR_ARRAY() => Symbol(".-")
-      #= Julia's `*` has no vector-vector method; also right for scalars. =#
-      DAE.MUL_SCALAR_PRODUCT() => :(OMBackend.CodeGeneration.vectorDot)
-      DAE.MUL_MATRIX_PRODUCT() => :*
-      DAE.DIV_ARRAY_SCALAR() => :/
-      DAE.DIV_SCALAR_ARRAY() => Symbol("./")
-      DAE.POW_ARRAY_SCALAR() => Symbol(".^")
-      DAE.POW_SCALAR_ARRAY() => Symbol(".^")
-      DAE.POW_ARR() => :^
-      DAE.POW_ARR2() => Symbol(".^")
-      DAE.AND() => :(&)
-      DAE.OR() => :(||)
-      DAE.NOT() => :(!)
-      DAE.LESS() => :(<)
-      DAE.LESSEQ() => :(<=)
-      DAE.GREATER() => :(>)
-      DAE.GREATEREQ() => :(>=)
-      DAE.EQUAL() => :(==)
-      DAE.NEQUAL() => :(!=)
-      DAE.USERDEFINED() => OMBackend.unsupported("operator", op)
-      _ => OMBackend.unsupported("operator", op)
-    end
+The Julia operator of a SimCode operator: element-wise ones broadcast (`.*`, `./`, `.^`; the
+same on scalars), a scalar with an array `.+`, `.-`, `./`, `.^` and `*`, `/`; the scalar product
+`vectorDot` (Julia's `*` has no vector-vector method), the matrix products and the matrix power
+`*`, `^`; `and` `&`, `or` `||`.
+"""
+function opKindToJuliaOperator(k::SC.OpKind)::Union{Symbol, Expr}
+  k in (SC.OP_ADD, SC.OP_ADD_EW) && return :+
+  k in (SC.OP_SUB, SC.OP_SUB_EW, SC.OP_UMINUS) && return :-
+  k in (SC.OP_MUL, SC.OP_MUL_SCALAR_ARRAY, SC.OP_MUL_ARRAY_SCALAR, SC.OP_MATRIX_PRODUCT,
+        SC.OP_MUL_VECTOR_MATRIX, SC.OP_MUL_MATRIX_VECTOR) && return :*
+  k in (SC.OP_DIV, SC.OP_DIV_ARRAY_SCALAR) && return :/
+  k in (SC.OP_POW, SC.OP_POW_MATRIX) && return :^
+  k === SC.OP_MUL_EW && return Symbol(".*")
+  k in (SC.OP_DIV_EW, SC.OP_DIV_SCALAR_ARRAY) && return Symbol("./")
+  k in (SC.OP_POW_EW, SC.OP_POW_SCALAR_ARRAY, SC.OP_POW_ARRAY_SCALAR) && return Symbol(".^")
+  k in (SC.OP_ADD_SCALAR_ARRAY, SC.OP_ADD_ARRAY_SCALAR) && return Symbol(".+")
+  k in (SC.OP_SUB_SCALAR_ARRAY, SC.OP_SUB_ARRAY_SCALAR) && return Symbol(".-")
+  k === SC.OP_SCALAR_PRODUCT && return :(OMBackend.CodeGeneration.vectorDot)
+  k === SC.OP_AND && return :(&)
+  k === SC.OP_OR && return :(||)
+  k === SC.OP_NOT && return :(!)
+  k === SC.OP_LESS && return :(<)
+  k === SC.OP_LESSEQ && return :(<=)
+  k === SC.OP_GREATER && return :(>)
+  k === SC.OP_GREATEREQ && return :(>=)
+  k === SC.OP_EQUAL && return :(==)
+  k === SC.OP_NEQUAL && return :(!=)
+  OMBackend.unsupported("operator", k)
 end
 
-#= Direct SimCode OpKind -> Julia operator Symbol, equivalent to
-   DAE_OP_toJuliaOperator(toDAEOperator(k)) but without the throwaway
-   DAE.Operator allocation per operator node in codegen. =#
-function opKindToJuliaOperator(k::SimulationCode.OpKind)::Union{Symbol, Expr}
-  if k === SimulationCode.OP_ADD;          :+
-  elseif k === SimulationCode.OP_SUB;      :-
-  elseif k === SimulationCode.OP_MUL;      :*
-  elseif k === SimulationCode.OP_DIV;      :/
-  elseif k === SimulationCode.OP_POW;      :^
-  elseif k === SimulationCode.OP_UMINUS;   :-
-  elseif k === SimulationCode.OP_AND;      :(&)
-  elseif k === SimulationCode.OP_OR;       :(||)
-  elseif k === SimulationCode.OP_NOT;      :(!)
-  elseif k === SimulationCode.OP_LESS;     :(<)
-  elseif k === SimulationCode.OP_LESSEQ;   :(<=)
-  elseif k === SimulationCode.OP_GREATER;  :(>)
-  elseif k === SimulationCode.OP_GREATEREQ; :(>=)
-  elseif k === SimulationCode.OP_EQUAL;    :(==)
-  elseif k === SimulationCode.OP_NEQUAL;   :(!=)
-  elseif k === SimulationCode.OP_DOT;      :(OMBackend.CodeGeneration.vectorDot)
-  else error("opKindToJuliaOperator: unhandled OpKind $k")
+"""
+    builtinCallToJulia(e, lower)
+
+A call outside the MTK equations (callbacks, the DifferentialEquations code generator) with
+its arguments lowered by `lower`: `Integer(e)` the identity (an enumeration is its index
+already), `String` from the arguments' types, a built-in by its implementation
+(MODELICA_BUILTIN_FUNCTIONS: `sample()` in a when body has no other binding in the model's
+module), another function by its name.
+"""
+function builtinCallToJulia(e::SC.CALL, lower::F)::Expr where {F}
+  local name = String(e.name)
+  (e.kind === SC.CALL_BUILTIN && e.name === :Integer) && return lower(first(e.args))
+  (e.kind === SC.CALL_BUILTIN && e.name === :String) && return AlgorithmicCodeGeneration.modelicaStringCall(e.args, lower)
+  local args = Any[lower(x) for x in e.args]
+  local builtinSym = get(AlgorithmicCodeGeneration.MODELICA_BUILTIN_FUNCTIONS, name, nothing)
+  if builtinSym !== nothing
+    local qualified = Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(:AlgorithmicCodeGeneration)), QuoteNode(builtinSym))
+    return quote $(qualified)($(args...)) end
   end
-end
-
-
-"
-  TODO: Keeping it simple for now, we assume we only have one argument in the call
-  We handle derivatives separately
-"
-function DAECallExpressionToJuliaCallExpression(pathStr::String, expLst::List, simCode, ht; varPrefix=varPrefix)::Expr
-  @match pathStr begin
-    "der" => begin
-      local arg = listHead(expLst)
-      @match arg begin
-        DAE.ARRAY(_, _, array) => begin
-          local elemExprs = map(array) do e
-            DAECallExpressionToJuliaCallExpression("der", Cons(e, MetaModelica.nil), simCode, ht; varPrefix=varPrefix)
-          end
-          Expr(:vect, elemExprs...)
-        end
-        #= der(literal) ≡ 0. See companion arm in DAECallExpressionToMTKCallExpression. =#
-        DAE.RCONST(_) => quote 0.0 end
-        DAE.ICONST(_) => quote 0 end
-        DAE.BCONST(_) => quote false end
-        _ => begin
-          varName = SimulationCode.DAE_identifierToString(arg)
-          (index, _) = ht[varName]
-          quote
-            dx[$(index)] #= der($varName) =#
-          end
-        end
-      end
-    end
-    "pre" => begin
-      local arg = listHead(expLst)
-      @match arg begin
-        DAE.ARRAY(_, _, array) => begin
-          local elemExprs = map(array) do e
-            DAECallExpressionToJuliaCallExpression("pre", Cons(e, MetaModelica.nil), simCode, ht; varPrefix=varPrefix)
-          end
-          Expr(:vect, elemExprs...)
-        end
-        #= pre(literal) ≡ literal. =#
-        DAE.RCONST(r) => quote $r end
-        DAE.ICONST(i) => quote $i end
-        DAE.BCONST(b) => quote $b end
-        _ => begin
-          varName = SimulationCode.DAE_identifierToString(arg)
-          (index, _) = ht[varName]
-          indexForVar = ht[varName][1]
-          quote
-            (integrator.u[$(indexForVar)])
-          end
-        end
-      end
-    end
-    #= See sibling arm in DAECallExpressionToMTKCallExpression — Integer(enum)
-       collapses to identity since enums are already integer-indexed in codegen. =#
-    "Integer" => begin
-      OMBackend.CodeGeneration.expToJuliaExp(listHead(expLst), simCode, varPrefix=varPrefix)
-    end
-    #= Values read from the integrator are Float64s: String takes their types
-       from the expressions. =#
-    "String" => AlgorithmicCodeGeneration.modelicaStringCall(
-      collect(expLst), x -> OMBackend.CodeGeneration.expToJuliaExp(x, simCode, varPrefix=varPrefix))
-    _  =>  begin
-      argPart = tuple(map((x) -> OMBackend.CodeGeneration.expToJuliaExp(x, simCode, varPrefix=varPrefix), expLst)...)
-      #= Mirror DAECallExpressionToMTKCallExpression: route Modelica built-ins
-         (sample, noEvent, smooth, ...) to their qualified
-         OMBackend.CodeGeneration.AlgorithmicCodeGeneration stubs. Without
-         this, sample() inside the body of a when-statement or any non-MTK
-         code path emits a bare `sample(...)` Julia call which the per-model
-         module cannot resolve. =#
-      builtinSym = get(AlgorithmicCodeGeneration.MODELICA_BUILTIN_FUNCTIONS, pathStr, nothing)
-      if builtinSym !== nothing
-        qualifiedName = Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(:AlgorithmicCodeGeneration)), QuoteNode(builtinSym))
-        quote
-          $(qualifiedName)($(argPart...))
-        end
-      else
-        funcName = Symbol(pathStr)
-        quote
-          $(funcName)($(argPart...))
-        end
-      end
-    end
-  end
+  return quote $(e.name)($(args...)) end
 end
 
 """
@@ -411,16 +257,9 @@ function getActiveModel(simCode)
   return activeModelName
 end
 
-function _isSimCodeFunctionName(name::AbstractString, simCode)::Bool
-  local canonical = OMBackend.canonicalName(name)
-  for f in simCode.functions
-    if f.name == canonical
-      return true
-    end
-  end
-  return false
-end
-
+"Whether `name` names a function of the model."
+_isSimCodeFunctionName(name::AbstractString, simCode::SC.SIM_CODE)::Bool =
+  any(f -> f.name == OMBackend.canonicalName(name), simCode.functions)
 
 """
   Removes all comments from a given exp
@@ -429,11 +268,13 @@ function stripComments(ex::Expr)::Expr
   return Base.remove_linenums!(ex)
 end
 
-#= Iterative equivalent of `MacroTools.postwalk`. Visits each subexpression
-   bottom-up, replacing each node with the result of `f(rebuilt_node)`.
-   Used in place of the recursive walker for huge generated function-body
-   ASTs (e.g. wrappers for Modelica.Utilities.Strings.scanToken family),
-   where the recursive form blows past Julia's runtime stack guard. =#
+"""
+Iterative equivalent of `MacroTools.postwalk`. Visits each subexpression
+bottom-up, replacing each node with the result of `f(rebuilt_node)`.
+Used in place of the recursive walker for huge generated function-body
+ASTs (e.g. wrappers for Modelica.Utilities.Strings.scanToken family),
+where the recursive form blows past Julia's runtime stack guard.
+"""
 function _iterativePostwalk(f, root)
   isa(root, Expr) || return f(root)
   local todo = Any[(root, false)]
@@ -483,56 +324,25 @@ function stripBeginBlocks(e)::Expr
 end
 
 """
-Convert a MetaModelica list of DAE subscripts directly to Julia Expr form
-without going through string conversion + Meta.parse.
-Returns an integer for single constant subscripts, or a tuple Expr for multiple.
-"""
-#= Build an array indexing Expr from a symbol and subscript expression.
-   subscriptExpr is the return value of subscriptsToExpr:
-   single value (int/Expr) or Expr(:tuple, ...) for multi-dimensional. =#
-function makeRefExpr(sym, subscriptExpr)
-  if subscriptExpr isa Expr && subscriptExpr.head == :tuple
-    return Expr(:ref, sym, subscriptExpr.args...)
-  else
-    return Expr(:ref, sym, subscriptExpr)
-  end
-end
+    resolveAliasedCref(fullName, simCode)
 
-function isCycleInSCCs(sccs)
-  for sc in sccs
-    if length(sc) > 1
-      return true
-    end
-  end
-  return false
-end
-
+A reference to a variable alias elimination removed that survived in an expression (missed by
+the substitution): `(true, expr)` with its representative (negated for a negated alias),
+`(false, nothing)` for a name the alias map does not have.
 """
-    resolveAliasedCref(fullName, simCode, hashTable; varPrefix, varSuffix)
-
-Fallback for code generation when a variable was eliminated by alias elimination
-but a reference to it survived in the equation expressions (missed by substitution).
-Returns `(true, expr)` if the variable was found in `simCode.aliasMap`, or `(false, nothing)`.
-"""
-function resolveAliasedCref(fullName::String, simCode, hashTable; varPrefix="", varSuffix="")
+function resolveAliasedCref(fullName::String, simCode::SC.SIM_CODE)::Tuple{Bool, Union{Nothing, Expr}}
   for entry in simCode.aliasMap
-    if entry.eliminatedName == fullName
-      local repEntry = get(hashTable, entry.representativeName, nothing)
-      if repEntry !== nothing
-        local sym = Symbol(varPrefix, repEntry[2].name, varSuffix)
-        if entry.negated
-          return (true, :(-$(sym)))
-        else
-          return (true, quote $(sym) end)
-        end
-      end
-    end
+    entry.eliminatedName == fullName || continue
+    local repEntry = get(simCode.stringToSimVarHT, entry.representativeName, nothing)
+    repEntry === nothing && continue
+    local sym = Symbol(last(repEntry).name)
+    return (true, entry.negated ? :(-$(sym)) : quote $(sym) end)
   end
   return (false, nothing)
 end
 
 """
-  Helper used by the lowered DAE.RSUB(`re`) form. Falls back through:
+  Helper used by the lowered RSUB(`re`) form. Falls back through:
     Base.Complex — `.re`
     NamedTuple / structs with `:re` — `getproperty`
     Symbolics.Num wrapping a Complex term — `real(num)`
@@ -546,271 +356,121 @@ end
 @inline _recordFieldRe(x::Tuple) = x[1]
 @inline _recordFieldRe(x) = hasproperty(x, :re) ? getproperty(x, :re) : real(x)
 
-#= A record's field `name`, the `ix`th: by position in a tuple (a function returning a
-   record returns its fields in order: the MSL Media `setState_psX(...).T`), by name
-   otherwise (a record constructor's NamedTuple). =#
+"""
+A record's field `name`, the `ix`th: by position in a tuple (a function returning a
+record returns its fields in order: the MSL Media `setState_psX(...).T`), by name
+otherwise (a record constructor's NamedTuple).
+"""
 @inline _recordField(x::Tuple, name::Symbol, ix::Integer) = ix >= 1 ? x[ix] : getproperty(x, name)
 @inline _recordField(x, name::Symbol, ::Integer) = getproperty(x, name)
 
 """
-  Companion to `_recordFieldRe` for the imaginary part (DAE.RSUB(`im`)).
+  Companion to `_recordFieldRe` for the imaginary part (RSUB(`im`)).
   Same `Base.Complex` reason: avoid the module-scope shadow of `Complex`.
 """
 @inline _recordFieldIm(x::Base.Complex) = x.im
 @inline _recordFieldIm(x::Tuple) = x[2]
 @inline _recordFieldIm(x) = hasproperty(x, :im) ? getproperty(x, :im) : imag(x)
 
+"""
+  The value of a constant: a literal's, or an expression of constants and parameters evaluated
+  (operators and calls of constants: MSL Fluid's tanks' max(1.0, 1e-15); a negation, a
+  relation, an if-expression, a parameter: MSL Blocks' RSFlipFlop pre_u_start = not Qini).
+"""
+function evalConstant(c::SC.Exp, simCode::SC.SIM_CODE)
+  c isa Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST} && return c.value
+  c isa Union{SC.BINARY, SC.LBINARY, SC.UNARY, SC.CALL, SC.LUNARY, SC.RELATION, SC.IFEXP, SC.EXP_CREF} &&
+    return OMBackend.CodeGeneration.evalExpression(c, simCode)
+  OMBackend.unsupported("not a constant", c)
+end
+
+"The value of a literal."
+function evalConstant(c::SC.Exp)
+  c isa Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST} && return c.value
+  OMBackend.unsupported("not a constant", c)
+end
 
 """
-  Given the variable idx and simCode statically decide if this variable is
-  the LHS target of any when-equation `ASSIGN` / `REINIT` statement
-  (including elsewhen branches).
-
-  Such variables receive their state updates from discrete callbacks at
-  event time, so they should be routed into the discrete bucket rather than
-  the continuous residual set during MTK code generation. This prevents the
-  continuous integrator from synthesising a competing dynamic for a
-  variable that is only meaningful at event boundaries.
+  The value of a bound parameter's binding (evalConstant); UnsupportedLowering for another
+  variable or a binding that is no constant.
 """
-function involvedInEvent(idx, simCode)
-  local targetName = nothing
-  for (k, (i, sv)) in simCode.stringToSimVarHT
-    if i == idx
-      targetName = k
-      break
+function evalSimCodeParameter(v::SC.SIMVAR, simCode::SC.SIM_CODE)
+  (v.varKind isa SC.PARAMETER && v.varKind.bindExp !== nothing) ||
+    OMBackend.unsupported("a constant value of a variable other than a bound parameter", v.name)
+  return evalConstant(v.varKind.bindExp, simCode)
+end
+
+"""
+    _substituteBoundParameters(exp, simCode; skipNames, shouldEval, seen, keepTunable)
+
+`exp` with its parameters replaced by their bindings, themselves so substituted; `shouldEval`
+cleared where it reads a variable, a parameter without a binding (a free one an initial
+equation determines), a name the table does not have, a cyclic binding. With `keepTunable`, a
+tunable parameter (withTunableParameters) stays a reference, read at run time.
+"""
+function _substituteBoundParameters(exp::SC.Exp, simCode::SC.SIM_CODE;
+                                    skipNames::OrderedSet{String} = OrderedSet{String}(),
+                                    shouldEval::Base.RefValue{Bool} = Ref(true),
+                                    seen::OrderedSet{String} = OrderedSet{String}(),
+                                    keepTunable::Bool = false)::SC.Exp
+  local replace = e::SC.Exp -> begin
+    e isa SC.EXP_CREF || return e
+    local key = SC.crefName(e.cref)
+    key in skipNames && return e
+    if keepTunable && OMBackend.isTunableParameter(key)
+      shouldEval[] = false
+      return e
     end
-  end
-  targetName === nothing && return false
-
-  for weq in simCode.whenEquations
-    local wEqInner = weq.whenEquation
-    if _whenStmtLstTargets(wEqInner.whenStmtLst, targetName)
-      return true
+    local entry = get(simCode.stringToSimVarHT, key, nothing)
+    if entry === nothing || SC.isStateOrAlgebraic(last(entry))
+      shouldEval[] = false
+      return e
     end
-    #= elsewhenPart carries two storage shapes: BDAE wraps with
-       SOME(WHEN_EQUATION(WHEN_STMTS)), SimCode stores the bare WHEN_STMTS. =#
-    local ew = wEqInner.elsewhenPart
-    while ew !== nothing
-      local nested = ew isa SOME ? ew.data : ew
-      local inner = hasproperty(nested, :whenEquation) ? nested.whenEquation : nested
-      if _whenStmtLstTargets(inner.whenStmtLst, targetName)
-        return true
-      end
-      ew = inner.elsewhenPart
+    local k = last(entry).varKind
+    local bindExp = k isa Union{SC.PARAMETER, SC.ARRAY_PARAMETER} ? k.bindExp : nothing
+    if bindExp === nothing || key in seen
+      shouldEval[] = false
+      return e
     end
+    push!(seen, key)
+    local resolved = _substituteBoundParameters(bindExp, simCode; skipNames, shouldEval, seen, keepTunable)
+    delete!(seen, key)
+    return resolved
   end
-  return false
+  return SC.mapExp(replace, exp)
 end
 
 """
-  Walk a `List{BDAE.WhenOperator}` and return true if any `ASSIGN`'s
-  `left` cref-name or any `REINIT`'s `stateVar` cref-name matches
-  `targetName` (the simCode `stringToSimVarHT` key).
+    equationSides(eq) -> Tuple{Exp, Exp}
+
+The sides of an equation: an equation's and an array equation's, a residual's `(exp, 0.0)`.
 """
-function _whenStmtLstTargets(stmtLst, targetName::String)::Bool
-  for stmt in stmtLst
-    local lhsName = if stmt isa BDAE.ASSIGN || stmt isa SimulationCode.ASSIGN
-      SimulationCode.string(_asDAE(stmt.left))
-    elseif stmt isa BDAE.REINIT || stmt isa SimulationCode.REINIT
-      SimulationCode.string(stmt.stateVar)
-    else
-      ""
-    end
-    if lhsName == targetName
-      return true
-    end
-  end
-  return false
-end
+equationSides(eq::SC.EQUATION)::Tuple{SC.Exp, SC.Exp} = (eq.lhs, eq.rhs)
+equationSides(eq::SC.ARRAY_EQUATION)::Tuple{SC.Exp, SC.Exp} = (eq.left, eq.right)
+equationSides(eq::SC.RESIDUAL_EQUATION)::Tuple{SC.Exp, SC.Exp} = (eq.exp, SC.RCONST(0.0))
+equationSides(eq::SC.Equation) = error("equationSides: no (lhs, rhs) for $(typeof(eq))")
 
 """
-  This function evaluates a single DAE-constant:{Bool, Integer, Real, String}.
-  If the argument  to this function is not a constant it throws an error.
+The equations `equationSides` takes.
 """
-function evalDAEConstant(daeConstant::DAE.Exp, simCode)
-  @match daeConstant begin
-    DAE.BCONST(bool) => bool
-    DAE.ICONST(int) => int
-    DAE.RCONST(real) => real
-    DAE.SCONST(tmpStr) => tmpStr
-    #= Try to evaluate the expression: operators and calls of constants (MSL
-       Fluid's tanks: a parameter bound to max(1.0, 1e-15)), a negation, a relation, an
-       if-expression or a parameter (MSL Blocks' RSFlipFlop: pre_u_start = not Qini). =#
-    DAE.BINARY(__) || DAE.LBINARY(__) || DAE.UNARY(__) || DAE.CALL(__) ||
-      DAE.LUNARY(__) || DAE.RELATION(__) || DAE.IFEXP(__) || DAE.CREF(__) => begin
-      OMBackend.CodeGeneration.evalDAE_Expression(daeConstant, simCode)
-    end
-    _ => OMBackend.unsupported("not a constant", daeConstant)
-  end
-end
-
-function evalDAEConstant(daeConstant::DAE.Exp)
-  @match daeConstant begin
-    DAE.BCONST(bool) => bool
-    DAE.ICONST(int) => int
-    DAE.RCONST(real) => real
-    DAE.SCONST(tmpStr) => tmpStr
-    #= Try to evaluate the expression =#
-    _ => OMBackend.unsupported("not a constant", daeConstant)
-  end
-end
-
-#= SIM-native: literal fast-path returns the value without toDAEExp; computed
-   constants (BINARY/LBINARY) still route through the DAE constant evaluator. =#
-function evalDAEConstant(c::SimulationCode.Exp, simCode)
-  @match c begin
-    SimulationCode.BCONST(b) => b
-    SimulationCode.ICONST(i) => i
-    SimulationCode.RCONST(r) => r
-    SimulationCode.SCONST(s) => s
-    SimulationCode.BINARY(__) || SimulationCode.LBINARY(__) || SimulationCode.UNARY(__) || SimulationCode.CALL(__) ||
-      SimulationCode.LUNARY(__) || SimulationCode.RELATION(__) || SimulationCode.IFEXP(__) || SimulationCode.EXP_CREF(__) =>
-      OMBackend.CodeGeneration.evalDAE_Expression(SimulationCode.toDAEExp(c), simCode)
-    _ => OMBackend.unsupported("not a constant", SimulationCode.toDAEExp(c))
-  end
-end
-function evalDAEConstant(c::SimulationCode.Exp)
-  @match c begin
-    SimulationCode.BCONST(b) => b
-    SimulationCode.ICONST(i) => i
-    SimulationCode.RCONST(r) => r
-    SimulationCode.SCONST(s) => s
-    _ => OMBackend.unsupported("not a constant", SimulationCode.toDAEExp(c))
-  end
-end
-
-
-"""
-  Evaluates a simulation code parameter's binding (evalDAEConstant).
-  UnsupportedLowering when `v` is not a bound parameter or the binding not a constant.
-"""
-function evalSimCodeParameter(v::V, simCode) where V
-  return @match v.varKind begin
-    SimulationCode.PARAMETER(SOME(bindExp)) => evalDAEConstant(bindExp, simCode)
-    _ => OMBackend.unsupported("a constant value of a variable other than a bound parameter", v.name)
-  end
-end
-
-"""
- Evalutates the components in a DAE expression (Currently if the components are parameters)
- With `keepTunable`, a tunable parameter (withTunableParameters) stays a
- reference, read at run time, and the expression is not evaluated.
-"""
-function _substituteBoundParameters(exp, simCode;
-                                    skipNames::OrderedSet{String}=OrderedSet{String}(),
-                                    shouldEval::Base.RefValue{Bool}=Ref(true),
-                                    seen::OrderedSet{String}=OrderedSet{String}(),
-                                    keepTunable::Bool=false)
-  function replaceParameterVariable(exp, ht)
-    if Util.isCref(exp)
-      local key = string(exp)
-      if key in skipNames
-        return (exp, true, ht)
-      end
-      if keepTunable && OMBackend.isTunableParameter(key)
-        shouldEval[] = false
-        return (exp, true, ht)
-      end
-      local entry = get(simCode.stringToSimVarHT, key, nothing)
-      if entry === nothing
-        shouldEval[] = false
-        return (exp, true, ht)
-      end
-      local simVar = last(entry)
-      if SimulationCode.isStateOrAlgebraic(simVar)
-        shouldEval[] = false
-      else
-        local bindExp = @match simVar.varKind begin
-          SimulationCode.PARAMETER(SOME(be)) => SimulationCode.toDAEExp(be)
-          SimulationCode.ARRAY_PARAMETER(_, SOME(be)) => SimulationCode.toDAEExp(be)
-          _ => nothing
-        end
-        if bindExp !== nothing
-          if key in seen
-            shouldEval[] = false
-            return (exp, true, ht)
-          end
-          push!(seen, key)
-          local resolved = _substituteBoundParameters(bindExp, simCode;
-                                                      skipNames=skipNames,
-                                                      shouldEval=shouldEval,
-                                                      seen=seen,
-                                                      keepTunable=keepTunable)
-          delete!(seen, key)
-          return (resolved, true, ht)
-        else
-          #= Parameter without binding (fixed=false, determined by an initial
-             equation not solved yet). Leave the CREF in place and avoid eval. =#
-          shouldEval[] = false
-        end
-      end
-    end
-    (exp, true, ht)
-  end
-  return first(Util.traverseExpBottomUp(exp, replaceParameterVariable, 0))
-end
-
-"""
-    equationSides(eq) -> Tuple{DAE.Exp, DAE.Exp}
-
-Return (lhs, rhs) for any BDAE equation shape.
-
-- `BDAE.EQUATION`           has `.lhs` / `.rhs`
-- `BDAE.COMPLEX_EQUATION`   has `.left` / `.right`   (record-to-record equality)
-- `BDAE.ARRAY_EQUATION`     has `.left` / `.right`   (pre-scalarized array equality)
-- `BDAE.RESIDUAL_EQUATION`  has `.exp`, already in LHS−RHS=0 form → return `(eq.exp, RCONST(0.0))`
-
-Any other shape throws; the caller should have screened those out.
-"""
-function equationSides(eq)::Tuple{DAE.Exp, DAE.Exp}
-  if eq isa BDAE.EQUATION || eq isa SimulationCode.EQUATION
-    return (SimulationCode.toDAEExp(eq.lhs), SimulationCode.toDAEExp(eq.rhs))
-  elseif eq isa BDAE.COMPLEX_EQUATION
-    return (eq.left, eq.right)
-  elseif eq isa BDAE.ARRAY_EQUATION || eq isa SimulationCode.ARRAY_EQUATION
-    return (SimulationCode.toDAEExp(eq.left), SimulationCode.toDAEExp(eq.right))
-  elseif eq isa BDAE.RESIDUAL_EQUATION || eq isa SimulationCode.RESIDUAL_EQUATION
-    return (SimulationCode.toDAEExp(eq.exp), DAE.RCONST(0.0))
-  end
-  error("equationSides: no (lhs, rhs) for $(typeof(eq)); " *
-        "caller should filter to EQUATION / COMPLEX_EQUATION / ARRAY_EQUATION / RESIDUAL_EQUATION.")
-end
-
-#= The equations `equationSides` takes. =#
-hasEquationSides(eq)::Bool =
-  eq isa Union{BDAE.EQUATION, SimulationCode.EQUATION, BDAE.COMPLEX_EQUATION, BDAE.ARRAY_EQUATION,
-               SimulationCode.ARRAY_EQUATION, BDAE.RESIDUAL_EQUATION, SimulationCode.RESIDUAL_EQUATION}
+hasEquationSides(eq::SC.Equation)::Bool = eq isa Union{SC.EQUATION, SC.ARRAY_EQUATION, SC.RESIDUAL_EQUATION}
 
 """
     isParametricOnlyEquation(eq, simCode) -> Bool
 
-Check if an initial equation only involves parameters (no state/algebraic variables).
-Such equations determine parameter values and should not be treated as initial conditions.
+Whether an initial equation involves parameters only (no state, algebraic or discrete
+variable): it determines parameter values, it is no initial condition. An if-equation (CDL
+SunRiseSet, the hydronic networks) has no sides: false.
 """
-function isParametricOnlyEquation(eq, simCode::SimulationCode.SimCode)::Bool
-  #= an if-equation (INLINE_IF_EQUATION: CDL SunRiseSet, the hydronic networks) has no sides =#
+function isParametricOnlyEquation(eq::SC.Equation, simCode::SC.SIM_CODE)::Bool
   hasEquationSides(eq) || return false
-  ht = simCode.stringToSimVarHT
-  hasStateOrAlg = Ref(false)
-  function checker(exp, acc)
-    if Util.isCref(exp)
-      local key = string(exp)
-      local entry = get(ht, key, nothing)
-      if entry !== nothing
-        local sv = last(entry)
-        if SimulationCode.isStateOrAlgebraic(sv) || SimulationCode.isDiscrete(sv)
-          hasStateOrAlg[] = true
-        end
-      end
-    end
-    (exp, true, acc)
+  local ht = simCode.stringToSimVarHT
+  local names = OrderedSet{String}()
+  foreach(e -> SC.crefNames!(names, e), equationSides(eq))
+  return !any(names) do n
+    local entry = get(ht, n, nothing)
+    entry !== nothing && (SC.isStateOrAlgebraic(last(entry)) || SC.isDiscrete(last(entry)))
   end
-  lhs, rhs = equationSides(eq)
-  Util.traverseExpBottomUp(lhs, checker, 0)
-  if !hasStateOrAlg[]
-    Util.traverseExpBottomUp(rhs, checker, 0)
-  end
-  return !hasStateOrAlg[]
 end
 
 function _substituteExprValues(expr, valMap::Dict{Symbol, Float64})
@@ -872,18 +532,8 @@ function _substituteExprValues(expr, valMap::Dict{Symbol, Float64})
   return newExpr
 end
 
-function isIntOrBool(@nospecialize(exp::DAE.Exp))
-  @match exp begin
-    DAE.BCONST(__) => true
-    DAE.ICONST(__) => true
-    DAE.CREF(componentRef, DAE.T_INTEGER(__) || DAE.T_BOOL(__)) => true
-    _ => false
-  end
-end
-isIntOrBool(exp::SimulationCode.Exp)::Bool =
-  exp isa SimulationCode.ICONST || exp isa SimulationCode.BCONST ||
-  (exp isa SimulationCode.EXP_CREF &&
-   (exp.ty isa SimulationCode.TYPE_INTEGER || exp.ty isa SimulationCode.TYPE_BOOL))
+isIntOrBool(exp::SC.Exp)::Bool =
+  exp isa Union{SC.ICONST, SC.BCONST} || (exp isa SC.EXP_CREF && exp.ty isa Union{SC.TYPE_INTEGER, SC.TYPE_BOOL})
 
 """
 `writeEqsToFile(elems::Vector{Expr}, filename)`
@@ -913,40 +563,27 @@ function writeEqsToFile(elems::Vector{Expr}, filename)
 end
 
 """
-  Returns true if there is no discrete variables in the condition.
+  Whether a condition reads no discrete variable: `time` alone, or with a continuous variable
+  (a relation against `time` such as `time >= t_next` is a time event, a zero-crossing of
+  `time - rhs`, even with a discrete operand: an edge-triggered ContinuousCallback rather than a
+  level-triggered discrete callback that re-fires every step); a name the table does not have.
+  Parameters are constants and discretes change at events only: a condition of those (`(tLH >
+  0 or tHL > 0) and change(x)`) is an event-driven discrete callback.
 """
-function isContinuousCondition(cond::DAE.Exp, simCode)
-  local allCrefs = Util.getAllCrefs(cond)
-  local isContinuousCond = false
-  if isone(length(allCrefs)) && string(first(allCrefs)) == "time"
-    isContinuousCond = true
-  else
-    for cref in allCrefs
-      local ht = simCode.stringToSimVarHT
-      local crefName = string(cref)
-      if crefName == "time"
-        #= A relation against `time` (e.g. `time >= t_next`) is a time/state
-           event, i.e. a zero-crossing of `time - rhs`, even when the other
-           operand is a discrete variable. Treat it as continuous so it is
-           emitted as an edge-triggered ContinuousCallback rather than a
-           level-triggered discrete callback that re-fires every step. =#
-        isContinuousCond = true
-        continue
-      end
-      if !haskey(ht, crefName)
-        isContinuousCond = true
-        continue
-      end
-      local var = last(ht[crefName])
-      #= Only a genuinely continuous variable makes the condition continuous.
-         Parameters are constant and discrete variables change only at events,
-         so a condition over only those (e.g. `(tLH>0 or tHL>0) and change(x)`)
-         is an event-driven discrete callback, not a zero-crossing. =#
-      isContinuousCond = isContinuousCond ||
-        (!(SimulationCode.isDiscrete(var)) && !(SimulationCode.isParameter(var)))
+function isContinuousCondition(cond::SC.Exp, simCode::SC.SIM_CODE)::Bool
+  local names = SC.allCrefNames(cond)
+  (length(names) == 1 && only(names) == "time") && return true
+  local ht = simCode.stringToSimVarHT
+  local continuous = false
+  for n in names
+    if n == "time" || !haskey(ht, n)
+      continuous = true
+      continue
     end
+    local v = last(ht[n])
+    continuous = continuous || (!SC.isDiscrete(v) && !SC.isParameter(v))
   end
-  return isContinuousCond
+  return continuous
 end
 
 """
@@ -967,13 +604,13 @@ function replaceVars(sym::Symbol; kwargs...)
     #= Lookup the variable. =#
     local htEntry = kwargs[:ht][vStr]
     local sVar = last(htEntry)
-    local isStateOrAlg = SimulationCode.isStateOrAlgebraic(sVar)
+    local isStateOrAlg = SimCode.isStateOrAlgebraic(sVar)
     if isStateOrAlg
       #= useIndexedU: for ContinuousCallback conditions the trial state is passed as u,
          so generate u[idx] instead of integrator[:sym] to correctly detect sign changes. =#
       if get(kwargs, :useIndexedU, false)
         local idx = first(htEntry)
-        #= useMTKIdx: use runtime MTK variable ordering instead of BDAE index.
+        #= useMTKIdx: use runtime MTK variable ordering instead of the SimCode index.
            MTK may reorder unknowns (e.g., algebraic vars before differential),
            so _mtk_idx (built from unknowns(reducedSystem)) gives the correct u position. =#
         if get(kwargs, :useMTKIdx, false)
@@ -1019,62 +656,19 @@ function exprContainsDatatype(ex, datatype)
 end
 
 """
-  Flatten a record argument in a function call into its constituent fields.
-  Returns a vector of Symbols for the flattened fields, or empty vector if not a record.
+    flattenRecordCallArg(arg, simCode)
+
+The fields of a record argument of a call, as their flattened variables (`<name>_<field>`);
+empty for another argument. A connector-typed Complex reference
+(`Modelica.ComplexBlocks.Interfaces.ComplexInput u`) the same, if one of its fields is a
+variable.
 """
-function flattenRecordCallArg(arg::DAE.Exp, simCode, hashTable; varPrefix::String="", varSuffix::String="")::Vector{Symbol}
-  @match arg begin
-    #= Original pattern: T_COMPLEX wrapping a RECORD class. =#
-    DAE.CREF(cr, DAE.T_COMPLEX(DAE.ClassInf.RECORD(__), varLst, _)) => begin
-      local baseName::String = SimulationCode.string(cr)
-      local flattenedExprs::Vector{Symbol} = Symbol[]
-      for field in varLst
-        @match field begin
-          DAE.TYPES_VAR(fieldName, _, _, _, _) => begin
-            local flatName::String = baseName * COMPONENT_SEPARATOR * fieldName
-            #= Check if the flattened variable exists in the hash table =#
-            if haskey(hashTable, flatName)
-              push!(flattenedExprs, Symbol(varPrefix * flatName * varSuffix))
-            else
-              push!(flattenedExprs, Symbol(flatName))
-            end
-          end
-          _ => nothing
-        end
-      end
-      return flattenedExprs
-    end
-    #= Connector-typed Complex CREFs (e.g. `Modelica.ComplexBlocks.Interfaces.ComplexInput
-       transferFunction_u`) carry a T_COMPLEX with `ClassInf.CONNECTOR` rather than
-       `ClassInf.RECORD`. Codegen needs the same scalarization treatment — without it,
-       a bare `transferFunction_u` symbol leaks into the generated module and triggers
-       `UndefVarError` at MTK eval. Same flattening, different ClassInf. =#
-    DAE.CREF(cr, DAE.T_COMPLEX(_, varLst, _)) => begin
-      local baseName::String = SimulationCode.string(cr)
-      local flattenedExprs::Vector{Symbol} = Symbol[]
-      for field in varLst
-        @match field begin
-          DAE.TYPES_VAR(fieldName, _, _, _, _) => begin
-            local flatName::String = baseName * COMPONENT_SEPARATOR * fieldName
-            if haskey(hashTable, flatName)
-              push!(flattenedExprs, Symbol(varPrefix * flatName * varSuffix))
-            else
-              push!(flattenedExprs, Symbol(flatName))
-            end
-          end
-          _ => nothing
-        end
-      end
-      #= Only treat as flattened if at least one scalar sibling exists in HT.
-         Otherwise fall through to the default codegen path so we don't emit
-         bogus references to fields that were never produced. =#
-      if any(s -> haskey(hashTable, String(s)), flattenedExprs)
-        return flattenedExprs
-      end
-      return Symbol[]
-    end
-    _ => return Symbol[]
-  end
+function flattenRecordCallArg(arg::SC.Exp, simCode::SC.SIM_CODE)::Vector{Symbol}
+  (arg isa SC.EXP_CREF && arg.ty isa SC.TYPE_COMPLEX) || return Symbol[]
+  local baseName = SC.crefName(arg.cref)
+  local flat = Symbol[Symbol(baseName * COMPONENT_SEPARATOR * f) for f in arg.ty.fieldNames]
+  arg.ty.isRecord && return flat
+  return any(s -> haskey(simCode.stringToSimVarHT, String(s)), flat) ? flat : Symbol[]
 end
 
 """
@@ -1164,37 +758,22 @@ function equationMentionsVariableName(eqStr::AbstractString, varName::AbstractSt
   end
 end
 
-function containsDerCall(@nospecialize(exp::DAE.Exp))::Bool
-  @match exp begin
-    DAE.CALL(Absyn.IDENT("der"), _) => true
-    DAE.UNARY(_, e) => containsDerCall(e)
-    DAE.BINARY(e1, _, e2) => containsDerCall(e1) || containsDerCall(e2)
-    DAE.LUNARY(_, e) => containsDerCall(e)
-    DAE.LBINARY(e1, _, e2) => containsDerCall(e1) || containsDerCall(e2)
-    DAE.RELATION(e1, _, e2) => containsDerCall(e1) || containsDerCall(e2)
-    DAE.IFEXP(c, t, e) => containsDerCall(c) || containsDerCall(t) || containsDerCall(e)
-    DAE.CALL(_, explst) => any(containsDerCall, explst)
-    DAE.CAST(_, e) => containsDerCall(e)
-    DAE.ASUB(e, _) => containsDerCall(e)
-    DAE.TSUB(e, _, _) => containsDerCall(e)
-    _ => false
-  end
-end
+"Whether `e` reads a derivative."
+containsDerCall(e::SC.Exp)::Bool = SC.anyExp(x -> x isa SC.DER || SC.isBuiltin(x, :der), e)
 
 """
     startValueVariableNames(simCode) -> Vector{String}
 
-The variables whose start values go into the initial-value map: the flagged
-irreducibles, then every state that is not among them. A state keeps its
-start value whether or not it is irreducible (a state MTK may reduce still
-needs one, and a structural transition model has no initialization problem
-to find it).
+The variables whose start values go into the initial-value map: the flagged irreducibles,
+then every state not among them (a state keeps its start value whether or not it is
+irreducible: one MTK may reduce still needs one, and a model with structural transitions has
+no initialization problem to find it).
 """
-function startValueVariableNames(simCode::SimulationCode.SIM_CODE)::Vector{String}
+function startValueVariableNames(simCode::SC.SIM_CODE)::Vector{String}
   local names = String[vn for vn in simCode.irreducibleVariables]
   local seen = Set{String}(names)
   for (name, (_, simVar)) in simCode.stringToSimVarHT
-    simVar.varKind isa SimulationCode.STATE || continue
+    simVar.varKind isa SC.STATE || continue
     name in seen && continue
     push!(names, name)
     push!(seen, name)
@@ -1202,222 +781,69 @@ function startValueVariableNames(simCode::SimulationCode.SIM_CODE)::Vector{Strin
   return names
 end
 
-function hasExplicitStartValue(vars::Vector, simCode::SimulationCode.SIM_CODE)::Bool
-  local ht::Dict = simCode.stringToSimVarHT
-  for var in vars
-    local entry = get(ht, var, nothing)
-    if entry === nothing
-      continue
-    end
-    (_, simVar) = entry
-    local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
-    @match optAttributes begin
-      SOME(attributes) => begin
-        @match attributes.start begin
-          SOME(_) => return true
-          _ => nothing
-        end
-      end
-      _ => nothing
-    end
-  end
-  return false
+"Whether one of `vars` has a start value."
+function hasExplicitStartValue(vars::Vector, simCode::SC.SIM_CODE)::Bool
+  local ht = simCode.stringToSimVarHT
+  return any(v -> haskey(ht, v) && last(ht[v]).attributes.start !== nothing, vars)
 end
 
-function fixedStartVarNames(vars::Vector, simCode::SimulationCode.SIM_CODE)::Vector{String}
-  local result::Vector{String} = String[]
-  if isempty(vars)
-    return result
-  end
-  local ht::Dict = simCode.stringToSimVarHT
-  for var in vars
-    haskey(ht, var) || continue
-    (_, simVar) = ht[var]
-    #= Without a start too: the default start 0 is fixed (MLS 4.9.1). =#
-    local matched = @match simVar.attributes begin
-      SOME(attributes) => @match attributes.fixed begin
-        SOME(DAE.BCONST(true)) => true
-        _ => false
-      end
-      _ => false
-    end
-    matched && push!(result, simVar.name)
-  end
-  return result
+"The names of `vars` of `fixed = true` (without a start too: the default start 0 is fixed, MLS 4.9.1)."
+function fixedStartVarNames(vars::Vector, simCode::SC.SIM_CODE)::Vector{String}
+  local ht = simCode.stringToSimVarHT
+  return String[last(ht[v]).name for v in vars if haskey(ht, v) && SC.isTrueLiteral(last(ht[v]).attributes.fixed)]
 end
 
-function _isLiteralBind(exp::DAE.Exp)::Bool
-  @match exp begin
-    DAE.RCONST(__) => true
-    DAE.ICONST(__) => true
-    DAE.BCONST(__) => true
-    DAE.SCONST(__) => true
-    DAE.ENUM_LITERAL(__) => true
-    _ => false
-  end
-end
+_isLiteralBind(exp::SC.Exp)::Bool = exp isa Union{SC.RCONST, SC.ICONST, SC.BCONST, SC.SCONST, SC.ENUM_LITERAL}
 
-#= SimCode-native bindings (post-bindExp migration) reach the literal check too. =#
-_isLiteralBind(exp::SimulationCode.Exp)::Bool =
-  exp isa SimulationCode.RCONST || exp isa SimulationCode.ICONST ||
-  exp isa SimulationCode.BCONST || exp isa SimulationCode.SCONST ||
-  exp isa SimulationCode.ENUM_LITERAL
+#= ==================================================================================== =#
+#= The functions the model calls                                                        =#
+#= ==================================================================================== =#
 
-function isArrayType(v::DAE.VAR)::Bool
-  local crefType = @match v.componentRef begin
-    DAE.CREF_IDENT(_, identType, _) => identType
-    DAE.CREF_QUAL(_, identType, _, _) => identType
-    _ => v.ty
-  end
-  @match crefType begin
-    DAE.T_ARRAY(__) => true
-    _ => false
-  end
-end
-
-function collectCalledFunctionNames!(names::OrderedSet{String}, @nospecialize(exp::DAE.Exp))
-  @match exp begin
-    DAE.CALL(path = path, expLst = explst) => begin
-      push!(names, string(path))
-      for arg in explst
-        collectCalledFunctionNames!(names, arg)
-      end
-    end
-    _ => begin
-      Util.traverseExpTopDown(exp,
-                              (e, acc) -> begin
-                                if e isa DAE.CALL
-                                  push!(acc, string(e.path))
-                                end
-                                (e, true, acc)
-                              end,
-                              names)
-    end
-  end
+"The names of the functions an expression (an equation's, a statement's) calls, built-ins too."
+function collectCalledFunctionNames!(names::OrderedSet{String}, e::SC.Exp)::OrderedSet{String}
+  SC.foreachExp(x -> x isa SC.CALL && push!(names, String(x.name)), e)
   return names
 end
-
-function collectCalledFunctionNames!(names::OrderedSet{String},
-                                     eq::Union{BDAE.RESIDUAL_EQUATION, SimulationCode.RESIDUAL_EQUATION})
-  collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.exp))
+collectCalledFunctionNames!(names::OrderedSet{String}, eq::SC.RESIDUAL_EQUATION) = collectCalledFunctionNames!(names, eq.exp)
+function collectCalledFunctionNames!(names::OrderedSet{String}, eq::Union{SC.EQUATION, SC.ARRAY_EQUATION})
+  foreach(e -> collectCalledFunctionNames!(names, e), equationSides(eq))
+  return names
 end
-
-function collectCalledFunctionNames!(names::OrderedSet{String}, eq::BDAE.EQUATION)
-  collectCalledFunctionNames!(names, eq.lhs)
-  collectCalledFunctionNames!(names, eq.rhs)
+function collectCalledFunctionNames!(names::OrderedSet{String}, s::SC.ASSIGN)
+  collectCalledFunctionNames!(names, s.left)
+  return collectCalledFunctionNames!(names, s.right)
 end
+collectCalledFunctionNames!(names::OrderedSet{String}, s::SC.REINIT) = collectCalledFunctionNames!(names, s.value)
+collectCalledFunctionNames!(names::OrderedSet{String}, s::SC.NORETCALL) = collectCalledFunctionNames!(names, s.exp)
+collectCalledFunctionNames!(names::OrderedSet{String}, ::Union{SC.Equation, SC.Statement}) = names
 
-Base.@nospecializeinfer function collectCalledFunctionNames!(names::OrderedSet{String}, @nospecialize(eq::SimulationCode.EQUATION))
-  collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.lhs))
-  collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.rhs))
-end
-
-function collectCalledFunctionNames!(names::OrderedSet{String}, eq::BDAE.ARRAY_EQUATION)
-  collectCalledFunctionNames!(names, eq.left)
-  collectCalledFunctionNames!(names, eq.right)
-end
-
-Base.@nospecializeinfer function collectCalledFunctionNames!(names::OrderedSet{String}, @nospecialize(eq::SimulationCode.ARRAY_EQUATION))
-  collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.left))
-  collectCalledFunctionNames!(names, SimulationCode.toDAEExp(eq.right))
-end
-
-function collectCalledFunctionNames!(names::OrderedSet{String}, eq::BDAE.SOLVED_EQUATION)
-  collectCalledFunctionNames!(names, eq.exp)
-end
-
-function collectCalledFunctionNames!(names::OrderedSet{String}, eq::BDAE.COMPLEX_EQUATION)
-  collectCalledFunctionNames!(names, eq.left)
-  collectCalledFunctionNames!(names, eq.right)
+function collectCalledFunctionNames!(names::OrderedSet{String}, simCode::SC.SIM_CODE)::OrderedSet{String}
+  foreach(eq -> collectCalledFunctionNames!(names, eq), simCode.residualEquations)
+  foreach(eq -> collectCalledFunctionNames!(names, eq), simCode.initialEquations)
+  for ifEq in simCode.ifEquations, b in ifEq.branches
+    collectCalledFunctionNames!(names, b.condition)
+    foreach(eq -> collectCalledFunctionNames!(names, eq), b.residualEquations)
+  end
+  for w in simCode.whenEquations
+    collectCalledFunctionNames!(names, w.whenEquation.condition)
+    foreach(s -> collectCalledFunctionNames!(names, s), w.whenEquation.body)
+  end
+  return names
 end
 
 """
-    getRHSVariables(op) -> Vector{DAE.ComponentRef}
+    getRHSVariables(s) -> Vector{String}
 
-Unified WhenOperator RHS-cref collector that accepts both BDAE-side and
-SimCode-side operator records. BDAE variants delegate to
-`Backend.BDAEUtil.getRHSVariables`.
+The names a when-clause's statement reads (the previous backend's order: the reverse of
+their first occurrence): an assignment's value, a reinit's value, a call's, an assert's
+condition, message and level, a terminate's message.
 """
-# Helper: SIM-side WhenOperators carry ::Exp; Util.getAllCrefs is DAE.Exp-typed.
-_asDAE(e::DAE.Exp) = e
-_asDAE(e::SimulationCode.Exp) = SimulationCode.toDAEExp(e)
-
-function getRHSVariables(op::Union{BDAE.ASSIGN, SimulationCode.ASSIGN})::Vector{DAE.ComponentRef}
-  return listArray(Util.getAllCrefs(_asDAE(op.right)))
-end
-
-function getRHSVariables(op::Union{BDAE.REINIT, SimulationCode.REINIT})::Vector{DAE.ComponentRef}
-  return listArray(Util.getAllCrefs(_asDAE(op.value)))
-end
-
-function getRHSVariables(op::Union{BDAE.NORETCALL, SimulationCode.NORETCALL})::Vector{DAE.ComponentRef}
-  return listArray(Util.getAllCrefs(_asDAE(op.exp)))
-end
-
-function getRHSVariables(op::Union{BDAE.ASSERT, SimulationCode.ASSERT})::Vector{DAE.ComponentRef}
-  return vcat(listArray(Util.getAllCrefs(_asDAE(op.condition))),
-              listArray(Util.getAllCrefs(_asDAE(op.message))),
-              listArray(Util.getAllCrefs(_asDAE(op.level))))
-end
-
-function getRHSVariables(op::Union{BDAE.TERMINATE, SimulationCode.TERMINATE})::Vector{DAE.ComponentRef}
-  return listArray(Util.getAllCrefs(_asDAE(op.message)))
-end
-
-function getRHSVariables(::Union{BDAE.RECOMPILATION, SimulationCode.RECOMPILATION})::Vector{DAE.ComponentRef}
-  return DAE.ComponentRef[]
-end
-
-function getRHSVariables(::Union{BDAE.AGENTIC_RECOMPILATION, SimulationCode.AGENTIC_RECOMPILATION})::Vector{DAE.ComponentRef}
-  return DAE.ComponentRef[]
-end
-
-function collectCalledFunctionNames!(names::OrderedSet{String}, stmt::Union{BDAE.ASSIGN, SimulationCode.ASSIGN})
-  collectCalledFunctionNames!(names, _asDAE(stmt.left))
-  collectCalledFunctionNames!(names, _asDAE(stmt.right))
-end
-
-function collectCalledFunctionNames!(names::OrderedSet{String}, stmt::Union{BDAE.REINIT, SimulationCode.REINIT})
-  collectCalledFunctionNames!(names, stmt.stateVar)
-  collectCalledFunctionNames!(names, _asDAE(stmt.value))
-end
-
-function collectCalledFunctionNames!(names::OrderedSet{String}, stmt::Union{BDAE.NORETCALL, SimulationCode.NORETCALL})
-  collectCalledFunctionNames!(names, _asDAE(stmt.exp))
-end
-
-# SIM-Exp passthrough so `branch.condition` (now ::Exp) routes through the DAE.Exp visitor.
-function collectCalledFunctionNames!(names::OrderedSet{String}, e::SimulationCode.Exp)
-  return collectCalledFunctionNames!(names, SimulationCode.toDAEExp(e))
-end
-
-function collectCalledFunctionNames!(names::OrderedSet{String}, ::Any)
-  return names
-end
-
-function collectCalledFunctionNames!(names::OrderedSet{String}, simCode::SimulationCode.SIM_CODE)
-  for eq in simCode.residualEquations
-    collectCalledFunctionNames!(names, eq)
-  end
-  for eq in simCode.initialEquations
-    collectCalledFunctionNames!(names, eq)
-  end
-  for ifEq in simCode.ifEquations
-    for branch in ifEq.branches
-      collectCalledFunctionNames!(names, branch.condition)
-      for eq in branch.residualEquations
-        collectCalledFunctionNames!(names, eq)
-      end
-    end
-  end
-  for whenEq in simCode.whenEquations
-    collectCalledFunctionNames!(names, SimulationCode.toDAEExp(whenEq.whenEquation.condition))
-    for stmt in whenEq.whenEquation.whenStmtLst
-      collectCalledFunctionNames!(names, stmt)
-    end
-  end
-  return names
-end
+getRHSVariables(s::SC.ASSIGN)::Vector{String} = SC.allCrefNames(s.right)
+getRHSVariables(s::SC.REINIT)::Vector{String} = SC.allCrefNames(s.value)
+getRHSVariables(s::SC.NORETCALL)::Vector{String} = SC.allCrefNames(s.exp)
+getRHSVariables(s::SC.ASSERT)::Vector{String} = vcat(SC.allCrefNames(s.condition), SC.allCrefNames(s.message), SC.allCrefNames(s.level))
+getRHSVariables(s::SC.TERMINATE)::Vector{String} = SC.allCrefNames(s.message)
+getRHSVariables(::SC.Statement)::Vector{String} = String[]
 
 function _resolveModelicaCallTargets(expr)
   if !(expr isa Expr)
@@ -1486,117 +912,12 @@ function _renameAlgIdentifiers(expr, names::OrderedSet{String})
   return _renameAlgIdentifiers(expr, names, "_alg_")
 end
 
-function _readStartAttributeAsLiteral(sv)::Float64
-  local attrs = sv.attributes
-  @match attrs begin
-    SOME(a) => begin
-      @match a.start begin
-        SOME(DAE.RCONST(r)) => Float64(r)
-        SOME(DAE.ICONST(i)) => Float64(i)
-        SOME(DAE.BCONST(b)) => (b ? 1.0 : 0.0)
-        _ => 0.0
-      end
-    end
-    _ => 0.0
-  end
-end
-
-function _collectInitAlgLhsRhsCrefsDAE!(lhs::OrderedSet{String}, rhs::OrderedSet{String}, stmt)
-  local pushCrefsFrom = function(exp)
-    exp === nothing && return
-    for c in Util.getAllCrefs(exp); push!(rhs, string(c)); end
-  end
-  local crefName = function(e)
-    @match e begin
-      DAE.CREF(cr, _) => string(cr)
-      _ => ""
-    end
-  end
-  @match stmt begin
-    DAE.STMT_ASSIGN(_, e1, e, _) => begin
-      local n = crefName(e1); !isempty(n) && push!(lhs, n)
-      pushCrefsFrom(e)
-    end
-    DAE.STMT_TUPLE_ASSIGN(_, lhsList, e, _) => begin
-      for lhsExp in lhsList
-        local n = crefName(lhsExp); !isempty(n) && push!(lhs, n)
-      end
-      pushCrefsFrom(e)
-    end
-    DAE.STMT_ASSIGN_ARR(_, e1, e, _) => begin
-      local n = crefName(e1); !isempty(n) && push!(lhs, n)
-      pushCrefsFrom(e)
-    end
-    DAE.STMT_NORETCALL(e, _) => pushCrefsFrom(e)
-    DAE.STMT_ASSERT(c, m, l, _) => begin
-      pushCrefsFrom(c); pushCrefsFrom(m); pushCrefsFrom(l)
-    end
-    DAE.STMT_TERMINATE(m, _) => pushCrefsFrom(m)
-    DAE.STMT_REINIT(v, val, _) => begin
-      pushCrefsFrom(v); pushCrefsFrom(val)
-    end
-    DAE.STMT_IF(cond, body, else_, _) => begin
-      pushCrefsFrom(cond)
-      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-      _collectInitAlgLhsRhsCrefsDAEElse!(lhs, rhs, else_)
-    end
-    DAE.STMT_FOR(_, _, iter, _, range, body, _) => begin
-      pushCrefsFrom(range)
-      push!(lhs, iter)
-      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-    end
-    DAE.STMT_PARFOR(_, _, iter, _, range, body, _, _) => begin
-      pushCrefsFrom(range)
-      push!(lhs, iter)
-      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-    end
-    DAE.STMT_WHILE(cond, body, _) => begin
-      pushCrefsFrom(cond)
-      for s in body; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-    end
-    _ => nothing
-  end
-end
-
-function _collectInitAlgLhsRhsCrefsDAEElse!(lhs::OrderedSet{String}, rhs::OrderedSet{String}, else_)
-  @match else_ begin
-    DAE.ELSE(stmts) => for s in stmts; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-    DAE.ELSEIF(cond, stmts, rest) => begin
-      for c in Util.getAllCrefs(cond); push!(rhs, string(c)); end
-      for s in stmts; _collectInitAlgLhsRhsCrefsDAE!(lhs, rhs, s); end
-      _collectInitAlgLhsRhsCrefsDAEElse!(lhs, rhs, rest)
-    end
-    _ => nothing
-  end
-end
-
-function _collectInitAlgLhsRhsCrefs!(lhs::OrderedSet{String}, rhs::OrderedSet{String}, op)
-  # Use DAE_identifierToString → canonicalName so cref strings match stringToSimVarHT key format
-  # (per-dim brackets `mem[1][1]`, not comma-join `mem[1, 1]`).
-  local pushCrefsFrom = function(exp)
-    exp === nothing && return
-    for c in Util.getAllCrefs(exp)
-      push!(rhs, SimulationCode.DAE_identifierToString(c))
-    end
-  end
-  if op isa BDAE.ASSIGN || op isa SimulationCode.ASSIGN
-    # SimulationCode.ASSIGN.left is ::Exp (SIM.EXP_CREF) post-migration; convert to DAE for the match.
-    local leftDAE = op isa SimulationCode.ASSIGN ? SimulationCode.toDAEExp(op.left) : op.left
-    @match leftDAE begin
-      DAE.CREF(cr, _) => push!(lhs, SimulationCode.DAE_identifierToString(cr))
-      _ => nothing
-    end
-    pushCrefsFrom(op.right)
-  elseif op isa BDAE.REINIT || op isa SimulationCode.REINIT
-    push!(lhs, SimulationCode.DAE_identifierToString(op.stateVar))
-    pushCrefsFrom(op.value)
-  elseif op isa BDAE.NORETCALL || op isa SimulationCode.NORETCALL
-    pushCrefsFrom(op.exp)
-  elseif op isa BDAE.ASSERT || op isa SimulationCode.ASSERT
-    pushCrefsFrom(op.condition); pushCrefsFrom(op.message); pushCrefsFrom(op.level)
-  elseif op isa BDAE.TERMINATE || op isa SimulationCode.TERMINATE
-    pushCrefsFrom(op.message)
-  end
+"The literal start value of a variable as a Float64 (0.0 for none or one not a literal)."
+function _readStartAttributeAsLiteral(sv::SC.SIMVAR)::Float64
+  local s = sv.attributes.start
+  s isa Union{SC.RCONST, SC.ICONST} && return Float64(s.value)
+  s isa SC.BCONST && return s.value ? 1.0 : 0.0
+  return 0.0
 end
 
 using ExportAll

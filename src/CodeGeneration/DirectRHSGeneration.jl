@@ -519,7 +519,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     initRels === nothing || initRels.eval!(p_vec, u0, t0; finiteOnly = true)
     local uEntry = copy(u0)
     local firstErr = nothing
-    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0,
+    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
                                                               pinned=pinnedIdx,
                                                               derivative_targets=derivativeInitTargets,
                                                               eqLabels=eqLabels,
@@ -563,7 +563,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local targetsNow = Ref(derivativeInitTargets)
     local resolveWith = (u, pv, ok) -> begin
       local kept = u[keptIdx]
-      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0,
+      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
                                               pinned=pinnedIdx,
                                               derivative_targets=targetsNow[],
                                               eqLabels=eqLabels,
@@ -655,7 +655,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       end
       targetsNow[] = targets
       try
-        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; t0 = t0,
+        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
                                          pinned=pinnedIdx,
                                          derivative_targets=targets,
                                          eqLabels=eqLabels,
@@ -683,14 +683,16 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
   return problem
 end
 
-#= The initialization of a model with homotopy() (MLS 3.7.4.4), as
-   OpenModelica's default for such a model: solved at λ = 0 (the simplified
-   expressions), then from each solution at λ = 1/3, 2/3 and 1 (the actual
-   ones), λ the parameter `pv[k]`. `refresh!(u, pv)` sets the relations'
-   literals at each step's solution: kept at the entry's, the limiters of
-   MSL SignalGenerator's op-amps stayed linear and the path returned to the
-   unstable equilibrium (OpenModelica: saturated, -15 V). The direct solve
-   from `u` when a step throws; λ is 1 afterwards either way. =#
+"""
+The initialization of a model with homotopy() (MLS 3.7.4.4), as
+OpenModelica's default for such a model: solved at λ = 0 (the simplified
+expressions), then from each solution at λ = 1/3, 2/3 and 1 (the actual
+ones), λ the parameter `pv[k]`. `refresh!(u, pv)` sets the relations'
+literals at each step's solution: kept at the entry's, the limiters of
+MSL SignalGenerator's op-amps stayed linear and the path returned to the
+unstable equilibrium (OpenModelica: saturated, -15 V). The direct solve
+from `u` when a step throws; λ is 1 afterwards either way.
+"""
 function _homotopyContinuation(solve, u, pv, k::Int; refresh! = nothing, finalSolve = solve)
   local uh = copy(u)
   local pvBefore = copy(pv)
@@ -712,12 +714,14 @@ function _homotopyContinuation(solve, u, pv, k::Int; refresh! = nothing, finalSo
   return finalSolve(uh, pv)
 end
 
-#= Initialization equations of discretes that read the signals (an observed variable, another
-   state): the init solve leaves the discretes out, and only the rows with a literal or a
-   parameter value were pinned (_collectHardInitializationValues); the others were dropped.
-   Buildings' PartialConvertTime, `k = integer(modTimAux/lenWea) + 1; tNext = k*lenWea`:
-   tNext stayed 0, the weather file's time a year ahead. Evaluated on the entry state at t0,
-   again until none changes (tNext reads k). =#
+"""
+Initialization equations of discretes that read the signals (an observed variable, another
+state): the init solve leaves the discretes out, and only the rows with a literal or a
+parameter value were pinned (_collectHardInitializationValues); the others were dropped.
+Buildings' PartialConvertTime, `k = integer(modTimAux/lenWea) + 1; tNext = k*lenWea`:
+tNext stayed 0, the weather file's time a year ahead. Evaluated on the entry state at t0,
+again until none changes (tNext reads k).
+"""
 function _evaluateDiscreteInitialRows!(u0::Vector{Float64}, reducedSystem, states, params, p_vec::Vector{Float64},
                                        t0::Float64, discreteNames::AbstractSet{String})::Vector{Float64}
   local stateIdx = Dict{String, Int}(string(st) => i for (i, st) in enumerate(states))
@@ -756,10 +760,12 @@ function _evaluateDiscreteInitialRows!(u0::Vector{Float64}, reducedSystem, state
   return u0
 end
 
-#= Returns `(values, constraintKeys)`. `values` seeds u0; `constraintKeys`
-   names the literal initialization-equation LHS variables: user-requested
-   constraints that must stay pinned through the free phases of the init
-   solve regardless of what splitInitialValues demoted to guesses. =#
+"""
+Returns `(values, constraintKeys)`. `values` seeds u0; `constraintKeys`
+names the literal initialization-equation LHS variables: user-requested
+constraints that must stay pinned through the free phases of the init
+solve regardless of what splitInitialValues demoted to guesses.
+"""
 function _collectHardInitializationValues(reducedSystem, finalInitialValues;
                                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
                                           valuesMayDiffer::Union{AbstractSet{String},Nothing}=nothing)
@@ -800,22 +806,24 @@ function _collectHardInitializationValues(reducedSystem, finalInitialValues;
 end
 
 
-#= What a run with other tunable parameter values needs (DAE_REINIT,
-   OMBackend.withTunableParameters; OpenModelica's `-override`), as
-   `(resolvedAt, entryAt, followTunable!)`:
-   - `followTunable!(pv)` sets the parameters bound to tunable ones
-     (`q = 2 * p`, an MTK parameter whose value the run does not set) from
-     their bindings. Stale, a relation-when read q's compiled value.
-   - `resolvedAt(pv)` is nothing when no parameter the entry state reads
-     changed, else `(resolved, initResolved, changed)`: the parameter values
-     as the build resolved them, with the run's. Only the parameters the
-     symbolic start values, guesses and initialization equations read, and
-     those their bindings read, are resolved again (all 140 of the MSL
-     DoublePendulum's took 0.2 s a run).
-   - `entryAt(r)` is the entry state for them, evaluated as the build's
-     (`uStart`): `x(start = p, fixed = true)` and `initial equation x = p`
-     kept x(0) = 1 for p = 2. The parameters the initialization computes keep
-     their start values. =#
+"""
+What a run with other tunable parameter values needs (DAE_REINIT,
+OMBackend.withTunableParameters; OpenModelica's `-override`), as
+`(resolvedAt, entryAt, followTunable!)`:
+- `followTunable!(pv)` sets the parameters bound to tunable ones
+  (`q = 2 * p`, an MTK parameter whose value the run does not set) from
+  their bindings. Stale, a relation-when read q's compiled value.
+- `resolvedAt(pv)` is nothing when no parameter the entry state reads
+  changed, else `(resolved, initResolved, changed)`: the parameter values
+  as the build resolved them, with the run's. Only the parameters the
+  symbolic start values, guesses and initialization equations read, and
+  those their bindings read, are resolved again (all 140 of the MSL
+  DoublePendulum's took 0.2 s a run).
+- `entryAt(r)` is the entry state for them, evaluated as the build's
+  (`uStart`): `x(start = p, fixed = true)` and `initial equation x = p`
+  kept x(0) = 1 for p = 2. The parameters the initialization computes keep
+  their start values.
+"""
 function _runEntry(reducedSystem; states, params, pars, finalInitialValues, systemGuesses, resolvedParams,
                    unknownParamNames, valuesMayDiffer, observedEquations, uStart, tunableParameters)
   local paramNames = String[string(p) for p in params]
@@ -856,8 +864,10 @@ function _runEntry(reducedSystem; states, params, pars, finalInitialValues, syst
   return (resolvedAt, entryAt, followTunable!)
 end
 
-#= `pv -> nothing` writing the dependents' values into `pv`, for a
-   `_parameterDependents` result; nothing for nothing. =#
+"""
+`pv -> nothing` writing the dependents' values into `pv`, for a
+`_parameterDependents` result; nothing for nothing.
+"""
 function _dependentsWriter(dependents)
   dependents === nothing && return nothing
   local (dF, dIdxs) = dependents
@@ -870,9 +880,11 @@ function _dependentsWriter(dependents)
   end
 end
 
-#= The parameters `values` read that are in `parsByName`, and those their
-   bindings read. A value whose variables cannot be listed makes every
-   parameter one (the entry is then evaluated again for any change). =#
+"""
+The parameters `values` read that are in `parsByName`, and those their
+bindings read. A value whose variables cannot be listed makes every
+parameter one (the entry is then evaluated again for any change).
+"""
 function _entryParameters(values, parsByName::AbstractDict{String})::OrderedSet{String}
   local out = OrderedSet{String}()
   local pending = Any[v for v in values if _tryToFloat64(v) === nothing]
@@ -893,9 +905,11 @@ function _entryParameters(values, parsByName::AbstractDict{String})::OrderedSet{
   return out
 end
 
-#= Whether an initialization equation needs a solve: one that is not a start
-   value `x = v`, a variable of the system and a number (a derivative row,
-   `y = 2*x`, `2*x = 4`). =#
+"""
+Whether an initialization equation needs a solve: one that is not a start
+value `x = v`, a variable of the system and a number (a derivative row,
+`y = 2*x`, `2*x = 4`).
+"""
 function _hasSolvedInitializationRows(reducedSystem; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)::Bool
   local variables = Set{String}(string(v) for v in Iterators.flatten((ModelingToolkit.unknowns(reducedSystem),
                                                                       ModelingToolkit.parameters(reducedSystem),
@@ -936,16 +950,18 @@ function _derivativeInitializationTargets(reducedSystem, states;
 end
 
 
-#= Initialization equations with a signal-valued RHS (references unknowns or
-   observed variables). Literal / parameter-resolvable rows are pinned via
-   _collectHardInitializationValues and _derivativeInitializationTargets;
-   the rows collected here become extra residual rows of the DAE init solve,
-   so user initial equations like `x = signal` and `der(x) = signal` hold at
-   t0. Returns `(gFunc, derIdxs, mmScales)` where `gFunc(u, p, t)` evaluates
-   the row expressions, `derIdxs[i] == 0` marks an algebraic row with residual
-   `g[i]`, and `derIdxs[i] > 0` marks a derivative row with residual
-   `du[derIdxs[i]] - mmScales[i] * g[i]`. Returns nothing when no such rows
-   exist or they cannot be reduced to states/params. =#
+"""
+Initialization equations with a signal-valued RHS (references unknowns or
+observed variables). Literal / parameter-resolvable rows are pinned via
+_collectHardInitializationValues and _derivativeInitializationTargets;
+the rows collected here become extra residual rows of the DAE init solve,
+so user initial equations like `x = signal` and `der(x) = signal` hold at
+t0. Returns `(gFunc, derIdxs, mmScales)` where `gFunc(u, p, t)` evaluates
+the row expressions, `derIdxs[i] == 0` marks an algebraic row with residual
+`g[i]`, and `derIdxs[i] > 0` marks a derivative row with residual
+`du[derIdxs[i]] - mmScales[i] * g[i]`. Returns nothing when no such rows
+exist or they cannot be reduced to states/params.
+"""
 function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
                                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing,
                                           excludeNames::AbstractSet{String}=OrderedSet{String}())
@@ -1040,10 +1056,12 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
   return (gFunc, derIdxs, mmScales)
 end
 
-#= Inline observed definitions into `exprs` on demand so only states, params
-   and the iv remain; the observed list is topologically ordered, so bounded
-   repeated substitution terminates. Returns the indices of the rows that
-   reduced to those (a row still reading der() inside an observed does not). =#
+"""
+Inline observed definitions into `exprs` on demand so only states, params
+and the iv remain; the observed list is topologically ordered, so bounded
+repeated substitution terminates. Returns the indices of the rows that
+reduced to those (a row still reading der() inside an observed does not).
+"""
 function _inlineObservedRows!(exprs, reducedSystem, states, params, iv)::Vector{Int}
   local obsEqs = ModelingToolkit.observed(reducedSystem)
   local obsByStr = OrderedDict{String, Any}(string(o.lhs) => o.rhs for o in obsEqs)
@@ -1068,15 +1086,17 @@ function _inlineObservedRows!(exprs, reducedSystem, states, params, iv)::Vector{
              if all(v -> string(v) in allowed, Symbolics.get_variables(ex))]
 end
 
-#= Initialization equations `p = f(...)` for a parameter p without a value
-   (fixed = false; the MSL analytic loop joints' positiveBranch, the branch of
-   the loop's solution that the initial positions select). No unknown of the
-   init solve is p: as a residual row the solve can only meet it by moving u
-   to where f is p's default, relaxing fixed starts (or not at all, for a
-   Boolean f). The init solve assigns p = f at each evaluation instead, and p
-   keeps its value at the initial state. Returns `(pFunc, pIdxs)`, where
-   `pFunc(u, p, t)` evaluates the values of `p[pIdxs]`, or nothing. A row whose
-   f reads its own p stays a residual row. =#
+"""
+Initialization equations `p = f(...)` for a parameter p without a value
+(fixed = false; the MSL analytic loop joints' positiveBranch, the branch of
+the loop's solution that the initial positions select). No unknown of the
+init solve is p: as a residual row the solve can only meet it by moving u
+to where f is p's default, relaxing fixed starts (or not at all, for a
+Boolean f). The init solve assigns p = f at each evaluation instead, and p
+keeps its value at the initial state. Returns `(pFunc, pIdxs)`, where
+`pFunc(u, p, t)` evaluates the values of `p[pIdxs]`, or nothing. A row whose
+f reads its own p stays a residual row.
+"""
 function _initialParameterAssignments(reducedSystem, states, params, iv; assignable::AbstractSet{String})
   local initEqs = ModelingToolkit.initialization_equations(reducedSystem)
   local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
@@ -1111,14 +1131,16 @@ function _initialParameterAssignments(reducedSystem, states, params, iv; assigna
 end
 
 
-#= Parameters whose binding reads `roots` (directly or through other such
-   parameters): `spring.spring.c = spring.c` for the free spring.c of the MSL
-   InitSpringConstant. _buildParamVector resolved them from the roots' start
-   values; a root the initialization changes must carry them along. Returns
-   `(depFunc, depIdxs, depNames)` with `depFunc(p)` the values of `p[depIdxs]`
-   from the roots in `p` and `depNames` every dependent (in `params` or not),
-   or nothing. A dependent that still reads a name outside `params` after
-   substitution is left out. =#
+"""
+Parameters whose binding reads `roots` (directly or through other such
+parameters): `spring.spring.c = spring.c` for the free spring.c of the MSL
+InitSpringConstant. _buildParamVector resolved them from the roots' start
+values; a root the initialization changes must carry them along. Returns
+`(depFunc, depIdxs, depNames)` with `depFunc(p)` the values of `p[depIdxs]`
+from the roots in `p` and `depNames` every dependent (in `params` or not),
+or nothing. A dependent that still reads a name outside `params` after
+substitution is left out.
+"""
 function _parameterDependents(pars, params, roots::AbstractSet{String};
                               resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
   isempty(roots) && return nothing
@@ -1190,8 +1212,10 @@ function _parameterDependents(pars, params, roots::AbstractSet{String};
   return (depFunc, depIdxs, deps)
 end
 
-#= The literal derivative initial equations `der(w) = c` whose w is not an
-   unknown: `(ws, cs)`. =#
+"""
+The literal derivative initial equations `der(w) = c` whose w is not an
+unknown: `(ws, cs)`.
+"""
 function _observedDerivativeInitEquations(reducedSystem, states;
                                           resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
   local exprs = Any[]
@@ -1212,13 +1236,15 @@ function _observedDerivativeInitEquations(reducedSystem, states;
   return (exprs, tgts)
 end
 
-#= Literal derivative initial equations `der(w) = c` on an observed w (not an
-   unknown; those are derivative targets): w inlined to the unknowns, its
-   gradient w.r.t. the unknowns and the independent variable (explicit time)
-   by the DAG differentiation, compiled as the nonzeros. Returns
-   `(nzFunc!, rows, cols, n, targets)`: row k's der(w) is
-   Σ nz * (col <= n ? u̇[col] : 1). Nothing when there are none or they
-   cannot be reduced or differentiated. =#
+"""
+Literal derivative initial equations `der(w) = c` on an observed w (not an
+unknown; those are derivative targets): w inlined to the unknowns, its
+gradient w.r.t. the unknowns and the independent variable (explicit time)
+by the DAG differentiation, compiled as the nonzeros. Returns
+`(nzFunc!, rows, cols, n, targets)`: row k's der(w) is
+Σ nz * (col <= n ? u̇[col] : 1). Nothing when there are none or they
+cannot be reduced or differentiated.
+"""
 function _observedDerivativeTargets(reducedSystem, states, params, iv;
                                     resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
   local (exprs, tgts) = _observedDerivativeInitEquations(reducedSystem, states; resolvedParams=resolvedParams)
@@ -1242,14 +1268,16 @@ function _observedDerivativeTargets(reducedSystem, states, params, iv;
   end
 end
 
-#= The RHS's explicit time derivative ∂F/∂t (states and parameters fixed),
-   the tgrad of the problem: by the DAG differentiation when every row has a
-   derivative rule and it evaluates finite at the entry, else by a central
-   difference (as the solver's own). Rosenbrock methods need it in each step;
-   their finite difference in t has a step growing with t, and its error in
-   the MSL SMEE machines' 50 Hz sources (~0.2 V/s at t = 2.8) set a floor
-   the algebraic step control chased until maxiters (SMEE_DOL stopped at
-   2.835 s after 1e6 steps). =#
+"""
+The RHS's explicit time derivative ∂F/∂t (states and parameters fixed),
+the tgrad of the problem: by the DAG differentiation when every row has a
+derivative rule and it evaluates finite at the entry, else by a central
+difference (as the solver's own). Rosenbrock methods need it in each step;
+their finite difference in t has a step growing with t, and its error in
+the MSL SMEE machines' 50 Hz sources (~0.2 V/s at t = 2.8) set a floor
+the algebraic step control chased until maxiters (SMEE_DOL stopped at
+2.835 s after 1e6 steps).
+"""
 function _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, t0)
   #= Kill switch OMBACKEND_TGRAD=false: no tgrad (the solver differences in t itself). =#
   OMBackend.envSwitch("OMBACKEND_TGRAD") || return nothing
@@ -1282,12 +1310,16 @@ function _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u0, p_vec, 
   end
 end
 
-#= The time derivative of rows that do not read t. =#
+"""
+The time derivative of rows that do not read t.
+"""
 _zeroTimeDerivative(dT, u, p, t) = (fill!(dT, 0); nothing)
 
-#= ∂F/∂t of the rows `exprs` (explicit time) by the DAG differentiation, as an
-   in-place `f!(out, u, p, t)`; nothing when a row has no derivative rule (a
-   time table). =#
+"""
+∂F/∂t of the rows `exprs` (explicit time) by the DAG differentiation, as an
+in-place `f!(out, u, p, t)`; nothing when a row has no derivative rule (a
+time table).
+"""
 function _explicitTimeDerivative(exprs, states, params, iv)
   try
     #= The states as variables (x(t) would otherwise be a function of t), only t's column. =#
@@ -1304,15 +1336,17 @@ function _explicitTimeDerivative(exprs, states, params, iv)
   end
 end
 
-#= The time derivatives of the algebraic unknowns (zero mass-matrix rows of a
-   diagonal mass matrix) at (u, p, t): differentiating the algebraic rows
-   0 = F_a(u, t) gives J_aa ż_a = -(J_ad u̇_d + ∂F_a/∂t), with u̇_d = F_d / m_d
-   from `du` = F(u). J from the symbolic sparse Jacobian (kept sparse, written
-   into `J`), ∂F_a/∂t from `ft!` or, without it (or when it throws or is not
-   finite), by a second-order one-sided difference (a time switch at t sees
-   its right limit there). The raw RHS with p
-   fixed: parameters are constant in time. A singular J_aa takes the
-   least-squares solution; NaN if anything throws. =#
+"""
+The time derivatives of the algebraic unknowns (zero mass-matrix rows of a
+diagonal mass matrix) at (u, p, t): differentiating the algebraic rows
+0 = F_a(u, t) gives J_aa ż_a = -(J_ad u̇_d + ∂F_a/∂t), with u̇_d = F_d / m_d
+from `du` = F(u). J from the symbolic sparse Jacobian (kept sparse, written
+into `J`), ∂F_a/∂t from `ft!` or, without it (or when it throws or is not
+finite), by a second-order one-sided difference (a time switch at t sees
+its right limit there). The raw RHS with p
+fixed: parameters are constant in time. A singular J_aa takes the
+least-squares solution; NaN if anything throws.
+"""
 function _algebraicDerivatives!(J, rhs, jac, ft!, mm, algIdx, difIdx, u, du, p, t)
   try
     jac(J, u, p, t)
@@ -1343,12 +1377,14 @@ function _algebraicDerivatives!(J, rhs, jac, ft!, mm, algIdx, difIdx, u, du, p, 
   end
 end
 
-#= The literal values of the if-equation relations at an initial state:
-   `eval!(pv, u, t)` writes 1.0/0.0 into their ifCond parameters and returns
-   whether one changed. From the codegen's entries (ifCond, observed names,
-   crossing functions, observed -> Bool); an entry whose ifCond is not a
-   parameter is left out, and when the crossing functions cannot be observed
-   there are none. Nothing when none remain. =#
+"""
+The literal values of the if-equation relations at an initial state:
+`eval!(pv, u, t)` writes 1.0/0.0 into their ifCond parameters and returns
+whether one changed. From the codegen's entries (ifCond, observed names,
+crossing functions, observed -> Bool); an entry whose ifCond is not a
+parameter is left out, and when the crossing functions cannot be observed
+there are none. Nothing when none remain.
+"""
 function _initialRelationLiterals(reducedSystem, params, entries)
   isempty(entries) && return nothing
   local paramIdx = Dict{String, Int}(string(p) => i for (i, p) in enumerate(params))
@@ -1385,12 +1421,14 @@ function _initialRelationLiterals(reducedSystem, params, entries)
   return (eval! = eval!, idxs = Int[k for (k, _...) in kept])
 end
 
-#= The discrete clusters at initialization, for `_settleInitialDiscretes!`:
-   the codegen's clusters (instances of their own) bound to the reduced
-   system (the problem does not exist yet), their members' start values
-   (index => value, those that evaluate) and per cluster the start values its
-   pre() reads take (MLS 8.6: pre(v) = v.start). Nothing when there are none
-   or they cannot be observed. =#
+"""
+The discrete clusters at initialization, for `_settleInitialDiscretes!`:
+the codegen's clusters (instances of their own) bound to the reduced
+system (the problem does not exist yet), their members' start values
+(index => value, those that evaluate) and per cluster the start values its
+pre() reads take (MLS 8.6: pre(v) = v.start). Nothing when there are none
+or they cannot be observed.
+"""
 function _initialDiscreteClusters(clusters, reducedSystem, startOf::AbstractDict{String, Float64})
   isempty(clusters) && return nothing
   local starts = Pair{Int, Float64}[]
@@ -1412,10 +1450,12 @@ function _initialDiscreteClusters(clusters, reducedSystem, startOf::AbstractDict
   return (clusters = clusters, starts = starts, preStarts = preStarts)
 end
 
-#= The members whose cluster body, at state u (relations literal, MLS 8.5;
-   pre() the start values, else the values in u; initial() true), gives
-   another value than u holds: index => value. Local buffers: a
-   re-initialization may run while another one does. =#
+"""
+The members whose cluster body, at state u (relations literal, MLS 8.5;
+pre() the start values, else the values in u; initial() true), gives
+another value than u holds: index => value. Local buffers: a
+re-initialization may run while another one does.
+"""
 function _initialDiscreteChanges(dc, u, pv, t0::Float64 = 0.0)
   local point = (u = u, p = pv, t = t0)
   local changes = Pair{Int, Float64}[]
@@ -1435,26 +1475,28 @@ function _initialDiscreteChanges(dc, u, pv, t0::Float64 = 0.0)
   return changes
 end
 
-#= Initial fixpoint of the discrete clusters' mixed systems, as OpenModelica
-   solves them (MLS 8.6: a discrete equation outside a when holds at the
-   initial solution, its relations at their literal values, pre() at the
-   start values). The initial algorithm set the members from their
-   equations at the continuous start values before the solve (an ideal
-   diode's `off = s < 0` at s = 0: conducting); with a fixed inductor
-   current or capacitor voltage that entry can make the solve fail (MSL
-   HBridge_RL: 340 kA) or reach another fixpoint of the mixed system
-   (MultiPhase Rectifier: every diode conducting, 5.8e6 V).
-   When an entry member differs from its start value (`startPath`), from the
-   entry with the members at their start values: solved, the members take
-   their bodies' values at the solution, solved again until they stay.
-   Otherwise, or when that does not settle, from the first solution the same
-   way. A result is taken only if the differential states `kept` stay where
-   the solve it started from had them (OpenModelica keeps states without an
-   initial equation at their start: a diode with a free capacitor voltage
-   must not move it to reach the tie s = 0); else, and on a cycle, a pass
-   limit, a throw or a failed solve, the first solution stands and the event
-   iteration at the start settles the members as before.
-   Returns `(u, settled)`. =#
+"""
+Initial fixpoint of the discrete clusters' mixed systems, as OpenModelica
+solves them (MLS 8.6: a discrete equation outside a when holds at the
+initial solution, its relations at their literal values, pre() at the
+start values). The initial algorithm set the members from their
+equations at the continuous start values before the solve (an ideal
+diode's `off = s < 0` at s = 0: conducting); with a fixed inductor
+current or capacitor voltage that entry can make the solve fail (MSL
+HBridge_RL: 340 kA) or reach another fixpoint of the mixed system
+(MultiPhase Rectifier: every diode conducting, 5.8e6 V).
+When an entry member differs from its start value (`startPath`), from the
+entry with the members at their start values: solved, the members take
+their bodies' values at the solution, solved again until they stay.
+Otherwise, or when that does not settle, from the first solution the same
+way. A result is taken only if the differential states `kept` stay where
+the solve it started from had them (OpenModelica keeps states without an
+initial equation at their start: a diode with a free capacitor voltage
+must not move it to reach the tie s = 0); else, and on a cycle, a pass
+limit, a throw or a failed solve, the first solution stands and the event
+iteration at the start settles the members as before.
+Returns `(u, settled)`.
+"""
 function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int};
                                   startPath::Bool = true, maxPasses::Int = 10, startSolve = resolve, t0::Float64 = 0.0)
   dc === nothing && return (u0, false)
@@ -1514,13 +1556,15 @@ function _settleInitialDiscretes!(resolve, u0, uEntry, pv, dc, kept::Vector{Int}
   return (u0, false)
 end
 
-#= Initial event iteration for the if-equation relations: solved with their
-   entry values, the relations take their literal values at the solution
-   and, while one changes, the initialization is solved again (from the last
-   solution) for them. A cycle, a pass limit, a throw or a solve that does
-   not converge keeps the first solution and the entry parameters (MSL
-   EngineV6_analytic: the gas force's `v_rel < 0` was false at the entry,
-   the steady-state filter settled on the wrong torque). =#
+"""
+Initial event iteration for the if-equation relations: solved with their
+entry values, the relations take their literal values at the solution
+and, while one changes, the initialization is solved again (from the last
+solution) for them. A cycle, a pass limit, a throw or a solve that does
+not converge keeps the first solution and the entry parameters (MSL
+EngineV6_analytic: the gas force's `v_rel < 0` was false at the entry,
+the steady-state filter settled on the wrong torque).
+"""
 function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5, t0::Float64 = 0.0)
   rels === nothing && return u0
   local pvFirst = copy(pv)
@@ -1550,14 +1594,16 @@ function _settleInitialRelations!(resolve, u0, pv, rels; maxPasses::Int = 5, t0:
   return uFirst
 end
 
-#= The DAE init solve with the free parameters p[freeIdx] as unknowns: they
-   are appended to u as algebraic unknowns (zero mass-matrix rows whose
-   residuals are identically zero), so each phase may move them like a free
-   algebraic variable; `follow!(p)` updates the parameters bound to them.
-   Returns the states; p[freeIdx] keeps the solved values. =#
+"""
+The DAE init solve with the free parameters p[freeIdx] as unknowns: they
+are appended to u as algebraic unknowns (zero mass-matrix rows whose
+residuals are identically zero), so each phase may move them like a free
+algebraic variable; `follow!(p)` updates the parameters bound to them.
+Returns the states; p[freeIdx] keeps the solved values.
+"""
 function _solveDAEInitializationFree!(u0, rhs, pv, mm, freeIdx::Vector{Int}, follow!;
-                                      extra_residuals=nothing, kwargs...)
-  isempty(freeIdx) && return _solveDAEInitialization!(u0, rhs, pv, mm; extra_residuals=extra_residuals, kwargs...)
+                                      extra_residuals=nothing, sparsity=nothing, kwargs...)
+  isempty(freeIdx) && return _solveDAEInitialization!(u0, rhs, pv, mm; extra_residuals=extra_residuals, sparsity=sparsity, kwargs...)
   local n = length(u0)
   local nq = length(freeIdx)
   local setFree! = (p, u) -> begin
@@ -1677,14 +1723,16 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
   end
 end
 
-#= The symbolic Jacobian, and where an entry is not finite at a point (its formula overflows:
-   d/dv 2/(1 + exp(-k*v)) is Inf/Inf at k*v = -702, MSL AIMC_Conveyor's smooth sign; Buildings'
-   Carnot COP at the start) that entry by differences of the right-hand side: the step was NaN,
-   the solver Unstable. Central differences, one-sided where a side leaves the right-hand
-   side's domain (|dT|^n at dT = 0: Buildings' borehole HexInternalElement), the symbolic entry
-   where neither is finite. With the numeric partials the symbolic Jacobian is built for more
-   models; before, a call without a derivative rule sent the whole Jacobian to the solver's
-   finite differences, which hid it. =#
+"""
+The symbolic Jacobian, and where an entry is not finite at a point (its formula overflows:
+d/dv 2/(1 + exp(-k*v)) is Inf/Inf at k*v = -702, MSL AIMC_Conveyor's smooth sign; Buildings'
+Carnot COP at the start) that entry by differences of the right-hand side: the step was NaN,
+the solver Unstable. Central differences, one-sided where a side leaves the right-hand
+side's domain (|dT|^n at dT = 0: Buildings' borehole HexInternalElement), the symbolic entry
+where neither is finite. With the numeric partials the symbolic Jacobian is built for more
+models; before, a call without a derivative rule sent the whole Jacobian to the solver's
+finite differences, which hid it.
+"""
 function _finiteJacobian(symJac::Function, rhsFunc::Function)::Function
   return (J, u, p, t) -> begin
     symJac(J, u, p, t)
@@ -1724,17 +1772,19 @@ struct _NoDagDerivative <: Exception
   retry::Bool
 end
 
-#= The sparse symbolic Jacobian of `rhs_list` with respect to `states`,
-   differentiating each expression as the DAG it is: a subexpression shared
-   by several uses (the observed equations full_equations inlines, a
-   multibody chain of frames) is differentiated once per state, and the
-   derivatives share their subexpressions the same way. Symbolics'
-   sparsejacobian differentiates the trees: MSL EngineV6_analytic's 17
-   equations are 1,943 DAG nodes but 14.6 million tree nodes, and its 17x17
-   Jacobian took 48 s and 15 GB. The structure is Symbolics'
-   (jacobian_sparsity: an entry for each state an equation reads), the rules
-   are its derivative rules (derivative_idx); throws _NoDagDerivative where
-   there is none. =#
+"""
+The sparse symbolic Jacobian of `rhs_list` with respect to `states`,
+differentiating each expression as the DAG it is: a subexpression shared
+by several uses (the observed equations full_equations inlines, a
+multibody chain of frames) is differentiated once per state, and the
+derivatives share their subexpressions the same way. Symbolics'
+sparsejacobian differentiates the trees: MSL EngineV6_analytic's 17
+equations are 1,943 DAG nodes but 14.6 million tree nodes, and its 17x17
+Jacobian took 48 s and 15 GB. The structure is Symbolics'
+(jacobian_sparsity: an entry for each state an equation reads), the rules
+are its derivative rules (derivative_idx); throws _NoDagDerivative where
+there is none.
+"""
 function _dagSparseJacobian(rhs_list, states; columns::Union{Nothing, AbstractSet{Int}} = nothing)
   local T = Symbolics.VartypeT
   local stateIdx = Dict{Any, Int}(Symbolics.unwrap(s) => j for (j, s) in enumerate(states))
@@ -1845,12 +1895,14 @@ function _dagSparseJacobian(rhs_list, states; columns::Union{Nothing, AbstractSe
   return Symbolics.SparseArrays.sparse(I, J, V, length(rhs_list), length(states))
 end
 
-#= Symbolic simplification can fold integer parameter products into exact
-   Rational{BigInt} coefficients; one such literal promotes every downstream
-   operation to BigFloat, allocating per RHS call. Demote at the generated-code
-   boundary where Float64 semantics are already assumed. Exact integer
-   literals (Int128/BigInt) stay untouched: RNG state constants are bit-exact
-   and exceed Float64's 2^53 integer range. =#
+"""
+Symbolic simplification can fold integer parameter products into exact
+Rational{BigInt} coefficients; one such literal promotes every downstream
+operation to BigFloat, allocating per RHS call. Demote at the generated-code
+boundary where Float64 semantics are already assumed. Exact integer
+literals (Int128/BigInt) stay untouched: RNG state constants are bit-exact
+and exceed Float64's 2^53 integer range.
+"""
 _demoteWideNumericLiterals!(x) =
   x isa Union{Rational, BigFloat, Irrational} ? Float64(x) : x
 function _demoteWideNumericLiterals!(ex::Expr)
@@ -1962,9 +2014,11 @@ function _buildStateVector(states, finalInitialValues;
 end
 
 
-#= `equationStrs`: the equations' strings, once, not per state and round
-   (`string` of an equation is 5-10 us, and the scan was 97 % of an entry
-   state's cost, a tunable run's too). =#
+"""
+`equationStrs`: the equations' strings, once, not per state and round
+(`string` of an equation is 5-10 us, and the scan was 97 % of an entry
+state's cost, a tunable run's too).
+"""
 function _propagateObservedAliasInitialValues!(u0, states, matchedSet::OrderedSet{String},
                                                hardValueMap::Dict{Any, Float64},
                                                observedEquations; equationStrs::AbstractVector{String})
@@ -2081,10 +2135,12 @@ function _evalSymbolicFunctionCall(expr, nameToNumeric::Dict{String, Float64})
   return v isa Real ? Float64(v) : nothing
 end
 
-#= A value of _evalSymbolicFunctionCall's walk: a constant as it is (a Boolean or a String
-   argument of a Modelica function, `use_Rb` and the instance name of Buildings' borehole
-   resistance functions: made Float64, or dropped, the call was not evaluated), a parameter by
-   its number, a call by its result; nothing when a leaf is unknown. =#
+"""
+A value of _evalSymbolicFunctionCall's walk: a constant as it is (a Boolean or a String
+argument of a Modelica function, `use_Rb` and the instance name of Buildings' borehole
+resistance functions: made Float64, or dropped, the call was not evaluated), a parameter by
+its number, a call by its result; nothing when a leaf is unknown.
+"""
 function _symbolicCallValue(expr, nameToNumeric::Dict{String, Float64})
   expr isa Union{Number, AbstractString} && return expr
   expr isa Symbolics.Num && (expr = Symbolics.unwrap(expr))
@@ -2115,10 +2171,12 @@ function _symbolicCallValue(expr, nameToNumeric::Dict{String, Float64})
 end
 
 
-#= The number `v` holds, or nothing. SymbolicUtils keeps a constant as a
-   Const term: `Num(1.0)` unwraps to one, not to a Number, so a test for a
-   Number missed every constant (each was resolved by substitution, 0.6 s for
-   the MSL DoublePendulum's 140 parameters). =#
+"""
+The number `v` holds, or nothing. SymbolicUtils keeps a constant as a
+Const term: `Num(1.0)` unwraps to one, not to a Number, so a test for a
+Number missed every constant (each was resolved by substitution, 0.6 s for
+the MSL DoublePendulum's 140 parameters).
+"""
 function _constantNumber(v)
   local u = v isa Symbolics.Num ? Symbolics.unwrap(v) : v
   u isa Number && return u
@@ -2356,16 +2414,18 @@ _callbackList(::Nothing) = Any[]
 _callbackList(cb::DiffEqBase.CallbackSet) = Any[cb.continuous_callbacks..., cb.discrete_callbacks...]
 _callbackList(cb::ModelingToolkit.SciMLBase.DECallback) = Any[cb]
 
-#= The re-initializations a merged callback can carry for all its components:
-   NoInit (the state as the affect left it) or nothing (the integrator's own,
-   BrownFullBasicInit for a DAE: defaultInitializeKwargs). They differ, and
-   OrdinaryDiffEqCore applies it at every event of the callback, also where it
-   only moves to the event time (`change_t_via_interpolation!`). The merge
-   created the callback with nothing for components that asked NoInit (MTK's
-   events): a full re-solve at each event, at the solve's abstol, and MSL
-   DifferenceAmplifier stopped with InitialFailure at its ramp's end.
-   EventReinit (a branch event's re-solve of the algebraic unknowns) has no
-   state either, so a callback carrying it is as model-independent. =#
+"""
+The re-initializations a merged callback can carry for all its components:
+NoInit (the state as the affect left it) or nothing (the integrator's own,
+BrownFullBasicInit for a DAE: defaultInitializeKwargs). They differ, and
+OrdinaryDiffEqCore applies it at every event of the callback, also where it
+only moves to the event time (`change_t_via_interpolation!`). The merge
+created the callback with nothing for components that asked NoInit (MTK's
+events): a full re-solve at each event, at the solve's abstol, and MSL
+DifferenceAmplifier stopped with InitialFailure at its ramp's end.
+EventReinit (a branch event's re-solve of the algebraic unknowns) has no
+state either, so a callback carrying it is as model-independent.
+"""
 _mergeableReinit(ia)::Bool = ia === nothing || ia isa ModelingToolkit.SciMLBase.NoInit || ia isa EventReinit
 
 #= Typed callable structs for the merged continuous callback. Typed fields and a
@@ -2624,9 +2684,11 @@ function _tryToFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=
   return nothing
 end
 
-#= An initialization equation on der(der(x)) (Differential(t, 2)) was taken as
-   one on der(x): its order is not checked where the state is matched.
-   Refused, as OpenModelica does. =#
+"""
+An initialization equation on der(der(x)) (Differential(t, 2)) was taken as
+one on der(x): its order is not checked where the state is matched.
+Refused, as OpenModelica does.
+"""
 function _requireFirstOrder(@nospecialize(lhs), eq)
   local op = SymbolicUtils.operation(lhs)
   local order = hasproperty(op, :order) ? getproperty(op, :order) : 1
@@ -2658,7 +2720,9 @@ function _hasDerivative(@nospecialize(x))::Bool
   return any(_hasDerivative, SU.arguments(x))
 end
 
-#= Whether a value reads a variable that is neither time nor a resolved parameter. =#
+"""
+Whether a value reads a variable that is neither time nor a resolved parameter.
+"""
 function _readsUnknowns(@nospecialize(val), resolvedParams)::Bool
   local u = val isa Symbolics.Num ? Symbolics.unwrap(val) : val
   u isa Number && return false
@@ -2671,8 +2735,10 @@ function _readsUnknowns(@nospecialize(val), resolvedParams)::Bool
   return any(v -> string(v) != "t" && (resolvedParams === nothing || !haskey(resolvedParams, string(v))), vars)
 end
 
-#= A symbolic term without variables, evaluated by applying its operations to
-   its evaluated arguments; nothing where it has a variable. =#
+"""
+A symbolic term without variables, evaluated by applying its operations to
+its evaluated arguments; nothing where it has a variable.
+"""
 function _evalConstantTerm(@nospecialize(x))
   local u = x isa Symbolics.Num ? Symbolics.unwrap(x) : x
   u isa Number && return u

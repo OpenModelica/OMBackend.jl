@@ -33,9 +33,8 @@
 *
 */ =#
 
-using MetaModelica
 using ExportAll
-using Absyn
+import MetaModelica
 #= For interactive evaluation. =#
 using ModelingToolkit
 using SymbolicUtils
@@ -73,19 +72,16 @@ systems and for algebraic rows of generated discrete variables.
 """
 daeFallbackSolver() = FBDF(autodiff = ADTypes.AutoFiniteDiff())
 
-import ..CodeGeneration
-import ..Runtime
-import .Backend.BDAE
-import .Backend.BDAECreate
-import .Backend.BDAEUtil
-import .Backend.Causalize
-import .Backend.ClockPartitioning
-import .Backend.ClockedLowering
-import .SimulationCode
+import .CodeGeneration
+import .Runtime
+import .OMJLIR
+import .LowerFlatModel
+import .LowerFlatModel: FunctionList
+import .Passes
+import .SimCode
 
 import Base.Meta
 import JuliaFormatter
-import OMBackend.CodeGeneration
 import OMFrontend
 import Plots
 import SCode
@@ -190,8 +186,6 @@ function warnMissingStartValues(enabled::Bool)
 end
 
 @enum BackendMode begin
-  DAE_MODE = 1
-  ODE_MODE = 2 #Currently not in operation
   MTK_MODE = 3
   #=
     Direct DifferentialEquations.jl emission. Builds an `ODEProblem` with an
@@ -220,17 +214,6 @@ Read at each call site, so changes take effect immediately without restarting Ju
 """
 const DEFAULT_BACKEND_MODE = Ref{BackendMode}(IMTK_MODE)
 
-function info()
-  println("OMBackend.jl")
-  println("A Julia backend for the Equation Oriented Language Modelica!")
-  println("Run any test module by executing runExample(<model-name>)")
-  println("Available Example models include:")
-  for (k,v) in EXAMPLE_MODELS
-    println(k)
-  end
-end
-
-
 """
   MTK Models that have been compiled one time.
 TODO: Optimally we should keep the frontend structure
@@ -244,6 +227,29 @@ const COMPILED_MODELS_MTK = Dict{String, Tuple{Expr, Bool, UInt64}}()
 DEJL (DifferentialEquations.jl) models that have been compiled one time.
 """
 const COMPILED_MODELS_DEJL = Dict{String, Tuple{Expr, Bool, UInt64}}()
+
+"How many times each model's code was dumped in this process (`dumpGeneratedCode`)."
+const CODE_DUMP_COUNT = Dict{String, Int}()
+const CODE_DUMP_LOCK = ReentrantLock()
+
+"""
+    dumpGeneratedCode(modelName, code)
+
+With `OMBACKEND_CODE_DUMP_DIR` set, write the generated module to
+`<dir>/<modelName>-<n>.jl`, `n` counting the translations of the model in this
+process: the reference corpus for comparing the code generation before and after
+a backend change.
+"""
+function dumpGeneratedCode(modelName::String, code::Expr)::Nothing
+  local dir = get(ENV, "OMBACKEND_CODE_DUMP_DIR", "")
+  isempty(dir) && return nothing
+  lock(CODE_DUMP_LOCK) do
+    local n = CODE_DUMP_COUNT[modelName] = get(CODE_DUMP_COUNT, modelName, 0) + 1
+    mkpath(dir)
+    write(joinpath(dir, "$(modelName)-$(n).jl"), string(code))
+  end
+  return nothing
+end
 
 """
 Array-preserving code generation for flat models translated with `scalarized = false`
@@ -267,14 +273,9 @@ const ARRAY_ODE_MODELS = Set{String}()
 # Per-model log-run directory captured at translate (`lower`) time. Looked up
 # at simulate time by `simulateModel` so any dumps emitted during the
 # post-MTK / `buildDirectRHSProblem` / `_solveDAEInitialization!` codegen
-# paths land in the same per-model run directory as the BDAE/simCode logs,
+# paths land in the same per-model run directory as the OMJLIR/simCode logs,
 # not the session root. Keyed by canonical model name.
 const MODEL_RUN_DIRS = Dict{String, String}()
-
-function logRunModelName(frontendDAE::DAE.DAE_LIST)::String
-  @match DAE.COMP(ident = ident) = listHead(frontendDAE.elementLst)
-  return ident
-end
 
 function logRunModelName(frontendDAE::OMFrontend.Frontend.FlatModel)::String
   return string(frontendDAE.name)
@@ -313,108 +314,78 @@ end
     forgetModel(modelName::String) -> Nothing
 
 Drops the cached build of one model and frees its external objects (tables) by their
-destructors. For a long run over many models (a coverage worker): without it every model's
-build and tables stay for the whole session. A solution of the model that reads one of its
-tables afterwards throws; simulate the model again for a new one.
+destructors, with its generated code and its run directory. For a long
+run over many models (a coverage worker): without it every model's build, tables and code stay
+for the whole session. A solution of the model that reads one of its tables afterwards throws;
+simulate the model again for a new one (a translate).
 """
 function forgetModel(modelName::String)::Nothing
-  IMTKGen.forgetBuild(canonicalName(modelName))
+  local cname = canonicalName(modelName)
+  IMTKGen.forgetBuild(cname)
+  for name in unique((modelName, cname))
+    delete!(COMPILED_MODELS_MTK, name)
+    delete!(COMPILED_MODELS_DEJL, name)
+    delete!(MODEL_RUN_DIRS, name)
+  end
   return nothing
 end
 
 """
- This function lowers the given Hybrid DAE to target code.
- It does so by first lowering the code to the backend representation and then to
- the simulation code representation.
- Finally, target code is generated depending on the backend mode (defaults to MTK mode).
-The function list contains the sequential parts of a modelica model, that is the different functions that the model might use.
-This is not part of the lowering process but it is to be generated before we generate MTK target code
+    translate(fm; functionList = nothing, BackendMode = DEFAULT_BACKEND_MODE[], warnMissingStartValues = nothing,
+              eliminateNonDynamic = nothing, observedFilter = nothing, checkSimCode = true, scalarized = true)
+
+The target code of the flat model `fm` and its functions (the frontend's function list): `fm`
+lowered to OMJLIR and through its passes (`omjlirModel`), to the simulation code and its
+passes (SimCode.simulationCode; SimCode.deSimulationCode for DEMode), checked
+(`checkSimCode`), and the code generated for the backend mode. A flat model with arrays kept
+(`scalarized = false`) goes to the array-preserving generation first (ARRAY_ODE_GENERATION), to
+this path where it is outside its scope.
 """
-Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.DAE_LIST, OMFrontend.Frontend.FlatModel});
-                   functionList = nothing,
-                   BackendMode = DEFAULT_BACKEND_MODE[],
-                   warnMissingStartValues = nothing,
-                   eliminateNonDynamic::Union{Nothing, Bool, SimulationCode.EliminationOptions} = nothing,
+function translate(fm::OMFrontend.Frontend.FlatModel;
+                   functionList::Union{Nothing, FunctionList} = nothing,
+                   BackendMode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
+                   warnMissingStartValues::Union{Nothing, Bool} = nothing,
+                   eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
                    checkSimCode::Bool = true,
-                   returnNameMap::Bool = false,
                    scalarized::Bool = true)
   local previousWarnSetting = WARN_MISSING_START_VALUES[]
-  local runId = createLogRunId(logRunModelName(frontendDAE))
+  local modelName = logRunModelName(fm)
+  local runId = createLogRunId(modelName)
+  MODEL_RUN_DIRS[canonicalName(modelName)] = runId
   resetFallbacks!()
-  if warnMissingStartValues !== nothing
-    warnMissingStartValues isa Bool || error("warnMissingStartValues must be Bool or nothing")
-    WARN_MISSING_START_VALUES[] = warnMissingStartValues
-  end
+  warnMissingStartValues === nothing || (WARN_MISSING_START_VALUES[] = warnMissingStartValues)
   try
-    frontendDAE isa OMFrontend.Frontend.FlatModel && delete!(ARRAY_ODE_MODELS, canonicalName(frontendDAE.name))
-    if frontendDAE isa OMFrontend.Frontend.FlatModel && !scalarized && ARRAY_ODE_GENERATION[]
-      local arrayResult = @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(frontendDAE; functionList)
+    delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
+    if !scalarized && ARRAY_ODE_GENERATION[]
+      local arrayResult = @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(fm; functionList)
       arrayResult === nothing || return arrayResult
     end
     return withLogRunDir(runId) do
-      #= Dump the flat model with functions as it arrives from the frontend =#
-      @BACKEND_LOGGING if frontendDAE isa OMFrontend.Frontend.FlatModel
-        local fLst = functionList !== nothing ? functionList : MetaModelica.nil
-        debugWrite(logPath("backend/simCode", "frontend_initialModel.log"),
-          replace(OMFrontend.Frontend.toFlatString(frontendDAE, fLst), "\\n" => "\n"))
-      end
-      local bDAE = @BACKEND_PERFLOG "[backendAPI] lower" (frontendDAE isa OMFrontend.Frontend.FlatModel ?
-                                                          lower(frontendDAE; scalarized) : lower(frontendDAE))
-      #= Clocked partitions are partitioned (ClockPartitioning), not generated yet =#
-      isempty(bDAE.clocked.partitions) ||
-        unsupported("clocked partitions (synchronous Modelica, MLS 16): no code generation for them yet",
-                    ClockPartitioning.describe(bDAE.clocked))
-      local simCode
-      if BackendMode == DAE_MODE
-        error("DAE-mode is deprecated.")
-      elseif BackendMode == DEMode
-        #=
-          Direct DifferentialEquations.jl path: a subset of the MTK path's
-          SimCode passes (not, e.g., lowerComplexOperatorRecords,
-          evaluateConstantFunctionOutputs, foldExplicitSingleAssign,
-          propagateInitialValues), no observed-equation work, the DE emitter.
-        =#
-        simCode = _simCodeWithFunctions(bDAE, functionList)
-        local nameMap = NameRewriteMap()
-        simCode = _runSimCodePasses(simCode, [
-          #= A pure string-shortening pass, a no-op for enum-free models. =#
-          "simplifyEnumLiteralPaths" => SimulationCode.simplifyEnumLiteralPaths,
-          "flattenRecordCallSites" => SimulationCode.flattenRecordCallSites,
-          "canonicalizeCrefNames" => sc -> SimulationCode.canonicalizeCrefNames(sc; nameMap = nameMap),
-          "resolveIfExpInBindings" => SimulationCode.resolveIfExpInBindings!,
-          "pruneConstantConditions" => SimulationCode.pruneConstantConditions,
-          "foldParameterClosure" => SimulationCode.foldParameterClosure,
-          "inlinePreOfConstantParameters" => SimulationCode.inlinePreOfConstantParameters,
-          "propagateConstants" => SimulationCode.propagateConstants,
-          "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
-          "eliminateRHSEquivalentEquations" => SimulationCode.eliminateRHSEquivalentEquations,
-          "simplifySemiLinear" => SimulationCode.simplifySemiLinear,
-          "removeRedundantEquations" => SimulationCode.removeRedundantEquations,
-          "eliminateConstantParameters" => SimulationCode.eliminateConstantParameters,
-          #= After eliminateConstantParameters: `state = param` (param bound to a
-             literal) is `state = literal` by then. =#
-          "eliminateFrozenStates" => SimulationCode.eliminateFrozenStates,
-          "pruneConstantConditions" => SimulationCode.pruneConstantConditions])
-        if !isempty(simCode.structuralTransitions) || !isempty(simCode.subModels)
-          error("DEMode does not support structural transitions / VSS at this time. " *
-                "Re-run with mode = OMBackend.MTK_MODE.")
-        end
+      #= The flat model with its functions as it arrives from the frontend =#
+      @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "frontend_initialModel.log"),
+        replace(OMFrontend.Frontend.toFlatString(fm, functionList === nothing ? MetaModelica.nil : functionList), "\\n" => "\n"))
+      local model = @BACKEND_PERFLOG "[backendAPI] lower" omjlirModel(fm; functionList, scalarized)
+      if BackendMode == DEMode
+        #= Direct DifferentialEquations.jl path: a subset of the MTK path's SimCode passes (not,
+           e.g., the Complex lowering, the function evaluation, the folds, the initial values),
+           no observed-equation work, the DE emitter. =#
+        local simCode = SimCode.deSimulationCode(model)
+        (SimCode.hasStructuralTransitions(simCode) || SimCode.hasSubModels(simCode)) &&
+          error("DEMode does not support structural transitions / VSS at this time. Re-run with mode = OMBackend.MTK_MODE.")
         _checkSimCodeBeforeCodegen(simCode, checkSimCode)
-        return _translationResult(generateDETargetCode(simCode), nameMap, returnNameMap)
+        return _translationResult(generateDETargetCode(simCode))
       elseif BackendMode == MTK_MODE || BackendMode == IMTK_MODE
-        local nameMap = NameRewriteMap()
-        simCode = mtkSimCode(bDAE, functionList; eliminateNonDynamic, observedFilter, nameMap)
+        local simCode = mtkSimCode(model; eliminateNonDynamic, observedFilter)
         _checkSimCodeBeforeCodegen(simCode, checkSimCode)
-        local _genCode = if BackendMode == IMTK_MODE
+        local genCode = if BackendMode == IMTK_MODE
           @BACKEND_PERFLOG "[backendAPI] generateIMTKTargetCode" generateIMTKTargetCode(simCode)
         else
           @BACKEND_PERFLOG "[backendAPI] generateMTKTargetCode" generateMTKTargetCode(simCode)
         end
-        return _translationResult(_genCode, nameMap, returnNameMap)
-      else
-        @error "Unsupported BackendMode: $BackendMode. Valid modes are: MTK_MODE, IMTK_MODE, DEMode"
+        return _translationResult(genCode)
       end
+      error("Unsupported BackendMode: $BackendMode. Valid modes are: MTK_MODE, IMTK_MODE, DEMode")
     end
   finally
     WARN_MISSING_START_VALUES[] = previousWarnSetting
@@ -422,462 +393,69 @@ Base.@nospecializeinfer function translate(@nospecialize(frontendDAE::Union{DAE.
 end
 
 """
-    mtkSimCode(bDAE::BDAE.BACKEND_DAE, functionList; eliminateNonDynamic = nothing,
-               observedFilter = nothing, nameMap = NameRewriteMap()) -> SimulationCode.SIM_CODE
+    omjlirModel(fm; functionList = nothing, scalarized = true) -> OMJLIR.Model
 
-The SimCode the MTK and IMTK paths generate code from: `bDAE` with its Modelica functions through
-the SimCode passes. A translate's, and that of a model recompiled during its simulation
-(Runtime.translateToSimCode: with only four of the passes, a MultiBody model's redundant
-equation stayed and the recompiled system was unbalanced).
+The OMJLIR model of the flat model `fm` and its functions (the frontend's function list),
+through the passes (Passes.PIPELINE): what the simulation code is lowered from. A flat model
+with arrays kept (`scalarized = false`, OM's `scalarize = false`) is scalarized first: the
+backend takes scalars.
 """
-function mtkSimCode(bDAE::BDAE.BACKEND_DAE, functionList::Union{Nothing, List};
-                    eliminateNonDynamic::Union{Nothing, Bool, SimulationCode.EliminationOptions} = nothing,
-                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                    nameMap::NameRewriteMap = NameRewriteMap())::SimulationCode.SIM_CODE
-  local simCode = _simCodeWithFunctions(bDAE, functionList)
-  #= The variables a validation asks for, known to the parameter eliminations
-     (SimulationCode._requestedNames); the filter itself is applied after the passes. =#
-  observedFilter === nothing || (@assign simCode.observedFilter = _observedFilterStrings(observedFilter))
-  simCode = _runSimCodePasses(simCode, [
-    #= Collapse qualified ENUM_LITERAL paths to leaf `Type.Literal` IDENT form. =#
-    "simplifyEnumLiteralPaths" => SimulationCode.simplifyEnumLiteralPaths,
-    #= Flatten record arguments in equation call sites to match the flattened
-       function signatures (_simCodeWithFunctions). =#
-    "flattenRecordCallSites" => SimulationCode.flattenRecordCallSites,
-    #= Canonicalize every generated name once SimCode has its final record-call shape. =#
-    "canonicalizeCrefNames" => sc -> SimulationCode.canonicalizeCrefNames(sc; nameMap = nameMap),
-    #= Resolve constant-condition IFEXPs in parameter bindings =#
-    "resolveIfExpInBindings" => SimulationCode.resolveIfExpInBindings!,
-    #= Prune IFEXP/IF_EQUATION conditions that became compile-time constants. =#
-    "pruneConstantConditions" => SimulationCode.pruneConstantConditions,
-    #= Constant propagation and alias elimination run AFTER record flattening
-       so that all CREF references are in their final form before substitution.
-       Running these earlier caused dangling references when flattenRecordCallSites
-       introduced new CREFs for already-eliminated variables.
-       The BLT-driven parameter-closure fold runs before propagateConstants so that
-       parameter-closure chains (e.g. KinematicPTP's seven algebraic unknowns
-       defined solely by parameter expressions) are parameters before MTK sees
-       them: zero guesses on those unknowns gave NaN/Inf in the Newton init. =#
-    "foldParameterClosure" => SimulationCode.foldParameterClosure,
-    "inlinePreOfConstantParameters" => SimulationCode.inlinePreOfConstantParameters,
-    "propagateConstants" => SimulationCode.propagateConstants,
-    "lowerComplexOperatorRecords" => SimulationCode.lowerComplexOperatorRecords,
-    "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
-    "eliminateRHSEquivalentEquations" => SimulationCode.eliminateRHSEquivalentEquations,
-    #= MLS 3.7.2.5's rule for chains of semiLinear equations: needs the aliases resolved. =#
-    "simplifySemiLinear" => SimulationCode.simplifySemiLinear,
-    "removeRedundantEquations" => SimulationCode.removeRedundantEquations,
-    #= Shrinks the parameter list MTK sees before structural_simplify. The pass
-       skips VSS / sub-model variants where a parameter could be re-bound
-       at runtime. =#
-    "eliminateConstantParameters" => SimulationCode.eliminateConstantParameters,
-    #= Drop protected sink variables and their defining equations; before
-       eliminateDeadParameters, so parameters whose only consumer was a dropped
-       sink are swept too. =#
-    "dropObservationOnlyVariables" => SimulationCode.dropObservationOnlyVariables,
-    "eliminateDeadParameters" => SimulationCode.eliminateDeadParameters,
-    #= Function outputs that are constants for every value of the call's
-       variables (OpenModelica's evalFunc; MSL Spice3's capacitances): before
-       eliminateFrozenStates, so derivatives they multiplied vanish. =#
-    "evaluateConstantFunctionOutputs" => SimulationCode.evaluateConstantFunctionOutputs,
-    #= After eliminateConstantParameters: `state = param` (param bound to a
-       literal) is `state = literal` by then. =#
-    "eliminateFrozenStates" => SimulationCode.eliminateFrozenStates,
-    #= Generalised single-defining-equation tearing: substitutes `0 = v - rhs`
-       where v is an unprotected ALG_VARIABLE uniquely defined by that residual.
-       Skips sub-models / metaModel / flatModel, bracketed (scalarized array)
-       names and names already in aliasMap; aborts the fold if a folded name
-       survives anywhere. `x = 1/y` with y in no other equation first as `y = 1/x`. =#
-    "orientReciprocalEquations" => SimulationCode.orientReciprocalEquations,
-    "foldExplicitSingleAssign" => SimulationCode.foldExplicitSingleAssign,
-    #= Second alias elimination: earlier simplifiers (foldExplicitSingleAssign,
-       propagateConstants, dropObservationOnlyVariables) collapse n-term connector
-       flow sums into 2-term residuals like `a + b = 0` the first could not see. =#
-    "eliminateAliasVariables" => SimulationCode.eliminateAliasVariables,
-    #= Chains of semiLinear equations the second alias elimination joined (MSL
-       FluidHeatFlow's massless pump: its port's H_flow became the ambient's). =#
-    "simplifySemiLinear" => SimulationCode.simplifySemiLinear])
-  #= Second RHS-equivalence pass: the alias-elim2 above can collapse two
-     equations of the form `Xi - der(s_i)` onto the same `der(s)`. The
-     pass keys equations by RHS string before its own substitution
-     propagates, so a single iteration can leave equivalent pairs
-     ungrouped when one pair must fold first to expose another's key
-     (e.g. mass1_v → brake_v before ifEq_tmp1 ↔ ifEq_tmp2 becomes
-     visible via the now-shared der(brake_v)). Iterate to fixed point;
-     a no-op call is cheap and returns simCode unchanged. =#
-  let prev = -1
-    for _ in 1:6
-      simCode = _runSimCodePasses(simCode, ["eliminateRHSEquivalentEquations" =>
-                                              SimulationCode.eliminateRHSEquivalentEquations])
-      local n = length(simCode.residualEquations)
-      n == prev && break
-      prev = n
-    end
-  end
-  simCode = _runSimCodePasses(simCode, [
-    "classifyAdditionalDiscretes" => SimulationCode._classifyAdditionalDiscreteVariables,
-    "pruneConstantConditions" => SimulationCode.pruneConstantConditions])
-  #= Output-only variable elimination runs AFTER const-prop and alias-elim,
-     so that alias chains are resolved and the output-only subgraph is cleanly separated.
-     A fresh matching is computed from the current equation/variable set. =#
-  local elimOpts = if eliminateNonDynamic === true
-    SimulationCode.EliminationOptions()
-  elseif eliminateNonDynamic isa SimulationCode.EliminationOptions
-    eliminateNonDynamic
-  else
-    nothing
-  end
-  if elimOpts !== nothing
-    simCode = _runSimCodePasses(simCode, ["eliminateNonDynamic" =>
-                                            sc -> SimulationCode.eliminateOutputOnlyVariables(sc, elimOpts)])
-  end
-  #= Observed filter: controls which alias-eliminated variables become observed equations.
-     Default (nothing): skip ALL alias observed equations for fast compilation.
-     With filter patterns: keep only matching aliases as observed. =#
-  local observedBefore = SimulationCode.simCodeMetrics(simCode)
-  local observedT0 = time()
-  if observedFilter === nothing
-    #= Default: drop alias-map entries whose eliminated name is an
-       internal/auto-generated cref (scalarized array indices like
-       `R_T[1][2]`, frame-internal `frame_a_t[3]`, etc.) but KEEP
-       entries whose eliminated name is a user-visible Modelica
-       identifier. Without this, state-state aliases produced by
-       OMBackend's alias-elim passes (e.g. `rev_phi ~ damper_phi_rel`
-       from the Revolute joint flange constraint) get silently
-       dropped before codegen, so `sol(t; idxs = lookup[\"rev_phi\"])`
-       raises KeyError in tests that query the eliminated name.
-       A "user-visible" name is heuristic: no `[` (no scalarized array
-       subscript). The bracket guard catches the vast majority of MultiBody internals (Engine1a's
-       876 aliases collapse to a small handful) while preserving the
-       named Modelica vars that user code can reasonably query. =#
-    if !isempty(simCode.aliasMap)
-      local originalCount = length(simCode.aliasMap)
-      local kept = filter(simCode.aliasMap) do entry
-        #= Drop dangling aliases whose representative has itself been
-           eliminated from the SimVar HT (e.g. FrozenStateConstraint:
-           `a → F` survives in aliasMap after `F` is removed by
-           eliminateFrozenStates; emitting `a ~ F` then raises
-           UndefVarError at the eval that binds alias names). =#
-        _isUserVisibleAliasName(entry.eliminatedName) &&
-          haskey(simCode.stringToSimVarHT, entry.representativeName)
-      end
-      @debug "[SIMCODE: observedFilter] kept $(length(kept)) of $originalCount user-visible alias observed equations (default filter)"
-      @assign simCode.aliasMap = kept
-    end
-  else
-    local filterStrings = _observedFilterStrings(observedFilter)
-    @assign simCode.observedFilter = filterStrings
-    #= Filter alias map entries to keep only matching patterns =#
-    if !isempty(simCode.aliasMap)
-      local originalCount = length(simCode.aliasMap)
-      local patterns = [Regex(p) for p in filterStrings]
-      local filteredMap = filter(simCode.aliasMap) do entry
-        any(p -> occursin(p, entry.eliminatedName), patterns)
-      end
-      @assign simCode.aliasMap = filteredMap
-      @debug "[SIMCODE: observedFilter] kept $(length(filteredMap)) of $originalCount alias observed equations"
-    end
-  end
-  SimulationCode.logSimCodePassMetrics("observedFilter", observedBefore, simCode, time() - observedT0)
-  simCode = SimulationCode.cleanupTrivialResidualEquations(simCode; sourcePass = "observedFilter")
-  #= Forward-propagate initialization values through the causalized equations
-     (time=0 + params + starts -> source/ramp -> dependent flow/pressure),
-     attaching resolved values as start attributes so the init solver starts
-     from a finite, consistent iterate instead of a 0.0 that divides by zero. =#
-  simCode = _runSimCodePasses(simCode, [
-    "propagateInitialValues" => SimulationCode.propagateInitialValues,
-    #= Re-derive SCCs against the residual array MTK will actually see.
-       The SCC stamp written by transformToSimCode indexes into the
-       pre-pipeline residual list and is stale after alias-elim,
-       foldExplicitSingleAssign, output-only elimination, etc. MTK
-       codegen needs accurate cycle info to extract NonlinearSystem
-       sub-blocks per cyclic SCC. =#
-    "recomputeStronglyConnectedComponents" => SimulationCode.recomputeStronglyConnectedComponents])
-  #= Standalone index-overconstraint diagnostic on the final SimCode (gated
-     by OMBACKEND_INDEX_DIAG); inspects the differential-incidence
-     localization without mutating the system. =#
-  simCode = SimulationCode.indexOverconstraintDiagnostic(simCode)
-  return simCode
+function omjlirModel(fm::OMFrontend.Frontend.FlatModel; functionList::Union{Nothing, FunctionList} = nothing,
+                     scalarized::Bool = true)::OMJLIR.Model
+  scalarized || (fm = @BACKEND_PERFLOG "[backendAPI] scalarizeKeptArrays" OMFrontend.Frontend.scalarizeKeptArrays(fm))
+  local model = LowerFlatModel.lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
+  return Passes.runPasses!(model)
 end
 
-#= SimCode of `bDAE` with its Modelica functions, their record parameters
-   flattened (the call sites follow in flattenRecordCallSites). =#
-function _simCodeWithFunctions(bDAE::BDAE.BACKEND_DAE, functionList)::SimulationCode.SIM_CODE
-  local simCode = @BACKEND_PERFLOG "[backendAPI] generateSimulationCode" generateSimulationCode(bDAE; mode = MTK_MODE)
-  #= before the passes: they read the equations' sides =#
-  SimulationCode.lowerInitialIfEquations!(simCode)
-  SimulationCode.splitTupleInitialEquations!(simCode)
-  local (functions, externalRuntimeNeeded) = functionList === nothing ? (SimulationCode.ModelicaFunction[], false) :
-    generateSimCodeFunctions(functionList)
-  local modelFunctions = SimulationCode.flattenRecordParameters(functions)
-  @assign begin
-    simCode.functions = modelFunctions
-    simCode.externalRuntime = externalRuntimeNeeded
-  end
-  #= The modes of a structural model call the model's functions: a mode's code qualifies the
-     calls by its own list (an empty one left every call an UndefVarError in the module). =#
-  local modes = simCode.subModels
-  for i in eachindex(modes)
-    local mode = modes[i]
-    @assign mode.functions = modelFunctions
-    modes[i] = mode
-  end
-  SIMCODE_DUMP_SEQ[] = 0
-  @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "simCode_00_initial.log"), SimulationCode.dumpSimCode(simCode))
-  return simCode
-end
+"""
+    mtkSimCode(model; eliminateNonDynamic = nothing, observedFilter = nothing) -> SimCode.SIM_CODE
 
-#= The number of the backend-logging SimCode dumps of the current translate: a
-   pass that runs twice (pruneConstantConditions, eliminateAliasVariables) keeps
-   both dumps. =#
-const SIMCODE_DUMP_SEQ = Ref(0)
+The simulation code the MTK and IMTK paths generate code from: the OMJLIR model `model` through
+the SimCode passes (SimCode.simulationCode). A translate's, and that of a model recompiled
+during its simulation (Runtime.translateToSimCode).
+"""
+mtkSimCode(model::OMJLIR.Model; eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
+           observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing)::SimCode.SIM_CODE =
+  SimCode.simulationCode(model; eliminateNonDynamic,
+                         observedFilter = observedFilter === nothing ? nothing : _observedFilterStrings(observedFilter))
 
-#= Runs `passes` (name => pass) in order; with backend logging on, dumps the
-   SimCode after each to simCode_<NN>_after_<name>.log. =#
-function _runSimCodePasses(simCode::SimulationCode.SIM_CODE, passes::Vector{<:Pair{String}})::SimulationCode.SIM_CODE
-  for (name, pass) in passes
-    simCode = SimulationCode.runSimCodePass(name, simCode, pass)
-    @BACKEND_LOGGING begin
-      SIMCODE_DUMP_SEQ[] += 1
-      debugWrite(logPath("backend/simCode", "simCode_$(lpad(SIMCODE_DUMP_SEQ[], 2, '0'))_after_$(name).log"),
-                 SimulationCode.dumpSimCode(simCode))
-    end
-  end
-  return simCode
-end
-
-#= Heuristic predicate: is the eliminated alias name something a Modelica
-   user might reasonably query via `sol(t; idxs = :name)`? Scalarized array
-   indices and frame-internal connector names contain `[` and are filtered
-   out by default; clean identifiers like `rev_phi` / `damper_w_rel` are
-   kept so the alias observed equation reaches MTK. =#
-function _isUserVisibleAliasName(name::AbstractString)::Bool
-  occursin('[', name) && return false
-  return true
-end
-
-function _translationResult(result::Tuple{String, Expr}, nameMap::NameRewriteMap,
-                            returnNameMap::Bool)
-  if returnNameMap
-    return (result[1], result[2], nameMap)
-  end
+function _translationResult(result::Tuple{String, Expr})::Tuple{String, Expr}
+  dumpGeneratedCode(result[1], result[2])
   return result
 end
 
-function _checkSimCodeBeforeCodegen(simCode::SimulationCode.SIM_CODE, checkSimCode::Bool)
-  if !checkSimCode
-    return nothing
-  end
-  local checkResult = SimulationCode.SimCodeCheck.check(simCode)
-  # An :error cref/canonical violation means a residual references a name that
-  # resolves to no SimVar/eliminated/builtin; code generation would otherwise
-  # throw a bare UndefVarError deep in MTK. Abort with the located reason, and
-  # skip the verbose warning report so a caller catching SimCodeCheckError can
-  # silence the failure entirely.
-  local blocking = filter(v -> v.severity === :error &&
-                               (v.rule === :canonical_cref_names || v.rule === :cref_resolution),
-                          checkResult.violations)
+"""
+The simulation code checked before the code generation (SimCode.check): a reference that
+resolves to no variable, eliminated variable or builtin aborts it with the located reason (the
+code generation would otherwise throw a bare UndefVarError deep in MTK); the other violations
+are reported.
+"""
+function _checkSimCodeBeforeCodegen(simCode::SimCode.SIM_CODE, checkSimCode::Bool)::Nothing
+  checkSimCode || return nothing
+  local result = SimCode.check(simCode)
+  local blocking = filter(v -> v.severity === :error && v.rule === :cref_resolution, result.violations)
   if !isempty(blocking)
     local details = join([string("  - ", v.where, ": ", v.detail) for v in blocking], "\n")
-    throw(SimulationCode.SimCodeCheck.SimCodeCheckError(
+    throw(SimCode.SimCodeCheckError(
       string("Code generation aborted for ", simCode.name, ": ", length(blocking),
              " unresolved component reference(s). These references do not resolve ",
              "against the simulation variable table, the eliminated-variable set, or ",
              "the builtin set, so code generation would raise an undefined-variable error.\n", details)))
   end
-  SimulationCode.SimCodeCheck.report(stderr, checkResult; modelName = string(simCode.name))
+  SimCode.report(stderr, result; modelName = simCode.name)
   return nothing
-end
-
-"""
-`function dumpInitialSystem(frontendDAE::DAE.DAE_LIST)`
- Dumps a textual representation of the initial system.
-"""
-function dumpInitialSystem(frontendDAE::DAE.DAE_LIST)::String
-  str =  "Length of frontend DAE:" * string(length(frontendDAE.elementLst)) * "\n"
-  bDAE = BDAECreate.lower(frontendDAE)
-  str *= BDAEUtil.stringHeading1(bDAE, "translated")
-  return str
-end
-
-"""
-`function printInitialSystem(frontendDAE::DAE.DAE_LIST)`
- Dumps a textual representation of the initial system.
-"""
-function printInitialSystem(frontendDAE::DAE.DAE_LIST)
-  print(dumpInitialSystem(frontendDAE::DAE.DAE_LIST))
-end
-
-"""
- Transforms given DAE-IR/Hybrid DAE to backend DAE-IR (BDAE-IR)
-"""
-function lower(frontendDAE::DAE.DAE_LIST)::BDAE.BACKEND_DAE
-  local modelName = logRunModelName(frontendDAE)
-  local runId = createLogRunId(modelName)
-  # Remember the translate-time run dir so simulate-time code can land its
-  # dumps in the same per-model directory. Key by canonical name to match the
-  # lookup in simulateModel.
-  MODEL_RUN_DIRS[canonicalName(modelName)] = runId
-  local lowerWork = function()
-    local bDAE::BDAE.BACKEND_DAE
-    @debug "Length of frontend DAE:" length(frontendDAE.elementLst)
-    @assert typeof(listHead(frontendDAE.elementLst)) == DAE.COMP
-    #= Create Backend structure from Frontend structure =#
-    bDAE = BDAECreate.lower(frontendDAE)
-    @debug "[BDAE] translated; full dump is available in backend/bdae logs when backend logging is enabled"
-    #= Transform ASUB expressions: der(array)[i] to der(array[i]) =#
-    bDAE = Causalize.transformASUBExpressions(bDAE)
-    #= Order-lower nested derivatives der(der(x)) into first-order auxiliary states =#
-    bDAE = Causalize.lowerHigherOrderDerivatives(bDAE)
-    #= Mark state variables =#
-    bDAE = Causalize.detectStates(bDAE)
-    @debug "[BDAE] states marked"
-    #= Flatten CREF_QUAL with subscripted array finals =#
-    bDAE = Causalize.flattenArrayCrefs(bDAE)
-    #= Transform if expressions to if equations =#
-    bDAE = Causalize.detectIfExpressions(bDAE)
-    @debug "[BDAE] if equations transformed"
-    #= Expand record field array variables into individual scalar element variables =#
-    bDAE = Causalize.expandRecordFieldArrays(bDAE)
-    #= Expand COMPLEX_EQUATIONs into scalar equations =#
-    bDAE = Causalize.expandComplexEquations(bDAE)
-    #= Unroll constant-range reductions before SimCode drops iterator subscripts =#
-    bDAE = Causalize.unrollConstantReductions(bDAE)
-    #= We always residualize since residuals are easier to work with =#
-    bDAE = Causalize.residualizeEveryEquation(bDAE)
-    @debug "[BDAE] residualized"
-    return bDAE
-  end
-  return hasActiveLogRunDir() ? lowerWork() : withLogRunDir(lowerWork, runId)
-end
-
-
-"""
-  Transforms given FlatModelica to backend DAE-IR (BDAE-IR).
-"""
-#= `scalarized = false`: the flat model was flattened with arrays kept (OM's
-   `scalarize = false`); it is scalarized here first, the backend takes scalars. =#
-function lower(fm::OMFrontend.Frontend.FLAT_MODEL; scalarized::Bool = true)
-  if !scalarized
-    fm = @BACKEND_PERFLOG "[backendAPI] scalarizeKeptArrays" OMFrontend.Frontend.scalarizeKeptArrays(fm)
-  end
-  local modelName = logRunModelName(fm)
-  local runId = createLogRunId(modelName)
-  MODEL_RUN_DIRS[canonicalName(modelName)] = runId
-  local lowerWork = function()
-    local preprocessedFM = FrontendUtil.handleBuiltin(fm)
-    local bDAE = BDAECreate.lower(preprocessedFM)
-    #= The clocked partitions out of the continuous system, before its passes (synchronous
-       Modelica, MLS 16) =#
-    bDAE = ClockPartitioning.partitionClocks(bDAE)
-    @BACKEND_LOGGING isempty(bDAE.clocked.partitions) ||
-      debugWrite(logPath("backend/bdae", "bdae_clockedPartitions.log"), ClockPartitioning.describe(bDAE.clocked))
-    #= and as when-clauses of the continuous system, one per base clock =#
-    bDAE = ClockedLowering.lowerClockedPartitions(bDAE)
-    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_initial.log"), BDAEUtil.stringHeading1(bDAE, "initial BDAE"))
-    #= Dump the actual DAE.Exp structure to a file for analysis =#
-    @BACKEND_LOGGING begin
-      open(logPath("backend/bdae", "bdae_structureDump.log"), "w") do io
-        println(io, "=== BDAE Expression Structure Dump ===")
-        for (i, eq) in enumerate(first(bDAE.eqs).orderedEqs)
-          if i <= 20  # Dump first 20 equations
-            println(io, "\n--- Equation $i: $(typeof(eq)) ---")
-            dump(io, eq; maxdepth=10)
-          end
-        end
-        println(io, "\n=== First 10 Variables ===")
-        for (i, v) in enumerate(first(bDAE.eqs).orderedVars)
-          if i <= 10
-            println(io, "\n--- Variable $i ---")
-            dump(io, v; maxdepth=8)
-          end
-        end
-      end
-    end
-    #= Reclassify integer variables as parameters and remove their equations =#
-    bDAE = Causalize.resolveIntegerVariables(bDAE)
-    #= Transform ASUB expressions: der(array)[i] to der(array[i]) =#
-    bDAE = Causalize.transformASUBExpressions(bDAE)
-    #= Order-lower nested derivatives der(der(x)) into first-order auxiliary states =#
-    bDAE = Causalize.lowerHigherOrderDerivatives(bDAE)
-    #= Mark state variables =#
-    bDAE = Causalize.detectStates(bDAE)
-    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterDetectStates.log"), BDAEUtil.stringHeading1(bDAE, "after detect states"))
-
-    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterASUBTransform.log"), BDAEUtil.stringHeading1(bDAE, "after ASUB transformation"))
-    #= Flatten CREF_QUAL with subscripted array finals to match hash table entries =#
-    bDAE = Causalize.flattenArrayCrefs(bDAE)
-    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterFlattenCrefs.log"), BDAEUtil.stringHeading1(bDAE, "after CREF flattening"))
-    #= Transform if expressions to if equations =#
-    bDAE = Causalize.detectIfExpressions(bDAE)
-    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterIfExpressions.log"), BDAEUtil.stringHeading1(bDAE, "after if expressions"))
-    #= Expand record field array variables into individual scalar element variables =#
-    bDAE = Causalize.expandRecordFieldArrays(bDAE)
-    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterExpandRecordFields.log"), BDAEUtil.stringHeading1(bDAE, "after record field expansion"))
-    #= Expand COMPLEX_EQUATIONs into scalar equations =#
-    bDAE = Causalize.expandComplexEquations(bDAE)
-    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterExpandComplex.log"), BDAEUtil.stringHeading1(bDAE, "after complex equation expansion"))
-    #= Unroll constant-range reductions before SimCode drops iterator subscripts =#
-    bDAE = Causalize.unrollConstantReductions(bDAE)
-    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterUnrollReductions.log"), BDAEUtil.stringHeading1(bDAE, "after reduction unrolling"))
-    bDAE = Causalize.residualizeEveryEquation(bDAE)
-    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_afterResidualize.log"), BDAEUtil.stringHeading1(bDAE, "after residualize"))
-    #=
-      Remove unused parameters and or constants.
-      Important optimization for some systems.
-      TODO: also check bindings of all parameters before re-adding this call.
-    =#
-    #bDAE = Causalize.detectUnusedParametersAndConstants(bDAE)
-    #= Find and reclassify discrete variables not marked as discrete. =#
-    @BACKEND_LOGGING debugWrite(logPath("backend/bdae", "bdae_residualTransformation.log"), BDAEUtil.stringHeading1(bDAE, "residuals"))
-    return bDAE
-  end
-  return hasActiveLogRunDir() ? lowerWork() : withLogRunDir(lowerWork, runId)
-end
-
-"""
-  Transforms  BDAE-IR to simulation code for DAE-mode.
-  If `eliminateNonDynamic` is provided, output-only variables are eliminated after SimCode creation.
-"""
-function generateSimulationCode(bDAE::BDAE.BACKEND_DAE;
-                                mode)::SimulationCode.SimCode
-  local simCode = SimulationCode.transformToSimCode(bDAE; mode = mode)
-  @info "[SIMCODE: $(simCode.name)] transformed" residuals=length(simCode.residualEquations) initial=length(simCode.initialEquations) ifEquations=length(simCode.ifEquations) variables=length(simCode.stringToSimVarHT)
-  #= NOTE: propagateConstants, eliminateAliasVariables, and eliminateOutputOnlyVariables
-     are now called from translate() AFTER flattenRecordCallSites, so that record
-     argument expansion does not introduce dangling references to already-eliminated
-     variables, and output-only elimination sees the fully simplified system. =#
-  return simCode
-end
-
-"""
-  Translates functions to simulation code.
-"""
-function generateSimCodeFunctions(functions::List{OMFrontend.Frontend.M_FUNCTION})
-  local simCodeFunctions = SimulationCode.generateSimCodeFunctions(functions)
-  return simCodeFunctions
 end
 
 #= Final SimCode of the most recent codegen, for interactive inspection. =#
 const LAST_SIM_CODE = Ref{Any}(nothing)
 
 """
-    clockedPartitioning(fm::OMFrontend.Frontend.FLAT_MODEL) -> Backend.BDAE.ClockedPartitioning
-
-The clocked partitions of a flat model and their base clocks (Backend.ClockPartitioning), for
-inspection: `ClockPartitioning.describe` prints them.
-"""
-function clockedPartitioning(fm::OMFrontend.Frontend.FLAT_MODEL)::BDAE.ClockedPartitioning
-  return ClockPartitioning.partitionClocks(BDAECreate.lower(FrontendUtil.handleBuiltin(fm))).clocked
-end
-
-"""
-`generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)`
+`generateMTKTargetCode(simCode::SimCode.SIM_CODE)`
   Generates code interfacing ModelingToolkit.jl
   The resulting code is saved in a table which contains functions that were simulated
   this session. Returns the generated modelName and corresponding generated code
 """
-function generateMTKTargetCode(simCode::SimulationCode.SIM_CODE)
+function generateMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
   LAST_SIM_CODE[] = simCode
   #= Target code =#
   (modelName::String, modelCode::Expr) = CodeGeneration.generateMTKCode(simCode)
@@ -905,7 +483,7 @@ end
 `IMTKGen.generateIMTKCode`, which also builds + structurally simplifies the
 System in the backend and dumps it. Caches into `COMPILED_MODELS_MTK`.
 """
-function generateIMTKTargetCode(simCode::SimulationCode.SIM_CODE)
+function generateIMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
   LAST_SIM_CODE[] = simCode
   #= IMTKGen.generateIMTKCode evals the (current) module while building, so the
      loaded module is already fresh: record changeDetected = false so a later
@@ -915,13 +493,15 @@ function generateIMTKTargetCode(simCode::SimulationCode.SIM_CODE)
   (modelName::String, modelCode::Expr) = IMTKGen.generateIMTKCode(simCode)
   local codeHash = hash(modelCode)
   @info "[IMTK GEN] generated target code" model=modelName codeHash=codeHash
-  local structural = SimulationCode.hasStructuralTransitions(simCode) || SimulationCode.hasSubModels(simCode)
+  local structural = SimCode.hasStructuralTransitions(simCode) || SimCode.hasSubModels(simCode)
   COMPILED_MODELS_MTK[modelName] = (modelCode, structural, codeHash)
   return (modelName, modelCode)
 end
 
-#= The generated code of a model for writing it out: the array path's module for an array
-   model, else the MTK path's code. =#
+"""
+The generated code of a model for writing it out: the array path's module for an array
+model, else the MTK path's code.
+"""
 _writtenModel(modelName) = modelName in ARRAY_ODE_MODELS && haskey(COMPILED_MODELS_DEJL, modelName) ?
   COMPILED_MODELS_DEJL[modelName][1] : getCompiledModel(modelName)
 
@@ -932,12 +512,12 @@ function getCompiledModel(modelName)
 end
 
 """
-`generateDETargetCode(simCode::SimulationCode.SIM_CODE)`
+`generateDETargetCode(simCode::SimCode.SIM_CODE)`
   Generates code interfacing DifferentialEquations.jl directly (DEMode).
   Produces an in-place ODEProblem with the RHS indexed by integer position.
   Caches the result in COMPILED_MODELS_DEJL so simulateModel can pick it up.
 """
-function generateDETargetCode(simCode::SimulationCode.SIM_CODE)
+function generateDETargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
   (modelName::String, modelCode::Expr) = CodeGeneration.DEGen.generateDECode(simCode)
   local codeHash = hash(modelCode)
   if haskey(COMPILED_MODELS_DEJL, modelName)
@@ -958,7 +538,7 @@ The array-preserving translation of a flat model with arrays kept (from the fron
 `scalarize = false`), or `nothing` when the model is outside its scope (the reason is
 logged). OM falls back to the scalarizing flatten and `translate` then.
 """
-function translateArrays(fm::OMFrontend.Frontend.FlatModel; functionList = nothing)
+function translateArrays(fm::OMFrontend.Frontend.FlatModel; functionList::Union{Nothing, FunctionList} = nothing)
   delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
   ARRAY_ODE_GENERATION[] || return nothing
   if !isempty(TUNABLE_PARAMETERS[])
@@ -968,15 +548,18 @@ function translateArrays(fm::OMFrontend.Frontend.FlatModel; functionList = nothi
   return @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(fm; functionList)
 end
 
-#= The array ODE module of a no-scalarize flat model (ARRAY_ODE_GENERATION), cached as a
-   DE-mode model; nothing (and an @info with the reason) for a model outside its scope. =#
-function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel; functionList = nothing)
+"""
+The array ODE module of a no-scalarize flat model (ARRAY_ODE_GENERATION), cached as a
+DE-mode model; nothing (and an @info with the reason) for a model outside its scope.
+"""
+function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel; functionList::Union{Nothing, FunctionList} = nothing)
   local modelName = canonicalName(fm.name)
   local (name, modelCode) = CodeGeneration.ArrayODEGen.generateArrayODECode(fm, modelName; functions = functionList)
   if name === nothing
     @info "[backendAPI] array ODE path not taken for $(modelName): $(modelCode)"
     return nothing
   end
+  dumpGeneratedCode(modelName, modelCode)
   #= evaluated again at the next simulate: a module of this name may be another path's =#
   COMPILED_MODELS_DEJL[modelName] = (modelCode, true, hash(modelCode))
   #= and the ModelingToolkit path's build goes: its module is replaced, and its code (the same
@@ -1013,7 +596,9 @@ end
 
 modelWasCompiledAgainDE(modelName) = COMPILED_MODELS_DEJL[modelName][2]
 
-#= The DE-mode module of `modelName` evaluated: later calls reuse it until it changes. =#
+"""
+The DE-mode module of `modelName` evaluated: later calls reuse it until it changes.
+"""
 function _evalModelDE(modelName::String, modelCode::Expr)
   @eval $modelCode
   local (code, _, h) = COMPILED_MODELS_DEJL[modelName]
@@ -1559,6 +1144,8 @@ function MTK_evaluateAllObserved(sol, obs_eqs, modelName::String)
   return result
 end
 
-#= An observedFilter's patterns as strings. =#
+"""
+An observedFilter's patterns as strings.
+"""
 _observedFilterStrings(f::Vector{Regex})::Vector{String} = String[p.pattern for p in f]
 _observedFilterStrings(f::Vector{String})::Vector{String} = f

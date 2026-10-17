@@ -75,6 +75,7 @@ module ArrayODEGen
 import OMFrontend
 import ModelingToolkit
 import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError
+import ...LowerFlatModel: FunctionList
 
 const SII = ModelingToolkit.SymbolicIndexingInterface
 
@@ -103,16 +104,20 @@ struct ArrayModelParameters
   model::Module
 end
 
-#= The entry of the discrete log for time t: at an event instant the values before it (the left
-   limit, as the states' interpolation and OpenModelica's result files), at the stop time the
-   final ones; `right` takes the values after an event instant (the second of a saved pair). =#
+"""
+The entry of the discrete log for time t: at an event instant the values before it (the left
+limit, as the states' interpolation and OpenModelica's result files), at the stop time the
+final ones; `right` takes the values after an event instant (the second of a saved pair).
+"""
 _dlogIndex(times, t, tend, right::Bool = false) =
   (right || t >= tend) ? max(1, searchsortedlast(times, t)) : max(1, searchsortedfirst(times, t) - 1)
 
 const _OMBACKEND = parentmodule(parentmodule(@__MODULE__))
 
-#= Name lookups accept the Modelica name (c[2].T) and the canonical one
-   (OMBackend.canonicalName). =#
+"""
+Name lookups accept the Modelica name (c[2].T) and the canonical one
+(OMBackend.canonicalName).
+"""
 function _nameIndex(names::Vector{String})::Dict{String, Int}
   local d = Dict{String, Int}()
   for (i, n) in enumerate(names)
@@ -130,7 +135,9 @@ points of a solution of an array model; `nothing` for an unknown name.
 """
 variableValues(sol, name::String) = Base.invokelatest(_variableValues, sol, name)
 
-#= In the latest world: the generated module is newer than the caller. =#
+"""
+In the latest world: the generated module is newer than the caller.
+"""
 function _variableValues(sol, name::String)
   local p = sol.prob.p
   local m = p.model
@@ -201,7 +208,8 @@ function SII.observed(sys::ArraySystem, x)
   local (kind, i) = _observedIdx(sys)[_sym(x)]
   local model = getfield(sys, :model)
   if kind == :alg
-    return (u, p, t) -> Base.invokelatest(model.algebraics, u, p, t)[i]
+    #= the binding read in the latest world too: the module is newer than the caller =#
+    return (u, p, t) -> (Base.@invokelatest model.algebraics(u, p, t))[i]
   end
   return (u, p, t) -> begin
     local times = first.(p.dlog)
@@ -213,12 +221,14 @@ SII.all_variable_symbols(sys::ArraySystem) = vcat(getfield(sys, :stateSyms), col
 SII.all_symbols(sys::ArraySystem) = vcat(SII.all_variable_symbols(sys), :t)
 SII.default_values(::ArraySystem) = Dict()
 
-#= A relation of the model (MLS 8.5, OpenModelica's relationhysteresis, as the MTK path's
-   relationRefresh.jl): it keeps its value p.rel[k] between events and changes only in mode
-   (an event). zc <= 0 where it is true; its crossing function, into z when given, is shifted
-   by eps = H * (1 + max(|x|, |y|)) away from its value, so the root lands where the new value
-   is clear: a true relation stays true while zc <= eps, a false one becomes true at zc <= -eps.
-   With H = 0 (initialization) it is evaluated literally. =#
+"""
+A relation of the model (MLS 8.5, OpenModelica's relationhysteresis, as the MTK path's
+relationRefresh.jl): it keeps its value p.rel[k] between events and changes only in mode
+(an event). zc <= 0 where it is true; its crossing function, into z when given, is shifted
+by eps = H * (1 + max(|x|, |y|)) away from its value, so the root lands where the new value
+is clear: a true relation stays true while zc <= eps, a false one becomes true at zc <= -eps.
+With H = 0 (initialization) it is evaluated literally.
+"""
 _finiteAbs(x) = (local v = abs(x); v < 1.0e300 ? v : 0.0)
 @inline function _rel(z, p, mode::Bool, k::Int, x, y, op)
   local H = p.hyst[1]
@@ -230,12 +240,14 @@ _finiteAbs(x) = (local v = abs(x); v < 1.0e300 ? v : 0.0)
   return p.rel[k]
 end
 
-#= An event-generating function (integer, floor, ceil, div, mod, rem; MLS 3.7.2): its value
-   v = floor/ceil/trunc(q) changes only at events (in mode), and then (as a relation, _rel)
-   only where q has left the interval that keeps v by more than the hysteresis eps: the state
-   just before an event (an interpolation a hair past the boundary) keeps the old value. Two
-   crossing functions bound that interval: z[k] crosses where q passes its upper end, z[k + 1]
-   its lower end. At the initialization (H = 0) the value is literal. =#
+"""
+An event-generating function (integer, floor, ceil, div, mod, rem; MLS 3.7.2): its value
+v = floor/ceil/trunc(q) changes only at events (in mode), and then (as a relation, _rel)
+only where q has left the interval that keeps v by more than the hysteresis eps: the state
+just before an event (an interpolation a hair past the boundary) keeps the old value. Two
+crossing functions bound that interval: z[k] crosses where q passes its upper end, z[k + 1]
+its lower end. At the initialization (H = 0) the value is literal.
+"""
 _evInterval(kind::Symbol, v) = kind === :floor ? (v, v + 1) : kind === :ceil ? (v - 1, v) :
                                v > 0 ? (v, v + 1) : v < 0 ? (v - 1, v) : (-1.0, 1.0)
 @inline function _evfn(z, p, mode::Bool, k::Int, kind::Symbol, q)
@@ -253,8 +265,10 @@ _evInterval(kind::Symbol, v) = kind === :floor ? (v, v + 1) : kind === :ceil ? (
   return v
 end
 
-#= The hysteresis H for a solve, as the MTK path (relationRefresh.jl _hysteresis): OpenModelica's
-   tolZC = 1e-4 * min(reltol, span / 500). =#
+"""
+The hysteresis H for a solve, as the MTK path (relationRefresh.jl _hysteresis): OpenModelica's
+tolZC = 1e-4 * min(reltol, span / 500).
+"""
 _hysteresis(integrator) = 1.0e-4 * max(min(Float64(first(integrator.opts.reltol)),
                                            abs(Float64(integrator.sol.prob.tspan[2] - integrator.sol.prob.tspan[1])) / 500), 1.0e-12)
 
@@ -272,8 +286,10 @@ struct NotSupported <: Exception
 end
 ns(msg::AbstractString) = throw(NotSupported(String(msg)))
 
-#= The frontend's evaluation of a binding, range or start value; a failure there (an
-   expression its evaluator does not handle) puts the model outside the array path. =#
+"""
+The frontend's evaluation of a binding, range or start value; a failure there (an
+expression its evaluator does not handle) puts the model outside the array path.
+"""
 function _evalFrontend(@nospecialize(e))
   try
     return F.evalExp(e)
@@ -283,7 +299,9 @@ function _evalFrontend(@nospecialize(e))
   end
 end
 
-#= An expression in a reason message (printing must not fail). =#
+"""
+An expression in a reason message (printing must not fail).
+"""
 _str(@nospecialize(x)) = try
   Base.first(F.toString(x), 200)
 catch
@@ -338,8 +356,10 @@ irKey(x::Rel) = string("rel", x.id, x.op, "(", irKey(x.lhs), ",", irKey(x.rhs), 
 irKey(x::Op) = string(x.op, "(", join(irKey.(x.args), ","), ")")
 irKey(x::EvFn) = string("ev", x.id, x.kind, "(", irKey(x.arg), ")")
 
-#= The variable accesses of an expression, in a fixed order (not those inside subscripts,
-   not pre values). =#
+"""
+The variable accesses of an expression, in a fixed order (not those inside subscripts,
+not pre values).
+"""
 function accesses!(acc::Vector{Ref}, x::IR)
   if x isa Ref
     push!(acc, x)
@@ -495,7 +515,9 @@ end
 
 _crefName(cr::F.ComponentRef)::String = join([F.name(p.node) for p in _partsRootFirst(cr)], ".")
 
-#= A literal frontend expression as a Julia value (scalars, nested arrays row-major). =#
+"""
+A literal frontend expression as a Julia value (scalars, nested arrays row-major).
+"""
 function _literalValue(e::F.Expression)
   e = F.getBindingExp(e)
   if e isa F.REAL_EXPRESSION
@@ -541,7 +563,9 @@ function _paramValue!(g::Gen, name::String)
   return val
 end
 
-#= A parameter with fixed = false starts (the initialization's guess) from its start value. =#
+"""
+A parameter with fixed = false starts (the initialization's guess) from its start value.
+"""
 function _freeParamStart(v::F.Variable)
   local dims = F.isArray(v.ty) ? [F.size(d) for d in F.arrayDims(v.ty)] : Int[]
   local st = _startValues(v, isempty(dims) ? 1 : prod(dims))
@@ -549,7 +573,9 @@ function _freeParamStart(v::F.Variable)
   return permutedims(reshape(st, reverse(dims)...), length(dims):-1:1)   #= row-major start values =#
 end
 
-#= Start values of a variable, row-major. =#
+"""
+Start values of a variable, row-major.
+"""
 function _startValues(v::F.Variable, n::Int)::Vector{Float64}
   local start = nothing
   for (an, ab) in v.typeAttributes
@@ -561,7 +587,9 @@ function _startValues(v::F.Variable, n::Int)::Vector{Float64}
   return vals
 end
 
-#= The fixed attribute of a variable's elements, row-major (default false). =#
+"""
+The fixed attribute of a variable's elements, row-major (default false).
+"""
 function _fixedValues(v::F.Variable, n::Int; default::Bool = false)::Vector{Bool}
   for (an, ab) in v.typeAttributes
     if an == "fixed"
@@ -581,8 +609,10 @@ const MATH_BUILTINS = Dict("sin" => :sin, "cos" => :cos, "tan" => :tan, "asin" =
                            "log" => :log, "log10" => :log10, "sqrt" => :sqrt, "abs" => :abs,
                            "sinh" => :sinh, "cosh" => :cosh, "tanh" => :tanh,
                            "min" => :min, "max" => :max, "sign" => :sign)
-#= String(...) of Modelica, as the MTK path formats it (resolved when called: that module
-   may load after this one) =#
+"""
+String(...) of Modelica, as the MTK path formats it (resolved when called: that module
+may load after this one)
+"""
 _modelicaString(args...) = _OMBACKEND.CodeGeneration.AlgorithmicCodeGeneration.modelica_String(args...)
 
 const MATH_WRAPPED = ("sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "exp", "log", "log10")
@@ -608,7 +638,9 @@ function _relationOp(op)::Symbol
   ns("relation operator $(op)")
 end
 
-#= Whether an expression varies continuously (states, algebraic variables, time). =#
+"""
+Whether an expression varies continuously (states, algebraic variables, time).
+"""
 function _continuous(g::Gen, x::IR)::Bool
   x isa TimeIR && return true
   x isa Ref && return g.vars[x.name].kind in (:state, :alg) || any(s -> _continuous(g, s), x.subs)
@@ -617,12 +649,16 @@ function _continuous(g::Gen, x::IR)::Bool
   return false   #= an EvFn is constant between events =#
 end
 
-#= A Boolean-valued expression (whatever type the call's argument was given: String(n > 3)). =#
+"""
+A Boolean-valued expression (whatever type the call's argument was given: String(n > 3)).
+"""
 _booleanExp(@nospecialize(e)) = e isa F.CAST_EXPRESSION ? _booleanExp(e.exp) :
   (e isa F.RELATION_EXPRESSION || e isa F.LBINARY_EXPRESSION || e isa F.LUNARY_EXPRESSION || e isa F.BOOLEAN_EXPRESSION)
 
-#= An assert's message as an expression (String(x, ...) formatted as OpenModelica does);
-   its text where the array path cannot evaluate it. =#
+"""
+An assert's message as an expression (String(x, ...) formatted as OpenModelica does);
+its text where the array path cannot evaluate it.
+"""
 function _messageIR(g::Gen, @nospecialize(m::F.Expression), ctx::Ctx)::IR
   try
     return toIR(g, m, _with(ctx; noEvent = true))
@@ -816,8 +852,10 @@ function _callIR(g::Gen, e::F.CALL_EXPRESSION, ctx::Ctx)::IR
   return Op(jf, IR[toIR(g, a, ctx) for a in args])
 end
 
-#= An array value (a function's array argument): its elements written out (as a reduction's
-   terms), column-major, reshaped to its dimensions. =#
+"""
+An array value (a function's array argument): its elements written out (as a reduction's
+terms), column-major, reshaped to its dimensions.
+"""
 function _arrayValueIR(g::Gen, @nospecialize(e::F.Expression), ctx::Ctx)::IR
   local ty = F.typeOf(e)
   F.hasKnownSize(ty) || ns("array argument of unknown size " * _str(e))
@@ -858,7 +896,9 @@ function _reductionIR(g::Gen, fname::String, @nospecialize(arg::F.Expression), c
   return acc
 end
 
-#= sum(e for i in r, j in s), product, min, max: the terms for every iterator value written out. =#
+"""
+sum(e for i in r, j in s), product, min, max: the terms for every iterator value written out.
+"""
 function _iterReductionIR(g::Gen, call, ctx::Ctx, text::String)::IR
   local fname = F.AbsynUtil.pathString(F.name(call.fn))
   fname in ("sum", "product", "min", "max") || ns("reduction " * text)
@@ -883,7 +923,9 @@ function _iterReductionIR(g::Gen, call, ctx::Ctx, text::String)::IR
   return foldl((a, b) -> Op(op, IR[a, b]), terms)
 end
 
-#= Matrix and vector products in an element-wise context: the inner dimension written out. =#
+"""
+Matrix and vector products in an element-wise context: the inner dimension written out.
+"""
 function _productIR(g::Gen, e::F.BINARY_EXPRESSION, ctx::Ctx)::IR
   local O = F.Op
   local op = e.operator.op
@@ -1012,7 +1054,9 @@ end
 
 _crossDomain(d::Matrix{Int}, ranges::Vector{Vector{Int}}) = foldl(_crossDomain, ranges; init = d)
 
-#= sample() of an equation as the sample slot of the when wi that schedules its instants. =#
+"""
+sample() of an equation as the sample slot of the when wi that schedules its instants.
+"""
 function _sampleSlots(x::IR, wi::Int)::IR
   x isa Op && x.op == :sample && return Op(:sampleof, IR[Lit(wi), x.args[3]])
   x isa Op && return Op(x.op, IR[_sampleSlots(a, wi) for a in x.args])
@@ -1021,10 +1065,14 @@ function _sampleSlots(x::IR, wi::Int)::IR
   return x
 end
 
-#= The first sample slot of when wi: the slots are numbered when by when, instance by instance. =#
+"""
+The first sample slot of when wi: the slots are numbered when by when, instance by instance.
+"""
 _whenSampleBase(g::Gen, wi::Int) = sum((g.whens[k].nsample * size(g.whens[k].domain, 2) for k in 1:(wi - 1)); init = 0)
 
-#= Whether x reads only literals, iterators and parameters (no variable, no time). =#
+"""
+Whether x reads only literals, iterators and parameters (no variable, no time).
+"""
 function _parametersOnly(g::Gen, x::IR)::Bool
   (x isa Lit || x isa Slot) && return true
   x isa Ref && return g.vars[x.name].kind == :param && !x.der && all(s -> _parametersOnly(g, s), x.subs)
@@ -1032,7 +1080,9 @@ function _parametersOnly(g::Gen, x::IR)::Bool
   return false
 end
 
-#= The value of an expression that depends only on slots and parameters, at a domain column. =#
+"""
+The value of an expression that depends only on slots and parameters, at a domain column.
+"""
 function _evalStatic(g::Gen, x::IR, d::Matrix{Int}, col::Int)
   if x isa Lit
     return x.v
@@ -1175,15 +1225,19 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
   push!(g.classes, EqClass(lhs, rhs, size(dom, 1), dom, ctx.nrel[], _str(eq)))
 end
 
-#= Whether a condition depends on loop indices and parameters only. =#
+"""
+Whether a condition depends on loop indices and parameters only.
+"""
 _isStatic(g::Gen, x::IR)::Bool =
   x isa Lit || x isa Slot ||
   (x isa Ref && !x.der && g.vars[x.name].kind == :param && all(s -> _isStatic(g, s), x.subs)) ||
   (x isa Op && !(x.op in (:initial, :sample)) && all(a -> _isStatic(g, a), x.args))
 
-#= An if-equation on variable conditions whose branches (with an else) each give the same
-   variables as v = e: one equation per variable, v = if c1 then e1 elseif ... else en (as
-   omc's if-equation to if-expression); its relations generate events. =#
+"""
+An if-equation on variable conditions whose branches (with an else) each give the same
+variables as v = e: one equation per variable, v = if c1 then e1 elseif ... else en (as
+omc's if-equation to if-expression); its relations generate events.
+"""
 function _addDynamicIf!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{String}, idom::Matrix{Int};
                         initial::Bool = false)
   local iters = Dict(n => k for (k, n) in enumerate(iterNames))
@@ -1222,9 +1276,11 @@ function _addDynamicIf!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector
   end
 end
 
-#= (a, _, c) = call: the call once, into a temporary, and an assignment of each
-   (non-wildcard) target from its output (the call was made per target, and per element of
-   an array target). =#
+"""
+(a, _, c) = call: the call once, into a temporary, and an assignment of each
+(non-wildcard) target from its output (the call was made per target, and per element of
+an array target).
+"""
 function _tupleAssignments(g::Gen, @nospecialize(lhs), call::IR, ctx::Ctx)::Vector{Stmt}
   local out = Stmt[]
   local res = Slot(g.tmpSlot -= 1)
@@ -1294,24 +1350,32 @@ function _addWhen!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{Stri
   push!(g.whens, WhenClass(cond, body, starts, length(iterNames), idom, ctx.nrel[], ctx.nsam[], _str(eq)))
 end
 
-#= initial() activates a when at the initialization only as its condition (MLS 8.6, as
-   OpenModelica): inside an expression (initial() or x > 0.6) it is false. =#
+"""
+initial() activates a when at the initialization only as its condition (MLS 8.6, as
+OpenModelica): inside an expression (initial() or x > 0.6) it is false.
+"""
 _topLevelInitial(x::IR) = (x isa Op && x.op == :initial) ? x : _noInitial(x)
 
-#= A when-condition: a Boolean expression, or a vector of them (when {c1, c2}: Op(:vect),
-   each element with its own condition slot and edge; initial() counts as an element). =#
+"""
+A when-condition: a Boolean expression, or a vector of them (when {c1, c2}: Op(:vect),
+each element with its own condition slot and edge; initial() counts as an element).
+"""
 function _whenCondition(g::Gen, @nospecialize(c::F.Expression), ctx::Ctx)::IR
   c isa F.ARRAY_EXPRESSION || return _topLevelInitial(toIR(g, c, ctx))
   return Op(:vect, IR[_topLevelInitial(toIR(g, el, ctx)) for el in c.elements])
 end
 
-#= The condition elements of a when (one for a scalar condition). =#
+"""
+The condition elements of a when (one for a scalar condition).
+"""
 _condElements(c::IR)::Vector{IR} = (c isa Op && c.op == :elsewhen) ? IR[e for b in c.args for e in _condElements(b)] :
                                    (c isa Op && c.op == :vect) ? c.args : IR[c]
 _noInitial(x::IR) = !(x isa Op) ? x : x.op == :initial ? Lit(false) : Op(x.op, IR[_noInitial(a) for a in x.args])
 
-#= An algorithm section: statements to IR. A vectorized algorithm (one for-loop over a $
-   iterator, from a component array) keeps the loop as the class domain. =#
+"""
+An algorithm section: statements to IR. A vectorized algorithm (one for-loop over a \$
+iterator, from a component array) keeps the loop as the class domain.
+"""
 function _addAlgorithm!(g::Gen, alg)
   local stmts = collect(alg.statements)
   local iterNames = String[]
@@ -1330,10 +1394,12 @@ function _addAlgorithm!(g::Gen, alg)
   push!(g.algs, AlgClass(body, length(iterNames), idom, ctx.nrel[], nwhen[], _str(alg.statements[1])))
 end
 
-#= An initial algorithm: run once at the initialization, after the free states are solved and
-   before the first event iteration, without events (its relations and event-generating
-   functions literal). It may assign discrete variables (and assert); initial equations may not
-   read what it assigns. =#
+"""
+An initial algorithm: run once at the initialization, after the free states are solved and
+before the first event iteration, without events (its relations and event-generating
+functions literal). It may assign discrete variables (and assert); initial equations may not
+read what it assigns.
+"""
 function _addInitialAlgorithm!(g::Gen, alg)
   local stmts = collect(alg.statements)
   local iterNames = String[]
@@ -1407,8 +1473,10 @@ function _stmtIR(g::Gen, @nospecialize(st), ctx::Ctx, nwhen::Base.RefValue{Int})
   ns("statement " * _str(st))
 end
 
-#= Sums as sorted term lists, so connection sums that list their terms in another order share
-   a shape. =#
+"""
+Sums as sorted term lists, so connection sums that list their terms in another order share
+a shape.
+"""
 function _canonical(x::IR)::IR
   x isa Op || return x
   local args = IR[_canonical(a) for a in x.args]
@@ -1432,7 +1500,9 @@ function _canonical(x::IR)::IR
   return Op(x.op, args)
 end
 
-#= Literal integer subscripts replaced by new slots (their values pushed to `vals`). =#
+"""
+Literal integer subscripts replaced by new slots (their values pushed to `vals`).
+"""
 function _abstracted(x::IR, vals::Vector{Int})::IR
   if x isa Ref
     local subs = IR[]
@@ -1458,7 +1528,9 @@ function _abstracted(x::IR, vals::Vector{Int})::IR
   return x
 end
 
-#= Scalar equations (no slots) that differ only in literal subscripts become one class. =#
+"""
+Scalar equations (no slots) that differ only in literal subscripts become one class.
+"""
 function _reroll(classes::Vector{EqClass})::Vector{EqClass}
   local out = EqClass[]
   local groups = Dict{String, Int}()
@@ -1522,7 +1594,9 @@ function _evalInt(g::Gen, x::IR, d::Matrix{Int}, col::Int)::Int
   ns("subscript")
 end
 
-#= Zero-based position of an element in a variable (row-major); subscripts 1-based. =#
+"""
+Zero-based position of an element in a variable (row-major); subscripts 1-based.
+"""
 function _elementOffset(info::VarInfo, idx::Vector{Int}, name::String)::Int
   length(idx) == length(info.dims) || ns("subscript count of $(name)")
   local off = 0
@@ -1547,8 +1621,10 @@ struct Elements
   nEq::Int
 end
 
-#= The unknown id of a variable element, or 0 (parameters, states read, when-assigned
-   discretes). =#
+"""
+The unknown id of a variable element, or 0 (parameters, states read, when-assigned
+discretes).
+"""
 function _unknownOf(g::Gen, info::VarInfo, off::Int, der::Bool)::Int
   info.kind == :alg && return g.nStates + off
   info.kind == :discrete && return get(g.discUnknown, off, 0)
@@ -1556,8 +1632,10 @@ function _unknownOf(g::Gen, info::VarInfo, off::Int, der::Bool)::Int
   return 0
 end
 
-#= The elements an algorithm instance reads and assigns, walking its statements (for-loops
-   with their static ranges). =#
+"""
+The elements an algorithm instance reads and assigns, walking its statements (for-loops
+with their static ranges).
+"""
 function _algAccesses!(g::Gen, stmts::Vector{Stmt}, env::Dict{Int, Int}, d::Matrix{Int}, col::Int,
                        outs::Set{Int}, ins::Set{Int}, sids::Set{Int})
   local readIR! = function (x::IR)
@@ -1667,7 +1745,9 @@ function _elements(g::Gen)::Elements
   return Elements(class, col, uptr, uid, upos, sptr, sid, outs, nEq)
 end
 
-#= Maximum matching instances <-> unknowns (greedy, then augmenting paths). =#
+"""
+Maximum matching instances <-> unknowns (greedy, then augmenting paths).
+"""
 function _match(el::Elements, nU::Int)::Vector{Int}
   local N = el.nEq
   local matchRow = zeros(Int, length(el.class))
@@ -1725,9 +1805,11 @@ function _match(el::Elements, nU::Int)::Vector{Int}
   return matchRow
 end
 
-#= Kahn's algorithm in batches: all ready instances of one (class, matched access) at a time,
-   a key whose remaining instances are all ready first. Returns the batches (consecutive equal
-   keys merged), the matched access per instance and the producer per unknown. =#
+"""
+Kahn's algorithm in batches: all ready instances of one (class, matched access) at a time,
+a key whose remaining instances are all ready first. Returns the batches (consecutive equal
+keys merged), the matched access per instance and the producer per unknown.
+"""
 function _schedule(el::Elements, matchRow::Vector{Int}, nU::Int)
   local N = length(el.class)
   local producer = zeros(Int, nU)
@@ -1804,8 +1886,10 @@ function _schedule(el::Elements, matchRow::Vector{Int}, nU::Int)
   return (batches, pos, producer)
 end
 
-#= The states every equation instance depends on, through the algebraic unknowns it reads
-   (in schedule order); nothing when that would be large. =#
+"""
+The states every equation instance depends on, through the algebraic unknowns it reads
+(in schedule order); nothing when that would be large.
+"""
 function _stateDeps(el::Elements, matchRow, batches, producer)
   local N = length(el.class)
   local deps = Vector{Vector{Int}}(undef, N)
@@ -1826,7 +1910,9 @@ function _stateDeps(el::Elements, matchRow, batches, producer)
   return deps
 end
 
-#= State dependencies of every state derivative (the Jacobian's rows). =#
+"""
+State dependencies of every state derivative (the Jacobian's rows).
+"""
 function _jacobianPattern(el::Elements, matchRow, deps, nStates::Int)
   deps === nothing && return nothing
   local N = length(el.class)
@@ -1844,10 +1930,12 @@ end
 
 #= ---------------------------------------------------------------- initialization =#
 
-#= The initial equations as a square system: each instance matched to a state element that
-   is not fixed and that it depends on (directly or through the algebraic unknowns); free
-   states no initial equation reaches keep their start values (as omc). Returns the matched
-   states, the residual code and the number of residuals. =#
+"""
+The initial equations as a square system: each instance matched to a state element that
+is not fixed and that it depends on (directly or through the algebraic unknowns); free
+states no initial equation reaches keep their start values (as omc). Returns the matched
+states, the residual code and the number of residuals.
+"""
 function _initialization(g::Gen, deps, producer, fixedMask::Vector{Bool})
   isempty(g.initClasses) && return (Int[], Any[], 0, Tuple{String, Int}[])
   #= a free parameter element (name, column-major index) is unknown g.nStates + k =#
@@ -1919,8 +2007,10 @@ end
 
 _nAccesses(x::IR) = length(accesses!(Ref[], x))
 
-#= The equation lhs = rhs solved for its access number `pos` (accesses numbered over lhs,
-   then rhs): the access and the expression it equals. =#
+"""
+The equation lhs = rhs solved for its access number `pos` (accesses numbered over lhs,
+then rhs): the access and the expression it equals.
+"""
 function _solveFor(lhs::IR, rhs::IR, pos::Int, text::String)
   local nl = _nAccesses(lhs)
   local (s, o, k) = pos <= nl ? (lhs, rhs, pos) : (rhs, lhs, pos - nl)
@@ -2049,8 +2139,10 @@ function jl(g::Gen, x::IR)
   error("IR")
 end
 
-#= Statement code of an algorithm; when-statements use wcond from `condBase` (nwhen per
-   instance) and run their bodies only when fire (event iteration). =#
+"""
+Statement code of an algorithm; when-statements use wcond from `condBase` (nwhen per
+instance) and run their bodies only when fire (event iteration).
+"""
 function _stmtCode(g::Gen, stmts::Vector{Stmt}, condBase::Int, nwhen::Int; inWhen::Bool = false)::Vector{Any}
   local out = Any[]
   for st in stmts
@@ -2114,8 +2206,10 @@ function _stmtCode(g::Gen, stmts::Vector{Stmt}, condBase::Int, nwhen::Int; inWhe
   return out
 end
 
-#= A loop over the domain columns `cols` of a class running `body` with the slots (and _col,
-   the column) bound: an affine range when the columns allow it, else a table. =#
+"""
+A loop over the domain columns `cols` of a class running `body` with the slots (and _col,
+the column) bound: an affine range when the columns allow it, else a table.
+"""
 function _loopCode(nslots::Int, domain::Matrix{Int}, cols::Vector{Int}, body::Expr)
   local M = vcat(domain[:, cols], reshape(cols, 1, :))
   local m = size(M, 2)
@@ -2141,7 +2235,9 @@ end
 
 #= ---------------------------------------------------------------- parameters =#
 
-#= The parameters a binding reads. =#
+"""
+The parameters a binding reads.
+"""
 function _bindingDeps(g::Gen, b::F.Binding)::Vector{String}
   F.isBound(b) || return String[]
   local deps = String[]
@@ -2156,9 +2252,11 @@ function _bindingDeps(g::Gen, b::F.Binding)::Vector{String}
   return deps
 end
 
-#= The parameters the equations read and, transitively, those their bindings read, in
-   dependency order, each with its binding as code over the others (nothing when the
-   binding is not expressible here: the value then cannot follow a changed dependency). =#
+"""
+The parameters the equations read and, transitively, those their bindings read, in
+dependency order, each with its binding as code over the others (nothing when the
+binding is not expressible here: the value then cannot follow a changed dependency).
+"""
 function _parameterRules(g::Gen)
   local order = String[]
   local state = Dict{String, Int}()   #= 1 visiting, 2 done =#
@@ -2219,7 +2317,7 @@ end
 The array-preserving module of a no-scalarize flat model, or `nothing` and the reason the
 model is outside the supported scope.
 """
-function generateArrayODECode(fm::F.FlatModel, modelName::String; functions = nothing)
+function generateArrayODECode(fm::F.FlatModel, modelName::String; functions::Union{Nothing, FunctionList} = nothing)
   try
     return (modelName, _generate(fm, modelName; functions = functions))
   catch err
@@ -2243,7 +2341,9 @@ function _vtype(v::F.Variable)::Symbol
   ns("variable type of $(_str(v.name))")
 end
 
-#= Whether generated code raises an error (a function's assert: Base.error). =#
+"""
+Whether generated code raises an error (a function's assert: Base.error).
+"""
 function _containsErrorCall(@nospecialize(x))::Bool
   x isa AbstractVector && return any(_containsErrorCall, x)
   x isa Expr || return false
@@ -2251,20 +2351,20 @@ function _containsErrorCall(@nospecialize(x))::Bool
   return any(_containsErrorCall, x.args)
 end
 
-#= The model's Modelica functions as Julia functions of the module (the MTK path's code
-   generation: SimulationCode.generateSimCodeFunctions, AlgorithmicCodeGeneration.generateFunctions),
-   each a module constant named as the frontend's function list names it (dots as _), so the
-   equations and the functions' calls of each other find it. Returns (definitions, outputs). =#
-function _functionDefinitions(functions)
+"""
+The model's Modelica functions as Julia functions of the module (the MTK path's code
+generation: AlgorithmicCodeGeneration.generateFunctions),
+each a module constant named as the frontend's function list names it (dots as _), so the
+equations and the functions' calls of each other find it. Returns (definitions, outputs).
+"""
+function _functionDefinitions(functions::Union{Nothing, FunctionList})
   local defs = Any[]; local outs = Dict{String, Int}()
   (functions === nothing || isempty(functions)) && return (defs, outs)
-  local SC = _OMBACKEND.SimulationCode
-  local (mfs, _) = try
-    SC.generateSimCodeFunctions(functions)
+  local mfs = try
+    _OMBACKEND.SimCode.simFunctions(_OMBACKEND.LowerFlatModel.lowerFunctions(functions))
   catch err
     ns("the model's functions: " * first(sprint(showerror, err), 160))
   end
-  mfs = SC.flattenRecordParameters(mfs)
   local (exprs, names) = try
     _OMBACKEND.CodeGeneration.AlgorithmicCodeGeneration.generateFunctions(mfs)
   catch err
@@ -2291,7 +2391,7 @@ function _functionDefinitions(functions)
   return (defs, outs)
 end
 
-function _generate(fm::F.FlatModel, modelName::String; functions = nothing)::Expr
+function _generate(fm::F.FlatModel, modelName::String; functions::Union{Nothing, FunctionList} = nothing)::Expr
   local (functionDefs, functionOutputs) = _functionDefinitions(functions)
   (FULL[] || isempty(fm.initialAlgorithms)) || ns("initial algorithms (OMBackend.ARRAY_PATH_FULL)")
   #= States: the variables under der(). =#

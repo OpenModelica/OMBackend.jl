@@ -34,29 +34,20 @@
 */ =#
 
 #=
-  MTK / Symbolics-specific lowering helpers carved out of CodeGenerationUtil.
-  Generic predicates, parameter folding and Expr utilities still live in
-  CodeGenerationUtil; this module is the home for code that is coupled to
-  ModelingToolkit / Symbolics / SymbolicUtils.
+  The lowering of SimCode expressions to the ModelingToolkit model (`expToJuliaExpMTK`, one
+  method per expression), of conditions to zero-crossing functions and callback conditions, and
+  the values the code generation needs at the start of the simulation (the t0 value map, the
+  initial branches of if-equations).
 =#
 module MTK_CodeGenerationUtil
 
 import DataStructures
 using DataStructures: OrderedSet
 import MacroTools
-using MetaModelica
-using MetaModelica: Cons
-using Setfield
-using DocStringExtensions
 using ModelingToolkit
 using LinearAlgebra
 
-using ...FrontendUtil
-import ...FrontendUtil.Util
-using ...Backend
-import ...Backend.BDAE
-using ...SimulationCode
-
+import ...SimCode
 import ...OMBackend
 import ..AlgorithmicCodeGeneration
 import ..CodeGenerationUtil
@@ -67,273 +58,231 @@ import ..MTKDump: dumpPreStructuralSimplifyExpr
 import ...@BACKEND_LOGGING
 import ...COMPONENT_SEPARATOR
 
-import Absyn
-import DAE
-import MetaGraphs
-import OMFrontend
-import OMParser
 import Symbolics
 import Symbolics.RuntimeGeneratedFunctions
 import SymbolicUtils
 import OMRuntimeExternalC
 
-#= Bool-context lowering for DiscreteCallback condition functions: emits real
-   `&&` / `||` / `!` where `expToJuliaExpMTK` uses arithmetic encoding for
-   compatibility with Symbolics.jl in residual contexts. =#
-function expToJuliaBoolMTK(@nospecialize(cond::DAE.Exp), simCode; cachedChange::Bool = false)
-  @match cond begin
-    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
-      local lhs = expToJuliaExpMTK(e1, simCode)
-      local rhs = expToJuliaExpMTK(e2, simCode)
-      local opSym = DAE_OP_toJuliaOperator(op)
-      :($opSym($lhs, $rhs))
-    end
-    DAE.LBINARY(exp1 = e1, operator = DAE.AND(__), exp2 = e2) =>
-      :($(_boolOperandMTK(e1, simCode, cachedChange)) && $(_boolOperandMTK(e2, simCode, cachedChange)))
-    DAE.LBINARY(exp1 = e1, operator = DAE.OR(__), exp2 = e2) =>
-      :($(_boolOperandMTK(e1, simCode, cachedChange)) || $(_boolOperandMTK(e2, simCode, cachedChange)))
-    DAE.LUNARY(operator = DAE.NOT(__), exp = e1) =>
-      :(!($(_boolOperandMTK(e1, simCode, cachedChange))))
-    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
-      local innerArgs = collect(lst)
-      if length(innerArgs) == 1
-        expToJuliaBoolMTK(innerArgs[1], simCode; cachedChange = cachedChange)
-      else
-        expToJuliaExpMTK(cond, simCode)
-      end
-    end
-    #= Modelica `change(x)` ≡ `pre(x) != x`. Used as a trigger condition in
-       discrete callbacks synthesised from non-when algorithm bodies whose
-       LHS is discrete-time. The DiscreteCallback environment exposes the
-       previous step's state vector as `integrator.uprev` and the current
-       one as `x` (via the cache lookup the surrounding affect generator
-       builds), so the runtime test is a straightforward index comparison. =#
-    DAE.CALL(Absyn.IDENT("change"), lst, _) => begin
-      local innerArgs = collect(lst)
-      if length(innerArgs) == 1
-        local curr = expToJuliaBoolMTK(innerArgs[1], simCode; cachedChange = cachedChange)
-        local prev = _preValueLookup(innerArgs[1], simCode; cachedChange = cachedChange)
-        :(($(curr)) != ($(prev)))
-      else
-        expToJuliaExpMTK(cond, simCode)
-      end
-    end
-    #= Modelica `edge(b)` ≡ `b and not pre(b)` — the rising-edge detector. Uses
-       the same previous-value machinery as `change`; the `!= 0` normalises a
-       Boolean discrete stored as a Float64 (0.0/1.0) so `&&`/`!` stay boolean. =#
-    DAE.CALL(Absyn.IDENT("edge"), lst, _) => begin
-      local innerArgs = collect(lst)
-      if length(innerArgs) == 1
-        local curr = expToJuliaBoolMTK(innerArgs[1], simCode; cachedChange = cachedChange)
-        local prev = _preValueLookup(innerArgs[1], simCode; cachedChange = cachedChange)
-        :((($(curr)) != 0) && !((($(prev)) != 0)))
-      else
-        expToJuliaExpMTK(cond, simCode)
-      end
-    end
-    #= `initial()` is true exactly during the initialisation phase. The
-       DiscreteCallback we use for synthesised when-equations does not run
-       during MTK's InitializationProblem — the body's init-pass fires
-       through the `__runInitialAlgorithm!` path the BDAECreate lifter sets
-       up. So `initial()` as a runtime check is always false here. =#
-    DAE.CALL(Absyn.IDENT("initial"), _, _) => :(false)
-    #= `terminal()` fires only at end-of-simulation; the per-step DiscreteCallback has no finalize hook, so it never triggers here. =#
-    DAE.CALL(Absyn.IDENT("terminal"), _, _) => :(false)
-    _ => expToJuliaExpMTK(cond, simCode)
-  end
-end
+const SC = SimCode
 
-#= An operand of not/and/or: a Boolean variable (or its pre()) is stored as a
-   Float64 (0.0/1.0) in the state vector, and `!active` threw a MethodError
-   (`when not active`, the StateGraph steps). =#
-function _boolOperandMTK(@nospecialize(e::DAE.Exp), simCode, cachedChange::Bool)
-  local x = expToJuliaBoolMTK(e, simCode; cachedChange = cachedChange)
-  local isBool = e isa DAE.RELATION || e isa DAE.LBINARY || e isa DAE.LUNARY || e isa DAE.BCONST ||
-                 (e isa DAE.CALL && string(e.path) in ("change", "edge", "initial", "terminal"))
-  return isBool ? x : :($x != 0)
-end
+#= ==================================================================================== =#
+#= Conditions                                                                           =#
+#= ==================================================================================== =#
 
-#= Compile-time helper: emit the Julia expression that reads the previous
-   value of a CREF from the discrete callback's `integrator.uprev` /
-   parameter table. Falls back to `expToJuliaExpMTK` (which gives the
-   current-value lookup) for non-CREF arguments — `pre(constant)` and
-   `pre(parameter)` are the same as the current value. =#
-function _preValueLookup(@nospecialize(arg::DAE.Exp), simCode; cachedChange::Bool = false)
-  @match arg begin
-    DAE.CREF(componentRef = cr) => begin
-      local crefStr = string(arg)
-      local ht = simCode.stringToSimVarHT
-      if !haskey(ht, crefStr)
-        return expToJuliaExpMTK(arg, simCode)
-      end
-      local (_, sv) = ht[crefStr]
-      if SimulationCode.isParameter(sv)
-        return expToJuliaExpMTK(arg, simCode)
-      end
-      #= States and discretes both live on the integrator's state vector;
-         the surrounding callback codegen has populated `lookuptableStates`
-         with `Symbol(name) => index`. Read through the integrator: the
-         affect binds the model's variables by name, and one named `x`
-         replaced the state vector `x` (a BoundsError). =#
-      if cachedChange
-        return :(get(_changePreValues,
-                     Symbol($(string(sv.name))),
-                     integrator.u[lookuptableStates[Symbol($(string(sv.name)))]]))
-      end
-      :(integrator.uprev[lookuptableStates[Symbol($(string(sv.name)))]])
+"""
+    expToJuliaBoolMTK(cond, simCode; cachedChange = false)
+
+A condition of a DiscreteCallback as a Julia Boolean: relations and `&&`, `||`, `!` as such
+(`expToJuliaExpMTK` encodes them arithmetically, for Symbolics in the equations); `change(x)`
+as `x != pre(x)` and `edge(b)` as `b and not pre(b)`, from the integrator's previous state (the
+values the callback cached before its sweep with `cachedChange`); `initial()` and
+`terminal()` false: the callback runs neither in the initialization (the initial algorithms
+do) nor at the end.
+"""
+function expToJuliaBoolMTK(cond::SC.Exp, simCode::SC.SIM_CODE; cachedChange::Bool = false)
+  if cond isa SC.RELATION
+    local op = opKindToJuliaOperator(cond.op)
+    return :($op($(expToJuliaExpMTK(cond.exp1, simCode)), $(expToJuliaExpMTK(cond.exp2, simCode))))
+  elseif cond isa SC.LBINARY
+    local a = _boolOperandMTK(cond.exp1, simCode, cachedChange)
+    local b = _boolOperandMTK(cond.exp2, simCode, cachedChange)
+    return cond.op === SC.OP_AND ? :($a && $b) : :($a || $b)
+  elseif cond isa SC.LUNARY
+    return :(!($(_boolOperandMTK(cond.exp, simCode, cachedChange))))
+  elseif cond isa SC.CALL && cond.kind === SC.CALL_BUILTIN
+    if length(cond.args) == 1 && cond.name in (:noEvent, :change, :edge)
+      local arg = only(cond.args)
+      cond.name === :noEvent && return expToJuliaBoolMTK(arg, simCode; cachedChange)
+      local curr = expToJuliaBoolMTK(arg, simCode; cachedChange)
+      local prev = _preValueLookup(arg, simCode; cachedChange)
+      #= `!= 0`: a Boolean discrete is a Float64 (0.0/1.0) in the state vector =#
+      return cond.name === :change ? :(($(curr)) != ($(prev))) : :((($(curr)) != 0) && !((($(prev)) != 0)))
     end
-    _ => expToJuliaExpMTK(arg, simCode)
+    cond.name in (:initial, :terminal) && return false
   end
+  return expToJuliaExpMTK(cond, simCode)
 end
 
 """
-Transforms a DAE Condition into a MTK continuous condition.
+An operand of not/and/or: a Boolean variable (or its pre()) is a Float64 (0.0/1.0) in the
+state vector, and `!active` threw a MethodError (`when not active`, the StateGraph steps).
+"""
+function _boolOperandMTK(e::SC.Exp, simCode::SC.SIM_CODE, cachedChange::Bool)
+  local x = expToJuliaBoolMTK(e, simCode; cachedChange)
+  local isBool = e isa Union{SC.RELATION, SC.LBINARY, SC.LUNARY, SC.BCONST} ||
+                 (e isa SC.CALL && e.kind === SC.CALL_BUILTIN && e.name in (:change, :edge, :initial, :terminal))
+  return isBool ? x : :($x != 0)
+end
+
+"""
+The value of a reference before the event, in a discrete callback: from the integrator's
+previous state (`lookuptableStates` the callback's table of the states' indices), read
+through the integrator (the affect binds the model's variables by name: one named `x`
+replaced the state vector `x`, a BoundsError). A parameter's, a constant's: its value.
+"""
+function _preValueLookup(arg::SC.Exp, simCode::SC.SIM_CODE; cachedChange::Bool = false)
+  arg isa SC.EXP_CREF || return expToJuliaExpMTK(arg, simCode)
+  local entry = get(simCode.stringToSimVarHT, SC.crefName(arg.cref), nothing)
+  (entry === nothing || SC.isParameter(last(entry))) && return expToJuliaExpMTK(arg, simCode)
+  local name = last(entry).name
+  cachedChange && return :(get(_changePreValues, Symbol($(name)), integrator.u[lookuptableStates[Symbol($(name))]]))
+  return :(integrator.uprev[lookuptableStates[Symbol($(name))]])
+end
+
+"""
+    transformToMTKContinuousCondition(cond, simCode; atInitial = false, normalized = false)
+
+The zero-crossing function of a condition: negative where the condition holds. A relation
+`a < b` as `a - b`; `==`, `<>`, a Boolean variable or call `b` as `0.5 - b`; `or`, `and`, `not`
+as `min`, `max`, `-`; `initial()` a constant, negative at the initialization (`atInitial`, the
+condition's initial value) and positive after it (the event iteration's start re-evaluation
+reads the runtime one: MSL FluxTubes' Tellinen hysteresis stayed in its `if initial()` branch).
 
 `normalized`: each relation's difference divided by its own scale, `1 + max(|a|, |b|)`
 (`_operandScaleExpr`), so that where min/max combine several relations a hysteresis is
 relative to each one's operands (OpenModelica's per-relation hysteresis).
 """
-function transformToMTKContinuousCondition(cond, simCode; atInitial::Bool = false, normalized::Bool = false)
-  # @match patterns are DAE.* only; convert SIM-side conditions at entry.
-  if cond isa SimulationCode.Exp
-    cond = SimulationCode.toDAEExp(cond)
-  end
-  local difference = function (a::DAE.Exp, b::DAE.Exp)
+function transformToMTKContinuousCondition(cond::SC.Exp, simCode::SC.SIM_CODE;
+                                           atInitial::Bool = false, normalized::Bool = false)
+  local difference = (a::SC.Exp, b::SC.Exp) -> begin
     local ja = expToJuliaExpMTK(a, simCode); local jb = expToJuliaExpMTK(b, simCode)
-    normalized || return :($(ja) - $(jb))
-    return :(($(ja) - $(jb)) / $(_operandScaleExpr(Any[ja, jb])))
+    normalized ? :(($(ja) - $(jb)) / $(_operandScaleExpr(Any[ja, jb]))) : :($(ja) - $(jb))
   end
-  local sub = c -> transformToMTKContinuousCondition(c, simCode; atInitial = atInitial, normalized = normalized)
-  res = @match cond begin
-    DAE.RELATION(e1, DAE.LESS(__), e2) => difference(e1, e2)
-    DAE.RELATION(e1, DAE.LESSEQ(__), e2) => difference(e1, e2)
-    DAE.RELATION(e1, DAE.GREATER(__), e2) => difference(e2, e1)
-    DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => difference(e2, e1)
-    #= Boolean-valued sub-conditions: encode `b` (true=1, false=0) such that the
-       result is *negative* when the original condition is TRUE — the convention
-       used by min/max for OR/AND composition and by evalInitialCondition. The
-       previous `b - 0.5` form had inverted polarity. =#
-    DAE.RELATION(e1, DAE.EQUAL(__), e2) => begin
-      :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
-    end
-    DAE.RELATION(e1, DAE.NEQUAL(__), e2) => begin
-      :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
-    end
-    DAE.CREF(__) => begin
-      :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
-    end
-    DAE.LBINARY(e1, DAE.OR(__), e2) => :(min($(sub(e1)), $(sub(e2))))
-    DAE.LBINARY(e1, DAE.AND(__), e2) => :(max($(sub(e1)), $(sub(e2))))
-    #= Logical NOT: negate the inner condition =#
-    DAE.LUNARY(DAE.NOT(__), e) => :(-($(sub(e))))
-    #= Strip noEvent wrapper and recurse =#
-    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
-      local innerArgs = collect(lst)
-      if length(innerArgs) == 1
-        sub(innerArgs[1])
-      else
-        OMBackend.unsupported("noEvent with several arguments in a condition", cond)
-      end
-    end
-    #= initial() is true during the initialization (`atInitial`: the
-       condition's initial value) and false after it: a constant crossing
-       function, negative (true) or positive (false). The event iteration's
-       start re-evaluation reads the runtime one (MSL FluxTubes' Tellinen
-       hysteresis stayed in its `if initial()` branch, k = 0.01, dHyst = 0). =#
-    DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
-      atInitial ? :(-1) : :(1)
-    end
-    #= General function call as boolean condition: same polarity rule. =#
-    DAE.CALL(__) => begin
-      :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
-    end
-    _ => begin
-      OMBackend.unsupported("condition expression", cond)
-    end
+  local sub = c::SC.Exp -> transformToMTKContinuousCondition(c, simCode; atInitial, normalized)
+  if cond isa SC.RELATION
+    cond.op in (SC.OP_LESS, SC.OP_LESSEQ) && return difference(cond.exp1, cond.exp2)
+    cond.op in (SC.OP_GREATER, SC.OP_GREATEREQ) && return difference(cond.exp2, cond.exp1)
+    #= `==`, `<>`: true is 1, false 0; negative when true (`b - 0.5` inverted the polarity:
+       `nperiod == 0` with nperiod = -1 read true inside a min). =#
+    return :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
+  elseif cond isa SC.LBINARY
+    return cond.op === SC.OP_OR ? :(min($(sub(cond.exp1)), $(sub(cond.exp2)))) :
+                                  :(max($(sub(cond.exp1)), $(sub(cond.exp2))))
+  elseif cond isa SC.LUNARY
+    return :(-($(sub(cond.exp))))
+  elseif SC.isBuiltin(cond, :noEvent)
+    length(cond.args) == 1 || OMBackend.unsupported("noEvent with several arguments in a condition", cond)
+    return sub(only(cond.args))
+  elseif SC.isBuiltin(cond, :initial)
+    return atInitial ? :(-1) : :(1)
+  elseif cond isa Union{SC.EXP_CREF, SC.PRE, SC.CALL}
+    return :(0.5 - $(expToJuliaExpMTK(cond, simCode)))
   end
-  return res
+  OMBackend.unsupported("condition expression", cond)
+end
+
+"The zero-crossing equation `zc ~ 0` of a condition (`transformToMTKContinuousCondition`)."
+transformToMTKContinuousConditionEquation(cond::SC.Exp, simCode::SC.SIM_CODE; atInitial::Bool = false)::Expr =
+  :($(transformToMTKContinuousCondition(cond, simCode; atInitial)) ~ 0)
+
+"""
+True if the condition holds at its zero-crossing boundary (zc == 0): the normalized
+crossing function cannot tell >= from > there, the relation's operator decides.
+Conservative: false for anything but a (negated, noEvent-wrapped) relation.
+"""
+function condClosedAtBoundary(cond::SC.Exp)::Bool
+  cond isa SC.RELATION && return cond.op in (SC.OP_LESSEQ, SC.OP_GREATEREQ, SC.OP_EQUAL)
+  (cond isa SC.LUNARY && cond.exp isa SC.RELATION) && return cond.exp.op in (SC.OP_LESS, SC.OP_GREATER)
+  (SC.isBuiltin(cond, :noEvent) && length(cond.args) == 1) && return condClosedAtBoundary(only(cond.args))
+  return false
+end
+
+#= Relation semantics for events (MLS 8.5, OpenModelica's relationhysteresis): a relation
+   keeps its value during integration and changes only at events; its crossing function has
+   a hysteresis relative to that value, so it is never zero after the initialization or after
+   an event (FMI 3.0 3.1.1). =#
+
+"The relations of a condition that generate events (not inside noEvent)."
+function _eventRelations(cond::SC.Exp)::Vector{SC.RELATION}
+  local out = SC.RELATION[]
+  local visit = function (e::SC.Exp)
+    if SC.isBuiltin(e, :noEvent)
+      return
+    elseif e isa SC.RELATION
+      push!(out, e)
+      return
+    end
+    foreach(visit, SC.children(e))
+  end
+  visit(cond)
+  return out
 end
 
 """
-Transforms a DAE Condition into a MTK continuous condition equation.
+The scale of a condition's operands, `1 + max(|a|, |b|, ...)`, for the hysteresis width
+`H * scale` (OpenModelica: max(|a|,|b|) + nominal).
 """
-function transformToMTKContinuousConditionEquation(cond, simCode; atInitial::Bool = false)
-  # @match patterns are DAE.* only; convert SIM-side conditions at entry.
-  if cond isa SimulationCode.Exp
-    cond = SimulationCode.toDAEExp(cond)
+function _conditionScaleExpr(cond::SC.Exp, simCode::SC.SIM_CODE)
+  local terms = Any[]
+  for rel in _eventRelations(cond)
+    push!(terms, expToJuliaExpMTK(rel.exp1, simCode), expToJuliaExpMTK(rel.exp2, simCode))
   end
-  res = @match cond begin
-    DAE.RELATION(e1, DAE.LESS(__), e2) => begin
-      :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)) ~ 0)
-    end
-    DAE.RELATION(e1, DAE.LESSEQ(__), e2) => begin
-      :($(expToJuliaExpMTK(e1, simCode)) - $(expToJuliaExpMTK(e2, simCode)) ~ 0)
-    end
-    DAE.RELATION(e1, DAE.GREATER(__), e2) => begin
-      :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)) ~ 0)
-    end
-    DAE.RELATION(e1, DAE.GREATEREQ(__), e2) => begin
-      :($(expToJuliaExpMTK(e2, simCode)) - $(expToJuliaExpMTK(e1, simCode)) ~ 0)
-    end
-    #= Equality / inequality / boolean CREF / general boolean CALL all encode a
-       Bool-valued condition. Convention: the zero-crossing function is negative
-       when the original condition is TRUE, positive when FALSE (see the OR / AND
-       composition with min / max, and `evalInitialCondition`). A Bool b
-       cast to Float64 maps `true=>1.0`, `false=>0.0`, so the encoding must be
-       `0.5 - b`, not `b - 0.5` — the latter inverts polarity, e.g. `nperiod == 0`
-       with nperiod = -1 (false) produces `0 - 0.5 = -0.5` and is mis-read as TRUE
-       inside `min(...)`, flipping the whole disjunction. =#
-    DAE.RELATION(e1, DAE.EQUAL(__), e2) => begin
-      :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
-    end
-    DAE.RELATION(e1, DAE.NEQUAL(__), e2) => begin
-      :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
-    end
-    #= Boolean variable used directly as condition: same polarity rule. =#
-    DAE.CREF(__) => begin
-      :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
-    end
-    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      :(min($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
-            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))) ~ 0)
-    end
-    DAE.LBINARY(e1, DAE.AND(__), e2) => begin
-      :(max($(transformToMTKContinuousCondition(e1, simCode; atInitial = atInitial)),
-            $(transformToMTKContinuousCondition(e2, simCode; atInitial = atInitial))) ~ 0)
-    end
-    #= Logical NOT: negate the inner condition =#
-    DAE.LUNARY(DAE.NOT(__), e) => begin
-      :(-($(transformToMTKContinuousCondition(e, simCode; atInitial = atInitial))) ~ 0)
-    end
-    #= Strip noEvent wrapper and recurse =#
-    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
-      local innerArgs = collect(lst)
-      if length(innerArgs) == 1
-        transformToMTKContinuousConditionEquation(innerArgs[1], simCode; atInitial = atInitial)
-      else
-        OMBackend.unsupported("noEvent with several arguments in a condition", cond)
-      end
-    end
-    #= initial(): see transformToMTKContinuousCondition. =#
-    DAE.CALL(Absyn.IDENT("initial"), _, _) => begin
-      atInitial ? :(-1 ~ 0) : :(1 ~ 0)
-    end
-    #= General function call as boolean condition: same polarity rule as above. =#
-    DAE.CALL(__) => begin
-      :(0.5 - $(expToJuliaExpMTK(cond, simCode)) ~ 0)
-    end
-    _ => begin
-      OMBackend.unsupported("condition expression", cond)
-    end
-  end
-  return res
+  isempty(terms) && return 1.0
+  return _operandScaleExpr(terms)
 end
 
+"""
+`1 + max(|x|, ...)` of lowered operands. An infinite operand (the MSL Spice3 V_pulse's
+default pulse width and period, inf, in `time >= T0 + Tfalling`) is left out: it made the
+hysteresis infinite.
+"""
+function _operandScaleExpr(xs::Vector{Any})
+  local terms = Any[:(ModelingToolkit.ifelse(abs($(x)) < 1.0e300, abs($(x)), 0.0)) for x in xs]
+  return length(terms) == 1 ? :(1.0 + $(terms[1])) : :(1.0 + max($(terms...)))
+end
 
-#= The delay() calls of the model being generated (delays.jl), as (key, argument, delay time) with the
-   argument and the delay time as Julia expressions; a call's position is the index of its history, and
-   an equal call shares it. With DELAY_MODEL, the name the histories are kept under. Both reset at the
-   start of each model's (or structural mode's) generation. =#
+"""
+A literal: a constant, its negation, an array of them.
+"""
+function _isLiteralExp(e::SC.Exp)::Bool
+  e isa Union{SC.ICONST, SC.RCONST, SC.SCONST, SC.BCONST, SC.ENUM_LITERAL} && return true
+  e isa SC.UNARY && return _isLiteralExp(e.exp)
+  e isa SC.ARRAY_EXP && return all(_isLiteralExp, e.elements)
+  return false
+end
+
+"""
+The literal value of a condition (as at the initialization), as a Julia Bool expression
+over `observed.zcK`: each relation from its own crossing function, `<`/`>` strict and
+`<=`/`>=` closed, and/or/not as such. `obsKws` collects the observed crossing functions.
+Nothing for a condition of another shape.
+"""
+function _literalConditionExpr(cond::SC.Exp, simCode::SC.SIM_CODE, obsKws::Vector{Expr})
+  local rec = e::SC.Exp -> _literalConditionExpr(e, simCode, obsKws)
+  local observe = function (zc)
+    local name = Symbol("zc", length(obsKws) + 1)
+    push!(obsKws, Expr(:kw, name, zc))
+    return :(observed.$(name))
+  end
+  if cond isa SC.RELATION
+    local zc = observe(transformToMTKContinuousCondition(cond, simCode))
+    #= == and <> cross as 0.5 - (a == b): negative exactly when it holds =#
+    return cond.op in (SC.OP_LESSEQ, SC.OP_GREATEREQ) ? :($(zc) <= 0) : :($(zc) < 0)
+  elseif cond isa SC.LBINARY
+    local l = rec(cond.exp1); local r = rec(cond.exp2)
+    (l === nothing || r === nothing) && return nothing
+    return cond.op === SC.OP_AND ? :($(l) && $(r)) : :($(l) || $(r))
+  elseif cond isa SC.LUNARY
+    local inner = rec(cond.exp)
+    return inner === nothing ? nothing : :(!$(inner))
+  elseif SC.isBuiltin(cond, :noEvent)
+    return length(cond.args) == 1 ? rec(only(cond.args)) : nothing
+  elseif cond isa SC.EXP_CREF
+    return :($(observe(expToJuliaExpMTK(cond, simCode))) > 0.5)
+  elseif cond isa SC.BCONST
+    return cond.value
+  end
+  return nothing
+end
+
+#= ==================================================================================== =#
+#= State of the lowering                                                                =#
+#= ==================================================================================== =#
+
+#= The delay() calls of the model being generated (delays.jl), as (key, argument, delay time)
+   with the argument and the delay time as Julia expressions; a call's position is the index
+   of its history, and an equal call shares it. With DELAY_MODEL, the name the histories are
+   kept under. Both reset at the start of each model's (or structural mode's) generation. =#
 const DELAY_CALLS = Tuple{String, Any, Any}[]
 const DELAY_MODEL = Ref{Symbol}(:none)
 
@@ -344,287 +293,461 @@ function _delayIndex!(key::String, x, delayTime)::Int
   return length(DELAY_CALLS)
 end
 
-#= The argument of a when body the event iteration runs (codeGen.jl: the
-   relation whens of `_emitRelationWhen`, and the discrete-when and
-   elsewhen-arm affects): the state before the current sweep, indexed by
-   `lookuptableStates`. =#
+#= The argument of a when body the event iteration runs (codeGen.jl: the relation whens of
+   `_emitRelationWhen`, and the discrete-when and elsewhen-arm affects): the state before the
+   current sweep, indexed by `lookuptableStates`. =#
 const PRE_SNAPSHOT = :__prevals
-#= The state index a when assignment writes through (`integrator.u[i]`): a
-   reserved name, the body binds the model's variables by their own names (a
-   discrete `idx` indexing a table, BuildingsRepro.ParameterArrayByDiscreteIndex). =#
+#= The state index a when assignment writes through (`integrator.u[i]`): a reserved name, the
+   body binds the model's variables by their own names (a discrete `idx` indexing a table,
+   BuildingsRepro.ParameterArrayByDiscreteIndex). =#
 const STATE_INDEX = :__stateIdx
-#= The homotopy parameter λ (homotopy(actual, simplified), MLS 3.7.4.4):
-   1 in a simulation; the initialization of a model with homotopy() goes from
-   0 (the simplified expressions) to 1 (`_homotopyContinuation`), as
-   OpenModelica's default does. =#
+#= The homotopy parameter λ (homotopy(actual, simplified), MLS 3.7.4.4): 1 in a simulation;
+   the initialization of a model with homotopy() goes from 0 (the simplified expressions) to 1
+   (`_homotopyContinuation`), as OpenModelica's default does. =#
 const HOMOTOPY_LAMBDA = :_homotopyLambda
-#= Whether homotopy() is lowered as the blend in λ: in the continuous
-   equations and the initialization equations only (ODE_MODE_MTK_MODEL_GENERATION),
-   where λ is a parameter and the continuation acts. Elsewhere (when bodies and
-   conditions, relations, if-equation branches, bindings, observed equations)
-   the actual expression: the blend read an undefined λ there (an
-   UndefVarError at the first event), and λ is 1 after the initialization. =#
+#= Whether homotopy() is lowered as the blend in λ: in the continuous equations and the
+   initialization equations only (ODE_MODE_MTK_MODEL_GENERATION), where λ is a parameter and
+   the continuation acts. Elsewhere (when bodies and conditions, relations, if-equation
+   branches, bindings, observed equations) the actual expression: the blend read an undefined
+   λ there (an UndefVarError at the first event), and λ is 1 after the initialization. =#
 const HOMOTOPY_BLEND = Base.ScopedValues.ScopedValue(false)
 
-#= Where `pre(v)` of a variable is read while a when body is lowered: false,
-   from `v` itself; true (within `with(PRE_FROM_SNAPSHOT => true)`), from
-   `PRE_SNAPSHOT`, so a body sees the pre() values even when an earlier body
-   of the same sweep assigned the variable. =#
+#= Where `pre(v)` of a variable is read while a when body is lowered: false, from `v` itself;
+   true (within `with(PRE_FROM_SNAPSHOT => true)`), from `PRE_SNAPSHOT`, so a body sees the
+   pre() values even when an earlier body of the same sweep assigned the variable. =#
 const PRE_FROM_SNAPSHOT = Base.ScopedValues.ScopedValue(false)
 
+#= ==================================================================================== =#
+#= Expressions                                                                          =#
+#= ==================================================================================== =#
+
 """
-  TODO: Keeping it simple for now, we assume we only have one argument in the call..
-  Also the der as symbol is really ugly..
+    expToJuliaExpMTK(e, simCode)
+
+The Julia expression of the SimCode expression `e` in the ModelingToolkit model: a reference
+by its variable's symbol, `time` as `t`, `der(x)` as `D(x)`; the Boolean operators
+arithmetically (`a and b` as `a * b`: neither `&&` nor `&` works on Symbolics' mix of Bool, Num
+and BasicSymbolic); an if-expression of Real branches as `c * a + (1 - c) * b`; a call of the
+model's functions with its records' fields as arguments, of a built-in by its implementation.
 """
-function DAECallExpressionToMTKCallExpression(pathStr::String, expLst::List,
-                                              simCode::SimulationCode.SimCode, ht; varPrefix=varPrefix, varSuffix = varSuffix, derAsSymbol=false)::Expr
-  @match pathStr begin
-    "der" => begin
-      local arg = listHead(expLst)
-      @match arg begin
-        #= Scalarize der({c1, c2, ...}) into [der(c1), der(c2), ...].
-           MSL MultiBody (Body.Q, frame_a.R_T rows etc.) emits a DAE.ARRAY
-           of element CREFs that survives frontend scalarization. Without
-           this arm DAE_identifierToString throws on the DAE.ARRAY. =#
-        DAE.ARRAY(_, _, array) => begin
-          local elemExprs = map(array) do e
-            DAECallExpressionToMTKCallExpression("der", Cons(e, MetaModelica.nil), simCode, ht;
-              varPrefix=varPrefix, varSuffix=varSuffix, derAsSymbol=derAsSymbol)
-          end
-          Expr(:vect, elemExprs...)
-        end
-        #= der(literal) ≡ 0. Reachable when an upstream parameter-eval pass
-           (solveParametricInitialEquations, foldParameterClosure) substituted
-           a parameter cref with its default constant before residual rewriting.
-           See SimCodeCheck rule_no_literal_in_der_pre for early diagnostic. =#
-        DAE.RCONST(_) => quote 0.0 end
-        DAE.ICONST(_) => quote 0 end
-        DAE.BCONST(_) => quote false end
-        #= der(-x) = -der(x): the name was taken through the minus (x grew for
-           der(-x) = 1). =#
-        DAE.UNARY(DAE.UMINUS(__), inner) => begin
-          local d = DAECallExpressionToMTKCallExpression("der", Cons(inner, MetaModelica.nil), simCode, ht;
-                                                         varPrefix=varPrefix, varSuffix=varSuffix, derAsSymbol=derAsSymbol)
-          :(-($(d)))
-        end
-        #= der of an expression: an initial equation der(w) = 0 whose w the
-           backend replaced by its definition. Differentiated later (the init
-           solve's derivative rows on observed expressions). =#
-        _ where (!(arg isa DAE.CREF || arg isa DAE.UNARY) && !derAsSymbol) => begin
-          local inner = expToJuliaExpMTK(arg, simCode; varPrefix = varPrefix, varSuffix = varSuffix)
-          quote
-            D($(inner))
-          end
-        end
-        _ => begin
-          varName = SimulationCode.DAE_identifierToString(arg)
-          if derAsSymbol
-            quote
-              $(Symbol("der_$(varName)"))
-            end
-          else
-            quote
-              D($(Symbol(varName)))
-            end
-          end
-        end
-      end
-    end
-    "pre" => begin
-      local arg = listHead(expLst)
-      @match arg begin
-        DAE.ARRAY(_, _, array) => begin
-          local elemExprs = map(array) do e
-            DAECallExpressionToMTKCallExpression("pre", Cons(e, MetaModelica.nil), simCode, ht;
-              varPrefix=varPrefix, varSuffix=varSuffix, derAsSymbol=derAsSymbol)
-          end
-          Expr(:vect, elemExprs...)
-        end
-        #= pre(literal) ≡ literal — pre-of-constant is the constant itself. =#
-        DAE.RCONST(r) => quote $r end
-        DAE.ICONST(i) => quote $i end
-        DAE.BCONST(b) => quote $b end
-        _ => begin
-          varName = SimulationCode.DAE_identifierToString(arg)
-          local entry = get(simCode.stringToSimVarHT, varName, nothing)
-          if PRE_FROM_SNAPSHOT[] && entry !== nothing && !SimulationCode.isParameter(last(entry))
-            :($(PRE_SNAPSHOT)[lookuptableStates[$(QuoteNode(Symbol(varName)))]])
-          else
-            quote
-              $(Symbol(varName))
-            end
-          end
-        end
-      end
-    end
-    #= noEvent(if c then a else b) on Real branches: only the branch c chooses (Symbolics'
-       ifelse evaluates and differentiates that one). The arithmetic lowering of if-expressions,
-       c*a + (1 - c)*b, turned a NaN of the other branch into the result: MSL ContinuousMean's
-       der(mu) = noEvent(if time >= t_0 + t_eps then (u - mu)/(time - t_0) else 0) was NaN at
-       t_0 (the Noise examples: Unstable at the first step). noEvent is how a model guards a
-       branch that is not defined where it is not chosen. =#
-    "noEvent" where (length(expLst) == 1 && listHead(expLst) isa DAE.IFEXP &&
-                     !(listHead(expLst).expCond isa DAE.BCONST) &&
-                     !_ifexpBranchIsNonReal(listHead(expLst).expThen) &&
-                     !_ifexpBranchIsNonReal(listHead(expLst).expElse)) => begin
-      local ie = listHead(expLst)
-      local lower = e -> expToJuliaExpMTK(e, simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derAsSymbol)
-      :(ifelse(OMBackend.CodeGeneration.MTK_CodeGenerationUtil._noEventCondition($(lower(ie.expCond))), $(lower(ie.expThen)), $(lower(ie.expElse))))
-    end
-    #= delay(x, T[, Tmax]): x's value T ago, from the model's history of x (delays.jl). =#
-    "delay" => begin
-      local args = collect(expLst)
-      local x = expToJuliaExpMTK(args[1], simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derAsSymbol)
-      local T = expToJuliaExpMTK(args[2], simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derAsSymbol)
-      local k = _delayIndex!(string(args[1]) * "|" * string(args[2]), x, T)
-      :(OMBackend.CodeGeneration.delayLookup($(QuoteNode(DELAY_MODEL[])), $k, t, $T, $x))
-    end
-    "initial" => begin
-      #= Modelica initial() is true only during initialization (handled separately by MTK).
-         In continuous equations it is always false (0 in arithmetic boolean context). =#
-      quote
-        0
-      end
-    end
-    #= Modelica Integer(enum) returns the 1-based index of an enum literal. Our
-       codegen already lowers enum CREFs to integer indices and ENUM_LITERAL to
-       its `index` field, so the cast is the identity at the Julia level. Without
-       this arm the splice emits `Integer(::Num)` which has no method. =#
-    #= homotopy(actual, simplified): a blend in the homotopy parameter λ (1
-       in a simulation), for the initialization's continuation from the
-       simplified expressions (MLS 3.7.4.4; OpenModelica's default for a
-       model with homotopy). It was the actual expression only: the
-       initialization found a root the simplified ones do not lead to (CubicRoot:
-       x = -0.347, OpenModelica 1.879). =#
-    "homotopy" => begin
-      local lower = e -> expToJuliaExpMTK(e, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derAsSymbol)
-      local a = lower(listHead(expLst))
-      HOMOTOPY_BLEND[] ?
-        :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_homotopy($(a), $(lower(listHead(listRest(expLst)))), $(HOMOTOPY_LAMBDA))) :
-        a
-    end
-    "Integer" => begin
-      expToJuliaExpMTK(listHead(expLst), simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derAsSymbol)
-    end
-    #= sample(start, interval) read in a when body (lowered with PRE_FROM_SNAPSHOT):
-       whether the instant is a tick, as the occupant lighting's `if sampleTrigger`
-       at `when {occ, sampleTrigger}` asks. Elsewhere false (modelica_sample), the
-       time between the ticks. =#
-    "sample" where PRE_FROM_SNAPSHOT[] => begin
-      local (start, interval) = map(x -> expToJuliaExpMTK(x, simCode), collect(expLst))
-      :(OMBackend.CodeGeneration._isSampleInstant(integrator.t, $(start), $(interval)))
-    end
-    #= A String parameter's binding (createStringParameterAssignments): the
-       argument types from the expressions, not from the values. =#
-    "String" => AlgorithmicCodeGeneration.modelicaStringCall(collect(expLst), x -> expToJuliaExpMTK(x, simCode))
-    _  =>  begin
-      argPart = tuple(map((x) -> expToJuliaExpMTK(x, simCode), expLst)...)
-      #= Check if this is a Modelica built-in with a dedicated Julia implementation =#
-      builtinSym = get(AlgorithmicCodeGeneration.MODELICA_BUILTIN_FUNCTIONS, pathStr, nothing)
-      if builtinSym !== nothing
-        qualifiedName = Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(:AlgorithmicCodeGeneration)), QuoteNode(builtinSym))
-        quote
-          $(qualifiedName)($(argPart...))
-        end
-      else
-        funcName = Symbol(pathStr)
-        quote
-          $(funcName)($(argPart...))
-        end
-      end
-    end
+function expToJuliaExpMTK end
+
+expToJuliaExpMTK(e::Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST}, ::SC.SIM_CODE)::Expr = quote $(e.value) end
+expToJuliaExpMTK(::SC.WILD, ::SC.SIM_CODE)::Expr = quote _ end
+"An enumeration literal is its index."
+expToJuliaExpMTK(e::SC.ENUM_LITERAL, ::SC.SIM_CODE)::Expr = quote $(e.index) end
+
+function expToJuliaExpMTK(e::SC.EXP_CREF, simCode::SC.SIM_CODE)::Expr
+  (e.cref.sym === :time && e.ty isa SC.TYPE_REAL) && return quote t end
+  e.ty isa SC.TYPE_ARRAY && return _wholeArrayExpr(e, simCode)
+  if !isempty(e.cref.subs)
+    local element = _arrayElementExpr(String(e.cref.sym), Any[s for s in e.cref.subs], simCode)
+    element === nothing || return element
   end
+  return _variableExpr(SC.crefName(e.cref), simCode)
+end
+
+"`der(x)`: `D(x)`."
+expToJuliaExpMTK(e::SC.DER, ::SC.SIM_CODE)::Expr = quote D($(Symbol(SC.crefName(e.cref)))) end
+
+"""
+`pre(x)`: in a when body lowered with PRE_FROM_SNAPSHOT, the value of `x` before the event
+iteration's sweep; else `x` (a callback reads its arguments before the affect changes them).
+"""
+function expToJuliaExpMTK(e::SC.PRE, simCode::SC.SIM_CODE)::Expr
+  local name = SC.crefName(e.cref)
+  local entry = get(simCode.stringToSimVarHT, name, nothing)
+  if PRE_FROM_SNAPSHOT[] && entry !== nothing && !SC.isParameter(last(entry))
+    return :($(PRE_SNAPSHOT)[lookuptableStates[$(QuoteNode(Symbol(name)))]])
+  end
+  return quote $(Symbol(name)) end
+end
+
+function expToJuliaExpMTK(e::SC.BINARY, simCode::SC.SIM_CODE)::Expr
+  local op = opKindToJuliaOperator(e.op)
+  return :($op($(expToJuliaExpMTK(e.exp1, simCode)), $(expToJuliaExpMTK(e.exp2, simCode))))
+end
+
+expToJuliaExpMTK(e::SC.UNARY, simCode::SC.SIM_CODE)::Expr =
+  :($(opKindToJuliaOperator(e.op))($(expToJuliaExpMTK(e.exp, simCode))))
+
+"`not a`: `1 - a`."
+expToJuliaExpMTK(e::SC.LUNARY, simCode::SC.SIM_CODE)::Expr = :(1 - $(expToJuliaExpMTK(e.exp, simCode)))
+
+"""
+`a and b`: `a * b`; `a or b`: `a + b - a * b`, the operands bound once (spliced twice, a
+left-nested chain of ors grew exponentially: Digital RAM and table when-conditions).
+"""
+function expToJuliaExpMTK(e::SC.LBINARY, simCode::SC.SIM_CODE)::Expr
+  local a = expToJuliaExpMTK(e.exp1, simCode)
+  local b = expToJuliaExpMTK(e.exp2, simCode)
+  e.op === SC.OP_AND && return :($(a) * $(b))
+  return :(let _a = $(a), _b = $(b); _a + _b - _a * _b end)
+end
+
+function expToJuliaExpMTK(e::SC.RELATION, simCode::SC.SIM_CODE)::Expr
+  local op = opKindToJuliaOperator(e.op)
+  return quote ($op($(expToJuliaExpMTK(e.exp1, simCode)), $(expToJuliaExpMTK(e.exp2, simCode)))) end
 end
 
 """
-  _ifexpBranchIsNonReal(e::DAE.Exp) -> Bool
-
-Conservative type sniff used by the IFEXP lowering: returns `true` when the
-expression's runtime value is clearly not a Real number, so the arithmetic
-`cond*then + (1-cond)*else` encoding cannot apply.
-
-Detects:
-- `DAE.SCONST` literals — String values
-- `DAE.CREF` whose `ty` is `DAE.T_STRING` — String parameters / variables
-- `DAE.CALL` whose `attr.ty` is `DAE.T_STRING` — String-returning functions
-- Nested `DAE.IFEXP` — recurse into both branches
-- `DAE.TUPLE` and a `DAE.CALL` of several outputs — a tuple (a guarded multi-output call
-  of a sub-clocked partition: `if active then random(pre(state)) else (pre(y), pre(state))`)
-
-Used to decide whether to emit `ifelse(cond, then, else)` (works for any type)
-or the MTK-friendlier arithmetic form (Real only).
+`if c then a else b`: of a literal condition its branch; of Real branches `c * a + (1 - c) * b`
+(ModelingToolkit.ifelse has dispatch problems with BasicSymbolic and Num); else
+`ifelse(c, a, b)` (a String, a tuple: CombiTables' `if useFile then fileName else "NoName"`).
 """
-Base.@nospecializeinfer function _ifexpBranchIsNonReal(@nospecialize(e::DAE.Exp))::Bool
-  @match e begin
-    DAE.SCONST(_) => true
-    DAE.CREF(_, ty) => ty isa DAE.T_STRING
-    DAE.CALL(_, _, attrs) => attrs.ty isa Union{DAE.T_STRING, DAE.T_TUPLE}
-    DAE.IFEXP(_, t, el) => _ifexpBranchIsNonReal(t) || _ifexpBranchIsNonReal(el)
-    DAE.TUPLE(_) => true
-    _ => false
+function expToJuliaExpMTK(e::SC.IFEXP, simCode::SC.SIM_CODE)::Expr
+  if e.cond isa SC.BCONST
+    return quote
+      $(LineNumberNode(@__LINE__, "evaluated if expr"))
+      $(expToJuliaExpMTK(e.cond.value ? e.thenExp : e.elseExp, simCode))
+    end
   end
+  local c = expToJuliaExpMTK(e.cond, simCode)
+  local a = _guardNonIntegerPowerBasesForEagerBranch(expToJuliaExpMTK(e.thenExp, simCode))
+  local b = _guardNonIntegerPowerBasesForEagerBranch(expToJuliaExpMTK(e.elseExp, simCode))
+  (_ifexpBranchIsNonReal(e.thenExp) || _ifexpBranchIsNonReal(e.elseExp)) && return :(ifelse(Bool($(c)), $(a), $(b)))
+  return :($(c) * $(a) + (1 - $(c)) * $(b))
 end
 
-#= The condition of a noEvent if-expression as ifelse takes it: a Bool, or a symbolic Bool. A
-   Boolean the backend holds as a Real (0 or 1: MSL ElastoGap's `contact`) is true above 1/2. =#
+"""
+    _ifexpBranchIsNonReal(e)
+
+Whether a branch of an if-expression is clearly no Real number, so the arithmetic
+`c * a + (1 - c) * b` does not apply: a String (literal, variable, call), a tuple (a guarded
+call of several outputs of a sub-clocked partition: `if active then random(pre(state)) else
+(pre(y), pre(state))`), an if-expression of such a branch.
+"""
+function _ifexpBranchIsNonReal(e::SC.Exp)::Bool
+  e isa Union{SC.SCONST, SC.TUPLE} && return true
+  e isa SC.EXP_CREF && return e.ty isa SC.TYPE_STRING
+  e isa SC.CALL && return e.ty isa Union{SC.TYPE_STRING, SC.TYPE_TUPLE}
+  e isa SC.IFEXP && return _ifexpBranchIsNonReal(e.thenExp) || _ifexpBranchIsNonReal(e.elseExp)
+  return false
+end
+
+"""
+The condition of a noEvent if-expression as ifelse takes it: a Bool, or a symbolic Bool. A
+Boolean the backend holds as a Real (0 or 1: MSL ElastoGap's `contact`) is true above 1/2.
+"""
 _noEventCondition(c::Bool)::Bool = c
 _noEventCondition(c::Number)::Bool = !iszero(c)
 _noEventCondition(c::Symbolics.Num) = SymbolicUtils.symtype(Symbolics.unwrap(c)) <: Bool ? c : c > 0.5
 _noEventCondition(c::SymbolicUtils.BasicSymbolic) = SymbolicUtils.symtype(c) <: Bool ? c : c > 0.5
 
-#= SimCode-Exp entry: codegen consumes `SimulationCode.Exp`
-   directly. The body below mirrors the `::DAE.Exp` version's dispatch
-   shape but operates on SIM Exp variants:
+expToJuliaExpMTK(e::SC.CAST, simCode::SC.SIM_CODE)::Expr = quote $(generateCastExpressionMTK(e.ty, e.exp, simCode)) end
 
-   - Trivial leaves (ICONST / RCONST / BCONST / SCONST / ENUM_LITERAL)
-     are emitted natively — no DAE round-trip.
-   - Algebraic / logical / relational composites (BINARY / UNARY /
-     LBINARY / LUNARY / RELATION / IFEXP / CAST / TUPLE) recurse into
-     this same SIM-Exp entry. The `OpKind` enum maps to the existing
-     `DAE_OP_toJuliaOperator` helper by reconstructing a minimal
-     `DAE.Operator` value (the operator-side type is unused by the
-     helper for the common cases).
-   - Complex shapes that drive the bulk of the DAE.Exp version
-     (EXP_CREF, CALL, ASUB, ARRAY_EXP, RECORD, TSUB) fall through to the
-     `::DAE.Exp` emitter via `toDAEExp` for now. Migrating each is a
-     mechanical mirror of the matching `DAE.X` arm in the long
-     function below; do it variant-by-variant so each landing is
-     small and testable. =#
 """
-    expToJuliaExpMTK(exp::SimulationCode.Exp, simCode; varPrefix="", varSuffix="", derSymbol=false)::Expr
+    generateCastExpressionMTK(ty, exp, simCode)
 
-SIM-Exp method. Emits an MTK `Expr` for a `SimulationCode.Exp`: scalars and
-operators directly, complex shapes (EXP_CREF/CALL/ASUB/ARRAY_EXP/RECORD/TSUB)
-by delegating to the `::DAE.Exp` method below via `toDAEExp`. `varPrefix`/
-`varSuffix` affix emitted cref names; `derSymbol` emits derivatives as a symbol.
+A conversion to `ty`: to Real `float(x)`, to a Real array `float.(x)`, to an Integer array
+`Int.(round.(x))`.
 """
-expToJuliaExpMTK(exp::SimulationCode.BCONST, simCode::SimulationCode.SIM_CODE;
-                 varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr = quote $(exp.value) end
-expToJuliaExpMTK(exp::SimulationCode.ICONST, simCode::SimulationCode.SIM_CODE;
-                 varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr = quote $(exp.value) end
-expToJuliaExpMTK(exp::SimulationCode.RCONST, simCode::SimulationCode.SIM_CODE;
-                 varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr = quote $(exp.value) end
-expToJuliaExpMTK(exp::SimulationCode.SCONST, simCode::SimulationCode.SIM_CODE;
-                 varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr = quote $(exp.value) end
-expToJuliaExpMTK(exp::SimulationCode.WILD, simCode::SimulationCode.SIM_CODE;
-                 varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr = quote _ end
-
-function expToJuliaExpMTK(exp::SimulationCode.ENUM_LITERAL, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  return quote $(exp.index) end
+function generateCastExpressionMTK(ty::SC.SType, exp::SC.Exp, simCode::SC.SIM_CODE)::Expr
+  local x = expToJuliaExpMTK(exp, simCode)
+  ty isa SC.TYPE_REAL && return quote float($(x)) end
+  (ty isa SC.TYPE_ARRAY && ty.elementType isa SC.TYPE_REAL) && return quote float.($(x)) end
+  (ty isa SC.TYPE_ARRAY && ty.elementType isa SC.TYPE_INTEGER) && return quote Int.(round.($(x))) end
+  OMBackend.unsupported("cast to $(ty)", exp)
 end
 
-#= A subscript as the flattened names write it (`2`, `idx`). =#
-_subscriptText(@nospecialize(s))::String =
-  s isa DAE.ICONST ? string(s.integer) : s isa DAE.INDEX ? _subscriptText(s.exp) : string(s)
+expToJuliaExpMTK(e::SC.TUPLE, simCode::SC.SIM_CODE)::Expr = Expr(:tuple, (expToJuliaExpMTK(x, simCode) for x in e.elements)...)
 
-#= `base[idx][2]`, a flattened name whose subscript is a variable (the array crefs the backend
-   flattened: CDL's Integer TimeTable `y[:] = val[idx, :]`, idx a discrete; its elements kept,
-   _referenceDynamicallyIndexed!): the lookup of the table of base's elements, all known at the
-   build (the dimensions from the names in the table), indexed at run time; nothing otherwise. =#
-function _dynamicSubscriptLookup(name::String, simCode::SimulationCode.SIM_CODE)::Union{Expr, Nothing}
-  #= a record array's field after the subscripts (`uacp[stage]_UAcp`, Buildings' DX coils):
-     literal subscripts only there =#
+"""
+Output `k` of a call: `tupleElementCall(f, k, args...)`, of an array output of known size
+`tupleArrayElementCall(f, k, dims, args...)` (indexing the call, `Num(term)[1]`, is a no-op in
+Symbolics); of another tuple the element.
+"""
+function expToJuliaExpMTK(e::SC.TSUB, simCode::SC.SIM_CODE)::Expr
+  e.exp isa SC.CALL || return :($(expToJuliaExpMTK(e.exp, simCode))[$(e.index)])
+  local call = e.exp
+  local fn = QuoteNode(call.name)
+  local args = _modelicaFunctionCallArgs(call.args, simCode)
+  if e.ty isa SC.TYPE_ARRAY && !isempty(e.ty.dims) && all(>=(0), e.ty.dims)
+    return :(OMBackend.CodeGeneration.tupleArrayElementCall($fn, $(e.index), $(Tuple(e.ty.dims)), $(args...)))
+  end
+  return :(OMBackend.CodeGeneration.tupleElementCall($fn, $(e.index), $(args...)))
+end
+
+"""
+A field of a record value: `re`, `im` by their projections (a Julia Complex, a record's
+NamedTuple, a Symbolics Num of a Complex term: Magnetic.FundamentalWave's
+`Complex.'*'.multiply(c1, c2).re`); another by name, or by position in a tuple of a function's
+outputs.
+"""
+function expToJuliaExpMTK(e::SC.RSUB, simCode::SC.SIM_CODE)::Expr
+  local inner = expToJuliaExpMTK(e.exp, simCode)
+  e.fieldName == "re" && return :(OMBackend.CodeGeneration._recordFieldRe($inner))
+  e.fieldName == "im" && return :(OMBackend.CodeGeneration._recordFieldIm($inner))
+  local ix = AlgorithmicCodeGeneration._positionalFieldIndex(e.exp, e.index)
+  return :(OMBackend.CodeGeneration._recordField($inner, $(QuoteNode(Symbol(e.fieldName))), $(ix)))
+end
+
+"""
+A record value: Modelica's `Complex(re, im)` as Julia's; another as a NamedTuple of its
+fields, each wrapped as a Num (a bare BasicSymbolic field broke the arithmetic on a parameter
+record passed to a function: Spice3's Mosfet, the ideal gases' DataRecord).
+"""
+function expToJuliaExpMTK(e::SC.RECORD, simCode::SC.SIM_CODE)::Expr
+  if e.name === :Complex && length(e.exps) == 2
+    return quote Complex($(expToJuliaExpMTK(e.exps[1], simCode)), $(expToJuliaExpMTK(e.exps[2], simCode))) end
+  end
+  local fields = Expr[:(Symbolics.wrap($(expToJuliaExpMTK(x, simCode)))) for x in e.exps]
+  length(e.fieldNames) == length(fields) || return Expr(:tuple, fields...)
+  return Expr(:tuple, Expr(:parameters, (Expr(:(=), Symbol(n), f) for (n, f) in zip(e.fieldNames, fields))...))
+end
+
+expToJuliaExpMTK(e::SC.ARRAY_EXP, simCode::SC.SIM_CODE)::Expr = handleArrayExp(e, simCode)
+
+"""
+A function argument with bound arguments: a closure calling the function's wrapper (symbolic
+arguments make a term, numeric ones a value).
+"""
+function expToJuliaExpMTK(e::SC.PARTEVALFUNCTION, simCode::SC.SIM_CODE)::Expr
+  local callee = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(e.name))
+  return AlgorithmicCodeGeneration._partialApplicationExpr(callee, Any[expToJuliaExpMTK(x, simCode) for x in e.args], e)
+end
+
+"""
+A reduction: `sum`, `product`, `min`, `max` of a generator; an array constructor
+`{e for i in u, j in v}` as a comprehension, its last iterator the first dimension
+(MLS 10.4.1.2; a Julia comprehension's first iterator is).
+"""
+function expToJuliaExpMTK(e::SC.REDUCTION, simCode::SC.SIM_CODE)::Expr
+  local body = expToJuliaExpMTK(e.body, simCode)
+  local iterators = Expr[Expr(:(=), it.name, expToJuliaExpMTK(it.range, simCode)) for it in e.iterators]
+  e.reducer === :array && return Expr(:comprehension, body, reverse(iterators)...)
+  local f = get(REDUCERS_MTK, e.reducer, nothing)
+  f === nothing && OMBackend.unsupported("the reduction $(e.reducer)", e)
+  return :($(f)($(Expr(:generator, body, iterators...))))
+end
+
+const REDUCERS_MTK = Dict{Symbol, Symbol}(:sum => :sum, :product => :prod, :min => :minimum, :max => :maximum)
+
+function expToJuliaExpMTK(e::SC.RANGE, simCode::SC.SIM_CODE)::Expr
+  local start = expToJuliaExpMTK(e.start, simCode)
+  local stop = expToJuliaExpMTK(e.stop, simCode)
+  e.step === nothing && return :($start:$stop)
+  return :($start:$(expToJuliaExpMTK(e.step, simCode)):$stop)
+end
+
+function expToJuliaExpMTK(e::SC.CALL, simCode::SC.SIM_CODE)::Expr
+  e.kind === SC.CALL_BUILTIN && return _builtinCallMTK(e, simCode)
+  return _modelicaFunctionCallExpr(e, simCode)
+end
+
+expToJuliaExpMTK(e::SC.Exp, ::SC.SIM_CODE)::Expr = OMBackend.unsupported("expression", e)
+
+#= ==================================================================================== =#
+#= References                                                                           =#
+#= ==================================================================================== =#
+
+"""
+    _variableExpr(name, simCode)
+
+The variable `name`: its symbol in the table; an eliminated alias's representative (the
+substitution missed the reference); an element by a variable subscript from its array's table
+(`_dynamicSubscriptLookup`); else the name itself.
+"""
+function _variableExpr(name::String, simCode::SC.SIM_CODE)::Expr
+  local entry = get(simCode.stringToSimVarHT, name, nothing)
+  entry === nothing || return quote $(Symbol(last(entry).name)) end
+  local (aliasResolved, aliasExpr) = resolveAliasedCref(name, simCode)
+  if aliasResolved
+    @warn "expToJuliaExpMTK: resolved alias-eliminated cref via fallback" name
+    return aliasExpr
+  end
+  local dynamic = _dynamicSubscriptLookup(name, simCode)
+  dynamic === nothing || return dynamic
+  return quote $(Symbol(name)) end
+end
+
+"""
+    _wholeArrayExpr(e, simCode)
+
+A whole array by its name, `x`, when its elements are variables (its last element is); a zero
+size one as an empty array of its shape (MSL Fluid's Xi_outflow[Medium.nXi], nXi = 0 for a
+single substance); else the array of its elements (MSL Engine1b_analytic's frame_im.R.T passed
+to selectBranch in an initial equation).
+"""
+function _wholeArrayExpr(e::SC.EXP_CREF, simCode::SC.SIM_CODE)::Expr
+  local ty = e.ty::SC.TYPE_ARRAY
+  any(==(0), ty.dims) && return _emptyArrayExpr(ty)
+  any(<(0), ty.dims) && OMBackend.unsupported("array dimension", e)
+  local name = SC.crefName(e.cref)
+  local lastElement = name * join("[$(d)]" for d in ty.dims)
+  haskey(simCode.stringToSimVarHT, lastElement) && return quote $(Symbol(name)) end
+  local (aliasResolved, aliasExpr) = resolveAliasedCref(lastElement, simCode)
+  if aliasResolved
+    @warn "expToJuliaExpMTK: resolved alias-eliminated array variable via fallback" lastElement
+    return aliasExpr
+  end
+  length(ty.dims) <= 2 || OMBackend.unsupported("an array of more than two dimensions without variables", name)
+  local element = idx::Vector{Int} -> expToJuliaExpMTK(SC.EXP_CREF(SC.SimCref(Symbol(name), idx), ty.elementType), simCode)
+  length(ty.dims) == 1 && return Expr(:vect, (element([i]) for i in 1:ty.dims[1])...)
+  return Expr(:vcat, (Expr(:row, (element([i, j]) for j in 1:ty.dims[2])...) for i in 1:ty.dims[1])...)
+end
+
+function _emptyArrayExpr(ty::SC.TYPE_ARRAY)::Expr
+  local elementType = ty.elementType isa SC.TYPE_INTEGER ? :Int : ty.elementType isa SC.TYPE_BOOL ? :Bool : :Float64
+  return :(zeros($elementType, $((max(d, 0) for d in ty.dims)...)))
+end
+
+"""
+    _arrayElementExpr(base, subs, simCode)
+
+An element of the array variable `base` (one kept as an array) by its lowered subscripts:
+with literal subscripts, the element of its binding (an array literal) or its scalar variable
+(`R_T[1][2]`: a record's field array has both, the parent's binding is empty where equations
+give the values); else `base[subs...]`. `nothing` for a `base` that is no array variable.
+"""
+function _arrayElementExpr(base::String, subs::Vector{Any}, simCode::SC.SIM_CODE)::Union{Nothing, Expr}
+  local ht = simCode.stringToSimVarHT
+  local entry = get(ht, base, nothing)
+  (entry !== nothing && last(entry).varKind isa Union{SC.ARRAY, SC.ARRAY_PARAMETER}) || return nothing
+  if all(s -> s isa Integer, subs)
+    local binding = last(entry).varKind.bindExp
+    if binding isa SC.ARRAY_EXP
+      local element = binding
+      for i in subs
+        element isa SC.ARRAY_EXP || OMBackend.unsupported("a binding row that is not an array literal", element)
+        element = element.elements[i]
+      end
+      return expToJuliaExpMTK(element, simCode)
+    end
+    local scalar = get(ht, base * join("[$(i)]" for i in subs), nothing)
+    scalar === nothing || return quote $(Symbol(last(scalar).name)) end
+  end
+  return quote
+    $(LineNumberNode(@__LINE__, "Array subscript: $base"))
+    $(Symbol(base))[$(subs...)]
+  end
+end
+
+"A subscript: a literal as its value, `:` as `:`, another lowered."
+function _subscriptExpr(s::SC.Exp, simCode::SC.SIM_CODE)
+  s isa SC.ICONST && return s.value
+  s isa SC.WHOLE_DIMENSION && return :(:)
+  return expToJuliaExpMTK(s, simCode)
+end
+
+"""
+A subscript as the flattened names write it (`2`, `idx`); `?` for another expression.
+"""
+_subscriptText(s::SC.Exp)::String = s isa SC.ICONST ? string(s.value) : s isa SC.EXP_CREF ? SC.crefName(s.cref) : "?"
+
+"""
+`exp[subs...]`. With literal subscripts: an element of an array output of a call
+(`tupleArrayElementAt`), the scalar variable of an array's element (a record's field array,
+`frame_b.R.T[1, 1]`), an output of a function's call (`tupleElementCall`); else the indexing.
+With a subscript that is not a literal: an element of an array known at the build
+(`_dynamicSubscriptLookup`), of variables (`_variableSelectionExpr`), of a constant table
+(`constTableLookup`, symbolic indices: Digital's `Buf3sTable[strength, UX01Conv[enable], ...]`);
+else the indexing.
+"""
+function expToJuliaExpMTK(e::SC.ASUB, simCode::SC.SIM_CODE)::Expr
+  local subs = Any[_subscriptExpr(s, simCode) for s in e.subs]
+  all(s -> s isa Integer, subs) && return _literalSubscriptExpr(e, Int[s for s in subs], simCode)
+  local inner = e.exp
+  if inner isa SC.EXP_CREF
+    local table = _dynamicSubscriptLookup(SC.crefName(inner.cref) * join("[" * _subscriptText(s) * "]" for s in e.subs), simCode)
+    table === nothing || return table
+  end
+  if inner isa SC.ARRAY_EXP && length(subs) == 1
+    local selection = _variableSelectionExpr(inner.elements, only(subs), simCode)
+    selection === nothing || return selection
+  end
+  local innerCode = expToJuliaExpMTK(inner, simCode)
+  local entry = inner isa SC.EXP_CREF ? get(simCode.stringToSimVarHT, SC.crefName(inner.cref), nothing) : nothing
+  if inner isa SC.ARRAY_EXP || (entry !== nothing && last(entry).varKind isa SC.DATA_STRUCTURE)
+    return quote OMBackend.CodeGeneration.constTableLookup($(innerCode), $(subs...)) end
+  end
+  return quote $(innerCode)[$(subs...)] end
+end
+
+function _literalSubscriptExpr(e::SC.ASUB, subs::Vector{Int}, simCode::SC.SIM_CODE)::Expr
+  local inner = e.exp
+  local output = _functionOutputOf(inner, simCode)
+  if output !== nothing
+    local (call, k) = output
+    return :(OMBackend.CodeGeneration.tupleArrayElementAt($(QuoteNode(call.name)), $k, $(Tuple(subs)),
+                                                         $(_modelicaFunctionCallArgs(call.args, simCode)...)))
+  end
+  if inner isa SC.EXP_CREF && isempty(inner.cref.subs)
+    local entry = get(simCode.stringToSimVarHT, SC.crefName(inner.cref) * join("[$(i)]" for i in subs), nothing)
+    entry === nothing || return quote $(Symbol(last(entry).name)) end
+  end
+  #= An element of a function's result (an output of several, an element of an array output:
+     Xorshift128plus.initialState, Integer[4]): a term of its own for symbolic arguments (a
+     parameter binding: MSL PlanarLoops_analytic's normalizeWithAssert(n)[2]: an array whose
+     size follows the arguments is one opaque term). With literal arguments the indexing stays:
+     the result is numbers, evaluated once for all its elements (_parameterBindingExpr). =#
+  if length(subs) == 1 && _isModelFunctionCall(inner, simCode) &&
+     !(inner.ty isa SC.TYPE_ARRAY && all(_isLiteralExp, inner.args))
+    return :(OMBackend.CodeGeneration.tupleElementCall($(QuoteNode(inner.name)), $(only(subs)),
+                                                      $(_modelicaFunctionCallArgs(inner.args, simCode)...)))
+  end
+  return quote $(expToJuliaExpMTK(inner, simCode))[$(subs...)] end
+end
+
+"Whether `e` calls one of the model's functions (SIM_CODE.functions)."
+_isModelFunctionCall(e::SC.Exp, simCode::SC.SIM_CODE)::Bool =
+  e isa SC.CALL && e.kind !== SC.CALL_BUILTIN && _isSimCodeFunctionName(String(e.name), simCode)
+
+"""
+Output `k` of a call of one of the model's functions, as `f(...)[k]` or `TSUB(f(...), k)`:
+`(call, k)`, else nothing. Its elements are indexed through tupleArrayElementAt (plain
+indexing of tupleElementCall's scalar Num fails).
+"""
+function _functionOutputOf(e::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, Tuple{SC.CALL, Int}}
+  if e isa SC.ASUB && _isModelFunctionCall(e.exp, simCode) && length(e.subs) == 1 && only(e.subs) isa SC.ICONST
+    return (e.exp, only(e.subs).value)
+  elseif e isa SC.TSUB && _isModelFunctionCall(e.exp, simCode)
+    return (e.exp, e.index)
+  end
+  return nothing
+end
+
+"""
+    _variableSelectionExpr(elements, index, simCode)
+
+`{x1, x2, ...}[i]` of variables by a subscript `i` that is not a literal (SimCode's reference
+by a variable subscript of a part before the last: Buildings' DX coils' `sta[i].nomVal`): the
+lookup of the table of their values when all are known at the build; else the variable `i`
+selects, `ifelse(i == 1, x1, ifelse(i == 2, x2, ...))`. Nothing for other elements.
+"""
+function _variableSelectionExpr(elements::Vector{SC.Exp}, index, simCode::SC.SIM_CODE)::Union{Nothing, Expr}
+  isempty(elements) && return nothing
+  all(x -> x isa SC.EXP_CREF && !(x.ty isa SC.TYPE_ARRAY), elements) || return nothing
+  local names = String[SC.crefName(x.cref) for x in elements]
+  local table = _knownValues(names, simCode)
+  table === nothing || return :(OMBackend.CodeGeneration.constTableLookup($(table), $(index)))
+  local ht = simCode.stringToSimVarHT
+  all(n -> haskey(ht, n), names) || return nothing
+  return quote $(_selectionChain(Symbol[Symbol(last(ht[n]).name) for n in names], index)) end
+end
+
+"`ifelse(i == 1, x1, ifelse(i == 2, x2, ... xn))`."
+function _selectionChain(symbols::Vector{Symbol}, index)
+  local chain = symbols[end]
+  for k in (length(symbols) - 1):-1:1
+    chain = :(ifelse($(index) == $(k), $(symbols[k]), $(chain)))
+  end
+  return chain
+end
+
+"""
+    _dynamicSubscriptLookup(name, simCode)
+
+`base[idx][2]`, a flattened name whose subscript is a variable (the array crefs the backend
+flattened: CDL's Integer TimeTable `y[:] = val[idx, :]`, idx a discrete; its elements kept): the
+lookup of the table of base's elements, all known at the build (the dimensions from the names
+in the table), indexed at run time; for elements not known at the build (`fixed = false`
+parameters the initialization computes, variables: Buildings' DX coils' `uacp[stage].UAcp`),
+one subscript a variable, the element the index selects among their variables; nothing
+otherwise.
+"""
+function _dynamicSubscriptLookup(name::String, simCode::SC.SIM_CODE)::Union{Expr, Nothing}
+  #= a record array's field after the subscripts (`uacp[stage]_UAcp`): literal subscripts only there =#
   local m = match(r"^([^\[\]]+)((?:\[[^\[\]]+\])+)((?:[^\[\]]|\[[0-9]+\])*)$", name)
   m === nothing && return nothing
   local base = String(m.captures[1])
@@ -644,7 +767,7 @@ function _dynamicSubscriptLookup(name::String, simCode::SimulationCode.SIM_CODE)
     end
   end
   #= the extent of each dimension: the elements along it from 1 =#
-  local key = (d, k) -> base * join("[" * string(j == d ? k : 1) * "]" for j in eachindex(subs)) * suffix
+  local key = (d::Int, k::Int) -> base * join("[" * string(j == d ? k : 1) * "]" for j in eachindex(subs)) * suffix
   local dims = Int[]
   for d in eachindex(subs)
     local n = 0
@@ -654,11 +777,9 @@ function _dynamicSubscriptLookup(name::String, simCode::SimulationCode.SIM_CODE)
     n == 0 && return nothing
     push!(dims, n)
   end
-  local table = _buildTimeTable(base, suffix, dims, simCode)
+  local names = map(I -> base * join("[" * string(i) * "]" for i in Tuple(I)) * suffix, CartesianIndices(Tuple(dims)))
+  local table = _knownValues(names, simCode)
   table === nothing || return :(OMBackend.CodeGeneration.constTableLookup($(table), $(index...)))
-  #= Elements not known at the build (`fixed = false` parameters the initialization computes,
-     variables: Buildings' DX coils' `uacp[stage].UAcp`), one subscript a variable: the element
-     the index selects, among their variables =#
   local dynamic = findall(s -> tryparse(Int, s) === nothing, subs)
   length(dynamic) == 1 || return nothing
   local d = only(dynamic)
@@ -668,1754 +789,498 @@ function _dynamicSubscriptLookup(name::String, simCode::SimulationCode.SIM_CODE)
     entry === nothing && return nothing
     push!(symbols, Symbol(last(entry).name))
   end
-  local chain = symbols[end]
-  for k in (length(symbols) - 1):-1:1
-    chain = :(ifelse($(index[d]) == $(k), $(symbols[k]), $(chain)))
-  end
-  return quote $(chain) end
+  return quote $(_selectionChain(symbols, index[d])) end
 end
 
-#= The values of the elements `base[i][j]...suffix`, all known at the build, or nothing. =#
-function _buildTimeTable(base::String, suffix::String, dims::Vector{Int}, simCode::SimulationCode.SIM_CODE)::Union{Array{Float64}, Nothing}
+"""
+The values of the parameters `names` (an array of them), all known at the build, or nothing.
+"""
+function _knownValues(names::AbstractArray{String}, simCode::SC.SIM_CODE)::Union{Array{Float64}, Nothing}
   local ht = simCode.stringToSimVarHT
-  local table = Array{Float64}(undef, dims...)
-  for I in CartesianIndices(table)
-    local entry = get(ht, base * join("[" * string(i) * "]" for i in Tuple(I)) * suffix, nothing)
+  local table = Array{Float64}(undef, size(names)...)
+  for I in eachindex(names)
+    local entry = get(ht, names[I], nothing)
     entry === nothing && return nothing
     local kind = last(entry).varKind
-    (kind isa SimulationCode.PARAMETER && kind.bindExp isa SOME) || return nothing
-    local b = kind.bindExp.data
-    local v = SimulationCode.tryEvalNumeric(SimulationCode.toDAEExp(b), simCode)
+    (kind isa SC.PARAMETER && kind.bindExp !== nothing) || return nothing
+    local b = kind.bindExp
+    local v = SC.tryEvalNumeric(b, simCode)
     #= `integer(table[...][i, j])`: evaluated as the initial values are =#
-    v === nothing && (v = _t0Number(() -> evalDAEConstant(b, simCode)))
+    v === nothing && (v = _t0Number(() -> evalConstant(b, simCode)))
     v === nothing && return nothing
     table[I] = v
   end
   return table
 end
 
-function expToJuliaExpMTK(exp::SimulationCode.EXP_CREF, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  #= SimCref is flat post-Causalize.flattenArrayCrefs, so the CREF_QUAL hierarchy
-     that the DAE arm handles cannot reach here. Handle the cheap scalar / "time" /
-     simple subscript cases natively; delegate T_ARRAY-typed and harder subscript
-     cases to the DAE.Exp emitter. =#
-  if exp.cref.sym === :time && exp.ty isa SimulationCode.TYPE_REAL
-    return quote t end
-  end
-  if exp.ty isa SimulationCode.TYPE_ARRAY
-    return expToJuliaExpMTK(SimulationCode.toDAEExp(exp), simCode;
-                            varSuffix = varSuffix, varPrefix = varPrefix,
-                            derSymbol = derSymbol)
-  end
-  local hashTable = simCode.stringToSimVarHT
-  local nameStr = string(exp.cref.sym)
-  local lookUpStr = isempty(exp.cref.subs) ?
-    nameStr :
-    string(nameStr, "[", join(exp.cref.subs, ","), "]")
-  local htEntry = get(hashTable, lookUpStr, nothing)
-  if htEntry !== nothing
-    return quote $(Symbol(htEntry[2].name)) end
-  end
-  local (aliasResolved, aliasExpr) = resolveAliasedCref(lookUpStr, simCode, hashTable,
-    varPrefix = varPrefix, varSuffix = varSuffix)
-  if aliasResolved
-    @warn "expToJuliaExpMTK[SIM]: resolved alias-eliminated cref via fallback" lookUpStr
-    return aliasExpr
-  end
-  local dynamic = _dynamicSubscriptLookup(lookUpStr, simCode)
-  dynamic !== nothing && return dynamic
-  return quote $(Symbol(string(varPrefix, lookUpStr, varSuffix))) end
-end
+#= ==================================================================================== =#
+#= Arrays                                                                               =#
+#= ==================================================================================== =#
 
-function expToJuliaExpMTK(exp::SimulationCode.BINARY, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  local lhs = expToJuliaExpMTK(exp.exp1, simCode;
-                                varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local rhs = expToJuliaExpMTK(exp.exp2, simCode;
-                                varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local opSym = opKindToJuliaOperator(exp.op)
-  return :( $opSym($(lhs), $(rhs)) )
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.UNARY, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  local operand = expToJuliaExpMTK(exp.exp, simCode;
-                                    varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local opSym = opKindToJuliaOperator(exp.op)
-  return :( $opSym($(operand)) )
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.LUNARY, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  local operand = expToJuliaExpMTK(exp.exp, simCode;
-                                    varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  if exp.op === SimulationCode.OP_NOT
-    return :( 1 - $(operand) )
-  end
-  local opSym = opKindToJuliaOperator(exp.op)
-  return :( $opSym($(operand)) )
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.LBINARY, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  local lhs = expToJuliaExpMTK(exp.exp1, simCode;
-                                varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local rhs = expToJuliaExpMTK(exp.exp2, simCode;
-                                varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  if exp.op === SimulationCode.OP_OR
-    return :( $(lhs) + $(rhs) - $(lhs) * $(rhs) )
-  elseif exp.op === SimulationCode.OP_AND
-    return :( $(lhs) * $(rhs) )
-  end
-  local opSym = opKindToJuliaOperator(exp.op)
-  return :( $opSym($(lhs), $(rhs)) )
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.RELATION, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  local lhs = expToJuliaExpMTK(exp.exp1, simCode;
-                                varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local rhs = expToJuliaExpMTK(exp.exp2, simCode;
-                                varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local opSym = opKindToJuliaOperator(exp.op)
-  return quote ($opSym($(lhs), $(rhs))) end
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.IFEXP, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  if exp.cond isa SimulationCode.BCONST
-    local branch = exp.cond.value ? exp.thenExp : exp.elseExp
-    local e = expToJuliaExpMTK(branch, simCode;
-                                varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-    return quote
-      $(LineNumberNode(@__LINE__, "evaluated if expr"))
-      $(e)
-    end
-  end
-  local condJL = expToJuliaExpMTK(exp.cond, simCode;
-                                   varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  local thenJL = _guardNonIntegerPowerBasesForEagerBranch(
-    expToJuliaExpMTK(exp.thenExp, simCode;
-                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol))
-  local elseJL = _guardNonIntegerPowerBasesForEagerBranch(
-    expToJuliaExpMTK(exp.elseExp, simCode;
-                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol))
-  #= Same Real-vs-non-Real branch-typing rule as the DAE.Exp version
-     (see comment above the matching `DAE.IFEXP` arm). =#
-  if _ifexpBranchIsNonReal(SimulationCode.toDAEExp(exp.thenExp)) ||
-     _ifexpBranchIsNonReal(SimulationCode.toDAEExp(exp.elseExp))
-    return :(ifelse(Bool($(condJL)), $(thenJL), $(elseJL)))
-  else
-    return :( $(condJL) * $(thenJL) + (1 - $(condJL)) * $(elseJL) )
-  end
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.CAST, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  return quote
-    $(generateCastExpressionMTK(SimulationCode.toDAEType(exp.ty), SimulationCode.toDAEExp(exp.exp), simCode, varPrefix))
-  end
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.TUPLE, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  local elemExprs = Expr[expToJuliaExpMTK(e, simCode;
-                                            varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-                          for e in exp.PR]
-  return Expr(:tuple, elemExprs...)
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.TSUB, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  #= TSUB over a CALL needs the Modelica-function dispatch in the DAE arm
-     (tupleElementCall / tupleArrayElementCall); only the non-CALL form
-     lowers cleanly to plain indexing. =#
-  if exp.exp isa SimulationCode.CALL
-    return expToJuliaExpMTK(SimulationCode.toDAEExp(exp), simCode;
-                            varSuffix = varSuffix, varPrefix = varPrefix,
-                            derSymbol = derSymbol)
-  end
-  local tupleExpr = expToJuliaExpMTK(exp.exp, simCode;
-                                      varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-  return :($tupleExpr[$(exp.index)])
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.RSUB, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  local innerJL = expToJuliaExpMTK(exp.exp, simCode;
-                                    varPrefix = varPrefix, varSuffix = varSuffix,
-                                    derSymbol = derSymbol)
-  if exp.fieldName == "re"
-    return :(OMBackend.CodeGeneration._recordFieldRe($innerJL))
-  elseif exp.fieldName == "im"
-    return :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
-  end
-  local ix = AlgorithmicCodeGeneration._positionalFieldIndex(SimulationCode.toDAEExp(exp.exp), exp.index)
-  return :(OMBackend.CodeGeneration._recordField($innerJL, $(QuoteNode(Symbol(exp.fieldName))), $(ix)))
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.ARRAY_EXP, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  return handleArrayExp(SimulationCode.toDAEExp(exp), simCode)
-end
-
-function expToJuliaExpMTK(exp::SimulationCode.RECORD, simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "", derSymbol::Bool = false)::Expr
-  #= Mirror the DAE.RECORD arms: Modelica `Complex(re, im)` becomes Julia's
-     `Complex(re, im)`; any other record lowers to a `Symbolics.wrap`-wrapped
-     NamedTuple keyed by field name. =#
-  if exp.path isa Absyn.IDENT && exp.path.name == "Complex" && length(exp.exps) == 2
-    local reExpr = expToJuliaExpMTK(exp.exps[1], simCode;
-                                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-    local imExpr = expToJuliaExpMTK(exp.exps[2], simCode;
-                                     varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-    return quote Complex($reExpr, $imExpr) end
-  end
-  local wrappedElems = Expr[:(Symbolics.wrap($(expToJuliaExpMTK(e, simCode;
-                                                                  varPrefix = varPrefix,
-                                                                  varSuffix = varSuffix,
-                                                                  derSymbol = derSymbol))))
-                             for e in exp.exps]
-  if length(exp.fieldNames) == length(wrappedElems)
-    local names = Symbol[Symbol(n) for n in exp.fieldNames]
-    local pairs = Expr[Expr(:(=), names[i], wrappedElems[i]) for i in eachindex(names)]
-    return Expr(:tuple, Expr(:parameters, pairs...))
-  end
-  return Expr(:tuple, wrappedElems...)
-end
-
-#= Fallback: CALL and any variant without a SIM-native arm route through the
-   DAE.Exp emitter (~600 lines of HT lookup, alias resolution, builtin/external
-   function dispatch, array-binding unfolding). Each can be migrated incrementally
-   to its own SIM-native method above. =#
-Base.@nospecializeinfer function expToJuliaExpMTK(@nospecialize(exp::SimulationCode.Exp),
-                          simCode::SimulationCode.SIM_CODE;
-                          varSuffix = "", varPrefix = "",
-                          derSymbol::Bool = false)::Expr
-  return expToJuliaExpMTK(SimulationCode.toDAEExp(exp), simCode;
-                          varSuffix = varSuffix, varPrefix = varPrefix,
-                          derSymbol = derSymbol)
+"""
+An expression of literals only (no variable, no call).
+"""
+function _isConstantExp(e::SC.Exp)::Bool
+  e isa Union{SC.RCONST, SC.ICONST, SC.BCONST, SC.SCONST, SC.ENUM_LITERAL} && return true
+  e isa SC.UNARY && return _isConstantExp(e.exp)
+  e isa SC.BINARY && return _isConstantExp(e.exp1) && _isConstantExp(e.exp2)
+  e isa SC.ARRAY_EXP && return all(_isConstantExp, e.elements)
+  return false
 end
 
 """
-    expToJuliaExpMTK(exp::DAE.Exp, simCode; varPrefix="", varSuffix="", derSymbol=false)::Expr
+    handleArrayExp(e, simCode)
 
-DAE-Exp method (the bulk emitter). Converts a `DAE.Exp` into an MTK `Expr`. The
-`SimulationCode.Exp` method above dispatches here via `toDAEExp` for shapes it
-does not handle natively. `varPrefix`/`varSuffix` affix emitted cref names;
-`derSymbol` emits derivatives as a symbol.
+An array literal: of constants, the array evaluated at the build (rows stacked along the first
+dimension: a three-dimensional literal's rows are matrices, Buildings' Borefields
+TemporalSuperposition); with variables, a vector, a matrix by `hvcat` of its rows' elements.
 """
-function expToJuliaExpMTK(@nospecialize(exp::DAE.Exp),
-                          simCode::SimulationCode.SIM_CODE;
-                          varSuffix="",
-                          varPrefix="",
-                          derSymbol::Bool=false)::Expr
-  hashTable = simCode.stringToSimVarHT
-  local expr::Expr = begin
-    local int::Int64
-    local real::Float64
-    local bool::Bool
-    local tmpStr::String
-    local cr::DAE.ComponentRef
-    local e1::DAE.Exp
-    local e2::DAE.Exp
-    local e3::DAE.Exp
-    local expl::List{DAE.Exp}
-    local lstexpl::List{List{DAE.Exp}}
-    @match exp begin
-      DAE.BCONST(bool) => quote $bool end
-      DAE.ICONST(int) => quote $int end
-      DAE.RCONST(real) => quote $real end
-      DAE.SCONST(tmpStr) => quote $tmpStr end
-      DAE.CREF(DAE.CREF_IDENT("time", DAE.T_REAL(_)), _) => begin
-        quote
-          t
-        end
-      end
-      #=
-      Qualified path to a variable of type array.
-      See array access below.
-      Note that the array is added as <name>[<size>] in the HT during the simcode phase.
-      Hence, the dimensionality must be added before lookup in the ht.
-      =#
-      #= A zero-size array has no variables (MSL Fluid's Xi_outflow[Medium.nXi],
-         nXi = 0 for a single substance, passed to setState_phX): an empty array
-         of its shape. =#
-      DAE.CREF(cr, DAE.T_ARRAY(ty, dims)) where _isZeroSizeArray(dims) => _emptyArrayExpr(ty, dims)
-      DAE.CREF(cr, DAE.T_ARRAY(ty, dims)) => begin
-        lookUpStr = string(exp)
-        arrName = string(exp)
-        #= To make sure the variable is indexed =#
-        for d in dims
-          local i = @match d begin
-            DAE.DIM_INTEGER(n) => n
-            _ => OMBackend.unsupported("array dimension", d)
-          end
-          lookUpStr *= string("[", i, "]")
-        end
-        local arrEntry = get(hashTable, lookUpStr, nothing)
-        if arrEntry !== nothing
-          hashTable[arrName] = arrEntry
-          expr = quote $(Symbol(arrName)) end
-          expr
-        else
-          local (aliasResolved, aliasExpr) = resolveAliasedCref(lookUpStr, simCode, hashTable,
-            varPrefix=varPrefix, varSuffix=varSuffix)
-          if aliasResolved
-            @warn "expToJuliaExpMTK: resolved alias-eliminated T_ARRAY variable via fallback" lookUpStr
-            aliasExpr
-          else
-            #= Not a variable of its own (its elements were eliminated): the array
-               of its elements, each lowered as a subscripted reference. The bare
-               name was undefined (MSL Engine1b_analytic's frame_im.R.T passed to
-               selectBranch in an initial equation). =#
-            local sizes = Int[d.integer for d in dims]   #= DIM_INTEGER: checked above =#
-            length(sizes) <= 2 || OMBackend.unsupported("an array of more than two dimensions without variables", arrName)
-            local elem = idx -> expToJuliaExpMTK(
-              DAE.CREF(DAE.CREF_IDENT(arrName, ty, MetaModelica.list((DAE.INDEX(DAE.ICONST(i)) for i in idx)...)), ty),
-              simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-            length(sizes) == 1 ? Expr(:vect, (elem((i,)) for i in 1:sizes[1])...) :
-              Expr(:vcat, (Expr(:row, (elem((i, j)) for j in 1:sizes[2])...) for i in 1:sizes[1])...)
-          end
-        end
-      end
-      #=
-      This is an array access. Note the difference to the case above,
-      that is a component of type array.
-      In the case above we do not lookup the subscript whereas here it is subscripted.
-      =#
-      DAE.CREF(DAE.CREF_IDENT(ident, identType, subscriptLst), _) where !isempty(subscriptLst) => begin
-        local varName = SimulationCode.string(ident)
-        #= First try to handle as subscripted array with binding expression =#
-        local cref = DAE.CREF_IDENT(ident, identType, subscriptLst)
-        (success, arrayExpr) = tryHandleSubscriptedArrayCref(cref, hashTable, simCode,
-          varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-        if success
-          arrayExpr
-        else
-          #= Fallback: look up expanded variable name or generate runtime subscript =#
-          local allConstant = true
-          local lookUpStr = ""
-          for s in subscriptLst
-            @match s begin
-              DAE.INDEX(DAE.ICONST(i)) => begin
-                lookUpStr *= string("[", i, "]")
-              end
-              _ => begin
-                allConstant = false
-              end
-            end
-          end
-          if allConstant
-            local fullKey = string(varName, lookUpStr)
-            local htEntry = get(hashTable, fullKey, nothing)
-            if htEntry !== nothing
-              quote
-                $(LineNumberNode(@__LINE__, "$varName array"))
-                $(Symbol(htEntry[2].name))
-              end
-            else
-              #= Variable was eliminated by alias elimination. Resolve via aliasMap. =#
-              local (aliasResolved, aliasExpr) = resolveAliasedCref(fullKey, simCode, hashTable,
-                varPrefix=varPrefix, varSuffix=varSuffix)
-              if aliasResolved
-                @warn "expToJuliaExpMTK: resolved alias-eliminated variable via fallback" fullKey
-                aliasExpr
-              else
-                #= Variable not in hash table (may have been eliminated), using direct reference =#
-                quote $(Symbol(string(varPrefix, fullKey, varSuffix))) end
-              end
-            end
-          else
-            #= Variable subscripts: generate runtime indexing =#
-            local subExprs = map(subscriptLst) do sub
-              @match sub begin
-                DAE.INDEX(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-                DAE.SLICE(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-                DAE.WHOLEDIM(__) => :(:)
-                _ => OMBackend.unsupported("subscript", sub)
-              end
-            end
-            #= a parameter array known at the build: its table (_dynamicSubscriptLookup) =#
-            local flatName = varName * join("[" * (s isa DAE.INDEX ? _subscriptText(s) : "?") * "]" for s in subscriptLst)
-            local dynamic = _dynamicSubscriptLookup(flatName, simCode)
-            if dynamic !== nothing
-              dynamic
-            else
-              local baseSymbol = Symbol(varPrefix, varName, varSuffix)
-              Expr(:ref, baseSymbol, subExprs...)
-            end
-          end
-        end
-      end
-      #=
-      Note in some cases we still retain information that something is a part of a complex component.
-      In this case we reference a component that in turn is a part of a record.
-      =#
-      DAE.CREF(DAE.CREF_QUAL(componentRef = componentRef,
-                             ident = ident,
-                             subscriptLst = subscriptLst,
-                             identType = identType), ty) where {
-                                 FrontendUtil.Util.finalCrefIsArray(componentRef)
-                             } =>
-      begin
-        local cr = DAE.CREF_QUAL(ident, identType, subscriptLst, componentRef)
-        varName = SimulationCode.DAE_identifierToString(cr)
-        #= Workaround =#
-        local fcr = FrontendUtil.Util.getFinalCref(componentRef)
-        local fcrs = FrontendUtil.Util.getAllCrefsAsVector(cr)
-        local subscripts = fcr.subscriptLst
-        @assign fcr.subscriptLst = MetaModelica.nil
-        local lookupStrPrefix = reduce((x,y) -> string(x, COMPONENT_SEPARATOR, y), map(string, fcrs[1:end-1]))
-        local lookupStr = string(lookupStrPrefix, COMPONENT_SEPARATOR, SimulationCode.DAE_identifierToString(fcr))
-
-        local lookupEntry = get(hashTable, lookupStr, nothing)
-        if lookupEntry === nothing
-          #= Base name not found. The backend scalarizes arrays into individual elements,
-             so try looking up the element name with subscripts (e.g., "var[1]"). =#
-          local allConstSubs = true
-          local subSuffix = ""
-          for sub in subscripts
-            @match sub begin
-              DAE.INDEX(DAE.ICONST(i)) => begin
-                subSuffix = string(subSuffix, "[", i, "]")
-              end
-              _ => begin
-                allConstSubs = false
-                break
-              end
-            end
-          end
-          local elemKey = string(lookupStr, subSuffix)
-          local elemLookup = allConstSubs ? get(hashTable, elemKey, nothing) : nothing
-          if elemLookup !== nothing
-            local elemName = elemLookup[2].name
-            quote $(Symbol(string(varPrefix, elemName, varSuffix))) end
-          else
-            #= Check if alias-eliminated =#
-            local (aliasRes2, aliasEx2) = resolveAliasedCref(elemKey, simCode, hashTable,
-              varPrefix=varPrefix, varSuffix=varSuffix)
-            if aliasRes2
-              @warn "expToJuliaExpMTK: resolved alias-eliminated CREF_QUAL element via fallback" elemKey
-              aliasEx2
-            else
-              local ss = subscriptsToExpr(subscripts, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-              local refExpr = makeRefExpr(Symbol(string(varPrefix, lookupStr, varSuffix)), ss)
-              quote
-                $(LineNumberNode(@__LINE__, "Array access to missing var: $lookupStr"))
-                $(refExpr)
-              end
-            end
-          end
-        else
-          local indexAndVar = lookupEntry
-          local varKind = indexAndVar[2].varKind
-          @match varKind begin
-            (SimulationCode.ARRAY(_, SOME(bindRaw && SimulationCode.ARRAY_EXP(__))) ||
-             SimulationCode.ARRAY_PARAMETER(_, SOME(bindRaw && SimulationCode.ARRAY_EXP(__)))) => begin
-              local bindArray = SimulationCode.toDAEExp(bindRaw)
-              local subIndices = Int[]
-              local allConstant = true
-              for sub in subscripts
-                @match sub begin
-                  DAE.INDEX(DAE.ICONST(i)) => push!(subIndices, i)
-                  _ => begin allConstant = false; break end
-                end
-              end
-              if allConstant && !isempty(subIndices)
-                #= Evaluate binding expression at compile time =#
-                local element = if length(subIndices) == 1
-                  listGet(bindArray.array, first(subIndices))
-                else
-                  local current = bindArray
-                  for idx in subIndices
-                    current isa DAE.ARRAY || OMBackend.unsupported("a binding row that is not an array literal", current)
-                    current = listGet(current.array, idx)
-                  end
-                  current
-                end
-                return expToJuliaExpMTK(element, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-              end
-            end
-            _ => ()
-          end
-          #= Fallback: generate array indexing =#
-          local vRef = string(varPrefix, indexAndVar[2].name, varSuffix)
-          local ss = subscriptsToExpr(subscripts, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-          local refExpr = makeRefExpr(Symbol(vRef), ss)
-          quote
-            $(LineNumberNode(@__LINE__, "Array access to: $vRef"))
-            $(refExpr)
-          end
-        end
-      end
-
-      DAE.CREF(cr, _)  => begin
-        varName = SimulationCode.DAE_identifierToString(cr)
-        if !haskey(hashTable, varName)
-          #= Try to handle as subscripted array access (e.g., R_w[1] where R_w is an ARRAY) =#
-          (success, arrayExpr) = tryHandleSubscriptedArrayCref(cr, hashTable, simCode,
-            varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-          if success
-            arrayExpr
-          else
-            #= Check if alias-eliminated =#
-            local (aliasRes, aliasEx) = resolveAliasedCref(varName, simCode, hashTable,
-              varPrefix=varPrefix, varSuffix=varSuffix)
-            if aliasRes
-              @warn "expToJuliaExpMTK: resolved alias-eliminated bare CREF via fallback" varName
-              aliasEx
-            else
-              #= Variable not in hash table, using direct reference; a flattened name
-                 with a variable subscript, a lookup of its known table =#
-              local dynamic = _dynamicSubscriptLookup(varName, simCode)
-              dynamic !== nothing ? dynamic : quote $(Symbol(string(varPrefix, varName, varSuffix))) end
-            end
-          end
-        else
-          indexAndVar = hashTable[varName]
-          varKind::SimulationCode.SimVarType = indexAndVar[2].varKind
-          @match varKind begin
-            SimulationCode.INPUT(__) => OMBackend.unsupported("INPUT variable", varName)
-            SimulationCode.STATE(__) => quote
-              $(LineNumberNode(@__LINE__, "$varName state"))
-              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-            end
-            SimulationCode.PARAMETER(__) => quote
-              $(LineNumberNode(@__LINE__, "$varName parameter"))
-              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-            end
-            SimulationCode.ALG_VARIABLE(__) => quote
-              $(LineNumberNode(@__LINE__, "$varName, algebraic"))
-              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-            end
-            SimulationCode.DISCRETE(__) => quote
-              $(LineNumberNode(@__LINE__, "$varName, discrete"))
-              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-            end
-            SimulationCode.DATA_STRUCTURE(__) => quote
-              $(LineNumberNode(@__LINE__, "$varName, datastructure variable"))
-              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-            end
-            SimulationCode.STRING(__) => quote
-              $(LineNumberNode(@__LINE__, "$varName, datastructure variable"))
-              $(Symbol(string(varPrefix, indexAndVar[2].name, varSuffix)))
-            end
-            _ => OMBackend.unsupported("variable kind $(nameof(typeof(varKind)))", varName)
-          end
-        end
-      end
-      DAE.UNARY(operator = op, exp = e1) => begin
-        o = DAE_OP_toJuliaOperator(op)
-        quote
-          $(o)($(expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix)))
-        end
-      end
-      DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-        local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        local rhs = expToJuliaExpMTK(e2, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        local opSym = DAE_OP_toJuliaOperator(op)
-        #= Matrix multiplication: operands are always proper Matrix (from hvcat in
-           equation codegen) or symbolic Num (where ensureMatrix is a no-op).
-           Function impl params are pre-converted by generateArrayConversions. =#
-        :($opSym($(lhs), $(rhs)))
-      end
-      DAE.LUNARY(operator = op, exp = e1)  => begin
-        local operand = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        @match op begin
-          DAE.NOT(__) => :(1 - $(operand))
-          _ => begin
-            local opSym = DAE_OP_toJuliaOperator(op)
-            :($opSym($(operand)))
-          end
-        end
-      end
-      DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-        local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        local rhs = expToJuliaExpMTK(e2, simCode, varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        #= Use arithmetic for boolean ops: AND = a*b, OR = a+b-a*b, on 0/1 values.
-           Neither short-circuit (&&/||) nor bitwise (|/&) work reliably with Symbolics.jl
-           due to type mismatches between Bool, Num, and BasicSymbolic{Real}. =#
-        @match op begin
-          #= Bind both operands once: `a + b - a*b` splices `lhs`/`rhs` twice, so a
-             left-nested OR chain duplicates the accumulator at every step and the
-             generated Expr grows exponentially (Digital RAM/table when-conditions). =#
-          DAE.OR(__) => :(let _a = $(lhs), _b = $(rhs); _a + _b - _a * _b end)
-          DAE.AND(__) => :($(lhs) * $(rhs))
-          _ => begin
-            local opSym = DAE_OP_toJuliaOperator(op)
-            :($opSym($(lhs), $(rhs)))
-          end
-        end
-      end
-      DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
-        local lhs = expToJuliaExpMTK(e1, simCode, varPrefix=varPrefix, varSuffix = varSuffix,derSymbol = derSymbol)
-        local rhs = expToJuliaExpMTK(e2, simCode,varPrefix=varPrefix, varSuffix = varSuffix, derSymbol = derSymbol)
-        local op = DAE_OP_toJuliaOperator(op)
-        quote
-          ($op($(lhs), $(rhs)))
-        end
-      end
-      DAE.IFEXP(DAE.BCONST(false), e2, e3) => begin
-        local e = expToJuliaExpMTK(e3, simCode)
-        quote
-          $(LineNumberNode(@__LINE__, "evaluated if expr: $(string(exp))"))
-          $(e)
-        end
-      end
-      DAE.IFEXP(DAE.BCONST(true), e2, e3) => begin
-        local e = expToJuliaExpMTK(e2, simCode)
-        quote
-          $(LineNumberNode(@__LINE__, "evaluated if expr: $(string(exp))"))
-          $(e)
-        end
-      end
-      #=
-      In the other case, see if the condition can be evaluated into a constant.
-      If that is the case the expression can be resolved.
-      =#
-      DAE.IFEXP(expCond, expThen, expElse) => begin
-        local condJL = expToJuliaExpMTK(expCond, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-        local thenJL = _guardNonIntegerPowerBasesForEagerBranch(
-          expToJuliaExpMTK(expThen, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
-        local elseJL = _guardNonIntegerPowerBasesForEagerBranch(
-          expToJuliaExpMTK(expElse, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
-        #= For Real branches use arithmetic ifelse: cond*then + (1-cond)*else.
-           This avoids type dispatch issues with ModelingToolkit.ifelse on
-           BasicSymbolic{Real} vs Num. For String / Boolean / Integer branches
-           the arithmetic encoding is invalid (you cannot multiply a String by
-           a number), so fall back to Julia's `ifelse(cond, then, else)`.
-           Surfaces on every CombiTable / CombiTimeTable model where the
-           constructor's `fileName` argument is wrapped in
-           `if useFile and ... then fileName else "NoName"`. =#
-        if _ifexpBranchIsNonReal(expThen) || _ifexpBranchIsNonReal(expElse)
-          :(ifelse(Bool($(condJL)), $(thenJL), $(elseJL)))
-        else
-          :($(condJL) * $(thenJL) + (1 - $(condJL)) * $(elseJL))
-        end
-      end
-      DAE.CALL(path = Absyn.IDENT(tmpStr), expLst = explst)  => begin
-        #= Route through _modelicaFunctionCallExpr (which consults the runtime
-           registry) when the name is either a simcode function OR a registered
-           OMRuntimeExternalC runtime function (e.g. the impure-RNG family). The
-           registry check matters for callers that run before simCode.functions
-           is populated (solveParametricInitialEquations!), where the bare-symbol
-           fallback would emit an unbound name that fails at eval. =#
-        if _isSimCodeFunctionName(tmpStr, simCode) ||
-           haskey(AlgorithmicCodeGeneration.MODELICA_UTILITIES_TO_RUNTIME_C, OMBackend.canonicalName(tmpStr))
-          _modelicaFunctionCallExpr(tmpStr, explst, simCode, hashTable;
-                                    varPrefix = varPrefix,
-                                    varSuffix = varSuffix,
-                                    derSymbol = derSymbol)
-        else
-          #Call as symbol is really ugly.. please fix me :(
-          DAECallExpressionToMTKCallExpression(tmpStr, explst, simCode, hashTable; varPrefix=varPrefix, varSuffix = varSuffix, derAsSymbol=derSymbol)
-        end
-      end
-      DAE.CALL(path, expLst) => begin
-        _modelicaFunctionCallExpr(path, expLst, simCode, hashTable;
-                                  varPrefix = varPrefix,
-                                  varSuffix = varSuffix,
-                                  derSymbol = derSymbol)
-      end
-      DAE.CAST(ty, exp)  => begin
-        quote
-          $(generateCastExpressionMTK(ty, exp, simCode, varPrefix))
-        end
-      end
-      #= a function argument with bound arguments: a closure calling the function's wrapper
-         (symbolic arguments make a term, numeric ones a value) =#
-      DAE.PARTEVALFUNCTION(path, expList, ty, origType) => begin
-        local callee = Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(Symbol(OMBackend.canonicalName(string(path)))))
-        AlgorithmicCodeGeneration._partialApplicationExpr(callee,
-          Any[expToJuliaExpMTK(e, simCode; varPrefix = varPrefix, varSuffix = varSuffix, derSymbol = derSymbol) for e in expList],
-          ty, origType)
-      end
-      #= For enumeration we just take the value of the index. =#
-      DAE.ENUM_LITERAL(path, index) => begin
-        quote
-          $(LineNumberNode(@__LINE__, "$(string(path)) ENUM"))
-          $(index)
-        end
-      end
-      DAE.ARRAY(DAE.T_ARRAY(DAE.T_REAL(MetaModelica.Nil(__)), dims), scalar, arr) => begin
-        handleArrayExp(exp, simCode)
-      end
-      DAE.ARRAY(DAE.T_ARRAY(DAE.T_INTEGER(MetaModelica.Nil(__)), dims), scalar, arr) => begin
-        handleArrayExp(exp, simCode)
-      end
-      DAE.ARRAY(DAE.T_ARRAY(_, _), _, _) => begin
-        handleArrayExp(exp, simCode)
-      end
-      #= Handle array subscripting: expr[subscripts] =#
-      DAE.ASUB(innerExp, subscripts) => begin
-        #= Convert subscripts to Julia indices =#
-        local subExprs = map(subscripts) do sub
-          @match sub begin
-            DAE.ICONST(i) => i
-            DAE.INDEX(DAE.ICONST(i)) => i
-            #= Non-constant subscript: lower its inner index expression. =#
-            DAE.INDEX(e) => expToJuliaExpMTK(e, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-            DAE.SLICE(e) => expToJuliaExpMTK(e, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-            DAE.WHOLE_NONEXP(e) => expToJuliaExpMTK(e, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-            _ => expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-          end
-        end
-        local allConstSubs = all(s -> s isa Integer, subExprs)
-        #= A parameter array known at the build by a variable subscript (CDL's Integer
-           TimeTable: val[idx, j] in a when): its table (_dynamicSubscriptLookup). =#
-        local _dynTable = (!allConstSubs && innerExp isa DAE.CREF) ?
-          _dynamicSubscriptLookup(SimulationCode.DAE_identifierToString(innerExp.componentRef) *
-                                  join("[" * _subscriptText(s) * "]" for s in subscripts), simCode) : nothing
-        #= When the inner expression is a bare CREF (no subscripts on the CREF itself)
-           and all ASUB subscripts are constant, try scalarized variable lookup.
-           This handles record field array equations like frame_b.R.T[1,1] = frame_a.R.T[1,1]
-           where the frontend flattened to ASUB(CREF("R_T"), [1,1]) instead of CREF("R_T", subs=[1,1]). =#
-        if _dynTable !== nothing
-          _dynTable
-        elseif allConstSubs
-          #= First, detect nested ASUB(ASUB(CALL(qualified_path, args), [tupleIx]), [subExprs...])
-             where the inner ASUB extracts a tuple element that is an array.
-             This covers BOTH 1D access [i] and multi-D access [i, j, ...].
-             Plain indexing on tupleElementCall fails because it returns a scalar Num. =#
-          local _nestedTupleArrResult = @match innerExp begin
-            DAE.ASUB(DAE.CALL(path, expLst), innerSubs) where {_isSimCodeFunctionPath(path, simCode) && length(innerSubs) == 1} => begin
-              local innerSubExpr = first(innerSubs)
-              local tupleIx = @match innerSubExpr begin
-                DAE.ICONST(i) => i
-                DAE.INDEX(DAE.ICONST(i)) => i
-                _ => nothing
-              end
-              if tupleIx === nothing
-                nothing
-              else
-                local callFuncName2 = Symbol(OMBackend.canonicalName(string(path)))
-                local fnQuote2 = QuoteNode(callFuncName2)
-                local callArgs2 = _modelicaFunctionCallArgs(expLst, simCode, hashTable;
-                                                            varPrefix = varPrefix,
-                                                            varSuffix = varSuffix,
-                                                            derSymbol = derSymbol)
-                local arrIdxTuple = Tuple(Int[Int(s) for s in subExprs])
-                :(OMBackend.CodeGeneration.tupleArrayElementAt($fnQuote2, $tupleIx, $arrIdxTuple, $(callArgs2...)))
-              end
-            end
-            #= Same pattern but with TSUB instead of inner ASUB for tuple extraction.
-               Handles ASUB(TSUB(CALL(func, args), tupleIx), [arraySubscripts]). =#
-            DAE.TSUB(DAE.CALL(path, expLst), tupleIx, _) where {_isSimCodeFunctionPath(path, simCode)} => begin
-              local callFuncName3 = Symbol(OMBackend.canonicalName(string(path)))
-              local fnQuote3 = QuoteNode(callFuncName3)
-              local callArgs3 = _modelicaFunctionCallArgs(expLst, simCode, hashTable;
-                                                          varPrefix = varPrefix,
-                                                          varSuffix = varSuffix,
-                                                          derSymbol = derSymbol)
-              local arrIdxTuple3 = Tuple(Int[Int(s) for s in subExprs])
-              :(OMBackend.CodeGeneration.tupleArrayElementAt($fnQuote3, $tupleIx, $arrIdxTuple3, $(callArgs3...)))
-            end
-            _ => nothing
-          end
-          local scalarizedResult = @match innerExp begin
-            DAE.CREF(DAE.CREF_IDENT(ident, _, sLst), _) where {isempty(sLst)} => begin
-              local lookUpStr = string(ident) * join(("[" * string(s) * "]" for s in subExprs))
-              local entry = get(hashTable, lookUpStr, nothing)
-              if entry !== nothing
-                quote $(Symbol(string(varPrefix, entry[2].name, varSuffix))) end
-              else
-                nothing
-              end
-            end
-            _ => nothing
-          end
-          if _nestedTupleArrResult !== nothing
-            _nestedTupleArrResult
-          elseif scalarizedResult !== nothing
-            scalarizedResult
-          elseif length(subExprs) == 1 && first(subExprs) isa Integer
-            #= An element of a Modelica function call's result: ASUB(CALL(qualified_path, args), [ix]),
-               an output of a multi-output function or an element of an array-returning one
-               (Modelica.Math.Random.Generators.Xorshift128plus.initialState, Integer[4]): the
-               result indexed, for numbers. With symbolic arguments (a parameter binding: MSL
-               PlanarLoops_analytic's normalizeWithAssert(n)[2]) an array whose size follows the
-               arguments is one opaque term, so the element is a term of its own. With literal
-               arguments the indexing stays: the result is numbers, and a parameter binding's
-               call is then evaluated once for all its elements (_parameterBindingExpr). =#
-            local _asubCallResult = @match innerExp begin
-              DAE.CALL(path, expLst, DAE.CALL_ATTR(ty = DAE.T_ARRAY(__))) where {_isSimCodeFunctionPath(path, simCode) &&
-                                                                                   all(_isLiteralDAEExp, expLst)} => nothing
-              DAE.CALL(path, expLst) where {_isSimCodeFunctionPath(path, simCode)} => begin
-                local callFuncName = Symbol(OMBackend.canonicalName(string(path)))
-                local fnQuote = QuoteNode(callFuncName)
-                local callArgs = _modelicaFunctionCallArgs(expLst, simCode, hashTable;
-                                                           varPrefix = varPrefix,
-                                                           varSuffix = varSuffix,
-                                                           derSymbol = derSymbol)
-                local ix = first(subExprs)
-                :(OMBackend.CodeGeneration.tupleElementCall($fnQuote, $ix, $(callArgs...)))
-              end
-              _ => nothing
-            end
-            if _asubCallResult !== nothing
-              _asubCallResult
-            else
-              local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-              quote $(innerCode)[$(first(subExprs))] end
-            end
-          else
-            local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-            if length(subExprs) == 1
-              quote $(innerCode)[$(first(subExprs))] end
-            else
-              quote $(innerCode)[$(subExprs...)] end
-            end
-          end
-        else
-          #= Symbolic indexing into a literal constant array: MTK rejects
-             `arr[Num, Num]` because Num isn't a valid array index. Emit a
-             call to OMBackend.CodeGeneration.constTableLookup, which is
-             Symbolic-aware: it returns the literal element for numeric args
-             and an opaque Symbolics Term for symbolic args, so MTK
-             structural-simplify treats the whole lookup as a black box. =#
-          local innerCode = expToJuliaExpMTK(innerExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-          local _isArrayLiteral = (innerExp isa DAE.ARRAY)
-          #= Detect a CREF into a constant `DATA_STRUCTURE` table (e.g.
-             `Modelica.Electrical.Digital`'s `Buf3sTable[strength,
-             UX01Conv[enable], UX01Conv[NotTable[x]]]`). Those are flattened
-             as module-level `Matrix{Int}` constants; with Symbolic Num
-             indices the plain `arr[i,j]` form throws
-             `ArgumentError: invalid index ... of type SymbolicUtils.BasicSymbolicImpl`.
-             Routing through `constTableLookup` works for both numeric and
-             symbolic indices. =#
-          local _isConstTableCref = (innerExp isa DAE.CREF) && let
-            local _crefName = SimulationCode.DAE_identifierToString(innerExp.componentRef)
-            haskey(hashTable, _crefName) &&
-              hashTable[_crefName][2].varKind isa SimulationCode.DATA_STRUCTURE
-          end
-          if _isArrayLiteral || _isConstTableCref
-            quote
-              OMBackend.CodeGeneration.constTableLookup($(innerCode), $(subExprs...))
-            end
-          elseif length(subExprs) == 1
-            #= Function call results are proper Matrix (impl bodies use ensureArray
-               for array construction, generateArrayConversions for params).
-               Symbolic Num handles subscripting directly. =#
-            quote
-              $(innerCode)[$(first(subExprs))]
-            end
-          else
-            #= Multi-dim non-literal non-const-table-CREF with symbolic indices.
-               This shape is rare and most likely a bug upstream — we have no
-               way to dispatch to a Symbolic-aware Matrix indexer without a
-               concrete table to look at. Keep the plain form so the runtime
-               error points at the offending expression. =#
-            quote
-              $(innerCode)[$(subExprs...)]
-            end
-          end
-        end
-      end
-      DAE.REDUCTION(reductionInfo, bodyExp, iterators) => begin
-        #= Handle array comprehensions and reductions =#
-        local bodyExpr = expToJuliaExpMTK(bodyExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-        #= Build iterator expressions =#
-        local iterExprs = Expr[]
-        for iter in iterators
-          @match iter begin
-            DAE.REDUCTIONITER(id, rangeExp, guardExp, _) => begin
-              guardExp === nothing || OMBackend.unsupported("a reduction iterator with a guard", exp)
-              local rangeExpr = expToJuliaExpMTK(rangeExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-              push!(iterExprs, Expr(:(=), Symbol(id), rangeExpr))
-            end
-          end
-        end
-        #= Handle different reduction types =#
-        @match reductionInfo.path begin
-          Absyn.IDENT("array") => begin
-            #= {e for i in u, j in v}: the last iterator is the first dimension
-               (MLS 10.4.1.2); a Julia comprehension's first iterator is. =#
-            Expr(:comprehension, bodyExpr, reverse(iterExprs)...)
-          end
-          Absyn.IDENT("sum") => begin
-            #= Sum reduction: sum(expr for i in range) =#
-            local genExpr = Expr(:generator, bodyExpr, iterExprs...)
-            :(sum($genExpr))
-          end
-          Absyn.IDENT("product") => begin
-            #= Product reduction =#
-            local genExpr = Expr(:generator, bodyExpr, iterExprs...)
-            :(prod($genExpr))
-          end
-          Absyn.IDENT("min") => begin
-            local genExpr = Expr(:generator, bodyExpr, iterExprs...)
-            :(minimum($genExpr))
-          end
-          Absyn.IDENT("max") => begin
-            local genExpr = Expr(:generator, bodyExpr, iterExprs...)
-            :(maximum($genExpr))
-          end
-          _ => OMBackend.unsupported("the reduction $(reductionInfo.path)", exp)
-        end
-      end
-      DAE.RANGE(_, startExp, NONE(), stopExp) => begin
-        #= Range expression: start:stop =#
-        local startExpr = expToJuliaExpMTK(startExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-        local stopExpr = expToJuliaExpMTK(stopExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-        :($startExpr:$stopExpr)
-      end
-      DAE.RANGE(_, startExp, SOME(stepExp), stopExp) => begin
-        #= Range expression: start:step:stop =#
-        local startExpr = expToJuliaExpMTK(startExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-        local stepExpr = expToJuliaExpMTK(stepExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-        local stopExpr = expToJuliaExpMTK(stopExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-        :($startExpr:$stepExpr:$stopExpr)
-      end
-      DAE.TSUB(tupleExp, ix, tsubTy) => begin
-        #= Tuple subscript: extract element ix from a tuple-returning expression.
-           For function calls, use tupleElementCall for scalar elements or
-           tupleArrayElementCall for array elements. Direct indexing
-           (expr[ix]) fails because Num(scalar_term)[1] is a no-op in Symbolics. =#
-        if tupleExp isa DAE.CALL
-          local callFuncName = Symbol(OMBackend.canonicalName(string(tupleExp.path)))
-          local fnQuote = QuoteNode(callFuncName)
-          local args = _modelicaFunctionCallArgs(tupleExp.expLst, simCode, hashTable;
-                                                 varPrefix = varPrefix,
-                                                 varSuffix = varSuffix,
-                                                 derSymbol = derSymbol)
-          #= Check if the tuple element type is an array with known dimensions =#
-          local tsubArrayDims = nothing
-          if tsubTy isa DAE.T_ARRAY
-            local intDims = Int[]
-            local allKnown = true
-            for d in tsubTy.dims
-              if d isa DAE.DIM_INTEGER
-                push!(intDims, d.integer)
-              else
-                allKnown = false
-                break
-              end
-            end
-            if allKnown && !isempty(intDims)
-              tsubArrayDims = Tuple(intDims)
-            end
-          end
-          if tsubArrayDims !== nothing
-            :(OMBackend.CodeGeneration.tupleArrayElementCall($fnQuote, $ix, $tsubArrayDims, $(args...)))
-          else
-            :(OMBackend.CodeGeneration.tupleElementCall($fnQuote, $ix, $(args...)))
-          end
-        else
-          local tupleExpr = expToJuliaExpMTK(tupleExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix)
-          :($tupleExpr[$ix])
-        end
-      end
-      #=
-      Record constructor special case: Modelica `Complex(re, im)`.
-
-      The Modelica `Complex` operator record is inlined from
-      `Modelica.ComplexMath.j` (the imaginary unit) and similar constants
-      into backend IR as DAE.RECORD(IDENT("Complex"), [re, im], ...).
-      Lower it to Julia's built-in `Complex(re, im)` so downstream
-      arithmetic works with the standard Julia/Symbolics complex support.
-
-      Non-Complex record constructors deliberately fall through to the
-      generic `_ => throw(...)` below. A permissive tuple fallback has
-      been tried and regressed models whose call-argument handling
-      expects a CREF-stringifiable expression (FilterWithDifferentiation
-      hit `DAE_identifierToString: DAE.ARRAY` via
-      DAECallExpressionToMTKCallExpression once a non-Complex RECORD got
-      lowered to a tuple). If we encounter a non-Complex record
-      constructor we want the compile-time error, not a silent
-      type-mismatch downstream.
-      =#
-      DAE.RECORD(Absyn.IDENT("Complex"), expl, _, _) where length(expl) == 2 => begin
-        local reExpr = expToJuliaExpMTK(listGet(expl, 1), simCode,
-                                        varPrefix=varPrefix,
-                                        varSuffix=varSuffix,
-                                        derSymbol=derSymbol)
-        local imExpr = expToJuliaExpMTK(listGet(expl, 2), simCode,
-                                        varPrefix=varPrefix,
-                                        varSuffix=varSuffix,
-                                        derSymbol=derSymbol)
-        quote Complex($reExpr, $imExpr) end
-      end
-      #=
-      Generic record constructor fallback. Lowers any DAE.RECORD to a
-      Julia `NamedTuple` keyed by the Modelica field names. Used by
-      Spice3.Internal.Mosfet.Mosfet and Media.IdealGases.DataRecord
-      parameter records.
-
-      Historically a plain tuple fallback regressed FilterWithDifferentiation
-      because downstream `DAECallExpressionToMTKCallExpression` der/pre arms
-      did not handle DAE.ARRAY-of-CREFs — those arms now scalarize, so this
-      permissive arm is safe again.
-      =#
-      DAE.RECORD(_, expl, fieldNames, _) => begin
-        local elemExprs = [expToJuliaExpMTK(e, simCode;
-                                             varPrefix=varPrefix,
-                                             varSuffix=varSuffix,
-                                             derSymbol=derSymbol)
-                           for e in expl]
-        local names = [Symbol(n) for n in fieldNames]
-        #= Wrap each field with `Symbolics.wrap` so the resulting NamedTuple
-           field type is `Num` (or stays `Number` for plain literals).
-           Without the wrap, fields can hold a bare `BasicSymbolic{Real}`
-           which is rejected by `SymbolicUtils._numeric_or_arrnumeric_symtype`
-           and shows up as `MethodError: -(::SymReal, ::SymReal)` when MTK
-           applies arithmetic to a Modelica function-call argument that
-           was passed a parameter record (Spice3.Internal.Mosfet.Mosfet,
-           Media.IdealGases.DataRecord). Verified harmless on
-           Magnetic.FundamentalWave — those use the `Complex(re, im)`
-           special-case constructor handled at the previous arm, not this
-           generic record fallback. =#
-        local wrappedElems = [:(Symbolics.wrap($(e))) for e in elemExprs]
-        if length(names) == length(wrappedElems)
-          local pairs = [Expr(:(=), names[i], wrappedElems[i]) for i in eachindex(names)]
-          Expr(:tuple, Expr(:parameters, pairs...))
-        else
-          #= Safety: fall back to positional tuple if field-name list is mismatched. =#
-          Expr(:tuple, wrappedElems...)
-        end
-      end
-      #=
-        Record-field subscript: extract one named field from a record-valued
-        sub-expression. Surfaces on Magnetic.FundamentalWave / QuasiStatic
-        models where Modelica `Complex.*.multiply(c1,c2).re` reaches the
-        backend with an unevaluated outer `*` (the OMC inliner left it
-        intact). We lower this to `getproperty(inner, :fieldName)`, which
-        works for:
-          • Julia `Base.Complex` (has `re`/`im` fields directly)
-          • NamedTuple lowering of MOS / Medium parameter records (line 1480)
-          • Any user-defined Julia struct with the named field
-        For the canonical `re` / `im` fields we additionally hand off to
-        `real` / `imag` when the inner is a Symbolics `Num` so the
-        symbolic engine sees the structural complex projection rather
-        than a plain `getproperty` call. =#
-      DAE.RSUB(exp = innerExp, ix = ix, fieldName = fname) => begin
-        local innerJL = expToJuliaExpMTK(innerExp, simCode;
-                                          varPrefix=varPrefix,
-                                          varSuffix=varSuffix,
-                                          derSymbol=derSymbol)
-        if fname == "re"
-          :(OMBackend.CodeGeneration._recordFieldRe($innerJL))
-        elseif fname == "im"
-          :(OMBackend.CodeGeneration._recordFieldIm($innerJL))
-        else
-          :(OMBackend.CodeGeneration._recordField($innerJL, $(QuoteNode(Symbol(fname))),
-                                                  $(AlgorithmicCodeGeneration._positionalFieldIndex(innerExp, ix))))
-        end
-      end
-    _ => OMBackend.unsupported("expression", exp)
-    end
-  end
-  return expr
-end
-
-_isZeroSizeArray(dims)::Bool = any(d -> d isa DAE.DIM_INTEGER && d.integer == 0, dims)
-
-function _emptyArrayExpr(ty::DAE.Type, dims)::Expr
-  local elType = ty isa DAE.T_INTEGER ? :Int : ty isa DAE.T_BOOL ? :Bool : :Float64
-  local sizes = [d isa DAE.DIM_INTEGER ? Int(d.integer) : 0 for d in dims]
-  return :(zeros($elType, $(sizes...)))
-end
-
-"""
-  Try to handle a CREF that references a subscripted array parameter.
-  Returns (success::Bool, expr::Expr).
-  If the base array has a binding expression and subscripts are constant,
-  evaluates at compile time. Otherwise generates symbol reference.
-"""
-function tryHandleSubscriptedArrayCref(cr::DAE.ComponentRef, hashTable, simCode;
-                                        varPrefix="", varSuffix="", derSymbol=false)
-  local subscripts = FrontendUtil.Util.getSubscriptsFromCref(cr)
-  local baseName = FrontendUtil.Util.getBaseNameWithoutSubscripts(cr)
-
-  if isempty(subscripts)
-    return (false, :())
-  end
-  local baseVar = get(hashTable, baseName, nothing)
-  if baseVar === nothing
-    return (false, :())
-  end
-  if !(baseVar[2].varKind isa SimulationCode.ARRAY || baseVar[2].varKind isa SimulationCode.ARRAY_PARAMETER)
-    return (false, :())
-  end
-
-  local arrayKind = baseVar[2].varKind
-  local subExprs = map(subscripts) do sub
-    @match sub begin
-      DAE.INDEX(DAE.ICONST(i)) => i
-      DAE.ICONST(i) => i
-      #= A DAE.Subscript is lowered through its expression (it was passed whole: a MethodError). =#
-      DAE.INDEX(idxExp) || DAE.SLICE(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-      DAE.WHOLEDIM(__) => :(:)
-      _ => sub isa DAE.Exp ? expToJuliaExpMTK(sub, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol) :
-                             OMBackend.unsupported("subscript", sub)
-    end
-  end
-
-  #= Check if we have a binding expression and all subscripts are constant integers =#
-  local allConstantSubscripts = all(s -> s isa Integer, subExprs)
-
-  if allConstantSubscripts
-    @match arrayKind begin
-      (SimulationCode.ARRAY(_, SOME(bindRaw && SimulationCode.ARRAY_EXP(__))) ||
-       SimulationCode.ARRAY_PARAMETER(_, SOME(bindRaw && SimulationCode.ARRAY_EXP(__)))) => begin
-        local bindArray = SimulationCode.toDAEExp(bindRaw)
-        #= Extract element from the binding expression =#
-        local element = if length(subExprs) == 1
-          listGet(bindArray.array, first(subExprs))
-        else
-          #= Multi-dimensional array: navigate nested structure =#
-          local current = bindArray
-          for idx in subExprs
-            current isa DAE.ARRAY || OMBackend.unsupported("a binding row that is not an array literal", current)
-            current = listGet(current.array, idx)
-          end
-          current
-        end
-        #= Convert the extracted element to a Julia expression =#
-        local constExpr = expToJuliaExpMTK(element, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-        return (true, constExpr)
-      end
-      _ => () #= Fall through to check scalarized variable or generate symbol reference =#
-    end
-  end
-
-  #= When subscripts are constant, check if a scalarized element variable exists in
-     the hash table (e.g. "R_T[1][2]" for subscripts [1,2]). Record field arrays
-     create both a parent ARRAY variable and individual scalar element variables.
-     The parent has no binding when values come from equations, so we must look up the
-     scalarized name instead of generating runtime indexing on the parent. =#
-  if allConstantSubscripts
-    local scalarLookup = baseName * join(("[" * string(s) * "]" for s in subExprs))
-    local scalarEntry = get(hashTable, scalarLookup, nothing)
-    if scalarEntry !== nothing
-      local scalarName = scalarEntry[2].name
-      return (true, quote $(Symbol(string(varPrefix, scalarName, varSuffix))) end)
-    end
-  end
-
-  #= Fallback: generate symbol reference for dynamic access =#
-  local expr = if length(subExprs) == 1
-    quote
-      $(LineNumberNode(@__LINE__, "Array subscript: $baseName"))
-      $(Symbol(string(varPrefix, baseName, varSuffix)))[$(first(subExprs))]
-    end
-  else
-    quote
-      $(LineNumberNode(@__LINE__, "Array subscript: $baseName"))
-      $(Symbol(string(varPrefix, baseName, varSuffix)))[$(subExprs...)]
-    end
-  end
-
-  return (true, expr)
-end
-
-"""
-  Generate code for array expressions.
-  For arrays with constants, evaluates at codegen time.
-  For arrays with CREFs (variable references), generates code with symbolic expressions.
-"""
-function handleArrayExp(exp::DAE.ARRAY, simCode)
-  local steps = listHead(exp.ty.dims)
-  local dimSize = length(exp.ty.dims)
-  @assert(steps isa DAE.DIM_INTEGER, "Only integer dimensions are currently supported. Type was : $(typeof(steps))")
-  steps = steps.integer
-  #= Determine element type from DAE type =#
-  local elemType = @match exp.ty begin
-    DAE.T_ARRAY(ty = DAE.T_REAL(__)) => Float64
-    DAE.T_ARRAY(ty = DAE.T_INTEGER(__)) => Int
-    _ => Float64  #= Default to Float64 =#
-  end
-  #= Check if all elements are constant (no variable references) at the DAE level =#
-  local canEval = all(FrontendUtil.Util.isConstantExp, exp.array)
-  #= Generate expressions for each element =#
-  local elemExprs = [expToJuliaExpMTK(listGet(exp.array, i), simCode) for i in 1:steps]
-  local arrJL = if canEval
-    try
-      [eval(expr) for expr in elemExprs]
+function handleArrayExp(e::SC.ARRAY_EXP, simCode::SC.SIM_CODE)::Expr
+  local dims = e.ty isa SC.TYPE_ARRAY ? e.ty.dims : Int[length(e.elements)]
+  local steps = first(dims)
+  steps >= 0 || OMBackend.unsupported("an array literal of a size not known", e)
+  local elemExprs = Expr[expToJuliaExpMTK(e.elements[i], simCode) for i in 1:steps]
+  local values = nothing
+  if all(_isConstantExp, e.elements)
+    values = try
+      Any[eval(x) for x in elemExprs]
     catch err
       OMBackend._fallback(err, :constantArrayElements; expect = Union{UndefVarError, MethodError})
-      canEval = false
-      []
-    end
-  else
-    []
-  end
-  if canEval
-    #= All elements are constants, return pre-computed array =#
-    if dimSize >= 2
-      #= rows of rows: stacked along the first dimension (a three-dimensional literal's
-         rows are matrices, and transpose has no method for the stack: Buildings'
-         Borefields TemporalSuperposition) =#
-      arr = ndims(first(arrJL)) >= 2 ? stack(arrJL; dims = 1) : Matrix(transpose(stack(arrJL)))
-      quote
-        $(arr)
-      end
-    else
-      quote
-        $[arrJL...]
-      end
-    end
-  else
-    #= Contains CREFs, generate array with symbolic element expressions =#
-    if dimSize >= 2
-      #= For 2D arrays, generate hvcat for direct matrix construction =#
-      local allScalars = Expr[]
-      local nCols = 0
-      local flattenable = true
-      for i in 1:steps
-        local rowDaeExp = listGet(exp.array, i)
-        if @match rowDaeExp begin
-          DAE.ARRAY(__) => true
-          _ => false
-        end
-          local rowLen = listHead(rowDaeExp.ty.dims).integer
-          if nCols == 0
-            nCols = rowLen
-          end
-          for j in 1:rowLen
-            push!(allScalars, expToJuliaExpMTK(listGet(rowDaeExp.array, j), simCode))
-          end
-        else
-          flattenable = false
-          break
-        end
-      end
-      if flattenable && nCols > 0
-        local colCounts = ntuple(_ -> nCols, steps)
-        quote
-          hvcat($(colCounts), $(allScalars...))
-        end
-      else
-        #= Fallback: rows are not plain arrays =#
-        quote
-          let rows = [$(elemExprs...)]
-            ndims(first(rows)) >= 2 ? stack(rows; dims = 1) : Matrix(transpose(stack(rows)))
-          end
-        end
-      end
-    else
-      quote
-        [$(elemExprs...)]
-      end
+      nothing
     end
   end
-end
-
-"""
-  If the system needs to conduct index reduction make sure to inform MTK.
-(We avoid structural simplification for now since that might interfere with some other algorithms)
-"""
-function performStructuralSimplify(simplify; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                                   split::Bool = !OMBackend.DIRECT_RHS_GENERATION[])::Expr
-  #= Dump the pre-simplify ODESystem (equations + unknowns) so structural-balance
-     debugging does not require re-running the model with extra instrumentation.
-     Written to `backend/codeGen/preStructuralSimplify.log` next to the existing
-     codegen logs. Only emitted when `ENABLE_BACKEND_LOGGING=true` was set at
-     OMBackend load time; @BACKEND_LOGGING is a compile-time NOP otherwise so
-     normal runs pay zero cost.
-     Capture the absolute log path at codegen time so the dump lands in the
-     same per-model run directory as the existing BDAE/simCode logs. The
-     `logRunDir` stack is active during translate; by simulate time the model
-     dir would no longer be on the stack and the dump would land in the
-     session root. =#
-  local dumpExpr = :(nothing)
-  @BACKEND_LOGGING dumpExpr = dumpPreStructuralSimplifyExpr(
-      OMBackend.logPath("backend/codeGen", "preStructuralSimplify.log"))
-  local simplifyExpr = quote
-    $dumpExpr
-    reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true, split = $(split))
+  if values !== nothing
+    length(dims) >= 2 || return quote $[values...] end
+    local arr = ndims(first(values)) >= 2 ? stack(values; dims = 1) : Matrix(transpose(stack(values)))
+    return quote $(arr) end
   end
-  if observedFilter === nothing || isempty(observedFilter)
-    return simplifyExpr
-  end
-  #= Embed the observed filter patterns into the generated code.
-     After structural_simplify, filter the observed equations to keep only
-     those whose LHS variable name matches at least one pattern. =#
-  local patternStrings = if observedFilter isa Vector{Regex}
-    [p.pattern for p in observedFilter]
-  else
-    observedFilter
+  length(dims) >= 2 || return quote [$(elemExprs...)] end
+  local rows = e.elements[1:steps]
+  if all(r -> r isa SC.ARRAY_EXP, rows) && steps > 0
+    local nCols = length(first(rows).elements)
+    if nCols > 0
+      local scalars = Expr[expToJuliaExpMTK(x, simCode) for r in rows for x in r.elements]
+      return quote hvcat($(ntuple(_ -> nCols, steps)), $(scalars...)) end
+    end
   end
   return quote
-    $simplifyExpr
-    local _obsPatterns = [Regex(p) for p in $(patternStrings)]
-    local _allObs = ModelingToolkit.observed(reducedSystem)
-    local _nBefore = length(_allObs)
-    #= Keep matched observed equations AND the transitive closure of observed
-       variables their RHS references; dropping a dependency leaves it
-       referenced-but-undefined in the residual/init build_function. =#
-    local _obsByLhs = Dict(string(eq.lhs) => eq for eq in _allObs)
-    local _keepNames = OrderedSet{String}()
-    local _stack = String[string(eq.lhs) for eq in _allObs
-                          if any(p -> occursin(p, string(eq.lhs)), _obsPatterns)]
-    #= Also seed from observed vars referenced by the system equations: the
-       residual / init build_function references them, so their defs must survive. =#
-    for _seq in ModelingToolkit.equations(reducedSystem)
-      for _side in (_seq.lhs, _seq.rhs)
-        for _v in Symbolics.get_variables(_side)
-          local _vn = string(_v)
-          haskey(_obsByLhs, _vn) && push!(_stack, _vn)
-        end
-      end
-    end
-    while !isempty(_stack)
-      local _nm = pop!(_stack)
-      (_nm in _keepNames) && continue
-      push!(_keepNames, _nm)
-      local _eq = get(_obsByLhs, _nm, nothing)
-      _eq === nothing && continue
-      for _v in Symbolics.get_variables(_eq.rhs)
-        local _vn = string(_v)
-        (haskey(_obsByLhs, _vn) && !(_vn in _keepNames)) && push!(_stack, _vn)
-      end
-    end
-    local _filteredObs = filter(eq -> string(eq.lhs) in _keepNames, _allObs)
-    if length(_filteredObs) < _nBefore
-      @debug "[MTK GEN: observed] observedFilter: kept $(length(_filteredObs)) of $(_nBefore) MTK observed equations"
-      reducedSystem = Setfield.set(reducedSystem, Setfield.PropertyLens{:observed}(), _filteredObs)
+    let rows = [$(elemExprs...)]
+      ndims(first(rows)) >= 2 ? stack(rows; dims = 1) : Matrix(transpose(stack(rows)))
     end
   end
+end
+
+#= ==================================================================================== =#
+#= Calls                                                                                =#
+#= ==================================================================================== =#
+
+"""
+    _builtinCallMTK(e, simCode)
+
+A call of a built-in: `der` and `pre` of an expression, `noEvent` of a Real if-expression as
+`ifelse` (only the branch the condition chooses: the arithmetic if-expression turned a NaN of
+the other branch into the result, MSL ContinuousMean's `noEvent(if time >= t_0 + t_eps then
+(u - mu)/(time - t_0) else 0)`), `delay` from the model's history (delays.jl), `initial()` 0
+in the equations (the initialization has its own), `homotopy` as the blend in λ where the
+continuation acts (`HOMOTOPY_BLEND`), `Integer` of an enumeration the identity (it is its
+index already), `sample` in a when body whether the instant is a tick (`if sampleTrigger` at
+`when {occ, sampleTrigger}`); another by its implementation (MODELICA_BUILTIN_FUNCTIONS) or its
+name.
+"""
+function _builtinCallMTK(e::SC.CALL, simCode::SC.SIM_CODE)::Expr
+  local lower = x::SC.Exp -> expToJuliaExpMTK(x, simCode)
+  local name = e.name
+  if name === :der
+    return _derivativeExpr(first(e.args), simCode)
+  elseif name === :pre
+    return _preExpr(first(e.args), simCode)
+  elseif name === :noEvent && length(e.args) == 1 && _isRealIfExp(only(e.args))
+    local ie = only(e.args)::SC.IFEXP
+    return :(ifelse(OMBackend.CodeGeneration.MTK_CodeGenerationUtil._noEventCondition($(lower(ie.cond))), $(lower(ie.thenExp)), $(lower(ie.elseExp))))
+  elseif name === :delay
+    return _delayExpr(e.args, simCode)
+  elseif name === :initial
+    return quote 0 end
+  elseif name === :homotopy
+    local actual = lower(e.args[1])
+    HOMOTOPY_BLEND[] || return actual
+    return :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_homotopy($(actual), $(lower(e.args[2])), $(HOMOTOPY_LAMBDA)))
+  elseif name === :Integer
+    return lower(e.args[1])
+  elseif name === :sample && PRE_FROM_SNAPSHOT[]
+    return :(OMBackend.CodeGeneration._isSampleInstant(integrator.t, $(lower(e.args[1])), $(lower(e.args[2]))))
+  elseif name === :String
+    #= a String parameter's binding (createStringParameterAssignments): the argument types
+       from the expressions, not from the values =#
+    return AlgorithmicCodeGeneration.modelicaStringCall(e.args, lower)
+  end
+  local args = map(lower, e.args)
+  local builtin = get(AlgorithmicCodeGeneration.MODELICA_BUILTIN_FUNCTIONS, String(name), nothing)
+  builtin === nothing && return quote $(name)($(args...)) end
+  local callee = Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)), QuoteNode(:AlgorithmicCodeGeneration)), QuoteNode(builtin))
+  return quote $(callee)($(args...)) end
+end
+
+_isRealIfExp(e::SC.Exp)::Bool =
+  e isa SC.IFEXP && !(e.cond isa SC.BCONST) && !_ifexpBranchIsNonReal(e.thenExp) && !_ifexpBranchIsNonReal(e.elseExp)
+
+"""
+    _derivativeExpr(arg, simCode)
+
+`der` of an expression the passes left (an initial equation `der(w) = 0` whose `w` was replaced
+by its definition, differentiated later): of an array its elements' (MultiBody's `der({c1,
+c2})`), of a literal 0 (a parameter replaced by its value), of `-x` `-der(x)`, of a variable
+`D(x)`, else `D(e)`.
+"""
+function _derivativeExpr(arg::SC.Exp, simCode::SC.SIM_CODE)::Expr
+  arg isa SC.ARRAY_EXP && return Expr(:vect, (_derivativeExpr(x, simCode) for x in arg.elements)...)
+  arg isa SC.RCONST && return quote 0.0 end
+  arg isa SC.ICONST && return quote 0 end
+  arg isa SC.BCONST && return quote false end
+  (arg isa SC.UNARY && arg.op === SC.OP_UMINUS) && return :(-($(_derivativeExpr(arg.exp, simCode))))
+  arg isa SC.EXP_CREF && return expToJuliaExpMTK(SC.DER(arg.cref), simCode)
+  return quote D($(expToJuliaExpMTK(arg, simCode))) end
 end
 
 """
-  Generates different constructors for the ODESystem depending on given parameters.
-  If-equation events use SymbolicContinuousCallback with discrete_parameters,
-  so ifCond variables live in the parameter vector (not ODE state).
+    _preExpr(arg, simCode)
+
+`pre` of an expression the passes left (a variable replaced by its definition): of an array its
+elements', of a literal the literal, else the expression of the references' pre values.
 """
-function odeSystemWithEvents(hasEvents, modelName; hasObserved = false)
-  #= When the model has events (if-equations), do NOT pass observed equations here.
-     MTK's complete(sys) injects observed(sys) into every callback's AffectSystem
-     (abstractsystem.jl:651), which causes tearing failures when observed equations
-     introduce variables the callback sub-system cannot solve.
-     Observed equations are injected into the reduced system AFTER structural_simplify
-     returns, so callbacks never see them (see MTK_CodeGeneration.jl). =#
-  #= `initial_eqs` is passed as `initialization_eqs` kwarg only when non-empty.
-     These are constraints from the Modelica `initial equation` block that MUST
-     hold at t=0 (e.g. `PID.gainPID.y = 0` for InitialOutput init of a PID).
-     Without this, the constraints are passed only as `guesses` (Pair form),
-     which MTK treats as starting points the solver may ignore. =#
-  if hasEvents
-    :(ODESystem(eqs, t, vars, parameters;
-              name=:($(Symbol($modelName))),
-              continuous_events = events, guesses = initialValues,
-              initialization_eqs = initialConstraintEqs))
-  elseif hasObserved
-    :(ODESystem(eqs, t, vars, parameters;
-              name=:($(Symbol($modelName))), guesses = initialValues,
-              observed = observedEqs,
-              initialization_eqs = initialConstraintEqs))
-  else
-    :(ODESystem(eqs, t, vars, parameters;
-              name=:($(Symbol($modelName))), guesses = initialValues,
-              initialization_eqs = initialConstraintEqs))
-  end
+function _preExpr(arg::SC.Exp, simCode::SC.SIM_CODE)::Expr
+  arg isa SC.ARRAY_EXP && return Expr(:vect, (_preExpr(x, simCode) for x in arg.elements)...)
+  arg isa Union{SC.RCONST, SC.ICONST, SC.BCONST} && return quote $(arg.value) end
+  local pre = SC.mapExp(x -> (x isa SC.EXP_CREF && x.cref.sym !== :time) ? SC.PRE(x.cref, x.ty) : x, arg)
+  return expToJuliaExpMTK(pre, simCode)
+end
+
+"`delay(x, T[, Tmax])`: x's value T ago, from the model's history of x (delays.jl)."
+function _delayExpr(args::Vector{SC.Exp}, simCode::SC.SIM_CODE)::Expr
+  local x = expToJuliaExpMTK(args[1], simCode)
+  local T = expToJuliaExpMTK(args[2], simCode)
+  local k = _delayIndex!(string(args[1]) * "|" * string(args[2]), x, T)
+  return :(OMBackend.CodeGeneration.delayLookup($(QuoteNode(DELAY_MODEL[])), $k, t, $T, $x))
 end
 
 """
-  Decide the iv of the condition (whether the zero-crossing function is at zero at t=0).
-  Returns true if the zero-crossing expression evaluates to zero at t=0.
-  Returns false if it evaluates to a nonzero value (guard is active or inactive).
-  When simCode is provided, substitutes parameter values and state variable start values.
+    _modelicaFunctionCallExpr(e, simCode)
+
+A call of a function: OMFrontend's delay functions (`OpenModelica.Internal.delay2/3`, as
+OpenModelica: functions whose body was the identity) from the model's history; a Boolean
+reduction with a symbolic form (lowerKnownSymbolicFunctionCall); a Julia mirror of a Modelica
+function (MODELICA_BUILTIN_FUNCTIONS: Modelica.Math.Vectors.length); Modelica.Utilities by
+OMRuntimeExternalC; another by its name, its record arguments by their fields.
 """
-function _singleBlockPayload(@nospecialize(e))
-  while e isa Expr && e.head === :block
-    local payload = Any[a for a in e.args if !(a isa LineNumberNode)]
-    length(payload) == 1 || return e
-    e = payload[1]
+function _modelicaFunctionCallExpr(e::SC.CALL, simCode::SC.SIM_CODE)::Expr
+  local name = String(e.name)
+  name in ("OpenModelica_Internal_delay2", "OpenModelica_Internal_delay3") && return _delayExpr(e.args, simCode)
+  local lowered = lowerKnownSymbolicFunctionCall(name, e.args, simCode)
+  lowered === nothing || return lowered
+  local args = _modelicaFunctionCallArgs(e.args, simCode)
+  local builtinSym = get(AlgorithmicCodeGeneration.MODELICA_BUILTIN_FUNCTIONS, name, nothing)
+  if builtinSym !== nothing
+    local builtinCallee = Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)),
+                                        QuoteNode(:AlgorithmicCodeGeneration)), QuoteNode(builtinSym))
+    return Expr(:call, builtinCallee, args...)
   end
-  return e
+  local runtimeName = get(AlgorithmicCodeGeneration.MODELICA_UTILITIES_TO_RUNTIME_C, name, nothing)
+  local callee = runtimeName === nothing ? e.name :
+    :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.RuntimeCCall($(Expr(:., :OMRuntimeExternalC, QuoteNode(runtimeName)))))
+  return Expr(:call, callee, args...)
 end
 
-function _isNonIntegerJuliaConstant(@nospecialize(e))::Bool
-  local v = _singleBlockPayload(e)
-  v isa Integer && return false
-  return v isa Real && !isinteger(v)
-end
+"""
+    _modelicaFunctionCallArgs(args, simCode)
 
-#= ModelingToolkit.ifelse and the arithmetic if-expression lowering evaluate
-   both branches. Guard only those eager branch payloads against one-sided
-   event-localization noise around a relation boundary; ordinary powers keep
-   their native domain semantics. =#
-function _guardNonIntegerPowerBasesForEagerBranch(@nospecialize(e))
-  if e isa Expr
-    local args = Any[_guardNonIntegerPowerBasesForEagerBranch(a) for a in e.args]
-    if e.head === :call && length(args) == 3 && args[1] == :^ &&
-       _isNonIntegerJuliaConstant(args[3])
-      return :(max($(args[2]), 0.0) ^ $(args[3]))
-    end
-    return Expr(e.head, args...)
+The arguments of a call of a function: a record by its fields (`flattenRecordCallArg`), an
+element of an array of records by its fields' elements, a Complex-returning call by its
+outputs (`_expandComplexReturnArg`), another lowered.
+"""
+function _modelicaFunctionCallArgs(args::Vector{SC.Exp}, simCode::SC.SIM_CODE)::Vector{Any}
+  local out = Any[]
+  for arg in args
+    local fields = flattenRecordCallArg(arg, simCode)
+    isempty(fields) || (append!(out, fields); continue)
+    local elementFields = _recordArrayElementCallArgs(arg, simCode)
+    isempty(elementFields) || (append!(out, elementFields); continue)
+    local extracts = _expandComplexReturnArg(arg, simCode)
+    extracts === nothing || (append!(out, extracts); continue)
+    push!(out, expToJuliaExpMTK(arg, simCode))
   end
-  return e
+  return out
 end
 
-#= Numerically evaluate a scalar DAE.Exp at t0 against `valMap` (params +
-   already-seeded vars). Returns nothing for anything outside the small
-   arithmetic/`integer` subset, so callers fall back safely. =#
-function _evalDAENumeric(@nospecialize(e), valMap::Dict{Symbol, Float64})::Union{Float64, Nothing}
-  @match e begin
-    DAE.RCONST(__) => Float64(e.real)
-    DAE.ICONST(__) => Float64(e.integer)
-    DAE.BCONST(__) => e.bool ? 1.0 : 0.0
-    DAE.CREF(__) => begin
-      local nm = SimulationCode.DAE_identifierToString(e.componentRef)
-      nm == "time" ? 0.0 : get(valMap, Symbol(nm), nothing)
-    end
-    DAE.UNARY(operator = DAE.UMINUS(__)) => begin
-      local a = _evalDAENumeric(e.exp, valMap); a === nothing ? nothing : -a
-    end
-    DAE.BINARY(__) => begin
-      local a = _evalDAENumeric(e.exp1, valMap); a === nothing && return nothing
-      local b = _evalDAENumeric(e.exp2, valMap); b === nothing && return nothing
-      @match e.operator begin
-        DAE.ADD(__) => a + b
-        DAE.SUB(__) => a - b
-        DAE.MUL(__) => a * b
-        DAE.DIV(__) => b == 0.0 ? nothing : a / b
-        DAE.POW(__) => (a < 0.0 && !isinteger(b)) ? nothing : a ^ b
-        _ => nothing
-      end
-    end
-    DAE.CAST(__) => _evalDAENumeric(e.exp, valMap)
-    DAE.IFEXP(__) => begin
-      local c = _evalDAENumeric(e.expCond, valMap); c === nothing && return nothing
-      _evalDAENumeric(c != 0.0 ? e.expThen : e.expElse, valMap)
-    end
-    DAE.RELATION(__) => begin
-      local a = _evalDAENumeric(e.exp1, valMap); a === nothing && return nothing
-      local b = _evalDAENumeric(e.exp2, valMap); b === nothing && return nothing
-      @match e.operator begin
-        DAE.LESS(__) => a < b ? 1.0 : 0.0
-        DAE.LESSEQ(__) => a <= b ? 1.0 : 0.0
-        DAE.GREATER(__) => a > b ? 1.0 : 0.0
-        DAE.GREATEREQ(__) => a >= b ? 1.0 : 0.0
-        DAE.EQUAL(__) => a == b ? 1.0 : 0.0
-        DAE.NEQUAL(__) => a != b ? 1.0 : 0.0
-        _ => nothing
-      end
-    end
-    DAE.LUNARY(DAE.NOT(__), _) => begin
-      local a = _evalDAENumeric(e.exp, valMap); a === nothing && return nothing
-      a == 0.0 ? 1.0 : 0.0
-    end
-    DAE.LBINARY(__) => begin
-      local a = _evalDAENumeric(e.exp1, valMap); a === nothing && return nothing
-      local b = _evalDAENumeric(e.exp2, valMap); b === nothing && return nothing
-      @match e.operator begin
-        DAE.AND(__) => (a != 0.0 && b != 0.0) ? 1.0 : 0.0
-        DAE.OR(__) => (a != 0.0 || b != 0.0) ? 1.0 : 0.0
-        _ => nothing
-      end
-    end
-    DAE.CALL(path = Absyn.IDENT(fn)) => begin
-      local argv = collect(e.expLst)
-      isempty(argv) && return nothing
-      #= smooth(k, expr) evaluates to its second argument. =#
-      if fn == "smooth"
-        return length(argv) == 2 ? _evalDAENumeric(argv[2], valMap) : nothing
-      end
-      local a = _evalDAENumeric(argv[1], valMap); a === nothing && return nothing
-      if (fn == "min" || fn == "max") && length(argv) == 2
-        local b = _evalDAENumeric(argv[2], valMap); b === nothing && return nothing
-        return fn == "min" ? min(a, b) : max(a, b)
-      end
-      fn == "integer" ? (isfinite(a) ? floor(a) : nothing) :
-      fn == "floor"   ? floor(a) :
-      fn == "ceil"    ? ceil(a) :
-      fn == "abs"     ? abs(a) :
-      fn == "sqrt"    ? (a < 0.0 ? nothing : sqrt(a)) :
-      fn == "noEvent" ? a :
-      (fn == "float" || fn == "Real" || fn == "Integer") ? a : nothing
-    end
-    _ => nothing
+"""
+An element of a named array of records by subscripts that are not literals (`data[i]` in a
+reduction: the ideal gases' `h_T(data[i], T, ...)`, MSL Media mixtures): that element of
+each field array, `data_MM[i]` (the module-level arrays of _recordArrayFieldArrays). Empty
+otherwise.
+"""
+function _recordArrayElementCallArgs(arg::SC.Exp, simCode::SC.SIM_CODE)::Vector{Any}
+  (arg isa SC.ASUB && arg.exp isa SC.EXP_CREF) || return Any[]
+  local elemTy = arg.exp.ty
+  local nDims = 0
+  while elemTy isa SC.TYPE_ARRAY
+    nDims += length(elemTy.dims)
+    elemTy = elemTy.elementType
   end
+  (elemTy isa SC.TYPE_COMPLEX && elemTy.isRecord) || return Any[]
+  (nDims == 0 || length(arg.subs) == nDims) || return Any[]
+  local base = SC.crefName(arg.exp.cref)
+  occursin('[', base) && return Any[]
+  any(s -> s isa Union{SC.RANGE, SC.ARRAY_EXP, SC.WHOLE_DIMENSION}, arg.subs) && return Any[]
+  local idx = Any[expToJuliaExpMTK(s, simCode) for s in arg.subs]
+  return Any[Expr(:ref, Symbol(base * COMPONENT_SEPARATOR * f), idx...) for f in elemTy.fieldNames]
 end
 
-#= Substitute a loop iterator with a constant integer inside an expression,
-   including in component-reference subscripts. =#
-function _substIterT0(@nospecialize(e::DAE.Exp), iterId::String, value::Int)::DAE.Exp
-  local repl = function (ex::DAE.Exp, arg)
-    local res = ex
-    @match ex begin
-      DAE.CREF(DAE.CREF_IDENT(id, _, _), _) where (id == iterId) => begin
-        res = DAE.ICONST(value)
-        ()
-      end
-      _ => ()
+"""
+A Complex-returning argument (a call of a record output, a record constructor) as its
+fields' values for an enclosing call: `tupleElementCall(:f, k, args...)` for k = 1..nFields
+of a call, the field expressions of a record literal; nothing for another argument (or a
+record of fewer than two fields).
+"""
+function _expandComplexReturnArg(arg::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, Vector{Any}}
+  if arg isa SC.CALL && arg.ty isa SC.TYPE_COMPLEX
+    local nFields = length(arg.ty.fieldNames)
+    nFields >= 2 || return nothing
+    local innerArgs = Any[]
+    for inner in arg.args
+      local flat = flattenRecordCallArg(inner, simCode)
+      isempty(flat) || (append!(innerArgs, flat); continue)
+      local nested = _expandComplexReturnArg(inner, simCode)
+      nested === nothing || (append!(innerArgs, nested); continue)
+      push!(innerArgs, expToJuliaExpMTK(inner, simCode))
     end
-    return (res, true, arg)
-  end
-  return first(Util.traverseExpTopDown(e, repl, 0))
-end
-
-function _substIterStmt(@nospecialize(stmt), iterId::String, value::Int)
-  @match stmt begin
-    DAE.STMT_ASSIGN(__) =>
-      DAE.STMT_ASSIGN(stmt.type_,
-                      _substIterT0(stmt.exp1, iterId, value),
-                      _substIterT0(stmt.exp, iterId, value),
-                      stmt.source)
-    DAE.STMT_IF(__) =>
-      DAE.STMT_IF(_substIterT0(stmt.exp, iterId, value),
-                  list((_substIterStmt(s, iterId, value) for s in stmt.statementLst)...),
-                  _substIterElse(stmt.else_, iterId, value),
-                  stmt.source)
-    DAE.STMT_FOR(__) => begin
-      #= An inner loop shadowing the same iterator keeps its own binding. =#
-      if stmt.iter == iterId
-        stmt
-      else
-        DAE.STMT_FOR(stmt.type_, stmt.iterIsArray, stmt.iter, stmt.index,
-                     _substIterT0(stmt.range, iterId, value),
-                     list((_substIterStmt(s, iterId, value) for s in stmt.statementLst)...),
-                     stmt.source)
-      end
-    end
-    _ => stmt
-  end
-end
-
-function _substIterElse(@nospecialize(els), iterId::String, value::Int)
-  @match els begin
-    DAE.ELSE(__) => DAE.ELSE(list((_substIterStmt(s, iterId, value) for s in els.statementLst)...))
-    DAE.ELSEIF(__) => DAE.ELSEIF(_substIterT0(els.exp, iterId, value),
-                                 list((_substIterStmt(s, iterId, value) for s in els.statementLst)...),
-                                 _substIterElse(els.else_, iterId, value))
-    _ => els
-  end
-end
-
-#= `written` (when given) collects the names an assignment wrote. =#
-function _execInitAlgStmts!(valMap::Dict{Symbol, Float64}, stmts; written = nothing)::Nothing
-  for stmt in stmts
-    _execInitAlgStmt!(valMap, stmt; written)
+    return Any[:(OMBackend.CodeGeneration.tupleElementCall($(QuoteNode(arg.name)), $k, $(innerArgs...))) for k in 1:nFields]
+  elseif arg isa SC.RECORD && arg.ty isa SC.TYPE_COMPLEX
+    length(arg.exps) >= 2 || return nothing
+    return Any[expToJuliaExpMTK(x, simCode) for x in arg.exps]
   end
   return nothing
 end
 
-function _execInitAlgElse!(valMap::Dict{Symbol, Float64}, @nospecialize(els); written = nothing)::Nothing
-  @match els begin
-    DAE.ELSE(__) => _execInitAlgStmts!(valMap, els.statementLst; written)
-    DAE.ELSEIF(__) => begin
-      local c = _evalDAENumeric(els.exp, valMap)
-      if c !== nothing
-        c != 0.0 ? _execInitAlgStmts!(valMap, els.statementLst; written) :
-                   _execInitAlgElse!(valMap, els.else_; written)
-      end
-      ()
+# TODO: unify cref resolution into one function consulting both the SimCode (state /
+# numeric-param lookup tables) and the module-level bindings (String parameters, data
+# structures), so callers need not special-case the latter.
+
+"""
+In a callback's condition or affect: a state from `x`, a parameter from the integrator's
+parameters. A `p` in scope was the callback set's, the event parameters as symbols (the
+condition a Num: Buildings' weather data readers, `canRepeatWeatherFile - (modTimAux >
+tNext)`), where the condition did not bind its own.
+"""
+function getIdxForLookupMTK(crefAsStr::String, simCode::SC.SIM_CODE)
+  crefAsStr == "time" && return :t
+  local simVar = last(simCode.stringToSimVarHT[crefAsStr])
+  if !SC.isParameter(simVar)
+    return Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(crefAsStr)))))
+  end
+  return Expr(:call, getindex, :(integrator.p), Expr(:call, :getindex, :lookuptableParams, :(Symbol($(crefAsStr)))))
+end
+
+#= ==================================================================================== =#
+#= Values at the build                                                                  =#
+#= ==================================================================================== =#
+
+"""
+    evalExpression(e, simCode; keepTunable = false)
+
+`e` evaluated at the build: its parameters replaced by their bindings, recursively (a
+parameter alias `actualGlobalSeed = globalSeed_seed` left the bare name otherwise), lowered
+and evaluated; the lowered expression where it reads a variable or a parameter without a
+binding. With `keepTunable`, tunable parameters stay references (_substituteBoundParameters).
+"""
+function evalExpression(e::SC.Exp, simCode::SC.SIM_CODE; keepTunable::Bool = false)::Expr
+  local shouldEval = Ref(true)
+  local substituted = _substituteBoundParameters(e, simCode; shouldEval, keepTunable)
+  local jl = expToJuliaExpMTK(substituted, simCode)
+  shouldEval[] || return quote $(jl) end
+  local value = try
+    eval(jl)
+  catch err
+    #= left unevaluated: it reads a name that is not a constant here =#
+    OMBackend._fallback(err, :evalExpression; expect = Union{UndefVarError, MethodError})
+    jl
+  end
+  return quote $(value) end
+end
+
+"""
+Whether `e` reads a tunable parameter (withTunableParameters), directly or through the
+bindings of the parameters it reads.
+"""
+function _readsTunableParameter(e::SC.Exp, simCode::SC.SIM_CODE)::Bool
+  isempty(OMBackend.TUNABLE_PARAMETERS[]) && return false
+  local resolved = _substituteBoundParameters(e, simCode; keepTunable = true)
+  return any(OMBackend.isTunableParameter, SC.crefNames!(OrderedSet{String}(), resolved))
+end
+
+"""
+    _evalNumeric(e, valMap)
+
+A scalar expression evaluated numerically at t0 from `valMap` (the parameters' values and the
+variables' values so far): the arithmetic, relations, Boolean operators, `integer`, `floor`,
+`ceil`, `abs`, `sqrt`, `min`, `max`, `smooth`, `noEvent`; nothing for anything else.
+"""
+function _evalNumeric(e::SC.Exp, valMap::Dict{Symbol, Float64})::Union{Float64, Nothing}
+  e isa Union{SC.RCONST, SC.ICONST} && return Float64(e.value)
+  e isa SC.BCONST && return e.value ? 1.0 : 0.0
+  if e isa Union{SC.EXP_CREF, SC.ASUB}
+    local name = SC.scalarReferenceName(e)
+    name === nothing && return nothing
+    return name == "time" ? 0.0 : get(valMap, Symbol(name), nothing)
+  end
+  e isa SC.CAST && return _evalNumeric(e.exp, valMap)
+  if e isa SC.UNARY
+    local a = _evalNumeric(e.exp, valMap)
+    return a === nothing ? nothing : -a
+  elseif e isa SC.LUNARY
+    local a = _evalNumeric(e.exp, valMap)
+    return a === nothing ? nothing : (a == 0.0 ? 1.0 : 0.0)
+  elseif e isa SC.IFEXP
+    local c = _evalNumeric(e.cond, valMap)
+    return c === nothing ? nothing : _evalNumeric(c != 0.0 ? e.thenExp : e.elseExp, valMap)
+  elseif e isa Union{SC.BINARY, SC.RELATION, SC.LBINARY}
+    local a = _evalNumeric(e.exp1, valMap); a === nothing && return nothing
+    local b = _evalNumeric(e.exp2, valMap); b === nothing && return nothing
+    if e isa SC.RELATION
+      local holds = SC.compareValues(a, e.op, b)
+      return holds === nothing ? nothing : holds ? 1.0 : 0.0
     end
-    _ => ()
+    e isa SC.LBINARY && return (e.op === SC.OP_AND ? (a != 0.0 && b != 0.0) : (a != 0.0 || b != 0.0)) ? 1.0 : 0.0
+    e.op === SC.OP_ADD && return a + b
+    e.op === SC.OP_SUB && return a - b
+    e.op === SC.OP_MUL && return a * b
+    e.op === SC.OP_DIV && return b == 0.0 ? nothing : a / b
+    e.op === SC.OP_POW && return (a < 0.0 && !isinteger(b)) ? nothing : a ^ b
+    return nothing
+  elseif e isa SC.CALL && e.kind === SC.CALL_BUILTIN && !isempty(e.args)
+    e.name === :smooth && return length(e.args) == 2 ? _evalNumeric(e.args[2], valMap) : nothing
+    local a = _evalNumeric(e.args[1], valMap); a === nothing && return nothing
+    if e.name in (:min, :max) && length(e.args) == 2
+      local b = _evalNumeric(e.args[2], valMap); b === nothing && return nothing
+      return e.name === :min ? min(a, b) : max(a, b)
+    end
+    e.name === :integer && return isfinite(a) ? floor(a) : nothing
+    e.name === :floor && return floor(a)
+    e.name === :ceil && return ceil(a)
+    e.name === :abs && return abs(a)
+    e.name === :sqrt && return a < 0.0 ? nothing : sqrt(a)
+    e.name in (:noEvent, :float, :Real, :Integer) && return a
   end
   return nothing
 end
 
-function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, @nospecialize(stmt); written = nothing)::Nothing
-  @match stmt begin
-    DAE.STMT_ASSIGN(__) => begin
-      local nm = stmt.exp1 isa DAE.CREF ? SimulationCode.DAE_identifierToString(stmt.exp1) : nothing
-      if nm !== nothing
-        local v = _evalDAENumeric(stmt.exp, valMap)
-        if v !== nothing
-          valMap[Symbol(nm)] = v
-          written === nothing || push!(written, Symbol(nm))
-        end
-      end
-      ()
-    end
-    DAE.STMT_IF(__) => begin
-      local c = _evalDAENumeric(stmt.exp, valMap)
-      if c !== nothing
-        if c != 0.0
-          _execInitAlgStmts!(valMap, stmt.statementLst; written)
-        else
-          _execInitAlgElse!(valMap, stmt.else_; written)
-        end
-      end
-      ()
-    end
-    DAE.STMT_FOR(__) => begin
-      @match stmt.range begin
-        DAE.RANGE(__) => begin
-          local startV = _evalDAENumeric(stmt.range.start, valMap)
-          local stopV = _evalDAENumeric(stmt.range.stop, valMap)
-          local stepV = 1.0
-          @match stmt.range.step begin
-            SOME(se) => begin
-              local sv = _evalDAENumeric(se, valMap)
-              stepV = sv === nothing ? NaN : sv
-              ()
-            end
-            _ => ()
-          end
-          #= Int() of a bound beyond Int64 throws an InexactError (review, 2026-09-29). =#
-          if startV !== nothing && stopV !== nothing && isfinite(stepV) && stepV != 0.0 &&
-             isinteger(startV) && isinteger(stopV) && isinteger(stepV) &&
-             max(abs(startV), abs(stopV), abs(stepV)) < 2.0^62
-            for iv in Int(startV):Int(stepV):Int(stopV)
-              for s in stmt.statementLst
-                _execInitAlgStmt!(valMap, _substIterStmt(s, stmt.iter, iv); written)
-              end
-            end
-          end
-          ()
-        end
-        _ => ()
-      end
-      ()
-    end
-    _ => ()
+"""
+A statement with the loop iterator `name` replaced by `value` (an inner loop of the same
+iterator keeps its own).
+"""
+function _withIteratorValue(s::SC.Statement, name::Symbol, value::Int)::SC.Statement
+  local sub = e::SC.Exp -> SC.mapExp(x -> (x isa SC.EXP_CREF && x.cref.sym === name && isempty(x.cref.subs)) ? SC.ICONST(value) : x, e)
+  local body = b::Vector{SC.Statement} -> SC.Statement[_withIteratorValue(x, name, value) for x in b]
+  if s isa SC.FOR
+    s.iterator.name === name && return s
+    return SC.FOR(SC.Iterator(s.iterator.name, sub(s.iterator.range)), body(s.body), s.source)
+  elseif s isa SC.IF
+    return SC.IF(SC.Branch[SC.Branch(sub(b.condition), body(b.body)) for b in s.branches], body(s.elseBody), s.source)
+  elseif s isa SC.ASSIGN
+    return SC.ASSIGN(sub(s.left), sub(s.right), s.source)
+  end
+  return s
+end
+
+"""
+    _execInitAlgStmts!(valMap, statements, written)
+
+The statements of an initial algorithm interpreted at t0 into `valMap`: assignments of a
+variable, if/elseif/else, for-loops over constant integer ranges; another statement, an
+expression `_evalNumeric` does not evaluate, is skipped (its names keep their values).
+`written` (when given) collects the names an assignment wrote.
+"""
+function _execInitAlgStmts!(valMap::Dict{Symbol, Float64}, statements::Vector{SC.Statement},
+                            written::Union{Nothing, Set{Symbol}})::Nothing
+  foreach(s -> _execInitAlgStmt!(valMap, s, written), statements)
+  return nothing
+end
+
+function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, s::SC.ASSIGN, written::Union{Nothing, Set{Symbol}})::Nothing
+  local name = SC.scalarReferenceName(s.left)
+  name === nothing && return nothing
+  local v = _evalNumeric(s.right, valMap)
+  v === nothing && return nothing
+  valMap[Symbol(name)] = v
+  written === nothing || push!(written, Symbol(name))
+  return nothing
+end
+
+function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, s::SC.IF, written::Union{Nothing, Set{Symbol}})::Nothing
+  for b in s.branches
+    local c = _evalNumeric(b.condition, valMap)
+    c === nothing && return nothing
+    c != 0.0 && return _execInitAlgStmts!(valMap, b.body, written)
+  end
+  return _execInitAlgStmts!(valMap, s.elseBody, written)
+end
+
+function _execInitAlgStmt!(valMap::Dict{Symbol, Float64}, s::SC.FOR, written::Union{Nothing, Set{Symbol}})::Nothing
+  local range = s.iterator.range
+  range isa SC.RANGE || return nothing
+  local startV = _evalNumeric(range.start, valMap)
+  local stopV = _evalNumeric(range.stop, valMap)
+  local stepV = range.step === nothing ? 1.0 : something(_evalNumeric(range.step, valMap), NaN)
+  #= Int() of a bound beyond Int64 throws an InexactError =#
+  (startV !== nothing && stopV !== nothing && isfinite(stepV) && stepV != 0.0 &&
+   isinteger(startV) && isinteger(stopV) && isinteger(stepV) &&
+   max(abs(startV), abs(stopV), abs(stepV)) < 2.0^62) || return nothing
+  for iv in Int(startV):Int(stepV):Int(stopV), b in s.body
+    _execInitAlgStmt!(valMap, _withIteratorValue(b, s.iterator.name, iv), written)
   end
   return nothing
 end
 
-#= Seed valMap with initial-algorithm-assigned values (e.g. trapezoid `count`,
-   `T_start`) evaluated at t0, in statement order. Interprets assignments,
-   if/elseif/else and for-loops over constant integer ranges; anything else
-   is skipped and the affected names keep their defaults. Without this,
-   discrete states set imperatively in an `initial algorithm` (no `start`
-   attribute) default to 0.0 when evaluating if-equation initial branches,
-   picking the wrong branch. =#
-function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode; written = nothing)
+_execInitAlgStmt!(::Dict{Symbol, Float64}, ::SC.Statement, ::Union{Nothing, Set{Symbol}})::Nothing = nothing
+
+"""
+    _seedInitialAlgValues!(valMap, simCode, written = nothing)
+
+`valMap` with the values the initial algorithm sections (`section`: an `initial algorithm`, an
+algorithm's `when initial()`) assign at t0 (trapezoid `count`, `T_start`), in statement order.
+Without them a discrete set imperatively in an `initial algorithm` (no `start` attribute) was
+0.0 where the initial branches of if-equations are chosen: the wrong branch. Not the `initial()`
+arms of when-equations and discrete clusters: the DAE initialization starts their discretes at
+their start values and the clusters settle them after it, so the branches must read those (as
+the old pipeline did: only its sections had DAE statements); seeded, MSL 4.1.0 IMC_YD's main
+switches started open in the branches and closed in the initialization, which then failed and
+moved the logical delays' tSwitch.
+"""
+function _seedInitialAlgValues!(valMap::Dict{Symbol, Float64}, simCode::SC.SIM_CODE,
+                                written::Union{Nothing, Set{Symbol}} = nothing)::Dict{Symbol, Float64}
   for ia in simCode.initialAlgorithms
-    _execInitAlgStmts!(valMap, ia.daeStatements; written)
+    ia.section && _execInitAlgStmts!(valMap, ia.statements, written)
   end
   return valMap
 end
 
-#= True if the condition is TRUE at its zero-crossing boundary (zc == 0).
-   The normalized crossing function cannot distinguish >= from > there; the
-   original relational operator decides. Conservative: false for anything
-   but a (possibly negated / noEvent-wrapped) plain relation. =#
-function condClosedAtBoundary(cond)::Bool
-  if cond isa SimulationCode.Exp
-    cond = SimulationCode.toDAEExp(cond)
-  end
-  @match cond begin
-    DAE.RELATION(_, DAE.LESSEQ(__), _) => true
-    DAE.RELATION(_, DAE.GREATEREQ(__), _) => true
-    DAE.RELATION(_, DAE.EQUAL(__), _) => true
-    DAE.LUNARY(DAE.NOT(__), DAE.RELATION(_, DAE.LESS(__), _)) => true
-    DAE.LUNARY(DAE.NOT(__), DAE.RELATION(_, DAE.GREATER(__), _)) => true
-    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
-      local args = collect(lst)
-      length(args) == 1 ? condClosedAtBoundary(args[1]) : false
-    end
-    _ => false
-  end
-end
+#= ==================================================================================== =#
+#= The t0 value map                                                                     =#
+#= ==================================================================================== =#
 
-#= Relation semantics for events (MLS 8.5, OpenModelica's relationhysteresis):
-   a relation keeps its value during integration and changes only at events;
-   its crossing function has a hysteresis relative to that value, so it is
-   never zero after initialization or after an event (FMI 3.0 3.1.1). =#
+#= One-entry memo: the map is requested once per if-equation branch but only depends on the
+   simCode object, and the forward-evaluation sweep is not free. Fields: (the simCode, valMap,
+   explicit, trusted-derived pairs). The simCode is kept and compared by identity: an
+   `objectid` comes from its fields' addresses, which the GC gives a later model's. =#
+const _T0_MAP_CACHE = Ref{Union{Nothing, Tuple{SC.SIM_CODE, Dict{Symbol, Float64}, Set{Symbol}, Vector{Pair{Symbol, Float64}}}}}(nothing)
 
-#= The relations of a condition that generate events (not inside noEvent). =#
-Base.@nospecializeinfer function _eventRelations(@nospecialize(cond))::Vector{DAE.Exp}
-  cond isa SimulationCode.Exp && (cond = SimulationCode.toDAEExp(cond))
-  local out = DAE.Exp[]
-  local visit = function (e, arg)
-    @match e begin
-      DAE.CALL(Absyn.IDENT("noEvent"), _, _) => return (e, false, arg)
-      DAE.RELATION(__) => begin
-        push!(out, e)
-        return (e, false, arg)
-      end
-      _ => return (e, true, arg)
-    end
-  end
-  Util.traverseExpTopDown(cond, visit, nothing)
-  return out
-end
+"Whether the t0 map memo is that of `simCode`."
+_t0MapCachedFor(simCode::SC.SIM_CODE)::Bool = (local c = _T0_MAP_CACHE[]; c !== nothing && c[1] === simCode)
 
-#= The scale of a condition's operands, `1 + max(|a|, |b|, ...)`, for the
-   hysteresis width `H * scale` (OpenModelica: max(|a|,|b|) + nominal). =#
-function _conditionScaleExpr(@nospecialize(cond), simCode)
-  local terms = Any[]
-  #= An infinite operand (the MSL Spice3 V_pulse's default pulse width and
-     period, inf, in `time >= T0 + Tfalling`) is left out: it made the
-     hysteresis infinite. =#
-  for rel in _eventRelations(cond)
-    push!(terms, expToJuliaExpMTK(rel.exp1, simCode), expToJuliaExpMTK(rel.exp2, simCode))
-  end
-  isempty(terms) && return 1.0
-  return _operandScaleExpr(terms)
-end
-
-#= A literal: a constant, its negation, an array of them. =#
-Base.@nospecializeinfer function _isLiteralDAEExp(@nospecialize(e::DAE.Exp))::Bool
-  @match e begin
-    DAE.ICONST(__) || DAE.RCONST(__) || DAE.SCONST(__) || DAE.BCONST(__) || DAE.ENUM_LITERAL(__) => true
-    DAE.UNARY(exp = x) => _isLiteralDAEExp(x)
-    DAE.ARRAY(array = xs) => all(_isLiteralDAEExp, xs)
-    _ => false
-  end
-end
-
-#= `1 + max(|x|, ...)` of lowered operands, an infinite one left out (above). =#
-function _operandScaleExpr(xs::Vector{Any})
-  local terms = Any[:(ModelingToolkit.ifelse(abs($(x)) < 1.0e300, abs($(x)), 0.0)) for x in xs]
-  return length(terms) == 1 ? :(1.0 + $(terms[1])) : :(1.0 + max($(terms...)))
-end
-
-#= The literal value of a condition (as at initialization), as a Julia Bool
-   expression over `observed.zcK`: each relation from its own crossing
-   function, `<`/`>` strict and `<=`/`>=` closed, and/or/not as such.
-   `obsKws` collects the observed crossing functions. Nothing if the
-   condition has a shape this does not cover. =#
-Base.@nospecializeinfer function _literalConditionExpr(@nospecialize(cond), simCode, obsKws::Vector{Expr})
-  cond isa SimulationCode.Exp && (cond = SimulationCode.toDAEExp(cond))
-  local rec(@nospecialize e) = _literalConditionExpr(e, simCode, obsKws)
-  local observe = function (zc)
-    local name = Symbol("zc", length(obsKws) + 1)
-    push!(obsKws, Expr(:kw, name, zc))
-    return :(observed.$(name))
-  end
-  return @match cond begin
-    DAE.RELATION(_, op, _) => begin
-      local zc = observe(transformToMTKContinuousCondition(cond, simCode))
-      (op isa DAE.LESSEQ || op isa DAE.GREATEREQ) ? :($(zc) <= 0) :
-        #= == and <> cross as 0.5 - (a == b): negative exactly when it holds. =#
-        (op isa DAE.LESS || op isa DAE.GREATER || op isa DAE.EQUAL || op isa DAE.NEQUAL) ? :($(zc) < 0) : nothing
-    end
-    DAE.LBINARY(e1, DAE.AND(__), e2) => begin
-      local l = rec(e1); local r = rec(e2)
-      (l === nothing || r === nothing) ? nothing : :($(l) && $(r))
-    end
-    DAE.LBINARY(e1, DAE.OR(__), e2) => begin
-      local l = rec(e1); local r = rec(e2)
-      (l === nothing || r === nothing) ? nothing : :($(l) || $(r))
-    end
-    DAE.LUNARY(DAE.NOT(__), e) => begin
-      local inner = rec(e)
-      inner === nothing ? nothing : :(!$(inner))
-    end
-    DAE.CALL(Absyn.IDENT("noEvent"), lst, _) => begin
-      local args = collect(lst)
-      length(args) == 1 ? rec(args[1]) : nothing
-    end
-    DAE.CREF(__) => :($(observe(expToJuliaExpMTK(cond, simCode))) > 0.5)
-    DAE.BCONST(b) => b
-    _ => nothing
-  end
-end
-
-#= Symbol -> value map at t0: parameter values plus state/algebraic start
-   attributes (default 0.0), overridden by early init-algorithm results.
-   `explicit` collects the symbols whose value came from an actual source
-   (parameter, explicit start attribute, init-algorithm result) rather than
-   the 0.0 default. =#
-#= One-entry memo: the map is requested once per if-equation branch but only
-   depends on the simCode object, and the forward-evaluation sweep is not free.
-   Fields: (simCode id, valMap, explicit, trusted-derived pairs). =#
-const _T0_MAP_CACHE = Ref{Tuple{UInt, Dict{Symbol, Float64}, Set{Symbol}, Vector{Pair{Symbol, Float64}}}}(
-  (UInt(0), Dict{Symbol, Float64}(), Set{Symbol}(), Pair{Symbol, Float64}[]))
-
-#= The number `f()` (evalDAEConstant, evalSimCodeParameter) gives, or nothing
-   when it is not a constant. A BINARY/LBINARY comes back as evalDAE_Expression's
-   `:block` around its evaluated value (around the Expr itself when it reads a
-   variable): `Float64` of the block was a MethodError, swallowed, so such a
-   start value was lost (error policy, stage 4). =#
-function _t0Number(f)::Union{Float64, Nothing}
+"""
+The number `f()` (evalConstant, evalSimCodeParameter) gives, or nothing when it is not a
+constant. A BINARY/LBINARY comes back as evalExpression's `:block` around its value (around
+the Expr itself when it reads a variable).
+"""
+function _t0Number(f::F)::Union{Float64, Nothing} where {F}
   local raw = try
     f()
   catch err
@@ -2430,62 +1295,54 @@ function _t0Number(f)::Union{Float64, Nothing}
   return raw isa Real ? Float64(raw) : nothing
 end
 
-#= The forms evalDAEConstant evaluates: a literal, or a BINARY/LBINARY through
-   evalDAE_Expression. The t0 map asks only for those (anything else is not a
-   constant, which is the rule, not a failure). =#
-_isEvaluableConstant(@nospecialize(e))::Bool =
-  e isa Union{DAE.BCONST, DAE.ICONST, DAE.RCONST, DAE.SCONST, DAE.BINARY, DAE.LBINARY,
-              SimulationCode.BCONST, SimulationCode.ICONST, SimulationCode.RCONST, SimulationCode.SCONST,
-              SimulationCode.BINARY, SimulationCode.LBINARY}
+"""
+The forms evalConstant evaluates: a literal, or a BINARY/LBINARY through evalExpression.
+The t0 map asks only for those (anything else is not a constant, which is the rule, not a
+failure).
+"""
+_isEvaluableConstant(e::Union{Nothing, SC.Exp})::Bool =
+  e isa Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST, SC.BINARY, SC.LBINARY}
 
-#= `sv`'s start value as a number, or nothing. =#
-function _startNumber(sv, simCode)::Union{Float64, Nothing}
-  local startExp = @match sv.attributes begin
-    SOME(attr) where hasproperty(attr, :start) => @match attr.start begin
-      SOME(e) => e
-      _ => nothing
-    end
-    _ => nothing
-  end
-  return _isEvaluableConstant(startExp) ? _t0Number(() -> evalDAEConstant(startExp, simCode)) : nothing
+"""
+`sv`'s start value as a number, or nothing.
+"""
+function _startNumber(sv::SC.SIMVAR, simCode::SC.SIM_CODE)::Union{Float64, Nothing}
+  local start = sv.attributes.start
+  return _isEvaluableConstant(start) ? _t0Number(() -> evalConstant(start, simCode)) : nothing
 end
 
-_isFixedStart(sv)::Bool = @match sv.attributes begin
-  SOME(attr) where hasproperty(attr, :fixed) => @match attr.fixed begin
-    SOME(DAE.BCONST(true)) => true
-    _ => false
-  end
-  _ => false
-end
+_isFixedStart(sv::SC.SIMVAR)::Bool = sv.attributes.fixed == SC.BCONST(true)
 
-function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{Symbol}}
-  local cached = _T0_MAP_CACHE[]
-  if cached[1] === objectid(simCode)
+"""
+    _buildT0ValueMapAndExplicit(simCode)
+
+The values at t0 by symbol: the parameters' (binding, else start), the states' and algebraic
+variables' starts (0.0 without one), the initial algorithms' results, extended through the
+explicit residuals (`_forwardEvalT0!`); and the symbols whose value has an actual source
+(`explicit`, not the 0.0 default). The consequences of the values safe for hard decisions
+(parameters, fixed starts, the initial algorithms' results) override guess-grade starts first,
+so a branch never reads a value the fixed initial configuration contradicts.
+"""
+function _buildT0ValueMapAndExplicit(simCode::SC.SIM_CODE)::Tuple{Dict{Symbol, Float64}, Set{Symbol}}
+  if _t0MapCachedFor(simCode)
+    local cached = _T0_MAP_CACHE[]
     return (copy(cached[2]), copy(cached[3]))
   end
   local valMap = Dict{Symbol, Float64}()
   local explicit = Set{Symbol}()
-  #= Values safe for hard structural decisions (branch selection): parameters,
-     fixed=true starts, init-algorithm results. Non-fixed starts are guesses
-     and may contradict the actual initial configuration. =#
   local trusted = Set{Symbol}()
-  local ht = simCode.stringToSimVarHT
-  for (key, (_, sv)) in ht
+  for (key, (_, sv)) in simCode.stringToSimVarHT
     local sym = Symbol(key)
-    if sv.varKind isa SimulationCode.PARAMETER
-      #= The binding's value, else the start value. =#
-      local bind = @match sv.varKind begin
-        SimulationCode.PARAMETER(SOME(b)) => b
-        _ => nothing
-      end
-      local pval = _isEvaluableConstant(bind) ? _t0Number(() -> evalDAEConstant(bind, simCode)) : nothing
+    if sv.varKind isa SC.PARAMETER
+      local bind = sv.varKind.bindExp
+      local pval = _isEvaluableConstant(bind) ? _t0Number(() -> evalConstant(bind, simCode)) : nothing
       pval === nothing && (pval = _startNumber(sv, simCode))
       if pval !== nothing
         valMap[sym] = pval
         push!(explicit, sym)
         push!(trusted, sym)
       end
-    elseif SimulationCode.isStateOrAlgebraic(sv)
+    elseif SC.isStateOrAlgebraic(sv)
       local sval = _startNumber(sv, simCode)
       if sval !== nothing
         push!(explicit, sym)
@@ -2494,15 +1351,12 @@ function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{
       valMap[sym] = something(sval, 0.0)
     end
   end
-  #= The names the initial algorithms assign (by name: an assignment equal to
-     the start value is an initial-algorithm result too). =#
+  #= the names the initial algorithms assign (an assignment equal to the start value is an
+     initial algorithm's result too) =#
   local written = Set{Symbol}()
-  _seedInitialAlgValues!(valMap, simCode; written)
+  _seedInitialAlgValues!(valMap, simCode, written)
   union!(explicit, written)
   union!(trusted, written)
-  #= Trusted-first sweep: deterministic consequences of trusted data override
-     guess-grade start values in the map, so branch decisions never read a
-     value contradicted by the fixed initial configuration. =#
   local trustedBase = copy(trusted)
   local trustedMap = Dict{Symbol, Float64}(k => valMap[k] for k in trusted if haskey(valMap, k))
   _forwardEvalT0!(trustedMap, trusted, simCode)
@@ -2513,204 +1367,167 @@ function _buildT0ValueMapAndExplicit(simCode)::Tuple{Dict{Symbol, Float64}, Set{
     push!(explicit, k)
   end
   _forwardEvalT0!(valMap, explicit, simCode)
-  _T0_MAP_CACHE[] = (objectid(simCode), copy(valMap), copy(explicit), trustedDerived)
+  _T0_MAP_CACHE[] = (simCode, copy(valMap), copy(explicit), trustedDerived)
   return (valMap, explicit)
 end
 
-#= Trusted-derived t0 values (deterministic consequences of parameters and
-   fixed=true starts). Used to override guess-grade init values at build time. =#
-function buildT0TrustedDerivedPairs(simCode)::Vector{Pair{Symbol, Float64}}
-  local cached = _T0_MAP_CACHE[]
-  if cached[1] === objectid(simCode)
-    return copy(cached[4])
-  end
-  _buildT0ValueMapAndExplicit(simCode)
+"""
+The values derived from the trusted ones (deterministic consequences of parameters and
+fixed starts), for overriding guess-grade initial values at the build.
+"""
+function buildT0TrustedDerivedPairs(simCode::SC.SIM_CODE)::Vector{Pair{Symbol, Float64}}
+  _t0MapCachedFor(simCode) || _buildT0ValueMapAndExplicit(simCode)
   return copy(_T0_MAP_CACHE[][4])
 end
 
-_buildT0ValueMap(simCode)::Dict{Symbol, Float64} = first(_buildT0ValueMapAndExplicit(simCode))
+_buildT0ValueMap(simCode::SC.SIM_CODE)::Dict{Symbol, Float64} = first(_buildT0ValueMapAndExplicit(simCode))
 
-#= True when every variable-position Symbol of the expression is explicit.
-   Call heads and qualified references are code, not variables. =#
-function _exprSymbolsExplicit(e, explicit::Set{Symbol})::Bool
-  if e isa Symbol
-    return e in explicit
-  elseif e isa Expr
-    e.head == :. && return true
-    local args = e.head == :call ? e.args[2:end] : e.args
-    for a in args
-      a isa LineNumberNode && continue
-      _exprSymbolsExplicit(a, explicit) || return false
-    end
-    return true
+"""
+True when every variable-position Symbol of the expression is explicit. Call heads and
+qualified references are code, not variables.
+"""
+function _exprSymbolsExplicit(@nospecialize(e), explicit::Set{Symbol})::Bool
+  e isa Symbol && return e in explicit
+  e isa Expr || return true
+  e.head == :. && return true
+  for a in (e.head == :call ? e.args[2:end] : e.args)
+    a isa LineNumberNode && continue
+    _exprSymbolsExplicit(a, explicit) || return false
   end
   return true
 end
 
-#= Whole Float64 literals in index position fault plain numeric evaluation
-   (the lowering emits `x[3.0]`); convert them to Int literals. =#
-_intifyFloatIndices(x) = x
+"""
+Whole Float64 literals in index position fault plain numeric evaluation (the lowering
+emits `x[3.0]`): Int literals.
+"""
+_intifyFloatIndices(@nospecialize(x)) = x
 function _intifyFloatIndices(x::Expr)
-  local newArgs = if x.head == :ref && length(x.args) >= 2
-    vcat(Any[_intifyFloatIndices(x.args[1])],
-         Any[(i isa Float64 && isinteger(i)) ? Int(i) : _intifyFloatIndices(i) for i in x.args[2:end]])
-  else
-    Any[_intifyFloatIndices(a) for a in x.args]
+  if x.head == :ref && length(x.args) >= 2
+    return Expr(x.head, _intifyFloatIndices(x.args[1]),
+                (i isa Float64 && isinteger(i) ? Int(i) : _intifyFloatIndices(i) for i in x.args[2:end])...)
   end
-  return Expr(x.head, newArgs...)
+  return Expr(x.head, (_intifyFloatIndices(a) for a in x.args)...)
 end
 
-#= Evaluate a causalized branch RHS at the t0 value map. Returns nothing when
-   the expression is not statically evaluable, or when it references any
-   non-explicit (0.0-defaulted) variable: a seed contaminated by defaults can
-   pull the consistent-IC solve to a wrong root. =#
-function evalCausalRHSAtT0(rhsExpr, valMap::Dict{Symbol, Float64},
+"""
+    evalCausalRHSAtT0(rhsExpr, valMap, explicit = Set{Symbol}())
+
+A causalized right-hand side evaluated at the t0 value map; nothing where it is not
+statically evaluable or reads a variable without an explicit value (a seed contaminated by
+0.0 defaults can pull the consistent-initial-conditions solve to a wrong root).
+"""
+function evalCausalRHSAtT0(@nospecialize(rhsExpr), valMap::Dict{Symbol, Float64},
                            explicit::Set{Symbol} = Set{Symbol}())::Union{Float64, Nothing}
-  if ccall(:jl_generating_output, Cint, ()) != 0
-    return nothing
-  end
+  ccall(:jl_generating_output, Cint, ()) != 0 && return nothing
   _exprSymbolsExplicit(rhsExpr, explicit) || return nothing
   local numExpr = _intifyFloatIndices(_substituteExprValues(rhsExpr, valMap))
   try
-    #= Generated Modelica function bindings live in the parent CodeGeneration
-       module (Phase A evals them there), not in this submodule. =#
+    #= generated Modelica function bindings live in the parent CodeGeneration module =#
     local result = Core.eval(parentmodule(@__MODULE__), numExpr)
-    local numResult = if result isa Number
-      Float64(result)
-    else
-      local unwrapped = Base.invokelatest(SymbolicUtils.unwrap, result)
-      if unwrapped isa Number
-        Float64(unwrapped)
-      else
-        return nothing
-      end
-    end
-    return isfinite(numResult) ? numResult : nothing
+    local value = result isa Number ? Float64(result) : Base.invokelatest(SymbolicUtils.unwrap, result)
+    value isa Number || return nothing
+    return isfinite(value) ? Float64(value) : nothing
   catch err
-    #= A name not resolved yet, a Modelica function outside its domain. =#
+    #= a name not resolved yet, a Modelica function outside its domain =#
     OMBackend._fallback(err, :evalCausalRHSAtT0; expect = Union{UndefVarError, MethodError})
     return nothing
   end
 end
 
-_t0ContainsDer(x) = false
-function _t0ContainsDer(x::Expr)
-  if x.head == :call && !isempty(x.args) && (x.args[1] === :der || x.args[1] === :D)
-    return true
-  end
-  return any(_t0ContainsDer, x.args)
-end
+_t0ContainsDer(@nospecialize(x)) = false
+_t0ContainsDer(x::Expr) = (x.head == :call && !isempty(x.args) && x.args[1] in (:der, :D)) || any(_t0ContainsDer, x.args)
 
-#= Forward-evaluate explicitly causal residuals (`0 = cref - rhs`) at t0 to
-   extend the value map through chains the start attributes do not cover
-   (frame positions, guarded line-force lengths). Operands must already be
-   explicit, so defaulted values never contaminate a filled-in entry. =#
-function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, simCode)
-  if ccall(:jl_generating_output, Cint, ()) != 0
-    return
-  end
-  local loweredCache = IdDict{Any, Any}()
-  local mkPair = function (rawExp)
-    local dae = rawExp isa DAE.Exp ? rawExp : SimulationCode.toDAEExp(rawExp)
-    local arm = @match dae begin
-      DAE.BINARY(DAE.CREF(cr, _), DAE.SUB(__), rhs) => (cr, rhs)
-      _ => nothing
-    end
-    arm === nothing && return nothing
-    local (cr, rhsDAE) = arm
-    local tgt = Symbol(SimulationCode.DAE_identifierToString(cr))
-    (tgt in explicit) && return nothing
-    local rhsExpr = get!(loweredCache, rhsDAE) do
+"""
+The explicit residuals `0 = x - rhs` evaluated forward at t0, extending the value map
+through chains the start attributes do not cover (frame positions, guarded line-force
+lengths); with the residuals of the if-equations' initial branches, chosen again as the map
+grows. Operands must be explicit already, so defaulted values never contaminate a
+filled-in entry.
+"""
+function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, simCode::SC.SIM_CODE)::Nothing
+  ccall(:jl_generating_output, Cint, ()) != 0 && return nothing
+  local lowered = Dict{SC.Exp, Any}()
+  local pair = function (e::SC.Exp)
+    (e isa SC.BINARY && e.op === SC.OP_SUB && e.exp1 isa SC.EXP_CREF) || return nothing
+    local target = Symbol(SC.crefName(e.exp1.cref))
+    target in explicit && return nothing
+    local rhs = get!(lowered, e.exp2) do
       try
-        expToJuliaExpMTK(rhsDAE, simCode)
+        expToJuliaExpMTK(e.exp2, simCode)
       catch err
         OMBackend._fallback(err, :forwardEvalT0Lowering; only = OMBackend.UnsupportedLowering)
-        :__t0_lower_failed
+        nothing
       end
     end
-    rhsExpr === :__t0_lower_failed && return nothing
-    _t0ContainsDer(rhsExpr) && return nothing
-    return (tgt, rhsExpr)
+    (rhs === nothing || _t0ContainsDer(rhs)) && return nothing
+    return (target, rhs)
   end
-  #= Outer rounds re-select if-equation branches as the value map grows: a
-     branch whose condition depends on derived values only becomes decidable
-     after the residual sweep has filled them. =#
-  for _outer in 1:3
+  for _ in 1:3
     local pairs = Tuple{Symbol, Any}[]
     for eq in simCode.residualEquations
-      local p = mkPair(eq.exp)
+      local p = pair(eq.exp)
       p === nothing || push!(pairs, p)
     end
-    local envStr = Dict{String, Float64}(string(k) => valMap[k] for k in explicit if haskey(valMap, k))
+    local env = Dict{String, Float64}(string(k) => valMap[k] for k in explicit if haskey(valMap, k))
     for ifEq in simCode.ifEquations
-      local br = SimulationCode._selectActiveInitBranch(ifEq, envStr)
-      br === nothing && continue
-      for req in br.residualEquations
-        local p = mkPair(req.exp)
+      local branch = SC.activeInitialBranch(ifEq, env)
+      branch === nothing && continue
+      for r in branch.residualEquations
+        local p = pair(r.exp)
         p === nothing || push!(pairs, p)
       end
     end
-    local outerProgressed = false
-    local progressed = true
-    local rounds = 0
-    while progressed && rounds < 20
-      progressed = false
-      rounds += 1
-      for (tgt, rhsExpr) in pairs
-        (tgt in explicit) && continue
-        local v = evalCausalRHSAtT0(rhsExpr, valMap, explicit)
+    local progressed = false
+    for _ in 1:20
+      local round = false
+      for (target, rhs) in pairs
+        target in explicit && continue
+        local v = evalCausalRHSAtT0(rhs, valMap, explicit)
         v === nothing && continue
-        valMap[tgt] = v
-        push!(explicit, tgt)
-        progressed = true
-        outerProgressed = true
+        valMap[target] = v
+        push!(explicit, target)
+        round = true
       end
+      round || break
+      progressed = true
     end
-    outerProgressed || break
+    progressed || break
   end
-  return
+  return nothing
 end
 
-function evalInitialCondition(mtkCond, simCode; closedBoundary::Bool = false, extraVals = nothing)
-  #= Skip during precompile output: `eval(...)` below would mutate this
-     closed module's bindings and Julia rejects that. The runtime path is
-     unaffected. Fallback `true` matches the existing catch arm. =#
-  if ccall(:jl_generating_output, Cint, ()) != 0
-    return true
-  end
-  #= Evaluate zero-crossing function at t=0 to determine initial condition.
-     Works at the Expr level: substitutes all variable/parameter references
-     in the mtkCond Expr (form :(lhs ~ 0)) with numeric values, then evals
-     the result. Returns true when the zero-crossing function is non-negative
-     at t=0 (condition FALSE), false when negative (condition TRUE).
-     The caller inverts: ifCond = !(evalInitialCondition(...)). =#
+"""
+    evalInitialCondition(mtkCond, simCode; closedBoundary = false, extraVals = nothing)
+
+Whether a condition is false at t0: its zero-crossing function (`zc ~ 0`) evaluated with the
+t0 value map (and `extraVals`, the relays' t0 values: an operand that is an if-equation's
+target defaulted to 0 and chose the wrong initial branch) is positive, at zero `closedBoundary`
+decides. The caller inverts: `ifCond = !evalInitialCondition(...)`. True where it cannot be
+evaluated.
+"""
+function evalInitialCondition(mtkCond::Expr, simCode::SC.SIM_CODE; closedBoundary::Bool = false,
+                              extraVals::Union{Nothing, AbstractDict{Symbol, Float64}} = nothing)::Bool
+  #= during the precompile output eval would mutate this closed module's bindings =#
+  ccall(:jl_generating_output, Cint, ()) != 0 && return true
   local valMap = _buildT0ValueMap(simCode)
-  #= Relay-computed t0 values: condition operands that are themselves
-     if-equation targets would otherwise default to 0 here and select the
-     wrong initial branch. =#
-  if extraVals !== nothing
-    for (k, v) in extraVals
-      valMap[k] = v
-    end
-  end
+  extraVals === nothing || merge!(valMap, extraVals)
   local numExpr = _substituteExprValues(_extractZeroCrossingLHS(mtkCond), valMap)
-  local numResult = try
+  local value = try
     _numberOf(eval(numExpr))
-  catch e
-    #= A name without a t0 value, a Modelica function outside its domain. =#
-    OMBackend._fallback(e, :evalInitialCondition; expect = Union{UndefVarError, MethodError}, impact = :result)
-    @warn "evalInitialCondition: failed to evaluate, defaulting to true" exception=(e, catch_backtrace())
+  catch err
+    #= a name without a t0 value, a Modelica function outside its domain =#
+    OMBackend._fallback(err, :evalInitialCondition; expect = Union{UndefVarError, MethodError}, impact = :result)
+    @warn "evalInitialCondition: failed to evaluate, defaulting to true" exception=(err, catch_backtrace())
     return true
   end
-  #= The zero-crossing function is negative when the condition is TRUE,
-     positive when FALSE. Return true when condition is FALSE (positive),
-     because the caller inverts: ifCond = !(evalInitialCondition(...)).
-     At zc == 0 the original operator decides (closedBoundary). =#
-  return closedBoundary ? numResult > 0.0 : numResult >= 0.0
+  return closedBoundary ? value > 0.0 : value >= 0.0
 end
 
-#= An evaluated condition value as a Float64 (a symbolic constant unwrapped; 0.0 otherwise). =#
-function _numberOf(result)::Float64
+"""
+An evaluated condition value as a Float64 (a symbolic constant unwrapped; 0.0 otherwise).
+"""
+function _numberOf(@nospecialize(result))::Float64
   result isa Number && return Float64(result)
   local unwrapped = Base.invokelatest(SymbolicUtils.unwrap, result)
   unwrapped isa Number && return Float64(unwrapped)
@@ -2718,206 +1535,18 @@ function _numberOf(result)::Float64
   return Float64(valued isa Number ? valued : 0.0)
 end
 
-"""
-Extract the LHS from a zero-crossing equation Expr of the form :(lhs ~ 0).
-Handles nested forms like :(min(a, b) ~ 0).
-"""
+"The left side of a zero-crossing equation `lhs ~ 0`; another expression itself."
 function _extractZeroCrossingLHS(expr::Expr)
-  if expr.head == :call && length(expr.args) == 3 && expr.args[1] == :~
-    return expr.args[2]
-  end
+  (expr.head == :call && length(expr.args) == 3 && expr.args[1] == :~) && return expr.args[2]
   return expr
 end
 
-"""
-  Generates code for DAE cast expressions for MTK code.
-"""
-function generateCastExpressionMTK(@nospecialize(ty::DAE.Type), @nospecialize(exp::DAE.Exp),
-                                   simCode, varPrefix = "", varSuffix = "")
-  expr = @match ty, exp begin
-    (DAE.T_REAL(__), DAE.ICONST(__)) => begin
-      quote
-        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,)))
-      end
-    end
-    (DAE.T_REAL(__), DAE.CREF(cref)) where typeof(cref.identType) === DAE.T_INTEGER => begin
-      quote
-        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,)))
-      end
-    end
-    #= Conversion to a float, other alternatives. =#
-    (DAE.T_REAL(__), _) => begin
-      quote
-        float($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,)))
-      end
-    end
-    #= Conversion of array to real array (broadcast float) =#
-    (DAE.T_ARRAY(DAE.T_REAL(__), _), _) => begin
-      quote
-        float.($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,)))
-      end
-    end
-    #= Conversion to integer array =#
-    (DAE.T_ARRAY(DAE.T_INTEGER(__), _), _) => begin
-      quote
-        Int.(round.($(expToJuliaExpMTK(exp, simCode, varPrefix=varPrefix, varSuffix = varSuffix,))))
-      end
-    end
-    _ => OMBackend.unsupported("cast to $(ty)", exp)
-  end
-  return expr
-end
-
-# TODO: unify cref resolution into one function consulting both the SimCode
-# (state / numeric-param lookup tables) and the module-level bindings (String
-# parameters, data structures), so callers need not special-case the latter.
-getIdxForLookupMTK(x::Union{DAE.ComponentRef, DAE.CREF}, simCode) = getIdxForLookupMTK(string(x), simCode)
-
-#= In a callback's condition or affect: a state from `x`, a parameter from the integrator's
-   parameters. A `p` in scope was the callback set's, the event parameters as symbols (the
-   condition a Num: Buildings' weather data readers, `canRepeatWeatherFile - (modTimAux >
-   tNext)`), where the condition did not bind its own. =#
-function getIdxForLookupMTK(crefAsStr::String, simCode)
-  if crefAsStr == "time"
-    return :t
-  end
-  @match _, simVar = simCode.stringToSimVarHT[crefAsStr]
-  if !(SimulationCode.isParameter(simVar))
-    Expr(:call, getindex, :x, Expr(:call, :getindex, :lookuptableStates, :(Symbol($(crefAsStr)))))
-  else
-    Expr(:call, getindex, :(integrator.p), Expr(:call, :getindex, :lookuptableParams, :(Symbol($(crefAsStr)))))
-  end
-end
-
-
-#= Helpers that depend on the MTK lowering (expToJuliaExpMTK / ModelingToolkit.ifelse / Symbolics) =#
-
-_isSimCodeFunctionPath(path::Absyn.Path, simCode)::Bool = _isSimCodeFunctionName(string(path), simCode)
-
-#= An element of a named array of records by subscripts that are not literals (`data[i]` in a
-   reduction: the ideal gases' `h_T(data[i], T, ...)`, MSL Media mixtures): that element of
-   each field array, `data_MM[i]` (the module-level arrays of _recordArrayFieldArrays). With
-   the subscript dropped (before toSimExp kept it), the whole field arrays were passed. Empty
-   otherwise. =#
-function _recordArrayElementCallArgs(arg::DAE.Exp, simCode::SimulationCode.SIM_CODE;
-                                     varPrefix::String = "", varSuffix::String = "", derSymbol::Bool = false)::Vector{Any}
-  (arg isa DAE.ASUB && arg.exp isa DAE.CREF) || return Any[]
-  local elemTy = arg.exp.ty
-  local nDims = 0
-  while elemTy isa DAE.T_ARRAY
-    nDims += length(collect(elemTy.dims))
-    elemTy = elemTy.ty
-  end
-  (elemTy isa DAE.T_COMPLEX && elemTy.complexClassType isa DAE.ClassInf.RECORD) || return Any[]
-  local subs = collect(arg.sub)
-  #= the base's type is the array's, or the element's (toSimExp of a subscripted cref types
-     the base by its identifier's type) =#
-  (nDims == 0 || length(subs) == nDims) || return Any[]
-  local base = SimulationCode.string(arg.exp.componentRef)
-  occursin('[', base) && return Any[]
-  #= an ASUB's subscripts: expressions, or INDEX subscripts (a slice is not an element) =#
-  local idx = Any[]
-  for sub in subs
-    local e = sub isa DAE.INDEX ? sub.exp : sub
-    (e isa DAE.Exp && !(e isa DAE.RANGE || e isa DAE.ARRAY)) || return Any[]
-    push!(idx, expToJuliaExpMTK(e, simCode; varPrefix, varSuffix, derSymbol))
-  end
-  return Any[Expr(:ref, Symbol(base * COMPONENT_SEPARATOR * f.name), idx...) for f in elemTy.varLst]
-end
-
-function _modelicaFunctionCallArgs(expLst,
-                                   simCode,
-                                   hashTable;
-                                   varPrefix = "",
-                                   varSuffix = "",
-                                   derSymbol = false)
-  local args::Vector{Any} = Any[]
-  for arg in expLst
-    local flattenedArgs::Vector{Symbol} = flattenRecordCallArg(arg, simCode, hashTable;
-                                                               varPrefix = varPrefix,
-                                                               varSuffix = varSuffix)
-    if !isempty(flattenedArgs)
-      append!(args, flattenedArgs)
-      continue
-    end
-    local elementFields = _recordArrayElementCallArgs(arg, simCode; varPrefix, varSuffix, derSymbol)
-    if !isempty(elementFields)
-      append!(args, elementFields)
-      continue
-    end
-
-    local extracts = _expandComplexReturnArg(arg, simCode, hashTable;
-                                             varPrefix = varPrefix,
-                                             varSuffix = varSuffix,
-                                             derSymbol = derSymbol)
-    if extracts !== nothing
-      append!(args, extracts)
-      continue
-    end
-
-    push!(args, expToJuliaExpMTK(arg, simCode;
-                                 varPrefix = varPrefix,
-                                 varSuffix = varSuffix,
-                                 derSymbol = derSymbol))
-  end
-  return args
-end
-
-function subscriptsToExpr(subscripts, simCode; varPrefix="", varSuffix="", derSymbol=:der)
-  local exprs = map(subscripts) do sub
-    @match sub begin
-      DAE.INDEX(DAE.ICONST(i)) => i
-      DAE.ICONST(i) => i
-      DAE.INDEX(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-      DAE.SLICE(idxExp) => expToJuliaExpMTK(idxExp, simCode, varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-      DAE.WHOLEDIM(__) => :(:)
-      _ => Meta.parse(string(sub))  #= Fallback for unknown subscript types =#
-    end
-  end
-  if length(exprs) == 1
-    return first(exprs)
-  else
-    return Expr(:tuple, exprs...)
-  end
-end
-
-function evalDAE_Expression(expr, simCode; keepTunable::Bool = false)::Expr
-  local shouldEval = Ref(true)
-  #= Replaces all known bound parameters in the DAE expression. This must be
-     recursive: parameter aliases such as `actualGlobalSeed = globalSeed_seed`
-     otherwise leave a bare `globalSeed_seed` in the generated Julia expression
-     even after `globalSeed_seed` itself has been solved from an initial equation.
-     With `keepTunable`, tunable parameters stay references (_substituteBoundParameters). =#
-  local daeExp = _substituteBoundParameters(expr, simCode; shouldEval=shouldEval, keepTunable=keepTunable)
-  local jlExpr = expToJuliaExpMTK(daeExp, simCode)
-  local evaluatedJLExpr = if shouldEval[]
-    try
-      eval(jlExpr)
-    catch err
-      #= Left unevaluated: it reads a name that is not a constant here. =#
-      OMBackend._fallback(err, :evalDAE_Expression; expect = Union{UndefVarError, MethodError})
-      jlExpr
-    end
-  else
-    jlExpr
-  end
-  return quote $(evaluatedJLExpr) end
-end
-
-#= Whether `exp` reads a tunable parameter (withTunableParameters), directly or
-   through the bindings of the parameters it reads. =#
-function _readsTunableParameter(exp, simCode)::Bool
-  isempty(OMBackend.TUNABLE_PARAMETERS[]) && return false
-  local resolved = _substituteBoundParameters(exp, simCode; keepTunable = true)
-  return any(c -> OMBackend.isTunableParameter(string(c)), Util.getAllCrefs(resolved))
-end
-
-#= `e` with `time` read as 0.0, the start time of the build. =#
-_timeAtBuildStart(@nospecialize(e)) = first(Util.traverseExpBottomUp(e, (x, acc) ->
-  (x isa DAE.CREF && x.componentRef isa DAE.CREF_IDENT && x.componentRef.ident == "time" ? DAE.RCONST(0.0) : x, acc), nothing))
+#= ==================================================================================== =#
+#= Tuple equations                                                                      =#
+#= ==================================================================================== =#
 
 """
-    _tupleEquationTargets(lhs::DAE.Exp, rhs::DAE.Exp) -> Union{Nothing, Vector{Tuple{DAE.Exp, DAE.Exp, DAE.Type}}}
+    _tupleEquationTargets(lhs, rhs)
 
 The targets of a tuple equation `(t1, t2, ...) = f(...)` of a pure call: per variable of the
 left side, (its reference, the call's output or output element it equals, that one's type). A
@@ -2925,19 +1554,19 @@ wildcard has none; an array of references takes the output's elements (MSL
 Blocks.Continuous.Filter: `({r[1], r[2]}, _, _, _) = roots.lowPass(cr, ...)`). `nothing` for
 another left side.
 """
-function _tupleEquationTargets(lhs::DAE.Exp, rhs::DAE.Exp)::Union{Nothing, Vector{Tuple{DAE.Exp, DAE.Exp, DAE.Type}}}
-  (lhs isa DAE.TUPLE && rhs isa DAE.CALL && !rhs.attr.isImpure && rhs.attr.ty isa DAE.T_TUPLE) || return nothing
-  local targets = collect(lhs.PR)
-  local types = collect(rhs.attr.ty.types)
-  length(types) >= length(targets) || return nothing
-  local out = Tuple{DAE.Exp, DAE.Exp, DAE.Type}[]
-  for (k, t) in enumerate(targets)
-    if t isa DAE.CREF
-      t.componentRef isa DAE.WILD || push!(out, (t, DAE.TSUB(rhs, k, types[k]), types[k]))
-    elseif t isa DAE.ARRAY && types[k] isa DAE.T_ARRAY &&
-           all(e -> e isa DAE.CREF && !(e.componentRef isa DAE.WILD), t.array)
-      for (j, e) in enumerate(t.array)
-        push!(out, (e, DAE.ASUB(DAE.TSUB(rhs, k, types[k]), MetaModelica.list(DAE.INDEX(DAE.ICONST(j)))), types[k].ty))
+function _tupleEquationTargets(lhs::SC.Exp, rhs::SC.Exp)::Union{Nothing, Vector{Tuple{SC.EXP_CREF, SC.Exp, SC.SType}}}
+  (lhs isa SC.TUPLE && rhs isa SC.CALL && rhs.kind !== SC.CALL_IMPURE_FUNCTION && rhs.ty isa SC.TYPE_TUPLE) || return nothing
+  local types = rhs.ty.types
+  length(types) >= length(lhs.elements) || return nothing
+  local out = Tuple{SC.EXP_CREF, SC.Exp, SC.SType}[]
+  for (k, t) in enumerate(lhs.elements)
+    if t isa SC.WILD
+      continue
+    elseif t isa SC.EXP_CREF
+      push!(out, (t, SC.TSUB(rhs, k, types[k]), types[k]))
+    elseif t isa SC.ARRAY_EXP && types[k] isa SC.TYPE_ARRAY && all(e -> e isa SC.EXP_CREF, t.elements)
+      for (j, e) in enumerate(t.elements)
+        push!(out, (e, SC.ASUB(SC.TSUB(rhs, k, types[k]), SC.Exp[SC.ICONST(j)]), types[k].elementType))
       end
     else
       return nothing
@@ -2946,77 +1575,75 @@ function _tupleEquationTargets(lhs::DAE.Exp, rhs::DAE.Exp)::Union{Nothing, Vecto
   return out
 end
 
-#= `(p1, p2, ...) = f(...)`, every free parameter of the equation alone on the left and none in
-   the call (Buildings' borehole resistances: `(x, Rgb, Rgg, RCondGro) = internalResistancesOneUTube(...)`,
-   in HexInternalElement with states, in its validations without): each p_k bound to the call's
-   k-th output (or output element: _tupleEquationTargets), its value at the build where the call
-   interprets with the parameters' values, else the output's expression (its symbolic term did
-   not fold with a String argument, the instance name). Not an impure f (one call for each
-   output). =#
-function _bindTupleOfFreeParameters!(lhs::DAE.Exp, rhs::DAE.Exp, freeParams::Vector{String},
-                                     simCode::SimulationCode.SimCode)::Bool
+"""
+`e` with `time` read as 0.0, the start time of the build.
+"""
+_timeAtBuildStart(e::SC.Exp)::SC.Exp =
+  SC.mapExp(x -> (x isa SC.EXP_CREF && x.cref.sym === :time && isempty(x.cref.subs)) ? SC.RCONST(0.0) : x, e)
+
+"""
+`(p1, p2, ...) = f(...)`, every free parameter of the equation alone on the left and none in
+the call (Buildings' borehole resistances: `(x, Rgb, Rgg, RCondGro) =
+internalResistancesOneUTube(...)`, in HexInternalElement with states, in its validations
+without): each p_k bound to the call's k-th output (or output element:
+_tupleEquationTargets), its value at the build where the call interprets with the
+parameters' values, else the output's expression (its symbolic term did not fold with a
+String argument, the instance name). Not an impure f (one call for each output).
+"""
+function _bindTupleOfFreeParameters!(lhs::SC.Exp, rhs::SC.Exp, freeParams::Vector{String}, simCode::SC.SIM_CODE)::Bool
   local targets = _tupleEquationTargets(lhs, rhs)
   targets === nothing && return false
-  local binds = Tuple{String, DAE.Exp, DAE.Type}[(string(t), e, ty) for (t, e, ty) in targets]
+  local binds = Tuple{String, SC.Exp, SC.SType}[(SC.crefName(t.cref), e, ty) for (t, e, ty) in targets]
   local names = String[first(b) for b in binds]
   (!isempty(names) && allunique(names) && issetequal(names, freeParams)) || return false
-  any(c -> string(c) in names, Util.getAllCrefs(rhs)) && return false
+  any(c -> c in names, SC.allCrefNames(rhs)) && return false
   local ht = simCode.stringToSimVarHT
   for (name, element, ty) in binds
     local (idx, sv) = ht[name]
-    local value = ty isa DAE.T_REAL ? SimulationCode.valueAtBuildStart(element, simCode) : nothing
-    local binding = SimulationCode.toSimExp(value === nothing ? element : DAE.RCONST(value))
-    ht[name] = (idx, SimulationCode.SIMVAR(sv.name, sv.index, SimulationCode.PARAMETER(SOME(binding)), sv.attributes))
+    local value = ty isa SC.TYPE_REAL ? SC.valueAtBuildStart(element, simCode) : nothing
+    ht[name] = (idx, SC.withKind(sv, SC.PARAMETER(value === nothing ? element : SC.RCONST(value))))
   end
   return true
 end
 
 """
+The names of the references of `e` (not der() or pre()), in bottom-up order.
+"""
+function _referenceNames(e::SC.Exp)::Vector{String}
+  local out = String[]
+  SC.mapExp(x -> (x isa SC.EXP_CREF && push!(out, SC.crefName(x.cref)); x), e)
+  return out
+end
+
+"""
+Whether `e` reads the variable `name` (of Integer type, with `integer`).
+"""
+_readsName(e::SC.Exp, name::String; integer::Bool = false)::Bool =
+  SC.anyExp(x -> x isa SC.EXP_CREF && SC.crefName(x.cref) == name && (!integer || x.ty isa SC.TYPE_INTEGER), e)
+
+"""
+`name` bound to `binding` in the table (a free parameter the build solved).
+"""
+function _bindParameter!(simCode::SC.SIM_CODE, name::String, binding::SC.Exp)::Nothing
+  local (idx, sv) = simCode.stringToSimVarHT[name]
+  simCode.stringToSimVarHT[name] = (idx, SC.withKind(sv, SC.PARAMETER(binding)))
+  return nothing
+end
+
+"""
     solveParametricInitialEquations!(simCode)
 
-For initial equations that only involve parameters (no states/algebraics),
-solve numerically for parameters with `fixed=false` (no binding).
-Updates the simCode hash table with the solved binding values.
+The initial equations that only involve parameters (no states or algebraic variables) solved
+numerically for their free parameters (`fixed = false`, no binding): the table bound to the
+solved values, to a fixed point (each pass may bind a free parameter another equation reads;
+at most one pass per equation finishes a chain in the worst order), then the coupled ones
+(`_solveCoupledParametricInitialEquations!`). At the build the start time is 0 (`t0 = time`,
+MSL Blocks.Math.Mean; simulateFromBuild refuses another start time for such a model,
+_startTimeGuard).
 """
-function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
-  ht = simCode.stringToSimVarHT
-  local function containsCref(exp, name::String)::Bool
-    local found = Ref(false)
-    function visit(e, acc)
-      if !found[] && Util.isCref(e) && string(e) == name
-        found[] = true
-      end
-      (e, true, acc)
-    end
-    Util.traverseExpBottomUp(exp, visit, 0)
-    return found[]
-  end
-  local function containsIntegerCref(exp, name::String)::Bool
-    local found = Ref(false)
-    function visit(e, acc)
-      if !found[] && Util.isCref(e) && string(e) == name
-        @match e begin
-          DAE.CREF(_, DAE.T_INTEGER(__)) => begin
-            found[] = true
-            nothing
-          end
-          _ => nothing
-        end
-      end
-      (e, true, acc)
-    end
-    Util.traverseExpBottomUp(exp, visit, 0)
-    return found[]
-  end
-  local function solvedValueExp(x, asInteger::Bool)
-    if asInteger && isfinite(x)
-      return DAE.ICONST(Int(round(x)))
-    end
-    return DAE.RCONST(x)
-  end
-  #= Iterate to fixed-point: each pass may bind a free parameter that another
-     equation depends on. Cap iterations to (length+1) so a chain of N equations
-     finishes even with the worst-case ordering. =#
+function solveParametricInitialEquations!(simCode::SC.SIM_CODE)::Nothing
+  local ht = simCode.stringToSimVarHT
+  local solvedValueExp = (x::Float64, asInteger::Bool) -> asInteger && isfinite(x) ? SC.ICONST(Int(round(x))) : SC.RCONST(x)
   local nEq = length(simCode.initialEquations)
   local solvedThisPass = true
   local pass = 0
@@ -3024,214 +1651,148 @@ function solveParametricInitialEquations!(simCode::SimulationCode.SimCode)
     solvedThisPass = false
     pass += 1
     local solvedNames = String[]
-  for ieq in simCode.initialEquations
-    if !isParametricOnlyEquation(ieq, simCode)
-      continue
-    end
-    #= Find free parameters (no binding) in this equation =#
-    freeParams = String[]
-    function findFree(exp, acc)
-      if Util.isCref(exp)
-        local key = string(exp)
-        local entry = get(ht, key, nothing)
-        if entry !== nothing
-          local sv = last(entry)
-          if !SimulationCode.hasBindingExp(sv) && SimulationCode.isParameter(sv)
-            push!(freeParams, key)
-          end
-        end
-      end
-      (exp, true, acc)
-    end
-    #= At the build the start time is 0 (`t0 = time`, MSL Blocks.Math.Mean;
-       simulateFromBuild refuses another start time for such a model,
-       _startTimeGuard): `time` could not be evaluated, and the parameter kept
-       its start value. =#
-    local ieqLhs, ieqRhs = map(_timeAtBuildStart, equationSides(ieq))
-    Util.traverseExpBottomUp(ieqLhs, findFree, 0)
-    Util.traverseExpBottomUp(ieqRhs, findFree, 0)
-    unique!(freeParams)
-    if _bindTupleOfFreeParameters!(ieqLhs, ieqRhs, freeParams, simCode)
-      append!(solvedNames, freeParams)
-      solvedThisPass = true
-      continue
-    end
-    if length(freeParams) != 1
-      continue
-    end
-    freeName = freeParams[1]
-    #= A tunable parameter is set at run time: solved here, the free one kept
-       its compiled value in every run (`q = 2 * p`). Alone on a side it is
-       bound to the other side (`p = q`, `2 * p = q`), and follows p as a
-       bound parameter does; otherwise it stays unbound and the
-       initialization computes it for the run's values (`q * q = p`). As an
-       unbound parameter alone on the right it was assigned nowhere: q = 0. =#
-    if any(side -> _readsTunableParameter(side, simCode), (ieqLhs, ieqRhs))
-      local isFree = e -> e isa DAE.CREF && string(e) == freeName
-      local other = isFree(ieqLhs) ? ieqRhs : isFree(ieqRhs) ? ieqLhs : nothing
-      if other !== nothing && !containsCref(other, freeName)
-        local (idx, oldSV) = ht[freeName]
-        ht[freeName] = (idx, SimulationCode.SIMVAR(oldSV.name, oldSV.index,
-                                                   SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(other))), oldSV.attributes))
-        push!(solvedNames, freeName)
+    for ieq in simCode.initialEquations
+      isParametricOnlyEquation(ieq, simCode) || continue
+      local (ieqLhs, ieqRhs) = map(_timeAtBuildStart, equationSides(ieq))
+      local freeParams = unique(String[n for side in (ieqLhs, ieqRhs) for n in _referenceNames(side)
+                                       if (local entry = get(ht, n, nothing); entry !== nothing &&
+                                           SC.isParameter(last(entry)) && !SC.hasBindingExp(last(entry)))])
+      if _bindTupleOfFreeParameters!(ieqLhs, ieqRhs, freeParams, simCode)
+        append!(solvedNames, freeParams)
         solvedThisPass = true
-      end
-      continue
-    end
-    #= Get initial guess from start attribute =#
-    local (_, freeSV) = ht[freeName]
-    local guess = something(_startNumber(freeSV, simCode), 0.1)
-    #= Build residual: LHS - RHS = 0.
-       Replace all bound params recursively, leave the free param as the scalar
-       Newton variable. This handles alias chains like
-       actualGlobalSeed = globalSeed_seed, where globalSeed_seed was solved by
-       an earlier initial equation in the same fixed-point loop. =#
-    local skipFree = OrderedSet{String}([freeName])
-    local lhsEvalOk = Ref(true)
-    local rhsEvalOk = Ref(true)
-    local lhsSubst = _substituteBoundParameters(ieqLhs, simCode;
-                                                skipNames=skipFree,
-                                                shouldEval=lhsEvalOk)
-    local rhsSubst = _substituteBoundParameters(ieqRhs, simCode;
-                                                skipNames=skipFree,
-                                                shouldEval=rhsEvalOk)
-    #= If the free parameter sits on the LHS (e.g. `globalSeed_seed = automaticGlobalSeed(0.0)`),
-       swap the sides so eval(lhsJl) is on the constants side and the freeName lives in the
-       residual function we Newton-solve. Without this swap eval(lhsJl) tries to evaluate the
-       bare freeName cref and trips an UndefVarError. =#
-    if containsCref(lhsSubst, freeName) && !containsCref(rhsSubst, freeName)
-      lhsSubst, rhsSubst = rhsSubst, lhsSubst
-      lhsEvalOk, rhsEvalOk = rhsEvalOk, lhsEvalOk
-    end
-    local freeIsInteger = containsIntegerCref(ieqLhs, freeName) || containsIntegerCref(ieqRhs, freeName)
-    #= Defer if substitution left an unresolved CREF; the fixed-point loop will retry. =#
-    if !lhsEvalOk[]
-      continue
-    end
-    #= Interpreted first: it calls the model's functions, which the generated code does not
-       have yet (CDL's TimeTable: t0 = round(integer(time/timeRange)*timeRange, 6), read by
-       its table's startTime at module level). =#
-    local lhsVal = SimulationCode.valueAtBuildStart(lhsSubst, simCode)
-    if lhsVal === nothing
-      local lhsJl = expToJuliaExpMTK(lhsSubst, simCode)
-      lhsVal = try
-        local raw = eval(lhsJl)
-        raw isa Symbolics.Num ? Float64(Symbolics.unwrap(raw)) : Float64(raw)
-      catch err
-        OMBackend._fallback(err, :parametricInitLhs; expect = Union{UndefVarError, MethodError}, impact = :result)
-        @warn "[SIMCODE: solveParametricInitialEquations] could not evaluate LHS" freeName err
         continue
       end
-    end
-    #= Common case: a free parameter aliases a bound parameter/literal directly,
-       e.g. `globalSeed_seed = globalSeed_fixedSeed`. Avoid Newton here; it
-       may keep the start guess if the generated residual fails to depend on the
-       argument due to world-age/module binding subtleties. =#
-    if containsCref(rhsSubst, freeName) && rhsSubst isa DAE.CREF
-      local (idx, oldSV) = ht[freeName]
-      local newSV = SimulationCode.SIMVAR(oldSV.name, oldSV.index,
-        SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(solvedValueExp(lhsVal, freeIsInteger)))), oldSV.attributes)
-      ht[freeName] = (idx, newSV)
+      length(freeParams) == 1 || continue
+      local freeName = only(freeParams)
+      #= A tunable parameter is set at run time: solved here, the free one kept its compiled
+         value in every run (`q = 2 * p`). Alone on a side it is bound to the other side (`p =
+         q`, `2 * p = q`), and follows p as a bound parameter does; otherwise it stays unbound
+         and the initialization computes it for the run's values (`q * q = p`). As an unbound
+         parameter alone on the right it was assigned nowhere: q = 0. =#
+      if any(side -> _readsTunableParameter(side, simCode), (ieqLhs, ieqRhs))
+        local isFree = e::SC.Exp -> e isa SC.EXP_CREF && SC.crefName(e.cref) == freeName
+        local other = isFree(ieqLhs) ? ieqRhs : isFree(ieqRhs) ? ieqLhs : nothing
+        if other !== nothing && !_readsName(other, freeName)
+          _bindParameter!(simCode, freeName, other)
+          push!(solvedNames, freeName)
+          solvedThisPass = true
+        end
+        continue
+      end
+      local guess = something(_startNumber(last(ht[freeName]), simCode), 0.1)
+      #= The residual LHS - RHS = 0, the bound parameters replaced recursively (an alias chain
+         actualGlobalSeed = globalSeed_seed, globalSeed_seed solved by an earlier initial
+         equation of the fixed point), the free parameter the scalar Newton variable. =#
+      local skipFree = OrderedSet{String}([freeName])
+      local lhsEvalOk = Ref(true)
+      local rhsEvalOk = Ref(true)
+      local lhsSubst = _substituteBoundParameters(ieqLhs, simCode; skipNames = skipFree, shouldEval = lhsEvalOk)
+      local rhsSubst = _substituteBoundParameters(ieqRhs, simCode; skipNames = skipFree, shouldEval = rhsEvalOk)
+      #= The free parameter on the left (`globalSeed_seed = automaticGlobalSeed(0.0)`): the
+         sides swapped, so the left is the constants' side (evaluating the bare free name was an
+         UndefVarError). =#
+      if _readsName(lhsSubst, freeName) && !_readsName(rhsSubst, freeName)
+        (lhsSubst, rhsSubst) = (rhsSubst, lhsSubst)
+        (lhsEvalOk, rhsEvalOk) = (rhsEvalOk, lhsEvalOk)
+      end
+      local freeIsInteger = _readsName(ieqLhs, freeName; integer = true) || _readsName(ieqRhs, freeName; integer = true)
+      #= A reference substitution left unresolved: the fixed point tries again. =#
+      lhsEvalOk[] || continue
+      #= Interpreted first: it calls the model's functions, which the generated code does not
+         have yet (CDL's TimeTable: t0 = round(integer(time/timeRange)*timeRange, 6), read by
+         its table's startTime at module level). =#
+      local lhsVal = SC.valueAtBuildStart(lhsSubst, simCode)
+      if lhsVal === nothing
+        lhsVal = try
+          local raw = eval(expToJuliaExpMTK(lhsSubst, simCode))
+          raw isa Symbolics.Num ? Float64(Symbolics.unwrap(raw)) : Float64(raw)
+        catch err
+          OMBackend._fallback(err, :parametricInitLhs; expect = Union{UndefVarError, MethodError}, impact = :result)
+          @warn "[SIMCODE: solveParametricInitialEquations] could not evaluate LHS" freeName err
+          continue
+        end
+      end
+      #= A free parameter that aliases a bound parameter or a literal (`globalSeed_seed =
+         globalSeed_fixedSeed`): no Newton (it may keep the start guess where the generated
+         residual does not depend on its argument: world age, module bindings). =#
+      if rhsSubst isa SC.EXP_CREF && _readsName(rhsSubst, freeName)
+        _bindParameter!(simCode, freeName, solvedValueExp(lhsVal, freeIsInteger))
+        push!(solvedNames, freeName)
+        solvedThisPass = true
+        continue
+      end
+      rhsEvalOk[] || continue
+      local freeSymbol = Symbol(freeName)
+      local rhsJl = expToJuliaExpMTK(rhsSubst, simCode)
+      #= f(x) = lhsVal - rhs(x) =#
+      local residualFn = try
+        eval(Expr(:->, freeSymbol, Expr(:call, :-, lhsVal, rhsJl)))
+      catch e
+        OMBackend._fallback(e, :parametricInitResidual; expect = Union{UndefVarError, MethodError}, impact = :result)
+        @warn "[SIMCODE: solveParametricInitialEquations] could not build residual" freeName e
+        continue
+      end
+      #= Newton-Raphson (invokelatest: world age). A call of the residual can throw where the
+         right side reads a parameter whose binding the frontend could not fold (neither a value
+         nor the free one: an UndefVarError); without the catch the translation was aborted. =#
+      local x = guess
+      local newtonOk = true
+      local lastStep = Inf
+      try
+        for _ in 1:100
+          local fx = Base.invokelatest(residualFn, x)
+          abs(fx) < 1e-10 && break
+          local h = max(abs(x) * 1e-8, 1e-12)
+          local dfx = (Base.invokelatest(residualFn, x + h) - Base.invokelatest(residualFn, x - h)) / (2h)
+          abs(dfx) < 1e-15 && break
+          lastStep = fx / dfx
+          x -= lastStep
+        end
+      catch err
+        OMBackend._fallback(err, :parametricInitNewton; expect = Union{UndefVarError, MethodError}, impact = :result)
+        @warn "[SIMCODE: solveParametricInitialEquations] residual call threw, skipping" freeName err
+        newtonOk = false
+      end
+      #= Converged: a small residual, or a small last step (the rounding of `0 = 1e9*G - 2e9` is
+         about 4e-7). Otherwise the parameter stays unbound, for the initialization
+         (generateInitialEquationsAsConstraints takes an equation reading one). =#
+      newtonOk = newtonOk && let fx = try Base.invokelatest(residualFn, x) catch; NaN end
+        isfinite(x) && isfinite(fx) &&
+          (abs(fx) <= 1e-8 * max(1.0, abs(lhsVal)) || abs(lastStep) <= 1e-10 * max(1.0, abs(x)))
+      end
+      newtonOk || continue
+      @debug "[SIMCODE: solveParametricInitialEquations] solved $freeName = $x (from initial equation)"
+      _bindParameter!(simCode, freeName, solvedValueExp(x, freeIsInteger))
       push!(solvedNames, freeName)
       solvedThisPass = true
-      continue
     end
-    if !rhsEvalOk[]
-      continue
-    end
-    local freeSymbol = Symbol(freeName)
-    local rhsJl = expToJuliaExpMTK(rhsSubst, simCode)
-    #= Create residual function: f(x) = lhsVal - rhs(x) =#
-    local residualFn = try
-      eval(Expr(:->, freeSymbol, Expr(:call, :-, lhsVal, rhsJl)))
-    catch e
-      OMBackend._fallback(e, :parametricInitResidual; expect = Union{UndefVarError, MethodError}, impact = :result)
-      @warn "[SIMCODE: solveParametricInitialEquations] could not build residual" freeName e
-      continue
-    end
-    #= Newton-Raphson solver (use invokelatest to avoid world-age issues).
-       Wrapped in try/catch because rhsJl may reference parameters that have
-       a binding the front-end could not fold (so they are not in paramValues
-       and not freeName either). Invoking residualFn on such an expression
-       throws UndefVarError; without this catch the exception propagates out
-       of solveParametricInitialEquations and aborts translate. =#
-    local x = guess
-    local eps = 1e-10
-    local maxIter = 100
-    local newtonOk = true
-    local lastStep = Inf
-    try
-      for _ in 1:maxIter
-        local fx = Base.invokelatest(residualFn, x)
-        if abs(fx) < eps
-          break
-        end
-        local h = max(abs(x) * 1e-8, 1e-12)
-        local dfx = (Base.invokelatest(residualFn, x + h) - Base.invokelatest(residualFn, x - h)) / (2h)
-        if abs(dfx) < 1e-15
-          break
-        end
-        lastStep = fx / dfx
-        x -= lastStep
-      end
-    catch err
-      OMBackend._fallback(err, :parametricInitNewton; expect = Union{UndefVarError, MethodError}, impact = :result)
-      @warn "[SIMCODE: solveParametricInitialEquations] residual call threw, skipping" freeName err
-      newtonOk = false
-    end
-    #= Converged: a small residual, or a small last step (the rounding of
-       `0 = 1e9*G - 2e9` is about 4e-7). Otherwise the parameter stays unbound,
-       for the initialization (generateInitialEquationsAsConstraints takes an
-       equation reading one). =#
-    newtonOk = newtonOk && let fx = try Base.invokelatest(residualFn, x) catch; NaN end
-      isfinite(x) && isfinite(fx) &&
-        (abs(fx) <= 1e-8 * max(1.0, abs(lhsVal)) || abs(lastStep) <= 1e-10 * max(1.0, abs(x)))
-    end
-    if !newtonOk
-      continue
-    end
-    @debug "[SIMCODE: solveParametricInitialEquations] solved $freeName = $x (from initial equation)"
-    #= Update the simCode hash table with the solved value =#
-    local (idx, oldSV) = ht[freeName]
-    local newSV = SimulationCode.SIMVAR(oldSV.name, oldSV.index,
-      SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(solvedValueExp(x, freeIsInteger)))), oldSV.attributes)
-    ht[freeName] = (idx, newSV)
-    push!(solvedNames, freeName)
-    solvedThisPass = true
+    isempty(solvedNames) ||
+      @debug "[SIMCODE: solveParametricInitialEquations] pass $pass solved $(length(solvedNames)) parameter(s)" solvedNames
   end
-  if pass == 1 && !isempty(solvedNames)
-    @debug "[SIMCODE: solveParametricInitialEquations] pass $pass solved $(length(solvedNames)) parameter(s)" solvedNames
-  elseif !isempty(solvedNames)
-    @debug "[SIMCODE: solveParametricInitialEquations] pass $pass solved $(length(solvedNames)) more parameter(s)" solvedNames
-  end
-  end #= while fixed-point =#
   _solveCoupledParametricInitialEquations!(simCode)
+  return nothing
 end
 
-#= The parametric initial equations left, of several free parameters each, solved together
-   where they are as many as their free parameters (MSL 4 SMPM_ResistiveBraking: the
-   steady-state currents idq_sr from two coupled equations; one at a time they were not
-   solved, and the free parameters kept their start values, 0). Not where one reads a
-   tunable parameter (its run's value is not known here) or the solve does not converge:
-   those stay unbound, as before. =#
-function _solveCoupledParametricInitialEquations!(simCode::SimulationCode.SimCode)
+"""
+The parametric initial equations left, of several free parameters each, solved together
+where they are as many as their free parameters (MSL 4 SMPM_ResistiveBraking: the
+steady-state currents idq_sr from two coupled equations; one at a time they were not
+solved, and the free parameters kept their start values, 0). Not where one reads a tunable
+parameter (its run's value is not known here) or the solve does not converge: those stay
+unbound, as before.
+"""
+function _solveCoupledParametricInitialEquations!(simCode::SC.SIM_CODE)::Nothing
   local ht = simCode.stringToSimVarHT
-  local isFreeParam = key -> begin
+  local isFreeParam = key::String -> begin
     local entry = get(ht, key, nothing)
-    entry !== nothing && SimulationCode.isParameter(last(entry)) && !SimulationCode.hasBindingExp(last(entry))
+    entry !== nothing && SC.isParameter(last(entry)) && !SC.hasBindingExp(last(entry))
   end
-  local sides = Tuple{DAE.Exp, DAE.Exp}[]
+  local sides = Tuple{SC.Exp, SC.Exp}[]
   local free = OrderedSet{String}()
   for ieq in simCode.initialEquations
     isParametricOnlyEquation(ieq, simCode) || continue
     local (lhs, rhs) = map(_timeAtBuildStart, equationSides(ieq))
-    local names = OrderedSet{String}()
-    for side in (lhs, rhs)
-      Util.traverseExpBottomUp(side, (e, acc) -> begin
-        Util.isCref(e) && isFreeParam(string(e)) && push!(names, string(e))
-        (e, true, acc)
-      end, 0)
-    end
+    local names = OrderedSet{String}(n for side in (lhs, rhs) for n in _referenceNames(side) if isFreeParam(n))
     length(names) >= 2 || continue
     any(side -> _readsTunableParameter(side, simCode), (lhs, rhs)) && return nothing
     push!(sides, (lhs, rhs)); union!(free, names)
@@ -3280,66 +1841,54 @@ function _solveCoupledParametricInitialEquations!(simCode::SimulationCode.SimCod
     return nothing
   end
   converged || return nothing
-  for (k, name) in enumerate(names)
-    local (idx, oldSV) = ht[name]
-    ht[name] = (idx, SimulationCode.SIMVAR(oldSV.name, oldSV.index,
-                                           SimulationCode.PARAMETER(SOME(SimulationCode.toSimExp(DAE.RCONST(x[k])))), oldSV.attributes))
-  end
+  foreach(((k, name),) -> _bindParameter!(simCode, name, SC.RCONST(x[k])), enumerate(names))
   @debug "[SIMCODE: solveParametricInitialEquations] solved $(n) coupled free parameters" names x
   return nothing
 end
 
-#= True when every variable reference in `condition` is a DISCRETE simvar, a
-   PARAMETER, or a constant (no STATE / ALG_VARIABLE / `time`). For such conditions
-   the if-expression can gate directly on the held discrete value; the discrete's
-   own update event localises the switch, so no ifCond relay is needed. =#
-function _ifConditionAllDiscreteOrParameter(@nospecialize(condition), simCode)::Bool
-  #= initial() is true during the initialization only: a condition with it is
-     a relation (its crossing function a constant of either sign), not a gate
-     on the runtime value, where initial() is false (MSL LimIntegrator's
-     `initial() and not limitsAtInit` never held). =#
+#= ==================================================================================== =#
+#= If-equations                                                                         =#
+#= ==================================================================================== =#
+
+"""
+True when every variable reference in `condition` is a DISCRETE simvar or a PARAMETER (no
+STATE / ALG_VARIABLE / `time`): the if-expression gates directly on the held value, the
+discrete's own update event localises the switch, so no ifCond relay is needed. A condition
+with initial() is a relation (its crossing function a constant of either sign), not a gate
+on the runtime value, where initial() is false (MSL LimIntegrator's `initial() and not
+limitsAtInit` never held).
+"""
+function _ifConditionAllDiscreteOrParameter(condition::SC.Exp, simCode::SC.SIM_CODE)::Bool
   _hasInitialCall(condition) && return false
-  local refs::OrderedSet{String} = OrderedSet{String}()
-  SimulationCode.collectCrefNames!(refs, condition)
+  local refs = SC.crefNames!(OrderedSet{String}(), condition)
   isempty(refs) && return false
   local ht = simCode.stringToSimVarHT
   for name in refs
     name == "time" && return false
     local entry = get(ht, name, nothing)
     entry === nothing && return false
-    local kind = entry[2].varKind
-    if !(kind isa SimulationCode.DISCRETE || kind isa SimulationCode.PARAMETER)
-      return false
-    end
+    last(entry).varKind isa Union{SC.DISCRETE, SC.PARAMETER} || return false
   end
   return true
 end
 
-function _hasInitialCall(@nospecialize(condition))::Bool
-  local d = condition isa SimulationCode.Exp ? SimulationCode.toDAEExp(condition) : condition
-  local found = Ref(false)
-  Util.traverseExpBottomUp(d, (x, acc) -> begin
-    x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name == "initial" && (found[] = true)
-    (x, true, acc)
-  end, 0)
-  return found[]
+_hasInitialCall(condition::SC.Exp)::Bool = SC.anyExp(x -> SC.isBuiltin(x, :initial), condition)
+
+"""
+True when every non-else branch condition of an if-equation is discrete/parameter, so the
+residual gates directly on the boolean condition instead of emitting a continuous ifCond
+relay callback.
+"""
+function _allBranchConditionsDiscrete(branches::AbstractVector{<:SC.BRANCH}, simCode::SC.SIM_CODE)::Bool
+  return all(b -> b.targets == -1 || _ifConditionAllDiscreteOrParameter(b.condition, simCode), branches)
 end
 
-"True when every non-else branch condition of an if-equation is discrete/parameter,
- so the residual gates directly on the boolean condition instead of emitting a
- continuous ifCond relay callback."
-function _allBranchConditionsDiscrete(branches, simCode)::Bool
-  for b in branches
-    b.targets == -1 && continue
-    _ifConditionAllDiscreteOrParameter(b.condition, simCode) || return false
-  end
-  return true
-end
-
-#= Residuals pair across branches by the variable their causalized form
-   defines, with the positional index only as a fallback: source-order
-   differences between sibling branches (hoisted nested ifs, lifted
-   if-expressions) make pure positional pairing relay the wrong variable. =#
+"""
+Residuals pair across branches by the variable their causalized form defines, with the
+positional index only as a fallback: source-order differences between sibling branches
+(hoisted nested ifs, lifted if-expressions) made pure positional pairing relay the wrong
+variable.
+"""
 function _causalLhsKey(@nospecialize(lhsExpr))::String
   local e = lhsExpr isa Expr ? Base.remove_linenums!(copy(lhsExpr)) : lhsExpr
   while e isa Expr && e.head === :block && length(e.args) == 1
@@ -3348,209 +1897,192 @@ function _causalLhsKey(@nospecialize(lhsExpr))::String
   return string(e)
 end
 
-function _branchResidualForLhs(branch, lhsKey::String, fallbackIdx::Int, simCode)
+function _branchResidualForLhs(branch::SC.BRANCH, lhsKey::String, fallbackIdx::Int, simCode::SC.SIM_CODE)::SC.RESIDUAL_EQUATION
   for r in branch.residualEquations
-    if _causalLhsKey(last(deCausalize(r, simCode))) == lhsKey
-      return r
-    end
+    _causalLhsKey(last(deCausalize(r, simCode))) == lhsKey && return r
   end
   return branch.residualEquations[min(fallbackIdx, length(branch.residualEquations))]
 end
 
 """
-  Generates an if-expression equation and add it to the continuous part of the system.
-Assume single equations in each if-branch for now.
-An assertion error should have been thrown earlier before reaching this function.
+    generateIfExpressions(branches, target, resEqIdx, identifier, simCode; subIdentifier = 1,
+                          lhsKey = nothing, residualForm = false)
 
-The sub identifier is used to for the different branches of a single if-equation.
-Hence for the model:
+The value of an if-equation's residual `resEqIdx` as nested `ifelse` over its branches from
+`target`: per branch its right-hand side (causal form; its residual with `residualForm`, where
+the branches define different variables), gated by the branch's condition where every
+condition is discrete or a parameter (its own update event localises the step: no relay, and
+no start value of a relay that picks the wrong branch), else by its `ifCond` relay parameter
+(`ifCond<identifier><subIdentifier> == 1`: a discrete parameter the solver never perturbs).
+For
 
 ```modelica
-model IfEquationDer
-  parameter Real u = 4;
-  parameter Real uMax = 10;
-  parameter Real uMin = 2;
-  Real y;
-equation
-  if uMax < time then
-    der(y) = uMax;
-  elseif uMin < time then
-    der(y) = uMin;
-  else
-    der(y) = u;
-  end if;
-end IfEquationDer;
+if uMax < time then der(y) = uMax; elseif uMin < time then der(y) = uMin; else der(y) = u; end if;
 ```
 
-The if expression:
-```
-D(y) ~ ifelse(ifCond11 == true, uMin, ifelse(ifCond12 == true, uMax, u))
-```
-will be generated along with variables for the sub branches.
-
+`D(y) ~ ifelse(ifCond11 == 1, uMax, ifelse(ifCond12 == 1, uMin, u))`.
 """
-function generateIfExpressions(branches,
-                               target::Int,
-                               resEqIdx::Int,
-                               identifier::Int,
-                               simCode;
-                               subIdentifier::Int = 1,
-                               lhsKey::Union{String, Nothing} = nothing,
-                               residualForm::Bool = false)
+function generateIfExpressions(branches::AbstractVector{<:SC.BRANCH}, target::Int, resEqIdx::Int, identifier::Int,
+                               simCode::SC.SIM_CODE; subIdentifier::Int = 1,
+                               lhsKey::Union{String, Nothing} = nothing, residualForm::Bool = false)
   local branch = branches[target]
   local selEq = (lhsKey === nothing || residualForm) ?
                 branch.residualEquations[min(resEqIdx, length(branch.residualEquations))] :
                 _branchResidualForLhs(branch, lhsKey, resEqIdx, simCode)
-  #= The branch's value: its right-hand side (causal form), or its residual
-     when the branches define different variables. =#
   local value = _guardNonIntegerPowerBasesForEagerBranch(
-    residualForm ? expToJuliaExpMTK(SimulationCode.toDAEExp(selEq.exp), simCode) :
-                   first(deCausalize(selEq, simCode)))
-  if branch.targets == -1
-    return :($(value))
-  end
-  #= When every branch condition is discrete/parameter (e.g. an event-held Boolean),
-     gate directly on the condition value: its own update event localises the step,
-     so no `ifCond` relay parameter or continuous callback is needed (and the relay's
-     start-attribute initial value, which can pick the wrong branch, is avoided). =#
-  local cond = if _ifConditionAllDiscreteOrParameter(branch.condition, simCode)
-    #= Per branch: an elseif chain may mix a discrete condition (changed by a
-       when, never a crossing of its own) with relations. =#
-    :( $(expToJuliaExpMTK(SimulationCode.toDAEExp(branch.condition), simCode)) > 0.5 )
-  else
-    #= ifCond variables are discrete parameters (not ODE unknowns), so the solver
-       never perturbs them during Jacobian computation. Exact comparison is safe. =#
-    :( $(Symbol(string("ifCond", identifier, subIdentifier))) == 1 )
-  end
+    residualForm ? expToJuliaExpMTK(selEq.exp, simCode) : first(deCausalize(selEq, simCode)))
+  branch.targets == -1 && return :($(value))
+  local cond = _ifConditionAllDiscreteOrParameter(branch.condition, simCode) ?
+    :($(expToJuliaExpMTK(branch.condition, simCode)) > 0.5) :
+    :($(Symbol(string("ifCond", identifier, subIdentifier))) == 1)
   quote
     ModelingToolkit.ifelse($(cond),
                            $(value),
-                           $(generateIfExpressions(branches,
-                                                   branches[target].targets,
-                                                   resEqIdx,
-                                                   identifier,
-                                                   simCode;
-                                                   subIdentifier = subIdentifier + 1,
-                                                   lhsKey = lhsKey,
-                                                   residualForm = residualForm)))
+                           $(generateIfExpressions(branches, branch.targets, resEqIdx, identifier, simCode;
+                                                   subIdentifier = subIdentifier + 1, lhsKey, residualForm)))
   end
 end
 
-#= TODO.
-  We currently assume residuals that we have made causal
-  and that the original equations are written in a certain form.
-=#
-function deCausalize(eq, simCode)
-  local expDAE = SimulationCode.toDAEExp(eq.exp)
-  @match expDAE begin
-    DAE.BINARY(DAE.RCONST(0.0), _, exp2) => begin
-      (:($(expToJuliaExpMTK(exp2, simCode))), :($(expToJuliaExpMTK(expDAE.exp1, simCode))))
-    end
-    DAE.BINARY(exp1, _, DAE.RCONST(0.0)) => begin
-      (:($(expToJuliaExpMTK(expDAE.exp2, simCode))), :($(expToJuliaExpMTK(exp1, simCode))))
-    end
-    DAE.BINARY(exp1, _, exp2) => begin
-      (:($(expToJuliaExpMTK(exp2, simCode))), :($(expToJuliaExpMTK(exp1, simCode))))
-    end
-    _ => begin
-      OMBackend.unsupported("equation", eq)
-    end
-  end
+"""
+    deCausalize(eq, simCode)
+
+The sides of a residual `a - b` (or `a + b`, ...) as `(b, a)`: the value and the variable of
+the causal form the code generation gave the residuals of if-equations' branches. TODO: this
+assumes residuals in that form.
+"""
+function deCausalize(eq::SC.RESIDUAL_EQUATION, simCode::SC.SIM_CODE)::Tuple{Any, Any}
+  local e = eq.exp
+  e isa SC.BINARY || OMBackend.unsupported("equation", eq)
+  return (expToJuliaExpMTK(e.exp2, simCode), expToJuliaExpMTK(e.exp1, simCode))
 end
 
-#= If `arg` is a Complex-returning expression (CALL with T_COMPLEX return,
-   or RECORD constructor), produce a Vector{Expr} of per-field scalar extracts
-   suitable for splicing into an enclosing call's argument list. Returns
-   `nothing` for anything else so callers can fall back to the default path.
+#= ==================================================================================== =#
+#= Eager branches                                                                       =#
+#= ==================================================================================== =#
 
-   For a CALL whose return is T_COMPLEX(varLst=[re, im]), this emits
-   `tupleElementCall(:funcName, k, ...inner-scalar-args...)` for k = 1..nFields.
-   For a RECORD literal it just splices the field expressions. =#
-function _expandComplexReturnArg(arg::DAE.Exp, simCode, hashTable;
-                                  varPrefix::String="", varSuffix::String="",
-                                  derSymbol::Bool=false)
-  @match arg begin
-    DAE.CALL(path, innerExpLst, DAE.CALL_ATTR(ty=DAE.T_COMPLEX(varLst=varLst))) => begin
-      local nFields = length(collect(varLst))
-      nFields >= 2 || return nothing
-      local fnName = Symbol(string(path))
-      local fnQuote = QuoteNode(fnName)
-      local innerArgs = Any[]
-      for inner in innerExpLst
-        local flat = flattenRecordCallArg(inner, simCode, hashTable; varPrefix=varPrefix, varSuffix=varSuffix)
-        if !isempty(flat)
-          append!(innerArgs, flat)
-          continue
+function _singleBlockPayload(@nospecialize(e))
+  while e isa Expr && e.head === :block
+    local payload = Any[a for a in e.args if !(a isa LineNumberNode)]
+    length(payload) == 1 || return e
+    e = payload[1]
+  end
+  return e
+end
+
+function _isNonIntegerJuliaConstant(@nospecialize(e))::Bool
+  local v = _singleBlockPayload(e)
+  v isa Integer && return false
+  return v isa Real && !isinteger(v)
+end
+
+"""
+ModelingToolkit.ifelse and the arithmetic if-expression evaluate both branches. Guard only
+those eager branch payloads against one-sided event-localization noise around a relation
+boundary; ordinary powers keep their native domain semantics.
+"""
+function _guardNonIntegerPowerBasesForEagerBranch(@nospecialize(e))
+  e isa Expr || return e
+  local args = Any[_guardNonIntegerPowerBasesForEagerBranch(a) for a in e.args]
+  if e.head === :call && length(args) == 3 && args[1] == :^ && _isNonIntegerJuliaConstant(args[3])
+    return :(max($(args[2]), 0.0) ^ $(args[3]))
+  end
+  return Expr(e.head, args...)
+end
+
+#= ==================================================================================== =#
+#= The system                                                                           =#
+#= ==================================================================================== =#
+
+"""
+    performStructuralSimplify(; observedFilter = nothing, split = !DIRECT_RHS_GENERATION[])
+
+The structural simplification of `firstOrderSystem` into `reducedSystem`; with an observed
+filter, the observed equations kept those whose variable a pattern matches, with the observed
+variables they read and the system's and the initialization equations read. With
+ENABLE_BACKEND_LOGGING, the system before is dumped to `backend/codeGen/preStructuralSimplify.log`
+(the path taken at codegen time, in the model's run directory).
+"""
+function performStructuralSimplify(; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
+                                   split::Bool = !OMBackend.DIRECT_RHS_GENERATION[])::Expr
+  local dumpExpr = :(nothing)
+  @BACKEND_LOGGING dumpExpr = dumpPreStructuralSimplifyExpr(
+      OMBackend.logPath("backend/codeGen", "preStructuralSimplify.log"))
+  local simplifyExpr = quote
+    $dumpExpr
+    reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true, split = $(split))
+  end
+  (observedFilter === nothing || isempty(observedFilter)) && return simplifyExpr
+  local patternStrings = observedFilter isa Vector{Regex} ? [p.pattern for p in observedFilter] : observedFilter
+  return quote
+    $simplifyExpr
+    local _obsPatterns = [Regex(p) for p in $(patternStrings)]
+    local _allObs = ModelingToolkit.observed(reducedSystem)
+    local _nBefore = length(_allObs)
+    #= Keep matched observed equations AND the transitive closure of observed
+       variables their RHS references; dropping a dependency leaves it
+       referenced-but-undefined in the residual/init build_function. =#
+    local _obsByLhs = Dict(string(eq.lhs) => eq for eq in _allObs)
+    local _keepNames = OrderedSet{String}()
+    local _stack = String[string(eq.lhs) for eq in _allObs
+                          if any(p -> occursin(p, string(eq.lhs)), _obsPatterns)]
+    #= Also seed from observed vars referenced by the system equations and the
+       initialization equations: the residual / init build_function references them
+       (the initialization rows are inlined to the states through the observed
+       equations: MSL IMC_YD's rotorCage.electroMagneticConverter.V_m = Complex(0, 0)),
+       so their defs must survive. =#
+    for _seq in Iterators.flatten((ModelingToolkit.equations(reducedSystem),
+                                   ModelingToolkit.initialization_equations(reducedSystem)))
+      for _side in (_seq.lhs, _seq.rhs)
+        for _v in Symbolics.get_variables(_side)
+          local _vn = string(_v)
+          haskey(_obsByLhs, _vn) && push!(_stack, _vn)
         end
-        local nested = _expandComplexReturnArg(inner, simCode, hashTable;
-                                                varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-        if nested !== nothing
-          append!(innerArgs, nested)
-          continue
-        end
-        push!(innerArgs, expToJuliaExpMTK(inner, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol))
       end
-      return Any[:(OMBackend.CodeGeneration.tupleElementCall($fnQuote, $k, $(innerArgs...))) for k in 1:nFields]
     end
-    DAE.RECORD(_, expl, _, DAE.T_COMPLEX(__)) => begin
-      local fieldExprs = [expToJuliaExpMTK(e, simCode; varPrefix=varPrefix, varSuffix=varSuffix, derSymbol=derSymbol)
-                          for e in expl]
-      length(fieldExprs) >= 2 || return nothing
-      return Any[fieldExprs...]
+    while !isempty(_stack)
+      local _nm = pop!(_stack)
+      (_nm in _keepNames) && continue
+      push!(_keepNames, _nm)
+      local _eq = get(_obsByLhs, _nm, nothing)
+      _eq === nothing && continue
+      for _v in Symbolics.get_variables(_eq.rhs)
+        local _vn = string(_v)
+        (haskey(_obsByLhs, _vn) && !(_vn in _keepNames)) && push!(_stack, _vn)
+      end
     end
-    _ => return nothing
+    local _filteredObs = filter(eq -> string(eq.lhs) in _keepNames, _allObs)
+    if length(_filteredObs) < _nBefore
+      @debug "[MTK GEN: observed] observedFilter: kept $(length(_filteredObs)) of $(_nBefore) MTK observed equations"
+      reducedSystem = Setfield.set(reducedSystem, Setfield.PropertyLens{:observed}(), _filteredObs)
+    end
   end
 end
 
-function _modelicaFunctionCallExpr(path,
-                                   expLst,
-                                   simCode,
-                                   hashTable;
-                                   varPrefix = "",
-                                   varSuffix = "",
-                                   derSymbol = false)
-  local normalizedFuncName = OMBackend.canonicalName(string(path))
-  #= OMFrontend lowers delay(x, T[, Tmax]) to OpenModelica.Internal.delay2/delay3, as OpenModelica: a
-     generated function whose body was the identity. The history-based term (delays.jl). =#
-  if normalizedFuncName in ("OpenModelica_Internal_delay2", "OpenModelica_Internal_delay3")
-    return DAECallExpressionToMTKCallExpression("delay", expLst isa List ? expLst : MetaModelica.list(expLst...), simCode, hashTable;
-                                                varPrefix = varPrefix, varSuffix = varSuffix, derAsSymbol = derSymbol)
+"""
+    odeSystemWithEvents(hasEvents, modelName; hasObserved = false)
+
+The ODESystem's constructor: with the if-equations' events (SymbolicContinuousCallback with
+discrete parameters: the ifCond relays live in the parameter vector) but then no observed
+equations (MTK's complete(sys) injects them into every callback's AffectSystem, which fails
+tearing where they introduce variables the callback cannot solve: they are added to the
+reduced system after structural_simplify, MTK_CodeGeneration.jl); the initial equations as
+`initialization_eqs` (constraints that hold at t = 0: `PID.gainPID.y = 0`, not only guesses).
+"""
+function odeSystemWithEvents(hasEvents::Bool, modelName::String; hasObserved::Bool = false)::Expr
+  if hasEvents
+    return :(System(eqs, t, vars, parameters;
+                       name=:($(Symbol($modelName))),
+                       continuous_events = events, guesses = initialValues,
+                       initialization_eqs = initialConstraintEqs))
+  elseif hasObserved
+    return :(System(eqs, t, vars, parameters;
+                       name=:($(Symbol($modelName))), guesses = initialValues,
+                       observed = observedEqs,
+                       initialization_eqs = initialConstraintEqs))
   end
-  local lowered = lowerKnownSymbolicFunctionCall(normalizedFuncName, expLst, simCode, hashTable;
-                                                varPrefix = varPrefix,
-                                                varSuffix = varSuffix,
-                                                derSymbol = derSymbol)
-  lowered !== nothing && return lowered
-  #= Qualified MSL paths (e.g. Modelica.Math.Vectors.length) only reach this
-     branch because the bare-name dispatcher fires for Absyn.IDENT calls.
-     Reuse MODELICA_BUILTIN_FUNCTIONS so a registered Julia mirror resolves
-     the call instead of emitting an unresolved Symbol that fails at eval. =#
-  local builtinSym = get(AlgorithmicCodeGeneration.MODELICA_BUILTIN_FUNCTIONS,
-                         normalizedFuncName, nothing)
-  if builtinSym !== nothing
-    local builtinCallee = Expr(:., Expr(:., Expr(:., :OMBackend, QuoteNode(:CodeGeneration)),
-                                        QuoteNode(:AlgorithmicCodeGeneration)),
-                               QuoteNode(builtinSym))
-    local builtinExpr = Expr(:call, builtinCallee)
-    append!(builtinExpr.args, _modelicaFunctionCallArgs(expLst, simCode, hashTable;
-                                                       varPrefix = varPrefix,
-                                                       varSuffix = varSuffix,
-                                                       derSymbol = derSymbol))
-    return builtinExpr
-  end
-  local runtimeName = get(AlgorithmicCodeGeneration.MODELICA_UTILITIES_TO_RUNTIME_C,
-                          normalizedFuncName, nothing)
-  local callee = if runtimeName !== nothing
-    :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.RuntimeCCall($(Expr(:., :OMRuntimeExternalC, QuoteNode(runtimeName)))))
-  else
-    Symbol(normalizedFuncName)
-  end
-  local expr = Expr(:call, callee)
-  append!(expr.args, _modelicaFunctionCallArgs(expLst, simCode, hashTable;
-                                               varPrefix = varPrefix,
-                                               varSuffix = varSuffix,
-                                               derSymbol = derSymbol))
-  return expr
+  return :(System(eqs, t, vars, parameters;
+                     name=:($(Symbol($modelName))), guesses = initialValues,
+                     initialization_eqs = initialConstraintEqs))
 end
 
 using ExportAll

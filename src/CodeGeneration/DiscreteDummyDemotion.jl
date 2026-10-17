@@ -105,9 +105,11 @@ end
 
 #= ---- Module-private Expr-shape match helpers ---- =#
 
-#= Strip `begin ... end` blocks wrapping a single value (source-location
-   decoration added by codegen). Equations arrive as
-   `0 ~ begin <line> A end - begin <line> B end` rather than `0 ~ A - B`. =#
+"""
+Strip `begin ... end` blocks wrapping a single value (source-location
+decoration added by codegen). Equations arrive as
+`0 ~ begin <line> A end - begin <line> B end` rather than `0 ~ A - B`.
+"""
 function _unwrap(@nospecialize(e))
   while e isa Expr && e.head === :block
     local nontrivial = filter(x -> !(x isa LineNumberNode), e.args)
@@ -136,9 +138,11 @@ function _refName(@nospecialize(e))
   return nothing
 end
 
-#= `0 ~ const + ref` or `0 ~ ref - const` or `0 ~ -ref` or `0 ~ ref` (a
-   discrete set to zero: MSL Media's state.phase = setState_phX(...).phase,
-   the function's constant output 0). Returns the pinned cref name, or nothing. =#
+"""
+`0 ~ const + ref` or `0 ~ ref - const` or `0 ~ -ref` or `0 ~ ref` (a
+discrete set to zero: MSL Media's state.phase = setState_phX(...).phase,
+the function's constant output 0). Returns the pinned cref name, or nothing.
+"""
 function _matchAlias(@nospecialize(rhs))
   rhs = _unwrap(rhs)
   rhs isa Symbol && return string(rhs)
@@ -164,8 +168,10 @@ function _matchAlias(@nospecialize(rhs))
   return nothing
 end
 
-#= True iff `e` contains a call to `constTableLookup` (either bare or
-   dotted, e.g. `OMBackend.CodeGeneration.constTableLookup(...)`). =#
+"""
+True iff `e` contains a call to `constTableLookup` (either bare or
+dotted, e.g. `OMBackend.CodeGeneration.constTableLookup(...)`).
+"""
 function _isConstTableLookupCall(@nospecialize(e))
   e isa Expr || return false
   e.head === :call || return false
@@ -179,9 +185,11 @@ function _isConstTableLookupCall(@nospecialize(e))
   return false
 end
 
-#= True iff `e` contains an `ifelse` call OR a `constTableLookup` call
-   anywhere in its subtree. Both shapes definitionally drive a discrete
-   variable when they appear on one side of a `0 ~ disc - <expr>`. =#
+"""
+True iff `e` contains an `ifelse` call OR a `constTableLookup` call
+anywhere in its subtree. Both shapes definitionally drive a discrete
+variable when they appear on one side of a `0 ~ disc - <expr>`.
+"""
 function _containsIfelse(@nospecialize(e))
   e isa Expr || return false
   if e.head === :call && !isempty(e.args) && e.args[1] === IFELSE_HEAD
@@ -194,9 +202,11 @@ function _containsIfelse(@nospecialize(e))
   return false
 end
 
-#= True iff `e` contains a relational comparison anywhere in its subtree.
-   Comparisons return a Boolean, so `0 ~ disc - (a < b)` definitionally
-   pins `disc`. =#
+"""
+True iff `e` contains a relational comparison anywhere in its subtree.
+Comparisons return a Boolean, so `0 ~ disc - (a < b)` definitionally
+pins `disc`.
+"""
 function _containsComparison(@nospecialize(e))
   e isa Expr || return false
   if e.head === :call && !isempty(e.args) && e.args[1] in COMPARISON_OPS
@@ -208,8 +218,10 @@ function _containsComparison(@nospecialize(e))
   return false
 end
 
-#= True iff `e` contains a Modelica `integer(x)` builtin (lowered as
-   `integer`, `modelica_integer`, or `floor`). =#
+"""
+True iff `e` contains a Modelica `integer(x)` builtin (lowered as
+`integer`, `modelica_integer`, or `floor`).
+"""
 function _containsIntegerDefCall(@nospecialize(e))
   e isa Expr || return false
   if e.head === :call && !isempty(e.args)
@@ -226,10 +238,12 @@ function _containsIntegerDefCall(@nospecialize(e))
   return false
 end
 
-#= True iff `e` contains a `D(...)` or `der(...)` call. A residual where
-   the non-discrete side is a derivative expression (e.g. `0 ~ der(x) - k`)
-   is a state equation, not a definitional binding, so must not be
-   treated as one by `_matchArithmeticDefinedDiscrete`. =#
+"""
+True iff `e` contains a `D(...)` or `der(...)` call. A residual where
+the non-discrete side is a derivative expression (e.g. `0 ~ der(x) - k`)
+is a state equation, not a definitional binding, so must not be
+treated as one by `_matchArithmeticDefinedDiscrete`.
+"""
 function _containsDerivative(@nospecialize(e))
   e isa Expr || return false
   if e.head === :call && !isempty(e.args) && e.args[1] in DERIVATIVE_HEADS
@@ -241,7 +255,9 @@ function _containsDerivative(@nospecialize(e))
   return false
 end
 
-#= `0 ~ disc ± ifelse(...)` — RHS contains an `ifelse` call. =#
+"""
+`0 ~ disc ± ifelse(...)` — RHS contains an `ifelse` call.
+"""
 function _matchIfelseDefinedDiscrete(@nospecialize(rhs), discreteSet::OrderedSet{String})
   rhs = _unwrap(rhs)
   rhs isa Expr || return nothing
@@ -257,7 +273,9 @@ function _matchIfelseDefinedDiscrete(@nospecialize(rhs), discreteSet::OrderedSet
   return nothing
 end
 
-#= `0 ~ disc ± (a < b)` — RHS contains a Boolean comparison. =#
+"""
+`0 ~ disc ± (a < b)` — RHS contains a Boolean comparison.
+"""
 function _matchComparisonDefinedDiscrete(@nospecialize(rhs), discreteSet::OrderedSet{String})
   rhs = _unwrap(rhs)
   rhs isa Expr || return nothing
@@ -273,7 +291,9 @@ function _matchComparisonDefinedDiscrete(@nospecialize(rhs), discreteSet::Ordere
   return nothing
 end
 
-#= `0 ~ disc ± integer(x)`. =#
+"""
+`0 ~ disc ± integer(x)`.
+"""
 function _matchIntegerDefinedDiscrete(@nospecialize(rhs), discreteSet::OrderedSet{String})
   rhs = _unwrap(rhs)
   rhs isa Expr || return nothing
@@ -289,10 +309,12 @@ function _matchIntegerDefinedDiscrete(@nospecialize(rhs), discreteSet::OrderedSe
   return nothing
 end
 
-#= Generic arithmetic-defined discrete: `0 ~ disc ± expr` where `expr` is
-   a compound expression (`Expr`, not a bare cref) and does NOT itself
-   contain a derivative call. Skips when-assigned discretes (the callback
-   needs their state slot). =#
+"""
+Generic arithmetic-defined discrete: `0 ~ disc ± expr` where `expr` is
+a compound expression (`Expr`, not a bare cref) and does NOT itself
+contain a derivative call. Skips when-assigned discretes (the callback
+needs their state slot).
+"""
 function _matchArithmeticDefinedDiscrete(@nospecialize(rhs),
                                          discreteSet::OrderedSet{String},
                                          whenAssignedSet::OrderedSet{String})
@@ -316,8 +338,10 @@ function _matchArithmeticDefinedDiscrete(@nospecialize(rhs),
   return nothing
 end
 
-#= `0 ~ disc ± ifEq_tmpN` where ifEq_tmpN is a lifted if-equation target.
-   The target equation `ifEq_tmpN ~ ifelse(...)` already pins the value. =#
+"""
+`0 ~ disc ± ifEq_tmpN` where ifEq_tmpN is a lifted if-equation target.
+The target equation `ifEq_tmpN ~ ifelse(...)` already pins the value.
+"""
 function _matchConditionalTargetDefinedDiscrete(@nospecialize(rhs),
                                                 discreteSet::OrderedSet{String},
                                                 conditionalTargets::OrderedSet{String})
@@ -337,46 +361,26 @@ function _matchConditionalTargetDefinedDiscrete(@nospecialize(rhs),
   return nothing
 end
 
-#= Build the set of cref names that any when-equation writes to. Discrete
-   vars in this set MUST keep their `der(d) ~ 0` dummy — the callback
-   needs the state slot. =#
-function _collectWhenAssignedNames(simCode)::OrderedSet{String}
+"""
+Build the set of cref names that any when-equation writes to. Discrete
+vars in this set MUST keep their `der(d) ~ 0` dummy — the callback
+needs the state slot.
+"""
+function _collectWhenAssignedNames(simCode::SC.SIM_CODE)::OrderedSet{String}
   local names = OrderedSet{String}()
-  for whenEq in simCode.whenEquations
-    SimulationCode._collectWhenAssignTargets!(names, whenEq.whenEquation)
-  end
+  foreach(w -> SC.whenTargets!(names, w.whenEquation), simCode.whenEquations)
   return names
 end
 
-#= Collect the cref name from a leaf cref expression. =#
-function _collectCrefsInExp!(names::OrderedSet{String}, e::SimulationCode.EXP_CREF)
-  local r = SimulationCode.extractCrefName(e)
-  r !== nothing && push!(names, r[1])
-  return nothing
-end
-
-#= Recurse into the Exp-typed fields of any other SimCode expression. =#
-function _collectCrefsInExp!(names::OrderedSet{String}, @nospecialize(e::SimulationCode.Exp))
-  for fn in fieldnames(typeof(e))
-    local v = getfield(e, fn)
-    if v isa SimulationCode.Exp
-      _collectCrefsInExp!(names, v)
-    elseif v isa AbstractVector
-      for x in v
-        x isa SimulationCode.Exp && _collectCrefsInExp!(names, x)
-      end
-    end
-  end
-  return nothing
-end
-
-#= Discrete vars that participate in a recomputed cyclic residual SCC.
-   Treating them as held states adds an equation on top of the loop
-   equations — keep them algebraic and let MTK tear the loop. =#
-function _collectCyclicSCCDiscretes(simCode, whenAssignedSet::OrderedSet{String})::OrderedSet{String}
+"""
+Discrete vars that participate in a recomputed cyclic residual SCC.
+Treating them as held states adds an equation on top of the loop
+equations — keep them algebraic and let MTK tear the loop.
+"""
+function _collectCyclicSCCDiscretes(simCode::SC.SIM_CODE, whenAssignedSet::OrderedSet{String})::OrderedSet{String}
   local cyclic = OrderedSet{String}()
   try
-    local (sccs, eqToVar) = SimulationCode._recomputeSCCsFromSimCode(simCode)
+    local (sccs, eqToVar) = SC.residualComponents(simCode)
     for scc in sccs
       length(scc) > 1 || continue
       for eqIdx in scc
@@ -386,7 +390,7 @@ function _collectCyclicSCCDiscretes(simCode, whenAssignedSet::OrderedSet{String}
         varName in whenAssignedSet && continue
         local entry = get(simCode.stringToSimVarHT, varName, nothing)
         entry === nothing && continue
-        if entry[2].varKind isa SimulationCode.DISCRETE
+        if entry[2].varKind isa SC.DISCRETE
           push!(cyclic, varName)
         end
       end
@@ -398,11 +402,13 @@ function _collectCyclicSCCDiscretes(simCode, whenAssignedSet::OrderedSet{String}
   return cyclic
 end
 
-#= Walk the residual equations once and collect every cref name that is
-   definitionally pinned by some match pattern. Returns a tuple of
-   (aliasPinned, comparisonPinned). comparisonPinned tracks the
-   comparison-derived subset separately so the duplicate-residual
-   discount can reclaim them first. =#
+"""
+Walk the residual equations once and collect every cref name that is
+definitionally pinned by some match pattern. Returns a tuple of
+(aliasPinned, comparisonPinned). comparisonPinned tracks the
+comparison-derived subset separately so the duplicate-residual
+discount can reclaim them first.
+"""
 function _scanDefinitionalPinning(equations::Vector{Expr},
                                   discreteSet::OrderedSet{String},
                                   whenAssignedSet::OrderedSet{String},
@@ -457,11 +463,13 @@ function _scanDefinitionalPinning(equations::Vector{Expr},
   return (aliasPinned, comparisonPinned)
 end
 
-#= Discrete names a residual `0 ~ disc ± rhs` actually defines (the discrete is
-   a top-level operand of the subtraction/sum, or `0 ~ -disc`). Only such
-   discretes may be demoted by the heuristic excess fill: removing the
-   `der(d) ~ 0` dummy of a discrete no residual defines strands it with no
-   equation, leaving the system under-determined. =#
+"""
+Discrete names a residual `0 ~ disc ± rhs` actually defines (the discrete is
+a top-level operand of the subtraction/sum, or `0 ~ -disc`). Only such
+discretes may be demoted by the heuristic excess fill: removing the
+`der(d) ~ 0` dummy of a discrete no residual defines strands it with no
+equation, leaving the system under-determined.
+"""
 function _residualDefinedDiscretes(equations::Vector{Expr}, discreteSet::OrderedSet{String})::OrderedSet{String}
   local defined = OrderedSet{String}()
   for eq in equations
@@ -487,9 +495,11 @@ function _residualDefinedDiscretes(equations::Vector{Expr}, discreteSet::Ordered
   return defined
 end
 
-#= Collect every if-equation target LHS (`ifEq_tmpN ~ ifelse(...)`).
-   These names drive the `_matchConditionalTargetDefinedDiscrete`
-   pattern. =#
+"""
+Collect every if-equation target LHS (`ifEq_tmpN ~ ifelse(...)`).
+These names drive the `_matchConditionalTargetDefinedDiscrete`
+pattern.
+"""
 function _collectConditionalTargets(ifEqComponents::Vector{IfEquationComponent})::OrderedSet{String}
   local targets = OrderedSet{String}()
   for component in ifEqComponents
@@ -504,10 +514,12 @@ function _collectConditionalTargets(ifEqComponents::Vector{IfEquationComponent})
   return targets
 end
 
-#= Count duplicate residual equations (modulo line-number decoration and
-   pre-rewrite form). Duplicates are dropped by MTK at simplify time, so
-   the codegen-time over-determination count must discount them. =#
-function _countDuplicateResiduals(equations::Vector{Expr}, simCode)
+"""
+Count duplicate residual equations (modulo line-number decoration and
+pre-rewrite form). Duplicates are dropped by MTK at simplify time, so
+the codegen-time over-determination count must discount them.
+"""
+function _countDuplicateResiduals(equations::Vector{Expr}, simCode::SC.SIM_CODE)
   local seen = OrderedSet{String}()
   local nDup = 0
   local dupKeys = String[]
@@ -548,7 +560,7 @@ count, and comparison-defined demotions are reclaimed first when they
 exist (since the comparison pattern coincides with StateGraph edge
 pulses, which should stay held).
 """
-function planDemotions(simCode,
+function planDemotions(simCode::SC.SIM_CODE,
                        equations::Vector{Expr},
                        ifEqComponents::Vector{IfEquationComponent},
                        discreteVariables::Vector{String},

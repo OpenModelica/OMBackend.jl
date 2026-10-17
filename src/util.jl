@@ -41,7 +41,6 @@ using Dates
 using DataStructures: OrderedDict, OrderedSet
 
 import Absyn
-import DAE
 
 
 """
@@ -130,17 +129,6 @@ function _canonicalIdentSegments(ident::AbstractString)::Vector{String}
   return String[s]
 end
 
-function _subscriptSuffix(subscriptLst)::String
-  iterate(subscriptLst) === nothing && return ""
-  local buf = IOBuffer()
-  for s in subscriptLst
-    print(buf, "[")
-    print(buf, string(s))
-    print(buf, "]")
-  end
-  return String(take!(buf))
-end
-
 function _canonicalPathSegments(path::Absyn.IDENT)
   return _canonicalIdentSegments(path.name)
 end
@@ -151,32 +139,6 @@ end
 
 function _canonicalPathSegments(path::Absyn.FULLYQUALIFIED)
   return _canonicalPathSegments(path.path)
-end
-
-function _canonicalCrefSegments(cr::DAE.CREF_IDENT)
-  local segs = _canonicalIdentSegments(cr.ident)
-  local suffix = _subscriptSuffix(cr.subscriptLst)
-  isempty(suffix) || (segs[end] = string(segs[end], suffix))
-  return segs
-end
-
-function _canonicalCrefSegments(cr::DAE.CREF_QUAL)
-  local segs = _canonicalIdentSegments(cr.ident)
-  local suffix = _subscriptSuffix(cr.subscriptLst)
-  isempty(suffix) || (segs[end] = string(segs[end], suffix))
-  return vcat(segs,
-              _canonicalCrefSegments(cr.componentRef))
-end
-
-function _canonicalCrefSegments(cr::DAE.CREF_ITER)
-  local segs = _canonicalIdentSegments(cr.ident)
-  local suffix = _subscriptSuffix(cr.subscriptLst)
-  isempty(suffix) || (segs[end] = string(segs[end], suffix))
-  return segs
-end
-
-function _canonicalCrefSegments(::DAE.WILD)
-  return String["_"]
 end
 
 function canonicalName(name::AbstractString)::String
@@ -196,24 +158,8 @@ function canonicalName(name::AbstractString)::String
 end
 
 canonicalName(path::Absyn.Path)::String = _joinCanonicalSegments(_canonicalPathSegments(path))
-canonicalName(cr::DAE.ComponentRef)::String = _joinCanonicalSegments(_canonicalCrefSegments(cr))
-canonicalName(exp::DAE.CREF)::String = canonicalName(exp.componentRef)
 
 canonicalSymbol(x)::Symbol = Symbol(canonicalName(x))
-
-#= NameRewriteMap is populated incrementally by `_recordNameRewrite!` while the
-   canonicalize pass walks the SimCode tree. Use `canonicalToOriginal[canonical]`
-   to recover the dotted Modelica name for diagnostics; the standalone
-   "originalName" inverse cannot be reconstructed from a canonical string alone
-   because `.` is irreversibly collapsed to `_`. =#
-struct NameRewriteMap
-  originalToCanonical::OrderedDict{String, String}
-  canonicalToOriginal::OrderedDict{String, String}
-end
-
-NameRewriteMap() = NameRewriteMap(OrderedDict{String, String}(),
-                                  OrderedDict{String, String}())
-
 
 #= -----------------------------------------------------------------------------
    Log directory helpers.

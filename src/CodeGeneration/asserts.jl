@@ -76,10 +76,12 @@ struct ModelicaAssert{O <: NamedTuple, C, M, Z}
   crossings::Z
 end
 
-#= The asserts as one DiscreteCallback, added to `callbacks`. The variables are
-   read through the problem's symbolic index (states, observed and eliminated
-   variables alike); an assert on a variable the simulation does not keep is
-   reported and left out. =#
+"""
+The asserts as one DiscreteCallback, added to `callbacks`. The variables are
+read through the problem's symbolic index (states, observed and eliminated
+variables alike); an assert on a variable the simulation does not keep is
+reported and left out.
+"""
 function withAssertCallback(callbacks, problem, asserts::Vector)
   local checks = Tuple{ModelicaAssert, Any}[]
   local byName = _variablesByName(problem)
@@ -116,7 +118,10 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
       pending[i] = NaN
       local τm = (τp + integrator.t) / 2
       local (src, at) = integrator.tprev <= τm ? (_stateAt(integrator, τm), (t = τm,)) : (integrator, integrator)
-      if !a.condition(_assertValues(a, getter, src), at) && !(a.warning && violated[i])
+      #= Halfway still at the boundary up to rounding (a crossing just after an initialization
+         at it: the level drained by 1e-14) is no failure: the state now decides. =#
+      if !a.condition(_assertValues(a, getter, src), at) && !(a.warning && violated[i]) &&
+         !_atAssertBoundary(a, getter, src, Float64(at.t))
         report(a, getter, integrator, τp)
         violated[i] = true
         return nothing
@@ -126,7 +131,7 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
       violated[i] = false
     elseif !all && (atCrossing || integrator.t == τp)
       pending[i] = integrator.t
-    elseif all && a.timeVarying && isnan(τp) && _atAssertBoundary(a, getter, integrator)
+    elseif all && a.timeVarying && isnan(τp) && _atAssertBoundary(a, getter, integrator, integrator.t)
       #= The initialization's state at a boundary a relation touches, past it by rounding
          (MSL TanksWithEmptyingPipe1: level_start = height = 2, the level computed from the
          mass 2 + 4e-16, `level <= height` failed, or not, by run): decided at the next check,
@@ -194,8 +199,10 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
   return DiffEqBase.CallbackSet(callbacks, zc, cb)
 end
 
-#= The problem's variables by name: states, observed (eliminated and alias
-   variables) and parameters. =#
+"""
+The problem's variables by name: states, observed (eliminated and alias
+variables) and parameters.
+"""
 function _variablesByName(problem)
   local byName = Dict{Symbol, Any}()
   local sys = hasproperty(problem.f, :sys) ? problem.f.sys : nothing
@@ -210,21 +217,27 @@ end
 _assertValues(a::ModelicaAssert, getter, src) =
   getter === nothing ? NamedTuple() : NamedTuple{keys(a.observed)}(Tuple(getter(src)))
 
-#= Whether a relation of the assert is at its boundary up to rounding: its crossing function
-   within 1e-9 of zero at the integrator's state. =#
-function _atAssertBoundary(a::ModelicaAssert, getter, integrator::ModelingToolkit.SciMLBase.DEIntegrator)::Bool
-  local values = _assertValues(a, getter, integrator)
-  return any(f -> abs(Float64(f(values, (t = integrator.t,)))) <= 1e-9, a.crossings)
+"""
+Whether a relation of the assert is at its boundary up to rounding: its crossing function
+within 1e-9 of zero at the state `src` (the integrator's, the solution's at `t`).
+"""
+function _atAssertBoundary(a::ModelicaAssert, getter, src, t::Float64)::Bool
+  local values = _assertValues(a, getter, src)
+  return any(f -> abs(Float64(f(values, (t = t,)))) <= 1e-9, a.crossings)
 end
 
-#= The solution at τ within the last step, as a value provider for the getters. =#
+"""
+The solution at τ within the last step, as a value provider for the getters.
+"""
 _stateAt(integrator, τ) =
   ModelingToolkit.SymbolicIndexingInterface.ProblemState(; u = integrator(τ), p = integrator.p, t = τ)
 
-#= The first time in (tprev, t] at which the condition fails, by bisection on
-   the step's interpolation: the check runs at step ends and a step can be long
-   (der(x) = 1 is solved in one step). The step end if the interpolation does
-   not bracket the change. =#
+"""
+The first time in (tprev, t] at which the condition fails, by bisection on
+the step's interpolation: the check runs at step ends and a step can be long
+(der(x) = 1 is solved in one step). The step end if the interpolation does
+not bracket the change.
+"""
 function _violationTime(a::ModelicaAssert, getter, integrator)
   local lo = integrator.tprev; local hi = integrator.t
   hi > lo || return hi

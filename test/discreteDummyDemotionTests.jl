@@ -8,7 +8,7 @@
 using Test
 using DataStructures: OrderedSet
 
-include(joinpath(@__DIR__, "backendTestMocks.jl"))
+isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "backendTestMocks.jl"))
 using .BackendTestMocks
 
 const _CG = OMBackend.CodeGeneration

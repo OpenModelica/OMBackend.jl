@@ -1,34 +1,36 @@
-#= The protection of a variable, marked on its attributes (BDAECreate._maybeMarkAttrProtected;
-   dropObservationOnlyVariables reads it): an enumeration's, a String's and a Clock's
-   attributes became an empty Real's, their start, fixed, min and max lost, and a variable
-   without attributes got a Real's whatever its type. =#
+#= The protection of a variable and its attributes (dropObservationOnlyVariables reads the
+   protection): an enumeration's, a String's and a Clock's attributes once became an empty
+   Real's when the protection was marked on them, their start, fixed, min and max lost. In
+   OMJLIR and the simulation code the protection is a field of its own: a protected
+   variable of each type keeps its attributes. =#
 using Test
 import OMBackend
-import DAE
-import MetaModelica
+import OMFrontend
 
 @testset "Protected variables keep their attributes" begin
-  local mark = OMBackend.Backend.BDAECreate._maybeMarkAttrProtected
-  local nil = MetaModelica.nil
-  local NONE = MetaModelica.NONE
-  local SOME = MetaModelica.SOME
-  local start = SOME(DAE.ICONST(2))
-  local enumAttrs = SOME(DAE.VAR_ATTR_ENUMERATION(NONE(), NONE(), NONE(), start, SOME(DAE.BCONST(true)),
-                                                  NONE(), NONE(), NONE(), NONE()))
-  local marked = mark(enumAttrs, DAE.PROTECTED(), DAE.T_ENUMERATION_DEFAULT).data
-  @test marked isa DAE.VAR_ATTR_ENUMERATION
-  @test marked.start === enumAttrs.data.start
-  @test marked.isProtected.data === true
-  #= Without attributes: the empty ones of the variable's type (of an array's elements). =#
-  local intArray = DAE.T_ARRAY(DAE.T_INTEGER(nil), MetaModelica.list(DAE.DIM_INTEGER(3)))
-  for (ty, attrType) in ((DAE.T_REAL(nil), DAE.VAR_ATTR_REAL), (DAE.T_INTEGER(nil), DAE.VAR_ATTR_INT),
-                         (DAE.T_BOOL(nil), DAE.VAR_ATTR_BOOL), (DAE.T_STRING(nil), DAE.VAR_ATTR_STRING),
-                         (DAE.T_ENUMERATION_DEFAULT, DAE.VAR_ATTR_ENUMERATION), (intArray, DAE.VAR_ATTR_INT))
-    local attrs = mark(NONE(), DAE.PROTECTED(), ty).data
-    @test attrs isa attrType
-    @test attrs.isProtected.data === true
+  local file = joinpath(@__DIR__, "Models", "ProtectedAttributes.mo")
+  local (fm, cache) = OMFrontend.instantiateSCodeToFM("ProtectedAttributes", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
+  local model = OMBackend.omjlirModel(fm; functionList = OMFrontend.cacheToFunctionList(cache))
+  local IR = OMBackend.OMJLIR
+  local byName = Dict(String(v.name) => v for v in model.variables)
+  local text = e -> e === nothing ? nothing : IR.toString(e)
+  for (name, start) in (("e", "E.two"), ("k", "2"), ("b", "true"), ("m[2]", "4"))
+    local v = byName[name]
+    @test v.isProtected
+    @test text(v.attributes.start) == start
+    @test text(v.attributes.fixed) == "true"
   end
-  #= A public variable's attributes stay as they are. =#
-  @test mark(enumAttrs, DAE.PUBLIC(), DAE.T_ENUMERATION_DEFAULT) === enumAttrs
-  @test mark(NONE(), DAE.PUBLIC(), DAE.T_REAL(nil)) === NONE()
+  @test text(byName["k"].attributes.min) == "0" && text(byName["k"].attributes.max) == "5"
+  #= A public variable is not protected. =#
+  @test !byName["x"].isProtected
+
+  local SC = OMBackend.SimCode
+  local ht = SC.fromOMJLIR(model).stringToSimVarHT
+  for (name, ty) in (("e", SC.TYPE_ENUM), ("k", SC.TYPE_INTEGER), ("b", SC.TYPE_BOOL), ("m[2]", SC.TYPE_INTEGER))
+    local v = last(ht[name])
+    @test v.attributes.isProtected
+    @test v.attributes.start !== nothing
+    @test v.elementType isa ty
+  end
+  @test !last(ht["x"]).attributes.isProtected
 end

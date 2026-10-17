@@ -50,13 +50,11 @@ SIM_CODE -> Julia mapping of `expToJuliaExp` in `codeGen.jl`
 
 module DEGen
 
-using MetaModelica
-import ..SimulationCode
+import ..SimCode
 import ..CodeGeneration
-import ..CodeGeneration: DAE_OP_toJuliaOperator, stripBeginBlocks
-import ..Backend.BDAE
-import DAE
-import Absyn
+import ..CodeGeneration: opKindToJuliaOperator, stripBeginBlocks
+
+const SC = SimCode
 
 """
 Layout descriptor: ordered names of states / parameters / discretes,
@@ -78,21 +76,17 @@ Build a DELayout from a SIM_CODE. States and algebraic variables are kept
 separate; only states occupy slots in `u`. Algebraic variables are not
 supported in the initial DEMode scope and trigger an explicit error.
 """
-function buildDELayout(simCode::SimulationCode.SIM_CODE)::DELayout
+function buildDELayout(simCode::SC.SIM_CODE)::DELayout
   local stateNames = String[]
   local algNames = String[]
   local paramNames = String[]
   local discreteNames = String[]
-  local ht = simCode.stringToSimVarHT
-  for (name, (_, simVar)) in ht
-    @match simVar.varKind begin
-      SimulationCode.STATE(__) => push!(stateNames, name)
-      SimulationCode.PARAMETER(__) => push!(paramNames, name)
-      SimulationCode.ALG_VARIABLE(__) => push!(algNames, name)
-      SimulationCode.DISCRETE(__) => push!(discreteNames, name)
-      SimulationCode.STATE_DERIVATIVE(__) => nothing
-      _ => nothing
-    end
+  for (name, (_, simVar)) in simCode.stringToSimVarHT
+    local k = simVar.varKind
+    k isa SC.STATE && push!(stateNames, name)
+    k isa SC.PARAMETER && push!(paramNames, name)
+    k isa SC.ALG_VARIABLE && push!(algNames, name)
+    k isa SC.DISCRETE && push!(discreteNames, name)
   end
   sort!(stateNames)
   sort!(algNames)
@@ -105,217 +99,68 @@ function buildDELayout(simCode::SimulationCode.SIM_CODE)::DELayout
                   stateIndex, paramIndex, discreteIndex)
 end
 
-#= SimCode-Exp entry: per-variant dispatch mirrors `toDAEExp`;
-   only the EXP_CREF leaf and the operator map touch a per-node DAE projection. =#
 """
-Lower a DAE.Exp to Julia for the DE backend. Emits expressions that read
-states from `u[i]`, parameters from `p[i]`, and time from `t`. State
-derivatives are emitted as `du[i]`. Discrete variables (currently
-unsupported in user-facing code) follow the parameter slot.
+    expToJuliaExpDE(e, layout, simCode)
 
-Differs from `expToJuliaExp` in `codeGen.jl` by:
-  - using the DELayout integer indices instead of `simCode.stringToSimVarHT[name][1]`
-  - rejecting CALL fallthrough that would silently emit unresolved Julia symbols
-  - inlining IFEXP: it survives where the if-expression-to-if-equation pass
-    leaves expressions that depend on time.
+An expression for the DE backend: states from `u[i]`, parameters from `p[i]`, time from `t`,
+state derivatives `du[i]` (the DELayout's integer indices). An algebraic or a discrete
+variable is refused (the pure-ODE scope), and so is any other expression.
 """
-expToJuliaExpDE(e::SimulationCode.BCONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
-expToJuliaExpDE(e::SimulationCode.ICONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
-expToJuliaExpDE(e::SimulationCode.RCONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
-expToJuliaExpDE(e::SimulationCode.SCONST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr = Expr(:block, e.value)
+function expToJuliaExpDE end
 
-function expToJuliaExpDE(e::SimulationCode.EXP_CREF, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
-  local varName = SimulationCode.string(SimulationCode.toDAECref(e.cref).componentRef)
-  if varName == "time"
-    return Expr(:block, :t)
-  end
+expToJuliaExpDE(e::Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST}, ::DELayout, ::SC.SIM_CODE)::Expr = Expr(:block, e.value)
+
+function expToJuliaExpDE(e::SC.EXP_CREF, layout::DELayout, simCode::SC.SIM_CODE)::Expr
+  local varName = SC.crefName(e.cref)
+  varName == "time" && return Expr(:block, :t)
   local entry = get(simCode.stringToSimVarHT, varName, nothing)
   entry === nothing && error("DEMode: unknown CREF '$(varName)' in expression lowering")
-  local kind = entry[2].varKind
-  @match kind begin
-    SimulationCode.STATE(__) => Expr(:ref, :u, layout.stateIndex[varName])
-    SimulationCode.STATE_DERIVATIVE(__) => Expr(:ref, :du, layout.stateIndex[kind.varName])
-    SimulationCode.PARAMETER(__) => Expr(:ref, :p, layout.paramIndex[varName])
-    SimulationCode.ALG_VARIABLE(__) =>
-      error("DEMode: algebraic variable '$(varName)' encountered. " *
-            "Pure-ODE scope only at this milestone.")
-    SimulationCode.DISCRETE(__) =>
-      error("DEMode: discrete variable '$(varName)' encountered. " *
-            "Discrete/event support is not in the initial milestone.")
-    _ => error("DEMode: unsupported variable kind $(kind) for '$(varName)'")
-  end
+  local kind = last(entry).varKind
+  kind isa SC.STATE && return Expr(:ref, :u, layout.stateIndex[varName])
+  kind isa SC.STATE_DERIVATIVE && return Expr(:ref, :du, layout.stateIndex[kind.varName])
+  kind isa SC.PARAMETER && return Expr(:ref, :p, layout.paramIndex[varName])
+  kind isa SC.ALG_VARIABLE && error("DEMode: algebraic variable '$(varName)' encountered. Pure-ODE scope only at this milestone.")
+  kind isa SC.DISCRETE && error("DEMode: discrete variable '$(varName)' encountered. Discrete/event support is not in the initial milestone.")
+  error("DEMode: unsupported variable kind $(kind) for '$(varName)'")
 end
 
-function expToJuliaExpDE(e::SimulationCode.UNARY, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
-  :($o($(expToJuliaExpDE(e.exp, layout, simCode))))
-end
-function expToJuliaExpDE(e::SimulationCode.LUNARY, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
-  :($o($(expToJuliaExpDE(e.exp, layout, simCode))))
-end
-function expToJuliaExpDE(e::SimulationCode.BINARY, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
-  :($o($(expToJuliaExpDE(e.exp1, layout, simCode)), $(expToJuliaExpDE(e.exp2, layout, simCode))))
-end
-function expToJuliaExpDE(e::SimulationCode.LBINARY, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
-  :($o($(expToJuliaExpDE(e.exp1, layout, simCode)), $(expToJuliaExpDE(e.exp2, layout, simCode))))
-end
-function expToJuliaExpDE(e::SimulationCode.RELATION, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
-  local o = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(e.op))
-  :($o($(expToJuliaExpDE(e.exp1, layout, simCode)), $(expToJuliaExpDE(e.exp2, layout, simCode))))
-end
-function expToJuliaExpDE(e::SimulationCode.IFEXP, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
-  :(($(expToJuliaExpDE(e.cond, layout, simCode))) ?
-    $(expToJuliaExpDE(e.thenExp, layout, simCode)) :
-    $(expToJuliaExpDE(e.elseExp, layout, simCode)))
-end
-expToJuliaExpDE(e::SimulationCode.CAST, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr =
-  expToJuliaExpDE(e.exp, layout, simCode)
-function expToJuliaExpDE(e::SimulationCode.CALL, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
-  e.path isa Absyn.IDENT || error("DEMode: unsupported call path $(e.path) in expression lowering")
-  local fn = Symbol(e.path.name)
-  local argExprs = [expToJuliaExpDE(a, layout, simCode) for a in e.args]
-  Expr(:call, fn, argExprs...)
-end
-Base.@nospecializeinfer function expToJuliaExpDE(@nospecialize(exp::SimulationCode.Exp),
-                                                 layout::DELayout,
-                                                 simCode::SimulationCode.SIM_CODE)::Expr
-  error("DEMode: unsupported SimulationCode.Exp shape $(typeof(exp)): $exp")
-end
+expToJuliaExpDE(e::SC.DER, layout::DELayout, ::SC.SIM_CODE)::Expr = Expr(:ref, :du, layout.stateIndex[SC.crefName(e.cref)])
 
-function expToJuliaExpDE(exp::DAE.Exp, layout::DELayout, simCode::SimulationCode.SIM_CODE)::Expr
-  local hashTable = simCode.stringToSimVarHT
-  @match exp begin
-    DAE.BCONST(b) => Expr(:block, b)
-    DAE.ICONST(i) => Expr(:block, i)
-    DAE.RCONST(r) => Expr(:block, r)
-    DAE.SCONST(s) => Expr(:block, s)
-    DAE.CREF(cr, _) => begin
-      local varName = SimulationCode.string(cr)
-      if varName == "time"
-        Expr(:block, :t)
-      else
-        local entry = get(hashTable, varName, nothing)
-        entry === nothing && error("DEMode: unknown CREF '$(varName)' in expression lowering")
-        local kind = entry[2].varKind
-        @match kind begin
-          SimulationCode.STATE(__) => begin
-            local idx = layout.stateIndex[varName]
-            Expr(:ref, :u, idx)
-          end
-          SimulationCode.STATE_DERIVATIVE(__) => begin
-            local stateName = kind.varName
-            local idx = layout.stateIndex[stateName]
-            Expr(:ref, :du, idx)
-          end
-          SimulationCode.PARAMETER(__) => begin
-            local idx = layout.paramIndex[varName]
-            Expr(:ref, :p, idx)
-          end
-          SimulationCode.ALG_VARIABLE(__) => begin
-            error("DEMode: algebraic variable '$(varName)' encountered. " *
-                  "Pure-ODE scope only at this milestone.")
-          end
-          SimulationCode.DISCRETE(__) => begin
-            error("DEMode: discrete variable '$(varName)' encountered. " *
-                  "Discrete/event support is not in the initial milestone.")
-          end
-          _ => error("DEMode: unsupported variable kind $(kind) for '$(varName)'")
-        end
-      end
-    end
-    DAE.UNARY(operator = op, exp = e1) => begin
-      local o = DAE_OP_toJuliaOperator(op)
-      :($o($(expToJuliaExpDE(e1, layout, simCode))))
-    end
-    DAE.BINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-      local o = DAE_OP_toJuliaOperator(op)
-      :($o($(expToJuliaExpDE(e1, layout, simCode)), $(expToJuliaExpDE(e2, layout, simCode))))
-    end
-    DAE.LUNARY(operator = op, exp = e1) => begin
-      local o = DAE_OP_toJuliaOperator(op)
-      :($o($(expToJuliaExpDE(e1, layout, simCode))))
-    end
-    DAE.LBINARY(exp1 = e1, operator = op, exp2 = e2) => begin
-      local o = DAE_OP_toJuliaOperator(op)
-      :($o($(expToJuliaExpDE(e1, layout, simCode)), $(expToJuliaExpDE(e2, layout, simCode))))
-    end
-    DAE.RELATION(exp1 = e1, operator = op, exp2 = e2) => begin
-      local o = DAE_OP_toJuliaOperator(op)
-      :($o($(expToJuliaExpDE(e1, layout, simCode)), $(expToJuliaExpDE(e2, layout, simCode))))
-    end
-    DAE.IFEXP(expCond = c, expThen = t1, expElse = e1) => begin
-      :(($(expToJuliaExpDE(c, layout, simCode))) ?
-        $(expToJuliaExpDE(t1, layout, simCode)) :
-        $(expToJuliaExpDE(e1, layout, simCode)))
-    end
-    DAE.CAST(exp = e1) => expToJuliaExpDE(e1, layout, simCode)
-    DAE.CALL(path = Absyn.IDENT(name), expLst = args) => begin
-      local fn = Symbol(name)
-      local argExprs = [expToJuliaExpDE(a, layout, simCode) for a in args]
-      Expr(:call, fn, argExprs...)
-    end
-    _ => error("DEMode: unsupported DAE.Exp shape $(typeof(exp)): $exp")
-  end
-end
+expToJuliaExpDE(e::Union{SC.UNARY, SC.LUNARY}, layout::DELayout, simCode::SC.SIM_CODE)::Expr =
+  :($(opKindToJuliaOperator(e.op))($(expToJuliaExpDE(e.exp, layout, simCode))))
+
+expToJuliaExpDE(e::Union{SC.BINARY, SC.RELATION}, layout::DELayout, simCode::SC.SIM_CODE)::Expr =
+  :($(opKindToJuliaOperator(e.op))($(expToJuliaExpDE(e.exp1, layout, simCode)), $(expToJuliaExpDE(e.exp2, layout, simCode))))
+
+expToJuliaExpDE(e::SC.LBINARY, layout::DELayout, simCode::SC.SIM_CODE)::Expr =
+  Expr(e.op === SC.OP_AND ? :&& : :||, expToJuliaExpDE(e.exp1, layout, simCode), expToJuliaExpDE(e.exp2, layout, simCode))
+
+"An if-expression inlined: it survives where the if-expression-to-if-equation pass leaves expressions that depend on time."
+expToJuliaExpDE(e::SC.IFEXP, layout::DELayout, simCode::SC.SIM_CODE)::Expr =
+  :(($(expToJuliaExpDE(e.cond, layout, simCode))) ? $(expToJuliaExpDE(e.thenExp, layout, simCode)) : $(expToJuliaExpDE(e.elseExp, layout, simCode)))
+
+expToJuliaExpDE(e::SC.CAST, layout::DELayout, simCode::SC.SIM_CODE)::Expr = expToJuliaExpDE(e.exp, layout, simCode)
+
+expToJuliaExpDE(e::SC.CALL, layout::DELayout, simCode::SC.SIM_CODE)::Expr =
+  Expr(:call, e.name, (expToJuliaExpDE(a, layout, simCode) for a in e.args)...)
+
+expToJuliaExpDE(e::SC.Exp, ::DELayout, ::SC.SIM_CODE)::Expr = error("DEMode: unsupported expression $(typeof(e)): $e")
 
 """
 Lower a single residual equation (lhs - rhs == 0) to a Julia statement
 of the form `du[i] = <rhs>`. The emitter assumes the residual has been
-pre-rewritten so `der(state)` appears solitary on one side.
-
-Returns nothing if the residual cannot be solved for a single derivative;
-the caller is expected to detect this condition and refuse the model.
+pre-rewritten so `der(state)` appears solitary on one side; another
+residual is refused.
 """
-function residualToDerivativeAssignment(eq::Union{BDAE.RESIDUAL_EQUATION, SimulationCode.RESIDUAL_EQUATION},
-                                        layout::DELayout,
-                                        simCode::SimulationCode.SIM_CODE)
-  local rhsExp = SimulationCode.toDAEExp(eq.exp)
-  #=
-    The residualization pass produces equations of the form lhs - rhs = 0.
-    Inspect the top-level shape: BINARY(SUB, lhs, rhs) is the canonical case.
-    Decide which side is `der(<state>)` and emit `du[idx] = otherSide`.
-  =#
-  @match rhsExp begin
-    DAE.BINARY(exp1 = e1, operator = DAE.SUB(__), exp2 = e2) => begin
-      local lhsCall = _matchDerCall(e1)
-      local rhsCall = _matchDerCall(e2)
-      if lhsCall !== nothing
-        local stateName = lhsCall
-        local idx = get(layout.stateIndex, stateName, nothing)
-        idx === nothing && error("DEMode: der() of unknown state '$(stateName)'")
-        return :(du[$idx] = $(expToJuliaExpDE(e2, layout, simCode)))
-      elseif rhsCall !== nothing
-        local stateName = rhsCall
-        local idx = get(layout.stateIndex, stateName, nothing)
-        idx === nothing && error("DEMode: der() of unknown state '$(stateName)'")
-        return :(du[$idx] = $(expToJuliaExpDE(e1, layout, simCode)))
-      else
-        error("DEMode: residual is not a pure ODE for any state. Equation: $(rhsExp)")
-      end
-    end
-    _ => error("DEMode: residual has unexpected top-level shape: $(typeof(rhsExp))")
-  end
-end
-
-"""
-Detect a `der(<state>)` call and return the state name. Returns `nothing`
-if the expression is not a call to `der`.
-"""
-function _matchDerCall(e::DAE.Exp)
-  @match e begin
-    DAE.CALL(path = Absyn.IDENT("der"), expLst = args) => begin
-      length(args) == 1 || return nothing
-      local arg = listHead(args)
-      @match arg begin
-        DAE.CREF(cr, _) => SimulationCode.string(cr)
-        _ => nothing
-      end
-    end
-    _ => nothing
-  end
+function residualToDerivativeAssignment(eq::SC.RESIDUAL_EQUATION, layout::DELayout, simCode::SC.SIM_CODE)::Expr
+  local e = eq.exp
+  (e isa SC.BINARY && e.op === SC.OP_SUB) || error("DEMode: residual has unexpected top-level shape: $(e)")
+  local (derivative, value) = e.exp1 isa SC.DER ? (e.exp1, e.exp2) : e.exp2 isa SC.DER ? (e.exp2, e.exp1) :
+    error("DEMode: residual is not a pure ODE for any state. Equation: $(e)")
+  local stateName = SC.crefName(derivative.cref)
+  local idx = get(layout.stateIndex, stateName, nothing)
+  idx === nothing && error("DEMode: der() of unknown state '$(stateName)'")
+  return :(du[$idx] = $(expToJuliaExpDE(value, layout, simCode)))
 end
 
 """
@@ -324,17 +169,13 @@ Returns an `Expr(:block, ...)` that writes each parameter binding into `p`
 in dependency order (we emit textual order; chained parameter dependencies
 are already resolved by `propagateConstants` upstream).
 """
-function generateDEParameterAssignments(layout::DELayout,
-                                        simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+function generateDEParameterAssignments(layout::DELayout, simCode::SC.SIM_CODE)::Vector{Expr}
   local stmts = Expr[]
   local ht = simCode.stringToSimVarHT
   for name in layout.paramNames
-    (_, simVar) = ht[name]
-    local bindExp = @match simVar.varKind begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => SimulationCode.toDAEExp(exp)
-      SimulationCode.PARAMETER(bindExp = NONE()) => nothing
-      _ => error("DEMode: parameter '$(name)' has non-parameter SimVarType")
-    end
+    local simVar = last(ht[name])
+    simVar.varKind isa SC.PARAMETER || error("DEMode: parameter '$(name)' has non-parameter SimVarType")
+    local bindExp = simVar.varKind.bindExp
     local idx = layout.paramIndex[name]
     if bindExp === nothing
       push!(stmts, :(p[$idx] = 0.0))
@@ -349,14 +190,13 @@ end
 Build the state initial-value vector. For each state, look up `start`
 attribute. Missing-start defaults to 0.0 (matches Modelica spec).
 """
-function generateDEStartConditions(layout::DELayout,
-                                   simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+function generateDEStartConditions(layout::DELayout, simCode::SC.SIM_CODE)::Vector{Expr}
   local stmts = Expr[]
   local ht = simCode.stringToSimVarHT
   for name in layout.stateNames
-    (_, simVar) = ht[name]
+    local simVar = last(ht[name])
     local idx = layout.stateIndex[name]
-    local startExp = _readStartAttribute(simVar)
+    local startExp = simVar.attributes.start
     if startExp === nothing
       push!(stmts, :(u0[$idx] = 0.0))
     else
@@ -366,35 +206,18 @@ function generateDEStartConditions(layout::DELayout,
   return stmts
 end
 
-function _readStartAttribute(simVar::SimulationCode.SIMVAR)
-  simVar.attributes === nothing && return nothing
-  @match simVar.attributes begin
-    SOME(attrs) => @match attrs.start begin
-      SOME(s) => s
-      NONE() => nothing
-    end
-    NONE() => nothing
-  end
-end
-
 """
 Generate the residual-equation body of the RHS function.
 """
-function generateDERHSBody(layout::DELayout,
-                           simCode::SimulationCode.SIM_CODE)::Vector{Expr}
-  local stmts = Expr[]
-  for eq in simCode.residualEquations
-    push!(stmts, residualToDerivativeAssignment(eq, layout, simCode))
-  end
-  return stmts
-end
+generateDERHSBody(layout::DELayout, simCode::SC.SIM_CODE)::Vector{Expr} =
+  Expr[residualToDerivativeAssignment(eq, layout, simCode) for eq in simCode.residualEquations]
 
 """
 Top-level DEMode emitter. Mirrors the shape of `ODE_MODE_MTK` (returns
 `(modelName, moduleExpr)`) but the body is a pure DifferentialEquations.jl
 problem, no MTK call.
 """
-function generateDECode(simCode::SimulationCode.SIM_CODE)
+function generateDECode(simCode::SC.SIM_CODE)
   local layout = buildDELayout(simCode)
   if !isempty(layout.algNames)
     error("DEMode: model '$(simCode.name)' has $(length(layout.algNames)) algebraic " *

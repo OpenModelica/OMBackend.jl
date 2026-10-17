@@ -47,8 +47,10 @@
    solve in a fresh session — paid once at build, not once per model. =#
 using PrecompileTools: @setup_workload, @compile_workload
 
-#= Small index-1 system whose algebraic row folds away, leaving a pure-ODE
-   reduced system (UniformScaling mass matrix) — the most common DirectRHS class. =#
+"""
+Small index-1 system whose algebraic row folds away, leaving a pure-ODE
+reduced system (UniformScaling mass matrix) — the most common DirectRHS class.
+"""
 function _precompileBuildReduced()
   @independent_variables t
   D = Differential(t)
@@ -57,7 +59,7 @@ function _precompileBuildReduced()
   eqs = [D(x) ~ -a * x + y,
          D(y) ~ x - y,
          0 ~ z - (x + y)]
-  sys = ODESystem(eqs, t, [x, y, z], [a];
+  sys = System(eqs, t, [x, y, z], [a];
                   name = :OMBackendPrecompileWarmup,
                   guesses = [z => 0.0],
                   initialization_eqs = ModelingToolkit.Equation[])
@@ -66,8 +68,10 @@ function _precompileBuildReduced()
   return (reduced, [x => 1.0, y => 0.0], Dict(a => 1.0))
 end
 
-#= Mirrors the generated XModel build for the standard MTK System-form path
-   (structural transitions / non-DirectRHS modes). =#
+"""
+Mirrors the generated XModel build for the standard MTK System-form path
+(structural transitions / non-DirectRHS modes).
+"""
 function _precompileWarmup()
   local (reduced, ivs, pars) = _precompileBuildReduced()
   local prob = ODEProblem(reduced, merge(Dict(ivs), pars), (0.0, 1.0);
@@ -79,9 +83,11 @@ function _precompileWarmup()
   return nothing
 end
 
-#= Bakes the type-erased DirectRHS solve into the image. Builds the problem
-   through the real `buildDirectRHSProblem` (so the type matches what models
-   produce) and solves with the two default solvers. =#
+"""
+Bakes the type-erased DirectRHS solve into the image. Builds the problem
+through the real `buildDirectRHSProblem` (so the type matches what models
+produce) and solves with the two default solvers.
+"""
 function _precompileWarmupDirectRHS()
   local (reduced, ivs, pars) = _precompileBuildReduced()
   local callbacks = ModelingToolkit.SciMLBase.CallbackSet()
@@ -91,10 +97,12 @@ function _precompileWarmupDirectRHS()
   return nothing
 end
 
-#= Plain OMBackend-parented callback functions for the event-ful DirectRHS bake.
-   They live in OMBackend so the callback-erasure whitelist guard collapses them
-   exactly as it does the generated when-equation callbacks. The condition crosses
-   zero during the warmup solve so the event-handling path is compiled too. =#
+"""
+Plain OMBackend-parented callback functions for the event-ful DirectRHS bake.
+They live in OMBackend so the callback-erasure whitelist guard collapses them
+exactly as it does the generated when-equation callbacks. The condition crosses
+zero during the warmup solve so the event-handling path is compiled too.
+"""
 function _precompileCBCondition(u::Vector{Float64}, t::Float64, integrator)::Float64
   return u[1] - 0.5
 end
@@ -125,11 +133,13 @@ function _precompileBuildDirectRHSEventfulProblem()
   return _precompileCollapseCallback(prob)
 end
 
-#= Bakes the type-erased event-ful DirectRHS solve into the image. With RHS/jac
-   erasure the `F` param already matches the pure-ODE warmup; the only remaining
-   model-specific axis is the callback, now collapsed to a model-independent type.
-   Solving here compiles `solve(::ErasedEventFulType, ::alg)` once for the whole
-   legacy when-equation class. =#
+"""
+Bakes the type-erased event-ful DirectRHS solve into the image. With RHS/jac
+erasure the `F` param already matches the pure-ODE warmup; the only remaining
+model-specific axis is the callback, now collapsed to a model-independent type.
+Solving here compiles `solve(::ErasedEventFulType, ::alg)` once for the whole
+legacy when-equation class.
+"""
 function _precompileWarmupDirectRHSEventful()::Nothing
   local prob = _precompileBuildDirectRHSEventfulProblem()
   solve(prob, defaultSolver())
@@ -137,10 +147,12 @@ function _precompileWarmupDirectRHSEventful()::Nothing
   return nothing
 end
 
-#= Small index-1 DAE (a retained nonlinear algebraic constraint keeps a non-identity
-   mass matrix) with a continuous event. The pure-ODE warmups above never exercise the
-   DAE mass-matrix solve (sparse W assembly / reinit) nor the MTK `process_events`
-   callback path that the chua-class models pay for at first run, so this bakes both. =#
+"""
+Small index-1 DAE (a retained nonlinear algebraic constraint keeps a non-identity
+mass matrix) with a continuous event. The pure-ODE warmups above never exercise the
+DAE mass-matrix solve (sparse W assembly / reinit) nor the MTK `process_events`
+callback path that the chua-class models pay for at first run, so this bakes both.
+"""
 function _precompileBuildReducedEventfulDAE()
   @independent_variables t
   D = Differential(t)
@@ -149,7 +161,7 @@ function _precompileBuildReducedEventfulDAE()
   local eqs = [D(x) ~ -a * x + y, 0 ~ y^3 + y - x]
   local ev = ModelingToolkit.SymbolicContinuousCallback([x ~ 0.5] => [x ~ 0.4];
                reinitializealg = ModelingToolkit.SciMLBase.NoInit())
-  local sys = ODESystem(eqs, t, [x, y], [a]; name = :OMBackendPrecompileEventfulDAE,
+  local sys = System(eqs, t, [x, y], [a]; name = :OMBackendPrecompileEventfulDAE,
                         continuous_events = [ev], guesses = [y => 0.0],
                         initialization_eqs = ModelingToolkit.Equation[])
   local reduced = CodeGeneration.structural_simplify(sys; simplify = true,
@@ -157,8 +169,10 @@ function _precompileBuildReducedEventfulDAE()
   return (reduced, [x => 1.0, y => 0.0], Dict(a => 1.0))
 end
 
-#= Bakes the DAE-with-continuous-callback DirectRHS solve (chua class: non-identity
-   mass matrix + an MTK process_events callback) into the image. =#
+"""
+Bakes the DAE-with-continuous-callback DirectRHS solve (chua class: non-identity
+mass matrix + an MTK process_events callback) into the image.
+"""
 function _precompileWarmupMTKCallbackDAE()::Nothing
   local (reduced, ivs, pars) = _precompileBuildReducedEventfulDAE()
   local prob = CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0),
@@ -173,10 +187,12 @@ function _precompileWarmupMTKCallbackDAE()::Nothing
   return nothing
 end
 
-#= Bakes the array path's solve into the image (CodeGeneration.ArrayODEGen modules: an RHS
-   the solve wraps, a sparse Jacobian pattern, an ArraySystem, an ArrayModelParameters).
-   Every array model without events shares these types, so its first solve in a fresh
-   session reuses this one. =#
+"""
+Bakes the array path's solve into the image (CodeGeneration.ArrayODEGen modules: an RHS
+the solve wraps, a sparse Jacobian pattern, an ArraySystem, an ArrayModelParameters).
+Every array model without events shares these types, so its first solve in a fresh
+session reuses this one.
+"""
 function _precompileArrayRHS!(du, u, p, t)
   du .= -u
   return nothing

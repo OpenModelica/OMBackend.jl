@@ -3,8 +3,11 @@
 # About OMBackend.jl
 
 OMBackend.jl is one component of OMJL, the Modelica compiler infrastructure
-for Julia. It transforms a Hybrid DAE produced by OMFrontend.jl into a system
-that can be simulated with DifferentialEquations.jl and ModelingToolkit.jl.
+for Julia. It lowers the flat model produced by OMFrontend.jl to its own
+intermediate representation, OMJLIR (`src/IR`), runs its passes there
+(`src/Backend/Passes`), generates the simulation code (`src/SimCode`) and from
+it a system that can be simulated with DifferentialEquations.jl and
+ModelingToolkit.jl (`src/CodeGeneration`).
 
 # Requirements
 
@@ -20,12 +23,13 @@ relevant ones are:
 * DifferentialEquations.jl, OrdinaryDiffEq.jl, DiffEqBase.jl, DiffEqCallbacks.jl, Sundials.jl
 * ModelingToolkit.jl, Symbolics.jl, SymbolicUtils.jl
 * Graphs.jl, MetaGraphs.jl, DataStructures.jl, MacroTools.jl, Setfield.jl
-* Plots.jl, GR.jl, CSV.jl, Tables.jl
+* Plots.jl
 * ExportAll.jl, DocStringExtensions.jl, JuliaFormatter.jl
 
-The OMJL ecosystem packages are consumed as in-tree siblings via
-`Project.toml`'s `[sources]` block. They must be checked out as sibling
-directories next to `OMBackend.jl`:
+The OMJL ecosystem packages are developed from sibling checkouts next to
+`OMBackend.jl`, as the CI does (`Pkg.develop` of each, `.github/workflows/CI.yml`).
+OMBackend uses Absyn, MetaModelica, OMFrontend, OMRuntimeExternalC and SCode;
+DAE, ImmutableList, ListUtil and OMParser are OMFrontend's:
 
 * Absyn.jl
 * DAE.jl
@@ -54,8 +58,8 @@ OMJL-workspace/
 ```
 
 `OMRuntimeExternalC.jl` is not in the General registry. The others are served
-by the OpenModelica Julia registry but the local `[sources]` paths take
-precedence and are used for development.
+by the OpenModelica Julia registry, but the developed checkouts take precedence
+and are used for development.
 
 # Installation
 
@@ -67,16 +71,19 @@ julia> Pkg.Registry.add("General")
 julia> Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
 ```
 
-From the `OMBackend.jl` directory, activate the project and build:
+From the `OMBackend.jl` directory, activate the project, develop the sibling
+checkouts and build:
 
 ```julia
 julia> import Pkg
 julia> Pkg.activate(".")
+julia> Pkg.develop([Pkg.PackageSpec(path = joinpath("..", p)) for p in
+                    ("Absyn.jl", "DAE.jl", "ImmutableList.jl", "ListUtil.jl", "MetaModelica.jl",
+                     "OMFrontend.jl", "OMParser.jl", "OMRuntimeExternalC.jl", "SCode.jl")])
 julia> Pkg.build(verbose = true)
 ```
 
-`deps/build.jl` resolves and builds the dependent OM*.jl packages (notably
-`OMParser` and `OMFrontend`).
+`deps/build.jl` builds OMFrontend, and with it OMParser's parser library.
 
 Then load the package:
 
@@ -102,8 +109,8 @@ julia> include("test/runtests.jl")
 
 # Example use
 
-Given a Modelica model translated to Hybrid DAE by OMFrontend.jl, pass it to
-`OMBackend.translate` and then simulate.
+Given a Modelica model flattened by OMFrontend.jl, pass the flat model and its
+functions to `OMBackend.translate` and then simulate (`examples/` has more).
 
 ```modelica
 model BouncingBallReals
@@ -121,8 +128,11 @@ end BouncingBallReals;
 ```
 
 ```julia
-julia> OMBackend.translate(BouncingBallReals)
-julia> OMBackend.simulate("BouncingBallReals", tspan = (0.0, 2.5))
+julia> import OMFrontend
+julia> scode = OMFrontend.translateToSCode(OMFrontend.parseFile("BouncingBallReals.mo"))
+julia> (fm, cache) = OMFrontend.instantiateSCodeToFM("BouncingBallReals", scode)
+julia> OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
+julia> OMBackend.simulateModel("BouncingBallReals"; tspan = (0.0, 2.5))
 ```
 
 ![image](https://user-images.githubusercontent.com/8775827/99516636-b6914280-298e-11eb-85cf-c9041314e9b4.png)

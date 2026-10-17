@@ -38,7 +38,6 @@ module RuntimeUtil
 import Absyn
 import DifferentialEquations
 import DifferentialEquations.ReturnCode
-import DAE
 import ModelingToolkit
 import OMBackend
 import OMBackend.@BACKEND_LOGGING
@@ -337,7 +336,8 @@ the old variable of its name without the component (`bouncingBall_y` the pendulu
 every variable that way, fixed and its attributes replaced, made a MultiBody model's recompiled
 system unbalanced (`body_frame_a_f` took `revolute_frame_a_f`'s value).
 """
-function updateInitialConditions!(simCode, integrator)::Nothing
+function updateInitialConditions!(simCode::OMBackend.SimCode.SIM_CODE, integrator)::Nothing
+  local SC = OMBackend.SimCode
   local values = createLookupTable(integrator)
   #= the old values by the name without the component; nothing when two old variables share it =#
   local byLocalName = Dict{String, Union{Nothing, Float64}}()
@@ -348,23 +348,24 @@ function updateInitialConditions!(simCode, integrator)::Nothing
   end
   local ht = simCode.stringToSimVarHT
   for (name, (idx, simVar)) in ht
-    local attributes0 = simVar.attributes
-    (attributes0 === nothing || attributes0.data isa DAE.VAR_ATTR_REAL) || continue
+    (simVar.elementType isa SC.TYPE_REAL || !SC.attributesGiven(simVar.elementType, simVar.attributes)) || continue
     local exact = get(values, name, nothing)
     local attributes = if exact !== nothing
-      OMBackend.SimulationCode._withStartValue(attributes0, exact)
+      SC.withAttributes(simVar.attributes; start = SC.RCONST(exact),
+                        fixed = SC.attributesGiven(simVar.elementType, simVar.attributes) ? simVar.attributes.fixed : SC.BCONST(false))
     else
       local other = get(byLocalName, _withoutComponent(name), nothing)
       other === nothing && continue
-      SOME(DAE.makeRealAttribute(; start = SOME(other), fixed = true))
+      SC.withAttributes(SC.NO_ATTRIBUTES; start = SC.RCONST(other), fixed = SC.BCONST(true))
     end
-    @assign simVar.attributes = attributes
-    ht[name] = (idx, simVar)
+    ht[name] = (idx, SC.SIMVAR(simVar.name, simVar.index, simVar.varKind, attributes, simVar.elementType))
   end
   return nothing
 end
 
-#= A flattened name without its first component (`pendulum_y` -> `y`; "" for `x`). =#
+"""
+A flattened name without its first component (`pendulum_y` -> `y`; "" for `x`).
+"""
 _withoutComponent(name::String)::String = join(split(name, "_")[2:end], "_")
 
 end #= module =#

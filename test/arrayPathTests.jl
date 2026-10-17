@@ -1,7 +1,7 @@
 #= Array-preserving code generation (translate with scalarized = false): models from the
    frontend's no-scalarize mode keep their loops in the generated code; results equal the
    scalarizing path's. =#
-const ARRAY_PATH_FILE = joinpath(@__DIR__, "models", "ArrayPath.mo")
+const ARRAY_PATH_FILE = joinpath(@__DIR__, "Models", "ArrayPath.mo")
 const _ARRAY_PATH_SCODE = Ref{Any}(nothing)
 
 function _arrayPathTranslate(model::String; scalarized::Bool)

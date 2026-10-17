@@ -309,8 +309,10 @@ function residualToExplicit(eq_expr::Expr)
     end
 end
 
-#= The number an expression of numeric literals and + - * / evaluates to,
-   or nothing. The emitters wrap literals in blocks with line numbers. =#
+"""
+The number an expression of numeric literals and + - * / evaluates to,
+or nothing. The emitters wrap literals in blocks with line numbers.
+"""
 function _numericLiteralValue(@nospecialize(ex))
     ex = _unwrapBlock(ex)
     ex isa Real && return ex

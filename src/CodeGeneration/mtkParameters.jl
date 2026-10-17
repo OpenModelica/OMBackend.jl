@@ -41,10 +41,12 @@
    of the model function, by the call's code. Every element called it (Buildings'
    TemperatureResponseMatrix: 152 calls of an impure function that computes a g-function
    and writes a file, 15 s each); a binding is evaluated once. =#
-#= `bindExp`: a SimCode binding, or a DAE start value (a parameter without a binding). =#
-function _parameterBindingExpr(bindExp::Union{SimulationCode.Exp, DAE.Exp}, simCode::SimulationCode.SIM_CODE)
+"""
+`bindExp`: a binding, or a start value (a parameter without a binding).
+"""
+function _parameterBindingExpr(bindExp::SC.Exp, simCode::SC.SIM_CODE)
   local e = expToJuliaExpMTK(bindExp, simCode)
-  (bindExp isa SimulationCode.Exp && _isLiteralCallElement(bindExp)) || return e
+  _isLiteralCallElement(bindExp) || return e
   #= the indexing, inside the quote blocks of the translation =#
   local ref = e
   while ref isa Expr && ref.head === :block
@@ -58,79 +60,52 @@ function _parameterBindingExpr(bindExp::Union{SimulationCode.Exp, DAE.Exp}, simC
   return e
 end
 
-#= f(...)[i, ...] with literal arguments and subscripts. =#
-_isLiteralCallElement(e::SimulationCode.Exp)::Bool =
-  e isa SimulationCode.ASUB && e.exp isa SimulationCode.CALL && all(_isLiteralSimExp, e.exp.args) &&
-  all(s -> s isa SimulationCode.ICONST, e.subs)
-
-_isLiteralSimExp(e::SimulationCode.Exp)::Bool =
-  e isa Union{SimulationCode.ICONST, SimulationCode.RCONST, SimulationCode.SCONST, SimulationCode.BCONST,
-              SimulationCode.ENUM_LITERAL} ||
-  (e isa SimulationCode.UNARY && _isLiteralSimExp(e.exp)) ||
-  (e isa SimulationCode.ARRAY_EXP && all(_isLiteralSimExp, e.elements))
+"""
+f(...)[i, ...] with literal arguments and subscripts.
+"""
+_isLiteralCallElement(e::SC.Exp)::Bool =
+  e isa SC.ASUB && e.exp isa SC.CALL && all(_isLiteralExp, e.exp.args) && all(s -> s isa SC.ICONST, e.subs)
 
 """
-  `createParameterEquationsMTK(parameters::Vector, type, simCode::SimulationCode.SIM_CODE)`
-    The Type specifies what kind of parameter equation a call to this function should yield.
+A parameter's value: its binding, else its start (a literal or an expression of other
+parameters: MSL 4.1.0's lightning examples), else 0.0.
 """
-function createParameterEquationsMTK(parameters::Vector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
-  local parameterEquations::Vector = Expr[]
+function _parameterValueExp(simVar::SC.SIMVAR)::SC.Exp
+  local k = simVar.varKind::SC.PARAMETER
+  k.bindExp === nothing || return k.bindExp
+  return something(simVar.attributes.start, SC.RCONST(0.0))
+end
+
+"""
+    createParameterEquationsMTK(parameters, simCode)
+
+The parameters' values as `p => value` pairs (a String parameter skipped). Both sides of a
+pair are wrapped with `Symbolics.wrap` to keep the pair element type at `Pair{Num, Num}`:
+without the left wrap MTK failed `convert(Pair{Num}, Pair{BasicSymbolicImpl{SymReal},
+Float64})` where the parameter symbol resolves to a bare `BasicSymbolic` (SpeedControlledDCPM);
+`Symbolics.wrap` is a no-op on a `Num`. An Integer or Boolean value as a float.
+"""
+function createParameterEquationsMTK(parameters::Vector, simCode::SC.SIM_CODE)::Vector{Expr}
+  local parameterEquations = Expr[]
   local ht = simCode.stringToSimVarHT
   for param in parameters
-    (index, simVar) = ht[param]
-    local simVarType::SimulationCode.SimVarType = simVar.varKind
-    bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => begin
-        exp
-      end
-      #= We have a parameter without a binding. Check if we have a start attribute...=#
-      SimulationCode.PARAMETER(__) => begin
-        local optAttributes::Option{DAE.VariableAttributes} = simVar.attributes
-        @match optAttributes begin
-          #= Its start, a literal or an expression of other parameters (MSL 4.1.0's
-             lightning examples: a start that reads another parameter was refused). =#
-          SOME(attr) where attr.start isa SOME => begin
-            @match SOME(startVal) = attr.start
-            startVal
-          end
-          #= Either NONE() for missing attributes, or SOME(attr) whose start is
-             NONE(). Both collapse to the default-float path. Without this
-             catch-all the match fails on SOME{VariableAttributes} whose start
-             is unset (e.g. several Blocks.Examples.Filter variants). =#
-          _ => DAE.RCONST(0.0)
-        end
-      end
-      SimulationCode.STRING(__) => begin
-        @warn "String parameter $(param) found in numeric parameter list; skipping."
-        continue
-      end
-      _ => begin
-        throw(ErrorException("Unknown SimulationCode.SimVarType for parameter: " * string(param)  * " of type: " * string(simVarType)))
-      end
+    local simVar = last(ht[param])
+    if simVar.varKind isa SC.STRING
+      @warn "String parameter $(param) found in numeric parameter list; skipping."
+      continue
     end
-    #=
-      Check if conversions are needed.
-      Both sides of the Pair are wrapped with `Symbolics.wrap` to keep the
-      pair element type at `Pair{Num, Num}`. Without the LHS wrap MTK fails
-      `convert(Pair{Num}, Pair{BasicSymbolicImpl{SymReal}, Float64})` on
-      models like SpeedControlledDCPM where the parameter symbol resolves
-      to a bare `BasicSymbolic`. `Symbolics.wrap` is a no-op when the input
-      is already a `Num`.
-    =#
-    expr = if isIntOrBool(bindExp)
+    simVar.varKind isa SC.PARAMETER ||
+      throw(ErrorException("Unknown SimVarType for parameter: " * string(param) * " of type: " * string(simVar.varKind)))
+    local bindExp = _parameterValueExp(simVar)
+    push!(parameterEquations, if isIntOrBool(bindExp)
       quote
         $(LineNumberNode(@__LINE__, "$param eq"))
         Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap(float($(_parameterBindingExpr(bindExp, simCode))))
       end
     else
-        :(Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap($(_parameterBindingExpr(bindExp, simCode))))
-    end
-      # expr = quote
-      #   $(LineNumberNode(@__LINE__, "$param eq"))
-      #   $(Symbol(simVar.name)) => float($((expToJuliaExpMTK(bindExp, simCode))))
-      # end
-    push!(parameterEquations, expr)
-  end #=For=#
+      :(Symbolics.wrap($(Symbol(simVar.name))) => Symbolics.wrap($(_parameterBindingExpr(bindExp, simCode))))
+    end)
+  end
   return parameterEquations
 end
 
@@ -140,78 +115,68 @@ end
   concrete Julia arrays assigned to their symbol names, so that the generated
   algorithmic functions can subscript into them.
 """
-function createArrayParametersMTK(arrayParameters::Vector, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+function createArrayParametersMTK(arrayParameters::Vector, simCode::SC.SIM_CODE)::Vector{Expr}
   local exprs = Expr[]
   local ht = simCode.stringToSimVarHT
   for param in arrayParameters
-    (_, simVar) = ht[param]
+    local simVar = last(ht[param])
     local vk = simVar.varKind
-    @match vk begin
-      SimulationCode.ARRAY_PARAMETER(dims, SOME(bindExp)) => begin
-        local valExpr = expToJuliaExpMTK(bindExp, simCode)
-        push!(exprs, :($(Symbol(simVar.name)) = $(valExpr)))
-      end
-      SimulationCode.ARRAY_PARAMETER(dims, NONE()) => begin
-        #= AUDIT (ombackend-bug-audit-2026-06-05 #12): no binding expression.
-           Mirror the scalar parameter paths (createParameterEquationsMTK /
-           createParameterArray) and consult the declared start attribute before
-           defaulting to zeros, so an unbound array parameter carrying a non-zero
-           array-literal start is not silently materialized as all zeros. Only an
-           explicit array-literal start is emitted directly (a scalar/other start
-           has ambiguous broadcast shape); anything else falls through to a
-           warned zeros materialization so the gap is attributable. =#
-        local arrStart = @match simVar.attributes begin
-          SOME(attr) where attr.start isa SOME => begin
-            @match SOME(sv) = attr.start
-            (sv isa DAE.ARRAY) ? expToJuliaExpMTK(sv, simCode) : nothing
-          end
-          _ => nothing
-        end
-        if arrStart === nothing
-          @warn "[MTK GEN: createArrayParametersMTK] array parameter $(simVar.name): no binding and no array-literal start; materializing as zeros($(dims)). Any function subscripting it computes with zeros."
-          push!(exprs, :($(Symbol(simVar.name)) = zeros(Float64, $(dims...))))
-        else
-          push!(exprs, :($(Symbol(simVar.name)) = $(arrStart)))
-        end
-      end
-      _ => nothing
+    vk isa SC.ARRAY_PARAMETER || continue
+    if vk.bindExp !== nothing
+      push!(exprs, :($(Symbol(simVar.name)) = $(expToJuliaExpMTK(vk.bindExp, simCode))))
+      continue
+    end
+    #= AUDIT (ombackend-bug-audit-2026-06-05 #12): no binding expression. Mirror the scalar
+       parameter paths (createParameterEquationsMTK / createParameterArray) and consult the
+       declared start attribute before defaulting to zeros, so an unbound array parameter
+       carrying a non-zero array-literal start is not silently materialized as all zeros. Only
+       an explicit array-literal start is emitted directly (a scalar/other start has ambiguous
+       broadcast shape); anything else falls through to a warned zeros materialization so the
+       gap is attributable. =#
+    local start = simVar.attributes.start
+    if start isa SC.ARRAY_EXP
+      push!(exprs, :($(Symbol(simVar.name)) = $(expToJuliaExpMTK(start, simCode))))
+    else
+      @warn "[MTK GEN: createArrayParametersMTK] array parameter $(simVar.name): no binding and no array-literal start; materializing as zeros($(vk.dimensions)). Any function subscripting it computes with zeros."
+      push!(exprs, :($(Symbol(simVar.name)) = zeros(Float64, $(vk.dimensions...))))
     end
   end
   return exprs
 end
 
-#= The binding the model function assigns a parameter (createParameterAssignmentsMTK),
-   or nothing. A tunable parameter stays the symbolic @parameters variable: a parameter
-   bound to it (`rate = 3 * k`) then lowers to a symbolic expression, so changing k
-   changes rate too. One without a binding (a free parameter, fixed = false) is
-   computed by the initialization. =#
-function _assignedBinding(param, ht)
-  SimulationCode.isTunableParameter(param) && return nothing
-  return @match ht[param][2].varKind begin
-    SimulationCode.PARAMETER(bindExp = SOME(exp)) => exp
-    _ => nothing
-  end
+"""
+The binding the model function assigns a parameter (createParameterAssignmentsMTK),
+or nothing. A tunable parameter stays the symbolic @parameters variable: a parameter
+bound to it (`rate = 3 * k`) then lowers to a symbolic expression, so changing k
+changes rate too. One without a binding (a free parameter, fixed = false) is
+computed by the initialization.
+"""
+function _assignedBinding(param::String, ht::AbstractDict)::Union{Nothing, SC.Exp}
+  OMBackend.isTunableParameter(param) && return nothing
+  local k = last(ht[param]).varKind
+  return k isa SC.PARAMETER ? k.bindExp : nothing
 end
 
-#= The parameters the model function assigns no value: the equations and the other
-   parameters' bindings refer to them by name, as the symbolic parameters. =#
-unassignedParameters(parameters::Vector, simCode::SimulationCode.SIM_CODE)::Set{Symbol} =
+"""
+The parameters the model function assigns no value: the equations and the other
+parameters' bindings refer to them by name, as the symbolic parameters.
+"""
+unassignedParameters(parameters::Vector, simCode::SC.SIM_CODE)::Set{Symbol} =
   Set{Symbol}(Symbol(p) for p in parameters if _assignedBinding(p, simCode.stringToSimVarHT) === nothing)
 
 """
   Creates parameters assignments *(:=) on a MTK parameters compatible format.
 """
-function createParameterAssignmentsMTK(parameters::Vector,
-                                       simCode::SimulationCode.SIM_CODE)::Vector{Expr}
-  local parameterEquations::Vector = Expr[]
+function createParameterAssignmentsMTK(parameters::Vector, simCode::SC.SIM_CODE)::Vector{Expr}
+  local parameterEquations = Expr[]
   local ht = simCode.stringToSimVarHT
   for param in parameters
-    bindExp = _assignedBinding(param, ht)
+    local bindExp = _assignedBinding(param, ht)
     bindExp === nothing && continue
-    (index, simVar) = ht[param]
+    local simVar = last(ht[param])
     #= Solution for https://github.com/SciML/ModelingToolkit.jl/issues/991 =#
     #TODO: Is this workaround still relevant? John 2023-02-22
-    expr =  if isIntOrBool(bindExp)
+    local expr = if isIntOrBool(bindExp)
       quote
         $(LineNumberNode(@__LINE__, "$param eq"))
         $(Symbol(simVar.name)) = float($(_parameterBindingExpr(bindExp, simCode)))
@@ -236,7 +201,7 @@ table2_combiTimeTable_fileName = "NoName"
 lossTable_fileName = "NoName"
 ```
 """
-function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+function createStringParameterAssignments(simCode::SC.SIM_CODE)::Vector{Expr}
   local exprs::Vector{Expr} = Expr[]
   local emitted = Set{String}()
   #= Variables the SimCode passes eliminated (aliases, folded equations): no
@@ -247,32 +212,28 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
      a String parameter bound to a function's SHA) =#
   local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
   for varName in keys(simCode.stringToSimVarHT)
-    SimulationCode.isTunableParameter(varName) && continue
-    (idx, simVar) = simCode.stringToSimVarHT[varName]
-    local bindExp = @match simVar.varKind begin
-      SimulationCode.STRING(bindExp = SOME(e)) => e
-      SimulationCode.PARAMETER(bindExp = SOME(e)) where _isLiteralBind(e) => e
-      _ => nothing
-    end
+    OMBackend.isTunableParameter(varName) && continue
+    local simVar = last(simCode.stringToSimVarHT[varName])
+    local k = simVar.varKind
+    local bindExp = k isa SC.STRING ? k.bindExp :
+      (k isa SC.PARAMETER && k.bindExp !== nothing && _isLiteralBind(k.bindExp)) ? k.bindExp : nothing
     #= A String variable set by an equation (`s = if time > 0.5 then "ab"
        else "abc"`) was assigned nowhere: an UndefVarError at module load. =#
-    bindExp === nothing && simVar.varKind isa SimulationCode.STRING &&
+    bindExp === nothing && simVar.varKind isa SC.STRING &&
       OMBackend.unsupported("a String variable set by an equation", varName)
     bindExp === nothing && continue
     #= A String kind is a String parameter, but also a String variable: one
        reading time or a variable changes during the simulation, assigned here
        once (`t` undefined at module level). A String it reads is checked on
        its own. =#
-    if simVar.varKind isa SimulationCode.STRING
-      local d = SimulationCode.toDAEExp(bindExp)
-      local varying = _expMentionsTime(d) || any(Util.getAllCrefs(d)) do c
-        local e = get(simCode.stringToSimVarHT, string(c), nothing)
-        e !== nothing && last(e).varKind isa Union{SimulationCode.STATE, SimulationCode.STATE_DERIVATIVE,
-                                                   SimulationCode.ALG_VARIABLE, SimulationCode.DISCRETE,
-                                                   SimulationCode.INPUT, SimulationCode.ARRAY}
+    if simVar.varKind isa SC.STRING
+      local reads = SC.allCrefNames(bindExp)
+      local varying = _expMentionsTime(bindExp) || any(reads) do c
+        local e = get(simCode.stringToSimVarHT, c, nothing)
+        e !== nothing && last(e).varKind isa Union{SC.STATE, SC.STATE_DERIVATIVE, SC.ALG_VARIABLE, SC.DISCRETE, SC.INPUT, SC.ARRAY}
       end
       varying && OMBackend.unsupported("a String variable that changes during the simulation", varName)
-      local gone = [string(c) for c in Util.getAllCrefs(d) if string(c) in eliminated]
+      local gone = [c for c in reads if c in eliminated]
       isempty(gone) || OMBackend.unsupported("a String variable that reads an eliminated variable",
                                              varName * ": " * join(gone, ", "))
     end
@@ -295,11 +256,13 @@ function createStringParameterAssignments(simCode::SimulationCode.SIM_CODE)::Vec
   return exprs
 end
 
-#= Parameters with a computed binding that a DATA_STRUCTURE's binding reads (MSL 4.1
-   CombiTimeTable's isCsvExt from its file name, an argument of the table's constructor):
-   at module level as well, each after what it reads; a parameter that reads anything
-   else (a variable, an array or another data structure) is left as it was. =#
-function _dataStructureParameterPrelude(simCode::SimulationCode.SIM_CODE, emitted::Set{String})::Vector{Expr}
+"""
+Parameters with a computed binding that a DATA_STRUCTURE's binding reads (MSL 4.1
+CombiTimeTable's isCsvExt from its file name, an argument of the table's constructor):
+at module level as well, each after what it reads; a parameter that reads anything
+else (a variable, an array or another data structure) is left as it was.
+"""
+function _dataStructureParameterPrelude(simCode::SC.SIM_CODE, emitted::Set{String})::Vector{Expr}
   local ht = simCode.stringToSimVarHT
   local out = Expr[]
   local visiting = Set{String}()
@@ -315,12 +278,12 @@ function _dataStructureParameterPrelude(simCode::SimulationCode.SIM_CODE, emitte
     local e = get(ht, nm, nothing)
     e === nothing && return false
     local sv = last(e)
-    (sv.varKind isa SimulationCode.PARAMETER && !SimulationCode.isTunableParameter(nm)) || return false
+    (sv.varKind isa SC.PARAMETER && !OMBackend.isTunableParameter(nm)) || return false
     local b = sv.varKind.bindExp
-    b isa SOME || return false
+    b === nothing && return false
     push!(visiting, nm)
-    local ok = all(c -> emit!(string(c)), Util.getAllCrefs(SimulationCode.toDAEExp(b.data)))
-    local rhs = ok ? OMBackend._tryOr(() -> expToJuliaExpMTK(b.data, simCode), nothing, :dataStructureParameterPrelude;
+    local ok = all(emit!, SC.allCrefNames(b))
+    local rhs = ok ? OMBackend._tryOr(() -> expToJuliaExpMTK(b, simCode), nothing, :dataStructureParameterPrelude;
                                      only = UnsupportedLowering, impact = :result) : nothing
     delete!(visiting, nm)
     rhs === nothing && (push!(failed, nm); return false)
@@ -330,10 +293,8 @@ function _dataStructureParameterPrelude(simCode::SimulationCode.SIM_CODE, emitte
     return true
   end
   for (_, (_, sv)) in ht
-    sv.varKind isa SimulationCode.DATA_STRUCTURE || continue
-    local b = sv.varKind.bindExp
-    b isa SOME || continue
-    foreach(c -> emit!(string(c)), Util.getAllCrefs(SimulationCode.toDAEExp(b.data)))
+    (sv.varKind isa SC.DATA_STRUCTURE && sv.varKind.bindExp !== nothing) || continue
+    foreach(emit!, SC.allCrefNames(sv.varKind.bindExp))
   end
   return out
 end
@@ -344,18 +305,20 @@ end
    emission via createArrayParametersMTK happens too late: it lives inside
    `function <Model>Model(tspan)`, while DATA_STRUCTURE_ASSIGNMENTS run at
    module load time. =#
-#= Module-level prelude for array parameters referenced by DATA_STRUCTURE
-   constructors. Two cases:
+"""
+Module-level prelude for array parameters referenced by DATA_STRUCTURE
+constructors. Two cases:
 
-     1. The HT carries a single ARRAY_PARAMETER entry with a literal-array bind.
-        Emit `name = <array-expr>` directly.
-     2. The HT carries scalarized entries (e.g. `tableData[1][1]`,
-        `tableData[1][2]`, ..., `tableData[3][2]`) and the parent name has no
-        bind of its own. Reconstruct an N-dim Julia matrix from the scalar
-        element bindings and emit `tableData = <reconstructed>`. Required
-        because ExternalObject constructors (CombiTable, CombiTimeTable, ...)
-        appear at module top and reference the parent array name. =#
-function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+  1. The HT carries a single ARRAY_PARAMETER entry with a literal-array bind.
+     Emit `name = <array-expr>` directly.
+  2. The HT carries scalarized entries (e.g. `tableData[1][1]`,
+     `tableData[1][2]`, ..., `tableData[3][2]`) and the parent name has no
+     bind of its own. Reconstruct an N-dim Julia matrix from the scalar
+     element bindings and emit `tableData = <reconstructed>`. Required
+     because ExternalObject constructors (CombiTable, CombiTimeTable, ...)
+     appear at module top and reference the parent array name.
+"""
+function createArrayParameterPrelude(simCode::SC.SIM_CODE)::Vector{Expr}
   local exprs::Vector{Expr} = Expr[]
   local ht = simCode.stringToSimVarHT
 
@@ -366,15 +329,8 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
      resulting integration trajectory. =#
   local neededBases = OrderedSet{String}()
   for (_, (_, simVar)) in ht
-    @match simVar.varKind begin
-      SimulationCode.DATA_STRUCTURE(SOME(b)) => begin
-        @match b begin
-          SimulationCode.CALL(__) => SimulationCode.collectCrefNames!(neededBases, b)
-          _ => nothing
-        end
-      end
-      _ => nothing
-    end
+    (simVar.varKind isa SC.DATA_STRUCTURE && simVar.varKind.bindExp isa SC.CALL) &&
+      SC.crefNames!(neededBases, simVar.varKind.bindExp)
   end
   #= Also include any ARRAY_PARAMETER whose subscripted form appears in
      residual equations. This rescues `world_gravityArrowHead_lengthDirection[2]`
@@ -386,7 +342,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
      ARRAY_PARAMETERs in HT so we only emit parents that actually exist. =#
   local _residualCrefs = OrderedSet{String}()
   for eq in simCode.residualEquations
-    SimulationCode.collectCrefNames!(_residualCrefs, eq.exp)
+    SC.crefNames!(_residualCrefs, eq.exp)
   end
   for _n in _residualCrefs
     local _bracket = findfirst('[', _n)
@@ -394,11 +350,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
       local _base = _n[1:_bracket-1]
       local _entry = get(ht, _base, nothing)
       _entry === nothing && continue
-      local _isArr = @match _entry[2].varKind begin
-        SimulationCode.ARRAY_PARAMETER(__) => true
-        _ => false
-      end
-      _isArr && push!(neededBases, _base)
+      _entry[2].varKind isa SC.ARRAY_PARAMETER && push!(neededBases, _base)
     end
   end
   #= Collect orphan subscripted CREFs (referenced in residuals, base NOT in HT)
@@ -423,10 +375,7 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
 
   local emitted = OrderedSet{String}()
   for (varName, (_, simVar)) in ht
-    local bindExp = @match simVar.varKind begin
-      SimulationCode.ARRAY_PARAMETER(_, SOME(e)) => SimulationCode.toDAEExp(e)
-      _ => nothing
-    end
+    local bindExp = simVar.varKind isa SC.ARRAY_PARAMETER ? simVar.varKind.bindExp : nothing
     bindExp === nothing && continue
     varName ∈ neededBases || continue
     varName ∈ emitted && continue
@@ -453,16 +402,11 @@ function createArrayParameterPrelude(simCode::SimulationCode.SIM_CODE)::Vector{E
       push!(indices, parse(Int, m.captures[1]))
     end
     isempty(indices) && continue
-    local val = @match simVar.varKind begin
-      SimulationCode.PARAMETER(SOME(SimulationCode.RCONST(r))) => r
-      SimulationCode.PARAMETER(SOME(SimulationCode.ICONST(i))) => i
-      SimulationCode.PARAMETER(SOME(SimulationCode.BCONST(b))) => b
-      #= An element bound to an expression of parameters, its value at the build (MSL
-         4 BearingFriction's ExternalCombiTable1D(table = tau_pos) with RobotR3's
-         tau_pos = [0, Rv0 / unitTorque; ...]: the table was undefined). =#
-      SimulationCode.PARAMETER(SOME(e)) => SimulationCode.valueAtBuildStart(SimulationCode.toDAEExp(e), simCode)
-      _ => nothing
-    end
+    #= A literal binding; one of an expression of parameters, its value at the build (MSL 4
+       BearingFriction's ExternalCombiTable1D(table = tau_pos) with RobotR3's tau_pos = [0, Rv0
+       / unitTorque; ...]: the table was undefined). =#
+    local b = simVar.varKind isa SC.PARAMETER ? simVar.varKind.bindExp : nothing
+    local val = b === nothing ? nothing : b isa Union{SC.RCONST, SC.ICONST, SC.BCONST} ? b.value : SC.valueAtBuildStart(b, simCode)
     val === nothing && continue
     push!(get!(scalarGroups, baseName, Tuple{Vector{Int}, Any, Int}[]),
           (indices, val, length(indices)))
@@ -534,7 +478,7 @@ The module-level assignments of the data structures (records, external objects) 
 `dataStructureVariables`; an external object is registered under the model `owner`, whose build
 frees it (a structural mode's are its model's).
 """
-function createDataStructureAssignments(dataStructureVariables::Vector{String}, simCode::SimulationCode.SIM_CODE;
+function createDataStructureAssignments(dataStructureVariables::Vector{String}, simCode::SC.SIM_CODE;
                                         owner::String = simCode.name)::Vector{Expr}
   local dsAssignments::Vector = Expr[]
   local ht = simCode.stringToSimVarHT
@@ -545,15 +489,11 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
      using CombiTable / CombiTimeTable / ExternalObject constructors. =#
   local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
   for ds in dataStructureVariables
-    (index, simVar) = ht[ds]
-    local simVarType::SimulationCode.SimVarType = simVar.varKind
-    #= An unbound DATA_STRUCTURE (bindExp NONE) is a dead/eliminated record
-       field with no remaining reference (e.g. a Medium `data` field whose uses
-       were constant-folded away); emit nothing rather than failing the model. =#
-    bindExp = @match simVarType begin
-      SimulationCode.DATA_STRUCTURE(bindExp = SOME(exp)) => exp
-      _ => nothing
-    end
+    local simVar = last(ht[ds])
+    #= An unbound DATA_STRUCTURE is a dead/eliminated record field with no remaining reference
+       (a Medium `data` field whose uses were constant-folded away); emit nothing rather than
+       failing the model. =#
+    local bindExp = simVar.varKind isa SC.DATA_STRUCTURE ? simVar.varKind.bindExp : nothing
     bindExp === nothing && continue
     local rhs = expToJuliaExpMTK(bindExp, simCode)
     if rhs isa Expr
@@ -561,9 +501,9 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
     end
     #= an external object by its name in the terms that read it (ExternalObjectRef), owned by
        this model's build and freed with it by its class's destructor =#
-    local callee = bindExp isa SimulationCode.CALL ? OMBackend.canonicalName(string(bindExp.path)) : ""
+    local callee = bindExp isa SC.CALL ? String(bindExp.name) : ""
     local destructor = endswith(callee, "_constructor") ? Symbol(replace(callee, r"_constructor$" => "_destructor")) : Symbol("")
-    expr = quote
+    local expr = quote
       $(LineNumberNode(@__LINE__, "$ds eq"))
       $(Symbol(simVar.name)) = OMBackend.CodeGeneration._externalObjectRef($(QuoteNode(Symbol(simVar.name))), $(rhs),
                                                                         $(QuoteNode(destructor)), $(OMBackend.canonicalName(owner)))
@@ -572,7 +512,7 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
     #= A record's fields by their flattened names too (`Medium_data[1]_MM`): the equations
        read the record, the eliminated observed equations its fields (the MSL ideal-gas
        mixtures' molar masses: UndefVarError). =#
-    if bindExp isa SimulationCode.RECORD && length(bindExp.fieldNames) == length(bindExp.exps)
+    if bindExp isa SC.RECORD && length(bindExp.fieldNames) == length(bindExp.exps)
       for (field, fieldExp) in zip(bindExp.fieldNames, bindExp.exps)
         local fieldRhs = try
           expToJuliaExpMTK(fieldExp, simCode)
@@ -583,7 +523,7 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
         local fieldSym = Symbol(simVar.name * "_" * field)
         push!(dsAssignments, :($(fieldSym) = $(fieldRhs)))
         #= An array field's elements by their scalarized names too (`Medium_data_alow[1]`). =#
-        if fieldExp isa SimulationCode.ARRAY_EXP
+        if fieldExp isa SC.ARRAY_EXP
           for k in eachindex(fieldExp.elements)
             push!(dsAssignments, :($(Symbol("$(fieldSym)[$(k)]")) = $(fieldSym)[$(k)]))
           end
@@ -595,20 +535,20 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
   return dsAssignments
 end
 
-#= For an array of records `base[1..n]` among the data structures, each field as an array
-   `base_field = [base[1]_field, ...]`: a whole record array passed to a function goes field
-   by field (`h_T(Medium_data_name, Medium_data_MM, ...)`). =#
-function _recordArrayFieldArrays(dataStructureVariables::Vector{String}, simCode::SimulationCode.SIM_CODE)::Vector{Expr}
+"""
+For an array of records `base[1..n]` among the data structures, each field as an array
+`base_field = [base[1]_field, ...]`: a whole record array passed to a function goes field
+by field (`h_T(Medium_data_name, Medium_data_MM, ...)`).
+"""
+function _recordArrayFieldArrays(dataStructureVariables::Vector{String}, simCode::SC.SIM_CODE)::Vector{Expr}
   local ht = simCode.stringToSimVarHT
   local elements = OrderedDict{String, Dict{Int, Vector{String}}}()
   for ds in dataStructureVariables
     local m = match(r"^(.*)\[(\d+)\]$", ds)
     m === nothing && continue
-    local bindExp = @match ht[ds][2].varKind begin
-      SimulationCode.DATA_STRUCTURE(bindExp = SOME(exp)) => exp
-      _ => nothing
-    end
-    bindExp isa SimulationCode.RECORD || continue
+    local k = ht[ds][2].varKind
+    local bindExp = k isa SC.DATA_STRUCTURE ? k.bindExp : nothing
+    bindExp isa SC.RECORD || continue
     get!(elements, m.captures[1], Dict{Int, Vector{String}}())[parse(Int, m.captures[2])] = bindExp.fieldNames
   end
   local out = Expr[]
@@ -630,53 +570,33 @@ Statically fold a parameter bind expression to a Float64. Returns nothing
 when the expression depends on anything that is not a parameter chain
 grounded in literals.
 """
-function _foldParameterBindStatic(@nospecialize(exp), simCode::SimulationCode.SIM_CODE;
-                                  depth::Int = 0)::Union{Float64, Nothing}
+function _foldParameterBindStatic(exp::SC.Exp, simCode::SC.SIM_CODE; depth::Int = 0)::Union{Float64, Nothing}
   depth > 32 && return nothing
-  if exp isa SimulationCode.RCONST || exp isa SimulationCode.ICONST
-    return Float64(exp.value)
-  elseif exp isa SimulationCode.BCONST
-    return exp.value ? 1.0 : 0.0
-  elseif exp isa DAE.RCONST
-    return Float64(exp.real)
-  elseif exp isa DAE.ICONST
-    return Float64(exp.integer)
-  elseif exp isa DAE.BCONST
-    return exp.bool ? 1.0 : 0.0
-  elseif exp isa SimulationCode.ENUM_LITERAL || exp isa DAE.ENUM_LITERAL
-    return Float64(exp.index)
-  elseif exp isa SimulationCode.CAST
-    return _foldParameterBindStatic(exp.exp, simCode; depth = depth + 1)
-  elseif exp isa SimulationCode.UNARY
+  exp isa Union{SC.RCONST, SC.ICONST} && return Float64(exp.value)
+  exp isa SC.BCONST && return exp.value ? 1.0 : 0.0
+  exp isa SC.ENUM_LITERAL && return Float64(exp.index)
+  exp isa SC.CAST && return _foldParameterBindStatic(exp.exp, simCode; depth = depth + 1)
+  if exp isa SC.UNARY
     local v = _foldParameterBindStatic(exp.exp, simCode; depth = depth + 1)
-    v === nothing && return nothing
-    local op = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
-    return op === :- ? -v : (op === :+ ? v : nothing)
-  elseif exp isa SimulationCode.BINARY
+    return v === nothing ? nothing : -v
+  elseif exp isa SC.BINARY
     local l = _foldParameterBindStatic(exp.exp1, simCode; depth = depth + 1)
     l === nothing && return nothing
     local r = _foldParameterBindStatic(exp.exp2, simCode; depth = depth + 1)
     r === nothing && return nothing
-    local binop = DAE_OP_toJuliaOperator(SimulationCode.toDAEOperator(exp.op))
-    binop === :+ && return l + r
-    binop === :- && return l - r
-    binop === :* && return l * r
-    binop === :/ && return l / r
-    binop === :^ && return l ^ r
+    exp.op === SC.OP_ADD && return l + r
+    exp.op === SC.OP_SUB && return l - r
+    exp.op === SC.OP_MUL && return l * r
+    exp.op === SC.OP_DIV && return l / r
+    exp.op === SC.OP_POW && return l ^ r
     return nothing
-  elseif exp isa SimulationCode.EXP_CREF
+  elseif exp isa SC.EXP_CREF
     exp.cref.sym === :time && return nothing
-    local lookUpStr = isempty(exp.cref.subs) ?
-      string(exp.cref.sym) :
-      string(exp.cref.sym, "[", join(exp.cref.subs, ","), "]")
-    local entry = get(simCode.stringToSimVarHT, lookUpStr, nothing)
+    local entry = get(simCode.stringToSimVarHT, SC.crefName(exp.cref), nothing)
     entry === nothing && return nothing
-    local bind = @match entry[2].varKind begin
-      SimulationCode.PARAMETER(bindExp = SOME(b)) => b
-      _ => nothing
-    end
-    bind === nothing && return nothing
-    return _foldParameterBindStatic(bind, simCode; depth = depth + 1)
+    local k = last(entry).varKind
+    (k isa SC.PARAMETER && k.bindExp !== nothing) || return nothing
+    return _foldParameterBindStatic(k.bindExp, simCode; depth = depth + 1)
   end
   return nothing
 end
@@ -687,31 +607,15 @@ end
   The index here is the index assigned by the code generator earlier in the lowering
   of the hybrid DAE.
 """
-function createParameterArray(parameters::Vector{T1},
-                              parameterAssignments::Vector{T2},
-                              simCode::SIM_T) where {T1, T2, SIM_T}
+function createParameterArray(parameters::Vector, parameterAssignments::Vector, simCode::SC.SIM_CODE)
   local paramArray = Union{Float64, Symbol}[]
   local hT = simCode.stringToSimVarHT
   for param in parameters
-    (index, simVar) = hT[param]
-    local simVarType::SimulationCode.SimVarType = simVar.varKind
-    local hasBind::Bool = false
-    bindExp = @match simVarType begin
-      SimulationCode.PARAMETER(bindExp = SOME(exp)) => begin
-        hasBind = true
-        exp
-      end
-      SimulationCode.PARAMETER(__) => begin
-        @match simVar.attributes begin
-          SOME(attr) where attr.start isa SOME => begin
-            @match SOME(startVal) = attr.start
-            startVal
-          end
-          _ => DAE.RCONST(0.0)
-        end
-      end
-      _ => throw(ErrorException("createParameterArray: parameter $(param) has no bound expression (got $(simVarType))."))
-    end
+    local simVar = last(hT[param])
+    simVar.varKind isa SC.PARAMETER ||
+      throw(ErrorException("createParameterArray: parameter $(param) has no bound expression (got $(simVar.varKind))."))
+    local hasBind = simVar.varKind.bindExp !== nothing
+    local bindExp = _parameterValueExp(simVar)
     #= Fold statically; a codegen-time module-scope eval can read stale
        same-named symbols left behind by previously translated models. =#
     local folded = _foldParameterBindStatic(bindExp, simCode)

@@ -54,7 +54,7 @@
    t = 1e5). Each callback substitutes every other condition, n(n - 1) in all. =#
 const _TIME_EVENT_AHEAD = 1.0e-10
 
-function _buildTimeEventRefreshCallbacks(allPT::Vector, simCode)
+function _buildTimeEventRefreshCallbacks(allPT::Vector, simCode::SC.SIM_CODE)
   local n = length(allPT)
   local cbs = Expr[]
   for k in 1:n
@@ -103,7 +103,7 @@ end
 Each if equation is marked by the identifier.
 So the first will have 1 and so on.
 """
-function createIfEquations(stateVariables, algebraicVariables, simCode)
+function createIfEquations(stateVariables::Vector, algebraicVariables::Vector, simCode::SC.SIM_CODE)
   local ifEquations = IfEquationComponent[]
   local identifier::Int
   local sortedIfEquations = _sortedIfEquations(simCode)
@@ -127,14 +127,16 @@ function createIfEquations(stateVariables, algebraicVariables, simCode)
   return ifEquations
 end
 
-#= The if-equations in the order of their sort keys, each key computed once
-   (`sort(by = ...)` computed it, lowering residuals, at every comparison). =#
-function _sortedIfEquations(simCode)
+"""
+The if-equations in the order of their sort keys, each key computed once
+(`sort(by = ...)` computed it, lowering residuals, at every comparison).
+"""
+function _sortedIfEquations(simCode::SC.SIM_CODE)::Vector{SC.IF_EQUATION}
   local ifEqs = collect(simCode.ifEquations)
   return ifEqs[sortperm([_ifEquationSortKey(e, simCode) for e in ifEqs])]
 end
 
-function _ifEquationSortKey(ifEq::SimulationCode.IF_EQUATION, simCode)::String
+function _ifEquationSortKey(ifEq::SC.IF_EQUATION, simCode::SC.SIM_CODE)::String
   local targets = String[]
   for branch in ifEq.branches
     for resEq in branch.residualEquations
@@ -151,9 +153,9 @@ function _ifEquationSortKey(ifEq::SimulationCode.IF_EQUATION, simCode)::String
   return join(targets, "|")
 end
 
-function _ifConditionDependsOnTime(@nospecialize(condition))::Bool
+function _ifConditionDependsOnTime(condition::SC.Exp)::Bool
   local refs::OrderedSet{String} = OrderedSet{String}()
-  SimulationCode.collectCrefNames!(refs, condition)
+  SC.crefNames!(refs, condition)
   return "time" in refs
 end
 
@@ -171,16 +173,16 @@ The transition instant is then fixed a priori, so coincident time events
 Conservative: any non-parameter reference returns false, keeping the default
 per-branch continuous callback.
 """
-function _ifConditionIsPureTimeEvent(@nospecialize(condition), simCode)::Bool
+function _ifConditionIsPureTimeEvent(condition::SC.Exp, simCode::SC.SIM_CODE)::Bool
   local refs::OrderedSet{String} = OrderedSet{String}()
-  SimulationCode.collectCrefNames!(refs, condition)
+  SC.crefNames!(refs, condition)
   ("time" in refs) || return false
   local ht = simCode.stringToSimVarHT
   for name in refs
     name == "time" && continue
     local entry = get(ht, name, nothing)
     entry === nothing && return false
-    (entry[2].varKind isa SimulationCode.PARAMETER) || return false
+    (entry[2].varKind isa SC.PARAMETER) || return false
   end
   return true
 end
@@ -226,22 +228,24 @@ One for each conditional variable created.
    if-equation relay target (key of the shared relay-t0 map): exactly the
    chained staged-trajectory case where a boundary crossing must re-evaluate
    sibling conditions live instead of applying static toggles. =#
-function _conditionReferencesRelayTarget(@nospecialize(condition), rT0)::Bool
+function _conditionReferencesRelayTarget(condition::SC.Exp, rT0::AbstractDict{Symbol, Float64})::Bool
   isempty(rT0) && return false
   local refs::OrderedSet{String} = OrderedSet{String}()
-  SimulationCode.collectCrefNames!(refs, condition)
+  SC.crefNames!(refs, condition)
   for name in refs
     haskey(rT0, Symbol(name)) && return true
   end
   return false
 end
 
-#= Initial branch-condition values consistent with the t0 values of the
-   targets this if-equation defines. Round: evaluate every condition with the
-   current relay-t0 map, select the branch, evaluate the selected branch's
-   target RHS values at t0 and feed them back; stop when the condition vector
-   is stable. Mutates `rT0` so later if-equations see earlier targets. =#
-function _fixedPointInitialConditions(ifEq::SimulationCode.IF_EQUATION, simCode, rT0)::Vector{Bool}
+"""
+Initial branch-condition values consistent with the t0 values of the
+targets this if-equation defines. Round: evaluate every condition with the
+current relay-t0 map, select the branch, evaluate the selected branch's
+target RHS values at t0 and feed them back; stop when the condition vector
+is stable. Mutates `rT0` so later if-equations see earlier targets.
+"""
+function _fixedPointInitialConditions(ifEq::SC.IF_EQUATION, simCode::SC.SIM_CODE, rT0::AbstractDict{Symbol, Float64})::Vector{Bool}
   OMBackend.envSwitch("OMBACKEND_RELAY_T0_FIXEDPOINT") || return Bool[]
   local condBranches = [b for b in ifEq.branches if b.identifier != -1]
   local elseBranch = nothing
@@ -306,10 +310,10 @@ end
 
 function createIfEquation(stateVariables::Vector,
                           algebraicVariables::Vector,
-                          ifEq::SimulationCode.IF_EQUATION,
+                          ifEq::SC.IF_EQUATION,
                           identifier::Int,
-                          simCode,
-                          relayT0 = nothing)::IfEquationComponent
+                          simCode::SC.SIM_CODE,
+                          relayT0::Union{Nothing, AbstractDict{Symbol, Float64}} = nothing)::IfEquationComponent
   local i::Int = 0
   local nBranches::Int = length(ifEq.branches)
   local branchesWithConds::Int = nBranches - 1
@@ -354,182 +358,177 @@ function createIfEquation(stateVariables::Vector,
   local initLiterals = Expr[]
   for branch in ifEq.branches
     i += 1
-    @match branch begin
-      SimulationCode.BRANCH(condition, residuals, -1 #= Else =#, targets, _, _, _, _, _) => begin
-      end
-      SimulationCode.BRANCH(condition, residuals, _, targets, _, _, _, _, _) => begin
-        condIdx += 1
-        local mtkCond = transformToMTKContinuousConditionEquation(branch.condition, simCode)
-        #= Evaluate the initial value condition; the original operator decides
-           the zc == 0 boundary. Precomputed via the relay-aware fixed point. =#
-        local _closedB = MTK_CodeGenerationUtil.condClosedAtBoundary(branch.condition)
-        local ivCond = condIdx <= length(ivPre) ? ivPre[condIdx] :
-                       evalInitialCondition(transformToMTKContinuousConditionEquation(branch.condition, simCode;
-                                                                                      atInitial = true),
-                                            simCode; closedBoundary = _closedB, extraVals = _rT0)
-        local numVal = ivCond ? 1.0 : 0.0
-        local invVal = ivCond ? 0.0 : 1.0
-        #= Build ImperativeAffect: function returns a NamedTuple of new values.
-           modified NamedTuple maps aliases to the symbolic parameter variables.
-           Callback fires for every branch condition; ifCondN is the load-bearing
-           branch switch the residual ifelse reads.
+    branch.identifier == -1 && continue
+    condIdx += 1
+    local mtkCond = transformToMTKContinuousConditionEquation(branch.condition, simCode)
+    #= Evaluate the initial value condition; the original operator decides
+       the zc == 0 boundary. Precomputed via the relay-aware fixed point. =#
+    local _closedB = MTK_CodeGenerationUtil.condClosedAtBoundary(branch.condition)
+    local ivCond = condIdx <= length(ivPre) ? ivPre[condIdx] :
+                   evalInitialCondition(transformToMTKContinuousConditionEquation(branch.condition, simCode;
+                                                                                  atInitial = true),
+                                        simCode; closedBoundary = _closedB, extraVals = _rT0)
+    local numVal = ivCond ? 1.0 : 0.0
+    local invVal = ivCond ? 0.0 : 1.0
+    #= Build ImperativeAffect: function returns a NamedTuple of new values.
+       modified NamedTuple maps aliases to the symbolic parameter variables.
+       Callback fires for every branch condition; ifCondN is the load-bearing
+       branch switch the residual ifelse reads.
 
-           Direction-aware toggle: the MTK convention here is `zcLhs < 0` <=>
-           condition TRUE. The positive edge (`affect`, prev_sign < 0) is a
-           true->false transition, the negative edge (`affect_neg`, prev_sign > 0)
-           is false->true. So the firing branch's own ifCond is set false on the
-           positive edge and true on the negative edge. A single constant value
-           cannot toggle a condition that crosses repeatedly (e.g. a Pulse/periodic
-           source waveform). Other branches' ifConds keep their current value:
-           the branch conditions nest first-true-wins (generateIfExpressions), so
-           each ifCond stands for its own condition only. =#
-        local modifiedKws::Vector{Expr} = Expr[Expr(:kw, sym, sym) for sym in allIfCondSyms]
-        local modifiedNT::Expr = Expr(:tuple, Expr(:parameters, modifiedKws...))
-        local upKws::Vector{Expr}   = Expr[Expr(:kw, sym, (j == i) ? 0.0 : :(modified.$(sym))) for (j, sym) in enumerate(allIfCondSyms)]
-        local downKws::Vector{Expr} = Expr[Expr(:kw, sym, (j == i) ? 1.0 : :(modified.$(sym))) for (j, sym) in enumerate(allIfCondSyms)]
-        local upFExpr::Expr   = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, upKws...))))
-        local downFExpr::Expr = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, downKws...))))
-        local affectTuple::Expr     = :(($(upFExpr), $(modifiedNT)))
-        local affectNegTuple::Expr  = :(($(downFExpr), $(modifiedNT)))
-        #= Multi-branch chains whose conditions reference solved unknowns: a
-           static toggle scrambles the selection when one boundary crossing
-           hands over to a SIBLING branch (staged trajectories with computed
-           phase times). Re-evaluate every sibling condition live from its own
-           zero crossing on either edge; first-true-wins nesting keeps the
-           relay consistent. Purely time/parameter-staged chains keep the
-           static toggles: their transition instants are exact and the
-           deferred pure-time refresh machinery owns them. =#
-        local liveAffect = nothing
-        if branchesWithConds > 1 && length(allZcs) == branchesWithConds &&
-           anyRelayCondBranch &&
-           OMBackend.envSwitch("OMBACKEND_LIVE_IFCOND_AFFECT")
-          local liveKws = Expr[]
-          local liveObsKws = Expr[]
-          for (j, sym) in enumerate(allIfCondSyms)
-            local zcName = Symbol("zc", j)
-            local test = allClosed[j] ? :(observed.$(zcName) <= 0) : :(observed.$(zcName) < 0)
-            push!(liveKws, Expr(:kw, sym, :($(test) ? 1.0 : 0.0)))
-            push!(liveObsKws, Expr(:kw, zcName, allZcs[j]))
-          end
-          local liveFn = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, liveKws...))))
-          local liveObsNT = Expr(:tuple, Expr(:parameters, liveObsKws...))
-          liveAffect = :(ModelingToolkit.ImperativeAffect($(liveFn), $(modifiedNT);
-                                                          observed = $(liveObsNT), skip_checks = true))
-        end
-        #= When the branch condition depends on a non-lifted algebraic variable
-           (an operating-point value `evalInitialCondition` defaulted to 0, e.g.
-           an op-amp input voltage), the static initial ifCond can be wrong with
-           no zero-crossing to fire the affect. Add an `initialize` affect that
-           re-evaluates the condition from the solved state (mirrors
-           evalInitialCondition: zc < 0 means the condition is TRUE). Restricted
-           to non-lifted algebraic zc so it does not observe other lifted ifEq_tmp
-           values (which would form a circular init dependency). =#
-        local zcLhs = _extractZeroCrossingLHS(mtkCond)
-        local thisSym::Symbol = allIfCondSyms[i]
-        if MTK_CodeGenerationUtil._ifConditionAllDiscreteOrParameter(branch.condition, simCode)
-          #= A discrete or parameter condition: the residuals gate directly on it
-             (generateIfExpressions), whose own update event localises the step.
-             No crossing function, no callback. =#
-          push!(ivConditions, ivCond)
-        #= A condition with initial() is a relation (a constant crossing function
-           of either sign), not a pure-time event: `initial() or time > T` held
-           until T. =#
-        elseif !MTK_CodeGenerationUtil._hasInitialCall(branch.condition) &&
-               _ifConditionIsPureTimeEvent(branch.condition, simCode)
-          #= Deterministic time event: defer to model-level refresh callbacks built
-             in createIfEquations, so two sources whose transitions coincide cannot
-             drop one another's affect. `numVal` is the post-crossing ifCond value
-             (same value the per-branch toggle would set). The ifCond parameter is
-             still declared and initialised below via ivConditions. =#
-          push!(pureTimeEvents, (thisSym, zcLhs, mtkCond, numVal))
-          push!(ivConditions, ivCond)
-        else
-          #= The crossing function with a hysteresis relative to the branch's
-             buffered value (MLS 8.5; OpenModelica LessZC): a TRUE relation turns
-             FALSE when zc > eps, a FALSE one TRUE when zc < -eps, eps = H*scale.
-             g is never zero after initialization or an event, so a function
-             starting at its threshold (a dead centre) or two coinciding roots
-             cannot be missed or chatter. =#
-          #= Several relations: each crossing on its own scale (normalized), as each has its
-             own hysteresis in OpenModelica. One scale for all made it relative to the largest
-             operand: MSL Spice3 V_pulse's `(time < TD or counter2 == 0) or time >= T0 +
-             Tfalling` with Tfalling = 1e60 kept `time < TD` true after TD. =#
-          local zcHyst = zcLhs
-          local scaleExpr = MTK_CodeGenerationUtil._conditionScaleExpr(branch.condition, simCode)
-          if length(MTK_CodeGenerationUtil._eventRelations(branch.condition)) > 1
-            zcHyst = MTK_CodeGenerationUtil.transformToMTKContinuousCondition(branch.condition, simCode; normalized = true)
-            scaleExpr = 1.0
-          end
-          local hystCond = :((($(zcHyst)) + $(ZC_HYSTERESIS) * ($(scaleExpr)) * (1 - 2 * $(thisSym))) ~ 0)
-          push!(relations, (thisSym, zcHyst, scaleExpr))
-          #= The literal value at initialization, from the solved initial state
-             (the static value comes from start attributes). Not for conditions
-             on other lifted if-expressions: their values are not ready then. =#
-          local initAffect = nothing
-          local litInit = nothing
-          local litObsInit = Expr[]
-          if !_exprMentionsPrefix(zcLhs, "ifEq_tmp")
-            local litObs = Expr[]
-            local lit = MTK_CodeGenerationUtil._literalConditionExpr(branch.condition, simCode, litObs)
-            litInit = lit
-            litObsInit = litObs
-            if lit !== nothing
-              local litObsNT = Expr(:tuple, Expr(:parameters, litObs...))
-              local litModNT = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, thisSym)))
-              local litRetNT = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :(($(lit)) ? 1.0 : 0.0))))
-              initAffect = :(ModelingToolkit.ImperativeAffect(((modified, observed, ctx, integrator) -> $(litRetNT)),
-                                                              $(litModNT); observed = $(litObsNT), skip_checks = true))
-            end
-          end
-          local cond::Expr
-          local _dupLiveZc::Bool = false
-          if liveAffect !== nothing
-            local _zcKey = string(mtkCond)
-            #= A sibling may already have registered this exact crossing; its
-               live affect rewrites this branch's ifCond too. =#
-            _dupLiveZc = _zcKey in liveZcSeen
-            push!(liveZcSeen, _zcKey)
-          end
-          if _dupLiveZc
-            cond = :(nothing)
-          elseif liveAffect !== nothing
-            #= Positional affect form: the pair form does not commit an
-               ImperativeAffect's writes. =#
-            cond = :(ModelingToolkit.SymbolicContinuousCallback(
-              ($(hystCond)),
-              $(liveAffect);
-              affect_neg = $(liveAffect),
-              initialize = $(liveAffect),
-              rootfind = SciMLBase.RightRootFind,
-              reinitializealg = SciMLBase.NoInit()
-            ))
-          elseif initAffect !== nothing
-            #= Settled by the initialization too (MLS 8.6: a relation takes its
-               literal value at the initial solution), unless it reads pre(),
-               an event operator or time (the init solve is at t = 0). =#
-            if !_conditionHasCall(branch.condition, ("pre", "initial", "terminal", "sample", "edge", "change", "delay")) &&
-               !_ifConditionDependsOnTime(branch.condition)
-              local obsNames = Symbol[kw.args[1] for kw in litObsInit]
-              push!(initLiterals, :(($(QuoteNode(thisSym)), $(QuoteNode(obsNames)), Any[$([kw.args[2] for kw in litObsInit]...)],
-                                     (observed -> $(litInit)))))
-            end
-            cond = :(ModelingToolkit.SymbolicContinuousCallback(
-              ($(hystCond)) => $(affectTuple);
-              affect_neg = $(affectNegTuple),
-              initialize = $(initAffect),
-              reinitializealg = $(_BRANCH_EVENT_REINIT)
-            ))
-          else
-            cond = :(ModelingToolkit.SymbolicContinuousCallback(
-              ($(hystCond)) => $(affectTuple);
-              affect_neg = $(affectNegTuple),
-              reinitializealg = $(_BRANCH_EVENT_REINIT)
-            ))
-          end
-          _dupLiveZc || push!(conditions, cond)
-          push!(ivConditions, ivCond)
+       Direction-aware toggle: the MTK convention here is `zcLhs < 0` <=>
+       condition TRUE. The positive edge (`affect`, prev_sign < 0) is a
+       true->false transition, the negative edge (`affect_neg`, prev_sign > 0)
+       is false->true. So the firing branch's own ifCond is set false on the
+       positive edge and true on the negative edge. A single constant value
+       cannot toggle a condition that crosses repeatedly (e.g. a Pulse/periodic
+       source waveform). Other branches' ifConds keep their current value:
+       the branch conditions nest first-true-wins (generateIfExpressions), so
+       each ifCond stands for its own condition only. =#
+    local modifiedKws::Vector{Expr} = Expr[Expr(:kw, sym, sym) for sym in allIfCondSyms]
+    local modifiedNT::Expr = Expr(:tuple, Expr(:parameters, modifiedKws...))
+    local upKws::Vector{Expr}   = Expr[Expr(:kw, sym, (j == i) ? 0.0 : :(modified.$(sym))) for (j, sym) in enumerate(allIfCondSyms)]
+    local downKws::Vector{Expr} = Expr[Expr(:kw, sym, (j == i) ? 1.0 : :(modified.$(sym))) for (j, sym) in enumerate(allIfCondSyms)]
+    local upFExpr::Expr   = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, upKws...))))
+    local downFExpr::Expr = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, downKws...))))
+    local affectTuple::Expr     = :(($(upFExpr), $(modifiedNT)))
+    local affectNegTuple::Expr  = :(($(downFExpr), $(modifiedNT)))
+    #= Multi-branch chains whose conditions reference solved unknowns: a
+       static toggle scrambles the selection when one boundary crossing
+       hands over to a SIBLING branch (staged trajectories with computed
+       phase times). Re-evaluate every sibling condition live from its own
+       zero crossing on either edge; first-true-wins nesting keeps the
+       relay consistent. Purely time/parameter-staged chains keep the
+       static toggles: their transition instants are exact and the
+       deferred pure-time refresh machinery owns them. =#
+    local liveAffect = nothing
+    if branchesWithConds > 1 && length(allZcs) == branchesWithConds &&
+       anyRelayCondBranch &&
+       OMBackend.envSwitch("OMBACKEND_LIVE_IFCOND_AFFECT")
+      local liveKws = Expr[]
+      local liveObsKws = Expr[]
+      for (j, sym) in enumerate(allIfCondSyms)
+        local zcName = Symbol("zc", j)
+        local test = allClosed[j] ? :(observed.$(zcName) <= 0) : :(observed.$(zcName) < 0)
+        push!(liveKws, Expr(:kw, sym, :($(test) ? 1.0 : 0.0)))
+        push!(liveObsKws, Expr(:kw, zcName, allZcs[j]))
+      end
+      local liveFn = :((modified, observed, ctx, integrator) -> $(Expr(:tuple, Expr(:parameters, liveKws...))))
+      local liveObsNT = Expr(:tuple, Expr(:parameters, liveObsKws...))
+      liveAffect = :(ModelingToolkit.ImperativeAffect($(liveFn), $(modifiedNT);
+                                                      observed = $(liveObsNT), skip_checks = true))
+    end
+    #= When the branch condition depends on a non-lifted algebraic variable
+       (an operating-point value `evalInitialCondition` defaulted to 0, e.g.
+       an op-amp input voltage), the static initial ifCond can be wrong with
+       no zero-crossing to fire the affect. Add an `initialize` affect that
+       re-evaluates the condition from the solved state (mirrors
+       evalInitialCondition: zc < 0 means the condition is TRUE). Restricted
+       to non-lifted algebraic zc so it does not observe other lifted ifEq_tmp
+       values (which would form a circular init dependency). =#
+    local zcLhs = _extractZeroCrossingLHS(mtkCond)
+    local thisSym::Symbol = allIfCondSyms[i]
+    if MTK_CodeGenerationUtil._ifConditionAllDiscreteOrParameter(branch.condition, simCode)
+      #= A discrete or parameter condition: the residuals gate directly on it
+         (generateIfExpressions), whose own update event localises the step.
+         No crossing function, no callback. =#
+      push!(ivConditions, ivCond)
+    #= A condition with initial() is a relation (a constant crossing function
+       of either sign), not a pure-time event: `initial() or time > T` held
+       until T. =#
+    elseif !MTK_CodeGenerationUtil._hasInitialCall(branch.condition) &&
+           _ifConditionIsPureTimeEvent(branch.condition, simCode)
+      #= Deterministic time event: defer to model-level refresh callbacks built
+         in createIfEquations, so two sources whose transitions coincide cannot
+         drop one another's affect. `numVal` is the post-crossing ifCond value
+         (same value the per-branch toggle would set). The ifCond parameter is
+         still declared and initialised below via ivConditions. =#
+      push!(pureTimeEvents, (thisSym, zcLhs, mtkCond, numVal))
+      push!(ivConditions, ivCond)
+    else
+      #= The crossing function with a hysteresis relative to the branch's
+         buffered value (MLS 8.5; OpenModelica LessZC): a TRUE relation turns
+         FALSE when zc > eps, a FALSE one TRUE when zc < -eps, eps = H*scale.
+         g is never zero after initialization or an event, so a function
+         starting at its threshold (a dead centre) or two coinciding roots
+         cannot be missed or chatter. =#
+      #= Several relations: each crossing on its own scale (normalized), as each has its
+         own hysteresis in OpenModelica. One scale for all made it relative to the largest
+         operand: MSL Spice3 V_pulse's `(time < TD or counter2 == 0) or time >= T0 +
+         Tfalling` with Tfalling = 1e60 kept `time < TD` true after TD. =#
+      local zcHyst = zcLhs
+      local scaleExpr = MTK_CodeGenerationUtil._conditionScaleExpr(branch.condition, simCode)
+      if length(MTK_CodeGenerationUtil._eventRelations(branch.condition)) > 1
+        zcHyst = MTK_CodeGenerationUtil.transformToMTKContinuousCondition(branch.condition, simCode; normalized = true)
+        scaleExpr = 1.0
+      end
+      local hystCond = :((($(zcHyst)) + $(ZC_HYSTERESIS) * ($(scaleExpr)) * (1 - 2 * $(thisSym))) ~ 0)
+      push!(relations, (thisSym, zcHyst, scaleExpr))
+      #= The literal value at initialization, from the solved initial state
+         (the static value comes from start attributes). Not for conditions
+         on other lifted if-expressions: their values are not ready then. =#
+      local initAffect = nothing
+      local litInit = nothing
+      local litObsInit = Expr[]
+      if !_exprMentionsPrefix(zcLhs, "ifEq_tmp")
+        local litObs = Expr[]
+        local lit = MTK_CodeGenerationUtil._literalConditionExpr(branch.condition, simCode, litObs)
+        litInit = lit
+        litObsInit = litObs
+        if lit !== nothing
+          local litObsNT = Expr(:tuple, Expr(:parameters, litObs...))
+          local litModNT = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, thisSym)))
+          local litRetNT = Expr(:tuple, Expr(:parameters, Expr(:kw, thisSym, :(($(lit)) ? 1.0 : 0.0))))
+          initAffect = :(ModelingToolkit.ImperativeAffect(((modified, observed, ctx, integrator) -> $(litRetNT)),
+                                                          $(litModNT); observed = $(litObsNT), skip_checks = true))
         end
       end
+      local cond::Expr
+      local _dupLiveZc::Bool = false
+      if liveAffect !== nothing
+        local _zcKey = string(mtkCond)
+        #= A sibling may already have registered this exact crossing; its
+           live affect rewrites this branch's ifCond too. =#
+        _dupLiveZc = _zcKey in liveZcSeen
+        push!(liveZcSeen, _zcKey)
+      end
+      if _dupLiveZc
+        cond = :(nothing)
+      elseif liveAffect !== nothing
+        #= Positional affect form: the pair form does not commit an
+           ImperativeAffect's writes. =#
+        cond = :(ModelingToolkit.SymbolicContinuousCallback(
+          ($(hystCond)),
+          $(liveAffect);
+          affect_neg = $(liveAffect),
+          initialize = $(liveAffect),
+          rootfind = SciMLBase.RightRootFind,
+          reinitializealg = SciMLBase.NoInit()
+        ))
+      elseif initAffect !== nothing
+        #= Settled by the initialization too (MLS 8.6: a relation takes its
+           literal value at the initial solution), unless it reads pre(),
+           an event operator or time (the init solve is at t = 0). =#
+        if !_conditionHasCall(branch.condition, ("pre", "initial", "terminal", "sample", "edge", "change", "delay")) &&
+           !_ifConditionDependsOnTime(branch.condition)
+          local obsNames = Symbol[kw.args[1] for kw in litObsInit]
+          push!(initLiterals, :(($(QuoteNode(thisSym)), $(QuoteNode(obsNames)), Any[$([kw.args[2] for kw in litObsInit]...)],
+                                 (observed -> $(litInit)))))
+        end
+        cond = :(ModelingToolkit.SymbolicContinuousCallback(
+          ($(hystCond)) => $(affectTuple);
+          affect_neg = $(affectNegTuple),
+          initialize = $(initAffect),
+          reinitializealg = $(_BRANCH_EVENT_REINIT)
+        ))
+      else
+        cond = :(ModelingToolkit.SymbolicContinuousCallback(
+          ($(hystCond)) => $(affectTuple);
+          affect_neg = $(affectNegTuple),
+          reinitializealg = $(_BRANCH_EVENT_REINIT)
+        ))
+      end
+      _dupLiveZc || push!(conditions, cond)
+      push!(ivConditions, ivCond)
     end
   end
   #= Create the equations themselves =#
@@ -612,13 +611,11 @@ function createIfEquation(stateVariables::Vector,
                              relayGuesses, relations, initLiterals)
 end
 
-#= Whether a condition calls one of `names`. =#
-function _conditionHasCall(@nospecialize(cond), names)::Bool
-  cond isa SimulationCode.Exp && (cond = SimulationCode.toDAEExp(cond))
-  local found = Ref(false)
-  Util.traverseExpBottomUp(cond, (x, acc) -> begin
-    x isa DAE.CALL && x.path isa Absyn.IDENT && x.path.name in names && (found[] = true)
-    (x, true, acc)
-  end, 0)
-  return found[]
+"""
+Whether a condition calls one of the built-ins `names` (`pre` of a reference is a PRE).
+"""
+function _conditionHasCall(cond::SC.Exp, names::Tuple{Vararg{String}})::Bool
+  return SC.anyExp(cond) do x
+    (x isa SC.PRE && "pre" in names) || (x isa SC.CALL && x.kind === SC.CALL_BUILTIN && String(x.name) in names)
+  end
 end

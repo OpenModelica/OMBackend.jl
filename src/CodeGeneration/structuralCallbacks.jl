@@ -36,7 +36,7 @@
 """
   Creates the structural callbacks
 """
-function createStructuralCallbacks(simCode, structuralTransitions::Vector{ST}) where {ST}
+function createStructuralCallbacks(simCode::SC.SIM_CODE, structuralTransitions::Vector{SC.StructuralTransition})
   local structuralCallbacks = Expr[]
   local idx = 1
   for structuralTransisiton in structuralTransitions
@@ -49,14 +49,11 @@ end
 """
   Creates a single structural callback for an explicit transition.
 """
-function createStructuralCallback(simCode, simCodeStructuralTransition::SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION, idx)
-  local structuralTransition = simCodeStructuralTransition
+function createStructuralCallback(simCode::SC.SIM_CODE, structuralTransition::SC.EXPLICIT_STRUCTURAL_TRANSITION, idx::Int)
   local callbackName = createCallbackName(structuralTransition, 0)
-  # SIM.Exp -> DAE.Exp at the boundary; DAE-typed helpers below.
-  local conditionDAE = SimulationCode.toDAEExp(structuralTransition.transitionCondition)
-
-  if isContinuousCondition(conditionDAE, simCode)
-    local cond = transformToZeroCrossingCondition(conditionDAE)
+  local transitionCondition = structuralTransition.transitionCondition
+  if isContinuousCondition(transitionCondition, simCode)
+    local cond = transformToZeroCrossingCondition(transitionCondition)
     quote
       function $(Symbol(callbackName))(destinationSystem, callbacks)
         #= Represents a structural change. =#
@@ -83,7 +80,7 @@ function createStructuralCallback(simCode, simCodeStructuralTransition::Simulati
           structuralChange.structureChanged = true
         end
         function condition(x, t, integrator)
-          return $(expToJuliaExp(conditionDAE, simCode))
+          return $(expToJuliaExp(transitionCondition, simCode))
         end
         local cb = DiscreteCallback(condition, affect!)
         return (cb, structuralChange)
@@ -99,15 +96,10 @@ end
 TODO:
 Also make sure to create possible other elements in the structural when equation
 """
-function createStructuralCallback(simCode,
-                                  simCodeStructuralTransition::SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION,
-                                  idx)
-  local structuralTransition = simCodeStructuralTransition
+function createStructuralCallback(simCode::SC.SIM_CODE, structuralTransition::SC.IMPLICIT_STRUCTURAL_TRANSITION, idx::Int)
   local callbackName = createCallbackName(structuralTransition, idx)
-  local whenCondition = SimulationCode.toDAEExp(structuralTransition.whenEquation.condition)
-  local stmtLst = structuralTransition.whenEquation.whenStmtLst
-  local stringToSimVarHT = simCode.stringToSimVarHT
-  (whenOperators, recompilationDirective) = createStructuralWhenStatements(stmtLst, simCode)
+  local whenCondition = structuralTransition.whenEquation.condition
+  local (whenOperators, recompilationDirective) = createStructuralWhenStatements(structuralTransition.whenEquation.body, simCode)
   local affect::Expr = quote
     function affect!(integrator)
       $(whenOperators...)
@@ -118,97 +110,75 @@ function createStructuralCallback(simCode,
       terminate!(integrator, ReturnCode.Success)
     end
   end
-  callback = @match whenCondition begin
-    DAE.CALL(Absyn.IDENT("sample"), args, attrs) => begin
-      @match start <| interval <| tail = args
-      #= Resolve the interval at callback construction time. Literal RCONST/ICONST are
-         baked as compile-time constants (they cannot change between runs). Parameter
-         CREFs are resolved at runtime from the `pars` dict threaded into the callback
-         factory, so per-simulation parameter overrides (`simulate(tspan, parameters=...)`)
-         are honored. Falls back to the simCode-resolved value if the parameter is not
-         present in `pars` (e.g. alias-eliminated or renamed). =#
-      local Δt_code = @match interval begin
-        DAE.RCONST(r) => :( $(r) )
-        DAE.ICONST(i) => :( $(Float64(i)) )
-        DAE.CREF(cr, _) => begin
-          local cname = SimulationCode.DAE_identifierToString(cr)
-          local fallbackVal = begin
-            local sv = last(simCode.stringToSimVarHT[cname])
-            evalSimCodeParameter(sv, simCode)
-          end
-          quote
-            let _resolved = nothing
-              for (_k, _v) in pars
-                if string(_k) == $(cname)
-                  _resolved = _v
-                  break
-                end
-              end
-              isnothing(_resolved) ? $(fallbackVal) : _resolved
+  local callback = if SC.isBuiltin(whenCondition, :sample)
+    #= The interval: a literal is a constant of the code (it cannot change between runs); a
+       parameter is read at run time from the `pars` the callback factory takes, so a
+       simulation's parameter values (`simulate(tspan, parameters = ...)`) hold, its value
+       here the fallback where `pars` does not have it (an alias eliminated, renamed). =#
+    local interval = whenCondition.args[2]
+    local Δt_code = if interval isa Union{SC.RCONST, SC.ICONST}
+      :($(Float64(interval.value)))
+    elseif interval isa SC.EXP_CREF
+      local cname = SC.crefName(interval.cref)
+      local fallbackVal = evalSimCodeParameter(last(simCode.stringToSimVarHT[cname]), simCode)
+      quote
+        let _resolved = nothing
+          for (_k, _v) in pars
+            if string(_k) == $(cname)
+              _resolved = _v
+              break
             end
           end
+          isnothing(_resolved) ? $(fallbackVal) : _resolved
         end
-        _ => :( $(evalDAEConstant(interval, simCode)) )
       end
-      quote
-        $(affect)
-        local _Δt = $(Δt_code)
-        local cb = PeriodicCallback(affect!, _Δt)
-      end
+    else
+      :($(evalConstant(interval, simCode)))
     end
-    _ #=Continuous or discrete =# => begin
-      if isContinuousCondition(whenCondition, simCode)
-        local zeroCrossingCond = transformToZeroCrossingCondition(whenCondition)
-        quote
-          $(affect)
-          function condition(u, t, integrator)
-            return $(replaceVars(expToJuliaExpMTK(zeroCrossingCond, simCode);
-                                 integratorCref = "integrator",
-                                 prefix = "[",
-                                 suffix = "]",
-                                 ht = simCode.stringToSimVarHT,
-                                 useIndexedU = true,
-                                 useMTKIdx = true))
-          end
-          local cb = ContinuousCallback(condition, affect!)
-        end
-      else #= Discrete =#
-        quote
-          $(affect)
-          function condition(u, t, integrator)
-            return $(expToJuliaExpMTK(whenCondition, simCode))
-          end
-          local cb = ContinuousCallback(condition, affect!)
-        end
-
+    quote
+      $(affect)
+      local _Δt = $(Δt_code)
+      local cb = PeriodicCallback(affect!, _Δt)
+    end
+  elseif isContinuousCondition(whenCondition, simCode)
+    local zeroCrossingCond = transformToZeroCrossingCondition(whenCondition)
+    quote
+      $(affect)
+      function condition(u, t, integrator)
+        return $(replaceVars(expToJuliaExpMTK(zeroCrossingCond, simCode);
+                             integratorCref = "integrator",
+                             prefix = "[",
+                             suffix = "]",
+                             ht = simCode.stringToSimVarHT,
+                             useIndexedU = true,
+                             useMTKIdx = true))
       end
+      local cb = ContinuousCallback(condition, affect!)
+    end
+  else
+    quote
+      $(affect)
+      function condition(u, t, integrator)
+        return $(expToJuliaExpMTK(whenCondition, simCode))
+      end
+      local cb = ContinuousCallback(condition, affect!)
     end
   end
   #=
     Construct the specified structural change.
     Dispatch on whether this is a standard recompilation or an agentic one.
   =#
-  @match SOME(metaModel) = simCode.metaModel
-  structuralCallback = if typeof(recompilationDirective) === BDAE.AGENTIC_RECOMPILATION ||
-                          typeof(recompilationDirective) === SimulationCode.AGENTIC_RECOMPILATION
+  local metaModel = simCode.frontendModel
+  metaModel === nothing && unsupported("a structural change of a model without its frontend model", simCode.name)
+  local structuralCallback = if recompilationDirective isa SC.AGENTIC_RECOMPILATION
     #= Agentic recompilation: new values come from the external agent at runtime =#
-    local componentsToChange = [string(c) for c in recompilationDirective.componentsToChange]
-    local promptVal = if isSome(recompilationDirective.prompt)
-      @match SOME(s) = recompilationDirective.prompt
-      s
-    else
-      nothing
-    end
-    local initEqVal = if isSome(recompilationDirective.initialEquations)
-      @match SOME(s) = recompilationDirective.initialEquations
-      s
-    else
-      nothing
-    end
+    local componentsToChange = String[SC.crefName(c) for c in recompilationDirective.componentsToChange]
+    local promptVal = recompilationDirective.prompt
+    local initEqVal = recompilationDirective.initialEquations
     quote
       function $(Symbol(callbackName))(reducedSystem, pars)
         #= Build a name→MTK-index map so condition functions use the correct u[i].
-           MTK may reorder unknowns relative to the BDAE state indices. =#
+           MTK may reorder unknowns relative to the SimCode state indices. =#
         local _mtk_idx = Dict{String, Int}(
           split(string(v), "(")[1] => i
           for (i, v) in enumerate(ModelingToolkit.unknowns(reducedSystem)))
@@ -228,27 +198,23 @@ function createStructuralCallback(simCode,
       end
     end
   else
-    #= Standard recompilation: new value is determined by a Modelica expression =#
-    local componentToModify = string(recompilationDirective.componentToChange)
-    # RECOMPILATION.newValue is ::Exp post-migration; collapse to DAE.Exp for both
-    # the cref-as-string lookup and the codegen call.
-    local newValueDAE = SimulationCode.toDAEExp(recompilationDirective.newValue)
-    local newValue::Expr = if typeof(newValueDAE) === DAE.CREF
-      local variableSpec = last(simCode.stringToSimVarHT[string(newValueDAE)])
-      @match SimulationCode.SIMVAR(name, index, SimulationCode.PARAMETER(SOME(bindExp)), _) = variableSpec
-      expToJuliaExpMTK(bindExp, simCode)
+    #= Standard recompilation: the new value is a Modelica expression; a parameter's is its
+       binding, another evaluated with the component's current value =#
+    local componentToModify = SC.crefName(recompilationDirective.componentToChange)
+    local newValueExp = recompilationDirective.newValue
+    local newValue::Expr = if newValueExp isa SC.EXP_CREF
+      local variableSpec = last(simCode.stringToSimVarHT[SC.crefName(newValueExp.cref)])
+      (variableSpec.varKind isa SC.PARAMETER && variableSpec.varKind.bindExp !== nothing) ||
+        unsupported("a structural change to a variable other than a bound parameter", variableSpec.name)
+      expToJuliaExpMTK(variableSpec.varKind.bindExp, simCode)
     else
-      newValue = expToJuliaExpMTK(newValueDAE, simCode)
-      evalExpr = quote
-          variableSpec = last(stringToSimVarHT[$(componentToModify)])
-          @match SimulationCode.SIMVAR(name, index, SimulationCode.PARAMETER(SOME(bindExp)), _) = variableSpec
-          parameterVal = OMBackend.CodeGeneration.evalDAEConstant(bindExp)
-          $(Symbol(componentToModify)) = parameterVal
-          $(newValue)
-        end
-      evalExpr
+      quote
+        local variableSpec = last(stringToSimVarHT[$(componentToModify)])
+        $(Symbol(componentToModify)) = OMBackend.CodeGeneration.evalConstant(variableSpec.varKind.bindExp)
+        $(expToJuliaExpMTK(newValueExp, simCode))
+      end
     end
-    modification = quote
+    local modification = quote
       ($(componentToModify), $("$(newValue)"))
     end
     quote
@@ -277,19 +243,11 @@ end
   Creates the supermodel that composes one or more submodels.
   This is to allow the model to modify itself.
 """
-function createStructuralAssignments(simCode, structuralTransitions::Vector{ST}) where {ST}
+function createStructuralAssignments(simCode::SC.SIM_CODE, structuralTransitions::Vector{SC.StructuralTransition})
   local structuralAssignments = Expr[]
-  local idx = 1
-  for structuralTransisiton in structuralTransitions
-    @match structuralTransisiton begin
-      SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION(__) => begin
-        push!(structuralAssignments, createStructuralAssignment(simCode, structuralTransisiton))
-      end
-      SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION(__) => begin
-        push!(structuralAssignments, createStructuralAssignment(simCode, structuralTransisiton, idx))
-      end
-    end
-    idx += 1
+  for (idx, transition) in enumerate(structuralTransitions)
+    push!(structuralAssignments, transition isa SC.EXPLICIT_STRUCTURAL_TRANSITION ?
+      createStructuralAssignment(simCode, transition) : createStructuralAssignment(simCode, transition, idx))
   end
   result = quote
     structuralCallbacks = OMBackend.Runtime.AbstractStructuralChange[]
@@ -303,8 +261,7 @@ end
   This function creates a structural assignment.
   That is the constructor for a structural callback guiding structural change.
 """
-function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION)
-  local structuralTransition = simCodeStructuralTransition
+function createStructuralAssignment(simCode::SC.SIM_CODE, structuralTransition::SC.EXPLICIT_STRUCTURAL_TRANSITION)
   local callbackName = createCallbackName(structuralTransition)
   local toState = structuralTransition.toState
   local toStateProblem = Symbol(toState * "Problem")
@@ -323,8 +280,7 @@ end
   Creates a structural assignment for an implicit structural transition.
   These are numbered from 1->N
 """
-function createStructuralAssignment(simCode, simCodeStructuralTransition::SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION, idx::Int)
-  local structuralTransition = simCodeStructuralTransition
+function createStructuralAssignment(simCode::SC.SIM_CODE, structuralTransition::SC.IMPLICIT_STRUCTURAL_TRANSITION, idx::Int)
   local callbackName = createCallbackName(structuralTransition, idx)
   local integratorCallbackName = string(callbackName, "_CALLBACK")
   local structuralChangeStructure = string(callbackName, "_STRUCTURAL_CHANGE")
@@ -335,7 +291,7 @@ function createStructuralAssignment(simCode, simCodeStructuralTransition::Simula
   end
 end
 
-function createCallbackName(structuralTransisiton::SimulationCode.EXPLICIT_STRUCTURAL_TRANSITION, idx = 0)
+function createCallbackName(structuralTransisiton::SC.EXPLICIT_STRUCTURAL_TRANSITION, idx::Int = 0)
   return "structuralCallback" * structuralTransisiton.fromState * structuralTransisiton.toState
 end
 
@@ -343,14 +299,14 @@ end
   Creates a structural callback for the when equation.
   The name is up to change.
 """
-function createCallbackName(structuralTransisiton::SimulationCode.IMPLICIT_STRUCTURAL_TRANSITION, idx::Int)
+function createCallbackName(structuralTransisiton::SC.IMPLICIT_STRUCTURAL_TRANSITION, idx::Int)
   return string("structuralCallbackWhenEquation", idx)
 end
 
 """
   Creates the variables that are shared between the structural modes of a model.
 """
-function createCommonVariables(commonVariables)
+function createCommonVariables(commonVariables::Vector{String})
   commonVariablesExpr = Expr[]
   for variable in commonVariables
     res = :(
@@ -370,24 +326,20 @@ end
   The second part is the recompilation statement itself that specifies what structural changes are to occur.
   This last part is then used by the runtime to just-in-time compile the model when the event occurs.
 """
-function createStructuralWhenStatements(whenStatements,
-                                        simCode::SimulationCode.SIM_CODE)
-  local res::Vector{Expr} = Expr[]
-  local recompilationOperator
+function createStructuralWhenStatements(whenStatements::Vector{SC.Statement}, simCode::SC.SIM_CODE)
+  local res = Expr[]
+  local recompilationOperator = nothing
   for wStmt in whenStatements
-    if wStmt isa BDAE.ASSIGN || wStmt isa SimulationCode.ASSIGN
-      exp1 = expToJuliaExp(wStmt.left, simCode, varPrefix="integrator.u")
-      exp2 = expToJuliaExp(wStmt.right, simCode)
-      push!(res, :($(exp1) = $(exp2)))
-    elseif wStmt isa BDAE.RECOMPILATION || wStmt isa SimulationCode.RECOMPILATION
+    if wStmt isa SC.ASSIGN
+      push!(res, :($(expToJuliaExp(wStmt.left, simCode; varPrefix = "integrator.u")) = $(expToJuliaExp(wStmt.right, simCode))))
+    elseif wStmt isa Union{SC.RECOMPILATION, SC.AGENTIC_RECOMPILATION}
       recompilationOperator = wStmt
-    elseif wStmt isa BDAE.AGENTIC_RECOMPILATION || wStmt isa SimulationCode.AGENTIC_RECOMPILATION
-      recompilationOperator = wStmt
-    elseif wStmt isa BDAE.REINIT || wStmt isa SimulationCode.REINIT
-      throw("Reinit is not allowed in a structural when equation")
+    elseif wStmt isa SC.REINIT
+      unsupported("reinit in a structural when-equation", wStmt)
     else
       unsupported("statement in a when equation", wStmt)
     end
   end
+  recompilationOperator === nothing && unsupported("a structural when-equation without a recompilation", whenStatements)
   return (res, recompilationOperator)
 end

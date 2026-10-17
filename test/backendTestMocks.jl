@@ -1,42 +1,34 @@
-#= Shared mock/fixture utilities for OMBackend unit tests.
-
-   Provides minimal hand-built SimulationCode constructs so individual backend
-   functions (codegen passes, traversals, demotion planning) can be unit-tested
-   without a full frontend+flatten translate. Isolated in a module so the
-   builders do not clash with test-file-local helpers. =#
+#= Shared fixtures for OMBackend unit tests: a simulation code without equations and the
+   SimCode values of variables, so single backend functions (code generation passes,
+   traversals, demotion planning) are tested without a translation. In a module, so the
+   builders do not clash with a test file's own helpers. =#
 module BackendTestMocks
 
 import OMBackend
-const SC = OMBackend.SimulationCode
-const CG = OMBackend.CodeGeneration
-const DAEx = OMBackend.DAE
-import MetaModelica
-const NONE = MetaModelica.NONE
-const nil = MetaModelica.nil
+const SC = OMBackend.SimCode
 
-export mockSimCode, simCref, daeCref, daeCrefExp, T_R
+export mockSimCode, simCref, simVar
 
-const T_R = DAEx.T_REAL(nil)
+"A reference to the variable `name` of type `ty`."
+simCref(name::String, ty::SC.SType = SC.TYPE_REAL())::SC.EXP_CREF = SC.EXP_CREF(SC.SimCref(Symbol(name)), ty)
 
-simCref(name)    = SC.EXP_CREF(SC.SimCref(Symbol(name)), SC.TYPE_REAL())
-daeCref(name)    = DAEx.CREF_IDENT(name, T_R, nil)
-daeCrefExp(name) = DAEx.CREF(daeCref(name), T_R)
+"The variable `name` of kind `kind` and element type `ty`, without attributes."
+simVar(name::String, kind::SC.SimVarType, ty::SC.SType = SC.TYPE_REAL())::SC.SIMVAR =
+  SC.SIMVAR(name, nothing, kind, SC.NO_ATTRIBUTES, ty)
 
 """
-    mockSimCode(ht) -> SC.SIM_CODE
+    mockSimCode(variables = SIMVAR[]; name = "mock") -> SC.SIM_CODE
 
-Minimal SIM_CODE with an empty equation/when/if system and the given
-`stringToSimVarHT`. Sufficient for unit-testing passes that take their
-equations as a separate argument (e.g. `planDemotions`) and only consult
-the simcode for when-assigned / cyclic-SCC / duplicate-residual accounting.
+A simulation code of the variables `variables` (indexed as the lowering indexes them: a
+state's derivative too) without equations, enough for the passes that take their equations
+as an argument and only look variables up.
 """
-function mockSimCode(ht = Dict{String, Tuple{Int, SC.SimVar}}())
-  return SC.SIM_CODE("mock", ht,
-    SC.RESIDUAL_EQUATION[], SC.Equation[], SC.WHEN_EQUATION[], SC.IF_EQUATION[],
-    false, Int[], SC.Graphs.SimpleDiGraph(0), [], SC.StructuralTransition[], [],
-    String[], String[], SC.Equation[], "mock", NONE(), String[],
-    SC.ModelicaFunction[], false, SC.RESIDUAL_EQUATION[], String[], SC.AliasEntry[],
-    nothing, SC.INITIAL_ALGORITHM[], SC.BDAE.ASSERT_EQUATION[])
+function mockSimCode(variables::Vector{SC.SIMVAR} = SC.SIMVAR[]; name::String = "mock")::SC.SIM_CODE
+  return SC.SIM_CODE(name, SC.createIndices(variables), SC.RESIDUAL_EQUATION[], SC.Equation[], SC.WHEN_EQUATION[],
+                     SC.IF_EQUATION[], SC.StructuralTransition[],
+                     SC.SIM_CODE[], String[], String[], SC.Equation[], name, nothing, String[], SC.ModelicaFunction[], false,
+                     SC.RESIDUAL_EQUATION[], String[], SC.AliasEntry[], nothing, SC.INITIAL_ALGORITHM[], SC.ASSERT_EQUATION[],
+                     String[])
 end
 
 end # module BackendTestMocks

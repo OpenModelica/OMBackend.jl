@@ -51,8 +51,10 @@ left limit); for a variable delay time, the delayed jump's event is at the jump'
 time at the jump.
 =#
 
-#= A delay() call as OMFrontend passes it on: OpenModelica.Internal.delay2/delay3 (or a bare delay). =#
-_isDelayCall(@nospecialize(path)) = string(path) in ("OpenModelica.Internal.delay2", "OpenModelica.Internal.delay3", "delay")
+"""
+A delay() call as OMFrontend passes it on: OpenModelica.Internal.delay2/delay3 (or a bare delay).
+"""
+_isDelayCall(e::SC.Exp)::Bool = e isa SC.CALL && e.name in (:OpenModelica_Internal_delay2, :OpenModelica_Internal_delay3, :delay)
 
 mutable struct DelayHistory
   t::Vector{Float64}
@@ -61,35 +63,55 @@ mutable struct DelayHistory
 end
 DelayHistory() = DelayHistory(Float64[], Float64[], Float64[])
 
-#= A model's histories, by the model's name (a structural mode's own), and whether they are read as
-   right limits (during a delayed jump's event). The terms and the callbacks name them rather than hold
-   them: a build's parameters are deep-copied (iMTKGen's pristine parameters), and a copied history is
-   one the recorders never fill. =#
-const DELAY_HISTORIES = Dict{Symbol, Vector{DelayHistory}}()
-const DELAY_RIGHT_LIMIT = Dict{Symbol, Bool}()
+"""
+    DelayState(histories, rightLimit)
 
-function delayHistories!(model::Symbol, n::Integer)
-  DELAY_HISTORIES[model] = [DelayHistory() for _ in 1:n]
-  DELAY_RIGHT_LIMIT[model] = false
-  return nothing
+A solve's delay histories of one model (a structural mode's own), one per delay() call, and
+whether they are read as right limits (during a delayed jump's event).
+"""
+mutable struct DelayState
+  histories::Vector{DelayHistory}
+  rightLimit::Bool
 end
+
+"The key of the delay states in a task's local storage."
+const DELAY_STATE_KEY = :omjl_delay_states
+
+"""
+    delayStates()
+
+The delay states of the solves of the current task, by model name. The terms and the callbacks
+name a model's state rather than hold it: a build's parameters are deep-copied (iMTKGen's
+pristine parameters), and a copied history is one the recorders never fill. Per task: an
+integrator evaluates its right-hand side and runs its callbacks in the task that solves, so two
+solves of one model at once (threads, an ensemble's trajectories) each have their own, and one
+solve's start does not empty another's.
+"""
+delayStates()::Dict{Symbol, DelayState} =
+  get!(() -> Dict{Symbol, DelayState}(), task_local_storage(), DELAY_STATE_KEY)::Dict{Symbol, DelayState}
+
+"The delay state of `model` in the current task; `nothing` before its solve's start."
+delayState(model::Symbol)::Union{Nothing, DelayState} = get(delayStates(), model, nothing)
+
+"A new delay state of `model` with `n` empty histories, the current task's."
+delayHistories!(model::Symbol, n::Integer)::DelayState =
+  delayStates()[model] = DelayState([DelayHistory() for _ in 1:n], false)
 
 """
     clearDelayHistories!()
 
-Empty every model's delay histories: before a solve, so the initialization reads the arguments
-themselves, not the previous solve's start values.
+The current task's delay states dropped: before a solve, so the initialization reads the arguments
+themselves, not the previous solve's start values (a history is created at the solve's start).
 """
-function clearDelayHistories!()
-  for hs in values(DELAY_HISTORIES), h in hs
-    empty!(h.t); empty!(h.v); empty!(h.due)
-  end
-  foreach(m -> DELAY_RIGHT_LIMIT[m] = false, collect(keys(DELAY_RIGHT_LIMIT)))
+function clearDelayHistories!()::Nothing
+  empty!(delayStates())
   return nothing
 end
 
-#= The value at s = t - delayTime, as a left limit or (`right`) a right limit on a recorded jump; `x` is
-   the argument's value at the present time t. =#
+"""
+The value at s = t - delayTime, as a left limit or (`right`) a right limit on a recorded jump; `x` is
+the argument's value at the present time t.
+"""
 function _delayedValue(h::DelayHistory, s::Float64, right::Bool, t::Float64, x::Float64)
   local n = length(h.t)
   s <= h.t[1] && return h.v[1]
@@ -119,11 +141,10 @@ SymbolicUtils.promote_symtype(::DelayedValueFn, args...) = Real
 SymbolicUtils.promote_shape(::DelayedValueFn, szs::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 
 function (f::DelayedValueFn)(t, delayTime, x)
-  local hs = get(DELAY_HISTORIES, f.model, nothing)
-  (hs === nothing || f.k > length(hs) || isempty(hs[f.k].t)) && return x
+  local s = delayState(f.model)
+  (s === nothing || f.k > length(s.histories) || isempty(s.histories[f.k].t)) && return x
   local tt = Float64(_primalValue(t))
-  return _delayedValue(hs[f.k], tt - Float64(_primalValue(delayTime)), get(DELAY_RIGHT_LIMIT, f.model, false),
-                       tt, Float64(_primalValue(x)))
+  return _delayedValue(s.histories[f.k], tt - Float64(_primalValue(delayTime)), s.rightLimit, tt, Float64(_primalValue(x)))
 end
 
 """
@@ -135,14 +156,18 @@ delayLookup(model::Symbol, k::Integer, t, delayTime, x) =
   hasSymbolicArgs(t, delayTime, x) ? makeSymbolicTerm(DelayedValueFn(model, k), Any[t, delayTime, x]) :
                                      DelayedValueFn(model, k)(t, delayTime, x)
 
-#= The delayed jumps' time events: a discrete callback at each due time, among the other callbacks, so
-   the event iteration (withRelationRefresh) runs after it; from its affect until the recorder after the
-   event, the delayed values are right limits. Due times already passed are dropped. =#
+"""
+The delayed jumps' time events: a discrete callback at each due time, among the other callbacks, so
+the event iteration (withRelationRefresh) runs after it; from its affect until the recorder after the
+event, the delayed values are right limits. Due times already passed are dropped.
+"""
 function withDelayEvents(callbacks, model::Symbol)
   local due = function (u, t, integrator)
+    local s = delayState(model)
+    s === nothing && return false
     local tol = 1e-12 * max(1.0, abs(t))
     local hit = false
-    for h in get(DELAY_HISTORIES, model, DelayHistory[]), k in length(h.due):-1:1
+    for h in s.histories, k in length(h.due):-1:1
       local d = h.due[k]
       abs(d - t) <= tol && (hit = true)
       d <= t + tol && deleteat!(h.due, k)
@@ -150,7 +175,8 @@ function withDelayEvents(callbacks, model::Symbol)
     return hit
   end
   local affect! = function (integrator)
-    DELAY_RIGHT_LIMIT[model] = true
+    local s = delayState(model)
+    s === nothing || (s.rightLimit = true)
     _derivativeDiscontinuity!(integrator, true)
     return nothing
   end
@@ -161,15 +187,15 @@ end
 """
     withDelayRecords(callbacks, problem, model, args, delayTimes) -> callbacks
 
-`model`'s histories of its delay() arguments `args` (symbolic, in `problem`'s system): created here, then
-filled by two callbacks that only read (their conditions do the work and never fire, so no step is a
+`model`'s histories of its delay() arguments `args` (symbolic, in `problem`'s system): created at the
+start of each solve (in its task: `delayStates`), then filled by two callbacks that only read (their conditions do the work and never fire, so no step is a
 discontinuity): the first records the step end as the solver took it, the last one the values after the
 event callbacks. A value that changed at an event is a jump: recorded as the right limit, and due again
 `delayTime` later within the time span (a time event, withDelayEvents).
 """
 function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delayTimes::Vector)
-  delayHistories!(model, length(args))
   isempty(args) && return callbacks
+  local n = length(args)
   local sys = problem.f.sys
   local argumentValues = ModelingToolkit.build_explicit_observed_function(sys, args)
   local delayTimeValues = ModelingToolkit.build_explicit_observed_function(sys, delayTimes)
@@ -178,24 +204,26 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
      the last callback's. =#
   local start! = function (c, u, t, integrator)
     local v = Base.invokelatest(argumentValues, u, integrator.p, t)
-    for (k, h) in enumerate(DELAY_HISTORIES[model])
-      empty!(h.t); empty!(h.v); empty!(h.due)
+    for (k, h) in enumerate(delayHistories!(model, n).histories)
       push!(h.t, t); push!(h.v, Float64(v[k]))
     end
-    DELAY_RIGHT_LIMIT[model] = false
     return nothing
   end
   local stepEnd = function (u, t, integrator)
+    local s = delayState(model)
+    s === nothing && return false
     local v = now(integrator)
-    for (k, h) in enumerate(DELAY_HISTORIES[model])
+    for (k, h) in enumerate(s.histories)
       t > h.t[end] && (push!(h.t, t); push!(h.v, Float64(v[k])))
     end
     return false
   end
   local afterEvents = function (u, t, integrator)
+    local s = delayState(model)
+    s === nothing && return false
     local v = now(integrator)
     local T = nothing
-    for (k, h) in enumerate(DELAY_HISTORIES[model])
+    for (k, h) in enumerate(s.histories)
       local x = Float64(v[k])
       #= Round-off from an event's algebraic re-solve is no jump. =#
       (t == h.t[end] && abs(x - h.v[end]) <= 1e-6 * max(1.0, abs(x))) && continue
@@ -209,7 +237,7 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
       push!(h.due, tDue)
       ModelingToolkit.SciMLBase.add_tstop!(integrator, tDue)
     end
-    DELAY_RIGHT_LIMIT[model] = false
+    s.rightLimit = false
     return false
   end
   local never! = integrator -> nothing

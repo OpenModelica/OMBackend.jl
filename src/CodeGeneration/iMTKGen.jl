@@ -42,7 +42,8 @@
 module IMTKGen
 
 import ..CodeGeneration
-import ..SimulationCode
+import ..SimCode
+const SC = SimCode
 
 #= The build's start time: the initialization is solved at it, and simulateIMTK remakes the
    cached problem for a tspan from that start (another start builds again). OM.simulate
@@ -93,8 +94,10 @@ const LAST_MODELCODE  = Ref{Any}(nothing)
    start attribute stays one, but its value is compiled into the equations. =#
 const TUNABLE_SETS    = Dict{String, Set{String}}()
 
-#= Forget a model's cached build (a failed or skipped build, a translate in
-   another mode): an older build must not answer for the current one. =#
+"""
+Forget a model's cached build (a failed or skipped build, a translate in
+another mode): an older build must not answer for the current one.
+"""
 function forgetBuild(cname::String)
   _forgetReinit(cname)
   for cache in (BUILT, BUILT_HASH, REDUCED_SYSTEMS, PRISTINE_P, TUNABLE_SETS)
@@ -106,10 +109,12 @@ function forgetBuild(cname::String)
   return nothing
 end
 
-#= The re-initialization registered for a cached build's problem
-   (CodeGeneration.DAE_REINIT, keyed by its reduced system): its closure holds
-   the build's data, kept for the whole session when only the build was
-   forgotten. =#
+"""
+The re-initialization registered for a cached build's problem
+(CodeGeneration.DAE_REINIT, keyed by its reduced system): its closure holds
+the build's data, kept for the whole session when only the build was
+forgotten.
+"""
 function _forgetReinit(cname::String)
   local built = get(BUILT, cname, nothing)
   (built isa Tuple && !isempty(built)) || return nothing
@@ -125,7 +130,7 @@ end
 Build the module via `generateMTKCode`, then construct the System and run
 `structural_simplify` in the backend, caching the build for reuse at simulate.
 """
-function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
+function generateIMTKCode(simCode::SC.SIM_CODE)
   local (modelName, modelCode) = CodeGeneration.generateMTKCode(simCode)
   local cname = _OMBackend().canonicalName(modelName)
   #= Only the standard PROGRAM_GENERATION path emits `simulateFromBuild` and
@@ -136,8 +141,8 @@ function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
   if ccall(:jl_generating_output, Cint, ()) != 0
     #= Precompile/image generation: Core.eval'ing the model module into this
        closed backend module is rejected; skip the build+eval (codegen warmed). =#
-  elseif !SimulationCode.hasStructuralTransitions(simCode) &&
-         !SimulationCode.hasSubModels(simCode)
+  elseif !SC.hasStructuralTransitions(simCode) &&
+         !SC.hasSubModels(simCode)
     TUNABLE_SETS[cname] = copy(_OMBackend().TUNABLE_PARAMETERS[])
     _buildAndCache(modelName, modelCode)
   else
@@ -147,9 +152,11 @@ function generateIMTKCode(simCode::SimulationCode.SIM_CODE)
   return (modelName, modelCode)
 end
 
-#= Eval the module, invoke `<name>Model(_buildTspan())` (runs structural_simplify),
-   and cache the resulting 9-tuple. The post-simplify System (element 5) is also
-   stashed for the optional dump and external inspection via `reducedSystem`. =#
+"""
+Eval the module, invoke `<name>Model(_buildTspan())` (runs structural_simplify),
+and cache the resulting 9-tuple. The post-simplify System (element 5) is also
+stashed for the optional dump and external inspection via `reducedSystem`.
+"""
 function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool = false)
   local OMB = _OMBackend()
   local cname = OMB.canonicalName(modelName)
@@ -341,8 +348,10 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
   end
 end
 
-#= A copy of `prob` with the tunable parameters `parameters` (name => value;
-   Modelica or flattened names, array elements as `A[2][1]` or `A[2,1]`) set. =#
+"""
+A copy of `prob` with the tunable parameters `parameters` (name => value;
+Modelica or flattened names, array elements as `A[2][1]` or `A[2,1]`) set.
+"""
 function _setParameterValues(prob, parameters, modelName)
   local OMB = _OMBackend()
   local MTK = OMB.Runtime.ModelingToolkit

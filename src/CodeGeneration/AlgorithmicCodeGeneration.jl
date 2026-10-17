@@ -34,13 +34,11 @@
 */ =#
 
 module AlgorithmicCodeGeneration
-import ..SimulationCode
-import ..Absyn
+import ..SimCode
 import ..CodeGeneration
 import ..CodeGeneration: COMPONENT_SEPARATOR
-import DAE
+import LinearAlgebra
 import OMRuntimeExternalC
-using MetaModelica
 include("modelicaBuiltins.jl")
 include("algorithmic.jl")
 include("externalC.jl")

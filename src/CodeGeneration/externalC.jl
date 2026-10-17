@@ -43,8 +43,10 @@
    OMRuntimeExternalC's libModelicaCallbacks (loaded RTLD_GLOBAL). A function that a library
    OMRuntimeExternalC ships defines (its Library annotation) is called there, not compiled. =#
 
-#= The string values of every key = "..." (or key = {"...", ...}) in an annotation (the
-   flat annotation has the default IncludeDirectory before the declared one). =#
+"""
+The string values of every key = "..." (or key = {"...", ...}) in an annotation (the
+flat annotation has the default IncludeDirectory before the declared one).
+"""
 function _annotationStrings(ann::AbstractString, key::AbstractString)::Vector{String}
   local out = String[]
   for m in eachmatch(Regex("\\b" * key * "\\s*=\\s*(\\{[^}]*\\}|\"(?:[^\"\\\\]|\\\\.)*\")"), ann)
@@ -81,7 +83,9 @@ char* ModelicaAllocateStringWithErrorReturn(size_t len);
 #endif
 """
 
-#= The shared library of the C code (cached by the code and its include directories). =#
+"""
+The shared library of the C code (cached by the code and its include directories).
+"""
 function _compileIncludeLibrary(code::String, dirs::Vector{String})::String
   local dir = joinpath(first(DEPOT_PATH), "omjl", "external-c")
   mkpath(dir)
@@ -109,21 +113,25 @@ function _compileIncludeLibrary(code::String, dirs::Vector{String})::String
   return lib
 end
 
-#= The C type of a Modelica scalar type (DAE). =#
-function _cScalarType(@nospecialize(ty::DAE.Type))
-  ty isa DAE.T_REAL && return :Cdouble
-  (ty isa DAE.T_INTEGER || ty isa DAE.T_BOOL || ty isa DAE.T_ENUMERATION) && return :Cint
-  ty isa DAE.T_STRING && return :Cstring
+"""
+The C type of a Modelica scalar type.
+"""
+function _cScalarType(t::SimCode.SType)
+  t isa SimCode.TYPE_REAL && return :Cdouble
+  t isa Union{SimCode.TYPE_INTEGER, SimCode.TYPE_BOOL, SimCode.TYPE_ENUM} && return :Cint
+  t isa SimCode.TYPE_STRING && return :Cstring
   #= an external object (its constructor's result, the other functions' argument): the
      C pointer (Buildings' weeklyScheduleInit, initArray, fileWriterInit) =#
-  ty isa DAE.T_COMPLEX && ty.complexClassType isa DAE.ClassInf.EXTERNAL_OBJ && return :(Ptr{Cvoid})
+  t isa SimCode.TYPE_COMPLEX && !t.isRecord && return :(Ptr{Cvoid})
   return nothing
 end
 
-#= The library OMRuntimeExternalC ships under a name of the Library annotation, when it
-   defines the function: OMRuntimeExternalC has no Julia function for every C function of
-   its libraries (MSL's ModelicaInternal_mkdir, in libModelicaExternalC; its Include,
-   ModelicaInternal.h, only declares it). =#
+"""
+The library OMRuntimeExternalC ships under a name of the Library annotation, when it
+defines the function: OMRuntimeExternalC has no Julia function for every C function of
+its libraries (MSL's ModelicaInternal_mkdir, in libModelicaExternalC; its Include,
+ModelicaInternal.h, only declares it).
+"""
 function _shippedLibraryDefining(ann::AbstractString, cname::Symbol)::Union{String, Nothing}
   local installed = OMRuntimeExternalC.installedLibPath
   installed === nothing && return nothing
@@ -141,18 +149,16 @@ end
 """
     ensureExternalC!(func)
 
-For an external "C" function (SimulationCode.EXTERNAL_MODELICA_FUNCTION) whose C function
+For an external "C" function (SimCode.EXTERNAL_MODELICA_FUNCTION) whose C function
 OMRuntimeExternalC has no Julia function for: one that ccalls it in the library of its Library
 annotation that OMRuntimeExternalC ships, or else compiled from the code of its Include.
 """
-function ensureExternalC!(func::SimulationCode.EXTERNAL_MODELICA_FUNCTION)
-  local call = Meta.parse(func.libInfo)
-  call isa Expr && call.head === :toplevel && length(call.args) == 1 && (call = call.args[1])
-  local (resultVar, callExpr) = call isa Expr && call.head === :(=) ? (call.args[1], call.args[2]) : (nothing, call)
-  (callExpr isa Expr && callExpr.head === :call && callExpr.args[1] isa Symbol) || return nothing
+function ensureExternalC!(func::SimCode.EXTERNAL_MODELICA_FUNCTION)
+  local call = _externalCallExpr(func.external)
+  local (resultVar, callExpr) = call.head === :(=) ? (call.args[1], call.args[2]) : (nothing, call)
   local cname = callExpr.args[1]
   (isdefined(OMRuntimeExternalC, cname) || isdefined(externalCModule(), cname)) && return nothing
-  local ann = get(SimulationCode.EXTERNAL_C_ANNOTATIONS, cname, "")
+  local ann = func.external.annotation
   local lib = _shippedLibraryDefining(ann, cname)
   if lib === nothing
     local includes = _annotationStrings(ann, "Include")
@@ -161,17 +167,14 @@ function ensureExternalC!(func::SimulationCode.EXTERNAL_MODELICA_FUNCTION)
        or one that does not exist, is no directory =#
     local dirs = String[]
     for d in _annotationStrings(ann, "IncludeDirectory")
-      local path = CodeGeneration.OMBackend._tryOr(() -> SimulationCode.OMFrontend.resolveModelicaURI(d), nothing,
+      local path = CodeGeneration.OMBackend._tryOr(() -> CodeGeneration.OMFrontend.resolveModelicaURI(d), nothing,
                                                    :externalCIncludeDirectory; only = ErrorException)
       path !== nothing && isdir(path) && push!(dirs, path)
     end
     lib = _compileIncludeLibrary(join(includes, "\n"), dirs)
   end
-  local vars = Dict{Symbol, DAE.VAR}()
-  for v in Iterators.flatten((func.inputs, func.outputs, func.locals))
-    vars[Symbol(DAE_VAR_ToJulia(v))] = v
-  end
-  local outputs = Set{Symbol}(Symbol(DAE_VAR_ToJulia(v)) for v in func.outputs)
+  local vars = _externalVariables(func)
+  local outputs = Set{Symbol}(_varSymbol(v) for v in func.outputs)
   local params = Symbol[]; local types = Any[]; local args = Any[]; local prep = Expr[]; local back = Expr[]
   for (k, a) in enumerate(callExpr.args[2:end])
     local p = Symbol("a", k)
@@ -204,7 +207,7 @@ function ensureExternalC!(func::SimulationCode.EXTERNAL_MODELICA_FUNCTION)
   end
   local rt = resultVar === nothing ? :Cvoid :
     (resultVar isa Symbol && haskey(vars, resultVar) ? _cScalarType(vars[resultVar].ty) : nothing)
-  rt === nothing && CodeGeneration.unsupported("an external C function's result of this type", func.libInfo)
+  rt === nothing && CodeGeneration.unsupported("an external C function's result of this type", func.external)
   local ccallExpr = Expr(:call, :ccall, Expr(:tuple, QuoteNode(cname), lib), rt === :Cstring ? :(Ptr{UInt8}) : rt,
                          Expr(:tuple, types...), args...)
   local body = quote

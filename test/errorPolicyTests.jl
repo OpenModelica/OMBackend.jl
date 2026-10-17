@@ -1,8 +1,6 @@
 #= The error policy of fallbacks (src/errorPolicy.jl). =#
 using Test
 import OMBackend
-import DAE
-import MetaModelica
 
 module ErrorPolicyForeign
 struct Callable end
@@ -60,11 +58,10 @@ end
     @test !OMBackend.isBug(e, Base.backtrace())
     local shown = sprint(showerror, e)
     @test startswith(shown, "UnsupportedLowering: condition expression: xxx") && length(shown) < 400
-    @test_throws OMBackend.UnsupportedLowering OMBackend.SimulationCode.DAE_identifierToString(42)
-    local ty = DAE.T_REAL(MetaModelica.nil)
-    local cref = DAE.CREF(DAE.CREF_IDENT("x", ty, MetaModelica.nil), ty)
-    @test_throws OMBackend.UnsupportedLowering OMBackend.CodeGeneration.evalDAEConstant(cref)
-    @test OMBackend.CodeGeneration.evalDAEConstant(DAE.RCONST(2.0)) == 2.0
+    local SC = OMBackend.SimCode
+    local cref = SC.EXP_CREF(SC.SimCref(:x), SC.TYPE_REAL())
+    @test_throws OMBackend.UnsupportedLowering OMBackend.CodeGeneration.evalConstant(cref)
+    @test OMBackend.CodeGeneration.evalConstant(SC.RCONST(2.0)) == 2.0
     #= A fallback takes it: never a programming error. =#
     withenv("OMBACKEND_FALLBACK_ON_BUG" => nothing) do
       @test OMBackend._tryOr(() -> OMBackend.unsupported("statement", 1), :fallback, :unsupportedSite) === :fallback
@@ -80,17 +77,17 @@ end
   end
   @testset "t0 values of evaluated constants" begin
     local t0Number = OMBackend.CodeGeneration.MTK_CodeGenerationUtil._t0Number
-    #= evalDAE_Expression's block around the evaluated value (a BINARY start value was lost). =#
+    #= evalExpression's block around the evaluated value (a BINARY start value was lost). =#
     @test t0Number(() -> quote 2.5 end) == 2.5
     @test t0Number(() -> true) == 1.0
     @test t0Number(() -> quote x + 1 end) === nothing
     @test t0Number(() -> "a string") === nothing
     @test t0Number(() -> OMBackend.unsupported("not a constant", 1)) === nothing
-    #= Only the forms evalDAEConstant evaluates are asked for. =#
+    #= Only the forms evalConstant evaluates are asked for. =#
     local evaluable = OMBackend.CodeGeneration.MTK_CodeGenerationUtil._isEvaluableConstant
-    local ty = DAE.T_REAL(MetaModelica.nil)
-    @test evaluable(DAE.RCONST(1.0)) && evaluable(DAE.BINARY(DAE.RCONST(1.0), DAE.ADD(ty), DAE.RCONST(2.0)))
-    @test !evaluable(DAE.CREF(DAE.CREF_IDENT("p", ty, MetaModelica.nil), ty)) && !evaluable(nothing)
+    local SC = OMBackend.SimCode
+    @test evaluable(SC.RCONST(1.0)) && evaluable(SC.BINARY(SC.RCONST(1.0), SC.OP_ADD, SC.RCONST(2.0)))
+    @test !evaluable(SC.EXP_CREF(SC.SimCref(:p), SC.TYPE_REAL())) && !evaluable(nothing)
   end
   @testset "_tryOr" begin
     @test OMBackend._tryOr(() -> error("x"), 7, :tryOrSite) == 7
