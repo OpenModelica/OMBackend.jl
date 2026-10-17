@@ -2495,11 +2495,11 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   #= the system the accepted reduction came from: the relaxed one after a retry below =#
   local _simplifiedFrom = sys
   if OMBackend.BACKEND_LOGGING[]
-    local _ss_timed = @timed ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
+    local _ss_timed = @timed ModelingToolkit.mtkcompile(sys; simplify = simplify, split = useSplit)
     sys = _ss_timed.value
     @debug "[MTK GEN: simplify] structural_simplify took $(_ss_timed.time)s, $(round(_ss_timed.bytes / 1e9, digits=2)) GiB"
   else
-    sys = ModelingToolkit.structural_simplify(sys; simplify = simplify, split = useSplit)
+    sys = ModelingToolkit.mtkcompile(sys; simplify = simplify, split = useSplit)
   end
   #= A structurally singular reduction (equations != unknowns) can be caused by a
      soft StateSelect hint conflicting with a constraint MTK index-reduces. Retry
@@ -2508,7 +2508,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
     local (nNeutralized, relaxedSys) = neutralizeSoftStatePriority(_preSimplifySys)
     if nNeutralized > 0
       local retried = try
-        ModelingToolkit.structural_simplify(relaxedSys; simplify = simplify, split = useSplit)
+        ModelingToolkit.mtkcompile(relaxedSys; simplify = simplify, split = useSplit)
       catch e
         @warn "[MTK GEN: simplify] retry without soft state-priority hints threw" exception = (e, catch_backtrace())
         nothing
@@ -2532,7 +2532,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
     local marked = _withIrreducible(_simplifiedFrom, readers)
     #= a refinement: when MTK cannot reduce the marked system, the first reduction stays =#
     local again = try
-      ModelingToolkit.structural_simplify(marked; simplify = simplify, split = useSplit)
+      ModelingToolkit.mtkcompile(marked; simplify = simplify, split = useSplit)
     catch e
       OMBackend._fallback(e, :structural_simplify_ifConditionReaders; expect = Exception, impact = :result)
       nothing

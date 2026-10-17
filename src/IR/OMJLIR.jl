@@ -114,6 +114,19 @@ function Base.:(==)(a::T, b::T)::Bool where {T <: Node}
 end
 Base.:(==)(::Node, ::Node)::Bool = false
 
+"""
+Fields compared one by one with `isequal`, as `hash` hashes them: the identity of a `Dict` or
+`Set` key (`REAL(0.0)` and `REAL(-0.0)` apart, `REAL(NaN)` equal to itself; `==` has them the
+other way round, as numbers).
+"""
+function Base.isequal(a::T, b::T)::Bool where {T <: Node}
+  for f in fieldnames(T)
+    isequal(getfield(a, f), getfield(b, f)) || return false
+  end
+  return true
+end
+Base.isequal(::Node, ::Node)::Bool = false
+
 function Base.hash(a::T, h::UInt)::UInt where {T <: Node}
   local r = hash(T, h)
   for f in fieldnames(T)
@@ -273,6 +286,7 @@ end
 ComponentRef(name::Symbol, ty::ModelicaType = T_UNKNOWN()) = ComponentRef(CrefPart[CrefPart(name, Subscript[], ty)])
 
 Base.:(==)(a::ComponentRef, b::ComponentRef)::Bool = a.name === b.name
+Base.isequal(a::ComponentRef, b::ComponentRef)::Bool = a.name === b.name
 Base.hash(c::ComponentRef, h::UInt)::UInt = hash(c.name, h)
 
 "The subscripts of the last part: those of an array variable's reference."
@@ -731,7 +745,7 @@ mutable struct ARRAY_EQUATION <: Equation
   attributes::EquationAttributes
 end
 
-"`lhs = rhs` of record type `ty`: `size` scalar equations."
+"`lhs = rhs` of record type `ty`: `size` equations, one per field (a record or array field counts one)."
 mutable struct RECORD_EQUATION <: Equation
   lhs::Expression
   rhs::Expression
@@ -1749,7 +1763,7 @@ _print(io::IO, s::Statement) = _print(io, s, "")
 _print(io::IO, s::ASSIGNMENT, ::String) = (_print(io, s.lhs); print(io, " := "); _print(io, s.rhs))
 function _printBranches(io::IO, keyword::String, elseKeyword::String, branches::Vector{StatementBranch}, indent::String)
   for (i, b) in enumerate(branches)
-    print(io, i == 1 ? keyword : "\n" * indent * elseKeyword, " ")
+    print(io, i == 1 ? keyword : indent * elseKeyword, " ")
     _print(io, b.condition)
     print(io, " then\n")
     _printStatements(io, b.body, indent * "  ")

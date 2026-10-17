@@ -1267,10 +1267,13 @@ end
 #= ==================================================================================== =#
 
 #= One-entry memo: the map is requested once per if-equation branch but only depends on the
-   simCode object, and the forward-evaluation sweep is not free. Fields: (simCode id, valMap,
-   explicit, trusted-derived pairs). =#
-const _T0_MAP_CACHE = Ref{Tuple{UInt, Dict{Symbol, Float64}, Set{Symbol}, Vector{Pair{Symbol, Float64}}}}(
-  (UInt(0), Dict{Symbol, Float64}(), Set{Symbol}(), Pair{Symbol, Float64}[]))
+   simCode object, and the forward-evaluation sweep is not free. Fields: (the simCode, valMap,
+   explicit, trusted-derived pairs). The simCode is kept and compared by identity: an
+   `objectid` comes from its fields' addresses, which the GC gives a later model's. =#
+const _T0_MAP_CACHE = Ref{Union{Nothing, Tuple{SC.SIM_CODE, Dict{Symbol, Float64}, Set{Symbol}, Vector{Pair{Symbol, Float64}}}}}(nothing)
+
+"Whether the t0 map memo is that of `simCode`."
+_t0MapCachedFor(simCode::SC.SIM_CODE)::Bool = (local c = _T0_MAP_CACHE[]; c !== nothing && c[1] === simCode)
 
 """
 The number `f()` (evalConstant, evalSimCodeParameter) gives, or nothing when it is not a
@@ -1321,8 +1324,10 @@ explicit residuals (`_forwardEvalT0!`); and the symbols whose value has an actua
 so a branch never reads a value the fixed initial configuration contradicts.
 """
 function _buildT0ValueMapAndExplicit(simCode::SC.SIM_CODE)::Tuple{Dict{Symbol, Float64}, Set{Symbol}}
-  local cached = _T0_MAP_CACHE[]
-  cached[1] === objectid(simCode) && return (copy(cached[2]), copy(cached[3]))
+  if _t0MapCachedFor(simCode)
+    local cached = _T0_MAP_CACHE[]
+    return (copy(cached[2]), copy(cached[3]))
+  end
   local valMap = Dict{Symbol, Float64}()
   local explicit = Set{Symbol}()
   local trusted = Set{Symbol}()
@@ -1362,7 +1367,7 @@ function _buildT0ValueMapAndExplicit(simCode::SC.SIM_CODE)::Tuple{Dict{Symbol, F
     push!(explicit, k)
   end
   _forwardEvalT0!(valMap, explicit, simCode)
-  _T0_MAP_CACHE[] = (objectid(simCode), copy(valMap), copy(explicit), trustedDerived)
+  _T0_MAP_CACHE[] = (simCode, copy(valMap), copy(explicit), trustedDerived)
   return (valMap, explicit)
 end
 
@@ -1371,7 +1376,7 @@ The values derived from the trusted ones (deterministic consequences of paramete
 fixed starts), for overriding guess-grade initial values at the build.
 """
 function buildT0TrustedDerivedPairs(simCode::SC.SIM_CODE)::Vector{Pair{Symbol, Float64}}
-  _T0_MAP_CACHE[][1] === objectid(simCode) || _buildT0ValueMapAndExplicit(simCode)
+  _t0MapCachedFor(simCode) || _buildT0ValueMapAndExplicit(simCode)
   return copy(_T0_MAP_CACHE[][4])
 end
 
@@ -1989,7 +1994,7 @@ end
 #= ==================================================================================== =#
 
 """
-    performStructuralSimplify(simplify; observedFilter = nothing, split = !DIRECT_RHS_GENERATION[])
+    performStructuralSimplify(; observedFilter = nothing, split = !DIRECT_RHS_GENERATION[])
 
 The structural simplification of `firstOrderSystem` into `reducedSystem`; with an observed
 filter, the observed equations kept those whose variable a pattern matches, with the observed
@@ -1997,7 +2002,7 @@ variables they read and the system's and the initialization equations read. With
 ENABLE_BACKEND_LOGGING, the system before is dumped to `backend/codeGen/preStructuralSimplify.log`
 (the path taken at codegen time, in the model's run directory).
 """
-function performStructuralSimplify(simplify::Bool; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
+function performStructuralSimplify(; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
                                    split::Bool = !OMBackend.DIRECT_RHS_GENERATION[])::Expr
   local dumpExpr = :(nothing)
   @BACKEND_LOGGING dumpExpr = dumpPreStructuralSimplifyExpr(
@@ -2065,17 +2070,17 @@ reduced system after structural_simplify, MTK_CodeGeneration.jl); the initial eq
 """
 function odeSystemWithEvents(hasEvents::Bool, modelName::String; hasObserved::Bool = false)::Expr
   if hasEvents
-    return :(ODESystem(eqs, t, vars, parameters;
+    return :(System(eqs, t, vars, parameters;
                        name=:($(Symbol($modelName))),
                        continuous_events = events, guesses = initialValues,
                        initialization_eqs = initialConstraintEqs))
   elseif hasObserved
-    return :(ODESystem(eqs, t, vars, parameters;
+    return :(System(eqs, t, vars, parameters;
                        name=:($(Symbol($modelName))), guesses = initialValues,
                        observed = observedEqs,
                        initialization_eqs = initialConstraintEqs))
   end
-  return :(ODESystem(eqs, t, vars, parameters;
+  return :(System(eqs, t, vars, parameters;
                      name=:($(Symbol($modelName))), guesses = initialValues,
                      initialization_eqs = initialConstraintEqs))
 end

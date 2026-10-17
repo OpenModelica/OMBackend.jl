@@ -84,6 +84,9 @@ function equationKey(eq::IR.Equation, h::UInt = zero(UInt))::UInt
   return h
 end
 
+"The seed of `deduplicateEquations!`' second key."
+const DEDUP_SEED = 0x9e3779b97f4a7c15
+
 """
     deduplicateEquations!(model)
 
@@ -92,16 +95,17 @@ copies kept (the frontend emits some equations of inner/outer components twice).
 """
 function deduplicateEquations!(model::IR.Model)::IR.Model
   for p in Iterators.flatten((model.continuous, (m.system for m in model.modes)))
-    local seen = Set{UInt}()
+    local seen = Set{Tuple{UInt, UInt}}()
     local unique = IR.Equation[]
     for eq in p.equations
-      local k = equationKey(eq)
+      #= two keys of independent seeds: a collision of one would drop an equation =#
+      local k = (equationKey(eq), equationKey(eq, DEDUP_SEED))
       k in seen && continue
       push!(seen, k)
       push!(unique, eq)
     end
     local removed = length(p.equations) - length(unique)
-    removed > 0 && println("[dedup] Equations: $(length(p.equations)) -> $(length(unique)) (removed $(removed) duplicates)")
+    removed > 0 && @debug "[OMJLIR: deduplicateEquations] $(length(p.equations)) -> $(length(unique)) equations ($(removed) duplicates removed)"
     p.equations = unique
   end
   return model
@@ -111,8 +115,9 @@ end
     addBindingEquations!(model)
 
 The declaration bindings of continuous-time and discrete variables as equations (after the
-others, MLS 4.4.4): a Real's (scalar) `v = e`; a Boolean's given as an if-expression a when /
-elsewhen equation (the value updates at the branch condition's events); a Boolean's, Integer's
+others, MLS 4.4.4): a Real's (scalar) `v = e`; a Boolean's `if a > b then true else false`
+a when / elsewhen equation (`isLatchedBooleanBinding`: it updates at the condition's events);
+a Boolean's, Integer's
 or enumeration's `v = e` (the discrete lifting makes it a when-equation where `e` is
 discrete-time). A discrete Real with a binding is not Modelica (not supported). Parameters and
 constants (their bindings are their values), Strings, arrays and records (their bindings are
@@ -136,7 +141,7 @@ function addBindingEquations!(variables::IR.VariableSet, partition::IR.Partition
     local lhs = IR.CREF(v.cref, v.ty)
     if continuous && v.ty isa IR.T_REAL
       push!(partition.equations, IR.SCALAR_EQUATION(lhs, v.binding, v.ty, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
-    elseif discrete && v.ty isa IR.T_BOOLEAN && v.binding isa IR.IF_EXPRESSION
+    elseif discrete && v.ty isa IR.T_BOOLEAN && isLatchedBooleanBinding(v.binding)
       local b = v.binding
       local branches = IR.WhenBranch[
         IR.WhenBranch(IR.Expression[b.condition], false, false, IR.Statement[IR.ASSIGNMENT(lhs, b.thenExp, IR.NO_SOURCE)]),
@@ -153,11 +158,20 @@ function addBindingEquations!(variables::IR.VariableSet, partition::IR.Partition
 end
 
 "The inverted relation `a > b` -> `a < b`, `a < b` -> `a > b` (the when-equation of a Boolean binding)."
-function invertCondition(c::IR.Expression)::IR.Expression
-  (c isa IR.RELATION && c.op === IR.GREATER) && return IR.RELATION(c.exp1, IR.LESS, c.exp2, c.index)
-  (c isa IR.RELATION && c.op === IR.LESS) && return IR.RELATION(c.exp1, IR.GREATER, c.exp2, c.index)
-  error("Tried to invert unsupported backend condition: $(IR.toString(c))")
+function invertCondition(c::IR.RELATION)::IR.RELATION
+  c.op === IR.GREATER && return IR.RELATION(c.exp1, IR.LESS, c.exp2, c.index)
+  c.op === IR.LESS && return IR.RELATION(c.exp1, IR.GREATER, c.exp2, c.index)
+  unsupported("inverting this relation", IR.toString(c))
 end
+
+"""
+A Boolean binding the previous backend made a when / elsewhen equation: `if a > b then true
+else false` (or `<`), its branches literals. Another (a `>=`, a Boolean condition, a branch
+that is a variable, which a when would latch at the crossing) is the equation `v = e`.
+"""
+isLatchedBooleanBinding(b::Union{Nothing, IR.Expression})::Bool =
+  b isa IR.IF_EXPRESSION && b.condition isa IR.RELATION && b.condition.op in (IR.GREATER, IR.LESS) &&
+  b.thenExp isa IR.BOOLEAN && b.elseExp isa IR.BOOLEAN
 
 """
     hoistIfEquationAsserts!(model)

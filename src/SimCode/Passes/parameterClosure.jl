@@ -44,7 +44,8 @@ residuals removed; to a fixed point (a folded variable unlocks the next: `sd_max
 1/abs(aux1[1])` once `aux1[1]` is folded). MSL KinematicPTP's seven parameter closures reached
 MTK as unknowns with a zero guess (`sqrt(1/0)` in the first Newton step). Not a variable of an
 if-equation's condition (the condition is evaluated at the module's scope, where a folded
-parameter is no name), not a `*THETA`. Nothing for a model with structural modes, without
+parameter is no name). The folded variables are recorded (`foldedVariables`): a pass that drops
+one of them as a parameter keeps it observable. Nothing for a model with structural modes, without
 residuals, or if the fold would remove every residual (MTK takes no empty system).
 """
 function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
@@ -55,7 +56,6 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
     b.identifier == ELSE_BRANCH && continue
     union!(excluded, allCrefNames(b.condition))
   end
-  foreach(n -> endswith(n, "THETA") && push!(excluded, n), keys(ht))
   local algNames = OrderedSet{String}(n for (n, (_, sv)) in ht if !(n in excluded) && sv.varKind isa ALG_VARIABLE)
   isempty(algNames) && return simCode
   local definingEquation = Dict{String, Int}()
@@ -92,7 +92,8 @@ function foldParameterClosure(simCode::SIM_CODE)::SIM_CODE
   return update(simCode; stringToSimVarHT = newHT,
                 residualEquations = RESIDUAL_EQUATION[eq for (i, eq) in enumerate(simCode.residualEquations) if !(i in removed)],
                 irreducibleVariables = filter(unfolded, simCode.irreducibleVariables),
-                sharedVariables = filter(unfolded, simCode.sharedVariables))
+                sharedVariables = filter(unfolded, simCode.sharedVariables),
+                foldedVariables = vcat(simCode.foldedVariables, collect(keys(folded))))
 end
 
 """

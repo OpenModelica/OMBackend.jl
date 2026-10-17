@@ -470,8 +470,8 @@ The when-equations of regular algorithm sections, and the names of the variables
 
 - an algorithm of when statements only: each when statement (a first branch `when initial()`
   is `initialWhensOfAlgorithms`', its elsewhen arms are here);
-- else: each top-level `if c then v := e; end if` of a discrete `v` as `when c then v := e`
-  (MSL Sources.Table / Step / Pulse unroll their bodies so); the whole body, unless it is one
+- else: each top-level `if c then v := e; end if` of a discrete `v` the section assigns nowhere
+  else as `when c then v := e` (`liftIfToWhen!`); the whole body, unless it is one
   discrete assignment, as an initial when-equation (it runs once at the initialization, in
   order) and a when-equation on `change()` of its discrete inputs and of its relations with a
   continuous operand (MLS 17.4.4: a non-when algorithm with discrete targets runs at every
@@ -486,10 +486,10 @@ function liftAlgorithmWhens(algorithms::Vector{IR.ALGORITHM}, known::Set{Symbol}
       foreach(s -> liftAlgorithmWhenStatement!(out, s, lifted), alg.statements)
       continue
     end
-    for s in alg.statements
-      liftIfToWhen!(out, s, alg.source)
-    end
-    isSingleDiscreteAssignment(alg.statements) || liftBodyToWhens!(out, alg.statements, alg.source, lifted, known)
+    local counts = assignmentCounts(alg.statements)
+    #= the conditions of the ifs lifted on their own: the body's lifting has no when of their sample() =#
+    local ownWhens = IR.Expression[s.branches[1].condition for s in alg.statements if liftIfToWhen!(out, s, alg.source, counts)]
+    isSingleDiscreteAssignment(alg.statements) || liftBodyToWhens!(out, alg.statements, alg.source, lifted, known, ownWhens)
     for s in alg.statements
       s isa IR.WHEN_STATEMENT && liftAlgorithmWhenStatement!(out, s, lifted)
     end
@@ -515,11 +515,12 @@ function liftAlgorithmWhenStatement!(out::Vector{IR.Equation}, s::IR.WHEN_STATEM
     return nothing
   end
   if first.atInitial
-    #= An initial arm the lifter cannot lower stays empty. =#
+    #= An initial arm the lifter cannot lower stays empty (its variables start from their
+       start values): a fallback that changes the result, reported. =#
     local (initOps, initAssigned) = try
       bodyStatements(first.body, BodyLowering(true, true, "a when body"))
     catch err
-      err isa UnsupportedLowering || rethrow()
+      _fallback(err, :algorithmInitialArm; only = UnsupportedLowering, impact = :result)
       (IR.Statement[], Symbol[])
     end
     union!(lifted, initAssigned)
@@ -554,18 +555,47 @@ function whenEquationOf(branches::Vector{IR.WhenBranch}, source::IR.Source, lift
 end
 
 """
-A top-level `if c then v := e; end if` of a discrete `v` (one assignment, no else needed:
-for the sources the assignment is idempotent and their conditions monotone in time) as
-`when c then v := e`.
+A top-level `if c then v := e; end if` of a discrete `v` (one branch of one assignment, no
+else) that the section assigns nowhere else (`counts`) as `when c then v := e`: its event is
+`c`'s (a `sample()` the body's lifting has no trigger for). An if with an elseif or an else, or a
+`v` another statement assigns (`v := v * 10` after it), is the body's lifting's alone, which runs
+the section in order: a when of the first branch beside it assigned `v` twice at one event.
 """
-function liftIfToWhen!(out::Vector{IR.Equation}, s::IR.Statement, source::IR.Source)::Bool
-  (s isa IR.IF_STATEMENT && length(s.branches[1].body) == 1) || return false
+function liftIfToWhen!(out::Vector{IR.Equation}, s::IR.Statement, source::IR.Source, counts::Dict{Symbol, Int})::Bool
+  (s isa IR.IF_STATEMENT && length(s.branches) == 1 && isempty(s.elseBody) && length(s.branches[1].body) == 1) ||
+    return false
   local a = s.branches[1].body[1]
   (a isa IR.ASSIGNMENT && a.lhs isa IR.CREF && isDiscreteType(IR.typeOf(a.lhs)) && !(IR.typeOf(a.lhs) isa IR.T_ARRAY)) ||
     return false
+  get(counts, a.lhs.cref.name, 0) == 1 || return false
   push!(out, IR.WHEN_EQUATION([IR.WhenBranch(IR.Expression[s.branches[1].condition], false, false, IR.Statement[a])],
                               IR.REGULAR_WHEN, source, IR.DEFAULT_ATTRIBUTES))
   return true
+end
+
+"""
+    assignmentCounts(stmts)
+
+How often the statements assign each variable (the targets of assignments and tuple
+assignments, in if-, for-, while- and when-statements too).
+"""
+function assignmentCounts(stmts::Vector{IR.Statement})::Dict{Symbol, Int}
+  local counts = Dict{Symbol, Int}()
+  local visit
+  visit = s -> begin
+    if s isa IR.ASSIGNMENT
+      for t in (s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
+        t isa IR.CREF && (counts[t.cref.name] = get(counts, t.cref.name, 0) + 1)
+      end
+    elseif s isa Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}
+      foreach(b -> foreach(visit, b.body), s.branches)
+      s isa IR.IF_STATEMENT && foreach(visit, s.elseBody)
+    elseif s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}
+      foreach(visit, s.body)
+    end
+  end
+  foreach(visit, stmts)
+  return counts
 end
 
 """
@@ -573,10 +603,12 @@ A regular algorithm's body as an initial when-equation (the body run once at the
 initialization, `initial()` true) and a when-equation on `change()` of its discrete inputs and
 of its relations with a continuous operand (`initial()` false): the source-style bodies
 `y := y0; y := if time >= t[i] then x[i] else y` have their events in those relations, not in
-the constant seed.
+the constant seed. A `sample()` the body reads (`if sample(t0, T) then n := 1; end if; n := n * 10`)
+is an event of its own: a when-equation of the body on it, unless an if on it is lifted on its
+own (`ownWhens`, the conditions of `liftIfToWhen!`'s whens: the body there twice at a tick).
 """
 function liftBodyToWhens!(out::Vector{IR.Equation}, stmts::Vector{IR.Statement}, source::IR.Source,
-                          lifted::Set{Symbol}, known::Set{Symbol})::Nothing
+                          lifted::Set{Symbol}, known::Set{Symbol}, ownWhens::Vector{IR.Expression})::Nothing
   local (initOps, initAssigned) = bodyStatements(stmts, BodyLowering(true, false, "an algorithm section"))
   local (runOps, runAssigned) = bodyStatements(stmts, BodyLowering(false, false, "an algorithm section"))
   union!(lifted, initAssigned)
@@ -598,7 +630,21 @@ function liftBodyToWhens!(out::Vector{IR.Equation}, stmts::Vector{IR.Statement},
     push!(out, IR.WHEN_EQUATION([IR.WhenBranch(IR.Expression[condition], false, false, runOps)],
                                 IR.REGULAR_WHEN, source, IR.DEFAULT_ATTRIBUTES))
   end
+  isempty(runOps) && return nothing
+  local owned = Set{IR.Expression}(c for w in ownWhens for c in samplesIn(w))
+  for s in unique(c for op in runOps if op isa IR.ASSIGNMENT for c in samplesIn(op.rhs))
+    s in owned && continue
+    push!(out, IR.WHEN_EQUATION([IR.WhenBranch(IR.Expression[s], false, false, runOps)], IR.REGULAR_WHEN, source,
+                                IR.DEFAULT_ATTRIBUTES))
+  end
   return nothing
+end
+
+"The `sample()` calls in `e`."
+function samplesIn(e::IR.Expression)::Vector{IR.Expression}
+  local out = IR.Expression[]
+  IR.foreachExp(x -> IR.isBuiltinCall(x, :sample) && push!(out, x), e)
+  return out
 end
 
 """

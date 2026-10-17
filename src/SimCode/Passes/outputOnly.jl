@@ -212,7 +212,8 @@ isLinearlySolvableFor(e::Exp, name::String)::Bool = occursLinearly(e, name) == (
 
 The algebraic (and array) variables the dynamics do not need (`essentialEquations`, on a
 fresh matching) removed with the residuals that define them, if those solve them linearly;
-recorded for the observed equations. A variable that a remaining residual (or one reading its
+recorded for the observed equations. `options`: with `reachability` every such variable, else
+only those a pattern of `patterns` matches; none a pattern of `keepPatterns` matches. A variable that a remaining residual (or one reading its
 array's name), a when-clause, an initial equation reads, a Complex part, one of a fixed start,
 is kept with its residual, to a fixed point (what a kept residual reads stays too). Never every
 residual. Nothing for a model with modes or translated again at its structural changes.
@@ -234,6 +235,8 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
     (i in essential || !haskey(variableOf, i)) && continue
     local name = variableOf[i]
     (haskey(ht, name) && last(ht[name]).varKind isa Union{ALG_VARIABLE, ARRAY}) || continue
+    (options.reachability || any(p -> occursin(p, name), options.patterns)) || continue
+    any(p -> occursin(p, name), options.keepPatterns) && continue
     isLinearlySolvableFor(residuals[i].exp, name) || continue
     push!(removed, i)
     push!(pairs, (name, i))

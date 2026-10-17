@@ -325,6 +325,7 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
             dispatchedToDAEInit = true
             @VSS_DEBUG @info "VSS transfer: re-ran MTK DAE init" n_inherited=length(u0Dict) u_after=integrator.u
           catch err
+            OMBackend._fallback(err, :vssTransferDAEInit; impact = :result)
             @VSS_DEBUG @info "VSS transfer DAE-init path failed; falling back to vector u0" err
             dispatchedToDAEInit = false
           end
@@ -889,7 +890,8 @@ end
 The SimCode of a recompiled model with its functions (`functionList`, the frontend's), as a
 translate's (OMBackend.omjlirModel, OMBackend.mtkSimCode).
 """
-translateToSimCode(flatModelica::OMFrontend.Frontend.FlatModel, functionList)::OMBackend.SimCode.SIM_CODE =
+translateToSimCode(flatModelica::OMFrontend.Frontend.FlatModel,
+                   functionList::Union{Nothing, OMBackend.LowerFlatModel.FunctionList})::OMBackend.SimCode.SIM_CODE =
   OMBackend.mtkSimCode(OMBackend.omjlirModel(flatModelica; functionList))
 
 """

@@ -38,14 +38,13 @@
 
 The simulation code of a model: variables with their categories and indices, residual
 equations, when- and if-equations, initial equations and algorithms, the functions the model
-calls; the code generators' input. It is lowered from OMJLIR (fromOMJLIR.jl) and transformed
+calls; the code generators' input. It is lowered from OMJLIR (`fromOMJLIR`, lowerModel.jl) and transformed
 by its passes; its types (types.jl) are its own and depend on no other representation.
 """
 module SimCode
 
 import DataStructures: OrderedDict, OrderedSet
 import Graphs
-import MetaGraphs
 import ..BackendUtil.GraphAlgorithms
 import ..OMJLIR
 import ..Passes: legacyName, isSampleTrigger, isBuiltinCallOf, tupleAssignElements, initialCall, builtinCall, edgeCall

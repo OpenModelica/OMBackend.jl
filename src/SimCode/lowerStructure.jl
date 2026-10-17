@@ -33,8 +33,7 @@
 *
 */ =#
 
-#= The structure of the simulation code: the irreducible variables, the equation-variable
-   graph, the matching and the strongly connected components, the if-equations' branches. =#
+#= The structure of the simulation code: the irreducible variables, the if-equations' branches. =#
 
 #= ==================================================================================== =#
 #= Irreducible variables                                                                =#
@@ -52,8 +51,7 @@ parameters:
   `s`, became an observed ifelse read back with the final parameter values);
 - the states the when-equations read or write (their callbacks index the state vector by name);
 - the discretes in the when-conditions (an eliminated one is read by the callback), of their
-  first branches (the previous backend's);
-- a variable named `*THETA` (Zimmer's homotopy parameter).
+  first branches (the previous backend's).
 """
 function irreducibleVariables(names::Names, ifEquations::Vector{IR.IF_EQUATION}, whens::Vector{WHEN_EQUATION},
                               vars::Vector{IR.Variable}, ht::HT)::Vector{String}
@@ -73,33 +71,7 @@ function irreducibleVariables(names::Names, ifEquations::Vector{IR.IF_EQUATION},
   for w in whens, n in allCrefNames(w.whenEquation.condition)
     (haskey(ht, n) && last(ht[n]).varKind isa DISCRETE) && push!(out, n)
   end
-  local theta = thetaVariable(ht)
-  theta === nothing || push!(out, theta)
   return filter(n -> n != "time", out)
-end
-
-"The variable named `*THETA` (at most one)."
-function thetaVariable(ht::HT)::Union{Nothing, String}
-  local thetas = [k for k in keys(ht) if endswith(k, "THETA")]
-  @assert length(thetas) < 2
-  return isempty(thetas) ? nothing : first(thetas)
-end
-
-"""
-    addThetaResidual!(residuals, irreducibles, ht)
-
-Zimmer's homotopy parameter `*THETA` as an algebraic variable with the equation `THETA = 1`
-(irreducible).
-"""
-function addThetaResidual!(residuals::Vector{RESIDUAL_EQUATION}, irreducibles::Vector{String}, ht::HT)::Nothing
-  local theta = thetaVariable(ht)
-  theta === nothing && return nothing
-  push!(irreducibles, theta)
-  push!(residuals, RESIDUAL_EQUATION(BINARY(EXP_CREF(SimCref(Symbol(theta)), TYPE_REAL()), OP_SUB, RCONST(1.0)),
-                                     NO_SOURCE, EQ_ATTR_DEFAULT))
-  local (index, sv) = ht[theta]
-  ht[theta] = (index, withKind(sv, ALG_VARIABLE(0)))
-  return nothing
 end
 
 "The equations of an if-equation's branches (the else-branch's last)."
@@ -226,158 +198,21 @@ whenStatementExps(s::NORETCALL)::Vector{Exp} = Exp[s.exp]
 whenStatementExps(s::Statement)::Vector{Exp} = Exp[]
 
 #= ==================================================================================== =#
-#= The equation-variable graph, matching, components                                   =#
-#= ==================================================================================== =#
-
-"""
-    equationVariableGraph(names, residuals, ifEquations, whens, ht)
-
-The bipartite graph of the residual system for the matching: each equation's unknowns by
-their indices (an algebraic variable's sort index, a state's index): the residuals', the
-first branch's equations of each if-equation (the branches are balanced), and the Real
-assignments of the when-equations' first branches.
-"""
-function equationVariableGraph(names::Names, residuals::Vector{RESIDUAL_EQUATION}, ifEquations::Vector{IR.IF_EQUATION},
-                               whens::Vector{WHEN_EQUATION}, ht::HT)::OrderedDict{Int, Vector{Int}}
-  local graph = OrderedDict{Int, Vector{Int}}()
-  for r in residuals
-    graph[length(graph) + 1] = equationUnknowns(r.exp, ht)
-  end
-  addIfEquationRows!(graph, names, ifEquations, ht)
-  addWhenRows!(graph, whens, ht)
-  return graph
-end
-
-"""
-    equationUnknowns(e, ht)
-
-The unknowns of a residual `e` by their indices, sorted: the algebraic variables it reads (in
-`pre()` too) and the states whose derivatives it reads.
-"""
-function equationUnknowns(e::Exp, ht::HT)::Vector{Int}
-  local out = Int[]
-  local seen = Set{String}()
-  foreachExp(e) do x
-    local (name, derivative) = x isa Union{EXP_CREF, PRE} ? (crefName(x.cref), false) : x isa DER ? (crefName(x.cref), true) : (nothing, false)
-    (name === nothing || name in seen) && return
-    local entry = get(ht, name, nothing)
-    entry === nothing && return
-    local (index, sv) = entry
-    if !derivative && sv.varKind isa ALG_VARIABLE
-      push!(seen, name)
-      push!(out, sv.varKind.sortIdx)
-    elseif derivative && sv.varKind isa STATE
-      push!(seen, name)
-      push!(out, index)
-    end
-  end
-  return sort(out)
-end
-
-"The indices of the unknowns among `refs` (an algebraic variable's sort index, a state's index), sorted."
-function unknownIndices(refs, ht::HT)::Vector{Int}
-  local out = Int[]
-  for name in refs
-    local entry = get(ht, name, nothing)
-    entry === nothing && continue
-    local (index, sv) = entry
-    sv.varKind isa ALG_VARIABLE ? push!(out, sv.varKind.sortIdx) : sv.varKind isa STATE && push!(out, index)
-  end
-  return sort(out)
-end
-
-function addIfEquationRows!(graph::OrderedDict{Int, Vector{Int}}, names::Names, ifEquations::Vector{IR.IF_EQUATION}, ht::HT)
-  for eq in ifEquations
-    isempty(eq.branches) && continue
-    for e in eq.branches[1].equations
-      if e isa IR.SCALAR_EQUATION
-        graph[length(graph) + 1] = equationUnknowns(BINARY(simExp(names, e.lhs), OP_SUB, simExp(names, e.rhs)), ht)
-      elseif e isa IR.IF_EQUATION
-        graph[length(graph) + 1] = unknownIndices(nestedIfReferences(names, e, ht), ht)
-      else
-        graph[length(graph) + 1] = Int[]
-      end
-    end
-  end
-  return graph
-end
-
-"""
-The references of a nested if-equation for the graph (the previous backend's): its
-conditions' references (states too), its equations' algebraic variables and differentiated
-states.
-"""
-function nestedIfReferences(names::Names, eq::IR.IF_EQUATION, ht::HT)::Vector{String}
-  local out = String[]
-  for b in eq.branches
-    append!(out, referenceNames(names, b.condition))
-  end
-  for e in branchEquations(eq)
-    if e isa IR.IF_EQUATION
-      append!(out, nestedIfReferences(names, e, ht))
-    elseif e isa IR.SCALAR_EQUATION
-      foreachExp(BINARY(simExp(names, e.lhs), OP_SUB, simExp(names, e.rhs))) do x
-        if x isa Union{EXP_CREF, PRE}
-          local entry = get(ht, crefName(x.cref), nothing)
-          (entry !== nothing && last(entry).varKind isa ALG_VARIABLE) && push!(out, crefName(x.cref))
-        elseif x isa DER
-          push!(out, crefName(x.cref))
-        end
-      end
-    end
-  end
-  return out
-end
-
-function addWhenRows!(graph::OrderedDict{Int, Vector{Int}}, whens::Vector{WHEN_EQUATION}, ht::HT)
-  for w in whens, s in w.whenEquation.body
-    (s isa ASSIGN && s.left isa EXP_CREF && s.left.ty isa TYPE_REAL) || continue
-    local refs = String[]
-    local add = x -> x isa Union{EXP_CREF, DER, PRE} && push!(refs, crefName(x.cref))
-    foreachExp(add, s.left)
-    foreachExp(add, s.right)
-    graph[length(graph) + 1] = unknownIndices(refs, ht)
-  end
-  return graph
-end
-
-"""
-    matchAndSort(graph)
-
-The matching of the equations to their unknowns and the strongly connected components of the
-resulting graph; a structurally singular system is left to MTK (its structural_simplify does
-index reduction), as one the matching fails on (the recursion overflowing on a large one).
-"""
-function matchAndSort(graph::OrderedDict{Int, Vector{Int}})::Tuple{Bool, Vector{Int}, MetaGraphs.MetaDiGraph, Vector{Vector{Int}}}
-  local (isSingular, matchOrder) = try
-    GraphAlgorithms.matching(graph, length(graph.keys))
-  catch e
-    e isa StackOverflowError || _fallback(e, :matchingDelegatedToMTK)
-    return (true, Int[], MetaGraphs.MetaDiGraph(), Vector{Int}[])
-  end
-  local digraph = GraphAlgorithms.merge(matchOrder, graph)
-  return (isSingular, matchOrder, digraph, GraphAlgorithms.stronglyConnectedComponents(digraph))
-end
-
-#= ==================================================================================== =#
 #= If-equations                                                                         =#
 #= ==================================================================================== =#
 
 """
-    constructIfEquations(names, ifEquations, residuals, whens, ht)
+    constructIfEquations(names, ifEquations)
 
-The if-equations of the simulation code, each a small graph of branches: per branch its
-condition, its residuals, and the structure (matching, components) of the system with the
-branch's equations in place of the if-equation (the others' first branches as in the main
-graph). Nested if-equations are flattened first (`flattenIfEquation`); an if-equation without
-an else-branch holds no equations (the asserts were hoisted) and is left out.
+The if-equations of the simulation code: per branch its condition and its residuals. Nested
+if-equations are flattened first (`flattenIfEquation`); an if-equation without an else-branch
+holds no equations (the asserts were hoisted) and is left out. A branch's equation that is not
+a scalar equation is not supported.
 """
-function constructIfEquations(names::Names, ifEquations::Vector{IR.IF_EQUATION}, residuals::Vector{RESIDUAL_EQUATION},
-                              whens::Vector{WHEN_EQUATION}, ht::HT)::Vector{IF_EQUATION}
+function constructIfEquations(names::Names, ifEquations::Vector{IR.IF_EQUATION})::Vector{IF_EQUATION}
   local out = IF_EQUATION[]
-  for (i, original) in enumerate(ifEquations)
+  for original in ifEquations
     local eq = flattenIfEquation(original)
-    local others = IR.IF_EQUATION[e for (j, e) in enumerate(ifEquations) if j != i]
     if isempty(eq.elseEquations)
       all(holdsNoEquations, b.equations for b in eq.branches) ||
         unsupported("an if-equation without else whose branches have equations", IR.toString(eq.branches[1].condition))
@@ -389,21 +224,11 @@ function constructIfEquations(names::Names, ifEquations::Vector{IR.IF_EQUATION},
     for (condition, equations, identifier) in arms
       local branchResiduals = RESIDUAL_EQUATION[]
       for e in equations
-        if e isa IR.SCALAR_EQUATION
-          push!(branchResiduals, residual(names, e))
-        else
-          @warn "Skipping unsupported $(nameof(typeof(e))) inside an if-equation's branch; the model may translate but lose this equation's effect"
-        end
+        e isa IR.SCALAR_EQUATION || unsupported("this equation in an if-equation's branch", IR.toString(e))
+        push!(branchResiduals, residual(names, e))
       end
-      local graph = OrderedDict{Int, Vector{Int}}()
-      for r in vcat(residuals, branchResiduals)
-        graph[length(graph) + 1] = equationUnknowns(r.exp, ht)
-      end
-      addIfEquationRows!(graph, names, others, ht)
-      addWhenRows!(graph, whens, ht)
-      local (isSingular, matchOrder, digraph, sccs) = matchAndSort(graph)
       local target = identifier == ELSE_BRANCH ? ELSE_BRANCH : identifier + 1
-      push!(branches, BRANCH(condition, branchResiduals, identifier, target, isSingular, matchOrder, digraph, sccs, ht))
+      push!(branches, BRANCH(condition, branchResiduals, identifier, target))
     end
     push!(out, IF_EQUATION(branches))
   end

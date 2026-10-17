@@ -392,7 +392,7 @@ function flattenedStatement(s::IR.ASSIGNMENT, fields::RecordFields)::Vector{IR.S
     #= an array (a whole record array: one statement, scattered by the code generation) =#
     local rhs = x(s.rhs)
     (recordFieldReferences(s.lhs, fields) !== nothing && !(rhs isa IR.CALL) && recordFieldReferences(s.rhs, fields) === nothing) &&
-      error("assigning $(IR.toString(s.rhs)) to the record array $(IR.toString(s.lhs)) in a function is not supported")
+      unsupported("an assignment of this value to a record array in a function", IR.toString(s))
     return IR.Statement[IR.ASSIGNMENT(x(s.lhs), rhs, s.source)]
   end
   local lhsPart = s.lhs isa IR.CREF && length(s.lhs.cref.parts) == 1 ? s.lhs.cref.parts[1] : nothing

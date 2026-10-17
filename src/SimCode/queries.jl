@@ -245,6 +245,8 @@ typeOf(e::TUPLE)::SType = TYPE_TUPLE(SType[typeOf(x) for x in e.elements])
 function typeOf(e::BINARY)::SType
   local (t1, t2) = (typeOf(e.exp1), typeOf(e.exp2))
   e.op === OP_SCALAR_PRODUCT && return scalarType(t1)
+  local product = productType(e.op, t1, t2)
+  product === nothing || return product
   local array = t1 isa TYPE_ARRAY ? t1 : t2 isa TYPE_ARRAY ? t2 : nothing
   local element = e.op in (OP_DIV, OP_DIV_EW, OP_DIV_SCALAR_ARRAY, OP_DIV_ARRAY_SCALAR, OP_POW, OP_POW_EW,
                            OP_POW_SCALAR_ARRAY, OP_POW_ARRAY_SCALAR, OP_POW_MATRIX) ? TYPE_REAL() :
@@ -259,6 +261,20 @@ function typeOf(e::ASUB)::SType
   local kept = Int[d for (k, d) in enumerate(t.dims) if k > length(e.subs) ||
                    e.subs[k] isa WHOLE_DIMENSION || typeOf(e.subs[k]) isa TYPE_ARRAY]
   return isempty(kept) ? t.elementType : TYPE_ARRAY(t.elementType, kept)
+end
+
+"""
+The type of a vector-matrix, matrix-vector or matrix product of operands of known dimensions
+(`A[n, m] * v[m]` is `[n]`); `nothing` for another operator or operands.
+"""
+function productType(op::OpKind, t1::SType, t2::SType)::Union{Nothing, SType}
+  (op in (OP_MUL_MATRIX_VECTOR, OP_MUL_VECTOR_MATRIX, OP_MATRIX_PRODUCT) && t1 isa TYPE_ARRAY && t2 isa TYPE_ARRAY) ||
+    return nothing
+  local element = (t1.elementType isa TYPE_INTEGER && t2.elementType isa TYPE_INTEGER) ? TYPE_INTEGER() : TYPE_REAL()
+  op === OP_MUL_MATRIX_VECTOR && length(t1.dims) == 2 && return TYPE_ARRAY(element, Int[t1.dims[1]])
+  op === OP_MUL_VECTOR_MATRIX && length(t2.dims) == 2 && return TYPE_ARRAY(element, Int[t2.dims[2]])
+  op === OP_MATRIX_PRODUCT && length(t1.dims) == 2 && length(t2.dims) == 2 && return TYPE_ARRAY(element, Int[t1.dims[1], t2.dims[2]])
+  return nothing
 end
 
 "The scalar type of `t` (of an array, its element type)."

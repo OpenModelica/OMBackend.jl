@@ -195,9 +195,8 @@ literalOf(v::Float64, ::TYPE_BOOL)::Exp = BCONST(v != 0.0)
 literalOf(v::Float64, ::SType)::Exp = RCONST(v)
 literalOf(v::ENUM_LITERAL, ::SType)::Exp = v
 
-"The literal of an array element of the value `v` (read by subscripts, of no type: a Real)."
-elementLiteral(v::Float64)::Exp = RCONST(v)
-elementLiteral(v::ENUM_LITERAL)::Exp = v
+"The literal of an array element of the value `v`, of the array's element type `ty` (an Integer array's element an Integer)."
+elementLiteral(v::ParameterValue, ty::SType)::Exp = literalOf(v, scalarType(ty))
 
 """
     enumerationValue(e, simCode, seen)
@@ -228,7 +227,7 @@ function valueVisitor(e::Exp, values::Dict{String, ParameterValue})::Tuple{Exp, 
   elseif e isa ASUB
     local name = elementName(e)
     local v = name === nothing ? nothing : get(values, name, nothing)
-    v === nothing || return (elementLiteral(v), false, values)
+    v === nothing || return (elementLiteral(v, typeOf(e)), false, values)
   end
   return (e, true, values)
 end
@@ -326,8 +325,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   local initialEquations = Equation[initialWithValues(eq, values) for eq in simCode.initialEquations]
   local ifEquations = IF_EQUATION[IF_EQUATION(BRANCH[BRANCH(x(b.condition), RESIDUAL_EQUATION[RESIDUAL_EQUATION(x(eq.exp), eq.source, eq.attr)
                                                                                            for eq in b.residualEquations],
-                                                           b.identifier, b.targets, b.isSingular, b.matchOrder, b.equationGraph,
-                                                           b.sccs, b.stringToSimVarHT) for b in ifEq.branches])
+                                                           b.identifier, b.targets) for b in ifEq.branches])
                                   for ifEq in simCode.ifEquations]
   local whenEquations = WHEN_EQUATION[WHEN_EQUATION(whenWithValues(w.whenEquation, x), w.source, w.attr) for w in simCode.whenEquations]
   #= the bindings too: a kept candidate's (still read), a String's (evaluated where an eliminated parameter is no name) =#
@@ -348,8 +346,12 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   local eliminated = String[n for n in keys(values) if !(n in read)]
   isempty(eliminated) && return simCode
   foreach(n -> delete!(newHT, n), eliminated)
+  #= a model variable folded into a parameter stays observable: `v = <its value>` =#
+  local (observed, observations) = foldedObservations(simCode, eliminated, n -> literalOf(values[n], last(ht[n]).elementType))
   return update(simCode; residualEquations = residuals, initialEquations, ifEquations, whenEquations, stringToSimVarHT = newHT,
-                eliminatedEquations = RESIDUAL_EQUATION[RESIDUAL_EQUATION(x(eq.exp), eq.source, eq.attr) for eq in simCode.eliminatedEquations],
+                eliminatedVariables = vcat(simCode.eliminatedVariables, observed),
+                eliminatedEquations = vcat(RESIDUAL_EQUATION[RESIDUAL_EQUATION(x(eq.exp), eq.source, eq.attr) for eq in simCode.eliminatedEquations],
+                                           observations),
                 asserts = ASSERT_EQUATION[ASSERT_EQUATION(x(a.condition), x(a.message), a.level, a.source) for a in simCode.asserts],
                 initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(mapStatementExps(x, a.statements), a.section) for a in simCode.initialAlgorithms])
 end
@@ -376,7 +378,7 @@ end
 The protected algebraic (and array) variables no one observes dropped with their defining
 residual: a variable at most one residual reads, and nothing else (no initial equation, if-
 or when-equation, assert, alias, attribute, if-expression condition, eliminated equation,
-function body). To a fixed point: a sink whose only reader was a dropped sink's residual
+function body; not one the observed filter asks for). To a fixed point: a sink whose only reader was a dropped sink's residual
 goes next. Nothing for a model with modes or translated again at its structural changes.
 """
 function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
@@ -384,7 +386,7 @@ function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   local ht = simCode.stringToSimVarHT
   local droppable = v::SIMVAR -> v.attributes.isProtected && v.varKind isa Union{ALG_VARIABLE, ARRAY}
   any(((_, (_, v)),) -> droppable(v), ht) || return simCode
-  local untouchable = OrderedSet{String}()
+  local untouchable = requestedNames(simCode)
   initialEquationNames!(untouchable, simCode.initialEquations)
   ifEquationNames!(untouchable, simCode.ifEquations)
   foreach(w -> whenCrefNames!(untouchable, w.whenEquation), simCode.whenEquations)
@@ -470,5 +472,24 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
   @debug "[SIMCODE: $(simCode.name): eliminateDeadParameters] dropped $(length(dead)) unread parameters"
   local newHT = copy(ht)
   foreach(n -> delete!(newHT, n), dead)
-  return update(simCode; stringToSimVarHT = newHT)
+  #= a folded model variable observed by its binding (whose parameters the bindings' reads keep) =#
+  local (observed, observations) = foldedObservations(simCode, dead, n -> something(last(ht[n]).varKind.bindExp, RCONST(0.0)))
+  return update(simCode; stringToSimVarHT = newHT, eliminatedVariables = vcat(simCode.eliminatedVariables, observed),
+                eliminatedEquations = vcat(simCode.eliminatedEquations, observations))
+end
+
+"""
+    foldedObservations(simCode, dropped, valueOf)
+
+Of the parameters `dropped`, the model variables `foldParameterClosure` folded
+(`foldedVariables`) with their observed equations `v - valueOf(v)`: eliminated variables, read
+from the solution (dropped with no equation, a variable of the model was in none).
+"""
+function foldedObservations(simCode::SIM_CODE, dropped::Vector{String}, valueOf::F)::Tuple{Vector{String}, Vector{RESIDUAL_EQUATION}} where {F}
+  local folded = Set{String}(simCode.foldedVariables)
+  local names = String[n for n in dropped if n in folded]
+  local ht = simCode.stringToSimVarHT
+  local equations = RESIDUAL_EQUATION[RESIDUAL_EQUATION(BINARY(EXP_CREF(SimCref(Symbol(n)), last(ht[n]).elementType), OP_SUB, valueOf(n)),
+                                                        NO_SOURCE, EQ_ATTR_DEFAULT) for n in names]
+  return (names, equations)
 end

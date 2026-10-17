@@ -58,7 +58,7 @@ states eliminated (the states without der() then demoted again: a frozen factor 
 flow sums), the right-hand-side equivalence to a fixed point (at most 6 rounds), the discretes
 of when-equations classified, the output-only variables eliminated (`eliminateNonDynamic`),
 the alias observations filtered (`observedFilter`, else the user-visible names: no `[`), the
-initial values propagated, the strongly connected components recomputed.
+initial values propagated.
 """
 function simulationCode(model::IR.Model; observedFilter::Union{Nothing, Vector{String}} = nothing,
                         eliminateNonDynamic::Union{Nothing, Bool, EliminationOptions} = nothing)::SIM_CODE
@@ -99,8 +99,7 @@ function simulationCode(model::IR.Model; observedFilter::Union{Nothing, Vector{S
     eliminateNonDynamic isa EliminationOptions ? eliminateNonDynamic : nothing
   options === nothing || (simCode = runSimCodePass("eliminateNonDynamic", simCode, sc -> eliminateOutputOnlyVariables(sc, options)))
   simCode = runSimCodePass("observedFilter", simCode, filterAliasObservations)
-  simCode = runPasses(simCode, ["propagateInitialValues" => propagateInitialValues,
-                                "recomputeStronglyConnectedComponents" => recomputeStronglyConnectedComponents])
+  simCode = runPasses(simCode, ["propagateInitialValues" => propagateInitialValues])
   return indexOverconstraintDiagnostic(simCode)
 end
 

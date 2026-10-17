@@ -72,8 +72,8 @@ systems and for algebraic rows of generated discrete variables.
 """
 daeFallbackSolver() = FBDF(autodiff = ADTypes.AutoFiniteDiff())
 
-import ..CodeGeneration
-import ..Runtime
+import .CodeGeneration
+import .Runtime
 import .OMJLIR
 import .LowerFlatModel
 import .LowerFlatModel: FunctionList
@@ -82,7 +82,6 @@ import .SimCode
 
 import Base.Meta
 import JuliaFormatter
-import OMBackend.CodeGeneration
 import OMFrontend
 import Plots
 import SCode
@@ -215,17 +214,6 @@ Read at each call site, so changes take effect immediately without restarting Ju
 """
 const DEFAULT_BACKEND_MODE = Ref{BackendMode}(IMTK_MODE)
 
-function info()
-  println("OMBackend.jl")
-  println("A Julia backend for the Equation Oriented Language Modelica!")
-  println("Run any test module by executing runExample(<model-name>)")
-  println("Available Example models include:")
-  for (k,v) in EXAMPLE_MODELS
-    println(k)
-  end
-end
-
-
 """
   MTK Models that have been compiled one time.
 TODO: Optimally we should keep the frontend structure
@@ -326,12 +314,19 @@ end
     forgetModel(modelName::String) -> Nothing
 
 Drops the cached build of one model and frees its external objects (tables) by their
-destructors. For a long run over many models (a coverage worker): without it every model's
-build and tables stay for the whole session. A solution of the model that reads one of its
-tables afterwards throws; simulate the model again for a new one.
+destructors, with its generated code and its run directory. For a long
+run over many models (a coverage worker): without it every model's build, tables and code stay
+for the whole session. A solution of the model that reads one of its tables afterwards throws;
+simulate the model again for a new one (a translate).
 """
 function forgetModel(modelName::String)::Nothing
-  IMTKGen.forgetBuild(canonicalName(modelName))
+  local cname = canonicalName(modelName)
+  IMTKGen.forgetBuild(cname)
+  for name in unique((modelName, cname))
+    delete!(COMPILED_MODELS_MTK, name)
+    delete!(COMPILED_MODELS_DEJL, name)
+    delete!(MODEL_RUN_DIRS, name)
+  end
   return nothing
 end
 

@@ -126,8 +126,8 @@ end
     classifyVariables(simCode) -> ClassifiedVariables
 
 For `ODE_MODE_MTK_MODEL_GENERATION`: walk `simCode.stringToSimVarHT`
-once and bucket each variable by its `varKind`. An `ALG_VARIABLE` is algebraic, unless no
-residual is matched to it and a when-equation sets it (`involvedInEvent`): then discrete.
+once and bucket each variable by its `varKind`. An `ALG_VARIABLE` is algebraic, unless a
+when-equation sets it (`SC.whenAssignedNames`): then discrete.
 
 Also extracts the per-variable `StateSelect` annotation (`NEVER`,
 `AVOID`, `PREFER`, `ALWAYS`) into MTK state-priority pairs, but only for
@@ -145,9 +145,7 @@ function classifyVariables(simCode::SC.SIM_CODE)::ClassifiedVariables
   local stateDerivatives       = String[]
   local dataStructureVariables = String[]
   local statePriorityPairs     = Tuple{Symbol, Int}[]
-  #= Membership set built once: the per-variable `idx in matchOrder` below was an
-     O(V) scan of the matchOrder Vector, making classification O(V^2). =#
-  local matchOrderSet = OrderedSet{Int}(simCode.matchOrder)
+  local whenTargets = SC.whenAssignedNames(simCode)
   for (varName, (idx, var)) in simCode.stringToSimVarHT
     local varType = var.varKind
     if varType isa SC.INPUT
@@ -161,9 +159,9 @@ function classifyVariables(simCode::SC.SIM_CODE)::ClassifiedVariables
     elseif varType isa SC.DISCRETE
       push!(discreteVariables, varName)
     elseif varType isa SC.ALG_VARIABLE
-      #= An algebraic variable no residual solves that a when sets is a discrete. =#
-      (!(idx in matchOrderSet) && involvedInEvent(idx, simCode)) ? push!(discreteVariables, varName) :
-                                                                   push!(algebraicVariables, varName)
+      #= An algebraic variable a when sets is a discrete (`classifyAdditionalDiscretes` makes them
+         so, but not in a model with structural modes or translated again at its changes). =#
+      varName in whenTargets ? push!(discreteVariables, varName) : push!(algebraicVariables, varName)
     elseif varType isa SC.DATA_STRUCTURE
       push!(dataStructureVariables, varName)
     elseif varType isa SC.STATE_DERIVATIVE
@@ -965,7 +963,6 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
   local statePriorityPairs     = vars.statePriorityPairs
 
 
-  local performIndexReduction = simCode.isSingular
   local skipInitializeProb = SC.hasStructuralTransitions(simCode) || SC.hasFrontendModel(simCode)
   #= Solve parametric initial equations (initial equations that only involve parameters).
      This determines values for fixed=false parameters before code generation. =#
@@ -1355,7 +1352,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
                                                             !isempty(simCode.eliminatedVariables)))
       firstOrderSystem = nonLinearSystem
       #= Structural simplification =#
-      $(performStructuralSimplify(performIndexReduction; observedFilter = simCode.observedFilter, split = !useDirectRHS))
+      $(performStructuralSimplify(; observedFilter = simCode.observedFilter, split = !useDirectRHS))
       #= Inject observed equations post-simplification so they do not interfere
          with AffectSystem tearing during callback compilation. =#
       if @isdefined(observedEqs) && !isempty(observedEqs)

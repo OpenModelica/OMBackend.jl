@@ -234,7 +234,7 @@ function tryEvalScalar(e::Exp, simCode::SIM_CODE, seen::OrderedSet{String})
   elseif isBuiltin(e, :Integer)
     length(e.args) == 1 || return nothing
     local v = tryEvalScalar(e.args[1], simCode, seen)
-    return v isa Number ? Int(v) : nothing
+    return v isa Number && isinteger(v) ? Int(v) : nothing
   elseif e isa CAST
     return tryEvalScalar(e.exp, simCode, seen)
   elseif e isa Union{RELATION, LBINARY, LUNARY}
@@ -278,7 +278,7 @@ function boundParameterExpression(e::Exp, simCode::SIM_CODE, seen::OrderedSet{St
 end
 
 "`v1 op v2` for a relational `op` of two numbers; `==`/`<>` of other values; `nothing` if either is unknown."
-function compareScalarValues(v1, op::OpKind, v2)::Union{Bool, Nothing}
+function compareScalarValues(v1::Union{Nothing, Bool, Real, String}, op::OpKind, v2::Union{Nothing, Bool, Real, String})::Union{Bool, Nothing}
   (v1 === nothing || v2 === nothing) && return nothing
   (v1 isa Number && v2 isa Number) && return compareValues(Float64(v1), op, Float64(v2))
   op === OP_EQUAL && return v1 == v2

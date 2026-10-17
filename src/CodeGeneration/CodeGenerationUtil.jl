@@ -372,41 +372,6 @@ otherwise (a record constructor's NamedTuple).
 @inline _recordFieldIm(x::Tuple) = x[2]
 @inline _recordFieldIm(x) = hasproperty(x, :im) ? getproperty(x, :im) : imag(x)
 
-
-"""
-  Whether the variable of index `idx` is the target of a when-equation's assignment or reinit
-  (an elsewhen arm's too): its updates come from the discrete callbacks at the events, it goes
-  to the discrete variables, not to the continuous residuals (the integrator would synthesize
-  a competing dynamic for a variable that means something at the event boundaries only).
-"""
-function involvedInEvent(idx, simCode::SC.SIM_CODE)::Bool
-  local targetName = nothing
-  for (k, (i, sv)) in simCode.stringToSimVarHT
-    if i == idx
-      targetName = k
-      break
-    end
-  end
-  targetName === nothing && return false
-  for weq in simCode.whenEquations
-    local w = weq.whenEquation
-    while w !== nothing
-      _whenStmtLstTargets(w.body, targetName) && return true
-      w = w.elsewhenPart
-    end
-  end
-  return false
-end
-
-"Whether a when-clause's statements assign (or reinit) the variable `targetName`."
-function _whenStmtLstTargets(body::Vector{SC.Statement}, targetName::String)::Bool
-  for s in body
-    s isa SC.ASSIGN && s.left isa SC.EXP_CREF && SC.crefName(s.left.cref) == targetName && return true
-    s isa SC.REINIT && SC.crefName(s.stateVar) == targetName && return true
-  end
-  return false
-end
-
 """
   The value of a constant: a literal's, or an expression of constants and parameters evaluated
   (operators and calls of constants: MSL Fluid's tanks' max(1.0, 1e-15); a negation, a

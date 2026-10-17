@@ -377,9 +377,11 @@ function attributesGiven(elementType::SType, a::SimVarAttributes)::Bool
 end
 
 "`a` with the given attributes replaced."
-withAttributes(a::SimVarAttributes; start = a.start, fixed = a.fixed, nominal = a.nominal, min = a.min, max = a.max,
-               unit = a.unit, displayUnit = a.displayUnit, quantity = a.quantity, stateSelect = a.stateSelect,
-               isProtected = a.isProtected)::SimVarAttributes =
+withAttributes(a::SimVarAttributes; start::Union{Nothing, Exp} = a.start, fixed::Union{Nothing, Exp} = a.fixed,
+               nominal::Union{Nothing, Exp} = a.nominal, min::Union{Nothing, Exp} = a.min, max::Union{Nothing, Exp} = a.max,
+               unit::Union{Nothing, Exp} = a.unit, displayUnit::Union{Nothing, Exp} = a.displayUnit,
+               quantity::Union{Nothing, Exp} = a.quantity, stateSelect::Union{Nothing, Symbol} = a.stateSelect,
+               isProtected::Bool = a.isProtected)::SimVarAttributes =
   SimVarAttributes(start, fixed, nominal, min, max, unit, displayUnit, quantity, stateSelect, isProtected)
 
 "An attribute's value negated, the literals folded; `nothing` for none."

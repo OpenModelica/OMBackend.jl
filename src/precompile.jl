@@ -59,7 +59,7 @@ function _precompileBuildReduced()
   eqs = [D(x) ~ -a * x + y,
          D(y) ~ x - y,
          0 ~ z - (x + y)]
-  sys = ODESystem(eqs, t, [x, y, z], [a];
+  sys = System(eqs, t, [x, y, z], [a];
                   name = :OMBackendPrecompileWarmup,
                   guesses = [z => 0.0],
                   initialization_eqs = ModelingToolkit.Equation[])
@@ -161,7 +161,7 @@ function _precompileBuildReducedEventfulDAE()
   local eqs = [D(x) ~ -a * x + y, 0 ~ y^3 + y - x]
   local ev = ModelingToolkit.SymbolicContinuousCallback([x ~ 0.5] => [x ~ 0.4];
                reinitializealg = ModelingToolkit.SciMLBase.NoInit())
-  local sys = ODESystem(eqs, t, [x, y], [a]; name = :OMBackendPrecompileEventfulDAE,
+  local sys = System(eqs, t, [x, y], [a]; name = :OMBackendPrecompileEventfulDAE,
                         continuous_events = [ev], guesses = [y => 0.0],
                         initialization_eqs = ModelingToolkit.Equation[])
   local reduced = CodeGeneration.structural_simplify(sys; simplify = true,

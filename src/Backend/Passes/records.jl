@@ -116,18 +116,18 @@ function fieldExpression(e::IR.Expression, name::Symbol, ty::IR.ModelicaType)::I
     return IR.CREF(IR.ComponentRef(IR.CrefPart[e.cref.parts..., IR.CrefPart(name, IR.Subscript[], ty)]), ty)
   elseif e isa IR.RECORD
     local k = findfirst(f -> f.name === name, e.ty.fields)
-    k === nothing && (@warn "fieldExpression: the record value has no field $(name)"; return e)
+    k === nothing && unsupported("a record value without the field $(name)", IR.toString(e))
     return e.elements[k]
   elseif e isa IR.IF_EXPRESSION
     return IR.IF_EXPRESSION(e.condition, fieldExpression(e.thenExp, name, ty), fieldExpression(e.elseExp, name, ty), ty)
   elseif e isa IR.CALL && e.name in COMPLEX_CONJ && !isempty(e.arguments)
     name === :re && return fieldExpression(e.arguments[1], :re, ty)
     name === :im && return IR.UNARY(IR.UMINUS, fieldExpression(e.arguments[1], :im, ty), ty)
-    error("fieldExpression: field $(name) of conj(), not re or im")
+    unsupported("the field $(name) of conj(), not re or im", IR.toString(e))
   elseif e isa IR.CALL && e.name in COMPLEX_FROM_REAL
     name === :re && return isempty(e.arguments) ? e : e.arguments[1]
     name === :im && return length(e.arguments) >= 2 ? e.arguments[2] : IR.REAL(0.0)
-    error("fieldExpression: field $(name) of Complex(), not re or im")
+    unsupported("the field $(name) of Complex(), not re or im", IR.toString(e))
   end
-  error("fieldExpression: the field $(name) of $(IR.toString(e)) ($(nameof(typeof(e))))")
+  unsupported("the field $(name) of this record expression ($(nameof(typeof(e))))", IR.toString(e))
 end

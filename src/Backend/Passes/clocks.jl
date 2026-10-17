@@ -414,7 +414,7 @@ end
 isPartitionVariable(v::IR.Variable)::Bool = !(IR.isKnown(v) || v.kind isa IR.EXTERNAL_OBJECT || v.ty isa IR.T_CLOCK)
 
 "The names of variables of `variables` sorted as the previous backend sorted them."
-sortedByName(names, variables::IR.VariableSet)::Vector{Symbol} =
+sortedByName(names::Union{AbstractSet{Symbol}, AbstractVector{Symbol}, Base.Generator}, variables::IR.VariableSet)::Vector{Symbol} =
   sort!(collect(names); by = n -> legacyName(variables[n].cref))
 
 """

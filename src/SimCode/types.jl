@@ -35,7 +35,7 @@
 
 #= The SimCode types: a closed set, lower-level than OMJLIR's. Everything above them (the
    structural kinds, der/pre as calls, records, clocks, the frontend's names) is resolved
-   by the lowering from OMJLIR (fromOMJLIR.jl), so the code generators read only these. =#
+   by the lowering from OMJLIR (`fromOMJLIR`, lowerModel.jl), so the code generators read only these. =#
 
 #= ==================================================================================== =#
 #= Values                                                                               =#
@@ -55,6 +55,19 @@ function Base.:(==)(a::T, b::T)::Bool where {T <: Node}
   return true
 end
 Base.:(==)(::Node, ::Node)::Bool = false
+
+"""
+Fields compared one by one with `isequal`, as `hash` hashes them: the identity of a `Dict` or
+`Set` key (`RCONST(0.0)` and `RCONST(-0.0)` apart, `RCONST(NaN)` equal to itself; `==` has
+them the other way round, as numbers).
+"""
+function Base.isequal(a::T, b::T)::Bool where {T <: Node}
+  for f in fieldnames(T)
+    isequal(getfield(a, f), getfield(b, f)) || return false
+  end
+  return true
+end
+Base.isequal(::Node, ::Node)::Bool = false
 
 function Base.hash(a::T, h::UInt)::UInt where {T <: Node}
   local r = hash(T, h)
@@ -160,6 +173,7 @@ SimCref(name::AbstractString) = SimCref(Symbol(name), Int[])
 SimCref(name::AbstractString, subs::Vector{Int}) = SimCref(Symbol(name), subs)
 
 Base.:(==)(a::SimCref, b::SimCref)::Bool = a.sym === b.sym && a.subs == b.subs
+Base.isequal(a::SimCref, b::SimCref)::Bool = a == b
 Base.hash(c::SimCref, h::UInt)::UInt = hash(c.subs, hash(c.sym, h))
 
 #= ==================================================================================== =#
@@ -781,20 +795,17 @@ end
 abstract type Construct end
 
 """
+    BRANCH(condition, residualEquations, identifier, targets)
+
 A branch of an if-equation: its condition, its residual equations, its identifier (`-1` for
-the else-branch) and target, and the structure of its equations (matching, graph, SCCs) over
-its variables.
+the else-branch) and the identifier of the branch evaluated when its condition does not hold
+(`-1` for the else-branch).
 """
-struct BRANCH{T6 <: Graphs.AbstractGraph} <: Construct
+struct BRANCH <: Construct
   condition::Exp
   residualEquations::Vector{RESIDUAL_EQUATION}
   identifier::Int
   targets::Int
-  isSingular::Bool
-  matchOrder::Vector{Int}
-  equationGraph::T6
-  sccs::Vector{Vector{Int}}
-  stringToSimVarHT::OrderedDict{String, Tuple{Int, SIMVAR}}
 end
 
 "The identifier of an else-branch."
@@ -825,9 +836,9 @@ end
 """
     EliminationOptions(; reachability = true, patterns = Regex[], keepPatterns = Regex[])
 
-Options of the non-dynamic variable elimination (`eliminateNonDynamic`): eliminate the
-variables not reachable from the state derivatives; also those matching `patterns`; keep those
-matching `keepPatterns`.
+Options of the non-dynamic variable elimination (`eliminateNonDynamic`): the variables the
+dynamics do not need (not reachable from the state derivatives) are eliminated, all of them with
+`reachability`, else those matching `patterns`; never those matching `keepPatterns`.
 """
 struct EliminationOptions
   reachability::Bool
@@ -850,24 +861,17 @@ end
     SIM_CODE
 
 The simulation code of a model: its variables by name (index, SimVar), its residual, initial,
-when- and if-equations, the matching and the strongly connected components of the residual
-system, its structural modes and transitions, the functions it calls, its initial algorithms
-and asserts, and what the passes eliminated (for observed equations).
-
-A model with structural modes has the matching, graph and components per mode
-(`subModels`), not at the top.
+when- and if-equations, its structural modes and transitions, the functions it calls, its
+initial algorithms and asserts, and what the passes eliminated (for observed equations). A
+model with structural modes has a simulation code per mode (`subModels`).
 """
-struct SIM_CODE{T8 <: Graphs.AbstractGraph}
+struct SIM_CODE
   name::String
   stringToSimVarHT::OrderedDict{String, Tuple{Int, SIMVAR}}
   residualEquations::Vector{RESIDUAL_EQUATION}
   initialEquations::Vector{Equation}
   whenEquations::Vector{WHEN_EQUATION}
   ifEquations::Vector{IF_EQUATION}
-  isSingular::Bool
-  matchOrder::Vector{Int}
-  equationGraph::T8
-  stronglyConnectedComponents::Vector{Vector{Int}}
   structuralTransitions::Vector{StructuralTransition}
   subModels::Vector{SIM_CODE}
   sharedVariables::Vector{String}
@@ -885,6 +889,8 @@ struct SIM_CODE{T8 <: Graphs.AbstractGraph}
   observedFilter::Union{Nothing, Vector{String}}
   initialAlgorithms::Vector{INITIAL_ALGORITHM}
   asserts::Vector{ASSERT_EQUATION}
+  "The model's variables `foldParameterClosure` made parameters: observed when a pass drops them."
+  foldedVariables::Vector{String}
 end
 
 """

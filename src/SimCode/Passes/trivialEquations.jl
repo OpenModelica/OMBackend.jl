@@ -89,7 +89,7 @@ end
 
 "A branch with other residuals."
 withResiduals(b::BRANCH, residuals::Vector{RESIDUAL_EQUATION})::BRANCH =
-  BRANCH(b.condition, residuals, b.identifier, b.targets, b.isSingular, b.matchOrder, b.equationGraph, b.sccs, b.stringToSimVarHT)
+  BRANCH(b.condition, residuals, b.identifier, b.targets)
 
 """
     cleanupTrivialResidualEquations(simCode; sourcePass)
@@ -152,8 +152,7 @@ end
 
 function resolvedBranch(b::BRANCH, simCode::SIM_CODE)::BRANCH
   local c = b.identifier == ELSE_BRANCH ? b.condition : resolveConstantIfExp(b.condition, simCode)
-  return BRANCH(c, RESIDUAL_EQUATION[resolvedResidual(r, simCode) for r in b.residualEquations], b.identifier, b.targets,
-                b.isSingular, b.matchOrder, b.equationGraph, b.sccs, b.stringToSimVarHT)
+  return BRANCH(c, RESIDUAL_EQUATION[resolvedResidual(r, simCode) for r in b.residualEquations], b.identifier, b.targets)
 end
 
 "The branches numbered again, the last (or an else-branch) the else-branch."
@@ -162,7 +161,7 @@ function reindexIfBranches(branches::Vector{BRANCH})::Vector{BRANCH}
   for (k, b) in enumerate(branches)
     local isElse = b.identifier == ELSE_BRANCH || k == length(branches)
     push!(out, BRANCH(isElse ? SCONST("ELSE_BRANCH") : b.condition, b.residualEquations, isElse ? ELSE_BRANCH : k,
-                      isElse ? ELSE_BRANCH : k + 1, b.isSingular, b.matchOrder, b.equationGraph, b.sccs, b.stringToSimVarHT))
+                      isElse ? ELSE_BRANCH : k + 1))
   end
   return out
 end
@@ -189,8 +188,7 @@ function pruneIfEquation(ifEq::IF_EQUATION, simCode::SIM_CODE)::Tuple{Union{Noth
       continue
     elseif c === true
       isempty(kept) && return (nothing, b.residualEquations)
-      push!(kept, BRANCH(SCONST("ELSE_BRANCH"), b.residualEquations, ELSE_BRANCH, ELSE_BRANCH, b.isSingular, b.matchOrder,
-                         b.equationGraph, b.sccs, b.stringToSimVarHT))
+      push!(kept, BRANCH(SCONST("ELSE_BRANCH"), b.residualEquations, ELSE_BRANCH, ELSE_BRANCH))
       return (IF_EQUATION(reindexIfBranches(kept)), RESIDUAL_EQUATION[])
     end
     push!(kept, b)
@@ -224,6 +222,26 @@ end
 #= ==================================================================================== =#
 
 """
+    residualUnknownCount(ht)
+
+The number of unknowns: a state counted once (the table has `x` and `der(x)`: the residuals
+determine one of them), an algebraic and a discrete variable (a discrete a when-equation
+defines too: an upper bound of the residuals' unknowns), an array variable's elements.
+"""
+function residualUnknownCount(ht::HT)::Int
+  local n = 0
+  for (_, (_, v)) in ht
+    local k = v.varKind
+    if k isa Union{STATE, ALG_VARIABLE, DISCRETE}
+      n += 1
+    elseif k isa ARRAY
+      n += prod(k.dimensions; init = 1)
+    end
+  end
+  return n
+end
+
+"""
     removeRedundantEquations(simCode)
 
 After the alias elimination, a system with more residuals than unknowns without its
@@ -233,7 +251,7 @@ Without duplicates the system stays (the imbalance surfaces in the solver).
 """
 function removeRedundantEquations(simCode::SIM_CODE)::SIM_CODE
   local res = simCode.residualEquations
-  local nVars = count(((_, (_, sv)),) -> isUnknownVarKind(sv.varKind), simCode.stringToSimVarHT)
+  local nVars = residualUnknownCount(simCode.stringToSimVarHT)
   length(res) <= nVars && return simCode
   local extra = length(res) - nVars
   @info "[SIMCODE: $(simCode.name): removeRedundantEquations] over-determined by $extra equation(s); removing only provably-redundant (duplicate) residuals"

@@ -247,6 +247,10 @@ function startValues(variables::IR.VariableSet)::Dict{Symbol, IR.Expression}
   return out
 end
 
+"The initial equations' constants (`initialConstants`): values and `pre()` values by name, each in their order."
+const InitialConstants = NamedTuple{(:values, :valueOrder, :pre, :preOrder),
+                                    Tuple{Dict{Symbol, IR.Expression}, Vector{Symbol}, Dict{Symbol, IR.Expression}, Vector{Symbol}}}
+
 """
     initialConstants(initialEquations, known)
 
@@ -254,7 +258,7 @@ The initial equations that fix a variable or a `pre()` value to a literal or a p
 (`pre(y) = pre_y_start`, the MSL Hysteresis and Pre blocks): `values` (name => value) and `pre`
 (name => value for `pre(name) = value`).
 """
-function initialConstants(initialEquations::Vector{IR.Equation}, known::Set{Symbol})
+function initialConstants(initialEquations::Vector{IR.Equation}, known::Set{Symbol})::InitialConstants
   local values = Dict{Symbol, IR.Expression}()
   local valueOrder = Symbol[]
   local pre = Dict{Symbol, IR.Expression}()
@@ -352,7 +356,7 @@ definition's); `pre(n) = v`; and `pre(n)` of a candidate `m = pre(n)` whose valu
 equation fixes, directly or through an alias (the StateGraph InitialStep).
 """
 function initialPreValues(starts::Dict{Symbol, IR.Expression}, names::Vector{Symbol}, candidates::Dict{Symbol, Candidate},
-                          sets::Vector{Vector{Symbol}}, definitionOf::Dict{Symbol, Symbol}, constants)
+                          sets::Vector{Vector{Symbol}}, definitionOf::Dict{Symbol, Symbol}, constants::InitialConstants)
   local fixed = Symbol[]
   (isempty(sets) && isempty(constants.values) && isempty(constants.pre)) && return (starts, fixed)
   local lookup = copy(starts)
@@ -417,18 +421,27 @@ inlineSiblings(e::IR.Expression, subst::Dict{Symbol, IR.Expression})::IR.Express
   end
 
 """
-`e` with `pre(n)` for `n` in `members` replaced by its value at the initialization (`false`
-for one without a start value, the Boolean default).
+`e` with `pre(n)` for `n` in `members` replaced by its value at the initialization (for one
+without a start value, its type's default: `false`, `0`, the first literal).
 """
 foldPreOfMembers(e::IR.Expression, members::Set{Symbol}, starts::Dict{Symbol, IR.Expression})::IR.Expression =
   IR.mapExpTopDown(e) do x
     if IR.isBuiltinCall(x, :pre)
       local a = x.arguments[1]
-      (a isa IR.CREF && a.cref.name in members) && return (get(starts, a.cref.name, IR.BOOLEAN(false)), false)
+      (a isa IR.CREF && a.cref.name in members) && return (get(() -> defaultStart(a.ty), starts, a.cref.name), false)
       return (x, false)
     end
     return (x, true)
   end
+
+"The start value of a discrete variable without one (MLS 4.8.1): `false`, `0`, the enumeration's first literal, `0.0`."
+function defaultStart(ty::IR.ModelicaType)::IR.Expression
+  local t = IR.elementType(ty)
+  t isa IR.T_INTEGER && return IR.INTEGER(0)
+  t isa IR.T_ENUMERATION && return IR.dimensionIndex(IR.DIM_ENUM(t), 1)
+  t isa IR.T_REAL && return IR.REAL(0.0)
+  return IR.BOOLEAN(false)
+end
 
 """
 The topological order of a cluster by its references outside `pre()` (a member after the
@@ -584,7 +597,7 @@ The equations with the discrete definitions lifted (`liftDiscreteEquations!`): t
 their order, then the clusters. With the names lifted.
 """
 function liftDiscreteEquations(equations::Vector{IR.Equation}, known::Set{Symbol}, starts::Dict{Symbol, IR.Expression},
-                               constants, variables::IR.VariableSet)::Tuple{Vector{IR.Equation}, Vector{Symbol}}
+                               constants::InitialConstants, variables::IR.VariableSet)::Tuple{Vector{IR.Equation}, Vector{Symbol}}
   local out = IR.Equation[]
   local candidates = Candidate[]
   local aliases = Tuple{Symbol, Symbol}[]

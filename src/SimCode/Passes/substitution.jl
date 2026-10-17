@@ -186,14 +186,18 @@ substitute(a::ASSERT_EQUATION, rs::Replacements)::ASSERT_EQUATION =
   ASSERT_EQUATION(substitute(a.condition, rs), substitute(a.message, rs), a.level, a.source)
 substitute(a::INITIAL_ALGORITHM, rs::Replacements)::INITIAL_ALGORITHM = INITIAL_ALGORITHM(substitute(a.statements, rs), a.section)
 
-"An initial equation substituted: a residual, an equation, an array equation; another kept."
+"An initial equation substituted: a residual, an equation, an array equation, an if-equation of them; another kept."
 substituteInitial(eq::Union{RESIDUAL_EQUATION, EQUATION, ARRAY_EQUATION}, rs::Replacements)::Equation = substitute(eq, rs)
+substituteInitial(eq::INLINE_IF_EQUATION, rs::Replacements)::Equation =
+  INLINE_IF_EQUATION(Exp[substitute(c, rs) for c in eq.conditions],
+                     Vector{Equation}[Equation[substituteInitial(e, rs) for e in b] for b in eq.branchesTrue],
+                     Equation[substituteInitial(e, rs) for e in eq.branchElse], eq.source, eq.attr)
 substituteInitial(eq::Equation, ::Replacements)::Equation = eq
 
 "An if-equation branch with its condition and its residuals substituted."
 function substitute(b::BRANCH, rs::Replacements)::BRANCH
   return BRANCH(substitute(b.condition, rs), RESIDUAL_EQUATION[substitute(eq, rs) for eq in b.residualEquations],
-                b.identifier, b.targets, b.isSingular, b.matchOrder, b.equationGraph, b.sccs, b.stringToSimVarHT)
+                b.identifier, b.targets)
 end
 
 substitute(ifEq::IF_EQUATION, rs::Replacements)::IF_EQUATION = IF_EQUATION(BRANCH[substitute(b, rs) for b in ifEq.branches])

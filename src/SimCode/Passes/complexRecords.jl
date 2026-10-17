@@ -65,6 +65,17 @@ canonical name (`Complex_'*'_multiply` as `multiply`).
 """
 operatorName(name::Symbol)::String = String(last(split(String(name), '_')))
 
+"""
+    isComplexFunction(name)
+
+Whether `name` is one of Complex's operator functions (`Complex_'*'_multiply`,
+`Complex_'constructor'_fromReal`) or of Modelica.ComplexMath (`Modelica_ComplexMath_conj`): the
+calls `operatorName` reads as Complex operations. A Real function so named (a `Pkg.add` of four
+inputs) is no Complex operation.
+"""
+isComplexFunction(name::Symbol)::Bool =
+  (local s = String(name); startswith(s, "Complex_") || startswith(s, "Complex.") || startswith(s, "Modelica_ComplexMath_"))
+
 "The variables of the real and imaginary parts of the Complex variable `base`."
 partVariables(base::String)::Tuple{Exp, Exp} = (EXP_CREF(SimCref(base * "_re"), TYPE_REAL()), EXP_CREF(SimCref(base * "_im"), TYPE_REAL()))
 mul(a::Exp, b::Exp)::Exp = BINARY(a, OP_MUL, b)
@@ -96,7 +107,7 @@ function complexParts(e::Exp)::Union{Nothing, Tuple{Exp, Exp}}
     e.ty isa TYPE_COMPLEX || return nothing
     return partVariables(crefName(e.cref))
   end
-  e isa CALL || return nothing
+  (e isa CALL && isComplexFunction(e.name)) || return nothing
   local (op, args, n) = (operatorName(e.name), e.args, length(e.args))
   local x = lowerComplex
   if op == "fromReal" && n >= 1
@@ -161,6 +172,7 @@ function complexProjection(e::Exp)::Union{Nothing, Exp}
     local p = complexParts(e.exp)
     return p === nothing ? nothing : p[e.index]
   elseif e isa CALL
+    isComplexFunction(e.name) || return nothing
     local op = operatorName(e.name)
     op in ("'abs'", "abs", "arg") || return nothing
     local args = e.args

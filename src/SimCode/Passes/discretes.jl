@@ -45,6 +45,13 @@ function whenTargets!(names::OrderedSet{String}, w::WHEN_STMTS)::OrderedSet{Stri
   return names
 end
 
+"The variables the when-equations assign or reinit (their elsewhen arms too)."
+function whenAssignedNames(simCode::SIM_CODE)::OrderedSet{String}
+  local targets = OrderedSet{String}()
+  foreach(w -> whenTargets!(targets, w.whenEquation), simCode.whenEquations)
+  return targets
+end
+
 """
     classifyAdditionalDiscretes(simCode)
 
@@ -55,8 +62,7 @@ Nothing for a model with structural modes or translated again at its structural 
 function classifyAdditionalDiscretes(simCode::SIM_CODE)::SIM_CODE
   (hasStructuralTransitions(simCode) || hasSubModels(simCode) || hasFrontendModel(simCode)) && return simCode
   isempty(simCode.whenEquations) && return simCode
-  local targets = OrderedSet{String}()
-  foreach(w -> whenTargets!(targets, w.whenEquation), simCode.whenEquations)
+  local targets = whenAssignedNames(simCode)
   local ht = simCode.stringToSimVarHT
   local algebraic = String[n for n in targets if haskey(ht, n) && last(ht[n]).varKind isa ALG_VARIABLE]
   isempty(algebraic) && return simCode

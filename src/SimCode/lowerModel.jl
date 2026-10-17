@@ -41,8 +41,7 @@
 The simulation code of `model` (after the passes): the variables by their simulation names
 with their categories and indices, the equations of the continuous-time partition as
 residuals `lhs - rhs`, its when-equations (initial ones and the initial arms of others as
-initial algorithms), its if-equations with their branches' structure, the initial equations,
-the asserts, the matching and the strongly connected components of the residual system.
+initial algorithms), its if-equations, the initial equations, the asserts.
 """
 function fromOMJLIR(model::IR.Model)::SIM_CODE
   isempty(model.modes) && return lowerSystem(model, model.variables, model.continuous[1])
@@ -130,19 +129,16 @@ function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.P
                                         for a in initialAlgorithms]
   local whenEquations = WHEN_EQUATION[lowerWhen(names, w) for w in runtimeWhens]
   local irreducibles = irreducibleVariables(names, eqs.ifs, whenEquations, vars, ht)
-  addThetaResidual!(residuals, irreducibles, ht)
-  local graph = equationVariableGraph(names, residuals, eqs.ifs, whenEquations, ht)
-  local (isSingular, matchOrder, digraph, sccs) = matchAndSort(graph)
-  local simIfEquations = constructIfEquations(names, eqs.ifs, residuals, whenEquations, ht)
+  local simIfEquations = constructIfEquations(names, eqs.ifs)
   local initialEquations::Vector{Equation} = Equation[lowerInitialEquation(names, eq) for eq in partition.initialEquations
                                     if !(eq isa IR.ASSERT_EQUATION)]
   initialEquations = splitTupleInitialEquations(lowerInitialIfEquations(initialEquations), ht)
   local transitions = StructuralTransition[lowerStructuralTransition(names, w) for w in eqs.structural]
   return SIM_CODE(String(codeName(Symbol(name))), ht, residuals, initialEquations, whenEquations, simIfEquations,
-                  isSingular, matchOrder, digraph, sccs, transitions, SIM_CODE[], String[], String[], Equation[],
+                  transitions, SIM_CODE[], String[], String[], Equation[],
                   String(codeName(Symbol(something(model.initialMode, model.name)))), model.frontendModel, irreducibles,
                   functions, any(f -> f isa EXTERNAL_MODELICA_FUNCTION, functions),
-                  RESIDUAL_EQUATION[], String[], AliasEntry[], nothing, initialAlgorithms, asserts)
+                  RESIDUAL_EQUATION[], String[], AliasEntry[], nothing, initialAlgorithms, asserts, String[])
 end
 
 """

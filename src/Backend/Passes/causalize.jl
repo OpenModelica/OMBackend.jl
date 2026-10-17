@@ -692,7 +692,7 @@ function expandEquations(equations::Vector{IR.Equation}; arrays::Bool)::Vector{I
       local fields = fieldEquations(eq)
       append!(out, fields !== nothing ? fields : elementEquations(eq, [[k] for k in 1:eq.size], eq.ty))
     elseif arrays && eq isa IR.ARRAY_EQUATION
-      local sizes = Int[something(IR.dimensionSize(d), 0) for d in eq.ty.dimensions]
+      local sizes = Int[knownSize(d, eq) for d in eq.ty.dimensions]
       #= the last index fastest, as the elements of an array value =#
       local indices = [reverse(collect(Tuple(i))) for i in CartesianIndices(Tuple(reverse(sizes)))]
       append!(out, elementEquations(eq, vec(indices), eq.ty))
@@ -701,6 +701,13 @@ function expandEquations(equations::Vector{IR.Equation}; arrays::Bool)::Vector{I
     end
   end
   return out
+end
+
+"The size of an equation's dimension; an unknown one is not supported (its equations would be left out)."
+function knownSize(d::IR.Dimension, eq::IR.Equation)::Int
+  local n = IR.dimensionSize(d)
+  n === nothing && unsupported("an array equation of a dimension of unknown size", IR.toString(eq))
+  return n
 end
 
 """
@@ -717,8 +724,8 @@ function fieldEquations(eq::IR.RECORD_EQUATION)::Union{Nothing, Vector{IR.Equati
     local value = fieldByIndex(e, k)
     local fieldRef = IR.CrefPart[r.cref.parts..., IR.CrefPart(field.name, IR.Subscript[], field.ty)]
     if field.ty isa IR.T_ARRAY
-      for i in CartesianIndices(Tuple(something(IR.dimensionSize(d), 0) for d in field.ty.dimensions))
-        local subs = IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in Tuple(i)]
+      for i in CartesianIndices(Tuple(knownSize(d, eq) for d in field.ty.dimensions))
+        local subs = IR.Subscript[IR.INDEX(IR.INTEGER(j)) for j in Tuple(i)]
         local elementRef = IR.ComponentRef(IR.CrefPart[fieldRef[1:end-1]..., IR.CrefPart(field.name, subs, field.ty)])
         push!(out, IR.SCALAR_EQUATION(IR.CREF(elementRef, field.ty.elementType),
                                       IR.SUBSCRIPTED(value, subs, field.ty.elementType), field.ty.elementType,
@@ -867,10 +874,8 @@ replaced by the value; `nothing` for another.
 function reductionElements(body::IR.Expression, iterators::Vector{IR.Iterator})::Union{Nothing, Vector{IR.Expression}}
   length(iterators) == 1 || return nothing
   local range = iterators[1].range
-  local values = if range isa IR.RANGE && range.start isa IR.INTEGER && range.stop isa IR.INTEGER &&
-                    (range.step === nothing || range.step isa IR.INTEGER)
-    local step = range.step === nothing ? 1 : range.step.value
-    step == 0 ? nothing : collect(range.start.value:step:range.stop.value)
+  local values = if range isa IR.RANGE
+    rangeValues(range)
   elseif range isa IR.ARRAY && all(x -> x isa IR.INTEGER, range.elements)
     Int[x.value for x in range.elements]
   else

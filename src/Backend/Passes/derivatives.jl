@@ -63,9 +63,12 @@ function introduceDerivatives!(variables::IR.VariableSet, partition::IR.Partitio
       x.name in seen || (push!(seen, x.name); push!(states, x))
     end
   end
+  local introduced = Set{Symbol}()
   for x in states
     local v = get(variables, x.name, nothing)
+    #= a reference that is no variable keeps its der() call =#
     v === nothing && continue
+    push!(introduced, x.name)
     local d = IR.derivativeName(x.name)
     v.kind = IR.STATE(1, d, true)
     haskey(variables, d) && continue
@@ -73,7 +76,7 @@ function introduceDerivatives!(variables::IR.VariableSet, partition::IR.Partitio
                                  false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :introduceDerivatives))
   end
   local toDerivative = e -> begin
-    (IR.isBuiltinCall(e, :der) && e.arguments[1] isa IR.CREF && e.arguments[1].cref.name in seen) || return e
+    (IR.isBuiltinCall(e, :der) && e.arguments[1] isa IR.CREF && e.arguments[1].cref.name in introduced) || return e
     return IR.CREF(IR.ComponentRef(IR.derivativeName(e.arguments[1].cref.name), e.ty), e.ty)
   end
   foreach(eq -> IR.mapEquation!(toDerivative, eq), partition.equations)

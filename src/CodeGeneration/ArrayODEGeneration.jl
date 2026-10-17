@@ -208,7 +208,8 @@ function SII.observed(sys::ArraySystem, x)
   local (kind, i) = _observedIdx(sys)[_sym(x)]
   local model = getfield(sys, :model)
   if kind == :alg
-    return (u, p, t) -> Base.invokelatest(model.algebraics, u, p, t)[i]
+    #= the binding read in the latest world too: the module is newer than the caller =#
+    return (u, p, t) -> (Base.@invokelatest model.algebraics(u, p, t))[i]
   end
   return (u, p, t) -> begin
     local times = first.(p.dlog)

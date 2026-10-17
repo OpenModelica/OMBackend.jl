@@ -25,9 +25,10 @@ as an argument and only look variables up.
 """
 function mockSimCode(variables::Vector{SC.SIMVAR} = SC.SIMVAR[]; name::String = "mock")::SC.SIM_CODE
   return SC.SIM_CODE(name, SC.createIndices(variables), SC.RESIDUAL_EQUATION[], SC.Equation[], SC.WHEN_EQUATION[],
-                     SC.IF_EQUATION[], false, Int[], SC.MetaGraphs.MetaDiGraph(), Vector{Int}[], SC.StructuralTransition[],
+                     SC.IF_EQUATION[], SC.StructuralTransition[],
                      SC.SIM_CODE[], String[], String[], SC.Equation[], name, nothing, String[], SC.ModelicaFunction[], false,
-                     SC.RESIDUAL_EQUATION[], String[], SC.AliasEntry[], nothing, SC.INITIAL_ALGORITHM[], SC.ASSERT_EQUATION[])
+                     SC.RESIDUAL_EQUATION[], String[], SC.AliasEntry[], nothing, SC.INITIAL_ALGORITHM[], SC.ASSERT_EQUATION[],
+                     String[])
 end
 
 end # module BackendTestMocks

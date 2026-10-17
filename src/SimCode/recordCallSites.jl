@@ -85,7 +85,7 @@ end
 function branchRecordArguments(b::BRANCH, x::F)::BRANCH where {F}
   return BRANCH(b.identifier == ELSE_BRANCH ? b.condition : x(b.condition),
                 RESIDUAL_EQUATION[RESIDUAL_EQUATION(x(r.exp), r.source, r.attr) for r in b.residualEquations],
-                b.identifier, b.targets, b.isSingular, b.matchOrder, b.equationGraph, b.sccs, b.stringToSimVarHT)
+                b.identifier, b.targets)
 end
 
 function initialRecordArguments(eq::Equation, x::F)::Equation where {F}
@@ -170,12 +170,10 @@ function expandRecordArguments(e::Exp, ht::HT)::Exp
   elseif e isa TUPLE
     any(isRecordReference, e.elements) || return e
     return TUPLE(reduce(vcat, (isRecordReference(el) ? fieldReferences(el, ht) : Exp[el] for el in e.elements)))
-  elseif e isa Union{BINARY, UNARY, RELATION, LBINARY, LUNARY, CAST, IFEXP, ARRAY_EXP}
-    return mapChildren(x, e)
-  elseif e isa ASUB
-    return ASUB(x(e.exp), e.subs)
   end
-  return e
+  #= every other expression's subexpressions (a call under a TSUB, an RSUB, a subscript, a
+     reduction's body) =#
+  return mapChildren(x, e)
 end
 
 isRecordType(ty::SType)::Bool = ty isa TYPE_COMPLEX && ty.isRecord

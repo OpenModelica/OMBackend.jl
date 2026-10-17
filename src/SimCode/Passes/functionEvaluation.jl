@@ -613,7 +613,8 @@ end
 #= Values at the start of the build                                                     =#
 #= ==================================================================================== =#
 
-const INITIAL_ALGORITHM_ENVIRONMENT = Ref{Any}(nothing)
+"The memo of `initialAlgorithmEnvironment`: the simulation code it was computed for (kept, compared by identity), its environment and interpretation."
+const INITIAL_ALGORITHM_ENVIRONMENT = Ref{Union{Nothing, Tuple{SIM_CODE, Dict{String, Any}, Interpretation}}}(nothing)
 
 """
     initialAlgorithmEnvironment(simCode)
@@ -621,11 +622,13 @@ const INITIAL_ALGORITHM_ENVIRONMENT = Ref{Any}(nothing)
 The initial algorithms interpreted at the start time 0 (the build's, as for the sample()
 ticks), with the values of the parameters that have one: what they assign (CDL's samplers set
 their sample start so, from a free parameter). An algorithm the interpretation does not follow
-assigns nothing. Memoized for the model being generated (by identity and name).
+assigns nothing. Memoized for the simulation code being generated (by identity: the memo keeps
+it, so its identity is not a later one's, as an `objectid` would be after the GC reused its
+fields' memory).
 """
 function initialAlgorithmEnvironment(simCode::SIM_CODE)::Tuple{Dict{String, Any}, Interpretation}
   local cached = INITIAL_ALGORITHM_ENVIRONMENT[]
-  cached !== nothing && cached[1] == (objectid(simCode), simCode.name) && return (cached[2], cached[3])
+  cached !== nothing && cached[1] === simCode && return (cached[2], cached[3])
   local ctx = Interpretation(simCode)
   local env = Dict{String, Any}("time" => 0.0)
   for (k, (_, v)) in simCode.stringToSimVarHT
@@ -643,7 +646,7 @@ function initialAlgorithmEnvironment(simCode::SIM_CODE)::Tuple{Dict{String, Any}
       err isa InterpretationBail || _fallback(err, :initialAlgorithmInterpretation; expect = MethodError)
     end
   end
-  INITIAL_ALGORITHM_ENVIRONMENT[] = ((objectid(simCode), simCode.name), env, ctx)
+  INITIAL_ALGORITHM_ENVIRONMENT[] = (simCode, env, ctx)
   return (env, ctx)
 end
 

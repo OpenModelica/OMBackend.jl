@@ -161,6 +161,7 @@ function lowerDimension(d::F.Dimension)::IR.Dimension
   return IR.DIM_UNKNOWN()
 end
 
+"The OMJLIR subscript of the frontend subscript `s`."
 function lowerSubscript(s::F.Subscript)::IR.Subscript
   s isa F.SUBSCRIPT_INDEX && return IR.INDEX(lowerExp(s.index))
   s isa F.SUBSCRIPT_SLICE && return IR.SLICE(lowerExp(s.slice))
@@ -184,10 +185,10 @@ function crefParts(cref::F.ComponentRef)::Vector{IR.CrefPart}
 end
 
 "The OMJLIR reference of the frontend component reference `cref`."
-lowerCref(cref)::IR.ComponentRef = IR.ComponentRef(crefParts(cref))
+lowerCref(cref::F.ComponentRef)::IR.ComponentRef = IR.ComponentRef(crefParts(cref))
 
 "A reference to a variable as an expression: `_` for the frontend's wildcard."
-lowerCrefExp(cref, ty::IR.ModelicaType)::IR.Expression =
+lowerCrefExp(cref::F.ComponentRef, ty::IR.ModelicaType)::IR.Expression =
   isvariant(cref, F.COMPONENT_REF_WILD) ? IR.WILD() : IR.CREF(lowerCref(cref), ty)
 
 #= ==================================================================================== =#
@@ -203,18 +204,24 @@ const OPS = let ops = Dict{Int, IR.Op}()
   ops
 end
 
+"The OMJLIR operator of the frontend operator `operator`."
 function lowerOp(operator::F.Operator)::IR.Op
   local op = get(OPS, Int(operator.op), nothing)
   op === nothing && error("OMJLIR lowering: a user-defined operator the frontend did not resolve")
   return op
 end
 
-typeOfExp(e)::IR.ModelicaType = lowerType(F.typeOf(e))
+"The OMJLIR type of the frontend expression `e`."
+typeOfExp(e::F.NFExpression)::IR.ModelicaType = lowerType(F.typeOf(e))
 
-lowerExps(es)::Vector{IR.Expression} = IR.Expression[lowerExp(e) for e in es]
+"The frontend's expressions, of a vector or a MetaModelica list."
+const Expressions = Union{AbstractVector{<:F.NFExpression}, MetaModelica.List{<:F.NFExpression}}
+
+"The OMJLIR expressions of the frontend expressions `es`."
+lowerExps(es::Expressions)::Vector{IR.Expression} = IR.Expression[lowerExp(e) for e in es]
 
 "An optional expression (a MetaModelica `Option`): lowered, or `nothing`."
-lowerOptExp(o)::Union{Nothing, IR.Expression} =
+lowerOptExp(o::MetaModelica.Option{<:F.NFExpression})::Union{Nothing, IR.Expression} =
   o isa MetaModelica.SOME ? lowerExp(o.data) : nothing
 
 "The OMJLIR expression of the frontend expression `e`."
@@ -319,6 +326,7 @@ lowerExp(e::F.NFExpression)::IR.Expression =
 "`inline`: the frontend's inline types that inline the function."
 const INLINE_TYPES = (:NORM_INLINE, :BUILTIN_EARLY_INLINE, :EARLY_INLINE)
 
+"A typed call, array constructor or reduction."
 function lowerCall(call::F.Call)::IR.Expression
   if isvariant(call, F.TYPED_CALL)
     local a = call.attributes
@@ -334,8 +342,8 @@ function lowerCall(call::F.Call)::IR.Expression
   error("OMJLIR lowering: an untyped call")
 end
 
-"The iterators of an array constructor or a reduction."
-lowerIterators(iters)::Vector{IR.Iterator} =
+"The iterators of an array constructor or a reduction: (iterator node, range) pairs."
+lowerIterators(iters::Union{AbstractVector{<:Tuple}, MetaModelica.List{<:Tuple}})::Vector{IR.Iterator} =
   IR.Iterator[IR.Iterator(Symbol(F.name(node)), lowerExp(range)) for (node, range) in iters]
 
 lowerClock(k::F.INFERRED_CLOCK)::IR.ClockKind = IR.INFERRED_CLOCK()
@@ -351,7 +359,9 @@ lowerClock(k::F.SOLVER_CLOCK)::IR.ClockKind =
 #= Statements                                                                           =#
 #= ==================================================================================== =#
 
-lowerStatements(stmts)::Vector{IR.Statement} = IR.Statement[lowerStatement(s) for s in stmts]
+"The OMJLIR statements of the frontend statements `stmts`, of a vector or a MetaModelica list."
+lowerStatements(stmts::Union{AbstractVector{<:F.Statement}, MetaModelica.List{<:F.Statement}})::Vector{IR.Statement} =
+  IR.Statement[lowerStatement(s) for s in stmts]
 
 """
     lowerAssignment(lhs, rhs, source)
@@ -489,10 +499,10 @@ function callEquation(call::IR.Expression, source::IR.Source)::IR.Equation
   return IR.ASSERT_EQUATION(call, IR.STRING(replace(String(call.name), "." => "_")), ASSERTION_ERROR, source)
 end
 
-"The number of scalar equations of a record equation: of a record type, its fields."
+"The number of equations of a record equation: one per field (`expandEquations` indexes them so), per element of an array of records."
 recordSize(ty::IR.T_RECORD)::Int = length(ty.fields)
 recordSize(ty::IR.T_ARRAY)::Int =
-  recordSize(ty.elementType) * prod(d isa IR.DIM_SIZE ? d.size : 1 for d in ty.dimensions; init = 1)
+  recordSize(ty.elementType) * prod(something(IR.dimensionSize(d), 1) for d in ty.dimensions; init = 1)
 recordSize(ty::IR.ModelicaType)::Int = 1
 
 """
@@ -571,7 +581,8 @@ function whenStatements(eqs::Vector{F.Equation})::Vector{IR.Statement}
     if isvariant(eq, F.EQUATION_EQUALITY) || isvariant(eq, F.EQUATION_ARRAY_EQUALITY)
       push!(out, IR.ASSIGNMENT(lowerExp(eq.lhs), lowerExp(eq.rhs), source))
     elseif isvariant(eq, F.EQUATION_CREF_EQUALITY)
-      local ty = lowerType(eq.lhs.ty)
+      #= of the type of `lhs` with its subscripts, as in an equation section (`lowerEquation`) =#
+      local ty = lowerType(F.getSubscriptedType(eq.lhs))
       push!(out, IR.ASSIGNMENT(IR.CREF(lowerCref(eq.lhs), ty), IR.CREF(lowerCref(eq.rhs), ty), source))
     elseif isvariant(eq, F.EQUATION_REINIT)
       push!(out, IR.REINIT(lowerCref(F.toCref(eq.cref)), lowerExp(eq.reinitExp), source))
@@ -677,12 +688,14 @@ function variableKind(variability::Integer, ty::IR.ModelicaType)::IR.VariableKin
   return IR.ALGEBRAIC()
 end
 
+"The causality of a top-level variable."
 function lowerDirection(direction::Integer)::IR.Direction
   direction == F.Direction.INPUT && return IR.INPUT
   direction == F.Direction.OUTPUT && return IR.OUTPUT
   return IR.NO_DIRECTION
 end
 
+"The connector prefix of a variable, from the frontend's connector type bits."
 function lowerConnector(cty::Integer)::IR.ConnectorKind
   local C = F.ConnectorType
   (cty & C.POTENTIAL) > 0 && return IR.POTENTIAL
@@ -846,7 +859,9 @@ function lowerFunction(fn::F.M_FUNCTION)::IR.ModelicaFunction
                              IR.NO_SOURCE)
 end
 
-functionVariables(nodes)::Vector{IR.FunctionVariable} = IR.FunctionVariable[functionVariable(n) for n in nodes]
+"The variables of a function's inputs, outputs or protected section."
+functionVariables(nodes::Union{AbstractVector{<:F.InstNode}, MetaModelica.List{<:F.InstNode}})::Vector{IR.FunctionVariable} =
+  IR.FunctionVariable[functionVariable(n) for n in nodes]
 
 """
     functionVariable(node)
@@ -883,7 +898,7 @@ function lowerExternal(fn::F.M_FUNCTION)::IR.ExternalDeclaration
   local s = F.IOStream_M.create("external", F.IOStream_M.LIST())
   local flat = F.IOStream_M.string(F.toFlatStream(sections, fn.path, s; inFunction = true))
   local at = findfirst("annotation", flat)
-  return IR.ExternalDeclaration(sections.name, sections.language, lowerExps(collect(sections.args)), output,
+  return IR.ExternalDeclaration(sections.name, sections.language, lowerExps(collect(F.NFExpression, sections.args)), output,
                                 at === nothing ? "" : flat[first(at):end])
 end
 
