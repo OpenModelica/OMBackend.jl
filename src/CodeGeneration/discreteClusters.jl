@@ -124,7 +124,9 @@ _readValues(c::DiscreteCluster, integrator) = c.values(integrator.u, integrator.
 _operands(c::DiscreteCluster, v) = view(v, 1:c.nOperands)
 _preValues(c::DiscreteCluster, v) = v[(c.nOperands + 1):(c.nOperands + c.nPre)]
 
-#= The crossing functions and scales at (u, t): relation k's are zs[2k - 1] and zs[2k]. =#
+"""
+The crossing functions and scales at (u, t): relation k's are zs[2k - 1] and zs[2k].
+"""
 function _crossingValues!(c::DiscreteCluster, u, p, t)
   c.crossings!(c.zs, u, p, t)
   return c.zs
@@ -133,15 +135,19 @@ _crossingValues!(c::DiscreteCluster, integrator) = _crossingValues!(c, integrato
 
 _literal(zs, k::Int, strict::Bool) = strict ? zs[2k - 1] < 0 : zs[2k - 1] <= 0
 
-#= Relation k by the hysteresis rule from `old`; an exact one literal. =#
+"""
+Relation k by the hysteresis rule from `old`; an exact one literal.
+"""
 function _ruled(c::DiscreteCluster, zs, k::Int, H, old::Bool)
   c.exact[k] && return _literal(zs, k, c.strict[k])
   return _hysteresisRule(zs[2k - 1], H * zs[2k], old)
 end
 
-#= The functions for a system (the problem's, or the reduced system before
-   the problem exists): the reads, the crossing functions in place, the
-   members' indices. =#
+"""
+The functions for a system (the problem's, or the reduced system before
+the problem exists): the reads, the crossing functions in place, the
+members' indices.
+"""
 function _bindToSystem!(c::DiscreteCluster, sys)
   local SII = ModelingToolkit.SymbolicIndexingInterface
   c.values = _buildObservedFunction(sys, c.reads)
@@ -150,7 +156,9 @@ function _bindToSystem!(c::DiscreteCluster, sys)
   return c
 end
 
-#= The functions for the problem's system. =#
+"""
+The functions for the problem's system.
+"""
 function _bind!(c::DiscreteCluster, problem)
   _bindToSystem!(c, problem.f.sys)
   for (name, k) in zip(c.names, c.memberIndex)
@@ -159,8 +167,10 @@ function _bind!(c::DiscreteCluster, problem)
   return c
 end
 
-#= The crossing functions, shifted by the hysteresis relative to the buffers.
-   Called at every condition evaluation: the typed loop is behind a barrier. =#
+"""
+The crossing functions, shifted by the hysteresis relative to the buffers.
+Called at every condition evaluation: the typed loop is behind a barrier.
+"""
 function _crossings!(out, c::DiscreteCluster, u, t, integrator)
   _shiftCrossings!(out, _crossingValues!(c, u, integrator.p, t), c.rel, c.exact, c.eventOnly,
                    _hysteresisFromTolerance(integrator))
@@ -175,11 +185,13 @@ function _shiftCrossings!(out, zs::Vector{Float64}, rel::Vector{Bool}, exact::Ve
   return nothing
 end
 
-#= The crossing functions at an event: an exact relation exactly on its
-   boundary takes its value just after the instant (`_TIME_EVENT_AHEAD`), as
-   an event's relations do (MLS 8.5): `sin(time) > 0.5` at pi/6 and
-   `time >= pulseStart` just after the sample are true; read at the instant
-   the first would be false again after its located crossing flipped it. =#
+"""
+The crossing functions at an event: an exact relation exactly on its
+boundary takes its value just after the instant (`_TIME_EVENT_AHEAD`), as
+an event's relations do (MLS 8.5): `sin(time) > 0.5` at pi/6 and
+`time >= pulseStart` just after the sample are true; read at the instant
+the first would be false again after its located crossing flipped it.
+"""
 function _eventCrossingValues!(c::DiscreteCluster, integrator)
   local zs = _crossingValues!(c, integrator)
   any(k -> c.exact[k] && iszero(zs[2k - 1]), eachindex(c.rel)) || return zs
@@ -192,20 +204,24 @@ function _eventCrossingValues!(c::DiscreteCluster, integrator)
   return zs
 end
 
-#= Whether a relation disagrees with the state by the rule from `reference`
-   (the buffers, or the values at the start of a pass). =#
+"""
+Whether a relation disagrees with the state by the rule from `reference`
+(the buffers, or the values at the start of a pass).
+"""
 function _inconsistent(c::DiscreteCluster, integrator, reference::Vector{Bool} = c.rel)
   local zs = _eventCrossingValues!(c, integrator)
   local H = _hysteresisFromTolerance(integrator)
   return any(k -> _ruled(c, zs, k, H, reference[k]) != c.rel[k], eachindex(c.rel))
 end
 
-#= Phase 1 of a sweep: the buffers from the state. Whether one changed. A
-   relation whose crossing the callback located changes, as in OpenModelica:
-   its shifted crossing function is zero where the rule flips it, and the
-   algebraic solve at the event can leave it just inside the hysteresis band
-   (an ideal thyristor's firing, found only at the end of the next step). A
-   state clearly on the old side flips it back in the next sweep. =#
+"""
+Phase 1 of a sweep: the buffers from the state. Whether one changed. A
+relation whose crossing the callback located changes, as in OpenModelica:
+its shifted crossing function is zero where the rule flips it, and the
+algebraic solve at the event can leave it just inside the hysteresis band
+(an ideal thyristor's firing, found only at the end of the next step). A
+state clearly on the old side flips it back in the next sweep.
+"""
 function _update!(c::DiscreteCluster, integrator)
   local zs = _eventCrossingValues!(c, integrator)
   local H = _hysteresisFromTolerance(integrator)
@@ -220,7 +236,9 @@ function _update!(c::DiscreteCluster, integrator)
   return changed
 end
 
-#= Every relation literal on the state (MLS 8.5, as at initialization). =#
+"""
+Every relation literal on the state (MLS 8.5, as at initialization).
+"""
 function _literalBuffers!(c::DiscreteCluster, integrator)
   local zs = _crossingValues!(c, integrator)
   for k in eachindex(c.rel)
@@ -230,7 +248,9 @@ function _literalBuffers!(c::DiscreteCluster, integrator)
   return nothing
 end
 
-#= Write the body's values. Whether a member changed. =#
+"""
+Write the body's values. Whether a member changed.
+"""
 function _write!(c::DiscreteCluster, integrator, values)
   values === nothing && return false
   local changed = false
@@ -243,7 +263,9 @@ function _write!(c::DiscreteCluster, integrator, values)
   return changed
 end
 
-#= `body` is generated code, compiled after OMBackend: call it in the latest world. =#
+"""
+`body` is generated code, compiled after OMBackend: call it in the latest world.
+"""
 _runBody(c::DiscreteCluster, integrator, v, pre, relPre, initial::Bool) =
   Base.invokelatest(c.body, integrator, _operands(c, v), pre, c.rel, relPre, initial)
 
@@ -253,12 +275,16 @@ _runBody(c::DiscreteCluster, integrator, v, pre, relPre, initial::Bool) =
 const _MIXED_SYSTEM_LIMIT = 10
 const _SEARCH_LIMIT = 8
 
-#= The values of the members that are unknowns: in the state, or of the body. =#
+"""
+The values of the members that are unknowns: in the state, or of the body.
+"""
 _memberValues(c::DiscreteCluster, integrator) = Float64[integrator.u[k] for k in c.memberIndex if k != 0]
 _memberValues(c::DiscreteCluster, values::Tuple) =
   Float64[values[i] for i in eachindex(c.memberIndex) if c.memberIndex[i] != 0]
 
-#= Whether the body's values equal the state's (members that are unknowns). =#
+"""
+Whether the body's values equal the state's (members that are unknowns).
+"""
 _settled(c::DiscreteCluster, integrator, values) =
   values === nothing || all(i -> c.memberIndex[i] == 0 || integrator.u[c.memberIndex[i]] == values[i],
                             eachindex(c.memberIndex))
@@ -268,9 +294,11 @@ function _traceBody(c::DiscreteCluster, integrator, pre, relPre, values, v)
           " relPre=", Int.(relPre), " -> ", values, " reads=", round.(v; sigdigits = 6))
 end
 
-#= A failed algebraic solve leaves the solution's return code at
-   InitialFailure, and later solves report the same even when they succeed:
-   put back the code from before a trial that failed. =#
+"""
+A failed algebraic solve leaves the solution's return code at
+InitialFailure, and later solves report the same even when they succeed:
+put back the code from before a trial that failed.
+"""
 _restoreRetcode!(integrator, retcode) =
   (integrator.sol = ModelingToolkit.SciMLBase.solution_new_retcode(integrator.sol, retcode); nothing)
 
@@ -370,8 +398,10 @@ function _search!(c::DiscreteCluster, integrator, pre, relPre, reinit, relStart,
   return false
 end
 
-#= At the start, on the solved initial state: every relation literal, then
-   the body where the when has an initial() term. Whether a member changed. =#
+"""
+At the start, on the solved initial state: every relation literal, then
+the body where the when has an initial() term. Whether a member changed.
+"""
 function _initialize!(c::DiscreteCluster, integrator)
   _literalBuffers!(c, integrator)
   c.atStart == 0 && return false

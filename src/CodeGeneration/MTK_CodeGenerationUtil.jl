@@ -103,8 +103,10 @@ function expToJuliaBoolMTK(cond::SC.Exp, simCode::SC.SIM_CODE; cachedChange::Boo
   return expToJuliaExpMTK(cond, simCode)
 end
 
-#= An operand of not/and/or: a Boolean variable (or its pre()) is a Float64 (0.0/1.0) in the
-   state vector, and `!active` threw a MethodError (`when not active`, the StateGraph steps). =#
+"""
+An operand of not/and/or: a Boolean variable (or its pre()) is a Float64 (0.0/1.0) in the
+state vector, and `!active` threw a MethodError (`when not active`, the StateGraph steps).
+"""
 function _boolOperandMTK(e::SC.Exp, simCode::SC.SIM_CODE, cachedChange::Bool)
   local x = expToJuliaBoolMTK(e, simCode; cachedChange)
   local isBool = e isa Union{SC.RELATION, SC.LBINARY, SC.LUNARY, SC.BCONST} ||
@@ -112,10 +114,12 @@ function _boolOperandMTK(e::SC.Exp, simCode::SC.SIM_CODE, cachedChange::Bool)
   return isBool ? x : :($x != 0)
 end
 
-#= The value of a reference before the event, in a discrete callback: from the integrator's
-   previous state (`lookuptableStates` the callback's table of the states' indices), read
-   through the integrator (the affect binds the model's variables by name: one named `x`
-   replaced the state vector `x`, a BoundsError). A parameter's, a constant's: its value. =#
+"""
+The value of a reference before the event, in a discrete callback: from the integrator's
+previous state (`lookuptableStates` the callback's table of the states' indices), read
+through the integrator (the affect binds the model's variables by name: one named `x`
+replaced the state vector `x`, a BoundsError). A parameter's, a constant's: its value.
+"""
 function _preValueLookup(arg::SC.Exp, simCode::SC.SIM_CODE; cachedChange::Bool = false)
   arg isa SC.EXP_CREF || return expToJuliaExpMTK(arg, simCode)
   local entry = get(simCode.stringToSimVarHT, SC.crefName(arg.cref), nothing)
@@ -171,9 +175,11 @@ end
 transformToMTKContinuousConditionEquation(cond::SC.Exp, simCode::SC.SIM_CODE; atInitial::Bool = false)::Expr =
   :($(transformToMTKContinuousCondition(cond, simCode; atInitial)) ~ 0)
 
-#= True if the condition holds at its zero-crossing boundary (zc == 0): the normalized
-   crossing function cannot tell >= from > there, the relation's operator decides.
-   Conservative: false for anything but a (negated, noEvent-wrapped) relation. =#
+"""
+True if the condition holds at its zero-crossing boundary (zc == 0): the normalized
+crossing function cannot tell >= from > there, the relation's operator decides.
+Conservative: false for anything but a (negated, noEvent-wrapped) relation.
+"""
 function condClosedAtBoundary(cond::SC.Exp)::Bool
   cond isa SC.RELATION && return cond.op in (SC.OP_LESSEQ, SC.OP_GREATEREQ, SC.OP_EQUAL)
   (cond isa SC.LUNARY && cond.exp isa SC.RELATION) && return cond.exp.op in (SC.OP_LESS, SC.OP_GREATER)
@@ -202,8 +208,10 @@ function _eventRelations(cond::SC.Exp)::Vector{SC.RELATION}
   return out
 end
 
-#= The scale of a condition's operands, `1 + max(|a|, |b|, ...)`, for the hysteresis width
-   `H * scale` (OpenModelica: max(|a|,|b|) + nominal). =#
+"""
+The scale of a condition's operands, `1 + max(|a|, |b|, ...)`, for the hysteresis width
+`H * scale` (OpenModelica: max(|a|,|b|) + nominal).
+"""
 function _conditionScaleExpr(cond::SC.Exp, simCode::SC.SIM_CODE)
   local terms = Any[]
   for rel in _eventRelations(cond)
@@ -213,15 +221,19 @@ function _conditionScaleExpr(cond::SC.Exp, simCode::SC.SIM_CODE)
   return _operandScaleExpr(terms)
 end
 
-#= `1 + max(|x|, ...)` of lowered operands. An infinite operand (the MSL Spice3 V_pulse's
-   default pulse width and period, inf, in `time >= T0 + Tfalling`) is left out: it made the
-   hysteresis infinite. =#
+"""
+`1 + max(|x|, ...)` of lowered operands. An infinite operand (the MSL Spice3 V_pulse's
+default pulse width and period, inf, in `time >= T0 + Tfalling`) is left out: it made the
+hysteresis infinite.
+"""
 function _operandScaleExpr(xs::Vector{Any})
   local terms = Any[:(ModelingToolkit.ifelse(abs($(x)) < 1.0e300, abs($(x)), 0.0)) for x in xs]
   return length(terms) == 1 ? :(1.0 + $(terms[1])) : :(1.0 + max($(terms...)))
 end
 
-#= A literal: a constant, its negation, an array of them. =#
+"""
+A literal: a constant, its negation, an array of them.
+"""
 function _isLiteralExp(e::SC.Exp)::Bool
   e isa Union{SC.ICONST, SC.RCONST, SC.SCONST, SC.BCONST, SC.ENUM_LITERAL} && return true
   e isa SC.UNARY && return _isLiteralExp(e.exp)
@@ -229,10 +241,12 @@ function _isLiteralExp(e::SC.Exp)::Bool
   return false
 end
 
-#= The literal value of a condition (as at the initialization), as a Julia Bool expression
-   over `observed.zcK`: each relation from its own crossing function, `<`/`>` strict and
-   `<=`/`>=` closed, and/or/not as such. `obsKws` collects the observed crossing functions.
-   Nothing for a condition of another shape. =#
+"""
+The literal value of a condition (as at the initialization), as a Julia Bool expression
+over `observed.zcK`: each relation from its own crossing function, `<`/`>` strict and
+`<=`/`>=` closed, and/or/not as such. `obsKws` collects the observed crossing functions.
+Nothing for a condition of another shape.
+"""
 function _literalConditionExpr(cond::SC.Exp, simCode::SC.SIM_CODE, obsKws::Vector{Expr})
   local rec = e::SC.Exp -> _literalConditionExpr(e, simCode, obsKws)
   local observe = function (zc)
@@ -411,8 +425,10 @@ function _ifexpBranchIsNonReal(e::SC.Exp)::Bool
   return false
 end
 
-#= The condition of a noEvent if-expression as ifelse takes it: a Bool, or a symbolic Bool. A
-   Boolean the backend holds as a Real (0 or 1: MSL ElastoGap's `contact`) is true above 1/2. =#
+"""
+The condition of a noEvent if-expression as ifelse takes it: a Bool, or a symbolic Bool. A
+Boolean the backend holds as a Real (0 or 1: MSL ElastoGap's `contact`) is true above 1/2.
+"""
 _noEventCondition(c::Bool)::Bool = c
 _noEventCondition(c::Number)::Bool = !iszero(c)
 _noEventCondition(c::Symbolics.Num) = SymbolicUtils.symtype(Symbolics.unwrap(c)) <: Bool ? c : c > 0.5
@@ -614,7 +630,9 @@ function _subscriptExpr(s::SC.Exp, simCode::SC.SIM_CODE)
   return expToJuliaExpMTK(s, simCode)
 end
 
-#= A subscript as the flattened names write it (`2`, `idx`); `?` for another expression. =#
+"""
+A subscript as the flattened names write it (`2`, `idx`); `?` for another expression.
+"""
 _subscriptText(s::SC.Exp)::String = s isa SC.ICONST ? string(s.value) : s isa SC.EXP_CREF ? SC.crefName(s.cref) : "?"
 
 """
@@ -675,9 +693,11 @@ end
 _isModelFunctionCall(e::SC.Exp, simCode::SC.SIM_CODE)::Bool =
   e isa SC.CALL && e.kind !== SC.CALL_BUILTIN && _isSimCodeFunctionName(String(e.name), simCode)
 
-#= Output `k` of a call of one of the model's functions, as `f(...)[k]` or `TSUB(f(...), k)`:
-   `(call, k)`, else nothing. Its elements are indexed through tupleArrayElementAt (plain
-   indexing of tupleElementCall's scalar Num fails). =#
+"""
+Output `k` of a call of one of the model's functions, as `f(...)[k]` or `TSUB(f(...), k)`:
+`(call, k)`, else nothing. Its elements are indexed through tupleArrayElementAt (plain
+indexing of tupleElementCall's scalar Num fails).
+"""
 function _functionOutputOf(e::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, Tuple{SC.CALL, Int}}
   if e isa SC.ASUB && _isModelFunctionCall(e.exp, simCode) && length(e.subs) == 1 && only(e.subs) isa SC.ICONST
     return (e.exp, only(e.subs).value)
@@ -772,7 +792,9 @@ function _dynamicSubscriptLookup(name::String, simCode::SC.SIM_CODE)::Union{Expr
   return quote $(_selectionChain(symbols, index[d])) end
 end
 
-#= The values of the parameters `names` (an array of them), all known at the build, or nothing. =#
+"""
+The values of the parameters `names` (an array of them), all known at the build, or nothing.
+"""
 function _knownValues(names::AbstractArray{String}, simCode::SC.SIM_CODE)::Union{Array{Float64}, Nothing}
   local ht = simCode.stringToSimVarHT
   local table = Array{Float64}(undef, size(names)...)
@@ -795,7 +817,9 @@ end
 #= Arrays                                                                               =#
 #= ==================================================================================== =#
 
-#= An expression of literals only (no variable, no call). =#
+"""
+An expression of literals only (no variable, no call).
+"""
 function _isConstantExp(e::SC.Exp)::Bool
   e isa Union{SC.RCONST, SC.ICONST, SC.BCONST, SC.SCONST, SC.ENUM_LITERAL} && return true
   e isa SC.UNARY && return _isConstantExp(e.exp)
@@ -987,10 +1011,12 @@ function _modelicaFunctionCallArgs(args::Vector{SC.Exp}, simCode::SC.SIM_CODE)::
   return out
 end
 
-#= An element of a named array of records by subscripts that are not literals (`data[i]` in a
-   reduction: the ideal gases' `h_T(data[i], T, ...)`, MSL Media mixtures): that element of
-   each field array, `data_MM[i]` (the module-level arrays of _recordArrayFieldArrays). Empty
-   otherwise. =#
+"""
+An element of a named array of records by subscripts that are not literals (`data[i]` in a
+reduction: the ideal gases' `h_T(data[i], T, ...)`, MSL Media mixtures): that element of
+each field array, `data_MM[i]` (the module-level arrays of _recordArrayFieldArrays). Empty
+otherwise.
+"""
 function _recordArrayElementCallArgs(arg::SC.Exp, simCode::SC.SIM_CODE)::Vector{Any}
   (arg isa SC.ASUB && arg.exp isa SC.EXP_CREF) || return Any[]
   local elemTy = arg.exp.ty
@@ -1008,10 +1034,12 @@ function _recordArrayElementCallArgs(arg::SC.Exp, simCode::SC.SIM_CODE)::Vector{
   return Any[Expr(:ref, Symbol(base * COMPONENT_SEPARATOR * f), idx...) for f in elemTy.fieldNames]
 end
 
-#= A Complex-returning argument (a call of a record output, a record constructor) as its
-   fields' values for an enclosing call: `tupleElementCall(:f, k, args...)` for k = 1..nFields
-   of a call, the field expressions of a record literal; nothing for another argument (or a
-   record of fewer than two fields). =#
+"""
+A Complex-returning argument (a call of a record output, a record constructor) as its
+fields' values for an enclosing call: `tupleElementCall(:f, k, args...)` for k = 1..nFields
+of a call, the field expressions of a record literal; nothing for another argument (or a
+record of fewer than two fields).
+"""
 function _expandComplexReturnArg(arg::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, Vector{Any}}
   if arg isa SC.CALL && arg.ty isa SC.TYPE_COMPLEX
     local nFields = length(arg.ty.fieldNames)
@@ -1036,10 +1064,12 @@ end
 # numeric-param lookup tables) and the module-level bindings (String parameters, data
 # structures), so callers need not special-case the latter.
 
-#= In a callback's condition or affect: a state from `x`, a parameter from the integrator's
-   parameters. A `p` in scope was the callback set's, the event parameters as symbols (the
-   condition a Num: Buildings' weather data readers, `canRepeatWeatherFile - (modTimAux >
-   tNext)`), where the condition did not bind its own. =#
+"""
+In a callback's condition or affect: a state from `x`, a parameter from the integrator's
+parameters. A `p` in scope was the callback set's, the event parameters as symbols (the
+condition a Num: Buildings' weather data readers, `canRepeatWeatherFile - (modTimAux >
+tNext)`), where the condition did not bind its own.
+"""
 function getIdxForLookupMTK(crefAsStr::String, simCode::SC.SIM_CODE)
   crefAsStr == "time" && return :t
   local simVar = last(simCode.stringToSimVarHT[crefAsStr])
@@ -1076,8 +1106,10 @@ function evalExpression(e::SC.Exp, simCode::SC.SIM_CODE; keepTunable::Bool = fal
   return quote $(value) end
 end
 
-#= Whether `e` reads a tunable parameter (withTunableParameters), directly or through the
-   bindings of the parameters it reads. =#
+"""
+Whether `e` reads a tunable parameter (withTunableParameters), directly or through the
+bindings of the parameters it reads.
+"""
 function _readsTunableParameter(e::SC.Exp, simCode::SC.SIM_CODE)::Bool
   isempty(OMBackend.TUNABLE_PARAMETERS[]) && return false
   local resolved = _substituteBoundParameters(e, simCode; keepTunable = true)
@@ -1140,8 +1172,10 @@ function _evalNumeric(e::SC.Exp, valMap::Dict{Symbol, Float64})::Union{Float64, 
   return nothing
 end
 
-#= A statement with the loop iterator `name` replaced by `value` (an inner loop of the same
-   iterator keeps its own). =#
+"""
+A statement with the loop iterator `name` replaced by `value` (an inner loop of the same
+iterator keeps its own).
+"""
 function _withIteratorValue(s::SC.Statement, name::Symbol, value::Int)::SC.Statement
   local sub = e::SC.Exp -> SC.mapExp(x -> (x isa SC.EXP_CREF && x.cref.sym === name && isempty(x.cref.subs)) ? SC.ICONST(value) : x, e)
   local body = b::Vector{SC.Statement} -> SC.Statement[_withIteratorValue(x, name, value) for x in b]
@@ -1238,9 +1272,11 @@ end
 const _T0_MAP_CACHE = Ref{Tuple{UInt, Dict{Symbol, Float64}, Set{Symbol}, Vector{Pair{Symbol, Float64}}}}(
   (UInt(0), Dict{Symbol, Float64}(), Set{Symbol}(), Pair{Symbol, Float64}[]))
 
-#= The number `f()` (evalConstant, evalSimCodeParameter) gives, or nothing when it is not a
-   constant. A BINARY/LBINARY comes back as evalExpression's `:block` around its value (around
-   the Expr itself when it reads a variable). =#
+"""
+The number `f()` (evalConstant, evalSimCodeParameter) gives, or nothing when it is not a
+constant. A BINARY/LBINARY comes back as evalExpression's `:block` around its value (around
+the Expr itself when it reads a variable).
+"""
 function _t0Number(f::F)::Union{Float64, Nothing} where {F}
   local raw = try
     f()
@@ -1256,13 +1292,17 @@ function _t0Number(f::F)::Union{Float64, Nothing} where {F}
   return raw isa Real ? Float64(raw) : nothing
 end
 
-#= The forms evalConstant evaluates: a literal, or a BINARY/LBINARY through evalExpression.
-   The t0 map asks only for those (anything else is not a constant, which is the rule, not a
-   failure). =#
+"""
+The forms evalConstant evaluates: a literal, or a BINARY/LBINARY through evalExpression.
+The t0 map asks only for those (anything else is not a constant, which is the rule, not a
+failure).
+"""
 _isEvaluableConstant(e::Union{Nothing, SC.Exp})::Bool =
   e isa Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST, SC.BINARY, SC.LBINARY}
 
-#= `sv`'s start value as a number, or nothing. =#
+"""
+`sv`'s start value as a number, or nothing.
+"""
 function _startNumber(sv::SC.SIMVAR, simCode::SC.SIM_CODE)::Union{Float64, Nothing}
   local start = sv.attributes.start
   return _isEvaluableConstant(start) ? _t0Number(() -> evalConstant(start, simCode)) : nothing
@@ -1326,8 +1366,10 @@ function _buildT0ValueMapAndExplicit(simCode::SC.SIM_CODE)::Tuple{Dict{Symbol, F
   return (valMap, explicit)
 end
 
-#= The values derived from the trusted ones (deterministic consequences of parameters and
-   fixed starts), for overriding guess-grade initial values at the build. =#
+"""
+The values derived from the trusted ones (deterministic consequences of parameters and
+fixed starts), for overriding guess-grade initial values at the build.
+"""
 function buildT0TrustedDerivedPairs(simCode::SC.SIM_CODE)::Vector{Pair{Symbol, Float64}}
   _T0_MAP_CACHE[][1] === objectid(simCode) || _buildT0ValueMapAndExplicit(simCode)
   return copy(_T0_MAP_CACHE[][4])
@@ -1335,8 +1377,10 @@ end
 
 _buildT0ValueMap(simCode::SC.SIM_CODE)::Dict{Symbol, Float64} = first(_buildT0ValueMapAndExplicit(simCode))
 
-#= True when every variable-position Symbol of the expression is explicit. Call heads and
-   qualified references are code, not variables. =#
+"""
+True when every variable-position Symbol of the expression is explicit. Call heads and
+qualified references are code, not variables.
+"""
 function _exprSymbolsExplicit(@nospecialize(e), explicit::Set{Symbol})::Bool
   e isa Symbol && return e in explicit
   e isa Expr || return true
@@ -1348,8 +1392,10 @@ function _exprSymbolsExplicit(@nospecialize(e), explicit::Set{Symbol})::Bool
   return true
 end
 
-#= Whole Float64 literals in index position fault plain numeric evaluation (the lowering
-   emits `x[3.0]`): Int literals. =#
+"""
+Whole Float64 literals in index position fault plain numeric evaluation (the lowering
+emits `x[3.0]`): Int literals.
+"""
 _intifyFloatIndices(@nospecialize(x)) = x
 function _intifyFloatIndices(x::Expr)
   if x.head == :ref && length(x.args) >= 2
@@ -1387,11 +1433,13 @@ end
 _t0ContainsDer(@nospecialize(x)) = false
 _t0ContainsDer(x::Expr) = (x.head == :call && !isempty(x.args) && x.args[1] in (:der, :D)) || any(_t0ContainsDer, x.args)
 
-#= The explicit residuals `0 = x - rhs` evaluated forward at t0, extending the value map
-   through chains the start attributes do not cover (frame positions, guarded line-force
-   lengths); with the residuals of the if-equations' initial branches, chosen again as the map
-   grows. Operands must be explicit already, so defaulted values never contaminate a
-   filled-in entry. =#
+"""
+The explicit residuals `0 = x - rhs` evaluated forward at t0, extending the value map
+through chains the start attributes do not cover (frame positions, guarded line-force
+lengths); with the residuals of the if-equations' initial branches, chosen again as the map
+grows. Operands must be explicit already, so defaulted values never contaminate a
+filled-in entry.
+"""
 function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, simCode::SC.SIM_CODE)::Nothing
   ccall(:jl_generating_output, Cint, ()) != 0 && return nothing
   local lowered = Dict{SC.Exp, Any}()
@@ -1471,7 +1519,9 @@ function evalInitialCondition(mtkCond::Expr, simCode::SC.SIM_CODE; closedBoundar
   return closedBoundary ? value > 0.0 : value >= 0.0
 end
 
-#= An evaluated condition value as a Float64 (a symbolic constant unwrapped; 0.0 otherwise). =#
+"""
+An evaluated condition value as a Float64 (a symbolic constant unwrapped; 0.0 otherwise).
+"""
 function _numberOf(@nospecialize(result))::Float64
   result isa Number && return Float64(result)
   local unwrapped = Base.invokelatest(SymbolicUtils.unwrap, result)
@@ -1520,17 +1570,21 @@ function _tupleEquationTargets(lhs::SC.Exp, rhs::SC.Exp)::Union{Nothing, Vector{
   return out
 end
 
-#= `e` with `time` read as 0.0, the start time of the build. =#
+"""
+`e` with `time` read as 0.0, the start time of the build.
+"""
 _timeAtBuildStart(e::SC.Exp)::SC.Exp =
   SC.mapExp(x -> (x isa SC.EXP_CREF && x.cref.sym === :time && isempty(x.cref.subs)) ? SC.RCONST(0.0) : x, e)
 
-#= `(p1, p2, ...) = f(...)`, every free parameter of the equation alone on the left and none in
-   the call (Buildings' borehole resistances: `(x, Rgb, Rgg, RCondGro) =
-   internalResistancesOneUTube(...)`, in HexInternalElement with states, in its validations
-   without): each p_k bound to the call's k-th output (or output element:
-   _tupleEquationTargets), its value at the build where the call interprets with the
-   parameters' values, else the output's expression (its symbolic term did not fold with a
-   String argument, the instance name). Not an impure f (one call for each output). =#
+"""
+`(p1, p2, ...) = f(...)`, every free parameter of the equation alone on the left and none in
+the call (Buildings' borehole resistances: `(x, Rgb, Rgg, RCondGro) =
+internalResistancesOneUTube(...)`, in HexInternalElement with states, in its validations
+without): each p_k bound to the call's k-th output (or output element:
+_tupleEquationTargets), its value at the build where the call interprets with the
+parameters' values, else the output's expression (its symbolic term did not fold with a
+String argument, the instance name). Not an impure f (one call for each output).
+"""
 function _bindTupleOfFreeParameters!(lhs::SC.Exp, rhs::SC.Exp, freeParams::Vector{String}, simCode::SC.SIM_CODE)::Bool
   local targets = _tupleEquationTargets(lhs, rhs)
   targets === nothing && return false
@@ -1547,18 +1601,24 @@ function _bindTupleOfFreeParameters!(lhs::SC.Exp, rhs::SC.Exp, freeParams::Vecto
   return true
 end
 
-#= The names of the references of `e` (not der() or pre()), in bottom-up order. =#
+"""
+The names of the references of `e` (not der() or pre()), in bottom-up order.
+"""
 function _referenceNames(e::SC.Exp)::Vector{String}
   local out = String[]
   SC.mapExp(x -> (x isa SC.EXP_CREF && push!(out, SC.crefName(x.cref)); x), e)
   return out
 end
 
-#= Whether `e` reads the variable `name` (of Integer type, with `integer`). =#
+"""
+Whether `e` reads the variable `name` (of Integer type, with `integer`).
+"""
 _readsName(e::SC.Exp, name::String; integer::Bool = false)::Bool =
   SC.anyExp(x -> x isa SC.EXP_CREF && SC.crefName(x.cref) == name && (!integer || x.ty isa SC.TYPE_INTEGER), e)
 
-#= `name` bound to `binding` in the table (a free parameter the build solved). =#
+"""
+`name` bound to `binding` in the table (a free parameter the build solved).
+"""
 function _bindParameter!(simCode::SC.SIM_CODE, name::String, binding::SC.Exp)::Nothing
   local (idx, sv) = simCode.stringToSimVarHT[name]
   simCode.stringToSimVarHT[name] = (idx, SC.withKind(sv, SC.PARAMETER(binding)))
@@ -1708,12 +1768,14 @@ function solveParametricInitialEquations!(simCode::SC.SIM_CODE)::Nothing
   return nothing
 end
 
-#= The parametric initial equations left, of several free parameters each, solved together
-   where they are as many as their free parameters (MSL 4 SMPM_ResistiveBraking: the
-   steady-state currents idq_sr from two coupled equations; one at a time they were not
-   solved, and the free parameters kept their start values, 0). Not where one reads a tunable
-   parameter (its run's value is not known here) or the solve does not converge: those stay
-   unbound, as before. =#
+"""
+The parametric initial equations left, of several free parameters each, solved together
+where they are as many as their free parameters (MSL 4 SMPM_ResistiveBraking: the
+steady-state currents idq_sr from two coupled equations; one at a time they were not
+solved, and the free parameters kept their start values, 0). Not where one reads a tunable
+parameter (its run's value is not known here) or the solve does not converge: those stay
+unbound, as before.
+"""
 function _solveCoupledParametricInitialEquations!(simCode::SC.SIM_CODE)::Nothing
   local ht = simCode.stringToSimVarHT
   local isFreeParam = key::String -> begin
@@ -1783,12 +1845,14 @@ end
 #= If-equations                                                                         =#
 #= ==================================================================================== =#
 
-#= True when every variable reference in `condition` is a DISCRETE simvar or a PARAMETER (no
-   STATE / ALG_VARIABLE / `time`): the if-expression gates directly on the held value, the
-   discrete's own update event localises the switch, so no ifCond relay is needed. A condition
-   with initial() is a relation (its crossing function a constant of either sign), not a gate
-   on the runtime value, where initial() is false (MSL LimIntegrator's `initial() and not
-   limitsAtInit` never held). =#
+"""
+True when every variable reference in `condition` is a DISCRETE simvar or a PARAMETER (no
+STATE / ALG_VARIABLE / `time`): the if-expression gates directly on the held value, the
+discrete's own update event localises the switch, so no ifCond relay is needed. A condition
+with initial() is a relation (its crossing function a constant of either sign), not a gate
+on the runtime value, where initial() is false (MSL LimIntegrator's `initial() and not
+limitsAtInit` never held).
+"""
 function _ifConditionAllDiscreteOrParameter(condition::SC.Exp, simCode::SC.SIM_CODE)::Bool
   _hasInitialCall(condition) && return false
   local refs = SC.crefNames!(OrderedSet{String}(), condition)
@@ -1805,17 +1869,21 @@ end
 
 _hasInitialCall(condition::SC.Exp)::Bool = SC.anyExp(x -> SC.isBuiltin(x, :initial), condition)
 
-#= True when every non-else branch condition of an if-equation is discrete/parameter, so the
-   residual gates directly on the boolean condition instead of emitting a continuous ifCond
-   relay callback. =#
+"""
+True when every non-else branch condition of an if-equation is discrete/parameter, so the
+residual gates directly on the boolean condition instead of emitting a continuous ifCond
+relay callback.
+"""
 function _allBranchConditionsDiscrete(branches::AbstractVector{<:SC.BRANCH}, simCode::SC.SIM_CODE)::Bool
   return all(b -> b.targets == -1 || _ifConditionAllDiscreteOrParameter(b.condition, simCode), branches)
 end
 
-#= Residuals pair across branches by the variable their causalized form defines, with the
-   positional index only as a fallback: source-order differences between sibling branches
-   (hoisted nested ifs, lifted if-expressions) made pure positional pairing relay the wrong
-   variable. =#
+"""
+Residuals pair across branches by the variable their causalized form defines, with the
+positional index only as a fallback: source-order differences between sibling branches
+(hoisted nested ifs, lifted if-expressions) made pure positional pairing relay the wrong
+variable.
+"""
 function _causalLhsKey(@nospecialize(lhsExpr))::String
   local e = lhsExpr isa Expr ? Base.remove_linenums!(copy(lhsExpr)) : lhsExpr
   while e isa Expr && e.head === :block && length(e.args) == 1
@@ -1902,9 +1970,11 @@ function _isNonIntegerJuliaConstant(@nospecialize(e))::Bool
   return v isa Real && !isinteger(v)
 end
 
-#= ModelingToolkit.ifelse and the arithmetic if-expression evaluate both branches. Guard only
-   those eager branch payloads against one-sided event-localization noise around a relation
-   boundary; ordinary powers keep their native domain semantics. =#
+"""
+ModelingToolkit.ifelse and the arithmetic if-expression evaluate both branches. Guard only
+those eager branch payloads against one-sided event-localization noise around a relation
+boundary; ordinary powers keep their native domain semantics.
+"""
 function _guardNonIntegerPowerBasesForEagerBranch(@nospecialize(e))
   e isa Expr || return e
   local args = Any[_guardNonIntegerPowerBasesForEagerBranch(a) for a in e.args]

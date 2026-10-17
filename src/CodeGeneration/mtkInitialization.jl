@@ -53,8 +53,10 @@ function createStartConditionsEquationsMTK(states::Vector, algebraics::Vector, s
   return vcat(algInit, stateInit, ieqInit)
 end
 
-#= An initial equation `lhs = rhs`; another kind (an if-equation the lowering left: its
-   branches do not line up) is refused. =#
+"""
+An initial equation `lhs = rhs`; another kind (an if-equation the lowering left: its
+branches do not line up) is refused.
+"""
 function _initialEquation(ieq::SC.Equation)::SC.EQUATION
   ieq isa SC.EQUATION || unsupported("this initial equation (an if-equation whose branches differ)", ieq)
   return ieq
@@ -113,12 +115,14 @@ function generateInitialEquationsAsConstraints(initialEqs::Vector{SC.Equation}, 
   return result
 end
 
-#= The right side of an initial equation, lowered (both of its forms:
-   generateInitialEquationsAsConstraints, generateInitialEquations). `time` (the independent
-   variable, in no table: MSL ControlledTanks' `v = time`), an unknown and a parameter without
-   a binding stay references; a bound parameter and an expression are evaluated at the build,
-   except where they read a tunable parameter, directly or through a binding: `x = p` and `x =
-   q` with q = 2 * p kept x(0) for every p. =#
+"""
+The right side of an initial equation, lowered (both of its forms:
+generateInitialEquationsAsConstraints, generateInitialEquations). `time` (the independent
+variable, in no table: MSL ControlledTanks' `v = time`), an unknown and a parameter without
+a binding stay references; a bound parameter and an expression are evaluated at the build,
+except where they read a tunable parameter, directly or through a binding: `x = p` and `x =
+q` with q = 2 * p kept x(0) for every p.
+"""
 function _initialEquationRhs(rhs::SC.Exp, simCode::SC.SIM_CODE)
   rhs isa SC.EXP_CREF || return evalExpression(rhs, simCode; keepTunable = true)
   _isTimeCref(rhs) && return expToJuliaExpMTK(rhs, simCode)
@@ -129,8 +133,10 @@ function _initialEquationRhs(rhs::SC.Exp, simCode::SC.SIM_CODE)
   return evalSimCodeParameter(last(entry), simCode)
 end
 
-#= Whether an equation reads a parameter without a binding (a fixed=false one the build did
-   not solve). =#
+"""
+Whether an equation reads a parameter without a binding (a fixed=false one the build did
+not solve).
+"""
 function _readsUnboundParameter(ieq::SC.Equation, simCode::SC.SIM_CODE)::Bool
   local ht = simCode.stringToSimVarHT
   return any(equationSides(ieq)) do side
@@ -141,8 +147,10 @@ function _readsUnboundParameter(ieq::SC.Equation, simCode::SC.SIM_CODE)::Bool
   end
 end
 
-#= Whether `e` reads a state, an algebraic or a discrete variable, or one the passes eliminated
-   (in no table). =#
+"""
+Whether `e` reads a state, an algebraic or a discrete variable, or one the passes eliminated
+(in no table).
+"""
 function _readsUnknown(e::SC.Exp, simCode::SC.SIM_CODE)::Bool
   local ht = simCode.stringToSimVarHT
   return any(SC.allCrefNames(e)) do name
@@ -276,8 +284,10 @@ end
 #= Initial algorithms                                                                   =#
 #= ==================================================================================== =#
 
-#= The names an initial algorithm's statement assigns (`lhs`; a for loop's iterator too) and
-   reads (`rhs`). =#
+"""
+The names an initial algorithm's statement assigns (`lhs`; a for loop's iterator too) and
+reads (`rhs`).
+"""
 function _collectInitAlgNames!(lhs::OrderedSet{String}, rhs::OrderedSet{String}, s::SC.Statement)
   local reads = e::SC.Exp -> union!(rhs, SC.allCrefNames(e))
   local assigns = e::SC.Exp -> e isa SC.EXP_CREF && push!(lhs, SC.crefName(e.cref))
@@ -315,14 +325,16 @@ function _collectInitAlgNames!(lhs::OrderedSet{String}, rhs::OrderedSet{String},
   return lhs
 end
 
-#= What the build evaluated at time 0, for a simulation from another start time. The
-   parametric initial equations it solved that read `time` are refused (MSL Blocks.Math.Mean's
-   t0 = time gave 0 with any start time); one reading an unbound parameter is solved by the
-   initialization, at the start time. Start values reading time: the build's u0, for time 0.
-   The ticks of a sample() or a Pulse's period count from the start time (PeriodicCallback's
-   phase: sample(0, 0.25) from 0.1 ticked at 0.1, 0.35). The early initial algorithms run
-   again at the start time, refused only where a value differs (a Pulse's count is the same
-   over its first period). Nothing when there is neither. =#
+"""
+What the build evaluated at time 0, for a simulation from another start time. The
+parametric initial equations it solved that read `time` are refused (MSL Blocks.Math.Mean's
+t0 = time gave 0 with any start time); one reading an unbound parameter is solved by the
+initialization, at the start time. Start values reading time: the build's u0, for time 0.
+The ticks of a sample() or a Pulse's period count from the start time (PeriodicCallback's
+phase: sample(0, 0.25) from 0.1 ticked at 0.1, 0.35). The early initial algorithms run
+again at the start time, refused only where a value differs (a Pulse's count is the same
+over its first period). Nothing when there is neither.
+"""
 function _startTimeGuard(simCode::SC.SIM_CODE)::Expr
   local what = String[]
   for ieq in simCode.initialEquations
@@ -350,7 +362,9 @@ function _startTimeGuard(simCode::SC.SIM_CODE)::Expr
   end
 end
 
-#= Whether a when (an elsewhen arm too) is lowered to a PeriodicCallback. =#
+"""
+Whether a when (an elsewhen arm too) is lowered to a PeriodicCallback.
+"""
 function _hasPeriodicWhen(simCode::SC.SIM_CODE)::Bool
   return any(simCode.whenEquations) do weq
     local arm = weq.whenEquation
@@ -364,18 +378,22 @@ end
 
 _expMentionsTime(e::SC.Exp)::Bool = SC.anyExp(_isTimeCref, e)
 
-#= The initial algorithms the early pass runs: the sections (`initial algorithm`, an
-   algorithm's `when initial()`), else the other initial arms; less those reading a derivative:
-   der() reads the problem, which the early pass runs before. A section reading one is refused
-   (generateInitialAlgorithmEarlyFunction); the other initial arms the runtime pass runs
-   (_initialDerivativeReads). =#
+"""
+The initial algorithms the early pass runs: the sections (`initial algorithm`, an
+algorithm's `when initial()`), else the other initial arms; less those reading a derivative:
+der() reads the problem, which the early pass runs before. A section reading one is refused
+(generateInitialAlgorithmEarlyFunction); the other initial arms the runtime pass runs
+(_initialDerivativeReads).
+"""
 function _earlyInitialAlgorithms(simCode::SC.SIM_CODE)::Vector{SC.INITIAL_ALGORITHM}
   local sections = any(ia -> ia.section, simCode.initialAlgorithms) ?
     filter(ia -> ia.section, simCode.initialAlgorithms) : simCode.initialAlgorithms
   return any(_readsDerivative, sections) ? filter(!_readsDerivative, sections) : sections
 end
 
-#= Whether an initial algorithm reads der(). =#
+"""
+Whether an initial algorithm reads der().
+"""
 function _readsDerivative(ia::SC.INITIAL_ALGORITHM)::Bool
   local found = false
   foreach(s -> SC.mapStatementExps(e -> (found |= containsDerCall(e); e), s), ia.statements)
@@ -409,11 +427,13 @@ function emitInitAlgU0Appends(simCode::SC.SIM_CODE)::Vector{Expr}
   return appends
 end
 
-#= The value an initial algorithm section reads for the fixed variable `name`: its start (0
-   without one, MLS 4.9.1), evaluated at the build. A start that does not evaluate there (a
-   Modelica function's call) is refused, and one that reads a tunable parameter is an error as
-   a direct read is (the pass runs once, at the build): both were read as 0.0 (y0 := x + 1
-   gave 1 for `x(start = twice(p), fixed = true)`, OpenModelica 3). =#
+"""
+The value an initial algorithm section reads for the fixed variable `name`: its start (0
+without one, MLS 4.9.1), evaluated at the build. A start that does not evaluate there (a
+Modelica function's call) is refused, and one that reads a tunable parameter is an error as
+a direct read is (the pass runs once, at the build): both were read as 0.0 (y0 := x + 1
+gave 1 for `x(start = twice(p), fixed = true)`, OpenModelica 3).
+"""
 function _fixedStartForInitialAlgorithm(name::String, sv::SC.SIMVAR, simCode::SC.SIM_CODE)::Float64
   local start = sv.attributes.start
   start === nothing && return 0.0
@@ -434,8 +454,10 @@ function _fixedStartForInitialAlgorithm(name::String, sv::SC.SIMVAR, simCode::SC
   return Float64(value)
 end
 
-#= A variable's start value in the early pass: its start attribute, a literal or an expression
-   that evaluates (`start = x0`, a parameter); else its literal start (0.0 without one). =#
+"""
+A variable's start value in the early pass: its start attribute, a literal or an expression
+that evaluates (`start = x0`, a parameter); else its literal start (0.0 without one).
+"""
 function _initAlgStartValue(sv::SC.SIMVAR, simCode::SC.SIM_CODE)::Float64
   local start = sv.attributes.start
   start === nothing && return 0.0
@@ -443,12 +465,14 @@ function _initAlgStartValue(sv::SC.SIMVAR, simCode::SC.SIM_CODE)::Float64
   return v === nothing ? _readStartAttributeAsLiteral(sv) : v
 end
 
-#= The non-parameter variables that the assignments to `lhsNames` set, as (assigned name,
-   variable, index into the assigned value): the name itself (index nothing), or for an array
-   its scalarized elements name[k] present in the table (`x := {1, 2, 3}`; 2-D names x[1][2]
-   are not matched). A for loop's iterator (`iterators`, also among the assigned names) is no
-   variable, even where an array of its name is. An array parameter is refused (captured as one
-   number; none in MSL 3.2.3: 14 initial algorithms). =#
+"""
+The non-parameter variables that the assignments to `lhsNames` set, as (assigned name,
+variable, index into the assigned value): the name itself (index nothing), or for an array
+its scalarized elements name[k] present in the table (`x := {1, 2, 3}`; 2-D names x[1][2]
+are not matched). A for loop's iterator (`iterators`, also among the assigned names) is no
+variable, even where an array of its name is. An array parameter is refused (captured as one
+number; none in MSL 3.2.3: 14 initial algorithms).
+"""
 function _initAlgTargets(lhsNames, simCode::SC.SIM_CODE, iterators::Set{String} = Set{String}();
                          parameters::Bool = false)::Vector{Tuple{String, String, Union{Nothing, Int}}}
   local ht = simCode.stringToSimVarHT
@@ -478,7 +502,9 @@ function _initAlgTargets(lhsNames, simCode::SC.SIM_CODE, iterators::Set{String} 
   return out
 end
 
-#= The iterators of the for loops of the early initial algorithms. =#
+"""
+The iterators of the for loops of the early initial algorithms.
+"""
 function _initAlgIterators(simCode::SC.SIM_CODE)::Set{String}
   local out = Set{String}()
   local walk! = nothing
@@ -516,14 +542,18 @@ function emitInitAlgConstraintAppends(simCode::SC.SIM_CODE)::Vector{Expr}
   return appends
 end
 
-#= der(x) as the builtin call der(x), which the algorithmic translator emits as a call (a
-   function has no derivatives): _initialDerivativeReads reads its value from the problem. =#
+"""
+der(x) as the builtin call der(x), which the algorithmic translator emits as a call (a
+function has no derivatives): _initialDerivativeReads reads its value from the problem.
+"""
 _derAsCall(e::SC.Exp)::SC.Exp =
   SC.mapExp(x -> x isa SC.DER ? SC.CALL(:der, SC.Exp[SC.EXP_CREF(x.cref, SC.TYPE_REAL())], SC.TYPE_REAL(), SC.CALL_BUILTIN) : x, e)
 
-#= der(x) in a runtime initial algorithm (the initial() arm of a relation on a derivative,
-   MSL FluxTubes' `asc = der(Hstat) > 0`) reads the derivative from the problem
-   (_initialDerivative); there is no `der` function. =#
+"""
+der(x) in a runtime initial algorithm (the initial() arm of a relation on a derivative,
+MSL FluxTubes' `asc = der(Hstat) > 0`) reads the derivative from the problem
+(_initialDerivative); there is no `der` function.
+"""
 function _initialDerivativeReads(@nospecialize(ex))
   ex isa Expr || return ex
   if ex.head === :call && length(ex.args) == 2 && ex.args[1] === :der
@@ -542,9 +572,11 @@ function _blockValue(@nospecialize(ex))
   return length(body) == 1 ? _blockValue(body[1]) : ex
 end
 
-#= The derivative of the variable `name` at `problem`'s start values: the runtime initial
-   algorithm runs before the solve. A discrete cluster's start pass evaluates such a relation
-   again on the solved state. =#
+"""
+The derivative of the variable `name` at `problem`'s start values: the runtime initial
+algorithm runs before the solve. A discrete cluster's start pass evaluates such a relation
+again on the solved state.
+"""
 function _initialDerivative(problem, name::Symbol)
   local sys = problem.f.sys
   local d = ModelingToolkit.Differential(ModelingToolkit.get_iv(sys))(getproperty(sys, name))
@@ -552,8 +584,10 @@ function _initialDerivative(problem, name::Symbol)
   return Float64(f(problem.u0, problem.p, first(problem.tspan)))
 end
 
-#= pre(v) at the initialization: v's start value (MLS 3.7.3). The runtime pass runs a `when
-   initial()` body after the early pass, which set v already: `n = pre(n) + 1` gave 2. =#
+"""
+pre(v) at the initialization: v's start value (MLS 3.7.3). The runtime pass runs a `when
+initial()` body after the early pass, which set v already: `n = pre(n) + 1` gave 2.
+"""
 function _preAtInitialization(e::SC.Exp, simCode::SC.SIM_CODE)::SC.Exp
   return SC.mapExp(e) do x
     local name = _preReadName(x)
@@ -562,23 +596,27 @@ function _preAtInitialization(e::SC.Exp, simCode::SC.SIM_CODE)::SC.Exp
   end
 end
 
-#= Both initialization passes run at the initialization: initial() is true (a body that reads
-   it, MSL Fluid PumpingSystem's TriggeredTrapezoid: UndefVarError `initial`). =#
+"""
+Both initialization passes run at the initialization: initial() is true (a body that reads
+it, MSL Fluid PumpingSystem's TriggeredTrapezoid: UndefVarError `initial`).
+"""
 _initialIsTrue(e::SC.Exp)::SC.Exp = SC.mapExp(x -> SC.isBuiltin(x, :initial) ? SC.BCONST(true) : x, e)
 
-#= A statement of a runtime initial algorithm (the initial arms of when-equations) as Julia
-   for module-top eval inside `__runInitialAlgorithm!`: the parameters folded to their
-   bindings (_substituteBoundParameters) and lowered with the algorithmic translator, so no
-   Symbolics bindings are needed at the initialization; initial() true and pre(v) v's start.
+"""
+A statement of a runtime initial algorithm (the initial arms of when-equations) as Julia
+for module-top eval inside `__runInitialAlgorithm!`: the parameters folded to their
+bindings (_substituteBoundParameters) and lowered with the algorithmic translator, so no
+Symbolics bindings are needed at the initialization; initial() true and pre(v) v's start.
 
-   An assignment to a parameter and a reinit write `LATEST_PROBLEM`; an assignment to another
-   variable is collected in `_hard`, which simulate turns into hard start values of the
-   unknowns (`remake(prob; u0 = …)`). The function runs after the ODEProblem is constructed
-   (`simulate(...)` in the generated module), so LATEST_PROBLEM is in scope. Without this, the
-   left side stayed at its default (0): `T_start := startTime + count*period` in the trapezoid
-   signal source was dropped, breaking every model that relies on `initial algorithm` to seed
-   states. An assert of level error stops the simulation, as an equation's does (on the
-   initialization's values). =#
+An assignment to a parameter and a reinit write `LATEST_PROBLEM`; an assignment to another
+variable is collected in `_hard`, which simulate turns into hard start values of the
+unknowns (`remake(prob; u0 = …)`). The function runs after the ODEProblem is constructed
+(`simulate(...)` in the generated module), so LATEST_PROBLEM is in scope. Without this, the
+left side stayed at its default (0): `T_start := startTime + count*period` in the trapezoid
+signal source was dropped, breaking every model that relies on `initial algorithm` to seed
+states. An assert of level error stops the simulation, as an equation's does (on the
+initialization's values).
+"""
 function _initialWhenOpToJulia(wStmt::SC.Statement, simCode::SC.SIM_CODE, renamedNames::OrderedSet{String} = OrderedSet{String}())
   local sub = e::SC.Exp -> _substituteBoundParameters(_preAtInitialization(_initialIsTrue(_derAsCall(e)), simCode), simCode)
   local lowerAlg = e::SC.Exp -> _initialDerivativeReads(_renameAlgIdentifiers(
@@ -616,11 +654,13 @@ function _initialWhenOpToJulia(wStmt::SC.Statement, simCode::SC.SIM_CODE, rename
   unsupported("initial when-statement variant", wStmt)
 end
 
-#= A statement of an initial arm in the procedural body of `__runInitialAlgorithmEarly!`
-   (where the model has no initial algorithm section): an assignment `_alg_<lhs> = <rhs>`
-   (`local` at the first one of its left side), the right side's names renamed
-   (`_renameAlgIdentifiers`) so they bind to the let-block's locals, not to the module-level
-   Symbolics bindings of the same name. =#
+"""
+A statement of an initial arm in the procedural body of `__runInitialAlgorithmEarly!`
+(where the model has no initial algorithm section): an assignment `_alg_<lhs> = <rhs>`
+(`local` at the first one of its left side), the right side's names renamed
+(`_renameAlgIdentifiers`) so they bind to the let-block's locals, not to the module-level
+Symbolics bindings of the same name.
+"""
 function _initialWhenOpToJuliaEarly(wStmt::SC.Statement, simCode::SC.SIM_CODE,
                                     renamedNames::OrderedSet{String}, seenLHS::OrderedSet{String})::Expr
   local sub = e::SC.Exp -> _substituteBoundParameters(_initialIsTrue(e), simCode)
@@ -646,15 +686,19 @@ function _initialWhenOpToJuliaEarly(wStmt::SC.Statement, simCode::SC.SIM_CODE,
   return Expr(:block, :nothing)
 end
 
-#= reinit in a `when initial()` body: OpenModelica ignores it (x keeps its start), the early
-   pass failed, the runtime pass set it. None in MSL 3.2.3. =#
+"""
+reinit in a `when initial()` body: OpenModelica ignores it (x keeps its start), the early
+pass failed, the runtime pass set it. None in MSL 3.2.3.
+"""
 _refuseInitialReinit(wStmt::SC.REINIT) = OMBackend.unsupported("reinit in a when initial() body", SC.crefName(wStmt.stateVar))
 
-#= Modelica function calls in algorithm code are `Base.invokelatest(Name, ...)` with Name bound
-   in OMBackend.CodeGeneration (createModelicaFunctionWrapper), which a function body runs in.
-   The early initial algorithm runs in the model's module, where Name is undefined: qualify it.
-   (MSL WriteRealMatrixToFile: `when initial() then success1 := writeRealMatrix(...)` raised
-   UndefVarError, swallowed, and success1..4 stayed false.) =#
+"""
+Modelica function calls in algorithm code are `Base.invokelatest(Name, ...)` with Name bound
+in OMBackend.CodeGeneration (createModelicaFunctionWrapper), which a function body runs in.
+The early initial algorithm runs in the model's module, where Name is undefined: qualify it.
+(MSL WriteRealMatrixToFile: `when initial() then success1 := writeRealMatrix(...)` raised
+UndefVarError, swallowed, and success1..4 stayed false.)
+"""
 function _qualifyInvokedFunctions(@nospecialize(ex))
   ex isa Expr || return ex
   local args = map(_qualifyInvokedFunctions, ex.args)
@@ -820,7 +864,9 @@ function generateInitialAlgorithmEarlyFunction(simCode::SC.SIM_CODE)::Expr
   end
 end
 
-#= The Boolean references an assignment's right side reads. =#
+"""
+The Boolean references an assignment's right side reads.
+"""
 function _collectBoolRhsCrefs!(names::OrderedSet{String}, op::SC.Statement)::OrderedSet{String}
   op isa SC.ASSIGN || return names
   SC.foreachExp(e -> e isa SC.EXP_CREF && e.ty isa SC.TYPE_BOOL && push!(names, SC.crefName(e.cref)), op.right)

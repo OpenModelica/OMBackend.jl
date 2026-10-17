@@ -103,17 +103,21 @@ end
 realBinary(a::SC.Exp, op::SC.OpKind, b::SC.Exp)::SC.Exp = SC.BINARY(a, op, b)
 realCall(name::Symbol, args::SC.Exp...)::SC.Exp = SC.CALL(name, SC.Exp[args...], SC.TYPE_REAL(), SC.CALL_BUILTIN)
 
-#= integer(X) is a step (often cast to Real); a continuous zero-crossing on it never triggers,
-   so `when integer(X) <> Y` froze (Modelica.Blocks.Sources.Pulse): the argument X of an
-   integer() call (under a cast), else nothing. =#
+"""
+integer(X) is a step (often cast to Real); a continuous zero-crossing on it never triggers,
+so `when integer(X) <> Y` froze (Modelica.Blocks.Sources.Pulse): the argument X of an
+integer() call (under a cast), else nothing.
+"""
 function _zcIntArg(e::SC.Exp)::Union{Nothing, SC.Exp}
   local inner = e isa SC.CAST ? e.exp : e
   return SC.isBuiltin(inner, :integer) && length(inner.args) == 1 ? inner.args[1] : nothing
 end
 
-#= A relation with an integer() operand as a smooth zero-crossing on X: floor(X) >= Y is
-   X >= Y for an integer-valued Y, floor(X) > Y is X >= Y + 1; `nothing` for another
-   condition. =#
+"""
+A relation with an integer() operand as a smooth zero-crossing on X: floor(X) >= Y is
+X >= Y for an integer-valued Y, floor(X) > Y is X >= Y + 1; `nothing` for another
+condition.
+"""
 function _zcRewriteIntegerRel(cond::SC.Exp)::Union{Nothing, SC.Exp}
   cond isa SC.RELATION || return nothing
   local (e1, op, e2) = (cond.exp1, cond.op, cond.exp2)
@@ -136,9 +140,11 @@ function _zcRewriteIntegerRel(cond::SC.Exp)::Union{Nothing, SC.Exp}
   return nothing
 end
 
-#= An operand of a logical operator in a zero-crossing condition: a relation (or a logical
-   expression of them) its zero-crossing function, a Boolean value (a parameter, a discrete)
-   1 - 2b, -1 where true. =#
+"""
+An operand of a logical operator in a zero-crossing condition: a relation (or a logical
+expression of them) its zero-crossing function, a Boolean value (a parameter, a discrete)
+1 - 2b, -1 where true.
+"""
 function _zeroCrossingOperand(e::SC.Exp)::SC.Exp
   (e isa Union{SC.RELATION, SC.LBINARY, SC.LUNARY} || SC.isBuiltin(e, :change)) && return transformToZeroCrossingCondition(e)
   return realBinary(SC.RCONST(1.0), SC.OP_SUB, realBinary(SC.RCONST(2.0), SC.OP_MUL, e))
@@ -262,11 +268,13 @@ function stripComments(ex::Expr)::Expr
   return Base.remove_linenums!(ex)
 end
 
-#= Iterative equivalent of `MacroTools.postwalk`. Visits each subexpression
-   bottom-up, replacing each node with the result of `f(rebuilt_node)`.
-   Used in place of the recursive walker for huge generated function-body
-   ASTs (e.g. wrappers for Modelica.Utilities.Strings.scanToken family),
-   where the recursive form blows past Julia's runtime stack guard. =#
+"""
+Iterative equivalent of `MacroTools.postwalk`. Visits each subexpression
+bottom-up, replacing each node with the result of `f(rebuilt_node)`.
+Used in place of the recursive walker for huge generated function-body
+ASTs (e.g. wrappers for Modelica.Utilities.Strings.scanToken family),
+where the recursive form blows past Julia's runtime stack guard.
+"""
 function _iterativePostwalk(f, root)
   isa(root, Expr) || return f(root)
   local todo = Any[(root, false)]
@@ -348,9 +356,11 @@ end
 @inline _recordFieldRe(x::Tuple) = x[1]
 @inline _recordFieldRe(x) = hasproperty(x, :re) ? getproperty(x, :re) : real(x)
 
-#= A record's field `name`, the `ix`th: by position in a tuple (a function returning a
-   record returns its fields in order: the MSL Media `setState_psX(...).T`), by name
-   otherwise (a record constructor's NamedTuple). =#
+"""
+A record's field `name`, the `ix`th: by position in a tuple (a function returning a
+record returns its fields in order: the MSL Media `setState_psX(...).T`), by name
+otherwise (a record constructor's NamedTuple).
+"""
 @inline _recordField(x::Tuple, name::Symbol, ix::Integer) = ix >= 1 ? x[ix] : getproperty(x, name)
 @inline _recordField(x, name::Symbol, ::Integer) = getproperty(x, name)
 
@@ -475,7 +485,9 @@ equationSides(eq::SC.ARRAY_EQUATION)::Tuple{SC.Exp, SC.Exp} = (eq.left, eq.right
 equationSides(eq::SC.RESIDUAL_EQUATION)::Tuple{SC.Exp, SC.Exp} = (eq.exp, SC.RCONST(0.0))
 equationSides(eq::SC.Equation) = error("equationSides: no (lhs, rhs) for $(typeof(eq))")
 
-#= The equations `equationSides` takes. =#
+"""
+The equations `equationSides` takes.
+"""
 hasEquationSides(eq::SC.Equation)::Bool = eq isa Union{SC.EQUATION, SC.ARRAY_EQUATION, SC.RESIDUAL_EQUATION}
 
 """

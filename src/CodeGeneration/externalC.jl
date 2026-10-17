@@ -43,8 +43,10 @@
    OMRuntimeExternalC's libModelicaCallbacks (loaded RTLD_GLOBAL). A function that a library
    OMRuntimeExternalC ships defines (its Library annotation) is called there, not compiled. =#
 
-#= The string values of every key = "..." (or key = {"...", ...}) in an annotation (the
-   flat annotation has the default IncludeDirectory before the declared one). =#
+"""
+The string values of every key = "..." (or key = {"...", ...}) in an annotation (the
+flat annotation has the default IncludeDirectory before the declared one).
+"""
 function _annotationStrings(ann::AbstractString, key::AbstractString)::Vector{String}
   local out = String[]
   for m in eachmatch(Regex("\\b" * key * "\\s*=\\s*(\\{[^}]*\\}|\"(?:[^\"\\\\]|\\\\.)*\")"), ann)
@@ -81,7 +83,9 @@ char* ModelicaAllocateStringWithErrorReturn(size_t len);
 #endif
 """
 
-#= The shared library of the C code (cached by the code and its include directories). =#
+"""
+The shared library of the C code (cached by the code and its include directories).
+"""
 function _compileIncludeLibrary(code::String, dirs::Vector{String})::String
   local dir = joinpath(first(DEPOT_PATH), "omjl", "external-c")
   mkpath(dir)
@@ -109,7 +113,9 @@ function _compileIncludeLibrary(code::String, dirs::Vector{String})::String
   return lib
 end
 
-#= The C type of a Modelica scalar type. =#
+"""
+The C type of a Modelica scalar type.
+"""
 function _cScalarType(t::SimCode.SType)
   t isa SimCode.TYPE_REAL && return :Cdouble
   t isa Union{SimCode.TYPE_INTEGER, SimCode.TYPE_BOOL, SimCode.TYPE_ENUM} && return :Cint
@@ -120,10 +126,12 @@ function _cScalarType(t::SimCode.SType)
   return nothing
 end
 
-#= The library OMRuntimeExternalC ships under a name of the Library annotation, when it
-   defines the function: OMRuntimeExternalC has no Julia function for every C function of
-   its libraries (MSL's ModelicaInternal_mkdir, in libModelicaExternalC; its Include,
-   ModelicaInternal.h, only declares it). =#
+"""
+The library OMRuntimeExternalC ships under a name of the Library annotation, when it
+defines the function: OMRuntimeExternalC has no Julia function for every C function of
+its libraries (MSL's ModelicaInternal_mkdir, in libModelicaExternalC; its Include,
+ModelicaInternal.h, only declares it).
+"""
 function _shippedLibraryDefining(ann::AbstractString, cname::Symbol)::Union{String, Nothing}
   local installed = OMRuntimeExternalC.installedLibPath
   installed === nothing && return nothing

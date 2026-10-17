@@ -127,8 +127,10 @@ function createIfEquations(stateVariables::Vector, algebraicVariables::Vector, s
   return ifEquations
 end
 
-#= The if-equations in the order of their sort keys, each key computed once
-   (`sort(by = ...)` computed it, lowering residuals, at every comparison). =#
+"""
+The if-equations in the order of their sort keys, each key computed once
+(`sort(by = ...)` computed it, lowering residuals, at every comparison).
+"""
 function _sortedIfEquations(simCode::SC.SIM_CODE)::Vector{SC.IF_EQUATION}
   local ifEqs = collect(simCode.ifEquations)
   return ifEqs[sortperm([_ifEquationSortKey(e, simCode) for e in ifEqs])]
@@ -236,11 +238,13 @@ function _conditionReferencesRelayTarget(condition::SC.Exp, rT0::AbstractDict{Sy
   return false
 end
 
-#= Initial branch-condition values consistent with the t0 values of the
-   targets this if-equation defines. Round: evaluate every condition with the
-   current relay-t0 map, select the branch, evaluate the selected branch's
-   target RHS values at t0 and feed them back; stop when the condition vector
-   is stable. Mutates `rT0` so later if-equations see earlier targets. =#
+"""
+Initial branch-condition values consistent with the t0 values of the
+targets this if-equation defines. Round: evaluate every condition with the
+current relay-t0 map, select the branch, evaluate the selected branch's
+target RHS values at t0 and feed them back; stop when the condition vector
+is stable. Mutates `rT0` so later if-equations see earlier targets.
+"""
 function _fixedPointInitialConditions(ifEq::SC.IF_EQUATION, simCode::SC.SIM_CODE, rT0::AbstractDict{Symbol, Float64})::Vector{Bool}
   OMBackend.envSwitch("OMBACKEND_RELAY_T0_FIXEDPOINT") || return Bool[]
   local condBranches = [b for b in ifEq.branches if b.identifier != -1]
@@ -607,7 +611,9 @@ function createIfEquation(stateVariables::Vector,
                              relayGuesses, relations, initLiterals)
 end
 
-#= Whether a condition calls one of the built-ins `names` (`pre` of a reference is a PRE). =#
+"""
+Whether a condition calls one of the built-ins `names` (`pre` of a reference is a PRE).
+"""
 function _conditionHasCall(cond::SC.Exp, names::Tuple{Vararg{String}})::Bool
   return SC.anyExp(cond) do x
     (x isa SC.PRE && "pre" in names) || (x isa SC.CALL && x.kind === SC.CALL_BUILTIN && String(x.name) in names)

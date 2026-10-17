@@ -37,12 +37,14 @@
    relations read through, zero sets and their pins). Relations are keyed by themselves
    (SimCode expressions compare and hash structurally). =#
 
-#= A synthesized cluster's body can read a Boolean defined by a relation elsewhere (an ideal
-   thyristor's `fire`, the output of a comparison block). The body reads the relation instead
-   (outside pre()), and the relation joins the cluster's event sources: the cluster is
-   evaluated again when it changes, as every discrete equation is at every event (MLS 8.6),
-   with the relation pinned to its value after the crossing (at the crossing itself `fire` can
-   still read false). Returns the relations and the body. =#
+"""
+A synthesized cluster's body can read a Boolean defined by a relation elsewhere (an ideal
+thyristor's `fire`, the output of a comparison block). The body reads the relation instead
+(outside pre()), and the relation joins the cluster's event sources: the cluster is
+evaluated again when it changes, as every discrete equation is at every event (MLS 8.6),
+with the relation pinned to its value after the crossing (at the crossing itself `fire` can
+still read false). Returns the relations and the body.
+"""
 function _inlineReadBooleanRelations(rels::Vector{SC.RELATION}, assigns::Vector{Tuple{Symbol, SC.Exp, Bool}},
                                      relationOf::Dict{String, SC.RELATION}, simCode::SC.SIM_CODE)
   local members = Set{String}(string(d) for (d, _, _) in assigns)
@@ -61,14 +63,18 @@ function _inlineReadBooleanRelations(rels::Vector{SC.RELATION}, assigns::Vector{
   return (rels2, Tuple{Symbol, SC.Exp, Bool}[(d, _inlineOutsidePre(rhs, subst), isInt) for (d, rhs, isInt) in assigns])
 end
 
-#= `e` with the references `subst` names replaced, outside pre(), edge() and change(). =#
+"""
+`e` with the references `subst` names replaced, outside pre(), edge() and change().
+"""
 function _inlineOutsidePre(e::SC.Exp, subst::Dict{String, SC.Exp})::SC.Exp
   e isa SC.EXP_CREF && return get(subst, SC.crefName(e.cref), e)
   (e isa SC.CALL && e.kind === SC.CALL_BUILTIN && e.name in (:pre, :edge, :change)) && return e
   return SC.mapChildren(x -> _inlineOutsidePre(x, subst), e)
 end
 
-#= The names of the references an expression reads outside pre(). =#
+"""
+The names of the references an expression reads outside pre().
+"""
 function _crefNamesOutsidePre(e::SC.Exp)::Set{String}
   local names = Set{String}()
   local visit = function (x::SC.Exp)
@@ -80,10 +86,12 @@ function _crefNamesOutsidePre(e::SC.Exp)::Set{String}
   return names
 end
 
-#= A Boolean condition variable resolved to its defining relation: a residual `0 ~ v - REL`
-   (`above = x > 0.1`); nothing for another. Lets `change(b)`/`edge(b)` over an observed Boolean
-   route to an MTK SymbolicContinuousCallback (which reads observed variables and root-finds)
-   instead of the CallbackSet (which cannot read the observed `b`). =#
+"""
+A Boolean condition variable resolved to its defining relation: a residual `0 ~ v - REL`
+(`above = x > 0.1`); nothing for another. Lets `change(b)`/`edge(b)` over an observed Boolean
+route to an MTK SymbolicContinuousCallback (which reads observed variables and root-finds)
+instead of the CallbackSet (which cannot read the observed `b`).
+"""
 function _condVarRelation(crefName::String, simCode::SC.SIM_CODE)::Union{Nothing, SC.RELATION}
   for req in simCode.residualEquations
     local r = _definingRelation(req)
@@ -92,14 +100,18 @@ function _condVarRelation(crefName::String, simCode::SC.SIM_CODE)::Union{Nothing
   return nothing
 end
 
-#= (name, relation) of a residual `0 ~ v - REL`, or nothing. =#
+"""
+(name, relation) of a residual `0 ~ v - REL`, or nothing.
+"""
 function _definingRelation(req::SC.RESIDUAL_EQUATION)::Union{Nothing, Tuple{String, SC.RELATION}}
   local b = req.exp
   (b isa SC.BINARY && b.op === SC.OP_SUB && b.exp1 isa SC.EXP_CREF && b.exp2 isa SC.RELATION) || return nothing
   return (SC.crefName(b.exp1.cref), b.exp2)
 end
 
-#= Every Boolean defined by a relation (_condVarRelation), by name. =#
+"""
+Every Boolean defined by a relation (_condVarRelation), by name.
+"""
 function _condVarRelations(simCode::SC.SIM_CODE)::Dict{String, SC.RELATION}
   local out = Dict{String, SC.RELATION}()
   for req in simCode.residualEquations
@@ -109,9 +121,11 @@ function _condVarRelations(simCode::SC.SIM_CODE)::Dict{String, SC.RELATION}
   return out
 end
 
-#= The zero-crossing relations of a `change(...)`/`edge(...)` condition (or an or-chain of them)
-   into `rels`. The argument may be a relation or a Boolean variable defined by one
-   (`_condVarRelation`). =#
+"""
+The zero-crossing relations of a `change(...)`/`edge(...)` condition (or an or-chain of them)
+into `rels`. The argument may be a relation or a Boolean variable defined by one
+(`_condVarRelation`).
+"""
 function _collectChangeRelations!(rels::Vector{SC.RELATION}, e::SC.Exp, simCode::SC.SIM_CODE)::Bool
   if e isa SC.LBINARY && e.op === SC.OP_OR
     return _collectChangeRelations!(rels, e.exp1, simCode) && _collectChangeRelations!(rels, e.exp2, simCode)
@@ -131,27 +145,35 @@ function _collectChangeRelations!(rels::Vector{SC.RELATION}, e::SC.Exp, simCode:
   return _isChangeOfPre(e)
 end
 
-#= `change(pre(v))`: a term of the condition of a cluster the lifter made without relations;
-   invalid in Modelica, so no user when has it. =#
+"""
+`change(pre(v))`: a term of the condition of a cluster the lifter made without relations;
+invalid in Modelica, so no user when has it.
+"""
 _isChangeOfPre(e::SC.Exp)::Bool = SC.isBuiltin(e, :change) && _isPreRead(first(e.args))
 
-#= pre(v), also behind the sign a negated alias substitution puts in front. =#
+"""
+pre(v), also behind the sign a negated alias substitution puts in front.
+"""
 function _isPreRead(a::SC.Exp)::Bool
   (a isa SC.PRE || SC.isBuiltin(a, :pre)) && return true
   a isa Union{SC.UNARY, SC.LUNARY} && return _isPreRead(a.exp)
   return false
 end
 
-#= The relations of a lifted when's condition (empty for a cluster without relations, which
-   only the event iteration evaluates), or nothing for another condition. =#
+"""
+The relations of a lifted when's condition (empty for a cluster without relations, which
+only the event iteration evaluates), or nothing for another condition.
+"""
 function _extractChangeRelations(cond::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, Vector{SC.RELATION}}
   local rels = SC.RELATION[]
   return _collectChangeRelations!(rels, cond, simCode) ? rels : nothing
 end
 
-#= Whether a when-condition marks a synthesized (lifter) when: a literal `initial()` term or a
-   `change()`/`edge()` call. Such whens carry the implied §17.4.4 initial() term and run their
-   body at t0; user whens with bare relation conditions must not. =#
+"""
+Whether a when-condition marks a synthesized (lifter) when: a literal `initial()` term or a
+`change()`/`edge()` call. Such whens carry the implied §17.4.4 initial() term and run their
+body at t0; user whens with bare relation conditions must not.
+"""
 function _condHasInitial(e::SC.Exp)::Bool
   (SC.isBuiltin(e, :initial) || SC.isBuiltin(e, :change) || SC.isBuiltin(e, :edge)) && return true
   e isa SC.LBINARY && return _condHasInitial(e.exp1) || _condHasInitial(e.exp2)
@@ -159,22 +181,28 @@ function _condHasInitial(e::SC.Exp)::Bool
   return false
 end
 
-#= Whether a when-condition is `edge(...)` (or an or-chain of edges), which fires on the rising
-   transition only (false to true), unlike `change` (both). =#
+"""
+Whether a when-condition is `edge(...)` (or an or-chain of edges), which fires on the rising
+transition only (false to true), unlike `change` (both).
+"""
 function _isEdgeWhenCondition(e::SC.Exp)::Bool
   SC.isBuiltin(e, :edge) && return true
   (e isa SC.LBINARY && e.op === SC.OP_OR) && return _isEdgeWhenCondition(e.exp1) && _isEdgeWhenCondition(e.exp2)
   return false
 end
 
-#= `e` with each relation `pins` has replaced by its pinned value. =#
+"""
+`e` with each relation `pins` has replaced by its pinned value.
+"""
 _substRelations(e::SC.Exp, pins::Dict{SC.Exp, Bool})::SC.Exp =
   SC.mapExp(x -> x isa SC.RELATION && haskey(pins, x) ? SC.BCONST(pins[x]) : x, e)
 
-#= The zero set of an ordering relation: its two operands in a canonical order, and whether
-   the relation holds when the first canonical operand is the larger one. `a <= b`, `a > b`,
-   `b >= a`, `b < a` all switch where a - b crosses zero. `nothing` for relations that are not
-   orderings (==, <>). =#
+"""
+The zero set of an ordering relation: its two operands in a canonical order, and whether
+the relation holds when the first canonical operand is the larger one. `a <= b`, `a > b`,
+`b >= a`, `b < a` all switch where a - b crosses zero. `nothing` for relations that are not
+orderings (==, <>).
+"""
 function _relationZeroSet(rel::SC.Exp)::Union{Nothing, Tuple{String, String, Bool}}
   (rel isa SC.RELATION && rel.op in (SC.OP_GREATER, SC.OP_GREATEREQ, SC.OP_LESS, SC.OP_LESSEQ)) || return nothing
   local greater = rel.op in (SC.OP_GREATER, SC.OP_GREATEREQ)
@@ -183,7 +211,9 @@ function _relationZeroSet(rel::SC.Exp)::Union{Nothing, Tuple{String, String, Boo
   return s1 <= s2 ? (s1, s2, greater) : (s2, s1, !greater)
 end
 
-#= Group relations that share a zero set, in first-occurrence order. =#
+"""
+Group relations that share a zero set, in first-occurrence order.
+"""
 function _groupRelationsByZeroSet(rels::Vector{SC.RELATION})::Vector{Vector{SC.RELATION}}
   local groups = Vector{SC.RELATION}[]
   local groupOf = Dict{Tuple{String, String}, Int}()
@@ -204,7 +234,9 @@ function _groupRelationsByZeroSet(rels::Vector{SC.RELATION})::Vector{Vector{SC.R
   return groups
 end
 
-#= Values of every relation in a zero-set group once `rel` has value `val`. =#
+"""
+Values of every relation in a zero-set group once `rel` has value `val`.
+"""
 function _zeroSetPins(group::Vector{SC.RELATION}, rel::SC.RELATION, val::Bool)::Dict{SC.Exp, Bool}
   local pins = Dict{SC.Exp, Bool}(rel => val)
   local zs = _relationZeroSet(rel)

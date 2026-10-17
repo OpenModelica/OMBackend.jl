@@ -40,16 +40,20 @@
   frees all unknowns to handle rank-deficient kinematic loops.
 =#
 
-#= Residual vector of one init iterate: dynamics rows (du minus targets) plus
-   the optional extra rows from signal-valued initialization equations. =#
+"""
+Residual vector of one init iterate: dynamics rows (du minus targets) plus
+the optional extra rows from signal-valued initialization equations.
+"""
 function _initResidualVec(du, u, eq_idx, targets, extraRes)
   local base = du[eq_idx] .- targets
   extraRes === nothing && return base
   return vcat(base, extraRes(du, u))
 end
 
-#= Forward-difference Jacobian of the init residual at u0 over the var_idx
-   columns. `res` is the residual already evaluated at u0. =#
+"""
+Forward-difference Jacobian of the init residual at u0 over the var_idx
+columns. `res` is the residual already evaluated at u0.
+"""
 function _fdInitResidualJacobian(rhsFunc, p_vec, u0, eq_idx, targets, extraRes, var_idx, res;
                                  eps_fd=1e-7)
   local J = zeros(length(res), length(var_idx))
@@ -66,13 +70,15 @@ function _fdInitResidualJacobian(rhsFunc, p_vec, u0, eq_idx, targets, extraRes, 
   return J
 end
 
-#= Underdetermined-init completion: a converged root whose Jacobian has a
-   nontrivial null space means the equations leave spare degrees of freedom.
-   Tool convention is to complete such a system by fixing selected variables
-   at their start values. Pin the algebraic unknowns with the largest
-   null-space projections at their entry values and re-solve the remainder
-   from the root; keep the completed root only when the constrained solve
-   converges. =#
+"""
+Underdetermined-init completion: a converged root whose Jacobian has a
+nontrivial null space means the equations leave spare degrees of freedom.
+Tool convention is to complete such a system by fixing selected variables
+at their start values. Pin the algebraic unknowns with the largest
+null-space projections at their entry values and re-solve the remainder
+from the root; keep the completed root only when the constrained solve
+converges.
+"""
 function _completeUnderdeterminedInit!(u0, rhsFunc, p_vec, eq_idx, var_idx, algCandidates, u0_entry;
                                        targets=zeros(Float64, length(eq_idx)), tol=1e-10,
                                        extraRes=nothing, maxiter=200, restoreIdx=Int[])
@@ -157,12 +163,14 @@ function _completeUnderdeterminedInit!(u0, rhsFunc, p_vec, eq_idx, var_idx, algC
   return changed
 end
 
-#= A free unknown guessed at exactly 0 can make a residual row non-finite
-   at the entry (MSL QS FluxTubes GeneralLeakage: `0 = -7e-6 + 0.3/G_m`, G_m
-   without a start value), and then no phase can start. Those guesses become
-   1: all together, else one at a time where it lowers the number of
-   non-finite rows. Only at such an entry, which no phase could solve from.
-   Whether a guess changed. =#
+"""
+A free unknown guessed at exactly 0 can make a residual row non-finite
+at the entry (MSL QS FluxTubes GeneralLeakage: `0 = -7e-6 + 0.3/G_m`, G_m
+without a start value), and then no phase can start. Those guesses become
+1: all together, else one at a time where it lowers the number of
+non-finite rows. Only at such an entry, which no phase could solve from.
+Whether a guess changed.
+"""
 function _nudgeZeroGuesses!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residuals, fixed)
   local du = similar(u0)
   local nonFinite = u -> (rhsFunc(du, u, p_vec, 0.0);
@@ -191,8 +199,10 @@ function _nudgeZeroGuesses!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residua
   return changed
 end
 
-#= `converged` is set false when no phase converged (the result is then the
-   best effort the warning or the error below reports). =#
+"""
+`converged` is set false when no phase converged (the result is then the
+best effort the warning or the error below reports).
+"""
 function _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
                                   converged::Base.RefValue{Bool}=Ref(true), t0::Float64=0.0)
   #= The residuals at the start time t0: the phases below evaluate at their time 0. Assigned
@@ -386,11 +396,13 @@ function _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; maxiter=200, tol=1e-10,
   return u0
 end
 
-#= Anchored attempt first (when a guess vector is provided), then an
-   unanchored polish continuing from the stalled endpoint: the anchor term
-   biases the stationary point off the residual zero when the root lies far
-   from the guesses, stalling short of tolerance, but branch selection is
-   already done at the stalled endpoint. =#
+"""
+Anchored attempt first (when a guess vector is provided), then an
+unanchored polish continuing from the stalled endpoint: the anchor term
+biases the stationary point off the residual zero when the root lies far
+from the guesses, stalling short of tolerance, but branch selection is
+already done at the stalled endpoint.
+"""
 function _solveDAEPhaseAnchored!(u0, rhsFunc, p_vec, eq_idx, var_idx, anchorVals;
                                  targets=zeros(Float64, length(eq_idx)), maxiter=50, tol=1e-10,
                                  extraRes=nothing, phaseLabel::String="")
@@ -416,20 +428,22 @@ function _solveDAEPhaseAnchored!(u0, rhsFunc, p_vec, eq_idx, var_idx, anchorVals
                          phaseLabel=string(phaseLabel, "-polish"))
 end
 
-#= The Newton step of an init phase: the minimum-norm step, pinv's, which
-   also serves the underdetermined and anchored phases. Where pinv's rank
-   cutoff (eps * min(m, n) * the largest singular value) drops a direction of
-   an unanchored Jacobian with at least as many rows as columns, and the
-   Jacobian is regular once its rows and columns are scaled, the step is that
-   scaled matrix's Newton step (for more rows than columns, its row-weighted
-   least-squares step) when it descends. A badly scaled Jacobian is not a
-   singular one: an ideal diode in the wrong mode at the start has s = -8e5
-   against Ron = 1e-5; the dropped direction is the one that corrects s, the
-   step moved the if-equation's coefficient instead, the phase crept above
-   its tolerance, and a later phase moved the states to fit the wrong mode (a
-   capacitor's start value). Elsewhere the step is pinv's, bit for bit: a V6
-   engine cylinder's piston reaches its stroke limit to 1e-12, and a last-bit
-   change of the initial crank angle trips that assert. =#
+"""
+The Newton step of an init phase: the minimum-norm step, pinv's, which
+also serves the underdetermined and anchored phases. Where pinv's rank
+cutoff (eps * min(m, n) * the largest singular value) drops a direction of
+an unanchored Jacobian with at least as many rows as columns, and the
+Jacobian is regular once its rows and columns are scaled, the step is that
+scaled matrix's Newton step (for more rows than columns, its row-weighted
+least-squares step) when it descends. A badly scaled Jacobian is not a
+singular one: an ideal diode in the wrong mode at the start has s = -8e5
+against Ron = 1e-5; the dropped direction is the one that corrects s, the
+step moved the if-equation's coefficient instead, the phase crept above
+its tolerance, and a later phase moved the states to fit the wrong mode (a
+capacitor's start value). Elsewhere the step is pinv's, bit for bit: a V6
+engine cylinder's piston reaches its stroke limit to 1e-12, and a last-bit
+change of the initial crank angle trips that assert.
+"""
 function _newtonStep(Js, ress, unanchored::Bool)
   if unanchored && size(Js, 1) >= size(Js, 2) && !isempty(Js) && !LinearAlgebra.isdiag(Js)
     local S = LinearAlgebra.svdvals(Js)

@@ -363,7 +363,9 @@ function updateInitialConditions!(simCode::OMBackend.SimCode.SIM_CODE, integrato
   return nothing
 end
 
-#= A flattened name without its first component (`pendulum_y` -> `y`; "" for `x`). =#
+"""
+A flattened name without its first component (`pendulum_y` -> `y`; "" for `x`).
+"""
 _withoutComponent(name::String)::String = join(split(name, "_")[2:end], "_")
 
 end #= module =#

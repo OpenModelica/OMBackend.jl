@@ -429,10 +429,12 @@ function _translationResult(result::Tuple{String, Expr})::Tuple{String, Expr}
   return result
 end
 
-#= The simulation code checked before the code generation (SimCode.check): a reference that
-   resolves to no variable, eliminated variable or builtin aborts it with the located reason (the
-   code generation would otherwise throw a bare UndefVarError deep in MTK); the other violations
-   are reported. =#
+"""
+The simulation code checked before the code generation (SimCode.check): a reference that
+resolves to no variable, eliminated variable or builtin aborts it with the located reason (the
+code generation would otherwise throw a bare UndefVarError deep in MTK); the other violations
+are reported.
+"""
 function _checkSimCodeBeforeCodegen(simCode::SimCode.SIM_CODE, checkSimCode::Bool)::Nothing
   checkSimCode || return nothing
   local result = SimCode.check(simCode)
@@ -501,8 +503,10 @@ function generateIMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
   return (modelName, modelCode)
 end
 
-#= The generated code of a model for writing it out: the array path's module for an array
-   model, else the MTK path's code. =#
+"""
+The generated code of a model for writing it out: the array path's module for an array
+model, else the MTK path's code.
+"""
 _writtenModel(modelName) = modelName in ARRAY_ODE_MODELS && haskey(COMPILED_MODELS_DEJL, modelName) ?
   COMPILED_MODELS_DEJL[modelName][1] : getCompiledModel(modelName)
 
@@ -549,8 +553,10 @@ function translateArrays(fm::OMFrontend.Frontend.FlatModel; functionList::Union{
   return @BACKEND_PERFLOG "[backendAPI] generateArrayODECode" generateArrayODETargetCode(fm; functionList)
 end
 
-#= The array ODE module of a no-scalarize flat model (ARRAY_ODE_GENERATION), cached as a
-   DE-mode model; nothing (and an @info with the reason) for a model outside its scope. =#
+"""
+The array ODE module of a no-scalarize flat model (ARRAY_ODE_GENERATION), cached as a
+DE-mode model; nothing (and an @info with the reason) for a model outside its scope.
+"""
 function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel; functionList::Union{Nothing, FunctionList} = nothing)
   local modelName = canonicalName(fm.name)
   local (name, modelCode) = CodeGeneration.ArrayODEGen.generateArrayODECode(fm, modelName; functions = functionList)
@@ -595,7 +601,9 @@ end
 
 modelWasCompiledAgainDE(modelName) = COMPILED_MODELS_DEJL[modelName][2]
 
-#= The DE-mode module of `modelName` evaluated: later calls reuse it until it changes. =#
+"""
+The DE-mode module of `modelName` evaluated: later calls reuse it until it changes.
+"""
 function _evalModelDE(modelName::String, modelCode::Expr)
   @eval $modelCode
   local (code, _, h) = COMPILED_MODELS_DEJL[modelName]
@@ -1141,6 +1149,8 @@ function MTK_evaluateAllObserved(sol, obs_eqs, modelName::String)
   return result
 end
 
-#= An observedFilter's patterns as strings. =#
+"""
+An observedFilter's patterns as strings.
+"""
 _observedFilterStrings(f::Vector{Regex})::Vector{String} = String[p.pattern for p in f]
 _observedFilterStrings(f::Vector{String})::Vector{String} = f

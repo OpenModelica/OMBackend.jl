@@ -565,9 +565,11 @@ const _BRANCH_EVENT_REINIT = :(OMBackend.CodeGeneration.EventReinit())
 """
 generateMTKCode(simCode::SC.SIM_CODE) = ODE_MODE_MTK(simCode)
 
-#= The generated model module compiles with optimize=0 compile=min infer=false
-   (a short build); OMBACKEND_MODULE_COMPILE_MIN off: default compilation, to
-   measure what the per-step closures of the module cost interpreted. =#
+"""
+The generated model module compiles with optimize=0 compile=min infer=false
+(a short build); OMBACKEND_MODULE_COMPILE_MIN off: default compilation, to
+measure what the per-step closures of the module cost interpreted.
+"""
 _moduleCompilerOptions() = OMBackend.envSwitch("OMBACKEND_MODULE_COMPILE_MIN") ?
   :(Base.Experimental.@compiler_options optimize=0 compile=min infer=false) : nothing
 
@@ -1522,12 +1524,14 @@ function generateAliasObservedBlock(simCode::SC.SIM_CODE,
   end
 end
 
-#= The eliminated pairs in an order where each equation comes after the
-   eliminated variables it reads (the observed equations are evaluated in
-   order). The passes append their pairs one after another, and an earlier
-   pair can read a later one's variable (the fold's `total` reading the
-   output-only `v[2]`, a name of the second alias pass). Depth first, with a
-   stack (a long chain); a cycle is broken where the search entered it. =#
+"""
+The eliminated pairs in an order where each equation comes after the
+eliminated variables it reads (the observed equations are evaluated in
+order). The passes append their pairs one after another, and an earlier
+pair can read a later one's variable (the fold's `total` reading the
+output-only `v[2]`, a name of the second alias pass). Depth first, with a
+stack (a long chain); a cycle is broken where the search entered it.
+"""
 function _eliminatedDependencyOrder(elimVars::Vector{String}, elimEqs::Vector{SC.RESIDUAL_EQUATION})::Vector{Int}
   local position = Dict(v => i for (i, v) in enumerate(elimVars))
   local reads = map(elimEqs) do eq

@@ -124,8 +124,10 @@ const _ALGEBRAIC_CHECK_POINTS = (0.2, 0.5, 0.8)
 const _PROJECTION_TOLERANCE = 1.0e-6
 const _PROJECTION_ITERATIONS = 8
 
-#= The algebraic rows of a diagonal mass matrix, or none (an ODE, a
-   DAEFunction, a mass matrix that mixes rows). =#
+"""
+The algebraic rows of a diagonal mass matrix, or none (an ODE, a
+DAEFunction, a mass matrix that mixes rows).
+"""
 function _algebraicRows(f)
   hasproperty(f, :mass_matrix) || return Int[]
   local mm = f.mass_matrix
@@ -134,15 +136,19 @@ function _algebraicRows(f)
   return Int[i for i in axes(mm, 1) if iszero(mm[i, i])]
 end
 
-#= A Rodas method (OrdinaryDiffEqRosenbrock's Rodas3P ... Rodas5Pr): one
-   step, no FSAL derivative. By name: the Rosenbrock methods differ in FSAL. =#
+"""
+A Rodas method (OrdinaryDiffEqRosenbrock's Rodas3P ... Rodas5Pr): one
+step, no FSAL derivative. By name: the Rosenbrock methods differ in FSAL.
+"""
 _isRodas(alg) = startswith(string(nameof(typeof(alg))), "Rodas")
 
 const _SparseArrays = Symbolics.SparseArrays
 
-#= Where the entries of jac[rows, rows] are stored (column-major over J):
-   an index into a sparse Jacobian's nonzeros (0 where it stores none), or a
-   dense one's linear index. =#
+"""
+Where the entries of jac[rows, rows] are stored (column-major over J):
+an index into a sparse Jacobian's nonzeros (0 where it stores none), or a
+dense one's linear index.
+"""
 function _jacobianPick(jac, rows::Vector{Int})::Vector{Int}
   local pick = Vector{Int}(undef, length(rows)^2)
   local n = 0
@@ -163,9 +169,11 @@ end
 _storedValues(jac::_SparseArrays.AbstractSparseMatrixCSC) = _SparseArrays.nonzeros(jac)
 _storedValues(jac::AbstractMatrix) = vec(jac)
 
-#= At the start of a solve: whether it applies (a Rodas method with adaptive
-   steps on the mass-matrix form: a DAE solver gets the residual form), and
-   work arrays of the state's element type (dual numbers under ForwardDiff). =#
+"""
+At the start of a solve: whether it applies (a Rodas method with adaptive
+steps on the mass-matrix form: a DAE solver gets the residual form), and
+work arrays of the state's element type (dual numbers under ForwardDiff).
+"""
 function _startStepControl!(c::AlgebraicStepControl, integrator)
   local f = hasproperty(integrator, :f) ? integrator.f : nothing
   c.active = f !== nothing && hasproperty(integrator, :alg) && _isRodas(integrator.alg) &&
@@ -184,7 +192,9 @@ function _startStepControl!(c::AlgebraicStepControl, integrator)
   return nothing
 end
 
-#= The tolerance-scaled RMS norm of a correction of the algebraic unknowns at u. =#
+"""
+The tolerance-scaled RMS norm of a correction of the algebraic unknowns at u.
+"""
 function _scaledNorm(rows::Vector{Int}, integrator, correction, u)
   local abstol = integrator.opts.abstol
   local reltol = integrator.opts.reltol
@@ -196,7 +206,9 @@ function _scaledNorm(rows::Vector{Int}, integrator, correction, u)
   return sqrt(total / length(rows))
 end
 
-#= f[rows] at (w.u, t) into w.g. =#
+"""
+f[rows] at (w.u, t) into w.g.
+"""
 function _algebraicResidual!(w::AlgebraicWork, rows::Vector{Int}, integrator, t)
   integrator.f(w.f0, w.u, integrator.p, t)
   for (i, r) in enumerate(rows)
@@ -205,9 +217,11 @@ function _algebraicResidual!(w::AlgebraicWork, rows::Vector{Int}, integrator, t)
   return w.g
 end
 
-#= d f[rows] / d u[rows] at (w.u, t) into w.J: from the problem's Jacobian
-   when it has one, else by forward differences; factorized in place. The
-   factorization, or nothing when singular. =#
+"""
+d f[rows] / d u[rows] at (w.u, t) into w.J: from the problem's Jacobian
+when it has one, else by forward differences; factorized in place. The
+factorization, or nothing when singular.
+"""
 function _algebraicJacobian!(w::AlgebraicWork, rows::Vector{Int}, integrator, t)
   local f = integrator.f
   local p = integrator.p
@@ -234,10 +248,12 @@ function _algebraicJacobian!(w::AlgebraicWork, rows::Vector{Int}, integrator, t)
   return LinearAlgebra.issuccess(F) ? F : nothing
 end
 
-#= The largest error of the dense output of the algebraic unknowns at the
-   check points of the last step, in the solver's error norm (1 is the
-   tolerance), and the factorized Jacobian at the midpoint (nothing when
-   singular or when the step has no length). =#
+"""
+The largest error of the dense output of the algebraic unknowns at the
+check points of the last step, in the solver's error norm (1 is the
+tolerance), and the factorized Jacobian at the midpoint (nothing when
+singular or when the step has no length).
+"""
 function _algebraicError!(w::AlgebraicWork, rows::Vector{Int}, integrator)
   local t0 = integrator.tprev
   local dt = integrator.t - t0
@@ -257,8 +273,10 @@ function _algebraicError!(w::AlgebraicWork, rows::Vector{Int}, integrator)
   return (err, F)
 end
 
-#= Newton on the algebraic rows at the step end, differential unknowns kept.
-   Kept only if it converges; the state is left as it was otherwise. =#
+"""
+Newton on the algebraic rows at the step end, differential unknowns kept.
+Kept only if it converges; the state is left as it was otherwise.
+"""
 function _projectStepEnd!(w::AlgebraicWork, rows::Vector{Int}, F, integrator)
   F === nothing && return nothing
   local u = integrator.u

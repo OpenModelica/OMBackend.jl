@@ -41,7 +41,9 @@
    of the model function, by the call's code. Every element called it (Buildings'
    TemperatureResponseMatrix: 152 calls of an impure function that computes a g-function
    and writes a file, 15 s each); a binding is evaluated once. =#
-#= `bindExp`: a binding, or a start value (a parameter without a binding). =#
+"""
+`bindExp`: a binding, or a start value (a parameter without a binding).
+"""
 function _parameterBindingExpr(bindExp::SC.Exp, simCode::SC.SIM_CODE)
   local e = expToJuliaExpMTK(bindExp, simCode)
   _isLiteralCallElement(bindExp) || return e
@@ -58,12 +60,16 @@ function _parameterBindingExpr(bindExp::SC.Exp, simCode::SC.SIM_CODE)
   return e
 end
 
-#= f(...)[i, ...] with literal arguments and subscripts. =#
+"""
+f(...)[i, ...] with literal arguments and subscripts.
+"""
 _isLiteralCallElement(e::SC.Exp)::Bool =
   e isa SC.ASUB && e.exp isa SC.CALL && all(_isLiteralExp, e.exp.args) && all(s -> s isa SC.ICONST, e.subs)
 
-#= A parameter's value: its binding, else its start (a literal or an expression of other
-   parameters: MSL 4.1.0's lightning examples), else 0.0. =#
+"""
+A parameter's value: its binding, else its start (a literal or an expression of other
+parameters: MSL 4.1.0's lightning examples), else 0.0.
+"""
 function _parameterValueExp(simVar::SC.SIMVAR)::SC.Exp
   local k = simVar.varKind::SC.PARAMETER
   k.bindExp === nothing || return k.bindExp
@@ -138,19 +144,23 @@ function createArrayParametersMTK(arrayParameters::Vector, simCode::SC.SIM_CODE)
   return exprs
 end
 
-#= The binding the model function assigns a parameter (createParameterAssignmentsMTK),
-   or nothing. A tunable parameter stays the symbolic @parameters variable: a parameter
-   bound to it (`rate = 3 * k`) then lowers to a symbolic expression, so changing k
-   changes rate too. One without a binding (a free parameter, fixed = false) is
-   computed by the initialization. =#
+"""
+The binding the model function assigns a parameter (createParameterAssignmentsMTK),
+or nothing. A tunable parameter stays the symbolic @parameters variable: a parameter
+bound to it (`rate = 3 * k`) then lowers to a symbolic expression, so changing k
+changes rate too. One without a binding (a free parameter, fixed = false) is
+computed by the initialization.
+"""
 function _assignedBinding(param::String, ht::AbstractDict)::Union{Nothing, SC.Exp}
   OMBackend.isTunableParameter(param) && return nothing
   local k = last(ht[param]).varKind
   return k isa SC.PARAMETER ? k.bindExp : nothing
 end
 
-#= The parameters the model function assigns no value: the equations and the other
-   parameters' bindings refer to them by name, as the symbolic parameters. =#
+"""
+The parameters the model function assigns no value: the equations and the other
+parameters' bindings refer to them by name, as the symbolic parameters.
+"""
 unassignedParameters(parameters::Vector, simCode::SC.SIM_CODE)::Set{Symbol} =
   Set{Symbol}(Symbol(p) for p in parameters if _assignedBinding(p, simCode.stringToSimVarHT) === nothing)
 
@@ -246,10 +256,12 @@ function createStringParameterAssignments(simCode::SC.SIM_CODE)::Vector{Expr}
   return exprs
 end
 
-#= Parameters with a computed binding that a DATA_STRUCTURE's binding reads (MSL 4.1
-   CombiTimeTable's isCsvExt from its file name, an argument of the table's constructor):
-   at module level as well, each after what it reads; a parameter that reads anything
-   else (a variable, an array or another data structure) is left as it was. =#
+"""
+Parameters with a computed binding that a DATA_STRUCTURE's binding reads (MSL 4.1
+CombiTimeTable's isCsvExt from its file name, an argument of the table's constructor):
+at module level as well, each after what it reads; a parameter that reads anything
+else (a variable, an array or another data structure) is left as it was.
+"""
 function _dataStructureParameterPrelude(simCode::SC.SIM_CODE, emitted::Set{String})::Vector{Expr}
   local ht = simCode.stringToSimVarHT
   local out = Expr[]
@@ -293,17 +305,19 @@ end
    emission via createArrayParametersMTK happens too late: it lives inside
    `function <Model>Model(tspan)`, while DATA_STRUCTURE_ASSIGNMENTS run at
    module load time. =#
-#= Module-level prelude for array parameters referenced by DATA_STRUCTURE
-   constructors. Two cases:
+"""
+Module-level prelude for array parameters referenced by DATA_STRUCTURE
+constructors. Two cases:
 
-     1. The HT carries a single ARRAY_PARAMETER entry with a literal-array bind.
-        Emit `name = <array-expr>` directly.
-     2. The HT carries scalarized entries (e.g. `tableData[1][1]`,
-        `tableData[1][2]`, ..., `tableData[3][2]`) and the parent name has no
-        bind of its own. Reconstruct an N-dim Julia matrix from the scalar
-        element bindings and emit `tableData = <reconstructed>`. Required
-        because ExternalObject constructors (CombiTable, CombiTimeTable, ...)
-        appear at module top and reference the parent array name. =#
+  1. The HT carries a single ARRAY_PARAMETER entry with a literal-array bind.
+     Emit `name = <array-expr>` directly.
+  2. The HT carries scalarized entries (e.g. `tableData[1][1]`,
+     `tableData[1][2]`, ..., `tableData[3][2]`) and the parent name has no
+     bind of its own. Reconstruct an N-dim Julia matrix from the scalar
+     element bindings and emit `tableData = <reconstructed>`. Required
+     because ExternalObject constructors (CombiTable, CombiTimeTable, ...)
+     appear at module top and reference the parent array name.
+"""
 function createArrayParameterPrelude(simCode::SC.SIM_CODE)::Vector{Expr}
   local exprs::Vector{Expr} = Expr[]
   local ht = simCode.stringToSimVarHT
@@ -521,9 +535,11 @@ function createDataStructureAssignments(dataStructureVariables::Vector{String}, 
   return dsAssignments
 end
 
-#= For an array of records `base[1..n]` among the data structures, each field as an array
-   `base_field = [base[1]_field, ...]`: a whole record array passed to a function goes field
-   by field (`h_T(Medium_data_name, Medium_data_MM, ...)`). =#
+"""
+For an array of records `base[1..n]` among the data structures, each field as an array
+`base_field = [base[1]_field, ...]`: a whole record array passed to a function goes field
+by field (`h_T(Medium_data_name, Medium_data_MM, ...)`).
+"""
 function _recordArrayFieldArrays(dataStructureVariables::Vector{String}, simCode::SC.SIM_CODE)::Vector{Expr}
   local ht = simCode.stringToSimVarHT
   local elements = OrderedDict{String, Dict{Int, Vector{String}}}()

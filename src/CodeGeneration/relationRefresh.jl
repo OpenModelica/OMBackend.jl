@@ -63,12 +63,14 @@
       sweep per link; a model that does not settle (chattering) is stopped
       with an error, as OpenModelica does. =#
 
-#= A getter for a crossing function or scale; a constant (not symbolic) is a
-   Real that is not a Symbolics.Num. Not SII.getu: it takes an expression over
-   observed variables for a parameter-only one (GetParameterObserved), and the
-   generated function then reads the unknowns as undefined globals (the V6
-   cylinder rig, `2*v_rel` with v_rel observed). A single variable works, and
-   so does building the observed function directly. =#
+"""
+A getter for a crossing function or scale; a constant (not symbolic) is a
+Real that is not a Symbolics.Num. Not SII.getu: it takes an expression over
+observed variables for a parameter-only one (GetParameterObserved), and the
+generated function then reads the unknowns as undefined globals (the V6
+cylinder rig, `2*v_rel` with v_rel observed). A single variable works, and
+so does building the observed function directly.
+"""
 function _valueGetter(problem, @nospecialize(ex))
   local v = Symbolics.unwrap(ex)
   (v isa Real && !(v isa Symbolics.Num)) && return (integrator -> Float64(v))
@@ -76,25 +78,31 @@ function _valueGetter(problem, @nospecialize(ex))
   return integrator -> f(integrator.u, integrator.p, integrator.t)
 end
 
-#= The hysteresis H for a relative tolerance and a solve's time span, as
-   OpenModelica's tolZC = 1e-4 * min(stepSize, tolerance), its output step
-   the span over 500 intervals (its default): an absolute 1e-4 * reltol is
-   1e-7 at the default tolerance, the whole span of the MSL Spice3 examples,
-   and no relation on time switched before their stop time (a pulse source
-   stayed at 0 V). The if-equation relations read it from their parameter
-   (setZCHysteresis! sets it per solve), the whens from the integrator. =#
+"""
+The hysteresis H for a relative tolerance and a solve's time span, as
+OpenModelica's tolZC = 1e-4 * min(stepSize, tolerance), its output step
+the span over 500 intervals (its default): an absolute 1e-4 * reltol is
+1e-7 at the default tolerance, the whole span of the MSL Spice3 examples,
+and no relation on time switched before their stop time (a pulse source
+stayed at 0 V). The if-equation relations read it from their parameter
+(setZCHysteresis! sets it per solve), the whens from the integrator.
+"""
 _hysteresis(reltol, span::Real = Inf) =
   1.0e-4 * max(min(Float64(first(reltol)), abs(Float64(span)) / 500), 1.0e-12)
 _timeSpan(tspan) = Float64(last(tspan)) - Float64(first(tspan))
 _hysteresisFromTolerance(integrator) = _hysteresis(integrator.opts.reltol, _timeSpan(integrator.sol.prob.tspan))
 
-#= A relation's value by the hysteresis rule, from its buffered value `old`:
-   true when zc <= 0 (true while zc <= eps, becomes true at zc <= -eps). =#
+"""
+A relation's value by the hysteresis rule, from its buffered value `old`:
+true when zc <= 0 (true while zc <= eps, becomes true at zc <= -eps).
+"""
 _hysteresisRule(zc, eps, old::Bool) = old ? zc <= eps : zc <= -eps
 
-#= Sweeps before the event iteration gives up: at least 20, and 3 per
-   relation or when (a chain through algebraic variables takes one per
-   link). =#
+"""
+Sweeps before the event iteration gives up: at least 20, and 3 per
+relation or when (a chain through algebraic variables takes one per
+link).
+"""
 _eventIterationLimit(n::Integer) = max(20, 3 * n)
 
 #= The if-equation relations: their buffers (the ifCond parameters), and
@@ -110,8 +118,10 @@ end
 
 Base.length(r::IfRelations) = length(r.crossing)
 
-#= The relations `entries` = `(ifCond, crossing function, scale)` of
-   `problem`; nothing when there are none or they cannot be read. =#
+"""
+The relations `entries` = `(ifCond, crossing function, scale)` of
+`problem`; nothing when there are none or they cannot be read.
+"""
 function _ifRelations(problem, hSym::Symbol, entries::Vector)
   isempty(entries) && return nothing
   local SII = ModelingToolkit.SymbolicIndexingInterface
@@ -129,7 +139,9 @@ function _ifRelations(problem, hSym::Symbol, entries::Vector)
   end
 end
 
-#= A copy: setting a buffer changes the parameters the getter reads. =#
+"""
+A copy: setting a buffer changes the parameters the getter reads.
+"""
 _bufferValues(buffers, integrator) = Float64[v for v in buffers(integrator)]
 
 function _ruled(r::IfRelations, integrator, k::Int, old::Bool)
@@ -142,8 +154,10 @@ function _inconsistent(r::IfRelations, integrator)
   return any(k -> _ruled(r, integrator, k, values[k] > 0.5) != (values[k] > 0.5), eachindex(values))
 end
 
-#= Phase 1 of a sweep for the if-equation relations: each buffer from the
-   state. Whether one changed. =#
+"""
+Phase 1 of a sweep for the if-equation relations: each buffer from the
+state. Whether one changed.
+"""
 function _update!(r::IfRelations, integrator)
   local changed = false
   for (k, value) in enumerate(_bufferValues(r.buffers, integrator))
@@ -156,17 +170,19 @@ function _update!(r::IfRelations, integrator)
   return changed
 end
 
-#= The if-equation relations switched back and forth in the event iteration:
-   a comparator with positive feedback (MSL SignalGenerator) has its linear
-   branch's solution at the unstable midpoint, where the relation flips back,
-   and the saturated one it left. OpenModelica solves the loop with the live
-   if-expression and lands on the other saturated side. Here the combinations
-   of the literals, the fewest changes first (at most `maxRelations`
-   relations), until one holds at its own solution: the algebraic unknowns
-   solved for it, every relation evaluates to its literal there (with
-   `clear`, beyond its hysteresis band too). Whether one was found; the
-   literals and the state are then that solution's, else as before. A failed
-   solve's return code is put back. =#
+"""
+The if-equation relations switched back and forth in the event iteration:
+a comparator with positive feedback (MSL SignalGenerator) has its linear
+branch's solution at the unstable midpoint, where the relation flips back,
+and the saturated one it left. OpenModelica solves the loop with the live
+if-expression and lands on the other saturated side. Here the combinations
+of the literals, the fewest changes first (at most `maxRelations`
+relations), until one holds at its own solution: the algebraic unknowns
+solved for it, every relation evaluates to its literal there (with
+`clear`, beyond its hysteresis band too). Whether one was found; the
+literals and the state are then that solution's, else as before. A failed
+solve's return code is put back.
+"""
 function _consistentIfRelations!(r::IfRelations, integrator, reinit; maxRelations::Int = 10, clear::Bool = false)
   local base = _bufferValues(r.buffers, integrator)
   local n = length(base)
@@ -235,7 +251,9 @@ function namedValueFunctions(sys, names::Vector{String})
   return [ModelingToolkit.build_explicit_observed_function(sys, byName[n]) for n in names]
 end
 
-#= The system's unknowns, observed variables and parameters by plain name. =#
+"""
+The system's unknowns, observed variables and parameters by plain name.
+"""
 function _variablesByPlainName(sys)::Dict{String, Any}
   local byName = Dict{String, Any}()
   for v in ModelingToolkit.unknowns(sys)
@@ -270,10 +288,12 @@ mutable struct RelationWhenAffect{E, B}
   last::Bool                 # the condition when the whens last fired
 end
 
-#= The value functions for the integrator's system; nothing while it lacks
-   the names (another mode). Resolved once per system (`a.sys`, initially
-   :unresolved); becoming active, the relation starts literal and does not
-   fire (a when true at the start is not an edge). =#
+"""
+The value functions for the integrator's system; nothing while it lacks
+the names (another mode). Resolved once per system (`a.sys`, initially
+:unresolved); becoming active, the relation starts literal and does not
+fire (a when true at the start is not an edge).
+"""
 function _whenFunctions(a::RelationWhenAffect, integrator)
   local sys = hasproperty(integrator.f, :sys) ? integrator.f.sys : nothing
   a.sys === sys && return a.fns
@@ -286,9 +306,11 @@ function _whenFunctions(a::RelationWhenAffect, integrator)
   return a.fns
 end
 
-#= `eval` and `body!` are generated code, which a variable-structure model
-   may compile while it runs (after the solve started): call them in the
-   latest world. =#
+"""
+`eval` and `body!` are generated code, which a variable-structure model
+may compile while it runs (after the solve started): call them in the
+latest world.
+"""
 function _whenValues(a::RelationWhenAffect, u, t, integrator)
   local fns = a.fns
   local p = integrator.p
@@ -300,7 +322,9 @@ function _whenLiteral(a::RelationWhenAffect, u, t, integrator)
   return a.strict ? zc < 0 : zc <= 0
 end
 
-#= The relation's value by the hysteresis rule at the integrator's state. =#
+"""
+The relation's value by the hysteresis rule at the integrator's state.
+"""
 function _whenRuled(a::RelationWhenAffect, integrator)
   local (zc, scale) = _whenValues(a, integrator.u, integrator.t, integrator)
   return _hysteresisRule(zc, _hysteresisFromTolerance(integrator) * scale, a.rel)
@@ -311,7 +335,9 @@ function _whenInconsistent(a::RelationWhenAffect, integrator)
   return _whenRuled(a, integrator) != a.rel
 end
 
-#= Phase 1 of a sweep: the buffer from the state. Whether it changed. =#
+"""
+Phase 1 of a sweep: the buffer from the state. Whether it changed.
+"""
 function _whenRelationUpdate!(a::RelationWhenAffect, integrator)
   _whenFunctions(a, integrator) === nothing && return false
   local new = _whenRuled(a, integrator)
@@ -320,8 +346,10 @@ function _whenRelationUpdate!(a::RelationWhenAffect, integrator)
   return true
 end
 
-#= Phase 2: the body, when the condition became true since the whens last
-   fired; `pre` is the state before the sweep's bodies. Whether it fired. =#
+"""
+Phase 2: the body, when the condition became true since the whens last
+fired; `pre` is the state before the sweep's bodies. Whether it fired.
+"""
 function _whenFire!(a::RelationWhenAffect, integrator, pre)
   a.fns === nothing && return false
   local fire = a.rel && !a.last
@@ -428,32 +456,42 @@ struct EventIteration
   instant::Base.RefValue{Tuple{Float64, Int}}
 end
 
-#= Whether a callback changed the state in the step that just ended: a
-   continuous event, or an earlier discrete callback (the integrator's flag,
-   `derivative_discontinuity` since SciMLBase 3, `u_modified` before). =#
+"""
+Whether a callback changed the state in the step that just ended: a
+continuous event, or an earlier discrete callback (the integrator's flag,
+`derivative_discontinuity` since SciMLBase 3, `u_modified` before).
+"""
 _changedThisStep(integrator) =
   _continuousEventFired(integrator) ||
   (hasproperty(integrator, :derivative_discontinuity) && integrator.derivative_discontinuity) ||
   (hasproperty(integrator, :u_modified) && integrator.u_modified)
 
-#= Whether the when fires; where it does not, its change()/edge() memory
-   takes the values. =#
+"""
+Whether the when fires; where it does not, its change()/edge() memory
+takes the values.
+"""
 _holds(d::DiscreteWhenAffect, integrator) = d.condition(integrator.u, integrator.t, integrator)
 
-#= Within a sweep: the change()/edge() memory stays (the condition's
-   `_follow` false). It follows the values once the iteration settles. =#
+"""
+Within a sweep: the change()/edge() memory stays (the condition's
+`_follow` false). It follows the values once the iteration settles.
+"""
 _holdsInSweep(d::DiscreteWhenAffect, integrator) = d.condition(integrator.u, integrator.t, integrator, false)
 
 _follow!(d::DiscreteWhenAffect, integrator) = (_holds(d, integrator); nothing)
 
-#= Whether a continuous callback fired in the step that just ended: the
-   integrators of OrdinaryDiffEqCore and Sundials record it in
-   `event_last_time` (0 when none) before they run the discrete callbacks. =#
+"""
+Whether a continuous callback fired in the step that just ended: the
+integrators of OrdinaryDiffEqCore and Sundials record it in
+`event_last_time` (0 when none) before they run the discrete callbacks.
+"""
 _continuousEventFired(integrator) =
   hasproperty(integrator, :event_last_time) && integrator.event_last_time != 0
 
-#= After a step: whether a continuous event fired, a relation disagrees with
-   the state, or a discrete when's condition holds. =#
+"""
+After a step: whether a continuous event fired, a relation disagrees with
+the state, or a discrete when's condition holds.
+"""
 function _needsIteration(e::EventIteration, integrator)
   _continuousEventFired(integrator) && return true
   e.ifRelations !== nothing && _inconsistent(e.ifRelations, integrator) && return true
@@ -514,9 +552,11 @@ function noteReinit!(integrator, k::Int)
   return nothing
 end
 
-#= The states a reinit() wrote at this instant after the first `since` (a
-   sweep hides those of the instant until it began: a reinit() in its own
-   bodies is seen in the next sweep). =#
+"""
+The states a reinit() wrote at this instant after the first `since` (a
+sweep hides those of the instant until it began: a reinit() in its own
+bodies is seen in the next sweep).
+"""
 function _reinitializedSince(integrator, since::Int)::Vector{Int}
   ismutable(integrator) || return Int[]
   local h = get(_INSTANT_PRE, integrator, nothing)
@@ -527,8 +567,10 @@ end
 _reinitializedCount(integrator) =
   ismutable(integrator) ? (local h = get(_INSTANT_PRE, integrator, nothing); h === nothing ? 0 : length(h.reinitialized)) : 0
 
-#= `f()` with the states `hidden` at their values in `pre` (the reinitialized
-   ones in the first sweep), put back after. =#
+"""
+`f()` with the states `hidden` at their values in `pre` (the reinitialized
+ones in the first sweep), put back after.
+"""
 function _hidingReinit(f, integrator, pre, hidden::Vector{Int})
   isempty(hidden) && return f()
   local now = integrator.u[hidden]
@@ -547,9 +589,11 @@ function _endInstant!(integrator)
   return nothing
 end
 
-#= Phases 1 and 2 of a sweep (see the top of the file); the first of an
-   instant reads pre() from the state before it (instantPre). Whether
-   anything changed. =#
+"""
+Phases 1 and 2 of a sweep (see the top of the file); the first of an
+instant reads pre() from the state before it (instantPre). Whether
+anything changed.
+"""
 function _sweep!(e::EventIteration, integrator, firstSweep::Bool)
   local pre = firstSweep ? instantPre(integrator) : copy(integrator.u)
   local relPre = [copy(c.rel) for c in e.clusters]
@@ -613,10 +657,12 @@ function _sweep!(e::EventIteration, integrator, firstSweep::Bool)
   return changed
 end
 
-#= The algebraic unknowns solved again within a sweep, for the bodies that
-   read them next. A failure is not the event's (phase 3 solves again): the
-   return code is put back, or its InitialFailure made every later solve
-   report failure. =#
+"""
+The algebraic unknowns solved again within a sweep, for the bodies that
+read them next. A failure is not the event's (phase 3 solves again): the
+return code is put back, or its InitialFailure made every later solve
+report failure.
+"""
 function _staleResolve!(integrator, reinit)
   local retcode = integrator.sol.retcode
   _resolveAlgebraics!(integrator, reinit) && return true
@@ -633,9 +679,11 @@ end
    fixed 1e-6 s, so 1e-6 of the time span instead (as its DAE problems
    start), if smaller than the current step. Not for a DAE problem: DFBDF
    restarted from a smaller step ended in NaN (DAEIfReinit). =#
-#= OrdinaryDiffEq's initial step estimate after an event (auto_dt_reset!). It reads the next
-   tstop: at an event on the last one there is none left (MSL 4 RobotR3: a BoundsError in
-   first_tstop), and no step to size either. =#
+"""
+OrdinaryDiffEq's initial step estimate after an event (auto_dt_reset!). It reads the next
+tstop: at an event on the last one there is none left (MSL 4 RobotR3: a BoundsError in
+first_tstop), and no step to size either.
+"""
 function _autoDtReset!(integrator)
   local tstops = integrator.opts.tstops
   isempty(tstops) && return nothing
@@ -676,8 +724,10 @@ _markingPending(cb::DiffEqBase.DiscreteCallback, pending::Base.RefValue{Bool}) =
                               cb.save_positions, cb.initializealg, cb.saved_clock_partitions,
                               cb.initialize_save_discretes)
 
-#= `resolve`: another callback fired (_PendingAffect); the algebraic
-   unknowns follow it first, as after a continuous event. =#
+"""
+`resolve`: another callback fired (_PendingAffect); the algebraic
+unknowns follow it first, as after a continuous event.
+"""
 _terminated(integrator) = integrator.sol.retcode == ModelingToolkit.SciMLBase.ReturnCode.Terminated
 
 function _iterate!(e::EventIteration, integrator, resolve::Bool = false)
@@ -754,12 +804,14 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
   return nothing
 end
 
-#= At the start, after the event callbacks' initialize functions set every
-   relation to its literal value at the solved initial state: the discrete
-   clusters set theirs and run their initial bodies. If one changed a
-   discrete, or an if-equation relation differs from the value the
-   initialization used, the algebraic unknowns are solved again (the states
-   kept). =#
+"""
+At the start, after the event callbacks' initialize functions set every
+relation to its literal value at the solved initial state: the discrete
+clusters set theirs and run their initial bodies. If one changed a
+discrete, or an if-equation relation differs from the value the
+initialization used, the algebraic unknowns are solved again (the states
+kept).
+"""
 function _initialize!(e::EventIteration, integrator)
   #= An affect that ran at the start before this (a sample(0, ...) tick:
      PeriodicCallback's initial_affect) recorded the state before it. The
@@ -785,9 +837,11 @@ function _initialize!(e::EventIteration, integrator)
   return nothing
 end
 
-#= The holder's state if an affect recorded it at the start of this solve. A
-   holder of an earlier solve from the same time (reinit!) is not read: it
-   was dropped when that solve's iteration ended, or its time is another. =#
+"""
+The holder's state if an affect recorded it at the start of this solve. A
+holder of an earlier solve from the same time (reinit!) is not read: it
+was dropped when that solve's iteration ended, or its time is another.
+"""
 function _instantStateAtStart(integrator)
   ismutable(integrator) || return nothing
   local h = get(_INSTANT_PRE, integrator, nothing)
@@ -823,9 +877,11 @@ function _startResolve!(e::EventIteration, integrator)
   return false
 end
 
-#= The callbacks that stay, and the whens the iteration takes over: those on
-   a relation and the discrete clusters (their continuous callbacks stay, to
-   locate the events) and those on a discrete condition (their callbacks go). =#
+"""
+The callbacks that stay, and the whens the iteration takes over: those on
+a relation and the discrete clusters (their continuous callbacks stay, to
+locate the events) and those on a discrete condition (their callbacks go).
+"""
 function _splitCallbacks(callbacks)
   local kept = Any[]
   local relationWhens = RelationWhenAffect[]
@@ -846,15 +902,17 @@ function _splitCallbacks(callbacks)
   return (kept, relationWhens, clusters, discreteWhens)
 end
 
-#= A mass-matrix problem with algebraic unknowns and continuous events of its
-   own (MTK's: an if-equation's pure time events, NoInit): the event iteration
-   solves its algebraic unknowns again after such an event too, after the
-   step-end recorder took the left limit (withDelayRecords). Without the
-   iteration nothing did, but the merged continuous callback's re-solve with
-   the integrator's algorithm (DirectRHSGeneration.jl `_mergeableReinit`),
-   inside the callback: there delay() recorded no jump, and where that re-solve
-   is gone, the unknowns kept their old values until the next step's end (a
-   `time > 1.5` branch read by delay() recorded a ramp over the step). =#
+"""
+A mass-matrix problem with algebraic unknowns and continuous events of its
+own (MTK's: an if-equation's pure time events, NoInit): the event iteration
+solves its algebraic unknowns again after such an event too, after the
+step-end recorder took the left limit (withDelayRecords). Without the
+iteration nothing did, but the merged continuous callback's re-solve with
+the integrator's algorithm (DirectRHSGeneration.jl `_mergeableReinit`),
+inside the callback: there delay() recorded no jump, and where that re-solve
+is gone, the unknowns kept their old values until the next step's end (a
+`time > 1.5` branch read by delay() recorded a ramp over the step).
+"""
 function _eventsOnAlgebraicUnknowns(problem)
   isempty(_algebraicRows(problem.f)) && return false
   local own = get(problem.kwargs, :callback, nothing)
@@ -959,17 +1017,21 @@ end
    callback's reinitializealg is fixed when the code is generated. =#
 struct EventReinit <: ModelingToolkit.SciMLBase.DAEInitializationAlgorithm end
 
-#= SciMLBase's fallback takes any algorithm for any integrator,
-   OrdinaryDiffEqCore's any for its own. =#
+"""
+SciMLBase's fallback takes any algorithm for any integrator,
+OrdinaryDiffEqCore's any for its own.
+"""
 DiffEqBase.initialize_dae!(integrator::ModelingToolkit.SciMLBase.DEIntegrator, ::EventReinit) =
   _eventReinit!(integrator)
 DiffEqBase.initialize_dae!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator, ::EventReinit) =
   _eventReinit!(integrator)
 
-#= `alg`: BrownFullBasicInit at its own tolerance, or the table-cluster
-   models' (tableClusterInitAlg); the same fallback for both (the MSL QS
-   IMC_Transformer's switching event at t = 2 stopped at a residual within
-   the solve's abstol but above the table algorithm's 1e-8). =#
+"""
+`alg`: BrownFullBasicInit at its own tolerance, or the table-cluster
+models' (tableClusterInitAlg); the same fallback for both (the MSL QS
+IMC_Transformer's switching event at t = 2 stopped at a residual within
+the solve's abstol but above the table algorithm's 1e-8).
+"""
 function _eventReinit!(integrator, alg = DiffEqBase.BrownFullBasicInit())
   local InitialFailure = ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
   local before = integrator.sol.retcode
@@ -1000,12 +1062,14 @@ function _eventReinit!(integrator, alg = DiffEqBase.BrownFullBasicInit())
   return _restoreRetcode!(integrator, before)
 end
 
-#= Whether every algebraic row's residual at u is within the solve's abstol
-   plus its round-off floor, 1e3 eps times the size of its terms
-   (sum_j |J_ij u_j|, from the problem's Jacobian; false without one). A
-   switched ideal element's rows carry terms of 1e11 (the MSL QS
-   IMC_Transformer's commuting switch: s = -9.1e5 against Goff = 1e-5), and
-   their residual stays near 1e-5 whatever the solver does. =#
+"""
+Whether every algebraic row's residual at u is within the solve's abstol
+plus its round-off floor, 1e3 eps times the size of its terms
+(sum_j |J_ij u_j|, from the problem's Jacobian; false without one). A
+switched ideal element's rows carry terms of 1e11 (the MSL QS
+IMC_Transformer's commuting switch: s = -9.1e5 against Goff = 1e-5), and
+their residual stays near 1e-5 whatever the solver does.
+"""
 function _atRoundoffFloor(integrator, u)
   local f = integrator.f
   (hasproperty(f, :jac) && f.jac !== nothing && hasproperty(f, :jac_prototype) && f.jac_prototype !== nothing) ||
@@ -1026,14 +1090,16 @@ function _atRoundoffFloor(integrator, u)
   return all(k -> abs(r[k]) <= abstol + 1.0e3 * eps(Float64) * scale[k], rows)
 end
 
-#= Whether one more Newton correction of the algebraic unknowns at u (the
-   differential ones kept) is within the solve's tolerance: in the solver's
-   error norm (algebraicStepControl.jl `_scaledNorm`, 1 is the tolerance), the
-   norm the integrator's own Newton iteration converges in. A Jacobian too
-   ill-conditioned for the re-solve's 1e-10 can leave the unknowns there all
-   the same: MSL DifferenceAmplifier at its ramp's end, the transistors'
-   der(vbc) at 1e9 (condition 7e26), the residual stalls at 1e-4 with a
-   correction of 0.08 (RMS, as the integrator's norm; 0.22 at most). =#
+"""
+Whether one more Newton correction of the algebraic unknowns at u (the
+differential ones kept) is within the solve's tolerance: in the solver's
+error norm (algebraicStepControl.jl `_scaledNorm`, 1 is the tolerance), the
+norm the integrator's own Newton iteration converges in. A Jacobian too
+ill-conditioned for the re-solve's 1e-10 can leave the unknowns there all
+the same: MSL DifferenceAmplifier at its ramp's end, the transistors'
+der(vbc) at 1e9 (condition 7e26), the residual stalls at 1e-4 with a
+correction of 0.08 (RMS, as the integrator's norm; 0.22 at most).
+"""
 function _withinSolveTolerance(integrator, u)
   local f = integrator.f
   local rows = _algebraicRows(f)
@@ -1048,11 +1114,15 @@ function _withinSolveTolerance(integrator, u)
   return _scaledNorm(rows, integrator, w.correction, u) <= 1
 end
 
-#= The solve's absolute tolerance, the smallest of a per-component one. =#
+"""
+The solve's absolute tolerance, the smallest of a per-component one.
+"""
 _solveAbstol(integrator) = (local a = integrator.opts.abstol; a isa Number ? a : minimum(a))
 
-#= The largest residual of the algebraic equations of a mass-matrix ODE at
-   u (Inf for other problems). =#
+"""
+The largest residual of the algebraic equations of a mass-matrix ODE at
+u (Inf for other problems).
+"""
 function _maxAlgebraicResidual(integrator, u)
   local f = integrator.f
   local rows = _algebraicRows(f)
@@ -1062,10 +1132,12 @@ function _maxAlgebraicResidual(integrator, u)
   return maximum(k -> abs(r[k]), rows)
 end
 
-#= Solve the algebraic unknowns again with `alg` (nothing: EventReinit),
-   the differential states kept (a pure ODE has none). A DAEFunction (DFBDF,
-   IDA) has no mass matrix; its algebraic variables are the ones
-   `differential_vars` excludes. Whether it succeeded. =#
+"""
+Solve the algebraic unknowns again with `alg` (nothing: EventReinit),
+the differential states kept (a pure ODE has none). A DAEFunction (DFBDF,
+IDA) has no mass matrix; its algebraic variables are the ones
+`differential_vars` excludes. Whether it succeeded.
+"""
 function _resolveAlgebraics!(integrator, alg = nothing)
   local f = integrator.f
   if hasproperty(f, :mass_matrix)
@@ -1098,10 +1170,12 @@ function setZCHysteresis!(problem, hSym::Symbol, reltol)
   return problem
 end
 
-#= Callbacks that change parameters at initialization (the literal relation
-   values) make the integrator save t0 twice; interpolating at t0 then uses
-   the zero-length interval and returns NaN. The solution starts with the
-   post-initialization values, as a Modelica result does. =#
+"""
+Callbacks that change parameters at initialization (the literal relation
+values) make the integrator save t0 twice; interpolating at t0 then uses
+the zero-length interval and returns NaN. The solution starts with the
+post-initialization values, as a Modelica result does.
+"""
 function dropPreInitializationPoint!(sol)
   (length(sol.t) >= 2 && sol.t[1] == sol.t[2]) || return sol
   local n = length(sol.t)

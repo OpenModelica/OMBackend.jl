@@ -63,7 +63,9 @@ function precedence(e::Exp)::Int
   return 10
 end
 
-#= An operand, parenthesized where it binds less tightly than `p` (or as tightly, `strict`). =#
+"""
+An operand, parenthesized where it binds less tightly than `p` (or as tightly, `strict`).
+"""
 function _printOperand(io::IO, e::Exp, p::Int; strict::Bool = false)
   local q = precedence(e)
   local paren = q < p || (strict && q == p)

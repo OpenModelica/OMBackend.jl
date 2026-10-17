@@ -51,7 +51,9 @@ left limit); for a variable delay time, the delayed jump's event is at the jump'
 time at the jump.
 =#
 
-#= A delay() call as OMFrontend passes it on: OpenModelica.Internal.delay2/delay3 (or a bare delay). =#
+"""
+A delay() call as OMFrontend passes it on: OpenModelica.Internal.delay2/delay3 (or a bare delay).
+"""
 _isDelayCall(e::SC.Exp)::Bool = e isa SC.CALL && e.name in (:OpenModelica_Internal_delay2, :OpenModelica_Internal_delay3, :delay)
 
 mutable struct DelayHistory
@@ -88,8 +90,10 @@ function clearDelayHistories!()
   return nothing
 end
 
-#= The value at s = t - delayTime, as a left limit or (`right`) a right limit on a recorded jump; `x` is
-   the argument's value at the present time t. =#
+"""
+The value at s = t - delayTime, as a left limit or (`right`) a right limit on a recorded jump; `x` is
+the argument's value at the present time t.
+"""
 function _delayedValue(h::DelayHistory, s::Float64, right::Bool, t::Float64, x::Float64)
   local n = length(h.t)
   s <= h.t[1] && return h.v[1]
@@ -135,9 +139,11 @@ delayLookup(model::Symbol, k::Integer, t, delayTime, x) =
   hasSymbolicArgs(t, delayTime, x) ? makeSymbolicTerm(DelayedValueFn(model, k), Any[t, delayTime, x]) :
                                      DelayedValueFn(model, k)(t, delayTime, x)
 
-#= The delayed jumps' time events: a discrete callback at each due time, among the other callbacks, so
-   the event iteration (withRelationRefresh) runs after it; from its affect until the recorder after the
-   event, the delayed values are right limits. Due times already passed are dropped. =#
+"""
+The delayed jumps' time events: a discrete callback at each due time, among the other callbacks, so
+the event iteration (withRelationRefresh) runs after it; from its affect until the recorder after the
+event, the delayed values are right limits. Due times already passed are dropped.
+"""
 function withDelayEvents(callbacks, model::Symbol)
   local due = function (u, t, integrator)
     local tol = 1e-12 * max(1.0, abs(t))

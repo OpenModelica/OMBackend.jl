@@ -40,11 +40,13 @@
 #= Equation-form affects                                                                =#
 #= ==================================================================================== =#
 
-#= An operand inside an event affect. `pre(x)` becomes `ModelingToolkit.Pre(x)`, the
-   pre-event value, so an affect that reads a discrete's own previous value (`mode = …
-   pre(mode) …`) is solvable; a bare reference would make the written variable appear on its
-   own right side and MTK raises UnsolvableCallbackError. Continuous operands read their
-   current value. =#
+"""
+An operand inside an event affect. `pre(x)` becomes `ModelingToolkit.Pre(x)`, the
+pre-event value, so an affect that reads a discrete's own previous value (`mode = …
+pre(mode) …`) is solvable; a bare reference would make the written variable appear on its
+own right side and MTK raises UnsolvableCallbackError. Continuous operands read their
+current value.
+"""
 function _affectExpToReal(e::SC.Exp, simCode::SC.SIM_CODE)
   e isa SC.PRE && return :(ModelingToolkit.Pre($(expToJuliaExpMTK(SC.EXP_CREF(e.cref, e.ty), simCode))))
   SC.isBuiltin(e, :pre) && return :(ModelingToolkit.Pre($(expToJuliaExpMTK(first(e.args), simCode))))
@@ -53,10 +55,12 @@ function _affectExpToReal(e::SC.Exp, simCode::SC.SIM_CODE)
   return expToJuliaExpMTK(e, simCode)
 end
 
-#= A Boolean expression as an MTK Real (0.0/1.0): each relation `ifelse(rel, 1.0, 0.0)`, so
-   and/or/not stay arithmetic on Reals (a bare relation is a Julia Bool, and `Bool + Bool` an
-   Int64, illegal in the Boolean context the affect feeds). pre() and discretes are 0/1 Reals
-   already. =#
+"""
+A Boolean expression as an MTK Real (0.0/1.0): each relation `ifelse(rel, 1.0, 0.0)`, so
+and/or/not stay arithmetic on Reals (a bare relation is a Julia Bool, and `Bool + Bool` an
+Int64, illegal in the Boolean context the affect feeds). pre() and discretes are 0/1 Reals
+already.
+"""
 function _boolToReal(e::SC.Exp, simCode::SC.SIM_CODE)
   e isa SC.BCONST && return e.value ? :(1.0) : :(0.0)
   if e isa SC.RELATION
@@ -77,9 +81,11 @@ function _boolToReal(e::SC.Exp, simCode::SC.SIM_CODE)
   return expToJuliaExpMTK(e, simCode)
 end
 
-#= An Integer or enumeration discrete's right side as an MTK Real of its value (not a 0/1
-   Boolean): the conditions through the Boolean lowering, the branches their values, so a
-   five-valued FSM (PartialFriction's `mode`) is kept instead of clamped. =#
+"""
+An Integer or enumeration discrete's right side as an MTK Real of its value (not a 0/1
+Boolean): the conditions through the Boolean lowering, the branches their values, so a
+five-valued FSM (PartialFriction's `mode`) is kept instead of clamped.
+"""
 function _discreteIntToReal(e::SC.Exp, simCode::SC.SIM_CODE)
   e isa Union{SC.ICONST, SC.RCONST} && return Float64(e.value)
   e isa SC.BCONST && return e.value ? 1.0 : 0.0
@@ -93,47 +99,57 @@ function _discreteIntToReal(e::SC.Exp, simCode::SC.SIM_CODE)
   return expToJuliaExpMTK(e, simCode)
 end
 
-#= One affect equation `disc ~ <value>` for a lifted discrete: the triggering relations
-   pinned to their post-crossing values (`pins`, a zero-set group, see _zeroSetPins).
-   Integer/enum discretes keep their multi-valued result; Boolean discretes are 0/1-clamped. =#
+"""
+One affect equation `disc ~ <value>` for a lifted discrete: the triggering relations
+pinned to their post-crossing values (`pins`, a zero-set group, see _zeroSetPins).
+Integer/enum discretes keep their multi-valued result; Boolean discretes are 0/1-clamped.
+"""
 function _discreteAffectEq(discSym::Symbol, rhs::SC.Exp, pins::Dict{SC.Exp, Bool}, isInt::Bool, simCode::SC.SIM_CODE)::Expr
   local pinned = _substRelations(rhs, pins)
   isInt && return :($(discSym) ~ $(_discreteIntToReal(pinned, simCode)))
   return :($(discSym) ~ ModelingToolkit.ifelse(0.5 < $(_boolToReal(pinned, simCode)), 1.0, 0.0))
 end
 
-#= The initialize affect for a lifted discrete: the FULL right side at t0 (no relation pinned).
-   A `time >= startTime` relation is already satisfied at t0, so no zero crossing fires
-   there; without this the discrete is stuck at its default start value. The `initial()` term
-   of the §17.4.4 condition. =#
+"""
+The initialize affect for a lifted discrete: the FULL right side at t0 (no relation pinned).
+A `time >= startTime` relation is already satisfied at t0, so no zero crossing fires
+there; without this the discrete is stuck at its default start value. The `initial()` term
+of the §17.4.4 condition.
+"""
 function _discreteAffectEqInit(discSym::Symbol, rhs::SC.Exp, isInt::Bool, simCode::SC.SIM_CODE)::Expr
   isInt && return :($(discSym) ~ $(_discreteIntToReal(rhs, simCode)))
   return :($(discSym) ~ ModelingToolkit.ifelse(0.5 < $(_boolToReal(rhs, simCode)), 1.0, 0.0))
 end
 
-#= The discrete-cluster path (discreteClusters.jl): the whens over relations of coupled
-   discretes are evaluated by the event iteration (MLS 8.6) instead of MTK affects, which have
-   no event iteration: a pulse's sample event, the whens it enables and the algebraic re-solve
-   then happen in one event. The path for every model; OMBACKEND_DISCRETE_PRE_MEMORY=false
-   keeps the MTK affects for the models without mode FSMs, table or switch clusters (the
-   variable keeps its name from the pre-memory affects this replaced). =#
+"""
+The discrete-cluster path (discreteClusters.jl): the whens over relations of coupled
+discretes are evaluated by the event iteration (MLS 8.6) instead of MTK affects, which have
+no event iteration: a pulse's sample event, the whens it enables and the algebraic re-solve
+then happen in one event. The path for every model; OMBACKEND_DISCRETE_PRE_MEMORY=false
+keeps the MTK affects for the models without mode FSMs, table or switch clusters (the
+variable keeps its name from the pre-memory affects this replaced).
+"""
 _discreteClustersForced()::Bool = OMBackend.envSwitch("OMBACKEND_DISCRETE_PRE_MEMORY")
 
-#= Whether an expression reads a constant table by a subscript (an ASUB). Such clusters are
-   Newton-hostile: equation-form affects compile to an implicit solve whose residuals are
-   piecewise constant. =#
+"""
+Whether an expression reads a constant table by a subscript (an ASUB). Such clusters are
+Newton-hostile: equation-form affects compile to an implicit solve whose residuals are
+piecewise constant.
+"""
 function _expHasTableLookup(e::SC.Exp)::Bool
   e isa SC.ASUB && return true
   e isa Union{SC.BINARY, SC.LBINARY, SC.RELATION, SC.UNARY, SC.LUNARY, SC.CAST, SC.IFEXP, SC.CALL} || return false
   return any(_expHasTableLookup, SC.children(e))
 end
 
-#= True if the model has lifted discrete-Boolean when clusters AND its residuals read
-   constant tables. The affect system MTK builds for an equation-form affect pulls in the
-   surrounding algebraic equations, so the model-level residual content decides
-   Newton-hostility, not the cluster bodies. Selects the imperative affect lowering and the
-   Newton-FD event re-initialization. A cluster without relations (it follows pre() values)
-   closes no loop through a table. =#
+"""
+True if the model has lifted discrete-Boolean when clusters AND its residuals read
+constant tables. The affect system MTK builds for an equation-form affect pulls in the
+surrounding algebraic equations, so the model-level residual content decides
+Newton-hostility, not the cluster bodies. Selects the imperative affect lowering and the
+Newton-FD event re-initialization. A cluster without relations (it follows pre() values)
+closes no loop through a table.
+"""
 function _modelHasTableClusters(simCode::SC.SIM_CODE)::Bool
   local hasCluster = any(simCode.whenEquations) do weq
     local rels = _extractChangeRelations(weq.whenEquation.condition, simCode)
@@ -142,8 +158,10 @@ function _modelHasTableClusters(simCode::SC.SIM_CODE)::Bool
   return hasCluster && any(eq -> _expHasTableLookup(eq.exp), simCode.residualEquations)
 end
 
-#= Unwrap nested block Exprs (and their annotation LineNumberNodes) down to the core
-   expression. =#
+"""
+Unwrap nested block Exprs (and their annotation LineNumberNodes) down to the core
+expression.
+"""
 function _unwrapBlockExpr(@nospecialize(e))
   while e isa Expr && e.head == :block
     local args = [a for a in e.args if !(a isa LineNumberNode)]
@@ -153,24 +171,30 @@ function _unwrapBlockExpr(@nospecialize(e))
   return e
 end
 
-#= The name a pre() reads: of `pre(x)`, x; nothing for another expression. =#
+"""
+The name a pre() reads: of `pre(x)`, x; nothing for another expression.
+"""
 function _preReadName(e::SC.Exp)::Union{Nothing, String}
   e isa SC.PRE && return SC.crefName(e.cref)
   (SC.isBuiltin(e, :pre) && first(e.args) isa SC.EXP_CREF) && return SC.crefName(first(e.args).cref)
   return nothing
 end
 
-#= Whether an expression reads pre() of a name in `names`. =#
+"""
+Whether an expression reads pre() of a name in `names`.
+"""
 _expHasPreOf(e::SC.Exp, names::Set{String})::Bool =
   SC.anyExp(x -> (local n = _preReadName(x); n !== nothing && n in names), e)
 
 _isIntegerOrEnumeration(v::SC.SIMVAR)::Bool = v.elementType isa Union{SC.TYPE_INTEGER, SC.TYPE_ENUM}
 
-#= True if a lifted cluster assigns an Integer/enum discrete (a mode variable) whose right side
-   reads pre() of a discrete assigned in the same cluster. Such bodies are sequential FSM
-   transitions; the equation-form affect solves them simultaneously, which mis-latches. Scoped
-   to the mode-carrying shape; Boolean-only self-pre clusters (freewheel logic) stay on the
-   plain path, which iterates them to a fixpoint within the event (_eventIterAffectParts). =#
+"""
+True if a lifted cluster assigns an Integer/enum discrete (a mode variable) whose right side
+reads pre() of a discrete assigned in the same cluster. Such bodies are sequential FSM
+transitions; the equation-form affect solves them simultaneously, which mis-latches. Scoped
+to the mode-carrying shape; Boolean-only self-pre clusters (freewheel logic) stay on the
+plain path, which iterates them to a fixpoint within the event (_eventIterAffectParts).
+"""
 function _modelHasModeFSMClusters(simCode::SC.SIM_CODE)::Bool
   for weq in simCode.whenEquations
     _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
@@ -189,15 +213,19 @@ function _modelHasModeFSMClusters(simCode::SC.SIM_CODE)::Bool
   return false
 end
 
-#= Newton with an FD Jacobian degenerates to the Gauss-Jacobi sweep that piecewise-constant
-   algebraic rows need; Broyden's secant update diverges on them. The event re-init default
-   for table-cluster models. =#
+"""
+Newton with an FD Jacobian degenerates to the Gauss-Jacobi sweep that piecewise-constant
+algebraic rows need; Broyden's secant update diverges on them. The event re-init default
+for table-cluster models.
+"""
 function tableClusterInitAlg()
   return DiffEqBase.BrownFullBasicInit(1e-8, NonlinearSolve.NewtonRaphson(; autodiff = ADTypes.AutoFiniteDiff()))
 end
 
-#= The discrete unknowns of Integer, Boolean or enumeration type, whose values must stay
-   integral (withIntegralDiscretes). =#
+"""
+The discrete unknowns of Integer, Boolean or enumeration type, whose values must stay
+integral (withIntegralDiscretes).
+"""
 function integralDiscreteNames(discreteSyms::AbstractVector, simCode::SC.SIM_CODE)::Vector{String}
   local out = String[]
   for s in discreteSyms
@@ -208,8 +236,10 @@ function integralDiscreteNames(discreteSyms::AbstractVector, simCode::SC.SIM_COD
   return out
 end
 
-#= Whether `name` is a Boolean discrete (pre(name) read from the Float memory must become a
-   Bool before use in an and/or/not context). =#
+"""
+Whether `name` is a Boolean discrete (pre(name) read from the Float memory must become a
+Bool before use in an and/or/not context).
+"""
 function _isBoolDiscreteName(name::String, simCode::SC.SIM_CODE)::Bool
   local entry = get(simCode.stringToSimVarHT, name, nothing)
   return entry !== nothing && last(entry).elementType isa SC.TYPE_BOOL
@@ -239,13 +269,17 @@ const LoweringFailure = Union{UnsupportedLowering, _UnsupportedInAffect}
    would emit an undefined Julia function for them. =#
 const _AFFECT_UNSUPPORTED_BUILTINS = (:sample, :terminal, :delay, :der, :reinit, :cardinality)
 
-#= The pinned value of a relation inside an affect body (a Bool, or an expression that reads
-   it, a discrete cluster's buffer), or nothing. =#
+"""
+The pinned value of a relation inside an affect body (a Bool, or an expression that reads
+it, a discrete cluster's buffer), or nothing.
+"""
 _relPinValue(e::SC.Exp, relPins::AbstractDict{SC.Exp}) = (!isempty(relPins) && e isa SC.RELATION) ? get(relPins, e, nothing) : nothing
 
-#= For edge()/change() of a relation, or of a Boolean defined by one, whose values `relPins`
-   and values before the pass `relPre` are given (a discrete cluster): the two expressions.
-   Otherwise nothing. =#
+"""
+For edge()/change() of a relation, or of a Boolean defined by one, whose values `relPins`
+and values before the pass `relPre` are given (a discrete cluster): the two expressions.
+Otherwise nothing.
+"""
 function _relationAndPre(v::SC.Exp, relPins::AbstractDict{SC.Exp}, relPre::Union{Nothing, AbstractDict{SC.Exp}},
                          simCode::SC.SIM_CODE)
   relPre === nothing && return nothing
@@ -373,13 +407,15 @@ function _affectValue(e::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_C
   throw(_UnsupportedInAffect(e))
 end
 
-#= A call in an affect body: the event operators edge() and change() Boolean, initial() its
-   value, the others refused (they mean nothing there); the index helpers of Digital's gate
-   residuals (the lookup rounds its index: floor/integer only evaluate the inner value) and the
-   numeric functions as Julia's; noEvent() and smooth() semantic no-ops; String Modelica's
-   (Julia's String has no such method: an assert message, MSL Media); another function by its
-   name (an external one: CombiTimeTable's getNextTimeEvent), its arguments read like the
-   others. =#
+"""
+A call in an affect body: the event operators edge() and change() Boolean, initial() its
+value, the others refused (they mean nothing there); the index helpers of Digital's gate
+residuals (the lookup rounds its index: floor/integer only evaluate the inner value) and the
+numeric functions as Julia's; noEvent() and smooth() semantic no-ops; String Modelica's
+(Julia's String has no such method: an assert message, MSL Media); another function by its
+name (an external one: CombiTimeTable's getNextTimeEvent), its arguments read like the
+others.
+"""
 function _affectCall(e::SC.CALL, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE, rec::R, recb::B,
                      initVal::Union{Bool, Symbol}) where {R, B}
   _isDelayCall(e) && throw(_UnsupportedInAffect(e))
@@ -402,25 +438,31 @@ function _affectCall(e::SC.CALL, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_C
   return Expr(:call, name, map(rec, e.args)...)
 end
 
-#= True if some member's right side reads pre() of a cluster member, so one pass of the body
-   can leave pre(x) <> x (see _eventIterAffectParts). =#
+"""
+True if some member's right side reads pre() of a cluster member, so one pass of the body
+can leave pre(x) <> x (see _eventIterAffectParts).
+"""
 function _clusterReadsOwnPre(assigns::Vector{Tuple{Symbol, SC.Exp, Bool}})::Bool
   local members = Set{String}(string(d) for (d, _, _) in assigns)
   return any(rhs -> _expHasPreOf(rhs, members), (rhs for (_, rhs, _) in assigns))
 end
 
-#= True for the condition of a when synthesized from discrete equations: an or-chain of
-   `change(<relation>)`. User whens (`when change(b)`, `when x > 0`) run their body once per
-   event and must not be iterated. =#
+"""
+True for the condition of a when synthesized from discrete equations: an or-chain of
+`change(<relation>)`. User whens (`when change(b)`, `when x > 0`) run their body once per
+event and must not be iterated.
+"""
 function _isSynthesizedChangeCondition(cond::SC.Exp)::Bool
   SC.isBuiltin(cond, :change) && return first(cond.args) isa SC.RELATION || _isChangeOfPre(cond)
   (cond isa SC.LBINARY && cond.op === SC.OP_OR) && return _isSynthesizedChangeCondition(cond.exp1) && _isSynthesizedChangeCondition(cond.exp2)
   return false
 end
 
-#= Whether the ImperativeAffect can be generated for this cluster: every right side lowers
-   into its body. Otherwise the cluster keeps the equation-form affects, which lower more
-   expression kinds. =#
+"""
+Whether the ImperativeAffect can be generated for this cluster: every right side lowers
+into its body. Otherwise the cluster keeps the equation-form affects, which lower more
+expression kinds.
+"""
 function _eventIterLowerable(assigns::Vector{Tuple{Symbol, SC.Exp, Bool}}, simCode::SC.SIM_CODE)::Bool
   try
     _eventIterAffectParts(assigns, simCode)
@@ -435,15 +477,17 @@ end
 #= Upper bound on the passes of one event iteration. =#
 const _EVENT_ITERATION_MAX_PASSES = 20
 
-#= The ImperativeAffect for a plain-path cluster that reads its own pre() values: Modelica's
-   event iteration (§8.6). Each pass evaluates the body in order with pre(x) = x after the
-   previous pass (x at the event for the first pass) and member references = their latest
-   value, until a pass changes nothing. The pinned relations stay pinned; the other operands
-   are read once, at the event. An equation-form affect is one pass: in the OneWayClutch the
-   crossing to w_rel <= 0 sets stuck, but `locked = pre(stuck) and not startForward` needs the
-   second pass, so without it the freewheel never locks. `iterate = false`: one pass (a
-   cluster that does not read its own pre()). `initVal`: the value of initial() (true in the
-   t0 pass). =#
+"""
+The ImperativeAffect for a plain-path cluster that reads its own pre() values: Modelica's
+event iteration (§8.6). Each pass evaluates the body in order with pre(x) = x after the
+previous pass (x at the event for the first pass) and member references = their latest
+value, until a pass changes nothing. The pinned relations stay pinned; the other operands
+are read once, at the event. An equation-form affect is one pass: in the OneWayClutch the
+crossing to w_rel <= 0 sets stuck, but `locked = pre(stuck) and not startForward` needs the
+second pass, so without it the freewheel never locks. `iterate = false`: one pass (a
+cluster that does not read its own pre()). `initVal`: the value of initial() (true in the
+t0 pass).
+"""
 function _eventIterAffectParts(assigns::Vector{Tuple{Symbol, SC.Exp, Bool}}, simCode::SC.SIM_CODE;
                                relPins::Dict{SC.Exp, Bool} = _EMPTY_REL_PINS, initVal::Bool = false, iterate::Bool = true)
   local obsAcc = Dict{Symbol, Symbol}()
@@ -499,7 +543,9 @@ function _eventIterAffectParts(assigns::Vector{Tuple{Symbol, SC.Exp, Bool}}, sim
   return (fexpr, obsNT, modNT)
 end
 
-#= _eventIterAffectParts as an ImperativeAffect expression. =#
+"""
+_eventIterAffectParts as an ImperativeAffect expression.
+"""
 function _imperativeClusterAffect(assigns::Vector{Tuple{Symbol, SC.Exp, Bool}}, simCode::SC.SIM_CODE; kwargs...)::Expr
   local (fn, obs, mod) = _eventIterAffectParts(assigns, simCode; kwargs...)
   return :(ModelingToolkit.ImperativeAffect($(fn), $(mod); observed = $(obs), skip_checks = true))
@@ -509,9 +555,11 @@ end
 #= Module-level declarations of the generated model                                    =#
 #= ==================================================================================== =#
 
-#= A discrete's start attribute as a number: a literal, an enumeration literal (its index), or
-   a parameter's folded binding (the MSL thyristor bridges' off(start = offStart_p1)). Nothing
-   without a start or when it does not evaluate. =#
+"""
+A discrete's start attribute as a number: a literal, an enumeration literal (its index), or
+a parameter's folded binding (the MSL thyristor bridges' off(start = offStart_p1)). Nothing
+without a start or when it does not evaluate.
+"""
 function _discreteStartValue(sv::SC.SIMVAR, simCode::SC.SIM_CODE)::Union{Float64, Nothing}
   local start = sv.attributes.start
   start === nothing && return nothing
@@ -544,10 +592,12 @@ function liftedDiscreteNames(simCode::SC.SIM_CODE)::Vector{String}
   return names
 end
 
-#= Module-level list of the discretes the discrete clusters assign (emitDiscreteClusters): the
-   direct-RHS initialization leaves them to the clusters' start bodies; with their start values
-   and those of the other discretes (what pre() reads at the initialization, MLS 8.6), for the
-   initial fixpoint of the clusters. Empty when the model does not take that path. =#
+"""
+Module-level list of the discretes the discrete clusters assign (emitDiscreteClusters): the
+direct-RHS initialization leaves them to the clusters' start bodies; with their start values
+and those of the other discretes (what pre() reads at the initialization, MLS 8.6), for the
+initial fixpoint of the clusters. Empty when the model does not take that path.
+"""
 function liftedDiscretesDecl(simCode::SC.SIM_CODE)::Expr
   _usesDiscreteClusters(simCode) || return Expr(:block)
   local names = liftedDiscreteNames(simCode)
@@ -564,17 +614,19 @@ function liftedDiscretesDecl(simCode::SC.SIM_CODE)::Expr
   end
 end
 
-#= Module-level list of the Real parameters without a value that the initialization computes
-   (fixed = false, no binding; the MSL InitSpringConstant's spring.c): the direct-RHS
-   initialization solves them next to the states. Names are the MTK parameters'
-   (simVar.name). A parameter alone on the left of an initial equation is assigned by it (at
-   codegen, or by the init solve's assignments, which take the left side), not free: the MSL
-   Mean block's `t0 = time` (as a free unknown it had no determining row, and its zero Jacobian
-   column disabled the scaled Newton step the ideal diodes of DiodeBridge2mPulse need); so are
-   the variables of a tuple equation, each equal to the call's output (MSL Filter's `({r[1],
-   r[2]}, _, _, _) = roots.lowPass(cr, ...)`). Those the initialization assigns are
-   ASSIGNED_PARAMETERS: only these, never a bound or tunable parameter alone on the left (`p =
-   2 * q`: p was overwritten with 2q, and q never solved). =#
+"""
+Module-level list of the Real parameters without a value that the initialization computes
+(fixed = false, no binding; the MSL InitSpringConstant's spring.c): the direct-RHS
+initialization solves them next to the states. Names are the MTK parameters'
+(simVar.name). A parameter alone on the left of an initial equation is assigned by it (at
+codegen, or by the init solve's assignments, which take the left side), not free: the MSL
+Mean block's `t0 = time` (as a free unknown it had no determining row, and its zero Jacobian
+column disabled the scaled Newton step the ideal diodes of DiodeBridge2mPulse need); so are
+the variables of a tuple equation, each equal to the call's output (MSL Filter's `({r[1],
+r[2]}, _, _, _) = roots.lowPass(cr, ...)`). Those the initialization assigns are
+ASSIGNED_PARAMETERS: only these, never a bound or tunable parameter alone on the left (`p =
+2 * q`: p was overwritten with 2q, and q never solved).
+"""
 function freeParametersDecl(simCode::SC.SIM_CODE)::Expr
   local assigned = OrderedSet{String}()
   for ieq in simCode.initialEquations
@@ -603,12 +655,14 @@ function freeParametersDecl(simCode::SC.SIM_CODE)::Expr
   return Expr(:block, decls...)
 end
 
-#= Module-level list of the user's fixed values (USER_PINS): the continuous Real variables
-   with fixed = true (their start, or the default one) and the left sides of initial equations
-   `v = literal or parameter`, named as the MTK unknowns (simVar.name; a relayed variable by
-   its if-equation temporary). Not discretes: fixed = true there is `pre(v) = start` (MLS
-   8.6), which may move at the start. The direct-RHS initialization refuses a result that moved
-   one (buildDirectRHSProblem). Empty when there are none. =#
+"""
+Module-level list of the user's fixed values (USER_PINS): the continuous Real variables
+with fixed = true (their start, or the default one) and the left sides of initial equations
+`v = literal or parameter`, named as the MTK unknowns (simVar.name; a relayed variable by
+its if-equation temporary). Not discretes: fixed = true there is `pre(v) = start` (MLS
+8.6), which may move at the start. The direct-RHS initialization refuses a result that moved
+one (buildDirectRHSProblem). Empty when there are none.
+"""
 function userPinsDecl(simCode::SC.SIM_CODE, relayAliases::AbstractDict)::Expr
   local names = OrderedSet{String}()
   local rename = n -> string(get(relayAliases, Symbol(n), Symbol(n)))
@@ -654,56 +708,68 @@ function userPinsDecl(simCode::SC.SIM_CODE, relayAliases::AbstractDict)::Expr
   return :(USER_PINS = $(sort!(collect(names))))
 end
 
-#= Module-level list of the discrete variables (DISCRETE_VARIABLES): their fixed start is
-   `pre(v) = start` (MLS 8.6), and an initialization equation `v ~ start` beside `v ~ value` (a
-   when initial() body) is no conflict (_collectHardInitializationValues). Empty when there are
-   none. =#
+"""
+Module-level list of the discrete variables (DISCRETE_VARIABLES): their fixed start is
+`pre(v) = start` (MLS 8.6), and an initialization equation `v ~ start` beside `v ~ value` (a
+when initial() body) is no conflict (_collectHardInitializationValues). Empty when there are
+none.
+"""
 function discreteVariablesDecl(simCode::SC.SIM_CODE)::Expr
   local names = sort!([sv.name for (_, (_, sv)) in simCode.stringToSimVarHT if SC.isDiscrete(sv)])
   isempty(names) && return Expr(:block)
   return :(DISCRETE_VARIABLES = $(names))
 end
 
-#= Module-level list of the tunable parameters (TUNABLE_NAMES, withTunableParameters) the model
-   was compiled with, for the runs with other values of them (DirectRHSGeneration's
-   _runEntry). Empty when there are none. =#
+"""
+Module-level list of the tunable parameters (TUNABLE_NAMES, withTunableParameters) the model
+was compiled with, for the runs with other values of them (DirectRHSGeneration's
+_runEntry). Empty when there are none.
+"""
 function tunableParametersDecl()::Expr
   local names = sort!(collect(OMBackend.TUNABLE_PARAMETERS[]))
   isempty(names) && return Expr(:block)
   return :(TUNABLE_NAMES = $(names))
 end
 
-#= Whether a continuous or initialization equation of the model calls homotopy() (where it is
-   the blend, HOMOTOPY_BLEND): it then gets the homotopy parameter (HOMOTOPY_LAMBDA). =#
+"""
+Whether a continuous or initialization equation of the model calls homotopy() (where it is
+the blend, HOMOTOPY_BLEND): it then gets the homotopy parameter (HOMOTOPY_LAMBDA).
+"""
 function _usesHomotopy(simCode::SC.SIM_CODE)::Bool
   local has = e::SC.Exp -> SC.anyExp(x -> SC.isBuiltin(x, :homotopy), e)
   any(eq -> has(eq.exp), simCode.residualEquations) && return true
   return any(ieq -> hasEquationSides(ieq) && any(has, equationSides(ieq)), simCode.initialEquations)
 end
 
-#= Whether the model takes the discrete-cluster path, shared by every site that must agree
-   (emitDiscreteClusters, the MTK events, LIFTED_DISCRETES). =#
+"""
+Whether the model takes the discrete-cluster path, shared by every site that must agree
+(emitDiscreteClusters, the MTK events, LIFTED_DISCRETES).
+"""
 _usesDiscreteClusters(simCode::SC.SIM_CODE)::Bool =
   _discreteClustersForced() || _modelHasTableClusters(simCode) || _modelHasModeFSMClusters(simCode) ||
   _modelHasSwitchClusters(simCode) || _modelHasRelationlessClusters(simCode)
 
-#= True if a lifted cluster has no relation (it follows pre() values): only the event
-   iteration evaluates it, the MTK events have no crossing for it. =#
+"""
+True if a lifted cluster has no relation (it follows pre() values): only the event
+iteration evaluates it, the MTK events have no crossing for it.
+"""
 _modelHasRelationlessClusters(simCode::SC.SIM_CODE)::Bool =
   any(simCode.whenEquations) do w
     local rels = _extractChangeRelations(w.whenEquation.condition, simCode)
     rels !== nothing && isempty(rels)
   end
 
-#= True if a lifted cluster closes an algebraic loop through its own equations, as the MSL's
-   ideal diodes and thyristors: one of its relations reads an algebraic unknown that only
-   equations reading a member, or a value a member selects, determine (s in `off = s < 0`, `v =
-   s*(if off then 1 else Ron)`, `i = s*(if off then Goff else 1)`). After the cluster changes,
-   s and the circuit must be solved again before its relation is read, within the event: the
-   discrete-cluster path's event iteration does that; the equation-form affect's implicit solve
-   fails on the piecewise equations, and at a thyristor's firing the observed relation is read
-   at the crossing itself. A switch with an arc model is not one: its relation reads the
-   circuit's own current and voltage. =#
+"""
+True if a lifted cluster closes an algebraic loop through its own equations, as the MSL's
+ideal diodes and thyristors: one of its relations reads an algebraic unknown that only
+equations reading a member, or a value a member selects, determine (s in `off = s < 0`, `v =
+s*(if off then 1 else Ron)`, `i = s*(if off then Goff else 1)`). After the cluster changes,
+s and the circuit must be solved again before its relation is read, within the event: the
+discrete-cluster path's event iteration does that; the equation-form affect's implicit solve
+fails on the piecewise equations, and at a thyristor's firing the observed relation is read
+at the crossing itself. A switch with an arc model is not one: its relation reads the
+circuit's own current and voltage.
+"""
 function _modelHasSwitchClusters(simCode::SC.SIM_CODE)::Bool
   local ht = simCode.stringToSimVarHT
   local names = (exps...) -> (local ns = OrderedSet{String}(); foreach(e -> SC.crefNames!(ns, e), exps); ns)
@@ -746,12 +812,16 @@ function _modelHasSwitchClusters(simCode::SC.SIM_CODE)::Bool
   return any(op -> op in read && !(op in foreign), keys(own))
 end
 
-#= The discrete-cluster and self-scheduling lowerings run only the assignments of a when body:
-   its asserts are not checked there (reported). =#
+"""
+The discrete-cluster and self-scheduling lowerings run only the assignments of a when body:
+its asserts are not checked there (reported).
+"""
 _uncheckedWhenAssert(st::SC.ASSERT) =
   @warn "[MTK GEN: when] an assert in a when on a buffered relation or a self-scheduling time when is not checked" condition = string(st.condition)
 
-#= Whether an expression has an Integer or enumeration value. =#
+"""
+Whether an expression has an Integer or enumeration value.
+"""
 function _isIntegralValued(e::SC.Exp)::Bool
   e isa SC.EXP_CREF && return _isIntegralType(e.ty)
   e isa Union{SC.ICONST, SC.ENUM_LITERAL} && return true
@@ -761,13 +831,15 @@ end
 _isIntegralType(ty::SC.SType)::Bool =
   ty isa Union{SC.TYPE_INTEGER, SC.TYPE_ENUM} || (ty isa SC.TYPE_ARRAY && _isIntegralType(ty.elementType))
 
-#= A synthesized when cluster's ordered (discrete, right side, numeric) assignments; `nothing`
-   when it assigns nothing. A single-member cluster has one entry; a coupled FSM cluster has the
-   body in topological order. The cluster paths are the only ones for such a when
-   (createCallbackCode), so what they cannot run is refused. Numeric (else Boolean) by the
-   variable's type, else by the type of the assigned reference or value: an alias elimination
-   can make a Boolean variable (a gate's Logic input) the member that a clock's `y = if ...
-   then '0' else '1'` sets. =#
+"""
+A synthesized when cluster's ordered (discrete, right side, numeric) assignments; `nothing`
+when it assigns nothing. A single-member cluster has one entry; a coupled FSM cluster has the
+body in topological order. The cluster paths are the only ones for such a when
+(createCallbackCode), so what they cannot run is refused. Numeric (else Boolean) by the
+variable's type, else by the type of the assigned reference or value: an alias elimination
+can make a Boolean variable (a gate's Logic input) the member that a clock's `y = if ...
+then '0' else '1'` sets.
+"""
 function _gatherClusterAssigns(weq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE)::Union{Nothing, Vector{Tuple{Symbol, SC.Exp, Bool}}}
   weq.whenEquation.elsewhenPart === nothing ||
     unsupported("an elsewhen of a when on a buffered relation (a discrete cluster)", weq.whenEquation.condition)
@@ -789,9 +861,11 @@ end
 #= Self-scheduling time whens                                                           =#
 #= ==================================================================================== =#
 
-#= The relations comparing `time` against a `pre()` value (a self-scheduling time event) of an
-   or-chain. False when a disjunct is neither such a relation nor initial(): its trigger would
-   be lost. =#
+"""
+The relations comparing `time` against a `pre()` value (a self-scheduling time event) of an
+or-chain. False when a disjunct is neither such a relation nor initial(): its trigger would
+be lost.
+"""
 function _collectSelfSchedRels!(rels::Vector{SC.RELATION}, e::SC.Exp)::Bool
   if e isa SC.RELATION && (_isTimeCref(e.exp1) || _isTimeCref(e.exp2)) && (_isPreCref(e.exp1) || _isPreCref(e.exp2))
     push!(rels, e)
@@ -804,10 +878,12 @@ function _collectSelfSchedRels!(rels::Vector{SC.RELATION}, e::SC.Exp)::Bool
   return SC.isBuiltin(e, :initial)
 end
 
-#= The relations of a self-scheduling time when (the time tables' `when {time >=
-   pre(nextEvent), initial()}`, its initial() split off into an initial algorithm): the `time ⋚
-   pre(x)` relations of its condition. Another trigger or an elsewhen is refused: the general
-   path cannot evaluate such a condition either. =#
+"""
+The relations of a self-scheduling time when (the time tables' `when {time >=
+pre(nextEvent), initial()}`, its initial() split off into an initial algorithm): the `time ⋚
+pre(x)` relations of its condition. Another trigger or an elsewhen is refused: the general
+path cannot evaluate such a condition either.
+"""
 function _selfSchedulingTimeRels(weq::SC.WHEN_EQUATION)::Vector{SC.RELATION}
   local cond = weq.whenEquation.condition
   local rels = SC.RELATION[]
@@ -818,14 +894,16 @@ function _selfSchedulingTimeRels(weq::SC.WHEN_EQUATION)::Vector{SC.RELATION}
   return rels
 end
 
-#= (functionExpr, observedNT, modifiedNT) of the ImperativeAffect of a self-scheduling
-   time-event when. Each assignment `x := rhs` is recomputed imperatively (`_affectValue`:
-   time as integrator.t, a table handle the module global, an external call resolved). The
-   table residual's pre(x) lowers to x, omc's state between events: the table's left limit for
-   t >= x, the new segment after this affect. `atInit` lowers `initial()` to true for the run at
-   the start of a solve. The state before the instant is taken before the affect writes (pre()
-   of what it sets, read by a when it triggers at the same instant: `e = edge(b)` with b set
-   here stayed false). =#
+"""
+(functionExpr, observedNT, modifiedNT) of the ImperativeAffect of a self-scheduling
+time-event when. Each assignment `x := rhs` is recomputed imperatively (`_affectValue`:
+time as integrator.t, a table handle the module global, an external call resolved). The
+table residual's pre(x) lowers to x, omc's state between events: the table's left limit for
+t >= x, the new segment after this affect. `atInit` lowers `initial()` to true for the run at
+the start of a solve. The state before the instant is taken before the affect writes (pre()
+of what it sets, read by a when it triggers at the same instant: `e = edge(b)` with b set
+here stayed false).
+"""
 function _selfSchedAffectParts(weq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE; atInit::Bool = false)
   local obsAcc = Dict{Symbol, Symbol}()
   local stmts = Expr[]
@@ -855,18 +933,22 @@ function _selfSchedAffectParts(weq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE; atIn
   return (fexpr, obsNT, modNT)
 end
 
-#= Whether a self-scheduling when's body reads no pre() of a variable it sets: run again at a
-   fixed time it gives the same values. =#
+"""
+Whether a self-scheduling when's body reads no pre() of a variable it sets: run again at a
+fixed time it gives the same values.
+"""
 function _selfSchedIdempotent(weq::SC.WHEN_EQUATION)::Bool
   local body = weq.whenEquation.body
   local assigned = Set{String}(SC.crefName(st.left.cref) for st in body if st isa SC.ASSIGN && st.left isa SC.EXP_CREF)
   return !any(st -> st isa SC.ASSIGN && _expHasPreOf(st.right, assigned), body)
 end
 
-#= MTK SymbolicContinuousCallbacks for self-scheduling time-event whens. The crossing `time -
-   nextTimeEvent` fires when time reaches the held discrete; an ImperativeAffect runs the body
-   again (it updates only integrator.u, never an AffectSystem, so it does not pull the
-   table-fed continuous network into an unsolvable callback). =#
+"""
+MTK SymbolicContinuousCallbacks for self-scheduling time-event whens. The crossing `time -
+nextTimeEvent` fires when time reaches the held discrete; an ImperativeAffect runs the body
+again (it updates only integrator.u, never an AffectSystem, so it does not pull the
+table-fed continuous network into an unsolvable callback).
+"""
 function createSelfSchedulingTimeWhenEvents(simCode::SC.SIM_CODE)::Vector{Expr}
   local events = Expr[]
   for weq in simCode.whenEquations
@@ -907,11 +989,13 @@ function createSelfSchedulingTimeWhenEvents(simCode::SC.SIM_CODE)::Vector{Expr}
   return events
 end
 
-#= The event iteration over the buffered relations (relationRefresh.jl): after every step, a
-   relation that disagrees with the state is flipped with the hysteresis rule, and so on until
-   nothing changes. Emitted with no if-equation relations too: whens on a relation among the
-   callbacks are iterated as well (none of either: a no-op). In the latest world, like the
-   event list: the symbolic variables are globals bound while the model is built. =#
+"""
+The event iteration over the buffered relations (relationRefresh.jl): after every step, a
+relation that disagrees with the state is flipped with the hysteresis rule, and so on until
+nothing changes. Emitted with no if-equation relations too: whens on a relation among the
+callbacks are iterated as well (none of either: a no-op). In the latest world, like the
+event list: the symbolic variables are globals bound while the model is built.
+"""
 function emitRelationRefresh(relations::Vector)::Expr
   local entries = [:(($(QuoteNode(sym)), $(zc), $(scale))) for (sym, zc, scale) in relations]
   return :(callbacks = OMBackend.CodeGeneration.withRelationRefresh(callbacks, problem,
@@ -923,12 +1007,14 @@ end
 #= Asserts                                                                              =#
 #= ==================================================================================== =#
 
-#= The asserts of equation sections (simCode.asserts) as one callback that checks them after
-   the initialization and after each accepted step (asserts.jl). Conditions and messages are
-   lowered like event affects: every variable is read through `observed`, `time` from the
-   integrator. An assert whose expression cannot be lowered is reported and left out. Names,
-   not the symbolic variables, are observed: a variable the compiler eliminated has no binding
-   in the generated code, but may still be observed by name. =#
+"""
+The asserts of equation sections (simCode.asserts) as one callback that checks them after
+the initialization and after each accepted step (asserts.jl). Conditions and messages are
+lowered like event affects: every variable is read through `observed`, `time` from the
+integrator. An assert whose expression cannot be lowered is reported and left out. Names,
+not the symbolic variables, are observed: a variable the compiler eliminated has no binding
+in the generated code, but may still be observed by name.
+"""
 function emitAssertCallback(simCode::SC.SIM_CODE)::Expr
   isempty(simCode.asserts) && return Expr(:block)
   local entries = Expr[]
@@ -960,11 +1046,13 @@ end
 
 _isEffectCall(e::SC.Exp)::Bool = e isa SC.CALL && e.ty isa SC.TYPE_NORETCALL
 
-#= The crossings of an assert condition's ordering relations on numbers (`a - b`), where the
-   condition can change within a step (asserts.jl). One is 1.0 where the condition's
-   short-circuit does not reach its relation (`x <= 0 or sqrt(x) < 2`: sqrt(x) of a negative
-   threw). Not under noEvent(), nor inside another expression (a call's argument, a
-   reduction). =#
+"""
+The crossings of an assert condition's ordering relations on numbers (`a - b`), where the
+condition can change within a step (asserts.jl). One is 1.0 where the condition's
+short-circuit does not reach its relation (`x <= 0 or sqrt(x) < 2`: sqrt(x) of a negative
+threw). Not under noEvent(), nor inside another expression (a call's argument, a
+reduction).
+"""
 function _assertCrossingExprs(cond::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)::Vector{Any}
   local out = Any[]
   local both = (r, c) -> r === true ? c : :($(r) && $(c))
@@ -992,8 +1080,10 @@ function _assertCrossingExprs(cond::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCod
   return out
 end
 
-#= An assert's condition; a call equation for its effects runs and holds, one in an
-   if-equation's branch, `if guard then call else true`, where the guard holds. =#
+"""
+An assert's condition; a call equation for its effects runs and holds, one in an
+if-equation's branch, `if guard then call else true`, where the guard holds.
+"""
 function _assertConditionExpr(cond::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)
   _isEffectCall(cond) && return :($(_effectCallExpr(cond, obsAcc, simCode)); true)
   if cond isa SC.IFEXP && _isEffectCall(cond.thenExp)
@@ -1004,9 +1094,11 @@ function _assertConditionExpr(cond::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCod
   return _affectBool(cond, obsAcc, simCode)
 end
 
-#= A call for its effects, its arguments read as values: a String as it is, a Boolean decoded
-   from the arithmetic encoding, an array element by element (a literal one too: its elements
-   may be variables). =#
+"""
+A call for its effects, its arguments read as values: a String as it is, a Boolean decoded
+from the arithmetic encoding, an array element by element (a literal one too: its elements
+may be variables).
+"""
 function _effectCallExpr(call::SC.CALL, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)::Expr
   local arg = nothing
   arg = a::SC.Exp -> a isa SC.SCONST ? a.value :
@@ -1018,10 +1110,12 @@ end
 _isBooleanExp(e::SC.Exp)::Bool =
   e isa Union{SC.BCONST, SC.RELATION, SC.LBINARY, SC.LUNARY} || (e isa Union{SC.EXP_CREF, SC.CALL} && e.ty isa SC.TYPE_BOOL)
 
-#= An assert's message: string literals, `+` concatenation and String(x) of variables;
-   anything else is shown as the Modelica expression. A String parameter is a module-level
-   binding (createStringParameterAssignments), not a variable of the simulation (read through
-   `observed`, the assert was left out as reading a variable the simulation does not keep). =#
+"""
+An assert's message: string literals, `+` concatenation and String(x) of variables;
+anything else is shown as the Modelica expression. A String parameter is a module-level
+binding (createStringParameterAssignments), not a variable of the simulation (read through
+`observed`, the assert was left out as reading a variable the simulation does not keep).
+"""
 function _assertMessageExpr(msg::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)
   local part = nothing
   part = e::SC.Exp -> begin
@@ -1052,9 +1146,11 @@ _exprMentions(@nospecialize(e), s::Symbol) = e === s || (e isa Expr && any(a -> 
 #= Discrete clusters                                                                    =#
 #= ==================================================================================== =#
 
-#= Whether a relation has no continuous-time operand: only time, parameters, constants and
-   discretes. Its crossing gets no hysteresis, so time events stay exact (as the if-equation
-   branches keep pure time events exact). =#
+"""
+Whether a relation has no continuous-time operand: only time, parameters, constants and
+discretes. Its crossing gets no hysteresis, so time events stay exact (as the if-equation
+branches keep pure time events exact).
+"""
 function _withoutContinuousOperand(rel::SC.Exp, simCode::SC.SIM_CODE)::Bool
   for name in SC.allCrefNames(rel)
     name == "time" && continue
@@ -1065,8 +1161,10 @@ function _withoutContinuousOperand(rel::SC.Exp, simCode::SC.SIM_CODE)::Bool
   return true
 end
 
-#= The variables a when reads through pre(), in first-occurrence order; `edge(b)` and
-   `change(b)` read pre(b). =#
+"""
+The variables a when reads through pre(), in first-occurrence order; `edge(b)` and
+`change(b)` read pre(b).
+"""
 function _clusterPreNames(cond::SC.Exp, assigns::Vector{Tuple{Symbol, SC.Exp, Bool}})::Vector{String}
   local names = String[]
   local visit = function (e::SC.Exp)
@@ -1116,12 +1214,14 @@ function _equationGraph(simCode::SC.SIM_CODE)::_EquationGraph
   return _EquationGraph(names, occurs, fixed)
 end
 
-#= Whether solving the algebraic unknowns again can change what a cluster reads: a read
-   reachable from its members through the equations over the names a re-solve moves. An ideal
-   diode's `s` in `off = s < 0` is; a switched-capacitor clock's `time >= pulseStart` and a
-   constant resistance are not, and such a cluster settles without a solve of its own: the
-   event iteration solves once after the sweep (CauerLowPassSC: 11 solves per clock event ->
-   1). =#
+"""
+Whether solving the algebraic unknowns again can change what a cluster reads: a read
+reachable from its members through the equations over the names a re-solve moves. An ideal
+diode's `s` in `off = s < 0` is; a switched-capacitor clock's `time >= pulseStart` and a
+constant resistance are not, and such a cluster settles without a solve of its own: the
+event iteration solves once after the sweep (CauerLowPassSC: 11 solves per clock event ->
+1).
+"""
 function _clusterCoupled(members::Vector{String}, reads::OrderedSet{String}, g::_EquationGraph)::Bool
   local reached = Set{String}(members)
   local frontier = copy(members)
@@ -1140,12 +1240,14 @@ function _clusterCoupled(members::Vector{String}, reads::OrderedSet{String}, g::
   return any(n -> n in reached && !(n in members), reads)
 end
 
-#= One DiscreteCluster (discreteClusters.jl) for a when on the relations `rels` that assigns
-   `assigns`. Every distinct relation gets a buffer; `==` and `<>` (a crossing function that
-   jumps between -0.5 and 0.5) and relations without a continuous-time operand have no
-   hysteresis. A when lifted from discrete equations holds at every pass of an event (its
-   equations do); another fires when its condition does. Later members read an earlier one's
-   new value (the body is in topological order). =#
+"""
+One DiscreteCluster (discreteClusters.jl) for a when on the relations `rels` that assigns
+`assigns`. Every distinct relation gets a buffer; `==` and `<>` (a crossing function that
+jumps between -0.5 and 0.5) and relations without a continuous-time operand have no
+hysteresis. A when lifted from discrete equations holds at every pass of an event (its
+equations do); another fires when its condition does. Later members read an earlier one's
+new value (the body is in topological order).
+"""
 function _discreteClusterSpec(cond::SC.Exp, rels::Vector{SC.RELATION}, assigns::Vector{Tuple{Symbol, SC.Exp, Bool}},
                               simCode::SC.SIM_CODE, table::Bool, graph::_EquationGraph)::Expr
   local buffered = unique(rels)
@@ -1208,8 +1310,10 @@ function emitDiscreteClusters(simCode::SC.SIM_CODE)::Expr
                                                                       Base.invokelatest(() -> Any[$(specs...)])))
 end
 
-#= The DiscreteCluster constructions of the model's discrete clusters (emitDiscreteClusters);
-   empty when it has none. =#
+"""
+The DiscreteCluster constructions of the model's discrete clusters (emitDiscreteClusters);
+empty when it has none.
+"""
 function _discreteClusterSpecs(simCode::SC.SIM_CODE)::Vector{Expr}
   _usesDiscreteClusters(simCode) || return Expr[]
   local table = _modelHasTableClusters(simCode)
@@ -1319,18 +1423,22 @@ end
 #= When statements                                                                      =#
 #= ==================================================================================== =#
 
-#= The target of field `f` of a record target of a tuple assignment: the field's variable
-   (`r_f`), or an omitted output's. =#
+"""
+The target of field `f` of a record target of a tuple assignment: the field's variable
+(`r_f`), or an omitted output's.
+"""
 function _recordFieldTarget(target::SC.Exp, f::String)::SC.Exp
   target isa SC.WILD && return target
   target isa SC.EXP_CREF || unsupported("this record target of a tuple assignment in a when", target)
   return SC.EXP_CREF(SC.SimCref(SC.crefName(target.cref) * COMPONENT_SEPARATOR * f), SC.TYPE_REAL())
 end
 
-#= `integrator.u[i] = value` of a when's assignment to the variable `var`, and the body's
-   local of it (a later statement read the value from before: Buildings' occupant windows,
-   `(ran, state) = random(pre(state)); on = ran < p` decided on the previous sample's
-   number). =#
+"""
+`integrator.u[i] = value` of a when's assignment to the variable `var`, and the body's
+local of it (a later statement read the value from before: Buildings' occupant windows,
+`(ran, state) = random(pre(state)); on = ran < p` decided on the previous sample's
+number).
+"""
 function _stateAssignment(var::SC.SIMVAR, value)::Expr
   quote
     $(MTK_CodeGenerationUtil.STATE_INDEX) = lookuptableStates[Symbol($(var.name))]
@@ -1339,8 +1447,10 @@ function _stateAssignment(var::SC.SIMVAR, value)::Expr
   end
 end
 
-#= A target of a tuple assignment in a when: a variable, an array of them, or `_`. A target
-   missing from the variable table would be bound as a local of the affect, its value lost. =#
+"""
+A target of a tuple assignment in a when: a variable, an array of them, or `_`. A target
+missing from the variable table would be bound as a local of the affect, its value lost.
+"""
 function _emitWhenTupleElementAssignMTK!(res::Vector{Expr}, lhs::SC.Exp, rhsAccess::Union{Symbol, Expr}, simCode::SC.SIM_CODE)::Vector{Expr}
   if lhs isa SC.WILD
     return res
@@ -1427,17 +1537,21 @@ function createWhenStatementsMTK(statements::Vector{SC.Statement}, simCode::SC.S
   return res
 end
 
-#= Whether a when-equation's condition is Modelica's `terminal()`. =#
+"""
+Whether a when-equation's condition is Modelica's `terminal()`.
+"""
 _isTerminalWhen(eq::SC.WHEN_EQUATION)::Bool = SC.isBuiltin(eq.whenEquation.condition, :terminal)
 
-#= Post-solve runner for `when terminal()` bodies, or `nothing` when the model has none (so
-   models without a terminal event are unchanged). The bodies reuse `createWhenStatementsMTK`
-   by mocking `integrator` from the final solution point: writes land in `_sol.u[end]` using
-   the same state-index convention the discrete-callback affects rely on. Runs only on success.
-   String parameters are module-level constants: referenced directly, not shadowed by a
-   nonexistent state lookup. The external functions the body calls are bound to their
-   OMBackend.CodeGeneration RTG wrapper: the bare model-module name is the @register_symbolic
-   binding (symbolic only), which has no method for concrete runtime arguments. =#
+"""
+Post-solve runner for `when terminal()` bodies, or `nothing` when the model has none (so
+models without a terminal event are unchanged). The bodies reuse `createWhenStatementsMTK`
+by mocking `integrator` from the final solution point: writes land in `_sol.u[end]` using
+the same state-index convention the discrete-callback affects rely on. Runs only on success.
+String parameters are module-level constants: referenced directly, not shadowed by a
+nonexistent state lookup. The external functions the body calls are bound to their
+OMBackend.CodeGeneration RTG wrapper: the bare model-module name is the @register_symbolic
+binding (symbolic only), which has no method for concrete runtime arguments.
+"""
 function createTerminalBodyRunner(simCode::SC.SIM_CODE)
   local terminalWhens = filter(_isTerminalWhen, simCode.whenEquations)
   isempty(terminalWhens) && return nothing

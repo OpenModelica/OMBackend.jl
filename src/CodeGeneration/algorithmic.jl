@@ -44,8 +44,10 @@ const SC = SimCode
 #= The return expression of the function being generated (a `return` statement's). =#
 const _CURRENT_RETURN_EXPR = Ref{Any}(nothing)
 
-#= A single-valued block as its value: `quote $int end` is `Expr(:block, int)`, which inside
-   `Expr(:ref, ...)` prints as `a[(1;)]`, invalid Julia. =#
+"""
+A single-valued block as its value: `quote \$int end` is `Expr(:block, int)`, which inside
+`Expr(:ref, ...)` prints as `a[(1;)]`, invalid Julia.
+"""
 function _unwrapSubscriptExpr(raw)
   if raw isa Expr && raw.head === :block
     local stripped = filter(a -> !(a isa LineNumberNode), raw.args)
@@ -97,11 +99,15 @@ function _algAssignmentPreallocation(lhs::SC.Exp)
   return :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.ensureAlgArrayLength!($(name), $index))
 end
 
-#= The lowered left-hand side indexes the array `name`: a scalarized element
-   (signalPWM[3].sawtooth.count lowered to one name) has no array to grow. =#
+"""
+The lowered left-hand side indexes the array `name`: a scalarized element
+(signalPWM[3].sawtooth.count lowered to one name) has no array to grow.
+"""
 _indexesArray(lhs, name) = lhs isa Expr && lhs.head === :ref && _unwrapSubscriptExpr(lhs.args[1]) === name
 
-#= A range (`a:b`, `a:s:b`). =#
+"""
+A range (`a:b`, `a:s:b`).
+"""
 _isRangeExpr(@nospecialize(x)) = x isa Expr && x.head === :call && !isempty(x.args) && x.args[1] === :(:)
 
 function _algAssignment(lhsExp::SC.Exp, rhs::Expr)
@@ -136,13 +142,19 @@ _funcParamElemType(v::SC.FunctionVariable)::SC.SType = SC.scalarType(v.ty)
 "The number of a function variable's dimensions."
 _funcParamRank(v::SC.FunctionVariable)::Int = max(length(v.dimensions), v.ty isa SC.TYPE_ARRAY ? length(v.ty.dims) : 0)
 
-#= A multi-dimensional array (2 dimensions or more). =#
+"""
+A multi-dimensional array (2 dimensions or more).
+"""
 isMultiDimArray(v::SC.FunctionVariable)::Bool = _funcParamRank(v) >= 2
 
-#= An array output: the wrapper must run the body (its result is indexed). =#
+"""
+An array output: the wrapper must run the body (its result is indexed).
+"""
 hasArrayOutput(f::SC.ModelicaFunction)::Bool = any(_funcParamIsArray, f.outputs)
 
-#= The dimensions of the one array output of known sizes, `(4,)`, `(3, 3)`; `()` otherwise. =#
+"""
+The dimensions of the one array output of known sizes, `(4,)`, `(3, 3)`; `()` otherwise.
+"""
 function computeArrayOutputDims(f::SC.ModelicaFunction)::Tuple{Vararg{Int}}
   length(f.outputs) == 1 || return ()
   local t = only(f.outputs).ty
@@ -150,15 +162,19 @@ function computeArrayOutputDims(f::SC.ModelicaFunction)::Tuple{Vararg{Int}}
   return Tuple(t.dims)
 end
 
-#= The size of a dimension of a function variable: a literal, or an expression of the inputs;
-   `[:]` (0) starts empty and grows as it is assigned (ensureAlgArrayLength!). =#
+"""
+The size of a dimension of a function variable: a literal, or an expression of the inputs;
+`[:]` (0) starts empty and grows as it is assigned (ensureAlgArrayLength!).
+"""
 _daeDimToJulia(d::SC.Exp) = d isa SC.ICONST ? d.value : _unwrapSubscriptExpr(expToJuliaExpAlg(d))
 
-#= An Integer or enumeration input is an Int in the function, an array of them an Int array:
-   read from the integrator (a discrete's value) it arrives as a Float64 (MSL TimeTable's
-   `last`, a table index in getInterpolationCoefficients: "invalid index: 2.0"; Digital's
-   Logic values indexing its tables in RAM: "invalid index: 1.0"). A symbolic argument is
-   left as it is. =#
+"""
+An Integer or enumeration input is an Int in the function, an array of them an Int array:
+read from the integrator (a discrete's value) it arrives as a Float64 (MSL TimeTable's
+`last`, a table index in getInterpolationCoefficients: "invalid index: 2.0"; Digital's
+Logic values indexing its tables in RAM: "invalid index: 1.0"). A symbolic argument is
+left as it is.
+"""
 function generateIntegerInputConversions(inputs::Vector{SC.FunctionVariable})::Vector{Expr}
   local conversions = Expr[]
   for v in inputs
@@ -172,7 +188,9 @@ _integerInput(x::AbstractFloat) = isinteger(x) ? Int(x) : x
 _integerInput(x::AbstractArray{<:AbstractFloat}) = all(isinteger, x) ? Int.(x) : x
 _integerInput(x) = x
 
-#= The multi-dimensional array inputs as proper arrays (ensureArray). =#
+"""
+The multi-dimensional array inputs as proper arrays (ensureArray).
+"""
 function generateArrayConversions(inputs::Vector{SC.FunctionVariable})::Vector{Expr}
   local conversions = Expr[]
   for v in inputs
@@ -183,8 +201,10 @@ function generateArrayConversions(inputs::Vector{SC.FunctionVariable})::Vector{E
   return conversions
 end
 
-#= A record-typed variable's fields (an array of records': its elements') as their flattened
-   symbols, `<name>_<field>`; empty for another variable. =#
+"""
+A record-typed variable's fields (an array of records': its elements') as their flattened
+symbols, `<name>_<field>`; empty for another variable.
+"""
 function flattenRecordInput(v::SC.FunctionVariable)::Vector{Symbol}
   local fields = _recordFieldNames(_funcParamElemType(v))
   return Symbol[Symbol(v.name, COMPONENT_SEPARATOR, f) for f in fields]
@@ -210,8 +230,10 @@ function _scalarDefault(t::SC.SType; enumeration = 1, other = nothing)
   return other
 end
 
-#= The locals: from their defaults (an array as a copy: `Real Awork[n, n] = A` is written into,
-   `A` not), an array zero-filled, a scalar its type's default; a record as its fields'. =#
+"""
+The locals: from their defaults (an array as a copy: `Real Awork[n, n] = A` is written into,
+`A` not), an array zero-filled, a scalar its type's default; a record as its fields'.
+"""
 function generateLocals(locals::Vector{SC.FunctionVariable})::Vector{Expr}
   local decls = Expr[]
   for v in locals
@@ -236,11 +258,13 @@ function generateLocals(locals::Vector{SC.FunctionVariable})::Vector{Expr}
   return decls
 end
 
-#= A record-typed local as its per-field locals (`flat`), set as omc's C code sets a record
-   variable: from its default (`Sat s = Sat(p, 0)`), else each field from its own default
-   (the instance's modifiers, the record type's: `SaturationProperties sat(psat = p, Tsat =
-   0)`, MSL R134a's getPhase_ph read sat_psat unset). A field without one, or of a record type,
-   stays unset, and so does an array of records' (`_recordArrayLocal`). =#
+"""
+A record-typed local as its per-field locals (`flat`), set as omc's C code sets a record
+variable: from its default (`Sat s = Sat(p, 0)`), else each field from its own default
+(the instance's modifiers, the record type's: `SaturationProperties sat(psat = p, Tsat =
+0)`, MSL R134a's getPhase_ph read sat_psat unset). A field without one, or of a record type,
+stays unset, and so does an array of records' (`_recordArrayLocal`).
+"""
 function _recordLocal(v::SC.FunctionVariable, flat::Vector{Symbol})::Vector{Expr}
   _funcParamIsArray(v) && return _recordArrayLocal(v, flat)
   local decls = Expr[Expr(:local, fs) for fs in flat]
@@ -258,11 +282,13 @@ function _recordLocal(v::SC.FunctionVariable, flat::Vector{Symbol})::Vector{Expr
   return decls
 end
 
-#= An array of records as a local (MSL ReferenceAir's Ice09 Gibbs function: `MyComplex[3]
-   r_2 = {MyComplex(...), ...}`, `MyComplex o[12]`): each field an array of the local's
-   dimensions (r_2_re, r_2_im), from a default by the records' fields, else zero-filled for
-   the elements the body assigns. A field of a record or array type, or dimensions not known
-   here, leave it declared only. =#
+"""
+An array of records as a local (MSL ReferenceAir's Ice09 Gibbs function: `MyComplex[3]
+r_2 = {MyComplex(...), ...}`, `MyComplex o[12]`): each field an array of the local's
+dimensions (r_2_re, r_2_im), from a default by the records' fields, else zero-filled for
+the elements the body assigns. A field of a record or array type, or dimensions not known
+here, leave it declared only.
+"""
 function _recordArrayLocal(v::SC.FunctionVariable, flat::Vector{Symbol})::Vector{Expr}
   local decls = Expr[Expr(:local, fs) for fs in flat]
   local elemTy = _funcParamElemType(v)
@@ -281,8 +307,10 @@ function _recordArrayLocal(v::SC.FunctionVariable, flat::Vector{Symbol})::Vector
   return decls
 end
 
-#= The elements of a one-dimensional array of record literals by field (the k-th entry: field
-   k of each element, lowered); nothing for another default. =#
+"""
+The elements of a one-dimensional array of record literals by field (the k-th entry: field
+k of each element, lowered); nothing for another default.
+"""
 function _recordArrayBindingFields(elements::Vector{SC.Exp}, nFields::Int)::Union{Nothing, Vector{Vector{Any}}}
   local out = [Any[] for _ in 1:nFields]
   for e in elements
@@ -294,8 +322,10 @@ function _recordArrayBindingFields(elements::Vector{SC.Exp}, nFields::Int)::Unio
   return out
 end
 
-#= A zero-filled array for an array-typed function variable, its dimensions possibly
-   depending on the inputs; an empty one where they are not known. =#
+"""
+A zero-filled array for an array-typed function variable, its dimensions possibly
+depending on the inputs; an empty one where they are not known.
+"""
 function _arrayDefault(v::SC.FunctionVariable)
   local t = _funcParamElemType(v)
   local jlElemDefault = t isa SC.TYPE_INTEGER ? :Int : t isa SC.TYPE_BOOL ? :Bool : :Float64
@@ -382,10 +412,12 @@ function generateFunctions(functions::Vector{SC.ModelicaFunction})::Tuple{Vector
   return jFuncs, names
 end
 
-#= The derivative rule of `func`'s derivative annotation (CodeGeneration.FUNCTION_DERIVATIVE_RULES):
-   the derivative function and, in order, the inputs whose derivatives it takes (the Real ones
-   without zeroDerivative/noDerivative). Scalar inputs only: flattened records move the
-   positions. =#
+"""
+The derivative rule of `func`'s derivative annotation (CodeGeneration.FUNCTION_DERIVATIVE_RULES):
+the derivative function and, in order, the inputs whose derivatives it takes (the Real ones
+without zeroDerivative/noDerivative). Scalar inputs only: flattened records move the
+positions.
+"""
 function _functionDerivativeRuleExpr(func::SC.ModelicaFunction, functions::Vector{SC.ModelicaFunction})
   local d = func.derivative
   d === nothing && return nothing
@@ -441,10 +473,12 @@ function generateExternalOutputAllocations(outputs::Vector{SC.FunctionVariable})
   return decls
 end
 
-#= A Modelica Integer (or Boolean) array for a C `int*`: rounded, since an
-   Integer held in the Float64 state vector can be an ulp off after a solver
-   step (the MSL noise generators' xorshift states, 1.3705433889999998e9 for
-   1370543389: `convert` threw InexactError in ActuatorWithNoise). =#
+"""
+A Modelica Integer (or Boolean) array for a C `int*`: rounded, since an
+Integer held in the Float64 state vector can be an ulp off after a solver
+step (the MSL noise generators' xorshift states, 1.3705433889999998e9 for
+1370543389: `convert` threw InexactError in ActuatorWithNoise).
+"""
 _roundToCint(x::AbstractArray{Cint}) = x
 _roundToCint(x::AbstractArray) = map(v -> v isa Integer ? Cint(v) : round(Cint, v), x)
 _roundToCint(x) = x
@@ -473,19 +507,25 @@ function _externalCallExpr(x::SC.ExternalCall)::Expr
   return x.output === nothing ? call : Expr(:(=), _unwrapSubscriptExpr(_externalArgument(x.output)), call)
 end
 
-#= An argument of an external call: a variable by its name, `size(a, i)`, a literal. =#
+"""
+An argument of an external call: a variable by its name, `size(a, i)`, a literal.
+"""
 _externalArgument(e::SC.EXP_CREF) = Symbol(SC.crefName(e.cref))
 _externalArgument(e::SC.Exp) = expToJuliaExpAlg(e)
 
-#= The variables of an external function by their Julia names. =#
+"""
+The variables of an external function by their Julia names.
+"""
 _externalVariables(func::SC.EXTERNAL_MODELICA_FUNCTION)::Dict{Symbol, SC.FunctionVariable} =
   Dict{Symbol, SC.FunctionVariable}(_varSymbol(v) => v for v in Iterators.flatten((func.inputs, func.outputs, func.locals)))
 
-#= An external "FORTRAN 77" function (Modelica.Math.Matrices.LAPACK): its locals and outputs
-   initialized from their defaults (Awork = A, x = b), the routine of Julia's LAPACK called
-   with every argument by reference (arrays as fresh Float64/Int64 copies it may overwrite,
-   scalars in Refs read back after the call, a character with its hidden length last, as
-   gfortran passes it), and the outputs returned. =#
+"""
+An external "FORTRAN 77" function (Modelica.Math.Matrices.LAPACK): its locals and outputs
+initialized from their defaults (Awork = A, x = b), the routine of Julia's LAPACK called
+with every argument by reference (arrays as fresh Float64/Int64 copies it may overwrite,
+scalars in Refs read back after the call, a character with its hidden length last, as
+gfortran passes it), and the outputs returned.
+"""
 function _fortranExternalBody(func::SC.EXTERNAL_MODELICA_FUNCTION)::Expr
   local call = _externalCallExpr(func.external)
   local (resultVar, callExpr) = call.head === :(=) ? (call.args[1], call.args[2]) : (nothing, call)
@@ -562,21 +602,27 @@ function generateExternalReturnExpr(outputs::Vector{SC.FunctionVariable})
   return length(accessors) == 1 ? accessors[1] : Expr(:tuple, accessors...)
 end
 
-#= An external function: OMRuntimeExternalC's, or one ensureExternalC! defined (externalC.jl),
-   read by invokelatest: defined in this world (an older world's read of a newer binding is
-   deprecated, an error in later Julia versions). =#
+"""
+An external function: OMRuntimeExternalC's, or one ensureExternalC! defined (externalC.jl),
+read by invokelatest: defined in this world (an older world's read of a newer binding is
+deprecated, an error in later Julia versions).
+"""
 _externalFunction(name::Symbol) =
   isdefined(externalCModule(), name) ? Base.invokelatest(getglobal, externalCModule(), name) :
                                        getfield(OMRuntimeExternalC, name)
 
-#= A C function's arguments: an external object as its pointer (CodeGeneration._externalPtr). =#
+"""
+A C function's arguments: an external object as its pointer (CodeGeneration._externalPtr).
+"""
 _externalPtrArgs(args::AbstractVector)::Vector{Any} =
   Any[:(OMBackend.CodeGeneration._externalPtr($a)) for a in args]
 
-#= The external call with its function resolved to the function object (captured in the
-   generated closure: no name of OMRuntimeExternalC need be in scope where it runs) and its
-   arguments as pointers where they are external objects. Any number of arguments: MSL's
-   getPid has none (pid = ModelicaInternal_getpid()). =#
+"""
+The external call with its function resolved to the function object (captured in the
+generated closure: no name of OMRuntimeExternalC need be in scope where it runs) and its
+arguments as pointers where they are external objects. Any number of arguments: MSL's
+getPid has none (pid = ModelicaInternal_getpid()).
+"""
 function namespaceifyExternalFunction(expr::Expr)::Expr
   if expr.head === :(=)
     local callExpr = last(expr.args)
@@ -605,10 +651,12 @@ function generateStatement(stmt::SC.ASSIGN)
   return _algAssignment(stmt.left, _algValue(stmt.right))
 end
 
-#= The value an assignment stores: an array variable read whole as a copy, as the defaults are
-   (Modelica assigns values). `PRea := PRea_new` bound both names to one array, and the writes
-   into PRea_new[m, k] changed PRea: Buildings' multipoleFluidTemperature saw no change after
-   its first iteration and stopped. =#
+"""
+The value an assignment stores: an array variable read whole as a copy, as the defaults are
+(Modelica assigns values). `PRea := PRea_new` bound both names to one array, and the writes
+into PRea_new[m, k] changed PRea: Buildings' multipoleFluidTemperature saw no change after
+its first iteration and stopped.
+"""
 function _algValue(exp::SC.Exp)::Expr
   local rhs = expToJuliaExpAlg(exp)
   return _isWholeArrayVariable(exp) ? :(collect($rhs)) : rhs
@@ -678,16 +726,20 @@ function _recordElementFieldExps(exp::SC.Exp)::Union{Nothing, Vector{SC.Exp}}
   return SC.Exp[_fieldElement(_flatFieldSymbol(String(base), n), subs, ft) for (n, ft) in zip(t.fieldNames, t.fieldTypes)]
 end
 
-#= The element `subs` of the field array `name`. =#
+"""
+The element `subs` of the field array `name`.
+"""
 function _fieldElement(name::Symbol, subs::Vector{Any}, ty::SC.SType)::SC.Exp
   all(s -> s isa Int, subs) && return SC.EXP_CREF(SC.SimCref(name, Int[s for s in subs]), ty)
   return SC.ASUB(SC.EXP_CREF(SC.SimCref(name), SC.TYPE_ARRAY(ty, fill(-1, length(subs)))),
                  SC.Exp[s isa Int ? SC.ICONST(s) : s for s in subs])
 end
 
-#= A record value as its field tuple: a record variable's flattened fields (it has no tuple of
-   its own), an element of an array of records its fields' elements, an if-expression's
-   branches each so, anything else as it lowers. =#
+"""
+A record value as its field tuple: a record variable's flattened fields (it has no tuple of
+its own), an element of an array of records its fields' elements, an if-expression's
+branches each so, anything else as it lowers.
+"""
 function _recordTupleExpr(exp::SC.Exp)
   local rec = _recordCrefFields(exp)
   rec === nothing || return Expr(:tuple, [_flatFieldSymbol(rec[1], f) for f in rec[2]]...)
@@ -703,14 +755,20 @@ function _recordTupleExpr(exp::SC.Exp)
   return expToJuliaExpAlg(exp)
 end
 
-#= The field names of a record type, in declaration order; empty for another type. =#
+"""
+The field names of a record type, in declaration order; empty for another type.
+"""
 _recordFieldNames(t::SC.SType)::Vector{String} = t isa SC.TYPE_COMPLEX && t.isRecord ? t.fieldNames : String[]
 
-#= The types of a record type's fields; empty for another type. =#
+"""
+The types of a record type's fields; empty for another type.
+"""
 _recordFieldTypes(t::SC.SType)::Vector{SC.SType} = t isa SC.TYPE_COMPLEX && t.isRecord ? t.fieldTypes : SC.SType[]
 
-#= Whether no field of the record type `t` is a record: its value's tuple is then field for
-   field (a nested record's fields are flattened in its place). =#
+"""
+Whether no field of the record type `t` is a record: its value's tuple is then field for
+field (a nested record's fields are flattened in its place).
+"""
 function _hasNoRecordFields(t::SC.SType)::Bool
   local types = _recordFieldTypes(t)
   return !isempty(types) && all(ft -> isempty(_recordFieldNames(ft)), types)
@@ -776,10 +834,12 @@ function _isEmptyRecordValue(exp::SC.Exp)::Bool
   return t isa SC.TYPE_COMPLEX && t.isRecord && isempty(t.fieldNames)
 end
 
-#= The record type of `exp` where it is no named record variable: a call returning a record,
-   a record literal (a constant the frontend folded: the ideal gas `data`), an element of an
-   array of records (a scalar subscript per dimension); `nothing` otherwise. Such an
-   expression evaluates to the record's fields as a tuple. =#
+"""
+The record type of `exp` where it is no named record variable: a call returning a record,
+a record literal (a constant the frontend folded: the ideal gas `data`), an element of an
+array of records (a scalar subscript per dimension); `nothing` otherwise. Such an
+expression evaluates to the record's fields as a tuple.
+"""
 function _recordValueType(exp::SC.Exp)
   local t = if exp isa Union{SC.CALL, SC.RECORD, SC.EXP_CREF}
     exp.ty
@@ -793,9 +853,11 @@ function _recordValueType(exp::SC.Exp)
   return t !== nothing && !isempty(_recordFieldNames(t)) ? t : nothing
 end
 
-#= The position of field `ix` in the tuple a record-valued `exp` evaluates to, where every
-   field up to it is a scalar: a function returns a nested record's fields flattened in its
-   place, so a later field's position is not its index. -1 (read it by name) otherwise. =#
+"""
+The position of field `ix` in the tuple a record-valued `exp` evaluates to, where every
+field up to it is a scalar: a function returns a nested record's fields flattened in its
+place, so a later field's position is not its index. -1 (read it by name) otherwise.
+"""
 function _positionalFieldIndex(exp::SC.Exp, ix::Integer)::Int
   local t = _recordValueType(exp)
   t === nothing && return -1
@@ -818,8 +880,10 @@ function _recordCrefFields(exp::SC.Exp)::Union{Nothing, Tuple{String, Vector{Str
   return isempty(fieldNames) ? nothing : (base, fieldNames)
 end
 
-#= The flat field symbol `<base>_<kth field>` of a record read by one literal index (`r[k]`,
-   field access, not array indexing); `nothing` otherwise. =#
+"""
+The flat field symbol `<base>_<kth field>` of a record read by one literal index (`r[k]`,
+field access, not array indexing); `nothing` otherwise.
+"""
 function _recordIndexFieldSymbol(arrExp::SC.Exp, subs::Vector{SC.Exp})::Union{Nothing, Symbol}
   local base = _plainCrefName(arrExp)
   base === nothing && return nothing
@@ -834,11 +898,13 @@ end
 _plainCrefName(exp::SC.Exp)::Union{Nothing, String} =
   exp isa SC.EXP_CREF && isempty(exp.cref.subs) ? String(exp.cref.sym) : nothing
 
-#= `(a, , b) := f(...)` as a Julia destructuring `(a, _, b) = f(...)`. A generated function
-   returns a record output as its fields in place (generateIOL), so a record target takes them
-   into its flattened field symbols and an omitted record output skips one `_` per field. A
-   target that is no plain name (`v[2]`, `eigenvalues[:, 1]`, a record's field) takes its
-   element through a temporary and an ordinary assignment. =#
+"""
+`(a, , b) := f(...)` as a Julia destructuring `(a, _, b) = f(...)`. A generated function
+returns a record output as its fields in place (generateIOL), so a record target takes them
+into its flattened field symbols and an omitted record output skips one `_` per field. A
+target that is no plain name (`v[2]`, `eigenvalues[:, 1]`, a record's field) takes its
+element through a temporary and an ordinary assignment.
+"""
 function _tupleAssignment(stmt::SC.ASSIGN)::Expr
   local targetsIn = (stmt.left::SC.TUPLE).elements
   local rt = SC.typeOf(stmt.right)
@@ -869,8 +935,10 @@ function _tupleAssignment(stmt::SC.ASSIGN)::Expr
   return isempty(stores) ? assignment : Expr(:block, assignment, stores...)
 end
 
-#= The targets of a record output's fields: an omitted output's `_`s, a plain record name's
-   flattened field symbols. =#
+"""
+The targets of a record output's fields: an omitted output's `_`s, a plain record name's
+flattened field symbols.
+"""
 function _recordTupleTargets(target::SC.Exp, fields::Vector{String}, stmt::SC.ASSIGN)::Vector{Symbol}
   target isa SC.WILD && return fill(:_, length(fields))
   local rec = _recordCrefFields(target)
@@ -917,8 +985,10 @@ function generateStatement(stmt::SC.IF)::Expr
   return tail
 end
 
-#= AssertionLevel = enumeration(warning, error): warning is literal 1, so the level is matched
-   by name. Any other level expression means error. =#
+"""
+AssertionLevel = enumeration(warning, error): warning is literal 1, so the level is matched
+by name. Any other level expression means error.
+"""
 isWarningAssertionLevel(level::SC.Exp)::Bool = level isa SC.ENUM_LITERAL && endswith(String(level.name), "warning")
 
 """
@@ -959,7 +1029,9 @@ expToJuliaExpAlg(e::SC.BCONST)::Expr = quote $(e.value) end
 expToJuliaExpAlg(e::SC.ICONST)::Expr = quote $(e.value) end
 expToJuliaExpAlg(e::SC.RCONST)::Expr = quote $(e.value) end
 expToJuliaExpAlg(e::SC.SCONST)::Expr = quote $(e.value) end
-#= An enumeration literal is its index. =#
+"""
+An enumeration literal is its index.
+"""
 expToJuliaExpAlg(e::SC.ENUM_LITERAL)::Expr = quote $(e.index) end
 expToJuliaExpAlg(::SC.WILD)::Expr = quote _ end
 expToJuliaExpAlg(::SC.WHOLE_DIMENSION)::Expr = quote $(:(:)) end
@@ -969,8 +1041,10 @@ function expToJuliaExpAlg(e::SC.EXP_CREF)::Expr
   return Expr(:ref, e.cref.sym, e.cref.subs...)
 end
 
-#= pre(x) in an (initial) algorithm body is the sequentially seeded held value: the argument,
-   as the MTK expression path does. =#
+"""
+pre(x) in an (initial) algorithm body is the sequentially seeded held value: the argument,
+as the MTK expression path does.
+"""
 expToJuliaExpAlg(e::SC.PRE)::Expr = expToJuliaExpAlg(SC.EXP_CREF(e.cref, e.ty))
 
 expToJuliaExpAlg(e::SC.UNARY)::Expr = :($(CodeGeneration.opKindToJuliaOperator(e.op))($(expToJuliaExpAlg(e.exp))))
@@ -984,11 +1058,15 @@ function expToJuliaExpAlg(e::SC.BINARY)::Expr
   return :($(CodeGeneration.opKindToJuliaOperator(e.op))($(lhs), $(rhs)))
 end
 
-#= Boolean discretes read back from the state are 0/1 numbers: compared with 0 before `not`. =#
+"""
+Boolean discretes read back from the state are 0/1 numbers: compared with 0 before `not`.
+"""
 expToJuliaExpAlg(e::SC.LUNARY)::Expr = :($(CodeGeneration.opKindToJuliaOperator(e.op))($(expToJuliaExpAlg(e.exp)) != 0))
 
-#= `||` and `&&` are special forms, `Expr(:||, ...)`; their operands compared with 0 (Boolean
-   discretes read back from the state are 0/1 numbers: a bare `&&` threw a TypeError). =#
+"""
+`||` and `&&` are special forms, `Expr(:||, ...)`; their operands compared with 0 (Boolean
+discretes read back from the state are 0/1 numbers: a bare `&&` threw a TypeError).
+"""
 function expToJuliaExpAlg(e::SC.LBINARY)::Expr
   local (lhs, rhs) = (expToJuliaExpAlg(e.exp1), expToJuliaExpAlg(e.exp2))
   e.op === SC.OP_OR && return Expr(:||, :($(lhs) != 0), :($(rhs) != 0))
@@ -999,8 +1077,10 @@ end
 expToJuliaExpAlg(e::SC.RELATION)::Expr =
   :($(CodeGeneration.opKindToJuliaOperator(e.op))($(expToJuliaExpAlg(e.exp1)), $(expToJuliaExpAlg(e.exp2))))
 
-#= The condition compared with 0: a numerically encoded Boolean discrete made `if <float>`
-   throw a TypeError. =#
+"""
+The condition compared with 0: a numerically encoded Boolean discrete made `if <float>`
+throw a TypeError.
+"""
 function expToJuliaExpAlg(e::SC.IFEXP)::Expr
   local cond = :($(expToJuliaExpAlg(e.cond)) != 0)
   local thenExp = expToJuliaExpAlg(e.thenExp)
@@ -1038,9 +1118,11 @@ function expToJuliaExpAlg(e::SC.CALL)::Expr
   return isempty(shared) ? quote $(expr) end : Expr(:let, Expr(:block, shared...), expr)
 end
 
-#= A function argument with bound arguments: a closure calling the function as a call in a
-   function body does; a bound record argument by its fields, as the callee takes it (MSL 4
-   Inverse_sh_T's `function f_nonlinear(data = ..., ...)`). =#
+"""
+A function argument with bound arguments: a closure calling the function as a call in a
+function body does; a bound record argument by its fields, as the callee takes it (MSL 4
+Inverse_sh_T's `function f_nonlinear(data = ..., ...)`).
+"""
 function expToJuliaExpAlg(e::SC.PARTEVALFUNCTION)::Expr
   local bound = Any[(_recordCrefFields(b) !== nothing || _recordValueType(b) !== nothing) ? Expr(:..., _recordTupleExpr(b)) :
                     expToJuliaExpAlg(b) for b in e.args]
@@ -1049,8 +1131,10 @@ function expToJuliaExpAlg(e::SC.PARTEVALFUNCTION)::Expr
   return closure
 end
 
-#= A cast: the frontend casts to Real only (typeCast), an Integer array to a Real one too
-   (left uncast, `y := m; y[1] := 1.5` failed with an InexactError). =#
+"""
+A cast: the frontend casts to Real only (typeCast), an Integer array to a Real one too
+(left uncast, `y := m; y[1] := 1.5` failed with an InexactError).
+"""
 function expToJuliaExpAlg(e::SC.CAST)::Expr
   local innerExpr = expToJuliaExpAlg(e.exp)
   e.ty isa SC.TYPE_REAL && return :(float($innerExpr))
@@ -1060,7 +1144,9 @@ function expToJuliaExpAlg(e::SC.CAST)::Expr
   CodeGeneration.unsupported("a cast to $(e.ty)", e)
 end
 
-#= An array literal; of rows (a matrix literal) a proper Matrix (ensureArray). =#
+"""
+An array literal; of rows (a matrix literal) a proper Matrix (ensureArray).
+"""
 function expToJuliaExpAlg(e::SC.ARRAY_EXP)::Expr
   local arrExpr = Expr(:vect, Any[expToJuliaExpAlg(x) for x in e.elements]...)
   return e.ty isa SC.TYPE_ARRAY && length(e.ty.dims) >= 2 ? :(OMBackend.CodeGeneration.ensureArray($arrExpr)) : arrExpr
@@ -1072,8 +1158,10 @@ function expToJuliaExpAlg(e::SC.RANGE)::Expr
   return :($startExpr:$(expToJuliaExpAlg(e.step)):$stopExpr)
 end
 
-#= An array element; a record read by a literal index its field (field access, not array
-   indexing: the flat field symbol, as the record's fields are flattened). =#
+"""
+An array element; a record read by a literal index its field (field access, not array
+indexing: the flat field symbol, as the record's fields are flattened).
+"""
 function expToJuliaExpAlg(e::SC.ASUB)::Expr
   local recordField = _recordIndexFieldSymbol(e.exp, e.subs)
   recordField === nothing || return quote $(recordField) end
@@ -1081,14 +1169,18 @@ function expToJuliaExpAlg(e::SC.ASUB)::Expr
   return Expr(:ref, arrExpr, Any[_algIndexExpr(s) for s in e.subs]...)
 end
 
-#= A record constructor: a tuple (one field: the field). =#
+"""
+A record constructor: a tuple (one field: the field).
+"""
 function expToJuliaExpAlg(e::SC.RECORD)::Expr
   local fieldExprs = Any[expToJuliaExpAlg(x) for x in e.exps]
   return length(fieldExprs) == 1 ? first(fieldExprs) : Expr(:tuple, fieldExprs...)
 end
 
-#= An array comprehension or reduction ({e for i in u, j in v}: the last iterator is the first
-   dimension, MLS 10.4.1.2; a Julia comprehension's first iterator is). =#
+"""
+An array comprehension or reduction ({e for i in u, j in v}: the last iterator is the first
+dimension, MLS 10.4.1.2; a Julia comprehension's first iterator is).
+"""
 function expToJuliaExpAlg(e::SC.REDUCTION)::Expr
   local bodyExpr = expToJuliaExpAlg(e.body)
   local iterExprs = Expr[Expr(:(=), Symbol(it.name), expToJuliaExpAlg(it.range)) for it in e.iterators]
@@ -1101,11 +1193,15 @@ end
 "The Julia functions of Modelica's reductions."
 const REDUCERS = Dict{Symbol, Symbol}(:sum => :sum, :product => :prod, :min => :minimum, :max => :maximum)
 
-#= A tuple output's element: a direct index. =#
+"""
+A tuple output's element: a direct index.
+"""
 expToJuliaExpAlg(e::SC.TSUB)::Expr = :($(expToJuliaExpAlg(e.exp))[$(e.index)])
 
-#= A record field of a value (the `re`/`im` of a Complex value, another by its position or
-   name): the MTK path's helpers (algorithmic code never has Symbolics values). =#
+"""
+A record field of a value (the `re`/`im` of a Complex value, another by its position or
+name): the MTK path's helpers (algorithmic code never has Symbolics values).
+"""
 function expToJuliaExpAlg(e::SC.RSUB)::Expr
   local innerJL = expToJuliaExpAlg(e.exp)
   e.fieldName == "re" && return :(OMBackend.CodeGeneration._recordFieldRe($innerJL))

@@ -222,12 +222,16 @@ modelica_integer(x::Symbolics.Num) =
 modelica_integer(x::Number) = floor(Int, x)
 modelica_integer(x) = floor(x)
 
-#= Modelica `Integer(enum_value)` returns the 1-based index of an enum literal.
-   Our codegen lowers enum CREFs to integer indices and ENUM_LITERAL to its
-   `index` field, so this is the identity at the Julia level. =#
+"""
+Modelica `Integer(enum_value)` returns the 1-based index of an enum literal.
+Our codegen lowers enum CREFs to integer indices and ENUM_LITERAL to its
+`index` field, so this is the identity at the Julia level.
+"""
 modelica_Integer(x) = x
-#= Truncated toward zero (MLS 3.7.1: div(-7, 2) = -3), as Base.div; a symbolic
-   quotient through sign and floor (it was floor: -4). =#
+"""
+Truncated toward zero (MLS 3.7.1: div(-7, 2) = -3), as Base.div; a symbolic
+quotient through sign and floor (it was floor: -4).
+"""
 modelica_div(x, y) = div(x, y)
 modelica_div(x::Symbolics.Num, y) = _truncSymbolic(x / y)
 modelica_div(x, y::Symbolics.Num) = _truncSymbolic(x / y)
@@ -374,11 +378,15 @@ Julia: LinearAlgebra.cross(x, y).
 """
 modelica_cross(x, y) = LinearAlgebra.cross(collect(x), collect(y))
 
-#= Euclidean norm mirroring MSL Modelica.Math.Vectors.length(v) = sqrt(v*v). =#
+"""
+Euclidean norm mirroring MSL Modelica.Math.Vectors.length(v) = sqrt(v*v).
+"""
 modelica_vectors_length(v::AbstractVector) = sqrt(sum(x -> x * x, v))
 modelica_vectors_length(v::Number) = abs(v)
 
-#= MSL Modelica.Math.isEqual(s1, s2, eps=0) = abs(s1-s2) <= eps. =#
+"""
+MSL Modelica.Math.isEqual(s1, s2, eps=0) = abs(s1-s2) <= eps.
+"""
 modelica_math_isEqual(s1, s2, eps = 0.0) = abs(s1 - s2) <= eps
 
 """
@@ -428,7 +436,9 @@ end
 modelica_sum(a) = sum(a)
 modelica_product(a) = prod(a)
 
-#= min/max: Modelica overloads these for both scalars and arrays =#
+"""
+min/max: Modelica overloads these for both scalars and arrays
+"""
 modelica_min(a) = minimum(a)
 modelica_min(a, b) = min(a, b)
 modelica_max(a) = maximum(a)
@@ -563,7 +573,9 @@ modelica_String(x::Real, significantDigits::Integer, minimumLength::Integer, lef
   _cFormat(leftJustified ? "%-*.*g" : "%*.*g", Float64(x); width = minimumLength, precision = significantDigits)
 modelica_String(x::Integer, minimumLength::Integer, leftJustified::Bool) =
   modelica_String(x isa Bool ? (x ? "true" : "false") : string(x), minimumLength, leftJustified)
-#= An enumeration literal's name. =#
+"""
+An enumeration literal's name.
+"""
 modelica_String(x::AbstractString, minimumLength::Integer, leftJustified::Bool) =
   leftJustified ? rpad(x, minimumLength) : lpad(x, minimumLength)
 function modelica_String(x::Real, format::AbstractString)
@@ -572,21 +584,25 @@ function modelica_String(x::Real, format::AbstractString)
   return _cFormat("%" * format, Float64(x))
 end
 
-#= C's printf of one double, after the width and precision of a `*.*` format,
-   through Julia's Printf (the same conversions, as C): Windows exports no
-   snprintf symbol (the Universal CRT defines it inline), and the ccall failed
-   there ("could not load symbol", 2026-10-03). =#
+"""
+C's printf of one double, after the width and precision of a `*.*` format,
+through Julia's Printf (the same conversions, as C): Windows exports no
+snprintf symbol (the Universal CRT defines it inline), and the ccall failed
+there ("could not load symbol", 2026-10-03).
+"""
 function _cFormat(fmt::String, x::Float64; width::Union{Integer, Nothing} = nothing, precision::Integer = 0)
   width === nothing || (fmt = replace(fmt, "*.*" => string(width, ".", precision)))
   return Printf.format(Printf.Format(fmt), x)
 end
 
-#= A call of Modelica's String with the arguments the frontend fills in, each
-   lowered by `lower`: (r, significantDigits, minimumLength, leftJustified),
-   (x, minimumLength, leftJustified) of an Integer, Boolean or enumeration
-   value, or (r, format). Where the integrator holds the values they are
-   Float64s: Integer arguments are rounded, Boolean ones compared with 0, and
-   an enumeration value is its literal's name. =#
+"""
+A call of Modelica's String with the arguments the frontend fills in, each
+lowered by `lower`: (r, significantDigits, minimumLength, leftJustified),
+(x, minimumLength, leftJustified) of an Integer, Boolean or enumeration
+value, or (r, format). Where the integrator holds the values they are
+Float64s: Integer arguments are rounded, Boolean ones compared with 0, and
+an enumeration value is its literal's name.
+"""
 function modelicaStringCall(args::Vector{SimCode.Exp}, lower)::Expr
   local S = :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_String)
   local int = e -> :(round(Int, $(lower(e))))
@@ -619,9 +635,11 @@ We return the actual expression (lambda=1 case).
 """
 modelica_homotopy(actual, simplified) = actual
 
-#= In the equations, with the homotopy parameter λ: the actual expression at
-   λ = 1 (the simplified one is not used there, and may be anything), the
-   blend λ actual + (1 - λ) simplified below it. =#
+"""
+In the equations, with the homotopy parameter λ: the actual expression at
+λ = 1 (the simplified one is not used there, and may be anything), the
+blend λ actual + (1 - λ) simplified below it.
+"""
 modelica_homotopy(actual, simplified, λ) = ifelse(λ >= 1, actual, λ * actual + (1 - λ) * simplified)
 
 """

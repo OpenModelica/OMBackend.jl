@@ -48,17 +48,23 @@
 const HEADER_STRING ="
   $(copyrightString())"
 
-#= An elsewhen arm as a when-equation of its own, `nothing` for none. =#
+"""
+An elsewhen arm as a when-equation of its own, `nothing` for none.
+"""
 _elsewhenInner(::Nothing) = nothing
 _elsewhenInner(p::SC.WHEN_STMTS)::SC.WHEN_EQUATION = SC.WHEN_EQUATION(p, SC.NO_SOURCE, SC.EQ_ATTR_DEFAULT)
 
 _elsewhenCondition(arm::SC.WHEN_EQUATION)::SC.Exp = arm.whenEquation.condition
 _elsewhenStmtLst(arm::SC.WHEN_EQUATION)::Vector{SC.Statement} = arm.whenEquation.body
 
-#= The names a when body reads (getRHSVariables of each statement). =#
+"""
+The names a when body reads (getRHSVariables of each statement).
+"""
 _bodyReads(body::Vector{SC.Statement})::Vector{String} = reduce(vcat, (getRHSVariables(s) for s in body); init = String[])
 
-#= The names a when body assigns. =#
+"""
+The names a when body assigns.
+"""
 function _bodyWrites(body::Vector{SC.Statement})::OrderedSet{String}
   local written = OrderedSet{String}()
   for s in body
@@ -67,9 +73,11 @@ function _bodyWrites(body::Vector{SC.Statement})::OrderedSet{String}
   return written
 end
 
-#= The names a condition reads OUTSIDE any `change(...)` or `pre(...)`: the level-valued
-   Booleans of the condition (`when boolVar then`), for which the discrete callback keeps an
-   edge latch. =#
+"""
+The names a condition reads OUTSIDE any `change(...)` or `pre(...)`: the level-valued
+Booleans of the condition (`when boolVar then`), for which the discrete callback keeps an
+edge latch.
+"""
 function _collectBareCrefStrings(cond::SC.Exp)::OrderedSet{String}
   local out = OrderedSet{String}()
   local walk = function (e::SC.Exp, insideObs::Bool)
@@ -166,7 +174,9 @@ returnCallbackSet()::Vector{Symbol} = Symbol[Symbol("cb", t) for t in 1:COUNT_CA
 createEquations(equations::Vector{SC.WHEN_EQUATION}, simCode::SC.SIM_CODE)::Vector{Expr} =
   Expr[eqToJulia(eq, simCode, i) for (i, eq) in enumerate(equations)]
 
-#= The lookups of the variables name[1], name[2], ... (none when name[1] is not a variable). =#
+"""
+The lookups of the variables name[1], name[2], ... (none when name[1] is not a variable).
+"""
 function _scalarizedElementLookups(name::String, simCode::SC.SIM_CODE)::Vector{Any}
   local elems = Any[]
   local key = string(name, "[1]")
@@ -181,13 +191,15 @@ end
    replace them. =#
 const _WHEN_CALLBACK_LOCALS = ("x", "p", "t", "integrator", "lookuptableStates", "lookuptableParams")
 
-#= `name = <state/param lookup>` bindings for the names a when callback reads, one per name. A
-   name the table does not have is an inlined constant (a logic ResetMap[i] element) the
-   lowering emits as a literal, and gets none (a state/param index for it would KeyError),
-   unless it is a whole array of variables: then the vector of their values (MSL
-   GenerateRandomNumbers' when reads pre(state64), a discrete Integer[2]). A String or a data
-   structure (an external object: Buildings' borehole ExtendableArray) is a module-level
-   binding (createDataStructureAssignments), never a state or parameter slot. =#
+"""
+`name = <state/param lookup>` bindings for the names a when callback reads, one per name. A
+name the table does not have is an inlined constant (a logic ResetMap[i] element) the
+lowering emits as a literal, and gets none (a state/param index for it would KeyError),
+unless it is a whole array of variables: then the vector of their values (MSL
+GenerateRandomNumbers' when reads pre(state64), a discrete Integer[2]). A String or a data
+structure (an external object: Buildings' borehole ExtendableArray) is a module-level
+binding (createDataStructureAssignments), never a state or parameter slot.
+"""
 function _whenLookupBindings(names::Vector{String}, simCode::SC.SIM_CODE)::Vector{Expr}
   local out = Expr[]
   for name in unique(names)
@@ -209,7 +221,9 @@ end
 
 _isTimeCref(e::SC.Exp)::Bool = e isa SC.EXP_CREF && e.cref.sym === :time && isempty(e.cref.subs)
 
-#= The constant threshold of a `time <relop> c` relation, or nothing. =#
+"""
+The constant threshold of a `time <relop> c` relation, or nothing.
+"""
 function _timeThreshold(rel::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, Vector{Float64}}
   (rel isa SC.RELATION && rel.op in (SC.OP_LESS, SC.OP_LESSEQ, SC.OP_GREATER, SC.OP_GREATEREQ)) || return nothing
   local thr = _isTimeCref(rel.exp1) ? rel.exp2 : _isTimeCref(rel.exp2) ? rel.exp1 : nothing
@@ -218,11 +232,13 @@ function _timeThreshold(rel::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, Vecto
   return v === nothing ? nothing : Float64[v]
 end
 
-#= The threshold of a `time >= thr` (or mirrored `thr <= time`) relation that reads a runtime
-   discrete variable, or nothing: a runtime-scheduled time event (the threshold is known once
-   the assigning when fires): no PresetTimeCallback, and a ContinuousCallback is unsafe
-   (simultaneous crossings of several such callbacks are tie-broken to a single applied
-   affect). =#
+"""
+The threshold of a `time >= thr` (or mirrored `thr <= time`) relation that reads a runtime
+discrete variable, or nothing: a runtime-scheduled time event (the threshold is known once
+the assigning when fires): no PresetTimeCallback, and a ContinuousCallback is unsafe
+(simultaneous crossings of several such callbacks are tie-broken to a single applied
+affect).
+"""
 function _discreteTimeEventThreshold(cond::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, SC.Exp}
   cond isa SC.RELATION || return nothing
   local thr = (_isTimeCref(cond.exp1) && cond.op in (SC.OP_GREATEREQ, SC.OP_GREATER)) ? cond.exp2 :
@@ -242,8 +258,10 @@ function _discreteTimeEventThreshold(cond::SC.Exp, simCode::SC.SIM_CODE)::Union{
   return hasDiscrete ? thr : nothing
 end
 
-#= `change(p)` of a parameter or a literal never fires: no event, and it does not disqualify a
-   pure time-threshold chain. =#
+"""
+`change(p)` of a parameter or a literal never fires: no event, and it does not disqualify a
+pure time-threshold chain.
+"""
 function _isConstChangeArg(a::SC.Exp, simCode::SC.SIM_CODE)::Bool
   a isa Union{SC.RCONST, SC.ICONST, SC.BCONST} && return true
   a isa SC.EXP_CREF || return false
@@ -251,11 +269,13 @@ function _isConstChangeArg(a::SC.Exp, simCode::SC.SIM_CODE)::Bool
   return entry !== nothing && SC.isParameter(last(entry))
 end
 
-#= A synthesized table/time when-condition: an or-chain whose every leaf is `change(time
-   <relop> const)` (a time threshold) or `change(param)` (never fires). The threshold times (may
-   be none), or nothing for a condition with another trigger. Such whens fire AT the thresholds
-   (a PresetTimeCallback): a ContinuousCallback rootfinding on the spiky change() value never
-   detects the crossings (Digital.Sources.Table, time-driven sources). =#
+"""
+A synthesized table/time when-condition: an or-chain whose every leaf is `change(time
+<relop> const)` (a time threshold) or `change(param)` (never fires). The threshold times (may
+be none), or nothing for a condition with another trigger. Such whens fire AT the thresholds
+(a PresetTimeCallback): a ContinuousCallback rootfinding on the spiky change() value never
+detects the crossings (Digital.Sources.Table, time-driven sources).
+"""
 function _collectTimeThresholds(cond::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, Vector{Float64}}
   if cond isa SC.LBINARY && cond.op === SC.OP_OR
     local l = _collectTimeThresholds(cond.exp1, simCode)
@@ -269,7 +289,9 @@ function _collectTimeThresholds(cond::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothi
   return nothing
 end
 
-#= The lookup tables of a callback, built at its first call (`cache` a Ref of them). =#
+"""
+The lookup tables of a callback, built at its first call (`cache` a Ref of them).
+"""
 function _lookupTables(cache::Symbol)::Expr
   quote
     local lookuptableStates
@@ -288,12 +310,14 @@ function _lookupTables(cache::Symbol)::Expr
   end
 end
 
-#= An `elsewhen time >= thr` arm (thr reading a runtime discrete) as an edge-guarded
-   DiscreteCallback: ContinuousCallbacks are unsafe here, when several such arms cross zero at
-   the same instant the integrator applies only one and the rest never re-fire. `ewRefSym`
-   names a Ref shared with the parent when-branch holding the last consumed threshold: the
-   parent consumes the threshold when it fires at or past it (elsewhen exclusivity), and this
-   callback consumes it on firing so a level-true condition stays edge-only. =#
+"""
+An `elsewhen time >= thr` arm (thr reading a runtime discrete) as an edge-guarded
+DiscreteCallback: ContinuousCallbacks are unsafe here, when several such arms cross zero at
+the same instant the integrator applies only one and the rest never re-fire. `ewRefSym`
+names a Ref shared with the parent when-branch holding the last consumed threshold: the
+parent consumes the threshold when it fires at or past it (elsewhen exclusivity), and this
+callback consumes it on firing so a level-true condition stays edge-only.
+"""
 function _emitElsewhenThresholdTimeWhen(elseArm::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, ewRefSym::Symbol, thr::SC.Exp)::Expr
   ADD_CALLBACK()
   local callbacks = COUNT_CALLBACKS()
@@ -332,8 +356,10 @@ function _emitElsewhenThresholdTimeWhen(elseArm::SC.WHEN_EQUATION, simCode::SC.S
   end
 end
 
-#= A PresetTimeCallback for a table/time when: the (time-dependent) body at each threshold, so
-   a stepped output (a Digital Table) lands on its sample times. =#
+"""
+A PresetTimeCallback for a table/time when: the (time-dependent) body at each threshold, so
+a stepped output (a Digital Table) lands on its sample times.
+"""
 function _emitPresetTimeWhen(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, callbacks::Int, thresholds::Vector{Float64})::Expr
   local body = eq.whenEquation.body
   #= pre(v) from the state before the instant (instantPre): an earlier statement's new value is not pre(v). =#
@@ -359,7 +385,9 @@ end
 
 _isPreCref(e::SC.Exp)::Bool = e isa SC.PRE || SC.isBuiltin(e, :pre)
 
-#= `(time - S)/P` (or `time/P`): (S, P) as numbers, or nothing. =#
+"""
+`(time - S)/P` (or `time/P`): (S, P) as numbers, or nothing.
+"""
 function _timeOffsetOverPeriod(e::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, Tuple{Float64, Float64}}
   (e isa SC.BINARY && e.op === SC.OP_DIV) || return nothing
   local p = OMBackend._tryOr(() -> SC.tryEvalNumeric(e.exp2, simCode), nothing, :timePeriod)
@@ -374,12 +402,14 @@ function _timeOffsetOverPeriod(e::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, 
   return (Float64(s), Float64(p))
 end
 
-#= MSL 4.1's Pulse: `time >= (pre(count) + 1)*period + startTime`, a time event (4.0 had
-   `integer((time - startTime)/period) > pre(count)`). The threshold, affine in pre(count), at
-   counts 0, 1 and 2 gives (startTime, period), or nothing; the when must count it up by one
-   (`count = pre(count) + 1`: `t = pre(t) + dt` under `time >= pre(t)` is no such clock). As a
-   generic when the pulse lost the end of most periods: the relation `time < T_start +
-   T_width` jumped with T_start (the 4.0 path refreshes it, _collectIfCondRefresh). =#
+"""
+MSL 4.1's Pulse: `time >= (pre(count) + 1)*period + startTime`, a time event (4.0 had
+`integer((time - startTime)/period) > pre(count)`). The threshold, affine in pre(count), at
+counts 0, 1 and 2 gives (startTime, period), or nothing; the when must count it up by one
+(`count = pre(count) + 1`: `t = pre(t) + dt` under `time >= pre(t)` is no such clock). As a
+generic when the pulse lost the end of most periods: the relation `time < T_start +
+T_width` jumped with T_start (the 4.0 path refreshes it, _collectIfCondRefresh).
+"""
 function _affinePreThreshold(thr::SC.Exp, simCode::SC.SIM_CODE, stmts::Vector{SC.Statement})::Union{Nothing, Tuple{Float64, Float64}}
   local name = Ref("")
   local f = Float64[]
@@ -396,7 +426,9 @@ function _affinePreThreshold(thr::SC.Exp, simCode::SC.SIM_CODE, stmts::Vector{SC
   return (f[1] - period, period)
 end
 
-#= Whether the statements assign `name = pre(name) + 1`. =#
+"""
+Whether the statements assign `name = pre(name) + 1`.
+"""
 function _countsUpByOne(stmts::Vector{SC.Statement}, name::String, simCode::SC.SIM_CODE)::Bool
   for st in stmts
     (st isa SC.ASSIGN && SC.crefNameOf(st.left) == name) || continue
@@ -414,8 +446,10 @@ function _countsUpByOne(stmts::Vector{SC.Statement}, name::String, simCode::SC.S
   return false
 end
 
-#= `e` with its pre(v), all of one v (its name into `name`), replaced by the literal k; nothing
-   for an expression other than arithmetic of references and literals. =#
+"""
+`e` with its pre(v), all of one v (its name into `name`), replaced by the literal k; nothing
+for an expression other than arithmetic of references and literals.
+"""
 function _substitutePre(e::SC.Exp, k::Float64, name::Base.RefValue{String})::Union{Nothing, SC.Exp}
   if e isa SC.PRE
     local nm = SC.crefName(e.cref)
@@ -436,12 +470,14 @@ function _substitutePre(e::SC.Exp, k::Float64, name::Base.RefValue{String})::Uni
   return e isa Union{SC.EXP_CREF, SC.RCONST, SC.ICONST} ? e : nothing
 end
 
-#= The Modelica Source.Pulse / SignalSource periodic when-condition
-   `integer((time - startTime)/period) <relop> pre(counter)` (or MSL 4.1's
-   `_affinePreThreshold`): (startTime, period), or nothing. A periodic clock: it fires AT
-   t = startTime + n*period (a PeriodicCallback). A ContinuousCallback rootfinding on the
-   staircase `integer(...) > pre(count)`, a piecewise-constant 0/1, cannot reliably catch it:
-   the pulse counter and T_start froze (Blocks.Sources.Pulse, the machines driven by it). =#
+"""
+The Modelica Source.Pulse / SignalSource periodic when-condition
+`integer((time - startTime)/period) <relop> pre(counter)` (or MSL 4.1's
+`_affinePreThreshold`): (startTime, period), or nothing. A periodic clock: it fires AT
+t = startTime + n*period (a PeriodicCallback). A ContinuousCallback rootfinding on the
+staircase `integer(...) > pre(count)`, a piecewise-constant 0/1, cannot reliably catch it:
+the pulse counter and T_start froze (Blocks.Sources.Pulse, the machines driven by it).
+"""
 function _pulsePeriodicSpec(cond::SC.Exp, simCode::SC.SIM_CODE, stmts::Vector{SC.Statement})::Union{Nothing, Tuple{Float64, Float64}}
   (cond isa SC.RELATION && cond.op in (SC.OP_GREATER, SC.OP_GREATEREQ)) || return nothing
   _isTimeCref(cond.exp1) && return _affinePreThreshold(cond.exp2, simCode, stmts)
@@ -450,12 +486,14 @@ function _pulsePeriodicSpec(cond::SC.Exp, simCode::SC.SIM_CODE, stmts::Vector{SC
   return _timeOffsetOverPeriod(only(cond.exp1.args), simCode)
 end
 
-#= An if-condition that reads a discrete a periodic when updates (the Pulse `time < T_start +
-   T_width`, T_start set at each period boundary) cannot be refreshed by its own MTK continuous
-   callback: when T_start jumps the zero-crossing expression jumps across 0 with no smooth
-   crossing for the rootfinder to catch. For each if-condition that reads a variable the when
-   body writes, the assignment that re-derives its `ifCondNI` discrete parameter from the
-   (now-current) condition value (the naming of createIfEquations: `ifCond<sortIndex><branch>`). =#
+"""
+An if-condition that reads a discrete a periodic when updates (the Pulse `time < T_start +
+T_width`, T_start set at each period boundary) cannot be refreshed by its own MTK continuous
+callback: when T_start jumps the zero-crossing expression jumps across 0 with no smooth
+crossing for the rootfinder to catch. For each if-condition that reads a variable the when
+body writes, the assignment that re-derives its `ifCondNI` discrete parameter from the
+(now-current) condition value (the naming of createIfEquations: `ifCond<sortIndex><branch>`).
+"""
 function _collectIfCondRefresh(writtenLHS::OrderedSet{String}, simCode::SC.SIM_CODE)::Tuple{Vector{String}, Vector{Expr}}
   local refreshCrefs = String[]
   local assigns = Expr[]
@@ -479,14 +517,16 @@ function _collectIfCondRefresh(writtenLHS::OrderedSet{String}, simCode::SC.SIM_C
   return (refreshCrefs, assigns)
 end
 
-#= Companion to _collectIfCondRefresh for discrete-Boolean whens: one whose condition reads a
-   discrete the periodic body writes (BooleanPulse `y = time >= pulseStart and time <
-   pulseStart + Twidth`, pulseStart re-sampled each period) is lowered to MTK continuous
-   callbacks that cannot catch the discontinuous threshold jump. Its body runs again in the
-   periodic callback, from the now-current threshold. A discrete cluster needs none: the event
-   iteration after the step sees its relation on the written discrete flip (exact, no
-   hysteresis) and solves the cluster again with the algebraic unknowns. The refresh names
-   (bound again from the updated state) and the body statements. =#
+"""
+Companion to _collectIfCondRefresh for discrete-Boolean whens: one whose condition reads a
+discrete the periodic body writes (BooleanPulse `y = time >= pulseStart and time <
+pulseStart + Twidth`, pulseStart re-sampled each period) is lowered to MTK continuous
+callbacks that cannot catch the discontinuous threshold jump. Its body runs again in the
+periodic callback, from the now-current threshold. A discrete cluster needs none: the event
+iteration after the step sees its relation on the written discrete flip (exact, no
+hysteresis) and solves the cluster again with the algebraic unknowns. The refresh names
+(bound again from the updated state) and the body statements.
+"""
 function _collectDiscreteBoolWhenRefresh(writtenLHS::OrderedSet{String}, simCode::SC.SIM_CODE)::Tuple{Vector{String}, Vector{Expr}}
   local refreshCrefs = String[]
   local refreshStmts = Expr[]
@@ -508,12 +548,14 @@ function _collectDiscreteBoolWhenRefresh(writtenLHS::OrderedSet{String}, simCode
   return (refreshCrefs, refreshStmts)
 end
 
-#= A PeriodicCallback for a Pulse-style periodic when: the body at the
-   `integer((time-startTime)/period)` increments, t = startTime + n*period for the n in
-   (tspan[1], stopTime]. `_firstEdge` is the first such instant assuming tspan[1] = 0 (Modelica's
-   `integer` is floor), in (0, period]: a valid non-negative phase. A bare `phase =
-   mod(startTime, period)` with `initial_affect = false` dropped the first edge whenever
-   startTime < 0 (-0.035), shifting the whole pulse train by one period. =#
+"""
+A PeriodicCallback for a Pulse-style periodic when: the body at the
+`integer((time-startTime)/period)` increments, t = startTime + n*period for the n in
+(tspan[1], stopTime]. `_firstEdge` is the first such instant assuming tspan[1] = 0 (Modelica's
+`integer` is floor), in (0, period]: a valid non-negative phase. A bare `phase =
+mod(startTime, period)` with `initial_affect = false` dropped the first edge whenever
+startTime < 0 (-0.035), shifting the whole pulse train by one period.
+"""
 function _emitPulsePeriodicWhen(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, callbacks::Int, startTime::Float64, period::Float64)::Expr
   local body = eq.whenEquation.body
   local _firstEdge = startTime + (floor(-startTime / period) + 1.0) * period
@@ -550,9 +592,11 @@ end
 const _RELATION_WHEN_EXCLUDED_CALLS = (:edge, :change, :sample, :initial, :terminal, :der, :pre,
                                        :delay, :noEvent, :smooth, :reinit)
 
-#= A when condition that is one relation `a op b` (op one of < <= > >=) whose operands call
-   none of the operators above (nor a delay, pre(), der()): (a, b, isLess, strict), or
-   nothing. =#
+"""
+A when condition that is one relation `a op b` (op one of < <= > >=) whose operands call
+none of the operators above (nor a delay, pre(), der()): (a, b, isLess, strict), or
+nothing.
+"""
 function _singleRelationWhen(cond::SC.Exp)::Union{Nothing, Tuple{SC.Exp, SC.Exp, Bool, Bool}}
   (cond isa SC.RELATION && cond.op in (SC.OP_LESS, SC.OP_LESSEQ, SC.OP_GREATER, SC.OP_GREATEREQ)) || return nothing
   local excluded = e::SC.Exp -> e isa Union{SC.PRE, SC.DER} || _isDelayCall(e) ||
@@ -561,10 +605,12 @@ function _singleRelationWhen(cond::SC.Exp)::Union{Nothing, Tuple{SC.Exp, SC.Exp,
   return (cond.exp1, cond.exp2, cond.op in (SC.OP_LESS, SC.OP_LESSEQ), cond.op in (SC.OP_LESS, SC.OP_GREATER))
 end
 
-#= A when-equation on one relation (relationRefresh.jl relationWhenCallback): the relation is
-   buffered, set literally at the start, with a hysteresis, and the body runs only when it
-   becomes true. `zc` is `a - b` for < and <=, `b - a` for > and >=, so the relation is true
-   when zc < 0 (or <= 0). =#
+"""
+A when-equation on one relation (relationRefresh.jl relationWhenCallback): the relation is
+buffered, set literally at the start, with a hysteresis, and the body runs only when it
+becomes true. `zc` is `a - b` for < and <=, `b - a` for > and >=, so the relation is true
+when zc < 0 (or <= 0).
+"""
 function _emitRelationWhen(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, callbacks::Int, rel::Tuple{SC.Exp, SC.Exp, Bool, Bool})::Expr
   local body = eq.whenEquation.body
   local (e1, e2, isLess, strict) = rel
@@ -599,31 +645,39 @@ function _emitRelationWhen(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, callbacks
   end
 end
 
-#= Whether the time is a tick of a PeriodicCallback, t0 + phase + k*period. With final_affect
-   the callback also runs when the integration ends: a tick there runs (omc samples at the stop
-   time too: n(1) = 6 for ticks at 0.5, ..., 1.0; the callback left out the final time), any
-   other end not. =#
+"""
+Whether the time is a tick of a PeriodicCallback, t0 + phase + k*period. With final_affect
+the callback also runs when the integration ends: a tick there runs (omc samples at the stop
+time too: n(1) = 6 for ticks at 0.5, ..., 1.0; the callback left out the final time), any
+other end not.
+"""
 function _isPeriodicTick(integrator, phase::Real, period::Real)::Bool
   local n = (integrator.t - first(integrator.sol.prob.tspan) - phase) / period
   return n >= -1e-9 && abs(n - round(n)) <= 1e-9 * max(1.0, abs(n))
 end
 
-#= Whether `t` is a tick of sample(start, interval): start + k*interval, k = 0, 1, ... =#
+"""
+Whether `t` is a tick of sample(start, interval): start + k*interval, k = 0, 1, ...
+"""
 function _isSampleInstant(t::Real, start::Real, interval::Real)::Bool
   local n = (t - start) / interval
   return n >= -1e-9 && abs(n - round(n)) <= 1e-9 * max(1.0, abs(n))
 end
 
-#= The conjuncts of `e` (`a and b and c`: a, b, c). =#
+"""
+The conjuncts of `e` (`a and b and c`: a, b, c).
+"""
 function _conjuncts!(out::Vector{SC.Exp}, e::SC.Exp)::Vector{SC.Exp}
   (e isa SC.LBINARY && e.op === SC.OP_AND) || return push!(out, e)
   _conjuncts!(out, e.exp1)
   return _conjuncts!(out, e.exp2)
 end
 
-#= `(sample call, guard)` of a when condition that is `sample(...)` or a conjunction with
-   exactly one sample() conjunct (the guard: the other conjuncts, or nothing); `(nothing,
-   nothing)` otherwise. =#
+"""
+`(sample call, guard)` of a when condition that is `sample(...)` or a conjunction with
+exactly one sample() conjunct (the guard: the other conjuncts, or nothing); `(nothing,
+nothing)` otherwise.
+"""
 function _splitSampleCondition(cond::SC.Exp)::Tuple{Union{Nothing, SC.CALL}, Union{Nothing, SC.Exp}}
   local conjuncts = _conjuncts!(SC.Exp[], cond)
   local isSample = e::SC.Exp -> SC.isBuiltin(e, :sample)
@@ -635,7 +689,9 @@ function _splitSampleCondition(cond::SC.Exp)::Tuple{Union{Nothing, SC.CALL}, Uni
   return (only(samples), foldl((a, b) -> SC.LBINARY(a, SC.OP_AND, b), rest))
 end
 
-#= The sample() calls of a condition that is only sample()s or-ed (more than one), or nothing. =#
+"""
+The sample() calls of a condition that is only sample()s or-ed (more than one), or nothing.
+"""
 function _sampleDisjuncts(cond::SC.Exp)::Union{Vector{SC.CALL}, Nothing}
   local out = SC.CALL[]
   local collect! = nothing
@@ -648,9 +704,11 @@ function _sampleDisjuncts(cond::SC.Exp)::Union{Vector{SC.CALL}, Nothing}
   return (collect!(cond) && length(out) > 1) ? out : nothing
 end
 
-#= `(sample calls, the other disjuncts or-ed)` of a condition that or-s sample()s with other
-   triggers, none of them under a sample() (Buildings' occupant lighting: `when {occ,
-   sampleTrigger}`, edge(occ) or sample(t0, samplePeriod)), or nothing. =#
+"""
+`(sample calls, the other disjuncts or-ed)` of a condition that or-s sample()s with other
+triggers, none of them under a sample() (Buildings' occupant lighting: `when {occ,
+sampleTrigger}`, edge(occ) or sample(t0, samplePeriod)), or nothing.
+"""
 function _sampleOrOthers(cond::SC.Exp)::Union{Tuple{Vector{SC.CALL}, SC.Exp}, Nothing}
   local samples = SC.CALL[]
   local others = SC.Exp[]
@@ -670,11 +728,13 @@ function _sampleOrOthers(cond::SC.Exp)::Union{Tuple{Vector{SC.CALL}, SC.Exp}, No
   return (samples, foldl((a, b) -> SC.LBINARY(a, SC.OP_OR, b), others))
 end
 
-#= The ticks of the sample()s of a when that or-s them with other triggers (`clocks`:
-   (interval, phase, a tick at the initial time) each). A tick marks its instant in `tickAt`:
-   the event iteration, which runs after the instant's other ticks, then runs the when once
-   (`affect!` takes the tick). At the start of a solve no iteration follows: there the tick runs
-   `affect!` itself. The end of a solve is a tick only where a clock ticks. =#
+"""
+The ticks of the sample()s of a when that or-s them with other triggers (`clocks`:
+(interval, phase, a tick at the initial time) each). A tick marks its instant in `tickAt`:
+the event iteration, which runs after the instant's other ticks, then runs the when once
+(`affect!` takes the tick). At the start of a solve no iteration follows: there the tick runs
+`affect!` itself. The end of a solve is a tick only where a clock ticks.
+"""
 function _sampleTickCallback(tickAt::Base.RefValue{Float64}, affect!::Function, clocks::Vector)
   local ticks = map(clocks) do (dt, phase, initialTick)
     local tick! = integrator -> begin
@@ -689,12 +749,14 @@ function _sampleTickCallback(tickAt::Base.RefValue{Float64}, affect!::Function, 
   return DiffEqBase.CallbackSet(ticks...)
 end
 
-#= (interval, phase, a tick at the initial time) of `sample(start, interval)`. The ticks are
-   start + i*interval, i = 0, 1, ...: the phase is the first one from the initial time (taken as
-   0). A start not known here is refused (generated code cannot read the parameters at module
-   level); a negative one ticks from its first tick after 0 (sample(-0.15, 0.25) at 0.1, not
-   0.25). A tick at the initial time is taken too, after the initialization (omc, Dymola: MSL
-   RealFFT1's `when sample(0, Ts)` samples y(0) into its FFT buffer). =#
+"""
+(interval, phase, a tick at the initial time) of `sample(start, interval)`. The ticks are
+start + i*interval, i = 0, 1, ...: the phase is the first one from the initial time (taken as
+0). A start not known here is refused (generated code cannot read the parameters at module
+level); a negative one ticks from its first tick after 0 (sample(-0.15, 0.25) at 0.1, not
+0.25). A tick at the initial time is taken too, after the initialization (omc, Dymola: MSL
+RealFFT1's `when sample(0, Ts)` samples y(0) into its FFT buffer).
+"""
 function _sampleClock(sampleCall::SC.CALL, simCode::SC.SIM_CODE)::Tuple{Any, Float64, Bool}
   local (start, interval) = (sampleCall.args[1], sampleCall.args[2])
   local intervalValue = SC.tryEvalNumeric(interval, simCode)
@@ -789,10 +851,12 @@ function eqToJulia(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, arrayIdx::Int)::E
   return _discreteWhen(eq, condition, cond, tickCalls, simCode, callbacks)
 end
 
-#= The condition function of a continuous when's ContinuousCallback, its zero crossing `cond`
-   lowered with the variables looked up (MTK may reorder the unknowns: an index of the
-   variables' order is wrong after structural_simplify). Where none of the names is a state or
-   a parameter `noTrigger` (the condition cannot be evaluated). =#
+"""
+The condition function of a continuous when's ContinuousCallback, its zero crossing `cond`
+lowered with the variables looked up (MTK may reorder the unknowns: an index of the
+variables' order is wrong after structural_simplify). Where none of the names is a state or
+a parameter `noTrigger` (the condition cannot be evaluated).
+"""
 function _continuousWhenCondition(cond::SC.Exp, simCode::SC.SIM_CODE, callbacks::Int; withParameters::Bool)::Expr
   local names = filter(n -> n != "time", SC.allCrefNames(cond))
   local xs = Symbol[Symbol(n) for n in names]
@@ -830,9 +894,11 @@ function _continuousWhenCondition(cond::SC.Exp, simCode::SC.SIM_CODE, callbacks:
   end
 end
 
-#= A continuous when and its elsewhen of the same zero crossing: one ContinuousCallback whose
-   affect runs the arm the condition selects. pre(v) from the state before the instant
-   (instantPre): an earlier statement's new value is not pre(v). =#
+"""
+A continuous when and its elsewhen of the same zero crossing: one ContinuousCallback whose
+affect runs the arm the condition selects. pre(v) from the state before the instant
+(instantPre): an earlier statement's new value is not pre(v).
+"""
 function _continuousWhenElseWhen(eq::SC.WHEN_EQUATION, elsePart::SC.WHEN_EQUATION, cond::SC.Exp, simCode::SC.SIM_CODE, callbacks::Int)::Expr
   local wEq = eq.whenEquation
   local (thenStatements, elseStatements) = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
@@ -870,14 +936,16 @@ function _continuousWhenElseWhen(eq::SC.WHEN_EQUATION, elsePart::SC.WHEN_EQUATIO
   end
 end
 
-#= A continuous when: a ContinuousCallback on its zero crossing. pre(v) from the state before
-   the instant (instantPre): `b = not pre(c); k = if pre(c) ...` with c = b read b's new value
-   (k = 20, OpenModelica 10). RightRootFind: the event lands just past the root, where the
-   condition has changed sign; from the left of it the next step finds the same crossing
-   again (DiffEqBase 7 no longer suppresses that repeat: ElseWhenBasic looped at x = 0.3 until
-   MaxIters). No `affect_neg!`: transformToZeroCrossingCondition encodes the direction
-   (positive to negative triggers); `affect_neg! = affect!` double-fired on each oscillation
-   (the bouncing ball's reinit at the down- and the up-crossing: Zeno, maxiters). =#
+"""
+A continuous when: a ContinuousCallback on its zero crossing. pre(v) from the state before
+the instant (instantPre): `b = not pre(c); k = if pre(c) ...` with c = b read b's new value
+(k = 20, OpenModelica 10). RightRootFind: the event lands just past the root, where the
+condition has changed sign; from the left of it the next step finds the same crossing
+again (DiffEqBase 7 no longer suppresses that repeat: ElseWhenBasic looped at x = 0.3 until
+MaxIters). No `affect_neg!`: transformToZeroCrossingCondition encodes the direction
+(positive to negative triggers); `affect_neg! = affect!` double-fired on each oscillation
+(the bouncing ball's reinit at the down- and the up-crossing: Zeno, maxiters).
+"""
 function _continuousWhen(eq::SC.WHEN_EQUATION, cond::SC.Exp, simCode::SC.SIM_CODE, callbacks::Int)::Expr
   local wEq = eq.whenEquation
   local whenStatements = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
@@ -918,13 +986,15 @@ function _continuousWhen(eq::SC.WHEN_EQUATION, cond::SC.Exp, simCode::SC.SIM_COD
   end
 end
 
-#= A when on sample() clocks: a PeriodicCallback per clock (the body once at an instant two
-   clocks share), the guard read at each tick. The variables are looked up (MTK reorders the
-   unknowns). pre(v) from the state before the instant (instantPre): a body reading pre(c)
-   after setting its alias b (`b = not pre(c); k = if pre(c) ...`) read the new value. The
-   discrete-Boolean whens whose condition reads a discrete the body writes (BooleanPulse `y`
-   reads the re-sampled `pulseStart`) are refreshed in the affect: their own continuous
-   callbacks cannot catch the threshold jump. =#
+"""
+A when on sample() clocks: a PeriodicCallback per clock (the body once at an instant two
+clocks share), the guard read at each tick. The variables are looked up (MTK reorders the
+unknowns). pre(v) from the state before the instant (instantPre): a body reading pre(c)
+after setting its alias b (`b = not pre(c); k = if pre(c) ...`) read the new value. The
+discrete-Boolean whens whose condition reads a discrete the body writes (BooleanPulse `y`
+reads the re-sampled `pulseStart`) are refreshed in the affect: their own continuous
+callbacks cannot catch the threshold jump.
+"""
 function _periodicWhen(eq::SC.WHEN_EQUATION, sampleCalls::Vector{SC.CALL}, sampleGuard::Union{Nothing, SC.Exp},
                        simCode::SC.SIM_CODE, callbacks::Int)::Expr
   local wEq = eq.whenEquation
@@ -980,8 +1050,10 @@ function _periodicWhen(eq::SC.WHEN_EQUATION, sampleCalls::Vector{SC.CALL}, sampl
   end
 end
 
-#= `_changePreValues[x] = <state vector>[i]` for the non-parameter names of a condition: the
-   change()/edge() memory. =#
+"""
+`_changePreValues[x] = <state vector>[i]` for the non-parameter names of a condition: the
+change()/edge() memory.
+"""
 function _changeMemoryUpdates(names::Vector{String}, simCode::SC.SIM_CODE, stateVector::Union{Symbol, Expr})::Vector{Expr}
   local out = Expr[]
   for n in names
@@ -999,13 +1071,15 @@ function _changeMemoryUpdates(names::Vector{String}, simCode::SC.SIM_CODE, state
   return out
 end
 
-#= A when on a discrete condition: a callback of the event iteration (discreteWhenCallback).
-   The variables are looked up (MTK reorders the unknowns). pre(v) from a snapshot: the event
-   iteration passes the state before its sweep (the algebraic unknowns are solved again before
-   the discrete whens run, and `iAtOpen = pre(i)` read the current i). An elsewhen arm `time >=
-   thr` with a runtime-discrete threshold is a scheduled time event: the parent affect (which
-   assigns the threshold) adds a tstop at it, the arm an edge-guarded DiscreteCallback ordered
-   after the parent (_emitElsewhenThresholdTimeWhen). =#
+"""
+A when on a discrete condition: a callback of the event iteration (discreteWhenCallback).
+The variables are looked up (MTK reorders the unknowns). pre(v) from a snapshot: the event
+iteration passes the state before its sweep (the algebraic unknowns are solved again before
+the discrete whens run, and `iAtOpen = pre(i)` read the current i). An elsewhen arm `time >=
+thr` with a runtime-discrete threshold is a scheduled time event: the parent affect (which
+assigns the threshold) adds a tstop at it, the arm an edge-guarded DiscreteCallback ordered
+after the parent (_emitElsewhenThresholdTimeWhen).
+"""
 function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, tickCalls::Union{Nothing, Vector{SC.CALL}},
                        simCode::SC.SIM_CODE, callbacks::Int)::Expr
   local wEq = eq.whenEquation

@@ -94,8 +94,10 @@ const LAST_MODELCODE  = Ref{Any}(nothing)
    start attribute stays one, but its value is compiled into the equations. =#
 const TUNABLE_SETS    = Dict{String, Set{String}}()
 
-#= Forget a model's cached build (a failed or skipped build, a translate in
-   another mode): an older build must not answer for the current one. =#
+"""
+Forget a model's cached build (a failed or skipped build, a translate in
+another mode): an older build must not answer for the current one.
+"""
 function forgetBuild(cname::String)
   _forgetReinit(cname)
   for cache in (BUILT, BUILT_HASH, REDUCED_SYSTEMS, PRISTINE_P, TUNABLE_SETS)
@@ -107,10 +109,12 @@ function forgetBuild(cname::String)
   return nothing
 end
 
-#= The re-initialization registered for a cached build's problem
-   (CodeGeneration.DAE_REINIT, keyed by its reduced system): its closure holds
-   the build's data, kept for the whole session when only the build was
-   forgotten. =#
+"""
+The re-initialization registered for a cached build's problem
+(CodeGeneration.DAE_REINIT, keyed by its reduced system): its closure holds
+the build's data, kept for the whole session when only the build was
+forgotten.
+"""
 function _forgetReinit(cname::String)
   local built = get(BUILT, cname, nothing)
   (built isa Tuple && !isempty(built)) || return nothing
@@ -148,9 +152,11 @@ function generateIMTKCode(simCode::SC.SIM_CODE)
   return (modelName, modelCode)
 end
 
-#= Eval the module, invoke `<name>Model(_buildTspan())` (runs structural_simplify),
-   and cache the resulting 9-tuple. The post-simplify System (element 5) is also
-   stashed for the optional dump and external inspection via `reducedSystem`. =#
+"""
+Eval the module, invoke `<name>Model(_buildTspan())` (runs structural_simplify),
+and cache the resulting 9-tuple. The post-simplify System (element 5) is also
+stashed for the optional dump and external inspection via `reducedSystem`.
+"""
 function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool = false)
   local OMB = _OMBackend()
   local cname = OMB.canonicalName(modelName)
@@ -342,8 +348,10 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
   end
 end
 
-#= A copy of `prob` with the tunable parameters `parameters` (name => value;
-   Modelica or flattened names, array elements as `A[2][1]` or `A[2,1]`) set. =#
+"""
+A copy of `prob` with the tunable parameters `parameters` (name => value;
+Modelica or flattened names, array elements as `A[2][1]` or `A[2,1]`) set.
+"""
 function _setParameterValues(prob, parameters, modelName)
   local OMB = _OMBackend()
   local MTK = OMB.Runtime.ModelingToolkit

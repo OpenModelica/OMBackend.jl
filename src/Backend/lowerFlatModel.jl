@@ -306,8 +306,10 @@ function lowerExp(e::F.PARTIAL_FUNCTION_APPLICATION_EXPRESSION)::IR.Expression
                                 Symbol[Symbol(n) for n in e.argNames], inputs, lowerType(e.ty))
 end
 lowerExp(e::F.BINDING_EXP)::IR.Expression = lowerExp(e.exp)
-#= Boxing (of a function's polymorphic or functional arguments) has no meaning in Julia, where
-   every value is a value: the code generation always took the boxed expression itself. =#
+"""
+Boxing (of a function's polymorphic or functional arguments) has no meaning in Julia, where
+every value is a value: the code generation always took the boxed expression itself.
+"""
 lowerExp(e::F.BOX_EXPRESSION)::IR.Expression = lowerExp(e.exp)
 lowerExp(e::F.UNBOX_EXPRESSION)::IR.Expression = lowerExp(e.exp)
 lowerExp(e::F.MUTABLE_EXPRESSION)::IR.Expression = lowerExp(F.P_Pointer.access(e.exp))

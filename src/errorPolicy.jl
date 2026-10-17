@@ -91,9 +91,11 @@ function _collectSourceModules!(m::Module)
   return SOURCE_MODULES
 end
 
-#= `bt` is the error's backtrace. An AssertionError is ours only when our code
-   asserted: ModelingToolkit's and Symbolics' assertions depend on the model
-   (a fallback). =#
+"""
+`bt` is the error's backtrace. An AssertionError is ours only when our code
+asserted: ModelingToolkit's and Symbolics' assertions depend on the model
+(a fallback).
+"""
 function isBug(@nospecialize(e), bt)::Bool
   e isa Union{UndefVarError, UndefKeywordError, FieldError} && return true
   e isa AssertionError && return _thrownInSourceModules(bt)
@@ -101,10 +103,14 @@ function isBug(@nospecialize(e), bt)::Bool
   return false
 end
 
-#= A callable object's module is its type's; a type's (a constructor) its own. =#
+"""
+A callable object's module is its type's; a type's (a constructor) its own.
+"""
 _isOwnFunction(@nospecialize(f))::Bool = parentmodule(f isa Union{DataType, UnionAll} ? f : typeof(f)) in SOURCE_MODULES
 
-#= The first frame outside Base and Core (its throw helpers) is in our source. =#
+"""
+The first frame outside Base and Core (its throw helpers) is in our source.
+"""
 function _thrownInSourceModules(bt)::Bool
   for frame in Base.StackTraces.stacktrace(bt)
     local m = _frameModule(frame)
