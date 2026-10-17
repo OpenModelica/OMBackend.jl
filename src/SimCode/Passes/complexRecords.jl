@@ -69,12 +69,27 @@ operatorName(name::Symbol)::String = String(last(split(String(name), '_')))
     isComplexFunction(name)
 
 Whether `name` is one of Complex's operator functions (`Complex_'*'_multiply`,
-`Complex_'constructor'_fromReal`) or of Modelica.ComplexMath (`Modelica_ComplexMath_conj`): the
-calls `operatorName` reads as Complex operations. A Real function so named (a `Pkg.add` of four
-inputs) is no Complex operation.
+`Complex_'constructor'_fromReal`) or of Modelica.ComplexMath (`Modelica_ComplexMath_conj`).
 """
 isComplexFunction(name::Symbol)::Bool =
   (local s = String(name); startswith(s, "Complex_") || startswith(s, "Complex.") || startswith(s, "Modelica_ComplexMath_"))
+
+"An operator record's function: its name has an operator's part (`ComplexVoltage_'*'_multiply`, `_'+'`, `_'constructor'_`)."
+isOperatorRecordFunction(name::Symbol)::Bool = occursin(r"_'(\*|\+|-|/|constructor)'(_|$)", String(name))
+
+"A record of the fields `re` and `im`: Complex, or a type that extends it (Modelica.SIunits.ComplexVoltage)."
+isComplexRecordType(t::SType)::Bool = t isa TYPE_COMPLEX && t.isRecord && t.fieldNames == ["re", "im"]
+
+"""
+    isComplexOperation(e)
+
+Whether the call `e` is one `operatorName` reads as a Complex operation: a function of Complex or
+Modelica.ComplexMath (`isComplexFunction`), or an operator of a type extending Complex
+(`Modelica_SIunits_ComplexVoltage_'*'_multiply`, `isOperatorRecordFunction`) that returns one. A
+Real function named like an operation (a `Pkg.add` of four inputs) is none.
+"""
+isComplexOperation(e::CALL)::Bool =
+  isComplexFunction(e.name) || (isOperatorRecordFunction(e.name) && isComplexRecordType(e.ty))
 
 "The variables of the real and imaginary parts of the Complex variable `base`."
 partVariables(base::String)::Tuple{Exp, Exp} = (EXP_CREF(SimCref(base * "_re"), TYPE_REAL()), EXP_CREF(SimCref(base * "_im"), TYPE_REAL()))
@@ -107,7 +122,7 @@ function complexParts(e::Exp)::Union{Nothing, Tuple{Exp, Exp}}
     e.ty isa TYPE_COMPLEX || return nothing
     return partVariables(crefName(e.cref))
   end
-  (e isa CALL && isComplexFunction(e.name)) || return nothing
+  (e isa CALL && isComplexOperation(e)) || return nothing
   local (op, args, n) = (operatorName(e.name), e.args, length(e.args))
   local x = lowerComplex
   if op == "fromReal" && n >= 1
