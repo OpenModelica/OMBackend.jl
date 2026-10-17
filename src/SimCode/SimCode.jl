@@ -47,6 +47,8 @@ import DataStructures: OrderedDict, OrderedSet
 import Graphs
 import ..BackendUtil.GraphAlgorithms
 import ..OMJLIR
+import ..Traversal
+import ..Traversal: traverseFields, traverseElements
 import ..Passes: legacyName, isSampleTrigger, isBuiltinCallOf, tupleAssignElements, initialCall, builtinCall, edgeCall
 import ..unsupported, .._fallback, ..isTunableParameter, ..TUNABLE_PARAMETERS, ..BACKEND_PERFLOG, ..envSwitch
 const IR = OMJLIR

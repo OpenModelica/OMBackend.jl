@@ -133,12 +133,19 @@ end
 #= ==================================================================================== =#
 
 """
-    substitute(s, replacements)
+    substitute(x, replacements)
 
-The statement `s` with the variables of `replacements` substituted; an assignment to (a
-reinit of) a variable replaced by a negated one assigns the representative the negated value
-(`-x := r` as `x := -r`).
+A statement, an equation, a when-clause or an initial algorithm with the variables of
+`replacements` substituted in its expressions and in its statements, field by field (see
+`Traversal`). An assignment to (a reinit of) a variable replaced by a negated one assigns the
+representative the negated value (`-x := r` as `x := -r`).
 """
+substitute(x::Union{Statement, Equation, Construct, WHEN_STMTS, INITIAL_ALGORITHM}, rs::Replacements) =
+  first(traverseFields(x, _substituteChild, rs))
+
+"`substitute` as a traversal's `recur`: an expression or a nested statement substituted."
+_substituteChild(x::Union{Exp, Statement}, rs::Replacements) = (substitute(x, rs), rs)
+
 function substitute(s::ASSIGN, rs::Replacements)::Statement
   local (left, right) = withNegationMoved(substitute(s.left, rs), substitute(s.right, rs))
   return ASSIGN(left, right, s.source)
@@ -151,20 +158,6 @@ function substitute(s::REINIT, rs::Replacements)::Statement
   return REINIT(replacementCref(r), negatedIf(value, r.negated), s.source)
 end
 
-substitute(s::IF, rs::Replacements)::Statement =
-  IF(Branch[Branch(substitute(b.condition, rs), substitute(b.body, rs)) for b in s.branches], substitute(s.elseBody, rs), s.source)
-substitute(s::FOR, rs::Replacements)::Statement =
-  FOR(Iterator(s.iterator.name, substitute(s.iterator.range, rs)), substitute(s.body, rs), s.source)
-substitute(s::WHILE, rs::Replacements)::Statement = WHILE(substitute(s.condition, rs), substitute(s.body, rs), s.source)
-substitute(s::WHEN, rs::Replacements)::Statement =
-  WHEN(Branch[Branch(substitute(b.condition, rs), substitute(b.body, rs)) for b in s.branches], s.source)
-substitute(s::ASSERT, rs::Replacements)::Statement =
-  ASSERT(substitute(s.condition, rs), substitute(s.message, rs), substitute(s.level, rs), s.source)
-substitute(s::TERMINATE, rs::Replacements)::Statement = TERMINATE(substitute(s.message, rs), s.source)
-substitute(s::NORETCALL, rs::Replacements)::Statement = NORETCALL(substitute(s.exp, rs), s.source)
-substitute(s::RECOMPILATION, rs::Replacements)::Statement = RECOMPILATION(s.componentToChange, substitute(s.newValue, rs))
-substitute(s::Union{RETURN, BREAK, AGENTIC_RECOMPILATION}, ::Replacements)::Statement = s
-
 substitute(body::Vector{Statement}, rs::Replacements)::Vector{Statement} = Statement[substitute(s, rs) for s in body]
 
 "An assignment's sides with a negated target's negation moved to the value."
@@ -173,19 +166,6 @@ function withNegationMoved(left::Exp, right::Exp)::Tuple{Exp, Exp}
   return (left.exp, UNARY(OP_UMINUS, right))
 end
 
-"A when-clause with the variables of `replacements` substituted, its elsewhen arms too."
-substitute(w::WHEN_STMTS, rs::Replacements)::WHEN_STMTS =
-  WHEN_STMTS(substitute(w.condition, rs), substitute(w.body, rs),
-             w.elsewhenPart === nothing ? nothing : substitute(w.elsewhenPart, rs))
-
-substitute(eq::RESIDUAL_EQUATION, rs::Replacements)::RESIDUAL_EQUATION = RESIDUAL_EQUATION(substitute(eq.exp, rs), eq.source, eq.attr)
-substitute(eq::EQUATION, rs::Replacements)::Equation = EQUATION(substitute(eq.lhs, rs), substitute(eq.rhs, rs), eq.source, eq.attr)
-substitute(eq::ARRAY_EQUATION, rs::Replacements)::Equation =
-  ARRAY_EQUATION(eq.dimSize, substitute(eq.left, rs), substitute(eq.right, rs), eq.source, eq.attr)
-substitute(a::ASSERT_EQUATION, rs::Replacements)::ASSERT_EQUATION =
-  ASSERT_EQUATION(substitute(a.condition, rs), substitute(a.message, rs), a.level, a.source)
-substitute(a::INITIAL_ALGORITHM, rs::Replacements)::INITIAL_ALGORITHM = INITIAL_ALGORITHM(substitute(a.statements, rs), a.section)
-
 "An initial equation substituted: a residual, an equation, an array equation, an if-equation of them; another kept."
 substituteInitial(eq::Union{RESIDUAL_EQUATION, EQUATION, ARRAY_EQUATION}, rs::Replacements)::Equation = substitute(eq, rs)
 substituteInitial(eq::INLINE_IF_EQUATION, rs::Replacements)::Equation =
@@ -193,11 +173,3 @@ substituteInitial(eq::INLINE_IF_EQUATION, rs::Replacements)::Equation =
                      Vector{Equation}[Equation[substituteInitial(e, rs) for e in b] for b in eq.branchesTrue],
                      Equation[substituteInitial(e, rs) for e in eq.branchElse], eq.source, eq.attr)
 substituteInitial(eq::Equation, ::Replacements)::Equation = eq
-
-"An if-equation branch with its condition and its residuals substituted."
-function substitute(b::BRANCH, rs::Replacements)::BRANCH
-  return BRANCH(substitute(b.condition, rs), RESIDUAL_EQUATION[substitute(eq, rs) for eq in b.residualEquations],
-                b.identifier, b.targets)
-end
-
-substitute(ifEq::IF_EQUATION, rs::Replacements)::IF_EQUATION = IF_EQUATION(BRANCH[substitute(b, rs) for b in ifEq.branches])

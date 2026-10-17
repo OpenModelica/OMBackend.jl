@@ -66,9 +66,9 @@ function resolveConstantIfExp(e::Exp)::Exp
     local c = e.cond isa BCONST ? e.cond.value : tryEvalCondition(e.cond)
     c === true && return resolveConstantIfExp(e.thenExp)
     c === false && return resolveConstantIfExp(e.elseExp)
-    return rebuildIfChanged(e, resolveConstantIfExp)
+    return mapChildren(resolveConstantIfExp, e)
   end
-  e isa Union{BINARY, UNARY, CALL, ARRAY_EXP} && return rebuildIfChanged(e, resolveConstantIfExp)
+  e isa Union{BINARY, UNARY, CALL, ARRAY_EXP} && return mapChildren(resolveConstantIfExp, e)
   return e
 end
 
@@ -80,11 +80,8 @@ function resolveConstantIfExp(e::Exp, simCode::SIM_CODE)::Exp
   end
   e isa Union{IFEXP, BINARY, UNARY, LBINARY, LUNARY, RELATION, CAST, CALL, ARRAY_EXP, ASUB} ||
     return e
-  return rebuildIfChanged(e, x -> resolveConstantIfExp(x, simCode))
+  return mapChildren(x -> resolveConstantIfExp(x, simCode), e)
 end
-
-"`e` with `f` applied to its children, itself if none changed."
-rebuildIfChanged(e::Exp, f::F) where {F} = first(traverseChildren(e, (x, a) -> (f(x), a), nothing))
 
 """
     tryEvalCondition(c[, simCode])

@@ -53,6 +53,71 @@ isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "backend
       @test o === e
     end
 
+    @testset "Traversal: one traversal, field by field, for SimCode and OMJLIR" begin
+      #= every type a traversal rebuilds has its default constructor (a component reference,
+         whose flat name follows its parts, is rebuilt by its own rule) =#
+      local concrete = (m, S) -> filter(T -> T isa DataType && isconcretetype(T) && T <: S, Any[getfield(m, n) for n in names(m; all = true)])
+      local rebuilt = vcat(concrete(SC, SC.Exp), concrete(SC, SC.Statement), concrete(SC, SC.Equation), concrete(SC, SC.Construct),
+                           Any[SC.Iterator, SC.Branch, SC.WHEN_STMTS],
+                           concrete(IR, IR.Expression), concrete(IR, IR.Statement), concrete(IR, IR.Subscript), concrete(IR, IR.ClockKind),
+                           Any[IR.Iterator, IR.StatementBranch, IR.WhenBranch, IR.EquationBranch, IR.CrefPart])
+      @test length(rebuilt) > 80
+      for T in rebuilt
+        @test hasmethod(T, Tuple{fieldtypes(T)...})
+      end
+      local gt0 = e -> SC.RELATION(e, SC.OP_GREATER, R(0.0), 0)
+      #= children in field order: a reduction's iterator ranges after its body, a range's absent step skipped =#
+      local r = SC.RANGE(SC.TYPE_INTEGER(), SC.ICONST(1), nothing, SC.ICONST(3))
+      @test SC.children(r) == SC.Exp[SC.ICONST(1), SC.ICONST(3)]
+      @test SC.children(SC.REDUCTION(:sum, x, SC.Iterator[SC.Iterator(:i, r)], SC.TYPE_REAL())) == SC.Exp[x, r]
+      @test SC.children(SC.IFEXP(SC.BCONST(true), x, y)) == SC.Exp[SC.BCONST(true), x, y]
+      @test isempty(SC.children(x))
+      #= a one-level map: the node itself if no child changed, else rebuilt with its leaves kept =#
+      local rsub = SC.RSUB(x, 2, "re", SC.TYPE_REAL())
+      @test SC.mapChildren(identity, rsub) === rsub
+      @test SC.mapChildren(c -> c == x ? y : c, rsub) == SC.RSUB(y, 2, "re", SC.TYPE_REAL())
+      @test SC.anyExp(c -> c == y, SC.BINARY(x, SC.OP_ADD, SC.UNARY(SC.OP_UMINUS, y)))
+      @test !SC.anyExp(c -> c == y, rsub)
+      #= statements: the expressions of nested statements, the iterator's range; reinit's target kept =#
+      local s = SC.FOR(SC.Iterator(:i, SC.RANGE(SC.TYPE_INTEGER(), SC.ICONST(1), nothing, x)),
+                       SC.Statement[SC.IF(SC.Branch[SC.Branch(x, SC.Statement[SC.REINIT(SC.SimCref(:x), x, SC.NO_SOURCE)])],
+                                          SC.Statement[SC.ASSIGN(y, x, SC.NO_SOURCE)], SC.NO_SOURCE)], SC.NO_SOURCE)
+      local xToZ = e -> SC.substitute(e, alias("x", "z"))
+      local s2 = SC.mapStatementExps(xToZ, s)
+      @test s2.iterator.range.stop == ref("z")
+      @test s2.body[1].branches[1].condition == ref("z")
+      @test s2.body[1].branches[1].body[1] == SC.REINIT(SC.SimCref(:x), ref("z"), SC.NO_SOURCE)
+      @test s2.body[1].elseBody[1] == SC.ASSIGN(y, ref("z"), SC.NO_SOURCE)
+      @test SC.mapStatementExps(identity, s) === s
+      #= substitution reaches a nested assignment's own rule: a negated target's negation moved to the value =#
+      local ifs = SC.IF(SC.Branch[SC.Branch(SC.BCONST(true), SC.Statement[SC.ASSIGN(x, R(1.0), SC.NO_SOURCE)])], SC.Statement[], SC.NO_SOURCE)
+      @test SC.substitute(ifs, alias("x", "y"; negated = true)).branches[1].body[1] == SC.ASSIGN(y, neg(R(1.0)), SC.NO_SOURCE)
+      #= a when-clause's elsewhen arms, an equation =#
+      local w = SC.WHEN_STMTS(gt0(x), SC.Statement[], SC.WHEN_STMTS(gt0(y), SC.Statement[SC.ASSIGN(ref("w"), x, SC.NO_SOURCE)], nothing))
+      local w2 = SC.substitute(w, alias("x", "z"))
+      @test w2.condition == gt0(ref("z")) && w2.elsewhenPart.condition == gt0(y)
+      @test w2.elsewhenPart.body[1] == SC.ASSIGN(ref("w"), ref("z"), SC.NO_SOURCE)
+      local eq = SC.EQUATION(x, y, SC.NO_SOURCE, SC.EQ_ATTR_DEFAULT)
+      @test SC.substitute(eq, alias("x", "z")).lhs == ref("z")
+      #= OMJLIR: a reference's subscripts are children, its flat name follows them =#
+      local xi = IR.CREF(IR.ComponentRef(IR.CrefPart[IR.CrefPart(:x, IR.Subscript[IR.INDEX(IR.CREF(IR.ComponentRef(:i, IR.T_INTEGER()), IR.T_INTEGER()))], IR.T_REAL())]), IR.T_REAL())
+      @test IR.children(xi) == IR.Expression[IR.CREF(IR.ComponentRef(:i, IR.T_INTEGER()), IR.T_INTEGER())]
+      local x2 = IR.mapExp(e -> (e isa IR.CREF && e.cref.name === :i) ? IR.INTEGER(2) : e, xi)
+      @test x2.cref.name === Symbol("x[2]")
+      @test IR.mapExp(identity, xi) === xi
+      #= OMJLIR's equations are entities: mapped in place, nested equations too, their identity kept =#
+      local inner = IR.SCALAR_EQUATION(xi, IR.REAL(1.0), IR.T_REAL(), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES)
+      local ifEq = IR.IF_EQUATION(IR.EquationBranch[IR.EquationBranch(IR.CREF(IR.ComponentRef(:i, IR.T_INTEGER()), IR.T_BOOLEAN()), IR.Equation[inner])],
+                                  IR.Equation[], IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES)
+      @test IR.mapEquation!(e -> (e isa IR.CREF && e.cref.name === :i) ? IR.INTEGER(2) : e, ifEq) === ifEq
+      @test ifEq.branches[1].equations[1] === inner
+      @test inner.lhs.cref.name === Symbol("x[2]")
+      @test ifEq.branches[1].condition == IR.INTEGER(2)
+      local roots = IR.Expression[]
+      IR.foreachRootExp(e -> push!(roots, e), ifEq)
+      @test roots == IR.Expression[IR.INTEGER(2), inner.lhs, IR.REAL(1.0)]
+    end
+
     @testset "substitute: an alias by its representative" begin
       @test SC.substitute(x, alias("x", "y")) == y                                     # bare
       @test SC.substitute(x, alias("x", "y"; negated = true)) == neg(y)                # negated
