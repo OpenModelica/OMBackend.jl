@@ -359,7 +359,10 @@ import .ExampleModels
   #= ── 19. Array-preserving code generation (no-scalarize models) ─ =#
   include("arrayPathTests.jl")
 
-  #= ── 20. The backend reads the frontend's flat model only ──────── =#
+  #= ── 20. The initialization's one-unknown rows ──────────────────── =#
+  include("initializationCausalRowsTests.jl")
+
+  #= ── 21. The backend reads the frontend's flat model only ──────── =#
   @testset "No DAE in the backend" begin
     #= The frontend's DAE, the previous backend's BDAE and its SimulationCode are gone: the
        backend lowers the flat model to OMJLIR. No source reads them (prose may name them). =#

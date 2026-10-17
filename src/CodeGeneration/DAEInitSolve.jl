@@ -200,11 +200,77 @@ function _nudgeZeroGuesses!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residua
 end
 
 """
+    _solveCausalRows!(u0, rhsFunc, p_vec, eq_idx, eq_target, unknowns, sparsity; tol)
+
+The initialization's one-unknown blocks of a square system (as many rows as `unknowns`), before
+the simultaneous solve (OpenModelica's causal order): a row that reads one unknown not yet
+solved (by the Jacobian's structure `sparsity`) and is affine in it (probed at three values) is
+solved for it, the unknowns so solved known for the rows after, until no row is left of that
+kind. Such a row is that unknown's in every matching, so its value holds at every solution with
+the others' values, and the solve starts from it: from the media's start values (MSL Fluid's d =
+150, p = 5e6 against 1000 and 1.1e5, the tank's mass 0) MeasuringTemperature's tanks were a
+simultaneous Newton of 78 rows that converged or not on rounding. A value is kept only where the
+row's residual at it is zero to the tolerance; a probe that fails (outside a medium's range)
+leaves the row. Returns how many unknowns were solved.
+"""
+function _solveCausalRows!(u0::Vector{Float64}, rhsFunc::F, p_vec::Vector{Float64}, eq_idx::Vector{Int},
+                           eq_target::Vector{Float64}, unknowns::Vector{Int},
+                           sparsity::Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}; tol::Float64)::Int where {F}
+  local SA = Symbolics.SparseArrays
+  local rowsOf = permutedims(sparsity)   # column k: the columns row k reads
+  local open = BitSet(unknowns)
+  local du = similar(u0)
+  local residualAt = (w::Int, j::Int, x::Float64) -> begin
+    u0[j] = x
+    rhsFunc(du, u0, p_vec, 0.0)
+    du[eq_idx[w]] - eq_target[w]
+  end
+  local done = falses(length(eq_idx))
+  local solved = 0
+  local progressed = true
+  while progressed
+    progressed = false
+    for w in eachindex(eq_idx)
+      done[w] && continue
+      local k = eq_idx[w]
+      k <= size(rowsOf, 2) || continue
+      local reads = Int[c for c in SA.rowvals(rowsOf)[SA.nzrange(rowsOf, k)] if c in open]
+      length(reads) == 1 || continue
+      local j = only(reads)
+      local x0 = u0[j]
+      local h = 0.5 * max(1.0, abs(x0))
+      local accepted = try
+        local (f0, f1, f2) = (residualAt(w, j, x0), residualAt(w, j, x0 + h), residualAt(w, j, x0 + 2h))
+        local (s1, s2) = (f1 - f0, f2 - f1)
+        local scale = max(1.0, abs(f0), abs(f1), abs(f2))
+        local affine = all(isfinite, (f0, f1, f2)) && !iszero(s1) &&
+                       abs(s1 - s2) <= 1.0e-8 * max(abs(s1), abs(s2)) + 1.0e-12 * scale
+        local x = affine ? x0 - f0 * h / s1 : NaN
+        isfinite(x) && abs(residualAt(w, j, x)) <= max(tol, 1.0e-10 * scale)
+      catch e
+        OMBackend._fallback(e, :solveCausalRows)
+        false
+      end
+      if accepted
+        delete!(open, j)
+        done[w] = true
+        solved += 1
+        progressed = true
+      else
+        u0[j] = x0
+      end
+    end
+  end
+  return solved
+end
+
+"""
 `converged` is set false when no phase converged (the result is then the
 best effort the warning or the error below reports).
 """
 function _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
-                                  converged::Base.RefValue{Bool}=Ref(true), t0::Float64=0.0)
+                                  converged::Base.RefValue{Bool}=Ref(true), t0::Float64=0.0,
+                                  sparsity::Union{Nothing, Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}}=nothing)
   #= The residuals at the start time t0: the phases below evaluate at their time 0. Assigned
      once (closures below capture it: a reassigned argument would be boxed). =#
   local rhsFunc = t0 == 0.0 ? rhsAt0 : (du, u, p, t) -> rhsAt0(du, u, p, t + t0)
@@ -287,6 +353,19 @@ function _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; maxiter=200, tol=1e-10,
       completeInit!(warmVars)
       return u0
     end
+  end
+  #= The one-unknown rows first (`sparsity` the right-hand side's Jacobian structure), over the
+     unknowns the latched phase solves (all but the pins and the latches): only where those are
+     as many as the rows. A row that reads one unknown is that unknown's in every matching of a
+     square system; in phase 1's (the differential states held, more rows than unknowns) it is
+     not: MeasuringTemperature's `m = V*d` with the mass m, a state, held at its start 0 gave V
+     = 0. Not for a warm start, which is a solution for nearby values already. =#
+  local causalVars = Int[i for i in 1:n if !(i in pinnedSet) && !(i in discretePinnedSet)]
+  if sparsity !== nothing && extra_residuals === nothing && !isempty(causalVars) &&
+     length(causalVars) == length(eq_idx)
+    local nCausal = _solveCausalRows!(u0, rhsFunc, p_vec, eq_idx, eq_target, causalVars, sparsity; tol = tol)
+    OMBackend.envSwitch("OMBACKEND_INIT_TRACE") && println("[initcausal] ", nCausal, " of ", length(causalVars),
+                                                           " unknowns from one-unknown rows")
   end
   local alg_unpinned = [i for i in alg_idx if !(i in pinnedSet)]
   local u0_phase1 = copy(u0)

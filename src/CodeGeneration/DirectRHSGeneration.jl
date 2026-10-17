@@ -519,7 +519,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     initRels === nothing || initRels.eval!(p_vec, u0, t0; finiteOnly = true)
     local uEntry = copy(u0)
     local firstErr = nothing
-    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0,
+    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
                                                               pinned=pinnedIdx,
                                                               derivative_targets=derivativeInitTargets,
                                                               eqLabels=eqLabels,
@@ -563,7 +563,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local targetsNow = Ref(derivativeInitTargets)
     local resolveWith = (u, pv, ok) -> begin
       local kept = u[keptIdx]
-      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0,
+      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
                                               pinned=pinnedIdx,
                                               derivative_targets=targetsNow[],
                                               eqLabels=eqLabels,
@@ -655,7 +655,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       end
       targetsNow[] = targets
       try
-        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; t0 = t0,
+        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
                                          pinned=pinnedIdx,
                                          derivative_targets=targets,
                                          eqLabels=eqLabels,
@@ -1602,8 +1602,8 @@ algebraic variable; `follow!(p)` updates the parameters bound to them.
 Returns the states; p[freeIdx] keeps the solved values.
 """
 function _solveDAEInitializationFree!(u0, rhs, pv, mm, freeIdx::Vector{Int}, follow!;
-                                      extra_residuals=nothing, kwargs...)
-  isempty(freeIdx) && return _solveDAEInitialization!(u0, rhs, pv, mm; extra_residuals=extra_residuals, kwargs...)
+                                      extra_residuals=nothing, sparsity=nothing, kwargs...)
+  isempty(freeIdx) && return _solveDAEInitialization!(u0, rhs, pv, mm; extra_residuals=extra_residuals, sparsity=sparsity, kwargs...)
   local n = length(u0)
   local nq = length(freeIdx)
   local setFree! = (p, u) -> begin
