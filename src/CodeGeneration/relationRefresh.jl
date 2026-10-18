@@ -1002,8 +1002,9 @@ function withIntegralDiscretes(callbacks, problem, names::Vector{String})
   return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(cb, callbacks)
 end
 
-#= The re-solve of the algebraic unknowns at an event: BrownFullBasicInit
-   at its own tolerance (1e-10 on the residual: relations are decided on the
+#= The re-solve of the algebraic unknowns at an event: Newton with the
+   problem's own Jacobian first (`_eventNewton!`), then BrownFullBasicInit,
+   both at its own tolerance (1e-10 on the residual: relations are decided on the
    solved values; a looser one skips the solve where a switched diode's
    equations barely change the residual, and its s keeps the wrong sign).
    Where that is out of reach (large values, a switched Jacobian near
@@ -1027,12 +1028,59 @@ DiffEqBase.initialize_dae!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEInte
   _eventReinit!(integrator)
 
 """
+    _eventNewton!(integrator; tol, maxiters) -> Bool
+
+Newton on the algebraic rows of a mass-matrix problem with the problem's own Jacobian (its
+algebraic block, factorized sparse when the Jacobian is), the differential unknowns kept, to
+`tol` on the residual. Whether it converged; `integrator.u` changes only then (its algebraic
+unknowns, as BrownFullBasicInit's). At an event's crossing a relation without an event
+(`noEvent`, a stream port's upstream side) can switch within a finite-difference step, and
+BrownFullBasicInit's Jacobian of differences is wrong there: MSL Fluid MeasuringTemperature's
+tank port flows at 1e-10 at their reversal took re-solves of 70-80 s (1352 nonlinear steps),
+1 to 3 iterations with the problem's Jacobian. Float64 states only (a sparse LU of dual
+numbers has no method).
+"""
+function _eventNewton!(integrator::ModelingToolkit.SciMLBase.DEIntegrator; tol::Float64, maxiters::Int = 10)::Bool
+  local f = integrator.f
+  (eltype(integrator.u) === Float64 && hasproperty(f, :jac) && f.jac !== nothing &&
+   hasproperty(f, :jac_prototype) && f.jac_prototype !== nothing && ModelingToolkit.SciMLBase.isinplace(f)) || return false
+  local rows = _algebraicRows(f)
+  isempty(rows) && return false
+  local (p, t) = (integrator.p, integrator.t)
+  local u = copy(integrator.u)
+  local residual = similar(u)
+  local jac = similar(f.jac_prototype, Float64)
+  for _ in 0:maxiters
+    f(residual, u, p, t)
+    local g = residual[rows]
+    all(isfinite, g) || return false
+    if maximum(abs, g) <= tol
+      copyto!(integrator.u, u)
+      return true
+    end
+    f.jac(jac, u, p, t)
+    local F = LinearAlgebra.lu(jac[rows, rows]; check = false)
+    LinearAlgebra.issuccess(F) || return false
+    u[rows] .-= F \ g
+  end
+  return false
+end
+
+"""
 `alg`: BrownFullBasicInit at its own tolerance, or the table-cluster
 models' (tableClusterInitAlg); the same fallback for both (the MSL QS
 IMC_Transformer's switching event at t = 2 stopped at a residual within
-the solve's abstol but above the table algorithm's 1e-8).
+the solve's abstol but above the table algorithm's 1e-8). Newton with the
+problem's Jacobian first, to the same tolerance (`_eventNewton!`).
 """
-function _eventReinit!(integrator, alg = DiffEqBase.BrownFullBasicInit())
+function _eventReinit!(integrator::ModelingToolkit.SciMLBase.DEIntegrator, alg::DiffEqBase.BrownFullBasicInit = DiffEqBase.BrownFullBasicInit())
+  local solved = try
+    _eventNewton!(integrator; tol = alg.abstol)
+  catch err
+    OMBackend._fallback(err, :eventNewton)
+    false
+  end
+  solved && return nothing
   local InitialFailure = ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
   local before = integrator.sol.retcode
   local u0 = copy(integrator.u)
