@@ -1071,6 +1071,21 @@ The first sample slot of when wi: the slots are numbered when by when, instance 
 _whenSampleBase(g::Gen, wi::Int) = sum((g.whens[k].nsample * size(g.whens[k].domain, 2) for k in 1:(wi - 1)); init = 0)
 
 """
+Whether `x` calls a function (`:fcall`) and reads parameters only (`_parametersOnly`).
+"""
+function _callOfParameters(g::Gen, x::IR)::Bool
+  _parametersOnly(g, x) || return false
+  local found = false
+  local visit = function (y)
+    y isa Op || return
+    y.op == :fcall && (found = true)
+    foreach(visit, y.args)
+  end
+  visit(x)
+  return found
+end
+
+"""
 Whether x reads only literals, iterators and parameters (no variable, no time).
 """
 function _parametersOnly(g::Gen, x::IR)::Bool
@@ -1173,6 +1188,15 @@ function _addEquation!(g::Gen, @nospecialize(eq::F.Equation), iterNames::Vector{
        after the initialization's solve like an initial algorithm's (it is no unknown of it) =#
     if isempty(edims) && ilhs isa Ref && !ilhs.der && g.vars[ilhs.name].kind == :discrete &&
        !any(r -> r.name == ilhs.name, accesses!(Ref[], irhs))
+      push!(g.initAlgs, AlgClass(Stmt[SAssign(ilhs, irhs)], nIter, idom, 0, 0, _str(eq)))
+      return
+    end
+    #= p = expr of parameters for a parameter with fixed = false: assigned once, as an initial
+       algorithm's (no unknown of the solve): MSL GlobalSeed's `id_impure =
+       initializeImpureRandom(seed)`, an impure call the solve's Newton made at every evaluation,
+       a new value each time (ImpureGenerator stalled) =#
+    if isempty(edims) && ilhs isa Ref && !ilhs.der && ilhs.name in g.freeParams && !(get(g.params, ilhs.name, nothing) isa AbstractArray) &&
+       all(r -> r.name != ilhs.name && g.vars[r.name].kind == :param, accesses!(Ref[], irhs))
       push!(g.initAlgs, AlgClass(Stmt[SAssign(ilhs, irhs)], nIter, idom, 0, 0, _str(eq)))
       return
     end
@@ -2103,6 +2127,10 @@ function jl(g::Gen, x::IR)
     local idx = Any[jl(g, s) for s in x.ref.subs]
     info.kind == :state && return :(p.upre[$(_linear(info, idx))])
     info.kind == :discrete && return _discreteRead(info, :(p.dpre[$(_linear(info, idx))]))
+    #= An algebraic variable's value before the instant is not kept: its current value was
+       read (`peak = pre(u)` at u's step took the value after it, OpenModelica the one
+       before); the scalarized path keeps it. =#
+    info.kind == :alg && ns("pre() of the algebraic variable $(x.ref.name)")
     return jl(g, x.ref)   #= pre of a parameter =#
   elseif x isa Rel
     local k = :($(g.relBase) + (_col - 1) * $(g.relCount) + $(x.id))
@@ -2366,7 +2394,9 @@ function _functionDefinitions(functions::Union{Nothing, FunctionList})
     ns("the model's functions: " * first(sprint(showerror, err), 160))
   end
   local (exprs, names) = try
-    _OMBACKEND.CodeGeneration.AlgorithmicCodeGeneration.generateFunctions(mfs)
+    #= closures of the model module: its functions are its constants, not the wrappers a
+       compiled body (compiledFunction) would call =#
+    _OMBACKEND.CodeGeneration.AlgorithmicCodeGeneration.generateFunctions(mfs; compiled = false)
   catch err
     ns("the model's functions: " * first(sprint(showerror, err), 160))
   end
@@ -2669,6 +2699,12 @@ function _generate(fm::F.FlatModel, modelName::String; functions::Union{Nothing,
       local idx = Any[jl(g, s) for s in target.subs]
       if kind == :reinit
         push!(stmtsOf[b], :(p.ureinit[$(_linear(info, idx))] = $(jl(g, value))))
+      elseif _callOfParameters(g, value)
+        #= a call of parameters only: once per pass of the event iteration (WHEN_MEMO), as the body
+           fires once in an instant; the passes rerun a fired body, and an impure function (MSL
+           impureRandom(id)) gave a new value in each: the initial events of ImpureGenerator never
+           settled. A pure one gives the same value. =#
+        push!(stmtsOf[b], :(p.d[$(_linear(info, idx))] = Float64(get!(() -> $(jl(g, value)), WHEN_MEMO, ($wi, $i, _col)))))
       else
         push!(stmtsOf[b], :(p.d[$(_linear(info, idx))] = Float64($(jl(g, value)))))
       end
@@ -2819,6 +2855,8 @@ function _generate(fm::F.FlatModel, modelName::String; functions::Union{Nothing,
     const SAMPLE_START = zeros($(length(sampleSchedule)))
     const SAMPLE_INTERVAL = zeros($(length(sampleSchedule)))
     const N_WHENS = $(nWhenInst)
+    #= the values of when-body calls of parameters in a pass of the event iteration =#
+    const WHEN_MEMO = Dict{Tuple{Int, Int, Int}, Any}()
 
     #= The parameter values with `overrides` (Modelica names of parameters or of their
        elements => values) applied; parameters whose bindings read a changed one are
@@ -3091,6 +3129,7 @@ function _generate(fm::F.FlatModel, modelName::String; functions::Union{Nothing,
       local du = similar(u); local a = similar(u, $nAlg)
       for _ in 1:50
         p.dpre .= p.d; p.upre .= u; p.ureinit .= u
+        empty!(WHEN_MEMO)
         #= passes with the same pre() until nothing changes (a fired body runs in each: with
            pre() fixed it gives the same values) =#
         local settled = false

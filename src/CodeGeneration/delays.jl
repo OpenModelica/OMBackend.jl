@@ -46,9 +46,9 @@ delayTime later: a time event there (withDelayEvents), which runs the event iter
 has one. Only during that event are the delayed values read as right limits (the value after the
 jump); otherwise as left limits, so a delay of a delayed value records the jump as a jump again.
 
-Not handled: a jump caused inside a continuous callback's affect is recorded after it (without its
-left limit); for a variable delay time, the delayed jump's event is at the jump's time plus the delay
-time at the jump.
+A jump caused inside a continuous callback's affect: its left limit is recorded where the callback moves
+the integrator to the event (the first re-solve of the instant, before the affect). Not handled: for a
+variable delay time, the delayed jump's event is at the jump's time plus the delay time at the jump.
 =#
 
 """
@@ -202,13 +202,6 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
   local now(integrator) = Base.invokelatest(argumentValues, integrator.u, integrator.p, integrator.t)
   #= The start values once every other callback's initialization (the clusters' start bodies) has run:
      the last callback's. =#
-  local start! = function (c, u, t, integrator)
-    local v = Base.invokelatest(argumentValues, u, integrator.p, t)
-    for (k, h) in enumerate(delayHistories!(model, n).histories)
-      push!(h.t, t); push!(h.v, Float64(v[k]))
-    end
-    return nothing
-  end
   local stepEnd = function (u, t, integrator)
     local s = delayState(model)
     s === nothing && return false
@@ -217,6 +210,15 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
       t > h.t[end] && (push!(h.t, t); push!(h.v, Float64(v[k])))
     end
     return false
+  end
+  local start! = function (c, u, t, integrator)
+    local v = Base.invokelatest(argumentValues, u, integrator.p, t)
+    for (k, h) in enumerate(delayHistories!(model, n).histories)
+      push!(h.t, t); push!(h.v, Float64(v[k]))
+    end
+    #= The left limits at a branch event, before its affect (eventInstant.jl beginInstant!). =#
+    atInstantStart!(integrator, i -> (stepEnd(i.u, i.t, i); nothing))
+    return nothing
   end
   local afterEvents = function (u, t, integrator)
     local s = delayState(model)

@@ -153,7 +153,8 @@ isBuiltin(e::Exp, name::Symbol)::Bool = e isa CALL && e.kind === CALL_BUILTIN &&
 
 The value of a numeric expression of literals (and, with `simCode`, parameters): `+ - * /`
 (and, with `simCode`, `^` where real), unary minus, abs(), noEvent() (with `simCode` also
-Integer(), casts, enumeration literals as their indices); `nothing` if it does not evaluate.
+Integer(), sqrt() of a non-negative value, casts, enumeration literals as their indices);
+`nothing` if it does not evaluate.
 """
 function tryEvalNumeric(e::Exp)::Union{Float64, Nothing}
   e isa RCONST && return e.value
@@ -188,6 +189,11 @@ function tryEvalNumeric(e::Exp, simCode::SIM_CODE, seen::OrderedSet{String})::Un
     length(e.args) == 1 || return nothing
     local v = tryEvalNumeric(e.args[1], simCode, seen)
     return v === nothing ? nothing : e.name === :abs ? abs(v) : v
+  elseif isBuiltin(e, :sqrt)
+    #= MSL 4 CompareLosslessLines: the Pulse's period td = len/c0, c0 = 1/sqrt(l*c) =#
+    length(e.args) == 1 || return nothing
+    local v = tryEvalNumeric(e.args[1], simCode, seen)
+    return (v === nothing || v < 0.0) ? nothing : sqrt(v)
   elseif e isa BINARY && e.op in (OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_POW)
     local (v1, v2) = (tryEvalNumeric(e.exp1, simCode, seen), tryEvalNumeric(e.exp2, simCode, seen))
     (v1 === nothing || v2 === nothing) && return nothing

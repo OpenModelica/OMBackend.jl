@@ -362,6 +362,39 @@ import .ExampleModels
   #= ── 20. The initialization's one-unknown rows ──────────────────── =#
   include("initializationCausalRowsTests.jl")
 
+  #= ── 20b. OMBackend's index reduction step by step ──────────────── =#
+  include("indexReductionTests.jl")
+
+  #= ── 20c. Zero flow and zero speed (semiLinear chains, noEvent) ─── =#
+  include("zeroFlowTests.jl")
+
+  #= ── 20d. Parameters an initial algorithm assigns ───────────────── =#
+  include("initialAlgorithmParameterTests.jl")
+
+  #= ── 20e. Impure calls on the array path ───────────────────────── =#
+  include("impureCallTests.jl")
+
+  #= ── 20f. A function's arrays of records bound by calls ────────── =#
+  include("recordArrayLocalTests.jl")
+
+  #= ── 20g. The model's functions compiled ─────────────────────────── =#
+  include("compiledFunctionTests.jl")
+
+  #= ── 20h. Extractor calls hoisted: one call per function and arguments ── =#
+  include("extractorHoistTests.jl")
+
+  #= ── 20i. Underdetermined initialization: states at their start values ── =#
+  include("initFixStatesTests.jl")
+
+  #= ── 20j. A relation that located its event takes the change ── =#
+  include("relationLocatedTests.jl")
+
+  #= ── 20k. Partials of a function's call terms (extractors, flat calls) ── =#
+  include("callPartialTests.jl")
+
+  #= ── 20l. Observed equations without a cycle ── =#
+  include("observedCycleTests.jl")
+
   #= ── 21. The backend reads the frontend's flat model only ──────── =#
   @testset "No DAE in the backend" begin
     #= The frontend's DAE, the previous backend's BDAE and its SimulationCode are gone: the

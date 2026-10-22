@@ -59,8 +59,11 @@ Every algebraic variable a single residual `v - x` defines (`x` without a deriva
 without `v`) replaced by `x` everywhere, its residual removed and recorded for the observed
 equations; to a fixed point (at most 8 rounds). Not a scalarized array element (the code
 generators rebuild the array from its elements), an alias's, an irreducible, shared or event
-variable (`eventAndComplexNames`), one of a fixed start (its initial equation). A round in which a folded name is still read somewhere is undone; one
-that would remove every residual is not done. Nothing for a model with modes or translated
+variable (`eventAndComplexNames`), one of a fixed start (its initial equation), one on a cycle of the
+round's definitions (cyclicNames: InitialEquationTests IEQ54, `u = 2y + 0.1x` and `y = noEvent(if u > 1
+...)`, folded together, were observed equations without an order, ModelingToolkit's "The equations have
+at least one cycle"; they stay residuals, a loop). A round in which a folded name is still read somewhere
+is undone; one that would remove every residual is not done. Nothing for a model with modes or translated
 again at its structural changes.
 """
 function foldExplicitSingleAssign(simCode::SIM_CODE)::SIM_CODE
@@ -94,6 +97,8 @@ function foldExplicitOnce(simCode::SIM_CODE, kept::OrderedSet{String})::Union{No
     push!(get!(definitions, name, Tuple{Int, Exp}[]), (i, x))
   end
   local folded = OrderedDict{String, Tuple{Int, Exp}}(n => only(ds) for (n, ds) in definitions if length(ds) == 1)
+  local cyclic = cyclicNames(OrderedDict{String, OrderedSet{String}}(n => crefNames!(OrderedSet{String}(), x) for (n, (_, x)) in folded))
+  foreach(n -> delete!(folded, n), cyclic)
   isempty(folded) && return nothing
   length(residuals) <= length(folded) && return nothing
   local rs = Replacements(n => Replacement(x, false, false) for (n, (_, x)) in folded)

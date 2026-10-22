@@ -43,6 +43,44 @@ function runPasses(simCode::SIM_CODE, passes::Vector{<:Pair{String}})::SIM_CODE
   return simCode
 end
 
+"The SimCode passes `simulationCode` runs first, in order (before the right-hand-side equivalence's fixed point)."
+const FIRST_PASSES = Pair{String, Function}[
+  "resolveIfExpInBindings" => resolveIfExpInBindings!,
+  "pruneConstantConditions" => pruneConstantConditions,
+  "foldParameterClosure" => foldParameterClosure,
+  "inlinePreOfConstantParameters" => inlinePreOfConstantParameters,
+  "propagateConstants" => propagateConstants,
+  "demoteDeadStates" => demoteDeadStates,
+  "lowerComplexOperatorRecords" => lowerComplexOperatorRecords,
+  "eliminateAliasVariables" => eliminateAliasVariables,
+  "eliminateRHSEquivalentEquations" => eliminateRHSEquivalentEquations,
+  "simplifySemiLinear" => simplifySemiLinear,
+  "removeRedundantEquations" => removeRedundantEquations,
+  "eliminateConstantParameters" => eliminateConstantParameters,
+  "dropObservationOnlyVariables" => dropObservationOnlyVariables,
+  "eliminateDeadParameters" => eliminateDeadParameters,
+  "evaluateConstantFunctionOutputs" => evaluateConstantFunctionOutputs,
+  "eliminateFrozenStates" => eliminateFrozenStates,
+  "demoteDeadStates" => demoteDeadStates,
+  "orientReciprocalEquations" => orientReciprocalEquations,
+  "foldExplicitSingleAssign" => foldExplicitSingleAssign,
+  "eliminateAliasVariables" => eliminateAliasVariables,
+  "simplifySemiLinear" => simplifySemiLinear]
+
+"""
+    simulationCodeThroughFunctionOutputs(model) -> SIM_CODE
+
+The simulation code of `model` through its first passes up to the evaluation of constant function
+outputs (`evaluateConstantFunctionOutputs`): the constants of the parameters' values and of
+functions' outputs (MSL Spice3's capacitances), not those of the frozen states and later folds.
+What index reduction plans with (`OMBackend.knownValues`).
+"""
+function simulationCodeThroughFunctionOutputs(model::IR.Model)::SIM_CODE
+  local simCode = runSimCodePass("flattenRecordCallSites", fromOMJLIR(model), flattenRecordCallSites)
+  local k = findfirst(p -> first(p) == "evaluateConstantFunctionOutputs", FIRST_PASSES)
+  return runPasses(simCode, FIRST_PASSES[1:k])
+end
+
 """
     simulationCode(model; observedFilter = nothing, eliminateNonDynamic = nothing)
 
@@ -64,28 +102,7 @@ function simulationCode(model::IR.Model; observedFilter::Union{Nothing, Vector{S
                         eliminateNonDynamic::Union{Nothing, Bool, EliminationOptions} = nothing)::SIM_CODE
   local simCode = runSimCodePass("flattenRecordCallSites", fromOMJLIR(model), flattenRecordCallSites)
   observedFilter === nothing || (simCode = update(simCode; observedFilter))
-  simCode = runPasses(simCode, [
-    "resolveIfExpInBindings" => resolveIfExpInBindings!,
-    "pruneConstantConditions" => pruneConstantConditions,
-    "foldParameterClosure" => foldParameterClosure,
-    "inlinePreOfConstantParameters" => inlinePreOfConstantParameters,
-    "propagateConstants" => propagateConstants,
-    "demoteDeadStates" => demoteDeadStates,
-    "lowerComplexOperatorRecords" => lowerComplexOperatorRecords,
-    "eliminateAliasVariables" => eliminateAliasVariables,
-    "eliminateRHSEquivalentEquations" => eliminateRHSEquivalentEquations,
-    "simplifySemiLinear" => simplifySemiLinear,
-    "removeRedundantEquations" => removeRedundantEquations,
-    "eliminateConstantParameters" => eliminateConstantParameters,
-    "dropObservationOnlyVariables" => dropObservationOnlyVariables,
-    "eliminateDeadParameters" => eliminateDeadParameters,
-    "evaluateConstantFunctionOutputs" => evaluateConstantFunctionOutputs,
-    "eliminateFrozenStates" => eliminateFrozenStates,
-    "demoteDeadStates" => demoteDeadStates,
-    "orientReciprocalEquations" => orientReciprocalEquations,
-    "foldExplicitSingleAssign" => foldExplicitSingleAssign,
-    "eliminateAliasVariables" => eliminateAliasVariables,
-    "simplifySemiLinear" => simplifySemiLinear])
+  simCode = runPasses(simCode, FIRST_PASSES)
   #= the second alias elimination can make two residuals read one der(s): to a fixed point =#
   local previous = -1
   for _ in 1:6
@@ -95,6 +112,9 @@ function simulationCode(model::IR.Model; observedFilter::Union{Nothing, Vector{S
   end
   simCode = runPasses(simCode, ["classifyAdditionalDiscretes" => classifyAdditionalDiscretes,
                                 "pruneConstantConditions" => pruneConstantConditions])
+  #= after OMBackend's index reduction: der() of the dummy states the aliases left in initial equations, negated left-hand sides =#
+  simCode.indexReduced && (simCode = runPasses(simCode, ["derivativesOfDummyStates" => derivativesOfDummyStates,
+                                                         "unnegatedInitialEquations" => unnegatedInitialEquations]))
   local options = eliminateNonDynamic === true ? EliminationOptions() :
     eliminateNonDynamic isa EliminationOptions ? eliminateNonDynamic : nothing
   options === nothing || (simCode = runSimCodePass("eliminateNonDynamic", simCode, sc -> eliminateOutputOnlyVariables(sc, options)))

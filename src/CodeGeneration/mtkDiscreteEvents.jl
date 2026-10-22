@@ -400,12 +400,22 @@ function _affectValue(e::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_C
     any(s -> s isa SC.WHOLE_DIMENSION, e.subs) && throw(_UnsupportedInAffect(e))
     return :(OMBackend.CodeGeneration.constTableLookup($(expToJuliaExpMTK(e.exp, simCode)), $((rec(s) for s in e.subs)...)))
   end
-  e isa SC.ARRAY_EXP && return expToJuliaExpMTK(e, simCode)
+  #= an array of values the body reads (relations, variables) element by element, as the other operands:
+     MSL 4's Batteries PulseSeries, `oneTrue({time >= Tstart1[1] and ..., ...})`, passed the symbolic relations
+     to the function. A constant array (a table) as it was. =#
+  if e isa SC.ARRAY_EXP
+    _isLiteralArray(e) && return expToJuliaExpMTK(e, simCode)
+    return Expr(:vect, map(rec, e.elements)...)
+  end
   #= an element of a multi-output call (a tuple assignment split per target: MSL TimeTable's
      (a, b, ...) := getInterpolationCoefficients(...)) =#
   e isa SC.TSUB && return :(getindex($(rec(e.exp)), $(e.index)))
   throw(_UnsupportedInAffect(e))
 end
+
+"Whether the array expression `e` holds only literals (nested arrays of them too)."
+_isLiteralArray(e::SC.ARRAY_EXP)::Bool =
+  all(x -> x isa Union{SC.ICONST, SC.RCONST, SC.BCONST, SC.SCONST} || (x isa SC.ARRAY_EXP && _isLiteralArray(x)), e.elements)
 
 """
 A call in an affect body: the event operators edge() and change() Boolean, initial() its
@@ -623,7 +633,10 @@ codegen, or by the init solve's assignments, which take the left side), not free
 Mean block's `t0 = time` (as a free unknown it had no determining row, and its zero Jacobian
 column disabled the scaled Newton step the ideal diodes of DiodeBridge2mPulse need); so are
 the variables of a tuple equation, each equal to the call's output (MSL Filter's `({r[1],
-r[2]}, _, _, _) = roots.lowPass(cr, ...)`). Those the initialization assigns are
+r[2]}, _, _, _) = roots.lowPass(cr, ...)`), and the left sides of the initial algorithms'
+assignments (MSL Fluid TraceSubstances' `ind`, its substance's index: a fixed parameter of 0
+against the algorithm's `ind = 1` kept a row the initialization could not hold, and it moved
+RoomCO2's fixed T to 347 K). Those the initialization assigns are
 ASSIGNED_PARAMETERS: only these, never a bound or tunable parameter alone on the left (`p =
 2 * q`: p was overwritten with 2q, and q never solved).
 """
@@ -639,6 +652,8 @@ function freeParametersDecl(simCode::SC.SIM_CODE)::Expr
       targets === nothing || foreach(t -> push!(assigned, SC.crefName(first(t).cref)), targets)
     end
   end
+  local reads = OrderedSet{String}()
+  foreach(ia -> _collectInitAlgNames!(assigned, reads, ia), _earlyInitialAlgorithms(simCode))
   local names = String[]
   local assignedNames = String[]
   for (key, (_, sv)) in simCode.stringToSimVarHT

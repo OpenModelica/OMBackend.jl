@@ -793,6 +793,27 @@ function fixedStartVarNames(vars::Vector, simCode::SC.SIM_CODE)::Vector{String}
   return String[last(ht[v]).name for v in vars if haskey(ht, v) && SC.isTrueLiteral(last(ht[v]).attributes.fixed)]
 end
 
+"""
+    relayFixedStarts(algebraicVariables, aliases, simCode) -> Vector{String}
+
+The algebraic variables of `fixed = true` the relay elimination drops (`aliases`, member =>
+representative), one per representative without a fixed start of its own: their start,
+substituted onto the representative, is an initialization constraint.
+"""
+function relayFixedStarts(algebraicVariables::Vector{String}, aliases::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)::Vector{String}
+  local ht = simCode.stringToSimVarHT
+  local isFixed = name::String -> haskey(ht, name) && SC.isTrueLiteral(last(ht[name]).attributes.fixed)
+  local constrained = Set{Symbol}()
+  local out = String[]
+  for name in algebraicVariables
+    local rep = get(aliases, Symbol(name), nothing)
+    (rep === nothing || !isFixed(name) || isFixed(String(rep)) || rep in constrained) && continue
+    push!(constrained, rep)
+    push!(out, name)
+  end
+  return out
+end
+
 _isLiteralBind(exp::SC.Exp)::Bool = exp isa Union{SC.RCONST, SC.ICONST, SC.BCONST, SC.SCONST, SC.ENUM_LITERAL}
 
 #= ==================================================================================== =#

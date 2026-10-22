@@ -175,24 +175,31 @@ createEquations(equations::Vector{SC.WHEN_EQUATION}, simCode::SC.SIM_CODE)::Vect
   Expr[eqToJulia(eq, simCode, i) for (i, eq) in enumerate(equations)]
 
 """
-The lookups of the variables name[1], name[2], ... (none when name[1] is not a variable).
+The variables name[1], name[2], ... (none when name[1] is not a variable).
 """
-function _scalarizedElementLookups(name::String, simCode::SC.SIM_CODE)::Vector{Any}
-  local elems = Any[]
+function _scalarizedElementKeys(name::String, simCode::SC.SIM_CODE)::Vector{String}
+  local keys = String[]
   local key = string(name, "[1]")
   while haskey(simCode.stringToSimVarHT, key)
-    push!(elems, getIdxForLookupMTK(key, simCode))
-    key = string(name, "[", length(elems) + 1, "]")
+    push!(keys, key)
+    key = string(name, "[", length(keys) + 1, "]")
   end
-  return elems
+  return keys
 end
 
 #= The names the when callbacks bind themselves: a variable binding of the same name would
    replace them. =#
 const _WHEN_CALLBACK_LOCALS = ("x", "p", "t", "integrator", "lookuptableStates", "lookuptableParams")
 
+#= The state vector as the when callbacks' lookups read it: the callback's `x`, taken once per
+   callback body, so a model variable named `x` (bound to its value by a lookup) does not hide
+   it from the lookups after it (a Cartesian pendulum's x, y: a BoundsError on a Float64). =#
+const _WHEN_STATE_VECTOR = Symbol("#u")
+
 """
-`name = <state/param lookup>` bindings for the names a when callback reads, one per name. A
+`name = <state/param lookup>` bindings for the names a when callback reads, one per name, the
+states read from the callback's state vector as it was before any binding
+(`_WHEN_STATE_VECTOR`). A
 name the table does not have is an inlined constant (a logic ResetMap[i] element) the
 lowering emits as a literal, and gets none (a state/param index for it would KeyError),
 unless it is a whole array of variables: then the vector of their values (MSL
@@ -201,21 +208,32 @@ structure (an external object: Buildings' borehole ExtendableArray) is a module-
 binding (createDataStructureAssignments), never a state or parameter slot.
 """
 function _whenLookupBindings(names::Vector{String}, simCode::SC.SIM_CODE)::Vector{Expr}
+  local u = _WHEN_STATE_VECTOR
+  local readsStates = false
+  #= a state lookup `getindex(x, i)` reads `u` instead =#
+  local lookup = function (key::String)
+    local e = getIdxForLookupMTK(key, simCode)
+    (e isa Expr && e.head === :call && e.args[1] === getindex && e.args[2] === :x) || return e
+    readsStates = true
+    return Expr(:call, getindex, u, e.args[3:end]...)
+  end
   local out = Expr[]
   for name in unique(names)
     local entry = get(simCode.stringToSimVarHT, name, nothing)
     if entry === nothing
-      local elems = _scalarizedElementLookups(name, simCode)
-      isempty(elems) && continue
+      local keys = _scalarizedElementKeys(name, simCode)
+      isempty(keys) && continue
       name in _WHEN_CALLBACK_LOCALS &&
         OMBackend.unsupported("a when reading the whole array $(name) (a name the event callback uses itself)", name)
-      push!(out, Expr(:(=), Symbol(name), Expr(:vect, elems...)))
+      push!(out, Expr(:(=), Symbol(name), Expr(:vect, map(lookup, keys)...)))
       continue
     end
     OMBackend.envSwitch("OMBACKEND_WHEN_STRING_SKIP") && last(entry).varKind isa SC.STRING && continue
     last(entry).varKind isa SC.DATA_STRUCTURE && continue
-    push!(out, Expr(:(=), Symbol(name), getIdxForLookupMTK(name, simCode)))
+    push!(out, Expr(:(=), Symbol(name), lookup(name)))
   end
+  #= taken where a lookup reads it (a callback that reads no state may have no `x`) =#
+  readsStates && pushfirst!(out, :($(u) = @isdefined($(u)) ? $(u) : x))
   return out
 end
 

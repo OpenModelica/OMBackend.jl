@@ -72,7 +72,8 @@ _elementSubscripts(name::AbstractString)::String =
 #= Environment switches of the backend, read on each use: set one in a running
    session and rerun. Kill switches (default on) turn a mechanism off to compare
    with the behaviour before it; diagnostics (default off) print or keep what a
-   run did. "true", "1" or "yes" (any case) is on; anything else set is off.
+   run did; research features (default off) are new paths not yet the default. "true", "1" or
+   "yes" (any case) is on; anything else set is off.
    The logging switches (ENABLE_BACKEND_LOGGING, ENABLE_BACKEND_PERFLOG,
    ENABLE_VSS_DEBUG) are read once at load into Refs (util.jl); OMJL_LOG_DIR
    is a directory. =#
@@ -82,10 +83,13 @@ const ENV_SWITCHES = Dict{String, Tuple{Bool, String}}(
   "OMBACKEND_DEMOTE_CONDTARGETS" => (true, "demote a discrete that an if-equation relay defines"),
   "OMBACKEND_DISCRETE_PRE_MEMORY" => (true, "discrete clusters with event iteration for every model (off: MTK affects where no mode FSM, table or switch cluster needs them)"),
   "OMBACKEND_INIT_ANCHOR" => (true, "initialization phase 2 anchored to the entry guesses (the nearest root)"),
+  "OMBACKEND_INIT_FIX_STATES" => (true, "an underdetermined initialization completed as OpenModelica and Dymola do: the unfixed states a matching leaves free fixed at their start values, the square remainder solved (off: phase 2's least squares over all states)"),
   "OMBACKEND_INIT_COMPLETE" => (true, "complete an underdetermined initialization by null-space projection"),
   "OMBACKEND_INIT_DISCRETES" => (true, "initial fixpoint of the discrete clusters"),
   "OMBACKEND_INIT_RELATIONS" => (true, "initial values of the if-equations' relation literals"),
   "OMBACKEND_INIT_REPIN" => (true, "re-pin the pinned and latched variables after the free initialization phase"),
+  "OMBACKEND_CALL_PARTIALS" => (true, "partials by central differences of the terms of a function's element extractors and flat calls in the symbolic Jacobian (off: no rule, the whole Jacobian by finite differences)"),
+  "OMBACKEND_COMPILED_FUNCTIONS" => (true, "the model's Modelica functions compiled, as RuntimeGeneratedFunctions of CodeGeneration (off: closures of the model module, interpreted under OMBACKEND_MODULE_COMPILE_MIN)"),
   "OMBACKEND_MODULE_COMPILE_MIN" => (true, "the generated model module compiles with optimize=0 compile=min infer=false (off: default compilation; longer build)"),
   "OMBACKEND_INIT_ROWSCALE" => (true, "row scaling of the initialization Newton Jacobian"),
   "OMBACKEND_INIT_SYMBOLIC_EQS" => (true, "symbolic initialization residuals of the reduced system"),
@@ -93,6 +97,13 @@ const ENV_SWITCHES = Dict{String, Tuple{Bool, String}}(
   "OMBACKEND_RELAY_T0_FIXEDPOINT" => (true, "initial if-equation branches by a fixed point with their targets' t0 values"),
   "OMBACKEND_TGRAD" => (true, "exact time derivative (tgrad) for DirectRHS problems"),
   "OMBACKEND_WHEN_STRING_SKIP" => (true, "String variables left out of the when callbacks' index bindings"),
+  "OMBACKEND_IF_READS_IRREDUCIBLE" => (false, "the variables an if-equation of several targets reads (its conditions' and equations' algebraic variables) kept unknowns as its targets are (off: only its targets and the states it differentiates; a condition variable an explicit equation defines stays explicit)"),
+  "OMBACKEND_INDEX_REDUCTION" => (true, "OMBackend's own index reduction and state selection on OMJLIR (Passes.IndexReduction; off: MTK's structural_simplify reduces the index)"),
+  "OMBACKEND_DYNAMIC_STATE_SETS" => (true, "with OMBACKEND_INDEX_REDUCTION: dynamic state sets (OpenModelica's form, x = A * V), switched while the simulation runs where the choice depends on the state (one row once the static dummies are eliminated: a quaternion's norm, a pendulum's positions with its velocities), and OpenModelica's ranking of variables without a StateSelect; off: the choice at the start values"),
+  "OMBACKEND_ALIAS_SUBSTITUTION" => (true, "with OMBACKEND_INDEX_REDUCTION: the alias sets (a = ±b, a = c) read through one representative before index reduction (Passes.IndexReduction.substituteAliases!; the alias equations kept), undone where the model is not reduced; off: index reduction reads them as written"),
+  "OMBACKEND_ARRAY_INDEX_REDUCTION" => (true, "with OMBACKEND_INDEX_REDUCTION: a model translated with its arrays kept (scalarize = false) whose index is above one reduced in array form (Passes.IndexReduction.reduceIndexArrays!: planned on its elements, for-equations differentiated with their iterators, arrays of one kind), then scalarized for the simulation code; off, or where the array form does not take the plan: scalarized in the frontend as before"),
+  "OMBACKEND_PREFER_STATES" => (true, "with OMBACKEND_INDEX_REDUCTION: a continuous variable of StateSelect.prefer that the model does not differentiate an artificial state, as OpenModelica's (Pantelides differentiates the equations that make it one; given up where they do not differentiate): MSL Fluid's medium states instead of a volume's m and U, omc's states for PumpingSystem, the Machines' idq currents; off: only StateSelect.always"),
+  "OMBACKEND_SOLVE_DERIVATIVES" => (true, "with OMBACKEND_INDEX_REDUCTION: the derivative unknowns of a reduced model solved for and substituted (Passes.IndexReduction.solveDerivatives!), so the code generators compute them from the other unknowns; off: they stay algebraic unknowns, kept by MTK"),
   #= Diagnostics =#
   "OMBACKEND_EVENT_TRACE" => (false, "trace the event iteration"),
   "OMBACKEND_FALLBACK_ON_BUG" => (false, "observe mode of the error policy (errorPolicy.jl): a programming error in a fallback's try is logged at @error and the fallback taken instead of propagating"),

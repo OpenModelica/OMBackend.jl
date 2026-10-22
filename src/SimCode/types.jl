@@ -891,6 +891,10 @@ struct SIM_CODE
   asserts::Vector{ASSERT_EQUATION}
   "The model's variables `foldParameterClosure` made parameters: observed when a pass drops them."
   foldedVariables::Vector{String}
+  "OMBackend reduced the model's index (Passes.IndexReduction, OMBACKEND_INDEX_REDUCTION): MTK only tears."
+  indexReduced::Bool
+  "Its dummy derivatives (simulation names): algebraic, left out of the error control (`defaultToleranceKwargs`)."
+  dummyDerivatives::Vector{String}
 end
 
 """

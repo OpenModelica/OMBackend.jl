@@ -321,19 +321,30 @@ end
 
 `(y, x, sa, sb)` of the residual `y - semiLinear(x, sa, sb)` (or `semiLinear(...) - y`), `y` a
 variable; a negated `y` turned round (`-semiLinear(x, sa, sb) = semiLinear(-x, sb, sa)`: the
-alias elimination writes a port's flow as the other port's negated). `nothing` for another.
+alias elimination writes a port's flow as the other port's negated). Double negations of `y`
+and `x` are dropped (the second alias elimination substitutes a negated alias into a negated
+reference: `-(-H_flow)`, `semiLinear(-(-m_flow), ...)`). `nothing` for another.
 """
 function semiLinearEquation(e::Exp)::Union{Nothing, NTuple{4, Exp}}
   (e isa BINARY && e.op === OP_SUB) || return nothing
   for (y, c) in ((e.exp1, e.exp2), (e.exp2, e.exp1))
     (isBuiltin(c, :semiLinear) && length(c.args) == 3) || continue
-    y isa EXP_CREF && return (y, c.args[1], c.args[2], c.args[3])
-    (y isa UNARY && y.op === OP_UMINUS && y.exp isa EXP_CREF) && return (y.exp, negated(c.args[1]), c.args[3], c.args[2])
+    local (yy, x) = (withoutDoubleNegation(y), withoutDoubleNegation(c.args[1]))
+    yy isa EXP_CREF && return (yy, x, c.args[2], c.args[3])
+    (yy isa UNARY && yy.op === OP_UMINUS && yy.exp isa EXP_CREF) && return (yy.exp, negated(x), c.args[3], c.args[2])
   end
   return nothing
 end
 
 negated(e::Exp)::Exp = e isa UNARY && e.op === OP_UMINUS ? e.exp : UNARY(OP_UMINUS, e)
+
+"`e` without its pairs of leading negations (`-(-x)` is `x`)."
+function withoutDoubleNegation(e::Exp)::Exp
+  while e isa UNARY && e.op === OP_UMINUS && e.exp isa UNARY && e.exp.op === OP_UMINUS
+    e = e.exp.exp
+  end
+  return e
+end
 
 """
     semiLinearChain(eqs)

@@ -11,8 +11,9 @@ import OMBackend
   local mm = [1.0 0.0; 0.0 0.0]
   local f = SB.ODEFunction((du, u, p, t) -> (du[1] = -u[1]; du[2] = u[2] - u[1]; nothing); mass_matrix = mm)
   local problem = SB.ODEProblem(f, [1.0, 1.0], (0.0, 1.0))
-  @test CG.defaultInitializeKwargs(problem, (; abstol = [1.0e-6, 1.0e-8]), false).initializealg.abstol == 1.0e-8
-  @test CG.defaultInitializeKwargs(problem, (; abstol = 1.0e-7), false).initializealg.abstol == 1.0e-7
+  #= the BrownFullBasicInit the start re-solve (StartReinit) runs =#
+  @test CG.defaultInitializeKwargs(problem, (; abstol = [1.0e-6, 1.0e-8]), false).initializealg.alg.abstol == 1.0e-8
+  @test CG.defaultInitializeKwargs(problem, (; abstol = 1.0e-7), false).initializealg.alg.abstol == 1.0e-7
   #= The caller's abstol per unknown stands; a problem without a system has no names to tell
      dummy derivatives by. =#
   @test CG.defaultToleranceKwargs(problem, (; abstol = [1.0e-6, 1.0e-8])) == (;)

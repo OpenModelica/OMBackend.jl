@@ -427,9 +427,11 @@ function createIfEquation(stateVariables::Vector,
        values (which would form a circular init dependency). =#
     local zcLhs = _extractZeroCrossingLHS(mtkCond)
     local thisSym::Symbol = allIfCondSyms[i]
-    if MTK_CodeGenerationUtil._ifConditionAllDiscreteOrParameter(branch.condition, simCode)
+    if MTK_CodeGenerationUtil._ifConditionAllDiscreteOrParameter(branch.condition, simCode) ||
+       MTK_CodeGenerationUtil._ifConditionLiteral(branch.condition, simCode)
       #= A discrete or parameter condition: the residuals gate directly on it
-         (generateIfExpressions), whose own update event localises the step.
+         (generateIfExpressions), whose own update event localises the step; a
+         noEvent condition: the residuals gate on it as written (MLS 3.7.4).
          No crossing function, no callback. =#
       push!(ivConditions, ivCond)
     #= A condition with initial() is a relation (a constant crossing function

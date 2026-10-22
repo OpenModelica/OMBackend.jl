@@ -615,7 +615,13 @@ function liftBodyToWhens!(out::Vector{IR.Equation}, stmts::Vector{IR.Statement},
   union!(lifted, runAssigned)
   (isempty(initOps) && isempty(runOps)) && return nothing
   isempty(initOps) || push!(out, initialWhen(initOps, source))
-  local triggers = IR.Expression[changeCall(c) for c in discreteInputs(runOps, Set{Symbol}(runAssigned))]
+  #= an input read only through pre() changes the body one pass after it changes: `change(pre(x))`, the
+     lifter's iterated form (MSL RadioButtonSource's `pre_reset := pre(reset)` fired on change(reset), read the
+     old value, and never ran again: the buttons never reset) =#
+  runOps = IR.Statement[op isa IR.ASSIGNMENT ? IR.ASSIGNMENT(op.lhs, preOfElements(op.rhs), op.source) : op for op in runOps]
+  local direct = readOutsidePre(runOps)
+  local triggers = IR.Expression[c.cref.name in direct ? changeCall(c) : changeCall(builtinCall(:pre, IR.Expression[c], c.ty))
+                                 for c in discreteInputs(runOps, Set{Symbol}(runAssigned))]
   local relationsSeen = IR.Expression[]
   for op in runOps
     op isa IR.ASSIGNMENT || continue
@@ -644,6 +650,48 @@ end
 function samplesIn(e::IR.Expression)::Vector{IR.Expression}
   local out = IR.Expression[]
   IR.foreachExp(x -> IR.isBuiltinCall(x, :sample) && push!(out, x), e)
+  return out
+end
+
+"""
+    preOfElements(e)
+
+`e` with `pre({a, b, ...})[k]` (a literal index) as `pre(element k)`: the frontend's form of an array's
+`pre()` read by element (RadioButtonSource's `pre(reset)`).
+"""
+preOfElements(e::IR.Expression)::IR.Expression = IR.mapExp(e) do x
+  (x isa IR.SUBSCRIPTED && length(x.subscripts) == 1 && x.subscripts[1] isa IR.INDEX &&
+   x.subscripts[1].exp isa IR.INTEGER && IR.isBuiltinCall(x.exp, :pre) && length(x.exp.arguments) == 1 &&
+   x.exp.arguments[1] isa IR.ARRAY) || return x
+  local elements = x.exp.arguments[1].elements
+  local k = x.subscripts[1].exp.value
+  (1 <= k <= length(elements)) || return x
+  return builtinCall(:pre, IR.Expression[elements[k]], IR.typeOf(elements[k]))
+end
+
+"""
+    readOutsidePre(ops) -> Set{Symbol}
+
+The variables the statements' expressions read outside `pre()`.
+"""
+function readOutsidePre(ops::Vector{IR.Statement})::Set{Symbol}
+  local out = Set{Symbol}()
+  local visit
+  visit = e -> begin
+    IR.isBuiltinCall(e, :pre) && return nothing
+    e isa IR.CREF && push!(out, e.cref.name)
+    foreach(visit, IR.children(e))
+    nothing
+  end
+  for op in ops
+    if op isa IR.ASSIGNMENT
+      visit(op.rhs)
+    elseif op isa IR.NORETCALL
+      visit(op.call)
+    elseif op isa IR.ASSERT
+      visit(op.condition); visit(op.message); visit(op.level)
+    end
+  end
   return out
 end
 
@@ -838,7 +886,7 @@ end
 The Real variables an algorithm section assigns outside its when statements, as equations
 (MLS 11.1.2: the section runs as a whole, in order): the statements run symbolically
 (`AlgorithmRun`), each Real variable `v = <its value at the end>`, a record variable the record
-equation; an assert checked on the values at its point. The discrete targets stay the when
+equation (`recordValueEquations`); an assert checked on the values at its point. The discrete targets stay the when
 lifter's. A section reading `initial()` is reported, not lowered.
 """
 function realAssignmentEquations(stmts::Vector{IR.Statement}, source::IR.Source,
@@ -864,6 +912,7 @@ function realAssignmentEquations(stmts::Vector{IR.Statement}, source::IR.Source,
       name in run.readAsVariable &&
         unsupported("an algorithm section assigning $(name) after reading it in der(), edge() or change()", op.lhs)
       run.values[name] = algorithmValue(op.rhs, run)
+      op.lhs.ty isa IR.T_RECORD && assignFields!(run, name, run.values[name], op.lhs.ty)
       any(v -> first(v) === name, values) || push!(values, (name, op.lhs))
     elseif op isa IR.ASSERT
       push!(out, IR.ASSERT_EQUATION(algorithmValue(op.condition, run), algorithmValue(op.message, run), op.level, op.source))
@@ -876,10 +925,56 @@ function realAssignmentEquations(stmts::Vector{IR.Statement}, source::IR.Source,
       name in whenLifted && unsupported("a Real variable an algorithm section assigns both in a when and outside one", lhs)
       push!(out, IR.SCALAR_EQUATION(lhs, run.values[name], lhs.ty, source, DYNAMIC))
     elseif lhs.ty isa IR.T_RECORD
-      #= as a record equation of the flat model: one of a call stays whole =#
-      local value = run.values[name]
-      value isa IR.CALL ? push!(out, IR.RECORD_EQUATION(lhs, value, lhs.ty, length(lhs.ty.fields), source, IR.DEFAULT_ATTRIBUTES)) :
-                          append!(out, recordEquations(lhs, value, source))
+      append!(out, recordValueEquations(lhs, run.values[name], Set{Symbol}(first.(values)), source))
+    end
+  end
+  return out
+end
+
+"""
+    assignFields!(run, name, value, ty)
+
+After the whole record `name := value`: each of its fields the section also assigns by itself
+its field of `value`, until that assignment (`vp := init(rp, lp)` then `vp.m_dConduct := ...`,
+MSL Spice3's semiconductor resistor: a read in between is `init(rp, lp)[4]`).
+"""
+function assignFields!(run::AlgorithmRun, name::Symbol, value::IR.Expression, ty::IR.T_RECORD)::Nothing
+  for (k, field) in enumerate(ty.fields)
+    local fieldName = Symbol(String(name), ".", field.name)
+    local fieldValue = fieldByIndex(value, k)
+    fieldName in run.assigned && (run.values[fieldName] = fieldValue)
+    fieldName in run.wholes || continue
+    field.ty isa IR.T_RECORD ? assignFields!(run, fieldName, fieldValue, field.ty) :
+      unsupported("an algorithm section assigning elements of an array field of a record it assigns whole", fieldName)
+  end
+  return nothing
+end
+
+"""
+    recordValueEquations(lhs, value, own, source) -> Vector{Equation}
+
+The equations of a record variable an algorithm section assigns whole, `lhs = value`: as a
+record equation of the flat model (one of a call stays whole); without the fields the section
+also assigns by themselves (`own`, whose equations are their own: their values at the end),
+field by field.
+"""
+function recordValueEquations(lhs::IR.CREF, value::IR.Expression, own::Set{Symbol}, source::IR.Source)::Vector{IR.Equation}
+  local prefix = String(lhs.cref.name) * "."
+  if !any(n -> startswith(String(n), prefix), own)
+    return value isa IR.CALL ? IR.Equation[IR.RECORD_EQUATION(lhs, value, lhs.ty, length(lhs.ty.fields), source, IR.DEFAULT_ATTRIBUTES)] :
+                               recordEquations(lhs, value, source)
+  end
+  local out = IR.Equation[]
+  for (k, field) in enumerate(lhs.ty.fields)
+    local l = fieldExpression(lhs, field.name, field.ty)::IR.CREF
+    l.cref.name in own && continue
+    local r = fieldByIndex(value, k)
+    if field.ty isa IR.T_RECORD
+      append!(out, recordValueEquations(l, r, own, source))
+    elseif field.ty isa IR.T_ARRAY
+      push!(out, IR.ARRAY_EQUATION(l, r, field.ty, source, IR.DEFAULT_ATTRIBUTES))
+    else
+      push!(out, IR.SCALAR_EQUATION(l, r, field.ty, source, IR.DEFAULT_ATTRIBUTES))
     end
   end
   return out

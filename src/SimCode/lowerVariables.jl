@@ -56,6 +56,8 @@ function simVarKind(v::IR.Variable, names::Names)::SimVarType
   local known = k isa Union{IR.PARAMETER, IR.CONSTANT}
   k isa IR.STATE && return STATE()
   (k isa IR.ALGEBRAIC && ty isa IR.T_REAL) && return ALG_VARIABLE(0)
+  #= index reduction's dummy states and dummy derivatives (OMBACKEND_INDEX_REDUCTION) are algebraic =#
+  (k isa Union{IR.DUMMY_STATE, IR.DUMMY_DER} && ty isa IR.T_REAL) && return ALG_VARIABLE(0)
   (known && ty isa Union{IR.T_RECORD, IR.T_CLASS, IR.T_EXTERNAL_OBJECT}) && return DATA_STRUCTURE(binding())
   ty isa IR.T_EXTERNAL_OBJECT && return DATA_STRUCTURE(binding())
   ty isa Union{IR.T_REAL, IR.T_BOOLEAN, IR.T_INTEGER, IR.T_ENUMERATION} && known &&

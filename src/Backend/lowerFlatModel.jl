@@ -831,10 +831,86 @@ end
 """
     lowerFunctions(functions)
 
-The functions the model calls (the frontend's list, in its order) in OMJLIR.
+The functions the model calls (the frontend's list, in its order) in OMJLIR, the derivatives
+synthesized for inlined functions after them (`withInlineDerivatives`).
 """
 lowerFunctions(functions::FunctionList)::Vector{IR.ModelicaFunction} =
-  IR.ModelicaFunction[lowerFunction(f) for f in functions]
+  withInlineDerivatives(IR.ModelicaFunction[lowerFunction(f) for f in functions])
+
+"""
+    withInlineDerivatives(functions)
+
+`functions` with a derivative for each `Inline = true` function without one whose body is
+`y := g(a1, ..., an)`, `g` with a derivative annotation (`inlineDerivative`): the derivative
+added after the functions and the function annotated with it. OpenModelica inlines such a
+function before the index reduction (MSL IF97's `rho_ph(p, h, phase, region) :=
+rho_props_ph(p, h, waterBaseProp_ph(p, h, phase, region))`) and evaluates the auxiliary record
+once. Differentiated inlined, the record was a call argument of `g`'s derivative in an
+equation, and the code generation evaluates such a call once per field of the record (16 for
+IF97's, MSL Fluid's MeasuringTemperature 5 times slower); in a function body it is evaluated
+once.
+"""
+function withInlineDerivatives(functions::Vector{IR.ModelicaFunction})::Vector{IR.ModelicaFunction}
+  local byName = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in functions)
+  local out = copy(functions)
+  for (k, f) in enumerate(functions)
+    local derivative = inlineDerivative(f, byName)
+    derivative === nothing && continue
+    out[k] = IR.ModelicaFunction(f.name, f.inputs, f.outputs, f.locals, f.body, f.external,
+                                 IR.FunctionDerivative[IR.FunctionDerivative(derivative.name, 1, Int[])], f.impure, f.inline,
+                                 f.source)
+    push!(out, derivative)
+  end
+  return out
+end
+
+"""
+    inlineDerivative(f, byName)
+
+The derivative of an `Inline = true` function `f` without a derivative annotation whose body
+is `y := g(a1, ..., an)`, `g` with a derivative annotation of order 1: `g`'s derivative function
+at the same arguments, named `f__inlineDer`. It takes `f`'s inputs and a derivative for each
+Real one. Of `g`'s arguments, a Real one that takes a derivative must be one of `f`'s inputs or
+a literal; another kind of one `g`'s annotation excludes (IF97's auxiliary record). `nothing`
+for another function.
+"""
+function inlineDerivative(f::IR.ModelicaFunction, byName::Dict{Symbol, IR.ModelicaFunction})::Union{Nothing, IR.ModelicaFunction}
+  (f.inline && isempty(f.derivatives) && f.external === nothing && length(f.outputs) == 1 && length(f.body) == 1) ||
+    return nothing
+  local out = only(f.outputs)
+  out.ty isa IR.T_REAL || return nothing
+  all(v -> v.ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN}, f.inputs) || return nothing
+  local stmt = only(f.body)
+  (stmt isa IR.ASSIGNMENT && stmt.lhs isa IR.CREF && stmt.lhs.cref.name === out.name && stmt.rhs isa IR.CALL &&
+   !stmt.rhs.attributes.builtin) || return nothing
+  local call = stmt.rhs
+  local g = get(byName, call.name, nothing)
+  g === nothing && return nothing
+  local gk = findfirst(d -> d.order == 1, g.derivatives)
+  (gk === nothing || length(call.arguments) != length(g.inputs)) && return nothing
+  local gd = g.derivatives[gk]
+  local derOf = Dict{Symbol, IR.Expression}()
+  local derInputs = IR.FunctionVariable[]
+  for v in f.inputs
+    v.ty isa IR.T_REAL || continue
+    local name = Symbol(v.name, "__der")
+    push!(derInputs, IR.FunctionVariable(name, v.ty, nothing, Pair{Symbol, IR.Expression}[]))
+    derOf[v.name] = IR.CREF(IR.ComponentRef(name, v.ty), v.ty)
+  end
+  local derArgs = IR.Expression[]
+  for (i, a) in enumerate(call.arguments)
+    local ty = g.inputs[i].ty
+    (i in gd.excludedInputs || ty isa Union{IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION, IR.T_STRING}) && continue
+    ty isa IR.T_REAL || return nothing
+    local d = a isa IR.CREF ? get(derOf, a.cref.name, nothing) : a isa Union{IR.REAL, IR.INTEGER} ? IR.REAL(0.0) : nothing
+    d === nothing && return nothing
+    push!(derArgs, d)
+  end
+  local derCall = IR.CALL(gd.derivative, IR.Expression[call.arguments..., derArgs...], out.ty, call.attributes)
+  return IR.ModelicaFunction(Symbol(f.name, "__inlineDer"), vcat(f.inputs, derInputs), IR.FunctionVariable[out],
+                             IR.FunctionVariable[], IR.Statement[IR.ASSIGNMENT(stmt.lhs, derCall, stmt.source)], nothing,
+                             IR.FunctionDerivative[], f.impure, false, f.source)
+end
 
 """
     lowerFunction(fn)

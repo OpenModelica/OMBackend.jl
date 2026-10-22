@@ -207,6 +207,7 @@ isLinearlySolvableFor(e::Exp, name::String)::Bool = occursLinearly(e, name) == (
 #= The pass                                                                             =#
 #= ==================================================================================== =#
 
+
 """
     eliminateOutputOnlyVariables(simCode, options)
 
@@ -216,7 +217,8 @@ recorded for the observed equations. `options`: with `reachability` every such v
 only those a pattern of `patterns` matches; none a pattern of `keepPatterns` matches. A variable that a remaining residual (or one reading its
 array's name), a when-clause, an initial equation reads, a Complex part, one of a fixed start,
 is kept with its residual, to a fixed point (what a kept residual reads stays too). Never every
-residual. Nothing for a model with modes or translated again at its structural changes.
+residual. Candidates on a cycle of what their residuals read are kept too (cyclicNames): the observed
+equations need an order. Nothing for a model with modes or translated again at its structural changes.
 """
 function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOptions)::SIM_CODE
   (hasSubModels(simCode) || hasFrontendModel(simCode)) && return simCode
@@ -267,7 +269,10 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
       name in whenReads || name in initialReads || name in complexParts
   end
   local candidates = OrderedSet{String}(first(p) for p in pairs)
-  local kept = OrderedSet{String}()
+  local kept = cyclicNames(OrderedDict{String, OrderedSet{String}}(n => reads[i] for (n, i) in pairs))
+  for (name, i) in pairs
+    name in kept && delete!(removed, i)
+  end
   local more = true
   while more
     more = false

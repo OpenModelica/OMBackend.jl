@@ -222,6 +222,53 @@ end
   @test i.u[4] == hHot && hOfT(i.u[5]) ≈ hHot && i.u[1] == 0.5 && i.u[2] > 0
 end
 
+#= The re-solve where undamped Newton diverges: 0 = atan(y - 1) from y = 4 (its steps grow beyond |y - 1| > 1.39); as
+   MSL 4 Fluid IncompressibleFluidNetwork at t = 50 (valve1 closing, the network's pressure level weakly tied to
+   its boundaries, Newton along the pressures). Newton with its steps halved while they raise the residual
+   (`_dampedFraction`, the next stage) solves it, and so does Levenberg-Marquardt with the problem's Jacobian
+   (`_eventLevenbergMarquardt!`), before the polyalgorithm. =#
+@testset "Event re-solve: damped Newton and Levenberg-Marquardt where Newton diverges" begin
+  local CG = OMBackend.CodeGeneration
+  local SB = CG.ModelingToolkit.SciMLBase
+  local ODE = CG.OrdinaryDiffEq
+  local SA = CG.Symbolics.SparseArrays
+  local f!(du, u, p, t) = (du[1] = -u[1]; du[2] = atan(u[2] - 1); nothing)
+  local jac!(J, u, p, t) = (fill!(SA.nonzeros(J), 0.0); J[1, 1] = -1; J[2, 2] = 1 / (1 + (u[2] - 1)^2); nothing)
+  local proto = SA.sparse([1, 2], [1, 2], ones(2), 2, 2)
+  local prob = SB.ODEProblem(SB.ODEFunction(f!; mass_matrix = [1.0 0.0; 0.0 0.0], jac = jac!, jac_prototype = proto),
+                             [1.0, 4.0], (0.0, 1.0))
+  local i = ODE.init(prob, ODE.Rodas5P(); initializealg = SB.NoInit())
+  @test !CG._eventNewton!(i; tol = 1e-10) && i.u[2] == 4.0
+  @test CG._eventNewton!(i; tol = 1e-10, damped = true) && i.u[2] ≈ 1.0
+  local k = ODE.init(prob, ODE.Rodas5P(); initializealg = SB.NoInit())
+  @test CG._eventLevenbergMarquardt!(k; tol = 1e-10) && k.u[2] ≈ 1.0
+  local j = ODE.init(prob, ODE.Rodas5P(); initializealg = SB.NoInit())
+  CG.DiffEqBase.initialize_dae!(j, CG.EventReinit())
+  @test j.sol.retcode == SB.ReturnCode.Default && j.u[2] ≈ 1.0 && j.u[1] == 1.0
+end
+
+#= Newton at a square-root characteristic, 0 = sign(y - 1) sqrt(|y - 1|), from y = 4: the full step overshoots to the
+   mirror point y = -2 and back (MSL Fluid TanksWithOverflow's overflow port, its pressure jumping by ±35 kPa when the
+   level falls below the port). Damped Newton, the stage after it, halves the step while it does not lower the
+   residual (`_dampedFraction`). =#
+@testset "Event re-solve: damped Newton at a square-root characteristic" begin
+  local CG = OMBackend.CodeGeneration
+  local SB = CG.ModelingToolkit.SciMLBase
+  local ODE = CG.OrdinaryDiffEq
+  local SA = CG.Symbolics.SparseArrays
+  local f!(du, u, p, t) = (du[1] = -u[1]; du[2] = sign(u[2] - 1) * sqrt(abs(u[2] - 1)); nothing)
+  local jac!(J, u, p, t) = (fill!(SA.nonzeros(J), 0.0); J[1, 1] = -1; J[2, 2] = 0.5 / sqrt(abs(u[2] - 1)); nothing)
+  local proto = SA.sparse([1, 2], [1, 2], ones(2), 2, 2)
+  local prob = SB.ODEProblem(SB.ODEFunction(f!; mass_matrix = [1.0 0.0; 0.0 0.0], jac = jac!, jac_prototype = proto),
+                             [1.0, 4.0], (0.0, 1.0))
+  local i = ODE.init(prob, ODE.Rodas5P(); initializealg = SB.NoInit())
+  @test !CG._eventNewton!(i; tol = 1e-10) && i.u[2] == 4.0
+  @test CG._eventNewton!(i; tol = 1e-10, damped = true) && i.u[2] ≈ 1.0 && i.u[1] == 1.0
+  local j = ODE.init(prob, ODE.Rodas5P(); initializealg = SB.NoInit())
+  CG.DiffEqBase.initialize_dae!(j, CG.EventReinit())
+  @test j.sol.retcode == SB.ReturnCode.Default && j.u[2] ≈ 1.0
+end
+
 #= A large algebraic block (3000 rows, tridiagonal, each row reading the differential state):
    the re-solve factorizes the block sparse, as the problem's Jacobian is (a dense copy would be
    72 MB at every event). =#

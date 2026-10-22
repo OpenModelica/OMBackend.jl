@@ -459,11 +459,37 @@ function liftIfExpressions!(model::IR.Model)::IR.Model
     local lifter = IfExpressionLifter(variables, Dict{Any, IR.CREF}(), IR.Equation[], Ref(0))
     for eq in p.equations
       (eq isa IR.WHEN_EQUATION && eq.kind !== IR.STRUCTURAL_WHEN) && continue
+      #= for-equations come here only with the arrays kept (index reduction in array form), which then
+         declines: the lifted if-equation would read the iterator outside its loop (MSL RobotR3.oneAxis's
+         `moving[i] = if abs(q_end[i] - q_begin[i]) > eps then ...`, a free `i` in the generated code) =#
+      (eq isa IR.FOR_EQUATION && ifReadsIterator(eq)) &&
+        throw(IndexReduction.NotHandled("an if-expression that reads a for-equation's iterator"))
       mapRoots!(e -> lift(lifter, e, false), eq)
     end
     append!(p.equations, lifter.equations)
   end
   return model
+end
+
+"""
+    ifReadsIterator(eq, scope) -> Bool
+
+Whether an if-expression in the body of the for-equation `eq` (or of the for-equations in it) reads one of
+their iterators (`scope`, the enclosing ones).
+"""
+function ifReadsIterator(eq::IR.FOR_EQUATION, scope::Set{Symbol} = Set{Symbol}())::Bool
+  local inner = union(scope, Set{Symbol}((eq.iterator.name,)))
+  local readsInner = x -> x isa IR.CREF && x.cref.name in inner
+  for b in eq.body
+    if b isa IR.FOR_EQUATION
+      ifReadsIterator(b, inner) && return true
+      continue
+    end
+    local hit = false
+    IR.foreachExp(x -> ((x isa IR.IF_EXPRESSION && IR.anyExp(readsInner, x)) && (hit = true); nothing), b)
+    hit && return true
+  end
+  return false
 end
 
 "The state of the lifting in a partition: the lifted if-expressions' variables (by shape), their equations, the next number."
@@ -693,9 +719,7 @@ function expandEquations(equations::Vector{IR.Equation}; arrays::Bool)::Vector{I
       append!(out, fields !== nothing ? fields : elementEquations(eq, [[k] for k in 1:eq.size], eq.ty))
     elseif arrays && eq isa IR.ARRAY_EQUATION
       local sizes = Int[knownSize(d, eq) for d in eq.ty.dimensions]
-      #= the last index fastest, as the elements of an array value =#
-      local indices = [reverse(collect(Tuple(i))) for i in CartesianIndices(Tuple(reverse(sizes)))]
-      append!(out, elementEquations(eq, vec(indices), eq.ty))
+      append!(out, elementEquations(eq, rowMajor(sizes), eq.ty))
     else
       push!(out, eq)
     end

@@ -384,8 +384,12 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local discreteNames = OrderedSet{String}(liftedDiscretes)
     #= Plain names: an array element prints as `var"off[2]"(t)`. =#
     local isDiscreteKey = k -> _plainVariableName(k) in discreteNames
+    #= A state's start that is no fixed value is not held where an initialization equation of an observed variable
+       reads the state: that equation determines it (MSL R134a2 with p and h its volumes' states: `volume1.medium.T =
+       300` read h, held at the medium's default start, and the solve moved the fixed p instead). =#
+    local readByObservedInit = _statesReadByObservedInitialization(reducedSystem, states)
     local pinnedKeyStrSet = OrderedSet{String}(
-      k for k in union(explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues),
+      k for k in union(setdiff(explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues), readByObservedInit),
                        initEqPinKeys)
       if !isDiscreteKey(k))
     local pinnedIdx = Int[i for (i, st) in enumerate(states)
@@ -519,7 +523,15 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     initRels === nothing || initRels.eval!(p_vec, u0, t0; finiteOnly = true)
     local uEntry = copy(u0)
     local firstErr = nothing
+    #= each unknown's rank in the model's order (the start values' order): an underdetermined
+       initialization fixes the first states (DAEInitSolve, phase 1b) =#
+    local declared = Dict{String, Int}()
+    for (k, pair) in enumerate(finalInitialValues)
+      get!(declared, _plainVariableName(pair.first), k)
+    end
+    local stateOrder = Int[get(declared, _plainVariableName(st), typemax(Int)) for st in states]
     local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
+                                                              stateOrder = stateOrder,
                                                               pinned=pinnedIdx,
                                                               derivative_targets=derivativeInitTargets,
                                                               eqLabels=eqLabels,
@@ -564,7 +576,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
     local resolveWith = (u, pv, ok) -> begin
       local kept = u[keptIdx]
       local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
-                                              pinned=pinnedIdx,
+                                              stateOrder=stateOrder, pinned=pinnedIdx,
                                               derivative_targets=targetsNow[],
                                               eqLabels=eqLabels,
                                               extra_residuals=useExtra ? residualsAt(pv) : nothing,
@@ -656,7 +668,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, c
       targetsNow[] = targets
       try
         local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
-                                         pinned=pinnedIdx,
+                                         stateOrder=stateOrder, pinned=pinnedIdx,
                                          derivative_targets=targets,
                                          eqLabels=eqLabels,
                                          extra_residuals=useExtra ? residualsAt(pp) : nothing,
@@ -906,16 +918,43 @@ function _entryParameters(values, parsByName::AbstractDict{String})::OrderedSet{
 end
 
 """
+    _statesReadByObservedInitialization(reducedSystem, states) -> Set{String}
+
+The states (by name) the initialization equations of observed variables read through the observed definitions
+(followed through other observed variables): the initialization solves them, so their starts are not held.
+"""
+function _statesReadByObservedInitialization(reducedSystem, states)::Set{String}
+  local definitions = Dict{String, Any}(string(o.lhs) => o.rhs for o in ModelingToolkit.observed(reducedSystem))
+  local stateNames = Set{String}(string(st) for st in states)
+  local out = Set{String}()
+  local seen = Set{String}()
+  local pending = String[string(eq.lhs) for eq in ModelingToolkit.initialization_equations(reducedSystem)
+                         if haskey(definitions, string(eq.lhs))]
+  while !isempty(pending)
+    local name = pop!(pending)
+    name in seen && continue
+    push!(seen, name)
+    for v in Symbolics.get_variables(definitions[name])
+      local k = string(v)
+      k in stateNames ? push!(out, k) : (haskey(definitions, k) && push!(pending, k))
+    end
+  end
+  return out
+end
+
+"""
 Whether an initialization equation needs a solve: one that is not a start
 value `x = v`, a variable of the system and a number (a derivative row,
 `y = 2*x`, `2*x = 4`).
 """
 function _hasSolvedInitializationRows(reducedSystem; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)::Bool
-  local variables = Set{String}(string(v) for v in Iterators.flatten((ModelingToolkit.unknowns(reducedSystem),
-                                                                      ModelingToolkit.parameters(reducedSystem),
-                                                                      (o.lhs for o in ModelingToolkit.observed(reducedSystem)))))
+  local observedNames = Set{String}(string(o.lhs) for o in ModelingToolkit.observed(reducedSystem))
+  local variables = union(observedNames, Set{String}(string(v) for v in Iterators.flatten((ModelingToolkit.unknowns(reducedSystem),
+                                                                                         ModelingToolkit.parameters(reducedSystem)))))
+  #= A number for an observed variable is solved for too: it is no state's start (MSL R134a2 with p and h its
+     volumes' states: `volume1.medium.T = 300` left h at the medium's default, 420000 for 426130). =#
   return any(ModelingToolkit.initialization_equations(reducedSystem)) do eq
-    startswith(string(eq.lhs), "Differential(") || !(string(eq.lhs) in variables) ||
+    startswith(string(eq.lhs), "Differential(") || !(string(eq.lhs) in variables) || string(eq.lhs) in observedNames ||
       _tryToFloat64(eq.rhs; resolvedParams=resolvedParams) === nothing
   end
 end
@@ -1652,7 +1691,7 @@ function _buildRHSExpression(rhs_list, states, params, iv)
     local result = Symbolics.build_function(rhs_list, states, params, iv;
                                              expression=Val{true}, cse=true)
     @debug "DirectRHS: generated RHS function with CSE"
-    return _demoteWideNumericLiterals!(result[2])  # in-place form
+    return _hoistExtractorCalls!(_demoteWideNumericLiterals!(result[2]))  # in-place form
   catch e
     OMBackend._fallback(e, :_buildRHSExpression)
     @warn "DirectRHS: CSE failed, using direct generation" exception=(e, catch_backtrace())
@@ -2400,15 +2439,20 @@ events of the MTK system it was built with (its callbacks other than those of
 `buildCallbacks`, the set it was built from). A solve uses the problem's alone:
 solve() merges `problem.kwargs[:callback]` with the callbacks it is given, so a
 callback in both would run twice. The structural (VSS) paths build their
-problems from the build's callbacks, which stay the full set.
+problems from the build's callbacks, which stay the full set. With the
+algebraic step control among `callbacks`, the problem's `isoutofdomain` is its
+step-end check (AlgebraicDomainCheck).
 """
 function withProblemCallbacks(problem, buildCallbacks, callbacks)
   local built = Base.IdSet{Any}(_callbackList(buildCallbacks))
   local own = filter(c -> !(c in built), _callbackList(get(problem.kwargs, :callback, nothing)))
+  #= With the algebraic step control, its check of a step end before the step is accepted. =#
+  local control = _stepControl(callbacks)
+  local domain = control === nothing ? NamedTuple() : (; isoutofdomain = AlgebraicDomainCheck(control))
   #= Lazily: a remake of an MTK problem with trivial initialization would
      otherwise run it now, at build time, instead of in the solve. =#
   return ModelingToolkit.SciMLBase.remake(problem; callback = DiffEqBase.CallbackSet(own..., _callbackList(callbacks)...),
-                                          lazy_initialization = true)
+                                          lazy_initialization = true, domain...)
 end
 _callbackList(::Nothing) = Any[]
 _callbackList(cb::DiffEqBase.CallbackSet) = Any[cb.continuous_callbacks..., cb.discrete_callbacks...]

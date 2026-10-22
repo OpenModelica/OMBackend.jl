@@ -61,7 +61,10 @@
    3. the algebraic unknowns are solved again, and the next sweep starts,
       until nothing changes. A chain through algebraic variables takes one
       sweep per link; a model that does not settle (chattering) is stopped
-      with an error, as OpenModelica does. =#
+      with an error, as OpenModelica does.
+
+   The instant's pre-state: eventInstant.jl; the algebraic re-solve at an
+   event (EventReinit): eventReinit.jl. =#
 
 """
 A getter for a crossing function or scale; a constant (not symbolic) is a
@@ -97,6 +100,13 @@ A relation's value by the hysteresis rule, from its buffered value `old`:
 true when zc <= 0 (true while zc <= eps, becomes true at zc <= -eps).
 """
 _hysteresisRule(zc, eps, old::Bool) = old ? zc <= eps : zc <= -eps
+
+"""
+Whether a crossing function `zc` is on its relation's boundary to rounding
+(a ramp's end, `1 + (-1)` or `1 - 1.0000000000000009`), far inside the
+hysteresis band.
+"""
+_onBoundary(zc, scale) = abs(zc) <= 1.0e-12 * max(abs(scale), 1.0)
 
 """
 Sweeps before the event iteration gives up: at least 20, and 3 per
@@ -286,6 +296,7 @@ mutable struct RelationWhenAffect{E, B}
   fns::Any                   # the value functions, or nothing (another mode's system)
   rel::Bool                  # the relation's buffer
   last::Bool                 # the condition when the whens last fired
+  located::Bool              # its crossing function located the event being handled
 end
 
 """
@@ -336,15 +347,33 @@ function _whenInconsistent(a::RelationWhenAffect, integrator)
 end
 
 """
-Phase 1 of a sweep: the buffer from the state. Whether it changed.
+Phase 1 of a sweep: the buffer from the state. Whether it changed. A false
+`<=` or `>=` exactly on its boundary at the event holds (as a cluster's,
+discreteClusters.jl `_update!`). A relation whose own crossing function
+located the event changes where the root finder left it on the shifted
+boundary (`_locatedOnBoundary`), though the rule does not see it past.
 """
 function _whenRelationUpdate!(a::RelationWhenAffect, integrator)
   _whenFunctions(a, integrator) === nothing && return false
-  local new = _whenRuled(a, integrator)
+  local (zc, scale) = _whenValues(a, integrator.u, integrator.t, integrator)
+  local eps = _hysteresisFromTolerance(integrator) * scale
+  local new = _hysteresisRule(zc, eps, a.rel)
+  (!new && !a.rel && !a.strict && _onBoundary(zc, scale)) && (new = true)
+  (new == a.rel && a.located && _locatedOnBoundary(zc, eps, a.rel)) && (new = !a.rel)
+  a.located = false
   new == a.rel && return false
   a.rel = new
   return true
 end
+
+"""
+Whether the shifted crossing function `zc + eps (1 - 2 rel)` (the callback's condition) is
+within 1 % of the hysteresis `eps` of zero: where the root finder left the event it
+located, a hair before the boundary. The rule kept the relation, nothing changed, and the
+root was found again at the next step: MSL Machines IMC_DCBraking with preferred states, a
+dynamic state set's switch at +2.3e-14 for 200 000 steps of 4e-16 s (MaxIters).
+"""
+_locatedOnBoundary(zc, eps, rel::Bool)::Bool = abs(zc + eps * (1 - 2 * rel)) <= 1.0e-2 * abs(eps)
 
 """
 Phase 2: the body, when the condition became true since the whens last
@@ -359,8 +388,9 @@ function _whenFire!(a::RelationWhenAffect, integrator, pre)
 end
 
 #= The crossing only locates the event: it is handled after the step, with
-   every other relation (the event iteration). The state is not changed. =#
-(a::RelationWhenAffect)(integrator) = (_derivativeDiscontinuity!(integrator, false); nothing)
+   every other relation (the event iteration). The state is not changed; the
+   relation records that it located it (_whenRelationUpdate!). =#
+(a::RelationWhenAffect)(integrator) = (a.located = true; _derivativeDiscontinuity!(integrator, false); nothing)
 
 """
     relationWhenCallback(names, eval, strict, body!) -> ContinuousCallback
@@ -371,7 +401,7 @@ zc <= 0, and `scale` sizes the hysteresis. `body!(integrator, pre)` is the
 when body (`pre(v)` read from `pre`).
 """
 function relationWhenCallback(names::Vector{String}, eval, strict::Bool, body!)
-  local a = RelationWhenAffect(names, eval, strict, body!, :unresolved, nothing, false, false)
+  local a = RelationWhenAffect(names, eval, strict, body!, :unresolved, nothing, false, false, false)
   local condition = function (u, t, integrator)
     _whenFunctions(a, integrator) === nothing && return 1.0
     local (zc, scale) = _whenValues(a, u, t, integrator)
@@ -382,6 +412,7 @@ function relationWhenCallback(names::Vector{String}, eval, strict::Bool, body!)
      generated function per name, per when, as OMSurrogates solves a build
      over and over). =#
   local initialize = function (c, u, t, integrator)
+    a.located = false
     local sys = hasproperty(integrator.f, :sys) ? integrator.f.sys : nothing
     if a.sys === sys && a.fns !== nothing
       a.rel = _whenLiteral(a, integrator.u, integrator.t, integrator)
@@ -498,95 +529,6 @@ function _needsIteration(e::EventIteration, integrator)
   any(a -> _whenInconsistent(a, integrator), e.relationWhens) && return true
   any(c -> _inconsistent(c, integrator), e.clusters) && return true
   return any(d -> _holds(d, integrator), e.discreteWhens)
-end
-
-#= pre() at an event instant (MLS 3.7.5, 8.6): the values before it. Every
-   affect at that time and the first sweep of the event iteration read them:
-   OpenModelica's first iteration evaluates its sorted equations with one
-   pre(), so a when that another when's change triggers at the same instant
-   fires in it with the values before the instant (`when sample(0.5, 1) then
-   n = pre(n) + 1` and `when n > 0 then m = pre(n) * 10`: m = 0; each affect's
-   own snapshot gave 10). A later sweep is a later iteration: pre() is the
-   state before it. Per integrator, recorded by the first affect at a new time
-   and dropped when the iteration settles. A reinit() takes effect after the
-   first iteration (OpenModelica, needToIterate): in the first sweep the
-   relations see the reinitialized states at their values before the instant,
-   and a when on such a relation fires in the next sweep, where pre() is the
-   state after the reinit (`when sample(0.5, 1) then reinit(x, 0)` and `when
-   x < 0.1 then y = pre(x)`: y = 0); a when on a discrete the same body sets
-   fires in the first, with pre() before the instant (y = pre(x) = 1.5). =#
-mutable struct _InstantPre
-  t::Float64
-  u::Any
-  reinitialized::Vector{Int}   # the states a reinit() wrote at this instant
-end
-
-const _INSTANT_PRE = WeakKeyDict{Any, _InstantPre}()
-
-"""
-    instantPre(integrator)
-
-The state before the current event instant, for pre() in an affect: recorded
-by the first affect at a new time. Read only.
-"""
-function instantPre(integrator)
-  ismutable(integrator) || return copy(integrator.u)
-  local h = get!(() -> _InstantPre(NaN, nothing, Int[]), _INSTANT_PRE, integrator)
-  if h.t != integrator.t
-    h.t = integrator.t
-    h.u = copy(integrator.u)
-    empty!(h.reinitialized)
-  end
-  return h.u
-end
-
-"""
-    noteReinit!(integrator, k)
-
-A reinit() of the state `k` at this instant, before it writes it (see `instantPre`).
-"""
-function noteReinit!(integrator, k::Int)
-  ismutable(integrator) || return nothing
-  instantPre(integrator)
-  push!(_INSTANT_PRE[integrator].reinitialized, k)
-  return nothing
-end
-
-"""
-The states a reinit() wrote at this instant after the first `since` (a
-sweep hides those of the instant until it began: a reinit() in its own
-bodies is seen in the next sweep).
-"""
-function _reinitializedSince(integrator, since::Int)::Vector{Int}
-  ismutable(integrator) || return Int[]
-  local h = get(_INSTANT_PRE, integrator, nothing)
-  (h === nothing || h.t != integrator.t || length(h.reinitialized) <= since) && return Int[]
-  return unique(h.reinitialized[(since + 1):end])
-end
-
-_reinitializedCount(integrator) =
-  ismutable(integrator) ? (local h = get(_INSTANT_PRE, integrator, nothing); h === nothing ? 0 : length(h.reinitialized)) : 0
-
-"""
-`f()` with the states `hidden` at their values in `pre` (the reinitialized
-ones in the first sweep), put back after.
-"""
-function _hidingReinit(f, integrator, pre, hidden::Vector{Int})
-  isempty(hidden) && return f()
-  local now = integrator.u[hidden]
-  integrator.u[hidden] = pre[hidden]
-  try
-    return f()
-  finally
-    integrator.u[hidden] = now
-  end
-end
-
-function _endInstant!(integrator)
-  ismutable(integrator) || return nothing
-  local h = get(_INSTANT_PRE, integrator, nothing)
-  h === nothing || (h.t = NaN; h.u = nothing)
-  return nothing
 end
 
 """
@@ -810,7 +752,9 @@ relation to its literal value at the solved initial state: the discrete
 clusters set theirs and run their initial bodies. If one changed a
 discrete, or an if-equation relation differs from the value the
 initialization used, the algebraic unknowns are solved again (the states
-kept).
+kept). Then the event iteration runs at the start, pre() the initial values
+(OpenModelica's storePreValues and updateDiscreteSystem at the end of the
+initialization).
 """
 function _initialize!(e::EventIteration, integrator)
   #= An affect that ran at the start before this (a sample(0, ...) tick:
@@ -833,19 +777,14 @@ function _initialize!(e::EventIteration, integrator)
     _INSTANT_PRE[integrator].u = start
   end
   foreach(d -> d.initialize!(start, integrator.t, integrator), e.discreteWhens)
-  isempty(moved) ? _endInstant!(integrator) : _iterate!(e, integrator, true)
+  #= The initialization solved the discretes with pre() at the start values
+     (`mode(start = Unknown, fixed = true)`); the iteration reads pre() from the
+     initial values: the friction's `startBackward = pre(mode) == Stuck and sa <
+     -f0_max` holds at the start (MSL LossyGearDemo2's bearing breaks away at
+     t = 0, as in OpenModelica; it stayed locked). Nothing changes in most
+     models: one sweep. =#
+  _iterate!(e, integrator, !isempty(moved))
   return nothing
-end
-
-"""
-The holder's state if an affect recorded it at the start of this solve. A
-holder of an earlier solve from the same time (reinit!) is not read: it
-was dropped when that solve's iteration ended, or its time is another.
-"""
-function _instantStateAtStart(integrator)
-  ismutable(integrator) || return nothing
-  local h = get(_INSTANT_PRE, integrator, nothing)
-  return h === nothing || h.t != integrator.t ? nothing : h.u
 end
 
 function _initializeRelations!(e::EventIteration, integrator)
@@ -972,229 +911,6 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
                                          save_positions = (false, true),
                                          initializealg = ModelingToolkit.SciMLBase.NoInit())
   return DiffEqBase.CallbackSet(kept..., cb)
-end
-
-#= Integer, Boolean and enumeration variables hold integral values. They
-   are unknowns with der(v) = 0, and a Rosenbrock or BDF step can leave
-   round-off in them (pivoting in the linear solve mixes rows):
-   3 becomes 3.0000000000000004, and change(v) or v == 3 would see it. =#
-
-"""
-    withIntegralDiscretes(callbacks, problem, names) -> callbacks
-
-Add a DiscreteCallback ahead of the other discrete callbacks (before the event
-iteration reads them), that rounds the unknowns `names` back to integers
-after a step that left round-off in them.
-"""
-function withIntegralDiscretes(callbacks, problem, names::Vector{String})
-  local states = getStatesAsSymbols(problem.f)
-  local idx = Int[k for k in indexin(Symbol.(names), states) if k !== nothing]
-  isempty(idx) && return callbacks
-  local drifted = (u, t, integrator) -> any(k -> u[k] != round(u[k]), idx)
-  local round! = function (integrator)
-    for k in idx
-      integrator.u[k] = round(integrator.u[k])
-    end
-    return nothing
-  end
-  local cb = DiffEqBase.DiscreteCallback(drifted, round!; save_positions = (false, false),
-                                         initializealg = ModelingToolkit.SciMLBase.NoInit())
-  return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(cb, callbacks)
-end
-
-#= The re-solve of the algebraic unknowns at an event: Newton with the
-   problem's own Jacobian first (`_eventNewton!`), then BrownFullBasicInit,
-   both at its own tolerance (1e-10 on the residual: relations are decided on the
-   solved values; a looser one skips the solve where a switched diode's
-   equations barely change the residual, and its s keeps the wrong sign).
-   Where that is out of reach (large values, a switched Jacobian near
-   singular: a thyristor bridge's commutation stops at 4e-9 with values of
-   1e6), the result stands if it did not raise the residual and the
-   residual is within the solve's abstol, as the initialization's
-   (defaultInitializeKwargs), or at its round-off floor, or the unknowns are
-   within the solve's tolerance (`_withinSolveTolerance`). Not raised: a
-   second re-solve at the same event (after the move to the event time,
-   after the affect) starts where the first stopped. A type, because a
-   callback's reinitializealg is fixed when the code is generated. =#
-struct EventReinit <: ModelingToolkit.SciMLBase.DAEInitializationAlgorithm end
-
-"""
-SciMLBase's fallback takes any algorithm for any integrator,
-OrdinaryDiffEqCore's any for its own.
-"""
-DiffEqBase.initialize_dae!(integrator::ModelingToolkit.SciMLBase.DEIntegrator, ::EventReinit) =
-  _eventReinit!(integrator)
-DiffEqBase.initialize_dae!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator, ::EventReinit) =
-  _eventReinit!(integrator)
-
-"""
-    _eventNewton!(integrator; tol, maxiters) -> Bool
-
-Newton on the algebraic rows of a mass-matrix problem with the problem's own Jacobian (its
-algebraic block, factorized sparse when the Jacobian is), the differential unknowns kept, to
-`tol` on the residual. Whether it converged; `integrator.u` changes only then (its algebraic
-unknowns, as BrownFullBasicInit's). At an event's crossing a relation without an event
-(`noEvent`, a stream port's upstream side) can switch within a finite-difference step, and
-BrownFullBasicInit's Jacobian of differences is wrong there: MSL Fluid MeasuringTemperature's
-tank port flows at 1e-10 at their reversal took re-solves of 70-80 s (1352 nonlinear steps),
-1 to 3 iterations with the problem's Jacobian. Float64 states only (a sparse LU of dual
-numbers has no method).
-"""
-function _eventNewton!(integrator::ModelingToolkit.SciMLBase.DEIntegrator; tol::Float64, maxiters::Int = 10)::Bool
-  local f = integrator.f
-  (eltype(integrator.u) === Float64 && hasproperty(f, :jac) && f.jac !== nothing &&
-   hasproperty(f, :jac_prototype) && f.jac_prototype !== nothing && ModelingToolkit.SciMLBase.isinplace(f)) || return false
-  local rows = _algebraicRows(f)
-  isempty(rows) && return false
-  local (p, t) = (integrator.p, integrator.t)
-  local u = copy(integrator.u)
-  local residual = similar(u)
-  local jac = similar(f.jac_prototype, Float64)
-  for _ in 0:maxiters
-    f(residual, u, p, t)
-    local g = residual[rows]
-    all(isfinite, g) || return false
-    if maximum(abs, g) <= tol
-      copyto!(integrator.u, u)
-      return true
-    end
-    f.jac(jac, u, p, t)
-    local F = LinearAlgebra.lu(jac[rows, rows]; check = false)
-    LinearAlgebra.issuccess(F) || return false
-    u[rows] .-= F \ g
-  end
-  return false
-end
-
-"""
-`alg`: BrownFullBasicInit at its own tolerance, or the table-cluster
-models' (tableClusterInitAlg); the same fallback for both (the MSL QS
-IMC_Transformer's switching event at t = 2 stopped at a residual within
-the solve's abstol but above the table algorithm's 1e-8). Newton with the
-problem's Jacobian first, to the same tolerance (`_eventNewton!`).
-"""
-function _eventReinit!(integrator::ModelingToolkit.SciMLBase.DEIntegrator, alg::DiffEqBase.BrownFullBasicInit = DiffEqBase.BrownFullBasicInit())
-  local solved = try
-    _eventNewton!(integrator; tol = alg.abstol)
-  catch err
-    OMBackend._fallback(err, :eventNewton)
-    false
-  end
-  solved && return nothing
-  local InitialFailure = ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
-  local before = integrator.sol.retcode
-  local u0 = copy(integrator.u)
-  try
-    DiffEqBase.initialize_dae!(integrator, alg)
-  catch err
-    OMBackend._fallback(err, :eventInitializeDae)
-    #= A method of the default polyalgorithm can throw (NonlinearSolve's
-       MoreTrustRegion descent, `restructure(x, nothing)`, on the MSL Spice3
-       Inverter's switching MOSFETs): Newton with finite differences instead,
-       from the state before; a failure if that throws too. =#
-    copyto!(integrator.u, u0)
-    try
-      DiffEqBase.initialize_dae!(integrator, tableClusterInitAlg())
-    catch err2
-      OMBackend._fallback(err2, :eventInitializeDaeNewton; impact = :result)
-      copyto!(integrator.u, u0)
-      _restoreRetcode!(integrator, InitialFailure)
-    end
-  end
-  (integrator.sol.retcode == InitialFailure && before != InitialFailure) || return nothing
-  local residual = _maxAlgebraicResidual(integrator, integrator.u)
-  ((residual <= _solveAbstol(integrator) || _atRoundoffFloor(integrator, integrator.u) ||
-    _withinSolveTolerance(integrator, integrator.u)) &&
-   residual <= _maxAlgebraicResidual(integrator, u0)) || return nothing
-  @debug "[events] algebraic re-solve kept within the solve's tolerance" t = integrator.t residual
-  return _restoreRetcode!(integrator, before)
-end
-
-"""
-Whether every algebraic row's residual at u is within the solve's abstol
-plus its round-off floor, 1e3 eps times the size of its terms
-(sum_j |J_ij u_j|, from the problem's Jacobian; false without one). A
-switched ideal element's rows carry terms of 1e11 (the MSL QS
-IMC_Transformer's commuting switch: s = -9.1e5 against Goff = 1e-5), and
-their residual stays near 1e-5 whatever the solver does.
-"""
-function _atRoundoffFloor(integrator, u)
-  local f = integrator.f
-  (hasproperty(f, :jac) && f.jac !== nothing && hasproperty(f, :jac_prototype) && f.jac_prototype !== nothing) ||
-    return false
-  local rows = _algebraicRows(f)
-  (isempty(rows) || !ModelingToolkit.SciMLBase.isinplace(f)) && return false
-  local J = similar(f.jac_prototype, eltype(u))
-  local r = similar(u)
-  try
-    f.jac(J, u, integrator.p, integrator.t)
-    f(r, u, integrator.p, integrator.t)
-  catch e
-    OMBackend._fallback(e, :roundoffFloorJacobian)
-    return false
-  end
-  local scale = abs.(J) * abs.(u)
-  local abstol = _solveAbstol(integrator)
-  return all(k -> abs(r[k]) <= abstol + 1.0e3 * eps(Float64) * scale[k], rows)
-end
-
-"""
-Whether one more Newton correction of the algebraic unknowns at u (the
-differential ones kept) is within the solve's tolerance: in the solver's
-error norm (algebraicStepControl.jl `_scaledNorm`, 1 is the tolerance), the
-norm the integrator's own Newton iteration converges in. A Jacobian too
-ill-conditioned for the re-solve's 1e-10 can leave the unknowns there all
-the same: MSL DifferenceAmplifier at its ramp's end, the transistors'
-der(vbc) at 1e9 (condition 7e26), the residual stalls at 1e-4 with a
-correction of 0.08 (RMS, as the integrator's norm; 0.22 at most).
-"""
-function _withinSolveTolerance(integrator, u)
-  local f = integrator.f
-  local rows = _algebraicRows(f)
-  (isempty(rows) || !ModelingToolkit.SciMLBase.isinplace(f)) && return false
-  local n = length(rows)
-  local w = AlgebraicWork(copy(u), similar(u), similar(u), similar(u, n), similar(u, n), similar(u, n, n),
-                          nothing, nothing, Int[])
-  local F = _algebraicJacobian!(w, rows, integrator, integrator.t)
-  F === nothing && return false
-  _algebraicResidual!(w, rows, integrator, integrator.t)
-  LinearAlgebra.ldiv!(w.correction, F, w.g)
-  return _scaledNorm(rows, integrator, w.correction, u) <= 1
-end
-
-"""
-The solve's absolute tolerance, the smallest of a per-component one.
-"""
-_solveAbstol(integrator) = (local a = integrator.opts.abstol; a isa Number ? a : minimum(a))
-
-"""
-The largest residual of the algebraic equations of a mass-matrix ODE at
-u (Inf for other problems).
-"""
-function _maxAlgebraicResidual(integrator, u)
-  local f = integrator.f
-  local rows = _algebraicRows(f)
-  (isempty(rows) || !ModelingToolkit.SciMLBase.isinplace(f)) && return Inf
-  local r = similar(u)
-  f(r, u, integrator.p, integrator.t)
-  return maximum(k -> abs(r[k]), rows)
-end
-
-"""
-Solve the algebraic unknowns again with `alg` (nothing: EventReinit),
-the differential states kept (a pure ODE has none). A DAEFunction (DFBDF,
-IDA) has no mass matrix; its algebraic variables are the ones
-`differential_vars` excludes. Whether it succeeded.
-"""
-function _resolveAlgebraics!(integrator, alg = nothing)
-  local f = integrator.f
-  if hasproperty(f, :mass_matrix)
-    local mm = f.mass_matrix
-    (mm isa LinearAlgebra.UniformScaling || all(!iszero, LinearAlgebra.diag(mm))) && return true
-  end
-  alg === nothing ? DiffEqBase.initialize_dae!(integrator, EventReinit()) : _eventReinit!(integrator, alg)
-  _derivativeDiscontinuity!(integrator, true)
-  return integrator.sol.retcode != ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
 end
 
 """

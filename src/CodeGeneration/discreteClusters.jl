@@ -220,7 +220,12 @@ relation whose crossing the callback located changes, as in OpenModelica:
 its shifted crossing function is zero where the rule flips it, and the
 algebraic solve at the event can leave it just inside the hysteresis band
 (an ideal thyristor's firing, found only at the end of the next step). A
-state clearly on the old side flips it back in the next sweep.
+state clearly on the old side flips it back in the next sweep. A false
+relation `<=` or `>=` whose crossing function is zero at the event, to
+rounding (`_onBoundary`), holds (literally, MLS 8.5): MSL SimpleGearShift's
+brake normal force ramps to exactly 0 at a time event, and `free = fn <= 0`
+stayed false (the hysteresis asks for zc <= -eps), the brake sliding forward
+without a force.
 """
 function _update!(c::DiscreteCluster, integrator)
   local zs = _eventCrossingValues!(c, integrator)
@@ -228,6 +233,7 @@ function _update!(c::DiscreteCluster, integrator)
   local changed = false
   for k in eachindex(c.rel)
     local new = c.crossed[k] ? !c.rel[k] : _ruled(c, zs, k, H, c.rel[k])
+    (!new && !c.rel[k] && !c.strict[k] && _onBoundary(zs[2k - 1], zs[2k])) && (new = true)
     c.crossed[k] = false
     new == c.rel[k] && continue
     c.rel[k] = new

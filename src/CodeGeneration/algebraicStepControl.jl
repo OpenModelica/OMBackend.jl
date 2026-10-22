@@ -62,6 +62,13 @@
       equations (Newton with the Jacobian of step 1). A Rodas step starts from
       the state alone (no FSAL derivative, no history), so this needs no
       restart.
+   3. Before a step is accepted (the solve's `isoutofdomain`,
+      AlgebraicDomainCheck): a step end where the algebraic equations do not
+      evaluate to finite numbers is rejected, and the solver retries with a
+      smaller step. The error estimate and step 2 cannot catch it: an
+      unknown that ran off to 1e176 sets its own error scale, and no Newton
+      recovers from there. Only that: a step end merely far from the
+      equations stands, as one past an event whose re-solve fixes it.
    Other methods control the algebraic error themselves (BDF through its
    predictor) or keep state a changed step end would not match, so only Rodas
    methods use it. Its work arrays belong to one solve at a time: parallel
@@ -81,9 +88,15 @@ mutable struct AlgebraicStepControl
   capDt::Float64             # the step and its error when the current run of caps began (0: no run)
   capErr::Float64
   floorErr::Float64          # an error that did not shrink with the step: errors up to twice it do not cap
+  lastDt::Float64            # the last capped step and its error (0: the last step was not capped)
+  lastErr::Float64
+  model::Any                 # this solve's right-hand side and parameters (f, p), for AlgebraicDomainCheck (it
+                             # gets only the state); not the integrator, which holds the solution: kept in the
+                             # model module's problem, every model's last solution stayed (MSL Magnetic
+                             # ThreePhaseTransformerWithRectifier: 3.3 GB after its run)
 end
 
-AlgebraicStepControl(rows::Vector{Int}) = AlgebraicStepControl(rows, false, nothing, 0.0, 0.0, 0.0)
+AlgebraicStepControl(rows::Vector{Int}) = AlgebraicStepControl(rows, false, nothing, 0.0, 0.0, 0.0, 0.0, 0.0, nothing)
 
 #= A solve's work arrays, concretely typed: the work after a step runs behind
    one dynamic dispatch (_control!). The fields were `Any` (a dispatch per
@@ -179,7 +192,8 @@ function _startStepControl!(c::AlgebraicStepControl, integrator)
   c.active = f !== nothing && hasproperty(integrator, :alg) && _isRodas(integrator.alg) &&
              integrator.opts.adaptive && _algebraicRows(f) == c.rows
   c.active || return nothing
-  c.capDt = 0.0; c.capErr = 0.0; c.floorErr = 0.0
+  c.capDt = 0.0; c.capErr = 0.0; c.floorErr = 0.0; c.lastDt = 0.0; c.lastErr = 0.0
+  c.model = (integrator.f, integrator.p)
   local u = integrator.u
   local n = length(c.rows)
   local fjac = hasproperty(f, :jac) ? f.jac : nothing
@@ -209,8 +223,13 @@ end
 """
 f[rows] at (w.u, t) into w.g.
 """
-function _algebraicResidual!(w::AlgebraicWork, rows::Vector{Int}, integrator, t)
-  integrator.f(w.f0, w.u, integrator.p, t)
+_algebraicResidual!(w::AlgebraicWork, rows::Vector{Int}, integrator, t) = _algebraicResidualOf!(w, rows, integrator.f, integrator.p, t)
+
+"""
+f[rows] at (w.u, t), with the right-hand side `f` and parameters `p`, into w.g.
+"""
+function _algebraicResidualOf!(w::AlgebraicWork, rows::Vector{Int}, f, p, t)
+  f(w.f0, w.u, p, t)
   for (i, r) in enumerate(rows)
     w.g[i] = w.f0[r]
   end
@@ -327,6 +346,10 @@ function _control!(c::AlgebraicStepControl, w::AlgebraicWork, integrator)
        row: 1.7e-5 at every step size), and capping on it would shrink the
        step until maxiters. =#
     c.capErr > 0 && abs(dt) <= 0.5 * c.capDt && err >= 0.5 * c.capErr && (c.floorErr = max(c.floorErr, err))
+    #= Nor one that falls slower than dt^2 from the last capped step (MSL R134a2 with p and h its volumes'
+       states: the derivative unknown der(p), ~1e7 and fast, fell like dt; capped from its first error of 2.3e5,
+       the steps went to 1e-12 and stayed). =#
+    c.lastDt > 0 && abs(dt) <= 0.5 * c.lastDt && err > c.lastErr * (abs(dt) / c.lastDt)^2 && (c.floorErr = max(c.floorErr, err))
     local capped = false
     if err > 2 * c.floorErr
       local (lo, hi) = _ALGEBRAIC_STEP_FACTORS
@@ -342,9 +365,56 @@ function _control!(c::AlgebraicStepControl, w::AlgebraicWork, integrator)
     elseif c.capErr == 0
       c.capDt = abs(dt); c.capErr = err
     end
+    (c.lastDt, c.lastErr) = capped ? (abs(dt), err) : (0.0, 0.0)
   end
   _projectStepEnd!(w, c.rows, F, integrator)
   return nothing
+end
+
+"""
+    AlgebraicDomainCheck(control)
+
+The solve's `isoutofdomain` with the algebraic step control `control` (step 3
+at the top of the file): whether the proposed step end `u` at `t` is rejected.
+"""
+struct AlgebraicDomainCheck
+  control::AlgebraicStepControl
+end
+
+function (d::AlgebraicDomainCheck)(u, p, t)
+  local c = d.control
+  c.active || return false
+  return _outOfDomain(c, c.work, c.model, u, t)
+end
+
+"""
+Whether the algebraic equations at the step end u at t do not evaluate to finite numbers (or
+throw): the step is rejected. MSL Spice3 Inverter: no capacitance at the output node, so its
+voltage is algebraic, and at the start both MOSFETs sit at the edge of conduction (the residual
+~ k (v^2 - D^2), its slope gmin alone, 2e-12). The first Rodas step's stage went to 1e4 V, the
+exponentials to 1e176 and the residual to Inf, and the step was accepted. A step end that is only
+far from the equations stands: a stricter check (its residual against the step's start values')
+held MSL TwoMass before its time event at 0.7 s, where the step past the event leaves the old
+branch's equations and the event's re-solve fixes the unknowns.
+"""
+function _outOfDomain(c::AlgebraicStepControl, w::AlgebraicWork, model::Tuple{Any, Any}, u, t)::Bool
+  copyto!(w.u, u)
+  local g = try
+    _algebraicResidualOf!(w, c.rows, model[1], model[2], t)
+  catch err
+    #= The model's residual threw at the step end (a domain error of a run-off value). =#
+    OMBackend._fallback(err, :algebraicDomain)
+    return true
+  end
+  return !all(isfinite, g)
+end
+
+"""
+The algebraic step control of `callbacks`, or nothing.
+"""
+function _stepControl(callbacks)
+  local i = findfirst(isStepControl, _callbackList(callbacks))
+  return i === nothing ? nothing : _callbackList(callbacks)[i].condition
 end
 
 """

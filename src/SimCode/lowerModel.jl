@@ -138,7 +138,9 @@ function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.P
                   transitions, SIM_CODE[], String[], String[], Equation[],
                   String(codeName(Symbol(something(model.initialMode, model.name)))), model.frontendModel, irreducibles,
                   functions, any(f -> f isa EXTERNAL_MODELICA_FUNCTION, functions),
-                  RESIDUAL_EQUATION[], String[], AliasEntry[], nothing, initialAlgorithms, asserts, String[])
+                  RESIDUAL_EQUATION[], String[], AliasEntry[], nothing, initialAlgorithms, asserts, String[],
+                  any(v -> v.kind isa Union{IR.DUMMY_STATE, IR.DUMMY_DER}, vars),
+                  String[simName(names, v.cref) for v in vars if v.kind isa IR.DUMMY_DER])
 end
 
 """

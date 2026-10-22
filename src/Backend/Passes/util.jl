@@ -107,6 +107,37 @@ mentionsInitial(e::IR.Expression)::Bool = IR.anyExp(isInitialCall, e)
 isTime(e::IR.Expression)::Bool = e isa IR.CREF && e.cref.name === :time
 
 """
+    rowMajor(sizes) -> Vector{Vector{Int}}
+
+The subscripts of an array of dimensions `sizes`, the last subscript fastest (the order of an
+array value's elements, and of the frontend's scalarized elements: `x[1,1]`, `x[1,2]`, ...).
+"""
+function rowMajor(sizes::Vector{Int})::Vector{Vector{Int}}
+  local out = Vector{Int}[]
+  any(==(0), sizes) && return out
+  sizehint!(out, prod(sizes))
+  local index = ones(Int, length(sizes))
+  while true
+    push!(out, copy(index))
+    local d = length(sizes)
+    while d > 0 && index[d] == sizes[d]
+      index[d] = 1
+      d -= 1
+    end
+    d == 0 && return out
+    index[d] += 1
+  end
+end
+
+"The flat name of `cref` without its subscripts (`c[2].p.T` and `c.p.T[2]` are `c.p.T`)."
+unsubscriptedName(cref::IR.ComponentRef)::Symbol =
+  length(cref.parts) == 1 ? cref.parts[1].name :
+    IR.ComponentRef(IR.CrefPart[IR.CrefPart(p.name, IR.Subscript[], p.ty) for p in cref.parts]).name
+
+"The subscripts of all parts of `cref`, in order (`c[2].v[3]`: 2, 3): those of the element of an array variable it names."
+allSubscripts(cref::IR.ComponentRef)::Vector{IR.Subscript} = IR.Subscript[s for p in cref.parts for s in p.subscripts]
+
+"""
     foldInteger(e)
 
 The value of an Integer expression of literals, `+`, `-` and `*` (`2 - 1` after a loop's

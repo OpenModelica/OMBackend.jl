@@ -1875,6 +1875,34 @@ end
 _hasInitialCall(condition::SC.Exp)::Bool = SC.anyExp(x -> SC.isBuiltin(x, :initial), condition)
 
 """
+    _ifConditionLiteral(condition, simCode)
+
+True when an if-equation's branch condition is evaluated as written in the residuals: its
+relations are all inside noEvent() (MLS 3.7.4: no events), the references outside them
+discretes or parameters (their own events localise a change), and it has no initial(), pre()
+or other event operator. An ifCond relay with hysteresis kept MSL FluidHeatFlow IdealPump's
+`noEvent(abs(w) < small)` false after the speed returned to zero: `abs(w) - small` never falls
+below the hysteresis, and the else branch divided by the zero speed.
+"""
+function _ifConditionLiteral(condition::SC.Exp, simCode::SC.SIM_CODE)::Bool
+  SC.anyExp(x -> SC.isBuiltin(x, :noEvent), condition) || return false
+  isempty(_eventRelations(condition)) || return false
+  local eventOperator = SC.anyExp(condition) do x
+    x isa SC.PRE || (x isa SC.CALL && x.kind === SC.CALL_BUILTIN && x.name in (:initial, :terminal, :sample, :edge, :change, :delay))
+  end
+  eventOperator && return false
+  local outside = OrderedSet{String}()
+  local visit = function (e::SC.Exp)
+    SC.isBuiltin(e, :noEvent) && return
+    e isa SC.EXP_CREF && push!(outside, SC.crefName(e.cref))
+    foreach(visit, SC.children(e))
+  end
+  visit(condition)
+  local ht = simCode.stringToSimVarHT
+  return all(n -> haskey(ht, n) && last(ht[n]).varKind isa Union{SC.DISCRETE, SC.PARAMETER}, outside)
+end
+
+"""
 True when every non-else branch condition of an if-equation is discrete/parameter, so the
 residual gates directly on the boolean condition instead of emitting a continuous ifCond
 relay callback.
@@ -1912,7 +1940,8 @@ The value of an if-equation's residual `resEqIdx` as nested `ifelse` over its br
 `target`: per branch its right-hand side (causal form; its residual with `residualForm`, where
 the branches define different variables), gated by the branch's condition where every
 condition is discrete or a parameter (its own update event localises the step: no relay, and
-no start value of a relay that picks the wrong branch), else by its `ifCond` relay parameter
+no start value of a relay that picks the wrong branch), as written where its relations are all
+inside noEvent() (`_ifConditionLiteral`), else by its `ifCond` relay parameter
 (`ifCond<identifier><subIdentifier> == 1`: a discrete parameter the solver never perturbs).
 For
 
@@ -1934,6 +1963,8 @@ function generateIfExpressions(branches::AbstractVector{<:SC.BRANCH}, target::In
   branch.targets == -1 && return :($(value))
   local cond = _ifConditionAllDiscreteOrParameter(branch.condition, simCode) ?
     :($(expToJuliaExpMTK(branch.condition, simCode)) > 0.5) :
+    _ifConditionLiteral(branch.condition, simCode) ?
+    :(OMBackend.CodeGeneration.MTK_CodeGenerationUtil._noEventCondition($(expToJuliaExpMTK(branch.condition, simCode)))) :
     :($(Symbol(string("ifCond", identifier, subIdentifier))) == 1)
   quote
     ModelingToolkit.ifelse($(cond),
@@ -1994,23 +2025,30 @@ end
 #= ==================================================================================== =#
 
 """
-    performStructuralSimplify(; observedFilter = nothing, split = !DIRECT_RHS_GENERATION[])
+    performStructuralSimplify(; observedFilter = nothing, split = !DIRECT_RHS_GENERATION[], indexReduced = false)
 
-The structural simplification of `firstOrderSystem` into `reducedSystem`; with an observed
+The structural simplification of `firstOrderSystem` into `reducedSystem` (tearing only for a
+system OMBackend reduced, `indexReduced`); with an observed
 filter, the observed equations kept those whose variable a pattern matches, with the observed
 variables they read and the system's and the initialization equations read. With
 ENABLE_BACKEND_LOGGING, the system before is dumped to `backend/codeGen/preStructuralSimplify.log`
 (the path taken at codegen time, in the model's run directory).
 """
 function performStructuralSimplify(; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                                   split::Bool = !OMBackend.DIRECT_RHS_GENERATION[])::Expr
+                                   split::Bool = !OMBackend.DIRECT_RHS_GENERATION[], indexReduced::Bool = false)::Expr
   local dumpExpr = :(nothing)
   @BACKEND_LOGGING dumpExpr = dumpPreStructuralSimplifyExpr(
       OMBackend.logPath("backend/codeGen", "preStructuralSimplify.log"))
-  local simplifyExpr = quote
-    $dumpExpr
-    reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true, split = $(split))
-  end
+  #= a system OMBackend reduced (SIM_CODE.indexReduced) is of index 1 with its states chosen: MTK only tears =#
+  local simplifyExpr = indexReduced ?
+    quote
+      $dumpExpr
+      reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true, split = $(split), fully_determined = false)
+    end :
+    quote
+      $dumpExpr
+      reducedSystem = OMBackend.CodeGeneration.structural_simplify(firstOrderSystem; simplify = true, allow_parameter=true, split = $(split))
+    end
   (observedFilter === nothing || isempty(observedFilter)) && return simplifyExpr
   local patternStrings = observedFilter isa Vector{Regex} ? [p.pattern for p in observedFilter] : observedFilter
   return quote

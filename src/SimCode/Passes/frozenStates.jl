@@ -152,7 +152,9 @@ end
 """
     eliminateFrozenStates(simCode)
 
-The states and algebraic variables pinned to a literal (`frozenVariable`) replaced by it
+The states and algebraic variables pinned to a literal (`frozenVariable` of the residual with
+its arithmetic of literals folded: a parameter fold leaves MSL FluidHeatFlow's zero friction
+loss `Q_flow - 0.0 * V_flow * dp`, whose energy balance then joins the semiLinear chain) replaced by it
 everywhere (`der()` of a frozen state by 0), their residuals removed and recorded for the
 observed equations, the residuals folded (`foldNumeric`); to a fixed point (at most 16
 rounds: `w - der(phi)` pins `w` once `phi` is frozen). A Kinematic ground leaves a state
@@ -200,7 +202,7 @@ function eliminateFrozenOnce(simCode::SIM_CODE, kept::OrderedSet{String})::Union
   local shared = Set{String}(simCode.sharedVariables)
   local frozen = OrderedDict{String, Tuple{Exp, Int}}()
   for (i, eq) in enumerate(residuals)
-    local f = frozenVariable(eq.exp, ht)
+    local f = frozenVariable(foldNumeric(eq.exp), ht)
     f === nothing && continue
     local (name, value) = f
     (name in shared || name in kept || haskey(frozen, name)) && continue
@@ -244,10 +246,14 @@ FundamentalWave's eddy-current core, whose loss `Q_flow = c * V_m * der(Phi)` go
 frozen `V_m = 0` and `Q_flow = 0` when its conductance G is 0) as algebraic variables,
 their derivatives dropped: a state without dynamics is an alias or an algebraic variable for the
 later passes (as a state MTK integrated it as a free unknown: SMPM_Braking took 44k steps and
-failed). Nothing for a model with modes or translated again at its structural changes.
+failed). Nothing for a model with modes or translated again at its structural changes. For a
+model index reduction reduced, a state's link to its derivative variable is no reader where
+nothing else reads that variable (`unlinkUnreadStateDerivatives`).
 """
 function demoteDeadStates(simCode::SIM_CODE)::SIM_CODE
   (hasSubModels(simCode) || hasFrontendModel(simCode)) && return simCode
+  #= after OMBackend's index reduction a state's der() is in its link to \$DER_x too =#
+  simCode.indexReduced && (simCode = unlinkUnreadStateDerivatives(simCode))
   local dead = deadStateNames(simCode)
   isempty(dead) && return simCode
   local newHT = copy(simCode.stringToSimVarHT)

@@ -173,6 +173,8 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
   if !overwriteCache && get(BUILT_HASH, cname, UInt64(0)) == buildHash &&
      haskey(BUILT, cname) && isdefined(OMB, Symbol(cname))
     @info "[IMTK GEN] regenerated code unchanged; reusing compiled module + cached build" model = modelName
+    #= this translate registered the functions in CodeGeneration =#
+    OMB.CodeGeneration.registerModelFunctions!(getglobal(OMB, Symbol(cname)))
     return nothing
   end
   try
@@ -284,6 +286,8 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
     forgetBuild(cname)
     Core.eval(OMB, OMB.getCompiledModel(cname))
     OMB.modelEvaluated!(cname)
+  else
+    OMB.CodeGeneration.registerModelFunctions!(getglobal(OMB, Symbol(cname)))
   end
   #= The cached build is initialized at the build's start time: another start time
      builds again, then the same pipeline (its remake only moved tspan, and the

@@ -193,7 +193,21 @@ function isDiscreteTime(e::IR.Expression, known::Set{Symbol})::Bool
   e isa IR.LBINARY && return isDiscreteTime(e.exp1, known) && isDiscreteTime(e.exp2, known)
   e isa IR.LUNARY && return isDiscreteTime(e.exp, known)
   e isa Union{IR.BOOLEAN, IR.INTEGER, IR.REAL, IR.STRING, IR.ENUM_LITERAL} && return true
-  e isa IR.CALL && return e.name in (:pre, :initial, :change, :edge, :sample, :noEvent)
+  e isa IR.ARRAY && return all(x -> isDiscreteTime(x, known), e.elements)
+  e isa IR.ARRAY_CONSTRUCTOR && return isDiscreteTime(e.body, known)
+  if e isa IR.CALL
+    e.name in (:pre, :initial, :change, :edge, :sample, :noEvent) && return true
+    #= a pure function of the model of discrete-time arguments with relations among them: MSL 4's
+       Batteries PulseSeries, `on1 = oneTrue({time >= Tstart1[k] and time < Tstart1[k] + T1 for k in
+       1:n1})`, was left an equation, its relations made no events, and the steps passed over the
+       pulses. One of discrete variables only stays an equation, as before: lifted, MSL
+       IntegerNetwork1's `y = expr[firstTrueIndex(u)]` read a parameter array by a runtime index in
+       an affect, and StateGraph ShowCompositeStep's `suspend = anyTrue({...}) or ...` had its
+       initialization row on an alias outside the lifted names =#
+    return !e.attributes.builtin && !e.attributes.impure && !isempty(e.arguments) &&
+           all(a -> isDiscreteTime(a, known), e.arguments) &&
+           any(a -> IR.anyExp(x -> x isa IR.RELATION, a), e.arguments)
+  end
   e isa IR.IF_EXPRESSION && return isDiscreteTime(e.condition, known) && isDiscreteTime(e.thenExp, known) &&
                                    isDiscreteTime(e.elseExp, known)
   e isa IR.CREF && return e.cref.name in known || !isRealType(e.ty)
@@ -208,7 +222,9 @@ function candidateOf(eq::IR.Equation, known::Set{Symbol})::Union{Nothing, Candid
   local name = lhs.cref.name
   (name === :time || name in known) && return nothing
   isDiscreteTime(eq.rhs, known) || return nothing
-  return Candidate(name, lhs, eq.rhs, eq.source, eq)
+  #= array constructors over constant ranges as their arrays (`unroll`): the when-body reads the elements
+     (`Tstart1[2]`), not the scalarized array's name =#
+  return Candidate(name, lhs, unroll(eq.rhs), eq.source, eq)
 end
 
 """

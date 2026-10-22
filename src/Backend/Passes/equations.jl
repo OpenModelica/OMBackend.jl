@@ -40,12 +40,27 @@
 """
     removeSmooth!(model)
 
-`smooth(order, e)` as `e` where it is the whole side of an equation of the model's main
-partition (MLS 3.7.4.2: its use is optional); smooth() elsewhere stays.
+`smooth(order, e)` in the equations of the model's main partition (MLS 3.7.4.2: its use is
+optional). Of a literal order of at least 1, `noEvent(e)` where `e` holds a relation or an
+if-expression: the expression and its derivatives are continuous, so an event adds nothing to
+the solve (MSL SoftStarter's quadratic load torque, `smooth(1, if w >= 0 then w^2 else -w^2)`,
+validates only so). Of order 0, `e` where it is the whole side, else smooth() stays and its
+relations are events: its derivative jumps, and the event keeps the solve accurate and in range
+(the OpAmp limiter `homotopy(smooth(0, if ...), ...)` of MSL SignalGenerator; actualStream,
+`smooth(0, m_flow * (if m_flow > 0 then inStream(h) else h))`, in MSL InverseParameterization's
+pump; as noEvent, OpenModelica's choice, the one failed validation and the other left IF97's range).
 """
 function removeSmooth!(model::IR.Model)::IR.Model
+  local eventful = x -> x isa IR.RELATION || x isa IR.IF_EXPRESSION
+  local differentiable = e -> begin
+    (IR.isBuiltinCall(e, :smooth) && length(e.arguments) == 2 && e.arguments[1] isa IR.INTEGER &&
+     e.arguments[1].value >= 1) || return e
+    local inner = e.arguments[2]
+    return IR.anyExp(eventful, inner) ? builtinCall(:noEvent, IR.Expression[inner], IR.typeOf(inner)) : inner
+  end
   local strip = e -> IR.isBuiltinCall(e, :smooth) && length(e.arguments) == 2 ? e.arguments[2] : e
   for eq in model.continuous[1].equations
+    IR.mapEquation!(differentiable, eq)
     eq isa IR.SCALAR_EQUATION || continue
     if IR.isBuiltinCall(eq.rhs, :smooth)
       eq.rhs = strip(eq.rhs)

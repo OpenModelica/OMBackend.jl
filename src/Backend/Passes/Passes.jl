@@ -44,7 +44,7 @@ module Passes
 
 import ..OMJLIR
 import ..unsupported, .._fallback, ..UnsupportedLowering
-import ..isTunableParameter
+import ..isTunableParameter, ..envSwitch
 const IR = OMJLIR
 
 include("util.jl")
@@ -56,6 +56,8 @@ include("clocks.jl")
 include("clockedLowering.jl")
 include("derivatives.jl")
 include("causalize.jl")
+include("Evaluation/Evaluation.jl")
+include("IndexReduction/IndexReduction.jl")
 
 """
 The passes, in order: name => pass. The first group is the previous backend's BDAECreate (the
@@ -97,6 +99,23 @@ function runPasses!(model::IR.Model; through::Union{Nothing, String} = nothing):
   for (name, pass) in PIPELINE
     model = pass(model)
     name == through && break
+  end
+  #= OMBackend's own index reduction (OMBACKEND_INDEX_REDUCTION off: MTK's structural_simplify reduces the index) =#
+  (through === nothing && envSwitch("OMBACKEND_INDEX_REDUCTION")) && (model = IndexReduction.reduceIndex!(model))
+  return model
+end
+
+"""
+    runPassesKeepingArrays!(model) -> Model
+
+`model`, lowered with its arrays kept, through the passes before index reduction (`PIPELINE`), its array
+equations of continuous arrays kept as for-equations over their elements (`IndexReduction.rollArrayEquations!`,
+before `expandEquations`, which splits the others): what the array form of index reduction takes.
+"""
+function runPassesKeepingArrays!(model::IR.Model)::IR.Model
+  for (name, pass) in PIPELINE
+    name == "expandEquations" && (model = IndexReduction.rollArrayEquations!(model))
+    model = pass(model)
   end
   return model
 end

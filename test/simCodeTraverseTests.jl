@@ -183,6 +183,15 @@ isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "backend
       @test SC.foldNumeric(SC.DER(SC.SimCref(:x))) == SC.DER(SC.SimCref(:x))
     end
 
+    @testset "tryEvalNumeric: parameters through their bindings, sqrt" begin
+      #= MSL 4 CompareLosslessLines: the Pulse's period td = 1/c0, c0 = 1/sqrt(l*c); without sqrt
+         its when missed the periodic path and wrote T_start at a step's end =#
+      local c0 = SC.BINARY(R(1.0), SC.OP_DIV, call(:sqrt, SC.BINARY(R(2.5e-7), SC.OP_MUL, R(1.0e-10))))
+      local sc = M.mockSimCode([M.simVar("c0", SC.PARAMETER(c0)), M.simVar("td", SC.PARAMETER(SC.BINARY(R(1.0), SC.OP_DIV, ref("c0"))))])
+      @test SC.tryEvalNumeric(ref("td"), sc) ≈ 5.0e-9
+      @test SC.tryEvalNumeric(call(:sqrt, R(-1.0)), sc) === nothing
+    end
+
     @testset "crefNames!: the names an expression reads" begin
       local names = e -> collect(SC.crefNames!(SC.OrderedSet{String}(), e))
       @test names(ref("a")) == ["a"]

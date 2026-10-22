@@ -46,9 +46,12 @@ The variables the code generation must keep as unknowns (MTK must not eliminate 
 parameters:
 
 - of an if-equation whose branches assign one variable (every lifted if-expression), that
-  variable; of another, the variables of its conditions and equations and what its branches
-  assign (nested if-equations included: a state an if-equation defines, MSL 4 KinematicPTP's
-  `s`, became an observed ifelse read back with the final parameter values);
+  variable; of another, what its branches assign and the states it differentiates (nested
+  if-equations included: a state an if-equation defines, MSL 4 KinematicPTP's `s`, became an
+  observed ifelse read back with the final parameter values), with OMBACKEND_IF_READS_IRREDUCIBLE
+  also the variables of its conditions and the algebraic variables its equations read (off: a
+  condition variable an explicit equation defines stays explicit, MSL FluidHeatFlow IdealPump's
+  speed in `noEvent(abs(w) < small)` exactly zero, not the solver's rounding of it);
 - the states the when-equations read or write (their callbacks index the state vector by name);
 - the discretes in the when-conditions (an eliminated one is read by the callback), of their
   first branches (the previous backend's).
@@ -61,12 +64,16 @@ function irreducibleVariables(names::Names, ifEquations::Vector{IR.IF_EQUATION},
     if target !== nothing
       push!(out, target)
     else
-      append!(out, ifEquationVariables(names, eq, vars))
+      append!(out, ifEquationVariables(names, eq, vars; reads = envSwitch("OMBACKEND_IF_READS_IRREDUCIBLE")))
       append!(out, ifEquationTargets(names, eq))
     end
   end
   local stateNames = Set{String}(simName(names, v.cref) for v in vars if v.kind isa IR.STATE)
   append!(out, statesUsedByWhens(whens, stateNames))
+  #= index reduction's dummy derivatives, where it does not solve for them (OMBACKEND_SOLVE_DERIVATIVES off):
+     solved from their own equations, not eliminated by MTK =#
+  envSwitch("OMBACKEND_SOLVE_DERIVATIVES") ||
+    append!(out, String[simName(names, v.cref) for v in vars if v.kind isa IR.DUMMY_DER])
   filter!(n -> n == "time" || (haskey(ht, n) && !(last(ht[n]).varKind isa PARAMETER)), out)
   for w in whens, n in allCrefNames(w.whenEquation.condition)
     (haskey(ht, n) && last(ht[n]).varKind isa DISCRETE) && push!(out, n)
@@ -107,22 +114,24 @@ function ifEquationTargets(names::Names, eq::IR.IF_EQUATION)::Vector{String}
 end
 
 """
-    ifEquationVariables(names, eq, vars)
+    ifEquationVariables(names, eq, vars; reads = true)
 
 The references of an if-equation's conditions, then for each of its equations the algebraic
 variables it reads and the states it differentiates (in the variables' order); of nested
-if-equations in turn.
+if-equations in turn. Without `reads`, only the states it differentiates.
 """
-function ifEquationVariables(names::Names, eq::IR.IF_EQUATION, vars::Vector{IR.Variable})::Vector{String}
+function ifEquationVariables(names::Names, eq::IR.IF_EQUATION, vars::Vector{IR.Variable}; reads::Bool = true)::Vector{String}
   local out = String[]
-  for b in eq.branches
-    append!(out, reverse(unique(referenceNames(names, b.condition))))
+  if reads
+    for b in eq.branches
+      append!(out, reverse(unique(referenceNames(names, b.condition))))
+    end
   end
   for e in branchEquations(eq)
     if e isa IR.IF_EQUATION
-      append!(out, ifEquationVariables(names, e, vars))
+      append!(out, ifEquationVariables(names, e, vars; reads))
     elseif e isa IR.SCALAR_EQUATION
-      local read = Set{String}(vcat(referenceNames(names, e.lhs), referenceNames(names, e.rhs)))
+      local read = reads ? Set{String}(vcat(referenceNames(names, e.lhs), referenceNames(names, e.rhs))) : Set{String}()
       local differentiated = Set{String}(vcat(derivativeNames(names, e.lhs), derivativeNames(names, e.rhs)))
       for v in vars
         local n = simName(names, v.cref)

@@ -267,6 +267,10 @@ function simCrefExp(names::Names, cref::IR.ComponentRef, ty::IR.ModelicaType)::E
   end
   local last = cref.parts[end]
   local base = simName(names, IR.ComponentRef(IR.CrefPart[cref.parts[1:end-1]..., IR.CrefPart(last.name, IR.Subscript[], last.ty)]))
+  if !(base in names.known)
+    local field = recordFieldExp(names, cref)
+    field === nothing || return field
+  end
   if isempty(last.subscripts) && !(base in names.known)
     return something(variablesBySubscript(names, cref, ty), Some(EXP_CREF(SimCref(Symbol(full)), simType(ty))))
   end
@@ -281,6 +285,40 @@ function simCrefExp(names::Names, cref::IR.ComponentRef, ty::IR.ModelicaType)::E
   all(s -> s isa IR.INDEX && s.exp isa Union{IR.INTEGER, IR.ENUM_LITERAL}, last.subscripts) &&
     return EXP_CREF(SimCref(Symbol(full)), simType(ty))
   return ASUB(EXP_CREF(SimCref(Symbol(base)), simType(last.ty)), Exp[subscriptExp(names, s) for s in last.subscripts])
+end
+
+"""
+    recordFieldExp(names, cref) -> Union{Nothing, Exp}
+
+A reference to a field of a model's record variable whose fields are no variables of their own
+(an element of an array of record constants, MSL Media's `Medium2.data[1].MM`: the variable is
+`Medium2.data[1]`) as the field of the variable's value (RSUB, an element of an array field
+ASUB); `nothing` where no prefix of `cref` is a known scalar variable of a record type. Not in a
+function (whose names know no scalars): its record variables are flattened, `r.f` a name of its
+own.
+"""
+function recordFieldExp(names::Names, cref::IR.ComponentRef)::Union{Nothing, Exp}
+  for k in length(cref.parts) - 1:-1:1
+    local prefix = cref.parts[k]
+    local ty = isempty(prefix.subscripts) ? prefix.ty : IR.elementType(prefix.ty)
+    ty isa IR.T_RECORD || continue
+    local name = simName(names, IR.ComponentRef(cref.parts[1:k]))
+    name in names.scalars || continue
+    local exp = EXP_CREF(SimCref(Symbol(name)), simType(ty))
+    for p in @view cref.parts[k + 1:end]
+      ty isa IR.T_RECORD || return nothing
+      local i = findfirst(f -> f.name === p.name, ty.fields)
+      i === nothing && return nothing
+      exp = RSUB(exp, i, String(p.name), simType(ty.fields[i].ty))
+      ty = ty.fields[i].ty
+      if !isempty(p.subscripts)
+        exp = ASUB(exp, Exp[subscriptExp(names, s) for s in p.subscripts])
+        ty = IR.elementType(ty)
+      end
+    end
+    return exp
+  end
+  return nothing
 end
 
 "The SimCref of a reference (a variable's name)."

@@ -34,8 +34,7 @@
 */ =#
 
 #= The functions of the simulation code: OMJLIR's functions with their record inputs and
-   outputs as the records' fields, `smooth()` removed, a derivative synthesized for an
-   `Inline = true` function without one. =#
+   outputs as the records' fields, `smooth()` removed. =#
 
 "A function with its records flattened, and its number of inputs as declared."
 struct FlattenedFunction
@@ -49,23 +48,11 @@ const RecordFields = Dict{Symbol, Vector{Tuple{Symbol, IR.ModelicaType}}}
 """
     simFunctions(functions)
 
-The functions in the simulation code, in their order; for an `Inline = true` function whose
-body is `y := g(...)`, `g` with a derivative annotation and the function without one, a
-derivative (`inlineDerivative`) after them.
+The functions in the simulation code, in their order (an inlined function's derivative is
+OMJLIR's, `withInlineDerivatives`).
 """
-function simFunctions(functions::Vector{IR.ModelicaFunction})::Vector{ModelicaFunction}
-  local out = ModelicaFunction[simFunction(flattenRecordParameters(f)) for f in functions]
-  for (f, ir) in zip(copy(out), functions)
-    (f isa MODELICA_FUNCTION && ir.inline && f.derivative === nothing) || continue
-    local derivative = inlineDerivative(f, out)
-    derivative === nothing && continue
-    push!(out, derivative)
-    local k = findfirst(g -> g === f, out)
-    out[k] = MODELICA_FUNCTION(f.name, f.inputs, f.outputs, f.locals, f.statements,
-                               FunctionDerivative(derivative.name, Int[], length(ir.inputs)))
-  end
-  return out
-end
+simFunctions(functions::Vector{IR.ModelicaFunction})::Vector{ModelicaFunction} =
+  ModelicaFunction[simFunction(flattenRecordParameters(f)) for f in functions]
 
 """
     simFunction(f)
@@ -122,62 +109,6 @@ end
 
 withoutSmooth(e::Exp)::Exp =
   e isa CALL && e.kind === CALL_BUILTIN && e.name === :smooth && length(e.args) == 2 ? e.args[2] : mapChildren(withoutSmooth, e)
-
-#= ==================================================================================== =#
-#= Inline derivatives                                                                   =#
-#= ==================================================================================== =#
-
-"The name of the derivative synthesized for an inlined function."
-inlineDerivativeName(name::String)::String = name * "__inlineDer"
-
-"""
-    inlineDerivative(f, functions)
-
-The derivative of an `Inline = true` function `f` whose body is `y := g(a1, ..., an)`, `g` with
-a derivative annotation: `g`'s derivative function at the same arguments, as OpenModelica
-inlines `f` before the index reduction (MSL IF97's `rho_ph(p, h, phase, region) :=
-rho_props_ph(p, h, waterBaseProp_ph(...))`). It takes `f`'s inputs and a derivative for each
-Real one; `g`'s arguments are its declared inputs (a record-valued call one, spread at the code
-generation): a Real one that takes a derivative must be one of `f`'s inputs or a literal, another
-one (IF97's auxiliary record) one `g`'s annotation excludes. `nothing` for another function.
-"""
-function inlineDerivative(f::MODELICA_FUNCTION, functions::Vector{ModelicaFunction})::Union{Nothing, MODELICA_FUNCTION}
-  (length(f.outputs) == 1 && only(f.outputs).ty isa TYPE_REAL && length(f.statements) == 1) || return nothing
-  all(v -> v.ty isa Union{TYPE_REAL, TYPE_INTEGER, TYPE_BOOL}, f.inputs) || return nothing
-  local stmt = only(f.statements)
-  (stmt isa ASSIGN && stmt.right isa CALL && stmt.right.kind !== CALL_BUILTIN) || return nothing
-  local call = stmt.right
-  local gk = findfirst(h -> h.name == String(call.name), functions)
-  gk === nothing && return nothing
-  local g = functions[gk]
-  (g isa MODELICA_FUNCTION && g.derivative !== nothing) || return nothing
-  local gd = g.derivative
-  #= the arguments by g's declared inputs (a record-valued call is one, spread over the record's
-     fields), the positions gd counts and excludes by =#
-  length(call.args) == gd.nInputs || return nothing
-  local derOf = Dict{String, Exp}()
-  local derInputs = FunctionVariable[]
-  for v in f.inputs
-    v.ty isa TYPE_REAL || continue
-    push!(derInputs, FunctionVariable(v.name * "__der", v.ty, v.dimensions, v.default, v.fieldDefaults))
-    derOf[v.name] = EXP_CREF(SimCref(Symbol(v.name, "__der")), TYPE_REAL())
-  end
-  local derArgs = Exp[]
-  for (i, a) in enumerate(call.args)
-    i in gd.excludedInputs && continue
-    local ty = typeOf(a)
-    ty isa Union{TYPE_INTEGER, TYPE_BOOL, TYPE_ENUM, TYPE_STRING} && continue
-    ty isa TYPE_REAL || return nothing
-    local d = a isa EXP_CREF ? get(derOf, crefName(a.cref), nothing) : a isa Union{RCONST, ICONST} ? RCONST(0.0) : nothing
-    d === nothing && return nothing
-    push!(derArgs, d)
-  end
-  local out = only(f.outputs)
-  local derCall = CALL(Symbol(gd.name), Exp[call.args..., derArgs...], call.ty, call.kind)
-  local body = Statement[ASSIGN(EXP_CREF(SimCref(Symbol(out.name)), out.ty), derCall, stmt.source)]
-  return MODELICA_FUNCTION(inlineDerivativeName(f.name), vcat(f.inputs, derInputs), FunctionVariable[out],
-                           FunctionVariable[], body, nothing)
-end
 
 #= ==================================================================================== =#
 #= Record inputs and outputs as their fields                                            =#

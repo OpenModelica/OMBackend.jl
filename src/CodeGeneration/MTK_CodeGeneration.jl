@@ -445,26 +445,29 @@ end
 """
     defaultInitializeKwargs(problem, kwargs, tableClusters) -> NamedTuple
 
-The DAE initialization of a solve when the caller chose none. Table-cluster
-models: Newton with finite differences (`tableClusterInitAlg`). Otherwise, for
+The DAE initialization of a solve when the caller chose none, as the event
+re-solve's stages and acceptance (`StartReinit`). Table-cluster models: Newton with
+finite differences (`tableClusterInitAlg`). Otherwise, for
 a problem without an initialization problem (OM.jl solves the initial values
 itself): BrownFullBasicInit at the solve's abstol, which OrdinaryDiffEq used by
-default before OrdinaryDiffEqCore 4. Since then the default only checks u0,
-and fails where OM.jl's initial values leave a residual in an algebraic
-equation (the PID models of PIDDecomposition.mo).
+default before OrdinaryDiffEqCore 4 (alone it held the raw residual to the abstol: MSL
+TanksWithEmptyingPipe2). The default since then only checks u0, and fails where
+OM.jl's initial values leave a residual in an algebraic equation (the PID models of
+PIDDecomposition.mo). It is also the re-solve at the events of a callback without
+its own (`_mergeableReinit`).
 """
 function defaultInitializeKwargs(problem, kwargs, tableClusters::Bool)
   haskey(kwargs, :initializealg) && return (;)
-  tableClusters && return (; initializealg = tableClusterInitAlg())
+  tableClusters && return (; initializealg = StartReinit(tableClusterInitAlg()))
   ModelingToolkit.SciMLBase.has_initializeprob(problem.f) && return (;)
   #= A caller's abstol per unknown: NonlinearSolve takes a scalar (a vector
      was a MethodError in its termination check). =#
   local abstol = get(kwargs, :abstol, 1.0e-6)
-  return (; initializealg = DiffEqBase.BrownFullBasicInit(abstol isa Number ? abstol : minimum(abstol)))
+  return (; initializealg = StartReinit(DiffEqBase.BrownFullBasicInit(abstol isa Number ? abstol : minimum(abstol))))
 end
 
 """
-    defaultToleranceKwargs(problem, kwargs) -> NamedTuple
+    defaultToleranceKwargs(problem, kwargs; dummyDerivatives = String[]) -> NamedTuple
 
 The absolute tolerance per unknown of a mass-matrix problem whose algebraic
 unknowns include derivatives (`xˍt`: MTK's dummy derivatives from index
@@ -479,15 +482,24 @@ V1's 0.2 GHz sine moved the transistors' der(vbc) by 1e9 V/s, until the solve
 stopped near 2e-6 s (MaxIters or Unstable); left out, it runs to 1 s in
 6000 steps and ends at OpenModelica's values. A derivative that is a state
 (`xˍt` after order lowering, a mass-matrix row of 1) stays controlled.
+
+The `dummyDerivatives` of OMBackend's index reduction (SIM_CODE.dummyDerivatives)
+are left out too: they jump at events; controlled, the transformer currents' of
+MSL Rectifier6pulse held the steps at the diodes' switching until MaxIters
+(SMEE_Rectifier and Rectifier12pulse too). Its other derivative unknowns, a
+state's derivative kept as an unknown (`\$DER_aimc_inertiaRotor_w`), stay
+controlled: left out, MSL AIMC_DOL's stator currents were 0.45 % off the
+reference at reltol 1e-6 (MTK's path 0.03 %).
 """
-function defaultToleranceKwargs(problem, kwargs)
+function defaultToleranceKwargs(problem, kwargs; dummyDerivatives::Vector{String} = String[])
   local abstol = get(kwargs, :abstol, 1.0e-6)
   abstol isa Number || return (;)
   local rows = _algebraicRows(problem.f)
   isempty(rows) && return (;)
   local names = string.(getStatesAsSymbols(problem.f))
   length(names) == length(problem.u0) || return (;)
-  local derivatives = Int[k for k in rows if occursin("ˍt", names[k])]
+  local dummies = Set{String}(dummyDerivatives)
+  local derivatives = Int[k for k in rows if occursin("ˍt", names[k]) || names[k] in dummies]
   isempty(derivatives) && return (;)
   local perUnknown = fill(Float64(abstol), length(problem.u0))
   perUnknown[derivatives] .= Inf
@@ -785,6 +797,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SC.SIM_CODE, modelName::String
       qualifyModelicaFunctions!(f, funcNames)
     end
   end
+  MODEL_FUNCTIONS[Symbol(MODEL_NAME)] = (collect(funcNames), functions)
   programBody = quote
     using ModelingToolkit
     using DifferentialEquations
@@ -892,7 +905,7 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SC.SIM_CODE, modelName::String
       global LATEST_SOLVE_TRIPLE = (_problemForSolver, _solver, nothing)
       local _initKw = OMBackend.CodeGeneration.defaultInitializeKwargs(_problemForSolver, kwargs,
                                                                        $(_modelHasTableClusters(simCode)))
-      local _tolKw = OMBackend.CodeGeneration.defaultToleranceKwargs(_problemForSolver, kwargs)
+      local _tolKw = OMBackend.CodeGeneration.defaultToleranceKwargs(_problemForSolver, kwargs; dummyDerivatives = $(filter(n -> haskey(simCode.stringToSimVarHT, n), simCode.dummyDerivatives)))
       OMBackend.CodeGeneration._resetRHSError!()
       local _sol = solve(_problemForSolver, _solver; kwargs..., _initKw..., _tolKw...)
       #= If the init-alg-remake'd problem produced InitialFailure (MTK could
@@ -1118,8 +1131,15 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
   local _paramSyms = OrderedSet{Symbol}(Symbol(name)
     for (name, (_, sv)) in simCode.stringToSimVarHT
     if sv.varKind isa Union{SC.PARAMETER, SC.ARRAY_PARAMETER})
-  local (_ifEqRelay_eqs, _ifEqRelay_aliases) = eliminateIfEqRelays(EQUATIONS; preferKeep = _condDiscretes, paramSyms = _paramSyms)
+  #= after OMBackend's index reduction, a state and the derivative variables aliased to it (`\$DER.x`)
+     form relays: the declared state keeps its name =#
+  local _relayKeep = simCode.indexReduced ?
+    union(_condDiscretes, OrderedSet{Symbol}(Symbol(s) for s in stateVariables if !startswith(string(s), "\$"))) : _condDiscretes
+  local (_ifEqRelay_eqs, _ifEqRelay_aliases) = eliminateIfEqRelays(EQUATIONS; preferKeep = _relayKeep, paramSyms = _paramSyms)
   EQUATIONS = _ifEqRelay_eqs
+  #= after OMBackend's index reduction, the fixed starts of the relay members dropped here hold on
+     their representative (a dummy derivative's start: MSL DoublePendulumInitTip's v_rel_a_1) =#
+  local _relayFixedStarts = simCode.indexReduced ? relayFixedStarts(algebraicVariables, _ifEqRelay_aliases, simCode) : String[]
   if !isempty(_ifEqRelay_aliases)
     @info "[RELAY] aliases" _ifEqRelay_aliases
     local _drop = OrderedSet(keys(_ifEqRelay_aliases))
@@ -1330,7 +1350,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
         local _eqs = Symbolics.Equation[$([_substSyms(e, _ifEqRelay_aliases) for e in Base.ScopedValues.with(HOMOTOPY_BLEND => usesHomotopy) do
                                              generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)
                                            end]...),
-                                        $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, algebraicVariables, discreteVariables), simCode)]...)]
+                                        $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, algebraicVariables, discreteVariables, _relayFixedStarts), simCode)]...)]
         $(emitInitAlgConstraintAppends(simCode)...)
         return _eqs
       end
@@ -1352,7 +1372,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
                                                             !isempty(simCode.eliminatedVariables)))
       firstOrderSystem = nonLinearSystem
       #= Structural simplification =#
-      $(performStructuralSimplify(; observedFilter = simCode.observedFilter, split = !useDirectRHS))
+      $(performStructuralSimplify(; observedFilter = simCode.observedFilter, split = !useDirectRHS, indexReduced = simCode.indexReduced))
       #= Inject observed equations post-simplification so they do not interfere
          with AffectSystem tearing during callback compilation. =#
       if @isdefined(observedEqs) && !isempty(observedEqs)

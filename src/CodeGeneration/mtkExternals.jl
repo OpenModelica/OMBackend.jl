@@ -41,19 +41,140 @@ const MODELICA_FUNCTION_IMPLS = Dict{Symbol, Function}()
 #= Global dictionary to store RTG wrappers for each function =#
 const MODELICA_FUNCTION_WRAPPERS = Dict{Symbol, Any}()
 
+"""
+The module whose code registered each Modelica function's implementation (generateFunctions): a
+model's module, or CodeGeneration for the registration a translate makes before the model's module
+exists (evalGeneratedFunctions!). registerModelFunctions! reads it.
+"""
+const MODELICA_FUNCTION_OWNERS = Dict{Symbol, Module}()
+
+"""
+A model module's Modelica functions by the module's name: the functions' names and the code that
+registers them, the code its module has (ODE_MODE_MTK_PROGRAM_GENERATION). registerModelFunctions!
+reads it.
+"""
+const MODEL_FUNCTIONS = Dict{Symbol, Tuple{Vector{Symbol}, Vector{Expr}}}()
+
+"""
+    registerModelFunctions!(mod::Module)
+
+Registers the Modelica functions of the model module `mod` again where another module's
+registration replaced one, before `mod` is used without being evaluated again (its code unchanged,
+a cached build). The registries are by function name: a translate registers its functions in
+CodeGeneration before the model's module exists (evalGeneratedFunctions!), and another model's
+module registers its functions of the same name. A reused module then called implementations that
+read the model's constants from CodeGeneration (MSL RoomCO2WithControls translated twice: an
+UndefVarError of `ductOut_Medium_nXi`) or another model's.
+"""
+function registerModelFunctions!(mod::Module)::Nothing
+  local entry = get(MODEL_FUNCTIONS, nameof(mod), nothing)
+  entry === nothing && return nothing
+  local (names, code) = entry
+  all(n -> get(MODELICA_FUNCTION_OWNERS, n, nothing) === mod, names) && return nothing
+  Core.eval(mod, Expr(:block, code...))
+  return nothing
+end
+
 #= A Modelica function's wrapper (createModelicaFunctionWrapper): its
    RuntimeGeneratedFunction behind a method of the function's arity. An RGF
    binds its arguments unchecked, so a call with fewer read past the argument
    tuple and crashed the process (MSL Water IF97, 2026-09-30); here a wrong
-   argument count is a MethodError. =#
+   argument count is a MethodError. The RGF takes the arguments as one tuple
+   (_tupleArgFunction). =#
 struct ModelicaFunctionWrapper{N, F} <: Function
   name::Symbol
   rgf::F
 end
 ModelicaFunctionWrapper{N}(name::Symbol, rgf::F) where {N, F} = ModelicaFunctionWrapper{N, F}(name, rgf)
-(w::ModelicaFunctionWrapper{N})(args::Vararg{Any, N}) where {N} = w.rgf(args...)
+(w::ModelicaFunctionWrapper{N})(args::Vararg{Any, N}) where {N} = w.rgf(args)
 Base.nameof(w::ModelicaFunctionWrapper) = w.name
 Base.show(io::IO, w::ModelicaFunctionWrapper) = print(io, w.name)
+
+"""
+How long a compiled Modelica function runs interpreted before its body is called, in nanoseconds per
+node of its code and the code of the compiled functions it calls, which compile with it (CompileTier):
+about what compiling costs a node (MSL R134a2's dtofphOnePhase, 27,000 nodes: 2.6 s), so a function
+runs interpreted about as long as its compilation would take, at most twice the time of the better of
+the two. Every body compiled at its first call with numbers: R134a2's build compiled 58 of its 130
+functions (390,000 nodes) for the few calls of its initialization, its translate 26 s (interpreted
+8 s); by its own code alone, its 53 nodes, dt_ph compiled after 3 ms and dtofphOnePhase with it.
+"""
+const COMPILE_AFTER_NS_PER_NODE = Ref{UInt64}(50_000)
+
+"""
+Each compiled Modelica function's number of nodes and the compiled functions it calls, by name
+(compiledFunction): the time it runs interpreted (_compileAfter).
+"""
+const COMPILED_CODE_SIZES = Dict{Symbol, Tuple{Int, Tuple{Vararg{Symbol}}}}()
+
+"""
+The calls of the compiled Modelica function `name` so far (CompiledModelicaFunction): the time they
+ran interpreted, the time after which its body is called (_compileAfter, at its first call: 0 before),
+whether it is.
+"""
+mutable struct CompileTier
+  const name::Symbol
+  interpreted::UInt64
+  after::UInt64
+  compiled::Bool
+end
+
+"""
+A Modelica function's compiled implementation (compiledFunction): its body, a function of one
+tuple of the arguments, behind a method of the function's arity, as ModelicaFunctionWrapper; its
+interpreted closure, which runs its calls until its tier's time (CompileTier) and an evaluation with
+symbolic arguments calls (_symbolicImpl). One per build: the call memo (_memoizedCallBy) starts over
+for a new implementation.
+"""
+struct CompiledModelicaFunction{N, F} <: Function
+  f::F
+  interp::Function
+  tier::CompileTier
+end
+CompiledModelicaFunction{N}(name::Symbol, f::F, interp::Function) where {N, F} =
+  CompiledModelicaFunction{N, F}(f, interp, CompileTier(name, 0, 0, false))
+#= the body's call opaque to inference: compiling this method inferred the body for the arguments,
+   called or not (MSL R134a2: its translate 30 s, interpreted 10 s) =#
+(c::CompiledModelicaFunction{N})(args::Vararg{Any, N}) where {N} =
+  c.tier.compiled ? Base.inferencebarrier(c.f)(args) : _interpreted(c, args)
+
+"""
+The call `args` of `c` by its interpreted closure, its time added to the tier's (CompileTier): past the
+tier's time the calls are the body's.
+"""
+function _interpreted(c::CompiledModelicaFunction, args::Tuple)
+  local tier = c.tier
+  tier.after == 0 && (tier.after = _compileAfter(tier.name))
+  local t0 = time_ns()
+  local r = Base.invokelatest(c.interp, args...)
+  tier.interpreted += time_ns() - t0
+  tier.interpreted >= tier.after && (tier.compiled = true)
+  return r
+end
+
+"""
+The implementation of a Modelica function that an eager evaluation with symbolic arguments calls
+(_symbolicFuncDispatch, the element functions): a compiled function's interpreted closure. Its body
+called with them was compiled for Symbolics' types at each translate (MSL R134a2: 130 functions of
+390,000 expression nodes; the translate 41 s and 8.5 GB allocated, interpreted 8 s).
+"""
+_symbolicImpl(impl::CompiledModelicaFunction)::Function = impl.interp
+_symbolicImpl(impl::Function)::Function = impl
+
+"""
+`(a, b, ...) -> body` as a function of one tuple of its arguments,
+`ˍ₋args -> (a = ˍ₋args[1]; b = ˍ₋args[2]; ...; body)`, and its number of arguments. An RGF called
+with its arguments compiles for them as `Any` past a few dozen: its call splats them into
+`generated_callfunc`, whose varargs signature Julia widens, and the body ran type-unstable (MSL
+Spice3's mosCalcNoBypassCode, 159 arguments: 65 KB allocated a call). One tuple keeps the types.
+"""
+function _tupleArgFunction(ex::Expr)::Tuple{Expr, Int}
+  ex.head === :-> || throw(ArgumentError("not an anonymous function: $(ex.head)"))
+  local params = ex.args[1]
+  local names = params isa Symbol ? Any[params] : params.args
+  local unpack = Any[:($(n) = ˍ₋args[$i]) for (i, n) in enumerate(names)]
+  return (Expr(:->, :ˍ₋args, Expr(:block, unpack..., ex.args[2])), length(names))
+end
 
 #= The same hash in every process for the functions of this module's terms
    (the wrappers above and the element extractors below). By default a
@@ -284,6 +405,47 @@ function Symbolics.derivative_rule(p::ModelicaFunctionPartial{N, K}, ::Val{N},
   return _partialTerm(ModelicaFunctionPartial{N, K + 1}(p.name, (p.idx..., I)), args)
 end
 
+"""
+The RuntimeGeneratedFunctions that are calls of a Modelica function in terms: an element extractor of its
+outputs (getOrCreateElemFunc and the three others), a flat call (_getOrCreateFlatScalarFunc). A term of one
+has partials (CallPartial) where NUMERIC_PARTIALS has them.
+"""
+const CALL_RGFS = Base.IdSet{Any}()
+
+"""
+The partial derivative of a term of a call function (CALL_RGFS) by its arguments `idx` in turn: central
+differences of the function at run time (_centralPartial), as ModelicaFunctionPartial for a wrapper's
+term. Its own partials nest. Without it such a term had no rule, and the whole Jacobian was finite
+differences of the right-hand side (OMBACKEND_CALL_PARTIALS; MSL RoomCO2WithControls: the step of a
+pressure of 1e5 crossed its ducts' zero-flow regularization, and the solve took 3000 steps to 0.0037 s).
+"""
+struct CallPartial{N, K} <: Function
+  f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction
+  idx::NTuple{K, Int}
+end
+Base.nameof(p::CallPartial) = Symbol("call_d", Base.join(p.idx, "_"))
+Base.show(io::IO, p::CallPartial) = print(io, nameof(p))
+Base.hash(p::CallPartial, h::UInt) = hash(p.idx, hash(p.f, hash(:CallPartial, h)))
+
+function (p::CallPartial{N, K})(args::Vararg{Any, N}) where {N, K}
+  any(a -> a isa Symbolics.Num || a isa SymbolicUtils.BasicSymbolic, args) &&
+    return _partialTerm(p, Any[Symbolics.unwrap(a) for a in args])
+  return _centralPartial(p.f, args, p.idx, eps(Float64)^(1 / (K + 2)))
+end
+
+_partialTerm(p::CallPartial, args::AbstractVector) = SymbolicUtils.Term{SymbolicUtils.SymReal}(p, collect(Any, args); type = Real)
+
+function Symbolics.derivative_rule(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{<:Any, _RGF_TAG, _RGF_TAG}, ::Val{N},
+                                   args::SymbolicUtils.ROArgsT{Symbolics.VartypeT}, ::Val{I}) where {N, I}
+  (NUMERIC_PARTIALS[] && f in CALL_RGFS && OMBackend.envSwitch("OMBACKEND_CALL_PARTIALS")) || return nothing
+  return _partialTerm(CallPartial{N, 1}(f, (I,)), args)
+end
+
+function Symbolics.derivative_rule(p::CallPartial{N, K}, ::Val{N},
+                                   args::SymbolicUtils.ROArgsT{Symbolics.VartypeT}, ::Val{I}) where {N, K, I}
+  return _partialTerm(CallPartial{N, K + 1}(p.f, (p.idx..., I)), args)
+end
+
 #= Cache for per-element extractor functions.
    Key: (funcName::Symbol, indices::Tuple{Vararg{Int}}, nArgs::Int)
    Value: the created function object
@@ -377,6 +539,177 @@ function unwrapForSymbolic(x)
 end
 
 """
+The results a task's extractors keep of one Modelica function (`_memoizedCall`): its
+implementation, then argument tuples and results in pairs, the oldest replaced first.
+"""
+mutable struct CallMemo
+  impl::Any
+  args::Vector{Any}
+  results::Vector{Any}
+  next::Int
+end
+
+"The results `_memoizedCall` keeps per function and task."
+const CALL_MEMO_SLOTS = 16
+
+"""
+    _memoizedCall(name, impl, args...)
+
+`impl(args...)` for the element extractors of a function's outputs (`getOrCreateElemFunc`,
+`getOrCreateTupleElemFunc`; the flat ones by their scalar arguments, `_memoizedCallBy`): a
+record- or tuple-valued call is one term per field, each
+calling the function, so the function ran once per field (MSL Spice3 Nor: each MOSFET's
+`mosCalcNoBypassCode` 5 times a right-hand side, 20 calls of 7 ms). Its last results with
+equal arguments (`===`, plain values only: no array whose contents could change) are taken
+again: a function an equation calls is pure (MLS 12.3; an impure one only in when-clauses,
+initial sections or `pure()`). A finite-difference Jacobian's column changes some calls'
+arguments only, so the others repeat. Kept per task (no locks between threads), for the
+implementation they were computed with (a new build replaces it).
+"""
+_memoizedCall(name::Symbol, impl, args::Vararg{Any, N}) where {N} = _memoizedCallBy(name, impl, args, args...)
+
+"""
+    _memoizedCallBy(name, impl, key, args...)
+
+`_memoizedCall` with the results kept by `key`: a flat extractor's scalar arguments, of which it
+builds the array arguments (`_getOrCreateFlatElemFunc`: Spice3's MOSFET model takes an array).
+"""
+_memoizedCallBy(name::Symbol, impl, key::Tuple, args::Vararg{Any, N}) where {N} = _memoizedTupleCall(name, impl, key, args)
+
+"""
+`_memoizedCallBy` with the arguments as one tuple (an extractor's whole result, ExtractorWhole).
+"""
+function _memoizedTupleCall(name::Symbol, impl, key::Tuple, args::Tuple)
+  isbitstype(typeof(key)) || return _callWithTuple(impl, args)
+  local memos = get!(() -> Dict{Symbol, CallMemo}(), task_local_storage(), :ombackendCallMemo)::Dict{Symbol, CallMemo}
+  local memo = get!(() -> CallMemo(impl, Any[], Any[], 0), memos, name)
+  if memo.impl !== impl
+    (memo.impl, memo.next) = (impl, 0)
+    empty!(memo.args)
+    empty!(memo.results)
+  end
+  for k in eachindex(memo.args)
+    memo.args[k] === key && return memo.results[k]
+  end
+  local result = _callWithTuple(impl, args)
+  if length(memo.args) < CALL_MEMO_SLOTS
+    push!(memo.args, key)
+    push!(memo.results, result)
+  else
+    memo.next = memo.next % CALL_MEMO_SLOTS + 1
+    memo.args[memo.next] = key
+    memo.results[memo.next] = result
+  end
+  return result
+end
+
+"""
+`impl(args...)` from the tuple of its arguments, in the latest world: a compiled implementation
+(CompiledModelicaFunction) takes the tuple as it is, so its arguments are not splatted.
+"""
+_callWithTuple(impl::CompiledModelicaFunction, args::Tuple) = impl.tier.compiled ? Base.invokelatest(impl.f, args) : _interpreted(impl, args)
+_callWithTuple(impl, args::Tuple) = Base.invokelatest(impl, args...)
+
+"""
+The whole result of the Modelica function `name` whose outputs the element extractors read
+(getOrCreateElemFunc and the three others), from one tuple of an extractor's arguments, through
+the call memo as the extractors: the generated right-hand side calls it once per function and
+arguments and reads the fields of its result (_hoistExtractorCalls!). `S`: the flat extractors'
+shapes of the function's arguments (_getOrCreateFlatElemFunc), `nothing` for the arguments as they are.
+"""
+struct ExtractorWhole{S}
+  name::Symbol
+end
+(w::ExtractorWhole{nothing})(args::Tuple) = _memoizedTupleCall(w.name, MODELICA_FUNCTION_IMPLS[w.name], args, args)
+(w::ExtractorWhole{S})(args::Tuple) where {S} =
+  _memoizedTupleCall(w.name, MODELICA_FUNCTION_IMPLS[w.name], args, _reassembleArgs(args, Val(S)))
+
+"""
+A flat extractor's arguments as the function takes them: its scalars, and the arrays of `shapes`
+built from them as the extractor builds them (a vector literal, a matrix reshaped from one).
+"""
+@generated function _reassembleArgs(flat::Tuple, ::Val{shapes}) where {shapes}
+  local exprs = Any[]
+  local offset = 1
+  for shape in shapes
+    local n = prod(shape; init = 1)
+    local elements = Expr(:vect, Any[:(flat[$k]) for k in offset:offset + n - 1]...)
+    push!(exprs, shape == () ? :(flat[$offset]) : length(shape) == 1 ? elements : :(reshape($elements, $(shape[1]), $(shape[2]))))
+    offset += n
+  end
+  return Expr(:tuple, exprs...)
+end
+
+"An element of a function's whole result, as getOrCreateElemFunc's extractor reads it."
+_pickElement(result, i::Int) = result[i]
+function _pickElement(result, i::Int, j::Int)
+  local row = result[i]
+  return row isa AbstractVector ? row[j] : result[i, j]
+end
+
+"An array element of an output of a function's whole result, as getOrCreateTupleElemFunc's extractor reads it."
+_pickTupleElement(result, t::Int, i::Int) = result[t][i]
+function _pickTupleElement(result, t::Int, i::Int, j::Int)
+  local element = result[t]
+  local row = element[i]
+  return row isa AbstractVector ? row[j] : element[i, j]
+end
+
+"""
+What each element extractor reads (_hoistExtractorCalls!): its function's whole result
+(ExtractorWhole), the pick (_pickElement, _pickTupleElement) and the pick's indices.
+"""
+const EXTRACTOR_INFO = IdDict{Any, Tuple{ExtractorWhole, Symbol, Tuple{Vararg{Int}}}}()
+
+"""
+The generated code's calls of element extractors (EXTRACTOR_INFO) with equal arguments as one call
+of their function's whole result (ExtractorWhole) before the first, each field read from it: an
+extractor is one call per field read, each through the call memo with all the function's arguments
+(MSL Spice3 Nor: 20 calls of 162 arguments for its 4 MOSFETs; the right-hand side took 21 µs with
+every call a memo hit, the MOSFET evaluations about 1.3 µs of it). In place, in each block of `ex`,
+for an extractor call that is an assignment's right-hand side (build_function's code with CSE).
+"""
+function _hoistExtractorCalls!(ex::Expr)::Expr
+  isempty(EXTRACTOR_INFO) && return ex
+  local worklist = Any[ex]
+  while !isempty(worklist)
+    local e = pop!(worklist)
+    e isa Expr || continue
+    e.head === :block && _hoistExtractorCallsInBlock!(e)
+    append!(worklist, e.args)
+  end
+  return ex
+end
+
+"""
+`_hoistExtractorCalls!` in the statements of one block.
+"""
+function _hoistExtractorCallsInBlock!(block::Expr)::Expr
+  local wholes = Dict{Tuple{ExtractorWhole, Vector{Any}}, Symbol}()
+  local statements = Any[]
+  local changed = false
+  for st in block.args
+    local call = st isa Expr && st.head === :(=) && length(st.args) == 2 ? st.args[2] : nothing
+    local info = call isa Expr && call.head === :call && !isempty(call.args) ? get(EXTRACTOR_INFO, call.args[1], nothing) : nothing
+    if info !== nothing
+      local (whole, pick, indices) = info
+      local args = call.args[2:end]
+      local v = get(wholes, (whole, args), nothing)
+      if v === nothing
+        v = gensym(:whole)
+        wholes[(whole, args)] = v
+        push!(statements, :($v = $whole($(Expr(:tuple, args...)))))
+      end
+      st = Expr(:(=), st.args[1], Expr(:call, GlobalRef(@__MODULE__, pick), v, indices...))
+      changed = true
+    end
+    push!(statements, st)
+  end
+  changed && (block.args = statements)
+  return block
+end
+
+"""
 Get or create a per-element extractor function for an array-returning Modelica function.
 The extractor calls the implementation directly via MODELICA_FUNCTION_IMPLS and extracts
 a single element by index. This avoids creating getindex(Term{Real}(...), i) symbolic
@@ -389,7 +722,7 @@ function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArg
   end
   local fnQuote = QuoteNode(funcName)
   local argNames = [Symbol("a", k) for k in 1:nArgs]
-  local implCall = Expr(:call, :(Base.invokelatest), :impl, argNames...)
+  local implCall = Expr(:call, :_memoizedCall, fnQuote, :impl, argNames...)
   local body
   #= Results pass through exactly. Converting to Float64 corrupts Integer
      results (RNG state words exceed 2^53) and float-ifies integer exponents,
@@ -416,6 +749,8 @@ function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArg
   end
   local f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
   ELEM_FUNC_CACHE[key] = f
+  EXTRACTOR_INFO[f] = (ExtractorWhole{nothing}(funcName), :_pickElement, indices)
+  push!(CALL_RGFS, f)
   return f
 end
 
@@ -494,7 +829,7 @@ function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}},
     end
   end
 
-  local implCall = Expr(:call, :(Base.invokelatest), :impl, origArgNames...)
+  local implCall = Expr(:call, :_memoizedCallBy, fnQuote, :impl, Expr(:tuple, flatArgNames...), origArgNames...)
   push!(stmts, :(impl = MODELICA_FUNCTION_IMPLS[$fnQuote]))
   push!(stmts, :(result = $implCall))
 
@@ -516,6 +851,8 @@ function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}},
   local body = Expr(:->, Expr(:tuple, flatArgNames...), Expr(:block, stmts...))
   local f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
   TUPLE_ELEM_FUNC_CACHE[key] = f
+  EXTRACTOR_INFO[f] = (ExtractorWhole{shapes}(funcName), :_pickElement, indices)
+  push!(CALL_RGFS, f)
   return f
 end
 
@@ -528,7 +865,7 @@ end
 # can be cached and later returned even when makeSymbolicTerm passes
 # `type = Real` explicitly, poisoning subsequent sums and breaking
 # `-(::SymReal, ::SymReal)` in MTK alias_elimination.
-SymbolicUtils._promote_symtype(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial}, args) = Real
+SymbolicUtils._promote_symtype(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial, CallPartial}, args) = Real
 SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 
 # Same reason for shape. Scalar-returning extractor RGFs must be reported as
@@ -537,7 +874,7 @@ SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 # mismatch in MTK's substitution rebuild path (terminterface.jl `maketerm` for
 # `+`/`-`). Without this, a wrapper whose body returns a Modelica vector can
 # poison a sum with shape `Unknown(2)`.
-SymbolicUtils.promote_shape(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial}, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial, CallPartial}, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 SymbolicUtils.promote_shape(::typeof(floor), args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 SymbolicUtils.promote_shape(::typeof(floor), arg::SymbolicUtils.Unknown) = SymbolicUtils.ShapeVecT()
 
@@ -624,7 +961,7 @@ function tupleElementCall(funcName::Symbol, ix::Int, args...)
        Produces elementary symbolic expressions Symbolics can differentiate.
        Falls back to opaque RTG extractors if eval fails (if-statement on symbolic). =#
     try
-      local impl = MODELICA_FUNCTION_IMPLS[funcName]
+      local impl = _symbolicImpl(MODELICA_FUNCTION_IMPLS[funcName])
       local preparedArgs = _prepareArgsForEagerEval(args)
       local result = Base.invokelatest(impl, preparedArgs...)
       return result[ix]
@@ -664,7 +1001,7 @@ function getOrCreateTupleElemFunc(funcName::Symbol, tupleIdx::Int, arrayIndices:
   end
   local fnQuote = QuoteNode(funcName)
   local argNames = [Symbol("a", k) for k in 1:nArgs]
-  local implCall = Expr(:call, :(Base.invokelatest), :impl, argNames...)
+  local implCall = Expr(:call, :_memoizedCall, fnQuote, :impl, argNames...)
   local body
   #= Results pass through exactly. Converting to Float64 corrupts Integer
      results (RNG state words exceed 2^53) and float-ifies integer exponents,
@@ -695,6 +1032,8 @@ function getOrCreateTupleElemFunc(funcName::Symbol, tupleIdx::Int, arrayIndices:
   end
   local f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
   TUPLE_ELEM_FUNC_CACHE[key] = f
+  EXTRACTOR_INFO[f] = (ExtractorWhole{nothing}(funcName), :_pickTupleElement, (tupleIdx, arrayIndices...))
+  push!(CALL_RGFS, f)
   return f
 end
 
@@ -733,7 +1072,7 @@ function _getOrCreateFlatTupleElemFunc(funcName::Symbol, tupleIdx::Int, arrayInd
     end
   end
 
-  local implCall = Expr(:call, :(Base.invokelatest), :impl, origArgNames...)
+  local implCall = Expr(:call, :_memoizedCallBy, fnQuote, :impl, Expr(:tuple, flatArgNames...), origArgNames...)
   push!(stmts, :(impl = MODELICA_FUNCTION_IMPLS[$fnQuote]))
   push!(stmts, :(result = $implCall))
   push!(stmts, :(tupleElem = result[$tupleIdx]))
@@ -759,6 +1098,8 @@ function _getOrCreateFlatTupleElemFunc(funcName::Symbol, tupleIdx::Int, arrayInd
   local body = Expr(:->, Expr(:tuple, flatArgNames...), Expr(:block, stmts...))
   local f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
   TUPLE_ELEM_FUNC_CACHE[key] = f
+  EXTRACTOR_INFO[f] = (ExtractorWhole{shapes}(funcName), :_pickTupleElement, (tupleIdx, arrayIndices...))
+  push!(CALL_RGFS, f)
   return f
 end
 
@@ -774,7 +1115,7 @@ function tupleArrayElementCall(funcName::Symbol, tupleIdx::Int, dims::Tuple{Vara
     #= Try eager evaluation: call impl with Num-wrapped args, extract tuple element.
        Produces elementary symbolic expressions for Pantelides differentiation. =#
     try
-      local impl = MODELICA_FUNCTION_IMPLS[funcName]
+      local impl = _symbolicImpl(MODELICA_FUNCTION_IMPLS[funcName])
       local preparedArgs = _prepareArgsForEagerEval(args)
       local result = Base.invokelatest(impl, preparedArgs...)
       local tupleElem = result[tupleIdx]
@@ -823,7 +1164,7 @@ function tupleArrayElementAt(funcName::Symbol, tupleIdx::Int, arrayIndices::Tupl
   if hasSymbolicArgs(args...)
     #= Try eager evaluation: call impl with Num-wrapped args, extract scalar. =#
     try
-      local impl = MODELICA_FUNCTION_IMPLS[funcName]
+      local impl = _symbolicImpl(MODELICA_FUNCTION_IMPLS[funcName])
       local preparedArgs = _prepareArgsForEagerEval(args)
       local result = Base.invokelatest(impl, preparedArgs...)
       local tupleElem = result[tupleIdx]
@@ -914,6 +1255,7 @@ function _getOrCreateFlatScalarFunc(funcName::Symbol, nFlat::Int, shapes::Tuple)
   local body = Expr(:->, Expr(:tuple, flatArgNames...), Expr(:block, stmts...))
   local f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
   TUPLE_ELEM_FUNC_CACHE[key] = f
+  push!(CALL_RGFS, f)
   return f
 end
 
@@ -1096,10 +1438,17 @@ function constTableLookup(table::AbstractArray, idxs...)
   if hasSymbolicArgs(idxs...)
     return makeSymbolicTerm(ConstTableLookupFn(table), Any[idxs...])
   else
-    return table[ntuple(k -> clamp(_toIndex(idxs[k]), 1, size(table, k)),
-                       length(idxs))...]
+    return table[ntuple(k -> _tableIndex(idxs[k], size(table, k)), length(idxs))...]
   end
 end
+
+"""
+An index of a constant table (constTableLookup): a scalar clamped to `1:n` (_toIndex), a slice's
+indices as they are (a function's `X[1:nXi]` of an inlined literal X: the clamp's MethodError of a
+range).
+"""
+_tableIndex(v::Union{Colon, AbstractVector{<:Integer}}, n::Int) = v
+_tableIndex(v::Any, n::Int) = clamp(_toIndex(v), 1, n)
 
 """
 Clamp the resolved table index to the valid range [1, size(table, k)].
@@ -1169,7 +1518,7 @@ function _symbolicFuncDispatch(funcName::Symbol, origArgs::Vector{Any}, isArray:
     expanded === nothing || return expanded
   end
   try
-    local impl = MODELICA_FUNCTION_IMPLS[funcName]
+    local impl = _symbolicImpl(MODELICA_FUNCTION_IMPLS[funcName])
     local preparedArgs = _prepareArgsForEagerEval(origArgs)
     local result = Base.invokelatest(impl, preparedArgs...)
     if isArray && !isempty(dims)
@@ -1251,6 +1600,224 @@ function _buildWrapperBody(funcName::Symbol, nArgs::Int, arrayFunction::Bool, ou
   end
 end
 
+"""
+A Modelica function's code as a RuntimeGeneratedFunction can compile it, or `nothing`. An RGF's
+body can define no closure ("the function body AST defined by this @generated function is not
+pure"); RGF turns an anonymous function or an `Expr(:generator)` into an opaque closure, not
+the frontend's comprehension `Expr(:comprehension, body, k = r)` (ComplexLoweringTests'
+quasiRMS), and a generator of several iterators it zips, where a comprehension takes their
+product. Here a comprehension is `Base.collect([T, ]Base.Generator(k -> body, r))`, as Julia
+lowers it, several iterators `Base.Iterators.product`'s; a generator's filter or nested loops
+and a `do` block: `nothing` (the function stays a closure of the model module).
+"""
+function _compilableFunction(ex::Expr)::Union{Expr, Nothing}
+  local body = _compilableCode(ex.args[2])
+  return body === _NOT_COMPILABLE ? nothing : Expr(:->, ex.args[1], body)
+end
+
+const _NOT_COMPILABLE = gensym(:notCompilable)
+
+"""
+`ex` with its comprehensions and generators as calls (_compilableFunction), or _NOT_COMPILABLE.
+"""
+function _compilableCode(ex)
+  ex isa Expr || return ex
+  ex.head in (:do, :filter, :flatten) && return _NOT_COMPILABLE
+  if ex.head === :comprehension || ex.head === :typed_comprehension
+    local typed = ex.head === :typed_comprehension
+    local rest = typed ? ex.args[2:end] : ex.args
+    local gen = length(rest) == 1 && rest[1] isa Expr && rest[1].head === :generator ? rest[1] : Expr(:generator, rest...)
+    local g = _compilableCode(gen)
+    g === _NOT_COMPILABLE && return g
+    if typed
+      local T = _compilableCode(ex.args[1])
+      return T === _NOT_COMPILABLE ? T : :(Base.collect($T, $g))
+    end
+    return :(Base.collect($g))
+  end
+  if ex.head === :generator
+    local iters = ex.args[2:end]
+    (!isempty(iters) && all(it -> it isa Expr && it.head === :(=) && it.args[1] isa Symbol, iters)) || return _NOT_COMPILABLE
+    local body = _compilableCode(ex.args[1])
+    local ranges = Any[_compilableCode(it.args[2]) for it in iters]
+    (body === _NOT_COMPILABLE || any(r -> r === _NOT_COMPILABLE, ranges)) && return _NOT_COMPILABLE
+    length(iters) == 1 && return :(Base.Generator($(Expr(:->, iters[1].args[1], body)), $(ranges[1])))
+    local t = gensym(:iteration)
+    local unpack = Any[:(local $(it.args[1]) = $t[$i]) for (i, it) in enumerate(iters)]
+    return :(Base.Generator($(Expr(:->, t, Expr(:block, unpack..., body))), Base.Iterators.product($(ranges...))))
+  end
+  local args = Any[]
+  for a in ex.args
+    local c = _compilableCode(a)
+    c === _NOT_COMPILABLE && return c
+    push!(args, c)
+  end
+  return Expr(ex.head, args...)
+end
+
+"""
+A Modelica function's implementation compiled (OMBACKEND_COMPILED_FUNCTIONS). A closure of the
+model module runs interpreted (the module is compile=min, _moduleCompilerOptions): MSL Spice3's
+MOSFET evaluation (mosCalcNoBypassCode, 1355 statements and 10 nested calls) took 45 µs a call,
+5 s of the Spice3 Nor's 8.5 s; MSL Media MoistAir1 7.2 s (compiled 0.09 s). Here `name`'s code
+`ex` becomes two functions of CodeGeneration: its body, of one tuple of the arguments
+(_tupleArgFunction), and its entry, which a compiled function's call of it (one of `callees`)
+calls: the body for numeric arguments, decided by their types (_isNumericArg), so that the call
+is inferred, else the wrapper (a symbolic call, _symbolicFuncDispatch). A call through the
+wrapper's global was dynamic and its result Any: the MOSFET body that destructures drainCur's
+result ran type-unstable (46 KB a call; through the entries 48 ns, none). Its names are CodeGeneration's: a call of a function not
+compiled (an external one) finds the wrapper createModelicaFunctionWrapper binds. While
+precompiling, an RGF (an evaluation into this module would be lost), its calls through the
+wrappers. `interp`, the function's closure in `mod`, runs the calls until the function has run
+interpreted about as long as compiling its body takes (CompileTier), and the evaluations with
+symbolic arguments (_symbolicImpl).
+"""
+function compiledFunction(name::Symbol, ex::Expr, callees::Tuple{Vararg{Symbol}}, mod::Module, interp::Function)::Function
+  ex = _modelNamesFrom(ex, mod)
+  COMPILED_CODE_SIZES[name] = (_exprNodes(ex), callees)
+  ccall(:jl_generating_output, Cint, ()) == 1 && return _compiledRGF(name, ex, interp)
+  local (body, n) = _tupleArgFunction(ex)
+  local params = ex.args[1] isa Symbol ? Any[ex.args[1]] : ex.args[1].args
+  local bodyName = _compiledBodyName(name)
+  local numeric = foldr((a, b) -> :($a && $b), Any[:(_isNumericArg($p)) for p in params]; init = true)
+  Core.eval(@__MODULE__, quote
+    function $bodyName(ˍ₋args::Tuple)
+      $(_entryCalls!(deepcopy(body.args[2]), callees))
+    end
+    function $(_compiledEntryName(name))($(params...))
+      $numeric && return $bodyName($(Expr(:tuple, params...)))
+      return MODELICA_FUNCTION_WRAPPERS[$(QuoteNode(name))]($(params...))
+    end
+  end)
+  return CompiledModelicaFunction{n}(name, Base.invokelatest(getglobal, @__MODULE__, bodyName), interp)
+end
+
+"""
+`ex` compiled as a RuntimeGeneratedFunction of CodeGeneration (compiledFunction while precompiling):
+its calls of other functions through their wrappers' globals.
+"""
+function _compiledRGF(name::Symbol, ex::Expr, interp::Function)::Function
+  local (body, n) = _tupleArgFunction(ex)
+  return CompiledModelicaFunction{n}(name, RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body), interp)
+end
+
+"The number of nodes of `ex`."
+function _exprNodes(ex::Expr)::Int
+  local nodes = 0
+  local worklist = Any[ex]
+  while !isempty(worklist)
+    local e = pop!(worklist)
+    nodes += 1
+    e isa Expr && append!(worklist, e.args)
+  end
+  return nodes
+end
+
+"""
+The time the compiled function `name` runs interpreted before its body is called (CompileTier): by
+the nodes of its code and of the compiled functions it calls, directly or not (COMPILED_CODE_SIZES).
+"""
+function _compileAfter(name::Symbol)::UInt64
+  local nodes = 0
+  local seen = Set{Symbol}((name,))
+  local worklist = Symbol[name]
+  while !isempty(worklist)
+    local (n, callees) = get(COMPILED_CODE_SIZES, pop!(worklist), (0, ()))
+    nodes += n
+    for c in callees
+      c in seen || (push!(seen, c); push!(worklist, c))
+    end
+  end
+  return COMPILE_AFTER_NS_PER_NODE[] * max(nodes, 1)
+end
+
+"""
+`ex` (a function's code, `args -> body`) with each name it reads that is neither its own (an argument, a
+local, an iteration variable) nor one of CodeGeneration's read from `mod`, the model's module, where its
+closure read it: a constant of the model's code (MSL Fluid's `pipe4_Medium_nXi`, a medium's number of
+independent mass fractions, in its pipe's functions; compiled in CodeGeneration it was an UndefVarError,
+BranchingDynamicPipes and RoomCO2WithControls 4.1.0). A copy.
+"""
+function _modelNamesFrom(ex::Expr, mod::Module)::Expr
+  local code = deepcopy(ex)
+  local own = _ownNames(code)
+  local worklist = Any[code]
+  while !isempty(worklist)
+    local e = pop!(worklist)
+    for i in eachindex(e.args)
+      local a = e.args[i]
+      if a isa Expr
+        push!(worklist, a)
+      elseif a isa Symbol && !(a in own) && !isdefined(@__MODULE__, a) && !_isNotRead(e, i)
+        e.args[i] = GlobalRef(mod, a)
+      end
+    end
+  end
+  return code
+end
+
+"""
+The names `ex` defines: its arguments, the names it assigns or declares local, its loops' and
+comprehensions' variables, its closures' arguments.
+"""
+function _ownNames(ex::Expr)::Set{Symbol}
+  local own = Set{Symbol}()
+  local add!(x) = x isa Symbol ? push!(own, x) :
+    x isa Expr && x.head in (:tuple, :(::), :..., :parameters) ? foreach(add!, x.head === :(::) ? x.args[1:1] : x.args) :
+    x isa Expr && x.head === :(=) ? add!(x.args[1]) : nothing
+  ex.head === :-> && add!(ex.args[1])
+  local worklist = Any[ex]
+  while !isempty(worklist)
+    local e = pop!(worklist)
+    e isa Expr || continue
+    if e.head === :(=) || e.head === :local
+      e.head === :(=) ? add!(e.args[1]) : foreach(add!, e.args)
+    elseif e.head === :->
+      add!(e.args[1])
+    end
+    append!(worklist, e.args)
+  end
+  return own
+end
+
+"Whether `e.args[i]` is a name that is not read: `end` and `begin` in an index, a macro's name, a keyword's name."
+_isNotRead(e::Expr, i::Int)::Bool =
+  (e.head === :ref && e.args[i] in (:end, :begin)) || (e.head === :macrocall && i == 1) || (e.head === :kw && i == 1)
+
+"The function of a compiled Modelica function's body (compiledFunction)."
+_compiledBodyName(name::Symbol)::Symbol = Symbol("#omjl_body#", name)
+
+"The function a compiled function's call of the compiled function `name` calls (compiledFunction)."
+_compiledEntryName(name::Symbol)::Symbol = Symbol("#omjl_entry#", name)
+
+"""
+Whether a compiled entry's argument is numeric by its type alone (compiledFunction): with all its
+arguments numeric the entry's symbolic branch is compiled away and its result type is its body's.
+"""
+_isNumericArg(::Union{Float64, Int64, Bool, String}) = true
+_isNumericArg(::AbstractArray{<:Union{Float64, Int64, Bool, String}}) = true
+_isNumericArg(::Any) = false
+
+"""
+`ex` with its calls of `callees` calling their entries (_compiledEntryName), in place.
+"""
+function _entryCalls!(ex::Expr, callees::Tuple{Vararg{Symbol}})::Expr
+  isempty(callees) && return ex
+  local worklist = Any[ex]
+  local visited = Base.IdSet{Any}()
+  while !isempty(worklist)
+    local e = pop!(worklist)
+    e isa Expr || continue
+    e in visited && continue
+    push!(visited, e)
+    if e.head === :call && !isempty(e.args) && e.args[1] isa Symbol && e.args[1] in callees
+      e.args[1] = _compiledEntryName(e.args[1])
+    end
+    append!(worklist, e.args)
+  end
+  return ex
+end
+
 function createModelicaFunctionWrapper(funcName::Symbol, nArgs::Int, arrayFunction::Bool = false, outputDims::Tuple{Vararg{Int}} = ())
   #= Always (re-)create the wrapper so the correct arrayFunction flag is applied. =#
 
@@ -1258,7 +1825,7 @@ function createModelicaFunctionWrapper(funcName::Symbol, nArgs::Int, arrayFuncti
      RTG functions are world-age safe: they can be called from any world age,
      unlike @eval-created functions which are "too new" when called from
      RuntimeGeneratedFunction context (e.g., MTK equation evaluation). =#
-  local body = _buildWrapperBody(funcName, nArgs, arrayFunction, outputDims)
+  local body = first(_tupleArgFunction(_buildWrapperBody(funcName, nArgs, arrayFunction, outputDims)))
   local rtg = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
   MODELICA_FUNCTION_WRAPPERS[funcName] = ModelicaFunctionWrapper{nArgs}(funcName, rtg)
   if arrayFunction && !isempty(outputDims)
@@ -2416,6 +2983,61 @@ function _withIrreducible(sys::ModelingToolkit.AbstractSystem, vars::Vector{Any}
 end
 
 """
+    mtkcompileLogged(sys, simplify, split, kwargs) -> System
+
+`ModelingToolkit.mtkcompile` of `sys`, timed under `BACKEND_LOGGING`.
+"""
+function mtkcompileLogged(sys::ModelingToolkit.AbstractSystem, simplify::Bool, split::Bool, kwargs::NamedTuple)
+  OMBackend.BACKEND_LOGGING[] || return ModelingToolkit.mtkcompile(sys; simplify = simplify, split = split, kwargs...)
+  local timed = @timed ModelingToolkit.mtkcompile(sys; simplify = simplify, split = split, kwargs...)
+  @debug "[MTK GEN: simplify] structural_simplify took $(timed.time)s, $(round(timed.bytes / 1e9, digits=2)) GiB"
+  return timed.value
+end
+
+"""
+    readsNonUnitInteger(ex) -> Bool
+
+Whether the symbolic expression `ex` reads a numeric literal that is an integer other than 0
+and ±1 within MTK's coefficient range (|c| <= 127).
+"""
+function readsNonUnitInteger(@nospecialize(ex))::Bool
+  local stack = Any[ex]
+  while !isempty(stack)
+    local e = pop!(stack)
+    if SymbolicUtils.isconst(e)
+      local v = SymbolicUtils.unwrap_const(e)
+      (v isa Real && !(v isa Bool) && isfinite(v) && isinteger(v) && 1 < abs(v) <= 127) && return true
+    elseif SymbolicUtils.iscall(e)
+      append!(stack, SymbolicUtils.arguments(e))
+    end
+  end
+  return false
+end
+
+"""
+    scaleNonUnitIntegerEquations(sys) -> (n, System)
+
+`sys` with each of its `n` algebraic equations that read an integer literal other than 0 and ±1
+(`readsNonUnitInteger`) multiplied on both sides by 1/√2: no coefficient of it is an integer, so
+MTK's alias elimination leaves it to tearing. The fallback when that elimination overflows Int64.
+"""
+function scaleNonUnitIntegerEquations(sys::ModelingToolkit.AbstractSystem)::Tuple{Int, ModelingToolkit.AbstractSystem}
+  local k = sqrt(0.5)
+  local n = 0
+  local eqs = Symbolics.Equation[]
+  for eq in ModelingToolkit.get_eqs(sys)
+    if ModelingToolkit.isdiffeq(eq) || !readsNonUnitInteger(Symbolics.unwrap(eq.rhs - eq.lhs))
+      push!(eqs, eq)
+    else
+      push!(eqs, Symbolics.Equation(k * eq.lhs, k * eq.rhs))
+      n += 1
+    end
+  end
+  @set! sys.eqs = eqs
+  return (n, sys)
+end
+
+"""
   The irreducible variables scheme does not work using plain simplify.
 
   It should be noted that for some models both running tearing and structural simplification are needed.
@@ -2490,16 +3112,27 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   end
 
   local useSplit = get(kwargs, :split, true)
+  #= fully_determined = false for a system OMBackend reduced (tearing only); not passed otherwise =#
+  local compileKwargs = haskey(kwargs, :fully_determined) ? (; fully_determined = kwargs[:fully_determined]) : (;)
   sys = _timeMayBeZero(sys)
   local _preSimplifySys = sys
   #= the system the accepted reduction came from: the relaxed one after a retry below =#
   local _simplifiedFrom = sys
-  if OMBackend.BACKEND_LOGGING[]
-    local _ss_timed = @timed ModelingToolkit.mtkcompile(sys; simplify = simplify, split = useSplit)
-    sys = _ss_timed.value
-    @debug "[MTK GEN: simplify] structural_simplify took $(_ss_timed.time)s, $(round(_ss_timed.bytes / 1e9, digits=2)) GiB"
-  else
-    sys = ModelingToolkit.mtkcompile(sys; simplify = simplify, split = useSplit)
+  sys = try
+    mtkcompileLogged(sys, simplify, useSplit, compileKwargs)
+  catch e
+    e isa OverflowError || rethrow()
+    #= MTK's alias elimination runs fraction-free Bareiss in Int64 over the linear equations of
+       integer coefficients (|c| <= 127); on a large system the entries outgrow Int64 (MSL
+       BranchingDynamicPipes' `Is = 10 * m_flow`: -5625000000 * -1875000000; Spice3's
+       FourBitBinaryAdder, EngineV6). The equations with a coefficient other than ±1 are kept out
+       of it (scaleNonUnitIntegerEquations); the aliases stay. =#
+    local (nScaled, scaledSys) = scaleNonUnitIntegerEquations(sys)
+    nScaled == 0 && rethrow()
+    @info "[MTK GEN: simplify] alias elimination overflowed Int64; $(nScaled) equation(s) with integer coefficients other than ±1 kept out of it"
+    _preSimplifySys = scaledSys
+    _simplifiedFrom = scaledSys
+    mtkcompileLogged(scaledSys, simplify, useSplit, compileKwargs)
   end
   #= A structurally singular reduction (equations != unknowns) can be caused by a
      soft StateSelect hint conflicting with a constraint MTK index-reduces. Retry
@@ -2508,7 +3141,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
     local (nNeutralized, relaxedSys) = neutralizeSoftStatePriority(_preSimplifySys)
     if nNeutralized > 0
       local retried = try
-        ModelingToolkit.mtkcompile(relaxedSys; simplify = simplify, split = useSplit)
+        ModelingToolkit.mtkcompile(relaxedSys; simplify = simplify, split = useSplit, compileKwargs...)
       catch e
         @warn "[MTK GEN: simplify] retry without soft state-priority hints threw" exception = (e, catch_backtrace())
         nothing

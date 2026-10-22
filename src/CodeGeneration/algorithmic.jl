@@ -184,8 +184,17 @@ function generateIntegerInputConversions(inputs::Vector{SC.FunctionVariable})::V
   end
   return conversions
 end
-_integerInput(x::AbstractFloat) = isinteger(x) ? Int(x) : x
-_integerInput(x::AbstractArray{<:AbstractFloat}) = all(isinteger, x) ? Int.(x) : x
+"""
+An Integer input's value as an Int: exact, or within rounding of an integer (a discrete read
+at an event the integrator located inside a step is interpolated there, a constant to
+5.000000000000001: MSL TimeTable's `last` at HBridge_DC_Drive's duty-cycle event, 4.1.0).
+Another value as it is.
+"""
+function _integerInput(x::AbstractFloat)
+  local r = round(x)
+  return isfinite(x) && abs(x - r) <= 1.0e3 * eps(max(1.0, abs(x))) ? Int(r) : x
+end
+_integerInput(x::AbstractArray{<:AbstractFloat}) = all(v -> _integerInput(v) isa Int, x) ? Int.(round.(x)) : x
 _integerInput(x) = x
 
 """
@@ -285,9 +294,11 @@ end
 """
 An array of records as a local (MSL ReferenceAir's Ice09 Gibbs function: `MyComplex[3]
 r_2 = {MyComplex(...), ...}`, `MyComplex o[12]`): each field an array of the local's
-dimensions (r_2_re, r_2_im), from a default by the records' fields, else zero-filled for
-the elements the body assigns. A field of a record or array type, or dimensions not known
-here, leave it declared only.
+dimensions (r_2_re, r_2_im), from a default by the records' fields (record literals, or
+record-valued calls each evaluated once: `Complex[2] t = {Complex(...), Complex(...)}`,
+Complex's constructor; zero-filled, `2 t[1] log(t[1])` was NaN and so was the ice's entropy),
+else zero-filled for the elements the body assigns. A field of a record or array type, or
+dimensions not known here, leave it declared only.
 """
 function _recordArrayLocal(v::SC.FunctionVariable, flat::Vector{Symbol})::Vector{Expr}
   local decls = Expr[Expr(:local, fs) for fs in flat]
@@ -299,24 +310,35 @@ function _recordArrayLocal(v::SC.FunctionVariable, flat::Vector{Symbol})::Vector
   local dimExprs = map(_daeDimToJulia, v.dimensions)
   (isempty(dimExprs) || any(d -> d isa Number && d <= 0, dimExprs)) && return decls
   local jlTy = t -> t isa SC.TYPE_INTEGER ? :Int : t isa SC.TYPE_BOOL ? :Bool : :Float64
-  local byField = v.default isa SC.ARRAY_EXP ? _recordArrayBindingFields(v.default.elements, length(flat)) : nothing
+  local elements = v.default isa SC.ARRAY_EXP ? _recordArrayElementTuples(v.default.elements, length(flat)) : nothing
+  if elements === nothing
+    for (k, fs) in enumerate(flat)
+      push!(decls, :($fs = zeros($(jlTy(fieldTys[k])), $(dimExprs...))))
+    end
+    return decls
+  end
+  local tuples = Symbol("__omjl_", v.name, "_elements")
+  push!(decls, :(local $tuples = ($(elements...),)))
   for (k, fs) in enumerate(flat)
-    push!(decls, byField === nothing ? :($fs = zeros($(jlTy(fieldTys[k])), $(dimExprs...))) :
-                                        :($fs = $(jlTy(fieldTys[k]))[$(byField[k]...)]))
+    push!(decls, :($fs = $(jlTy(fieldTys[k]))[e[$k] for e in $tuples]))
   end
   return decls
 end
 
 """
-The elements of a one-dimensional array of record literals by field (the k-th entry: field
-k of each element, lowered); nothing for another default.
+The elements of a one-dimensional array of records, each as its fields' tuple: a record
+literal's fields lowered, a record-valued call's result (`_recordTupleExpr`); nothing for
+another element.
 """
-function _recordArrayBindingFields(elements::Vector{SC.Exp}, nFields::Int)::Union{Nothing, Vector{Vector{Any}}}
-  local out = [Any[] for _ in 1:nFields]
+function _recordArrayElementTuples(elements::Vector{SC.Exp}, nFields::Int)::Union{Nothing, Vector{Any}}
+  local out = Any[]
   for e in elements
-    (e isa SC.RECORD && length(e.exps) == nFields) || return nothing
-    for k in 1:nFields
-      push!(out[k], expToJuliaExpAlg(e.exps[k]))
+    if e isa SC.RECORD && length(e.exps) == nFields
+      push!(out, Expr(:tuple, Any[expToJuliaExpAlg(x) for x in e.exps]...))
+    elseif e isa SC.CALL && e.ty isa SC.TYPE_COMPLEX
+      push!(out, _recordTupleExpr(e))
+    else
+      return nothing
     end
   end
   return out
@@ -368,9 +390,11 @@ end
   each is an implementation stored in MODELICA_FUNCTION_IMPLS and a wrapper created at module
   load time that looks it up (createModelicaFunctionWrapper).
 """
-function generateFunctions(functions::Vector{SC.ModelicaFunction})::Tuple{Vector{Expr}, Vector{String}}
+function generateFunctions(functions::Vector{SC.ModelicaFunction};
+                           compiled::Bool = CodeGeneration.OMBackend.envSwitch("OMBACKEND_COMPILED_FUNCTIONS"))::Tuple{Vector{Expr}, Vector{String}}
   local jFuncs = Expr[]
   local names = String[]
+  local codes = Tuple{SC.ModelicaFunction, Int, Bool, Tuple{Vararg{Int}}, Expr, Union{Expr, Nothing}}[]
   for func in functions
     local inputs = generateIOL(func.inputs)
     local outputs = generateIOL(func.outputs)
@@ -384,8 +408,8 @@ function generateFunctions(functions::Vector{SC.ModelicaFunction})::Tuple{Vector
       local inputConversions = vcat(generateArrayConversions(func.inputs), generateIntegerInputConversions(func.inputs))
       local returnExpr = length(outputs) > 1 ? Expr(:tuple, outputs...) : length(outputs) == 1 ? outputs[1] : nothing
       _CURRENT_RETURN_EXPR[] = returnExpr
-      Expr(:block, inputConversions..., generateOutputDefaults(func.outputs)..., generateLocals(func.locals)...,
-           generateStatements(func.statements)..., :(return $(returnExpr)))
+      _directCalls!(Expr(:block, inputConversions..., generateOutputDefaults(func.outputs)..., generateLocals(func.locals)...,
+                         generateStatements(func.statements)..., :(return $(returnExpr))))
     elseif func.external.language == "FORTRAN 77"
       _fortranExternalBody(func)
     else
@@ -399,17 +423,76 @@ function generateFunctions(functions::Vector{SC.ModelicaFunction})::Tuple{Vector
     end
     local anonFunc = nArgs == 0 ? Expr(:->, Expr(:tuple), funcBody) :
       nArgs == 1 ? Expr(:->, inputs[1], funcBody) : Expr(:->, Expr(:tuple, inputs...), funcBody)
+    #= compiled: CodeGeneration's functions (compiledFunction), not a closure of the model module,
+       which runs interpreted =#
+    local compilable = compiled && func isa SC.MODELICA_FUNCTION ? CodeGeneration._compilableFunction(anonFunc) : nothing
+    push!(codes, (func, nArgs, isArrayFunc, outputDims, anonFunc, compilable))
+  end
+  local compiledNames = Set{Symbol}(Symbol(c[1].name) for c in codes if c[6] !== nothing)
+  for (func, nArgs, isArrayFunc, outputDims, anonFunc, compilable) in codes
+    #= a compiled function's calls of the compiled ones: their entries (compiledFunction) =#
+    local impl = compilable === nothing ? anonFunc :
+      :(OMBackend.CodeGeneration.compiledFunction($(QuoteNode(Symbol(func.name))), $(QuoteNode(compilable)),
+                                                  $(Expr(:tuple, QuoteNode.(sort!(collect(intersect(_calledNames(compilable), compiledNames))))...)),
+                                                  @__MODULE__, $(anonFunc)))
     local f = quote
       #= Create the wrapper function (always re-created to apply correct flags) =#
       OMBackend.CodeGeneration.createModelicaFunctionWrapper($(QuoteNode(Symbol(func.name))), $(nArgs), $(isArrayFunc), $(outputDims))
       #= Store the implementation in the dictionary =#
-      OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(Symbol(func.name)))] = $(anonFunc)
+      OMBackend.CodeGeneration.MODELICA_FUNCTION_IMPLS[$(QuoteNode(Symbol(func.name)))] = $(impl)
+      OMBackend.CodeGeneration.MODELICA_FUNCTION_OWNERS[$(QuoteNode(Symbol(func.name)))] = @__MODULE__
       $(_functionDerivativeRuleExpr(func, functions))
     end
     push!(jFuncs, f)
     push!(names, func.name)
   end
   return jFuncs, names
+end
+
+"""
+The names `ex` calls (`name(...)`, the first argument of a call when it is a Symbol).
+"""
+function _calledNames(ex)::Set{Symbol}
+  local found = Set{Symbol}()
+  local worklist = Any[ex]
+  local visited = Base.IdSet{Any}()
+  while !isempty(worklist)
+    local e = pop!(worklist)
+    e isa Expr || continue
+    e in visited && continue
+    push!(visited, e)
+    e.head === :call && !isempty(e.args) && e.args[1] isa Symbol && push!(found, e.args[1])
+    append!(worklist, e.args)
+  end
+  return found
+end
+
+"""
+A function body's calls of the model's functions made directly, in place:
+`Base.invokelatest(name, args...)` (expToJuliaExpAlg's call, for code compiled before the
+callee's wrapper exists) becomes `name(args...)`. A body runs in the latest world (every caller
+enters it through `Base.invokelatest`: its wrapper, the call memo, the numeric partials), where
+the callee's wrapper is defined. The hop splatted every argument into a new tuple: an MSL
+Spice3 MOSFET evaluation (mosCalcNoBypassCode, 159 arguments) spent most of its time in the
+hops to its 10 nested calls (drainCur's 139 arguments: 15 µs through the hop, 7 µs direct).
+A worklist with identity dedup, as qualifyModelicaFunctions!: bodies nest deeply.
+"""
+function _directCalls!(body::Expr)::Expr
+  local worklist = Any[body]
+  local visited = Base.IdSet{Any}()
+  while !isempty(worklist)
+    local e = pop!(worklist)
+    e isa Expr || continue
+    e in visited && continue
+    push!(visited, e)
+    if e.head === :call && length(e.args) >= 2 && e.args[1] == :(Base.invokelatest) && e.args[2] isa Symbol
+      popfirst!(e.args)
+    end
+    for a in e.args
+      a isa Expr && push!(worklist, a)
+    end
+  end
+  return body
 end
 
 """

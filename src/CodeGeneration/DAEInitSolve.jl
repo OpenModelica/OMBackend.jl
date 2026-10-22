@@ -270,7 +270,8 @@ best effort the warning or the error below reports).
 """
 function _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
                                   converged::Base.RefValue{Bool}=Ref(true), t0::Float64=0.0,
-                                  sparsity::Union{Nothing, Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}}=nothing)
+                                  sparsity::Union{Nothing, Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}}=nothing,
+                                  stateOrder::Vector{Int}=Int[])
   #= The residuals at the start time t0: the phases below evaluate at their time 0. Assigned
      once (closures below capture it: a reassigned argument would be boxed). =#
   local rhsFunc = t0 == 0.0 ? rhsAt0 : (du, u, p, t) -> rhsAt0(du, u, p, t + t0)
@@ -376,6 +377,43 @@ function _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; maxiter=200, tol=1e-10,
     completeInit!(alg_unpinned)
     return u0
   end
+  #= Phase 1b: an underdetermined initialization completed as OpenModelica and Dymola complete it. With
+     fewer rows than unknowns (the latches held), the unfixed states the rows leave free are fixed at their
+     start values (_initStatesToFix, a matching: never an algebraic unknown) and the square remainder is
+     solved. Phase 1 holds every state, which an initialization equation on a state contradicts; phase 2
+     frees them all, and its least squares ends anywhere on the solutions near the start values, its
+     completion pinning algebraic unknowns (`x + y = 5` from x(start = 1), y(start = 2): x = 2, y = 3, where
+     OpenModelica fixes x: x = 1, y = 4; test/Models/InitFixStates.mo). =#
+  local fixVars = [i for i in 1:n if !(i in pinnedSet) && !(i in discretePinnedSet)]
+  #= the states in the model's order (`stateOrder`, its rank of each unknown): the first ones are fixed =#
+  local fixStateCols = sort!(Int[k for (k, i) in enumerate(fixVars) if i <= nSafe && mm[i, i] != 0];
+                             by = k -> fixVars[k] <= length(stateOrder) ? stateOrder[fixVars[k]] : typemax(Int))
+  if OMBackend.envSwitch("OMBACKEND_INIT_FIX_STATES") && 0 < length(fixVars) - length(init_res_vec) < length(fixStateCols)
+    local fixed = _initStatesToFix(_initIncidence(rhsFunc, p_vec, u0, eq_idx, eq_target, extra_residuals, fixVars, sparsity),
+                                   length(fixVars), fixStateCols)
+    if fixed !== nothing
+      local fixedSet = Set{Int}(fixVars[k] for k in fixed)
+      local vars1b = Int[i for i in fixVars if !(i in fixedSet)]
+      OMBackend.envSwitch("OMBACKEND_INIT_TRACE") &&
+        println("[initfix] ", length(fixed), " of ", length(fixStateCols), " unfixed states fixed at their start values")
+      #= square: Newton; anchored only where it does not converge (the anchor rows pull off the root) =#
+      local u0_1b = copy(u0)
+      local solved1b = _solveDAEPhase!(u0_1b, rhsFunc, p_vec, eq_idx, vars1b; targets=eq_target, maxiter=min(maxiter, 50),
+                                       tol=tol, extraRes=extra_residuals, phaseLabel="p1b-fixed")
+      if !solved1b
+        copyto!(u0_1b, u0)
+        solved1b = _solveDAEPhaseAnchored!(u0_1b, rhsFunc, p_vec, eq_idx, vars1b,
+                                           OMBackend.envSwitch("OMBACKEND_INIT_ANCHOR") ? copy(u0) : nothing;
+                                           targets=eq_target, maxiter=maxiter, tol=tol,
+                                           extraRes=extra_residuals, phaseLabel="p1b-fixed")
+      end
+      if solved1b
+        copyto!(u0, u0_1b)
+        completeInit!(vars1b)
+        return u0
+      end
+    end
+  end
   #= Phase 2: free all unpinned vars (alg + diff without fixed=true) to allow
      algebraic eqs to be satisfied by adjusting differential vars. Pinned vars
      stay at user-requested values. Anchored to the entry guesses so an
@@ -476,6 +514,119 @@ function _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; maxiter=200, tol=1e-10,
 end
 
 """
+    _initStatesToFix(incidence, nVars, stateCols) -> Union{Nothing, Vector{Int}}
+
+The unfixed states an underdetermined initialization fixes at their start values, as OpenModelica
+(Initialization.fixInitialSystem; Ochel and Bachmann, EOOLT 2013) and Dymola ("Assuming fixed start
+value for the continuous states") do: one artificial row per missing equation, which reads the unfixed
+states `stateCols`, and the rows (`incidence[r]`, the unknowns `1:nVars` row `r` reads) matched to the
+unknowns; the states the artificial rows are matched to. The artificial rows first: they take the first
+states, which a row takes from them only where it has no other unknown, so the earlier states are the
+ones fixed (OpenModelica's choice in `x + y = 5` for x(start = 1), y(start = 2): x = 1, y = 4). An
+algebraic unknown is never fixed: `nothing` where no matching covers every unknown (the rows singular
+without fixing an algebraic unknown), and for an overdetermined system.
+"""
+function _initStatesToFix(incidence::Vector{Vector{Int}}, nVars::Int, stateCols::Vector{Int})::Union{Nothing, Vector{Int}}
+  local nMissing = nVars - length(incidence)
+  nMissing < 0 && return nothing
+  nMissing == 0 && return Int[]
+  isempty(stateCols) && return nothing
+  local rows = vcat([stateCols for _ in 1:nMissing], incidence)
+  local assign = _maximumMatching(rows, nVars)
+  any(==(0), assign) && return nothing
+  return sort!([c for c in 1:nVars if assign[c] <= nMissing])
+end
+
+"""
+    _maximumMatching(rows, n) -> Vector{Int}
+
+A maximum matching of `rows` (each the columns `1:n` it reads) to the columns: `assign[c]`, the row
+column `c` is matched to, 0 for none (Kuhn's augmenting paths, rows in order). The search keeps its
+path on explicit stacks: a recursive one can overflow the stack on a large system, which ends the
+process on this platform.
+"""
+function _maximumMatching(rows::Vector{Vector{Int}}, n::Int)::Vector{Int}
+  local assign = zeros(Int, n)
+  local visited = falses(n)
+  local rowStack = Int[]
+  local posStack = Int[]
+  local colStack = Int[]
+  for r in eachindex(rows)
+    local direct = findfirst(c -> assign[c] == 0, rows[r])
+    if direct !== nothing
+      assign[rows[r][direct]] = r
+      continue
+    end
+    fill!(visited, false)
+    empty!(rowStack); empty!(posStack); empty!(colStack)
+    push!(rowStack, r); push!(posStack, 0)
+    while !isempty(rowStack)
+      local row = rowStack[end]
+      local pos = posStack[end] + 1
+      if pos > length(rows[row])
+        #= exhausted: back to the row whose column led here =#
+        pop!(rowStack); pop!(posStack)
+        isempty(colStack) || pop!(colStack)
+        continue
+      end
+      posStack[end] = pos
+      local c = rows[row][pos]
+      visited[c] && continue
+      visited[c] = true
+      push!(colStack, c)
+      if assign[c] == 0
+        #= an augmenting path: each row on it takes the column it chose =#
+        for d in eachindex(colStack)
+          assign[colStack[d]] = rowStack[d]
+        end
+        break
+      end
+      push!(rowStack, assign[c]); push!(posStack, 0)
+    end
+  end
+  return assign
+end
+
+"""
+    _initIncidence(rhsFunc, p_vec, u0, eq_idx, targets, extraRes, vars, sparsity) -> Vector{Vector{Int}}
+
+The unknowns (positions in `vars`) each initialization row reads: a right-hand side's row (`eq_idx`)
+by the right-hand side's Jacobian structure `sparsity` when known, the initialization-equation rows
+(`extraRes`) and the rest by finite differences, at the entry point and at a point near it (a factor
+that is 0 there, a current at its start value 0, hides an occurrence).
+"""
+function _initIncidence(rhsFunc::F, p_vec::Vector{Float64}, u0::Vector{Float64}, eq_idx::Vector{Int},
+                        targets::Vector{Float64}, extraRes, vars::Vector{Int},
+                        sparsity::Union{Nothing, Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}})::Vector{Vector{Int}} where {F}
+  local du = similar(u0)
+  rhsFunc(du, u0, p_vec, 0.0)
+  local res = _initResidualVec(du, u0, eq_idx, targets, extraRes)
+  local J = _fdInitResidualJacobian(rhsFunc, p_vec, u0, eq_idx, targets, extraRes, vars, res)
+  #= a deterministic point near the entry (the golden-ratio sequence) =#
+  local near = copy(u0)
+  for (k, j) in enumerate(vars)
+    near[j] += 1e-3 * max(1.0, abs(u0[j])) * (2 * mod(k * 0.6180339887498949, 1.0) - 1)
+  end
+  rhsFunc(du, near, p_vec, 0.0)
+  local resNear = _initResidualVec(du, near, eq_idx, targets, extraRes)
+  local Jnear = all(isfinite, resNear) ?
+    _fdInitResidualJacobian(rhsFunc, p_vec, near, eq_idx, targets, extraRes, vars, resNear) : nothing
+  local position = Dict{Int, Int}(j => k for (k, j) in enumerate(vars))
+  local structure = sparsity === nothing ? nothing : permutedims(sparsity)   # column k: the columns row k reads
+  local incidence = Vector{Vector{Int}}(undef, length(res))
+  for r in eachindex(res)
+    if structure !== nothing && r <= length(eq_idx) && eq_idx[r] <= size(structure, 2)
+      incidence[r] = sort!(Int[position[j] for j in Symbolics.SparseArrays.rowvals(structure)[Symbolics.SparseArrays.nzrange(structure, eq_idx[r])]
+                              if haskey(position, j)])
+    else
+      incidence[r] = Int[k for k in eachindex(vars)
+                         if J[r, k] != 0 || !isfinite(J[r, k]) || (Jnear !== nothing && Jnear[r, k] != 0)]
+    end
+  end
+  return incidence
+end
+
+"""
 Anchored attempt first (when a guess vector is provided), then an
 unanchored polish continuing from the stalled endpoint: the anchor term
 biases the stationary point off the residual zero when the root lies far
@@ -542,6 +693,46 @@ function _newtonStep(Js, ress, unanchored::Bool)
   return LinearAlgebra.pinv(Js) * ress
 end
 
+"""
+    stationaryPhase(norms) -> Bool
+
+Whether a phase's iterate has stopped moving: its last `INIT_STATIONARY_ITERATIONS` equilibrated
+residual norms (`norms`) agree to 1e-8 (they wander at round-off, 1e-11 to 3e-9, where the
+iterate has stalled). The remaining iterations would only repeat the Jacobian and the line
+search: MSL PrismaticConstraint's anchored phase held 0.0083998691 for 195 of its 200, Fluid's
+PumpingSystem spent 500 s of its translation so (IF97 calls that throw at every trial).
+"""
+function stationaryPhase(norms::Vector{Float64})::Bool
+  length(norms) >= INIT_STATIONARY_ITERATIONS || return false
+  local last = @view norms[end - INIT_STATIONARY_ITERATIONS + 1:end]
+  local (lo, hi) = extrema(last)
+  return hi - lo <= 1.0e-8 * max(hi, eps(Float64))
+end
+
+"The iterations over which `stationaryPhase` compares the norms."
+const INIT_STATIONARY_ITERATIONS = 10
+
+"""
+    crawlingPhase(norms) -> Bool
+
+Whether a phase has stopped making progress: its best equilibrated norm (`norms`) of the last
+`INIT_CRAWL_ITERATIONS` iterations is less than `INIT_CRAWL_FACTOR` below the best before them.
+Newton near a root gains orders of magnitude per iteration; an anchored phase wandering between
+1.5e5 and 1.7e5 (Fluid's PumpingSystem, 200 iterations from each of five entries, IF97 calls
+throwing at every trial) does not reach 1e-10 in the iterations left.
+"""
+function crawlingPhase(norms::Vector{Float64})::Bool
+  local n = length(norms)
+  n > INIT_CRAWL_ITERATIONS || return false
+  local before = minimum(@view norms[1:(n - INIT_CRAWL_ITERATIONS)])
+  local recent = minimum(@view norms[(n - INIT_CRAWL_ITERATIONS + 1):n])
+  return recent > (1 - INIT_CRAWL_FACTOR) * before
+end
+
+"The window and the relative gain of `crawlingPhase`."
+const INIT_CRAWL_ITERATIONS = 50
+const INIT_CRAWL_FACTOR = 0.01
+
 function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Float64, length(eq_idx)), maxiter=50, tol=1e-10, anchorVals=nothing, anchorWeight=1e-2, extraRes=nothing, phaseLabel::String="")
   local nVar = length(var_idx)
   local du = similar(u0)
@@ -553,10 +744,14 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
      raw residual units make both the tolerance and any line-search measure
      meaningless. Dividing each row by its entry gradient magnitude (floored
      at 1 so weak rows are never inflated) puts residuals in solve-variable
-     units, comparable across rows AND across iterates. =#
+     units, comparable across rows AND across iterates. Refreshed once, after
+     the first step, for the rows a far entry guess scaled 1e3 times too high. =#
   local rowNorm = Float64[]
   local lastNres = Float64[]
   local phiEntry = Inf
+  #= the equilibrated norms of the iterations: a phase whose iterate no longer moves (`stationaryPhase`) stops =#
+  local norms = Float64[]
+  local stationary = false
   for iter in 1:maxiter
     rhsFunc(du, u0, p_vec, 0.0)
     local res = _initResidualVec(du, u0, eq_idx, targets, extraRes)
@@ -578,6 +773,17 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
     if iter == 1
       rowNorm = OMBackend.envSwitch("OMBACKEND_INIT_ROWSCALE") ?
         [max(maximum(abs, @view J[i, :]), 1.0) for i in 1:nRows] : ones(nRows)
+    elseif iter == 2 && OMBackend.envSwitch("OMBACKEND_INIT_ROWSCALE")
+      #= A row whose entry scale came from a far guess (MSL ThreeSprings: a line force's direction
+         r/s_small = -2e9 where its length's start is 0) is equilibrated again after the first
+         step, where its scale is 1e3 times smaller: frozen, it stays weighted out and the phase
+         stalls at a floor above the tolerance. The objective's entry value with it. =#
+      local rescaled = false
+      for i in 1:nRows
+        local current = max(maximum(abs, @view J[i, :]), 1.0)
+        rowNorm[i] > 1.0e3 * current && ((rowNorm[i], rescaled) = (current, true))
+      end
+      rescaled && (phiEntry = Inf)
     end
     local norm_res = maximum(abs, res ./ rowNorm)
     traceInit && (lastNres = res ./ rowNorm)
@@ -593,6 +799,11 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
     end
     if norm_res < tol
       return true
+    end
+    push!(norms, norm_res)
+    if stationaryPhase(norms) || crawlingPhase(norms)
+      stationary = true
+      break
     end
     local Js = J ./ rowNorm
     local ress = res ./ rowNorm
@@ -640,7 +851,7 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
       return sqrt(s)
     end
     local phi0 = scaledNorm(res, u0)
-    iter == 1 && (phiEntry = phi0)
+    isinf(phiEntry) && (phiEntry = phi0)
     #= Backtracking line search: a fixed step-length clamp starves quasi-linear
        systems whose solution components are large (e.g. di/dt = V/L). Take the
        full Newton step when it reduces the objective; halve only when it does not. =#
@@ -690,7 +901,8 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
     end
   end
   if traceInit
-    local msg = "[initphase " * phaseLabel * "] FAIL maxiter exhausted"
+    local msg = "[initphase " * phaseLabel * "] FAIL " *
+                (stationary ? "no progress (stationaryPhase, crawlingPhase)" : "maxiter exhausted")
     if !isempty(lastNres)
       local order = sortperm(abs.(lastNres); rev = true)
       msg *= ", worst rows: " * join((string(order[k], "=>", round(lastNres[order[k]], sigdigits = 3))

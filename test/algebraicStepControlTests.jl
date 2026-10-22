@@ -32,6 +32,27 @@ the tolerance and projects the step ends onto the algebraic equations.
   @test projected.retcode == ReturnCode.Success
   @test residual(projected) < 1e-7                   # the step ends to 1e-6 of the tolerance
 
+  #= The domain check (the problems' isoutofdomain, see withProblemCallbacks): a step end whose
+     algebraic equations are not finite is rejected, so the solver retries smaller (MSL Spice3
+     Inverter's first step ran its output node off to 1e232 and was accepted: Rodas's error
+     estimate is 0 for algebraic unknowns); a finite one stands, however far from its equations (a
+     step past an event, which the event's re-solve fixes: MSL TwoMass). Here y overflows the
+     exponential above ~18. =#
+  local node!(du, u, p, t) = (du[1] = 0.0; v = -5e13 * t;
+                              du[2] = 1e-5 * (v^2 - u[2] * abs(u[2])) + 2e-12 * (v - u[2]) - 1e-14 * (exp((u[2] - v) / 0.025) - 1);
+                              nothing)
+  local prob3 = ODE.ODEProblem(ODE.ODEFunction(node!; mass_matrix = mm), [0.0, 0.0], (0.0, 1e-13))
+  local cbs3 = CG.withAlgebraicStepControl(nothing, prob3)
+  local domain = CG.AlgebraicDomainCheck(CG._stepControl(cbs3))
+  local integ3 = ODE.init(prob3, rodas; callback = cbs3, isoutofdomain = domain)
+  #= it keeps the right-hand side and parameters, not the integrator: the model module keeps the
+     problem, and through the integrator every model's last solution stayed (MSL Magnetic
+     ThreePhaseTransformerWithRectifier: 2.3 GB, a coverage worker's footprint past 8 GB) =#
+  @test CG._stepControl(cbs3).model === (integ3.f, integ3.p)
+  @test !domain([0.0, 10.0], nothing, 1e-15)
+  @test domain([0.0, 20.0], nothing, 1e-15)
+  @test domain([0.0, NaN], nothing, 1e-15)
+
   #= An ODE has no algebraic rows: nothing is added. Other methods (a BDF
      controls the algebraic error itself, and its history would not match a
      changed state) and fixed steps do not use it. It is no event callback. =#

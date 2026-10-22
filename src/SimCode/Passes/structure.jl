@@ -67,6 +67,28 @@ function maximumMatching(incidence::Vector{OrderedSet{String}})::Tuple{Vector{St
 end
 
 """
+    cyclicNames(deps)
+
+The names of `deps` on a cycle of what each reads (`deps[n]`, its names of `deps` counted): as observed
+equations, each solved for its name, they would have no order (foldExplicitSingleAssign,
+eliminateOutputOnlyVariables).
+"""
+function cyclicNames(deps::OrderedDict{String, OrderedSet{String}})::OrderedSet{String}
+  local names = collect(keys(deps))
+  local index = Dict{String, Int}(n => k for (k, n) in enumerate(names))
+  local g = Graphs.SimpleDiGraph(length(names))
+  for (k, n) in enumerate(names), m in deps[n]
+    local j = get(index, m, 0)
+    (j > 0 && j != k) && Graphs.add_edge!(g, k, j)
+  end
+  local cyclic = OrderedSet{String}()
+  for c in GraphAlgorithms.stronglyConnectedComponents(g)
+    length(c) > 1 && foreach(k -> push!(cyclic, names[k]), c)
+  end
+  return cyclic
+end
+
+"""
     residualComponents(simCode)
 
 The strongly connected components of the residuals and the unknown each residual is matched
