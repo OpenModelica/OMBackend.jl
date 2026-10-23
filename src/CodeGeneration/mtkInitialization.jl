@@ -383,12 +383,38 @@ The initial algorithms the early pass runs: the sections (`initial algorithm`, a
 algorithm's `when initial()`), else the other initial arms; less those reading a derivative:
 der() reads the problem, which the early pass runs before. A section reading one is refused
 (generateInitialAlgorithmEarlyFunction); the other initial arms the runtime pass runs
-(_initialDerivativeReads).
+(_initialDerivativeReads). Not the sections the runtime pass runs (_lateSections).
 """
 function _earlyInitialAlgorithms(simCode::SC.SIM_CODE)::Vector{SC.INITIAL_ALGORITHM}
-  local sections = any(ia -> ia.section, simCode.initialAlgorithms) ?
-    filter(ia -> ia.section, simCode.initialAlgorithms) : simCode.initialAlgorithms
+  local late = _lateSections(simCode)
+  local sections = any(ia -> ia.section && !(ia in late), simCode.initialAlgorithms) ?
+    filter(ia -> ia.section && !(ia in late), simCode.initialAlgorithms) : filter(ia -> !(ia in late), simCode.initialAlgorithms)
   return any(_readsDerivative, sections) ? filter(!_readsDerivative, sections) : sections
+end
+
+"""
+    _lateSections(simCode) -> Vector{SC.INITIAL_ALGORITHM}
+
+The sections of assignments only that read a variable the initialization determines (not a parameter, a String,
+a fixed start, time, or one the section assigns): the runtime pass runs them, after the initialization, with its
+values (generateInitialAlgorithmFunction). The early pass runs before it and refused them: MSL MathBoolean's
+OnDelay, `when initial() then delaySignal := u; t_next := time - 1`, its input u connected (BooleanNetwork1).
+"""
+function _lateSections(simCode::SC.SIM_CODE)::Vector{SC.INITIAL_ALGORITHM}
+  local ht = simCode.stringToSimVarHT
+  local late = SC.INITIAL_ALGORITHM[]
+  for ia in simCode.initialAlgorithms
+    (ia.section && all(st -> st isa SC.ASSIGN, ia.statements) && !_readsDerivative(ia)) || continue
+    local (lhs, rhs) = (OrderedSet{String}(), OrderedSet{String}())
+    _collectInitAlgNames!(lhs, rhs, ia)
+    local determined = name -> begin
+      (name == "time" || name in lhs || !haskey(ht, name)) && return false
+      local sv = last(ht[name])
+      return !(sv.varKind isa Union{SC.PARAMETER, SC.ARRAY_PARAMETER, SC.STRING, SC.DATA_STRUCTURE}) && !_isFixedStart(sv)
+    end
+    any(determined, rhs) && push!(late, ia)
+  end
+  return late
 end
 
 """
@@ -878,7 +904,7 @@ end
 
 Emit a `function __runInitialAlgorithm!(t0 = 0.0) ... end` whose body executes once during
 the initialization: the initial arms of the when-equations (not the sections: the early pass
-emits control-flow-correct `initialization_eqs` for their left sides). Parameter literals are
+emits control-flow-correct `initialization_eqs` for their left sides; but those of `_lateSections`). Parameter literals are
 in the bodies already (the SimCode lowering inlines them), so no module-scope parameter
 bindings are needed here. A no-op stub when the model has none.
 """
@@ -888,7 +914,8 @@ function generateInitialAlgorithmFunction(simCode::SC.SIM_CODE)::Expr
       return Dict{Any, Any}()
     end
   end
-  local whenAlgorithms = filter(ia -> !ia.section, simCode.initialAlgorithms)
+  local late = _lateSections(simCode)
+  local whenAlgorithms = filter(ia -> !ia.section || ia in late, simCode.initialAlgorithms)
   isempty(whenAlgorithms) && return noRuntimePass
   local lhsNames = OrderedSet{String}()
   local rhsNames = OrderedSet{String}()

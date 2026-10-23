@@ -42,7 +42,8 @@
    partition after the partition it samples, MLS 16.10). The partitions' variables are
    discrete; previous(x) is pre(x), hold(y) is y.
 
-   Not lowered (unsupported): solver clocks, Boolean when-clauses in a partition (MLS 16.8.1),
+   A solver clock's partition is discretized first (ExplicitEuler, ImplicitEuler: discretizedPartition).
+   Not lowered (unsupported): other solver methods, Boolean when-clauses in a partition (MLS 16.8.1),
    interval() of a sub-clock of an event clock, equations that are not assignments of one of
    the partition's variables (an algebraic loop at a tick). A periodic clock's first tick is at
    time 0, and `sample(u)` reads u at the tick, not its left limit. =#
@@ -353,6 +354,54 @@ function eventClockCondition(b::Int, c::IR.Expression, known::Set{Symbol})::Tupl
   return (lhs, IR.Variable[v], lifted)
 end
 
+"""
+    discretizedPartition(p, method, interval, newVars) -> Partition
+
+A clocked discretized continuous-time partition (a solver clock, MLS 16.8.2) as a discrete-time one: each
+`der(x)` a discrete variable its equation assigns at the tick (pushed to `newVars`), and x integrated from its
+previous tick by `method`, its start at the first tick (as omc): "ExplicitEuler" `x = previous(x) + interval() *
+previous(der(x))`, "ImplicitEuler" `x = previous(x) + interval() * der(x)` (where der(x) reads x, an algebraic
+loop at the tick: not supported). MSL Clocked's ClockedWithDiscretizedContinuousController (a PI),
+ControlledMixingUnit (an inverse plant model).
+"""
+function discretizedPartition(p::IR.Partition, method::String, interval::Union{Nothing, IR.Expression},
+                              newVars::Vector{IR.Variable})::IR.Partition
+  method in ("ExplicitEuler", "ImplicitEuler") ||
+    unsupported("a solver clock's method other than ExplicitEuler and ImplicitEuler", method)
+  interval === nothing && unsupported("a solver clock of an event clock (no interval)", method)
+  #= the states in the order of their first der(), each with its derivative variable =#
+  local states = Symbol[]
+  local derivatives = Dict{Symbol, IR.CREF}()
+  local derivativeOf = e -> begin
+    (e isa IR.CALL && builtinName(e) === :der && length(e.arguments) == 1) || return e
+    local x = e.arguments[1]
+    x isa IR.CREF || unsupported("der() of an expression in a clocked discretized partition", e)
+    return get!(derivatives, x.cref.name) do
+      push!(states, x.cref.name)
+      IR.CREF(IR.ComponentRef(Symbol("omjl_der_", x.cref.name), IR.T_REAL()), IR.T_REAL())
+    end
+  end
+  local equations = IR.Equation[p.equations...]
+  foreach(eq -> IR.mapEquation!(derivativeOf, eq), equations)
+  any(eq -> usesOperator(eq, :der), p.initialEquations) &&
+    unsupported("der() in an initial equation of a clocked discretized partition", method)
+  local firstTick = builtinCall(:firstTick, IR.Expression[], IR.T_BOOLEAN())
+  local step = builtinCall(:interval, IR.Expression[], IR.T_REAL())
+  for x in states
+    local d = derivatives[x]
+    local xRef = IR.CREF(IR.ComponentRef(x, IR.T_REAL()), IR.T_REAL())
+    local previous = e -> builtinCall(:previous, IR.Expression[e], IR.T_REAL())
+    local slope = method == "ExplicitEuler" ? previous(d) : d
+    local stepped = IR.BINARY(previous(xRef), IR.ADD, IR.BINARY(step, IR.MUL, slope, IR.T_REAL()), IR.T_REAL())
+    push!(equations, IR.SCALAR_EQUATION(xRef, IR.IF_EXPRESSION(firstTick, previous(xRef), stepped, IR.T_REAL()),
+                                        IR.T_REAL(), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
+    push!(newVars, IR.Variable(d.cref.name, IR.T_REAL(), IR.DISCRETE(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION, false,
+                               IR.NOT_CONNECTOR, IR.NO_SOURCE, :lowerClockedPartitions))
+  end
+  return IR.Partition(p.index, p.association, vcat(p.unknowns, Symbol[derivatives[x].cref.name for x in states]),
+                      equations, p.initialEquations)
+end
+
 "`hold(y)` as `y`: in the continuous system, the clocked variable's value at its last tick."
 withoutHold(e::IR.Expression)::IR.Expression =
   IR.mapExp(x -> (x isa IR.CALL && builtinName(x) === :hold && length(x.arguments) == 1) ? x.arguments[1] : x, e)
@@ -373,10 +422,12 @@ equations (the partitions' initial when-equations, an event clock's condition's)
 function lowerBaseClock(b::Int, base::IR.ClockKind, parts::Vector{IR.Partition}, known::Set{Symbol},
                         variables::IR.VariableSet)::Tuple{IR.Equation, Vector{IR.Variable}, Vector{IR.Equation}}
   local subClocks = IR.SubClock[p.association.subClock for p in parts]
-  any(c -> c.solverMethod !== nothing, subClocks) &&
-    unsupported("a clocked discretized continuous-time partition (a solver clock)", IR.toString(base))
   any(c -> c.shift < 0, subClocks) && unsupported("a sub-clock that starts before its base clock (MLS 16.5.2)", IR.toString(base))
   local interval = baseInterval(base)
+  local newVars = IR.Variable[]
+  #= the partitions of a solver clock as discrete-time ones =#
+  parts = IR.Partition[p.association.subClock.solverMethod === nothing ? p :
+                       discretizedPartition(p, p.association.subClock.solverMethod, interval, newVars) for p in parts]
   #= the base clock ticks at the sub-clocks' grid; an event clock at its events, which its
      sub-clocks count in whole ticks =#
   local grid = if interval === nothing
@@ -386,7 +437,6 @@ function lowerBaseClock(b::Int, base::IR.ClockKind, parts::Vector{IR.Partition},
   else
     reduce(gcd, vcat([c.factor for c in subClocks], [c.shift for c in subClocks]))
   end
-  local newVars = IR.Variable[]
   local extraEqs = IR.Equation[]
   local condition = if interval === nothing
     local (c, cVars, cEqs) = eventClockCondition(b, withoutHold(base.condition), known)

@@ -1427,6 +1427,16 @@ function (c::ConstTableLookupFn)(rt_idxs...)
   return c.table[resolved...]
 end
 SymbolicUtils.promote_symtype(::ConstTableLookupFn, args...) = Real
+
+"""
+A constant table lookup is piecewise constant in its indices (`_primalValue`): its derivative by each
+is 0. Without this rule the symbolic Jacobian had no derivative for the lookup and the whole
+Jacobian went to the solver's finite differences, and the event re-solves, which need the
+problem's Jacobian, to BrownFullBasicInit: MSL IMC_InverterDrive's space-vector PWM table
+(`{{true, false, false}, ...}[ka + 1, :]`), 0.65 s per switching event.
+"""
+Symbolics.derivative_rule(::ConstTableLookupFn, ::Val{N}, ::SymbolicUtils.ROArgsT{Symbolics.VartypeT}, ::Val{I}) where {N, I} =
+  Symbolics.SConst(0)
 """
 maketerm RE-INFERS shape too, not just symtype; the generic fallback yields
 Unknown, which trips `promote_shape(==, Unknown, scalar)` once the rebuilt term

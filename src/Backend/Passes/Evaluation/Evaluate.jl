@@ -150,27 +150,17 @@ evaluates (`StartValues` with `parametersOnly`: `revolute.e = {0, 0, 1}`, the re
 literal (`world.frame_b.R.w[1] = 0.0`), through the equations that then set another
 (`bar1.frame_a.R.w[1] = world.frame_b.R.w[1]`), in every equation but the one that sets it (its
 row). `known`: more variables' values (SimCode's), taken for a variable a function call defines
-(`v = f(...)`, the only equation with v on its left: a record function's output SimCode's
-interpretation finds constant, which this folding cannot evaluate; not the values SimCode infers
+(`v = f(...)` or `(c, v) = f(...)`, the only equation with v on its left: a record function's output
+SimCode's interpretation finds constant, which this folding cannot evaluate, MSL Spice3's clamp diodes'
+`(cc, m_dCap) = diodeNoBypassCode(...)` without a junction capacitance; not the values SimCode infers
 from the unreduced, singular system), kept in that equation. The equations are copies, the indices the partition's.
 """
 function withKnownValues(model::IR.Model, partition::IR.Partition;
                          known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::IR.Partition
   local values = StartValues(model.variables, model.functions; parametersOnly = true)
-  local constants = Dict{Symbol, Tuple{IR.Expression, Int}}()
   #= the values known from elsewhere (SimCode's folding: `knownValues`) of variables a function call defines (what
      this folding cannot evaluate: a record function's output), each kept in its defining equation =#
-  #= only a variable one equation has on its left: of two (a connector's `f = 0` and a body's `f = m * resolve2(...)`)
-     the function's is the equation of motion, not the variable's definition =#
-  local lefts = Dict{Symbol, Vector{Int}}()
-  for (i, eq) in enumerate(partition.equations)
-    (eq isa IR.SCALAR_EQUATION && eq.lhs isa IR.CREF && haskey(known, eq.lhs.cref.name)) &&
-      push!(get!(Vector{Int}, lefts, eq.lhs.cref.name), i)
-  end
-  for (name, is) in lefts
-    (length(is) == 1 && callsFunction(partition.equations[only(is)].rhs)) || continue
-    constants[name] = (known[name], only(is))
-  end
+  local constants = functionDefinedValues(partition, known)
   local substitute = (e::IR.Expression, i::Int) -> begin
     if e isa IR.CREF
       local c = get(constants, e.cref.name, nothing)
@@ -200,6 +190,31 @@ function withKnownValues(model::IR.Model, partition::IR.Partition;
     end
   end
   return IR.Partition(partition.index, partition.association, partition.unknowns, equations, partition.initialEquations)
+end
+
+"""
+    functionDefinedValues(partition, known) -> Dict{Symbol, Tuple{Expression, Int}}
+
+The values of `known` (SimCode's: `knownValues`) of the variables a function call defines, each with the index of
+its defining equation: `v = f(...)` or `(c, v) = f(...)`, the only equation of `partition` with v on its left (of
+two, a connector's `f = 0` and a body's `f = m * resolve2(...)`, the function's is the equation of motion, not the
+variable's definition).
+"""
+function functionDefinedValues(partition::IR.Partition, known::Dict{Symbol, IR.Expression})::Dict{Symbol, Tuple{IR.Expression, Int}}
+  local out = Dict{Symbol, Tuple{IR.Expression, Int}}()
+  isempty(known) && return out
+  local lefts = Dict{Symbol, Vector{Int}}()
+  for (i, eq) in enumerate(partition.equations)
+    eq isa IR.SCALAR_EQUATION || continue
+    for target in (eq.lhs isa IR.TUPLE ? eq.lhs.elements : IR.Expression[eq.lhs])
+      (target isa IR.CREF && haskey(known, target.cref.name)) && push!(get!(Vector{Int}, lefts, target.cref.name), i)
+    end
+  end
+  for (name, is) in lefts
+    (length(is) == 1 && callsFunction(partition.equations[only(is)].rhs)) || continue
+    out[name] = (known[name], only(is))
+  end
+  return out
 end
 
 "Whether `e` calls a function that is no built-in."

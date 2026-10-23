@@ -145,9 +145,11 @@ wrapped in a `RuntimeGeneratedFunction` for world-age safety.
 `splitInitialValues` demoted to guesses. Without these, algebraic variables
 default to 0.0, which may cause InitialFailure for DAE systems.
 
-Returns an `ODEProblem` ready for `solve()`.
+Returns an `ODEProblem` ready for `solve()`. `callbacks` is not specialized on: its type holds the generated
+module's closures (a new type per translate), and the method only passes it on; specialized, it compiled
+12-14 s again for each translate of MSL BatchPlant_StandardWater.
 """
-function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
+function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @nospecialize(callbacks);
                                allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
                                liftedDiscretes=String[],
                                freeParameters=String[],
@@ -1086,7 +1088,7 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
      lowering such a function. =#
   local gFunc = try
     local fExpr = Symbolics.build_function(exprs, states, params, iv; expression = Val{true}, cse = true)
-    _exprToRTGFunction(fExpr[1])
+    _exprToRTGFunction(_sinkBranchAssignments!(fExpr[1]))
   catch e
     OMBackend._fallback(e, :_symbolicInitializationResiduals_2, impact = :result)
     @debug "DirectRHS: could not build symbolic initialization residuals" exception = e
@@ -1160,7 +1162,7 @@ function _initialParameterAssignments(reducedSystem, states, params, iv; assigna
   isempty(keep) && return nothing
   local pFunc = try
     local fExpr = Symbolics.build_function(exprs[keep], states, params, iv; expression = Val{true}, cse = true)
-    _exprToRTGFunction(fExpr[1])
+    _exprToRTGFunction(_sinkBranchAssignments!(fExpr[1]))
   catch e
     OMBackend._fallback(e, :_initialParameterAssignments_2, impact = :result)
     @debug "DirectRHS: could not build the initial parameter assignments" exception = e
@@ -1299,7 +1301,7 @@ function _observedDerivativeTargets(reducedSystem, states, params, iv;
     local (I, J, _) = Symbolics.SparseArrays.findnz(Jw)
     local nzSym = collect(Symbolics.SparseArrays.nonzeros(Jw))
     local fExpr = Symbolics.build_function(nzSym, states, params, iv; expression = Val{true}, cse = true)
-    return (_exprToRTGFunction(_demoteWideNumericLiterals!(fExpr[2])), I, J, length(states), tgts)
+    return (_exprToRTGFunction(_sinkBranchAssignments!(_demoteWideNumericLiterals!(fExpr[2]))), I, J, length(states), tgts)
   catch e
     OMBackend._fallback(e, :_observedDerivativeTargets, impact = :result)
     @warn "DirectRHS: derivative initial equations on observed variables not differentiated; left out" exception = e
@@ -1367,7 +1369,7 @@ function _explicitTimeDerivative(exprs, states, params, iv)
     Symbolics.SparseArrays.nnz(Jt) == 0 && return _zeroTimeDerivative
     local col = Any[Jt[i, n + 1] for i in 1:length(exprs)]
     local fExpr = Symbolics.build_function(col, states, params, iv; expression = Val{true}, cse = true)
-    return _exprToRTGFunction(_demoteWideNumericLiterals!(fExpr[2]))
+    return _exprToRTGFunction(_sinkBranchAssignments!(_demoteWideNumericLiterals!(fExpr[2])))
   catch e
     OMBackend._fallback(e, :_explicitTimeDerivative)
     @debug "DirectRHS: explicit time derivative not symbolic; a finite difference instead" exception = e
@@ -1691,7 +1693,7 @@ function _buildRHSExpression(rhs_list, states, params, iv)
     local result = Symbolics.build_function(rhs_list, states, params, iv;
                                              expression=Val{true}, cse=true)
     @debug "DirectRHS: generated RHS function with CSE"
-    return _hoistExtractorCalls!(_demoteWideNumericLiterals!(result[2]))  # in-place form
+    return _hoistExtractorCalls!(_sinkBranchAssignments!(_demoteWideNumericLiterals!(result[2])))  # in-place form
   catch e
     OMBackend._fallback(e, :_buildRHSExpression)
     @warn "DirectRHS: CSE failed, using direct generation" exception=(e, catch_backtrace())
@@ -1740,7 +1742,7 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
     local nzSym = collect(Symbolics.SparseArrays.nonzeros(jacSym))
     local result = Symbolics.build_function(nzSym, states, params, iv;
                                             expression=Val{true}, cse=true)
-    local nzFunc = _exprToRTGFunction(_demoteWideNumericLiterals!(result[2]))
+    local nzFunc = _exprToRTGFunction(_sinkBranchAssignments!(_demoteWideNumericLiterals!(result[2])))
     local jacProto = similar(jacSym, Float64)
     jacProto.nzval .= 0.0
     local nnz0 = length(nzSym)
@@ -1949,6 +1951,113 @@ function _demoteWideNumericLiterals!(ex::Expr)
     ex.args[i] = _demoteWideNumericLiterals!(a)
   end
   return ex
+end
+
+"""
+    _sinkBranchAssignments!(ex) -> ex
+
+`build_function`'s code with CSE assigns every subterm before the `if` that selects an `ifelse`'s
+branch, so the branch not taken was evaluated too: a Modelica function there that fails for that
+branch's values failed the call (MSL PsychrometricData: `if x < 5e-6 then 200 else
+Medium.saturationTemperature(ps_phi[i])` at ps_phi = 0; MLS 3.6.5 evaluates the chosen branch only).
+In place, in each block: a CSE temporary that only one branch reads, directly or through the
+temporaries moved there, is assigned in the innermost branch that holds all its reads.
+"""
+function _sinkBranchAssignments!(ex::Expr)::Expr
+  local worklist = Any[ex]
+  while !isempty(worklist)
+    local e = pop!(worklist)
+    e isa Expr || continue
+    e.head === :block && _sinkBranchAssignmentsInBlock!(e)
+    append!(worklist, e.args)
+  end
+  return ex
+end
+
+"The CSE temporary (`##cse#k`) a statement assigns, or `nothing`."
+function _assignedTemporary(@nospecialize(st))::Union{Nothing, Symbol}
+  (st isa Expr && st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol) || return nothing
+  return startswith(String(st.args[1]), "##cse#") ? st.args[1] : nothing
+end
+
+"The two-branch `if` a temporary's statement assigns, or `nothing` (an `elseif` chain is not split)."
+function _assignedIf(@nospecialize(st))::Union{Nothing, Expr}
+  _assignedTemporary(st) === nothing && return nothing
+  local rhs = st.args[2]
+  return rhs isa Expr && rhs.head === :if && length(rhs.args) == 3 ? rhs : nothing
+end
+
+"The temporaries of `defined` that `e` reads, added to `out`."
+function _readTemporaries!(out::Set{Symbol}, @nospecialize(e), defined::Dict{Symbol, Int})::Set{Symbol}
+  if e isa Symbol
+    haskey(defined, e) && push!(out, e)
+  elseif e isa Expr
+    for a in e.args
+      _readTemporaries!(out, a, defined)
+    end
+  end
+  return out
+end
+
+"The longest common prefix of two branch paths."
+function _commonBranchPrefix(a::Vector{Tuple{Int, Int}}, b::Vector{Tuple{Int, Int}})::Vector{Tuple{Int, Int}}
+  local n = 0
+  while n < min(length(a), length(b)) && a[n + 1] == b[n + 1]
+    n += 1
+  end
+  return a[1:n]
+end
+
+"""
+`_sinkBranchAssignments!` in the statements of one block. From the last statement back, each
+temporary's reads are known when its assignment is reached (CSE assigns before it reads): its place
+is the common prefix of the branch paths of its reads (a path: `(statement, 2)` for a then branch,
+`(statement, 3)` for an else branch, outermost first); a statement in a branch reads in that
+branch, its own branches one level deeper.
+"""
+function _sinkBranchAssignmentsInBlock!(block::Expr)::Expr
+  local stmts = block.args
+  local defined = Dict{Symbol, Int}()
+  for (i, st) in enumerate(stmts)
+    local v = _assignedTemporary(st)
+    v === nothing || (defined[v] = i)
+  end
+  any(i -> _assignedIf(stmts[i]) !== nothing, values(defined)) || return block
+  local place = [Tuple{Int, Int}[] for _ in stmts]
+  local readAt = Dict{Symbol, Vector{Tuple{Int, Int}}}()
+  local record! = (reads::Set{Symbol}, at::Vector{Tuple{Int, Int}}) -> for s in reads
+    readAt[s] = haskey(readAt, s) ? _commonBranchPrefix(readAt[s], at) : at
+  end
+  for i in length(stmts):-1:1
+    local st = stmts[i]
+    local v = _assignedTemporary(st)
+    v === nothing || (place[i] = get(readAt, v, Tuple{Int, Int}[]))
+    local ifex = _assignedIf(st)
+    if ifex === nothing
+      record!(_readTemporaries!(Set{Symbol}(), v === nothing ? st : st.args[2], defined), place[i])
+    else
+      record!(_readTemporaries!(Set{Symbol}(), ifex.args[1], defined), place[i])
+      for k in (2, 3)
+        record!(_readTemporaries!(Set{Symbol}(), ifex.args[k], defined), vcat(place[i], [(i, k)]))
+      end
+    end
+  end
+  local moved = Dict{Tuple{Int, Int}, Vector{Int}}()
+  for i in eachindex(stmts)
+    isempty(place[i]) || push!(get!(moved, last(place[i]), Int[]), i)
+  end
+  isempty(moved) && return block
+  local branchStatements = b -> b isa Expr && b.head === :block ? b.args : Any[b]
+  function rebuild(i::Int)
+    local st = stmts[i]
+    local ifex = _assignedIf(st)
+    (ifex === nothing || !(haskey(moved, (i, 2)) || haskey(moved, (i, 3)))) && return st
+    local branches = [Expr(:block, Any[rebuild(j) for j in get(moved, (i, k), Int[])]..., branchStatements(ifex.args[k])...)
+                      for k in (2, 3)]
+    return Expr(:(=), st.args[1], Expr(:if, ifex.args[1], branches...))
+  end
+  block.args = Any[rebuild(i) for i in eachindex(stmts) if isempty(place[i])]
+  return block
 end
 
 

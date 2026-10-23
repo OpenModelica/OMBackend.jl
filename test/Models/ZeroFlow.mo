@@ -102,4 +102,16 @@ package ZeroFlow "Zero flow and zero speed: MSL FluidHeatFlow WaterPump's compon
     der(E) = tau;
   end SmoothQuadraticLoad;
 
+  model FlatZeroFlow "two quadratic losses in series from 110 kPa to 100 kPa, the flow from its start 0, where both are flat to the initialization's finite differences (MSL MomentumBalanceFittings): 3 m_flow^2 = 1e4"
+    parameter Real pa = 110000;
+    parameter Real pb = 100000;
+    Real m_flow(start = 0);
+    Real p(start = 5e6);
+    Real V(start = 0, fixed = true);
+  equation
+    pa - p = m_flow * abs(m_flow);
+    p - pb = 2 * m_flow * abs(m_flow);
+    der(V) = m_flow;
+  end FlatZeroFlow;
+
 end ZeroFlow;

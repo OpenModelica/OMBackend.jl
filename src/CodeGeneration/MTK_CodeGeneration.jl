@@ -545,10 +545,10 @@ struct IfEquationComponent
      start-value map, merged as soft guesses so guarded denominators do not
      start at 0/0 in the DAE init. =#
   relayGuesses         :: Vector{Expr}
-  #= (ifCond, crossing function, scale) of each branch whose event has a
+  #= (ifCond, crossing function, scale, whether the condition reads time) of each branch whose event has a
      hysteresis: checked after every step by the event iteration
      (withRelationRefresh). =#
-  relations            :: Vector{Tuple{Symbol, Any, Any}}
+  relations            :: Vector{Tuple{Symbol, Any, Any, Bool}}
   #= (ifCond, observed names, observed crossing functions, observed -> Bool)
      of the relations whose literal value the initialization settles
      (_settleInitialRelations!): the t0 value, from the solved state. =#
@@ -557,7 +557,7 @@ end
 IfEquationComponent(events, conditionalEquations, conditionVariables, conditionNameAndIV, pureTimeEvents,
                     relayGuesses) =
   IfEquationComponent(events, conditionalEquations, conditionVariables, conditionNameAndIV, pureTimeEvents,
-                      relayGuesses, Tuple{Symbol, Any, Any}[], Expr[])
+                      relayGuesses, Tuple{Symbol, Any, Any, Bool}[], Expr[])
 
 #= The hysteresis parameter H of the event crossing functions (set per solve
    from its reltol, as OpenModelica's tolZC = 1e-4 * relTol). =#
@@ -1135,7 +1135,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
      form relays: the declared state keeps its name =#
   local _relayKeep = simCode.indexReduced ?
     union(_condDiscretes, OrderedSet{Symbol}(Symbol(s) for s in stateVariables if !startswith(string(s), "\$"))) : _condDiscretes
-  local (_ifEqRelay_eqs, _ifEqRelay_aliases) = eliminateIfEqRelays(EQUATIONS; preferKeep = _relayKeep, paramSyms = _paramSyms)
+  #= Not a representative: a discrete the demotion made algebraic. Of a pure alias of two discretes it demoted one;
+     kept as the relay's representative it had no equation left and its held partner was substituted away (MSL
+     ControlledTanks' radio buttons: `pre(shut.reset[2]) = false` then read no variable of the system). =#
+  local _demoted = Set{Symbol}(Symbol(d) for d in _demotionPlan.toDemote)
+  local (_ifEqRelay_eqs, _ifEqRelay_aliases) = eliminateIfEqRelays(EQUATIONS; preferKeep = _relayKeep, paramSyms = _paramSyms,
+                                                                   avoid = _demoted)
   EQUATIONS = _ifEqRelay_eqs
   #= after OMBackend's index reduction, the fixed starts of the relay members dropped here hold on
      their representative (a dummy derivative's start: MSL DoublePendulumInitTip's v_rel_a_1) =#

@@ -440,10 +440,14 @@ The parameters nothing reads dropped: no residual, initial equation, if- or when
 assert, eliminated equation, alias, attribute, binding, function body, initial algorithm;
 not one the observed filter asks for, a Complex variable's part, an element of an external
 object's array or of an array read by a subscript that is no literal, a tunable one. Nothing
-for a model with modes or translated again at its structural changes.
+for a model with modes or translated again at its structural changes, nor for one without
+continuous equations, whose parameters are its result (MSL readRealParameterModel: three
+parameters read from a file and a when-equation that prints; its reference compares them, the
+solution had none).
 """
 function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
   (hasSubModels(simCode) || hasFrontendModel(simCode)) && return simCode
+  (isempty(simCode.residualEquations) && isempty(simCode.ifEquations)) && return simCode
   local ht = simCode.stringToSimVarHT
   local read = OrderedSet{String}()
   foreach(eq -> crefNames!(read, eq.exp), simCode.residualEquations)

@@ -84,7 +84,7 @@ equationText(eq::IR.Equation; n::Int = 100)::String = first(replace(string(eq), 
 
 What index reduction does to `model` (OMJLIR before index reduction: the passes run `through`
 the last one; `OMBackend.explainIndexReduction` from a flat model) and why: planned as
-`reduceIndex!` plans (the aliases substituted, again with the simulation code's known values
+`reduceIndex!` plans (its hidden linear constraints exposed, the aliases substituted, again with the simulation code's known values
 where reduced), the model left as it is.
 """
 function explain(model::IR.Model)::Explanation
@@ -93,6 +93,7 @@ function explain(model::IR.Model)::Explanation
   local partition = model.continuous[1]
   local trace = BlockTrace[]
   local aliases = nothing
+  local exposed = exposeLinearConstraints!(model, partition)
   try
     #= planned as `reduceIndex!` plans: as written, where reduced with the aliases substituted (`aliasPlan`) =#
     local p = try
@@ -108,6 +109,7 @@ function explain(model::IR.Model)::Explanation
   finally
     #= the model restored =#
     aliases === nothing || undoAliases!(model, partition, aliases)
+    undoLinearConstraints!(partition, exposed)
   end
 end
 

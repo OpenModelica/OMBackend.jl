@@ -378,6 +378,10 @@ event condition, whose name the generated callback reads from the state
 vector). When a component contains such a symbol it is forced to be the
 root so it is never substituted away.
 
+`avoid` names symbols that must not be a representative (the discretes the
+demotion made algebraic: once the relay is gone they have no equation); a
+component whose representative is one is re-rooted onto a member that is not.
+
 `paramSyms` names symbols that are parameters (no module-global symbolic
 binding). A relay touching one is kept as an equation rather than
 eliminated: collapsing a bound variable onto a parameter strands the
@@ -386,7 +390,8 @@ variable to the parameter correctly on its own.
 """
 function eliminateIfEqRelays(equations::Vector{Expr};
                              preferKeep::OrderedSet{Symbol} = OrderedSet{Symbol}(),
-                             paramSyms::OrderedSet{Symbol} = OrderedSet{Symbol}())
+                             paramSyms::OrderedSet{Symbol} = OrderedSet{Symbol}(),
+                             avoid::AbstractSet{Symbol} = Set{Symbol}())
     #= Union-find (not a plain map): a variable that is the leaf-alias LHS of two
        relays (`A~B`, `A~C`) means A≡B≡C; a `raw[k]=v` map overwrites and drops one
        side, disconnecting it from its definer. Union-find keeps the component intact. =#
@@ -437,6 +442,25 @@ function eliminateIfEqRelays(equations::Vector{Expr};
             parent[keep] = keep
         end
     end
+    #= A component whose representative is to be avoided and that no other equation reads (it has none once the
+       relays are gone; one another equation defines is a representative as before: MSL Digital's auxiliaries)
+       re-rooted onto its first other member (by name) that is not. =#
+    if !isempty(avoid)
+        local others = Set{Symbol}()
+        foreach(eq -> _collectSymbols!(others, eq), non_relay)
+        local members = Dict{Symbol,Vector{Symbol}}()
+        for k in keys(parent)
+            push!(get!(Vector{Symbol}, members, getroot(k)), k)
+        end
+        for (r, ms) in members
+            (r in avoid && !(r in others)) || continue
+            local i = findfirst(m -> !(m in avoid), sort(ms; by = string))
+            i === nothing && continue
+            local keep = sort(ms; by = string)[i]
+            parent[r] = keep
+            parent[keep] = keep
+        end
+    end
     local alias = Dict{Symbol,Symbol}()
     for k in keys(parent)
         local r = getroot(k)
@@ -444,6 +468,16 @@ function eliminateIfEqRelays(equations::Vector{Expr};
     end
     resolved = [_substSyms(eq, alias) for eq in non_relay]
     return (resolved, alias)
+end
+
+"The symbols an expression reads, added to `out`."
+function _collectSymbols!(out::Set{Symbol}, @nospecialize(ex))::Set{Symbol}
+    if ex isa Symbol
+        push!(out, ex)
+    elseif ex isa Expr
+        foreach(a -> _collectSymbols!(out, a), ex.args)
+    end
+    return out
 end
 
 # Extract symbol from any simple leaf (plain Symbol or sym(t) call).

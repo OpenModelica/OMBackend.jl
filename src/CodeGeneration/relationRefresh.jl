@@ -124,12 +124,13 @@ struct IfRelations
   scale::Vector{Any}                   # per relation: integrator -> scale
   hysteresis::Any                      # integrator -> H
   compiled::Vector{Float64}            # the ifConds the initialization used
+  timed::Vector{Bool}                  # per relation: its condition reads time (`_bandEdgeRule`)
 end
 
 Base.length(r::IfRelations) = length(r.crossing)
 
 """
-The relations `entries` = `(ifCond, crossing function, scale)` of
+The relations `entries` = `(ifCond, crossing function, scale, reads time)` of
 `problem`; nothing when there are none or they cannot be read.
 """
 function _ifRelations(problem, hSym::Symbol, entries::Vector)
@@ -141,7 +142,8 @@ function _ifRelations(problem, hSym::Symbol, entries::Vector)
     return IfRelations(buffers, Any[SII.setp(problem, s) for s in syms],
                        Any[_valueGetter(problem, e[2]) for e in entries],
                        Any[_valueGetter(problem, e[3]) for e in entries],
-                       SII.getp(problem, hSym), _bufferValues(buffers, problem))
+                       SII.getp(problem, hSym), _bufferValues(buffers, problem),
+                       Bool[length(e) >= 4 && e[4] === true for e in entries])
   catch err
     OMBackend._fallback(err, :ifRelationsFromProblem; impact = :result)
     @warn "[events] the if-equation relations cannot be read from the problem; they are not iterated" exception = err
@@ -155,8 +157,30 @@ A copy: setting a buffer changes the parameters the getter reads.
 _bufferValues(buffers, integrator) = Float64[v for v in buffers(integrator)]
 
 function _ruled(r::IfRelations, integrator, k::Int, old::Bool)
-  local eps = r.hysteresis(integrator) * r.scale[k](integrator)
-  return _hysteresisRule(r.crossing[k](integrator), eps, old)
+  local scale = r.scale[k](integrator)
+  local eps = r.hysteresis(integrator) * scale
+  local zc = r.crossing[k](integrator)
+  return r.timed[k] ? _bandEdgeRule(zc, eps, scale, old) : _hysteresisRule(zc, eps, old)
+end
+
+"""
+    _bandEdgeRule(zc, eps, scale, old) -> Bool
+
+The hysteresis rule (`_hysteresisRule`) with the band's edge, to rounding (`_onBoundary`), as crossed: for a
+relation that reads time. Its callback locates a crossing where its shifted function is zero, the band's edge;
+a relation of the same crossing function (a twin) is at its own edge there, to rounding, and its callback does
+not fire: OrdinaryDiffEq takes a component near zero at the last event as crossed. By the band it stayed: MSL
+Blocks.Sources.Trapezoid without width, `time < T_start + T_rising` and `time < T_start + T_width`, held
+SignalPWM's triangle at its peak for the rest of a period (HBridge_DC_Drive missed two switchings). Not for a
+relation of the state: two equal pipes' flows at their laminar limit (MSL FluidHeatFlow TwoMass) are crossed
+by their own callbacks, and taken as crossed in the sweep the run became Unstable.
+"""
+function _bandEdgeRule(zc::Real, eps::Real, scale::Real, old::Bool)::Bool
+  #= only an edge apart from the relation's own boundary: at zc = 0 (a time event exactly on its threshold,
+     MSL Spice3's pulse sources) the literal decides, `<` or `>=`, which the band keeps and this rule does not
+     know (flipped there, the start's event iteration ended the solve: CompareLosslessLines, Spice3 Inverter) =#
+  local atEdge = _onBoundary(old ? zc - eps : zc + eps, scale) && !_onBoundary(zc, scale)
+  return atEdge ? !old : _hysteresisRule(zc, eps, old)
 end
 
 function _inconsistent(r::IfRelations, integrator)
@@ -485,6 +509,8 @@ struct EventIteration
   #= The last instant iterated and how often in a row (the integrator stuck
      at one time: `_iterateInstant!`). =#
   instant::Base.RefValue{Tuple{Float64, Int}}
+  #= The instant of the last degenerate restart and how many in a row (`_restartStepSize!`). =#
+  stall::Base.RefValue{Tuple{Float64, Int}}
 end
 
 """
@@ -633,8 +659,33 @@ function _autoDtReset!(integrator)
   return nothing
 end
 
-_restartStepSize!(integrator) = nothing
-function _restartStepSize!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator)
+"""
+The length of an event's instant at `t`: crossings closer than this coincide (`_TIME_EVENT_AHEAD`).
+"""
+_instantLength(t::Real) = _TIME_EVENT_AHEAD * (1 + abs(t))
+
+"""
+Steps of at most this many ulps of t are degenerate (`_restartStepSize!`).
+"""
+const _DEGENERATE_STEP_ULPS = 8
+
+_restartStepSize!(integrator, stall::Base.RefValue{Tuple{Float64, Int}}) = nothing
+
+"""
+    _restartStepSize!(integrator, stall)
+
+The next step after an event that changed the equations (see above). A degenerate step (`_DEGENERATE_STEP_ULPS`)
+that comes again within the same instant (`_instantLength`, at most the restart's cap; `stall` holds the instant's
+start and the count) restarts at the instant's length: one an ulp long, its Rosenbrock matrix's algebraic rows were
+singular to rounding and their values off by more than the hysteresis, so the callback located the next crossing
+an ulp later, and the step after that again (MSL ThyristorBridge2Pulse_DC_Drive: steps of 1 to 5 ulps where the
+diagonal thyristors commutate, 1.5 million of them over 7e-11 s; SimpleTriacCircuit: zero steps at one time; both
+MaxIters). A single one stays (MSL Spice3 Inverter, a span of 1e-11 s, is Unstable with its zero steps restarted),
+and so do longer short steps (SMPM_Braking's diode commutates in steps of 19 to 51 ulps and leaves them 4e-12 s on;
+restarted at an instant's length, its crossing was located 5.7e-15 s into every step).
+"""
+function _restartStepSize!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator,
+                           stall::Base.RefValue{Tuple{Float64, Int}})
   local prob = integrator.sol.prob
   prob isa ModelingToolkit.SciMLBase.AbstractODEProblem || return nothing
   local mm = integrator.f.mass_matrix
@@ -643,7 +694,15 @@ function _restartStepSize!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEInte
     return nothing
   end
   local span = abs(prob.tspan[2] - prob.tspan[1])
-  local dt = min(abs(integrator.dt), 1.0e-6 * (isfinite(span) ? span : 1.0))
+  local cap = 1.0e-6 * (isfinite(span) ? span : 1.0)
+  local dt = min(abs(integrator.dt), cap)
+  local t = Float64(integrator.t)
+  if dt <= _DEGENERATE_STEP_ULPS * eps(t)
+    local (start, count) = stall[]
+    local window = min(_instantLength(start), cap)
+    stall[] = start <= t <= start + window ? (start, count + 1) : (t, 1)
+    last(stall[]) > 1 && (dt = min(_instantLength(t), cap))
+  end
   integrator.dt = integrator.tdir * dt
   integrator.dtpropose = integrator.dt
   return nothing
@@ -721,7 +780,7 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
       continue
     end
     if !changed
-      n - forced > 1 && _restartStepSize!(integrator)
+      n - forced > 1 && _restartStepSize!(integrator, e.stall)
       #= Settled: the discrete whens' change()/edge() memory takes the
          values (pre() at the next event); none of them holds here. =#
       foreach(d -> _follow!(d, integrator), e.discreteWhens)
@@ -897,7 +956,7 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
             sum((length(c.rel) + length(c.members) for c in clusters); init = 0)
   local reinit = any(c -> c.table, clusters) ? tableClusterInitAlg() : nothing
   local e = EventIteration(ifRelations, relationWhens, clusters, discreteWhens, _eventIterationLimit(n), reinit,
-                           Ref((NaN, 0)))
+                           Ref((NaN, 0)), Ref((NaN, 0)))
   local pending = Ref(false)
   kept = Any[cb isa DiffEqBase.DiscreteCallback ? _markingPending(cb, pending) : cb for cb in kept]
   local cb = DiffEqBase.DiscreteCallback((u, t, integrator) -> pending[] || _needsIteration(e, integrator),

@@ -102,13 +102,14 @@ mutable struct DiscreteCluster
   memberIndex::Vector{Int}   # each member's position in u; 0 when it is not an unknown
   rel::Vector{Bool}          # the relation buffers
   crossed::Vector{Bool}      # the relations whose crossing the callback located, until the next update
+  locatedAt::Vector{Float64} # per relation the time of its last located flip (`_update!`)
 end
 
 DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled = true,
                 eventOnly = fill(false, length(strict))) =
   DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled, eventOnly,
                   nothing, nothing, zeros(2 * length(strict)), Int[], fill(false, length(strict)),
-                  fill(false, length(strict)))
+                  fill(false, length(strict)), fill(NaN, length(strict)))
 
 #= SciMLBase 3 renamed u_modified! (now deprecated) to derivative_discontinuity!. =#
 const _derivativeDiscontinuity! = isdefined(ModelingToolkit.SciMLBase, :derivative_discontinuity!) ?
@@ -225,15 +226,26 @@ relation `<=` or `>=` whose crossing function is zero at the event, to
 rounding (`_onBoundary`), holds (literally, MLS 8.5): MSL SimpleGearShift's
 brake normal force ramps to exactly 0 at a time event, and `free = fn <= 0`
 stayed false (the hysteresis asks for zc <= -eps), the brake sliding forward
-without a force.
+without a force. A relation whose crossing function is exactly zero takes its
+literal value: MSL ThyristorBridge2mPulse_DC_Drive's
+`fire_n = gainNegative.y > replicator.y` read `0 > 0` after the timer reset
+and stayed true in the band, firing the thyristors at the wrong time. Only
+exactly: the algebraic solve leaves a commutating thyristor's current at
++-1e-15, and the literal of its sign flipped at every sweep. Not where the
+callback located it at this instant: a locked brake's `w < 0` was located at
+the band's edge, the new mode's solve put w at exactly 0, and the literal
+flipped it back, every 2e-12 s (MSL Rotational HeatLosses: MaxIters).
 """
 function _update!(c::DiscreteCluster, integrator)
   local zs = _eventCrossingValues!(c, integrator)
   local H = _hysteresisFromTolerance(integrator)
   local changed = false
+  local t = Float64(integrator.t)
   for k in eachindex(c.rel)
-    local new = c.crossed[k] ? !c.rel[k] : _ruled(c, zs, k, H, c.rel[k])
+    local new = iszero(zs[2k - 1]) && c.locatedAt[k] != t ? _literal(zs, k, c.strict[k]) :
+                c.crossed[k] ? !c.rel[k] : _ruled(c, zs, k, H, c.rel[k])
     (!new && !c.rel[k] && !c.strict[k] && _onBoundary(zs[2k - 1], zs[2k])) && (new = true)
+    c.crossed[k] && new != c.rel[k] && (c.locatedAt[k] = t)
     c.crossed[k] = false
     new == c.rel[k] && continue
     c.rel[k] = new
@@ -251,6 +263,7 @@ function _literalBuffers!(c::DiscreteCluster, integrator)
     c.rel[k] = _literal(zs, k, c.strict[k])
   end
   fill!(c.crossed, false)
+  fill!(c.locatedAt, NaN)
   return nothing
 end
 

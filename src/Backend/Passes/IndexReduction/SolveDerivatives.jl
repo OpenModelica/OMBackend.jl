@@ -142,7 +142,7 @@ end
 const ZERO_PIVOT = 1e-12
 
 """
-    derivativeEdges(model, partition, unknowns, functions, known, start) -> Dict{Symbol, Vector{DerivativeEdge}}
+    derivativeEdges(model, partition, unknowns, functions, known, start; simValues) -> Dict{Symbol, Vector{DerivativeEdge}}
 
 For each derivative unknown the equations that can determine it: those reading it linearly (a
 partial derivative that does not read it, not 0); an if-equation reading it as one with a
@@ -157,11 +157,15 @@ edge, a division by 0 at the initialization). A
 coefficient 0 by its form (`isZeroConstant`, in a form the folding misses: MultiBody's
 `R.T[1,1] = from_Q(Q, angularVelocity2(Q, der(Q)))[1][1]` reads `der(Q)` only in the record's
 other field) is no edge, nor a piecewise one 0 in a branch that reads unknowns (`isPiecewise`: MSL Media's
-smooth state transition, 1 in one branch and 0 in another).
+smooth state transition, 1 in one branch and 0 in another), nor one 0 or not finite with `simValues` (the
+simulation code's values of the variables a function call defines, `functionDefinedValues`) for the
+variables it reads: MSL Spice3's diodes without a junction capacitance, `icap = m_dCap * der(v)` with
+`(cc, m_dCap) = diodeNoBypassCode(...)` 0, solved for der(v), divided by 0.
 """
 function derivativeEdges(model::IR.Model, partition::IR.Partition, unknowns::Set{Symbol},
                          functions::Dict{Symbol, IR.ModelicaFunction}, known::StartValues,
-                         start::StartValues)::Dict{Symbol, Vector{DerivativeEdge}}
+                         start::StartValues;
+                         simValues::Dict{Symbol, Tuple{IR.Expression, Int}} = Dict{Symbol, Tuple{IR.Expression, Int}}())::Dict{Symbol, Vector{DerivativeEdge}}
   local edges = Dict{Symbol, Vector{DerivativeEdge}}(d => DerivativeEdge[] for d in unknowns)
   for (i, eq) in enumerate(partition.equations)
     (isDerivativeLink(eq) || !(eq isa Union{IR.SCALAR_EQUATION, IR.IF_EQUATION}) || readsHomotopy(eq)) && continue
@@ -185,6 +189,11 @@ function derivativeEdges(model::IR.Model, partition::IR.Partition, unknowns::Set
         continue
       end
       isPiecewise(c) && continue
+      if !isempty(simValues)
+        local withValues = IR.mapExp(x -> (x isa IR.CREF && haskey(simValues, x.cref.name)) ? first(simValues[x.cref.name]) : x, c)
+        local byValues = readsNoUnknown(withValues, model.variables) ? evaluate(withValues, known) : nothing
+        (byValues !== nothing && (byValues == 0 || !isfinite(byValues))) && continue
+      end
       local atStart = evaluate(c, start)
       local given = atStart !== nothing && isfinite(atStart) && readsGivenStarts(c, model.variables)
       (given && abs(atStart) <= ZERO_PIVOT) && continue
@@ -382,7 +391,7 @@ function solveThroughSolved!(solved::Dict{Symbol, IR.Expression}, equationOf::Di
 end
 
 """
-    solveDerivatives!(model, partition) -> Vector{Symbol}
+    solveDerivatives!(model, partition; known) -> Vector{Symbol}
 
 The derivative unknowns of a reduced partition solved for and substituted: each assigned an
 equation that determines it (`matchDerivatives`), that equation solved for it (`d = -r0 / c`,
@@ -392,16 +401,19 @@ value substituted into the other equations (the state's link, `\$STATEDER.x = ..
 derivative then occurs only in its own equation and the code generators compute it from the
 others: the unknowns an algebraic loop keeps are the model's (the diodes' `icap`, under the
 integrator's error control), not the derivatives (left out of it). An unknown an if-equation
-determines stays, so do derivatives in a cycle (`resolvedValues`). The unknowns so solved for,
-in order.
+determines stays, so do derivatives in a cycle (`resolvedValues`). `known`: the simulation code's
+values the plan was made with (`Plan`'s), of which those of variables a function call defines
+evaluate the coefficients (`derivativeEdges`). The unknowns so solved for, in order.
 """
-function solveDerivatives!(model::IR.Model, partition::IR.Partition)::Vector{Symbol}
+function solveDerivatives!(model::IR.Model, partition::IR.Partition;
+                           known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::Vector{Symbol}
   local unknowns = Set{Symbol}(v.name for v in model.variables if isDerivativeUnknown(v))
   isempty(unknowns) && return Symbol[]
   local functions = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
-  local known = StartValues(model.variables, model.functions; parametersOnly = true)
+  local parameters = StartValues(model.variables, model.functions; parametersOnly = true)
   local start = StartValues(model.variables, model.functions; equations = vcat(partition.equations, partition.initialEquations))
-  local edges = derivativeEdges(model, partition, unknowns, functions, known, start)
+  local edges = derivativeEdges(model, partition, unknowns, functions, parameters, start;
+                                simValues = functionDefinedValues(partition, known))
   local matched = matchDerivatives(edges)
   local solved = Dict{Symbol, IR.Expression}()
   local equationOf = Dict{Symbol, Int}()

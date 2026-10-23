@@ -60,6 +60,17 @@ _zfResiduals(sc) = [sprint(show, r.exp) for r in sc.residualEquations]
     @test OMBackend.getVariableValues(sol, "dp")[end] == 0
   end
 
+  @testset "the initialization from a flow guessed at 0, where the losses are flat" begin
+    #= the flow's Jacobian column 0 at its guess: Newton could not move it, and the pressure took the loop's
+       mismatch (MomentumBalanceFittings: 3333 Pa in three rows, the phases stalled); nudged to 1 =#
+    local (fm, functions) = _zfFlat("FlatZeroFlow")
+    OMBackend.translate(fm; functionList = functions)
+    local sol = OMBackend.simulateModel(OMBackend.canonicalName("ZeroFlow.FlatZeroFlow"); tspan = (0.0, 1.0))
+    @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
+    @test OMBackend.getVariableValues(sol, "m_flow")[1] ≈ sqrt(1e4 / 3) rtol = 1e-6
+    @test OMBackend.getVariableValues(sol, "p")[1] ≈ 110000 - 1e4 / 3 rtol = 1e-9
+  end
+
   @testset "smooth(0, ...) with its event, smooth(1, ...) without" begin
     #= order 0, actualStream: the flow's zero an event (as noEvent, MSL InverseParameterization's pump left IF97's
        range); E(1) = int_0^0.5 (0.5 - t)(1 + t) dt + int_0.5^1 2 (0.5 - t) dt = 7/48 - 12/48 =#

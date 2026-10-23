@@ -395,6 +395,33 @@ import .ExampleModels
   #= ── 20l. Observed equations without a cycle ── =#
   include("observedCycleTests.jl")
 
+  #= ── 20m. Parameters as a model's result; external String outputs ── =#
+  include("parameterResultTests.jl")
+
+  #= ── 20n. An if-expression's branch not taken is not evaluated ── =#
+  include("lazyBranchTests.jl")
+
+  #= ── 20o. Known values of a function's tuple output in index reduction ── =#
+  include("tupleKnownValueTests.jl")
+
+  #= ── 20p. Clocked discretized continuous-time partitions (solver clocks) ── =#
+  include("solverClockTests.jl")
+
+  #= ── 20q. sample() in a discrete cluster; an initial section after the initialization ── =#
+  include("sampleClusterTests.jl")
+
+  #= ── 20r. Aliases of held discretes: the held one the relay's representative ── =#
+  include("discreteAliasTests.jl")
+
+  #= ── 20s. Hidden linear constraints among the states; a table lookup's derivative ── =#
+  include("hiddenConstraintTests.jl")
+
+  #= ── 20t. The band's edge as crossed for if-equation relations that read time ── =#
+  include("bandEdgeRuleTests.jl")
+
+  #= ── 20u. A cluster relation exactly on its boundary; the step after an event ── =#
+  include("exactZeroRelationTests.jl")
+
   #= ── 21. The backend reads the frontend's flat model only ──────── =#
   @testset "No DAE in the backend" begin
     #= The frontend's DAE, the previous backend's BDAE and its SimulationCode are gone: the

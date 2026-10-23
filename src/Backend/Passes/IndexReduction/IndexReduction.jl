@@ -87,10 +87,11 @@ import ...envSwitch
 import ..Evaluation: arithmetic, asRecord, divide, elementOf, evaluate, foldScalar, genericOffset,
        genericValues, ifThenElse, inlineBody, isLiteral, isOne, isZero, isZeroExp, literalCondition,
        literalValue, minus, negate, ONE, plus, power, real, selectElement, StartValues, subscripted,
-       times, withKnownValues, ZERO, zeroOf
+       times, withKnownValues, functionDefinedValues, ZERO, zeroOf
 const IR = OMJLIR
 
 include("Structure.jl")
+include("LinearConstraints.jl")
 include("Pantelides.jl")
 include("Differentiate.jl")
 include("Aliases.jl")

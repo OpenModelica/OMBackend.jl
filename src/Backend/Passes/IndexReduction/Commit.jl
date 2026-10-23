@@ -36,18 +36,20 @@
 #= The plan of index reduction, made without changing the model, and its commit. =#
 
 """
-    Plan(structure, differentiated, dummies, sets)
+    Plan(structure, differentiated, dummies, sets, known)
 
 What index reduction changes in a partition: the structure Pantelides' algorithm grew (its new
 derivative variables), the differentiated equations (by the index of the equation they are
 derivatives of), the dummy derivatives (the dynamic sets' candidates among them), and the dynamic
-state sets.
+state sets; the simulation code's values it was made with (`KNOWN_VALUES`; empty for a plan as
+written), which the derivatives' solve reads too (`solveDerivatives!`).
 """
 struct Plan
   structure::Structure
   differentiated::Dict{Int, Vector{IR.Equation}}
   dummies::Set{Int}
   sets::Vector{DynamicSet}
+  known::Dict{Symbol, IR.Expression}
 end
 
 """
@@ -83,28 +85,29 @@ function plan(model::IR.Model, partition::IR.Partition;
   nRows == unknownCount(s) ||
     throw(NotHandled("a continuous system of $(nRows) rows over $(unknownCount(s)) unknowns (not square as the structure reads it)"))
   local preferred = artificialStates!(s, folded, model.variables; prefer = envSwitch("OMBACKEND_PREFER_STATES"))
-  preferred == 0 && return planStructure(s, nRows, folded, model; trace)
+  preferred == 0 && return planStructure(s, nRows, folded, model; trace, known)
   try
-    return planStructure(s, nRows, folded, model; trace)
+    return planStructure(s, nRows, folded, model; trace, known)
   catch e
     e isa NotHandled || rethrow()
     #= the artificial states of StateSelect.prefer given up where their equations do not differentiate, as
        OpenModelica's sanityCheckArtificialStates (all of them here) =#
     local t = Structure(model.variables, folded, model.functions; derived)
     artificialStates!(t, folded, model.variables; prefer = false)
-    return planStructure(t, nRows, folded, model; trace)
+    return planStructure(t, nRows, folded, model; trace, known)
   end
 end
 
 """
-    planStructure(s, nRows, partition, model; trace) -> Union{Nothing, Plan}
+    planStructure(s, nRows, partition, model; trace, known) -> Union{Nothing, Plan}
 
 The plan of `plan` from the structure `s` of `partition` (its first `nRows` rows the partition's, its artificial
 states' derivatives added): Pantelides' algorithm, the differentiated equations, the dummy derivatives; `nothing`
-where nothing is differentiated.
+where nothing is differentiated. `known`: the simulation code's values the plan is made with.
 """
 function planStructure(s::Structure, nRows::Int, partition::IR.Partition, model::IR.Model;
-                       trace::Union{Nothing, Vector{BlockTrace}} = nothing)::Union{Nothing, Plan}
+                       trace::Union{Nothing, Vector{BlockTrace}} = nothing,
+                       known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::Union{Nothing, Plan}
   pantelides!(s)
   length(s.rows) == nRows && return nothing
   local differentiated = differentiatedEquations(s, partition, model.functions)
@@ -112,7 +115,7 @@ function planStructure(s::Structure, nRows::Int, partition::IR.Partition, model:
   trace === nothing || empty!(trace)
   local dummies = dummyDerivatives(s, partition, differentiated, model.variables, model.functions; sets, trace)
   foreach(set -> union!(dummies, set.candidates, set.linked...), sets)
-  return Plan(s, differentiated, dummies, sets)
+  return Plan(s, differentiated, dummies, sets, known)
 end
 
 "The names of the continuous variables of `partition` (`isContinuousVariable`)."
@@ -349,7 +352,8 @@ end
     reduceIndex!(model) -> Model
 
 Index reduction and state selection of the model's continuous partition (`OMBACKEND_INDEX_REDUCTION`,
-on by default): planned on the model as written; where reduced, again with the aliases read
+on by default): the linear constraints the structure does not show written in first
+(`exposeLinearConstraints!`, which keeps the equations' solutions); planned on the model as written; where reduced, again with the aliases read
 through their representatives (`aliasPlan`, switch `OMBACKEND_ALIAS_SUBSTITUTION`), then
 committed. A model of index 1 is left as it is. Where the plan does not handle the model (a
 model with structural modes, a construct `NotHandled` names), the model is left as it is, MTK's
@@ -361,6 +365,7 @@ function reduceIndex!(model::IR.Model)::IR.Model
     return model
   end
   local partition = model.continuous[1]
+  local exposed = exposeLinearConstraints!(model, partition)
   local (p, aliases) = try
     local written = plan(model, partition)
     written === nothing ? (nothing, nothing) : aliasPlan(model, partition, written)
@@ -371,9 +376,10 @@ function reduceIndex!(model::IR.Model)::IR.Model
   end
   p === nothing && return model
   commit!(model, partition, p)
-  local solved = envSwitch("OMBACKEND_SOLVE_DERIVATIVES") ? solveDerivatives!(model, partition) : Symbol[]
+  local solved = envSwitch("OMBACKEND_SOLVE_DERIVATIVES") ? solveDerivatives!(model, partition; known = p.known) : Symbol[]
   local sets = isempty(p.sets) ? "" : "; dynamic state sets $(join(("{" * join(String.(p.structure.variables[[p.structure.antiderivative[c] for c in vcat(set.candidates, set.linked...)]]), ", ") * "}" for set in p.sets), ", "))"
   local aliasText = (aliases === nothing || aliases.substituted == 0) ? "" : "$(aliases.substituted) aliases substituted; "
-  @info "[index reduction] $(model.name): $(aliasText)$(length(p.dummies)) dummy derivatives, states $(join(first(String.(p.structure.variables[selectedStates(p.structure, p.dummies)]), 8), ", "))$(sets)$(isempty(solved) ? "" : "; $(length(solved)) derivatives solved for")"
+  local exposedText = isempty(exposed) ? "" : "$(length(exposed)) hidden linear constraints exposed; "
+  @info "[index reduction] $(model.name): $(exposedText)$(aliasText)$(length(p.dummies)) dummy derivatives, states $(join(first(String.(p.structure.variables[selectedStates(p.structure, p.dummies)]), 8), ", "))$(sets)$(isempty(solved) ? "" : "; $(length(solved)) derivatives solved for")"
   return model
 end

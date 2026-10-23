@@ -265,6 +265,13 @@ Base.showerror(io::IO, e::_UnsupportedInAffect) =
 #= What a lowering to an affect body or a run-time check throws for a construct it does not support. =#
 const LoweringFailure = Union{UnsupportedLowering, _UnsupportedInAffect}
 
+"""
+Whether an affect body being lowered is a discrete cluster's, whose sample() calls' ticks run the event
+iteration (_discreteClusterSpecs, _withTicks): there sample() is whether the instant is a tick. Elsewhere it
+is refused (the one-pass affects keep it).
+"""
+const CLUSTER_TICKS = Base.ScopedValues.ScopedValue(false)
+
 #= Modelica event operators with no meaning inside an affect body; the generic call lowering
    would emit an undefined Julia function for them. =#
 const _AFFECT_UNSUPPORTED_BUILTINS = (:sample, :terminal, :delay, :der, :reinit, :cardinality)
@@ -433,6 +440,9 @@ function _affectCall(e::SC.CALL, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_C
   local name = e.name
   name === :initial && return initVal
   name in (:edge, :change) && return recb(e)
+  #= whether the instant is a tick, in a discrete cluster's body (its ticks run the event iteration, _withTicks) =#
+  (name === :sample && length(e.args) == 2 && CLUSTER_TICKS[]) &&
+    return :(OMBackend.CodeGeneration._isSampleInstant(integrator.t, $(rec(e.args[1])), $(rec(e.args[2]))))
   name in _AFFECT_UNSUPPORTED_BUILTINS && throw(_UnsupportedInAffect(e))
   name === :floor && return :(floor($(rec(e.args[1]))))
   name === :integer && return :(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.modelica_integer($(rec(e.args[1]))))
@@ -1012,7 +1022,7 @@ callbacks are iterated as well (none of either: a no-op). In the latest world, l
 event list: the symbolic variables are globals bound while the model is built.
 """
 function emitRelationRefresh(relations::Vector)::Expr
-  local entries = [:(($(QuoteNode(sym)), $(zc), $(scale))) for (sym, zc, scale) in relations]
+  local entries = [:(($(QuoteNode(sym)), $(zc), $(scale), $(timed))) for (sym, zc, scale, timed) in relations]
   return :(callbacks = OMBackend.CodeGeneration.withRelationRefresh(callbacks, problem,
                                                                      $(QuoteNode(ZC_HYSTERESIS)),
                                                                      Base.invokelatest(() -> Any[$(entries...)])))
@@ -1321,8 +1331,48 @@ world, like the event list: the symbolic variables are globals bound while the m
 function emitDiscreteClusters(simCode::SC.SIM_CODE)::Expr
   local specs = _discreteClusterSpecs(simCode)
   isempty(specs) && return Expr(:block)
-  return :(callbacks = OMBackend.CodeGeneration.withDiscreteClusters(callbacks, problem,
-                                                                      Base.invokelatest(() -> Any[$(specs...)])))
+  local ticks = [_sampleClock(c, simCode) for c in _clusterSampleCalls(simCode)]
+  return quote
+    $([:(callbacks = OMBackend.CodeGeneration._withTicks(callbacks, $(c[1]), $(c[2]), $(c[3]))) for c in ticks]...)
+    callbacks = OMBackend.CodeGeneration.withDiscreteClusters(callbacks, problem, Base.invokelatest(() -> Any[$(specs...)]))
+  end
+end
+
+"""
+    _clusterSampleCalls(simCode) -> Vector{SC.CALL}
+
+The sample() calls the discrete clusters' bodies read, distinct (MSL BooleanNetwork1's RSFlipFlop: its
+reset `sample(0.3, 0.5)` inlined into the flip-flop's cluster): the body reads one as whether the instant is
+a tick (_affectCall), and its ticks run the event iteration (_withTicks).
+"""
+function _clusterSampleCalls(simCode::SC.SIM_CODE)::Vector{SC.CALL}
+  local calls = SC.CALL[]
+  local seen = Set{String}()
+  for weq in simCode.whenEquations
+    _extractChangeRelations(weq.whenEquation.condition, simCode) === nothing && continue
+    local assigns = _gatherClusterAssigns(weq, simCode)
+    assigns === nothing && continue
+    for (_, rhs, _) in assigns
+      SC.anyExp(rhs) do x
+        (SC.isBuiltin(x, :sample) && length(x.args) == 2 && !(string(x) in seen)) && (push!(seen, string(x)); push!(calls, x))
+        false
+      end
+    end
+  end
+  return calls
+end
+
+"""
+    _withTicks(callbacks, interval, phase, initialTick) -> callbacks
+
+`callbacks` with a discrete callback at the ticks phase + k * interval (from the initial time; at the initial
+time where `initialTick`, and at the end), whose affect does nothing: a discrete callback marks the event
+iteration pending (withRelationRefresh), which evaluates the discrete clusters there.
+"""
+function _withTicks(callbacks, interval::Real, phase::Real, initialTick::Bool)
+  local cb = DiffEqCallbacks.PeriodicCallback(_ -> nothing, interval; phase = phase, initial_affect = initialTick,
+                                              final_affect = true, save_positions = (false, false))
+  return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(callbacks, cb)
 end
 
 """
@@ -1344,7 +1394,9 @@ function _discreteClusterSpecs(simCode::SC.SIM_CODE)::Vector{Expr}
       (rels, assigns) = _inlineReadBooleanRelations(rels, assigns, relationOf, simCode)
     end
     graph === nothing && (graph = _equationGraph(simCode))
-    push!(specs, _discreteClusterSpec(weq.whenEquation.condition, rels, assigns, simCode, table, graph))
+    push!(specs, Base.ScopedValues.with(CLUSTER_TICKS => true) do
+      _discreteClusterSpec(weq.whenEquation.condition, rels, assigns, simCode, table, graph)
+    end)
   end
   return specs
 end

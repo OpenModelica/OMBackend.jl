@@ -417,9 +417,10 @@ function generateFunctions(functions::Vector{SC.ModelicaFunction};
       #= ccall-mutable buffers for every output, the array inputs converted to their C element
          type, the protected locals the call passes (MSL realFFT_raw's work array); the Refs
          dereferenced in the return. =#
-      Expr(:block, generateExternalInputConversions(func.inputs)..., generateExternalOutputAllocations(func.outputs)...,
+      local cArguments = _externalArgumentNames(func.external)
+      Expr(:block, generateExternalInputConversions(func.inputs)..., generateExternalOutputAllocations(func.outputs, cArguments)...,
            generateLocals(func.locals)..., namespaceifyExternalFunction(_externalCallExpr(func.external)),
-           generateExternalReturnExpr(func.outputs))
+           generateExternalReturnExpr(func.outputs, cArguments))
     end
     local anonFunc = nArgs == 0 ? Expr(:->, Expr(:tuple), funcBody) :
       nArgs == 1 ? Expr(:->, inputs[1], funcBody) : Expr(:->, Expr(:tuple, inputs...), funcBody)
@@ -538,7 +539,7 @@ function _ccallElemType(t::SC.SType)
   return :Float64
 end
 
-function generateExternalOutputAllocations(outputs::Vector{SC.FunctionVariable})::Vector{Expr}
+function generateExternalOutputAllocations(outputs::Vector{SC.FunctionVariable}, cArguments::Set{Symbol})::Vector{Expr}
   local decls = Expr[]
   for v in outputs
     local s = _varSymbol(v)
@@ -548,8 +549,11 @@ function generateExternalOutputAllocations(outputs::Vector{SC.FunctionVariable})
       local unresolved = any(d -> d isa Number && d <= 0, dimExprs)
       !isempty(dimExprs) && !unresolved ? :(zeros($(jlElemType), $(dimExprs...))) : :($(jlElemType)[])
     else
+      #= a String output the call passes, a `const char**` the C function sets (ModelicaStrings_scanString):
+         a "" could not be set, and no method took it (MSL readRealParameter, a MethodError); the call's
+         result (ModelicaInternal_readLine's) is assigned =#
       v.ty isa SC.TYPE_REAL ? :(Ref{Cdouble}(0.0)) : v.ty isa Union{SC.TYPE_INTEGER, SC.TYPE_BOOL} ? :(Ref{Cint}(Cint(0))) :
-        v.ty isa SC.TYPE_STRING ? "" : 0
+        v.ty isa SC.TYPE_STRING ? (s in cArguments ? :(Ref{Cstring}(C_NULL)) : "") : 0
     end
     push!(decls, :(local $s = $alloc))
   end
@@ -578,6 +582,10 @@ function generateExternalInputConversions(inputs::Vector{SC.FunctionVariable})::
   end
   return conversions
 end
+
+"The variables an external call passes as its arguments (generateExternalOutputAllocations)."
+_externalArgumentNames(x::SC.ExternalCall)::Set{Symbol} =
+  Set{Symbol}(_externalArgument(a) for a in x.arguments if a isa SC.EXP_CREF)
 
 """
     _externalCallExpr(x)
@@ -674,13 +682,14 @@ function lapackFunction(name::Symbol)::Ptr{Cvoid}
   end
 end
 
-function generateExternalReturnExpr(outputs::Vector{SC.FunctionVariable})
+function generateExternalReturnExpr(outputs::Vector{SC.FunctionVariable}, cArguments::Set{Symbol})
   isempty(outputs) && return nothing
   local accessors = Any[]
   for v in outputs
     local s = _varSymbol(v)
     push!(accessors, _funcParamIsArray(v) ? s : v.ty isa SC.TYPE_REAL ? :($s[]) : v.ty isa SC.TYPE_INTEGER ? :(Int($s[])) :
-                     v.ty isa SC.TYPE_BOOL ? :($s[] != 0) : s)
+                     v.ty isa SC.TYPE_BOOL ? :($s[] != 0) :
+                     v.ty isa SC.TYPE_STRING && s in cArguments ? :($s[] == C_NULL ? "" : unsafe_string($s[])) : s)
   end
   return length(accessors) == 1 ? accessors[1] : Expr(:tuple, accessors...)
 end

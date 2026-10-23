@@ -354,7 +354,7 @@ function createIfEquation(stateVariables::Vector,
   local anyRelayCondBranch::Bool =
     any(b -> b.identifier != -1 && _conditionReferencesRelayTarget(b.condition, _rT0),
         ifEq.branches)
-  local relations = Tuple{Symbol, Any, Any}[]
+  local relations = Tuple{Symbol, Any, Any, Bool}[]
   local initLiterals = Expr[]
   for branch in ifEq.branches
     i += 1
@@ -464,7 +464,7 @@ function createIfEquation(stateVariables::Vector,
         scaleExpr = 1.0
       end
       local hystCond = :((($(zcHyst)) + $(ZC_HYSTERESIS) * ($(scaleExpr)) * (1 - 2 * $(thisSym))) ~ 0)
-      push!(relations, (thisSym, zcHyst, scaleExpr))
+      push!(relations, (thisSym, zcHyst, scaleExpr, _ifConditionDependsOnTime(branch.condition)))
       #= The literal value at initialization, from the solved initial state
          (the static value comes from start attributes). Not for conditions
          on other lifted if-expressions: their values are not ready then. =#

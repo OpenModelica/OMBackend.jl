@@ -265,16 +265,58 @@ function _solveCausalRows!(u0::Vector{Float64}, rhsFunc::F, p_vec::Vector{Float6
 end
 
 """
+    ErasedRHS(f)
+
+A right-hand side `f(du, u, p, t)` behind an abstract field: the initialization's phases are compiled once for every
+model (their argument of one type), not again for each generated right-hand side (a RuntimeGeneratedFunction's type is
+its code's hash). MSL CoupledClutches compiled the initialization's body 1.36 s of its 2.3 s translate. A call is one
+dynamic dispatch (~0.1 µs; a right-hand side takes 10-140 µs).
+"""
+struct ErasedRHS <: Function
+  f::Function
+end
+
+(r::ErasedRHS)(du::AbstractVector, u::AbstractVector, p, t::Real) = (r.f(du, u, p, t); nothing)
+
+"""
+    ErasedResiduals(f)
+
+Extra initialization residuals `f(du, u) -> Vector` behind an abstract field, for the same reason as `ErasedRHS`.
+"""
+struct ErasedResiduals <: Function
+  f::Function
+end
+
+(r::ErasedResiduals)(du::AbstractVector, u::AbstractVector) = r.f(du, u)
+
+_erasedRHS(f::ErasedRHS)::ErasedRHS = f
+_erasedRHS(f::Function)::ErasedRHS = ErasedRHS(f)
+_erasedResiduals(::Nothing)::Nothing = nothing
+_erasedResiduals(f::ErasedResiduals)::ErasedResiduals = f
+_erasedResiduals(f::Function)::ErasedResiduals = ErasedResiduals(f)
+
+"""
+    _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; extra_residuals, kwargs...) -> u0
+
+The initialization solve (`_solveDAEInitializationErased!`) with the right-hand side and the extra residuals
+type-erased (`ErasedRHS`, `ErasedResiduals`): only this forwarding method is compiled per model.
+"""
+function _solveDAEInitialization!(u0, @nospecialize(rhsAt0::Function), p_vec, mm; @nospecialize(extra_residuals = nothing), kwargs...)
+  return _solveDAEInitializationErased!(u0, _erasedRHS(rhsAt0), p_vec, mm; extra_residuals = _erasedResiduals(extra_residuals),
+                                        kwargs...)
+end
+
+"""
 `converged` is set false when no phase converged (the result is then the
 best effort the warning or the error below reports).
 """
-function _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals=nothing, discrete_pinned=Int[], warm::Bool=false,
+function _solveDAEInitializationErased!(u0, rhsAt0::ErasedRHS, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals::Union{Nothing, ErasedResiduals}=nothing, discrete_pinned=Int[], warm::Bool=false,
                                   converged::Base.RefValue{Bool}=Ref(true), t0::Float64=0.0,
                                   sparsity::Union{Nothing, Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}}=nothing,
                                   stateOrder::Vector{Int}=Int[])
   #= The residuals at the start time t0: the phases below evaluate at their time 0. Assigned
      once (closures below capture it: a reassigned argument would be boxed). =#
-  local rhsFunc = t0 == 0.0 ? rhsAt0 : (du, u, p, t) -> rhsAt0(du, u, p, t + t0)
+  local rhsFunc = t0 == 0.0 ? rhsAt0 : ErasedRHS((du, u, p, t) -> rhsAt0(du, u, p, t + t0))
   local n = length(u0)
   local nMM = size(mm, 1)
   local nSafe = min(n, nMM)
@@ -733,6 +775,17 @@ end
 const INIT_CRAWL_ITERATIONS = 50
 const INIT_CRAWL_FACTOR = 0.01
 
+"""
+The unknowns of a stalled phase at exactly 0 whose Jacobian column is 0, not nudged yet
+(_solveDAEPhase!): at a flat point of every row that reads them Newton cannot move them, and the
+other unknowns take the rows' mismatch. MSL MomentumBalanceFittings: suddenExpansion2.m_flow from
+its start 0, where the quadratic pressure losses are flat; the two pressures of the loop took a
+third of its 10 kPa each, and the phases stalled there. Nudged to 1, as a zero guess at a
+non-finite entry (_nudgeZeroGuesses!).
+"""
+_flatZeroUnknowns(J::AbstractMatrix{Float64}, u0::AbstractVector{Float64}, var_idx::AbstractVector{Int}, nudged::Set{Int})::Vector{Int} =
+  Int[var_idx[k] for k in eachindex(var_idx) if iszero(u0[var_idx[k]]) && !(var_idx[k] in nudged) && all(iszero, @view J[:, k])]
+
 function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Float64, length(eq_idx)), maxiter=50, tol=1e-10, anchorVals=nothing, anchorWeight=1e-2, extraRes=nothing, phaseLabel::String="")
   local nVar = length(var_idx)
   local du = similar(u0)
@@ -752,6 +805,7 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
   #= the equilibrated norms of the iterations: a phase whose iterate no longer moves (`stationaryPhase`) stops =#
   local norms = Float64[]
   local stationary = false
+  local nudged = Set{Int}()
   for iter in 1:maxiter
     rhsFunc(du, u0, p_vec, 0.0)
     local res = _initResidualVec(du, u0, eq_idx, targets, extraRes)
@@ -802,6 +856,13 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
     end
     push!(norms, norm_res)
     if stationaryPhase(norms) || crawlingPhase(norms)
+      local flat = _flatZeroUnknowns(J, u0, var_idx, nudged)
+      if !isempty(flat)
+        traceInit && println("[initphase ", phaseLabel, "] flat at 0, nudged to 1: ", flat)
+        foreach(j -> (u0[j] = 1.0; push!(nudged, j)), flat)
+        empty!(norms)
+        continue
+      end
       stationary = true
       break
     end
