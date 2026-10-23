@@ -422,6 +422,9 @@ import .ExampleModels
   #= ── 20u. A cluster relation exactly on its boundary; the step after an event ── =#
   include("exactZeroRelationTests.jl")
 
+  #= ── 20v. The model cache within its memory limit ── =#
+  include("cacheTests.jl")
+
   #= ── 21. The backend reads the frontend's flat model only ──────── =#
   @testset "No DAE in the backend" begin
     #= The frontend's DAE, the previous backend's BDAE and its SimulationCode are gone: the

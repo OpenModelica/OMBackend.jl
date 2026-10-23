@@ -333,6 +333,7 @@ function clearCaches!(; models::Bool=true,
                       empty!(IMTKGen.BUILT); empty!(IMTKGen.BUILT_HASH);
                       empty!(IMTKGen.REDUCED_SYSTEMS); empty!(IMTKGen.PRISTINE_P);
                       empty!(CodeGeneration.DAE_REINIT);
+                      Cache.clear!();
                       push!(cleared, "models"))
   implementations && (empty!(CodeGeneration.MODELICA_FUNCTION_IMPLS); empty!(CodeGeneration.MODELICA_FUNCTION_OWNERS);
                       empty!(CodeGeneration.MODEL_FUNCTIONS); empty!(CodeGeneration.COMPILED_CODE_SIZES);
@@ -355,9 +356,14 @@ simulate the model again for a new one (a translate).
 function forgetModel(modelName::String)::Nothing
   local cname = canonicalName(modelName)
   IMTKGen.forgetBuild(cname)
+  Cache.remove!(cname)
   for name in unique((modelName, cname))
     delete!(COMPILED_MODELS_MTK, name)
     delete!(COMPILED_MODELS_DEJL, name)
+    #= else a simulate by name took it for a translated array model and found no code (MSL SignConvention after
+       a coverage worker forgot it: "DE-mode model ... is not compiled") =#
+    delete!(ARRAY_ODE_MODELS, name)
+    delete!(ARRAY_REDUCED_MODELS, name)
     delete!(MODEL_RUN_DIRS, name)
   end
   return nothing
@@ -671,6 +677,7 @@ function generateMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
     local moduleAlreadyExists = isdefined(OMBackend, Symbol(modelName))
     COMPILED_MODELS_MTK[modelName] = (modelCode, moduleAlreadyExists, codeHash)
   end
+  Cache.store!(canonicalName(modelName), Cache.sizeOf(modelCode))
   return (modelName, modelCode)
 end
 
@@ -691,6 +698,8 @@ function generateIMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
   @info "[IMTK GEN] generated target code" model=modelName codeHash=codeHash
   local structural = SimCode.hasStructuralTransitions(simCode) || SimCode.hasSubModels(simCode)
   COMPILED_MODELS_MTK[modelName] = (modelCode, structural, codeHash)
+  local cname = canonicalName(modelName)
+  Cache.store!(cname, Cache.sizeOf((modelCode, get(IMTKGen.BUILT, cname, nothing), get(IMTKGen.PRISTINE_P, cname, nothing))))
   return (modelName, modelCode)
 end
 
@@ -724,6 +733,7 @@ function generateDETargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
     local moduleAlreadyExists = isdefined(OMBackend, Symbol(modelName))
     COMPILED_MODELS_DEJL[modelName] = (modelCode, moduleAlreadyExists, codeHash)
   end
+  Cache.store!(canonicalName(modelName), Cache.sizeOf(modelCode))
   return (modelName, modelCode)
 end
 
@@ -765,6 +775,7 @@ function generateArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel; functionL
   dumpGeneratedCode(modelName, modelCode)
   #= evaluated again at the next simulate: a module of this name may be another path's =#
   COMPILED_MODELS_DEJL[modelName] = (modelCode, true, hash(modelCode))
+  Cache.store!(modelName, Cache.sizeOf(modelCode))
   #= and the ModelingToolkit path's build goes: its module is replaced, and its code (the same
      for a model without arrays) would reuse the build at its next translate =#
   IMTKGen.forgetBuild(modelName)
