@@ -1219,7 +1219,7 @@ function tupleArrayElementOf(output::Any, arrayIndices::Tuple{Vararg{Int}})
   if length(arrayIndices) == 1
     return output[arrayIndices[1]]
   elseif length(arrayIndices) == 2
-    local row = output[arrayIndices[1]]
+    local row::Any = output[arrayIndices[1]]
     return row isa AbstractVector ? row[arrayIndices[2]] : output[arrayIndices[1], arrayIndices[2]]
   end
   error("3D+ tuple array indices not supported")

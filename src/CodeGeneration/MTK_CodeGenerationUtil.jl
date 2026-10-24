@@ -470,7 +470,7 @@ Symbolics); of another tuple the element.
 function expToJuliaExpMTK(e::SC.TSUB, simCode::SC.SIM_CODE)::Expr
   e.exp isa SC.CALL || return :($(expToJuliaExpMTK(e.exp, simCode))[$(e.index)])
   local call = e.exp
-  local once = _whenBodyCall(call)
+  local once::Union{Nothing, Symbol} = _whenBodyCall(call)
   once === nothing || return :($once()[$(e.index)])
   local fn = QuoteNode(call.name)
   local args = _modelicaFunctionCallArgs(call.args, simCode)
@@ -681,7 +681,7 @@ function _literalSubscriptExpr(e::SC.ASUB, subs::Vector{Int}, simCode::SC.SIM_CO
   local output = _functionOutputOf(inner, simCode)
   if output !== nothing
     local (call, k) = output
-    local once = _whenBodyCall(call)
+    local once::Union{Nothing, Symbol} = _whenBodyCall(call)
     once === nothing || return :(OMBackend.CodeGeneration.tupleArrayElementOf($once()[$k], $(Tuple(subs))))
     return :(OMBackend.CodeGeneration.tupleArrayElementAt($(QuoteNode(call.name)), $k, $(Tuple(subs)),
                                                          $(_modelicaFunctionCallArgs(call.args, simCode)...)))
@@ -697,8 +697,8 @@ function _literalSubscriptExpr(e::SC.ASUB, subs::Vector{Int}, simCode::SC.SIM_CO
      the result is numbers, evaluated once for all its elements (_parameterBindingExpr). =#
   if length(subs) == 1 && _isModelFunctionCall(inner, simCode) &&
      !(inner.ty isa SC.TYPE_ARRAY && all(_isLiteralExp, inner.args))
-    local once = _whenBodyCall(inner)
-    once === nothing || return :($once()[$(only(subs))])
+    local callOnce::Union{Nothing, Symbol} = _whenBodyCall(inner)
+    callOnce === nothing || return :($callOnce()[$(only(subs))])
     return :(OMBackend.CodeGeneration.tupleElementCall($(QuoteNode(inner.name)), $(only(subs)),
                                                       $(_modelicaFunctionCallArgs(inner.args, simCode)...)))
   end

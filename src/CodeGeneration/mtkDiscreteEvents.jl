@@ -1545,9 +1545,9 @@ integration, an assert of level error throws (as an equation's: asserts.jl), of 
 reports. A call the body reads in several statements is evaluated once (`_whenBodyCalls`).
 """
 function createWhenStatementsMTK(statements::Vector{SC.Statement}, simCode::SC.SIM_CODE)::Vector{Expr}
-  local (calls, definitions) = _whenBodyCalls(statements, simCode)
+  local (calls::Dict{SC.CALL, Symbol}, definitions::Vector{Expr}) = _whenBodyCalls(statements, simCode)
   #= always within its own table: a body lowered inside another's must not see the other's =#
-  local res = Base.ScopedValues.with(MTK_CodeGenerationUtil.WHEN_BODY_CALLS => calls) do
+  local res::Vector{Expr} = Base.ScopedValues.with(MTK_CodeGenerationUtil.WHEN_BODY_CALLS => calls) do
     _createWhenStatementsMTK(statements, simCode)
   end
   return vcat(definitions, res)
@@ -1566,28 +1566,28 @@ past 15 GB). A call reading a variable the body assigns or reinitializes is left
 assignment before one of its uses changes its value.
 """
 function _whenBodyCalls(statements::Vector{SC.Statement}, simCode::SC.SIM_CODE)::Tuple{Dict{SC.CALL, Symbol}, Vector{Expr}}
-  local counts = OrderedDict{SC.CALL, Int}()
+  local counts::OrderedDict{SC.CALL, Int} = OrderedDict{SC.CALL, Int}()
   for s in statements, e in _statementExps(s)
     _countModelCalls!(counts, e, simCode)
   end
-  local calls = Dict{SC.CALL, Symbol}()
-  local definitions = Expr[]
+  local calls::Dict{SC.CALL, Symbol} = Dict{SC.CALL, Symbol}()
+  local definitions::Vector{Expr} = Expr[]
   any(>(1), values(counts)) || return (calls, definitions)
-  local written = Set{String}(_crefBase(n) for n in _bodyWrites(statements))
+  local written::Set{String} = Set{String}(_crefBase(n) for n in _bodyWrites(statements))
   foreach(s -> s isa SC.REINIT && push!(written, _crefBase(SC.crefName(s.stateVar))), statements)
   #= The names carry the body's hash: several bodies share a scope (the terminal bodies, a when's
      elsewhen arms, a periodic when's refreshes), and a local function of the same name in one of
      them replaced the other's (two RealFFT blocks: the second's FFT in both). =#
-  local tag = string(hash(statements); base = 36)
+  local tag::String = string(hash(statements); base = 36)
   for (call, n) in counts
     (n > 1 && !_readsWritten(call, written)) || continue
-    local k = length(calls) + 1
-    local value = Symbol("#whenCall", k, "_", tag)
-    local once = Symbol("#whenCallOnce", k, "_", tag)
+    local k::Int = length(calls) + 1
+    local value::Symbol = Symbol("#whenCall", k, "_", tag)
+    local once::Symbol = Symbol("#whenCallOnce", k, "_", tag)
     calls[call] = once
-    local args = MTK_CodeGenerationUtil._modelicaFunctionCallArgs(call.args, simCode)
+    local args::Vector{Any} = MTK_CodeGenerationUtil._modelicaFunctionCallArgs(call.args, simCode)
     push!(definitions, quote
-      local $value = Ref{Any}(nothing)
+      local $value::Base.RefValue{Any} = Ref{Any}(nothing)
       local $once() = ($value[] === nothing &&
                        ($value[] = OMBackend.CodeGeneration.modelicaFunctionResult($(QuoteNode(call.name)), $(args...)));
                        $value[])
@@ -1602,7 +1602,7 @@ field of a written record (`r_f` of `r`: a tuple's record target is assigned fie
 """
 function _readsWritten(call::SC.CALL, written::Set{String})::Bool
   return any(SC.allCrefNames(call)) do name
-    local base = _crefBase(name)
+    local base::String = _crefBase(name)
     base in written || any(w -> startswith(base, w * "_"), written)
   end
 end
@@ -1613,7 +1613,7 @@ one), counted into `counts`: the places MTK_CodeGenerationUtil reads from a body
 (WHEN_BODY_CALLS). A call's arguments go with it: not counted apart.
 """
 function _countModelCalls!(counts::OrderedDict{SC.CALL, Int}, e::SC.Exp, simCode::SC.SIM_CODE)::Nothing
-  local call = (e isa SC.TSUB || e isa SC.ASUB) ? e.exp : nothing
+  local call::Union{Nothing, SC.Exp} = (e isa SC.TSUB || e isa SC.ASUB) ? e.exp : nothing
   if call isa SC.CALL && call.kind === SC.CALL_FUNCTION && MTK_CodeGenerationUtil._isModelFunctionCall(call, simCode)
     counts[call] = get(counts, call, 0) + 1
     e isa SC.ASUB && foreach(s -> _countModelCalls!(counts, s, simCode), e.subs)
