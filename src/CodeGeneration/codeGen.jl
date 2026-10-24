@@ -60,7 +60,7 @@ _elsewhenStmtLst(arm::SC.WHEN_EQUATION)::Vector{SC.Statement} = arm.whenEquation
 """
 The names a when body reads (getRHSVariables of each statement).
 """
-_bodyReads(body::Vector{SC.Statement})::Vector{String} = reduce(vcat, (getRHSVariables(s) for s in body); init = String[])
+_bodyReads(body::Vector{SC.Statement})::Vector{String} = unique!(reduce(vcat, (getRHSVariables(s) for s in body); init = String[]))
 
 """
 The names a when body assigns.

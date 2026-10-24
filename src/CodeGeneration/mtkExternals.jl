@@ -1196,22 +1196,33 @@ function tupleArrayElementAt(funcName::Symbol, tupleIdx::Int, arrayIndices::Tupl
       return makeSymbolicTerm(f, uwArgs)
     end
   else
-    local impl = MODELICA_FUNCTION_IMPLS[funcName]
-    local result = Base.invokelatest(impl, args...)
-    local tupleElem = result[tupleIdx]
-    if length(arrayIndices) == 1
-      return tupleElem[arrayIndices[1]]
-    elseif length(arrayIndices) == 2
-      local row = tupleElem[arrayIndices[1]]
-      if row isa AbstractVector
-        return row[arrayIndices[2]]
-      else
-        return tupleElem[arrayIndices[1], arrayIndices[2]]
-      end
-    else
-      error("3D+ tuple array indices not supported")
-    end
+    return tupleArrayElementOf(modelicaFunctionResult(funcName, args...)[tupleIdx], arrayIndices)
   end
+end
+
+"""
+    modelicaFunctionResult(funcName, args...)
+
+The outputs of the Modelica function `funcName` for numeric arguments, as its implementation
+returns them (a tuple of several). A when body that reads one call's outputs in several
+statements evaluates it so once (createWhenStatementsMTK).
+"""
+modelicaFunctionResult(funcName::Symbol, args...) = Base.invokelatest(MODELICA_FUNCTION_IMPLS[funcName], args...)
+
+"""
+    tupleArrayElementOf(output, arrayIndices)
+
+The element `arrayIndices` of an array output of a function (a matrix's also from a vector of
+its rows). Any value its implementation returns that indexes so (generic on purpose).
+"""
+function tupleArrayElementOf(output::Any, arrayIndices::Tuple{Vararg{Int}})
+  if length(arrayIndices) == 1
+    return output[arrayIndices[1]]
+  elseif length(arrayIndices) == 2
+    local row::Any = output[arrayIndices[1]]
+    return row isa AbstractVector ? row[arrayIndices[2]] : output[arrayIndices[1], arrayIndices[2]]
+  end
+  error("3D+ tuple array indices not supported")
 end
 
 """

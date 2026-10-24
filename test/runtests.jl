@@ -421,6 +421,7 @@ import .ExampleModels
 
   #= ── 20u. A cluster relation exactly on its boundary; the step after an event ── =#
   include("exactZeroRelationTests.jl")
+  include("whenBodyCallTests.jl")
 
   #= ── 20v. The model cache within its memory limit ── =#
   include("cacheTests.jl")

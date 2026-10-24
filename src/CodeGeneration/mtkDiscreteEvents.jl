@@ -1542,9 +1542,103 @@ The statements of a when body in a callback's affect: an assignment writes the s
 (a tuple's targets each an output, a record output's fields in place: a generated function
 returns them so, an omitted one skipped), a reinit too (noteReinit!), terminate() stops the
 integration, an assert of level error throws (as an equation's: asserts.jl), of level warning
-reports.
+reports. A call the body reads in several statements is evaluated once (`_whenBodyCalls`).
 """
 function createWhenStatementsMTK(statements::Vector{SC.Statement}, simCode::SC.SIM_CODE)::Vector{Expr}
+  local (calls::Dict{SC.CALL, Symbol}, definitions::Vector{Expr}) = _whenBodyCalls(statements, simCode)
+  #= always within its own table: a body lowered inside another's must not see the other's =#
+  local res::Vector{Expr} = Base.ScopedValues.with(MTK_CodeGenerationUtil.WHEN_BODY_CALLS => calls) do
+    _createWhenStatementsMTK(statements, simCode)
+  end
+  return vcat(definitions, res)
+end
+
+"""
+    _whenBodyCalls(statements, simCode) -> (calls, definitions)
+
+The calls of the model's pure functions that a when body reads in more than one place, each
+evaluated once, on its first use, by a local function (`definitions`; `calls` names it for each
+call, MTK_CodeGenerationUtil.WHEN_BODY_CALLS). A body's if-statements are an assignment per
+target (whenOperators) and its tuple assignments one per output (tupleAssignElements), each with
+the whole call: MSL RealFFT's `(info, abs, arg) := realFFT(buf, nf)` in an if-statement was the
+call of all ns elements of `buf` 2 nf + 1 times (Rectifier6pulseFFT: 803 times 4000, the build
+past 15 GB). A call reading a variable the body assigns or reinitializes is left as it is: an
+assignment before one of its uses changes its value.
+"""
+function _whenBodyCalls(statements::Vector{SC.Statement}, simCode::SC.SIM_CODE)::Tuple{Dict{SC.CALL, Symbol}, Vector{Expr}}
+  local counts::OrderedDict{SC.CALL, Int} = OrderedDict{SC.CALL, Int}()
+  for s in statements, e in _statementExps(s)
+    _countModelCalls!(counts, e, simCode)
+  end
+  local calls::Dict{SC.CALL, Symbol} = Dict{SC.CALL, Symbol}()
+  local definitions::Vector{Expr} = Expr[]
+  any(>(1), values(counts)) || return (calls, definitions)
+  local written::Set{String} = Set{String}(_crefBase(n) for n in _bodyWrites(statements))
+  foreach(s -> s isa SC.REINIT && push!(written, _crefBase(SC.crefName(s.stateVar))), statements)
+  #= The names carry the body's hash: several bodies share a scope (the terminal bodies, a when's
+     elsewhen arms, a periodic when's refreshes), and a local function of the same name in one of
+     them replaced the other's (two RealFFT blocks: the second's FFT in both). =#
+  local tag::String = string(hash(statements); base = 36)
+  for (call, n) in counts
+    (n > 1 && !_readsWritten(call, written)) || continue
+    local k::Int = length(calls) + 1
+    local value::Symbol = Symbol("#whenCall", k, "_", tag)
+    local once::Symbol = Symbol("#whenCallOnce", k, "_", tag)
+    calls[call] = once
+    local args::Vector{Any} = MTK_CodeGenerationUtil._modelicaFunctionCallArgs(call.args, simCode)
+    push!(definitions, quote
+      local $value::Base.RefValue{Any} = Ref{Any}(nothing)
+      local $once() = ($value[] === nothing &&
+                       ($value[] = OMBackend.CodeGeneration.modelicaFunctionResult($(QuoteNode(call.name)), $(args...)));
+                       $value[])
+    end)
+  end
+  return (calls, definitions)
+end
+
+"""
+Whether `call` reads a variable of `written` (the bases of the names a body assigns): by its base, or as a
+field of a written record (`r_f` of `r`: a tuple's record target is assigned field by field).
+"""
+function _readsWritten(call::SC.CALL, written::Set{String})::Bool
+  return any(SC.allCrefNames(call)) do name
+    local base::String = _crefBase(name)
+    base in written || any(w -> startswith(base, w * "_"), written)
+  end
+end
+
+"""
+The calls of the model's pure functions in `e` whose outputs it reads (`f(x)[k]`, an element of
+one), counted into `counts`: the places MTK_CodeGenerationUtil reads from a body's local function
+(WHEN_BODY_CALLS). A call's arguments go with it: not counted apart.
+"""
+function _countModelCalls!(counts::OrderedDict{SC.CALL, Int}, e::SC.Exp, simCode::SC.SIM_CODE)::Nothing
+  local call::Union{Nothing, SC.Exp} = (e isa SC.TSUB || e isa SC.ASUB) ? e.exp : nothing
+  if call isa SC.CALL && call.kind === SC.CALL_FUNCTION && MTK_CodeGenerationUtil._isModelFunctionCall(call, simCode)
+    counts[call] = get(counts, call, 0) + 1
+    e isa SC.ASUB && foreach(s -> _countModelCalls!(counts, s, simCode), e.subs)
+  else
+    foreach(c -> _countModelCalls!(counts, c, simCode), SC.children(e))
+  end
+  return nothing
+end
+
+"The expressions a when statement evaluates."
+_statementExps(s::SC.ASSIGN)::Vector{SC.Exp} = SC.Exp[s.right]
+_statementExps(s::SC.REINIT)::Vector{SC.Exp} = SC.Exp[s.value]
+_statementExps(s::SC.NORETCALL)::Vector{SC.Exp} = SC.Exp[s.exp]
+_statementExps(s::SC.ASSERT)::Vector{SC.Exp} = SC.Exp[s.condition, s.message, s.level]
+_statementExps(s::SC.TERMINATE)::Vector{SC.Exp} = SC.Exp[s.message]
+_statementExps(::SC.Statement)::Vector{SC.Exp} = SC.Exp[]
+
+"A variable's name without its subscripts (`buf` of `buf[3]`, of `buf[?]`)."
+_crefBase(name::String)::String = String(first(split(name, '['; limit = 2)))
+
+"""
+The statements of a when body (createWhenStatementsMTK), with the calls of
+MTK_CodeGenerationUtil.WHEN_BODY_CALLS read from their local functions.
+"""
+function _createWhenStatementsMTK(statements::Vector{SC.Statement}, simCode::SC.SIM_CODE)::Vector{Expr}
   local res = Expr[]
   @debug "[MTK GEN: when] createWhenStatementsMTK" statements=length(statements)
   for wStmt in statements
