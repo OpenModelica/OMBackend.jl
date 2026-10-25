@@ -171,10 +171,10 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
                           OMB.DIRECT_JAC_GENERATION[], OMB.DIRECT_JAC_TREE_NODE_LIMIT[],
                           OMB.DIRECT_RHS_TYPE_ERASE[]))
   if !overwriteCache && get(BUILT_HASH, cname, UInt64(0)) == buildHash &&
-     haskey(BUILT, cname) && isdefined(OMB, Symbol(cname))
+     haskey(BUILT, cname) && OMB._modelDefined(Symbol(cname))
     @info "[IMTK GEN] regenerated code unchanged; reusing compiled module + cached build" model = modelName
     #= this translate registered the functions in CodeGeneration =#
-    OMB.CodeGeneration.registerModelFunctions!(getglobal(OMB, Symbol(cname)))
+    OMB.CodeGeneration.registerModelFunctions!(OMB._modelModule(Symbol(cname)))
     return nothing
   end
   try
@@ -282,12 +282,12 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
   #= Structural/sub-model/flat-model iMTK builds skip _buildAndCache and are not
      eval'd at translate; eval on the first simulate after the translate (mirrors MTK_MODE):
      the previous translate's module answered with its code, and its tables were freed. =#
-  if !isdefined(OMB, Symbol(cname)) || OMB.modelWasCompiledAgain(cname)
+  if !OMB._modelDefined(Symbol(cname)) || OMB.modelWasCompiledAgain(cname)
     forgetBuild(cname)
     Core.eval(OMB, OMB.getCompiledModel(cname))
     OMB.modelEvaluated!(cname)
   else
-    OMB.CodeGeneration.registerModelFunctions!(getglobal(OMB, Symbol(cname)))
+    OMB.CodeGeneration.registerModelFunctions!(OMB._modelModule(Symbol(cname)))
   end
   #= The cached build is initialized at the build's start time: another start time
      builds again, then the same pipeline (its remake only moved tspan, and the
@@ -299,7 +299,7 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
   if haskey(BUILT, cname)
     try
       local cached = sameStart ? BUILT[cname] :
-        Base.invokelatest(getfield(getfield(OMB, Symbol(cname)), Symbol(cname, "Model")), tspan)
+        Base.invokelatest(getfield(OMB._modelModule(Symbol(cname)), Symbol(cname, "Model")), tspan)
       local prob   = OMB.Runtime.ModelingToolkit.SciMLBase.remake(cached[1]; tspan = tspan)
       #= Restore the build-time parameter values: a previous run's affects may
          have mutated the shared vector (ifCond toggles persist otherwise). =#

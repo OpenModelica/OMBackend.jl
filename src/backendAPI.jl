@@ -674,7 +674,7 @@ function generateMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
     #= If the module already exists from a previous compilation (e.g. after
        clearCaches!), mark as needing re-eval so simulateModel picks up the
        new code instead of reusing the stale module. =#
-    local moduleAlreadyExists = isdefined(OMBackend, Symbol(modelName))
+    local moduleAlreadyExists = _modelDefined(Symbol(modelName))
     COMPILED_MODELS_MTK[modelName] = (modelCode, moduleAlreadyExists, codeHash)
   end
   Cache.store!(canonicalName(modelName), Cache.sizeOf(modelCode))
@@ -730,7 +730,7 @@ function generateDETargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
     local changeDetected = previousHash != codeHash
     COMPILED_MODELS_DEJL[modelName] = (modelCode, changeDetected, codeHash)
   else
-    local moduleAlreadyExists = isdefined(OMBackend, Symbol(modelName))
+    local moduleAlreadyExists = _modelDefined(Symbol(modelName))
     COMPILED_MODELS_DEJL[modelName] = (modelCode, moduleAlreadyExists, codeHash)
   end
   Cache.store!(canonicalName(modelName), Cache.sizeOf(modelCode))
@@ -955,13 +955,13 @@ function simulateModel(modelName::String;
     modelCode = getCompiledModel(modelName)
     try
       #= Only re-eval if the module does not exist yet or the code changed =#
-      local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) || modelWasCompiledAgain(modelName)
+      local needsEval = overwriteCache || !_modelDefined(Symbol(modelName)) || modelWasCompiledAgain(modelName)
       if needsEval
         #= the replaced module's build and external objects go with it =#
         IMTKGen.forgetBuild(modelName)
         @eval $modelCode
       else
-        CodeGeneration.registerModelFunctions!(getfield(OMBackend, Symbol(modelName)))
+        CodeGeneration.registerModelFunctions!(_modelModule(Symbol(modelName)))
       end
       #= Run in latest world age to see the just-eval'd module. Push the
          translate-time run dir on the log stack so any dumps emitted during
@@ -1008,7 +1008,7 @@ function simulateModel(modelName::String;
       rethrow(err)
     end
     try
-      local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) || modelWasCompiledAgainDE(modelName)
+      local needsEval = overwriteCache || !_modelDefined(Symbol(modelName)) || modelWasCompiledAgainDE(modelName)
       if needsEval
         _evalModelDE(modelName, modelCode)
       end
@@ -1047,14 +1047,14 @@ function getMTKProblem(modelName::String;
   modelName = canonicalName(modelName)
   local arrayModel = modelName in ARRAY_ODE_MODELS
   local modelCode::Expr = arrayModel ? getCompiledModelDE(modelName) : getCompiledModel(modelName)
-  local needsEval = overwriteCache || !isdefined(OMBackend, Symbol(modelName)) ||
+  local needsEval = overwriteCache || !_modelDefined(Symbol(modelName)) ||
     (arrayModel ? modelWasCompiledAgainDE(modelName) : modelWasCompiledAgain(modelName))
   if needsEval
     #= the replaced module's build and external objects go with it =#
     arrayModel || IMTKGen.forgetBuild(modelName)
     arrayModel ? _evalModelDE(modelName, modelCode) : @eval($modelCode)
   elseif !arrayModel
-    CodeGeneration.registerModelFunctions!(getfield(OMBackend, Symbol(modelName)))
+    CodeGeneration.registerModelFunctions!(_modelModule(Symbol(modelName)))
   end
   Base.invokelatest() do
     local mod = getfield(OMBackend, Symbol(modelName))
@@ -1138,6 +1138,18 @@ function pristineParameters(modelName::String)
   local p = get(IMTKGen.PRISTINE_P, canonicalName(modelName), nothing)
   return p === nothing ? nothing : deepcopy(p)
 end
+
+"""
+    _modelDefined(name::Symbol) -> Bool
+    _modelModule(name::Symbol) -> Module
+
+Whether the module of a compiled model (`OMBackend.<name>`) is defined, and that module, read in the
+latest world. `translate` evaluates the module; a caller that translates and simulates in one function
+runs in the world it started in, where the binding does not exist yet: Julia 1.12 warns ("access to
+binding ... in a world prior to its definition world") and later versions error.
+"""
+_modelDefined(name::Symbol)::Bool = Base.invokelatest(isdefined, OMBackend, name)
+_modelModule(name::Symbol)::Module = Base.invokelatest(getglobal, OMBackend, name)
 
 """
     resimulateModel(modelName; solver, tspan, parameters = Dict(), kwargs...)
@@ -1309,8 +1321,8 @@ function MTK_getObserved(sol, modelName=nothing)
   end
   if modelName !== nothing
     local modSym = canonicalSymbol(modelName)
-    if isdefined(OMBackend, modSym)
-      local mod = getfield(OMBackend, modSym)
+    if _modelDefined(modSym)
+      local mod = _modelModule(modSym)
       if isdefined(mod, :LATEST_REDUCED_SYSTEM)
         return ModelingToolkit.observed(mod.LATEST_REDUCED_SYSTEM)
       end
@@ -1328,10 +1340,10 @@ Used as fallback for purely algebraic (0-unknown) models where `sol[sym]` is una
 """
 function MTK_evaluateAllObserved(sol, obs_eqs, modelName::String)
   local modSym = canonicalSymbol(modelName)
-  if !isdefined(OMBackend, modSym)
+  if !_modelDefined(modSym)
     return nothing
   end
-  local mod = getfield(OMBackend, modSym)
+  local mod = _modelModule(modSym)
   if !isdefined(mod, :LATEST_REDUCED_SYSTEM)
     return nothing
   end

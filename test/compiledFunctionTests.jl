@@ -119,7 +119,8 @@ import OMFrontend
       @test OMBackend.getVariableValues(sol, "h.s")[end] ≈ exp(-1) rtol = 1e-4
       @test OMBackend.getVariableValues(sol, "h.y")[end] ≈ 10.0
       @test OMBackend.getVariableValues(sol, "h.w")[end] ≈ 10.0
-      @test CG.MODELICA_FUNCTION_OWNERS[:h_Med_g] === getfield(OMBackend, Symbol(name))
+      #= the module this translate evaluated: read in the latest world (the loop runs in an older one) =#
+      @test CG.MODELICA_FUNCTION_OWNERS[:h_Med_g] === OMBackend._modelModule(Symbol(name))
       @test Base.invokelatest(CG.MODELICA_FUNCTION_IMPLS[:h_Med_g], 1.0, [1.0, 2.0, 4.0]) == 7.0
     end
   end
