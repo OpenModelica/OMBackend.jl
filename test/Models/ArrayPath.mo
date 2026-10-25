@@ -86,7 +86,7 @@ package ArrayPath
     end for;
   end Rectifier;
 
-  model AlgebraicLoop "Outside the array path: it is scalarized as before"
+  model AlgebraicLoop "Outside the array path (a loop in a model without arrays): it is scalarized as before"
     Real x(start = 1, fixed = true);
     Real y, z;
   equation
@@ -339,4 +339,70 @@ package ArrayPath
   algorithm
     check(2 * x);
   end ElseWhen;
+  model LocalLoops "a nonlinear loop of two unknowns per element (y, w): solved per element by Newton"
+    parameter Integer N = 4;
+    Real x[N](start = {1.0 + i for i in 1:N}, each fixed = true);
+    Real y[N];
+    Real w[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = -y[i];
+      y[i] + w[i] ^ 3 = x[i];
+      w[i] = y[i] + 0.1 * sin(time);
+    end for;
+  end LocalLoops;
+  model LocalLoops1000 = LocalLoops(N = 1000);
+  model Cubic "an equation nonlinear in its unknown: y^3 + y = x per element"
+    parameter Integer N = 3;
+    Real x[N](start = {1.0, 2.0, 3.0}, each fixed = true);
+    Real y[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = -y[i];
+      y[i] ^ 3 + y[i] = x[i];
+    end for;
+  end Cubic;
+  model LoopWithEvent "a loop per element through a relation (events in a loop): outside the array path, scalarized as before"
+    parameter Integer N = 3;
+    Real x[N](each start = 1, each fixed = true);
+    Real y[N];
+    Real z[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = -y[i];
+      y[i] + z[i] = x[i];
+      y[i] - z[i] = if x[i] > 0.5 then 0.5 * x[i] else 0.2 * x[i];
+    end for;
+  end LoopWithEvent;
+  model CoupledLoop "an algebraic loop through all the elements (a tridiagonal system in v): an index-1 DAE, v states of the solver"
+    parameter Integer N = 20;
+    Real x[N](start = {i / N for i in 1:N}, each fixed = true);
+    Real v[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = v[i] - x[i];
+    end for;
+    2 * v[1] - v[2] = x[1];
+    for i in 2:N - 1 loop
+      -v[i - 1] + 3 * v[i] - v[i + 1] = x[i];
+    end for;
+    -v[N - 1] + 2 * v[N] = x[N];
+  end CoupledLoop;
+  model CoupledLoop1000 = CoupledLoop(N = 1000);
+  model CoupledNonlinear "the loop through the elements nonlinear (v^3 terms), and an algebraic variable after it"
+    parameter Integer N = 20;
+    Real x[N](start = {i / N for i in 1:N}, each fixed = true);
+    Real v[N];
+    Real w[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = w[i];
+      w[i] = v[i] - x[i];
+    end for;
+    2 * v[1] - v[2] + 0.1 * v[1] ^ 3 = x[1];
+    for i in 2:N - 1 loop
+      -v[i - 1] + 3 * v[i] - v[i + 1] + 0.1 * v[i] ^ 3 = x[i];
+    end for;
+    -v[N - 1] + 2 * v[N] + 0.1 * v[N] ^ 3 = x[N];
+  end CoupledNonlinear;
 end ArrayPath;

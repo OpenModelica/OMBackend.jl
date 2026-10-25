@@ -43,7 +43,9 @@ end
 function _irArraySimulate(name::String, names::Vector{String}, stop::Float64; kept::Bool)::Vector{Float64}
   local (fm, functions) = kept ? _irArrayFlat(name) : _irFlat(name)
   OMBackend.translate(fm; functionList = functions, scalarized = !kept)
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction." * name); tspan = (0.0, stop))
+  #= tight tolerances: the arrays-kept model may take another path (array code) than the scalarized one =#
+  local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction." * name); tspan = (0.0, stop),
+                                      reltol = 1e-10, abstol = 1e-10)
   @test sol.retcode == ReturnCode.Success
   return Float64[OMBackend.getVariableValues(sol, n)[end] for n in names]
 end
@@ -487,6 +489,17 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
     local before = (length(m.continuous[1].equations), [string(v.kind) for v in m.variables])
     @test_throws _IRd.NotHandled _IRd.reduceIndexArrays!(m)
     @test (length(m.continuous[1].equations), [string(v.kind) for v in m.variables]) == before
+    #= the derivative unknowns solved in array form (solvedInArrays): each for-equation's body once, its iterator kept;
+       the model with its arrays not changed (the scalarized path's) =#
+    m = _irArrayUnreduced("InertiaArray")
+    _IRd.reduceIndexArrays!(m)
+    local beforeSolve::Vector{String} = string.(m.continuous[1].equations)
+    local (solved::_IRM.Model, solvedNames::Vector{Symbol}) = _IRd.solvedInArrays(m)
+    @test Symbol("\$DER.w1") in solvedNames && Symbol("\$DER.\$DER.phi2") in solvedNames
+    local lines::Vector{String} = string.(solved.continuous[1].equations)
+    @test all(eq::_IRM.Equation -> eq isa _IRM.FOR_EQUATION, solved.continuous[1].equations)
+    @test any(l::String -> occursin("\$STATEDER.w1[\$i1] = ((sin(time) * /*Real*/ \$i1) - tau[\$i1])", l), lines)
+    @test string.(m.continuous[1].equations) == beforeSolve
     #= translated with the arrays kept: the results of the scalarized model =#
     withenv("OMBACKEND_ARRAY_INDEX_REDUCTION" => "true") do
       #= InertiaArray, AngleArray: states; the pendulums: a family of dynamic state sets, over a vector (PendulumArray),
@@ -501,12 +514,38 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
                                   ("MixedPendulums", ["single.x", "x[1]", "y[2]"], 3.0))
         local scalarized = _irArraySimulate(name, names, stop; kept = false)
         local kept = _irArraySimulate(name, names, stop; kept = true)
-        @test OMBackend.canonicalName("IndexReduction." * name) in OMBackend.ARRAY_REDUCED_MODELS
+        local cn::String = OMBackend.canonicalName("IndexReduction." * name)
+        @test cn in OMBackend.ARRAY_REDUCED_MODELS
         @test isapprox(kept, scalarized; atol = 1e-8, rtol = 1e-8)
+        #= explicit once its derivatives are solved: array code (ArrayODEGen); the pendulums' dynamic state sets
+           (a fixed start on a dummy state, the sets' when-equations, a loop per element) the scalarized form =#
+        @test (cn in OMBackend.ARRAY_ODE_MODELS) == (name in ("InertiaArray", "AngleArray"))
+        name in ("InertiaArray", "AngleArray") ||
+          @test occursin("array code after index reduction", OMBackend.scalarizedFallbackReason(cn))
       end
-      #= `each start = sum(m)`: every element's start the sum, not m's elements =#
+      #= `each start = sum(m)`: every element's start the sum, not m's elements (on the element view: sum of an
+         array literal) =#
       @test _irArraySimulate("EachStartArray", ["phi1[1]", "phi1[3]", "phi2[2]"], 1.0; kept = true) ≈ fill(0.6, 3)
       @test OMBackend.canonicalName("IndexReduction.EachStartArray") in OMBackend.ARRAY_REDUCED_MODELS
+      @test OMBackend.canonicalName("IndexReduction.EachStartArray") in OMBackend.ARRAY_ODE_MODELS
+      #= the array code off: the reduced model scalarized, the same results =#
+      local inertia::Vector{String} = ["phi1[1]", "phi2[4]", "w2[3]", "tau[2]"]
+      local arrayCode::Vector{Float64} = _irArraySimulate("InertiaArray", inertia, 2.0; kept = true)
+      OMBackend.ARRAY_ODE_GENERATION[] = false
+      try
+        @test isapprox(_irArraySimulate("InertiaArray", inertia, 2.0; kept = true), arrayCode; atol = 1e-8, rtol = 1e-8)
+        @test !(OMBackend.canonicalName("IndexReduction.InertiaArray") in OMBackend.ARRAY_ODE_MODELS)
+      finally
+        OMBackend.ARRAY_ODE_GENERATION[] = true
+      end
+      #= rigid pairs: phi1[i] = i (t - sin t) / 3 =#
+      @test arrayCode[1] ≈ (2.0 - sin(2.0)) / 3 rtol = 1e-8
+      #= x and vx the states (StateSelect.prefer): y, the root of x^2 + y^2 = 1 near its start, solved per element by
+         Newton in the array code =#
+      local prefer::Vector{String} = ["x[1]", "y[2]", "vx[3]", "F[1]"]
+      local preferKept::Vector{Float64} = _irArraySimulate("PendulumsPrefer", prefer, 2.0; kept = true)
+      @test OMBackend.canonicalName("IndexReduction.PendulumsPrefer") in OMBackend.ARRAY_ODE_MODELS
+      @test isapprox(preferKept, _irArraySimulate("PendulumsPrefer", prefer, 2.0; kept = false); atol = 1e-8, rtol = 1e-8)
       local kept = _irArraySimulate("BoundaryArray", ["x[1]", "x[3]"], 1.0; kept = true)
       @test !(OMBackend.canonicalName("IndexReduction.BoundaryArray") in OMBackend.ARRAY_REDUCED_MODELS)
       @test kept ≈ [exp(-1), 0.5 * exp(-1)] rtol = 1e-4

@@ -638,6 +638,24 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     phi1 = phi2;
   end EachStartArray;
 
+  model PendulumsPrefer "Cartesian pendulums, x and vx the states (StateSelect.prefer): the reduced model solves y, the root of x^2 + y^2 = 1 near its start, per element by Newton"
+    parameter Integer N = 3;
+    parameter Real g = 9.81;
+    Real x[N](start = {0.5, 0.6, 0.7}, each fixed = true, each stateSelect = StateSelect.prefer);
+    Real vx[N](each start = 0, each fixed = true, each stateSelect = StateSelect.prefer);
+    Real y[N](each start = -0.8);
+    Real vy[N];
+    Real F[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = vx[i];
+      der(y[i]) = vy[i];
+      der(vx[i]) = -x[i] * F[i];
+      der(vy[i]) = -y[i] * F[i] - g;
+      x[i] ^ 2 + y[i] ^ 2 = 1;
+    end for;
+  end PendulumsPrefer;
+
   record Phasor "a record of two Reals (as MSL Complex)"
     Real re;
     Real im;

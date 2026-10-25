@@ -407,8 +407,33 @@ evaluate the coefficients (`derivativeEdges`). The unknowns so solved for, in or
 """
 function solveDerivatives!(model::IR.Model, partition::IR.Partition;
                            known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::Vector{Symbol}
+  local solution::Union{Nothing, DerivativeSolution} = derivativeSolution(model, partition; known)
+  return solution === nothing ? Symbol[] : substituteDerivatives!(partition, solution)
+end
+
+"""
+    DerivativeSolution(resolved, equationOf, throughSolved)
+
+What `solveDerivatives!` substitutes: each solved derivative unknown's value (`resolvedValues`), the equation it is
+solved from (its index in the partition), and the unknowns `solveThroughSolved!` solved, or solved again, from an
+equation with the values of others put in.
+"""
+struct DerivativeSolution
+  resolved::Dict{Symbol, IR.Expression}
+  equationOf::Dict{Symbol, Int}
+  throughSolved::Set{Symbol}
+end
+
+"""
+    derivativeSolution(model, partition; known) -> Union{Nothing, DerivativeSolution}
+
+The decisions of `solveDerivatives!` (the matching, the solved values, resolved), the partition not changed;
+`nothing` where no derivative unknown is solved for.
+"""
+function derivativeSolution(model::IR.Model, partition::IR.Partition;
+                            known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::Union{Nothing, DerivativeSolution}
   local unknowns = Set{Symbol}(v.name for v in model.variables if isDerivativeUnknown(v))
-  isempty(unknowns) && return Symbol[]
+  isempty(unknowns) && return nothing
   local functions = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
   local parameters = StartValues(model.variables, model.functions; parametersOnly = true)
   local start = StartValues(model.variables, model.functions; equations = vcat(partition.equations, partition.initialEquations))
@@ -422,11 +447,24 @@ function solveDerivatives!(model::IR.Model, partition::IR.Partition;
     solved[d] = solvedValue(partition.equations[e.equation]::IR.SCALAR_EQUATION, d, e.coefficient)
     equationOf[d] = e.equation
   end
+  local matchedValues::Dict{Symbol, IR.Expression} = copy(solved)
   solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, model.variables, start)
-  isempty(solved) && return Symbol[]
+  isempty(solved) && return nothing
   local resolved = resolvedValues(solved)
-  isempty(resolved) && return Symbol[]
-  local definitions = Dict{Int, Symbol}(equationOf[d] => d for d in keys(resolved))
+  isempty(resolved) && return nothing
+  local throughSolved::Set{Symbol} = Set{Symbol}(d for (d, value) in solved if get(matchedValues, d, nothing) !== value)
+  return DerivativeSolution(resolved, equationOf, throughSolved)
+end
+
+"""
+    substituteDerivatives!(partition, solution) -> Vector{Symbol}
+
+The solved derivatives of `solution` substituted into the partition: each one's equation `d = value`, its value in
+the other equations; the unknowns so solved for, in order.
+"""
+function substituteDerivatives!(partition::IR.Partition, solution::DerivativeSolution)::Vector{Symbol}
+  local resolved::Dict{Symbol, IR.Expression} = solution.resolved
+  local definitions::Dict{Int, Symbol} = Dict{Int, Symbol}(solution.equationOf[d] => d for d in keys(resolved))
   local substitute = x -> (x isa IR.CREF && haskey(resolved, x.cref.name)) ? substitutable(x, resolved[x.cref.name]) : x
   for (i, eq) in enumerate(partition.equations)
     local d = get(definitions, i, nothing)
