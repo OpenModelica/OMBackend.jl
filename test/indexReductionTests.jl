@@ -500,6 +500,15 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
     @test all(n -> haskey(m.variables, Symbol(n)), ("x[1]", "x[2]", "x[3]")) && !haskey(m.variables, :x)
     @test m.variables[:y].ty isa _IRM.T_ARRAY && any(eq -> eq isa _IRM.FOR_EQUATION, m.continuous[1].equations)
     @test m.variables[Symbol("x[2]")].kind isa _IRM.DUMMY_STATE
+    #= component rolling (rollComponents!): the instances' variables arrays over them on a part of rolled components,
+       their elements keeping their names; the instances' equations for-equations over them =#
+    m = _irArrayUnreduced("SeparatePairs")
+    local unrolledNames::Set{Symbol} = Set{Symbol}(v.name for v in _IRd.scalarizeArrays(m).model.variables)
+    @test _IRd.rollComponents!(m) == 1
+    @test m.variables[Symbol("a|b|c.phi1")].ty == _IRM.T_ARRAY(_IRM.T_REAL(), _IRM.Dimension[_IRM.DIM_SIZE(3)])
+    @test m.variables[Symbol("a|b|c.phi1")].cref.parts[1].ty == _IRM.T_COMPONENTS(Symbol("IndexReduction.RigidPair"), [:a, :b, :c])
+    @test Set{Symbol}(v.name for v in _IRd.scalarizeArrays(m).model.variables) == unrolledNames
+    @test count(eq -> eq isa _IRM.FOR_EQUATION, m.continuous[1].equations) == 5
     #= the derivative unknowns solved in array form (solvedInArrays): each for-equation's body once, its iterator kept;
        the model with its arrays not changed (the scalarized path's) =#
     m = _irArrayUnreduced("InertiaArray")
@@ -571,6 +580,14 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
       local records::Vector{Float64} = _irArraySimulate("RecordsArray", recordNames, 1.0; kept = true)
       @test OMBackend.canonicalName("IndexReduction.RecordsArray") in OMBackend.ARRAY_ODE_MODELS
       @test isapprox(records, _irArraySimulate("RecordsArray", recordNames, 1.0; kept = false); atol = 1e-8, rtol = 1e-8)
+      #= separately declared components rolled (OMBACKEND_ROLL_COMPONENTS): array code, the elements under their own
+         names, as scalarized; phi1 = k (t - sin(t)) / 3 =#
+      local pairNames::Vector{String} = ["a.phi1", "b.phi1", "c.phi1", "c.tau", "total"]
+      local rolledPairs::Vector{Float64} = withenv(() -> _irArraySimulate("SeparatePairs", pairNames, 1.0; kept = true),
+                                                   "OMBACKEND_ROLL_COMPONENTS" => "true")
+      @test OMBackend.canonicalName("IndexReduction.SeparatePairs") in OMBackend.ARRAY_ODE_MODELS
+      @test isapprox(rolledPairs, _irArraySimulate("SeparatePairs", pairNames, 1.0; kept = false); atol = 1e-8, rtol = 1e-8)
+      @test rolledPairs[[1, 2, 3, 5]] ≈ (1 - sin(1)) / 3 .* [1, 2, 3, 6] rtol = 1e-7
       local w05::Float64 = (2 * (1 - cos(0.5)) + 0.5) / 3
       local phi05::Float64 = (2 * (0.5 - sin(0.5)) + 0.125) / 3
       local phiEnd::Float64 = phi05 + 0.5 * w05 + 0.125

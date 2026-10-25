@@ -828,4 +828,28 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     fromC = gainOf(c);
   end RecordsArray;
 
+  model RigidPair "a rigidly coupled pair of inertias driven by k sin(t) (index 3): phi1 = k (t - sin(t)) / 3"
+    parameter Real k = 1;
+    Real phi1(start = 0, fixed = true);
+    Real w1(start = 0, fixed = true);
+    Real phi2;
+    Real w2;
+    Real tau;
+  equation
+    der(phi1) = w1;
+    der(phi2) = w2;
+    der(w1) = k * sin(time) - tau;
+    2 * der(w2) = tau;
+    phi1 = phi2;
+  end RigidPair;
+
+  model SeparatePairs "three RigidPairs declared one by one: rolled into arrays over the instances (OMBACKEND_ROLL_COMPONENTS), reduced in array form; total reads all three"
+    RigidPair a(k = 1);
+    RigidPair b(k = 2);
+    RigidPair c(k = 3);
+    Real total "2 (t - sin(t))";
+  equation
+    total = a.phi1 + b.phi1 + c.phi1;
+  end SeparatePairs;
+
 end IndexReduction;

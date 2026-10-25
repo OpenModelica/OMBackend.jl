@@ -224,6 +224,11 @@ function _crefIRx(g::Gen, e::OIR.CREF, ctx::Ctx)::IR
   #= an element variable of its own (an array split for index reduction, `x[2]`), else the array it subscripts =#
   local whole::Bool = !OIR.hasSubscripts(cr) || haskey(g.vars, String(cr.name)) || haskey(g.derOf, String(cr.name))
   local name::String = whole ? String(cr.name) : String(Passes.unsubscriptedName(cr))
+  if !(haskey(g.vars, name) || haskey(g.derOf, name))
+    #= an element of an array split along its inner dimensions: the slice's (`slicedCref`) =#
+    local sliced::Union{Nothing, OIR.ComponentRef} = _IRD.slicedCref(cr, (n::Symbol) -> haskey(g.vars, String(n)) || haskey(g.derOf, String(n)))
+    sliced === nothing || return _crefIRx(g, OIR.CREF(sliced, e.ty), ctx)
+  end
   local subscripts::Vector{OIR.Subscript} = whole ? OIR.Subscript[] : Passes.allSubscripts(cr)
   local subs::Vector{IR} = IR[s isa OIR.INDEX ? toIR(g, s.exp, ctx) : ns("a slice of $(name)") for s in subscripts]
   return _elementRefIR(g, name, subs)

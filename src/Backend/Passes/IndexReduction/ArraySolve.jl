@@ -141,9 +141,9 @@ end
 
 The body equation `body` solved in array form for the derivative its iterations `rows` (element view row => the
 derivative solved from it) are solved for: the reference in the body that is each row's derivative at its iteration
-(one for all of them, subscripted by the iterators, each once), the coefficient as the element view's (a literal where
-it reads only parameters, `derivativeEdges`), the value `solvedValue`'s. NotHandled where the rows solve for
-references the body does not have alike.
+(one for all of them, subscripted by the iterators, each once), the coefficient as the element view's (an expression
+where it reads only parameters too: `literalCoefficients = false`), the value `solvedValue`'s. NotHandled where the
+rows solve for references the body does not have alike.
 """
 function solvedTemplate(body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}, rows::Vector{Pair{Int, Symbol}},
                         view::Scalarized, E::Elements, model::IR.Model, functions::Dict{Symbol, IR.ModelicaFunction},
@@ -172,19 +172,19 @@ function solvedTemplate(body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}, row
     throw(NotHandled("a derivative solved through $(cref.cref.name), not subscripted by its iterators $(iterators)"))
   local c::Union{Nothing, IR.Expression} = partialDerivative(canonical, cref.cref.name, functions; derivativeCalls = true)
   c === nothing && throw(NotHandled("the coefficient of $(cref.cref.name) in $(equationLine(body))"))
-  local value::Union{Nothing, Float64} = readsNoUnknown(c, model.variables) ? evaluate(c, parameters) : nothing
-  (value !== nothing && isfinite(value) && value != 0) && (c = real(value))
   return SolvedTemplate(cref, iterators, solvedValue(canonical, cref.cref.name, c))
 end
 
 """
-    resolvedTemplates(templates, E) -> Dict{Symbol, IR.Expression}
+    resolvedTemplates(templates, E, small) -> Dict{Symbol, IR.Expression}
 
 Each template's value with the solved derivatives it reads replaced by theirs, in dependency order (`resolvedValues`
 in array form: a value read at its reference's subscripts, `instantiated`); those in a cycle, and those that read one,
-left out. A value larger than `SUBSTITUTED_VALUE_NODE_LIMIT` nodes stays a reference.
+left out. A value stays a reference where the element view's values are larger than `SUBSTITUTED_VALUE_NODE_LIMIT`
+nodes (`small`: the solved derivatives whose values are put in): the template's size counts the iterators'
+subscripts, which the elements do not have.
 """
-function resolvedTemplates(templates::Dict{Symbol, SolvedTemplate}, E::Elements)::Dict{Symbol, IR.Expression}
+function resolvedTemplates(templates::Dict{Symbol, SolvedTemplate}, E::Elements, small::Set{Symbol})::Dict{Symbol, IR.Expression}
   local reads::Dict{Symbol, Set{Symbol}} = Dict{Symbol, Set{Symbol}}()
   for (target, t) in templates
     local r::Set{Symbol} = Set{Symbol}()
@@ -202,7 +202,7 @@ function resolvedTemplates(templates::Dict{Symbol, SolvedTemplate}, E::Elements)
     resolved[t] = foldTree(IR.mapExp(templates[t].value) do x::IR.Expression
       local s::Union{Nothing, Symbol} = solvedTarget(x, E, templates)
       (s === nothing || !haskey(resolved, s)) && return x
-      return substitutable(x, instantiated(templates[s], x, resolved[s]))
+      return s in small ? instantiated(templates[s], x, resolved[s]) : x
     end)
     for r in readers[t]
       pending[r] -= 1
@@ -240,11 +240,60 @@ function solvedInArrays(model::IR.Model;
   throw(NotHandled("derivatives solved in array form: more splits than 64"))
 end
 
+"""
+    unsubstitutedNote(eq, solution, E, templates, small) -> String
+
+For a refusal: the solved derivatives an element equation of the array form still reads, and why their values were
+not put in (no template of the array form, its values not small in the element view, or not resolved).
+"""
+function unsubstitutedNote(eq::IR.Equation, solution::DerivativeSolution, E::Elements, templates::Dict{Symbol, SolvedTemplate},
+                           small::Set{Symbol})::String
+  local notes::Vector{String} = String[]
+  IR.foreachExp(eq) do x::IR.Expression
+    (x isa IR.CREF && haskey(solution.resolved, x.cref.name)) || return nothing
+    local target::Symbol = haskey(E.array, x.cref.name) ? E.array[x.cref.name][1] : x.cref.name
+    push!(notes, "$(x.cref.name): " * (!haskey(templates, target) ? "no template ($(target))" : !(target in small) ? "not small" :
+                                       "not resolved, reads " * readChain(target, E, templates)))
+    nothing
+  end
+  return isempty(notes) ? "" : " (still read: " * join(unique(notes), "; ") * ")"
+end
+
+"A cycle among the templates' reads reachable from `target` (depth first), or the reads of `target`: for a refusal."
+function readChain(target::Symbol, E::Elements, templates::Dict{Symbol, SolvedTemplate})::String
+  local readsOf::Function = (t::Symbol) -> begin
+    local reads::Vector{Symbol} = Symbol[]
+    IR.foreachExp(x::IR.Expression -> (local s::Union{Nothing, Symbol} = solvedTarget(x, E, templates); (s === nothing || s in reads) || push!(reads, s); nothing),
+                  templates[t].value)
+    reads
+  end
+  local stack::Vector{Symbol} = Symbol[]
+  local done::Set{Symbol} = Set{Symbol}()
+  local cycle::Vector{Symbol} = Symbol[]
+  local visit::Function = function (t::Symbol)
+    t in done && return false
+    local at::Union{Nothing, Int} = findfirst(==(t), stack)
+    if at !== nothing
+      append!(cycle, stack[at:end]); push!(cycle, t)
+      return true
+    end
+    push!(stack, t)
+    for r in readsOf(t)
+      visit(r) && return true
+    end
+    pop!(stack); push!(done, t)
+    return false
+  end
+  visit(target) && return "cycle " * join(String.(cycle), " -> ")
+  return join(String.(readsOf(target)), ", ")
+end
+
 "`solvedInArrays` without splitting: NotHandled, naming the arrays or for-equations to split, where solved differently."
 function solvedInArraysOnce(model::IR.Model; known::Dict{Symbol, IR.Expression})::Tuple{IR.Model, Vector{Symbol}}
   local view::Scalarized = scalarizeArrays(model)
   local elementPartition::IR.Partition = view.model.continuous[1]
-  local solution::Union{Nothing, DerivativeSolution} = derivativeSolution(view.model, elementPartition; known)
+  #= the coefficients that read only parameters as expressions: the array form's differ per element =#
+  local solution::Union{Nothing, DerivativeSolution} = derivativeSolution(view.model, elementPartition; known, literalCoefficients = false)
   solution === nothing && return (model, Symbol[])
   isempty(solution.throughSolved) ||
     throw(NotHandled("derivatives solved through the values of others ($(first(sort!(collect(solution.throughSolved)))))"))
@@ -292,13 +341,20 @@ function solvedInArraysOnce(model::IR.Model; known::Dict{Symbol, IR.Expression})
   isempty(splitEquations) ||
     throw(NotHandled("for-equations whose iterations are solved differently ($(length(splitEquations)): slicing)", Symbol[],
                      sort!(collect(splitEquations))))
-  local resolved::Dict{Symbol, IR.Expression} = resolvedTemplates(templates, E)
+  #= a solved derivative put in where the element view puts its elements' values in (all of them small) =#
+  local small::Set{Symbol} = Set{Symbol}()
+  for target in keys(templates)
+    local elementNames::Vector{Symbol} = haskey(E.elements, target) ? E.elements[target] : Symbol[target]
+    all(d::Symbol -> haskey(solution.resolved, d) && !expressionLargerThan(solution.resolved[d], SUBSTITUTED_VALUE_NODE_LIMIT), elementNames) &&
+      push!(small, target)
+  end
+  local resolved::Dict{Symbol, IR.Expression} = resolvedTemplates(templates, E, small)
   #= the values put in (a copy: the model with its arrays stays the scalarized path's), the bodies their definitions =#
   local equations::Vector{IR.Equation} = deepcopy(partition.equations)
   local substitute::Function = (x::IR.Expression) -> begin
     local s::Union{Nothing, Symbol} = solvedTarget(x, E, templates)
     (s === nothing || !haskey(resolved, s)) && return x
-    return substitutable(x, instantiated(templates[s], x, resolved[s]))
+    return s in small ? instantiated(templates[s], x, resolved[s]) : x
   end
   for (i, eq) in enumerate(equations)
     equations[i] = IR.mapEquation!(substitute, eq)
@@ -320,7 +376,8 @@ function solvedInArraysOnce(model::IR.Model; known::Dict{Symbol, IR.Expression})
     throw(NotHandled("derivatives solved in array form: $(length(mine)) element equations, the element view $(length(elementPartition.equations))"))
   for (a, b) in zip(mine, elementPartition.equations)
     (a isa IR.SCALAR_EQUATION ? sameEquation(a, b) : string(a) == string(b)) ||
-      throw(NotHandled("derivatives solved in array form: $(equationLine(a)) for the element view's $(equationLine(b))"))
+      throw(NotHandled("derivatives solved in array form: $(equationLine(a)) for the element view's $(equationLine(b))" *
+                       unsubstitutedNote(a, solution, E, templates, small)))
   end
   return (solved, sort!(collect(keys(resolved))))
 end

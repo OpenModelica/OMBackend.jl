@@ -565,12 +565,17 @@ function reducedArrayModel(fm::OMFrontend.Frontend.FlatModel;
   return _arrayReductionStep(fm, decline) do
     local lowered::OMJLIR.Model = LowerFlatModel.lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
     #= a model without for-equations or array equations over continuous arrays reduces as the scalarized one: the
-       passes not run for it =#
-    if !(reduction.hasContinuousArrays(lowered) && reduction.hasArrayEquations(lowered))
+       passes not run for it; unless its separately declared components are rolled into arrays (OMBACKEND_ROLL_COMPONENTS) =#
+    local roll::Bool = envSwitch("OMBACKEND_ROLL_COMPONENTS") && !isempty(reduction.componentGroups(lowered.variables))
+    if !roll && !(reduction.hasContinuousArrays(lowered) && reduction.hasArrayEquations(lowered))
       decline("no for-equations or array equations over continuous arrays")
       return nothing
     end
     local model::OMJLIR.Model = Passes.runPassesKeepingArrays!(lowered)
+    if roll && reduction.rollComponents!(model) == 0 && !(reduction.hasContinuousArrays(model) && reduction.hasArrayEquations(model))
+      decline("no for-equations or array equations over continuous arrays, its components not rolled")
+      return nothing
+    end
     if !reduction.reduceIndexArrays!(model)
       decline("index 1, nothing to reduce")
       return nothing

@@ -126,6 +126,11 @@ view's structure knows.
 function canonicalReferences(e::IR.Expression, E::Elements, variables::IR.VariableSet)::IR.Expression
   return IR.mapExp(e) do x
     (x isa IR.CREF && IR.hasSubscripts(x.cref)) || return x
+    #= an element of an array split along its inner dimensions: the slice's (`slicedCref`) =#
+    if !haskey(variables, unsubscriptedName(x.cref))
+      local sliced::Union{Nothing, IR.ComponentRef} = slicedCref(x.cref, (n::Symbol) -> haskey(variables, n))
+      sliced === nothing || (x = IR.CREF(sliced, x.ty))
+    end
     local element = elementReference(x, E)
     element === x && return x
     return arrayReferences(element, E, variables)
@@ -175,6 +180,11 @@ function newArrays(names::Vector{Symbol}, s::Structure, E::Elements, model::IR.M
   local arrayOf = copy(E.array)
   local elementsOf = copy(E.elements)
   local dimensionsOf = Dict{Symbol, Vector{IR.Dimension}}(v.name => v.ty.dimensions for v in model.variables if v.ty isa IR.T_ARRAY)
+  #= a new derivative array's array of the model (to split for slicing: `x` of `\$DER.x`) =#
+  local rootOf::Dict{Symbol, Symbol} = Dict{Symbol, Symbol}()
+  #= every array derived for some of its elements only, collected: split together =#
+  local partial::Vector{Symbol} = Symbol[]
+  local firstPartial::String = ""
   local byOrder = Dict{Int, Vector{Symbol}}()
   foreach(n -> push!(get!(() -> Symbol[], byOrder, derivativeOrder(s, s.index[n])), n), names)
   for order in sort!(collect(keys(byOrder)))
@@ -190,20 +200,25 @@ function newArrays(names::Vector{Symbol}, s::Structure, E::Elements, model::IR.M
     end
     for (array, derived) in sort!(collect(byArray); by = first)
       local expected = Symbol[IR.derivativeName(e) for e in elementsOf[array]]
-      Set(derived) == Set(expected) ||
-        throw(NotHandled("the derivatives of $(length(derived)) of the $(length(expected)) elements of the array $(array) (slicing)",
-                         Symbol[array], Int[]))
+      if Set(derived) != Set(expected)
+        isempty(partial) && (firstPartial = "the derivatives of $(length(derived)) of the $(length(expected)) elements of the array $(array)")
+        push!(partial, get(rootOf, array, array))
+        continue
+      end
       local name = IR.derivativeName(array)
       haskey(model.variables, name) && throw(NotHandled("a derivative array $(name) that exists"))
       push!(out, IR.Variable(name, IR.T_ARRAY(IR.T_REAL(), dimensionsOf[array]), IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES,
                              IR.NO_DIRECTION, false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :indexReduction))
       dimensionsOf[name] = dimensionsOf[array]
       elementsOf[name] = expected
+      rootOf[name] = get(rootOf, array, array)
       for (e, d) in zip(elementsOf[array], expected)
         arrayOf[d] = (name, arrayOf[e][2])
       end
     end
   end
+  isempty(partial) || throw(NotHandled("$(firstPartial)$(length(partial) > 1 ? " and $(length(partial) - 1) more arrays" : "") (slicing)",
+                                       unique(partial), Int[]))
   return out
 end
 
@@ -324,9 +339,12 @@ function forDerivatives(eq::IR.FOR_EQUATION, rows::Vector{Int}, view::Scalarized
     count == 0 && continue
     local (body, iterators) = bodyAt(eq, path)
     body isa IR.SCALAR_EQUATION || throw(NotHandled("differentiating a $(nameof(typeof(body))) in a for-equation"))
-    local current::IR.Equation = inlineEquation(IR.SCALAR_EQUATION(canonicalReferences(body.lhs, E, variables),
-                                                                   canonicalReferences(body.rhs, E, variables),
-                                                                   body.ty, body.source, body.attributes), functions)
+    local inlined::IR.SCALAR_EQUATION = inlineEquation(IR.SCALAR_EQUATION(canonicalReferences(body.lhs, E, variables),
+                                                                          canonicalReferences(body.rhs, E, variables),
+                                                                          body.ty, body.source, body.attributes), functions)
+    #= the references an inlined body made (a record argument's fields) canonical too =#
+    local current::IR.Equation = IR.SCALAR_EQUATION(canonicalReferences(inlined.lhs, E, variables), canonicalReferences(inlined.rhs, E, variables),
+                                                    inlined.ty, inlined.source, inlined.attributes)
     local chain = IR.SCALAR_EQUATION[]
     for _ in 1:count
       current = differentiateEquation(current, seeds)
@@ -565,7 +583,7 @@ function reduceIndexArrays!(model::IR.Model)::Bool
       arrayCommit(model, model.continuous[1], view, written)
       break
     catch err
-      (err isa NotHandled && needsSplit(err) && splits < 64) || rethrow()
+      (err isa NotHandled && needsSplit(err) && splits < 256) || rethrow()
       splitArrays!(model, view, err.arrays, err.equations)
       splits += 1
       #= split down to no array equations, or most of the arrays' elements split: little the array form keeps, the
