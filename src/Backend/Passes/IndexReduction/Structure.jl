@@ -38,12 +38,22 @@
 
 """
     NotHandled(reason)
+    NotHandled(reason, arrays, equations)
 
-What index reduction does not handle (yet): the model is left to the MTK path.
+What index reduction does not handle (yet): the model is left to the MTK path. With arrays kept, the arrays whose
+elements a plan treats differently and the for-equations (by index in the partition) whose iterations it
+differentiates differently: the array form takes the plan once those are split (`splitArrays!`).
 """
 struct NotHandled <: Exception
   reason::String
+  arrays::Vector{Symbol}
+  equations::Vector{Int}
 end
+
+NotHandled(reason::String) = NotHandled(reason, Symbol[], Int[])
+
+"Whether `e` names arrays or for-equations whose splitting would let the array form take the plan (slicing)."
+needsSplit(e::NotHandled)::Bool = !(isempty(e.arrays) && isempty(e.equations))
 
 Base.showerror(io::IO, e::NotHandled) = print(io, "index reduction does not handle ", e.reason)
 

@@ -376,8 +376,29 @@ function scalarExpression(e::IR.Expression, values::Dict{Symbol, Int}, E::Elemen
   return IR.mapExp(pruned) do x
     x isa IR.CREF && return elementReference(x, E)
     (x isa IR.SUBSCRIPTED && literalIndices(x.subscripts) !== nothing) && return pickElement(x.exp, x.subscripts, x.ty, E)
+    (x isa IR.BINARY && x.op == IR.SCALAR_PRODUCT) && return expandedScalarProduct(x, E)
     return x
   end
+end
+
+"""
+    expandedScalarProduct(e, E) -> Expression
+
+A scalar product of two vectors of a known size in the scalarized model: the sum of the products of their elements
+(`pickElement`), as the frontend's scalarization writes it (MultiBody's `tau = -frame_b.t * e`); as it is where the
+size is not known.
+"""
+function expandedScalarProduct(e::IR.BINARY, E::Elements)::IR.Expression
+  local ty1::IR.ModelicaType = IR.typeOf(e.exp1)
+  (ty1 isa IR.T_ARRAY && length(ty1.dimensions) == 1 && ty1.dimensions[1] isa IR.DIM_SIZE) || return e
+  local element::IR.ModelicaType = IR.elementType(ty1)
+  local terms::Vector{IR.Expression} = IR.Expression[]
+  for k in 1:ty1.dimensions[1].size
+    local index::Vector{IR.Subscript} = IR.Subscript[IR.INDEX(IR.INTEGER(k))]
+    push!(terms, times(pickElement(e.exp1, index, element, E), pickElement(e.exp2, index, element, E)))
+  end
+  isempty(terms) && return zeroOf(e)
+  return foldTree(foldl(plus, terms))
 end
 
 """

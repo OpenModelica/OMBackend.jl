@@ -527,6 +527,23 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     x[1] = x[2];
   end BoundaryArray;
 
+  model BoundaryWithArray "BoundaryArray's tie splits x into its elements (slicing); the array y stays an array"
+    parameter Integer N = 3;
+    parameter Integer M = 4;
+    Real x[N](start = {1, 1, 0.5}, fixed = {true, false, true});
+    Real f;
+    Real y[M](each start = 1, each fixed = true);
+  equation
+    for i in 2:N loop
+      der(x[i]) = -x[i];
+    end for;
+    der(x[1]) = -x[1] + f;
+    x[1] = x[2];
+    for j in 1:M loop
+      der(y[j]) = -j * y[j];
+    end for;
+  end BoundaryWithArray;
+
   model AngleArray "PendulumAngle per element in a for-equation: the differentiated body x[i] = L * sin(phi[i]) reads the parameter L (kept symbolic in array form)"
     parameter Integer N = 3;
     parameter Real g = 9.81;
@@ -754,5 +771,61 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     der(m) = -m;
     m = 2 * x + x ^ 3;
   end PreferredState;
+
+  record Gain "a record with an array field, passed to functions by its fields"
+    Real k;
+    Real offset[2];
+  end Gain;
+
+  function gainTimes "a record argument and an array argument: g.k x[1] + g.offset[1] x[2]"
+    input Gain g;
+    input Real x[2];
+    output Real y;
+  algorithm
+    y := g.k * x[1] + g.offset[1] * x[2];
+  end gainTimes;
+
+  function gainOf "a record result"
+    input Real k;
+    output Gain g;
+  algorithm
+    g := Gain(k = k, offset = {0.5 * k, 0});
+  end gainOf;
+
+  model RecordsArray "InertiaArray driven through a record and an array argument, a record result, a fixed = false parameter, an if-equation on time, a literal indexed by the iterator; a record variable's array field read by a for-equation: array code after index reduction"
+    parameter Integer N = 3;
+    parameter Gain gain(k = 2, offset = {1, 0});
+    parameter Real c(fixed = false) "6";
+    Real phi1[N](each start = 0, each fixed = true);
+    Real w1[N](each start = 0, each fixed = true);
+    Real phi2[N];
+    Real w2[N];
+    Real tau[N];
+    Real drive[N] "i (2 sin(t) + 1) before 0.5, 3 i after";
+    Gain observed "k = w1[1], offset = phi1[1:2]";
+    Gain fromC "gainOf(c): offset[1] = 3";
+    Real sum1 "w1[1] + phi1[1]";
+    Real weighted[N] "{1, 0.5, 2} .* w1: rolled, the literal indexed by the iterator";
+  initial equation
+    c = 3 * gain.k;
+  equation
+    der(phi1) = w1;
+    der(phi2) = w2;
+    for i in 1:N loop
+      if time < 0.5 then
+        drive[i] = gainTimes(gain, {sin(time), 1.0}) * i;
+      else
+        drive[i] = fromC.offset[1] * i;
+      end if;
+      der(w1[i]) = drive[i] - tau[i];
+    end for;
+    2 * der(w2) = tau;
+    phi1 = phi2;
+    observed.k = w1[1];
+    observed.offset = phi1[1:2];
+    sum1 = gainTimes(observed, {1.0, 1.0});
+    weighted = {1, 0.5, 2} .* w1;
+    fromC = gainOf(c);
+  end RecordsArray;
 
 end IndexReduction;

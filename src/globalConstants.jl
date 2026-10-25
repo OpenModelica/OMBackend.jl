@@ -106,6 +106,7 @@ const ENV_SWITCHES = Dict{String, Tuple{Bool, String}}(
   "OMBACKEND_PREFER_STATES" => (true, "with OMBACKEND_INDEX_REDUCTION: a continuous variable of StateSelect.prefer that the model does not differentiate an artificial state, as OpenModelica's (Pantelides differentiates the equations that make it one; given up where they do not differentiate): MSL Fluid's medium states instead of a volume's m and U, omc's states for PumpingSystem, the Machines' idq currents; off: only StateSelect.always"),
   "OMBACKEND_SOLVE_DERIVATIVES" => (true, "with OMBACKEND_INDEX_REDUCTION: the derivative unknowns of a reduced model solved for and substituted (Passes.IndexReduction.solveDerivatives!), so the code generators compute them from the other unknowns; off: they stay algebraic unknowns, kept by MTK"),
   #= Diagnostics =#
+  "OMBACKEND_ARRAY_TRACE" => (false, "print the array code's classes, instances and algebraic loop blocks"),
   "OMBACKEND_EVENT_TRACE" => (false, "trace the event iteration"),
   "OMBACKEND_FALLBACK_ON_BUG" => (false, "observe mode of the error policy (errorPolicy.jl): a programming error in a fallback's try is logged at @error and the fallback taken instead of propagating"),
   "OMBACKEND_INDEX_DIAG" => (false, "log the equations the index analysis finds over-constraining"),

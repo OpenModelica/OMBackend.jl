@@ -141,7 +141,8 @@ type whose variables are the elements of one array at the same subscripts (`\$DE
 """
 function uniformKind(array::Symbol, kinds::Vector{IR.VariableKind}, E::Elements)::IR.VariableKind
   local K = typeof(kinds[1])
-  all(k -> k isa K, kinds) || throw(NotHandled("an array whose elements the plan gives different kinds ($(array): $(unique(typeof.(kinds))))"))
+  all(k -> k isa K, kinds) ||
+    throw(NotHandled("an array whose elements the plan gives different kinds ($(array): $(unique(typeof.(kinds))))", Symbol[array], Int[]))
   K === IR.ALGEBRAIC && return IR.ALGEBRAIC()
   local named = Symbol[kindVariable(k) for k in kinds]
   local of = get(E.array, named[1], nothing)
@@ -190,7 +191,8 @@ function newArrays(names::Vector{Symbol}, s::Structure, E::Elements, model::IR.M
     for (array, derived) in sort!(collect(byArray); by = first)
       local expected = Symbol[IR.derivativeName(e) for e in elementsOf[array]]
       Set(derived) == Set(expected) ||
-        throw(NotHandled("the derivatives of $(length(derived)) of the $(length(expected)) elements of the array $(array) (slicing)"))
+        throw(NotHandled("the derivatives of $(length(derived)) of the $(length(expected)) elements of the array $(array) (slicing)",
+                         Symbol[array], Int[]))
       local name = IR.derivativeName(array)
       haskey(model.variables, name) && throw(NotHandled("a derivative array $(name) that exists"))
       push!(out, IR.Variable(name, IR.T_ARRAY(IR.T_REAL(), dimensionsOf[array]), IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES,
@@ -237,7 +239,7 @@ function arraySeeds(s::Structure, derivatives::Dict{Symbol, Symbol}, E::Elements
       local derivative = get(derivatives, name, nothing)
       derivative === nothing || return IR.CREF(variables[derivative].cref, variables[derivative].ty)
       any(n -> haskey(s.index, n), members) &&
-        throw(NotHandled("the derivative of the array $(name), its elements' derivatives not one array"))
+        throw(NotHandled("the derivative of the array $(name), its elements' derivatives not one array", Symbol[name], Int[]))
       return nothing
     end
     local v = get(s.index, name, 0)
@@ -317,7 +319,8 @@ function forDerivatives(eq::IR.FOR_EQUATION, rows::Vector{Int}, view::Scalarized
   for (path, pathRows) in byPath
     local count = length(get(p.differentiated, pathRows[1], IR.Equation[]))
     all(r -> length(get(p.differentiated, r, IR.Equation[])) == count, pathRows) ||
-      throw(NotHandled("a for-equation whose iterations are differentiated unequally (slicing)"))
+      throw(NotHandled("a for-equation whose iterations are differentiated unequally (slicing)", Symbol[],
+                       Int[view.origins[pathRows[1]].equation]))
     count == 0 && continue
     local (body, iterators) = bodyAt(eq, path)
     body isa IR.SCALAR_EQUATION || throw(NotHandled("differentiating a $(nameof(typeof(body))) in a for-equation"))
@@ -382,7 +385,8 @@ function stateLinks(s::Structure, dummies::Set{Int}, E::Elements, derivatives::D
   local equations = IR.Equation[]
   for (array, selected) in sort!(collect(byArray); by = first)
     length(selected) == length(E.elements[array]) ||
-      throw(NotHandled("$(length(selected)) of the $(length(E.elements[array])) elements of the array $(array) states (slicing)"))
+      throw(NotHandled("$(length(selected)) of the $(length(E.elements[array])) elements of the array $(array) states (slicing)",
+                       Symbol[array], Int[]))
     local derivative = get(derivatives, array, nothing)
     derivative === nothing && throw(NotHandled("the states of the array $(array), their derivatives not one array"))
     local link = newVariable(stateDerivativeName(array), variables[array].ty)
@@ -417,7 +421,8 @@ function arrayKinds(kinds::Dict{Symbol, IR.VariableKind}, E::Elements, variables
       local changed = count(n -> haskey(kinds, n), members)
       changed == 0 && continue
       changed == length(members) ||
-        throw(NotHandled("$(changed) of the $(length(members)) elements of the array $(v.name) change their kind (slicing)"))
+        throw(NotHandled("$(changed) of the $(length(members)) elements of the array $(v.name) change their kind (slicing)",
+                         Symbol[v.name], Int[]))
       out[v.name] = uniformKind(v.name, IR.VariableKind[kinds[n] for n in members], E)
     elseif haskey(kinds, v.name)
       out[v.name] = kinds[v.name]
@@ -537,19 +542,45 @@ end
 
 Index reduction of an arrays-kept model in array form: planned on its element view (`scalarizeArrays`, `knownPlan`),
 committed in array form (`arrayCommit`, `commitArrays!`); true where reduced. False where the model has no
-continuous arrays or needs no reduction. NotHandled, the model unchanged, where the array form does not take the
-plan (der() of an expression, an array's elements treated differently: the caller then takes the scalarized path).
+continuous arrays or needs no reduction. An array whose elements the plan treats differently (slicing) is split into
+its elements first (`splitArrays!`), and the plan committed again. NotHandled where the array form does not take the
+plan (der() of an expression, a split down to no array equations: the caller takes the scalarized path and discards
+the model, which a split may have changed).
 """
 function reduceIndexArrays!(model::IR.Model)::Bool
   hasContinuousArrays(model) || return false
   any(readsDerCall, model.continuous[1].equations) && throw(NotHandled("der() of an expression with arrays kept"))
-  local view = scalarizeArrays(model)
-  local partition = view.model.continuous[1]
-  local written = plan(view.model, partition)
+  local view::Scalarized = scalarizeArrays(model)
+  local partition::IR.Partition = view.model.continuous[1]
+  local written::Union{Nothing, Plan} = plan(view.model, partition)
   written === nothing && return false
   #= the array form of the plan as written first: a plan it does not take is refused before the simulation code's
-     values are computed for the plan again (`knownPlan`) =#
-  arrayCommit(model, model.continuous[1], view, written)
+     values are computed for the plan again (`knownPlan`). Arrays whose elements it treats differently (slicing) are
+     split into their elements, the plan made again on the same element view, until it takes it. =#
+  local splits::Int = 0
+  local arrayElements::Int = sum((length(view.elements.elements[v.name]) for v in model.variables
+                                  if isContinuousArray(v) && haskey(view.elements.elements, v.name)); init = 0)
+  while true
+    try
+      arrayCommit(model, model.continuous[1], view, written)
+      break
+    catch err
+      (err isa NotHandled && needsSplit(err) && splits < 64) || rethrow()
+      splitArrays!(model, view, err.arrays, err.equations)
+      splits += 1
+      #= split down to no array equations, or most of the arrays' elements split: little the array form keeps, the
+         scalarized path is the one (MSL EngineV6: its frames' vectors and rotations, 10877 elements split) =#
+      local kept::Int = sum((length(view.elements.elements[v.name]) for v in model.variables
+                             if isContinuousArray(v) && haskey(view.elements.elements, v.name)); init = 0)
+      (hasArrayEquations(model) && 2 * kept >= arrayElements) ||
+        throw(NotHandled("slicing that splits most of the arrays ($(arrayElements - kept) of $(arrayElements) elements, " *
+                         "starting at $(err.reason))"))
+      view = scalarizeArrays(model)
+      partition = view.model.continuous[1]
+      written = plan(view.model, partition)
+      written === nothing && return false
+    end
+  end
   local known = KNOWN_VALUES[] === nothing ? Dict{Symbol, IR.Expression}() : KNOWN_VALUES[](view.model)
   local p = isempty(known) ? written : plan(view.model, partition; known)
   p === nothing && return false

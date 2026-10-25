@@ -2984,6 +2984,12 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   local matchRow = _match(el, nU)
   local (batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}}, pos::Vector{Int}, producer::Vector{Int}, loops::LoopBlocks) =
     _schedule(el, matchRow, nU)
+  if _OMBACKEND.envSwitch("OMBACKEND_ARRAY_TRACE")
+    local blockSizes::Dict{Int, Int} = Dict{Int, Int}()
+    foreach(b::Vector{Int} -> (blockSizes[length(b)] = get(blockSizes, length(b), 0) + 1), loops.blocks)
+    println("[arraycode] ", length(g.classes), " classes, ", length(el.class), " instances; loop blocks (instances => count): ",
+            sort!(collect(blockSizes)), "; ", length(loops.families), " families")
+  end
   #= algebraic loops in the array code only where it keeps arrays (a class of more than one instance): a model without
      arrays gains nothing from it, and the scalar path solves its loops (tearing) with its initialization and events =#
   local hasArrays::Bool = any(c::EqClass -> size(c.domain, 2) > 1, g.classes)

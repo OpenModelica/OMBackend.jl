@@ -484,11 +484,22 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
     m = _irArrayUnreduced("AngleArray")
     @test _IRd.reduceIndexArrays!(m)
     @test any(eq -> occursin("\$DER.x[i] = (L * (cos(phi[i]) * \$DER.phi[i]))", string(eq)), m.continuous[1].equations)
-    #= a boundary element differs: refused (slicing), the model unchanged =#
+    #= a boundary element differs: x split into its elements (slicing); its only array, so refused: most of the arrays
+       split =#
     m = _irArrayUnreduced("BoundaryArray")
-    local before = (length(m.continuous[1].equations), [string(v.kind) for v in m.variables])
-    @test_throws _IRd.NotHandled _IRd.reduceIndexArrays!(m)
-    @test (length(m.continuous[1].equations), [string(v.kind) for v in m.variables]) == before
+    local refusal::Union{Nothing, _IRd.NotHandled} = try
+      _IRd.reduceIndexArrays!(m)
+      nothing
+    catch err
+      err
+    end
+    @test refusal isa _IRd.NotHandled && occursin("splits most of the arrays", refusal.reason)
+    #= beside an array that stays one: x split, the plan committed, y's for-equation kept =#
+    m = _irArrayUnreduced("BoundaryWithArray")
+    @test _IRd.reduceIndexArrays!(m)
+    @test all(n -> haskey(m.variables, Symbol(n)), ("x[1]", "x[2]", "x[3]")) && !haskey(m.variables, :x)
+    @test m.variables[:y].ty isa _IRM.T_ARRAY && any(eq -> eq isa _IRM.FOR_EQUATION, m.continuous[1].equations)
+    @test m.variables[Symbol("x[2]")].kind isa _IRM.DUMMY_STATE
     #= the derivative unknowns solved in array form (solvedInArrays): each for-equation's body once, its iterator kept;
        the model with its arrays not changed (the scalarized path's) =#
     m = _irArrayUnreduced("InertiaArray")
@@ -547,8 +558,23 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
       @test OMBackend.canonicalName("IndexReduction.PendulumsPrefer") in OMBackend.ARRAY_ODE_MODELS
       @test isapprox(preferKept, _irArraySimulate("PendulumsPrefer", prefer, 2.0; kept = false); atol = 1e-8, rtol = 1e-8)
       local kept = _irArraySimulate("BoundaryArray", ["x[1]", "x[3]"], 1.0; kept = true)
+      #= x split, y kept: array code, the values of x as BoundaryArray's, y[j] = exp(-j t) =#
+      local withArray::Vector{Float64} = _irArraySimulate("BoundaryWithArray", ["x[1]", "x[3]", "y[2]", "y[4]"], 1.0; kept = true)
+      @test OMBackend.canonicalName("IndexReduction.BoundaryWithArray") in OMBackend.ARRAY_ODE_MODELS
+      @test withArray ≈ [exp(-1), 0.5 * exp(-1), exp(-2), exp(-4)] rtol = 1e-6
       @test !(OMBackend.canonicalName("IndexReduction.BoundaryArray") in OMBackend.ARRAY_REDUCED_MODELS)
       @test kept ≈ [exp(-1), 0.5 * exp(-1)] rtol = 1e-4
+      #= records and arrays through functions, a record result, a fixed = false parameter, an if-equation on time, a
+         literal indexed by the iterator, a record variable's array field: array code, as the scalarized path and
+         w1[i]' = drive[i] / 3, drive[i] = i (2 sin(t) + 1) before 0.5, 3 i after =#
+      local recordNames::Vector{String} = ["phi1[1]", "w1[3]", "tau[2]", "drive[2]", "sum1", "weighted[2]"]
+      local records::Vector{Float64} = _irArraySimulate("RecordsArray", recordNames, 1.0; kept = true)
+      @test OMBackend.canonicalName("IndexReduction.RecordsArray") in OMBackend.ARRAY_ODE_MODELS
+      @test isapprox(records, _irArraySimulate("RecordsArray", recordNames, 1.0; kept = false); atol = 1e-8, rtol = 1e-8)
+      local w05::Float64 = (2 * (1 - cos(0.5)) + 0.5) / 3
+      local phi05::Float64 = (2 * (0.5 - sin(0.5)) + 0.125) / 3
+      local phiEnd::Float64 = phi05 + 0.5 * w05 + 0.125
+      @test records ≈ [phiEnd, 3 * w05 + 1.5, 4.0, 6.0, w05 + 0.5 + phiEnd, 0.5 * (2 * w05 + 1.0)] rtol = 1e-7
     end
     #= switch off: the frontend scalarizes =#
     withenv(() -> _irArraySimulate("InertiaArray", ["phi1[1]"], 1.0; kept = true), "OMBACKEND_ARRAY_INDEX_REDUCTION" => "false")

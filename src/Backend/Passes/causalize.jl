@@ -401,7 +401,10 @@ end
 A binding that references a variable with a binding is that binding (`p2 = p1` with
 `p1 = 3` is `p2 = 3`), through chains of references, unless the referenced variable is tunable
 (withTunableParameters: its value may change). The reference is looked up by its name without
-its last subscripts (the previous backend's): a reference to an array's element stays.
+its last subscripts (the previous backend's): a reference to an array's element stays. With arrays
+kept, a reference to an element of an array whose binding is an array value is that value's element
+(MSL MultiBody's `I_31 = I[3, 1]` with `I = resolveDyade1(R, diagonal(...))`: the whole matrix was
+the binding of the scalar I_31).
 """
 function resolveBindingReferences!(model::IR.Model)::IR.Model
   for (variables, _) in partitionsWithVariables(model)
@@ -421,10 +424,13 @@ function resolveBindingReferences!(variables::IR.VariableSet)::Nothing
       v.binding isa IR.CREF || continue
       local target = legacyName(withoutLastSubscripts(v.binding.cref))
       isTunableParameter(target) && continue
-      local b = get(bindings, target, nothing)
+      local b::Union{Nothing, IR.Expression} = get(bindings, target, nothing)
       (b === nothing || b isa IR.CREF) && continue
-      v.binding = b
-      bindings[legacyName(v.cref)] = b
+      local subscripts::Vector{IR.Subscript} = v.binding.cref.parts[end].subscripts
+      local value::IR.Expression = (isempty(subscripts) || !(IR.typeOf(b) isa IR.T_ARRAY)) ? b :
+        Evaluation.selectElement(b, subscripts, v.binding.ty)
+      v.binding = value
+      bindings[legacyName(v.cref)] = value
       changed = true
     end
     changed || return nothing

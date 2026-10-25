@@ -46,9 +46,15 @@ solved in array form: solvedInArrays) to the variables and classes of this modul
   - Start values, fixed attributes and parameter values are evaluated on the model's element view
     (Evaluation.StartValues of scalarizeArrays), each element's own.
 
-Not (yet), NotSupported (the caller takes the scalarized path): when-, if- and array equations,
-algorithms, sample(), a fixed start on a dummy state (the reduced initialization's), parameters
-with fixed = false, records, array operands outside subscripts.
+  - Records reach the code through functions: a record argument by its fields (as the generated
+    functions take it), an array argument as the array of its elements, a record result as the
+    tuple of its fields; an element of an array expression by distributing its subscripts
+    (`selectElement`) or indexing its value. If-equations as the flat model's; parameters with
+    fixed = false unknowns of the initialization.
+
+Not (yet), NotSupported (the caller takes the scalarized path): when- and array equations,
+algorithms, sample(), a fixed start on a dummy state (the reduced initialization's), whole arrays
+in scalar equations, records of records through functions.
 =#
 
 const OIR = OMJLIR
@@ -104,7 +110,8 @@ function _bindingDepsIR(g::Gen, v::OIR.Variable)::Vector{String}
   v.binding === nothing && return deps
   OIR.foreachExp(v.binding) do x::OIR.Expression
     x isa OIR.CREF || return nothing
-    local nm::String = String(OIR.hasSubscripts(x.cref) ? Passes.unsubscriptedName(x.cref) : x.cref.name)
+    local nm::String = (!OIR.hasSubscripts(x.cref) || haskey(g.vars, String(x.cref.name))) ? String(x.cref.name) :
+      String(Passes.unsubscriptedName(x.cref))
     local info::Union{Nothing, VarInfo} = get(g.vars, nm, nothing)
     info !== nothing && info.kind == :param && !(nm in deps) && push!(deps, nm)
     nothing
@@ -172,6 +179,7 @@ function toIR(g::Gen, e::OIR.Expression, ctx::Ctx)::IR
     return Op(:neg, IR[toIR(g, e.exp, ctx)])
   elseif e isa OIR.BINARY
     e.ty isa OIR.T_STRING && return Op(:string, IR[toIR(g, e.exp1, ctx), toIR(g, e.exp2, ctx)])
+    e.op == OIR.SCALAR_PRODUCT && return _scalarProductIRx(g, e, ctx)
     return Op(_binaryOpIR(e.op), IR[toIR(g, e.exp1, ctx), toIR(g, e.exp2, ctx)])
   elseif e isa OIR.LUNARY
     e.op == OIR.NOT || ns("logical operator $(e.op)")
@@ -191,9 +199,13 @@ function toIR(g::Gen, e::OIR.Expression, ctx::Ctx)::IR
     return Op(:if, IR[toIR(g, e.condition, ctx), toIR(g, e.thenExp, ctx), toIR(g, e.elseExp, ctx)])
   elseif e isa OIR.TUPLE_ELEMENT
     e.ty isa Union{OIR.T_ARRAY, OIR.T_RECORD} && ns("an array or record output: $(_strIR(e))")
-    return Op(:index, IR[toIR(g, e.exp, ctx), Lit(e.index)])
+    return Op(:index, IR[toIR(g, e.exp, ctx), Lit(_outputPosition(OIR.typeOf(e.exp), e.index))])
   elseif e isa OIR.CALL
     return _callIRx(g, e, ctx)
+  elseif e isa OIR.SUBSCRIPTED
+    return _subscriptedIRx(g, e, ctx)
+  elseif e isa OIR.RECORD_ELEMENT
+    return _recordElementIRx(g, e, ctx)
   end
   ns("expression $(nameof(typeof(e))): $(_strIR(e))")
 end
@@ -209,17 +221,240 @@ function _crefIRx(g::Gen, e::OIR.CREF, ctx::Ctx)::IR
     haskey(ctx.iters, own) && return Slot(ctx.iters[own])
     (own == "time" && !haskey(g.vars, own)) && return TimeIR()
   end
-  local name::String = String(OIR.hasSubscripts(cr) ? Passes.unsubscriptedName(cr) : cr.name)
-  local der::Bool = haskey(g.derOf, name)
-  der && (name = g.derOf[name])
-  local info::Union{Nothing, VarInfo} = get(g.vars, name, nothing)
-  info === nothing && ns("unknown variable $(name)")
-  local subscripts::Vector{OIR.Subscript} = Passes.allSubscripts(cr)
-  isempty(subscripts) && !isempty(info.dims) && ns("the array $(name) as a whole in an equation of scalars")
-  length(subscripts) == length(info.dims) || ns("partial subscripts on $(name)")
+  #= an element variable of its own (an array split for index reduction, `x[2]`), else the array it subscripts =#
+  local whole::Bool = !OIR.hasSubscripts(cr) || haskey(g.vars, String(cr.name)) || haskey(g.derOf, String(cr.name))
+  local name::String = whole ? String(cr.name) : String(Passes.unsubscriptedName(cr))
+  local subscripts::Vector{OIR.Subscript} = whole ? OIR.Subscript[] : Passes.allSubscripts(cr)
   local subs::Vector{IR} = IR[s isa OIR.INDEX ? toIR(g, s.exp, ctx) : ns("a slice of $(name)") for s in subscripts]
-  der && info.kind != :state && ns("der of non-state $(name)")
-  return Ref(name, subs, der)
+  return _elementRefIR(g, name, subs)
+end
+
+"""
+The element `subs` (all of its subscripts, or none for a scalar) of the variable `name`; of a state derivative's link
+(`\$STATEDER.x`) der of the state's element.
+"""
+function _elementRefIR(g::Gen, name::String, subs::Vector{IR})::IR
+  local der::Bool = haskey(g.derOf, name)
+  local target::String = der ? g.derOf[name] : name
+  local info::Union{Nothing, VarInfo} = get(g.vars, target, nothing)
+  info === nothing && ns("unknown variable $(target)")
+  isempty(subs) && !isempty(info.dims) && ns("the array $(target) as a whole in an equation of scalars")
+  length(subs) == length(info.dims) || ns("partial subscripts on $(target)")
+  der && info.kind != :state && ns("der of non-state $(target)")
+  return Ref(target, subs, der)
+end
+
+"""
+A scalar product of two vectors of a known size (MultiBody's `tau = -frame_b.t * e`): the sum of the products of
+their elements (`_subscriptedIRx`).
+"""
+function _scalarProductIRx(g::Gen, e::OIR.BINARY, ctx::Ctx)::IR
+  local ty1::OIR.ModelicaType = OIR.typeOf(e.exp1)
+  local ty2::OIR.ModelicaType = OIR.typeOf(e.exp2)
+  (ty1 isa OIR.T_ARRAY && ty2 isa OIR.T_ARRAY && length(ty1.dimensions) == 1 && ty1.dimensions[1] isa OIR.DIM_SIZE) ||
+    ns("a scalar product of $(_strIR(e))")
+  local terms::Vector{IR} = IR[]
+  for k in 1:ty1.dimensions[1].size
+    local index::Vector{OIR.Subscript} = OIR.Subscript[OIR.INDEX(OIR.INTEGER(k))]
+    push!(terms, Op(:*, IR[toIR(g, OIR.SUBSCRIPTED(e.exp1, index, ty1.elementType), ctx),
+                           toIR(g, OIR.SUBSCRIPTED(e.exp2, index, ty2.elementType), ctx)]))
+  end
+  isempty(terms) && return Lit(0.0)
+  return foldl((a::IR, b::IR) -> Op(:+, IR[a, b]), terms)
+end
+
+"""
+An element of an array expression (`{155, 155, 155}[\$i1]`, `(R.T * v)[i]`, `resolve1(R, v)[i]`): of element-wise
+arithmetic, a product, a literal by literal subscripts the element distributed (`Evaluation.selectElement`); of an
+array variable its element; of an array literal the element at the subscripts (the literal array indexed, else the
+vector of its elements); of a function's array result or a record's array field the value indexed.
+"""
+function _subscriptedIRx(g::Gen, e::OIR.SUBSCRIPTED, ctx::Ctx)::IR
+  local field::OIR.Expression = _fieldExpression(e)
+  field === e || return toIR(g, field, ctx)
+  all(s::OIR.Subscript -> s isa OIR.INDEX, e.subscripts) || ns("a slice of $(_strIR(e))")
+  local picked::OIR.Expression = _EV.selectElement(e.exp, e.subscripts, e.ty)
+  picked isa OIR.SUBSCRIPTED || return toIR(g, picked, ctx)
+  local base::OIR.Expression = _fieldExpression(picked.exp)
+  base === picked.exp || return toIR(g, OIR.SUBSCRIPTED(base, picked.subscripts, e.ty), ctx)
+  if base isa OIR.CREF
+    #= the reference subscripted (an element variable of its own where the array was split: `R.T[1,2]`) =#
+    local last::OIR.CrefPart = base.cref.parts[end]
+    local parts::Vector{OIR.CrefPart} = OIR.CrefPart[base.cref.parts[1:end - 1]...,
+                                                     OIR.CrefPart(last.name, _composedSubscripts(last.subscripts, picked.subscripts), last.ty)]
+    return _crefIRx(g, OIR.CREF(OIR.ComponentRef(parts), e.ty), ctx)
+  end
+  local subs::Vector{IR} = IR[toIR(g, (s::OIR.INDEX).exp, ctx) for s in picked.subscripts]
+  if base isa OIR.ARRAY
+    local literal::Union{Nothing, Array} = _literalArrayIR(base)
+    literal === nothing || return Op(:index, IR[Lit(literal); subs])
+    length(subs) == 1 || ns("an array of arrays subscripted: $(_strIR(e))")
+    return Op(:index, IR[Op(:vect, IR[toIR(g, x, ctx) for x in base.elements]), subs[1]])
+  end
+  #= another array (a built-in's: `cat(2, {{0.0}, ...}, ...)[\$i1, \$i2]`) by subscripts not all literal: its value
+     (its elements by literal subscripts, `_valueIRx`) indexed =#
+  local literalSubscripts::Bool = all(s::OIR.Subscript -> (s::OIR.INDEX).exp isa OIR.INTEGER, picked.subscripts)
+  (_isFunctionCall(g, base) || base isa OIR.RECORD_ELEMENT || !literalSubscripts) || ns("an element of $(_strIR(base))")
+  return Op(:index, IR[_valueIRx(g, base, ctx); subs])
+end
+
+"""
+A record's field read by its position (`absoluteRotation(R1, R2)[1]`: the frontend reads a field of a record-valued
+call so) as the record element; a field of a record literal or variable the field itself (`_fieldOf`); another
+expression as it is.
+"""
+function _fieldExpression(e::OIR.Expression)::OIR.Expression
+  if e isa OIR.SUBSCRIPTED && length(e.subscripts) == 1 && e.subscripts[1] isa OIR.INDEX
+    local position::OIR.Expression = (e.subscripts[1]::OIR.INDEX).exp
+    local rty::OIR.ModelicaType = OIR.typeOf(e.exp)
+    if position isa OIR.INTEGER && rty isa OIR.T_RECORD
+      local f::OIR.Field = rty.fields[position.value]
+      return _fieldExpression(OIR.RECORD_ELEMENT(e.exp, position.value, f.name, f.ty))
+    end
+  end
+  if e isa OIR.RECORD_ELEMENT && e.exp isa Union{OIR.CREF, OIR.RECORD}
+    local recordType::OIR.ModelicaType = OIR.typeOf(e.exp)
+    recordType isa OIR.T_RECORD && return _fieldOf(e.exp, e.index, recordType.fields[e.index])
+  end
+  return e
+end
+
+"""
+The subscripts of a reference `x[outer]` subscripted again by `inner`: a slice (`phi1[1:2]`) or a whole dimension
+indexed by the next inner subscript (a literal range's element, or `first + step * (k - 1)`), an index kept, the
+inner subscripts left after them appended.
+"""
+function _composedSubscripts(outer::Vector{OIR.Subscript}, inner::Vector{OIR.Subscript})::Vector{OIR.Subscript}
+  local out::Vector{OIR.Subscript} = OIR.Subscript[]
+  local next::Int = 1
+  for s in outer
+    if s isa OIR.INDEX
+      push!(out, s)
+      continue
+    end
+    next <= length(inner) || ns("a slice subscripted partly")
+    local k::OIR.Expression = (inner[next]::OIR.INDEX).exp
+    next += 1
+    if s isa OIR.WHOLE
+      push!(out, OIR.INDEX(k))
+      continue
+    end
+    local range::Union{Nothing, StepRange{Int, Int}} = _IRD.literalRange(_IRD.foldTree((s::OIR.SLICE).exp))
+    range === nothing && ns("a slice by $(_strIR(s.exp))")
+    push!(out, OIR.INDEX(k isa OIR.INTEGER ? OIR.INTEGER(range[k.value]) :
+      _IRD.foldTree(OIR.BINARY(OIR.INTEGER(first(range) - step(range)), OIR.ADD,
+                               OIR.BINARY(OIR.INTEGER(step(range)), OIR.MUL, k, OIR.T_INTEGER()), OIR.T_INTEGER()))))
+  end
+  append!(out, inner[next:end])
+  return out
+end
+
+"The value of an array literal of literals (a vector, a matrix of rows of equal length); `nothing` for another."
+function _literalArrayIR(e::OIR.ARRAY)::Union{Nothing, Array}
+  isempty(e.elements) && return nothing
+  all(x::OIR.Expression -> x isa Union{OIR.INTEGER, OIR.REAL, OIR.BOOLEAN}, e.elements) &&
+    return map(x::OIR.Expression -> x.value, e.elements)
+  all(x::OIR.Expression -> x isa OIR.ARRAY, e.elements) || return nothing
+  local rows::Vector{Union{Nothing, Array}} = Union{Nothing, Array}[_literalArrayIR(x) for x in e.elements]
+  all(r::Union{Nothing, Array} -> r !== nothing && ndims(r) == 1 && length(r) == length(rows[1]), rows) || return nothing
+  return permutedims(reduce(hcat, rows))
+end
+
+"Whether `e` calls a Modelica function of the model (`_functionDefinitions`)."
+_isFunctionCall(g::Gen, e::OIR.Expression)::Bool =
+  e isa OIR.CALL && !e.attributes.builtin && haskey(g.functions, replace(String(e.name), "." => "_"))
+
+"""
+The position of output `k` of a call of type `ty` in the tuple a generated function returns: a record output is its
+fields (`generateIOL`).
+"""
+function _outputPosition(ty::OIR.ModelicaType, k::Int)::Int
+  ty isa OIR.T_TUPLE || return k
+  return 1 + sum((t isa OIR.T_RECORD ? length(t.fields) : 1 for t in ty.types[1:k - 1]); init = 0)
+end
+
+"""
+The value of an expression as a function's argument: a scalar's (`toIR`); an array's the array of its elements
+(column-major, `Op(:arrayval)`), of a function's array result the call's, of a record's array field the field's.
+"""
+function _valueIRx(g::Gen, x::OIR.Expression, ctx::Ctx)::IR
+  local e::OIR.Expression = _fieldExpression(x)
+  local ty::OIR.ModelicaType = OIR.typeOf(e)
+  ty isa OIR.T_ARRAY || return toIR(g, e, ctx)
+  _isFunctionCall(g, e) && return _functionCallIRx(g, e::OIR.CALL, ctx)
+  e isa OIR.RECORD_ELEMENT && !(e.exp isa Union{OIR.CREF, OIR.RECORD}) && return _recordElementIRx(g, e, ctx)
+  local dims::Vector{Int} = Int[d isa OIR.DIM_SIZE ? d.size : ns("an array argument of a size not known: $(_strIR(e))")
+                                for d in ty.dimensions]
+  prod(dims) <= MAX_REDUCTION_TERMS || ns("an array argument of $(prod(dims)) elements")
+  local elements::Vector{IR} = IR[]
+  for t in Iterators.product((1:d for d in dims)...)   #= column-major: the first index fastest =#
+    local subscripts::Vector{OIR.Subscript} = OIR.Subscript[OIR.INDEX(OIR.INTEGER(i)) for i in t]
+    push!(elements, toIR(g, OIR.SUBSCRIPTED(e, subscripts, ty.elementType), ctx))
+  end
+  #= a constant array: its value in the code =#
+  if all(x::IR -> x isa Lit, elements)
+    local constant::Vector = map(x::IR -> (x::Lit).v, elements)
+    return Lit(length(dims) == 1 ? constant : reshape(constant, dims...))
+  end
+  return Op(:arrayval, IR[Lit(Tuple(dims)); elements])
+end
+
+"""
+Field `k` (`f`) of a record expression: of a record literal its element, of a reference to a record variable the
+field's reference (`R.T`), of another (a call) its record element.
+"""
+function _fieldOf(a::OIR.Expression, k::Int, f::OIR.Field)::OIR.Expression
+  a isa OIR.RECORD && return a.elements[k]
+  a isa OIR.CREF && return OIR.CREF(OIR.ComponentRef(OIR.CrefPart[a.cref.parts..., OIR.CrefPart(f.name, OIR.Subscript[], f.ty)]), f.ty)
+  return OIR.RECORD_ELEMENT(a, k, f.name, f.ty)
+end
+
+"""
+A field of a record value: of a record literal or a record variable the field (`_fieldOf`), of a function's record
+result the call's tuple at the field (the function returns a record by its fields, `generateIOL`).
+"""
+function _recordElementIRx(g::Gen, e::OIR.RECORD_ELEMENT, ctx::Ctx)::IR
+  local rty::OIR.ModelicaType = OIR.typeOf(e.exp)
+  rty isa OIR.T_RECORD || ns("a field of $(_strIR(e.exp)), not a record")
+  e.exp isa Union{OIR.CREF, OIR.RECORD} && return _valueIRx(g, _fieldOf(e.exp, e.index, rty.fields[e.index]), ctx)
+  _isFunctionCall(g, e.exp) || ns("a field of $(_strIR(e.exp))")
+  any(f::OIR.Field -> f.ty isa OIR.T_RECORD, rty.fields) && ns("a record result with record fields: $(_strIR(e.exp))")
+  local call::IR = _functionCallIRx(g, e.exp::OIR.CALL, ctx)
+  return g.functions[replace(String((e.exp::OIR.CALL).name), "." => "_")] == 1 ? call : Op(:index, IR[call, Lit(e.index)])
+end
+
+"""
+An argument's values (onto `out`): a record's fields each (a generated function takes a record by its fields, `R_T`,
+`R_w`: `generateIOL`), an array's or a scalar's value (`_valueIRx`).
+"""
+function _argumentsIRx!(out::Vector{IR}, g::Gen, a::OIR.Expression, ctx::Ctx)::Nothing
+  local ty::OIR.ModelicaType = OIR.typeOf(a)
+  if ty isa OIR.T_RECORD
+    for (k, f) in enumerate(ty.fields)
+      f.ty isa OIR.T_RECORD && ns("a record argument with record fields: $(_strIR(a))")
+      push!(out, _valueIRx(g, _fieldOf(a, k, f), ctx))
+    end
+  else
+    push!(out, _valueIRx(g, a, ctx))
+  end
+  return nothing
+end
+
+"""
+A call of a Modelica function of the model (`_isFunctionCall`) as its value: its arguments' values
+(`_argumentsIRx!`); of a function of more outputs typed as its first, that output; of a record result the tuple of
+its fields (and the outputs after it).
+"""
+function _functionCallIRx(g::Gen, e::OIR.CALL, ctx::Ctx)::IR
+  local jn::String = replace(String(e.name), "." => "_")
+  local callArgs::Vector{IR} = IR[]
+  for a in e.arguments
+    _argumentsIRx!(callArgs, g, a, ctx)
+  end
+  local call::IR = Op(:fcall, IR[Lit(Symbol(jn)), callArgs...])
+  #= the outputs counted as returned, a record by its fields (generateIOL): a record result is the tuple's first =#
+  g.functions[jn] > 1 && !(e.ty isa Union{OIR.T_TUPLE, OIR.T_RECORD}) && (call = Op(:index, IR[call, Lit(1)]))
+  return call
 end
 
 function _callIRx(g::Gen, e::OIR.CALL, ctx::Ctx)::IR
@@ -262,18 +497,11 @@ function _callIRx(g::Gen, e::OIR.CALL, ctx::Ctx)::IR
     fname in ("mod", "rem") || return v
     return Op(:-, IR[xs[1], Op(:*, IR[v, xs[2]])])
   end
-  #= a Modelica function of the model (_functionDefinitions), of scalar arguments =#
-  local jn::String = replace(fname, "." => "_")
-  if haskey(g.functions, jn)
-    local callArgs::Vector{IR} = IR[]
-    for a in args
-      OIR.typeOf(a) isa Union{OIR.T_ARRAY, OIR.T_RECORD} && ns("function $(fname) with an array or record argument")
-      push!(callArgs, toIR(g, a, ctx))
-    end
-    e.ty isa Union{OIR.T_ARRAY, OIR.T_RECORD} && ns("function $(fname) of an array or record result")
-    local call::IR = Op(:fcall, IR[Lit(Symbol(jn)), callArgs...])
-    g.functions[jn] > 1 && !(e.ty isa OIR.T_TUPLE) && (call = Op(:index, IR[call, Lit(1)]))
-    return call
+  #= a Modelica function of the model (_functionDefinitions); its array or record result only under a subscript or
+     a field (_subscriptedIRx, _recordElementIRx) =#
+  if _isFunctionCall(g, e)
+    e.ty isa Union{OIR.T_ARRAY, OIR.T_RECORD} && ns("function $(fname) of an array or record result outside an element")
+    return _functionCallIRx(g, e, ctx)
   end
   local jf::Union{Nothing, Symbol} = startswith(fname, "Modelica.Math.") && fname[15:end] in MATH_WRAPPED ?
     MATH_BUILTINS[fname[15:end]] : get(MATH_BUILTINS, fname, nothing)
@@ -294,6 +522,13 @@ function _addEquationIR!(g::Gen, eq::OIR.Equation, iterNames::Vector{String}, id
     range === nothing && ns("for range $(_strIR(eq.iterator.range))")
     local values::Vector{Int} = collect(Int, range)
     isempty(values) && return
+    if any(b::OIR.Equation -> _readsElementArray(g, b), eq.body)
+      #= unrolled: each iteration's equations read the elements by literal subscripts (like ones one class again) =#
+      for value in values, b in eq.body
+        _addEquationIR!(g, _withIteratorIR(b, Dict{Symbol, Int}(eq.iterator.name => value)), iterNames, idom; initial = initial)
+      end
+      return
+    end
     local dom::Matrix{Int} = _crossDomain(idom, values)
     for b in eq.body
       _addEquationIR!(g, b, [iterNames; String(eq.iterator.name)], dom; initial = initial)
@@ -307,6 +542,9 @@ function _addEquationIR!(g::Gen, eq::OIR.Equation, iterNames::Vector{String}, id
     ctx.nsam[] == 0 || ns("sample() in an equation")
     push!(initial ? g.initClasses : g.classes, EqClass(lhs, rhs, nIter, idom, ctx.nrel[], _strIR(eq)))
     return
+  elseif eq isa OIR.IF_EQUATION
+    _addIfEquationIR!(g, eq, iterNames, idom; initial = initial)
+    return
   elseif eq isa OIR.ASSERT_EQUATION
     local actx::Ctx = Ctx(iters, Int[], Base.RefValue(0), true)
     push!(initial ? g.initAsserts : g.asserts,
@@ -316,6 +554,75 @@ function _addEquationIR!(g::Gen, eq::OIR.Equation, iterNames::Vector{String}, id
   end
   ns("$(nameof(typeof(eq))) in an OMJLIR model: $(_strIR(eq))")
 end
+
+"""
+An if-equation (`_addDynamicIf!` of the flat model's): on conditions of parameters and iterators each instance its
+branch's equations; on a variable condition each variable its branches assign (`v = e` in every branch and the else)
+one class `v = if c1 then e1 elseif ... else en`.
+"""
+function _addIfEquationIR!(g::Gen, eq::OIR.IF_EQUATION, iterNames::Vector{String}, idom::Matrix{Int}; initial::Bool = false)
+  local iters::Dict{String, Int} = Dict{String, Int}(n => k for (k, n) in enumerate(iterNames))
+  local nIter::Int = length(iterNames)
+  local bodies::Vector{Vector{OIR.Equation}} = Vector{OIR.Equation}[[br.equations for br in eq.branches]; [eq.elseEquations]]
+  local staticCtx::Ctx = Ctx(iters, Int[], Base.RefValue(0), true)
+  local conditions::Vector{IR} = IR[toIR(g, br.condition, staticCtx) for br in eq.branches]
+  if all(c::IR -> _isStatic(g, c), conditions)
+    local groups::Vector{Vector{Int}} = Vector{Int}[Int[] for _ in bodies]
+    for j in 1:size(idom, 2)
+      local k::Union{Nothing, Int} = findfirst(c::IR -> _evalStatic(g, c, idom, j) == true, conditions)
+      push!(groups[k === nothing ? length(bodies) : k], j)
+    end
+    for (body, cols) in zip(bodies, groups)
+      isempty(cols) && continue
+      foreach(b::OIR.Equation -> _addEquationIR!(g, b, iterNames, idom[:, cols]; initial = initial), body)
+    end
+    return
+  end
+  local keyed::Vector{Dict{String, OIR.SCALAR_EQUATION}} = Dict{String, OIR.SCALAR_EQUATION}[]
+  for body in bodies
+    local assigned::Dict{String, OIR.SCALAR_EQUATION} = Dict{String, OIR.SCALAR_EQUATION}()
+    for b in body
+      (b isa OIR.SCALAR_EQUATION && b.lhs isa OIR.CREF) || ns("if-equation on a variable condition: branch equation $(_strIR(b))")
+      local key::String = String(b.lhs.cref.name)
+      haskey(assigned, key) && ns("if-equation on a variable condition: two equations for $(key)")
+      assigned[key] = b
+    end
+    push!(keyed, assigned)
+  end
+  all(d::Dict{String, OIR.SCALAR_EQUATION} -> Set(keys(d)) == Set(keys(keyed[1])), keyed) ||
+    ns("if-equation on a variable condition: branches give different variables")
+  for key in sort!(collect(keys(keyed[1])))
+    local ctx::Ctx = Ctx(iters, Int[], Base.RefValue(0), initial)
+    local lhs::IR = toIR(g, keyed[1][key].lhs, ctx)
+    local rhs::IR = toIR(g, keyed[end][key].rhs, ctx)
+    for i in length(eq.branches):-1:1
+      rhs = Op(:if, IR[toIR(g, eq.branches[i].condition, ctx), toIR(g, keyed[i][key].rhs, ctx), rhs])
+    end
+    ctx.nsam[] == 0 || ns("sample() in an equation")
+    push!(initial ? g.initClasses : g.classes,
+          EqClass(lhs, rhs, nIter, idom, initial ? 0 : ctx.nrel[], "$(key) = if ... ($(_strIR(eq.branches[1].condition)))"))
+  end
+end
+
+"""
+Whether the equation reads an array that is no variable by subscripts (`frame_a.R.w[\$i1]`: a record's array field,
+whose elements are variables of their own, `expandRecordFieldArrays!`, read by a for-equation rolled before).
+"""
+function _readsElementArray(g::Gen, eq::OIR.Equation)::Bool
+  local found::Bool = false
+  OIR.foreachExp(eq) do x::OIR.Expression
+    (x isa OIR.SUBSCRIPTED && x.exp isa OIR.CREF && !OIR.hasSubscripts(x.exp.cref) && OIR.typeOf(x.exp) isa OIR.T_ARRAY) ||
+      return nothing
+    local nm::String = String(x.exp.cref.name)
+    (haskey(g.vars, nm) || haskey(g.derOf, nm)) || (found = true)
+    nothing
+  end
+  return found
+end
+
+"A copy of the equation `eq` with the iterators of `values` replaced by their values (`withIterators`)."
+_withIteratorIR(eq::OIR.Equation, values::Dict{Symbol, Int})::OIR.Equation =
+  OIR.mapEquation!(x::OIR.Expression -> _IRD.withIterators(x, values), deepcopy(eq))
 
 function _generateIR(model::OIR.Model, modelName::String; functions::Union{Nothing, FunctionList} = nothing)::Expr
   (length(model.continuous) == 1 && isempty(model.clocked) && isempty(model.modes)) ||
@@ -358,15 +665,27 @@ function _generateIR(model::OIR.Model, modelName::String; functions::Union{Nothi
     end
     local dims::Vector{Int} = _dimsIR(v)
     local n::Int = isempty(dims) ? 1 : prod(dims)
-    local names::Vector{Symbol} = get(E.elements, v.name, Symbol[v.name])
+    #= the element view's elements; of a record field array of a parameter (its elements parameters of their own, the
+       array kept for a call's whole argument: `expandRecordFieldArrays`) its elements' references =#
+    local names::Vector{Symbol} = haskey(E.elements, v.name) ? E.elements[v.name] :
+      (!isempty(dims) && kind isa Union{OIR.PARAMETER, OIR.CONSTANT}) ?
+        Symbol[_IRD.modelElementCref(v, index).name for index in Passes.rowMajor(dims)] : Symbol[v.name]
     length(names) == n || ns("the elements of $(nm)")
     local elementNames::Vector{String} = String.(names)
     local vtype::Symbol = _vtypeIR(v.ty)
     local perPart::Vector{Int} = Int[length(dims)]
     if kind isa Union{OIR.PARAMETER, OIR.CONSTANT}
-      any(x::Symbol -> !fixedOf(x, true), names) && ns("parameter $(nm) with fixed = false")
+      #= fixed = false: an unknown of the initialization (its initial equations), from its start =#
+      local free::Vector{Bool} = Bool[!fixedOf(x, true) for x in names]
+      (any(free) && !all(free)) && ns("parameter $(nm) with fixed = false on some elements")
       local value::Any = nothing
-      if vtype != :other
+      if all(free)
+        v.binding === nothing || ns("parameter $(nm) with fixed = false and a binding")
+        push!(g.freeParams, nm)
+        local starts::Vector{Float64} = startOf.(names)
+        value = isempty(dims) ? starts[1] :
+          length(dims) == 1 ? starts : permutedims(reshape(starts, reverse(dims)...), length(dims):-1:1)
+      elseif vtype != :other
         local vals::Vector{Any} = Any[]
         for x in names
           local elementValue::Union{Nothing, Float64} = values(x)
@@ -379,7 +698,7 @@ function _generateIR(model::OIR.Model, modelName::String; functions::Union{Nothi
       g.vars[nm] = VarInfo(:param, dims, perPart, 0, vtype, IRVariable(v, elementNames, value))
       continue
     end
-    v.binding === nothing || ns("the binding of $(nm), not a parameter")
+    #= a variable's binding is an equation of the partition already (Passes.addBindingEquations!) =#
     if kind isa OIR.STATE
       vtype == :real || ns("the state $(nm), not Real")
       g.vars[nm] = VarInfo(:state, dims, perPart, g.nStates, :real, IRVariable(v, elementNames, nothing))
@@ -387,6 +706,13 @@ function _generateIR(model::OIR.Model, modelName::String; functions::Union{Nothi
       append!(u0, startOf.(names))
       append!(fixedMask, Bool[fixedOf(x, false) for x in names])
       append!(stateNamesOrdered, elementNames)
+    elseif kind isa OIR.DISCRETE || (kind isa OIR.ALGEBRAIC && vtype in (:int, :bool))
+      vtype == :other && ns("the discrete variable $(nm) of type $(v.ty)")
+      #= an Integer or Boolean an equation computes (MultiBody's colors): discrete, in the discrete buffer =#
+      g.vars[nm] = VarInfo(:discrete, dims, perPart, g.nDiscrete, vtype, IRVariable(v, elementNames, nothing))
+      g.nDiscrete += n
+      append!(d0, startOf.(names))
+      append!(discreteNamesOrdered, elementNames)
     elseif kind isa Union{OIR.ALGEBRAIC, OIR.DUMMY_STATE, OIR.DUMMY_DER}
       vtype == :real || ns("the algebraic variable $(nm), not Real")
       local fixed::Vector{Bool} = Bool[fixedOf(x, false) for x in names]
@@ -396,12 +722,6 @@ function _generateIR(model::OIR.Model, modelName::String; functions::Union{Nothi
       g.nAlg += n
       append!(a0, startOf.(names))
       append!(algNamesOrdered, elementNames)
-    elseif kind isa OIR.DISCRETE
-      vtype == :other && ns("the discrete variable $(nm) of type $(v.ty)")
-      g.vars[nm] = VarInfo(:discrete, dims, perPart, g.nDiscrete, vtype, IRVariable(v, elementNames, nothing))
-      g.nDiscrete += n
-      append!(d0, startOf.(names))
-      append!(discreteNamesOrdered, elementNames)
     else
       ns("the variable $(nm) of kind $(nameof(typeof(kind)))")
     end

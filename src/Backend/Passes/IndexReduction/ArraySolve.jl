@@ -84,11 +84,11 @@ any subscripts), a solved scalar by its name; `nothing` for another.
 """
 function solvedTarget(x::IR.Expression, E::Elements, templates::Dict{Symbol, SolvedTemplate})::Union{Nothing, Symbol}
   x isa IR.CREF || return nothing
-  if IR.hasSubscripts(x.cref)
-    local array::Symbol = unsubscriptedName(x.cref)
-    return (haskey(E.sizes, array) && haskey(templates, array)) ? array : nothing
-  end
-  return (haskey(templates, x.cref.name) && !haskey(E.sizes, x.cref.name)) ? x.cref.name : nothing
+  #= a scalar of its own first (an element of an array split for index reduction, `x[2]`) =#
+  (haskey(templates, x.cref.name) && !haskey(E.sizes, x.cref.name)) && return x.cref.name
+  IR.hasSubscripts(x.cref) || return nothing
+  local array::Symbol = unsubscriptedName(x.cref)
+  return (haskey(E.sizes, array) && haskey(templates, array)) ? array : nothing
 end
 
 """
@@ -227,6 +227,21 @@ of an array equation, or where the check fails.
 function solvedInArrays(model::IR.Model;
                         known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::Tuple{IR.Model, Vector{Symbol}}
   envSwitch("OMBACKEND_SOLVE_DERIVATIVES") || return (model, Symbol[])
+  #= a derivative array whose elements are solved differently (slicing): split into its elements (`splitArrays!`, in
+     place: the model's meaning, and its scalarized form, unchanged), then solved again =#
+  for _ in 1:64
+    try
+      return solvedInArraysOnce(model; known)
+    catch err
+      (err isa NotHandled && needsSplit(err)) || rethrow()
+      splitArrays!(model, scalarizeArrays(model), err.arrays, err.equations)
+    end
+  end
+  throw(NotHandled("derivatives solved in array form: more splits than 64"))
+end
+
+"`solvedInArrays` without splitting: NotHandled, naming the arrays or for-equations to split, where solved differently."
+function solvedInArraysOnce(model::IR.Model; known::Dict{Symbol, IR.Expression})::Tuple{IR.Model, Vector{Symbol}}
   local view::Scalarized = scalarizeArrays(model)
   local elementPartition::IR.Partition = view.model.continuous[1]
   local solution::Union{Nothing, DerivativeSolution} = derivativeSolution(view.model, elementPartition; known)
@@ -240,6 +255,9 @@ function solvedInArrays(model::IR.Model;
   #= the rows each body's iterations solve, by body; each solved derivative array (or scalar) from one body =#
   local solvedRows::Dict{Tuple{Int, Vector{Int}}, Vector{Pair{Int, Symbol}}} = Dict{Tuple{Int, Vector{Int}}, Vector{Pair{Int, Symbol}}}()
   local bodyOf::Dict{Symbol, Tuple{Int, Vector{Int}}} = Dict{Symbol, Tuple{Int, Vector{Int}}}()
+  #= every array and for-equation solved differently (slicing), collected: split together =#
+  local splitArrays::Set{Symbol} = Set{Symbol}()
+  local splitEquations::Set{Int} = Set{Int}()
   for d in sort!(collect(keys(solution.resolved)))
     local r::Int = solution.equationOf[d]
     local origin::EquationOrigin = view.origins[r]
@@ -247,21 +265,33 @@ function solvedInArrays(model::IR.Model;
     local key::Tuple{Int, Vector{Int}} = (origin.equation, origin.path)
     push!(get!(() -> Pair{Int, Symbol}[], solvedRows, key), r => d)
     local target::Symbol = haskey(E.array, d) ? E.array[d][1] : d
-    get!(bodyOf, target, key) == key ||
-      throw(NotHandled("the elements of the derivative array $(target) solved from different equations (slicing)"))
+    get!(bodyOf, target, key) == key || push!(splitArrays, target)
   end
+  for (target, key) in bodyOf
+    target in splitArrays && continue
+    length(solvedRows[key]) == length(rowsOf[key]) || push!(splitEquations, key[1])
+    (haskey(E.elements, target) && length(solvedRows[key]) != length(E.elements[target])) && push!(splitArrays, target)
+  end
+  (isempty(splitArrays) && isempty(splitEquations)) ||
+    throw(NotHandled("derivative arrays solved element by element differently ($(length(splitArrays)) arrays, " *
+                     "$(length(splitEquations)) for-equations: slicing)", sort!(collect(splitArrays)), sort!(collect(splitEquations))))
   local functions::Dict{Symbol, IR.ModelicaFunction} = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
   local parameters::StartValues = StartValues(model.variables, model.functions; parametersOnly = true)
   local templates::Dict{Symbol, SolvedTemplate} = Dict{Symbol, SolvedTemplate}()
   for (target, key) in bodyOf
     local rows::Vector{Pair{Int, Symbol}} = solvedRows[key]
-    length(rows) == length(rowsOf[key]) ||
-      throw(NotHandled("$(length(rows)) of the $(length(rowsOf[key])) iterations of a for-equation solved for derivatives (slicing)"))
-    haskey(E.elements, target) && length(rows) != length(E.elements[target]) &&
-      throw(NotHandled("$(length(rows)) of the $(length(E.elements[target])) elements of the derivative array $(target) solved (slicing)"))
     local (body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}) = templateBody(partition, key)
-    templates[target] = solvedTemplate(body, iterators, rows, view, E, model, functions, parameters)
+    #= a body its iterations solve for different references, or not in array form: unrolled (slicing) =#
+    try
+      templates[target] = solvedTemplate(body, iterators, rows, view, E, model, functions, parameters)
+    catch err
+      (err isa NotHandled && !isempty(iterators)) || rethrow()
+      push!(splitEquations, key[1])
+    end
   end
+  isempty(splitEquations) ||
+    throw(NotHandled("for-equations whose iterations are solved differently ($(length(splitEquations)): slicing)", Symbol[],
+                     sort!(collect(splitEquations))))
   local resolved::Dict{Symbol, IR.Expression} = resolvedTemplates(templates, E)
   #= the values put in (a copy: the model with its arrays stays the scalarized path's), the bodies their definitions =#
   local equations::Vector{IR.Equation} = deepcopy(partition.equations)
