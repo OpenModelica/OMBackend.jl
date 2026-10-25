@@ -46,6 +46,7 @@ import DiffEqCallbacks
 import OrdinaryDiffEq
 import ADTypes
 import NonlinearSolve
+import Graphs
 
 import ..SimCode
 const SC = SimCode
