@@ -1960,6 +1960,84 @@ struct LoopBlocks
   families::Vector{Vector{Tuple{Int, Int}}}
 end
 
+const _SPARSE = ModelingToolkit.Symbolics.SparseArrays
+const _LINALG = ModelingToolkit.Symbolics.SparseArrays.LinearAlgebra
+
+"""
+    columnColors(S) -> Vector{Int}
+
+A greedy coloring of the columns of the sparse pattern `S`: columns that share no row get one color, so one residual
+evaluation perturbing all of a color's columns gives each of their Jacobian columns (Curtis, Powell, Reid).
+"""
+function columnColors(S::_SPARSE.SparseMatrixCSC{Float64, Int})::Vector{Int}
+  local colors::Vector{Int} = zeros(Int, size(S, 2))
+  local used::Vector{BitVector} = BitVector[]
+  for j in 1:size(S, 2)
+    local rows::Vector{Int} = S.rowval[S.colptr[j]:(S.colptr[j + 1] - 1)]
+    local c::Union{Nothing, Int} = findfirst(u::BitVector -> !any(r::Int -> u[r], rows), used)
+    if c === nothing
+      push!(used, falses(size(S, 1)))
+      c = length(used)
+    end
+    foreach(r::Int -> (used[c][r] = true), rows)
+    colors[j] = c
+  end
+  return colors
+end
+
+"""
+    sparseNewton!(residual!, y, S, colors; abstol, maxiters) -> Bool
+
+Newton on `residual!(res, y) = 0`, `y` in place: the Jacobian of the pattern `S` by forward differences, one residual
+evaluation per color (`columnColors`), factored sparse; within `abstol`, steps go on while they reduce the residuals
+tenfold (to round-off: a DAE solver checks the consistency at its own tolerance); whether the residuals end within
+`abstol` (`false` also for a singular Jacobian or a residual not finite).
+"""
+function sparseNewton!(residual!::Function, y::Vector{Float64}, S::_SPARSE.SparseMatrixCSC{Float64, Int}, colors::Vector{Int};
+                       abstol::Float64, maxiters::Int = 50)::Bool
+  local n::Int = length(y)
+  local r::Vector{Float64} = zeros(n); local rp::Vector{Float64} = zeros(n); local yp::Vector{Float64} = zeros(n)
+  local J::_SPARSE.SparseMatrixCSC{Float64, Int} = copy(S)
+  local groups::Vector{Vector{Int}} = Vector{Int}[Int[] for _ in 1:maximum(colors; init = 0)]
+  foreach(j::Int -> push!(groups[colors[j]], j), 1:n)
+  local h::Vector{Float64} = zeros(n)
+  residual!(r, y)
+  local previous::Float64 = Inf
+  for _ in 1:maxiters
+    all(isfinite, r) || return false
+    local rnorm::Float64 = maximum(abs, r; init = 0.0)
+    (rnorm <= abstol && (rnorm == 0.0 || rnorm > 0.1 * previous)) && return true
+    previous = rnorm
+    for cols in groups
+      yp .= y
+      for j in cols
+        h[j] = sqrt(eps(Float64)) * max(1.0, abs(y[j]))
+        yp[j] += h[j]
+      end
+      residual!(rp, yp)
+      for j in cols, k in _SPARSE.nzrange(J, j)
+        J.nzval[k] = (rp[J.rowval[k]] - r[J.rowval[k]]) / h[j]
+      end
+    end
+    local step::Vector{Float64} = try
+      _LINALG.lu(J) \ r
+    catch err
+      err isa _LINALG.SingularException || rethrow()
+      return false
+    end
+    local before::Vector{Float64} = copy(y)
+    y .-= step
+    residual!(r, y)
+    #= past round-off a step may make the residuals larger: the last iterate kept =#
+    if rnorm <= abstol && !(maximum(abs, r; init = 0.0) < rnorm)
+      y .= before
+      residual!(r, y)
+      return true
+    end
+  end
+  return all(isfinite, r) && maximum(abs, r; init = 0.0) <= abstol
+end
+
 """
 Blocks of more equation instances than this are solved as an index-1 DAE (`DaeLayout`: their unknowns states of the
 solver, a mass matrix), smaller ones by a generated Newton solve per block (`_loopFamilyCode`).
@@ -2996,12 +3074,21 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   (isempty(loops.blocks) || hasArrays) || ns("algebraic loop in a model without arrays (the scalar path solves it)")
   local dae::DaeLayout = _daeLayout(g, el, loops, matchRow)
   local nY::Int = length(dae.ids)
+  local daeBlocks::Vector{Vector{Int}} = Vector{Int}[Int[dae.row[r] for r in loops.blocks[b]]
+                                                     for ((ci, _), batch) in batches if ci == 0 for b in batch if dae.blocks[b]]
+  #= with an array DAE (OMBACKEND_ARRAY_DAE_EVENTS): its unknowns solved with the initial equations (`initialize`) and
+     again in every sweep of an event iteration (`eventIteration!`), so they stay consistent with the relations; off,
+     such a model is the scalar path's (MSL EngineV6 in array code: correct, 15x slower than the scalar path's torn
+     loops, and the default sparse LU refuses its Jacobian after events) =#
   if nY > 0
-    (isempty(g.whens) && !any(c::EqClass -> c.nrel > 0, g.classes) && !any(a::AlgClass -> a.nrel > 0 || a.nwhen > 0, g.algs) &&
-     isempty(g.asserts) && isempty(g.assertTexts)) ||
-      ns("events or asserts in a model with an algebraic loop through the elements (an array DAE)")
-    (isempty(g.initClasses) && isempty(g.freeParams) && isempty(g.initAlgs) && !g.usesInitial) ||
-      ns("initial equations in a model with an algebraic loop through the elements (an array DAE)")
+    (isempty(g.initAlgs)) || ns("initial algorithms in a model with an algebraic loop through the elements (an array DAE)")
+    if !_OMBACKEND.envSwitch("OMBACKEND_ARRAY_DAE_EVENTS")
+      (isempty(g.whens) && !any(c::EqClass -> c.nrel > 0, g.classes) && !any(a::AlgClass -> a.nrel > 0 || a.nwhen > 0, g.algs) &&
+       isempty(g.asserts) && isempty(g.assertTexts)) ||
+        ns("events or asserts in a model with an algebraic loop through the elements (an array DAE; OMBACKEND_ARRAY_DAE_EVENTS)")
+      (isempty(g.initClasses) && isempty(g.freeParams) && !g.usesInitial) ||
+        ns("initial equations in a model with an algebraic loop through the elements (an array DAE; OMBACKEND_ARRAY_DAE_EVENTS)")
+    end
   end
   local deps::Union{Nothing, Vector{Vector{Int}}} = _stateDeps(el, matchRow, batches, producer, loops, dae, g.nStates)
   local pattern = _jacobianPattern(el, matchRow, deps, g.nStates)
@@ -3019,7 +3106,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       foreach(c::Int -> (push!(pattern[1], R); push!(pattern[2], c)), sort!(collect(cols)))
     end
   end
-  local (initUnknowns, initBody, nInit, freeCols) = _initialization(g, deps, producer, fixedMask)
+  #= the initial equations' candidates: the states an instance depends on through the DAE blocks' inputs (their
+     unknowns are solved with the initial equations, `initialize`, not matched to them) =#
+  local initDeps = nY == 0 ? deps :
+    _stateDeps(el, matchRow, batches, producer, loops, DaeLayout(falses(length(loops.blocks)), Int[], Dict{Int, Int}(), zeros(Int, length(el.class))), g.nStates)
+  local (initUnknowns, initBody, nInit, freeCols) = _initialization(g, initDeps, producer, fixedMask)
   #= initial algorithms: code, and what they assign (initial equations may not read it) =#
   local initAlgOuts = Set{String}()
   local collectOuts! = function (stmts)
@@ -3401,6 +3492,15 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= the unknowns of the algebraic loops through the elements, states of the solver after the model's (an index-1
        DAE: their rows of the mass matrix zero) =#
     const DAE_IDS = $(dae.ids)
+    #= the DAE's blocks in the order of the schedule: their slots (an instance's residual row is its unknown's slot),
+       their Jacobians' patterns (of the model's) and column colors =#
+    const DAE_BLOCKS = $(daeBlocks)
+    const DAE_PATTERNS = $(jacProto === :(nothing) ? nothing :
+      :(begin
+          local S = $jacProto
+          [S[$nStates .+ b, $nStates .+ b] for b in DAE_BLOCKS]
+        end))
+    const DAE_COLORS = DAE_PATTERNS === nothing ? nothing : [$(columnColors)(S) for S in DAE_PATTERNS]
     const N_DAE = $(nY)
     #= initialization: the states the initial equations determine (one per residual) =#
     const INIT_UNKNOWNS = $(initStates)
@@ -3567,74 +3667,125 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
        initial equations determine, solved for them. =#
     function initialize(u0, p, t)
       local nS = length(INIT_UNKNOWNS)
+      local nP = length(INIT_PARAMS)
+      local nX = length(u0) - N_DAE
       local u = copy(u0)
       local du = similar(u); local a = similar(u, $nAlg)
       local setUnknowns! = function (uu, z)
         uu[INIT_UNKNOWNS] .= view(z, 1:nS)
-        p.values[INIT_PARAMS] .= view(z, (nS + 1):length(z))
+        p.values[INIT_PARAMS] .= view(z, (nS + 1):(nS + nP))
         return uu
       end
+      #= the DAE's unknowns: first as guessed (the initial equations mostly read none of them: EngineV6's parameters
+         with fixed = false, from parameters), then solved for the result (initializeDAE!); where the initial equations
+         then do not hold, solved again with the DAE's unknowns solved in each evaluation (`nested`), from the last
+         solution =#
+      local ylast = u0[(nX + 1):end]
+      local nested = Ref(false)
       #= the relations keep their values during a solve =#
       local residual = function (res, z, _)
         local uz = similar(z, length(u0))
         uz .= u0
         setUnknowns!(uz, z)
+        if N_DAE > 0
+          uz[(nX + 1):end] .= ylast
+          if nested[]
+            initializeDAE!(uz, p, t)
+            ylast .= view(uz, (nX + 1):length(uz))
+          end
+        end
         local duz = similar(uz); local az = similar(uz, $nAlg)
         equations!(duz, az, uz, p, t, nothing, false)
         initialResiduals!(res, duz, az, uz, p, t)
         return nothing
       end
+      local z = vcat(u0[INIT_UNKNOWNS], p.values[INIT_PARAMS])
       #= MLS 8.6, as the MTK path: the relations at the guess, a solve with them, then at the
          solution again, until they settle (a branch the solved state selects); relations that
          cycle (no consistent branch) keep the first solution =#
-      local z = vcat(u0[INIT_UNKNOWNS], p.values[INIT_PARAMS])
-      local first = nothing
-      local seen = Tuple{Vector{Bool}, Vector{Float64}}[]
-      for _ in 1:20
-        equations!(du, a, setUnknowns!(u, z), p, t, nothing, true)
-        local rel0 = copy(p.rel); local e0 = copy(p.evv)
-        if (rel0, e0) in seen
-          equations!(du, a, setUnknowns!(u, first), p, t, nothing, true)
-          return u
+      local solveSettled = function ()
+        local first = nothing
+        local seen = Tuple{Vector{Bool}, Vector{Float64}}[]
+        for _ in 1:20
+          equations!(du, a, setUnknowns!(u, z), p, t, nothing, true)
+          local rel0 = copy(p.rel); local e0 = copy(p.evv)
+          if (rel0, e0) in seen
+            equations!(du, a, setUnknowns!(u, first), p, t, nothing, true)
+            return u
+          end
+          push!(seen, (rel0, e0))
+          local prob = NonlinearSolve.NonlinearProblem(NonlinearSolve.NonlinearFunction(residual), z)
+          local sol = NonlinearSolve.solve(prob, NonlinearSolve.NewtonRaphson(autodiff = ADTypes.AutoFiniteDiff());
+                                           abstol = 1e-10, reltol = 1e-10)
+          #= no solution: refused as the MTK path refuses it (OpenModelica fails there too) =#
+          DifferentialEquations.SciMLBase.successful_retcode(sol) ||
+            $(_OMBACKEND.unsupported)("fixed start values or initial equations that the initialization cannot hold",
+                                      string("the initial system (", sol.retcode, ")"))
+          z = copy(sol.u)
+          first === nothing && (first = copy(z))
+          equations!(du, a, setUnknowns!(u, z), p, t, nothing, true)
+          (p.rel == rel0 && p.evv == e0) && return u
         end
-        push!(seen, (rel0, e0))
-        local prob = NonlinearSolve.NonlinearProblem(NonlinearSolve.NonlinearFunction(residual), z)
-        local sol = NonlinearSolve.solve(prob, NonlinearSolve.NewtonRaphson(autodiff = ADTypes.AutoFiniteDiff());
-                                         abstol = 1e-10, reltol = 1e-10)
-        #= no solution: refused as the MTK path refuses it (OpenModelica fails there too) =#
-        DifferentialEquations.SciMLBase.successful_retcode(sol) ||
-          $(_OMBACKEND.unsupported)("fixed start values or initial equations that the initialization cannot hold",
-                                    string("the initial system (", sol.retcode, ")"))
-        z = copy(sol.u)
-        first === nothing && (first = copy(z))
-        equations!(du, a, setUnknowns!(u, z), p, t, nothing, true)
-        (p.rel == rel0 && p.evv == e0) && return u
+        equations!(du, a, setUnknowns!(u, first), p, t, nothing, true)
+        return u
       end
-      equations!(du, a, setUnknowns!(u, first), p, t, nothing, true)
+      solveSettled()
+      N_DAE == 0 && return u
+      u[(nX + 1):end] .= ylast
+      initializeDAE!(u, p, t)
+      ylast .= view(u, (nX + 1):length(u))
+      local res = zeros(N_INIT)
+      equations!(du, a, u, p, t, nothing, false)
+      initialResiduals!(res, du, a, u, p, t)
+      maximum(abs, res; init = 0.0) <= 1e-8 && return u
+      nested[] = true
+      solveSettled()
+      u[(nX + 1):end] .= ylast
       return u
     end
 
-    #= The DAE unknowns consistent with the states at the start: their residuals solved (Newton, the Jacobian by finite
-       differences); refused where they have no solution. =#
+    #= The DAE unknowns consistent with the states (and the relations): each block's residuals solved for its unknowns,
+       the blocks in the order of the schedule (a block reads the ones before it: MSL EngineV6's cylinders' position
+       loops before the accelerations and forces they couple; all at once, from zero guesses, did not converge), Newton
+       with the Jacobian by finite differences; refused where one has no solution. =#
     function initializeDAE!(u, p, t)
       local nS::Int = length(u) - N_DAE
-      local residual::Function = function (res::AbstractVector, y::AbstractVector, _)
-        local uz::AbstractVector = similar(y, length(u))
-        uz .= u
-        uz[(nS + 1):end] .= y
-        local duz::AbstractVector = similar(uz); local az::AbstractVector = similar(uz, $nAlg)
-        equations!(duz, az, uz, p, t, nothing, false)
-        res .= view(duz, (nS + 1):length(uz))
-        return nothing
+      for (k, slots) in enumerate(DAE_BLOCKS)
+        local at::Vector{Int} = nS .+ slots
+        local residual::Function = function (res::AbstractVector, y::AbstractVector, _)
+          local uz::AbstractVector = similar(y, length(u))
+          uz .= u
+          uz[at] .= y
+          local duz::AbstractVector = similar(uz); local az::AbstractVector = similar(uz, $nAlg)
+          equations!(duz, az, uz, p, t, nothing, false)
+          res .= view(duz, at)
+          return nothing
+        end
+        #= the residuals' tolerance relative to their size at the guess and with the unknowns 0, the size of the
+           equations' terms (EngineV6's gas forces make them 1e9: an absolute 1e-10 is below their round-off, and
+           Newton ran to its iteration limit) =#
+        local r0::Vector{Float64} = zeros(length(at)); local rz::Vector{Float64} = zeros(length(at))
+        residual(r0, u[at], nothing)
+        residual(rz, zeros(length(at)), nothing)
+        local abstol::Float64 = 1e-10 * max(1.0, maximum(abs, r0; init = 0.0), maximum(abs, rz; init = 0.0))
+        #= consistent already (a warm start: the initialization's Jacobian, an event that changed nothing here) =#
+        maximum(abs, r0; init = 0.0) <= abstol && continue
+        #= Newton on the block's sparsity (colored differences, sparse factorization); the dense solve where it fails =#
+        if DAE_PATTERNS !== nothing
+          local y::Vector{Float64} = u[at]
+          if $(sparseNewton!)((res, yy) -> residual(res, yy, nothing), y, DAE_PATTERNS[k], DAE_COLORS[k]; abstol = abstol)
+            u[at] .= y
+            continue
+          end
+        end
+        local prob::NonlinearSolve.NonlinearProblem = NonlinearSolve.NonlinearProblem(NonlinearSolve.NonlinearFunction(residual), u[at])
+        local sol::DifferentialEquations.SciMLBase.NonlinearSolution = NonlinearSolve.solve(prob, NonlinearSolve.NewtonRaphson(autodiff = ADTypes.AutoFiniteDiff());
+                                         abstol = abstol, reltol = 1e-10, maxiters = 50)
+        DifferentialEquations.SciMLBase.successful_retcode(sol) ||
+          $(_OMBACKEND.unsupported)("an algebraic loop through the elements without a solution at the start",
+                                    string("its residuals (", sol.retcode, ")"))
+        u[at] .= sol.u
       end
-      local prob::NonlinearSolve.NonlinearProblem = NonlinearSolve.NonlinearProblem(NonlinearSolve.NonlinearFunction(residual),
-                                                                                   u[(nS + 1):end])
-      local sol::DifferentialEquations.SciMLBase.NonlinearSolution = NonlinearSolve.solve(prob, NonlinearSolve.NewtonRaphson(autodiff = ADTypes.AutoFiniteDiff());
-                                       abstol = 1e-10, reltol = 1e-10)
-      DifferentialEquations.SciMLBase.successful_retcode(sol) ||
-        $(_OMBACKEND.unsupported)("an algebraic loop through the elements without a solution at the start",
-                                  string("its residuals (", sol.retcode, ")"))
-      u[(nS + 1):end] .= sol.u
       return u
     end
 
@@ -3720,6 +3871,12 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         for _ in 1:50
           local relBefore = copy(p.rel); local dBefore = copy(p.d)
           local rBefore = copy(p.ureinit); local wBefore = copy(p.wnew); local eBefore = copy(p.evv)
+          #= the DAE's unknowns for the relations and discrete values of this pass (reinit() sets states only: the
+             unknowns' part of ureinit follows them) =#
+          if N_DAE > 0
+            initializeDAE!(u, p, t)
+            p.ureinit[(length(u) - N_DAE + 1):end] .= view(u, (length(u) - N_DAE + 1):length(u))
+          end
           equations!(du, a, u, p, t, nothing, true, fire)
           whens!(du, a, u, p, t, nothing, true, fire)
           settled = relBefore == p.rel && dBefore == p.d && rBefore == p.ureinit && wBefore == p.wnew &&
@@ -3853,13 +4010,18 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       return changed
     end
 
+    #= The parameters and discrete state of a simulation over `tspan` (before the initialization). =#
+    function modelParameters(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}())
+      return $(paramsType)(flatParameters(isempty(parameters) ? PARAMS : parameterValues(parameters)),
+                           zeros(Bool, N_RELATIONS), copy(D0), copy(D0), zeros(Bool, N_WHENS),
+                           zeros(Bool, length(SAMPLE_START)), [false], [false], copy(U0), copy(U0),
+                           zeros(Bool, N_WHENS), Tuple{Float64, Vector{Float64}}[], zeros(N_RELATIONS), [0.0], [Float64(tspan[2])],
+                           zeros($nAlg), @__MODULE__)
+    end
+
     #= The problem and its event callbacks, as getMTKProblem returns them. =#
     function $(Symbol(modelName, "Model"))(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}())
-      local p = $(paramsType)(flatParameters(isempty(parameters) ? PARAMS : parameterValues(parameters)),
-                              zeros(Bool, N_RELATIONS), copy(D0), copy(D0), zeros(Bool, N_WHENS),
-                              zeros(Bool, length(SAMPLE_START)), [false], [false], copy(U0), copy(U0),
-                              zeros(Bool, N_WHENS), Tuple{Float64, Vector{Float64}}[], zeros(N_RELATIONS), [0.0], [Float64(tspan[2])],
-                              zeros($nAlg), @__MODULE__)
+      local p = modelParameters(tspan; parameters = parameters)
       local u0 = copy(U0)
       N_INIT > 0 && (u0 = initialize(u0, p, tspan[1]))
       N_DAE > 0 && initializeDAE!(u0, p, tspan[1])
@@ -3903,6 +4065,10 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
 
     function simulate(tspan = (0.0, 1.0), solver = Tsit5(); parameters::AbstractDict = Dict{String, Any}(), kwargs...)
       local (prob, callbacks) = $(Symbol(modelName, "Model"))(tspan; parameters = parameters)
+      #= an array DAE: its unknowns consistent from initializeDAE! (at the start, in every event iteration), not the
+         solver's initialization, which checks them at its own tolerance (round-off of 1e9 forces is above it) =#
+      N_DAE > 0 && return DifferentialEquations.solve(prob, solver; callback = callbacks,
+                                                      initializealg = DifferentialEquations.SciMLBase.NoInit(), kwargs...)
       return DifferentialEquations.solve(prob, solver; callback = callbacks, kwargs...)
     end
   end

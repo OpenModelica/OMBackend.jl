@@ -141,9 +141,22 @@ function wholeDerivative(e::IR.CREF, seeds::Seeds{<:ArrayVariables})::IR.Express
   e.ty isa IR.T_ARRAY || return wholeDerivative(e.cref.name, e.ty, seeds)
   if IR.hasSubscripts(e.cref)
     #= a part of an array (a rolled component's vector, `G[\$c].cylinder.e`): that part of its derivative array; of
-       an array without one (a parameter's) zeros, as of a whole array =#
+       an array without one, by literal subscripts its elements' derivatives (a record's array field whose elements are
+       variables, `frame_a.R.w`: theirs; a parameter's: 0), by others zeros where its elements have no derivative (a
+       parameter's), NotHandled where they do =#
     local array = seeds.variable(unsubscriptedName(e.cref))
     if array === nothing
+      local sizes::Vector{Int} = knownSizes(e.ty, "a part of the array $(unsubscriptedName(e.cref))")
+      local subscripts::Vector{IR.Subscript} = allSubscripts(e.cref)
+      if all(x::IR.Subscript -> x isa IR.INDEX && (x::IR.INDEX).exp isa IR.INTEGER, subscripts)
+        local prefix::String = String(unsubscriptedName(e.cref))
+        local given::Vector{Int} = Int[((x::IR.INDEX).exp::IR.INTEGER).value for x in subscripts]
+        return elementsDerivative(prefix, [given; sizes], given, IR.elementType(e.ty), seeds)
+      end
+      local probe::IR.ComponentRef = withIteratorsAsOne(e.cref)
+      local probeElement::Symbol = Symbol(probe.name, "[", join(ones(Int, length(sizes)), ","), "]")
+      seeds.variable(probeElement) === nothing ||
+        throw(NotHandled("the derivative of a part of an array ($(e.cref.name)) whose elements are variables of their own"))
       local zeros::Union{Nothing, IR.Expression} = zeroOf(e)
       zeros === nothing && throw(NotHandled("the derivative of a part of an array ($(e.cref.name)) of a size not known"))
       return zeros
@@ -157,12 +170,18 @@ function wholeDerivative(e::IR.CREF, seeds::Seeds{<:ArrayVariables})::IR.Express
   return d === nothing ? wholeDerivative(e.cref.name, e.ty, seeds) : d
 end
 
+"A reference with every subscript that is not a literal index as 1 (a probe element of a part of an array)."
+withIteratorsAsOne(cref::IR.ComponentRef)::IR.ComponentRef =
+  IR.ComponentRef(IR.CrefPart[IR.CrefPart(p.name, IR.Subscript[(x isa IR.INDEX && (x::IR.INDEX).exp isa IR.INTEGER) ? x : IR.INDEX(IR.INTEGER(1))
+                                                         for x in p.subscripts], p.ty) for p in cref.parts])
+
 """
     arrayElementDerivative(e, seeds) -> Expression
 
 The derivative of an element of an array whose derivative the seeds (`ArrayVariables`) give as a whole: that
-element of the derivative array (`\$DER.x[i]`, `\$DER.c.T[i]`, the subscripts of all parts on its one part); 0 for
-another reference, and with other seeds (the variable has no derivative).
+element of the derivative array (`\$DER.x[i]`, `\$DER.c.T[i]`, the subscripts of all parts on its one part); of a
+slice's element the slice's; of an element of an array that is no variable, its elements' derivatives at the
+subscripts; 0 for another reference, and with other seeds (the variable has no derivative).
 """
 arrayElementDerivative(::IR.CREF, ::Seeds)::IR.Expression = ZERO
 
@@ -172,7 +191,15 @@ function arrayElementDerivative(e::IR.CREF, seeds::Seeds{<:ArrayVariables})::IR.
   if array === nothing
     #= an element of an array split along its inner dimensions: the slice's (`slicedCref`) =#
     local sliced::Union{Nothing, IR.ComponentRef} = slicedCref(e.cref, (n::Symbol) -> seeds.variable(n) !== nothing)
-    return sliced === nothing ? ZERO : derivativeOf(IR.CREF(sliced, e.ty), seeds)
+    sliced === nothing || return derivativeOf(IR.CREF(sliced, e.ty), seeds)
+    #= an element by subscripts of an array that is no variable but whose elements are (a record's array field,
+       `frame_a.R.w[\$i1]`): the array of its elements' derivatives (by name, 0 for a parameter's) at the subscripts =#
+    local last::IR.CrefPart = e.cref.parts[end]
+    if last.ty isa IR.T_ARRAY && length(IR.dimensions(last.ty)) == length(last.subscripts) &&
+       all(p::IR.CrefPart -> isempty(p.subscripts), e.cref.parts[1:end - 1]) && all(x::IR.Subscript -> x isa IR.INDEX, last.subscripts)
+      return foldTree(selectElement(wholeDerivative(unsubscriptedName(e.cref), last.ty, seeds), last.subscripts, e.ty))
+    end
+    return ZERO
   end
   (array isa IR.CREF && array.ty isa IR.T_ARRAY && !IR.hasSubscripts(array.cref) && length(array.cref.parts) == 1) ||
     throw(NotHandled("the derivative of the element $(e.cref.name), its array's derivative $(IR.toString(array))"))

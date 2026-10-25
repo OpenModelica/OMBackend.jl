@@ -186,6 +186,12 @@ end
     local (s2::Vector{Float64}, a2::Vector{Float64}, sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution) = _bothWays("ArrayPath.CoupledLoop", ["x[1]", "v[2]", "x[20]", "v[10]"]; tight...)
     @test isapprox(a2, s2; atol = 1e-9)
     @test length(sol.u[1]) == 40
+    #= with an event in the loop (its unknowns solved again in the event iteration), a when-equation, an assert and an
+       initial equation (x[N] free, solved with the loop's unknowns): OMBACKEND_ARRAY_DAE_EVENTS =#
+    local (s3::Vector{Float64}, a3::Vector{Float64}, _) = withenv(() -> _bothWays("ArrayPath.CoupledLoopEvents", ["x[1]", "v[2]", "x[20]", "v[10]", "crossings"]; tight...),
+                                                                  "OMBACKEND_ARRAY_DAE_EVENTS" => "true")
+    @test isapprox(a3, s3; atol = 1e-8)
+    @test a3[5] == 1.0
     #= nonlinear (the scalarized model's initialization fails here): its residuals at the end =#
     local name::String = _arrayPathTranslate("ArrayPath.CoupledNonlinear"; scalarized = false)
     @test _arrayPathTaken(name)

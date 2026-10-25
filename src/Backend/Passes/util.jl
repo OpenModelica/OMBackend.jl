@@ -264,7 +264,14 @@ function legacyName(cref::IR.ComponentRef)::String
   local io = IOBuffer()
   for (i, p) in enumerate(cref.parts)
     i > 1 && print(io, '_')
-    print(io, p.name)
+    #= a part of rolled components by a literal index: the member (`cylinder3`), as `flatName` =#
+    if p.ty isa IR.T_COMPONENTS && length(p.subscripts) == 1 && p.subscripts[1] isa IR.INDEX && (p.subscripts[1]::IR.INDEX).exp isa IR.INTEGER
+      print(io, p.ty.members[((p.subscripts[1]::IR.INDEX).exp::IR.INTEGER).value])
+      continue
+    end
+    #= a slice's literal subscripts in its name (`T[1,2]`, splitInner!) each in brackets of its own, as subscripts are =#
+    local name::String = String(p.name)
+    print(io, occursin('[', name) ? replace(name, r"\[([0-9]+(?:,[0-9]+)+)\]" => (m::AbstractString) -> "[" * join(split(m[2:end - 1], ','), "][") * "]") : name)
     for sub in p.subscripts
       print(io, '[')
       printLegacySubscript(io, sub)

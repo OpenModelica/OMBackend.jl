@@ -405,4 +405,25 @@ package ArrayPath
     end for;
     -v[N - 1] + 2 * v[N] + 0.1 * v[N] ^ 3 = x[N];
   end CoupledNonlinear;
+  model CoupledLoopEvents "CoupledLoop (an array DAE) with an event in the loop (a forcing from t = 0.5), a when-equation on a state, an assert and an initial equation for x[N]"
+    parameter Integer N = 20;
+    Real x[N](start = {i / N for i in 1:N}, fixed = {i < N for i in 1:N});
+    Real v[N];
+    Integer crossings(start = 0, fixed = true);
+  initial equation
+    x[N] = 0.5;
+  equation
+    for i in 1:N loop
+      der(x[i]) = v[i] - x[i];
+    end for;
+    2 * v[1] - v[2] = x[1] + (if time < 0.5 then 0 else 1);
+    for i in 2:N - 1 loop
+      -v[i - 1] + 3 * v[i] - v[i + 1] = x[i];
+    end for;
+    -v[N - 1] + 2 * v[N] = x[N];
+    when x[1] > 0.1 then
+      crossings = pre(crossings) + 1;
+    end when;
+    assert(v[1] < 100, "v[1] stays below 100");
+  end CoupledLoopEvents;
 end ArrayPath;
