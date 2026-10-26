@@ -127,6 +127,29 @@ _dlogIndex(times, t, tend, right::Bool = false) =
 const _OMBACKEND = parentmodule(parentmodule(@__MODULE__))
 
 """
+    StepRejectingRHS(f)
+
+An array model's right-hand side `f` whose error (a domain error, a Modelica assert or error: the scalar path's
+`_RHS_STEP_ERRORS`) rejects the step: the derivatives NaN, the solver retries smaller; the error is kept until the
+run ends (`_rethrowRHSError` throws it if the run fails), not forgotten when a later call succeeds (the scalar path's
+`_StepRejectingRHS` clears it: an error-level assert in a function ended an array model's run without its message).
+"""
+struct StepRejectingRHS{F} <: Function
+  f::F
+end
+
+function (r::StepRejectingRHS)(du, u, p, t)
+  try
+    r.f(du, u, p, t)
+  catch err
+    err isa _OMBACKEND.CodeGeneration._RHS_STEP_ERRORS || rethrow()
+    _OMBACKEND.CodeGeneration.LAST_RHS_ERROR[] = err
+    fill!(du, NaN)
+  end
+  return nothing
+end
+
+"""
 Name lookups accept the Modelica name (c[2].T) and the canonical one
 (OMBackend.canonicalName).
 """
@@ -2934,8 +2957,8 @@ The solve of the loop family `f` (`LOOPFAMILY_f!`): its tables (each member's in
 per unknown: the last solution, at first the start values) and the body that solves the members it is called for,
 each by Newton's method on the residuals of its instances (lhs - rhs, by the template's classes at the member's
 columns), the unknowns set in place (a state derivative in du, an algebraic variable in a), the Jacobian by forward
-differences; the last solution kept as the next guess (in Float64 solves). Not relations in a loop (events), nor a
-discrete unknown.
+differences; the last solution kept as the next guess (in Float64 solves); residuals or a Jacobian not finite, or a
+singular Jacobian, make the unknowns NaN (the solver rejects the step). Not relations in a loop (events), nor a discrete unknown.
 """
 function _loopFamilyCode(g::Gen, f::Int, template::Vector{Tuple{Int, Int}}, blocks::Vector{Vector{Int}}, el::Elements,
                          matchRow::Vector{Int}, a0::Vector{Float64}, relBases::Vector{Int})::Tuple{Vector{Any}, Expr}
@@ -2991,7 +3014,19 @@ function _loopFamilyCode(g::Gen, f::Int, template::Vector{Tuple{Int, Int}}, bloc
           end
           _x[_j] = _xj
         end
-        local _dx::AbstractVector = _J \ _r
+        #= residuals or a Jacobian not finite, or a singular one (a trial point of the solver where the equations
+           overflow, or a junction's derivative underflows: MSL DifferenceAmplifier's transistors): the unknowns NaN, so
+           the step is rejected =#
+        if !(all(isfinite, _r) && all(isfinite, _J))
+          fill!(_x, NaN)
+          break
+        end
+        local _F = LinearAlgebra.lu(_J; check = false)
+        if !LinearAlgebra.issuccess(_F)
+          fill!(_x, NaN)
+          break
+        end
+        local _dx::AbstractVector = _F \ _r
         local _step::Real = 0.0
         for _j in 1:$k
           _x[_j] -= _dx[_j]
@@ -3000,7 +3035,8 @@ function _loopFamilyCode(g::Gen, f::Int, template::Vector{Tuple{Int, Int}}, bloc
         _step <= 1.0e-12 && break
       end
       $set
-      if eltype(a) === Float64
+      #= the solution as the next guess, not a failed solve's NaN =#
+      if eltype(a) === Float64 && all(isfinite, _x)
         for _j in 1:$k
           $G[_j, _m] = _x[_j]
         end
@@ -4274,6 +4310,26 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       return nothing
     end
 
+    #= The right-hand side's derivative in time (Rosenbrock methods): central differences of the step the solver's own
+       take away from t = 0 (relative to |t|), near t = 0 a billionth of the run: the solver's step 6e-6 there spans all
+       of MSL DifferenceAmplifier's sources (a damped 0.2 GHz sine, ramps of 1 ns), and its steps shrank to 1e-25. An
+       error in the right-hand side is recorded as the step-rejecting RHS's (`StepRejectingRHS`). =#
+    function tgrad!(dT, u, p, t)
+      local h::Float64 = cbrt(eps(Float64)) * max(abs(Float64(t)), 1.0e-9 * abs(p.tend[1]), floatmin(Float64))
+      local after = similar(dT); local before = similar(dT)
+      try
+        RHS!(after, u, p, t + h)
+        RHS!(before, u, p, t - h)
+      catch err
+        err isa OMBackend.CodeGeneration._RHS_STEP_ERRORS || rethrow()
+        OMBackend.CodeGeneration.LAST_RHS_ERROR[] = err
+        fill!(dT, NaN)
+        return nothing
+      end
+      dT .= (after .- before) ./ (2h)
+      return nothing
+    end
+
     #= The algebraic variables at a point (u, t) of a solution: the discrete, relation and
        event-function values of that time from the event log (after a solve p holds the final
        ones), on a copy of the discrete state. =#
@@ -4492,7 +4548,10 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       _logDiscretes!(p, tspan[1])
       $(isempty(initAssertBody) ? nothing : :(checkInitialAsserts(u0, p, tspan[1])))
       invariants!(p.abuf, p)
-      local f::ODEFunction = ODEFunction(RHS!; jac_prototype = $jacProto, sys = $(ArraySystem)(@__MODULE__))
+      #= a domain error or an assert in the right-hand side rejects the step (the solver retries smaller), as in the
+         scalar path (MSL DifferenceAmplifier's x^y of a negative x at a trial point) =#
+      local f::ODEFunction = ODEFunction($(StepRejectingRHS)(RHS!); jac_prototype = $jacProto,
+                                         tgrad = tgrad!, sys = $(ArraySystem)(@__MODULE__))
       #= RightRootFind: the event lands just past the root, where the relation has its new value. =#
       local cbs = Any[]
       #= the relations were set literally above; from the solve on they have the hysteresis =#
@@ -4513,7 +4572,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
 
     function simulate(tspan = (0.0, 1.0), solver = Tsit5(); parameters::AbstractDict = Dict{String, Any}(), kwargs...)
       local (prob, callbacks) = $(Symbol(modelName, "Model"))(tspan; parameters = parameters)
-      return DifferentialEquations.solve(prob, solver; callback = callbacks, kwargs...)
+      OMBackend.CodeGeneration._resetRHSError!()
+      local sol = DifferentialEquations.solve(prob, solver; callback = callbacks, kwargs...)
+      #= an error that every smaller step met ends the run =#
+      OMBackend.CodeGeneration._rethrowRHSError(sol)
+      return sol
     end
   end
   return Expr(:module, true, Symbol(modelName), stripBeginBlocks(code))
