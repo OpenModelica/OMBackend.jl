@@ -374,7 +374,7 @@ package ArrayPath
       y[i] - z[i] = if x[i] > 0.5 then 0.5 * x[i] else 0.2 * x[i];
     end for;
   end LoopWithEvent;
-  model CoupledLoop "an algebraic loop through all the elements (a tridiagonal system in v): an index-1 DAE, v states of the solver"
+  model CoupledLoop "an algebraic loop through all the elements (a tridiagonal system in v), solved in the right-hand side"
     parameter Integer N = 20;
     Real x[N](start = {i / N for i in 1:N}, each fixed = true);
     Real v[N];

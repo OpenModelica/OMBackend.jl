@@ -527,7 +527,7 @@ function _addEquationIR!(g::Gen, eq::OIR.Equation, iterNames::Vector{String}, id
     range === nothing && ns("for range $(_strIR(eq.iterator.range))")
     local values::Vector{Int} = collect(Int, range)
     isempty(values) && return
-    if any(b::OIR.Equation -> _readsElementArray(g, b), eq.body)
+    if any(b::OIR.Equation -> _readsElementArray(g, b) || _subscriptsLiteral(b, eq.iterator.name), eq.body)
       #= unrolled: each iteration's equations read the elements by literal subscripts (like ones one class again) =#
       for value in values, b in eq.body
         _addEquationIR!(g, _withIteratorIR(b, Dict{Symbol, Int}(eq.iterator.name => value)), iterNames, idom; initial = initial)
@@ -616,10 +616,31 @@ whose elements are variables of their own, `expandRecordFieldArrays!`, read by a
 function _readsElementArray(g::Gen, eq::OIR.Equation)::Bool
   local found::Bool = false
   OIR.foreachExp(eq) do x::OIR.Expression
-    (x isa OIR.SUBSCRIPTED && x.exp isa OIR.CREF && !OIR.hasSubscripts(x.exp.cref) && OIR.typeOf(x.exp) isa OIR.T_ARRAY) ||
-      return nothing
-    local nm::String = String(x.exp.cref.name)
+    #= also as a reference subscripted on its last part (`observed.offset[\$i1]`, inlined: `subscriptedReference`) =#
+    local base::Union{Nothing, OIR.ComponentRef} =
+      (x isa OIR.SUBSCRIPTED && x.exp isa OIR.CREF && !OIR.hasSubscripts(x.exp.cref) && OIR.typeOf(x.exp) isa OIR.T_ARRAY) ? x.exp.cref :
+      (x isa OIR.CREF && length(x.cref.parts) > 1 && !isempty(x.cref.parts[end].subscripts) &&
+       all(p::OIR.CrefPart -> isempty(p.subscripts), x.cref.parts[1:end - 1])) ? x.cref : nothing
+    base === nothing && return nothing
+    local last::OIR.CrefPart = base.parts[end]
+    local nm::String = String(OIR.ComponentRef(OIR.CrefPart[base.parts[1:end - 1]; OIR.CrefPart(last.name, OIR.Subscript[], last.ty)]).name)
     (haskey(g.vars, nm) || haskey(g.derOf, nm)) || (found = true)
+    nothing
+  end
+  return found
+end
+
+"""
+Whether the equation subscripts an array literal by the iterator `it` (an inlined call's matrix product, `_inlinedEquation`:
+`{{R.T[1, 1], ...}, ...}[\$i1, 2]`): unrolled, the subscripts are literal and the element is picked.
+"""
+function _subscriptsLiteral(eq::OIR.Equation, it::Symbol)::Bool
+  local found::Bool = false
+  local isIterator::Function = (y::OIR.Expression) -> y isa OIR.CREF && length(y.cref.parts) == 1 && y.cref.name === it &&
+                                                      !OIR.hasSubscripts(y.cref)
+  OIR.foreachExp(eq) do x::OIR.Expression
+    (x isa OIR.SUBSCRIPTED && x.exp isa OIR.ARRAY) || return nothing
+    any(s::OIR.Subscript -> s isa OIR.INDEX && OIR.anyExp(isIterator, (s::OIR.INDEX).exp), x.subscripts) && (found = true)
     nothing
   end
   return found
@@ -628,6 +649,39 @@ end
 "A copy of the equation `eq` with the iterators of `values` replaced by their values (`withIterators`)."
 _withIteratorIR(eq::OIR.Equation, values::Dict{Symbol, Int})::OIR.Equation =
   OIR.mapEquation!(x::OIR.Expression -> _IRD.withIterators(x, values), deepcopy(eq))
+
+"Whether statements hold an assert (also in branches and loops)."
+function _hasAssert(stmts::Vector{OIR.Statement})::Bool
+  for st in stmts
+    st isa OIR.ASSERT && return true
+    st isa OIR.IF_STATEMENT && (any(b::OIR.StatementBranch -> _hasAssert(b.body), st.branches) || _hasAssert(st.elseBody)) && return true
+    (st isa OIR.FOR_STATEMENT || st isa OIR.WHILE_STATEMENT) && _hasAssert(st.body) && return true
+  end
+  return false
+end
+
+"""
+    _inlinedEquation(eq, functions) -> Equation
+
+`eq` with its calls of `functions` inlined where their algorithms run into one expression (`IndexReduction.inlineCalls`;
+scalar, if- and for-equations, a for-equation's body): MultiBody's `planarRotation(e, phi, w)[1][2, 1]` as
+`e[2] * e[1] + (-(e[2] * e[1])) * cos(phi) - e[3] * sin(phi)`, no call and no array built per element (each element of
+a record result called the function again). Other kinds, and an equation without such a call, as they are (inlining
+also writes a subscripted reference on its parts: `observed.offset[\$i1]` of a record variable's array field, whose
+elements are variables, then read as a variable of its own).
+"""
+function _inlinedEquation(eq::OIR.Equation, functions::Dict{Symbol, OIR.ModelicaFunction})::OIR.Equation
+  local calls::Bool = false
+  OIR.foreachExp(eq) do x::OIR.Expression
+    (x isa OIR.CALL && haskey(functions, x.name)) && (calls = true)
+    nothing
+  end
+  calls || return eq
+  (eq isa OIR.SCALAR_EQUATION || eq isa OIR.IF_EQUATION) && return _IRD.inlineEquation(eq, functions)
+  eq isa OIR.FOR_EQUATION &&
+    return OIR.FOR_EQUATION(eq.iterator, OIR.Equation[_inlinedEquation(e, functions) for e in eq.body], eq.source, eq.attributes)
+  return eq
+end
 
 function _generateIR(model::OIR.Model, modelName::String; functions::Union{Nothing, FunctionList} = nothing)::Expr
   (length(model.continuous) == 1 && isempty(model.clocked) && isempty(model.modes)) ||
@@ -735,8 +789,12 @@ function _generateIR(model::OIR.Model, modelName::String; functions::Union{Nothi
   for (link, state) in g.derOf
     haskey(g.vars, state) && g.vars[state].kind == :state || ns("the state derivative $(link) of $(state), not a state")
   end
+  #= after index reduction, the calls inlined (MLS: InlineAfterIndexReduction, Inline) where a body runs into one
+     expression; not a function with an assert (inlined, its check is lost: normalizeWithAssert) =#
+  local inlinable::Dict{Symbol, OIR.ModelicaFunction} =
+    Dict{Symbol, OIR.ModelicaFunction}(f.name => f for f in model.functions if f.external === nothing && !_hasAssert(f.body))
   for eq in partition.equations
-    _addEquationIR!(g, eq, String[], NO_SLOTS)
+    _addEquationIR!(g, _inlinedEquation(eq, inlinable), String[], NO_SLOTS)
   end
   for nm in fixedNonStates
     #= fixed = true on a variable that is no state: the initial equation v = start =#
@@ -750,7 +808,7 @@ function _generateIR(model::OIR.Model, modelName::String; functions::Union{Nothi
     end
   end
   for eq in partition.initialEquations
-    _addEquationIR!(g, eq, String[], NO_SLOTS; initial = true)
+    _addEquationIR!(g, _inlinedEquation(eq, inlinable), String[], NO_SLOTS; initial = true)
   end
   return _emitModule(g, modelName, functionDefs, u0, d0, a0, fixedMask, stateNamesOrdered, algNamesOrdered,
                      discreteNamesOrdered)

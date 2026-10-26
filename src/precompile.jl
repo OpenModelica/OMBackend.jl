@@ -201,7 +201,8 @@ end
 function _precompileWarmupArrayPath()::Nothing
   local AG = CodeGeneration.ArrayODEGen
   local p = AG.ArrayModelParameters(Float64[], Bool[], Float64[], Float64[], Bool[], Bool[], [false], [false], zeros(2),
-                                    zeros(2), Bool[], Tuple{Float64, Vector{Float64}}[], Float64[], [0.0], [1.0], Float64[], OMBackend)
+                                    zeros(2), Bool[], Tuple{Float64, Vector{Float64}}[], Float64[], [0.0], [1.0], Float64[],
+                                    AG.BlockSolver[], OMBackend)
   local sys = AG.ArraySystem(Dict{Symbol, Int}(), Symbol[], Dict{Symbol, Tuple{Symbol, Int}}(), OMBackend)
   local jac = CodeGeneration.Symbolics.SparseArrays.sparse([1, 2], [1, 2], ones(2), 2, 2)
   local f = ODEFunction(_precompileArrayRHS!; jac_prototype = jac, sys = sys)

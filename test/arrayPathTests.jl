@@ -182,14 +182,14 @@ end
     local batches::Int = OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[].batches
     @test _arrayPathTaken(_arrayPathTranslate("ArrayPath.LocalLoops1000"; scalarized = false))
     @test OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[].batches == batches
-    #= a tridiagonal loop through all the elements: the unknowns v states of an index-1 DAE (a mass matrix) =#
+    #= a tridiagonal loop through all the elements: solved in the right-hand side (blockSolve!), the solver sees the
+       states only =#
     local (s2::Vector{Float64}, a2::Vector{Float64}, sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution) = _bothWays("ArrayPath.CoupledLoop", ["x[1]", "v[2]", "x[20]", "v[10]"]; tight...)
     @test isapprox(a2, s2; atol = 1e-9)
-    @test length(sol.u[1]) == 40
+    @test length(sol.u[1]) == 20
     #= with an event in the loop (its unknowns solved again in the event iteration), a when-equation, an assert and an
-       initial equation (x[N] free, solved with the loop's unknowns): OMBACKEND_ARRAY_DAE_EVENTS =#
-    local (s3::Vector{Float64}, a3::Vector{Float64}, _) = withenv(() -> _bothWays("ArrayPath.CoupledLoopEvents", ["x[1]", "v[2]", "x[20]", "v[10]", "crossings"]; tight...),
-                                                                  "OMBACKEND_ARRAY_DAE_EVENTS" => "true")
+       initial equation (x[N] free) =#
+    local (s3::Vector{Float64}, a3::Vector{Float64}, _) = _bothWays("ArrayPath.CoupledLoopEvents", ["x[1]", "v[2]", "x[20]", "v[10]", "crossings"]; tight...)
     @test isapprox(a3, s3; atol = 1e-8)
     @test a3[5] == 1.0
     #= nonlinear (the scalarized model's initialization fails here): its residuals at the end =#
