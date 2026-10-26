@@ -96,15 +96,19 @@ const BACKEND_PERFLOG = Ref{Bool}(get(ENV, "ENABLE_BACKEND_PERFLOG", "false") ==
 """
     @BACKEND_PERFLOG "label" expr
 
-Wraps `expr` in `@time` when `BACKEND_PERFLOG[]` is true; otherwise the
-expression is evaluated with no instrumentation. The runtime check costs
-one boolean load and one branch per call site, so use it on coarse pass
-boundaries, not in tight inner loops.
+Wraps `expr` in `@time` when `BACKEND_PERFLOG[]` is true, then prints the
+process's max RSS (memory outside the GC heap too: LLVM compiling a generated
+module, which `@time`'s allocations do not show); otherwise the expression is
+evaluated with no instrumentation. The runtime check costs one boolean load
+and one branch per call site, so use it on coarse pass boundaries, not in
+tight inner loops.
 """
 macro BACKEND_PERFLOG(label, expr)
   return quote
     if $(BACKEND_PERFLOG)[]
-      @time $(esc(label)) $(esc(expr))
+      local value = @time $(esc(label)) $(esc(expr))
+      println($(esc(label)), ": max RSS ", round(Sys.maxrss() / 2^30; digits = 2), " GB")
+      value
     else
       $(esc(expr))
     end

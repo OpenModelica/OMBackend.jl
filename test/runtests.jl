@@ -368,6 +368,9 @@ import .ExampleModels
   #= ── 20c. Zero flow and zero speed (semiLinear chains, noEvent) ─── =#
   include("zeroFlowTests.jl")
 
+  #= ── 20d. The arrays-kept precompile workload takes its paths ──── =#
+  include("precompileWorkloadTests.jl")
+
   #= ── 20d. Parameters an initial algorithm assigns ───────────────── =#
   include("initialAlgorithmParameterTests.jl")
 

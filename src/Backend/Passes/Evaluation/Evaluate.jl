@@ -335,6 +335,16 @@ function evaluateCall(e::IR.CALL, values::StartValues)::Union{Nothing, Float64}
   end
   n in (:noEvent, :homotopy) && return evaluate(args[1], values)
   n === :smooth && return evaluate(args[2], values)
+  #= a reduction of an array literal (`each start = sum(m)` on the element view: `sum({m[1], m[2], m[3]})`) =#
+  if n in (:sum, :product, :min, :max) && length(args) == 1 && args[1] isa IR.ARRAY && !isempty(args[1].elements)
+    local terms::Vector{Float64} = Float64[]
+    for x in args[1].elements
+      local v::Union{Nothing, Float64} = evaluate(x, values)
+      v === nothing && return nothing
+      push!(terms, v)
+    end
+    return n === :sum ? sum(terms) : n === :product ? prod(terms) : n === :min ? minimum(terms) : maximum(terms)
+  end
   if n in (:min, :max, :atan2, :div, :mod, :rem) && length(args) == 2
     local (a, b) = (evaluate(args[1], values), evaluate(args[2], values))
     (a === nothing || b === nothing) && return nothing

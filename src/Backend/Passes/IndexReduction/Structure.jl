@@ -38,12 +38,22 @@
 
 """
     NotHandled(reason)
+    NotHandled(reason, arrays, equations)
 
-What index reduction does not handle (yet): the model is left to the MTK path.
+What index reduction does not handle (yet): the model is left to the MTK path. With arrays kept, the arrays whose
+elements a plan treats differently and the for-equations (by index in the partition) whose iterations it
+differentiates differently: the array form takes the plan once those are split (`splitArrays!`).
 """
 struct NotHandled <: Exception
   reason::String
+  arrays::Vector{Symbol}
+  equations::Vector{Int}
 end
+
+NotHandled(reason::String) = NotHandled(reason, Symbol[], Int[])
+
+"Whether `e` names arrays or for-equations whose splitting would let the array form take the plan (slicing)."
+needsSplit(e::NotHandled)::Bool = !(isempty(e.arrays) && isempty(e.equations))
 
 Base.showerror(io::IO, e::NotHandled) = print(io, "index reduction does not handle ", e.reason)
 
@@ -413,7 +423,7 @@ function inlineCalls(e::IR.Expression, functions::Dict{Symbol, IR.ModelicaFuncti
       (any(d -> d.order == 1, f.derivatives) && IR.anyExp(y -> opaqueCall(y, functions), inlined)) && return x
       return inlined
     elseif x isa IR.SUBSCRIPTED
-      return foldTree(selectElement(x.exp, x.subscripts, x.ty))
+      return subscriptedReference(foldTree(selectElement(x.exp, x.subscripts, x.ty)))
     elseif x isa IR.RECORD_ELEMENT
       local record = asRecord(x.exp)
       return record === nothing ? x : foldTree(record.elements[x.index])
@@ -423,14 +433,38 @@ function inlineCalls(e::IR.Expression, functions::Dict{Symbol, IR.ModelicaFuncti
 end
 
 """
+    subscriptedReference(e) -> Expression
+
+A reference subscripted further (`(G[\$c].frame.R.T)[2, \$i1]`, an inlined body's field of a rolled component's
+record) as the reference with the subscripts on its parts that have dimensions left (`G[\$c].frame.R.T[2, \$i1]`),
+which differentiation and the element view read as an element; another expression as it is.
+"""
+function subscriptedReference(e::IR.Expression)::IR.Expression
+  (e isa IR.SUBSCRIPTED && e.exp isa IR.CREF && all(s::IR.Subscript -> s isa IR.INDEX, e.subscripts)) || return e
+  local parts::Vector{IR.CrefPart} = copy((e.exp::IR.CREF).cref.parts)
+  local next::Int = 1
+  for (k, p) in enumerate(parts)
+    local free::Int = length(IR.dimensions(p.ty)) - length(p.subscripts)
+    (free > 0 && next <= length(e.subscripts)) || continue
+    any(s::IR.Subscript -> !(s isa IR.INDEX), p.subscripts) && return e
+    local taken::Int = min(free, length(e.subscripts) - next + 1)
+    parts[k] = IR.CrefPart(p.name, IR.Subscript[p.subscripts; e.subscripts[next:next + taken - 1]], p.ty)
+    next += taken
+  end
+  next > length(e.subscripts) || return e
+  return IR.CREF(IR.ComponentRef(parts), e.ty)
+end
+
+"""
 Whether `e` is a record element of an array at a subscript that is no literal (`data[i]` in a constructor
 over `i`): inlined, a function's body reads its fields, `data[i].Tlimit`, which the simulation code cannot
 name (MSL Media's mixtures, `{h_T(data[i], T) for i in 1:nX}`: SimpleNaturalGas ran with undefined
-parameters once its medium's T was a state). The call stays.
+parameters once its medium's T was a state). The call stays. Not a record of rolled components (`G[\$c].frame_a.R`,
+`rollComponents!`), whose fields are arrays the code names.
 """
 iteratorIndexedRecord(e::IR.Expression)::Bool =
   e isa IR.CREF && e.ty isa IR.T_RECORD &&
-  any(p -> any(sub -> sub isa IR.INDEX && !(sub.exp isa IR.INTEGER), p.subscripts), e.cref.parts)
+  any(p -> !(p.ty isa IR.T_COMPONENTS) && any(sub -> sub isa IR.INDEX && !(sub.exp isa IR.INTEGER), p.subscripts), e.cref.parts)
 
 """
     opaqueCall(e, functions) -> Bool

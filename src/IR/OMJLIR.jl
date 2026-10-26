@@ -211,6 +211,18 @@ struct T_CLASS <: ModelicaType
   name::Symbol
 end
 
+"""
+    T_COMPONENTS(cls, members)
+
+The type of a part that stands for separately declared components of the class `cls` (EngineV6's `cylinder1`, ...,
+`cylinder6`) rolled into an array of `length(members)` (`IndexReduction.rollComponents!`): the part subscripted by a
+literal `k` is named as the member `members[k]` (`flatName`), so an element keeps its flat name (`cylinder3.x`).
+"""
+struct T_COMPONENTS <: ModelicaType
+  cls::Symbol
+  members::Vector{Symbol}
+end
+
 "The type of a call to a function with several outputs."
 struct T_TUPLE <: ModelicaType
   types::Vector{ModelicaType}
@@ -1284,10 +1296,12 @@ end
 
 "The element type of an array type; a scalar type itself."
 elementType(ty::T_ARRAY)::ModelicaType = ty.elementType
+elementType(ty::T_COMPONENTS)::ModelicaType = T_CLASS(ty.cls)
 elementType(ty::ModelicaType)::ModelicaType = ty
 
 "The dimensions of an array type; none for a scalar type."
 dimensions(ty::T_ARRAY)::Vector{Dimension} = ty.dimensions
+dimensions(ty::T_COMPONENTS)::Vector{Dimension} = Dimension[DIM_SIZE(length(ty.members))]
 dimensions(::ModelicaType)::Vector{Dimension} = Dimension[]
 
 isArray(ty::ModelicaType)::Bool = ty isa T_ARRAY
@@ -1521,6 +1535,7 @@ _print(io::IO, t::T_ARRAY) = (_print(io, t.elementType); print(io, "["); _printJ
 _print(io::IO, f::Field) = (_print(io, f.ty); print(io, " ", f.name))
 _print(io::IO, t::T_RECORD) = print(io, t.name)
 _print(io::IO, t::Union{T_EXTERNAL_OBJECT, T_CLASS}) = print(io, t.name)
+_print(io::IO, t::T_COMPONENTS) = print(io, t.cls, "[", length(t.members), "]")
 _print(io::IO, t::T_TUPLE) = (print(io, "("); _printJoined(io, t.types); print(io, ")"))
 _print(io::IO, t::T_FUNCTION) = print(io, "function ", t.name)
 _print(io::IO, ::T_NORETCALL) = print(io, "()")
@@ -1543,13 +1558,18 @@ _print(io::IO, p::CrefPart) = print(io, flatName(CrefPart[p]))
 
 The flat name of a reference's parts: the names joined by `.`, each with its subscripts in
 brackets separated by `,`; a literal index as its value (`2`, `true`, `E.one`), another
-expression as written.
+expression as written. A part of rolled components (`T_COMPONENTS`) subscripted by a literal
+index is named as that member (`cylinder3`).
 """
 function flatName(parts::Vector{CrefPart})::Symbol
   length(parts) == 1 && isempty(parts[1].subscripts) && return parts[1].name
   local io = IOBuffer()
   for (i, p) in enumerate(parts)
     i > 1 && print(io, '.')
+    if p.ty isa T_COMPONENTS && length(p.subscripts) == 1 && p.subscripts[1] isa INDEX && (p.subscripts[1]::INDEX).exp isa INTEGER
+      print(io, p.ty.members[((p.subscripts[1]::INDEX).exp::INTEGER).value])
+      continue
+    end
     print(io, p.name)
     isempty(p.subscripts) && continue
     print(io, '[')

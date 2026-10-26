@@ -527,6 +527,23 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     x[1] = x[2];
   end BoundaryArray;
 
+  model BoundaryWithArray "BoundaryArray's tie splits x into its elements (slicing); the array y stays an array"
+    parameter Integer N = 3;
+    parameter Integer M = 4;
+    Real x[N](start = {1, 1, 0.5}, fixed = {true, false, true});
+    Real f;
+    Real y[M](each start = 1, each fixed = true);
+  equation
+    for i in 2:N loop
+      der(x[i]) = -x[i];
+    end for;
+    der(x[1]) = -x[1] + f;
+    x[1] = x[2];
+    for j in 1:M loop
+      der(y[j]) = -j * y[j];
+    end for;
+  end BoundaryWithArray;
+
   model AngleArray "PendulumAngle per element in a for-equation: the differentiated body x[i] = L * sin(phi[i]) reads the parameter L (kept symbolic in array form)"
     parameter Integer N = 3;
     parameter Real g = 9.81;
@@ -638,6 +655,24 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     phi1 = phi2;
   end EachStartArray;
 
+  model PendulumsPrefer "Cartesian pendulums, x and vx the states (StateSelect.prefer): the reduced model solves y, the root of x^2 + y^2 = 1 near its start, per element by Newton"
+    parameter Integer N = 3;
+    parameter Real g = 9.81;
+    Real x[N](start = {0.5, 0.6, 0.7}, each fixed = true, each stateSelect = StateSelect.prefer);
+    Real vx[N](each start = 0, each fixed = true, each stateSelect = StateSelect.prefer);
+    Real y[N](each start = -0.8);
+    Real vy[N];
+    Real F[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = vx[i];
+      der(y[i]) = vy[i];
+      der(vx[i]) = -x[i] * F[i];
+      der(vy[i]) = -y[i] * F[i] - g;
+      x[i] ^ 2 + y[i] ^ 2 = 1;
+    end for;
+  end PendulumsPrefer;
+
   record Phasor "a record of two Reals (as MSL Complex)"
     Real re;
     Real im;
@@ -736,5 +771,162 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     der(m) = -m;
     m = 2 * x + x ^ 3;
   end PreferredState;
+
+  record Gain "a record with an array field, passed to functions by its fields"
+    Real k;
+    Real offset[2];
+  end Gain;
+
+  function gainTimes "a record argument and an array argument: g.k x[1] + g.offset[1] x[2]"
+    input Gain g;
+    input Real x[2];
+    output Real y;
+  algorithm
+    y := g.k * x[1] + g.offset[1] * x[2];
+  end gainTimes;
+
+  function gainOf "a record result"
+    input Real k;
+    output Gain g;
+  algorithm
+    g := Gain(k = k, offset = {0.5 * k, 0});
+  end gainOf;
+
+  model RecordsArray "InertiaArray driven through a record and an array argument, a record result, a fixed = false parameter, an if-equation on time, a literal indexed by the iterator; a record variable's array field read by a for-equation: array code after index reduction"
+    parameter Integer N = 3;
+    parameter Gain gain(k = 2, offset = {1, 0});
+    parameter Real c(fixed = false) "6";
+    Real phi1[N](each start = 0, each fixed = true);
+    Real w1[N](each start = 0, each fixed = true);
+    Real phi2[N];
+    Real w2[N];
+    Real tau[N];
+    Real drive[N] "i (2 sin(t) + 1) before 0.5, 3 i after";
+    Gain observed "k = w1[1], offset = phi1[1:2]";
+    Gain fromC "gainOf(c): offset[1] = 3";
+    Real sum1 "w1[1] + phi1[1]";
+    Real weighted[N] "{1, 0.5, 2} .* w1: rolled, the literal indexed by the iterator";
+  initial equation
+    c = 3 * gain.k;
+  equation
+    der(phi1) = w1;
+    der(phi2) = w2;
+    for i in 1:N loop
+      if time < 0.5 then
+        drive[i] = gainTimes(gain, {sin(time), 1.0}) * i;
+      else
+        drive[i] = fromC.offset[1] * i;
+      end if;
+      der(w1[i]) = drive[i] - tau[i];
+    end for;
+    2 * der(w2) = tau;
+    phi1 = phi2;
+    observed.k = w1[1];
+    observed.offset = phi1[1:2];
+    sum1 = gainTimes(observed, {1.0, 1.0});
+    weighted = {1, 0.5, 2} .* w1;
+    fromC = gainOf(c);
+  end RecordsArray;
+
+  model RigidPair "a rigidly coupled pair of inertias driven by k sin(t) (index 3): phi1 = k (t - sin(t)) / 3"
+    parameter Real k = 1;
+    Real phi1(start = 0, fixed = true);
+    Real w1(start = 0, fixed = true);
+    Real phi2;
+    Real w2;
+    Real tau;
+  equation
+    der(phi1) = w1;
+    der(phi2) = w2;
+    der(w1) = k * sin(time) - tau;
+    2 * der(w2) = tau;
+    phi1 = phi2;
+  end RigidPair;
+
+  model SeparatePairs "three RigidPairs declared one by one: rolled into arrays over the instances (OMBACKEND_ROLL_COMPONENTS), reduced in array form; total reads all three"
+    RigidPair a(k = 1);
+    RigidPair b(k = 2);
+    RigidPair c(k = 3);
+    Real total "2 (t - sin(t))";
+  equation
+    total = a.phi1 + b.phi1 + c.phi1;
+  end SeparatePairs;
+
+  model TimedPair "a RigidPair that records when phi1 passes 0.01 (k (t - sin(t)) / 3 = 0.01) and counts it"
+    extends RigidPair;
+    discrete Real tCross(start = -1, fixed = true);
+    Integer crossings(start = 0, fixed = true);
+  equation
+    when phi1 > 0.01 then
+      tCross = time;
+      crossings = pre(crossings) + 1;
+    end when;
+  end TimedPair;
+
+  model SeparateTimedPairs "three TimedPairs declared one by one: rolled, reduced in array form, the when-equation over the instances in the array code"
+    TimedPair a(k = 1);
+    TimedPair b(k = 2);
+    TimedPair c(k = 3);
+  end SeparateTimedPairs;
+
+  connector FluidPort "MSL Media's test port: an enthalpy flow beside the mass flow"
+    flow Real m_flow;
+    Real h;
+    flow Real H_flow;
+  end FluidPort;
+
+  model FlowSource "mass flow m_flow out of the source at enthalpy hs"
+    input Real m_flow;
+    parameter Real hs = 1;
+    FluidPort port;
+  equation
+    port.m_flow = -m_flow;
+    port.H_flow = semiLinear(port.m_flow, port.h, hs);
+  end FlowSource;
+
+  model EnthalpyVolume "an enthalpy store of mass M (index 2: U = M h, both differentiated)"
+    parameter Real M = 1;
+    Real U;
+    Real h(start = 0, fixed = true);
+    Real dh;
+    FluidPort port;
+  equation
+    der(U) = port.H_flow;
+    U = M * h;
+    der(h) = dh;
+    port.h = h;
+    port.m_flow = 0;
+  end EnthalpyVolume;
+
+  model EnthalpyPipe "MSL Media's ShortPipe without pressures: the enthalpy carried by the flow"
+    FluidPort a;
+    FluidPort b;
+  equation
+    a.H_flow = semiLinear(a.m_flow, a.h, b.h);
+    a.H_flow + b.H_flow = 0;
+    a.m_flow + b.m_flow = 0;
+  end EnthalpyPipe;
+
+  model EnthalpyAmbient "MSL Media's FixedAmbient: enthalpy h0 at inflow"
+    parameter Real h0 = 2;
+    FluidPort port;
+  equation
+    port.H_flow = semiLinear(port.m_flow, port.h, h0);
+  end EnthalpyAmbient;
+
+  model SemiLinearChain "source -> v1 -> p1 -> v2 -> p2 -> ambient, the flow time (0 at the start); v and p rolled; p2's and the ambient's semiLinear a chain through p2.b.h (MLS 3.7.2.5). h1 = 1 - exp(-t^2/2), h2 = 1 - (1 + t^2/2) exp(-t^2/2)"
+    FlowSource source(m_flow = time);
+    EnthalpyVolume v1;
+    EnthalpyVolume v2;
+    EnthalpyPipe p1;
+    EnthalpyPipe p2;
+    EnthalpyAmbient amb;
+  equation
+    connect(source.port, v1.port);
+    connect(v1.port, p1.a);
+    connect(p1.b, v2.port);
+    connect(v2.port, p2.a);
+    connect(p2.b, amb.port);
+  end SemiLinearChain;
 
 end IndexReduction;

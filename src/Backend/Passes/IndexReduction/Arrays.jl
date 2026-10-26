@@ -161,15 +161,19 @@ function elements(variables::IR.VariableSet)::Elements
   local E = Elements(Dict{Symbol, Vector{Symbol}}(), Dict{Symbol, Vector{Int}}(), Dict{Symbol, Tuple{Symbol, Vector{Int}}}(),
                      Dict{Symbol, IR.ComponentRef}())
   local derived = Tuple{IR.Variable, String, Symbol}[]
-  for v in variables
+  #= the arrays of rolled components first (their elements may be another array's, kept beside them: rollComponents!) =#
+  local rolledFirst::Vector{IR.Variable} = IR.Variable[v for v in variables if v.cref.parts[1].ty isa IR.T_COMPONENTS]
+  append!(rolledFirst, IR.Variable[v for v in variables if !(v.cref.parts[1].ty isa IR.T_COMPONENTS)])
+  for v in rolledFirst
     v.ty isa IR.T_ARRAY || continue
     local from = derivedFrom(v, variables)
     if from === nothing
       local sizes = knownSizes(v.ty, "the array $(v.name)")
       local crefs = IR.ComponentRef[modelElementCref(v, index) for index in rowMajor(sizes)]
       #= a record field array of a parameter or a constant: its elements are variables already, the array kept beside
-         them for a call's whole argument (expandRecordFieldArrays), as in the scalarized model =#
-      local existing = count(c -> haskey(variables, c.name), crefs)
+         them for a call's whole argument (expandRecordFieldArrays), as in the scalarized model; or elements of a rolled
+         array (an instance's array kept beside it) =#
+      local existing = count(c -> haskey(variables, c.name) || haskey(E.array, c.name), crefs)
       existing == length(crefs) && continue
       existing == 0 || throw(NotHandled("the array $(v.name), $(existing) of its $(length(crefs)) elements variables of their own"))
       addElements!(E, v, sizes, crefs)
@@ -376,8 +380,29 @@ function scalarExpression(e::IR.Expression, values::Dict{Symbol, Int}, E::Elemen
   return IR.mapExp(pruned) do x
     x isa IR.CREF && return elementReference(x, E)
     (x isa IR.SUBSCRIPTED && literalIndices(x.subscripts) !== nothing) && return pickElement(x.exp, x.subscripts, x.ty, E)
+    (x isa IR.BINARY && x.op == IR.SCALAR_PRODUCT) && return expandedScalarProduct(x, E)
     return x
   end
+end
+
+"""
+    expandedScalarProduct(e, E) -> Expression
+
+A scalar product of two vectors of a known size in the scalarized model: the sum of the products of their elements
+(`pickElement`), as the frontend's scalarization writes it (MultiBody's `tau = -frame_b.t * e`); as it is where the
+size is not known.
+"""
+function expandedScalarProduct(e::IR.BINARY, E::Elements)::IR.Expression
+  local ty1::IR.ModelicaType = IR.typeOf(e.exp1)
+  (ty1 isa IR.T_ARRAY && length(ty1.dimensions) == 1 && ty1.dimensions[1] isa IR.DIM_SIZE) || return e
+  local element::IR.ModelicaType = IR.elementType(ty1)
+  local terms::Vector{IR.Expression} = IR.Expression[]
+  for k in 1:ty1.dimensions[1].size
+    local index::Vector{IR.Subscript} = IR.Subscript[IR.INDEX(IR.INTEGER(k))]
+    push!(terms, times(pickElement(e.exp1, index, element, E), pickElement(e.exp2, index, element, E)))
+  end
+  isempty(terms) && return zeroOf(e)
+  return foldTree(foldl(plus, terms))
 end
 
 """

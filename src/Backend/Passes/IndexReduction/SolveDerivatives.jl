@@ -160,12 +160,15 @@ other field) is no edge, nor a piecewise one 0 in a branch that reads unknowns (
 smooth state transition, 1 in one branch and 0 in another), nor one 0 or not finite with `simValues` (the
 simulation code's values of the variables a function call defines, `functionDefinedValues`) for the
 variables it reads: MSL Spice3's diodes without a junction capacitance, `icap = m_dCap * der(v)` with
-`(cc, m_dCap) = diodeNoBypassCode(...)` 0, solved for der(v), divided by 0.
+`(cc, m_dCap) = diodeNoBypassCode(...)` 0, solved for der(v), divided by 0. `literalCoefficients` false: a coefficient
+that reads only parameters stays an expression (its value still decides the edge), as the array form's, whose
+coefficient differs per element (`solvedInArrays`).
 """
 function derivativeEdges(model::IR.Model, partition::IR.Partition, unknowns::Set{Symbol},
                          functions::Dict{Symbol, IR.ModelicaFunction}, known::StartValues,
                          start::StartValues;
-                         simValues::Dict{Symbol, Tuple{IR.Expression, Int}} = Dict{Symbol, Tuple{IR.Expression, Int}}())::Dict{Symbol, Vector{DerivativeEdge}}
+                         simValues::Dict{Symbol, Tuple{IR.Expression, Int}} = Dict{Symbol, Tuple{IR.Expression, Int}}(),
+                         literalCoefficients::Bool = true)::Dict{Symbol, Vector{DerivativeEdge}}
   local edges = Dict{Symbol, Vector{DerivativeEdge}}(d => DerivativeEdge[] for d in unknowns)
   for (i, eq) in enumerate(partition.equations)
     (isDerivativeLink(eq) || !(eq isa Union{IR.SCALAR_EQUATION, IR.IF_EQUATION}) || readsHomotopy(eq)) && continue
@@ -185,7 +188,7 @@ function derivativeEdges(model::IR.Model, partition::IR.Partition, unknowns::Set
       local value = readsNoUnknown(c, model.variables) ? evaluate(c, known) : nothing
       (value !== nothing && (value == 0 || !isfinite(value))) && continue
       if value !== nothing
-        push!(edges[d], DerivativeEdge(i, real(value), true, Inf, others))
+        push!(edges[d], DerivativeEdge(i, literalCoefficients ? real(value) : c, true, Inf, others))
         continue
       end
       isPiecewise(c) && continue
@@ -407,13 +410,39 @@ evaluate the coefficients (`derivativeEdges`). The unknowns so solved for, in or
 """
 function solveDerivatives!(model::IR.Model, partition::IR.Partition;
                            known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::Vector{Symbol}
+  local solution::Union{Nothing, DerivativeSolution} = derivativeSolution(model, partition; known)
+  return solution === nothing ? Symbol[] : substituteDerivatives!(partition, solution)
+end
+
+"""
+    DerivativeSolution(resolved, equationOf, throughSolved)
+
+What `solveDerivatives!` substitutes: each solved derivative unknown's value (`resolvedValues`), the equation it is
+solved from (its index in the partition), and the unknowns `solveThroughSolved!` solved, or solved again, from an
+equation with the values of others put in.
+"""
+struct DerivativeSolution
+  resolved::Dict{Symbol, IR.Expression}
+  equationOf::Dict{Symbol, Int}
+  throughSolved::Set{Symbol}
+end
+
+"""
+    derivativeSolution(model, partition; known) -> Union{Nothing, DerivativeSolution}
+
+The decisions of `solveDerivatives!` (the matching, the solved values, resolved), the partition not changed;
+`nothing` where no derivative unknown is solved for. `literalCoefficients`: `derivativeEdges`'.
+"""
+function derivativeSolution(model::IR.Model, partition::IR.Partition;
+                            known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}(),
+                            literalCoefficients::Bool = true)::Union{Nothing, DerivativeSolution}
   local unknowns = Set{Symbol}(v.name for v in model.variables if isDerivativeUnknown(v))
-  isempty(unknowns) && return Symbol[]
+  isempty(unknowns) && return nothing
   local functions = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
   local parameters = StartValues(model.variables, model.functions; parametersOnly = true)
   local start = StartValues(model.variables, model.functions; equations = vcat(partition.equations, partition.initialEquations))
   local edges = derivativeEdges(model, partition, unknowns, functions, parameters, start;
-                                simValues = functionDefinedValues(partition, known))
+                                simValues = functionDefinedValues(partition, known), literalCoefficients)
   local matched = matchDerivatives(edges)
   local solved = Dict{Symbol, IR.Expression}()
   local equationOf = Dict{Symbol, Int}()
@@ -422,11 +451,24 @@ function solveDerivatives!(model::IR.Model, partition::IR.Partition;
     solved[d] = solvedValue(partition.equations[e.equation]::IR.SCALAR_EQUATION, d, e.coefficient)
     equationOf[d] = e.equation
   end
+  local matchedValues::Dict{Symbol, IR.Expression} = copy(solved)
   solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, model.variables, start)
-  isempty(solved) && return Symbol[]
+  isempty(solved) && return nothing
   local resolved = resolvedValues(solved)
-  isempty(resolved) && return Symbol[]
-  local definitions = Dict{Int, Symbol}(equationOf[d] => d for d in keys(resolved))
+  isempty(resolved) && return nothing
+  local throughSolved::Set{Symbol} = Set{Symbol}(d for (d, value) in solved if get(matchedValues, d, nothing) !== value)
+  return DerivativeSolution(resolved, equationOf, throughSolved)
+end
+
+"""
+    substituteDerivatives!(partition, solution) -> Vector{Symbol}
+
+The solved derivatives of `solution` substituted into the partition: each one's equation `d = value`, its value in
+the other equations; the unknowns so solved for, in order.
+"""
+function substituteDerivatives!(partition::IR.Partition, solution::DerivativeSolution)::Vector{Symbol}
+  local resolved::Dict{Symbol, IR.Expression} = solution.resolved
+  local definitions::Dict{Int, Symbol} = Dict{Int, Symbol}(solution.equationOf[d] => d for d in keys(resolved))
   local substitute = x -> (x isa IR.CREF && haskey(resolved, x.cref.name)) ? substitutable(x, resolved[x.cref.name]) : x
   for (i, eq) in enumerate(partition.equations)
     local d = get(definitions, i, nothing)

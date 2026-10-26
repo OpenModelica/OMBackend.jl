@@ -86,7 +86,7 @@ package ArrayPath
     end for;
   end Rectifier;
 
-  model AlgebraicLoop "Outside the array path: it is scalarized as before"
+  model AlgebraicLoop "Outside the array path (a loop in a model without arrays): it is scalarized as before"
     Real x(start = 1, fixed = true);
     Real y, z;
   equation
@@ -210,6 +210,32 @@ package ArrayPath
   equation
     der(x) = -k * x + t0;
   end FreeParam;
+  model DoubleExpImpulse "fixed = false parameters of a double exponential impulse per element (MSL LightningImpulse, DoubleExp, 10/350 us): from the starts, undamped Newton ran to the degenerate root tau1 = tau2, eta = 0"
+    parameter Integer N = 2;
+    parameter Real T1 = 10e-6;
+    parameter Real T2 = 350e-6;
+    parameter Real T0 = T2 * T1 / (T2 - T1) * log(T2 / T1);
+    parameter Real eta[N](each fixed = false, each start = 1);
+    parameter Real T[N](each fixed = false, each start = T0);
+    parameter Real T10[N](each fixed = false, each start = 0.01 * T0);
+    parameter Real tau1[N](each fixed = false, each start = T2);
+    parameter Real tau2[N](each fixed = false, each start = T1);
+    Real x[N](each start = 0, each fixed = true);
+    Real y[N];
+  initial equation
+    for i in 1:N loop
+      exp(-T[i] / tau1[i]) / tau1[i] = exp(-T[i] / tau2[i]) / tau2[i];
+      eta[i] = exp(-T[i] / tau1[i]) - exp(-T[i] / tau2[i]);
+      0.1 * eta[i] = exp(-T10[i] / tau1[i]) - exp(-T10[i] / tau2[i]);
+      0.9 * eta[i] = exp(-(T10[i] + 0.8 * T1) / tau1[i]) - exp(-(T10[i] + 0.8 * T1) / tau2[i]);
+      0.5 * eta[i] = exp(-(T10[i] - 0.1 * T1 + T2) / tau1[i]) - exp(-(T10[i] - 0.1 * T1 + T2) / tau2[i]);
+    end for;
+  equation
+    for i in 1:N loop
+      y[i] = (exp(-time / tau1[i]) - exp(-time / tau2[i])) / eta[i];
+      der(x[i]) = y[i];
+    end for;
+  end DoubleExpImpulse;
   model InitAlgPulse "an initial algorithm sets discrete values (as MSL's Pulse)"
     parameter Real period = 0.25;
     parameter Real startTime = -0.6;
@@ -339,4 +365,91 @@ package ArrayPath
   algorithm
     check(2 * x);
   end ElseWhen;
+  model LocalLoops "a nonlinear loop of two unknowns per element (y, w): solved per element by Newton"
+    parameter Integer N = 4;
+    Real x[N](start = {1.0 + i for i in 1:N}, each fixed = true);
+    Real y[N];
+    Real w[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = -y[i];
+      y[i] + w[i] ^ 3 = x[i];
+      w[i] = y[i] + 0.1 * sin(time);
+    end for;
+  end LocalLoops;
+  model LocalLoops1000 = LocalLoops(N = 1000);
+  model Cubic "an equation nonlinear in its unknown: y^3 + y = x per element"
+    parameter Integer N = 3;
+    Real x[N](start = {1.0, 2.0, 3.0}, each fixed = true);
+    Real y[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = -y[i];
+      y[i] ^ 3 + y[i] = x[i];
+    end for;
+  end Cubic;
+  model LoopWithEvent "a loop per element through a relation (events in a loop): outside the array path, scalarized as before"
+    parameter Integer N = 3;
+    Real x[N](each start = 1, each fixed = true);
+    Real y[N];
+    Real z[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = -y[i];
+      y[i] + z[i] = x[i];
+      y[i] - z[i] = if x[i] > 0.5 then 0.5 * x[i] else 0.2 * x[i];
+    end for;
+  end LoopWithEvent;
+  model CoupledLoop "an algebraic loop through all the elements (a tridiagonal system in v), solved in the right-hand side"
+    parameter Integer N = 20;
+    Real x[N](start = {i / N for i in 1:N}, each fixed = true);
+    Real v[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = v[i] - x[i];
+    end for;
+    2 * v[1] - v[2] = x[1];
+    for i in 2:N - 1 loop
+      -v[i - 1] + 3 * v[i] - v[i + 1] = x[i];
+    end for;
+    -v[N - 1] + 2 * v[N] = x[N];
+  end CoupledLoop;
+  model CoupledLoop1000 = CoupledLoop(N = 1000);
+  model CoupledNonlinear "the loop through the elements nonlinear (v^3 terms), and an algebraic variable after it"
+    parameter Integer N = 20;
+    Real x[N](start = {i / N for i in 1:N}, each fixed = true);
+    Real v[N];
+    Real w[N];
+  equation
+    for i in 1:N loop
+      der(x[i]) = w[i];
+      w[i] = v[i] - x[i];
+    end for;
+    2 * v[1] - v[2] + 0.1 * v[1] ^ 3 = x[1];
+    for i in 2:N - 1 loop
+      -v[i - 1] + 3 * v[i] - v[i + 1] + 0.1 * v[i] ^ 3 = x[i];
+    end for;
+    -v[N - 1] + 2 * v[N] + 0.1 * v[N] ^ 3 = x[N];
+  end CoupledNonlinear;
+  model CoupledLoopEvents "CoupledLoop (an array DAE) with an event in the loop (a forcing from t = 0.5), a when-equation on a state, an assert and an initial equation for x[N]"
+    parameter Integer N = 20;
+    Real x[N](start = {i / N for i in 1:N}, fixed = {i < N for i in 1:N});
+    Real v[N];
+    Integer crossings(start = 0, fixed = true);
+  initial equation
+    x[N] = 0.5;
+  equation
+    for i in 1:N loop
+      der(x[i]) = v[i] - x[i];
+    end for;
+    2 * v[1] - v[2] = x[1] + (if time < 0.5 then 0 else 1);
+    for i in 2:N - 1 loop
+      -v[i - 1] + 3 * v[i] - v[i + 1] = x[i];
+    end for;
+    -v[N - 1] + 2 * v[N] = x[N];
+    when x[1] > 0.1 then
+      crossings = pre(crossings) + 1;
+    end when;
+    assert(v[1] < 100, "v[1] stays below 100");
+  end CoupledLoopEvents;
 end ArrayPath;

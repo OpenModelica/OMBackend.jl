@@ -136,8 +136,9 @@ end
     scalarElement(e, subscripts, ty) -> Union{Nothing, Expression}
 
 A scalar element of element-wise or array-scalar arithmetic (`({0, 0, 1} * w)[3]` is `1 * w`,
-folded: `w`), the operands' elements picked (of `transpose(A)[i, j]`, `A[j, i]`; of an
-if-expression, each branch's; of a cast, its operand's), or of a matrix-matrix, matrix-vector or
+folded: `w`; `*` and `/` of an array result whose operands are of its rank or scalars), the
+operands' elements picked (of `transpose(A)[i, j]`, `A[j, i]`; of an if-expression, each
+branch's; of a cast, its operand's), or of a matrix-matrix, matrix-vector or
 vector-matrix product, the sum over the inner index (`(R_rel.T * {{0, 0, 0}, ..., {0, 0, 1}})[1, 1]`,
 a MultiBody frame's partial derivative); `nothing` for another expression.
 """
@@ -155,6 +156,19 @@ function scalarElement(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::I
     e.op in (IR.SUB, IR.SUB_EW) && return minus(pick(e.exp1), pick(e.exp2))
     e.op === IR.MUL_EW && return times(pick(e.exp1), pick(e.exp2))
     e.op === IR.DIV_EW && return divide(pick(e.exp1), pick(e.exp2))
+    #= `*`, `/` of an array result whose operands are arrays of its rank or scalars: element-wise (the lowering's
+       `{1, 0.5, 2} .* w`) =#
+    if e.op in (IR.MUL, IR.DIV) && e.ty isa IR.T_ARRAY
+      local rank::Int = length(IR.dimensions(e.ty))
+      local operand::Function = (x::IR.Expression) -> begin
+        local t::IR.ModelicaType = IR.typeOf(x)
+        t isa IR.T_ARRAY || return x
+        return length(IR.dimensions(t)) == rank ? pick(x) : nothing
+      end
+      local (a, b) = (operand(e.exp1), operand(e.exp2))
+      (a === nothing || b === nothing) && return nothing
+      return e.op === IR.MUL ? times(a, b) : divide(a, b)
+    end
     e.op in (IR.MATRIX_PRODUCT, IR.MUL_MATRIX_VECTOR, IR.MUL_VECTOR_MATRIX) && return productElement(e, subscripts, ty)
   elseif e isa IR.UNARY && e.op === IR.UMINUS
     return negate(pick(e.exp))

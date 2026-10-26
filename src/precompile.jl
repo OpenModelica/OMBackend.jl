@@ -198,14 +198,64 @@ function _precompileArrayRHS!(du, u, p, t)
   return nothing
 end
 
+"The warmup's time gradient (`_precompileWarmupArrayPath`): its right-hand side does not read t."
+function _precompileArrayTgrad!(dT, u, p, t)
+  fill!(dT, 0.0)
+  return nothing
+end
+
 function _precompileWarmupArrayPath()::Nothing
   local AG = CodeGeneration.ArrayODEGen
   local p = AG.ArrayModelParameters(Float64[], Bool[], Float64[], Float64[], Bool[], Bool[], [false], [false], zeros(2),
-                                    zeros(2), Bool[], Tuple{Float64, Vector{Float64}}[], Float64[], [0.0], [1.0], OMBackend)
+                                    zeros(2), Bool[], Tuple{Float64, Vector{Float64}}[], Float64[], [0.0], [1.0], Float64[],
+                                    AG.BlockSolver[], OMBackend)
   local sys = AG.ArraySystem(Dict{Symbol, Int}(), Symbol[], Dict{Symbol, Tuple{Symbol, Int}}(), OMBackend)
   local jac = CodeGeneration.Symbolics.SparseArrays.sparse([1, 2], [1, 2], ones(2), 2, 2)
-  local f = ODEFunction(_precompileArrayRHS!; jac_prototype = jac, sys = sys)
+  #= the time gradient wrapped as the array code wraps it (one type for every array model) =#
+  local tgrad = CodeGeneration.DiffEqBase.wrapfun_jac_iip(_precompileArrayTgrad!, ([1.0, 2.0], [1.0, 2.0], p, 0.0))
+  local f = ODEFunction(_precompileArrayRHS!; jac_prototype = jac, tgrad = tgrad, sys = sys)
   solve(ODEProblem(f, [1.0, 2.0], (0.0, 1.0), p), defaultSolver(); callback = nothing)
+  return nothing
+end
+
+const ARRAYS_KEPT_WORKLOAD = joinpath(@__DIR__, "Precompile", "ArraysKept.mo")
+include_dependency(ARRAYS_KEPT_WORKLOAD)
+
+"""
+The arrays-kept paths over the models of `Precompile/ArraysKept.mo`, as `translate` takes them, up to the generated
+module's code (a module is not evaluated while the package image is built): the frontend's flatten with the arrays
+kept, lowering and the passes, component rolling, index reduction in array form with its splits, the derivatives
+solved in array form and the array code after index reduction (`Chain`: MultiBody's frames through functions, slicing;
+`Volumes`: a semiLinear chain, a free parameter, a when-equation), and the array code of a model without index
+reduction (`LoopEvents`: a torn loop, events, a when-equation, an assert). Their code then compiles into the package image, not at each process's first
+such model: MSL EngineV6's first build compiled 2371 methods (18.7 s) for reducedArrayModel and 594 (3.8 s) for its
+array code, of OMBackend's own code (`Traversal.traverseField`'s specializations by node and pass: 1073). Each model
+must take its path (an error otherwise: the workload would compile less than it says). The registries those paths
+write are cleared of the workload's models.
+"""
+function _precompileWarmupArraysKept()::Nothing
+  local scode = OMFrontend.translateToSCode(OMFrontend.parseFile(ARRAYS_KEPT_WORKLOAD))
+  for model in ("Chain", "Volumes", "LoopEvents")
+    local name::String = "OMBackendWorkload." * model
+    local cn::String = canonicalName(name)
+    try
+      local (fm::OMFrontend.Frontend.FlatModel, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = false)
+      local functions::FunctionList = OMFrontend.cacheToFunctionList(cache)
+      local code::Tuple = if model == "LoopEvents"
+        CodeGeneration.ArrayODEGen.generateArrayODECode(fm, cn; functions)
+      else
+        local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(fm; functionList = functions)
+        reduced === nothing && error("$(name) not reduced in array form: $(scalarizedFallbackReason(cn))")
+        local (solved::OMJLIR.Model, _) = Passes.IndexReduction.solvedInArrays(reduced)
+        CodeGeneration.ArrayODEGen.generateArrayODECode(solved, cn; functions)
+      end
+      code[1] === nothing && error("$(name): no array code ($(code[2]))")
+    finally
+      delete!(ARRAY_PATH_REASONS, cn)
+      delete!(ARRAY_REDUCED_MODELS, cn)
+      delete!(ARRAY_ODE_MODELS, cn)
+    end
+  end
   return nothing
 end
 
@@ -239,6 +289,11 @@ end
         _precompileWarmupArrayPath()
       catch err
         @warn "[OMBackend] array-path precompile warmup skipped" exception = (err, catch_backtrace())
+      end
+      try
+        Base.CoreLogging.with_logger(_precompileWarmupArraysKept, Base.CoreLogging.NullLogger())
+      catch err
+        @warn "[OMBackend] arrays-kept precompile warmup skipped" exception = (err, catch_backtrace())
       end
     end
   end

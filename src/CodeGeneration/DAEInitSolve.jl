@@ -296,6 +296,74 @@ _erasedResiduals(f::ErasedResiduals)::ErasedResiduals = f
 _erasedResiduals(f::Function)::ErasedResiduals = ErasedResiduals(f)
 
 """
+    _solveCausalBlocks!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residuals, unknowns, sparsity; tol, maxiter) -> Int
+
+The initialization's square system (as many rows as `unknowns`: the right-hand side's rows `eq_idx`,
+then the initialization equations' `extra_residuals`) in causal order, as OpenModelica's
+block-lower-triangular form: each row matched to an unknown (a maximum matching by the Jacobian's
+structure `sparsity`; the initialization equations' rows by finite differences, `_initIncidence`), the
+strongly connected blocks of the matched rows' dependencies solved one after
+the other, in dependency order, each by Newton over its own unknowns (`_solveDAEPhase!`) with the
+blocks before it known. A block that does not converge ends the pass: the simultaneous phases go on
+from the blocks solved before it, whose values hold at every solution with theirs. Nothing where the
+system is one block or has no perfect matching. MSL EngineV6's slider-cranks: a loop's positions are a
+block of their own; solved together with the gas forces (polynomials of the piston position, far
+outside their range at the start guesses), the phases stalled at residuals of 35 and the free
+initialization moved the fixed load speed (test/initializationCausalRowsTests.jl). Returns how many unknowns were
+solved.
+"""
+function _solveCausalBlocks!(u0::Vector{Float64}, rhsFunc::F, p_vec::Vector{Float64}, eq_idx::Vector{Int},
+                             eq_target::Vector{Float64}, extra_residuals::Union{Nothing, ErasedResiduals},
+                             unknowns::Vector{Int}, sparsity::Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int};
+                             tol::Float64, maxiter::Int)::Int where {F}
+  local SA = Symbolics.SparseArrays
+  local nEq::Int = length(eq_idx)
+  local reads::Vector{Vector{Int}} = if extra_residuals === nothing
+    local rowsOf::SA.SparseMatrixCSC{Float64, Int} = permutedims(sparsity)   # column k: the columns row k reads
+    local position::Dict{Int, Int} = Dict{Int, Int}(j => k for (k, j) in enumerate(unknowns))
+    Vector{Int}[k <= size(rowsOf, 2) ? Int[position[c] for c in SA.rowvals(rowsOf)[SA.nzrange(rowsOf, k)] if haskey(position, c)] :
+                Int[] for k in eq_idx]
+  else
+    _initIncidence(rhsFunc, p_vec, u0, eq_idx, eq_target, extra_residuals, unknowns, sparsity)
+  end
+  length(reads) == length(unknowns) || return 0
+  local assign::Vector{Int} = _maximumMatching(reads, length(unknowns))   # assign[c]: the row of unknown c
+  all(!iszero, assign) || return 0
+  local columnOf::Vector{Int} = zeros(Int, length(reads))
+  foreach(c::Int -> (columnOf[assign[c]] = c), eachindex(assign))
+  #= an edge from the row that determines an unknown to each row that reads it =#
+  local g::Graphs.SimpleDiGraph{Int} = Graphs.SimpleDiGraph(length(reads))
+  for (w, cs) in enumerate(reads), c in cs
+    assign[c] == w || Graphs.add_edge!(g, assign[c], w)
+  end
+  local blocks::Vector{Vector{Int}} = Graphs.strongly_connected_components(g)
+  length(blocks) > 1 || return 0
+  local order::Vector{Int} = Graphs.topological_sort_by_dfs(Graphs.condensation(g, blocks))
+  local traceInit::Bool = OMBackend.envSwitch("OMBACKEND_INIT_TRACE")
+  local solved::Int = 0
+  for b in order
+    local rows::Vector{Int} = sort(blocks[b])
+    local vars::Vector{Int} = Int[unknowns[columnOf[w]] for w in rows]
+    local eqRows::Vector{Int} = Int[w for w in rows if w <= nEq]
+    #= the block's own initialization-equation rows =#
+    local extraRows::Vector{Int} = Int[w - nEq for w in rows if w > nEq]
+    local blockExtra::Union{Nothing, ErasedResiduals} = isempty(extraRows) ? nothing :
+      ErasedResiduals((du::AbstractVector, u::AbstractVector) -> extra_residuals(du, u)[extraRows])
+    local trial::Vector{Float64} = copy(u0)
+    local converged::Bool = _solveDAEPhase!(trial, rhsFunc, p_vec, eq_idx[eqRows], vars; targets = eq_target[eqRows],
+                                            maxiter = maxiter, tol = tol, extraRes = blockExtra, phaseLabel = "block")
+    if !converged
+      traceInit && println("[initblocks] block of ", length(rows), " rows did not converge; ", solved, " of ",
+                           length(unknowns), " unknowns solved block by block")
+      break
+    end
+    copyto!(u0, trial)
+    solved += length(vars)
+  end
+  return solved
+end
+
+"""
     _solveDAEInitialization!(u0, rhsAt0, p_vec, mm; extra_residuals, kwargs...) -> u0
 
 The initialization solve (`_solveDAEInitializationErased!`) with the right-hand side and the extra residuals
@@ -409,6 +477,14 @@ function _solveDAEInitializationErased!(u0, rhsAt0::ErasedRHS, p_vec, mm; maxite
     local nCausal = _solveCausalRows!(u0, rhsFunc, p_vec, eq_idx, eq_target, causalVars, sparsity; tol = tol)
     OMBackend.envSwitch("OMBACKEND_INIT_TRACE") && println("[initcausal] ", nCausal, " of ", length(causalVars),
                                                            " unknowns from one-unknown rows")
+  end
+  #= then the blocks in causal order, the initialization equations' rows among them: each a smaller,
+     better-posed Newton than the whole =#
+  if sparsity !== nothing && !isempty(causalVars) && length(causalVars) == length(init_res_vec)
+    local nBlocks::Int = _solveCausalBlocks!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residuals, causalVars, sparsity;
+                                             tol = tol, maxiter = min(maxiter, 50))
+    OMBackend.envSwitch("OMBACKEND_INIT_TRACE") && println("[initblocks] ", nBlocks, " of ", length(causalVars),
+                                                           " unknowns solved block by block")
   end
   local alg_unpinned = [i for i in alg_idx if !(i in pinnedSet)]
   local u0_phase1 = copy(u0)

@@ -240,17 +240,20 @@ function crefValue(e::IR.CREF, run::Interpretation)::Union{Nothing, FlatValue}
   return v === nothing ? nothing : scalarValue(v)
 end
 
-"The flat name of a reference, its subscripts evaluated in `run`; `nothing` where one does not evaluate to an index."
+"The flat name of a reference, its subscripts evaluated in `run` (as `flatName`); `nothing` where one does not evaluate to an index."
 function resolvedName(cref::IR.ComponentRef, run::Interpretation)::Union{Nothing, String}
   all(p -> isempty(p.subscripts), cref.parts) && return String(cref.name)
   local io = IOBuffer()
   for (i, p) in enumerate(cref.parts)
     i > 1 && print(io, '.')
-    print(io, p.name)
-    isempty(p.subscripts) && continue
+    if isempty(p.subscripts)
+      print(io, p.name)
+      continue
+    end
     local index = subscriptIndices(p.subscripts, run)
     index === nothing && return nothing
-    print(io, '[', join(index, ','), ']')
+    #= a part of rolled components by its member (`cylinder3`), as `flatName` =#
+    (p.ty isa IR.T_COMPONENTS && length(index) == 1) ? print(io, p.ty.members[index[1]]) : print(io, p.name, '[', join(index, ','), ']')
   end
   return String(take!(io))
 end

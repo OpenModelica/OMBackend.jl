@@ -15,12 +15,12 @@ end
 _arrayPathTaken(name) = name in OMBackend.ARRAY_ODE_MODELS
 _values(sol, names) = [OMBackend.getVariableValues(sol, n)[end] for n in names]
 
-function _bothWays(model, names; tspan = (0.0, 1.0))
+function _bothWays(model, names; tspan = (0.0, 1.0), kwargs...)
   local name = _arrayPathTranslate(model; scalarized = true)
-  local s = _values(OMBackend.simulateModel(name; tspan = tspan), names)
+  local s::Vector{Float64} = _values(OMBackend.simulateModel(name; tspan = tspan, kwargs...), names)
   _arrayPathTranslate(model; scalarized = false)
   @test _arrayPathTaken(name)
-  local sol = OMBackend.simulateModel(name; tspan = tspan)
+  local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution = OMBackend.simulateModel(name; tspan = tspan, kwargs...)
   @test sol.retcode == ReturnCode.Success
   return (s, _values(sol, names), sol)
 end
@@ -115,6 +115,13 @@ end
     local (s3, a3, _) = _bothWays("ArrayPath.FreeParam", ["x"])
     @test a3[1] ≈ 2 * exp(-1.0) rtol = 1e-5
     @test maximum(abs.(s3 .- a3)) < 1e-5
+    #= a double exponential's free parameters (MSL LightningImpulse): the physical root, eta = 0.9511..., tau1 = 470 us,
+       tau2 = 4.06 us, not tau1 = tau2 with eta = 0 (undamped Newton from the starts) =#
+    local impulse = _arrayPathTranslate("ArrayPath.DoubleExpImpulse"; scalarized = false)
+    @test _arrayPathTaken(impulse)
+    local (eta, tau1, tau2) = (0.9511248490912196, 4.7010661173524463e-4, 4.0639516102066676e-6)
+    local ys = _values(OMBackend.simulateModel(impulse; tspan = (0.0, 1e-3), reltol = 1e-10, abstol = 1e-12), ["y[1]", "y[2]", "x[1]"])
+    @test ys ≈ [fill((exp(-1e-3 / tau1) - exp(-1e-3 / tau2)) / eta, 2); (tau1 * (1 - exp(-1e-3 / tau1)) - tau2 * (1 - exp(-1e-3 / tau2))) / eta] rtol = 1e-8
     local (s4, a4, _) = _bothWays("ArrayPath.InitAlgPulse", ["count", "T_start", "y"])
     @test maximum(abs.(s4 .- a4)) < 1e-6
     @test a4[1:2] ≈ [6.0, 0.9] atol = 1e-6
@@ -171,10 +178,47 @@ end
     @test startswith(err.message, "x reached 0.5")
   end
 
-  @testset "Outside the scope: scalarized as before" begin
-    local name = _arrayPathTranslate("ArrayPath.AlgebraicLoop"; scalarized = false)
-    @test !_arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+  @testset "Algebraic loops: per element by Newton, through the elements as a DAE" begin
+    local tight::NamedTuple = (reltol = 1e-10, abstol = 1e-10)
+    #= an equation nonlinear in its unknown; a nonlinear loop of two per element =#
+    local (s::Vector{Float64}, a::Vector{Float64}, _) = _bothWays("ArrayPath.Cubic", ["x[1]", "y[2]", "x[3]"]; tight...)
+    @test isapprox(a, s; atol = 1e-9)
+    (s, a, _) = _bothWays("ArrayPath.LocalLoops", ["x[1]", "y[2]", "w[4]"]; tight...)
+    @test isapprox(a, s; atol = 1e-9)
+    #= one solve for the family of blocks: the code does not grow with n =#
+    local batches::Int = OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[].batches
+    @test _arrayPathTaken(_arrayPathTranslate("ArrayPath.LocalLoops1000"; scalarized = false))
+    @test OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[].batches == batches
+    #= a tridiagonal loop through all the elements: solved in the right-hand side (blockSolve!), the solver sees the
+       states only =#
+    local (s2::Vector{Float64}, a2::Vector{Float64}, sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution) = _bothWays("ArrayPath.CoupledLoop", ["x[1]", "v[2]", "x[20]", "v[10]"]; tight...)
+    @test isapprox(a2, s2; atol = 1e-9)
+    @test length(sol.u[1]) == 20
+    #= with an event in the loop (its unknowns solved again in the event iteration), a when-equation, an assert and an
+       initial equation (x[N] free) =#
+    local (s3::Vector{Float64}, a3::Vector{Float64}, _) = _bothWays("ArrayPath.CoupledLoopEvents", ["x[1]", "v[2]", "x[20]", "v[10]", "crossings"]; tight...)
+    @test isapprox(a3, s3; atol = 1e-8)
+    @test a3[5] == 1.0
+    #= nonlinear (the scalarized model's initialization fails here): its residuals at the end =#
+    local name::String = _arrayPathTranslate("ArrayPath.CoupledNonlinear"; scalarized = false)
+    @test _arrayPathTaken(name)
+    sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), tight...)
     @test sol.retcode == ReturnCode.Success
+    local val::Function = (n::String) -> OMBackend.getVariableValues(sol, n)[end]
+    local (x::Vector{Float64}, v::Vector{Float64}, w::Vector{Float64}) = ([val("x[$i]") for i in 1:20], [val("v[$i]") for i in 1:20], [val("w[$i]") for i in 1:20])
+    local residuals::Vector{Float64} = [2v[1] - v[2] + 0.1v[1]^3 - x[1]; [-v[i - 1] + 3v[i] - v[i + 1] + 0.1v[i]^3 - x[i] for i in 2:19];
+                       -v[19] + 2v[20] + 0.1v[20]^3 - x[20]]
+    @test maximum(abs, residuals) < 1e-10
+    @test w ≈ v .- x atol = 1e-12
+  end
+
+  @testset "Outside the scope: scalarized as before" begin
+    #= a loop of a model without arrays (the scalar path solves it); a loop through a relation (events in a loop) =#
+    for model in ("ArrayPath.AlgebraicLoop", "ArrayPath.LoopWithEvent")
+      local name::String = _arrayPathTranslate(model; scalarized = false)
+      @test !_arrayPathTaken(name)
+      local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+      @test sol.retcode == ReturnCode.Success
+    end
   end
 end
