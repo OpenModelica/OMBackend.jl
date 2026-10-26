@@ -198,6 +198,12 @@ function _precompileArrayRHS!(du, u, p, t)
   return nothing
 end
 
+"The warmup's time gradient (`_precompileWarmupArrayPath`): its right-hand side does not read t."
+function _precompileArrayTgrad!(dT, u, p, t)
+  fill!(dT, 0.0)
+  return nothing
+end
+
 function _precompileWarmupArrayPath()::Nothing
   local AG = CodeGeneration.ArrayODEGen
   local p = AG.ArrayModelParameters(Float64[], Bool[], Float64[], Float64[], Bool[], Bool[], [false], [false], zeros(2),
@@ -205,7 +211,9 @@ function _precompileWarmupArrayPath()::Nothing
                                     AG.BlockSolver[], OMBackend)
   local sys = AG.ArraySystem(Dict{Symbol, Int}(), Symbol[], Dict{Symbol, Tuple{Symbol, Int}}(), OMBackend)
   local jac = CodeGeneration.Symbolics.SparseArrays.sparse([1, 2], [1, 2], ones(2), 2, 2)
-  local f = ODEFunction(_precompileArrayRHS!; jac_prototype = jac, sys = sys)
+  #= the time gradient wrapped as the array code wraps it (one type for every array model) =#
+  local tgrad = CodeGeneration.DiffEqBase.wrapfun_jac_iip(_precompileArrayTgrad!, ([1.0, 2.0], [1.0, 2.0], p, 0.0))
+  local f = ODEFunction(_precompileArrayRHS!; jac_prototype = jac, tgrad = tgrad, sys = sys)
   solve(ODEProblem(f, [1.0, 2.0], (0.0, 1.0), p), defaultSolver(); callback = nothing)
   return nothing
 end

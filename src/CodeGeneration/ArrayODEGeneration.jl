@@ -4550,8 +4550,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       invariants!(p.abuf, p)
       #= a domain error or an assert in the right-hand side rejects the step (the solver retries smaller), as in the
          scalar path (MSL DifferenceAmplifier's x^y of a negative x at a trial point) =#
+      #= tgrad! wrapped to one type for every array model (the right-hand side is, AutoSpecialize): the model's own
+         function type in the problem compiled the solver again for each model =#
       local f::ODEFunction = ODEFunction($(StepRejectingRHS)(RHS!); jac_prototype = $jacProto,
-                                         tgrad = tgrad!, sys = $(ArraySystem)(@__MODULE__))
+                                         tgrad = OMBackend.CodeGeneration.DiffEqBase.wrapfun_jac_iip(tgrad!, (u0, u0, p, Float64(tspan[1]))),
+                                         sys = $(ArraySystem)(@__MODULE__))
       #= RightRootFind: the event lands just past the root, where the relation has its new value. =#
       local cbs = Any[]
       #= the relations were set literally above; from the solve on they have the hysteresis =#
