@@ -175,7 +175,15 @@ function _blockNewton!(s::BlockSolver, residual!::R, args::Tuple, full::Bool)::B
     end
     #= EngineV6's piston speed at top dead center, zero to round-off, flipped a relation in every pass of the event
        iteration while each solve stepped again =#
-    (iteration == 1 && step <= 1.0e-5) && return true
+    if iteration == 1 && step <= 1.0e-5
+      #= a Jacobian of this call evaluated last at its perturbed points (the equations' du and a there): back at the
+         iterate =#
+      if fresh
+        residual!(r, x, args...)
+        s.residuals += 1
+      end
+      return true
+    end
     x .-= dx
     residual!(r, x, args...)
     s.residuals += 1

@@ -88,3 +88,18 @@ at x = 2.9); the acceleration a follows from f. Solved together from the zero gu
   @test solvedInit[1] == 0.5
   @test solvedInit[2] ≈ u[2] rtol = 1.0e-8
 end
+
+#= The blocks' incidence probes (initialization equations: by finite differences, at a point near the entry) reach
+   y < 0 in sqrt(y) from its start 0: the DomainError ended the initialization, which the phases after solve. =#
+@testset "Initialization: an exception in the blocks' pass" begin
+  local CG = OMBackend.CodeGeneration
+  local SA = CG.Symbolics.SparseArrays
+  #= u = [x, y]: der(x) = -x, 0 = sqrt(y) - x, initially x = 2 =#
+  local rhs!(du, u, p, t) = (du[1] = -u[1]; du[2] = sqrt(u[2]) - u[1]; nothing)
+  local mm::Matrix{Float64} = [1.0 0.0; 0.0 0.0]
+  local sparsity::SA.SparseMatrixCSC{Float64, Int} = SA.sparse([1, 2, 2], [1, 1, 2], zeros(3), 2, 2)
+  local u::Vector{Float64} = CG._solveDAEInitialization!([0.0, 0.0], rhs!, Float64[], mm; sparsity = sparsity,
+                                                         extra_residuals = (du, u) -> [u[1] - 2.0])
+  @test u[1] ≈ 2.0 atol = 1.0e-8
+  @test u[2] ≈ 4.0 atol = 1.0e-8
+end

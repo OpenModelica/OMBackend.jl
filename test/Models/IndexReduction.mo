@@ -640,6 +640,27 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     end for;
   end MixedPendulums;
 
+  model PendulumsFirstForceLaw "PendulumArray, the first pendulum's force law twice the others': its derivatives solved from other bodies, solvedInArrays splits the arrays in place"
+    parameter Integer n = 3;
+    Real x[n](each start = 0.6, each fixed = true);
+    Real y[n](each start = -0.8);
+    Real vx[n](each start = 0, each fixed = true);
+    Real vy[n];
+    Real F[n];
+  equation
+    for i in 1:n loop
+      der(x[i]) = vx[i];
+      der(y[i]) = vy[i];
+      x[i]^2 + y[i]^2 = 1;
+    end for;
+    der(vx[1]) = -2 * F[1] * x[1];
+    der(vy[1]) = -2 * F[1] * y[1] - 9.81;
+    for i in 2:n loop
+      der(vx[i]) = -F[i] * x[i];
+      der(vy[i]) = -F[i] * y[i] - 9.81;
+    end for;
+  end PendulumsFirstForceLaw;
+
   model EachStartArray "each start = sum(m): one start for every element of phi1 (not m's elements); rigidly coupled pairs at rest"
     parameter Real m[3] = {0.1, 0.2, 0.3};
     Real phi1[3](each start = sum(m), each fixed = true);

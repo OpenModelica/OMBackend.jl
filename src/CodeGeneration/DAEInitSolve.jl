@@ -481,8 +481,15 @@ function _solveDAEInitializationErased!(u0, rhsAt0::ErasedRHS, p_vec, mm; maxite
   #= then the blocks in causal order, the initialization equations' rows among them: each a smaller,
      better-posed Newton than the whole =#
   if sparsity !== nothing && !isempty(causalVars) && length(causalVars) == length(init_res_vec)
-    local nBlocks::Int = _solveCausalBlocks!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residuals, causalVars, sparsity;
-                                             tol = tol, maxiter = min(maxiter, 50))
+    #= an exception at a point only the blocks' Newton or their incidence probes reach (a function's domain, an
+       assert): on to the phases below, u0 as after the last converged block =#
+    local nBlocks::Int = try
+      _solveCausalBlocks!(u0, rhsFunc, p_vec, eq_idx, eq_target, extra_residuals, causalVars, sparsity;
+                          tol = tol, maxiter = min(maxiter, 50))
+    catch e
+      OMBackend._fallback(e, :solveCausalBlocks)
+      0
+    end
     OMBackend.envSwitch("OMBACKEND_INIT_TRACE") && println("[initblocks] ", nBlocks, " of ", length(causalVars),
                                                            " unknowns solved block by block")
   end

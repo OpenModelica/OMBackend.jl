@@ -649,7 +649,12 @@ function generateReducedArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel, re
   isempty(TUNABLE_PARAMETERS[]) || return decline("withTunableParameters (the ModelingToolkit path's tunable sets)")
   local reduction::Module = Passes.IndexReduction
   local (modelName::Union{Nothing, String}, modelCode::Union{String, Expr}) = try
-    local (solved::OMJLIR.Model, _) = @BACKEND_PERFLOG "[backendAPI] solvedInArrays" reduction.solvedInArrays(reduced)
+    #= solvedInArrays splits arrays in place (splitArrays!), a split that throws part-way leaves its model half split:
+       a copy, so the scalarized fallback reads `reduced` as reduced =#
+    local working::OMJLIR.Model = OMJLIR.Model(reduced.name, deepcopy(reduced.variables), deepcopy(reduced.continuous),
+                                               reduced.clocked, reduced.baseClocks, reduced.functions, reduced.initialMode,
+                                               reduced.modes, reduced.transitions, reduced.frontendModel)
+    local (solved::OMJLIR.Model, _) = @BACKEND_PERFLOG "[backendAPI] solvedInArrays" reduction.solvedInArrays(working)
     @BACKEND_PERFLOG "[backendAPI] array code (after index reduction)" CodeGeneration.ArrayODEGen.generateArrayODECode(solved, name; functions = functionList)
   catch err
     isFatal(err) && rethrow()

@@ -178,6 +178,21 @@ end
     @test startswith(err.message, "x reached 0.5")
   end
 
+  #= blockSolve! from a guess at the solution: a fresh Jacobian (its evaluations at perturbed points), its first step
+     at round-off; the equations' a was left at the last color's perturbed point (1.5e-8 relative) =#
+  @testset "A block solve's equations at its solution after a fresh Jacobian" begin
+    local AG::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local SA::Module = OMBackend.CodeGeneration.Symbolics.SparseArrays
+    local c::Vector{Float64} = [1.0, 2.0]
+    local S::SA.SparseMatrixCSC{Float64, Int} = SA.sparse([1, 2], [1, 2], [1.0, 1.0], 2, 2)
+    local s::AG.BlockSolver = AG.BlockSolver(S, AG.columnColors(S), copy(c))
+    local residual!(r, y, du, a, u, p, t, z, mode, fire) = (a .= y; r .= y .- c; nothing)
+    local (du::Vector{Float64}, a::Vector{Float64}) = (zeros(2), zeros(2))
+    AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, nothing, false, false)
+    @test s.jacobians == 1
+    @test a == c
+  end
+
   @testset "Algebraic loops: per element by Newton, through the elements as a DAE" begin
     local tight::NamedTuple = (reltol = 1e-10, abstol = 1e-10)
     #= an equation nonlinear in its unknown; a nonlinear loop of two per element =#

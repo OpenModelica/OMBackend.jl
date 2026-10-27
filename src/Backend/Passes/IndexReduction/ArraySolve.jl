@@ -216,8 +216,10 @@ end
     solvedInArrays(model; known) -> Tuple{IR.Model, Vector{Symbol}}
 
 The model reduced in array form (`reduceIndexArrays!`) with its derivative unknowns solved for in array form (the
-switch OMBACKEND_SOLVE_DERIVATIVES): a new model (its variables shared, its partition's equations new; `model` not
-changed) and the derivatives so solved (arrays and scalars). The decisions are `solveDerivatives!`'s on the element
+switch OMBACKEND_SOLVE_DERIVATIVES): a new model (its variables shared, its partition's equations new) and the
+derivatives so solved (arrays and scalars). `model` is changed in place where a derivative array is split
+(`splitArrays!`: its meaning and its scalarized form unchanged, but a split that throws part-way leaves it half split):
+a caller that goes on with `model` passes a copy. The decisions are `solveDerivatives!`'s on the element
 view (`derivativeSolution`; `known` as there); each body solved once for the derivative its iterations determine
 (`solvedTemplate`), the values resolved (`resolvedTemplates`) and put in. Checked: the result scalarized is the
 element view solved. NotHandled where a derivative array's elements are solved from different bodies or only some of

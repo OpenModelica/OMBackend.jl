@@ -548,6 +548,19 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
       @test _irArraySimulate("EachStartArray", ["phi1[1]", "phi1[3]", "phi2[2]"], 1.0; kept = true) ≈ fill(0.6, 3)
       @test OMBackend.canonicalName("IndexReduction.EachStartArray") in OMBackend.ARRAY_REDUCED_MODELS
       @test OMBackend.canonicalName("IndexReduction.EachStartArray") in OMBackend.ARRAY_ODE_MODELS
+      #= a derivative array solved from different bodies: solvedInArrays splits it in place, so the array code solves
+         a copy and the scalarized fallback (a dynamic state set) reads the reduced model as reduced =#
+      let (fm, functions) = _irArrayFlat("PendulumsFirstForceLaw")
+        local reduced::_IRM.Model = OMBackend.reducedArrayModel(fm; functionList = functions)
+        local names::Vector{Symbol} = Symbol[v.name for v in reduced.variables]
+        @test OMBackend.generateReducedArrayODETargetCode(fm, reduced; functionList = functions) === nothing
+        @test Symbol[v.name for v in reduced.variables] == names
+      end
+      local firstLaw::Vector{String} = ["x[1]", "y[1]", "x[2]", "F[1]", "F[3]"]
+      local firstLawScalarized::Vector{Float64} = _irArraySimulate("PendulumsFirstForceLaw", firstLaw, 1.0; kept = false)
+      @test isapprox(_irArraySimulate("PendulumsFirstForceLaw", firstLaw, 1.0; kept = true), firstLawScalarized;
+                     atol = 1e-8, rtol = 1e-8)
+      @test OMBackend.canonicalName("IndexReduction.PendulumsFirstForceLaw") in OMBackend.ARRAY_REDUCED_MODELS
       #= the array code off: the reduced model scalarized, the same results =#
       local inertia::Vector{String} = ["phi1[1]", "phi2[4]", "w2[3]", "tau[2]"]
       local arrayCode::Vector{Float64} = _irArraySimulate("InertiaArray", inertia, 2.0; kept = true)
