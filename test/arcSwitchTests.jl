@@ -20,23 +20,20 @@ import OMFrontend
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
   local sol = OMBackend.simulateModel(OMBackend.canonicalName("ArcSwitchYD.Switching"); tspan = (0.0, 0.06))
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
-  local closerCurrents(t::Float64)::Vector{Float64} =
-    [OMBackend.getVariableValues(sol, "closer[$k].i")[argmin(abs.(sol.t .- t))] for k in 1:3]
+  #= a variable's value at t, interpolated (the saved points are sparse) =#
+  local value(name::String, t::Float64)::Float64 = sol(t; idxs = OMBackend.canonicalSymbol(name))
   #= open (Goff): milliamperes until the delay closes them, then the windings' currents =#
-  local (open, closed) = (closerCurrents(0.03), closerCurrents(0.05))
-  @test maximum(abs, open) < 0.01
-  @test maximum(abs, closed) > 10
-  #= the quenches: events (a repeated time) at the reference's instants =#
-  local events::Vector{Float64} = unique(Float64[sol.t[k] for k in 2:length(sol.t) if sol.t[k] == sol.t[k - 1]])
-  @test any(t::Float64 -> abs(t - 0.025102795) < 1.0e-6, events)
-  @test count(t::Float64 -> abs(t - 0.0285941) < 1.0e-6, events) == 2
-  #= the winding currents at 28 ms, interpolated (the saved points are sparse) =#
-  local named::Dict{String, Any} =
-    Dict{String, Any}(string(x) => x for x in OMBackend.CodeGeneration.ModelingToolkit.unknowns(sol.prob.f.sys))
-  local winding(k::Int)::Float64 = sol(0.028; idxs = named["var\"i[$k]\"(t)"])
-  @test isapprox([winding(k) for k in 1:3], [29.49484, -29.49234, -0.002509956]; rtol = 1.0e-4)
+  @test maximum(k::Int -> abs(value("closer[$k].i", 0.03)), 1:3) < 0.01
+  @test isapprox([value("closer[$k].i", 0.05) for k in 1:3], [-10.696, 213.24, -202.55]; rtol = 1.0e-4)
+  @test isapprox([value("i[$k]", 0.028) for k in 1:3], [29.49484, -29.49234, -0.002509956]; rtol = 1.0e-4)
+  #= the quenches: the first time after the opening each opener's `quenched` holds =#
+  local quenchedAt(s, k::Int)::Float64 = begin
+    local q::Vector{Float64} = OMBackend.getVariableValues(s, "opener[$k].quenched")
+    s.t[findfirst(j::Int -> s.t[j] > 0.025 && q[j] > 0.5, eachindex(s.t))]
+  end
+  @test isapprox([quenchedAt(sol, k) for k in 1:3], [0.028594113, 0.028594051, 0.025102795]; atol = 1.0e-6)
   #= a second solve of the cached build takes the same path: the event iteration's memory of degenerate step restarts
      (`stall`) was kept from the first, and the arcs of phases 1 and 2 quenched at 29.288 ms =#
   local again = OMBackend.simulateModel(OMBackend.canonicalName("ArcSwitchYD.Switching"); tspan = (0.0, 0.06))
-  @test unique(Float64[again.t[k] for k in 2:length(again.t) if again.t[k] == again.t[k - 1]]) == events
+  @test [quenchedAt(again, k) for k in 1:3] == [quenchedAt(sol, k) for k in 1:3]
 end
