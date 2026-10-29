@@ -486,10 +486,14 @@ stopped near 2e-6 s (MaxIters or Unstable); left out, it runs to 1 s in
 The `dummyDerivatives` of OMBackend's index reduction (SIM_CODE.dummyDerivatives)
 are left out too: they jump at events; controlled, the transformer currents' of
 MSL Rectifier6pulse held the steps at the diodes' switching until MaxIters
-(SMEE_Rectifier and Rectifier12pulse too). Its other derivative unknowns, a
-state's derivative kept as an unknown (`\$DER_aimc_inertiaRotor_w`), stay
-controlled: left out, MSL AIMC_DOL's stator currents were 0.45 % off the
-reference at reltol 1e-6 (MTK's path 0.03 %).
+(SMEE_Rectifier and Rectifier12pulse too). So are its other derivative unknowns
+(`\$DER_x`, a state's derivative kept as an unknown), as in OpenModelica:
+after MSL IMC_YDarc's arc quenched, the stator currents' derivatives were
+fixed only through the open switch's Goff (the algebraic block's condition
+3.6e9), their noise was above the tolerance at any step, and the solve
+stalled in 5e-13 s steps (MaxIters at 2.0027 s; left out, 2.5 s in 28 s).
+Controlled, they were what MSL 3.2.3's AIMC_DOL needed (2026-10-23); on 4.1.0
+its IMC_DOL is closer to the reference left out (0.0033 A against 0.0060).
 """
 function defaultToleranceKwargs(problem, kwargs; dummyDerivatives::Vector{String} = String[])
   local abstol = get(kwargs, :abstol, 1.0e-6)
@@ -499,7 +503,7 @@ function defaultToleranceKwargs(problem, kwargs; dummyDerivatives::Vector{String
   local names = string.(getStatesAsSymbols(problem.f))
   length(names) == length(problem.u0) || return (;)
   local dummies = Set{String}(dummyDerivatives)
-  local derivatives = Int[k for k in rows if occursin("ˍt", names[k]) || names[k] in dummies]
+  local derivatives::Vector{Int} = Int[k for k in rows if occursin("ˍt", names[k]) || startswith(names[k], "\$DER_") || names[k] in dummies]
   isempty(derivatives) && return (;)
   local perUnknown = fill(Float64(abstol), length(problem.u0))
   perUnknown[derivatives] .= Inf

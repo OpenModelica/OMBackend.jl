@@ -2046,7 +2046,7 @@ end
 The structural simplification of `firstOrderSystem` into `reducedSystem` (tearing only for a
 system OMBackend reduced, `indexReduced`); with an observed
 filter, the observed equations kept those whose variable a pattern matches, with the observed
-variables they read and the system's and the initialization equations read. With
+variables they read and the system's, the initialization equations' and the events' read. With
 ENABLE_BACKEND_LOGGING, the system before is dumped to `backend/codeGen/preStructuralSimplify.log`
 (the path taken at codegen time, in the model's run directory).
 """
@@ -2088,10 +2088,25 @@ function performStructuralSimplify(; observedFilter::Union{Nothing, Vector{Strin
                                    ModelingToolkit.initialization_equations(reducedSystem)))
       for _side in (_seq.lhs, _seq.rhs)
         for _v in Symbolics.get_variables(_side)
-          local _vn = string(_v)
+          local _vn::String = string(_v)
           haskey(_obsByLhs, _vn) && push!(_stack, _vn)
         end
       end
+    end
+    #= And from the observations injected after this (the alias and eliminated variables', the filter's already): an
+       alias reads a variable MTK made observed, which no pattern matches (MSL IMC_DCBraking's `imc.is[1] =
+       imc_spacePhasorS_i[1]`: dropped, the alias read an undefined name). =#
+    if @isdefined(observedEqs)
+      for _oeq in observedEqs, _v in Symbolics.get_variables(_oeq.rhs)
+        local _vn::String = string(_v)
+        haskey(_obsByLhs, _vn) && push!(_stack, _vn)
+      end
+    end
+    #= And from the events: process_events builds their conditions and affects from the observed equations (MSL
+       FullRobot's path planning relations read `pathPlanning_path_sd_max_inv`: dropped, its build failed). =#
+    for _v in OMBackend.CodeGeneration.MTK_CodeGenerationUtil.eventReadVariables(reducedSystem)
+      local _vn::String = string(_v)
+      haskey(_obsByLhs, _vn) && push!(_stack, _vn)
     end
     while !isempty(_stack)
       local _nm = pop!(_stack)
@@ -2100,7 +2115,7 @@ function performStructuralSimplify(; observedFilter::Union{Nothing, Vector{Strin
       local _eq = get(_obsByLhs, _nm, nothing)
       _eq === nothing && continue
       for _v in Symbolics.get_variables(_eq.rhs)
-        local _vn = string(_v)
+        local _vn::String = string(_v)
         (haskey(_obsByLhs, _vn) && !(_vn in _keepNames)) && push!(_stack, _vn)
       end
     end
@@ -2111,6 +2126,38 @@ function performStructuralSimplify(; observedFilter::Union{Nothing, Vector{Strin
     end
   end
 end
+
+"""
+    eventReadVariables(sys) -> Vector{Any}
+
+The variables the continuous and discrete events of `sys` read: their conditions and their imperative affects'
+observed and modified expressions (performStructuralSimplify's observed filter keeps their observed equations).
+"""
+function eventReadVariables(sys::ModelingToolkit.AbstractSystem)::Vector{Any}
+  local out::Vector{Any} = Any[]
+  for cb in Iterators.flatten((ModelingToolkit.continuous_events(sys), ModelingToolkit.discrete_events(sys)))
+    _symbolicReads!(out, cb.conditions)
+    for f in (:affect, :affect_neg, :initialize, :finalize)
+      hasfield(typeof(cb), f) && _symbolicReads!(out, getfield(cb, f))
+    end
+  end
+  return out
+end
+
+"""
+The variables an event's part reads, added to `out`: an equation's, an expression's, an imperative affect's observed
+and modified expressions; nothing for another part (no affect, a periodic discrete event's time).
+"""
+_symbolicReads!(out::Vector{Any}, @nospecialize(x))::Nothing = nothing
+_symbolicReads!(out::Vector{Any}, eq::Symbolics.Equation)::Nothing = (_symbolicReads!(out, eq.lhs); _symbolicReads!(out, eq.rhs))
+_symbolicReads!(out::Vector{Any}, x::Union{Symbolics.Num, SymbolicUtils.BasicSymbolic})::Nothing =
+  (append!(out, Symbolics.get_variables(x)); nothing)
+function _symbolicReads!(out::Vector{Any}, xs::Union{AbstractVector, Tuple, NamedTuple})::Nothing
+  foreach(x -> _symbolicReads!(out, x), xs)
+  return nothing
+end
+_symbolicReads!(out::Vector{Any}, a::ModelingToolkit.ImperativeAffect)::Nothing =
+  (_symbolicReads!(out, a.obs); _symbolicReads!(out, a.modified))
 
 """
     odeSystemWithEvents(hasEvents, modelName; hasObserved = false)

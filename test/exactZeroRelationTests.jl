@@ -42,3 +42,28 @@ end
   @test CG._update!(c, at(0.75))
   @test !c.rel[1]
 end
+
+#= Nor the rounding rule (`_onBoundary`: a false `<=` on its boundary to rounding holds): an open switch's quench
+   relation `abs(i) <= abs(v)*Goff` (MSL OpenerWithArc, CloserWithArc) compares the two sides of `i = Goff*v`, which
+   the integrator holds only to its error. Located at the band's edge it flipped false, the event's solve put it back
+   on its boundary, and the rule flipped it true again at the same instant (MSL IMC_YDarc). =#
+@testset "The rounding rule after a located crossing" begin
+  local CG = OMBackend.CodeGeneration
+  local zc = Ref(0.0)
+  local c = CG.DiscreteCluster(["quenched"], Any[], Any[], 0, 0, [false], [false], nothing, 0, false)
+  c.crossings! = (out, u, p, t) -> (out[1] = zc[]; out[2] = 1.0; nothing)
+  local at(t) = (u = Float64[], p = nothing, t = t, opts = (reltol = 1.0e-6,), sol = (prob = (tspan = (0.0, 1.0),),))
+  c.rel[1] = true
+  #= located at the band's edge: flipped false =#
+  zc[] = 1.04e-10
+  c.crossed[1] = true
+  CG._update!(c, at(0.5))
+  @test !c.rel[1]
+  #= back on its boundary to rounding at the same instant: kept =#
+  zc[] = 1.0e-16
+  @test !CG._update!(c, at(0.5))
+  @test !c.rel[1]
+  #= on its boundary at another instant, not located: it holds =#
+  @test CG._update!(c, at(0.75))
+  @test c.rel[1]
+end

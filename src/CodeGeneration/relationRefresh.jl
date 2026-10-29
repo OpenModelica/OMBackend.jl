@@ -749,11 +749,19 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
      relation counted 347 switches, OpenModelica 20). Such a model stops as
      before. =#
   local r = isempty(e.relationWhens) && isempty(e.discreteWhens) && isempty(e.clusters) ? e.ifRelations : nothing
-  if (resolve || _continuousEventFired(integrator)) && !_resolveAlgebraics!(integrator, e.reinit)
-    @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
-    #= The located crossings belong to this event. =#
-    foreach(c -> fill!(c.crossed, false), e.clusters)
-    return nothing
+  #= The algebraic unknowns at the event in the modes from before it. Where they have no solution, the modes the
+     relations switch to can have one (an arc's current caught past its quench window, MSL OpenerWithArc: `v =
+     V*sign(i)` has none there, the quenched `i = Goff*v` has; where the steps land relative to the window moved with
+     OrdinaryDiffEqCore 4.19): the return code is put back (`_staleResolve!`) and the sweep reads the relations at
+     the located crossing (the state there: a failed solve leaves its last iterate). The event fails if none changes,
+     or if the solve in the new modes fails too. =#
+  local unsolved::Bool = false
+  if resolve || _continuousEventFired(integrator)
+    local atCrossing::AbstractVector = copy(integrator.u)
+    if !_staleResolve!(integrator, e.reinit)
+      copyto!(integrator.u, atCrossing)
+      unsolved = true
+    end
   end
   #= The same instant again and again (a comparator with positive feedback at
      its fold, MSL SignalGenerator's fifth switch: the linear branch settled
@@ -779,6 +787,13 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
       forced = 1
       continue
     end
+    if !changed && unsolved
+      _restoreRetcode!(integrator, ModelingToolkit.SciMLBase.ReturnCode.InitialFailure)
+      @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
+      #= The located crossings belong to this event. =#
+      foreach(c -> fill!(c.crossed, false), e.clusters)
+      return nothing
+    end
     if !changed
       n - forced > 1 && _restartStepSize!(integrator, e.stall)
       #= Settled: the discrete whens' change()/edge() memory takes the
@@ -791,6 +806,7 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
       @error "[events] the algebraic variables could not be solved after the event at t = $(integrator.t)"
       return nothing
     end
+    unsolved = false
   end
   #= The if-equation relations may switch back and forth where the loop has
      a solution on another branch (a comparator with positive feedback): one
@@ -826,8 +842,9 @@ function _initialize!(e::EventIteration, integrator)
   #= Only the values the tick changed: the clusters initialize theirs below
      (a pulse true from the start is no edge). =#
   local moved = before === nothing ? Int[] : Int[k for k in eachindex(before) if !isequal(before[k], integrator.u[k])]
-  #= A new solve (a re-simulation reuses the callbacks): no instant repeated yet. =#
+  #= A new solve (a re-simulation reuses the callbacks): no instant repeated yet, no degenerate restart. =#
   e.instant[] = (NaN, 0)
+  e.stall[] = (NaN, 0)
   _initializeRelations!(e, integrator)
   local start = integrator.u
   if !isempty(moved)

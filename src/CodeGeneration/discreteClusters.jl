@@ -103,13 +103,16 @@ mutable struct DiscreteCluster
   rel::Vector{Bool}          # the relation buffers
   crossed::Vector{Bool}      # the relations whose crossing the callback located, until the next update
   locatedAt::Vector{Float64} # per relation the time of its last located flip (`_update!`)
+  band::Vector{Float64}      # per relation its hysteresis relative to H (`_hover!`)
+  peak::Vector{Float64}      # per relation the largest |crossing function| / scale since its last located flip
 end
 
 DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled = true,
                 eventOnly = fill(false, length(strict))) =
   DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled, eventOnly,
                   nothing, nothing, zeros(2 * length(strict)), Int[], fill(false, length(strict)),
-                  fill(false, length(strict)), fill(NaN, length(strict)))
+                  fill(false, length(strict)), fill(NaN, length(strict)), fill(1.0, length(strict)),
+                  fill(Inf, length(strict)))
 
 #= SciMLBase 3 renamed u_modified! (now deprecated) to derivative_discontinuity!. =#
 const _derivativeDiscontinuity! = isdefined(ModelingToolkit.SciMLBase, :derivative_discontinuity!) ?
@@ -141,7 +144,7 @@ Relation k by the hysteresis rule from `old`; an exact one literal.
 """
 function _ruled(c::DiscreteCluster, zs, k::Int, H, old::Bool)
   c.exact[k] && return _literal(zs, k, c.strict[k])
-  return _hysteresisRule(zs[2k - 1], H * zs[2k], old)
+  return _hysteresisRule(zs[2k - 1], H * c.band[k] * zs[2k], old)
 end
 
 """
@@ -173,16 +176,50 @@ The crossing functions, shifted by the hysteresis relative to the buffers.
 Called at every condition evaluation: the typed loop is behind a barrier.
 """
 function _crossings!(out, c::DiscreteCluster, u, t, integrator)
-  _shiftCrossings!(out, _crossingValues!(c, u, integrator.p, t), c.rel, c.exact, c.eventOnly,
+  _shiftCrossings!(out, _crossingValues!(c, u, integrator.p, t), c.rel, c.exact, c.eventOnly, c.band, c.peak,
                    _hysteresisFromTolerance(integrator))
   return nothing
 end
 
 function _shiftCrossings!(out, zs::Vector{Float64}, rel::Vector{Bool}, exact::Vector{Bool}, eventOnly::Vector{Bool},
-                          H::Float64)
+                          band::Vector{Float64}, peak::Vector{Float64}, H::Float64)
   for k in eachindex(rel)
-    out[k] = eventOnly[k] ? 1.0 : exact[k] ? zs[2k - 1] : zs[2k - 1] + H * zs[2k] * (1 - 2 * rel[k])
+    if eventOnly[k] || exact[k]
+      out[k] = eventOnly[k] ? 1.0 : zs[2k - 1]
+      continue
+    end
+    peak[k] = max(peak[k], abs(zs[2k - 1]) / max(abs(zs[2k]), 1.0))
+    out[k] = zs[2k - 1] + H * band[k] * zs[2k] * (1 - 2 * rel[k])
   end
+  return nothing
+end
+
+"""
+The hysteresis of a relation that hovers on its boundary, relative to H: the
+integrator's tolerance (H is 1e-4 of it, `_hysteresis`).
+"""
+const _HOVER_BAND = 1.0e4
+
+"""
+    _hover!(c, k, H)
+
+At a located flip of relation k at a new instant: its band is the tolerance
+(`_HOVER_BAND`) where its crossing function stayed within half of it since
+its last located flip (`peak`), H elsewhere. Such a relation hovers on its
+boundary, its operands held only to the integrator's error, which crosses H
+back and forth: MSL OpenerWithArc's quench relation `abs(i) <= abs(v)*Goff`
+compares the two sides of its quenched equation `i = Goff*v` (v an algebraic
+unknown of the DAE), an event every 0.25 ms (MSL IMC_YDarc: 46 000 to 2 s).
+OpenModelica solves the algebraic operands of its relations from the states.
+Leaving the band, at its edge, the relation is past half of it: H again.
+Decided by the relation's own values, not by what it reads: the tolerance for
+every relation reading an algebraic unknown delayed a timer's output on its
+threshold by the band (MSL Thyristor1Pulse_R fired 2e-4 s late at the default
+tolerance) and RobotR3 FullRobot's `time >= path.endTime + swingTime`.
+"""
+function _hover!(c::DiscreteCluster, k::Int, H::Float64)::Nothing
+  c.band[k] = c.peak[k] <= 0.5 * _HOVER_BAND * H ? _HOVER_BAND : 1.0
+  c.peak[k] = 0.0
   return nothing
 end
 
@@ -234,7 +271,13 @@ exactly: the algebraic solve leaves a commutating thyristor's current at
 +-1e-15, and the literal of its sign flipped at every sweep. Not where the
 callback located it at this instant: a locked brake's `w < 0` was located at
 the band's edge, the new mode's solve put w at exactly 0, and the literal
-flipped it back, every 2e-12 s (MSL Rotational HeatLosses: MaxIters).
+flipped it back, every 2e-12 s (MSL Rotational HeatLosses: MaxIters). Nor
+the rounding rule there: an open switch's quench relation
+`abs(i) <= abs(v)*Goff` (MSL OpenerWithArc, CloserWithArc) compares the
+two sides of its equation `i = Goff*v`, which the integrator holds only to
+its error (v an algebraic unknown); located at the band's edge it flipped
+false, the event's solve put it back on its boundary, and the rule flipped
+it true again at the same instant (MSL IMC_YDarc).
 """
 function _update!(c::DiscreteCluster, integrator)
   local zs = _eventCrossingValues!(c, integrator)
@@ -244,8 +287,11 @@ function _update!(c::DiscreteCluster, integrator)
   for k in eachindex(c.rel)
     local new = iszero(zs[2k - 1]) && c.locatedAt[k] != t ? _literal(zs, k, c.strict[k]) :
                 c.crossed[k] ? !c.rel[k] : _ruled(c, zs, k, H, c.rel[k])
-    (!new && !c.rel[k] && !c.strict[k] && _onBoundary(zs[2k - 1], zs[2k])) && (new = true)
-    c.crossed[k] && new != c.rel[k] && (c.locatedAt[k] = t)
+    (!new && !c.rel[k] && !c.strict[k] && c.locatedAt[k] != t && _onBoundary(zs[2k - 1], zs[2k])) && (new = true)
+    if c.crossed[k] && new != c.rel[k]
+      c.locatedAt[k] != t && _hover!(c, k, H)
+      c.locatedAt[k] = t
+    end
     c.crossed[k] = false
     new == c.rel[k] && continue
     c.rel[k] = new
@@ -264,6 +310,8 @@ function _literalBuffers!(c::DiscreteCluster, integrator)
   end
   fill!(c.crossed, false)
   fill!(c.locatedAt, NaN)
+  fill!(c.band, 1.0)
+  fill!(c.peak, Inf)
   return nothing
 end
 
@@ -351,8 +399,10 @@ function _solveMixedSystem!(c::DiscreteCluster, integrator, pre, relPre, reinit)
     push!(tried, _memberValues(c, integrator))
     _write!(c, integrator, values)
     changed = true
-    #= Uncoupled: the event iteration solves once after the sweep. =#
-    c.coupled && (_resolveAlgebraics!(integrator, reinit) || return changed)
+    #= Uncoupled: the event iteration solves once after the sweep. A failed solve puts the return code back
+       (`_staleResolve!`): the sweep goes on, and an InitialFailure left here made every later solve of the instant
+       fail. =#
+    c.coupled && (_staleResolve!(integrator, reinit) || return changed)
     local before = copy(c.rel)
     _update!(c, integrator)
     flipped .|= before .!= c.rel

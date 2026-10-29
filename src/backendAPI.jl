@@ -797,13 +797,16 @@ function generateIMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
      loaded module is already fresh: record changeDetected = false so a later
      MTK-mode simulate on this model does not needlessly re-eval the module. A
      structural model's module is evaluated at its first simulate (simulateIMTK):
-     changed until then. =#
+     changed until then. So is the module of a failed build: the failure freed its
+     external objects (forgetBuild), and the module's own simulate read the freed
+     tables ("... was freed with the build it belonged to") instead of failing on
+     the build's error (MSL FullRobot with an observed filter). =#
   (modelName::String, modelCode::Expr) = IMTKGen.generateIMTKCode(simCode)
   local codeHash = hash(modelCode)
   @info "[IMTK GEN] generated target code" model=modelName codeHash=codeHash
-  local structural = SimCode.hasStructuralTransitions(simCode) || SimCode.hasSubModels(simCode)
-  COMPILED_MODELS_MTK[modelName] = (modelCode, structural, codeHash)
   local cname = canonicalName(modelName)
+  local structural::Bool = SimCode.hasStructuralTransitions(simCode) || SimCode.hasSubModels(simCode)
+  COMPILED_MODELS_MTK[modelName] = (modelCode, structural || !haskey(IMTKGen.BUILT, cname), codeHash)
   Cache.store!(cname, Cache.sizeOf((modelCode, get(IMTKGen.BUILT, cname, nothing), get(IMTKGen.PRISTINE_P, cname, nothing))))
   return (modelName, modelCode)
 end
