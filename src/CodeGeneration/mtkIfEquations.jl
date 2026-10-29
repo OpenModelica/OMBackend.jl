@@ -566,7 +566,7 @@ function createIfEquation(stateVariables::Vector,
     (_t0ValMap, _t0Explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
   end
   #= Branches that define different variables (a switch with an arc:
-     i = Goff*v while quenched, v = Ron*i when closed) take the residual form,
+     i = Goff*v once the arc is out, v = Ron*i when closed) take the residual form,
      the whole if-equation (pairing by variable and by position must not
      mix); the causal one put each branch's right-hand side on the first
      branch's variable (i = Ron*i). =#

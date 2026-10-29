@@ -750,8 +750,8 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
      before. =#
   local r = isempty(e.relationWhens) && isempty(e.discreteWhens) && isempty(e.clusters) ? e.ifRelations : nothing
   #= The algebraic unknowns at the event in the modes from before it. Where they have no solution, the modes the
-     relations switch to can have one (an arc's current caught past its quench window, MSL OpenerWithArc: `v =
-     V*sign(i)` has none there, the quenched `i = Goff*v` has; where the steps land relative to the window moved with
+     relations switch to can have one (an arc's current caught past its arc-out window, MSL OpenerWithArc: `v =
+     V*sign(i)` has none there, the arc-off `i = Goff*v` has; where the steps land relative to the window moved with
      OrdinaryDiffEqCore 4.19): the return code is put back (`_staleResolve!`) and the sweep reads the relations at
      the located crossing (the state there: a failed solve leaves its last iterate). The event fails if none changes,
      or if the solve in the new modes fails too. =#

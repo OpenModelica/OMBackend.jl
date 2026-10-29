@@ -21,7 +21,7 @@ import OMBackend
 end
 
 #= Derivative unknowns are left out of the error control: a state's derivative kept as an unknown (`$DER_x`) as well
-   as the dummy derivatives (MSL IMC_YDarc: their noise after an arc quenched stalled the solve). The state and the
+   as the dummy derivatives (MSL IMC_YDarc: their noise after an arc went out stalled the solve). The state and the
    other algebraic unknowns keep the solve's abstol. =#
 @testset "Derivative unknowns out of the error control" begin
   local SB = OMBackend.ModelingToolkit.SciMLBase

@@ -1,4 +1,4 @@
-package ArcSwitchYD "MSL 4.1.0's SwitchYDwithArc (Machines.Utilities) on three RL windings, its components' equations copied: the Y openers open at 25 ms (arcs), the D closers close 20 ms later"
+package ArcSwitchYD "MSL 4.1.0's SwitchYDwithArc (Machines.Utilities) on three RL windings, its components' equations copied (MSL's `quenched` is `arcOff` here): the Y openers open at 25 ms (arcs), the D closers close 20 ms later"
   model LogicalDelay "Modelica.Blocks.Logical.LogicalDelay"
     parameter Real delayTime = 0;
     input Boolean u;
@@ -29,16 +29,16 @@ package ArcSwitchYD "MSL 4.1.0's SwitchYDwithArc (Machines.Utilities) on three R
     Boolean on = not off;
   protected
     discrete Real tSwitch(start = -1e60);
-    Boolean quenched(start = true, fixed = true);
+    Boolean arcOff(start = true, fixed = true) "the arc has gone out (MSL: quenched)";
   equation
     when edge(off) then
       tSwitch = time;
     end when;
-    quenched = off and (abs(i) <= abs(v) * Goff or pre(quenched));
+    arcOff = off and (abs(i) <= abs(v) * Goff or pre(arcOff));
     if on then
       v = Ron * i;
     else
-      if quenched then
+      if arcOff then
         i = Goff * v;
       else
         v = min(Vmax, V0 + dVdt * (time - tSwitch)) * sign(i);
@@ -59,16 +59,16 @@ package ArcSwitchYD "MSL 4.1.0's SwitchYDwithArc (Machines.Utilities) on three R
     Boolean on = not off;
   protected
     discrete Real tSwitch(start = -1e60);
-    Boolean quenched(start = true, fixed = true);
+    Boolean arcOff(start = true, fixed = true) "the arc has gone out (MSL: quenched)";
   equation
     when edge(on) then
       tSwitch = time;
     end when;
-    quenched = off and (abs(i) <= abs(v) * Goff or pre(quenched));
+    arcOff = off and (abs(i) <= abs(v) * Goff or pre(arcOff));
     if on then
       v = Ron * i;
     else
-      if quenched then
+      if arcOff then
         i = Goff * v;
       else
         v = min(Vmax, V0 + dVdt * (time - tSwitch)) * sign(i);

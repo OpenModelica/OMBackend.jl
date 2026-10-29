@@ -149,13 +149,13 @@ end
 end
 
 #= A cluster relation that stayed within the tolerance of its boundary since its last located flip hovers there, its
-   operands held to the integrator's error (MSL IMC_YDarc's quench relations: an event every 0.25 ms): its band is
+   operands held to the integrator's error (MSL IMC_YDarc's arc-out relations: an event every 0.25 ms): its band is
    the tolerance (CodeGeneration._hover!), until a flip after it moved away. A first flip keeps H. Its crossing
    function set by hand, on stand-in integrators: H = 1e-10, the hover level 5e-7. =#
 @testset "Discrete cluster: the band of a relation hovering on its boundary" begin
   local CG = OMBackend.CodeGeneration
   local zc = Ref(0.0)
-  local c = CG.DiscreteCluster(["quenched"], Any[], Any[], 0, 0, [false], [false], nothing, 0, false)
+  local c = CG.DiscreteCluster(["arcOff"], Any[], Any[], 0, 0, [false], [false], nothing, 0, false)
   c.crossings! = (zs, u, p, t) -> (zs[1] = zc[]; zs[2] = 1.0; nothing)
   local at(t::Float64) = (u = Float64[], p = nothing, t = t, opts = (reltol = 1.0e-6,), sol = (prob = (tspan = (0.0, 1.0),),))
   local out = zeros(1)

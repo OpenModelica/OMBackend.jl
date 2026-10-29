@@ -488,7 +488,7 @@ are left out too: they jump at events; controlled, the transformer currents' of
 MSL Rectifier6pulse held the steps at the diodes' switching until MaxIters
 (SMEE_Rectifier and Rectifier12pulse too). So are its other derivative unknowns
 (`\$DER_x`, a state's derivative kept as an unknown), as in OpenModelica:
-after MSL IMC_YDarc's arc quenched, the stator currents' derivatives were
+after MSL IMC_YDarc's arc went out, the stator currents' derivatives were
 fixed only through the open switch's Goff (the algebraic block's condition
 3.6e9), their noise was above the tolerance at any step, and the solve
 stalled in 5e-13 s steps (MaxIters at 2.0027 s; left out, 2.5 s in 28 s).

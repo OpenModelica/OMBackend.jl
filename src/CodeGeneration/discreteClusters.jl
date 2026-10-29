@@ -207,8 +207,8 @@ At a located flip of relation k at a new instant: its band is the tolerance
 (`_HOVER_BAND`) where its crossing function stayed within half of it since
 its last located flip (`peak`), H elsewhere. Such a relation hovers on its
 boundary, its operands held only to the integrator's error, which crosses H
-back and forth: MSL OpenerWithArc's quench relation `abs(i) <= abs(v)*Goff`
-compares the two sides of its quenched equation `i = Goff*v` (v an algebraic
+back and forth: MSL OpenerWithArc's arc-out relation `abs(i) <= abs(v)*Goff`
+compares the two sides of its arc-off equation `i = Goff*v` (v an algebraic
 unknown of the DAE), an event every 0.25 ms (MSL IMC_YDarc: 46 000 to 2 s).
 OpenModelica solves the algebraic operands of its relations from the states.
 Leaving the band, at its edge, the relation is past half of it: H again.
@@ -272,7 +272,7 @@ exactly: the algebraic solve leaves a commutating thyristor's current at
 callback located it at this instant: a locked brake's `w < 0` was located at
 the band's edge, the new mode's solve put w at exactly 0, and the literal
 flipped it back, every 2e-12 s (MSL Rotational HeatLosses: MaxIters). Nor
-the rounding rule there: an open switch's quench relation
+the rounding rule there: an open switch's arc-out relation
 `abs(i) <= abs(v)*Goff` (MSL OpenerWithArc, CloserWithArc) compares the
 two sides of its equation `i = Goff*v`, which the integrator holds only to
 its error (v an algebraic unknown); located at the band's edge it flipped
