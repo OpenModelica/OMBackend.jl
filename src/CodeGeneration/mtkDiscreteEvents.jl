@@ -1274,12 +1274,39 @@ function _clusterCoupled(members::Vector{String}, reads::OrderedSet{String}, g::
 end
 
 """
+    _absProbes(rels, simCode) -> Vector{SC.RELATION}
+
+A relation `a >= 0` for each relation of `rels` that bounds an `abs(a)` of a continuous `a`
+from above (`abs(a) <= b`, `abs(a) < b`, `b >= abs(a)`, `b > abs(a)`): a probe the cluster
+buffers and its body does not read. Such a relation with a small b holds only in a narrow
+window around a = 0 (MSL CloserWithArc's arc-out `abs(i) <= abs(v)*Goff`: about 4e-5 A,
+nanoseconds of a 50 Hz current), which a step can cross with the crossing function positive at
+both ends: the arc burned on. The zero of `a` is a simple crossing the integrator locates, and
+the event there evaluates the relation inside its window (whether a step landed in it depended
+on the platform's rounding: the CI's macOS runner missed phase 3's arc-out at 25.10 ms). Only
+the bounded side: probing `abs(v)` too made events where the arc's voltage passed zero, and an
+event's solve there failed.
+"""
+function _absProbes(rels::Vector{SC.RELATION}, simCode::SC.SIM_CODE)::Vector{SC.RELATION}
+  local probes::Vector{SC.RELATION} = SC.RELATION[]
+  for r in rels
+    local bounded::SC.Exp = r.op in (SC.OP_LESS, SC.OP_LESSEQ) ? r.exp1 :
+                            r.op in (SC.OP_GREATER, SC.OP_GREATEREQ) ? r.exp2 : SC.BCONST(false)
+    SC.isBuiltin(bounded, :abs) || continue
+    local p::SC.RELATION = SC.RELATION(only(bounded.args), SC.OP_GREATEREQ, SC.RCONST(0.0), 0)
+    (_withoutContinuousOperand(p, simCode) || p in rels || p in probes) || push!(probes, p)
+  end
+  return probes
+end
+
+"""
 One DiscreteCluster (discreteClusters.jl) for a when on the relations `rels` that assigns
 `assigns`. Every distinct relation gets a buffer; `==` and `<>` (a crossing function that
 jumps between -0.5 and 0.5) and relations without a continuous-time operand have no
 hysteresis. A when lifted from discrete equations holds at every pass of an event (its
 equations do); another fires when its condition does. Later members read an earlier one's
-new value (the body is in topological order).
+new value (the body is in topological order). The probes of its `abs()` arguments
+(`_absProbes`) come after its relations.
 """
 function _discreteClusterSpec(cond::SC.Exp, rels::Vector{SC.RELATION}, assigns::Vector{Tuple{Symbol, SC.Exp, Bool}},
                               simCode::SC.SIM_CODE, table::Bool, graph::_EquationGraph)::Expr
@@ -1309,17 +1336,19 @@ function _discreteClusterSpec(cond::SC.Exp, rels::Vector{SC.RELATION}, assigns::
                    $(stmts...)
                    ($([Symbol("_v_", d) for (d, _, _) in assigns]...),)
                  end)
+  #= the probes (`_absProbes`) after the relations the body reads (`_rel[k]`) =#
+  local relations::Vector{SC.RELATION} = vcat(buffered, _absProbes(buffered, simCode))
   local reads = Any[operands..., Symbol.(preNames)...]
-  for r in buffered
+  for r in relations
     push!(reads, transformToMTKContinuousCondition(r, simCode), _conditionScaleExpr(r, simCode))
   end
-  local strict = Bool[r.op in (SC.OP_LESS, SC.OP_GREATER) for r in buffered]
-  local exact = Bool[_relationZeroSet(r) === nothing || _withoutContinuousOperand(r, simCode) for r in buffered]
-  local eventOnly = Bool[_withoutContinuousOperand(r, simCode) && !_expMentionsTime(r) for r in buffered]
+  local strict = Bool[r.op in (SC.OP_LESS, SC.OP_GREATER) for r in relations]
+  local exact = Bool[_relationZeroSet(r) === nothing || _withoutContinuousOperand(r, simCode) for r in relations]
+  local eventOnly = Bool[_withoutContinuousOperand(r, simCode) && !_expMentionsTime(r) for r in relations]
   local atStart = !_condHasInitial(cond) ? 0 : (table ? 2 : 1)
   local memberNames = String[string(d) for (d, _, _) in assigns]
   local readNames = OrderedSet{String}(string(o) for o in operands)
-  foreach(r -> SC.identifierNames!(readNames, r), buffered)
+  foreach(r -> SC.identifierNames!(readNames, r), relations)
   local coupled = _clusterCoupled(memberNames, readNames, graph)
   return :(OMBackend.CodeGeneration.DiscreteCluster($(memberNames),
                                                    Any[$([d for (d, _, _) in assigns]...)],

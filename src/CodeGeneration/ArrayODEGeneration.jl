@@ -717,6 +717,8 @@ function jl(g::Gen, x::IR)
     x.op == :initial && return :(p.initPhase[1])
     x.op == :String && return Expr(:call, _modelicaString, args...)
     x.op == :fcall && return Expr(:call, args...)
+    #= a relation with the probe of its abs() argument (`_withAbsProbe`): the probe's crossing kept, its value not =#
+    x.op == :probed && return Expr(:block, args[2], args[1])
     #= a temporary's value (a tuple equation's call) =#
     x.op == :setlocal && return Expr(:(=), args...)
     x.op == :assertcall && return :(($(args[1])) || _assertFailed(p, $(args[3]), ($(args[3]), _col), t, $(args[2])))

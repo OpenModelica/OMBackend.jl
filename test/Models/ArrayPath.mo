@@ -2029,6 +2029,19 @@ package ArrayPath
     end if;
     n := n + 1024;
   end WideIntegerIntermediate;
+  model AbsWindow "a relation on abs() true only in a window of nanoseconds around each zero of x: 5 in 50 ms (MLS 8.5; omc misses them)"
+    Real x(start = 1, fixed = true);
+    Real y(start = 0, fixed = true);
+    Boolean small;
+    Integer n(start = 0, fixed = true);
+  equation
+    der(x) = y;
+    der(y) = -(2 * 3.141592653589793 * 50) ^ 2 * x;
+    small = abs(x) <= 1.0e-7;
+    when small then
+      n = pre(n) + 1;
+    end when;
+  end AbsWindow;
   model InactiveElseif "an elseif condition evaluated only where the earlier ones are false (sqrt of a negative d): d, n = -10, 9 at 0.95 (omc)"
     Real x(start = 0, fixed = true);
     discrete Real d(start = -1, fixed = true);

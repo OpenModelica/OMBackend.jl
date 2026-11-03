@@ -262,7 +262,7 @@ function toIR(g::Gen, e::SC.Exp, ctx::Ctx)::IR
     (ctx.noEvent || !(_continuous(g, l) || _continuous(g, r))) && return Op(op, IR[l, r])
     op in (:(==), :!=) && ns("equality relation on continuous variables")
     ctx.nrel[] += 1
-    return Rel(op, l, r, ctx.nrel[])
+    return _withAbsProbe(g, Rel(op, l, r, ctx.nrel[]), op in (:<, :<=) ? l : r, ctx)
   elseif e isa SC.IFEXP
     return Op(:if, IR[toIR(g, e.cond, ctx), toIR(g, e.thenExp, ctx), toIR(g, e.elseExp, ctx)])
   elseif e isa SC.TSUB
@@ -889,11 +889,24 @@ function _whenTupleAssignments(g::Gen, lhs::SC.TUPLE, call::IR, callType::SC.STy
   return out
 end
 
+"""
+The relation `rel` with a probe of its bounded side's `abs()` argument when that side (`bounded`, the side that is to
+be the smaller) is `abs(a)` of a continuous `a`: `Op(:probed, [rel, a >= 0])`, the probe's crossing an event where `a`
+passes zero, where `rel` is evaluated inside the narrow window in which it holds (`abs(x) <= 1e-7` of a 50 Hz signal:
+nanoseconds, which a step crossed with the crossing function positive at both ends). As the MTK path's clusters
+(`_absProbes`).
+"""
+function _withAbsProbe(g::Gen, rel::Rel, bounded::IR, ctx::Ctx)::IR
+  (bounded isa Op && bounded.op === :abs && length(bounded.args) == 1 && _continuous(g, only(bounded.args))) || return rel
+  ctx.nrel[] += 1
+  return Op(:probed, IR[rel, Rel(:>=, only(bounded.args), Lit(0.0), ctx.nrel[])])
+end
+
 "Whether `x` is Boolean-valued in the code: a relation, a logical operation, a Boolean variable or its pre value."
 function _isBooleanIR(g::Gen, x::IR)::Bool
   x isa Rel && return true
   x isa Lit && return x.v isa Bool
-  x isa Op && return x.op in (:!, :&&, :||, :initial)
+  x isa Op && return x.op in (:!, :&&, :||, :initial, :probed)
   x isa Ref && return g.vars[x.name].vtype == :bool
   x isa Pre && return _isBooleanIR(g, x.ref)
   return false

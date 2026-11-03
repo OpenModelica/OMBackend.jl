@@ -140,19 +140,21 @@ _crossingValues!(c::DiscreteCluster, integrator) = _crossingValues!(c, integrato
 _literal(zs, k::Int, strict::Bool) = strict ? zs[2k - 1] < 0 : zs[2k - 1] <= 0
 
 """
-Relation k's value at the initialization: literal (MLS 8.5), and on its boundary to rounding (`_onBoundary`) the exact
-tie's (a non-strict relation holds, a strict one does not). An open switch's arc-out relation `abs(i) <= abs(v)*Goff`
-(MSL CloserWithArc) compares the two sides of its own equation `i = Goff*v`: the initialization's solve leaves it at
-+-1e-13, and the platform's rounding decided its value (true on a Mac, false on the CI's runners: the arcs went out at
-other times, or the Y-D switch's closers chattered at 45 ms).
+Relation k literal (MLS 8.5), and on its boundary to rounding (`_onBoundary`) the exact tie's value (a non-strict
+relation holds, a strict one does not), whichever side the rounding put it on: at the initialization, and for an exact
+relation (a time relation) at every pass. An open switch's arc-out relation `abs(i) <= abs(v)*Goff` (MSL CloserWithArc)
+compares the two sides of its own equation `i = Goff*v`, which the initialization's solve leaves at +-1e-13; a delay's
+`time >= tSwitch + delayTime` at its own time event reads t = 0.045 against 0.025 + 0.02 = 0.045000000000000005. The
+platform's rounding decided both (true on a Mac, false on the CI's runners: the arcs went out at other times, and the
+time relation, made true by the boundary rule and false by its literal in the next sweep, chattered).
 """
-_initialLiteral(zs, k::Int, strict::Bool)::Bool = _onBoundary(zs[2k - 1], zs[2k]) ? !strict : _literal(zs, k, strict)
+_tieLiteral(zs, k::Int, strict::Bool)::Bool = _onBoundary(zs[2k - 1], zs[2k]) ? !strict : _literal(zs, k, strict)
 
 """
-Relation k by the hysteresis rule from `old`; an exact one literal.
+Relation k by the hysteresis rule from `old`; an exact one literal, a tie to rounding as the tie (`_tieLiteral`).
 """
 function _ruled(c::DiscreteCluster, zs, k::Int, H, old::Bool)
-  c.exact[k] && return _literal(zs, k, c.strict[k])
+  c.exact[k] && return _tieLiteral(zs, k, c.strict[k])
   return _hysteresisRule(zs[2k - 1], H * c.band[k] * zs[2k], old)
 end
 
@@ -311,12 +313,12 @@ end
 
 """
 Every relation literal on the state (MLS 8.5, as at initialization; a tie to rounding as the exact tie,
-`_initialLiteral`).
+`_tieLiteral`).
 """
 function _literalBuffers!(c::DiscreteCluster, integrator)
   local zs = _crossingValues!(c, integrator)
   for k in eachindex(c.rel)
-    c.rel[k] = _initialLiteral(zs, k, c.strict[k])
+    c.rel[k] = _tieLiteral(zs, k, c.strict[k])
   end
   fill!(c.crossed, false)
   fill!(c.locatedAt, NaN)

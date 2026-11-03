@@ -117,9 +117,24 @@ end
 @testset "Initial relations on their boundary" begin
   local CG = OMBackend.CodeGeneration
   for zc in (3.4e-13, -1.9e-13, 0.0)
-    @test CG._initialLiteral([zc, 1.00071], 1, false)
-    @test !CG._initialLiteral([zc, 1.00071], 1, true)
+    @test CG._tieLiteral([zc, 1.00071], 1, false)
+    @test !CG._tieLiteral([zc, 1.00071], 1, true)
   end
   #= off the boundary: literal =#
-  @test !CG._initialLiteral([1.0e-9, 1.0], 1, false) && CG._initialLiteral([-1.0e-9, 1.0], 1, true)
+  @test !CG._tieLiteral([1.0e-9, 1.0], 1, false) && CG._tieLiteral([-1.0e-9, 1.0], 1, true)
 end
+
+#= An exact relation (a time relation) on its boundary to rounding holds when non-strict, in every pass: a delay's
+   `time >= tSwitch + delayTime` at its own event read t = 0.045 against 0.025 + 0.02 = 0.045000000000000005; made true
+   by the boundary rule and false by its literal in the next sweep, it chattered (ArcSwitchYD on the CI's Linux runner). =#
+@testset "An exact relation on its boundary to rounding" begin
+  local CG = OMBackend.CodeGeneration
+  local c = CG.DiscreteCluster(["y"], Any[], Any[], 0, 0, [false], [true], nothing, 0, false)
+  c.crossings! = (out, u, p, t) -> (out[1] = 3.4694500000000004e-18; out[2] = 1.045; nothing)
+  local at(t) = (u = Float64[], p = nothing, t = t, opts = (reltol = 1.0e-6,), sol = (prob = (tspan = (0.0, 1.0),),))
+  CG._update!(c, at(0.045))
+  @test c.rel[1]
+  @test !CG._update!(c, at(0.045)) && c.rel[1]
+  @test !CG._update!(c, at(0.045)) && c.rel[1]
+end
+

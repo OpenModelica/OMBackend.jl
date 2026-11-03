@@ -671,6 +671,9 @@ end
       #= a 64-bit Integer intermediate: the relation's difference of two native Integers must not wrap around (a false guard
          turned true before the event); the value is exact in Float64 =#
       scalarized || @test (local wi = run("WideIntegerIntermediate", scalarized); wi.retcode == ReturnCode.Terminated && abs(wi.t[end] - 0.5) < 1e-5)
+      #= a relation `abs(x) <= b` with a small b holds only in a narrow window around x = 0, which a step crosses with its
+         crossing function positive at both ends: the zero of x is watched too (`_absProbes`, `_withAbsProbe`) =#
+      @test at(run("AbsWindow", scalarized; stop = 0.05), "n", [0.004, 0.006, 0.016, 0.05]) == [0.0, 1.0, 2.0, 5.0]
       local ri = run("RoundedIntermediate", scalarized)
       @test ri.retcode == ReturnCode.Terminated && abs(ri.t[end] - 0.5) < 1e-5 && OMBackend.getVariableValues(ri, "n")[end] == 2.0
       scalarized || @test OMBackend.getVariableValues(run("IfNoEventCondition", scalarized), "hits")[end] == 1.0

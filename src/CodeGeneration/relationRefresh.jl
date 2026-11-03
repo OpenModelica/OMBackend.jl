@@ -401,7 +401,7 @@ function _whenValues(a::RelationWhenAffect, u, t, integrator)
   return Base.invokelatest(a.eval, t, (f(u, p, t) for f in fns)...)
 end
 
-"The when's relation at the start: literal, a tie to rounding as the exact tie (as `_initialLiteral`)."
+"The when's relation at the start: literal, a tie to rounding as the exact tie (as `_tieLiteral`)."
 function _whenLiteral(a::RelationWhenAffect, u, t, integrator)
   local (zc, scale) = _whenValues(a, u, t, integrator)
   _onBoundary(zc, scale) && return !a.strict
