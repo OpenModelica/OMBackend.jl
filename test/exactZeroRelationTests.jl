@@ -31,7 +31,7 @@ end
   local at(t) = (u = Float64[], p = nothing, t = t, opts = (reltol = 1.0e-6,), sol = (prob = (tspan = (0.0, 1.0),),))
   #= located at the band's edge: flipped, as the callback says =#
   zc[] = -1.04e-10
-  c.crossed[1] = true
+  c.crossed[1] = -1
   CG._update!(c, at(0.5))
   @test c.rel[1]
   #= the new mode's solve puts the crossing function at exactly 0, at the same instant: kept =#
@@ -56,7 +56,7 @@ end
   c.rel[1] = true
   #= located at the band's edge: flipped false =#
   zc[] = 1.04e-10
-  c.crossed[1] = true
+  c.crossed[1] = 1
   CG._update!(c, at(0.5))
   @test !c.rel[1]
   #= back on its boundary to rounding at the same instant: kept =#
@@ -138,3 +138,23 @@ end
   @test !CG._update!(c, at(0.045)) && c.rel[1]
 end
 
+
+#= A located crossing puts a cluster relation on the side it crossed to, it does not flip it: ArcSwitchYD's delay
+   `time >= tSwitch + delayTime` (0.045000000000000005), made true at t = 0.045 by the boundary rule, was located
+   crossing one ulp later and flipped false again; the closers opened and the event's solve failed (the CI's Linux
+   runner). Its crossing function set by hand, on stand-in integrators. =#
+@testset "A located crossing to the relation's own side" begin
+  local CG::Module = OMBackend.CodeGeneration
+  local zc::Base.RefValue{Float64} = Ref(3.4694500000000004e-18)
+  local c::OMBackend.CodeGeneration.DiscreteCluster = CG.DiscreteCluster(["y"], Any[], Any[], 0, 0, [false], [true], nothing, 0, false)
+  c.crossings! = (out, u, p, t) -> (out[1] = zc[]; out[2] = 1.045; nothing)
+  local at(t::Float64) = (u = Float64[], p = nothing, t = t, opts = (reltol = 1.0e-6,), sol = (prob = (tspan = (0.0, 1.0),),))
+  @test CG._update!(c, at(0.045)) && c.rel[1]
+  zc[] = -3.4694500000000004e-18
+  c.crossed[1] = -1
+  @test !CG._update!(c, at(0.045000000000000005)) && c.rel[1] && c.crossed == [0]
+  #= crossed back: false =#
+  zc[] = 1.0e-3
+  c.crossed[1] = 1
+  @test CG._update!(c, at(0.05)) && !c.rel[1]
+end

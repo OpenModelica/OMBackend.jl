@@ -144,8 +144,28 @@ end
   local integrator = (u = Float64[], p = nothing, t = 0.0, opts = (reltol = 1.0e-6,),
                       sol = (prob = (tspan = (0.0, 1.0),),))
   @test !CG._update!(c, integrator) && c.rel == [false]
-  c.crossed[1] = true
-  @test CG._update!(c, integrator) && c.rel == [true] && c.crossed == [false]
+  c.crossed[1] = -1
+  @test CG._update!(c, integrator) && c.rel == [true] && c.crossed == [0]
+end
+
+#= A cluster's members hold between its instants what its body left (CodeGeneration._hold!, _putBack!): at a crossing
+   inside a step the interpolation moved PersonalityAspects' day counter from 1.0 to 0.9999999999998931, and
+   `floor(time/24) <> pre(k)` kept it at 1 past t = 48 (OM.jl's suite). On a stand-in integrator, the member in u[2]. =#
+@testset "Discrete cluster: members held between instants" begin
+  local CG::Module = OMBackend.CodeGeneration
+  local c::OMBackend.CodeGeneration.DiscreteCluster = CG.DiscreteCluster(["k"], Any[:k], Any[], 0, 0, Bool[], Bool[], nothing, 0, false)
+  c.memberIndex = [2]
+  local integrator = (u = [0.5, 1.0], t = 32.0)
+  local pre::Vector{Float64} = copy(integrator.u)
+  #= nothing held yet (the first instant of a solve): left alone =#
+  integrator.u[2] = 0.9999999999998931
+  CG._putBack!(c, integrator, pre)
+  @test integrator.u[2] == 0.9999999999998931
+  integrator.u[2] = 1.0
+  CG._hold!(c, integrator)
+  integrator.u[2] = pre[2] = 0.9999999999998931
+  CG._putBack!(c, integrator, pre)
+  @test integrator.u[2] == 1.0 && pre[2] == 1.0 && integrator.u[1] == 0.5
 end
 
 #= A cluster relation that stayed within the tolerance of its boundary since its last located flip hovers there, its
@@ -164,7 +184,7 @@ end
       zc[] = z
       CG._crossings!(out, c, Float64[], t, at(t))
     end
-    c.crossed[1] = true
+    c.crossed[1] = last(zcs) < 0 ? -1 : 1
     CG._update!(c, at(t))
     return (c.rel[1], c.band[1])
   end

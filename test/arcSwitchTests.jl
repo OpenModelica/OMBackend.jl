@@ -8,7 +8,10 @@
    that window (OrdinaryDiffEqCore 4.19), the re-solve at the event in the arc's mode had no solution and ended the
    solve; stepped over, phase 3's arc burned on reversed and its winding carried -74 A at 28 ms. The reference values
    are the circuit's equations written out per mode (each arc going out a smooth crossing; Rodas5P and FBDF at reltol
-   1e-8 and 1e-10 agree to the digits below); omc 1.27.1 agrees on 25.1028 ms and fails its NLS at 28.594 ms. =#
+   1e-8 and 1e-10 agree to the digits below); omc 1.27.1 agrees on 25.1028 ms and fails its NLS at 28.594 ms.
+   At MSL IMC_YDarc's tolerance, 1e-6: at SciML's default 1e-3 a step crossed phase 2's zero of current (the arc's
+   `sign(i)` has no event, MLS 3.7.1), its interpolation 0.4 A off, and the arcs went out 12 us late, by the step
+   sequence (abstol 1.01e-6, reltol 0.95e-3; the CI's Linux runner). =#
 using Test
 import OMBackend
 import OMFrontend
@@ -18,7 +21,7 @@ import OMFrontend
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("ArcSwitchYD.Switching",
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("ArcSwitchYD.Switching"); tspan = (0.0, 0.06))
+  local sol = OMBackend.simulateModel(OMBackend.canonicalName("ArcSwitchYD.Switching"); tspan = (0.0, 0.06), reltol = 1.0e-6)
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
   #= a variable's value at t, interpolated (the saved points are sparse) =#
   local value(name::String, t::Float64)::Float64 = sol(t; idxs = OMBackend.canonicalSymbol(name))
@@ -34,6 +37,6 @@ import OMFrontend
   @test isapprox([arcOffAt(sol, k) for k in 1:3], [0.028594113, 0.028594051, 0.025102795]; atol = 1.0e-6)
   #= a second solve of the cached build takes the same path: the event iteration's memory of degenerate step restarts
      (`stall`) was kept from the first, and the arcs of phases 1 and 2 went out at 29.288 ms =#
-  local again = OMBackend.simulateModel(OMBackend.canonicalName("ArcSwitchYD.Switching"); tspan = (0.0, 0.06))
+  local again = OMBackend.simulateModel(OMBackend.canonicalName("ArcSwitchYD.Switching"); tspan = (0.0, 0.06), reltol = 1.0e-6)
   @test [arcOffAt(again, k) for k in 1:3] == [arcOffAt(sol, k) for k in 1:3]
 end

@@ -787,10 +787,14 @@ _terminated(integrator) = integrator.sol.retcode == ModelingToolkit.SciMLBase.Re
 
 function _iterate!(e::EventIteration, integrator, resolve::Bool = false)
   #= The left limit, before the algebraic unknowns follow another callback's
-     change; whether the callbacks before the iteration changed the state. =#
+     change, with the clusters' members at their held values (`_putBack!`);
+     whether the callbacks before the iteration changed the state. =#
   try
-    _iterateInstant!(e, integrator, resolve, !isequal(instantPre(integrator), integrator.u))
+    local pre = instantPre(integrator)
+    foreach(c -> _putBack!(c, integrator, pre), e.clusters)
+    _iterateInstant!(e, integrator, resolve, !isequal(pre, integrator.u))
   finally
+    foreach(c -> _hold!(c, integrator), e.clusters)
     _endInstant!(integrator)
   end
   return nothing
@@ -837,7 +841,7 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
       _restoreRetcode!(integrator, ModelingToolkit.SciMLBase.ReturnCode.InitialFailure)
       @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
       #= The located crossings belong to this event. =#
-      foreach(c -> fill!(c.crossed, false), e.clusters)
+      foreach(c -> fill!(c.crossed, 0), e.clusters)
       return nothing
     end
     if !changed

@@ -101,18 +101,19 @@ mutable struct DiscreteCluster
   zs::Vector{Float64}        # the output of crossings!
   memberIndex::Vector{Int}   # each member's position in u; 0 when it is not an unknown
   rel::Vector{Bool}          # the relation buffers
-  crossed::Vector{Bool}      # the relations whose crossing the callback located, until the next update
+  crossed::Vector{Int8}      # per relation the side its located crossing went to, until the next update (`_update!`)
   locatedAt::Vector{Float64} # per relation the time of its last located flip (`_update!`)
   band::Vector{Float64}      # per relation its hysteresis relative to H (`_hover!`)
   peak::Vector{Float64}      # per relation the largest |crossing function| / scale since its last located flip
+  held::Vector{Float64}      # per member its value at the end of the last instant (`_hold!`); NaN before the first
 end
 
 DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled = true,
                 eventOnly = fill(false, length(strict))) =
   DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atStart, table, coupled, eventOnly,
                   nothing, nothing, zeros(2 * length(strict)), Int[], fill(false, length(strict)),
-                  fill(false, length(strict)), fill(NaN, length(strict)), fill(1.0, length(strict)),
-                  fill(Inf, length(strict)))
+                  zeros(Int8, length(strict)), fill(NaN, length(strict)), fill(1.0, length(strict)),
+                  fill(Inf, length(strict)), fill(NaN, length(members)))
 
 #= SciMLBase 3 renamed u_modified! (now deprecated) to derivative_discontinuity!. =#
 const _derivativeDiscontinuity! = isdefined(ModelingToolkit.SciMLBase, :derivative_discontinuity!) ?
@@ -140,21 +141,23 @@ _crossingValues!(c::DiscreteCluster, integrator) = _crossingValues!(c, integrato
 _literal(zs, k::Int, strict::Bool) = strict ? zs[2k - 1] < 0 : zs[2k - 1] <= 0
 
 """
-Relation k literal (MLS 8.5), and on its boundary to rounding (`_onBoundary`) the exact tie's value (a non-strict
-relation holds, a strict one does not), whichever side the rounding put it on: at the initialization, and for an exact
-relation (a time relation) at every pass. An open switch's arc-out relation `abs(i) <= abs(v)*Goff` (MSL CloserWithArc)
-compares the two sides of its own equation `i = Goff*v`, which the initialization's solve leaves at +-1e-13; a delay's
-`time >= tSwitch + delayTime` at its own time event reads t = 0.045 against 0.025 + 0.02 = 0.045000000000000005. The
-platform's rounding decided both (true on a Mac, false on the CI's runners: the arcs went out at other times, and the
-time relation, made true by the boundary rule and false by its literal in the next sweep, chattered).
+Relation k at the initialization: literal (MLS 8.5), and on its boundary to rounding (`_onBoundary`) the exact tie's
+value (a non-strict relation holds, a strict one does not), whichever side the rounding put it on. An open switch's
+arc-out relation `abs(i) <= abs(v)*Goff` (MSL CloserWithArc) compares the two sides of its own equation `i = Goff*v`,
+which the initialization's solve leaves at +-1e-13: the platform's rounding decided it (true on a Mac, false on the CI's
+runners, and the arcs went out at other times).
 """
 _tieLiteral(zs, k::Int, strict::Bool)::Bool = _onBoundary(zs[2k - 1], zs[2k]) ? !strict : _literal(zs, k, strict)
 
 """
-Relation k by the hysteresis rule from `old`; an exact one literal, a tie to rounding as the tie (`_tieLiteral`).
+Relation k by the hysteresis rule from `old`; an exact one literal, a non-strict one on its boundary to rounding true
+in every pass (as `_update!`'s boundary rule makes a false one): a delay's `time >= tSwitch + delayTime` at its own time
+event read t = 0.045 against 0.025 + 0.02 = 0.045000000000000005, the boundary rule made it true and its literal false
+in the next sweep, back and forth (ArcSwitchYD on the CI's Linux runner). A strict one stays literal: `time > 1.2` at
+its time event is true just after it.
 """
 function _ruled(c::DiscreteCluster, zs, k::Int, H, old::Bool)
-  c.exact[k] && return _tieLiteral(zs, k, c.strict[k])
+  c.exact[k] && return (!c.strict[k] && _onBoundary(zs[2k - 1], zs[2k])) || _literal(zs, k, c.strict[k])
   return _hysteresisRule(zs[2k - 1], H * c.band[k] * zs[2k], old)
 end
 
@@ -265,11 +268,16 @@ end
 
 """
 Phase 1 of a sweep: the buffers from the state. Whether one changed. A
-relation whose crossing the callback located changes, as in OpenModelica:
-its shifted crossing function is zero where the rule flips it, and the
-algebraic solve at the event can leave it just inside the hysteresis band
-(an ideal thyristor's firing, found only at the end of the next step). A
-state clearly on the old side flips it back in the next sweep. A false
+relation whose crossing the callback located takes the side the crossing
+went to, as in OpenModelica: its shifted crossing function is zero where the
+rule flips it, and the algebraic solve at the event can leave it just inside
+the hysteresis band (an ideal thyristor's firing, found only at the end of
+the next step). A state clearly on the old side flips it back in the next
+sweep. The side, not a flip: a delay's `time >= tSwitch + delayTime`, made
+true at t = 0.045 by the boundary rule below (tSwitch + delayTime =
+0.045000000000000005), was located crossing one ulp later and flipped false
+again; the closers opened, and the event's solve failed (ArcSwitchYD on the
+CI's Linux runner). A false
 relation `<=` or `>=` whose crossing function is zero at the event, to
 rounding (`_onBoundary`), holds (literally, MLS 8.5): MSL SimpleGearShift's
 brake normal force ramps to exactly 0 at a time event, and `free = fn <= 0`
@@ -297,13 +305,13 @@ function _update!(c::DiscreteCluster, integrator)
   local t = Float64(integrator.t)
   for k in eachindex(c.rel)
     local new = iszero(zs[2k - 1]) && c.locatedAt[k] != t ? _literal(zs, k, c.strict[k]) :
-                c.crossed[k] ? !c.rel[k] : _ruled(c, zs, k, H, c.rel[k])
+                c.crossed[k] != 0 ? c.crossed[k] < 0 : _ruled(c, zs, k, H, c.rel[k])
     (!new && !c.rel[k] && !c.strict[k] && c.locatedAt[k] != t && _onBoundary(zs[2k - 1], zs[2k])) && (new = true)
-    if c.crossed[k] && new != c.rel[k]
+    if c.crossed[k] != 0 && new != c.rel[k]
       c.locatedAt[k] != t && _hover!(c, k, H)
       c.locatedAt[k] = t
     end
-    c.crossed[k] = false
+    c.crossed[k] = 0
     new == c.rel[k] && continue
     c.rel[k] = new
     changed = true
@@ -320,10 +328,37 @@ function _literalBuffers!(c::DiscreteCluster, integrator)
   for k in eachindex(c.rel)
     c.rel[k] = _tieLiteral(zs, k, c.strict[k])
   end
-  fill!(c.crossed, false)
+  fill!(c.crossed, 0)
   fill!(c.locatedAt, NaN)
   fill!(c.band, 1.0)
   fill!(c.peak, Inf)
+  fill!(c.held, NaN)
+  return nothing
+end
+
+"""
+The members' values now as what they hold until the next instant: the cluster's body is their only writer.
+"""
+function _hold!(c::DiscreteCluster, integrator)::Nothing
+  for (i, k) in enumerate(c.memberIndex)
+    k == 0 || (c.held[i] = integrator.u[k])
+  end
+  return nothing
+end
+
+"""
+The members at the values they held since the last instant, in the state and in the instant's pre() (`pre`, the state
+before it): at a crossing inside a step the solver's interpolation moves them by rounding. PersonalityAspects' day
+counter (`mod(time, 24)`, `stepWhen`) was 1.0 after t = 24 and read 0.9999999999998931 at the next event; its
+`time/24 >= pre(k) + 1` then crossed 2.5e-12 s before t = 48, where `floor(time/24) <> pre(k)` held with floor still
+1, and the count stayed 1.
+"""
+function _putBack!(c::DiscreteCluster, integrator, pre)::Nothing
+  for (i, k) in enumerate(c.memberIndex)
+    (k == 0 || isnan(c.held[i])) && continue
+    integrator.u[k] = c.held[i]
+    pre[k] = c.held[i]
+  end
   return nothing
 end
 
@@ -500,10 +535,11 @@ struct ClusterCrossings
   cluster::DiscreteCluster
 end
 
-#= `events`: per relation 0 (no crossing) or the crossing's direction (±1). =#
+#= `events`: per relation 0 (no crossing) or the crossing's direction, -sign of the crossing function before it: -1
+   to negative (the relation true), 1 to positive (false). =#
 function (a::ClusterCrossings)(integrator, events)
   for (k, d) in pairs(events)
-    d == 0 || (a.cluster.crossed[k] = true)
+    d == 0 || (a.cluster.crossed[k] = Int8(d))
   end
   _derivativeDiscontinuity!(integrator, false)
   return nothing
