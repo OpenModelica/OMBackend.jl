@@ -155,7 +155,7 @@ end
 
 function _ifConditionDependsOnTime(condition::SC.Exp)::Bool
   local refs::OrderedSet{String} = OrderedSet{String}()
-  SC.crefNames!(refs, condition)
+  SC.identifierNames!(refs, condition)
   return "time" in refs
 end
 
@@ -175,14 +175,14 @@ per-branch continuous callback.
 """
 function _ifConditionIsPureTimeEvent(condition::SC.Exp, simCode::SC.SIM_CODE)::Bool
   local refs::OrderedSet{String} = OrderedSet{String}()
-  SC.crefNames!(refs, condition)
+  SC.identifierNames!(refs, condition)
   ("time" in refs) || return false
   local ht = simCode.stringToSimVarHT
   for name in refs
     name == "time" && continue
     local entry = get(ht, name, nothing)
     entry === nothing && return false
-    (entry[2].varKind isa SC.PARAMETER) || return false
+    SC.isScalarParameter(entry[2]) || return false
   end
   return true
 end
@@ -231,7 +231,7 @@ One for each conditional variable created.
 function _conditionReferencesRelayTarget(condition::SC.Exp, rT0::AbstractDict{Symbol, Float64})::Bool
   isempty(rT0) && return false
   local refs::OrderedSet{String} = OrderedSet{String}()
-  SC.crefNames!(refs, condition)
+  SC.identifierNames!(refs, condition)
   for name in refs
     haskey(rT0, Symbol(name)) && return true
   end
@@ -566,7 +566,7 @@ function createIfEquation(stateVariables::Vector,
     (_t0ValMap, _t0Explicit) = MTK_CodeGenerationUtil._buildT0ValueMapAndExplicit(simCode)
   end
   #= Branches that define different variables (a switch with an arc:
-     i = Goff*v while quenched, v = Ron*i when closed) take the residual form,
+     i = Goff*v once the arc is out, v = Ron*i when closed) take the residual form,
      the whole if-equation (pairing by variable and by position must not
      mix); the causal one put each branch's right-hand side on the first
      branch's variable (i = Ron*i). =#

@@ -459,6 +459,22 @@ function clockedSubPartitions(scans::Vector{EquationScan}, representative::Vecto
   return clocked
 end
 
+"Whether a partition has clocks: clock variables, or equations its scans find clocked or holding a clocked value."
+hasClocks(clockVars::Set{Symbol}, scans::Vector{EquationScan})::Bool =
+  !isempty(clockVars) || any(s::EquationScan -> isClocked(s) || !isempty(s.held), scans)
+
+"""
+    hasClocks(model) -> Bool
+
+Whether the model's continuous partition has clocks or clocked equations (MLS 16), as `partitionClocks!` finds them
+before it partitions: what the arrays-kept route asks before the passes lower the clocked partitions.
+"""
+function hasClocks(model::IR.Model)::Bool
+  local clockVars::Set{Symbol} = Set{Symbol}(v.name for v in model.variables if v.ty isa IR.T_CLOCK)
+  local unknowns::Set{Symbol} = Set{Symbol}(v.name for v in model.variables if isPartitionVariable(v))
+  return hasClocks(clockVars, EquationScan[scanEquation(eq, unknowns, clockVars) for eq in model.continuous[1].equations])
+end
+
 """
     clockedVariables(variables, equations)
 
@@ -470,7 +486,7 @@ function clockedVariables(variables::IR.VariableSet, equations::Vector{IR.Equati
   local clockVars = Set{Symbol}(v.name for v in variables if v.ty isa IR.T_CLOCK)
   local unknowns = Set{Symbol}(v.name for v in variables if isPartitionVariable(v))
   local scans = EquationScan[scanEquation(eq, unknowns, clockVars) for eq in equations]
-  (isempty(clockVars) && !any(s -> isClocked(s) || !isempty(s.held), scans)) && return Set{Symbol}()
+  hasClocks(clockVars, scans) || return Set{Symbol}()
   local (sub, _, representative) = subPartitions(scans, falses(length(equations)), unknowns, variables)
   local clocked = clockedSubPartitions(scans, representative, sub)
   return Set{Symbol}(v for v in unknowns if find!(sub, v) in clocked)
@@ -490,7 +506,7 @@ function partitionClocks!(model::IR.Model)::IR.Model
   local unknowns = Set{Symbol}(v.name for v in variables if isPartitionVariable(v))
   local equations = system.equations
   local scans = EquationScan[scanEquation(eq, unknowns, clockVars) for eq in equations]
-  (isempty(clockVars) && !any(s -> isClocked(s) || !isempty(s.held), scans)) && return model
+  hasClocks(clockVars, scans) || return model
   isempty(model.modes) || unsupported("clocks in a model with structural modes", model.name)
   local parameters = Dict{Symbol, IR.Variable}(v.name => v for v in variables if IR.isKnown(v) || v.kind isa IR.EXTERNAL_OBJECT)
   local ctx = ClockContext(UnionFind(), Dict{Symbol, IR.Expression}(), Dict{Symbol, ResolvedClock}(), Set{Symbol}(),

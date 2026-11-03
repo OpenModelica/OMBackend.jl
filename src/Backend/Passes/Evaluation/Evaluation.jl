@@ -50,6 +50,15 @@ import ..expressionLargerThan
 import ...isTunableParameter
 const IR = OMJLIR
 
+"A step from a value to a part of it: a record's field by its name, an array's element by its indices."
+const Step = Union{Symbol, Vector{Int}}
+
+"The steps from a value to one of its scalars (`[:T, [1, 2]]` of `R.T[1,2]` in `R`; none for a scalar itself)."
+const Path = Vector{Step}
+
+"A flat value (Interpret.jl): its scalars by their paths (`[]` a scalar, `[[i, j]]` an array's element, `[:f]` a record's field)."
+const FlatValue = Dict{Path, Float64}
+
 include("Algebra.jl")
 include("Elements.jl")
 include("Inline.jl")

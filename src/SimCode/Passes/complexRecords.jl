@@ -92,7 +92,11 @@ isComplexOperation(e::CALL)::Bool =
   isComplexFunction(e.name) || (isOperatorRecordFunction(e.name) && isComplexRecordType(e.ty))
 
 "The variables of the real and imaginary parts of the Complex variable `base`."
-partVariables(base::String)::Tuple{Exp, Exp} = (EXP_CREF(SimCref(base * "_re"), TYPE_REAL()), EXP_CREF(SimCref(base * "_im"), TYPE_REAL()))
+partVariables(record::IR.ComponentRef)::Tuple{Exp, Exp} =
+  (partVariable(fieldCref(record, "re")), partVariable(fieldCref(record, "im")))
+
+"The variable of a Complex part (its reference `part`), its key derived from it."
+partVariable(part::IR.ComponentRef)::Exp = EXP_CREF(SimCref(Symbol(refKey(part)), Int[], part), TYPE_REAL())
 mul(a::Exp, b::Exp)::Exp = BINARY(a, OP_MUL, b)
 add(a::Exp, b::Exp)::Exp = BINARY(a, OP_ADD, b)
 sub(a::Exp, b::Exp)::Exp = BINARY(a, OP_SUB, b)
@@ -120,7 +124,7 @@ with the operands given whole or by part (the frontend splits a Complex input in
 function complexParts(e::Exp)::Union{Nothing, Tuple{Exp, Exp}}
   if e isa EXP_CREF
     e.ty isa TYPE_COMPLEX || return nothing
-    return partVariables(crefName(e.cref))
+    return partVariables(irRef(e.cref))
   end
   (e isa CALL && isComplexOperation(e)) || return nothing
   local (op, args, n) = (operatorName(e.name), e.args, length(e.args))

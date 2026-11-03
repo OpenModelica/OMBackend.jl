@@ -59,7 +59,7 @@ end
 
 The kind of each structure variable of the element view whose kind the plan changes (`plannedKind`), the selected
 states linked to their derivatives as `linkStateDerivative!` links them: a state's derivative `\$STATEDER.x`
-(STATE_DER), the derivative variable it read algebraic unless it is a state itself.
+(STATE_DER), the derivative variable it read an algebraic unknown (ALGEBRAIC_DER) unless it is a state itself.
 """
 function plannedKinds(s::Structure, dummies::Set{Int})::Dict{Symbol, IR.VariableKind}
   local kinds = Dict{Symbol, IR.VariableKind}()
@@ -69,10 +69,10 @@ function plannedKinds(s::Structure, dummies::Set{Int})::Dict{Symbol, IR.Variable
   end
   for v in selectedStates(s, dummies)
     local (state, derivative) = (s.variables[v], s.variables[s.derivative[v]])
-    local link = stateDerivativeName(state)
+    local link::Symbol = IR.stateDerivativeCref(s.crefs[v]).name
     kinds[state] = IR.STATE(1, link, true)
     kinds[link] = IR.STATE_DER(state)
-    get(kinds, derivative, nothing) isa IR.STATE || (kinds[derivative] = IR.ALGEBRAIC())
+    get(kinds, derivative, nothing) isa IR.STATE || (kinds[derivative] = IR.ALGEBRAIC_DER(state))
   end
   return kinds
 end
@@ -81,18 +81,23 @@ end
     arrayElementRef(name, E, variables) -> ComponentRef
 
 The element variable `name` of the element view as a reference into its array in the arrays-kept model
-(`x[2]`, `c[2].T`; `\$DER.x[2]` as the element 2 of the array `\$DER.x`); a scalar variable by its own reference.
+(`x[2]`, `c[2].T`; `\$DER.x[2]` as the element 2 of the derivative array `\$DER.x`, `IR.withLastSubscripts`); a scalar
+variable by its own reference; NotHandled for a name of neither.
 """
 function arrayElementRef(name::Symbol, E::Elements, variables::IR.VariableSet)::IR.ComponentRef
   local element = get(E.array, name, nothing)
   if element === nothing
-    local v = get(variables, name, nothing)
-    return v === nothing ? IR.ComponentRef(name, IR.T_REAL()) : v.cref
+    local v::Union{Nothing, IR.Variable} = get(variables, name, nothing)
+    v === nothing && throw(NotHandled("the element view's variable $(name), of no array and not of the model"))
+    return v.cref
   end
+  local (array::Symbol, index::Vector{Int}) = element
+  local arrayVariable::Union{Nothing, IR.Variable} = get(variables, array, nothing)
+  (arrayVariable !== nothing && IR.isDerivativeCref(arrayVariable.cref)) &&
+    return IR.withLastSubscripts(arrayVariable.cref, IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index])
   local cref = E.crefs[name]
   IR.hasSubscripts(cref) && return cref
-  #= a backend-made array, its elements named by flat names: the element of its one part =#
-  local (array, index) = element
+  #= another backend-made array of one part, its elements named by flat names: the element of its one part =#
   local part = variables[array].cref.parts[1]
   return IR.ComponentRef(IR.CrefPart[IR.CrefPart(part.name, IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index], part.ty)])
 end
@@ -164,6 +169,7 @@ end
 "The variable a kind names: a state's derivative, a derivative's state, a dummy's counterpart."
 kindVariable(k::IR.STATE)::Symbol = k.derivative
 kindVariable(k::IR.STATE_DER)::Symbol = k.state
+kindVariable(k::IR.ALGEBRAIC_DER)::Symbol = k.state
 kindVariable(k::IR.DUMMY_DER)::Symbol = k.dummyState
 kindVariable(k::IR.DUMMY_STATE)::Symbol = k.dummyDerivative
 
@@ -180,8 +186,9 @@ function newArrays(names::Vector{Symbol}, s::Structure, E::Elements, model::IR.M
   local arrayOf = copy(E.array)
   local elementsOf = copy(E.elements)
   local dimensionsOf = Dict{Symbol, Vector{IR.Dimension}}(v.name => v.ty.dimensions for v in model.variables if v.ty isa IR.T_ARRAY)
-  #= a new derivative array's array of the model (to split for slicing: `x` of `\$DER.x`) =#
+  #= a new derivative array's array of the model (to split for slicing: `x` of `\$DER.x`), and its reference =#
   local rootOf::Dict{Symbol, Symbol} = Dict{Symbol, Symbol}()
+  local crefOf::Dict{Symbol, IR.ComponentRef} = Dict{Symbol, IR.ComponentRef}()
   #= every array derived for some of its elements only, collected: split together =#
   local partial::Vector{Symbol} = Symbol[]
   local firstPartial::String = ""
@@ -192,22 +199,26 @@ function newArrays(names::Vector{Symbol}, s::Structure, E::Elements, model::IR.M
     for name in byOrder[order]
       local element = get(arrayOf, s.variables[s.antiderivative[s.index[name]]], nothing)
       if element === nothing
-        push!(out, IR.Variable(name, IR.T_REAL(), IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION,
+        push!(out, IR.Variable(s.crefs[s.index[name]], IR.T_REAL(), IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION,
                                false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :indexReduction))
       else
         push!(get!(() -> Symbol[], byArray, element[1]), name)
       end
     end
     for (array, derived) in sort!(collect(byArray); by = first)
-      local expected = Symbol[IR.derivativeName(e) for e in elementsOf[array]]
-      if Set(derived) != Set(expected)
-        isempty(partial) && (firstPartial = "the derivatives of $(length(derived)) of the $(length(expected)) elements of the array $(array)")
+      #= each element's derivative among those derived (the structure's antiderivative of each), in the elements' order =#
+      local derivativeOf::Dict{Symbol, Symbol} = Dict{Symbol, Symbol}(s.variables[s.antiderivative[s.index[d]]] => d for d in derived)
+      if length(derived) != length(elementsOf[array]) || !all(e::Symbol -> haskey(derivativeOf, e), elementsOf[array])
+        isempty(partial) && (firstPartial = "the derivatives of $(length(derived)) of the $(length(elementsOf[array])) elements of the array $(array)")
         push!(partial, get(rootOf, array, array))
         continue
       end
-      local name = IR.derivativeName(array)
+      local expected::Vector{Symbol} = Symbol[derivativeOf[e] for e in elementsOf[array]]
+      local cref::IR.ComponentRef = IR.derivativeCref(haskey(crefOf, array) ? crefOf[array] : model.variables[array].cref)
+      local name::Symbol = cref.name
       haskey(model.variables, name) && throw(NotHandled("a derivative array $(name) that exists"))
-      push!(out, IR.Variable(name, IR.T_ARRAY(IR.T_REAL(), dimensionsOf[array]), IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES,
+      crefOf[name] = cref
+      push!(out, IR.Variable(cref, IR.T_ARRAY(IR.T_REAL(), dimensionsOf[array]), IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES,
                              IR.NO_DIRECTION, false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :indexReduction))
       dimensionsOf[name] = dimensionsOf[array]
       elementsOf[name] = expected
@@ -299,7 +310,7 @@ function differentiatedForEquation(eq::IR.FOR_EQUATION, chains::Dict{Vector{Int}
     end
   end
   isempty(body) && return nothing
-  return IR.FOR_EQUATION(eq.iterator, body, eq.source, IR.EquationAttributes(eq.attributes.kind, true, nothing))
+  return IR.FOR_EQUATION(eq.iterator, body, eq.source, IR.EquationAttributes(eq.attributes.kind, true, nothing, false))
 end
 
 "The scalar equation `eq` of the arrays-kept model at the iterator `values`, in the element view's form (`equationExpression`)."
@@ -376,12 +387,12 @@ function linkEquation(link::IR.Variable, derivative::IR.Variable, sizes::Vector{
   local subscripts = iteratorSubscripts(sizes)
   local element = v::IR.Variable -> IR.CREF(distributedCref(v, subscripts), IR.T_REAL())
   return nestedFor(IR.Equation[IR.SCALAR_EQUATION(element(link), element(derivative), IR.T_REAL(), IR.NO_SOURCE,
-                                                  IR.DEFAULT_ATTRIBUTES)], sizes)
+                                                  IR.DERIVATIVE_LINK_ATTRIBUTES)], sizes)
 end
 
 "A variable the array form of a plan adds, of no attributes."
-newVariable(name::Symbol, ty::IR.ModelicaType)::IR.Variable =
-  IR.Variable(name, ty, IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION, false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :indexReduction)
+newVariable(cref::IR.ComponentRef, ty::IR.ModelicaType)::IR.Variable =
+  IR.Variable(cref, ty, IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION, false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :indexReduction)
 
 """
     stateLinks(s, dummies, E, derivatives, variables) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
@@ -407,18 +418,18 @@ function stateLinks(s::Structure, dummies::Set{Int}, E::Elements, derivatives::D
                        Symbol[array], Int[]))
     local derivative = get(derivatives, array, nothing)
     derivative === nothing && throw(NotHandled("the states of the array $(array), their derivatives not one array"))
-    local link = newVariable(stateDerivativeName(array), variables[array].ty)
+    local link::IR.Variable = newVariable(IR.stateDerivativeCref(variables[array].cref), variables[array].ty)
     push!(links, link)
     push!(variables, link)
     push!(equations, linkEquation(link, variables[derivative], E.sizes[array]))
   end
   for x in scalars
     local derivative = variables[s.variables[s.derivative[s.index[x]]]]
-    local link = newVariable(stateDerivativeName(x), IR.T_REAL())
+    local link::IR.Variable = newVariable(IR.stateDerivativeCref(variables[x].cref), IR.T_REAL())
     push!(links, link)
     push!(variables, link)
     push!(equations, IR.SCALAR_EQUATION(IR.CREF(link.cref, IR.T_REAL()), IR.CREF(derivative.cref, IR.T_REAL()), IR.T_REAL(),
-                                        IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
+                                        IR.NO_SOURCE, IR.DERIVATIVE_LINK_ATTRIBUTES))
   end
   return (links, equations)
 end
@@ -559,8 +570,9 @@ end
     reduceIndexArrays!(model) -> Bool
 
 Index reduction of an arrays-kept model in array form: planned on its element view (`scalarizeArrays`, `knownPlan`),
-committed in array form (`arrayCommit`, `commitArrays!`); true where reduced. False where the model has no
-continuous arrays or needs no reduction. An array whose elements the plan treats differently (slicing) is split into
+committed in array form (`arrayCommit`, `commitArrays!`); true where reduced. A model of index 1 is committed with
+the plan that differentiates nothing (its states, their derivative variables and links in array form, as the array
+code reads them): false. False, the model not changed, where it has no continuous arrays. An array whose elements the plan treats differently (slicing) is split into
 its elements first (`splitArrays!`), and the plan committed again. NotHandled where the array form does not take the
 plan (der() of an expression, a split down to no array equations: the caller takes the scalarized path and discards
 the model, which a split may have changed).
@@ -570,8 +582,7 @@ function reduceIndexArrays!(model::IR.Model)::Bool
   any(readsDerCall, model.continuous[1].equations) && throw(NotHandled("der() of an expression with arrays kept"))
   local view::Scalarized = scalarizeArrays(model)
   local partition::IR.Partition = view.model.continuous[1]
-  local written::Union{Nothing, Plan} = plan(view.model, partition)
-  written === nothing && return false
+  local written::Plan = plan(view.model, partition; indexOne = true)
   #= the array form of the plan as written first: a plan it does not take is refused before the simulation code's
      values are computed for the plan again (`knownPlan`). Arrays whose elements it treats differently (slicing) are
      split into their elements, until it takes it. The element view stays (the splits keep the model's meaning), so
@@ -585,8 +596,7 @@ function reduceIndexArrays!(model::IR.Model)::Bool
     try
       arrayCommit(model, model.continuous[1], view, written)
       stale || break
-      written = plan(view.model, partition)
-      written === nothing && return false
+      written = plan(view.model, partition; indexOne = true)
       stale = false
       arrayCommit(model, model.continuous[1], view, written)
       break
@@ -606,18 +616,51 @@ function reduceIndexArrays!(model::IR.Model)::Bool
       stale = true
     end
   end
+  return commitArrayPlan!(model, view, written)
+end
+
+"""
+    commitIndexOne!(model) -> Bool
+
+A model without continuous arrays (on the arrays-kept route, for the array code) of index 1 committed as
+`reduceIndexArrays!` commits one: the plan that differentiates nothing, its states, their derivative variables and
+links. False, the model not changed, where its index is above one (the scalarized path reduces it).
+"""
+function commitIndexOne!(model::IR.Model)::Bool
+  any(readsDerCall, model.continuous[1].equations) && throw(NotHandled("der() of an expression"))
+  local view::Scalarized = scalarizeArrays(model)
+  local written::Plan = plan(view.model, view.model.continuous[1]; indexOne = true)
+  isempty(written.differentiated) || return false
+  commitArrayPlan!(model, view, written)
+  return true
+end
+
+"Whether index reduction reduced `model`: it has dummy derivatives (one for each differentiated equation)."
+indexReduced(model::IR.Model)::Bool = any(v::IR.Variable -> v.kind isa Union{IR.DUMMY_DER, IR.DUMMY_STATE}, model.variables)
+
+"""
+    commitArrayPlan!(model, view, written) -> Bool
+
+The plan `written`, made on the element view `view` of `model` and taken by its array form, made again with the
+simulation code's values (`KNOWN_VALUES`) and committed in array form (`arrayCommit`, `commitArrays!`), the
+derivative unknowns solved for; whether it reduced the index (differentiated equations).
+"""
+function commitArrayPlan!(model::IR.Model, view::Scalarized, written::Plan)::Bool
   local known = KNOWN_VALUES[] === nothing ? Dict{Symbol, IR.Expression}() : KNOWN_VALUES[](view.model)
-  local p = isempty(known) ? written : plan(view.model, partition; known)
-  p === nothing && return false
+  local p::Plan = isempty(known) ? written : plan(view.model, view.model.continuous[1]; known, indexOne = true)
+  local reduced::Bool = !isempty(p.differentiated)
   local c = arrayCommit(model, model.continuous[1], view, p)
   commitArrays!(model, model.continuous[1], c)
   #= the derivative unknowns solved for, as on the scalarized path (`reduceIndex!`): left algebraic unknowns, MSL
      R134a2's der(p) of its volumes jumped at the dew line and the steps fell to 1e-16 =#
-  local solved = envSwitch("OMBACKEND_SOLVE_DERIVATIVES") ? solveDerivatives!(model, model.continuous[1]) : Symbol[]
+  #= a coefficient of parameters stays an expression (the array code's parameters can be overridden: `c * der(x) = 1`
+     with c overridden kept c's translated value) =#
+  local solved = envSwitch("OMBACKEND_SOLVE_DERIVATIVES") ?
+    solveDerivatives!(model, model.continuous[1]; literalCoefficients = false) : Symbol[]
   local states = sort!([String(n) for (n, k) in c.kinds if k isa IR.STATE])
   local stateText = isempty(states) ? "" : ", states $(join(first(states, 8), ", "))"
   local setText = c.sets == 0 ? "" : ", $(c.sets) dynamic state set$(c.sets == 1 ? "" : "s")"
   local solvedText = isempty(solved) ? "" : "; $(length(solved)) derivatives solved for"
-  @info "[index reduction] $(model.name): in array form, $(length(c.equations)) equations added$(stateText)$(setText)$(solvedText)"
-  return true
+  @info "[index reduction] $(model.name): $(reduced ? "" : "of index 1, ")in array form, $(length(c.equations)) equations added$(stateText)$(setText)$(solvedText)"
+  return reduced
 end

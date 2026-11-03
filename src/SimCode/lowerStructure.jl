@@ -74,7 +74,7 @@ function irreducibleVariables(names::Names, ifEquations::Vector{IR.IF_EQUATION},
      solved from their own equations, not eliminated by MTK =#
   envSwitch("OMBACKEND_SOLVE_DERIVATIVES") ||
     append!(out, String[simName(names, v.cref) for v in vars if v.kind isa IR.DUMMY_DER])
-  filter!(n -> n == "time" || (haskey(ht, n) && !(last(ht[n]).varKind isa PARAMETER)), out)
+  filter!(n -> n == "time" || (haskey(ht, n) && !isScalarParameter(last(ht[n]))), out)
   for w in whens, n in allCrefNames(w.whenEquation.condition)
     (haskey(ht, n) && last(ht[n]).varKind isa DISCRETE) && push!(out, n)
   end
@@ -135,7 +135,7 @@ function ifEquationVariables(names::Names, eq::IR.IF_EQUATION, vars::Vector{IR.V
       local differentiated = Set{String}(vcat(derivativeNames(names, e.lhs), derivativeNames(names, e.rhs)))
       for v in vars
         local n = simName(names, v.cref)
-        ((v.kind isa IR.ALGEBRAIC && n in read) || n in differentiated) && push!(out, n)
+        ((v.kind isa Union{IR.ALGEBRAIC, IR.ALGEBRAIC_DER} && n in read) || n in differentiated) && push!(out, n)
       end
     end
   end
@@ -204,6 +204,13 @@ whenStatementExps(s::REINIT)::Vector{Exp} = Exp[EXP_CREF(s.stateVar, TYPE_REAL()
 whenStatementExps(s::ASSERT)::Vector{Exp} = Exp[s.condition, s.message]
 whenStatementExps(s::TERMINATE)::Vector{Exp} = Exp[s.message]
 whenStatementExps(s::NORETCALL)::Vector{Exp} = Exp[s.exp]
+function whenStatementExps(s::IF)::Vector{Exp}
+  local out::Vector{Exp} = Exp[b.condition for b in s.branches]
+  for x in Iterators.flatten((Iterators.flatten(b.body for b in s.branches), s.elseBody))
+    append!(out, whenStatementExps(x))
+  end
+  return out
+end
 whenStatementExps(s::Statement)::Vector{Exp} = Exp[]
 
 #= ==================================================================================== =#

@@ -376,7 +376,7 @@ Chain A → B → C is resolved to A → C before substitution.
 representative of their alias component (e.g. discretes referenced in an
 event condition, whose name the generated callback reads from the state
 vector). When a component contains such a symbol it is forced to be the
-root so it is never substituted away.
+root so it is never substituted away; of two, the first in `preferKeep`'s order.
 
 `avoid` names symbols that must not be a representative (the discretes the
 demotion made algebraic: once the relay is gone they have no equation); a
@@ -429,10 +429,11 @@ function eliminateIfEqRelays(equations::Vector{Expr};
     #= Re-root any component that contains a preferKeep symbol onto that symbol,
        so the alias map substitutes the other members toward it. =#
     if !isempty(preferKeep)
+        local rank = Dict{Symbol,Int}(s => i for (i, s) in enumerate(preferKeep))
         local rootOf = Dict{Symbol,Symbol}()
         for k in keys(parent)
             local r = getroot(k)
-            if k in preferKeep && !haskey(rootOf, r)
+            if haskey(rank, k) && (!haskey(rootOf, r) || rank[k] < rank[rootOf[r]])
                 rootOf[r] = k
             end
         end

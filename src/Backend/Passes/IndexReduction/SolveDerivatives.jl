@@ -42,14 +42,12 @@
     isDerivativeUnknown(v) -> Bool
 
 Whether `v` is a derivative unknown of a reduced partition: a dummy derivative, or a state's
-derivative variable `\$DER.x` that its link `\$STATEDER.x = \$DER.x` made algebraic.
+derivative variable that its link `\$STATEDER.x = \$DER.x` made algebraic (ALGEBRAIC_DER).
 """
-isDerivativeUnknown(v::IR.Variable)::Bool =
-  v.kind isa IR.DUMMY_DER || (v.kind isa IR.ALGEBRAIC && startswith(String(v.name), "\$DER."))
+isDerivativeUnknown(v::IR.Variable)::Bool = v.kind isa Union{IR.DUMMY_DER, IR.ALGEBRAIC_DER}
 
-"Whether `eq` is a state's derivative link `\$STATEDER.x = \$DER.x`: the state's differential row, which determines no derivative unknown."
-isDerivativeLink(eq::IR.Equation)::Bool =
-  eq isa IR.SCALAR_EQUATION && eq.lhs isa IR.CREF && startswith(String(eq.lhs.cref.name), "\$STATEDER.")
+"Whether `eq` is a state's derivative link `\$STATEDER.x = \$DER.x` (its attributes' `derivativeLink`): the state's differential row, which determines no derivative unknown."
+isDerivativeLink(eq::IR.Equation)::Bool = eq isa IR.SCALAR_EQUATION && eq.attributes.derivativeLink
 
 "Whether `e` reads no unknown (only parameters, constants and literals; not `time`): a coefficient the code generators solve through."
 function readsNoUnknown(e::IR.Expression, variables::IR.VariableSet)::Bool
@@ -394,7 +392,7 @@ function solveThroughSolved!(solved::Dict{Symbol, IR.Expression}, equationOf::Di
 end
 
 """
-    solveDerivatives!(model, partition; known) -> Vector{Symbol}
+    solveDerivatives!(model, partition; known, literalCoefficients = true) -> Vector{Symbol}
 
 The derivative unknowns of a reduced partition solved for and substituted: each assigned an
 equation that determines it (`matchDerivatives`), that equation solved for it (`d = -r0 / c`,
@@ -406,12 +404,66 @@ others: the unknowns an algebraic loop keeps are the model's (the diodes' `icap`
 integrator's error control), not the derivatives (left out of it). An unknown an if-equation
 determines stays, so do derivatives in a cycle (`resolvedValues`). `known`: the simulation code's
 values the plan was made with (`Plan`'s), of which those of variables a function call defines
-evaluate the coefficients (`derivativeEdges`). The unknowns so solved for, in order.
+evaluate the coefficients (`derivativeEdges`); `literalCoefficients` false: a coefficient of parameters stays an
+expression (the array code's, whose parameters can be overridden), one more than a parameter or a literal a parameter
+of its own (`coefficientParameter!`). The unknowns so solved for, in order.
 """
 function solveDerivatives!(model::IR.Model, partition::IR.Partition;
-                           known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::Vector{Symbol}
-  local solution::Union{Nothing, DerivativeSolution} = derivativeSolution(model, partition; known)
-  return solution === nothing ? Symbol[] : substituteDerivatives!(partition, solution)
+                           known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}(),
+                           literalCoefficients::Bool = true)::Vector{Symbol}
+  local made::Dict{String, IR.Expression} = Dict{String, IR.Expression}()
+  local coefficient::Function = literalCoefficients ? identity : (c::IR.Expression) -> coefficientParameter!(model, c, made)
+  local solution::Union{Nothing, DerivativeSolution} = derivativeSolution(model, partition; known, literalCoefficients, coefficient)
+  return solution === nothing ? Symbol[] : substituteDerivatives!(partition, solution, model.variables)
+end
+
+"""
+    coefficientParameter!(model, c, made) -> Expression
+
+A derivative's coefficient `c` that reads only parameters (`readsNoUnknown`), solved through as an expression
+(`literalCoefficients` false), as a parameter of its own whose binding it is (`\$DER_COEFFICIENT_k`, added to the
+model's variables): the array code computes it once at each start, again where an override changes a parameter it
+reads, not in each right-hand side (`sin(p) * der(x) = 1`: `1.0 / sin(p)`). A literal, a reference, their negation as
+they are, and one that reads a parameter the initialization computes (fixed = false, through bindings too: a binding of
+it is no parameter rule the array code takes). `made`: the ones made, by their text (one parameter for a coefficient
+of several equations).
+"""
+function coefficientParameter!(model::IR.Model, c::IR.Expression, made::Dict{String, IR.Expression})::IR.Expression
+  local simple::Function = (x::IR.Expression) -> isLiteral(x) || x isa Union{IR.CREF, IR.SUBSCRIPTED}
+  (simple(c) || (c isa IR.UNARY && c.op === IR.UMINUS && simple(c.exp))) && return c
+  readsNoUnknown(c, model.variables) || return c
+  readsFreeParameter(c, model.variables, Set{Symbol}()) && return c
+  return get!(made, IR.toString(c)) do
+    local k::Int = 1
+    while haskey(model.variables, Symbol("\$DER_COEFFICIENT_", k))
+      k += 1
+    end
+    local cref::IR.ComponentRef = IR.ComponentRef(Symbol("\$DER_COEFFICIENT_", k), IR.T_REAL())
+    push!(model.variables, IR.Variable(cref, IR.T_REAL(), IR.PARAMETER(), c, IR.NO_ATTRIBUTES, IR.NO_DIRECTION, true,
+                                       IR.NOT_CONNECTOR, IR.NO_SOURCE, :solveDerivatives))
+    IR.CREF(cref, IR.T_REAL())
+  end
+end
+
+"""
+Whether `e` reads a parameter with fixed = false (one the initialization computes), directly or through the bindings of
+the parameters it reads (`seen`: those followed).
+"""
+function readsFreeParameter(e::IR.Expression, variables::IR.VariableSet, seen::Set{Symbol})::Bool
+  local found::Bool = false
+  IR.foreachExp(e) do x
+    (found || !(x isa IR.CREF) || x.cref.name in seen) && return nothing
+    push!(seen, x.cref.name)
+    local v::Union{Nothing, IR.Variable} = get(variables, x.cref.name, nothing)
+    #= an element of an array parameter: the array's =#
+    (v === nothing && !isempty(IR.subscripts(x.cref))) && (v = get(variables, IR.upToFirstSubscripted(x.cref).name, nothing))
+    (v === nothing || !(v.kind isa IR.PARAMETER)) && return nothing
+    local fixed::Union{Nothing, IR.Expression} = v.attributes.fixed
+    (fixed !== nothing && !(fixed isa IR.BOOLEAN && fixed.value)) && (found = true; return nothing)
+    v.binding === nothing || (found = readsFreeParameter(v.binding, variables, seen))
+    return nothing
+  end
+  return found
 end
 
 """
@@ -431,11 +483,13 @@ end
     derivativeSolution(model, partition; known) -> Union{Nothing, DerivativeSolution}
 
 The decisions of `solveDerivatives!` (the matching, the solved values, resolved), the partition not changed;
-`nothing` where no derivative unknown is solved for. `literalCoefficients`: `derivativeEdges`'.
+`nothing` where no derivative unknown is solved for. `literalCoefficients`: `derivativeEdges`'. `coefficient`: the
+expression a matched equation is solved through for its coefficient (`solveDerivatives!`: `coefficientParameter!`).
 """
 function derivativeSolution(model::IR.Model, partition::IR.Partition;
                             known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}(),
-                            literalCoefficients::Bool = true)::Union{Nothing, DerivativeSolution}
+                            literalCoefficients::Bool = true,
+                            coefficient::Function = identity)::Union{Nothing, DerivativeSolution}
   local unknowns = Set{Symbol}(v.name for v in model.variables if isDerivativeUnknown(v))
   isempty(unknowns) && return nothing
   local functions = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
@@ -448,7 +502,7 @@ function derivativeSolution(model::IR.Model, partition::IR.Partition;
   local equationOf = Dict{Symbol, Int}()
   for (d, e) in matched
     e.coefficient === nothing && continue
-    solved[d] = solvedValue(partition.equations[e.equation]::IR.SCALAR_EQUATION, d, e.coefficient)
+    solved[d] = solvedValue(partition.equations[e.equation]::IR.SCALAR_EQUATION, d, coefficient(e.coefficient))
     equationOf[d] = e.equation
   end
   local matchedValues::Dict{Symbol, IR.Expression} = copy(solved)
@@ -461,19 +515,19 @@ function derivativeSolution(model::IR.Model, partition::IR.Partition;
 end
 
 """
-    substituteDerivatives!(partition, solution) -> Vector{Symbol}
+    substituteDerivatives!(partition, solution, variables) -> Vector{Symbol}
 
-The solved derivatives of `solution` substituted into the partition: each one's equation `d = value`, its value in
-the other equations; the unknowns so solved for, in order.
+The solved derivatives of `solution` substituted into the partition: each one's equation `d = value` (`d` by its
+reference in `variables`), its value in the other equations; the unknowns so solved for, in order.
 """
-function substituteDerivatives!(partition::IR.Partition, solution::DerivativeSolution)::Vector{Symbol}
+function substituteDerivatives!(partition::IR.Partition, solution::DerivativeSolution, variables::IR.VariableSet)::Vector{Symbol}
   local resolved::Dict{Symbol, IR.Expression} = solution.resolved
   local definitions::Dict{Int, Symbol} = Dict{Int, Symbol}(solution.equationOf[d] => d for d in keys(resolved))
   local substitute = x -> (x isa IR.CREF && haskey(resolved, x.cref.name)) ? substitutable(x, resolved[x.cref.name]) : x
   for (i, eq) in enumerate(partition.equations)
     local d = get(definitions, i, nothing)
     partition.equations[i] = d === nothing ? IR.mapEquation!(substitute, eq) :
-      IR.SCALAR_EQUATION(IR.CREF(IR.ComponentRef(d, IR.T_REAL()), IR.T_REAL()), resolved[d], IR.T_REAL(), eq.source, eq.attributes)
+      IR.SCALAR_EQUATION(IR.CREF(variables[d].cref, IR.T_REAL()), resolved[d], IR.T_REAL(), eq.source, eq.attributes)
   end
   return sort(collect(keys(resolved)))
 end

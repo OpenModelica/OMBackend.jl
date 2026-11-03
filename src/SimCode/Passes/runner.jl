@@ -53,7 +53,7 @@ end
 
 function simCodeMetrics(sc::SIM_CODE)::SimCodeMetrics
   local unknowns = count(((_, (_, v)),) -> isUnknownVarKind(v.varKind), sc.stringToSimVarHT)
-  local parameters = count(((_, (_, v)),) -> isParameter(v), sc.stringToSimVarHT)
+  local parameters = count(((_, (_, v)),) -> isScalarParameter(v), sc.stringToSimVarHT)
   return SimCodeMetrics(length(sc.residualEquations), length(sc.initialEquations), length(sc.ifEquations),
                         sum((length(e.branches) for e in sc.ifEquations); init = 0),
                         sum((length(b.residualEquations) for e in sc.ifEquations for b in e.branches); init = 0),

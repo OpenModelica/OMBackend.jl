@@ -58,6 +58,7 @@ include("derivatives.jl")
 include("causalize.jl")
 include("Evaluation/Evaluation.jl")
 include("IndexReduction/IndexReduction.jl")
+include("arrayCodeForm.jl")
 
 """
 The passes, in order: name => pass. The first group is the previous backend's BDAECreate (the
@@ -75,6 +76,7 @@ const PIPELINE = Pair{String, Base.Function}[
   "hoistIfEquationAsserts" => hoistIfEquationAsserts!,
   "partitionClocks" => partitionClocks!,
   "lowerClockedPartitions" => lowerClockedPartitions!,
+  "liftEventFunctions" => liftEventFunctions!,
   "resolveIntegerVariables" => resolveIntegerVariables!,
   "moveSubscriptsIntoDer" => moveSubscriptsIntoDer!,
   "lowerHigherOrderDerivatives" => lowerHigherOrderDerivatives!,
@@ -108,16 +110,23 @@ end
 """
     runPassesKeepingArrays!(model) -> Model
 
-`model`, lowered with its arrays kept, through the passes before index reduction (`PIPELINE`), its array
+`model`, lowered with its arrays kept, through the passes before index reduction (`PIPELINE`; a binding that
+references another parameter kept: the array code's parameters can all be overridden), its array
 equations of continuous arrays kept as for-equations over their elements (`IndexReduction.rollArrayEquations!`,
-before `expandEquations`, which splits the others): what the array form of index reduction takes.
+before `expandEquations`, which splits the others), its for-equations' if-equations on the iterator alone split by
+the values taking each branch (`IndexReduction.splitStaticIfs!`): what the array form of index reduction takes.
 """
 function runPassesKeepingArrays!(model::IR.Model)::IR.Model
   for (name, pass) in PIPELINE
+    #= every parameter of the array code can be overridden (its parameterValues): a binding that references another
+       parameter keeps the reference, as a tunable one's does (an override of the referenced one reached nothing) =#
+    name == "resolveBindingReferences" && continue
+    #= the array code makes the events of integer(), floor() etc. itself =#
+    name == "liftEventFunctions" && continue
     name == "expandEquations" && (model = IndexReduction.rollArrayEquations!(model))
     model = pass(model)
   end
-  return model
+  return IndexReduction.splitStaticIfs!(model)
 end
 
 end # module Passes

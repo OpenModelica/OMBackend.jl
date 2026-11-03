@@ -208,7 +208,7 @@ function _precompileWarmupArrayPath()::Nothing
   local AG = CodeGeneration.ArrayODEGen
   local p = AG.ArrayModelParameters(Float64[], Bool[], Float64[], Float64[], Bool[], Bool[], [false], [false], zeros(2),
                                     zeros(2), Bool[], Tuple{Float64, Vector{Float64}}[], Float64[], [0.0], [1.0], Float64[],
-                                    AG.BlockSolver[], OMBackend)
+                                    AG.BlockSolver[], AG.ArrayRuntimeState(0, String[]), OMBackend)
   local sys = AG.ArraySystem(Dict{Symbol, Int}(), Symbol[], Dict{Symbol, Tuple{Symbol, Int}}(), OMBackend)
   local jac = CodeGeneration.Symbolics.SparseArrays.sparse([1, 2], [1, 2], ones(2), 2, 2)
   #= the time gradient wrapped as the array code wraps it (one type for every array model) =#
@@ -225,9 +225,9 @@ include_dependency(ARRAYS_KEPT_WORKLOAD)
 The arrays-kept paths over the models of `Precompile/ArraysKept.mo`, as `translate` takes them, up to the generated
 module's code (a module is not evaluated while the package image is built): the frontend's flatten with the arrays
 kept, lowering and the passes, component rolling, index reduction in array form with its splits, the derivatives
-solved in array form and the array code after index reduction (`Chain`: MultiBody's frames through functions, slicing;
-`Volumes`: a semiLinear chain, a free parameter, a when-equation), and the array code of a model without index
-reduction (`LoopEvents`: a torn loop, events, a when-equation, an assert). Their code then compiles into the package image, not at each process's first
+solved in array form and the array code (`Chain`: MultiBody's frames through functions, slicing; `Volumes`: a
+semiLinear chain, a free parameter, a when-equation; `LoopEvents`, of index one: a torn loop, events, a when-equation,
+an assert). Their code then compiles into the package image, not at each process's first
 such model: MSL EngineV6's first build compiled 2371 methods (18.7 s) for reducedArrayModel and 594 (3.8 s) for its
 array code, of OMBackend's own code (`Traversal.traverseField`'s specializations by node and pass: 1073). Each model
 must take its path (an error otherwise: the workload would compile less than it says). The registries those paths
@@ -241,14 +241,11 @@ function _precompileWarmupArraysKept()::Nothing
     try
       local (fm::OMFrontend.Frontend.FlatModel, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = false)
       local functions::FunctionList = OMFrontend.cacheToFunctionList(cache)
-      local code::Tuple = if model == "LoopEvents"
-        CodeGeneration.ArrayODEGen.generateArrayODECode(fm, cn; functions)
-      else
-        local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(fm; functionList = functions)
-        reduced === nothing && error("$(name) not reduced in array form: $(scalarizedFallbackReason(cn))")
-        local (solved::OMJLIR.Model, _) = Passes.IndexReduction.solvedInArrays(reduced)
-        CodeGeneration.ArrayODEGen.generateArrayODECode(solved, cn; functions)
-      end
+      local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(fm; functionList = functions)
+      reduced === nothing && error("$(name) not lowered in array form: $(scalarizedFallbackReason(cn))")
+      local (solved::OMJLIR.Model, _) = Passes.IndexReduction.solvedInArrays(reduced)
+      Passes.arrayCodeForm!(solved)
+      local code::Tuple = CodeGeneration.ArrayODEGen.generateArrayODECode(SimCode.lowerArraySystem(solved), cn)
       code[1] === nothing && error("$(name): no array code ($(code[2]))")
     finally
       delete!(ARRAY_PATH_REASONS, cn)

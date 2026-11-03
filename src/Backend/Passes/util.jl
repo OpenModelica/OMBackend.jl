@@ -129,13 +129,13 @@ function rowMajor(sizes::Vector{Int})::Vector{Vector{Int}}
   end
 end
 
-"The flat name of `cref` without its subscripts (`c[2].p.T` and `c.p.T[2]` are `c.p.T`)."
+"The flat name of `cref` without its subscripts (`c[2].p.T` and `c.p.T[2]` are `c.p.T`; a slice's part keeps its inner ones, `T_SLICE`): the name of the variable it reads."
 unsubscriptedName(cref::IR.ComponentRef)::Symbol =
-  length(cref.parts) == 1 ? cref.parts[1].name :
-    IR.ComponentRef(IR.CrefPart[IR.CrefPart(p.name, IR.Subscript[], p.ty) for p in cref.parts]).name
+  !IR.hasSubscripts(cref) ? cref.name :
+    (length(cref.parts) == 1 && !(cref.parts[1].ty isa IR.T_SLICE)) ? IR.arrayName(cref.parts[1]) : IR.withoutSubscripts(cref).name
 
-"The subscripts of all parts of `cref`, in order (`c[2].v[3]`: 2, 3): those of the element of an array variable it names."
-allSubscripts(cref::IR.ComponentRef)::Vector{IR.Subscript} = IR.Subscript[s for p in cref.parts for s in p.subscripts]
+"The subscripts of all parts of `cref`, in order (`c[2].v[3]`: 2, 3; `IR.partSubscripts`): those of the element of an array variable it names."
+allSubscripts(cref::IR.ComponentRef)::Vector{IR.Subscript} = IR.Subscript[s for p in cref.parts for s in IR.partSubscripts(p)]
 
 """
     foldInteger(e)
@@ -202,31 +202,21 @@ function rangeValues(range::IR.Expression)::Union{Nothing, Vector{Int}}
   return collect(a:s:b)
 end
 
-"""
-    namesOverlap(a, b)
+"The references `e` reads, those inside `pre()` (values before the event) left out."
+crefsReadOutsidePre(e::IR.Expression)::Vector{IR.ComponentRef} = crefsReadOutsidePre!(IR.ComponentRef[], e)
 
-Whether the names `a` and `b` name the same variable or one a part of the other (`buf` and
-`buf[2]`, `r` and `r.x`).
-"""
-function namesOverlap(a::Symbol, b::Symbol)::Bool
-  local (sa, sb) = (String(a), String(b))
-  local (short, long) = length(sa) <= length(sb) ? (sa, sb) : (sb, sa)
-  startswith(long, short) || return false
-  return length(long) == length(short) || long[nextind(long, lastindex(short))] in ('[', '.')
+"The references `e` reads outside `pre()`, pushed onto `out`."
+function crefsReadOutsidePre!(out::Vector{IR.ComponentRef}, e::IR.Expression)::Vector{IR.ComponentRef}
+  IR.isBuiltinCall(e, :pre) && return out
+  e isa IR.CREF && push!(out, e.cref)
+  for c::IR.Expression in IR.children(e)
+    crefsReadOutsidePre!(out, c)
+  end
+  return out
 end
 
 "The names of the variables `e` reads, those inside `pre()` (values before the event) left out."
-function namesReadOutsidePre(e::IR.Expression)::Vector{Symbol}
-  local out = Symbol[]
-  local visit
-  visit = x -> begin
-    IR.isBuiltinCall(x, :pre) && return
-    x isa IR.CREF && push!(out, x.cref.name)
-    foreach(visit, IR.children(x))
-  end
-  visit(e)
-  return out
-end
+namesReadOutsidePre(e::IR.Expression)::Vector{Symbol} = Symbol[c.name for c in crefsReadOutsidePre(e)]
 
 "The relations in `e`, each once (structurally), in a bottom-up order."
 function relationsIn(e::IR.Expression)::Vector{IR.RELATION}
@@ -253,6 +243,30 @@ hasContinuousOperand(rel::IR.Expression, known::Set{Symbol})::Bool =
 knownNames(variables::IR.VariableSet)::Set{Symbol} = Set{Symbol}(v.name for v in variables if IR.isKnown(v))
 
 """
+The built-ins whose value jumps where their argument crosses an integer: outside when-clauses and `noEvent()` they
+make events (MLS, "Event Triggering Mathematical Functions").
+"""
+const EVENT_FUNCTIONS = (:integer, :floor, :ceil, :div, :mod, :rem)
+
+"""
+    readsContinuousTime(e, variables, known)
+
+Whether `e` reads, outside `pre()`, `time` or a Real variable that is no parameter or constant (`known`) and no
+discrete one of `variables`: an event function of it makes events.
+"""
+function readsContinuousTime(e::IR.Expression, variables::IR.VariableSet, known::Set{Symbol})::Bool
+  local hit::Base.RefValue{Bool} = Ref(false)
+  IR.mapExpTopDown(e) do x::IR.Expression
+    IR.isBuiltinCall(x, :pre) && return (x, false)
+    if x isa IR.CREF && isRealType(x.ty) && !(x.cref.name in known)
+      (haskey(variables, x.cref.name) && variables[x.cref.name].kind isa IR.DISCRETE) || (hit[] = true)
+    end
+    return (x, !hit[])
+  end
+  return hit[]
+end
+
+"""
     legacyName(cref)
 
 The previous backend's name of a reference (BDAE's `string` of a DAE reference): the parts
@@ -264,14 +278,9 @@ function legacyName(cref::IR.ComponentRef)::String
   local io = IOBuffer()
   for (i, p) in enumerate(cref.parts)
     i > 1 && print(io, '_')
-    #= a part of rolled components by a literal index: the member (`cylinder3`), as `flatName` =#
-    if p.ty isa IR.T_COMPONENTS && length(p.subscripts) == 1 && p.subscripts[1] isa IR.INDEX && (p.subscripts[1]::IR.INDEX).exp isa IR.INTEGER
-      print(io, p.ty.members[((p.subscripts[1]::IR.INDEX).exp::IR.INTEGER).value])
-      continue
-    end
-    #= a slice's literal subscripts in its name (`T[1,2]`, splitInner!) each in brackets of its own, as subscripts are =#
-    local name::String = String(p.name)
-    print(io, occursin('[', name) ? replace(name, r"\[([0-9]+(?:,[0-9]+)+)\]" => (m::AbstractString) -> "[" * join(split(m[2:end - 1], ','), "][") * "]") : name)
+    print(io, p.name)
+    #= a slice's inner subscripts (`T[1,2]`, `T_SLICE`, splitInner!) each in brackets of its own, as subscripts are =#
+    p.ty isa IR.T_SLICE && foreach(k::Int -> print(io, '[', k, ']'), (p.ty::IR.T_SLICE).inner)
     for sub in p.subscripts
       print(io, '[')
       printLegacySubscript(io, sub)

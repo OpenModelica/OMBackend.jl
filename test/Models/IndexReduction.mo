@@ -873,6 +873,29 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     total = a.phi1 + b.phi1 + c.phi1;
   end SeparatePairs;
 
+  model DampedPair "a RigidPair damped above w1 = 0.5, by an if-expression the passes lift to an auxiliary (ifEq_tmp<k>)"
+    parameter Real k = 1;
+    Real phi1(start = 0, fixed = true);
+    Real w1(start = 0, fixed = true);
+    Real phi2;
+    Real w2;
+    Real tau;
+    Real damping;
+  equation
+    der(phi1) = w1;
+    der(phi2) = w2;
+    der(w1) = k * sin(time) - tau - damping;
+    2 * der(w2) = tau;
+    phi1 = phi2;
+    damping = 2 * (if w1 > 0.5 then 0.1 * (w1 - 0.5) else 0);
+  end DampedPair;
+
+  model SeparateDampedPairs "three DampedPairs declared one by one: their auxiliaries rolled into one array with them"
+    DampedPair a(k = 1);
+    DampedPair b(k = 2);
+    DampedPair c(k = 3);
+  end SeparateDampedPairs;
+
   model TimedPair "a RigidPair that records when phi1 passes 0.01 (k (t - sin(t)) / 3 = 0.01) and counts it"
     extends RigidPair;
     discrete Real tCross(start = -1, fixed = true);

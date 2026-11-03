@@ -42,9 +42,9 @@
    without the derivatives. Code generation solves such an equation for a derivative,
    dividing by cBS: 0/0 at the start of the Spice3 examples.
 
-   The function bodies are interpreted abstractly: each scalar variable is a constant or
-   UNKNOWN, keyed by its flattened name (`<record>_<field>`, array elements `name[i]`, `name[i,j]`
-   for constant subscripts; a whole array or record is read as UNKNOWN). Arithmetic of
+   The function bodies are interpreted abstractly: each scalar is a constant or UNKNOWN, by its
+   reference (`Env`: a variable's, an array element's by constant subscripts, a record's
+   field's; a whole array or record is read as UNKNOWN). Arithmetic of
    constants folds (a non-finite result is UNKNOWN); a scalar product with an exact 0 is 0;
    `false and x` is false, `true or x` true. An if whose condition is UNKNOWN runs both branches
    and keeps a variable constant only where both give the identical value; a branch under a
@@ -56,6 +56,15 @@
 
    Abstract values are `Bool`, `Int`, `Float64`, `UNKNOWN`, and vectors of them (an array, a
    function's outputs): the interpretation's methods take them untyped. =#
+
+"""
+    Env
+
+An interpretation's environment: the abstract value of each scalar by its reference (equal by its flat name): a
+variable's, an array element's (its literal subscripts on its last part, `IR.elementCref`), a record's field's
+(`fieldCref`); a model variable's by its IR reference, a function's variable's by its own (`FunctionVariable.cref`).
+"""
+const Env = Dict{IR.ComponentRef, Any}
 
 "The abstract value of what the interpretation does not know."
 struct UnknownValue end
@@ -111,10 +120,8 @@ recordFields(t::SType)::Union{Nothing, Vector{String}} = t isa TYPE_COMPLEX && t
 "The number of elements of an array type of known dimensions; `nothing` for another type."
 arrayLength(t::SType)::Union{Nothing, Int} = (t isa TYPE_ARRAY && all(d -> d >= 0, t.dims)) ? prod(t.dims; init = 1) : nothing
 
-subscriptSuffix(ix::Vector{Int})::String = isempty(ix) ? "" : "[" * join(ix, ",") * "]"
-
 "The values of subscripts as integers; `nothing` if one is not a constant."
-function subscriptValues(subs::Vector{Exp}, env::Dict{String, Any}, ctx::Interpretation)::Union{Nothing, Vector{Int}}
+function subscriptValues(subs::Vector{Exp}, env::Env, ctx::Interpretation)::Union{Nothing, Vector{Int}}
   local out = Int[]
   for s in subs
     local v = interpret(s, env, ctx)
@@ -124,8 +131,15 @@ function subscriptValues(subs::Vector{Exp}, env::Dict{String, Any}, ctx::Interpr
   return out
 end
 
-"A reference's key: its name, its literal subscripts as `[i,j]`."
-referenceKey(c::SimCref)::String = String(c.sym) * subscriptSuffix(c.subs)
+"The value of the scalar reference `ref` in `env`; UNKNOWN for none (a reference without an IR reference: a test's)."
+valueOf(env::Env, ref::Union{Nothing, IR.ComponentRef}) = ref === nothing ? UNKNOWN : get(env, ref, UNKNOWN)
+
+"The field `f` of the record reference `ref`; `nothing` without a reference."
+fieldOf(ref::Union{Nothing, IR.ComponentRef}, f::String)::Union{Nothing, IR.ComponentRef} = ref === nothing ? nothing : fieldCref(ref, f)
+
+"The element `ix` (literal indices) of the array reference `ref`; `nothing` without a reference."
+elementOf(ref::Union{Nothing, IR.ComponentRef}, ix::Vector{Int})::Union{Nothing, IR.ComponentRef} =
+  ref === nothing ? nothing : IR.elementCref(ref, ix)
 
 #= ==================================================================================== =#
 #= Expressions                                                                          =#
@@ -190,14 +204,14 @@ end
 The abstract value of the scalar expression `e` in `env` (a whole array or record, and
 anything not followed, is UNKNOWN).
 """
-function interpret(e::Exp, env::Dict{String, Any}, ctx::Interpretation)
+function interpret(e::Exp, env::Env, ctx::Interpretation)
   step!(ctx)
   e isa RCONST && return e.value
   e isa ICONST && return e.value
   e isa BCONST && return e.value
   if e isa EXP_CREF
     (e.ty isa TYPE_ARRAY || recordFields(e.ty) !== nothing) && return UNKNOWN
-    return get(env, referenceKey(e.cref), UNKNOWN)
+    return valueOf(env, e.cref.ref)
   elseif e isa BINARY
     return binaryValue(e.op, interpret(e.exp1, env, ctx), interpret(e.exp2, env, ctx))
   elseif e isa UNARY
@@ -239,11 +253,11 @@ function interpret(e::Exp, env::Dict{String, Any}, ctx::Interpretation)
     local ix = subscriptValues(e.subs, env, ctx)
     ix === nothing && return UNKNOWN
     if e.exp isa EXP_CREF
-      local k = referenceKey(e.exp.cref)
+      local ref::Union{Nothing, IR.ComponentRef} = e.exp.cref.ref
       local fields = recordFields(e.exp.ty)
-      fields === nothing && return get(env, k * subscriptSuffix(ix), UNKNOWN)
+      fields === nothing && return valueOf(env, elementOf(ref, ix))
       #= a record's field read by position =#
-      return (length(ix) == 1 && 1 <= ix[1] <= length(fields)) ? get(env, k * "_" * fields[ix[1]], UNKNOWN) : UNKNOWN
+      return (length(ix) == 1 && 1 <= ix[1] <= length(fields)) ? valueOf(env, fieldOf(ref, fields[ix[1]])) : UNKNOWN
     elseif e.exp isa CALL && !(e.exp.ty isa TYPE_ARRAY)
       local r = callValue(e.exp, env, ctx)
       return (r isa AbstractVector && length(ix) == 1 && 1 <= ix[1] <= length(r)) ? r[ix[1]] : UNKNOWN
@@ -258,7 +272,7 @@ function interpret(e::Exp, env::Dict{String, Any}, ctx::Interpretation)
 end
 
 "The abstract outputs of a call of a model's function (a vector over its flattened outputs), or a built-in's value; an impure function's are UNKNOWN."
-function callValue(e::CALL, env::Dict{String, Any}, ctx::Interpretation)
+function callValue(e::CALL, env::Env, ctx::Interpretation)
   e.kind === CALL_BUILTIN && return builtinValue(e.name, Any[interpret(a, env, ctx) for a in e.args])
   local f = get(ctx.functions, String(e.name), nothing)
   f === nothing && return UNKNOWN
@@ -275,14 +289,13 @@ The values of a call's argument, as the function's inputs are flattened: a recor
 fields (nested records recursively, arrays as vectors), a record literal's or constructor's
 values, a record-valued function's outputs, an array as a vector, else the scalar value.
 """
-function argumentValues!(out::Vector{Any}, e::Exp, env::Dict{String, Any}, ctx::Interpretation)::Vector{Any}
+function argumentValues!(out::Vector{Any}, e::Exp, env::Env, ctx::Interpretation)::Vector{Any}
   if e isa EXP_CREF && recordFields(e.ty) !== nothing
-    recordFieldValues!(out, referenceKey(e.cref), e.ty::TYPE_COMPLEX, env)
+    recordFieldValues!(out, e.cref.ref, e.ty::TYPE_COMPLEX, env)
   elseif e isa EXP_CREF && e.ty isa TYPE_ARRAY
     local n = arrayLength(e.ty)
     n === nothing && throw(InterpretationBail())
-    local k = referenceKey(e.cref)
-    push!(out, Any[get(env, k * "[" * string(i) * "]", UNKNOWN) for i in 1:n])
+    push!(out, Any[valueOf(env, elementOf(e.cref.ref, Int[i])) for i in 1:n])
   elseif e isa RECORD
     foreach(x -> argumentValues!(out, x, env, ctx), e.exps)
   elseif e isa CALL && recordFields(e.ty) !== nothing
@@ -302,14 +315,15 @@ function argumentValues!(out::Vector{Any}, e::Exp, env::Dict{String, Any}, ctx::
   return out
 end
 
-function recordFieldValues!(out::Vector{Any}, k::String, t::TYPE_COMPLEX, env::Dict{String, Any})::Vector{Any}
+"The values of the fields of the record reference `ref` of type `t`, as the function's inputs are flattened (nested records recursively, arrays as vectors)."
+function recordFieldValues!(out::Vector{Any}, ref::Union{Nothing, IR.ComponentRef}, t::TYPE_COMPLEX, env::Env)::Vector{Any}
   for (name, ft) in zip(t.fieldNames, t.fieldTypes)
-    local fk = k * "_" * name
+    local field::Union{Nothing, IR.ComponentRef} = fieldOf(ref, name)
     if recordFields(ft) !== nothing
-      recordFieldValues!(out, fk, ft::TYPE_COMPLEX, env)
+      recordFieldValues!(out, field, ft::TYPE_COMPLEX, env)
     else
       local n = arrayLength(ft)
-      push!(out, n === nothing ? get(env, fk, UNKNOWN) : Any[get(env, fk * "[" * string(i) * "]", UNKNOWN) for i in 1:n])
+      push!(out, n === nothing ? valueOf(env, field) : Any[valueOf(env, elementOf(field, Int[i])) for i in 1:n])
     end
   end
   return out
@@ -332,7 +346,7 @@ function functionValues(f::MODELICA_FUNCTION, args::Vector{Any}, ctx::Interpreta
   hit === missing || return hit === nothing ? unknown : hit
   ctx.depth >= MAX_CALL_DEPTH && return unknown
   ctx.memo[key] = nothing
-  local env = Dict{String, Any}()
+  local env = Env()
   local result = unknown
   ctx.depth += 1
   try
@@ -340,31 +354,31 @@ function functionValues(f::MODELICA_FUNCTION, args::Vector{Any}, ctx::Interpreta
     for (v, a) in zip(f.inputs, args)
       if isArrayVariable(v)
         a isa AbstractVector || throw(InterpretationBail())
-        foreach(((i, x),) -> env[v.name * "[" * string(i) * "]"] = x, enumerate(a))
+        foreach(((i, x),) -> env[IR.elementCref(v.cref, Int[i])] = x, enumerate(a))
       else
         a isa AbstractVector && throw(InterpretationBail())
-        env[v.name] = a
+        env[v.cref] = a
       end
     end
     #= as the generated code: an output starts at its default, else at 0.0 / 0 / false =#
     for v in f.outputs
       isArrayVariable(v) && continue
       if v.default !== nothing
-        env[v.name] = interpret(v.default, env, ctx)
+        env[v.cref] = interpret(v.default, env, ctx)
       elseif v.ty isa TYPE_REAL
-        env[v.name] = 0.0
+        env[v.cref] = 0.0
       elseif v.ty isa TYPE_INTEGER
-        env[v.name] = 0
+        env[v.cref] = 0
       elseif v.ty isa TYPE_BOOL
-        env[v.name] = false
+        env[v.cref] = false
       end
     end
     for v in f.locals
       (isArrayVariable(v) || v.default === nothing) && continue
-      env[v.name] = interpret(v.default, env, ctx)
+      env[v.cref] = interpret(v.default, env, ctx)
     end
     interpretStatements!(f.statements, env, ctx)
-    result = Any[isArrayVariable(v) ? UNKNOWN : get(env, v.name, UNKNOWN) for v in f.outputs]
+    result = Any[isArrayVariable(v) ? UNKNOWN : get(env, v.cref, UNKNOWN) for v in f.outputs]
   catch err
     #= a bail, or a construct the interpretation does not know (a MethodError of it) =#
     err isa InterpretationBail || _fallback(err, :interpretFunction; expect = MethodError)
@@ -376,50 +390,50 @@ function functionValues(f::MODELICA_FUNCTION, args::Vector{Any}, ctx::Interpreta
   return result
 end
 
-"`env` without the key `k` and its elements and record fields."
-function forget!(env::Dict{String, Any}, k::String)::Dict{String, Any}
-  for kk in collect(keys(env))
-    (kk == k || startswith(kk, k * "[") || startswith(kk, k * "_")) && delete!(env, kk)
+"`env` without the scalars of the reference `ref`: its own, its elements', its record fields' (`IR.crefsOverlap`)."
+function forget!(env::Env, ref::IR.ComponentRef)::Env
+  for k::IR.ComponentRef in collect(keys(env))
+    IR.crefsOverlap(k, ref) && delete!(env, k)
   end
   return env
 end
 
 "Assign the abstract `value` to the target `lhs` (a variable, a record's fields, an array's elements, an element)."
-function assignValue!(lhs::Exp, value, env::Dict{String, Any}, ctx::Interpretation)::Nothing
+function assignValue!(lhs::Exp, value, env::Env, ctx::Interpretation)::Nothing
   lhs isa WILD && return nothing
   if lhs isa EXP_CREF
-    local k = referenceKey(lhs.cref)
+    lhs.cref.ref === nothing && throw(InterpretationBail())
+    local ref::IR.ComponentRef = lhs.cref.ref
     step!(ctx, length(env))
-    forget!(env, k)
+    forget!(env, ref)
     local fields = recordFields(lhs.ty)
     if fields !== nothing
       #= a record: its fields from the value's (flattened, one level) =#
       if value isa AbstractVector && length(value) == length(fields) && !any(x -> x isa AbstractVector, value)
-        foreach(((f, x),) -> env[k * "_" * f] = x, zip(fields, value))
+        foreach(((f, x),) -> env[fieldCref(ref, f)] = x, zip(fields, value))
       end
     elseif lhs.ty isa TYPE_ARRAY
-      value isa AbstractVector && foreach(((i, x),) -> env[k * "[" * string(i) * "]"] = x, enumerate(value))
+      value isa AbstractVector && foreach(((i, x),) -> env[IR.elementCref(ref, Int[i])] = x, enumerate(value))
     elseif !(value isa AbstractVector)
-      env[k] = value
+      env[ref] = value
     end
     return nothing
   elseif lhs isa ASUB && lhs.exp isa EXP_CREF
     local ix = subscriptValues(lhs.subs, env, ctx)
-    ix === nothing && throw(InterpretationBail())
-    local ek = referenceKey(lhs.exp.cref) * subscriptSuffix(ix)
+    (ix === nothing || lhs.exp.cref.ref === nothing) && throw(InterpretationBail())
+    local element::IR.ComponentRef = IR.elementCref(lhs.exp.cref.ref, ix)
     step!(ctx, length(env))
-    forget!(env, ek)
-    value isa AbstractVector || (env[ek] = value)
+    forget!(env, element)
+    value isa AbstractVector || (env[element] = value)
     return nothing
   end
   throw(InterpretationBail())
 end
 
 "The value a record-typed right-hand side assigns: its fields'."
-function recordValue(rhs::Exp, fields::Vector{String}, env::Dict{String, Any}, ctx::Interpretation)
+function recordValue(rhs::Exp, fields::Vector{String}, env::Env, ctx::Interpretation)
   if rhs isa EXP_CREF
-    local k = referenceKey(rhs.cref)
-    return Any[get(env, k * "_" * f, UNKNOWN) for f in fields]
+    return Any[valueOf(env, fieldOf(rhs.cref.ref, f)) for f in fields]
   elseif rhs isa CALL
     return haskey(ctx.functions, String(rhs.name)) ? callValue(rhs, env, ctx) : Any[interpret(x, env, ctx) for x in rhs.args]
   elseif rhs isa RECORD
@@ -436,7 +450,7 @@ function recordValue(rhs::Exp, fields::Vector{String}, env::Dict{String, Any}, c
 end
 
 "`env` as the join of two branches' environments: a variable keeps a value both give identically."
-function joinBranches!(env::Dict{String, Any}, a::Dict{String, Any}, b::Dict{String, Any})::Dict{String, Any}
+function joinBranches!(env::Env, a::Env, b::Env)::Env
   empty!(env)
   for (k, va) in a
     sameValue(va, get(b, k, UNKNOWN)) && (env[k] = va)
@@ -445,7 +459,7 @@ function joinBranches!(env::Dict{String, Any}, a::Dict{String, Any}, b::Dict{Str
 end
 
 "Interpret the branches of an if from the `k`th on, then its else-statements."
-function interpretBranches!(s::IF, k::Int, env::Dict{String, Any}, ctx::Interpretation)::Nothing
+function interpretBranches!(s::IF, k::Int, env::Env, ctx::Interpretation)::Nothing
   k > length(s.branches) && return interpretStatements!(s.elseBody, env, ctx)
   local b = s.branches[k]
   local c = truthOf(interpret(b.condition, env, ctx))
@@ -470,7 +484,7 @@ loops of a constant range, asserts that hold on the constants (one of level warn
 fails is reported, once); bail out of anything else (a while, a return, a call for its side
 effects, terminate, an assert not known to hold).
 """
-function interpretStatements!(body::Vector{Statement}, env::Dict{String, Any}, ctx::Interpretation)::Nothing
+function interpretStatements!(body::Vector{Statement}, env::Env, ctx::Interpretation)::Nothing
   for s in body
     step!(ctx)
     if s isa ASSIGN && s.left isa TUPLE
@@ -498,11 +512,15 @@ function interpretStatements!(body::Vector{Statement}, env::Dict{String, Any}, c
       r isa RANGE || throw(InterpretationBail())
       local (a, st, b) = (interpret(r.start, env, ctx), r.step === nothing ? 1 : interpret(r.step, env, ctx), interpret(r.stop, env, ctx))
       (a isa Integer && st isa Integer && b isa Integer && st != 0) || throw(InterpretationBail())
+      #= the iterator is the loop's own: a variable of its name is hidden in the body, not changed =#
+      local iterator::IR.ComponentRef = IR.ComponentRef(s.iterator.name)
+      local hidden = get(env, iterator, missing)
       for i in a:st:b
         step!(ctx)
-        env[s.iterator.name] = i
+        env[iterator] = i
         interpretStatements!(s.body, env, ctx)
       end
+      hidden === missing ? delete!(env, iterator) : (env[iterator] = hidden)
     elseif s isa ASSERT
       local holds = try
         truthOf(interpret(s.condition, env, ctx))
@@ -537,7 +555,7 @@ end
 "The abstract outputs of a call from its arguments (literals known, anything else UNKNOWN), with a step budget of its own; `nothing` for an impure call."
 function callOutputs(call::CALL, f::MODELICA_FUNCTION, ctx::Interpretation)::Union{Nothing, Vector{Any}}
   call.kind === CALL_IMPURE_FUNCTION && return nothing
-  local env = Dict{String, Any}()
+  local env = Env()
   local args = Any[]
   (ctx.steps, ctx.depth) = (0, 0)
   try
@@ -614,7 +632,7 @@ end
 #= ==================================================================================== =#
 
 "The memo of `initialAlgorithmEnvironment`: the simulation code it was computed for (kept, compared by identity), its environment and interpretation."
-const INITIAL_ALGORITHM_ENVIRONMENT = Ref{Union{Nothing, Tuple{SIM_CODE, Dict{String, Any}, Interpretation}}}(nothing)
+const INITIAL_ALGORITHM_ENVIRONMENT = Ref{Union{Nothing, Tuple{SIM_CODE, Env, Interpretation}}}(nothing)
 
 """
     initialAlgorithmEnvironment(simCode)
@@ -626,15 +644,15 @@ assigns nothing. Memoized for the simulation code being generated (by identity: 
 it, so its identity is not a later one's, as an `objectid` would be after the GC reused its
 fields' memory).
 """
-function initialAlgorithmEnvironment(simCode::SIM_CODE)::Tuple{Dict{String, Any}, Interpretation}
+function initialAlgorithmEnvironment(simCode::SIM_CODE)::Tuple{Env, Interpretation}
   local cached = INITIAL_ALGORITHM_ENVIRONMENT[]
   cached !== nothing && cached[1] === simCode && return (cached[2], cached[3])
   local ctx = Interpretation(simCode)
-  local env = Dict{String, Any}("time" => 0.0)
-  for (k, (_, v)) in simCode.stringToSimVarHT
-    (v.varKind isa PARAMETER && v.varKind.bindExp !== nothing) || continue
+  local env = Env(IR.ComponentRef(:time) => 0.0)
+  for (_, (_, v)) in simCode.stringToSimVarHT
+    (hasBindingExp(v) && v.ref !== nothing) || continue
     local x = tryEvalNumeric(v.varKind.bindExp, simCode)
-    x === nothing || (env[k] = x)
+    x === nothing || (env[v.ref] = x)
   end
   for a in simCode.initialAlgorithms
     local trial = copy(env)

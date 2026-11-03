@@ -53,7 +53,6 @@ const SC = SimCode
 
 import ..@BACKEND_LOGGING
 import ..unsupported, ..UnsupportedLowering
-import ..COMPONENT_SEPARATOR
 
 import OMFrontend
 import Symbolics

@@ -50,14 +50,15 @@ Conventions:
 - A variable's name is its flat Modelica name (`:x`, `Symbol("a.b")`,
   `Symbol("r[2].v")` for an element of a scalarized array of records). A component reference
   is that name and the subscripts selecting elements of an array variable (`x[i]`).
-- The derivative of a state `x` is a variable of its own, `\$DER.x` (`derivativeName`), of
+- The derivative of a state `x` is a variable of its own, `\$DER.x` (`derivativeCref`), of
   kind `STATE_DER`; `der(x)` in an equation is a reference to it. A state and its derivative
   name each other (`STATE.derivative`, `STATE_DER.state`). With the derivatives as unknowns
   and the states as knowns, a partition's structure (adjacency, matching, strong components)
   is that of NB, so index reduction (Pantelides, dummy derivatives) can work on it: it adds
   derivative variables and differentiated equations, links an equation to its derivative
   (`EquationAttributes.derivative`) and marks dummy derivatives and states (`DUMMY_DER`,
-  `DUMMY_STATE`).
+  `DUMMY_STATE`). A selected state's derivative variable that its link to the state's
+  derivative made an algebraic unknown is `ALGEBRAIC_DER`.
 - Expressions, types and component references are immutable values with structural equality
   (`==`, `hash`). Variables and equations are mutable entities with identity (NB's
   pointers): a pass changes a variable's kind or an equation's attributes in place, and every
@@ -108,12 +109,47 @@ abstract type VariableKind <: Node end
 "How a partition is evaluated: continuously, or at the ticks of a clock."
 abstract type Association <: Node end
 
-"Fields compared one by one: the IR values are trees of vectors, strings and symbols."
-function Base.:(==)(a::T, b::T)::Bool where {T <: Node}
-  for f in fieldnames(T)
-    getfield(a, f) == getfield(b, f) || return false
+"""
+    fieldComparison(T, compare) -> Union{Bool, Expr}
+
+The body of a field-by-field comparison of two values `a`, `b` of the node type `T`:
+`compare(a.f₁, b.f₁) && compare(a.f₂, b.f₂) && ...`, `true` for a type without fields. For the
+`@generated` `==` and `isequal` of OMJLIR's and SimCode's nodes (defined before them: a generator
+runs in the world of its definition).
+"""
+function fieldComparison(T::DataType, compare::Function)::Union{Bool, Expr}
+  local ex::Union{Bool, Expr} = true
+  for f in reverse(fieldnames(T))
+    ex = :($compare(getfield(a, $(QuoteNode(f))), getfield(b, $(QuoteNode(f)))) && $ex)
   end
-  return true
+  return ex
+end
+
+"""
+    fieldHashing(T, hashField) -> Expr
+
+The body of the hash of a value `a` of the node type `T` with the seed `h`: the type's name hashed,
+then each field by `hashField` in field order, as a loop over `fieldnames(T)` would.
+"""
+function fieldHashing(T::DataType, hashField::Function)::Expr
+  local ex::Expr = :(hash($(QuoteNode(nameof(T))), h))
+  for f in fieldnames(T)
+    ex = :($hashField(getfield(a, $(QuoteNode(f))), $ex))
+  end
+  return ex
+end
+
+"A value's field hashed: an enumeration value by its integer (Base's hash has its type's), any other value by its own."
+fieldHash(x::Enum, h::UInt)::UInt = hash(Integer(x), h)
+fieldHash(x::Any, h::UInt)::UInt = hash(x, h)
+
+"""
+Fields compared one by one: the IR values are trees of vectors, strings and symbols. Unrolled per
+type (`fieldComparison`): a field read by a name known only at run time is a dynamic `getfield`
+that boxes an `Int`, `Float64` or enumeration field.
+"""
+@generated function Base.:(==)(a::T, b::T)::Bool where {T <: Node}
+  return fieldComparison(T, ==)
 end
 Base.:(==)(::Node, ::Node)::Bool = false
 
@@ -122,20 +158,19 @@ Fields compared one by one with `isequal`, as `hash` hashes them: the identity o
 `Set` key (`REAL(0.0)` and `REAL(-0.0)` apart, `REAL(NaN)` equal to itself; `==` has them the
 other way round, as numbers).
 """
-function Base.isequal(a::T, b::T)::Bool where {T <: Node}
-  for f in fieldnames(T)
-    isequal(getfield(a, f), getfield(b, f)) || return false
-  end
-  return true
+@generated function Base.isequal(a::T, b::T)::Bool where {T <: Node}
+  return fieldComparison(T, isequal)
 end
 Base.isequal(::Node, ::Node)::Bool = false
 
-function Base.hash(a::T, h::UInt)::UInt where {T <: Node}
-  local r = hash(T, h)
-  for f in fieldnames(T)
-    r = hash(getfield(a, f), r)
-  end
-  return r
+"""
+Fields hashed one by one after the type's name: the same in every build. A type's own hash, and
+with it an enumeration value's, Julia derives from its module's build id, new with every
+precompile (the code generators' names and the iteration order of a `Dict` or `Set` of values
+changed with it). Unrolled per type (`fieldHashing`).
+"""
+@generated function Base.hash(a::T, h::UInt)::UInt where {T <: Node}
+  return fieldHashing(T, fieldHash)
 end
 
 #= ==================================================================================== =#
@@ -215,12 +250,66 @@ end
     T_COMPONENTS(cls, members)
 
 The type of a part that stands for separately declared components of the class `cls` (EngineV6's `cylinder1`, ...,
-`cylinder6`) rolled into an array of `length(members)` (`IndexReduction.rollComponents!`): the part subscripted by a
-literal `k` is named as the member `members[k]` (`flatName`), so an element keeps its flat name (`cylinder3.x`).
+`cylinder6`) rolled into an array of `length(members)` (`IndexReduction.rollComponents!`). The part subscripted by a
+literal `k` is the member `members[k]` (`T_MEMBER`), so an element keeps its flat name (`cylinder3.x`).
 """
 struct T_COMPONENTS <: ModelicaType
   cls::Symbol
   members::Vector{Symbol}
+end
+
+"""
+    T_MEMBER(group, components, index)
+
+The type of a part that names one member of rolled components (`cylinder3`): the element `index` of the group part
+`group` of type `components` (`T_COMPONENTS`). The group part subscripted by a literal index is this part (`CrefPart`):
+a name in a flat name; the element of its group in an array's view (`partSubscripts`, `unsubscriptedPart`).
+"""
+struct T_MEMBER <: ModelicaType
+  group::Symbol
+  components::T_COMPONENTS
+  index::Int
+end
+
+"""
+    T_DER()
+
+The type of the first part of a derivative variable's reference, `\$DER` (`derivativeCref`): the variable is the
+derivative of the reference of the parts after it (`operand`). The parts are joined as any (`flatName`), so the name
+is `\$DER.` before the operand's (`\$DER.x`, `\$DER.c[2].T`); a reference into a derivative array has its subscripts
+on its last part (`withLastSubscripts`: `\$DER.c.T[i]` of `der(c[i].T)`).
+"""
+struct T_DER <: ModelicaType end
+
+"""
+    T_STATEDER()
+
+The type of the first part of a selected state's own derivative reference, `\$STATEDER` (`stateDerivativeCref`;
+index reduction's link `\$STATEDER.x = \$DER.x`): the state is the reference of the parts after it (`operand`).
+"""
+struct T_STATEDER <: ModelicaType end
+
+"""
+    T_DERAUX()
+
+The type of the first part of an auxiliary variable for `der(x)` that a lowering introduces (`der.x`,
+`auxiliaryDerivativeCref`): lowerHigherOrderDerivatives' (`der(der(x))` as `der(der.x)` with `der.x = der(x)`), a
+discretized clocked partition's (`der(x)` at its ticks). A variable of its own, not a derivative variable (`\$DER.x`,
+`T_DER`); its identifier in the code is `der_x` (`legacyName`).
+"""
+struct T_DERAUX <: ModelicaType end
+
+"""
+    T_SLICE(inner, of)
+
+The type of a part that names a slice of an array split along its inner dimensions (`IndexReduction.splitInner!`):
+the elements of the array `of` (the part's type before) at the inner subscripts `inner`. The part is named with them
+(`flatName`: `G.f.R.T[2,1]`, as its elements are, `cylinder3.f.R.T[2,1]`); its own subscripts follow them
+(`\$DER.G.f.R.T[2,1][\$c]`).
+"""
+struct T_SLICE <: ModelicaType
+  inner::Vector{Int}
+  of::ModelicaType
 end
 
 "The type of a call to a function with several outputs."
@@ -270,12 +359,21 @@ struct DIM_UNKNOWN <: Dimension end
     CrefPart(name, subscripts, ty)
 
 One part of a component reference: a name, its subscripts (`b[2]` of `a.b[2].c`) and the type
-of the component it names, before the subscripts (`Real[3]` of `b`).
+of the component it names, before the subscripts (`Real[3]` of `b`). A part of rolled components (`T_COMPONENTS`)
+subscripted by one literal index is made the member it names (`cylinder3`, `T_MEMBER`), without subscripts.
 """
 struct CrefPart <: Node
   name::Symbol
   subscripts::Vector{Subscript}
   ty::ModelicaType
+  function CrefPart(name::Symbol, subscripts::Vector{Subscript}, ty::ModelicaType)
+    ty isa T_MEMBER && !isempty(subscripts) && throw(ArgumentError("the member $(name) subscripted"))
+    if ty isa T_COMPONENTS && length(subscripts) == 1
+      local k::Union{Nothing, Int} = literalIndex(subscripts[1])
+      k === nothing || return new(ty.members[k], Subscript[], T_MEMBER(name, ty, k))
+    end
+    return new(name, subscripts, ty)
+  end
 end
 
 """
@@ -290,7 +388,8 @@ variable `x` is the variable subscripted (`variableName`).
 
 Two references are equal when their names are: the parts are for the passes that rewrite
 subscripts (an algorithm's loop over a scalarized array reads `x[i]`, then `x[2]`).
-`ComponentRef(name)` is a reference of one part, for the names the backend makes (`\$DER.x`).
+`ComponentRef(name)` is a reference of one part (a name without structure: an auxiliary variable the backend makes);
+a reference with structure is built from its parts (`derivativeCref`, `withField`, `appendSubscripts`).
 """
 struct ComponentRef <: Node
   parts::Vector{CrefPart}
@@ -304,17 +403,56 @@ Base.:(==)(a::ComponentRef, b::ComponentRef)::Bool = a.name === b.name
 Base.isequal(a::ComponentRef, b::ComponentRef)::Bool = a.name === b.name
 Base.hash(c::ComponentRef, h::UInt)::UInt = hash(c.name, h)
 
-"The subscripts of the last part: those of an array variable's reference."
-subscripts(c::ComponentRef)::Vector{Subscript} = c.parts[end].subscripts
+"Whether the part names a member of rolled components (`T_MEMBER`)."
+isMember(p::CrefPart)::Bool = isMember(p.ty)
+isMember(::T_MEMBER)::Bool = true
+isMember(::ModelicaType)::Bool = false
 
-"Whether `c` has a subscript in any part."
-hasSubscripts(c::ComponentRef)::Bool = any(p -> !isempty(p.subscripts), c.parts)
+"Whether a part's type is of rolled components: a group's (`T_COMPONENTS`) or a member's (`T_MEMBER`)."
+isRolled(::Union{T_COMPONENTS, T_MEMBER})::Bool = true
+isRolled(::ModelicaType)::Bool = false
+
+"""
+    partSubscripts(p) -> Vector{Subscript}
+
+The subscripts of the part `p` in its array's view: its own; a member's (`T_MEMBER`) its index in its group
+(`[3]` of `cylinder3`). The references taken apart into an array and the element's subscripts read these
+(`subscripts`, `hasSubscripts`, `appendSubscripts`).
+"""
+partSubscripts(p::CrefPart)::Vector{Subscript} = partSubscripts(p, p.ty)
+partSubscripts(p::CrefPart, ::ModelicaType)::Vector{Subscript} = p.subscripts
+partSubscripts(::CrefPart, t::T_MEMBER)::Vector{Subscript} = Subscript[INDEX(INTEGER(t.index))]
+
+"Whether the part is subscripted in its array's view (`partSubscripts`): a member is, by its index in its group."
+isSubscripted(p::CrefPart)::Bool = !isempty(p.subscripts) || isMember(p)
+
+"The name of the array the part `p` is of in its array's view: its own; a member's (`T_MEMBER`) its group's."
+arrayName(p::CrefPart)::Symbol = arrayName(p, p.ty)
+arrayName(p::CrefPart, ::ModelicaType)::Symbol = p.name
+arrayName(::CrefPart, t::T_MEMBER)::Symbol = t.group
+
+"The part `p` without its subscripts: of a member (`T_MEMBER`) its group's part (`cylinder1|...|cylinder6` of `cylinder3`)."
+unsubscriptedPart(p::CrefPart)::CrefPart = unsubscriptedPart(p, p.ty)
+unsubscriptedPart(p::CrefPart, ::ModelicaType)::CrefPart = CrefPart(p.name, Subscript[], p.ty)
+unsubscriptedPart(::CrefPart, t::T_MEMBER)::CrefPart = CrefPart(t.group, Subscript[], t.components)
+
+"The part `p` with `subscripts` in place of its own: of a member (`T_MEMBER`) its group's part subscripted (`unsubscriptedPart`)."
+function withSubscripts(p::CrefPart, subscripts::Vector{Subscript})::CrefPart
+  local base::CrefPart = unsubscriptedPart(p)
+  return CrefPart(base.name, subscripts, base.ty)
+end
+
+"The subscripts of the last part: those of an array variable's reference (`partSubscripts`)."
+subscripts(c::ComponentRef)::Vector{Subscript} = partSubscripts(c.parts[end])
+
+"Whether `c` has a subscript in any part (`isSubscripted`)."
+hasSubscripts(c::ComponentRef)::Bool = any(isSubscripted, c.parts)
 
 "The name of the variable `c` references: its own, or without the last part's subscripts."
 function variableName(c::ComponentRef, isVariable::F)::Symbol where {F}
   isVariable(c.name) && return c.name
-  isempty(c.parts[end].subscripts) && return c.name
-  return flatName(CrefPart[c.parts[1:end - 1]..., CrefPart(c.parts[end].name, Subscript[], c.parts[end].ty)])
+  isSubscripted(c.parts[end]) || return c.name
+  return withoutLastSubscripts(c).name
 end
 
 "Subscript by an index expression: `x[i]`."
@@ -553,7 +691,12 @@ struct SUBSCRIPTED <: Expression
   ty::ModelicaType
 end
 
-"Output `index` of the tuple `exp`."
+"""
+    TUPLE_ELEMENT(exp, index, ty)
+
+Element `index` of the tuple a call `exp` returns: its position in the function's result as generated, a record
+output's fields in place (`Passes.tupleAssignElements`: `(r, q) := f(x)` assigns `r.a`, `r.b`, `q` elements 1, 2, 3).
+"""
 struct TUPLE_ELEMENT <: Expression
   exp::Expression
   index::Int
@@ -727,20 +870,26 @@ of a clock (`EQ_CLOCKED`); `EQ_UNKNOWN` before classification.
 @enum EquationKind EQ_CONTINUOUS EQ_DISCRETE EQ_CLOCKED EQ_UNKNOWN
 
 """
-    EquationAttributes(kind, differentiated, derivative)
+    EquationAttributes(kind, differentiated, derivative, derivativeLink)
 
 `kind`: when the equation is evaluated. `differentiated`: the equation is the time
 derivative of another (made by index reduction). `derivative`: the equation's time
-derivative, once index reduction differentiated it; `nothing` before.
+derivative, once index reduction differentiated it; `nothing` before. `derivativeLink`: the
+equation links a selected state's derivative to the derivative variable the differentiated
+equations read (index reduction's `\$STATEDER.x = \$DER.x`): the state's differential row.
 """
 struct EquationAttributes
   kind::EquationKind
   differentiated::Bool
   derivative::Union{Nothing, Equation}
+  derivativeLink::Bool
 end
 
 "The attributes of an equation before classification."
-const DEFAULT_ATTRIBUTES = EquationAttributes(EQ_UNKNOWN, false, nothing)
+const DEFAULT_ATTRIBUTES = EquationAttributes(EQ_UNKNOWN, false, nothing, false)
+
+"The attributes of a state's derivative link (`derivativeLink`) before classification."
+const DERIVATIVE_LINK_ATTRIBUTES = EquationAttributes(EQ_UNKNOWN, false, nothing, true)
 
 "`lhs = rhs` of scalar type `ty`."
 mutable struct SCALAR_EQUATION <: Equation
@@ -869,6 +1018,17 @@ struct STATE_DER <: VariableKind
   state::Symbol
 end
 
+"""
+    ALGEBRAIC_DER(state)
+
+The derivative of `state` as an algebraic unknown: index reduction's derivative variable `\$DER.x` of a selected
+state, which the link `\$STATEDER.x = \$DER.x` (`STATE_DER`, the state's derivative) made algebraic. Algebraic for
+every pass that asks for an algebraic variable.
+"""
+struct ALGEBRAIC_DER <: VariableKind
+  state::Symbol
+end
+
 "A state derivative that index reduction made algebraic: the derivative of `dummyState`."
 struct DUMMY_DER <: VariableKind
   dummyState::Symbol
@@ -896,8 +1056,20 @@ end
 "A variable of type Clock."
 struct CLOCK_VARIABLE <: VariableKind end
 
-"A parameter."
-struct PARAMETER <: VariableKind end
+"""
+    PARAMETER(structural = false)
+
+A parameter; `structural`: the frontend evaluated it for the model's structure (an array size, a folded if-equation's
+condition: its STRUCTURAL_PARAMETER), so the generated code holds its translated value.
+"""
+struct PARAMETER <: VariableKind
+  structural::Bool
+end
+
+PARAMETER() = PARAMETER(false)
+
+"Printed as its constructor call, `PARAMETER()` for one not structural (as before the flag: generated code texts)."
+Base.show(io::IO, p::PARAMETER) = print(io, typeof(p), p.structural ? "(true)" : "()")
 
 "A constant."
 struct CONSTANT <: VariableKind end
@@ -1033,8 +1205,175 @@ isDiscrete(v::Variable)::Bool = v.kind isa DISCRETE || v.kind isa CLOCKED_STATE
 "A variable whose value is not computed from the equations: a parameter or a constant."
 isKnown(v::Variable)::Bool = v.kind isa PARAMETER || v.kind isa CONSTANT
 
-"The name of the derivative variable of the state `state`: `\$DER.state`."
-derivativeName(state::Symbol)::Symbol = Symbol("\$DER.", state)
+"The reference of the derivative variable of the variable `c` names: a part `\$DER` (T_DER) before `c`'s parts."
+derivativeCref(c::ComponentRef)::ComponentRef = withOperator(CrefPart(Symbol("\$DER"), Subscript[], T_DER()), c)
+
+"The reference of a selected state's own derivative (index reduction's link): a part `\$STATEDER` (T_STATEDER) before the state's parts."
+stateDerivativeCref(c::ComponentRef)::ComponentRef = withOperator(CrefPart(Symbol("\$STATEDER"), Subscript[], T_STATEDER()), c)
+
+"The reference of an auxiliary variable for `der(c)` (`der.x`, `T_DERAUX`): a part `der` before `c`'s parts."
+auxiliaryDerivativeCref(c::ComponentRef)::ComponentRef = withOperator(CrefPart(:der, Subscript[], T_DERAUX()), c)
+
+"Whether `c` is a derivative's reference (`\$DER.x`, `\$STATEDER.x`): its first part of type T_DER or T_STATEDER."
+isDerivativeCref(c::ComponentRef)::Bool = c.parts[1].ty isa Union{T_DER, T_STATEDER}
+
+"The reference a derivative's reference is of (`x` of `\$DER.x`, `\$DER.x` of `\$DER.\$DER.x`); `nothing` for another."
+operand(c::ComponentRef)::Union{Nothing, ComponentRef} = isDerivativeCref(c) ? ComponentRef(c.parts[2:end]) : nothing
+
+#= ==================================================================================== =#
+#= References built from references                                                     =#
+#= ==================================================================================== =#
+
+"The operator part `op` (`\$DER`, `\$STATEDER`) before the parts of `c`."
+withOperator(op::CrefPart, c::ComponentRef)::ComponentRef = ComponentRef(CrefPart[op; c.parts])
+
+"The position of the first part of `c` after its derivative parts (2 of `\$DER.x`, 3 of `\$DER.\$DER.x`, 1 of `x`)."
+function operandStart(c::ComponentRef)::Int
+  local k::Int = 1
+  while k < length(c.parts) && c.parts[k].ty isa Union{T_DER, T_STATEDER}
+    k += 1
+  end
+  return k
+end
+
+"`base` under the derivative parts of `like` (`\$DER.b` of `\$DER.a` and `b`; `base` itself if `like` has none)."
+withOperatorsOf(like::ComponentRef, base::ComponentRef)::ComponentRef =
+  ComponentRef(CrefPart[like.parts[1:operandStart(like) - 1]; base.parts])
+
+"""
+`c` with the subscripts of its last part replaced by `subscripts` (`x[2]` of `x[1]`): an element of an array variable
+or of a derivative array (`\$DER.c.T[i]` of `der(c[i].T)`: the subscripts on its last part); a member's on its group's
+part (`unsubscriptedPart`).
+"""
+withLastSubscripts(c::ComponentRef, subscripts::Vector{Subscript})::ComponentRef =
+  ComponentRef(CrefPart[(@view c.parts[1:end - 1]); withSubscripts(c.parts[end], subscripts)])
+
+"`c` with `subscripts` after its last part's own (`x[1]` of `x`, `x[1,2]` of `x[1]`; `partSubscripts`)."
+appendSubscripts(c::ComponentRef, subscripts::Vector{Subscript})::ComponentRef =
+  withLastSubscripts(c, Subscript[partSubscripts(c.parts[end]); subscripts])
+
+"`c` without its last part's subscripts (`a[1].x` of `a[1].x[2]`)."
+withoutLastSubscripts(c::ComponentRef)::ComponentRef = withLastSubscripts(c, Subscript[])
+
+"""
+    crefsOverlap(a, b)
+
+Whether the references `a` and `b` name the same variable or one a part of the other (`buf` and
+`buf[2]`, `r` and `r.x`, a row `m[1]` and its element `m[1,2]`), by their parts: the shorter's are the
+longer's first ones (`samePart`), its last part of the longer's name, one of the two not subscripted or
+its subscripts the other's first ones; of another name a member of the rolled array the other names whole
+(`isMemberOf`: `ifEq_tmp2` and `ifEq_tmp1|ifEq_tmp2`).
+"""
+function crefsOverlap(a::ComponentRef, b::ComponentRef)::Bool
+  local (short::ComponentRef, long::ComponentRef) = length(a.parts) <= length(b.parts) ? (a, b) : (b, a)
+  local n::Int = length(short.parts)
+  for k in 1:n - 1
+    samePart(short.parts[k], long.parts[k]) || return false
+  end
+  local (s::CrefPart, l::CrefPart) = (short.parts[n], long.parts[n])
+  s.name === l.name || return isMemberOf(s, l) || isMemberOf(l, s)
+  (isempty(s.subscripts) || isempty(l.subscripts)) && return true
+  sliceInner(s) == sliceInner(l) || return false
+  return sameSubscripts(s.subscripts, l.subscripts, min(length(s.subscripts), length(l.subscripts)))
+end
+
+"Whether the part `m` is a member (`T_MEMBER`) of the rolled array the part `g` names whole."
+isMemberOf(m::CrefPart, g::CrefPart)::Bool = isMemberOf(m.ty, g)
+isMemberOf(t::T_MEMBER, g::CrefPart)::Bool = t.group === g.name && isempty(g.subscripts)
+isMemberOf(::ModelicaType, ::CrefPart)::Bool = false
+
+"""
+    samePart(p, q)
+
+Whether the parts `p` and `q` print alike in a flat name (`flatName`): the same name, slice and subscripts; literal
+subscripts compared by value, without printing.
+"""
+function samePart(p::CrefPart, q::CrefPart)::Bool
+  p.name === q.name && sliceInner(p) == sliceInner(q) && length(p.subscripts) == length(q.subscripts) || return false
+  return sameSubscripts(p.subscripts, q.subscripts, length(p.subscripts))
+end
+
+"A slice's inner subscripts (`T_SLICE`); `nothing` for another part."
+sliceInner(p::CrefPart)::Union{Nothing, Vector{Int}} = p.ty isa T_SLICE ? (p.ty::T_SLICE).inner : nothing
+
+"Whether the first `n` subscripts of `a` and `b` print alike: literal Integer and Boolean indices by value, another by its printed form."
+function sameSubscripts(a::Vector{Subscript}, b::Vector{Subscript}, n::Int)::Bool
+  for k in 1:n
+    local (s::Subscript, t::Subscript) = (a[k], b[k])
+    local (x::Union{Nothing, Expression}, y::Union{Nothing, Expression}) = (s isa INDEX ? s.exp : nothing, t isa INDEX ? t.exp : nothing)
+    if x isa INTEGER && y isa INTEGER
+      x.value == y.value || return false
+    elseif x isa BOOLEAN && y isa BOOLEAN
+      x.value == y.value || return false
+    else
+      sprint(_printSubscriptInName, s) == sprint(_printSubscriptInName, t) || return false
+    end
+  end
+  return true
+end
+
+"The element `index` (literal Integer indices) of the array reference `c`: `c` with them after its last part's subscripts (`x[1,2]` of `x`)."
+elementCref(c::ComponentRef, index::Vector{Int})::ComponentRef = appendSubscripts(c, Subscript[INDEX(INTEGER(k)) for k in index])
+
+"""
+`c` without the subscripts of its parts (`a.x` of `a[1].x[2]`; a slice's part keeps its inner ones, `T_SLICE`; a
+member's part is its group's, `unsubscriptedPart`).
+"""
+withoutSubscripts(c::ComponentRef)::ComponentRef = ComponentRef(CrefPart[unsubscriptedPart(p) for p in c.parts])
+
+"The field `name`, of type `ty`, of the record reference `c` (`r.f`)."
+withField(c::ComponentRef, name::Symbol, ty::ModelicaType)::ComponentRef = ComponentRef(CrefPart[c.parts; CrefPart(name, Subscript[], ty)])
+
+"""
+    upToFirstSubscripted(c) -> ComponentRef
+
+`c` up to its first part with subscripts, without them (`x` of `x[1,2]`, `c` of `c[2].T`): the array an element is of,
+as the scalarized model names its elements. A rolled component's member (`T_MEMBER`) is a name. `c` itself where
+no part has subscripts.
+"""
+function upToFirstSubscripted(c::ComponentRef)::ComponentRef
+  for (k::Int, p::CrefPart) in enumerate(c.parts)
+    isempty(p.subscripts) && continue
+    return ComponentRef(CrefPart[c.parts[1:k - 1]; CrefPart(p.name, Subscript[], p.ty)])
+  end
+  return c
+end
+
+"The value of a literal Integer subscript (`x[2]`: 2); `nothing` for another."
+function literalIndex(s::Subscript)::Union{Nothing, Int}
+  s isa INDEX || return nothing
+  local e::Expression = s.exp
+  return e isa INTEGER ? e.value : nothing
+end
+
+"Whether `s` is a literal index: an Integer's or an enumeration literal (`x[2]`, `x[E.b]`; `literalIndex` for its Integer value)."
+isLiteralSubscript(s::Subscript)::Bool = s isa INDEX && s.exp isa Union{INTEGER, ENUM_LITERAL}
+
+"The literal Integer indices of `subscripts` (`literalIndex`); `nothing` if one is not."
+function literalIndices(subscripts::Vector{Subscript})::Union{Nothing, Vector{Int}}
+  local out::Vector{Int} = Vector{Int}(undef, length(subscripts))
+  for (k::Int, s::Subscript) in enumerate(subscripts)
+    local i::Union{Nothing, Int} = literalIndex(s)
+    i === nothing && return nothing
+    out[k] = i
+  end
+  return out
+end
+
+"""
+    mapKindNames(f, kind) -> VariableKind
+
+`kind` with each variable it names (a state's derivative, a derivative's state, a dummy's counterpart, a clocked
+state's previous value) as `f` of it; a kind that names none as it is. The passes that split, roll or lower variables
+rename what their kinds name by it.
+"""
+mapKindNames(f::F, k::STATE) where {F} = STATE(k.index, k.derivative === nothing ? nothing : f(k.derivative), k.natural)::VariableKind
+mapKindNames(f::F, k::STATE_DER) where {F} = STATE_DER(f(k.state))::VariableKind
+mapKindNames(f::F, k::ALGEBRAIC_DER) where {F} = ALGEBRAIC_DER(f(k.state))::VariableKind
+mapKindNames(f::F, k::DUMMY_DER) where {F} = DUMMY_DER(f(k.dummyState))::VariableKind
+mapKindNames(f::F, k::DUMMY_STATE) where {F} = DUMMY_STATE(f(k.dummyDerivative))::VariableKind
+mapKindNames(f::F, k::CLOCKED_STATE) where {F} = CLOCKED_STATE(f(k.previous), k.isStartFixed)::VariableKind
+mapKindNames(::F, k::VariableKind) where {F} = k
 
 "The derivative variable of the state `state` in `set`; `nothing` before it is introduced."
 function derivativeOf(set::VariableSet, state::Symbol)::Union{Nothing, Variable}
@@ -1065,19 +1404,33 @@ end
 
 """
     FunctionVariable(name, ty, binding, fieldBindings)
+    FunctionVariable(cref, ty, binding, fieldBindings)
 
 An input, output or protected variable of a function: its name, its type (an array's
 dimensions may be expressions of the inputs, `size(u, 1)`), its binding (an input's or
 output's default, a protected variable's value), and for one of a record type the bindings
 of its fields as the instance has them (its modifiers, the record's defaults; one reading
-another field reads the variable's own: `w.a`).
+another field reads the variable's own: `w.a`); its reference, the name its flat name: a
+declared variable's of one part, a flattened record's field's the record's and the field's
+parts (`r.a`; an array of records' `u.re`, SimCode's lowerFunctions).
 """
 struct FunctionVariable <: Node
   name::Symbol
   ty::ModelicaType
   binding::Union{Nothing, Expression}
   fieldBindings::Vector{Pair{Symbol, Expression}}
+  cref::ComponentRef
+  function FunctionVariable(name::Symbol, ty::ModelicaType, binding::Union{Nothing, Expression},
+                            fieldBindings::Vector{Pair{Symbol, Expression}}, cref::ComponentRef)
+    name === cref.name || error("FunctionVariable $(name): its reference names $(cref.name)")
+    return new(name, ty, binding, fieldBindings, cref)
+  end
 end
+
+FunctionVariable(name::Symbol, ty::ModelicaType, binding::Union{Nothing, Expression}, fieldBindings::Vector{Pair{Symbol, Expression}}) =
+  FunctionVariable(name, ty, binding, fieldBindings, ComponentRef(name, ty))
+FunctionVariable(cref::ComponentRef, ty::ModelicaType, binding::Union{Nothing, Expression}, fieldBindings::Vector{Pair{Symbol, Expression}}) =
+  FunctionVariable(cref.name, ty, binding, fieldBindings, cref)
 
 """
     FunctionDerivative(derivative, order, excludedInputs)
@@ -1297,11 +1650,14 @@ end
 "The element type of an array type; a scalar type itself."
 elementType(ty::T_ARRAY)::ModelicaType = ty.elementType
 elementType(ty::T_COMPONENTS)::ModelicaType = T_CLASS(ty.cls)
+elementType(ty::T_SLICE)::ModelicaType = elementType(ty.of)
 elementType(ty::ModelicaType)::ModelicaType = ty
 
 "The dimensions of an array type; none for a scalar type."
 dimensions(ty::T_ARRAY)::Vector{Dimension} = ty.dimensions
 dimensions(ty::T_COMPONENTS)::Vector{Dimension} = Dimension[DIM_SIZE(length(ty.members))]
+"A slice's: the dimensions of the array it is of without the inner ones its subscripts fix (`T_SLICE`)."
+dimensions(ty::T_SLICE)::Vector{Dimension} = dimensions(ty.of)[1:end - length(ty.inner)]
 dimensions(::ModelicaType)::Vector{Dimension} = Dimension[]
 
 isArray(ty::ModelicaType)::Bool = ty isa T_ARRAY
@@ -1488,6 +1844,59 @@ function crefsOf(e::Expression)::Vector{ComponentRef}
   return out
 end
 
+"""
+    referenceProblems(model) -> Vector{Symbol}
+
+The references of `model` (its variables', those its equations read, an algorithm's outputs, a `reinit`'s state, a
+recompilation's components) a part of which carries structure in its name: a `.` or `[` outside a quoted identifier
+(`'a.b'`). A reference is its parts and its flat name is derived from them (`flatName`), so no part may hide others or
+subscripts; the passes then never take a name apart.
+"""
+function referenceProblems(model::Model)::Vector{Symbol}
+  local out::Vector{Symbol} = Symbol[]
+  local refs::Vector{ComponentRef} = ComponentRef[v.cref for v in model.variables]
+  for p in Iterators.flatten((model.continuous, model.clocked)), eq in Iterators.flatten((p.equations, p.initialEquations))
+    foreachExp(x::Expression -> (x isa CREF && push!(refs, x.cref); nothing), eq)
+    eq isa ALGORITHM && (append!(refs, eq.outputs); statementReferences!(refs, eq.statements))
+    eq isa WHEN_EQUATION && foreach(b::WhenBranch -> statementReferences!(refs, b.body), eq.branches)
+  end
+  for c in refs
+    (structureInName(c) && !(c.name in out)) && push!(out, c.name)
+  end
+  return out
+end
+
+"Whether a part of `c` carries structure in its name: a `.` or `[` outside a quoted identifier (`referenceProblems`)."
+function structureInName(c::ComponentRef)::Bool
+  for p in c.parts
+    local name::String = String(p.name)
+    (startswith(name, '\'') && endswith(name, '\'')) && continue
+    (occursin('.', name) || occursin('[', name)) && return true
+  end
+  return false
+end
+
+"The references the statements `body` hold outside their expressions (a `reinit`'s state, a recompilation's components), nested bodies' too, pushed onto `out`."
+function statementReferences!(out::Vector{ComponentRef}, body::Vector{Statement})::Vector{ComponentRef}
+  for s in body
+    if s isa REINIT
+      push!(out, s.state)
+    elseif s isa RECOMPILATION
+      push!(out, s.component)
+    elseif s isa AGENTIC_RECOMPILATION
+      append!(out, s.components)
+    elseif s isa IF_STATEMENT
+      foreach(b::StatementBranch -> statementReferences!(out, b.body), s.branches)
+      statementReferences!(out, s.elseBody)
+    elseif s isa WHEN_STATEMENT
+      foreach(b::WhenBranch -> statementReferences!(out, b.body), s.branches)
+    elseif s isa Union{FOR_STATEMENT, WHILE_STATEMENT}
+      statementReferences!(out, s.body)
+    end
+  end
+  return out
+end
+
 "Whether `e` is a call of the built-in `name` (`:der`, `:pre`, ...)."
 isBuiltinCall(e::Expression, name::Symbol)::Bool =
   e isa CALL && e.name === name && e.attributes.builtin
@@ -1536,6 +1945,11 @@ _print(io::IO, f::Field) = (_print(io, f.ty); print(io, " ", f.name))
 _print(io::IO, t::T_RECORD) = print(io, t.name)
 _print(io::IO, t::Union{T_EXTERNAL_OBJECT, T_CLASS}) = print(io, t.name)
 _print(io::IO, t::T_COMPONENTS) = print(io, t.cls, "[", length(t.members), "]")
+_print(io::IO, t::T_MEMBER) = print(io, t.components.cls)
+_print(io::IO, ::T_DER) = print(io, "der")
+_print(io::IO, ::T_STATEDER) = print(io, "stateDer")
+_print(io::IO, ::T_DERAUX) = print(io, "derAux")
+_print(io::IO, t::T_SLICE) = (_print(io, t.of); print(io, "[", join(t.inner, ","), "]"))
 _print(io::IO, t::T_TUPLE) = (print(io, "("); _printJoined(io, t.types); print(io, ")"))
 _print(io::IO, t::T_FUNCTION) = print(io, "function ", t.name)
 _print(io::IO, ::T_NORETCALL) = print(io, "()")
@@ -1558,19 +1972,15 @@ _print(io::IO, p::CrefPart) = print(io, flatName(CrefPart[p]))
 
 The flat name of a reference's parts: the names joined by `.`, each with its subscripts in
 brackets separated by `,`; a literal index as its value (`2`, `true`, `E.one`), another
-expression as written. A part of rolled components (`T_COMPONENTS`) subscripted by a literal
-index is named as that member (`cylinder3`).
+expression as written; a slice's part (`T_SLICE`) with its inner subscripts first (`T[2,1]`).
 """
 function flatName(parts::Vector{CrefPart})::Symbol
-  length(parts) == 1 && isempty(parts[1].subscripts) && return parts[1].name
+  length(parts) == 1 && isempty(parts[1].subscripts) && !(parts[1].ty isa T_SLICE) && return parts[1].name
   local io = IOBuffer()
   for (i, p) in enumerate(parts)
     i > 1 && print(io, '.')
-    if p.ty isa T_COMPONENTS && length(p.subscripts) == 1 && p.subscripts[1] isa INDEX && (p.subscripts[1]::INDEX).exp isa INTEGER
-      print(io, p.ty.members[((p.subscripts[1]::INDEX).exp::INTEGER).value])
-      continue
-    end
     print(io, p.name)
+    p.ty isa T_SLICE && print(io, '[', join((p.ty::T_SLICE).inner, ','), ']')
     isempty(p.subscripts) && continue
     print(io, '[')
     for (j, sub) in enumerate(p.subscripts)
@@ -1785,11 +2195,13 @@ _print(io::IO, eq::ASSERT_EQUATION, ::String) =
   (print(io, "assert("); _printJoined(io, Expression[eq.condition, eq.message, eq.level]); print(io, ")"))
 
 _print(io::IO, a::EquationAttributes) =
-  print(io, a.kind, a.differentiated ? " differentiated" : "", a.derivative === nothing ? "" : " (has derivative)")
+  print(io, a.kind, a.differentiated ? " differentiated" : "", a.derivativeLink ? " derivative link" : "",
+        a.derivative === nothing ? "" : " (has derivative)")
 
 _print(io::IO, ::ALGEBRAIC) = print(io, "algebraic")
 _print(io::IO, k::STATE) = print(io, "state(", k.index, k.derivative === nothing ? "" : ", der = $(k.derivative)", ")")
 _print(io::IO, k::STATE_DER) = print(io, "der(", k.state, ")")
+_print(io::IO, k::ALGEBRAIC_DER) = print(io, "algebraic der(", k.state, ")")
 _print(io::IO, k::DUMMY_DER) = print(io, "dummy der(", k.dummyState, ")")
 _print(io::IO, k::DUMMY_STATE) = print(io, "dummy state, der = ", k.dummyDerivative)
 _print(io::IO, ::DISCRETE) = print(io, "discrete")
@@ -1870,5 +2282,46 @@ function dump(io::IO, model::Model)
 end
 
 dump(model::Model)::String = sprint(dump, model)
+
+#= ==================================================================================== =#
+#= Forms: values alike as written                                                       =#
+#= ==================================================================================== =#
+
+"""
+    sameForm(a, b) -> Bool
+
+Whether `a` and `b` are alike as written, field by field (equations too, which `==` compares by identity), leaving
+out what one occurrence carries: a source, an equation's attributes, a relation's index (its zero crossing). The
+instances' equations of one class are alike (IndexReduction's component rolling matches them by it, `formHash`).
+"""
+sameForm(a, b)::Bool = a == b
+sameForm(a::Vector, b::Vector)::Bool = length(a) == length(b) && all(k::Int -> sameForm(a[k], b[k]), eachindex(a))
+sameForm(::Source, ::Source)::Bool = true
+sameForm(::EquationAttributes, ::EquationAttributes)::Bool = true
+sameForm(a::RELATION, b::RELATION)::Bool = a.op === b.op && sameForm(a.exp1, b.exp1) && sameForm(a.exp2, b.exp2)
+@generated function sameForm(a::T, b::T)::Bool where {T <: Union{Node, Equation, EquationBranch}}
+  return fieldComparison(T, sameForm)
+end
+
+"""
+    formHash(x, h) -> UInt
+
+The hash of `x`'s form: alike forms (`sameForm`) hash alike, the same in every build (a type by its name, an
+enumeration value by its integer).
+"""
+formHash(x, h::UInt)::UInt = hash(x, h)
+formHash(x::Enum, h::UInt)::UInt = hash(Integer(x), h)
+function formHash(a::Vector, h::UInt)::UInt
+  for x in a
+    h = formHash(x, h)
+  end
+  return hash(length(a), h)
+end
+formHash(::Source, h::UInt)::UInt = h
+formHash(::EquationAttributes, h::UInt)::UInt = h
+formHash(a::RELATION, h::UInt)::UInt = formHash(a.exp2, formHash(a.exp1, hash(Integer(a.op), hash(:RELATION, h))))
+@generated function formHash(a::T, h::UInt)::UInt where {T <: Union{Node, Equation, EquationBranch}}
+  return fieldHashing(T, formHash)
+end
 
 end # module OMJLIR

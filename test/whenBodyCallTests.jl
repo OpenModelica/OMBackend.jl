@@ -24,10 +24,10 @@ end
 "The calls of `f` (`OMBackend.CodeGeneration.tupleArrayElementAt`, ...) in `code`."
 _wbcCalls(code::Expr, f::Expr)::Int = _wbcCount(e -> e isa Expr && e.head === :call && e.args[1] == f, code)
 
-"The definitions of a when body's local functions (`#whenCallOnce1_<hash>() = ...`) in `code`."
+"The definitions of a when body's local functions in `code`: without arguments, each the call of a model function (`once() = ... modelicaFunctionResult(...) ...`)."
 _wbcDefinitions(code::Expr)::Int =
-  _wbcCount(e -> e isa Expr && e.head === :(=) && e.args[1] isa Expr && e.args[1].head === :call &&
-                 startswith(string(e.args[1].args[1]), "#whenCallOnce"), code)
+  _wbcCount(e -> e isa Expr && e.head === :(=) && e.args[1] isa Expr && e.args[1].head === :call && length(e.args[1].args) == 1 &&
+                 e.args[2] isa Expr && _wbcCalls(e.args[2], :(OMBackend.CodeGeneration.modelicaFunctionResult)) == 1, code)
 
 "The final value of the variable `v` of `sol`."
 _wbcFinal(sol::WBC_SOLUTION, v::String)::Float64 = OMBackend.getVariableValues(sol, v)[end]

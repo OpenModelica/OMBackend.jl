@@ -212,11 +212,11 @@ end
 
 """
 A record-typed variable's fields (an array of records': its elements') as their flattened
-symbols, `<name>_<field>`; empty for another variable.
+symbols (`_fieldSymbol` of its reference: `<name>_<field>`); empty for another variable.
 """
 function flattenRecordInput(v::SC.FunctionVariable)::Vector{Symbol}
   local fields = _recordFieldNames(_funcParamElemType(v))
-  return Symbol[Symbol(v.name, COMPONENT_SEPARATOR, f) for f in fields]
+  return Symbol[_fieldSymbol(v.cref, f) for f in fields]
 end
 
 "The Julia names of the inputs (or outputs): a record's as its fields."
@@ -278,7 +278,7 @@ function _recordLocal(v::SC.FunctionVariable, flat::Vector{Symbol})::Vector{Expr
   _funcParamIsArray(v) && return _recordArrayLocal(v, flat)
   local decls = Expr[Expr(:local, fs) for fs in flat]
   if v.default !== nothing
-    local assign = _recordAssignment(SC.EXP_CREF(SC.SimCref(Symbol(v.name)), v.ty), v.default)
+    local assign = _recordAssignment(SC.EXP_CREF(SC.SimCref(Symbol(v.name), Int[], v.cref), v.ty), v.default)
     assign === nothing || push!(decls, assign)
     return decls
   end
@@ -777,19 +777,19 @@ function _recordAssignment(lhsExp::SC.Exp, rhsExp::SC.Exp)::Union{Nothing, Expr}
     return length(targets) == 1 ? Expr(:(=), targets[1], rhsTuple) : Expr(:(=), Expr(:tuple, targets...), rhsTuple)
   end
   lhs === nothing && return nothing
-  local (lhsBase, fieldNames) = lhs
+  local (lhsRecord, fieldNames) = lhs
   local rhsElement = _recordElementFieldExps(rhsExp)
   if rhsElement !== nothing && length(rhsElement) == length(fieldNames)
-    return Expr(:block, Expr[:($(_flatFieldSymbol(lhsBase, f)) = $(expToJuliaExpAlg(e))) for (f, e) in zip(fieldNames, rhsElement)]...)
+    return Expr(:block, Expr[:($(_flatFieldSymbol(lhsRecord, f)) = $(expToJuliaExpAlg(e))) for (f, e) in zip(fieldNames, rhsElement)]...)
   end
-  local rhsBase = _plainCrefName(rhsExp)
-  if rhsBase !== nothing
-    return Expr(:block, Expr[:($(_flatFieldSymbol(lhsBase, f)) = $(_flatFieldSymbol(rhsBase, f))) for f in fieldNames]...)
+  if _plainCrefName(rhsExp) !== nothing
+    local rhsRecord::SC.SimCref = (rhsExp::SC.EXP_CREF).cref
+    return Expr(:block, Expr[:($(_flatFieldSymbol(lhsRecord, f)) = $(_flatFieldSymbol(rhsRecord, f))) for f in fieldNames]...)
   elseif rhsExp isa SC.CALL || (rhsExp isa Union{SC.IFEXP, SC.RECORD} && _hasNoRecordFields(SC.typeOf(lhsExp)))
     #= A record literal, or an if-expression choosing between records, evaluates to the fields
        as a tuple too (MSL MixtureGasNasa setState_pTX: `state := if ... then
        ThermodynamicState(...) else ...`). =#
-    local targets = [_flatFieldSymbol(lhsBase, f) for f in fieldNames]
+    local targets = [_flatFieldSymbol(lhsRecord, f) for f in fieldNames]
     local rhs = _recordTupleExpr(rhsExp)
     return length(targets) == 1 ? Expr(:(=), targets[1], rhs) : Expr(:(=), Expr(:tuple, targets...), rhs)
   end
@@ -805,25 +805,33 @@ The fields of an element of an array of records, `u[k]`, as `u_re[k]`, `u_im[k]`
 field arrays, indexed alike); `nothing` for another expression. Scalar fields only.
 """
 function _recordElementFieldExps(exp::SC.Exp)::Union{Nothing, Vector{SC.Exp}}
-  local (base, subs, ty) = if exp isa SC.EXP_CREF && !isempty(exp.cref.subs)
-    (exp.cref.sym, Any[s for s in exp.cref.subs], exp.ty)
+  local ty::SC.SType = if exp isa SC.EXP_CREF && !isempty(exp.cref.subs)
+    exp.ty
   elseif exp isa SC.ASUB && exp.exp isa SC.EXP_CREF && isempty(exp.exp.cref.subs)
-    (exp.exp.cref.sym, Any[s for s in exp.subs], SC.typeOf(exp))
+    SC.typeOf(exp)
   else
     return nothing
   end
-  local t = ty isa SC.TYPE_COMPLEX ? ty : nothing
+  local t::Union{Nothing, SC.TYPE_COMPLEX} = ty isa SC.TYPE_COMPLEX ? ty : nothing
   (t === nothing || !t.isRecord || isempty(t.fieldNames)) && return nothing
   all(ft -> !(ft isa SC.TYPE_ARRAY) && isempty(_recordFieldNames(ft)), t.fieldTypes) || return nothing
-  return SC.Exp[_fieldElement(_flatFieldSymbol(String(base), n), subs, ft) for (n, ft) in zip(t.fieldNames, t.fieldTypes)]
+  #= the array of records: an element's reference without the element's subscripts (on its last part) =#
+  local (array::SC.IR.ComponentRef, subs::Vector{Any}) = exp isa SC.EXP_CREF ?
+    (SC.IR.withoutLastSubscripts(SC.irRef(exp.cref)), Any[s for s in exp.cref.subs]) :
+    (SC.irRef(((exp::SC.ASUB).exp::SC.EXP_CREF).cref), Any[s for s in (exp::SC.ASUB).subs])
+  return SC.Exp[_fieldElement(SC.fieldCref(array, n), subs, ft) for (n, ft) in zip(t.fieldNames, t.fieldTypes)]
 end
 
 """
-The element `subs` of the field array `name`.
+The element `subs` of the field array `field` (a record array's flattened field: `u.re`), by its identifier (`_identifier`) and its reference.
 """
-function _fieldElement(name::Symbol, subs::Vector{Any}, ty::SC.SType)::SC.Exp
-  all(s -> s isa Int, subs) && return SC.EXP_CREF(SC.SimCref(name, Int[s for s in subs]), ty)
-  return SC.ASUB(SC.EXP_CREF(SC.SimCref(name), SC.TYPE_ARRAY(ty, fill(-1, length(subs)))),
+function _fieldElement(field::SC.IR.ComponentRef, subs::Vector{Any}, ty::SC.SType)::SC.Exp
+  local name::Symbol = Symbol(_identifier(field))
+  if all(s -> s isa Int, subs)
+    local index::Vector{Int} = Int[s for s in subs]
+    return SC.EXP_CREF(SC.SimCref(name, index, SC.IR.elementCref(field, index)), ty)
+  end
+  return SC.ASUB(SC.EXP_CREF(SC.SimCref(name, Int[], field), SC.TYPE_ARRAY(ty, fill(-1, length(subs)))),
                  SC.Exp[s isa Int ? SC.ICONST(s) : s for s in subs])
 end
 
@@ -866,8 +874,33 @@ function _hasNoRecordFields(t::SC.SType)::Bool
   return !isempty(types) && all(ft -> isempty(_recordFieldNames(ft)), types)
 end
 
-"A flattened record field's symbol, `<base>_<field>` (flattenRecordInput's)."
-_flatFieldSymbol(base::AbstractString, field::AbstractString)::Symbol = Symbol(base, COMPONENT_SEPARATOR, field)
+"""
+The flattened symbol of the field `field` of the record the reference `c` reads (a function's flattened field, a model
+record's field variable): the field's reference's identifier (`_fieldSymbol`).
+"""
+_flatFieldSymbol(c::SC.SimCref, field::AbstractString)::Symbol = _fieldSymbol(SC.irRef(c), field)
+
+"The identifier of the field `field` of the record reference `record` (`_identifier` of the field's reference: `r_f`, `u_re`)."
+_fieldSymbol(record::SC.IR.ComponentRef, field::AbstractString)::Symbol = Symbol(_identifier(SC.fieldCref(record, field)))
+
+"""
+The code view (`SC.codeView`) of the model whose algorithm code is being generated (its initial algorithms and
+initial when-statements, `inCodeView`); `nothing` for a function's body.
+"""
+const CODE_VIEW = Base.ScopedValues.ScopedValue{Union{Nothing, SC.SIM_CODE}}(nothing)
+
+"""
+The identifier of the reference `ref` in the code being generated: in a model's code view its variable's
+(`SC.identifierOf`: a renumbered clash's too), in a function's body derived from it (`SC.derivedKey`, the function's
+locals' names).
+"""
+function _identifier(ref::SC.IR.ComponentRef)::String
+  local view::Union{Nothing, SC.SIM_CODE} = CODE_VIEW[]
+  return view === nothing ? SC.derivedKey(ref) : SC.identifierOf(view, ref)
+end
+
+"`f()`, generating algorithm code of the model whose code view is `view` (`CODE_VIEW`)."
+inCodeView(f::F, view::SC.SIM_CODE) where {F} = Base.ScopedValues.with(f, CODE_VIEW => view)
 
 """
     _algCallArgs(args; builtin = false, shared) -> Vector{Any}
@@ -960,16 +993,15 @@ function _positionalFieldIndex(exp::SC.Exp, ix::Integer)::Int
 end
 
 """
-    _recordCrefFields(exp) -> Union{Nothing,Tuple{String,Vector{String}}}
+    _recordCrefFields(exp) -> Union{Nothing,Tuple{SimCref,Vector{String}}}
 
-`(base, fieldNames)` of a reference without subscripts to a record or an array of records
-(whose fields are then arrays); `nothing` otherwise.
+`(record, fieldNames)` of a reference without subscripts to a record or an array of records
+(whose fields are then arrays): the reference and its type's field names; `nothing` otherwise.
 """
-function _recordCrefFields(exp::SC.Exp)::Union{Nothing, Tuple{String, Vector{String}}}
-  local base = _plainCrefName(exp)
-  base === nothing && return nothing
+function _recordCrefFields(exp::SC.Exp)::Union{Nothing, Tuple{SC.SimCref, Vector{String}}}
+  _plainCrefName(exp) === nothing && return nothing
   local fieldNames = _recordFieldNames(SC.scalarType(exp.ty))
-  return isempty(fieldNames) ? nothing : (base, fieldNames)
+  return isempty(fieldNames) ? nothing : ((exp::SC.EXP_CREF).cref, fieldNames)
 end
 
 """
@@ -977,13 +1009,12 @@ The flat field symbol `<base>_<kth field>` of a record read by one literal index
 field access, not array indexing); `nothing` otherwise.
 """
 function _recordIndexFieldSymbol(arrExp::SC.Exp, subs::Vector{SC.Exp})::Union{Nothing, Symbol}
-  local base = _plainCrefName(arrExp)
-  base === nothing && return nothing
+  _plainCrefName(arrExp) === nothing && return nothing
   local fieldNames = _recordFieldNames(arrExp.ty)
   (isempty(fieldNames) || length(subs) != 1 || !(only(subs) isa SC.ICONST)) && return nothing
   local k = only(subs).value
   1 <= k <= length(fieldNames) || return nothing
-  return _flatFieldSymbol(base, fieldNames[k])
+  return _flatFieldSymbol((arrExp::SC.EXP_CREF).cref, fieldNames[k])
 end
 
 "The name of a reference without subscripts; `nothing` for another expression."

@@ -39,18 +39,20 @@
     derivativesOfDummyStates(simCode) -> SIM_CODE
 
 `der(v)` of a variable that is no state (an initial equation's `der(flange.phi) = w_start`, the
-alias elimination having replaced `flange.phi` by a dummy state) as v's derivative variable
-`\$DER_v`, which index reduction made an unknown, or that variable's alias representative
-(negated where the alias is). A state's `der` stays; a `der(v)` with no derivative variable
-stays too (the code generators report it).
+alias elimination having replaced `flange.phi` by a dummy state) as v's derivative variable, which
+index reduction made an unknown (the dummy state's kind names it: `DUMMY_STATE`), or that
+variable's alias representative (negated where the alias is). A state's `der` stays; a `der(v)`
+with no derivative variable stays too (the code generators report it).
 """
 function derivativesOfDummyStates(simCode::SIM_CODE)::SIM_CODE
   local ht = simCode.stringToSimVarHT
   local aliases = Dict{String, Tuple{String, Bool}}(e.eliminatedName => (e.representativeName, e.negated) for e in simCode.aliasMap)
-  local reference = name -> EXP_CREF(SimCref(Symbol(name)), TYPE_REAL())
+  local reference::Function = (name::String) -> EXP_CREF(SimCref(Symbol(name), Int[], referenceOf(simCode, name)), TYPE_REAL())
   local derivativeOf = name -> begin
-    (haskey(ht, name) && last(ht[name]).varKind isa STATE) && return nothing
-    local d = "\$DER_" * name
+    haskey(ht, name) || return nothing
+    local kind::Union{Nothing, IR.VariableKind} = last(ht[name]).irKind
+    kind isa IR.DUMMY_STATE || return nothing
+    local d::String = String(kind.dummyDerivative)
     haskey(ht, d) && return reference(d)
     local alias = get(aliases, d, nothing)
     alias === nothing && return nothing
@@ -92,8 +94,8 @@ end
 """
     unlinkUnreadStateDerivatives(simCode) -> SIM_CODE
 
-The link `der(x) = \$DER_x` (index reduction's, the state's only `der(x)`) of a state whose
-derivative variable nothing else reads any more, a fold having removed its readers (MSL Spice3's
+The link `der(x) = \$DER_x` (index reduction's, the state's only `der(x)`; `\$DER_x` of kind
+`ALGEBRAIC_DER`) of a state whose derivative variable nothing else reads any more, a fold having removed its readers (MSL Spice3's
 `icapbx = capbx * der(vbx)`, capbx folded to 0): dropped with `\$DER_x`, so that the state is
 dead (`demoteDeadStates`), as without index reduction.
 """
@@ -103,7 +105,8 @@ function unlinkUnreadStateDerivatives(simCode::SIM_CODE)::SIM_CODE
     local e = eq.exp
     (e isa BINARY && e.op === OP_SUB && e.exp1 isa DER && e.exp2 isa EXP_CREF) || return nothing
     local d = crefName(e.exp2.cref)
-    (startswith(d, "\$DER_") && haskey(ht, d) && last(ht[d]).varKind isa ALG_VARIABLE) || return nothing
+    (haskey(ht, d) && last(ht[d]).varKind isa ALG_VARIABLE && last(ht[d]).irKind isa Union{IR.ALGEBRAIC_DER, IR.DUMMY_DER}) ||
+      return nothing
     return d
   end
   local links = Dict{Int, String}()
@@ -113,25 +116,11 @@ function unlinkUnreadStateDerivatives(simCode::SIM_CODE)::SIM_CODE
   end
   isempty(links) && return simCode
   local reads = Dict{String, Int}()
-  local visit = e::Exp -> foreachExp(x -> (x isa Union{EXP_CREF, PRE} && (reads[crefName(x.cref)] = get(reads, crefName(x.cref), 0) + 1)), e)
-  local visitStatement = s::Statement -> mapStatementExps(e -> (visit(e); e), s)
-  foreach(((i, eq),) -> haskey(links, i) || visit(eq.exp), enumerate(simCode.residualEquations))
-  foreach(eq -> visit(eq.exp), simCode.eliminatedEquations)
-  foreach(eq -> foreach(visit, equationExps(eq)), simCode.initialEquations)
-  for ifEq in simCode.ifEquations, b in ifEq.branches
-    visit(b.condition)
-    foreach(eq -> visit(eq.exp), b.residualEquations)
+  local visit::Function = (e::Exp) -> foreachExp(x::Exp -> (x isa Union{EXP_CREF, PRE} && (reads[crefName(x.cref)] = get(reads, crefName(x.cref), 0) + 1)), e)
+  #= every equation's reads but the links' own =#
+  foreachEquationExp(simCode; eliminated = true) do place::Tuple{Symbol, Int}, e::Exp
+    (place[1] === :residualEquations && haskey(links, place[2])) || visit(e)
   end
-  for w in simCode.whenEquations
-    local stmts = w.whenEquation
-    while stmts !== nothing
-      visit(stmts.condition)
-      foreach(visitStatement, stmts.body)
-      stmts = stmts.elsewhenPart
-    end
-  end
-  foreach(a -> foreach(visitStatement, a.statements), simCode.initialAlgorithms)
-  foreach(a -> (visit(a.condition); visit(a.message)), simCode.asserts)
   foreach(e -> (reads[e.representativeName] = get(reads, e.representativeName, 0) + 1), simCode.aliasMap)
   local unread = Set{Int}(i for (i, d) in links if get(reads, d, 0) == 0)
   isempty(unread) && return simCode

@@ -82,7 +82,7 @@ module IndexReduction
 
 import ..OMJLIR
 import ..substituteIterators, ..foldSubscripts, ..expressionLargerThan, ..foldInteger, ..mapRoots, ..rowMajor,
-       ..unsubscriptedName, ..allSubscripts, ..literalIndices
+       ..unsubscriptedName, ..allSubscripts
 import ...envSwitch
 import ..Evaluation: arithmetic, asRecord, divide, elementOf, evaluate, foldScalar, genericOffset,
        genericValues, ifThenElse, inlineBody, isLiteral, isOne, isZero, isZeroExp, literalCondition,

@@ -442,7 +442,9 @@ function _scanDefinitionalPinning(equations::Vector{Expr},
 
       #= Pairwise discrete alias: `0 ~ a - b` with both refs discrete.
          One alias residual + two dummies = three equations for two vars.
-         Demote the LATER side (arbitrary; the other gets handled by a
+         Demote the side no when assigns (a when-assigned one keeps its state slot and is the relay's
+         representative, its start the pair's: `i = Integer(e)` of a when's `e` demoted `e`, whose start
+         `E.one` gave way to `i`'s default 0), else the LATER side (arbitrary; the other gets handled by a
          neighbouring definitional match or by the heuristic). Skip
          StateGraph-style `_suspend`/`_resume` pairs. =#
       local rhsUnwrapped = _unwrap(rhsExp)
@@ -454,7 +456,7 @@ function _scanDefinitionalPinning(equations::Vector{Expr},
            nameA in discreteSet && nameB in discreteSet
           if !(endswith(nameA, "_suspend") || endswith(nameA, "_resume") ||
                endswith(nameB, "_suspend") || endswith(nameB, "_resume"))
-            push!(aliasPinned, nameB)
+            push!(aliasPinned, (nameB in whenAssignedSet && !(nameA in whenAssignedSet)) ? nameA : nameB)
           end
         end
       end

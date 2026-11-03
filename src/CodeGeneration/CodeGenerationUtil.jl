@@ -39,7 +39,7 @@
 module CodeGenerationUtil
 
 import DataStructures
-using DataStructures: OrderedSet
+using DataStructures: OrderedDict, OrderedSet
 import MacroTools
 using ModelingToolkit
 using LinearAlgebra
@@ -48,7 +48,6 @@ import ...SimCode
 import ...OMBackend
 import ..AlgorithmicCodeGeneration
 import ...@BACKEND_LOGGING
-import ...COMPONENT_SEPARATOR
 
 import Symbolics
 import Symbolics.RuntimeGeneratedFunctions
@@ -395,7 +394,7 @@ end
   variable or a binding that is no constant.
 """
 function evalSimCodeParameter(v::SC.SIMVAR, simCode::SC.SIM_CODE)
-  (v.varKind isa SC.PARAMETER && v.varKind.bindExp !== nothing) ||
+  SC.hasBindingExp(v) ||
     OMBackend.unsupported("a constant value of a variable other than a bound parameter", v.name)
   return evalConstant(v.varKind.bindExp, simCode)
 end
@@ -427,7 +426,7 @@ function _substituteBoundParameters(exp::SC.Exp, simCode::SC.SIM_CODE;
       return e
     end
     local k = last(entry).varKind
-    local bindExp = k isa Union{SC.PARAMETER, SC.ARRAY_PARAMETER} ? k.bindExp : nothing
+    local bindExp = k isa SC.PARAMETER ? k.bindExp : nothing
     if bindExp === nothing || key in seen
       shouldEval[] = false
       return e
@@ -466,7 +465,7 @@ function isParametricOnlyEquation(eq::SC.Equation, simCode::SC.SIM_CODE)::Bool
   hasEquationSides(eq) || return false
   local ht = simCode.stringToSimVarHT
   local names = OrderedSet{String}()
-  foreach(e -> SC.crefNames!(names, e), equationSides(eq))
+  foreach(e -> SC.identifierNames!(names, e), equationSides(eq))
   return !any(names) do n
     local entry = get(ht, n, nothing)
     entry !== nothing && (SC.isStateOrAlgebraic(last(entry)) || SC.isDiscrete(last(entry)))
@@ -581,7 +580,7 @@ function isContinuousCondition(cond::SC.Exp, simCode::SC.SIM_CODE)::Bool
       continue
     end
     local v = last(ht[n])
-    continuous = continuous || (!SC.isDiscrete(v) && !SC.isParameter(v))
+    continuous = continuous || (!SC.isDiscrete(v) && !SC.isScalarParameter(v))
   end
   return continuous
 end
@@ -658,15 +657,15 @@ end
 """
     flattenRecordCallArg(arg, simCode)
 
-The fields of a record argument of a call, as their flattened variables (`<name>_<field>`);
-empty for another argument. A connector-typed Complex reference
+The fields of a record argument of a call, as their flattened variables (`identifierOf` the fields'
+references: `<name>_<field>`); empty for another argument. A connector-typed Complex reference
 (`Modelica.ComplexBlocks.Interfaces.ComplexInput u`) the same, if one of its fields is a
 variable.
 """
 function flattenRecordCallArg(arg::SC.Exp, simCode::SC.SIM_CODE)::Vector{Symbol}
   (arg isa SC.EXP_CREF && arg.ty isa SC.TYPE_COMPLEX) || return Symbol[]
-  local baseName = SC.crefName(arg.cref)
-  local flat = Symbol[Symbol(baseName * COMPONENT_SEPARATOR * f) for f in arg.ty.fieldNames]
+  local record::SC.IR.ComponentRef = SC.irRef(arg.cref)
+  local flat = Symbol[Symbol(SC.identifierOf(simCode, SC.fieldCref(record, f))) for f in arg.ty.fieldNames]
   arg.ty.isRecord && return flat
   return any(s -> haskey(simCode.stringToSimVarHT, String(s)), flat) ? flat : Symbol[]
 end
@@ -674,24 +673,28 @@ end
 """
   Extract common hvcat subexpressions from a list of equation Exprs.
   Returns (modifiedEquations, preambleAssignments) where preamble contains
-  local variable assignments for deduplicated hvcat calls.
+  local variable assignments for deduplicated hvcat calls, in the order of their
+  first occurrences. A call is keyed by its expression without line numbers
+  (`HvcatKey`): its printed text carried the code generator's, so equal calls
+  made at different lines were not shared, and its hash order changed with an
+  edit of the code generator.
 """
 function extractCommonHvcats(equations::Vector)
-  local allHvcats = Dict{String, Int}()
-  local hvcatExprs = Dict{String, Expr}()
+  local allHvcats::OrderedDict{HvcatKey, Int} = OrderedDict{HvcatKey, Int}()
+  local hvcatExprs::Dict{HvcatKey, Expr} = Dict{HvcatKey, Expr}()
   for eq in equations
-    local found = Dict{String, Bool}()
+    local found::Set{HvcatKey} = Set{HvcatKey}()
     _collectHvcats!(eq, allHvcats, hvcatExprs, found)
   end
-  local duplicates = filter(p -> p.second >= 2, allHvcats)
+  local duplicates::OrderedDict{HvcatKey, Int} = filter(p -> p.second >= 2, allHvcats)
   if isempty(duplicates)
     return equations, Expr[]
   end
-  local replacements = Dict{String, Symbol}()
-  local preamble = Expr[]
-  local idx = 0
-  for (key, _) in duplicates
-    local varName = Symbol("_hv_", idx)
+  local replacements::Dict{HvcatKey, Symbol} = Dict{HvcatKey, Symbol}()
+  local preamble::Vector{Expr} = Expr[]
+  local idx::Int = 0
+  for (key::HvcatKey, _) in duplicates
+    local varName::Symbol = Symbol("_hv_", idx)
     replacements[key] = varName
     push!(preamble, :(local $varName = $(hvcatExprs[key])))
     idx += 1
@@ -700,34 +703,69 @@ function extractCommonHvcats(equations::Vector)
   return modifiedEqs, preamble
 end
 
-function _collectHvcats!(expr, counts::Dict{String,Int}, exprs::Dict{String,Expr}, found::Dict{String,Bool})
-  if !(expr isa Expr)
-    return
+"Whether `expr` is a call of `hvcat`."
+_isHvcat(expr::Expr)::Bool = expr.head == :call && length(expr.args) >= 1 && expr.args[1] == :hvcat
+
+"""
+    HvcatKey(expr)
+
+An `hvcat` call as a key: the call without its line numbers, equal by structure, its literals by type and value (`1`
+is not `1.0`, which `isequal` of the expressions takes as equal).
+"""
+struct HvcatKey
+  expr::Expr
+  HvcatKey(expr::Expr) = new(MacroTools.striplines(expr))
+end
+
+Base.:(==)(a::HvcatKey, b::HvcatKey)::Bool = _sameTree(a.expr, b.expr)
+Base.isequal(a::HvcatKey, b::HvcatKey)::Bool = _sameTree(a.expr, b.expr)
+Base.hash(k::HvcatKey, h::UInt)::UInt = _treeHash(k.expr, h)
+
+"Whether `a` and `b` are the same expression tree: heads, arguments, leaves of the same type and value."
+function _sameTree(a, b)::Bool
+  if a isa Expr
+    (b isa Expr && a.head === b.head && length(a.args) == length(b.args)) || return false
+    for k in eachindex(a.args)
+      _sameTree(a.args[k], b.args[k]) || return false
+    end
+    return true
   end
-  if expr.head == :call && length(expr.args) >= 1 && expr.args[1] == :hvcat
-    local key = string(expr)
-    if !haskey(found, key)
-      found[key] = true
+  return typeof(a) === typeof(b) && isequal(a, b)
+end
+
+"The hash of an expression tree, as `_sameTree` compares it (a leaf by its type and value)."
+function _treeHash(a, h::UInt)::UInt
+  a isa Expr || return hash(a, hash(typeof(a), h))
+  h = hash(a.head, h)
+  for x in a.args
+    h = _treeHash(x, h)
+  end
+  return h
+end
+
+"The `hvcat` calls of `expr`, each counted once per equation (`found`) into `counts`, the first of each key kept in `exprs`."
+function _collectHvcats!(expr, counts::OrderedDict{HvcatKey, Int}, exprs::Dict{HvcatKey, Expr}, found::Set{HvcatKey})::Nothing
+  expr isa Expr || return nothing
+  if _isHvcat(expr)
+    local key::HvcatKey = HvcatKey(expr)
+    if !(key in found)
+      push!(found, key)
       counts[key] = get(counts, key, 0) + 1
-      if !haskey(exprs, key)
-        exprs[key] = expr
-      end
+      haskey(exprs, key) || (exprs[key] = expr)
     end
   end
   for arg in expr.args
     _collectHvcats!(arg, counts, exprs, found)
   end
+  return nothing
 end
 
-function _replaceHvcats(expr, replacements::Dict{String,Symbol})
-  if !(expr isa Expr)
-    return expr
-  end
-  if expr.head == :call && length(expr.args) >= 1 && expr.args[1] == :hvcat
-    local key = string(expr)
-    if haskey(replacements, key)
-      return replacements[key]
-    end
+"`expr` with each `hvcat` call of a key in `replacements` replaced by its local."
+function _replaceHvcats(expr, replacements::Dict{HvcatKey, Symbol})
+  expr isa Expr || return expr
+  if _isHvcat(expr)
+    local name::Union{Nothing, Symbol} = get(replacements, HvcatKey(expr), nothing)
+    name === nothing || return name
   end
   for i in eachindex(expr.args)
     expr.args[i] = _replaceHvcats(expr.args[i], replacements)
@@ -836,6 +874,14 @@ function collectCalledFunctionNames!(names::OrderedSet{String}, s::SC.ASSIGN)
 end
 collectCalledFunctionNames!(names::OrderedSet{String}, s::SC.REINIT) = collectCalledFunctionNames!(names, s.value)
 collectCalledFunctionNames!(names::OrderedSet{String}, s::SC.NORETCALL) = collectCalledFunctionNames!(names, s.exp)
+function collectCalledFunctionNames!(names::OrderedSet{String}, s::SC.IF)
+  for b in s.branches
+    collectCalledFunctionNames!(names, b.condition)
+    foreach(x -> collectCalledFunctionNames!(names, x), b.body)
+  end
+  foreach(x -> collectCalledFunctionNames!(names, x), s.elseBody)
+  return names
+end
 collectCalledFunctionNames!(names::OrderedSet{String}, ::Union{SC.Equation, SC.Statement}) = names
 
 function collectCalledFunctionNames!(names::OrderedSet{String}, simCode::SC.SIM_CODE)::OrderedSet{String}
@@ -857,13 +903,20 @@ end
 
 The names a when-clause's statement reads (the previous backend's order: the reverse of
 their first occurrence): an assignment's value, a reinit's value, a call's, an assert's
-condition, message and level, a terminate's message.
+condition, message and level, a terminate's message, an if-statement's conditions and statements.
 """
 getRHSVariables(s::SC.ASSIGN)::Vector{String} = SC.allCrefNames(s.right)
 getRHSVariables(s::SC.REINIT)::Vector{String} = SC.allCrefNames(s.value)
 getRHSVariables(s::SC.NORETCALL)::Vector{String} = SC.allCrefNames(s.exp)
 getRHSVariables(s::SC.ASSERT)::Vector{String} = vcat(SC.allCrefNames(s.condition), SC.allCrefNames(s.message), SC.allCrefNames(s.level))
 getRHSVariables(s::SC.TERMINATE)::Vector{String} = SC.allCrefNames(s.message)
+function getRHSVariables(s::SC.IF)::Vector{String}
+  local out::Vector{String} = String[n for b in s.branches for n in SC.allCrefNames(b.condition)]
+  for x in Iterators.flatten((Iterators.flatten(b.body for b in s.branches), s.elseBody))
+    append!(out, getRHSVariables(x))
+  end
+  return unique!(out)
+end
 getRHSVariables(::SC.Statement)::Vector{String} = String[]
 
 function _resolveModelicaCallTargets(expr)

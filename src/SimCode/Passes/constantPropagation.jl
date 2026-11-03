@@ -57,7 +57,7 @@ end
 "Whether `c` names a parameter of `ht`."
 function isParameter(ht::HT, c::SimCref)::Bool
   local entry = get(ht, crefName(c), nothing)
-  return entry !== nothing && isParameter(last(entry))
+  return entry !== nothing && isScalarParameter(last(entry))
 end
 
 """
@@ -95,9 +95,11 @@ function propagateConstants(simCode::SIM_CODE)::SIM_CODE
   (hasStructuralTransitions(simCode) || hasSubModels(simCode)) && return simCode
   local ht = simCode.stringToSimVarHT
   local excluded = Set{String}(Iterators.flatten((simCode.sharedVariables, simCode.irreducibleVariables)))
-  local wholeArrays = Set{String}()
-  for eq in simCode.residualEquations, n in crefNames!(OrderedSet{String}(), eq.exp)
-    occursin('[', n) || push!(wholeArrays, n)
+  #= the arrays read whole (a reference that is no element, `arrayBase` its own name): their elements stay variables =#
+  local wholeArrays::Set{Symbol} = Set{Symbol}()
+  for eq in simCode.residualEquations, read::Read in crefReads!(Read[], eq.exp)
+    local c::SimCref = read.cref
+    (c.ref !== nothing && isempty(c.subs) && !isElementCref(c.ref)) && push!(wholeArrays, c.ref.name)
   end
   local replacements = Replacements()
   local eliminatedBy = OrderedDict{Int, String}()
@@ -117,8 +119,8 @@ function propagateConstants(simCode::SIM_CODE)::SIM_CODE
       end
       local (_, unknown, parameter, negated) = c
       unknown in excluded && continue
-      local bracket = findfirst('[', unknown)
-      (bracket !== nothing && unknown[1:prevind(unknown, bracket)] in wholeArrays) && continue
+      local array::Union{Nothing, Symbol} = elementArray(simCode, unknown)
+      (array !== nothing && array in wholeArrays) && continue
       haskey(replacements, unknown) && continue
       replacements[unknown] = Replacement(parameter, negated, true)
       eliminatedBy[i] = unknown

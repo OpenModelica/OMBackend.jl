@@ -267,7 +267,60 @@ end
    relation becomes true (MLS 8.3.5). The operands are read by name, so they
    may be unknowns, observed variables or parameters. =#
 
-_plainVariableName(@nospecialize(v)) = replace(string(v), "(t)" => "", "var\"" => "", "\"" => "")
+"""
+    variableName(v) -> Union{Nothing, String}
+
+The name of the symbolic variable `v` as SimCode names it (`opener[3]_tSwitch` for `var"opener[3]_tSwitch"(t)`, `R`
+for a parameter), from the symbol's own name, not from its printing; `nothing` for anything else (a derivative
+`Differential(t)(x)`, a sum, a number).
+"""
+function variableName(@nospecialize(v))::Union{Nothing, String}
+  local x = Symbolics.unwrap(v)
+  x isa SymbolicUtils.BasicSymbolic || return nothing
+  SymbolicUtils.issym(x) && return String(nameof(x))
+  (SymbolicUtils.iscall(x) && SymbolicUtils.issym(SymbolicUtils.operation(x))) || return nothing
+  return String(nameof(SymbolicUtils.operation(x)))
+end
+
+"""
+    _variableNames(xs) -> OrderedSet{String}
+
+The names (`variableName`) of the variables among `xs`, in order; anything else (a derivative, a number) has none.
+"""
+function _variableNames(xs)::OrderedSet{String}
+  local out::OrderedSet{String} = OrderedSet{String}()
+  for x in xs
+    local name::Union{Nothing, String} = variableName(x)
+    name === nothing || push!(out, name)
+  end
+  return out
+end
+
+"""
+    mtkDerivativeVariables(sys) -> Set{Any}
+
+The variables MTK created for derivatives (`xˍt`), unwrapped: the ones its schedule substitutes for derivatives
+(`dummy_sub`: `D(x) => xˍt`) that the generated model did not declare (no `SimCodeKind` of their own: `xˍt` keeps
+`x`'s, `simCodeKind`). The schedule substitutes the model's own variables too (`D(body.r_0) => body.v_0`, MSL
+HeatLosses): taken as MTK's, the bodies' velocities were given MTK's derivative starts and the solve ended in NaN at
+its first step.
+"""
+function mtkDerivativeVariables(sys::ModelingToolkit.AbstractSystem)::Set{Any}
+  ModelingToolkit.get_schedule(sys) === nothing && return Set{Any}()
+  return Set{Any}(x for x in (Symbolics.unwrap(v) for v in values(ModelingToolkit.get_schedule(sys).dummy_sub))
+                  if simCodeKind(x) === nothing)
+end
+
+"""
+    isIndependentVariable(v) -> Bool
+
+Whether `v` is the system's independent variable (time): the one plain symbol that is no parameter (an unknown is a
+call `x(t)`, a parameter carries the parameter metadata).
+"""
+function isIndependentVariable(@nospecialize(v))::Bool
+  local x = Symbolics.unwrap(v)
+  return x isa SymbolicUtils.BasicSymbolic && SymbolicUtils.issym(x) && !ModelingToolkit.isparameter(x)
+end
 
 """
     namedValueFunctions(sys, names) -> Vector or nothing
@@ -286,18 +339,14 @@ function namedValueFunctions(sys, names::Vector{String})
 end
 
 """
-The system's unknowns, observed variables and parameters by plain name.
+The system's unknowns, observed variables and parameters by name (`variableName`).
 """
 function _variablesByPlainName(sys)::Dict{String, Any}
   local byName = Dict{String, Any}()
-  for v in ModelingToolkit.unknowns(sys)
-    byName[_plainVariableName(v)] = v
-  end
-  for eq in ModelingToolkit.observed(sys)
-    byName[_plainVariableName(eq.lhs)] = eq.lhs
-  end
-  for p in ModelingToolkit.parameters(sys)
-    byName[_plainVariableName(p)] = p
+  for v in Iterators.flatten((ModelingToolkit.unknowns(sys), (eq.lhs for eq in ModelingToolkit.observed(sys)),
+                              ModelingToolkit.parameters(sys)))
+    local name::Union{Nothing, String} = variableName(v)
+    name === nothing || (byName[name] = v)
   end
   return byName
 end
@@ -629,12 +678,15 @@ end
 The algebraic unknowns solved again within a sweep, for the bodies that
 read them next. A failure is not the event's (phase 3 solves again): the
 return code is put back, or its InitialFailure made every later solve
-report failure.
+report failure; and so is the state, which the failed solve left at its
+last iterate.
 """
-function _staleResolve!(integrator, reinit)
+function _staleResolve!(integrator, reinit)::Bool
   local retcode = integrator.sol.retcode
+  local before::AbstractVector = copy(integrator.u)
   _resolveAlgebraics!(integrator, reinit) && return true
   _restoreRetcode!(integrator, retcode)
+  copyto!(integrator.u, before)
   return false
 end
 
@@ -749,12 +801,12 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
      relation counted 347 switches, OpenModelica 20). Such a model stops as
      before. =#
   local r = isempty(e.relationWhens) && isempty(e.discreteWhens) && isempty(e.clusters) ? e.ifRelations : nothing
-  if (resolve || _continuousEventFired(integrator)) && !_resolveAlgebraics!(integrator, e.reinit)
-    @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
-    #= The located crossings belong to this event. =#
-    foreach(c -> fill!(c.crossed, false), e.clusters)
-    return nothing
-  end
+  #= The algebraic unknowns at the event in the modes from before it. Where they have no solution, the modes the
+     relations switch to can have one (an arc's current caught past its arc-out window, MSL OpenerWithArc: `v =
+     V*sign(i)` has none there, the arc-off `i = Goff*v` has; where the steps land relative to the window moved with
+     OrdinaryDiffEqCore 4.19): the return code and the state are put back (`_staleResolve!`) and the sweep reads the
+     relations at the located crossing. The event fails if none changes, or if the solve in the new modes fails too. =#
+  local unsolved::Bool = (resolve || _continuousEventFired(integrator)) && !_staleResolve!(integrator, e.reinit)
   #= The same instant again and again (a comparator with positive feedback at
      its fold, MSL SignalGenerator's fifth switch: the linear branch settled
      where it meets the saturated one, and its crossing fired at once): the
@@ -779,6 +831,13 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
       forced = 1
       continue
     end
+    if !changed && unsolved
+      _restoreRetcode!(integrator, ModelingToolkit.SciMLBase.ReturnCode.InitialFailure)
+      @error "[events] the algebraic variables could not be solved at the event at t = $(integrator.t)"
+      #= The located crossings belong to this event. =#
+      foreach(c -> fill!(c.crossed, false), e.clusters)
+      return nothing
+    end
     if !changed
       n - forced > 1 && _restartStepSize!(integrator, e.stall)
       #= Settled: the discrete whens' change()/edge() memory takes the
@@ -791,6 +850,7 @@ function _iterateInstant!(e::EventIteration, integrator, resolve::Bool, affected
       @error "[events] the algebraic variables could not be solved after the event at t = $(integrator.t)"
       return nothing
     end
+    unsolved = false
   end
   #= The if-equation relations may switch back and forth where the loop has
      a solution on another branch (a comparator with positive feedback): one
@@ -826,8 +886,9 @@ function _initialize!(e::EventIteration, integrator)
   #= Only the values the tick changed: the clusters initialize theirs below
      (a pulse true from the start is no edge). =#
   local moved = before === nothing ? Int[] : Int[k for k in eachindex(before) if !isequal(before[k], integrator.u[k])]
-  #= A new solve (a re-simulation reuses the callbacks): no instant repeated yet. =#
+  #= A new solve (a re-simulation reuses the callbacks): no instant repeated yet, no degenerate restart. =#
   e.instant[] = (NaN, 0)
+  e.stall[] = (NaN, 0)
   _initializeRelations!(e, integrator)
   local start = integrator.u
   if !isempty(moved)

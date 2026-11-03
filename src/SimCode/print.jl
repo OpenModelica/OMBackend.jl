@@ -145,3 +145,88 @@ function Base.show(io::IO, e::PARTEVALFUNCTION)
   end
   print(io, ")")
 end
+
+#= Statements and equations: one line each, Modelica's form (the reasons a code generator refuses one name it so). =#
+
+"The statements or equations `body`, joined by `; `."
+function _printBody(io::IO, body::AbstractVector)
+  for (k, x) in enumerate(body)
+    k > 1 && print(io, "; ")
+    show(io, x)
+  end
+end
+
+"Branches `head c then body`, the later ones `elsehead c then body`."
+function _printBranches(io::IO, head::String, conditions::AbstractVector, bodies::AbstractVector)
+  for (k, (c, b)) in enumerate(zip(conditions, bodies))
+    print(io, k == 1 ? head : string(" else", head), " ")
+    show(io, c)
+    print(io, " then ")
+    _printBody(io, b)
+  end
+end
+
+Base.show(io::IO, s::ASSIGN) = (show(io, s.left); print(io, " := "); show(io, s.right))
+
+function Base.show(io::IO, s::IF)
+  _printBranches(io, "if", Exp[b.condition for b in s.branches], Vector{Statement}[b.body for b in s.branches])
+  isempty(s.elseBody) || (print(io, " else "); _printBody(io, s.elseBody))
+  print(io, " end if")
+end
+
+Base.show(io::IO, s::FOR) = (print(io, "for "); show(io, s.iterator); print(io, " loop "); _printBody(io, s.body); print(io, " end for"))
+Base.show(io::IO, s::WHILE) =
+  (print(io, "while "); show(io, s.condition); print(io, " loop "); _printBody(io, s.body); print(io, " end while"))
+
+function Base.show(io::IO, s::WHEN)
+  _printBranches(io, "when", Exp[b.condition for b in s.branches], Vector{Statement}[b.body for b in s.branches])
+  print(io, " end when")
+end
+
+Base.show(io::IO, s::ASSERT) = (print(io, "assert("); _printJoined(io, Exp[s.condition, s.message, s.level]); print(io, ")"))
+Base.show(io::IO, s::TERMINATE) = (print(io, "terminate("); show(io, s.message); print(io, ")"))
+
+function Base.show(io::IO, s::REINIT)
+  print(io, "reinit(", crefName(s.stateVar))
+  isempty(s.subscripts) || (print(io, "["); _printJoined(io, s.subscripts); print(io, "]"))
+  print(io, ", ")
+  show(io, s.value)
+  print(io, ")")
+end
+
+Base.show(io::IO, s::NORETCALL) = show(io, s.exp)
+Base.show(io::IO, ::RETURN) = print(io, "return")
+Base.show(io::IO, ::BREAK) = print(io, "break")
+
+Base.show(io::IO, eq::RESIDUAL_EQUATION) = (print(io, "0 = "); show(io, eq.exp))
+Base.show(io::IO, eq::EQUATION) = (show(io, eq.lhs); print(io, " = "); show(io, eq.rhs))
+Base.show(io::IO, eq::ARRAY_EQUATION) = (show(io, eq.left); print(io, " = "); show(io, eq.right))
+Base.show(io::IO, eq::FOR_EQUATION) =
+  (print(io, "for "); show(io, eq.iterator); print(io, " loop "); _printBody(io, eq.body); print(io, " end for"))
+Base.show(io::IO, eq::ALGORITHM) = (print(io, "algorithm "); _printBody(io, eq.statements))
+
+"A when-clause and its elsewhen parts."
+function _printWhen(io::IO, w::WHEN_STMTS)
+  local conditions::Vector{Exp} = Exp[]
+  local bodies::Vector{Vector{Statement}} = Vector{Statement}[]
+  local part::Union{Nothing, WHEN_STMTS} = w
+  while part !== nothing
+    push!(conditions, part.condition)
+    push!(bodies, part.body)
+    part = part.elsewhenPart
+  end
+  _printBranches(io, "when", conditions, bodies)
+  print(io, " end when")
+end
+
+Base.show(io::IO, eq::WHEN_EQUATION) = _printWhen(io, eq.whenEquation)
+Base.show(io::IO, eq::INITIAL_WHEN_EQUATION) = (print(io, "initial "); _printWhen(io, eq.whenEquation))
+
+function Base.show(io::IO, eq::INLINE_IF_EQUATION)
+  _printBranches(io, "if", eq.conditions, eq.branchesTrue)
+  isempty(eq.branchElse) || (print(io, " else "); _printBody(io, eq.branchElse))
+  print(io, " end if")
+end
+
+Base.show(io::IO, eq::ASSERT_EQUATION) = (print(io, "assert("); _printJoined(io, Exp[eq.condition, eq.message, eq.level]); print(io, ")"))
+Base.show(io::IO, eq::UNLOWERED_EQUATION) = print(io, eq.what, ": ", eq.construct)

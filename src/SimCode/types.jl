@@ -47,12 +47,9 @@ expressions, statements, variables and their parts.
 """
 abstract type Node end
 
-"Fields compared one by one: the values are trees of vectors, strings and symbols."
-function Base.:(==)(a::T, b::T)::Bool where {T <: Node}
-  for f in fieldnames(T)
-    getfield(a, f) == getfield(b, f) || return false
-  end
-  return true
+"Fields compared one by one: the values are trees of vectors, strings and symbols (unrolled per type, as OMJLIR's: `IR.fieldComparison`)."
+@generated function Base.:(==)(a::T, b::T)::Bool where {T <: Node}
+  return IR.fieldComparison(T, ==)
 end
 Base.:(==)(::Node, ::Node)::Bool = false
 
@@ -61,20 +58,14 @@ Fields compared one by one with `isequal`, as `hash` hashes them: the identity o
 `Set` key (`RCONST(0.0)` and `RCONST(-0.0)` apart, `RCONST(NaN)` equal to itself; `==` has
 them the other way round, as numbers).
 """
-function Base.isequal(a::T, b::T)::Bool where {T <: Node}
-  for f in fieldnames(T)
-    isequal(getfield(a, f), getfield(b, f)) || return false
-  end
-  return true
+@generated function Base.isequal(a::T, b::T)::Bool where {T <: Node}
+  return IR.fieldComparison(T, isequal)
 end
 Base.isequal(::Node, ::Node)::Bool = false
 
-function Base.hash(a::T, h::UInt)::UInt where {T <: Node}
-  local r = hash(T, h)
-  for f in fieldnames(T)
-    r = hash(getfield(a, f), r)
-  end
-  return r
+"Fields hashed one by one after the type's name, an enumeration value by its integer: the same in every build (unrolled, as OMJLIR's values: `IR.fieldHashing`, `IR.fieldHash`)."
+@generated function Base.hash(a::T, h::UInt)::UInt where {T <: Node}
+  return IR.fieldHashing(T, IR.fieldHash)
 end
 
 #= ==================================================================================== =#
@@ -157,20 +148,28 @@ end
 #= ==================================================================================== =#
 
 """
-    SimCref(sym, subs = Int[])
+    SimCref(sym, subs, ref)
 
-A reference to a simulation variable: its flat name (`body_frame_a_r_0`, `x[2]`) and, for an
-element of an array variable kept as an array, the integer subscripts. A single `===` on the
-symbol compares names.
+A reference to a simulation variable: its key (`body_frame_a_r_0`, `x[2]`), for an element of an
+array variable kept as an array the integer subscripts, and the IR reference it was lowered from
+(`ref`: the variable's, an element's with its subscripts, a record's field's, a function's local's), by
+whose parts every structural question is answered (the array an element is of, a record's field). The
+key is the reference's flat name (`refKey`; a function's local's its identifier, `derivedKey`); in the
+code view (`codeView`) the identifier. Equal by key and subscripts: a single `===` on the symbol compares
+names. `ref` is `nothing` only in tests.
 """
 struct SimCref
   sym::Symbol
   subs::Vector{Int}
+  ref::Union{Nothing, IR.ComponentRef}
 end
 
-SimCref(sym::Symbol) = SimCref(sym, Int[])
-SimCref(name::AbstractString) = SimCref(Symbol(name), Int[])
-SimCref(name::AbstractString, subs::Vector{Int}) = SimCref(Symbol(name), subs)
+"A reference by its key alone, without its IR reference: tests."
+SimCref(sym::Symbol) = SimCref(sym, Int[], nothing)
+
+"The IR reference of `c`; an error naming its key if it has none (a test's)."
+irRef(c::SimCref)::IR.ComponentRef =
+  c.ref === nothing ? error("SimCode reference $(c.sym) has no IR reference") : c.ref
 
 Base.:(==)(a::SimCref, b::SimCref)::Bool = a.sym === b.sym && a.subs == b.subs
 Base.isequal(a::SimCref, b::SimCref)::Bool = a == b
@@ -327,7 +326,12 @@ struct ASUB <: Exp
   subs::Vector{Exp}
 end
 
-"Output `index` of the tuple `exp`."
+"""
+    TSUB(exp, index, ty)
+
+Element `index` of the tuple a call `exp` returns: its position in the function's result as generated, a record
+output's fields in place (`Passes.tupleAssignElements`: `(r, q) := f(x)` assigns `r.a`, `r.b`, `q` elements 1, 2, 3).
+"""
 struct TSUB <: Exp
   exp::Exp
   index::Int
@@ -467,12 +471,21 @@ struct TERMINATE <: Statement
   source::Source
 end
 
-"`reinit(stateVar, value)`."
+"""
+    REINIT(stateVar, value, source, subscripts)
+
+`reinit(stateVar, value)`; of an element of an array state of a model with its arrays kept (`lowerArraySystem`) the
+state variable and the element's subscripts (an iterator's, `x[i]`), none otherwise.
+"""
 struct REINIT <: Statement
   stateVar::SimCref
   value::Exp
   source::Source
+  subscripts::Vector{Exp}
 end
+
+"`reinit(stateVar, value)` of a state, no subscripts."
+REINIT(stateVar::SimCref, value::Exp, source::Source) = REINIT(stateVar, value, source, Exp[])
 
 "A call without outputs as a statement."
 struct NORETCALL <: Statement
@@ -508,15 +521,22 @@ end
 #= ==================================================================================== =#
 
 """
-    EQ_ATTR(differentiated, alsoInitial)
+    EQ_ATTR(differentiated, alsoInitial, everyEvent = false)
 
 `differentiated`: the equation is the derivative of another (index reduction). `alsoInitial`:
-a when-equation's runtime arm whose condition had `initial()` too.
+a when-equation's runtime arm whose condition had `initial()` too. `everyEvent`: a when-equation
+of discrete equations (a lifted cluster, OMJLIR's `EQ_DISCRETE`) that the array code runs
+where it runs the discrete equations in event mode, at every pass of every event and of the
+start's iteration, its conditions the events' sources (OpenModelica's discrete equations: held
+between events, pre() the initial values after the initialization).
 """
 struct EQ_ATTR <: Node
   differentiated::Bool
   alsoInitial::Bool
+  everyEvent::Bool
 end
+
+EQ_ATTR(differentiated::Bool, alsoInitial::Bool) = EQ_ATTR(differentiated, alsoInitial, false)
 
 const EQ_ATTR_DEFAULT = EQ_ATTR(false, false)
 
@@ -543,6 +563,19 @@ struct ARRAY_EQUATION <: Equation
   dimSize::Vector{Int}
   left::Exp
   right::Exp
+  source::Source
+  attr::EQ_ATTR
+end
+
+"""
+    FOR_EQUATION(iterator, body, source, attr)
+
+`for iterator loop body end for`: the equations of `body` for each value of the iterator's range, which they read
+as an `EXP_CREF` of its name (of no IR reference); a model with its arrays kept (`SIM_CODE.arrayEquations`).
+"""
+struct FOR_EQUATION <: Equation
+  iterator::Iterator
+  body::Vector{Equation}
   source::Source
   attr::EQ_ATTR
 end
@@ -594,6 +627,19 @@ struct INLINE_IF_EQUATION <: Equation
   attr::EQ_ATTR
 end
 
+"""
+    UNLOWERED_EQUATION(what, construct, source)
+
+An equation of a branch of an if-equation the lowering of a model with its arrays kept (`lowerArraySystem`) could not
+express (UnsupportedLowering: what, and the construct's text): the branch may never be taken (a parameter's condition),
+so the code generators refuse it only where they reach it, with the reason.
+"""
+struct UNLOWERED_EQUATION <: Equation
+  what::String
+  construct::String
+  source::Source
+end
+
 "`assert(condition, message, level)` outside a when-clause: checked after each step."
 struct ASSERT_EQUATION <: Equation
   condition::Exp
@@ -638,32 +684,31 @@ struct DATA_STRUCTURE <: SimVarType
   bindExp::Union{Nothing, Exp}
 end
 
-"An array variable kept as an array: its dimensions and binding."
-struct ARRAY <: SimVarType
-  dimensions::Vector{Int}
-  bindExp::Union{Nothing, Exp}
-end
+"""
+    PARAMETER(bindExp, value = nothing)
 
-"A parameter, with its binding."
+A parameter (an array parameter, `SIMVAR.dims`, too), with its binding and its value where the lowering evaluated it (a
+model with its arrays kept: `lowerArraySystem`, by OMJLIR's Evaluation; a constant, an array one an array literal);
+`nothing` otherwise, and once its binding changes (`withBinding`).
+"""
 struct PARAMETER <: SimVarType
   bindExp::Union{Nothing, Exp}
+  value::Union{Nothing, Exp}
 end
 
-"An array parameter: its dimensions and binding."
-struct ARRAY_PARAMETER <: SimVarType
-  dimensions::Vector{Int}
-  bindExp::Union{Nothing, Exp}
-end
+PARAMETER(bindExp::Union{Nothing, Exp}) = PARAMETER(bindExp, nothing)
 
 "A discrete-time variable."
 struct DISCRETE <: SimVarType end
 
 """
     SimVarAttributes(start, fixed, nominal, min, max, unit, displayUnit, quantity, stateSelect,
-                     isProtected)
+                     isProtected, startExps = nothing)
 
 A variable's built-in attributes the code generators read: an expression for each one given,
-`nothing` for one not; `isProtected` for a protected variable.
+`nothing` for one not; `isProtected` for a protected variable. `startExps`: the start of each
+element (row-major) as written, where one reads a parameter (the array code's `start` is the
+evaluated constants; it computes these again from overridden parameters); `nothing` otherwise.
 """
 struct SimVarAttributes <: Node
   start::Union{Nothing, Exp}
@@ -676,17 +721,29 @@ struct SimVarAttributes <: Node
   quantity::Union{Nothing, Exp}
   stateSelect::Union{Nothing, Symbol}
   isProtected::Bool
+  startExps::Union{Nothing, Vector{Exp}}
 end
+
+SimVarAttributes(start, fixed, nominal, min, max, unit, displayUnit, quantity, stateSelect, isProtected::Bool) =
+  SimVarAttributes(start, fixed, nominal, min, max, unit, displayUnit, quantity, stateSelect, isProtected, nothing)
 
 const NO_ATTRIBUTES = SimVarAttributes(nothing, nothing, nothing, nothing, nothing, nothing, nothing,
                                        nothing, nothing, false)
 
 """
+    SIMVAR(name, index, varKind, attributes, elementType, dims, irKind, irOrigin, ref)
     SIMVAR(name, index, varKind, attributes, elementType)
 
 A simulation variable: its name, index (1-based, per category; `nothing` before indexing),
-category, attributes, and the type of its scalars (of an array variable, of its elements):
-what the code generators read to declare an Integer, Boolean or enumeration variable.
+category, attributes, the type of its scalars (of an array variable, of its elements):
+what the code generators read to declare an Integer, Boolean or enumeration variable; its
+dimensions (an array variable's sizes, outermost first; none for a scalar): its shape, apart
+from its category (an array state is a `STATE`, an array parameter a `PARAMETER`); its kind in OMJLIR (`IR.VariableKind`: a state, a state's derivative as an algebraic
+unknown, index reduction's dummy derivative or dummy state, ...), the variables it names
+by their simulation names (`simKind`), its origin there (`:model` for one of the flat
+model, else the pass that introduced it) and its reference there (`ref`: its parts, from which its
+name is derived; a state's derivative the IR derivative variable's); `nothing` for a variable that is
+not the IR's.
 """
 struct SIMVAR <: Node
   name::String
@@ -694,20 +751,29 @@ struct SIMVAR <: Node
   varKind::SimVarType
   attributes::SimVarAttributes
   elementType::SType
+  dims::Vector{Int}
+  irKind::Union{Nothing, IR.VariableKind}
+  irOrigin::Union{Nothing, Symbol}
+  ref::Union{Nothing, IR.ComponentRef}
 end
+
+"A scalar variable of no IR kind, origin and reference: tests."
+SIMVAR(name::String, index::Union{Nothing, Int}, varKind::SimVarType, attributes::SimVarAttributes, elementType::SType) =
+  SIMVAR(name, index, varKind, attributes, elementType, Int[], nothing, nothing, nothing)
 
 #= ==================================================================================== =#
 #= Functions and initial algorithms                                                     =#
 #= ==================================================================================== =#
 
 """
-    FunctionVariable(name, ty, dimensions, default, fieldDefaults)
+    FunctionVariable(name, ty, dimensions, default, fieldDefaults, cref)
 
-An input, output or protected variable of a function: its name; its type (an array's
-TYPE_ARRAY, a size an expression gives -1); an array's dimensions as expressions, for its
-allocation (`ICONST(n)`, an expression of the inputs `size(u, 1)`, `ICONST(0)` for `:`); its
-default value (`nothing` for none); for a record instance its fields' defaults (the
-instance's modifiers, the record's), by field.
+An input, output or protected variable of a function: its name (its identifier in the
+generated function); its type (an array's TYPE_ARRAY, a size an expression gives -1); an
+array's dimensions as expressions, for its allocation (`ICONST(n)`, an expression of the
+inputs `size(u, 1)`, `ICONST(0)` for `:`); its default value (`nothing` for none); for a record
+instance its fields' defaults (the instance's modifiers, the record's), by field; its IR
+reference (what the function body's references to it are, the name derived from it).
 """
 struct FunctionVariable <: Node
   name::String
@@ -715,6 +781,7 @@ struct FunctionVariable <: Node
   dimensions::Vector{Exp}
   default::Union{Nothing, Exp}
   fieldDefaults::Vector{Pair{String, Exp}}
+  cref::IR.ComponentRef
 end
 
 """
@@ -858,6 +925,29 @@ struct AliasEntry
 end
 
 """
+    ReferenceIndex(references, keyByReference, arrayOf, codeNames, elementNames)
+    ReferenceIndex(ht, order, modelName; elementNames)
+
+The simulation code's variables by their IR references and the names derived from them, built together from the
+variables' references once at lowering (`ReferenceIndex(ht, order, modelName)`) and renamed together (`codeView`):
+- `references`: every variable's IR reference by its key (`SIMVAR.ref`), the eliminated ones' too (a state's
+  derivative the IR derivative variable's): the structure of a name (`referenceOf`);
+- `keyByReference`: the keys by the references' names, `references` inverted (`keyOf`);
+- `arrayOf`: the array each element variable is an element of, by its key (`arrayBase` of its reference;
+  `elementArray`);
+- `codeNames`: each variable's identifier in the generated code by its key (`codeIdentifiers`; `codeName`): what the
+  code generators and OM.jl's results know it by (`a_b[1][2]` of `a.b[1,2]`, `der(x)` of a state's derivative).
+"""
+struct ReferenceIndex
+  references::Dict{String, IR.ComponentRef}
+  keyByReference::Dict{Symbol, String}
+  arrayOf::Dict{String, Symbol}
+  codeNames::Dict{String, String}
+  "An array variable's element names (row-major), by its key: a model with its arrays kept (`lowerArraySystem`)."
+  elementNames::Dict{String, Vector{String}}
+end
+
+"""
     SIM_CODE
 
 The simulation code of a model: its variables by name (index, SimVar), its residual, initial,
@@ -893,8 +983,73 @@ struct SIM_CODE
   foldedVariables::Vector{String}
   "OMBackend reduced the model's index (Passes.IndexReduction, OMBACKEND_INDEX_REDUCTION): MTK only tears."
   indexReduced::Bool
-  "Its dummy derivatives (simulation names): algebraic, left out of the error control (`defaultToleranceKwargs`)."
-  dummyDerivatives::Vector{String}
+  """
+  The variables' IR references, the keys by them, the arrays of the elements and the identifiers in the generated
+  code (`ReferenceIndex`). The code generators see the simulation code renamed to the identifiers (`codeView`); the
+  passes match user-given names against them.
+  """
+  referenceIndex::ReferenceIndex
+  """
+  The equations of a model lowered with its arrays kept (`lowerArraySystem`), in their order: scalar ones as written
+  (`EQUATION`, a tuple's too), for-equations (`FOR_EQUATION`), if-equations (`INLINE_IF_EQUATION`), asserts, when-
+  equations (`WHEN_EQUATION`, the initial ones `INITIAL_WHEN_EQUATION`). Empty for a scalar model, whose equations
+  are in the fields above; no pass of the scalar model's reads them.
+  """
+  arrayEquations::Vector{Equation}
+  "The initial equations of a model lowered with its arrays kept, in their order (as `arrayEquations`)."
+  arrayInitialEquations::Vector{Equation}
+end
+
+"""
+The array the variable `key` is an element of (`arrayBase` of its reference: `x` of `x[2]`, `c` of `c[2].T`), from
+`ReferenceIndex.arrayOf`; `nothing` for a variable that is no element.
+"""
+elementArray(sc::SIM_CODE, key::String)::Union{Nothing, Symbol} = get(sc.referenceIndex.arrayOf, key, nothing)
+
+"The IR reference of the variable `key` (`ReferenceIndex.references`, an eliminated variable's too); `nothing` for a name of no variable."
+referenceOf(sc::SIM_CODE, key::String)::Union{Nothing, IR.ComponentRef} = get(sc.referenceIndex.references, key, nothing)
+
+"The arrays of the element variables of `references`, by their keys (`ReferenceIndex.arrayOf`)."
+function elementArrays(references::Dict{String, IR.ComponentRef})::Dict{String, Symbol}
+  local out::Dict{String, Symbol} = Dict{String, Symbol}()
+  for (key::String, ref::IR.ComponentRef) in references
+    local array::Symbol = arrayBase(ref)
+    array === ref.name || (out[key] = array)
+  end
+  return out
+end
+
+"The identifier of the variable `key` in the generated code (`ReferenceIndex.codeNames`); `key` itself for a name of no variable (`time`, an iterator)."
+codeName(sc::SIM_CODE, key::AbstractString)::String = get(sc.referenceIndex.codeNames, key, key)
+
+"The key of the variable the IR reference `ref` (or of the reference name `name`) names; `nothing` for one that names none."
+keyOf(sc::SIM_CODE, ref::IR.ComponentRef)::Union{Nothing, String} = keyOf(sc, ref.name)
+keyOf(sc::SIM_CODE, name::Symbol)::Union{Nothing, String} = get(sc.referenceIndex.keyByReference, name, nothing)
+
+"""
+    identifierOf(sc, ref) -> String
+
+The identifier of the IR reference `ref` in the code view `sc` (`codeView`): its variable's (`keyOf`), else derived
+from the reference (`derivedKey`: a field of a record whose fields are the variables, an element of an array kept
+whole).
+"""
+function identifierOf(sc::SIM_CODE, ref::IR.ComponentRef)::String
+  local id::Union{Nothing, String} = keyOf(sc, ref)
+  return id === nothing ? derivedKey(ref) : id
+end
+
+"The IR reference of the variable `v`; an error naming it if it has none (a test's mock)."
+irRef(v::SIMVAR)::IR.ComponentRef = v.ref === nothing ? error("SimCode variable $(v.name) has no IR reference") : v.ref
+
+"The keys by the IR references' names of `references`; an error naming both keys if two variables have one reference."
+function referenceKeys(references::Dict{String, IR.ComponentRef})::Dict{Symbol, String}
+  local byReference::Dict{Symbol, String} = Dict{Symbol, String}()
+  for (key::String, ref::IR.ComponentRef) in references
+    local other::Union{Nothing, String} = get(byReference, ref.name, nothing)
+    other === nothing || error("SimCode variables $(join(sort([other, key]), " and ")) have one IR reference, $(ref.name)")
+    byReference[ref.name] = key
+  end
+  return byReference
 end
 
 """

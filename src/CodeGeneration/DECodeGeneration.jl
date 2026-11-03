@@ -84,7 +84,7 @@ function buildDELayout(simCode::SC.SIM_CODE)::DELayout
   for (name, (_, simVar)) in simCode.stringToSimVarHT
     local k = simVar.varKind
     k isa SC.STATE && push!(stateNames, name)
-    k isa SC.PARAMETER && push!(paramNames, name)
+    SC.isScalarParameter(simVar) && push!(paramNames, name)
     k isa SC.ALG_VARIABLE && push!(algNames, name)
     k isa SC.DISCRETE && push!(discreteNames, name)
   end
@@ -118,6 +118,7 @@ function expToJuliaExpDE(e::SC.EXP_CREF, layout::DELayout, simCode::SC.SIM_CODE)
   local kind = last(entry).varKind
   kind isa SC.STATE && return Expr(:ref, :u, layout.stateIndex[varName])
   kind isa SC.STATE_DERIVATIVE && return Expr(:ref, :du, layout.stateIndex[kind.varName])
+  SC.isArrayParameter(last(entry)) && error("DEMode: array parameter '$(varName)' encountered. Scalar parameters only at this milestone.")
   kind isa SC.PARAMETER && return Expr(:ref, :p, layout.paramIndex[varName])
   kind isa SC.ALG_VARIABLE && error("DEMode: algebraic variable '$(varName)' encountered. Pure-ODE scope only at this milestone.")
   kind isa SC.DISCRETE && error("DEMode: discrete variable '$(varName)' encountered. Discrete/event support is not in the initial milestone.")

@@ -190,7 +190,8 @@ function checkReferenceResolution(simCode::SIM_CODE)::Vector{CheckViolation}
   local out = CheckViolation[]
   local ht = simCode.stringToSimVarHT
   local known = union(OrderedSet{String}(keys(ht)), OrderedSet{String}(simCode.eliminatedVariables), BUILTIN_NAMES)
-  local bases = Set{String}(baseName(k) for k in keys(ht))
+  #= every variable's array (`elementArray`), or its own name for one that is no element: a subscripted read's array is one of them =#
+  local bases::Set{Symbol} = Set{Symbol}(something(elementArray(simCode, k), sv.ref.name) for (k, (_, sv)) in ht if sv.ref !== nothing)
   for (i, eq) in enumerate(simCode.residualEquations)
     local bound = Set{String}()
     foreachExp(e -> e isa REDUCTION && foreach(it -> push!(bound, String(it.name)), e.iterators), eq.exp)
@@ -201,7 +202,7 @@ function checkReferenceResolution(simCode::SIM_CODE)::Vector{CheckViolation}
       e isa Union{EXP_CREF, DER, PRE} || return
       local nm = crefName(e.cref)
       (nm in known || nm in bound) && return
-      (e isa EXP_CREF && e in subscripted && nm in bases) && return
+      (e isa EXP_CREF && e in subscripted && e.cref.ref !== nothing && arrayBase(e.cref.ref) in bases) && return
       push!(missing, nm)
     end
     foreach(nm -> push!(out, CheckViolation(:cref_resolution, :error, "residualEquations[$i]",
@@ -215,6 +216,30 @@ checkCanonicalNames(simCode::SIM_CODE)::Vector{CheckViolation} =
   CheckViolation[CheckViolation(:canonical_cref_names, :error, name, "stringToSimVarHT key is not canonical")
                  for name in keys(simCode.stringToSimVarHT) if occursin('.', name)]
 
+"""
+The references of the simulation code: every variable has its IR reference (`SIMVAR.ref`, in
+`ReferenceIndex.references`), none of whose parts carries structure in its name (`IR.structureInName`), and every
+reference the equations read (residual, initial, if-equations' branches, when bodies, asserts, initial
+algorithms) has one (`SimCref.ref`): the structure of every name, so that no pass takes a name apart.
+"""
+function checkReferences(simCode::SIM_CODE)::Vector{CheckViolation}
+  local out::Vector{CheckViolation} = CheckViolation[]
+  for (key, (_, sv)) in simCode.stringToSimVarHT
+    (sv.ref === nothing || referenceOf(simCode, key) === nothing) &&
+      push!(out, CheckViolation(:references, :error, key, "variable without its IR reference"))
+  end
+  for (key, ref) in simCode.referenceIndex.references
+    IR.structureInName(ref) && push!(out, CheckViolation(:references, :error, key, "IR reference $(ref.name) with structure in a part's name"))
+  end
+  local missing::Function = (place::Tuple{Symbol, Int}, c::SimCref) -> c.ref === nothing &&
+    push!(out, CheckViolation(:references, :error, "$(place[1])[$(place[2])]", "reference `$(crefName(c))` without its IR reference"))
+  foreachEquationExp(simCode; statement = (place::Tuple{Symbol, Int}, s::Statement) ->
+                       foreach(c::SimCref -> missing(place, c), statementTargets!(SimCref[], s))) do place::Tuple{Symbol, Int}, e::Exp
+    foreachExp(x::Exp -> (x isa Union{EXP_CREF, DER, PRE} && missing(place, x.cref); nothing), e)
+  end
+  return out
+end
+
 "The rules `check` runs, in order."
 const CHECK_RULES = Function[checkBalanced, checkAliasConsistency, checkEliminatedVariablesPruned, checkDeadStates,
-                             checkReferenceResolution, checkCanonicalNames]
+                             checkReferenceResolution, checkCanonicalNames, checkReferences]
