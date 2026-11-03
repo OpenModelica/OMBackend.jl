@@ -110,3 +110,16 @@ end
   #= at the initialization (H = 0): literal =#
   @test run(false, >=, 5.0, 5.0; H = 0.0)[1] && !run(false, >, 5.0, 5.0; H = 0.0)[1] && !run(true, >, 5.0, 5.0; H = 0.0)[1]
 end
+
+#= A relation at the initialization on its boundary to rounding takes the exact tie's value, whatever the sign of the
+   rounding: an open switch's arc-out relation `abs(i) <= abs(v)*Goff` compares the sides of `i = Goff*v`, left at
+   +-1e-13 by the initialization's solve (MSL CloserWithArc; ArcSwitchYD went another way on the CI's runners). =#
+@testset "Initial relations on their boundary" begin
+  local CG = OMBackend.CodeGeneration
+  for zc in (3.4e-13, -1.9e-13, 0.0)
+    @test CG._initialLiteral([zc, 1.00071], 1, false)
+    @test !CG._initialLiteral([zc, 1.00071], 1, true)
+  end
+  #= off the boundary: literal =#
+  @test !CG._initialLiteral([1.0e-9, 1.0], 1, false) && CG._initialLiteral([-1.0e-9, 1.0], 1, true)
+end

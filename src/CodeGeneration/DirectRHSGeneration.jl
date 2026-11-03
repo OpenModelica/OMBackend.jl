@@ -1509,7 +1509,7 @@ function _initialDiscreteChanges(dc, u, pv, t0::Float64 = 0.0)
     local v = Base.invokelatest(c.values, u, pv, t0)
     local zs = similar(c.zs)
     Base.invokelatest(c.crossings!, zs, u, pv, t0)
-    local rel = Bool[_literal(zs, k, c.strict[k]) for k in eachindex(c.rel)]
+    local rel = Bool[_initialLiteral(zs, k, c.strict[k]) for k in eachindex(c.rel)]
     local pre = [something(s, x) for (s, x) in zip(preStart, _preValues(c, v))]
     local vals = Base.invokelatest(c.body, point, _operands(c, v), pre, rel, copy(rel), true)
     vals === nothing && continue

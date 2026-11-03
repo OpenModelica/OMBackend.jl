@@ -140,6 +140,15 @@ _crossingValues!(c::DiscreteCluster, integrator) = _crossingValues!(c, integrato
 _literal(zs, k::Int, strict::Bool) = strict ? zs[2k - 1] < 0 : zs[2k - 1] <= 0
 
 """
+Relation k's value at the initialization: literal (MLS 8.5), and on its boundary to rounding (`_onBoundary`) the exact
+tie's (a non-strict relation holds, a strict one does not). An open switch's arc-out relation `abs(i) <= abs(v)*Goff`
+(MSL CloserWithArc) compares the two sides of its own equation `i = Goff*v`: the initialization's solve leaves it at
++-1e-13, and the platform's rounding decided its value (true on a Mac, false on the CI's runners: the arcs went out at
+other times, or the Y-D switch's closers chattered at 45 ms).
+"""
+_initialLiteral(zs, k::Int, strict::Bool)::Bool = _onBoundary(zs[2k - 1], zs[2k]) ? !strict : _literal(zs, k, strict)
+
+"""
 Relation k by the hysteresis rule from `old`; an exact one literal.
 """
 function _ruled(c::DiscreteCluster, zs, k::Int, H, old::Bool)
@@ -301,12 +310,13 @@ function _update!(c::DiscreteCluster, integrator)
 end
 
 """
-Every relation literal on the state (MLS 8.5, as at initialization).
+Every relation literal on the state (MLS 8.5, as at initialization; a tie to rounding as the exact tie,
+`_initialLiteral`).
 """
 function _literalBuffers!(c::DiscreteCluster, integrator)
   local zs = _crossingValues!(c, integrator)
   for k in eachindex(c.rel)
-    c.rel[k] = _literal(zs, k, c.strict[k])
+    c.rel[k] = _initialLiteral(zs, k, c.strict[k])
   end
   fill!(c.crossed, false)
   fill!(c.locatedAt, NaN)
