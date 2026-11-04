@@ -438,5 +438,5 @@ function withAlgebraicStepControl(callbacks, problem)
                                          initialize = (cb, u, t, integrator) -> _startStepControl!(c, integrator),
                                          save_positions = (false, false),
                                          initializealg = ModelingToolkit.SciMLBase.NoInit())
-  return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(cb, callbacks)
+  return _joinCallbacks(cb, callbacks)
 end

@@ -2516,10 +2516,10 @@ and merge them with custom callbacks (e.g. VSS structural change callbacks).
 Requires the reduced system to have been compiled with `split=false` so that
 the generated event callback functions expect a flat parameter vector.
 """
-function _extractAndMergeEventCallbacks(reducedSystem, customCallbacks)
+function _extractAndMergeEventCallbacks(reducedSystem, @nospecialize(customCallbacks))
   local eventCBs = nothing
   try
-    eventCBs = ModelingToolkit.process_events(reducedSystem; callback=customCallbacks)
+    eventCBs = ModelingToolkit.process_events(reducedSystem)
   catch ex
     #= Without the system's own events (if-equation relations, whens) the
        result is wrong (it went on with the custom callbacks only, a warning:
@@ -2534,7 +2534,13 @@ function _extractAndMergeEventCallbacks(reducedSystem, customCallbacks)
     return customCallbacks
   end
   @debug "DirectRHS: extracted event callbacks from reduced system"
-  return eventCBs
+  #= In the order of process_events(sys; callback = customCallbacks), the system's continuous
+     callbacks, then the custom ones, the custom discrete callbacks, then the system's, as the
+     erased set (_joinCallbacks): its merge made the tuple of them all. =#
+  local events::DiffEqBase.CallbackSet = _joinCallbacks(eventCBs)
+  local custom::DiffEqBase.CallbackSet = _joinCallbacks(customCallbacks)
+  return DiffEqBase.CallbackSet(Any[events.continuous_callbacks..., custom.continuous_callbacks...],
+                                Any[custom.discrete_callbacks..., events.discrete_callbacks...])
 end
 
 
@@ -2558,7 +2564,7 @@ function withProblemCallbacks(problem, buildCallbacks, callbacks)
   local domain = control === nothing ? NamedTuple() : (; isoutofdomain = AlgebraicDomainCheck(control))
   #= Lazily: a remake of an MTK problem with trivial initialization would
      otherwise run it now, at build time, instead of in the solve. =#
-  return ModelingToolkit.SciMLBase.remake(problem; callback = DiffEqBase.CallbackSet(own..., _callbackList(callbacks)...),
+  return ModelingToolkit.SciMLBase.remake(problem; callback = _joinCallbacks(own..., callbacks),
                                           lazy_initialization = true, domain...)
 end
 _callbackList(::Nothing) = Any[]
@@ -2764,25 +2770,49 @@ function _eraseContinuousCallbacks(cbset)
                                 initialize = initW, rootfind = rootfind, save_positions = savePos,
                                 initializealg = reinit)
   end
-  return SB.CallbackSet(vcc, dc...)
+  return _joinCallbacks(vcc, dc...)
 end
+
+"""
+    _joinCallbacks(parts...) -> CallbackSet
+
+The callbacks of `parts` (callback sets, callbacks, nothing) in one set, each kind in the order of the parts as
+SciMLBase's `CallbackSet(parts...)` orders them, but as two `Vector{Any}`, DiffEqBase's own erased form: one type for
+every model. The vararg constructor makes a tuple of the callbacks' types, a new type at each merge of a build, and the
+functions given the set or the problem holding it compiled again for each model (2026-11-04, MSL BatchPlant: 91
+instances of `split_callbacks`, 4 s; 12 of its translate's 12.8 s of compilation on such types). DiffEqBase's erased
+loops call each callback through `invokelatest`, in the order of the set.
+"""
+function _joinCallbacks(@nospecialize(parts...))::DiffEqBase.CallbackSet
+  local continuous = Any[]
+  local discrete = Any[]
+  for p in parts
+    _appendCallbacks!(continuous, discrete, p)
+  end
+  return DiffEqBase.CallbackSet(continuous, discrete)
+end
+
+_appendCallbacks!(::Vector{Any}, ::Vector{Any}, ::Nothing)::Nothing = nothing
+function _appendCallbacks!(continuous::Vector{Any}, discrete::Vector{Any}, set::DiffEqBase.CallbackSet)::Nothing
+  append!(continuous, set.continuous_callbacks)
+  append!(discrete, set.discrete_callbacks)
+  return nothing
+end
+_appendCallbacks!(continuous::Vector{Any}, ::Vector{Any}, @nospecialize(cb::ModelingToolkit.SciMLBase.AbstractContinuousCallback))::Nothing =
+  (push!(continuous, cb); nothing)
+_appendCallbacks!(::Vector{Any}, discrete::Vector{Any}, @nospecialize(cb::ModelingToolkit.SciMLBase.AbstractDiscreteCallback))::Nothing =
+  (push!(discrete, cb); nothing)
 
 """
     _eraseCallbackSet(cbset)
 
-`cbset` (a `CallbackSet`, one callback or nothing) as a `CallbackSet` of two `Vector{Any}`, DiffEqBase's own erased
-form, which it builds only for `AutoSpecialize` problems. The integrator's type then no longer holds the tuple of the
-model's callbacks, whose length and kinds differ per model (relation refresh, delays, asserts, the step control), so
-`solve` and the initialization compile once per process, not once per model (2026-11-04: 0.6-0.9 s of `solve!` and
-0.25 s of `initialize_dae!` per model). The erased loops call each callback through `invokelatest`, in the order of the
-set, compiled once per callback type. A solve that merges another callback set with it (a `callback` keyword) splats
-it back into tuples: correct, only specialized again.
+`cbset` (a `CallbackSet`, one callback or nothing) as the erased set of `_joinCallbacks`, for the solve: the integrator's
+type then no longer holds the tuple of the model's callbacks, so `solve` and the initialization compile once per
+process, not once per model (2026-11-04: 0.6-0.9 s of `solve!` and 0.25 s of `initialize_dae!` per model). A solve
+that merges another callback set with it (a `callback` keyword) splats it back into tuples: correct, only specialized
+again.
 """
-function _eraseCallbackSet(cbset)::DiffEqBase.CallbackSet
-  cbset === nothing && return DiffEqBase.CallbackSet(Any[], Any[])
-  local set::DiffEqBase.CallbackSet = cbset isa DiffEqBase.CallbackSet ? cbset : DiffEqBase.CallbackSet(cbset)
-  return DiffEqBase.CallbackSet(collect(Any, set.continuous_callbacks), collect(Any, set.discrete_callbacks))
-end
+_eraseCallbackSet(@nospecialize(cbset))::DiffEqBase.CallbackSet = _joinCallbacks(cbset)
 
 
 """

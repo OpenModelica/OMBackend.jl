@@ -143,7 +143,7 @@ function createCallbackCode(modelName::String, simCode::SC.SIM_CODE; generateSav
       $(WHEN_EQUATIONS...)
       $(LineNumberNode((@__LINE__), "IF EQUATIONS"))
       $(SAVE_FUNCTION)
-      return $(Expr(:call, :CallbackSet, returnCallbackSet()...))
+      return $(Expr(:call, :(OMBackend.CodeGeneration._joinCallbacks), returnCallbackSet()...))
     end
   end
 end
@@ -764,7 +764,7 @@ function _sampleTickCallback(tickAt::Base.RefValue{Float64}, affect!::Function, 
     DiffEqCallbacks.PeriodicCallback(tick!, dt; phase = phase, initial_affect = initialTick, final_affect = true,
                                      save_positions = (false, false))
   end
-  return DiffEqBase.CallbackSet(ticks...)
+  return _joinCallbacks(ticks...)
 end
 
 """

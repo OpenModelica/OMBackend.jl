@@ -772,9 +772,9 @@ function ODE_MODE_MTK(simCode::SC.SIM_CODE)
       #= END =#
       # Also need to have the original callbacks
       callbackConditions = $(if !isempty(structuralCallbacks)
-                               :(CallbackSet(callbacks, callbackSet...))
+                               :(OMBackend.CodeGeneration._joinCallbacks(callbacks, callbackSet...))
                              else
-                               :(CallbackSet(callbacks, callbackSet...))
+                               :(OMBackend.CodeGeneration._joinCallbacks(callbacks, callbackSet...))
                              end)
       #= Create the composite model. Dispatch on the mass matrix of the initial
          submodel exactly like the submodel builder does: pure ODE takes the

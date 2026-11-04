@@ -1435,7 +1435,7 @@ iteration pending (withRelationRefresh), which evaluates the discrete clusters t
 function _withTicks(callbacks, interval::Real, phase::Real, initialTick::Bool)
   local cb = DiffEqCallbacks.PeriodicCallback(_ -> nothing, interval; phase = phase, initial_affect = initialTick,
                                               final_affect = true, save_positions = (false, false))
-  return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(callbacks, cb)
+  return _joinCallbacks(callbacks, cb)
 end
 
 """

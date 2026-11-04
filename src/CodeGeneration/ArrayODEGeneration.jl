@@ -2219,7 +2219,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       pushfirst!(cbs, DiscreteCallback((u, t, integrator) -> false, integrator -> nothing;
                                        initialize = (c, u, t, integrator) -> $(_restoreStart!)(integrator.p),
                                        save_positions = (false, false)))
-      local cb = isempty(cbs) ? nothing : CallbackSet(cbs...)
+      local cb = isempty(cbs) ? nothing : OMBackend.CodeGeneration._joinCallbacks(cbs...)
       $(hasTerminate ? quote
           #= a terminate() at the initialization: the problem ends at its start =#
           p.state.terminated === nothing || return (ODEProblem(f, u0, (tspan[1], tspan[1]), p), cb)
