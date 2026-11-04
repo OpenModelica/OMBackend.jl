@@ -86,14 +86,32 @@ end
 """
 Bakes the type-erased DirectRHS solve into the image. Builds the problem
 through the real `buildDirectRHSProblem` (so the type matches what models
-produce) and solves with the two default solvers.
+produce) and solves it as a model's build does (`_precompileSolveAsModels`).
 """
 function _precompileWarmupDirectRHS()
   local (reduced, ivs, pars) = _precompileBuildReduced()
-  local callbacks = ModelingToolkit.SciMLBase.CallbackSet()
-  local prob = CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), callbacks)
-  solve(prob, defaultSolver())
-  solve(prob, daeFallbackSolver())
+  local callbacks = CodeGeneration._joinCallbacks()
+  _precompileSolveAsModels(CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), callbacks), callbacks)
+  return nothing
+end
+
+"""
+    _precompileSolveAsModels(prob, buildCallbacks)
+
+The solves of a model's build of `prob` from `buildCallbacks` (the generated build and `simulateFromBuild`, and
+simulateIMTK): its step control for a DAE (withAlgebraicStepControl, withProblemCallbacks: the solve's
+`isoutofdomain`), the callback set collapsed and erased, the solver `defaultSolverFor` picks from the default solver
+and from the DAE fallback, the default initialization and tolerances: the integrator types a model's solve has, compiled
+into the image. Solved without them, every process's first model compiled `solve!` again (2026-11-04).
+"""
+function _precompileSolveAsModels(prob, buildCallbacks)::Nothing
+  local callbacks = CodeGeneration.withAlgebraicStepControl(buildCallbacks, prob)
+  prob = _precompileCollapseCallback(CodeGeneration.withProblemCallbacks(prob, buildCallbacks, callbacks))
+  local initKw = CodeGeneration.defaultInitializeKwargs(prob, (;), false)
+  local tolKw = CodeGeneration.defaultToleranceKwargs(prob, (;))
+  for solver in (defaultSolver(), daeFallbackSolver())
+    solve(prob, CodeGeneration.defaultSolverFor(solver, prob, prob.f.sys, Set{Symbol}(), false); initKw..., tolKw...)
+  end
   return nothing
 end
 
@@ -111,39 +129,26 @@ function _precompileCBAffect!(integrator)::Nothing
   return nothing
 end
 
-#= Builds a pure-ODE DirectRHS problem carrying one continuous callback, so the
-   erased callback collapses to the single model-independent
-   `VectorContinuousCallback` that the legacy when-equation class produces. Kept
-   separate from the solve so the baked type can be checked against a real model. =#
-# Mirror simulateIMTK's solve-time collapse so the baked solve is over the same erased
-# callback type the runtime produces.
+"""
+simulateIMTK's solve-time collapse and erasure of the callbacks, so the baked solve is over the callback type the
+runtime produces.
+"""
 function _precompileCollapseCallback(prob)
   local cb = get(prob.kwargs, :callback, nothing)
-  cb === nothing && return prob
-  return ModelingToolkit.SciMLBase.remake(prob;
-            callback = CodeGeneration._eraseContinuousCallbacks(cb))
-end
-
-function _precompileBuildDirectRHSEventfulProblem()
-  local (reduced, ivs, pars) = _precompileBuildReduced()
-  local SB = ModelingToolkit.SciMLBase
-  local cbset = SB.CallbackSet(SB.ContinuousCallback(_precompileCBCondition,
-                                                     _precompileCBAffect!))
-  local prob = CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), cbset)
-  return _precompileCollapseCallback(prob)
+  cb === nothing || (cb = CodeGeneration._eraseContinuousCallbacks(cb))
+  return ModelingToolkit.SciMLBase.remake(prob; callback = CodeGeneration._eraseCallbackSet(cb))
 end
 
 """
-Bakes the type-erased event-ful DirectRHS solve into the image. With RHS/jac
-erasure the `F` param already matches the pure-ODE warmup; the only remaining
-model-specific axis is the callback, now collapsed to a model-independent type.
-Solving here compiles `solve(::ErasedEventFulType, ::alg)` once for the whole
-legacy when-equation class.
+Bakes the type-erased event-ful DirectRHS solve into the image: a pure-ODE problem carrying one continuous callback,
+which collapses to the model-independent `VectorContinuousCallback` of the legacy when-equation class; the event
+handling of the erased set compiled too (the condition crosses zero in the solve).
 """
 function _precompileWarmupDirectRHSEventful()::Nothing
-  local prob = _precompileBuildDirectRHSEventfulProblem()
-  solve(prob, defaultSolver())
-  solve(prob, daeFallbackSolver())
+  local (reduced, ivs, pars) = _precompileBuildReduced()
+  local SB = ModelingToolkit.SciMLBase
+  local cbset = CodeGeneration._joinCallbacks(SB.ContinuousCallback(_precompileCBCondition, _precompileCBAffect!))
+  _precompileSolveAsModels(CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), cbset), cbset)
   return nothing
 end
 
@@ -175,15 +180,11 @@ mass matrix + an MTK process_events callback) into the image.
 """
 function _precompileWarmupMTKCallbackDAE()::Nothing
   local (reduced, ivs, pars) = _precompileBuildReducedEventfulDAE()
-  local prob = CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0),
-                                                    ModelingToolkit.SciMLBase.CallbackSet())
-  prob = _precompileCollapseCallback(prob)
-  #= With the initialization a model's solve uses (defaultInitializeKwargs): the
-     default only checks u0, and this system's start values leave a residual
-     (4.5e-6 > abstol), so the workload failed and warmed nothing. =#
-  local initKw = CodeGeneration.defaultInitializeKwargs(prob, (;), false)
-  solve(prob, defaultSolver(); initKw...)
-  solve(prob, daeFallbackSolver(); initKw...)
+  local callbacks = CodeGeneration._joinCallbacks()
+  #= With the initialization a model's solve uses (defaultInitializeKwargs, in
+     _precompileSolveAsModels): the default only checks u0, and this system's start
+     values leave a residual (4.5e-6 > abstol), so the workload failed and warmed nothing. =#
+  _precompileSolveAsModels(CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), callbacks), callbacks)
   return nothing
 end
 
