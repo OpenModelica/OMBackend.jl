@@ -1039,15 +1039,16 @@ end
 #= ==================================================================================== =#
 
 """
-The asserts of equation sections (simCode.asserts) as one callback that checks them after
-the initialization and after each accepted step (asserts.jl). Conditions and messages are
-lowered like event affects: every variable is read through `observed`, `time` from the
-integrator. An assert whose expression cannot be lowered is reported and left out. Names,
-not the symbolic variables, are observed: a variable the compiler eliminated has no binding
-in the generated code, but may still be observed by name.
+    assertEntries(simCode) -> Vector{Expr}
+
+The asserts of equation sections (simCode.asserts) as `ModelicaAssert`s, which one callback
+checks after the initialization and after each accepted step (asserts.jl). Conditions and
+messages are lowered like event affects: every variable is read through `observed`, `time`
+from the integrator. An assert whose expression cannot be lowered is reported and left out.
+Names, not the symbolic variables, are observed: a variable the compiler eliminated has no
+binding in the generated code, but may still be observed by name.
 """
-function emitAssertCallback(simCode::SC.SIM_CODE)::Expr
-  isempty(simCode.asserts) && return Expr(:block)
+function assertEntries(simCode::SC.SIM_CODE)::Vector{Expr}
   local entries = Expr[]
   for a in simCode.asserts
     local obsAcc = Dict{Symbol, Symbol}()
@@ -1071,10 +1072,35 @@ function emitAssertCallback(simCode::SC.SIM_CODE)::Expr
                                                              $(string(a.condition)),
                                                              $(Expr(:tuple, (:((observed, integrator) -> $(c)) for c in crossings)...)))))
   end
+  return entries
+end
+
+"""
+    emitAssertsFunction(entries) -> Expr
+
+The asserts (`assertEntries`) as functions of the model's module: one an assert,
+`_modelAssert<k>()`, and `_modelAsserts()`, the vector of them all. Their closures, three an
+assert, read only their arguments and the module's names. Julia's lowering of a function is
+quadratic in its closures: in the model's build function MSL LightningSegmentedTransmissionLine's
+403 asserts took 55 s, in one function of the module 18 s (100 asserts: 1.1 s).
+"""
+function emitAssertsFunction(entries::Vector{Expr})::Expr
+  isempty(entries) && return Expr(:block)
+  local names::Vector{Symbol} = Symbol[Symbol("_modelAssert", k) for k in eachindex(entries)]
+  return Expr(:block, (:(function $(n)() return $(e) end) for (n, e) in zip(names, entries))...,
+              :(function _modelAsserts() return [$((Expr(:call, n) for n in names)...)] end))
+end
+
+"""
+    emitAssertCallback(simCode, entries) -> Expr
+
+The callback that checks the asserts `entries` (`_modelAsserts`), in the build function.
+"""
+function emitAssertCallback(simCode::SC.SIM_CODE, entries::Vector{Expr})::Expr
   isempty(entries) && return Expr(:block)
   #= the discrete variables: within a step that ends at an event their values are the step's (asserts.jl) =#
   local discrete::Vector{Symbol} = sort!(Symbol[Symbol(n) for (n, (_, v)) in simCode.stringToSimVarHT if v.varKind isa SC.DISCRETE])
-  return :(callbacks = OMBackend.CodeGeneration.withAssertCallback(callbacks, problem, [$(entries...)]; discrete = $(discrete)))
+  return :(callbacks = OMBackend.CodeGeneration.withAssertCallback(callbacks, problem, Base.invokelatest(_modelAsserts); discrete = $(discrete)))
 end
 
 _isEffectCall(e::SC.Exp)::Bool = e isa SC.CALL && e.ty isa SC.TYPE_NORETCALL
