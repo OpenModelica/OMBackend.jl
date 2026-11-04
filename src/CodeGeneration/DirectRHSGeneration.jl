@@ -2767,6 +2767,23 @@ function _eraseContinuousCallbacks(cbset)
   return SB.CallbackSet(vcc, dc...)
 end
 
+"""
+    _eraseCallbackSet(cbset)
+
+`cbset` (a `CallbackSet`, one callback or nothing) as a `CallbackSet` of two `Vector{Any}`, DiffEqBase's own erased
+form, which it builds only for `AutoSpecialize` problems. The integrator's type then no longer holds the tuple of the
+model's callbacks, whose length and kinds differ per model (relation refresh, delays, asserts, the step control), so
+`solve` and the initialization compile once per process, not once per model (2026-11-04: 0.6-0.9 s of `solve!` and
+0.25 s of `initialize_dae!` per model). The erased loops call each callback through `invokelatest`, in the order of the
+set, compiled once per callback type. A solve that merges another callback set with it (a `callback` keyword) splats
+it back into tuples: correct, only specialized again.
+"""
+function _eraseCallbackSet(cbset)::DiffEqBase.CallbackSet
+  cbset === nothing && return DiffEqBase.CallbackSet(Any[], Any[])
+  local set::DiffEqBase.CallbackSet = cbset isa DiffEqBase.CallbackSet ? cbset : DiffEqBase.CallbackSet(cbset)
+  return DiffEqBase.CallbackSet(collect(Any, set.continuous_callbacks), collect(Any, set.discrete_callbacks))
+end
+
 
 """
     _toFloat64(val; resolvedParams::Union{Dict{String,Float64},Nothing}=nothing)
