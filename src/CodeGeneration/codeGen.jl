@@ -125,7 +125,7 @@ function createCallbackCode(modelName::String, simCode::SC.SIM_CODE; generateSav
   local legacyWhens = filter(w -> _extractChangeRelations(w.whenEquation.condition, simCode) === nothing &&
                                   isempty(_selfSchedulingTimeRels(w)),
                              simCode.whenEquations)
-  local WHEN_EQUATIONS = createEquations(legacyWhens, simCode)
+  local (WHEN_FUNCTIONS, WHEN_EQUATIONS) = createEquations(legacyWhens, simCode)
   local SAVE_FUNCTION = generateSaveFunction ? createSaveFunction(modelName) : nothing
   #= saved_values_<model> = SavedValues(...) only with the save function: SavedValues lives in
      DiffEqCallbacks, a transitive dependency; its unconditional emission was an UndefVarError
@@ -134,6 +134,7 @@ function createCallbackCode(modelName::String, simCode::SC.SIM_CODE; generateSav
     :($(Symbol("saved_values_$(modelName)")) = SavedValues(Float64, Tuple{Float64,Array})) : nothing
   quote
     $(SAVED_VALUES_DECL)
+    $(WHEN_FUNCTIONS...)
     function $(Symbol("$(modelName)CallbackSet"))(aux)
       #= These are the locations of the parameters and auxiliary real variables respectively =#
       local p = aux[1]
@@ -170,9 +171,33 @@ end
 """
 returnCallbackSet()::Vector{Symbol} = Symbol[Symbol("cb", t) for t in 1:COUNT_CALLBACKS()]
 
-"The callbacks of the when-equations."
-createEquations(equations::Vector{SC.WHEN_EQUATION}, simCode::SC.SIM_CODE)::Vector{Expr} =
-  Expr[eqToJulia(eq, simCode, i) for (i, eq) in enumerate(equations)]
+"""
+    createEquations(equations, simCode) -> (functions, calls)
+
+The callbacks of the when-equations: per equation a function of the model's module,
+`_whenCallbacks<i>(p, reals, reducedSystem)`, that builds the callbacks it numbers (`cb<k>`,
+ADD_CALLBACK) and returns them, and its call in the callback set's function. Julia's lowering
+of a function is quadratic in its closures: all the whens' conditions and affects in the
+callback set's function took 2 s to evaluate for MSL BatchPlant's 55 whens (as the asserts,
+emitAssertsFunction).
+"""
+function createEquations(equations::Vector{SC.WHEN_EQUATION}, simCode::SC.SIM_CODE)::Tuple{Vector{Expr}, Vector{Expr}}
+  local functions = Expr[]
+  local calls = Expr[]
+  for (i, eq) in enumerate(equations)
+    local firstIndex::Int = COUNT_CALLBACKS() + 1
+    local code::Expr = eqToJulia(eq, simCode, i)
+    local cbs::Vector{Symbol} = Symbol[Symbol("cb", k) for k in firstIndex:COUNT_CALLBACKS()]
+    local name = Symbol("_whenCallbacks", i)
+    push!(functions, :(function $(name)(p, reals, reducedSystem)
+                         $(code)
+                         return ($(cbs...),)
+                       end))
+    push!(calls, isempty(cbs) ? :($(name)(p, reals, reducedSystem)) :
+                                :(($(cbs...),) = $(name)(p, reals, reducedSystem)))
+  end
+  return (functions, calls)
+end
 
 """
 The variables name[1], name[2], ... (none when name[1] is not a variable).
