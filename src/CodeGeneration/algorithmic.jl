@@ -425,8 +425,11 @@ function generateFunctions(functions::Vector{SC.ModelicaFunction};
     local anonFunc = nArgs == 0 ? Expr(:->, Expr(:tuple), funcBody) :
       nArgs == 1 ? Expr(:->, inputs[1], funcBody) : Expr(:->, Expr(:tuple, inputs...), funcBody)
     #= compiled: CodeGeneration's functions (compiledFunction), not a closure of the model module,
-       which runs interpreted =#
-    local compilable = compiled && func isa SC.MODELICA_FUNCTION ? CodeGeneration._compilableFunction(anonFunc) : nothing
+       which runs interpreted. An external C function's too: MSL's CombiTable1Ds lookup took 620 ns
+       and 96 bytes a call interpreted, and SoftStarter's crossing functions call it at every
+       condition evaluation. Not a FORTRAN 77 one: its LAPACK routine is the work. =#
+    local compilable = compiled && (func isa SC.MODELICA_FUNCTION || func.external.language != "FORTRAN 77") ?
+      CodeGeneration._compilableFunction(anonFunc) : nothing
     push!(codes, (func, nArgs, isArrayFunc, outputDims, anonFunc, compilable))
   end
   local compiledNames = Set{Symbol}(Symbol(c[1].name) for c in codes if c[6] !== nothing)
