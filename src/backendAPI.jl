@@ -338,6 +338,7 @@ function clearCaches!(; models::Bool=true,
                       push!(cleared, "models"))
   implementations && (empty!(CodeGeneration.MODELICA_FUNCTION_IMPLS); empty!(CodeGeneration.MODELICA_FUNCTION_OWNERS);
                       empty!(CodeGeneration.MODEL_FUNCTIONS); empty!(CodeGeneration.COMPILED_CODE_SIZES);
+                      empty!(CodeGeneration.COMPILED_BODIES);
                       push!(cleared, "implementations"))
   wrappers        && (empty!(CodeGeneration.MODELICA_FUNCTION_WRAPPERS); push!(cleared, "wrappers"))
   extractors      && (empty!(CodeGeneration.ELEM_FUNC_CACHE); empty!(CodeGeneration.TUPLE_ELEM_FUNC_CACHE);

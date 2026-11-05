@@ -256,3 +256,23 @@ function logPath(stage::AbstractString, filename::AbstractString)
   mkpath(dir)
   return joinpath(dir, filename)
 end
+
+"""
+    evaluationRejected(mod::Module) -> Bool
+
+Whether Julia rejects an evaluation into `mod` now. While a package image is generated, an evaluation into a module of
+a package loaded before ("closed": OMBackend's modules under OM.jl's precompile workload) "breaks incremental
+compilation" and throws; OMBackend's own workload evaluates into its modules, and what it defines is kept in its image,
+so its models are built and solved as in a session. Asked of the runtime (an empty evaluation), not of the precompile
+state.
+"""
+function evaluationRejected(mod::Module)::Bool
+  ccall(:jl_generating_output, Cint, ()) == 0 && return false
+  try
+    Core.eval(mod, nothing)
+  catch err
+    err isa ErrorException && return true
+    rethrow()
+  end
+  return false
+end

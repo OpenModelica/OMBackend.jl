@@ -221,38 +221,106 @@ end
 
 const ARRAYS_KEPT_WORKLOAD = joinpath(@__DIR__, "Precompile", "ArraysKept.mo")
 include_dependency(ARRAYS_KEPT_WORKLOAD)
+const TRANSLATE_WORKLOAD = joinpath(@__DIR__, "Precompile", "Translate.mo")
+include_dependency(TRANSLATE_WORKLOAD)
 
 """
-The arrays-kept paths over the models of `Precompile/ArraysKept.mo`, as `translate` takes them, up to the generated
-module's code (a module is not evaluated while the package image is built): the frontend's flatten with the arrays
-kept, lowering and the passes, component rolling, index reduction in array form with its splits, the derivatives
-solved in array form and the array code (`Chain`: MultiBody's frames through functions, slicing; `Volumes`: a
-semiLinear chain, a free parameter, a when-equation; `LoopEvents`, of index one: a torn loop, events, a when-equation,
-an assert). Their code then compiles into the package image, not at each process's first
-such model: MSL EngineV6's first build compiled 2371 methods (18.7 s) for reducedArrayModel and 594 (3.8 s) for its
-array code, of OMBackend's own code (`Traversal.traverseField`'s specializations by node and pass: 1073). Each model
-must take its path (an error otherwise: the workload would compile less than it says). The registries those paths
-write are cleared of the workload's models.
+    _precompileTranslateAndSimulate(scode, name::String, arrayCode::Bool) -> Nothing
+
+The model `name` of `scode` translated and simulated as OM.jl's `translate` and `simulate` do
+(`_precompileTranslate`); the build (the model's module evaluated into OMBackend, open while its own image is
+generated: `evaluationRejected`) and `simulateModel` with OM.jl's keyword arguments, so that the keyword calls compile
+for a session's argument types. `simulate` translates again (the cached build reused). `arrayCode`: whether the model
+takes the array code (an error otherwise: the workload would compile less than it says).
 """
-function _precompileWarmupArraysKept()::Nothing
-  local scode = OMFrontend.translateToSCode(OMFrontend.parseFile(ARRAYS_KEPT_WORKLOAD))
-  for model in ("Chain", "Volumes", "LoopEvents")
-    local name::String = "OMBackendWorkload." * model
-    local cn::String = canonicalName(name)
-    try
-      local (fm::OMFrontend.Frontend.FlatModel, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = false)
-      local functions::FunctionList = OMFrontend.cacheToFunctionList(cache)
-      local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(fm; functionList = functions)
-      reduced === nothing && error("$(name) not lowered in array form: $(scalarizedFallbackReason(cn))")
-      local (solved::OMJLIR.Model, _) = Passes.IndexReduction.solvedInArrays(reduced)
-      Passes.arrayCodeForm!(solved)
-      local code::Tuple = CodeGeneration.ArrayODEGen.generateArrayODECode(SimCode.lowerArraySystem(solved), cn)
-      code[1] === nothing && error("$(name): no array code ($(code[2]))")
-    finally
-      delete!(ARRAY_PATH_REASONS, cn)
-      delete!(ARRAY_REDUCED_MODELS, cn)
-      delete!(ARRAY_ODE_MODELS, cn)
+function _precompileTranslateAndSimulate(scode::OMFrontend.SCode.Program, name::String, arrayCode::Bool)::Nothing
+  local mode::BackendMode = DEFAULT_BACKEND_MODE[]
+  _precompileTranslate(scode, name, mode)
+  (canonicalName(name) in ARRAY_ODE_MODELS) == arrayCode ||
+    error("$(name): $(arrayCode ? "no array code" : "array code") ($(get(ARRAY_PATH_REASONS, canonicalName(name), "-")))")
+  _precompileTranslate(scode, name, mode)
+  simulateModel(name; MODE = mode, tspan = (0.0, 1.0), solver = defaultSolver(), overwriteCache = false)
+  return nothing
+end
+
+"""
+OM.jl's `translate` of the model `name` of `scode`: the frontend's flatten with the arrays kept and
+`translateReducedArrays` (the array code, else the scalarized reduced model), else the scalarizing flatten and
+`translate`.
+"""
+function _precompileTranslate(scode::OMFrontend.SCode.Program, name::String, mode::BackendMode)::Union{Nothing, Tuple{String, Expr}}
+  local (fm::OMFrontend.Frontend.FlatModel, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = false)
+  local reduced::Union{Nothing, Tuple{String, Expr}} =
+    translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache), BackendMode = mode,
+                           warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing,
+                           checkSimCode = true)
+  reduced === nothing || return reduced
+  (fm, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = true)
+  return translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), BackendMode = mode,
+                   warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing,
+                   checkSimCode = true, scalarized = true)
+end
+
+"""
+The registries of OMBackend's modules (their mutable Dict and Set constants and their Refs), with copies of their
+contents: the translate workload restores them (`_restoreRegistries!`), so that its models' builds, generated code,
+function implementations and run directories are not kept in the image (its models' modules are).
+"""
+function _registries(mod::Module = @__MODULE__, found::Vector{Pair{Any, Any}} = Pair{Any, Any}[])::Vector{Pair{Any, Any}}
+  for name in names(mod; all = true)
+    (isdefined(mod, name) && isconst(mod, name)) || continue
+    local value::Any = getglobal(mod, name)
+    if value isa Module
+      (value !== mod && parentmodule(value) === mod) && _registries(value, found)
+    elseif value isa Union{AbstractDict, AbstractSet} && ismutable(value)
+      push!(found, value => copy(value))
+    elseif value isa Base.RefValue && isassigned(value)
+      push!(found, value => value[])
     end
+  end
+  return found
+end
+
+"The registries `_registries` copied, with the contents they had."
+function _restoreRegistries!(registries::Vector{Pair{Any, Any}})::Nothing
+  for (registry, contents) in registries
+    if registry isa AbstractDict
+      empty!(registry)
+      merge!(registry, contents)
+    elseif registry isa AbstractSet
+      empty!(registry)
+      union!(registry, contents)
+    else
+      registry[] = contents
+    end
+  end
+  return nothing
+end
+
+"""
+The translate and simulate of OM.jl (`_precompileTranslateAndSimulate`) over the workload's models, so that their code
+compiles into the package image, not at each process's first model: `Precompile/Translate.mo`'s models of the
+scalarized paths (Drive, Pendulum: the scalarizing flatten; Rectifier: the reduced model scalarized; Thermostat: the
+array code with events) and `Precompile/ArraysKept.mo`'s of the array code (`Chain`: MultiBody's frames through
+functions, slicing; `Volumes`: a semiLinear chain, a free parameter, a when-equation; `LoopEvents`: a torn loop, events,
+an assert). A fresh process's first translate compiled 3-18 s of OMBackend's, MTK's and Symbolics' code before (MSL
+4.1.0 Rotational First 12.9 s, MultiBody DoublePendulum 17.9 s; EngineV6 2371 methods for reducedArrayModel); the
+registries are restored afterwards (`_registries`).
+"""
+function _precompileWarmupTranslate()::Nothing
+  local registries::Vector{Pair{Any, Any}} = _registries()
+  try
+    for (file, package, models) in ((TRANSLATE_WORKLOAD, "OMBackendTranslateWorkload",
+                                     ("Drive" => false, "Thermostat" => true, "Rectifier" => false, "Pendulum" => false)),
+                                    (ARRAYS_KEPT_WORKLOAD, "OMBackendWorkload",
+                                     ("Chain" => true, "Volumes" => true, "LoopEvents" => true)))
+      local scode::OMFrontend.SCode.Program = OMFrontend.translateToSCode(OMFrontend.parseFile(file))
+      for (model, arrayCode) in models
+        _precompileTranslateAndSimulate(scode, package * "." * model, arrayCode)
+      end
+    end
+  finally
+    _restoreRegistries!(registries)
   end
   return nothing
 end
@@ -289,9 +357,9 @@ end
         @warn "[OMBackend] array-path precompile warmup skipped" exception = (err, catch_backtrace())
       end
       try
-        Base.CoreLogging.with_logger(_precompileWarmupArraysKept, Base.CoreLogging.NullLogger())
+        Base.CoreLogging.with_logger(_precompileWarmupTranslate, Base.CoreLogging.NullLogger())
       catch err
-        @warn "[OMBackend] arrays-kept precompile warmup skipped" exception = (err, catch_backtrace())
+        @warn "[OMBackend] translate precompile warmup skipped" exception = (err, catch_backtrace())
       end
     end
   end

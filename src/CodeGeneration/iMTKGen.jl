@@ -138,8 +138,8 @@ function generateIMTKCode(simCode::SC.SIM_CODE)
      and sub-models use MODEL_GENERATION's simpler simulate; skip _buildAndCache so iMTK falls through cleanly to the module
      `simulate` instead of warning loudly for every such model. Mirrors the
      condition in ODE_MODE_MTK (MTK_CodeGeneration.jl:415). =#
-  if ccall(:jl_generating_output, Cint, ()) != 0
-    #= Precompile/image generation: Core.eval'ing the model module into this
+  if _OMBackend().evaluationRejected(_OMBackend())
+    #= OM.jl's precompile workload: Core.eval'ing the model module into this
        closed backend module is rejected; skip the build+eval (codegen warmed). =#
   elseif !SC.hasStructuralTransitions(simCode) &&
          !SC.hasSubModels(simCode)

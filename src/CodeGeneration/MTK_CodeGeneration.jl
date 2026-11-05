@@ -72,13 +72,13 @@ On function-eval failure, the offending generated source is dumped to
 `/tmp/om_bad_function.jl` and the error rethrown.
 """
 function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr}, simCode::SC.SIM_CODE)
-  #= Under precompile / image generation, eval'ing the model's generated Modelica functions
-     into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
+  #= Under another package's precompile (OM.jl's workload), eval'ing the model's generated Modelica
+     functions into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
      compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
      has already run (so its method instances are warmed for the bake), and a real runtime
      translate registers them normally — the guard is precompile-only. Mirrors the
-     jl_generating_output guard in generateIMTKCode (iMTKGen.jl). =#
-  if ccall(:jl_generating_output, Cint, ()) != 0
+     guard in generateIMTKCode (iMTKGen.jl). =#
+  if OMBackend.evaluationRejected(@__MODULE__)
     return nothing
   end
   for f in functions
