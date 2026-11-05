@@ -34,12 +34,19 @@ Sundials = "c3572dad-4567-51f8-b174-8c6c989267f4"
 SymbolicUtils = "d1185830-fcd6-423d-90d6-eec64667417b"
 Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
 
+[weakdeps]
+OMCompiler = "5eee2e4c-d6e4-4c2a-a3d5-a5d6acef407f"
+
+[extensions]
+OMBackendOMCompilerExt = "OMCompiler"
+
 [compat]
 ADTypes = "1"
 Absyn = "1.4"
 MetaModelica = "0.4.2"
 ModelingToolkit = "11.21"
 NonlinearSolve = "4"
+OMCompiler = "0.1"
 OMFrontend = "1.7.5"
 OMRuntimeExternalC = "0.3.6"
 PrecompileTools = "1"
