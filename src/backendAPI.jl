@@ -419,30 +419,74 @@ function translate(fm::OMFrontend.Frontend.FlatModel;
         replace(OMFrontend.Frontend.toFlatString(fm, functionList === nothing ? MetaModelica.nil : functionList), "\\n" => "\n"))
       local model::OMJLIR.Model = omjlir !== nothing ? omjlir :
         @BACKEND_PERFLOG "[backendAPI] lower" omjlirModel(fm; functionList, scalarized, arrayReduction = !arrayReduction)
-      if BackendMode == DEMode
-        #= Direct DifferentialEquations.jl path: a subset of the MTK path's SimCode passes (not,
-           e.g., the Complex lowering, the function evaluation, the folds, the initial values),
-           no observed-equation work, the DE emitter. =#
-        local simCode = SimCode.codeView(SimCode.deSimulationCode(model))
-        (SimCode.hasStructuralTransitions(simCode) || SimCode.hasSubModels(simCode)) &&
-          error("DEMode does not support structural transitions / VSS at this time. Re-run with mode = OMBackend.MTK_MODE.")
-        _checkSimCodeBeforeCodegen(simCode, checkSimCode)
-        return _translationResult(generateDETargetCode(simCode))
-      elseif BackendMode == MTK_MODE || BackendMode == IMTK_MODE
-        local simCode = mtkSimCode(model; eliminateNonDynamic, observedFilter)
-        _checkSimCodeBeforeCodegen(simCode, checkSimCode)
-        local genCode = if BackendMode == IMTK_MODE
-          @BACKEND_PERFLOG "[backendAPI] generateIMTKTargetCode" generateIMTKTargetCode(simCode)
-        else
-          @BACKEND_PERFLOG "[backendAPI] generateMTKTargetCode" generateMTKTargetCode(simCode)
-        end
-        return _translationResult(genCode)
-      end
-      error("Unsupported BackendMode: $BackendMode. Valid modes are: MTK_MODE, IMTK_MODE, DEMode")
+      return generateTargetCode(model; BackendMode, eliminateNonDynamic, observedFilter, checkSimCode)
     end
   finally
     WARN_MISSING_START_VALUES[] = previousWarnSetting
   end
+end
+
+"""
+    translate(model::OMJLIR.Model; BackendMode = DEFAULT_BACKEND_MODE[], warnMissingStartValues = nothing,
+              eliminateNonDynamic = nothing, observedFilter = nothing, checkSimCode = true)
+
+The target code of a model another frontend lowered to OMJLIR and through its passes
+(`lowerOMCFlatModel`).
+"""
+function translate(model::OMJLIR.Model;
+                   BackendMode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
+                   warnMissingStartValues::Union{Nothing, Bool} = nothing,
+                   eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
+                   observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
+                   checkSimCode::Bool = true)
+  local previousWarnSetting = WARN_MISSING_START_VALUES[]
+  local runId = createLogRunId(model.name)
+  MODEL_RUN_DIRS[canonicalName(model.name)] = runId
+  resetFallbacks!()
+  warnMissingStartValues === nothing || (WARN_MISSING_START_VALUES[] = warnMissingStartValues)
+  try
+    delete!(ARRAY_ODE_MODELS, canonicalName(model.name))
+    delete!(ARRAY_REDUCED_MODELS, canonicalName(model.name))
+    return withLogRunDir(runId) do
+      generateTargetCode(model; BackendMode, eliminateNonDynamic, observedFilter, checkSimCode)
+    end
+  finally
+    WARN_MISSING_START_VALUES[] = previousWarnSetting
+  end
+end
+
+"""
+    lowerOMCFlatModel(flatModel, functions)::OMJLIR.Model
+
+The OMJLIR model, through its passes, of a flat model omc's frontend made: an `NFFlatModel`
+and its `NFFunction`s, read through OMCompiler.jl. Defined when OMCompiler.jl is loaded.
+"""
+function lowerOMCFlatModel end
+
+"The target code of the OMJLIR model `model` for the backend mode `BackendMode`."
+function generateTargetCode(model::OMJLIR.Model; BackendMode::OMBackend.BackendMode,
+                            eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
+                            observedFilter::Union{Nothing, Vector{String}, Vector{Regex}}, checkSimCode::Bool)
+  if BackendMode == DEMode
+    #= Direct DifferentialEquations.jl path: a subset of the MTK path's SimCode passes (not,
+       e.g., the Complex lowering, the function evaluation, the folds, the initial values),
+       no observed-equation work, the DE emitter. =#
+    local simCode = SimCode.codeView(SimCode.deSimulationCode(model))
+    (SimCode.hasStructuralTransitions(simCode) || SimCode.hasSubModels(simCode)) &&
+      error("DEMode does not support structural transitions / VSS at this time. Re-run with mode = OMBackend.MTK_MODE.")
+    _checkSimCodeBeforeCodegen(simCode, checkSimCode)
+    return _translationResult(generateDETargetCode(simCode))
+  elseif BackendMode == MTK_MODE || BackendMode == IMTK_MODE
+    local simCode = mtkSimCode(model; eliminateNonDynamic, observedFilter)
+    _checkSimCodeBeforeCodegen(simCode, checkSimCode)
+    local genCode = if BackendMode == IMTK_MODE
+      @BACKEND_PERFLOG "[backendAPI] generateIMTKTargetCode" generateIMTKTargetCode(simCode)
+    else
+      @BACKEND_PERFLOG "[backendAPI] generateMTKTargetCode" generateMTKTargetCode(simCode)
+    end
+    return _translationResult(genCode)
+  end
+  error("Unsupported BackendMode: $BackendMode. Valid modes are: MTK_MODE, IMTK_MODE, DEMode")
 end
 
 """
