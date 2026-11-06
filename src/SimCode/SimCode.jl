@@ -49,8 +49,10 @@ import ..BackendUtil.GraphAlgorithms
 import ..OMJLIR
 import ..Traversal
 import ..Traversal: traverseFields, traverseElements
-import ..Passes: legacyName, isSampleTrigger, isBuiltinCallOf, tupleAssignElements, initialCall, builtinCall, edgeCall
-import ..unsupported, .._fallback, ..isTunableParameter, ..TUNABLE_PARAMETERS, ..BACKEND_PERFLOG, ..envSwitch
+import ..Passes
+import ..Passes: legacyName, isSampleTrigger, isBuiltinCallOf, tupleAssignElements, initialCall, builtinCall, edgeCall,
+  unsubscriptedName, allSubscripts
+import ..unsupported, ..UnsupportedLowering, .._fallback, ..isTunableParameter, ..TUNABLE_PARAMETERS, ..BACKEND_PERFLOG, ..envSwitch
 const IR = OMJLIR
 
 include("types.jl")
@@ -59,6 +61,7 @@ include("print.jl")
 include("lowerExpressions.jl")
 include("lowerVariables.jl")
 include("lowerModel.jl")
+include("lowerArrays.jl")
 include("lowerStructure.jl")
 include("recordCallSites.jl")
 include("lowerFunctions.jl")
@@ -82,5 +85,7 @@ include("Passes/outputOnly.jl")
 include("Passes/runner.jl")
 include("Passes/pipeline.jl")
 include("check.jl")
+include("codeView.jl")
+include("Domains/Domains.jl")
 
 end # module SimCode

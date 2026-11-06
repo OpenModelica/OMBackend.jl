@@ -65,8 +65,6 @@ function flattenRecordCallSites(simCode::SIM_CODE)::SIM_CODE
     local k = sv.varKind
     if k isa PARAMETER && k.bindExp !== nothing
       ht[name] = (index, withKind(sv, PARAMETER(x(k.bindExp))))
-    elseif k isa ARRAY_PARAMETER && k.bindExp !== nothing
-      ht[name] = (index, withKind(sv, ARRAY_PARAMETER(k.dimensions, x(k.bindExp))))
     end
   end
   return update(simCode; residualEquations = residuals, whenEquations = whens, ifEquations = ifs, initialAlgorithms, asserts,
@@ -76,7 +74,7 @@ end
 "A when-clause with its condition's and its statements' record arguments flattened (an assignment's value, a reinit's, a call, an assert's condition)."
 function whenRecordArguments(w::WHEN_STMTS, x::F)::WHEN_STMTS where {F}
   local body = Statement[s isa ASSIGN ? ASSIGN(s.left, x(s.right), s.source) :
-                         s isa REINIT ? REINIT(s.stateVar, x(s.value), s.source) :
+                         s isa REINIT ? REINIT(s.stateVar, x(s.value), s.source, Exp[x(e) for e in s.subscripts]) :
                          s isa NORETCALL ? NORETCALL(x(s.exp), s.source) :
                          s isa ASSERT ? ASSERT(x(s.condition), s.message, s.level, s.source) : s for s in w.body]
   return WHEN_STMTS(x(w.condition), body, w.elsewhenPart === nothing ? nothing : whenRecordArguments(w.elsewhenPart, x))
@@ -109,7 +107,7 @@ mapValues(g::G, s::WHILE) where {G} = WHILE(g(s.condition), Statement[mapValues(
 mapValues(g::G, s::WHEN) where {G} = WHEN(Branch[Branch(g(b.condition), Statement[mapValues(g, t) for t in b.body]) for b in s.branches], s.source)
 mapValues(g::G, s::ASSERT) where {G} = ASSERT(g(s.condition), g(s.message), g(s.level), s.source)
 mapValues(g::G, s::TERMINATE) where {G} = TERMINATE(g(s.message), s.source)
-mapValues(g::G, s::REINIT) where {G} = REINIT(s.stateVar, g(s.value), s.source)
+mapValues(g::G, s::REINIT) where {G} = REINIT(s.stateVar, g(s.value), s.source, Exp[g(x) for x in s.subscripts])
 mapValues(g::G, s::NORETCALL) where {G} = NORETCALL(g(s.exp), s.source)
 mapValues(g::G, s::RECOMPILATION) where {G} = RECOMPILATION(s.componentToChange, g(s.newValue))
 mapValues(g::G, s::Union{RETURN, BREAK, AGENTIC_RECOMPILATION}) where {G} = s
@@ -125,6 +123,7 @@ function splitTupleResidual(e::Exp)::Union{Nothing, Vector{Exp}}
   local call = e.exp2
   (call.kind !== CALL_IMPURE_FUNCTION && call.ty isa TYPE_TUPLE) || return nothing
   local out = Exp[]
+  #= the targets by their positions in the result (a record target is its fields, `expandRecordArguments`) =#
   for (k, target) in enumerate(e.exp1.elements)
     target isa WILD && continue
     target isa EXP_CREF || return nothing
@@ -150,7 +149,7 @@ function expandRecordArguments(e::Exp, ht::HT)::Exp
   local x = a -> expandRecordArguments(a, ht)
   if e isa CALL
     local args = Exp[]
-    for arg in e.args
+    for arg in (e.kind === CALL_BUILTIN ? e.args : Exp[literalArrayElement(a) for a in e.args])
       local fieldArrays = e.kind === CALL_BUILTIN ? nothing : splitRecordArrayArgument(arg, ht)
       if fieldArrays !== nothing
         append!(args, fieldArrays)
@@ -178,38 +177,55 @@ end
 
 isRecordType(ty::SType)::Bool = ty isa TYPE_COMPLEX && ty.isRecord
 
+"""
+    literalArrayElement(e)
+
+`{a, b, ...}[k]` by literal indices as its element (a medium's constant array of records the frontend folded, an element
+by an iterator: MSL Media's `h_T(data[i], T)`, a record value then passed by its fields); another expression as it is.
+"""
+function literalArrayElement(e::Exp)::Exp
+  e isa ASUB || return e
+  local x::Exp = literalArrayElement(e.exp)
+  for s in e.subs
+    (s isa ICONST && x isa ARRAY_EXP && 1 <= s.value <= length(x.elements)) || return e
+    x = x.elements[s.value]
+  end
+  return x
+end
+
 "A reference of a record type."
 isRecordReference(e::Exp)::Bool = e isa EXP_CREF && isRecordType(e.ty)
 
-"The references of a record reference's fields, `r_f` (an array field the array of its elements)."
+"The references of a record reference's fields, `r_f` (`fieldCref`; an array field the array of its elements)."
 function fieldReferences(e::EXP_CREF, ht::HT)::Vector{Exp}
-  local base = crefName(e.cref)
-  return Exp[fieldArgument(string(base, "_", n), t, ht) for (n, t) in zip(e.ty.fieldNames, e.ty.fieldTypes)]
+  local record::IR.ComponentRef = irRef(e.cref)
+  return Exp[fieldArgument(fieldCref(record, n), t, ht) for (n, t) in zip(e.ty.fieldNames, e.ty.fieldTypes)]
 end
 
 """
-    fieldArgument(name, ty, ht)
+    fieldArgument(field, ty, ht)
 
-A record field `name` as an argument: a scalar field's reference; an array field of one or
-two known dimensions as the array (of rows) of its elements' references; another the whole
-reference.
+A record field (its reference `field`) as an argument: a scalar field's reference; an array field
+of one or two known dimensions as the array (of rows) of its elements' references; another the
+whole reference.
 """
-function fieldArgument(name::String, ty::SType, ht::HT)::Exp
+function fieldArgument(field::IR.ComponentRef, ty::SType, ht::HT)::Exp
   if ty isa TYPE_ARRAY && all(d -> d >= 0, ty.dims) && length(ty.dims) in (1, 2)
     if length(ty.dims) == 1
-      return ARRAY_EXP(ty, true, Exp[EXP_CREF(elementCref(name, [i], ht), ty.elementType) for i in 1:ty.dims[1]])
+      return ARRAY_EXP(ty, true, Exp[EXP_CREF(elementCref(field, [i], ht), ty.elementType) for i in 1:ty.dims[1]])
     end
     local rowTy = TYPE_ARRAY(ty.elementType, Int[ty.dims[2]])
-    return ARRAY_EXP(ty, false, Exp[ARRAY_EXP(rowTy, true, Exp[EXP_CREF(elementCref(name, [i, j], ht), ty.elementType)
+    return ARRAY_EXP(ty, false, Exp[ARRAY_EXP(rowTy, true, Exp[EXP_CREF(elementCref(field, [i, j], ht), ty.elementType)
                                                                 for j in 1:ty.dims[2]]) for i in 1:ty.dims[1]])
   end
-  return EXP_CREF(SimCref(Symbol(name)), ty)
+  return EXP_CREF(SimCref(Symbol(refKey(field)), Int[], field), ty)
 end
 
-"The reference of the element `index` of the array `name`: a variable's name, else the array's with the subscripts."
-function elementCref(name::String, index::Vector{Int}, ht::HT)::SimCref
-  local full = string(name, join(("[$(i)]" for i in index)))
-  return haskey(ht, full) ? SimCref(Symbol(full)) : SimCref(Symbol(name), index)
+"The reference of the element `index` of the array reference `array`: its variable's, else the array's with the subscripts (`elementRead`)."
+function elementCref(array::IR.ComponentRef, index::Vector{Int}, ht::HT)::SimCref
+  local read::SimCref = elementRead(SimCref(Symbol(refKey(array)), Int[], array), index)
+  local key::String = refKey(irRef(read))
+  return haskey(ht, key) ? SimCref(Symbol(key), Int[], read.ref) : read
 end
 
 "An if-expression between record references or record-valued calls."
@@ -260,8 +276,8 @@ function splitRecordArrayArgument(arg::Exp, ht::HT)::Union{Nothing, Vector{Exp}}
   local elements = if arg isa ARRAY_EXP
     arg.elements
   elseif arg isa EXP_CREF && arg.ty isa TYPE_ARRAY && isRecordType(arg.ty.elementType) && length(arg.ty.dims) == 1 &&
-         arg.ty.dims[1] >= 0 && !occursin('[', crefName(arg.cref))
-    Exp[EXP_CREF(SimCref(arg.cref.sym, [i]), arg.ty.elementType) for i in 1:arg.ty.dims[1]]
+         arg.ty.dims[1] >= 0 && isempty(arg.cref.subs) && arg.cref.ref !== nothing && !isElementCref(arg.cref.ref)
+    Exp[EXP_CREF(elementRead(arg.cref, [i]), arg.ty.elementType) for i in 1:arg.ty.dims[1]]
   else
     return nothing
   end
@@ -278,7 +294,7 @@ end
 
 "Field `k` (`name`) of a record element of an array argument: a reference's field's name, a record value's element, a call's field by TSUB."
 function recordElementField(e::Exp, k::Int, name::String, ty::SType, ht::HT)::Exp
-  e isa EXP_CREF && return EXP_CREF(SimCref(Symbol(crefName(e.cref), "_", name)), ty)
+  e isa EXP_CREF && return (local field::IR.ComponentRef = fieldCref(irRef(e.cref), name); EXP_CREF(SimCref(Symbol(refKey(field)), Int[], field), ty))
   e isa RECORD && return expandRecordArguments(e.exps[k], ht)
   return TSUB(expandRecordArguments(e, ht), k, ty)
 end

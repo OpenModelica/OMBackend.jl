@@ -102,8 +102,9 @@ categoryPriority(::STATE)::Int = 100
 categoryPriority(::STATE_DERIVATIVE)::Int = 90
 categoryPriority(::DISCRETE)::Int = 80
 categoryPriority(::ALG_VARIABLE)::Int = 20
-categoryPriority(::ARRAY)::Int = 10
 categoryPriority(::SimVarType)::Int = 0
+"The preference of a variable for the representative of its aliases by its category; an algebraic array's less."
+categoryPriority(v::SIMVAR)::Int = isArrayAlgebraic(v) ? 10 : categoryPriority(v.varKind)
 
 """
     representativePriority(name, v, irreducible)
@@ -114,7 +115,7 @@ start is kept).
 """
 function representativePriority(name::String, v::SIMVAR, irreducible::Set{String})::Int
   local hasStart = v.attributes.start !== nothing && v.elementType isa Union{TYPE_REAL, TYPE_INTEGER, TYPE_BOOL}
-  return categoryPriority(v.varKind) + (name in irreducible ? 60 : 0) + (hasStart ? 5 : 0)
+  return categoryPriority(v) + (name in irreducible ? 60 : 0) + (hasStart ? 5 : 0)
 end
 
 """
@@ -257,11 +258,12 @@ function eliminateAliasVariables(simCode::SIM_CODE)::SIM_CODE
   isempty(stillRead) || @debug "[SIMCODE: $(simCode.name): eliminateAliasVariables] eliminated variables still read, kept" stillRead
   local newHT = copy(ht)
   local eliminated = String[n for n in keys(replacements) if !(n in stillRead)]
-  foreach(n -> deleteEliminated!(newHT, ht, n, representativeOf[n]), eliminated)
+  local derivatives::Dict{String, String} = derivativeKeys(ht)
+  foreach(n -> deleteEliminated!(newHT, ht, derivatives, n, representativeOf[n]), eliminated)
   for (name, attributes) in mergedAttributes
     haskey(newHT, name) || continue
     local (index, v) = newHT[name]
-    attributes == v.attributes || (newHT[name] = (index, SIMVAR(v.name, v.index, v.varKind, attributes, v.elementType)))
+    attributes == v.attributes || (newHT[name] = (index, withAttributes(v, attributes)))
   end
   local (observedVariables, observedEquations) = observationPairs(eliminated, pairs, removed, residuals, replacements, refs)
   local aliasMap = withAliases(simCode.aliasMap, filter(e -> !(e.eliminatedName in stillRead), entries))
@@ -275,14 +277,15 @@ function eliminateAliasVariables(simCode::SIM_CODE)::SIM_CODE
 end
 
 """
-    deleteEliminated!(newHT, ht, name, representative)
+    deleteEliminated!(newHT, ht, derivatives, name, representative)
 
 The eliminated variable `name` deleted from `newHT`; of a state aliased to a state, its
-derivative too (the substitution reads the representative's).
+derivative's entry too (`derivatives`, `derivativeKeys`: the substitution reads the representative's).
 """
-function deleteEliminated!(newHT::HT, ht::HT, name::String, representative::String)::Nothing
+function deleteEliminated!(newHT::HT, ht::HT, derivatives::Dict{String, String}, name::String, representative::String)::Nothing
   delete!(newHT, name)
-  last(ht[name]).varKind isa STATE && last(ht[representative]).varKind isa STATE && delete!(newHT, "der($(name))")
+  (last(ht[name]).varKind isa STATE && last(ht[representative]).varKind isa STATE && haskey(derivatives, name)) &&
+    delete!(newHT, derivatives[name])
   return nothing
 end
 
@@ -382,7 +385,8 @@ withAttributes(a::SimVarAttributes; start::Union{Nothing, Exp} = a.start, fixed:
                unit::Union{Nothing, Exp} = a.unit, displayUnit::Union{Nothing, Exp} = a.displayUnit,
                quantity::Union{Nothing, Exp} = a.quantity, stateSelect::Union{Nothing, Symbol} = a.stateSelect,
                isProtected::Bool = a.isProtected)::SimVarAttributes =
-  SimVarAttributes(start, fixed, nominal, min, max, unit, displayUnit, quantity, stateSelect, isProtected)
+  SimVarAttributes(start, fixed, nominal, min, max, unit, displayUnit, quantity, stateSelect, isProtected,
+                   start === a.start ? a.startExps : nothing)
 
 "An attribute's value negated, the literals folded; `nothing` for none."
 negatedValue(::Nothing)::Nothing = nothing
@@ -504,7 +508,7 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
       local name = crefName(v.cref)
       name in claimed && continue
       local sv = last(ht[name])
-      local priority = categoryPriority(sv.varKind) + (name in irreducible ? 60 : 0) + (isStateSelectAlways(sv) ? 200 : 0)
+      local priority = categoryPriority(sv) + (name in irreducible ? 60 : 0) + (isStateSelectAlways(sv) ? 200 : 0)
       priority > bestPriority && ((best, bestPriority) = (j, priority))
     end
     best == 0 && continue
@@ -515,8 +519,8 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
     for (j, (v, i, negated)) in enumerate(members)
       local name = crefName(v.cref)
       (j == best || name == repName || name in shared || name in claimed || name in representatives) && continue
-      (endswith(name, "_re") || endswith(name, "_im")) && continue
       local sv = last(ht[name])
+      (sv.ref !== nothing && isComplexPartCref(sv.ref)) && continue
       isStateSelectAlways(sv) && continue
       (name in irreducible && !(representative.varKind isa STATE && sv.varKind isa STATE)) && continue
       local n = xor(negated, repNegated)
@@ -533,11 +537,12 @@ function eliminateRHSEquivalentEquations(simCode::SIM_CODE)::SIM_CODE
   isempty(replacements) && return simCode
   @debug "[SIMCODE: $(simCode.name): eliminateRHSEquivalentEquations] $(length(replacements)) variables aliased by equal right-hand sides"
   local newHT = copy(ht)
-  foreach(e -> deleteEliminated!(newHT, ht, e.eliminatedName, e.representativeName), entries)
+  local derivatives::Dict{String, String} = derivativeKeys(ht)
+  foreach(e -> deleteEliminated!(newHT, ht, derivatives, e.eliminatedName, e.representativeName), entries)
   for (name, attributes) in mergedAttributes
     haskey(newHT, name) || continue
     local (index, v) = newHT[name]
-    attributes == v.attributes || (newHT[name] = (index, SIMVAR(v.name, v.index, v.varKind, attributes, v.elementType)))
+    attributes == v.attributes || (newHT[name] = (index, withAttributes(v, attributes)))
   end
   local eliminatedSet = Set{String}(eliminated)
   return update(simCode;

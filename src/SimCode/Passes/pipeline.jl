@@ -127,18 +127,20 @@ end
     filterAliasObservations(simCode)
 
 The alias observations the code generators emit as observed equations: those the observed
-filter's patterns match; without a filter, those of a user-visible eliminated name (no `[`:
-not a scalarized array element; MultiBody's hundreds of internals) whose representative is
-still a variable (an eliminated one, a frozen state's, would leave the observation unbound).
+filter's patterns match; without a filter, those of a user-visible eliminated variable (not a
+scalarized array's element, by its reference: MultiBody's hundreds of internals) whose
+representative is still a variable (an eliminated one, a frozen state's, would leave the
+observation unbound).
 """
 function filterAliasObservations(simCode::SIM_CODE)::SIM_CODE
   isempty(simCode.aliasMap) && return simCode
   local ht = simCode.stringToSimVarHT
+  local isElement::Function = (name::String) -> elementArray(simCode, name) !== nothing
   local keep = if simCode.observedFilter === nothing
-    e::AliasEntry -> !occursin('[', e.eliminatedName) && haskey(ht, e.representativeName)
+    e::AliasEntry -> !isElement(e.eliminatedName) && haskey(ht, e.representativeName)
   else
     local patterns = Regex[Regex(p) for p in simCode.observedFilter]
-    e::AliasEntry -> any(p -> occursin(p, e.eliminatedName), patterns)
+    e::AliasEntry -> any(p -> occursin(p, codeName(simCode, e.eliminatedName)), patterns)
   end
   return update(simCode; aliasMap = filter(keep, simCode.aliasMap))
 end

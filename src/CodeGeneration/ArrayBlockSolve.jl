@@ -99,6 +99,19 @@ mutable struct BlockSolver
   failures::Int
 end
 
+"""
+A copy of a solver for a copied problem (`deepcopy(prob.p)`): its buffers and dense factors copied, a sparse
+factorization not (the copy factors again: a copied UMFPACK object shared its C memory with the original's).
+"""
+function Base.deepcopy_internal(s::BlockSolver, dict::IdDict)::BlockSolver
+  haskey(dict, s) && return dict[s]
+  local c::BlockSolver = BlockSolver(Vector{Int}[copy(g) for g in s.groups], copy(s.J), s.dense, copy(s.factors), copy(s.pivots),
+                                     nothing, s.dense && s.factored, copy(s.y), copy(s.x), copy(s.r), copy(s.rp), copy(s.xp),
+                                     copy(s.dx), copy(s.h), s.solved, s.residuals, s.jacobians, s.failures)
+  dict[s] = c
+  return c
+end
+
 function BlockSolver(pattern::_SPARSE.SparseMatrixCSC{Float64, Int}, colors::Vector{Int}, guess::Vector{Float64})::BlockSolver
   local n::Int = length(guess)
   local groups::Vector{Vector{Int}} = Vector{Int}[Int[] for _ in 1:maximum(colors; init = 0)]

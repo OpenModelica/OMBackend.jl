@@ -50,7 +50,7 @@ function familyBase(name::Symbol, variables::IR.VariableSet)::Symbol
   while true
     local v::Union{Nothing, IR.Variable} = get(variables, current, nothing)
     v === nothing && return current
-    local from::Union{Nothing, Tuple{String, Symbol}} = derivedFrom(v, variables)
+    local from::Union{Nothing, Tuple{Vector{IR.CrefPart}, Symbol}} = derivedFrom(v, variables)
     from === nothing && return current
     current = from[2]
   end
@@ -145,23 +145,24 @@ end
 """
     innerSplittable(model, name) -> Bool
 
-Whether the array `name` of the model is one of rolled components (its first part of type `T_COMPONENTS`) of more
+Whether the array `name` of the model is one of rolled components (its first part rolled, `IR.isRolled`) of more
 dimensions than the instances'.
 """
 function innerSplittable(model::IR.Model, name::Symbol)::Bool
   local v::Union{Nothing, IR.Variable} = get(model.variables, name, nothing)
   v === nothing && return false
-  return v.cref.parts[1].ty isa IR.T_COMPONENTS && length(IR.dimensions(v.ty)) > 1
+  return IR.isRolled(v.cref.parts[1].ty) && length(IR.dimensions(v.ty)) > 1
 end
 
 """
-    sliceName(name, t) -> Symbol
+    sliceCref(cref, t) -> ComponentRef
 
-The name of the slice `t` (the inner subscripts) of the array `name`: its last part named with them (`G.b.T[1,2]`),
-as an element of the instance is (`cylinder3.b.T[1,2]`); of a derivative (`\$DER.G.b.T`) the derivative of the
-slice's.
+The reference of the slice `t` (the inner subscripts) of the array of reference `cref`: its last part of type
+`T_SLICE`, named with them (`G.b.T[1,2]`), as an element of the instance is (`cylinder3.b.T[1,2]`); of a derivative
+(`\$DER.G.b.T`) the derivative of the slice's.
 """
-sliceName(name::Symbol, t::Vector{Int})::Symbol = Symbol(name, "[", join(t, ","), "]")
+sliceCref(cref::IR.ComponentRef, t::Vector{Int})::IR.ComponentRef =
+  IR.ComponentRef(IR.CrefPart[cref.parts[1:end - 1]; IR.CrefPart(cref.parts[end].name, IR.Subscript[], IR.T_SLICE(t, cref.parts[end].ty))])
 
 """
     splitInner!(model, bases)
@@ -173,17 +174,15 @@ instance only the array literal of the slices; the for-equations whose iterators
 over them (`unrollIterators`). The model changed in place.
 """
 function splitInner!(model::IR.Model, bases::Set{Symbol})::Nothing
-  #= each family member's slices: name => (inner sizes, base or derived prefix) =#
-  local family::Dict{Symbol, Tuple{Vector{Int}, Symbol}} = Dict{Symbol, Tuple{Vector{Int}, Symbol}}()
+  #= each family member's slices: name => inner sizes =#
+  local family::Dict{Symbol, Vector{Int}} = Dict{Symbol, Vector{Int}}()
   for v in model.variables
-    local base::Symbol = familyBase(v.name, model.variables)
-    base in bases || continue
-    family[v.name] = (knownSizes(v.ty, "the array $(v.name)")[2:end], base)
+    familyBase(v.name, model.variables) in bases || continue
+    family[v.name] = knownSizes(v.ty, "the array $(v.name)")[2:end]
   end
-  local sliceOf::Function = (name::Symbol, t::Vector{Int}) -> begin
-    local base::Symbol = family[name][2]
-    name === base ? sliceName(base, t) : Symbol(String(name)[1:end - length(String(base))], sliceName(base, t))
-  end
+  #= the members' references, their slices' named by them (`sliceCref`) =#
+  local crefOf::Dict{Symbol, IR.ComponentRef} = Dict{Symbol, IR.ComponentRef}(v.name => v.cref for v in model.variables if haskey(family, v.name))
+  local sliceOf::Function = (name::Symbol, t::Vector{Int}) -> sliceCref(crefOf[name], t).name
   #= the variables: each member by its slices, in its place =#
   local out::Vector{IR.Variable} = IR.Variable[]
   for v in model.variables
@@ -191,14 +190,11 @@ function splitInner!(model::IR.Model, bases::Set{Symbol})::Nothing
       push!(out, v)
       continue
     end
-    local sizes::Vector{Int} = family[v.name][1]
+    local sizes::Vector{Int} = family[v.name]
     local n::Int = knownSizes(v.ty, "the array $(v.name)")[1]
     local element::IR.ModelicaType = IR.elementType(v.ty)
     for t in rowMajor(sizes)
-      local name::Symbol = sliceOf(v.name, t)
-      local cref::IR.ComponentRef = length(v.cref.parts) == 1 ? IR.ComponentRef(name, IR.T_ARRAY(element, IR.Dimension[IR.DIM_SIZE(n)])) :
-        IR.ComponentRef(IR.CrefPart[v.cref.parts[1:end - 1]..., IR.CrefPart(Symbol(v.cref.parts[end].name, "[", join(t, ","), "]"), IR.Subscript[], element)])
-      cref.name === name || throw(NotHandled("the slice $(name) of $(v.name) named $(cref.name)"))
+      local cref::IR.ComponentRef = sliceCref(v.cref, t)
       local slice::Function = (x::Union{Nothing, IR.Expression}) -> sliceValue(x, n, t)
       local a::IR.VariableAttributes = v.attributes
       local attributes::IR.VariableAttributes = IR.VariableAttributes(slice(a.start), slice(a.fixed), slice(a.nominal), slice(a.min),
@@ -211,11 +207,11 @@ function splitInner!(model::IR.Model, bases::Set{Symbol})::Nothing
   empty!(model.variables)
   foreach(v::IR.Variable -> push!(model.variables, v), out)
   local partition::IR.Partition = model.continuous[1]
-  partition.equations = IR.Equation[slicedEquation(eq, family, sliceOf, model.variables) for eq in partition.equations]
-  partition.initialEquations = IR.Equation[slicedEquation(eq, family, sliceOf, model.variables) for eq in partition.initialEquations]
+  partition.equations = IR.Equation[slicedEquation(eq, family, model.variables) for eq in partition.equations]
+  partition.initialEquations = IR.Equation[slicedEquation(eq, family, model.variables) for eq in partition.initialEquations]
   local unknowns::Vector{Symbol} = Symbol[]
   for u in partition.unknowns
-    haskey(family, u) ? append!(unknowns, Symbol[sliceOf(u, t) for t in rowMajor(family[u][1])]) : push!(unknowns, u)
+    haskey(family, u) ? append!(unknowns, Symbol[sliceOf(u, t) for t in rowMajor(family[u])]) : push!(unknowns, u)
   end
   empty!(partition.unknowns); append!(partition.unknowns, unknowns)
   return nothing
@@ -226,17 +222,17 @@ end
 
 A reference to an element of an array split along its inner dimensions (`splitInner!`) as the reference to the
 slice's element: `G[\$c].f.R.T[2, 1]` (an inlined body's field) is `G[\$c].f.R.T[2,1]` (the last part's literal
-subscripts in its name), a derivative's one part likewise (`\$DER.G.f.R.T[\$c, 2, 1]` is `\$DER.G.f.R.T[2,1][\$c]`).
+subscripts its slice's, `T_SLICE`), a derivative's likewise (`\$DER.G.f.R.T[\$c, 2, 1]` is `\$DER.G.f.R.T[2,1][\$c]`, on its last part).
 `nothing` where no such slice is a variable (`isVariable` of its name).
 """
 function slicedCref(cref::IR.ComponentRef, isVariable::Function)::Union{Nothing, IR.ComponentRef}
   local last::IR.CrefPart = cref.parts[end]
   for j in 0:length(last.subscripts) - 1
     local textual::Vector{IR.Subscript} = last.subscripts[j + 1:end]
-    all(s::IR.Subscript -> s isa IR.INDEX && (s::IR.INDEX).exp isa IR.INTEGER, textual) || continue
-    local name::Symbol = Symbol(last.name, "[", join(Int[((s::IR.INDEX).exp::IR.INTEGER).value for s in textual], ","), "]")
-    local candidate::IR.ComponentRef = IR.ComponentRef(IR.CrefPart[cref.parts[1:end - 1]..., IR.CrefPart(name, last.subscripts[1:j], last.ty)])
-    isVariable(IR.hasSubscripts(candidate) ? unsubscriptedName(candidate) : candidate.name) && return candidate
+    local inner::Union{Nothing, Vector{Int}} = IR.literalIndices(textual)
+    inner === nothing && continue
+    local candidate::IR.ComponentRef = IR.ComponentRef(IR.CrefPart[cref.parts[1:end - 1]; IR.CrefPart(last.name, last.subscripts[1:j], IR.T_SLICE(inner, last.ty))])
+    isVariable(unsubscriptedName(candidate)) && return candidate
   end
   return nothing
 end
@@ -258,22 +254,20 @@ function sliceValue(x::Union{Nothing, IR.Expression}, n::Int, t::Vector{Int})::U
 end
 
 "The kind of a slice: the array's, the variable it names (a state's derivative, a derivative's state) that one's slice."
-function slicedKind(kind::IR.VariableKind, family::Dict{Symbol, Tuple{Vector{Int}, Symbol}}, t::Vector{Int}, sliceOf::Function)::IR.VariableKind
+function slicedKind(kind::IR.VariableKind, family::Dict{Symbol, Vector{Int}}, t::Vector{Int}, sliceOf::Function)::IR.VariableKind
   local named::Function = (x::Symbol) -> haskey(family, x) ? sliceOf(x, t) : throw(NotHandled("a slice whose kind names $(x), not split with it"))
-  kind isa IR.STATE && kind.derivative !== nothing && return IR.STATE(kind.index, named(kind.derivative), kind.natural)
-  kind isa IR.STATE_DER && return IR.STATE_DER(named(kind.state))
-  kind isa IR.DUMMY_DER && return IR.DUMMY_DER(named(kind.dummyState))
-  kind isa IR.DUMMY_STATE && return IR.DUMMY_STATE(named(kind.dummyDerivative))
-  return kind
+  #= a clocked state's previous value is not split with it =#
+  kind isa IR.CLOCKED_STATE && return kind
+  return IR.mapKindNames(named, kind)
 end
 
 """
-    slicedEquation(eq, family, sliceOf, variables) -> IR.Equation
+    slicedEquation(eq, family, variables) -> IR.Equation
 
 An equation reading the split arrays `family` by their slices (`slicedReference`); its for-equations whose iterators
 subscript an inner dimension unrolled first (`unrollIterators`).
 """
-function slicedEquation(eq::IR.Equation, family::Dict{Symbol, Tuple{Vector{Int}, Symbol}}, sliceOf::Function,
+function slicedEquation(eq::IR.Equation, family::Dict{Symbol, Vector{Int}},
                         variables::IR.VariableSet)::IR.Equation
   local iterators::Set{Symbol} = Set{Symbol}()
   local reads::Bool = false
@@ -284,7 +278,7 @@ function slicedEquation(eq::IR.Equation, family::Dict{Symbol, Tuple{Vector{Int},
     reads = true
     local subscripts::Vector{IR.Subscript} = allSubscripts(x.cref)
     for s in subscripts[min(2, end + 1):end]
-      (s isa IR.INDEX && (s::IR.INDEX).exp isa IR.INTEGER) && continue
+      IR.literalIndex(s) !== nothing && continue
       IR.foreachExp(y::IR.Expression -> ((y isa IR.CREF && length(y.cref.parts) == 1 && !IR.hasSubscripts(y.cref)) && push!(iterators, y.cref.name); nothing),
                     (s::IR.INDEX).exp)
     end
@@ -292,7 +286,7 @@ function slicedEquation(eq::IR.Equation, family::Dict{Symbol, Tuple{Vector{Int},
   end
   reads || return eq
   local unrolled::Vector{IR.Equation} = isempty(iterators) ? IR.Equation[eq] : unrollIterators(eq, iterators)
-  local mapped::Vector{IR.Equation} = IR.Equation[IR.mapEquation!(x::IR.Expression -> slicedReference(x, family, sliceOf), deepcopy(u)) for u in unrolled]
+  local mapped::Vector{IR.Equation} = IR.Equation[IR.mapEquation!(x::IR.Expression -> slicedReference(x, family), deepcopy(u)) for u in unrolled]
   length(mapped) == 1 && return mapped[1]
   #= several equations from one: kept together in a for-equation of one iteration =#
   return IR.FOR_EQUATION(IR.Iterator(Symbol("\$u"), IR.RANGE(IR.INTEGER(1), nothing, IR.INTEGER(1), IR.T_ARRAY(IR.T_INTEGER(), IR.Dimension[IR.DIM_SIZE(1)]))),
@@ -318,37 +312,37 @@ function unrollIterators(eq::IR.Equation, iterators::Set{Symbol})::Vector{IR.Equ
 end
 
 """
-    slicedReference(x, family, sliceOf) -> IR.Expression
+    slicedReference(x, family) -> IR.Expression
 
 A reference to a split array by its slices: with literal inner subscripts the slice's element (the instance's
 subscript kept), by the instance's subscript only the array literal of the slices' elements (picked where literal
 subscripts follow); NotHandled for another (a whole array, an inner subscript not literal).
 """
-function slicedReference(x::IR.Expression, family::Dict{Symbol, Tuple{Vector{Int}, Symbol}}, sliceOf::Function)::IR.Expression
+function slicedReference(x::IR.Expression, family::Dict{Symbol, Vector{Int}})::IR.Expression
   #= the array literal of slices a part became, at literal subscripts (an unrolled `R.T[2, \$i1]`): the element =#
-  (x isa IR.SUBSCRIPTED && x.exp isa IR.ARRAY && literalIndices(x.subscripts) !== nothing) &&
+  (x isa IR.SUBSCRIPTED && x.exp isa IR.ARRAY && IR.literalIndices(x.subscripts) !== nothing) &&
     return foldTree(selectElement(x.exp, x.subscripts, x.ty))
   x isa IR.CREF || return x
   local name::Symbol = IR.hasSubscripts(x.cref) ? unsubscriptedName(x.cref) : x.cref.name
   haskey(family, name) || return x
-  local (sizes::Vector{Int}, _) = family[name]
+  local sizes::Vector{Int} = family[name]
   local subscripts::Vector{IR.Subscript} = allSubscripts(x.cref)
   isempty(subscripts) && throw(NotHandled("the whole array $(name), split along its inner dimensions"))
   local instance::IR.Subscript = subscripts[1]
   local element::IR.ModelicaType = IR.elementType(x.ty)
   local sliceRef::Function = (t::Vector{Int}) -> begin
-    local s::Symbol = sliceOf(name, t)
-    local cref::IR.ComponentRef = length(x.cref.parts) == 1 ? IR.ComponentRef(IR.CrefPart[IR.CrefPart(s, IR.Subscript[instance], x.cref.parts[1].ty)]) :
-      IR.ComponentRef(IR.CrefPart[IR.CrefPart(x.cref.parts[1].name, IR.Subscript[instance], x.cref.parts[1].ty), x.cref.parts[2:end - 1]...,
-                                  IR.CrefPart(Symbol(x.cref.parts[end].name, "[", join(t, ","), "]"), IR.Subscript[], element)])
+    local last::IR.CrefPart = IR.unsubscriptedPart(x.cref.parts[end])
+    local slice::IR.CrefPart = IR.CrefPart(last.name, IR.Subscript[], IR.T_SLICE(t, last.ty))
+    #= a derivative's slice (one of one part too) subscripted on its last part (`IR.withLastSubscripts`), another's on
+       its first (the instance) =#
+    local cref::IR.ComponentRef = (IR.isDerivativeCref(x.cref) || length(x.cref.parts) == 1) ?
+      IR.ComponentRef(IR.CrefPart[x.cref.parts[1:end - 1]; IR.CrefPart(slice.name, IR.Subscript[instance], slice.ty)]) :
+      IR.ComponentRef(IR.CrefPart[IR.withSubscripts(x.cref.parts[1], IR.Subscript[instance]); x.cref.parts[2:end - 1]; slice])
     IR.CREF(cref, element)
   end
   if length(subscripts) == 1 + length(sizes)
-    local t::Vector{Int} = Int[]
-    for s in subscripts[2:end]
-      (s isa IR.INDEX && (s::IR.INDEX).exp isa IR.INTEGER) || throw(NotHandled("the split array $(name) by an inner subscript not literal"))
-      push!(t, ((s::IR.INDEX).exp::IR.INTEGER).value)
-    end
+    local t::Union{Nothing, Vector{Int}} = IR.literalIndices(subscripts[2:end])
+    t === nothing && throw(NotHandled("the split array $(name) by an inner subscript not literal"))
     return sliceRef(t)
   end
   length(subscripts) == 1 || throw(NotHandled("the split array $(name) partly subscripted"))

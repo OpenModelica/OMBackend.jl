@@ -75,7 +75,8 @@ end
 The continuous-time structure of a partition (Pantelides' bipartite graph with its derivative
 links), grown by `pantelides!`:
 - `variables`: the continuous Real variables by name, the derivatives `pantelides!` adds after
-  them; `derivative[v]` the variable holding v's derivative (0: none), `antiderivative[v]` the
+  them, `crefs` their references (a derivative's `IR.derivativeCref` of its variable's);
+  `derivative[v]` the variable holding v's derivative (0: none), `antiderivative[v]` the
   variable v is the derivative of (0: none).
 - `rows`: the partition's scalar equations, then the differentiated ones; `incidence[r]` the
   variables row r reads (each lower derivative too), `differentiated[r]` the row holding r's
@@ -83,6 +84,7 @@ links), grown by `pantelides!`:
 """
 mutable struct Structure
   variables::Vector{Symbol}
+  crefs::Vector{IR.ComponentRef}
   index::Dict{Symbol, Int}
   derivative::Vector{Int}
   antiderivative::Vector{Int}
@@ -114,14 +116,16 @@ end
 isHighest(s::Structure, v::Int)::Bool = s.derivative[v] == 0
 
 """
-    addVariable!(s, name) -> Int
+    addVariable!(s, cref) -> Int
 
-`name` as a variable of the structure (once); its index.
+The variable of reference `cref` as a variable of the structure (once, by its name); its index.
 """
-function addVariable!(s::Structure, name::Symbol)::Int
+function addVariable!(s::Structure, cref::IR.ComponentRef)::Int
+  local name::Symbol = cref.name
   local i = get(s.index, name, 0)
   i != 0 && return i
   push!(s.variables, name)
+  push!(s.crefs, cref)
   push!(s.derivative, 0)
   push!(s.antiderivative, 0)
   s.index[name] = length(s.variables)
@@ -159,7 +163,7 @@ state derivative or an algebraic variable, not a when-equation's target.
 function isContinuousVariable(v::IR.Variable, discretes::Set{Symbol})::Bool
   v.ty isa IR.T_REAL || return false
   v.name in discretes && return false
-  return v.kind isa Union{IR.STATE, IR.STATE_DER, IR.ALGEBRAIC}
+  return v.kind isa Union{IR.STATE, IR.STATE_DER, IR.ALGEBRAIC, IR.ALGEBRAIC_DER}
 end
 
 "The built-in calls whose arguments are not read at the current time as continuous variables."
@@ -209,7 +213,7 @@ function continuousReads!(out::Vector{Symbol}, e::IR.Expression, resolve::F)::Ve
 end
 
 """
-    expandDerivatives!(equations, continuous, functions) -> Vector{Symbol}
+    expandDerivatives!(equations, continuous, variables, functions) -> Vector{Symbol}
 
 der() of an expression in `equations` (in place) replaced by its time derivative, each variable
 of `continuous` it reads by that variable's derivative (`der(a - k * b)` is `der(a) - k * der(b)`,
@@ -217,13 +221,13 @@ of `continuous` it reads by that variable's derivative (`der(a - k * b)` is `der
 `der(hystR - mu0 * Hstat)`, a MultiBody constraint's `der(frame_b.r_0)`. The variables read
 this way (each one's derivative the structure adds).
 """
-function expandDerivatives!(equations::Vector{IR.Equation}, continuous::Set{Symbol},
+function expandDerivatives!(equations::Vector{IR.Equation}, continuous::Set{Symbol}, variables::IR.VariableSet,
                             functions::Dict{Symbol, IR.ModelicaFunction})::Vector{Symbol}
   local derived = Symbol[]
   local variable = (name::Symbol) -> begin
     name in continuous || return nothing
     name in derived || push!(derived, name)
-    return IR.CREF(IR.ComponentRef(IR.derivativeName(name), IR.T_REAL()), IR.T_REAL())
+    return IR.CREF(IR.derivativeCref(variables[name].cref), IR.T_REAL())
   end
   local seeds = Seeds(variable, 1.0, functions)
   local expand = (e::IR.Expression) -> (e isa IR.CALL && e.attributes.builtin && e.name === :der) ?
@@ -341,9 +345,9 @@ function Structure(variables::IR.VariableSet, partition::IR.Partition, functions
                    derived::Vector{Symbol} = Symbol[])::Structure
   local functionsByName = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in functions)
   local discretes = discreteTargets(partition)
-  local s = Structure(Symbol[], Dict{Symbol, Int}(), Int[], Int[], Row[], Vector{Int}[], Int[], Int[])
+  local s::Structure = Structure(Symbol[], IR.ComponentRef[], Dict{Symbol, Int}(), Int[], Int[], Row[], Vector{Int}[], Int[], Int[])
   for v in variables
-    isContinuousVariable(v, discretes) && addVariable!(s, v.name)
+    isContinuousVariable(v, discretes) && addVariable!(s, v.cref)
   end
   for v in variables
     v.kind isa IR.STATE && v.kind.derivative !== nothing && haskey(s.index, v.name) || continue
@@ -437,10 +441,17 @@ end
 
 A reference subscripted further (`(G[\$c].frame.R.T)[2, \$i1]`, an inlined body's field of a rolled component's
 record) as the reference with the subscripts on its parts that have dimensions left (`G[\$c].frame.R.T[2, \$i1]`),
-which differentiation and the element view read as an element; another expression as it is.
+which differentiation and the element view read as an element; a derivative's on its last part
+(`IR.withLastSubscripts`, as many as its type has dimensions left); another expression as it is.
 """
 function subscriptedReference(e::IR.Expression)::IR.Expression
   (e isa IR.SUBSCRIPTED && e.exp isa IR.CREF && all(s::IR.Subscript -> s isa IR.INDEX, e.subscripts)) || return e
+  local cref::IR.ComponentRef = (e.exp::IR.CREF).cref
+  if IR.isDerivativeCref(cref)
+    length(e.subscripts) <= length(IR.dimensions((e.exp::IR.CREF).ty)) || return e
+    any(s::IR.Subscript -> !(s isa IR.INDEX), cref.parts[end].subscripts) && return e
+    return IR.CREF(IR.appendSubscripts(cref, e.subscripts), e.ty)
+  end
   local parts::Vector{IR.CrefPart} = copy((e.exp::IR.CREF).cref.parts)
   local next::Int = 1
   for (k, p) in enumerate(parts)

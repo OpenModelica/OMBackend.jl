@@ -40,7 +40,7 @@
 """
     removeSmooth!(model)
 
-`smooth(order, e)` in the equations of the model's main partition (MLS 3.7.4.2: its use is
+`smooth(order, e)` in the equations of the model's main partition (MLS 3.7.2.2: its use is
 optional). Of a literal order of at least 1, `noEvent(e)` where `e` holds a relation or an
 if-expression: the expression and its derivatives are continuous, so an event adds nothing to
 the solve (MSL SoftStarter's quadratic load torque, `smooth(1, if w >= 0 then w^2 else -w^2)`,
@@ -91,7 +91,7 @@ function equationKey(eq::IR.Equation, h::UInt = zero(UInt))::UInt
         foreach(e -> (h = equationKey(e, h)), b.equations)
       end
     elseif x isa IR.EquationAttributes
-      h = hash((x.kind, x.differentiated), h)
+      h = hash((x.kind, x.differentiated, x.derivativeLink), h)
     else
       h = hash(x, h)
     end
@@ -151,7 +151,7 @@ end
 function addBindingEquations!(variables::IR.VariableSet, partition::IR.Partition)::Nothing
   for v in variables
     v.binding === nothing && continue
-    local continuous = v.kind isa Union{IR.STATE, IR.ALGEBRAIC}
+    local continuous = v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER}
     local discrete = continuous || v.kind isa IR.DISCRETE
     local lhs = IR.CREF(v.cref, v.ty)
     if continuous && v.ty isa IR.T_REAL
@@ -195,35 +195,80 @@ The asserts in the branches of if-equations, as top-level asserts under the bran
 (`not guard or c`), after the other equations: the if-equation lowering takes residual
 equations only (MSL Fluid's AST_BatchPlant). A call for its effects (an assert of its own) is
 made under the branch's condition: `if guard then call else true` (Buildings' Movers print the
-minimum-decrease warning under `not haveMinimumDecrease`). An if-equation of asserts only is
-left out. Of the equations and of the initial equations.
+minimum-decrease warning under `not haveMinimumDecrease`). A `terminate()` (`terminateEquation`) is the
+when-equations of the branch's condition: `when guard then terminate(...)` as the condition becomes true, `when
+initial() then if guard then terminate(...) end if` where it holds at the start (OpenModelica terminates at the
+initialization there). An if-equation of asserts only is left out. Of the equations and of the initial equations
+(where a `terminate()` is not supported).
 """
 function hoistIfEquationAsserts!(model::IR.Model)::IR.Model
   for p in Iterators.flatten((model.continuous, (m.system for m in model.modes)))
     p.equations = hoistIfEquationAsserts(p.equations)
     p.initialEquations = hoistIfEquationAsserts(p.initialEquations)
+    for eq in p.initialEquations
+      eq isa IR.WHEN_EQUATION && any(b -> any(s -> s isa IR.TERMINATE, b.body), eq.branches) &&
+        unsupported("terminate() in an initial equation section", IR.toString(eq))
+    end
   end
   return model
 end
 
 function hoistIfEquationAsserts(equations::Vector{IR.Equation})::Vector{IR.Equation}
   any(hasBranchAssert, equations) || return equations
+  local (out::Vector{IR.Equation}, asserts::Vector{IR.Equation}) = hoistedParts(equations)
+  return vcat(out, asserts)
+end
+
+"""
+The equations without the asserts (and `terminate()`) of their if-equations' branches, and those hoisted
+(`hoistBranchAsserts!`); of a for-equation's if-equations a for-equation of their own over the same iterator (the
+arrays-kept route keeps for-equations).
+"""
+function hoistedParts(equations::Vector{IR.Equation})::Tuple{Vector{IR.Equation}, Vector{IR.Equation}}
   local out = IR.Equation[]
   local asserts = IR.Equation[]
   for eq in equations
+    if eq isa IR.FOR_EQUATION && hasBranchAssert(eq)
+      local (body::Vector{IR.Equation}, hoisted::Vector{IR.Equation}) = hoistedParts(eq.body)
+      isempty(body) || push!(out, IR.FOR_EQUATION(eq.iterator, body, eq.source, eq.attributes))
+      push!(asserts, IR.FOR_EQUATION(eq.iterator, hoisted, eq.source, eq.attributes))
+      continue
+    end
     local h = hasBranchAssert(eq) ? hoistBranchAsserts!(asserts, eq, nothing) : eq
     isEmptyIfEquation(h) || push!(out, h)
   end
-  return vcat(out, asserts)
+  return (out, asserts)
 end
 
 isEmptyIfEquation(eq::IR.Equation)::Bool =
   eq isa IR.IF_EQUATION && all(b -> isempty(b.equations), eq.branches) && isempty(eq.elseEquations)
 
 hasBranchAssert(eq::IR.Equation)::Bool =
-  eq isa IR.IF_EQUATION &&
-  any(e -> e isa IR.ASSERT_EQUATION || hasBranchAssert(e), Iterators.flatten((Iterators.flatten(b.equations for b in eq.branches),
-                                                                              eq.elseEquations)))
+  (eq isa IR.FOR_EQUATION && any(hasBranchAssert, eq.body)) ||
+  (eq isa IR.IF_EQUATION &&
+   any(e -> e isa IR.ASSERT_EQUATION || isTerminateEquation(e) || hasBranchAssert(e),
+       Iterators.flatten((Iterators.flatten(b.equations for b in eq.branches), eq.elseEquations))))
+
+"A `terminate()` of an equation section (`terminateEquation`): `when initial() then terminate(...)`."
+isTerminateEquation(eq::IR.Equation)::Bool =
+  eq isa IR.WHEN_EQUATION && length(eq.branches) == 1 && only(eq.branches).atInitial && !only(eq.branches).atTerminal &&
+  isempty(only(eq.branches).triggers) && length(only(eq.branches).body) == 1 && only(only(eq.branches).body) isa IR.TERMINATE
+
+"""
+The when-equations of a `terminate()` (`terminateEquation`) under `guard`: at the condition's rising edge (without its
+`noEvent()`: a when-condition generates its events, `if noEvent(x > 0.5) then terminate()` stops at 0.5), and at the
+initialization where it holds.
+"""
+function guardedTerminate(eq::IR.WHEN_EQUATION, guard::Union{Nothing, IR.Expression})::Vector{IR.Equation}
+  guard === nothing && return IR.Equation[eq]
+  local t::IR.TERMINATE = only(only(eq.branches).body)
+  local atStart::IR.IF_STATEMENT = IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(guard, IR.Statement[t])], IR.Statement[], t.source)
+  local trigger::IR.Expression = IR.mapExp((x::IR.Expression) -> IR.isBuiltinCall(x, :noEvent) ? only(x.arguments) : x, guard)
+  return IR.Equation[IR.WHEN_EQUATION(IR.WhenBranch[IR.WhenBranch(IR.Expression[trigger], false, false, IR.Statement[t])],
+                                      eq.kind, eq.source, eq.attributes),
+                     IR.WHEN_EQUATION(IR.WhenBranch[IR.WhenBranch(IR.Expression[], true, false, IR.Statement[atStart])],
+                                      eq.kind, eq.source, eq.attributes)]
+end
 
 function hoistBranchAsserts!(asserts::Vector{IR.Equation}, eq::IR.IF_EQUATION, outer::Union{Nothing, IR.Expression})::IR.IF_EQUATION
   local none = nothing
@@ -248,6 +293,8 @@ function takeBranchAsserts!(asserts::Vector{IR.Equation}, body::Vector{IR.Equati
       else
         push!(asserts, IR.ASSERT_EQUATION(orCondition(notCondition(guard), eq.condition), eq.message, eq.level, eq.source))
       end
+    elseif isTerminateEquation(eq)
+      append!(asserts, guardedTerminate(eq, guard))
     elseif eq isa IR.IF_EQUATION
       local h = hoistBranchAsserts!(asserts, eq, guard)
       isEmptyIfEquation(h) || push!(kept, h)

@@ -42,67 +42,40 @@
 """
     Names
 
-The simulation names of a model's references: a reference's flat name (`a.b[1,2]` is
-`a_b[1][2]`, `legacyName`), and for the references whose flat names collide (`a.b` and a
-variable `a_b`) a new one (`a_b_1`): the least qualified keeps the name. `known` are the
-names of the simulation variables (with `der(x)` of the states and the built-in `time`,
-`pi`, `e`): a reference to an element of an array known as a whole is the array's, subscripted.
-`stateOf` maps a derivative variable `\$DER.x` to its state `x`. `scalars` are the known names
-of variables that are not arrays.
+The keys of a lowering's references: of a model's variables their IR references' flat names
+(`a.b[1,2]`: the simulation code is keyed by the references, its identifiers in the generated code
+derived at the code generators' boundary, `codeIdentifiers`); of a function's locals their legacy
+names (`derivedKey`), the generated function's identifiers. `known` are the keys of the variables
+(with each state's derivative's and the built-in `time`, `pi`, `e`): a reference to an element of
+an array known as a whole is the array's, subscripted. `stateOf` maps a derivative variable `\$DER.x`
+to its state `x`. `scalars` are the known keys of variables that are not arrays.
 """
 struct Names
-  renamed::Dict{Symbol, String}
+  model::Bool
   known::Set{String}
   stateOf::Dict{Symbol, IR.ComponentRef}
   scalars::Set{String}
 end
 
 """
-    collidingNames(variables)
-
-The new names of the variables whose flat names collide, by the variables' names: of each
-group of references with one flat name, the least qualified (the first of those) keeps it, the
-others are `<name>_1`, `<name>_2`, ... (names not taken). A reference with subscripts is not
-renamed (with a warning).
-"""
-function collidingNames(variables::Vector{IR.Variable})::Dict{Symbol, String}
-  local byFlatName = OrderedDict{String, OrderedDict{Symbol, IR.ComponentRef}}()
-  for v in variables
-    push!(get!(OrderedDict{Symbol, IR.ComponentRef}, byFlatName, legacyName(v.cref)), v.name => v.cref)
-  end
-  local taken = Set{String}(keys(byFlatName))
-  local renamed = Dict{Symbol, String}()
-  for (flat, claimants) in byFlatName
-    length(claimants) < 2 && continue
-    local keep = argmin(n -> length(claimants[n].parts), collect(keys(claimants)))
-    for (name, cref) in claimants
-      name === keep && continue
-      if IR.hasSubscripts(cref)
-        @warn "The flat name $(flat) of the subscripted variable $(name) collides; left unresolved"
-        continue
-      end
-      local k = 1
-      while string(flat, "_", k) in taken
-        k += 1
-      end
-      local newName = string(flat, "_", k)
-      push!(taken, newName)
-      renamed[name] = newName
-    end
-  end
-  return renamed
-end
-
-"""
     simName(names, cref)
 
-The simulation name of `cref`: its flat name with every `.` as `_` (of an enumeration
-literal's subscript: `x[Logic_'U'(1)]`), a quoted name as it is; or its new name.
+The key of `cref` in the lowering `names`: a model variable's its flat name (`refKey`), a function
+local's its legacy name (`derivedKey`).
 """
-function simName(names::Names, cref::IR.ComponentRef)::String
-  local r = isempty(names.renamed) || IR.hasSubscripts(cref) ? nothing : get(names.renamed, cref.name, nothing)
-  r === nothing || return r
-  local flat = legacyName(cref)
+simName(names::Names, cref::IR.ComponentRef)::String = names.model ? refKey(cref) : derivedKey(cref)
+
+"The key of the model variable the IR reference `ref` names in the simulation code: its flat name."
+refKey(ref::IR.ComponentRef)::String = String(ref.name)
+
+"""
+    derivedKey(ref) -> String
+
+The legacy name of a reference (BDAE's): its `legacyName` with every `.` as `_`, a quoted name as it
+is. A variable's identifier in the generated code (`codeIdentifiers`), a function local's key.
+"""
+function derivedKey(ref::IR.ComponentRef)::String
+  local flat::String = legacyName(ref)
   (startswith(flat, '\'') && endswith(flat, '\'')) && return flat
   return replace(flat, '.' => '_')
 end
@@ -257,34 +230,33 @@ by its flat name.
 """
 function simCrefExp(names::Names, cref::IR.ComponentRef, ty::IR.ModelicaType)::Exp
   local state = get(names.stateOf, cref.name, nothing)
-  state === nothing || return DER(SimCref(Symbol(simName(names, state))))
+  state === nothing || return DER(SimCref(Symbol(simName(names, state)), Int[], state))
   local full = simName(names, cref)
-  full in names.known && return EXP_CREF(SimCref(Symbol(full)), simType(ty))
-  if any(p -> any(s -> !(s isa IR.INDEX && s.exp isa Union{IR.INTEGER, IR.ENUM_LITERAL}), p.subscripts),
-         @view cref.parts[1:end-1])
+  full in names.known && return EXP_CREF(SimCref(Symbol(full), Int[], cref), simType(ty))
+  if any(p::IR.CrefPart -> !all(IR.isLiteralSubscript, p.subscripts), @view cref.parts[1:end-1])
     local selected = variablesBySubscript(names, cref, ty)
     selected === nothing || return selected
   end
   local last = cref.parts[end]
-  local base = simName(names, IR.ComponentRef(IR.CrefPart[cref.parts[1:end-1]..., IR.CrefPart(last.name, IR.Subscript[], last.ty)]))
+  local baseCref::IR.ComponentRef = IR.withoutLastSubscripts(cref)
+  local base::String = simName(names, baseCref)
   if !(base in names.known)
     local field = recordFieldExp(names, cref)
     field === nothing || return field
   end
   if isempty(last.subscripts) && !(base in names.known)
-    return something(variablesBySubscript(names, cref, ty), Some(EXP_CREF(SimCref(Symbol(full)), simType(ty))))
+    return something(variablesBySubscript(names, cref, ty), Some(EXP_CREF(SimCref(Symbol(full), Int[], cref), simType(ty))))
   end
   #= a scalar subscripted by ones is the scalar: the frontend's equations of expandable
      connectors' scalar signals (`bus2.y1[1] = two.bus.y1[1]`, Buildings' Templates) =#
-  (base in names.scalars && all(p -> isempty(p.subscripts), @view cref.parts[1:end-1]) &&
-   all(s -> s isa IR.INDEX && s.exp isa IR.INTEGER && s.exp.value == 1, last.subscripts)) &&
-    return EXP_CREF(SimCref(Symbol(base)), simType(ty))
-  if all(s -> s isa IR.INDEX && s.exp isa IR.INTEGER, last.subscripts)
-    return EXP_CREF(SimCref(Symbol(base), Int[s.exp.value for s in last.subscripts]), simType(ty))
-  end
-  all(s -> s isa IR.INDEX && s.exp isa Union{IR.INTEGER, IR.ENUM_LITERAL}, last.subscripts) &&
-    return EXP_CREF(SimCref(Symbol(full)), simType(ty))
-  return ASUB(EXP_CREF(SimCref(Symbol(base)), simType(last.ty)), Exp[subscriptExp(names, s) for s in last.subscripts])
+  (base in names.scalars && !any(IR.isSubscripted, @view cref.parts[1:end-1]) &&
+   all(s -> IR.literalIndex(s) == 1, last.subscripts)) &&
+    return EXP_CREF(SimCref(Symbol(base), Int[], baseCref), simType(ty))
+  local index::Union{Nothing, Vector{Int}} = IR.literalIndices(last.subscripts)
+  index === nothing || return EXP_CREF(SimCref(Symbol(base), index, cref), simType(ty))
+  all(IR.isLiteralSubscript, last.subscripts) &&
+    return EXP_CREF(SimCref(Symbol(full), Int[], cref), simType(ty))
+  return ASUB(EXP_CREF(SimCref(Symbol(base), Int[], baseCref), simType(last.ty)), Exp[subscriptExp(names, s) for s in last.subscripts])
 end
 
 """
@@ -302,9 +274,10 @@ function recordFieldExp(names::Names, cref::IR.ComponentRef)::Union{Nothing, Exp
     local prefix = cref.parts[k]
     local ty = isempty(prefix.subscripts) ? prefix.ty : IR.elementType(prefix.ty)
     ty isa IR.T_RECORD || continue
-    local name = simName(names, IR.ComponentRef(cref.parts[1:k]))
+    local recordCref::IR.ComponentRef = IR.ComponentRef(cref.parts[1:k])
+    local name::String = simName(names, recordCref)
     name in names.scalars || continue
-    local exp = EXP_CREF(SimCref(Symbol(name)), simType(ty))
+    local exp::Exp = EXP_CREF(SimCref(Symbol(name), Int[], recordCref), simType(ty))
     for p in @view cref.parts[k + 1:end]
       ty isa IR.T_RECORD || return nothing
       local i = findfirst(f -> f.name === p.name, ty.fields)
@@ -322,7 +295,7 @@ function recordFieldExp(names::Names, cref::IR.ComponentRef)::Union{Nothing, Exp
 end
 
 "The SimCref of a reference (a variable's name)."
-simCref(names::Names, cref::IR.ComponentRef)::SimCref = SimCref(Symbol(simName(names, cref)))
+simCref(names::Names, cref::IR.ComponentRef)::SimCref = SimCref(Symbol(simName(names, cref)), Int[], cref)
 
 """
     variablesBySubscript(names, cref, ty)
@@ -332,16 +305,20 @@ part), its elements 1, 2, ... variables; `nothing` for another.
 """
 function variablesBySubscript(names::Names, cref::IR.ComponentRef, ty::IR.ModelicaType)::Union{Nothing, Exp}
   local positions = Tuple{Int, Int}[(p, k) for (p, part) in enumerate(cref.parts) for (k, s) in enumerate(part.subscripts)
-                                    if s isa IR.INDEX && !(s.exp isa Union{IR.INTEGER, IR.ENUM_LITERAL})]
+                                    if s isa IR.INDEX && !IR.isLiteralSubscript(s)]
   length(positions) == 1 || return nothing
   local (p, k) = only(positions)
   local index = cref.parts[p].subscripts[k].exp
-  local withIndex = i -> IR.ComponentRef(IR.CrefPart[q == p ?
+  local elementRef::Function = (i::Int) -> IR.ComponentRef(IR.CrefPart[q == p ?
     IR.CrefPart(part.name, IR.Subscript[j == k ? IR.INDEX(IR.INTEGER(i)) : s for (j, s) in enumerate(part.subscripts)], part.ty) :
     part for (q, part) in enumerate(cref.parts)])
-  local elements = Exp[]
-  while simName(names, withIndex(length(elements) + 1)) in names.known
-    push!(elements, EXP_CREF(SimCref(Symbol(simName(names, withIndex(length(elements) + 1)))), simType(ty)))
+  local elementTy::SType = simType(ty)
+  local elements::Vector{Exp} = Exp[]
+  while true
+    local ref::IR.ComponentRef = elementRef(length(elements) + 1)
+    local key::String = simName(names, ref)
+    key in names.known || break
+    push!(elements, EXP_CREF(SimCref(Symbol(key), Int[], ref), elementTy))
   end
   isempty(elements) && return nothing
   return ASUB(ARRAY_EXP(TYPE_ARRAY(simType(ty), Int[length(elements)]), true, elements), Exp[simExp(names, index)])

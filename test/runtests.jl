@@ -340,6 +340,10 @@ import .ExampleModels
 
   #= ── 13. The names Modelica function statements read ──────────── =#
   include("functionBodyCrefsTests.jl")
+  #= the partial evaluation of function calls, its environment by references =#
+  include("functionEvaluationTests.jl")
+  #= the code generators by references: record fields, a when body's writes, hvcats, small models =#
+  include("referenceLookupTests.jl")
 
   #= ── 14. Protected variables keep their attributes ────────────── =#
   include("protectedAttributesTests.jl")
@@ -358,12 +362,16 @@ import .ExampleModels
 
   #= ── 19. Array-preserving code generation (no-scalarize models) ─ =#
   include("arrayPathTests.jl")
+  include("simCodeArraysTests.jl")
 
   #= ── 20. The initialization's one-unknown rows ──────────────────── =#
   include("initializationCausalRowsTests.jl")
 
   #= ── 20b. OMBackend's index reduction step by step ──────────────── =#
   include("indexReductionTests.jl")
+
+  #= ── 20b'. References by their parts (slices, the algorithm lifter) ─ =#
+  include("referencePartsTests.jl")
 
   #= ── 20c. Zero flow and zero speed (semiLinear chains, noEvent) ─── =#
   include("zeroFlowTests.jl")
@@ -426,8 +434,26 @@ import .ExampleModels
   include("exactZeroRelationTests.jl")
   include("whenBodyCallTests.jl")
 
+  #= ── Parameters read by literal and by variable subscripts ── =#
+  include("parameterEliminationTests.jl")
+
   #= ── 20v. The model cache within its memory limit ── =#
   include("cacheTests.jl")
+
+  #= ── 20w. The initialization's parameters and pins by the variables' names ── =#
+  include("initializationNamesTests.jl")
+
+  #= ── 20w2. What the generated model's variables are (SimCodeKind, IfConditionParameter) ── =#
+  include("kindMetadataTests.jl")
+
+  #= ── 20x. An observed filter and the observations injected after it ── =#
+  include("observedFilterTests.jl")
+
+  #= ── 20y. A failed re-solve within the event iteration (arcs at a Y-D switch) ── =#
+  include("arcSwitchTests.jl")
+
+  #= ── 20z. A failed build's simulate fails on the build's error ── =#
+  include("failedBuildTests.jl")
 
   #= ── 21. The backend reads the frontend's flat model only ──────── =#
   @testset "No DAE in the backend" begin

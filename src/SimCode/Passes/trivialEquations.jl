@@ -231,11 +231,10 @@ defines too: an upper bound of the residuals' unknowns), an array variable's ele
 function residualUnknownCount(ht::HT)::Int
   local n = 0
   for (_, (_, v)) in ht
-    local k = v.varKind
-    if k isa Union{STATE, ALG_VARIABLE, DISCRETE}
+    if isArrayAlgebraic(v)
+      n += prod(v.dims; init = 1)
+    elseif v.varKind isa Union{STATE, ALG_VARIABLE, DISCRETE}
       n += 1
-    elseif k isa ARRAY
-      n += prod(k.dimensions; init = 1)
     end
   end
   return n

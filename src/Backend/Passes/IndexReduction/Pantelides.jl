@@ -144,12 +144,12 @@ end
 """
     addDerivative!(s, v) -> Int
 
-The derivative of variable `v` as a new variable of the structure (`\$DER.` before its name);
-its index.
+The derivative of variable `v` as a new variable of the structure (`IR.derivativeCref` of its
+reference: `\$DER.` before its name); its index.
 """
 function addDerivative!(s::Structure, v::Int)::Int
   s.derivative[v] == 0 || return s.derivative[v]
-  local d = addVariable!(s, IR.derivativeName(s.variables[v]))
+  local d::Int = addVariable!(s, IR.derivativeCref(s.crefs[v]))
   s.derivative[v] = d
   s.antiderivative[d] = v
   return d
@@ -293,7 +293,7 @@ function derivativeSeeds(s::Structure, functions::Vector{IR.ModelicaFunction})::
     v == 0 && return nothing
     local d = s.derivative[v]
     d == 0 && throw(NotHandled("the derivative of $(name), which Pantelides' algorithm gave none"))
-    return IR.CREF(IR.ComponentRef(s.variables[d], IR.T_REAL()), IR.T_REAL())
+    return IR.CREF(s.crefs[d], IR.T_REAL())
   end
   return Seeds(variable, 1.0, Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in functions))
 end

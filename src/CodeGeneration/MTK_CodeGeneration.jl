@@ -150,12 +150,12 @@ function classifyVariables(simCode::SC.SIM_CODE)::ClassifiedVariables
     local varType = var.varKind
     if varType isa SC.INPUT
       unsupported("INPUT variable", varName)
-    elseif varType isa Union{SC.STATE, SC.ARRAY}
+    elseif varType isa SC.STATE || SC.isArrayAlgebraic(var)
       push!(stateVariables, varName)
+    elseif SC.isArrayParameter(var)
+      push!(arrayParameters, varName)
     elseif varType isa SC.PARAMETER
       push!(parameters, varName)
-    elseif varType isa SC.ARRAY_PARAMETER
-      push!(arrayParameters, varName)
     elseif varType isa SC.DISCRETE
       push!(discreteVariables, varName)
     elseif varType isa SC.ALG_VARIABLE
@@ -170,7 +170,7 @@ function classifyVariables(simCode::SC.SIM_CODE)::ClassifiedVariables
     #= String parameters are non-numeric; excluded from MTK parameter system. =#
     #= StateSelect → MTK state_priority, only on actual MTK unknowns. =#
     local priority = var.elementType isa SC.TYPE_REAL ? get(STATE_PRIORITIES, something(var.attributes.stateSelect, :default), nothing) : nothing
-    if priority !== nothing && varType isa Union{SC.STATE, SC.ALG_VARIABLE, SC.ARRAY} && !startswith(varName, "der(")
+    if priority !== nothing && varType isa Union{SC.STATE, SC.ALG_VARIABLE}
       push!(statePriorityPairs, (Symbol(varName), priority))
     end
   end
@@ -260,6 +260,30 @@ function whenConditionDiscreteSyms(simCode::SC.SIM_CODE)::OrderedSet{Symbol}
 end
 
 """
+    whenAssignedDiscreteSyms(simCode) -> OrderedSet{Symbol}
+
+Names of the DISCRETE variables a when-equation assigns: the representative of their relay component (`i = Integer(e)`
+of a when's `e`). The component's start is theirs (relayed away, `e`'s fixed start `E.one` gave way to `i`'s default
+0) and the callbacks write them.
+"""
+function whenAssignedDiscreteSyms(simCode::SC.SIM_CODE)::OrderedSet{Symbol}
+  local out = OrderedSet{Symbol}()
+  local ht = simCode.stringToSimVarHT
+  for weq in simCode.whenEquations
+    local stmts = weq.whenEquation
+    while stmts !== nothing
+      for st in stmts.body
+        (st isa SC.ASSIGN && st.left isa SC.EXP_CREF) || continue
+        local nm::String = SC.crefName(st.left.cref)
+        (haskey(ht, nm) && SC.isDiscrete(last(ht[nm]))) && push!(out, Symbol(nm))
+      end
+      stmts = stmts.elsewhenPart
+    end
+  end
+  return out
+end
+
+"""
     substituteRelayAliasesInWhens(simCode, relayAliases) -> simCode
 
 Re-point when-equation reads of relay-eliminated leaf names at the surviving
@@ -290,7 +314,8 @@ function substituteRelayAliasesInWhens(simCode::SC.SIM_CODE, relayAliases::Dict{
   for (k, r) in relayAliases
     local ty = get(tyOf, string(k), nothing)
     ty === nothing && continue
-    replacements[string(k)] = SC.Replacement(SC.EXP_CREF(SC.SimCref(Symbol(r)), ty), false, false)
+    local entry::Union{Nothing, Tuple{Int, SC.SIMVAR}} = get(simCode.stringToSimVarHT, string(r), nothing)
+    replacements[string(k)] = SC.Replacement(SC.EXP_CREF(SC.SimCref(Symbol(r), Int[], entry === nothing ? nothing : last(entry).ref), ty), false, false)
   end
   isempty(replacements) && return simCode
   return SC.update(simCode; whenEquations = SC.WHEN_EQUATION[SC.WHEN_EQUATION(SC.substitute(w.whenEquation, replacements), w.source, w.attr)
@@ -407,21 +432,94 @@ function emitProblemConstruction(useDirectRHS::Bool, skipInitializeProb::Bool)::
 end
 
 """
-    defaultSolverFor(solver, problem, reducedSystem, discreteUnknownNames, hasWhens) -> solver
+    SimCodeKind(name, category, irKind, irOrigin)
+
+What an MTK variable is in the simulation code, as Symbolics metadata the generated model sets where it declares
+its variables: the variable's name, its SimCode category (the type of `SIMVAR.varKind`: STATE, ALG_VARIABLE,
+DISCRETE, ...), its OMJLIR kind (`SIMVAR.irKind`: ALGEBRAIC_DER, DUMMY_DER, ...) and its OMJLIR origin (`:model`, or
+the pass that introduced it). Immutable values only: the generated code's hash, which decides whether a translate
+reuses the compiled module, stays the same for the same model.
+"""
+struct SimCodeKind
+  name::Symbol
+  category::Type{<:SC.SimVarType}
+  irKind::Union{Nothing, SC.IR.VariableKind}
+  irOrigin::Union{Nothing, Symbol}
+end
+
+"""
+    simCodeKind(u) -> Union{Nothing, SimCodeKind}
+
+What the MTK variable `u` is in the simulation code; `nothing` for a variable the code generation or MTK made
+(MTK's derivative variables `xˍt`, if-equation and relation variables). A variable MTK derives from a declared one
+keeps its metadata (Symbolics' `rename`: `xˍt` from `x`), so the kind is `u`'s only where it names `u`.
+"""
+function simCodeKind(@nospecialize(u))::Union{Nothing, SimCodeKind}
+  local x = Symbolics.unwrap(u)
+  local k::Union{Nothing, SimCodeKind} = SymbolicUtils.getmetadata(x, SimCodeKind, nothing)
+  return k !== nothing && variableName(x) == String(k.name) ? k : nothing
+end
+
+"""
+Symbolics metadata of the parameters the generated model declares for its if-equations' conditions (`ifCond…`,
+`generateDiscreteIfCondDeclaration`).
+"""
+struct IfConditionParameter end
+
+"Whether `p` is a parameter the generated model declared for an if-equation's condition."
+isIfConditionParameter(@nospecialize(p))::Bool =
+  SymbolicUtils.getmetadata(Symbolics.unwrap(p), IfConditionParameter, false)
+
+"""
+    simCodeKinds(simCode) -> Vector{Tuple{Symbol, SimCodeKind}}
+
+Each variable of the simulation code by name with what it is there (`SimCodeKind`), for the generated model's
+declarations.
+"""
+simCodeKinds(simCode::SC.SIM_CODE)::Vector{Tuple{Symbol, SimCodeKind}} =
+  Tuple{Symbol, SimCodeKind}[(Symbol(name), SimCodeKind(Symbol(name), typeof(v.varKind), v.irKind, v.irOrigin))
+                             for (name, (_, v)) in simCode.stringToSimVarHT]
+
+"""
+    simCodeKindsExpr(simCode) -> Expr
+
+Code that builds `simCodeKinds(simCode)`, for the generated model: printed (`writeModelToFile`), it is Julia that
+parses, where the values themselves print in OMJLIR's notation.
+"""
+function simCodeKindsExpr(simCode::SC.SIM_CODE)::Expr
+  local entries::Vector{Expr} = Expr[:(($(QuoteNode(n)), $(_constructorExpr(k)))) for (n, k) in simCodeKinds(simCode)]
+  return :(Tuple{Symbol, OMBackend.CodeGeneration.SimCodeKind}[$(entries...)])
+end
+
+"The constructor call of a `SimCodeKind`, its category and OMJLIR kind by their qualified names."
+_constructorExpr(k::SimCodeKind)::Expr =
+  :(OMBackend.CodeGeneration.SimCodeKind($(QuoteNode(k.name)), OMBackend.SimCode.$(nameof(k.category)),
+                                         $(_constructorExpr(k.irKind)), $(QuoteNode(k.irOrigin))))
+_constructorExpr(::Nothing)::Nothing = nothing
+_constructorExpr(k::SC.IR.VariableKind)::Expr =
+  Expr(:call, :(OMBackend.OMJLIR.$(nameof(typeof(k)))),
+       (_literalExpr(getfield(k, f)) for f in fieldnames(typeof(k)))...)
+_literalExpr(x::Symbol)::QuoteNode = QuoteNode(x)
+_literalExpr(x::Union{Nothing, Bool, Int})::Union{Nothing, Bool, Int} = x
+
+"""
+    defaultSolverFor(solver, problem, reducedSystem, eventTriggers, hasWhens) -> solver
 
 Switch the Rosenbrock default (Rodas5P) to FBDF for the DAE shapes where
 Rosenbrock mass-matrix stepping is brittle: purely algebraic systems, and,
-in a model without when-equations, algebraic rows of generated discrete
-variables (`discreteUnknownNames`, as `name(t)`). Brake reaches a consistent
+in a model without when-equations, algebraic rows of the model's discrete
+variables (`simCodeKind`; not the event-trigger discretes `eventTriggers`, which
+the DiscreteCallbacks latch). Brake reaches a consistent
 initial residual, but Rodas5P aborts at once with dt_epsilon/NaN while FBDF
 advances the same mass-matrix problem. With when-equations the callbacks keep
 the discretes consistent, and FBDF's post-event re-initialization collapses
 dt at the first event. A solver the user chose is kept. Runs here rather than
 in the generated module, where a model variable (`count`) shadows Base.
 """
-function defaultSolverFor(solver, problem, reducedSystem, discreteUnknownNames::Vector{String}, hasWhens::Bool)
-  local name = string(nameof(typeof(solver)))
-  (startswith(name, "Rodas") || startswith(name, "Rosenbrock")) || return solver
+function defaultSolverFor(solver, problem, reducedSystem, eventTriggers::AbstractSet{Symbol}, hasWhens::Bool)
+  local ODECore::Module = OrdinaryDiffEq.OrdinaryDiffEqCore
+  solver isa Union{ODECore.OrdinaryDiffEqRosenbrockAlgorithm, ODECore.OrdinaryDiffEqRosenbrockAdaptiveAlgorithm} || return solver
+  local name::String = string(nameof(typeof(solver)))
   local n = problem.u0 === nothing ? 0 : length(problem.u0)
   local mm = problem.f.mass_matrix
   #= UniformScaling (pure ODE) reads 1 on the diagonal. =#
@@ -430,12 +528,13 @@ function defaultSolverFor(solver, problem, reducedSystem, discreteUnknownNames::
     @info "[MTK GEN: solver] zero differential states detected, switching default $(name) -> FBDF for purely-algebraic DAE"
     return OMBackend.daeFallbackSolver()
   end
-  (hasWhens || nDiff == n || isempty(discreteUnknownNames)) && return solver
-  local unknowns = ModelingToolkit.unknowns(reducedSystem)
-  #= MTK renders subscripted unknowns as var"name[i]"(t); strip the quotes. =#
-  mtkName(u) = replace(string(u), "var\"" => "", "\"" => "")
-  local names = Set(discreteUnknownNames)
-  if any(i -> mm[i, i] == 0 && mtkName(unknowns[i]) in names, 1:min(n, length(unknowns)))
+  (hasWhens || nDiff == n) && return solver
+  local unknowns::Vector = ModelingToolkit.unknowns(reducedSystem)
+  local isModelDiscrete::Function = (u) -> begin
+    local k::Union{Nothing, SimCodeKind} = simCodeKind(u)
+    k !== nothing && k.category === SC.DISCRETE && !(ModelingToolkit.getname(u) in eventTriggers)
+  end
+  if any(i -> mm[i, i] == 0 && isModelDiscrete(unknowns[i]), 1:min(n, length(unknowns)))
     @info "[MTK GEN: solver] algebraic rows involving generated discrete variables detected in mass-matrix system; switching default $(name) -> FBDF"
     return OMBackend.daeFallbackSolver()
   end
@@ -467,11 +566,11 @@ function defaultInitializeKwargs(problem, kwargs, tableClusters::Bool)
 end
 
 """
-    defaultToleranceKwargs(problem, kwargs; dummyDerivatives = String[]) -> NamedTuple
+    defaultToleranceKwargs(problem, kwargs) -> NamedTuple
 
 The absolute tolerance per unknown of a mass-matrix problem whose algebraic
 unknowns include derivatives (`xˍt`: MTK's dummy derivatives from index
-reduction): Inf for those, so the error control leaves them out, and the
+reduction, the variables its schedule substitutes for derivatives): Inf for those, so the error control leaves them out, and the
 solve's abstol (1e-6 by default) for the others. Nothing when the caller gave
 an abstol per unknown, or for a problem without such unknowns.
 
@@ -483,25 +582,35 @@ stopped near 2e-6 s (MaxIters or Unstable); left out, it runs to 1 s in
 6000 steps and ends at OpenModelica's values. A derivative that is a state
 (`xˍt` after order lowering, a mass-matrix row of 1) stays controlled.
 
-The `dummyDerivatives` of OMBackend's index reduction (SIM_CODE.dummyDerivatives)
+The dummy derivatives of OMBackend's index reduction (kind DUMMY_DER, `simCodeKind`)
 are left out too: they jump at events; controlled, the transformer currents' of
 MSL Rectifier6pulse held the steps at the diodes' switching until MaxIters
-(SMEE_Rectifier and Rectifier12pulse too). Its other derivative unknowns, a
-state's derivative kept as an unknown (`\$DER_aimc_inertiaRotor_w`), stay
-controlled: left out, MSL AIMC_DOL's stator currents were 0.45 % off the
-reference at reltol 1e-6 (MTK's path 0.03 %).
+(SMEE_Rectifier and Rectifier12pulse too). So are its other derivative unknowns
+(ALGEBRAIC_DER, a state's derivative kept as an unknown), as in OpenModelica:
+after MSL IMC_YDarc's arc went out, the stator currents' derivatives were
+fixed only through the open switch's Goff (the algebraic block's condition
+3.6e9), their noise was above the tolerance at any step, and the solve
+stalled in 5e-13 s steps (MaxIters at 2.0027 s; left out, 2.5 s in 28 s).
+Controlled, they were what MSL 3.2.3's AIMC_DOL needed (2026-10-23); on 4.1.0
+its IMC_DOL is closer to the reference left out (0.0033 A against 0.0060).
 """
-function defaultToleranceKwargs(problem, kwargs; dummyDerivatives::Vector{String} = String[])
+function defaultToleranceKwargs(problem, kwargs)
   local abstol = get(kwargs, :abstol, 1.0e-6)
   abstol isa Number || return (;)
-  local rows = _algebraicRows(problem.f)
+  local rows::Vector{Int} = _algebraicRows(problem.f)
   isempty(rows) && return (;)
-  local names = string.(getStatesAsSymbols(problem.f))
-  length(names) == length(problem.u0) || return (;)
-  local dummies = Set{String}(dummyDerivatives)
-  local derivatives = Int[k for k in rows if occursin("ˍt", names[k]) || names[k] in dummies]
+  problem.f.sys === nothing && return (;)
+  local unknowns::Vector = ModelingToolkit.get_unknowns(problem.f.sys)
+  length(unknowns) == length(problem.u0) || return (;)
+  #= OMBackend's derivative unknowns by their kind; MTK's own by its schedule =#
+  local mtkDerivatives::Set{Any} = mtkDerivativeVariables(problem.f.sys)
+  local isDerivative::Function = (u) -> begin
+    local k::Union{Nothing, SimCodeKind} = simCodeKind(u)
+    k === nothing ? Symbolics.unwrap(u) in mtkDerivatives : k.irKind isa Union{SC.IR.DUMMY_DER, SC.IR.ALGEBRAIC_DER}
+  end
+  local derivatives::Vector{Int} = Int[k for k in rows if isDerivative(unknowns[k])]
   isempty(derivatives) && return (;)
-  local perUnknown = fill(Float64(abstol), length(problem.u0))
+  local perUnknown::Vector{Float64} = fill(Float64(abstol), length(problem.u0))
   perUnknown[derivatives] .= Inf
   return (; abstol = perUnknown)
 end
@@ -822,9 +931,11 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SC.SIM_CODE, modelName::String
     #= simulateFromBuild: post-build solve pipeline (init-alg, Rodas/FBDF auto-switch,
        DAE routing, InitialFailure retry, terminal events). Extracted from simulate so
        the iMTK path can drive it with a cached build; simulate behavior is unchanged. =#
-    function simulateFromBuild(built, tspan = (0.0, 1.0), solver = OMBackend.defaultSolver(); kwargs...)
-      $(_startTimeGuard(simCode))
-      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreducible) = built
+    #= The problem of a build after the runtime initial algorithm (the initial arms of the when-equations, as
+       simulateFromBuild and getMTKProblem run it): its parameter assignments in the problem, its other assignments
+       hard starts (remake). (the problem, the problem before the remake, whether it was remade) =#
+    function problemFromBuild(built, tspan = (0.0, 1.0))
+      ($(Symbol("$(MODEL_NAME)Model_problem")), _, _, _, $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))) = built
       global LATEST_REDUCED_SYSTEM = $(Symbol("$(MODEL_NAME)Model_ReducedSystem"))
       global LATEST_PROBLEM = $(Symbol("$(MODEL_NAME)Model_problem"))
       #= Run in the latest world age: __runInitialAlgorithm! is compiled at
@@ -880,12 +991,19 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SC.SIM_CODE, modelName::String
           end
         end
       end
+      return (LATEST_PROBLEM, _origProblem, _didRemake)
+    end
+    function simulateFromBuild(built, tspan = (0.0, 1.0), solver = OMBackend.defaultSolver(); kwargs...)
+      $(_startTimeGuard(simCode))
+      ($(Symbol("$(MODEL_NAME)Model_problem")), callbacks, ivs, _ivs_all, $(Symbol("$(MODEL_NAME)Model_ReducedSystem")), _tspan2, _pars, _vars, _irreducible) = built
+      local (_initProblem, _origProblem, _didRemake) = problemFromBuild(built, tspan)
+      $(Symbol("$(MODEL_NAME)Model_problem")) = _initProblem
       #= Event-trigger discretes (referenced in a when-condition) are latched by
          DiscreteCallbacks and are not part of the brittle Rosenbrock mass-matrix
          coupling the FBDF switch targets; excluding them keeps the default
          Rosenbrock solver, which handles them without the FBDF tstop chatter. =#
       local _solver = OMBackend.CodeGeneration.defaultSolverFor(solver, $(Symbol("$(MODEL_NAME)Model_problem")), LATEST_REDUCED_SYSTEM,
-                                                                $(Expr(:ref, :String, [string(varName, "(t)") for (varName, (_, simVar)) in simCode.stringToSimVarHT if simVar.varKind isa SC.DISCRETE && !(Symbol(varName) in _condDiscretes)]...)),
+                                                                $(Set{Symbol}(_condDiscretes)),
                                                                 $(!isempty(simCode.whenEquations)))
       # Route DAE-native solvers (e.g. Sundials.IDA, DABDF2, DFBDF) through a residual-form DAEProblem rather than the ODEProblem with mass matrix.
       OMBackend.CodeGeneration.setZCHysteresis!($(Symbol("$(MODEL_NAME)Model_problem")), $(QuoteNode(ZC_HYSTERESIS)),
@@ -905,9 +1023,14 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SC.SIM_CODE, modelName::String
       global LATEST_SOLVE_TRIPLE = (_problemForSolver, _solver, nothing)
       local _initKw = OMBackend.CodeGeneration.defaultInitializeKwargs(_problemForSolver, kwargs,
                                                                        $(_modelHasTableClusters(simCode)))
-      local _tolKw = OMBackend.CodeGeneration.defaultToleranceKwargs(_problemForSolver, kwargs; dummyDerivatives = $(filter(n -> haskey(simCode.stringToSimVarHT, n), simCode.dummyDerivatives)))
+      local _tolKw = OMBackend.CodeGeneration.defaultToleranceKwargs(_problemForSolver, kwargs)
       OMBackend.CodeGeneration._resetRHSError!()
-      local _sol = solve(_problemForSolver, _solver; kwargs..., _initKw..., _tolKw...)
+      #= a terminate() the initial algorithm reached: the solve ends at its start =#
+      local _sol = $(_initialTerminates(simCode) ?
+                     :(__TERMINATE_AT_START[] === nothing ? solve(_problemForSolver, _solver; kwargs..., _initKw..., _tolKw...) :
+                       OMBackend.CodeGeneration.solveStoppedAtStart(_problemForSolver, _solver, __TERMINATE_AT_START[];
+                                                                    kwargs..., _initKw..., _tolKw...)) :
+                     :(solve(_problemForSolver, _solver; kwargs..., _initKw..., _tolKw...)))
       #= If the init-alg-remake'd problem produced InitialFailure (MTK could
          not reconcile init-alg hard-start u0 with the algebraic constraints),
          fall back to the un-remake'd problem so the solver can pick any
@@ -1130,11 +1253,15 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
      variable onto one. =#
   local _paramSyms = OrderedSet{Symbol}(Symbol(name)
     for (name, (_, sv)) in simCode.stringToSimVarHT
-    if sv.varKind isa Union{SC.PARAMETER, SC.ARRAY_PARAMETER})
+    if sv.varKind isa SC.PARAMETER)
   #= after OMBackend's index reduction, a state and the derivative variables aliased to it (`\$DER.x`)
-     form relays: the declared state keeps its name =#
+     form relays: the state keeps its name, unless introduceDerivatives or index reduction made it (a second-order
+     chain's `\$DER.x`, a state set's variables); `der.x` of lowerHigherOrderDerivatives (`der_x` in the code) is a state of the model =#
+  local _keepDiscretes = union(_condDiscretes, whenAssignedDiscreteSyms(simCode))
   local _relayKeep = simCode.indexReduced ?
-    union(_condDiscretes, OrderedSet{Symbol}(Symbol(s) for s in stateVariables if !startswith(string(s), "\$"))) : _condDiscretes
+    union(_keepDiscretes, OrderedSet{Symbol}(Symbol(s) for s in stateVariables
+                                             if !(last(simCode.stringToSimVarHT[s]).irOrigin in
+                                                  (:introduceDerivatives, :indexReduction)))) : _keepDiscretes
   #= Not a representative: a discrete the demotion made algebraic. Of a pure alias of two discretes it demoted one;
      kept as the relay's representative it had no equation left and its held partner was substituted away (MSL
      ControlledTanks' radio buttons: `pre(shut.reset[2]) = false` then read no variable of the system). =#
@@ -1274,7 +1401,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
       #= Declare ifCond variables as discrete time-dependent parameters.
          These are modified by SymbolicContinuousCallback affects and are NOT
          part of the ODE state vector, so the solver never perturbs them. =#
-      $(generateDiscreteIfCondDeclaration(ifCondParamDecls, ifCondParamNames))
+      $(generateDiscreteIfCondDeclaration(ifCondParamDecls, ifCondParamNames, Symbol[Symbol(v) for v in ifConditionalVariables]))
       #=
         Only variables that are present in the equation system later should be a part of the variables in the MTK system.
         This means that certain algebraic variables should not be listed among the variables (These are the discrete variables).
@@ -1293,6 +1420,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
       local _batchBlock = Expr(:block)
       for (sym, var) in vars
         push!(_batchBlock.args, :($sym = $var))
+      end
+      #= what each variable is in the simulation code (`simCodeKind`) =#
+      local _declared = Set{Symbol}(first.(vars))
+      for (sym, kind) in $(simCodeKindsExpr(simCode))
+        sym in _declared || continue
+        push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, OMBackend.CodeGeneration.SimCodeKind, $kind)))
       end
       local irreducibleSyms = $(irreducibleSyms)
       for sym in irreducibleSyms
@@ -1381,18 +1514,9 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
       #= Inject observed equations post-simplification so they do not interfere
          with AffectSystem tearing during callback compilation. =#
       if @isdefined(observedEqs) && !isempty(observedEqs)
-        #= Deduplicate observed equations by LHS variable name before injection.
-           Both alias and eliminated observed blocks can produce the same equation. =#
-        local _seenLHS = OrderedSet{String}()
-        local _uniqueObs = Symbolics.Equation[]
-        for _obs in observedEqs
-          local _lhsKey = string(Symbolics.unwrap(_obs.lhs))
-          if !(_lhsKey in _seenLHS)
-            push!(_seenLHS, _lhsKey)
-            push!(_uniqueObs, _obs)
-          end
-        end
-        reducedSystem = OMBackend.CodeGeneration.injectObservedEquations(reducedSystem, _uniqueObs)
+        #= One equation per left-hand side (injectObservedEquations): both alias and eliminated observed blocks can
+           produce the same equation. =#
+        reducedSystem = OMBackend.CodeGeneration.injectObservedEquations(reducedSystem, observedEqs)
       end
       #= Callbacks setup =#
       local eventParameters = [$(PARAMETER_RAW_ARRAY...)]
@@ -1557,7 +1681,7 @@ stack (a long chain); a cycle is broken where the search entered it.
 function _eliminatedDependencyOrder(elimVars::Vector{String}, elimEqs::Vector{SC.RESIDUAL_EQUATION})::Vector{Int}
   local position = Dict(v => i for (i, v) in enumerate(elimVars))
   local reads = map(elimEqs) do eq
-    local names = SC.crefNames!(OrderedSet{String}(), eq.exp)
+    local names = SC.identifierNames!(OrderedSet{String}(), eq.exp)
     Int[position[n] for n in names if haskey(position, n)]
   end
   local order = Int[]

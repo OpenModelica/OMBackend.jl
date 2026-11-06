@@ -40,107 +40,106 @@
 #= ==================================================================================== =#
 
 "The names the `start`, `fixed`, `min`, `max` and `nominal` attributes read: the code generators read them by name."
-function attributeNames!(names::OrderedSet{String}, ht::HT)::OrderedSet{String}
+function attributeNames!(names::OrderedSet{String}, ht::HT; dynamic::Union{Nothing, Set{Symbol}} = nothing)::OrderedSet{String}
   for (_, (_, v)) in ht
     local a = v.attributes
     for e in (a.start, a.fixed, a.min, a.max, a.nominal)
-      e === nothing || crefNames!(names, e)
+      e === nothing || crefNames!(names, e; dynamic)
     end
   end
   return names
 end
 
 "The names the conditions of the if-expressions in `e` read."
-function ifConditionNames!(names::OrderedSet{String}, e::Exp)::OrderedSet{String}
-  foreachExp(x -> x isa IFEXP && crefNames!(names, x.cond), e)
+function ifConditionNames!(names::OrderedSet{String}, e::Exp; dynamic::Union{Nothing, Set{Symbol}} = nothing)::OrderedSet{String}
+  foreachExp(x -> x isa IFEXP && crefNames!(names, x.cond; dynamic), e)
   return names
 end
 
 "The names a when-clause's condition and its elsewhen conditions read."
-function whenConditionNames!(names::OrderedSet{String}, w::WHEN_STMTS)::OrderedSet{String}
-  crefNames!(names, w.condition)
-  w.elsewhenPart === nothing || whenConditionNames!(names, w.elsewhenPart)
+function whenConditionNames!(names::OrderedSet{String}, w::WHEN_STMTS; dynamic::Union{Nothing, Set{Symbol}} = nothing)::OrderedSet{String}
+  crefNames!(names, w.condition; dynamic)
+  w.elsewhenPart === nothing || whenConditionNames!(names, w.elsewhenPart; dynamic)
   return names
 end
 
 "The names the Modelica functions' bodies read (their locals' defaults too)."
-function functionBodyNames!(names::OrderedSet{String}, functions::Vector{ModelicaFunction})::OrderedSet{String}
+function functionBodyNames!(names::OrderedSet{String}, functions::Vector{ModelicaFunction}; dynamic::Union{Nothing, Set{Symbol}} = nothing)::OrderedSet{String}
   for f in functions
     f isa MODELICA_FUNCTION || continue
     for v in f.locals
-      v.default === nothing || crefNames!(names, v.default)
+      v.default === nothing || crefNames!(names, v.default; dynamic)
     end
-    statementCrefNames!(names, f.statements)
+    statementCrefNames!(names, f.statements; dynamic)
   end
   return names
 end
 
 "The names the initial equations read (an array equation's too)."
-function initialEquationNames!(names::OrderedSet{String}, eqs::Vector{Equation})::OrderedSet{String}
+function initialEquationNames!(names::OrderedSet{String}, eqs::Vector{Equation}; dynamic::Union{Nothing, Set{Symbol}} = nothing)::OrderedSet{String}
   for eq in eqs, e in equationExps(eq)
-    crefNames!(names, e)
+    crefNames!(names, e; dynamic)
   end
   return names
 end
 
 "The names the if-equations read: their conditions', their branches' residuals'."
-function ifEquationNames!(names::OrderedSet{String}, ifEquations::Vector{IF_EQUATION})::OrderedSet{String}
+function ifEquationNames!(names::OrderedSet{String}, ifEquations::Vector{IF_EQUATION}; dynamic::Union{Nothing, Set{Symbol}} = nothing)::OrderedSet{String}
   for ifEq in ifEquations, b in ifEq.branches
-    crefNames!(names, b.condition)
-    foreach(eq -> crefNames!(names, eq.exp), b.residualEquations)
+    crefNames!(names, b.condition; dynamic)
+    foreach(eq -> crefNames!(names, eq.exp; dynamic), b.residualEquations)
   end
   return names
 end
 
 "The names the asserts' conditions and messages read."
-function assertNames!(names::OrderedSet{String}, asserts::Vector{ASSERT_EQUATION})::OrderedSet{String}
+function assertNames!(names::OrderedSet{String}, asserts::Vector{ASSERT_EQUATION}; dynamic::Union{Nothing, Set{Symbol}} = nothing)::OrderedSet{String}
   for a in asserts
-    crefNames!(names, a.condition)
-    crefNames!(names, a.message)
-  end
-  return names
-end
-
-"A name read with a subscript that is no literal (`val[idx][2]`, `val[?]`)."
-isDynamicallySubscripted(name::String)::Bool = occursin(r"\[[^\]0-9][^\]]*\]", name)
-
-"""
-    dynamicallyIndexedElements!(names, ht)
-
-Every element of an array of which `names` has a read by a subscript that is no literal: none
-is named, the code generators look them up at run time (CDL's TimeTable `y[:] = val[idx, :]`).
-"""
-function dynamicallyIndexedElements!(names::OrderedSet{String}, ht::HT)::OrderedSet{String}
-  local bases = Set{String}()
-  for name in names
-    local m = match(r"^([^\[\]]+)\[", name)
-    (m !== nothing && isDynamicallySubscripted(name)) && push!(bases, String(m.captures[1]))
-  end
-  isempty(bases) && return names
-  for k in keys(ht)
-    local i = findfirst('[', k)
-    (i !== nothing && k[1:prevind(k, i)] in bases) && push!(names, k)
+    crefNames!(names, a.condition; dynamic)
+    crefNames!(names, a.message; dynamic)
   end
   return names
 end
 
 """
-    dataStructureArrayElements!(names, ht)
+    dynamicallyIndexedElements!(names, simCode, dynamic)
+
+Every element of the arrays `dynamic`, those read by a subscript that reads a variable (`crefNames!`'s, `dynamicArrays!`):
+no element is named there, the code generators look it up at run time (CDL's TimeTable `y[:] = val[idx, :]`). A read
+by a literal subscript (an Integer's, an enumeration's, a Boolean's: `p[E_b(2)]`) names its element, which stays a
+variable or is folded like any other.
+"""
+function dynamicallyIndexedElements!(names::OrderedSet{String}, simCode::SIM_CODE, dynamic::Set{Symbol})::OrderedSet{String}
+  isempty(dynamic) && return names
+  for k::String in keys(simCode.stringToSimVarHT)
+    local array::Union{Nothing, Symbol} = elementArray(simCode, k)
+    (array !== nothing && array in dynamic) && push!(names, k)
+  end
+  return names
+end
+
+"""
+    dataStructureArrayElements!(names, simCode)
 
 The names an external object's constructor reads (`CombiTimeTable(..., table, ...)`), and the
-elements of the arrays among them: the code generators rebuild the array from its elements.
+elements of the arrays it reads whole (its references not an element's, `crefReads!`): the code
+generators rebuild the array from its elements.
 """
-function dataStructureArrayElements!(names::OrderedSet{String}, ht::HT)::OrderedSet{String}
-  local bases = OrderedSet{String}()
+function dataStructureArrayElements!(names::OrderedSet{String}, simCode::SIM_CODE; dynamic::Union{Nothing, Set{Symbol}} = nothing)::OrderedSet{String}
+  local ht::HT = simCode.stringToSimVarHT
+  local wholes::Set{Symbol} = Set{Symbol}()
   for (_, (_, v)) in ht
     (v.varKind isa DATA_STRUCTURE && v.varKind.bindExp isa CALL) || continue
-    crefNames!(names, v.varKind.bindExp)
-    crefNames!(bases, v.varKind.bindExp)
+    crefNames!(names, v.varKind.bindExp; dynamic)
+    for read::Read in crefReads!(Read[], v.varKind.bindExp)
+      local c::SimCref = read.cref
+      (c.ref !== nothing && isempty(c.subs) && !isElementCref(c.ref)) && push!(wholes, c.ref.name)
+    end
   end
-  isempty(bases) && return names
-  for k in keys(ht)
-    local i = findfirst('[', k)
-    (i !== nothing && k[1:prevind(k, i)] in bases) && push!(names, k)
+  isempty(wholes) && return names
+  for k::String in keys(ht)
+    local array::Union{Nothing, Symbol} = elementArray(simCode, k)
+    (array !== nothing && array in wholes) && push!(names, k)
   end
   return names
 end
@@ -156,8 +155,10 @@ function requestedNames(simCode::SIM_CODE)::OrderedSet{String}
   local patterns = simCode.observedFilter
   (patterns === nothing || isempty(patterns)) && return names
   local regexes = Regex[Regex(p) for p in patterns]
+  #= the patterns are the user's, on the variables' identifiers (`codeName`: `a_b[1][2]`) =#
   for n in keys(simCode.stringToSimVarHT)
-    any(r -> occursin(r, n), regexes) && push!(names, n)
+    local id::String = codeName(simCode, n)
+    any(r -> occursin(r, id), regexes) && push!(names, n)
   end
   return names
 end
@@ -174,16 +175,18 @@ too); `nothing` for another expression.
 """
 function elementName(e::Exp)::Union{Nothing, String}
   e isa EXP_CREF && return crefName(e.cref)
-  e isa ASUB || return nothing
-  local base = elementName(e.exp)
-  base === nothing && return nothing
-  local parts = String[]
-  for s in e.subs
-    local i = s isa ICONST ? s.value : (s isa RCONST && isinteger(s.value)) ? Int(s.value) : nothing
-    i === nothing && return nothing
-    push!(parts, "[$(i)]")
+  local index::Vector{Int} = Int[]
+  while e isa ASUB
+    local outer::Vector{Int} = Int[]
+    for s in e.subs
+      local i::Union{Nothing, Int} = s isa ICONST ? s.value : (s isa RCONST && isinteger(s.value)) ? Int(s.value) : nothing
+      i === nothing && return nothing
+      push!(outer, i)
+    end
+    index = Int[outer; index]
+    e = e.exp
   end
-  return string(base, parts...)
+  return (e isa EXP_CREF && !isempty(index)) ? elementKey(e.cref, index) : nothing
 end
 
 "The value of a parameter of a literal value: a number, or an enumeration literal."
@@ -215,12 +218,12 @@ end
 `e` with the parameters of `values` replaced by their literals, top-down: a reference by the
 literal of its type, an array element by literal subscripts by a Real.
 """
-function substituteValues(e::Exp, values::Dict{String, ParameterValue})::Exp
+function substituteValues(e::Exp, values::OrderedDict{String, ParameterValue})::Exp
   isempty(values) && return e
   return first(traverseExpTopDown(e, valueVisitor, values))
 end
 
-function valueVisitor(e::Exp, values::Dict{String, ParameterValue})::Tuple{Exp, Bool, Dict{String, ParameterValue}}
+function valueVisitor(e::Exp, values::OrderedDict{String, ParameterValue})::Tuple{Exp, Bool, OrderedDict{String, ParameterValue}}
   if e isa EXP_CREF
     local v = get(values, crefName(e.cref), nothing)
     v === nothing || return (literalOf(v, e.ty), false, values)
@@ -235,17 +238,20 @@ end
 """
     arrayElementValues!(values, name, binding, simCode, kept)
 
-The values of the elements (`name[i]`, nested arrays `name[i][j]`) of an array parameter's
-binding that evaluate: to a number, or to an element evaluated already; not a kept one.
+The values of the elements (by their keys, `elementKey`: `A[i]`, nested arrays `A[i,j]`) of the
+array parameter `name`'s binding that evaluate: to a number, or to an element evaluated already;
+not a kept one.
 """
-function arrayElementValues!(values::Dict{String, ParameterValue}, name::String, binding::Exp, simCode::SIM_CODE,
-                             kept::OrderedSet{String})::Nothing
+function arrayElementValues!(values::OrderedDict{String, ParameterValue}, name::String, binding::Exp, simCode::SIM_CODE,
+                             kept::OrderedSet{String}, index::Vector{Int} = Int[])::Nothing
   binding isa ARRAY_EXP || return nothing
+  local array::SimCref = SimCref(Symbol(name), Int[], last(simCode.stringToSimVarHT[name]).ref)
   for (i, x) in enumerate(binding.elements)
-    local elementName_ = string(name, "[", i, "]")
+    local at::Vector{Int} = Int[index; i]
+    local elementName_::String = elementKey(array, at)
     elementName_ in kept && continue
     if x isa ARRAY_EXP
-      arrayElementValues!(values, elementName_, x, simCode, kept)
+      arrayElementValues!(values, name, x, simCode, kept, at)
       continue
     end
     local v = something(enumerationValue(x, simCode, OrderedSet{String}()), Some(tryEvalNumeric(x, simCode)))
@@ -276,36 +282,37 @@ its structural changes. An enumeration parameter is replaced by its literal (not
 function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   (hasStructuralTransitions(simCode) || hasSubModels(simCode) || hasFrontendModel(simCode)) && return simCode
   local ht = simCode.stringToSimVarHT
+  #= the arrays read by a subscript that reads a variable, wherever the kept names are read =#
+  local dynamic::Set{Symbol} = Set{Symbol}()
   local kept = OrderedSet{String}(e.representativeName for e in simCode.aliasMap)
-  attributeNames!(kept, ht)
+  attributeNames!(kept, ht; dynamic)
   for ifEq in simCode.ifEquations, b in ifEq.branches
-    crefNames!(kept, b.condition)
+    crefNames!(kept, b.condition; dynamic)
   end
-  foreach(w -> whenConditionNames!(kept, w.whenEquation), simCode.whenEquations)
-  initialEquationNames!(kept, simCode.initialEquations)
+  foreach(w -> whenConditionNames!(kept, w.whenEquation; dynamic), simCode.whenEquations)
+  initialEquationNames!(kept, simCode.initialEquations; dynamic)
   union!(kept, requestedNames(simCode))
-  foreach(eq -> ifConditionNames!(kept, eq.exp), simCode.residualEquations)
+  foreach(eq -> ifConditionNames!(kept, eq.exp; dynamic), simCode.residualEquations)
   for (_, (_, v)) in ht
-    v.varKind isa Union{PARAMETER, ARRAY_PARAMETER} && v.varKind.bindExp !== nothing && ifConditionNames!(kept, v.varKind.bindExp)
+    v.varKind isa PARAMETER && v.varKind.bindExp !== nothing && ifConditionNames!(kept, v.varKind.bindExp; dynamic)
   end
-  dataStructureArrayElements!(kept, ht)
-  complexFieldNames!(kept, simCode.residualEquations, ht)
-  complexFieldNames!(kept, simCode.initialEquations, ht)
-  functionBodyNames!(kept, simCode.functions)
-  local equationReads = OrderedSet{String}()
-  foreach(eq -> crefNames!(equationReads, eq.exp), simCode.residualEquations)
+  dataStructureArrayElements!(kept, simCode; dynamic)
+  complexFieldNames!(kept, simCode.residualEquations, simCode)
+  complexFieldNames!(kept, simCode.initialEquations, simCode)
+  functionBodyNames!(kept, simCode.functions; dynamic)
+  #= the equations' dynamic reads: their arrays' elements stay variables (their other reads may be folded) =#
+  foreach(eq -> dynamicArrays!(dynamic, eq.exp), simCode.residualEquations)
   for ifEq in simCode.ifEquations, b in ifEq.branches
-    foreach(eq -> crefNames!(equationReads, eq.exp), b.residualEquations)
+    foreach(eq -> dynamicArrays!(dynamic, eq.exp), b.residualEquations)
   end
-  foreach(n -> isDynamicallySubscripted(n) && push!(kept, n), equationReads)
-  dynamicallyIndexedElements!(kept, ht)
+  dynamicallyIndexedElements!(kept, simCode, dynamic)
   if !isempty(TUNABLE_PARAMETERS[])
     union!(kept, TUNABLE_PARAMETERS[])
-    foreach(k -> isTunableParameter(k) && push!(kept, k), keys(ht))
+    foreach(k -> isTunableParameter(codeName(simCode, k)) && push!(kept, k), keys(ht))
   end
-  local values = Dict{String, ParameterValue}()
+  local values = OrderedDict{String, ParameterValue}()
   for (name, (_, v)) in ht
-    (name in kept || !(v.varKind isa PARAMETER) || v.varKind.bindExp === nothing) && continue
+    (name in kept || !isScalarParameter(v) || v.varKind.bindExp === nothing) && continue
     local x = v.elementType isa TYPE_ENUM ? enumerationValue(v.varKind.bindExp, simCode, OrderedSet{String}()) :
       tryEvalNumeric(v.varKind.bindExp, simCode)
     x === nothing || (values[name] = x)
@@ -315,7 +322,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   while length(values) != before
     before = length(values)
     for (name, (_, v)) in ht
-      (name in kept || !(v.varKind isa ARRAY_PARAMETER) || v.varKind.bindExp === nothing) && continue
+      (name in kept || !isArrayParameter(v) || v.varKind.bindExp === nothing) && continue
       arrayElementValues!(values, name, v.varKind.bindExp, simCode, kept)
     end
   end
@@ -332,7 +339,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
   local newHT = copy(ht)
   for (name, (index, v)) in ht
     local b = bindingOf(v.varKind)
-    (v.varKind isa Union{PARAMETER, ARRAY_PARAMETER, STRING} && b !== nothing) || continue
+    (v.varKind isa Union{PARAMETER, STRING} && b !== nothing) || continue
     local nb = x(b)
     nb == b || (newHT[name] = (index, withKind(v, withBinding(v.varKind, nb))))
   end
@@ -357,11 +364,11 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
 end
 
 "An initial residual or equation with the parameters of `values` replaced; another kept."
-initialWithValues(eq::RESIDUAL_EQUATION, values::Dict{String, ParameterValue})::Equation =
+initialWithValues(eq::RESIDUAL_EQUATION, values::OrderedDict{String, ParameterValue})::Equation =
   RESIDUAL_EQUATION(substituteValues(eq.exp, values), eq.source, eq.attr)
-initialWithValues(eq::EQUATION, values::Dict{String, ParameterValue})::Equation =
+initialWithValues(eq::EQUATION, values::OrderedDict{String, ParameterValue})::Equation =
   EQUATION(substituteValues(eq.lhs, values), substituteValues(eq.rhs, values), eq.source, eq.attr)
-initialWithValues(eq::Equation, ::Dict{String, ParameterValue})::Equation = eq
+initialWithValues(eq::Equation, ::OrderedDict{String, ParameterValue})::Equation = eq
 
 "A when-clause with `x` applied to its condition, to its statements' expressions, to its elsewhen arms'."
 function whenWithValues(w::WHEN_STMTS, x::F)::WHEN_STMTS where {F}
@@ -384,7 +391,7 @@ goes next. Nothing for a model with modes or translated again at its structural 
 function dropObservationOnlyVariables(simCode::SIM_CODE)::SIM_CODE
   (hasSubModels(simCode) || hasFrontendModel(simCode)) && return simCode
   local ht = simCode.stringToSimVarHT
-  local droppable = v::SIMVAR -> v.attributes.isProtected && v.varKind isa Union{ALG_VARIABLE, ARRAY}
+  local droppable = v::SIMVAR -> v.attributes.isProtected && v.varKind isa ALG_VARIABLE
   any(((_, (_, v)),) -> droppable(v), ht) || return simCode
   local untouchable = requestedNames(simCode)
   initialEquationNames!(untouchable, simCode.initialEquations)
@@ -449,29 +456,31 @@ function eliminateDeadParameters(simCode::SIM_CODE)::SIM_CODE
   (hasSubModels(simCode) || hasFrontendModel(simCode)) && return simCode
   (isempty(simCode.residualEquations) && isempty(simCode.ifEquations)) && return simCode
   local ht = simCode.stringToSimVarHT
+  #= the arrays read by a subscript that reads a variable, wherever they are read =#
+  local dynamic::Set{Symbol} = Set{Symbol}()
   local read = OrderedSet{String}()
-  foreach(eq -> crefNames!(read, eq.exp), simCode.residualEquations)
-  initialEquationNames!(read, simCode.initialEquations)
-  ifEquationNames!(read, simCode.ifEquations)
-  foreach(w -> whenCrefNames!(read, w.whenEquation), simCode.whenEquations)
-  assertNames!(read, simCode.asserts)
-  foreach(eq -> crefNames!(read, eq.exp), simCode.eliminatedEquations)
+  foreach(eq -> crefNames!(read, eq.exp; dynamic), simCode.residualEquations)
+  initialEquationNames!(read, simCode.initialEquations; dynamic)
+  ifEquationNames!(read, simCode.ifEquations; dynamic)
+  foreach(w -> whenCrefNames!(read, w.whenEquation; dynamic), simCode.whenEquations)
+  assertNames!(read, simCode.asserts; dynamic)
+  foreach(eq -> crefNames!(read, eq.exp; dynamic), simCode.eliminatedEquations)
   for e in simCode.aliasMap
     push!(read, e.representativeName, e.eliminatedName)
   end
-  attributeNames!(read, ht)
+  attributeNames!(read, ht; dynamic)
   union!(read, requestedNames(simCode))
-  functionBodyNames!(read, simCode.functions)
-  foreach(a -> statementCrefNames!(read, a.statements), simCode.initialAlgorithms)
-  complexFieldNames!(read, simCode.residualEquations, ht)
-  complexFieldNames!(read, simCode.initialEquations, ht)
+  functionBodyNames!(read, simCode.functions; dynamic)
+  foreach(a -> statementCrefNames!(read, a.statements; dynamic), simCode.initialAlgorithms)
+  complexFieldNames!(read, simCode.residualEquations, simCode)
+  complexFieldNames!(read, simCode.initialEquations, simCode)
   for (_, (_, v)) in ht
     local b = bindingOf(v.varKind)
-    (v.varKind isa Union{PARAMETER, ARRAY_PARAMETER, DATA_STRUCTURE} && b !== nothing) && crefNames!(read, b)
+    (v.varKind isa Union{PARAMETER, DATA_STRUCTURE} && b !== nothing) && crefNames!(read, b; dynamic)
   end
-  dataStructureArrayElements!(read, ht)
-  dynamicallyIndexedElements!(read, ht)
-  local dead = String[name for (name, (_, v)) in ht if v.varKind isa PARAMETER && !(name in read) && !isTunableParameter(name)]
+  dataStructureArrayElements!(read, simCode; dynamic)
+  dynamicallyIndexedElements!(read, simCode, dynamic)
+  local dead = String[name for (name, (_, v)) in ht if isScalarParameter(v) && !(name in read) && !isTunableParameter(codeName(simCode, name))]
   isempty(dead) && return simCode
   @debug "[SIMCODE: $(simCode.name): eliminateDeadParameters] dropped $(length(dead)) unread parameters"
   local newHT = copy(ht)
@@ -493,7 +502,7 @@ function foldedObservations(simCode::SIM_CODE, dropped::Vector{String}, valueOf:
   local folded = Set{String}(simCode.foldedVariables)
   local names = String[n for n in dropped if n in folded]
   local ht = simCode.stringToSimVarHT
-  local equations = RESIDUAL_EQUATION[RESIDUAL_EQUATION(BINARY(EXP_CREF(SimCref(Symbol(n)), last(ht[n]).elementType), OP_SUB, valueOf(n)),
+  local equations::Vector{RESIDUAL_EQUATION} = RESIDUAL_EQUATION[RESIDUAL_EQUATION(BINARY(EXP_CREF(SimCref(Symbol(n), Int[], last(ht[n]).ref), last(ht[n]).elementType), OP_SUB, valueOf(n)),
                                                         NO_SOURCE, EQ_ATTR_DEFAULT) for n in names]
   return (names, equations)
 end

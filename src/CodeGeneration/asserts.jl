@@ -58,6 +58,20 @@ end
 Base.showerror(io::IO, e::ModelicaAssertionError) =
   print(io, "ModelicaAssertionError: assertion violated at time ", e.time, ": ", e.message, "\n  condition: ", e.condition)
 
+"""
+    solveStoppedAtStart(prob, solver, message; kwargs...)
+
+The solve of a model that reached a `terminate()` at the initialization: it ends at its start (OpenModelica ends the
+simulation there, its result the initial values), the integrator initialized and no step taken (a callback's
+`initialize` cannot end it: the integrator's initialization reads the stop times after it).
+"""
+function solveStoppedAtStart(prob, solver, message::String; kwargs...)
+  local integrator = DiffEqBase.init(prob, solver; kwargs...)
+  @info "Modelica terminate() at the initialization" message
+  DiffEqBase.terminate!(integrator)
+  return DiffEqBase.solve!(integrator)
+end
+
 #= The errors of a Modelica function that reject a step instead of ending the run
    (_StepRejectingRHS, _sidePartial). =#
 const _RHS_STEP_ERRORS = Union{ErrorException, DomainError, ModelicaAssertionError}
@@ -80,9 +94,10 @@ end
 The asserts as one DiscreteCallback, added to `callbacks`. The variables are
 read through the problem's symbolic index (states, observed and eliminated
 variables alike); an assert on a variable the simulation does not keep is
-reported and left out.
+reported and left out. `discrete`: the names of the discrete variables (states
+the events set): a crossing left to decide is decided with their values there.
 """
-function withAssertCallback(callbacks, problem, asserts::Vector)
+function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vector{Symbol} = Symbol[])
   local checks = Tuple{ModelicaAssert, Any}[]
   local byName = _variablesByName(problem)
   for a in asserts
@@ -97,8 +112,32 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
   end
   isempty(checks) && return callbacks
   local violated = falses(length(checks))
-  local report = function (a, getter, integrator, τ)
-    local src = τ == integrator.t ? integrator : _stateAt(integrator, τ)
+  #= the state and parameters where a crossing was left to decide: an event at the step end that decides it set the
+     discrete states (`x <= 0.5 or d == 0` with d set at 0.6: the state at 0.55 interpolated d's new value); within the
+     step the discrete states keep their values there =#
+  local pendingU::Vector{Union{Nothing, Vector{Float64}}} = Union{Nothing, Vector{Float64}}[nothing for _ in checks]
+  local pendingP::Vector{Any} = Any[nothing for _ in checks]
+  local discreteIdx::Vector{Int} = Int[]
+  for n in discrete
+    haskey(byName, n) || continue
+    local k::Union{Nothing, Integer} = ModelingToolkit.SymbolicIndexingInterface.variable_index(problem, byName[n])
+    k isa Integer && push!(discreteIdx, k)
+  end
+  #= the state at the start of the current step (the end of the last check): its discrete states are the step's =#
+  local stepStartU::Base.RefValue{Vector{Float64}} = Ref(Float64[])
+  local stateWithin::Function = function (integrator, τ, i::Int)
+    local u::Vector{Float64} = integrator(τ)
+    pendingU[i] === nothing || (u[discreteIdx] .= pendingU[i][discreteIdx])
+    return ModelingToolkit.SymbolicIndexingInterface.ProblemState(; u = u, p = something(pendingP[i], integrator.p), t = τ)
+  end
+  local mark!::Function = function (integrator, i::Int)
+    pending[i] = integrator.t
+    pendingU[i] = copy(integrator.u)
+    pendingP[i] = deepcopy(integrator.p)
+    nothing
+  end
+  local report = function (a, getter, integrator, τ, src = nothing)
+    src === nothing && (src = τ == integrator.t ? integrator : _stateAt(integrator, τ))
     local msg = string(a.message(_assertValues(a, getter, src), (t = τ,)))
     a.warning || throw(ModelicaAssertionError(τ, msg, a.text))
     @warn "Assertion violated at time $(τ): $(msg)" condition = a.text
@@ -117,36 +156,48 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
     if !isnan(τp) && integrator.t > τp
       pending[i] = NaN
       local τm = (τp + integrator.t) / 2
-      local (src, at) = integrator.tprev <= τm ? (_stateAt(integrator, τm), (t = τm,)) : (integrator, integrator)
+      local (src, at) = integrator.tprev <= τm ? (stateWithin(integrator, τm, i), (t = τm,)) : (integrator, integrator)
+      #= at the crossing: its state =#
+      local atCrossingState = pendingU[i] === nothing ? nothing :
+        ModelingToolkit.SymbolicIndexingInterface.ProblemState(; u = pendingU[i], p = something(pendingP[i], integrator.p), t = τp)
+      pendingU[i] = nothing; pendingP[i] = nothing
       #= Halfway still at the boundary up to rounding (a crossing just after an initialization
          at it: the level drained by 1e-14) is no failure: the state now decides. =#
       if !a.condition(_assertValues(a, getter, src), at) && !(a.warning && violated[i]) &&
          !_atAssertBoundary(a, getter, src, Float64(at.t))
-        report(a, getter, integrator, τp)
+        report(a, getter, integrator, τp, atCrossingState)
         violated[i] = true
         return nothing
       end
     end
     if a.condition(_assertValues(a, getter, integrator), integrator)
       violated[i] = false
+      #= holding at a crossing (a relation at its boundary there: `x <= lim` at x = lim), it may fail just after:
+         decided halfway to the next check too, reported at the crossing =#
+      (atCrossing && isnan(pending[i])) && mark!(integrator, i)
     elseif !all && (atCrossing || integrator.t == τp)
-      pending[i] = integrator.t
+      mark!(integrator, i)
     elseif all && a.timeVarying && isnan(τp) && _atAssertBoundary(a, getter, integrator, integrator.t)
       #= The initialization's state at a boundary a relation touches, past it by rounding
          (MSL TanksWithEmptyingPipe1: level_start = height = 2, the level computed from the
          mass 2 + 4e-16, `level <= height` failed, or not, by run): decided at the next check,
          as a crossing. Further from the boundary it is reported at once. =#
-      pending[i] = integrator.t
+      mark!(integrator, i)
     elseif !(a.warning && violated[i])
-      local τ = all || !isempty(a.crossings) ? integrator.t : _violationTime(a, getter, integrator)
+      local τ = all || !isempty(a.crossings) ? integrator.t :
+        _violationTime(a, getter, integrator, stepStartU[], discreteIdx)
       report(a, getter, integrator, τ)
       violated[i] = true
     end
     nothing
   end
   local check! = function (integrator, all::Bool)
-    for (i, (a, _)) in enumerate(checks)
-      (all || a.timeVarying) && checkOne!(integrator, i, all, false)
+    try
+      for (i, (a, _)) in enumerate(checks)
+        (all || a.timeVarying) && checkOne!(integrator, i, all, false)
+      end
+    finally
+      stepStartU[] = copy(integrator.u)
     end
     return false
   end
@@ -154,6 +205,9 @@ function withAssertCallback(callbacks, problem, asserts::Vector)
                                          initialize = function (c, u, t, integrator)
                                            fill!(violated, false)
                                            fill!(pending, NaN)
+                                           fill!(pendingU, nothing)
+                                           fill!(pendingP, nothing)
+                                           stepStartU[] = copy(integrator.u)
                                            check!(integrator, true)
                                            nothing
                                          end,
@@ -236,13 +290,22 @@ _stateAt(integrator, τ) =
 The first time in (tprev, t] at which the condition fails, by bisection on
 the step's interpolation: the check runs at step ends and a step can be long
 (der(x) = 1 is solved in one step). The step end if the interpolation does
-not bracket the change.
+not bracket the change. Within the step the discrete states are those at its
+start (`stepStartU`, `discreteIdx`: an event that ended the step set them, and
+the interpolation carries the jump); a violation only with the event's values is
+the event's, at the step end.
 """
-function _violationTime(a::ModelicaAssert, getter, integrator)
+function _violationTime(a::ModelicaAssert, getter, integrator, stepStartU::Vector{Float64}, discreteIdx::Vector{Int})
   local lo = integrator.tprev; local hi = integrator.t
   hi > lo || return hi
-  local holds(τ) = a.condition(_assertValues(a, getter, _stateAt(integrator, τ)), (t = τ,))
+  local within::Function = (u::Vector{Float64}, τ) -> begin
+    (isempty(discreteIdx) || length(stepStartU) != length(u)) || (u[discreteIdx] .= stepStartU[discreteIdx])
+    ModelingToolkit.SymbolicIndexingInterface.ProblemState(; u = u, p = integrator.p, t = τ)
+  end
+  local holds(τ) = a.condition(_assertValues(a, getter, within(integrator(τ), τ)), (t = τ,))
   try
+    #= at the step end with the step's discrete states: holding there, the event's =#
+    a.condition(_assertValues(a, getter, within(copy(integrator.u), hi)), (t = hi,)) && return hi
     holds(lo) || return hi
     for _ in 1:80
       local mid = (lo + hi) / 2

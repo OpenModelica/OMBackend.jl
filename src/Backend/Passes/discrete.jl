@@ -151,6 +151,14 @@ end
 withRhs(c::Candidate, rhs::IR.Expression)::Candidate = Candidate(c.name, c.lhs, rhs, c.source, c.equation)
 
 """
+The attributes of a lifted cluster's when-equation (`emitCluster!`): discrete equations (`EQ_DISCRETE`, evaluated at
+events), as a when-equation on their relations' events; the array code runs it at every pass of every event
+(`SimCode.EQ_ATTR`'s `everyEvent`: OpenModelica's discrete equations, pre() the initial values after the
+initialization, a member's pre() read followed).
+"""
+const LIFTED_CLUSTER = IR.EquationAttributes(IR.EQ_DISCRETE, false, nothing, false)
+
+"""
     liftDiscreteEquations!(model)
 
 The discrete definitions of the equations (MLS 17.4.4: a discrete variable defined by
@@ -601,7 +609,7 @@ function emitCluster!(out::Vector{IR.Equation}, cluster::Vector{Symbol}, candida
   local source = body[1][3]
   push!(out, initialWhen(initBody, source))
   push!(out, IR.WHEN_EQUATION([IR.WhenBranch(IR.Expression[condition], false, false, runBody)], IR.REGULAR_WHEN, source,
-                              IR.DEFAULT_ATTRIBUTES))
+                              LIFTED_CLUSTER))
   foreach(b -> push!(lifted, b[1].cref.name), body)
   return nothing
 end
@@ -681,4 +689,199 @@ function liftDiscreteEquations(equations::Vector{IR.Equation}, known::Set{Symbol
     emitCluster!(out, cluster, byName, lifted, initialLookup, known, initialPre, otherRefs, canon)
   end
   return (out, lifted)
+end
+
+#= ==================================================================================== =#
+#= Event functions as discrete variables (the scalar code's)                            =#
+#= ==================================================================================== =#
+
+"""
+    liftEventFunctions!(model)
+
+The event functions of the equations (`EVENT_FUNCTIONS` of a continuous-time argument, `readsContinuousTime`; outside
+`noEvent()`, when-equations and asserts) as discrete variables that change where the argument crosses an integer
+(MLS, "Event Triggering Mathematical Functions"), for the scalar code: its generators made no events of them
+(`n = integer(10 time)` changed at the steps only). `floor(q)` is the discrete `\$EVT_k` of `stepWhen`, `integer(q)`
+its Integer form, `ceil(q)` `-floor(-q)`,
+`div(a, b)` `floor(a / b)` towards zero, `mod(a, b)` `a - floor(a / b) b`, `rem(a, b)` `a - div(a, b) b`. A discrete
+variable that one alone defines (`n = integer(q)`, an algorithm's `\$ALG_EVT_k`) is that when-equation's itself. One
+whose argument reads `NOT_AT_EVENTS` (`delay()`, `der()`), directly or through the variables equations define from them
+(`delayed`), stays inline: the when's body would evaluate it at the event, which the MTK code's affects do not (MSL
+Digital's TransportDelay, `integer(x_delayed)` of `x_delayed = delay(x, d)`; it changes at the delay's events). So
+does one of an inner one's step variable only (`integer(floor(q))`, `liftEvents`). The
+array code makes these events itself (as OpenModelica's event functions, its `EvFn`): `runPassesKeepingArrays!`
+leaves this pass out.
+"""
+function liftEventFunctions!(model::IR.Model)::IR.Model
+  for (variables, p) in partitionsWithVariables(model)
+    liftEventFunctions!(variables, p)
+  end
+  return model
+end
+
+"""
+    EventFunctionLifter(variables, known, delayed, byStep, equations)
+
+`liftEventFunctions!`' state in a partition: its variables and the names of its parameters and constants, the names
+`delayedNames` finds, the variable of each step (`floor(q)`, `integer(q)`), the when-equations that define them.
+"""
+struct EventFunctionLifter
+  variables::IR.VariableSet
+  known::Set{Symbol}
+  delayed::Set{Symbol}
+  byStep::Dict{IR.Expression, IR.CREF}
+  equations::Vector{IR.Equation}
+end
+
+"""
+The functions an event's affect does not evaluate (`liftEventFunctions!`): `delay()` (the frontend's
+`OpenModelica.Internal.delay2`/`delay3` too), `spatialDistribution()` and `der()` (`integer(der(x))`: "unsupported in
+an affect", a lost model).
+"""
+const NOT_AT_EVENTS = (:delay, Symbol("OpenModelica.Internal.delay2"), Symbol("OpenModelica.Internal.delay3"),
+                       :spatialDistribution, :der)
+
+"""
+    delayedNames(equations) -> Set{Symbol}
+
+The variables equations `v = e` define from `NOT_AT_EVENTS` (`delay()`, `der()`), directly or through other such
+variables.
+"""
+function delayedNames(equations::Vector{IR.Equation})::Set{Symbol}
+  local out::Set{Symbol} = Set{Symbol}()
+  local definitions::Vector{Tuple{Symbol, IR.Expression}} = Tuple{Symbol, IR.Expression}[
+    (eq.lhs.cref.name, eq.rhs) for eq in equations if eq isa IR.SCALAR_EQUATION && eq.lhs isa IR.CREF]
+  local grown::Bool = true
+  while grown
+    grown = false
+    for (name, rhs) in definitions
+      name in out && continue
+      (callsAnyOf(rhs, NOT_AT_EVENTS) || IR.anyExp(x -> x isa IR.CREF && x.cref.name in out, rhs)) || continue
+      push!(out, name)
+      grown = true
+    end
+  end
+  return out
+end
+
+"Whether the arguments of an event function make events that `liftEventFunctions!` lifts."
+liftable(l::EventFunctionLifter, args::Vector{IR.Expression})::Bool =
+  any(a -> readsContinuousTime(a, l.variables, l.known), args) &&
+  !any(a -> callsAnyOf(a, NOT_AT_EVENTS) || IR.anyExp(x -> x isa IR.CREF && x.cref.name in l.delayed, a), args)
+
+function liftEventFunctions!(variables::IR.VariableSet, partition::IR.Partition)::Nothing
+  local lifter::EventFunctionLifter = EventFunctionLifter(variables, knownNames(variables), delayedNames(partition.equations),
+                                                          Dict{IR.Expression, IR.CREF}(), IR.Equation[])
+  local kept::Vector{IR.Equation} = IR.Equation[]
+  for eq in partition.equations
+    if eq isa Union{IR.WHEN_EQUATION, IR.ASSERT_EQUATION}
+      push!(kept, eq)
+    elseif isStepDefinition(lifter, eq)
+      local definition::IR.SCALAR_EQUATION = eq
+      local q::IR.Expression = liftEvents(lifter, only(definition.rhs.arguments))
+      if liftable(lifter, IR.Expression[q])
+        push!(lifter.equations, stepWhen(definition.lhs, q, definition.source))
+      else
+        #= of an inner event function's step variable only: an equation of it (`liftEvents`) =#
+        definition.rhs = IR.CALL(definition.rhs.name, IR.Expression[q], definition.rhs.ty, definition.rhs.attributes)
+        push!(kept, eq)
+      end
+    else
+      mapRoots!(e -> liftEvents(lifter, e), eq)
+      push!(kept, eq)
+    end
+  end
+  isempty(lifter.equations) && return nothing
+  partition.equations = append!(kept, lifter.equations)
+  return nothing
+end
+
+"""
+Whether `eq` is `k = floor(q)` (`integer(q)` of an Integer `k`) of a discrete variable `k` and a continuous-time `q`:
+`stepWhen` defines `k` itself.
+"""
+function isStepDefinition(l::EventFunctionLifter, eq::IR.Equation)::Bool
+  (eq isa IR.SCALAR_EQUATION && eq.lhs isa IR.CREF && isBuiltinCallOf(eq.rhs, (:integer, :floor)) &&
+   length(eq.rhs.arguments) == 1 && liftable(l, eq.rhs.arguments)) || return false
+  local k::IR.CREF = eq.lhs
+  (eq.rhs.name === :integer) == (k.ty isa IR.T_INTEGER) || return false
+  return haskey(l.variables, k.cref.name) ? l.variables[k.cref.name].kind isa IR.DISCRETE : isDiscreteType(k.ty)
+end
+
+"`e` with its event functions of continuous-time arguments read from their variables (`liftEventFunctions!`)."
+function liftEvents(l::EventFunctionLifter, e::IR.Expression)::IR.Expression
+  return IR.mapExpTopDown(e) do x::IR.Expression
+    isBuiltinCallOf(x, (:noEvent, :pre)) && return (x, false)
+    (isBuiltinCallOf(x, EVENT_FUNCTIONS) && liftable(l, x.arguments)) || return (x, true)
+    local args::Vector{IR.Expression} = IR.Expression[liftEvents(l, a) for a in x.arguments]
+    #= of an inner event function's step variable only (`integer(floor(u + 0.5))`): it changes with that one, inline (a
+       step variable of a step variable fired at the inner one's event with a stale value: MSL IntegerNetwork1's 4) =#
+    liftable(l, args) || return (IR.CALL(x.name, args, x.ty, x.attributes), false)
+    return (eventValue(l, x.name, args, x.ty), false)
+  end
+end
+
+"The value of the event function `name` of `args` (of type `ty`) from step variables (`liftEventFunctions!`)."
+function eventValue(l::EventFunctionLifter, name::Symbol, args::Vector{IR.Expression}, ty::IR.ModelicaType)::IR.Expression
+  name === :integer && return stepVariable!(l, args[1], IR.T_INTEGER())
+  name === :floor && return stepVariable!(l, args[1], ty)
+  name === :ceil && return IR.UNARY(IR.UMINUS, stepVariable!(l, IR.UNARY(IR.UMINUS, args[1], ty), ty), ty)
+  local literal::Function = (n::Int) -> ty isa IR.T_INTEGER ? IR.INTEGER(n) : IR.REAL(Float64(n))
+  local q::IR.Expression = IR.BINARY(args[1], IR.DIV, args[2], ty)
+  local f::IR.CREF = stepVariable!(l, q, ty)
+  #= towards zero: a quotient past a negative floor truncates to one more (noEvent: it changes with f only) =#
+  local past::IR.Expression = IR.LBINARY(IR.RELATION(f, IR.LESS, literal(0), 0), IR.AND, IR.RELATION(q, IR.GREATER, f, 0))
+  local truncated::IR.Expression = IR.IF_EXPRESSION(builtinCall(:noEvent, IR.Expression[past], IR.T_BOOLEAN()),
+                                                    IR.BINARY(f, IR.ADD, literal(1), ty), f, ty)
+  name === :div && return truncated
+  return IR.BINARY(args[1], IR.SUB, IR.BINARY(name === :mod ? f : truncated, IR.MUL, args[2], ty), ty)
+end
+
+"The discrete variable of `floor(q)` (`integer(q)` of type Integer `ty`), with its `stepWhen`: one per step."
+function stepVariable!(l::EventFunctionLifter, q::IR.Expression, ty::IR.ModelicaType)::IR.CREF
+  local step::IR.CALL = builtinCall(ty isa IR.T_INTEGER ? :integer : :floor, IR.Expression[q], ty)
+  return get!(l.byStep, step) do
+    local n::Int = length(l.byStep) + 1
+    while haskey(l.variables, Symbol("\$EVT_", n))
+      n += 1
+    end
+    local cref::IR.ComponentRef = IR.ComponentRef(Symbol("\$EVT_", n), ty)
+    push!(l.variables, IR.Variable(cref, ty, IR.DISCRETE(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION, true,
+                                   IR.NOT_CONNECTOR, IR.NO_SOURCE, :liftEventFunctions))
+    local k::IR.CREF = IR.CREF(cref, ty)
+    push!(l.equations, stepWhen(k, q, IR.NO_SOURCE))
+    k
+  end
+end
+
+"""
+    stepWhen(k, q, source)
+
+The when-equation of the discrete `k = floor(q)` (`integer(q)` of an Integer `k`) with the events of `q`'s crossings:
+`when {initial(), q >= pre(k) + 1, q < pre(k)} then k = if initial() then floor(q) elseif noEvent(floor(q) <> pre(k))
+then floor(q) elseif noEvent(q >= pre(k) + 0.5) then pre(k) + 1 else pre(k) - 1; end when`. At its crossing `q` can
+read a hair short of the integer it crossed (`floor(q)` still `pre(k)`): the side of `pre(k) + 0.5` gives the
+direction (else `k` stayed, and its relation never fell again). The body reads none of the triggers: the MTK code pins
+a relation its when's body reads to its value after the crossing, and the down crossing took the up branch (MSL
+IntegerNetwork1: 4 for an input of at most 3).
+"""
+function stepWhen(k::IR.CREF, q::IR.Expression, source::IR.Source)::IR.WHEN_EQUATION
+  local ty::IR.ModelicaType = k.ty
+  local one::IR.Expression = ty isa IR.T_INTEGER ? IR.INTEGER(1) : IR.REAL(1.0)
+  local real::Function = (x::IR.Expression) -> ty isa IR.T_INTEGER ? IR.CAST(x, IR.T_REAL()) : x
+  local before::IR.CALL = preCall(k)
+  local above::IR.Expression = IR.BINARY(before, IR.ADD, one, ty)
+  local up::IR.RELATION = IR.RELATION(q, IR.GREATEREQ, real(above), 0)
+  local down::IR.RELATION = IR.RELATION(q, IR.LESS, real(before), 0)
+  local step::IR.CALL = builtinCall(ty isa IR.T_INTEGER ? :integer : :floor, IR.Expression[q], ty)
+  local half::IR.Expression = IR.BINARY(real(before), IR.ADD, IR.REAL(0.5), IR.T_REAL())
+  local quiet::Function = (r::IR.RELATION) -> builtinCall(:noEvent, IR.Expression[r], IR.T_BOOLEAN())
+  local moved::IR.Expression = quiet(IR.RELATION(step, IR.NEQUAL, before, 0))
+  local upper::IR.Expression = quiet(IR.RELATION(q, IR.GREATEREQ, half, 0))
+  local value::IR.Expression =
+    IR.IF_EXPRESSION(initialCall(), step,
+                     IR.IF_EXPRESSION(moved, step,
+                                      IR.IF_EXPRESSION(upper, above, IR.BINARY(before, IR.SUB, one, ty), ty), ty), ty)
+  return IR.WHEN_EQUATION([IR.WhenBranch(IR.Expression[up, down], true, false, IR.Statement[IR.ASSIGNMENT(k, value, source)])],
+                          IR.REGULAR_WHEN, source, IR.DEFAULT_ATTRIBUTES)
 end

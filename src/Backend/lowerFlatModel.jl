@@ -471,7 +471,7 @@ function lowerEquation(eq::F.Equation)::Union{Nothing, IR.Equation}
   elseif isvariant(eq, F.EQUATION_ASSERT)
     return IR.ASSERT_EQUATION(lowerExp(eq.condition), lowerExp(eq.message), lowerExp(eq.level), source)
   elseif isvariant(eq, F.EQUATION_TERMINATE)
-    unsupported("terminate() in an equation section outside a when-equation", F.toString(eq))
+    return terminateEquation(IR.TERMINATE(lowerExp(eq.message), source), source)
   elseif isvariant(eq, F.EQUATION_REINIT)
     unsupported("reinit() outside a when-equation (MLS 8.3.6)", F.toString(eq))
   elseif isvariant(eq, F.EQUATION_NORETCALL)
@@ -482,6 +482,16 @@ function lowerEquation(eq::F.Equation)::Union{Nothing, IR.Equation}
   #= EQUATION_CONNECT: the frontend's connection handling removed them =#
   return nothing
 end
+
+"""
+    terminateEquation(terminate, source)
+
+`terminate()` in an equation section outside a when-equation (MLS 8.3.8): the analysis ends where it is reached; one
+of no condition at the initialization, `when initial() then terminate(...)`. In an if-equation's branch
+`hoistIfEquationAsserts!` makes it when-equations of the branch's condition.
+"""
+terminateEquation(t::IR.TERMINATE, source::IR.Source)::IR.WHEN_EQUATION =
+  IR.WHEN_EQUATION(IR.WhenBranch[IR.WhenBranch(IR.Expression[], true, false, IR.Statement[t])], IR.REGULAR_WHEN, source, ATTRIBUTES)
 
 "`AssertionLevel.error`."
 const ASSERTION_ERROR = IR.ENUM_LITERAL(IR.T_ENUMERATION(:AssertionLevel, [:error, :warning]), :error, 1)
@@ -561,17 +571,122 @@ end
 
 """
 A when-equation: each branch's triggers and its equations as statements (an equality an
-assignment, an if-equation an if-statement). One with a structural change (`recompilation`)
-is a structural when-equation.
+assignment, an if-equation an if-statement), in an order that solves them (`whenEquationOrder`).
+One with a structural change (`recompilation`) is a structural when-equation.
 """
 function lowerWhenEquation(eq::F.Equation, source::IR.Source)::IR.WHEN_EQUATION
   local branches = IR.WhenBranch[]
   for b in eq.branches
-    push!(branches, whenBranch(lowerExp(b.condition), whenStatements(b.body)))
+    push!(branches, whenBranch(lowerExp(b.condition), whenEquationOrder(whenStatements(b.body))))
   end
   local structural = any(br -> any(s -> s isa IR.RECOMPILATION || s isa IR.AGENTIC_RECOMPILATION, br.body), branches)
   return IR.WHEN_EQUATION(branches, structural ? IR.STRUCTURAL_WHEN : IR.REGULAR_WHEN, source, ATTRIBUTES)
 end
+
+"""
+What a reference reads or writes (`whenEquationOrder`): its variable (`crefBase`) and, where it is one element (by
+literal subscripts) or a scalar, its name; `nothing` for a whole array or an element by a variable subscript (any of them).
+"""
+const Touch = Tuple{Symbol, Union{Nothing, Symbol}}
+
+touchOf(c::IR.CREF)::Touch =
+  (crefBase(c.cref), (c.ty isa IR.T_ARRAY || !all(IR.isLiteralSubscript, IR.subscripts(c.cref))) ? nothing : c.cref.name)
+
+"Whether two references may be the same element: of one variable, the same element or one of them all of it."
+overlaps(a::Touch, b::Touch)::Bool = a[1] === b[1] && (a[2] === nothing || b[2] === nothing || a[2] === b[2])
+
+"""
+    whenEquationOrder(stmts)
+
+The statements of a when-equation's branch (its equations, `whenStatements`) in an order that solves them, as the
+equations of a when-equation have none (MLS 8.3.5): the assignments each after those of what it reads (outside
+`pre()`; in their order where they read each other in a cycle), then the reinit, assert, terminate() and calls in their
+order (they read the solved values: `if n >= 3 then terminate() end if; n = pre(n) + 1` stops at the third tick). An
+if-statement of both is split in two (its assignments, its others).
+"""
+function whenEquationOrder(stmts::Vector{IR.Statement})::Vector{IR.Statement}
+  local assigning::Vector{IR.Statement} = IR.Statement[]
+  local effects::Vector{IR.Statement} = IR.Statement[]
+  for s in stmts
+    local (a::Union{Nothing, IR.Statement}, e::Union{Nothing, IR.Statement}) = splitWhenStatement(s)
+    a === nothing || push!(assigning, a)
+    e === nothing || push!(effects, e)
+  end
+  local writes::Vector{Vector{Touch}} = Vector{Touch}[assignedTouches!(Touch[], s) for s in assigning]
+  local reads::Vector{Vector{Touch}} = Vector{Touch}[readTouches!(Touch[], s) for s in assigning]
+  local readsFrom::Function = (i::Int, j::Int) -> any(r::Touch -> any(w::Touch -> overlaps(r, w), writes[j]), reads[i])
+  local ordered::Vector{IR.Statement} = IR.Statement[]
+  local done::BitVector = falses(length(assigning))
+  while !all(done)
+    #= the first one in order whose reads no other one left writes; in a cycle the first left =#
+    local k::Union{Nothing, Int} = findfirst(i -> !done[i] &&
+      !any(j -> j != i && !done[j] && readsFrom(i, j), eachindex(assigning)), eachindex(assigning))
+    k === nothing && (k = findfirst(!, done))
+    push!(ordered, assigning[k])
+    done[k] = true
+  end
+  return vcat(ordered, effects)
+end
+
+"""
+A when-equation's statement as its assignments and its other statements (reinit, assert, terminate(), calls), each
+`nothing` where it has none: an if-statement of both as two with the same conditions.
+"""
+function splitWhenStatement(s::IR.Statement)::Tuple{Union{Nothing, IR.Statement}, Union{Nothing, IR.Statement}}
+  s isa IR.ASSIGNMENT && return (s, nothing)
+  s isa IR.IF_STATEMENT || return (nothing, s)
+  local parts::Function = (body::Vector{IR.Statement}) -> begin
+    local (a::Vector{IR.Statement}, e::Vector{IR.Statement}) = (IR.Statement[], IR.Statement[])
+    for x in body
+      local (xa::Union{Nothing, IR.Statement}, xe::Union{Nothing, IR.Statement}) = splitWhenStatement(x)
+      xa === nothing || push!(a, xa)
+      xe === nothing || push!(e, xe)
+    end
+    (a, e)
+  end
+  local branchParts::Vector{Tuple{Vector{IR.Statement}, Vector{IR.Statement}}} = [parts(b.body) for b in s.branches]
+  local (elseA::Vector{IR.Statement}, elseE::Vector{IR.Statement}) = parts(s.elseBody)
+  local half::Function = (k::Int, elseBody::Vector{IR.Statement}) -> begin
+    (all(bp -> isempty(bp[k]), branchParts) && isempty(elseBody)) && return nothing
+    IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(b.condition, bp[k]) for (b, bp) in zip(s.branches, branchParts)],
+                    elseBody, s.source)
+  end
+  return (half(1, elseA), half(2, elseE))
+end
+
+"What a statement assigns (`Touch`)."
+function assignedTouches!(out::Vector{Touch}, s::IR.Statement)::Vector{Touch}
+  if s isa IR.ASSIGNMENT
+    for t in (s.lhs isa IR.TUPLE ? s.lhs.elements : s.lhs isa IR.ARRAY ? s.lhs.elements : IR.Expression[s.lhs])
+      t isa IR.CREF && push!(out, touchOf(t))
+    end
+  elseif s isa IR.IF_STATEMENT
+    foreach(x -> assignedTouches!(out, x), Iterators.flatten((Iterators.flatten(b.body for b in s.branches), s.elseBody)))
+  end
+  return out
+end
+
+"What a statement reads outside `pre()` (its values and conditions; `Touch`)."
+function readTouches!(out::Vector{Touch}, s::IR.Statement)::Vector{Touch}
+  local visit::Function = (e::IR.Expression) -> IR.mapExpTopDown(e) do x
+    IR.isBuiltinCall(x, :pre) && return (x, false)
+    x isa IR.CREF && push!(out, touchOf(x))
+    return (x, true)
+  end
+  if s isa IR.ASSIGNMENT
+    visit(s.rhs)
+  elseif s isa IR.IF_STATEMENT
+    for b in s.branches
+      visit(b.condition)
+      foreach(x -> readTouches!(out, x), b.body)
+    end
+    foreach(x -> readTouches!(out, x), s.elseBody)
+  end
+  return out
+end
+
+"A reference's variable up to its first part with subscripts (`x` of `x[2]`, `c` of `c[1].v`), else its name."
+crefBase(c::IR.ComponentRef)::Symbol = isempty(IR.subscripts(c)) ? c.name : IR.upToFirstSubscripted(c).name
 
 "The equations of a when-equation's branch, or of an if-equation in it, as statements."
 function whenStatements(eqs::Vector{F.Equation})::Vector{IR.Statement}
@@ -682,7 +797,8 @@ end
 function variableKind(variability::Integer, ty::IR.ModelicaType)::IR.VariableKind
   local V = F.Variability
   variability == V.CONSTANT && return IR.CONSTANT()
-  variability in (V.STRUCTURAL_PARAMETER, V.PARAMETER, V.NON_STRUCTURAL_PARAMETER) && return IR.PARAMETER()
+  variability == V.STRUCTURAL_PARAMETER && return IR.PARAMETER(true)
+  variability in (V.PARAMETER, V.NON_STRUCTURAL_PARAMETER) && return IR.PARAMETER()
   IR.elementType(ty) isa IR.T_CLOCK && return IR.CLOCK_VARIABLE()
   variability == V.DISCRETE && return IR.DISCRETE()
   return IR.ALGEBRAIC()
@@ -765,7 +881,7 @@ end
 function assignedCrefs(statements::Vector{IR.Statement})::Vector{IR.ComponentRef}
   local out = IR.ComponentRef[]
   local seen = Set{Symbol}()
-  local visit(s::IR.ASSIGNMENT) = foreach(t -> (t isa IR.CREF && !(t.cref.name in seen)) && (push!(seen, t.cref.name); push!(out, IR.ComponentRef(t.cref.name))),
+  local visit(s::IR.ASSIGNMENT) = foreach(t -> (t isa IR.CREF && !(t.cref.name in seen)) && (push!(seen, t.cref.name); push!(out, t.cref)),
                                          s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
   local visit(s::Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}) =
     (foreach(b -> foreach(visit, b.body), s.branches); s isa IR.IF_STATEMENT && foreach(visit, s.elseBody))
@@ -807,7 +923,32 @@ function lowerVariables(fm::F.FlatModel)::IR.VariableSet
     end
     push!(variables, lowered)
   end
+  structuralBindingReads!(variables)
   return variables
+end
+
+"""
+    structuralBindingReads!(variables)
+
+The parameters a structural parameter's binding reads structural too, transitively (the frontend marks the one it
+evaluated for the structure, `R` of `if R > 0` with `R = 2 * R0`, not `R0`; omc's frontend marks both): an override of
+`R0` would change the structure the code was generated for.
+"""
+function structuralBindingReads!(variables::IR.VariableSet)::Nothing
+  local todo::Vector{IR.Variable} = IR.Variable[v for v in variables if v.kind isa IR.PARAMETER && v.kind.structural]
+  while !isempty(todo)
+    local v::IR.Variable = pop!(todo)
+    v.binding === nothing && continue
+    IR.foreachExp(v.binding) do x::IR.Expression
+      x isa IR.CREF || return nothing
+      local w::Union{Nothing, IR.Variable} = get(variables, x.cref.name, nothing)
+      (w !== nothing && w.kind isa IR.PARAMETER && !w.kind.structural) || return nothing
+      w.kind = IR.PARAMETER(true)
+      push!(todo, w)
+      return nothing
+    end
+  end
+  return nothing
 end
 
 """

@@ -36,7 +36,6 @@
 module AlgorithmicCodeGeneration
 import ..SimCode
 import ..CodeGeneration
-import ..CodeGeneration: COMPONENT_SEPARATOR
 import LinearAlgebra
 import OMRuntimeExternalC
 include("modelicaBuiltins.jl")

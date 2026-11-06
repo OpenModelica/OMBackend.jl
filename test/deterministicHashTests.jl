@@ -24,3 +24,19 @@ import OMBackend
   @test length(split(first)) == 4
   @test first == second
 end
+
+#= OMJLIR's and SimCode's values hash by their type's name and their fields, an enumeration by its
+   value: the same in every build. By the type itself (and Base's enumeration hash, which has its
+   type's) they changed with every precompile, Julia deriving a type's hash from its module's build
+   id: the when bodies' local function names (`#whenCall1_<hash>`, WhenBodyCalls) and the order of a
+   Dict or Set of values (2026-10-30). A second process of the same build cannot tell; the hash's
+   parts can. =#
+@testset "IR and SimCode values hash by their contents" begin
+  local IR = OMBackend.OMJLIR
+  local SC = OMBackend.SimCode
+  local h::UInt = UInt(7)
+  @test hash(IR.INTEGER(1), h) == hash(1, hash(:INTEGER, h))
+  @test hash(SC.ICONST(1), h) == hash(1, hash(:ICONST, h))
+  local b::SC.BINARY = SC.BINARY(SC.ICONST(1), SC.OP_ADD, SC.ICONST(2))
+  @test hash(b, h) == hash(SC.ICONST(2), hash(Integer(SC.OP_ADD), hash(SC.ICONST(1), hash(:BINARY, h))))
+end

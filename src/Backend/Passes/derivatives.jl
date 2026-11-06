@@ -38,9 +38,9 @@
 
 The states and their derivative variables: every variable `x` of a `der(x)` in the equations
 of a continuous-time partition (or of a structural mode) is a state, its derivative the
-variable `\$DER.x` (kind STATE_DER, after the model's variables), and `der(x)` everywhere
-(equations and initial equations) a reference to it. With arrays kept, `der(x[i])` makes the
-array `x` a state, `\$DER.x` its derivative array, and the call the element `\$DER.x[i]`. `der`
+variable `\$DER.x` (kind STATE_DER, after the model's variables; its reference `IR.derivativeCref` of x's), and
+`der(x)` everywhere (equations and initial equations) a reference to it. With arrays kept, `der(x[i])` makes the
+array `x` a state, `\$DER.x` its derivative array, and the call the element `\$DER.x[i]` (`IR.withLastSubscripts`). `der`
 of another expression stays a call. The previous backend's detectStates: the states of the
 equations, not of the initial equations.
 """
@@ -73,22 +73,21 @@ function introduceDerivatives!(variables::IR.VariableSet, partition::IR.Partitio
     #= a reference that is no variable keeps its der() call =#
     v === nothing && continue
     push!(introduced, name)
-    local d = IR.derivativeName(name)
-    v.kind = IR.STATE(1, d, true)
-    haskey(variables, d) && continue
+    local d::IR.ComponentRef = IR.derivativeCref(v.cref)
+    v.kind = IR.STATE(1, d.name, true)
+    haskey(variables, d.name) && continue
     push!(variables, IR.Variable(d, v.ty, IR.STATE_DER(name), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION,
                                  false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :introduceDerivatives))
   end
   local toDerivative = e -> begin
     (IR.isBuiltinCall(e, :der) && e.arguments[1] isa IR.CREF) || return e
     local x = e.arguments[1].cref
-    x.name in introduced && return IR.CREF(IR.ComponentRef(IR.derivativeName(x.name), e.ty), e.ty)
+    x.name in introduced && return IR.CREF(variables[variables[x.name].kind.derivative].cref, e.ty)
     #= `der(x[i])` of an array state: the element `\$DER.x[i]` of its derivative array (`der(c[i].T)`, a field of
        a record array, `\$DER.c.T[i]`) =#
     local array = arrayOfElement(variables, x)
     (array !== nothing && array.name in introduced) || return e
-    local part = IR.CrefPart(IR.derivativeName(array.name), allSubscripts(x), array.ty)
-    return IR.CREF(IR.ComponentRef(IR.CrefPart[part]), e.ty)
+    return IR.CREF(IR.withLastSubscripts(variables[variables[array.name].kind.derivative].cref, allSubscripts(x)), e.ty)
   end
   foreach(eq -> IR.mapEquation!(toDerivative, eq), partition.equations)
   foreach(eq -> IR.mapEquation!(toDerivative, eq), partition.initialEquations)

@@ -1,6 +1,6 @@
 name = "OMBackend"
 uuid = "9400bd5f-7561-42f6-8760-03756753da50"
-version = "0.8.3"
+version = "0.8.4"
 authors = ["John Tinnerholm <johti17@liu.se>", "Karim Abdelhak <karim.abdelhak@fh-bielefeld.de>", "AnHeuermann <andreas.heuermann@fh-bielefeld.de>"]
 
 [deps]
@@ -47,7 +47,7 @@ MetaModelica = "0.4.2"
 ModelingToolkit = "11.21"
 NonlinearSolve = "4"
 OMCompiler = "0.1"
-OMFrontend = "1.7.5"
+OMFrontend = "1.8.3"
 OMRuntimeExternalC = "0.3.6"
 PrecompileTools = "1"
 SCode = "1.3"

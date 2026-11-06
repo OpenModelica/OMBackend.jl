@@ -369,16 +369,17 @@ function discretizedPartition(p::IR.Partition, method::String, interval::Union{N
   method in ("ExplicitEuler", "ImplicitEuler") ||
     unsupported("a solver clock's method other than ExplicitEuler and ImplicitEuler", method)
   interval === nothing && unsupported("a solver clock of an event clock (no interval)", method)
-  #= the states in the order of their first der(), each with its derivative variable =#
-  local states = Symbol[]
-  local derivatives = Dict{Symbol, IR.CREF}()
+  #= the states in the order of their first der(), each with its derivative variable (`der.x`,
+     `IR.auxiliaryDerivativeCref`) =#
+  local states = IR.ComponentRef[]
+  local derivatives = Dict{IR.ComponentRef, IR.CREF}()
   local derivativeOf = e -> begin
     (e isa IR.CALL && builtinName(e) === :der && length(e.arguments) == 1) || return e
     local x = e.arguments[1]
     x isa IR.CREF || unsupported("der() of an expression in a clocked discretized partition", e)
-    return get!(derivatives, x.cref.name) do
-      push!(states, x.cref.name)
-      IR.CREF(IR.ComponentRef(Symbol("omjl_der_", x.cref.name), IR.T_REAL()), IR.T_REAL())
+    return get!(derivatives, x.cref) do
+      push!(states, x.cref)
+      IR.CREF(IR.auxiliaryDerivativeCref(x.cref), IR.T_REAL())
     end
   end
   local equations = IR.Equation[p.equations...]
@@ -389,13 +390,13 @@ function discretizedPartition(p::IR.Partition, method::String, interval::Union{N
   local step = builtinCall(:interval, IR.Expression[], IR.T_REAL())
   for x in states
     local d = derivatives[x]
-    local xRef = IR.CREF(IR.ComponentRef(x, IR.T_REAL()), IR.T_REAL())
+    local xRef = IR.CREF(x, IR.T_REAL())
     local previous = e -> builtinCall(:previous, IR.Expression[e], IR.T_REAL())
     local slope = method == "ExplicitEuler" ? previous(d) : d
     local stepped = IR.BINARY(previous(xRef), IR.ADD, IR.BINARY(step, IR.MUL, slope, IR.T_REAL()), IR.T_REAL())
     push!(equations, IR.SCALAR_EQUATION(xRef, IR.IF_EXPRESSION(firstTick, previous(xRef), stepped, IR.T_REAL()),
                                         IR.T_REAL(), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
-    push!(newVars, IR.Variable(d.cref.name, IR.T_REAL(), IR.DISCRETE(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION, false,
+    push!(newVars, IR.Variable(d.cref, IR.T_REAL(), IR.DISCRETE(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION, false,
                                IR.NOT_CONNECTOR, IR.NO_SOURCE, :lowerClockedPartitions))
   end
   return IR.Partition(p.index, p.association, vcat(p.unknowns, Symbol[derivatives[x].cref.name for x in states]),

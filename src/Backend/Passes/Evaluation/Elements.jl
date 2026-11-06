@@ -114,9 +114,8 @@ derivative of the call is a record literal); a subscripted expression otherwise.
 """
 function selectElement(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType)::IR.Expression
   isempty(subscripts) && return e
-  local first = subscripts[1]
-  if first isa IR.INDEX && first.exp isa IR.INTEGER
-    local k = first.exp.value
+  local k::Union{Nothing, Int} = IR.literalIndex(subscripts[1])
+  if k !== nothing
     local record = asRecord(e)
     if record !== nothing && length(subscripts) == 1 && 1 <= k <= length(record.elements)
       return record.elements[k]
@@ -193,11 +192,8 @@ A scalar element of an array built-in of literal subscripts: `identity(n)[i, j]`
 `nothing` for another call.
 """
 function builtinElement(e::IR.CALL, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType)::Union{Nothing, IR.Expression}
-  local index = Int[]
-  for sub in subscripts
-    (sub isa IR.INDEX && sub.exp isa IR.INTEGER) || return nothing
-    push!(index, sub.exp.value)
-  end
+  local index::Union{Nothing, Vector{Int}} = IR.literalIndices(subscripts)
+  index === nothing && return nothing
   if e.name === :identity && length(index) == 2
     return index[1] == index[2] ? ONE : ZERO
   elseif e.name === :promote && length(e.arguments) == 2
@@ -290,11 +286,8 @@ end
 "`e[subscripts]`: a reference with the subscripts appended (its flat name), else a subscripted expression."
 function subscripted(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType)::IR.Expression
   e isa IR.ARRAY && return selectElement(e, subscripts, ty)
-  if e isa IR.CREF && all(sub -> sub isa IR.INDEX && sub.exp isa IR.INTEGER, subscripts)
-    local parts = copy(e.cref.parts)
-    local last = parts[end]
-    parts[end] = IR.CrefPart(last.name, vcat(last.subscripts, subscripts), ty)
-    return IR.CREF(IR.ComponentRef(parts), ty)
+  if e isa IR.CREF && all(sub -> IR.literalIndex(sub) !== nothing, subscripts)
+    return IR.CREF(IR.appendSubscripts(e.cref, subscripts), ty)
   end
   return IR.SUBSCRIPTED(e, subscripts, ty)
 end

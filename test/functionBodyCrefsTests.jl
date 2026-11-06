@@ -20,7 +20,7 @@ import OMBackend
     SC.ASSERT(ref("ok"), SC.SCONST("message"), SC.ICONST(1), src),
   ]
   local f = SC.MODELICA_FUNCTION("f", SC.FunctionVariable[], SC.FunctionVariable[],
-                                 SC.FunctionVariable[SC.FunctionVariable("l", SC.TYPE_REAL(), SC.Exp[], ref("w"), Pair{String, SC.Exp}[])],
+                                 SC.FunctionVariable[SC.FunctionVariable("l", SC.TYPE_REAL(), SC.Exp[], ref("w"), Pair{String, SC.Exp}[], OMBackend.OMJLIR.ComponentRef(:l))],
                                  statements, nothing)
   local out = SC.functionBodyNames!(SC.OrderedSet{String}(), SC.ModelicaFunction[f])
   for name in ("c", "a", "d", "b", "e", "y1", "y2", "p", "n", "z", "q", "ok", "w")

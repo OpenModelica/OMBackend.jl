@@ -205,8 +205,26 @@ isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "backend
       #= an element by literal subscripts: its name and its array's =#
       local rt = names(SC.ASUB(ref("R_T"), SC.Exp[SC.ICONST(1), SC.ICONST(1)]))
       @test "R_T[1][1]" in rt && "R_T" in rt
-      #= by a subscript that reads a variable: the array's dynamic mark =#
-      @test string("A", SC.DYNAMIC_SUBSCRIPT_MARK) in names(SC.ASUB(ref("A"), SC.Exp[ref("i", SC.TYPE_INTEGER())]))
+      #= by a subscript that reads a variable: the array's read, no name of an element; the read marked dynamic
+         (`crefReads!`), the array recorded in `dynamic` by its reference (`arrayBase`) =#
+      local aRef = OMBackend.OMJLIR.ComponentRef(:A)
+      local dynamicRead = SC.ASUB(SC.EXP_CREF(SC.SimCref(:A, Int[], aRef), SC.TYPE_REAL()), SC.Exp[ref("i", SC.TYPE_INTEGER())])
+      @test names(dynamicRead) == ["A", "i"]
+      local dynamic = Set{Symbol}()
+      SC.crefNames!(SC.OrderedSet{String}(), dynamicRead; dynamic)
+      @test dynamic == Set([:A])
+      @test SC.Read(SC.SimCref(:A), true) in SC.crefReads!(SC.Read[], dynamicRead)
+      #= an element read: the array's key and subscripts, its reference the element's =#
+      local element = first(SC.crefReads!(SC.Read[], SC.ASUB(SC.EXP_CREF(SC.SimCref(:A, Int[], aRef), SC.TYPE_REAL()),
+                                                             SC.Exp[SC.ICONST(2)])))
+      @test SC.crefName(element.cref) == "A[2]" && element.cref.ref.name === Symbol("A[2]") && !element.dynamic
+      #= the two key spaces of an element read: the passes' IR flat name, the code view's identifier (the array's
+         identifier and the subscripts, as the generated code indexes it) =#
+      local abRef = OMBackend.OMJLIR.ComponentRef(OMBackend.OMJLIR.CrefPart[OMBackend.OMJLIR.CrefPart(:a, OMBackend.OMJLIR.Subscript[], OMBackend.OMJLIR.T_REAL()),
+                                                                         OMBackend.OMJLIR.CrefPart(:b, OMBackend.OMJLIR.Subscript[], OMBackend.OMJLIR.T_REAL())])
+      local abRead = SC.ASUB(SC.EXP_CREF(SC.SimCref(:a_b, Int[], abRef), SC.TYPE_REAL()), SC.Exp[SC.ICONST(1), SC.ICONST(2)])
+      @test "a.b[1,2]" in SC.crefNames!(SC.OrderedSet{String}(), abRead)
+      @test collect(SC.identifierNames!(SC.OrderedSet{String}(), abRead)) == ["a_b[1][2]", "a_b"]
     end
 
     @testset "ifConditionNames!: the names of if-expression conditions" begin

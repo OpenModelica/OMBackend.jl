@@ -89,7 +89,7 @@ function foldExplicitOnce(simCode::SIM_CODE, kept::OrderedSet{String})::Union{No
     local d = explicitDefinition(eq.exp, ht)
     d === nothing && continue
     local (name, x) = d
-    (occursin('[', name) || occursin(']', name) || name in kept || name in aliases) && continue
+    (elementArray(simCode, name) !== nothing || name in kept || name in aliases) && continue
     local v = last(ht[name])
     (v.varKind isa ALG_VARIABLE && !hasFixedStart(v)) || continue
     anyExp(y -> y isa DER || (y isa CALL && y.name === :der), x) && continue
@@ -123,7 +123,7 @@ function foldExplicitOnce(simCode::SIM_CODE, kept::OrderedSet{String})::Union{No
   foreach(a -> statementCrefNames!(read, a.statements), initialAlgorithms)
   for (_, (_, v)) in ht
     local b = bindingOf(v.varKind)
-    (v.varKind isa Union{PARAMETER, ARRAY_PARAMETER, DATA_STRUCTURE} && b !== nothing) && crefNames!(read, b)
+    (v.varKind isa Union{PARAMETER, DATA_STRUCTURE} && b !== nothing) && crefNames!(read, b)
   end
   any(n -> n in read, keys(folded)) && return nothing
   local newHT = copy(ht)
@@ -164,7 +164,7 @@ function orientReciprocalEquations(simCode::SIM_CODE)::SIM_CODE
   local oriented = 0
   local residuals = RESIDUAL_EQUATION[]
   for eq in simCode.residualEquations
-    local e = reciprocalOrientation(eq.exp, ht, uses, excluded)
+    local e::Union{Nothing, Exp} = reciprocalOrientation(eq.exp, simCode, uses, excluded)
     e === nothing ? push!(residuals, eq) : (push!(residuals, RESIDUAL_EQUATION(e, eq.source, eq.attr)); oriented += 1)
   end
   oriented == 0 && return simCode
@@ -179,7 +179,8 @@ function reciprocalOf(e::Exp)::Union{Nothing, EXP_CREF}
 end
 
 "`x - 1/y` (`1/y - x`) as `y - 1/x`, both scalar algebraic unknowns without a fixed start, `y` in this equation only and in no excluded one; `nothing` for another residual."
-function reciprocalOrientation(e::Exp, ht::HT, uses::Dict{String, Int}, excluded::OrderedSet{String})::Union{Nothing, Exp}
+function reciprocalOrientation(e::Exp, simCode::SIM_CODE, uses::Dict{String, Int}, excluded::OrderedSet{String})::Union{Nothing, Exp}
+  local ht::HT = simCode.stringToSimVarHT
   (e isa BINARY && e.op === OP_SUB) || return nothing
   local (y, x) = (reciprocalOf(e.exp2), e.exp1)
   y === nothing && ((y, x) = (reciprocalOf(e.exp1), e.exp2))
@@ -187,7 +188,7 @@ function reciprocalOrientation(e::Exp, ht::HT, uses::Dict{String, Int}, excluded
   local (xn, yn) = (crefName(x.cref), crefName(y.cref))
   xn == yn && return nothing
   for n in (xn, yn)
-    (haskey(ht, n) && !occursin('[', n)) || return nothing
+    (haskey(ht, n) && elementArray(simCode, n) === nothing) || return nothing
     local v = last(ht[n])
     (v.varKind isa ALG_VARIABLE && !hasFixedStart(v)) || return nothing
   end

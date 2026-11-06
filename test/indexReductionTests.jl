@@ -62,6 +62,25 @@ _irStates(name::String)::Vector{String} = sort(String.(_irExplain(name).states))
 _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
   only(filter(eq -> eq isa _IRM.SCALAR_EQUATION && eq.lhs isa _IRM.CREF && eq.lhs.cref.name === name, eqs))
 
+"""
+The derivative variables of `model` (by the kinds, `antiderivatives`) and the references to them or their elements
+that do not have their derivative part first (`IR.isDerivativeCref`).
+"""
+function _irDerivativeRefViolations(model::_IRM.Model)::Vector{Symbol}
+  local anti::Dict{Symbol, Symbol} = _IRd.antiderivatives(model.variables)
+  local out::Vector{Symbol} = Symbol[v.name for v in model.variables if haskey(anti, v.name) && !_IRM.isDerivativeCref(v.cref)]
+  for p in model.continuous, eq in Iterators.flatten((p.equations, p.initialEquations))
+    _IRM.foreachExp(eq) do x::_IRM.Expression
+      x isa _IRM.CREF || return nothing
+      local name::Symbol = _IRM.hasSubscripts(x.cref) && !haskey(model.variables, x.cref.name) ?
+        OMBackend.Passes.unsubscriptedName(x.cref) : x.cref.name
+      (haskey(anti, name) && !_IRM.isDerivativeCref(x.cref)) && push!(out, x.cref.name)
+      nothing
+    end
+  end
+  return out
+end
+
 @testset "Index reduction" begin
   @testset "explain: outcome, differentiations, states" begin
     @test _irExplain("Index1").outcome === :index1
@@ -95,6 +114,16 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
     local (fm1, functions1) = _irFlat("Index1")
     local index1 = OMBackend.omjlirModel(fm1; functionList = functions1)
     @test index1.variables[:x].kind isa _IRM.STATE
+    #= derivative variables by their kinds, not their names: x, its derivative v (a state, second order), v's a =#
+    local real = (name::Symbol, kind::_IRM.VariableKind) ->
+      _IRM.Variable(name, _IRM.T_REAL(), kind, nothing, _IRM.NO_ATTRIBUTES, _IRM.NO_DIRECTION, false, _IRM.NOT_CONNECTOR,
+                    _IRM.NO_SOURCE, :model)
+    local chain = _IRM.VariableSet(_IRM.Variable[real(:x, _IRM.STATE(2, :v, true)), real(:v, _IRM.STATE(1, :a, true)),
+                                                 real(:a, _IRM.STATE_DER(:v)), real(:y, _IRM.ALGEBRAIC())])
+    local antiderivative::Dict{Symbol, Symbol} = _IRd.antiderivatives(chain)
+    @test antiderivative == Dict(:v => :x, :a => :v)
+    @test _IRd.baseVariable(antiderivative, :a) === :x && _IRd.baseVariable(antiderivative, :y) === :y
+    @test _IRd.derivativeChain(chain, :x) == [:v, :a] && isempty(_IRd.derivativeChain(chain, :y))
   end
 
   @testset "the choice of states" begin
@@ -289,9 +318,67 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
     local kind = name -> model.variables[name].kind
     @test kind(:phi1) isa _IRM.STATE && kind(:w1) isa _IRM.STATE
     @test kind(:phi2) isa _IRM.DUMMY_STATE && kind(:w2) isa _IRM.DUMMY_STATE
-    #= each state's derivative an algebraic unknown, linked by $STATEDER.x = $DER.x =#
+    #= each state's derivative an algebraic unknown (ALGEBRAIC_DER), linked by $STATEDER.x = $DER.x =#
     @test kind(:phi1).derivative === Symbol("\$STATEDER.phi1")
-    @test kind(Symbol("\$DER.phi1")) isa _IRM.ALGEBRAIC
+    @test kind(Symbol("\$DER.phi1")) == _IRM.ALGEBRAIC_DER(:phi1)
+    @test kind(Symbol("\$DER.phi2")) == _IRM.DUMMY_DER(:phi2)
+    #= the links marked as such (their attributes' derivativeLink), one per state; the model's own equations not =#
+    local eqs::Vector{_IRM.Equation} = model.continuous[1].equations
+    local isLink = (eq::_IRM.Equation) -> eq isa _IRM.SCALAR_EQUATION && eq.attributes.derivativeLink
+    @test _IRd.isDerivativeLink(_irEquationOf(eqs, Symbol("\$STATEDER.phi1")))
+    @test count(isLink, eqs) == 2 && _irEquationOf(eqs, Symbol("\$STATEDER.w1")).attributes.derivativeLink
+    #= SimCode keeps the kinds, the variables keyed and named by their IR names; the code generators' view by their
+       identifiers (codeView: a state's derivative der(x)) =#
+    local simCode = OMBackend.SimCode.lowerStructuralModes(model)
+    local irKind = (sc::OMBackend.SimCode.SIM_CODE, name::String) -> last(sc.stringToSimVarHT[name]).irKind
+    @test irKind(simCode, "phi1") == _IRM.STATE(1, Symbol("\$STATEDER.phi1"), true)
+    @test irKind(simCode, "\$DER.phi1") == _IRM.ALGEBRAIC_DER(:phi1)
+    @test irKind(simCode, "phi2") == _IRM.DUMMY_STATE(Symbol("\$DER.phi2"))
+    @test irKind(simCode, "\$DER.phi2") == _IRM.DUMMY_DER(:phi2)
+    local view::OMBackend.SimCode.SIM_CODE = OMBackend.SimCode.codeView(simCode)
+    @test irKind(view, "phi1") == _IRM.STATE(1, Symbol("der(phi1)"), true)
+    @test irKind(view, "\$DER_phi1") == _IRM.ALGEBRAIC_DER(:phi1)
+    @test irKind(view, "phi2") == _IRM.DUMMY_STATE(Symbol("\$DER_phi2"))
+    @test irKind(view, "\$DER_phi2") == _IRM.DUMMY_DER(:phi2)
+  end
+
+  @testset "derivative references by their parts (IR.derivativeCref)" begin
+    #= a derivative's reference: its derivative part before the parts of the reference it is the derivative of, its
+       name the one it had as a name (`\$DER.` before the flat name); an element of a derivative array on its last part =#
+    local c::_IRM.ComponentRef = _IRM.ComponentRef(_IRM.CrefPart[_IRM.CrefPart(:c, _IRM.Subscript[], _IRM.T_CLASS(:C)),
+                                                                 _IRM.CrefPart(:T, _IRM.Subscript[], _IRM.T_ARRAY(_IRM.T_REAL(), _IRM.Dimension[_IRM.DIM_SIZE(3)]))])
+    local d::_IRM.ComponentRef = _IRM.derivativeCref(c)
+    @test d.name === Symbol("\$DER.c.T") && _IRM.isDerivativeCref(d) && d.parts[1].ty isa _IRM.T_DER
+    @test _IRM.operand(d) == c && _IRM.operand(c) === nothing && !_IRM.isDerivativeCref(c)
+    @test _IRM.derivativeCref(d).name === Symbol("\$DER.\$DER.c.T") && _IRM.operand(_IRM.derivativeCref(d)) == d
+    @test _IRM.stateDerivativeCref(c).name === Symbol("\$STATEDER.c.T") && _IRM.stateDerivativeCref(c).parts[1].ty isa _IRM.T_STATEDER
+    local element::_IRM.ComponentRef = _IRM.withLastSubscripts(d, _IRM.Subscript[_IRM.INDEX(_IRM.INTEGER(2))])
+    @test element.name === Symbol("\$DER.c.T[2]") && _IRM.variableName(element, n::Symbol -> n === d.name) === d.name
+    #= every derivative variable and every reference to one by its parts: scalar states, state sets, the array form
+       (its derivative arrays, the links' arrays, scalarized), rolled components =#
+    local (fm, functions) = _irFlat("RigidInertias")
+    local rigid::_IRM.Model = OMBackend.omjlirModel(fm; functionList = functions)
+    @test _IRM.operand(rigid.variables[Symbol("\$DER.phi1")].cref) == rigid.variables[:phi1].cref
+    @test rigid.variables[Symbol("\$STATEDER.phi1")].cref.parts[1].ty isa _IRM.T_STATEDER
+    @test isempty(_irDerivativeRefViolations(rigid)) && isempty(_IRM.referenceProblems(rigid))
+    withenv("OMBACKEND_DYNAMIC_STATE_SETS" => "true") do
+      local (fs, fsFunctions) = _irFlat("PendulumCartesian")
+      local sets::_IRM.Model = OMBackend.omjlirModel(fs; functionList = fsFunctions)
+      @test _IRM.isDerivativeCref(sets.variables[Symbol("\$DER.\$STATESET1.x[1]")].cref)
+      #= a state set's variables: the set's part before their own, subscripted (`\$STATESET1.x[1]`, not one part) =#
+      local x1::_IRM.ComponentRef = sets.variables[Symbol("\$STATESET1.x[1]")].cref
+      @test length(x1.parts) == 2 && x1.parts[2].name === :x && length(x1.parts[2].subscripts) == 1
+      @test length(sets.variables[Symbol("\$STATESET1.A[1,1]")].cref.parts[2].subscripts) == 2
+      @test isempty(_irDerivativeRefViolations(sets)) && isempty(_IRM.referenceProblems(sets))
+    end
+    for name in ("InertiaArray", "SeparateDampedPairs")
+      local arrays::_IRM.Model = _irArrayUnreduced(name)
+      name == "SeparateDampedPairs" && _IRd.rollComponents!(arrays)
+      @test _IRd.reduceIndexArrays!(arrays)
+      @test isempty(_irDerivativeRefViolations(arrays)) && isempty(_IRM.referenceProblems(arrays))
+      local scalarized::_IRM.Model = _IRd.scalarizeArrays(arrays).model
+      @test isempty(_irDerivativeRefViolations(scalarized)) && isempty(_IRM.referenceProblems(scalarized))
+    end
   end
 
   @testset "derivative unknowns: a piecewise coefficient 0 in a branch is not solved through" begin
@@ -464,6 +551,14 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
     @test kind("phi2") isa _IRM.DUMMY_STATE && kind("w2") isa _IRM.DUMMY_STATE
     @test m.variables[Symbol("\$DER.\$DER.phi1")].ty isa _IRM.T_ARRAY
     @test kind("\$STATEDER.phi1") isa _IRM.STATE_DER
+    #= the for-equation's body marked as the link, its elements too once scalarized =#
+    local linkBodies::Vector{_IRM.Equation} = _IRM.Equation[eq.body[1] for eq in m.continuous[1].equations
+                                                            if eq isa _IRM.FOR_EQUATION && length(eq.body) == 1 &&
+                                                               _IRd.isDerivativeLink(eq.body[1])]
+    @test length(linkBodies) == 2 && all(b -> occursin("\$STATEDER.", string(b.lhs)), linkBodies)
+    local scalarLinks::Vector{String} = String[string(eq.lhs) for eq in _IRd.scalarizeArrays(m).model.continuous[1].equations
+                                                if _IRd.isDerivativeLink(eq)]
+    @test length(scalarLinks) == 2 * _IRM.dimensionSize(m.variables[:phi1].ty.dimensions[1])
     #= pendulums in a for-equation: the constraint differentiated twice in array form, the iterator kept; the dynamic
        state sets of the elements one family over them (its selection matrix A[i, j, c], its when-equation in the
        for-equation); the start values choose differently per element (x the dummy of the first, y of the others) =#
@@ -509,6 +604,17 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
     @test m.variables[Symbol("a|b|c.phi1")].cref.parts[1].ty == _IRM.T_COMPONENTS(Symbol("IndexReduction.RigidPair"), [:a, :b, :c])
     @test Set{Symbol}(v.name for v in _IRd.scalarizeArrays(m).model.variables) == unrolledNames
     @test count(eq -> eq isa _IRM.FOR_EQUATION, m.continuous[1].equations) == 5
+    #= an if-expression's auxiliary per instance (ifEq_tmp<k>: one part, no derivative by the kinds) rolled into one
+       array; a rolled derivative the derivative part before its base's rolled reference, read as a rolled array =#
+    m = _irArrayUnreduced("SeparateDampedPairs")
+    @test _IRd.rollComponents!(m) == 1
+    local auxiliary::_IRM.Variable = only(filter(v -> v.origin === :liftIfExpressions, collect(m.variables)))
+    @test auxiliary.cref.parts[1].ty isa _IRM.T_COMPONENTS && auxiliary.ty == _IRM.T_ARRAY(_IRM.T_REAL(), _IRM.Dimension[_IRM.DIM_SIZE(3)])
+    local rolledDerivative::_IRM.ComponentRef = m.variables[Symbol("\$DER.a|b|c.w1")].cref
+    @test rolledDerivative.parts[1].ty isa _IRM.T_DER && rolledDerivative.parts[2].ty isa _IRM.T_COMPONENTS
+    @test _IRM.operand(rolledDerivative) == m.variables[Symbol("a|b|c.w1")].cref
+    @test _IRd.isRolledReference(rolledDerivative)
+    @test !_IRd.isRolledReference(_IRM.derivativeCref(_IRM.ComponentRef(:x)))
     #= the derivative unknowns solved in array form (solvedInArrays): each for-equation's body once, its iterator kept;
        the model with its arrays not changed (the scalarized path's) =#
     m = _irArrayUnreduced("InertiaArray")
@@ -548,12 +654,18 @@ _irEquationOf(eqs::Vector{_IRM.Equation}, name::Symbol)::_IRM.SCALAR_EQUATION =
       @test _irArraySimulate("EachStartArray", ["phi1[1]", "phi1[3]", "phi2[2]"], 1.0; kept = true) ≈ fill(0.6, 3)
       @test OMBackend.canonicalName("IndexReduction.EachStartArray") in OMBackend.ARRAY_REDUCED_MODELS
       @test OMBackend.canonicalName("IndexReduction.EachStartArray") in OMBackend.ARRAY_ODE_MODELS
+      #= rolled components with their auxiliaries: the results of the scalarized model =#
+      local damped::Vector{String} = ["a.phi1", "b.w1", "c.w1", "c.damping"]
+      local dampedScalarized::Vector{Float64} = _irArraySimulate("SeparateDampedPairs", damped, 3.0; kept = false)
+      @test isapprox(_irArraySimulate("SeparateDampedPairs", damped, 3.0; kept = true), dampedScalarized; atol = 1e-8, rtol = 1e-8)
+      @test dampedScalarized[4] > 0.01
+      @test OMBackend.canonicalName("IndexReduction.SeparateDampedPairs") in OMBackend.ARRAY_REDUCED_MODELS
       #= a derivative array solved from different bodies: solvedInArrays splits it in place, so the array code solves
          a copy and the scalarized fallback (a dynamic state set) reads the reduced model as reduced =#
       let (fm, functions) = _irArrayFlat("PendulumsFirstForceLaw")
         local reduced::_IRM.Model = OMBackend.reducedArrayModel(fm; functionList = functions)
         local names::Vector{Symbol} = Symbol[v.name for v in reduced.variables]
-        @test OMBackend.generateReducedArrayODETargetCode(fm, reduced; functionList = functions) === nothing
+        @test OMBackend.generateReducedArrayODETargetCode(fm, reduced) === nothing
         @test Symbol[v.name for v in reduced.variables] == names
       end
       local firstLaw::Vector{String} = ["x[1]", "y[1]", "x[2]", "F[1]", "F[3]"]

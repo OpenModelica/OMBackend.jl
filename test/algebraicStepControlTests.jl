@@ -67,6 +67,12 @@ the tolerance and projects the step ends onto the algebraic equations.
   @test !control.active
   ODE.init(prob, rodas; callback = cbs)
   @test control.active
+  #= the Rodas methods by OrdinaryDiffEqCore's FSAL trait, not by name: Rodas4 and Rodas5P start a step from the
+     state alone; Rosenbrock23 and Rodas3 reuse the last step's derivative =#
+  local rosenbrock::Module = parentmodule(typeof(rodas))
+  @test CG._isRodas(rodas) && CG._isRodas(rosenbrock.Rodas4())
+  @test !CG._isRodas(rosenbrock.Rosenbrock23()) && !CG._isRodas(rosenbrock.Rodas3())
+  @test !CG._isRodas(OMBackend.OrdinaryDiffEqBDF.FBDF())
 
   #= The algebraic block from the problem's Jacobian: a precomputed pick of
      where jac[rows, rows] is stored (a sparse Jacobian's nonzeros, 0 for a

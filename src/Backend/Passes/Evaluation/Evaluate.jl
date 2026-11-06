@@ -58,7 +58,7 @@ struct StartValues
   "The right-hand sides of the equations that define parameters (or records of them) by name."
   defined::Dict{Symbol, IR.Expression}
   "Pure function calls interpreted so far: (function, arguments) to their outputs (`callValue`)."
-  calls::Dict{Tuple{Symbol, Vector{Dict{String, Float64}}}, Union{Nothing, Vector{Dict{String, Float64}}}}
+  calls::Dict{Tuple{Symbol, Vector{FlatValue}}, Union{Nothing, Vector{FlatValue}}}
 end
 
 function StartValues(variables::IR.VariableSet, functions::Vector{IR.ModelicaFunction}; parametersOnly::Bool = false,
@@ -71,7 +71,7 @@ function StartValues(variables::IR.VariableSet, functions::Vector{IR.ModelicaFun
   end
   return StartValues(variables, Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in functions),
                      Dict{Symbol, Union{Nothing, Float64}}(), parametersOnly, generic, defined,
-                     Dict{Tuple{Symbol, Vector{Dict{String, Float64}}}, Union{Nothing, Vector{Dict{String, Float64}}}}())
+                     Dict{Tuple{Symbol, Vector{FlatValue}}, Union{Nothing, Vector{FlatValue}}}())
 end
 
 "`values` at a generic point (`StartValues`' `generic`), a cache of its own (the pure calls' shared: their outputs depend on their arguments only)."
@@ -82,22 +82,48 @@ genericValues(values::StartValues)::StartValues =
 """
     definedValue(values, name) -> Union{Nothing, Float64}
 
-The value of the parameter `name` by the equation that defines it, or the record it is a field
-of (`R0 = planarFrame(a)` for `R0.T[1,2]`); `nothing` where none does or it does not evaluate.
+The value of the parameter `name` by the equation that defines it, or the record or array it is a
+part of (`R0 = planarFrame(a)` for `R0.T[1,2]`: the wholes of its reference, the longest first, `wholesOf`);
+`nothing` where none does or it does not evaluate.
 """
 function definedValue(values::StartValues, name::Symbol)::Union{Nothing, Float64}
   isempty(values.defined) && return nothing
-  local own = get(values.defined, name, nothing)
+  local own::Union{Nothing, IR.Expression} = get(values.defined, name, nothing)
   own === nothing || return evaluate(own, values)
-  local str = String(name)
-  for i in Iterators.reverse(collect(eachindex(str)))
-    str[i] in ('.', '[') || continue
-    local whole = get(values.defined, Symbol(str[1:prevind(str, i)]), nothing)
-    whole === nothing && continue
-    local v = valueOf(whole, Interpretation(values))
-    return v === nothing ? nothing : get(v, str[i:end], nothing)
+  local variable::Union{Nothing, IR.Variable} = get(values.variables, name, nothing)
+  variable === nothing && return nothing
+  for (whole::Symbol, path::Path) in wholesOf(variable.cref)
+    local definition::Union{Nothing, IR.Expression} = get(values.defined, whole, nothing)
+    definition === nothing && continue
+    local v::Union{Nothing, FlatValue} = valueOf(definition, Interpretation(values))
+    return v === nothing ? nothing : get(v, path, nothing)
   end
   return nothing
+end
+
+"""
+    wholesOf(ref) -> Vector{Tuple{Symbol, Path}}
+
+The records and arrays the reference `ref` is a part of, the longest first, each with the path from it to `ref`
+(`R0.T` and `[[1, 2]]`, `R0` and `[:T, [1, 2]]` of `R0.T[1,2]`): by its parts, a part's literal subscripts an
+element's step; a part subscripted otherwise ends the wholes.
+"""
+function wholesOf(ref::IR.ComponentRef)::Vector{Tuple{Symbol, Path}}
+  local out::Vector{Tuple{Symbol, Path}} = Tuple{Symbol, Path}[]
+  local rest::Path = Path()
+  for k in length(ref.parts):-1:1
+    local p::IR.CrefPart = ref.parts[k]
+    if !isempty(p.subscripts)
+      local index::Union{Nothing, Vector{Int}} = IR.literalIndices(p.subscripts)
+      index === nothing && return out
+      rest = vcat(Step[index], rest)
+      push!(out, (IR.ComponentRef(IR.CrefPart[ref.parts[1:k - 1]; IR.unsubscriptedPart(p)]).name, rest))
+    end
+    k > 1 || break
+    rest = vcat(Step[p.name], rest)
+    push!(out, (IR.ComponentRef(ref.parts[1:k - 1]).name, rest))
+  end
+  return out
 end
 
 """
@@ -250,7 +276,7 @@ function setsConstant(eq::IR.Equation, variables::IR.VariableSet)::Union{Nothing
   local (x, c) = isLiteral(eq.rhs) ? (eq.lhs, eq.rhs) : isLiteral(eq.lhs) ? (eq.rhs, eq.lhs) : (nothing, nothing)
   x isa IR.CREF || return nothing
   local v = get(variables, x.cref.name, nothing)
-  (v !== nothing && v.kind isa IR.ALGEBRAIC && v.ty isa IR.T_REAL) || return nothing
+  (v !== nothing && v.kind isa Union{IR.ALGEBRAIC, IR.ALGEBRAIC_DER} && v.ty isa IR.T_REAL) || return nothing
   return (x.cref.name, c)
 end
 

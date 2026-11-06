@@ -34,21 +34,47 @@
 */ =#
 
 #= Numeric evaluation of what does not fold into one expression: a function's algorithm run on
-   numbers (`callValue`), arrays and records. A value is flat: its scalars by the suffix of their
-   name, as the scalarized model and the function bodies name them (`""` a scalar, `"[1,2]"` an
-   array's element, `".T[1,1]"` an element of a record's field). Integers, Booleans and
+   numbers (`callValue`), arrays and records. A value is flat (`FlatValue`): its scalars by their paths,
+   the steps from the value to them (`[]` a scalar, `[[1, 2]]` an array's element, `[:T, [1, 1]]` an element of a
+   record's field); a function's variables by their names, a reference to one by its parts (`variablePath`), one
+   of the model by its reference with the subscripts evaluated (`resolvedReference`). Integers, Booleans and
    enumeration literals are numbers. Anything not handled gives `nothing`, never a throw: an
    external function, a String, a clock, an array of records in array arithmetic, a function as a
    function's output, a when-statement or reinit (not in a function). =#
 
-"A flat value: its scalars by the suffix of their name (`\"\"` a scalar, `\"[i,j]\"` an array's element, `\".f\"` a record's field)."
-const FlatValue = Dict{String, Float64}
+"The path of a scalar: no step."
+const SCALAR_PATH = Path()
 
 "The flat value of a scalar."
-scalarValue(x::Float64)::FlatValue = FlatValue("" => x)
+scalarValue(x::Float64)::FlatValue = FlatValue(SCALAR_PATH => x)
 
 "The scalar of a flat value; `nothing` for an array or a record."
-scalarOf(v::FlatValue)::Union{Nothing, Float64} = (length(v) == 1 && haskey(v, "")) ? v[""] : nothing
+scalarOf(v::FlatValue)::Union{Nothing, Float64} = (length(v) == 1 && haskey(v, SCALAR_PATH)) ? v[SCALAR_PATH] : nothing
+
+"`p` under the field `field`, or under the element `index` of an array (an array's element's indices after `index`: `[i, j]`)."
+underStep(field::Symbol, p::Path)::Path = vcat(Step[field], p)
+function underStep(index::Vector{Int}, p::Path)::Path
+  (!isempty(p) && p[1] isa Vector{Int}) && return vcat(Step[Int[index; p[1]::Vector{Int}]], @view p[2:end])
+  return vcat(Step[index], p)
+end
+
+"Whether the path `p` starts with the steps of `prefix`."
+function startsWith(p::Path, prefix::Path)::Bool
+  length(p) >= length(prefix) || return false
+  for k in eachindex(prefix)
+    p[k] == prefix[k] || return false
+  end
+  return true
+end
+
+"The part of the flat value `v` at `path` (its scalars under it, by the rest of their paths), a new value."
+function selectPath(v::FlatValue, path::Path)::FlatValue
+  local out::FlatValue = FlatValue()
+  for (p::Path, y::Float64) in v
+    startsWith(p, path) && (out[p[length(path) + 1:end]] = y)
+  end
+  return out
+end
 
 "The statements one interpretation runs at most, and the calls it nests at most (a loop or a recursion that does not end)."
 const MAX_INTERPRETED_STEPS = 100_000
@@ -61,16 +87,16 @@ struct PartialCall
 end
 
 """
-    Interpretation(values, scalars, functionArguments, steps, depth, inFunction)
+    Interpretation(values, variables, functionArguments, steps, depth, inFunction)
 
-One numeric evaluation: `scalars` the values of the running function's variables by flat name
-(`T[1,1]`, `R.T[2,3]`, `Q[4]`, a for-loop's iterator), `functionArguments` its inputs that are
-functions; outside a function (`inFunction` false) other names are the model's, by `values`
-(their start). `steps` the statements run so far, `depth` the calls nested.
+One numeric evaluation: `variables` the values of the running function's variables by their names (`T`, `R`, `Q`,
+a for-loop's iterator), `functionArguments` its inputs that are functions; outside a function (`inFunction`
+false) other references are the model's, by `values` (their start). `steps` the statements run so far, `depth`
+the calls nested.
 """
 mutable struct Interpretation
   values::StartValues
-  scalars::Dict{Symbol, Float64}
+  variables::Dict{Symbol, FlatValue}
   functionArguments::Dict{Symbol, PartialCall}
   steps::Int
   depth::Int
@@ -78,7 +104,7 @@ mutable struct Interpretation
 end
 
 "An interpretation of an expression of the model (not in a function), its names read at `values`."
-Interpretation(values::StartValues) = Interpretation(values, Dict{Symbol, Float64}(), Dict{Symbol, PartialCall}(), 0, 0, false)
+Interpretation(values::StartValues) = Interpretation(values, Dict{Symbol, FlatValue}(), Dict{Symbol, PartialCall}(), 0, 0, false)
 
 """
     interpretScalar(e, values) -> Union{Nothing, Float64}
@@ -116,8 +142,8 @@ function valueOf(e::IR.Expression, run::Interpretation)::Union{Nothing, FlatValu
     for (field, x) in zip(e.ty.fields, e.elements)
       local v = valueOf(x, run)
       v === nothing && return nothing
-      for (s, y) in v
-        out[string(".", field.name, s)] = y
+      for (s::Path, y::Float64) in v
+        out[underStep(field.name, s)] = y
       end
     end
     return out
@@ -199,14 +225,14 @@ function valueOf(e::IR.Expression, run::Interpretation)::Union{Nothing, FlatValu
   return nothing
 end
 
-"The flat value of an array literal's elements (`[i]` before each element's suffix)."
+"The flat value of an array literal's elements (each element's paths under its index, `underStep`)."
 function elementsValue(elements::Vector{IR.Expression}, run::Interpretation)::Union{Nothing, FlatValue}
   local out = FlatValue()
   for (i, x) in enumerate(elements)
     local v = valueOf(x, run)
     v === nothing && return nothing
-    for (s, y) in v
-      out[isempty(s) ? "[$i]" : startswith(s, "[") ? string("[", i, ",", SubString(s, 2)) : string("[", i, "]", s)] = y
+    for (s::Path, y::Float64) in v
+      out[underStep(Int[i], s)] = y
     end
   end
   return out
@@ -215,47 +241,70 @@ end
 """
     crefValue(e, run) -> Union{Nothing, FlatValue}
 
-A reference's value: its name with the subscripts evaluated (`c[k]`, `R.T[i,i]` in a loop); in a
-function, its variables' scalars (a whole array or record by its elements); outside one, the
-model's start value (`time` 0), a whole record or array of the model element by element.
+A reference's value, its subscripts evaluated (`c[k]`, `R.T[i,i]` in a loop): a variable of `run` (a function's,
+an iterator) at the reference's path (`variablePath`: a whole array or record by its elements); outside a
+function, else the model's start value of the reference (`resolvedReference`; `time` 0), a whole record or array
+of the model element by element.
 """
 function crefValue(e::IR.CREF, run::Interpretation)::Union{Nothing, FlatValue}
-  local name = resolvedName(e.cref, run)
-  if name === nothing
+  local indices::Union{Nothing, Vector{Vector{Int}}} = partIndices(e.cref, run)
+  if indices === nothing
     #= a slice or a whole dimension (`x[2:3]`, `A[:, 1]`) of the last part: the selection of the whole =#
     local last = e.cref.parts[end]
-    (isempty(last.subscripts) || any(p -> !isempty(p.subscripts), e.cref.parts[1:end - 1])) && return nothing
-    local whole = IR.CREF(IR.ComponentRef(IR.CrefPart[e.cref.parts[1:end - 1]..., IR.CrefPart(last.name, IR.Subscript[], last.ty)]), last.ty)
-    local v = crefValue(whole, run)
-    return v === nothing ? nothing : selectValue(v, last.subscripts, run)
+    (isempty(last.subscripts) || any(IR.isSubscripted, @view e.cref.parts[1:end - 1])) && return nothing
+    local array::IR.CREF = IR.CREF(IR.withoutLastSubscripts(e.cref), last.ty)
+    local arrayValue::Union{Nothing, FlatValue} = crefValue(array, run)
+    return arrayValue === nothing ? nothing : selectValue(arrayValue, last.subscripts, run)
   end
-  local x = get(run.scalars, Symbol(name), nothing)
-  x === nothing || return scalarValue(x)
-  local whole = prefixValue(run.scalars, name)
-  isempty(whole) || return whole
+  local own::Union{Nothing, FlatValue} = get(run.variables, e.cref.parts[1].name, nothing)
+  if own !== nothing
+    local v::FlatValue = selectPath(own, variablePath(e.cref, indices))
+    isempty(v) || return v
+  end
   run.inFunction && return nothing
-  name == "time" && return scalarValue(0.0)
-  e.ty isa Union{IR.T_RECORD, IR.T_ARRAY} && return wholeValue(name, e.ty, run.values)
-  local v = run.values(Symbol(name))
-  return v === nothing ? nothing : scalarValue(v)
+  local ref::IR.ComponentRef = resolvedReference(e.cref, indices)
+  ref.name === :time && return scalarValue(0.0)
+  e.ty isa Union{IR.T_RECORD, IR.T_ARRAY} && return wholeValue(ref, e.ty, run.values)
+  local x::Union{Nothing, Float64} = run.values(ref.name)
+  return x === nothing ? nothing : scalarValue(x)
 end
 
-"The flat name of a reference, its subscripts evaluated in `run` (as `flatName`); `nothing` where one does not evaluate to an index."
-function resolvedName(cref::IR.ComponentRef, run::Interpretation)::Union{Nothing, String}
-  all(p -> isempty(p.subscripts), cref.parts) && return String(cref.name)
-  local io = IOBuffer()
-  for (i, p) in enumerate(cref.parts)
-    i > 1 && print(io, '.')
+"The indices of the parts' subscripts, evaluated in `run` (none for a part without); `nothing` where one is no single index."
+function partIndices(cref::IR.ComponentRef, run::Interpretation)::Union{Nothing, Vector{Vector{Int}}}
+  local out::Vector{Vector{Int}} = Vector{Vector{Int}}(undef, length(cref.parts))
+  for (k::Int, p::IR.CrefPart) in enumerate(cref.parts)
     if isempty(p.subscripts)
-      print(io, p.name)
+      out[k] = Int[]
       continue
     end
-    local index = subscriptIndices(p.subscripts, run)
+    local index::Union{Nothing, Vector{Int}} = subscriptIndices(p.subscripts, run)
     index === nothing && return nothing
-    #= a part of rolled components by its member (`cylinder3`), as `flatName` =#
-    (p.ty isa IR.T_COMPONENTS && length(index) == 1) ? print(io, p.ty.members[index[1]]) : print(io, p.name, '[', join(index, ','), ']')
+    out[k] = index
   end
-  return String(take!(io))
+  return out
+end
+
+"""
+    variablePath(cref, indices) -> Path
+
+The path of the reference `cref` in the value of its first part's variable, its parts' subscripts at `indices`
+(`partIndices`): its first part's indices, then each other part's field and indices (`[[2], :x]` of `c[2].x`).
+"""
+function variablePath(cref::IR.ComponentRef, indices::Vector{Vector{Int}})::Path
+  local out::Path = Path()
+  for (k::Int, p::IR.CrefPart) in enumerate(cref.parts)
+    k > 1 && push!(out, p.name)
+    isempty(indices[k]) || push!(out, indices[k])
+  end
+  return out
+end
+
+"The reference `cref` with its subscripts as the literal `indices` (`partIndices`): a variable's of the model (`c[2].x` of `c[k].x`; a part of rolled components the member, `IR.CrefPart`)."
+function resolvedReference(cref::IR.ComponentRef, indices::Vector{Vector{Int}})::IR.ComponentRef
+  all(isempty, indices) && return cref
+  return IR.ComponentRef(IR.CrefPart[isempty(indices[k]) ? p :
+                                     IR.CrefPart(p.name, IR.Subscript[IR.INDEX(IR.INTEGER(i)) for i in indices[k]], p.ty)
+                                     for (k::Int, p::IR.CrefPart) in enumerate(cref.parts)])
 end
 
 "The indices of subscripts that are single indices; `nothing` for a slice, a whole dimension or an index that does not evaluate."
@@ -331,16 +380,16 @@ function iterate!(visit::F, iterators::Vector{IR.Iterator}, run::Interpretation)
     xs === nothing && return false
     push!(items, xs)
   end
-  local previous = Union{Nothing, Float64}[get(run.scalars, it.name, nothing) for it in iterators]
+  local previous = Union{Nothing, FlatValue}[get(run.variables, it.name, nothing) for it in iterators]
   local ok = true
   for I in CartesianIndices(Tuple(length.(items)))
     for (k, it) in enumerate(iterators)
-      run.scalars[it.name] = items[k][I[k]]
+      run.variables[it.name] = scalarValue(items[k][I[k]])
     end
     visit(collect(Tuple(I))) || (ok = false; break)
   end
   for (it, x) in zip(iterators, previous)
-    x === nothing ? delete!(run.scalars, it.name) : (run.scalars[it.name] = x)
+    x === nothing ? delete!(run.variables, it.name) : (run.variables[it.name] = x)
   end
   return ok
 end
@@ -368,32 +417,22 @@ function reductionValue(e::IR.REDUCTION, run::Interpretation)::Union{Nothing, Fl
   return acc[]
 end
 
-"The scalars under `name` (`name[...]`, `name.field`) as a flat value of their suffixes."
-function prefixValue(scalars::Dict{Symbol, Float64}, name::String)::FlatValue
-  local out = FlatValue()
-  for (k, x) in scalars
-    local s = String(k)
-    (length(s) > length(name) && startswith(s, name) && s[length(name) + 1] in ('[', '.')) || continue
-    out[s[length(name) + 1:end]] = x
-  end
-  return out
-end
-
 """
-    wholeValue(name, ty, values) -> Union{Nothing, FlatValue}
+    wholeValue(ref, ty, values) -> Union{Nothing, FlatValue}
 
 A whole record or array of the model (a reference the scalarized model keeps as a function's
-argument, `Frames.to_Q(body.R_start, ...)`) from the start values of its scalars.
+argument, `Frames.to_Q(body.R_start, ...)`) from the start values of its scalars (their references:
+`IR.withField`, `IR.elementCref`).
 """
-function wholeValue(name::String, ty::IR.ModelicaType, values::StartValues)::Union{Nothing, FlatValue}
+function wholeValue(ref::IR.ComponentRef, ty::IR.ModelicaType, values::StartValues)::Union{Nothing, FlatValue}
   local out = FlatValue()
-  return collectWhole!(out, name, "", ty, values) ? out : nothing
+  return collectWhole!(out, ref, Path(), ty, values) ? out : nothing
 end
 
-"`collectWhole!`'s step: the scalars of `name * suffix` of type `ty` into `out`; whether all evaluated."
-function collectWhole!(out::FlatValue, name::String, suffix::String, ty::IR.ModelicaType, values::StartValues)::Bool
+"`collectWhole!`'s step: the scalars of the reference `ref` (at `path` in the whole) of type `ty` into `out`; whether all evaluated."
+function collectWhole!(out::FlatValue, ref::IR.ComponentRef, path::Path, ty::IR.ModelicaType, values::StartValues)::Bool
   if ty isa IR.T_RECORD
-    return all(f -> collectWhole!(out, name, string(suffix, ".", f.name), f.ty, values), ty.fields)
+    return all(f -> collectWhole!(out, IR.withField(ref, f.name, f.ty), vcat(path, Step[f.name]), f.ty, values), ty.fields)
   elseif ty isa IR.T_ARRAY
     local sizes = Int[]
     for d in IR.dimensions(ty)
@@ -401,26 +440,27 @@ function collectWhole!(out::FlatValue, name::String, suffix::String, ty::IR.Mode
       n === nothing && return false
       push!(sizes, n)
     end
-    return all(I -> collectWhole!(out, name, string(suffix, "[", join(Tuple(I), ','), "]"), IR.elementType(ty), values),
+    return all(I -> (local index::Vector{Int} = collect(Tuple(I));
+                     collectWhole!(out, IR.elementCref(ref, index), vcat(path, Step[index]), IR.elementType(ty), values)),
                CartesianIndices(Tuple(sizes)))
   end
-  local x = values(Symbol(name, suffix))
+  local x = values(ref.name)
   x === nothing && return false
-  out[suffix] = x
+  out[path] = x
   return true
 end
 
 "The element of a flat value at `index` (all its dimensions: a scalar; fewer: the rest of the array, or a record element's fields)."
 function elementOf(v::FlatValue, index::Vector{Int})::Union{Nothing, FlatValue}
-  local p = string("[", join(index, ','))
+  local n::Int = length(index)
   local out = FlatValue()
-  for (s, y) in v
-    if s == p * "]"
-      out[""] = y
-    elseif startswith(s, p * ",")
-      out[string("[", SubString(s, length(p) + 2))] = y
-    elseif startswith(s, p * "]")
-      out[s[length(p) + 2:end]] = y
+  for (p::Path, y::Float64) in v
+    (!isempty(p) && p[1] isa Vector{Int}) || continue
+    local first::Vector{Int} = p[1]::Vector{Int}
+    if first == index
+      out[p[2:end]] = y
+    elseif length(first) > n && first[1:n] == index
+      out[vcat(Step[first[n + 1:end]], @view p[2:end])] = y
     end
   end
   return isempty(out) ? nothing : out
@@ -428,14 +468,9 @@ end
 
 "The field `field` of a record's flat value."
 function flatField(v::FlatValue, field::Symbol)::Union{Nothing, FlatValue}
-  local p = string(".", field)
   local out = FlatValue()
-  for (s, y) in v
-    if s == p
-      out[""] = y
-    elseif startswith(s, p) && s[length(p) + 1] in ('[', '.')
-      out[s[length(p) + 1:end]] = y
-    end
+  for (p::Path, y::Float64) in v
+    (!isempty(p) && p[1] === field) && (out[p[2:end]] = y)
   end
   return isempty(out) ? nothing : out
 end
@@ -443,20 +478,16 @@ end
 """
     toArray(v) -> Union{Nothing, Array{Float64}}
 
-A flat value of array elements (`[i,j]` suffixes, every index present) as an array; `nothing`
+A flat value of array elements (each path one step of indices, every index present) as an array; `nothing`
 for a scalar, a record or an incomplete array.
 """
 function toArray(v::FlatValue)::Union{Nothing, Array{Float64}}
   isempty(v) && return nothing
   local entries = Tuple{Vector{Int}, Float64}[]
-  for (s, y) in v
-    (startswith(s, "[") && endswith(s, "]")) || return nothing
-    local index = Int[]
-    for p in split(SubString(s, 2, lastindex(s) - 1), ',')
-      local k = tryparse(Int, p)
-      (k === nothing || k < 1) && return nothing
-      push!(index, k)
-    end
+  for (p::Path, y::Float64) in v
+    (length(p) == 1 && p[1] isa Vector{Int}) || return nothing
+    local index::Vector{Int} = p[1]::Vector{Int}
+    any(k::Int -> k < 1, index) && return nothing
     push!(entries, (index, y))
   end
   local n = length(first(first(entries)))
@@ -470,9 +501,9 @@ function toArray(v::FlatValue)::Union{Nothing, Array{Float64}}
   return A
 end
 
-"An array as a flat value (`[i,j]` suffixes)."
+"An array as a flat value (each element's path its indices)."
 function fromArray(A::AbstractArray{<:Real})::FlatValue
-  return FlatValue(string("[", join(Tuple(I), ','), "]") => Float64(A[I]) for I in CartesianIndices(A))
+  return FlatValue(Step[collect(Tuple(I))] => Float64(A[I]) for I in CartesianIndices(A))
 end
 
 """
@@ -569,9 +600,8 @@ function constructorValue(e::IR.ARRAY_CONSTRUCTOR, run::Interpretation)::Union{N
   local ok = iterate!(e.iterators, run) do position
     local v = valueOf(e.body, run)
     v === nothing && return false
-    local index = join(position, ',')
-    for (s, y) in v
-      out[isempty(s) ? "[$index]" : startswith(s, "[") ? string("[", index, ",", SubString(s, 2)) : string("[", index, "]", s)] = y
+    for (s::Path, y::Float64) in v
+      out[underStep(position, s)] = y
     end
     return true
   end
@@ -766,7 +796,7 @@ end
 "`callValue`'s run of `f`: its inputs `given` (by name; the others their defaults), its outputs' and locals' bindings, its algorithm; its outputs' values."
 function runFunction(f::IR.ModelicaFunction, given::Dict{Symbol, Union{FlatValue, PartialCall}},
                      run::Interpretation)::Union{Nothing, Vector{FlatValue}}
-  local inner = Interpretation(run.values, Dict{Symbol, Float64}(), Dict{Symbol, PartialCall}(), 0, run.depth + 1, true)
+  local inner = Interpretation(run.values, Dict{Symbol, FlatValue}(), Dict{Symbol, PartialCall}(), 0, run.depth + 1, true)
   for v in f.inputs
     local value = get(given, v.name, nothing)
     if value === nothing
@@ -774,39 +804,47 @@ function runFunction(f::IR.ModelicaFunction, given::Dict{Symbol, Union{FlatValue
       value = v.ty isa IR.T_FUNCTION ? functionArgument(v.binding, inner) : valueOf(v.binding, inner)
       value === nothing && return nothing
     end
-    value isa PartialCall ? (inner.functionArguments[v.name] = value) : bind!(inner, String(v.name), value)
+    value isa PartialCall ? (inner.functionArguments[v.name] = value) : bind!(inner, v.name, SCALAR_PATH, value)
   end
   #= a binding that does not evaluate leaves the variable to the algorithm; a record without one its fields' defaults =#
   for v in vcat(f.outputs, f.locals)
     if v.binding !== nothing
       local value = valueOf(v.binding, inner)
-      value === nothing || bind!(inner, String(v.name), value)
+      value === nothing || bind!(inner, v.name, SCALAR_PATH, value)
     else
       for (field, x) in v.fieldBindings
         local value = valueOf(x, inner)
-        value === nothing || bind!(inner, string(v.name, ".", field), value)
+        value === nothing || bind!(inner, v.name, Step[field], value)
       end
     end
   end
   runStatements!(f.body, inner) === :fail && return nothing
   local outputs = FlatValue[]
   for v in f.outputs
-    local x = get(inner.scalars, v.name, nothing)
-    local value = x === nothing ? prefixValue(inner.scalars, String(v.name)) : scalarValue(x)
-    isempty(value) && return nothing
-    push!(outputs, value)
+    local value::Union{Nothing, FlatValue} = get(inner.variables, v.name, nothing)
+    (value === nothing || isempty(value)) && return nothing
+    push!(outputs, copy(value))
   end
   return outputs
 end
 
-"The variable `name` given the value `v` in `run`: its old scalars (a whole array assigned again) removed."
-function bind!(run::Interpretation, name::String, v::FlatValue)::Nothing
-  delete!(run.scalars, Symbol(name))
-  for k in collect(keys(prefixValue(run.scalars, name)))
-    delete!(run.scalars, Symbol(name, k))
+"""
+    bind!(run, name, path, v)
+
+The variable `name` given the value `v` at `path` (`SCALAR_PATH`: the whole variable; an element, a field): its
+old scalars there (a whole array assigned again) removed. A copy: values read stay apart (`selectPath`).
+"""
+function bind!(run::Interpretation, name::Symbol, path::Path, v::FlatValue)::Nothing
+  if isempty(path)
+    run.variables[name] = copy(v)
+    return nothing
   end
-  for (s, y) in v
-    run.scalars[Symbol(name, s)] = y
+  local own::FlatValue = get!(FlatValue, run.variables, name)
+  for p in collect(keys(own))
+    startsWith(p, path) && delete!(own, p)
+  end
+  for (s::Path, y::Float64) in v
+    own[vcat(path, s)] = y
   end
   return nothing
 end
@@ -831,11 +869,11 @@ end
 
 function runStatement!(st::IR.ASSIGNMENT, run::Interpretation)::Symbol
   if st.lhs isa IR.CREF
-    local name = resolvedName(st.lhs.cref, run)
+    local indices::Union{Nothing, Vector{Vector{Int}}} = partIndices(st.lhs.cref, run)
     local v = valueOf(st.rhs, run)
     v === nothing && return :fail
-    name === nothing && return assignSelection!(st.lhs.cref, v, run)
-    bind!(run, name, v)
+    indices === nothing && return assignSelection!(st.lhs.cref, v, run)
+    bind!(run, st.lhs.cref.parts[1].name, variablePath(st.lhs.cref, indices), v)
     return :ok
   elseif st.lhs isa IR.TUPLE && st.rhs isa IR.CALL && !st.rhs.attributes.builtin
     local outputs = callValue(st.rhs, run)
@@ -843,9 +881,9 @@ function runStatement!(st::IR.ASSIGNMENT, run::Interpretation)::Symbol
     for (target, v) in zip(st.lhs.elements, outputs)
       target isa IR.WILD && continue
       target isa IR.CREF || return :fail
-      local name = resolvedName(target.cref, run)
-      name === nothing && return :fail
-      bind!(run, name, v)
+      local indices::Union{Nothing, Vector{Vector{Int}}} = partIndices(target.cref, run)
+      indices === nothing && return :fail
+      bind!(run, target.cref.parts[1].name, variablePath(target.cref, indices), v)
     end
     return :ok
   end
@@ -860,10 +898,14 @@ An assignment to a slice or a whole dimension of an array variable's last part (
 """
 function assignSelection!(cref::IR.ComponentRef, v::FlatValue, run::Interpretation)::Symbol
   local last = cref.parts[end]
-  (isempty(last.subscripts) || any(p -> !isempty(p.subscripts), cref.parts[1:end - 1])) && return :fail
-  local base = resolvedName(IR.ComponentRef(IR.CrefPart[cref.parts[1:end - 1]..., IR.CrefPart(last.name, IR.Subscript[], last.ty)]), run)
-  base === nothing && return :fail
-  local A = toArray(prefixValue(run.scalars, base))
+  (isempty(last.subscripts) || any(IR.isSubscripted, @view cref.parts[1:end - 1])) && return :fail
+  local base::IR.ComponentRef = IR.withoutLastSubscripts(cref)
+  local indices::Union{Nothing, Vector{Vector{Int}}} = partIndices(base, run)
+  indices === nothing && return :fail
+  local name::Symbol = base.parts[1].name
+  local path::Path = variablePath(base, indices)
+  local own::Union{Nothing, FlatValue} = get(run.variables, name, nothing)
+  local A = own === nothing ? nothing : toArray(selectPath(own, path))
   local sel = selections(last.subscripts, run)
   (A === nothing || sel === nothing || length(sel) > ndims(A)) && return :fail
   local full = vcat(sel, fill(Colon(), ndims(A) - length(sel)))
@@ -876,7 +918,7 @@ function assignSelection!(cref::IR.ComponentRef, v::FlatValue, run::Interpretati
     (B === nothing || length(B) != length(view(A, full...))) && return :fail
     A[full...] = reshape(B, size(view(A, full...)))
   end
-  bind!(run, base, fromArray(A))
+  bind!(run, name, path, fromArray(A))
   return :ok
 end
 
@@ -895,15 +937,15 @@ function runStatement!(st::IR.FOR_STATEMENT, run::Interpretation)::Symbol
   local items = range === nothing ? nothing : toArray(range)
   (items === nothing || ndims(items) != 1) && return :fail
   local name = st.iterator.name
-  local previous = get(run.scalars, name, nothing)
+  local previous::Union{Nothing, FlatValue} = get(run.variables, name, nothing)
   local status = :ok
   for k in items
-    run.scalars[name] = k
+    run.variables[name] = scalarValue(k)
     status = runStatements!(st.body, run)
     status === :break && (status = :ok; break)
     status === :ok || break
   end
-  previous === nothing ? delete!(run.scalars, name) : (run.scalars[name] = previous)
+  previous === nothing ? delete!(run.variables, name) : (run.variables[name] = previous)
   return status
 end
 

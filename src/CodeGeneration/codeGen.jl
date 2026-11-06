@@ -269,7 +269,7 @@ function _discreteTimeEventThreshold(cond::SC.Exp, simCode::SC.SIM_CODE)::Union{
     entry === nothing && return nothing
     if SC.isDiscrete(last(entry))
       hasDiscrete = true
-    elseif !SC.isParameter(last(entry))
+    elseif !SC.isScalarParameter(last(entry))
       return nothing
     end
   end
@@ -284,7 +284,7 @@ function _isConstChangeArg(a::SC.Exp, simCode::SC.SIM_CODE)::Bool
   a isa Union{SC.RCONST, SC.ICONST, SC.BCONST} && return true
   a isa SC.EXP_CREF || return false
   local entry = get(simCode.stringToSimVarHT, SC.crefName(a.cref), nothing)
-  return entry !== nothing && SC.isParameter(last(entry))
+  return entry !== nothing && SC.isScalarParameter(last(entry))
 end
 
 """
@@ -1076,7 +1076,7 @@ function _changeMemoryUpdates(names::Vector{String}, simCode::SC.SIM_CODE, state
   local out = Expr[]
   for n in names
     local entry = get(simCode.stringToSimVarHT, n, nothing)
-    (entry === nothing || SC.isParameter(last(entry))) && continue
+    (entry === nothing || SC.isScalarParameter(last(entry))) && continue
     local sym = QuoteNode(Symbol(last(entry).name))
     push!(out, quote
       let _idx = get(lookuptableStates, $(sym), nothing)
@@ -1136,7 +1136,7 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, ti
      input, a threshold block's output, read by `y = if u then time - entryTime ...`). =#
   local useLatch = any(condCrefs) do c
     local entry = get(simCode.stringToSimVarHT, c, nothing)
-    c in bareCrefs && entry !== nothing && !SC.isParameter(last(entry))
+    c in bareCrefs && entry !== nothing && !SC.isScalarParameter(last(entry))
   end
   #= A DiscreteCallback condition returns a Bool (SciMLBase): a Boolean discrete is a Float64 in
      `integrator.u` (0.0/1.0), a bare reference a Float64 ("non-boolean (Float64) used in
@@ -1149,7 +1149,7 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, ti
   local changeSeedPairs = Expr[]
   for c in condCrefs
     local entry = get(simCode.stringToSimVarHT, c, nothing)
-    (entry === nothing || SC.isParameter(last(entry))) && continue
+    (entry === nothing || SC.isScalarParameter(last(entry))) && continue
     push!(changeSeedPairs, :($(QuoteNode(Symbol(last(entry).name))) => $(_readStartAttributeAsLiteral(last(entry)))))
   end
   quote
@@ -1295,8 +1295,8 @@ function expToJuliaExp(e::SC.EXP_CREF, simCode::SC.SIM_CODE; varPrefix::String =
   name == "time" && return quote t end
   local (index, v) = simCode.stringToSimVarHT[name]
   local k = v.varKind
-  k isa SC.PARAMETER && return quote p[$index] end
-  k isa Union{SC.STATE, SC.ALG_VARIABLE, SC.DISCRETE} && return quote $(Meta.parse(varPrefix))[$index] end
+  SC.isScalarParameter(v) && return quote p[$index] end
+  (k isa Union{SC.STATE, SC.ALG_VARIABLE, SC.DISCRETE} && !SC.isArrayAlgebraic(v)) && return quote $(Meta.parse(varPrefix))[$index] end
   k isa SC.STATE_DERIVATIVE && return quote $(Symbol("dx", varSuffix))[$index] end
   k isa Union{SC.DATA_STRUCTURE, SC.STRING} && return quote $(Symbol(v.name)) end
   unsupported("a reference to a $(nameof(typeof(k))) over the solver's arrays", name)

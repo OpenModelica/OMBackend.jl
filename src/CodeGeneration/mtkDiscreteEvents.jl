@@ -587,7 +587,7 @@ function _discreteStartValue(sv::SC.SIMVAR, simCode::SC.SIM_CODE)::Union{Float64
   local entry = get(simCode.stringToSimVarHT, SC.crefName(start.cref), nothing)
   entry === nothing && return nothing
   local k = last(entry).varKind
-  (k isa SC.PARAMETER && k.bindExp !== nothing) || return nothing
+  SC.hasBindingExp(last(entry)) || return nothing
   return _foldParameterBindStatic(k.bindExp, simCode)
 end
 
@@ -667,7 +667,7 @@ function freeParametersDecl(simCode::SC.SIM_CODE)::Expr
   local names = String[]
   local assignedNames = String[]
   for (key, (_, sv)) in simCode.stringToSimVarHT
-    (SC.isParameter(sv) && !SC.hasBindingExp(sv)) || continue
+    (SC.isScalarParameter(sv) && !SC.hasBindingExp(sv)) || continue
     if key in assigned
       push!(assignedNames, sv.name)
     elseif sv.elementType isa SC.TYPE_REAL && sv.attributes.fixed == SC.BCONST(false)
@@ -719,7 +719,7 @@ function userPinsDecl(simCode::SC.SIM_CODE, relayAliases::AbstractDict)::Expr
     #= A parameter right side (a tunable one stays a reference) is a pin too; a conflict with a
        fixed start is then checked at the build and per run (DirectRHSGeneration's
        _collectHardInitializationValues), here only a literal's. =#
-    (rhs isa Number || (rhsEntry !== nothing && SC.isParameter(last(rhsEntry)))) || continue
+    (rhs isa Number || (rhsEntry !== nothing && SC.isScalarParameter(last(rhsEntry)))) || continue
     #= A fixed start and an initial equation that give one variable two values (`x(start = 1,
        fixed = true)` and `x = 2`): the initialization took the equation's without a word;
        OpenModelica refuses it. =#
@@ -797,9 +797,9 @@ circuit's own current and voltage.
 """
 function _modelHasSwitchClusters(simCode::SC.SIM_CODE)::Bool
   local ht = simCode.stringToSimVarHT
-  local names = (exps...) -> (local ns = OrderedSet{String}(); foreach(e -> SC.crefNames!(ns, e), exps); ns)
+  local names = (exps...) -> (local ns = OrderedSet{String}(); foreach(e -> SC.identifierNames!(ns, e), exps); ns)
   local isAlgebraic = name -> haskey(ht, name) && last(ht[name]).varKind isa SC.ALG_VARIABLE
-  local isUnknown = name -> haskey(ht, name) && !SC.isParameter(last(ht[name]))
+  local isUnknown = name -> haskey(ht, name) && !SC.isScalarParameter(last(ht[name]))
   local ifConds = [names((b.condition for b in ifEq.branches)...) for ifEq in simCode.ifEquations]
   #= Per candidate operand: the names that make an equation the cluster's own. =#
   local own = Dict{String, Set{String}}()
@@ -927,7 +927,8 @@ table residual's pre(x) lowers to x, omc's state between events: the table's lef
 t >= x, the new segment after this affect. `atInit` lowers `initial()` to true for the run at
 the start of a solve. The state before the instant is taken before the affect writes (pre()
 of what it sets, read by a when it triggers at the same instant: `e = edge(b)` with b set
-here stayed false).
+here stayed false). A variable assigned twice (a lifted body's start `x := pre(x)`, then its value) is set once, to
+its last value (MSL Interaction1's `timeTable.last`: a field of the named tuple twice did not parse).
 """
 function _selfSchedAffectParts(weq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE; atInit::Bool = false)
   local obsAcc = Dict{Symbol, Symbol}()
@@ -942,7 +943,12 @@ function _selfSchedAffectParts(weq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE; atIn
     local xn = SC.crefName(st.left.cref)
     local xsym = Symbol(xn)
     local vsym = Symbol("_v_", xn)
-    push!(stmts, :(local $(vsym) = $(_affectValue(st.right, obsAcc, simCode; initVal = atInit, subst))))
+    local value = _affectValue(st.right, obsAcc, simCode; initVal = atInit, subst)
+    if xsym in modNames
+      push!(stmts, :($(vsym) = $(value)))
+      continue
+    end
+    push!(stmts, :(local $(vsym) = $(value)))
     push!(retKws, Expr(:kw, xsym, vsym))
     push!(modNames, xsym)
     subst[xsym] = vsym
@@ -1055,7 +1061,7 @@ function emitAssertCallback(simCode::SC.SIM_CODE)::Expr
     local msg = _assertMessageExpr(a.message, obsAcc, simCode)
     local timeVarying = _exprMentions(cond, :integrator) || any(keys(obsAcc)) do k
       local e = get(simCode.stringToSimVarHT, string(k), nothing)
-      e === nothing || !(last(e).varKind isa Union{SC.PARAMETER, SC.ARRAY_PARAMETER})
+      e === nothing || !(last(e).varKind isa SC.PARAMETER)
     end
     local obsNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, k, QuoteNode(v)) for (k, v) in obsAcc]...))
     push!(entries, :(OMBackend.CodeGeneration.ModelicaAssert($(obsNT),
@@ -1066,7 +1072,9 @@ function emitAssertCallback(simCode::SC.SIM_CODE)::Expr
                                                              $(Expr(:tuple, (:((observed, integrator) -> $(c)) for c in crossings)...)))))
   end
   isempty(entries) && return Expr(:block)
-  return :(callbacks = OMBackend.CodeGeneration.withAssertCallback(callbacks, problem, [$(entries...)]))
+  #= the discrete variables: within a step that ends at an event their values are the step's (asserts.jl) =#
+  local discrete::Vector{Symbol} = sort!(Symbol[Symbol(n) for (n, (_, v)) in simCode.stringToSimVarHT if v.varKind isa SC.DISCRETE])
+  return :(callbacks = OMBackend.CodeGeneration.withAssertCallback(callbacks, problem, [$(entries...)]; discrete = $(discrete)))
 end
 
 _isEffectCall(e::SC.Exp)::Bool = e isa SC.CALL && e.ty isa SC.TYPE_NORETCALL
@@ -1181,7 +1189,7 @@ function _withoutContinuousOperand(rel::SC.Exp, simCode::SC.SIM_CODE)::Bool
     name == "time" && continue
     local entry = get(simCode.stringToSimVarHT, name, nothing)
     entry === nothing && return false
-    (SC.isDiscrete(last(entry)) || SC.isParameter(last(entry))) || return false
+    (SC.isDiscrete(last(entry)) || SC.isScalarParameter(last(entry))) || return false
   end
   return true
 end
@@ -1218,12 +1226,12 @@ struct _EquationGraph
 end
 
 function _equationGraph(simCode::SC.SIM_CODE)::_EquationGraph
-  local names = OrderedSet{String}[SC.crefNames!(OrderedSet{String}(), eq.exp) for eq in simCode.residualEquations]
+  local names = OrderedSet{String}[SC.identifierNames!(OrderedSet{String}(), eq.exp) for eq in simCode.residualEquations]
   for ifEq in simCode.ifEquations
     local ns = OrderedSet{String}()
     for b in ifEq.branches
-      SC.crefNames!(ns, b.condition)
-      foreach(eq -> SC.crefNames!(ns, eq.exp), b.residualEquations)
+      SC.identifierNames!(ns, b.condition)
+      foreach(eq -> SC.identifierNames!(ns, eq.exp), b.residualEquations)
     end
     push!(names, ns)
   end
@@ -1233,7 +1241,7 @@ function _equationGraph(simCode::SC.SIM_CODE)::_EquationGraph
   end
   local fixed = Set{String}(["time"])
   for (n, (_, v)) in simCode.stringToSimVarHT
-    SC.isParameter(v) && push!(fixed, n)
+    SC.isScalarParameter(v) && push!(fixed, n)
   end
   union!(fixed, _collectWhenAssignedNames(simCode))
   return _EquationGraph(names, occurs, fixed)
@@ -1266,12 +1274,39 @@ function _clusterCoupled(members::Vector{String}, reads::OrderedSet{String}, g::
 end
 
 """
+    _absProbes(rels, simCode) -> Vector{SC.RELATION}
+
+A relation `a >= 0` for each relation of `rels` that bounds an `abs(a)` of a continuous `a`
+from above (`abs(a) <= b`, `abs(a) < b`, `b >= abs(a)`, `b > abs(a)`): a probe the cluster
+buffers and its body does not read. Such a relation with a small b holds only in a narrow
+window around a = 0 (MSL CloserWithArc's arc-out `abs(i) <= abs(v)*Goff`: about 4e-5 A,
+nanoseconds of a 50 Hz current), which a step can cross with the crossing function positive at
+both ends: the arc burned on. The zero of `a` is a simple crossing the integrator locates, and
+the event there evaluates the relation inside its window (whether a step landed in it depended
+on the platform's rounding: the CI's macOS runner missed phase 3's arc-out at 25.10 ms). Only
+the bounded side: probing `abs(v)` too made events where the arc's voltage passed zero, and an
+event's solve there failed.
+"""
+function _absProbes(rels::Vector{SC.RELATION}, simCode::SC.SIM_CODE)::Vector{SC.RELATION}
+  local probes::Vector{SC.RELATION} = SC.RELATION[]
+  for r in rels
+    local bounded::SC.Exp = r.op in (SC.OP_LESS, SC.OP_LESSEQ) ? r.exp1 :
+                            r.op in (SC.OP_GREATER, SC.OP_GREATEREQ) ? r.exp2 : SC.BCONST(false)
+    SC.isBuiltin(bounded, :abs) || continue
+    local p::SC.RELATION = SC.RELATION(only(bounded.args), SC.OP_GREATEREQ, SC.RCONST(0.0), 0)
+    (_withoutContinuousOperand(p, simCode) || p in rels || p in probes) || push!(probes, p)
+  end
+  return probes
+end
+
+"""
 One DiscreteCluster (discreteClusters.jl) for a when on the relations `rels` that assigns
 `assigns`. Every distinct relation gets a buffer; `==` and `<>` (a crossing function that
 jumps between -0.5 and 0.5) and relations without a continuous-time operand have no
 hysteresis. A when lifted from discrete equations holds at every pass of an event (its
 equations do); another fires when its condition does. Later members read an earlier one's
-new value (the body is in topological order).
+new value (the body is in topological order). The probes of its `abs()` arguments
+(`_absProbes`) come after its relations.
 """
 function _discreteClusterSpec(cond::SC.Exp, rels::Vector{SC.RELATION}, assigns::Vector{Tuple{Symbol, SC.Exp, Bool}},
                               simCode::SC.SIM_CODE, table::Bool, graph::_EquationGraph)::Expr
@@ -1301,17 +1336,19 @@ function _discreteClusterSpec(cond::SC.Exp, rels::Vector{SC.RELATION}, assigns::
                    $(stmts...)
                    ($([Symbol("_v_", d) for (d, _, _) in assigns]...),)
                  end)
+  #= the probes (`_absProbes`) after the relations the body reads (`_rel[k]`) =#
+  local relations::Vector{SC.RELATION} = vcat(buffered, _absProbes(buffered, simCode))
   local reads = Any[operands..., Symbol.(preNames)...]
-  for r in buffered
+  for r in relations
     push!(reads, transformToMTKContinuousCondition(r, simCode), _conditionScaleExpr(r, simCode))
   end
-  local strict = Bool[r.op in (SC.OP_LESS, SC.OP_GREATER) for r in buffered]
-  local exact = Bool[_relationZeroSet(r) === nothing || _withoutContinuousOperand(r, simCode) for r in buffered]
-  local eventOnly = Bool[_withoutContinuousOperand(r, simCode) && !_expMentionsTime(r) for r in buffered]
+  local strict = Bool[r.op in (SC.OP_LESS, SC.OP_GREATER) for r in relations]
+  local exact = Bool[_relationZeroSet(r) === nothing || _withoutContinuousOperand(r, simCode) for r in relations]
+  local eventOnly = Bool[_withoutContinuousOperand(r, simCode) && !_expMentionsTime(r) for r in relations]
   local atStart = !_condHasInitial(cond) ? 0 : (table ? 2 : 1)
   local memberNames = String[string(d) for (d, _, _) in assigns]
   local readNames = OrderedSet{String}(string(o) for o in operands)
-  foreach(r -> SC.crefNames!(readNames, r), buffered)
+  foreach(r -> SC.identifierNames!(readNames, r), relations)
   local coupled = _clusterCoupled(memberNames, readNames, graph)
   return :(OMBackend.CodeGeneration.DiscreteCluster($(memberNames),
                                                    Any[$([d for (d, _, _) in assigns]...)],
@@ -1492,12 +1529,13 @@ end
 
 """
 The target of field `f` of a record target of a tuple assignment: the field's variable
-(`r_f`), or an omitted output's.
+(`r_f`: the field's reference, `SimCode.fieldCref`, its identifier `identifierOf`), or an omitted output's.
 """
-function _recordFieldTarget(target::SC.Exp, f::String)::SC.Exp
+function _recordFieldTarget(target::SC.Exp, f::String, simCode::SC.SIM_CODE)::SC.Exp
   target isa SC.WILD && return target
   target isa SC.EXP_CREF || unsupported("this record target of a tuple assignment in a when", target)
-  return SC.EXP_CREF(SC.SimCref(SC.crefName(target.cref) * COMPONENT_SEPARATOR * f), SC.TYPE_REAL())
+  local field::SC.IR.ComponentRef = SC.fieldCref(SC.irRef(target.cref), f)
+  return SC.EXP_CREF(SC.SimCref(Symbol(SC.identifierOf(simCode, field)), Int[], field), SC.TYPE_REAL())
 end
 
 """
@@ -1573,8 +1611,7 @@ function _whenBodyCalls(statements::Vector{SC.Statement}, simCode::SC.SIM_CODE):
   local calls::Dict{SC.CALL, Symbol} = Dict{SC.CALL, Symbol}()
   local definitions::Vector{Expr} = Expr[]
   any(>(1), values(counts)) || return (calls, definitions)
-  local written::Set{String} = Set{String}(_crefBase(n) for n in _bodyWrites(statements))
-  foreach(s -> s isa SC.REINIT && push!(written, _crefBase(SC.crefName(s.stateVar))), statements)
+  local written::Vector{SC.IR.ComponentRef} = _writtenArrays(statements)
   #= The names carry the body's hash: several bodies share a scope (the terminal bodies, a when's
      elsewhen arms, a periodic when's refreshes), and a local function of the same name in one of
      them replaced the other's (two RealFFT blocks: the second's FFT in both). =#
@@ -1597,13 +1634,37 @@ function _whenBodyCalls(statements::Vector{SC.Statement}, simCode::SC.SIM_CODE):
 end
 
 """
-Whether `call` reads a variable of `written` (the bases of the names a body assigns): by its base, or as a
-field of a written record (`r_f` of `r`: a tuple's record target is assigned field by field).
+The variables a when body assigns or reinitializes, by the arrays of their references (`upToFirstSubscripted`:
+`buf` of `buf[3]`): the references of an assignment's left-hand side (a subscript's too), a reinit's state.
 """
-function _readsWritten(call::SC.CALL, written::Set{String})::Bool
-  return any(SC.allCrefNames(call)) do name
-    local base::String = _crefBase(name)
-    base in written || any(w -> startswith(base, w * "_"), written)
+function _writtenArrays(statements::Vector{SC.Statement})::Vector{SC.IR.ComponentRef}
+  local out::Vector{SC.IR.ComponentRef} = SC.IR.ComponentRef[]
+  for s in statements
+    if s isa SC.ASSIGN
+      SC.foreachExp(x::SC.Exp -> (x isa Union{SC.EXP_CREF, SC.DER, SC.PRE} && _writtenArray!(out, x.cref); nothing), s.left)
+    elseif s isa SC.REINIT
+      _writtenArray!(out, s.stateVar)
+    end
+  end
+  return out
+end
+
+"The array of the reference `c` (`upToFirstSubscripted`), pushed onto `out`; nothing for one without an IR reference."
+function _writtenArray!(out::Vector{SC.IR.ComponentRef}, c::SC.SimCref)::Nothing
+  c.ref === nothing || push!(out, SC.IR.upToFirstSubscripted(c.ref))
+  return nothing
+end
+
+"""
+Whether `call` reads a variable of `written` (`_writtenArrays`): a reference whose array overlaps a written one
+(`IR.crefsOverlap`: the same, a field of a written record, a record a field of which is written: a tuple's record
+target is assigned field by field). A reference without an IR reference (`time`) names no variable.
+"""
+function _readsWritten(call::SC.CALL, written::Vector{SC.IR.ComponentRef})::Bool
+  return SC.anyExp(call) do x::SC.Exp
+    (x isa Union{SC.EXP_CREF, SC.DER, SC.PRE} && x.cref.ref !== nothing) || return false
+    local array::SC.IR.ComponentRef = SC.IR.upToFirstSubscripted(x.cref.ref)
+    return any(w::SC.IR.ComponentRef -> SC.IR.crefsOverlap(w, array), written)
   end
 end
 
@@ -1629,10 +1690,14 @@ _statementExps(s::SC.REINIT)::Vector{SC.Exp} = SC.Exp[s.value]
 _statementExps(s::SC.NORETCALL)::Vector{SC.Exp} = SC.Exp[s.exp]
 _statementExps(s::SC.ASSERT)::Vector{SC.Exp} = SC.Exp[s.condition, s.message, s.level]
 _statementExps(s::SC.TERMINATE)::Vector{SC.Exp} = SC.Exp[s.message]
+function _statementExps(s::SC.IF)::Vector{SC.Exp}
+  local out::Vector{SC.Exp} = SC.Exp[b.condition for b in s.branches]
+  for x in Iterators.flatten((Iterators.flatten(b.body for b in s.branches), s.elseBody))
+    append!(out, _statementExps(x))
+  end
+  return out
+end
 _statementExps(::SC.Statement)::Vector{SC.Exp} = SC.Exp[]
-
-"A variable's name without its subscripts (`buf` of `buf[3]`, of `buf[?]`)."
-_crefBase(name::String)::String = String(first(split(name, '['; limit = 2)))
 
 """
 The statements of a when body (createWhenStatementsMTK), with the calls of
@@ -1655,14 +1720,14 @@ function _createWhenStatementsMTK(statements::Vector{SC.Statement}, simCode::SC.
         else
           for f in fields
             pos += 1
-            _emitWhenTupleElementAssignMTK!(res, _recordFieldTarget(elem, f), :($tupSym[$pos]), simCode)
+            _emitWhenTupleElementAssignMTK!(res, _recordFieldTarget(elem, f, simCode), :($tupSym[$pos]), simCode)
           end
         end
       end
     elseif wStmt isa SC.ASSIGN
       local leftName = SC.crefNameOf(wStmt.left)
       leftName === nothing && unsupported("this assignment target in a when", wStmt.left)
-      push!(res, _stateAssignment(last(simCode.stringToSimVarHT[leftName]), expToJuliaExpMTK(wStmt.right, simCode)))
+      push!(res, _whenAssignmentMTK(last(simCode.stringToSimVarHT[leftName]), wStmt.right, simCode))
     elseif wStmt isa SC.REINIT
       local var = last(simCode.stringToSimVarHT[SC.crefName(wStmt.stateVar)])
       push!(res, quote
@@ -1691,11 +1756,52 @@ function _createWhenStatementsMTK(statements::Vector{SC.Statement}, simCode::SC.
                 $(violated)
               end
             end)
+    elseif wStmt isa SC.IF
+      push!(res, _whenIfMTK(wStmt, simCode))
     else
       unsupported("when-statement variant", wStmt)
     end
   end
   return res
+end
+
+"""
+An if-statement of a when body (calls and `terminate()` under their branch's condition, `SimCode.whenOperators`): the
+branches' statements under their conditions (a number where the lowering encoded and/or/not arithmetically).
+"""
+function _whenIfMTK(s::SC.IF, simCode::SC.SIM_CODE)::Expr
+  local chain::Expr = Expr(:block, _createWhenStatementsMTK(s.elseBody, simCode)...)
+  for b in Iterators.reverse(s.branches)
+    chain = Expr(:if, _whenConditionMTK(b.condition, simCode), Expr(:block, _createWhenStatementsMTK(b.body, simCode)...), chain)
+  end
+  return chain
+end
+
+"""
+A condition in a when body as a Julia Bool: and, or and not by short circuit (the arithmetic lowering evaluates both
+operands: `not (d < 0) and sqrt(d) > 0` took the square root of a negative d), another by its value, a number being true
+where it is not zero.
+"""
+function _whenConditionMTK(c::SC.Exp, simCode::SC.SIM_CODE)::Expr
+  if c isa SC.LBINARY
+    local a::Expr = _whenConditionMTK(c.exp1, simCode)
+    local b::Expr = _whenConditionMTK(c.exp2, simCode)
+    return c.op === SC.OP_AND ? :($a && $b) : :($a || $b)
+  elseif c isa SC.LUNARY
+    return :(!$(_whenConditionMTK(c.exp, simCode)))
+  end
+  return :(let _c = $(expToJuliaExpMTK(c, simCode)); _c isa Bool ? _c : _c != 0 end)
+end
+
+"""
+`var := e` in a when body: an if-expression as an `if` of its branches' assignments (the arithmetic lowering evaluates
+both branches: `if d > 0 then y := sqrt(d)` of a negative d threw, each `v := if c then e else v` an algorithm's when
+lowers to), another `e` by its value.
+"""
+function _whenAssignmentMTK(var::SC.SIMVAR, e::SC.Exp, simCode::SC.SIM_CODE)::Expr
+  e isa SC.IFEXP || return _stateAssignment(var, expToJuliaExpMTK(e, simCode))
+  return Expr(:if, _whenConditionMTK(e.cond, simCode), _whenAssignmentMTK(var, e.thenExp, simCode),
+              _whenAssignmentMTK(var, e.elseExp, simCode))
 end
 
 """

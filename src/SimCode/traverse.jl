@@ -138,39 +138,192 @@ mapStatement(f::F, s::Statement) where {F} = mapStatementExps(e -> mapExp(f, e),
 mapStatements(f::F, body::Vector{Statement}) where {F} = Statement[mapStatement(f, s) for s in body]
 
 """
-    crefNames!(names, e)
+    crefNames!(names, e; dynamic, element = elementKey)
 
 The names of the variables `e` reads, in order: a reference's name (with its subscripts,
 `x[1]` of an array element), a derivative's state's, a `pre(x)`'s variable;
-an array read by literal subscripts also as its element (`R_T[1][2]`), by a subscript that
-reads a variable as `R_T[?]` (`DYNAMIC_SUBSCRIPT_MARK`).
+an array read by literal subscripts also as its element, `element(c, index)` (`elementKey`: its reference's flat
+name). An array read by a subscript that reads a variable is the array's read only; with
+`dynamic`, that array (its `arrayBase`) recorded there.
 """
-function crefNames!(names::OrderedSet{String}, e::Exp)::OrderedSet{String}
-  if e isa EXP_CREF
-    push!(names, crefName(e.cref))
-  elseif e isa DER
-    push!(names, crefName(e.cref))
-  elseif e isa PRE
-    push!(names, crefName(e.cref))
-  elseif e isa ASUB && e.exp isa EXP_CREF
-    local base = crefName(e.exp.cref)
-    if all(s -> s isa ICONST, e.subs)
-      push!(names, string(base, join(("[$(s.value)]" for s in e.subs))))
-    elseif any(s -> anyExp(x -> x isa Union{EXP_CREF, DER, PRE}, s), e.subs)
-      push!(names, string(base, DYNAMIC_SUBSCRIPT_MARK))
+function crefNames!(names::OrderedSet{String}, e::Exp; dynamic::Union{Nothing, Set{Symbol}} = nothing,
+                    element::K = elementKey)::OrderedSet{String} where {K}
+  foreachRead(e) do c::SimCref, index::Union{Nothing, Vector{Int}}, isDynamic::Bool
+    if isDynamic
+      (dynamic !== nothing && c.ref !== nothing) && push!(dynamic, arrayBase(c.ref))
+    else
+      push!(names, index === nothing ? crefName(c) : element(c, index))
     end
-  end
-  for c in children(e)
-    crefNames!(names, c)
   end
   return names
 end
 
-"The name an array read with a subscript that reads a variable is known by (no element is named)."
-const DYNAMIC_SUBSCRIPT_MARK = "[?]"
+"""
+    identifierNames!(names, e) -> OrderedSet{String}
+
+`crefNames!` in the code view (`codeView`): the identifiers of the variables `e` reads, an array element read by
+literal subscripts by its array's identifier and the subscripts (`crefName(c, index)`: `a_b[1][2]`), as the
+generated code indexes it.
+"""
+identifierNames!(names::OrderedSet{String}, e::Exp)::OrderedSet{String} = crefNames!(names, e; element = crefName)
+
+"""
+    foreachRead(f, e)
+
+`f(c, index, dynamic)` for each reference `e` reads, in order, the one traversal of `crefNames!`, `crefReads!` and
+`dynamicArrays!`: a reference, a derivative's state, a `pre(x)`'s variable (`index` nothing); an array read by literal
+subscripts, `c` the array and `index` the subscripts (its element's name `crefName(c, index)`, its reference
+`elementRead(c, index)`, made only where asked); by a subscript that reads a variable, the array, `dynamic`.
+"""
+function foreachRead(f::F, e::Exp)::Nothing where {F}
+  if e isa Union{EXP_CREF, DER, PRE}
+    f(e.cref, nothing, false)
+  elseif e isa ASUB && e.exp isa EXP_CREF
+    if all(s::Exp -> s isa ICONST, e.subs)
+      f(e.exp.cref, Int[(s::ICONST).value for s in e.subs], false)
+    elseif any(s::Exp -> anyExp(x::Exp -> x isa Union{EXP_CREF, DER, PRE}, s), e.subs)
+      f(e.exp.cref, nothing, true)
+    end
+  end
+  traverseFields(e, _VisitReads(f), nothing)
+  return nothing
+end
+
+"`foreachRead` of `f` as a traversal's `recur`."
+struct _VisitReads{F}
+  f::F
+end
+(v::_VisitReads)(x::Exp, a::Nothing) = (foreachRead(v.f, x); (x, a))
+
+"""
+    Read(cref, dynamic)
+
+A reference an expression reads (`crefReads!`): a variable's, an array element's by literal subscripts (`elementRead`),
+or, `dynamic`, an array read by a subscript that reads a variable, whose element no subscript names.
+"""
+struct Read <: Node
+  cref::SimCref
+  dynamic::Bool
+end
+
+"""
+    crefReads!(reads, e) -> Vector{Read}
+
+The references `e` reads, in order (`foreachRead`), an element's by literal subscripts as its reference (`elementRead`).
+"""
+function crefReads!(reads::Vector{Read}, e::Exp)::Vector{Read}
+  foreachRead(e) do c::SimCref, index::Union{Nothing, Vector{Int}}, isDynamic::Bool
+    push!(reads, Read(index === nothing ? c : elementRead(c, index), isDynamic))
+  end
+  return reads
+end
+
+"The arrays `e` reads by a subscript that reads a variable (`foreachRead`'s dynamic reads, by `arrayBase`), pushed onto `dynamic`."
+function dynamicArrays!(dynamic::Set{Symbol}, e::Exp)::Set{Symbol}
+  foreachRead(e) do c::SimCref, _::Union{Nothing, Vector{Int}}, isDynamic::Bool
+    (isDynamic && c.ref !== nothing) && push!(dynamic, arrayBase(c.ref))
+  end
+  return dynamic
+end
+
+"""
+    elementKey(c, index) -> String
+
+The key of the element `index` (literal subscripts) of the array reference `c` in the simulation code: the flat name
+of its reference (`elementRead`: `A[1,2]` of `A`, `c[2].T` of `c` and `[2]`... as the IR names it); without a
+reference (a test's) its name `crefName(c, index)`.
+"""
+elementKey(c::SimCref, index::Vector{Int})::String = c.ref === nothing ? crefName(c, index) : refKey(irRef(elementRead(c, index)))
+
+"""
+    readKey(c) -> String
+
+The key of the variable the reference `c` reads: its symbol, an element of an array kept as an array (`c.subs`) its
+reference's flat name (`x[1,2]`); without a reference (a test's) its name `crefName(c)`.
+"""
+readKey(c::SimCref)::String = (isempty(c.subs) || c.ref === nothing) ? crefName(c) : refKey(c.ref)
+
+"""
+    elementRead(c, index) -> SimCref
+
+The element `index` (literal subscripts) of the array reference `c`: its key and subscripts
+followed by `index`, its IR reference the array's subscripted on its last part (`x[1,2]` of `x`).
+"""
+function elementRead(c::SimCref, index::Vector{Int})::SimCref
+  local ref::Union{Nothing, IR.ComponentRef} = c.ref === nothing ? nothing : IR.elementCref(c.ref, index)
+  return SimCref(c.sym, Int[c.subs; index], ref)
+end
+
+"""
+    foreachStatementExp(f, body, statement = noStatement)
+
+`f(e)` for each expression of the statements `body`, nested statements' too, in field order (a branch's condition
+before its body, a loop's range before its body); `statement(s)` on each statement before its expressions. The
+targets of `reinit` and of OM.jl's structural changes are references, not expressions (`statementTargets!`).
+"""
+function foreachStatementExp(f::F, body::Vector{Statement}, statement::G = noStatement)::Nothing where {F, G}
+  local visit::_StatementVisit{F, G} = _StatementVisit(f, statement)
+  foreach(s::Statement -> visit(s, nothing), body)
+  return nothing
+end
+
+"No visit of a statement (`foreachStatementExp`'s default)."
+noStatement(::Statement)::Nothing = nothing
+
+"`foreachStatementExp` as a traversal's `recur`: an expression visited, a statement visited and traversed in turn."
+struct _StatementVisit{F, G}
+  f::F
+  statement::G
+end
+(v::_StatementVisit)(e::Exp, a::Nothing) = (v.f(e); (e, a))
+(v::_StatementVisit)(s::Statement, a::Nothing) = (v.statement(s); traverseFields(s, v, nothing); (s, a))
+
+"The references a statement holds outside its expressions, pushed onto `out`: a `reinit`'s state, OM.jl's structural changes' components."
+statementTargets!(out::Vector{SimCref}, s::REINIT)::Vector{SimCref} = push!(out, s.stateVar)
+statementTargets!(out::Vector{SimCref}, s::RECOMPILATION)::Vector{SimCref} = push!(out, s.componentToChange)
+statementTargets!(out::Vector{SimCref}, s::AGENTIC_RECOMPILATION)::Vector{SimCref} = append!(out, s.componentsToChange)
+statementTargets!(out::Vector{SimCref}, ::Statement)::Vector{SimCref} = out
+
+"""
+    foreachEquationExp(f, simCode; eliminated = false, statement = (place, s) -> nothing)
+
+`f(place, e)` for each expression of the simulation code's equations, `place` the equation's (`(:residualEquations, 3)`):
+the residual equations (with `eliminated` the eliminated ones too), the initial equations' sides, the if-equations'
+conditions and branches, the when-equations' conditions and statements (`foreachStatementExp`), the initial
+algorithms' statements, the asserts' conditions and messages; `statement(place, s)` on each statement before its
+expressions.
+"""
+function foreachEquationExp(f::F, simCode::SIM_CODE; eliminated::Bool = false, statement::G = noPlacedStatement)::Nothing where {F, G}
+  foreach(((i, eq),) -> f((:residualEquations, i), eq.exp), enumerate(simCode.residualEquations))
+  eliminated && foreach(((i, eq),) -> f((:eliminatedEquations, i), eq.exp), enumerate(simCode.eliminatedEquations))
+  foreach(((i, eq),) -> foreach(e::Exp -> f((:initialEquations, i), e), equationExps(eq)), enumerate(simCode.initialEquations))
+  for (i, ifEq) in enumerate(simCode.ifEquations), b in ifEq.branches
+    f((:ifEquations, i), b.condition)
+    foreach(eq -> f((:ifEquations, i), eq.exp), b.residualEquations)
+  end
+  for (i, w) in enumerate(simCode.whenEquations)
+    local stmts::Union{Nothing, WHEN_STMTS} = w.whenEquation
+    while stmts !== nothing
+      f((:whenEquations, i), stmts.condition)
+      foreachStatementExp(e::Exp -> f((:whenEquations, i), e), stmts.body, s::Statement -> statement((:whenEquations, i), s))
+      stmts = stmts.elsewhenPart
+    end
+  end
+  for (i, a) in enumerate(simCode.initialAlgorithms)
+    foreachStatementExp(e::Exp -> f((:initialAlgorithms, i), e), a.statements, s::Statement -> statement((:initialAlgorithms, i), s))
+  end
+  foreach(((i, a),) -> (f((:asserts, i), a.condition); f((:asserts, i), a.message)), enumerate(simCode.asserts))
+  return nothing
+end
+
+"No visit of a placed statement (`foreachEquationExp`'s default)."
+noPlacedStatement(::Tuple{Symbol, Int}, ::Statement)::Nothing = nothing
 
 "A reference's name: its symbol, with its Integer subscripts (`A[1][2]`)."
 crefName(c::SimCref)::String = isempty(c.subs) ? String(c.sym) : string(c.sym, join(("[$(i)]" for i in c.subs)))
+
+"The name of the element `index` of the array reference `c` (`crefName` of `elementRead`), without making its reference."
+crefName(c::SimCref, index::Vector{Int})::String = string(crefName(c), join(("[$(i)]" for i in index)))
 
 #= ==================================================================================== =#
 #= Traversals with an accumulator (the passes')                                         =#

@@ -64,7 +64,8 @@ const _INSTANT_PRE = WeakKeyDict{Any, _InstantPre}()
     instantPre(integrator)
 
 The state before the current event instant, for pre() in an affect: recorded
-by the first affect at a new time. Read only.
+by the first affect at a new time. Read only, but for the discrete clusters'
+members, put back to their held values (`_putBack!`).
 """
 function instantPre(integrator)
   ismutable(integrator) || return copy(integrator.u)

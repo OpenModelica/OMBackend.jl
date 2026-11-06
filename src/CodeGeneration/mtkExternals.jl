@@ -2149,22 +2149,11 @@ function _derivativesAsSystemTerms(sys, exprs)
 end
 
 """
-    resolveAliasInitialValue(diffState, fullEqs, ivMap)
-
-  Resolve the initial value of a differential state that has no direct Modelica
-  start value (typically an MTK-generated derivative variable like `Xˍt`).
-
-  Scans `fullEqs` for a 2-variable linear equation where one variable is
-  `diffState` and the other has a known value in `ivMap`. Uses symbolic
-  variable analysis (`Symbolics.get_variables`, `isequal`, `substitute`).
-
-  Returns the resolved value, or `nothing` if no alias equation was found.
+Per-call-site index of the candidate (non-differential) equations, keyed by
+the names of the variables each contains (`variableName`). A scan of every
+equation for every resolve made initialization quadratic in system size on
+large reduced systems and dominated the whole simulate call.
 """
-#= Per-call-site index of the candidate (non-differential) equations, keyed by
-   the exact variable names each contains. Avoids re-stringifying and
-   re-scanning every equation for every resolve: on large reduced systems the
-   unindexed scan made initialization quadratic in system size and dominated
-   the whole simulate call. =#
 struct AliasEqIndex
   exprs::Vector{Any}
   varCounts::Vector{Int}
@@ -2187,30 +2176,27 @@ function buildAliasEqIndex(eqs)::AliasEqIndex
     push!(varCounts, length(vs))
     local i = length(exprs)
     for v in vs
-      push!(get!(() -> Int[], byVar, string(v)), i)
+      local name::Union{Nothing, String} = variableName(v)
+      name === nothing || push!(get!(() -> Int[], byVar, name), i)
     end
   end
   return AliasEqIndex(exprs, varCounts, byVar)
 end
 
+"""
+    resolveAliasInitialValue(diffState, idx, ivMap)
+
+  Resolve the initial value of a differential state that has no direct Modelica
+  start value (typically an MTK-generated derivative variable like `Xˍt`).
+
+  Scans the equations of `idx` that read `diffState` for a linear one whose
+  other variables have known values in `ivMap`. Uses symbolic variable analysis
+  (`Symbolics.get_variables`, `isequal`, `substitute`).
+
+  Returns the resolved value, or `nothing` if no alias equation was found.
+"""
 function resolveAliasInitialValue(diffState, idx::AliasEqIndex, ivMap::Dict)
-  local diffStr = string(diffState)
-  if !OMBackend.envSwitch("OMBACKEND_ALIAS_INDEX")
-    #= Legacy-faithful scan: every candidate equation whose text mentions the
-       state, simplify uncapped. =#
-    for i in 1:length(idx.exprs)
-      contains(string(idx.exprs[i]), diffStr) || continue
-      local resolved = try
-        _resolveAliasFromExpr(diffState, idx.exprs[i], 0, ivMap)
-      catch e
-        e isa Union{DivideError, OverflowError, InexactError} || rethrow()
-        nothing
-      end
-      resolved === nothing || return resolved
-    end
-    return nothing
-  end
-  for i in get(idx.byVar, diffStr, Int[])
+  for i in get(idx.byVar, variableName(diffState), Int[])
     #= Rational{Int} arithmetic inside substitute/simplify can overflow the
        denominator to 0 (DivideError) on pathological candidates; skip them. =#
     local resolved = try
@@ -2275,6 +2261,7 @@ function _resolveAliasFromExpr(diffState, @nospecialize(expr), varCount::Int, iv
   return nothing
 end
 
+"`resolveAliasInitialValue` over the equations `fullEqs` (their index built here)."
 function resolveAliasInitialValue(diffState, fullEqs, ivMap::Dict)
   return resolveAliasInitialValue(diffState, buildAliasEqIndex(fullEqs), ivMap)
 end
@@ -2290,12 +2277,12 @@ function _pinnedSidecarKey(reducedSystem)::Symbol
 end
 
 function explicitPinnedInitialValueKeys(reducedSystem, hardInitialValues)::OrderedSet{String}
-  return get(() -> OrderedSet(string(p.first) for p in hardInitialValues),
+  return get(() -> _variableNames(first(p) for p in hardInitialValues),
              _EXPLICIT_PINNED_INITIAL_VALUE_KEYS, _pinnedSidecarKey(reducedSystem))
 end
 
 """
-Names (as strings) of variables that appear in an algebraic (non-differential)
+Names (`variableName`) of variables that appear in an algebraic (non-differential)
 equation of `sys`, including observed equations: structural_simplify moves
 eliminated algebraic constraints to observed, so a state coupled only through
 them is still algebraically coupled. A differential equation `D(x) ~ rhs` is
@@ -2311,24 +2298,17 @@ function _algebraicCoupledVarStrs(sys)::OrderedSet{String}
     local lhs = Symbolics.value(eq.lhs)
     local isDiff = SymbolicUtils.iscall(lhs) && (SymbolicUtils.operation(lhs) isa ModelingToolkit.Differential)
     isDiff && continue
-    for v in Symbolics.get_variables(eq.lhs)
-      push!(out, string(v))
-    end
-    for v in Symbolics.get_variables(eq.rhs)
-      push!(out, string(v))
-    end
+    union!(out, _variableNames(Symbolics.get_variables(eq.lhs)), _variableNames(Symbolics.get_variables(eq.rhs)))
   end
   local obsEqs = observed(sys)
   for eq in obsEqs
     #= An observed lhs is the eliminated variable itself; only the rhs couples. =#
-    for v in Symbolics.get_variables(eq.rhs)
-      push!(out, string(v))
-    end
+    union!(out, _variableNames(Symbolics.get_variables(eq.rhs)))
   end
   return out
 end
 
-#= Names (as strings) of the variables initialization equations determine:
+#= Names (`variableName`) of the variables initialization equations determine:
    the left-hand side of each, and x for every derivative D(x) in them. The
    arguments of other right-hand sides (e.g. positions passed to a branch
    selection function) are only read. =#
@@ -2337,16 +2317,18 @@ The left sides of the initialization equations that fix a value (a literal
 or parameter right side). A signal-valued one (its rhs references a
 time-dependent variable, unknown or observed) determines its lhs through
 the init solve's residual rows; marking the lhs fixed would hold it at a
-stale numeric guess that fights the very equation it encodes. Parameters
-print without the (t) suffix and stay pinnable; occursin also catches array
-elements and derivative forms whose printed form does not END with it.
+stale numeric guess that fights the very equation it encodes. A right side of
+constant parameters and time only stays pinnable: one that reads a variable of
+time (a call `x(t)`: an unknown, or a parameter MTK made of a discrete, `d(t)`)
+does not.
 """
 function _fixedTrueLhsStrs(initEqs)::OrderedSet{String}
-  local out = OrderedSet{String}()
+  local out::OrderedSet{String} = OrderedSet{String}()
   for eq in initEqs
     local rhsVars = Symbolics.get_variables(eq.rhs)
-    any(occursin("(t)", string(v)) for v in rhsVars) && continue
-    push!(out, string(eq.lhs))
+    any(v -> SymbolicUtils.iscall(Symbolics.unwrap(v)), rhsVars) && continue
+    local name::Union{Nothing, String} = variableName(eq.lhs)
+    name === nothing || push!(out, name)
   end
   return out
 end
@@ -2362,17 +2344,22 @@ function _initializationVarStrs(initEqs; reads::Bool = false)::OrderedSet{String
   visit = function (ex, isLhs0::Bool)
     local isLhs = isLhs0 || reads
     local v = Symbolics.unwrap(ex)
-    SymbolicUtils.iscall(v) || (isLhs && push!(out, string(v)); return nothing)
+    if !SymbolicUtils.iscall(v)
+      #= a parameter, time or a constant (no name) =#
+      local name::Union{Nothing, String} = variableName(v)
+      isLhs && name !== nothing && push!(out, name)
+      return nothing
+    end
     local op = SymbolicUtils.operation(v)
     if op isa ModelingToolkit.Differential
       #= D(x), or D(expr): an observed variable the backend replaced by its
          definition; every variable in it. =#
-      foreach(a -> foreach(x -> push!(out, string(x)), Symbolics.get_variables(a)), SymbolicUtils.arguments(v))
+      foreach(a -> union!(out, _variableNames(Symbolics.get_variables(a))), SymbolicUtils.arguments(v))
       return nothing
     end
     #= x(t) is a call of x on t: a variable, not an expression. =#
     if SymbolicUtils.issym(op)
-      isLhs && push!(out, string(v))
+      isLhs && push!(out, variableName(v))
       return nothing
     end
     #= An expression on the left (`x + y = 1`) determines every variable in it. =#
@@ -2386,21 +2373,27 @@ function _initializationVarStrs(initEqs; reads::Bool = false)::OrderedSet{String
   return out
 end
 
-"Seed guesses for reduced unknowns by name; overrides only absent or default-0.0 entries."
+"""
+    mergeSoftGuesses(reducedSystem, pairs; force = false)
+
+Seed guesses for reduced unknowns: `pairs` of a variable's name (SimCode's, a String or a Symbol: the if-equations'
+relay guesses, the trusted t0 values, the propagated guesses) and its value, matched to the unknowns by name
+(`variableName`); overrides only absent or default-0.0 entries, every entry with `force`.
+"""
 function mergeSoftGuesses(reducedSystem, pairs::AbstractVector; force::Bool = false)
   isempty(pairs) && return reducedSystem
   local unkByStr = Dict{String, Any}()
   for u in unknowns(reducedSystem)
-    unkByStr[_plainVariableName(u)] = u
+    unkByStr[variableName(u)] = u
   end
   local gs = Dict{Any, Any}(ModelingToolkit.guesses(reducedSystem))
   local changed = false
   for p in pairs
-    local nm = _plainVariableName(String(first(p)))
+    local nm::String = String(first(p)::Union{Symbol, AbstractString})
     haskey(unkByStr, nm) || continue
     local cur = nothing
     for (k, v) in gs
-      if _plainVariableName(k) == nm
+      if variableName(k) == nm
         cur = v
         break
       end
@@ -2409,7 +2402,7 @@ function mergeSoftGuesses(reducedSystem, pairs::AbstractVector; force::Bool = fa
     local curv = cur === nothing ? nothing : Symbolics.value(cur)
     if force || curv === nothing || (curv isa Number && iszero(curv))
       for k in collect(keys(gs))
-        replace(string(k), "(t)" => "") == nm && delete!(gs, k)
+        variableName(k) == nm && delete!(gs, k)
       end
       gs[unkByStr[nm]] = last(p)
       changed = true
@@ -2454,7 +2447,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
        A non-fixed start an initialization equation determines was pinned:
        the init solve then freed every variable and moved the fixed ones
        (`x = 2y + 1` with y fixed at 2: y = 0, OpenModelica 2). =#
-    local pinnedKeys = OrderedSet(string(p.first) for p in finalInitialValues)
+    local pinnedKeys::OrderedSet{String} = _variableNames(first(p) for p in finalInitialValues)
     local odeInitEqs = ModelingToolkit.initialization_equations(reducedSystem)
     if !isempty(odeInitEqs)
       local fixedLhs = _fixedTrueLhsStrs(odeInitEqs)
@@ -2472,16 +2465,15 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
   for i in 1:min(size(massMatrix, 1), length(reducedUnks))
     if massMatrix[i, i] != 0
       push!(diffStateSet, reducedUnks[i])
-      push!(diffStateStrSet, string(reducedUnks[i]))
+      push!(diffStateStrSet, variableName(reducedUnks[i]))
     end
   end
-  #= Use string comparison for hard/soft split because finalInitialValues keys
-     are Num-wrapped while diffStateSet contains unwrapped BasicSymbolic values.
-     isequal(Num(x), x) can fail depending on Symbolics version. =#
+  #= By name (`variableName`): finalInitialValues keys are Num-wrapped while
+     diffStateSet contains unwrapped BasicSymbolic values. =#
   local hardInitialValues = Pair{Any, Any}[pair for pair in finalInitialValues
-                                           if string(pair.first) in diffStateStrSet]
+                                           if variableName(pair.first) in diffStateStrSet]
   local softInitialValues = Pair{Any, Any}[pair for pair in finalInitialValues
-                                           if !(string(pair.first) in diffStateStrSet)]
+                                           if !(variableName(pair.first) in diffStateStrSet)]
   #= When a DAE has only algebraic vars with explicit starts and no differential
      state has one, pin the algebraic starts as hard u0. MTK's DAE initializer
      then has a well-determined system (algebraic-pin + residuals) and converges
@@ -2515,18 +2507,18 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
      algebraic constraints can solve consistently with the user's hard pins. =#
   local fixedTrueLhsSet = _fixedTrueLhsStrs(initEqs)
   if hasInitConstraints
-    local hardKeyStrSet = OrderedSet(string(p.first) for p in hardInitialValues)
-    local reducedUnkStrSet = OrderedSet(string(u) for u in reducedUnks)
+    local hardKeyStrSet::OrderedSet{String} = _variableNames(first(p) for p in hardInitialValues)
+    local reducedUnkStrSet::OrderedSet{String} = _variableNames(reducedUnks)
     local promoted = 0
     for eq in initEqs
       local rhsVal = Symbolics.value(eq.rhs)
       rhsVal isa Number || continue
-      local lhsStr = string(eq.lhs)
+      local lhsStr::Union{Nothing, String} = variableName(eq.lhs)
       lhsStr in reducedUnkStrSet || continue
       lhsStr in hardKeyStrSet && continue
       push!(hardInitialValues, eq.lhs => Float64(rhsVal))
       push!(hardKeyStrSet, lhsStr)
-      softInitialValues = filter(p -> string(p.first) != lhsStr, softInitialValues)
+      softInitialValues = filter(p -> variableName(p.first) != lhsStr, softInitialValues)
       promoted += 1
     end
     if promoted > 0
@@ -2553,12 +2545,12 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
        over-determines the initialization (the init solve then frees every
        variable and moves the fixed=true ones; the MSL EngineV6's crank). =#
     local _initCoupled = _initializationVarStrs(initEqs; reads = true)
-    local demoted = filter(p -> !(string(p.first) in fixedTrueLhsSet) &&
-                                (string(p.first) in _algCoupled || string(p.first) in _initCoupled),
+    local demoted::Vector{Pair{Any, Any}} = filter(p -> (local name::Union{Nothing, String} = variableName(p.first);
+                                 !(name in fixedTrueLhsSet) && (name in _algCoupled || name in _initCoupled)),
                            hardInitialValues)
     if !isempty(demoted)
-      local _demotedKeys = OrderedSet(string(p.first) for p in demoted)
-      hardInitialValues = filter(p -> !(string(p.first) in _demotedKeys), hardInitialValues)
+      local _demotedKeys::OrderedSet{String} = _variableNames(first(p) for p in demoted)
+      hardInitialValues = filter(p -> !(variableName(p.first) in _demotedKeys), hardInitialValues)
       append!(softInitialValues, demoted)
       @debug "[MTK GEN: init] Demoted $(length(demoted)) non-fixed algebraic-coupled hard u0 entries to guesses (start without fixed=true)"
     end
@@ -2567,7 +2559,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
      initialization equations, and the deliberate algebraic-start special case).
      Alias-propagated values and MTK derivative defaults added below are seeds,
      not constraints; DirectRHS uses this sidecar to keep them adjustable. =#
-  local explicitPinnedKeyStrSet = OrderedSet(string(p.first) for p in hardInitialValues)
+  local explicitPinnedKeyStrSet::OrderedSet{String} = _variableNames(first(p) for p in hardInitialValues)
   if !isempty(softInitialValues)
     #= Drop pairs whose key unwrapped to a numeric constant. This happens when
        the keyed variable was eliminated by `structural_simplify` so its module
@@ -2594,10 +2586,10 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
      The allIVMap includes both reduced-system unknowns AND pre-simplification
      variables (allInitialValues) so we can resolve aliases to variables that
      were eliminated by structural_simplify. =#
-  #= Use string-based set for checking existing hard IVs, because isequal between
-     Num-wrapped keys (from finalInitialValues) and BasicSymbolic values (from
-     reducedUnks/diffStateSet) can fail. =#
-  local hardSymStrSet = OrderedSet(string(iv.first) for iv in hardInitialValues)
+  #= The hard IVs by name: their keys are Num-wrapped (finalInitialValues),
+     reducedUnks/diffStateSet BasicSymbolic. =#
+  local hardSymStrSet::OrderedSet{String} = _variableNames(first(iv) for iv in hardInitialValues)
+  local mtkDerivatives::Set{Any} = mtkDerivativeVariables(reducedSystem)
   #= Only feed user-explicit start values (hard + soft, both filtered through
      `skipDefaultsForStates`) to the alias resolver. `allInitialValues` carries
      default 0.0 entries for non-explicit vars; substituting those lets a
@@ -2619,10 +2611,10 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
     progressed = false
     explicitIVMap = Dict{Any, Any}(iv.first => iv.second for iv in hardInitialValues)
     for unk in reducedUnks
-      local unkStr = string(unk)
+      local unkStr::Union{Nothing, String} = variableName(unk)
       unkStr in hardSymStrSet && continue
-      contains(unkStr, "ˍ") || continue
-      local ivMapForResolve = filter(p -> string(p.first) != unkStr, explicitIVMap)
+      Symbolics.unwrap(unk) in mtkDerivatives || continue
+      local ivMapForResolve::Dict{Any, Any} = filter(p -> variableName(p.first) != unkStr, explicitIVMap)
       local resolved = resolveAliasInitialValue(unk, aliasIdx, ivMapForResolve)
       resolved === nothing && continue
       push!(hardInitialValues, unk => Float64(resolved))
@@ -2634,19 +2626,19 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
   local _defaulted0Starts = String[]
   #= A start demoted to a guess above is an explicit start: the 0.0 default
      below must not replace it (a capacitor's vc(start = 10) went to 0). =#
-  local softSymStrSet = OrderedSet(string(p.first) for p in softInitialValues)
+  local softSymStrSet::OrderedSet{String} = _variableNames(first(p) for p in softInitialValues)
   for diffState in diffStateSet
-    if !(string(diffState) in hardSymStrSet) && !(string(diffState) in softSymStrSet)
-      local diffStateStr = string(diffState)
+    local diffStateStr::Union{Nothing, String} = variableName(diffState)
+    if !(diffStateStr in hardSymStrSet) && !(diffStateStr in softSymStrSet)
       #= Only attempt alias resolution for MTK-generated derivative variables
-         (e.g. Inertia_phiˍt created by order-lowering). These have the Unicode
-         dot character ˍ in their name and no Modelica start value.
+         (e.g. Inertia_phiˍt; `mtkDerivativeVariables`), which have no Modelica
+         start value.
          For regular Modelica variables without explicit start values, do NOT add
          a hard u0 entry. Let MTK's initialization solver infer their values from
          algebraic constraints and guesses (e.g. phi inferred from x,y via
          x = L*sin(phi)). Adding hard 0.0 would override this inference. =#
-      if contains(diffStateStr, "\u02cd")
-        local ivMapForResolve = filter(p -> string(p.first) != diffStateStr, explicitIVMap)
+      if Symbolics.unwrap(diffState) in mtkDerivatives
+        local ivMapForResolve::Dict{Any, Any} = filter(p -> variableName(p.first) != diffStateStr, explicitIVMap)
         local resolved = resolveAliasInitialValue(diffState, aliasIdx, ivMapForResolve)
         local finalVal = something(resolved, 0.0)
         push!(hardInitialValues, diffState => finalVal)
@@ -2676,18 +2668,18 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
   #= Final sweep: ensure every reduced unknown has at least a guess.
      Even when the initialization problem is built, some unknowns may still lack
      coverage. The sweep provides 0.0 guesses as a safety net. =#
-  local hardSymStrSetFinal = OrderedSet(string(iv.first) for iv in hardInitialValues)
-  local currentGuessKeysFinal = OrderedSet(string(k) for k in keys(ModelingToolkit.guesses(reducedSystem)))
+  local hardSymStrSetFinal::OrderedSet{String} = _variableNames(first(iv) for iv in hardInitialValues)
+  local currentGuessKeysFinal::OrderedSet{String} = _variableNames(keys(ModelingToolkit.guesses(reducedSystem)))
   local missingUnks = filter(reducedUnks) do unk
-    local s = string(unk)
+    local s::Union{Nothing, String} = variableName(unk)
     !(s in hardSymStrSetFinal) && !(s in currentGuessKeysFinal)
   end
   if !isempty(missingUnks)
     local fallbackGuesses = Dict{Any, Any}(unk => 0.0 for unk in missingUnks)
     local currentGuesses3 = ModelingToolkit.guesses(reducedSystem)
     @set! reducedSystem.guesses = merge(currentGuesses3, fallbackGuesses)
-    append!(_defaulted0Starts, [string(u) for u in missingUnks])
-    @debug "[MTK GEN: init] Providing default 0.0 guesses for $(length(missingUnks)) uncovered unknowns: $(join([string(u) for u in missingUnks], ", "))"
+    append!(_defaulted0Starts, [variableName(u) for u in missingUnks])
+    @debug "[MTK GEN: init] Providing default 0.0 guesses for $(length(missingUnks)) uncovered unknowns: $(join([variableName(u) for u in missingUnks], ", "))"
   end
   local totalGuesses = length(softInitialValues) + length(missingUnks)
   @debug "[MTK GEN: init] ODEProblem: DAE, $(length(hardInitialValues)) hard u0 (differential), $(totalGuesses) as guesses (algebraic), $(length(reducedUnks)) unknowns ($(length(diffStateSet)) differential)"
@@ -2731,9 +2723,10 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
       _progress || break
     end
     if !isempty(_resolved)
-      reducedSystem = mergeSoftGuesses(reducedSystem, Pair{Any, Any}[k => v for (k, v) in _resolved])
+      reducedSystem = mergeSoftGuesses(reducedSystem, Pair{Any, Any}[variableName(k) => v for (k, v) in _resolved
+                                                                    if variableName(k) !== nothing])
       @info "[MTK GEN: init] PROPAGATED $(length(_resolved)) init guesses: " *
-            join([string(replace(string(k), "(t)" => ""), "=", round(v; digits=4)) for (k, v) in _resolved], ", ")
+            join([string(variableName(k), "=", round(v; digits=4)) for (k, v) in _resolved], ", ")
     else
       @info "[MTK GEN: init] propagation resolved nothing (targets=$(length(_targets)), pars=$(length(pars)))"
     end
@@ -2765,11 +2758,15 @@ defaulted to 0.0.
 """
 function buildDefaultGuesses(reducedSystem, finalInitialValues, allInitialValues)
   local reducedUnks = ModelingToolkit.unknowns(reducedSystem)
-  local hardKeys = OrderedSet(string(iv.first) for iv in finalInitialValues)
-  local allIVMap = Dict{String, Any}(string(iv.first) => iv.second for iv in allInitialValues)
+  local hardKeys::OrderedSet{String} = _variableNames(first(iv) for iv in finalInitialValues)
+  local allIVMap::Dict{String, Any} = Dict{String, Any}()
+  for iv in allInitialValues
+    local name::Union{Nothing, String} = variableName(first(iv))
+    name === nothing || (allIVMap[name] = last(iv))
+  end
   local guessDict = Dict{Any, Any}()
   for unk in reducedUnks
-    local unkStr = string(unk)
+    local unkStr::Union{Nothing, String} = variableName(unk)
     if !(unkStr in hardKeys)
       guessDict[unk] = get(allIVMap, unkStr, 0.0)
     end
@@ -2783,9 +2780,11 @@ end
 """
     injectObservedEquations(sys, observedEqs)
 
-Append `observedEqs` to the observed equations of a completed system.
-Used to inject observed equations AFTER structural_simplify so they do not
-interfere with AffectSystem tearing during callback compilation.
+Append `observedEqs` to the observed equations of a completed system, one per
+left-hand side variable (by `variableName`; the first of `observedEqs`, none for
+a variable the system observes already). Used to inject observed equations
+AFTER structural_simplify so they do not interfere with AffectSystem tearing
+during callback compilation.
 
 Updates the full parent chain so that MTK's getproperty delegation
 (which walks parents until it finds a root) can resolve the new variables.
@@ -2795,11 +2794,11 @@ function injectObservedEquations(sys, observedEqs::Vector)
   local existingObs = ModelingToolkit.get_observed(sys)
   local seenLHS = OrderedSet{String}()
   for eq in existingObs
-    push!(seenLHS, string(Symbolics.unwrap(eq.lhs)))
+    push!(seenLHS, variableName(eq.lhs))
   end
   local newEqs = Symbolics.Equation[]
   for eq in observedEqs
-    local lhsKey = string(Symbolics.unwrap(eq.lhs))
+    local lhsKey::Union{Nothing, String} = variableName(eq.lhs)
     if !(lhsKey in seenLHS)
       push!(seenLHS, lhsKey)
       push!(newEqs, eq)
@@ -2966,18 +2965,19 @@ moved its friction modes' switching off the reference (event conditions read int
 algebraic unknowns).
 """
 function _ifConditionReaders(reduced::ModelingToolkit.AbstractSystem, original::ModelingToolkit.AbstractSystem)::Vector{Any}
-  local conditions = Set{Any}(Symbolics.unwrap(p) for p in ModelingToolkit.parameters(original)
-                              if startswith(string(p), "ifCond"))
+  local conditions::Set{Any} = Set{Any}(Symbolics.unwrap(p) for p in ModelingToolkit.parameters(original) if isIfConditionParameter(p))
   isempty(conditions) && return Any[]
   local observed = ModelingToolkit.observed(reduced)
-  #= the derivatives index reduction created that read a condition, directly or through each other =#
+  #= the derivatives index reduction created (the variables MTK's schedule substitutes for derivatives) that read a
+     condition, directly or through each other =#
+  local created::Set{Any} = mtkDerivativeVariables(reduced)
   local derivatives = Set{Any}()
   local changed = true
   while changed
     changed = false
     for eq in observed
       local lhs = Symbolics.unwrap(eq.lhs)
-      (lhs in derivatives || !occursin("ˍt", string(lhs))) && continue
+      (lhs in derivatives || !(lhs in created)) && continue
       if any(v -> v in conditions || v in derivatives, Symbolics.get_variables(eq.rhs))
         push!(derivatives, lhs)
         changed = true

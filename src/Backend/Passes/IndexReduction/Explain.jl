@@ -137,7 +137,7 @@ function explainPlan(model::IR.Model, partition::IR.Partition, p::Plan, trace::V
     push!(blocks, ExplainedBlock(b.level, equations, candidates))
   end
   local sets = Vector{Symbol}[Symbol[s.variables[s.antiderivative[c]] for c in vcat(set.candidates, set.linked...)] for set in p.sets]
-  local setStates = Symbol[setStateName(k, l, j) for (k, set) in enumerate(p.sets) for l in 1:1+length(set.linked)
+  local setStates::Vector{Symbol} = Symbol[setStateCref(k, l, j).name for (k, set) in enumerate(p.sets) for l in 1:1+length(set.linked)
                            for j in 1:length(set.candidates)-size(set.jacobian, 1)]
   return Explanation(model.name, :reduced, "", differentiated, blocks, s.variables[selectedStates(s, p.dummies)], sets, setStates)
 end

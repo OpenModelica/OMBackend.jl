@@ -94,9 +94,9 @@ every mode has, then the top level's states, algebraic and discrete variables by
 """
 function sharedModeVariables(model::IR.Model)::Vector{String}
   local inMode = v::IR.Variable -> length(v.cref.parts) > 1 ? join((String(p.name) for p in v.cref.parts[2:end]), ".") : String(v.cref.parts[1].name)
-  local perMode = [String[inMode(v) for v in mode.variables if v.kind isa Union{IR.STATE, IR.ALGEBRAIC}] for mode in model.modes]
+  local perMode = [String[inMode(v) for v in mode.variables if v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER}] for mode in model.modes]
   local common = isempty(perMode) ? String[] : intersect(perMode...)
-  return vcat(common, String[inMode(v) for v in model.variables if v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.DISCRETE}])
+  return vcat(common, String[inMode(v) for v in model.variables if v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER, IR.DISCRETE}])
 end
 
 #= ==================================================================================== =#
@@ -114,8 +114,9 @@ function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.P
   local vars = IR.Variable[v for v in variables if !(v.kind isa IR.STATE_DER)]
   local names = systemNames(vars, model.name)
   local simVars = SIMVAR[SIMVAR(simName(names, v.cref), nothing, simVarKind(v, names), simVarAttributes(v, names),
-                                simType(IR.elementType(v.ty))) for v in vars]
-  local ht = createIndices(simVars)
+                                simType(IR.elementType(v.ty)), arrayDimensions(v), simKind(v.kind, variables, names), v.origin,
+                                v.cref) for v in vars]
+  local ht = createIndices(simVars, derivativeReferences(vars, variables, names))
   local eqs = classifyEquations(partition.equations)
   local initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(simStatements(names, w.branches[1].body), w.kind === IR.INITIAL_SECTION)
                                               for w in eqs.initialWhens]
@@ -125,7 +126,7 @@ function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.P
   local residuals = RESIDUAL_EQUATION[residual(names, eq) for eq in eqs.residuals]
   local (asserts, initialAssertAlgorithms) = lowerAsserts(names, ht, eqs.asserts, partition.initialEquations)
   append!(initialAlgorithms, initialAssertAlgorithms)
-  initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(mapStatements(e -> inlineParameters(e, ht), a.statements), a.section)
+  initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(mapStatements(e -> inlineParameters(e, ht, names), a.statements), a.section)
                                         for a in initialAlgorithms]
   local whenEquations = WHEN_EQUATION[lowerWhen(names, w) for w in runtimeWhens]
   local irreducibles = irreducibleVariables(names, eqs.ifs, whenEquations, vars, ht)
@@ -140,34 +141,111 @@ function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.P
                   functions, any(f -> f isa EXTERNAL_MODELICA_FUNCTION, functions),
                   RESIDUAL_EQUATION[], String[], AliasEntry[], nothing, initialAlgorithms, asserts, String[],
                   any(v -> v.kind isa Union{IR.DUMMY_STATE, IR.DUMMY_DER}, vars),
-                  String[simName(names, v.cref) for v in vars if v.kind isa IR.DUMMY_DER])
+                  ReferenceIndex(ht, String[simName(names, v.cref) for v in vars], model.name), Equation[], Equation[])
+end
+
+"""
+    ReferenceIndex(ht, order, modelName) -> ReferenceIndex
+
+The reference index of the variables `ht` (`ReferenceIndex`): their references (`SIMVAR.ref`), the keys by them
+(`referenceKeys`), the arrays of the elements (`elementArrays`), the identifiers (`codeIdentifiers`, `order` the
+variables' order in the IR, `modelName` for a renamed `t`).
+"""
+function ReferenceIndex(ht::HT, order::Vector{String}, modelName::String;
+                        elementNames::Dict{String, Vector{String}} = Dict{String, Vector{String}}())::ReferenceIndex
+  local references::Dict{String, IR.ComponentRef} = Dict{String, IR.ComponentRef}()
+  for (key::String, entry::Tuple{Int, SIMVAR}) in ht
+    local ref::Union{Nothing, IR.ComponentRef} = last(entry).ref
+    ref === nothing || (references[key] = ref)
+  end
+  return ReferenceIndex(references, referenceKeys(references), elementArrays(references),
+                        codeIdentifiers(order, references, ht, modelName), elementNames)
+end
+
+"""
+    codeIdentifiers(order, references, ht, modelName) -> Dict{String, String}
+
+Each variable's identifier in the generated code by its key (`ReferenceIndex.codeNames`), derived from its reference:
+its legacy name (`derivedKey`: `a_b[1][2]` of `a.b[1,2]`); a state's derivative `der(x)` of its state's; a variable
+named `t`, MTK's independent variable, `<model>V_t`. The legacy form is not one-to-one (`j2.v` and a variable `j2_v`,
+MSL's Fourbar1): of the variables of one legacy name the least qualified (the first, in `order`, the variables'
+order in the IR) keeps it, the others are `<name>_1`, `<name>_2`, ... (names not taken); a subscripted one cannot
+be renamed so, an error naming both. The simulation code's keys, the references' flat names, are unique.
+"""
+function codeIdentifiers(order::Vector{String}, references::Dict{String, IR.ComponentRef}, ht::HT, modelName::String)::Dict{String, String}
+  local out::Dict{String, String} = Dict{String, String}()
+  #= the variables by their legacy names, in the IR's order =#
+  local byLegacy::OrderedDict{String, Vector{String}} = OrderedDict{String, Vector{String}}()
+  for key::String in order
+    haskey(references, key) || continue
+    push!(get!(Vector{String}, byLegacy, derivedKey(references[key])), key)
+  end
+  local taken::Set{String} = Set{String}(keys(byLegacy))
+  for (legacy::String, keys::Vector{String}) in byLegacy
+    local keep::String = keys[argmin(Int[length(references[k].parts) for k in keys])]
+    for key in keys
+      if key == keep
+        out[key] = legacy
+        continue
+      end
+      IR.hasSubscripts(references[key]) &&
+        error("The variables $(keep) and $(key) have one identifier in the generated code, $(legacy), and $(key) is subscripted")
+      local k::Int = 1
+      while string(legacy, "_", k) in taken
+        k += 1
+      end
+      out[key] = string(legacy, "_", k)
+      push!(taken, out[key])
+    end
+  end
+  for (key::String, id::String) in out
+    if id == "t"
+      out[key] = string(codeName(Symbol(modelName)), "V_t")
+      @warn "Variable name t clash with builtin symbol in MTK. Variable renamed $(out[key])"
+    end
+  end
+  #= the states' derivatives, der(x) of their states' =#
+  for (key::String, entry::Tuple{Int, SIMVAR}) in ht
+    local v::SIMVAR = last(entry)
+    v.varKind isa STATE_DERIVATIVE && (out[key] = string("der(", out[v.varKind.varName], ")"))
+  end
+  return out
+end
+
+"""
+    derivativeReferences(vars, variables, names) -> Dict{String, IR.ComponentRef}
+
+Each state's derivative's reference by the state's key (`createIndices`' `der(x)` entries): the IR derivative variable
+its kind names (`\$DER.x`, or index reduction's `\$STATEDER.x`), else `IR.derivativeCref` of the state's.
+"""
+function derivativeReferences(vars::Vector{IR.Variable}, variables::IR.VariableSet, names::Names)::Dict{String, IR.ComponentRef}
+  local out::Dict{String, IR.ComponentRef} = Dict{String, IR.ComponentRef}()
+  for v in vars
+    v.kind isa IR.STATE || continue
+    local d::Union{Nothing, Symbol} = v.kind.derivative
+    out[simName(names, v.cref)] = (d !== nothing && haskey(variables, d)) ? variables[d].cref : IR.derivativeCref(v.cref)
+  end
+  return out
 end
 
 """
     systemNames(vars, modelName)
 
-The simulation names of the variables `vars` (collisions renamed; a variable named `t`, MTK's
-independent variable, as `<model>V_t`) and the names known as variables: theirs, `der(x)` of
-the states, `time`, `pi`, `e`; those of the variables that are not arrays.
+The keys of the variables `vars` (`Names`: their references' flat names) and the keys known as
+variables: theirs, the states' derivatives' (their IR derivative variables'), `time`, `pi`, `e`;
+those of the variables that are not arrays.
 """
 function systemNames(vars::Vector{IR.Variable}, modelName::String)::Names
   local stateOf = Dict{Symbol, IR.ComponentRef}()
   for v in vars
     (v.kind isa IR.STATE && v.kind.derivative !== nothing) && (stateOf[v.kind.derivative] = v.cref)
   end
-  local renamed = collidingNames(vars)
+  local names::Names = Names(true, Set{String}(), stateOf, Set{String}())
   for v in vars
-    if legacyName(v.cref) == "t" && !haskey(renamed, v.name)
-      renamed[v.name] = string(codeName(Symbol(modelName)), "V_t")
-      @warn "Variable name t clash with builtin symbol in MTK. Variable renamed $(renamed[v.name])"
-    end
-  end
-  local names = Names(renamed, Set{String}(), stateOf, Set{String}())
-  for v in vars
-    local n = simName(names, v.cref)
+    local n::String = simName(names, v.cref)
     push!(names.known, n)
     v.ty isa IR.T_ARRAY || push!(names.scalars, n)
-    v.kind isa IR.STATE && push!(names.known, "der($(n))")
+    v.kind isa IR.STATE && push!(names.known, v.kind.derivative === nothing ? refKey(IR.derivativeCref(v.cref)) : String(v.kind.derivative))
   end
   push!(names.known, "time", "pi", "e")
   return names
@@ -326,7 +404,7 @@ function splitTupleEquation(eq::EQUATION, ht::HT)::Union{Nothing, Vector{Equatio
   local types = eq.rhs.ty.types
   local targets = eq.lhs.elements
   length(types) >= length(targets) || return nothing
-  local isVariable = e -> e isa EXP_CREF && (local entry = get(ht, crefName(e.cref), nothing); entry !== nothing && !(last(entry).varKind isa PARAMETER))
+  local isVariable = e -> e isa EXP_CREF && (local entry = get(ht, crefName(e.cref), nothing); entry !== nothing && !isScalarParameter(last(entry)))
   local eqs = Equation[]
   for (k, target) in enumerate(targets)
     target isa WILD && continue
@@ -369,7 +447,7 @@ function lowerAsserts(names::Names, ht::OrderedDict{String, Tuple{Int, SIMVAR}},
       push!(initial, INITIAL_ALGORITHM(Statement[NORETCALL(a.condition, a.source)], false))
       continue
     end
-    local onVariables = any(n -> (local entry = get(ht, n, nothing); entry !== nothing && !(last(entry).varKind isa PARAMETER)),
+    local onVariables = any(n -> (local entry = get(ht, n, nothing); entry !== nothing && !isScalarParameter(last(entry))),
                             crefNames!(crefNames!(OrderedSet{String}(), a.condition), a.message))
     if !onVariables
       push!(out, a)
@@ -379,7 +457,7 @@ function lowerAsserts(names::Names, ht::OrderedDict{String, Tuple{Int, SIMVAR}},
       push!(initial, INITIAL_ALGORITHM(Statement[ASSERT(a.condition, a.message, a.level, a.source)], false))
     end
   end
-  local inline = e -> inlineParameters(e, ht; keepTunable = true, keepCalls = true)
+  local inline::Function = (e::Exp) -> inlineParameters(e, ht, names; keepTunable = true, keepCalls = true)
   out = ASSERT_EQUATION[ASSERT_EQUATION(inline(a.condition), inline(a.message), a.level, a.source) for a in out]
   return (out, initial)
 end
@@ -390,7 +468,7 @@ simAssert(names::Names, a::IR.ASSERT_EQUATION)::ASSERT_EQUATION =
 isNoReturnCall(e::IR.Expression)::Bool = e isa IR.CALL && e.ty isa IR.T_NORETCALL
 
 """
-    inlineParameters(e, ht; keepTunable)
+    inlineParameters(e, ht, names; keepTunable)
 
 `e` with the parameters replaced by their bindings, to a fixed point (a parameter bound to
 another): the initial algorithms run when the generated module is loaded, the asserts read
@@ -401,27 +479,29 @@ algorithm (it would keep its compiled value), a reference with `keepTunable`. Wi
 once: inlined, a time-varying assert's crossing called it at every evaluation (Buildings'
 weather data, `getTimeSpanTMY3(filNam, "tab1")` reading the weather file, 40 ms a call).
 """
-function inlineParameters(e::Exp, ht::OrderedDict{String, Tuple{Int, SIMVAR}}; keepTunable::Bool = false,
+function inlineParameters(e::Exp, ht::OrderedDict{String, Tuple{Int, SIMVAR}}, names::Names; keepTunable::Bool = false,
                           keepCalls::Bool = false)::Exp
   local visit = x -> begin
     local name = x isa EXP_CREF ? crefName(x.cref) : nothing
     name === nothing && return x
-    if isTunableParameter(name)
+    #= the tunable parameters are the user's, by their identifiers (`codeIdentifiers`' legacy names) =#
+    local id::String = x.cref.ref === nothing ? name : derivedKey(x.cref.ref)
+    if isTunableParameter(id)
       keepTunable && return x
-      throw(ArgumentError("tunable parameter $(name) is read in an initial algorithm, which is evaluated " *
+      throw(ArgumentError("tunable parameter $(id) is read in an initial algorithm, which is evaluated " *
                           "when the model is compiled, so it would keep its compiled value; leave it out of " *
                           "withTunableParameters"))
     end
     local entry = get(ht, name, nothing)
     if entry !== nothing
       local k = last(entry).varKind
-      local bind = k isa Union{PARAMETER, ARRAY_PARAMETER} ? k.bindExp : nothing
+      local bind = k isa PARAMETER ? k.bindExp : nothing
       (bind === nothing || (keepCalls && anyExp(y -> y isa CALL && y.kind !== CALL_BUILTIN, bind))) && return x
       return bind
     end
-    return something(scalarizedArrayParameter(name, ht), Some(x))
+    return something(scalarizedArrayParameter(x, ht), Some(x))
   end
-  local visitElements = x -> x isa ASUB ? something(elementsBySubscript(x, ht), Some(x)) : visit(x)
+  local visitElements::Function = (x::Exp) -> x isa ASUB ? something(elementsBySubscript(x, ht, names), Some(x)) : visit(x)
   local current = e
   for _ in 1:100
     local next = mapExp(visitElements, current)
@@ -432,19 +512,22 @@ function inlineParameters(e::Exp, ht::OrderedDict{String, Tuple{Int, SIMVAR}}; k
 end
 
 """
-    scalarizedArrayParameter(name, ht)
+    scalarizedArrayParameter(x, ht)
 
-The array value of an array parameter `name` known by its elements' parameters (`A[1][2]`,
-1 or 2 dimensions) with bindings, a missing element 0.0; `nothing` if there are none.
+The array value of an array parameter `x` known by its elements' parameters (`A[1][2]`: by
+their references, `elementIndex`; 1 or 2 dimensions) with bindings, a missing element 0.0;
+`nothing` if there are none.
 """
-function scalarizedArrayParameter(name::String, ht::OrderedDict{String, Tuple{Int, SIMVAR}})::Union{Nothing, Exp}
-  haskey(ht, name) && return nothing
+function scalarizedArrayParameter(x::EXP_CREF, ht::OrderedDict{String, Tuple{Int, SIMVAR}})::Union{Nothing, Exp}
+  (haskey(ht, crefName(x.cref)) || x.cref.ref === nothing || !isempty(x.cref.subs)) && return nothing
+  local array::IR.ComponentRef = x.cref.ref
   local entries = Tuple{Vector{Int}, Exp}[]
-  for (key, (_, sv)) in ht
-    local parsed = parseElementName(key)
-    (parsed === nothing || parsed[1] != name) && continue
-    (sv.varKind isa PARAMETER && sv.varKind.bindExp !== nothing) || continue
-    push!(entries, (parsed[2], sv.varKind.bindExp))
+  for (_, (_, sv)) in ht
+    sv.ref === nothing && continue
+    local index::Union{Nothing, Vector{Int}} = elementIndex(sv.ref, array)
+    index === nothing && continue
+    hasBindingExp(sv) || continue
+    push!(entries, (index, sv.varKind.bindExp))
   end
   isempty(entries) && return nothing
   local element = idx -> (local k = findfirst(x -> x[1] == idx, entries); k === nothing ? RCONST(0.0) : entries[k][2])
@@ -462,41 +545,27 @@ function scalarizedArrayParameter(name::String, ht::OrderedDict{String, Tuple{In
 end
 
 """
-    elementsBySubscript(e, ht)
+    elementsBySubscript(e, ht, names)
 
 An array that is not a variable read by a subscript that is not a literal (a loop's iterator:
-the plotters' `legend[i]`), its elements 1, 2, ... variables: the array of the elements'
-references, subscripted; `nothing` for another expression.
+the plotters' `legend[i]`), its elements 1, 2, ... variables (their references: the array's
+subscripted on its last part, their keys by `simName`): the array of the elements' references,
+subscripted; `nothing` for another expression.
 """
-function elementsBySubscript(e::ASUB, ht::OrderedDict{String, Tuple{Int, SIMVAR}})::Union{Nothing, Exp}
+function elementsBySubscript(e::ASUB, ht::OrderedDict{String, Tuple{Int, SIMVAR}}, names::Names)::Union{Nothing, Exp}
   (e.exp isa EXP_CREF && length(e.subs) == 1 && !(e.subs[1] isa ICONST)) || return nothing
-  local base = crefName(e.exp.cref)
-  haskey(ht, base) && return nothing
-  local elementTy = e.exp.ty isa TYPE_ARRAY ? e.exp.ty.elementType : e.exp.ty
-  local elements = Exp[]
-  while haskey(ht, string(base, "[", length(elements) + 1, "]"))
-    push!(elements, EXP_CREF(SimCref(Symbol(base, "[", length(elements) + 1, "]")), elementTy))
+  (haskey(ht, crefName(e.exp.cref)) || e.exp.cref.ref === nothing) && return nothing
+  local array::IR.ComponentRef = e.exp.cref.ref
+  local elementTy::SType = e.exp.ty isa TYPE_ARRAY ? e.exp.ty.elementType : e.exp.ty
+  local elements::Vector{Exp} = Exp[]
+  while true
+    local ref::IR.ComponentRef = IR.appendSubscripts(array, IR.Subscript[IR.INDEX(IR.INTEGER(length(elements) + 1))])
+    local key::String = simName(names, ref)
+    haskey(ht, key) || break
+    push!(elements, EXP_CREF(SimCref(Symbol(key), Int[], ref), elementTy))
   end
   isempty(elements) && return nothing
   return ASUB(ARRAY_EXP(TYPE_ARRAY(elementTy, Int[length(elements)]), true, elements), e.subs)
-end
-
-"An element's name `A[1][2]` as `(\"A\", [1, 2])`; `nothing` for another name."
-function parseElementName(key::String)::Union{Nothing, Tuple{String, Vector{Int}}}
-  local open = findfirst('[', key)
-  open === nothing && return nothing
-  local indices = Int[]
-  local rest = key[open:end]
-  while !isempty(rest)
-    rest[1] == '[' || return nothing
-    local close = findfirst(']', rest)
-    close === nothing && return nothing
-    local i = tryparse(Int, rest[2:close-1])
-    i === nothing && return nothing
-    push!(indices, i)
-    rest = rest[close+1:end]
-  end
-  return (key[1:open-1], indices)
 end
 
 #= ==================================================================================== =#
@@ -530,9 +599,15 @@ function substituteSampleTriggers(whens::Vector{IR.WHEN_EQUATION}, equations::Ve
     x isa IR.CREF && return (get(defs, x.cref.name, x), false)
     return (x, true)
   end
-  local bodyStatement = s -> s isa IR.ASSIGNMENT ? IR.ASSIGNMENT(s.lhs, inBody(s.rhs), s.source) :
-                             s isa IR.REINIT ? IR.REINIT(s.state, inBody(s.value), s.source) :
-                             s isa IR.ASSERT ? IR.ASSERT(inBody(s.condition), s.message, s.level, s.source) : s
+  local bodyStatement
+  bodyStatement = s -> s isa IR.ASSIGNMENT ? IR.ASSIGNMENT(s.lhs, inBody(s.rhs), s.source) :
+                       s isa IR.REINIT ? IR.REINIT(s.state, inBody(s.value), s.source) :
+                       s isa IR.ASSERT ? IR.ASSERT(inBody(s.condition), s.message, s.level, s.source) :
+                       s isa IR.NORETCALL ? IR.NORETCALL(inBody(s.exp), s.source) :
+                       s isa IR.TERMINATE ? IR.TERMINATE(inBody(s.message), s.source) :
+                       s isa IR.IF_STATEMENT ? IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(inBody(b.condition), IR.Statement[bodyStatement(x) for x in b.body])
+                                                                                   for b in s.branches],
+                                                                IR.Statement[bodyStatement(x) for x in s.elseBody], s.source) : s
   return IR.WHEN_EQUATION[IR.WHEN_EQUATION(IR.WhenBranch[IR.WhenBranch(IR.Expression[subst(t) for t in b.triggers],
                                                                       b.atInitial, b.atTerminal,
                                                                       IR.Statement[bodyStatement(s) for s in whenOperators(b.body)])
@@ -618,16 +693,22 @@ end
 A when-equation's body without if-statements (MLS 8.3.5: their branches assign the same
 variables): one assignment per variable of `if c1 then e1 elseif ... else en`, a branch
 without one keeping the value; a `reinit` likewise (to the state itself); an assert under its
-branch's condition. A call for its effects in a branch is not made.
+branch's condition; a call for its effects and a `terminate()` in an if-statement of their own, under the branch's
+condition.
 """
 function whenOperators(body::Vector{IR.Statement})::Vector{IR.Statement}
-  any(s -> s isa IR.IF_STATEMENT, body) || return body
+  any(s -> s isa IR.IF_STATEMENT && !isEffectIf(s), body) || return body
   local out = IR.Statement[]
   for s in body
-    s isa IR.IF_STATEMENT ? append!(out, ifStatementOperators(s)) : push!(out, s)
+    (s isa IR.IF_STATEMENT && !isEffectIf(s)) ? append!(out, ifStatementOperators(s)) : push!(out, s)
   end
   return out
 end
+
+"An if-statement of calls for their effects and `terminate()` only (`whenOperators` keeps it)."
+isEffectIf(s::IR.Statement)::Bool =
+  s isa IR.IF_STATEMENT &&
+  all(x -> x isa Union{IR.NORETCALL, IR.TERMINATE} || isEffectIf(x), Iterators.flatten((Iterators.flatten(b.body for b in s.branches), s.elseBody)))
 
 function ifStatementOperators(s::IR.IF_STATEMENT)::Vector{IR.Statement}
   local bodies = vcat([whenOperators(b.body) for b in s.branches], [whenOperators(s.elseBody)])
@@ -641,7 +722,7 @@ function ifStatementOperators(s::IR.IF_STATEMENT)::Vector{IR.Statement}
   push!(guards, before === nothing ? IR.BOOLEAN(true) : before)
   local targets = OrderedDict{Tuple{Symbol, IR.Expression}, IR.Expression}()
   local values = [Dict{Tuple{Symbol, IR.Expression}, IR.Expression}() for _ in bodies]
-  local asserts = IR.Statement[]
+  local effects = IR.Statement[]
   for (k, ops) in enumerate(bodies), op in ops
     if op isa IR.ASSIGNMENT
       targets[(:assign, op.lhs)] = op.lhs
@@ -651,8 +732,11 @@ function ifStatementOperators(s::IR.IF_STATEMENT)::Vector{IR.Statement}
       targets[(:reinit, state)] = state
       values[k][(:reinit, state)] = op.value
     elseif op isa IR.ASSERT
-      push!(asserts, IR.ASSERT(IR.LBINARY(IR.LUNARY(IR.NOT, guards[k]), IR.OR, op.condition), op.message, op.level, op.source))
-    elseif !(op isa IR.NORETCALL)
+      push!(effects, IR.ASSERT(IR.LBINARY(IR.LUNARY(IR.NOT, guards[k]), IR.OR, op.condition), op.message, op.level, op.source))
+    elseif op isa Union{IR.NORETCALL, IR.TERMINATE, IR.IF_STATEMENT}
+      #= an if-statement here is one of these (the branch's own, made above) =#
+      push!(effects, IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(guards[k], IR.Statement[op])], IR.Statement[], s.source))
+    else
       unsupported("this statement in an if-equation in a when-equation", IR.toString(op))
     end
   end
@@ -665,7 +749,7 @@ function ifStatementOperators(s::IR.IF_STATEMENT)::Vector{IR.Statement}
     end
     push!(out, kind === :assign ? IR.ASSIGNMENT(target, value, s.source) : IR.REINIT(target.cref, value, s.source))
   end
-  return vcat(out, asserts)
+  return vcat(out, effects)
 end
 
 """

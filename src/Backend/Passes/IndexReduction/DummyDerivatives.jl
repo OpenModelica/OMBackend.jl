@@ -96,14 +96,15 @@ Each structure variable's StateSelect as OpenModelica reads it after its alias e
 highest one declared in its alias set (`declared`; the variables `a = b`, `a = -b` equations
 join: RollingWheelSet's `der_theta1(stateSelect = always)` and its joint's `der_theta1`);
 NEVER for a set of derivative variables only (`\$DER.x` is a state only where no declared
-variable can be).
+variable can be; by the kinds, `antiderivatives`).
 """
 function aliasClasses(s::Structure, partition::IR.Partition, variables::IR.VariableSet,
                       declared::Vector{IR.StateSelect})::Vector{IR.StateSelect}
   local root = aliasRoots(s, partition)
   local best = Dict{Int, IR.StateSelect}()
+  local antiderivative::Dict{Symbol, Symbol} = antiderivatives(variables)
   for v in eachindex(s.variables)
-    (haskey(variables, s.variables[v]) && !startswith(String(s.variables[v]), '$')) || continue
+    (haskey(variables, s.variables[v]) && !haskey(antiderivative, s.variables[v])) || continue
     best[root[v]] = max(get(best, root[v], IR.NEVER), declared[v])
   end
   return IR.StateSelect[get(best, root[v], IR.NEVER) for v in eachindex(s.variables)]

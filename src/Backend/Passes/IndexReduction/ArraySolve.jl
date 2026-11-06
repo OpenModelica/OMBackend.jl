@@ -165,8 +165,9 @@ function solvedTemplate(body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}, row
   local cref::IR.CREF = only(values(candidates))
   all(((r, d)::Pair{Int, Symbol},) -> isElement(cref, r, d), rows) ||
     throw(NotHandled("a for-equation whose iterations are solved for different references ($(equationLine(body)))"))
-  #= each iterator once, as a subscript of its own: the value is over the iterators, read at any subscripts =#
-  local own::Vector{IR.Subscript} = allSubscripts(cref.cref)
+  #= each iterator once, as a subscript of its own: the value is over the iterators, read at any subscripts; a variable
+     of its own (an element of an array split for index reduction, `\$DER.x[2]`, as `solvedTarget` reads it) has none =#
+  local own::Vector{IR.Subscript} = haskey(model.variables, cref.cref.name) ? IR.Subscript[] : allSubscripts(cref.cref)
   (length(own) == length(iterators) &&
    Set(Symbol[s isa IR.INDEX && s.exp isa IR.CREF ? s.exp.cref.name : Symbol("") for s in own]) == Set(iterators)) ||
     throw(NotHandled("a derivative solved through $(cref.cref.name), not subscripted by its iterators $(iterators)"))
@@ -392,7 +393,7 @@ function solvedInArraysOnce(model::IR.Model, view::Scalarized, solution::Derivat
   local solved::IR.Model = IR.Model(model.name, model.variables, IR.Partition[solvedPartition], model.clocked, model.baseClocks,
                           model.functions, model.initialMode, model.modes, model.transitions, model.frontendModel)
   #= the check: the array form's elements are the element view's solved equations =#
-  substituteDerivatives!(elementPartition, solution)
+  substituteDerivatives!(elementPartition, solution, view.model.variables)
   local mine::Vector{IR.Equation} = scalarizeArrays(solved).model.continuous[1].equations
   length(mine) == length(elementPartition.equations) ||
     throw(NotHandled("derivatives solved in array form: $(length(mine)) element equations, the element view $(length(elementPartition.equations))"))

@@ -150,10 +150,13 @@ function _algebraicRows(f)
 end
 
 """
-A Rodas method (OrdinaryDiffEqRosenbrock's Rodas3P ... Rodas5Pr): one
-step, no FSAL derivative. By name: the Rosenbrock methods differ in FSAL.
+A Rodas method: a Rosenbrock method that starts each step from the state
+alone, no FSAL derivative (OrdinaryDiffEqCore's `isfsal` trait: Rodas3P ...
+Rodas6P; not Rosenbrock23, Rodas3 or Rodas3d, whose steps reuse the last
+derivative).
 """
-_isRodas(alg) = startswith(string(nameof(typeof(alg))), "Rodas")
+_isRodas(alg) = alg isa OrdinaryDiffEq.OrdinaryDiffEqCore.OrdinaryDiffEqRosenbrockAdaptiveAlgorithm &&
+                !OrdinaryDiffEq.OrdinaryDiffEqCore.isfsal(alg)
 
 const _SparseArrays = Symbolics.SparseArrays
 

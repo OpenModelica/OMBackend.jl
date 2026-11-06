@@ -198,12 +198,7 @@ The name of the array the previous backend took an element to be of: its name up
 first subscript, of an element whose last part has subscripts (`x[2]` of `x`, `a.x[2]` of
 `a.x`, `a[1].x[2]` of `a`); the reference's own name otherwise.
 """
-function elementBase(cref::IR.ComponentRef)::Symbol
-  isempty(IR.subscripts(cref)) && return cref.name
-  local k = findfirst(p -> !isempty(p.subscripts), cref.parts)
-  local parts = IR.CrefPart[cref.parts[1:k-1]..., IR.CrefPart(cref.parts[k].name, IR.Subscript[], cref.parts[k].ty)]
-  return IR.ComponentRef(parts).name
-end
+elementBase(cref::IR.ComponentRef)::Symbol = isempty(IR.subscripts(cref)) ? cref.name : IR.upToFirstSubscripted(cref).name
 
 """
     addAssignedNames!(names, body, candidates; nested)
@@ -276,13 +271,13 @@ end
     lowerHigherOrderDerivatives!(model)
 
 A derivative of a derivative as the first derivative of an auxiliary variable:
-`der(der(x))` is `der(der_x)` with the variable `der_x` and the equation `der_x = der(x)`
-(after the others; once per variable), recursively for higher ones. In the equations of the
+`der(der(x))` is `der(der.x)` with the variable `der.x` (`IR.auxiliaryDerivativeCref`, `der_x` in the code) and the
+equation `der.x = der(x)` (after the others; once per variable), recursively for higher ones. In the equations of the
 continuous-time partitions and the structural modes.
 """
 function lowerHigherOrderDerivatives!(model::IR.Model)::IR.Model
   for (variables, p) in partitionsWithVariables(model)
-    local auxiliaries = Dict{String, IR.ComponentRef}()
+    local auxiliaries = Dict{IR.ComponentRef, IR.ComponentRef}()
     local equations = IR.Equation[]
     local g = e -> IR.mapExp(x -> lowerNestedDer(x, variables, auxiliaries, equations), e)
     foreach(eq -> mapRoots!(g, eq), p.equations)
@@ -296,7 +291,7 @@ isDerOf(e::IR.Expression)::Bool = IR.isBuiltinCall(e, :der) && length(e.argument
 "Whether `e` is `der(...der(x)...)` of a reference `x`."
 endsInReference(e::IR.Expression)::Bool = e isa IR.CREF || (isDerOf(e) && endsInReference(e.arguments[1]))
 
-function lowerNestedDer(e::IR.Expression, variables::IR.VariableSet, auxiliaries::Dict{String, IR.ComponentRef},
+function lowerNestedDer(e::IR.Expression, variables::IR.VariableSet, auxiliaries::Dict{IR.ComponentRef, IR.ComponentRef},
                         equations::Vector{IR.Equation})::IR.Expression
   (isDerOf(e) && isDerOf(e.arguments[1]) && endsInReference(e.arguments[1].arguments[1])) || return e
   local aux = derivativeVariable(e.arguments[1], e.attributes, variables, auxiliaries, equations)
@@ -306,23 +301,22 @@ end
 """
     derivativeVariable(d, attributes, variables, auxiliaries, equations)
 
-The auxiliary variable equal to the derivative `d = der(a)`: `der_<a>` (of `a` lowered first
-if itself a derivative), with its equation `der_<a> = der(a)`; one per variable.
+The auxiliary variable equal to the derivative `d = der(a)`: `der.a` (`IR.auxiliaryDerivativeCref`, of `a` lowered
+first if itself a derivative), with its equation `der.a = der(a)`; one per variable (`auxiliaries`, by `a`).
 """
 function derivativeVariable(d::IR.CALL, attributes::IR.CallAttributes, variables::IR.VariableSet,
-                            auxiliaries::Dict{String, IR.ComponentRef}, equations::Vector{IR.Equation})::IR.ComponentRef
-  local arg = d.arguments[1]
-  local base = arg isa IR.CREF ? arg.cref : derivativeVariable(arg, attributes, variables, auxiliaries, equations)
-  local baseName = legacyName(base)
-  local existing = get(auxiliaries, baseName, nothing)
+                            auxiliaries::Dict{IR.ComponentRef, IR.ComponentRef}, equations::Vector{IR.Equation})::IR.ComponentRef
+  local arg::IR.Expression = d.arguments[1]
+  local base::IR.ComponentRef = arg isa IR.CREF ? arg.cref : derivativeVariable(arg, attributes, variables, auxiliaries, equations)
+  local existing::Union{Nothing, IR.ComponentRef} = get(auxiliaries, base, nothing)
   existing === nothing || return existing
-  local aux = IR.ComponentRef(Symbol("der_", baseName), IR.T_REAL())
+  local aux::IR.ComponentRef = IR.auxiliaryDerivativeCref(base)
   push!(variables, IR.Variable(aux, IR.T_REAL(), IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION,
                                false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :lowerHigherOrderDerivatives))
   push!(equations, IR.SCALAR_EQUATION(IR.CREF(aux, IR.T_REAL()),
                                       IR.CALL(:der, IR.Expression[IR.CREF(base, IR.T_REAL())], IR.T_REAL(), attributes),
                                       IR.T_REAL(), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
-  auxiliaries[baseName] = aux
+  auxiliaries[base] = aux
   return aux
 end
 
@@ -385,9 +379,7 @@ function runtimeIndexChoice(e::IR.Expression, iterators::Set{Symbol})::IR.Expres
   (ty isa IR.T_ARRAY && length(ty.dimensions) == 1 && ty.dimensions[1] isa IR.DIM_SIZE) || return e
   local n = ty.dimensions[1].size
   n > 0 || return e
-  local element = k -> IR.CREF(IR.ComponentRef(IR.CrefPart[e.cref.parts[1:end-1]...,
-                                                           IR.CrefPart(last.name, IR.Subscript[IR.INDEX(IR.INTEGER(k))], ty)]),
-                               ty.elementType)
+  local element::Function = (k::Int) -> IR.CREF(IR.withLastSubscripts(e.cref, IR.Subscript[IR.INDEX(IR.INTEGER(k))]), ty.elementType)
   local choice::IR.Expression = element(n)
   for k in n-1:-1:1
     choice = IR.IF_EXPRESSION(IR.RELATION(index, IR.EQUAL, IR.INTEGER(k), 0), element(k), choice, ty.elementType)
@@ -422,7 +414,7 @@ function resolveBindingReferences!(variables::IR.VariableSet)::Nothing
     local changed = false
     for v in variables
       v.binding isa IR.CREF || continue
-      local target = legacyName(withoutLastSubscripts(v.binding.cref))
+      local target::String = legacyName(IR.withoutLastSubscripts(v.binding.cref))
       isTunableParameter(target) && continue
       local b::Union{Nothing, IR.Expression} = get(bindings, target, nothing)
       (b === nothing || b isa IR.CREF) && continue
@@ -439,9 +431,6 @@ function resolveBindingReferences!(variables::IR.VariableSet)::Nothing
   return nothing
 end
 
-withoutLastSubscripts(cref::IR.ComponentRef)::IR.ComponentRef =
-  IR.ComponentRef(IR.CrefPart[cref.parts[1:end-1]..., IR.CrefPart(cref.parts[end].name, IR.Subscript[], cref.parts[end].ty)])
-
 #= ==================================================================================== =#
 #= If-expressions                                                                       =#
 #= ==================================================================================== =#
@@ -455,21 +444,26 @@ others): `if c then a else b` is the Real `ifEq_tmp<k>` with
 chain (an else-branch that is an if-expression with events) is one if-equation. Equal
 if-expressions share one variable (two zero-crossing callbacks of one condition in MTK leave
 the other's parameter pinned). Stays inline: an if-expression in `noEvent` or of a condition
-whose relations all are (no events, MLS 8.5); of a record value (the variable is a Real); in
+whose relations all are (no events, MLS 8.5); of a record value (the variable is a Real); with a call without a
+result in a branch (a hoisted call equation, an assert's condition: `isNoResultCall`); in
 the branches of a lifted one, one whose condition does not depend on time (a state-dependent
-condition crosses in both directions: its branches are evaluated as a continuous product).
-The when-equations (their code generation evaluates them in place) and algorithms are left.
+condition crosses in both directions: its branches are evaluated as a continuous product); in a
+for-equation (arrays kept), one that reads its iterator (the array code reads it inline; the scalar
+path takes such a model from the frontend's scalarized flatten). The when-equations (their code
+generation evaluates them in place), the asserts (checked where they are, not in the right-hand side: a Boolean
+if-expression of a condition lifted as a Real variable was read as a Boolean) and algorithms are left.
 """
 function liftIfExpressions!(model::IR.Model)::IR.Model
   for (variables, p) in partitionsWithVariables(model)
     local lifter = IfExpressionLifter(variables, Dict{Any, IR.CREF}(), IR.Equation[], Ref(0))
     for eq in p.equations
       (eq isa IR.WHEN_EQUATION && eq.kind !== IR.STRUCTURAL_WHEN) && continue
-      #= for-equations come here only with the arrays kept (index reduction in array form), which then
-         declines: the lifted if-equation would read the iterator outside its loop (MSL RobotR3.oneAxis's
-         `moving[i] = if abs(q_end[i] - q_begin[i]) > eps then ...`, a free `i` in the generated code) =#
-      (eq isa IR.FOR_EQUATION && ifReadsIterator(eq)) &&
-        throw(IndexReduction.NotHandled("an if-expression that reads a for-equation's iterator"))
+      eq isa IR.ASSERT_EQUATION && continue
+      #= for-equations come here only with the arrays kept: an if-expression that reads the iterator stays inline
+         (lifted, its if-equation would read the iterator outside its loop: MSL RobotR3.oneAxis's
+         `moving[i] = if abs(q_end[i] - q_begin[i]) > eps then ...`, a free `i` in the generated code); the array
+         code and index reduction read it there =#
+      (eq isa IR.FOR_EQUATION && ifReadsIterator(eq)) && continue
       mapRoots!(e -> lift(lifter, e, false), eq)
     end
     append!(p.equations, lifter.equations)
@@ -498,6 +492,12 @@ function ifReadsIterator(eq::IR.FOR_EQUATION, scope::Set{Symbol} = Set{Symbol}()
   return false
 end
 
+"""
+A call without a result (`hoistIfEquationAsserts!`'s call equation under its branch's condition, `if c then f() else
+true`, an assert's condition): a statement, not a value a Real variable could take.
+"""
+isNoResultCall(e::IR.Expression)::Bool = e isa IR.CALL && e.ty isa IR.T_NORETCALL
+
 "The state of the lifting in a partition: the lifted if-expressions' variables (by shape), their equations, the next number."
 struct IfExpressionLifter
   variables::IR.VariableSet
@@ -516,7 +516,7 @@ function lift(lifter::IfExpressionLifter, e::IR.Expression, timeDependentOnly::B
   e isa IR.IF_EXPRESSION || return IR.mapChildren(x -> lift(lifter, x, timeDependentOnly), e)
   local inner = x -> lift(lifter, x, true)
   if (timeDependentOnly && !dependsOnTime(e.condition)) || relationsAllInNoEvent(e.condition) ||
-     isRecordValued(e.thenExp) || isRecordValued(e.elseExp)
+     isRecordValued(e.thenExp) || isRecordValued(e.elseExp) || isNoResultCall(e.thenExp) || isNoResultCall(e.elseExp)
     return IR.IF_EXPRESSION(inner(e.condition), inner(e.thenExp), inner(e.elseExp), e.ty)
   end
   local conditions = IR.Expression[inner(e.condition)]
@@ -600,10 +600,10 @@ function expandRecordFieldArrays!(variables::IR.VariableSet)::Nothing
       push!(out, v)
     elseif !isempty(v.cref.parts[end].subscripts)
       push!(out, v)
-      local array = withoutLastSubscripts(v.cref)
+      local array::IR.ComponentRef = IR.withoutLastSubscripts(v.cref)
       (IR.isKnown(v) && all(d -> d isa IR.DIM_SIZE, array.parts[end].ty.dimensions)) || continue
       local (_, _, elements) = get!(groups, legacyName(array), (array, v, Dict{Vector{Int}, IR.Expression}()))
-      local index = literalIndices(v.cref.parts[end].subscripts)
+      local index::Union{Nothing, Vector{Int}} = IR.literalIndices(v.cref.parts[end].subscripts)
       (index === nothing || v.binding === nothing) || (elements[index] = v.binding)
     else
       append!(out, recordFieldArrayElements(v))
@@ -622,15 +622,12 @@ function expandRecordFieldArrays!(variables::IR.VariableSet)::Nothing
   return nothing
 end
 
-"Whether `cref` is an array field of a record: its last part of an array type, the one before of a record type."
+"""
+Whether `cref` is an array field of a record: its last part of an array type, the one before of a record type; not a
+derivative's (`IR.isDerivativeCref`: `\$DER.r.f` stays one variable).
+"""
 isRecordFieldArray(cref::IR.ComponentRef)::Bool =
-  length(cref.parts) >= 2 && cref.parts[end].ty isa IR.T_ARRAY && cref.parts[end-1].ty isa IR.T_RECORD
-
-"The literal Integer indices of `subscripts`; `nothing` if one is not."
-function literalIndices(subscripts::Vector{IR.Subscript})::Union{Nothing, Vector{Int}}
-  all(s -> s isa IR.INDEX && s.exp isa IR.INTEGER, subscripts) || return nothing
-  return Int[s.exp.value for s in subscripts]
-end
+  length(cref.parts) >= 2 && cref.parts[end].ty isa IR.T_ARRAY && cref.parts[end-1].ty isa IR.T_RECORD && !IR.isDerivativeCref(cref)
 
 """
     assembledBinding(sizes, elements, name)
@@ -671,8 +668,7 @@ function recordFieldArrayElements(v::IR.Variable)::Vector{IR.Variable}
   local out = IR.isKnown(v) ? IR.Variable[v] : IR.Variable[]
   for i in CartesianIndices(Tuple(d.size for d in ty.dimensions))
     local index = collect(Tuple(i))
-    local cref = IR.ComponentRef(IR.CrefPart[v.cref.parts[1:end-1]...,
-                                             IR.CrefPart(last.name, IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index], ty)])
+    local cref::IR.ComponentRef = IR.withLastSubscripts(v.cref, IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index])
     local binding = v.binding === nothing ? nothing : bindingElement(v.binding, index)
     push!(out, IR.Variable(cref, ty.elementType, v.kind, binding, v.attributes, v.direction, v.isProtected, v.connector,
                            v.source, :expandRecordFieldArrays))
@@ -823,9 +819,7 @@ function elementOf(e::IR.Expression, index::Vector{Int})::IR.Expression
   local subs = IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index]
   local ty = elementTypeOf(IR.typeOf(e), length(index))
   if e isa IR.CREF
-    local last = e.cref.parts[end]
-    local parts = IR.CrefPart[e.cref.parts[1:end-1]..., IR.CrefPart(last.name, vcat(last.subscripts, subs), last.ty)]
-    return IR.CREF(IR.ComponentRef(parts), ty)
+    return IR.CREF(IR.appendSubscripts(e.cref, subs), ty)
   end
   local recordTy = IR.typeOf(e)
   (recordTy isa IR.T_RECORD && length(index) == 1 && index[1] <= length(recordTy.fields)) && return fieldByIndex(e, index[1])
@@ -880,7 +874,7 @@ function unrollAt(e::IR.Expression)::IR.Expression
   if e isa IR.CALL && e.attributes.builtin && e.name in FOLDED_REDUCERS && length(e.arguments) == 1
     local arg = e.arguments[1]
     local elements = arg isa IR.ARRAY_CONSTRUCTOR ? reductionElements(arg.body, arg.iterators) :
-                     arg isa IR.ARRAY ? copy(arg.elements) : nothing
+                     arg isa IR.ARRAY ? literalElements!(IR.Expression[], arg) : nothing
     elements === nothing && return e
     return something(foldReduction(e.name, elements, e.ty, e.attributes), e)
   elseif e isa IR.REDUCTION && e.reducer in FOLDED_REDUCERS
@@ -914,6 +908,31 @@ function reductionElements(body::IR.Expression, iterators::Vector{IR.Iterator}):
   values === nothing && return nothing
   local name = iterators[1].name
   return IR.Expression[substituteIterators(body, Dict(name => k)) for k in values]
+end
+
+"""
+The elements of an array literal, of its nested literals and of its array variables of known sizes in turn
+(`max({{v[1], v[2]}, {w[1], w[2]}})`, `max({v, w})` with the arrays kept, reduce over the four: folded over the two
+rows it was `max` of two arrays).
+"""
+function literalElements!(out::Vector{IR.Expression}, e::IR.ARRAY)::Vector{IR.Expression}
+  for x in e.elements
+    x isa IR.ARRAY ? literalElements!(out, x) : arrayElements!(out, x)
+  end
+  return out
+end
+
+"The elements of `x`, row-major, where it is a reference to an array of known sizes (`v` of Real[2]: `v[1]`, `v[2]`); else `x`."
+function arrayElements!(out::Vector{IR.Expression}, x::IR.Expression)::Vector{IR.Expression}
+  local ty::IR.ModelicaType = IR.typeOf(x)
+  (x isa IR.CREF && ty isa IR.T_ARRAY) || return push!(out, x)
+  local n::Union{Nothing, Int} = IR.dimensionSize(first(ty.dimensions))
+  n === nothing && return push!(out, x)
+  local inner::IR.ModelicaType = length(ty.dimensions) == 1 ? ty.elementType : IR.T_ARRAY(ty.elementType, ty.dimensions[2:end])
+  for k in 1:n
+    arrayElements!(out, IR.CREF(IR.appendSubscripts(x.cref, IR.Subscript[IR.INDEX(IR.INTEGER(k))]), inner))
+  end
+  return out
 end
 
 """

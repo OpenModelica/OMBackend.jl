@@ -105,7 +105,7 @@ The name a variable reference or an element of an array variable by literal subs
 function crefLikeName(e::Exp)::Union{Nothing, String}
   e isa EXP_CREF && return crefName(e.cref)
   (e isa ASUB && e.exp isa EXP_CREF && !isempty(e.subs) && all(s -> s isa ICONST, e.subs)) || return nothing
-  return string(crefName(e.exp.cref), join(("[$(s.value)]" for s in e.subs)))
+  return elementKey(e.exp.cref, Int[(s::ICONST).value for s in e.subs])
 end
 
 "The name of `candidates` a residual `v - f` (or `f - v`) has as `v`; `nothing` for another residual."

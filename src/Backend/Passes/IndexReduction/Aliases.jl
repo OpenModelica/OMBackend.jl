@@ -174,15 +174,39 @@ function undoAliases!(model::IR.Model, partition::IR.Partition, undo::AliasUndo)
   return nothing
 end
 
-"The derivative chain of `name`: `\$DER.name`, `\$DER.\$DER.name`, ... as far as they are variables of the model."
+"The derivative chain of `name` by the states' kinds (`STATE.derivative`): `\$DER.name`, `\$DER.\$DER.name`, ... as far as they are variables of the model."
 function derivativeChain(variables::IR.VariableSet, name::Symbol)::Vector{Symbol}
   local chain = Symbol[]
-  local d = IR.derivativeName(name)
-  while haskey(variables, d)
-    push!(chain, d)
-    d = IR.derivativeName(d)
+  local k::IR.VariableKind = variables[name].kind
+  while k isa IR.STATE && k.derivative !== nothing && haskey(variables, k.derivative)
+    push!(chain, k.derivative)
+    k = variables[k.derivative].kind
   end
   return chain
+end
+
+"""
+    antiderivatives(variables) -> Dict{Symbol, Symbol}
+
+Each derivative variable's antiderivative, by the kinds: a state's `derivative` (a `\$DER.x` of a higher-order
+chain is a state itself), a dummy state's `dummyDerivative`, a derivative variable's state (`STATE_DER`,
+`ALGEBRAIC_DER`, `DUMMY_DER`).
+"""
+function antiderivatives(variables::IR.VariableSet)::Dict{Symbol, Symbol}
+  local out = Dict{Symbol, Symbol}()
+  for v in variables
+    local k::IR.VariableKind = v.kind
+    if k isa IR.STATE
+      k.derivative === nothing || (out[k.derivative] = v.name)
+    elseif k isa IR.DUMMY_STATE
+      out[k.dummyDerivative] = v.name
+    elseif k isa Union{IR.STATE_DER, IR.ALGEBRAIC_DER}
+      out[v.name] = k.state
+    elseif k isa IR.DUMMY_DER
+      out[v.name] = k.dummyState
+    end
+  end
+  return out
 end
 
 """
@@ -207,7 +231,7 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
   local discretes = discreteTargets(partition)
   local isCandidate = name::Symbol -> begin
     local v = get(variables, name, nothing)
-    v !== nothing && v.ty isa IR.T_REAL && v.kind isa Union{IR.STATE, IR.ALGEBRAIC} && !(name in discretes) &&
+    v !== nothing && v.ty isa IR.T_REAL && v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER} && !(name in discretes) &&
       v.direction !== IR.INPUT
   end
   local isConstant = (e::IR.Expression) -> begin
@@ -216,6 +240,7 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
     local v = get(variables, s[1], nothing)
     return v !== nothing && v.kind isa Union{IR.PARAMETER, IR.CONSTANT} && v.ty isa IR.T_REAL
   end
+  local antiderivative::Dict{Symbol, Symbol} = antiderivatives(variables)
   #= the variables that must keep their equations: written by whens (reinit) or algorithms, read whole, inputs =#
   local blocked = Set{Symbol}()
   local resolve = Resolver(Symbol[v.name for v in variables])
@@ -234,8 +259,8 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
     elseif eq isa IR.WHEN_EQUATION
       IR.foreachRootExp(eq) do e
         IR.foreachExp(e) do x
-          (x isa IR.CREF && startswith(String(x.cref.name), "\$DER.")) || return nothing
-          push!(blocked, baseName(x.cref.name))
+          (x isa IR.CREF && haskey(antiderivative, x.cref.name)) || return nothing
+          push!(blocked, baseVariable(antiderivative, x.cref.name))
           nothing
         end
         nothing
@@ -306,7 +331,7 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
   local undo = AliasUndo(partition.equations, partition.initialEquations,
                          Pair{Symbol, IR.VariableKind}[n => variables[n].kind for n in states],
                          IR.Variable[variables[d] for n in states for d in derivativeChain(variables, n)],
-                         count(n -> !startswith(String(n), "\$DER."), keys(replacements)))
+                         count(n -> !haskey(antiderivative, n), keys(replacements)))
   isempty(replacements) && return undo
   local substitute = (e::IR.Expression) -> (e isa IR.CREF ? get(replacements, e.cref.name, e) : e)
   local reads = (eq::IR.Equation) -> begin
@@ -330,11 +355,11 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
   return undo
 end
 
-"The variable a derivative variable is the derivative of (`\$DER.\$DER.x` -> `x`)."
-function baseName(name::Symbol)::Symbol
-  local s = String(name)
-  while startswith(s, "\$DER.")
-    s = s[6:end]
+"The variable a derivative variable is a derivative of, through its chain (`\$DER.\$DER.x` -> `x`; `antiderivatives`)."
+function baseVariable(antiderivative::Dict{Symbol, Symbol}, name::Symbol)::Symbol
+  local base::Symbol = name
+  while haskey(antiderivative, base)
+    base = antiderivative[base]
   end
-  return Symbol(s)
+  return base
 end

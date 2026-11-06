@@ -186,12 +186,12 @@ function eventAndComplexNames(simCode::SIM_CODE)::OrderedSet{String}
   local ht = simCode.stringToSimVarHT
   local names = ifEquationNames!(OrderedSet{String}(), simCode.ifEquations)
   foreach(w -> whenCrefNames!(names, w.whenEquation), simCode.whenEquations)
-  complexFieldNames!(names, simCode.residualEquations, ht)
-  complexFieldNames!(names, simCode.initialEquations, ht)
+  complexFieldNames!(names, simCode.residualEquations, simCode)
+  complexFieldNames!(names, simCode.initialEquations, simCode)
   for ifEq in simCode.ifEquations, b in ifEq.branches
-    complexFieldNames!(names, b.residualEquations, ht)
+    complexFieldNames!(names, b.residualEquations, simCode)
   end
-  complexFieldNames!(names, simCode.eliminatedEquations, ht)
+  complexFieldNames!(names, simCode.eliminatedEquations, simCode)
   return names
 end
 
@@ -219,7 +219,8 @@ function eliminateFrozenOnce(simCode::SIM_CODE, kept::OrderedSet{String})::Union
   local fold = eq::RESIDUAL_EQUATION -> RESIDUAL_EQUATION(foldNumeric(substitute(eq.exp, rs)), eq.source, eq.attr)
   local newHT = copy(ht)
   #= a frozen state's der() is 0 everywhere (the replacement is time-invariant): its entry goes too =#
-  foreach(n -> (last(ht[n]).varKind isa STATE && delete!(newHT, "der($(n))"); delete!(newHT, n)), keys(frozen))
+  local derivatives::Dict{String, String} = derivativeKeys(ht)
+  foreach(n -> (haskey(derivatives, n) && delete!(newHT, derivatives[n]); delete!(newHT, n)), keys(frozen))
   local eliminated = sort(collect(keys(frozen)))
   return update(simCode;
                 residualEquations = RESIDUAL_EQUATION[fold(eq) for (i, eq) in enumerate(residuals) if !(i in removed)],
@@ -257,10 +258,11 @@ function demoteDeadStates(simCode::SIM_CODE)::SIM_CODE
   local dead = deadStateNames(simCode)
   isempty(dead) && return simCode
   local newHT = copy(simCode.stringToSimVarHT)
+  local derivatives::Dict{String, String} = derivativeKeys(newHT)
   for name in dead
     local (index, v) = newHT[name]
     newHT[name] = (index, withKind(v, ALG_VARIABLE(index)))
-    delete!(newHT, "der($(name))")
+    haskey(derivatives, name) && delete!(newHT, derivatives[name])
   end
   @debug "[SIMCODE: $(simCode.name): demoteDeadStates] $(dead)"
   return update(simCode; stringToSimVarHT = newHT)
