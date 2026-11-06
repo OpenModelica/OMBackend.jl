@@ -1036,7 +1036,7 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
                                             iteration solves the algebraic variables itself. =#
                                          save_positions = (false, true),
                                          initializealg = ModelingToolkit.SciMLBase.NoInit())
-  return DiffEqBase.CallbackSet(kept..., cb)
+  return _joinCallbacks(kept..., cb)
 end
 
 """

@@ -578,5 +578,5 @@ function withDiscreteClusters(callbacks, problem, clusters::Vector)
     end
     push!(added, _clusterCallback(c))
   end
-  return callbacks === nothing ? DiffEqBase.CallbackSet(added...) : DiffEqBase.CallbackSet(callbacks, added...)
+  return _joinCallbacks(callbacks, added...)
 end

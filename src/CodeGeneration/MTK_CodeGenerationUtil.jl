@@ -1478,7 +1478,7 @@ statically evaluable or reads a variable without an explicit value (a seed conta
 """
 function evalCausalRHSAtT0(@nospecialize(rhsExpr), valMap::Dict{Symbol, Float64},
                            explicit::Set{Symbol} = Set{Symbol}())::Union{Float64, Nothing}
-  ccall(:jl_generating_output, Cint, ()) != 0 && return nothing
+  OMBackend.evaluationRejected(parentmodule(@__MODULE__)) && return nothing
   _exprSymbolsExplicit(rhsExpr, explicit) || return nothing
   local numExpr = _intifyFloatIndices(_substituteExprValues(rhsExpr, valMap))
   try
@@ -1505,7 +1505,7 @@ grows. Operands must be explicit already, so defaulted values never contaminate 
 filled-in entry.
 """
 function _forwardEvalT0!(valMap::Dict{Symbol, Float64}, explicit::Set{Symbol}, simCode::SC.SIM_CODE)::Nothing
-  ccall(:jl_generating_output, Cint, ()) != 0 && return nothing
+  OMBackend.evaluationRejected(parentmodule(@__MODULE__)) && return nothing
   local lowered = Dict{SC.Exp, Any}()
   local pair = function (e::SC.Exp)
     (e isa SC.BINARY && e.op === SC.OP_SUB && e.exp1 isa SC.EXP_CREF) || return nothing
@@ -1567,8 +1567,8 @@ evaluated.
 """
 function evalInitialCondition(mtkCond::Expr, simCode::SC.SIM_CODE; closedBoundary::Bool = false,
                               extraVals::Union{Nothing, AbstractDict{Symbol, Float64}} = nothing)::Bool
-  #= during the precompile output eval would mutate this closed module's bindings =#
-  ccall(:jl_generating_output, Cint, ()) != 0 && return true
+  #= under another package's precompile, eval would mutate this closed module's bindings =#
+  OMBackend.evaluationRejected(@__MODULE__) && return true
   local valMap = _buildT0ValueMap(simCode)
   extraVals === nothing || merge!(valMap, extraVals)
   local numExpr = _substituteExprValues(_extractZeroCrossingLHS(mtkCond), valMap)

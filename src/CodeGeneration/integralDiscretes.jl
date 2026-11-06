@@ -58,5 +58,5 @@ function withIntegralDiscretes(callbacks, problem, names::Vector{String})
   end
   local cb = DiffEqBase.DiscreteCallback(drifted, round!; save_positions = (false, false),
                                          initializealg = ModelingToolkit.SciMLBase.NoInit())
-  return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(cb, callbacks)
+  return _joinCallbacks(cb, callbacks)
 end

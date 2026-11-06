@@ -16,7 +16,8 @@ import OMFrontend
   #= the interpreted closure: the calls until the function has run as long as compiling it takes (CompileTier),
      and the symbolic ones (_symbolicImpl) =#
   local add = (a, b) -> a + 2b
-  local f = CG.compiledFunction(:omjlCompiledAdd, :((a, b) -> a + 2b), (), @__MODULE__, add)
+  local addCode::Expr = :((a, b) -> a + 2b)
+  local f = CG.compiledFunction(:omjlCompiledAdd, addCode, (), @__MODULE__, add)
   @test f isa CG.CompiledModelicaFunction
   @test CG._symbolicImpl(f) === add && CG._symbolicImpl(add) === add
   local interpCalls = Ref(0)
@@ -34,6 +35,14 @@ import OMFrontend
   @test call(tiered, 2.0, 4.0) == 8.0 && CG._callWithTuple(tiered, (1.0, 5.0)) == 5.0 && interpCalls[] == 2
   @test call(f, 1.0, 2.0) == 5.0
   @test_throws MethodError call(f, 1.0)
+  #= the same code compiled again (a model translated again: its code from the same code generation) reuses its body;
+     a method defined again would discard its compiled code, and while OMBackend's image is generated it is an error =#
+  local body::Method = only(methods(f.f))
+  @test CG.compiledFunction(:omjlCompiledAdd, copy(addCode), (), @__MODULE__, add).f === f.f && only(methods(f.f)) === body
+  #= other code: defined again =#
+  local changed = CG.compiledFunction(:omjlCompiledAdd, :((a, b) -> a + 3b), (), @__MODULE__, (a, b) -> a + 3b)
+  @test only(methods(f.f)) !== body && call(changed, 1.0, 2.0) == 7.0
+  f = CG.compiledFunction(:omjlCompiledAdd, addCode, (), @__MODULE__, add)
   #= 60 arguments: the body is inferred, no allocation =#
   local names = [Symbol("x", i) for i in 1:60]
   local sixty = Expr(:->, Expr(:tuple, names...), foldl((a, b) -> :($a + $b), names))

@@ -72,13 +72,13 @@ On function-eval failure, the offending generated source is dumped to
 `/tmp/om_bad_function.jl` and the error rethrown.
 """
 function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr}, simCode::SC.SIM_CODE)
-  #= Under precompile / image generation, eval'ing the model's generated Modelica functions
-     into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
+  #= Under another package's precompile (OM.jl's workload), eval'ing the model's generated Modelica
+     functions into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
      compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
      has already run (so its method instances are warmed for the bake), and a real runtime
      translate registers them normally — the guard is precompile-only. Mirrors the
-     jl_generating_output guard in generateIMTKCode (iMTKGen.jl). =#
-  if ccall(:jl_generating_output, Cint, ()) != 0
+     guard in generateIMTKCode (iMTKGen.jl). =#
+  if OMBackend.evaluationRejected(@__MODULE__)
     return nothing
   end
   for f in functions
@@ -772,9 +772,9 @@ function ODE_MODE_MTK(simCode::SC.SIM_CODE)
       #= END =#
       # Also need to have the original callbacks
       callbackConditions = $(if !isempty(structuralCallbacks)
-                               :(CallbackSet(callbacks, callbackSet...))
+                               :(OMBackend.CodeGeneration._joinCallbacks(callbacks, callbackSet...))
                              else
-                               :(CallbackSet(callbacks, callbackSet...))
+                               :(OMBackend.CodeGeneration._joinCallbacks(callbacks, callbackSet...))
                              end)
       #= Create the composite model. Dispatch on the mass matrix of the initial
          submodel exactly like the submodel builder does: pure ODE takes the
@@ -1377,6 +1377,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
      TanksWithOverflow's lowerTank_V, stateSelect = never). =#
   local _declaredVariables = OrderedSet{Symbol}(vcat(stateVariablesSym, algebraicVariablesSym))
   statePriorityPairs = filter(p -> first(p) in _declaredVariables, statePriorityPairs)
+  local asserts::Vector{Expr} = assertEntries(simCode)
   model = quote
     $(CALL_BACK_EQUATIONS)
     #= The discretes of the discrete clusters (the direct-RHS initialization
@@ -1392,6 +1393,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
        to avoid JIT overhead from compiling nested closures.
        Variable constructors only return symbol tuples, so they have no scope dependencies. =#
     $(varOuterDefs)
+    #= The variables' kinds and the asserts at module level too: in the build function, with
+       its thousands of locals, Julia's lowering of it took 55 s (MSL LightningSegmentedTransmissionLine). =#
+    function _simCodeKinds()
+      return $(simCodeKindsExpr(simCode))
+    end
+    $(emitAssertsFunction(asserts))
     function $(Symbol(MODEL_NAME * "Model"))(tspan = (0.0, 1.0))
       ModelingToolkit.@independent_variables t
       D = ModelingToolkit.Differential(t)
@@ -1423,7 +1430,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
       end
       #= what each variable is in the simulation code (`simCodeKind`) =#
       local _declared = Set{Symbol}(first.(vars))
-      for (sym, kind) in $(simCodeKindsExpr(simCode))
+      for (sym, kind) in Base.invokelatest(_simCodeKinds)
         sym in _declared || continue
         push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, OMBackend.CodeGeneration.SimCodeKind, $kind)))
       end
@@ -1564,7 +1571,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
       $(emitRelationRefresh(IF_RELATIONS))
       callbacks = OMBackend.CodeGeneration.withIntegralDiscretes(callbacks, problem, $(integralDiscreteNames(discreteVariablesSym, simCode)))
       #= Asserts after the event iteration: they check the settled state. =#
-      $(emitAssertCallback(simCode))
+      $(emitAssertCallback(simCode, asserts))
       #= In the latest world, as the lists above: the arguments read the model's
          variables, bound by eval in this function (MSL Digital FullAdder). =#
       callbacks = OMBackend.CodeGeneration.withDelayRecords(callbacks, problem, $(QuoteNode(Symbol(MODEL_NAME))),

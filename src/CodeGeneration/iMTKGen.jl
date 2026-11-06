@@ -138,8 +138,8 @@ function generateIMTKCode(simCode::SC.SIM_CODE)
      and sub-models use MODEL_GENERATION's simpler simulate; skip _buildAndCache so iMTK falls through cleanly to the module
      `simulate` instead of warning loudly for every such model. Mirrors the
      condition in ODE_MODE_MTK (MTK_CodeGeneration.jl:415). =#
-  if ccall(:jl_generating_output, Cint, ()) != 0
-    #= Precompile/image generation: Core.eval'ing the model module into this
+  if _OMBackend().evaluationRejected(_OMBackend())
+    #= OM.jl's precompile workload: Core.eval'ing the model module into this
        closed backend module is rejected; skip the build+eval (codegen warmed). =#
   elseif !SC.hasStructuralTransitions(simCode) &&
          !SC.hasSubModels(simCode)
@@ -323,15 +323,16 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
          Collapse the continuous callbacks HERE, inside invokelatest (a settled world,
          the build call having returned), then remake: the FunctionWrappers built around
          the RGF-backed MTK callbacks now resolve to the live methods (build-time collapse
-         captured a stale world -> wrong events), and the collapsed prob has the
-         model-independent erased type whose `solve` is baked into the image. =#
+         captured a stale world -> wrong events). Then the whole set erased
+         (`_eraseCallbackSet`), a model without callbacks too: the prob has the
+         model-independent type whose `solve` compiles once per process. =#
       return Base.invokelatest() do
         local SB = OMB.Runtime.ModelingToolkit.SciMLBase
         local p = prob
         if OMB.DIRECT_RHS_TYPE_ERASE[]
           local cb = get(p.kwargs, :callback, nothing)
-          cb === nothing ||
-            (p = SB.remake(p; callback = OMB.CodeGeneration._eraseContinuousCallbacks(cb)))
+          cb === nothing || (cb = OMB.CodeGeneration._eraseContinuousCallbacks(cb))
+          p = SB.remake(p; callback = OMB.CodeGeneration._eraseCallbackSet(cb))
         end
         local rebuilt = (p, cached[2], cached[3], cached[4], cached[5],
                          tspan, cached[7], cached[8], cached[9])

@@ -227,7 +227,7 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
      missed (x in [0.4, 0.5) between the events at 0.2 and 0.5). The solver
      finds them on the step's own path, before an event changes the state. =#
   local crossing = Tuple{Int, Int}[(i, k) for (i, (a, _)) in enumerate(checks) if a.timeVarying for k in eachindex(a.crossings)]
-  isempty(crossing) && return DiffEqBase.CallbackSet(callbacks, cb)
+  isempty(crossing) && return _joinCallbacks(callbacks, cb)
   local crossingCondition = function (out, u, t, integrator)
     local src = ModelingToolkit.SymbolicIndexingInterface.ProblemState(; u = u, p = integrator.p, t = t)
     local j = 0
@@ -250,7 +250,7 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
   local zc = DiffEqBase.VectorContinuousCallback(crossingCondition, crossingAffect!, length(crossing);
                                                  rootfind = ModelingToolkit.SciMLBase.RightRootFind,
                                                  save_positions = (false, false))
-  return DiffEqBase.CallbackSet(callbacks, zc, cb)
+  return _joinCallbacks(callbacks, zc, cb)
 end
 
 """

@@ -181,7 +181,7 @@ function withDelayEvents(callbacks, model::Symbol)
     return nothing
   end
   local cb = DiffEqBase.DiscreteCallback(due, affect!; save_positions = (false, false))
-  return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(callbacks, cb)
+  return _joinCallbacks(callbacks, cb)
 end
 
 """
@@ -246,6 +246,5 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
   local cbStepEnd = DiffEqBase.DiscreteCallback(stepEnd, never!; save_positions = (false, false))
   local cbAfterEvents = DiffEqBase.DiscreteCallback(afterEvents, never!; initialize = start!,
                                                     save_positions = (false, false))
-  return callbacks === nothing ? DiffEqBase.CallbackSet(cbStepEnd, cbAfterEvents) :
-                                 DiffEqBase.CallbackSet(cbStepEnd, callbacks, cbAfterEvents)
+  return _joinCallbacks(cbStepEnd, callbacks, cbAfterEvents)
 end

@@ -108,6 +108,15 @@ Each compiled Modelica function's number of nodes and the compiled functions it 
 const COMPILED_CODE_SIZES = Dict{Symbol, Tuple{Int, Tuple{Vararg{Symbol}}}}()
 
 """
+Each compiled Modelica function's body (compiledFunction) with the hash of the code and callees it was compiled from,
+by name: a translate of the same code again reuses it. A method defined again discards its compiled code (a model
+translated again compiled its functions again, OM.simulate after OM.translate), and while OMBackend's image is generated
+it is an error ("Method overwriting is not permitted during Module precompilation": the workload translates a model
+twice, as OM.simulate does).
+"""
+const COMPILED_BODIES = Dict{Symbol, Tuple{UInt, Function}}()
+
+"""
 The calls of the compiled Modelica function `name` so far (CompiledModelicaFunction): the time they
 ran interpreted, the time after which its body is called (_compileAfter, at its first call: 0 before),
 whether it is.
@@ -1687,8 +1696,8 @@ calls: the body for numeric arguments, decided by their types (_isNumericArg), s
 is inferred, else the wrapper (a symbolic call, _symbolicFuncDispatch). A call through the
 wrapper's global was dynamic and its result Any: the MOSFET body that destructures drainCur's
 result ran type-unstable (46 KB a call; through the entries 48 ns, none). Its names are CodeGeneration's: a call of a function not
-compiled (an external one) finds the wrapper createModelicaFunctionWrapper binds. While
-precompiling, an RGF (an evaluation into this module would be lost), its calls through the
+compiled (an external one) finds the wrapper createModelicaFunctionWrapper binds. Where an
+evaluation into this module is rejected (another package's precompile), an RGF, its calls through the
 wrappers. `interp`, the function's closure in `mod`, runs the calls until the function has run
 interpreted about as long as compiling its body takes (CompileTier), and the evaluations with
 symbolic arguments (_symbolicImpl).
@@ -1696,8 +1705,11 @@ symbolic arguments (_symbolicImpl).
 function compiledFunction(name::Symbol, ex::Expr, callees::Tuple{Vararg{Symbol}}, mod::Module, interp::Function)::Function
   ex = _modelNamesFrom(ex, mod)
   COMPILED_CODE_SIZES[name] = (_exprNodes(ex), callees)
-  ccall(:jl_generating_output, Cint, ()) == 1 && return _compiledRGF(name, ex, interp)
+  OMBackend.evaluationRejected(@__MODULE__) && return _compiledRGF(name, ex, interp)
   local (body, n) = _tupleArgFunction(ex)
+  local codeHash::UInt = hash((ex, callees))
+  local known::Union{Nothing, Tuple{UInt, Function}} = get(COMPILED_BODIES, name, nothing)
+  (known !== nothing && known[1] == codeHash) && return CompiledModelicaFunction{n}(name, known[2], interp)
   local params = ex.args[1] isa Symbol ? Any[ex.args[1]] : ex.args[1].args
   local bodyName = _compiledBodyName(name)
   local numeric = foldr((a, b) -> :($a && $b), Any[:(_isNumericArg($p)) for p in params]; init = true)
@@ -1710,11 +1722,13 @@ function compiledFunction(name::Symbol, ex::Expr, callees::Tuple{Vararg{Symbol}}
       return MODELICA_FUNCTION_WRAPPERS[$(QuoteNode(name))]($(params...))
     end
   end)
-  return CompiledModelicaFunction{n}(name, Base.invokelatest(getglobal, @__MODULE__, bodyName), interp)
+  local compiled::Function = Base.invokelatest(getglobal, @__MODULE__, bodyName)
+  COMPILED_BODIES[name] = (codeHash, compiled)
+  return CompiledModelicaFunction{n}(name, compiled, interp)
 end
 
 """
-`ex` compiled as a RuntimeGeneratedFunction of CodeGeneration (compiledFunction while precompiling):
+`ex` compiled as a RuntimeGeneratedFunction of CodeGeneration (compiledFunction where an evaluation is rejected):
 its calls of other functions through their wrappers' globals.
 """
 function _compiledRGF(name::Symbol, ex::Expr, interp::Function)::Function

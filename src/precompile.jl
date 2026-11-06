@@ -86,14 +86,32 @@ end
 """
 Bakes the type-erased DirectRHS solve into the image. Builds the problem
 through the real `buildDirectRHSProblem` (so the type matches what models
-produce) and solves with the two default solvers.
+produce) and solves it as a model's build does (`_precompileSolveAsModels`).
 """
 function _precompileWarmupDirectRHS()
   local (reduced, ivs, pars) = _precompileBuildReduced()
-  local callbacks = ModelingToolkit.SciMLBase.CallbackSet()
-  local prob = CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), callbacks)
-  solve(prob, defaultSolver())
-  solve(prob, daeFallbackSolver())
+  local callbacks = CodeGeneration._joinCallbacks()
+  _precompileSolveAsModels(CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), callbacks), callbacks)
+  return nothing
+end
+
+"""
+    _precompileSolveAsModels(prob, buildCallbacks)
+
+The solves of a model's build of `prob` from `buildCallbacks` (the generated build and `simulateFromBuild`, and
+simulateIMTK): its step control for a DAE (withAlgebraicStepControl, withProblemCallbacks: the solve's
+`isoutofdomain`), the callback set collapsed and erased, the solver `defaultSolverFor` picks from the default solver
+and from the DAE fallback, the default initialization and tolerances: the integrator types a model's solve has, compiled
+into the image. Solved without them, every process's first model compiled `solve!` again (2026-11-04).
+"""
+function _precompileSolveAsModels(prob, buildCallbacks)::Nothing
+  local callbacks = CodeGeneration.withAlgebraicStepControl(buildCallbacks, prob)
+  prob = _precompileCollapseCallback(CodeGeneration.withProblemCallbacks(prob, buildCallbacks, callbacks))
+  local initKw = CodeGeneration.defaultInitializeKwargs(prob, (;), false)
+  local tolKw = CodeGeneration.defaultToleranceKwargs(prob, (;))
+  for solver in (defaultSolver(), daeFallbackSolver())
+    solve(prob, CodeGeneration.defaultSolverFor(solver, prob, prob.f.sys, Set{Symbol}(), false); initKw..., tolKw...)
+  end
   return nothing
 end
 
@@ -111,39 +129,26 @@ function _precompileCBAffect!(integrator)::Nothing
   return nothing
 end
 
-#= Builds a pure-ODE DirectRHS problem carrying one continuous callback, so the
-   erased callback collapses to the single model-independent
-   `VectorContinuousCallback` that the legacy when-equation class produces. Kept
-   separate from the solve so the baked type can be checked against a real model. =#
-# Mirror simulateIMTK's solve-time collapse so the baked solve is over the same erased
-# callback type the runtime produces.
+"""
+simulateIMTK's solve-time collapse and erasure of the callbacks, so the baked solve is over the callback type the
+runtime produces.
+"""
 function _precompileCollapseCallback(prob)
   local cb = get(prob.kwargs, :callback, nothing)
-  cb === nothing && return prob
-  return ModelingToolkit.SciMLBase.remake(prob;
-            callback = CodeGeneration._eraseContinuousCallbacks(cb))
-end
-
-function _precompileBuildDirectRHSEventfulProblem()
-  local (reduced, ivs, pars) = _precompileBuildReduced()
-  local SB = ModelingToolkit.SciMLBase
-  local cbset = SB.CallbackSet(SB.ContinuousCallback(_precompileCBCondition,
-                                                     _precompileCBAffect!))
-  local prob = CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), cbset)
-  return _precompileCollapseCallback(prob)
+  cb === nothing || (cb = CodeGeneration._eraseContinuousCallbacks(cb))
+  return ModelingToolkit.SciMLBase.remake(prob; callback = CodeGeneration._eraseCallbackSet(cb))
 end
 
 """
-Bakes the type-erased event-ful DirectRHS solve into the image. With RHS/jac
-erasure the `F` param already matches the pure-ODE warmup; the only remaining
-model-specific axis is the callback, now collapsed to a model-independent type.
-Solving here compiles `solve(::ErasedEventFulType, ::alg)` once for the whole
-legacy when-equation class.
+Bakes the type-erased event-ful DirectRHS solve into the image: a pure-ODE problem carrying one continuous callback,
+which collapses to the model-independent `VectorContinuousCallback` of the legacy when-equation class; the event
+handling of the erased set compiled too (the condition crosses zero in the solve).
 """
 function _precompileWarmupDirectRHSEventful()::Nothing
-  local prob = _precompileBuildDirectRHSEventfulProblem()
-  solve(prob, defaultSolver())
-  solve(prob, daeFallbackSolver())
+  local (reduced, ivs, pars) = _precompileBuildReduced()
+  local SB = ModelingToolkit.SciMLBase
+  local cbset = CodeGeneration._joinCallbacks(SB.ContinuousCallback(_precompileCBCondition, _precompileCBAffect!))
+  _precompileSolveAsModels(CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), cbset), cbset)
   return nothing
 end
 
@@ -175,15 +180,11 @@ mass matrix + an MTK process_events callback) into the image.
 """
 function _precompileWarmupMTKCallbackDAE()::Nothing
   local (reduced, ivs, pars) = _precompileBuildReducedEventfulDAE()
-  local prob = CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0),
-                                                    ModelingToolkit.SciMLBase.CallbackSet())
-  prob = _precompileCollapseCallback(prob)
-  #= With the initialization a model's solve uses (defaultInitializeKwargs): the
-     default only checks u0, and this system's start values leave a residual
-     (4.5e-6 > abstol), so the workload failed and warmed nothing. =#
-  local initKw = CodeGeneration.defaultInitializeKwargs(prob, (;), false)
-  solve(prob, defaultSolver(); initKw...)
-  solve(prob, daeFallbackSolver(); initKw...)
+  local callbacks = CodeGeneration._joinCallbacks()
+  #= With the initialization a model's solve uses (defaultInitializeKwargs, in
+     _precompileSolveAsModels): the default only checks u0, and this system's start
+     values leave a residual (4.5e-6 > abstol), so the workload failed and warmed nothing. =#
+  _precompileSolveAsModels(CodeGeneration.buildDirectRHSProblem(reduced, ivs, pars, (0.0, 2.0), callbacks), callbacks)
   return nothing
 end
 
@@ -220,38 +221,106 @@ end
 
 const ARRAYS_KEPT_WORKLOAD = joinpath(@__DIR__, "Precompile", "ArraysKept.mo")
 include_dependency(ARRAYS_KEPT_WORKLOAD)
+const TRANSLATE_WORKLOAD = joinpath(@__DIR__, "Precompile", "Translate.mo")
+include_dependency(TRANSLATE_WORKLOAD)
 
 """
-The arrays-kept paths over the models of `Precompile/ArraysKept.mo`, as `translate` takes them, up to the generated
-module's code (a module is not evaluated while the package image is built): the frontend's flatten with the arrays
-kept, lowering and the passes, component rolling, index reduction in array form with its splits, the derivatives
-solved in array form and the array code (`Chain`: MultiBody's frames through functions, slicing; `Volumes`: a
-semiLinear chain, a free parameter, a when-equation; `LoopEvents`, of index one: a torn loop, events, a when-equation,
-an assert). Their code then compiles into the package image, not at each process's first
-such model: MSL EngineV6's first build compiled 2371 methods (18.7 s) for reducedArrayModel and 594 (3.8 s) for its
-array code, of OMBackend's own code (`Traversal.traverseField`'s specializations by node and pass: 1073). Each model
-must take its path (an error otherwise: the workload would compile less than it says). The registries those paths
-write are cleared of the workload's models.
+    _precompileTranslateAndSimulate(scode, name::String, arrayCode::Bool) -> Nothing
+
+The model `name` of `scode` translated and simulated as OM.jl's `translate` and `simulate` do
+(`_precompileTranslate`); the build (the model's module evaluated into OMBackend, open while its own image is
+generated: `evaluationRejected`) and `simulateModel` with OM.jl's keyword arguments, so that the keyword calls compile
+for a session's argument types. `simulate` translates again (the cached build reused). `arrayCode`: whether the model
+takes the array code (an error otherwise: the workload would compile less than it says).
 """
-function _precompileWarmupArraysKept()::Nothing
-  local scode = OMFrontend.translateToSCode(OMFrontend.parseFile(ARRAYS_KEPT_WORKLOAD))
-  for model in ("Chain", "Volumes", "LoopEvents")
-    local name::String = "OMBackendWorkload." * model
-    local cn::String = canonicalName(name)
-    try
-      local (fm::OMFrontend.Frontend.FlatModel, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = false)
-      local functions::FunctionList = OMFrontend.cacheToFunctionList(cache)
-      local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(fm; functionList = functions)
-      reduced === nothing && error("$(name) not lowered in array form: $(scalarizedFallbackReason(cn))")
-      local (solved::OMJLIR.Model, _) = Passes.IndexReduction.solvedInArrays(reduced)
-      Passes.arrayCodeForm!(solved)
-      local code::Tuple = CodeGeneration.ArrayODEGen.generateArrayODECode(SimCode.lowerArraySystem(solved), cn)
-      code[1] === nothing && error("$(name): no array code ($(code[2]))")
-    finally
-      delete!(ARRAY_PATH_REASONS, cn)
-      delete!(ARRAY_REDUCED_MODELS, cn)
-      delete!(ARRAY_ODE_MODELS, cn)
+function _precompileTranslateAndSimulate(scode::OMFrontend.SCode.Program, name::String, arrayCode::Bool)::Nothing
+  local mode::BackendMode = DEFAULT_BACKEND_MODE[]
+  _precompileTranslate(scode, name, mode)
+  (canonicalName(name) in ARRAY_ODE_MODELS) == arrayCode ||
+    error("$(name): $(arrayCode ? "no array code" : "array code") ($(get(ARRAY_PATH_REASONS, canonicalName(name), "-")))")
+  _precompileTranslate(scode, name, mode)
+  simulateModel(name; MODE = mode, tspan = (0.0, 1.0), solver = defaultSolver(), overwriteCache = false)
+  return nothing
+end
+
+"""
+OM.jl's `translate` of the model `name` of `scode`: the frontend's flatten with the arrays kept and
+`translateReducedArrays` (the array code, else the scalarized reduced model), else the scalarizing flatten and
+`translate`.
+"""
+function _precompileTranslate(scode::OMFrontend.SCode.Program, name::String, mode::BackendMode)::Union{Nothing, Tuple{String, Expr}}
+  local (fm::OMFrontend.Frontend.FlatModel, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = false)
+  local reduced::Union{Nothing, Tuple{String, Expr}} =
+    translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache), BackendMode = mode,
+                           warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing,
+                           checkSimCode = true)
+  reduced === nothing || return reduced
+  (fm, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = true)
+  return translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), BackendMode = mode,
+                   warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing,
+                   checkSimCode = true, scalarized = true)
+end
+
+"""
+The registries of OMBackend's modules (their mutable Dict and Set constants and their Refs), with copies of their
+contents: the translate workload restores them (`_restoreRegistries!`), so that its models' builds, generated code,
+function implementations and run directories are not kept in the image (its models' modules are).
+"""
+function _registries(mod::Module = @__MODULE__, found::Vector{Pair{Any, Any}} = Pair{Any, Any}[])::Vector{Pair{Any, Any}}
+  for name in names(mod; all = true)
+    (isdefined(mod, name) && isconst(mod, name)) || continue
+    local value::Any = getglobal(mod, name)
+    if value isa Module
+      (value !== mod && parentmodule(value) === mod) && _registries(value, found)
+    elseif value isa Union{AbstractDict, AbstractSet} && ismutable(value)
+      push!(found, value => copy(value))
+    elseif value isa Base.RefValue && isassigned(value)
+      push!(found, value => value[])
     end
+  end
+  return found
+end
+
+"The registries `_registries` copied, with the contents they had."
+function _restoreRegistries!(registries::Vector{Pair{Any, Any}})::Nothing
+  for (registry, contents) in registries
+    if registry isa AbstractDict
+      empty!(registry)
+      merge!(registry, contents)
+    elseif registry isa AbstractSet
+      empty!(registry)
+      union!(registry, contents)
+    else
+      registry[] = contents
+    end
+  end
+  return nothing
+end
+
+"""
+The translate and simulate of OM.jl (`_precompileTranslateAndSimulate`) over the workload's models, so that their code
+compiles into the package image, not at each process's first model: `Precompile/Translate.mo`'s models of the
+scalarized paths (Drive, Pendulum: the scalarizing flatten; Rectifier: the reduced model scalarized; Thermostat: the
+array code with events) and `Precompile/ArraysKept.mo`'s of the array code (`Chain`: MultiBody's frames through
+functions, slicing; `Volumes`: a semiLinear chain, a free parameter, a when-equation; `LoopEvents`: a torn loop, events,
+an assert). A fresh process's first translate compiled 3-18 s of OMBackend's, MTK's and Symbolics' code before (MSL
+4.1.0 Rotational First 12.9 s, MultiBody DoublePendulum 17.9 s; EngineV6 2371 methods for reducedArrayModel); the
+registries are restored afterwards (`_registries`).
+"""
+function _precompileWarmupTranslate()::Nothing
+  local registries::Vector{Pair{Any, Any}} = _registries()
+  try
+    for (file, package, models) in ((TRANSLATE_WORKLOAD, "OMBackendTranslateWorkload",
+                                     ("Drive" => false, "Thermostat" => true, "Rectifier" => false, "Pendulum" => false)),
+                                    (ARRAYS_KEPT_WORKLOAD, "OMBackendWorkload",
+                                     ("Chain" => true, "Volumes" => true, "LoopEvents" => true)))
+      local scode::OMFrontend.SCode.Program = OMFrontend.translateToSCode(OMFrontend.parseFile(file))
+      for (model, arrayCode) in models
+        _precompileTranslateAndSimulate(scode, package * "." * model, arrayCode)
+      end
+    end
+  finally
+    _restoreRegistries!(registries)
   end
   return nothing
 end
@@ -288,9 +357,9 @@ end
         @warn "[OMBackend] array-path precompile warmup skipped" exception = (err, catch_backtrace())
       end
       try
-        Base.CoreLogging.with_logger(_precompileWarmupArraysKept, Base.CoreLogging.NullLogger())
+        Base.CoreLogging.with_logger(_precompileWarmupTranslate, Base.CoreLogging.NullLogger())
       catch err
-        @warn "[OMBackend] arrays-kept precompile warmup skipped" exception = (err, catch_backtrace())
+        @warn "[OMBackend] translate precompile warmup skipped" exception = (err, catch_backtrace())
       end
     end
   end
