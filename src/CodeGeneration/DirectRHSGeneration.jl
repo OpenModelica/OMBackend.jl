@@ -1511,7 +1511,7 @@ function _initialDiscreteChanges(dc, u, pv, t0::Float64 = 0.0)
     Base.invokelatest(c.crossings!, zs, u, pv, t0)
     local rel = Bool[_tieLiteral(zs, k, c.strict[k]) for k in eachindex(c.rel)]
     local pre = [something(s, x) for (s, x) in zip(preStart, _preValues(c, v))]
-    local vals = Base.invokelatest(c.body, point, _operands(c, v), pre, rel, copy(rel), true)
+    local vals = _callBody(c.body, point, _operands(c, v), pre, rel, copy(rel), true)
     vals === nothing && continue
     for (i, k) in enumerate(c.memberIndex)
       (k == 0 || u[k] == vals[i]) && continue
@@ -2756,7 +2756,7 @@ function _eraseContinuousCallbacks(cbset)
   local condW = FW{Nothing, Tuple{AbstractVector{Float64}, AbstractVector{Float64}, Float64, Any}}(condF)
   #= Always FunctionWrapper-wrap the merged initialize (even when every sub uses the
      default) so the VCC's initialize param is the SAME model-independent type whether or
-     not a sub carries a custom initialize -> chua and the synthetic bake share one type. =#
+     not a sub carries a custom initialize -> chua and the other models share one type. =#
   local initW = FW{Nothing, Tuple{Any, Any, Any, Any}}(initF)
   local vcc = if _VCC_HAS_AFFECT_NEG
     local affW = FW{Nothing, Tuple{Any, Int}}(_MergedContinuousAffect(subs, offsets, lens, nsub, false))
@@ -2792,6 +2792,9 @@ function _joinCallbacks(@nospecialize(parts...))::DiffEqBase.CallbackSet
   return DiffEqBase.CallbackSet(continuous, discrete)
 end
 
+"""
+The continuous and discrete callbacks of `set` appended to `continuous` and `discrete` (none for `nothing`).
+"""
 _appendCallbacks!(::Vector{Any}, ::Vector{Any}, ::Nothing)::Nothing = nothing
 function _appendCallbacks!(continuous::Vector{Any}, discrete::Vector{Any}, set::DiffEqBase.CallbackSet)::Nothing
   append!(continuous, set.continuous_callbacks)
@@ -2806,13 +2809,13 @@ _appendCallbacks!(::Vector{Any}, discrete::Vector{Any}, @nospecialize(cb::Modeli
 """
     _eraseCallbackSet(cbset)
 
-`cbset` (a `CallbackSet`, one callback or nothing) as the erased set of `_joinCallbacks`, for the solve: the integrator's
-type then no longer holds the tuple of the model's callbacks, so `solve` and the initialization compile once per
-process, not once per model (2026-11-04: 0.6-0.9 s of `solve!` and 0.25 s of `initialize_dae!` per model). A solve
-that merges another callback set with it (a `callback` keyword) splats it back into tuples: correct, only specialized
-again.
+`cbset` (a `CallbackSet`, one callback or nothing) for the solve: its continuous callbacks collapsed
+(`_eraseContinuousCallbacks`), then the erased set of `_joinCallbacks`. The integrator's type then no longer holds the
+tuple of the model's callbacks, so `solve` and the initialization compile once per process, not once per model
+(2026-11-04: 0.6-0.9 s of `solve!` and 0.25 s of `initialize_dae!` per model). A solve that merges another callback set
+with it (a `callback` keyword) splats it back into tuples: correct, only specialized again.
 """
-_eraseCallbackSet(@nospecialize(cbset))::DiffEqBase.CallbackSet = _joinCallbacks(cbset)
+_eraseCallbackSet(@nospecialize(cbset))::DiffEqBase.CallbackSet = _joinCallbacks(_eraseContinuousCallbacks(cbset))
 
 
 """

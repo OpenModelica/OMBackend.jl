@@ -81,14 +81,14 @@ evaluated calls, the call depth and the step budget of the current call site.
 """
 mutable struct Interpretation
   functions::Dict{String, MODELICA_FUNCTION}
-  memo::Dict{Any, Any}
+  memo::Dict{Tuple{String, Vector{Any}}, Union{Nothing, Vector{Any}}}
   depth::Int
   steps::Int
 end
 
 Interpretation(simCode::SIM_CODE)::Interpretation =
   Interpretation(Dict{String, MODELICA_FUNCTION}(f.name => f for f in simCode.functions if f isa MODELICA_FUNCTION),
-                 Dict{Any, Any}(), 0, 0)
+                 Dict{Tuple{String, Vector{Any}}, Union{Nothing, Vector{Any}}}(), 0, 0)
 
 const MAX_CALL_DEPTH = 32
 const SITE_STEP_BUDGET = 2_000_000
@@ -101,8 +101,14 @@ function step!(ctx::Interpretation, n::Int = 1)::Nothing
 end
 
 isConstantValue(v)::Bool = v isa Real
-"A memo key: 1, 1.0 and true are different arguments."
-memoKey(v) = v isa AbstractVector ? Tuple(memoKey(x) for x in v) : (typeof(v), v)
+"""
+    memoKey(v) -> Vector{Any}
+
+A memo key: 1, 1.0 and true are different arguments. One key type for every call (a vector argument a nested
+key): the memo's lookups compile once, not once per tuple of argument types (49 instances, 0.8 s at MSL BatchPlant's
+first translate, 2026-11-07).
+"""
+memoKey(@nospecialize(v))::Vector{Any} = v isa AbstractVector ? Any[memoKey(x) for x in v] : Any[typeof(v), v]
 "The same value of the same type (true and 1, 1 and 1.0 are not); the signs of a zero are not told apart."
 sameValue(a, b)::Bool = (a isa Real && b isa Real) ? (typeof(a) == typeof(b) && (a === b || (iszero(a) && iszero(b)))) : isequal(a, b)
 isFiniteValue(v)::Bool = !(v isa AbstractFloat) || isfinite(v)
@@ -341,8 +347,8 @@ UNKNOWN when the body is not followed; an array output is UNKNOWN.
 """
 function functionValues(f::MODELICA_FUNCTION, args::Vector{Any}, ctx::Interpretation)::Vector{Any}
   local unknown = Any[UNKNOWN for _ in f.outputs]
-  local key = (f.name, memoKey(args))
-  local hit = get(ctx.memo, key, missing)
+  local key::Tuple{String, Vector{Any}} = (f.name, memoKey(args))
+  local hit::Union{Missing, Nothing, Vector{Any}} = get(ctx.memo, key, missing)
   hit === missing || return hit === nothing ? unknown : hit
   ctx.depth >= MAX_CALL_DEPTH && return unknown
   ctx.memo[key] = nothing

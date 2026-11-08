@@ -339,6 +339,10 @@ function clearCaches!(; models::Bool=true,
   implementations && (empty!(CodeGeneration.MODELICA_FUNCTION_IMPLS); empty!(CodeGeneration.MODELICA_FUNCTION_OWNERS);
                       empty!(CodeGeneration.MODEL_FUNCTIONS); empty!(CodeGeneration.COMPILED_CODE_SIZES);
                       empty!(CodeGeneration.COMPILED_BODIES);
+                      #= the calling task's memos of the calls and the failed eager evaluations (another
+                         task's go with it) =#
+                      delete!(task_local_storage(), :ombackendCallMemo);
+                      delete!(task_local_storage(), :ombackendEagerFailures);
                       push!(cleared, "implementations"))
   wrappers        && (empty!(CodeGeneration.MODELICA_FUNCTION_WRAPPERS); push!(cleared, "wrappers"))
   extractors      && (empty!(CodeGeneration.ELEM_FUNC_CACHE); empty!(CodeGeneration.TUPLE_ELEM_FUNC_CACHE);

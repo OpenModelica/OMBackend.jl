@@ -320,19 +320,16 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
          closure form as the MTK path, so the body executes inside the model module
          and `global LATEST_REDUCED_SYSTEM = …` / `global LATEST_PROBLEM = …` are
          visible to subsequent introspection on the module.
-         Collapse the continuous callbacks HERE, inside invokelatest (a settled world,
-         the build call having returned), then remake: the FunctionWrappers built around
-         the RGF-backed MTK callbacks now resolve to the live methods (build-time collapse
-         captured a stale world -> wrong events). Then the whole set erased
-         (`_eraseCallbackSet`), a model without callbacks too: the prob has the
-         model-independent type whose `solve` compiles once per process. =#
+         The callbacks erased HERE (`_eraseCallbackSet`), inside invokelatest (a settled
+         world, the build call having returned), then remake: the FunctionWrappers built
+         around the RGF-backed MTK callbacks now resolve to the live methods (build-time
+         collapse captured a stale world -> wrong events). A model without callbacks too:
+         the prob has the model-independent type whose `solve` compiles once per process. =#
       return Base.invokelatest() do
         local SB = OMB.Runtime.ModelingToolkit.SciMLBase
         local p = prob
         if OMB.DIRECT_RHS_TYPE_ERASE[]
-          local cb = get(p.kwargs, :callback, nothing)
-          cb === nothing || (cb = OMB.CodeGeneration._eraseContinuousCallbacks(cb))
-          p = SB.remake(p; callback = OMB.CodeGeneration._eraseCallbackSet(cb))
+          p = SB.remake(p; callback = OMB.CodeGeneration._eraseCallbackSet(get(p.kwargs, :callback, nothing)))
         end
         local rebuilt = (p, cached[2], cached[3], cached[4], cached[5],
                          tspan, cached[7], cached[8], cached[9])

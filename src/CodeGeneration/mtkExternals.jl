@@ -108,13 +108,25 @@ Each compiled Modelica function's number of nodes and the compiled functions it 
 const COMPILED_CODE_SIZES = Dict{Symbol, Tuple{Int, Tuple{Vararg{Symbol}}}}()
 
 """
-Each compiled Modelica function's body (compiledFunction) with the hash of the code and callees it was compiled from,
-by name: a translate of the same code again reuses it. A method defined again discards its compiled code (a model
-translated again compiled its functions again, OM.simulate after OM.translate), and while OMBackend's image is generated
-it is an error ("Method overwriting is not permitted during Module precompilation": the workload translates a model
-twice, as OM.simulate does).
+A compiled Modelica function's body (compiledFunction), the code and callees it was compiled from and their hash: a
+hash hit is confirmed on the code (`_sameCode`, literals by type: `hash(1) == hash(1.0)`). A struct with a `Function`
+field, not a tuple: a `Tuple{UInt, typeof(body)}` stored in the registry compiled its `setindex!` once per function
+(465 instances, 2 s at MSL BatchPlant's first translate, 2026-11-07).
 """
-const COMPILED_BODIES = Dict{Symbol, Tuple{UInt, Function}}()
+struct CompiledBody
+  codeHash::UInt
+  code::Expr
+  callees::Tuple{Vararg{Symbol}}
+  body::Function
+end
+
+"""
+Each compiled Modelica function's body (`CompiledBody`) by name: a translate of the same code again reuses it. A
+method defined again discards its compiled code (a model translated again compiled its functions again, OM.simulate
+after OM.translate), and while OMBackend's image is generated it is an error ("Method overwriting is not permitted
+during Module precompilation": the workload translates a model twice, as OM.simulate does).
+"""
+const COMPILED_BODIES = Dict{Symbol, CompiledBody}()
 
 """
 The calls of the compiled Modelica function `name` so far (CompiledModelicaFunction): the time they
@@ -133,15 +145,17 @@ A Modelica function's compiled implementation (compiledFunction): its body, a fu
 tuple of the arguments, behind a method of the function's arity, as ModelicaFunctionWrapper; its
 interpreted closure, which runs its calls until its tier's time (CompileTier) and an evaluation with
 symbolic arguments calls (_symbolicImpl). One per build: the call memo (_memoizedCallBy) starts over
-for a new implementation.
+for a new implementation. Not parametric in the body's type: the body is called only behind a barrier
+(`inferencebarrier`, `invokelatest`), and with it every function compiled its call and constructor
+again (MSL BatchPlant's first translate: about 600 instances, 1 s).
 """
-struct CompiledModelicaFunction{N, F} <: Function
-  f::F
+struct CompiledModelicaFunction{N} <: Function
+  f::Function
   interp::Function
   tier::CompileTier
 end
-CompiledModelicaFunction{N}(name::Symbol, f::F, interp::Function) where {N, F} =
-  CompiledModelicaFunction{N, F}(f, interp, CompileTier(name, 0, 0, false))
+CompiledModelicaFunction{N}(name::Symbol, f::Function, interp::Function; compiled::Bool = false) where {N} =
+  CompiledModelicaFunction{N}(f, interp, CompileTier(name, 0, 0, compiled))
 #= the body's call opaque to inference: compiling this method inferred the body for the arguments,
    called or not (MSL R134a2: its translate 30 s, interpreted 10 s) =#
 (c::CompiledModelicaFunction{N})(args::Vararg{Any, N}) where {N} =
@@ -969,14 +983,17 @@ function tupleElementCall(funcName::Symbol, ix::Int, args...)
     #= Try eager evaluation: call impl with original (Num-wrapped) args.
        Produces elementary symbolic expressions Symbolics can differentiate.
        Falls back to opaque RTG extractors if eval fails (if-statement on symbolic). =#
-    try
-      local impl = _symbolicImpl(MODELICA_FUNCTION_IMPLS[funcName])
-      local preparedArgs = _prepareArgsForEagerEval(args)
-      local result = Base.invokelatest(impl, preparedArgs...)
-      return result[ix]
-    catch err
-      #= Symbolic arguments: the opaque extractors below (_EAGER_SYMBOLIC_FAILURE). =#
-      OMBackend._fallback(err, :eagerFunctionElement; expect = _EAGER_SYMBOLIC_FAILURE)
+    if !_eagerFailed(funcName, args)
+      try
+        local impl = _symbolicImpl(MODELICA_FUNCTION_IMPLS[funcName])
+        local preparedArgs = _prepareArgsForEagerEval(args)
+        local result = Base.invokelatest(impl, preparedArgs...)
+        return result[ix]
+      catch err
+        #= Symbolic arguments: the opaque extractors below (_EAGER_SYMBOLIC_FAILURE). =#
+        _eagerFailure!(funcName, args, err)
+        OMBackend._fallback(err, :eagerFunctionElement; expect = _EAGER_SYMBOLIC_FAILURE)
+      end
     end
     #= Fallback: opaque RTG Term extractors =#
     local uwArgs = Any[unwrapForSymbolic(a) for a in args]
@@ -1547,24 +1564,54 @@ function _symbolicFuncDispatch(funcName::Symbol, origArgs::Vector{Any}, isArray:
     local expanded = expander(origArgs...)
     expanded === nothing || return expanded
   end
-  try
-    local impl = _symbolicImpl(MODELICA_FUNCTION_IMPLS[funcName])
-    local preparedArgs = _prepareArgsForEagerEval(origArgs)
-    local result = Base.invokelatest(impl, preparedArgs...)
-    if isArray && !isempty(dims)
-      return _ensureArrayShape(result, dims)
-    end
-    return result
-  catch err
-    OMBackend._fallback(err, :eagerFunctionCall; expect = _EAGER_SYMBOLIC_FAILURE)
-    local uwArgs = Any[unwrapForSymbolic(a) for a in origArgs]
-    if isArray && !isempty(dims)
-      return createSymbolicArrayCall(MODELICA_FUNCTION_WRAPPERS[funcName], uwArgs, dims; funcName=funcName)
-    else
-      return _makeScalarSymbolicTerm(funcName, uwArgs)
+  local key::Tuple = Tuple(origArgs)
+  if !_eagerFailed(funcName, key)
+    try
+      local impl = _symbolicImpl(MODELICA_FUNCTION_IMPLS[funcName])
+      local preparedArgs = _prepareArgsForEagerEval(origArgs)
+      local result = Base.invokelatest(impl, preparedArgs...)
+      if isArray && !isempty(dims)
+        return _ensureArrayShape(result, dims)
+      end
+      return result
+    catch err
+      _eagerFailure!(funcName, key, err)
+      OMBackend._fallback(err, :eagerFunctionCall; expect = _EAGER_SYMBOLIC_FAILURE)
     end
   end
+  local uwArgs = Any[unwrapForSymbolic(a) for a in origArgs]
+  if isArray && !isempty(dims)
+    return createSymbolicArrayCall(MODELICA_FUNCTION_WRAPPERS[funcName], uwArgs, dims; funcName=funcName)
+  else
+    return _makeScalarSymbolicTerm(funcName, uwArgs)
+  end
 end
+
+"""
+The eager symbolic evaluations of a function that threw a TypeError (a condition on a symbolic value), by their
+arguments, for the implementation they ran with (`impl`; a new build has new ones). The same call throws again; it
+falls back at once (`_eagerFailed`). A throw cost 0.5-2 ms on this Mac: MSL BatchPlant's translate threw 4918 times,
+most of the 8 s its eliminated variables' residuals took. Kept per task (no locks between threads), as the call memo.
+"""
+mutable struct EagerFailures
+  impl::Any
+  args::Set{Tuple}
+end
+
+function _eagerFailures(funcName::Symbol)::EagerFailures
+  local all = get!(() -> Dict{Symbol, EagerFailures}(), task_local_storage(), :ombackendEagerFailures)::Dict{Symbol, EagerFailures}
+  local impl::Any = get(MODELICA_FUNCTION_IMPLS, funcName, nothing)
+  local f::EagerFailures = get!(() -> EagerFailures(impl, Set{Tuple}()), all, funcName)
+  f.impl === impl || (f.impl = impl; empty!(f.args))
+  return f
+end
+
+"Whether the eager evaluation of `funcName` with the arguments `key` threw a TypeError before (EagerFailures)."
+_eagerFailed(funcName::Symbol, key::Tuple)::Bool = key in _eagerFailures(funcName).args
+
+"A failed eager evaluation: a TypeError recorded (EagerFailures)."
+_eagerFailure!(funcName::Symbol, key::Tuple, err)::Nothing =
+  (err isa TypeError && push!(_eagerFailures(funcName).args, key); nothing)
 
 """
 Build the body Expr for a wrapper function with the given arity and dispatch mode.
@@ -1708,8 +1755,11 @@ function compiledFunction(name::Symbol, ex::Expr, callees::Tuple{Vararg{Symbol}}
   OMBackend.evaluationRejected(@__MODULE__) && return _compiledRGF(name, ex, interp)
   local (body, n) = _tupleArgFunction(ex)
   local codeHash::UInt = hash((ex, callees))
-  local known::Union{Nothing, Tuple{UInt, Function}} = get(COMPILED_BODIES, name, nothing)
-  (known !== nothing && known[1] == codeHash) && return CompiledModelicaFunction{n}(name, known[2], interp)
+  local known::Union{Nothing, CompiledBody} = get(COMPILED_BODIES, name, nothing)
+  #= a body an earlier build compiled is called at once: its compilation is paid (MSL BatchPlant's warm translate ran
+     its IF97 functions interpreted again, the initialization 7.5 s instead of 2.3 s) =#
+  (known !== nothing && known.codeHash == codeHash && known.callees == callees && _sameCode(known.code, ex)) &&
+    return CompiledModelicaFunction{n}(name, known.body, interp; compiled = true)
   local params = ex.args[1] isa Symbol ? Any[ex.args[1]] : ex.args[1].args
   local bodyName = _compiledBodyName(name)
   local numeric = foldr((a, b) -> :($a && $b), Any[:(_isNumericArg($p)) for p in params]; init = true)
@@ -1723,7 +1773,7 @@ function compiledFunction(name::Symbol, ex::Expr, callees::Tuple{Vararg{Symbol}}
     end
   end)
   local compiled::Function = Base.invokelatest(getglobal, @__MODULE__, bodyName)
-  COMPILED_BODIES[name] = (codeHash, compiled)
+  COMPILED_BODIES[name] = CompiledBody(codeHash, ex, callees, compiled)
   return CompiledModelicaFunction{n}(name, compiled, interp)
 end
 
@@ -3403,13 +3453,21 @@ end
 """
 The names the legacy callbacks index the state vector by
 (`lookuptableStates[Symbol("name")]`, or `[:name]` for a pre() read) in
-generated code `ex`.
+generated code `ex`, and the variables a compiled continuous-when condition
+reads (`WhenCondition(names, ...)`, not its parameters): it reads them by the
+system's value functions, which read an observed variable too, but they stay
+unknowns as they were while the condition looked them up (the same system,
+the same solution).
 """
-function namedStateLookups(ex)::Vector{String}
+function namedStateLookups(ex, simCode::SC.SIM_CODE)::Vector{String}
   local names = OrderedSet{String}()
   local walk
   walk = function (e)
     e isa Expr || return nothing
+    if e.head == :call && length(e.args) == 3 && e.args[1] == :(OMBackend.CodeGeneration.WhenCondition) &&
+       e.args[2] isa Vector{String}
+      union!(names, Iterators.filter(n -> !SC.isScalarParameter(last(simCode.stringToSimVarHT[n])), e.args[2]))
+    end
     local key = if e.head == :ref && length(e.args) == 2 && e.args[1] === :lookuptableStates
       e.args[2]
     elseif e.head == :call && length(e.args) == 3 && e.args[1] in (:getindex, getindex) && e.args[2] === :lookuptableStates
@@ -3446,6 +3504,11 @@ function checkNamedStateLookups(problem, names::Vector{String})
     @warn "[events] callbacks index the state vector by these names, but they are not unknowns of the simplified system" missingNames
   return nothing
 end
+
+"""
+The index of each name in `names` (the states or parameters of a callback's lookup tables).
+"""
+_indexTable(names::AbstractVector)::Dict{Symbol, Int} = Dict{Symbol, Int}(Symbol(n) => i for (i, n) in enumerate(names))
 
 function getParametersAsSymbols(odeFunc::ODEFunction)
   odeFunc.sys === nothing && return Symbol[]

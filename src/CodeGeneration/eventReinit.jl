@@ -79,6 +79,97 @@ DiffEqBase.initialize_dae!(integrator::ModelingToolkit.SciMLBase.DEIntegrator, s
 DiffEqBase.initialize_dae!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator, s::StartReinit) =
   _eventReinit!(integrator, s.alg)
 
+const _SPARSE_JACOBIAN = Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}
+const _SPARSE_FACTORS = Symbolics.SparseArrays.UMFPACK.UmfpackLU{Float64, Int}
+
+"""
+The event Newton's work arrays for one integrator (`_eventNewton!`): the algebraic rows, the iterate, the residual and
+its algebraic rows `g`, the step, the Jacobian. For a sparse Jacobian also its algebraic block `jac[rows, rows]`, the
+position of each block entry among the Jacobian's stored values (`blockIndex`), and the block's factorization, redone
+in place (`_factorBlock!`). `prototype` and `massMatrix` are the problem's, to tell when it changed.
+"""
+mutable struct _EventNewtonWork{J <: AbstractMatrix{Float64}}
+  const prototype::AbstractMatrix
+  const massMatrix::Any
+  const rows::Vector{Int}
+  const u::Vector{Float64}
+  const residual::Vector{Float64}
+  const g::Vector{Float64}
+  const step::Vector{Float64}
+  const jac::J
+  const block::Union{Nothing, _SPARSE_JACOBIAN}
+  const blockIndex::Vector{Int}
+  const zeros::BitVector
+  factors::Union{Nothing, _SPARSE_FACTORS}
+end
+
+"""
+A new workspace for the problem function `f` (its Jacobian prototype, mass matrix and algebraic rows) and `n`
+unknowns.
+"""
+function _EventNewtonWork(f::ModelingToolkit.SciMLBase.AbstractDiffEqFunction, n::Int)
+  local rows::Vector{Int} = _algebraicRows(f)
+  local jac::AbstractMatrix{Float64} = similar(f.jac_prototype, Float64)
+  local block::Union{Nothing, _SPARSE_JACOBIAN} = jac isa _SPARSE_JACOBIAN ? jac[rows, rows] : nothing
+  local blockIndex::Vector{Int} = block === nothing ? Int[] : _blockIndex(jac, block, rows)
+  return _EventNewtonWork(f.jac_prototype, f.mass_matrix, rows, Vector{Float64}(undef, n), Vector{Float64}(undef, n),
+                          Vector{Float64}(undef, length(rows)), Vector{Float64}(undef, length(rows)), jac, block,
+                          blockIndex, falses(length(blockIndex)), nothing)
+end
+
+"""
+Where each stored entry of `block` (`jac[rows, rows]`) is among `jac`'s stored values.
+"""
+function _blockIndex(jac::_SPARSE_JACOBIAN, block::_SPARSE_JACOBIAN, rows::Vector{Int})::Vector{Int}
+  local index::Vector{Int} = Vector{Int}(undef, Symbolics.SparseArrays.nnz(block))
+  local blockRows::Vector{Int} = Symbolics.SparseArrays.rowvals(block)
+  for c in axes(block, 2), k in Symbolics.SparseArrays.nzrange(block, c)
+    index[k] = _storedIndex(jac, rows[blockRows[k]], rows[c])
+  end
+  return index
+end
+
+const _EVENT_NEWTON_WORK = WeakKeyDict{Any, _EventNewtonWork}()
+
+"""
+The integrator's event Newton work arrays (`_EventNewtonWork`): made at its first re-solve, and again when its problem
+changed (another Jacobian prototype or mass matrix). An immutable integrator gets new ones at every call.
+"""
+function _eventNewtonWork(integrator::ModelingToolkit.SciMLBase.DEIntegrator)::_EventNewtonWork
+  local f::ModelingToolkit.SciMLBase.AbstractDiffEqFunction = integrator.f
+  local n::Int = length(integrator.u)
+  ismutable(integrator) || return _EventNewtonWork(f, n)
+  local w::Union{Nothing, _EventNewtonWork} = get(_EVENT_NEWTON_WORK, integrator, nothing)
+  (w !== nothing && w.prototype === f.jac_prototype && w.massMatrix === f.mass_matrix && length(w.u) == n) && return w
+  w = _EventNewtonWork(f, n)
+  _EVENT_NEWTON_WORK[integrator] = w
+  return w
+end
+
+"""
+The algebraic block of `w.jac` factorized. A sparse one is copied into `w.block` and refactorized in place: UMFPACK's
+symbolic analysis is kept while the block's stored entries that are exactly zero stay the same (`w.zeros`). The
+analysis reads the values only for those (its count of the nonzero diagonal chooses its strategy), so the factors
+equal a fresh `lu`'s.
+"""
+function _factorBlock!(w::_EventNewtonWork{_SPARSE_JACOBIAN})::_SPARSE_FACTORS
+  local block::_SPARSE_JACOBIAN = w.block
+  local values::Vector{Float64} = Symbolics.SparseArrays.nonzeros(block)
+  local stored::Vector{Float64} = Symbolics.SparseArrays.nonzeros(w.jac)
+  local reuse::Bool = w.factors !== nothing
+  for (k, idx) in enumerate(w.blockIndex)
+    values[k] = stored[idx]
+    reuse &= iszero(values[k]) == w.zeros[k]
+  end
+  reuse || (w.zeros .= iszero.(values))
+  local factors::Union{Nothing, _SPARSE_FACTORS} = w.factors
+  w.factors = factors === nothing ? LinearAlgebra.lu(block; check = false) :
+                                    LinearAlgebra.lu!(factors, block; check = false, reuse_symbolic = reuse)
+  return w.factors
+end
+"The algebraic block of a dense Jacobian factored (a new LU each time)."
+_factorBlock!(w::_EventNewtonWork)::LinearAlgebra.Factorization{Float64} = LinearAlgebra.lu(w.jac[w.rows, w.rows]; check = false)
+
 """
     _eventNewton!(integrator; tol, maxiters, damped = false) -> Bool
 
@@ -108,18 +199,22 @@ function _eventNewton!(integrator::ModelingToolkit.SciMLBase.DEIntegrator; tol::
   local f = integrator.f
   (eltype(integrator.u) === Float64 && hasproperty(f, :jac) && f.jac !== nothing &&
    hasproperty(f, :jac_prototype) && f.jac_prototype !== nothing && ModelingToolkit.SciMLBase.isinplace(f)) || return false
-  local rows = _algebraicRows(f)
+  local w::_EventNewtonWork = _eventNewtonWork(integrator)
+  local rows::Vector{Int} = w.rows
   isempty(rows) && return false
   local (p, t) = (integrator.p, integrator.t)
-  local u = copy(integrator.u)
-  local residual = similar(u)
-  local jac = similar(f.jac_prototype, Float64)
-  local previous = Inf
+  local u::Vector{Float64} = copyto!(w.u, integrator.u)
+  local residual::Vector{Float64} = w.residual
+  local g::Vector{Float64} = w.g
+  local jac::AbstractMatrix{Float64} = w.jac
+  local previous::Float64 = Inf
   for _ in 0:maxiters
     f(residual, u, p, t)
-    local g = residual[rows]
+    for (i, k) in enumerate(rows)
+      g[i] = residual[k]
+    end
     all(isfinite, g) || return false
-    local size = maximum(abs, g)
+    local size::Float64 = maximum(abs, g)
     if size <= tol
       copyto!(integrator.u, u)
       return true
@@ -127,16 +222,18 @@ function _eventNewton!(integrator::ModelingToolkit.SciMLBase.DEIntegrator; tol::
     f.jac(jac, u, p, t)
     #= the round-off floor once Newton stalls: while it converges, a residual under the floor can
        still fall (a solution to round-off, not before it) =#
-    local stalled = size > previous / 2
+    local stalled::Bool = size > previous / 2
     previous = size
-    local floor = (abs.(jac) * abs.(u))[rows]
-    if stalled && all(k -> abs(g[k]) <= tol + 1e3 * eps() * floor[k], eachindex(g))
-      copyto!(integrator.u, u)
-      return true
+    if stalled
+      local floor::Vector{Float64} = (abs.(jac) * abs.(u))[rows]
+      if all(k -> abs(g[k]) <= tol + 1e3 * eps() * floor[k], eachindex(g))
+        copyto!(integrator.u, u)
+        return true
+      end
     end
-    local F = LinearAlgebra.lu(jac[rows, rows]; check = false)
+    local F::LinearAlgebra.Factorization{Float64} = _factorBlock!(w)
     LinearAlgebra.issuccess(F) || return false
-    local step = F \ g
+    local step::Vector{Float64} = LinearAlgebra.ldiv!(w.step, F, g)
     if stalled && _scaledNorm(rows, integrator, step, u) <= 1
       copyto!(integrator.u, u)
       return true

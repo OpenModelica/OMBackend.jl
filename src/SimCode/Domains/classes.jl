@@ -992,8 +992,8 @@ end
 
 """
 The instances of one `y` and `x` in chain order, `sa -> s1 -> ... -> sb` (each one's second slope the next one's
-first), every intermediate slope a variable, each slope once; `nothing` for another shape (the SimCode pass's
-`semiLinearChain`).
+first), no intermediate slope a literal (the caller checks them, `_chainNode`), each slope once; `nothing` for another
+shape (the SimCode pass's `semiLinearChain`).
 """
 function _semiLinearChain(eqs::Vector{SemiLinearInstance})::Union{Nothing, Vector{SemiLinearInstance}}
   length(eqs) >= 2 || return nothing
@@ -1008,11 +1008,38 @@ function _semiLinearChain(eqs::Vector{SemiLinearInstance})::Union{Nothing, Vecto
   local chain::Vector{SemiLinearInstance} = SemiLinearInstance[eqs[only(starts)]]
   while length(chain) < length(eqs)
     local next::Int = get(bySa, last(chain).sbKey, 0)
-    (next == 0 || !(last(chain).sb isa Ref)) && return nothing
+    (next == 0 || last(chain).sb isa Lit) && return nothing
     push!(chain, eqs[next])
   end
   haskey(bySa, last(chain).sbKey) && return nothing
   return chain
+end
+
+"""
+Whether `x` can be a semiLinear chain's intermediate slope, which the rewrite gives an equation: an algebraic unknown,
+or an expression of algebraic unknowns and parameters that reads one (`cp*T`: MSL FluidHeatFlow's components compute
+their enthalpy from their temperature); no state, discrete variable, time, pre() or relation (the SimCode pass's
+`semiLinearChainNode`).
+"""
+function _chainNode(g::Gen, x::IR)::Bool
+  local kinds::Set{Symbol} = Set{Symbol}()
+  _refKinds!(kinds, g, x) || return false
+  return :alg in kinds && issubset(kinds, (:alg, :param))
+end
+
+"""
+The kinds of the variables `x` reads into `kinds`; false where it reads time, pre(), a relation, an event-generating
+function, a derivative or a name that is no variable.
+"""
+function _refKinds!(kinds::Set{Symbol}, g::Gen, x::IR)::Bool
+  (x isa TimeIR || x isa Pre || x isa Rel || x isa EvFn) && return false
+  if x isa Ref
+    (x.der || !haskey(g.vars, x.name)) && return false
+    push!(kinds, g.vars[x.name].kind)
+    return all(s::IR -> _refKinds!(kinds, g, s), x.subs)
+  end
+  x isa Op && return all(a::IR -> _refKinds!(kinds, g, a), x.args)
+  return true
 end
 
 """
@@ -1113,8 +1140,8 @@ function _simplifySemiLinear!(g::Gen)::Int
   local added::Vector{EqClass} = EqClass[]
   local scalar::Matrix{Int} = Matrix{Int}(undef, 0, 1)
   local text::Function = (e::SemiLinearInstance) -> string("semiLinear chain (MLS 3.7.2.5): ", g.classes[e.class].text)
-  #= an intermediate slope the rewrite gives an equation of: an algebraic unknown (not a parameter or a state) =#
-  local algebraic::Function = (s::IR) -> s isa Ref && haskey(g.vars, s.name) && g.vars[s.name].kind == :alg
+  #= an intermediate slope the rewrite gives an equation of (`_chainNode`) =#
+  local algebraic::Function = (s::IR) -> _chainNode(g, s)
   local nChains::Int = 0
   for key in sort!(collect(keys(groups)))
     local chain::Union{Nothing, Vector{SemiLinearInstance}} = _semiLinearChain(groups[key])

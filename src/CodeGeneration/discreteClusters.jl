@@ -68,7 +68,8 @@ A when-equation evaluated by the event iteration (see the top of the file).
   operand (time, parameters, discretes only), or `==`/`<>`.
 - `body(integrator, operands, pre, rel, relPre, initial)`: the new values of
   the members, or `nothing` when the when does not fire. `rel` are the
-  relation values, `relPre` their values before the pass.
+  relation values, `relPre` their values before the pass. A TieredBody, or
+  a closure where it defines a function (`_callBody`).
 - `atStart`: the body at the start: 0 not run, 1 with initial() false, 2 with
   initial() true.
 - `table`: the model's algebraic rows read constant tables. A flag of the
@@ -120,10 +121,11 @@ const _derivativeDiscontinuity! = isdefined(ModelingToolkit.SciMLBase, :derivati
   ModelingToolkit.SciMLBase.derivative_discontinuity! : ModelingToolkit.SciMLBase.u_modified!
 
 #= Every evaluation of a cluster's body is printed with
-   OMBACKEND_EVENT_TRACE=true (read when an event is handled), or when this
-   is set to true. =#
+   OMBACKEND_EVENT_TRACE=true (read at the start of a solve, `_initialize!`: an ENV lookup at every body call cost
+   about 0.3 us), or when this is set to true. =#
 const _EVENT_TRACE = Ref{Union{Nothing, Bool}}(nothing)
-_eventTrace() = something(_EVENT_TRACE[], OMBackend.envSwitch("OMBACKEND_EVENT_TRACE"))
+const _EVENT_TRACE_ENV = Ref(false)
+_eventTrace()::Bool = something(_EVENT_TRACE[], _EVENT_TRACE_ENV[])
 
 _readValues(c::DiscreteCluster, integrator) = c.values(integrator.u, integrator.p, integrator.t)
 _operands(c::DiscreteCluster, v) = view(v, 1:c.nOperands)
@@ -258,13 +260,28 @@ end
 
 """
 Whether a relation disagrees with the state by the rule from `reference`
-(the buffers, or the values at the start of a pass).
+(the buffers, or the values at the start of a pass). With `literalInBand`
+(the search, `_search!`) a relation inside its hysteresis band may also take
+its literal value: there the state is on either side to the tolerance.
 """
-function _inconsistent(c::DiscreteCluster, integrator, reference::Vector{Bool} = c.rel)
-  local zs = _eventCrossingValues!(c, integrator)
-  local H = _hysteresisFromTolerance(integrator)
-  return any(k -> _ruled(c, zs, k, H, reference[k]) != c.rel[k], eachindex(c.rel))
+function _inconsistent(c::DiscreteCluster, integrator, reference::Vector{Bool} = c.rel;
+                       literalInBand::Bool = false)::Bool
+  local zs::Vector{Float64} = _eventCrossingValues!(c, integrator)
+  local H::Float64 = _hysteresisFromTolerance(integrator)
+  for k in eachindex(c.rel)
+    _ruled(c, zs, k, H, reference[k]) == c.rel[k] && continue
+    literalInBand && _literal(zs, k, c.strict[k]) == c.rel[k] && continue
+    return true
+  end
+  return false
 end
+
+"""
+Whether relation k is held by its hysteresis band only: its buffer is not its literal value on the state (`zs`), a
+relation of a continuous-time variable located by its crossings (not `exact`, not `eventOnly`).
+"""
+_heldInBand(c::DiscreteCluster, zs::AbstractVector{Float64}, k::Int)::Bool =
+  !c.exact[k] && !c.eventOnly[k] && _literal(zs, k, c.strict[k]) != c.rel[k]
 
 """
 Phase 1 of a sweep: the buffers from the state. Whether one changed. A
@@ -378,10 +395,48 @@ function _write!(c::DiscreteCluster, integrator, values)
 end
 
 """
-`body` is generated code, compiled after OMBackend: call it in the latest world.
+The body's values, or nothing where the when does not fire (`body` of DiscreteCluster).
 """
 _runBody(c::DiscreteCluster, integrator, v, pre, relPre, initial::Bool) =
-  Base.invokelatest(c.body, integrator, _operands(c, v), pre, c.rel, relPre, initial)
+  _callBody(c.body, integrator, _operands(c, v), pre, c.rel, relPre, initial)
+
+"""
+    TieredBody(interp, compiled, nodes)
+
+A cluster's body (mtkDiscreteEvents.jl `_discreteClusterSpec`, codeGen.jl `_tieredBody`): its closure of the model's
+module `interp`, run interpreted (the module is compile=min) in the latest world, until it has run about as long as
+compiling its code of `nodes` nodes takes (CompileTier), then the same code `compiled` (eventFunction), which runs in
+any world. Interpreted, MSL HBridge_DC_Drive's took 1 us a call, 2.8 million calls.
+"""
+struct TieredBody <: Function
+  interp::Function
+  compiled::RuntimeGeneratedFunctions.RuntimeGeneratedFunction
+  tier::CompileTier
+end
+
+TieredBody(interp::Function, compiled::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, nodes::Int) =
+  TieredBody(interp, compiled, CompileTier(:clusterBody, 0, COMPILE_AFTER_NS_PER_NODE[] * max(nodes, 1), false))
+
+"""
+A body that defines a function is its closure, generated code compiled after OMBackend: called in the latest world.
+"""
+_callBody(body::Function, integrator, o::AbstractVector, pre::AbstractVector, rel::Vector{Bool}, relPre::Vector{Bool},
+          initial::Bool) = Base.invokelatest(body, integrator, o, pre, rel, relPre, initial)
+
+function _callBody(b::TieredBody, integrator, o::AbstractVector, pre::AbstractVector, rel::Vector{Bool},
+                   relPre::Vector{Bool}, initial::Bool)
+  local tier::CompileTier = b.tier
+  tier.compiled && return _compiledBody(b.compiled, integrator, o, pre, rel, relPre, initial)
+  local t0::UInt64 = time_ns()
+  local values = Base.invokelatest(b.interp, integrator, o, pre, rel, relPre, initial)
+  tier.interpreted += time_ns() - t0
+  tier.interpreted >= tier.after && (tier.compiled = true)
+  return values
+end
+
+"A tiered body's compiled code: typed by the code."
+_compiledBody(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, integrator, o::AbstractVector, pre::AbstractVector,
+              rel::Vector{Bool}, relPre::Vector{Bool}, initial::Bool) = f(integrator, o, pre, rel, relPre, initial)
 
 #= Passes of the mixed system before a cluster gives up (the event iteration
    goes on with the last values), and the most relation groups a search may
@@ -471,11 +526,21 @@ such as `sa > tau0_max` and `sa > tau0` with peak = 1) vary together.
 Candidates are tried from the same state, fewest changes from `relStart`
 first. Whether a discrete changed; when none is consistent the state is put
 back, and a model that keeps cycling stops at the event iteration's limit.
+
+A relation held by its hysteresis band only (`_heldInBand`) is searched too,
+and its literal value counts as consistent: inside the band the state is on
+either side to the tolerance. MSL TanksWithOverflow: the upper tank's level
+reaches the overflow port, 2e-10 above it in the band of `fluidLevel >=
+portsData_height` (7e-10), the crossing located for another relation of the
+step; held false, neither `inFlow` mode is consistent (the inflow's s =
+m_flow is negative, the blocked port's s positive), and the event iteration
+failed; the literal `regularFlow` is the consistent mode.
 """
 function _search!(c::DiscreteCluster, integrator, pre, relPre, reinit, relStart, flipped)
   local zs = copy(_crossingValues!(c, integrator))
   local groups = Vector{Vector{Int}}()
-  for k in findall(flipped)
+  for k in eachindex(c.rel)
+    (flipped[k] || _heldInBand(c, zs, k)) || continue
     local j = findfirst(g -> zs[2first(g) - 1] == zs[2k - 1] && zs[2first(g)] == zs[2k], groups)
     j === nothing ? push!(groups, [k]) : push!(groups[j], k)
   end
@@ -503,7 +568,7 @@ function _search!(c::DiscreteCluster, integrator, pre, relPre, reinit, relStart,
       _restoreRetcode!(integrator, retcode)
       continue
     end
-    _inconsistent(c, integrator, relStart) && continue
+    _inconsistent(c, integrator, relStart; literalInBand = true) && continue
     _settled(c, integrator, _runBody(c, integrator, _readValues(c, integrator), pre, relPre, false)) || continue
     return true
   end
@@ -519,6 +584,7 @@ At the start, on the solved initial state: every relation literal, then
 the body where the when has an initial() term. Whether a member changed.
 """
 function _initialize!(c::DiscreteCluster, integrator)
+  _EVENT_TRACE_ENV[] = OMBackend.envSwitch("OMBACKEND_EVENT_TRACE")
   _literalBuffers!(c, integrator)
   c.atStart == 0 && return false
   local v = _readValues(c, integrator)

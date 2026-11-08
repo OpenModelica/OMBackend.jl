@@ -49,7 +49,9 @@ import OMFrontend
   local xs = ntuple(Float64, 60)
   for many in (CG.compiledFunction(:omjlCompiledMany, sixty, (), @__MODULE__, eval(sixty)), CG._compiledRGF(:omjlCompiledManyRGF, sixty, eval(sixty)))
     @test call(many, xs...) == sum(1:60)
-    local alloc = () -> (many.f(xs); @allocated many.f(xs))
+    #= the body itself (the field is a Function: called through it, the argument tuple is boxed) =#
+    local body = many.f
+    local alloc = () -> (body(xs); @allocated body(xs))
     @test call(alloc) == 0
   end
   #= a call of a compiled function: its entry, its record result inferred =#
