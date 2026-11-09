@@ -91,13 +91,35 @@ struct ModelicaAssert{O <: NamedTuple, C, M, Z}
 end
 
 """
+    AssertCrossings(names, f, count, nodes)
+
+The time-varying asserts' crossing functions as one compiled function (mtkDiscreteEvents.jl `_assertCrossingsCode`):
+`f(out, v, t)` writes the `count` crossings from the values `v` of the variables `names`. The assert callback runs
+the asserts' own closures (interpreted: the model's module is compile=min) until they have run about as long as
+compiling `f`'s `nodes` nodes takes (CompileTier), then `f`. MSL BranchingDynamicPipes' 141 crossings took 75 us an
+evaluation interpreted.
+"""
+struct AssertCrossings
+  names::Vector{Symbol}
+  f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction
+  count::Int
+  tier::CompileTier
+end
+
+AssertCrossings(names::Vector{Symbol}, f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, count::Int, nodes::Int) =
+  AssertCrossings(names, f, count, CompileTier(:assertCrossings, 0, COMPILE_AFTER_NS_PER_NODE[] * max(nodes, 1), false))
+
+"""
 The asserts as one DiscreteCallback, added to `callbacks`. The variables are
 read through the problem's symbolic index (states, observed and eliminated
 variables alike); an assert on a variable the simulation does not keep is
 reported and left out. `discrete`: the names of the discrete variables (states
 the events set): a crossing left to decide is decided with their values there.
+`crossings`: the crossings compiled (AssertCrossings), used where every
+time-varying assert is checked and the problem has its variables.
 """
-function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vector{Symbol} = Symbol[])
+function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vector{Symbol} = Symbol[],
+                            crossings::Union{Nothing, AssertCrossings} = nothing)
   local checks = Tuple{ModelicaAssert, Any}[]
   local byName = _variablesByName(problem)
   for a in asserts
@@ -191,13 +213,14 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
     end
     nothing
   end
+  local timeVarying::Vector{Int} = Int[i for (i, (a, _)) in enumerate(checks) if a.timeVarying]
   local check! = function (integrator, all::Bool)
     try
-      for (i, (a, _)) in enumerate(checks)
-        (all || a.timeVarying) && checkOne!(integrator, i, all, false)
+      for i in (all ? eachindex(checks) : timeVarying)
+        checkOne!(integrator, i, all, false)
       end
     finally
-      stepStartU[] = copy(integrator.u)
+      length(stepStartU[]) == length(integrator.u) ? copyto!(stepStartU[], integrator.u) : (stepStartU[] = copy(integrator.u))
     end
     return false
   end
@@ -227,17 +250,14 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
      missed (x in [0.4, 0.5) between the events at 0.2 and 0.5). The solver
      finds them on the step's own path, before an event changes the state. =#
   local crossing = Tuple{Int, Int}[(i, k) for (i, (a, _)) in enumerate(checks) if a.timeVarying for k in eachindex(a.crossings)]
-  isempty(crossing) && return DiffEqBase.CallbackSet(callbacks, cb)
+  isempty(crossing) && return _joinCallbacks(callbacks, cb)
+  local crossingFns::Vector{Function} = Function[checks[i][1].crossings[k] for (i, k) in crossing]
+  local compiled::Union{Nothing, Tuple{Any, AssertCrossings}} =
+    crossings !== nothing && crossings.count == length(crossing) && all(n -> haskey(byName, n), crossings.names) ?
+      (ModelingToolkit.SymbolicIndexingInterface.getu(problem, [byName[n] for n in crossings.names]), crossings) : nothing
   local crossingCondition = function (out, u, t, integrator)
-    local src = ModelingToolkit.SymbolicIndexingInterface.ProblemState(; u = u, p = integrator.p, t = t)
-    local j = 0
-    for (a, getter) in checks
-      (a.timeVarying && !isempty(a.crossings)) || continue
-      local values = _assertValues(a, getter, src)
-      for f in a.crossings
-        out[j += 1] = f(values, (t = t,))
-      end
-    end
+    _evaluateAssertCrossings!(out, compiled, crossingFns, crossing, checks,
+                              ModelingToolkit.SymbolicIndexingInterface.ProblemState(; u = u, p = integrator.p, t = t), t)
     nothing
   end
   #= The crossing's index, or (other DiffEqBase versions) the directions of
@@ -250,7 +270,7 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
   local zc = DiffEqBase.VectorContinuousCallback(crossingCondition, crossingAffect!, length(crossing);
                                                  rootfind = ModelingToolkit.SciMLBase.RightRootFind,
                                                  save_positions = (false, false))
-  return DiffEqBase.CallbackSet(callbacks, zc, cb)
+  return _joinCallbacks(callbacks, zc, cb)
 end
 
 """
@@ -267,6 +287,51 @@ function _variablesByName(problem)
   end
   return byName
 end
+
+"""
+The asserts' crossing functions at the state `src` into `out`: `fns[j]` is crossing `crossing[j]` = (assert, its
+relation) of `checks`, the assert's values read once. A flat typed loop: over the asserts (each a type of its own) and
+each one's tuple of closures every element dispatched dynamically, 66 of the 104 us an evaluation took in MSL
+BranchingDynamicPipes (81 asserts, 141 crossings).
+"""
+function _assertCrossings!(out::AbstractVector, fns::Vector{Function}, crossing::Vector{Tuple{Int, Int}},
+                           checks::Vector{Tuple{ModelicaAssert, Any}}, src, t::Real)::Nothing
+  local at::NamedTuple = (t = t,)
+  local owner::Int = 0
+  local values::NamedTuple = NamedTuple()
+  for j in eachindex(fns)
+    local i::Int = first(crossing[j])
+    if i != owner
+      local (a, getter) = checks[i]
+      values = _assertValues(a, getter, src)
+      owner = i
+    end
+    out[j] = fns[j](values, at)
+  end
+  return nothing
+end
+
+"""
+The asserts' crossings at the state `src` into `out`: by their closures (`_assertCrossings!`), or the compiled function
+(`compiled`: the getter of its variables and the AssertCrossings) once its tier is reached.
+"""
+function _evaluateAssertCrossings!(out::AbstractVector, compiled::Union{Nothing, Tuple{Any, AssertCrossings}},
+                                   fns::Vector{Function}, crossing::Vector{Tuple{Int, Int}},
+                                   checks::Vector{Tuple{ModelicaAssert, Any}}, src, t::Real)::Nothing
+  compiled === nothing && return _assertCrossings!(out, fns, crossing, checks, src, t)
+  local (getter, c) = compiled
+  local tier::CompileTier = c.tier
+  tier.compiled && return _compiledAssertCrossings!(c.f, out, getter(src), t)
+  local t0::UInt64 = time_ns()
+  _assertCrossings!(out, fns, crossing, checks, src, t)
+  tier.interpreted += time_ns() - t0
+  tier.interpreted >= tier.after && (tier.compiled = true)
+  return nothing
+end
+
+"The compiled crossings (AssertCrossings): typed by the code and the values."
+_compiledAssertCrossings!(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, out::AbstractVector, v::AbstractVector,
+                          t::Real)::Nothing = (f(out, v, t); nothing)
 
 _assertValues(a::ModelicaAssert, getter, src) =
   getter === nothing ? NamedTuple() : NamedTuple{keys(a.observed)}(Tuple(getter(src)))

@@ -1039,16 +1039,27 @@ end
 #= ==================================================================================== =#
 
 """
-The asserts of equation sections (simCode.asserts) as one callback that checks them after
-the initialization and after each accepted step (asserts.jl). Conditions and messages are
-lowered like event affects: every variable is read through `observed`, `time` from the
-integrator. An assert whose expression cannot be lowered is reported and left out. Names,
-not the symbolic variables, are observed: a variable the compiler eliminated has no binding
-in the generated code, but may still be observed by name.
+One generated assert (`assertEntries`): its `ModelicaAssert` construction, whether it is time-varying, and its
+crossing functions' code.
 """
-function emitAssertCallback(simCode::SC.SIM_CODE)::Expr
-  isempty(simCode.asserts) && return Expr(:block)
-  local entries = Expr[]
+struct AssertCode
+  entry::Expr
+  timeVarying::Bool
+  crossings::Vector{Any}
+end
+
+"""
+    assertEntries(simCode) -> Vector{AssertCode}
+
+The asserts of equation sections (simCode.asserts) as `ModelicaAssert`s, which one callback
+checks after the initialization and after each accepted step (asserts.jl). Conditions and
+messages are lowered like event affects: every variable is read through `observed`, `time`
+from the integrator. An assert whose expression cannot be lowered is reported and left out.
+Names, not the symbolic variables, are observed: a variable the compiler eliminated has no
+binding in the generated code, but may still be observed by name.
+"""
+function assertEntries(simCode::SC.SIM_CODE)::Vector{AssertCode}
+  local entries = AssertCode[]
   for a in simCode.asserts
     local obsAcc = Dict{Symbol, Symbol}()
     local (cond, crossings) = try
@@ -1064,17 +1075,87 @@ function emitAssertCallback(simCode::SC.SIM_CODE)::Expr
       e === nothing || !(last(e).varKind isa SC.PARAMETER)
     end
     local obsNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, k, QuoteNode(v)) for (k, v) in obsAcc]...))
-    push!(entries, :(OMBackend.CodeGeneration.ModelicaAssert($(obsNT),
+    push!(entries, AssertCode(:(OMBackend.CodeGeneration.ModelicaAssert($(obsNT),
                                                              (observed, integrator) -> $(cond),
                                                              (observed, integrator) -> $(msg),
                                                              $(AlgorithmicCodeGeneration.isWarningAssertionLevel(a.level)), $(timeVarying),
                                                              $(string(a.condition)),
-                                                             $(Expr(:tuple, (:((observed, integrator) -> $(c)) for c in crossings)...)))))
+                                                             $(Expr(:tuple, (:((observed, integrator) -> $(c)) for c in crossings)...)))),
+                              timeVarying, crossings))
   end
+  return entries
+end
+
+"""
+The time-varying asserts' crossing functions as one function `(_out, _v, _t) -> nothing` (asserts.jl
+`AssertCrossings`), in the order the assert callback evaluates them: an assert's `observed.x` is `_v[i]`, the `i`-th
+of the variables returned with it, and `integrator.t` the time `_t`. Nothing without crossings, or where a crossing
+reads the integrator otherwise or defines a function (`_definesFunction`).
+"""
+function _assertCrossingsCode(entries::Vector{AssertCode})::Union{Nothing, Tuple{Vector{Symbol}, Expr, Int}}
+  local names::Vector{Symbol} = Symbol[]
+  local index::Dict{Symbol, Int} = Dict{Symbol, Int}()
+  local stmts::Vector{Expr} = Expr[:(_out[$k] = $(_crossingReads(zc, names, index)))
+                                   for (k, zc) in enumerate(zc for a in entries if a.timeVarying for zc in a.crossings)]
+  isempty(stmts) && return nothing
+  local body::Expr = Expr(:block, stmts..., :(return nothing))
+  (_exprMentions(body, :integrator) || _exprMentions(body, :observed) || _definesFunction(body)) && return nothing
+  return (names, :((_out, _v, _t) -> $(body)), length(stmts))
+end
+
+"""
+An assert crossing's code `e` with `observed.x` as `_v[i]`, `x` the `i`-th of `names` (added there and to `index` at
+its first read), and `integrator.t` as `_t` (`_assertCrossingsCode`).
+"""
+function _crossingReads(@nospecialize(e), names::Vector{Symbol}, index::Dict{Symbol, Int})
+  e isa Expr || return e
+  if e.head === :. && e.args[1] === :observed && e.args[2] isa QuoteNode
+    local n::Symbol = e.args[2].value
+    return :(_v[$(get!(() -> (push!(names, n); length(names)), index, n))])
+  end
+  (e.head === :. && e.args[1] === :integrator && e.args[2] == QuoteNode(:t)) && return :_t
+  return Expr(e.head, Any[_crossingReads(a, names, index) for a in e.args]...)
+end
+
+"""
+    emitAssertsFunction(entries, modelPrefix) -> Expr
+
+The asserts (`assertEntries`) as functions of the model's module, named after the model (`modelPrefix`,
+`_<model>_`: the structural modes of a model share its module): one an assert, `<prefix>modelAssert<k>()`,
+`<prefix>modelAsserts()`, the vector of them all, and `<prefix>modelAssertCrossings()`, their crossings as one
+compiled function (`_assertCrossingsCode`, or nothing). Their closures, three an
+assert, read only their arguments and the module's names. Julia's lowering of a function is
+quadratic in its closures: in the model's build function MSL LightningSegmentedTransmissionLine's
+403 asserts took 55 s, in one function of the module 18 s (100 asserts: 1.1 s).
+"""
+function emitAssertsFunction(entries::Vector{AssertCode}, modelPrefix::String)::Expr
+  isempty(entries) && return Expr(:block)
+  local names::Vector{Symbol} = Symbol[Symbol(modelPrefix, "modelAssert", k) for k in eachindex(entries)]
+  local crossings::Union{Nothing, Tuple{Vector{Symbol}, Expr, Int}} = _assertCrossingsCode(entries)
+  return Expr(:block, (:(function $(n)() return $(e.entry) end) for (n, e) in zip(names, entries))...,
+              :(function $(Symbol(modelPrefix, "modelAsserts"))() return [$((Expr(:call, n) for n in names)...)] end),
+              :(function $(Symbol(modelPrefix, "modelAssertCrossings"))()
+                  return $(crossings === nothing ? nothing :
+                    :(OMBackend.CodeGeneration.AssertCrossings($(crossings[1]),
+                        OMBackend.CodeGeneration.eventFunction($(QuoteNode(crossings[2])), @__MODULE__),
+                        $(crossings[3]), $(_exprNodes(crossings[2])))))
+                end))
+end
+
+"""
+    emitAssertCallback(simCode, entries, modelPrefix) -> Expr
+
+The callback that checks the asserts `entries` (`<modelPrefix>modelAsserts`, emitAssertsFunction), in the build
+function.
+"""
+function emitAssertCallback(simCode::SC.SIM_CODE, entries::Vector{AssertCode}, modelPrefix::String)::Expr
   isempty(entries) && return Expr(:block)
   #= the discrete variables: within a step that ends at an event their values are the step's (asserts.jl) =#
   local discrete::Vector{Symbol} = sort!(Symbol[Symbol(n) for (n, (_, v)) in simCode.stringToSimVarHT if v.varKind isa SC.DISCRETE])
-  return :(callbacks = OMBackend.CodeGeneration.withAssertCallback(callbacks, problem, [$(entries...)]; discrete = $(discrete)))
+  return :(callbacks = OMBackend.CodeGeneration.withAssertCallback(callbacks, problem,
+                                                                   Base.invokelatest($(Symbol(modelPrefix, "modelAsserts")));
+                                                                   discrete = $(discrete),
+                                                                   crossings = Base.invokelatest($(Symbol(modelPrefix, "modelAssertCrossings")))))
 end
 
 _isEffectCall(e::SC.Exp)::Bool = e isa SC.CALL && e.ty isa SC.TYPE_NORETCALL
@@ -1353,7 +1434,7 @@ function _discreteClusterSpec(cond::SC.Exp, rels::Vector{SC.RELATION}, assigns::
   return :(OMBackend.CodeGeneration.DiscreteCluster($(memberNames),
                                                    Any[$([d for (d, _, _) in assigns]...)],
                                                    Any[$(reads...)], $(length(operands)), $(length(preNames)),
-                                                   $(strict), $(exact), $(body), $(atStart), $(table), $(coupled),
+                                                   $(strict), $(exact), $(_tieredBody(body)), $(atStart), $(table), $(coupled),
                                                    $(eventOnly)))
 end
 
@@ -1409,7 +1490,7 @@ iteration pending (withRelationRefresh), which evaluates the discrete clusters t
 function _withTicks(callbacks, interval::Real, phase::Real, initialTick::Bool)
   local cb = DiffEqCallbacks.PeriodicCallback(_ -> nothing, interval; phase = phase, initial_affect = initialTick,
                                               final_affect = true, save_positions = (false, false))
-  return callbacks === nothing ? DiffEqBase.CallbackSet(cb) : DiffEqBase.CallbackSet(callbacks, cb)
+  return _joinCallbacks(callbacks, cb)
 end
 
 """

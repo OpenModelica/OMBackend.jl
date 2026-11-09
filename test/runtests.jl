@@ -432,7 +432,20 @@ import .ExampleModels
 
   #= ── 20u. A cluster relation exactly on its boundary; the step after an event ── =#
   include("exactZeroRelationTests.jl")
+  include("heldInBandTests.jl")
+  include("semiLinearChainTests.jl")
+  include("periodicCounterTests.jl")
+  include("eventOrderTests.jl")
   include("whenBodyCallTests.jl")
+
+  #= ── 20u2. When conditions compiled: continuous whens, whens on a relation ── =#
+  include("compiledConditionTests.jl")
+
+  #= ── 20u3. Cluster bodies tiered, the event Newton's factors, assert crossings compiled, eager failures ── =#
+  include("eventPerfTests.jl")
+
+  #= ── 20u4. Build closures hoisted into functions of the model's module ── =#
+  include("hoistBuildClosuresTests.jl")
 
   #= ── Parameters read by literal and by variable subscripts ── =#
   include("parameterEliminationTests.jl")

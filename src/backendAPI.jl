@@ -139,8 +139,9 @@ Toggle with: `OMBackend.DIRECT_RHS_TYPE_ERASE[] = false` to disable.
 
 This also governs event-callback erasure: when on, `_eraseContinuousCallbacks`
 collapses the OM-generated continuous callbacks into a single, model-independent
-`VectorContinuousCallback` (MTK `process_events` callbacks are left unchanged), so
-event-ful models in the legacy when-equation class also share the problem type.
+`VectorContinuousCallback` (MTK `process_events` callbacks are left unchanged), and
+`_eraseCallbackSet` hands the solve the whole set as vectors, so models with any
+callbacks share the integrator type.
 """
 const DIRECT_RHS_TYPE_ERASE = Ref{Bool}(true)
 
@@ -337,6 +338,11 @@ function clearCaches!(; models::Bool=true,
                       push!(cleared, "models"))
   implementations && (empty!(CodeGeneration.MODELICA_FUNCTION_IMPLS); empty!(CodeGeneration.MODELICA_FUNCTION_OWNERS);
                       empty!(CodeGeneration.MODEL_FUNCTIONS); empty!(CodeGeneration.COMPILED_CODE_SIZES);
+                      empty!(CodeGeneration.COMPILED_BODIES);
+                      #= the calling task's memos of the calls and the failed eager evaluations (another
+                         task's go with it) =#
+                      delete!(task_local_storage(), :ombackendCallMemo);
+                      delete!(task_local_storage(), :ombackendEagerFailures);
                       push!(cleared, "implementations"))
   wrappers        && (empty!(CodeGeneration.MODELICA_FUNCTION_WRAPPERS); push!(cleared, "wrappers"))
   extractors      && (empty!(CodeGeneration.ELEM_FUNC_CACHE); empty!(CodeGeneration.TUPLE_ELEM_FUNC_CACHE);

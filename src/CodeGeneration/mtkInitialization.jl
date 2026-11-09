@@ -446,11 +446,21 @@ function emitInitAlgU0Appends(simCode::SC.SIM_CODE)::Vector{Expr}
   for (_, el, _) in _initAlgTargets(lhsNames, simCode, _initAlgIterators(simCode))
     local qn = QuoteNode(Symbol(el))
     push!(appends, :(if haskey(_algResults, $(qn))
-                       filter!(_p -> !isequal(_p.first, $(Symbol(el))), fiv)
-                       push!(fiv, $(Symbol(el)) => _algResults[$(qn)])
+                       OMBackend.CodeGeneration._replaceInitialValue!(fiv, $(Symbol(el)), _algResults[$(qn)])
                      end))
   end
   return appends
+end
+
+"""
+`v => value` in the initial values `fiv`, in place of any other value of `v` (emitInitAlgU0Appends). A function, not
+a closure in each append: the build function's lowering is quadratic in its closures (MSL BatchPlant's 181 appends
+took 0.8 s of its 2.4 s).
+"""
+function _replaceInitialValue!(fiv::AbstractVector, v, value)
+  filter!(p -> !isequal(p.first, v), fiv)
+  push!(fiv, v => value)
+  return fiv
 end
 
 """

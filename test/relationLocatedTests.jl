@@ -12,7 +12,7 @@ import OMBackend
                  sol = (prob = (tspan = (0.0, 1.0),),))
   local eps = CG._hysteresisFromTolerance(integ)
   local fresh() = CG.RelationWhenAffect(["x"], (t, x) -> (x, 1.0), true, (i, pre) -> nothing, nothing,
-                                        Any[(u, p, t) -> u[1]], false, false, false)
+                                        ((u, p, t) -> u[1],), false, false, false)
   #= the root finder's point: the shifted function zc + eps at +1e-14, the rule sees it short of zc <= -eps =#
   local integAt(x) = merge(integ, (u = [x],))
   local short = -eps + 1e-14

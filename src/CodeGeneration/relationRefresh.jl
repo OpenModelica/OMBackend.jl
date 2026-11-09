@@ -67,21 +67,6 @@
    event (EventReinit): eventReinit.jl. =#
 
 """
-A getter for a crossing function or scale; a constant (not symbolic) is a
-Real that is not a Symbolics.Num. Not SII.getu: it takes an expression over
-observed variables for a parameter-only one (GetParameterObserved), and the
-generated function then reads the unknowns as undefined globals (the V6
-cylinder rig, `2*v_rel` with v_rel observed). A single variable works, and
-so does building the observed function directly.
-"""
-function _valueGetter(problem, @nospecialize(ex))
-  local v = Symbolics.unwrap(ex)
-  (v isa Real && !(v isa Symbolics.Num)) && return (integrator -> Float64(v))
-  local f = _buildObservedFunction(problem.f.sys, v)
-  return integrator -> f(integrator.u, integrator.p, integrator.t)
-end
-
-"""
 The hysteresis H for a relative tolerance and a solve's time span, as
 OpenModelica's tolZC = 1e-4 * min(stepSize, tolerance), its output step
 the span over 500 intervals (its default): an absolute 1e-4 * reltol is
@@ -116,18 +101,20 @@ link).
 _eventIterationLimit(n::Integer) = max(20, 3 * n)
 
 #= The if-equation relations: their buffers (the ifCond parameters), and
-   functions that read each one's crossing function and scale. =#
+   one function that reads every one's crossing function and scale (one
+   observed function per value recomputed the observed chain each and cost
+   three dynamic calls a relation: MSL BatchPlant compiled 82 of them). =#
 struct IfRelations
   buffers::Any                         # integrator or problem -> the ifConds
   setBuffer::Vector{Any}               # per relation: (integrator, value) -> nothing
-  crossing::Vector{Any}                # per relation: integrator -> zc
-  scale::Vector{Any}                   # per relation: integrator -> scale
+  values!::Any                         # (out, u, p, t): relation k's crossing function out[2k - 1], its scale out[2k]
+  zs::Vector{Float64}                  # the output of values!
   hysteresis::Any                      # integrator -> H
   compiled::Vector{Float64}            # the ifConds the initialization used
   timed::Vector{Bool}                  # per relation: its condition reads time (`_bandEdgeRule`)
 end
 
-Base.length(r::IfRelations) = length(r.crossing)
+Base.length(r::IfRelations) = length(r.timed)
 
 """
 The relations `entries` = `(ifCond, crossing function, scale, reads time)` of
@@ -139,10 +126,10 @@ function _ifRelations(problem, hSym::Symbol, entries::Vector)
   local syms = Symbol[e[1] for e in entries]
   try
     local buffers = SII.getp(problem, syms)
+    local reads::Vector{Any} = Any[x for e in entries for x in (e[2], e[3])]
     return IfRelations(buffers, Any[SII.setp(problem, s) for s in syms],
-                       Any[_valueGetter(problem, e[2]) for e in entries],
-                       Any[_valueGetter(problem, e[3]) for e in entries],
-                       SII.getp(problem, hSym), _bufferValues(buffers, problem),
+                       first(_buildObservedFunction(problem.f.sys, reads; return_inplace = Val(true))),
+                       zeros(length(reads)), SII.getp(problem, hSym), _bufferValues(buffers, problem),
                        Bool[length(e) >= 4 && e[4] === true for e in entries])
   catch err
     OMBackend._fallback(err, :ifRelationsFromProblem; impact = :result)
@@ -156,10 +143,23 @@ A copy: setting a buffer changes the parameters the getter reads.
 """
 _bufferValues(buffers, integrator) = Float64[v for v in buffers(integrator)]
 
-function _ruled(r::IfRelations, integrator, k::Int, old::Bool)
-  local scale = r.scale[k](integrator)
-  local eps = r.hysteresis(integrator) * scale
-  local zc = r.crossing[k](integrator)
+"""
+The relations' crossing functions and scales at the integrator's state and parameters (the buffers): relation k's
+are `zs[2k - 1]` and `zs[2k]`.
+"""
+function _ifValues!(r::IfRelations, integrator)::Vector{Float64}
+  r.values!(r.zs, integrator.u, integrator.p, integrator.t)
+  return r.zs
+end
+
+"""
+Relation k by the hysteresis rule from `old`, its crossing function and scale from `zs` (`_ifValues!`), `H` the
+hysteresis.
+"""
+function _ruled(r::IfRelations, zs::Vector{Float64}, H::Float64, k::Int, old::Bool)::Bool
+  local scale::Float64 = zs[2k]
+  local eps::Float64 = H * scale
+  local zc::Float64 = zs[2k - 1]
   return r.timed[k] ? _bandEdgeRule(zc, eps, scale, old) : _hysteresisRule(zc, eps, old)
 end
 
@@ -185,7 +185,9 @@ end
 
 function _inconsistent(r::IfRelations, integrator)
   local values = r.buffers(integrator)
-  return any(k -> _ruled(r, integrator, k, values[k] > 0.5) != (values[k] > 0.5), eachindex(values))
+  local zs::Vector{Float64} = _ifValues!(r, integrator)
+  local H::Float64 = r.hysteresis(integrator)
+  return any(k -> _ruled(r, zs, H, k, values[k] > 0.5) != (values[k] > 0.5), eachindex(values))
 end
 
 """
@@ -194,11 +196,15 @@ state. Whether one changed.
 """
 function _update!(r::IfRelations, integrator)
   local changed = false
+  local H::Float64 = r.hysteresis(integrator)
+  local zs::Vector{Float64} = _ifValues!(r, integrator)
   for (k, value) in enumerate(_bufferValues(r.buffers, integrator))
     local old = value > 0.5
-    local new = _ruled(r, integrator, k, old)
+    local new = _ruled(r, zs, H, k, old)
     new == old && continue
     r.setBuffer[k](integrator, new ? 1.0 : 0.0)
+    #= the later relations read this buffer's new value (a crossing function can read it through the parameters) =#
+    _ifValues!(r, integrator)
     changed = true
   end
   return changed
@@ -225,21 +231,27 @@ function _consistentIfRelations!(r::IfRelations, integrator, reinit; maxRelation
   local retcode = integrator.sol.retcode
   local setAll! = lits -> foreach(k -> r.setBuffer[k](integrator, lits[k] ? 1.0 : 0.0), 1:n)
   local current = Bool[v > 0.5 for v in base]
-  local clearly = (k, lit) -> _ruled(r, integrator, k, !lit) == lit
+  local H::Float64 = r.hysteresis(integrator)
+  local clearly = (zs, k, lit) -> _ruled(r, zs, H, k, !lit) == lit
   #= With `clear`, a combination that holds clearly where it is stays: the
      instant was only iterated again (several callbacks at one time). =#
-  clear && all(k -> clearly(k, current[k]), 1:n) && return false
-  local zc0 = Float64[r.crossing[k](integrator) for k in 1:n]
+  if clear
+    local zsNow::Vector{Float64} = _ifValues!(r, integrator)
+    all(k -> clearly(zsNow, k, current[k]), 1:n) && return false
+  end
+  local zsStart::Vector{Float64} = copy(_ifValues!(r, integrator))
+  local zc0 = Float64[zsStart[2k - 1] for k in 1:n]
   #= Every relation holds. With `clear`, beyond its hysteresis band too, but
      for one the solve does not move (its crossing as at the start: an
      independent relation at its threshold, which holds either way), which
      keeps its literal. =#
   local holds = cand -> begin
-    all(k -> _ruled(r, integrator, k, cand[k]) == cand[k], 1:n) || return false
+    local zs::Vector{Float64} = _ifValues!(r, integrator)
+    all(k -> _ruled(r, zs, H, k, cand[k]) == cand[k], 1:n) || return false
     clear || return true
     all(1:n) do k
-      local static = isapprox(r.crossing[k](integrator), zc0[k]; rtol = 1e-12, atol = 1e-14)
-      static ? cand[k] == current[k] : clearly(k, cand[k])
+      local static = isapprox(zs[2k - 1], zc0[k]; rtol = 1e-12, atol = 1e-14)
+      static ? cand[k] == current[k] : clearly(zs, k, cand[k])
     end
   end
   #= Bit k of `flips` changes relation k; 0 is the combination that did not settle. =#
@@ -323,19 +335,65 @@ function isIndependentVariable(@nospecialize(v))::Bool
 end
 
 """
-    namedValueFunctions(sys, names) -> Vector or nothing
+    namedValueFunctions(sys, names) -> Tuple or nothing
 
 For each variable name (as the Modelica cref prints), a function `(u, p, t)`
-that returns its value: an unknown, an observed variable or a parameter.
-Nothing when the system lacks one of them (a variable-structure model runs
-the callbacks of every mode; a mode's callbacks see the other modes'
-systems).
+that returns its value: an unknown, an observed variable or a parameter; a
+tuple, so a call of all of them is typed (`_callEvent`). Nothing when the
+system lacks one of them (a variable-structure model runs the callbacks of
+every mode; a mode's callbacks see the other modes' systems).
 """
-function namedValueFunctions(sys, names::Vector{String})
+function namedValueFunctions(sys, names::Vector{String})::Union{Nothing, Tuple}
   sys === nothing && return nothing
-  local byName = _variablesByPlainName(sys)
+  local byName::Dict{String, Any} = _variablesByPlainName(sys)
   all(n -> haskey(byName, n), names) || return nothing
-  return [ModelingToolkit.build_explicit_observed_function(sys, byName[n]) for n in names]
+  return Tuple(ModelingToolkit.build_explicit_observed_function(sys, byName[n]) for n in names)
+end
+
+"""
+    eventFunction(code, mod) -> RuntimeGeneratedFunction
+
+An event's code, `(t, values...) -> value` (the crossing function of a continuous when, `WhenCondition`; a when on a
+relation's crossing function and scale, `relationWhenCallback`), compiled: a RuntimeGeneratedFunction of
+CodeGeneration whose names that are not its own are read from the model's module `mod` (`_modelNamesFrom`), its
+calls of Modelica functions through their wrappers. As a closure of the model's module it ran interpreted (the module
+is compile=min, `_moduleCompilerOptions`): MSL SoftStarter's two continuous whens 1.5-1.9 us a condition, its two whens
+on a relation 0.8-1.1 us, each evaluated about ten times a step. A RuntimeGeneratedFunction is called in any world, and
+one code is compiled once.
+"""
+function eventFunction(code::Expr, mod::Module)::RuntimeGeneratedFunctions.RuntimeGeneratedFunction
+  return RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, _modelNamesFrom(code, mod))
+end
+
+"""
+`ev(t, values...)` for the values the value functions `fns` (namedValueFunctions) give at (u, p, t): the call behind
+the barrier, typed by the functions' tuple.
+"""
+_callEvent(ev::Function, fns::Tuple, u::AbstractVector{Float64}, p, t::Float64) = ev(t, map(f -> f(u, p, t), fns)...)
+
+"""
+    WhenCondition(names, eval)
+
+The condition of a continuous when (codeGen.jl `_continuousWhen`): its crossing function, `eval(t, values...)`
+(eventFunction) of the values of `names`, which the system's value functions read (namedValueFunctions), resolved once
+per system. Where the system lacks a name (another mode's system, in a variable-structure model) 1.0: no crossing.
+"""
+mutable struct WhenCondition{E}
+  names::Vector{String}
+  eval::E
+  sys::Any                   # the system `fns` were built for (:unresolved at first)
+  fns::Union{Nothing, Tuple} # the value functions, or nothing (another mode's system)
+end
+
+WhenCondition(names::Vector{String}, eval::RuntimeGeneratedFunctions.RuntimeGeneratedFunction) =
+  WhenCondition(names, eval, :unresolved, nothing)
+
+function (c::WhenCondition)(u::AbstractVector{Float64}, t::Float64, integrator)::Float64
+  local sys::Union{Nothing, ModelingToolkit.AbstractSystem} = hasproperty(integrator.f, :sys) ? integrator.f.sys : nothing
+  sys === c.sys || (c.sys = sys; c.fns = namedValueFunctions(sys, c.names))
+  local fns::Union{Nothing, Tuple} = c.fns
+  fns === nothing && return 1.0
+  return _callEvent(c.eval, fns, u, integrator.p, t)
 end
 
 """
@@ -362,11 +420,11 @@ body, with the other relations.
 """
 mutable struct RelationWhenAffect{E, B}
   names::Vector{String}
-  eval::E                    # (t, values...) -> (zc, scale); true when zc < 0 (strict) or zc <= 0
+  eval::E                    # (t, values...) -> (zc, scale) (eventFunction); true when zc < 0 (strict) or zc <= 0
   strict::Bool
   body!::B                   # (integrator, pre) -> nothing; pre(v) read from the vector `pre`
   sys::Any                   # the system `fns` were built for (:unresolved at first)
-  fns::Any                   # the value functions, or nothing (another mode's system)
+  fns::Any                   # the value functions (a Tuple), or nothing (another mode's system)
   rel::Bool                  # the relation's buffer
   last::Bool                 # the condition when the whens last fired
   located::Bool              # its crossing function located the event being handled
@@ -391,15 +449,12 @@ function _whenFunctions(a::RelationWhenAffect, integrator)
 end
 
 """
-`eval` and `body!` are generated code, which a variable-structure model
-may compile while it runs (after the solve started): call them in the
-latest world.
+The crossing function and the scale at (u, t). `eval` is an eventFunction and the value functions are MTK's, both
+RuntimeGeneratedFunctions: called in any world, also where a variable-structure model compiles them after the solve
+started (`body!`, a closure of the model's module, is called in the latest world).
 """
-function _whenValues(a::RelationWhenAffect, u, t, integrator)
-  local fns = a.fns
-  local p = integrator.p
-  return Base.invokelatest(a.eval, t, (f(u, p, t) for f in fns)...)
-end
+_whenValues(a::RelationWhenAffect, u::AbstractVector{Float64}, t::Float64, integrator)::Tuple{Float64, Float64} =
+  _callEvent(a.eval, a.fns, u, integrator.p, t)
 
 "The when's relation at the start: literal, a tie to rounding as the exact tie (as `_tieLiteral`)."
 function _whenLiteral(a::RelationWhenAffect, u, t, integrator)
@@ -522,25 +577,65 @@ struct DiscreteWhenAffect{C, A, I}
                              # not and `follow`, its change()/edge() memory takes the values
   affect!::A                 # (integrator[, pre]) -> nothing; pre(v) read from `pre` (default: u on entry)
   initialize!::I             # (u, t, integrator) -> nothing: its state (an edge latch) at the start
+  reads::Vector{String}      # the names its condition and body read at their current values (not under pre())
+  writes::Vector{String}     # the names its body assigns (`_sweepOrder`)
 end
 
 (d::DiscreteWhenAffect)(integrator) = d.affect!(integrator)
 
+"""
+    TieredCondition(interp, compiled, shared, nodes)
+
+A discrete when's condition (codeGen.jl `_tieredCondition`), evaluated after every step: its closure of the model's
+module `interp`, which runs interpreted (the module is compile=min), until it has run about as long as compiling its
+code of `nodes` nodes takes (CompileTier, COMPILE_AFTER_NS_PER_NODE), then the same code `compiled` (eventFunction),
+the closure's shared state (`shared`: its caches, edge latch and change() memory, which its affect and initialization
+change) its arguments. Interpreted, each of MSL SoftStarter's nine took 2.4-2.9 us a step. Not parametric: its method
+and the functions given it compile once, not once per condition (55 in MSL BatchPlant); the compiled call is behind a
+barrier (`_compiledCondition`).
+"""
+struct TieredCondition <: Function
+  interp::Function
+  compiled::RuntimeGeneratedFunctions.RuntimeGeneratedFunction
+  shared::Tuple
+  tier::CompileTier
+end
+
+TieredCondition(interp::Function, compiled::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, shared::Tuple, nodes::Int) =
+  TieredCondition(interp, compiled, shared, CompileTier(:condition, 0, COMPILE_AFTER_NS_PER_NODE[] * max(nodes, 1), false))
+
+function (c::TieredCondition)(x::AbstractVector, t::Real, integrator, follow::Bool = true)::Bool
+  local tier::CompileTier = c.tier
+  tier.compiled && return _compiledCondition(c.compiled, c.shared, x, t, integrator, follow)
+  local t0::UInt64 = time_ns()
+  local r::Bool = c.interp(x, t, integrator, follow)
+  tier.interpreted += time_ns() - t0
+  tier.interpreted >= tier.after && (tier.compiled = true)
+  return r
+end
+
+"A tiered condition's compiled code called with its shared state: typed by the code and the state."
+_compiledCondition(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, shared::Tuple, x::AbstractVector, t::Real,
+                   integrator, follow::Bool)::Bool = f(x, t, integrator, follow, shared...)
+
 const _NO_WHEN_INITIALIZE = (u, t, integrator) -> nothing
 
 """
-    discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE) -> DiscreteCallback
+    discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE; reads, writes) -> DiscreteCallback
 
 A when on a discrete condition, checked after every step. `initialize!` runs at
 the start of every solve (a reinit! included). Its change()/edge() memory
 follows the values only after a step no other callback changed: an earlier
 callback in the same step can change a discrete without solving the algebraic
 unknowns again, and `edge(b) and c` would lose b's edge on a stale c (it fires
-a step later instead).
+a step later instead). `reads` and `writes`: the names it reads at their
+current values and those it assigns, which place it in the event iteration's
+sweep (`_sweepOrder`).
 """
-discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE) =
+discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE;
+                     reads::Vector{String} = String[], writes::Vector{String} = String[]) =
   DiffEqBase.DiscreteCallback((u, t, integrator) -> condition(u, t, integrator, !_changedThisStep(integrator)),
-                              DiscreteWhenAffect(condition, affect!, initialize!);
+                              DiscreteWhenAffect(condition, affect!, initialize!, reads, writes);
                               initialize = (c, u, t, integrator) -> begin
                                 initialize!(u, t, integrator)
                                 _derivativeDiscontinuity!(integrator, false)
@@ -555,6 +650,8 @@ struct EventIteration
   relationWhens::Vector{RelationWhenAffect}
   clusters::Vector{DiscreteCluster}
   discreteWhens::Vector{DiscreteWhenAffect}
+  #= A sweep's pass over the clusters (i) and the discrete whens (-j), in the order of what they read (`_sweepOrder`). =#
+  order::Vector{Int}
   limit::Int
   reinit::Any
   #= The last instant iterated and how often in a row (the integrator stuck
@@ -633,30 +730,62 @@ function _sweep!(e::EventIteration, integrator, firstSweep::Bool)
      discretes, or a cluster that no re-solve moves (`coupled` false, a pulse
      switching a circuit), can move the algebraic unknowns: they are solved
      again before a coupled cluster or a discrete when reads them in this
-     sweep. =#
-  local clusterPre = [_preValues(c, c.values(pre, integrator.p, integrator.t)) for c in e.clusters]
+     sweep. The clusters and the discrete whens run in the order of what they
+     read (`_sweepOrder`), and a cluster's relations are evaluated on the state
+     its body reads: where something before it in the pass changed the state
+     (a cluster, a when, a solve of the algebraic unknowns), again before it
+     runs, as OpenModelica evaluates a relation where its equation is, in the
+     sorted order. MSL StateGraph ControlledTanks: an inner transition of the
+     composite step `makeProduct` deactivated its step in one iteration and
+     activated the next one in the following, its `integer()` of the active
+     steps (`$EVT_k`, discrete.jl `stepWhen`) read 0 in between; evaluated at
+     the start of the sweep, its relation `q >= pre(k) + 1` read 0 and was true,
+     the steps' cluster before it put q back at -1, and the when fired on that
+     relation with q = pre(k): k = pre(k) - 1, two active steps, and the
+     composite step never became inactive when suspended. Only until the
+     cluster changed its members in this sweep: a relation reads pre(k) as k's
+     value in the state, which is pre(k) only before the body writes k (MSL
+     StateGraph ShowExceptions: refreshed in a later pass with k written, `q <
+     pre(k)` read the new k, and the when fired again on it). =#
+  local clusterPre::Vector{AbstractVector} = AbstractVector[_preValues(c, c.values(pre, integrator.p, integrator.t)) for c in e.clusters]
+  #= How often the state changed in this sweep, per cluster at which count its relations were evaluated, and whether
+     it changed its members in this sweep. =#
+  local moves::Int = 0
+  local evaluatedAt::Vector{Int} = zeros(Int, length(e.clusters))
+  local wrote::Vector{Bool} = fill(false, length(e.clusters))
   for pass in 1:e.limit
-    local stale = false
-    local passStart = copy(integrator.u)
-    local relationFired = false
+    local stale::Bool = false       # the algebraic unknowns, for a coupled cluster or a discrete when next
+    local whenStale::Bool = false   # the same after a discrete when, for a coupled cluster next
+    local fired::Bool = false
+    local passStart::AbstractVector = copy(integrator.u)
+    local relationFired::Bool = false
     for a in e.relationWhens
-      _whenFire!(a, integrator, pre) && (changed = true; stale = true; relationFired = true)
+      _whenFire!(a, integrator, pre) && (changed = true; stale = true; relationFired = true; moves += 1)
     end
-    for (i, c) in enumerate(e.clusters)
-      c.coupled && stale && (_staleResolve!(integrator, e.reinit); stale = false)
-      _solveMixedSystem!(c, integrator, clusterPre[i], relPre[i], e.reinit) || continue
-      changed = true
-      c.coupled || (stale = true)
+    for item in e.order
+      if item > 0
+        local c::DiscreteCluster = e.clusters[item]
+        c.coupled && (stale || whenStale) && (_staleResolve!(integrator, e.reinit); stale = whenStale = false; moves += 1)
+        if !wrote[item] && evaluatedAt[item] != moves
+          _hidingReinit(() -> _update!(c, integrator), integrator, pre, _reinitializedSince(integrator, since))
+          evaluatedAt[item] = moves
+        end
+        _solveMixedSystem!(c, integrator, clusterPre[item], relPre[item], e.reinit) || continue
+        changed = true
+        wrote[item] = true
+        moves += 1
+        c.coupled || (stale = true)
+      else
+        local d::DiscreteWhenAffect = e.discreteWhens[-item]
+        stale && (_staleResolve!(integrator, e.reinit); stale = whenStale = false; moves += 1)
+        _holdsInSweep(d, integrator) || continue
+        local before::AbstractVector = copy(integrator.u)
+        d.affect!(integrator, pre)
+        changed = true
+        isequal(integrator.u, before) || (fired = whenStale = true; moves += 1)
+      end
     end
-    stale && !isempty(e.discreteWhens) && _staleResolve!(integrator, e.reinit)
-    local before = copy(integrator.u)
-    local fired = false
-    for d in e.discreteWhens
-      _holdsInSweep(d, integrator) || continue
-      d.affect!(integrator, pre)
-      changed = fired = true
-    end
-    ((fired && !isequal(integrator.u, before)) || (relationFired && !isequal(integrator.u, passStart))) || break
+    (fired || (relationFired && !isequal(integrator.u, passStart))) || break
     #= A discrete when (or a when on a relation) changed a discrete: the relations and the
        bodies read the new value in this same iteration (MLS 8.6: its equations hold
        together, with the same pre(); `when x > 0.5 then d = 1` and `when x + d > 1.2
@@ -665,13 +794,15 @@ function _sweep!(e::EventIteration, integrator, firstSweep::Bool)
        starts; with the old t_start it fired at once. The algebraic unknowns follow first.
        A when with edge() or an edge latch does not fire again: its affect took the
        values. A when that fired in an earlier pass on a value this pass corrects is not
-       undone. =#
+       undone: the order of a pass (`_sweepOrder`) runs what it reads before it. =#
     _staleResolve!(integrator, e.reinit) || break
     _hidingReinit(integrator, pre, _reinitializedSince(integrator, since)) do
       e.ifRelations !== nothing && _update!(e.ifRelations, integrator)
       foreach(a -> _whenRelationUpdate!(a, integrator), e.relationWhens)
       foreach(c -> _update!(c, integrator), e.clusters)
     end
+    moves += 1
+    fill!(evaluatedAt, moves)
   end
   return changed
 end
@@ -985,6 +1116,177 @@ function _eventsOnAlgebraicUnknowns(problem)
 end
 
 """
+    _StateDependencies(sys, algebraic)
+
+What the positions of a problem's state are computed from, for the order of a sweep (`_sweepOrder`): the position of
+each unknown of `sys`, its observed equations, and per algebraic unknown (`algebraic`: the algebraic rows) the other
+positions its algebraic equations read: those of its connected part of the algebraic system, which is solved
+together. A system whose equations are not one per position has no algebraic part here.
+"""
+struct _StateDependencies
+  position::Dict{Any, Int}             # an unknown => its position in the state
+  observed::Dict{Any, Any}             # an observed variable => its right-hand side
+  solvedFrom::Dict{Int, Vector{Int}}   # an algebraic unknown's position => the other positions its solve reads
+end
+
+function _StateDependencies(sys, algebraic::Vector{Int})
+  local unknowns::Vector{Any} = Any[Symbolics.unwrap(x) for x in ModelingToolkit.get_unknowns(sys)]
+  local d::_StateDependencies = _StateDependencies(Dict{Any, Int}(x => i for (i, x) in enumerate(unknowns)),
+                                                   Dict{Any, Any}(Symbolics.unwrap(eq.lhs) => Symbolics.unwrap(eq.rhs)
+                                                                  for eq in ModelingToolkit.observed(sys)),
+                                                   Dict{Int, Vector{Int}}())
+  local eqs::AbstractVector = ModelingToolkit.equations(sys)
+  (isempty(algebraic) || length(eqs) != length(unknowns)) && return d
+  local isAlgebraic::Set{Int} = Set{Int}(algebraic)
+  local root::Dict{Int, Int} = Dict{Int, Int}(k => k for k in algebraic)
+  local find(k::Int)::Int = (while root[k] != k; k = root[k]; end; k)
+  local rowReads::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}()
+  for r in algebraic
+    local reads::Set{Int} = _stateReads(d, Any[eqs[r].lhs, eqs[r].rhs])
+    rowReads[r] = reads
+    local mine::Vector{Int} = Int[k for k in reads if k in isAlgebraic]
+    for k in mine
+      root[find(k)] = find(first(mine))
+    end
+  end
+  local outside::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}()
+  for r in algebraic
+    local mine::Vector{Int} = Int[k for k in rowReads[r] if k in isAlgebraic]
+    isempty(mine) && continue
+    union!(get!(Set{Int}, outside, find(first(mine))), (k for k in rowReads[r] if !(k in isAlgebraic)))
+  end
+  for k in algebraic
+    d.solvedFrom[k] = collect(get(outside, find(k), Set{Int}()))
+  end
+  return d
+end
+
+"""
+The positions of the state that the expressions `exprs` read: their unknowns, through the observed equations, and
+for an algebraic unknown what its solve reads (`_StateDependencies`).
+"""
+function _stateReads(d::_StateDependencies, exprs::Vector{Any})::Set{Int}
+  local out::Set{Int} = Set{Int}()
+  local seen::Set{Any} = Set{Any}()
+  local pending::Vector{Any} = Any[]
+  for e in exprs
+    append!(pending, Symbolics.get_variables(Symbolics.unwrap(e)))
+  end
+  while !isempty(pending)
+    local v = pop!(pending)
+    v in seen && continue
+    push!(seen, v)
+    local k::Union{Nothing, Int} = get(d.position, v, nothing)
+    if k !== nothing
+      push!(out, k)
+      union!(out, get(d.solvedFrom, k, Int[]))
+    elseif haskey(d.observed, v)
+      append!(pending, Symbolics.get_variables(d.observed[v]))
+    end
+  end
+  return out
+end
+
+"""
+    _sweepOrder(clusters, discreteWhens, problem) -> Vector{Int}
+
+The order of a sweep's pass over the discrete clusters (`i`) and the whens on discrete conditions (`-j`): the order
+before (the clusters, then the whens), with what an item reads moved before it (MLS 8.6: the equations of an
+iteration hold together with the same pre(), and OpenModelica evaluates them sorted). A cluster reads its operands and
+relations, not its pre() values, through the observed equations and the algebraic block; a when its condition and
+body, not under pre(). Two whens that share a variable (one assigns what the other reads or assigns) keep the
+model's order: the whens of an algorithm section run as its statements do. Items that read each other (a cycle: the
+phases of a circuit, a transition and its timer's when) keep the order before, and the passes settle them as before;
+a group of them moves as a whole, in that order. Only what an item reads moves: a free item does not run ahead (MSL
+StateGraph ShowExceptions: the composite steps' `integer()` counts ran before the steps they count).
+
+MSL StateGraph ControlledTanks: a RadioButtonSource's `when pre(reset) then on := false` resets `start.on` in the
+iteration in which the stop button's step becomes active. The cluster of the steps and transitions ran first, read
+the old `on` and fired the transition out of that step, and `when fire` took its edge before the next pass corrected
+it: the controller left the suspended step at once and never resumed the filling.
+"""
+function _sweepOrder(clusters::Vector{DiscreteCluster}, whens::Vector{DiscreteWhenAffect}, problem)::Vector{Int}
+  local items::Vector{Int} = vcat(collect(eachindex(clusters)), Int[-j for j in eachindex(whens)])
+  local sys = hasproperty(problem.f, :sys) ? problem.f.sys : nothing
+  (sys === nothing || length(items) <= 1 || !applicable(getStatesAsSymbols, problem.f)) && return items
+  local deps::_StateDependencies = _StateDependencies(sys, _algebraicRows(problem.f))
+  local byName::Dict{String, Int} = Dict{String, Int}(string(s) => i for (i, s) in enumerate(getStatesAsSymbols(problem.f)))
+  local positions(names::Vector{String})::Vector{Int} = Int[byName[n] for n in names if haskey(byName, n)]
+  local reads::Vector{Set{Int}} = Vector{Set{Int}}(undef, length(items))
+  local writes::Vector{Set{Int}} = Vector{Set{Int}}(undef, length(items))
+  for (k, item) in enumerate(items)
+    if item > 0
+      local c::DiscreteCluster = clusters[item]
+      reads[k] = _stateReads(deps, Any[c.reads[1:c.nOperands]; c.reads[(c.nOperands + c.nPre + 1):end]])
+      writes[k] = Set{Int}(i for i in c.memberIndex if i != 0)
+    else
+      local w::DiscreteWhenAffect = whens[-item]
+      local read::Vector{Int} = positions(w.reads)
+      reads[k] = Set{Int}(read)
+      foreach(i -> union!(reads[k], get(deps.solvedFrom, i, Int[])), read)
+      writes[k] = Set{Int}(positions(w.writes))
+    end
+  end
+  local n::Int = length(items)
+  #= before[b]: the items that run before b, in the order before =#
+  local before::Vector{Vector{Int}} = [Int[] for _ in 1:n]
+  for b in 1:n, a in 1:n
+    a == b && continue
+    local runsBefore::Bool = items[a] < 0 && items[b] < 0 ?
+      a < b && !(isdisjoint(writes[a], reads[b]) && isdisjoint(writes[a], writes[b]) && isdisjoint(reads[a], writes[b])) :
+      !isdisjoint(writes[a], reads[b])
+    runsBefore && push!(before[b], a)
+  end
+  local group::Vector{Int} = _cycleGroups(before)
+  local placed::Vector{Bool} = fill(false, n)
+  local order::Vector{Int} = Int[]
+  local place!(g::Int)::Nothing = begin
+    local members::Vector{Int} = Int[k for k in 1:n if group[k] == g && !placed[k]]
+    isempty(members) && return nothing
+    foreach(k -> placed[k] = true, members)
+    for k in members, a in before[k]
+      group[a] == g || placed[a] || place!(group[a])
+    end
+    append!(order, items[members])
+    return nothing
+  end
+  foreach(k -> place!(group[k]), 1:n)
+  return order
+end
+
+"""
+    _cycleGroups(before) -> Vector{Int}
+
+Per item the group of items that run before each other in a cycle (a strongly connected component of the graph
+`before[b]`: the items that run before b), numbered from 1; an item outside every cycle is a group of its own.
+"""
+function _cycleGroups(before::Vector{Vector{Int}})::Vector{Int}
+  local n::Int = length(before)
+  #= reaches[a, b]: a runs (transitively) before b =#
+  local reaches::BitMatrix = falses(n, n)
+  for b in 1:n
+    local pending::Vector{Int} = copy(before[b])
+    while !isempty(pending)
+      local a::Int = pop!(pending)
+      reaches[a, b] && continue
+      reaches[a, b] = true
+      append!(pending, before[a])
+    end
+  end
+  local group::Vector{Int} = zeros(Int, n)
+  local count::Int = 0
+  for a in 1:n
+    group[a] == 0 || continue
+    count += 1
+    group[a] = count
+    for b in (a + 1):n
+      group[b] == 0 && reaches[a, b] && reaches[b, a] && (group[b] = count)
+    end
+  end
+  return group
+end
+
+"""
     withRelationRefresh(callbacks, problem, hSym, entries) -> callbacks
 
 Add the event iteration over the buffered relations: the if-equation
@@ -1022,7 +1324,8 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
   local n = (ifRelations === nothing ? 0 : length(ifRelations)) + length(relationWhens) + length(discreteWhens) +
             sum((length(c.rel) + length(c.members) for c in clusters); init = 0)
   local reinit = any(c -> c.table, clusters) ? tableClusterInitAlg() : nothing
-  local e = EventIteration(ifRelations, relationWhens, clusters, discreteWhens, _eventIterationLimit(n), reinit,
+  local e = EventIteration(ifRelations, relationWhens, clusters, discreteWhens,
+                           _sweepOrder(clusters, discreteWhens, problem), _eventIterationLimit(n), reinit,
                            Ref((NaN, 0)), Ref((NaN, 0)))
   local pending = Ref(false)
   kept = Any[cb isa DiffEqBase.DiscreteCallback ? _markingPending(cb, pending) : cb for cb in kept]
@@ -1036,7 +1339,7 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
                                             iteration solves the algebraic variables itself. =#
                                          save_positions = (false, true),
                                          initializealg = ModelingToolkit.SciMLBase.NoInit())
-  return DiffEqBase.CallbackSet(kept..., cb)
+  return _joinCallbacks(kept..., cb)
 end
 
 """

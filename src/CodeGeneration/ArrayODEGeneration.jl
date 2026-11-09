@@ -2002,12 +2002,17 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
        and the same crossing was found again in every step (MSL EngineV6's piston speed at dead
        center). A time event (a relation of time and parameters crossed): the event iteration with
        the relations literal at the instant (H = 0), as at a sample instant: one on its boundary
-       there changes with it (a brake's normal force ramped to 0 at the time event: f <= 0 holds). =#
+       there changes with it (a brake's normal force ramped to 0 at the time event: f <= 0 holds).
+       The left limit lies beyond the hysteresis band (2H): a relation of time is located at its band's edge,
+       zc = -eps with eps = H*(1 + |t|), and at H = 1e-10 (reltol 1e-6) a left limit 1e-10*(1 + |t|) back put it
+       exactly on its threshold, where the exact-zero rule made it true already: the when on it took its rising
+       edge before the event and never fired (MSL 4.1 Trapezoid's `time >= (pre(count) + 1)*period +
+       startTime`: OpAmps.Differentiator's source stayed in its first period). =#
     function affectCrossing!(integrator, events::AbstractVector{Int8})
       local t = integrator.t
-      local tl = max(integrator.tprev, t - 1e-10 * (1 + abs(t)))
-      local ul = tl < t ? integrator(tl) : copy(integrator.uprev)
       local p = integrator.p
+      local tl = max(integrator.tprev, t - max(1e-10, 2 * p.hyst[1]) * (1 + abs(t)))
+      local ul = tl < t ? integrator(tl) : copy(integrator.uprev)
       local du = similar(ul); local a = similar(ul, $nAlg)
       local before::Vector{Bool} = copy(p.rel)
       equations!(du, a, ul, p, tl, nothing, true)
@@ -2219,7 +2224,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       pushfirst!(cbs, DiscreteCallback((u, t, integrator) -> false, integrator -> nothing;
                                        initialize = (c, u, t, integrator) -> $(_restoreStart!)(integrator.p),
                                        save_positions = (false, false)))
-      local cb = isempty(cbs) ? nothing : CallbackSet(cbs...)
+      local cb = isempty(cbs) ? nothing : OMBackend.CodeGeneration._joinCallbacks(cbs...)
       $(hasTerminate ? quote
           #= a terminate() at the initialization: the problem ends at its start =#
           p.state.terminated === nothing || return (ODEProblem(f, u0, (tspan[1], tspan[1]), p), cb)

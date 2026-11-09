@@ -74,6 +74,52 @@ function _bodyWrites(body::Vector{SC.Statement})::OrderedSet{String}
 end
 
 """
+The names a when reads at their current values, which place it in the event iteration's sweep (relationRefresh.jl
+`_sweepOrder`): those of its conditions and of its body's right-hand sides and if-conditions, not under pre() (the
+value before the iteration, MLS 3.7.5).
+"""
+function _whenReads(conditions::Vector{SC.Exp}, body::Vector{SC.Statement})::Vector{String}
+  local out::Vector{String} = String[]
+  foreach(c -> _currentReads!(out, c), conditions)
+  foreach(s -> _statementReads!(out, s), body)
+  return unique!(filter!(!=("time"), out))
+end
+
+function _currentReads!(out::Vector{String}, e::SC.Exp)::Nothing
+  e isa SC.PRE && return nothing
+  (e isa SC.CALL && e.name === :pre) && return nothing
+  e isa Union{SC.EXP_CREF, SC.DER} && push!(out, SC.crefName(e.cref))
+  foreach(x -> _currentReads!(out, x), SC.children(e))
+  return nothing
+end
+
+_statementReads!(out::Vector{String}, s::SC.ASSIGN)::Nothing = _currentReads!(out, s.right)
+function _statementReads!(out::Vector{String}, s::SC.IF)::Nothing
+  foreach(b -> _currentReads!(out, b.condition), s.branches)
+  foreach(x -> _statementReads!(out, x), Iterators.flatten((Iterators.flatten(b.body for b in s.branches), s.elseBody)))
+  return nothing
+end
+_statementReads!(out::Vector{String}, s::SC.Statement)::Nothing =
+  (foreach(e -> _currentReads!(out, e), SC.whenStatementExps(s)); nothing)
+
+"""
+The names a when body assigns, in its if-statements too, and the states it reinitializes (`_sweepOrder`).
+"""
+function _whenWrites(body::Vector{SC.Statement})::Vector{String}
+  local out::Vector{String} = String[]
+  foreach(s -> _statementWrites!(out, s), body)
+  return unique!(out)
+end
+
+_statementWrites!(out::Vector{String}, s::SC.ASSIGN)::Nothing = (append!(out, SC.allCrefNames(s.left)); nothing)
+_statementWrites!(out::Vector{String}, s::SC.REINIT)::Nothing = (push!(out, SC.crefName(s.stateVar)); nothing)
+function _statementWrites!(out::Vector{String}, s::SC.IF)::Nothing
+  foreach(x -> _statementWrites!(out, x), Iterators.flatten((Iterators.flatten(b.body for b in s.branches), s.elseBody)))
+  return nothing
+end
+_statementWrites!(out::Vector{String}, ::SC.Statement)::Nothing = nothing
+
+"""
 The names a condition reads OUTSIDE any `change(...)` or `pre(...)`: the level-valued
 Booleans of the condition (`when boolVar then`), for which the discrete callback keeps an
 edge latch.
@@ -125,7 +171,7 @@ function createCallbackCode(modelName::String, simCode::SC.SIM_CODE; generateSav
   local legacyWhens = filter(w -> _extractChangeRelations(w.whenEquation.condition, simCode) === nothing &&
                                   isempty(_selfSchedulingTimeRels(w)),
                              simCode.whenEquations)
-  local WHEN_EQUATIONS = createEquations(legacyWhens, simCode)
+  local (WHEN_FUNCTIONS, WHEN_EQUATIONS) = createEquations(legacyWhens, simCode, modelName)
   local SAVE_FUNCTION = generateSaveFunction ? createSaveFunction(modelName) : nothing
   #= saved_values_<model> = SavedValues(...) only with the save function: SavedValues lives in
      DiffEqCallbacks, a transitive dependency; its unconditional emission was an UndefVarError
@@ -134,6 +180,7 @@ function createCallbackCode(modelName::String, simCode::SC.SIM_CODE; generateSav
     :($(Symbol("saved_values_$(modelName)")) = SavedValues(Float64, Tuple{Float64,Array})) : nothing
   quote
     $(SAVED_VALUES_DECL)
+    $(WHEN_FUNCTIONS...)
     function $(Symbol("$(modelName)CallbackSet"))(aux)
       #= These are the locations of the parameters and auxiliary real variables respectively =#
       local p = aux[1]
@@ -143,7 +190,7 @@ function createCallbackCode(modelName::String, simCode::SC.SIM_CODE; generateSav
       $(WHEN_EQUATIONS...)
       $(LineNumberNode((@__LINE__), "IF EQUATIONS"))
       $(SAVE_FUNCTION)
-      return $(Expr(:call, :CallbackSet, returnCallbackSet()...))
+      return $(Expr(:call, :(OMBackend.CodeGeneration._joinCallbacks), returnCallbackSet()...))
     end
   end
 end
@@ -170,9 +217,35 @@ end
 """
 returnCallbackSet()::Vector{Symbol} = Symbol[Symbol("cb", t) for t in 1:COUNT_CALLBACKS()]
 
-"The callbacks of the when-equations."
-createEquations(equations::Vector{SC.WHEN_EQUATION}, simCode::SC.SIM_CODE)::Vector{Expr} =
-  Expr[eqToJulia(eq, simCode, i) for (i, eq) in enumerate(equations)]
+"""
+    createEquations(equations, simCode, modelName) -> (functions, calls)
+
+The callbacks of the when-equations: per equation a function of the model's module,
+`_<modelName>_whenCallbacks<i>(p, reals, reducedSystem)` (the structural modes of a model share its module),
+that builds the callbacks it numbers (`cb<k>`,
+ADD_CALLBACK) and returns them, and its call in the callback set's function. Julia's lowering
+of a function is quadratic in its closures: all the whens' conditions and affects in the
+callback set's function took 2 s to evaluate for MSL BatchPlant's 55 whens (as the asserts,
+emitAssertsFunction).
+"""
+function createEquations(equations::Vector{SC.WHEN_EQUATION}, simCode::SC.SIM_CODE,
+                         modelName::String)::Tuple{Vector{Expr}, Vector{Expr}}
+  local functions = Expr[]
+  local calls = Expr[]
+  for (i, eq) in enumerate(equations)
+    local firstIndex::Int = COUNT_CALLBACKS() + 1
+    local code::Expr = eqToJulia(eq, simCode, i)
+    local cbs::Vector{Symbol} = Symbol[Symbol("cb", k) for k in firstIndex:COUNT_CALLBACKS()]
+    local name::Symbol = Symbol("_", modelName, "_whenCallbacks", i)
+    push!(functions, :(function $(name)(p, reals, reducedSystem)
+                         $(code)
+                         return ($(cbs...),)
+                       end))
+    push!(calls, isempty(cbs) ? :($(name)(p, reals, reducedSystem)) :
+                                :(($(cbs...),) = $(name)(p, reals, reducedSystem)))
+  end
+  return (functions, calls)
+end
 
 """
 The variables name[1], name[2], ... (none when name[1] is not a variable).
@@ -370,7 +443,9 @@ function _emitElsewhenThresholdTimeWhen(elseArm::SC.WHEN_EQUATION, simCode::SC.S
     #= A discrete when, run after its parent's (in the event iteration where the model has
        buffered relations). =#
     $(Symbol("cb$(callbacks)")) = OMBackend.CodeGeneration.discreteWhenCallback($(Symbol("condition$(callbacks)")),
-                                                                              $(Symbol("affect$(callbacks)!")))
+                                                                              $(Symbol("affect$(callbacks)!"));
+                                                                              reads = String[$(_whenReads(SC.Exp[thr], _elsewhenStmtLst(elseArm))...)],
+                                                                              writes = String[$(_whenWrites(_elsewhenStmtLst(elseArm))...)])
   end
 end
 
@@ -611,15 +686,20 @@ const _RELATION_WHEN_EXCLUDED_CALLS = (:edge, :change, :sample, :initial, :termi
                                        :delay, :noEvent, :smooth, :reinit)
 
 """
+Whether `e` is one of the operators above, a delay, pre() or der(): an operand of a when on a relation calls none of
+them, nor does a continuous when's compiled condition (`_compiledConditionNames`).
+"""
+_excludedFromRelationWhen(e::SC.Exp)::Bool = e isa Union{SC.PRE, SC.DER} || _isDelayCall(e) ||
+  (e isa SC.CALL && e.kind === SC.CALL_BUILTIN && e.name in _RELATION_WHEN_EXCLUDED_CALLS)
+
+"""
 A when condition that is one relation `a op b` (op one of < <= > >=) whose operands call
 none of the operators above (nor a delay, pre(), der()): (a, b, isLess, strict), or
 nothing.
 """
 function _singleRelationWhen(cond::SC.Exp)::Union{Nothing, Tuple{SC.Exp, SC.Exp, Bool, Bool}}
   (cond isa SC.RELATION && cond.op in (SC.OP_LESS, SC.OP_LESSEQ, SC.OP_GREATER, SC.OP_GREATEREQ)) || return nothing
-  local excluded = e::SC.Exp -> e isa Union{SC.PRE, SC.DER} || _isDelayCall(e) ||
-    (e isa SC.CALL && e.kind === SC.CALL_BUILTIN && e.name in _RELATION_WHEN_EXCLUDED_CALLS)
-  (SC.anyExp(excluded, cond.exp1) || SC.anyExp(excluded, cond.exp2)) && return nothing
+  (SC.anyExp(_excludedFromRelationWhen, cond.exp1) || SC.anyExp(_excludedFromRelationWhen, cond.exp2)) && return nothing
   return (cond.exp1, cond.exp2, cond.op in (SC.OP_LESS, SC.OP_LESSEQ), cond.op in (SC.OP_LESS, SC.OP_GREATER))
 end
 
@@ -647,9 +727,11 @@ function _emitRelationWhen(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, callbacks
   end
   quote
     $(Symbol("cb$(callbacks)")) = let _affCache = Ref{Any}(nothing)
-      local _eval = (t, $(args...)) -> (Float64($(expToJuliaExpMTK(zc, simCode))),
-                                        1.0 + max(abs(Float64($(expToJuliaExpMTK(e1, simCode)))),
-                                                  abs(Float64($(expToJuliaExpMTK(e2, simCode))))))
+      local _eval = OMBackend.CodeGeneration.eventFunction(
+        $(QuoteNode(:((t, $(args...)) -> (Float64($(expToJuliaExpMTK(zc, simCode))),
+                                          1.0 + max(abs(Float64($(expToJuliaExpMTK(e1, simCode)))),
+                                                    abs(Float64($(expToJuliaExpMTK(e2, simCode))))))))),
+        @__MODULE__)
       local _body! = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT)) -> begin
         local t = integrator.t
         local x = integrator.u
@@ -764,7 +846,7 @@ function _sampleTickCallback(tickAt::Base.RefValue{Float64}, affect!::Function, 
     DiffEqCallbacks.PeriodicCallback(tick!, dt; phase = phase, initial_affect = initialTick, final_affect = true,
                                      save_positions = (false, false))
   end
-  return DiffEqBase.CallbackSet(ticks...)
+  return _joinCallbacks(ticks...)
 end
 
 """
@@ -870,12 +952,47 @@ function eqToJulia(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, arrayIdx::Int)::E
 end
 
 """
+The names a continuous when's crossing function `cond` reads (not time), for its compiled condition (WhenCondition):
+each a variable or a parameter of the model, none a String or a data structure, and `cond` calls none of the
+operators a when on a relation excludes (`_excludedFromRelationWhen`). A name the model does not have is an inlined
+constant the lowering emits as a literal (`_whenLookupBindings`). Nothing otherwise (a whole array of variables): the
+condition is a closure of the model's module.
+"""
+function _compiledConditionNames(cond::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, Vector{String}}
+  SC.anyExp(_excludedFromRelationWhen, cond) && return nothing
+  local names = String[]
+  for n in SC.allCrefNames(cond)
+    (n == "time" || n in names) && continue
+    local entry = get(simCode.stringToSimVarHT, n, nothing)
+    if entry === nothing
+      isempty(_scalarizedElementKeys(n, simCode)) || return nothing
+      continue
+    end
+    last(entry).varKind isa Union{SC.STRING, SC.DATA_STRUCTURE} && return nothing
+    push!(names, n)
+  end
+  return names
+end
+
+"""
 The condition function of a continuous when's ContinuousCallback, its zero crossing `cond`
 lowered with the variables looked up (MTK may reorder the unknowns: an index of the
 variables' order is wrong after structural_simplify). Where none of the names is a state or
-a parameter `noTrigger` (the condition cannot be evaluated).
+a parameter `noTrigger` (the condition cannot be evaluated). With `withParameters`, a
+condition `_compiledConditionNames` accepts is compiled (WhenCondition, its values read by
+the system's value functions).
 """
 function _continuousWhenCondition(cond::SC.Exp, simCode::SC.SIM_CODE, callbacks::Int; withParameters::Bool)::Expr
+  local compiledNames = withParameters ? _compiledConditionNames(cond, simCode) : nothing
+  if compiledNames !== nothing
+    local args = Symbol[Symbol(n) for n in compiledNames]
+    return quote
+      global $(Symbol("condition$(callbacks)"))
+      $(Symbol("condition$(callbacks)")) = OMBackend.CodeGeneration.WhenCondition($(compiledNames),
+        OMBackend.CodeGeneration.eventFunction($(QuoteNode(:((t, $(args...)) -> $(expToJuliaExpMTK(cond, simCode))))),
+                                               @__MODULE__))
+    end
+  end
   local names = filter(n -> n != "time", SC.allCrefNames(cond))
   local xs = Symbol[Symbol(n) for n in names]
   local unresolved = withParameters ?
@@ -1090,6 +1207,53 @@ function _changeMemoryUpdates(names::Vector{String}, simCode::SC.SIM_CODE, state
 end
 
 """
+Whether `ex` defines a function (a closure, a generator, a comprehension, a do-block) or calls a macro other than
+`@debug` and `@isdefined`: a RuntimeGeneratedFunction's code makes its closures opaque closures, and one that
+destructures its argument (`(i, s) in enumerate(xs)`) was a MethodError at its call.
+"""
+function _definesFunction(ex::Expr)::Bool
+  local worklist = Any[ex]
+  while !isempty(worklist)
+    local e = pop!(worklist)
+    e isa Expr || continue
+    e.head in (:->, :function, :generator, :comprehension, :typed_comprehension, :do) && return true
+    e.head === :macrocall && !(e.args[1] in (Symbol("@debug"), Symbol("@isdefined"))) && return true
+    append!(worklist, e.args)
+  end
+  return false
+end
+
+"""
+The definition of a discrete when's condition `name`, `(x, t, integrator, _follow::Bool = true) -> body`, in the
+`let` of the names `shared` (its caches, edge latch and change() memory, which its affect and initialization share):
+where `body` defines no function (`_definesFunction`), a TieredCondition of that closure and the same code compiled
+(eventFunction), the shared names its arguments; else the closure.
+"""
+function _tieredCondition(name::Symbol, body::Expr, shared::Vector{Symbol})::Expr
+  local closure = :((x, t, integrator, _follow::Bool = true) -> $(body))
+  _definesFunction(body) && return :(global $(name); $(name) = $(closure))
+  local code = :((x, t, integrator, _follow, $(shared...)) -> $(deepcopy(body)))
+  return quote
+    global $(name)
+    $(name) = OMBackend.CodeGeneration.TieredCondition($(closure),
+                OMBackend.CodeGeneration.eventFunction($(QuoteNode(code)), @__MODULE__),
+                ($(shared...),), $(_exprNodes(body)))
+  end
+end
+
+"""
+A discrete cluster's body `lambda`, `(integrator, _o, _pre, _rel, _relPre, _init) -> ...` (mtkDiscreteEvents.jl
+`_discreteClusterSpec`): where it defines no function (`_definesFunction`), a TieredBody of the closure and the same
+code compiled (eventFunction); else the closure.
+"""
+function _tieredBody(lambda::Expr)::Expr
+  _definesFunction(lambda.args[2]) && return lambda
+  return :(OMBackend.CodeGeneration.TieredBody($(lambda),
+             OMBackend.CodeGeneration.eventFunction($(QuoteNode(deepcopy(lambda))), @__MODULE__),
+             $(_exprNodes(lambda.args[2]))))
+end
+
+"""
 A when on a discrete condition: a callback of the event iteration (discreteWhenCallback).
 The variables are looked up (MTK reorders the unknowns). pre(v) from a snapshot: the event
 iteration passes the state before its sweep (the algebraic unknowns are solved again before
@@ -1152,6 +1316,50 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, ti
     (entry === nothing || SC.isScalarParameter(last(entry))) && continue
     push!(changeSeedPairs, :($(QuoteNode(Symbol(last(entry).name))) => $(_readStartAttributeAsLiteral(last(entry)))))
   end
+  #= Whether the when fires. `_follow`: whether change()/edge() may take the values now,
+     where it does not fire (false within an event iteration's sweep; see below). =#
+  local condBody = quote
+    local lookuptableStates
+    local lookuptableParams
+    if _condCache[] === nothing
+      local xs = $(Symbol[Symbol(c) for c in condCrefs])
+      local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
+      if !isempty(xs) && all(isnothing, indices)
+        @debug "[CB-DC$($(callbacks)) cond] false (no state mapping)" t xs
+        return false
+      end
+      lookuptableStates = Dict{Symbol, Union{Nothing, Int}}((xs) .=> indices)
+      lookuptableParams = OMBackend.CodeGeneration._indexTable(OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f))
+      _condCache[] = (lookuptableStates, lookuptableParams)
+    else
+      local cached = _condCache[]
+      lookuptableStates = cached[1]
+      lookuptableParams = cached[2]
+    end
+    local _changePreValues
+    if _changeCache[] === nothing
+      _changePreValues = copy(_changeSeedValues)
+      _changeCache[] = _changePreValues
+    else
+      _changePreValues = _changeCache[]
+    end
+    local _result = $(condValue)
+    @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
+    $(useLatch ? :(_result || (_latch[] = false)) : :())
+    local _fires = $(let f = useLatch ? :(_result && !_latch[]) : :_result
+                       tickCalls === nothing ? f : :($f || $tickNow)
+                     end)
+    #= change()/edge() compare with the values at the previous event (pre()): where the when
+       does not fire, the memory follows the values now (off turned false at 1/12 without
+       firing a `when edge(off)`, which then missed off's edge at 5/12); where it fires, its
+       affect does. Not within a sweep of the event iteration: an algebraic value the next
+       sweep solves again is stale there, and `edge(b) and c` would lose b's edge. =#
+    $(isempty(changeSeedPairs) ? :() : :(_follow && !_fires && begin $(_changeMemoryUpdates(condCrefs, simCode, :x)...) end))
+    _fires
+  end
+  #= The names of the `let` below, which the condition, its affect and its initialization share. =#
+  local shared = Symbol[:_condCache, :_affCache, :_changeCache, :_latch, :_changeSeedValues]
+  tickCalls === nothing || append!(shared, (:_tickAt, :_tickTaken))
   quote
     $(ewDecl)
     #= Typed caches: the condition runs after every step. =#
@@ -1161,49 +1369,7 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, ti
         _latch = Ref{Bool}(false),     # the edge latch
         $((tickCalls === nothing ? () : (:(_tickAt = Ref(NaN)), :(_tickTaken = Ref(NaN))))...)
         _changeSeedValues = Dict{Symbol, Any}($(changeSeedPairs...))
-      global $(Symbol("condition$(callbacks)"))
-      #= Whether the when fires. `_follow`: whether change()/edge() may take the values now,
-         where it does not fire (false within an event iteration's sweep; see below). =#
-      $(Symbol("condition$(callbacks)")) = (x, t, integrator, _follow::Bool = true) -> begin
-        local lookuptableStates
-        local lookuptableParams
-        if _condCache[] === nothing
-          local xs = $(Symbol[Symbol(c) for c in condCrefs])
-          local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
-          if !isempty(xs) && all(isnothing, indices)
-            @debug "[CB-DC$($(callbacks)) cond] false (no state mapping)" t xs
-            return false
-          end
-          lookuptableStates = Dict{Symbol, Union{Nothing, Int}}((xs) .=> indices)
-          local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
-          lookuptableParams = Dict{Symbol, Int}(sym => i for (i, sym) in enumerate(params))
-          _condCache[] = (lookuptableStates, lookuptableParams)
-        else
-          local cached = _condCache[]
-          lookuptableStates = cached[1]
-          lookuptableParams = cached[2]
-        end
-        local _changePreValues
-        if _changeCache[] === nothing
-          _changePreValues = copy(_changeSeedValues)
-          _changeCache[] = _changePreValues
-        else
-          _changePreValues = _changeCache[]
-        end
-        local _result = $(condValue)
-        @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
-        $(useLatch ? :(_result || (_latch[] = false)) : :())
-        local _fires = $(let f = useLatch ? :(_result && !_latch[]) : :_result
-                           tickCalls === nothing ? f : :($f || $tickNow)
-                         end)
-        #= change()/edge() compare with the values at the previous event (pre()): where the when
-           does not fire, the memory follows the values now (off turned false at 1/12 without
-           firing a `when edge(off)`, which then missed off's edge at 5/12); where it fires, its
-           affect does. Not within a sweep of the event iteration: an algebraic value the next
-           sweep solves again is stale there, and `edge(b) and c` would lose b's edge. =#
-        $(isempty(changeSeedPairs) ? :() : :(_follow && !_fires && begin $(_changeMemoryUpdates(condCrefs, simCode, :x)...) end))
-        _fires
-      end
+      $(_tieredCondition(Symbol("condition$(callbacks)"), condBody, shared))
       global $(Symbol("affect$(callbacks)!"))
       $(Symbol("affect$(callbacks)!")) = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)) -> begin
         local t = integrator.t
@@ -1264,7 +1430,9 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, ti
     #= Part of the event iteration where the model has buffered relations. =#
     $(Symbol("cb$(callbacks)")) = OMBackend.CodeGeneration.discreteWhenCallback($(Symbol("condition$(callbacks)")),
                                                                               $(Symbol("affect$(callbacks)!")),
-                                                                              $(Symbol("initialize$(callbacks)!")))
+                                                                              $(Symbol("initialize$(callbacks)!"));
+                                                                              reads = String[$(_whenReads(SC.Exp[condition, cond], wEq.body)...)],
+                                                                              writes = String[$(_whenWrites(wEq.body)...)])
     $(if ewThr !== nothing
         _emitElsewhenThresholdTimeWhen(ewArm, simCode, ewRefSym, ewThr)
       elseif wEq.elsewhenPart !== nothing

@@ -72,13 +72,13 @@ On function-eval failure, the offending generated source is dumped to
 `/tmp/om_bad_function.jl` and the error rethrown.
 """
 function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr}, simCode::SC.SIM_CODE)
-  #= Under precompile / image generation, eval'ing the model's generated Modelica functions
-     into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
+  #= Under another package's precompile (OM.jl's workload), eval'ing the model's generated Modelica
+     functions into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
      compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
      has already run (so its method instances are warmed for the bake), and a real runtime
      translate registers them normally — the guard is precompile-only. Mirrors the
-     jl_generating_output guard in generateIMTKCode (iMTKGen.jl). =#
-  if ccall(:jl_generating_output, Cint, ()) != 0
+     guard in generateIMTKCode (iMTKGen.jl). =#
+  if OMBackend.evaluationRejected(@__MODULE__)
     return nothing
   end
   for f in functions
@@ -771,11 +771,7 @@ function ODE_MODE_MTK(simCode::SC.SIM_CODE)
       $(commonVariables)
       #= END =#
       # Also need to have the original callbacks
-      callbackConditions = $(if !isempty(structuralCallbacks)
-                               :(CallbackSet(callbacks, callbackSet...))
-                             else
-                               :(CallbackSet(callbacks, callbackSet...))
-                             end)
+      callbackConditions = OMBackend.CodeGeneration._joinCallbacks(callbacks, callbackSet...)
       #= Create the composite model. Dispatch on the mass matrix of the initial
          submodel exactly like the submodel builder does: pure ODE takes the
          fast fill-all-u0 / skip-initializer path; DAE routes finalInitialValues
@@ -1320,7 +1316,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
      surviving relay representatives, so callback lookups hit live unknowns. =#
   simCode = substituteRelayAliasesInWhens(simCode, _ifEqRelay_aliases)
   local CALL_BACK_EQUATIONS = createCallbackCode(modelName, simCode; generateSaveFunction = false)
-  local NAMED_STATE_LOOKUPS = namedStateLookups(CALL_BACK_EQUATIONS)
+  local NAMED_STATE_LOOKUPS = namedStateLookups(CALL_BACK_EQUATIONS, simCode)
   #= The callbacks read and write these by name in the state vector, so they
      must survive structural_simplify: an explicit algebraic a when body reads
      (`z = w2` with `w2 = w + 1`) became observed, and the affect failed with a
@@ -1377,6 +1373,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
      TanksWithOverflow's lowerTank_V, stateSelect = never). =#
   local _declaredVariables = OrderedSet{Symbol}(vcat(stateVariablesSym, algebraicVariablesSym))
   statePriorityPairs = filter(p -> first(p) in _declaredVariables, statePriorityPairs)
+  local asserts::Vector{AssertCode} = assertEntries(simCode)
   model = quote
     $(CALL_BACK_EQUATIONS)
     #= The discretes of the discrete clusters (the direct-RHS initialization
@@ -1392,6 +1389,12 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
        to avoid JIT overhead from compiling nested closures.
        Variable constructors only return symbol tuples, so they have no scope dependencies. =#
     $(varOuterDefs)
+    #= The variables' kinds and the asserts at module level too: in the build function, with
+       its thousands of locals, Julia's lowering of it took 55 s (MSL LightningSegmentedTransmissionLine). =#
+    function $(Symbol(modelPrefix, "simCodeKinds"))()
+      return $(simCodeKindsExpr(simCode))
+    end
+    $(emitAssertsFunction(asserts, modelPrefix))
     function $(Symbol(MODEL_NAME * "Model"))(tspan = (0.0, 1.0))
       ModelingToolkit.@independent_variables t
       D = ModelingToolkit.Differential(t)
@@ -1423,7 +1426,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
       end
       #= what each variable is in the simulation code (`simCodeKind`) =#
       local _declared = Set{Symbol}(first.(vars))
-      for (sym, kind) in $(simCodeKindsExpr(simCode))
+      for (sym, kind) in Base.invokelatest($(Symbol(modelPrefix, "simCodeKinds")))
         sym in _declared || continue
         push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, OMBackend.CodeGeneration.SimCodeKind, $kind)))
       end
@@ -1564,7 +1567,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
       $(emitRelationRefresh(IF_RELATIONS))
       callbacks = OMBackend.CodeGeneration.withIntegralDiscretes(callbacks, problem, $(integralDiscreteNames(discreteVariablesSym, simCode)))
       #= Asserts after the event iteration: they check the settled state. =#
-      $(emitAssertCallback(simCode))
+      $(emitAssertCallback(simCode, asserts, modelPrefix))
       #= In the latest world, as the lists above: the arguments read the model's
          variables, bound by eval in this function (MSL Digital FullAdder). =#
       callbacks = OMBackend.CodeGeneration.withDelayRecords(callbacks, problem, $(QuoteNode(Symbol(MODEL_NAME))),
@@ -1583,7 +1586,192 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
   if !isempty(funcNames)
     qualifyModelicaFunctions!(model, funcNames)
   end
+  return hoistBuildClosures!(model, Symbol(MODEL_NAME * "Model"))
+end
+
+#= The build function's `Base.invokelatest(() -> body)` calls (the if-equation events, the discrete clusters, the
+   if-relations' start literals, the delays) as functions of the model's module. Julia's lowering of a function is
+   quadratic in its closures: MSL BatchPlant's build function held 471, and lowering it took 2.4-4.6 s, 0.7 s without
+   these. =#
+
+"""
+    hoistBuildClosures!(model, buildName) -> model
+
+Each `Base.invokelatest(() -> body)` of the build function `buildName` in `model` (a block of the module's
+definitions) as `Base.invokelatest(_<buildName>_part<k>, x...)`, `_<buildName>_part<k>(x...) = body` a function of
+the module defined before it (named by the build function: the structural modes of a model share its module), `x` the build function's locals the body reads (`_buildLocals`): the values the closure read, read
+at the same time (it was called at once). Not one in a loop, a `let`, a `try` or a closure (their own locals), nor a
+body that assigns a local of the build function. The same body twice (but for its line numbers) is one function (the
+discrete clusters: an instance set for the initialization and one for the solve, each call its own).
+"""
+function hoistBuildClosures!(model::Expr, buildName::Symbol)::Expr
+  local k::Union{Nothing, Int} = findfirst(a -> a isa Expr && a.head === :function && a.args[1] isa Expr &&
+                                                a.args[1].head === :call && a.args[1].args[1] === buildName, model.args)
+  k === nothing && return model
+  local build::Expr = model.args[k]
+  local locals::Set{Symbol} = _buildLocals(build)
+  local parts::Vector{Expr} = Expr[]
+  local named::Vector{Tuple{Any, Vector{Symbol}, Symbol}} = Tuple{Any, Vector{Symbol}, Symbol}[]
+  _hoistInvokelatest!(build.args[2], locals, parts, named, string("_", buildName, "_part"))
+  isempty(parts) && return model
+  splice!(model.args, k:(k - 1), parts)
   return model
+end
+
+"""
+The locals of the build function `fn`: its arguments and the names its body assigns, declares `local`, defines as a
+function (`function f` or `f(x) = ...`), or declares with ModelingToolkit's variable macros (`x`, `x(t)`, `x(t) = v`,
+`x(t)[1:n]`, a `begin` block of them), outside a new scope (a loop, `let`, `try`, a closure, a comprehension, quoted
+code); inside other macros too (`@named x = ...`). A name counted that is not a local is harmless (a hoisted body gets
+it as an argument, read at the same time), a local missed is not (the hoisted body would read the module's global).
+"""
+function _buildLocals(fn::Expr)::Set{Symbol}
+  local out::Set{Symbol} = Set{Symbol}()
+  for a in fn.args[1].args[2:end]
+    _assignedNames!(out, a isa Expr && a.head === :kw ? a.args[1] : a)
+  end
+  _buildLocals!(out, fn.args[2])
+  return out
+end
+
+const _MTK_VARIABLE_MACROS = (Symbol("@independent_variables"), Symbol("@variables"), Symbol("@parameters"))
+
+"The heads of the expressions that open a new scope or are not code of the build function (_buildLocals)."
+const _NEW_SCOPE_HEADS = (:function, :->, :for, :while, :let, :try, :comprehension, :generator, :typed_comprehension,
+                          :quote, :struct, :module)
+
+"""
+The names the left side `x` of an assignment or a `local` declaration binds into `out`: `x`, `x::T`, `x = v`,
+`(a, b)`, `(; a, b)`, `x = default` (an argument), and `f(x)` / `f(x) where T` (a short-form function).
+"""
+function _assignedNames!(out::Set{Symbol}, @nospecialize(x))::Nothing
+  if x isa Symbol
+    push!(out, x)
+  elseif x isa Expr && x.head in (:(=), :(::), :where, :call, :kw)
+    _assignedNames!(out, x.args[1])
+  elseif x isa Expr && x.head in (:tuple, :parameters)
+    foreach(y -> _assignedNames!(out, y), x.args)
+  end
+  return nothing
+end
+
+"""
+The name each argument `y` of a ModelingToolkit variable macro declares into `out`: `x`, `x(t)`, `x = v`,
+`x(t)[1:n]`, `x::T`, the declarations of a `begin` block (its metadata vectors declare nothing).
+"""
+function _declaredVariables!(out::Set{Symbol}, @nospecialize(y))::Nothing
+  if y isa Symbol
+    push!(out, y)
+  elseif y isa Expr && y.head in (:(=), :call, :ref, :(::))
+    _declaredVariables!(out, y.args[1])
+  elseif y isa Expr && y.head === :block
+    foreach(a -> _declaredVariables!(out, a), y.args)
+  end
+  return nothing
+end
+
+"""
+The locals the build function's body `e` binds into `out` (_buildLocals).
+"""
+function _buildLocals!(out::Set{Symbol}, @nospecialize(e))::Nothing
+  e isa Expr || return nothing
+  if e.head === :(=) || e.head === :local
+    for x in (e.head === :local ? e.args : Any[e.args[1]])
+      _assignedNames!(out, x)
+    end
+    #= the right side of a short-form function is its body, a new scope =#
+    local lhs::Any = e.head === :(=) ? e.args[1] : nothing
+    e.head === :(=) && !(lhs isa Expr && lhs.head in (:call, :where)) && _buildLocals!(out, e.args[2])
+  elseif e.head === :function
+    e.args[1] isa Expr && _assignedNames!(out, e.args[1])
+  elseif e.head === :macrocall
+    local m::Any = e.args[1]
+    local name::Any = m isa Expr && m.head === :. ? m.args[2].value : m
+    if name in _MTK_VARIABLE_MACROS
+      foreach(y -> _declaredVariables!(out, y), e.args[2:end])
+    else
+      foreach(a -> _buildLocals!(out, a), e.args[2:end])
+    end
+  elseif !(e.head in _NEW_SCOPE_HEADS)
+    foreach(a -> _buildLocals!(out, a), e.args)
+  end
+  return nothing
+end
+
+"Whether `e` is `Base.invokelatest(() -> body)`."
+_isInvokelatestClosure(@nospecialize(e))::Bool =
+  e isa Expr && e.head === :call && length(e.args) == 2 && e.args[1] == :(Base.invokelatest) &&
+  e.args[2] isa Expr && e.args[2].head === :-> && e.args[2].args[1] == Expr(:tuple)
+
+"""
+`e`'s `Base.invokelatest(() -> body)` calls hoisted (`hoistBuildClosures!`) into `parts`, each function's body,
+arguments and name (`prefix` and its number) in `named`; not into a new scope.
+"""
+function _hoistInvokelatest!(@nospecialize(e), locals::Set{Symbol}, parts::Vector{Expr},
+                             named::Vector{Tuple{Any, Vector{Symbol}, Symbol}}, prefix::String)::Nothing
+  e isa Expr || return nothing
+  e.head in (:quote, :function, :->, :for, :while, :let, :try, :comprehension, :generator, :typed_comprehension,
+             :macrocall) && return nothing
+  for (i, a) in enumerate(e.args)
+    if _isInvokelatestClosure(a)
+      local body::Any = a.args[2].args[2]
+      local own::Set{Symbol} = _ownNames(Expr(:block, body))
+      isempty(intersect(own, locals)) || continue
+      local reads::Vector{Symbol} = sort!(collect(intersect(_readNames!(Set{Symbol}(), body), locals)))
+      #= the same body by its code: the discrete clusters' two lists differ in their line numbers =#
+      local same::Union{Nothing, Int} = findfirst(p -> p[2] == reads && _sameCode(p[1], body), named)
+      local name::Symbol = same === nothing ? Symbol(prefix, length(parts) + 1) : named[same][3]
+      if same === nothing
+        push!(parts, :(function $(name)($(reads...)) $(body) end))
+        push!(named, (body, reads, name))
+      end
+      e.args[i] = :(Base.invokelatest($(name), $(reads...)))
+    else
+      _hoistInvokelatest!(a, locals, parts, named, prefix)
+    end
+  end
+  return nothing
+end
+
+"""
+The names `e` reads (its symbols but quoted code, keyword names, macro names), into `out`; an over-approximation
+(a name of a nested closure's own counts), bounded by the build function's locals.
+"""
+function _readNames!(out::Set{Symbol}, @nospecialize(e))::Set{Symbol}
+  if e isa Symbol
+    push!(out, e)
+  elseif e isa Expr
+    e.head === :quote && return _interpolatedNames!(out, e)
+    for (i, a) in enumerate(e.args)
+      (e.head === :kw && i == 1) && continue
+      (e.head === :macrocall && i == 1) && continue
+      _readNames!(out, a)
+    end
+  end
+  return out
+end
+
+"""
+Whether the code `a` and `b` are the same but for line numbers, in quoted code too, their literal values compared by
+`isequal` (an Expr's own `==` compares them by identity: two equal `Vector{String}` literals differ).
+"""
+function _sameCode(@nospecialize(a), @nospecialize(b))::Bool
+  if a isa Expr
+    (b isa Expr && a.head === b.head) || return false
+    local xs::Vector{Any} = filter(x -> !(x isa LineNumberNode), a.args)
+    local ys::Vector{Any} = filter(y -> !(y isa LineNumberNode), b.args)
+    return length(xs) == length(ys) && all(k -> _sameCode(xs[k], ys[k]), eachindex(xs))
+  end
+  a isa QuoteNode && return b isa QuoteNode && _sameCode(a.value, b.value)
+  return typeof(a) === typeof(b) && isequal(a, b)
+end
+
+"The names a quoted expression interpolates (`\$x`)."
+function _interpolatedNames!(out::Set{Symbol}, @nospecialize(e))::Set{Symbol}
+  e isa Expr || return out
+  e.head === :$ && return _readNames!(out, e.args[1])
+  foreach(a -> _interpolatedNames!(out, a), e.args)
+  return out
 end
 
 """

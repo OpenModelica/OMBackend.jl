@@ -295,7 +295,7 @@ function simplifySemiLinear(simCode::SIM_CODE)::SIM_CODE
   local nChains = 0
   for (_, eqs) in groups
     length(eqs) >= 2 || continue
-    local chain = semiLinearChain(eqs)
+    local chain = semiLinearChain(eqs, simCode.stringToSimVarHT)
     chain === nothing && continue
     local (_, y, x, _, _) = first(eqs)
     local nodes = Exp[chain[1][4]; [e[5] for e in chain]]
@@ -346,13 +346,14 @@ function withoutDoubleNegation(e::Exp)::Exp
 end
 
 """
-    semiLinearChain(eqs)
+    semiLinearChain(eqs, ht)
 
 The equations of one `y` and `x` in chain order, `sa -> s1 -> ... -> sb` (each one's second
-slope the next one's first), every intermediate slope a variable, each equation once;
-`nothing` for another shape.
+slope the next one's first), every intermediate slope a chain node (`semiLinearChainNode`), each
+equation once; `nothing` for another shape.
 """
-function semiLinearChain(eqs::Vector{Tuple{Int, Exp, Exp, Exp, Exp}})::Union{Nothing, Vector{Tuple{Int, Exp, Exp, Exp, Exp}}}
+function semiLinearChain(eqs::Vector{Tuple{Int, Exp, Exp, Exp, Exp}},
+                         ht::HT)::Union{Nothing, Vector{Tuple{Int, Exp, Exp, Exp, Exp}}}
   local bySa = Dict{Exp, Int}()
   for (k, e) in enumerate(eqs)
     haskey(bySa, e[4]) && return nothing
@@ -364,9 +365,32 @@ function semiLinearChain(eqs::Vector{Tuple{Int, Exp, Exp, Exp, Exp}})::Union{Not
   local chain = Tuple{Int, Exp, Exp, Exp, Exp}[eqs[only(starts)]]
   while length(chain) < length(eqs)
     local next = get(bySa, last(chain)[5], 0)
-    (next == 0 || !(last(chain)[5] isa EXP_CREF)) && return nothing
+    (next == 0 || !semiLinearChainNode(last(chain)[5], ht)) && return nothing
     push!(chain, eqs[next])
   end
   haskey(bySa, last(chain)[5]) && return nothing
   return chain
+end
+
+"""
+Whether `e` can be a semiLinear chain's intermediate slope, which the rewrite gives an equation (`s2 = s1`): a
+variable, or an expression of algebraic unknowns and parameters that reads one (MSL FluidHeatFlow's components
+compute their enthalpy from their temperature, `h = cp*T`: after the alias elimination the pump's slope is
+`medium.cp*T_q`; not a node, the chain through the pump broke in two and at zero flow nothing determined T_q,
+which drifted to 2e6 in OneMass).
+"""
+function semiLinearChainNode(e::Exp, ht::HT)::Bool
+  e isa EXP_CREF && return true
+  local algebraic::Bool = false
+  for n in crefNames!(OrderedSet{String}(), e)
+    local entry = get(ht, n, nothing)
+    entry === nothing && return false
+    local kind = last(entry).varKind
+    if kind isa ALG_VARIABLE
+      algebraic = true
+    elseif isUnknownVarKind(kind)
+      return false
+    end
+  end
+  return algebraic
 end
