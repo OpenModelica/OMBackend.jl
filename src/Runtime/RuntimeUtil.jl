@@ -47,7 +47,7 @@ import OMFrontend.Frontend
 import OMFrontend.Frontend.AbsynUtil
 import OMFrontend.Frontend.SCodeUtil
 
-import SCode
+import OMFrontend.SCode
 
 using MetaModelica
 

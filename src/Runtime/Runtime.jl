@@ -41,7 +41,7 @@ module Runtime
 include("RuntimeUtil.jl")
 import .RuntimeUtil
 import OMParser.Absyn
-import SCode
+import OMFrontend.SCode
 import OMBackend
 import OMBackend.SimCode
 import ..@BACKEND_LOGGING

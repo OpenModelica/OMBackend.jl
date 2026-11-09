@@ -84,7 +84,6 @@ import Base.Meta
 import JuliaFormatter
 import OMFrontend
 import Plots
-import SCode
 
 #= Settings =#
 const WARN_MISSING_START_VALUES = Ref(false)

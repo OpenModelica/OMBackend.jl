@@ -28,31 +28,29 @@ relevant ones are:
 
 The OMJL ecosystem packages are developed from sibling checkouts next to
 `OMBackend.jl`, as the CI does (`Pkg.develop` of each, `.github/workflows/CI.yml`).
-OMBackend uses MetaModelica, OMFrontend, OMParser (its `Absyn` module), OMRuntimeExternalC
-and SCode; DAE, ImmutableList and ListUtil are OMFrontend's:
+OMBackend uses MetaModelica, OMFrontend (with its `SCode` module), OMParser (its `Absyn` module) and
+OMRuntimeExternalC; ArrayUtil, ImmutableList and ListUtil are OMFrontend's:
 
-* DAE.jl
+* ArrayUtil.jl
 * ImmutableList.jl
 * ListUtil.jl
 * MetaModelica.jl
 * OMFrontend.jl
 * OMParser.jl
 * OMRuntimeExternalC.jl
-* SCode.jl
 
 Layout:
 
 ```
 OMJL-workspace/
-├── DAE.jl/
+├── ArrayUtil.jl/
 ├── ImmutableList.jl/
 ├── ListUtil.jl/
 ├── MetaModelica.jl/
 ├── OMBackend.jl/        <-- this repository
 ├── OMFrontend.jl/
 ├── OMParser.jl/
-├── OMRuntimeExternalC.jl/
-└── SCode.jl/
+└── OMRuntimeExternalC.jl/
 ```
 
 `OMRuntimeExternalC.jl` is not in the General registry. The others are served
@@ -76,8 +74,8 @@ checkouts (nothing is built: the parser is written in Julia):
 julia> import Pkg
 julia> Pkg.activate(".")
 julia> Pkg.develop([Pkg.PackageSpec(path = joinpath("..", p)) for p in
-                    ("DAE.jl", "ImmutableList.jl", "ListUtil.jl", "MetaModelica.jl",
-                     "OMFrontend.jl", "OMParser.jl", "OMRuntimeExternalC.jl", "SCode.jl")])
+                    ("ArrayUtil.jl", "ImmutableList.jl", "ListUtil.jl", "MetaModelica.jl",
+                     "OMFrontend.jl", "OMParser.jl", "OMRuntimeExternalC.jl")])
 ```
 
 Then load the package:

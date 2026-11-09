@@ -846,7 +846,7 @@ function _modeModuleImports()::Expr
   return quote
     import DataStructures.OrderedCollections
     using DataStructures.OrderedCollections: OrderedSet, OrderedDict
-    import SCode
+    import OMFrontend.SCode
     import OMBackend
     import OMBackend.CodeGeneration
     import Setfield
