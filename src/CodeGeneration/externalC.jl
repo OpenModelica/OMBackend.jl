@@ -167,8 +167,10 @@ function ensureExternalC!(func::SimCode.EXTERNAL_MODELICA_FUNCTION)
        or one that does not exist, is no directory =#
     local dirs = String[]
     for d in _annotationStrings(ann, "IncludeDirectory")
-      local path = CodeGeneration.OMBackend._tryOr(() -> CodeGeneration.OMFrontend.resolveModelicaURI(d), nothing,
-                                                   :externalCIncludeDirectory; only = ErrorException)
+      #= where the frontend loaded the library from (OMFrontend's extension); a model of another frontend has none =#
+      local resolve::Function = CodeGeneration.OMBackend.resolveModelicaURI
+      local path::Union{Nothing, String} = applicable(resolve, d) ?
+        CodeGeneration.OMBackend._tryOr(() -> resolve(d), nothing, :externalCIncludeDirectory; only = ErrorException) : nothing
       path !== nothing && isdir(path) && push!(dirs, path)
     end
     lib = _compileIncludeLibrary(join(includes, "\n"), dirs)

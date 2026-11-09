@@ -255,7 +255,7 @@ Base.:(==)(a::ExternalObjectRef, b::ExternalObjectRef) = a.name == b.name && a.h
 Printed with its serial number: a RuntimeGeneratedFunction's id is the SHA1 of its body's
 printed leaves, and its cache is global, so two builds whose generated functions differ only
 in the object (two models with a table `tab`, or a rebuild with other table data) got the
-first build's function and read its table (OM.jl buildingsReproTests: TableStartOfInitialEquation
+first build's function and read its table (OMJL buildingsReproTests: TableStartOfInitialEquation
 after TableInit3 read TableInit3's). Not by its address: since objects are freed, a new table
 can take a freed one's address, and the rebuild got the freed table's function. The name
 comes first, so a model's terms keep their order.

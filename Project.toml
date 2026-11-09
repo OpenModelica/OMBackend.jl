@@ -17,11 +17,8 @@ JuliaFormatter = "98e50ef6-434e-11e9-1051-2b60c6c9e899"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MacroTools = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
 MetaGraphs = "626554b9-1ddb-594c-aa3c-2596fe9399a5"
-MetaModelica = "9d7f2a79-07b5-5542-8b19-c0100dda6b06"
 ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
 NonlinearSolve = "8913a72c-1f9b-4ce2-8d82-65094dcecaec"
-OMFrontend = "b10394b5-f439-4073-a0c5-e09cb00cf46c"
-OMParser = "11f87224-cae7-4e99-a924-e50d12f62c59"
 OMRuntimeExternalC = "ada38df0-e20e-11ed-02f3-2b4b19c1ec8a"
 OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 OrdinaryDiffEqBDF = "6ad6398a-0878-4a85-9266-38940aa047c8"
@@ -35,10 +32,14 @@ SymbolicUtils = "d1185830-fcd6-423d-90d6-eec64667417b"
 Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
 
 [weakdeps]
+MetaModelica = "9d7f2a79-07b5-5542-8b19-c0100dda6b06"
 OMCompiler = "5eee2e4c-d6e4-4c2a-a3d5-a5d6acef407f"
+OMFrontend = "b10394b5-f439-4073-a0c5-e09cb00cf46c"
+OMParser = "11f87224-cae7-4e99-a924-e50d12f62c59"
 
 [extensions]
 OMBackendOMCompilerExt = "OMCompiler"
+OMBackendOMFrontendExt = ["OMFrontend", "OMParser", "MetaModelica"]
 
 [compat]
 ADTypes = "1"
@@ -56,10 +57,11 @@ SciMLBase = "3.56"
 julia = "1.13"
 
 [extras]
+OMFrontend = "b10394b5-f439-4073-a0c5-e09cb00cf46c"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["SparseArrays", "Test"]
+test = ["OMFrontend", "SparseArrays", "Test"]

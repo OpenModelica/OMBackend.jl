@@ -40,8 +40,6 @@ This file contains utility macros used by the backend.
 using Dates
 using DataStructures: OrderedDict, OrderedSet
 
-import OMParser.Absyn
-
 
 """
 Runtime-toggleable backend logging switch. Default is taken from
@@ -117,34 +115,6 @@ end
 
 const COMPONENT_SEPARATOR = "_"
 
-function _joinCanonicalSegments(segs)::String
-  length(segs) == 1 && return String(segs[1])
-  return join((String(s) for s in segs), COMPONENT_SEPARATOR)
-end
-
-function _canonicalIdentSegments(ident::AbstractString)::Vector{String}
-  local s = String(ident)
-  if startswith(s, "'") && endswith(s, "'")
-    return String[s]
-  end
-  if occursin('.', s)
-    return String[String(seg) for seg in split(s, '.')]
-  end
-  return String[s]
-end
-
-function _canonicalPathSegments(path::Absyn.IDENT)
-  return _canonicalIdentSegments(path.name)
-end
-
-function _canonicalPathSegments(path::Absyn.QUALIFIED)
-  return vcat(_canonicalIdentSegments(path.name), _canonicalPathSegments(path.path))
-end
-
-function _canonicalPathSegments(path::Absyn.FULLYQUALIFIED)
-  return _canonicalPathSegments(path.path)
-end
-
 function canonicalName(name::AbstractString)::String
   local s = String(name)
   if startswith(s, "der(") && endswith(s, ")")
@@ -160,8 +130,6 @@ function canonicalName(name::AbstractString)::String
   end
   return s
 end
-
-canonicalName(path::Absyn.Path)::String = _joinCanonicalSegments(_canonicalPathSegments(path))
 
 canonicalSymbol(x)::Symbol = Symbol(canonicalName(x))
 
@@ -261,7 +229,7 @@ end
     evaluationRejected(mod::Module) -> Bool
 
 Whether Julia rejects an evaluation into `mod` now. While a package image is generated, an evaluation into a module of
-a package loaded before ("closed": OMBackend's modules under OM.jl's precompile workload) "breaks incremental
+a package loaded before ("closed": OMBackend's modules under OMJL's precompile workload) "breaks incremental
 compilation" and throws; OMBackend's own workload evaluates into its modules, and what it defines is kept in its image,
 so its models are built and solved as in a session. Asked of the runtime (an empty evaluation), not of the precompile
 state.

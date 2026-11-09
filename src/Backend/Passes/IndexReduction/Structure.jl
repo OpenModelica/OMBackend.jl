@@ -510,7 +510,7 @@ inlineEquation(eq::IR.Equation, ::Dict{Symbol, IR.ModelicaFunction})::IR.Equatio
     positionEquations(eq, k) -> Vector{Equation}
 
 The equations of an if-equation at position `k`: the k-th of each branch and the else-branch's
-k-th from the end (the lowering reverses the else-branch, LowerFlatModel).
+k-th from the end (the lowering reverses the else-branch, OMBackendOMFrontendExt's LowerFlatModel).
 """
 function positionEquations(eq::IR.IF_EQUATION, k::Int)::Vector{IR.Equation}
   local out = IR.Equation[b.equations[k] for b in eq.branches]

@@ -139,7 +139,7 @@ function generateIMTKCode(simCode::SC.SIM_CODE)
      `simulate` instead of warning loudly for every such model. Mirrors the
      condition in ODE_MODE_MTK (MTK_CodeGeneration.jl:415). =#
   if _OMBackend().evaluationRejected(_OMBackend())
-    #= OM.jl's precompile workload: Core.eval'ing the model module into this
+    #= OMJL's precompile workload: Core.eval'ing the model module into this
        closed backend module is rejected; skip the build+eval (codegen warmed). =#
   elseif !SC.hasStructuralTransitions(simCode) &&
          !SC.hasSubModels(simCode)

@@ -150,7 +150,7 @@ end
 
 #= A cluster's members hold between its instants what its body left (CodeGeneration._hold!, _putBack!): at a crossing
    inside a step the interpolation moved PersonalityAspects' day counter from 1.0 to 0.9999999999998931, and
-   `floor(time/24) <> pre(k)` kept it at 1 past t = 48 (OM.jl's suite). On a stand-in integrator, the member in u[2]. =#
+   `floor(time/24) <> pre(k)` kept it at 1 past t = 48 (OMJL's suite). On a stand-in integrator, the member in u[2]. =#
 @testset "Discrete cluster: members held between instants" begin
   local CG::Module = OMBackend.CodeGeneration
   local c::OMBackend.CodeGeneration.DiscreteCluster = CG.DiscreteCluster(["k"], Any[:k], Any[], 0, 0, Bool[], Bool[], nothing, 0, false)

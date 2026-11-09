@@ -37,12 +37,13 @@
     OMBackendOMCompilerExt
 
 The flat model of omc's frontend (an `NFFlatModel` read through OMCompiler.jl) lowered into
-OMJLIR, as `LowerFlatModel` lowers OMFrontend.jl's. Its order and forms are that module's.
+OMJLIR, as `LowerFlatModel` (OMBackendOMFrontendExt) lowers OMFrontend.jl's. Its order and forms are that module's;
+the helpers on OMJLIR alone are `OMBackend.LowerUtil`'s.
 """
 module OMBackendOMCompilerExt
 
 import OMBackend
-import OMBackend: OMJLIR as IR, LowerFlatModel as L, unsupported
+import OMBackend: OMJLIR as IR, LowerUtil as L, unsupported
 import OMCompiler
 import OMCompiler: Node, EnumLiteral, ctor, apply
 

@@ -72,7 +72,7 @@ On function-eval failure, the offending generated source is dumped to
 `/tmp/om_bad_function.jl` and the error rethrown.
 """
 function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr}, simCode::SC.SIM_CODE)
-  #= Under another package's precompile (OM.jl's workload), eval'ing the model's generated Modelica
+  #= Under another package's precompile (OMJL's workload), eval'ing the model's generated Modelica
      functions into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
      compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
      has already run (so its method instances are warmed for the bake), and a real runtime
@@ -547,11 +547,11 @@ end
 The DAE initialization of a solve when the caller chose none, as the event
 re-solve's stages and acceptance (`StartReinit`). Table-cluster models: Newton with
 finite differences (`tableClusterInitAlg`). Otherwise, for
-a problem without an initialization problem (OM.jl solves the initial values
+a problem without an initialization problem (OMJL solves the initial values
 itself): BrownFullBasicInit at the solve's abstol, which OrdinaryDiffEq used by
 default before OrdinaryDiffEqCore 4 (alone it held the raw residual to the abstol: MSL
 TanksWithEmptyingPipe2). The default since then only checks u0, and fails where
-OM.jl's initial values leave a residual in an algebraic equation (the PID models of
+OMJL's initial values leave a residual in an algebraic equation (the PID models of
 PIDDecomposition.mo). It is also the re-solve at the events of a callback without
 its own (`_mergeableReinit`).
 """
@@ -846,7 +846,6 @@ function _modeModuleImports()::Expr
   return quote
     import DataStructures.OrderedCollections
     using DataStructures.OrderedCollections: OrderedSet, OrderedDict
-    import OMFrontend.SCode
     import OMBackend
     import OMBackend.CodeGeneration
     import Setfield

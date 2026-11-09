@@ -119,7 +119,7 @@ end
     mapStatementExps(g, s)
 
 `s` with each of its expressions `e` (of nested statements too) replaced by `g(e)`, whole;
-the targets of `reinit` and of OM.jl's structural changes (references, not expressions) kept.
+the targets of `reinit` and of OMJL's structural changes (references, not expressions) kept.
 """
 mapStatementExps(g::G, s::Statement) where {G} = first(traverseFields(s, _StatementExps(g), nothing))
 
@@ -132,7 +132,7 @@ end
 (m::_StatementExps)(e::Exp, a::Nothing) = (m.g(e), a)
 (m::_StatementExps)(s::Statement, a::Nothing) = (mapStatementExps(m.g, s), a)
 
-"`s` with `f` mapped (as by `mapExp`) over its expressions; the targets of `reinit` and of OM.jl's structural changes kept."
+"`s` with `f` mapped (as by `mapExp`) over its expressions; the targets of `reinit` and of OMJL's structural changes kept."
 mapStatement(f::F, s::Statement) where {F} = mapStatementExps(e -> mapExp(f, e), s)
 
 mapStatements(f::F, body::Vector{Statement}) where {F} = Statement[mapStatement(f, s) for s in body]
@@ -259,7 +259,7 @@ end
 
 `f(e)` for each expression of the statements `body`, nested statements' too, in field order (a branch's condition
 before its body, a loop's range before its body); `statement(s)` on each statement before its expressions. The
-targets of `reinit` and of OM.jl's structural changes are references, not expressions (`statementTargets!`).
+targets of `reinit` and of OMJL's structural changes are references, not expressions (`statementTargets!`).
 """
 function foreachStatementExp(f::F, body::Vector{Statement}, statement::G = noStatement)::Nothing where {F, G}
   local visit::_StatementVisit{F, G} = _StatementVisit(f, statement)
@@ -278,7 +278,7 @@ end
 (v::_StatementVisit)(e::Exp, a::Nothing) = (v.f(e); (e, a))
 (v::_StatementVisit)(s::Statement, a::Nothing) = (v.statement(s); traverseFields(s, v, nothing); (s, a))
 
-"The references a statement holds outside its expressions, pushed onto `out`: a `reinit`'s state, OM.jl's structural changes' components."
+"The references a statement holds outside its expressions, pushed onto `out`: a `reinit`'s state, OMJL's structural changes' components."
 statementTargets!(out::Vector{SimCref}, s::REINIT)::Vector{SimCref} = push!(out, s.stateVar)
 statementTargets!(out::Vector{SimCref}, s::RECOMPILATION)::Vector{SimCref} = push!(out, s.componentToChange)
 statementTargets!(out::Vector{SimCref}, s::AGENTIC_RECOMPILATION)::Vector{SimCref} = append!(out, s.componentsToChange)

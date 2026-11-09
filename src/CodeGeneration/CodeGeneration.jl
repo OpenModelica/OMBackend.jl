@@ -54,7 +54,6 @@ const SC = SimCode
 import ..@BACKEND_LOGGING
 import ..unsupported, ..UnsupportedLowering
 
-import OMFrontend
 import Symbolics
 import Symbolics.RuntimeGeneratedFunctions
 import SymbolicUtils

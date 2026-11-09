@@ -1,6 +1,6 @@
 #= Observed equations, each solved for its variable, need an order (Models/ObservedCycles.mo): a loop of
    explicit definitions or of output-only variables, eliminated together, was ModelingToolkit's "The
-   equations have at least one cycle" (OM.jl InitialEquationTests IEQ54 and IEQ55, once smooth(0, ...) was
+   equations have at least one cycle" (OMJL InitialEquationTests IEQ54 and IEQ55, once smooth(0, ...) was
    noEvent). Their variables stay unknowns (SimCode.cyclicNames). =#
 using Test
 import OMBackend

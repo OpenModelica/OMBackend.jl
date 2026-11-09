@@ -40,20 +40,17 @@ This file contains the runtime for structural change handling.
 module Runtime
 include("RuntimeUtil.jl")
 import .RuntimeUtil
-import OMParser.Absyn
-import OMFrontend.SCode
 import OMBackend
 import OMBackend.SimCode
 import ..@BACKEND_LOGGING
 import ..@VSS_DEBUG
-import OMFrontend
 
 import ModelingToolkit
+import Setfield
 
 using DataStructures
 using ModelingToolkit
 using DifferentialEquations
-using MetaModelica
 
 abstract type AbstractOMSolution end
 
@@ -116,15 +113,16 @@ mutable struct StructuralChange{SYS} <: AbstractStructuralChange
 end
 
 """
-  Wrapper callback for structural change that triggers a recompilation.
+  Wrapper callback for structural change that triggers a recompilation. `M`: the type of the frontend's model of the
+  model (OMFrontend's SCode class), which the recompilation changes and instantiates again (`recompiledSimCode`).
 """
-mutable struct StructuralChangeRecompilation{MOD <: Tuple} <: AbstractStructuralChange
+mutable struct StructuralChangeRecompilation{MOD <: Tuple, M} <: AbstractStructuralChange
   "The name of the next mode"
   name::String
   "Indicates if the structure has changed"
   structureChanged::Bool
-  "The meta model. That is a SCode representation of the model itself"
-  metaModel::SCode.CLASS
+  "The meta model: the frontend's representation of the model itself (OMFrontend: its SCode class)"
+  metaModel::M
   "The modification to be applied during recompilation"
   modification::MOD
   """
@@ -139,15 +137,15 @@ end
 """
   Wrapper callback for agentic recompilation.
   The new parameter values are determined at runtime by an external agent
-  that receives the model metamodel and current simulation state.
+  that receives the model metamodel and current simulation state. `M` as `StructuralChangeRecompilation`'s.
 """
-mutable struct StructuralChangeAgenticRecompilation <: AbstractStructuralChange
+mutable struct StructuralChangeAgenticRecompilation{M} <: AbstractStructuralChange
   "The name of the model being simulated"
   name::String
   "Indicates if the structure has changed"
   structureChanged::Bool
-  "SCode representation of the model — sent to the agent as context"
-  metaModel::SCode.CLASS
+  "The frontend's representation of the model (OMFrontend: its SCode class), sent to the agent as context"
+  metaModel::M
   "Names of the parameters the agent may modify"
   componentsToChange::Vector{String}
   "Symbol table used to map variable names to indices"
@@ -656,10 +654,8 @@ function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
       elseif integrator.t >= last(tspan) #= Hack to handle the special case where we are slightly above tstop=#
         sol = integrator.sol
         idx = findall(t -> t <= tspan[2], sol.t)
-        @assign begin
-          sol.t = sol.t[idx]
-          sol.u = sol.u[idx]
-        end
+        sol = Setfield.@set sol.t = sol.t[idx]
+        sol = Setfield.@set sol.u = sol.u[idx]
         push!(solutions, sol)
         return solutions
       end
@@ -690,13 +686,10 @@ function recompilation(activeModeName,
     @VSS_DEBUG @info "[RECOMPILATION] ENTER" activeModeName t=integrator.t
     local _t_start = time()
     local integrator_u = integrator.u
-    #= Have the SCode =#
     #= 1) Fetch the parameter from the structural callback =#
     local metaModel = structuralCallback.metaModel
     local modification = structuralCallback.modification
-    local inProgram = MetaModelica.list(metaModel)
-    local modelicaActiveModeName = RuntimeUtil.modelicaPathName(activeModeName, metaModel)
-    local elementToChange = first(modification)
+    local elementToChange::String = first(modification)
     #= Get the symbol table, using this we evaluate the new value based on the value of some parameter. =#
     local newValueExpr = Meta.parse(last(modification))
     newValueExpr = quote
@@ -704,19 +697,12 @@ function recompilation(activeModeName,
       $(newValueExpr)
     end
     local newValue = eval(newValueExpr)
+    newValue isa Real ||
+      error("Only primitive values {Integer, Boolean, Real} are currently supported in a Recompilation call, not $(repr(newValue))")
     @VSS_DEBUG @info "[RECOMPILATION] step 1/7: parsed modification" elementToChange newValue elapsed_s=round(time()-_t_start, digits=2)
-    #=  2) Change the parameters in the SCode via API (As specified by the modification)=#
-    #=  2.1 Change the parameter so that it is the same as the modification. =#
-    #= with the classes the model was instantiated with (a library: the MSL for a model using it) =#
-    newProgram = RuntimeUtil.setElementInSCodeProgram!(activeModeName, elementToChange, newValue, metaModel) <|
-      OMFrontend.recompilationProgram(OMFrontend.Frontend.SCodeUtil.elementName(metaModel))
-    @VSS_DEBUG @info "[RECOMPILATION] step 2/7: SCode mutated" elapsed_s=round(time()-_t_start, digits=2)
-    local classToInstantiate = modelicaActiveModeName
-    #= 3) Call the frontend + the backend + JIT compile Julia code in memory =#
-    local (flatModelica, functionCache) = OMFrontend.instantiateSCodeToFM(classToInstantiate, newProgram)
-    @VSS_DEBUG @info "[RECOMPILATION] step 3/7: frontend (instantiateSCodeToFM) done" elapsed_s=round(time()-_t_start, digits=2)
-    #= 3.1 Run the backend =#
-    local simulationCode = translateToSimCode(flatModelica, OMFrontend.cacheToFunctionList(functionCache))
+    #= 2) the frontend's model changed as the modification says, 3) instantiated again and through the backend =#
+    local simulationCode::SimCode.SIM_CODE = recompiledSimCode(metaModel, String(activeModeName), elementToChange, newValue;
+                                                               started = _t_start)
     @VSS_DEBUG @info "[RECOMPILATION] step 4/7: backend (translateToSimCode) done" elapsed_s=round(time()-_t_start, digits=2)
     #= 3.2 Adjust variables and special parameters =#
     RuntimeUtil.updateInitialConditions!(simulationCode, integrator)
@@ -885,14 +871,15 @@ function queryAgent(componentsToChange::Vector{String},
 end
 
 """
-    translateToSimCode(flatModelica, functionList) -> SIM_CODE
+    recompiledSimCode(metaModel, activeModeName::String, elementToChange::String, newValue::Real; started::Float64)
+      -> SimCode.SIM_CODE
 
-The SimCode of a recompiled model with its functions (`functionList`, the frontend's), as a
-translate's (OMBackend.omjlirModel, OMBackend.mtkSimCode).
+The simulation code of a model recompiled at a structural change: the frontend's model `metaModel` with the element
+`elementToChange` of the active mode `activeModeName` set to `newValue`, instantiated again and through the backend, as
+a translate's. Defined by the frontend's extension (OMBackendOMFrontendExt: an SCode class); `started`, the
+recompilation's start for its VSS_DEBUG timings.
 """
-translateToSimCode(flatModelica::OMFrontend.Frontend.FlatModel,
-                   functionList::Union{Nothing, OMBackend.LowerFlatModel.FunctionList})::OMBackend.SimCode.SIM_CODE =
-  OMBackend.mtkSimCode(OMBackend.omjlirModel(flatModelica; functionList))
+function recompiledSimCode end
 
 """
     translateToMTK(simulationCode::SIM_CODE, owner::String) -> Expr

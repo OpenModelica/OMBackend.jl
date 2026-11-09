@@ -786,7 +786,7 @@ end
 """
     lowerStructuralTransition(names, w)
 
-A structural when-equation (OM.jl's `recompilation`): the transition is known when its body
+A structural when-equation (OMJL's `recompilation`): the transition is known when its body
 runs.
 """
 function lowerStructuralTransition(names::Names, w::IR.WHEN_EQUATION)::StructuralTransition

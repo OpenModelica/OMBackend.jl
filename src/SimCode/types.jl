@@ -503,13 +503,13 @@ struct BREAK <: Statement
   source::Source
 end
 
-"OM.jl's structural change: translate the model again with `componentToChange = newValue`."
+"OMJL's structural change: translate the model again with `componentToChange = newValue`."
 struct RECOMPILATION <: Statement
   componentToChange::SimCref
   newValue::Exp
 end
 
-"OM.jl's structural change decided by an agent: the components it may change, its prompt."
+"OMJL's structural change decided by an agent: the components it may change, its prompt."
 struct AGENTIC_RECOMPILATION <: Statement
   componentsToChange::Vector{SimCref}
   prompt::Union{Nothing, String}
@@ -936,7 +936,7 @@ variables' references once at lowering (`ReferenceIndex(ht, order, modelName)`) 
 - `arrayOf`: the array each element variable is an element of, by its key (`arrayBase` of its reference;
   `elementArray`);
 - `codeNames`: each variable's identifier in the generated code by its key (`codeIdentifiers`; `codeName`): what the
-  code generators and OM.jl's results know it by (`a_b[1][2]` of `a.b[1,2]`, `der(x)` of a state's derivative).
+  code generators and OMJL's results know it by (`a_b[1][2]` of `a.b[1,2]`, `der(x)` of a state's derivative).
 """
 struct ReferenceIndex
   references::Dict{String, IR.ComponentRef}

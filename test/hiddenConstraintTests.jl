@@ -17,7 +17,7 @@ import OMFrontend
   local flat = () -> OMFrontend.instantiateSCodeToFM(name, OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   local passed = () -> begin
     local (fm, cache) = flat()
-    local lowered = OMBackend.LowerFlatModel.lowerFlatModel(fm; functions = OMFrontend.cacheToFunctionList(cache))
+    local lowered = OMBackend.lowerFlatModel(fm; functions = OMFrontend.cacheToFunctionList(cache))
     OMBackend.Passes.runPasses!(lowered; through = first(last(OMBackend.Passes.PIPELINE)))
   end
   local states = m -> Set{Symbol}(v.name for v in m.variables if v.kind isa IR.STATE)
