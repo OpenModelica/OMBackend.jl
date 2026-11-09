@@ -5,7 +5,6 @@ authors = ["John Tinnerholm <johti17@liu.se>", "Karim Abdelhak <karim.abdelhak@f
 
 [deps]
 ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
-Absyn = "ce2f92e2-a952-11e9-0543-8b443f216f1d"
 DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 DiffEqBase = "2b5f629d-d688-5b77-993f-72d75c75574e"
@@ -22,6 +21,7 @@ MetaModelica = "9d7f2a79-07b5-5542-8b19-c0100dda6b06"
 ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
 NonlinearSolve = "8913a72c-1f9b-4ce2-8d82-65094dcecaec"
 OMFrontend = "b10394b5-f439-4073-a0c5-e09cb00cf46c"
+OMParser = "11f87224-cae7-4e99-a924-e50d12f62c59"
 OMRuntimeExternalC = "ada38df0-e20e-11ed-02f3-2b4b19c1ec8a"
 OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 OrdinaryDiffEqBDF = "6ad6398a-0878-4a85-9266-38940aa047c8"
@@ -43,7 +43,7 @@ OMBackendOMCompilerExt = "OMCompiler"
 
 [compat]
 ADTypes = "1"
-Absyn = "1.4"
+OMParser = "1"
 DiffEqBase = "7.21.2"
 MetaModelica = "0.4.2, 0.5"
 ModelingToolkit = "11.21"

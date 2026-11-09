@@ -40,7 +40,7 @@ This file contains utility macros used by the backend.
 using Dates
 using DataStructures: OrderedDict, OrderedSet
 
-import Absyn
+import OMParser.Absyn
 
 
 """

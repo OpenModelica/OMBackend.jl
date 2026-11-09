@@ -28,10 +28,9 @@ relevant ones are:
 
 The OMJL ecosystem packages are developed from sibling checkouts next to
 `OMBackend.jl`, as the CI does (`Pkg.develop` of each, `.github/workflows/CI.yml`).
-OMBackend uses Absyn, MetaModelica, OMFrontend, OMRuntimeExternalC and SCode;
-DAE, ImmutableList, ListUtil and OMParser are OMFrontend's:
+OMBackend uses MetaModelica, OMFrontend, OMParser (its `Absyn` module), OMRuntimeExternalC
+and SCode; DAE, ImmutableList and ListUtil are OMFrontend's:
 
-* Absyn.jl
 * DAE.jl
 * ImmutableList.jl
 * ListUtil.jl
@@ -45,7 +44,6 @@ Layout:
 
 ```
 OMJL-workspace/
-├── Absyn.jl/
 ├── DAE.jl/
 ├── ImmutableList.jl/
 ├── ListUtil.jl/
@@ -71,19 +69,16 @@ julia> Pkg.Registry.add("General")
 julia> Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
 ```
 
-From the `OMBackend.jl` directory, activate the project, develop the sibling
-checkouts and build:
+From the `OMBackend.jl` directory, activate the project and develop the sibling
+checkouts (nothing is built: the parser is written in Julia):
 
 ```julia
 julia> import Pkg
 julia> Pkg.activate(".")
 julia> Pkg.develop([Pkg.PackageSpec(path = joinpath("..", p)) for p in
-                    ("Absyn.jl", "DAE.jl", "ImmutableList.jl", "ListUtil.jl", "MetaModelica.jl",
+                    ("DAE.jl", "ImmutableList.jl", "ListUtil.jl", "MetaModelica.jl",
                      "OMFrontend.jl", "OMParser.jl", "OMRuntimeExternalC.jl", "SCode.jl")])
-julia> Pkg.build(verbose = true)
 ```
-
-`deps/build.jl` builds OMFrontend, and with it OMParser's parser library.
 
 Then load the package:
 

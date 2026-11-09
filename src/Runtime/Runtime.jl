@@ -40,7 +40,7 @@ This file contains the runtime for structural change handling.
 module Runtime
 include("RuntimeUtil.jl")
 import .RuntimeUtil
-import Absyn
+import OMParser.Absyn
 import SCode
 import OMBackend
 import OMBackend.SimCode

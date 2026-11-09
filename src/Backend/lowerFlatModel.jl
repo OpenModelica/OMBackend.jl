@@ -59,7 +59,7 @@ the iterator), `r.x[2]` (a record's field in a function).
 """
 module LowerFlatModel
 
-import Absyn
+import OMParser.Absyn
 import MetaModelica
 import MetaModelica: isvariant
 import OMFrontend

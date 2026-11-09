@@ -35,7 +35,7 @@
 
 module RuntimeUtil
 
-import Absyn
+import OMParser.Absyn
 import DifferentialEquations
 import DifferentialEquations.ReturnCode
 import ModelingToolkit
