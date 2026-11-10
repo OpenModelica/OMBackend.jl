@@ -2019,8 +2019,6 @@ wrapWithInvokelatest(x) = x  #= For non-Expr types, return as-is =#
 
 
 """
-  $(SIGNATURES)
-
   Structurally simplify algebraic equations in a system and compute the
   topological sort of the observed equations. When `simplify=true`, the `simplify`
   function will be applied during the tearing process. It also takes kwargs
@@ -3331,8 +3329,6 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
 end
 
 """
-  $(TYPEDSIGNATURES)
-
   Takes a Nth order System and returns a new System written in first order
   form by defining new variables which represent the N-1 derivatives.
   """

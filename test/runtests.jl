@@ -60,11 +60,11 @@ end
 # before OMBackend — which pulls in OMRuntimeExternalC and its bundled
 # libintl-8.dll. On Windows, whichever libintl-8.dll loads first wins the name;
 # if OMRuntimeExternalC's loads first, Glib's libgio-2.0-0.dll later fails with
-# "the specified procedure could not be found". Preloading Plots here forces Glib's
-# gettext to win regardless of the package __init__ order, which (unlike the
-# in-module import in OMBackend) is not guaranteed when loading the precompiled
-# package on CI.
+# "the specified procedure could not be found". OMBackend does not import Plots
+# itself (a weak dependency), so the order is the caller's: here.
 import Plots
+#= The formatter of the generated code: loads OMBackend's JuliaFormatter extension. =#
+import JuliaFormatter
 
 import OMFrontend
 using OMBackend

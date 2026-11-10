@@ -1,4 +1,4 @@
-[![Github Action CI](https://github.com/OpenModelica/OMBackend.jl/workflows/CI/badge.svg)](https://github.com/OpenModelica/OMBackend.jl/actions) [![License: OSMC-PL](https://img.shields.io/badge/license-OSMC--PL-lightgrey.svg)](LICENSE.md) [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://OpenModelica.github.io/OMBackend.jl/dev/)
+[![Github Action CI](https://github.com/OpenModelica/OMBackend.jl/workflows/CI/badge.svg)](https://github.com/OpenModelica/OMBackend.jl/actions) [![License: AGPL-3.0 or OSMC-PL](https://img.shields.io/badge/license-AGPL--3.0%20or%20OSMC--PL-lightgrey.svg)](LICENSE.md) [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://OpenModelica.github.io/OMBackend.jl/dev/)
 
 # About OMBackend.jl
 
@@ -29,9 +29,17 @@ relevant ones are:
 
 * DifferentialEquations.jl, OrdinaryDiffEq.jl, DiffEqBase.jl, DiffEqCallbacks.jl, Sundials.jl
 * ModelingToolkit.jl, Symbolics.jl, SymbolicUtils.jl
-* Graphs.jl, MetaGraphs.jl, DataStructures.jl, MacroTools.jl, Setfield.jl
-* Plots.jl
-* ExportAll.jl, DocStringExtensions.jl, JuliaFormatter.jl
+* Graphs.jl, DataStructures.jl, MacroTools.jl, Setfield.jl
+* ExportAll.jl
+
+Weak dependencies, each with a package extension that Julia loads when the package is loaded (they keep the
+precompilation of OMBackend alone short; `OM` loads the first two itself):
+
+* Plots.jl: `OMBackend.plot` (`OMBackendPlotsExt`). On Windows load Plots before OMBackend: Glib's gettext
+  runtime must be loaded before OMRuntimeExternalC's (OMBackend.jl#101).
+* JuliaFormatter.jl: the formatted generated code of `printModel`, `modelToString` and `writeModelToFile`; without it
+  the code is written as it is (`OMBackendJuliaFormatterExt`).
+* OMFrontend.jl with OMParser.jl and MetaModelica.jl: the lowering of the frontend's flat model (`OMBackendOMFrontendExt`).
 
 The OMJL ecosystem packages are developed from sibling checkouts next to
 `OMBackend.jl`, as the CI does (`Pkg.develop` of each, `.github/workflows/CI.yml`).
@@ -159,5 +167,5 @@ If you use OMBackend.jl in academic work, please cite the entries in
 
 # License
 
-OMBackend.jl is distributed under the OSMC Public License. See
-[LICENSE.md](LICENSE.md).
+OMBackend.jl is distributed under the OSMC Public License 1.8 or the GNU Affero General
+Public License version 3, at the recipient's choice. See [LICENSE.md](LICENSE.md), which holds both.

@@ -34,13 +34,12 @@
 */ =#
 
 module OMBackend
-# Load Plots (and through it Glib's gettext runtime) BEFORE any include that pulls
-# in OMRuntimeExternalC. On Windows, OMRuntimeExternalC loads its own bundled
-# libintl-8.dll/libiconv-2.dll into the process; if that happens first, Glib's
-# libgio-2.0-0.dll later binds against the older gettext and fails to load with
-# "the specified procedure could not be found". Loading Plots first makes Glib's
-# gettext win the libintl-8.dll name, which OMRuntimeExternalC tolerates.
-import Plots
+# Plots is a weak dependency: it is loaded here no more, the extension OMBackendPlotsExt adds the plot methods
+# when the user loads Plots. On Windows Plots (and through it Glib's gettext runtime) must be loaded BEFORE any
+# package that pulls in OMRuntimeExternalC, which OMBackend does: OMRuntimeExternalC loads its own bundled
+# libintl-8.dll/libiconv-2.dll into the process, and if that happens first, Glib's libgio-2.0-0.dll later binds
+# against the older gettext and fails to load with "the specified procedure could not be found" (OMBackend.jl#101).
+# So `using Plots` goes before `using OMBackend` (OM and the tests of OMBackend do it).
 const CURRENT_DIRECTORY = @__DIR__
 include("$CURRENT_DIRECTORY/util.jl")
 include("$CURRENT_DIRECTORY/globalConstants.jl")
