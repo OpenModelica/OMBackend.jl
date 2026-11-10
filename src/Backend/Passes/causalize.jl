@@ -87,7 +87,7 @@ function mapRoots!(g::G, eq::IR.ASSERT_EQUATION)::IR.Equation where {G}
   return eq
 end
 
-"The statements with `g` applied to their root expressions (`mapRoots!`); the targets of `reinit` and of OM.jl's structural changes kept."
+"The statements with `g` applied to their root expressions (`mapRoots!`); the targets of `reinit` and of OMJL's structural changes kept."
 mapRoots(g::G, body::Vector{IR.Statement}) where {G} = IR.Statement[mapRoots(g, s) for s in body]
 mapRoots(g::G, s::IR.ASSIGNMENT) where {G} = IR.ASSIGNMENT(g(s.lhs), g(s.rhs), s.source)
 mapRoots(g::G, s::IR.IF_STATEMENT) where {G} =

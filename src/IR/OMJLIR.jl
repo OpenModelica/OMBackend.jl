@@ -838,7 +838,7 @@ end
 """
     RECOMPILATION(component, newValue)
 
-OM.jl's structural change at an event: the model is translated again with the parameter
+OMJL's structural change at an event: the model is translated again with the parameter
 `component` set to `newValue`.
 """
 struct RECOMPILATION <: Statement
@@ -849,7 +849,7 @@ end
 """
     AGENTIC_RECOMPILATION(components, prompt, initialEquations)
 
-OM.jl's structural change at an event decided by an agent: the components it may change, the
+OMJL's structural change at an event decided by an agent: the components it may change, the
 prompt and the initial equations for the new model.
 """
 struct AGENTIC_RECOMPILATION <: Statement
@@ -958,7 +958,7 @@ A when-equation's role: a regular one; an initial one the passes made: an initia
 section or an algorithm's `when initial()` body (`INITIAL_SECTION`: the initialization's first
 pass runs them, before the system is solved), the initial arm of a lifted algorithm or discrete
 cluster (`INITIAL_WHEN`); the initialization runs both before the model's own `when initial()`
-equations; OM.jl's structural transition (its body changes the model's structure:
+equations; OMJL's structural transition (its body changes the model's structure:
 `recompilation`, `agentic_recompilation`).
 """
 @enum WhenKind REGULAR_WHEN INITIAL_WHEN INITIAL_SECTION STRUCTURAL_WHEN
@@ -1557,7 +1557,7 @@ Partition(index::Int, association::Association, unknowns::Vector{Symbol},
 """
     StructuralMode(name, variables, system)
 
-A mode of an OM.jl model with structural modes: its variables and the system it switches to.
+A mode of an OMJL model with structural modes: its variables and the system it switches to.
 """
 struct StructuralMode
   name::String
@@ -1568,7 +1568,7 @@ end
 """
     StructuralTransition(from, to, condition)
 
-OM.jl's explicit structural transition: from mode `from` to mode `to` when `condition`
+OMJL's explicit structural transition: from mode `from` to mode `to` when `condition`
 becomes true.
 """
 struct StructuralTransition <: Node
@@ -1590,7 +1590,7 @@ A model in OMJLIR (NB's BackendDAE MAIN):
 - `clocked`: the clocked partitions (MLS 16.7), after clock partitioning.
 - `baseClocks`: the base clocks the clocked partitions tick with (`baseClock` indexes it).
 - `functions`: the functions the model calls, in the frontend's order.
-- `initialMode`, `modes`, `transitions`: OM.jl's structural modes, if the model has them.
+- `initialMode`, `modes`, `transitions`: OMJL's structural modes, if the model has them.
 - `frontendModel`: what the frontend needs to translate the model again at a structural
   change; the backend does not look into it.
 """

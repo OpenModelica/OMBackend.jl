@@ -1,7 +1,7 @@
 #= OMBackend's index reduction (Passes.IndexReduction) step by step on small models
    (Models/IndexReduction.mo): the plan's outcome, differentiations and states (explain), the
    choice of states, the folding of known values, symbolic partial derivatives, the commit to
-   OMJLIR, the derivative unknowns solved for, a simulation, and MTK's path with the switch off. The OM.jl suite checks such models'
+   OMJLIR, the derivative unknowns solved for, a simulation, and MTK's path with the switch off. The OMJL suite checks such models'
    values against analytic solutions and OpenModelica's states. =#
 const INDEX_REDUCTION_FILE = joinpath(@__DIR__, "Models", "IndexReduction.mo")
 const _INDEX_REDUCTION_SCODE = Ref{Any}(nothing)
@@ -20,7 +20,7 @@ end
 "The OMJLIR model of `IndexReduction.<name>` before index reduction (the passes through the last)."
 function _irUnreduced(name::String)::_IRM.Model
   local (fm, functions) = _irFlat(name)
-  local model = OMBackend.LowerFlatModel.lowerFlatModel(fm; functions = functions)
+  local model = OMBackend.lowerFlatModel(fm; functions = functions)
   return OMBackend.Passes.runPasses!(model; through = first(last(OMBackend.Passes.PIPELINE)))
 end
 
@@ -35,7 +35,7 @@ end
 "The OMJLIR model of `IndexReduction.<name>` with its arrays kept, before index reduction (`runPassesKeepingArrays!`, as translate)."
 function _irArrayUnreduced(name::String)::_IRM.Model
   local (fm, functions) = _irArrayFlat(name)
-  local model = OMBackend.LowerFlatModel.lowerFlatModel(fm; functions = functions)
+  local model = OMBackend.lowerFlatModel(fm; functions = functions)
   return OMBackend.Passes.runPassesKeepingArrays!(model)
 end
 
@@ -206,11 +206,11 @@ end
 
   @testset "an inlined function's derivative: a function, the record a call computes evaluated once (as IF97's rho_ph)" begin
     #= wrapped(x) := fromAux(x, auxOf(x, phase)), Inline = true; fromAux's derivative excludes the record: wrapped gets
-       the derivative wrapped__inlineDer (LowerFlatModel.withInlineDerivatives), and the index reduction differentiates
+       the derivative wrapped__inlineDer (LowerUtil.withInlineDerivatives), and the index reduction differentiates
        x2 = wrapped(x1) by it. Inlined, the derivative equation passed the call auxOf(x1, 0) to fromAuxDer, which the code
        generation evaluates once per field of the record (MSL MeasuringTemperature 5 times slower). =#
     local (fm, functions) = _irFlat("InlinedRecordDerivative")
-    local irFunctions = OMBackend.LowerFlatModel.lowerFunctions(functions)
+    local irFunctions = OMBackend.lowerFunctions(functions)
     local w = only(filter(f -> f.name === Symbol("IndexReduction.wrapped"), irFunctions))
     @test [(a.derivative, a.order, a.excludedInputs) for a in w.derivatives] == [(Symbol("IndexReduction.wrapped__inlineDer"), 1, Int[])]
     local d = only(filter(f -> f.name === Symbol("IndexReduction.wrapped__inlineDer"), irFunctions))
@@ -665,7 +665,7 @@ end
       let (fm, functions) = _irArrayFlat("PendulumsFirstForceLaw")
         local reduced::_IRM.Model = OMBackend.reducedArrayModel(fm; functionList = functions)
         local names::Vector{Symbol} = Symbol[v.name for v in reduced.variables]
-        @test OMBackend.generateReducedArrayODETargetCode(fm, reduced) === nothing
+        @test OMBackend.generateReducedArrayODETargetCode(OMBackend.canonicalName(fm.name), reduced) === nothing
         @test Symbol[v.name for v in reduced.variables] == names
       end
       local firstLaw::Vector{String} = ["x[1]", "y[1]", "x[2]", "F[1]", "F[3]"]

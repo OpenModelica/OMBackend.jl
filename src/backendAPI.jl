@@ -34,7 +34,6 @@
 */ =#
 
 using ExportAll
-import MetaModelica
 #= For interactive evaluation. =#
 using ModelingToolkit
 using SymbolicUtils
@@ -75,16 +74,12 @@ daeFallbackSolver() = FBDF(autodiff = ADTypes.AutoFiniteDiff())
 import .CodeGeneration
 import .Runtime
 import .OMJLIR
-import .LowerFlatModel
-import .LowerFlatModel: FunctionList
 import .Passes
 import .SimCode
 
 import Base.Meta
 import JuliaFormatter
-import OMFrontend
 import Plots
-import SCode
 
 #= Settings =#
 const WARN_MISSING_START_VALUES = Ref(false)
@@ -175,7 +170,7 @@ const OSMC_COPYRIGHT_HEADER = """
 *
 * See the full OSMC Public License conditions for more details.
 *
-* This file was generated automatically by OM.jl.
+* This file was generated automatically by OMJL.
 =#
 """
 
@@ -308,10 +303,6 @@ end
 # not the session root. Keyed by canonical model name.
 const MODEL_RUN_DIRS = Dict{String, String}()
 
-function logRunModelName(frontendDAE::OMFrontend.Frontend.FlatModel)::String
-  return string(frontendDAE.name)
-end
-
 """
     clearCaches!(; models=true, implementations=true, wrappers=true, extractors=true)
 
@@ -319,7 +310,7 @@ Clear persistent caches. By default all caches are cleared.
 Use keyword arguments to selectively clear individual caches.
 
 - `models`: compiled MTK model ASTs, the cached builds and their external objects (tables),
-  which their destructors free
+  which their destructors free, and the modes compiled at structural changes (`Runtime.RECOMPILED_MODES`)
 - `implementations`: Modelica function implementations
 - `wrappers`: RTG wrapper functions for symbolic dispatch
 - `extractors`: per-element array extractor functions
@@ -334,6 +325,7 @@ function clearCaches!(; models::Bool=true,
                       empty!(IMTKGen.BUILT); empty!(IMTKGen.BUILT_HASH);
                       empty!(IMTKGen.REDUCED_SYSTEMS); empty!(IMTKGen.PRISTINE_P);
                       empty!(CodeGeneration.DAE_REINIT);
+                      empty!(Runtime.RECOMPILED_MODES);
                       Cache.clear!();
                       push!(cleared, "models"))
   implementations && (empty!(CodeGeneration.MODELICA_FUNCTION_IMPLS); empty!(CodeGeneration.MODELICA_FUNCTION_OWNERS);
@@ -363,6 +355,7 @@ function forgetModel(modelName::String)::Nothing
   local cname = canonicalName(modelName)
   IMTKGen.forgetBuild(cname)
   Cache.remove!(cname)
+  Runtime.forgetRecompiledModes!(cname)
   for name in unique((modelName, cname))
     delete!(COMPILED_MODELS_MTK, name)
     delete!(COMPILED_MODELS_DEJL, name)
@@ -375,62 +368,6 @@ function forgetModel(modelName::String)::Nothing
   return nothing
 end
 
-"""
-    translate(fm; functionList = nothing, BackendMode = DEFAULT_BACKEND_MODE[], warnMissingStartValues = nothing,
-              eliminateNonDynamic = nothing, observedFilter = nothing, checkSimCode = true, scalarized = true,
-              omjlir = nothing)
-
-The target code of the flat model `fm` and its functions (the frontend's function list): `fm`
-lowered to OMJLIR and through its passes (`omjlirModel`; `omjlir`: that OMJLIR model, already
-lowered, `translateReducedArrays`), to the simulation code and its
-passes (SimCode.simulationCode; SimCode.deSimulationCode for DEMode), checked
-(`checkSimCode`), and the code generated for the backend mode. A flat model with arrays kept
-(`scalarized = false`) is lowered with its arrays and goes to the array-preserving generation first
-(`reducedArrayModel`, ARRAY_ODE_GENERATION), to this path where it is outside its scope.
-"""
-function translate(fm::OMFrontend.Frontend.FlatModel;
-                   functionList::Union{Nothing, FunctionList} = nothing,
-                   BackendMode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
-                   warnMissingStartValues::Union{Nothing, Bool} = nothing,
-                   eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
-                   observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                   checkSimCode::Bool = true,
-                   scalarized::Bool = true,
-                   omjlir::Union{Nothing, OMJLIR.Model} = nothing)
-  local previousWarnSetting = WARN_MISSING_START_VALUES[]
-  local modelName = logRunModelName(fm)
-  local runId = createLogRunId(modelName)
-  MODEL_RUN_DIRS[canonicalName(modelName)] = runId
-  resetFallbacks!()
-  warnMissingStartValues === nothing || (WARN_MISSING_START_VALUES[] = warnMissingStartValues)
-  try
-    delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
-    omjlir === nothing && delete!(ARRAY_REDUCED_MODELS, canonicalName(fm.name))
-    #= an attempt with the arrays kept records its own reasons (as translateReducedArrays); a scalarized translate after
-       it, or the reduced model's (`omjlir`), keeps them for OM's report =#
-    (scalarized || omjlir !== nothing) || delete!(ARRAY_PATH_REASONS, canonicalName(fm.name))
-    #= the index reduced in array form: its array code, else its scalarized form =#
-    local arrayReduction::Bool = !scalarized && omjlir === nothing
-    if arrayReduction
-      local reduced::Union{Nothing, OMJLIR.Model} = @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
-      if reduced !== nothing
-        local reducedResult::Union{Nothing, Tuple{String, Expr}} = @BACKEND_PERFLOG "[backendAPI] generateReducedArrayODECode" generateReducedArrayODETargetCode(fm, reduced)
-        reducedResult === nothing || return reducedResult
-        omjlir = scalarizedReducedModel(fm, reduced)
-      end
-    end
-    return withLogRunDir(runId) do
-      #= The flat model with its functions as it arrives from the frontend =#
-      @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "frontend_initialModel.log"),
-        replace(OMFrontend.Frontend.toFlatString(fm, functionList === nothing ? MetaModelica.nil : functionList), "\\n" => "\n"))
-      local model::OMJLIR.Model = omjlir !== nothing ? omjlir :
-        @BACKEND_PERFLOG "[backendAPI] lower" omjlirModel(fm; functionList, scalarized, arrayReduction = !arrayReduction)
-      return generateTargetCode(model; BackendMode, eliminateNonDynamic, observedFilter, checkSimCode)
-    end
-  finally
-    WARN_MISSING_START_VALUES[] = previousWarnSetting
-  end
-end
 
 """
     translate(model::OMJLIR.Model; BackendMode = DEFAULT_BACKEND_MODE[], warnMissingStartValues = nothing,
@@ -535,82 +472,27 @@ end
 
 Passes.IndexReduction.KNOWN_VALUES[] = knownValues
 
-"""
-    explainIndexReduction(fm; functionList = nothing) -> Passes.IndexReduction.Explanation
 
-What OMBackend's index reduction does to the flat model `fm` and why
-(`Passes.IndexReduction.explain`): the equations it differentiates and how often, the candidates
-of each choice with their StateSelect and the dummy derivatives among them, the states, the
-dynamic state sets; or why the model needs no reduction or is left to MTK. Planned as a
-translation would plan it, nothing translated.
-"""
-function explainIndexReduction(fm::OMFrontend.Frontend.FlatModel;
-                               functionList::Union{Nothing, FunctionList} = nothing)::Passes.IndexReduction.Explanation
-  local model = LowerFlatModel.lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
-  #= the passes but index reduction (it runs after the last one) =#
-  model = Passes.runPasses!(model; through = first(last(Passes.PIPELINE)))
-  return Passes.IndexReduction.explain(model)
-end
+
+
 
 """
-    omjlirModel(fm; functionList = nothing, scalarized = true, arrayReduction = true) -> OMJLIR.Model
+    reducedArrayModel(lower::Function, name::String) -> Union{Nothing, OMJLIR.Model}
 
-The OMJLIR model of the flat model `fm` and its functions (the frontend's function list),
-through the passes (Passes.PIPELINE): what the simulation code is lowered from. A flat model
-with arrays kept (`scalarized = false`, OM's `scalarize = false`) whose index OMBackend reduces in
-array form is lowered with its arrays (`arrayReducedModel`; not with `arrayReduction` false: a caller
-that tried it); another is scalarized first: the backend takes scalars.
+`reducedArrayModel` of the model `name` (canonical) that `lower()` lowers to OMJLIR (a frontend's lowering, run inside
+the step so that what it does not support declines the array form): through the passes keeping its arrays, its index
+reduced or its states committed in array form; `nothing` where the array form does not take it, the reason recorded.
 """
-function omjlirModel(fm::OMFrontend.Frontend.FlatModel; functionList::Union{Nothing, FunctionList} = nothing,
-                     scalarized::Bool = true, arrayReduction::Bool = true)::OMJLIR.Model
-  if !scalarized && arrayReduction
-    local reduced = arrayReducedModel(fm; functionList)
-    reduced === nothing || return reduced
-  end
-  scalarized || (fm = @BACKEND_PERFLOG "[backendAPI] scalarizeKeptArrays" OMFrontend.Frontend.scalarizeKeptArrays(fm))
-  local model = LowerFlatModel.lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
-  return Passes.runPasses!(model)
-end
-
-"""
-    arrayReducedModel(fm; functionList = nothing) -> Union{Nothing, OMJLIR.Model}
-
-The OMJLIR model of a flat model with arrays kept whose index OMBackend reduces in array form (the
-switch OMBACKEND_ARRAY_INDEX_REDUCTION, with OMBACKEND_INDEX_REDUCTION), for the scalar simulation
-code: reduced with its arrays (`reducedArrayModel`), then scalarized (`scalarizedReducedModel`).
-`nothing` where the array form does not take the model: the caller scalarizes in the frontend as
-before.
-"""
-function arrayReducedModel(fm::OMFrontend.Frontend.FlatModel;
-                           functionList::Union{Nothing, FunctionList} = nothing)::Union{Nothing, OMJLIR.Model}
-  local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(fm; functionList)
-  return reduced === nothing ? nothing : scalarizedReducedModel(fm, reduced)
-end
-
-"""
-    reducedArrayModel(fm; functionList = nothing) -> Union{Nothing, OMJLIR.Model}
-
-A flat model with arrays kept lowered with its arrays, through the passes (`runPassesKeepingArrays!`:
-its array equations as for-equations), its index reduced in array form where above one, its states
-committed in array form (`Passes.IndexReduction.reduceIndexArrays!`; a model without arrays to keep of
-index 1 the same, `commitIndexOne!`, for the array code only): what the array code
-(`generateReducedArrayODETargetCode`) or the scalarized form (`scalarizedReducedModel`) is made from.
-`nothing` where the array form does not take the model (switched off, no arrays to keep and of index
-above one, of index 1 with clocked partitions, of index above one with an if-expression that reads a
-for-equation's iterator, what it does not handle or the lowering does not support: logged; another
-error: a warning), the reason recorded (`declineArrayPath!`).
-"""
-function reducedArrayModel(fm::OMFrontend.Frontend.FlatModel;
-                           functionList::Union{Nothing, FunctionList} = nothing)::Union{Nothing, OMJLIR.Model}
-  delete!(ARRAY_REDUCED_MODELS, canonicalName(fm.name))
-  local decline::Function = (reason::String) -> declineArrayPath!(canonicalName(fm.name), "array index reduction", reason)
+function reducedArrayModel(lower::Function, name::String)::Union{Nothing, OMJLIR.Model}
+  delete!(ARRAY_REDUCED_MODELS, name)
+  local decline::Function = (reason::String) -> declineArrayPath!(name, "array index reduction", reason)
   if !(envSwitch("OMBACKEND_ARRAY_INDEX_REDUCTION") && envSwitch("OMBACKEND_INDEX_REDUCTION"))
     decline("switched off (OMBACKEND_ARRAY_INDEX_REDUCTION, OMBACKEND_INDEX_REDUCTION)")
     return nothing
   end
   local reduction::Module = Passes.IndexReduction
-  return _arrayReductionStep(fm, decline) do
-    local lowered::OMJLIR.Model = LowerFlatModel.lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
+  return _arrayReductionStep(name, decline) do
+    local lowered::OMJLIR.Model = lower()
     #= arrays to keep: for-equations or array equations over continuous arrays, or separately declared components
        rolled into arrays (OMBACKEND_ROLL_COMPONENTS) =#
     local roll::Bool = envSwitch("OMBACKEND_ROLL_COMPONENTS") && !isempty(reduction.componentGroups(lowered.variables))
@@ -646,7 +528,7 @@ function reducedArrayModel(fm::OMFrontend.Frontend.FlatModel;
 end
 
 """
-    scalarizedReducedModel(fm, reduced) -> Union{Nothing, OMJLIR.Model}
+    scalarizedReducedModel(name, reduced) -> Union{Nothing, OMJLIR.Model}
 
 The model reduced in array form (`reducedArrayModel`; not changed) scalarized for the scalar
 simulation code (`scalarizeArrays`), its derivative unknowns solved for (`solveDerivatives!`,
@@ -654,11 +536,11 @@ OMBACKEND_SOLVE_DERIVATIVES); recorded in ARRAY_REDUCED_MODELS. `nothing` where 
 reason recorded as `reducedArrayModel`'s), and for a model of index 1 (its states committed for the array code only):
 the frontend scalarizes it as before.
 """
-function scalarizedReducedModel(fm::OMFrontend.Frontend.FlatModel, reduced::OMJLIR.Model)::Union{Nothing, OMJLIR.Model}
-  local decline::Function = (reason::String) -> declineArrayPath!(canonicalName(fm.name), "array index reduction", reason)
+function scalarizedReducedModel(name::String, reduced::OMJLIR.Model)::Union{Nothing, OMJLIR.Model}
+  local decline::Function = (reason::String) -> declineArrayPath!(name, "array index reduction", reason)
   local reduction::Module = Passes.IndexReduction
   reduction.indexReduced(reduced) || return nothing
-  local scalar::Union{Nothing, OMJLIR.Model} = _arrayReductionStep(fm, decline) do
+  local scalar::Union{Nothing, OMJLIR.Model} = _arrayReductionStep(name, decline) do
     local s::OMJLIR.Model = reduction.scalarizeArrays(reduced).model
     #= the parameter references as the scalar pipeline resolves them (the arrays-kept passes keep them for the array
        code, whose parameters can all be overridden) =#
@@ -666,26 +548,26 @@ function scalarizedReducedModel(fm::OMFrontend.Frontend.FlatModel, reduced::OMJL
     envSwitch("OMBACKEND_SOLVE_DERIVATIVES") && reduction.solveDerivatives!(s, s.continuous[1])
     s
   end
-  scalar === nothing || push!(ARRAY_REDUCED_MODELS, canonicalName(fm.name))
+  scalar === nothing || push!(ARRAY_REDUCED_MODELS, name)
   return scalar
 end
 
 """
-`f()`, a step of the array index reduction of `fm`: a model it does not handle (NotHandled, UnsupportedLowering)
+`f()`, a step of the array index reduction of the model `name` (canonical): a model it does not handle (NotHandled, UnsupportedLowering)
 logged and declined (`decline`), another error (the optional route fails where it should refuse) a warning and
 declined; `nothing` then.
 """
-function _arrayReductionStep(f::Function, fm::OMFrontend.Frontend.FlatModel, decline::Function)::Union{Nothing, OMJLIR.Model}
+function _arrayReductionStep(f::Function, name::String, decline::Function)::Union{Nothing, OMJLIR.Model}
   local reduction::Module = Passes.IndexReduction
   try
     return f()
   catch err
     isFatal(err) && rethrow()
     if err isa Union{reduction.NotHandled, UnsupportedLowering}
-      @info "[index reduction] $(canonicalName(fm.name)): arrays kept, $(sprint(showerror, err)); scalarized in the frontend"
+      @info "[index reduction] $(name): arrays kept, $(sprint(showerror, err)); scalarized in the frontend"
       decline(sprint(showerror, err))
     else
-      @warn "[index reduction] $(canonicalName(fm.name)): arrays kept, an error ($(sprint(showerror, err))); scalarized in the frontend"
+      @warn "[index reduction] $(name): arrays kept, an error ($(sprint(showerror, err))); scalarized in the frontend"
       decline("an error: $(sprint(showerror, err))")
     end
     return nothing
@@ -693,9 +575,9 @@ function _arrayReductionStep(f::Function, fm::OMFrontend.Frontend.FlatModel, dec
 end
 
 """
-    generateReducedArrayODETargetCode(fm, reduced) -> Union{Nothing, Tuple{String, Expr}}
+    generateReducedArrayODETargetCode(name, reduced) -> Union{Nothing, Tuple{String, Expr}}
 
-The array ODE module of a flat model whose index was reduced in array form (`reduced`,
+The array ODE module of the model `name` (canonical) whose index was reduced in array form (`reduced`,
 `reducedArrayModel`; not changed): its derivative unknowns solved in array form
 (`Passes.IndexReduction.solvedInArrays`), in the array code's form (`Passes.arrayCodeForm!`), lowered into its
 simulation code (`SimCode.lowerArraySystem`), from which ArrayODEGen generates it; cached as a DE-mode
@@ -704,8 +586,7 @@ model (`_registerArrayODEModule!`), recorded in ARRAY_ODE_MODELS and ARRAY_REDUC
 an algebraic loop left, ...): the reason logged and recorded (`declineArrayPath!`, "array code after
 index reduction"), and the caller scalarizes the reduced model.
 """
-function generateReducedArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel, reduced::OMJLIR.Model)::Union{Nothing, Tuple{String, Expr}}
-  local name::String = canonicalName(fm.name)
+function generateReducedArrayODETargetCode(name::String, reduced::OMJLIR.Model)::Union{Nothing, Tuple{String, Expr}}
   local decline::Function = (reason::String) -> begin
     @info "[backendAPI] array code after index reduction not taken for $(name): $(reason)"
     declineArrayPath!(name, "array code after index reduction", reason)
@@ -738,53 +619,6 @@ function generateReducedArrayODETargetCode(fm::OMFrontend.Frontend.FlatModel, re
   return (name, modelCode)
 end
 
-"""
-    translateReducedArrays(fm; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic,
-                           observedFilter, checkSimCode) -> Union{Nothing, Tuple}
-
-`translate` of a flat model with arrays kept whose index OMBackend reduces in array form
-(`arrayReducedModel`); `nothing` where it does not (OM's translate then flattens with
-scalarization).
-"""
-function translateReducedArrays(fm::OMFrontend.Frontend.FlatModel;
-                                functionList::Union{Nothing, FunctionList} = nothing,
-                                BackendMode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
-                                warnMissingStartValues::Union{Nothing, Bool} = nothing,
-                                eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
-                                observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                                checkSimCode::Bool = true)
-  delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
-  delete!(ARRAY_PATH_REASONS, canonicalName(fm.name))
-  local reduced::Union{Nothing, OMJLIR.Model} = @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
-  reduced === nothing && return nothing
-  local arrayCode::Union{Nothing, Tuple{String, Expr}} =
-    @BACKEND_PERFLOG "[backendAPI] generateReducedArrayODECode" generateReducedArrayODETargetCode(fm, reduced)
-  arrayCode === nothing || return arrayCode
-  local model::Union{Nothing, OMJLIR.Model} = scalarizedReducedModel(fm, reduced)
-  model === nothing && return nothing
-  local name = canonicalName(fm.name)
-  #= The array form only where it translates and builds; otherwise its build is forgotten and OM's translate
-     scalarizes as before. Coverage 21 (the array form's first): a lifted if-expression left a for-equation's
-     iterator free (UndefVarError), a build failed (BoundsError) and the tables it had allocated were freed
-     under the problem that read them (Rotational Friction, CoupledClutches, Translational Brake). =#
-  local decline = (reason::String) -> begin
-    @info "[index reduction] $(name): arrays kept, the reduced model $(reason); scalarized in the frontend"
-    declineArrayPath!(name, "array index reduction", "the reduced model " * reason)
-    IMTKGen.forgetBuild(name)
-    delete!(COMPILED_MODELS_MTK, name)
-    delete!(ARRAY_REDUCED_MODELS, name)
-    nothing
-  end
-  local result = try
-    translate(fm; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic, observedFilter, checkSimCode,
-              omjlir = model)
-  catch err
-    isFatal(err) && rethrow()
-    return decline("does not translate ($(first(sprint(showerror, err), 200)))")
-  end
-  (BackendMode == IMTK_MODE && !haskey(IMTKGen.BUILT, name)) && return decline("does not build")
-  return result
-end
 
 """
     mtkSimCode(model; eliminateNonDynamic = nothing, observedFilter = nothing) -> SimCode.SIM_CODE

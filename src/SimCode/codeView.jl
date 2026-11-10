@@ -35,7 +35,7 @@
 
 #= The simulation code as the code generators see it: every key, reference and name renamed to its identifier
    in the generated code (`ReferenceIndex.codeNames`), derived from the references once at lowering. The passes key
-   the simulation code by the references' flat names; the generated code, OM.jl's results and the runtime know
+   the simulation code by the references' flat names; the generated code, OMJL's results and the runtime know
    the variables by these identifiers (`a_b[1][2]`, `der(x)`). =#
 
 """

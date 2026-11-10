@@ -72,7 +72,7 @@ On function-eval failure, the offending generated source is dumped to
 `/tmp/om_bad_function.jl` and the error rethrown.
 """
 function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr}, simCode::SC.SIM_CODE)
-  #= Under another package's precompile (OM.jl's workload), eval'ing the model's generated Modelica
+  #= Under another package's precompile (OMJL's workload), eval'ing the model's generated Modelica
      functions into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
      compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
      has already run (so its method instances are warmed for the bake), and a real runtime
@@ -396,6 +396,43 @@ emitStructuralTransitionProblem() = quote
 end
 
 """
+    compositeProblemConstruction(defaultMode::Bool) -> Expr
+
+The composite model's problem (`compositeProblem`) in a VSS model's function, from the initial mode's (`subModel`,
+built from `reducedSystem` with `finalInitialValues`, `initialValues` and `pars`) with the structural callbacks
+(`callbackSet`) after its own. A model without explicit modes (`defaultMode`, a recompilation's) has the model itself
+as its mode, built as the composite is (`emitStructuralTransitionProblem`): the mode's problem remade with the
+callbacks, not built a second time. Explicit modes are built as models of their own (their initialization solved:
+`emitInitSolveDAEProblem`): the composite is built from the mode's system as `emitStructuralTransitionProblem` builds
+it.
+"""
+function compositeProblemConstruction(defaultMode::Bool)::Expr
+  defaultMode && return quote
+    compositeProblem = ModelingToolkit.SciMLBase.remake(subModel;
+      callback = OMBackend.CodeGeneration._joinCallbacks(get(subModel.kwargs, :callback, nothing), callbackSet...),
+      lazy_initialization = true)
+  end
+  #= Dispatch on the mass matrix of the initial submodel exactly like the submodel builder does: pure ODE takes the
+     fast fill-all-u0 / skip-initializer path; DAE routes finalInitialValues as hard u0 while letting the initializer
+     use reducedSystem.guesses (already populated by splitInitialValues) to solve algebraic residuals such as
+     x = L*sin(phi) for the Pendulum. Injecting _compositeGuesses as hard u0 for a DAE submodel would pin phi = 0 and
+     silently violate the constraint. =#
+  return quote
+    local _compositeIsPureODE = Base.invokelatest(OMBackend.CodeGeneration.isPureODESystem, reducedSystem)
+    if _compositeIsPureODE
+      local _compositeGuesses = Base.invokelatest(
+        OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
+      compositeProblem = ModelingToolkit.ODEProblem(reducedSystem, merge(Dict(finalInitialValues), _compositeGuesses, pars),
+                                                    tspan; callback = callbackConditions,
+                                                    warn_initialize_determined = false, build_initializeprob = false)
+    else
+      compositeProblem = ModelingToolkit.ODEProblem(reducedSystem, merge(Dict(finalInitialValues), pars), tspan;
+                                                    callback = callbackConditions, warn_initialize_determined = false)
+    end
+  end
+end
+
+"""
     emitInitSolveDAEProblem()
 
 Strategy 3: standard DAE-with-init-solver. Force MTK to build the
@@ -547,11 +584,11 @@ end
 The DAE initialization of a solve when the caller chose none, as the event
 re-solve's stages and acceptance (`StartReinit`). Table-cluster models: Newton with
 finite differences (`tableClusterInitAlg`). Otherwise, for
-a problem without an initialization problem (OM.jl solves the initial values
+a problem without an initialization problem (OMJL solves the initial values
 itself): BrownFullBasicInit at the solve's abstol, which OrdinaryDiffEq used by
 default before OrdinaryDiffEqCore 4 (alone it held the raw residual to the abstol: MSL
 TanksWithEmptyingPipe2). The default since then only checks u0, and fails where
-OM.jl's initial values leave a residual in an algebraic equation (the PID models of
+OMJL's initial values leave a residual in an algebraic equation (the PID models of
 PIDDecomposition.mo). It is also the re-solve at the events of a callback without
 its own (`_mergeableReinit`).
 """
@@ -772,36 +809,7 @@ function ODE_MODE_MTK(simCode::SC.SIM_CODE)
       #= END =#
       # Also need to have the original callbacks
       callbackConditions = OMBackend.CodeGeneration._joinCallbacks(callbacks, callbackSet...)
-      #= Create the composite model. Dispatch on the mass matrix of the initial
-         submodel exactly like the submodel builder does: pure ODE takes the
-         fast fill-all-u0 / skip-initializer path; DAE routes finalInitialValues
-         as hard u0 while letting the initializer use reducedSystem.guesses
-         (already populated by splitInitialValues) to solve algebraic residuals
-         such as x = L*sin(phi) for the Pendulum. Injecting _compositeGuesses
-         as hard u0 for a DAE submodel would pin phi = 0 and silently violate
-         the constraint. =#
-      local _compositeIsPureODE = Base.invokelatest(
-        OMBackend.CodeGeneration.isPureODESystem, reducedSystem)
-      if _compositeIsPureODE
-        local _compositeGuesses = Base.invokelatest(
-          OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
-        compositeProblem = ModelingToolkit.ODEProblem(
-          reducedSystem,
-          merge(Dict(finalInitialValues), _compositeGuesses, pars),
-          tspan;
-          callback = callbackConditions,
-          warn_initialize_determined = false,
-          build_initializeprob = false,
-        )
-      else
-        compositeProblem = ModelingToolkit.ODEProblem(
-          reducedSystem,
-          merge(Dict(finalInitialValues), pars),
-          tspan;
-          callback = callbackConditions,
-          warn_initialize_determined = false,
-        )
-      end
+      $(compositeProblemConstruction(isempty(simCode.subModels)))
       #=
       Note the difference between the two here.
       In the case of recompilation we will get fresh callbacks updated to the new structure of the final code.
@@ -846,7 +854,6 @@ function _modeModuleImports()::Expr
   return quote
     import DataStructures.OrderedCollections
     using DataStructures.OrderedCollections: OrderedSet, OrderedDict
-    import SCode
     import OMBackend
     import OMBackend.CodeGeneration
     import Setfield

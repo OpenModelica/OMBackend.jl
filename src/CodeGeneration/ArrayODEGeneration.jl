@@ -1538,7 +1538,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
 
     const ASSERTS = $(assertTexts)
     #= A model function with an assert: the equations are evaluated after each step as for
-       the model's asserts (a call only an algebraic variable reads was never made: OM.jl's
+       the model's asserts (a call only an algebraic variable reads was never made: OMJL's
        AssertTests.ConstantCall, positiveTwice(-1.0)). =#
     const FUNCTION_ASSERTS = $(_containsErrorCall(functionDefs))
 

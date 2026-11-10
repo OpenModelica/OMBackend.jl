@@ -33,11 +33,13 @@
 *
 */ =#
 
-#= The package image's workloads: OM.jl's translate and simulate over small models of every route
-   (`_precompileWarmupTranslate`), the DirectRHS solve of a pure ODE (`_precompileWarmupDirectRHS`),
-   and the MTK System-form solve of the structural (VSS) paths (`_precompileWarmup`). Type erasure (the right-hand side and Jacobian behind FunctionWrappers, the
-   callback sets as vectors: `_eraseCallbackSet`) makes the problems of every model of a route one
-   type, so the solves compiled here are the ones a session's models run; a process's first model
+#= The package image's workloads: the DirectRHS solve of a pure ODE (`_precompileWarmupDirectRHS`), the MTK
+   System-form solve of the structural (VSS) paths (`_precompileWarmup`), and small OMJLIR models translated, built and
+   simulated by the array code and by MTK (`_precompileWarmupIR`): OMBackend is open here, so the builds evaluate into it.
+   OMJL's translate over larger models of every route is the OMFrontend extension's (OMBackendOMFrontendExt, its
+   precompile.jl; OMBackend is closed there, its models are translated only). Type erasure (the right-hand side
+   and Jacobian behind FunctionWrappers, the callback sets as vectors: `_eraseCallbackSet`) makes the problems of every
+   model of a route one type, so the solves compiled here are the ones a session's models run; a process's first model
    compiles its own generated code. =#
 using PrecompileTools: @setup_workload, @compile_workload
 
@@ -122,56 +124,12 @@ function _precompileSolveAsModels(prob::ModelingToolkit.SciMLBase.AbstractODEPro
   return nothing
 end
 
-const ARRAYS_KEPT_WORKLOAD = joinpath(@__DIR__, "Precompile", "ArraysKept.mo")
-include_dependency(ARRAYS_KEPT_WORKLOAD)
-const TRANSLATE_WORKLOAD = joinpath(@__DIR__, "Precompile", "Translate.mo")
-include_dependency(TRANSLATE_WORKLOAD)
-
-"""
-    _precompileTranslateAndSimulate(scode, name::String, arrayCode::Bool) -> Nothing
-
-The model `name` of `scode` translated and simulated as OM.jl's `translate` and `simulate` do
-(`_precompileTranslate`); the build (the model's module evaluated into OMBackend, open while its own image is
-generated: `evaluationRejected`) and `simulateModel` with OM.jl's keyword arguments, so that the keyword calls compile
-for a session's argument types. `simulate` translates again (the cached build reused). Simulated with the default
-solver and with the DAE fallback (`defaultSolverFor`'s choice for a purely algebraic system or discrete algebraic
-rows), so that both solvers' integrators over the erased problem types compile into the image. `arrayCode`: whether
-the model takes the array code (an error otherwise: the workload would compile less than it says).
-"""
-function _precompileTranslateAndSimulate(scode::OMFrontend.SCode.Program, name::String, arrayCode::Bool)::Nothing
-  local mode::BackendMode = DEFAULT_BACKEND_MODE[]
-  _precompileTranslate(scode, name, mode)
-  (canonicalName(name) in ARRAY_ODE_MODELS) == arrayCode ||
-    error("$(name): $(arrayCode ? "no array code" : "array code") ($(get(ARRAY_PATH_REASONS, canonicalName(name), "-")))")
-  _precompileTranslate(scode, name, mode)
-  for solver in (defaultSolver(), daeFallbackSolver())
-    simulateModel(name; MODE = mode, tspan = (0.0, 1.0), solver = solver, overwriteCache = false)
-  end
-  return nothing
-end
-
-"""
-OM.jl's `translate` of the model `name` of `scode`: the frontend's flatten with the arrays kept and
-`translateReducedArrays` (the array code, else the scalarized reduced model), else the scalarizing flatten and
-`translate`.
-"""
-function _precompileTranslate(scode::OMFrontend.SCode.Program, name::String, mode::BackendMode)::Union{Nothing, Tuple{String, Expr}}
-  local (fm::OMFrontend.Frontend.FlatModel, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = false)
-  local reduced::Union{Nothing, Tuple{String, Expr}} =
-    translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache), BackendMode = mode,
-                           warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing,
-                           checkSimCode = true)
-  reduced === nothing || return reduced
-  (fm, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = true)
-  return translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), BackendMode = mode,
-                   warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing,
-                   checkSimCode = true, scalarized = true)
-end
-
 """
 The registries of OMBackend's modules (their mutable Dict and Set constants and their Refs), with copies of their
-contents: the translate workload restores them (`_restoreRegistries!`), so that its models' builds, generated code,
-function implementations and run directories are not kept in the image (its models' modules are).
+contents: the workloads restore them (`_restoreRegistries!`), so that their models' builds, generated code, function
+implementations, run directories and array-code records are not kept in the image (their models' modules are). Base's
+`Set` is an immutable struct over a mutable Dict: a registry, though `ismutable` is false (ARRAY_ODE_MODELS and
+ARRAY_REDUCED_MODELS kept the workload's models before, 2026-11-09).
 """
 function _registries(mod::Module = @__MODULE__, found::Vector{Pair{Any, Any}} = Pair{Any, Any}[])::Vector{Pair{Any, Any}}
   for name in names(mod; all = true)
@@ -179,7 +137,7 @@ function _registries(mod::Module = @__MODULE__, found::Vector{Pair{Any, Any}} = 
     local value::Any = getglobal(mod, name)
     if value isa Module
       (value !== mod && parentmodule(value) === mod) && _registries(value, found)
-    elseif value isa Union{AbstractDict, AbstractSet} && ismutable(value)
+    elseif value isa Set || (value isa Union{AbstractDict, AbstractSet} && ismutable(value))
       push!(found, value => copy(value))
     elseif value isa Base.RefValue && isassigned(value)
       push!(found, value => value[])
@@ -204,27 +162,101 @@ function _restoreRegistries!(registries::Vector{Pair{Any, Any}})::Nothing
   return nothing
 end
 
+"A Real variable's reference."
+_irReal(name::Symbol)::OMJLIR.CREF = OMJLIR.CREF(OMJLIR.ComponentRef(name), OMJLIR.T_REAL())
+
+"A call of a built-in of a Real result (`der`, `pre`)."
+_irBuiltin(f::Symbol, argument::OMJLIR.Expression)::OMJLIR.CALL =
+  OMJLIR.CALL(f, OMJLIR.Expression[argument], OMJLIR.T_REAL(), OMJLIR.BUILTIN_CALL)
+
+"A binary operation of Real operands."
+_irBinary(a::OMJLIR.Expression, op::OMJLIR.Op, b::OMJLIR.Expression)::OMJLIR.BINARY = OMJLIR.BINARY(a, op, b, OMJLIR.T_REAL())
+
+"A Real variable of kind `kind`, with a binding, or a start value fixed."
+function _irVariable(name::Symbol, kind::OMJLIR.VariableKind; binding::Union{Nothing, Float64} = nothing,
+                     start::Union{Nothing, Float64} = nothing)::OMJLIR.Variable
+  local attributes::OMJLIR.VariableAttributes = start === nothing ? OMJLIR.NO_ATTRIBUTES :
+    OMJLIR.VariableAttributes(OMJLIR.REAL(start), OMJLIR.BOOLEAN(true), nothing, nothing, nothing, nothing, nothing,
+                              nothing, nothing)
+  return OMJLIR.Variable(OMJLIR.ComponentRef(name), OMJLIR.T_REAL(), kind, binding === nothing ? nothing : OMJLIR.REAL(binding),
+                         attributes, OMJLIR.NO_DIRECTION, false, OMJLIR.NOT_CONNECTOR, OMJLIR.NO_SOURCE, :model)
+end
+
+"An equation `lhs = rhs` of Reals."
+_irEquation(lhs::OMJLIR.Expression, rhs::OMJLIR.Expression)::OMJLIR.SCALAR_EQUATION =
+  OMJLIR.SCALAR_EQUATION(lhs, rhs, OMJLIR.T_REAL(), OMJLIR.NO_SOURCE, OMJLIR.DEFAULT_ATTRIBUTES)
+
+"A model of one continuous-time partition, as a frontend's lowering gives it (before the passes)."
+_irModel(name::String, variables::Vector{OMJLIR.Variable}, equations::Vector{OMJLIR.Equation})::OMJLIR.Model =
+  OMJLIR.Model(name, OMJLIR.VariableSet(variables),
+               OMJLIR.Partition[OMJLIR.Partition(1, OMJLIR.CONTINUOUS_PARTITION(), Symbol[], equations, OMJLIR.Equation[])],
+               OMJLIR.Partition[], OMJLIR.ClockKind[], OMJLIR.ModelicaFunction[], nothing, OMJLIR.StructuralMode[],
+               OMJLIR.StructuralTransition[], nothing)
+
 """
-The translate and simulate of OM.jl (`_precompileTranslateAndSimulate`) over the workload's models, so that their code
-compiles into the package image, not at each process's first model: `Precompile/Translate.mo`'s models of the
-scalarized paths (Drive, Pendulum: the scalarizing flatten; Rectifier: the reduced model scalarized; Thermostat: the
-array code with events) and `Precompile/ArraysKept.mo`'s of the array code (`Chain`: MultiBody's frames through
-functions, slicing; `Volumes`: a semiLinear chain, a free parameter, a when-equation; `LoopEvents`: a torn loop, events,
-an assert). A fresh process's first translate compiled 3-18 s of OMBackend's, MTK's and Symbolics' code before (MSL
-4.1.0 Rotational First 12.9 s, MultiBody DoublePendulum 17.9 s; EngineV6 2371 methods for reducedArrayModel); the
-registries are restored afterwards (`_registries`).
+`model Decay parameter Real a = 1; Real x(start = 1, fixed = true); Real y; equation der(x) = -a * x; y = 2 * x;
+end Decay;` in OMJLIR, named `name`.
 """
-function _precompileWarmupTranslate()::Nothing
+_irDecay(name::String)::OMJLIR.Model =
+  _irModel(name, OMJLIR.Variable[_irVariable(:a, OMJLIR.PARAMETER(); binding = 1.0),
+                                 _irVariable(:x, OMJLIR.ALGEBRAIC(); start = 1.0), _irVariable(:y, OMJLIR.ALGEBRAIC())],
+           OMJLIR.Equation[_irEquation(_irBuiltin(:der, _irReal(:x)),
+                                       OMJLIR.UNARY(OMJLIR.UMINUS, _irBinary(_irReal(:a), OMJLIR.MUL, _irReal(:x)), OMJLIR.T_REAL())),
+                           _irEquation(_irReal(:y), _irBinary(OMJLIR.REAL(2.0), OMJLIR.MUL, _irReal(:x)))])
+
+"""
+`model Counter Real x(start = 1, fixed = true); discrete Real n(start = 0, fixed = true); equation der(x) = -x;
+when x < 0.5 then n = pre(n) + 1; end when; end Counter;` in OMJLIR, named `name`: an event.
+"""
+function _irCounter(name::String)::OMJLIR.Model
+  local body::Vector{OMJLIR.Statement} =
+    OMJLIR.Statement[OMJLIR.ASSIGNMENT(_irReal(:n), _irBinary(_irBuiltin(:pre, _irReal(:n)), OMJLIR.ADD, OMJLIR.REAL(1.0)),
+                                       OMJLIR.NO_SOURCE)]
+  local condition::OMJLIR.Expression = OMJLIR.RELATION(_irReal(:x), OMJLIR.LESS, OMJLIR.REAL(0.5), 0)
+  local when::OMJLIR.WHEN_EQUATION =
+    OMJLIR.WHEN_EQUATION(OMJLIR.WhenBranch[LowerUtil.whenBranch(condition, body)], OMJLIR.REGULAR_WHEN, OMJLIR.NO_SOURCE,
+                         OMJLIR.DEFAULT_ATTRIBUTES)
+  return _irModel(name, OMJLIR.Variable[_irVariable(:x, OMJLIR.ALGEBRAIC(); start = 1.0),
+                                        _irVariable(:n, OMJLIR.DISCRETE(); start = 0.0)],
+                  OMJLIR.Equation[_irEquation(_irBuiltin(:der, _irReal(:x)), OMJLIR.UNARY(OMJLIR.UMINUS, _irReal(:x), OMJLIR.T_REAL())),
+                                  when])
+end
+
+"""
+    _precompileIRModel(model::Function, name::String, arrayCode::Bool) -> Nothing
+
+The OMJLIR model `model(name)` translated as OMJL's `translate` does after a frontend's lowering, by the array code
+(`reducedArrayModel`, `generateReducedArrayODETargetCode`; `arrayCode`) or through the passes and `translate`, then
+built and simulated as OMJL's `simulate` does, with the default solver and with the DAE fallback: the build and the
+solves of both routes compile into OMBackend's image without a frontend.
+"""
+function _precompileIRModel(model::Function, name::String, arrayCode::Bool)::Nothing
+  local mode::BackendMode = DEFAULT_BACKEND_MODE[]
+  if arrayCode
+    local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(() -> model(name), name)
+    (reduced !== nothing && generateReducedArrayODETargetCode(name, reduced) !== nothing) ||
+      error("$(name): no array code ($(get(ARRAY_PATH_REASONS, name, "-")))")
+  else
+    translate(Passes.runPasses!(model(name)); BackendMode = mode, warnMissingStartValues = nothing,
+              eliminateNonDynamic = true, observedFilter = nothing, checkSimCode = true)
+  end
+  for solver in (defaultSolver(), daeFallbackSolver())
+    simulateModel(name; MODE = mode, tspan = (0.0, 1.0), solver = solver, overwriteCache = false)
+  end
+  return nothing
+end
+
+"""
+The OMJLIR workload (`_precompileIRModel`): Decay and Counter by the array code and by the passes and `translate`, the
+registries restored afterwards (`_registries`). A frontend's translate workload adds the lowering and the passes of
+larger models (OMBackendOMFrontendExt); the build and the solve compile here, where OMBackend is open.
+"""
+function _precompileWarmupIR()::Nothing
   local registries::Vector{Pair{Any, Any}} = _registries()
   try
-    for (file, package, models) in ((TRANSLATE_WORKLOAD, "OMBackendTranslateWorkload",
-                                     ("Drive" => false, "Thermostat" => true, "Rectifier" => false, "Pendulum" => false)),
-                                    (ARRAYS_KEPT_WORKLOAD, "OMBackendWorkload",
-                                     ("Chain" => true, "Volumes" => true, "LoopEvents" => true)))
-      local scode::OMFrontend.SCode.Program = OMFrontend.translateToSCode(OMFrontend.parseFile(file))
-      for (model, arrayCode) in models
-        _precompileTranslateAndSimulate(scode, package * "." * model, arrayCode)
-      end
+    for (model, name) in ((_irDecay, "OMBackendIRWorkloadDecay"), (_irCounter, "OMBackendIRWorkloadCounter"))
+      _precompileIRModel(model, name * "Arrays", true)
+      _precompileIRModel(model, name, false)
     end
   finally
     _restoreRegistries!(registries)
@@ -251,9 +283,9 @@ end
         end
       end
       try
-        Base.CoreLogging.with_logger(_precompileWarmupTranslate, Base.CoreLogging.NullLogger())
+        Base.CoreLogging.with_logger(_precompileWarmupIR, Base.CoreLogging.NullLogger())
       catch err
-        @warn "[OMBackend] translate precompile warmup skipped" exception = (err, catch_backtrace())
+        @warn "[OMBackend] OMJLIR precompile warmup skipped" exception = (err, catch_backtrace())
       end
     end
   end

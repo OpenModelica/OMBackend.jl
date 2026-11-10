@@ -3,11 +3,18 @@
 # About OMBackend.jl
 
 OMBackend.jl is one component of OMJL, the Modelica compiler infrastructure
-for Julia. It lowers the flat model produced by OMFrontend.jl to its own
-intermediate representation, OMJLIR (`src/IR`), runs its passes there
-(`src/Backend/Passes`), generates the simulation code (`src/SimCode`) and from
-it a system that can be simulated with DifferentialEquations.jl and
-ModelingToolkit.jl (`src/CodeGeneration`).
+for Julia. It takes a model in its own intermediate representation, OMJLIR
+(`src/IR`), runs its passes there (`src/Backend/Passes`), generates the
+simulation code (`src/SimCode`) and from it a system that can be simulated with
+DifferentialEquations.jl and ModelingToolkit.jl (`src/CodeGeneration`).
+
+The flat model of OMFrontend.jl is lowered to OMJLIR by the package extension
+`OMBackendOMFrontendExt` (`ext/OMBackendOMFrontendExt`), which Julia loads when
+OMFrontend is loaded: the lowering, `translate(fm)` and the other entry points
+on the frontend's flat model, the frontend's part of a recompilation at a
+structural change, and the translate precompile workload. omc's flat model goes
+through `OMBackendOMCompilerExt` (with OMCompiler.jl). Without either,
+`OMBackend.translate` takes an `OMJLIR.Model`.
 
 # Requirements
 
@@ -28,33 +35,30 @@ relevant ones are:
 
 The OMJL ecosystem packages are developed from sibling checkouts next to
 `OMBackend.jl`, as the CI does (`Pkg.develop` of each, `.github/workflows/CI.yml`).
-OMBackend uses Absyn, MetaModelica, OMFrontend, OMRuntimeExternalC and SCode;
-DAE, ImmutableList, ListUtil and OMParser are OMFrontend's:
+OMBackend depends on OMRuntimeExternalC; OMFrontend (with its `SCode` module), OMParser (its `Absyn` module)
+and MetaModelica are weak dependencies, the triggers of `OMBackendOMFrontendExt`, and the tests use OMFrontend;
+ArrayUtil, ImmutableList and ListUtil are OMFrontend's:
 
-* Absyn.jl
-* DAE.jl
+* ArrayUtil.jl
 * ImmutableList.jl
 * ListUtil.jl
 * MetaModelica.jl
 * OMFrontend.jl
 * OMParser.jl
 * OMRuntimeExternalC.jl
-* SCode.jl
 
 Layout:
 
 ```
 OMJL-workspace/
-├── Absyn.jl/
-├── DAE.jl/
+├── ArrayUtil.jl/
 ├── ImmutableList.jl/
 ├── ListUtil.jl/
 ├── MetaModelica.jl/
 ├── OMBackend.jl/        <-- this repository
 ├── OMFrontend.jl/
 ├── OMParser.jl/
-├── OMRuntimeExternalC.jl/
-└── SCode.jl/
+└── OMRuntimeExternalC.jl/
 ```
 
 `OMRuntimeExternalC.jl` is not in the General registry. The others are served
@@ -71,19 +75,16 @@ julia> Pkg.Registry.add("General")
 julia> Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
 ```
 
-From the `OMBackend.jl` directory, activate the project, develop the sibling
-checkouts and build:
+From the `OMBackend.jl` directory, activate the project and develop the sibling
+checkouts (nothing is built: the parser is written in Julia):
 
 ```julia
 julia> import Pkg
 julia> Pkg.activate(".")
 julia> Pkg.develop([Pkg.PackageSpec(path = joinpath("..", p)) for p in
-                    ("Absyn.jl", "DAE.jl", "ImmutableList.jl", "ListUtil.jl", "MetaModelica.jl",
-                     "OMFrontend.jl", "OMParser.jl", "OMRuntimeExternalC.jl", "SCode.jl")])
-julia> Pkg.build(verbose = true)
+                    ("ArrayUtil.jl", "ImmutableList.jl", "ListUtil.jl", "MetaModelica.jl",
+                     "OMFrontend.jl", "OMParser.jl", "OMRuntimeExternalC.jl")])
 ```
-
-`deps/build.jl` builds OMFrontend, and with it OMParser's parser library.
 
 Then load the package:
 
@@ -109,8 +110,9 @@ julia> include("test/runtests.jl")
 
 # Example use
 
-Given a Modelica model flattened by OMFrontend.jl, pass the flat model and its
-functions to `OMBackend.translate` and then simulate (`examples/` has more).
+Given a Modelica model flattened by OMFrontend.jl (loading OMFrontend loads the
+extension), pass the flat model and its functions to `OMBackend.translate` and
+then simulate (`examples/` has more).
 
 ```modelica
 model BouncingBallReals

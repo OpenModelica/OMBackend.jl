@@ -11,7 +11,7 @@ import OMFrontend
 @testset "Known values of a tuple output" begin
   local file = joinpath(@__DIR__, "Models", "TupleKnownValues.mo")
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("TupleKnownValues.Clamp", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
-  local lowered = OMBackend.LowerFlatModel.lowerFlatModel(fm; functions = OMFrontend.cacheToFunctionList(cache))
+  local lowered = OMBackend.lowerFlatModel(fm; functions = OMFrontend.cacheToFunctionList(cache))
   local model = OMBackend.Passes.runPasses!(lowered; through = "unrollConstantReductions")
   local partition = model.continuous[1]
   local known = OMBackend.knownValues(model)

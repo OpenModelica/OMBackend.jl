@@ -39,7 +39,7 @@
   hand-built OMJLIR and SimCode values.
 
   For full integration tests (frontend + backend + simulation), see
-  the top-level OM.jl test suite at /test/runtests.jl.
+  the top-level OMJL test suite at /test/runtests.jl.
 =#
 
 # On Windows, a failed DLL load or a segfault in external Modelica C functions
@@ -132,21 +132,21 @@ import .ExampleModels
         ENV["OMJL_LOG_DIR"] = $(repr(tmp))
         cd($(repr(repoRoot)))
         include("src/OMBackend.jl")
-        include("examples/ExampleModels.jl")
-        using .ExampleModels
         println("same_module=", OMBackend === OMBackend.CodeGeneration.OMBackend)
-        (fm, functions) = ExampleModels.flatModel("HelloWorld")
-        OMBackend.translate(fm; functionList = functions, BackendMode = OMBackend.MTK_MODE)
+        model() = OMBackend.Passes.runPasses!(OMBackend._irDecay("Examples.HelloWorld"))
+        OMBackend.translate(model(); BackendMode = OMBackend.MTK_MODE)
         sleep(1)
-        OMBackend.translate(fm; functionList = functions, BackendMode = OMBackend.MTK_MODE)
+        OMBackend.translate(model(); BackendMode = OMBackend.MTK_MODE)
         runDirs = sort(filter(name -> startswith(name, "Examples_HelloWorld_"), readdir(ENV["OMJL_LOG_DIR"])))
         println("run_count=", length(runDirs))
         println("root_codegen=", isfile(joinpath(ENV["OMJL_LOG_DIR"], "backend", "codeGen", "equationFirstStageCodeGen.log")))
         println("run_codegen=", all(dir -> isfile(joinpath(ENV["OMJL_LOG_DIR"], dir, "backend", "codeGen", "equationFirstStageCodeGen.log")), runDirs))
         """
-        #= The test environment, which has OMBackend's dependencies: the package's own
+        #= OMBackend included from its source (the logging switch is read at load) has no package extensions, no
+           OMFrontend lowering: the model is OMJLIR (`_irDecay`), translated by the core.
+           The test environment, which has OMBackend's dependencies: the package's own
            project is not instantiated where its siblings are developed into a
-           temporary environment (OM.jl's ci/test-package.jl, since [sources] is gone). =#
+           temporary environment (OMJL's ci/test-package.jl, since [sources] is gone). =#
         local output = read(`$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script`, String)
         @test occursin("same_module=true", output)
         @test occursin("run_count=2", output)

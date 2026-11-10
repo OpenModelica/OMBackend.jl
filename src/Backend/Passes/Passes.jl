@@ -36,7 +36,7 @@
 """
     Passes
 
-The backend's passes on OMJLIR, between the lowering of the flat model (LowerFlatModel) and the
+The backend's passes on OMJLIR, between the lowering of the flat model (LowerFlatModel, OMBackendOMFrontendExt) and the
 lowering to SimCode. Each is a function of the model, documented with what it does and why;
 `PIPELINE` runs them in order.
 """

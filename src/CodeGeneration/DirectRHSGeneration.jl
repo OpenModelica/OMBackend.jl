@@ -34,7 +34,7 @@
 */ =#
 
 #=
-  Direct RHS Generation for OM.jl
+  Direct RHS Generation for OMJL
 
   Bypasses MTK's ODEProblem constructor by extracting the RHS function
   directly from the reduced system's symbolic equations. Uses

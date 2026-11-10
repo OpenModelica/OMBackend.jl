@@ -35,158 +35,11 @@
 
 module RuntimeUtil
 
-import Absyn
 import DifferentialEquations
 import DifferentialEquations.ReturnCode
 import ModelingToolkit
 import OMBackend
 import OMBackend.@BACKEND_LOGGING
-
-import OMFrontend
-import OMFrontend.Frontend
-import OMFrontend.Frontend.AbsynUtil
-import OMFrontend.Frontend.SCodeUtil
-
-import SCode
-
-using MetaModelica
-
-"""
-  Wrapper to a function in SCodeUtil.
-"""
-function getElementFromSCodeProgram(inIdent::String, inClass::SCode.Element)
-  result::SCode.Element = SCodeUtil.getElementNamed(inIdent, inClass)
-  return result
-end
-
-"""
-  Given a list of prefixes on the format <A>.<B>.<C>
-  returns the element pointed to by C.
-"""
-function getElementFromSCodeProgram(prefixes::Vector{String}, inClass::SCode.Element)
-  local currentElement::SCode.Element = inClass
-  for p in prefixes[2:end]
-    currentElement = getElementFromSCodeProgram(p, currentElement)
-  end
-  return currentElement
-end
-
-function _findClassPathByCanonicalName(target::String,
-                                       inClass::SCode.Element,
-                                       path::Vector{String})
-  if OMBackend.canonicalName(join(path, ".")) == target
-    return copy(path)
-  end
-
-  for element in listArray(SCodeUtil.getClassElements(inClass))
-    if SCodeUtil.isClass(element)
-      push!(path, SCodeUtil.elementName(element))
-      local found = _findClassPathByCanonicalName(target, element, path)
-      pop!(path)
-      if found !== nothing
-        return found
-      end
-    end
-  end
-
-  return nothing
-end
-
-function modelicaPathName(activeModeName::String, inClass::SCode.Element)::String
-  if occursin(".", activeModeName)
-    return activeModeName
-  end
-
-  local rootPath = String[SCodeUtil.elementName(inClass)]
-  local found = _findClassPathByCanonicalName(OMBackend.canonicalName(activeModeName),
-                                             inClass,
-                                             rootPath)
-  if found !== nothing
-    return join(found, ".")
-  end
-
-  return activeModeName
-end
-
-"""
-
-"""
-function replaceElementInSCodeProgramByName(inClass, inElement, name::String)
-  local path::Absyn.Path = AbsynUtil.stringPath(name)
-  return SCodeUtil.replaceOrAddElementInProgram(list(inClass),
-                                         inElement,
-                                         path)
-end
-
-"""
-```
-setElementInSCodeProgram!(activeModeName,inIdent::String, newValue::T, inClass::SCode.Element)
-```
-Given a name sets that element to a new value.
-It then returns the modified SCodeProgram.
-Currently, it is assumed to be at the top level of the class.
-A SCodeElement is either a component like a variable or a class.
-See SCode.jl for info about the SCode representation.
-
-TODO: Fix for all sub-levels as well
-"""
-function setElementInSCodeProgram!(activeModeName, inIdent::String, newValue::T, inClass::SCode.Element) where {T}
-  #=
-  Get the class name. The active class is required to be top level currently.
-  =#
-  local modelicaActiveModeName = modelicaPathName(activeModeName, inClass)
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modename.log"), activeModeName)
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modelica_modename.log"), modelicaActiveModeName)
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "original.log"), OMBackend.JuliaFormatter.format_text(string(inClass)))
-  local activeModeNamePrefixes::Vector{String} = map(string, split(modelicaActiveModeName, "."))
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "prefixes.log"), OMBackend.JuliaFormatter.format_text(string(activeModeNamePrefixes)))
-  local activeClass  = getElementFromSCodeProgram(activeModeNamePrefixes, inClass)
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "active.log"), OMBackend.JuliaFormatter.format_text(string(activeClass)))
-  #= Get all elements from the class together with the corresponding names =#
-  local elementToReplace::SCode.Element = getElementFromSCodeProgram(inIdent, activeClass)
-  local elements::Vector{SCode.Element} = listArray(SCodeUtil.getClassElements(activeClass))
-  local i = 1
-  local indexOfElementToReplace = 0
-  local modifiedClass = activeClass
-  for element in elements
-    if SCodeUtil.elementNameEqual(element, elementToReplace)
-      indexOfElementToReplace = i
-      break
-    end
-    i += 1
-  end
-  local modification = SCodeUtil.getComponentMod(elementToReplace)
-  @assign modification.binding = makeCondition(newValue)
-  @assign elementToReplace.modifications = modification
-  elements[indexOfElementToReplace] = elementToReplace
-  #write("elementToReplace.log", string(OMBackend.JuliaFormatter.format_text(string(elementToReplace))))
-  @assign activeClass.classDef.elementLst = arrayList(elements)
-  #=Replace the element in the specific class. =#
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "elementToReplace.log"), OMBackend.JuliaFormatter.format_text(string(elementToReplace)))
-  @match modifiedProg <| MetaModelica.nil = replaceElementInSCodeProgramByName(inClass,
-                                                                  activeClass,
-                                                                  modelicaActiveModeName)
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modifiedProg.log"), OMBackend.JuliaFormatter.format_text(string(modifiedProg)))
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "tmpClass.log"), OMBackend.JuliaFormatter.format_text(string(inClass)))
-  #=
-  We need to update the top level class as well in this case.
-  To do this we need to search for the element representing the class wee modified in the top level program again.
-  =#
-  return modifiedProg
-end
-
-makeCondition(val::Bool) = begin
-  SOME(Absyn.BOOL(val))
-end
-makeCondition(val::Int) = begin
-  SOME(Absyn.INTEGER(val))
-end
-makeCondition(val::Real) = begin
-  SOME(Absyn.REAL(string(val)))
-end
-makeCondition(val) = begin
-  throw("Only primitive values {Integer, Boolean, Real} are currently supported in a Recompilation call")
-end
 
 """
   Converts a symbol (of a MTK variable) to a string.
@@ -326,37 +179,62 @@ function getValuesForUnknowns(integrator)
 end
 
 """
-    updateInitialConditions!(simCode, integrator) -> Nothing
-
-The start values of the recompiled model's Real variables: their values at the change
-(createLookupTable), by name, with their other attributes, not fixed (the new problem starts
-from the state at the change: createNewU0, NoInit). A variable without one takes the value of
-the old variable of its name without the component (`bouncingBall_y` the pendulum's
-`pendulum_y`, a dynamic transition), fixed, when only one old variable has that name. Matching
-every variable that way, fixed and its attributes replaced, made a MultiBody model's recompiled
-system unbalanced (`body_frame_a_f` took `revolute_frame_a_f`'s value).
+The symbol table of a model's simulation code (`SIM_CODE.stringToSimVarHT`): a variable's index and its
+specification by its name.
 """
-function updateInitialConditions!(simCode::OMBackend.SimCode.SIM_CODE, integrator)::Nothing
+const SymbolTable = OMBackend.SimCode.OrderedDict{String, Tuple{Int, OMBackend.SimCode.SIMVAR}}
+
+"""
+    switchStartValues(ht::SymbolTable, values::Dict{String, Float64}) -> Dict{String, Tuple{Float64, Bool}}
+
+The start values a structural change gives the Real variables of the recompiled model's symbol table `ht`, from the
+old model's values at the change `values` (createLookupTable): the value of a variable's own name, else (`true`, by
+the local name) the value of the old variable of its name without the component (`bouncingBall_y` the pendulum's
+`pendulum_y`, a dynamic transition) when only one old variable has that name. `updateInitialConditions!` sets them;
+a recompiled mode compiled at an earlier change compares them (`Runtime.RecompiledMode`).
+"""
+function switchStartValues(ht::SymbolTable, values::Dict{String, Float64})::Dict{String, Tuple{Float64, Bool}}
   local SC = OMBackend.SimCode
-  local values = createLookupTable(integrator)
   #= the old values by the name without the component; nothing when two old variables share it =#
-  local byLocalName = Dict{String, Union{Nothing, Float64}}()
+  local byLocalName::Dict{String, Union{Nothing, Float64}} = Dict{String, Union{Nothing, Float64}}()
   for (name, v) in values
-    local local_ = _withoutComponent(name)
+    local local_::String = _withoutComponent(name)
     isempty(local_) && continue
     byLocalName[local_] = haskey(byLocalName, local_) ? nothing : v
   end
-  local ht = simCode.stringToSimVarHT
-  for (name, (idx, simVar)) in ht
+  local starts::Dict{String, Tuple{Float64, Bool}} = Dict{String, Tuple{Float64, Bool}}()
+  for (name, (_, simVar)) in ht
     (simVar.elementType isa SC.TYPE_REAL || !SC.attributesGiven(simVar.elementType, simVar.attributes)) || continue
-    local exact = get(values, name, nothing)
-    local attributes = if exact !== nothing
-      SC.withAttributes(simVar.attributes; start = SC.RCONST(exact),
-                        fixed = SC.attributesGiven(simVar.elementType, simVar.attributes) ? simVar.attributes.fixed : SC.BCONST(false))
+    local exact::Union{Nothing, Float64} = get(values, name, nothing)
+    if exact !== nothing
+      starts[name] = (exact, false)
     else
-      local other = get(byLocalName, _withoutComponent(name), nothing)
-      other === nothing && continue
-      SC.withAttributes(SC.NO_ATTRIBUTES; start = SC.RCONST(other), fixed = SC.BCONST(true))
+      local other::Union{Nothing, Float64} = get(byLocalName, _withoutComponent(name), nothing)
+      other === nothing || (starts[name] = (other, true))
+    end
+  end
+  return starts
+end
+
+"""
+    updateInitialConditions!(simCode, starts::Dict{String, Tuple{Float64, Bool}}) -> Nothing
+
+The start values of the recompiled model's Real variables, `starts` (`switchStartValues`): a value of the variable's
+own name with its other attributes, not fixed (the new problem starts from the state at the change: createNewU0,
+NoInit); a value by the local name fixed, its other attributes dropped. Matching every variable that way, fixed and
+its attributes replaced, made a MultiBody model's recompiled system unbalanced (`body_frame_a_f` took
+`revolute_frame_a_f`'s value).
+"""
+function updateInitialConditions!(simCode::OMBackend.SimCode.SIM_CODE, starts::Dict{String, Tuple{Float64, Bool}})::Nothing
+  local SC = OMBackend.SimCode
+  local ht::SymbolTable = simCode.stringToSimVarHT
+  for (name, (value, byLocalName)) in starts
+    local (idx::Int, simVar::SC.SIMVAR) = ht[name]
+    local attributes::SC.SimVarAttributes = if byLocalName
+      SC.withAttributes(SC.NO_ATTRIBUTES; start = SC.RCONST(value), fixed = SC.BCONST(true))
+    else
+      SC.withAttributes(simVar.attributes; start = SC.RCONST(value),
+                        fixed = SC.attributesGiven(simVar.elementType, simVar.attributes) ? simVar.attributes.fixed : SC.BCONST(false))
     end
     ht[name] = (idx, SC.withAttributes(simVar, attributes))
   end

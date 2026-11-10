@@ -64,7 +64,7 @@ function isTunableParameter(name::AbstractString, tun::AbstractSet{String})::Boo
 end
 
 """
-`A[2,1]` → `A[2][1]`, the form OM.jl gives scalarized array elements.
+`A[2,1]` → `A[2][1]`, the form OMJL gives scalarized array elements.
 """
 _elementSubscripts(name::AbstractString)::String =
   replace(name, r"\[\s*\d+(\s*,\s*\d+)+\s*\]" => m -> join("[" * strip(i) * "]" for i in split(m[2:end-1], ',')))
