@@ -37,11 +37,9 @@ The OMJL ecosystem packages are developed from sibling checkouts next to
 `OMBackend.jl`, as the CI does (`Pkg.develop` of each, `.github/workflows/CI.yml`).
 OMBackend depends on OMRuntimeExternalC; OMFrontend (with its `SCode` module), OMParser (its `Absyn` module)
 and MetaModelica are weak dependencies, the triggers of `OMBackendOMFrontendExt`, and the tests use OMFrontend;
-ArrayUtil, ImmutableList and ListUtil are OMFrontend's:
+ImmutableList is OMFrontend's (ArrayUtil and ListUtil are modules of OMFrontend):
 
-* ArrayUtil.jl
 * ImmutableList.jl
-* ListUtil.jl
 * MetaModelica.jl
 * OMFrontend.jl
 * OMParser.jl
@@ -51,9 +49,7 @@ Layout:
 
 ```
 OMJL-workspace/
-├── ArrayUtil.jl/
 ├── ImmutableList.jl/
-├── ListUtil.jl/
 ├── MetaModelica.jl/
 ├── OMBackend.jl/        <-- this repository
 ├── OMFrontend.jl/
@@ -82,8 +78,8 @@ checkouts (nothing is built: the parser is written in Julia):
 julia> import Pkg
 julia> Pkg.activate(".")
 julia> Pkg.develop([Pkg.PackageSpec(path = joinpath("..", p)) for p in
-                    ("ArrayUtil.jl", "ImmutableList.jl", "ListUtil.jl", "MetaModelica.jl",
-                     "OMFrontend.jl", "OMParser.jl", "OMRuntimeExternalC.jl")])
+                    ("ImmutableList.jl", "MetaModelica.jl", "OMFrontend.jl",
+                     "OMParser.jl", "OMRuntimeExternalC.jl")])
 ```
 
 Then load the package:
