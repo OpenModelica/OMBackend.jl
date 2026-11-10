@@ -1,4 +1,4 @@
-[![Github Action CI](https://github.com/OpenModelica/OMBackend.jl/workflows/CI/badge.svg)](https://github.com/OpenModelica/OMBackend.jl/actions) [![License: OSMC-PL](https://img.shields.io/badge/license-OSMC--PL-lightgrey.svg)](LICENSE.md)
+[![Github Action CI](https://github.com/OpenModelica/OMBackend.jl/workflows/CI/badge.svg)](https://github.com/OpenModelica/OMBackend.jl/actions) [![License: OSMC-PL](https://img.shields.io/badge/license-OSMC--PL-lightgrey.svg)](LICENSE.md) [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://OpenModelica.github.io/OMBackend.jl/dev/)
 
 # About OMBackend.jl
 
@@ -134,6 +134,23 @@ julia> OMBackend.simulateModel("BouncingBallReals"; tspan = (0.0, 2.5))
 ```
 
 ![image](https://user-images.githubusercontent.com/8775827/99516636-b6914280-298e-11eb-85cf-c9041314e9b4.png)
+
+# Documentation
+
+The documentation is built with Documenter.jl from `docs/`: the home page, getting started and the API
+reference.
+
+* Online: <https://OpenModelica.github.io/OMBackend.jl/> (the development version under `/dev/`, a release
+  under `/stable/` and `/vX.Y.Z/`).
+* In Julia: the docstring of every function is in the help mode, for example `?OMBackend.simulateModel`.
+* Locally, from the repository root (the HTML is written to `docs/build/`):
+
+```julia
+julia> import Pkg
+julia> Pkg.activate("docs")
+julia> Pkg.develop(path = ".")   # and the sibling packages, as in the Installation section
+julia> include("docs/make.jl")
+```
 
 # Citation
 

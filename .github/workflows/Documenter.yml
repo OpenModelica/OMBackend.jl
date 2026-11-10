@@ -1,0 +1,74 @@
+name: Documenter
+
+on:
+  push:
+    branches:
+      - master
+    tags: '*'
+  pull_request:
+  workflow_dispatch:
+
+# Cancel in-flight doc builds when a new commit lands on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  docs:
+    name: Build and deploy documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    permissions:
+      # Required to push to gh-pages.
+      contents: write
+      # Required for PR previews.
+      pull-requests: write
+      statuses: write
+
+    steps:
+      - name: Checkout OMBackend.jl
+        uses: actions/checkout@v4
+        with:
+          path: OMBackend.jl
+
+      # OMBackend depends on OMRuntimeExternalC, which is in the OpenModelica registry. The shared action
+      # checks the sibling out at the branch that matches this change, as CI.yml does.
+      - name: Checkout sibling OM*.jl packages
+        uses: JKRT/OM.jl/.github/actions/checkout-siblings@master
+        with:
+          packages: ImmutableList MetaModelica OMFrontend OMParser OMRuntimeExternalC
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.13'
+
+      - uses: julia-actions/cache@v2
+
+      - name: Instantiate docs environment
+        # OMBackend and the sibling checkouts are developed together in one call: developing the siblings
+        # first re-resolves the environment with OMBackend still a registry dependency, and Pkg then
+        # fetches it from GitHub instead of using this checkout.
+        shell: bash
+        working-directory: OMBackend.jl
+        run: |
+          julia --project=docs -e '
+            import Pkg
+            Pkg.Registry.add("General")
+            Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
+            siblings = ["../ImmutableList.jl", "../MetaModelica.jl", "../OMFrontend.jl",
+                        "../OMParser.jl", "../OMRuntimeExternalC.jl"]
+            specs = [Pkg.PackageSpec(path = p) for p in siblings]
+            push!(specs, Pkg.PackageSpec(path = pwd()))
+            Pkg.develop(specs)
+            Pkg.instantiate()
+          '
+
+      - name: Build (and deploy) docs
+        shell: bash
+        working-directory: OMBackend.jl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+        run: julia --project=docs --color=yes docs/make.jl
