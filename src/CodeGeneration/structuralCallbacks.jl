@@ -214,8 +214,11 @@ function createStructuralCallback(simCode::SC.SIM_CODE, structuralTransition::SC
         $(expToJuliaExpMTK(newValueExp, simCode))
       end
     end
-    local modification = quote
-      ($(componentToModify), $("$(newValue)"))
+    #= The new value as a function of the symbol table of the mode at the change, which has the component's binding =#
+    local modification::Expr = quote
+      ($(componentToModify), function (stringToSimVarHT::OMBackend.Runtime.RuntimeUtil.SymbolTable)
+                               $(newValue)
+                             end)
     end
     quote
       function $(Symbol(callbackName))(reducedSystem, pars)
@@ -223,7 +226,7 @@ function createStructuralCallback(simCode::SC.SIM_CODE, structuralTransition::SC
           OMBackend.CodeGeneration.variableName(v) => i
           for (i, v) in enumerate(ModelingToolkit.unknowns(reducedSystem)))
         stringToSimVarHT = $(simCode.stringToSimVarHT)
-        local modification::Tuple{String, String} = $(modification)
+        local modification::Tuple{String, Function} = $(modification)
         local structuralChange = OMBackend.Runtime.StructuralChangeRecompilation($(simCode.name),
                                                                                  false,
                                                                                  $(metaModel),

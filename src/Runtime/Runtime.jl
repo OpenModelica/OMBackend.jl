@@ -51,6 +51,8 @@ import Setfield
 using DataStructures
 using ModelingToolkit
 using DifferentialEquations
+#= SciMLBase's integrators, return codes, NoInit and remake (as ModelingToolkit has them) =#
+import ModelingToolkit.SciMLBase: DEIntegrator, ReturnCode, NoInit, remake
 
 abstract type AbstractOMSolution end
 
@@ -123,7 +125,10 @@ mutable struct StructuralChangeRecompilation{MOD <: Tuple, M} <: AbstractStructu
   structureChanged::Bool
   "The meta model: the frontend's representation of the model itself (OMFrontend: its SCode class)"
   metaModel::M
-  "The modification to be applied during recompilation"
+  """
+    The modification to be applied during recompilation: the element changed and the function of the symbol table
+    (`stringToSimVarHT`, the current mode's) that gives its new value (generated with the model, structuralCallbacks.jl)
+  """
   modification::MOD
   """
     The symbol table for the old model.
@@ -132,7 +137,24 @@ mutable struct StructuralChangeRecompilation{MOD <: Tuple, M} <: AbstractStructu
   stringToSimVarHT
   timeAtChange::Float64
   solutionAtChange
+  "The frontend's model the simulation started with, before any change"
+  origin::M
+  """
+    The changes made to `origin` so far, each element's last value (`string`), by element: with `origin` the key of
+    the mode they give (RECOMPILED_MODES). The frontend sets an element's binding to the value, so the model of a
+    change depends only on each element's last value.
+  """
+  applied::Vector{Pair{String, String}}
 end
+
+"""
+A structural change by recompilation of the frontend's model `metaModel`, before any change (as the generated callbacks
+create it): its `origin` the model itself, nothing `applied`.
+"""
+StructuralChangeRecompilation(name::String, structureChanged::Bool, metaModel::M, modification::MOD, stringToSimVarHT,
+                              timeAtChange::Float64, solutionAtChange) where {MOD <: Tuple, M} =
+  StructuralChangeRecompilation{MOD, M}(name, structureChanged, metaModel, modification, stringToSimVarHT, timeAtChange,
+                                        solutionAtChange, metaModel, Pair{String, String}[])
 
 """
   Wrapper callback for agentic recompilation.
@@ -156,6 +178,65 @@ mutable struct StructuralChangeAgenticRecompilation{M} <: AbstractStructuralChan
   prompt::Union{String, Nothing}
   "Serialized constraint equations from the initial equation block (nothing if absent)"
   initialEquations::Union{String, Nothing}
+end
+
+"""
+A mode compiled at a recompilation (`recompilation`), kept for the same changes of the same frontend model in the same
+build (RECOMPILED_MODES): a model that makes a change again (a sampled change, a second simulate) switches without
+compiling the mode again. Its problem before any solve, with its parameters as built (a solve's events change the
+problem's); the frontend's model after the change and the mode's symbol table; the symbol table before the change's
+start values and the start values (`RuntimeUtil.switchStartValues`), which a later change must give the same
+(`_sameStarts`) except those of the problem's unknowns the build took as their u0 (set in u0) and those of its observed
+variables (computed from the unknowns; the solve does not initialize: NoInit).
+"""
+struct RecompiledMode
+  problem::ODEProblem
+  "`problem.p` as built: a solve changes the problem's (discrete variables)"
+  parameters::Any
+  "The frontend's model after the change (OMFrontend: an SCode class)"
+  frontendModel::Any
+  stringToSimVarHT::RuntimeUtil.SymbolTable
+  "The symbol table before the change's start values (`RuntimeUtil.updateInitialConditions!`)"
+  originalHT::RuntimeUtil.SymbolTable
+  starts::Dict{String, Tuple{Float64, Bool}}
+  "The index in u0 of each unknown whose u0 the build took from its start value"
+  startsInU0::Dict{String, Int}
+  "The names of the problem's observed variables"
+  observed::Set{String}
+end
+
+"""
+The key of a recompiled mode: the owner model's name and module (its build), the objectid of the frontend's model the
+simulation started with and the changes made to it (`StructuralChangeRecompilation.applied`).
+"""
+const RecompiledModeKey = Tuple{String, Module, UInt, Vector{Pair{String, String}}}
+
+"""
+The recompiled modes (`RecompiledMode`) by their key (`RecompiledModeKey`). A model's are dropped with its build
+(`OMBackend.forgetModel`; a new build's first mode: `_rememberMode!`) and by `OMBackend.clearCaches!`.
+"""
+const RECOMPILED_MODES = Dict{RecompiledModeKey, RecompiledMode}()
+
+"""
+    forgetRecompiledModes!(owner::String) -> Nothing
+
+Drops the recompiled modes of the model `owner` (canonical name).
+"""
+function forgetRecompiledModes!(owner::String)::Nothing
+  filter!(entry -> first(first(entry)) != owner, RECOMPILED_MODES)
+  return nothing
+end
+
+"""
+    _rememberMode!(key::RecompiledModeKey, mode::RecompiledMode) -> Nothing
+
+Keeps `mode` under `key`, after dropping the modes of the same model in another build (an earlier one's module).
+"""
+function _rememberMode!(key::RecompiledModeKey, mode::RecompiledMode)::Nothing
+  local (owner::String, ownerModule::Module) = (key[1], key[2])
+  filter!(entry -> !(first(entry)[1] == owner && first(entry)[2] !== ownerModule), RECOMPILED_MODES)
+  RECOMPILED_MODES[key] = mode
+  return nothing
 end
 
 mutable struct OM_ProblemStructural{T0 <: String, T1, T2, T3}
@@ -205,7 +286,7 @@ Depending on the encompassing system we either just in time recompile the new sy
 Saving our current time step and reinitialize our new changed system
 .
 We should also statically detect if VSS simulation is needed since it is more resource heavy than regular simulation
-=# ≈
+=#
 
 """
   Custom solver function for Modelica code with structuralCallbacks to monitor the solving process
@@ -474,271 +555,269 @@ function _buildTransferU0Dict(newSystem, oldSystem, integrator,
 end
 
 """
-  Custom solver function for Modelica code with structuralCallbacks to monitor the solving process
-  (Using the integrator interface) from DifferentialEquations.jl
+    solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...) -> Vector{Any}
+
+Solves a model whose structural changes recompile it: integrates the active mode until a structural change
+(`_integrateSegment!`), switches to the mode of the change (`_switchMode`) and continues, to the end of `tspan`. The
+solutions of the modes, in order.
 """
-function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)
-  local problem = omProblem.problem
-  local structuralCallbacks = omProblem.structuralCallbacks
-  local callbackConditions = omProblem.callbackConditions
-  local activeModeName = omProblem.activeModeName
-  local integrator = init(problem, alg; kwargs...)
-  local solutions = Any[]
-  local tmpSolAtChange
-  #= Run the integrator=#
-  @label START_OF_INTEGRATION
+function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)::Vector{Any}
+  local problem::ODEProblem = omProblem.problem
+  local integrator::DEIntegrator = init(problem, alg; kwargs...)
+  local solutions::Vector{Any} = Any[]
   while true
-    local i = integrator
-    local old_t = i.t
-    #= Check structural callbacks in order =#
-    for j in 1:length(structuralCallbacks)
-      local cb = structuralCallbacks[j]
-      @VSS_DEBUG @info "Structure Changed? $(cb.structureChanged)"
-      if cb.structureChanged && i.t <= tspan[2]
-        @VSS_DEBUG @info "Recompilation directive triggered at:" i.t "Δt is:" (i.t - i.dt)
-        @VSS_DEBUG @info "[solve OM_ProblemRecompilation] calling recompilation" t=i.t cbName=cb.name
-        local _t_recomp = time()
-        local newU0
-        @VSS_DEBUG @info "Syms before recompilation:" getSyms(problem) integrator.u
-        (newProblem, newSymbolTable, finalInitialValues, initialValues, reducedSystem) = recompilation(cb.name,
-                                                                                                                    cb,
-                                                                                                                    integrator,
-                                                                                                                    tspan,
-                                                                                                                    callbackConditions)
-        @VSS_DEBUG @info "[solve OM_ProblemRecompilation] recompilation returned" elapsed_s=round(time()-_t_recomp, digits=2)
-        local symsOfOldProblem = getSyms(problem)
-        local symsOfNewProblem = getSyms(newProblem)
-        @VSS_DEBUG begin
-          @info "Old u" integrator.u
-          @info "initialValues" initialValues
-          @info "finalInitialValues" finalInitialValues
-          @info "symsOfOldProblem" symsOfOldProblem
-          @info "symsOfNewProblem" symsOfNewProblem
-        end
-        #= Use newProblem.u0 as the base vector: its ordering matches
-           symsOfNewProblem (MTK unknowns order), whereas `initialValues`
-           returned by the generated model can be ordered differently
-           (e.g. fixed=true phi/phid values landing at vy/vx slots when old
-           and new modes share no state name). createNewU0 then only
-           overrides entries whose suffix matched an old state. =#
-        local baseU0 = collect(Float64, newProblem.u0)
-        newU0 = RuntimeUtil.createNewU0(symsOfOldProblem,
-                                        symsOfNewProblem,
-                                        baseU0,
-                                        last(cb.solutionAtChange.u))
-        @VSS_DEBUG @info "[solve OM_ProblemRecompilation] newU0 from createNewU0" newU0 baseU0 symsOfNewProblem symsOfOldProblem oldFinal=last(cb.solutionAtChange.u)
-        #= Fill in observed variables: new state vars absent from old state vector
-           are recovered from the old solution's algebraic (observed) equations. =#
-        _fill_observed_u0!(newU0, symsOfOldProblem, newProblem, cb.solutionAtChange)
-        @VSS_DEBUG @info "The new u0" newU0
-        @VSS_DEBUG @info "[solve OM_ProblemRecompilation] newU0 after _fill_observed_u0" newU0 anyNaN=any(isnan, newU0) elapsed_s=round(time()-_t_recomp, digits=2)
-        #=
-        TODO:
-            Also add the continuous events here
-          TODO: If there are discrete events these should be evaluated before proceeding
-          local discrete_events = reducedSystem.discrete_events
-          @info "discrete_events:" discrete_events
-          =#
-          # # TMP for System 10 With optimization
-          #= Now we have the start values for the next part of the system=#
-          local _t_init = time()
-          #= In the latest world, as the steps: the recompiled model's module is newer than this
-             solve, and init runs its callbacks' initialization (a table's time events: a
-             MethodError of the module's closures). =#
-          integrator = Base.invokelatest(init, newProblem,
-                                         alg;
-                                         force_dtmin = true,
-                                         kwargs...)
-          @VSS_DEBUG @info "[solve OM_ProblemRecompilation] init(newProblem) done" elapsed_s=round(time()-_t_init, digits=2)
-          local _t_reinit = time()
-          Base.invokelatest(reinit!, integrator,
-                            newU0;
-                            t0 = i.t,
-                            tf = tspan[2],
-                            reset_dt = true,
-                            kwargs...)
-          @VSS_DEBUG @info "[solve OM_ProblemRecompilation] reinit! done" elapsed_s=round(time()-_t_reinit, digits=2)
-        #=
-          Reset with the new values of u0
-          and set the active mode to the mode we are currently using.
-        =#
-        #= Point the problem to the new problem =#
-        #= ! This runs for both routines. That is initialization and recompilation !=#
-        problem = newProblem
-        #= Note that the structural event might be triggered again here (We kill it later) =#
-        integrator.dt = min(integrator.dt, 1e-6)
-        local _t_step = time()
-        Base.invokelatest(step!, integrator, integrator.dt, true)
-        @VSS_DEBUG @info "[solve OM_ProblemRecompilation] first step! after reinit done" t=integrator.t dt=integrator.dt dtpropose=integrator.dtpropose u=integrator.u anyNaN=any(isnan, integrator.u) elapsed_s=round(time()-_t_step, digits=2)
-        #=
-        We reset the structural change pointer again here just to make sure
-        that we do not trigger the structural callback again.
-        Note,currently this will trigger the callback setting the boolean cb variable to true again.
-        However, we reset twice s.t it will not go into this conditional again for the same callback.
-        =#
-        integrator.just_hit_tstop = false
-        cb.structureChanged = false
-        #=
-        TODO:
-        Make a PR for the Julia guys to provide an option to step without triggering callbacks.
-        This so that we can avoid the hack above.
-        =#
-        @goto START_OF_INTEGRATION
-      end
-    end #= Structural callback handling =#
-    #= invoke latest to avoid world age problems =#
-    @VSS_DEBUG @info "integrator step" (integrator.t + integrator.dt) (integrator.t + integrator.dtpropose)
-    if integrator.t + integrator.dtpropose >= tspan[2]
-      @VSS_DEBUG @info "Timestep exceeds simulation, adjusting" integrator.t integrator.u (integrator.t + integrator.dtpropose)
-      integrator.dt = 1e-6
-      integrator.dtpropose = 1e-6
-      @VSS_DEBUG @info "After adjustment" integrator.dt integrator.dtpropose integrator.u
-      Base.invokelatest(step!, integrator, integrator.dt, true)
-    else
-      Base.invokelatest(step!, integrator, integrator.dt, false)
-    end
-    #=
-    If a structural callback was triggered at the last integration step this boolean variable is true.
-    =#
-    local timeBeforeCallbackWasApplied::Float64 = 0
-    local hitTstop = false
-    if i.just_hit_tstop == true&& RuntimeUtil.isReturnCodeSuccess(i)
-      local solAtChange
-      #= Find the callback that was triggered =#
-      local timeAtChange::Vector{Float64} = Float64[]
-      local uAtChange#::Vector{Vector{Float64}}
-      for cb in structuralCallbacks
-        if cb.structureChanged
-          timeBeforeCallbackWasApplied = cb.timeAtChange
-          #=
-          Save the old solution
-          Resize the solution to the time t before the change.
-          =#
-          @VSS_DEBUG @info "solutionAtChange.t" cb.solutionAtChange.t
-          local stopIdx = findlast((x) -> x == timeBeforeCallbackWasApplied, cb.solutionAtChange.t)
-          @assert stopIdx !== nothing "Invalid callback occurred during simulation"
-          @VSS_DEBUG @info "stopIdx" stopIdx
-          solAtChange = cb.solutionAtChange #Used for error checking
-          local modifiedSol = deepcopy(cb.solutionAtChange)
-          resize!(modifiedSol.t, stopIdx)
-          resize!(modifiedSol.u, stopIdx)
-          @VSS_DEBUG @info "modifiedSol after resize" modifiedSol.u modifiedSol.t
-          #= Assign the adjusted solution vector. =#
-          uAtChange = modifiedSol.u
-          timeAtChange = modifiedSol.t
-          tmpSolAtChange = uAtChange
-          #= The modified solution is the solution before we start the next part of the solution process. =#
-          @VSS_DEBUG @info "Saving solution..."
-          push!(solutions, modifiedSol)
-          hitTstop = true
-        end
-      end
-      if hitTstop
-        reinit!(i,
-                last(uAtChange);
-                t0 = timeBeforeCallbackWasApplied,
-                tf = tspan[2],
-                reset_dt = true,
-                erase_sol = true,
-                reinit_callbacks = false)
-        i.just_hit_tstop = false
-        @VSS_DEBUG begin
-          @info "uAtChange" uAtChange
-          @info "activeModeName" activeModeName
-          @info "timeBeforeCallbackWasApplied" timeBeforeCallbackWasApplied
-          @info "integrator.u" integrator.u
-          @info "integrator.t" integrator.t
-          @info "i.u" i.u
-          @info "i.t" i.t
-        end
-      elseif integrator.t >= last(tspan) #= Hack to handle the special case where we are slightly above tstop=#
-        sol = integrator.sol
-        idx = findall(t -> t <= tspan[2], sol.t)
-        sol = Setfield.@set sol.t = sol.t[idx]
-        sol = Setfield.@set sol.u = sol.u[idx]
-        push!(solutions, sol)
-        return solutions
-      end
-    end
+    #= In the latest world: a recompiled mode's functions are newer than this solve. Once per mode, not per step: a
+       function barrier, its steps compiled for the mode's integrator. =#
+    local change::Union{Nothing, AbstractStructuralChange} =
+      Base.invokelatest(_integrateSegment!, integrator, omProblem.structuralCallbacks, tspan, solutions)
+    change === nothing && return solutions
+    (problem, integrator) = _switchMode(change, problem, integrator, tspan, omProblem.callbackConditions, alg; kwargs...)
   end
-  push!(solutions, integrator.sol)
-  return solutions
 end
 
 """
-  Recompile the metamodel with components changed.
-  Returns a tuple of a new problem together with a new symbol table.
-inputs:
-  Name of the active model
-  The structural callback causing the recompilation
-  The current u values of the integrator
-  The provided timespan
-  The callback conditions (This to make sure that the new model have the same callbacks)
+    _integrateSegment!(integrator::DEIntegrator, structuralCallbacks::Vector{AbstractStructuralChange}, tspan::Tuple,
+                       solutions::Vector{Any}) -> Union{Nothing, AbstractStructuralChange}
+
+Steps the active mode's `integrator` until one of the structural callbacks has a change pending (returned; the mode's
+solution up to the change, its `solutionAtChange`, pushed to `solutions`) or to the end of `tspan` (nothing; the mode's
+solution up to the end pushed). An integration that fails, is terminated or stops advancing ends there (nothing; its
+solution pushed). A step's return code is Success (or Default) while the integration goes on.
 """
-function recompilation(activeModeName,
-                       structuralCallback::StructuralChangeRecompilation,
-                       integrator,
-                       tspan,
-                       callbackConditions)::Tuple
-  local runId = OMBackend.createLogRunId(activeModeName; suffix = "recompilation")
-  return OMBackend.withLogRunDir(runId) do
-    #=  Recompilation =#
-    @VSS_DEBUG @info "[RECOMPILATION] ENTER" activeModeName t=integrator.t
-    local _t_start = time()
-    local integrator_u = integrator.u
-    #= 1) Fetch the parameter from the structural callback =#
-    local metaModel = structuralCallback.metaModel
-    local modification = structuralCallback.modification
-    local elementToChange::String = first(modification)
-    #= Get the symbol table, using this we evaluate the new value based on the value of some parameter. =#
-    local newValueExpr = Meta.parse(last(modification))
-    newValueExpr = quote
-      stringToSimVarHT = $(structuralCallback.stringToSimVarHT)
-      $(newValueExpr)
+function _integrateSegment!(integrator::DEIntegrator, structuralCallbacks::Vector{AbstractStructuralChange},
+                            tspan::Tuple, solutions::Vector{Any})::Union{Nothing, AbstractStructuralChange}
+  local tEnd::Float64 = last(tspan)
+  while true
+    for cb in structuralCallbacks
+      (cb.structureChanged && integrator.t <= tEnd) && return cb
     end
-    local newValue = eval(newValueExpr)
+    local tBefore::Float64 = integrator.t
+    #= the last step: at least 1e-6, stopping at the end =#
+    if integrator.t + integrator.dtpropose >= tEnd
+      @VSS_DEBUG @info "Timestep exceeds simulation, adjusting" integrator.t (integrator.t + integrator.dtpropose)
+      integrator.dt = 1e-6
+      integrator.dtpropose = 1e-6
+      step!(integrator, integrator.dt, true)
+    else
+      step!(integrator, integrator.dt, false)
+    end
+    local retcode::ReturnCode.T = integrator.sol.retcode
+    local going::Bool = retcode == ReturnCode.Default || retcode == ReturnCode.Success
+    #= A structural callback's affect stops the integration at its change (terminate!, just_hit_tstop): the mode's
+       solution up to the change, the integrator back at the change; the change is made at the loop's start. =#
+    if going && integrator.just_hit_tstop
+      local changed::Union{Nothing, AbstractStructuralChange} = nothing
+      for cb in structuralCallbacks
+        cb.structureChanged || continue
+        _truncateAtChange!(cb)
+        push!(solutions, cb.solutionAtChange)
+        changed = cb
+      end
+      if changed !== nothing
+        reinit!(integrator, last(changed.solutionAtChange.u); t0 = changed.timeAtChange, tf = tEnd, reset_dt = true,
+                erase_sol = true, reinit_callbacks = false)
+        integrator.just_hit_tstop = false
+        continue
+      end
+    end
+    (going && tBefore < integrator.t < tEnd) && continue
+    if going && integrator.t >= tEnd
+      #= the last step may end slightly past the end =#
+      local solution = integrator.sol
+      local idx::Vector{Int} = findall(t -> t <= tEnd, solution.t)
+      solution = Setfield.@set solution.t = solution.t[idx]
+      solution = Setfield.@set solution.u = solution.u[idx]
+      push!(solutions, solution)
+    else
+      @VSS_DEBUG @info "[solve OM_ProblemRecompilation] integration ended" retcode t = integrator.t
+      push!(solutions, integrator.sol)
+    end
+    return nothing
+  end
+end
+
+"""
+    _truncateAtChange!(change::AbstractStructuralChange) -> Nothing
+
+The solution up to a structural change (`solutionAtChange`, the copy the callback's affect took) cut at the time of the
+change.
+"""
+function _truncateAtChange!(change::AbstractStructuralChange)::Nothing
+  local solution = change.solutionAtChange
+  local stopIdx::Union{Nothing, Int} = findlast(==(change.timeAtChange), solution.t)
+  stopIdx === nothing && error("Invalid callback occurred during simulation: no solution point at the change (t = $(change.timeAtChange))")
+  resize!(solution.t, stopIdx)
+  resize!(solution.u, stopIdx)
+  return nothing
+end
+
+"""
+    _switchMode(change::AbstractStructuralChange, problem::ODEProblem, integrator::DEIntegrator, tspan::Tuple,
+                callbackConditions::CallbackSet, alg; kwargs...) -> Tuple{ODEProblem, DEIntegrator}
+
+The problem of the mode the structural change `change` switches to (`recompilation`) and its integrator at the change,
+from the active mode's `problem` and `integrator` (back at the change): the new problem's unknowns at the values of the
+old states of the same names (`RuntimeUtil.createNewU0`), others from the old observed variables
+(`_fill_observed_u0!`). One step is taken, and the change reset (the structural event triggers again there).
+"""
+function _switchMode(change::AbstractStructuralChange, problem::ODEProblem, integrator::DEIntegrator, tspan::Tuple,
+                     callbackConditions::CallbackSet, alg; kwargs...)::Tuple{ODEProblem, DEIntegrator}
+  local started::Float64 = time()
+  local tChange::Float64 = integrator.t
+  @VSS_DEBUG @info "[solve OM_ProblemRecompilation] calling recompilation" t = tChange cbName = change.name
+  local newProblem::ODEProblem = recompilation(change.name, change, integrator, tspan, callbackConditions)
+  @VSS_DEBUG @info "[solve OM_ProblemRecompilation] recompilation returned" elapsed_s = round(time() - started, digits = 2)
+  local oldSyms::Vector{Symbol} = getSyms(problem)
+  #= newProblem.u0 as the base: its order is the new unknowns' (getSyms); createNewU0 sets the entries of the old
+     states of the same names =#
+  local newU0::Vector{Float64} = RuntimeUtil.createNewU0(oldSyms, getSyms(newProblem), collect(Float64, newProblem.u0),
+                                                         last(change.solutionAtChange.u))
+  #= new unknowns that are not old states: from the old solution's observed variables =#
+  _fill_observed_u0!(newU0, oldSyms, newProblem, change.solutionAtChange)
+  @VSS_DEBUG @info "[solve OM_ProblemRecompilation] new u0" newU0 anyNaN = any(isnan, newU0)
+  #= In the latest world, as the steps: init runs the new mode's callbacks' initialization (a table's time events). =#
+  local newIntegrator::DEIntegrator = Base.invokelatest(init, newProblem, alg; force_dtmin = true, kwargs...)
+  Base.invokelatest(reinit!, newIntegrator, newU0; t0 = tChange, tf = last(tspan), reset_dt = true, kwargs...)
+  #= The structural event may trigger again in this step: reset after it. =#
+  newIntegrator.dt = min(newIntegrator.dt, 1e-6)
+  Base.invokelatest(step!, newIntegrator, newIntegrator.dt, true)
+  newIntegrator.just_hit_tstop = false
+  change.structureChanged = false
+  @VSS_DEBUG @info "[solve OM_ProblemRecompilation] switched" t = newIntegrator.t elapsed_s = round(time() - started, digits = 2)
+  return (newProblem, newIntegrator)
+end
+
+"""
+    recompilation(activeModeName::String, structuralCallback::StructuralChangeRecompilation, integrator::DEIntegrator,
+                  tspan::Tuple, callbackConditions::CallbackSet) -> ODEProblem
+
+The problem of the mode a structural change switches to from the active mode `activeModeName`, at the change
+(`integrator`): the frontend's model with the change's element set to its new value (the `modification`'s function of
+the active mode's symbol table), instantiated and compiled again with its variables starting from the values at the
+change (`_compiledMode`), or the mode compiled before for the same changes and start values (RECOMPILED_MODES,
+`_sameStarts`). The mode's problem for `tspan` with the composite model's callbacks `callbackConditions` ahead of its
+own, not initialized by the solve (NoInit: `_switchMode` sets the state at the change). The structural callback
+continues from the mode: its frontend model, symbol table and changes.
+"""
+function recompilation(activeModeName::String, structuralCallback::StructuralChangeRecompilation,
+                       integrator::DEIntegrator, tspan::Tuple, callbackConditions::CallbackSet)::ODEProblem
+  local runId::String = OMBackend.createLogRunId(activeModeName; suffix = "recompilation")
+  return OMBackend.withLogRunDir(runId) do
+    local started::Float64 = time()
+    local elementToChange::String = first(structuralCallback.modification)
+    local newValueOf::Function = last(structuralCallback.modification)
+    local newValue = Base.invokelatest(newValueOf, structuralCallback.stringToSimVarHT)
     newValue isa Real ||
       error("Only primitive values {Integer, Boolean, Real} are currently supported in a Recompilation call, not $(repr(newValue))")
-    @VSS_DEBUG @info "[RECOMPILATION] step 1/7: parsed modification" elementToChange newValue elapsed_s=round(time()-_t_start, digits=2)
-    #= 2) the frontend's model changed as the modification says, 3) instantiated again and through the backend =#
-    local simulationCode::SimCode.SIM_CODE = recompiledSimCode(metaModel, String(activeModeName), elementToChange, newValue;
-                                                               started = _t_start)
-    @VSS_DEBUG @info "[RECOMPILATION] step 4/7: backend (translateToSimCode) done" elapsed_s=round(time()-_t_start, digits=2)
-    #= 3.2 Adjust variables and special parameters =#
-    RuntimeUtil.updateInitialConditions!(simulationCode, integrator)
-    #= the model's: the recompiled model's module is in its module, its build owns the tables =#
-    local owner = OMBackend.canonicalName(activeModeName)
-    local resultingModel = translateToMTK(simulationCode, owner)
-    @VSS_DEBUG @info "[RECOMPILATION] step 5/7: MTK codegen (translateToMTK) done" elapsed_s=round(time()-_t_start, digits=2)
-    #= 4.0 Revaulate the model=#
-    local modelName = string(owner, "Model")
-    local ownerModule = Base.invokelatest(getglobal, OMBackend, Symbol(owner))
-    Core.eval(ownerModule, resultingModel)
-    @VSS_DEBUG @info "[RECOMPILATION] step 6/7: module @eval done" modelName elapsed_s=round(time()-_t_start, digits=2)
-    local recompiled = Base.invokelatest(getglobal, ownerModule, :Recompiled)
-    local modelFunction = Base.invokelatest(getglobal, recompiled, Symbol(modelName))
-    (problem, callbacks, finalInitialValues, initialValues, reducedSystem, tspan, pars, vars) =
-      Base.invokelatest(modelFunction, tspan)
-    @VSS_DEBUG @info "[RECOMPILATION] step 7/7: modelCall @eval done (submodel ODEProblem built)" elapsed_s=round(time()-_t_start, digits=2)
-    # NoInit prevents MTK from re-running init NLS on within-mode reinit
-    # events; the recompilation handler already supplies a consistent newU0
-    # via createNewU0, so MTK re-init would only undo within-mode reinits
-    compositeProblem = ModelingToolkit.ODEProblem(
-      reducedSystem,
-      finalInitialValues,
-      tspan,
-      pars,
-      callback = CallbackSet(callbackConditions, callbacks),
-      initializealg = ModelingToolkit.SciMLBase.NoInit()
-    )
-    @VSS_DEBUG @info "[RECOMPILATION] composite ODEProblem rebuilt" elapsed_s=round(time()-_t_start, digits=2)
-    #=4) Changed System=#
-    #= 4.1 Update the structural callback with the new situation =#
-    structuralCallback.metaModel = simulationCode.frontendModel
-    structuralCallback.stringToSimVarHT = simulationCode.stringToSimVarHT
-    #= 4.2) Assign this system to newSystem. =#
-    return (compositeProblem, simulationCode.stringToSimVarHT, finalInitialValues, initialValues, reducedSystem)
+    local owner::String = OMBackend.canonicalName(activeModeName)
+    local ownerModule::Module = Base.invokelatest(getglobal, OMBackend, Symbol(owner))
+    local applied::Vector{Pair{String, String}} = _withChange(structuralCallback.applied, elementToChange, newValue)
+    local key::RecompiledModeKey = (owner, ownerModule, objectid(structuralCallback.origin), applied)
+    local values::Dict{String, Float64} = RuntimeUtil.createLookupTable(integrator)
+    local cached::Union{Nothing, RecompiledMode} = get(RECOMPILED_MODES, key, nothing)
+    local starts::Dict{String, Tuple{Float64, Bool}} =
+      cached === nothing ? Dict{String, Tuple{Float64, Bool}}() : RuntimeUtil.switchStartValues(cached.originalHT, values)
+    local reuse::Bool = cached !== nothing && _sameStarts(cached, starts)
+    @VSS_DEBUG @info "[RECOMPILATION]" activeModeName elementToChange newValue t = integrator.t compiledBefore = reuse
+    local mode::RecompiledMode = if reuse
+      cached
+    else
+      _compiledMode(structuralCallback.metaModel, activeModeName, owner, ownerModule, elementToChange, newValue, values,
+                    tspan, started)
+    end
+    reuse || _rememberMode!(key, mode)
+    local callback::CallbackSet =
+      OMBackend.CodeGeneration._joinCallbacks(callbackConditions, get(mode.problem.kwargs, :callback, nothing))
+    #= NoInit: the solve sets the state at the change (createNewU0); an initialization would undo reinits of the
+       mode's events. A mode compiled before: its u0 with this change's start values, its parameters as built. =#
+    local problem::ODEProblem = if reuse
+      remake(mode.problem; u0 = _u0WithStarts(mode, starts), p = deepcopy(mode.parameters), tspan, callback,
+             initializealg = NoInit(), lazy_initialization = true)
+    else
+      remake(mode.problem; callback, initializealg = NoInit(), lazy_initialization = true)
+    end
+    structuralCallback.metaModel = mode.frontendModel
+    structuralCallback.stringToSimVarHT = mode.stringToSimVarHT
+    structuralCallback.applied = applied
+    @VSS_DEBUG @info "[RECOMPILATION] done" elapsed_s = round(time() - started, digits = 2)
+    return problem
   end
+end
+
+"""
+    _withChange(applied::Vector{Pair{String, String}}, element::String, value::Real) -> Vector{Pair{String, String}}
+
+The changes `applied` with the element `element` set to `value`: each element's last value, sorted by element.
+"""
+function _withChange(applied::Vector{Pair{String, String}}, element::String, value::Real)::Vector{Pair{String, String}}
+  local changes::Vector{Pair{String, String}} = filter(change -> first(change) != element, applied)
+  push!(changes, element => string(value))
+  return sort!(changes; by = first)
+end
+
+"""
+    _compiledMode(metaModel, activeModeName::String, owner::String, ownerModule::Module, elementToChange::String,
+                  newValue::Real, values::Dict{String, Float64}, tspan::Tuple, started::Float64) -> RecompiledMode
+
+The mode of the frontend's model `metaModel` with the element `elementToChange` of the active mode `activeModeName` set
+to `newValue` (`recompiledSimCode`), its variables starting from the values at the change `values`
+(`RuntimeUtil.switchStartValues`), compiled into the module of the model `owner` (`ownerModule`: its build owns the
+tables) and its problem built for `tspan`. `started`: the recompilation's start, for the VSS_DEBUG timings.
+"""
+function _compiledMode(metaModel, activeModeName::String, owner::String, ownerModule::Module, elementToChange::String,
+                       newValue::Real, values::Dict{String, Float64}, tspan::Tuple, started::Float64)::RecompiledMode
+  local simulationCode::SimCode.SIM_CODE = recompiledSimCode(metaModel, activeModeName, elementToChange, newValue; started)
+  @VSS_DEBUG @info "[RECOMPILATION] frontend and backend done" elapsed_s = round(time() - started, digits = 2)
+  local originalHT::RuntimeUtil.SymbolTable = copy(simulationCode.stringToSimVarHT)
+  local starts::Dict{String, Tuple{Float64, Bool}} = RuntimeUtil.switchStartValues(originalHT, values)
+  RuntimeUtil.updateInitialConditions!(simulationCode, starts)
+  Core.eval(ownerModule, translateToMTK(simulationCode, owner))
+  @VSS_DEBUG @info "[RECOMPILATION] code generated and evaluated" elapsed_s = round(time() - started, digits = 2)
+  local recompiled::Module = Base.invokelatest(getglobal, ownerModule, :Recompiled)
+  local modelFunction::Function = Base.invokelatest(getglobal, recompiled, Symbol(owner, "Model"))
+  local problem::ODEProblem = first(Base.invokelatest(modelFunction, tspan))
+  @VSS_DEBUG @info "[RECOMPILATION] problem built" elapsed_s = round(time() - started, digits = 2)
+  local unknowns::Vector{String} = String[string(u.f.name) for u in ModelingToolkit.unknowns(problem.f.sys)]
+  local startsInU0::Dict{String, Int} = Dict{String, Int}()
+  for (i, name) in enumerate(unknowns)
+    local start::Union{Nothing, Tuple{Float64, Bool}} = get(starts, name, nothing)
+    (start !== nothing && isequal(problem.u0[i], first(start))) && (startsInU0[name] = i)
+  end
+  local observed::Set{String} = Set{String}(string(eq.lhs.f.name) for eq in ModelingToolkit.observed(problem.f.sys))
+  return RecompiledMode(problem, deepcopy(problem.p), simulationCode.frontendModel, simulationCode.stringToSimVarHT,
+                        originalHT, starts, startsInU0, observed)
+end
+
+"""
+    _sameStarts(mode::RecompiledMode, starts::Dict{String, Tuple{Float64, Bool}}) -> Bool
+
+Whether a change that gives the recompiled model the start values `starts` (`RuntimeUtil.switchStartValues`) can take
+the mode compiled before: the same variables get start values, by the same names (`updateInitialConditions!` sets
+their other attributes by it), and the same values except where the solve does not read them (the unknowns whose start
+the build took as their u0, set by `_u0WithStarts`; the observed variables).
+"""
+function _sameStarts(mode::RecompiledMode, starts::Dict{String, Tuple{Float64, Bool}})::Bool
+  length(starts) == length(mode.starts) || return false
+  for (name, (value, byLocalName)) in starts
+    local before::Union{Nothing, Tuple{Float64, Bool}} = get(mode.starts, name, nothing)
+    (before !== nothing && last(before) == byLocalName) || return false
+    (haskey(mode.startsInU0, name) || name in mode.observed || isequal(first(before), value)) || return false
+  end
+  return true
+end
+
+"""
+    _u0WithStarts(mode::RecompiledMode, starts::Dict{String, Tuple{Float64, Bool}}) -> Vector{Float64}
+
+The u0 of the mode compiled before for a change that gives the start values `starts` (`_sameStarts`): its own, with
+the new start values of the unknowns whose start the build took as their u0.
+"""
+function _u0WithStarts(mode::RecompiledMode, starts::Dict{String, Tuple{Float64, Bool}})::Vector{Float64}
+  local u0::Vector{Float64} = collect(Float64, mode.problem.u0)
+  for (name, i) in mode.startsInU0
+    u0[i] = first(starts[name])
+  end
+  return u0
 end
 
 """
@@ -753,11 +832,8 @@ end
   The agent returns a vector of new values, one per component in
   structuralCallback.componentsToChange.
 """
-function recompilation(activeModeName,
-                       structuralCallback::StructuralChangeAgenticRecompilation,
-                       integrator,
-                       tspan,
-                       callbackConditions)::Tuple
+function recompilation(activeModeName::String, structuralCallback::StructuralChangeAgenticRecompilation,
+                       integrator::DEIntegrator, tspan::Tuple, callbackConditions::CallbackSet)::ODEProblem
   local runId = OMBackend.createLogRunId(activeModeName; suffix = "agentic_recompilation")
   return OMBackend.withLogRunDir(runId) do
     @info "[RECOMPILATION] Agentic recompilation triggered at t=$(integrator.t), components=$(structuralCallback.componentsToChange)"
@@ -816,25 +892,23 @@ function recompilation(activeModeName,
       error("Agent returned $(length(newValues)) values for $(length(structuralCallback.componentsToChange)) components; expected equal length. components=$(structuralCallback.componentsToChange), returned=$(newValues)")
     end
     #= Apply each modification in sequence via the standard recompilation path =#
-    local problem = nothing
-    local ht_new = structuralCallback.stringToSimVarHT
-    local finalInitialValues = integrator.u
-    local initialValues = integrator.u
-    local reducedSystem = nothing
+    local problem::Union{Nothing, ODEProblem} = nothing
     for (componentName, newValue) in zip(structuralCallback.componentsToChange, newValues)
-      scr = StructuralChangeRecompilation(activeModeName,
-                                          false,
-                                          structuralCallback.metaModel,
-                                          (componentName, string(newValue)),
-                                          structuralCallback.stringToSimVarHT,
-                                          integrator.t,
-                                          Float64[])
-      (problem, ht_new, finalInitialValues, initialValues, reducedSystem) =
-        recompilation(activeModeName, scr, integrator, tspan, callbackConditions)
+      #= the agent's value, whatever the symbol table =#
+      local newValueOf::Function = let value = newValue
+        (_::RuntimeUtil.SymbolTable) -> value
+      end
+      local scr::StructuralChangeRecompilation = StructuralChangeRecompilation(activeModeName, false,
+                                                                               structuralCallback.metaModel,
+                                                                               (componentName, newValueOf),
+                                                                               structuralCallback.stringToSimVarHT,
+                                                                               integrator.t, Float64[])
+      problem = recompilation(activeModeName, scr, integrator, tspan, callbackConditions)
       structuralCallback.metaModel = scr.metaModel
       structuralCallback.stringToSimVarHT = scr.stringToSimVarHT
     end
-    return (problem, ht_new, finalInitialValues, initialValues, reducedSystem)
+    problem === nothing && error("agentic_recompilation without parameters to change ($(activeModeName))")
+    return problem
   end
 end
 

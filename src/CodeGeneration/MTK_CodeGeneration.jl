@@ -396,6 +396,43 @@ emitStructuralTransitionProblem() = quote
 end
 
 """
+    compositeProblemConstruction(defaultMode::Bool) -> Expr
+
+The composite model's problem (`compositeProblem`) in a VSS model's function, from the initial mode's (`subModel`,
+built from `reducedSystem` with `finalInitialValues`, `initialValues` and `pars`) with the structural callbacks
+(`callbackSet`) after its own. A model without explicit modes (`defaultMode`, a recompilation's) has the model itself
+as its mode, built as the composite is (`emitStructuralTransitionProblem`): the mode's problem remade with the
+callbacks, not built a second time. Explicit modes are built as models of their own (their initialization solved:
+`emitInitSolveDAEProblem`): the composite is built from the mode's system as `emitStructuralTransitionProblem` builds
+it.
+"""
+function compositeProblemConstruction(defaultMode::Bool)::Expr
+  defaultMode && return quote
+    compositeProblem = ModelingToolkit.SciMLBase.remake(subModel;
+      callback = OMBackend.CodeGeneration._joinCallbacks(get(subModel.kwargs, :callback, nothing), callbackSet...),
+      lazy_initialization = true)
+  end
+  #= Dispatch on the mass matrix of the initial submodel exactly like the submodel builder does: pure ODE takes the
+     fast fill-all-u0 / skip-initializer path; DAE routes finalInitialValues as hard u0 while letting the initializer
+     use reducedSystem.guesses (already populated by splitInitialValues) to solve algebraic residuals such as
+     x = L*sin(phi) for the Pendulum. Injecting _compositeGuesses as hard u0 for a DAE submodel would pin phi = 0 and
+     silently violate the constraint. =#
+  return quote
+    local _compositeIsPureODE = Base.invokelatest(OMBackend.CodeGeneration.isPureODESystem, reducedSystem)
+    if _compositeIsPureODE
+      local _compositeGuesses = Base.invokelatest(
+        OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
+      compositeProblem = ModelingToolkit.ODEProblem(reducedSystem, merge(Dict(finalInitialValues), _compositeGuesses, pars),
+                                                    tspan; callback = callbackConditions,
+                                                    warn_initialize_determined = false, build_initializeprob = false)
+    else
+      compositeProblem = ModelingToolkit.ODEProblem(reducedSystem, merge(Dict(finalInitialValues), pars), tspan;
+                                                    callback = callbackConditions, warn_initialize_determined = false)
+    end
+  end
+end
+
+"""
     emitInitSolveDAEProblem()
 
 Strategy 3: standard DAE-with-init-solver. Force MTK to build the
@@ -772,36 +809,7 @@ function ODE_MODE_MTK(simCode::SC.SIM_CODE)
       #= END =#
       # Also need to have the original callbacks
       callbackConditions = OMBackend.CodeGeneration._joinCallbacks(callbacks, callbackSet...)
-      #= Create the composite model. Dispatch on the mass matrix of the initial
-         submodel exactly like the submodel builder does: pure ODE takes the
-         fast fill-all-u0 / skip-initializer path; DAE routes finalInitialValues
-         as hard u0 while letting the initializer use reducedSystem.guesses
-         (already populated by splitInitialValues) to solve algebraic residuals
-         such as x = L*sin(phi) for the Pendulum. Injecting _compositeGuesses
-         as hard u0 for a DAE submodel would pin phi = 0 and silently violate
-         the constraint. =#
-      local _compositeIsPureODE = Base.invokelatest(
-        OMBackend.CodeGeneration.isPureODESystem, reducedSystem)
-      if _compositeIsPureODE
-        local _compositeGuesses = Base.invokelatest(
-          OMBackend.CodeGeneration.buildDefaultGuesses, reducedSystem, finalInitialValues, initialValues)
-        compositeProblem = ModelingToolkit.ODEProblem(
-          reducedSystem,
-          merge(Dict(finalInitialValues), _compositeGuesses, pars),
-          tspan;
-          callback = callbackConditions,
-          warn_initialize_determined = false,
-          build_initializeprob = false,
-        )
-      else
-        compositeProblem = ModelingToolkit.ODEProblem(
-          reducedSystem,
-          merge(Dict(finalInitialValues), pars),
-          tspan;
-          callback = callbackConditions,
-          warn_initialize_determined = false,
-        )
-      end
+      $(compositeProblemConstruction(isempty(simCode.subModels)))
       #=
       Note the difference between the two here.
       In the case of recompilation we will get fresh callbacks updated to the new structure of the final code.

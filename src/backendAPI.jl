@@ -310,7 +310,7 @@ Clear persistent caches. By default all caches are cleared.
 Use keyword arguments to selectively clear individual caches.
 
 - `models`: compiled MTK model ASTs, the cached builds and their external objects (tables),
-  which their destructors free
+  which their destructors free, and the modes compiled at structural changes (`Runtime.RECOMPILED_MODES`)
 - `implementations`: Modelica function implementations
 - `wrappers`: RTG wrapper functions for symbolic dispatch
 - `extractors`: per-element array extractor functions
@@ -325,6 +325,7 @@ function clearCaches!(; models::Bool=true,
                       empty!(IMTKGen.BUILT); empty!(IMTKGen.BUILT_HASH);
                       empty!(IMTKGen.REDUCED_SYSTEMS); empty!(IMTKGen.PRISTINE_P);
                       empty!(CodeGeneration.DAE_REINIT);
+                      empty!(Runtime.RECOMPILED_MODES);
                       Cache.clear!();
                       push!(cleared, "models"))
   implementations && (empty!(CodeGeneration.MODELICA_FUNCTION_IMPLS); empty!(CodeGeneration.MODELICA_FUNCTION_OWNERS);
@@ -354,6 +355,7 @@ function forgetModel(modelName::String)::Nothing
   local cname = canonicalName(modelName)
   IMTKGen.forgetBuild(cname)
   Cache.remove!(cname)
+  Runtime.forgetRecompiledModes!(cname)
   for name in unique((modelName, cname))
     delete!(COMPILED_MODELS_MTK, name)
     delete!(COMPILED_MODELS_DEJL, name)

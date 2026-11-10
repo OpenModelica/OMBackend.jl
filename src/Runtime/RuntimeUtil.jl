@@ -179,37 +179,62 @@ function getValuesForUnknowns(integrator)
 end
 
 """
-    updateInitialConditions!(simCode, integrator) -> Nothing
-
-The start values of the recompiled model's Real variables: their values at the change
-(createLookupTable), by name, with their other attributes, not fixed (the new problem starts
-from the state at the change: createNewU0, NoInit). A variable without one takes the value of
-the old variable of its name without the component (`bouncingBall_y` the pendulum's
-`pendulum_y`, a dynamic transition), fixed, when only one old variable has that name. Matching
-every variable that way, fixed and its attributes replaced, made a MultiBody model's recompiled
-system unbalanced (`body_frame_a_f` took `revolute_frame_a_f`'s value).
+The symbol table of a model's simulation code (`SIM_CODE.stringToSimVarHT`): a variable's index and its
+specification by its name.
 """
-function updateInitialConditions!(simCode::OMBackend.SimCode.SIM_CODE, integrator)::Nothing
+const SymbolTable = OMBackend.SimCode.OrderedDict{String, Tuple{Int, OMBackend.SimCode.SIMVAR}}
+
+"""
+    switchStartValues(ht::SymbolTable, values::Dict{String, Float64}) -> Dict{String, Tuple{Float64, Bool}}
+
+The start values a structural change gives the Real variables of the recompiled model's symbol table `ht`, from the
+old model's values at the change `values` (createLookupTable): the value of a variable's own name, else (`true`, by
+the local name) the value of the old variable of its name without the component (`bouncingBall_y` the pendulum's
+`pendulum_y`, a dynamic transition) when only one old variable has that name. `updateInitialConditions!` sets them;
+a recompiled mode compiled at an earlier change compares them (`Runtime.RecompiledMode`).
+"""
+function switchStartValues(ht::SymbolTable, values::Dict{String, Float64})::Dict{String, Tuple{Float64, Bool}}
   local SC = OMBackend.SimCode
-  local values = createLookupTable(integrator)
   #= the old values by the name without the component; nothing when two old variables share it =#
-  local byLocalName = Dict{String, Union{Nothing, Float64}}()
+  local byLocalName::Dict{String, Union{Nothing, Float64}} = Dict{String, Union{Nothing, Float64}}()
   for (name, v) in values
-    local local_ = _withoutComponent(name)
+    local local_::String = _withoutComponent(name)
     isempty(local_) && continue
     byLocalName[local_] = haskey(byLocalName, local_) ? nothing : v
   end
-  local ht = simCode.stringToSimVarHT
-  for (name, (idx, simVar)) in ht
+  local starts::Dict{String, Tuple{Float64, Bool}} = Dict{String, Tuple{Float64, Bool}}()
+  for (name, (_, simVar)) in ht
     (simVar.elementType isa SC.TYPE_REAL || !SC.attributesGiven(simVar.elementType, simVar.attributes)) || continue
-    local exact = get(values, name, nothing)
-    local attributes = if exact !== nothing
-      SC.withAttributes(simVar.attributes; start = SC.RCONST(exact),
-                        fixed = SC.attributesGiven(simVar.elementType, simVar.attributes) ? simVar.attributes.fixed : SC.BCONST(false))
+    local exact::Union{Nothing, Float64} = get(values, name, nothing)
+    if exact !== nothing
+      starts[name] = (exact, false)
     else
-      local other = get(byLocalName, _withoutComponent(name), nothing)
-      other === nothing && continue
-      SC.withAttributes(SC.NO_ATTRIBUTES; start = SC.RCONST(other), fixed = SC.BCONST(true))
+      local other::Union{Nothing, Float64} = get(byLocalName, _withoutComponent(name), nothing)
+      other === nothing || (starts[name] = (other, true))
+    end
+  end
+  return starts
+end
+
+"""
+    updateInitialConditions!(simCode, starts::Dict{String, Tuple{Float64, Bool}}) -> Nothing
+
+The start values of the recompiled model's Real variables, `starts` (`switchStartValues`): a value of the variable's
+own name with its other attributes, not fixed (the new problem starts from the state at the change: createNewU0,
+NoInit); a value by the local name fixed, its other attributes dropped. Matching every variable that way, fixed and
+its attributes replaced, made a MultiBody model's recompiled system unbalanced (`body_frame_a_f` took
+`revolute_frame_a_f`'s value).
+"""
+function updateInitialConditions!(simCode::OMBackend.SimCode.SIM_CODE, starts::Dict{String, Tuple{Float64, Bool}})::Nothing
+  local SC = OMBackend.SimCode
+  local ht::SymbolTable = simCode.stringToSimVarHT
+  for (name, (value, byLocalName)) in starts
+    local (idx::Int, simVar::SC.SIMVAR) = ht[name]
+    local attributes::SC.SimVarAttributes = if byLocalName
+      SC.withAttributes(SC.NO_ATTRIBUTES; start = SC.RCONST(value), fixed = SC.BCONST(true))
+    else
+      SC.withAttributes(simVar.attributes; start = SC.RCONST(value),
+                        fixed = SC.attributesGiven(simVar.elementType, simVar.attributes) ? simVar.attributes.fixed : SC.BCONST(false))
     end
     ht[name] = (idx, SC.withAttributes(simVar, attributes))
   end
