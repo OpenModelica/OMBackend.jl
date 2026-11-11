@@ -40,7 +40,7 @@
    name that ccalls it (in externalCModule()), with the C types of the Modelica declaration. The generated call
    then goes the way of the other external functions (namespaceifyExternalFunction).
    ModelicaError and the other utility functions resolve at load time from
-   OMRuntimeExternalC's libModelicaCallbacks (loaded RTLD_GLOBAL). A function that a library
+   OMRuntimeExternalC's libModelicaExternalC (loaded RTLD_GLOBAL). A function that a library
    OMRuntimeExternalC ships defines (its Library annotation) is called there, not compiled. =#
 
 """
@@ -127,23 +127,25 @@ function _cScalarType(t::SimCode.SType)
 end
 
 """
-The library OMRuntimeExternalC ships under a name of the Library annotation, when it
-defines the function: OMRuntimeExternalC has no Julia function for every C function of
-its libraries (MSL's ModelicaInternal_mkdir, in libModelicaExternalC; its Include,
-ModelicaInternal.h, only declares it).
+The Library annotation names of the Modelica Standard Library whose C functions are in OMRuntimeExternalC's
+library (libModelicaExternalC holds what MSL builds as ModelicaExternalC, ModelicaStandardTables, ModelicaIO,
+ModelicaMatIO and zlib).
+"""
+const SHIPPED_LIBRARY_NAMES = ("ModelicaExternalC", "ModelicaStandardTables", "ModelicaIO", "ModelicaMatIO", "zlib")
+
+"""
+The library OMRuntimeExternalC ships (its path), when a name of the Library annotation is one of
+SHIPPED_LIBRARY_NAMES and the library defines the function: OMRuntimeExternalC has no Julia function
+for every C function of the library (MSL's ModelicaInternal_mkdir; its Include, ModelicaInternal.h,
+only declares it).
 """
 function _shippedLibraryDefining(ann::AbstractString, cname::Symbol)::Union{String, Nothing}
-  local installed = OMRuntimeExternalC.installedLibPath
-  installed === nothing && return nothing
-  local ext = Sys.iswindows() ? ".dll" : Sys.isapple() ? ".dylib" : ".so"
-  for name in _annotationStrings(ann, "Library")
-    local lib = joinpath(dirname(installed), "lib" * name * ext)
-    isfile(lib) || continue
-    local handle = Base.Libc.Libdl.dlopen(lib, Base.Libc.Libdl.RTLD_GLOBAL | Base.Libc.Libdl.RTLD_LAZY; throw_error = false)
-    handle === nothing && continue
-    Base.Libc.Libdl.dlsym(handle, cname; throw_error = false) === nothing || return lib
-  end
-  return nothing
+  local lib::Union{String, Nothing} = OMRuntimeExternalC.libraryPath()
+  lib === nothing && return nothing
+  any(name -> name in SHIPPED_LIBRARY_NAMES, _annotationStrings(ann, "Library")) || return nothing
+  local handle = Base.Libc.Libdl.dlopen(lib, Base.Libc.Libdl.RTLD_GLOBAL | Base.Libc.Libdl.RTLD_LAZY; throw_error = false)
+  handle === nothing && return nothing
+  return Base.Libc.Libdl.dlsym(handle, cname; throw_error = false) === nothing ? nothing : lib
 end
 
 """

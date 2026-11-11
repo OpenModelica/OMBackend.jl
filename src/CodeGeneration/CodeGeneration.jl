@@ -38,7 +38,6 @@ module CodeGeneration
 import DataStructures
 using DataStructures: OrderedDict, OrderedSet
 using Setfield
-using DocStringExtensions
 using ModelingToolkit
 using LinearAlgebra
 import DiffEqBase

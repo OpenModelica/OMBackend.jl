@@ -2084,17 +2084,22 @@ end
 #= ==================================================================================== =#
 
 """
-    performStructuralSimplify(; observedFilter = nothing, split = !DIRECT_RHS_GENERATION[], indexReduced = false)
+    performStructuralSimplify(; observedFilter = nothing, split = !DIRECT_RHS_GENERATION[], indexReduced = false,
+                              lateReads = Symbol[], lateReadNames = String[])
 
 The structural simplification of `firstOrderSystem` into `reducedSystem` (tearing only for a
 system OMBackend reduced, `indexReduced`); with an observed
 filter, the observed equations kept those whose variable a pattern matches, with the observed
-variables they read and the system's, the initialization equations' and the events' read. With
-ENABLE_BACKEND_LOGGING, the system before is dumped to `backend/codeGen/preStructuralSimplify.log`
+variables they read and the system's, the initialization equations' and the events' read, and what is
+read from the problem once it is built: `lateReads` names the build function's locals that hold the
+symbolic expressions read then (`lateReadVariables`: the discrete clusters, the if-equation relations,
+the delay() arguments), `lateReadNames` the variables looked up by name then (`eventSideReadNames`).
+With ENABLE_BACKEND_LOGGING, the system before is dumped to `backend/codeGen/preStructuralSimplify.log`
 (the path taken at codegen time, in the model's run directory).
 """
 function performStructuralSimplify(; observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                                   split::Bool = !OMBackend.DIRECT_RHS_GENERATION[], indexReduced::Bool = false)::Expr
+                                   split::Bool = !OMBackend.DIRECT_RHS_GENERATION[], indexReduced::Bool = false,
+                                   lateReads::Vector{Symbol} = Symbol[], lateReadNames::Vector{String} = String[])::Expr
   local dumpExpr = :(nothing)
   @BACKEND_LOGGING dumpExpr = dumpPreStructuralSimplifyExpr(
       OMBackend.logPath("backend/codeGen", "preStructuralSimplify.log"))
@@ -2149,6 +2154,16 @@ function performStructuralSimplify(; observedFilter::Union{Nothing, Vector{Strin
     for _v in OMBackend.CodeGeneration.MTK_CodeGenerationUtil.eventReadVariables(reducedSystem)
       haskey(_obsByLhs, _v) && push!(_stack, _v)
     end
+    #= And from what is read from the problem once it is built: the discrete clusters, the relation refresh and the
+       delay records (symbolic), the asserts, the whens' bodies and the initial algorithms (by name). An observed
+       variable only they read was dropped, and the reader could not be bound (Models/ObservedFilter.mo). =#
+    for _v in OMBackend.CodeGeneration.MTK_CodeGenerationUtil.lateReadVariables($(lateReads...))
+      haskey(_obsByLhs, _v) && push!(_stack, _v)
+    end
+    local _lateReadNames::Set{String} = Set{String}($(lateReadNames))
+    for _eq in _allObs
+      something(OMBackend.CodeGeneration.variableName(_eq.lhs), "") in _lateReadNames && push!(_stack, _eq.lhs)
+    end
     while !isempty(_stack)
       local _lhs::Any = pop!(_stack)
       (_lhs in _keep) && continue
@@ -2165,6 +2180,47 @@ function performStructuralSimplify(; observedFilter::Union{Nothing, Vector{Strin
       reducedSystem = Setfield.set(reducedSystem, Setfield.PropertyLens{:observed}(), _filteredObs)
     end
   end
+end
+
+"""
+    lateReadVariables(lists...) -> Vector{Any}
+
+The variables the symbolic expressions in `lists` read (`_symbolicReads!`: nested vectors and tuples, a discrete
+cluster's reads): what the callbacks built after the problem read from its system, which performStructuralSimplify's
+observed filter therefore keeps.
+"""
+function lateReadVariables(lists::Vector{Any}...)::Vector{Any}
+  local out::Vector{Any} = Any[]
+  foreach(list::Vector{Any} -> _symbolicReads!(out, list), lists)
+  return out
+end
+
+"""
+    eventSideReadNames(simCode) -> Vector{String}
+
+The identifiers of the variables `simCode`'s when-equations (conditions, statements, elsewhen arms), asserts
+(condition, message, level) and initial algorithms read, in order: their generated code looks its variables up in
+the built problem by name (the whens' affects, the assert callback, the runtime initial algorithm), so
+performStructuralSimplify's observed filter keeps the observed ones.
+"""
+function eventSideReadNames(simCode::SC.SIM_CODE)::Vector{String}
+  local names::OrderedSet{String} = OrderedSet{String}()
+  local visit::Function = (e::SC.Exp) -> (SC.identifierNames!(names, e); nothing)
+  for w::SC.WHEN_EQUATION in simCode.whenEquations
+    local stmts::Union{Nothing, SC.WHEN_STMTS} = w.whenEquation
+    while stmts !== nothing
+      visit(stmts.condition)
+      SC.foreachStatementExp(visit, stmts.body)
+      stmts = stmts.elsewhenPart
+    end
+  end
+  for a::SC.ASSERT_EQUATION in simCode.asserts
+    foreach(visit, (a.condition, a.message, a.level))
+  end
+  for ia::SC.INITIAL_ALGORITHM in simCode.initialAlgorithms
+    SC.foreachStatementExp(visit, ia.statements)
+  end
+  return collect(names)
 end
 
 """

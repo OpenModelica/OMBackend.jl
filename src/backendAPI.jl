@@ -78,11 +78,22 @@ import .Passes
 import .SimCode
 
 import Base.Meta
-import JuliaFormatter
-import Plots
 
 #= Settings =#
 const WARN_MISSING_START_VALUES = Ref(false)
+
+#= The formatter of the generated code: JuliaFormatter's format_text once JuliaFormatter is loaded (the extension
+   OMBackendJuliaFormatterExt sets it), else the text as it is. =#
+const FORMAT_TEXT = Ref{Function}((text::String; kwargs...) -> text)
+
+"""
+    formatText(text::String; kwargs...)::String
+
+The Julia source `text` formatted with JuliaFormatter's `format_text` (the keywords are its), or `text` itself
+when JuliaFormatter is not loaded. JuliaFormatter is a weak dependency: `using JuliaFormatter` loads the extension
+that provides it (`OM` loads it).
+"""
+formatText(text::String; kwargs...)::String = FORMAT_TEXT[](text; kwargs...)
 
 """
 Toggle direct RHS generation, bypassing MTK's ODEProblem constructor.
@@ -150,21 +161,25 @@ const OSMC_COPYRIGHT_HEADER = """
 *
 * All rights reserved.
 *
-* THIS PROGRAM IS PROVIDED UNDER THE TERMS OF GPL VERSION 3 LICENSE OR
-* THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.2.
+* THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+* THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
 * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
-* RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GPL VERSION 3,
-* ACCORDING TO RECIPIENTS CHOICE.
+* RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+* VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
 *
-* The OpenModelica software and the Open Source Modelica
-* Consortium (OSMC) Public License (OSMC-PL) are obtained
-* from OSMC, either from the above address,
-* from the URLs: http:www.ida.liu.se/projects/OpenModelica or
-* http:www.openmodelica.org, and in the OpenModelica distribution.
-* GNU version 3 is obtained from: http:www.gnu.org/copyleft/gpl.html.
+* The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+* Public License (OSMC-PL) are obtained from OSMC, either from the above
+* address, from the URLs:
+* http://www.openmodelica.org or
+* https://github.com/OpenModelica/ or
+* http://www.ida.liu.se/projects/OpenModelica,
+* and in the OpenModelica distribution.
+*
+* GNU AGPL version 3 is obtained from:
+* https://www.gnu.org/licenses/licenses.html#GPL
 *
 * This program is distributed WITHOUT ANY WARRANTY; without
-* even the implied warranty of  MERCHANTABILITY or FITNESS
+* even the implied warranty of MERCHANTABILITY or FITNESS
 * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
 * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
 *
@@ -875,11 +890,11 @@ function modelToString(modelName::String; MTK = true, keepComments = true, keepB
   local modelStr::String = "$strippedModel"
   local formattedResults
   try
-    formattedResults = JuliaFormatter.format_text(modelStr;
-                                                  remove_extra_newlines = true,
-                                                  indent = 4,
-                                                  margin = 200,
-                                                  always_use_return = true)
+    formattedResults = formatText(modelStr;
+                                  remove_extra_newlines = true,
+                                  indent = 4,
+                                  margin = 200,
+                                  always_use_return = true)
   catch e
     isFatal(e) && rethrow()
     @warn "Julia Formatter failed to format the output results due to $(e)"
@@ -1161,54 +1176,18 @@ function resimulateModel(modelName::String;
                        (isempty(parameters) ? (;) : (; parameters = parameters))..., kwargs...)
 end
 
-"
-`plot(sol::Runtime.OMSolution)`
-  The default plot function of OMBackend.
-  All labels of the variables and the name is given by default
-"
-function plot(sol::Runtime.OMSolution)
-  local nsolution = sol.diffEqSol
-  local t = nsolution.t
-  local rescols = collect(eachcol(transpose(hcat(nsolution.u...))))
-  labels = permutedims(sol.idxToName.vals)
-  Plots.plot(t, rescols; labels=labels)
-end
+"""
+    plot(sol)
 
+Plots a solution of OMBackend with Plots.jl: an `OMSolution` (all variables with their names), an `OMSolutions`
+(its sub solutions on the same graph, keywords `legend`, `limX`, `limY`), a vector of solutions, or any solution
+Plots can plot. The methods are added by the extension OMBackendPlotsExt, which Julia loads when Plots is loaded:
+`using Plots` (on Windows before OMBackend is loaded, see the head of `src/OMBackend.jl`). `OM` loads Plots itself.
 """
-`function plot(sol)`
-  An alternative plot function in OMBackend.
-  All labels of the variables and the name is given by default
-"""
-function plot(sol)
-  Plots.plot(sol)
-end
+function plot end
 
-"""
-  Plot for an OMSolution that contains several sub solutions.
-  Plots all part of the solution on the same graph.
-"""
-function plot(sol::Runtime.OMSolutions; legend = false, limX = 0.0, limY = 1.0)
-  local sols = sol.diffEqSol
-  local prevP = Plots.plot!(sols[1]; legend = legend, xlim=limX, ylim = limY)
-  for sol in sols[2:end]
-    p = Plots.plot!(prevP; legend = legend, xlim=limX, ylim = limY)
-    prevP = p
-  end
-  return prevP
-end
-
-"""
-  Plots a vector of solutions
-"""
-function plot(sol::Vector; legend = false, limX = 0.0, limY = 1.0, kwargs...)
-  sols = sol
-  local prevP = Plots.plot!(sols[1]; legend = legend, xlim=limX, ylim = limY, kwargs...)
-  for sol in sols[2:end]
-    p = Plots.plot!(prevP; legend = legend, xlim=limX, ylim = limY, kwargs...)
-    prevP = p
-  end
-  return prevP
-end
+plot(args...; kwargs...) = throw(ArgumentError(
+  "OMBackend.plot needs Plots.jl: run `using Plots` (on Windows before loading OMBackend), or use OM, which loads it"))
 
 """
   Returns the value of a variable given a solution and a string.

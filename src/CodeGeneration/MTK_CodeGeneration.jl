@@ -1191,8 +1191,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
   local IF_RELATIONS = collect(Iterators.flatten(c.relations for c in IF_EQUATION_COMPONENTS))
   #= Kill switch OMBACKEND_INIT_DISCRETES=false: no initial fixpoint of the
      discrete clusters (_settleInitialDiscretes!). =#
-  local INIT_DISCRETE_CLUSTERS = OMBackend.envSwitch("OMBACKEND_INIT_DISCRETES") ?
-    _discreteClusterSpecs(simCode) : Expr[]
+  local DISCRETE_CLUSTERS::Vector{Expr} = _discreteClusterSpecs(simCode)
+  local INIT_DISCRETE_CLUSTERS = OMBackend.envSwitch("OMBACKEND_INIT_DISCRETES") ? DISCRETE_CLUSTERS : Expr[]
   local IF_INIT_LITERALS = OMBackend.envSwitch("OMBACKEND_INIT_RELATIONS") ?
     collect(Iterators.flatten(c.initLiterals for c in IF_EQUATION_COMPONENTS)) : Expr[]
   local ifCondParamNames = copy(ifConditionalVariables)
@@ -1519,8 +1519,22 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
                                               hasObserved = !isempty(simCode.aliasMap) ||
                                                             !isempty(simCode.eliminatedVariables)))
       firstOrderSystem = nonLinearSystem
+      #= What reads the problem once it is built, made before the structural simplification: its observed filter
+         keeps the observed variables these read. The relations and the discrete clusters the initialization
+         settles (clusters of their own), the discrete clusters and the if-equation relations of the event
+         iteration, the delay() arguments and delay times. In the latest world, like the event list: the symbolic
+         variables are globals bound while the model is built (MSL Digital FullAdder's delay arguments). =#
+      _ifInitLiterals = Base.invokelatest(() -> Any[$(IF_INIT_LITERALS...)])
+      _initDiscreteClusters = Base.invokelatest(() -> Any[$(INIT_DISCRETE_CLUSTERS...)])
+      local _discreteClusters::Vector{Any} = $(discreteClusterList(DISCRETE_CLUSTERS))
+      local _ifRelationEntries::Vector{Any} = $(relationRefreshEntries(IF_RELATIONS))
+      local _delayArguments::Vector{Any} = Base.invokelatest(() -> Any[$([c[2] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)])
+      local _delayTimes::Vector{Any} = Base.invokelatest(() -> Any[$([c[3] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)])
       #= Structural simplification =#
-      $(performStructuralSimplify(; observedFilter = simCode.observedFilter, split = !useDirectRHS, indexReduced = simCode.indexReduced))
+      $(performStructuralSimplify(; observedFilter = simCode.observedFilter, split = !useDirectRHS, indexReduced = simCode.indexReduced,
+                                  lateReads = [:_ifInitLiterals, :_initDiscreteClusters, :_discreteClusters, :_ifRelationEntries,
+                                               :_delayArguments, :_delayTimes],
+                                  lateReadNames = MTK_CodeGenerationUtil.eventSideReadNames(simCode)))
       #= Inject observed equations post-simplification so they do not interfere
          with AffectSystem tearing during callback compilation. =#
       if @isdefined(observedEqs) && !isempty(observedEqs)
@@ -1556,30 +1570,22 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
          structural-transition branch additionally dispatches at runtime on
          the mass matrix. See `emitProblemConstruction` and its three
          strategy emitters for the full rationale. =#
-      #= The relations the initialization settles (in the latest world, like
-         the event list: the symbolic variables are globals bound while the
-         model is built). =#
-      _ifInitLiterals = Base.invokelatest(() -> Any[$(IF_INIT_LITERALS...)])
-      #= The discrete clusters the initialization settles (instances of their own). =#
-      _initDiscreteClusters = Base.invokelatest(() -> Any[$(INIT_DISCRETE_CLUSTERS...)])
       #= The set the problem is built with (withProblemCallbacks replaces it). =#
       local _buildCallbacks = callbacks
       $(emitProblemConstruction(useDirectRHS, skipInitializeProb))
       OMBackend.CodeGeneration.checkNamedStateLookups(problem, $(NAMED_STATE_LOOKUPS))
-      $(emitDiscreteClusters(simCode))
+      $(emitDiscreteClusters(simCode, DISCRETE_CLUSTERS, :_discreteClusters))
       #= Only with delay() calls: a callback on every model made each one a model with
          events (OMSurrogates' UDEs refuse those). =#
       $(isempty(MTK_CodeGenerationUtil.DELAY_CALLS) ? :() :
         :(callbacks = OMBackend.CodeGeneration.withDelayEvents(callbacks, $(QuoteNode(Symbol(MODEL_NAME))))))
-      $(emitRelationRefresh(IF_RELATIONS))
-      callbacks = OMBackend.CodeGeneration.withIntegralDiscretes(callbacks, problem, $(integralDiscreteNames(discreteVariablesSym, simCode)))
+      $(emitRelationRefresh(:_ifRelationEntries))
+      callbacks = OMBackend.CodeGeneration.withHeldDiscretes(callbacks, problem, $(heldDiscreteNames(DISCRETE_DUMMY_EQUATIONS)),
+                                                             $(integralDiscreteNames(discreteVariablesSym, simCode)))
       #= Asserts after the event iteration: they check the settled state. =#
       $(emitAssertCallback(simCode, asserts, modelPrefix))
-      #= In the latest world, as the lists above: the arguments read the model's
-         variables, bound by eval in this function (MSL Digital FullAdder). =#
       callbacks = OMBackend.CodeGeneration.withDelayRecords(callbacks, problem, $(QuoteNode(Symbol(MODEL_NAME))),
-                    Base.invokelatest(() -> Any[$([c[2] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)]),
-                    Base.invokelatest(() -> Any[$([c[3] for c in MTK_CodeGenerationUtil.DELAY_CALLS]...)]))
+                                                            _delayArguments, _delayTimes)
       #= First among the discrete callbacks: it reads the step as the solver took it. =#
       callbacks = OMBackend.CodeGeneration.withAlgebraicStepControl(callbacks, problem)
       #= The problem carries them all: a solve uses the problem's. =#

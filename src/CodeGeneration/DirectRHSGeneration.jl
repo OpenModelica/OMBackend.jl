@@ -2554,7 +2554,8 @@ solve() merges `problem.kwargs[:callback]` with the callbacks it is given, so a
 callback in both would run twice. The structural (VSS) paths build their
 problems from the build's callbacks, which stay the full set. With the
 algebraic step control among `callbacks`, the problem's `isoutofdomain` is its
-step-end check (AlgebraicDomainCheck).
+step-end check (AlgebraicDomainCheck). Every continuous callback moves the
+integrator to its events with the held discretes put back (`holdingBack`).
 """
 function withProblemCallbacks(problem, buildCallbacks, callbacks)
   local built = Base.IdSet{Any}(_callbackList(buildCallbacks))
@@ -2564,7 +2565,7 @@ function withProblemCallbacks(problem, buildCallbacks, callbacks)
   local domain = control === nothing ? NamedTuple() : (; isoutofdomain = AlgebraicDomainCheck(control))
   #= Lazily: a remake of an MTK problem with trivial initialization would
      otherwise run it now, at build time, instead of in the solve. =#
-  return ModelingToolkit.SciMLBase.remake(problem; callback = _joinCallbacks(own..., callbacks),
+  return ModelingToolkit.SciMLBase.remake(problem; callback = holdingBack(_joinCallbacks(own..., callbacks)),
                                           lazy_initialization = true, domain...)
 end
 _callbackList(::Nothing) = Any[]
@@ -2581,7 +2582,8 @@ created the callback with nothing for components that asked NoInit (MTK's
 events): a full re-solve at each event, at the solve's abstol, and MSL
 DifferenceAmplifier stopped with InitialFailure at its ramp's end.
 EventReinit (a branch event's re-solve of the algebraic unknowns) has no
-state either, so a callback carrying it is as model-independent.
+state either, so a callback carrying it is as model-independent. HeldBack
+(integralDiscretes.jl) wraps one of these and is mergeable as what it wraps.
 """
 _mergeableReinit(ia)::Bool = ia === nothing || ia isa ModelingToolkit.SciMLBase.NoInit || ia isa EventReinit
 
@@ -2710,8 +2712,8 @@ any structural surprise: a non-`CallbackSet` argument, a continuous entry that i
 neither a scalar `ContinuousCallback` nor a `VectorContinuousCallback`, non-uniform
 `rootfind` / `save_positions` across components, or any component carrying event
 metadata a flat merge cannot represent (a custom `initialize` / `finalize`, an
-`idxs` slice, or a re-initialization other than nothing, NoInit or EventReinit, or not the
-same for all components).
+`idxs` slice, or a re-initialization other than nothing, NoInit or EventReinit (each also
+within a HeldBack), or not the same for all components).
 """
 function _eraseContinuousCallbacks(cbset)
   local SB = ModelingToolkit.SciMLBase

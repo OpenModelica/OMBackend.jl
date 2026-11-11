@@ -2019,8 +2019,6 @@ wrapWithInvokelatest(x) = x  #= For non-Expr types, return as-is =#
 
 
 """
-  $(SIGNATURES)
-
   Structurally simplify algebraic equations in a system and compute the
   topological sort of the observed equations. When `simplify=true`, the `simplify`
   function will be applied during the tearing process. It also takes kwargs
@@ -2290,24 +2288,56 @@ function _exprLargerThan(@nospecialize(ex), cap::Int)::Bool
   return false
 end
 
+"""
+The branch that a condition without variables selects, for an `ifelse` call; `nothing` for anything else, and for
+a condition that has no value (`sqrt` of a negative number: the `ifelse` stays).
+"""
+function _constantBranch(@nospecialize(ex))
+  (SymbolicUtils.iscall(ex) && SymbolicUtils.operation(ex) === ifelse) || return nothing
+  local args = SymbolicUtils.arguments(ex)
+  isempty(Symbolics.get_variables(args[1])) || return nothing
+  local condition = try
+    SymbolicUtils.unwrap_const(SymbolicUtils.evaluate(args[1]))
+  catch e
+    e isa DomainError || rethrow()
+    nothing
+  end
+  condition isa Bool || return nothing
+  return condition ? args[2] : args[3]
+end
+
+"""
+`ex` with every `ifelse` whose condition holds no variable (a pre-evaluated `ifCond` flag, a comparison of known
+values) replaced by the branch the condition selects. The condition is evaluated as a number
+(`SymbolicUtils.evaluate`); nothing else is rewritten, and `simplify` is not called.
+"""
+function _takeConstantBranches(@nospecialize(ex))
+  return SymbolicUtils.Rewriters.Postwalk(SymbolicUtils.Rewriters.PassThrough(_constantBranch))(ex)
+end
+
 function _resolveAliasFromExpr(diffState, @nospecialize(expr), varCount::Int, ivMap::Dict)
   local exprSub = Symbolics.substitute(expr, ivMap)
   #= Fast path: plain substitution. =#
   local intercept = Symbolics.value(Symbolics.substitute(exprSub, Dict(diffState => 0)))
   local sumOnePoint = Symbolics.value(Symbolics.substitute(exprSub, Dict(diffState => 1)))
   if !(intercept isa Number && sumOnePoint isa Number)
-    #= Slow path only when free vars remain: simplify folds a constant-condition
-       `ifelse` (e.g. a pre-evaluated `ifCond` flag) to its taken branch, so the
-       expression collapses to numeric-affine form instead of keeping spurious
-       free branch variables that would block resolution. Capped to small
-       equations: simplify on a large dynamics expression takes minutes and an
-       alias equation never has many variables. Its size is capped too: in a
-       system with few unknowns every equation has few variables, but with the
-       observed variables substituted (full_equations) an equation can be huge,
-       and simplify then runs out of memory (the V6 cylinder rig: 8 unknowns). =#
+    #= Slow path only when free vars remain. Capped to small equations: an alias equation never has many
+       variables. Its size is capped too: in a system with few unknowns every equation has few variables, but
+       with the observed variables substituted (full_equations) an equation can be huge, and simplify then runs
+       out of memory (the V6 cylinder rig: 8 unknowns). =#
     varCount <= 8 || return nothing
     _exprLargerThan(exprSub, 200) && return nothing
-    local exprS = Symbolics.simplify(exprSub)
+    #= A constant-condition `ifelse` is replaced by its taken branch, so the branch that is not taken does not
+       keep spurious free variables that would block the resolution. =#
+    local exprS = _takeConstantBranches(exprSub)
+    #= A variable other than the state left: the equation gives the state no number (a + b*x has numeric a and
+       a + b only when neither holds a variable). Decided before any `simplify`: on a quotient of sums of
+       exponentials that keeps variables, SymbolicUtils' polynomial gcd throws a BoundsError for some orders of
+       the terms (MSL HysteresisModelComparison's Everett function, aliasInitialValueTests.jl; the order differs
+       between processes and platforms). =#
+    any(v -> !isequal(v, diffState), Symbolics.get_variables(exprS)) && return nothing
+    #= Only the state is left: with a number for it `simplify` folds what the substitution leaves (a condition
+       on the state, `sqrt(0)`). =#
     intercept = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 0))))
     sumOnePoint = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 1))))
   end
@@ -3331,8 +3361,6 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
 end
 
 """
-  $(TYPEDSIGNATURES)
-
   Takes a Nth order System and returns a new System written in first order
   form by defining new variables which represent the N-1 derivatives.
   """

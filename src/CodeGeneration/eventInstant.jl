@@ -56,9 +56,60 @@ mutable struct _InstantPre
   t::Float64
   u::Any
   reinitialized::Vector{Int}   # the states a reinit() wrote at this instant
+  held::Vector{Int}            # the held discretes among the states (`holdDiscretes!`)
+  moving::Bool                 # the integrator is being moved to an event's time (`HeldBack`)
 end
 
+_InstantPre() = _InstantPre(NaN, nothing, Int[], Int[], false)
+
 const _INSTANT_PRE = WeakKeyDict{Any, _InstantPre}()
+
+"""
+    holdDiscretes!(integrator, held)
+
+The states `held` are held discretes: unknowns with der(v) = 0, which only an
+affect writes. Registered at the start of a solve (`withHeldDiscretes`).
+"""
+function holdDiscretes!(integrator, held::Vector{Int})::Nothing
+  (ismutable(integrator) && hasproperty(integrator, :uprev) && integrator.u isa Vector{Float64}) || return nothing
+  local h::_InstantPre = get!(_InstantPre, _INSTANT_PRE, integrator)
+  h.held = held
+  h.moving = false
+  return nothing
+end
+
+"""
+The record of `integrator` if it has held discretes, or nothing.
+"""
+function _heldRecord(integrator)::Union{Nothing, _InstantPre}
+  ismutable(integrator) || return nothing
+  local h::Union{Nothing, _InstantPre} = get(_INSTANT_PRE, integrator, nothing)
+  return (h === nothing || isempty(h.held)) ? nothing : h
+end
+
+"""
+The held discretes back at their values at the step's start, where the
+integrator was moved to an event's time inside the step (`HeldBack`).
+
+The move interpolates every state; the interpolant of a constant is not the
+constant: `(1 - Θ)*v + Θ*v` is off by an ulp for some Θ, and the value stays
+(15.0 became 15.000000000000002 at an event of another variable). A comparison
+for equality reads it: MSL's CombiTimeTable returns the value before a time
+event while `nextTimeEvent == preNextTimeEvent && t >= nextTimeEvent`, so with
+nextTimeEvent an ulp later the table's right side had a point discontinuity at
+the event's time, exactly where a step cut to it evaluates its stages (MSL
+4.1.0 Fluid.Examples.TraceSubstances.RoomCO2WithControls: a wrong dense output
+of that step). Nothing writes a held discrete inside a step, so its value at
+an event is the one at the step's start.
+"""
+function _heldBack!(h::_InstantPre, integrator)::Nothing
+  local u::Vector{Float64} = integrator.u
+  local uprev::Vector{Float64} = integrator.uprev
+  for k::Int in h.held
+    u[k] = uprev[k]
+  end
+  return nothing
+end
 
 """
     instantPre(integrator)
@@ -69,7 +120,7 @@ members, put back to their held values (`_putBack!`).
 """
 function instantPre(integrator)
   ismutable(integrator) || return copy(integrator.u)
-  local h = get!(() -> _InstantPre(NaN, nothing, Int[]), _INSTANT_PRE, integrator)
+  local h::_InstantPre = get!(_InstantPre, _INSTANT_PRE, integrator)
   if h.t != integrator.t
     h.t = integrator.t
     h.u = copy(integrator.u)

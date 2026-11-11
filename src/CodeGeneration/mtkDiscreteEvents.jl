@@ -223,8 +223,25 @@ function tableClusterInitAlg()
 end
 
 """
+The unknowns of the dummy equations `der(v) ~ 0` the model is built with: the held
+discretes, which only an affect writes (withHeldDiscretes).
+"""
+function heldDiscreteNames(dummyEquations::AbstractVector)::Vector{String}
+  local out::Vector{String} = String[]
+  for eq in dummyEquations
+    local inner = _unwrapBlock(eq)
+    (inner isa Expr && inner.head === :call && length(inner.args) == 3 && inner.args[1] === :~) || continue
+    local lhs = _unwrapBlock(inner.args[2])
+    (lhs isa Expr && lhs.head === :call && length(lhs.args) == 2 && (lhs.args[1] === :der || lhs.args[1] === :D)) || continue
+    local sym::Union{Nothing, Symbol} = _simpleLeafSymbol(lhs.args[2])
+    sym === nothing || push!(out, string(sym))
+  end
+  return out
+end
+
+"""
 The discrete unknowns of Integer, Boolean or enumeration type, whose values must stay
-integral (withIntegralDiscretes).
+integral (withHeldDiscretes).
 """
 function integralDiscreteNames(discreteSyms::AbstractVector, simCode::SC.SIM_CODE)::Vector{String}
   local out = String[]
@@ -1024,14 +1041,25 @@ end
 The event iteration over the buffered relations (relationRefresh.jl): after every step, a
 relation that disagrees with the state is flipped with the hysteresis rule, and so on until
 nothing changes. Emitted with no if-equation relations too: whens on a relation among the
-callbacks are iterated as well (none of either: a no-op). In the latest world, like the
-event list: the symbolic variables are globals bound while the model is built.
+callbacks are iterated as well (none of either: a no-op). `entries`: the build function's local
+that holds the relations (`relationRefreshEntries`).
 """
-function emitRelationRefresh(relations::Vector)::Expr
-  local entries = [:(($(QuoteNode(sym)), $(zc), $(scale), $(timed))) for (sym, zc, scale, timed) in relations]
-  return :(callbacks = OMBackend.CodeGeneration.withRelationRefresh(callbacks, problem,
-                                                                     $(QuoteNode(ZC_HYSTERESIS)),
-                                                                     Base.invokelatest(() -> Any[$(entries...)])))
+function emitRelationRefresh(entries::Symbol)::Expr
+  return :(callbacks = OMBackend.CodeGeneration.withRelationRefresh(callbacks, problem, $(QuoteNode(ZC_HYSTERESIS)),
+                                                                     $(entries)))
+end
+
+"""
+    relationRefreshEntries(relations) -> Expr
+
+The if-equation relations `(ifCond, crossing function, scale, reads time)` the event iteration reads
+(emitRelationRefresh), as the list the build function makes before the structural simplification (its observed filter
+keeps what they read). In the latest world, like the event list: the symbolic variables are globals bound while
+the model is built.
+"""
+function relationRefreshEntries(relations::Vector)::Expr
+  local entries::Vector{Expr} = Expr[:(($(QuoteNode(sym)), $(zc), $(scale), $(timed))) for (sym, zc, scale, timed) in relations]
+  return :(Base.invokelatest(() -> Any[$(entries...)]))
 end
 
 #= ==================================================================================== =#
@@ -1439,22 +1467,30 @@ function _discreteClusterSpec(cond::SC.Exp, rels::Vector{SC.RELATION}, assigns::
 end
 
 """
-    emitDiscreteClusters(simCode) -> Expr
+    emitDiscreteClusters(simCode, specs, clusters) -> Expr
 
-For a model with discrete clusters (`_usesDiscreteClusters`), the whens over relations of
+For a model with discrete clusters (`specs`, `_discreteClusterSpecs`: not empty), the whens over relations of
 coupled discretes are discrete clusters: a continuous callback each locates the crossings of
-their relations, and the event iteration (emitted after this) evaluates them. In the latest
-world, like the event list: the symbolic variables are globals bound while the model is built.
+their relations, and the event iteration (emitted after this) evaluates them. `clusters`: the build
+function's local that holds them (`discreteClusterList`).
 """
-function emitDiscreteClusters(simCode::SC.SIM_CODE)::Expr
-  local specs = _discreteClusterSpecs(simCode)
+function emitDiscreteClusters(simCode::SC.SIM_CODE, specs::Vector{Expr}, clusters::Symbol)::Expr
   isempty(specs) && return Expr(:block)
   local ticks = [_sampleClock(c, simCode) for c in _clusterSampleCalls(simCode)]
   return quote
     $([:(callbacks = OMBackend.CodeGeneration._withTicks(callbacks, $(c[1]), $(c[2]), $(c[3]))) for c in ticks]...)
-    callbacks = OMBackend.CodeGeneration.withDiscreteClusters(callbacks, problem, Base.invokelatest(() -> Any[$(specs...)]))
+    callbacks = OMBackend.CodeGeneration.withDiscreteClusters(callbacks, problem, $(clusters))
   end
 end
+
+"""
+    discreteClusterList(specs) -> Expr
+
+The discrete clusters of `specs` (`_discreteClusterSpecs`) as the list the build function makes before the structural
+simplification (its observed filter keeps what they read). In the latest world, like the event list: the symbolic
+variables are globals bound while the model is built.
+"""
+discreteClusterList(specs::Vector{Expr})::Expr = :(Base.invokelatest(() -> Any[$(specs...)]))
 
 """
     _clusterSampleCalls(simCode) -> Vector{SC.CALL}

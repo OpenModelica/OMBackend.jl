@@ -7,21 +7,25 @@
 *
 * All rights reserved.
 *
-* THIS PROGRAM IS PROVIDED UNDER THE TERMS OF GPL VERSION 3 LICENSE OR
-* THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.2.
+* THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+* THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
 * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
-* RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GPL VERSION 3,
-* ACCORDING TO RECIPIENTS CHOICE.
+* RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+* VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
 *
-* The OpenModelica software and the Open Source Modelica
-* Consortium (OSMC) Public License (OSMC-PL) are obtained
-* from OSMC, either from the above address,
-* from the URLs: http:www.ida.liu.se/projects/OpenModelica or
-* http:www.openmodelica.org, and in the OpenModelica distribution.
-* GNU version 3 is obtained from: http:www.gnu.org/copyleft/gpl.html.
+* The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+* Public License (OSMC-PL) are obtained from OSMC, either from the above
+* address, from the URLs:
+* http://www.openmodelica.org or
+* https://github.com/OpenModelica/ or
+* http://www.ida.liu.se/projects/OpenModelica,
+* and in the OpenModelica distribution.
+*
+* GNU AGPL version 3 is obtained from:
+* https://www.gnu.org/licenses/licenses.html#GPL
 *
 * This program is distributed WITHOUT ANY WARRANTY; without
-* even the implied warranty of  MERCHANTABILITY or FITNESS
+* even the implied warranty of MERCHANTABILITY or FITNESS
 * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
 * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
 *
@@ -56,11 +60,11 @@ end
 # before OMBackend — which pulls in OMRuntimeExternalC and its bundled
 # libintl-8.dll. On Windows, whichever libintl-8.dll loads first wins the name;
 # if OMRuntimeExternalC's loads first, Glib's libgio-2.0-0.dll later fails with
-# "the specified procedure could not be found". Preloading Plots here forces Glib's
-# gettext to win regardless of the package __init__ order, which (unlike the
-# in-module import in OMBackend) is not guaranteed when loading the precompiled
-# package on CI.
+# "the specified procedure could not be found". OMBackend does not import Plots
+# itself (a weak dependency), so the order is the caller's: here.
 import Plots
+#= The formatter of the generated code: loads OMBackend's JuliaFormatter extension. =#
+import JuliaFormatter
 
 import OMFrontend
 using OMBackend
@@ -458,6 +462,12 @@ import .ExampleModels
 
   #= ── 20w2. What the generated model's variables are (SimCodeKind, IfConditionParameter) ── =#
   include("kindMetadataTests.jl")
+
+  #= ── 20w3. The initial value of a state from an alias equation ── =#
+  include("aliasInitialValueTests.jl")
+
+  #= ── 20w4. Held discretes keep their values where an event moves the integrator ── =#
+  include("heldDiscreteTests.jl")
 
   #= ── 20x. An observed filter and the observations injected after it ── =#
   include("observedFilterTests.jl")

@@ -44,11 +44,11 @@ workload. OMBackend alone takes OMJLIR (`translate(::OMJLIR.Model)`; omc's front
 """
 module OMBackendOMFrontendExt
 
-#= OMBackend before OMFrontend. The process that precompiles this extension loads the packages in the order of these
-   imports, and on Windows the order decides which gettext runtime the process gets: OMBackend loads Plots (Glib's
-   libintl-8.dll) before OMRuntimeExternalC (the head of src/OMBackend.jl); OMFrontend alone loads OMRuntimeExternalC,
-   whose bundled libintl-8.dll then has the name, Glib's libraries cannot be loaded against it, and the process waits
-   behind Windows' "Entry Point Not Found" dialog (the precompilation never ends). =#
+#= The process that precompiles this extension loads the packages in the order of these imports. On Windows the
+   order decides which gettext runtime the process gets: OMRuntimeExternalC (a dependency of OMBackend, and of
+   OMFrontend) loads its bundled libintl-8.dll, Glib's libraries (Plots) cannot be loaded against it later, and the
+   process waits behind Windows' "Entry Point Not Found" dialog (the precompilation never ends). This extension does not
+   load Plots; a session that does must load Plots first (OM does, OMBackend.jl#101). =#
 import OMBackend
 import MetaModelica
 import OMFrontend

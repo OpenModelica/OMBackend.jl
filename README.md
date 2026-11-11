@@ -1,4 +1,4 @@
-[![Github Action CI](https://github.com/OpenModelica/OMBackend.jl/workflows/CI/badge.svg)](https://github.com/OpenModelica/OMBackend.jl/actions) [![License: OSMC-PL](https://img.shields.io/badge/license-OSMC--PL-lightgrey.svg)](LICENSE.md)
+[![Github Action CI](https://github.com/OpenModelica/OMBackend.jl/workflows/CI/badge.svg)](https://github.com/OpenModelica/OMBackend.jl/actions) [![License: AGPL-3.0 or OSMC-PL](https://img.shields.io/badge/license-AGPL--3.0%20or%20OSMC--PL-lightgrey.svg)](LICENSE.md) [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://OpenModelica.github.io/OMBackend.jl/dev/)
 
 # About OMBackend.jl
 
@@ -29,19 +29,25 @@ relevant ones are:
 
 * DifferentialEquations.jl, OrdinaryDiffEq.jl, DiffEqBase.jl, DiffEqCallbacks.jl, Sundials.jl
 * ModelingToolkit.jl, Symbolics.jl, SymbolicUtils.jl
-* Graphs.jl, MetaGraphs.jl, DataStructures.jl, MacroTools.jl, Setfield.jl
-* Plots.jl
-* ExportAll.jl, DocStringExtensions.jl, JuliaFormatter.jl
+* Graphs.jl, DataStructures.jl, MacroTools.jl, Setfield.jl
+* ExportAll.jl
+
+Weak dependencies, each with a package extension that Julia loads when the package is loaded (they keep the
+precompilation of OMBackend alone short; `OM` loads the first two itself):
+
+* Plots.jl: `OMBackend.plot` (`OMBackendPlotsExt`). On Windows load Plots before OMBackend: Glib's gettext
+  runtime must be loaded before OMRuntimeExternalC's (OMBackend.jl#101).
+* JuliaFormatter.jl: the formatted generated code of `printModel`, `modelToString` and `writeModelToFile`; without it
+  the code is written as it is (`OMBackendJuliaFormatterExt`).
+* OMFrontend.jl with OMParser.jl and MetaModelica.jl: the lowering of the frontend's flat model (`OMBackendOMFrontendExt`).
 
 The OMJL ecosystem packages are developed from sibling checkouts next to
 `OMBackend.jl`, as the CI does (`Pkg.develop` of each, `.github/workflows/CI.yml`).
 OMBackend depends on OMRuntimeExternalC; OMFrontend (with its `SCode` module), OMParser (its `Absyn` module)
 and MetaModelica are weak dependencies, the triggers of `OMBackendOMFrontendExt`, and the tests use OMFrontend;
-ArrayUtil, ImmutableList and ListUtil are OMFrontend's:
+ImmutableList is OMFrontend's (ArrayUtil and ListUtil are modules of OMFrontend):
 
-* ArrayUtil.jl
 * ImmutableList.jl
-* ListUtil.jl
 * MetaModelica.jl
 * OMFrontend.jl
 * OMParser.jl
@@ -51,9 +57,7 @@ Layout:
 
 ```
 OMJL-workspace/
-├── ArrayUtil.jl/
 ├── ImmutableList.jl/
-├── ListUtil.jl/
 ├── MetaModelica.jl/
 ├── OMBackend.jl/        <-- this repository
 ├── OMFrontend.jl/
@@ -82,8 +86,8 @@ checkouts (nothing is built: the parser is written in Julia):
 julia> import Pkg
 julia> Pkg.activate(".")
 julia> Pkg.develop([Pkg.PackageSpec(path = joinpath("..", p)) for p in
-                    ("ArrayUtil.jl", "ImmutableList.jl", "ListUtil.jl", "MetaModelica.jl",
-                     "OMFrontend.jl", "OMParser.jl", "OMRuntimeExternalC.jl")])
+                    ("ImmutableList.jl", "MetaModelica.jl", "OMFrontend.jl",
+                     "OMParser.jl", "OMRuntimeExternalC.jl")])
 ```
 
 Then load the package:
@@ -107,6 +111,19 @@ Or directly:
 ```julia
 julia> include("test/runtests.jl")
 ```
+
+# Utilities
+
+`utilities/` holds scripts for work on the package. They are not part of the
+package or its tests, and not of the test coverage (CI measures `src` only).
+
+- `lowerCheck.jl`: whether every definition of a source file lowers. Revise
+  applies a changed file only if all of it lowers; run this on edited files
+  before `Revise.revise()`. `lowerCheck("src/CodeGeneration/mtkExternals.jl", OMBackend.CodeGeneration)`
+  in a session, or `julia utilities/lowerCheck.jl files...` from the shell.
+- `aliasStartValueAB.jl`: compares the alias start value resolution with a
+  reference implementation on every candidate equation of the models built
+  (`aliasStartValueAB(models)`, in a session with OM loaded).
 
 # Example use
 
@@ -139,6 +156,23 @@ julia> OMBackend.simulateModel("BouncingBallReals"; tspan = (0.0, 2.5))
 
 ![image](https://user-images.githubusercontent.com/8775827/99516636-b6914280-298e-11eb-85cf-c9041314e9b4.png)
 
+# Documentation
+
+The documentation is built with Documenter.jl from `docs/`: the home page, getting started and the API
+reference.
+
+* Online: <https://OpenModelica.github.io/OMBackend.jl/> (the development version under `/dev/`, a release
+  under `/stable/` and `/vX.Y.Z/`).
+* In Julia: the docstring of every function is in the help mode, for example `?OMBackend.simulateModel`.
+* Locally, from the repository root (the HTML is written to `docs/build/`):
+
+```julia
+julia> import Pkg
+julia> Pkg.activate("docs")
+julia> Pkg.develop(path = ".")   # and the sibling packages, as in the Installation section
+julia> include("docs/make.jl")
+```
+
 # Citation
 
 If you use OMBackend.jl in academic work, please cite the entries in
@@ -146,5 +180,5 @@ If you use OMBackend.jl in academic work, please cite the entries in
 
 # License
 
-OMBackend.jl is distributed under the OSMC Public License. See
-[LICENSE.md](LICENSE.md).
+OMBackend.jl is distributed under the OSMC Public License 1.8 or the GNU Affero General
+Public License version 3, at the recipient's choice. See [LICENSE.md](LICENSE.md), which holds both.

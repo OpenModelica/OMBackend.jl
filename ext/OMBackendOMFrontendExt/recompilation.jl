@@ -172,11 +172,11 @@ function setElementInSCodeProgram!(activeModeName, inIdent::String, newValue::T,
   local modelicaActiveModeName = modelicaPathName(activeModeName, inClass)
   @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modename.log"), activeModeName)
   @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modelica_modename.log"), modelicaActiveModeName)
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "original.log"), OMBackend.JuliaFormatter.format_text(string(inClass)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "original.log"), OMBackend.formatText(string(inClass)))
   local activeModeNamePrefixes::Vector{String} = map(string, split(modelicaActiveModeName, "."))
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "prefixes.log"), OMBackend.JuliaFormatter.format_text(string(activeModeNamePrefixes)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "prefixes.log"), OMBackend.formatText(string(activeModeNamePrefixes)))
   local activeClass  = getElementFromSCodeProgram(activeModeNamePrefixes, inClass)
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "active.log"), OMBackend.JuliaFormatter.format_text(string(activeClass)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "active.log"), OMBackend.formatText(string(activeClass)))
   #= Get all elements from the class together with the corresponding names =#
   local elementToReplace::SCode.Element = getElementFromSCodeProgram(inIdent, activeClass)
   local elements::Vector{SCode.Element} = listArray(SCodeUtil.getClassElements(activeClass))
@@ -194,15 +194,15 @@ function setElementInSCodeProgram!(activeModeName, inIdent::String, newValue::T,
   @assign modification.binding = makeCondition(newValue)
   @assign elementToReplace.modifications = modification
   elements[indexOfElementToReplace] = elementToReplace
-  #write("elementToReplace.log", string(OMBackend.JuliaFormatter.format_text(string(elementToReplace))))
+  #write("elementToReplace.log", string(OMBackend.formatText(string(elementToReplace))))
   @assign activeClass.classDef.elementLst = arrayList(elements)
   #=Replace the element in the specific class. =#
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "elementToReplace.log"), OMBackend.JuliaFormatter.format_text(string(elementToReplace)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "elementToReplace.log"), OMBackend.formatText(string(elementToReplace)))
   @match modifiedProg <| MetaModelica.nil = replaceElementInSCodeProgramByName(inClass,
                                                                   activeClass,
                                                                   modelicaActiveModeName)
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modifiedProg.log"), OMBackend.JuliaFormatter.format_text(string(modifiedProg)))
-  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "tmpClass.log"), OMBackend.JuliaFormatter.format_text(string(inClass)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "modifiedProg.log"), OMBackend.formatText(string(modifiedProg)))
+  @BACKEND_LOGGING write(OMBackend.logPath("backend/runtime", "tmpClass.log"), OMBackend.formatText(string(inClass)))
   #=
   We need to update the top level class as well in this case.
   To do this we need to search for the element representing the class wee modified in the top level program again.
