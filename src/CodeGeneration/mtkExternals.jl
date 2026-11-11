@@ -2306,6 +2306,11 @@ function _resolveAliasFromExpr(diffState, @nospecialize(expr), varCount::Int, iv
     varCount <= 8 || return nothing
     _exprLargerThan(exprSub, 200) && return nothing
     local exprS = Symbolics.simplify(exprSub)
+    #= A variable other than the state left after the fold: the equation gives the state no number (a + b*x has
+       numeric a and a + b only when neither holds a variable), and the two simplifications below are not needed.
+       They are not harmless either: a quotient of such sums made SymbolicUtils' polynomial gcd throw a BoundsError
+       (MSL HysteresisModelComparison's Everett function, aliasInitialValueTests.jl). =#
+    any(v -> !isequal(v, diffState), Symbolics.get_variables(exprS)) && return nothing
     intercept = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 0))))
     sumOnePoint = Symbolics.value(Symbolics.simplify(Symbolics.substitute(exprS, Dict(diffState => 1))))
   end

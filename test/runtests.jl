@@ -463,6 +463,12 @@ import .ExampleModels
   #= ── 20w2. What the generated model's variables are (SimCodeKind, IfConditionParameter) ── =#
   include("kindMetadataTests.jl")
 
+  #= ── 20w3. The initial value of a state from an alias equation ── =#
+  include("aliasInitialValueTests.jl")
+
+  #= ── 20w4. Held discretes keep their values where an event moves the integrator ── =#
+  include("heldDiscreteTests.jl")
+
   #= ── 20x. An observed filter and the observations injected after it ── =#
   include("observedFilterTests.jl")
 

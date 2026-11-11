@@ -116,6 +116,10 @@ DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atS
                   zeros(Int8, length(strict)), fill(NaN, length(strict)), fill(1.0, length(strict)),
                   fill(Inf, length(strict)), fill(NaN, length(members)))
 
+"A discrete cluster reads its operands, its pre() values and its relations' crossing functions and scales (`reads`)."
+MTK_CodeGenerationUtil._symbolicReads!(out::Vector{Any}, c::DiscreteCluster)::Nothing =
+  MTK_CodeGenerationUtil._symbolicReads!(out, c.reads)
+
 #= SciMLBase 3 renamed u_modified! (now deprecated) to derivative_discontinuity!. =#
 const _derivativeDiscontinuity! = isdefined(ModelingToolkit.SciMLBase, :derivative_discontinuity!) ?
   ModelingToolkit.SciMLBase.derivative_discontinuity! : ModelingToolkit.SciMLBase.u_modified!

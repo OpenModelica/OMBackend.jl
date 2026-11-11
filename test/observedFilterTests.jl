@@ -32,6 +32,32 @@ end
   @test sol(0.5; idxs = :y) == 1
 end
 
+#= What is bound to the problem once it is built (the discrete clusters, the relation refresh, the delay records, the
+   asserts and whens by name) reads observed variables too: a variable only a discrete cluster read was dropped, and
+   the cluster could not be bound ("the discretes on cannot be read from the problem"; 32 models of the MSL 4.1.0
+   coverage run of 2026-11-10, which passes the reference's signals as the filter). =#
+@testset "An observed filter keeps what the discrete clusters read" begin
+  local file::String = joinpath(@__DIR__, "Models", "ObservedFilter.mo")
+  local scode = OMFrontend.translateToSCode(OMFrontend.parseFile(file))
+  local success = OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
+
+  local (fm, cache) = OMFrontend.instantiateSCodeToFM("ObservedFilter.ClusterOfObserved", scode)
+  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), observedFilter = ["^y\$"])
+  local sol = OMBackend.simulateModel(OMBackend.canonicalName("ObservedFilter.ClusterOfObserved"); tspan = (0.0, 1.0))
+  @test sol.retcode == success
+  #= x rises to reference + 0.1 at time 2/3, then falls: x = 4/3 - time until time 28/33 =#
+  @test sol(0.5; idxs = :y) ≈ 1.0 atol = 1e-6
+  @test sol(0.8; idxs = :y) ≈ 16 / 15 atol = 1e-5
+
+  (fm, cache) = OMFrontend.instantiateSCodeToFM("ObservedFilter.ClusterOfConstantObserved", scode)
+  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), observedFilter = ["^y\$"])
+  sol = OMBackend.simulateModel(OMBackend.canonicalName("ObservedFilter.ClusterOfConstantObserved"); tspan = (0.0, 1.0))
+  @test sol.retcode == success
+  #= up at x = 0.3 (time 0.3), then der(x) = 2 =#
+  @test sol(0.2; idxs = :y) ≈ 0.4 atol = 1e-6
+  @test sol(0.8; idxs = :y) ≈ 2.6 atol = 1e-5
+end
+
 #= An equation affect (ModelingToolkit's AffectSystem: `m ~ Pre(m) + w`) reads the observed w: the observed filter keeps
    it (eventReadVariables). =#
 @testset "The variables an equation affect reads" begin
