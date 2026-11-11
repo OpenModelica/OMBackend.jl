@@ -1,9 +1,10 @@
 #= The initial value of a state without a start value is resolved from an equation that is linear in it, when the
    equation's other variables have known values. An equation that keeps a variable gives no value, and is not
-   simplified further: with SymbolicUtils 4.55 the simplification of this one at x = 1 (a difference of quotients of
-   sums of exponentials) threw a BoundsError in the polynomial gcd, and the build of MSL 4.1.0
+   simplified at all: with SymbolicUtils 4.55 the simplification of this one (a difference of quotients of sums of
+   exponentials) threw a BoundsError in the polynomial gcd, and the build of MSL 4.1.0
    Magnetic.FluxTubes.Examples.Hysteresis.HysteresisModelComparison failed with it (coverage of 2026-11-10). The
-   error depends on the order of the variables: the names are the model's. =#
+   error depends on the order of the terms, which differs between processes and platforms (the equation as it
+   was at x = 1 here, the equation itself on the macOS runner): the names are the model's. =#
 using Test
 import OMBackend
 
@@ -33,4 +34,17 @@ import OMBackend
   @test CG._resolveAliasFromExpr(S.unwrap(x), S.unwrap(2 * x + 3 * a - 12), 2, Dict(S.unwrap(a) => 2.0)) ≈ 3.0
   @test CG._resolveAliasFromExpr(S.unwrap(x), S.unwrap(ifelse(flag > 0.5, H1, 2 * x) - 4 * a), 4,
                                  Dict(S.unwrap(a) => 2.0, S.unwrap(flag) => 0.0)) ≈ 4.0
+
+  #= a branch that a known condition does not take leaves no variable, also below another one; a condition that
+     holds a variable keeps its `ifelse` =#
+  local taken = (expression, values::Dict) -> CG._takeConstantBranches(S.substitute(S.unwrap(expression), values))
+  @test isequal(taken(ifelse(flag > 0.5, H1, ifelse(a < 3.0, 2 * x, H2)) - 4 * a,
+                      Dict(S.unwrap(a) => 2.0, S.unwrap(flag) => 0.0)), S.unwrap(2 * x - 8.0))
+  @test issetequal(S.get_variables(taken(ifelse(H1 > 0.5, x, a), Dict(S.unwrap(a) => 2.0))),
+                   S.get_variables(S.unwrap(H1 + x)))
+  @test CG._resolveAliasFromExpr(S.unwrap(x), S.unwrap(ifelse(H1 > 0.5, x, a) - 1.0), 3, Dict(S.unwrap(a) => 2.0)) ===
+        nothing
+  #= a condition without a value keeps its `ifelse` too =#
+  @test CG._resolveAliasFromExpr(S.unwrap(x), S.unwrap(ifelse(sqrt(a) < 0.5, x, 2 * x) - 1.0), 2,
+                                 Dict(S.unwrap(a) => -1.0)) === nothing
 end

@@ -112,6 +112,19 @@ Or directly:
 julia> include("test/runtests.jl")
 ```
 
+# Utilities
+
+`utilities/` holds scripts for work on the package. They are not part of the
+package or its tests, and not of the test coverage (CI measures `src` only).
+
+- `lowerCheck.jl`: whether every definition of a source file lowers. Revise
+  applies a changed file only if all of it lowers; run this on edited files
+  before `Revise.revise()`. `lowerCheck("src/CodeGeneration/mtkExternals.jl", OMBackend.CodeGeneration)`
+  in a session, or `julia utilities/lowerCheck.jl files...` from the shell.
+- `aliasStartValueAB.jl`: compares the alias start value resolution with a
+  reference implementation on every candidate equation of the models built
+  (`aliasStartValueAB(models)`, in a session with OM loaded).
+
 # Example use
 
 Given a Modelica model flattened by OMFrontend.jl (loading OMFrontend loads the
