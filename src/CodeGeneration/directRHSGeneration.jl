@@ -49,7 +49,7 @@
   Author: John Tinnerholm
 =#
 
-# MTK-stage dump helpers (see CodeGeneration/mtkDump.jl).
+# MTK-stage dump helpers (see CodeGeneration/MTKDump.jl).
 import .MTKDump: dumpBuildDirectRHSInputs, dumpRHSExpression
 
 #= A Modelica function's error in the right-hand side (an assert, Streams.error, a domain

@@ -34,7 +34,7 @@
 */ =#
 #= The derivative unknowns of a model reduced in array form solved for in array form, so that its arrays reach the
    code generation (ArrayODEGen): the decisions those of `solveDerivatives!` on the element view, committed per
-   for-equation as the plan is (ArrayCommit.jl). A body whose iterations determine the elements of a derivative array
+   for-equation as the plan is (arrayCommit.jl). A body whose iterations determine the elements of a derivative array
    is solved once for it, its iterators kept, and its value put into the equations that read the array; the result
    scalarized is checked against the element view solved, equation by equation. Where the elements of one array are
    solved differently (a boundary element) or the array form is not the elements' (a coefficient that differs per

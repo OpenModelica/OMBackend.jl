@@ -38,7 +38,7 @@
 
   All `@BACKEND_LOGGING`-gated dumps that capture state at the OMBackend → MTK
   boundary live in this submodule, so the call sites in MTK_CodeGenerationUtil.jl,
-  mtkExternals.jl, DirectRHSGeneration.jl, and MTK_CodeGeneration.jl reduce
+  mtkExternals.jl, directRHSGeneration.jl, and mtkCodeGeneration.jl reduce
   to a one-liner `MTKDump.dumpX(...)` invocation.
 
   When logging is off (`ENABLE_BACKEND_LOGGING != "true"` at module load), the

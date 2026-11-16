@@ -186,8 +186,20 @@ SimCode's interpretation finds constant, which this folding cannot evaluate, MSL
 `(cc, m_dCap) = diodeNoBypassCode(...)` without a junction capacitance; not the values SimCode infers
 from the unreduced, singular system), kept in that equation. The equations are copies, the indices the partition's.
 """
-function withKnownValues(model::IR.Model, partition::IR.Partition;
-                         known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::IR.Partition
+withKnownValues(model::IR.Model, partition::IR.Partition;
+                known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::IR.Partition =
+  first(withKnownValuesAndConstants(model, partition; known))
+
+"""
+    withKnownValuesAndConstants(model, partition; known) -> Tuple{Partition, Set{Symbol}}
+
+`withKnownValues` and the variables it took as constant (each substituted in the equations but its own): their time
+derivatives are zero, as the folded equations read them (an index reduction made on them gives them no derivative
+variable; MSL SMPM_CurrentSource's `dqToThreePhase.rotator.u[1]`, a gain of the constant d-current reference).
+"""
+function withKnownValuesAndConstants(model::IR.Model, partition::IR.Partition;
+                                     known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}()
+                                     )::Tuple{IR.Partition, Set{Symbol}}
   local values = StartValues(model.variables, model.functions; parametersOnly = true)
   #= the values known from elsewhere (SimCode's folding: `knownValues`) of variables a function call defines (what
      this folding cannot evaluate: a record function's output), each kept in its defining equation =#
@@ -222,7 +234,9 @@ function withKnownValues(model::IR.Model, partition::IR.Partition;
       push!(queue, j)
     end
   end
-  return IR.Partition(partition.index, partition.association, partition.unknowns, equations, partition.initialEquations)
+  local folded::IR.Partition =
+    IR.Partition(partition.index, partition.association, partition.unknowns, equations, partition.initialEquations)
+  return (folded, Set{Symbol}(keys(constants)))
 end
 
 """

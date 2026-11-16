@@ -140,7 +140,11 @@ function selectElement(@nospecialize(e::IR.Expression), subscripts::Vector{IR.Su
   #= pre(x)[k] is pre(x[k]), of any element type (a Boolean array's initial `pre(u) = {false, false}`) =#
   (IR.isBuiltinCall(e, :pre) && length(e.arguments) == 1) &&
     return IR.CALL(:pre, IR.Expression[selectElement(e.arguments[1], subscripts, ty)], ty, e.attributes)
-  local distributed = ty isa IR.T_REAL ? scalarElement(e, subscripts, ty) : nothing
+  #= the built-ins that pick an element of an argument, of any element type (the matrix literal `[1, 2]`,
+     `cat(2, {{1}}, {{2}})`, an Integer one: its `[1, 1]` the 1); the other distributions (arithmetic) of Reals =#
+  local picking::Bool = e isa IR.CALL && e.attributes.builtin && e.name in (:cat, :fill, :promote, :vector)
+  local distributed = ty isa IR.T_REAL ? scalarElement(e, subscripts, ty) :
+    picking ? builtinElement(e::IR.CALL, subscripts, ty) : nothing
   distributed === nothing || return distributed
   local picked = IR.SUBSCRIPTED(e, subscripts, ty)
   local z = isZeroExp(e) ? zeroOf(picked) : nothing

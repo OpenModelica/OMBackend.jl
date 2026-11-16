@@ -110,8 +110,8 @@ function reducedArrayModel end
 array code (`generateReducedArrayODETargetCode`), else the reduced model scalarized (`scalarizedReducedModel`);
 where the array form does not take it, or what it made does not translate or build, the model scalarized by the
 backend before the scalar passes (`backendScalarizedModel`, recorded in BACKEND_SCALARIZED_MODELS). `nothing`
-where none of these takes the model (OM's translate then flattens with scalarization; the reasons:
-`scalarizedFallbackReason`).
+where none of these takes the model (OM's translate then throws `ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED` with the
+reasons, `scalarizedFallbackReason`).
 """
 function translateReducedArrays end
 

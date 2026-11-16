@@ -863,14 +863,81 @@ end
    start), if smaller than the current step. Not for a DAE problem: DFBDF
    restarted from a smaller step ended in NaN (DAEIfReinit). =#
 """
-OrdinaryDiffEq's initial step estimate after an event (auto_dt_reset!). It reads the next
-tstop: at an event on the last one there is none left (MSL 4 RobotR3: a BoundsError in
-first_tstop), and no step to size either.
+OrdinaryDiffEq's initial step estimate after an event (auto_dt_reset!), proposed for the next step
+(`dtpropose`, which OrdinaryDiffEqCore's `apply_step!` takes). It reads the next tstop: at an event on
+the last one there is none left (MSL 4 RobotR3: a BoundsError in first_tstop), and no step to size
+either. `integrator.dt` keeps the length of the step that ended at the event: the step's interpolation
+divides by it, and a callback after this one that interpolates the step read it with the estimate
+instead (the array path's asserts, `_assertPending!`: MSL BranchingDynamicPipes, a restart of 2.2e-6 s
+in a step of 0.013 s, values 3000 steps out, a medium at 4125 K and a DomainError in its saturation
+pressure).
 """
 function _autoDtReset!(integrator)
   local tstops = integrator.opts.tstops
   isempty(tstops) && return nothing
+  local stepDt = integrator.dt
   ModelingToolkit.SciMLBase.auto_dt_reset!(integrator)
+  isfinite(integrator.dtpropose) || (integrator.dtpropose = _finiteInitialStep(integrator, integrator.dtpropose))
+  integrator.dt = stepDt
+  return nothing
+end
+
+"""
+    _finiteInitialStep(integrator, estimate) -> step
+
+OrdinaryDiffEq's initial step `estimate` (`auto_dt_reset!`, Hairer's) where it is finite; else Hairer's estimate again,
+its probe kept where the right-hand side is finite. The probe is an explicit Euler step of 1e-6 s (at most the next
+stop) from the state, and the right-hand side there gave the estimate: from junction voltages of 0, a derivative of
+5e19 V/s took the probe to 5e12 V, where the diode's exponential is not finite and the estimate NaN (MSL
+Spice3BenchmarkRtlInverter: DtNaN at the start; a given first step of 1e-15 s solves it). Here the probe 10 times
+shorter until the change of the right-hand side there has a finite norm. `estimate` unchanged for a problem with a
+mass matrix, whose right-hand side is no derivative, and where none of 30 probes is finite.
+"""
+function _finiteInitialStep(integrator, estimate::Float64)::Float64
+  local f = integrator.f
+  (OrdinaryDiffEq.OrdinaryDiffEqCore._is_identity_massmatrix(f.mass_matrix) && !isempty(integrator.opts.tstops)) ||
+    return estimate
+  local (u0::Vector{Float64}, t::Float64, p) = (integrator.u, Float64(integrator.t), integrator.p)
+  local tdir::Float64 = Float64(integrator.tdir)
+  local opts = integrator.opts
+  local f0::Vector{Float64} = similar(u0)
+  f(f0, u0, p, t)
+  local scale::Vector{Float64} = opts.abstol .+ abs.(u0) .* opts.reltol
+  local d1::Float64 = opts.internalnorm(f0 ./ scale, t)
+  isfinite(d1) || return estimate
+  local order::Int = OrdinaryDiffEq.OrdinaryDiffEqCore.alg_order(integrator.alg)
+  local dtmax::Float64 = min(abs(opts.dtmax), abs(OrdinaryDiffEq.OrdinaryDiffEqCore.first_tstop(integrator) - t))
+  local h::Float64 = min(1.0e-6, dtmax)
+  local f1::Vector{Float64} = similar(u0)
+  for _ in 1:30
+    f(f1, u0 .+ (tdir * h) .* f0, p, t + tdir * h)
+    #= finite, and its norm too: 9e162 V/s at the probe of 2e-19 s overflowed to Inf, the step 0 =#
+    local d2::Float64 = opts.internalnorm((f1 .- f0) ./ scale, t) / h
+    if isfinite(d2)
+      local d::Float64 = max(d1, d2)
+      local dt1::Float64 = d <= 1.0e-15 ? max(1.0e-6, 1.0e-3 * h) : 10.0^(-(2 + log10(d)) / order)
+      return tdir * max(abs(opts.dtmin), min(100 * h, dt1, dtmax))
+    end
+    h /= 10
+  end
+  return estimate
+end
+
+"""
+    _finiteFirstStep!(integrator)
+
+At a solve's start (a callback's `initialize`, before OrdinaryDiffEq sizes the first step): the first step
+(`_finiteInitialStep`) where OrdinaryDiffEq's estimate is not finite, set as a given one; nothing otherwise, nor for
+a given step.
+"""
+function _finiteFirstStep!(integrator)::Nothing
+  (iszero(integrator.dt) && integrator.opts.adaptive && !isempty(integrator.opts.tstops)) || return nothing
+  local estimate::Float64 = OrdinaryDiffEq.OrdinaryDiffEqCore._determine_initdt(integrator)
+  isfinite(estimate) && return nothing
+  local dt::Float64 = _finiteInitialStep(integrator, estimate)
+  isfinite(dt) || return nothing
+  integrator.dt = dt
+  integrator.dtpropose = dt
   return nothing
 end
 
@@ -918,8 +985,8 @@ function _restartStepSize!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEInte
     stall[] = start <= t <= start + window ? (start, count + 1) : (t, 1)
     last(stall[]) > 1 && (dt = min(_instantLength(t), cap))
   end
-  integrator.dt = integrator.tdir * dt
-  integrator.dtpropose = integrator.dt
+  #= proposed: `integrator.dt` stays the step's that ended at the event (`_autoDtReset!`) =#
+  integrator.dtpropose = integrator.tdir * dt
   return nothing
 end
 
@@ -1134,7 +1201,7 @@ own (MTK's: an if-equation's pure time events, NoInit): the event iteration
 solves its algebraic unknowns again after such an event too, after the
 step-end recorder took the left limit (withDelayRecords). Without the
 iteration nothing did, but the merged continuous callback's re-solve with
-the integrator's algorithm (DirectRHSGeneration.jl `_mergeableReinit`),
+the integrator's algorithm (directRHSGeneration.jl `_mergeableReinit`),
 inside the callback: there delay() recorded no jump, and where that re-solve
 is gone, the unknowns kept their old values until the next step's end (a
 `time > 1.5` branch read by delay() recorded a ramp over the step).

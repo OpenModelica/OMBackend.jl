@@ -311,13 +311,24 @@ function toIR(g::Gen, e::SC.Exp, ctx::Ctx)::IR
     local lop::Symbol = e.op == SC.OP_AND ? :&& : e.op == SC.OP_OR ? :|| : ns("logical operator $(e.op)")
     return Op(lop, IR[toIR(g, e.exp1, ctx), toIR(g, e.exp2, ctx)])
   elseif e isa SC.RELATION
+    #= an equal relation in the same scope: the same relation, its slot (OpenModelica's relations and the MTK path's
+       are unique by expression). A discrete cluster's inlined siblings repeat them: MSL Clutch's `locked` and `mode`
+       read `startBackward`'s `sa < -tau0_max`; a copy that a short-circuit skipped kept an old value, the locked
+       combination was never consistent (MSL Rotational's Friction stopped at the clutch's sticking, 0.109). =#
+    local key::RelationKey = (SC.RELATION(e.exp1, e.op, e.exp2, 0), ctx.iters, ctx.elem)
+    local known::Union{Nothing, IR} = ctx.noEvent ? nothing : get(ctx.relations, key, nothing)
+    known === nothing || return known
     local op::Symbol = _relationOp(e.op)
     local l::IR = toIR(g, e.exp1, ctx)
     local r::IR = toIR(g, e.exp2, ctx)
-    (ctx.noEvent || !(_continuous(g, l) || _continuous(g, r))) && return Op(op, IR[l, r])
+    local continuous::Bool = _continuous(g, l) || _continuous(g, r)
+    #= an initial algorithm's (a lifted cluster's initial arm): MSL RobotR3's bearing friction at w = -5e-32 from the
+       solve, `initial() and w < 0` made it start Backward (omc and the MTK path, `_tieLiteral`: Stuck) =#
+    (ctx.atStart && continuous && op in (:<, :<=, :>, :>=)) && return Op(:startRelation, IR[Lit(op), l, r])
+    (ctx.noEvent || !continuous) && return Op(op, IR[l, r])
     op in (:(==), :!=) && ns("equality relation on continuous variables")
     ctx.nrel[] += 1
-    return _withAbsProbe(g, Rel(op, l, r, ctx.nrel[]), op in (:<, :<=) ? l : r, ctx)
+    return ctx.relations[key] = _withAbsProbe(g, Rel(op, l, r, ctx.nrel[]), op in (:<, :<=) ? l : r, ctx)
   elseif e isa SC.IFEXP
     return Op(:if, IR[toIR(g, e.cond, ctx), toIR(g, e.thenExp, ctx), toIR(g, e.elseExp, ctx)])
   elseif e isa SC.TSUB
@@ -594,6 +605,16 @@ function _valueIRx(g::Gen, e::SC.Exp, ctx::Ctx)::IR
       return Op(:arrayval, IR[elementsOf[1]; IR[Pre(x::Ref) for x in @view elementsOf[2:end]]])
     end
   end
+  #= pre() of an array expression of variables (a slice, `pre(u_buffer[1:2])`: MSL Clocked's FIR buffers; the slice's
+     type is its element type): the array of pre() of the elements of its value =#
+  if e isa SC.CALL && e.kind == SC.CALL_BUILTIN && e.name === :pre && length(e.args) == 1 &&
+     (_expType(e.args[1]) isa SC.TYPE_ARRAY ||
+      (e.args[1] isa SC.ASUB && any((s::SC.Exp) -> s isa Union{SC.RANGE, SC.WHOLE_DIMENSION}, e.args[1].subs)))
+    local inner::IR = _valueIRx(g, e.args[1], ctx)
+    (inner isa Op && inner.op === :arrayval && all((x::IR) -> x isa Ref, @view inner.args[2:end])) ||
+      ns("pre of $(_str(e.args[1]))")
+    return Op(:arrayval, IR[inner.args[1]; IR[Pre(x::Ref) for x in @view inner.args[2:end]]])
+  end
   #= cat(1, v1, v2, ...) of vectors (MSL Media's mass fractions, `cat(1, Xi, {1 - sum(Xi)})`): the vector of their
      elements =#
   if e isa SC.CALL && e.kind == SC.CALL_BUILTIN && e.name === :cat && length(e.args) >= 2 && e.args[1] isa SC.ICONST &&
@@ -744,6 +765,14 @@ function _recordElementIRx(g::Gen, e::SC.RSUB, ctx::Ctx)::IR
                       _recordElementIRx(g, SC.RSUB(branches.elseExp, e.index, e.fieldName, e.ty), ctx)])
   end
   _isRecordValue(e.exp) && return _recordFieldIRx(g, e.exp, e.index, e.fieldName, ctx)
+  #= a field of an element of a vector of record literals at a literal subscript (MSL Media's `cp_T(data[1], T)` inlined
+     after index reduction, `data` evaluated: `{DataRecord(...), DataRecord(...)}[1].Tlimit`): the record's field =#
+  if e.exp isa SC.ASUB && length(e.exp.subs) == 1 && e.exp.subs[1] isa SC.ICONST && e.exp.exp isa SC.ARRAY_EXP
+    local records::Vector{SC.Exp} = e.exp.exp.elements
+    local at::Int = (e.exp.subs[1]::SC.ICONST).value
+    (1 <= at <= length(records) && records[at] isa SC.RECORD) &&
+      return _recordElementIRx(g, SC.RSUB(records[at], e.index, e.fieldName, e.ty), ctx)
+  end
   _isFunctionCall(g, e.exp) || ns("a field of $(_str(e.exp))")
   local rty::SC.SType = (e.exp::SC.CALL).ty
   (rty isa SC.TYPE_COMPLEX && rty.isRecord) || ns("a field of $(_str(e.exp)), not a record")
@@ -906,13 +935,16 @@ function _callIRx(g::Gen, e::SC.CALL, ctx::Ctx)::IR
     preRef isa Ref || ns("pre of $(_str(e))")
     return Pre(preRef)
   elseif fname == "homotopy"
-    return toIR(g, args[1], ctx)
+    #= homotopy(actual, simplified) (MLS 3.7.4.4): the blend in the initialization's λ (`homotopyStart!`) =#
+    length(args) == 2 || ns("homotopy with $(length(args)) arguments")
+    g.usesHomotopy = true
+    return Op(:homotopy, IR[toIR(g, args[1], ctx), toIR(g, args[2], ctx)])
   elseif builtin && fname == "Integer" && length(args) == 1
     #= Integer(e) of an enumeration value: its position, the number the code holds the value as, an Integer where
        it is a table's subscript (MSL Digital's `Integer(pre(x))`, `Integer(delay(x, t))` of the Logic values) =#
     return Op(:Int, IR[toIR(g, args[1], ctx)])
   elseif fname == "noEvent"
-    return toIR(g, args[1], _with(ctx; noEvent = true))
+    return toIR(g, args[1], _with(ctx; noEvent = true, atStart = false))
   elseif fname == "smooth"
     return toIR(g, args[2], ctx)
   elseif fname == "initial"
@@ -1416,8 +1448,8 @@ end
 _isReference(e::SC.Exp)::Bool = e isa Union{SC.EXP_CREF, SC.DER} || (e isa SC.ASUB && e.exp isa Union{SC.EXP_CREF, SC.DER})
 
 """
-The elements (row-major) of an array variable referred to as a whole, `v` or `pre(v)`; nothing for another
-expression.
+The elements (row-major) of an array variable referred to as a whole, `v` or `pre(v)` (a call or `SC.PRE`); nothing
+for another expression.
 """
 function _wholeArrayElements(g::Gen, e::SC.Exp)::Union{Nothing, Vector{SC.Exp}}
   if e isa SC.CALL && e.kind == SC.CALL_BUILTIN && e.name === :pre && length(e.args) == 1
@@ -1425,6 +1457,14 @@ function _wholeArrayElements(g::Gen, e::SC.Exp)::Union{Nothing, Vector{SC.Exp}}
     inner === nothing && return nothing
     local preType::SC.SType = e.ty isa SC.TYPE_ARRAY ? e.ty.elementType : e.ty
     return SC.Exp[SC.CALL(e.name, SC.Exp[x], preType, e.kind) for x in inner]
+  end
+  #= pre() of an array variable as a whole (a clocked partition's `previous(u)`, `sample(u)` at the tick) =#
+  if e isa SC.PRE && isempty(e.cref.subs) && e.ty isa SC.TYPE_ARRAY
+    local preInfo::Union{Nothing, VarInfo} = get(g.vars, String(e.cref.sym), nothing)
+    (preInfo === nothing || isempty(preInfo.dims)) && return nothing
+    local preElementType::SC.SType = (e.ty::SC.TYPE_ARRAY).elementType
+    return SC.Exp[SC.PRE(SC.SimCref(e.cref.sym, Int[t...], e.cref.ref), preElementType)
+                  for t in _elementSubscripts(preInfo.dims)]
   end
   (e isa SC.EXP_CREF && isempty(e.cref.subs) && e.ty isa SC.TYPE_ARRAY) || return nothing
   local info::Union{Nothing, VarInfo} = get(g.vars, String(e.cref.sym), nothing)
@@ -1460,7 +1500,6 @@ function _addWhen!(g::Gen, eq::SC.WHEN_EQUATION, iterNames::Vector{String}, idom
   local conds::Vector{IR} = IR[]
   local body::Vector{Tuple{Symbol, Ref, IR}} = Tuple{Symbol, Ref, IR}[]
   local starts::Vector{Int} = Int[]
-  local noTarget::Ref = Ref("", IR[], false)
   local branch::Union{Nothing, SC.WHEN_STMTS} = eq.whenEquation
   while branch !== nothing
     local triggers::Vector{IR} = IR[]
@@ -1486,35 +1525,199 @@ function _addWhen!(g::Gen, eq::SC.WHEN_EQUATION, iterNames::Vector{String}, idom
     isempty(triggers) && ns("a when-branch without a condition: $(_str(eq))")
     push!(conds, length(triggers) == 1 ? triggers[1] : Op(:vect, triggers))
     push!(starts, length(body) + 1)
-    for st in branch.body
-      if st isa SC.ASSIGN && st.left isa SC.TUPLE && _isFunctionCall(g, st.right)
-        #= (r, state) = f(pre(state)): the call once, each target from its output (Buildings.Occupants' random numbers) =#
-        append!(body, _whenTupleAssignments(g, st.left, toIR(g, st.right, ctx), _expType(st.right), ctx))
-      elseif st isa SC.ASSIGN
-        _isReference(st.left) || ns("a when-statement assigning $(_str(st.left))")
-        local target::IR = toIR(g, st.left, ctx)
-        (target isa Ref && g.vars[target.name].kind == :discrete) || ns("when assigns a non-discrete variable: $(_str(st.left))")
-        push!(body, (:assign, target, toIR(g, st.right, ctx)))
-      elseif st isa SC.REINIT
-        #= of an element of an array state: the state at the element's subscripts =#
-        local stateRef::SC.Exp = SC.EXP_CREF(st.stateVar, SC.TYPE_REAL())
-        local state::IR = toIR(g, isempty(st.subscripts) ? stateRef : SC.ASUB(stateRef, st.subscripts), ctx)
-        (state isa Ref && g.vars[state.name].kind == :state) || ns("reinit of a non-state: $(_str(eq))")
-        #= of a dynamic state set's state: the set's switch, in effect with the selection the body assigns =#
-        local ref::Union{Nothing, SC.IR.ComponentRef} = st.stateVar.ref
-        local switch::Bool = ref !== nothing && Passes.IndexReduction.isStateSetRef(ref)
-        push!(body, (switch ? :switch : :reinit, state, toIR(g, st.value, ctx)))
-      elseif st isa Union{SC.ASSERT, SC.NORETCALL, SC.TERMINATE, SC.IF}
-        push!(body, (:call, noTarget, _whenEffect(g, st, ctx)))
-      else
-        ns("a when-statement $(nameof(typeof(st))): $(_str(eq))")
-      end
-    end
+    _whenStatements!(body, g, branch.body, nothing, ctx, eq)
     branch = branch.elsewhenPart
   end
   local cond::IR = length(conds) == 1 ? conds[1] : Op(:elsewhen, conds)
   push!(g.whens, WhenClass(cond, body, starts, length(iterNames), idom, ctx.nrel[], ctx.nsam[], _str(eq), eq.attr.everyEvent))
   return nothing
+end
+
+"""
+    _whenStatements!(body, g, statements, guard, ctx, eq)
+
+A when-branch's statements onto its body (`_addWhen!`), in order. `guard`: `nothing` at the branch's top level; in a
+branch of an if-statement that assigns (`_whenIf!`) the temporary that holds whether that branch is taken: each
+assignment then `x := if taken then value else x`, each effect under it (`_guarded`).
+"""
+function _whenStatements!(body::Vector{Tuple{Symbol, Ref, IR}}, g::Gen, statements::Vector{SC.Statement},
+                          guard::Union{Nothing, Slot}, ctx::Ctx, eq::SC.WHEN_EQUATION)::Nothing
+  local noTarget::Ref = Ref("", IR[], false)
+  local entries::Vector{Tuple{Symbol, Ref, IR}} = Tuple{Symbol, Ref, IR}[]
+  for st in statements
+    empty!(entries)
+    if st isa SC.ASSIGN && st.left isa SC.TUPLE && st.right isa SC.IFEXP
+      #= a tuple of an if-expression (a subsampled clock's `(noise, seedState) := if tick then random(pre(seedState))
+         else (pre(noise), pre(seedState))`: MSL Clocked's Noise in ClockedWith_AD_DA_Effects): the if-statement of
+         the tuple assignments =#
+      local branch::SC.Branch = SC.Branch(st.right.cond, SC.Statement[SC.ASSIGN(st.left, st.right.thenExp, st.source)])
+      _whenIf!(body, g, SC.IF([branch], SC.Statement[SC.ASSIGN(st.left, st.right.elseExp, st.source)], st.source),
+               guard, ctx, eq)
+    elseif st isa SC.ASSIGN && st.left isa SC.TUPLE && st.right isa SC.TUPLE
+      append!(entries, _tupleOfPreAssignments(g, st, ctx))
+    elseif st isa SC.ASSIGN && st.left isa SC.TUPLE && _isFunctionCall(g, st.right)
+      #= (r, state) = f(pre(state)): the call once, each target from its output (Buildings.Occupants' random numbers) =#
+      append!(entries, _whenTupleAssignments(g, st.left, toIR(g, st.right, ctx), _expType(st.right), ctx))
+    elseif st isa SC.ASSIGN && _wholeArrayElements(g, st.left) !== nothing
+      append!(entries, _wholeArrayAssignments(g, st, ctx))
+    elseif st isa SC.ASSIGN
+      _isReference(st.left) || ns("a when-statement assigning $(_str(st.left))")
+      local target::IR = toIR(g, st.left, ctx)
+      (target isa Ref && g.vars[target.name].kind == :discrete) ||
+        ns("when assigns a non-discrete variable: $(_str(st.left))")
+      push!(entries, (:assign, target, toIR(g, st.right, ctx)))
+    elseif st isa SC.REINIT
+      guard === nothing || ns("reinit in an if-statement of a when-statement: $(_str(eq))")
+      #= of an element of an array state: the state at the element's subscripts =#
+      local stateRef::SC.Exp = SC.EXP_CREF(st.stateVar, SC.TYPE_REAL())
+      local state::IR = toIR(g, isempty(st.subscripts) ? stateRef : SC.ASUB(stateRef, st.subscripts), ctx)
+      (state isa Ref && g.vars[state.name].kind == :state) || ns("reinit of a non-state: $(_str(eq))")
+      #= of a dynamic state set's state: the set's switch, in effect with the selection the body assigns =#
+      local ref::Union{Nothing, SC.IR.ComponentRef} = st.stateVar.ref
+      local switch::Bool = ref !== nothing && Passes.IndexReduction.isStateSetRef(ref)
+      push!(entries, (switch ? :switch : :reinit, state, toIR(g, st.value, ctx)))
+    elseif st isa SC.IF && _assignsIn(st)
+      _whenIf!(body, g, st, guard, ctx, eq)
+    elseif st isa Union{SC.ASSERT, SC.NORETCALL, SC.TERMINATE, SC.IF}
+      push!(entries, (:call, noTarget, _whenEffect(g, st, ctx)))
+    else
+      ns("a when-statement $(nameof(typeof(st))): $(_str(eq))")
+    end
+    foreach(e::Tuple{Symbol, Ref, IR} -> push!(body, _guarded(e, guard)), entries)
+  end
+  return nothing
+end
+
+"""
+A tuple's assignment from a tuple of pre() values, `(noise, seedState) := (pre(noise), pre(seedState))` (a subsampled
+clock's hold, `_whenStatements!`): each target from its value, in order (the values read no target's value of this
+instant); a whole array target element by element.
+"""
+function _tupleOfPreAssignments(g::Gen, st::SC.ASSIGN, ctx::Ctx)::Vector{Tuple{Symbol, Ref, IR}}
+  local targets::Vector{SC.Exp} = (st.left::SC.TUPLE).elements
+  local values::Vector{SC.Exp} = (st.right::SC.TUPLE).elements
+  local isPre::Function = (v::SC.Exp) -> v isa SC.PRE || (v isa SC.CALL && v.kind == SC.CALL_BUILTIN && v.name === :pre)
+  (length(targets) == length(values) && all(isPre, values)) || ns("a when-statement assigning $(_str(st.left))")
+  local out::Vector{Tuple{Symbol, Ref, IR}} = Tuple{Symbol, Ref, IR}[]
+  for (t::SC.Exp, v::SC.Exp) in zip(targets, values)
+    t isa SC.WILD && continue
+    local single::SC.ASSIGN = SC.ASSIGN(t, v, st.source)
+    if _wholeArrayElements(g, t) !== nothing
+      append!(out, _wholeArrayAssignments(g, single, ctx))
+    else
+      local target::IR = toIR(g, t, ctx)
+      (target isa Ref && g.vars[target.name].kind == :discrete) ||
+        ns("when assigns a non-discrete variable: $(_str(t))")
+      push!(out, (:assign, target, toIR(g, v, ctx)))
+    end
+  end
+  return out
+end
+
+"Whether the if-statement `st` assigns a variable or reinitializes a state in one of its branches (nested too)."
+function _assignsIn(st::SC.IF)::Bool
+  local assigns::Function = (x::SC.Statement) -> x isa Union{SC.ASSIGN, SC.REINIT} || (x isa SC.IF && _assignsIn(x))
+  return any((b::SC.Branch) -> any(assigns, b.body), st.branches) || any(assigns, st.elseBody)
+end
+
+"""
+    _whenIf!(body, g, st, guard, ctx, eq)
+
+An if-statement that assigns, in a when-branch (MSL SignalExtrema's `if y_min < pre(y_min) then t_min = time; t_max =
+pre(t_max); elseif ... end if` in its when-equation): its conditions evaluated first, at the instant (noEvent, as
+`_whenEffect`'s), into temporaries, each whether its branch is taken (its condition holds, no earlier one's does, and
+the enclosing `guard`); then each branch's statements under its temporary (`_whenStatements!`), the else-branch's
+under none of the conditions holding.
+"""
+function _whenIf!(body::Vector{Tuple{Symbol, Ref, IR}}, g::Gen, st::SC.IF, guard::Union{Nothing, Slot}, ctx::Ctx,
+                  eq::SC.WHEN_EQUATION)::Nothing
+  local actx::Ctx = _with(ctx; noEvent = true)
+  local noTarget::Ref = Ref("", IR[], false)
+  local open::Union{Nothing, Slot} = guard   #= no earlier branch taken (and the guard) =#
+  local taken::Vector{Slot} = Slot[]
+  for b in st.branches
+    local condition::IR = toIR(g, b.condition, actx)
+    local slot::Slot = Slot(g.tmpSlot -= 1)
+    push!(body, (:call, noTarget, Op(:setlocal, IR[slot, open === nothing ? condition : Op(:&&, IR[open, condition])])))
+    push!(taken, slot)
+    local rest::Slot = Slot(g.tmpSlot -= 1)
+    push!(body, (:call, noTarget, Op(:setlocal, IR[rest, open === nothing ? Op(:!, IR[slot]) :
+                                                         Op(:&&, IR[open, Op(:!, IR[slot])])])))
+    open = rest
+  end
+  for (b, slot) in zip(st.branches, taken)
+    _whenStatements!(body, g, b.body, slot, ctx, eq)
+  end
+  isempty(st.elseBody) || _whenStatements!(body, g, st.elseBody, open, ctx, eq)
+  return nothing
+end
+
+"""
+A when body's entry under `guard` (`_whenStatements!`): itself without one; an assignment `x := if guard then value
+else x`, a statement for its effects (a call, a temporary's value) `if guard then ... end`.
+"""
+function _guarded(entry::Tuple{Symbol, Ref, IR}, guard::Union{Nothing, Slot})::Tuple{Symbol, Ref, IR}
+  guard === nothing && return entry
+  local (kind::Symbol, target::Ref, value::IR) = entry
+  kind === :assign && return (kind, target, Op(:if, IR[guard, value, target]))
+  kind === :call && return (kind, target, Op(:if, IR[guard, value, Op(:seq, IR[])]))
+  ns("a when-statement $(kind) in an if-statement")
+end
+
+"""
+A when body's assignment to an array variable as a whole, element by element: `y := u` (MSL Clocked's
+AssignClockVectorized, its clocked when-clause lowered to a when-equation) `y[1] := u[1]; y[2] := u[2]`. The value an
+array variable as a whole or pre() of one (`_wholeArrayElements`), or an array literal (UpSample2's `FIR1.a :=
+{1.0, 1.0, 1.0}`), of as many elements; both row-major.
+"""
+function _wholeArrayAssignments(g::Gen, st::SC.ASSIGN, ctx::Ctx)::Vector{Tuple{Symbol, Ref, IR}}
+  local targets::Vector{SC.Exp} = something(_wholeArrayElements(g, st.left))
+  local values::Union{Nothing, Vector{SC.Exp}} =
+    st.right isa SC.ARRAY_EXP ? _rowMajorElements(st.right) : _wholeArrayElements(g, st.right)
+  values === nothing && return _arrayValueAssignments(g, targets, st, ctx)
+  length(values) != length(targets) &&
+    ns("a when-statement assigning the array $(_str(st.left)) the value $(_str(st.right))")
+  local out::Vector{Tuple{Symbol, Ref, IR}} = Tuple{Symbol, Ref, IR}[]
+  for (t::SC.Exp, v::SC.Exp) in zip(targets, values)
+    local target::IR = toIR(g, t, ctx)
+    (target isa Ref && g.vars[target.name].kind == :discrete) || ns("when assigns a non-discrete variable: $(_str(t))")
+    push!(out, (:assign, target, toIR(g, v, ctx)))
+  end
+  return out
+end
+
+"""
+A when body's assignment to an array variable as a whole (its elements `targets`, row-major) from an array expression
+evaluated as one value (`_arrayValueIRx`: MSL Clocked's FIR buffer `u_buffer := if pre(first) then cat(1, {u}, u *
+cBufStart) else cat(1, {u}, pre(u_buffer[1:2]))`): the value into a temporary (a `:call` entry), as an assignment
+evaluates its right-hand side before it assigns, then each element from it.
+"""
+function _arrayValueAssignments(g::Gen, targets::Vector{SC.Exp}, st::SC.ASSIGN,
+                                ctx::Ctx)::Vector{Tuple{Symbol, Ref, IR}}
+  local what::String = "a when-statement assigning the array $(_str(st.left)) the value $(_str(st.right))"
+  local dims::Vector{Int} = _knownDims(_expType(st.left), what)
+  _knownDims(_expType(st.right), what) == dims || ns(what)
+  local value::Slot = Slot(g.tmpSlot -= 1)
+  local out::Vector{Tuple{Symbol, Ref, IR}} =
+    Tuple{Symbol, Ref, IR}[(:call, Ref("", IR[], false), Op(:setlocal, IR[value, _arrayValueIRx(g, st.right, ctx)]))]
+  for (t::SC.Exp, subs) in zip(targets, _elementSubscripts(dims))
+    local target::IR = toIR(g, t, ctx)
+    (target isa Ref && g.vars[target.name].kind == :discrete) || ns("when assigns a non-discrete variable: $(_str(t))")
+    push!(out, (:assign, target, Op(:index, IR[value; IR[Lit(k) for k in subs]])))
+  end
+  return out
+end
+
+"""
+The value of an array expression (`_arrayValueAssignments`): of an if-expression the if of its branches' values (its
+condition a scalar's), of `noEvent(e)` that of `e` without events, of another `_valueIRx`.
+"""
+function _arrayValueIRx(g::Gen, e::SC.Exp, ctx::Ctx)::IR
+  e isa SC.IFEXP &&
+    return Op(:if, IR[toIR(g, e.cond, ctx), _arrayValueIRx(g, e.thenExp, ctx), _arrayValueIRx(g, e.elseExp, ctx)])
+  (e isa SC.CALL && e.kind == SC.CALL_BUILTIN && e.name === :noEvent && length(e.args) == 1) &&
+    return _arrayValueIRx(g, e.args[1], _with(ctx; noEvent = true))
+  return _valueIRx(g, e, ctx)
 end
 
 """
@@ -1680,7 +1883,8 @@ discrete variables and parameters with fixed = false (`_initAlgTargets`).
 function _addInitialWhen!(g::Gen, eq::SC.INITIAL_WHEN_EQUATION, iterNames::Vector{String}, idom::Matrix{Int})::Nothing
   local w::SC.WHEN_STMTS = eq.whenEquation
   (w.elsewhenPart === nothing && isempty(_triggers(w.condition))) || ns("an initial when-equation with triggers: $(_str(eq))")
-  local ctx::Ctx = Ctx(Dict{String, Int}(n => k for (k, n) in enumerate(iterNames)), Int[], Base.RefValue(0), true)
+  local ctx::Ctx = Ctx(Dict{String, Int}(n => k for (k, n) in enumerate(iterNames)), Int[], Base.RefValue(0), true,
+                       Base.RefValue(0), Dict{RelationKey, IR}(), true)
   local body::Vector{Stmt} = Stmt[_stmtIR(g, st, ctx) for st in w.body]
   ctx.nsam[] == 0 || ns("sample() in an initial algorithm: $(_str(eq))")
   _initAlgTargets(g, body)
@@ -1714,7 +1918,8 @@ function _stmtIR(g::Gen, st::SC.Statement, ctx::Ctx)::Stmt
     local range::Union{Nothing, StepRange{Int, Int}} = _literalRange(st.iterator.range)
     range === nothing && ns("for range $(_str(st.iterator.range))")
     local k::Int = (g.tmpSlot -= 1)
-    local inner::Ctx = Ctx(merge(ctx.iters, Dict{String, Int}(String(st.iterator.name) => k)), ctx.elem, ctx.nrel, ctx.noEvent, ctx.nsam)
+    local inner::Ctx = Ctx(merge(ctx.iters, Dict{String, Int}(String(st.iterator.name) => k)), ctx.elem, ctx.nrel,
+                           ctx.noEvent, ctx.nsam, ctx.relations, ctx.atStart)
     return SFor(k, collect(range), Stmt[_stmtIR(g, x, inner) for x in st.body])
   elseif st isa SC.WHILE
     return SWhile(toIR(g, st.condition, _with(ctx; noEvent = true)), Stmt[_stmtIR(g, x, ctx) for x in st.body])
@@ -1730,6 +1935,63 @@ function _stmtIR(g::Gen, st::SC.Statement, ctx::Ctx)::Stmt
     return SBreak()
   end
   ns("a statement $(nameof(typeof(st))): $(_str(st))")
+end
+
+"""
+The if-equation `eq` on a variable condition with its branches in the form `_ifAssigned` and `_ifEquationCount` take
+(`_branchEquations`), its nested if-equations' too.
+"""
+_branchForm(eq::SC.INLINE_IF_EQUATION)::SC.INLINE_IF_EQUATION =
+  SC.INLINE_IF_EQUATION(eq.conditions, Vector{SC.Equation}[_branchEquations(b) for b in eq.branchesTrue],
+                        _branchEquations(eq.branchElse), eq.source, eq.attr)
+
+"""
+The equations of a branch of an if-equation on a variable condition, element by element: a for-equation over a literal
+range unrolled, the iterator its value in each (MSL LossyGear's `if ideal then ... else for i in 1:4 loop
+interpolation_result[1, i] = ... end for`); an element of an array equality the lowering wrote `value = reference`
+(`{{1, 1, 0, 0}}[1, 1] = interpolation_result[1, 1]`) as `reference = value`. Another equation as it is.
+"""
+function _branchEquations(body::Vector{SC.Equation})::Vector{SC.Equation}
+  local out::Vector{SC.Equation} = SC.Equation[]
+  for b in body
+    local range::Union{Nothing, StepRange{Int, Int}} = b isa SC.FOR_EQUATION ? _literalRange(b.iterator.range) : nothing
+    if range !== nothing
+      local loop::SC.FOR_EQUATION = b::SC.FOR_EQUATION
+      for value in range
+        append!(out, _branchEquations(SC.Equation[_withIteratorValue(x, loop.iterator.name, value) for x in loop.body]))
+      end
+    elseif b isa SC.INLINE_IF_EQUATION
+      push!(out, _branchForm(b))
+    elseif b isa SC.EQUATION && !_isReference(b.lhs) && _isReference(b.rhs)
+      push!(out, SC.EQUATION(b.rhs, b.lhs, b.source, b.attr))
+    else
+      push!(out, b)
+    end
+  end
+  return out
+end
+
+"""
+The equation `eq` of a for-equation's body with the iterator `name` its value `value` (`_branchEquations`); a nested
+for-equation of the same iterator keeps its own in its body.
+"""
+function _withIteratorValue(eq::SC.Equation, name::Symbol, value::Int)::SC.Equation
+  local isIterator::Function = (x::SC.Exp) -> x isa SC.EXP_CREF && x.cref.sym === name && isempty(x.cref.subs)
+  local valued::Function = (e::SC.Exp) -> first(SC.traverseExpTopDown(e, (x::SC.Exp, acc::Nothing) ->
+    isIterator(x) ? (SC.ICONST(value), false, acc) : (x, true, acc), nothing))
+  local valuedAll::Function = (eqs::Vector{SC.Equation}) ->
+    SC.Equation[_withIteratorValue(x, name, value) for x in eqs]
+  if eq isa SC.EQUATION
+    return SC.EQUATION(valued(eq.lhs), valued(eq.rhs), eq.source, eq.attr)
+  elseif eq isa SC.FOR_EQUATION
+    local body::Vector{SC.Equation} = eq.iterator.name === name ? eq.body : valuedAll(eq.body)
+    return SC.FOR_EQUATION(SC.Iterator(eq.iterator.name, valued(eq.iterator.range)), body, eq.source, eq.attr)
+  elseif eq isa SC.INLINE_IF_EQUATION
+    return SC.INLINE_IF_EQUATION(SC.Exp[valued(c) for c in eq.conditions],
+                                 Vector{SC.Equation}[valuedAll(b) for b in eq.branchesTrue], valuedAll(eq.branchElse),
+                                 eq.source, eq.attr)
+  end
+  ns("if-equation on a variable condition: branch equation $(_eqText(eq)) in a for-equation")
 end
 
 """
@@ -1867,6 +2129,7 @@ function _addIfEquation!(g::Gen, eq::SC.INLINE_IF_EQUATION, iterNames::Vector{St
     end
     return
   end
+  eq = _branchForm(eq)
   local assigned::Union{Nothing, Dict{String, SC.Exp}} = try
     _ifAssigned(eq)
   catch err
@@ -2008,7 +2271,7 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
   local g::Gen = Gen(Dict{String, VarInfo}(), 0, 0, 0, Dict{String, Any}(), Dict{String, Symbol}(), Set{String}(),
                 EqClass[], EqClass[], AlgClass[], Tuple{String, String, Bool}[], WhenClass[], AssertClass[], 0, 0, 0, 0,
                 -1000, false, Dict{Int, Int}(), AlgClass[], String[], AssertClass[], functionOutputs, Dict{String, String}(),
-                Set{String}(), Tuple{String, String}[], Tuple{String, IR, String}[], false, DelaySite[])
+                Set{String}(), Tuple{String, String}[], Tuple{String, IR, String}[], false, DelaySite[], false)
   local stateNamesOrdered::Vector{String} = String[]; local algNamesOrdered::Vector{String} = String[]
   local discreteNamesOrdered::Vector{String} = String[]
   local u0::Vector{Float64} = Float64[]; local d0::Vector{Float64} = Float64[]; local a0::Vector{Float64} = Float64[]

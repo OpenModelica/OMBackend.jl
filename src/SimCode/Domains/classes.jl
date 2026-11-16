@@ -35,7 +35,7 @@
 
 #= The domain level's classes and their expression form, its passes (rerolling, folding, alias elimination, semiLinear
    chains) and the causal level (elements, matching, scheduling with loops, tearing, solving for an unknown): moved
-   from CodeGeneration's ArrayODEGeneration.jl (2026-11-01), unchanged. =#
+   from CodeGeneration's ArrayODEGen.jl (2026-11-01), unchanged. =#
 
 struct NotSupported <: Exception
   msg::String
@@ -295,7 +295,11 @@ mutable struct Gen
   objects::Vector{Tuple{String, IR, String}}
   usesLeft::Bool   #= the code reads an algebraic variable's left limit at an event (pre() of it) =#
   delays::Vector{DelaySite}   #= the delay() calls of the equations and when-equations, numbered (`_numberDelays!`) =#
+  usesHomotopy::Bool   #= the code calls homotopy(): the initialization's continuation in its λ (`homotopyStart!`) =#
 end
+
+"A relation of a template by its expression and scope (the iterators' slots, the element-wise dimensions)."
+const RelationKey = Tuple{SC.Exp, Dict{String, Int}, Vector{Int}}
 
 struct Ctx
   iters::Dict{String, Int}  #= frontend iterator name -> slot =#
@@ -303,13 +307,21 @@ struct Ctx
   nrel::Base.RefValue{Int}  #= relations numbered so far in this template =#
   noEvent::Bool
   nsam::Base.RefValue{Int}  #= sample() calls numbered so far in this template =#
+  #= the relations numbered in this template: an equal relation in the same scope is the same relation, one slot
+     (`toIR`) =#
+  relations::Dict{RelationKey, IR}
+  #= an initial algorithm's: its relations of continuous values literal, a tie to rounding the exact tie
+     (`Op(:startRelation)`) =#
+  atStart::Bool
 end
 
-Ctx(iters, elem) = Ctx(iters, elem, Base.RefValue(0), false, Base.RefValue(0))
+Ctx(iters, elem) = Ctx(iters, elem, Base.RefValue(0), false, Base.RefValue(0), Dict{RelationKey, IR}(), false)
 
-Ctx(iters, elem, nrel, noEvent) = Ctx(iters, elem, nrel, noEvent, Base.RefValue(0))
+Ctx(iters, elem, nrel, noEvent) =
+  Ctx(iters, elem, nrel, noEvent, Base.RefValue(0), Dict{RelationKey, IR}(), false)
 
-_with(ctx::Ctx; elem = ctx.elem, noEvent = ctx.noEvent) = Ctx(ctx.iters, elem, ctx.nrel, noEvent, ctx.nsam)
+_with(ctx::Ctx; elem = ctx.elem, noEvent = ctx.noEvent, atStart = ctx.atStart) =
+  Ctx(ctx.iters, elem, ctx.nrel, noEvent, ctx.nsam, ctx.relations, atStart)
 
 function _paramValue!(g::Gen, name::String)
   haskey(g.params, name) && return g.params[name]
@@ -452,11 +464,14 @@ end
 
 """
 Whether a condition depends on loop indices and parameters only, by what `_evalStatic` evaluates (no call of a
-Modelica function, `:fcall`: such a condition is evaluated when the model runs).
+Modelica function, `:fcall`: such a condition is evaluated when the model runs). Not a parameter with fixed = false:
+the initialization computes it, so a condition on it is evaluated when the model runs (MSL DCPowerSupply's
+`if cp then`, cp from an initial algorithm).
 """
 _isStatic(g::Gen, x::IR)::Bool =
   x isa Lit || x isa Slot ||
-  (x isa Ref && !x.der && g.vars[x.name].kind == :param && all(s -> _isStatic(g, s), x.subs)) ||
+  (x isa Ref && !x.der && g.vars[x.name].kind == :param && !(x.name in g.freeParams) &&
+   all(s -> _isStatic(g, s), x.subs)) ||
   (x isa Op && !(x.op in (:initial, :sample, :fcall)) && all(a -> _isStatic(g, a), x.args))
 
 """
@@ -686,6 +701,31 @@ function _sourceSlots(g::Gen, nRelTotal::Int, relBases::Vector{Int}, whenRelBase
 end
 
 """
+The first slot of each slot's equation instance in the relation numbering: a class's, a when-equation's or an
+algorithm's at one column of its domain, whose relations are the slots from its base (`base + (col - 1) * nrel + id`).
+The relations of one instance (an if-expression's conditions) have the same; a slot of no instance its own.
+"""
+function _relationInstances(g::Gen, nRelTotal::Int, relBases::Vector{Int}, whenRelBases::Vector{Int},
+                            algRelBases::Vector{Int})::Vector{Int}
+  local first::Vector{Int} = collect(1:nRelTotal)
+  local mark!::Function = function (base::Int, nrel::Int, ncols::Int)
+    for col in 1:ncols, id in 1:nrel
+      first[base + (col - 1) * nrel + id] = base + (col - 1) * nrel + 1
+    end
+  end
+  for (ci, c) in enumerate(g.classes)
+    c.nrel == 0 || mark!(relBases[ci], c.nrel, size(c.domain, 2))
+  end
+  for (wi, w) in enumerate(g.whens)
+    w.nrel == 0 || mark!(whenRelBases[wi], w.nrel, size(w.domain, 2))
+  end
+  for (ai, a) in enumerate(g.algs)
+    a.nrel == 0 || mark!(algRelBases[ai], a.nrel, size(a.domain, 2))
+  end
+  return first
+end
+
+"""
 The slots of the relation numbering that are relations (`_rel`, `p.rel`), not an event-generating function's two
 crossing functions (`_evfn`).
 """
@@ -798,8 +838,8 @@ function _aliasTerms(c::EqClass)::Union{Nothing, Tuple{Ref, Ref, Bool}}
   return (x, y, n1 == n2)
 end
 
-"The variables the initial algorithms assign."
-function _initAlgAssigned(g::Gen)::Set{String}
+"The variables the initial algorithms assign (`which`: those of the algorithms it marks)."
+function _initAlgAssigned(g::Gen, which::BitVector = trues(length(g.initAlgs)))::Set{String}
   local names::Set{String} = Set{String}()
   local visit!::Function = function (stmts::Vector{Stmt})
     for st in stmts
@@ -808,9 +848,88 @@ function _initAlgAssigned(g::Gen)::Set{String}
       (st isa SFor || st isa SWhile) && visit!(st.body)
     end
   end
-  foreach(a::AlgClass -> visit!(a.body), g.initAlgs)
+  for (k::Int, a::AlgClass) in enumerate(g.initAlgs)
+    which[k] && visit!(a.body)
+  end
   return names
 end
+
+"""
+    _parameterAlgorithms(g) -> BitVector
+
+The initial algorithms that compute parameters and discrete values from parameters: they assign parameters, discrete
+variables (their initial value or pre() of it) no lifted cluster of discrete equations assigns, and the local of a
+tuple-valued call only, and read literals, iterators, parameters and discrete values, each parameter with fixed = false
+and each discrete value (or pre() of one) among them one such an algorithm assigns. They run before the initial
+system, which reads what they assign (MSL Engine1b_analytic: `rodLength = length(rRod_ia)`, `length = rodLength`, then
+the initial equation `positiveBranch = selectBranch(length, ...)`; MSL Noise's `r_raw = generator.random(pre(state))`,
+read by Variance's `mu = u`). The others run after it.
+"""
+function _parameterAlgorithms(g::Gen)::BitVector
+  local early::BitVector = falses(length(g.initAlgs))
+  #= the discrete variables of lifted clusters: their initialized values come with the clusters (`initialClusters!`) =#
+  local clusterNames::Set{String} = Set{String}()
+  for w::WhenClass in g.whens, (kind::Symbol, target::Ref, _) in w.body
+    (w.everyEvent && kind == :assign) && push!(clusterNames, target.name)
+  end
+  local isDiscrete::Function = (r::Ref) -> g.vars[r.name].kind == :discrete && !r.der
+  local isParam::Function = (r::Ref) -> g.vars[r.name].kind == :param && !r.der
+  local isTarget::Function = (r::Ref) -> isParam(r) || (isDiscrete(r) && !(r.name in clusterNames))
+  local reads::Vector{Vector{Ref}} = Vector{Ref}[Ref[] for _ in g.initAlgs]
+  local exp!::Function = (acc::Vector{Ref}, x::IR) -> begin
+    if x isa Ref
+      push!(acc, x)
+      foreach(s::IR -> exp!(acc, s), x.subs)
+    elseif x isa Pre
+      exp!(acc, x.ref)
+    elseif x isa Rel
+      exp!(acc, x.lhs); exp!(acc, x.rhs)
+    elseif x isa Op
+      x.op in (:sample, :initial) && return false
+      all(a::IR -> exp!(acc, a), x.args) || return false
+    elseif !(x isa Lit || x isa Slot)
+      return false
+    end
+    return true
+  end
+  local stmts!::Function = (acc::Vector{Ref}, body::Vector{Stmt}) -> all(body) do st::Stmt
+    if st isa SAssign || st isa SPreStart
+      isTarget(st.target) && all(s::IR -> exp!(acc, s), st.target.subs) && exp!(acc, st.value)
+    elseif st isa SIf
+      all(b::Tuple{IR, Vector{Stmt}} -> exp!(acc, b[1]) && stmts!(acc, b[2]), st.branches)
+    elseif st isa SFor
+      stmts!(acc, st.body)
+    elseif st isa SCall && st.call isa Op && st.call.op == :setlocal
+      #= the local of a tuple-valued call, its outputs assigned from it: (cr, c0, c1) = f(...) (MSL
+         Blocks.Continuous.Filter's coefficients, read by its steady-state initial equations der(x) = 0) =#
+      exp!(acc, st.call)
+    else
+      false
+    end
+  end
+  local readable::Function = (r::Ref) -> isParam(r) || isDiscrete(r)
+  local candidate::BitVector = BitVector([stmts!(reads[k], a.body) && all(readable, reads[k])
+                                          for (k::Int, a::AlgClass) in enumerate(g.initAlgs)])
+  #= a parameter with fixed = false or a discrete value it reads: assigned by such an algorithm (a fixed point, from
+     all candidates) =#
+  early .= candidate
+  local changed::Bool = true
+  while changed
+    local known::Set{String} = _initAlgAssigned(g, early)
+    local given::Function = (r::Ref) -> !(r.name in g.freeParams || isDiscrete(r)) || r.name in known
+    local next::BitVector = BitVector([early[k] && all(given, reads[k]) for k in eachindex(early)])
+    changed = next != early
+    early = next
+  end
+  return early
+end
+
+"""
+The parameters with fixed = false the initial system solves for: those the parameter algorithms
+(`_parameterAlgorithms`) do not compute before it.
+"""
+_initialFreeParams(g::Gen)::Set{String} =
+  setdiff(Set{String}(g.freeParams), _initAlgAssigned(g, _parameterAlgorithms(g)))
 
 "The variables algorithms (also initial ones) and when-equations assign."
 function _assignedNames(g::Gen)::Set{String}
@@ -1744,10 +1863,13 @@ end
 
 """
 Whether the divisors of an explicit solve (`_explicitDivisors`) are all nonzero at the instance column `col` of the
-class `c` (with the parameters' values; one that cannot be evaluated counts as zero).
+class `c` (with the parameters' values; one that cannot be evaluated counts as zero, as one that reads a parameter
+with fixed = false: the initialization computes it, MSL PrismaticWithLengthConstraint's `if positiveBranch then k2
+else -k2`).
 """
 function _nonzeroDivisors(g::Gen, divisors::Vector{IR}, c::EqClass, col::Int)::Bool
   for d in divisors
+    any(r::Ref -> r.name in g.freeParams, accesses!(Ref[], d)) && return false
     local value::Any = try
       _evalStatic(g, d, c.domain, col; structural = false)
     catch err
@@ -2103,6 +2225,66 @@ function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, nU::Int, p
   end
   done == length(live) || ns("algebraic loop through the blocks ($(length(live) - done) left)")
   return (batches, pos, producer, LoopBlocks(blocks, blockOf, families))
+end
+
+"""
+    _freeParameterDeps(g, el, matchRow, batches, producer, loops) -> Vector{Set{Tuple{String, Int}}}
+
+The elements (name, column-major index) of the parameters with fixed = false that every equation instance reads,
+directly or through the unknowns it reads (in schedule order, as `_stateDeps`; a loop block's instances all of the
+block's): the initialization's unknowns an initial equation of an algebraic variable can determine (MSL
+InitSpringConstant: `rev.a = 0` fixes the spring's c through the equations). Empty sets for a model without them.
+"""
+function _freeParameterDeps(g::Gen, el::InstanceTable, matchRow::Vector{Int},
+                            batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}}, producer::Vector{Int},
+                            loops::LoopBlocks)::Vector{Set{Tuple{String, Int}}}
+  local N::Int = length(el.class)
+  local deps::Vector{Set{Tuple{String, Int}}} = [Set{Tuple{String, Int}}() for _ in 1:N]
+  isempty(g.freeParams) && return deps
+  local free::Set{String} = _initialFreeParams(g)
+  local done::BitVector = falses(N)
+  #= the free parameter elements an instance reads itself =#
+  local own::Function = (r::Int, s::Set{Tuple{String, Int}}) -> begin
+    el.class[r] > 0 || return s
+    local c::EqClass = g.classes[el.class[r]]
+    for a::Ref in accesses!(accesses!(Ref[], c.lhs), c.rhs)
+      a.name in free || continue
+      local info::VarInfo = g.vars[a.name]
+      local idx::Vector{Int} = Int[_evalInt(g, x, c.domain, el.col[r]) for x in a.subs]
+      push!(s, (a.name, isempty(info.dims) ? 1 : LinearIndices(Tuple(info.dims))[idx...]))
+    end
+    return s
+  end
+  local through::Function = (r::Int, s::Set{Tuple{String, Int}}, skip::Function) -> begin
+    for i::Int in el.uptr[r]:(el.uptr[r + 1] - 1)
+      local q::Int = producer[el.uid[i]]
+      (q == 0 || skip(q) || !done[q]) && continue
+      union!(s, deps[q])
+    end
+    return s
+  end
+  for ((ci::Int, _), batch::Vector{Int}) in batches
+    if ci == 0
+      for b::Int in batch
+        local rs::Vector{Int} = loops.blocks[b]
+        local s::Set{Tuple{String, Int}} = Set{Tuple{String, Int}}()
+        for r::Int in rs
+          own(r, s)
+          through(r, s, (q::Int) -> loops.blockOf[q] == b)
+        end
+        for r::Int in rs
+          deps[r] = s
+          done[r] = true
+        end
+      end
+      continue
+    end
+    for r::Int in batch
+      deps[r] = through(r, own(r, Set{Tuple{String, Int}}()), (q::Int) -> q == r)
+      done[r] = true
+    end
+  end
+  return deps
 end
 
 """

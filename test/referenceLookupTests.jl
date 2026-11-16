@@ -78,7 +78,7 @@ import OMFrontend
     @test value(sol, "y", 1) ≈ 10.0 && OMBackend.getVariableValues(sol, "y")[end] ≈ 30.0
     #= a reference `tab[idx]` the code generation meets (CDL's TimeTable): the table of the elements by their
        references' identifiers, indexed at run time by the variable's symbol =#
-    isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "backendTestMocks.jl"))
+    isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "BackendTestMocks.jl"))
     local M = BackendTestMocks
     local sc = M.mockSimCode(vcat(SC.SIMVAR[M.simVar("tab[$k]", SC.PARAMETER(SC.RCONST(10.0 * k))) for k in 1:3],
                                   SC.SIMVAR[M.simVar("idx", SC.DISCRETE(), SC.TYPE_INTEGER())]))

@@ -31,7 +31,7 @@ TODO:
 =#
 
 
-# MTK-stage dump helpers (see CodeGeneration/mtkDump.jl).
+# MTK-stage dump helpers (see CodeGeneration/MTKDump.jl).
 import .MTKDump: dumpMTKPreSimplify, dumpMTKPostSimplify
 
 #= Global dictionary to store dynamically generated function implementations =#

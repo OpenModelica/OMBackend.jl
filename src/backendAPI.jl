@@ -209,7 +209,7 @@ end
     In-backend MTK path. Same module/codegen as MTK_MODE, but additionally
     constructs the System and runs structural_simplify in the backend at
     translate time and dumps the post-simplify System. Simulate reuses the
-    existing module interface. Implementation in CodeGeneration/iMTKGen.jl.
+    existing module interface. Implementation in CodeGeneration/IMTKGen.jl.
   =#
   IMTK_MODE = 5
 end
@@ -295,7 +295,8 @@ const BACKEND_SCALARIZED_MODELS = Set{String}()
 
 """
 Why the arrays-kept paths did not take a model at its last translate (canonical name => path => reason): what OM's
-translate reports when it falls back to the scalarizing flatten (`scalarizedFallbackReason`).
+translate reports in its error where none takes the model (`scalarizedFallbackReason`, OM's
+`ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`).
 """
 const ARRAY_PATH_REASONS = Dict{String, Dict{String, String}}()
 
@@ -311,8 +312,9 @@ end
 """
     scalarizedFallbackReason(name) -> String
 
-Why the model `name` (canonical) goes through the scalarizing flatten: the reasons the arrays-kept
-paths gave at its last translate (array index reduction, the array code after it, the backend's scalarization).
+Why no arrays-kept path took the model `name` (canonical): the reasons the arrays-kept paths gave at its last
+translate (array index reduction, the array code after it, the backend's scalarization). OM's translate throws them
+(`ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`); it no longer flattens a second time with scalarization (JKRT 2026-11-15).
 """
 function scalarizedFallbackReason(name::String)::String
   local reasons = get(ARRAY_PATH_REASONS, name, Dict{String, String}())
@@ -526,7 +528,20 @@ function reducedArrayModel(lower::Function, name::String)::Union{Nothing, OMJLIR
        assignments in their order) =#
     local model::OMJLIR.Model = Passes.runPassesKeepingArrays!(lowered)
     local rolled::Bool = roll && reduction.rollComponents!(model) > 0
-    if own || rolled
+    if rolled
+      #= the rolled instances' elements treated differently by the plan (a gear between rolled inertias, one of them
+         no state: slicing that splits most of the rolled arrays), or another form the rolled arrays do not take:
+         the components as declared (rolling only saves equations); the model is lowered again, the reduction's
+         splits changed it =#
+      try
+        reduction.reduceIndexArrays!(model)
+      catch err
+        err isa reduction.NotHandled || rethrow()
+        @info "[index reduction] $(name): rolled components not taken ($(sprint(showerror, err))), as declared"
+        model = Passes.runPassesKeepingArrays!(lower())
+        reduction.reduceIndexArrays!(model; arrays = own)
+      end
+    elseif own
       reduction.reduceIndexArrays!(model)
     else
       #= none to keep: its index reduced, or its states committed, in the array form all the same (the array code
@@ -577,7 +592,7 @@ passes with index reduction (`Passes.runPasses!`): what the frontend's scalarizi
 passes, gives, without flattening again. For the models the array form does not take (`reducedArrayModel`).
 `nothing` where the element view does not take the model (switched off, OMBACKEND_BACKEND_SCALARIZATION; what it
 does not handle: logged; another error: a warning), the reason recorded (`declineArrayPath!`, "backend
-scalarization"): the frontend scalarizes then.
+scalarization"): OM's translate throws then (`ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`).
 """
 function backendScalarizedModel(lower::Function, name::String)::Union{Nothing, OMJLIR.Model}
   local decline::Function = (reason::String) -> declineArrayPath!(name, "backend scalarization", reason)

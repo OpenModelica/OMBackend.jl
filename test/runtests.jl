@@ -167,6 +167,22 @@ import .ExampleModels
     end
   end
 
+  @testset "Logging switches from the loading process's environment" begin
+    #= read at load (`__init__`), not kept from the precompile cache: one precompiled with ENABLE_BACKEND_LOGGING=true
+       logged in every later session (its printed models with the dump code, kindMetadataTests' parse failed) =#
+    local saved::Tuple{Bool, Bool, Bool} =
+      (OMBackend.BACKEND_LOGGING[], OMBackend.VSS_DEBUG[], OMBackend.BACKEND_PERFLOG[])
+    try
+      OMBackend.BACKEND_LOGGING[] = true
+      withenv("ENABLE_BACKEND_LOGGING" => nothing, "ENABLE_VSS_DEBUG" => nothing, "ENABLE_BACKEND_PERFLOG" => "true") do
+        OMBackend.readLoggingSwitches!()
+      end
+      @test (OMBackend.BACKEND_LOGGING[], OMBackend.VSS_DEBUG[], OMBackend.BACKEND_PERFLOG[]) == (false, false, true)
+    finally
+      (OMBackend.BACKEND_LOGGING[], OMBackend.VSS_DEBUG[], OMBackend.BACKEND_PERFLOG[]) = saved
+    end
+  end
+
   #= ── 1. Cache management ──────────────────────────────────────── =#
 
   @testset "clearCaches!" begin
@@ -332,6 +348,7 @@ import .ExampleModels
 
   #= ── 9. Event iteration within one event ─────────────────────── =#
   include("eventIterationTests.jl")
+  include("restartStepTests.jl")
 
   #= ── 10. Step control for algebraic unknowns ─────────────────── =#
   include("algebraicStepControlTests.jl")

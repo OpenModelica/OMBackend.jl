@@ -38,9 +38,9 @@
 
 OMJLIR expressions as values, for the passes that reason about them (index reduction's
 differentiation and state selection): built with their zero and one terms dropped and their
-literals folded (Algebra.jl), their elements and fields picked (Elements.jl), a call inlined as
-the expression its function's algorithm computes (Inline.jl), evaluated at the start values
-(Evaluate.jl), and a function's algorithm run on numbers (Interpret.jl). Best effort: `nothing`
+literals folded (algebra.jl), their elements and fields picked (elements.jl), a call inlined as
+the expression its function's algorithm computes (inline.jl), evaluated at the start values
+(evaluate.jl), and a function's algorithm run on numbers (interpret.jl). Best effort: `nothing`
 where a value is not known.
 """
 module Evaluation
@@ -56,13 +56,13 @@ const Step = Union{Symbol, Vector{Int}}
 "The steps from a value to one of its scalars (`[:T, [1, 2]]` of `R.T[1,2]` in `R`; none for a scalar itself)."
 const Path = Vector{Step}
 
-"A flat value (Interpret.jl): its scalars by their paths (`[]` a scalar, `[[i, j]]` an array's element, `[:f]` a record's field)."
+"A flat value (interpret.jl): its scalars by their paths (`[]` a scalar, `[[i, j]]` an array's element, `[:f]` a record's field)."
 const FlatValue = Dict{Path, Float64}
 
-include("Algebra.jl")
-include("Elements.jl")
-include("Inline.jl")
-include("Evaluate.jl")
-include("Interpret.jl")
+include("algebra.jl")
+include("elements.jl")
+include("inline.jl")
+include("evaluate.jl")
+include("interpret.jl")
 
 end # Evaluation

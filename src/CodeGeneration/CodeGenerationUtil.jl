@@ -778,7 +778,7 @@ function _replaceHvcats(expr, replacements::Dict{HvcatKey, Symbol})
 end
 
 #= ===================================================================
-   Utilities migrated out of MTK_CodeGeneration.jl. These are pure
+   Utilities migrated out of mtkCodeGeneration.jl. These are pure
    predicates / collectors / Expr transforms — no MTK-specific codegen.
    =================================================================== =#
 

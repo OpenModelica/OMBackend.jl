@@ -463,12 +463,7 @@ function liftIfExpressions!(model::IR.Model)::IR.Model
     for eq in p.equations
       (eq isa IR.WHEN_EQUATION && eq.kind !== IR.STRUCTURAL_WHEN) && continue
       eq isa IR.ASSERT_EQUATION && continue
-      #= for-equations come here only with the arrays kept: an if-expression that reads the iterator stays inline
-         (lifted, its if-equation would read the iterator outside its loop: MSL RobotR3.oneAxis's
-         `moving[i] = if abs(q_end[i] - q_begin[i]) > eps then ...`, a free `i` in the generated code); the array
-         code and index reduction read it there =#
-      (eq isa IR.FOR_EQUATION && ifReadsIterator(eq)) && continue
-      mapRoots!((@nospecialize(e::IR.Expression)) -> lift(lifter, e, false), eq)
+      liftRoots!(lifter, eq)
     end
     append!(p.equations, lifter.equations)
   end
@@ -535,6 +530,32 @@ function IfExpressionLifter(variables::IR.VariableSet)::IfExpressionLifter
     next += 1
   end
   return IfExpressionLifter(variables, Dict{Any, IR.CREF}(), IR.Equation[], Ref(next))
+end
+
+"""
+The if-expressions of the equation `eq` lifted (`liftIfExpressions!`), but those of a for-equation that read its
+iterator, in an if-equation's branch too. For-equations come here only with the arrays kept: such an if-expression
+stays inline, the array code and index reduction read it in the loop. Lifted, its if-equation read the iterator outside
+the loop: MSL RobotR3.oneAxis's `moving[i] = if abs(q_end[i] - q_begin[i]) > eps then ...`, a free `i` in the
+generated code; LossyGear's `if ideal then ... else for i in 1:4 loop interpolation_result[1, i] = if smoothness ==
+... then getTable1DValueNoDer(tableID, i, ...) ...`, "unknown variable i".
+"""
+function liftRoots!(lifter::IfExpressionLifter, eq::IR.Equation)::Nothing
+  local g::Function = (@nospecialize(e::IR.Expression)) -> lift(lifter, e, false)
+  if eq isa IR.FOR_EQUATION
+    ifReadsIterator(eq) && return nothing
+    eq.iterator = IR.Iterator(eq.iterator.name, g(eq.iterator.range))
+    foreach((@nospecialize(x::IR.Equation)) -> liftRoots!(lifter, x), eq.body)
+  elseif eq isa IR.IF_EQUATION
+    eq.branches = IR.EquationBranch[IR.EquationBranch(g(b.condition), b.equations) for b in eq.branches]
+    for b in eq.branches
+      foreach((@nospecialize(x::IR.Equation)) -> liftRoots!(lifter, x), b.equations)
+    end
+    foreach((@nospecialize(x::IR.Equation)) -> liftRoots!(lifter, x), eq.elseEquations)
+  else
+    mapRoots!(g, eq)
+  end
+  return nothing
 end
 
 """

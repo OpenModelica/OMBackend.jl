@@ -33,7 +33,7 @@
 *
 */ =#
 
-#= iMTKGen.jl — in-backend MTK path: reuses generateMTKCode and the generated
+#= IMTKGen.jl — in-backend MTK path: reuses generateMTKCode and the generated
    module's `simulateFromBuild`. Builds + runs structural_simplify in the backend
    at translate time and caches the raw build tuple; simulate remakes the
    problem's tspan and delegates the post-build solve to `simulateFromBuild`, so
@@ -137,7 +137,7 @@ function generateIMTKCode(simCode::SC.SIM_CODE)
      returns the 9-tuple shape iMTK's cache assumes. Structural transitions
      and sub-models use MODEL_GENERATION's simpler simulate; skip _buildAndCache so iMTK falls through cleanly to the module
      `simulate` instead of warning loudly for every such model. Mirrors the
-     condition in ODE_MODE_MTK (MTK_CodeGeneration.jl:415). =#
+     condition in ODE_MODE_MTK (mtkCodeGeneration.jl:415). =#
   if _OMBackend().evaluationRejected(_OMBackend())
     #= OMJL's precompile workload: Core.eval'ing the model module into this
        closed backend module is rejected; skip the build+eval (codegen warmed). =#

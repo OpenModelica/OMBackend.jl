@@ -114,12 +114,27 @@ function whenTargets!(out::Set{Symbol}, eq::IR.Equation, variables::IR.VariableS
       whenTargets!(out, b, variables)
     end
   elseif eq isa IR.WHEN_EQUATION
-    for br in eq.branches, st in br.body
-      st isa IR.ASSIGNMENT || continue
-      for t in (st.lhs isa IR.TUPLE ? st.lhs.elements : IR.Expression[st.lhs])
-        t isa IR.CREF && push!(out, variableNameOf(t.cref, variables))
-      end
+    for br in eq.branches
+      foreach((st::IR.Statement) -> whenStatementTargets!(out, st, variables), br.body)
     end
+  end
+  return nothing
+end
+
+"""
+The variables the statement `st` of a when-branch assigns onto `out`: an assignment's targets, those of the branches of
+an if-statement (an if-equation in a when-equation: MSL PreisachEverett's `if init3 then aSav = ...; elseif ...`).
+"""
+function whenStatementTargets!(out::Set{Symbol}, st::IR.Statement, variables::IR.VariableSet)::Nothing
+  if st isa IR.ASSIGNMENT
+    for t in (st.lhs isa IR.TUPLE ? st.lhs.elements : IR.Expression[st.lhs])
+      t isa IR.CREF && push!(out, variableNameOf(t.cref, variables))
+    end
+  elseif st isa IR.IF_STATEMENT
+    for b in st.branches
+      foreach((x::IR.Statement) -> whenStatementTargets!(out, x, variables), b.body)
+    end
+    foreach((x::IR.Statement) -> whenStatementTargets!(out, x, variables), st.elseBody)
   end
   return nothing
 end

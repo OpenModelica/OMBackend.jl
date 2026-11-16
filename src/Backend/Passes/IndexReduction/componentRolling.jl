@@ -429,6 +429,10 @@ function rolledVariable(r::RolledVariable, g::ComponentGroup, groups::Vector{Com
   local first::IR.Variable = whole ? r.whole[1]::IR.Variable : r.elements[1][sort!(collect(keys(r.elements[1])))[1]]
   local innerSizes::Vector{Int} = whole ? knownSizes(first.ty, "the variable $(first.name)") : elementSizes(r)
   local elementTy::IR.ModelicaType = IR.elementType(first.ty)
+  #= the array form has no elements of external objects (`scalarVariables`): instances that hold one (a table's
+     `tableID`, MSL RadioButtonSource's BooleanTable: Interaction1) stay components =#
+  elementTy isa IR.T_EXTERNAL_OBJECT &&
+    throw(NotHandled("the variable $(variableLabel(r)), an external object"))
   local ty::IR.ModelicaType = IR.T_ARRAY(elementTy, IR.Dimension[IR.DIM_SIZE(d) for d in [n; innerSizes]])
   #= every element of every instance of one kind and type =#
   local everyOne::Vector{IR.Variable} = whole ? IR.Variable[x::IR.Variable for x in r.whole] :

@@ -77,7 +77,7 @@ function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr}, sim
      compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
      has already run (so its method instances are warmed for the bake), and a real runtime
      translate registers them normally — the guard is precompile-only. Mirrors the
-     guard in generateIMTKCode (iMTKGen.jl). =#
+     guard in generateIMTKCode (IMTKGen.jl). =#
   if OMBackend.evaluationRejected(@__MODULE__)
     return nothing
   end
@@ -1152,7 +1152,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
      `planDemotions` detects those cases (plus cyclic-SCC discretes and a
      bounded heuristic for any remaining excess) and `applyDemotionPlan!`
      drops the corresponding dummies, reclassifying the names as algebraic.
-     See OMBackend/src/CodeGeneration/DiscreteDummyDemotion.jl for the
+     See OMBackend/src/CodeGeneration/discreteDummyDemotion.jl for the
      full pattern catalogue and the when-equation safety rule. =#
   local discreteVariablesSym = Symbol[:($(Symbol(v))) for v in discreteVariables]
   local DISCRETE_DUMMY_EQUATIONS = [:(der($(Symbol(dv))) ~ 0) for dv in discreteVariables]
@@ -1446,7 +1446,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
         push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableStatePriority, $priority)))
       end
       #= Dump the resolved variable-binding batch before `eval`. See
-         CodeGeneration/mtkDump.jl. The dump runs at simulate time inside
+         CodeGeneration/MTKDump.jl. The dump runs at simulate time inside
          the model module, so it must reference MTKDump by its absolute
          module path (the model module does not import MTKDump). =#
       OMBackend.CodeGeneration.MTKDump.dumpBatchBlock(vars, irreducibleSyms, _statePriorityPairs, _batchBlock)

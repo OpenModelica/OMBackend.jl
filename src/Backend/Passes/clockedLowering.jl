@@ -201,19 +201,41 @@ function targetNames(e::IR.Expression)::Vector{Union{Nothing, Symbol}}
 end
 
 """
+    elementKeys(name, variables) -> Vector{Symbol}
+
+The keys a clocked partition's assignments and reads of `name` are matched by: of an array variable of literal sizes
+(arrays kept), its elements' names (`u[1]`, `u[2]`: the names of references to its elements), so that an element's
+equation assigns its element and a read of the whole array waits for all of them; of any other name, the name.
+"""
+function elementKeys(name::Symbol, variables::IR.VariableSet)::Vector{Symbol}
+  haskey(variables, name) || return Symbol[name]
+  local ty::IR.ModelicaType = variables[name].ty
+  (ty isa IR.T_ARRAY && all(d::IR.Dimension -> d isa IR.DIM_SIZE, ty.dimensions)) || return Symbol[name]
+  local sizes::Tuple = Tuple(Int[d.size for d in ty.dimensions])
+  return Symbol[Symbol(name, "[", join(Tuple(i), ","), "]") for i in CartesianIndices(sizes)]
+end
+
+"Names of variables or of their elements (`elementKeys`) sorted as `sortedByName` sorts variables."
+sortedKeys(names, variables::IR.VariableSet)::Vector{Symbol} =
+  sort!(collect(Symbol, names); by = n::Symbol -> haskey(variables, n) ? legacyName(variables[n].cref) : string(n))
+
+"""
     partitionStatements(partition, variables, r)
 
 The partition's equations as assignments of its variables: the bodies of its clocked
 when-clauses, its if-equations by variable, its tuple equations, its equations by a matching of
-equations to the variables they can be written for; its initial when-equations apart.
+equations to the variables they can be written for; its initial when-equations apart. An array variable (arrays
+kept) is matched and checked by its elements (`elementKeys`): `x = u[2]` written for `u[2]`.
 """
 function partitionStatements(partition::IR.Partition, r::ClockOperators,
                              variables::IR.VariableSet)::Tuple{Vector{IR.Statement}, Vector{IR.Equation}}
-  local names = Set{Symbol}(partition.unknowns)
+  local keysOf = (n::Symbol) -> elementKeys(n, variables)
+  local names = Set{Symbol}(k for v in partition.unknowns for k in keysOf(v))
   local statements = IR.Statement[]
   local initialWhens = IR.Equation[]
   local assigned = Set{Symbol}()
-  local pending = IR.SCALAR_EQUATION[]
+  #= equations of scalars or of arrays as a whole (`{1.0, 1.0, 1.0} = FIR1.a`, `sample(u, c) = y`) =#
+  local pending = Union{IR.SCALAR_EQUATION, IR.ARRAY_EQUATION}[]
   for eq in partition.equations
     if eq isa IR.WHEN_EQUATION
       local b = eq.branches[1]
@@ -243,23 +265,26 @@ function partitionStatements(partition::IR.Partition, r::ClockOperators,
          of them to an alias equation next to it (`(y, s) = f(...); y = w`). =#
       local (target, value) = eq.lhs isa IR.TUPLE ? (eq.lhs, eq.rhs) : (eq.rhs, eq.lhs)
       local ns = targetNames(target)
-      all(x -> x === nothing || x in names, ns) ||
+      all(x -> x === nothing || all(in(names), keysOf(x)), ns) ||
         unsupported("a clocked tuple equation that assigns other variables than its partition's", eq)
       push!(statements, IR.ASSIGNMENT(target, rewrite(r, value), eq.source))
       foreach(n -> n === nothing || push!(assigned, n), ns)
-    elseif eq isa IR.SCALAR_EQUATION
+    elseif eq isa Union{IR.SCALAR_EQUATION, IR.ARRAY_EQUATION}
       push!(pending, eq)
     else
       unsupported("an equation of this kind in a clocked partition", eq)
     end
   end
   #= the equations: each written for one of the partition's variables =#
+  local assignedKeys = Set{Symbol}(k for n in assigned for k in keysOf(n))
   local candidates = Vector{Symbol}[]
   for eq in pending
     local c = Symbol[]
     for side in (eq.lhs, eq.rhs)
       local n = nameOf(side)
-      n !== nothing && n in names && !(n in assigned) && !(n in c) && push!(c, n)
+      (n === nothing || n in c) && continue
+      local ks::Vector{Symbol} = keysOf(n)
+      (all(in(names), ks) && !any(in(assignedKeys), ks)) && push!(c, n)
     end
     push!(candidates, c)
   end
@@ -272,12 +297,12 @@ function partitionStatements(partition::IR.Partition, r::ClockOperators,
   end
   #= each of the partition's variables assigned once at a tick =#
   local count = Dict{Symbol, Int}()
-  for s in statements, t in statementTargets(s)
-    count[t] = get(count, t, 0) + 1
+  for s in statements, t in statementTargets(s), k in keysOf(t)
+    count[k] = get(count, k, 0) + 1
   end
-  local twice = sortedByName((v for (v, k) in count if k > 1), variables)
+  local twice = sortedKeys((v for (v, k) in count if k > 1), variables)
   isempty(twice) || unsupported("a variable of a clocked partition assigned twice at a tick", twice)
-  local unassigned = sortedByName((v for v in names if !haskey(count, v)), variables)
+  local unassigned = sortedKeys((v for v in names if !haskey(count, v)), variables)
   isempty(unassigned) || unsupported("a variable of a clocked partition no equation assigns", unassigned)
   return (statements, initialWhens)
 end
@@ -300,7 +325,7 @@ function ifAssignments(eq::IR.IF_EQUATION, r::ClockOperators, assigned::Set{Symb
   local targets = keys(first(branches))
   all(b -> Set(keys(b)) == Set(targets), branches) || unsupported("a clocked if-equation whose branches assign different variables", eq)
   local out = IR.Statement[]
-  for v in sortedByName(targets, variables)
+  for v in sortedKeys(targets, variables)
     local value = rewrite(r, last(branches)[v][2])
     for k in length(eq.branches):-1:1
       local thenValue = rewrite(r, branches[k][v][2])
@@ -501,7 +526,8 @@ function lowerBaseClock(b::Int, base::IR.ClockKind, parts::Vector{IR.Partition},
       push!(statements, IR.ASSIGNMENT(s.lhs, s.lhs isa IR.CREF ? noEventCall(guarded) : guarded, s.source))
     end
   end
-  local whenEq = IR.WHEN_EQUATION([IR.WhenBranch(IR.Expression[condition], false, false, sortStatements(statements))],
+  local whenEq = IR.WHEN_EQUATION([IR.WhenBranch(IR.Expression[condition], false, false,
+                                                 sortStatements(statements, variables))],
                                   IR.REGULAR_WHEN, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES)
   return (whenEq, newVars, extraEqs)
 end
@@ -520,20 +546,25 @@ statementReads(s::IR.Statement)::Set{Symbol} =
 """
 The statements of a base clock's when-clause in the order of their data: a statement after the
 statements assigning what it reads at this tick (`pre` reads the previous tick). Kahn's
-algorithm, stable; statements in a cycle (an algebraic loop at a tick) are not supported.
+algorithm, stable; statements in a cycle (an algebraic loop at a tick) are not supported. Targets and reads by their
+`elementKeys`: a read of a whole array after the assignments of its elements.
 """
-function sortStatements(statements::Vector{IR.Statement})::Vector{IR.Statement}
+function sortStatements(statements::Vector{IR.Statement}, variables::IR.VariableSet)::Vector{IR.Statement}
+  local targetKeys::Vector{Set{Symbol}} =
+    [Set{Symbol}(k for t in statementTargets(s) for k in elementKeys(t, variables)) for s in statements]
+  local readKeys::Vector{Set{Symbol}} =
+    [Set{Symbol}(k for t in statementReads(s) for k in elementKeys(t, variables)) for s in statements]
   local assignedBy = Dict{Symbol, Int}()
-  for (i, s) in enumerate(statements), t in statementTargets(s)
-    assignedBy[t] = i
+  for (i, ks) in enumerate(targetKeys), k in ks
+    assignedBy[k] = i
   end
-  for s in statements
-    local own = intersect(Set(statementTargets(s)), statementReads(s))
+  for (i, s) in enumerate(statements)
+    local own = intersect(targetKeys[i], readKeys[i])
     isempty(own) || unsupported("an algebraic loop in a clocked partition (a variable its own equation reads at the tick)",
                                 (sort!(collect(own)), s))
   end
-  local deps = [Set{Int}(assignedBy[v] for v in statementReads(s) if haskey(assignedBy, v) && assignedBy[v] != i)
-                for (i, s) in enumerate(statements)]
+  local deps = [Set{Int}(assignedBy[v] for v in readKeys[i] if haskey(assignedBy, v) && assignedBy[v] != i)
+                for i in eachindex(statements)]
   local done = falses(length(statements))
   local order = Int[]
   while length(order) < length(statements)

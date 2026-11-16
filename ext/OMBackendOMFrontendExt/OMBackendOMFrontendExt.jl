@@ -67,7 +67,7 @@ const F = OMFrontend.Frontend
 include("LowerFlatModel.jl")
 import .LowerFlatModel: FunctionList
 include("translate.jl")
-include("recompilation.jl")
+include("Recompilation.jl")
 
 "The file of a `modelica://` URI, where OMFrontend loaded the library from (OMFrontend.resolveModelicaURI)."
 resolveModelicaURI(uri::String)::String = OMFrontend.resolveModelicaURI(uri)

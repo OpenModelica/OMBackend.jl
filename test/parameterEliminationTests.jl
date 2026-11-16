@@ -5,7 +5,7 @@
 using Test
 import OMBackend
 import OMFrontend
-isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "backendTestMocks.jl"))
+isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "BackendTestMocks.jl"))
 
 const EIP_SOLUTION = OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.AbstractODESolution
 

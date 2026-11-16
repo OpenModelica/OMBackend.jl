@@ -71,7 +71,7 @@ end
 """
 OMJL's `translate` of the model `name` of `scode`: the frontend's flatten with the arrays kept and
 `translateReducedArrays` (the array code, else the scalarized reduced model, else the kept arrays scalarized by the
-backend), else the scalarizing flatten and `translate`.
+backend); an error where none takes the model (OMJL's `ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`: no second flatten).
 """
 function _precompileTranslate(scode::OMFrontend.SCode.Program, name::String,
                               mode::OMBackend.BackendMode)::Union{Nothing, Tuple{String, Expr}}
@@ -81,19 +81,15 @@ function _precompileTranslate(scode::OMFrontend.SCode.Program, name::String,
                            warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing,
                            checkSimCode = true)
   reduced === nothing || return reduced
-  (fm, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = true)
-  return translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), BackendMode = mode,
-                   warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing,
-                   checkSimCode = true, scalarized = true)
+  error("$(name): array preserving codegen not supported ($(OMBackend.scalarizedFallbackReason(canonicalName(name))))")
 end
 
 """
 The translate and simulate of OMJL (`_precompileTranslateAndSimulate`) over the workload's models, so that their code
-compiles into the extension's package image, not at each process's first model: `Precompile/Translate.mo`'s models of the
-scalarized path and of scalars in the array code (Drive: the kept flat model scalarized by the backend; Rectifier:
-the array code's loop of scalars; Pendulum: its index reduced in the array form; Thermostat: the array code with
-events) and `Precompile/ArraysKept.mo`'s of the array code (`Chain`: MultiBody's frames through
-functions, slicing; `Volumes`: a semiLinear chain, a free parameter, a when-equation; `LoopEvents`: a torn loop, events,
+compiles into the extension's package image, not at each process's first model: `Precompile/Translate.mo`'s models
+of scalars in the array code (Drive: rolled inertias the plan treats differently, taken as declared; Rectifier: the
+array code's loop of scalars; Pendulum: its index reduced in the array form; Thermostat: the array code with events)
+and `Precompile/ArraysKept.mo`'s of the array code (`Chain`: MultiBody's frames through functions, slicing; `Volumes`: a semiLinear chain, a free parameter, a when-equation; `LoopEvents`: a torn loop, events,
 an assert). A fresh process's first translate compiled 3-18 s of OMBackend's, MTK's and Symbolics' code before (MSL
 4.1.0 Rotational First 12.9 s, MultiBody DoublePendulum 17.9 s; EngineV6 2371 methods for reducedArrayModel); the
 registries are restored afterwards (`OMBackend._registries`). `simulate`: also build and simulate them, where an
@@ -104,7 +100,7 @@ function _precompileWarmupTranslate(; simulate::Bool = !OMBackend.evaluationReje
   local registries::Vector{Pair{Any, Any}} = OMBackend._registries()
   try
     for (file, package, models) in ((TRANSLATE_WORKLOAD, "OMBackendTranslateWorkload",
-                                     ("Drive" => false, "Thermostat" => true, "Rectifier" => true, "Pendulum" => true)),
+                                     ("Drive" => true, "Thermostat" => true, "Rectifier" => true, "Pendulum" => true)),
                                     (ARRAYS_KEPT_WORKLOAD, "OMBackendWorkload",
                                      ("Chain" => true, "Volumes" => true, "LoopEvents" => true)))
       local scode::OMFrontend.SCode.Program = OMFrontend.translateToSCode(OMFrontend.parseFile(file))

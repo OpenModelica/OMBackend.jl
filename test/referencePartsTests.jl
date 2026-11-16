@@ -1,7 +1,7 @@
 #= OMJLIR's references by their parts: a name is derived from them (`flatName`, `legacyName`), never taken apart.
    A slice of an array split along its inner dimensions (`T_SLICE`), and the algorithm lifter's questions by parts:
    which references overlap, the wholes an assignment's target is a part of, the arrays equations constrain; the
-   interpreter's values by paths (Evaluation's Interpret.jl), a scalar's wholes by its reference's parts. The
+   interpreter's values by paths (Evaluation's interpret.jl), a scalar's wholes by its reference's parts. The
    reduced models' references (state sets, derivatives, array form) are checked in indexReductionTests
    (`referenceProblems`). =#
 using Test

@@ -2271,7 +2271,7 @@ The ODESystem's constructor: with the if-equations' events (SymbolicContinuousCa
 discrete parameters: the ifCond relays live in the parameter vector) but then no observed
 equations (MTK's complete(sys) injects them into every callback's AffectSystem, which fails
 tearing where they introduce variables the callback cannot solve: they are added to the
-reduced system after structural_simplify, MTK_CodeGeneration.jl); the initial equations as
+reduced system after structural_simplify, mtkCodeGeneration.jl); the initial equations as
 `initialization_eqs` (constraints that hold at t = 0: `PID.gainPID.y = 0`, not only guesses).
 """
 function odeSystemWithEvents(hasEvents::Bool, modelName::String; hasObserved::Bool = false)::Expr

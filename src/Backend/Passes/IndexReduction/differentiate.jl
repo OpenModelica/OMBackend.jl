@@ -36,8 +36,8 @@
 #= Symbolic differentiation of OMJLIR expressions and equations: d/dt for the equations
    Pantelides' algorithm differentiates, partial derivatives for the Jacobians of state
    selection. One set of rules, a seed telling what a variable reference and time become. The
-   derivatives are built with Evaluation's simplifying constructors (Evaluation/Algebra.jl), a
-   call without derivative annotation inlined (Evaluation/Inline.jl). =#
+   derivatives are built with Evaluation's simplifying constructors (Evaluation/algebra.jl), a
+   call without derivative annotation inlined (Evaluation/inline.jl). =#
 
 """
     Seeds

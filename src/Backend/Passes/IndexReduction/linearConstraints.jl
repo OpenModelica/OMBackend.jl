@@ -114,6 +114,10 @@ function linearTerms!(row::LinearRow, @nospecialize(e::IR.Expression), scale::Ra
     local b = readsContinuous(e.exp2, resolve) ? nothing : knownRational(e.exp2, values)
     (b === nothing || iszero(b)) && return false
     return linearTerms!(row, e.exp1, scale / b, index, resolve, values)
+  elseif e isa IR.CALL && e.name === :sum && e.attributes.builtin && length(e.arguments) == 1 &&
+         e.arguments[1] isa IR.ARRAY
+    #= the sum of an array's elements, as the element view writes `sum(i)` (MSL ZeroInductor: `m * i0 = sum(i)`) =#
+    return all(x::IR.Expression -> linearTerms!(row, x, scale, index, resolve, values), e.arguments[1].elements)
   end
   return false
 end

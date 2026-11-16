@@ -79,7 +79,8 @@ end
 The solver of one large algebraic loop of an array model (`blockSolve!`): the columns of each color of its residuals'
 sparsity in its iteration variables, the Jacobian on that sparsity and its factorization, kept between calls (dense
 up to `DENSE_BLOCK_SIZE` variables: the factors in place with their pivots; else sparse), the last solution (the next
-call's guess; the start values until a solve succeeded) and counters (residual evaluations, Jacobians, failed solves).
+call's guess; the start values until a solve succeeded), the largest of its residuals (`rsolved`; -1 before the
+first) and counters (residual evaluations, Jacobians, failed solves).
 `rankDeficient`: the dense Jacobian was singular and `factors` holds its pseudo-inverse (`_blockJacobian!`).
 """
 mutable struct BlockSolver
@@ -99,6 +100,7 @@ mutable struct BlockSolver
   const dx::Vector{Float64}
   const h::Vector{Float64}
   solved::Bool
+  rsolved::Float64
   residuals::Int
   jacobians::Int
   failures::Int
@@ -113,7 +115,8 @@ function Base.deepcopy_internal(s::BlockSolver, dict::IdDict)::BlockSolver
   local c::BlockSolver = BlockSolver(Vector{Int}[copy(g) for g in s.groups], copy(s.J), s.dense, copy(s.factors), copy(s.pivots),
                                      nothing, s.dense && s.factored, s.rankDeficient, copy(s.y), copy(s.x), copy(s.r),
                                      copy(s.rp), copy(s.xp),
-                                     copy(s.dx), copy(s.h), s.solved, s.residuals, s.jacobians, s.failures)
+                                     copy(s.dx), copy(s.h), s.solved, s.rsolved, s.residuals, s.jacobians,
+                                     s.failures)
   dict[s] = c
   return c
 end
@@ -125,7 +128,7 @@ function BlockSolver(pattern::_SPARSE.SparseMatrixCSC{Float64, Int}, colors::Vec
   local dense::Bool = n <= DENSE_BLOCK_SIZE
   return BlockSolver(groups, copy(pattern), dense, zeros(dense ? n : 0, dense ? n : 0), zeros(_LINALG.BlasInt, dense ? n : 0),
                      nothing, false, false, copy(guess), zeros(n), zeros(n), zeros(n), zeros(n), zeros(n), zeros(n),
-                     false, 0, 0, 0)
+                     false, -1.0, 0, 0, 0)
 end
 
 """
@@ -134,13 +137,13 @@ end
 Solve a large algebraic loop of an array model where the equations reach it: `residual!(res, y, du, a, u, p, t, z,
 mode, fire)` places the iteration variables `y` where the equations read them (du, a), computes the loop's other
 unknowns from them and evaluates its residuals. Newton from the last solution with the kept factorization, else with
-a Jacobian in every step (also from the start values), then with differences over a step of the unknowns' size, with
-shortened steps, and for a loop never solved from its start values varied; the relations keep their values during
-the solve, then the
-residuals are evaluated once more at the solution with the caller's `z` and `mode` (crossing functions, relation
-values). Where no solve converges, the unknowns are NaN (the solver rejects the step; an initialization fails). An
-iterate whose last Jacobian was singular is no solution (`rankDeficient`: its steps were least-norm steps, small
-where the residuals are not).
+a Jacobian in every step (also from the start values), then with differences over sqrt(eps) of each unknown's own
+size, over a step of the unknowns' size, with shortened steps, and for a loop never solved from its start values
+varied; the relations keep their values during the solve, then the residuals are evaluated once more at the solution
+with the caller's `z` and `mode` (crossing functions, relation values). Where no solve converges, the unknowns are
+NaN (the solver rejects the step; an initialization fails). An iterate whose last Jacobian was singular is no
+solution (`rankDeficient`: its steps were least-norm steps, small where the residuals are not), but where all else
+fails one whose residuals are zero to round-off (`_consistentIterate`: a loop singular in its mode and consistent).
 """
 function blockSolve!(s::BlockSolver, residual!::R, du::AbstractVector, a::AbstractVector, u::AbstractVector, p, t::Real,
                      z, mode::Bool, fire::Bool)::Nothing where {R <: Function}
@@ -152,6 +155,12 @@ function blockSolve!(s::BlockSolver, residual!::R, du::AbstractVector, a::Abstra
   if !(ok && !s.rankDeficient) && s.solved
     s.x .= s.y
     ok = _blockAttempt!(s, residual!, args, :full)
+  end
+  if !(ok && !s.rankDeficient)
+    #= unknowns far below 1 whose standard differences, over at least sqrt(eps), cross a kink of the residuals
+       (`_differenceStep`; MSL DifferentialAmplifier's op-amp limiter): differences over their own size =#
+    s.x .= s.y
+    ok = _blockAttempt!(s, residual!, args, :fine)
   end
   if !(ok && !s.rankDeficient)
     #= a loop linear in its unknowns and badly conditioned (ideal switches: both thyristors of a commutating pair
@@ -175,10 +184,23 @@ function blockSolve!(s::BlockSolver, residual!::R, du::AbstractVector, a::Abstra
     s.x .= s.y .+ 0.1 .* max.(1.0, abs.(s.y))
     ok = _blockAttempt!(s, residual!, args, :damped)
   end
+  if !(ok && !s.rankDeficient)
+    #= a loop singular in its present mode but consistent (MSL OpenTank's ports above the level, both closed:
+       `m_flow = 0` from either side, the pressures free up to the pipe's equation): an iterate of least-norm steps
+       whose residuals are zero to round-off, as OpenModelica's solver accepts it (MSL TanksWithOverflow's overflow
+       pipe at the start); one whose residuals stay (rows without a derivative) is none =#
+    for kind in (:full, :damped)
+      s.x .= s.y
+      ok = _blockAttempt!(s, residual!, args, kind) && (!s.rankDeficient || _consistentIterate(s))
+      ok && break
+    end
+    ok && (s.rankDeficient = false)
+  end
   ok = ok && !s.rankDeficient
   if ok
     s.y .= s.x
     s.solved = true
+    s.rsolved = maximum(abs, s.r; init = 0.0)
   else
     s.failures += 1
     fill!(s.x, NaN)
@@ -200,10 +222,27 @@ function blockSolve!(s::BlockSolver, residual!::R, du::AbstractVector, a::Abstra
 end
 
 """
+    _consistentIterate(s) -> Bool
+
+Whether the residuals `s.r` at the iterate `s.x` are zero to round-off: each within 1e-8 of what the row's terms move
+by over the unknowns' size (its Jacobian row's entries times the unknowns, at least 1); a row without a derivative has
+to be zero.
+"""
+function _consistentIterate(s::BlockSolver)::Bool
+  local J::_SPARSE.SparseMatrixCSC{Float64, Int} = s.J
+  local scale::Vector{Float64} = zeros(length(s.r))
+  for j in axes(J, 2), k in _SPARSE.nzrange(J, j)
+    scale[J.rowval[k]] += abs(J.nzval[k]) * max(1.0, abs(s.x[j]))
+  end
+  return all(i::Int -> isfinite(s.r[i]) && abs(s.r[i]) <= 1.0e-8 * scale[i], eachindex(s.r))
+end
+
+"""
     _blockAttempt!(s, residual!, args, kind) -> Bool
 
 One attempt of `blockSolve!`: Newton with the kept factorization (`kind` `:kept`), with a Jacobian in every step
-(`:full`), that with differences over the unknowns' size (`:coarse`), or with shortened steps (`:damped`,
+(`:full`), that with differences over the unknowns' size (`:coarse`) or over sqrt(eps) of each one's own size
+(`:fine`, `_differenceStep`), or with shortened steps (`:damped`,
 `_blockDamped!`). An error of the residuals at an iterate or at a point the Jacobian's
 differences perturb (a domain error: `cos` of an infinite angle, a root of a negative number; a function's assert:
 the scalar path's `_RHS_STEP_ERRORS`) is a failed attempt, kept as the right-hand side's last error
@@ -213,7 +252,8 @@ the scalar path's `_RHS_STEP_ERRORS`) is a failed attempt, kept as the right-han
 function _blockAttempt!(s::BlockSolver, residual!::R, args::Tuple, kind::Symbol)::Bool where {R <: Function}
   try
     kind === :damped && return _blockDamped!(s, residual!, args)
-    return _blockNewton!(s, residual!, args, kind !== :kept; coarse = kind === :coarse)
+    return _blockNewton!(s, residual!, args, kind !== :kept;
+                         differences = kind in (:coarse, :fine) ? kind : :standard)
   catch err
     err isa _OMBACKEND.CodeGeneration._RHS_STEP_ERRORS || rethrow()
     _OMBACKEND.CodeGeneration.LAST_RHS_ERROR[] = err
@@ -232,17 +272,18 @@ calls with ten), else a Jacobian at the current iterate. Within 1e-10 of their v
 absolute near zero) the steps go on while they contract at least twofold, to round-off (1e-15): a solve's last digits
 then do not depend on its guess (a relation on a loop's unknown flipped back and forth between the passes of an event
 iteration and the checks after the steps, its hysteresis 1e-12 at a tolerance of 1e-8, below the loop's 1e-10). The
-guess is kept when its first step is at round-off already; the steps of a Jacobian of this call that stop contracting
-end within 1e-5 (EngineV6's forces of 1e9 cancel to zero only that far).
+guess is kept when its first step is at round-off already, or within 1e-8 with its residuals no larger than at the
+solution last accepted (`rsolved`: a solve from its own solution returns it); the steps of a Jacobian of this call that stop
+contracting end within 1e-5 (EngineV6's forces of 1e9 cancel to zero only that far).
 """
 function _blockNewton!(s::BlockSolver, residual!::R, args::Tuple, full::Bool;
-                       coarse::Bool = false)::Bool where {R <: Function}
+                       differences::Symbol = :standard)::Bool where {R <: Function}
   local x::Vector{Float64} = s.x; local r::Vector{Float64} = s.r; local dx::Vector{Float64} = s.dx
   residual!(r, x, args...)
   s.residuals += 1
   local fresh::Bool = false
   if full || !s.factored
-    _blockJacobian!(s, residual!, args; coarse) || return false
+    _blockJacobian!(s, residual!, args; differences) || return false
     fresh = true
   end
   local maxiters::Int = full ? 50 : 10 + length(s.groups)
@@ -255,8 +296,15 @@ function _blockNewton!(s::BlockSolver, residual!::R, args::Tuple, full::Bool;
       step = max(step, abs(dx[i]) / (1.0e-10 * (1.0 + abs(x[i]))))
     end
     #= EngineV6's piston speed at top dead center, zero to round-off, flipped a relation in every pass of the event
-       iteration while each solve stepped again =#
-    if iteration == 1 && step <= 1.0e-5
+       iteration while each solve stepped again. A badly conditioned loop's step at its solution is round-off times
+       the condition, beyond 1e-15 of the values: a guess whose residuals are no larger than those at the solution
+       last accepted (`rsolved`, at the same guess the same ones) is kept too. MSL ThyristorBridge2mPulse_DC_Drive, a
+       commutating pair of thyristors (1e-5 ohm against 1e5): residuals of 2e-15 to 6e-15 of their terms, steps of
+       1e-10 back and forth, a thyristor's `s < 0` at s = +-1.1e-10 flipped in every pass. Only where the step is
+       within 1e-8 of the values (`step <= 100`): DC_Drive's are up to 10; a guess far from the solution whose
+       residuals are small for the loop's scale was kept as well (MSL ThyristorBridge2mPulse_R: steps up to 7e14, the
+       mean values off from the first period) =#
+    if iteration == 1 && (step <= 1.0e-5 || (step <= 100.0 && maximum(abs, r; init = 0.0) <= s.rsolved))
       #= a Jacobian of this call evaluated last at its perturbed points (the equations' du and a there): back at the
          iterate =#
       if fresh
@@ -275,12 +323,12 @@ function _blockNewton!(s::BlockSolver, residual!::R, args::Tuple, full::Bool;
     step <= 1.0 && continue
     (rate >= 1.0 && fresh && step <= 1.0e5) && return all(isfinite, r)
     if full
-      _blockJacobian!(s, residual!, args; coarse) || return false
+      _blockJacobian!(s, residual!, args; differences) || return false
     elseif rate > 0.5 || step * rate^(maxiters - iteration) > 1.0
       #= diverging with a Jacobian of this call: the full Newton's; slow with one: on with it =#
       (fresh && rate >= 1.0) && return false
       if !fresh
-        _blockJacobian!(s, residual!, args; coarse) || return false
+        _blockJacobian!(s, residual!, args; differences) || return false
         fresh = true
         previous = Inf
       end
@@ -352,9 +400,24 @@ function _blockStep!(s::BlockSolver)::Nothing
 end
 
 """
-    _blockJacobian!(s, residual!, args) -> Bool
+    _differenceStep(x, differences) -> Float64
 
-The block's Jacobian at `s.x` (residuals `s.r` there) by forward differences, one evaluation per color, factored
+The step of a forward difference in an unknown of value `x`: `:standard` sqrt(eps) of its size, at least 1 (the
+unknowns' nominal value); `:coarse` its size, at least 1; `:fine` sqrt(eps) of its own size (of 1 at zero), for an
+unknown far below 1 whose standard step crosses a kink of the residuals (MSL DifferentialAmplifier: a current of
+1.6 mA reaches its op-amp's limiter with a gain of 1e9, the standard step of 1.5e-8 A moves its input by 15 V, beyond
+the 9.7 V to the supply).
+"""
+function _differenceStep(x::Float64, differences::Symbol)::Float64
+  differences === :fine && return sqrt(eps(Float64)) * (iszero(x) ? 1.0 : abs(x))
+  return (differences === :coarse ? 1.0 : sqrt(eps(Float64))) * max(1.0, abs(x))
+end
+
+"""
+    _blockJacobian!(s, residual!, args; differences) -> Bool
+
+The block's Jacobian at `s.x` (residuals `s.r` there) by forward differences (steps `_differenceStep`), one evaluation
+per color, factored
 (dense in place; sparse with the kept factorization's symbolic analysis); false for one not finite or a singular
 sparse one (no factorization kept: the next solve starts with a Jacobian). A singular dense one gives its
 pseudo-inverse for least-norm steps (`rankDeficient`; singular values below `RANK_TOLERANCE` of the largest count as
@@ -363,13 +426,14 @@ derivative there (MSL QuasiStatic SinglePhase Rectifier's power balance `v * con
 values, the loop never solved and its 83 variables NaN through a run that ended in Success), and the least-norm step
 of the other rows leaves that point.
 """
-function _blockJacobian!(s::BlockSolver, residual!::R, args::Tuple; coarse::Bool = false)::Bool where {R <: Function}
+function _blockJacobian!(s::BlockSolver, residual!::R, args::Tuple;
+                         differences::Symbol = :standard)::Bool where {R <: Function}
   local x::Vector{Float64} = s.x; local xp::Vector{Float64} = s.xp; local h::Vector{Float64} = s.h
   local J::_SPARSE.SparseMatrixCSC{Float64, Int} = s.J
   for cols in s.groups
     xp .= x
     for j in cols
-      h[j] = (coarse ? 1.0 : sqrt(eps(Float64))) * max(1.0, abs(x[j]))
+      h[j] = _differenceStep(x[j], differences)
       xp[j] += h[j]
     end
     residual!(s.rp, xp, args...)

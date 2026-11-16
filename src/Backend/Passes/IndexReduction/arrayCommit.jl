@@ -32,7 +32,7 @@
 * See the full OSMC Public License conditions for more details.
 *
 */ =#
-#= The plan made on the element view of an arrays-kept model (Arrays.jl), committed in array form: the arrays
+#= The plan made on the element view of an arrays-kept model (arrays.jl), committed in array form: the arrays
    whose elements the plan treats alike keep one kind, a for-equation whose iterations it differentiates alike is
    differentiated once, symbolically, its iterator kept (Otter and Elmqvist, Modelica Conference 2017, Theorem 2:
    under full incidence every element of an array equation is differentiated equally). Where the plan treats the
@@ -44,14 +44,16 @@
 
 What the array form of a plan adds to the model before it is changed: the new variables (derivative arrays, the
 states' derivative arrays `\$STATEDER.x` and scalar ones, the dynamic state sets'), the new kind of each variable
-whose kind changes, the equations to append (the differentiated ones, the states' links, the sets'), and the number
-of dynamic state sets (a family over the elements of arrays counted once).
+whose kind changes, the equations to append (the differentiated ones, the states' links, the sets'), the number
+of dynamic state sets (a family over the elements of arrays counted once), and the partition's equations with der()
+of an expression expanded (`derivativesExpanded`), in their order.
 """
 struct ArrayCommit
   variables::Vector{IR.Variable}
   kinds::Dict{Symbol, IR.VariableKind}
   equations::Vector{IR.Equation}
   sets::Int
+  expanded::Vector{IR.Equation}
 end
 
 """
@@ -251,14 +253,15 @@ function arrayDerivatives(s::Structure, E::Elements)::Dict{Symbol, Symbol}
 end
 
 """
-    arraySeeds(s, derivatives, E, variables, functions) -> Seeds
+    arraySeeds(s, derivatives, E, variables, functions, constants) -> Seeds
 
 The time derivative in array form: of an array variable the derivative array (`derivatives`; `x[i]` is then
 `\$DER.x[i]`, `arrayElementDerivative`), of an element or a scalar the structure's derivative as a reference into its
-array; NotHandled for an array of continuous variables whose elements' derivatives are not one array.
+array, of one the plan's structure read as a constant (`constants`) zero; NotHandled for an array of continuous
+variables whose elements' derivatives are not one array.
 """
 function arraySeeds(s::Structure, derivatives::Dict{Symbol, Symbol}, E::Elements, variables::IR.VariableSet,
-                    functions::Vector{IR.ModelicaFunction})::Seeds
+                    functions::Vector{IR.ModelicaFunction}, constants::Set{Symbol})::Seeds
   local variable = (name::Symbol) -> begin
     local members = get(E.elements, name, nothing)
     if members !== nothing
@@ -271,6 +274,7 @@ function arraySeeds(s::Structure, derivatives::Dict{Symbol, Symbol}, E::Elements
     local v = get(s.index, name, 0)
     v == 0 && return nothing
     local d = s.derivative[v]
+    (d == 0 && name in constants) && return ZERO
     d == 0 && throw(NotHandled("the derivative of $(name), which Pantelides' algorithm gave none"))
     return IR.CREF(arrayElementRef(s.variables[d], E, variables), IR.T_REAL())
   end
@@ -890,8 +894,8 @@ function differentiatedArrayEquations(partition::IR.Partition, view::Scalarized,
     push!(get!(() -> Int[], rowsOf, origin.equation), r)
   end
   local functionsByName = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in functions)
-  local seeds = arraySeeds(p.structure, derivatives, E, variables, functions)
-  local planSeeds = derivativeSeeds(p.structure, functions)
+  local seeds = arraySeeds(p.structure, derivatives, E, variables, functions, p.constants)
+  local planSeeds = derivativeSeeds(p.structure, functions; constants = p.constants)
   local known::StartValues = StartValues(view.model.variables, view.model.functions; parametersOnly = true)
   local out = IR.Equation[]
   for i in sort!(unique(Int[view.origins[r].equation for r in keys(p.differentiated)]))
@@ -960,14 +964,21 @@ function arrayCommit(model::IR.Model, partition::IR.Partition, view::Scalarized,
   local variables = IR.VariableSet(vcat(collect(model.variables), added))
   local E = extendedElements(view.elements, added, variables)
   local derivatives = arrayDerivatives(s, E)
+  #= der() of an expression by the chain rule in array form, as the plan read it (`expandDerivatives!` of `plan` and
+     `commit!`), before the equations are differentiated =#
+  local seeds::Seeds = arraySeeds(s, derivatives, E, variables, model.functions, p.constants)
+  local expanded::Vector{IR.Equation} =
+    IR.Equation[readsDerCall(eq) ? derivativesExpanded(eq, seeds) : eq for eq in partition.equations]
+  local expandedPartition::IR.Partition =
+    IR.Partition(partition.index, partition.association, partition.unknowns, expanded, partition.initialEquations)
   local (links, linkEquations) = stateLinks(s, p.dummies, E, derivatives, variables)
   E = extendedElements(E, links, variables)
   local kinds = arrayKinds(plannedKinds(s, p.dummies), E, variables)
-  local equations = differentiatedArrayEquations(partition, view, p, E, variables, derivatives, model.functions)
+  local equations = differentiatedArrayEquations(expandedPartition, view, p, E, variables, derivatives, model.functions)
   append!(equations, linkEquations)
   local (setVariables, setEquations, sets) = stateSets(model, p, E, variables, view.model.variables)
   append!(equations, setEquations)
-  return ArrayCommit(vcat(added, links, setVariables), kinds, equations, sets)
+  return ArrayCommit(vcat(added, links, setVariables), kinds, equations, sets, expanded)
 end
 
 "Whether the equation reads der() of an expression (a call introduceDerivatives left)."
@@ -978,17 +989,81 @@ function readsDerCall(eq::IR.Equation)::Bool
 end
 
 """
+A copy of the equation `eq` with der() of an expression replaced by its time derivative in array form (`seeds`:
+`arraySeeds`), as `expandDerivatives!` replaces it on the element view: MSL FluxTubes' Tellinen hysteresis
+`dHyst = der(hystR - mu0 * Hstat)` is `dHyst = \$DER.hystR - mu0 * \$DER.Hstat`.
+"""
+function derivativesExpanded(eq::IR.Equation, seeds::Seeds)::IR.Equation
+  local expand::Function = (@nospecialize(e::IR.Expression)) ->
+    IR.isBuiltinCall(e, :der) ? differentiate(only((e::IR.CALL).arguments), seeds) : e
+  return IR.mapEquation!(expand, deepcopy(eq))
+end
+
+"""
     commitArrays!(model, partition, c)
 
 The array form of a plan applied (`arrayCommit`): the new variables added, the kinds set, the equations appended.
 """
 function commitArrays!(model::IR.Model, partition::IR.Partition, c::ArrayCommit)::Nothing
+  partition.equations = c.expanded
   foreach(v -> push!(model.variables, v), c.variables)
   for (name, kind) in c.kinds
     model.variables[name].kind = kind
   end
   append!(partition.equations, c.equations)
+  partition.initialEquations =
+    IR.Equation[initialDummyDerivatives(eq, model.variables) for eq in partition.initialEquations]
   return nothing
+end
+
+"""
+The initial equation `eq` with der() of a dummy state (DUMMY_STATE: index reduction's, or one of the variables the
+initial equations read der() of, `initialDerivatives!`) its derivative variable: `der(v) = 0` reads `\$DER.v`, an
+element `der(x[2])` the element `\$DER.x[2]`; `eq` itself where it reads none.
+"""
+function initialDummyDerivatives(eq::IR.Equation, variables::IR.VariableSet)::IR.Equation
+  local isDummy::Function = (@nospecialize(x::IR.Expression)) -> begin
+    IR.isBuiltinCall(x, :der) || return false
+    local a::IR.Expression = only((x::IR.CALL).arguments)
+    a isa IR.CREF || return false
+    #= a variable of its own (`x[2]` of a model of scalars), else the element of an array =#
+    local v::Union{Nothing, IR.Variable} = get(variables, a.cref.name, nothing)
+    v === nothing && (v = get(variables, IR.withoutSubscripts(a.cref).name, nothing))
+    return v !== nothing && v.kind isa IR.DUMMY_STATE
+  end
+  local found::Bool = false
+  IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
+    found || (found = IR.anyExp(isDummy, e))
+    nothing
+  end
+  found || return eq
+  local replace::Function = (@nospecialize(x::IR.Expression)) ->
+    isDummy(x) ? IR.CREF(IR.derivativeCref(only((x::IR.CALL).arguments).cref), IR.T_REAL()) : x
+  return IR.mapEquation!(replace, deepcopy(eq))
+end
+
+"""
+    exposeArrayLinearConstraints!(model, view) -> Bool
+
+`exposeLinearConstraints!` for an arrays-kept model: the hidden linear constraints of its element view `view`
+(`linearConstraints`) written into `model`, each in place of the equation it combines, where that one is a scalar
+equation of `model` (the constraint's elements as references into their arrays: `arrayEquation`). Whether one was
+written. A star point of a polyphase winding that is not grounded: its current balance and a zero-sequence inductor's
+`i0 = sum(i) / m` give `i0 = 0`; as written, of index 1 with i0 a state, the algebraic loop of the winding's voltages
+was singular (MSL FundamentalWave's polyphase machines: "the initialization cannot hold"). A constraint in place of
+an element of a for- or array equation is left: one element of an array equation cannot be replaced in array form.
+"""
+function exposeArrayLinearConstraints!(model::IR.Model, view::Scalarized)::Bool
+  envSwitch("OMBACKEND_LINEAR_CONSTRAINTS") || return false
+  local equations::Vector{IR.Equation} = model.continuous[1].equations
+  local written::Bool = false
+  for (i::Int, constraint::IR.SCALAR_EQUATION) in linearConstraints(view.model, view.model.continuous[1])
+    local origin::EquationOrigin = view.origins[i]
+    (isempty(origin.path) && isempty(origin.element) && equations[origin.equation] isa IR.SCALAR_EQUATION) || continue
+    equations[origin.equation] = arrayEquation(constraint, view.elements, model.variables)
+    written = true
+  end
+  return written
 end
 
 """
@@ -1001,17 +1076,18 @@ code reads them): false. With `arrays` (the default) false, the model not change
 arrays; without, a model of scalars is reduced the same way (a scalar is the array form's variable of no
 dimensions: MSL Rotational ElasticBearing, of index 3 and no array, for the array code). An array whose elements the
 plan treats differently (slicing) is split into its elements first (`splitArrays!`), and the plan committed again.
-NotHandled where the array form does not take the plan (der() of an expression, a split down to no array equations:
-the caller takes the scalarized path and discards the model, which a split may have changed).
+NotHandled where the array form does not take the plan (a split down to no array equations, der() of an expression
+whose derivative it does not write: the caller takes the scalarized path and discards the model, which a split may
+have changed).
 """
 function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
   (arrays && !hasContinuousArrays(model)) && return false
-  any(readsDerCall, model.continuous[1].equations) && throw(NotHandled("der() of an expression with arrays kept"))
   local view::Scalarized = scalarizeArrays(model)
   #= the equations as the plan's structure reads them (the terms of parameters known as zero) =#
   dropKnownZeroTerms!(model, view) && (view = scalarizeArrays(model))
+  exposeArrayLinearConstraints!(model, view) && (view = scalarizeArrays(model))
   local partition::IR.Partition = view.model.continuous[1]
-  local written::Plan = plan(view.model, partition; indexOne = true)
+  local written::Plan = plan(view.model, partition; indexOne = true, initialDerivatives = true)
   #= the array form of the plan as written first: a plan it does not take is refused before the simulation code's
      values are computed for the plan again (`knownPlan`). Arrays whose elements it treats differently (slicing) are
      split into their elements, until it takes it. The element view stays (the splits keep the model's meaning), so
@@ -1025,7 +1101,7 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
     try
       arrayCommit(model, model.continuous[1], view, written)
       stale || break
-      written = plan(view.model, partition; indexOne = true)
+      written = plan(view.model, partition; indexOne = true, initialDerivatives = true)
       stale = false
       arrayCommit(model, model.continuous[1], view, written)
       break
@@ -1056,9 +1132,8 @@ A model without continuous arrays (on the arrays-kept route, for the array code)
 links. False, the model not changed, where its index is above one (the scalarized path reduces it).
 """
 function commitIndexOne!(model::IR.Model)::Bool
-  any(readsDerCall, model.continuous[1].equations) && throw(NotHandled("der() of an expression"))
   local view::Scalarized = scalarizeArrays(model)
-  local written::Plan = plan(view.model, view.model.continuous[1]; indexOne = true)
+  local written::Plan = plan(view.model, view.model.continuous[1]; indexOne = true, initialDerivatives = true)
   isempty(written.differentiated) || return false
   commitArrayPlan!(model, view, written)
   return true
@@ -1099,7 +1174,7 @@ function commitArrayPlan!(model::IR.Model, view::Scalarized, written::Plan)::Boo
   if !isempty(known)
     #= the model as the plan with these values reads it: without the terms a function's zero output takes out =#
     dropFunctionZeroTerms!(model, view, known) && (view = scalarizeArrays(model))
-    p = plan(view.model, view.model.continuous[1]; known, indexOne = true)
+    p = plan(view.model, view.model.continuous[1]; known, indexOne = true, initialDerivatives = true)
   end
   local reduced::Bool = !isempty(p.differentiated)
   local c = arrayCommit(model, model.continuous[1], view, p)

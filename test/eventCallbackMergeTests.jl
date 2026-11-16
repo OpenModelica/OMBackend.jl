@@ -1,4 +1,4 @@
-#= The merge of the continuous callbacks into one (DirectRHSGeneration.jl
+#= The merge of the continuous callbacks into one (directRHSGeneration.jl
    `_eraseContinuousCallbacks`) keeps their re-initialization. It created the merged
    callback with `initializealg = nothing` for components that asked NoInit (MTK's
    events): OrdinaryDiffEqCore then re-solved the DAE with the integrator's algorithm

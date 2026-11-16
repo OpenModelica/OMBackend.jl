@@ -61,8 +61,8 @@ import OMRuntimeExternalC
 #= Initialize RTG for this module to enable world-age-safe function generation =#
 RuntimeGeneratedFunctions.init(@__MODULE__)
 
-include("DAEInitSolve.jl")
-include("mtkDump.jl")
+include("daeInitSolve.jl")
+include("MTKDump.jl")
 include("mtkExternals.jl")
 include("./exprRewrite.jl")
 include("./arrayUtils.jl")
@@ -72,7 +72,7 @@ using .CodeGenerationUtil
 include("./MTK_CodeGenerationUtil.jl")
 using .MTK_CodeGenerationUtil
 include("./structuralCallbacks.jl")
-include("./DirectRHSGeneration.jl")
+include("./directRHSGeneration.jl")
 include("./asserts.jl")
 include("./eventInstant.jl")
 include("./eventReinit.jl")
@@ -81,23 +81,23 @@ include("./relationRefresh.jl")
 include("./integralDiscretes.jl")
 include("./delays.jl")
 include("./algebraicStepControl.jl")
-include("./MTK_CodeGeneration.jl")
+include("./mtkCodeGeneration.jl")
 include("./mtkInitialization.jl")
 include("./mtkIfEquations.jl")
 include("./mtkRelations.jl")
 include("./mtkDiscreteEvents.jl")
 include("./mtkParameters.jl")
 include("./mtkDeclarations.jl")
-include("./DiscreteDummyDemotion.jl")
+include("./discreteDummyDemotion.jl")
 
 #= The when-callback emitter (the MTK path uses it) and expToJuliaExp (the
    structural callbacks, CodeGenerationUtil) =#
 include("./codeGen.jl")
 
 #= Direct DifferentialEquations.jl code generation (DEMode, fresh emitter) =#
-include("./DECodeGeneration.jl")
+include("./DEGen.jl")
 
 #= Array-preserving explicit-ODE code generation (no-scalarize flat models, experimental) =#
-include("./ArrayODEGeneration.jl")
+include("./ArrayODEGen.jl")
 
 end #= End CodeGeneration=#

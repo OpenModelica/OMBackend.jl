@@ -51,14 +51,14 @@ include("$CURRENT_DIRECTORY/BackendUtil/BackendUtil.jl")
 include("$CURRENT_DIRECTORY/IR/Traversal.jl")
 include("$CURRENT_DIRECTORY/IR/OMJLIR.jl")
 include("$CURRENT_DIRECTORY/frontendInterface.jl")
-include("$CURRENT_DIRECTORY/Backend/lowerUtil.jl")
+include("$CURRENT_DIRECTORY/Backend/LowerUtil.jl")
 include("$CURRENT_DIRECTORY/Backend/Passes/Passes.jl")
 include("$CURRENT_DIRECTORY/SimCode/SimCode.jl")
 include("$CURRENT_DIRECTORY/Runtime/Runtime.jl")
 include("$CURRENT_DIRECTORY/CodeGeneration/CodeGeneration.jl")
 #= In-backend MTK path (System construction + structural_simplify at translate
    time). Included after CodeGeneration so it can `import ..CodeGeneration`. =#
-include("$CURRENT_DIRECTORY/CodeGeneration/iMTKGen.jl")
+include("$CURRENT_DIRECTORY/CodeGeneration/IMTKGen.jl")
 include("backendUtils.jl")
 #= Finally add the API=#
 include("backendAPI.jl")
@@ -66,4 +66,6 @@ include("backendAPI.jl")
 _collectSourceModules!(@__MODULE__)
 #= Precompile workload: warm shared MTK/OrdinaryDiffEq build+solve instances. =#
 include("precompile.jl")
+"The logging switches from the loading process's environment (`readLoggingSwitches!`), not the precompile cache's."
+__init__() = readLoggingSwitches!()
 end #=OMBackend=#

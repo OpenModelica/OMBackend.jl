@@ -490,7 +490,7 @@ package ArrayPath
       y[i] ^ 3 + y[i] = x[i];
     end for;
   end Cubic;
-  model LoopWithEvent "a loop per element through a relation (events in a loop): outside the array path, scalarized as before"
+  model LoopWithEvent "a loop per element through a relation (events in a loop)"
     parameter Integer N = 3;
     Real x[N](each start = 1, each fixed = true);
     Real y[N];
@@ -2808,6 +2808,54 @@ package ArrayPath
     der(z) = tmax;
   end TableDrive;
 
+  model TableIntegrator "a component holding its own table (MSL RadioButtonSource's BooleanTable)"
+    parameter Real k = 1;
+    parameter Real data[2, 2] = [0, 0; 1, 2];
+    parameter TimeTable tableID = TimeTable("NoName", "NoName", data, 0.0, {2}, 1, 2, 0.0, 3, false, ",", 0);
+    Real x(start = 0, fixed = true);
+  equation
+    der(x) = k * timeTableValue(tableID, 1, time, 1e60, 1e60);
+  end TableIntegrator;
+
+  model OverflowingProbe "a capacitor charged through two opposed junctions from 0 V (MSL Spice3BenchmarkRtlInverter's transistor): OrdinaryDiffEq's first-step probe lands at 1e9 V, where both currents overflow, their difference NaN, the step NaN; v -> 0.025 ln(I / 0.9e-14) = 0.98123"
+    parameter Real I = 1e3;
+    parameter Real C = 1e-12;
+    Real v(start = 0, fixed = true);
+    Real i1 = 1e-14 * exp(v / 0.025);
+    Real i2 = 1e-15 * exp(v / 0.025);
+  equation
+    C * der(v) = I - i1 + i2;
+  end OverflowingProbe;
+
+  model RolledTables "two components each with an external object (MSL Interaction1's start and stop): not rolled, the array form has no arrays of external objects; x = k t^2: 1, 2"
+    TableIntegrator a(k = 1);
+    TableIntegrator b(k = 2);
+  end RolledTables;
+
+  function timeTableNextEvent "Modelica.Blocks.Tables.Internal.getNextTimeEvent"
+    input TimeTable tableID;
+    input Real timeIn;
+    output Real nextTimeEvent;
+  external "C" nextTimeEvent = ModelicaStandardTables_CombiTimeTable_nextTimeEvent(tableID, timeIn)
+    annotation(Library = {"ModelicaStandardTables", "ModelicaIO", "ModelicaMatIO", "zlib"});
+  end timeTableNextEvent;
+
+  model TableSegments "a time table of constant segments with its time events (MSL CombiTimeTable, ConstantSegments): y = 0, 10, 2 from 0, 0.3, 0.6; x[i] = i (10 * 0.3 + 2 * 0.4) at 1"
+    parameter Real data[4, 2] = [0, 0; 0.3, 10; 0.6, 2; 1, 2];
+    parameter TimeTable tableID = TimeTable("NoName", "NoName", data, 0.0, {2}, 3, 2, 0.0, 1, false, ",", 0);
+    discrete Real nextEvent(start = 0, fixed = true);
+    Real y;
+    Real x[2](each start = 0, each fixed = true);
+  equation
+    when {time >= pre(nextEvent), initial()} then
+      nextEvent = timeTableNextEvent(tableID, time);
+    end when;
+    y = timeTableValue(tableID, 1, time, nextEvent, pre(nextEvent));
+    for i in 1:2 loop
+      der(x[i]) = i * y;
+    end for;
+  end TableSegments;
+
   function differences "two outputs, the first an array (MSL Machines' ToSpacePhasor)"
     input Real x[3];
     output Real y[2];
@@ -2852,6 +2900,83 @@ package ArrayPath
       der(x[i]) = -a[i] * x[i] + b;
     end for;
   end FreeParameterTuple;
+
+  model FreeParameterTupleSteady "(a, b) = f(k) in an initial equation read by the steady-state start der(x) = 0 (MSL Blocks.Examples.Filter): the tuple runs before the initial system; x[i] = b / a[i] at all times: 3, 1.5"
+    parameter Real k = 1;
+    parameter Real a[2](each fixed = false);
+    parameter Real b(fixed = false);
+    Real x[2];
+  initial equation
+    (a, b) = twoGains(k);
+    der(x) = zeros(2);
+  equation
+    for i in 1:2 loop
+      der(x[i]) = -a[i] * x[i] + b;
+    end for;
+  end FreeParameterTupleSteady;
+
+  function seedState "a generator's state from its seed (MSL Xorshift128plus.initialState)"
+    input Integer seed;
+    output Integer state[2];
+  algorithm
+    state := {seed, 2 * seed};
+  end seedState;
+
+  function drawNumber "a number and the next state (MSL Xorshift128plus.random)"
+    input Integer stateIn[2];
+    output Real r;
+    output Integer stateOut[2];
+  algorithm
+    r := 0.1 * stateIn[1] + 0.01 * stateIn[2];
+    stateOut := {stateIn[2], stateIn[1] + 1};
+  end drawNumber;
+
+  model InitialDiscreteChain "the initial values of discrete variables from parameters, read by the initial system (MSL NormalNoiseProperties: localSeed, pre(state), r_raw, r, then Variance's mu = u): they are given before it; mu = y at the start, 0.72, at all times"
+    parameter Integer fixedSeed = 3;
+    final parameter Integer localSeed(fixed = false);
+    Integer state[2];
+    discrete Real r_raw;
+    discrete Real r;
+    Real y;
+    Real mu;
+  initial equation
+    localSeed = fixedSeed;
+    pre(state) = seedState(localSeed);
+    r_raw = drawNumber(pre(state));
+    r = 2 * r_raw;
+    mu = y;
+  equation
+    when sample(0, 0.1) then
+      (r_raw, state) = drawNumber(pre(state));
+      r = 2 * r_raw;
+    end when;
+    y = r;
+    der(mu) = 0;
+  end InitialDiscreteChain;
+
+  model LeftLimitAtTimeEvent "pre(u) of u = if time < tStep then .. else ..: u's value before the time relation switches (MSL DemonstrateContinuousSignalExtrema's pulse edges): the step at 0.3 gives y_max = 1.6; with a discrete step time moved from 0.3 to 0.9 at 0.6, z_max = 2.8"
+    parameter Real T = 1e-6;
+    parameter Real tStep = 0.3;
+    discrete Real tEnd(start = 0.3, fixed = true);
+    Real u = 2 * time + (if time < tStep then 1 else -2);
+    Real v = 2 * time + (if time < tEnd then 1 else -2);
+    Real x(start = 1, fixed = true);
+    Real w(start = 1, fixed = true);
+    Real y_max(start = -10, fixed = true);
+    Real z_max(start = -10, fixed = true);
+  equation
+    der(x) = (u - x) / T;
+    der(w) = (v - w) / T;
+    when time >= 0.6 then
+      tEnd = 0.9;
+    end when;
+    when {u <= x, u >= x} then
+      y_max = max({pre(y_max), u, pre(u)});
+    end when;
+    when {v <= w, v >= w} then
+      z_max = max({pre(z_max), v, pre(v)});
+    end when;
+  end LeftLimitAtTimeEvent;
 
   model SaturatedLoop "an amplifier with a limited output in a loop (MSL IdealizedOpAmpLimited as a voltage follower): after the input's step at 0.5 the last solution is on the saturated piece (y = 15), from where Newton's method cycles between two points that are no solutions; y = K / (1 + K) u after it, x(1) = 7.5 + 0.5 K / (1 + K)"
     parameter Real K = 1000;

@@ -36,7 +36,7 @@
 #= OMJLIR expressions built simplified: the constructors drop zero and one terms and fold
    literals (`0 * w` is `0`, `if c then e else e` is `e`), the literal tests, and `foldScalar`,
    which rebuilds an arithmetic node with them. Differentiation builds its derivatives with them
-   (IndexReduction/Differentiate.jl). =#
+   (IndexReduction/differentiate.jl). =#
 
 const ZERO = IR.REAL(0.0)
 
