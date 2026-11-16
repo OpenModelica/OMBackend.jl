@@ -80,7 +80,7 @@ What the front half does not (yet) handle it reports with the reason, and the ca
 module ArrayODEGen
 
 import ModelingToolkit
-import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError, solveStoppedAtStart
+import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError, solveStoppedAtStart, _autoDtReset!
 import ...Passes
 import ...SimCode
 import ...SimCode.Domains: DomainSystem, InstanceTable, EqClass, EvFn, Gen, IR, Lit, LoopBlocks, NotSupported, Op, Pre,
@@ -99,10 +99,19 @@ include("ArrayBlockSolve.jl")
    solver is compiled once), the discrete state (relation values, discrete variables and their
    pre values, when-condition values, state values before the event) and the generated module. =#
 """
-    ArrayStartState(discrete, wcond, wnew, ndlog, upre, ureinit)
+    RootLogEntry
+
+The algebraic loops' roots at a time of a run (`ArrayRuntimeState.rootLog`): the time, each loop family's guesses
+(`ArrayModelParameters.loops`) and each large block's (`BlockSolver.y`) as the last solve left them.
+"""
+const RootLogEntry = Tuple{Float64, Vector{Matrix{Float64}}, Vector{Vector{Float64}}}
+
+"""
+    ArrayStartState(discrete, wcond, wnew, ndlog, upre, ureinit, loops, blocks, nRootLog)
 
 A problem's state after its initialization (`ArrayRuntimeState.atStart`): the discrete state (`_discreteState`), the
-when-conditions, the length of the event log, the pre() and reinit buffers of the states.
+when-conditions, the length of the event log, the pre() and reinit buffers of the states, the loops' roots (the
+families' and the large blocks' guesses) and the length of their log.
 """
 struct ArrayStartState
   discrete::Tuple{Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}}
@@ -111,6 +120,9 @@ struct ArrayStartState
   ndlog::Int
   upre::Vector{Float64}
   ureinit::Vector{Float64}
+  loops::Vector{Matrix{Float64}}
+  blocks::Vector{Vector{Float64}}
+  nRootLog::Int
 end
 
 """
@@ -123,7 +135,9 @@ the asserts' probe (`_violated!`), an assert crossing to decide (`pending`: its 
 terminate() reached, the discrete state at the start of the current step (`stepStart`, `_discreteState`: within a step
 that ends at an event the asserts read it), the String parameters' values (`Gen.strings`, with their overrides), the
 state just before the last event (`leftLimit`: its time and state, a reinit moved it after), the problem's state after
-its initialization (`atStart`, `ArrayStartState`: a solve of the problem starts from it again).
+its initialization (`atStart`, `ArrayStartState`: a solve of the problem starts from it again), the loops' roots at
+the start and at each accepted step (`rootLog`, `_logRoots!`: a loop with several roots, a quaternion's
+`Q * Q = 1`, is read after the run on the root the run was on at that time, `_rootsAt`).
 """
 mutable struct ArrayRuntimeState
   sampleStart::Vector{Float64}
@@ -139,10 +153,12 @@ mutable struct ArrayRuntimeState
   strings::Vector{String}
   leftLimit::Tuple{Float64, Vector{Float64}}
   atStart::Union{Nothing, ArrayStartState}
+  rootLog::Vector{RootLogEntry}
 end
 ArrayRuntimeState(nSamples::Int, strings::Vector{String}) =
   ArrayRuntimeState(zeros(nSamples), zeros(nSamples), Float64[], Dict{Tuple{Int, Int, Int}, Any}(), Set{Any}(), false, false,
-                    (NaN, Float64[]), nothing, (Float64[], Float64[], Bool[], Float64[]), strings, (NaN, Float64[]), nothing)
+                    (NaN, Float64[]), nothing, (Float64[], Float64[], Bool[], Float64[]), strings, (NaN, Float64[]),
+                    nothing, RootLogEntry[])
 
 struct ArrayModelParameters
   values::Vector{Float64}
@@ -162,6 +178,8 @@ struct ArrayModelParameters
   tend::Vector{Float64}        #= [stop time]: a solution read there gives the final values (_dlogIndex) =#
   abuf::Vector{Float64}        #= the algebraic variables of a right-hand side evaluated on Float64 (RHS!): no buffer per call =#
   blocks::Vector{BlockSolver}  #= the large algebraic loops' solvers (blockSolve!), in the order of the schedule =#
+  #= per loop family its members' guesses (unknown, member): the run's last solutions =#
+  loops::Vector{Matrix{Float64}}
   state::ArrayRuntimeState     #= the run's state (samples, memo, warnings, asserts, terminate) =#
   model::Module
 end
@@ -185,13 +203,88 @@ _discreteState(p::ArrayModelParameters)::Tuple{Vector{Float64}, Vector{Float64},
 
 "The state of `p` after its initialization (`ArrayStartState`)."
 _startState(p::ArrayModelParameters)::ArrayStartState =
-  ArrayStartState(_discreteState(p), copy(p.wcond), copy(p.wnew), length(p.dlog), copy(p.upre), copy(p.ureinit))
+  ArrayStartState(_discreteState(p), copy(p.wcond), copy(p.wnew), length(p.dlog), copy(p.upre), copy(p.ureinit),
+                  map(copy, p.loops), Vector{Float64}[copy(b.y) for b in p.blocks], length(p.state.rootLog))
+
+"""
+    _checkBlocksSolved(p)
+
+An error for a large algebraic loop that the initialization tried and never solved, as the scalar path's "the
+initial system". Its unknowns are NaN (`blockSolve!`); where no derivative reads them the solver neither rejects a
+step nor stops, and the run ended in Success with them NaN throughout (MSL QuasiStatic SinglePhase Rectifier).
+"""
+function _checkBlocksSolved(p::ArrayModelParameters)::Nothing
+  for (k::Int, b::BlockSolver) in enumerate(p.blocks)
+    (b.failures > 0 && !b.solved) &&
+      error("array model: the initial system: the algebraic loop $(k) of $(length(b.y)) unknowns has no solution " *
+            "from its start values")
+  end
+  return nothing
+end
+
+"""
+    _restartStep!(integrator)
+
+The next step after an event that changed the equations starts small, as on the MTK path (relationRefresh.jl
+`_restartStepSize!`): the derivatives can jump by orders of magnitude, and a step sized before the event crosses the
+fast transient at once, the values interpolated inside it far off (MSL SlewRateLimiter: one step of 0.4 s over a
+transient of 1e-4 s, `a` 12 for 0). The step is OrdinaryDiffEq's estimate of a first step (`_autoDtReset!`), at most
+1e-6 of the time span and the step proposed before. The estimate alone is not enough: the algebraic variables are
+solved inside the right-hand side, so a state that follows its input through a high gain has a derivative of
+round-off size at the event, and the estimate from it steps far over the transient (MSL OpAmps.Differentiator,
+V0 = 15000: 5e-3 s over a transient of 2e-6 s, the capacitor's voltage 0.02 V behind over the ramp). No step
+follows an event at the last stop.
+"""
+function _restartStep!(integrator)::Nothing
+  isempty(integrator.opts.tstops) && return nothing
+  local before::Float64 = abs(integrator.dtpropose)
+  _autoDtReset!(integrator)
+  local span::Float64 = abs(integrator.sol.prob.tspan[2] - integrator.sol.prob.tspan[1])
+  local cap::Float64 = 1.0e-6 * (isfinite(span) ? span : 1.0)
+  integrator.dt = integrator.tdir * min(abs(integrator.dt), cap, before)
+  integrator.dtpropose = integrator.dt
+  return nothing
+end
+
+"""
+    _logRoots!(p, t)
+
+The loops' roots of the run at time `t` logged (`ArrayRuntimeState.rootLog`): after the initialization and at each
+accepted step. Nothing for a model without algebraic loops.
+"""
+function _logRoots!(p::ArrayModelParameters, t::Real)::Nothing
+  (isempty(p.loops) && isempty(p.blocks)) && return nothing
+  push!(p.state.rootLog, (Float64(t), map(copy, p.loops), Vector{Float64}[copy(b.y) for b in p.blocks]))
+  return nothing
+end
+
+"""
+    _rootsAt(p, t, right) -> Vector{Matrix{Float64}}
+
+The loop families' guesses for a read of the solution at time `t`: the roots logged at the last step before `t`
+(`_logRoots!`; the left limit, as the states' interpolation: an entry at `t` itself may be the one after an event
+there), with `right` those at the last step at or before `t` (the second of a saved pair); the large blocks'
+guesses set to that entry's too; the current ones where nothing is logged. A read after the run started every loop
+from the run's last roots: at t = 0, after a run that ended on the other side of a quaternion's `Q * Q = 1`, on the
+other root.
+"""
+function _rootsAt(p::ArrayModelParameters, t::Real, right::Bool)::Vector{Matrix{Float64}}
+  local log::Vector{RootLogEntry} = p.state.rootLog
+  isempty(log) && return map(copy, p.loops)
+  local at::Int = right ? searchsortedlast(log, (Float64(t),); by = first) :
+                          searchsortedfirst(log, (Float64(t),); by = first) - 1
+  local entry::RootLogEntry = log[clamp(at, 1, length(log))]
+  for (b, y) in zip(p.blocks, entry[3])
+    b.y .= y
+  end
+  return map(copy, entry[2])
+end
 
 """
     _restoreStart!(p)
 
 `p` as after its initialization again (`ArrayRuntimeState.atStart`), at the start of a solve: a second solve of the
-problem started from the first one's end (its discrete values, the event log).
+problem started from the first one's end (its discrete values, the event log, its loops' roots).
 """
 function _restoreStart!(p::ArrayModelParameters)::Nothing
   local s::Union{Nothing, ArrayStartState} = p.state.atStart
@@ -199,6 +292,13 @@ function _restoreStart!(p::ArrayModelParameters)::Nothing
   p.d .= s.discrete[1]; p.dpre .= s.discrete[2]; p.rel .= s.discrete[3]; p.evv .= s.discrete[4]
   p.wcond .= s.wcond; p.wnew .= s.wnew; p.upre .= s.upre; p.ureinit .= s.ureinit
   resize!(p.dlog, s.ndlog)
+  for (G, start) in zip(p.loops, s.loops)
+    G .= start
+  end
+  for (b, y) in zip(p.blocks, s.blocks)
+    b.y .= y
+  end
+  resize!(p.state.rootLog, s.nRootLog)
   fill!(p.sampleActive, false)
   p.state.pending = (NaN, Float64[]); p.state.leftLimit = (NaN, Float64[]); p.state.terminated = nothing
   empty!(p.state.whenMemo)
@@ -444,6 +544,48 @@ const FULL = Base.Ref(true)
 const LAST_STATS = Base.Ref{Any}(nothing)
 
 """
+    ModelicaSubscriptError(name, index, size)
+
+A subscript computed from variable values that is outside its dimension. The generated functions run under
+`@inbounds`: such subscripts are checked (`_checkedSubscript`, `_checkedIndex`, `_checkedAssign!`). An error of the
+model, not of a step (it is not one of `_RHS_STEP_ERRORS`).
+"""
+struct ModelicaSubscriptError <: Exception
+  name::String
+  index::Int
+  size::Int
+end
+
+Base.showerror(io::IO, e::ModelicaSubscriptError) =
+  print(io, "ModelicaSubscriptError: subscript ", e.index, " of ", e.name, " is outside 1:", e.size)
+
+@noinline _subscriptError(i::Int, n::Int, name::String) = throw(ModelicaSubscriptError(name, i, n))
+
+@noinline function _indexError(a::AbstractArray, i::Tuple)
+  local k::Int = something(findfirst(d::Int -> !(1 <= i[d] <= size(a, d)), 1:length(i)), 1)
+  throw(ModelicaSubscriptError(string("an array of size ", size(a)), Int(i[k]), size(a, k)))
+end
+
+"The subscript `i` of a dimension of size `n` of the variable `name`, checked."
+@inline function _checkedSubscript(i::Integer, n::Int, name::String)::Int
+  (1 <= i <= n) || _subscriptError(Int(i), n, name)
+  return Int(i)
+end
+
+"`a[i...]` with subscripts computed from variable values, checked."
+@inline function _checkedIndex(a::AbstractArray, i::Vararg{Integer, N}) where {N}
+  checkbounds(Bool, a, i...) || _indexError(a, i)
+  return @inbounds a[i...]
+end
+
+"`a[i...] = v` with subscripts computed from variable values, checked."
+@inline function _checkedAssign!(a::AbstractArray, v, i::Vararg{Integer, N}) where {N}
+  checkbounds(Bool, a, i...) || _indexError(a, i)
+  @inbounds a[i...] = v
+  return v
+end
+
+"""
 String(...) of Modelica, as the MTK path formats it (resolved when called: that module
 may load after this one)
 """
@@ -550,8 +692,9 @@ end
 """
     _loopFamilyCode(g, f, template, blocks, el, matchRow, a0, relBases) -> Tuple{Vector{Any}, Expr}
 
-The solve of the loop family `f` (`LOOPFAMILY_f!`): its tables (each member's instance columns and unknowns, a guess
-per unknown: the last solution, at first the start values) and the body that solves the members it is called for,
+The solve of the loop family `f` (`LOOPFAMILY_f!`): its tables (each member's instance columns and unknowns, the first
+guess per unknown: the start values; a run keeps its last solutions as the next guesses in its parameters, `p.loops`)
+and the body that solves the members it is called for,
 each by Newton's method on the residuals of its instances (lhs - rhs, by the template's classes at the member's
 columns), the unknowns set in place (a state derivative in du, an algebraic variable in a), the Jacobian by forward
 differences; the last solution kept as the next guess (in Float64 solves); residuals or a Jacobian not finite, or a
@@ -593,10 +736,12 @@ function _loopFamilyCode(g::Gen, f::Int, template::Vector{Tuple{Int, Int}}, bloc
   local code::Expr = quote
     local _x::AbstractVector = similar(a, $k); local _r::AbstractVector = similar(a, $k)
     local _r2::AbstractVector = similar(a, $k); local _J::AbstractMatrix = similar(a, $k, $k)
+    local _G::Matrix{Float64} = p.loops[$f]
     for _m in members
       for _j in 1:$k
-        _x[_j] = $G[_j, _m]
+        _x[_j] = _G[_j, _m]
       end
+      local _converged::Bool = false
       for _it in 1:50
         $set
         $(residuals(:_r))
@@ -629,13 +774,16 @@ function _loopFamilyCode(g::Gen, f::Int, template::Vector{Tuple{Int, Int}}, bloc
           _x[_j] -= _dx[_j]
           _step = max(_step, abs(_dx[_j]) / (1.0 + abs(_x[_j])))
         end
+        _converged = _step <= 1.0e-8
         _step <= 1.0e-12 && break
       end
       $set
-      #= the solution as the next guess, not a failed solve's NaN =#
-      if eltype(a) === Float64 && all(isfinite, _x)
+      #= the solution as the next guess: not a failed solve's NaN, nor the last iterate of a solve that did not
+         converge (unknowns that hold no solution, as a state set's selection read with the other side's states: the
+         next solve went to another root from there) =#
+      if _converged && eltype(a) === Float64 && all(isfinite, _x)
         for _j in 1:$k
-          $G[_j, _m] = _x[_j]
+          _G[_j, _m] = _x[_j]
         end
       end
     end
@@ -662,6 +810,28 @@ function _discreteRead(info::VarInfo, loc)
   return loc
 end
 
+"Whether the subscript `x` is known without the variables' values: literals, loop slots, operations of those."
+_staticSubscript(x::IR)::Bool = x isa Lit || x isa Slot || (x isa Op && all(_staticSubscript, x.args))
+
+"""
+The code of the subscripts `subs` of the variable `name`: one computed from variable values (a table row chosen by a
+discrete variable) is checked against its dimension (`_checkedSubscript`), as the generated functions run under
+`@inbounds`; a start outside the range read memory outside the buffer (MSL Digital BUF3S).
+"""
+function _subscriptCode(g::Gen, info::VarInfo, name::String, subs::Vector{IR})::Vector{Any}
+  local idx::Vector{Any} = Any[]
+  for (k::Int, s::IR) in enumerate(subs)
+    local code::Any = jl(g, s)
+    if _staticSubscript(s)
+      push!(idx, code)
+    else
+      k <= length(info.dims) || ns("a subscript of $(name) beyond its dimensions")
+      push!(idx, Expr(:call, _checkedSubscript, code, info.dims[k], name))
+    end
+  end
+  return idx
+end
+
 function jl(g::Gen, x::IR)
   if x isa Lit
     return x.v
@@ -671,13 +841,16 @@ function jl(g::Gen, x::IR)
     return :t
   elseif x isa Ref
     local info = g.vars[x.name]
-    local idx = Any[jl(g, s) for s in x.subs]
     if info.kind == :param
       info.vtype == :other && ns("parameter $(x.name) of a type the array path does not pass")
       local v = _paramValue!(g, x.name)
-      v isa AbstractArray && return _discreteRead(info, Expr(:ref, g.paramSyms[x.name], idx...))
-      return g.paramSyms[x.name]
-    elseif info.kind == :state
+      v isa AbstractArray || return g.paramSyms[x.name]
+      local (psym, pidx) = (g.paramSyms[x.name], Any[jl(g, s) for s in x.subs])
+      return _discreteRead(info, all(_staticSubscript, x.subs) ? Expr(:ref, psym, pidx...) :
+                                                                 Expr(:call, _checkedIndex, psym, pidx...))
+    end
+    local idx = _subscriptCode(g, info, x.name, x.subs)
+    if info.kind == :state
       return x.der ? :(du[$(_linear(info, idx))]) : :(u[$(_linear(info, idx))])
     elseif info.kind == :discrete
       return _discreteRead(info, :(p.d[$(_linear(info, idx))]))
@@ -686,14 +859,15 @@ function jl(g::Gen, x::IR)
     end
   elseif x isa Pre
     local info = g.vars[x.ref.name]
-    local idx = Any[jl(g, s) for s in x.ref.subs]
+    info.kind == :param && return jl(g, x.ref)   #= pre of a parameter =#
+    local idx = _subscriptCode(g, info, x.ref.name, x.ref.subs)
     info.kind == :state && return :(p.upre[$(_linear(info, idx))])
     info.kind == :discrete && return _discreteRead(info, :(p.dpre[$(_linear(info, idx))]))
     #= An algebraic variable's value before the instant is not kept: its current value was
        read (`peak = pre(u)` at u's step took the value after it, OpenModelica the one
        before); the scalarized path keeps it. =#
     info.kind == :alg && ns("pre() of the algebraic variable $(x.ref.name)")
-    return jl(g, x.ref)   #= pre of a parameter =#
+    error("IR: pre() of $(x.ref.name)")
   elseif x isa Rel
     local k = :($(g.relBase) + (_col - 1) * $(g.relCount) + $(x.id))
     #= time and a parameter expression: a time event at its exact time =#
@@ -704,7 +878,9 @@ function jl(g::Gen, x::IR)
   elseif x isa Op
     local args = Any[jl(g, a) for a in x.args]
     x.op == :neg && return :(-$(args[1]))
-    x.op == :index && return Expr(:ref, args...)
+    #= a literal table: a subscript computed from variable values is checked (the code runs under @inbounds) =#
+    x.op == :index && return all(_staticSubscript, @view x.args[2:end]) ? Expr(:ref, args...) :
+                                                                         Expr(:call, _checkedIndex, args...)
     x.op == :vect && return Expr(:vect, args...)
     x.op == :if && return Expr(:if, args...)
     x.op == :&& && return Expr(:&&, args...)
@@ -744,14 +920,17 @@ function _stmtCode(g::Gen, stmts::Vector{Stmt}, condBase::Int, nwhen::Int; inWhe
   for st in stmts
     if st isa SAssign
       local info = g.vars[st.target.name]
-      local idx = Any[jl(g, s) for s in st.target.subs]
       if info.kind == :param
         #= a parameter with fixed = false, in an initial algorithm: its local (a view of
            p.values for an array; a scalar is written back after the algorithms) =#
         local sym = (_paramValue!(g, st.target.name); g.paramSyms[st.target.name])
-        push!(out, isempty(idx) ? :($sym = $(jl(g, st.value))) : :($sym[$(idx...)] = $(jl(g, st.value))))
+        local pidx = Any[jl(g, s) for s in st.target.subs]
+        push!(out, isempty(pidx) ? :($sym = $(jl(g, st.value))) :
+                   all(_staticSubscript, st.target.subs) ? :($sym[$(pidx...)] = $(jl(g, st.value))) :
+                   Expr(:call, _checkedAssign!, sym, jl(g, st.value), pidx...))
         continue
       end
+      local idx = _subscriptCode(g, info, st.target.name, st.target.subs)
       push!(out, info.kind == :discrete ? :(p.d[$(_linear(info, idx))] = Float64($(jl(g, st.value)))) :
                                           :(a[$(_linear(info, idx))] = $(jl(g, st.value))))
     elseif st isa SIf
@@ -919,7 +1098,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   local initAlgOuts::Set{String} = _initAlgAssigned(g)
   g.relBase = 0; g.relCount = 0
   local initAlgBody = Any[]
-  for ia in _initAlgOrder(g.initAlgs)
+  local (initAlgOrdered::Vector{AlgClass}, initAlgRefresh::BitVector) = _initAlgPlan(g)
+  for ia in initAlgOrdered
     local blk = Expr(:block, _stmtCode(g, ia.body, 0, 0)...)
     push!(initAlgBody, ia.nslots == 0 ? Expr(:let, :(_col = 1), blk) : _loopCode(ia.nslots, ia.domain, collect(1:size(ia.domain, 2)), blk))
   end
@@ -1081,8 +1261,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     local solution::Union{Nothing, Tuple{Ref, IR}} = any(r::Int -> (r, matchRow[r]) in el.aliased, batch) ? nothing : solutions[(ci, p)]
     if solution === nothing
       #= nonlinear in its unknown, or reading it through a reference that is it only at some instance: each instance
-         solved by Newton on its residual, as a loop of one (in a model with arrays, as the loops) =#
-      hasArrays || ns("cannot solve for an unknown in a model without arrays: $(c.text)")
+         solved by Newton on its residual, as a loop of one =#
       push!(familyTemplates, [(ci, p)])
       local f::Int = length(familyTemplates)
       loopFamily!(f, familyTemplates[f], [[r] for r in batch])
@@ -1094,7 +1273,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     g.relBase = relBases[ci]; g.relCount = c.nrel
     local tinfo = g.vars[target.name]
     local assign = tinfo.kind == :discrete ?
-      :(p.d[$(_linear(tinfo, Any[jl(g, s) for s in target.subs]))] = Float64($(jl(g, value)))) :
+      :(p.d[$(_linear(tinfo, _subscriptCode(g, tinfo, target.name, target.subs)))] = Float64($(jl(g, value)))) :
       :($(jl(g, target)) = $(jl(g, value)))
     emit!(c.nslots, c.domain, batch, assign)
   end
@@ -1136,9 +1315,16 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         continue
       end
       local info = g.vars[target.name]
-      local idx = Any[jl(g, s) for s in target.subs]
+      local idx = _subscriptCode(g, info, target.name, target.subs)
       if kind == :reinit
         push!(stmtsOf[b], :(p.ureinit[$(_linear(info, idx))] = $(jl(g, value))))
+      elseif kind == :switch
+        #= a dynamic state set's switch: the state takes the newly selected candidate's value with the selection
+           matrix the body assigns, not after the sweep. A pass with the new selection and the old state read
+           the candidates wrong (the state another candidate's value): the switch fired back, and the event
+           iteration did not settle (PendulumArray at t = 0.356) =#
+        push!(stmtsOf[b], :(p.ureinit[$(_linear(info, idx))] = $(jl(g, value))))
+        push!(stmtsOf[b], :(u[$(_linear(info, idx))] = p.ureinit[$(_linear(info, idx))]))
       elseif _callOfParameters(g, value)
         #= a call of parameters only: once per pass of the event iteration (p.state.whenMemo), as the body
            fires once in an instant; the passes rerun a fired body, and an impure function (MSL
@@ -1296,6 +1482,14 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   local initAlgWriteBack = Any[:(p.values[$(layoutOf[nm][1] + 1)] = $(g.paramSyms[nm]))
                                for nm in sort!(collect(initAlgOuts))
                                if nm in g.freeParams && haskey(layoutOf, nm) && !(g.params[nm] isa AbstractArray)]
+  #= the initial algorithms in their order; before one that reads what the equations compute from an earlier one's
+     assignments (`_initAlgPlan`), the equations again, with the parameters assigned so far =#
+  local initAlgCode = Any[]
+  for (k::Int, body::Any) in enumerate(initAlgBody)
+    initAlgRefresh[k] &&
+      push!(initAlgCode, Expr(:block, initAlgWriteBack..., :(equations!(du, a, u, p, t, nothing, true))))
+    push!(initAlgCode, body)
+  end
   local paramLocals = Any[]
   for nm in usedParams
     local info = g.vars[nm]
@@ -1416,6 +1610,9 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                                                                                   for ((I, J), gs) in zip(blockPatterns, blockGuesses)]...)]
     const BLOCK_COLORS = Vector{Int}[$(columnColors)(S) for S in BLOCK_PATTERNS]
     const BLOCK_GUESSES = $(blockGuesses)
+    #= the loop families' first guesses; none of a family of large blocks (BLOCK_GUESSES) =#
+    const LOOP_GUESSES = Matrix{Float64}[$([get(largeFamily, f, false) ? :(zeros(0, 0)) : Symbol("LOOP_GUESS_", f)
+                                            for f in eachindex(loopBodies)]...)]
     #= initialization: the states the initial equations determine (one per residual) =#
     const INIT_UNKNOWNS = $(initStates)
     const INIT_PARAMS = $(initParams)   #= fixed = false parameters: positions in p.values =#
@@ -1798,8 +1995,9 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       return nothing
     end
 
-    #= The initial algorithms, once at the start (asserts checked); the algebraic variables
-       they read from the equations at the initial state. =#
+    #= The initial algorithms, once at the start (asserts checked); the variables they read that the equations
+       compute, from the equations at the initial state (evaluated again where an earlier algorithm's assignments
+       reach them). =#
     function initialAlgorithms!(u, p, t)
       $(paramLocals...)
       local du = similar(u); local a = similar(u, $nAlg)
@@ -1808,7 +2006,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       p.checking[1] = true
       try
         @inbounds begin
-          $(initAlgBody...)
+          $(initAlgCode...)
         end
         $(initAlgWriteBack...)
       finally
@@ -1903,7 +2101,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
 
     #= The algebraic variables at a point (u, t) of a solution: the discrete, relation and
        event-function values of that time from the event log (after a solve p holds the final
-       ones), on a copy of the discrete state. =#
+       ones), on a copy of the discrete state; the loops started from the run's roots of that time (_rootsAt). =#
     function algebraics(u, p, t, right::Bool = false)
       local a = similar(u, $nAlg)
       local times = first.(p.dlog)
@@ -1914,9 +2112,37 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local evv = entry[(nD + nR + 1):end]
       local q = $(paramsType)(p.values, rel, d, copy(d), copy(p.wcond), copy(p.sampleActive),
                               [false], [false], copy(p.upre), copy(p.ureinit), copy(p.wnew), p.dlog, evv, copy(p.hyst), copy(p.tend),
-                              zeros($nAlg), p.blocks, p.state, p.model)
+                              zeros($nAlg), p.blocks, $(_rootsAt)(p, t, right), p.state, p.model)
       equations!(similar(u), a, u, q, t, nothing, false)
       return a
+    end
+
+    #= One sweep at (u, t): passes with the same pre() until nothing changes (a fired body runs in each: with pre()
+       fixed it gives the same values). Returns whether they settled. =#
+    function _settle!(du, a, u, p, t, fire::Bool)
+      p.upre .= u; p.ureinit .= u
+      empty!(p.state.whenMemo)
+      for _ in 1:50
+        local relBefore = copy(p.rel); local dBefore = copy(p.d)
+        local rBefore = copy(p.ureinit); local wBefore = copy(p.wnew); local eBefore = copy(p.evv)
+        equations!(du, a, u, p, t, nothing, true, fire)
+        whens!(du, a, u, p, t, nothing, true, fire)
+        (relBefore == p.rel && dBefore == p.d && rBefore == p.ureinit && wBefore == p.wnew && eBefore == p.evv) &&
+          return true
+      end
+      return false
+    end
+
+    #= The initialization's solution at (u, t): the relations, the when-conditions and the discrete variables the
+       equations compute, with pre() the start values (OpenModelica: pre(v) = v.start for the discrete variables).
+       No when fires on its condition there, the conditions' values become pre() of the conditions; with fire
+       (initial() true) the bodies of the whens initial() turns true run. reinit() has no effect. =#
+    function startSolution!(u, p, t, fire::Bool)
+      local du = similar(u); local a = similar(u, $nAlg)
+      _settle!(du, a, u, p, t, fire) || return false
+      p.ureinit .= u
+      p.wcond .= p.wnew
+      return true
     end
 
     #= Event iteration at (u, t), in sweeps as OpenModelica's updateDiscreteSystem (and the MTK
@@ -1927,21 +2153,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     function eventIteration!(u, p, t, fire::Bool, sampleInstant::Bool = false)
       local du = similar(u); local a = similar(u, $nAlg)
       for _ in 1:50
-        p.dpre .= p.d; p.upre .= u; p.ureinit .= u
-        empty!(p.state.whenMemo)
-        #= passes with the same pre() until nothing changes (a fired body runs in each: with
-           pre() fixed it gives the same values) =#
-        local settled = false
-        for _ in 1:50
-          local relBefore = copy(p.rel); local dBefore = copy(p.d)
-          local rBefore = copy(p.ureinit); local wBefore = copy(p.wnew); local eBefore = copy(p.evv)
-          equations!(du, a, u, p, t, nothing, true, fire)
-          whens!(du, a, u, p, t, nothing, true, fire)
-          settled = relBefore == p.rel && dBefore == p.d && rBefore == p.ureinit && wBefore == p.wnew &&
-                    eBefore == p.evv
-          settled && break
-        end
-        settled || return false
+        p.dpre .= p.d
+        _settle!(du, a, u, p, t, fire) || return false
         #= at a sample instant the samples are true for the first pass only (OpenModelica's
            updateDiscreteSystem: functionDAE once, the samples off, then iterated) =#
         sampleInstant && fill!(p.sampleActive, false)
@@ -1960,10 +2173,17 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= The event iteration at an event during the solve: a model that does not settle
        (relations switching back and forth) stops the simulation, as OpenModelica. =#
     function _eventAt!(integrator, sampleInstant::Bool = false)
+      local p = integrator.p
       #= the state just before the event (a reinit moves it): the asserts' left limit =#
-      integrator.p.state.leftLimit = (Float64(integrator.t), copy(integrator.u))
-      eventIteration!(integrator.u, integrator.p, integrator.t, true, sampleInstant) &&
+      p.state.leftLimit = (Float64(integrator.t), copy(integrator.u))
+      local relBefore::Vector{Bool} = copy(p.rel); local dBefore::Vector{Float64} = copy(p.d)
+      if eventIteration!(integrator.u, p, integrator.t, true, sampleInstant)
+        #= After an event that changed the equations the next step starts small (`_restartStep!`). A relation's
+           crossing changed them; a sample instant did where a relation, a discrete variable or the state changed. =#
+        (!sampleInstant || relBefore != p.rel || dBefore != p.d || p.state.leftLimit[2] != integrator.u) &&
+          $(_restartStep!)(integrator)
         return $(hasTerminate ? :(_terminateReached!(integrator)) : true)
+      end
       @error string("[events] the event iteration did not settle at t = ", integrator.t,
                     " (relations switching back and forth: a chattering model); the simulation stops")
       DifferentialEquations.SciMLBase.terminate!(integrator, DifferentialEquations.SciMLBase.ReturnCode.Failure)
@@ -1983,6 +2203,20 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= at the start of a solve: the relations' hysteresis for its tolerance and span =#
     function _startHysteresis!(c, u, t, integrator)
       integrator.p.hyst[1] = $(_hysteresis)(integrator)
+      return nothing
+    end
+
+    #= The loops' roots at the end of an accepted step, logged (_logRoots!). After an event at that time p holds
+       the roots of the event iteration's passes (the states before the reinit with the new discrete values): the
+       right-hand side at the state the next step starts from gives the roots the run goes on with. =#
+    function logStepRoots!(integrator)
+      local p = integrator.p
+      local t = integrator.t
+      if p.state.leftLimit[1] == t
+        local u = integrator.u
+        equations!(similar(u), similar(u, $nAlg), u, p, t, nothing, false)
+      end
+      $(_logRoots!)(p, t)
       return nothing
     end
 
@@ -2152,6 +2386,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                            zeros(Bool, N_WHENS), Tuple{Float64, Vector{Float64}}[], zeros(N_RELATIONS), [0.0], [Float64(tspan[2])],
                            zeros($nAlg),
                            $(BlockSolver)[$(BlockSolver)(BLOCK_PATTERNS[k], BLOCK_COLORS[k], BLOCK_GUESSES[k]) for k in eachindex(BLOCK_PATTERNS)],
+                           Matrix{Float64}[copy(G) for G in LOOP_GUESSES],
                            $(ArrayRuntimeState)(N_SAMPLES, strings), @__MODULE__)
     end
 
@@ -2168,21 +2403,25 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       $(isempty(initAlgBody) ? nothing : :(initialAlgorithms!(u0, p, tspan[1])))
       $(isempty(freeStartStmts) ? nothing : :(freeParameterStarts!(p)))
       N_SAMPLES == 0 || sampleSchedule!(p)
-      #= relations, when-conditions and the discrete variables equations compute at the start (no when fires there;
-         without events the only evaluation of those discrete variables) =#
-      (N_RELATIONS > 0 || N_WHENS > 0 || N_DISCRETE_UNKNOWNS > 0) &&
-        (eventIteration!(u0, p, tspan[1], false) || error("array model: the relations and discrete values at the start do not settle"))
-      if USES_INITIAL
-        #= when initial(): fire during initialization, then initial() is false again =#
-        p.initPhase[1] = true
-        eventIteration!(u0, p, tspan[1], true) || error("array model: the initial events do not settle")
-        p.initPhase[1] = false
-        local du = similar(u0); local a = similar(u0, $nAlg)
-        equations!(du, a, u0, p, tspan[1], nothing, true)
-        whens!(du, a, u0, p, tspan[1], nothing, true, false)
-        p.wcond .= p.wnew
+      if N_RELATIONS > 0 || N_WHENS > 0 || N_DISCRETE_UNKNOWNS > 0
+        #= the initialization's solution: pre() is the start values, no when fires on its condition =#
+        startSolution!(u0, p, tspan[1], false) ||
+          error("array model: the relations and discrete values at the start do not settle")
+        if USES_INITIAL
+          #= when initial(): its body runs in the initialization, then initial() is false again =#
+          p.initPhase[1] = true
+          startSolution!(u0, p, tspan[1], true) || error("array model: the initial events do not settle")
+          p.initPhase[1] = false
+          startSolution!(u0, p, tspan[1], false) || error("array model: the initial events do not settle")
+        end
+        #= the event iteration that follows the initialization: pre() takes the initialized values, and a when whose
+           condition that turns true fires (MSL Digital's gates: y = pre(auxiliary_n) leaves its start, the delay's
+           change(x) fires and schedules the output, as OpenModelica) =#
+        eventIteration!(u0, p, tspan[1], true) || error("array model: the events at the start do not settle")
       end
+      $(_checkBlocksSolved)(p)
       _logDiscretes!(p, tspan[1])
+      $(_logRoots!)(p, tspan[1])
       $(isempty(initAssertBody) ? nothing : :(checkInitialAsserts(u0, p, tspan[1])))
       invariants!(p.abuf, p)
       #= a domain error or an assert in the right-hand side rejects the step (the solver retries smaller), as in the
@@ -2221,6 +2460,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       end
       #= a solve of the problem starts from its state after the initialization (again, where it is solved again) =#
       p.state.atStart = $(_startState)(p)
+      #= after the others, its condition at each accepted step: the loops' roots of that time, for the reads after
+         the run =#
+      (isempty(p.loops) && isempty(p.blocks)) ||
+        push!(cbs, DiscreteCallback((u, t, integrator) -> (logStepRoots!(integrator); false), integrator -> nothing;
+                                    save_positions = (false, false)))
       pushfirst!(cbs, DiscreteCallback((u, t, integrator) -> false, integrator -> nothing;
                                        initialize = (c, u, t, integrator) -> $(_restoreStart!)(integrator.p),
                                        save_positions = (false, false)))
@@ -2317,64 +2561,168 @@ end
 _hasOp(x::IR, op::Symbol)::Bool = x isa Op && (x.op == op || any(a::IR -> _hasOp(a, op), x.args))
 
 """
-    _initAlgOrder(algs) -> Vector{AlgClass}
+    _initAlgPlan(g) -> (order, refresh)
 
-The initial algorithms in an order that runs each after those that assign what it reads (as written otherwise, and for
-a cycle), as the initialization solves them: an initial section reading another arm's target ran first and read its
-start (MSL OnDelay's `delaySignal := u` before `u := time >= 0`: false; the MTK code runs it late, true).
+The initial algorithms in an order that runs each after those whose assignments reach what it reads (as written
+otherwise, and for a cycle), as the initialization solves them: an initial section reading another arm's target ran
+first and read its start (MSL OnDelay's `delaySignal := u` before `u := time >= 0`: false; the MTK code runs it late,
+true). An assignment reaches a variable directly, or through the equations that compute it (a connection between two
+blocks: MSL Digital's gate reads `x`, equal to the source's `y` by a connect equation; before the source it read the
+start). `refresh[k]`: the equations are evaluated again before the k-th of the order, as an algorithm run since their
+last evaluation assigned what a variable it reads is computed from.
 """
-function _initAlgOrder(algs::Vector{AlgClass})::Vector{AlgClass}
-  length(algs) <= 1 && return algs
+function _initAlgPlan(g::Gen)::Tuple{Vector{AlgClass}, BitVector}
+  local algs::Vector{AlgClass} = g.initAlgs
+  local n::Int = length(algs)
+  n == 0 && return (algs, falses(0))
   local writes::Vector{Set{String}} = Set{String}[_stmtNames!(Set{String}(), a.body, false) for a in algs]
   local reads::Vector{Set{String}} = Set{String}[_stmtNames!(Set{String}(), a.body, true) for a in algs]
-  local done::BitVector = falses(length(algs))
-  local out::Vector{AlgClass} = AlgClass[]
-  while length(out) < length(algs)
-    local ready::Union{Nothing, Int} = findfirst(i::Int -> !done[i] &&
-      all(j::Int -> done[j] || j == i || isdisjoint(writes[j], reads[i]), eachindex(algs)), eachindex(algs))
+  local writeElements::Vector{ElementSets} = ElementSets[_stmtElements(a.body, false) for a in algs]
+  local readElements::Vector{ElementSets} = ElementSets[_stmtElements(a.body, true) for a in algs]
+  #= what the equations compute: the algebraic variables, the discrete ones that are unknowns of the equations =#
+  local computed::Set{String} = Set{String}()
+  for (nm::String, info::VarInfo) in g.vars
+    if info.kind == :alg || (info.kind == :discrete &&
+        any(k::Int -> haskey(g.discUnknown, info.offset + k), 1:(isempty(info.dims) ? 1 : prod(info.dims))))
+      push!(computed, nm)
+    end
+  end
+  #= the names of each equation and algorithm, and the equations of each name =#
+  local members::Vector{Set{String}} =
+    Set{String}[_readNames!(_readNames!(Set{String}(), c.lhs), c.rhs) for c in g.classes]
+  for a::AlgClass in g.algs
+    push!(members, _stmtNames!(_stmtNames!(Set{String}(), a.body, true), a.body, false))
+  end
+  local classesOf::Dict{String, Vector{Int}} = Dict{String, Vector{Int}}()
+  for (ci::Int, names::Set{String}) in enumerate(members), nm::String in names
+    push!(get!(() -> Int[], classesOf, nm), ci)
+  end
+  #= the computed variables each algorithm's assignments reach through the equations =#
+  local downstream::Vector{Set{String}} = Set{String}[]
+  for w::Set{String} in writes
+    local seen::Set{String} = Set{String}()
+    local visited::Set{Int} = Set{Int}()
+    local queue::Vector{String} = collect(w)
+    while !isempty(queue)
+      local nm::String = pop!(queue)
+      for ci::Int in get(classesOf, nm, Int[])
+        ci in visited && continue
+        push!(visited, ci)
+        for other::String in members[ci]
+          (other in computed && !(other in w) && !(other in seen)) || continue
+          push!(seen, other); push!(queue, other)
+        end
+      end
+    end
+    push!(downstream, seen)
+  end
+  #= the algorithms each one waits for: those that assign what it reads, or reach it through the equations. An
+     assignment by element where the subscripts are literals: the sections of the instances of a component array
+     assign and read the same names, each its own elements, and do not wait for one another (MSL Digital's delay in
+     two tristate buffers: as a cycle its `y := y_auxiliary` ran before the sections that assign y_auxiliary) =#
+  local assigning::Dict{String, Vector{Int}} = Dict{String, Vector{Int}}()
+  local reaching::Dict{String, Vector{Int}} = Dict{String, Vector{Int}}()
+  for j::Int in 1:n
+    foreach(nm::String -> push!(get!(() -> Int[], assigning, nm), j), writes[j])
+    foreach(nm::String -> push!(get!(() -> Int[], reaching, nm), j), downstream[j])
+  end
+  local waitsFor::Vector{Set{Int}} = Set{Int}[Set{Int}() for _ in 1:n]
+  for i::Int in 1:n, nm::String in reads[i]
+    for j::Int in get(assigning, nm, Int[])
+      (j != i && _elementsMeet(readElements[i][nm], writeElements[j][nm])) && push!(waitsFor[i], j)
+    end
+    for j::Int in get(reaching, nm, Int[])
+      j == i || push!(waitsFor[i], j)
+    end
+  end
+  local done::BitVector = falses(n)
+  local order::Vector{AlgClass} = AlgClass[]
+  local refresh::BitVector = falses(n)
+  local stale::Set{String} = Set{String}()
+  while length(order) < n
+    local ready::Union{Nothing, Int} = findfirst(i::Int -> !done[i] && all(j::Int -> done[j], waitsFor[i]), 1:n)
     local k::Int = ready === nothing ? findfirst(!, done) : ready
     done[k] = true
-    push!(out, algs[k])
+    push!(order, algs[k])
+    if !isdisjoint(reads[k], stale)
+      refresh[length(order)] = true
+      empty!(stale)
+    end
+    union!(stale, downstream[k])
   end
-  return out
+  return (order, refresh)
 end
 
-"The names the statements read outside pre() (`reads`) or assign, into `out`."
-function _stmtNames!(out::Set{String}, stmts::Vector{Stmt}, reads::Bool)::Set{String}
-  local exp!::Function = (x::IR) -> reads && _readNames!(out, x)
+"`f(ref)` for each reference the statements read outside pre() (`reads`) or assign."
+function _eachStmtRef(f::F, stmts::Vector{Stmt}, reads::Bool)::Nothing where {F <: Function}
+  local exp!::Function = (x::IR) -> (reads && _eachRead(f, x); nothing)
   for st in stmts
     if st isa SAssign
-      reads ? (exp!(st.value); foreach(exp!, st.target.subs)) : push!(out, st.target.name)
+      reads ? (exp!(st.value); foreach(exp!, st.target.subs)) : f(st.target)
     elseif st isa Union{SIf, SWhen}
-      foreach(b::Tuple{IR, Vector{Stmt}} -> (exp!(b[1]); _stmtNames!(out, b[2], reads)), st.branches)
+      foreach(b::Tuple{IR, Vector{Stmt}} -> (exp!(b[1]); _eachStmtRef(f, b[2], reads)), st.branches)
     elseif st isa SFor
-      _stmtNames!(out, st.body, reads)
+      _eachStmtRef(f, st.body, reads)
     elseif st isa SWhile
       exp!(st.cond)
-      _stmtNames!(out, st.body, reads)
+      _eachStmtRef(f, st.body, reads)
     elseif st isa SCall
       exp!(st.call)
     elseif st isa SAssert
       exp!(st.cond); exp!(st.msg)
     end
   end
+  return nothing
+end
+
+"`f(ref)` for each reference `x` reads outside pre() (a reference's subscripts too)."
+function _eachRead(f::F, x::IR)::Nothing where {F <: Function}
+  if x isa Ref
+    f(x)
+    foreach(s::IR -> _eachRead(f, s), x.subs)
+  elseif x isa Rel
+    _eachRead(f, x.lhs); _eachRead(f, x.rhs)
+  elseif x isa Op
+    foreach(a::IR -> _eachRead(f, a), x.args)
+  elseif x isa EvFn
+    _eachRead(f, x.arg)
+  end
+  return nothing
+end
+
+"The names the statements read outside pre() (`reads`) or assign, into `out`."
+function _stmtNames!(out::Set{String}, stmts::Vector{Stmt}, reads::Bool)::Set{String}
+  _eachStmtRef((r::Ref) -> push!(out, r.name), stmts, reads)
   return out
 end
 
 "The names `x` reads outside pre() (a reference's subscripts too), into `out`."
 function _readNames!(out::Set{String}, x::IR)::Set{String}
-  if x isa Ref
-    push!(out, x.name)
-    foreach(s::IR -> _readNames!(out, s), x.subs)
-  elseif x isa Rel
-    _readNames!(out, x.lhs); _readNames!(out, x.rhs)
-  elseif x isa Op
-    foreach(a::IR -> _readNames!(out, a), x.args)
-  elseif x isa EvFn
-    _readNames!(out, x.arg)
+  _eachRead((r::Ref) -> push!(out, r.name), x)
+  return out
+end
+
+"The elements of one name: those of literal subscripts, or `nothing`, the whole array (another subscript, none)."
+const Elements = Union{Nothing, Set{Vector{Int}}}
+"The elements by name."
+const ElementSets = Dict{String, Elements}
+
+"The elements the statements read outside pre() (`reads`) or assign, by name."
+function _stmtElements(stmts::Vector{Stmt}, reads::Bool)::ElementSets
+  local out::ElementSets = ElementSets()
+  _eachStmtRef(stmts, reads) do r::Ref
+    if isempty(r.subs) || !all(s::IR -> s isa Lit && s.v isa Integer && !(s.v isa Bool), r.subs)
+      out[r.name] = nothing
+    else
+      local known::Elements = get!(() -> Set{Vector{Int}}(), out, r.name)
+      known === nothing || push!(known, Int[Int((s::Lit).v) for s in r.subs])
+    end
   end
   return out
 end
+
+"Whether the elements `a` and `b` of one name have one in common."
+_elementsMeet(a::Elements, b::Elements)::Bool = a === nothing || b === nothing || !isdisjoint(a, b)
 
 "Whether the statement `st` has an operation `op` (`_hasOp`)."
 function _stmtHasOp(st::Stmt, op::Symbol)::Bool

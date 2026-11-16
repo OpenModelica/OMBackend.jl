@@ -141,10 +141,16 @@ allSubscripts(cref::IR.ComponentRef)::Vector{IR.Subscript} = IR.Subscript[s for 
     foldInteger(e)
 
 The value of an Integer expression of literals, `+`, `-` and `*` (`2 - 1` after a loop's
-iterator was replaced); `nothing` for another.
+iterator was replaced) and of an element of a range of them (`(1:2 - 1)[1]`, the frontend's
+element of a slice); `nothing` for another.
 """
 function foldInteger(e::IR.Expression)::Union{Nothing, Int}
   e isa IR.INTEGER && return e.value
+  if e isa IR.SUBSCRIPTED && e.exp isa IR.RANGE && length(e.subscripts) == 1 && e.subscripts[1] isa IR.INDEX
+    local values::Union{Nothing, Vector{Int}} = rangeValues(e.exp)
+    local k::Union{Nothing, Int} = foldInteger(e.subscripts[1].exp)
+    return (values === nothing || k === nothing || !(1 <= k <= length(values))) ? nothing : values[k]
+  end
   if e isa IR.UNARY && e.op === IR.UMINUS
     local v = foldInteger(e.exp)
     return v === nothing ? nothing : -v

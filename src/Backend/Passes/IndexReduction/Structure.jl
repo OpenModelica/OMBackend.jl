@@ -492,11 +492,14 @@ end
 """
     inlineEquation(eq, functions) -> Equation
 
-A scalar or if-equation with its calls inlined (`inlineCalls`): the form the structure reads
+A scalar, array or if-equation with its calls inlined (`inlineCalls`): the form the structure reads
 and index reduction differentiates, so both see the same dependencies. Other kinds as they are.
 """
 inlineEquation(eq::IR.SCALAR_EQUATION, functions::Dict{Symbol, IR.ModelicaFunction})::IR.Equation =
   IR.SCALAR_EQUATION(inlineCalls(eq.lhs, functions), inlineCalls(eq.rhs, functions), eq.ty, eq.source, eq.attributes)
+
+inlineEquation(eq::IR.ARRAY_EQUATION, functions::Dict{Symbol, IR.ModelicaFunction})::IR.Equation =
+  IR.ARRAY_EQUATION(inlineCalls(eq.lhs, functions), inlineCalls(eq.rhs, functions), eq.ty, eq.source, eq.attributes)
 
 function inlineEquation(eq::IR.IF_EQUATION, functions::Dict{Symbol, IR.ModelicaFunction})::IR.Equation
   local branches = IR.EquationBranch[IR.EquationBranch(b.condition, IR.Equation[inlineEquation(e, functions) for e in b.equations])

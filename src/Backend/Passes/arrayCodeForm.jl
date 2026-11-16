@@ -47,6 +47,8 @@ code generation takes; of its first partition (a model of several the generation
   - the lifted discrete clusters the event iteration runs at every pass are their equations (`everyPassClusters!`);
   - the derivative variables that only their definitions read are dropped (`dropUnreadDerivatives!`);
   - the calls are inlined after index reduction (`inlineAfterIndexReduction!`);
+  - the array equations left (the initial ones, those in branches and bodies) are for-equations over their elements
+    (`rollLeftArrayEquations!`);
   - the for-equations that read the elements of what is no variable, or subscript an array literal by their iterator,
     are unrolled (`unrollElementLoops!`);
   - the for-ranges that fold to Integer literals are those literal ranges (`literalRanges!`);
@@ -59,6 +61,7 @@ function arrayCodeForm!(model::IR.Model)::IR.Model
   everyPassClusters!(model)
   dropUnreadDerivatives!(model)
   inlineAfterIndexReduction!(model)
+  rollLeftArrayEquations!(model)
   unrollElementLoops!(model)
   literalRanges!(model)
   elementForm!(model)
@@ -273,7 +276,7 @@ end
     inlinedEquation(eq, functions) -> Equation
 
 `eq` with its calls of `functions` inlined where their algorithms run into one expression (`IndexReduction.inlineCalls`;
-scalar, if- and for-equations, a for-equation's body): MultiBody's `planarRotation(e, phi, w)[1][2, 1]` as
+scalar, array, if- and for-equations, a for-equation's body): MultiBody's `planarRotation(e, phi, w)[1][2, 1]` as
 `e[2] * e[1] + (-(e[2] * e[1])) * cos(phi) - e[3] * sin(phi)`, no call and no array built per element (each element of
 a record result called the function again). Other kinds, and an equation without such a call, as they are (inlining
 also writes a subscripted reference on its parts: `observed.offset[\$i1]` of a record variable's array field, whose
@@ -286,7 +289,8 @@ function inlinedEquation(eq::IR.Equation, functions::Dict{Symbol, IR.ModelicaFun
     nothing
   end
   calls || return eq
-  (eq isa IR.SCALAR_EQUATION || eq isa IR.IF_EQUATION) && return IndexReduction.inlineEquation(eq, functions)
+  (eq isa IR.SCALAR_EQUATION || eq isa IR.ARRAY_EQUATION || eq isa IR.IF_EQUATION) &&
+    return IndexReduction.inlineEquation(eq, functions)
   eq isa IR.FOR_EQUATION &&
     return IR.FOR_EQUATION(eq.iterator, IR.Equation[inlinedEquation(e, functions) for e in eq.body], eq.source, eq.attributes)
   return eq
@@ -295,6 +299,68 @@ end
 #= ==================================================================================== =#
 #= For-equations over elements                                                          =#
 #= ==================================================================================== =#
+
+"""
+    rollLeftArrayEquations!(model) -> Model
+
+The array equations the first partition still has as for-equations over their elements (`IndexReduction.elementLoop`):
+the initial ones, which no pass before rolls or splits (MSL Body's `zeros(3) = equalityConstraint(Q, Q_start)`, a
+state's `x = x_start`), and those in an if-equation's branches or a for-equation's body that read no continuous
+array. The array code has classes over index domains and none for an array equation as a whole. An inlined call's
+array literal subscripted by the iterator is then unrolled (`unrollElementLoops!`). One of an unknown size stays.
+An initial one that reads no continuous array (of a discrete array, of a parameter array with fixed = false) is its
+element equations: no residual solves it, the initialization assigns it, an element at a time, the reference on the
+left (the lowering writes an array equality `rhs = lhs`).
+"""
+function rollLeftArrayEquations!(model::IR.Model)::IR.Model
+  local partition::IR.Partition = model.continuous[1]
+  local variables::IR.VariableSet = model.variables
+  partition.equations = IR.Equation[elementLoops(eq, variables, 0) for eq in partition.equations]
+  local initial::Vector{IR.Equation} = IR.Equation[]
+  for eq in partition.initialEquations
+    local rolled::IR.Equation = elementLoops(eq, variables, 0)
+    local assigned::Bool = eq isa IR.ARRAY_EQUATION && !IndexReduction.readsContinuousArray(eq.lhs, variables) &&
+                           !IndexReduction.readsContinuousArray(eq.rhs, variables)
+    assigned ? append!(initial, IR.Equation[referenceLeft(x) for x in unrolledWhole(rolled)]) : push!(initial, rolled)
+  end
+  partition.initialEquations = initial
+  return model
+end
+
+"A scalar equation `value = reference` as `reference = value`; another as it is."
+referenceLeft(eq::IR.Equation)::IR.Equation =
+  (eq isa IR.SCALAR_EQUATION && eq.rhs isa IR.CREF && !(eq.lhs isa IR.CREF)) ?
+    IR.SCALAR_EQUATION(eq.rhs, eq.lhs, eq.ty, eq.source, eq.attributes) : eq
+
+"The equations of the for-equation `eq` at every value of its iterators (nested ones too); of no literal range as it
+is."
+function unrolledWhole(eq::IR.Equation)::Vector{IR.Equation}
+  eq isa IR.FOR_EQUATION || return IR.Equation[eq]
+  local range::Union{Nothing, StepRange{Int, Int}} =
+    IndexReduction.literalRange(IndexReduction.foldTree(eq.iterator.range))
+  range === nothing && return IR.Equation[eq]
+  return IR.Equation[x for value in range for b in eq.body
+                     for x in unrolledWhole(withIterator(b, Dict{Symbol, Int}(eq.iterator.name => value)))]
+end
+
+"`eq` with its array equations as for-equations over their elements, by iterators after the enclosing ones (`used`)."
+function elementLoops(eq::IR.Equation, variables::IR.VariableSet, used::Int)::IR.Equation
+  eq isa IR.ARRAY_EQUATION && return IndexReduction.elementLoop(eq, variables, used)
+  local rolled::Function = (eqs::Vector{IR.Equation}, inner::Int) ->
+    IR.Equation[elementLoops(e, variables, inner) for e in eqs]
+  if eq isa IR.FOR_EQUATION
+    local inner::Int = max(used, IndexReduction.iteratorIndex(eq.iterator.name))
+    return IR.FOR_EQUATION(eq.iterator, rolled(eq.body, inner), eq.source, eq.attributes)
+  elseif eq isa IR.IF_EQUATION
+    #= branches of array equations of one size: one for-equation with the if-equation in its body =#
+    local whole::IR.Equation = IndexReduction.rolledEquation(eq, variables, used)
+    whole === eq || return whole
+    local branches::Vector{IR.EquationBranch} =
+      IR.EquationBranch[IR.EquationBranch(b.condition, rolled(b.equations, used)) for b in eq.branches]
+    return IR.IF_EQUATION(branches, rolled(eq.elseEquations, used), eq.source, eq.attributes)
+  end
+  return eq
+end
 
 """
     unrollElementLoops!(model) -> Model
@@ -583,10 +649,8 @@ function subscriptedForm(e::IR.SUBSCRIPTED, cx::ElementContext)::IR.Expression
   base === picked.exp || return elementFormExp(IR.SUBSCRIPTED(base, picked.subscripts, e.ty), cx)
   local subscripts::Vector{IR.Subscript} = IR.Subscript[IR.INDEX(elementFormExp((s::IR.INDEX).exp, cx)) for s in picked.subscripts]
   if base isa IR.CREF
-    local last::IR.CrefPart = base.cref.parts[end]
-    local composed::Union{Nothing, Vector{IR.Subscript}} = composedSubscripts(last.subscripts, picked.subscripts)
-    composed === nothing && return e
-    local parts::Vector{IR.CrefPart} = IR.CrefPart[base.cref.parts[1:end - 1]..., IR.CrefPart(last.name, composed, last.ty)]
+    local parts::Union{Nothing, Vector{IR.CrefPart}} = composedParts(base.cref.parts, picked.subscripts)
+    parts === nothing && return e
     return crefForm(IR.CREF(IR.ComponentRef(parts), e.ty), cx)
   elseif base isa IR.ARRAY
     return IR.SUBSCRIPTED(IR.ARRAY(IR.Expression[elementFormExp(x, cx) for x in base.elements], base.ty), subscripts, e.ty)
@@ -628,6 +692,38 @@ function fieldOf(a::IR.Expression, k::Int, f::IR.Field)::IR.Expression
   a isa IR.RECORD && return a.elements[k]
   a isa IR.CREF && return IR.CREF(IR.ComponentRef(IR.CrefPart[a.cref.parts..., IR.CrefPart(f.name, IR.Subscript[], f.ty)]), f.ty)
   return IR.RECORD_ELEMENT(a, k, f.name, f.ty)
+end
+
+"""
+The parts of a reference subscripted again by `inner`: the slices and whole dimensions of each part before the last
+indexed by the next inner subscripts in order (`ac.pin[:].i` by `[k]` is `ac.pin[k].i`: a field of every component of
+an array), the last part's by those left, the rest appended to it (`composedSubscripts`). `nothing` where a part's
+subscripts do not compose, where the inner subscripts end inside a part before the last, and where an array part
+without subscripts stands before a sliced one (its dimension comes first, and it has no subscript to take it).
+"""
+function composedParts(parts::Vector{IR.CrefPart}, inner::Vector{IR.Subscript})::Union{Nothing, Vector{IR.CrefPart}}
+  local out::Vector{IR.CrefPart} = IR.CrefPart[]
+  local next::Int = 1
+  local unsubscriptedArray::Bool = false
+  for k in 1:length(parts) - 1
+    local p::IR.CrefPart = parts[k]
+    local open::Int = count((s::IR.Subscript) -> !(s isa IR.INDEX), p.subscripts)
+    if open == 0
+      unsubscriptedArray |= isempty(p.subscripts) && p.ty isa Union{IR.T_ARRAY, IR.T_COMPONENTS}
+      push!(out, p)
+      continue
+    end
+    (unsubscriptedArray || next + open - 1 > length(inner)) && return nothing
+    local composed::Union{Nothing, Vector{IR.Subscript}} = composedSubscripts(p.subscripts, inner[next:next + open - 1])
+    composed === nothing && return nothing
+    push!(out, IR.CrefPart(p.name, composed, p.ty))
+    next += open
+  end
+  local last::IR.CrefPart = parts[end]
+  local rest::Union{Nothing, Vector{IR.Subscript}} = composedSubscripts(last.subscripts, inner[next:end])
+  rest === nothing && return nothing
+  push!(out, IR.CrefPart(last.name, rest, last.ty))
+  return out
 end
 
 """
@@ -743,8 +839,11 @@ of a size not known, too many elements, or min and max of an empty array.
 function reductionForm(fname::Symbol, arg::IR.Expression, cx::ElementContext)::Union{Nothing, IR.Expression}
   local ty::IR.ModelicaType = IR.typeOf(arg)
   ty isa IR.T_ARRAY || return nothing
-  all((d::IR.Dimension) -> d isa IR.DIM_SIZE, ty.dimensions) || return nothing
-  local dims::Vector{Int} = Int[(d::IR.DIM_SIZE).size for d in ty.dimensions]
+  #= the dimensions from the operands where the type does not give them (an inlined function's `i .^ 2 / m` is typed
+     by the function's `i[:]`: MSL Machines' quasiRMS of the stray load's currents) =#
+  local shape::Union{Nothing, Vector{Int}} = Evaluation.shapeOf(arg)
+  (shape === nothing || length(shape) != length(ty.dimensions)) && return nothing
+  local dims::Vector{Int} = shape
   local n::Int = prod(dims)
   n <= MAX_ELEMENT_TERMS || return nothing
   n == 0 && return fname === :product ? IR.REAL(1.0) : fname === :sum ? IR.REAL(0.0) : nothing

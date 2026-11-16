@@ -61,21 +61,32 @@ struct SetFamily
   jacobian::Vector{IR.Expression}
 end
 
-"The iterators of a for-equation over the elements of arrays of `sizes`: `\$i1`, `\$i2`, ..."
-setIterators(sizes::Vector{Int})::Vector{Symbol} = Symbol[Symbol("\$i", d) for d in eachindex(sizes)]
+"""
+The iterators of a for-equation over the elements of arrays of `sizes`: `\$i1`, `\$i2`, ...; after `used` iterators
+of enclosing for-equations `\$i(used + 1)`, ...
+"""
+setIterators(sizes::Vector{Int}, used::Int = 0)::Vector{Symbol} =
+  Symbol[Symbol("\$i", used + d) for d in eachindex(sizes)]
 
 "The subscripts by the iterators over the elements of arrays of `sizes` (`setIterators`): `[\$i1, \$i2, ...]`."
-iteratorSubscripts(sizes::Vector{Int})::Vector{IR.Subscript} =
-  IR.Subscript[IR.INDEX(IR.CREF(IR.ComponentRef(it, IR.T_INTEGER()), IR.T_INTEGER())) for it in setIterators(sizes)]
+iteratorSubscripts(sizes::Vector{Int}, used::Int = 0)::Vector{IR.Subscript} =
+  IR.Subscript[IR.INDEX(IR.CREF(IR.ComponentRef(it, IR.T_INTEGER()), IR.T_INTEGER()))
+               for it in setIterators(sizes, used)]
+
+"The index `N` of an iterator `\$iN` (`setIterators`, the frontend's vectorization of a component array); else 0."
+function iteratorIndex(name::Symbol)::Int
+  local text::String = String(name)
+  return startswith(text, "\$i") ? something(tryparse(Int, SubString(text, 3)), 0) : 0
+end
 
 """
     nestedFor(body, sizes) -> FOR_EQUATION
 
 The equations `body` for every element of arrays of `sizes`: nested for-equations over the dimensions, the first the
-outermost, by the iterators `setIterators(sizes)`.
+outermost, by the iterators `setIterators(sizes, used)`.
 """
-function nestedFor(body::Vector{IR.Equation}, sizes::Vector{Int})::IR.FOR_EQUATION
-  local iterators = setIterators(sizes)
+function nestedFor(body::Vector{IR.Equation}, sizes::Vector{Int}, used::Int = 0)::IR.FOR_EQUATION
+  local iterators = setIterators(sizes, used)
   local eq = IR.FOR_EQUATION(IR.Iterator(iterators[end], integerRange(sizes[end])), body, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES)
   for d in reverse(eachindex(sizes))[2:end]
     eq = IR.FOR_EQUATION(IR.Iterator(iterators[d], integerRange(sizes[d])), IR.Equation[eq], IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES)
@@ -90,8 +101,8 @@ integerRange(n::Int)::IR.Expression = IR.RANGE(IR.INTEGER(1), nothing, IR.INTEGE
     setLevels(set, s, E) -> Union{Nothing, Tuple{Vector{SetLevel}, Vector{Int}}}
 
 The levels of a dynamic state set whose candidates are elements of arrays, all at the same subscripts, and those
-subscripts; `nothing` for a set of scalars. NotHandled for one of elements at different subscripts or of
-scalars and elements together.
+subscripts; `nothing` for a set of scalars and for one of elements at different subscripts (r[1], r[2] of a
+position vector: a scalar set whose equations read the arrays). NotHandled for scalars and elements together.
 """
 function setLevels(set::DynamicSet, s::Structure, E::Elements)::Union{Nothing, Tuple{Vector{SetLevel}, Vector{Int}}}
   local levels = SetLevel[]
@@ -110,7 +121,7 @@ function setLevels(set::DynamicSet, s::Structure, E::Elements)::Union{Nothing, T
         end
         elementCount += 1
         index === nothing && (index = element[2])
-        element[2] == index || throw(NotHandled("a dynamic state set of the elements of arrays at different subscripts"))
+        element[2] == index || return nothing
         push!(out, element[1])
       end
     end
@@ -257,7 +268,7 @@ function nestedArray(sizes::Vector{Int}, ty::IR.ModelicaType, leaves::Vector{IR.
 end
 
 """
-    familyParts(f, k, s, E, variables, viewVariables) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
+    familyParts(f, k, s, E, variables, viewVariables, carried) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
 
 The family of dynamic state sets `f` as the `k`-th state set of the model, `dynamicSetParts` per element in array
 form: the selection matrices `\$STATESETk.A[i.., j, c]` (Integer, the start values' choice of each element), the
@@ -267,7 +278,8 @@ twice the dummy's. The states' start values guess the variables the start values
 element view's).
 """
 function familyParts(f::SetFamily, k::Int, s::Structure, E::Elements, variables::IR.VariableSet,
-                     viewVariables::IR.VariableSet)::Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
+                     viewVariables::IR.VariableSet,
+                     carried::Dict{Symbol, Float64})::Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
   local n = length(f.levels[1].variables)
   local sizes = f.sizes
   local at = iteratorSubscripts(sizes)
@@ -302,8 +314,10 @@ function familyParts(f::SetFamily, k::Int, s::Structure, E::Elements, variables:
     local guesses = IR.Expression[]
     for (set, start) in zip(f.sets, starts), j in 1:n-1
       local candidates = l == 1 ? set.candidates : set.linked[l - 1]
-      local v = get(viewVariables, s.variables[s.antiderivative[candidates[selects(start, j)]]], nothing)
-      push!(guesses, (v === nothing || v.attributes.start === nothing) ? IR.REAL(0.0) : arrayReferences(v.attributes.start, E, variables))
+      local selected::Symbol = s.variables[s.antiderivative[candidates[selects(start, j)]]]
+      local v = get(viewVariables, selected, nothing)
+      push!(guesses, (v === nothing || v.attributes.start === nothing) ? IR.REAL(get(carried, selected, 0.0)) :
+                     arrayReferences(v.attributes.start, E, variables))
     end
     local derivativeRef::IR.ComponentRef = IR.derivativeCref(cref)
     local x::IR.Variable = IR.Variable(cref, stateType, IR.STATE(1, derivativeRef.name, true), nothing,

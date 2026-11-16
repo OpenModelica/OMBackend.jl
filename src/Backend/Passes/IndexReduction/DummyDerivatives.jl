@@ -305,16 +305,20 @@ OpenModelica), then by the largest pivot of the Jacobian at the start values (Ga
 elimination with pivoting in the class's columns), among equals the derivative of a derivative
 variable, then a variable without a fixed start, then the later variable (so the first
 declared and the fixed stay states, as OpenModelica chooses). Where the start values do not
-give a regular choice, their pivots are kept and the rest chosen at a generic point (a special
-start, all currents 0, makes entries vanish): first one that keeps the relations explicit
-equations give (`propagatedValues`, computed once in `generic`), then `genericValues`, else
-structurally, those pivots first.
+give a regular choice, their pivots are kept and the rest chosen first at the start values
+carried through the relations explicit equations give (`propagatedValues` without `generic`,
+computed once in `start`: a start given to `body.r_0` only, the Jacobian reading the line
+force's `r_rel_0`, MSL MultiBody's SpringDamperSystem), then at a generic point (a special
+start, all currents 0, makes entries vanish): first one that keeps those relations
+(`propagatedValues`, computed once in `generic`), then `genericValues`, else structurally,
+those pivots first.
 """
 function chooseDummies(s::Structure, rows::Vector{Int}, columns::Vector{Int}, partition::IR.Partition,
                        differentiated::Dict{Int, Vector{IR.Equation}}, variables::IR.VariableSet,
                        functions::Dict{Symbol, IR.ModelicaFunction}, values::StartValues,
                        classes::Dict{Int, Int}, natural::BitVector,
-                       generic::Base.RefValue{Union{Nothing, StartValues}})::Vector{Int}
+                       generic::Base.RefValue{Union{Nothing, StartValues}},
+                       start::Base.RefValue{Union{Nothing, StartValues}})::Vector{Int}
   #= within a class, first the derivatives of derivative variables (`\$DER.x` has no name of its own: a
      declared variable it equals, `w = der(phi)`, makes the better state), then of variables without
      a fixed start (of the aliases `I1.phi`, `I1.flange_a.phi`, whose entries tie, the one the user
@@ -323,9 +327,16 @@ function chooseDummies(s::Structure, rows::Vector{Int}, columns::Vector{Int}, pa
   local order = sort(columns; by = c -> (classes[c], firstOrder(c), fixedStart(s, variables, c) ? 1 : 0, -baseVariable(s, c), -c))
   local atStart = numericChoice(s, rows, order, classes, partition, differentiated, functions, values; partial = true)
   (atStart !== nothing && length(atStart) == length(rows)) && return atStart
-  #= a special start (all currents 0) can make the Jacobian singular there: the pivots it gives kept, the rest at a
-     generic point that keeps the relations explicit equations give (`propagatedValues`), else at one that does not =#
+  #= the declared start values alone can make the Jacobian singular: the pivots they give kept, the rest at the start
+     values carried through the explicit relations (a variable without a start that an equation gives from those
+     with one); a special start (all currents 0) is singular there too: then at a generic point that keeps the
+     relations (`propagatedValues`), else at one that does not =#
   local forced = something(atStart, Int[])
+  start[] === nothing &&
+    (start[] = propagatedValues(s, partition, differentiated, functions, values, natural; generic = false))
+  local carried = numericChoice(s, rows, order, classes, partition, differentiated, functions, something(start[]);
+                                forced)
+  carried === nothing || return carried
   generic[] === nothing && (generic[] = propagatedValues(s, partition, differentiated, functions, values, natural))
   for point in (something(generic[]), genericValues(values))
     local numeric = numericChoice(s, rows, order, classes, partition, differentiated, functions, point; forced)
@@ -475,7 +486,7 @@ function eliminate!(A::Elimination, bi::Int, bj::Int)::Nothing
 end
 
 """
-    propagatedValues(s, partition, differentiated, functions, values, natural) -> StartValues
+    propagatedValues(s, partition, differentiated, functions, values, natural; generic = true) -> StartValues
 
 A generic point that keeps the relations the equations give explicitly: a variable an equation
 determines once the others it reads are known (linear in it: `gamma = p * phi`, a connection's
@@ -484,11 +495,15 @@ left to solve, the next of the others takes its start moved by `genericOffset` (
 the states first (of the derivatives the model's own equations read, `natural`), lower
 derivatives before higher. `genericValues` alone moves apart two variables an equation ties
 (MSL ActuatorWithNoise: the machine's rotor angle and its controller's), where a choice regular
-there is singular on every trajectory.
+there is singular on every trajectory. Without `generic`, the start values carried through
+those relations instead, an estimate of the initial point: the others take their start as it
+is (0 where none is given), those of a fixed start first, then those of a given start
+(`startRank`), so a variable without a start takes what an equation gives from those with one.
 """
 function propagatedValues(s::Structure, partition::IR.Partition, differentiated::Dict{Int, Vector{IR.Equation}},
-                          functions::Dict{Symbol, IR.ModelicaFunction}, values::StartValues, natural::BitVector)::StartValues
-  local point = genericValues(values)
+                          functions::Dict{Symbol, IR.ModelicaFunction}, values::StartValues, natural::BitVector;
+                          generic::Bool = true)::StartValues
+  local point = generic ? genericValues(values) : ownValues(values)
   local assigned = falses(length(s.variables))
   local open = Int[length(s.incidence[r]) for r in eachindex(s.rows)]
   local readers = [Int[] for _ in s.variables]
@@ -497,7 +512,8 @@ function propagatedValues(s::Structure, partition::IR.Partition, differentiated:
   end
   local queue = Int[r for r in eachindex(s.rows) if open[r] == 1]
   local state = v::Int -> s.derivative[v] != 0 && natural[s.derivative[v]]
-  local seeds = sort(collect(eachindex(s.variables)); by = v -> (state(v) ? 0 : 1, derivativeOrder(s, v), v))
+  local rank = v::Int -> generic ? 0 : startRank(s, values.variables, v)
+  local seeds = sort(collect(eachindex(s.variables)); by = v -> (rank(v), state(v) ? 0 : 1, derivativeOrder(s, v), v))
   local next = 1
   while true
     while !isempty(queue)
@@ -513,12 +529,19 @@ function propagatedValues(s::Structure, partition::IR.Partition, differentiated:
       next += 1
     end
     next > length(seeds) && break
-    #= its start moved by its offset (a derivative, no variable of its own: its offset from 0) =#
+    #= its start, at the generic point moved by its offset (a derivative, no variable of its own: from 0) =#
     local name = s.variables[seeds[next]]
-    point.cache[name] = something(point(name), genericOffset(name))
+    point.cache[name] = something(point(name), generic ? genericOffset(name) : 0.0)
     markAssigned!(queue, assigned, open, readers, seeds[next])
   end
   return point
+end
+
+"How much the start of variable `v` is given: 0 a fixed start, 1 a declared one, 2 none (or no variable of its own)."
+function startRank(s::Structure, variables::IR.VariableSet, v::Int)::Int
+  local var::Union{Nothing, IR.Variable} = get(variables, s.variables[v], nothing)
+  (var === nothing || var.attributes.start === nothing) && return 2
+  return var.attributes.fixed isa IR.BOOLEAN && var.attributes.fixed.value ? 0 : 1
 end
 
 "`propagatedValues`' step: variable `c` known, the rows that then read one unknown queued."
@@ -781,7 +804,8 @@ The dummy derivatives (Mattsson-Söderlind): level by level from the highest, th
 equations (in their highest form, then one differentiation less, while still differentiated)
 and as candidates the highest derivatives they read (then the chosen ones one differentiation
 less), a regular choice of as many candidates as equations per independent block
-(`chooseDummies`). Throws NotHandled where a StateSelect.always variable would have to become
+(`chooseDummies`; `start` takes the start values carried through the explicit relations where
+a choice made that point). Throws NotHandled where a StateSelect.always variable would have to become
 a dummy. With OMBACKEND_DYNAMIC_STATE_SETS, a variable without a StateSelect is ranked as
 OpenModelica ranks it (`declaredClasses`), and a block whose choice depends on the state adds
 its sets (`dynamicSets`) to `sets`, those of derivative levels linked (`linkSets`). `trace`
@@ -791,7 +815,9 @@ gets each block: its level (1 the highest derivatives), rows, candidates and dum
 function dummyDerivatives(s::Structure, partition::IR.Partition, differentiated::Dict{Int, Vector{IR.Equation}},
                           variables::IR.VariableSet, functions::Vector{IR.ModelicaFunction};
                           sets::Vector{DynamicSet} = DynamicSet[],
-                          trace::Union{Nothing, Vector{BlockTrace}} = nothing)::Set{Int}
+                          trace::Union{Nothing, Vector{BlockTrace}} = nothing,
+                          start::Base.RefValue{Union{Nothing, StartValues}} =
+                            Ref{Union{Nothing, StartValues}}(nothing))::Set{Int}
   local functionsByName = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in functions)
   local values = StartValues(variables, functions; equations = vcat(partition.equations, partition.initialEquations))
   local generic = Ref{Union{Nothing, StartValues}}(nothing)
@@ -813,7 +839,7 @@ function dummyDerivatives(s::Structure, partition::IR.Partition, differentiated:
         throw(NotHandled("dummy derivatives: $(length(blockRows)) differentiated equations and $(length(blockColumns)) derivatives in a block"))
       local classes = choiceClasses(s, blockColumns, aliasClass, declared, natural)
       local chosen = chooseDummies(s, blockRows, blockColumns, partition, differentiated, variables, functionsByName, values,
-                                   classes, natural, generic)
+                                   classes, natural, generic, start)
       append!(chosenLevel, chosen)
       trace === nothing || push!(trace, BlockTrace(level, blockRows, blockColumns, chosen))
       dynamic && append!(sets, dynamicSets(s, level, blockRows, blockColumns, chosen, classes, partition, differentiated,
@@ -832,6 +858,90 @@ function dummyDerivatives(s::Structure, partition::IR.Partition, differentiated:
   end
   return dummies
 end
+
+"""
+    CarriedStarts(values, aliased)
+
+The start values carried through the explicit relations for the continuous variables that declare no start
+(`carriedStarts`; finite values other than 0), and those of them whose alias set (`aliasRoots`: `a = b`, `a = -b`)
+holds a variable with a declared start: their value is that alias's start, which the model gives (a tool's alias
+set has one start), where another's is an estimate.
+"""
+struct CarriedStarts
+  values::Dict{Symbol, Float64}
+  aliased::Set{Symbol}
+end
+
+CarriedStarts() = CarriedStarts(Dict{Symbol, Float64}(), Set{Symbol}())
+
+"""
+    carriedStarts(s, partition, differentiated, variables, functions, start) -> CarriedStarts
+
+The start values carried through the explicit relations (`propagatedValues` without `generic`; `start` holds the
+point where the choice of dummies made it) of the continuous variables that declare no start: an estimate of the
+initial point where the model gives none, the guesses the commit writes (`applyCarried!`). MSL SpringDamperSystem:
+the fixed start is on `body1.r_0`; its alias `frame_a.r_0`, whose elements a state set selects, and the damper's
+state `s = length` declare none: from 0 the initial system's residuals are not finite, and `r_0[2]`, solved from the
+distance, takes the other root.
+"""
+function carriedStarts(s::Structure, partition::IR.Partition, differentiated::Dict{Int, Vector{IR.Equation}},
+                       variables::IR.VariableSet, functions::Vector{IR.ModelicaFunction},
+                       start::Base.RefValue{Union{Nothing, StartValues}})::CarriedStarts
+  local carried::CarriedStarts = CarriedStarts()
+  local open::Vector{Symbol} = Symbol[name for name in s.variables if declaresNoStart(get(variables, name, nothing))]
+  isempty(open) && return carried
+  local root::Vector{Int} = aliasRoots(s, partition)
+  local declared::Set{Int} =
+    Set{Int}(root[v] for v in eachindex(s.variables) if declaresStart(get(variables, s.variables[v], nothing)))
+  if start[] === nothing
+    local values::StartValues =
+      StartValues(variables, functions; equations = vcat(partition.equations, partition.initialEquations))
+    local byName::Dict{Symbol, IR.ModelicaFunction} = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in functions)
+    start[] = propagatedValues(s, partition, differentiated, byName, values, naturalDerivatives(s); generic = false)
+  end
+  local point::StartValues = something(start[])
+  for name in open
+    local value::Union{Nothing, Float64} = get(point.cache, name, nothing)
+    (value === nothing || !isfinite(value)) && continue
+    value == 0.0 || (carried.values[name] = value)
+    root[s.index[name]] in declared && push!(carried.aliased, name)
+  end
+  return carried
+end
+
+"Whether `v` is a continuous Real variable with a start attribute."
+declaresStart(::Nothing)::Bool = false
+declaresStart(v::IR.Variable)::Bool =
+  v.ty isa IR.T_REAL && v.kind isa Union{IR.STATE, IR.ALGEBRAIC} && v.attributes.start !== nothing
+
+"Whether `v` is a continuous Real variable without a start attribute."
+declaresNoStart(::Nothing)::Bool = false
+declaresNoStart(v::IR.Variable)::Bool =
+  v.ty isa IR.T_REAL && v.kind isa Union{IR.STATE, IR.ALGEBRAIC} && v.attributes.start === nothing
+
+"""
+    applyCarried!(variables, carried) -> Nothing
+
+The carried start values (`carriedStarts`) written as the start (a guess, fixed is not set) of the variables that
+declare none, after the commit set the kinds: of the states, and of the variables with an alias that declares one
+(`aliased`: the model's start; a variable solved from others takes the root near it). Not of the others: a start
+attribute reads as declared to what follows (the derivatives' solve tries pivots at the given starts,
+`readsGivenStarts`), and an algebraic variable's estimate is not that. A state set's states take theirs from the
+candidates' carried starts (`dynamicSetParts`, `familyParts`).
+"""
+function applyCarried!(variables::IR.VariableSet, carried::CarriedStarts)::Nothing
+  for (name, value) in carried.values
+    local v::Union{Nothing, IR.Variable} = get(variables, name, nothing)
+    (v === nothing || v.attributes.start !== nothing) && continue
+    (v.kind isa IR.STATE || name in carried.aliased) || continue
+    v.attributes = withStart(v.attributes, IR.REAL(value))
+  end
+  return nothing
+end
+
+"`attributes` with the start `start`."
+withStart(a::IR.VariableAttributes, start::IR.Expression)::IR.VariableAttributes =
+  IR.VariableAttributes(start, a.fixed, a.nominal, a.min, a.max, a.unit, a.displayUnit, a.quantity, a.stateSelect)
 
 """
     naturalDerivatives(s) -> BitVector

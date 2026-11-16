@@ -54,8 +54,7 @@ the domain level (`domainSystem`), from which CodeGeneration's ArrayODEGen (_emi
   - When-equations as the flat model's (`_addWhen!`): their triggers the condition, sample() in it.
 
 Not (yet), NotSupported (the caller takes the scalarized path): array equations, algorithms, a
-when-equation of the passes' structural kinds, sample() outside a when-condition, a
-fixed start on a dummy state (the reduced initialization's), whole arrays in scalar equations,
+when-equation of the passes' structural kinds, sample() outside a when-condition, whole arrays in scalar equations,
 records of records through functions.
 =#
 
@@ -349,8 +348,13 @@ record's array field the value indexed.
 """
 function _subscriptedIRx(g::Gen, e::SC.ASUB, ctx::Ctx)::IR
   any((s::SC.Exp) -> s isa SC.WHOLE_DIMENSION || s isa SC.RANGE, e.subs) && ns("a slice of $(_str(e))")
-  local subs::Vector{IR} = IR[toIR(g, s, ctx) for s in e.subs]
   local base::SC.Exp = e.exp
+  #= an element of an element (`{{1.0, 2.0}, {3.0, 4.0}}[\$i1][\$i2]`, a matrix modifier over a component array): the
+     element at both subscripts =#
+  if base isa SC.ASUB && !any((s::SC.Exp) -> s isa SC.WHOLE_DIMENSION || s isa SC.RANGE, base.subs)
+    return _subscriptedIRx(g, SC.ASUB(base.exp, SC.Exp[base.subs; e.subs]), ctx)
+  end
+  local subs::Vector{IR} = IR[toIR(g, s, ctx) for s in e.subs]
   base isa SC.EXP_CREF && isempty(base.cref.subs) && return _elementRefIR(g, String(base.cref.sym), subs)
   base isa SC.DER && return _elementRefIR(g, String(base.cref.sym), subs; der = true)
   #= an element of pre() of an array (a function's array argument, `f(pre(state))`): pre() of the element =#
@@ -630,14 +634,17 @@ _eqText(@nospecialize(eq))::String = _str(eq)
 
 """
 Whether the initial equation `lhs = rhs` is an assignment, made once as an initial algorithm's (no unknown of the
-initialization's solve): a scalar discrete variable's initial value (`d = expr`, CDL Discrete's `y = y_start`, assigned
-after the solve), or a scalar parameter with fixed = false given the value of an expression of parameters (`p =
-expr`): MSL GlobalSeed's `id_impure = initializeImpureRandom(seed)`, an impure call the solve's Newton made at every
+initialization's solve): the initial value of a discrete variable, scalar or an array's element (`d = expr`, CDL
+Discrete's `y = y_start`, assigned after the solve), or such a parameter with fixed = false given the value of an
+expression of parameters (`p = expr`): MSL GlobalSeed's `id_impure = initializeImpureRandom(seed)`, an impure call the solve's Newton made at every
 evaluation, a new value each time (ImpureGenerator stalled). Not of free parameters the solve determines (a double
 exponential's `eta = exp(-T/tau1) - exp(-T/tau2)`); those an earlier such assignment gives are known.
 """
 function _initialAssignment(g::Gen, lhs::IR, rhs::IR)::Bool
-  (lhs isa Ref && !lhs.der && isempty(g.vars[lhs.name].dims)) || return false
+  (lhs isa Ref && !lhs.der) || return false
+  #= a scalar, or an element of an array by literal subscripts (an initial array equation, an element at a time) =#
+  local dims::Int = length(g.vars[lhs.name].dims)
+  (length(lhs.subs) == dims && all(x::IR -> x isa Lit, lhs.subs)) || return false
   local known::Function = (name::String) -> !(name in g.freeParams) ||
     any(a::AlgClass -> any(st::Stmt -> st isa SAssign && st.target.name == name, a.body), g.initAlgs)
   local reads::Vector{Ref} = accesses!(Ref[], rhs)
@@ -743,8 +750,26 @@ function _addEquation!(g::Gen, eq::SC.Equation, iterNames::Vector{String}, idom:
   ns("$(nameof(typeof(eq))) in the simulation code: $(_str(eq))")
 end
 
-"The triggers of a when-branch's condition (`SimCode.lowerArraySystem`: the vector of several, none the empty one; one itself)."
-_triggers(c::SC.Exp)::Vector{SC.Exp} = c isa SC.ARRAY_EXP ? c.elements : SC.Exp[c]
+"""
+The triggers of a when-branch's condition (`SimCode.lowerArraySystem`: the vector of several, none the empty one; one
+itself): an or of `change()` calls its terms (the condition of a lifted discrete cluster or algorithm with several
+relations, `Passes.changeCondition`: each change holds at its own event only, so the or rises where one of them does).
+"""
+function _triggers(c::SC.Exp)::Vector{SC.Exp}
+  c isa SC.ARRAY_EXP && return c.elements
+  local terms::Vector{SC.Exp} = SC.Exp[]
+  return c isa SC.LBINARY && _changeTerms!(terms, c) ? terms : SC.Exp[c]
+end
+
+"The terms of an or of `change()` calls, in order, into `terms`; false where `c` is no such or (`terms` then unused)."
+function _changeTerms!(terms::Vector{SC.Exp}, c::SC.Exp)::Bool
+  if c isa SC.CALL
+    (c.kind == SC.CALL_BUILTIN && c.name === :change) || return false
+    push!(terms, c)
+    return true
+  end
+  return c isa SC.LBINARY && c.op == SC.OP_OR && _changeTerms!(terms, c.exp1) && _changeTerms!(terms, c.exp2)
+end
 
 "Whether `e` is a reference: a variable, `der` of a state (an element of one too), as it is; no expression of it."
 _isReference(e::SC.Exp)::Bool = e isa Union{SC.EXP_CREF, SC.DER} || (e isa SC.ASUB && e.exp isa Union{SC.EXP_CREF, SC.DER})
@@ -791,7 +816,10 @@ function _addWhen!(g::Gen, eq::SC.WHEN_EQUATION, iterNames::Vector{String}, idom
         local stateRef::SC.Exp = SC.EXP_CREF(st.stateVar, SC.TYPE_REAL())
         local state::IR = toIR(g, isempty(st.subscripts) ? stateRef : SC.ASUB(stateRef, st.subscripts), ctx)
         (state isa Ref && g.vars[state.name].kind == :state) || ns("reinit of a non-state: $(_str(eq))")
-        push!(body, (:reinit, state, toIR(g, st.value, ctx)))
+        #= of a dynamic state set's state: the set's switch, in effect with the selection the body assigns =#
+        local ref::Union{Nothing, SC.IR.ComponentRef} = st.stateVar.ref
+        local switch::Bool = ref !== nothing && Passes.IndexReduction.isStateSetRef(ref)
+        push!(body, (switch ? :switch : :reinit, state, toIR(g, st.value, ctx)))
       elseif st isa Union{SC.ASSERT, SC.NORETCALL, SC.TERMINATE, SC.IF}
         push!(body, (:call, noTarget, _whenEffect(g, st, ctx)))
       else
@@ -974,6 +1002,61 @@ function _stmtIR(g::Gen, st::SC.Statement, ctx::Ctx)::Stmt
 end
 
 """
+The variables the branches of an if-equation on a variable condition assign, each with its left side: `v = e`, or an
+if-equation in a branch that assigns them likewise (MSL KinematicPTP's phases). The same variables in every branch
+and the else, each once; NotSupported otherwise.
+"""
+function _ifAssigned(eq::SC.INLINE_IF_EQUATION)::Dict{String, SC.Exp}
+  local bodies::Vector{Vector{SC.Equation}} = Vector{SC.Equation}[eq.branchesTrue; [eq.branchElse]]
+  local perBranch::Vector{Dict{String, SC.Exp}} = Dict{String, SC.Exp}[_bodyAssigned(body) for body in bodies]
+  for d in perBranch
+    Set(keys(d)) == Set(keys(perBranch[1])) ||
+      ns("if-equation on a variable condition: branches give different variables")
+  end
+  return perBranch[1]
+end
+
+"The variables the equations of one branch of an if-equation assign (`_ifAssigned`), each with its left side."
+function _bodyAssigned(body::Vector{SC.Equation})::Dict{String, SC.Exp}
+  local assigned::Dict{String, SC.Exp} = Dict{String, SC.Exp}()
+  local add::Function = (key::String, lhs::SC.Exp) -> begin
+    haskey(assigned, key) && ns("if-equation on a variable condition: two equations for $(key)")
+    assigned[key] = lhs
+  end
+  for b in body
+    if b isa SC.INLINE_IF_EQUATION
+      foreach(kv::Pair{String, SC.Exp} -> add(kv.first, kv.second), collect(_ifAssigned(b)))
+    elseif b isa SC.EQUATION && _isReference(b.lhs)
+      add(string(b.lhs), b.lhs)
+    else
+      ns("if-equation on a variable condition: branch equation $(_eqText(b))")
+    end
+  end
+  return assigned
+end
+
+"What the if-equation `eq` gives the variable `key` (`_ifAssigned`): `if c1 then e1 elseif ... else en`."
+function _ifRhs(g::Gen, eq::SC.INLINE_IF_EQUATION, key::String, ctx::Ctx)::IR
+  local rhs::IR = _bodyRhs(g, eq.branchElse, key, ctx)
+  for i in length(eq.conditions):-1:1
+    rhs = Op(:if, IR[toIR(g, eq.conditions[i], ctx), _bodyRhs(g, eq.branchesTrue[i], key, ctx), rhs])
+  end
+  return rhs
+end
+
+"What the equations of one branch give the variable `key`: its equation's right side, or a nested if-equation's."
+function _bodyRhs(g::Gen, body::Vector{SC.Equation}, key::String, ctx::Ctx)::IR
+  for b in body
+    if b isa SC.INLINE_IF_EQUATION
+      haskey(_ifAssigned(b), key) && return _ifRhs(g, b, key, ctx)
+    elseif b isa SC.EQUATION && string(b.lhs) == key
+      return toIR(g, b.rhs, ctx)
+    end
+  end
+  ns("if-equation on a variable condition: no equation for $(key)")
+end
+
+"""
 An if-equation: on conditions of parameters and iterators each instance its branch's equations; on a variable
 condition each variable its branches assign (`v = e` in every branch and the else) one class
 `v = if c1 then e1 elseif ... else en`.
@@ -996,26 +1079,11 @@ function _addIfEquation!(g::Gen, eq::SC.INLINE_IF_EQUATION, iterNames::Vector{St
     end
     return
   end
-  local keyed::Vector{Dict{String, SC.EQUATION}} = Dict{String, SC.EQUATION}[]
-  for body in bodies
-    local assigned::Dict{String, SC.EQUATION} = Dict{String, SC.EQUATION}()
-    for b in body
-      (b isa SC.EQUATION && _isReference(b.lhs)) || ns("if-equation on a variable condition: branch equation $(_eqText(b))")
-      local key::String = string(b.lhs)
-      haskey(assigned, key) && ns("if-equation on a variable condition: two equations for $(key)")
-      assigned[key] = b
-    end
-    push!(keyed, assigned)
-  end
-  all(d::Dict{String, SC.EQUATION} -> Set(keys(d)) == Set(keys(keyed[1])), keyed) ||
-    ns("if-equation on a variable condition: branches give different variables")
-  for key in sort!(collect(keys(keyed[1])))
+  local assigned::Dict{String, SC.Exp} = _ifAssigned(eq)
+  for key in sort!(collect(keys(assigned)))
     local ctx::Ctx = Ctx(iters, Int[], Base.RefValue(0), initial)
-    local lhs::IR = toIR(g, keyed[1][key].lhs, ctx)
-    local rhs::IR = toIR(g, keyed[end][key].rhs, ctx)
-    for i in length(eq.conditions):-1:1
-      rhs = Op(:if, IR[toIR(g, eq.conditions[i], ctx), toIR(g, keyed[i][key].rhs, ctx), rhs])
-    end
+    local lhs::IR = toIR(g, assigned[key], ctx)
+    local rhs::IR = _ifRhs(g, eq, key, ctx)
     ctx.nsam[] == 0 || ns("sample() in an equation")
     push!(initial ? g.initClasses : g.classes,
           EqClass(lhs, rhs, nIter, idom, initial ? 0 : ctx.nrel[], "$(key) = if ... ($(_str(eq.conditions[1])))"))
@@ -1149,7 +1217,10 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
     length(elementNames) == n || ns("the elements of $(nm)")
     local vtype::Symbol = SC.valueType(sv.elementType)
     local perPart::Vector{Int} = Int[length(dims)]
-    local startOf::Function = () -> Float64[Float64(x) for x in _attributeValues(sv.attributes.start, n, 0.0, "start", elementNames[1])]
+    #= without a start attribute: 0, an enumeration its first literal (MLS 4.9.5) =#
+    local defaultStart::Float64 = sv.elementType isa SC.TYPE_ENUM ? 1.0 : 0.0
+    local startOf::Function = () -> Float64[Float64(x) for x in
+      _attributeValues(sv.attributes.start, n, defaultStart, "start", elementNames[1])]
     local fixedOf::Function = (default::Bool) -> Bool[x for x in _attributeValues(sv.attributes.fixed, n, default, "fixed attribute", elementNames[1])]
     local startOrRule::Function = () -> try
       startOf()
@@ -1209,7 +1280,6 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
     elseif category in (:algebraic, :derivative, :dummyState)
       vtype == :real || ns("the algebraic variable $(nm), not Real")
       local fixed::Vector{Bool} = fixedOf(false)
-      category == :dummyState && any(fixed) && ns("a fixed start on the dummy state $(nm)")
       local algStarts::Vector{Float64} = startOf()
       any(fixed) && push!(fixedNonStates, (nm, Any[x for x in fixed], Any[x for x in algStarts]))
       g.vars[nm] = VarInfo(:alg, dims, perPart, g.nAlg, :real, SimVariable(sv, elementNames, nothing))

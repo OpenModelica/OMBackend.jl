@@ -66,6 +66,7 @@ lowering's transformations), then clock partitioning and the clocked lowering, t
 Causalize passes (the derivative variables in the place of its detection of the states).
 """
 const PIPELINE = Pair{String, Base.Function}[
+  "removeEmptyEquations" => removeEmptyEquations!,
   "removeSmooth" => removeSmooth!,
   "decomposeRecordEquations" => decomposeRecordEquations!,
   "liftAlgorithms" => liftAlgorithms!,
@@ -126,6 +127,8 @@ function runPassesKeepingArrays!(model::IR.Model)::IR.Model
     name == "expandEquations" && (model = IndexReduction.rollArrayEquations!(model))
     model = pass(model)
   end
+  #= the array form has Real values only: what is left of Complex ones is their projections =#
+  model = lowerComplexProjections!(model)
   return IndexReduction.splitStaticIfs!(model)
 end
 

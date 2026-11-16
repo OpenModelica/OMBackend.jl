@@ -145,11 +145,11 @@ function causalSchedule!(g::Gen; keepsArrays::Bool, full::Bool, fixedMask::Vecto
     println("[arraycode] ", length(g.classes), " classes, ", length(el.class), " instances; loop blocks (instances => count): ",
             sort!(collect(blockSizes)), "; ", length(loops.families), " families")
   end
-  #= algebraic loops in the array code only where it keeps arrays (a class of more than one instance, and `keepsArrays`:
-     not only rolled components of a model of index 1): a model without arrays gains nothing from it, and the scalar
-     path solves its loops (tearing) with its initialization and events =#
+  #= whether the model keeps arrays (a class of more than one instance, and `keepsArrays`: not only rolled components
+     of a model of index 1). Its algebraic loops are the array code's either way: a model of scalars is one of
+     arrays of no dimensions (a loop that does not start declines the array code at the translate,
+     `OMBackend._arrayStartFailure`) =#
   local hasArrays::Bool = keepsArrays && any(c::EqClass -> size(c.domain, 2) > 1, g.classes)
-  (isempty(loops.blocks) || hasArrays) || ns("algebraic loop in a model without arrays (the scalar path solves it)")
   local large::BitVector = _largeBlocks(g, loops, matchRow)
   local deps::Union{Nothing, Vector{Vector{Int}}} = _stateDeps(el, matchRow, batches, producer, loops, g.nStates)
   local pattern::Union{Nothing, Tuple{Vector{Int}, Vector{Int}}} = _jacobianPattern(el, matchRow, deps, g.nStates)

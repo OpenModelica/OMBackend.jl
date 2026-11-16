@@ -450,14 +450,15 @@ whose relations all are (no events, MLS 8.5); of a record value (the variable is
 result in a branch (a hoisted call equation, an assert's condition: `isNoResultCall`); in
 the branches of a lifted one, one whose condition does not depend on time (a state-dependent
 condition crosses in both directions: its branches are evaluated as a continuous product); in a
-for-equation (arrays kept), one that reads its iterator (the array code reads it inline; the scalar
-path takes such a model from the frontend's scalarized flatten). The when-equations (their code
-generation evaluates them in place), the asserts (checked where they are, not in the right-hand side: a Boolean
-if-expression of a condition lifted as a Real variable was read as a Boolean) and algorithms are left.
+for-equation (arrays kept), one that reads its iterator (the array code reads it inline; where such a
+model is scalarized after its reduction, `liftIfExpressions!(model, selected)` lifts it then). The
+when-equations (their code generation evaluates them in place), the asserts (checked where they are, not in the
+right-hand side: a Boolean if-expression of a condition lifted as a Real variable was read as a Boolean) and
+algorithms are left.
 """
 function liftIfExpressions!(model::IR.Model)::IR.Model
   for (variables, p) in partitionsWithVariables(model)
-    local lifter = IfExpressionLifter(variables, Dict{Any, IR.CREF}(), IR.Equation[], Ref(0))
+    local lifter = IfExpressionLifter(variables)
     for eq in p.equations
       (eq isa IR.WHEN_EQUATION && eq.kind !== IR.STRUCTURAL_WHEN) && continue
       eq isa IR.ASSERT_EQUATION && continue
@@ -470,6 +471,24 @@ function liftIfExpressions!(model::IR.Model)::IR.Model
     end
     append!(p.equations, lifter.equations)
   end
+  return model
+end
+
+"""
+    liftIfExpressions!(model, selected) -> Model
+
+The if-expressions of the equations `selected` (their positions in the model's continuous partition) lifted as
+`liftIfExpressions!(model)` lifts them, the other equations left as they are: for the equations a model reduced with
+its arrays kept had in for-equations, whose if-expressions on the iterator stayed inline until it was scalarized.
+"""
+function liftIfExpressions!(model::IR.Model, selected::Vector{Int})::IR.Model
+  isempty(selected) && return model
+  local p::IR.Partition = only(model.continuous)
+  local lifter = IfExpressionLifter(model.variables)
+  for i in selected
+    mapRoots!((@nospecialize(e::IR.Expression)) -> lift(lifter, e, false), p.equations[i])
+  end
+  append!(p.equations, lifter.equations)
   return model
 end
 
@@ -508,6 +527,15 @@ struct IfExpressionLifter
   tick::Base.RefValue{Int}
 end
 
+"A lifter of `variables`, numbering after the lifted if-expressions they already have (`ifEq_tmp<k>`)."
+function IfExpressionLifter(variables::IR.VariableSet)::IfExpressionLifter
+  local next::Int = 0
+  while haskey(variables, Symbol("ifEq_tmp", next))
+    next += 1
+  end
+  return IfExpressionLifter(variables, Dict{Any, IR.CREF}(), IR.Equation[], Ref(next))
+end
+
 """
     lift(lifter, e, timeDependentOnly)
 
@@ -536,10 +564,13 @@ function lift(lifter::IfExpressionLifter, @nospecialize(e::IR.Expression), timeD
   existing === nothing || return existing
   local name = Symbol("ifEq_tmp", lifter.tick[])
   lifter.tick[] += 1
-  local v = IR.CREF(IR.ComponentRef(name, IR.T_REAL()), IR.T_REAL())
-  push!(lifter.variables, IR.Variable(name, IR.T_REAL(), IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION,
+  #= an array-valued if-expression (arrays kept): an array variable, its branches array equations =#
+  local ty::IR.ModelicaType = e.ty isa IR.T_ARRAY ? e.ty : IR.T_REAL()
+  local v = IR.CREF(IR.ComponentRef(name, ty), ty)
+  push!(lifter.variables, IR.Variable(name, ty, IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION,
                                       false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :liftIfExpressions))
-  local assign = x -> IR.Equation[IR.SCALAR_EQUATION(v, x, IR.T_REAL(), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES)]
+  local assign = x -> IR.Equation[ty isa IR.T_ARRAY ? IR.ARRAY_EQUATION(v, x, ty, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES) :
+                                  IR.SCALAR_EQUATION(v, x, IR.T_REAL(), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES)]
   push!(lifter.equations, IR.IF_EQUATION(IR.EquationBranch[IR.EquationBranch(c, assign(x)) for (c, x) in zip(conditions, values)],
                                          assign(elseValue), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
   lifter.lifted[key] = v
@@ -599,7 +630,7 @@ function expandRecordFieldArrays!(variables::IR.VariableSet)::Nothing
      previous backend's). =#
   local groups = Dict{String, Tuple{IR.ComponentRef, IR.Variable, Dict{Vector{Int}, IR.Expression}}}()
   for v in variables
-    if !isRecordFieldArray(v.cref)
+    if !isRecordFieldArray(v.cref) || isOfComponentArray(v)
       push!(out, v)
     elseif !isempty(v.cref.parts[end].subscripts)
       push!(out, v)
@@ -624,6 +655,14 @@ function expandRecordFieldArrays!(variables::IR.VariableSet)::Nothing
   foreach(v -> push!(variables, v), out)
   return nothing
 end
+
+"""
+Whether the array `v` holds the dimensions of a component array besides its own (`cylinders.R.T` of
+`Shape cylinders[3]`, arrays kept: `Real[3, 3, 3]`, the field's own type `Real[3, 3]`). Such an array stays one
+variable: its elements by the field's own type alone would be those of one component.
+"""
+isOfComponentArray(v::IR.Variable)::Bool =
+  v.ty isa IR.T_ARRAY && length(IR.dimensions(v.ty)) > length(IR.dimensions(v.cref.parts[end].ty))
 
 """
 Whether `cref` is an array field of a record: its last part of an array type, the one before of a record type; not a
@@ -940,11 +979,18 @@ end
 
 """
 The reduction `reducer` of `elements` as a chain of `+` or `*`, or nested `min`/`max` calls (of
-`attributes`); `nothing` for none.
+`attributes`). Of no elements: `sum` is 0 and `product` 1 of a Real or Integer result (MLS 10.3.4; a tank's
+`sum(topPorts.m_flow)` without top ports, arrays kept: `sum({})` reached the generated code as `sum(Any[])`, MSL
+AST_BatchPlant's tank tests), `nothing` for `min`, `max` and another type.
 """
 function foldReduction(reducer::Symbol, elements::Vector{IR.Expression}, ty::IR.ModelicaType,
                        attributes::IR.CallAttributes)::Union{Nothing, IR.Expression}
-  isempty(elements) && return nothing
+  if isempty(elements)
+    reducer in (:sum, :product) || return nothing
+    ty isa IR.T_REAL && return IR.REAL(reducer === :sum ? 0.0 : 1.0)
+    ty isa IR.T_INTEGER && return IR.INTEGER(reducer === :sum ? 0 : 1)
+    return nothing
+  end
   local acc = elements[1]
   for x in elements[2:end]
     acc = reducer === :sum ? IR.BINARY(acc, IR.ADD, x, ty) :

@@ -142,7 +142,8 @@ end
 The body equation `body` solved in array form for the derivative its iterations `rows` (element view row => the
 derivative solved from it) are solved for: the reference in the body that is each row's derivative at its iteration
 (one for all of them, subscripted by the iterators, each once), the coefficient as the element view's (an expression
-where it reads only parameters too: `literalCoefficients = false`), the value `solvedValue`'s. NotHandled where the
+where it reads only parameters too: `literalCoefficients = false`; the literal it is at every iteration,
+`rowLiteral`), the value `solvedValue`'s. NotHandled where the
 rows solve for references the body does not have alike.
 """
 function solvedTemplate(body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}, rows::Vector{Pair{Int, Symbol}},
@@ -173,7 +174,28 @@ function solvedTemplate(body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}, row
     throw(NotHandled("a derivative solved through $(cref.cref.name), not subscripted by its iterators $(iterators)"))
   local c::Union{Nothing, IR.Expression} = partialDerivative(canonical, cref.cref.name, functions; derivativeCalls = true)
   c === nothing && throw(NotHandled("the coefficient of $(cref.cref.name) in $(equationLine(body))"))
-  return SolvedTemplate(cref, iterators, solvedValue(canonical, cref.cref.name, c))
+  return SolvedTemplate(cref, iterators, solvedValue(canonical, cref.cref.name, rowLiteral(c, rows, valuesAt, E)))
+end
+
+"""
+    rowLiteral(c, rows, valuesAt, E) -> Expression
+
+The coefficient `c` of a body's derivative as the literal it is at every one of its iterations `rows`, where they
+all give the same one; else `c`. A product rule's terms on a matrix read by the iterator (FreeMotion's
+`w = 2 * (M(Q) * der(Q))` differentiated: `0.0 * der(Q[k])` per element) are zero only once the iterator has a value:
+in array form the coefficient was an expression, the value divided by it, and the element view's value (the literal's
+reciprocal) was another form.
+"""
+function rowLiteral(c::IR.Expression, rows::Vector{Pair{Int, Symbol}}, valuesAt::Function, E::Elements)::IR.Expression
+  isLiteral(c) && return c
+  local literal::Union{Nothing, IR.Expression} = nothing
+  for (r, _) in rows
+    local atRow::IR.Expression = foldTree(equationExpression(c, valuesAt(r), E))
+    isLiteral(atRow) || return c
+    (literal === nothing || literalValue(literal) == literalValue(atRow)) || return c
+    literal = atRow
+  end
+  return something(literal, c)
 end
 
 """
@@ -224,8 +246,10 @@ a caller that goes on with `model` passes a copy. The decisions are `solveDeriva
 view (`derivativeSolution`; `known` as there); each body solved once for the derivative its iterations determine
 (`solvedTemplate`), the values resolved (`resolvedTemplates`) and put in. Checked: the result scalarized is the
 element view solved. NotHandled where a derivative array's elements are solved from different bodies or only some of
-them, a body's iterations for different references, through others' values (`solveThroughSolved!`), from an element
-of an array equation, or where the check fails.
+them, a body's iterations for different references, from an element of an array equation, or where the check
+fails. A derivative the element view solved with the values of others put into its equation (`solveThroughSolved!`:
+a stray inductance in series with a main one, MSL Machines' air gaps) is solved from its body with the others'
+values put in (`withTemplateValues`).
 """
 function solvedInArrays(model::IR.Model;
                         known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::Tuple{IR.Model, Vector{Symbol}}
@@ -311,6 +335,51 @@ function readChain(target::Symbol, E::Elements, templates::Dict{Symbol, SolvedTe
 end
 
 """
+    throughPartners(solution, E, bodyOf) -> Dict{Symbol, Set{Symbol}}
+
+The solved derivatives (arrays or scalars, the keys of `bodyOf`) the element view solved with the values of others
+put into their equation (`DerivativeSolution.through`), each with those others (arrays or scalars). NotHandled,
+naming the arrays to split, where only some elements of an array are solved so.
+"""
+function throughPartners(solution::DerivativeSolution, E::Elements,
+                         bodyOf::Dict{Symbol, Tuple{Int, Vector{Int}}})::Dict{Symbol, Set{Symbol}}
+  local partners::Dict{Symbol, Set{Symbol}} = Dict{Symbol, Set{Symbol}}()
+  isempty(solution.through) && return partners
+  local mixed::Vector{Symbol} = Symbol[]
+  for target in keys(bodyOf)
+    local names::Vector{Symbol} = haskey(E.elements, target) ? E.elements[target] : Symbol[target]
+    local n::Int = count(d::Symbol -> haskey(solution.through, d), names)
+    n == 0 && continue
+    if n != length(names)
+      push!(mixed, target)
+      continue
+    end
+    local others::Set{Symbol} = Set{Symbol}()
+    for d in names, o in solution.through[d]
+      push!(others, haskey(E.array, o) ? E.array[o][1] : o)
+    end
+    partners[target] = others
+  end
+  #= of a cycle of two the element view solves the one first by name again, per element: an array whose elements
+     meet partners of other names (a rotation, MSL Machines' `i_ms = i_ss + RotationMatrix * i_rr`) is split =#
+  isempty(mixed) ||
+    throw(NotHandled("derivative arrays solved through the values of others for some of their elements " *
+                     "($(length(mixed)) arrays: slicing)", sort!(mixed), Int[]))
+  return partners
+end
+
+"The body `body` with the values of the solved derivatives `others` put in at their references (`instantiated`)."
+function withTemplateValues(body::IR.SCALAR_EQUATION, others::Set{Symbol}, E::Elements,
+                            templates::Dict{Symbol, SolvedTemplate})::IR.SCALAR_EQUATION
+  local insert::Function = (x::IR.Expression) -> begin
+    local s::Union{Nothing, Symbol} = solvedTarget(x, E, templates)
+    return (s !== nothing && s in others) ? instantiated(templates[s], x, templates[s].value) : x
+  end
+  return IR.SCALAR_EQUATION(IR.mapExp(insert, body.lhs), IR.mapExp(insert, body.rhs), body.ty, body.source,
+                            body.attributes)
+end
+
+"""
     solvedInArraysOnce(model, view, solution) -> Tuple{IR.Model, Vector{Symbol}}
 
 `solvedInArrays` without splitting, of the model's element view `view` and its derivatives' solution `solution`:
@@ -318,8 +387,6 @@ NotHandled, naming the arrays or for-equations to split, where solved differentl
 """
 function solvedInArraysOnce(model::IR.Model, view::Scalarized, solution::DerivativeSolution)::Tuple{IR.Model, Vector{Symbol}}
   local elementPartition::IR.Partition = view.model.continuous[1]
-  isempty(solution.throughSolved) ||
-    throw(NotHandled("derivatives solved through the values of others ($(first(sort!(collect(solution.throughSolved)))))"))
   local E::Elements = view.elements
   local partition::IR.Partition = model.continuous[1]
   local rowsOf::Dict{Tuple{Int, Vector{Int}}, Vector{Int}} = Dict{Tuple{Int, Vector{Int}}, Vector{Int}}()
@@ -350,12 +417,31 @@ function solvedInArraysOnce(model::IR.Model, view::Scalarized, solution::Derivat
   local functions::Dict{Symbol, IR.ModelicaFunction} = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
   local parameters::StartValues = StartValues(model.variables, model.functions; parametersOnly = true)
   local templates::Dict{Symbol, SolvedTemplate} = Dict{Symbol, SolvedTemplate}()
+  local partners::Dict{Symbol, Set{Symbol}} = throughPartners(solution, E, bodyOf)
   for (target, key) in bodyOf
+    haskey(partners, target) && continue
     local rows::Vector{Pair{Int, Symbol}} = solvedRows[key]
     local (body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}) = templateBody(partition, key)
     #= a body its iterations solve for different references, or not in array form: unrolled (slicing) =#
     try
       templates[target] = solvedTemplate(body, iterators, rows, view, E, model, functions, parameters)
+    catch err
+      (err isa NotHandled && !isempty(iterators)) || rethrow()
+      push!(splitEquations, key[1])
+    end
+  end
+  #= then those solved with the values of others put into their body (`solveThroughSolved!`): the body with the
+     others' templates' values put in, as the element view puts their matched values in, solved the same way =#
+  for target in sort!(collect(keys(partners)))
+    local key::Tuple{Int, Vector{Int}} = bodyOf[target]
+    key[1] in splitEquations && continue
+    local others::Set{Symbol} = partners[target]
+    all(o::Symbol -> haskey(templates, o), others) ||
+      throw(NotHandled("derivatives solved through the values of others that have no value in array form ($(target))"))
+    local (body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}) = templateBody(partition, key)
+    local substituted::IR.SCALAR_EQUATION = withTemplateValues(body, others, E, templates)
+    try
+      templates[target] = solvedTemplate(substituted, iterators, solvedRows[key], view, E, model, functions, parameters)
     catch err
       (err isa NotHandled && !isempty(iterators)) || rethrow()
       push!(splitEquations, key[1])

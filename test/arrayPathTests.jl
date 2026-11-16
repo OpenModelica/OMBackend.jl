@@ -143,6 +143,53 @@ end
     @test OMBackend.simulateModel(name; tspan = (0.0, 0.4)).retcode == ReturnCode.Success
   end
 
+  @testset "Initial array equations: for-equations over their elements (rollLeftArrayEquations!)" begin
+    #= of references, of an inlined call against a literal (MSL Body: zeros(3) = equalityConstraint(Q, Q_start)), of a
+       call that is not inlined (its result subscripted per element); q(1) = q0 exp(-1) =#
+    for m in ("ArrayPath.ArrayInitialRefs", "ArrayPath.ArrayInitialCall", "ArrayPath.ArrayInitialLoopCall")
+      local (s, a, _) = _bothWays(m, ["q[1]", "q[2]"]; reltol = 1e-9, abstol = 1e-9)
+      @test maximum(abs.(a .- [exp(-1), 2 * exp(-1)])) < 1e-6
+      @test maximum(abs.(s .- a)) < 1e-6
+    end
+    #= of a parameter array with fixed = false and of a discrete array: assignments of the initialization, an element
+       at a time (no residual solves them); q' = -p q, d doubled at 0.5 =#
+    local (s, a, sol) = _bothWays("ArrayPath.ArrayInitialFree", ["q[1]", "q[2]", "d[1]", "d[2]"]; reltol = 1e-9, abstol = 1e-9)
+    @test maximum(abs.(a .- [exp(-1), exp(-2), 6, 8])) < 1e-6 && maximum(abs.(s .- a)) < 1e-6
+    @test OMBackend.getVariableValues(sol, "d[2]")[1] == 4
+  end
+
+  @testset "The step after an event, a singular Jacobian at the start values, a coefficient of zero" begin
+    local tight::NamedTuple = (reltol = 1e-9, abstol = 1e-9)
+    #= y follows u with Td = 1e-4, u stops rising at 0.2: a = der(y) = 20 exp(-(t - 0.2) / Td). The step sized before
+       the event crossed the transient at once: a(0.2003) read 18.9 (`_restartStep!`) =#
+    local step::String = _arrayPathTranslate("ArrayPath.StepAfterEvent"; scalarized = false)
+    @test _arrayPathTaken(step)
+    local s1 = OMBackend.simulateModel(step; tspan = (0.0, 0.3), reltol = 1e-8, abstol = 1e-10)
+    @test s1.retcode == ReturnCode.Success
+    @test [s1(t; idxs = :a) for t in (0.2003, 0.2005, 0.21)] ≈ [20 * exp(-3), 20 * exp(-5), 0.0] atol = 1e-3
+    #= a state following its input through a gain of 15000 into a limit, no event at the limit: the solver's own
+       estimate of the first step after the slope's change is 0.01 s, the output at its limit after 2e-6 s; x stayed
+       on the input, 5.32 at 0.11 (the values: this model at a tolerance of 1e-10) =#
+    local kink::String = _arrayPathTranslate("ArrayPath.HighGainKink"; scalarized = false)
+    @test _arrayPathTaken(kink)
+    local s2 = OMBackend.simulateModel(kink; tspan = (0.0, 0.11), reltol = 1e-6, abstol = 1e-8)
+    @test s2.retcode == ReturnCode.Success
+    @test [s2(t; idxs = :x) for t in (0.101, 0.105, 0.11)] ≈ [0.6116052, 1.8580219, 3.4969888] atol = 1e-4
+    #= (v[k] + i[k])^3 = P in a loop through the elements, the start values zero: its rows of the Jacobian are zero
+       there. The loop was never solved, its unknowns NaN and the run a Success (`_blockJacobian!`: a least-norm step;
+       `_checkBlocksSolved`) =#
+    local i0::Float64 = 1 / 1.05
+    local (s, a, sol) = _bothWays("ArrayPath.SingularStart", ["v[1]", "i[1]", "v[5]", "x"]; tight...)
+    @test a ≈ [2 - i0, i0, 2 - i0, i0 * (1 - exp(-1))] atol = 1e-7
+    @test maximum(abs.(s .- a)) < 1e-7
+    @test all(b -> b.solved && b.failures == 0, sol.prob.p.blocks) && !isempty(sol.prob.p.blocks)
+    #= i[k] * R[k] = v[k] - vi[k] with R = {0, 0, 1}: not solved for i[k] where R[k] is 0 (0 / 0 from the first
+       evaluation on; `InstanceTable.vanishing`) =#
+    local (sz, az, _) = _bothWays("ArrayPath.ZeroCoefficient", ["v[1]", "v[2]", "v[3]"]; tight...)
+    @test az ≈ [exp(-0.5), exp(-0.5), exp(-1 / 3)] atol = 1e-7
+    @test maximum(abs.(sz .- az)) < 1e-7
+  end
+
   @testset "Initialization, sample, static if, discrete equations, algorithms" begin
     for (m, names, T) in (("ArrayPath.InitSteady", ["x", "y"], 1.0),
                           ("ArrayPath.SampleZOH", ["x", "u", "k"], 1.0),
@@ -296,14 +343,128 @@ end
     @test w ≈ v .- x atol = 1e-12
   end
 
-  @testset "Outside the scope: scalarized as before" begin
-    #= a loop of a model without arrays (the scalar path solves it); a loop through a relation (events in a loop) =#
-    for model in ("ArrayPath.AlgebraicLoop", "ArrayPath.LoopWithEvent")
-      local name::String = _arrayPathTranslate(model; scalarized = false)
-      @test !_arrayPathTaken(name)
-      local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
-      @test sol.retcode == ReturnCode.Success
+  @testset "Models of scalars: algebraic loops, index above one, a clock; outside the scope: scalarized" begin
+    local tight::NamedTuple = (reltol = 1e-9, abstol = 1e-9)
+    #= a model without arrays is the array code's (its variables arrays of no dimensions): a loop of scalars
+       (y = 0.75 x, z = 0.25 x, x' = -0.75 x), a nonlinear one, an index of two reduced in the array form
+       ((m1 + m2) x1'' = -k x1). Declined before by policy ("algebraic loop in a model without arrays", "no
+       for-equations or array equations over continuous arrays, of index above one": 69 MSL 4.1.0 models) =#
+    local (s, a, _) = _bothWays("ArrayPath.AlgebraicLoop", ["x", "y", "z"]; tight...)
+    @test a ≈ exp(-0.75) .* [1.0, 0.75, 0.25] atol = 1e-7
+    @test maximum(abs.(s .- a)) < 1e-7
+    local (sn, an, _) = _bothWays("ArrayPath.ScalarLoop", ["x", "y", "z"]; tight...)
+    @test an[2] + an[3]^3 ≈ an[1] atol = 1e-9
+    @test an[2] - an[3] ≈ 0.5 * an[1] atol = 1e-9
+    @test maximum(abs.(sn .- an)) < 1e-7
+    local (s2, a2, _) = _bothWays("ArrayPath.ScalarIndexTwo", ["x1", "x2"]; tight...)
+    @test a2 ≈ [cos(sqrt(10 / 3)), cos(sqrt(10 / 3))] atol = 1e-7
+    @test maximum(abs.(s2 .- a2)) < 1e-7
+    #= a clocked partition of index 1 (lowered to a when-equation on sample()): ticks at 0, 0.1, 0.2 before 0.25.
+       Declined before ("index 1 with clocked partitions": 57 MSL 4.1.0 models) =#
+    local (sc, ac, _) = _bothWays("ArrayPath.ClockedSampleHold", ["xs", "xd", "y"]; tspan = (0.0, 0.25), tight...)
+    @test ac ≈ [exp(-0.2), exp(-0.1), exp(-0.1)] atol = 1e-7
+    @test maximum(abs.(sc .- ac)) < 1e-7
+    #= a loop through a relation (events in a loop): scalarized as before =#
+    local name::String = _arrayPathTranslate("ArrayPath.LoopWithEvent"; scalarized = false)
+    @test !_arrayPathTaken(name)
+    local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution =
+      OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    @test sol.retcode == ReturnCode.Success
+  end
+
+  @testset "Complex values: record equations in for bodies, array equations of records" begin
+    #= a record equation in a for body is the equations of its fields (`bodyRecordEquations`), a Complex one its real
+       and imaginary parts with the operator calls taken apart (`complexParts`); an array equation of Complex values
+       a for-equation of the parts (`elementLoop`), by its fields' arrays (`recordArrayEquations`) or an equation per
+       element (`recordElementEquations`). The array form of index reduction refused each ("a RECORD_EQUATION with
+       arrays kept", 49 MSL 4.1.0 models); `(-i0).re` in a branch of an if-expression failed on every route =#
+    local tight::NamedTuple = (reltol = 1e-9, abstol = 1e-9)
+    for (model, name, expected) in (("ArrayPath.RecordForBody", "x[1]", exp(-1.5)),
+                                    ("ArrayPath.RecordForSum", "x[2]", exp(-2.0)),
+                                    ("ArrayPath.RecordForIf", "x", exp(-1.0)),
+                                    ("ArrayPath.RecordComponents", "x", exp(-1.75)),
+                                    ("ArrayPath.ComplexArrays", "x[3]", exp(-1.0)))
+      local (s, a, _) = _bothWays(model, [name]; tight...)
+      @test a[1] ≈ expected atol = 1e-7
+      @test s[1] ≈ expected atol = 1e-7
     end
+    #= the parts of Complex operations, and the projections =#
+    local I::Module = OMBackend.OMJLIR
+    local complex::I.ModelicaType = I.T_RECORD(:Complex, I.Field[I.Field(:re, I.T_REAL()), I.Field(:im, I.T_REAL())])
+    local z::I.Expression = I.CREF(I.ComponentRef(:z, complex), complex)
+    local negated::I.Expression = I.CALL(Symbol("Complex.'-'.negate"), I.Expression[z], complex, I.FUNCTION_CALL)
+    local parts = OMBackend.Passes.complexParts(negated)
+    @test parts !== nothing && I.toString(parts[1]) == "(-z.re)" && I.toString(parts[2]) == "(-z.im)"
+    local magnitude::I.Expression =
+      I.CALL(Symbol("Modelica.ComplexMath.'abs'"), I.Expression[z], I.T_REAL(), I.FUNCTION_CALL)
+    @test I.toString(OMBackend.Passes.complexProjection(magnitude)) == "(((z.re ^ 2.0) + (z.im ^ 2.0)) ^ 0.5)"
+    @test OMBackend.Passes.complexParts(I.CALL(:f, I.Expression[z], complex, I.FUNCTION_CALL)) === nothing
+  end
+
+  @testset "Derivatives solved with the value of another put in; the sum of an element-wise power" begin
+    #= der(is) and der(psi) read each other: the element view solves one from its equation with the other's value put
+       in (`solveThroughSolved!`), the array form from the body with the other's template put in
+       (`withTemplateValues`). Refused before ("derivatives solved through the values of others": 57 MSL 4.1.0 models
+       behind it, the Machines among them) =#
+    local tight::NamedTuple = (reltol = 1e-9, abstol = 1e-9)
+    local a::Float64 = 2 / 1.1
+    local (s, v, _) = _bothWays("ArrayPath.DerivativeTwoCycle", ["is[1]", "psi[2]"]; tight...)
+    @test v[1] ≈ (a * sin(1.0) - cos(1.0) + exp(-a)) / (1.1 * (1 + a^2)) atol = 1e-7
+    @test maximum(abs.(s .- v)) < 1e-7
+    #= sum(i .^ 2 / m): an element of an element-wise power is the element's power (`scalarElement`) =#
+    local (sp, vp, _) = _bothWays("ArrayPath.ElementwisePowerSum", ["x"]; tight...)
+    @test vp[1] ≈ exp(-sqrt(14 / 3)) atol = 1e-7
+    @test sp[1] ≈ vp[1] atol = 1e-7
+  end
+
+  @testset "Scalarized by the backend: array targets of when-equations and of an algorithm's tuple" begin
+    #= models the array code does not take stay in the backend (its element view, no second flatten): `d = 2 * pre(d)`
+       in a when-equation is an assignment per element (`elementAssignments`), in the branches of an if too; the array
+       target of an algorithm's tuple stays its reference (`wholeTargets`). The element view gave both the array of
+       the elements as the target, which the when's and the tuple's translation refused. An initial array equation
+       `pre(s) = seedPair(seed)` has its elements in that orientation (as lowered it is `rhs = lhs`): with
+       `seedPair(seed)[k] = pre(s[k])` the scalarized model did not build =#
+    for (model, names, T, expected) in (("ArrayPath.WhenArrayTarget", ["d[1]", "d[2]"], 1.0, [6.0, 8.0]),
+                                        ("ArrayPath.WhenIfArrayTarget", ["d[1]", "d[2]"], 1.0, [8.0, 10.0]),
+                                        ("ArrayPath.TupleArrayTarget", ["r", "s[1]", "s[2]"], 0.9, [5.0, 3.0, 3.0]),
+                                        ("ArrayPath.PreArrayStart", ["r", "s[1]", "s[2]"], 0.9,
+                                         [2.000000005e9, 2.000000003e9, 3.0]))
+      #= the route of OM's translate (`translateReducedArrays`: `nothing` is its caller's second flatten) =#
+      local name::String = _arrayPathTranslate(model; scalarized = false)
+      local (fm, cache) = OMFrontend.instantiateSCodeToFM(model, _ARRAY_PATH_SCODE[]; scalarize = false)
+      @test OMBackend.translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache)) !== nothing
+      @test name in OMBackend.BACKEND_SCALARIZED_MODELS
+      #= switched off: `nothing` (the caller's scalarizing flatten), the reason recorded =#
+      withenv("OMBACKEND_BACKEND_SCALARIZATION" => "false") do
+        @test OMBackend.translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache)) === nothing
+        @test !(name in OMBackend.BACKEND_SCALARIZED_MODELS)
+        @test occursin("backend scalarization: switched off", OMBackend.scalarizedFallbackReason(name))
+      end
+      _arrayPathTranslate(model; scalarized = false)
+      local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution =
+        OMBackend.simulateModel(name; tspan = (0.0, T))
+      @test sol.retcode == ReturnCode.Success
+      @test _values(sol, names) ≈ expected atol = 1e-9
+    end
+  end
+
+  @testset "Scalarized by the backend: reductions of no elements, elements of a row of a table" begin
+    local I::Module = OMBackend.OMJLIR
+    #= sum and product of no elements are 0 and 1 (a tank's sum(topPorts.m_flow) without top ports: with the arrays
+       kept `sum({})` reached the generated code, MethodError zero(Any); MSL AST_BatchPlant's tank tests) =#
+    @test OMBackend.Passes.foldReduction(:sum, I.Expression[], I.T_REAL(), I.BUILTIN_CALL) === I.REAL(0.0)
+    @test OMBackend.Passes.foldReduction(:product, I.Expression[], I.T_INTEGER(), I.BUILTIN_CALL) === I.INTEGER(1)
+    @test OMBackend.Passes.foldReduction(:max, I.Expression[], I.T_REAL(), I.BUILTIN_CALL) === nothing
+    #= fire[ka + 1, :][2] is fire[ka + 1, 2] (a row of SVPWM's constant Boolean table by a discrete index: left
+       nested, the row's lookup was one term in the generated code, its second element a BoundsError) =#
+    local ka::I.Expression = I.CREF(I.ComponentRef(:ka, I.T_INTEGER()), I.T_INTEGER())
+    local table::I.Expression = I.CREF(I.ComponentRef(:fire, I.T_BOOLEAN()), I.T_BOOLEAN())
+    local row::I.Expression = I.SUBSCRIPTED(table, I.Subscript[I.INDEX(ka), I.WHOLE()], I.T_BOOLEAN())
+    local picked::I.Expression =
+      OMBackend.Passes.Evaluation.selectElement(row, I.Subscript[I.INDEX(I.INTEGER(2))], I.T_BOOLEAN())
+    @test picked isa I.SUBSCRIPTED && picked.exp === table && length(picked.subscripts) == 2
+    @test picked.subscripts[1] isa I.INDEX && picked.subscripts[1].exp === ka
+    @test picked.subscripts[2] isa I.INDEX && picked.subscripts[2].exp === I.INTEGER(2)
   end
 
   @testset "a when algorithm reading its target, reinit of elements, enumeration dimensions" begin
@@ -738,6 +899,74 @@ end
       @test at(es, "e1", [0.1, 0.7]) == [1.0, 3.0] && at(es, "e2", [0.1, 0.7]) == [2.0, 1.0]
       local vs = run("VarSubscript", scalarized)
       @test at(vs, "x[1]", T5) == [1.0, 12.0, 12.0, 32.0, 32.0] && at(vs, "x[2]", T5) == [2.0, 2.0, 22.0, 22.0, 42.0]
+    end
+  end
+
+  @testset "slices of component arrays, a start solution that fires whens, checked subscripts, enumeration starts" begin
+    local run = (model::String, scalarized::Bool; stop::Float64 = 1.0) -> begin
+      local n = _arrayPathTranslate("ArrayPath." * model; scalarized)
+      scalarized || @test _arrayPathTaken(n)
+      return OMBackend.simulateModel(n; tspan = (0.0, stop))
+    end
+    local at = (sol, var::String, ts::Vector{Float64}) -> begin
+      local v::Vector{Float64} = OMBackend.getVariableValues(sol, var)
+      return [v[findlast(<=(t + 1e-12), sol.t)] for t in ts]
+    end
+    #= a field of a connector array and of a model array through a whole slice (ac.pin[:].i, c[:].x) =#
+    local R = [1.0, 2.0, 4.0]
+    @test _values(run("SliceConnectors", false), ["load.q[1]", "load.q[2]", "load.q[3]"]) ≈
+      [(cos(k) - cos(k + 1)) / R[k] for k in 1:3] atol = 1e-6
+    @test _values(run("SliceCells", false), ["s"]) ≈ [2 * sum((1 - exp(-k)) / k for k in 1:3)] atol = 1e-6
+    #= the binding of a field of a model array is an equation over the elements (it stays on the merged variable) =#
+    local bc = run("BindCells", false)
+    @test _values(bc, ["c[2].a", "c[3].b", "y[1]"]) ≈ [exp(-4), 6 * exp(-6), 3 * exp(-2)] atol = 1e-6
+    #= a modifier over a model array on an array field is each element's value (a constructor, a matrix); an array
+       field bound in the class is an array equation in the for-equation over the elements, rolled =#
+    @test _values(run("ModCells", false), ["c[1].x", "c[2].x", "c[3].x"]) ≈ exp.(-[3.0, 5.0, 7.0]) atol = 1e-6
+    @test _values(run("ModCellsMatrix", false), ["c[1].x", "c[3].x"]) ≈ exp.(-[3.0, 7.0]) atol = 1e-6
+    @test _values(run("WCells", false), ["c[2].a", "c[3].w[2]"]) ≈ [exp(-2), 2 * exp(-2)] atol = 1e-6
+    #= a record with array fields in a model array (c.R.T is Real[3, 2, 2]) stays an array of the component =#
+    @test _values(run("TurnCells", false), ["c[1].x", "c[3].x"]) ≈ [exp(-2), exp(-2)] atol = 1e-6
+    #= elements of smooth() and vector(cat()); an if-equation on a function of parameters; an array-valued
+       if-expression is an array variable, its if-equation a for-equation over the elements =#
+    @test _values(run("ElementForms", false), ["x", "y", "e[2]"]) ≈ [exp(-1), 2 * exp(-1), -exp(-1)] atol = 1e-6
+    #= a fixed start on a dummy state (x, y the state): the initial equation x = start gives the state's value =#
+    @test _values(run("FixedDummy", false), ["y[1]", "y[2]", "z[2]"]) ≈
+          [2 * exp(-1), 4 * exp(-1), 4 * exp(-1)] atol = 1e-5
+    #= index 3 through an inlined function of a record's matrix: R.T[1, i] and R.T[3, i] are read times parameters
+       known as zero (e = {0, 1, 0}), so Pantelides' algorithm gave them no derivatives; the for-equation's derivative
+       reads none of them =#
+    @test _values(run("SlidingMass", false), ["s"]) ≈
+          [9.81 / 2 * (cos(1.5) + sin(0.5) * sinh(1)) + (1 - 9.81 / 2 * cos(0.5)) * cosh(1)] atol = 1e-5
+    #= the slide's acceleration has a coefficient in each of the three force equations, R.T[2, i], every one 0 at
+       some angle (R.T[2, 1] at the start): not divided by, an unknown of the solver's linear system; to t = 4, past
+       the zeros of all of them =#
+    for scalarized in (true, false)
+      @test _values(run("SlidingMassAligned", scalarized; stop = 4.0), ["s"]) ≈
+            [9.81 / 2 * cos(4) + (1 - 9.81 / 2) * cosh(4)] rtol = 1e-4
+    end
+    #= an if-equation in a branch of an if-equation on a variable condition: one class `y[i] = if ... (if ...)` =#
+    @test _values(run("NestedIf", false), ["y[1]", "y[2]"]) ≈ [2 * exp(-1), 4 * exp(-1)] atol = 1e-5
+    #= pre() is the start at the initialization and no when fires on its condition there; the event iteration after it
+       fires them: the change of x from its start (omc). Initial sections of two instances, merged to arrays, run in
+       the order of what they read through the equation between them (d2.x = d1.y). The scalarized route misses the
+       first change (open) =#
+    local T = [0.0, 0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 1.0]
+    local dp = run("DelayPair", false)
+    @test at(dp, "d1.y", T) == [1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0]
+    @test at(dp, "d2.y", T) == [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0]
+    #= a run-time subscript outside its array is an error (omc: an assertion), not a read outside it =#
+    local err = try
+      run("SubscriptOutside", false)
+      nothing
+    catch e
+      e
+    end
+    @test err isa OMBackend.CodeGeneration.ArrayODEGen.ModelicaSubscriptError && err.index == 3 && err.size == 2
+    #= an enumeration without a start starts at its first literal (MLS 4.9.5; omc 1.27.1: 0, an assertion) =#
+    for scalarized in (true, false)
+      local ed = run("EnumDefaultStart", scalarized)
+      @test at(ed, "i[1]", [0.1, 0.7]) == [10.0, 30.0] && at(ed, "i[2]", [0.1, 0.7]) == [10.0, 20.0]
     end
   end
 end

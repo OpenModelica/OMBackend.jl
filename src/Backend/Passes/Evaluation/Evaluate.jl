@@ -79,6 +79,11 @@ genericValues(values::StartValues)::StartValues =
   StartValues(values.variables, values.functions, Dict{Symbol, Union{Nothing, Float64}}(), values.parametersOnly, true,
               values.defined, values.calls)
 
+"`values` with a cache of its own (the pure calls' shared): a point whose values a caller sets (`propagatedValues`)."
+ownValues(values::StartValues)::StartValues =
+  StartValues(values.variables, values.functions, Dict{Symbol, Union{Nothing, Float64}}(), values.parametersOnly,
+              values.generic, values.defined, values.calls)
+
 """
     definedValue(values, name) -> Union{Nothing, Float64}
 

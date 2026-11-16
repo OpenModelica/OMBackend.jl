@@ -60,8 +60,9 @@ derivatives make the block's Jacobian regular, the candidates ranked by
 3. a constant entry of the Jacobian before one that reads the unknowns (`x = L * sin(phi)`
    keeps phi the state);
 4. the largest pivot of the Jacobian at the start values (where those are not regular, their
-   pivots kept and the rest at a generic point that keeps the relations explicit equations
-   give, `propagatedValues`, then at `genericValues`, then structurally);
+   pivots kept and the rest at the start values carried through the relations explicit
+   equations give, `propagatedValues`, then at a generic point that keeps those relations,
+   then at `genericValues`, then structurally);
 5. among equals, as dummy first the derivative of a derivative variable (`\$DER.x`, which has
    no name of its own), then a variable without a fixed start, then the later declared: the
    first declared variables, and those the user fixed, stay states.
@@ -82,11 +83,12 @@ module IndexReduction
 
 import ..OMJLIR
 import ..substituteIterators, ..foldSubscripts, ..expressionLargerThan, ..foldInteger, ..mapRoots, ..rowMajor,
-       ..unsubscriptedName, ..allSubscripts
+       ..unsubscriptedName, ..allSubscripts, ..recordEquations, ..constantRecord, ..bodyRecordEquations
 import ...envSwitch
+import ...LowerUtil: assignedCrefs
 import ..Evaluation: arithmetic, asRecord, divide, elementOf, evaluate, foldScalar, genericOffset,
        genericValues, ifThenElse, inlineBody, isLiteral, isOne, isZero, isZeroExp, literalCondition,
-       literalValue, minus, negate, ONE, plus, power, real, selectElement, StartValues, subscripted,
+       literalValue, minus, negate, ONE, ownValues, plus, power, real, selectElement, StartValues, subscripted,
        times, withKnownValues, functionDefinedValues, ZERO, zeroOf
 const IR = OMJLIR
 

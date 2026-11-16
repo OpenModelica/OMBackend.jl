@@ -188,7 +188,7 @@ package ArrayPath
     end for;
   end Rectifier;
 
-  model AlgebraicLoop "Outside the array path (a loop in a model without arrays): it is scalarized as before"
+  model AlgebraicLoop "a loop in a model without arrays: the array code's (y = 0.75 x, z = 0.25 x, x' = -0.75 x)"
     Real x(start = 1, fixed = true);
     Real y, z;
   equation
@@ -2106,4 +2106,566 @@ package ArrayPath
     der(x) = 10 * time;
     n = integer(der(x));
   end StepOfDer;
+  connector SlicePin
+    Real v;
+    flow Real i;
+  end SlicePin;
+  connector SlicePlug
+    parameter Integer m = 3;
+    SlicePin pin[m];
+  end SlicePlug;
+  model SliceSource
+    parameter Integer m = 3;
+    SlicePlug plug(m = m);
+  equation
+    plug.pin.v = {sin(time + k) for k in 1:m};
+  end SliceSource;
+  model SliceLoad
+    parameter Integer m = 3;
+    parameter Real R[m] = {1.0, 2.0, 4.0};
+    SlicePlug ac(m = m);
+    Real vAC[m] = ac.pin[:].v;
+    Real iAC[m] = ac.pin[:].i;
+    Real q[m](each start = 0.0, each fixed = true);
+  equation
+    vAC = R .* iAC;
+    der(q) = iAC;
+  end SliceLoad;
+  model SliceConnectors "ac.pin[:].i, a field of a connector array: q[k] = (cos(k) - cos(k + 1)) / R[k] at 1"
+    SliceSource source;
+    SliceLoad load;
+  equation
+    connect(source.plug, load.ac);
+  end SliceConnectors;
+  model SliceCell
+    parameter Real k = 1.0;
+    Real x(start = 1.0, fixed = true);
+  equation
+    der(x) = -k * x;
+  end SliceCell;
+  model SliceCells "a field of a model array through a whole slice (c[:].x): s = 2 sum((1 - exp(-k)) / k) at 1"
+    parameter Integer n = 3;
+    SliceCell c[n](k = {1.0, 2.0, 3.0});
+    Real y[n];
+    Real s(start = 0.0, fixed = true);
+  equation
+    y = 2.0 * c[:].x;
+    der(s) = sum(y);
+  end SliceCells;
+  model DelayCell "MSL InertialDelaySensitive, reduced: an initial() arm, a change() arm, an assignment after"
+    input Integer x(start = 1, fixed = true);
+    output Integer y(start = y0, fixed = true);
+    parameter Real tD = 0.1;
+    parameter Integer y0 = 1;
+  protected
+    Integer y_aux(start = y0, fixed = true);
+    Integer y_old(start = y0, fixed = true);
+    discrete Real t_next;
+  algorithm
+    when {initial(), change(x) and not initial()} then
+      y_old := if initial() or pre(y) == 1 then y0 else pre(y);
+      t_next := time + (if x > y_old then tD else 0.0);
+      if x <= y_old then
+        y_aux := x;
+      end if;
+    elsewhen time >= t_next then
+      y_aux := x;
+    end when;
+    y := y_aux;
+  end DelayCell;
+  model DelayPair "two instances chained by an equation: x's change from its start fires after the initialization"
+    DelayCell d1(tD = 0.1);
+    DelayCell d2(tD = 0.2);
+    Integer u = if time < 0.3 then 2 else 3;
+    Real z(start = 0, fixed = true);
+  equation
+    der(z) = 1;
+    d1.x = u;
+    d2.x = d1.y;
+  end DelayPair;
+  model SubscriptOutside "a run-time subscript leaving its table at 0.6: an error, not a read outside it"
+    constant Integer tab[2] = {5, 7};
+    Real v(start = 0, fixed = true);
+    discrete Integer k(start = 1, fixed = true);
+    discrete Integer x(start = 0, fixed = true);
+  equation
+    der(v) = 1;
+  algorithm
+    when sample(0.1, 0.25) then
+      x := tab[k];
+      k := k + 1;
+    end when;
+  end SubscriptOutside;
+  model EnumDefaultStart "an enumeration without a start: its first literal, a table's subscript (i = 10, 30)"
+    constant Integer tab[SwapEnum] = {10, 20, 30};
+    discrete SwapEnum e[2];
+    Integer i[2];
+    Real x(start = 0, fixed = true);
+  equation
+    der(x) = 1;
+    when time > 0.5 then
+      e[1] = SwapEnum.three;
+      e[2] = SwapEnum.two;
+    end when;
+  algorithm
+    for j in 1:2 loop
+      i[j] := tab[e[j]];
+    end for;
+  end EnumDefaultStart;
+  model BindCell "a declaration binding of a field (b)"
+    parameter Real k = 1.0;
+    Real a(start = 1.0, fixed = true);
+    Real b = 2.0 * k * a;
+  equation
+    der(a) = -b;
+  end BindCell;
+  model BindCells "bindings of fields of a model array stay on the merged arrays: a[k] = exp(-2 k t)"
+    BindCell c[3](k = {1.0, 2.0, 3.0});
+    Real y[3] = 3.0 * c.a;
+  end BindCells;
+  model ModCell "an array field (r) for a modifier"
+    Real r[2];
+    Real x(start = 1.0, fixed = true);
+  equation
+    der(x) = -(r[1] + r[2]) * x;
+  end ModCell;
+  model ModCells "a modifier over a model array on an array field, per element: c[k].x = exp(-(2 k + 1) t)"
+    parameter Real p[3] = {1.0, 2.0, 3.0};
+    ModCell c[3](r = {{p[i], p[i] + 1.0} for i in 1:3});
+  end ModCells;
+  model ModCellsMatrix "the same with a matrix as the value"
+    ModCell c[3](r = {{1.0, 2.0}, {2.0, 3.0}, {3.0, 4.0}});
+  end ModCellsMatrix;
+  model WCell "an array field (w) bound in the class"
+    Real a(start = 1.0, fixed = true);
+    Real w[2] = {a, 2.0 * a};
+  equation
+    der(a) = -w[2];
+  end WCell;
+  model WCells "an array field of a model array bound in its class: c[k].a = exp(-2 t)"
+    WCell c[3];
+  end WCells;
+  record Turn "a record with array fields"
+    Real T[2, 2];
+    Real w[2];
+  end Turn;
+  model TurnCell
+    input Turn R;
+    Real x(start = 1.0, fixed = true);
+  equation
+    der(x) = -R.w[2] * R.T[1, 1] * x;
+  end TurnCell;
+  model TurnCells "a record with array fields in a model array (c.R.T is Real[3, 2, 2]): c[k].x = exp(-2 t)"
+    Turn R;
+    TurnCell c[3](each R = R);
+  equation
+    R.T = {{1.0, 0.0}, {0.0, 1.0}};
+    R.w = {time, 2.0};
+  end TurnCells;
+  model FixedDummy "a fixed start on a dummy state: y[i] = 2 i exp(-t), from x[i] = i at the start"
+    Real x[2](start = {1, 2}, each fixed = true);
+    Real y[2](each stateSelect = StateSelect.prefer);
+    Real z[2];
+  equation
+    for i in 1:2 loop
+      x[i] + y[i] = 3 * i;
+      der(y[i]) = -y[i];
+      der(x[i]) = z[i];
+    end for;
+  end FixedDummy;
+
+  model NestedIf "an if-equation in a branch of an if-equation on a variable condition"
+    Real x(start = 1, fixed = true);
+    Real y[2];
+  equation
+    der(x) = -x;
+    for i in 1:2 loop
+      if time < 0.5 then
+        y[i] = i * x;
+      else
+        if x > 0.1 then
+          y[i] = 2 * i * x;
+        else
+          y[i] = 0;
+        end if;
+      end if;
+    end for;
+  end NestedIf;
+
+  model ElementForms "elements of smooth() and vector(), an if-equation on a function of parameters: x = exp(-t)"
+    parameter Real n[3] = {0.0, -1.0, 0.0};
+    Real e[3];
+    Real v[3];
+    Real x(start = 1.0, fixed = true);
+    Real y;
+  equation
+    e = smooth(0, if x > -1.0 then n * x else n);
+    v = vector(cat(1, {{x}, {2.0 * x}}, {{0.0}}));
+    if norm2(n) > 0.5 then
+      y = 2.0 * x;
+    else
+      y = x;
+    end if;
+    der(x) = e[2] - v[2] + y;
+  end ElementForms;
+  record Turned
+    Real T[3, 3];
+    Real w[3];
+  end Turned;
+
+  function resolveBack "v in the frame R is turned from"
+    input Turned R;
+    input Real v[3];
+    output Real u[3];
+  algorithm
+    u := transpose(R.T) * v;
+    annotation(Inline = true);
+  end resolveBack;
+
+  model SlidingMass "a mass on a turning slide: R.T[1, i] and R.T[3, i] times parameters known as zero (e[1], e[3])"
+    parameter Real e[3] = {0, 1, 0} "the slide's axis, in the turning frame";
+    parameter Real g = 9.81;
+    parameter Real phi0 = 0.5;
+    Real phi;
+    Turned R "the frame, turned by phi about z";
+    Real s(start = 1, fixed = true) "s = (g/2) (cos(phi) + sin(1/2) sinh(t)) + (1 - (g/2) cos(1/2)) cosh(t)";
+    Real v(start = 0, fixed = true);
+    Real r[3], vr[3], f[3];
+  equation
+    phi = time + phi0;
+    R = Turned(T = {{cos(phi), sin(phi), 0}, {-sin(phi), cos(phi), 0}, {0, 0, 1}}, w = {0, 0, der(phi)});
+    r = resolveBack(R, e * s);
+    v = der(s);
+    der(r) = vr;
+    der(vr) = f + {0, -g, 0};
+    R.T[2, 1] * f[1] + R.T[2, 2] * f[2] + R.T[2, 3] * f[3] = 0;
+  end SlidingMass;
+
+  model SlidingMassAligned "the slide along y at the start: R.T[2, 1] = 0 there; s = (g/2) cos(t) + (1 - g/2) cosh(t)"
+    extends SlidingMass(phi0 = 0);
+  end SlidingMassAligned;
+
+  function initialResidue "q - q0 per element, inlined (as MSL Frames.Quaternions.Orientation.equalityConstraint)"
+    input Real q[2];
+    input Real q0[2];
+    output Real r[2];
+  algorithm
+    r := {q[1] - q0[1], q[2] - q0[2]};
+    annotation(Inline = true);
+  end initialResidue;
+
+  function initialResidueLoop "initialResidue by a loop: not inlined, called per element"
+    input Real q[2];
+    input Real q0[2];
+    output Real r[2];
+  algorithm
+    for i in 1:2 loop
+      r[i] := q[i] - q0[i];
+    end for;
+  end initialResidueLoop;
+
+  model ArrayInitialRefs "an initial array equation of references: q(1) = q0 exp(-1)"
+    parameter Real q0[2] = {1, 2};
+    Real q[2];
+  initial equation
+    q = q0;
+  equation
+    der(q) = -q;
+  end ArrayInitialRefs;
+
+  model ArrayInitialCall "an initial array equation of an inlined call against a literal (MSL Body: zeros(3) = equalityConstraint(Q, Q_start))"
+    parameter Real q0[2] = {1, 2};
+    Real q[2];
+  initial equation
+    zeros(2) = initialResidue(q, q0);
+  equation
+    der(q) = -q;
+  end ArrayInitialCall;
+
+  model ArrayInitialLoopCall "ArrayInitialCall, the call's body a loop (not inlined)"
+    parameter Real q0[2] = {1, 2};
+    Real q[2];
+  initial equation
+    zeros(2) = initialResidueLoop(q, q0);
+  equation
+    der(q) = -q;
+  end ArrayInitialLoopCall;
+
+  model ArrayInitialFree "initial array equations that no residual solves: of a parameter array with fixed = false, of a discrete array (assignments of the initialization, per element)"
+    parameter Real p[2](each fixed = false, each start = 0);
+    discrete Real d[2];
+    Real q[2](each start = 1, each fixed = true);
+  initial equation
+    p = {1, 2};
+    d = {3, 4};
+  equation
+    der(q) = -p .* q;
+    when time > 0.5 then
+      d[1] = 2 * pre(d[1]);
+      d[2] = 2 * pre(d[2]);
+    end when;
+  end ArrayInitialFree;
+
+  model StepAfterEvent "a fast transient right after an event: y follows u with Td = 1e-4 and u stops rising at 0.2, so a = der(y) falls from 20 to 0 within a millisecond; the step after the event starts small"
+    parameter Real Td = 1e-4;
+    Real u = if time < 0.2 then 20 * time else 4;
+    Real y(start = 0, fixed = true);
+    Real a = der(y);
+  equation
+    der(y) = (u - y) / Td;
+  end StepAfterEvent;
+
+  model HighGainKink "a state that follows its input through a gain of 15000 into a limit without an event (an op-amp differentiator): the input's slope rises at 0.1, the output is at its limit 2e-6 s later; the solver's own estimate of a first step after the event is 0.01 s"
+    parameter Real V0 = 15000;
+    parameter Real RC = 0.05;
+    Real vin = if time < 0.1 then 0.3 + 0.1 * time else 0.31 + 500 * (time - 0.1);
+    Real x(start = 0.3, fixed = true);
+    Real vn = vin - x;
+    Real vout = smooth(0, noEvent(if V0 * vn > 15 then -15 else if V0 * vn < -15 then 15 else -V0 * vn));
+  equation
+    RC * der(x) = vn - vout;
+  end HighGainKink;
+
+  model SingularStart "an algebraic loop through the elements whose Jacobian is singular at the start values: (v[k] + i[k])^3 = P has no derivative at v = i = 0; one solution, v + i = 2, i = (E - 2) / (1 + 5 c)"
+    parameter Real E = 3;
+    parameter Real P = 8;
+    parameter Real c = 0.01;
+    Real v[5];
+    Real i[5];
+    Real s;
+    Real x(start = 0, fixed = true);
+  equation
+    s = c * (i[1] + i[2] + i[3] + i[4] + i[5]);
+    for k in 1:5 loop
+      (v[k] + i[k])^3 = P;
+      v[k] + 2 * i[k] = E - s;
+    end for;
+    der(x) = i[1] - x;
+  end SingularStart;
+
+  model ZeroCoefficient "an unknown times a parameter that is zero (a resistance of 0 in series): i[k] * R[k] = v[k] - vi[k] is not solved for i[k] where R[k] = 0; v' = -v / 2 there, -v / 3 with R = 1"
+    parameter Real R[3] = {0, 0, 1};
+    Real v[3](each start = 1, each fixed = true);
+    Real vi[3];
+    Real i[3];
+  equation
+    for k in 1:3 loop
+      i[k] * R[k] = v[k] - vi[k];
+      i[k] = vi[k] / 2;
+      der(v[k]) = -i[k];
+    end for;
+  end ZeroCoefficient;
+
+  function swapStep "two outputs, the second an array"
+    input Real s[2];
+    output Real r;
+    output Real t[2];
+  algorithm
+    r := s[1] + s[2];
+    t := {s[2], s[1] + 1};
+  end swapStep;
+
+  model WhenArrayTarget "a when-equation that assigns a whole array (not array code: scalarized by the backend, an assignment per element); d doubled at 0.5"
+    discrete Real d[2](start = {3, 4}, each fixed = true);
+    Real x(start = 0, fixed = true);
+  equation
+    der(x) = 1;
+    when x > 0.5 then
+      d = 2 * pre(d);
+    end when;
+  end WhenArrayTarget;
+
+  model WhenIfArrayTarget "WhenArrayTarget, the array assigned in the branches of an if: d + 1 at 0.25, doubled at 0.75"
+    discrete Real d[2](start = {3, 4}, each fixed = true);
+    Real x(start = 0, fixed = true);
+  equation
+    der(x) = 1;
+    when {x > 0.25, x > 0.75} then
+      if x > 0.5 then
+        d = 2 * pre(d);
+      else
+        d = pre(d) + {1, 1};
+      end if;
+    end when;
+  end WhenIfArrayTarget;
+
+  model TupleArrayTarget "an algorithm's tuple with an array target (the reference kept as the frontend's scalarization has it); at 0.25, 0.5, 0.75: r = 3, 4, 5, s = {2, 2}, {2, 3}, {3, 3}"
+    discrete Real s[2](start = {1, 2}, each fixed = true);
+    discrete Real r(start = 0, fixed = true);
+    Real x(start = 0, fixed = true);
+  equation
+    der(x) = 1;
+  algorithm
+    when sample(0.25, 0.25) then
+      (r, s) := swapStep(pre(s));
+    end when;
+  end TupleArrayTarget;
+
+  function seedPair "a start for a pair of states from a seed (large, as a random generator's)"
+    input Integer seed;
+    output Integer s[2];
+  algorithm
+    for k in 1:2 loop
+      s[k] := seed + k - 1;
+    end for;
+    s[2] := s[2] + 2000000000;
+  end seedPair;
+
+  function nextPair "two outputs, the second an Integer array"
+    input Integer s[2];
+    output Real r;
+    output Integer t[2];
+  algorithm
+    r := s[1] + s[2];
+    t := {s[2], s[1] + 1};
+  end nextPair;
+
+  model PreArrayStart "the start of pre() of an array by an initial array equation (MSL Noise: pre(state) = initialState(...)); its elements pre(s[k]) = seedPair(seed)[k] in this orientation for the initialization"
+    parameter Integer seed = 1;
+    discrete Integer s[2];
+    discrete Real r(start = 0, fixed = true);
+    Real x(start = 0, fixed = true);
+  initial equation
+    pre(s) = seedPair(seed);
+  equation
+    der(x) = 1;
+  algorithm
+    when sample(0.25, 0.25) then
+      (r, s) := nextPair(pre(s));
+    end when;
+  end PreArrayStart;
+
+  model RecordForBody "a Complex equation in a for body, arrays kept: z[k] = Complex(x[k], -x[k]); x' = -1.5 x"
+    parameter Integer m = 3;
+    Complex z[m];
+    Real x[m](each start = 1, each fixed = true);
+  equation
+    for k in 1:m loop
+      z[k] = Complex(x[k], -x[k]);
+      der(x[k]) = -z[k].re + 0.5 * z[k].im;
+    end for;
+  end RecordForBody;
+
+  model RecordForSum "Complex arithmetic in a for body: w = z + z j with z = x (1 + 2 j); x' = -(w.re + w.im) = -2 x"
+    parameter Integer m = 3;
+    Complex z[m];
+    Complex w[m];
+    Real x[m](each start = 1, each fixed = true);
+  equation
+    for k in 1:m loop
+      z[k] = Complex(x[k], 2 * x[k]);
+      w[k] = z[k] + z[k] * Complex(0, 1);
+      der(x[k]) = -w[k].re - w[k].im;
+    end for;
+  end RecordForSum;
+
+  model RecordForIf "a Complex equation in a for body with an if-expression on the iterator (MSL PlugToPin): i[2] = -i0, the others 0; x' = -x"
+    parameter Integer m = 3;
+    parameter Integer k0 = 2;
+    Complex i0;
+    Complex i[m];
+    Real x(start = 1, fixed = true);
+  equation
+    i0 = Complex(x, -x);
+    for j in 1:m loop
+      i[j] = if j == k0 then -i0 else Complex(0);
+    end for;
+    der(x) = i[2].re + i[1].im;
+  end RecordForIf;
+
+  model ComplexResistor "v = R i of Complex values"
+    Complex v;
+    Complex i;
+    parameter Real R = 2;
+  equation
+    v = R * i;
+  end ComplexResistor;
+
+  model RecordComponents "a component array with a Complex equation (a for-equation with the arrays kept); x' = -x (1 + 1/2 + 1/4)"
+    ComplexResistor r[3](R = {1, 2, 4});
+    Real x(start = 1, fixed = true);
+  equation
+    for k in 1:3 loop
+      r[k].v = Complex(x, 0);
+    end for;
+    der(x) = -(r[1].i.re + r[2].i.re + r[3].i.re);
+  end RecordComponents;
+
+  model ComplexArrays "array equations of Complex values: of two arrays (by their fields' arrays), of an array constructor (a for-equation of the parts), of the elements written out (an equation per element and part); i = u j, x' = -i.im = -x"
+    parameter Integer m = 3;
+    Complex v[m];
+    Complex u[m];
+    Complex i[m];
+    Complex s[m];
+    Real x[m](each start = 1, each fixed = true);
+  equation
+    v = {Complex(x[k], 0) for k in 1:m};
+    u = v;
+    i = {u[k] * Complex(0, 1) for k in 1:m};
+    s = {i[1] + u[1], i[2] + u[2], i[3] + u[3]};
+    for k in 1:m loop
+      der(x[k]) = -s[k].im;
+    end for;
+  end ComplexArrays;
+
+  model DerivativeTwoCycle "a stray inductance in series with a main one (MSL Machines' air gaps, per axis): psi = Lm is is no state; Ls der(is) + der(psi) = u - R is and der(psi) = Lm der(is) read each other's derivative, one solved with the other's value put in; (Ls + Lm) is' = u - R is"
+    parameter Real Ls = 0.1;
+    parameter Real Lm = 1;
+    parameter Real R = 2;
+    Real is[2](each start = 0, each fixed = true);
+    Real psi[2];
+  equation
+    Ls * der(is) + der(psi) = {sin(time), cos(time)} - R * is;
+    psi = Lm * is;
+  end DerivativeTwoCycle;
+
+  model ElementwisePowerSum "the sum of an element-wise power of an array (MSL Machines' quasiRMS: sqrt(sum(i .^ 2 / m))); i[k] = k x, x' = -sqrt(14 / 3) x"
+    parameter Integer m = 3;
+    Real i[m];
+    Real x(start = 1, fixed = true);
+  equation
+    for k in 1:m loop
+      i[k] = k * x;
+    end for;
+    der(x) = -sqrt(sum(i .^ 2 / m));
+  end ElementwisePowerSum;
+
+  model ScalarLoop "a nonlinear loop of scalars (no arrays): y + z^3 = x, y - z = x / 2"
+    Real x(start = 1, fixed = true);
+    Real y(start = 1);
+    Real z;
+  equation
+    der(x) = -y;
+    y + z^3 = x;
+    y - z = 0.5 * x;
+  end ScalarLoop;
+
+  model ScalarIndexTwo "two masses rigidly coupled, scalars (no arrays, index above one): (m1 + m2) x1'' = -k x1"
+    parameter Real m1 = 1;
+    parameter Real m2 = 2;
+    parameter Real k = 10;
+    Real x1(start = 1, fixed = true);
+    Real v1(start = 0, fixed = true);
+    Real x2;
+    Real v2;
+    Real f;
+  equation
+    der(x1) = v1;
+    m1 * der(v1) = -k * x1 + f;
+    der(x2) = v2;
+    m2 * der(v2) = -f;
+    x2 = x1;
+  end ScalarIndexTwo;
+
+  model ClockedSampleHold "a periodic clock of 0.1 s samples x, a unit delay, held into the continuous system (a clocked partition of index 1, no arrays)"
+    Real x(start = 1, fixed = true);
+    Real xs(start = 0);
+    Real xd(start = 0);
+    Real y;
+  equation
+    der(x) = -x;
+    xs = sample(x, Clock(0.1));
+    xd = previous(xs);
+    y = hold(xd);
+  end ClockedSampleHold;
 end ArrayPath;

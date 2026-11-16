@@ -88,6 +88,16 @@ import OMBackend
     @test R.equationForm(eq(x(:y), op(x(:a), IRp.MUL, x(:b)))) == R.equationForm(eq(op(x(:b), IRp.MUL, x(:a)), x(:y)))
     @test R.equationForm(eq(x(:a), x(:b))) != R.equationForm(eq(x(:a), x(:c)))
     @test hash(R.equationForm(eq(x(:a), x(:b)))) == hash(R.equationForm(eq(x(:b), x(:a))))
+    #= terms grouped another way, and the element-wise operators of scalars: (a + b) + c = y is a .+ (b + c) = y,
+       y = a .* b is y = b * a; of arrays they are not sums of scalars =#
+    local ew = (a, o, b) -> IRp.BINARY(a, o, b, IRp.T_REAL())
+    @test R.equationForm(eq(op(op(x(:a), IRp.ADD, x(:b)), IRp.ADD, x(:c)), x(:y))) ==
+          R.equationForm(eq(ew(x(:a), IRp.ADD_EW, op(x(:b), IRp.ADD, x(:c))), x(:y)))
+    local form = (l, r) -> R.equationForm(eq(l, r))
+    @test form(x(:y), ew(x(:a), IRp.MUL_EW, x(:b))) == form(x(:y), op(x(:b), IRp.MUL, x(:a)))
+    @test form(x(:y), ew(x(:a), IRp.SUB_EW, x(:b))) != form(x(:y), ew(x(:b), IRp.SUB_EW, x(:a)))
+    @test R.isScalarSum(ew(x(:a), IRp.SUB_EW, x(:b))) &&
+          !R.isScalarSum(IRp.BINARY(x(:a), IRp.ADD_EW, x(:b), IRp.T_ARRAY(IRp.T_REAL(), IRp.Dimension[])))
   end
 
   @testset "the interpreter's values by paths, the wholes of a reference by its parts" begin

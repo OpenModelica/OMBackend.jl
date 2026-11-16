@@ -36,13 +36,16 @@
 #= The plan of index reduction, made without changing the model, and its commit. =#
 
 """
-    Plan(structure, differentiated, dummies, sets, known)
+    Plan(structure, differentiated, dummies, sets, known, carried)
 
 What index reduction changes in a partition: the structure Pantelides' algorithm grew (its new
 derivative variables), the differentiated equations (by the index of the equation they are
 derivatives of), the dummy derivatives (the dynamic sets' candidates among them), and the dynamic
 state sets; the simulation code's values it was made with (`KNOWN_VALUES`; empty for a plan as
-written), which the derivatives' solve reads too (`solveDerivatives!`).
+written), which the derivatives' solve reads too (`solveDerivatives!`); the start values carried
+through the explicit relations for the variables that declare none (`carriedStarts`), which the
+commit writes as the guesses of the states among them, of those with an alias that declares one, and of the
+sets' states.
 """
 struct Plan
   structure::Structure
@@ -50,6 +53,7 @@ struct Plan
   dummies::Set{Int}
   sets::Vector{DynamicSet}
   known::Dict{Symbol, IR.Expression}
+  carried::CarriedStarts
 end
 
 """
@@ -113,13 +117,19 @@ function planStructure(s::Structure, nRows::Int, partition::IR.Partition, model:
                        known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}(),
                        indexOne::Bool = false)::Union{Nothing, Plan}
   pantelides!(s)
-  length(s.rows) == nRows && return indexOne ? Plan(s, Dict{Int, Vector{IR.Equation}}(), Set{Int}(), DynamicSet[], known) : nothing
+  if length(s.rows) == nRows
+    indexOne || return nothing
+    return Plan(s, Dict{Int, Vector{IR.Equation}}(), Set{Int}(), DynamicSet[], known, CarriedStarts())
+  end
   local differentiated = differentiatedEquations(s, partition, model.functions)
   local sets = DynamicSet[]
   trace === nothing || empty!(trace)
-  local dummies = dummyDerivatives(s, partition, differentiated, model.variables, model.functions; sets, trace)
+  local start = Ref{Union{Nothing, StartValues}}(nothing)
+  local dummies = dummyDerivatives(s, partition, differentiated, model.variables, model.functions; sets, trace, start)
   foreach(set -> union!(dummies, set.candidates, set.linked...), sets)
-  return Plan(s, differentiated, dummies, sets, known)
+  local carried::CarriedStarts =
+    carriedStarts(s, partition, differentiated, model.variables, model.functions, start)
+  return Plan(s, differentiated, dummies, sets, known, carried)
 end
 
 "The names of the continuous variables of `partition` (`isContinuousVariable`)."
@@ -157,6 +167,7 @@ function commit!(model::IR.Model, partition::IR.Partition, plan::Plan)::Nothing
     local kind = plannedKind(s, D, v)
     kind === nothing || (model.variables[s.variables[v]].kind = kind)
   end
+  applyCarried!(model.variables, plan.carried)
   for (eq, chain) in sort(collect(plan.differentiated); by = first)
     local previous = partition.equations[eq]
     for derivative in chain
@@ -168,7 +179,7 @@ function commit!(model::IR.Model, partition::IR.Partition, plan::Plan)::Nothing
   for v in selectedStates(s, D)
     linkStateDerivative!(model, partition, s.variables[v], s.variables[s.derivative[v]])
   end
-  foreach(((k, set),) -> dynamicSet!(model, partition, s, set, k), enumerate(plan.sets))
+  foreach(((k, set),) -> dynamicSet!(model, partition, s, set, k, plan.carried.values), enumerate(plan.sets))
   return nothing
 end
 
@@ -192,7 +203,7 @@ function plannedKind(s::Structure, dummies::Set{Int}, v::Int)::Union{Nothing, IR
 end
 
 """
-    dynamicSet!(model, partition, s, set, k)
+    dynamicSet!(model, partition, s, set, k, carried)
 
 The dynamic state set `set` as the `k`-th state set of the model (`\$STATESETk`, OpenModelica's
 form): its candidates are dummy derivatives (commit!), their variables `V` dummy states; the
@@ -205,27 +216,30 @@ when-equation makes candidate `d` the dummy where its pivot (`jacobian`, one row
 twice the dummy's: `A` set to the selection of the others, the states of every level
 reinitialized to it.
 """
-function dynamicSet!(model::IR.Model, partition::IR.Partition, s::Structure, set::DynamicSet, k::Int)::Nothing
-  local (variables, equations) = dynamicSetParts(model, s, set, k)
+function dynamicSet!(model::IR.Model, partition::IR.Partition, s::Structure, set::DynamicSet, k::Int,
+                     carried::Dict{Symbol, Float64})::Nothing
+  local (variables, equations) = dynamicSetParts(model.variables, s, set, k, carried)
   foreach(v -> push!(model.variables, v), variables)
   append!(partition.equations, equations)
   return nothing
 end
 
 """
-    dynamicSetParts(model, s, set, k) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
+    dynamicSetParts(modelVariables, s, set, k, carried) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
 
 The variables and equations of the dynamic state set `set` as the `k`-th state set of the model (`dynamicSet!`),
-the model not changed.
+the model not changed. `modelVariables`: the variables the set's candidates are looked up in (their references, the
+start values that guess the states).
 """
-function dynamicSetParts(model::IR.Model, s::Structure, set::DynamicSet, k::Int)::Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
+function dynamicSetParts(modelVariables::IR.VariableSet, s::Structure, set::DynamicSet, k::Int,
+                         carried::Dict{Symbol, Float64})::Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
   size(set.jacobian, 1) == 1 || throw(NotHandled("a dynamic state set of $(size(set.jacobian, 1)) rows"))
   local variables = IR.Variable[]
   local equations = IR.Equation[]
   local n = length(set.candidates)
   #= a variable of the model or the structure by its own reference (a matrix element as SimCode names it, a derivative
      `IR.derivativeCref`); NotHandled for another name =#
-  local realRef::Function = (name::Symbol) -> IR.CREF(haskey(model.variables, name) ? model.variables[name].cref :
+  local realRef::Function = (name::Symbol) -> IR.CREF(haskey(modelVariables, name) ? modelVariables[name].cref :
                                           haskey(s.index, name) ? s.crefs[s.index[name]] :
                                           throw(NotHandled("the state set's variable $(name), of neither the model nor the structure")), IR.T_REAL())
   local integerRef::Function = (cref::IR.ComponentRef) -> IR.CREF(cref, IR.T_INTEGER())
@@ -250,8 +264,10 @@ function dynamicSetParts(model::IR.Model, s::Structure, set::DynamicSet, k::Int)
     push!(levels, (V, x))
     for j in 1:n-1
       local derivative::IR.ComponentRef = IR.derivativeCref(x[j])
-      local var = get(model.variables, V[index(start, j)], nothing)
-      local guess = var === nothing ? nothing : var.attributes.start
+      #= its guess: the start of the candidate it selects, where that declares none the start carried to it =#
+      local var = get(modelVariables, V[index(start, j)], nothing)
+      local guess::Union{Nothing, IR.Expression} = var === nothing ? nothing : var.attributes.start
+      (guess === nothing && haskey(carried, V[index(start, j)])) && (guess = IR.REAL(carried[V[index(start, j)]]))
       local state::IR.Variable = IR.Variable(x[j], IR.T_REAL(), IR.STATE(1, derivative.name, true), nothing,
                                              IR.VariableAttributes(guess, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing),
                                              IR.NO_DIRECTION, true, IR.NOT_CONNECTOR, IR.NO_SOURCE, :indexReduction)
@@ -291,6 +307,9 @@ The reference of a variable of the `k`-th dynamic state set: the set's part (`\$
 """
 stateSetCref(k::Int, name::Symbol, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType)::IR.ComponentRef =
   IR.ComponentRef(IR.CrefPart[IR.CrefPart(Symbol("\$STATESET", k), IR.Subscript[], IR.T_CLASS(:StateSet)), IR.CrefPart(name, subscripts, ty)])
+
+"Whether `cref` is of a dynamic state set (`stateSetCref`: its first part of the class StateSet)."
+isStateSetRef(cref::IR.ComponentRef)::Bool = !isempty(cref.parts) && cref.parts[1].ty == IR.T_CLASS(:StateSet)
 
 "The `j`-th state of the `l`-th level of the `k`-th dynamic state set: `\$STATESETk.x[j]`, `\$STATESETk.dx[j]` (its derivative level), ..."
 setStateCref(k::Int, l::Int, j::Int)::IR.ComponentRef =

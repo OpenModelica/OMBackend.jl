@@ -51,7 +51,7 @@ partition, no clocks, no structural modes):
     the initialization;
   - a reference to an element of an array variable as the variable subscripted (`ASUB`, `elementReference`);
   - the bindings of the parameters the equations read (through other bindings too: `Passes.parametersRead`), the
-    others' left out (the array code takes their values, evaluated); the start and fixed attributes;
+    others' left out where their values evaluate (the array code takes those); the start and fixed attributes;
   - the values the array code takes per element evaluated on the variables' element view (`IndexReduction.elements`,
     `scalarVariables`, OMJLIR's `Evaluation.StartValues`): each variable's start and fixed attributes (as constants
     where an element has one and every element's evaluates; a missing one the default, `0.0` and `false`, a
@@ -69,8 +69,11 @@ function lowerArraySystem(model::IR.Model)::SIM_CODE
   local evaluated::Dict{Symbol, ElementValues} = elementValues(model.variables, E, model.functions)
   local variables::IR.VariableSet = elementReferenceVariables(model.variables)
   local read::Set{Symbol} = Passes.parametersRead(model)
+  #= a parameter no equation reads keeps its binding where its value does not evaluate (a table's `t_min =
+     getTimeTableTmin(tableID)`, an external object's): the array code computes it at each start =#
   for v in variables
-    (v.kind isa Union{IR.PARAMETER, IR.CONSTANT} && !(v.name in read)) && (v.binding = nothing)
+    (v.kind isa Union{IR.PARAMETER, IR.CONSTANT} && !(v.name in read) && evaluated[v.name].values !== nothing) &&
+      (v.binding = nothing)
   end
   local partition::IR.Partition = model.continuous[1]
   local vars::Vector{IR.Variable} = IR.Variable[v for v in variables if !(v.kind isa IR.STATE_DER)]

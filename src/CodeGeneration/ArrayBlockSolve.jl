@@ -48,6 +48,9 @@ const _UMFPACK_LU = _SPARSE.UMFPACK.UmfpackLU{Float64, Int}
 "Blocks of up to this many iteration variables are factored dense (LAPACK, in place), larger ones sparse (UMFPACK)."
 const DENSE_BLOCK_SIZE = 128
 
+"Singular values of a dense block's Jacobian below this share of the largest are zero (`_blockJacobian!`)."
+const RANK_TOLERANCE = 1.0e-6
+
 """
     columnColors(S) -> Vector{Int}
 
@@ -77,6 +80,7 @@ The solver of one large algebraic loop of an array model (`blockSolve!`): the co
 sparsity in its iteration variables, the Jacobian on that sparsity and its factorization, kept between calls (dense
 up to `DENSE_BLOCK_SIZE` variables: the factors in place with their pivots; else sparse), the last solution (the next
 call's guess; the start values until a solve succeeded) and counters (residual evaluations, Jacobians, failed solves).
+`rankDeficient`: the dense Jacobian was singular and `factors` holds its pseudo-inverse (`_blockJacobian!`).
 """
 mutable struct BlockSolver
   const groups::Vector{Vector{Int}}
@@ -86,6 +90,7 @@ mutable struct BlockSolver
   const pivots::Vector{_LINALG.BlasInt}
   F::Union{Nothing, _UMFPACK_LU}
   factored::Bool
+  rankDeficient::Bool
   const y::Vector{Float64}
   const x::Vector{Float64}
   const r::Vector{Float64}
@@ -106,7 +111,8 @@ factorization not (the copy factors again: a copied UMFPACK object shared its C 
 function Base.deepcopy_internal(s::BlockSolver, dict::IdDict)::BlockSolver
   haskey(dict, s) && return dict[s]
   local c::BlockSolver = BlockSolver(Vector{Int}[copy(g) for g in s.groups], copy(s.J), s.dense, copy(s.factors), copy(s.pivots),
-                                     nothing, s.dense && s.factored, copy(s.y), copy(s.x), copy(s.r), copy(s.rp), copy(s.xp),
+                                     nothing, s.dense && s.factored, s.rankDeficient, copy(s.y), copy(s.x), copy(s.r),
+                                     copy(s.rp), copy(s.xp),
                                      copy(s.dx), copy(s.h), s.solved, s.residuals, s.jacobians, s.failures)
   dict[s] = c
   return c
@@ -118,7 +124,8 @@ function BlockSolver(pattern::_SPARSE.SparseMatrixCSC{Float64, Int}, colors::Vec
   foreach(j::Int -> push!(groups[colors[j]], j), 1:n)
   local dense::Bool = n <= DENSE_BLOCK_SIZE
   return BlockSolver(groups, copy(pattern), dense, zeros(dense ? n : 0, dense ? n : 0), zeros(_LINALG.BlasInt, dense ? n : 0),
-                     nothing, false, copy(guess), zeros(n), zeros(n), zeros(n), zeros(n), zeros(n), zeros(n), false, 0, 0, 0)
+                     nothing, false, false, copy(guess), zeros(n), zeros(n), zeros(n), zeros(n), zeros(n), zeros(n),
+                     false, 0, 0, 0)
 end
 
 """
@@ -129,7 +136,9 @@ mode, fire)` places the iteration variables `y` where the equations read them (d
 unknowns from them and evaluates its residuals. Newton from the last solution with the kept factorization, else with
 a Jacobian in every step (also from the start values); the relations keep their values during the solve, then the
 residuals are evaluated once more at the solution with the caller's `z` and `mode` (crossing functions, relation
-values). Where no solve converges, the unknowns are NaN (the solver rejects the step; an initialization fails).
+values). Where no solve converges, the unknowns are NaN (the solver rejects the step; an initialization fails). An
+iterate whose last Jacobian was singular is no solution (`rankDeficient`: its steps were least-norm steps, small
+where the residuals are not).
 """
 function blockSolve!(s::BlockSolver, residual!::R, du::AbstractVector, a::AbstractVector, u::AbstractVector, p, t::Real,
                      z, mode::Bool, fire::Bool)::Nothing where {R <: Function}
@@ -138,10 +147,11 @@ function blockSolve!(s::BlockSolver, residual!::R, du::AbstractVector, a::Abstra
   local args::Tuple = (du, a, u, p, t, nothing, false, fire)
   s.x .= s.y
   local ok::Bool = _blockNewton!(s, residual!, args, !s.solved)
-  if !ok && s.solved
+  if !(ok && !s.rankDeficient) && s.solved
     s.x .= s.y
     ok = _blockNewton!(s, residual!, args, true)
   end
+  ok = ok && !s.rankDeficient
   if ok
     s.y .= s.x
     s.solved = true
@@ -221,9 +231,11 @@ function _blockNewton!(s::BlockSolver, residual!::R, args::Tuple, full::Bool)::B
   return previous <= 1.0 && all(isfinite, r)
 end
 
-"The Newton step `s.dx` for the residuals `s.r` with the kept factorization."
+"The Newton step `s.dx` for the residuals `s.r` with the kept factorization (the least-norm one with a pseudo-inverse)."
 function _blockStep!(s::BlockSolver)::Nothing
-  if s.dense
+  if s.rankDeficient
+    _LINALG.mul!(s.dx, s.factors, s.r)
+  elseif s.dense
     s.dx .= s.r
     _LINALG.LAPACK.getrs!('N', s.factors, s.pivots, s.dx)
   else
@@ -236,8 +248,13 @@ end
     _blockJacobian!(s, residual!, args) -> Bool
 
 The block's Jacobian at `s.x` (residuals `s.r` there) by forward differences, one evaluation per color, factored
-(dense in place; sparse with the kept factorization's symbolic analysis); false for a singular one or one not finite
-(no factorization kept: the next solve starts with a Jacobian).
+(dense in place; sparse with the kept factorization's symbolic analysis); false for one not finite or a singular
+sparse one (no factorization kept: the next solve starts with a Jacobian). A singular dense one gives its
+pseudo-inverse for least-norm steps (`rankDeficient`; singular values below `RANK_TOLERANCE` of the largest count as
+zero, the forward differences' accuracy), not kept either: products of unknowns that start at zero have no
+derivative there (MSL QuasiStatic SinglePhase Rectifier's power balance `v * conj(i)`: two zero rows at the start
+values, the loop never solved and its 83 variables NaN through a run that ended in Success), and the least-norm step
+of the other rows leaves that point.
 """
 function _blockJacobian!(s::BlockSolver, residual!::R, args::Tuple)::Bool where {R <: Function}
   local x::Vector{Float64} = s.x; local xp::Vector{Float64} = s.xp; local h::Vector{Float64} = s.h
@@ -256,6 +273,7 @@ function _blockJacobian!(s::BlockSolver, residual!::R, args::Tuple)::Bool where 
   end
   s.jacobians += 1
   s.factored = false
+  s.rankDeficient = false
   all(isfinite, J.nzval) || return false
   if s.dense
     fill!(s.factors, 0.0)
@@ -263,6 +281,11 @@ function _blockJacobian!(s::BlockSolver, residual!::R, args::Tuple)::Bool where 
       s.factors[J.rowval[k], j] = J.nzval[k]
     end
     s.factored = _LINALG.LAPACK.getrf!(s.factors, s.pivots; check = false)[3] == 0
+    if !s.factored
+      s.factors .= _LINALG.pinv(Matrix(J); rtol = RANK_TOLERANCE)
+      s.rankDeficient = true
+      return true
+    end
   else
     local F::_UMFPACK_LU = s.F === nothing ? _LINALG.lu(J; check = false) : _LINALG.lu!(s.F::_UMFPACK_LU, J; check = false)
     s.factored = _LINALG.issuccess(F)

@@ -44,13 +44,17 @@ The element variables of the array variables of a model (`elements(variables)`):
 the array `a` in row-major order (the last subscript fastest, as the frontend scalarizes: `x[1,1]`, `x[1,2]`,
 ...), `sizes[a]` its dimensions, `array[e]` the array of the element `e` and its subscripts, `crefs[e]` the
 element's reference as the scalarized model names it (`c[2].p.T` of the array `c.p.T`, whose dimension is the
-record array's; `\$DER.c[2].T` of the backend's `\$DER.c.T`).
+record array's; `\$DER.c[2].T` of the backend's `\$DER.c.T`). `passesFollow`: the view is of a model as lowered, for
+the scalar passes (`scalarizeArrays(model; passesFollow = true)`), and keeps what they take as the frontend's
+scalarization does: a reference by a subscript known at run time only (`chooseRuntimeIndices!`), a record equation
+of a call (`fieldEquations`). The view the array form's index reduction plans on does not.
 """
 struct Elements
   elements::Dict{Symbol, Vector{Symbol}}
   sizes::Dict{Symbol, Vector{Int}}
   array::Dict{Symbol, Tuple{Symbol, Vector{Int}}}
   crefs::Dict{Symbol, IR.ComponentRef}
+  passesFollow::Bool
 end
 
 """
@@ -132,10 +136,12 @@ end
     modelElementCref(v, index) -> ComponentRef
 
 The reference of the element `index` of the array variable `v` as the scalarized model names it: the subscripts
-on the parts whose types are arrays (`c[2].p.T` of `c.p.T`, a field of the record array `c`).
+on the parts whose types are arrays (`c[2].p.T` of `c.p.T`, a field of the record array `c`), each the index of its
+dimension (`IR.dimensionIndex`: the literal of an enumeration's, `t[Logic.'0']`).
 """
 function modelElementCref(v::IR.Variable, index::Vector{Int})::IR.ComponentRef
-  return distributedCref(v, IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index])
+  local dims::Vector{IR.Dimension} = IR.dimensions(v.ty)
+  return distributedCref(v, IR.Subscript[IR.INDEX(IR.dimensionIndex(dims[d], k)) for (d, k) in enumerate(index)])
 end
 
 "The elements `crefs` (row-major) of the array `v` of `sizes` into `E`."
@@ -158,11 +164,11 @@ end
 The element variables of the array variables of `variables`, by their scalarized names (`Elements`): a model
 array's by its reference (`modelElementCref`), a derivative array's (`\$DER.x`) by its operator part before the
 elements of the array it is the derivative of (`\$DER.x[2]`, `\$DER.c[2].T`), after that array's. Not an array whose elements are variables
-already (a record field array of a parameter, `expandRecordFieldArrays`).
+already (a record field array of a parameter, `expandRecordFieldArrays`). `passesFollow` as `Elements` has it.
 """
-function elements(variables::IR.VariableSet)::Elements
+function elements(variables::IR.VariableSet; passesFollow::Bool = false)::Elements
   local E = Elements(Dict{Symbol, Vector{Symbol}}(), Dict{Symbol, Vector{Int}}(), Dict{Symbol, Tuple{Symbol, Vector{Int}}}(),
-                     Dict{Symbol, IR.ComponentRef}())
+                     Dict{Symbol, IR.ComponentRef}(), passesFollow)
   local derived::Vector{Tuple{IR.Variable, Vector{IR.CrefPart}, Symbol}} = Tuple{IR.Variable, Vector{IR.CrefPart}, Symbol}[]
   #= the arrays of rolled components first (their elements may be another array's, kept beside them: rollComponents!) =#
   local rolledFirst::Vector{IR.Variable} = IR.Variable[v for v in variables if IR.isRolled(v.cref.parts[1].ty)]
@@ -220,7 +226,7 @@ end
 made of), a new `Elements`; `E` not changed. NotHandled for an added array that is no backend-made one.
 """
 function extendedElements(E::Elements, added::Vector{IR.Variable}, variables::IR.VariableSet)::Elements
-  local out = Elements(copy(E.elements), copy(E.sizes), copy(E.array), copy(E.crefs))
+  local out = Elements(copy(E.elements), copy(E.sizes), copy(E.array), copy(E.crefs), E.passesFollow)
   local derived::Vector{Tuple{IR.Variable, Vector{IR.CrefPart}, Symbol}} = Tuple{IR.Variable, Vector{IR.CrefPart}, Symbol}[]
   for v in added
     v.ty isa IR.T_ARRAY || continue
@@ -235,12 +241,14 @@ end
 """
     selectedIndices(s, n) -> Union{Nothing, Int, Vector{Int}}
 
-The indices a subscript selects of a dimension of size `n`: one (`x[2]`), several (`x[2:3]`, `x[{1, 3}]`, `x[:]`);
-`nothing` where they are not literals (an iterator, a parameter).
+The indices a subscript selects of a dimension of size `n`: one (`x[2]`; `x[1 + 1]`, `x[(1:2)[1]]`, `foldInteger`),
+several (`x[2:3]`, `x[{1, 3}]`, `x[:]`); `nothing` where they are not literals (an iterator, a parameter).
 """
 function selectedIndices(s::IR.INDEX, ::Int)::Union{Nothing, Int, Vector{Int}}
-  s.exp isa IR.INTEGER || return nothing
-  return s.exp.value
+  local e::IR.Expression = s.exp
+  e isa IR.ENUM_LITERAL && return e.index   # a dimension of an enumeration: the literal's position
+  e isa IR.BOOLEAN && return e.value ? 2 : 1
+  return foldInteger(e)
 end
 selectedIndices(::IR.WHOLE, n::Int)::Union{Nothing, Int, Vector{Int}} = collect(1:n)
 function selectedIndices(s::IR.SLICE, ::Int)::Union{Nothing, Int, Vector{Int}}
@@ -284,16 +292,119 @@ loop) leaves the reference as it is; `danglingReference` finds those where they 
 function elementReference(e::IR.CREF, E::Elements)::IR.Expression
   local array = IR.hasSubscripts(e.cref) ? unsubscriptedName(e.cref) : e.cref.name
   local sizes = get(E.sizes, array, nothing)
-  sizes === nothing && return e
-  local subscripts = allSubscripts(e.cref)
-  length(subscripts) > length(sizes) && throw(NotHandled("the reference $(e.cref.name) of more subscripts than its array's dimensions"))
+  #= an array without elements has no variables: the empty array literal, as the frontend's scalarization writes it =#
+  (sizes === nothing && isEmptyArrayType(e.ty)) && return IR.ARRAY(IR.Expression[], e.ty)
+  sizes === nothing && return recordReference(e)
+  local selection::Union{Nothing, Vector{Union{Int, Vector{Int}}}} = referenceSelection(e.cref, sizes)
+  selection === nothing && return e
+  return selectedElements(array, Int[], selection, E, IR.elementType(e.ty))
+end
+
+"Whether `ty` is an array type with a dimension of size 0."
+isEmptyArrayType(ty::IR.ModelicaType)::Bool = ty isa IR.T_ARRAY && any(d -> IR.dimensionSize(d) == 0, ty.dimensions)
+
+"""
+    withoutEmptyTargets(e) -> Expression
+
+A tuple of targets (the left-hand side of an equation or an assignment of a call with several outputs) with each
+array without elements discarded (`_`), as the frontend's scalarization writes it; another expression as it is.
+"""
+function withoutEmptyTargets(e::IR.Expression)::IR.Expression
+  (e isa IR.TUPLE && any(isEmptyArray, e.elements)) || return e
+  return IR.TUPLE(IR.Expression[isEmptyArray(x) ? IR.WILD() : x for x in e.elements], e.ty)
+end
+
+isEmptyArray(e::IR.Expression)::Bool = e isa IR.ARRAY && isempty(e.elements)
+
+"""
+    referenceSelection(cref, sizes) -> Union{Nothing, Vector{Union{Int, Vector{Int}}}}
+
+What the subscripts of `cref` (of all its parts, the leading dimensions: `allSubscripts`) select of an array of
+`sizes`, per dimension (`selectedIndices`; a dimension without a subscript whole); `nothing` where one is not
+literal.
+"""
+function referenceSelection(cref::IR.ComponentRef, sizes::Vector{Int})::Union{Nothing, Vector{Union{Int, Vector{Int}}}}
+  local subscripts::Vector{IR.Subscript} = allSubscripts(cref)
+  length(subscripts) > length(sizes) &&
+    throw(NotHandled("the reference $(cref.name) of more subscripts than its array's dimensions"))
   local selection = Vector{Union{Int, Vector{Int}}}(undef, length(sizes))
   for d in eachindex(sizes)
-    local picked = d <= length(subscripts) ? selectedIndices(subscripts[d], sizes[d]) : collect(1:sizes[d])
-    picked === nothing && return e
+    local picked::Union{Nothing, Int, Vector{Int}} =
+      d <= length(subscripts) ? selectedIndices(subscripts[d], sizes[d]) : collect(1:sizes[d])
+    picked === nothing && return nothing
     selection[d] = picked
   end
-  return selectedElements(array, Int[], selection, E, IR.elementType(e.ty))
+  return selection
+end
+
+"""
+    recordSizes(cref) -> Union{Nothing, Vector{Int}}
+
+The dimensions the types of the parts of `cref` have, in order (`[3]` of `s.pin.i`, `pin[3]`): those of the array
+of records a reference to a record names. `nothing` where one is not known, or a part is not a plain array (a slice,
+heterogeneous components).
+"""
+function recordSizes(cref::IR.ComponentRef)::Union{Nothing, Vector{Int}}
+  local sizes::Vector{Int} = Int[]
+  for p in cref.parts
+    (p.ty isa IR.T_SLICE || p.ty isa IR.T_COMPONENTS) && return nothing
+    for d in IR.dimensions(p.ty)
+      local n::Union{Nothing, Int} = IR.dimensionSize(d)
+      n === nothing && return nothing
+      push!(sizes, n)
+    end
+  end
+  return sizes
+end
+
+"""
+The reference to the element `index` of the array of records `cref` names: the subscripts on the parts whose types
+are arrays (`s.pin[2].i`).
+"""
+function recordElementCref(cref::IR.ComponentRef, index::Vector{Int})::IR.ComponentRef
+  local parts::Vector{IR.CrefPart} = IR.CrefPart[]
+  local k::Int = 0
+  for p in cref.parts
+    local n::Int = length(IR.dimensions(p.ty))
+    push!(parts, IR.CrefPart(p.name, IR.Subscript[IR.INDEX(IR.INTEGER(i)) for i in index[k + 1:k + n]], p.ty))
+    k += n
+  end
+  return IR.ComponentRef(parts)
+end
+
+"""
+    recordReference(e) -> Expression
+
+A reference to a record of an array (`s.pin.i` of `pin[3]`, `i` of `Complex i[m]`; the view has the arrays of its
+scalar fields, `s.pin.i.re`, not one of the record): an element by its subscripts on the parts whose types are
+arrays (`s.pin[2].i`, whose fields are the element variables), a whole array or a slice by the array literal of
+them. Another reference, and one by a subscript that is not literal, as it is.
+"""
+function recordReference(e::IR.CREF)::IR.Expression
+  local element::IR.ModelicaType = IR.elementType(e.ty)
+  element isa IR.T_RECORD || return e
+  local sizes::Union{Nothing, Vector{Int}} = recordSizes(e.cref)
+  (sizes === nothing || isempty(sizes)) && return e
+  local selection::Union{Nothing, Vector{Union{Int, Vector{Int}}}} = referenceSelection(e.cref, sizes)
+  selection === nothing && return e
+  return selectedRecords(e.cref, Int[], selection, sizes, element)
+end
+
+"The records of the array `cref` names that `selection` picks after `index`: `selectedElements` of record references."
+function selectedRecords(cref::IR.ComponentRef, index::Vector{Int}, selection::Vector{Union{Int, Vector{Int}}},
+                         sizes::Vector{Int}, element::IR.T_RECORD)::IR.Expression
+  local d::Int = length(index) + 1
+  if d > length(selection)
+    all(k -> 1 <= index[k] <= sizes[k], eachindex(index)) ||
+      throw(NotHandled("the element $(cref.name)$(index) outside the array's dimensions $(sizes)"))
+    return IR.CREF(recordElementCref(cref, index), element)
+  end
+  local picked::Union{Int, Vector{Int}} = selection[d]
+  picked isa Int && return selectedRecords(cref, push!(copy(index), picked), selection, sizes, element)
+  local dims = IR.Dimension[IR.DIM_SIZE(length(s)) for s in selection[d:end] if s isa Vector{Int}]
+  local elements::Vector{IR.Expression} =
+    IR.Expression[selectedRecords(cref, push!(copy(index), k), selection, sizes, element) for k in picked]
+  return IR.ARRAY(elements, IR.T_ARRAY(element, dims))
 end
 
 """
@@ -345,9 +456,11 @@ end
 
 `e[subscripts]` for an expression `e` of the scalarized model and literal subscripts: picked out of an array value
 (`(2 * {a, b})[1]` is `2 * a`, `selectElement`; `{f(i) for i in 1:n}[2]` is `f(2)`, a nested constructor by each
-subscript in turn; `cos({a, b})[2]` is `cos(b)`, an element-wise built-in); subscripted where it is not.
+subscript in turn; `cos({a, b})[2]` is `cos(b)`, `der({a, b})[2]` is `der(b)`, `(not {a, b})[2]` is `not b`: an
+element-wise operator, `isElementwise`, also where it is left inside the picked element); subscripted where it is not.
 """
-function pickElement(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType, E::Elements)::IR.Expression
+function pickElement(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType,
+                     E::Elements)::IR.Expression
   local index::Union{Nothing, Vector{Int}} = IR.literalIndices(subscripts)
   if e isa IR.ARRAY_CONSTRUCTOR && index !== nothing
     local body = constructorElement(e, index[1])
@@ -356,36 +469,121 @@ function pickElement(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::IR.
       return length(subscripts) == 1 ? element : pickElement(element, subscripts[2:end], ty, E)
     end
   end
-  if e isa IR.CALL && e.attributes.builtin && e.name in ELEMENTWISE_BUILTINS && length(e.arguments) == 1 &&
-     IR.typeOf(e.arguments[1]) isa IR.T_ARRAY
+  if e isa IR.CALL && isElementwise(e)
     return IR.CALL(e.name, IR.Expression[pickElement(e.arguments[1], subscripts, ty, E)], ty, e.attributes)
+  elseif e isa IR.LUNARY && isElementwise(e)
+    return IR.LUNARY(e.op, pickElement(e.exp, subscripts, ty, E))
+  elseif e isa IR.LBINARY && isElementwise(e)
+    return IR.LBINARY(logicalOperand(e.exp1, subscripts, ty, E), e.op, logicalOperand(e.exp2, subscripts, ty, E))
   end
-  return foldTree(selectElement(e, subscripts, ty))
+  local picked::IR.Expression = selectElement(e, subscripts, ty)
+  #= an element-wise operator left subscripted inside the element (`(a + der(b))[2]`: `a[2] + der(b)[2]`) =#
+  if IR.anyExp(isSubscriptedElementwise, picked)
+    picked = IR.mapExp(x -> isSubscriptedElementwise(x) ? pickElement(x.exp, x.subscripts, x.ty, E) : x, picked)
+  end
+  return foldTree(picked)
 end
 
-"The built-in functions of one argument applied element-wise to an array (MLS 12.4.6)."
+"An operand of an element-wise `and` or `or`: its element where it is an array, the scalar otherwise."
+logicalOperand(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType, E::Elements)::IR.Expression =
+  isArrayValued(e) ? pickElement(e, subscripts, ty, E) : e
+
+"""
+The built-in functions and operators of one argument applied element-wise to an array (MLS 12.4.6; `der`, `pre`,
+`previous` and `noEvent` of an array are those of its elements, MLS 3.7.4).
+"""
 const ELEMENTWISE_BUILTINS = (:sin, :cos, :tan, :asin, :acos, :atan, :sinh, :cosh, :tanh, :exp, :log, :log10, :sqrt,
-                              :abs, :sign, :floor, :ceil)
+                              :abs, :sign, :floor, :ceil, :der, :pre, :previous, :noEvent)
+
+"""
+    isElementwise(e) -> Bool
+
+Whether `e` is an operator applied to an array element by element, so that an element of it is the operator of the
+operand's element: a built-in of `ELEMENTWISE_BUILTINS` of one array argument, `not`, `and`, `or` of arrays.
+"""
+isElementwise(e::IR.CALL)::Bool =
+  e.attributes.builtin && e.name in ELEMENTWISE_BUILTINS && length(e.arguments) == 1 && isArrayValued(e.arguments[1])
+isElementwise(e::IR.LUNARY)::Bool = isArrayValued(e.exp)
+isElementwise(e::IR.LBINARY)::Bool = isArrayValued(e.exp1) || isArrayValued(e.exp2)
+isElementwise(::IR.Expression)::Bool = false
+
+"Whether `e` is an array (a logical operator has no type of its own: by its operands)."
+isArrayValued(e::IR.LUNARY)::Bool = isArrayValued(e.exp)
+isArrayValued(e::IR.LBINARY)::Bool = isArrayValued(e.exp1) || isArrayValued(e.exp2)
+isArrayValued(e::IR.Expression)::Bool = IR.typeOf(e) isa IR.T_ARRAY
+
+"Whether `x` is an element-wise operator subscripted by literals (`pickElement` takes the operand's element)."
+isSubscriptedElementwise(x::IR.Expression)::Bool =
+  x isa IR.SUBSCRIPTED && isElementwise(x.exp) && IR.literalIndices(x.subscripts) !== nothing
+
+"""
+    selectedParts(e) -> Expression
+
+`e` (its iterators replaced) with what its literals select taken before the rest is mapped: an element of an array
+literal (a table of pivots, a binding), an element of a constructor (`{f(i) for i in 1:1000}[100]`: its body there,
+the others not made), the branch of an if-expression whose condition is of literals (`if j == {1, 2, 3}[i] then a
+else b` at an `i` and a `j`, as the frontend's scalarization takes it; the other branch may read an element its
+array does not have, `x[i - 1]` at `i = 1`).
+"""
+selectedParts(e::IR.Expression)::IR.Expression = IR.mapExpTopDown(x -> (selectedPart(x), true), e)
+
+"The part of `x` its literals select (`selectedParts`), in turn (an element that is an if-expression); `x` without."
+function selectedPart(@nospecialize(x::IR.Expression))::IR.Expression
+  while true
+    local taken::IR.Expression = x
+    if x isa IR.IF_EXPRESSION
+      local known::Union{Nothing, Bool} = literalCondition(foldTree(selectedParts(x.condition)))
+      known === nothing || (taken = known ? x.thenExp : x.elseExp)
+    elseif x isa IR.SUBSCRIPTED && IR.literalIndices(x.subscripts) !== nothing
+      if x.exp isa IR.ARRAY
+        taken = selectElement(x.exp, x.subscripts, x.ty)
+        #= an element the literal does not have: subscripted again, as it was =#
+        (taken isa IR.SUBSCRIPTED && taken.exp === x.exp) && return x
+      elseif x.exp isa IR.ARRAY_CONSTRUCTOR
+        local body::Union{Nothing, IR.Expression} = constructorElement(x.exp, IR.literalIndex(x.subscripts[1]))
+        body === nothing ||
+          (taken = length(x.subscripts) == 1 ? body : IR.SUBSCRIPTED(body, x.subscripts[2:end], x.ty))
+      end
+    end
+    taken === x && return x
+    x = taken
+  end
+end
 
 """
     scalarExpression(e, values, E) -> Expression
 
 `e` in the scalarized model: the iterators of `values` replaced by their values (`withIterators`), references to
 arrays by their element variables (`elementReference`), an element picked out of an array value where its
-subscripts are literals (`pickElement`).
+subscripts are literals (`pickElement`). What literals select is taken first (`selectedParts`).
 """
 function scalarExpression(e::IR.Expression, values::Dict{Symbol, Int}, E::Elements)::IR.Expression
-  #= an element of an array literal (a table of pivots, a binding) picked before its other elements are mapped =#
-  local pruned = IR.mapExpTopDown(withIterators(e, values)) do x
-    (x isa IR.SUBSCRIPTED && x.exp isa IR.ARRAY && IR.literalIndices(x.subscripts) !== nothing) || return (x, true)
-    return (selectElement(x.exp, x.subscripts, x.ty), true)
-  end
+  local pruned::IR.Expression = selectedParts(withIterators(e, values))
   return IR.mapExp(pruned) do x
     x isa IR.CREF && return elementReference(x, E)
     (x isa IR.SUBSCRIPTED && IR.literalIndices(x.subscripts) !== nothing) && return pickElement(x.exp, x.subscripts, x.ty, E)
     (x isa IR.BINARY && x.op == IR.SCALAR_PRODUCT) && return expandedScalarProduct(x, E)
+    x isa IR.ARRAY_CONSTRUCTOR && return expandedConstructor(x, E)
     return x
   end
+end
+
+"""
+    expandedConstructor(e, E) -> Expression
+
+An array constructor of one iterator over a literal range as the array literal of its body at each of the
+iterator's values, each scalarized (`{f(x[i]) for i in 1:3}` is `{f(x[1]), f(x[2]), f(x[3])}`, as the frontend's
+scalarization writes it: the references by the iterator are to element variables); as it is for another one (a
+range that is not constant, several iterators).
+"""
+function expandedConstructor(e::IR.ARRAY_CONSTRUCTOR, E::Elements)::IR.Expression
+  length(e.iterators) == 1 || return e
+  local range::Union{Nothing, StepRange{Int, Int}} = literalRange(e.iterators[1].range)
+  range === nothing && return e
+  local name::Symbol = e.iterators[1].name
+  local elements::Vector{IR.Expression} =
+    IR.Expression[scalarExpression(withIterator(e.body, name, k), NO_ITERATORS, E) for k in range]
+  return IR.ARRAY(elements, e.ty)
 end
 
 """
@@ -393,14 +591,16 @@ end
 
 A scalar product of two vectors of a known size in the scalarized model: the sum of the products of their elements
 (`pickElement`), as the frontend's scalarization writes it (MultiBody's `tau = -frame_b.t * e`); as it is where the
-size is not known.
+size of neither is known (one's may be an expression of parameters, `bb[2:na] * x`: the other's holds).
 """
 function expandedScalarProduct(e::IR.BINARY, E::Elements)::IR.Expression
   local ty1::IR.ModelicaType = IR.typeOf(e.exp1)
-  (ty1 isa IR.T_ARRAY && length(ty1.dimensions) == 1 && ty1.dimensions[1] isa IR.DIM_SIZE) || return e
+  local size::Union{Nothing, Int} = vectorSize(ty1)
+  size === nothing && (size = vectorSize(IR.typeOf(e.exp2)))
+  size === nothing && return e
   local element::IR.ModelicaType = IR.elementType(ty1)
   local terms::Vector{IR.Expression} = IR.Expression[]
-  for k in 1:ty1.dimensions[1].size
+  for k in 1:size
     local index::Vector{IR.Subscript} = IR.Subscript[IR.INDEX(IR.INTEGER(k))]
     push!(terms, times(pickElement(e.exp1, index, element, E), pickElement(e.exp2, index, element, E)))
   end
@@ -408,14 +608,21 @@ function expandedScalarProduct(e::IR.BINARY, E::Elements)::IR.Expression
   return foldTree(foldl(plus, terms))
 end
 
+"The size of a vector type where it is a literal; `nothing` for another type."
+function vectorSize(ty::IR.ModelicaType)::Union{Nothing, Int}
+  (ty isa IR.T_ARRAY && length(ty.dimensions) == 1) || return nothing
+  return IR.dimensionSize(ty.dimensions[1])
+end
+
 """
     equationExpression(e, values, E) -> Expression
 
 `scalarExpression` of an expression of an equation, which may not keep a reference to an array by a subscript
-that is not literal (`danglingReference`): NotHandled for one.
+that is not literal (`danglingReference`): NotHandled for one, unless the scalar passes follow (`E.passesFollow`).
 """
 function equationExpression(e::IR.Expression, values::Dict{Symbol, Int}, E::Elements)::IR.Expression
   local scalar = scalarExpression(e, values, E)
+  E.passesFollow && return scalar
   local dangling = danglingReference(scalar, E)
   dangling === nothing || throw(NotHandled("the reference $(dangling) to an array by a subscript that is not constant"))
   return scalar
@@ -425,8 +632,8 @@ end
     ElementValue
 
 An attribute or binding of an array variable, for its elements (`elementValue`, `valueAt`): `EachValue` the same
-for every element, `ArrayValue` an array value picked per element, `ComponentValue` a component array's value of its
-fields per element.
+for every element, `ArrayValue` an array value picked per element (of a component array, per element of the field
+in each component), `ComponentValue` a value reading the fields of the element's own component.
 """
 abstract type ElementValue end
 
@@ -435,23 +642,32 @@ struct EachValue <: ElementValue
   value::IR.Expression
 end
 
-"An array value of the variable's dimensions, scalarized once (`scalarExpression`), its element picked per element."
+"""
+    ArrayValue(value, ty, lead)
+
+An array value, scalarized once (`scalarExpression`), its element picked per element: of the variable's dimensions
+(`lead` 0), or of its trailing ones, the same for each component of a component array (`b = {1, 2}` of `b[2]` in
+`f[3]`, as the frontend keeps the class's value; `lead` the component's dimensions before it, 1).
+"""
 struct ArrayValue <: ElementValue
   value::IR.Expression
   ty::IR.T_ARRAY
+  lead::Int
 end
 
 """
-    ComponentValue(value, prefix, sizes)
+    ComponentValue(value, cref, ty, lead)
 
-A value of a field of a component array written over the component's fields (`p.L * cos(p.angle)` of `p.x`, as the
-frontend keeps it for `p[3]`): for each element its fields' elements (`componentElement`); `prefix` the component's
-parts, `sizes` its dimensions.
+A value of a variable `cref` in a component array that reads fields of its own component (`p.L * cos(p.angle)` of
+`p.x`, `bb[1] / a` of `d`: the class's value, its references typed as in the class, as the frontend keeps it for
+`p[3]`): for each element the fields of the element's component (`componentElement`), then, of an array value (`ty`
+of the field's own dimensions, after the `lead` of its components), the element's.
 """
 struct ComponentValue <: ElementValue
   value::IR.Expression
-  prefix::Vector{Symbol}
-  sizes::Vector{Int}
+  cref::IR.ComponentRef
+  ty::IR.ModelicaType
+  lead::Int
 end
 
 elementValue(::Nothing, ::IR.Variable, ::Elements)::Nothing = nothing
@@ -459,48 +675,85 @@ elementValue(::Nothing, ::IR.Variable, ::Elements)::Nothing = nothing
 """
     elementValue(a, v, E) -> ElementValue
 
-The attribute or binding `a` of the array variable `v` for its elements: an array value of `v`'s dimensions an
-`ArrayValue`; a scalar one reading whole fields of `v`'s own component array a `ComponentValue`; another scalar one
-an `EachValue` (read as written). NotHandled for an array value of other dimensions, and for a component value that
-reduces a field (`sum(p.w)`).
+The attribute or binding `a` of the array variable `v` for its elements: one reading fields of `v`'s own component
+(`isComponentField`) a `ComponentValue`; another array value, of `v`'s dimensions or of its trailing ones (a field
+array of a component array, the value of each component), an `ArrayValue`; another scalar one an `EachValue` (read
+as written). A dimension of the value without a literal size (`fill(0.0, n)` typed `Real[n]`) is the variable's.
+NotHandled for an array value of other dimensions.
 """
 function elementValue(a::IR.Expression, v::IR.Variable, E::Elements)::ElementValue
   local sizes = E.sizes[v.name]
   local ty = IR.typeOf(a)
+  local lead::Int = length(sizes)
   if ty isa IR.T_ARRAY
     local dims = Int[something(IR.dimensionSize(d), -1) for d in IR.dimensions(ty)]
-    dims == sizes || throw(NotHandled("an attribute of $(v.name) of dimensions $(dims), the variable's $(sizes)"))
-    return ArrayValue(scalarExpression(a, NO_ITERATORS, E), ty)
+    lead -= length(dims)
+    (lead >= 0 && all(k -> dims[k] == -1 || dims[k] == sizes[lead + k], eachindex(dims))) ||
+      throw(NotHandled("an attribute of $(v.name) of dimensions $(dims), the variable's $(sizes)"))
   end
-  local prefix = componentPrefix(v.cref)
-  (prefix !== nothing && IR.anyExp(x -> isComponentField(x, prefix, sizes, E), a)) ||
-    return EachValue(scalarExpression(a, NO_ITERATORS, E))
-  IR.anyExp(x -> x isa IR.CALL && x.attributes.builtin && x.name in REDUCING_BUILTINS, a) &&
-    throw(NotHandled("an attribute of the component array field $(v.name) that reduces an array ($(IR.toString(a)))"))
-  return ComponentValue(a, prefix, sizes)
+  IR.anyExp(x -> isComponentField(x, v.cref, sizes, E), a) && return ComponentValue(a, v.cref, ty, lead)
+  local value::IR.Expression = scalarExpression(a, NO_ITERATORS, E)
+  return ty isa IR.T_ARRAY ? ArrayValue(value, ty, lead) : EachValue(value)
 end
 
-"The built-in functions that reduce an array or read its shape: a component value reading fields through one is not componentwise."
-const REDUCING_BUILTINS = (:sum, :product, :min, :max, :size, :ndims, :scalar, :vector, :matrix, :transpose, :cross, :skew,
-                           :identity, :diagonal, :fill, :zeros, :ones, :linspace, :cat, :array)
-
 """
-    componentPrefix(cref) -> Union{Nothing, Vector{Symbol}}
+    componentDimensions(x, E) -> Int
 
-Of a field of a component array (the dimensions on a part before the last: `p.x` of `p[3]`), the names of the parts
-up to the component's (`[:p]`); `nothing` for another reference (an array of one part, a field array of a scalar
-component).
+The leading dimensions of the array `x` references that its type does not have and its subscripts do not index:
+those of the component arrays it is a field of, in a value kept as the class has it (`p.L` typed `Real`, `p.w[1]`
+of `Real w[2]`, in a value of a field of `p[3]`: 1). 0 for a reference typed with all its dimensions (`s` typed
+`Real[3]` in `p(k = s)`), and for one to no array.
 """
-function componentPrefix(cref::IR.ComponentRef)::Union{Nothing, Vector{Symbol}}
-  local parts = cref.parts
-  local k = findlast(p -> !isempty(IR.dimensions(p.ty)), parts[1:end-1])
-  k === nothing && return nothing
-  return Symbol[p.name for p in parts[1:k]]
+function componentDimensions(x::IR.CREF, E::Elements)::Int
+  local full::Union{Nothing, Vector{Int}} =
+    get(E.sizes, IR.hasSubscripts(x.cref) ? unsubscriptedName(x.cref) : x.cref.name, nothing)
+  full === nothing && IR.elementType(x.ty) isa IR.T_RECORD && (full = recordSizes(x.cref))
+  full === nothing && return 0
+  return length(full) - count(s -> s isa IR.INDEX, allSubscripts(x.cref)) - length(IR.dimensions(x.ty))
 end
 
-"Whether `x` is a whole reference to a field of the component array `prefix` of dimensions `sizes`."
-isComponentField(x::IR.Expression, prefix::Vector{Symbol}, sizes::Vector{Int}, E::Elements)::Bool =
-  x isa IR.CREF && !IR.hasSubscripts(x.cref) && get(E.sizes, x.cref.name, nothing) == sizes && componentPrefix(x.cref) == prefix
+"""
+    componentCref(cref, own, index, missing) -> ComponentRef
+
+The reference `cref` of a value of the element `index` of the variable `own`, with the element's component named:
+the component arrays both are fields of (the parts of the same names from the first, before `own`'s last), where
+`cref` does not subscript them, subscripted by the element's indices of them (`p[2].L` for `p.L` in the value of
+`p.x[2]`), up to `missing` dimensions (`componentDimensions`); the parts' types `own`'s (a value's reference may
+lack those of the parts before its component). `cref` itself where it names none.
+"""
+componentCref(cref::IR.ComponentRef, own::IR.ComponentRef, index::Vector{Int}, missing::Int)::IR.ComponentRef =
+  componentCref(cref, own, IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index], missing)
+
+"`componentCref` by the subscripts `index` of the element (the iterators of a for-equation over the elements)."
+function componentCref(cref::IR.ComponentRef, own::IR.ComponentRef, index::Vector{IR.Subscript},
+                       missing::Int)::IR.ComponentRef
+  local parts::Vector{IR.CrefPart} = cref.parts
+  local at::Int = 0
+  for k in 1:min(length(cref.parts), length(own.parts) - 1)
+    local p::IR.CrefPart = cref.parts[k]
+    local q::IR.CrefPart = own.parts[k]
+    p.name === q.name || break
+    local n::Int = q.ty isa IR.T_ARRAY ? length(IR.dimensions(q.ty)) : 0
+    if 0 < n <= missing && isempty(p.subscripts)
+      parts === cref.parts && (parts = copy(cref.parts))
+      parts[k] = IR.CrefPart(p.name, index[at + 1:at + n], q.ty)
+      missing -= n
+    end
+    at += n
+  end
+  return parts === cref.parts ? cref : IR.ComponentRef(parts)
+end
+
+"""
+Whether `x` reads a field of the component an element of the variable `own` (of dimensions `sizes`) is in: a
+reference typed without its components' dimensions (`componentDimensions`) that shares them with `own`
+(`componentCref`).
+"""
+function isComponentField(x::IR.Expression, own::IR.ComponentRef, sizes::Vector{Int}, E::Elements)::Bool
+  x isa IR.CREF || return false
+  local missing::Int = componentDimensions(x, E)
+  return missing > 0 && componentCref(x.cref, own, sizes, missing) !== x.cref
+end
 
 """
     valueAt(v, index, E) -> Union{Nothing, Expression}
@@ -511,15 +764,15 @@ cannot scalarize (a reference by a subscript that is not literal, an element-wis
 valueAt(::Nothing, ::Vector{Int}, ::Elements)::Nothing = nothing
 valueAt(v::EachValue, ::Vector{Int}, E::Elements)::IR.Expression = checkedValue(v.value, E)
 valueAt(v::ArrayValue, index::Vector{Int}, E::Elements)::IR.Expression =
-  checkedValue(pickElement(v.value, IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index], IR.elementType(v.ty), E), E)
+  checkedValue(pickElement(v.value, IR.Subscript[IR.INDEX(IR.INTEGER(index[k])) for k in (v.lead + 1):length(index)],
+                           IR.elementType(v.ty), E), E)
 valueAt(v::ComponentValue, index::Vector{Int}, E::Elements)::IR.Expression = checkedValue(componentElement(v, index, E), E)
 
 "`value`, scalarized for an element; NotHandled where it is not (`valueAt`)."
 function checkedValue(value::IR.Expression, E::Elements)::IR.Expression
-  local dangling = danglingReference(value, E)
+  local dangling = E.passesFollow ? nothing : danglingReference(value, E)
   dangling === nothing || throw(NotHandled("an attribute reading $(dangling) by a subscript that is not constant"))
-  IR.anyExp(x -> x isa IR.CALL && x.attributes.builtin && x.name in ELEMENTWISE_BUILTINS &&
-                 any(a -> IR.typeOf(a) isa IR.T_ARRAY, x.arguments), value) &&
+  IR.anyExp(x -> x isa IR.CALL && isElementwise(x), value) &&
     throw(NotHandled("an attribute of an element-wise built-in of an array ($(IR.toString(value)))"))
   return value
 end
@@ -527,19 +780,20 @@ end
 """
     componentElement(v, index, E) -> Expression
 
-The component value `v` for the element `index`: each whole field of its component array by its element at `index`
-(`isComponentField`), then scalarized (`scalarExpression`). NotHandled for a whole array left (another array, a field
-of another size).
+The component value `v` for the element `index`: each field of its component by that of the element's component
+(`componentCref`), scalarized (`scalarExpression`), and of an array value the element's (`pickElement`).
 """
 function componentElement(v::ComponentValue, index::Vector{Int}, E::Elements)::IR.Expression
-  local selection = Union{Int, Vector{Int}}[k for k in index]
-  local picked = IR.mapExp(v.value) do x
-    isComponentField(x, v.prefix, v.sizes, E) || return x
-    return selectedElements(x.cref.name, Int[], selection, E, IR.elementType(x.ty))
+  local named::IR.Expression = IR.mapExp(v.value) do x
+    x isa IR.CREF || return x
+    local missing::Int = componentDimensions(x, E)
+    missing > 0 || return x
+    return IR.CREF(componentCref(x.cref, v.cref, index, missing), x.ty)
   end
-  IR.anyExp(x -> x isa IR.CREF && !IR.hasSubscripts(x.cref) && haskey(E.sizes, x.cref.name), picked) &&
-    throw(NotHandled("a component array's attribute reading another whole array ($(IR.toString(v.value)))"))
-  return scalarExpression(picked, NO_ITERATORS, E)
+  local value::IR.Expression = scalarExpression(named, NO_ITERATORS, E)
+  v.lead == length(index) && return value
+  return pickElement(value, IR.Subscript[IR.INDEX(IR.INTEGER(index[k])) for k in (v.lead + 1):length(index)],
+                     IR.elementType(v.ty), E)
 end
 
 "The element of the array `name` at `index` where `name` is an array of `E`; NotHandled for a scalar."
@@ -583,7 +837,9 @@ function scalarVariables(variables::IR.VariableSet, E::Elements)::IR.VariableSet
       continue
     end
     local element = IR.elementType(v.ty)
+    #= clocks and external objects: variables of the scalar passes only (the array form has no element of them) =#
     element isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION, IR.T_STRING} ||
+      (E.passesFollow && element isa Union{IR.T_CLOCK, IR.T_EXTERNAL_OBJECT}) ||
       throw(NotHandled("the array $(v.name) of $(element) elements"))
     local (binding, start, fixed, nominal, low, high) =
       (elementValue(v.binding, v, E), elementValue(a.start, v, E), elementValue(a.fixed, v, E), elementValue(a.nominal, v, E),
@@ -629,8 +885,8 @@ end
 
 function scalarEquations!(out::Vector{IR.Equation}, origins::Vector{EquationOrigin}, eq::IR.SCALAR_EQUATION,
                           origin::EquationOrigin, values::Dict{Symbol, Int}, E::Elements)::Nothing
-  push!(out, IR.SCALAR_EQUATION(equationExpression(eq.lhs, values, E), equationExpression(eq.rhs, values, E), eq.ty,
-                                eq.source, unlinked(eq.attributes)))
+  local lhs::IR.Expression = withoutEmptyTargets(equationExpression(eq.lhs, values, E))
+  push!(out, IR.SCALAR_EQUATION(lhs, equationExpression(eq.rhs, values, E), eq.ty, eq.source, unlinked(eq.attributes)))
   push!(origins, origin)
   return nothing
 end
@@ -638,12 +894,29 @@ end
 function scalarEquations!(out::Vector{IR.Equation}, origins::Vector{EquationOrigin}, eq::IR.ARRAY_EQUATION,
                           origin::EquationOrigin, values::Dict{Symbol, Int}, E::Elements)::Nothing
   local (lhs, rhs) = (equationExpression(eq.lhs, values, E), equationExpression(eq.rhs, values, E))
+  #= As lowered, an array equation is `rhs = lhs` of its source (LowerFlatModel's `lowerEquation`); its elements for
+     the scalar passes are `lhs[i] = rhs[i]` again, as the frontend's scalarization writes them: the initialization
+     takes `pre(x) = value` as the start of `pre(x)` in that orientation only (MSL Noise's `pre(state) =
+     initialState(...)`: with the sides swapped the model did not build, "DAE init: residual 2e9") =#
+  E.passesFollow && ((lhs, rhs) = (rhs, lhs))
   local element = IR.elementType(eq.ty)
-  for index in rowMajor(knownSizes(eq.ty, "an array equation"))
+  local indices::Vector{Vector{Int}} = rowMajor(knownSizes(eq.ty, "an array equation"))
+  #= and in the frontend's order, the last element first: the order of the equations decides the alias roots and the
+     states the passes choose (MSL MultiBody PrismaticConstraint: other states, and a build the frontend's order
+     does not need) =#
+  E.passesFollow && reverse!(indices)
+  for index in indices
     local subscripts = IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index]
-    push!(out, IR.SCALAR_EQUATION(pickElement(lhs, subscripts, element, E), pickElement(rhs, subscripts, element, E), element,
-                                  eq.source, unlinked(eq.attributes)))
-    push!(origins, EquationOrigin(origin.equation, origin.path, origin.iteration, index))
+    local (l, r) = (pickElement(lhs, subscripts, element, E), pickElement(rhs, subscripts, element, E))
+    local at = EquationOrigin(origin.equation, origin.path, origin.iteration, index)
+    if element isa IR.T_RECORD   # an element of an array of records: the record equation of the two elements
+      local fieldwise::IR.RECORD_EQUATION =
+        IR.RECORD_EQUATION(l, r, element, length(element.fields), eq.source, eq.attributes)
+      scalarEquations!(out, origins, fieldwise, at, NO_ITERATORS, E)
+      continue
+    end
+    push!(out, IR.SCALAR_EQUATION(l, r, element, eq.source, unlinked(eq.attributes)))
+    push!(origins, at)
   end
   return nothing
 end
@@ -680,7 +953,8 @@ end
 function scalarEquations!(out::Vector{IR.Equation}, origins::Vector{EquationOrigin}, eq::IR.WHEN_EQUATION,
                           origin::EquationOrigin, values::Dict{Symbol, Int}, E::Elements)::Nothing
   local branches = IR.WhenBranch[IR.WhenBranch(IR.Expression[equationExpression(t, values, E) for t in b.triggers], b.atInitial,
-                                               b.atTerminal, scalarStatements(b.body, values, E)) for b in eq.branches]
+                                               b.atTerminal, elementAssignments(scalarStatements(b.body, values, E), E))
+                                 for b in eq.branches]
   push!(out, IR.WHEN_EQUATION(branches, eq.kind, eq.source, unlinked(eq.attributes)))
   push!(origins, origin)
   return nothing
@@ -688,11 +962,26 @@ end
 
 function scalarEquations!(out::Vector{IR.Equation}, origins::Vector{EquationOrigin}, eq::IR.ALGORITHM,
                           origin::EquationOrigin, values::Dict{Symbol, Int}, E::Elements)::Nothing
+  local loop::Union{Nothing, IR.FOR_STATEMENT} = E.passesFollow ? independentLoop(eq.statements) : nothing
+  local range::Union{Nothing, StepRange{Int, Int}} =
+    loop === nothing ? nothing : literalRange(scalarExpression(loop.iterator.range, values, E))
+  if loop !== nothing && range !== nothing
+    #= one algorithm per iteration, as the frontend's scalarization has one per component =#
+    local inner::Dict{Symbol, Int} = copy(values)
+    for k in range
+      inner[loop.iterator.name] = k
+      scalarEquations!(out, origins, IR.ALGORITHM(loop.body, assignedCrefs(loop.body), eq.source, eq.attributes),
+                       EquationOrigin(origin.equation, origin.path, vcat(origin.iteration, k), Int[]), inner, E)
+    end
+    return nothing
+  end
   local outputs = IR.ComponentRef[]
   for c in eq.outputs
     pushReferences!(outputs, elementReference(IR.CREF(withIteratorCref(c, values), IR.T_UNKNOWN()), E))
   end
-  push!(out, IR.ALGORITHM(scalarStatements(eq.statements, values, E), outputs, eq.source, unlinked(eq.attributes)))
+  local statements::Vector{IR.Statement} = IR.Statement[wholeTargets(s, x, values) for (s, x) in
+                                                        zip(eq.statements, scalarStatements(eq.statements, values, E))]
+  push!(out, IR.ALGORITHM(statements, outputs, eq.source, unlinked(eq.attributes)))
   push!(origins, origin)
   return nothing
 end
@@ -711,8 +1000,104 @@ function scalarEquations!(out::Vector{IR.Equation}, origins::Vector{EquationOrig
   return nothing
 end
 
+"""
+A record equation, where the scalar passes follow (`E.passesFollow`; NotHandled otherwise): by its fields where its
+right-hand side is not a call (`recordEquations`, as the frontend's scalarization writes `a = b` of two records),
+each scalarized in turn; one of a call (its result assigned whole; the branch of an if-expression its iterators
+select, `selectedParts`), or that has no fields to go by, a record equation of the scalarized sides. A constant
+`Complex(re, im)` constructor call is the record value (`constantRecord`).
+"""
+function scalarEquations!(out::Vector{IR.Equation}, origins::Vector{EquationOrigin}, eq::IR.RECORD_EQUATION,
+                          origin::EquationOrigin, values::Dict{Symbol, Int}, E::Elements)::Nothing
+  E.passesFollow || throw(NotHandled("a RECORD_EQUATION with arrays kept"))
+  local lhs::IR.Expression = constantRecord(withIterators(eq.lhs, values))
+  local rhs::IR.Expression = constantRecord(selectedParts(withIterators(eq.rhs, values)))
+  if !(rhs isa IR.CALL)
+    local fields::Vector{IR.Equation} = recordEquations(lhs, rhs, eq.source)
+    if !(length(fields) == 1 && fields[1] isa IR.RECORD_EQUATION)
+      foreach(f -> scalarEquations!(out, origins, f, origin, NO_ITERATORS, E), fields)
+      return nothing
+    end
+  end
+  push!(out, IR.RECORD_EQUATION(equationExpression(lhs, NO_ITERATORS, E), equationExpression(rhs, NO_ITERATORS, E),
+                                eq.ty, eq.size, eq.source, unlinked(eq.attributes)))
+  push!(origins, origin)
+  return nothing
+end
+
 scalarEquations!(::Vector{IR.Equation}, ::Vector{EquationOrigin}, eq::IR.Equation, ::EquationOrigin, ::Dict{Symbol, Int},
                  ::Elements)::Nothing = throw(NotHandled("a $(nameof(typeof(eq))) with arrays kept"))
+
+"""
+    independentLoop(statements) -> Union{Nothing, IR.FOR_STATEMENT}
+
+The for-statement an algorithm consists of, where its iterations are independent of each other: the algorithm is
+then one algorithm per iteration (with arrays kept the frontend writes the algorithm section of a component array
+as a loop over the components; scalarized it has one algorithm per component). Independent: every variable the
+body assigns or reinitializes is subscripted by the loop's iterator in one of its dimensions, the same in every
+assignment and in every reference of the body, so that an iteration reads and writes its own elements only.
+`nothing` for another algorithm (several statements, a target that is not a reference, a variable assigned whole).
+"""
+function independentLoop(statements::Vector{IR.Statement})::Union{Nothing, IR.FOR_STATEMENT}
+  (length(statements) == 1 && statements[1] isa IR.FOR_STATEMENT) || return nothing
+  local loop::IR.FOR_STATEMENT = statements[1]
+  local name::Symbol = loop.iterator.name
+  local targets::Vector{IR.ComponentRef} = IR.ComponentRef[]
+  collectTargets!(targets, loop.body) || return nothing
+  local at::Dict{Symbol, Int} = Dict{Symbol, Int}()   # an assigned array => the dimension the iterator subscripts
+  for target in targets
+    local dimension::Union{Nothing, Int} = iteratorDimension(target, name)
+    dimension === nothing && return nothing
+    get!(at, unsubscriptedName(target), dimension) == dimension || return nothing
+  end
+  isempty(at) && return nothing
+  local independent::Base.RefValue{Bool} = Ref(true)
+  for s in loop.body
+    IR.foreachExp(s) do x::IR.Expression
+      x isa IR.CREF || return nothing
+      local array::Symbol = IR.hasSubscripts(x.cref) ? unsubscriptedName(x.cref) : x.cref.name
+      local dimension::Union{Nothing, Int} = get(at, array, nothing)
+      dimension === nothing && return nothing
+      iteratorDimension(x.cref, name) == dimension || (independent[] = false)
+      return nothing
+    end
+  end
+  return independent[] ? loop : nothing
+end
+
+"The first of the dimensions of `cref` (`allSubscripts`) subscripted by the iterator `name`; `nothing` without one."
+function iteratorDimension(cref::IR.ComponentRef, name::Symbol)::Union{Nothing, Int}
+  for (d, s) in enumerate(allSubscripts(cref))
+    local index::Union{Nothing, IR.Expression} = s isa IR.INDEX ? s.exp : nothing
+    (index isa IR.CREF && index.cref.name === name && !IR.hasSubscripts(index.cref)) && return d
+  end
+  return nothing
+end
+
+"""
+    collectTargets!(out, statements) -> Bool
+
+The references `statements` assign or reinitialize, pushed onto `out`; false where a target is not a reference
+(or a tuple of references and discarded outputs).
+"""
+collectTargets!(out::Vector{IR.ComponentRef}, statements::Vector{IR.Statement})::Bool =
+  all(s -> collectTargets!(out, s), statements)
+function collectTargets!(out::Vector{IR.ComponentRef}, s::IR.ASSIGNMENT)::Bool
+  for target in (s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
+    target isa IR.WILD && continue
+    target isa IR.CREF || return false
+    push!(out, target.cref)
+  end
+  return true
+end
+collectTargets!(out::Vector{IR.ComponentRef}, s::IR.REINIT)::Bool = (push!(out, s.state); true)
+collectTargets!(out::Vector{IR.ComponentRef}, s::IR.IF_STATEMENT)::Bool =
+  all(b -> collectTargets!(out, b.body), s.branches) && collectTargets!(out, s.elseBody)
+collectTargets!(out::Vector{IR.ComponentRef}, s::IR.WHEN_STATEMENT)::Bool =
+  all(b -> collectTargets!(out, b.body), s.branches)
+collectTargets!(out::Vector{IR.ComponentRef}, s::Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT})::Bool =
+  collectTargets!(out, s.body)
+collectTargets!(::Vector{IR.ComponentRef}, ::IR.Statement)::Bool = true
 
 "`cref` with the iterators of `values` replaced by their values, its subscripts folded."
 withIteratorCref(cref::IR.ComponentRef, values::Dict{Symbol, Int})::IR.ComponentRef =
@@ -725,9 +1110,85 @@ Statements with their root expressions scalarized (`scalarExpression`; a loop's 
 by its element variable.
 """
 function scalarStatements(body::Vector{IR.Statement}, values::Dict{Symbol, Int}, E::Elements)::Vector{IR.Statement}
-  local g = e::IR.Expression -> scalarExpression(e, values, E)
+  #= a tuple as a root expression is the targets of an assignment =#
+  local g = e::IR.Expression -> withoutEmptyTargets(scalarExpression(e, values, E))
   return IR.Statement[scalarReinit(mapRoots(g, s), values, E) for s in body]
 end
+
+"""
+    elementAssignments(body, E) -> Vector{Statement}
+
+The statements of a when-equation with each assignment of an array (`d = 2 * pre(d)`, arrays kept: `{d[1], d[2]} :=
+2 * pre({d[1], d[2]})` in the scalarized model) as one assignment per element (`pickElement` of both sides), as the
+frontend's scalarization writes the equation; in the branches of an if too. An array of records and a tuple of
+targets stay. Not for an algorithm's statements: those run in order, and an array's assignment there reads its whole
+right-hand side before an element is assigned (`wholeTargets`).
+"""
+function elementAssignments(body::Vector{IR.Statement}, E::Elements)::Vector{IR.Statement}
+  local out::Vector{IR.Statement} = IR.Statement[]
+  foreach(s -> elementAssignments!(out, s, E), body)
+  return out
+end
+function elementAssignments!(out::Vector{IR.Statement}, s::IR.ASSIGNMENT, E::Elements)::Nothing
+  local ty::IR.ModelicaType = s.lhs isa IR.ARRAY ? IR.typeOf(s.lhs) : IR.T_UNKNOWN()
+  local element::IR.ModelicaType = ty isa IR.T_ARRAY ? IR.elementType(ty) : ty
+  if !(ty isa IR.T_ARRAY) || element isa IR.T_RECORD
+    push!(out, s)
+    return nothing
+  end
+  for index in rowMajor(knownSizes(ty, "an array assigned in a when-equation"))
+    local subscripts::Vector{IR.Subscript} = IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index]
+    push!(out, IR.ASSIGNMENT(pickElement(s.lhs, subscripts, element, E), pickElement(s.rhs, subscripts, element, E),
+                             s.source))
+  end
+  return nothing
+end
+function elementAssignments!(out::Vector{IR.Statement}, s::IR.IF_STATEMENT, E::Elements)::Nothing
+  local branches::Vector{IR.StatementBranch} =
+    IR.StatementBranch[IR.StatementBranch(b.condition, elementAssignments(b.body, E)) for b in s.branches]
+  push!(out, IR.IF_STATEMENT(branches, elementAssignments(s.elseBody, E), s.source))
+  return nothing
+end
+elementAssignments!(out::Vector{IR.Statement}, s::IR.Statement, ::Elements)::Nothing = (push!(out, s); nothing)
+
+"""
+    wholeTargets(original, scalar, values) -> Statement
+
+The statement `scalar` of an algorithm (`scalarStatements` of `original`) with each target that is an array as a
+whole as the reference it was (`s`, not `{s[1], s[2]}`; a loop's iterators at their values), also in a tuple of
+targets and in nested statements: the form the frontend's scalarization gives an algorithm, which the passes on
+algorithms take (`Passes.tupleAssignElements`: a target that is not a variable is not supported; MSL realFFT's
+`(info, Ai, ...) := realFFT(...)`, Xorshift64star's `(r, state) := random(pre(state))`).
+"""
+function wholeTargets(original::IR.ASSIGNMENT, scalar::IR.ASSIGNMENT, values::Dict{Symbol, Int})::IR.Statement
+  local lhs::IR.Expression = scalar.lhs
+  if original.lhs isa IR.TUPLE && lhs isa IR.TUPLE && length(original.lhs.elements) == length(lhs.elements)
+    lhs = IR.TUPLE(IR.Expression[wholeTarget(o, x, values) for (o, x) in zip(original.lhs.elements, lhs.elements)],
+                   lhs.ty)
+  else
+    lhs = wholeTarget(original.lhs, lhs, values)
+  end
+  return IR.ASSIGNMENT(lhs, scalar.rhs, scalar.source)
+end
+"The target `scalar` of `original`: the reference `original` where its scalarized form is its array of elements."
+wholeTarget(original::IR.Expression, scalar::IR.Expression, values::Dict{Symbol, Int})::IR.Expression =
+  (original isa IR.CREF && scalar isa IR.ARRAY) ? withIterators(original, values) : scalar
+wholeTargets(original::IR.IF_STATEMENT, scalar::IR.IF_STATEMENT, values::Dict{Symbol, Int})::IR.Statement =
+  IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(x.condition, wholeTargets(o.body, x.body, values))
+                                     for (o, x) in zip(original.branches, scalar.branches)],
+                  wholeTargets(original.elseBody, scalar.elseBody, values), scalar.source)
+wholeTargets(original::IR.FOR_STATEMENT, scalar::IR.FOR_STATEMENT, values::Dict{Symbol, Int})::IR.Statement =
+  IR.FOR_STATEMENT(scalar.iterator, wholeTargets(original.body, scalar.body, values), scalar.source)
+wholeTargets(original::IR.WHILE_STATEMENT, scalar::IR.WHILE_STATEMENT, values::Dict{Symbol, Int})::IR.Statement =
+  IR.WHILE_STATEMENT(scalar.condition, wholeTargets(original.body, scalar.body, values), scalar.source)
+wholeTargets(original::IR.WHEN_STATEMENT, scalar::IR.WHEN_STATEMENT, values::Dict{Symbol, Int})::IR.Statement =
+  IR.WHEN_STATEMENT(IR.WhenBranch[IR.WhenBranch(x.triggers, x.atInitial, x.atTerminal,
+                                                wholeTargets(o.body, x.body, values))
+                                  for (o, x) in zip(original.branches, scalar.branches)], scalar.source)
+wholeTargets(::IR.Statement, scalar::IR.Statement, ::Dict{Symbol, Int})::IR.Statement = scalar
+wholeTargets(original::Vector{IR.Statement}, scalar::Vector{IR.Statement},
+             values::Dict{Symbol, Int})::Vector{IR.Statement} =
+  IR.Statement[wholeTargets(o, x, values) for (o, x) in zip(original, scalar)]
 
 "A `reinit`'s state by its element variable; another statement (its nested ones too) as it is."
 function scalarReinit(s::IR.REINIT, values::Dict{Symbol, Int}, E::Elements)::IR.Statement
@@ -741,17 +1202,17 @@ scalarReinit(s::IR.IF_STATEMENT, values::Dict{Symbol, Int}, E::Elements)::IR.Sta
 scalarReinit(s::IR.Statement, ::Dict{Symbol, Int}, ::Elements)::IR.Statement = s
 
 """
-    scalarizeArrays(model) -> Scalarized
+    scalarizeArrays(model; passesFollow = false) -> Scalarized
 
 `model` with its arrays as their elements (`Scalarized`): its variables (`scalarVariables`), the equations and
 initial equations of its continuous partition (`scalarEquations!`). The model is not changed. NotHandled for a
 model with several continuous partitions, clocked partitions or structural modes, and for what
-`scalarEquations!` does not handle.
+`scalarEquations!` does not handle. `passesFollow`: `model` is as lowered and the scalar passes follow (`Elements`).
 """
-function scalarizeArrays(model::IR.Model)::Scalarized
+function scalarizeArrays(model::IR.Model; passesFollow::Bool = false)::Scalarized
   (length(model.continuous) == 1 && isempty(model.clocked) && isempty(model.modes)) ||
     throw(NotHandled("arrays in a model of several partitions or structural modes"))
-  local E = elements(model.variables)
+  local E = elements(model.variables; passesFollow)
   local variables = scalarVariables(model.variables, E)
   local p = model.continuous[1]
   local equations = IR.Equation[]
@@ -793,6 +1254,61 @@ function hasArrayEquations(model::IR.Model)::Bool
 end
 
 """
+    bindingEquation(v, variables) -> Union{Nothing, FOR_EQUATION}
+
+The declaration binding of the continuous Real array `v` (arrays kept) as a for-equation over its elements
+(`nestedFor`): `for \$i1 in 1:3 loop c[\$i1].b = 2 * c[\$i1].a; end for` of `Real b = 2 * a` in `C c[3]`. The
+frontend keeps the binding of a field of a component array as the class has it, its references typed without the
+components' dimensions (`c.a` typed `Real`): those are the fields of the element's component (`componentCref`). An
+array value of the field's own dimensions gives its element (`elementAt`). `nothing` where a dimension has no
+literal size, or the value's dimensions are not the variable's trailing ones.
+"""
+function bindingEquation(v::IR.Variable, variables::IR.VariableSet)::Union{Nothing, IR.FOR_EQUATION}
+  local binding::Union{Nothing, IR.Expression} = v.binding
+  (binding === nothing || !(v.ty isa IR.T_ARRAY)) && return nothing
+  local sizes::Vector{Int} = Int[]
+  for d in IR.dimensions(v.ty)
+    local n::Union{Nothing, Int} = IR.dimensionSize(d)
+    n === nothing && return nothing
+    push!(sizes, n)
+  end
+  local ty::IR.ModelicaType = IR.typeOf(binding)
+  local own::Int = ty isa IR.T_ARRAY ? length(IR.dimensions(ty)) : 0
+  local lead::Int = length(sizes) - own
+  lead >= 0 || return nothing
+  local subscripts::Vector{IR.Subscript} = iteratorSubscripts(sizes)
+  local named::IR.Expression = IR.mapExp(binding) do @nospecialize(x::IR.Expression)
+    x isa IR.CREF || return x
+    local missing::Int = missingComponentDimensions(x, variables)
+    missing > 0 || return x
+    return IR.CREF(componentCref(x.cref, v.cref, subscripts, missing), x.ty)
+  end
+  local element::IR.ModelicaType = IR.elementType(v.ty)
+  local value::IR.Expression = own == 0 ? named : elementAt(named, subscripts[lead + 1:end], element, variables)
+  local lhs::IR.Expression = IR.CREF(distributedCref(v, subscripts), element)
+  return nestedFor(IR.Equation[IR.SCALAR_EQUATION(lhs, value, element, v.source, IR.DEFAULT_ATTRIBUTES)], sizes)
+end
+
+"""
+`componentDimensions` of the reference `x` in a model with its arrays kept: the leading dimensions of the array
+variable it names that its type does not have and its subscripts do not index; 0 for a reference to no array.
+"""
+function missingComponentDimensions(x::IR.CREF, variables::IR.VariableSet)::Int
+  local name::Symbol = IR.hasSubscripts(x.cref) ? unsubscriptedName(x.cref) : x.cref.name
+  local v::Union{Nothing, IR.Variable} = get(variables, name, nothing)
+  #= a record is no variable: its dimensions are its first Real field's (`c.V_m` of a component array of Complex
+     values: `c.V_m.re`) =#
+  local ty::IR.ModelicaType = IR.elementType(x.ty)
+  while v === nothing && ty isa IR.T_RECORD && !isempty(ty.fields)
+    name = Symbol(name, ".", ty.fields[1].name)
+    v = get(variables, name, nothing)
+    ty = IR.elementType(ty.fields[1].ty)
+  end
+  (v === nothing || !(v.ty isa IR.T_ARRAY)) && return 0
+  return length(IR.dimensions(v.ty)) - count(s -> s isa IR.INDEX, allSubscripts(x.cref)) - length(IR.dimensions(x.ty))
+end
+
+"""
     rollArrayEquations!(model) -> Model
 
 The array equations of `model`'s continuous partitions (arrays kept) that read a continuous array as for-equations
@@ -802,26 +1318,141 @@ over their elements (`nestedFor`), before `expandEquations` would split them int
 """
 function rollArrayEquations!(model::IR.Model)::IR.Model
   for p in model.continuous
-    p.equations = IR.Equation[rolledEquation(eq, model.variables) for eq in p.equations]
+    local equations::Vector{IR.Equation} = IR.Equation[]
+    for eq in p.equations
+      local rolled::IR.Equation = rolledEquation(eq, model.variables)
+      local elements::Union{Nothing, Vector{IR.Equation}} =
+        rolled === eq && eq isa IR.ARRAY_EQUATION ? recordElementEquations(eq, model.variables) : nothing
+      elements === nothing ? push!(equations, rolled) : append!(equations, elements)
+    end
+    p.equations = equations
   end
   return model
 end
 
-rolledEquation(eq::IR.Equation, ::IR.VariableSet)::IR.Equation = eq
+"""
+The element of the array of records `e` at `subscripts`: of a reference the reference subscripted (an array of
+records is no variable, `elementAt` reads a variable's dimensions; its fields' arrays are), of another expression
+`elementAt`.
+"""
+function recordElementAt(e::IR.Expression, subscripts::Vector{IR.Subscript}, element::IR.ModelicaType,
+                         variables::IR.VariableSet)::IR.Expression
+  e isa IR.CREF && return IR.CREF(IR.appendSubscripts(e.cref, subscripts), element)
+  return elementAt(e, subscripts, element, variables)
+end
 
-function rolledEquation(eq::IR.ARRAY_EQUATION, variables::IR.VariableSet)::IR.Equation
-  local sizes = Int[]
+"""
+    recordElementEquations(eq, variables) -> Union{Nothing, Vector{Equation}}
+
+The array equation `eq` of records that is no for-equation over its elements (`elementLoop`: a side is the array of
+its elements' values written out, `{i_p[1] + i_n[1], i_p[2] + i_n[2], ...}`, which has no element by an iterator)
+as the equations of each element's fields (`bodyRecordEquations`); `nothing` for another equation, an unknown size,
+or where a record equation is left. `expandEquations` wrote one equation of a record per element, one row for its
+two unknowns (MSL QuasiStatic Polyphase: 18 unknowns over the rows).
+"""
+function recordElementEquations(eq::IR.ARRAY_EQUATION, variables::IR.VariableSet)::Union{Nothing, Vector{IR.Equation}}
+  local element::IR.ModelicaType = IR.elementType(eq.ty)
+  element isa IR.T_RECORD || return nothing
+  local sizes::Vector{Int} = Int[]
   for d in eq.ty.dimensions
-    local n = IR.dimensionSize(d)
+    local n::Union{Nothing, Int} = IR.dimensionSize(d)
+    n === nothing && return nothing
+    push!(sizes, n)
+  end
+  local out::Vector{IR.Equation} = IR.Equation[]
+  for index in rowMajor(sizes)
+    local subscripts::Vector{IR.Subscript} = IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index]
+    local elements::IR.RECORD_EQUATION =
+      IR.RECORD_EQUATION(recordElementAt(eq.lhs, subscripts, element, variables),
+                         recordElementAt(eq.rhs, subscripts, element, variables), element, length(element.fields),
+                         eq.source, eq.attributes)
+    local fields::Vector{IR.Equation} = bodyRecordEquations(IR.Equation[elements])
+    any(f -> f isa IR.RECORD_EQUATION, fields) && return nothing
+    append!(out, fields)
+  end
+  return out
+end
+
+rolledEquation(eq::IR.Equation, ::IR.VariableSet, used::Int = 0)::IR.Equation = eq
+
+"""
+The array equations in the body of a for-equation rolled likewise (`for \$i1 loop {a[\$i1], b[\$i1]} = c[\$i1].w`,
+an array field of a component array), by iterators after the enclosing ones (`used`, `iteratorIndex`).
+"""
+function rolledEquation(eq::IR.FOR_EQUATION, variables::IR.VariableSet, used::Int = 0)::IR.Equation
+  local inner::Int = max(used, iteratorIndex(eq.iterator.name))
+  local body::Vector{IR.Equation} = IR.Equation[rolledEquation(b, variables, inner) for b in eq.body]
+  all(k -> body[k] === eq.body[k], eachindex(body)) && return eq
+  return IR.FOR_EQUATION(eq.iterator, body, eq.source, eq.attributes)
+end
+
+function rolledEquation(eq::IR.ARRAY_EQUATION, variables::IR.VariableSet, used::Int = 0)::IR.Equation
+  #= an array of records has no variable of its own (its fields' arrays are the variables) =#
+  (IR.elementType(eq.ty) isa IR.T_RECORD || readsContinuousArray(eq.lhs, variables) ||
+   readsContinuousArray(eq.rhs, variables)) || return eq
+  return elementLoop(eq, variables, used)
+end
+
+"""
+    elementLoop(eq, variables, used) -> Equation
+
+The array equation `eq` as a for-equation over its elements (`nestedFor`, `lhs[\$i1] = rhs[\$i1]` by `elementAt`),
+by iterators after the enclosing ones (`used`); of an unknown size as it is. Of records: the elements' record
+equation by its fields in the body (`bodyRecordEquations`: a Complex one by its parts, `i_p[\$i1].re + i_n[\$i1].re
+= 0.0`), as it is where that leaves a record equation (a function's record result).
+"""
+function elementLoop(eq::IR.ARRAY_EQUATION, variables::IR.VariableSet, used::Int = 0)::IR.Equation
+  local sizes::Vector{Int} = Int[]
+  for d in eq.ty.dimensions
+    local n::Union{Nothing, Int} = IR.dimensionSize(d)
     n === nothing && return eq
     push!(sizes, n)
   end
-  (readsContinuousArray(eq.lhs, variables) || readsContinuousArray(eq.rhs, variables)) || return eq
-  local subscripts = iteratorSubscripts(sizes)
-  local element = IR.elementType(eq.ty)
-  local body = IR.SCALAR_EQUATION(elementAt(eq.lhs, subscripts, element, variables), elementAt(eq.rhs, subscripts, element, variables),
-                                  element, eq.source, eq.attributes)
-  return nestedFor(IR.Equation[body], sizes)
+  local subscripts::Vector{IR.Subscript} = iteratorSubscripts(sizes, used)
+  local element::IR.ModelicaType = IR.elementType(eq.ty)
+  if element isa IR.T_RECORD
+    local elements::IR.RECORD_EQUATION =
+      IR.RECORD_EQUATION(recordElementAt(eq.lhs, subscripts, element, variables),
+                         recordElementAt(eq.rhs, subscripts, element, variables), element, length(element.fields),
+                         eq.source, eq.attributes)
+    local fields::Vector{IR.Equation} = bodyRecordEquations(IR.Equation[elements])
+    any(f -> f isa IR.RECORD_EQUATION, fields) && return eq
+    return nestedFor(fields, sizes, used)
+  end
+  local body::IR.SCALAR_EQUATION =
+    IR.SCALAR_EQUATION(elementAt(eq.lhs, subscripts, element, variables),
+                       elementAt(eq.rhs, subscripts, element, variables), element, eq.source, eq.attributes)
+  return nestedFor(IR.Equation[body], sizes, used)
+end
+
+"""
+An if-equation whose branches all hold array equations of one size (an array-valued if-expression lifted to its
+variable, `liftIfExpressions!`: `if c then tmp = a else tmp = b`) as a for-equation over the elements with the
+if-equation of their elements in its body: `for i in 1:n loop if c then tmp[i] = a[i] else ... end for`.
+"""
+function rolledEquation(eq::IR.IF_EQUATION, variables::IR.VariableSet, used::Int = 0)::IR.Equation
+  local bodies::Vector{Vector{IR.Equation}} =
+    Vector{IR.Equation}[[b.equations for b in eq.branches]; [eq.elseEquations]]
+  local lead::Union{Nothing, IR.Equation} = isempty(bodies[1]) ? nothing : bodies[1][1]
+  lead isa IR.ARRAY_EQUATION || return eq
+  local sizes::Vector{Int} = Int[]
+  for d in lead.ty.dimensions
+    local n::Union{Nothing, Int} = IR.dimensionSize(d)
+    n === nothing && return eq
+    push!(sizes, n)
+  end
+  local alike = (b::IR.Equation) -> b isa IR.ARRAY_EQUATION && b.ty.dimensions == lead.ty.dimensions
+  all(body -> !isempty(body) && all(alike, body), bodies) || return eq
+  local subscripts::Vector{IR.Subscript} = iteratorSubscripts(sizes, used)
+  local element::IR.ModelicaType = IR.elementType(lead.ty)
+  local elements = (body::Vector{IR.Equation}) ->
+    IR.Equation[IR.SCALAR_EQUATION(elementAt(b.lhs, subscripts, element, variables),
+                                   elementAt(b.rhs, subscripts, element, variables), element, b.source, b.attributes)
+                for b in body]
+  local rolled::IR.IF_EQUATION =
+    IR.IF_EQUATION(IR.EquationBranch[IR.EquationBranch(b.condition, elements(b.equations)) for b in eq.branches],
+                   elements(eq.elseEquations), eq.source, eq.attributes)
+  return nestedFor(IR.Equation[rolled], sizes, used)
 end
 
 """
@@ -923,6 +1554,13 @@ function elementAt(@nospecialize(e::IR.Expression), subscripts::Vector{IR.Subscr
       local v = get(variables, x.exp.cref.name, nothing)
       (v !== nothing && v.ty isa IR.T_ARRAY && length(IR.dimensions(v.ty)) == length(subscripts)) &&
         return IR.CREF(distributedCref(v, subscripts), x.ty)
+    elseif x.exp isa IR.CREF
+      #= an array field of an element of a component array (`c[\$i1].w`, in a for-equation over the components) =#
+      local own::Vector{IR.Subscript} = allSubscripts(x.exp.cref)
+      local w = get(variables, unsubscriptedName(x.exp.cref), nothing)
+      (w !== nothing && w.ty isa IR.T_ARRAY && all(s -> s isa IR.INDEX, own) &&
+       length(IR.dimensions(w.ty)) == length(own) + length(subscripts)) &&
+        return IR.CREF(distributedCref(w, vcat(own, subscripts)), x.ty)
     elseif x.exp isa IR.ARRAY_CONSTRUCTOR && length(subscripts) == 1
       local body = constructorAt(x.exp, only(subscripts))
       body === nothing || return body

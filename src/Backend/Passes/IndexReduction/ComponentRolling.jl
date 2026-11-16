@@ -323,11 +323,15 @@ function equationForm(eq::IR.Equation)::RolledForm
   return SumForm(UInt[hash(t) for t in terms] <= UInt[hash(t) for t in flipped] ? terms : flipped)
 end
 
+"Whether `e` is a sum or difference of scalars: `+`, `-`, and the element-wise `.+`, `.-` of a scalar type."
+isScalarSum(e::IR.Expression)::Bool =
+  e isa IR.BINARY && (e.op in (IR.ADD, IR.SUB) || (e.op in (IR.ADD_EW, IR.SUB_EW) && !(e.ty isa IR.T_ARRAY)))
+
 "The signed terms of a sum (`(true, a)`, `(false, b)`), zeros left out, each term's form (`termForm`)."
 function signedTerms!(out::Vector{Tuple{Bool, TermForm}}, e::IR.Expression, positive::Bool)::Vector{Tuple{Bool, TermForm}}
-  if e isa IR.BINARY && e.op in (IR.ADD, IR.SUB)
+  if isScalarSum(e)
     signedTerms!(out, e.exp1, positive)
-    signedTerms!(out, e.exp2, e.op == IR.ADD ? positive : !positive)
+    signedTerms!(out, e.exp2, e.op in (IR.ADD, IR.ADD_EW) ? positive : !positive)
   elseif e isa IR.UNARY && e.op == IR.UMINUS
     signedTerms!(out, e.exp, !positive)
   elseif !(e isa Union{IR.REAL, IR.INTEGER} && iszero(e.value))
@@ -338,9 +342,9 @@ end
 
 "A term's form: its sums' terms and its products' factors in a normal order; another expression as written."
 function termForm(e::IR.Expression)::TermForm
-  if (e isa IR.BINARY && e.op in (IR.ADD, IR.SUB)) || (e isa IR.UNARY && e.op == IR.UMINUS)
+  if isScalarSum(e) || (e isa IR.UNARY && e.op == IR.UMINUS)
     return SumForm(sort!(signedTerms!(Tuple{Bool, TermForm}[], e, true); by = hash))
-  elseif e isa IR.BINARY && e.op == IR.MUL
+  elseif e isa IR.BINARY && (e.op == IR.MUL || (e.op == IR.MUL_EW && !(e.ty isa IR.T_ARRAY)))
     return ProductForm(sort!(TermForm[termForm(e.exp1), termForm(e.exp2)]; by = hash))
   end
   return LeafForm(e)

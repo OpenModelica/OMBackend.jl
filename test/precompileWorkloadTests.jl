@@ -5,6 +5,7 @@
 @testset "Precompile workload: translate and simulate" begin
   local CG = OMBackend.CodeGeneration
   local registered()::Vector{String} = String[collect(OMBackend.ARRAY_ODE_MODELS); collect(OMBackend.ARRAY_REDUCED_MODELS);
+                                              collect(OMBackend.BACKEND_SCALARIZED_MODELS);
                                               collect(keys(OMBackend.ARRAY_PATH_REASONS)); collect(keys(OMBackend.COMPILED_MODELS_MTK));
                                               collect(keys(OMBackend.IMTKGen.BUILT)); string.(keys(CG.MODELICA_FUNCTION_IMPLS));
                                               string.(keys(CG.COMPILED_BODIES))]
