@@ -137,6 +137,9 @@ function selectElement(@nospecialize(e::IR.Expression), subscripts::Vector{IR.Su
       return selectElement(e.elements[k], subscripts[2:end], ty)
     end
   end
+  #= pre(x)[k] is pre(x[k]), of any element type (a Boolean array's initial `pre(u) = {false, false}`) =#
+  (IR.isBuiltinCall(e, :pre) && length(e.arguments) == 1) &&
+    return IR.CALL(:pre, IR.Expression[selectElement(e.arguments[1], subscripts, ty)], ty, e.attributes)
   local distributed = ty isa IR.T_REAL ? scalarElement(e, subscripts, ty) : nothing
   distributed === nothing || return distributed
   local picked = IR.SUBSCRIPTED(e, subscripts, ty)

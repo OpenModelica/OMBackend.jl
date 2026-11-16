@@ -365,9 +365,15 @@ arrayStatement(names::Names, s::IR.IF_STATEMENT)::Statement =
 
 function arrayStatement(names::Names, s::IR.REINIT)::Statement
   local c::IR.ComponentRef = s.state
-  (IR.hasSubscripts(c) && !(simName(names, c) in names.known)) || return simStatement(names, s)
+  IR.hasSubscripts(c) || return simStatement(names, s)
   local base::IR.ComponentRef = IR.withoutSubscripts(c)
-  simName(names, base) in names.known || unsupported("a reinit of an element of no variable", IR.toString(c))
+  #= an element of an array variable by its subscripts, also where the element's own name is known (a rolled
+     component's state `mean1|mean2[1].x` is known as `mean1.x` too: "unknown variable mean1.x" in the array code);
+     an element that is a variable of its own (an array split for index reduction) by its name =#
+  if !(simName(names, base) in names.known)
+    simName(names, c) in names.known && return simStatement(names, s)
+    unsupported("a reinit of an element of no variable", IR.toString(c))
+  end
   local subscripts::Vector{Exp} = Exp[]
   for x in allSubscripts(c)
     x isa IR.INDEX || unsupported("a reinit of a slice", IR.toString(c))

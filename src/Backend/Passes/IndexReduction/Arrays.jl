@@ -1290,6 +1290,34 @@ function bindingEquation(v::IR.Variable, variables::IR.VariableSet)::Union{Nothi
 end
 
 """
+    discreteBindingEquations(v, variables) -> Vector{Equation}
+
+The declaration binding of the Boolean, Integer or enumeration array `v` (arrays kept: a field of an array of
+records, `states.phase` of `ThermodynamicState states[1] = {medium.state}`) as one equation per element,
+`v[k] = e[k]` (`bindingEquation` with its iterations written out, an element of an array literal picked): the
+passes of discrete equations take scalar ones. Empty where `bindingEquation` gives none. Without them the elements
+were discrete unknowns no equation gives (MSL Fluid PumpingSystem: 314 equations for 316 unknowns).
+"""
+function discreteBindingEquations(v::IR.Variable, variables::IR.VariableSet)::Vector{IR.Equation}
+  local rolled::Union{Nothing, IR.FOR_EQUATION} = bindingEquation(v, variables)
+  rolled === nothing && return IR.Equation[]
+  local iterators::Set{Symbol} = Set{Symbol}()
+  local loop::IR.Equation = rolled
+  while loop isa IR.FOR_EQUATION
+    push!(iterators, loop.iterator.name)
+    loop = loop.body[1]
+  end
+  local picked = (@nospecialize(x::IR.Expression)) ->
+    x isa IR.SUBSCRIPTED ? subscriptedReference(foldTree(selectElement(x.exp, x.subscripts, x.ty))) : x
+  local out::Vector{IR.Equation} = IR.Equation[]
+  for eq::IR.Equation in unrollIterators(rolled, iterators)
+    push!(out, eq isa IR.SCALAR_EQUATION ?
+                 IR.SCALAR_EQUATION(eq.lhs, IR.mapExp(picked, eq.rhs), eq.ty, eq.source, eq.attributes) : eq)
+  end
+  return out
+end
+
+"""
 `componentDimensions` of the reference `x` in a model with its arrays kept: the leading dimensions of the array
 variable it names that its type does not have and its subscripts do not index; 0 for a reference to no array.
 """
@@ -1337,8 +1365,50 @@ records is no variable, `elementAt` reads a variable's dimensions; its fields' a
 """
 function recordElementAt(e::IR.Expression, subscripts::Vector{IR.Subscript}, element::IR.ModelicaType,
                          variables::IR.VariableSet)::IR.Expression
-  e isa IR.CREF && return IR.CREF(IR.appendSubscripts(e.cref, subscripts), element)
+  e isa IR.CREF && return IR.CREF(sliceElementCref(e.cref, subscripts), element)
   return elementAt(e, subscripts, element, variables)
+end
+
+"""
+    sliceElementCref(cref, subscripts) -> ComponentRef
+
+The element `subscripts` of the array the reference `cref` names, where its parts select whole dimensions or ranges
+of them: each subscript in place of the reference's next slice, in order (`mediums[:].state` at i is
+`mediums[i].state`; `statesFM[2:3]` at i is `statesFM[1 + i]`, the range's member: `sliceMember`), those left after
+its last part's own (`IR.appendSubscripts`). MSL Fluid's pipes, `mediums[:].state = statesFM[2:3]`: with the
+subscript appended the body read `mediums[:].state[i].p` ("of more subscripts than its array's dimensions").
+"""
+function sliceElementCref(cref::IR.ComponentRef, subscripts::Vector{IR.Subscript})::IR.ComponentRef
+  local next::Int = 0
+  local parts::Vector{IR.CrefPart} = IR.CrefPart[]
+  for p::IR.CrefPart in cref.parts
+    local own::Vector{IR.Subscript} = IR.Subscript[]
+    for s::IR.Subscript in p.subscripts
+      local slice::Bool = s isa Union{IR.WHOLE, IR.SLICE} && next < length(subscripts)
+      push!(own, slice ? sliceMember(s, subscripts[next += 1]) : s)
+    end
+    push!(parts, own == p.subscripts ? p : IR.CrefPart(p.name, own, p.ty))
+  end
+  local resolved::IR.ComponentRef = IR.ComponentRef(parts)
+  return next == length(subscripts) ? resolved : IR.appendSubscripts(resolved, subscripts[(next + 1):end])
+end
+
+"The member `at` of the dimension a slice subscript selects: of the whole dimension `at` itself."
+sliceMember(::IR.WHOLE, at::IR.Subscript)::IR.Subscript = at
+
+"""
+Of a range of Integer literals its member: `first + (at - 1) * step`, a literal for a literal `at` (`2:3` at 2 is 3,
+at `i` it is `1 + i`). NotHandled for a slice that is no such range (an array of indices).
+"""
+function sliceMember(s::IR.SLICE, at::IR.Subscript)::IR.Subscript
+  local range::Union{Nothing, StepRange{Int, Int}} = literalRange(foldTree(s.exp))
+  (range === nothing || !(at isa IR.INDEX)) && throw(NotHandled("an element of a slice that is no range of literals"))
+  local k::Union{Nothing, Int} = IR.literalIndex(at)
+  k === nothing || return IR.INDEX(IR.INTEGER(range[k]))
+  local offset::Int = first(range) - step(range)
+  local scaled::IR.Expression =
+    step(range) == 1 ? at.exp : IR.BINARY(IR.INTEGER(step(range)), IR.MUL, at.exp, IR.T_INTEGER())
+  return IR.INDEX(offset == 0 ? scaled : IR.BINARY(IR.INTEGER(offset), IR.ADD, scaled, IR.T_INTEGER()))
 end
 
 """

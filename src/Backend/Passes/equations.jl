@@ -171,6 +171,8 @@ or enumeration's `v = e` (the discrete lifting makes it a when-equation where `e
 discrete-time). A Real array's `v = e` as a for-equation over its elements (`IndexReduction.bindingEquation`;
 arrays kept: a field of a component array, `Real b = 2 * a` of `C c[3]`; the frontend makes the binding of an array
 declared as one an equation itself and leaves none on the variable).
+A Boolean, Integer or enumeration array's (arrays kept) an equation per element
+(`IndexReduction.discreteBindingEquations`).
 A discrete Real with a binding is not Modelica (not supported). Parameters and constants (their bindings are their
 values), Strings, records and the other arrays are left.
 """
@@ -204,6 +206,8 @@ function addBindingEquations!(variables::IR.VariableSet, partition::IR.Partition
       push!(partition.equations, IR.WHEN_EQUATION(branches, IR.REGULAR_WHEN, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
     elseif discrete && v.ty isa Union{IR.T_BOOLEAN, IR.T_INTEGER, IR.T_ENUMERATION}
       push!(partition.equations, IR.SCALAR_EQUATION(lhs, v.binding, v.ty, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
+    elseif discrete && v.ty isa IR.T_ARRAY && v.ty.elementType isa Union{IR.T_BOOLEAN, IR.T_INTEGER, IR.T_ENUMERATION}
+      append!(partition.equations, IndexReduction.discreteBindingEquations(v, variables))
     elseif v.kind isa IR.DISCRETE && v.ty isa IR.T_REAL
       unsupported("a discrete Real variable with a declaration binding", v.name)
     end

@@ -82,8 +82,10 @@ slicing, not yet), NotHandled, and the frontend scalarizes.
 module IndexReduction
 
 import ..OMJLIR
+import ..builtinCall
 import ..substituteIterators, ..foldSubscripts, ..expressionLargerThan, ..foldInteger, ..mapRoots, ..rowMajor,
-       ..unsubscriptedName, ..allSubscripts, ..recordEquations, ..constantRecord, ..bodyRecordEquations
+       ..unsubscriptedName, ..variableNameOf, ..allSubscripts, ..recordEquations, ..constantRecord,
+       ..bodyRecordEquations
 import ...envSwitch
 import ...LowerUtil: assignedCrefs
 import ..Evaluation: arithmetic, asRecord, divide, elementOf, evaluate, foldScalar, genericOffset,

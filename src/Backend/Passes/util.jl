@@ -134,6 +134,10 @@ unsubscriptedName(cref::IR.ComponentRef)::Symbol =
   !IR.hasSubscripts(cref) ? cref.name :
     (length(cref.parts) == 1 && !(cref.parts[1].ty isa IR.T_SLICE)) ? IR.arrayName(cref.parts[1]) : IR.withoutSubscripts(cref).name
 
+"The variable a reference is to or into: its own name, else (an element) its array's."
+variableNameOf(c::IR.ComponentRef, variables::IR.VariableSet)::Symbol =
+  (IR.hasSubscripts(c) && !haskey(variables, c.name)) ? unsubscriptedName(c) : c.name
+
 "The subscripts of all parts of `cref`, in order (`c[2].v[3]`: 2, 3; `IR.partSubscripts`): those of the element of an array variable it names."
 allSubscripts(cref::IR.ComponentRef)::Vector{IR.Subscript} = IR.Subscript[s for p in cref.parts for s in IR.partSubscripts(p)]
 

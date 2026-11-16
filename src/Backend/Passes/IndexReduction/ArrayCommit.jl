@@ -318,6 +318,26 @@ elementEquation(eq::IR.SCALAR_EQUATION, values::Dict{Symbol, Int}, E::Elements):
   IR.SCALAR_EQUATION(equationExpression(eq.lhs, values, E), equationExpression(eq.rhs, values, E), eq.ty, eq.source, eq.attributes)
 
 """
+The if-equation `eq` of the arrays-kept model at the iterator `values`, as the element view writes one
+(`scalarEquations!`): a branch whose condition folds to false left out, one that folds to true the else of those
+before it; the else's one equation alone where no branch is left.
+"""
+function elementEquation(eq::IR.IF_EQUATION, values::Dict{Symbol, Int}, E::Elements)::IR.Equation
+  local branches::Vector{IR.EquationBranch} = IR.EquationBranch[]
+  local elseEquations::Vector{IR.Equation} = eq.elseEquations
+  for b::IR.EquationBranch in eq.branches
+    local condition::IR.Expression = foldTree(equationExpression(b.condition, values, E))
+    local taken::Union{Nothing, Bool} = literalCondition(condition)
+    taken === false && continue
+    taken === true && (elseEquations = b.equations; break)
+    push!(branches, IR.EquationBranch(condition, IR.Equation[elementEquation(e, values, E) for e in b.equations]))
+  end
+  local rest::Vector{IR.Equation} = IR.Equation[elementEquation(e, values, E) for e in elseEquations]
+  (isempty(branches) && length(rest) == 1) && return rest[1]
+  return IR.IF_EQUATION(branches, rest, eq.source, eq.attributes)
+end
+
+"""
 Whether two scalar equations are one, their sides' arithmetic folded (`foldTree`): structurally, or up to the order
 and the grouping of their sums' terms and the order of their products' factors (`equationForm`: the derivative of a
 scalar product written `a * b` in a for-equation's body and term by term in the element view).
@@ -328,6 +348,23 @@ function sameEquation(a::IR.SCALAR_EQUATION, b::IR.SCALAR_EQUATION)::Bool
   (al == bl && ar == br) && return true
   return equationForm(IR.SCALAR_EQUATION(al, ar, a.ty, a.source, a.attributes)) ==
          equationForm(IR.SCALAR_EQUATION(bl, br, b.ty, b.source, b.attributes))
+end
+
+"An equation's line with its sides folded as `sameEquation` compares them (`foldTree`); another equation's as it is."
+foldedLine(eq::IR.SCALAR_EQUATION)::String =
+  equationLine(IR.SCALAR_EQUATION(foldTree(eq.lhs), foldTree(eq.rhs), eq.ty, eq.source, eq.attributes))
+foldedLine(eq::IR.Equation)::String = equationLine(eq)
+
+"""
+Where the texts `a` and `b` first differ, 100 characters of each around it (`a ... vs b ...`): a message's part for
+two equations of thousands of characters (a medium's derivative: 98000 each, the whole of both in a refusal).
+"""
+function firstDifference(a::String, b::String)::String
+  local (x::Vector{Char}, y::Vector{Char}) = (collect(a), collect(b))
+  local shorter::Int = min(length(x), length(y))
+  local k::Int = something(findfirst(i::Int -> x[i] != y[i], 1:shorter), shorter + 1)
+  local around = (t::Vector{Char}) -> String(t[max(1, k - 40):min(length(t), k + 60)])
+  return string("at character ", k, " of ", length(x), " and ", length(y), ": ", around(x), " vs ", around(y))
 end
 
 "Whether `name` is a Real parameter or constant of `variables` whose value `values` knows as zero."
@@ -369,10 +406,338 @@ function withoutKnownZeros(eq::IR.SCALAR_EQUATION, variables::IR.VariableSet, va
   return IR.SCALAR_EQUATION(foldTree(IR.mapExp(zeroed, eq.lhs)), foldTree(IR.mapExp(zeroed, eq.rhs)), eq.ty, eq.source,
                             eq.attributes)
 end
+"Two if-equations: the same conditions (folded) in order and their branches' equations the same, one by one."
+function sameEquation(a::IR.IF_EQUATION, b::IR.IF_EQUATION)::Bool
+  (length(a.branches) == length(b.branches) && length(a.elseEquations) == length(b.elseEquations)) || return false
+  for (x::IR.EquationBranch, y::IR.EquationBranch) in zip(a.branches, b.branches)
+    (foldTree(x.condition) == foldTree(y.condition) && length(x.equations) == length(y.equations)) || return false
+    all(((e, f),) -> sameEquation(e, f), zip(x.equations, y.equations)) || return false
+  end
+  return all(((e, f),) -> sameEquation(e, f), zip(a.elseEquations, b.elseEquations))
+end
+
+"An if-equation without the terms of parameters known as zero, in each branch's scalar equations."
+function withoutKnownZeros(eq::IR.IF_EQUATION, variables::IR.VariableSet, values::StartValues,
+                           E::Elements)::IR.IF_EQUATION
+  local folded = (equations::Vector{IR.Equation}) ->
+    IR.Equation[e isa IR.SCALAR_EQUATION ? withoutKnownZeros(e, variables, values, E) : e for e in equations]
+  return IR.IF_EQUATION(IR.EquationBranch[IR.EquationBranch(b.condition, folded(b.equations)) for b in eq.branches],
+                        folded(eq.elseEquations), eq.source, eq.attributes)
+end
+
+"Another equation as it is."
+withoutKnownZeros(eq::IR.Equation, ::IR.VariableSet, ::StartValues, ::Elements)::IR.Equation = eq
+
 sameEquation(::IR.Equation, ::IR.Equation)::Bool = false
 
 "An equation as one line of text, for a message."
 equationLine(eq::IR.Equation)::String = replace(string(eq), r"\s*\n\s*" => " ")
+
+"""
+The names of the variables (no parameters or constants) the equation `eq` reads (a for-equation: its body), an
+array's for a read of an element of it (`variableNameOf`).
+"""
+function variableReads(eq::IR.Equation, variables::IR.VariableSet)::Set{Symbol}
+  local names::Set{Symbol} = Set{Symbol}()
+  local visit = (@nospecialize(e::IR.Expression)) -> begin
+    if e isa IR.CREF
+      local v = get(variables, variableNameOf(e.cref, variables), nothing)
+      (v === nothing || v.kind isa Union{IR.PARAMETER, IR.CONSTANT}) || push!(names, v.name)
+    end
+    nothing
+  end
+  IR.foreachExp(visit, eq)
+  return names
+end
+
+"""
+    dropKnownZeroTerms!(model, view) -> Bool
+
+The scalar equations of the model's continuous partition as the plan's structure reads them (`withKnownValues`):
+without the terms a Real parameter known as zero before the simulation takes out (`withoutKnownZeros`), where that
+takes a variable out of the equation. Left in, the committed model kept a variable the plan did not count on: MSL
+FundamentalWave's converter at orientation 0, `-v = N.re * der(Phi.re) + N.im * der(Phi.im)` with `N.im = 0`, kept
+`der(Phi.im)` as an unknown whose only coefficient is zero (the array code: structurally singular). An equation whose
+variables the zeros leave in place stays as written, its parameters symbolic. A scalar state whose derivative no
+equation reads after that is no state (`demoteDeadStates!`). Whether an equation changed.
+"""
+function dropKnownZeroTerms!(model::IR.Model, view::Scalarized)::Bool
+  local variables::IR.VariableSet = view.model.variables
+  local values::StartValues = StartValues(variables, view.model.functions; parametersOnly = true)
+  #= a zero of some elements only (a polyphase converter's `N[k].im` at the phase of orientation 0) that takes a
+     derivative out of those iterations: the state of that element is none while its siblings are, so the arrays are
+     split and their equations unrolled; the terms then go out of the scalar equations =#
+  local sliced::Vector{Symbol} = derivativesZeroedInArrays(model, view, values)
+  if !isempty(sliced)
+    splitArrays!(model, view, sliced, Int[])
+    view = scalarizeArrays(model)
+    variables = view.model.variables
+    values = StartValues(variables, view.model.functions; parametersOnly = true)
+  end
+  local equations::Vector{IR.Equation} = model.continuous[1].equations
+  local dropped::Set{Symbol} = Set{Symbol}()
+  for (k::Int, eq::IR.Equation) in enumerate(equations)
+    eq isa IR.SCALAR_EQUATION || continue
+    local folded::IR.SCALAR_EQUATION = withoutKnownZeros(eq, variables, values, view.elements)
+    local before::Set{Symbol} = variableReads(eq, model.variables)
+    local after::Set{Symbol} = variableReads(folded, model.variables)
+    (length(after) < length(before) && issubset(after, before)) || continue
+    equations[k] = folded
+    union!(dropped, setdiff(before, after))
+  end
+  #= the variables the equations give as zero (the folds above made some: `V_m = 0` of a core without conductance),
+     as the plan's structure knows them (`withKnownValues`), out of the equations where that takes another variable
+     out (`lossPower = V_m * der(Phi)`: the plan counts on no der(Phi) there) =#
+  dropZeroVariableTerms!(equations, model.variables, dropped, Set{Symbol}(), Set{Int}())
+  isempty(dropped) || demoteDeadStates!(model, dropped)
+  return !isempty(dropped) || !isempty(sliced)
+end
+
+"""
+    dropZeroVariableTerms!(equations, variables, dropped, known, defining) -> Nothing
+
+The scalar equations and the for-equations (their bodies) without the reads of the variables that are zero
+(`zeroVariables`: those of `known`, and those the scalar equations give), where that takes another variable out of
+the equation; the variables taken out added to `dropped`. The equations of `defining` (by index: those that define a
+variable of `known`) stay as written.
+"""
+function dropZeroVariableTerms!(equations::Vector{IR.Equation}, variables::IR.VariableSet, dropped::Set{Symbol},
+                                known::Set{Symbol}, defining::Set{Int})::Nothing
+  local (givenZero::Set{Symbol}, giving::Dict{Int, Symbol}) = zeroVariables(equations, variables, known, defining)
+  isempty(givenZero) && return nothing
+  for (k::Int, eq::IR.Equation) in enumerate(equations)
+    (eq isa Union{IR.SCALAR_EQUATION, IR.FOR_EQUATION} && !(k in defining)) || continue
+    local folded::IR.Equation = withoutZeroVariables(eq, variables, givenZero, get(giving, k, nothing))
+    local out::Set{Symbol} = setdiff(variableReads(eq, variables), variableReads(folded, variables))
+    issubset(out, givenZero) && continue
+    equations[k] = folded
+    union!(dropped, out)
+  end
+  return nothing
+end
+
+"""
+    dropFunctionZeroTerms!(model, view, known) -> Bool
+
+`dropKnownZeroTerms!` for the zeros among the simulation code's values `known` (`KNOWN_VALUES`, of the element view
+`view`) of the variables a function call defines (`functionDefinedValues`: a record function's output its
+interpretation finds constant), which the plan made with them reads as literals (`withKnownValues`) in every
+equation but the defining one: MSL Spice3's MOSFET without capacitances,
+`icGS = cc.cGS * (der(G.v) - der(Sinternal))` with `cc.cGS = mosCalcNoBypassCode(...)` zero. The plan then
+differentiates nothing and has no states; left in, the committed model kept the gate's and the internal nodes'
+voltages as states without an equation for a derivative (the array code: structurally singular,
+`0 = S.v - Sinternal` reads no unknown). An array is zero where all its elements are (the MOSFETs rolled into one
+class, their equations for-equations: Spice3's inverter chains); one of some zero elements only stays as written.
+Whether an equation changed.
+"""
+function dropFunctionZeroTerms!(model::IR.Model, view::Scalarized, known::Dict{Symbol, IR.Expression})::Bool
+  local constants::Dict{Symbol, Tuple{IR.Expression, Int}} = functionDefinedValues(view.model.continuous[1], known)
+  local zeroElements::Set{Symbol} = Set{Symbol}()
+  for (name::Symbol, c::Tuple{IR.Expression, Int}) in constants
+    isZero(c[1]) && push!(zeroElements, name)
+  end
+  isempty(zeroElements) && return false
+  #= the model's variables that are zero: a scalar, an array of zero elements =#
+  local zero::Set{Symbol} = Set{Symbol}()
+  for v::IR.Variable in model.variables
+    local elements::Union{Nothing, Vector{Symbol}} = get(view.elements.elements, v.name, nothing)
+    (elements === nothing ? v.name in zeroElements : all(in(zeroElements), elements)) && push!(zero, v.name)
+  end
+  isempty(zero) && return false
+  #= the defining equations, by the model's equations the view's rows are of =#
+  local defining::Set{Int} = Set{Int}(view.origins[c[2]].equation for c::Tuple{IR.Expression, Int} in values(constants))
+  local dropped::Set{Symbol} = Set{Symbol}()
+  dropZeroVariableTerms!(model.continuous[1].equations, model.variables, dropped, zero, defining)
+  isempty(dropped) && return false
+  demoteDeadStates!(model, dropped)
+  return true
+end
+
+"""
+    zeroVariable(eq, variables) -> Union{Nothing, Symbol}
+
+The Real algebraic scalar variable the scalar equation `eq` gives as zero: `x = 0`, `0 = x` (the plan's
+`setsConstant`), also negated or times a literal other than zero (`1.5707963267948966 * V_m.re = 0`); nothing for
+any other equation.
+"""
+function zeroVariable(eq::IR.SCALAR_EQUATION, variables::IR.VariableSet)::Union{Nothing, Symbol}
+  (isZero(eq.rhs) || isZero(eq.lhs)) || return nothing
+  local side::IR.Expression = isZero(eq.rhs) ? eq.lhs : eq.rhs
+  while true
+    if side isa IR.UNARY && side.op === IR.UMINUS
+      side = side.exp
+    elseif side isa IR.BINARY && side.op === IR.MUL && isLiteral(side.exp1) && !isZero(side.exp1)
+      side = side.exp2
+    elseif side isa IR.BINARY && side.op === IR.MUL && isLiteral(side.exp2) && !isZero(side.exp2)
+      side = side.exp1
+    else
+      break
+    end
+  end
+  (side isa IR.CREF && !IR.hasSubscripts(side.cref)) || return nothing
+  local v = get(variables, side.cref.name, nothing)
+  (v !== nothing && v.kind isa Union{IR.ALGEBRAIC, IR.ALGEBRAIC_DER} && v.ty isa IR.T_REAL) || return nothing
+  return v.name
+end
+
+"""
+    zeroVariables(equations, variables, known, defining) -> (Set{Symbol}, Dict{Int, Symbol})
+
+The variables the scalar equations give as zero, and for each equation that gives one (by its index) the variable:
+by an equation of its own (`zeroVariable`), or by one that is such an equation once the others are zero (`y = x`,
+`y = x * w`), until no more is found. `known`: variables that are zero by other means (a function's constant
+output), in the result too; the equations of `defining` (those that define them) give none.
+"""
+function zeroVariables(equations::Vector{IR.Equation}, variables::IR.VariableSet, known::Set{Symbol},
+                       defining::Set{Int})::Tuple{Set{Symbol}, Dict{Int, Symbol}}
+  local givenZero::Set{Symbol} = copy(known)
+  local giving::Dict{Int, Symbol} = Dict{Int, Symbol}()
+  local grew::Bool = true
+  while grew
+    grew = false
+    for (k::Int, eq::IR.Equation) in enumerate(equations)
+      (eq isa IR.SCALAR_EQUATION && !haskey(giving, k) && !(k in defining)) || continue
+      local folded::IR.SCALAR_EQUATION =
+        isempty(givenZero) ? eq : withoutZeroVariables(eq, variables, givenZero, nothing)
+      local name::Union{Nothing, Symbol} = zeroVariable(folded, variables)
+      (name === nothing || name in givenZero) && continue
+      push!(givenZero, name)
+      giving[k] = name
+      grew = true
+    end
+  end
+  return (givenZero, giving)
+end
+
+"""
+The scalar equation `eq` with each read of a variable of `givenZero` (of an element of one that is an array) as
+that zero, its arithmetic folded; `own`: the variable this equation gives, which stays.
+"""
+function withoutZeroVariables(eq::IR.SCALAR_EQUATION, variables::IR.VariableSet, givenZero::Set{Symbol},
+                              own::Union{Nothing, Symbol})::IR.SCALAR_EQUATION
+  local zeroed = (@nospecialize(e::IR.Expression)) -> begin
+    e isa IR.CREF || return e
+    local name::Symbol = variableNameOf(e.cref, variables)
+    return (name !== own && name in givenZero) ? ZERO : e
+  end
+  return IR.SCALAR_EQUATION(foldTree(IR.mapExp(zeroed, eq.lhs)), foldTree(IR.mapExp(zeroed, eq.rhs)), eq.ty, eq.source,
+                            eq.attributes)
+end
+
+"A for-equation with its body's scalar equations (those of a for-equation in it too) so."
+function withoutZeroVariables(eq::IR.FOR_EQUATION, variables::IR.VariableSet, givenZero::Set{Symbol},
+                              own::Union{Nothing, Symbol})::IR.FOR_EQUATION
+  local body::Vector{IR.Equation} = IR.Equation[]
+  for b::IR.Equation in eq.body
+    local inBody::Bool = b isa Union{IR.SCALAR_EQUATION, IR.FOR_EQUATION}
+    push!(body, inBody ? withoutZeroVariables(b, variables, givenZero, own) : b)
+  end
+  return IR.FOR_EQUATION(eq.iterator, body, eq.source, eq.attributes)
+end
+
+"""
+    derivativesZeroedInArrays(model, view, values) -> Vector{Symbol}
+
+The arrays of derivative variables an element of which a parameter known as zero takes out of an iteration of a
+for-equation or array equation (`withoutKnownZeros` of the element view's equation reads it no more): in those
+iterations the plan's structure has no such derivative, in the others it has (`dropKnownZeroTerms!` splits them).
+"""
+function derivativesZeroedInArrays(model::IR.Model, view::Scalarized, values::StartValues)::Vector{Symbol}
+  local variables::IR.VariableSet = view.model.variables
+  local equations::Vector{IR.Equation} = model.continuous[1].equations
+  local rows::Vector{IR.Equation} = view.model.continuous[1].equations
+  local arrayOf::Dict{Symbol, Symbol} = Dict{Symbol, Symbol}()
+  for (array::Symbol, elements::Vector{Symbol}) in view.elements.elements, element::Symbol in elements
+    arrayOf[element] = array
+  end
+  local arrays::Set{Symbol} = Set{Symbol}()
+  for (r::Int, row::IR.Equation) in enumerate(rows)
+    (row isa IR.SCALAR_EQUATION && !(equations[view.origins[r].equation] isa IR.SCALAR_EQUATION)) || continue
+    local folded::IR.SCALAR_EQUATION = withoutKnownZeros(row, variables, values, view.elements)
+    local before::Set{Symbol} = variableReads(row, variables)
+    local after::Set{Symbol} = variableReads(folded, variables)
+    (length(after) < length(before) && issubset(after, before)) || continue
+    for name::Symbol in setdiff(before, after)
+      (variables[name].kind isa IR.STATE_DER && haskey(arrayOf, name)) && push!(arrays, arrayOf[name])
+    end
+  end
+  return sort!(collect(arrays))
+end
+
+"""
+    demoteDeadStates!(model, candidates)
+
+The Real states (scalars and arrays) whose derivative variable (of `candidates`: the variables a fold took out of an
+equation) no equation of the model reads any more: algebraic variables, their derivative variables gone, as the
+plan's structure reads them (`Structure`) and SimCode's `demoteDeadStates` makes them on the scalarized path. Left a
+state, the array code kept it as given and its derivative as an unknown without an equation.
+"""
+function demoteDeadStates!(model::IR.Model, candidates::Set{Symbol})::Nothing
+  local read::Set{Symbol} = Set{Symbol}()
+  local visit = (@nospecialize(e::IR.Expression)) ->
+    (e isa IR.CREF && push!(read, variableNameOf(e.cref, model.variables)); nothing)
+  for partition::IR.Partition in model.continuous
+    foreach((eq::IR.Equation) -> IR.foreachExp(visit, eq), partition.equations)
+    foreach((eq::IR.Equation) -> IR.foreachExp(visit, eq), partition.initialEquations)
+  end
+  local dead::Set{Symbol} = Set{Symbol}()
+  for v::IR.Variable in model.variables
+    (v.kind isa IR.STATE && IR.elementType(v.ty) isa IR.T_REAL && v.kind.derivative !== nothing) || continue
+    local derivative::Symbol = v.kind.derivative
+    (derivative in candidates && !(derivative in read) && haskey(model.variables, derivative)) || continue
+    v.kind = IR.ALGEBRAIC()
+    push!(dead, derivative)
+  end
+  isempty(dead) || filter!((v::IR.Variable) -> !(v.name in dead), model.variables)
+  return nothing
+end
+
+"""
+    preparedBody(body, E, variables, elementVariables, functions, known) -> Equation
+
+The body equation of a for-equation as `forDerivatives` differentiates it: its references canonical
+(`canonicalReferences`), its calls inlined (the references an inlined body made, a record argument's fields, canonical
+too), without the terms of parameters known as zero (`withoutKnownZeros`). A scalar equation; or an if-equation of
+one scalar equation per branch, its conditions' references canonical: an if-expression the passes lifted
+(`ifEq_tmp = ...` in every branch), in a for-equation where its components were rolled (MSL Spice3's `V_pulse`,
+Blocks' `Ramp` in two sources of one class: `if time < startTime then 0 else ...`, a voltage or current the
+constraint differentiates). NotHandled for another body.
+"""
+function preparedBody(body::IR.SCALAR_EQUATION, E::Elements, variables::IR.VariableSet,
+                      elementVariables::IR.VariableSet, functions::Dict{Symbol, IR.ModelicaFunction},
+                      known::StartValues)::IR.Equation
+  local canonical = (@nospecialize(e::IR.Expression)) -> canonicalReferences(e, E, variables)
+  local inlined::IR.Equation =
+    inlineEquation(IR.SCALAR_EQUATION(canonical(body.lhs), canonical(body.rhs), body.ty, body.source, body.attributes),
+                   functions)
+  local again::IR.SCALAR_EQUATION = IR.SCALAR_EQUATION(canonical(inlined.lhs), canonical(inlined.rhs), inlined.ty,
+                                                       inlined.source, inlined.attributes)
+  return withoutKnownZeros(again, elementVariables, known, E)
+end
+
+function preparedBody(body::IR.IF_EQUATION, E::Elements, variables::IR.VariableSet, elementVariables::IR.VariableSet,
+                      functions::Dict{Symbol, IR.ModelicaFunction}, known::StartValues)::IR.Equation
+  local branches::Vector{IR.EquationBranch} = IR.EquationBranch[]
+  for b::IR.EquationBranch in body.branches
+    push!(branches, IR.EquationBranch(canonicalReferences(b.condition, E, variables),
+                                      preparedBranch(b.equations, E, variables, elementVariables, functions, known)))
+  end
+  return IR.IF_EQUATION(branches, preparedBranch(body.elseEquations, E, variables, elementVariables, functions, known),
+                        body.source, body.attributes)
+end
+
+preparedBody(body::IR.Equation, ::Elements, ::IR.VariableSet, ::IR.VariableSet, ::Dict{Symbol, IR.ModelicaFunction},
+             ::StartValues)::IR.Equation =
+  throw(NotHandled("differentiating a $(nameof(typeof(body))) in a for-equation"))
+
+"The one scalar equation of an if-equation's branch, prepared (`preparedBody`); NotHandled for another branch."
+function preparedBranch(equations::Vector{IR.Equation}, E::Elements, variables::IR.VariableSet,
+                        elementVariables::IR.VariableSet, functions::Dict{Symbol, IR.ModelicaFunction},
+                        known::StartValues)::Vector{IR.Equation}
+  (length(equations) == 1 && equations[1] isa IR.SCALAR_EQUATION) ||
+    throw(NotHandled("differentiating an if-equation in a for-equation whose branch is not one scalar equation"))
+  return IR.Equation[preparedBody(equations[1], E, variables, elementVariables, functions, known)]
+end
 
 """
     forDerivatives(eq, rows, view, p, seeds, planSeeds, E, variables, functions, known)
@@ -383,7 +748,8 @@ The derivatives in array form of the body equations of the for-equation `eq` tha
 often as the plan differentiates each of its iterations, its iterators kept; checked against the derivative of
 every iteration (its element view's equation differentiated by the plan's structure, `planSeeds`, as written: the
 parameters symbolic, which the plan's own equations read as their values; those known as zero, `known`, are zero in
-both: `withoutKnownZeros`). NotHandled where the iterations are
+both: `withoutKnownZeros`). A body that is an if-equation of one equation per branch (a lifted if-expression) is
+differentiated branch by branch, as one at the top level (`preparedBody`). NotHandled where the iterations are
 differentiated unequally (slicing) or the array form's derivative of one is not its own.
 """
 function forDerivatives(eq::IR.FOR_EQUATION, rows::Vector{Int}, view::Scalarized, p::Plan, seeds::Seeds, planSeeds::Seeds,
@@ -402,16 +768,8 @@ function forDerivatives(eq::IR.FOR_EQUATION, rows::Vector{Int}, view::Scalarized
                        Int[view.origins[pathRows[1]].equation]))
     count == 0 && continue
     local (body, iterators) = bodyAt(eq, path)
-    body isa IR.SCALAR_EQUATION || throw(NotHandled("differentiating a $(nameof(typeof(body))) in a for-equation"))
-    local inlined::IR.SCALAR_EQUATION = inlineEquation(IR.SCALAR_EQUATION(canonicalReferences(body.lhs, E, variables),
-                                                                          canonicalReferences(body.rhs, E, variables),
-                                                                          body.ty, body.source, body.attributes), functions)
-    #= the references an inlined body made (a record argument's fields) canonical too =#
-    local current::IR.Equation =
-      withoutKnownZeros(IR.SCALAR_EQUATION(canonicalReferences(inlined.lhs, E, variables),
-                                           canonicalReferences(inlined.rhs, E, variables), inlined.ty, inlined.source,
-                                           inlined.attributes), elementVariables, known, E)
-    local chain = IR.SCALAR_EQUATION[]
+    local current::IR.Equation = preparedBody(body, E, variables, elementVariables, functions, known)
+    local chain = IR.Equation[]
     for _ in 1:count
       current = differentiateEquation(current, seeds)
       push!(chain, current)
@@ -420,13 +778,14 @@ function forDerivatives(eq::IR.FOR_EQUATION, rows::Vector{Int}, view::Scalarized
     for r in pathRows
       foreach(((it, k),) -> (values[it] = k), zip(iterators, view.origins[r].iteration))
       local own::IR.Equation = inlineEquation(viewEquations[r], functions)
-      own isa IR.SCALAR_EQUATION && (own = withoutKnownZeros(own, elementVariables, known, E))
+      own = withoutKnownZeros(own, elementVariables, known, E)
       for derivative in chain
         own = differentiateEquation(own, planSeeds)
         #= an iteration's own zeros (`p[i]` at this i) =#
         local mine = withoutKnownZeros(elementEquation(derivative, values, E), elementVariables, known, E)
         sameEquation(mine, own) ||
-          throw(NotHandled("a for-equation whose derivative in array form is not the element's at $(view.origins[r].iteration): $(equationLine(mine)) vs $(equationLine(own))"))
+          throw(NotHandled("a for-equation whose derivative in array form is not the element's at " *
+                           "$(view.origins[r].iteration): $(firstDifference(foldedLine(mine), foldedLine(own)))"))
       end
     end
     chains[path] = chain
@@ -649,6 +1008,8 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
   (arrays && !hasContinuousArrays(model)) && return false
   any(readsDerCall, model.continuous[1].equations) && throw(NotHandled("der() of an expression with arrays kept"))
   local view::Scalarized = scalarizeArrays(model)
+  #= the equations as the plan's structure reads them (the terms of parameters known as zero) =#
+  dropKnownZeroTerms!(model, view) && (view = scalarizeArrays(model))
   local partition::IR.Partition = view.model.continuous[1]
   local written::Plan = plan(view.model, partition; indexOne = true)
   #= the array form of the plan as written first: a plan it does not take is refused before the simulation code's
@@ -734,7 +1095,12 @@ derivative unknowns solved for; whether it reduced the index (differentiated equ
 """
 function commitArrayPlan!(model::IR.Model, view::Scalarized, written::Plan)::Bool
   local known = KNOWN_VALUES[] === nothing ? Dict{Symbol, IR.Expression}() : KNOWN_VALUES[](view.model)
-  local p::Plan = isempty(known) ? written : plan(view.model, view.model.continuous[1]; known, indexOne = true)
+  local p::Plan = written
+  if !isempty(known)
+    #= the model as the plan with these values reads it: without the terms a function's zero output takes out =#
+    dropFunctionZeroTerms!(model, view, known) && (view = scalarizeArrays(model))
+    p = plan(view.model, view.model.continuous[1]; known, indexOne = true)
+  end
   local reduced::Bool = !isempty(p.differentiated)
   local c = arrayCommit(model, model.continuous[1], view, p)
   commitArrays!(model, model.continuous[1], c)

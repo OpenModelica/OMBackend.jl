@@ -133,7 +133,8 @@ real(x::Float64)::IR.Expression = IR.REAL(x)
 
 A scalar arithmetic node (`ADD`, `SUB`, `MUL`, `DIV`, `POW`, unary minus of a Real) rebuilt with
 the constructors above, its zero and one terms dropped and its literals folded (`0 * w` is `0`);
-an if-expression of equal branches the branch (`ifThenElse`); another node as it is.
+an if-expression of equal branches the branch (`ifThenElse`); `size` of an array literal along its first dimension
+the number of its elements; a scalar product of two vector literals the sum of its terms; another node as it is.
 """
 function foldScalar(x::IR.Expression)::IR.Expression
   if x isa IR.BINARY && x.ty isa IR.T_REAL
@@ -142,10 +143,23 @@ function foldScalar(x::IR.Expression)::IR.Expression
     x.op === IR.MUL && return times(x.exp1, x.exp2)
     x.op === IR.DIV && return divide(x.exp1, x.exp2)
     x.op === IR.POW && return power(x.exp1, x.exp2)
+    #= a scalar product of two vector literals: the sum of their elements' products (`{dh_dX} * {der_X}`, the
+       derivative of a medium function by its mass fractions written out, where the element view of a for-equation
+       has the terms: "a for-equation whose derivative in array form is not the element's") =#
+    if x.op === IR.SCALAR_PRODUCT && x.exp1 isa IR.ARRAY && x.exp2 isa IR.ARRAY && !isempty(x.exp1.elements) &&
+       length(x.exp1.elements) == length(x.exp2.elements) &&
+       !any((y::IR.Expression) -> y isa IR.ARRAY, x.exp1.elements) &&
+       !any((y::IR.Expression) -> y isa IR.ARRAY, x.exp2.elements)
+      return foldl(plus, IR.Expression[times(a, b) for (a, b) in zip(x.exp1.elements, x.exp2.elements)])
+    end
   elseif x isa IR.UNARY && x.op === IR.UMINUS && x.ty isa IR.T_REAL
     return negate(x.exp)
   elseif x isa IR.IF_EXPRESSION
     return ifThenElse(x.condition, x.thenExp, x.elseExp, x.ty)
+  elseif x isa IR.SIZE && x.exp isa IR.ARRAY && x.dimension isa IR.INTEGER && x.dimension.value == 1
+    #= `size({a, b}, 1)`: the literal's elements' number (`if size({Xi[1]}, 1) == 2 then ... else ...`, a state record
+       chosen by the mass fractions' number in MSL Fluid: its condition is a literal's then, `ifThenElse`) =#
+    return IR.INTEGER(length(x.exp.elements))
   end
   return x
 end

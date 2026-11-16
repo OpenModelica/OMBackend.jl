@@ -82,6 +82,11 @@ function (r::ClockOperators)(e::IR.Expression)::IR.Expression
   elseif name === :previous && length(args) == 1
     return IR.CALL(:pre, args, e.ty, IR.BUILTIN_CALL)
   elseif name === :sample && length(args) == 2 && isClock(args[2])
+    #= of a variable: its left limit at the tick (MLS 16.5.1), marked (`IR.SAMPLED_READ`). At a tick where it jumps
+       the value after the jump is not sampled; a hold's output sampled back into its partition is last tick's (MSL
+       Clocked Sample2, Sample3: an algebraic loop through the hold otherwise) =#
+    (args[1] isa IR.CREF && args[1].cref.name !== :time) &&
+      return IR.CALL(IR.SAMPLED_READ, IR.Expression[args[1]], e.ty, IR.BUILTIN_CALL)
     return args[1]
   elseif name === :hold && length(args) == 1
     return args[1]

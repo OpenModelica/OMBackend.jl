@@ -169,6 +169,9 @@ function solvedTemplate(body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}, row
   #= each iterator once, as a subscript of its own: the value is over the iterators, read at any subscripts; a variable
      of its own (an element of an array split for index reduction, `\$DER.x[2]`, as `solvedTarget` reads it) has none =#
   local own::Vector{IR.Subscript} = haskey(model.variables, cref.cref.name) ? IR.Subscript[] : allSubscripts(cref.cref)
+  #= a scalar equation's reference to the one element of its array (`\$DER.star.pin.i[1]`, a plug of one phase: the
+     zero-sequence star of MSL Machines' IMC_DOL_CommonLeakage) has literal subscripts and no iterator: as a scalar =#
+  (isempty(iterators) && all(s::IR.Subscript -> IR.literalIndex(s) !== nothing, own)) && (own = IR.Subscript[])
   (length(own) == length(iterators) &&
    Set(Symbol[s isa IR.INDEX && s.exp isa IR.CREF ? s.exp.cref.name : Symbol("") for s in own]) == Set(iterators)) ||
     throw(NotHandled("a derivative solved through $(cref.cref.name), not subscripted by its iterators $(iterators)"))

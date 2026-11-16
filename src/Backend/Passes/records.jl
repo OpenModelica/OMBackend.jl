@@ -216,6 +216,16 @@ function complexProjection(@nospecialize(e::IR.Expression))::Union{Nothing, IR.E
     (e.field in (:re, :im) && e.exp isa Union{IR.CALL, IR.IF_EXPRESSION, IR.RECORD}) || return nothing
     local parts::Union{Nothing, NTuple{2, IR.Expression}} = complexParts(e.exp)
     return parts === nothing ? nothing : e.field === :re ? parts[1] : parts[2]
+  elseif e isa Union{IR.TUPLE_ELEMENT, IR.SUBSCRIPTED}
+    #= a Complex operation's result by position, the form the record equations give `y = a * b` of Complex values
+       (`y.re = Complex.'*'.multiply(a, b)[1]`). Not a function of a library whose body decides its value (the scalar
+       product of Complex vectors conjugates its first argument in MSL 4, not in MSL 3): the array code calls it =#
+    (e.exp isa IR.CALL && isComplexOperation(e.exp)) || return nothing
+    local position::Union{Nothing, Int} = e isa IR.TUPLE_ELEMENT ? e.index :
+      length(e.subscripts) == 1 ? IR.literalIndex(e.subscripts[1]) : nothing
+    (position === nothing || !(position in (1, 2))) && return nothing
+    local byPosition::Union{Nothing, NTuple{2, IR.Expression}} = complexParts(e.exp)
+    return byPosition === nothing ? nothing : byPosition[position]
   end
   (e isa IR.CALL && !isempty(e.arguments) && !isComplexType(e.ty)) || return nothing
   local name::String = String(e.name)
@@ -267,6 +277,9 @@ function complexParts(e::IR.Expression)::Union{Nothing, NTuple{2, IR.Expression}
     b === nothing && return nothing
     return (IR.IF_EXPRESSION(e.condition, a[1], b[1], real), IR.IF_EXPRESSION(e.condition, a[2], b[2], real))
   end
+  #= the constructor of a record type that extends Complex, `Modelica.Units.SI.ComplexVoltage(re, im)` =#
+  (e isa IR.CALL && isComplexType(e.ty) && length(e.arguments) == 2 && e.name === (e.ty::IR.T_RECORD).name) &&
+    return (e.arguments[1], e.arguments[2])
   (e isa IR.CALL && isComplexOperation(e)) || return nothing
   local op::String = complexOperation(e.name)
   local n::Int = length(e.arguments)

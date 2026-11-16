@@ -570,6 +570,14 @@ end
 
 "The attributes of a call to a pure built-in function."
 const BUILTIN_CALL = CallAttributes(true, false, false)
+
+"""
+The mark of a variable read by `sample(u, clock)` in a lowered clocked partition (a built-in call of one argument,
+`\$sampled(u)`): the read takes u's left limit at the tick (MLS 16.5.1). The array code reads pre() of u
+(`Passes.arrayCodeForm!`); the simulation code of the other routes reads u (`SimCode.simExp`: their sample
+callbacks run before the instant's other events).
+"""
+const SAMPLED_READ = Symbol("\$sampled")
 "The attributes of a call to a pure function of the model."
 const FUNCTION_CALL = CallAttributes(false, false, false)
 
@@ -1339,11 +1347,15 @@ function upToFirstSubscripted(c::ComponentRef)::ComponentRef
   return c
 end
 
-"The value of a literal Integer subscript (`x[2]`: 2); `nothing` for another."
+"""
+The value of a literal subscript: an Integer's (`x[2]`: 2), an enumeration literal's position in its type
+(`map[Logic.'U']` of an array over the enumeration: 1); `nothing` for another.
+"""
 function literalIndex(s::Subscript)::Union{Nothing, Int}
   s isa INDEX || return nothing
   local e::Expression = s.exp
-  return e isa INTEGER ? e.value : nothing
+  e isa INTEGER && return e.value
+  return e isa ENUM_LITERAL ? e.index : nothing
 end
 
 "Whether `s` is a literal index: an Integer's or an enumeration literal (`x[2]`, `x[E.b]`; `literalIndex` for its Integer value)."

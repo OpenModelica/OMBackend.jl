@@ -155,14 +155,52 @@ function innerSplittable(model::IR.Model, name::Symbol)::Bool
 end
 
 """
+    sliceParts(parts, t) -> Vector{CrefPart}
+
+The parts after the instances' of a rolled array's reference as its slice `t`'s (the inner subscripts), without
+subscripts: each part that carries inner dimensions a slice part (`T_SLICE`) with its share of `t`, in order: the last
+part where it is the array (`T[1,2]` of `G.b.T`), a part in the middle where the dimension is an array of components'
+(`R[1].p.i` of `line1|line2.R.p.i`, R the line's resistors: with the subscripts all on the last part the part `R` kept
+its dimension, "its reference of more dimensions than 1", MSL's lines, plugs and terminal boxes). NotHandled where
+the parts' dimensions are not those of `t`.
+"""
+function sliceParts(parts::AbstractVector{IR.CrefPart}, t::Vector{Int})::Vector{IR.CrefPart}
+  local out::Vector{IR.CrefPart} = IR.CrefPart[]
+  local k::Int = 0
+  for p::IR.CrefPart in parts
+    local n::Int = length(IR.dimensions(p.ty))
+    if n == 0
+      push!(out, IR.CrefPart(p.name, IR.Subscript[], p.ty))
+      continue
+    end
+    k + n <= length(t) ||
+      throw(NotHandled("a slice by $(length(t)) inner subscripts of a reference of more inner dimensions"))
+    push!(out, IR.CrefPart(p.name, IR.Subscript[], IR.T_SLICE(t[(k + 1):(k + n)], p.ty)))
+    k += n
+  end
+  k == length(t) ||
+    throw(NotHandled("a slice by $(length(t)) inner subscripts of a reference of $(k) inner dimensions"))
+  return out
+end
+
+"""
     sliceCref(cref, t) -> ComponentRef
 
-The reference of the slice `t` (the inner subscripts) of the array of reference `cref`: its last part of type
-`T_SLICE`, named with them (`G.b.T[1,2]`), as an element of the instance is (`cylinder3.b.T[1,2]`); of a derivative
-(`\$DER.G.b.T`) the derivative of the slice's.
+The reference of the slice `t` (the inner subscripts) of the array of reference `cref` (without subscripts): the parts
+that carry the inner dimensions of type `T_SLICE` (`sliceParts`), named with them (`G.b.T[1,2]`,
+`line1|line2.R[1].p.i`), as an element of the instance is (`cylinder3.b.T[1,2]`); of a reference of one part that
+part; of a derivative (`\$DER.G.b.T`) the derivative of the slice's (`\$DER.G.b.T[1,2]`, `\$DER.line1|line2.L[1].i`:
+its elements the derivatives of the slice's elements by name).
 """
-sliceCref(cref::IR.ComponentRef, t::Vector{Int})::IR.ComponentRef =
-  IR.ComponentRef(IR.CrefPart[cref.parts[1:end - 1]; IR.CrefPart(cref.parts[end].name, IR.Subscript[], IR.T_SLICE(t, cref.parts[end].ty))])
+function sliceCref(cref::IR.ComponentRef, t::Vector{Int})::IR.ComponentRef
+  #= a derivative's (of any order, `\$DER.\$DER.x`): its operators before the slice of what they are of =#
+  IR.isDerivativeCref(cref) &&
+    return IR.withOperatorsOf(cref, sliceCref(IR.ComponentRef(cref.parts[IR.operandStart(cref):end]), t))
+  local last::IR.CrefPart = cref.parts[end]
+  length(cref.parts) == 1 &&
+    return IR.ComponentRef(IR.CrefPart[IR.CrefPart(last.name, IR.Subscript[], IR.T_SLICE(t, last.ty))])
+  return IR.ComponentRef(IR.CrefPart[cref.parts[1]; sliceParts(@view(cref.parts[2:end]), t)])
+end
 
 """
     splitInner!(model, bases)
@@ -227,6 +265,42 @@ subscripts its slice's, `T_SLICE`), a derivative's likewise (`\$DER.G.f.R.T[\$c,
 """
 function slicedCref(cref::IR.ComponentRef, isVariable::Function)::Union{Nothing, IR.ComponentRef}
   local last::IR.CrefPart = cref.parts[end]
+  #= a derivative's element, its subscripts all on its last part (`\$DER.line1|line2.L.i[\$c, 1]`): the derivative of
+     the slice (`sliceCref`: `\$DER.line1|line2.L[1].i`) by the subscripts before the literal inner ones =#
+  if IR.isDerivativeCref(cref)
+    local bare::IR.ComponentRef = IR.withoutSubscripts(cref)
+    for j in 0:length(last.subscripts) - 1
+      local innerOf::Union{Nothing, Vector{Int}} = IR.literalIndices(last.subscripts[j + 1:end])
+      innerOf === nothing && continue
+      local slice::Union{Nothing, IR.ComponentRef} = try
+        sliceCref(bare, innerOf)
+      catch err
+        err isa NotHandled || rethrow()
+        nothing
+      end
+      (slice !== nothing && isVariable(slice.name)) && return IR.withLastSubscripts(slice, last.subscripts[1:j])
+    end
+    return nothing
+  end
+  #= the parts after the first each by all of its dimensions' literal subscripts (`line[\$c].R[1].p.i`): a slice
+     whose inner dimensions are those parts' (`sliceParts`) =#
+  if length(cref.parts) > 1
+    local parts::Vector{IR.CrefPart} = IR.CrefPart[cref.parts[1]]
+    local sliced::Bool = false
+    for p::IR.CrefPart in @view cref.parts[2:end]
+      local inner::Union{Nothing, Vector{Int}} = isempty(p.subscripts) ? nothing : IR.literalIndices(p.subscripts)
+      if inner !== nothing && length(inner) == length(IR.dimensions(p.ty)) && !(p.ty isa IR.T_SLICE)
+        push!(parts, IR.CrefPart(p.name, IR.Subscript[], IR.T_SLICE(inner, p.ty)))
+        sliced = true
+      else
+        push!(parts, p)
+      end
+    end
+    if sliced
+      local byParts::IR.ComponentRef = IR.ComponentRef(parts)
+      isVariable(unsubscriptedName(byParts)) && return byParts
+    end
+  end
   for j in 0:length(last.subscripts) - 1
     local textual::Vector{IR.Subscript} = last.subscripts[j + 1:end]
     local inner::Union{Nothing, Vector{Int}} = IR.literalIndices(textual)
@@ -331,14 +405,14 @@ function slicedReference(x::IR.Expression, family::Dict{Symbol, Vector{Int}})::I
   local instance::IR.Subscript = subscripts[1]
   local element::IR.ModelicaType = IR.elementType(x.ty)
   local sliceRef::Function = (t::Vector{Int}) -> begin
-    local last::IR.CrefPart = IR.unsubscriptedPart(x.cref.parts[end])
-    local slice::IR.CrefPart = IR.CrefPart(last.name, IR.Subscript[], IR.T_SLICE(t, last.ty))
-    #= a derivative's slice (one of one part too) subscripted on its last part (`IR.withLastSubscripts`), another's on
-       its first (the instance) =#
-    local cref::IR.ComponentRef = (IR.isDerivativeCref(x.cref) || length(x.cref.parts) == 1) ?
-      IR.ComponentRef(IR.CrefPart[x.cref.parts[1:end - 1]; IR.CrefPart(slice.name, IR.Subscript[instance], slice.ty)]) :
-      IR.ComponentRef(IR.CrefPart[IR.withSubscripts(x.cref.parts[1], IR.Subscript[instance]); x.cref.parts[2:end - 1]; slice])
-    IR.CREF(cref, element)
+    #= a derivative's slice (the derivative of the slice's) and one of one part subscripted on its last part
+       (`IR.withLastSubscripts`); another's on its first (the instance), the inner subscripts on the parts that carry
+       the dimensions (`sliceParts`) =#
+    (IR.isDerivativeCref(x.cref) || length(x.cref.parts) == 1) &&
+      return IR.CREF(IR.withLastSubscripts(sliceCref(IR.withoutSubscripts(x.cref), t), IR.Subscript[instance]), element)
+    local bare::Vector{IR.CrefPart} = IR.CrefPart[IR.unsubscriptedPart(p) for p in @view x.cref.parts[2:end]]
+    local instances::IR.CrefPart = IR.withSubscripts(x.cref.parts[1], IR.Subscript[instance])
+    IR.CREF(IR.ComponentRef(IR.CrefPart[instances; sliceParts(bare, t)]), element)
   end
   if length(subscripts) == 1 + length(sizes)
     local t::Union{Nothing, Vector{Int}} = IR.literalIndices(subscripts[2:end])

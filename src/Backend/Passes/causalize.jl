@@ -451,7 +451,8 @@ result in a branch (a hoisted call equation, an assert's condition: `isNoResultC
 the branches of a lifted one, one whose condition does not depend on time (a state-dependent
 condition crosses in both directions: its branches are evaluated as a continuous product); in a
 for-equation (arrays kept), one that reads its iterator (the array code reads it inline; where such a
-model is scalarized after its reduction, `liftIfExpressions!(model, selected)` lifts it then). The
+model is scalarized after its reduction, `liftIfExpressions!(model, selected)` lifts it then); in an array
+constructor or a reduction, one that reads its iterator. The
 when-equations (their code generation evaluates them in place), the asserts (checked where they are, not in the
 right-hand side: a Boolean if-expression of a condition lifted as a Real variable was read as a Boolean) and
 algorithms are left.
@@ -543,6 +544,16 @@ end
 """
 function lift(lifter::IfExpressionLifter, @nospecialize(e::IR.Expression), timeDependentOnly::Bool)::IR.Expression
   IR.isBuiltinCall(e, :noEvent) && return e
+  #= an array constructor or a reduction with an if-expression that reads its iterator stays as it is, as a
+     for-equation with one (`ifReadsIterator`): lifted, the if-equation read the iterator outside its scope (`{... /
+     (if i == 2 then 3 else 2) ... for i in 2:n - 1}`, the work of the pressure in MSL Fluid's pipes: "unknown
+     variable i") =#
+  if e isa Union{IR.ARRAY_CONSTRUCTOR, IR.REDUCTION}
+    local bound::Set{Symbol} = Set{Symbol}(it.name for it in e.iterators)
+    local readsBound = (@nospecialize(y::IR.Expression)) -> y isa IR.CREF && y.cref.name in bound
+    local ifReads = (@nospecialize(x::IR.Expression)) -> x isa IR.IF_EXPRESSION && IR.anyExp(readsBound, x)
+    IR.anyExp(ifReads, e.body) && return e
+  end
   e isa IR.IF_EXPRESSION || return IR.mapChildren((@nospecialize(x::IR.Expression)) ->
                                                     lift(lifter, x, timeDependentOnly), e)
   local inner = x -> lift(lifter, x, true)
@@ -712,11 +723,26 @@ function recordFieldArrayElements(v::IR.Variable)::Vector{IR.Variable}
     local index = collect(Tuple(i))
     local cref::IR.ComponentRef = IR.withLastSubscripts(v.cref, IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index])
     local binding = v.binding === nothing ? nothing : bindingElement(v.binding, index)
-    push!(out, IR.Variable(cref, ty.elementType, v.kind, binding, v.attributes, v.direction, v.isProtected, v.connector,
+    #= the element's own start, fixed, nominal, min and max: with the array's, `state.X[1]` had the start
+       `{0.01, 0.99}` (MSL Media MoistAir: "the start of medium.state.X[1] does not evaluate") =#
+    local a::IR.VariableAttributes = v.attributes
+    local attributes::IR.VariableAttributes =
+      IR.VariableAttributes(attributeElement(a.start, index), attributeElement(a.fixed, index),
+                            attributeElement(a.nominal, index), attributeElement(a.min, index),
+                            attributeElement(a.max, index), a.unit, a.displayUnit, a.quantity, a.stateSelect)
+    push!(out, IR.Variable(cref, ty.elementType, v.kind, binding, attributes, v.direction, v.isProtected, v.connector,
                            v.source, :expandRecordFieldArrays))
   end
   return out
 end
+
+"""
+The element `index` of an attribute of an array variable: of an array value (a start `{0.01, 0.99}`) its element
+(`bindingElement`), a scalar's (given for each element) itself.
+"""
+attributeElement(::Nothing, ::Vector{Int})::Nothing = nothing
+attributeElement(a::IR.Expression, index::Vector{Int})::Union{Nothing, IR.Expression} =
+  (a isa IR.ARRAY || IR.typeOf(a) isa IR.T_ARRAY) ? bindingElement(a, index) : a
 
 """
 The element `index` of an array binding: of an array value its element (`nothing` outside
@@ -763,12 +789,27 @@ function expandEquations(equations::Vector{IR.Equation}; arrays::Bool)::Vector{I
       append!(out, fields !== nothing ? fields : elementEquations(eq, [[k] for k in 1:eq.size], eq.ty))
     elseif arrays && eq isa IR.ARRAY_EQUATION
       local sizes = Int[knownSize(d, eq) for d in eq.ty.dimensions]
-      append!(out, elementEquations(eq, rowMajor(sizes), eq.ty))
+      foreach(element -> append!(out, recordElementEquations(element)), elementEquations(eq, rowMajor(sizes), eq.ty))
     else
       push!(out, eq)
     end
   end
   return out
+end
+
+"""
+    recordElementEquations(eq) -> Vector{Equation}
+
+An element equation of an array equation of records (`{setState_phX(...), setState_phX(...)} = states`, a Complex
+vector's `aw = {...}`: `states[1] = setState_phX(...)`) as the equations of its fields (`fieldEquations`:
+`states[1].p = call[1]`), a reference on one side; `eq` itself for another. Left whole it is one row for the unknowns
+of all its fields (MSL Fluid's flow models, with arrays kept: fewer rows than unknowns).
+"""
+function recordElementEquations(eq::IR.Equation)::Vector{IR.Equation}
+  (eq isa IR.SCALAR_EQUATION && eq.ty isa IR.T_RECORD) || return IR.Equation[eq]
+  local fields::Union{Nothing, Vector{IR.Equation}} =
+    fieldEquations(IR.RECORD_EQUATION(eq.lhs, eq.rhs, eq.ty, length(eq.ty.fields), eq.source, eq.attributes))
+  return fields === nothing ? IR.Equation[eq] : fields
 end
 
 "The size of an equation's dimension; an unknown one is not supported (its equations would be left out)."

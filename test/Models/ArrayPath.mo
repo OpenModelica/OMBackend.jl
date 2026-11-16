@@ -2668,4 +2668,548 @@ package ArrayPath
     xd = previous(xs);
     y = hold(xd);
   end ClockedSampleHold;
+
+  model ClockedLeftLimit "sample(u, clock) at a tick where u jumps takes u's left limit (MLS 16.5.1): u and the Boolean b step at 0.2, a tick of the clock of 0.1 s, so ys and bs step at the tick at 0.3; a hold's output sampled back into its partition is last tick's: n counts the ticks (no algebraic loop through the hold)"
+    Real u = if time < 0.2 then 0 else 1;
+    Boolean b = time >= 0.2;
+    Real ys(start = 0);
+    Boolean bs(start = false);
+    Real n(start = 0);
+    Integer k = integer(floor(10 * time + 0.5)) "an Integer the equations compute (MSL's realToInteger of a table), sampled: 2 at 0.2, 3 at 0.3";
+    Integer ks(start = 0);
+    Real y;
+    Boolean by;
+    Real nh;
+    Integer kh;
+  equation
+    ys = sample(u, Clock(0.1));
+    bs = sample(b, Clock(0.1));
+    n = sample(nh, Clock(0.1)) + 1;
+    ks = sample(k, Clock(0.1));
+    y = hold(ys);
+    by = hold(bs);
+    nh = hold(n);
+    kh = hold(ks);
+  end ClockedLeftLimit;
+
+  model PeriodMean "MSL Blocks.Math.Mean: u integrated over a period, the mean taken and the state reset at its end; the start of the state and of the output by initial equations"
+    parameter Real f = 5;
+    parameter Real x0 = 0;
+    parameter Real y0 = 0;
+    Real u;
+    Real x;
+    discrete Real y;
+  initial equation
+    x = x0;
+    y = y0;
+  equation
+    der(x) = u;
+    when sample(1 / f, 1 / f) then
+      y = f * pre(x);
+      reinit(x, 0);
+    end when;
+  end PeriodMean;
+
+  model RolledReinit "two separately declared instances rolled into arrays: the reinit of each one's state, the initial equations of their discrete outputs (for-equations over the instances). At 0.95: m1.y = 1, m2.y = 0.85, m1.x = 0.15, m2.x = 0.04625"
+    PeriodMean m1(f = 5);
+    PeriodMean m2(f = 10);
+  equation
+    m1.u = 1;
+    m2.u = time;
+  end RolledReinit;
+
+  model PreStartCell "a counter whose value before the first event is given by an initial equation on pre()"
+    discrete Real e;
+    Real x(start = 0, fixed = true);
+  initial equation
+    pre(e) = 0.5;
+  equation
+    der(x) = 1;
+    when x > 0.3 then
+      e = pre(e) + 1;
+    end when;
+  end PreStartCell;
+
+  model PreStarts "pre(e) = 0.5 of a component array (MSL Timer's pre(entryTime) = 0 in a rolled component): an initial for-equation that no residual solves; e = 1.5 after 0.3"
+    PreStartCell c[2];
+  end PreStarts;
+
+  model PreStartParameter "pre(y) = a parameter's value, of variables an equation computes (MSL Hysteresis' pre(y) = pre_y_start, MultiSwitch's pre(y) = y_default): y[1] starts true and x[1] rises, y[2] starts false and x[2] falls; with pre() the start value (false) both fell"
+    parameter Boolean y0 = true;
+    Real x[2](each start = 0.5, each fixed = true);
+    Boolean y[2];
+  initial equation
+    pre(y[1]) = y0;
+    pre(y[2]) = not y0;
+  equation
+    for i in 1:2 loop
+      der(x[i]) = if y[i] then 1 else -1;
+      y[i] = not pre(y[i]) and x[i] > 1 or pre(y[i]) and x[i] >= 0;
+    end for;
+  end PreStartParameter;
+
+  class TimeTable "Modelica.Blocks.Types.ExternalCombiTimeTable of MSL 4.1"
+    extends ExternalObject;
+    function constructor
+      input String tableName;
+      input String fileName;
+      input Real table[:, :];
+      input Real startTime;
+      input Integer columns[:];
+      input Integer smoothness;
+      input Integer extrapolation;
+      input Real shiftTime;
+      input Integer timeEvents;
+      input Boolean verboseRead;
+      input String delimiter;
+      input Integer nHeaderLines;
+      output TimeTable externalCombiTimeTable;
+    external "C" externalCombiTimeTable = ModelicaStandardTables_CombiTimeTable_init3(fileName, tableName,
+      table, size(table, 1), size(table, 2), startTime, columns, size(columns, 1), smoothness, extrapolation,
+      shiftTime, timeEvents, verboseRead, delimiter, nHeaderLines)
+      annotation(Library = {"ModelicaStandardTables", "ModelicaIO", "ModelicaMatIO", "zlib"});
+    end constructor;
+
+    function destructor
+      input TimeTable externalCombiTimeTable;
+    external "C" ModelicaStandardTables_CombiTimeTable_close(externalCombiTimeTable)
+      annotation(Library = {"ModelicaStandardTables", "ModelicaIO", "ModelicaMatIO", "zlib"});
+    end destructor;
+  end TimeTable;
+
+  function timeTableValue "Modelica.Blocks.Tables.Internal.getTimeTableValueNoDer"
+    input TimeTable tableID;
+    input Integer icol;
+    input Real timeIn;
+    input Real nextTimeEvent;
+    input Real pre_nextTimeEvent;
+    output Real y;
+  external "C" y = ModelicaStandardTables_CombiTimeTable_getValue(tableID, icol, timeIn, nextTimeEvent, pre_nextTimeEvent)
+    annotation(Library = {"ModelicaStandardTables", "ModelicaIO", "ModelicaMatIO", "zlib"});
+  end timeTableValue;
+
+  function timeTableTmax "Modelica.Blocks.Tables.Internal.getTimeTableTmax"
+    input TimeTable tableID;
+    output Real timeMax;
+  external "C" timeMax = ModelicaStandardTables_CombiTimeTable_maximumTime(tableID)
+    annotation(Library = {"ModelicaStandardTables", "ModelicaIO", "ModelicaMatIO", "zlib"});
+  end timeTableTmax;
+
+  model TableDrive "an external object (a time table, linear from 0 to 2 over [0, 1]) read by the equations of an array and by a parameter's binding (MSL CombiTimeTable's tableID and t_max): x[i] = i t^2, tmax = 1"
+    parameter Real data[2, 2] = [0, 0; 1, 2];
+    parameter TimeTable tableID = TimeTable("NoName", "NoName", data, 0.0, {2}, 1, 2, 0.0, 3, false, ",", 0);
+    parameter Real tmax = timeTableTmax(tableID);
+    Real x[2](each start = 0, each fixed = true);
+    Real z(start = 0, fixed = true);
+  equation
+    for i in 1:2 loop
+      der(x[i]) = i * timeTableValue(tableID, 1, time, 1e60, 1e60);
+    end for;
+    der(z) = tmax;
+  end TableDrive;
+
+  function differences "two outputs, the first an array (MSL Machines' ToSpacePhasor)"
+    input Real x[3];
+    output Real y[2];
+    output Real mean;
+  algorithm
+    for k in 1:2 loop
+      y[k] := x[k] - x[k + 1];
+    end for;
+    mean := (x[1] + x[2] + x[3]) / 3;
+  end differences;
+
+  model FirstArrayOutput "the array output of a function of two outputs, the first taken (i_ = ToSpacePhasor(i)): y[k] = x[k] - x[k + 1], x[i] = x0[i] exp(-i t)"
+    Real x[3](start = {1, 2, 4}, each fixed = true);
+    Real y[2];
+    Real w[2] "of an array expression as the argument (ToSpacePhasor(v_p - v_n)): w = 2 y";
+  equation
+    for i in 1:3 loop
+      der(x[i]) = -i * x[i];
+    end for;
+    y = differences(x);
+    w = differences(2 * x - {1, 1, 1});
+  end FirstArrayOutput;
+
+  function twoGains "two outputs, the first an array (MSL Filter's coefficient functions)"
+    input Real k;
+    output Real a[2];
+    output Real b;
+  algorithm
+    a := {k, 2 * k};
+    b := 3 * k;
+  end twoGains;
+
+  model FreeParameterTuple "(a, b) = f(k) in an initial equation, a and b parameters with fixed = false (MSL Filter's (cr, c0, c1) = coefficients.lowPass(...)): der(x[i]) = -a[i] x[i] + b, x[i] = b / a[i] + (1 - b / a[i]) exp(-a[i] t)"
+    parameter Real k = 1;
+    parameter Real a[2](each fixed = false);
+    parameter Real b(fixed = false);
+    Real x[2](each start = 1, each fixed = true);
+  initial equation
+    (a, b) = twoGains(k);
+  equation
+    for i in 1:2 loop
+      der(x[i]) = -a[i] * x[i] + b;
+    end for;
+  end FreeParameterTuple;
+
+  model SaturatedLoop "an amplifier with a limited output in a loop (MSL IdealizedOpAmpLimited as a voltage follower): after the input's step at 0.5 the last solution is on the saturated piece (y = 15), from where Newton's method cycles between two points that are no solutions; y = K / (1 + K) u after it, x(1) = 7.5 + 0.5 K / (1 + K)"
+    parameter Real K = 1000;
+    Real u = if time < 0.5 then 100 else 1;
+    Real e;
+    Real y;
+    Real x(start = 0, fixed = true);
+  equation
+    e = u - y;
+    y = smooth(0, noEvent(if K * e > 15 then 15 else if K * e < -15 then -15 else K * e));
+    der(x) = y;
+  end SaturatedLoop;
+
+  model BilinearStart "a loop whose Jacobian is singular at the start values: R * i = v with R and i both 0 there (MSL's resistor with a heat port: R_actual without a start); R = 100 (1 + 1e-3 (T - 300)), T - 300 = 0.01 v i, x integrates i: about sin(1) / 10"
+    Real v = 10 * cos(time);
+    Real R;
+    Real i;
+    Real T(start = 300);
+    Real x(start = 0, fixed = true);
+  equation
+    R * i = v;
+    R = 100 * (1 + 1e-3 * (T - 300));
+    T - 300 = 0.01 * v * i;
+    der(x) = i;
+  end BilinearStart;
+
+  model ZeroOrientation "MSL FundamentalWave's converter at orientation 0: -v = Nre * der(Phire) + Nim * der(Phiim) with Nim = Nt * sin(orientation) = 0, so der(Phiim) has a zero coefficient only and Phiim is no state; a coil of 1 ohm and a reluctance of 1: Phire = exp(-t), Phiim = 0"
+    parameter Real Nt = 1;
+    parameter Real orientation = 0;
+    final parameter Real Nre = Nt * cos(orientation);
+    final parameter Real Nim = Nt * sin(orientation);
+    Real Phire(start = 1, fixed = true);
+    Real Phiim;
+    Real i;
+    Real v;
+    Real Vre;
+    Real Vim;
+  equation
+    Vre = Nre * i;
+    Vim = Nim * i;
+    -v = Nre * der(Phire) + Nim * der(Phiim);
+    v = i;
+    Vre = Phire;
+    Vim = Phiim;
+  end ZeroOrientation;
+
+  model ZeroOrientationPhases "three converters at the orientations 0, 2 pi / 3, 4 pi / 3 (MSL FundamentalWave's polyphase converter): Nim[1] = 0 takes der(Phiim[1]) out of the first iteration only, so Phiim[1] is no state while Phiim[2] and Phiim[3] are; every phase: a coil of 1 ohm and a reluctance of 1, Phire[k]^2 + Phiim[k]^2 = exp(-2 t)"
+    parameter Real Nt = 1;
+    parameter Real orientation[3] = {0, 2.0943951023931953, 4.1887902047863905};
+    final parameter Real Nre[3] = {Nt * cos(orientation[k]) for k in 1:3};
+    final parameter Real Nim[3] = {Nt * sin(orientation[k]) for k in 1:3};
+    Real Phire[3](start = {cos(orientation[k]) for k in 1:3}, each fixed = true);
+    Real Phiim[3];
+    Real i[3];
+    Real v[3];
+    Real Vre[3];
+    Real Vim[3];
+    Real w[24](each start = 1, each fixed = true) "arrays that stay arrays beside the split ones";
+  equation
+    for k in 1:3 loop
+      Vre[k] = Nre[k] * i[k];
+      Vim[k] = Nim[k] * i[k];
+      -v[k] = Nre[k] * der(Phire[k]) + Nim[k] * der(Phiim[k]);
+      v[k] = i[k];
+      Vre[k] = Phire[k];
+      Vim[k] = Phiim[k];
+    end for;
+    for j in 1:24 loop
+      der(w[j]) = -w[j];
+    end for;
+  end ZeroOrientationPhases;
+
+  model ZeroConductanceCore "MSL FundamentalWave's eddy-current core without conductance, in series with a winding: Vm = G * der(PhiCore) with G = 0 gives Vm = 0, and loss = Vm * der(PhiCore) is the only other read of der(PhiCore), so PhiCore is no state (it is the winding's flux); a winding of 2 turns at v = sin(t): Phi = (1 - cos(t)) / 2"
+    parameter Real G = 0 "the core's conductance: none";
+    parameter Real N = 2;
+    Real Phi(start = 0, fixed = true);
+    Real PhiCore;
+    Real Vm;
+    Real v;
+    Real loss;
+  equation
+    v = sin(time);
+    v = N * der(Phi);
+    PhiCore = Phi;
+    Vm = G * der(PhiCore);
+    loss = Vm * der(PhiCore);
+  end ZeroConductanceCore;
+
+  model IdealDiodeLoop "MSL IdealSemiconductor's equations, two diodes on sources of opposite phase: the Boolean off[k] = s[k] < 0 is in the loop of s, vd and i (a discrete unknown in an algebraic loop); conducting i = V / (R + Ron), blocking i = Goff V / (1 + R Goff); q(1) = (1 - Goff) / (pi (R + Ron))"
+    parameter Real R = 1;
+    parameter Real Ron = 1e-5;
+    parameter Real Goff = 1e-5;
+    Real s[2](each start = 0);
+    Real vd[2];
+    Real i[2];
+    Boolean off[2](each start = true);
+    Real q(start = 0, fixed = true);
+  equation
+    for k in 1:2 loop
+      off[k] = s[k] < 0;
+      vd[k] = s[k] * (if off[k] then 1 else Ron);
+      i[k] = s[k] * (if off[k] then Goff else 1);
+      (if k == 1 then 1 else -1) * sin(2 * 3.141592653589793 * time) = R * i[k] + vd[k];
+    end for;
+    der(q) = i[1];
+  end IdealDiodeLoop;
+
+  model ThyristorCommutation "three ideal thyristors from three phase sources to one load (a center tap rectifier), fired 20 degrees after the natural commutation: the loop of all (a discrete unknown per thyristor, cut there); when one fires the last still conducts, and for a pass of the event iteration both do: a near short (2 Ron = 2e-5 ohm under 0.6 V), a linear loop of condition 1e10; q(1) = 3 sqrt(3) / (2 pi) cos(20 degrees) within 1e-3"
+    constant Real pi = 3.141592653589793;
+    parameter Real R = 1;
+    parameter Real Ron = 1e-5;
+    parameter Real Goff = 1e-5;
+    Real v[3];
+    Real s[3](each start = 0);
+    Real vd[3];
+    Real i[3];
+    Real vL;
+    Boolean fire[3];
+    Boolean off[3](each start = true);
+    Real q(start = 0, fixed = true);
+  equation
+    for k in 1:3 loop
+      v[k] = sin(2 * pi * time - (k - 1) * 2 * pi / 3);
+      fire[k] = sin(2 * pi * time - (k - 1) * 2 * pi / 3 - pi / 6 - pi / 9) > 0;
+      off[k] = s[k] < 0 or pre(off[k]) and not fire[k];
+      vd[k] = s[k] * (if off[k] then 1 else Ron);
+      i[k] = s[k] * (if off[k] then Goff else 1);
+      v[k] - vL = vd[k];
+    end for;
+    vL = R * (i[1] + i[2] + i[3]);
+    der(q) = vL;
+  end ThyristorCommutation;
+
+  function complexMeanMagnitude "the mean magnitude of a vector of Complex values (MSL QuasiStatic's quasiRMS)"
+    input Complex u[:];
+    output Real y;
+  algorithm
+    y := 0;
+    for i in 1:size(u, 1) loop
+      y := y + sqrt(u[i].re ^ 2 + u[i].im ^ 2);
+    end for;
+    y := y / size(u, 1);
+  end complexMeanMagnitude;
+
+  function conjugatedProduct "sum(conj(a[k]) * b[k]): MSL 4's Complex scalarProduct, a record result of vectors of records"
+    input Complex a[:];
+    input Complex b[size(a, 1)];
+    output Complex c;
+  algorithm
+    c := Complex(0, 0);
+    for i in 1:size(a, 1) loop
+      c := Complex(c.re + a[i].re * b[i].re + a[i].im * b[i].im, c.im + a[i].re * b[i].im - a[i].im * b[i].re);
+    end for;
+  end conjugatedProduct;
+
+  model ComplexVectorArguments "vectors of Complex values as function arguments (the variables are their fields' vectors) and a Complex result: u = {x, j x}, k = {1, j}; y = conj(k) . u = 2 x (unconjugated it were 0), r = x"
+    parameter Complex k[2] = {Complex(1, 0), Complex(0, 1)};
+    Real x(start = 1, fixed = true);
+    Complex u[2];
+    Complex y;
+    Real r;
+  equation
+    der(x) = -x;
+    u = {Complex(x, 0), Complex(0, x)};
+    y = conjugatedProduct(k, u);
+    r = complexMeanMagnitude(u);
+  end ComplexVectorArguments;
+
+  model IfBranchResiduals "if-equations on a variable condition whose branches set different variables and have a left side that is no reference (MSL CCCVcharger, IdealSwitchWithArc, DCPowerSupply's -i = ...): a charger of constant current, then constant voltage, on R and C, two elements; vc = t until u = 1 + t reaches Vend, then vc' = Vend - vc: vc(3) = {2 - exp(-2), 3 - exp(-1)}"
+    parameter Real Vend[2] = {2, 3};
+    parameter Real I = 1;
+    parameter Real R = 1;
+    parameter Real C = 1;
+    Real vc[2](each start = 0, each fixed = true);
+    Real u[2];
+    Real i[2];
+    Boolean cv[2](each start = false, each fixed = true);
+  equation
+    for k in 1:2 loop
+      C * der(vc[k]) = i[k];
+      u[k] = R * i[k] + vc[k];
+      cv[k] = time >= k;
+      if cv[k] then
+        u[k] = Vend[k];
+      else
+        -i[k] = -I;
+      end if;
+    end for;
+  end IfBranchResiduals;
+
+  model InitialCluster "discrete equations whose initial() term decides them at the initialization (MSL PartialFriction's startBackward = ... or initial() and w < 0, mode start Unknown): back and mode = -1 there, x rises from -1 with slope 1; with pre(mode) the start value again in the start's iteration, mode was 0 and x stayed"
+    Real x(start = -1, fixed = true);
+    Boolean back(start = false, fixed = true);
+    Integer mode(start = 3, fixed = true);
+  equation
+    back = pre(mode) == 0 and x < -2 or initial() and x < 0;
+    mode = if (pre(mode) == -1 or back) and x < 0 then -1 else 0;
+    der(x) = if mode == -1 then 1 else 0;
+  end InitialCluster;
+
+  model StickSlip "a mass with Coulomb friction and a stiction peak (MSL PartialFriction's equations), pushed by 2 sin(t): stuck until 2 sin(t) > Fmax = 1.5 at asin(0.75), then sliding against F0 = 1: v(2) = 2 (cos(asin(0.75)) - cos(2)) - (2 - asin(0.75)) = 1.00324; sa, a and f in a loop with the discrete startForward and locked (a mixed system)"
+    parameter Real m = 1;
+    parameter Real F0 = 1;
+    parameter Real Fmax = 1.5;
+    Real u = 2 * sin(time);
+    Real v(start = 0, fixed = true);
+    Real a;
+    Real sa;
+    Real f;
+    Boolean startForward(start = false, fixed = true);
+    Boolean startBackward(start = false, fixed = true);
+    Boolean locked;
+    Integer mode(start = 0, fixed = true);
+  equation
+    der(v) = a;
+    m * a = u - f;
+    startForward = pre(mode) == 0 and (sa > Fmax or pre(startForward) and sa > F0) or pre(mode) == -1 and v > 1e-10 or initial() and v > 0;
+    startBackward = pre(mode) == 0 and (sa < -Fmax or pre(startBackward) and sa < -F0) or pre(mode) == 1 and v < -1e-10 or initial() and v < 0;
+    locked = not (pre(mode) == 1 or startForward or pre(mode) == -1 or startBackward);
+    a = if locked then 0 else if startForward then sa - Fmax else if startBackward then sa + Fmax else if pre(mode) == 1 then sa - Fmax else sa + Fmax;
+    f = if locked then sa else if startForward then F0 else if startBackward then -F0 else if pre(mode) == 1 then F0 else -F0;
+    mode = if (pre(mode) == 1 or startForward) and v > 0 then 1 else if (pre(mode) == -1 or startBackward) and v < 0 then -1 else 0;
+  end StickSlip;
+
+  record FlowState "a record of two Reals (as a medium's ThermodynamicState)"
+    Real p;
+    Real T;
+  end FlowState;
+
+  function flowState "the state at a pressure and an enthalpy (not inlined: an algorithm with an if)"
+    input Real p;
+    input Real h;
+    output FlowState state;
+  algorithm
+    if h > 0 then
+      state := FlowState(p = p, T = h / 2);
+    else
+      state := FlowState(p = p, T = 0);
+    end if;
+  end flowState;
+
+  model RecordArrayElements "an array of records set by an array of calls (MSL Fluid's flow models: states = {setState_phX(...), setState_phX(...)}): an equation per field of each element, states[k].p and states[k].T; x = exp(-t), y = states[1].p + states[2].T = 5 x"
+    FlowState states[2];
+    Real x(start = 1, fixed = true);
+    Real y;
+  equation
+    der(x) = -x;
+    states = {flowState(x, 4 * x), flowState(2 * x, 8 * x)};
+    y = states[1].p + states[2].T;
+  end RecordArrayElements;
+
+  model ColorShape "a shape with a Real color (as MSL MultiBody's visualizers)"
+    input Real color[3];
+    Real brightness;
+  equation
+    brightness = color[1] + color[2] + color[3];
+  end ColorShape;
+
+  model ColoredBody "Integer color inputs given on to Real ones, the second by the first (MSL MultiBody Body's sphereColor and cylinderColor)"
+    input Integer sphereColor[3] = {0, 128, 255};
+    input Integer cylinderColor[3] = sphereColor;
+    parameter Real m = 1;
+    ColorShape sphere(color = sphereColor);
+    ColorShape cylinder(color = cylinderColor);
+    Real v(start = 1, fixed = true);
+  equation
+    m * der(v) = -v;
+  end ColoredBody;
+
+  model RolledBodies "two bodies of one class (rolled into arrays over the instances), the second's mass the first's: the equalities of the Integer colors stay as written, and the mass array's second element reads its first; v = exp(-t / 2) in both, the shapes' brightness 383"
+    ColoredBody body1(m = 2);
+    ColoredBody body2(m = body1.m);
+  end RolledBodies;
+
+  function squareBothWays "k1 x^2 for x >= 0, -k2 x^2 below (as MSL Fluid's regSquare2 outside its regularized band): one expression, which the backend inlines (no Inline annotation: the frontend leaves the call)"
+    input Real x;
+    input Real k1;
+    input Real k2;
+    output Real y;
+  algorithm
+    y := if x >= 0 then k1 * x ^ 2 else -k2 * x ^ 2;
+  end squareBothWays;
+
+  model InlinedRelation "a function with a relation inlined into an equation of a loop: the relation is the function's, no event (MLS 3.7.5), so the loop is solved on the branch of its iterate, not on the branch held since the last event. Two tanks of area 1 joined by a valve, q the flow from 1 to 2: h1 - h2 = squareBothWays(q, 1, 4). From h = {2, 0}: q = sqrt(h1 - h2), the difference d = h1 - h2 follows der(d) = -2 sqrt(d), d = (sqrt(2) - t)^2, zero at t = sqrt(2)"
+    Real h[2](start = {2, 0}, each fixed = true);
+    Real q(start = 1);
+    Real dp;
+  equation
+    der(h[1]) = -q;
+    der(h[2]) = q;
+    dp = h[1] - h[2];
+    dp = squareBothWays(q, 1, 4);
+  end InlinedRelation;
+
+  model PreStartInLoop "pre() of a discrete array's elements given in an initial for-equation (MSL Fluid's tank: pre(aboveLevel[i]) = level_start >= height[i]); above[i] keeps its value inside a band of 0.1 around height[i]. x = 0.5 + 0.4 cos(t): at t = 0, x = 0.9, above = {true, true} by pre() (without it above[1] is false: 0.9 is inside its band); at t = 1, x = 0.716: {false, true}"
+    parameter Real height[2] = {0.85, 0.6};
+    parameter Real x0 = 0.9;
+    Real x;
+    Boolean above[2];
+    Real count;
+  initial equation
+    for i in 1:2 loop
+      pre(above[i]) = x0 >= height[i];
+    end for;
+  equation
+    x = 0.5 + 0.4 * cos(time);
+    for i in 1:2 loop
+      above[i] = x >= height[i] + 0.1 or pre(above[i]) and x >= height[i] - 0.1;
+    end for;
+    count = (if above[1] then 1 else 0) + (if above[2] then 10 else 0);
+  end PreStartInLoop;
+
+  function quarterTurn "j^k as a Complex number (as MSL ComplexBlocks' powerOfJ)"
+    input Integer k;
+    output Complex z;
+  algorithm
+    z := if mod(k, 4) == 0 then Complex(1, 0) else if mod(k, 4) == 1 then Complex(0, 1) else if mod(k, 4) == 2 then Complex(-1, 0) else Complex(0, -1);
+    annotation(Inline = true);
+  end quarterTurn;
+
+  model RecordIfField "a field of an if-expression of records (an inlined function's value): w = {x j^1, x j^2}, x = exp(-t)"
+    Real x(start = 1, fixed = true);
+    Complex w[2];
+  equation
+    der(x) = -x;
+    w = {Complex(x, 0) * quarterTurn(1), Complex(x, 0) * quarterTurn(2)};
+  end RecordIfField;
+
+  model SampleCounter "counts the samples of its period, in an algorithm section"
+    parameter Real period = 0.25;
+    Integer n(start = 0, fixed = true);
+  algorithm
+    when sample(period, period) then
+      n := pre(n) + 1;
+    end when;
+  end SampleCounter;
+
+  model ComponentAlgorithms "an array of components with an algorithm section each: with the arrays kept the sections come as one for-statement around the when-statement (MSL Digital's InertialDelaySensitive); until t = 0.95 the periods 0.25 and 0.1 give 3 and 9 samples"
+    SampleCounter c[2](period = {0.25, 0.1});
+    Real x(start = 1, fixed = true);
+  equation
+    der(x) = -x;
+  end ComponentAlgorithms;
+
+  type Logic3 = enumeration(Unknown, Low, High);
+
+  model EnumSubscriptCluster "an array over an enumeration read at a literal (MSL Digital's ResetMap[Logic.'U']), and a discrete equation with a relation of parameters beside one of time: its lifted when-equation has change(tHigh[1] > 0) among its triggers, which never fires. y = gain[High] x + k: 2 exp(-1) + 2 at t = 1"
+    parameter Real gain[Logic3] = {0, 1, 2};
+    parameter Real tBase = 1;
+    parameter Real tHigh[2] = {tBase, 2 * tBase};
+    Boolean b;
+    Integer k;
+    Real x(start = 1, fixed = true);
+    Real y;
+  equation
+    der(x) = -x;
+    b = time > 0.5;
+    k = if tHigh[1] > 0 then (if b then 2 else 1) else 0;
+    y = gain[Logic3.High] * x + k;
+  end EnumSubscriptCluster;
 end ArrayPath;

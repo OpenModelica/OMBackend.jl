@@ -40,7 +40,9 @@ The causal level of the initialization (`causalSchedule!`): each instance of the
 order, then by column) matched to an unknown it reaches (a state element that is not fixed, directly or through the
 algebraic unknowns it depends on, or a free parameter's element: unknown `nStates + k` the `k`-th of `freeColumns`), the
 instances' number, the free parameter elements (name, column-major index). Free states no initial equation reaches
-keep their start values (as omc).
+keep their start values (as omc). An instance no unknown is left for has 0: an initial equation beyond the free
+states (two inductors in series, each with `i = 0`: one current is a state), out of the square system and checked
+at the solution (as omc removes a redundant consistent initial equation).
 """
 struct InitialMatching
   matchRow::Vector{Int}
@@ -87,8 +89,9 @@ end
     domainPasses!(g) -> Gen
 
 The domain level's passes on the domain system `g` (`domainSystem`): its classes rerolled and folded, the alias
-variables read through their roots, semiLinear chains rewritten (MLS 3.7.2.5), and the discrete variables equations
-compute numbered as unknowns of the system (after the states and algebraic variables).
+variables read through their roots, semiLinear chains rewritten (MLS 3.7.2.5), the discrete variables equations
+compute numbered as unknowns of the system (after the states and algebraic variables), and the delay() calls
+numbered (`_numberDelays!`).
 """
 function domainPasses!(g::Gen)::Gen
   g.classes = _reroll(g.classes)
@@ -111,6 +114,7 @@ function domainPasses!(g::Gen)::Gen
       g.discUnknown[info.offset + k] = (nU += 1)
     end
   end
+  _numberDelays!(g)
   return g
 end
 
@@ -136,9 +140,17 @@ function causalSchedule!(g::Gen; keepsArrays::Bool, full::Bool, fixedMask::Vecto
     g.usesInitial && ns("initial() (OMBackend.ARRAY_PATH_FULL)")
   end
   local el::InstanceTable = _elements(g)
-  local matchRow::Vector{Int} = _match(el, nU)
+  local matchRow::Vector{Int} = _match(el, nU, String[c.text for c in g.classes])
+  #= the discrete unknowns the event iteration settles: computed from the continuous variables through relations
+     only (a Boolean's `off = s < 0`), so constant between events; a loop is cut there (`_scheduleWithLoops`) =#
+  local settled::BitVector = falses(nU)
+  for r in 1:el.nEq
+    matchRow[r] > g.nStates + g.nAlg || continue
+    local own::EqClass = g.classes[el.class[r]]
+    settled[matchRow[r]] = !(_continuous(g, own.lhs) || _continuous(g, own.rhs))
+  end
   local (batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}}, pos::Vector{Int}, producer::Vector{Int}, loops::LoopBlocks) =
-    _schedule(el, matchRow, nU)
+    _schedule(el, matchRow, nU, settled)
   if _OMBACKEND.envSwitch("OMBACKEND_ARRAY_TRACE")
     local blockSizes::Dict{Int, Int} = Dict{Int, Int}()
     foreach(b::Vector{Int} -> (blockSizes[length(b)] = get(blockSizes, length(b), 0) + 1), loops.blocks)
@@ -150,7 +162,7 @@ function causalSchedule!(g::Gen; keepsArrays::Bool, full::Bool, fixedMask::Vecto
      arrays of no dimensions (a loop that does not start declines the array code at the translate,
      `OMBackend._arrayStartFailure`) =#
   local hasArrays::Bool = keepsArrays && any(c::EqClass -> size(c.domain, 2) > 1, g.classes)
-  local large::BitVector = _largeBlocks(g, loops, matchRow)
+  local large::BitVector = _largeBlocks(g, loops, matchRow, el)
   local deps::Union{Nothing, Vector{Vector{Int}}} = _stateDeps(el, matchRow, batches, producer, loops, g.nStates)
   local pattern::Union{Nothing, Tuple{Vector{Int}, Vector{Int}}} = _jacobianPattern(el, matchRow, deps, g.nStates)
   local initial::InitialMatching = _initialMatching(g, deps, producer, fixedMask)
@@ -282,8 +294,9 @@ end
 
 The initial equations as a square system (`InitialMatching`): each instance matched (augmenting paths) to a state
 element that is not fixed (`fixedMask`) and that it depends on (directly or through the algebraic unknowns: `deps` of
-their producing rows), or to an element of a free parameter it reads. NotSupported for an instance without one
-(over-determined) or a model whose dependencies were not computed (a large pattern).
+their producing rows), or to an element of a free parameter it reads. An instance without one is matched to none
+(0: over-determined, held only if the others' solution satisfies it). NotSupported for a model whose dependencies
+were not computed (a large pattern).
 """
 function _initialMatching(g::Gen, deps::Union{Nothing, Vector{Vector{Int}}}, producer::Vector{Int},
                           fixedMask::Vector{Bool})::InitialMatching
@@ -330,8 +343,7 @@ function _initialMatching(g::Gen, deps::Union{Nothing, Vector{Vector{Int}}}, pro
   local matchRow::Vector{Int} = zeros(Int, length(rows))
   for r0 in eachindex(rows)
     local visited::Set{Int} = Set{Int}()
-    _augment!(rows, matchCol, matchRow, visited, r0) ||
-      ns("initialization over-determined (an initial equation without a free state)")
+    _augment!(rows, matchCol, matchRow, visited, r0)
   end
   return InitialMatching(matchRow, length(rows), freeCols)
 end

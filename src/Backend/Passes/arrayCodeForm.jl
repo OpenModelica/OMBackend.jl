@@ -53,10 +53,14 @@ code generation takes; of its first partition (a model of several the generation
     are unrolled (`unrollElementLoops!`);
   - the for-ranges that fold to Integer literals are those literal ranges (`literalRanges!`);
   - the expressions are in their element form: what the code takes per element written so (`elementForm!`), the
-    parameters' bindings that read parameters too.
+    parameters' bindings that read parameters too;
+  - the for-equations the element form left reading the elements of what is no variable are unrolled
+    (`unrollElementLoops!` again: `{state.X}[1][\$i2]`, the field of a record array of one record, is
+    `state.X[\$i2]` only then; MSL Fluid's `heatTransfer.states = {medium.state}` of a moist air volume).
 """
 function arrayCodeForm!(model::IR.Model)::IR.Model
   (length(model.continuous) == 1 && isempty(model.clocked) && isempty(model.modes)) || return model
+  sampledReadsAsPre!(model)
   whenAssignedDiscrete!(model)
   everyPassClusters!(model)
   dropUnreadDerivatives!(model)
@@ -65,6 +69,22 @@ function arrayCodeForm!(model::IR.Model)::IR.Model
   unrollElementLoops!(model)
   literalRanges!(model)
   elementForm!(model)
+  unrollElementLoops!(model)
+  return model
+end
+
+"""
+The reads of `sample(u, clock)` (`IR.SAMPLED_READ`) as pre() of u: the array code's event iteration evaluates the
+equations before a tick's when-equation, so u's left limit is its value before the event's sweep (pre() of a
+discrete variable, of an algebraic one the buffer the iteration keeps).
+"""
+function sampledReadsAsPre!(model::IR.Model)::IR.Model
+  local asPre = (@nospecialize(e::IR.Expression)) ->
+    (e isa IR.CALL && e.name === IR.SAMPLED_READ) ? IR.CALL(:pre, e.arguments, e.ty, IR.BUILTIN_CALL) : e
+  for partition in model.continuous
+    foreach(eq -> IR.mapEquation!(asPre, eq), partition.equations)
+    foreach(eq -> IR.mapEquation!(asPre, eq), partition.initialEquations)
+  end
   return model
 end
 
@@ -103,10 +123,6 @@ function whenTargets!(out::Set{Symbol}, eq::IR.Equation, variables::IR.VariableS
   end
   return nothing
 end
-
-"The variable a reference is to or into: its own name, else (an element) its array's."
-variableNameOf(c::IR.ComponentRef, variables::IR.VariableSet)::Symbol =
-  (IR.hasSubscripts(c) && !haskey(variables, c.name)) ? unsubscriptedName(c) : c.name
 
 #= ==================================================================================== =#
 #= Clusters evaluated at every pass                                                     =#
@@ -251,7 +267,8 @@ end
 
 The first partition's equations and initial equations with their calls inlined where the functions' algorithms run
 into one expression (MLS: InlineAfterIndexReduction, Inline; `inlinedEquation`); not of an external function or one
-with an assert (inlined, its check is lost: normalizeWithAssert).
+with an assert (inlined, its check is lost: normalizeWithAssert). The relations of an inlined body generate no events
+(`IndexReduction.withoutEvents`).
 """
 function inlineAfterIndexReduction!(model::IR.Model)::IR.Model
   local inlinable::Dict{Symbol, IR.ModelicaFunction} =
@@ -290,7 +307,7 @@ function inlinedEquation(eq::IR.Equation, functions::Dict{Symbol, IR.ModelicaFun
   end
   calls || return eq
   (eq isa IR.SCALAR_EQUATION || eq isa IR.ARRAY_EQUATION || eq isa IR.IF_EQUATION) &&
-    return IndexReduction.inlineEquation(eq, functions)
+    return IndexReduction.inlineEquation(eq, functions; noEvents = true)
   eq isa IR.FOR_EQUATION &&
     return IR.FOR_EQUATION(eq.iterator, IR.Equation[inlinedEquation(e, functions) for e in eq.body], eq.source, eq.attributes)
   return eq
@@ -308,9 +325,10 @@ the initial ones, which no pass before rolls or splits (MSL Body's `zeros(3) = e
 state's `x = x_start`), and those in an if-equation's branches or a for-equation's body that read no continuous
 array. The array code has classes over index domains and none for an array equation as a whole. An inlined call's
 array literal subscripted by the iterator is then unrolled (`unrollElementLoops!`). One of an unknown size stays.
-An initial one that reads no continuous array (of a discrete array, of a parameter array with fixed = false) is its
-element equations: no residual solves it, the initialization assigns it, an element at a time, the reference on the
-left (the lowering writes an array equality `rhs = lhs`).
+An initial one that reads no continuous variable (of a discrete array, of a parameter array with fixed = false; a
+for-equation over the elements of such, a rolled component's) is its element equations: no residual solves it, the
+initialization assigns it, an element at a time, the reference on the left (the lowering writes an array equality
+`rhs = lhs`).
 """
 function rollLeftArrayEquations!(model::IR.Model)::IR.Model
   local partition::IR.Partition = model.continuous[1]
@@ -319,18 +337,40 @@ function rollLeftArrayEquations!(model::IR.Model)::IR.Model
   local initial::Vector{IR.Equation} = IR.Equation[]
   for eq in partition.initialEquations
     local rolled::IR.Equation = elementLoops(eq, variables, 0)
-    local assigned::Bool = eq isa IR.ARRAY_EQUATION && !IndexReduction.readsContinuousArray(eq.lhs, variables) &&
-                           !IndexReduction.readsContinuousArray(eq.rhs, variables)
+    local assigned::Bool = eq isa Union{IR.ARRAY_EQUATION, IR.FOR_EQUATION} && !readsContinuous(eq, variables)
     assigned ? append!(initial, IR.Equation[referenceLeft(x) for x in unrolledWhole(rolled)]) : push!(initial, rolled)
   end
   partition.initialEquations = initial
   return model
 end
 
-"A scalar equation `value = reference` as `reference = value`; another as it is."
+"A scalar equation `value = reference` (or `value = pre(reference)`) as `reference = value`; another as it is."
 referenceLeft(eq::IR.Equation)::IR.Equation =
-  (eq isa IR.SCALAR_EQUATION && eq.rhs isa IR.CREF && !(eq.lhs isa IR.CREF)) ?
+  (eq isa IR.SCALAR_EQUATION && isReference(eq.rhs) && !isReference(eq.lhs)) ?
     IR.SCALAR_EQUATION(eq.rhs, eq.lhs, eq.ty, eq.source, eq.attributes) : eq
+
+"A reference, or `pre` of one."
+isReference(e::IR.Expression)::Bool =
+  e isa IR.CREF || (IR.isBuiltinCall(e, :pre) && length(e.arguments) == 1 && e.arguments[1] isa IR.CREF)
+
+"""
+Whether the equation `eq` (its nested ones too) reads a continuous variable: a state, a derivative or an algebraic
+Real, scalar or array. An initial equation that reads none (of the elements of discrete arrays, of parameters with
+fixed = false, of `pre()` of them: a rolled component's `for \$c loop mean[\$c].y_last = mean[\$c].y0`) is no
+residual of the initialization's solve.
+"""
+function readsContinuous(eq::IR.Equation, variables::IR.VariableSet)::Bool
+  local found::Base.RefValue{Bool} = Ref(false)
+  IR.foreachExp(eq) do @nospecialize(x::IR.Expression)
+    (found[] || !(x isa IR.CREF)) && return nothing
+    local name::Symbol = IR.hasSubscripts(x.cref) ? IndexReduction.unsubscriptedName(x.cref) : x.cref.name
+    local v::Union{Nothing, IR.Variable} = get(variables, name, nothing)
+    (v !== nothing && v.kind isa Union{IR.STATE, IR.STATE_DER, IR.ALGEBRAIC, IR.ALGEBRAIC_DER} &&
+     IR.elementType(v.ty) isa IR.T_REAL) && (found[] = true)
+    return nothing
+  end
+  return found[]
+end
 
 "The equations of the for-equation `eq` at every value of its iterators (nested ones too); of no literal range as it
 is."
@@ -637,11 +677,29 @@ end
 An element of an array expression (`{155, 155, 155}[\$i1]`, `(R.T * v)[i]`, `resolve1(R, v)[i]`): of element-wise
 arithmetic, a product, a literal by literal subscripts the element distributed (`Evaluation.selectElement`); of an
 array variable its element (the reference subscripted, `composedSubscripts`); of an array literal, a function's array
-result, a record's array field the element of the value. Subscripts that are not all indices as they are.
+result, a record's array field the element of the value; of an element that is picked (`{state.X}[1][2]`, the field
+of a record array of one record: MSL Fluid's `heatTransfer.states = {medium.state}`) the element of what was picked.
+Subscripts that are not all indices as they are.
 """
 function subscriptedForm(e::IR.SUBSCRIPTED, cx::ElementContext)::IR.Expression
   local field::IR.Expression = fieldExpression(e)
   field === e || return elementFormExp(field, cx)
+  if e.exp isa IR.SUBSCRIPTED
+    local inner::IR.Expression = subscriptedForm(e.exp, cx)
+    inner isa IR.SUBSCRIPTED || return elementFormExp(IR.SUBSCRIPTED(inner, e.subscripts, e.ty), cx)
+  end
+  #= of an array constructor of one iterator by a literal first subscript (`{p_a + (p_b - p_a) * (i - 1) / 4 for i in
+     1:5}[2]`, the binding of `ps_start` in MSL Fluid's pipes: "unknown variable i"): its body at that value =#
+  if e.exp isa IR.ARRAY_CONSTRUCTOR && length(e.exp.iterators) == 1
+    local at::Union{Nothing, Int} = IR.literalIndex(e.subscripts[1])
+    local values::Union{Nothing, StepRange{Int, Int}} =
+      IndexReduction.literalRange(IndexReduction.foldTree(e.exp.iterators[1].range))
+    if at !== nothing && values !== nothing && 1 <= at <= length(values)
+      local body::IR.Expression =
+        IndexReduction.withIterators(e.exp.body, Dict{Symbol, Int}(e.exp.iterators[1].name => values[at]))
+      return elementFormExp(length(e.subscripts) == 1 ? body : IR.SUBSCRIPTED(body, e.subscripts[2:end], e.ty), cx)
+    end
+  end
   all((s::IR.Subscript) -> s isa IR.INDEX, e.subscripts) || return e
   local picked::IR.Expression = Evaluation.selectElement(e.exp, e.subscripts, e.ty)
   picked isa IR.SUBSCRIPTED || return elementFormExp(picked, cx)
@@ -823,6 +881,13 @@ form.
 """
 function callForm(e::IR.CALL, cx::ElementContext)::IR.Expression
   local fname::Symbol = e.name
+  #= a reduction over an array constructor of a constant range (an inlined function's `sum({v[k] * conj(i[k]) for k
+     in 1:m})`, MSL QuasiStatic's activePower): unrolled (`unrollAt`), its Complex projections by their parts =#
+  if e.attributes.builtin && fname in FOLDED_REDUCERS && length(e.arguments) == 1 &&
+     e.arguments[1] isa IR.ARRAY_CONSTRUCTOR
+    local unrolled::IR.Expression = unrollAt(e)
+    unrolled === e || return elementFormExp(withComplexProjections(unrolled), cx)
+  end
   if e.attributes.builtin && (fname in (:sum, :product) || (fname in (:min, :max) && length(e.arguments) == 1))
     local written::Union{Nothing, IR.Expression} = reductionForm(fname, e.arguments[1], cx)
     written === nothing || return written
