@@ -41,6 +41,10 @@ the heap (`sizeOf`). When their total passes the limit (`limitBytes`, 6 GiB unle
 says otherwise), the oldest models are forgotten (OMBackend.forgetModel) until the rest fits; the model just stored
 stays, however large. Storing a model again (a new translate or build) makes it the newest.
 
+The sizes are measured only when the live heap is over the limit (`store!`): the cached models are on the heap, so
+below it their total is too. Measuring a build walks every object it reaches (MSL BatchPlant_StandardWater: 3.6 s
+for 78 MiB, the MTK system's structure most of it).
+
 What the sizes do not count: the compiled code of a model's generated module, which Julia never frees, and the
 memory of external objects (tables) outside the Julia heap, which forgetting a model frees by their destructors.
 """
@@ -52,9 +56,14 @@ The cached models' canonical names, oldest first.
 const MODELS = String[]
 
 """
-The size in bytes of each cached model's code and build when it was stored.
+The size in bytes of each measured cached model's code and build.
 """
 const SIZES = Dict{String, Int}()
+
+"""
+The cached models not measured yet, each with a function returning what to measure (`store!`).
+"""
+const PENDING = Dict{String, Function}()
 
 """
 The default limit of the cached models' total size, in GiB.
@@ -90,25 +99,49 @@ sizeOf(@nospecialize(x))::Int = Base.summarysize(x; exclude = NOT_COUNTED)
 """
     totalBytes() -> Int
 
-The total size of the cached models.
+The total size of the cached models, the ones not measured yet measured now.
 """
-totalBytes()::Int = sum(values(SIZES); init = 0)
+function totalBytes()::Int
+  for (name, measured) in PENDING
+    SIZES[name] = sizeOf(measured())
+  end
+  empty!(PENDING)
+  return sum(values(SIZES); init = 0)
+end
 
 """
-    store!(name, bytes; forget = OMBackend.forgetModel) -> Vector{String}
+    store!(name, measured::Function; forget = OMBackend.forgetModel) -> Vector{String}
+    store!(name, bytes::Int; forget)
 
-`name` (a canonical model name) cached with `bytes`, as the newest model; then the oldest models forgotten
-(`forget(name)`) while the total is over the limit, `name` kept. The models forgotten, oldest first.
+`name` (a canonical model name) cached as the newest model, with its size: `sizeOf(measured())` when a size is
+needed, or `bytes`. Then, if the live heap is over the limit, the oldest models forgotten (`forget(name)`) while
+the cached models' total is, `name` kept. The models forgotten, oldest first.
 """
+function store!(name::String, measured::Function; forget::Function = _forgetModel)::Vector{String}
+  remove!(name)
+  push!(MODELS, name)
+  PENDING[name] = measured
+  return _forgetOldest!(forget)
+end
+
 function store!(name::String, bytes::Int; forget::Function = _forgetModel)::Vector{String}
   remove!(name)
   push!(MODELS, name)
   SIZES[name] = bytes
+  return _forgetOldest!(forget)
+end
+
+"The oldest models forgotten while the cached models' total is over the limit, the newest kept (`store!`)."
+function _forgetOldest!(forget::Function)::Vector{String}
   local forgotten = String[]
   local limit = limitBytes()
+  #= the cached models are on the heap: under the limit while it is (the live bytes count those allocated since
+     the last collection too, garbage or not) =#
+  Base.gc_live_bytes() > limit || return forgotten
   while totalBytes() > limit && length(MODELS) > 1
     local oldest = popfirst!(MODELS)
     delete!(SIZES, oldest)
+    delete!(PENDING, oldest)
     push!(forgotten, oldest)
     forget(oldest)
   end
@@ -126,6 +159,7 @@ function remove!(name::String)::Nothing
   local k = findfirst(==(name), MODELS)
   k === nothing || deleteat!(MODELS, k)
   delete!(SIZES, name)
+  delete!(PENDING, name)
   return nothing
 end
 
@@ -137,6 +171,7 @@ No model cached (OMBackend.clearCaches!).
 function clear!()::Nothing
   empty!(MODELS)
   empty!(SIZES)
+  empty!(PENDING)
   return nothing
 end
 

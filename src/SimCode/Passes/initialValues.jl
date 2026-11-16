@@ -43,7 +43,7 @@ Boolean as 0 or 1, an enumeration literal as its index), arithmetic, if-expressi
 elementary functions in their domains, `noEvent`, `smooth`, `max`, `min`; `nothing` for a free
 variable, `der()`, `pre()`, a division by zero, an array element, another construct.
 """
-function initialValue(e::Exp, env::AbstractDict{String, Float64})::Union{Nothing, Float64}
+function initialValue(@nospecialize(e::Exp), env::AbstractDict{String, Float64})::Union{Nothing, Float64}
   e isa RCONST && return e.value
   e isa ICONST && return Float64(e.value)
   e isa BCONST && return e.value ? 1.0 : 0.0
@@ -98,7 +98,7 @@ function builtinInitialValue(name::Symbol, args::Vector{Exp}, env::AbstractDict{
 end
 
 "The truth of a condition at the initialization (`initial()` holds); `nothing` if it is not known."
-function initialTruth(e::Exp, env::AbstractDict{String, Float64})::Union{Nothing, Bool}
+function initialTruth(@nospecialize(e::Exp), env::AbstractDict{String, Float64})::Union{Nothing, Bool}
   e isa BCONST && return e.value
   if e isa LUNARY && e.op === OP_NOT
     local v = initialTruth(e.exp, env)

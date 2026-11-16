@@ -65,14 +65,14 @@ mapRoots!(g::G, eq::IR.ALGORITHM) where {G} = eq
 function mapRoots!(g::G, eq::IR.IF_EQUATION)::IR.Equation where {G}
   eq.branches = IR.EquationBranch[IR.EquationBranch(g(b.condition), b.equations) for b in eq.branches]
   for b in eq.branches
-    foreach(e -> mapRoots!(g, e), b.equations)
+    foreach((@nospecialize(e::IR.Equation)) -> mapRoots!(g, e), b.equations)
   end
-  foreach(e -> mapRoots!(g, e), eq.elseEquations)
+  foreach((@nospecialize(e::IR.Equation)) -> mapRoots!(g, e), eq.elseEquations)
   return eq
 end
 function mapRoots!(g::G, eq::IR.FOR_EQUATION)::IR.Equation where {G}
   eq.iterator = IR.Iterator(eq.iterator.name, g(eq.iterator.range))
-  foreach(e -> mapRoots!(g, e), eq.body)
+  foreach((@nospecialize(e::IR.Equation)) -> mapRoots!(g, e), eq.body)
   return eq
 end
 function mapRoots!(g::G, eq::IR.WHEN_EQUATION)::IR.Equation where {G}
@@ -235,14 +235,14 @@ and an array value's element at a literal index as that element (`{a, b}[2]` as 
 equations of the continuous-time partitions and the structural modes.
 """
 function moveSubscriptsIntoDer!(model::IR.Model)::IR.Model
-  local g = e -> IR.mapExp(moveSubscriptIntoDer, e)
+  local g = (@nospecialize(e::IR.Expression)) -> IR.mapExp(moveSubscriptIntoDer, e)
   for (_, p) in partitionsWithVariables(model)
     foreach(eq -> mapRoots!(g, eq), p.equations)
   end
   return model
 end
 
-function moveSubscriptIntoDer(e::IR.Expression)::IR.Expression
+function moveSubscriptIntoDer(@nospecialize(e::IR.Expression))::IR.Expression
   e isa IR.SUBSCRIPTED || return e
   if IR.isBuiltinCall(e.exp, :der) && length(e.exp.arguments) == 1
     local element = elementOfArrayValue(IR.SUBSCRIPTED(e.exp.arguments[1], e.subscripts, e.ty))
@@ -279,7 +279,8 @@ function lowerHigherOrderDerivatives!(model::IR.Model)::IR.Model
   for (variables, p) in partitionsWithVariables(model)
     local auxiliaries = Dict{IR.ComponentRef, IR.ComponentRef}()
     local equations = IR.Equation[]
-    local g = e -> IR.mapExp(x -> lowerNestedDer(x, variables, auxiliaries, equations), e)
+    local g = (@nospecialize(e::IR.Expression)) ->
+      IR.mapExp((@nospecialize(x::IR.Expression)) -> lowerNestedDer(x, variables, auxiliaries, equations), e)
     foreach(eq -> mapRoots!(g, eq), p.equations)
     append!(p.equations, equations)
   end
@@ -338,19 +339,20 @@ function chooseRuntimeIndices!(model::IR.Model)::IR.Model
   for (variables, p) in partitionsWithVariables(model)
     for eq in p.equations
       local iterators = iteratorNames(eq)
-      mapRoots!(e -> IR.mapExp(x -> runtimeIndexChoice(x, iterators), e), eq)
+      mapRoots!((@nospecialize(e::IR.Expression)) ->
+                IR.mapExp((@nospecialize(x::IR.Expression)) -> runtimeIndexChoice(x, iterators), e), eq)
     end
     for v in variables
       v.binding === nothing && continue
       local iterators = iteratorNames(v.binding)
-      v.binding = IR.mapExp(x -> runtimeIndexChoice(x, iterators), v.binding)
+      v.binding = IR.mapExp((@nospecialize(x::IR.Expression)) -> runtimeIndexChoice(x, iterators), v.binding)
     end
   end
   return model
 end
 
 "The names of the iterators of the reductions, array constructors and for-equations in `x`."
-function iteratorNames(x::Union{IR.Expression, IR.Equation})::Set{Symbol}
+function iteratorNames(@nospecialize(x::Union{IR.Expression, IR.Equation}))::Set{Symbol}
   local names = Set{Symbol}()
   local visit = e -> e isa Union{IR.REDUCTION, IR.ARRAY_CONSTRUCTOR} && foreach(it -> push!(names, it.name), e.iterators)
   if x isa IR.Expression
@@ -464,7 +466,7 @@ function liftIfExpressions!(model::IR.Model)::IR.Model
          `moving[i] = if abs(q_end[i] - q_begin[i]) > eps then ...`, a free `i` in the generated code); the array
          code and index reduction read it there =#
       (eq isa IR.FOR_EQUATION && ifReadsIterator(eq)) && continue
-      mapRoots!(e -> lift(lifter, e, false), eq)
+      mapRoots!((@nospecialize(e::IR.Expression)) -> lift(lifter, e, false), eq)
     end
     append!(p.equations, lifter.equations)
   end
@@ -511,9 +513,10 @@ end
 
 `e` with its if-expressions lifted; `timeDependentOnly` in the branches of a lifted one.
 """
-function lift(lifter::IfExpressionLifter, e::IR.Expression, timeDependentOnly::Bool)::IR.Expression
+function lift(lifter::IfExpressionLifter, @nospecialize(e::IR.Expression), timeDependentOnly::Bool)::IR.Expression
   IR.isBuiltinCall(e, :noEvent) && return e
-  e isa IR.IF_EXPRESSION || return IR.mapChildren(x -> lift(lifter, x, timeDependentOnly), e)
+  e isa IR.IF_EXPRESSION || return IR.mapChildren((@nospecialize(x::IR.Expression)) ->
+                                                    lift(lifter, x, timeDependentOnly), e)
   local inner = x -> lift(lifter, x, true)
   if (timeDependentOnly && !dependsOnTime(e.condition)) || relationsAllInNoEvent(e.condition) ||
      isRecordValued(e.thenExp) || isRecordValued(e.elseExp) || isNoResultCall(e.thenExp) || isNoResultCall(e.elseExp)
@@ -866,11 +869,11 @@ function unrollConstantReductions!(model::IR.Model)::IR.Model
 end
 
 "`e` with its constant reductions unrolled, top-down: an unrolled one's elements in turn."
-unroll(e::IR.Expression)::IR.Expression = IR.mapChildren(unroll, unrollAt(e))
+unroll(@nospecialize(e::IR.Expression))::IR.Expression = IR.mapChildren(unroll, unrollAt(e))
 
 const FOLDED_REDUCERS = (:sum, :product, :min, :max)
 
-function unrollAt(e::IR.Expression)::IR.Expression
+function unrollAt(@nospecialize(e::IR.Expression))::IR.Expression
   if e isa IR.CALL && e.attributes.builtin && e.name in FOLDED_REDUCERS && length(e.arguments) == 1
     local arg = e.arguments[1]
     local elements = arg isa IR.ARRAY_CONSTRUCTOR ? reductionElements(arg.body, arg.iterators) :

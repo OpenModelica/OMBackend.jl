@@ -96,8 +96,8 @@ function simFunctionVariable(names::Names, v::IR.FunctionVariable)::FunctionVari
 end
 
 "`s` without `smooth(p, e)` (as `e`, its own smooth() kept), in an assignment, a call, a condition, a range, a loop's body (the previous backend's)."
-function removeSmooth(s::Statement)::Statement
-  local x = e -> withoutSmooth(e)
+function removeSmooth(@nospecialize(s::Statement))::Statement
+  local x = (@nospecialize(e::Exp)) -> withoutSmooth(e)
   s isa ASSIGN && return ASSIGN(x(s.left), x(s.right), s.source)
   s isa IF && return IF(Branch[Branch(i == 1 ? x(b.condition) : b.condition, i == 1 ? Statement[removeSmooth(t) for t in b.body] : b.body)
                                for (i, b) in enumerate(s.branches)], s.elseBody, s.source)
@@ -107,7 +107,7 @@ function removeSmooth(s::Statement)::Statement
   return s
 end
 
-withoutSmooth(e::Exp)::Exp =
+withoutSmooth(@nospecialize(e::Exp))::Exp =
   e isa CALL && e.kind === CALL_BUILTIN && e.name === :smooth && length(e.args) == 2 ? e.args[2] : mapChildren(withoutSmooth, e)
 
 #= ==================================================================================== =#
@@ -223,13 +223,13 @@ first field's (`size(u, 1)` as `size(u.re, 1)`), and the record arguments of cal
 (`expandedArguments`). In a function without flattened records only a call with a
 record-valued argument is changed (the callee takes the record's fields).
 """
-function flattenedExpression(e::IR.Expression, fields::RecordFields)::IR.Expression
+function flattenedExpression(@nospecialize(e::IR.Expression), fields::RecordFields)::IR.Expression
   isempty(fields) && !hasRecordValuedArgument(e) && return e
   return flattenRecordReferences(e, fields)
 end
 
-function flattenRecordReferences(e::IR.Expression, fields::RecordFields)::IR.Expression
-  local x = a -> flattenRecordReferences(a, fields)
+function flattenRecordReferences(@nospecialize(e::IR.Expression), fields::RecordFields)::IR.Expression
+  local x = (@nospecialize(a::IR.Expression)) -> flattenRecordReferences(a, fields)
   if e isa IR.CREF && length(e.cref.parts) >= 2 && haskey(fields, e.cref.parts[1].name)
     return IR.mapChildren(x, IR.CREF(fieldElementCref(e.cref), e.ty))
   elseif e isa IR.SIZE && e.exp isa IR.CREF && length(e.exp.cref.parts) == 1 && haskey(fields, e.exp.cref.name)
@@ -333,7 +333,7 @@ through a temporary record (`recordElementAssignment`); a tuple assignment's rec
 their fields.
 """
 function flattenedStatement(s::IR.ASSIGNMENT, fields::RecordFields)::Vector{IR.Statement}
-  local x = e -> flattenedExpression(e, fields)
+  local x = (@nospecialize(e::IR.Expression)) -> flattenedExpression(e, fields)
   s.lhs isa IR.TUPLE && return IR.Statement[flattenedTupleAssignment(s, fields)]
   if IR.typeOf(s.lhs) isa IR.T_ARRAY
     #= an array (a whole record array: one statement, scattered by the code generation) =#

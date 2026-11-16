@@ -88,7 +88,7 @@ end
 const NO_ITERATORS = Dict{Symbol, Int}()
 
 "The dimensions of an array type; NotHandled for a dimension of a size not known (`what` names it)."
-function knownSizes(ty::IR.ModelicaType, what::String)::Vector{Int}
+function knownSizes(@nospecialize(ty::IR.ModelicaType), what::String)::Vector{Int}
   local sizes = Int[]
   for d in IR.dimensions(ty)
     local n = IR.dimensionSize(d)
@@ -914,9 +914,10 @@ element-wise arithmetic (`selectElement`): a whole array variable's element refe
 constructor's body at the iterators (`constructorAt`: `{sin(time) * i for i in 1:n}` is `sin(time) * \$i1`),
 another expression subscripted.
 """
-function elementAt(e::IR.Expression, subscripts::Vector{IR.Subscript}, element::IR.ModelicaType,
+function elementAt(@nospecialize(e::IR.Expression), subscripts::Vector{IR.Subscript},
+                   @nospecialize(element::IR.ModelicaType),
                    variables::IR.VariableSet)::IR.Expression
-  return IR.mapExp(selectElement(e, subscripts, element)) do x
+  return IR.mapExp(selectElement(e, subscripts, element)) do @nospecialize(x::IR.Expression)
     (x isa IR.SUBSCRIPTED && x.subscripts == subscripts) || return x
     if x.exp isa IR.CREF && !IR.hasSubscripts(x.exp.cref)
       local v = get(variables, x.exp.cref.name, nothing)
@@ -944,6 +945,8 @@ function constructorAt(e::IR.ARRAY_CONSTRUCTOR, s::IR.Subscript)::Union{Nothing,
   local value = (first(range) == 1 && step(range) == 1) ? s.exp :
     IR.BINARY(IR.INTEGER(first(range) - step(range)), IR.ADD, IR.BINARY(IR.INTEGER(step(range)), IR.MUL, s.exp, IR.T_INTEGER()), IR.T_INTEGER())
   local name = e.iterators[1].name
-  return IR.mapExp(x -> (x isa IR.CREF && length(x.cref.parts) == 1 && !IR.hasSubscripts(x.cref) && x.cref.name === name) ? value : x,
+  return IR.mapExp((@nospecialize(x::IR.Expression)) ->
+                     (x isa IR.CREF && length(x.cref.parts) == 1 && !IR.hasSubscripts(x.cref) &&
+                      x.cref.name === name) ? value : x,
                    e.body)
 end

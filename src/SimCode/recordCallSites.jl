@@ -47,7 +47,7 @@ generation has no tuple residuals). Of the structural modes too.
 """
 function flattenRecordCallSites(simCode::SIM_CODE)::SIM_CODE
   local ht = simCode.stringToSimVarHT
-  local x = e -> expandRecordArguments(e, ht)
+  local x = (@nospecialize(e::Exp)) -> expandRecordArguments(e, ht)
   local residuals = RESIDUAL_EQUATION[]
   for eq in simCode.residualEquations
     local e = x(eq.exp)
@@ -146,7 +146,7 @@ equation's record target is its fields, as the function returns them). Builtins 
 of records whole.
 """
 function expandRecordArguments(e::Exp, ht::HT)::Exp
-  local x = a -> expandRecordArguments(a, ht)
+  local x = (@nospecialize(a::Exp)) -> expandRecordArguments(a, ht)
   if e isa CALL
     local args = Exp[]
     for arg in (e.kind === CALL_BUILTIN ? e.args : Exp[literalArrayElement(a) for a in e.args])
@@ -183,7 +183,7 @@ isRecordType(ty::SType)::Bool = ty isa TYPE_COMPLEX && ty.isRecord
 `{a, b, ...}[k]` by literal indices as its element (a medium's constant array of records the frontend folded, an element
 by an iterator: MSL Media's `h_T(data[i], T)`, a record value then passed by its fields); another expression as it is.
 """
-function literalArrayElement(e::Exp)::Exp
+function literalArrayElement(@nospecialize(e::Exp))::Exp
   e isa ASUB || return e
   local x::Exp = literalArrayElement(e.exp)
   for s in e.subs

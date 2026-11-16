@@ -449,19 +449,21 @@ end
     RootMap(f)
 
 `f` applied to the root expressions of a traversal's statements and equations (their sides, conditions, arguments),
-and to a reinit's target as a reference (`f` giving a reference again).
+and to a reinit's target as a reference (`f` giving a reference again). `f` is held untyped, as in the IR's
+traversals (IR/OMJLIR.jl, Traversal): one copy of the traversal's code per node type, not per function.
 """
-struct RootMap{F}
-  f::F
+mutable struct RootMap
+  const f::Any
 end
 
 "An expression of a traversal: `f` of it."
-(m::RootMap)(e::IR.Expression, a::Nothing) = (m.f(e), a)
+(m::RootMap)(e::IR.Expression, a::Nothing) = (m.f(e)::IR.Expression, a)
 
 "A reinit: its target as a reference through `f` (a reference again: its element form), its value through `f`."
 function (m::RootMap)(s::IR.REINIT, a::Nothing)
-  local target::IR.Expression = m.f(IR.CREF(s.state, IR.T_REAL()))
-  return (IR.REINIT(target isa IR.CREF ? target.cref : s.state, m.f(s.value), s.source), a)
+  local target::IR.Expression = m.f(IR.CREF(s.state, IR.T_REAL()))::IR.Expression
+  local value::IR.Expression = m.f(s.value)::IR.Expression
+  return (IR.REINIT(target isa IR.CREF ? target.cref : s.state, value, s.source), a)
 end
 
 "A statement or an equation of a traversal: its fields through the traversal."

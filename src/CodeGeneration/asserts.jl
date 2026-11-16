@@ -79,15 +79,19 @@ const _RHS_STEP_ERRORS = Union{ErrorException, DomainError, ModelicaAssertionErr
 #= One generated assert: the variables it reads (local name => variable name),
    the condition and message as functions of those values and the integrator,
    and a crossing function per relation of the condition (`a - b` for `a < b`,
-   1.0 where the condition does not reach it; a tuple). =#
-struct ModelicaAssert{O <: NamedTuple, C, M, Z}
-  observed::O
-  condition::C
-  message::M
+   1.0 where the condition does not reach it). Not parametric: typed by its
+   closures (a type each), every function of an assert and the callback's
+   comprehensions over them were compiled once per assert (MSL
+   BatchPlant_StandardWater: 0.28 s of each build); the callback reaches the
+   asserts through an untyped vector, so its calls were dynamic either way. =#
+struct ModelicaAssert
+  observed::NamedTuple
+  condition::Function
+  message::Function
   warning::Bool
   timeVarying::Bool
   text::String
-  crossings::Z
+  crossings::Vector{Function}
 end
 
 """

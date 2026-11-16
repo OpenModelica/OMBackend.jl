@@ -112,7 +112,8 @@ end
 literals (the frontend reads a field of a record-valued call by its position, `f(x)[1]`; the
 derivative of the call is a record literal); a subscripted expression otherwise.
 """
-function selectElement(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType)::IR.Expression
+function selectElement(@nospecialize(e::IR.Expression), subscripts::Vector{IR.Subscript},
+                       ty::IR.ModelicaType)::IR.Expression
   isempty(subscripts) && return e
   local k::Union{Nothing, Int} = IR.literalIndex(subscripts[1])
   if k !== nothing
@@ -142,7 +143,7 @@ vector-matrix product, the sum over the inner index (`(R_rel.T * {{0, 0, 0}, ...
 a MultiBody frame's partial derivative); `nothing` for another expression.
 """
 function scalarElement(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType)::Union{Nothing, IR.Expression}
-  local pick = x::IR.Expression -> selectElement(x, subscripts, ty)
+  local pick = (@nospecialize(x::IR.Expression)) -> selectElement(x, subscripts, ty)
   if e isa IR.BINARY
     e.op === IR.MUL_ARRAY_SCALAR && return times(pick(e.exp1), e.exp2)
     e.op === IR.MUL_SCALAR_ARRAY && return times(e.exp1, pick(e.exp2))
@@ -256,7 +257,7 @@ or record literal of its elements' references (`{{R.T[1,1], ...}, ...}`): in a s
 only the elements are variables, as the frontend writes them (`{e[1], e[2], e[3]}`). Other
 expressions as they are; an array of unknown size stays a reference.
 """
-function expandWhole(e::IR.Expression)::IR.Expression
+function expandWhole(@nospecialize(e::IR.Expression))::IR.Expression
   e isa IR.CREF || return e
   local ty = e.ty
   if ty isa IR.T_RECORD
@@ -293,7 +294,8 @@ function subscripted(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::IR.
 end
 
 "The field `name` of a record expression: of a reference, the reference to it; of a record or a constructor call, its element; of a call, the call's field."
-function fieldOf(e::IR.Expression, name::Symbol, ty::IR.ModelicaType)::Union{Nothing, IR.Expression}
+function fieldOf(@nospecialize(e::IR.Expression), name::Symbol,
+                 @nospecialize(ty::IR.ModelicaType))::Union{Nothing, IR.Expression}
   if e isa IR.CREF
     local parts = copy(e.cref.parts)
     push!(parts, IR.CrefPart(name, IR.Subscript[], ty))
@@ -314,7 +316,7 @@ end
 `e` as a record expression: itself, or a call of a record's constructor with every field given
 (positionally, in the record's field order); `nothing` otherwise.
 """
-function asRecord(e::IR.Expression)::Union{Nothing, IR.RECORD}
+function asRecord(@nospecialize(e::IR.Expression))::Union{Nothing, IR.RECORD}
   e isa IR.RECORD && return e
   (e isa IR.CALL && e.ty isa IR.T_RECORD && e.name === e.ty.name && length(e.arguments) == length(e.ty.fields)) || return nothing
   return IR.RECORD(copy(e.arguments), e.ty)

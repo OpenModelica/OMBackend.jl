@@ -705,7 +705,7 @@ function generateMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
     local moduleAlreadyExists = _modelDefined(Symbol(modelName))
     COMPILED_MODELS_MTK[modelName] = (modelCode, moduleAlreadyExists, codeHash)
   end
-  Cache.store!(canonicalName(modelName), Cache.sizeOf(modelCode))
+  Cache.store!(canonicalName(modelName), () -> modelCode)
   return (modelName, modelCode)
 end
 
@@ -730,7 +730,7 @@ function generateIMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
   local cname = canonicalName(modelName)
   local structural::Bool = SimCode.hasStructuralTransitions(simCode) || SimCode.hasSubModels(simCode)
   COMPILED_MODELS_MTK[modelName] = (modelCode, structural || !haskey(IMTKGen.BUILT, cname), codeHash)
-  Cache.store!(cname, Cache.sizeOf((modelCode, get(IMTKGen.BUILT, cname, nothing), get(IMTKGen.PRISTINE_P, cname, nothing))))
+  Cache.store!(cname, () -> (modelCode, get(IMTKGen.BUILT, cname, nothing), get(IMTKGen.PRISTINE_P, cname, nothing)))
   return (modelName, modelCode)
 end
 
@@ -764,7 +764,7 @@ function generateDETargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
     local moduleAlreadyExists = _modelDefined(Symbol(modelName))
     COMPILED_MODELS_DEJL[modelName] = (modelCode, moduleAlreadyExists, codeHash)
   end
-  Cache.store!(canonicalName(modelName), Cache.sizeOf(modelCode))
+  Cache.store!(canonicalName(modelName), () -> modelCode)
   return (modelName, modelCode)
 end
 
@@ -773,7 +773,7 @@ function _registerArrayODEModule!(modelName::String, modelCode::Expr)::Nothing
   dumpGeneratedCode(modelName, modelCode)
   #= evaluated again at the next simulate: a module of this name may be another path's =#
   COMPILED_MODELS_DEJL[modelName] = (modelCode, true, hash(modelCode))
-  Cache.store!(modelName, Cache.sizeOf(modelCode))
+  Cache.store!(modelName, () -> modelCode)
   #= and the ModelingToolkit path's build goes: its module is replaced, and its code (the same
      for a model without arrays) would reuse the build at its next translate =#
   IMTKGen.forgetBuild(modelName)

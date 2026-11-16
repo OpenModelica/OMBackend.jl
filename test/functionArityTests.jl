@@ -1,8 +1,7 @@
 #= The wrapper of a generated Modelica function (createModelicaFunctionWrapper) has
-   the function's arity. Its RuntimeGeneratedFunction binds the arguments unchecked:
-   a call with fewer read past the argument tuple and crashed the process (MSL
-   Water IF97, a record argument passed whole, 2026-09-30). It passes them as one
-   tuple (_tupleArgFunction). =#
+   the function's arity. Its body as a RuntimeGeneratedFunction bound the arguments
+   unchecked: a call with fewer read past the argument tuple and crashed the process
+   (MSL Water IF97, a record argument passed whole, 2026-09-30). =#
 using Test
 import OMBackend
 
@@ -18,6 +17,24 @@ import OMBackend
      type when MTK rebuilds the term (`-(::SymReal, ::SymReal)` failed with Any). =#
   @test SU._promote_symtype(w, Any[1.0, 2.0]) === Real
   @test SU.promote_shape(w, SU.ShapeVecT(), SU.ShapeVecT()) == SU.ShapeVecT()
+end
+
+#= The generated functions' wrappers are one type (their body a ModelicaFunctionCall): as a
+   RuntimeGeneratedFunction each, every wrapper was compiled for each argument types it met (MSL
+   BatchPlant: 349 instances, 1.6 s). A call runs the function's implementation. =#
+@testset "Generated function wrappers share one type" begin
+  local CG = OMBackend.CodeGeneration
+  CG.createModelicaFunctionWrapper(:omjlWrapperTypeA, 2)
+  CG.createModelicaFunctionWrapper(:omjlWrapperTypeB, 2)
+  local a = CG.MODELICA_FUNCTION_WRAPPERS[:omjlWrapperTypeA]
+  @test typeof(a) === typeof(CG.MODELICA_FUNCTION_WRAPPERS[:omjlWrapperTypeB])
+  CG.MODELICA_FUNCTION_IMPLS[:omjlWrapperTypeA] = (x, y) -> x + 2 * y
+  @test a(1.0, 2.0) == 5.0
+  @test_throws MethodError a(1.0)
+  for n in (:omjlWrapperTypeA, :omjlWrapperTypeB)
+    delete!(CG.MODELICA_FUNCTION_WRAPPERS, n)
+    delete!(CG.MODELICA_FUNCTION_IMPLS, n)
+  end
 end
 
 #= The element extractors of a record- or tuple-valued call (one term per field) call the

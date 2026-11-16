@@ -370,6 +370,7 @@ import .ExampleModels
 
   #= ── 20. The initialization's one-unknown rows ──────────────────── =#
   include("initializationCausalRowsTests.jl")
+  include("initGroupedDifferencesTests.jl")
 
   #= ── 20b. OMBackend's index reduction step by step ──────────────── =#
   include("indexReductionTests.jl")
@@ -391,6 +392,9 @@ import .ExampleModels
 
   #= ── 20f. A function's arrays of records bound by calls ────────── =#
   include("recordArrayLocalTests.jl")
+
+  #= ── 20f2. A function's work arrays by literal subscripts as scalars ── =#
+  include("workArrayLocalTests.jl")
 
   #= ── 20g. The model's functions compiled ─────────────────────────── =#
   include("compiledFunctionTests.jl")

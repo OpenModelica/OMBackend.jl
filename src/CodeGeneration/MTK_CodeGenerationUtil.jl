@@ -143,7 +143,7 @@ relative to each one's operands (OpenModelica's per-relation hysteresis).
 """
 function transformToMTKContinuousCondition(cond::SC.Exp, simCode::SC.SIM_CODE;
                                            atInitial::Bool = false, normalized::Bool = false)
-  local difference = (a::SC.Exp, b::SC.Exp) -> begin
+  local difference = (@nospecialize(a::SC.Exp), @nospecialize(b::SC.Exp)) -> begin
     local ja = expToJuliaExpMTK(a, simCode); local jb = expToJuliaExpMTK(b, simCode)
     normalized ? :(($(ja) - $(jb)) / $(_operandScaleExpr(Any[ja, jb]))) : :($(ja) - $(jb))
   end
@@ -171,7 +171,8 @@ function transformToMTKContinuousCondition(cond::SC.Exp, simCode::SC.SIM_CODE;
 end
 
 "The zero-crossing equation `zc ~ 0` of a condition (`transformToMTKContinuousCondition`)."
-transformToMTKContinuousConditionEquation(cond::SC.Exp, simCode::SC.SIM_CODE; atInitial::Bool = false)::Expr =
+transformToMTKContinuousConditionEquation(@nospecialize(cond::SC.Exp),
+                                          simCode::SC.SIM_CODE; atInitial::Bool = false)::Expr =
   :($(transformToMTKContinuousCondition(cond, simCode; atInitial)) ~ 0)
 
 """
@@ -451,7 +452,7 @@ expToJuliaExpMTK(e::SC.CAST, simCode::SC.SIM_CODE)::Expr = quote $(generateCastE
 A conversion to `ty`: to Real `float(x)`, to a Real array `float.(x)`, to an Integer array
 `Int.(round.(x))`.
 """
-function generateCastExpressionMTK(ty::SC.SType, exp::SC.Exp, simCode::SC.SIM_CODE)::Expr
+function generateCastExpressionMTK(@nospecialize(ty::SC.SType), @nospecialize(exp::SC.Exp), simCode::SC.SIM_CODE)::Expr
   local x = expToJuliaExpMTK(exp, simCode)
   ty isa SC.TYPE_REAL && return quote float($(x)) end
   (ty isa SC.TYPE_ARRAY && ty.elementType isa SC.TYPE_REAL) && return quote float.($(x)) end
@@ -947,7 +948,7 @@ index already), `sample` in a when body whether the instant is a tick (`if sampl
 name.
 """
 function _builtinCallMTK(e::SC.CALL, simCode::SC.SIM_CODE)::Expr
-  local lower = x::SC.Exp -> expToJuliaExpMTK(x, simCode)
+  local lower = (@nospecialize(x::SC.Exp)) -> expToJuliaExpMTK(x, simCode)
   local name = e.name
   if name === :der
     return _derivativeExpr(first(e.args), simCode)
@@ -1076,7 +1077,7 @@ reduction: the ideal gases' `h_T(data[i], T, ...)`, MSL Media mixtures): that el
 each field array, `data_MM[i]` (the module-level arrays of _recordArrayFieldArrays). Empty
 otherwise.
 """
-function _recordArrayElementCallArgs(arg::SC.Exp, simCode::SC.SIM_CODE)::Vector{Any}
+function _recordArrayElementCallArgs(@nospecialize(arg::SC.Exp), simCode::SC.SIM_CODE)::Vector{Any}
   (arg isa SC.ASUB && arg.exp isa SC.EXP_CREF) || return Any[]
   local elemTy = arg.exp.ty
   local nDims = 0
@@ -1638,7 +1639,8 @@ end
 `e` with `time` read as 0.0, the start time of the build.
 """
 _timeAtBuildStart(e::SC.Exp)::SC.Exp =
-  SC.mapExp(x -> (x isa SC.EXP_CREF && x.cref.sym === :time && isempty(x.cref.subs)) ? SC.RCONST(0.0) : x, e)
+  SC.mapExp((@nospecialize(x::SC.Exp)) ->
+              (x isa SC.EXP_CREF && x.cref.sym === :time && isempty(x.cref.subs)) ? SC.RCONST(0.0) : x, e)
 
 """
 `(p1, p2, ...) = f(...)`, every free parameter of the equation alone on the left and none in
@@ -1670,14 +1672,14 @@ The names of the references of `e` (not der() or pre()), in bottom-up order.
 """
 function _referenceNames(e::SC.Exp)::Vector{String}
   local out = String[]
-  SC.mapExp(x -> (x isa SC.EXP_CREF && push!(out, SC.crefName(x.cref)); x), e)
+  SC.mapExp((@nospecialize(x::SC.Exp)) -> (x isa SC.EXP_CREF && push!(out, SC.crefName(x.cref)); x), e)
   return out
 end
 
 """
 Whether `e` reads the variable `name` (of Integer type, with `integer`).
 """
-_readsName(e::SC.Exp, name::String; integer::Bool = false)::Bool =
+_readsName(@nospecialize(e::SC.Exp), name::String; integer::Bool = false)::Bool =
   SC.anyExp(x -> x isa SC.EXP_CREF && SC.crefName(x.cref) == name && (!integer || x.ty isa SC.TYPE_INTEGER), e)
 
 """
@@ -1917,7 +1919,7 @@ with initial() is a relation (its crossing function a constant of either sign), 
 on the runtime value, where initial() is false (MSL LimIntegrator's `initial() and not
 limitsAtInit` never held).
 """
-function _ifConditionAllDiscreteOrParameter(condition::SC.Exp, simCode::SC.SIM_CODE)::Bool
+function _ifConditionAllDiscreteOrParameter(@nospecialize(condition::SC.Exp), simCode::SC.SIM_CODE)::Bool
   _hasInitialCall(condition) && return false
   local refs = SC.identifierNames!(OrderedSet{String}(), condition)
   isempty(refs) && return false
@@ -2205,7 +2207,7 @@ performStructuralSimplify's observed filter keeps the observed ones.
 """
 function eventSideReadNames(simCode::SC.SIM_CODE)::Vector{String}
   local names::OrderedSet{String} = OrderedSet{String}()
-  local visit::Function = (e::SC.Exp) -> (SC.identifierNames!(names, e); nothing)
+  local visit::Function = (@nospecialize(e::SC.Exp)) -> (SC.identifierNames!(names, e); nothing)
   for w::SC.WHEN_EQUATION in simCode.whenEquations
     local stmts::Union{Nothing, SC.WHEN_STMTS} = w.whenEquation
     while stmts !== nothing

@@ -244,8 +244,8 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
   #= the variables that must keep their equations: written by whens (reinit) or algorithms, read whole, inputs =#
   local blocked = Set{Symbol}()
   local resolve = Resolver(Symbol[v.name for v in variables])
-  local scanWhole = (e::IR.Expression) -> begin
-    IR.foreachExp(e) do x
+  local scanWhole = (@nospecialize(e::IR.Expression)) -> begin
+    IR.foreachExp(e) do @nospecialize(x::IR.Expression)
       x isa IR.CREF || return nothing
       local n = x.cref.name
       (haskey(variables, n) || !haskey(resolve.under, n)) && return nothing
@@ -257,8 +257,8 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
     if eq isa IR.ALGORITHM
       foreach(c -> union!(blocked, resolve(c.name)), eq.outputs)
     elseif eq isa IR.WHEN_EQUATION
-      IR.foreachRootExp(eq) do e
-        IR.foreachExp(e) do x
+      IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
+        IR.foreachExp(e) do @nospecialize(x::IR.Expression)
           (x isa IR.CREF && haskey(antiderivative, x.cref.name)) || return nothing
           push!(blocked, baseVariable(antiderivative, x.cref.name))
           nothing
@@ -333,16 +333,17 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
                          IR.Variable[variables[d] for n in states for d in derivativeChain(variables, n)],
                          count(n -> !haskey(antiderivative, n), keys(replacements)))
   isempty(replacements) && return undo
-  local substitute = (e::IR.Expression) -> (e isa IR.CREF ? get(replacements, e.cref.name, e) : e)
+  local substitute = (@nospecialize(e::IR.Expression)) -> (e isa IR.CREF ? get(replacements, e.cref.name, e) : e)
   local reads = (eq::IR.Equation) -> begin
     local found = false
-    IR.foreachRootExp(eq) do e
-      found || (found = IR.anyExp(x -> x isa IR.CREF && haskey(replacements, x.cref.name), e))
+    IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
+      found || (found = IR.anyExp((@nospecialize(x::IR.Expression)) ->
+                                    x isa IR.CREF && haskey(replacements, x.cref.name), e))
       nothing
     end
     found
   end
-  local rewrite = (eq::IR.Equation) ->
+  local rewrite = (@nospecialize(eq::IR.Equation)) ->
     (eq in definitions || eq isa Union{IR.WHEN_EQUATION, IR.ASSERT_EQUATION} || !reads(eq)) ? eq : IR.mapEquation!(substitute, deepcopy(eq))
   partition.equations = IR.Equation[rewrite(eq) for eq in partition.equations]
   partition.initialEquations = IR.Equation[rewrite(eq) for eq in partition.initialEquations]

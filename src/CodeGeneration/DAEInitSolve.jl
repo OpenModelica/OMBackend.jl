@@ -40,6 +40,9 @@
   frees all unknowns to handle rank-deficient kinematic loops.
 =#
 
+"SparseArrays, as Symbolics loads it."
+const SA = Symbolics.SparseArrays
+
 """
 Residual vector of one init iterate: dynamics rows (du minus targets) plus
 the optional extra rows from signal-valued initialization equations.
@@ -51,23 +54,74 @@ function _initResidualVec(du, u, eq_idx, targets, extraRes)
 end
 
 """
-Forward-difference Jacobian of the init residual at u0 over the var_idx
-columns. `res` is the residual already evaluated at u0.
+Forward-difference Jacobian of the init residual at u0 over the var_idx columns. `res` is the residual already
+evaluated at u0.
+
+With the unknowns each row of the right-hand side reads (`ErasedRHS`'s `structure`), the columns that share no row
+are perturbed together, one call per group (`_columnGroups`). A column's perturbed right-hand side is the
+group's in the rows that read it and the unperturbed one in the others, so the Jacobian is the column-by-column
+differences' bit for bit; the initialization equations' rows (`extraRes`) are evaluated per column from it. MSL
+BatchPlant_StandardWater: 160 columns, 160 right-hand sides a Jacobian before.
 """
 function _fdInitResidualJacobian(rhsFunc, p_vec, u0, eq_idx, targets, extraRes, var_idx, res;
                                  eps_fd=1e-7)
-  local J = zeros(length(res), length(var_idx))
-  local du_pert = similar(u0)
-  for (jcol, jstate) in enumerate(var_idx)
-    local u_pert = copy(u0)
-    #= Relative to the value: 1e-7 vanished in 8.1e9 (Buildings' PowerLinearized, T4 = T^4),
-       a zero column, and Newton never moved. =#
-    u_pert[jstate] += eps_fd * max(1.0, abs(u0[jstate]))
-    local h = u_pert[jstate] - u0[jstate]
-    rhsFunc(du_pert, u_pert, p_vec, 0.0)
-    J[:, jcol] = (_initResidualVec(du_pert, u_pert, eq_idx, targets, extraRes) .- res) ./ h
+  local J::Matrix{Float64} = zeros(length(res), length(var_idx))
+  local structure::Union{Nothing, SA.SparseMatrixCSC{Float64, Int}} = _rhsStructure(rhsFunc, length(u0))
+  local du_pert::Vector{Float64} = similar(u0)
+  #= Relative to the value: 1e-7 vanished in 8.1e9 (Buildings' PowerLinearized, T4 = T^4), a zero column, and Newton
+     never moved. =#
+  local perturbed = (u::Vector{Float64}, j::Int) -> (u[j] += eps_fd * max(1.0, abs(u0[j])); u)
+  if structure === nothing
+    for (jcol, jstate) in enumerate(var_idx)
+      local u_pert::Vector{Float64} = perturbed(copy(u0), jstate)
+      rhsFunc(du_pert, u_pert, p_vec, 0.0)
+      J[:, jcol] = (_initResidualVec(du_pert, u_pert, eq_idx, targets, extraRes) .- res) ./ (u_pert[jstate] - u0[jstate])
+    end
+    return J
+  end
+  local du0::Vector{Float64} = similar(u0)
+  rhsFunc(du0, u0, p_vec, 0.0)
+  local du_col::Vector{Float64} = similar(u0)
+  local rows::Vector{Int} = SA.rowvals(structure)
+  for group in _columnGroups(structure, var_idx)
+    local u_group::Vector{Float64} = copy(u0)
+    foreach(jcol -> perturbed(u_group, var_idx[jcol]), group)
+    rhsFunc(du_pert, u_group, p_vec, 0.0)
+    for jcol in group
+      local jstate::Int = var_idx[jcol]
+      local u_col::Vector{Float64} = perturbed(copy(u0), jstate)
+      copyto!(du_col, du0)
+      for k in SA.nzrange(structure, jstate)
+        du_col[rows[k]] = du_pert[rows[k]]
+      end
+      J[:, jcol] = (_initResidualVec(du_col, u_col, eq_idx, targets, extraRes) .- res) ./ (u_col[jstate] - u0[jstate])
+    end
   end
   return J
+end
+
+"""
+    _columnGroups(structure, var_idx) -> Vector{Vector{Int}}
+
+The positions of `var_idx` in groups whose columns of `structure` (the rows reading each unknown) share no row: a
+greedy coloring, in the order of `var_idx`.
+"""
+function _columnGroups(structure::SA.SparseMatrixCSC{Float64, Int}, var_idx::AbstractVector{Int})::Vector{Vector{Int}}
+  local groups::Vector{Vector{Int}} = Vector{Int}[]
+  local taken::Vector{BitVector} = BitVector[]   # per group: the rows its columns read
+  local rows::Vector{Int} = SA.rowvals(structure)
+  for (jcol, jstate) in enumerate(var_idx)
+    local colRows = @view rows[SA.nzrange(structure, jstate)]
+    local g::Union{Nothing, Int} = findfirst(t -> !any(r -> t[r], colRows), taken)
+    if g === nothing
+      push!(groups, Int[])
+      push!(taken, falses(size(structure, 1)))
+      g = length(groups)
+    end
+    push!(groups[g], jcol)
+    foreach(r -> taken[g][r] = true, colRows)
+  end
+  return groups
 end
 
 """
@@ -216,7 +270,6 @@ leaves the row. Returns how many unknowns were solved.
 function _solveCausalRows!(u0::Vector{Float64}, rhsFunc::F, p_vec::Vector{Float64}, eq_idx::Vector{Int},
                            eq_target::Vector{Float64}, unknowns::Vector{Int},
                            sparsity::Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}; tol::Float64)::Int where {F}
-  local SA = Symbolics.SparseArrays
   local rowsOf = permutedims(sparsity)   # column k: the columns row k reads
   local open = BitSet(unknowns)
   local du = similar(u0)
@@ -274,9 +327,18 @@ dynamic dispatch (~0.1 µs; a right-hand side takes 10-140 µs).
 """
 struct ErasedRHS <: Function
   f::Function
+  #= The unknowns each row reads, every one (column j: the rows reading unknown j), else nothing: the columns of
+     _fdInitResidualJacobian are grouped by it. =#
+  structure::Union{Nothing, SA.SparseMatrixCSC{Float64, Int}}
 end
+ErasedRHS(f::Function) = ErasedRHS(f, nothing)
 
 (r::ErasedRHS)(du::AbstractVector, u::AbstractVector, p, t::Real) = (r.f(du, u, p, t); nothing)
+
+"The Jacobian structure of `rhs` (an `ErasedRHS`'s, of `n` unknowns), else nothing."
+_rhsStructure(rhs::ErasedRHS, n::Int)::Union{Nothing, SA.SparseMatrixCSC{Float64, Int}} =
+  rhs.structure !== nothing && size(rhs.structure) == (n, n) ? rhs.structure : nothing
+_rhsStructure(@nospecialize(rhs), n::Int)::Nothing = nothing
 
 """
     ErasedResiduals(f)
@@ -316,7 +378,6 @@ function _solveCausalBlocks!(u0::Vector{Float64}, rhsFunc::F, p_vec::Vector{Floa
                              eq_target::Vector{Float64}, extra_residuals::Union{Nothing, ErasedResiduals},
                              unknowns::Vector{Int}, sparsity::Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int};
                              tol::Float64, maxiter::Int)::Int where {F}
-  local SA = Symbolics.SparseArrays
   local nEq::Int = length(eq_idx)
   local reads::Vector{Vector{Int}} = if extra_residuals === nothing
     local rowsOf::SA.SparseMatrixCSC{Float64, Int} = permutedims(sparsity)   # column k: the columns row k reads
@@ -381,10 +442,12 @@ best effort the warning or the error below reports).
 function _solveDAEInitializationErased!(u0, rhsAt0::ErasedRHS, p_vec, mm; maxiter=200, tol=1e-10, failure_threshold=20.0, pinned=Int[], derivative_targets=Pair{Int, Float64}[], eqLabels=nothing, extra_residuals::Union{Nothing, ErasedResiduals}=nothing, discrete_pinned=Int[], warm::Bool=false,
                                   converged::Base.RefValue{Bool}=Ref(true), t0::Float64=0.0,
                                   sparsity::Union{Nothing, Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}}=nothing,
-                                  stateOrder::Vector{Int}=Int[])
+                                  stateOrder::Vector{Int}=Int[],
+                                  jacobianStructure::Union{Nothing, SA.SparseMatrixCSC{Float64, Int}}=nothing)
   #= The residuals at the start time t0: the phases below evaluate at their time 0. Assigned
-     once (closures below capture it: a reassigned argument would be boxed). =#
-  local rhsFunc = t0 == 0.0 ? rhsAt0 : ErasedRHS((du, u, p, t) -> rhsAt0(du, u, p, t + t0))
+     once (closures below capture it: a reassigned argument would be boxed). `jacobianStructure`: the unknowns
+     each row of the right-hand side reads, for the grouped differences (_fdInitResidualJacobian). =#
+  local rhsFunc = ErasedRHS(t0 == 0.0 ? rhsAt0.f : (du, u, p, t) -> rhsAt0(du, u, p, t + t0), jacobianStructure)
   local n = length(u0)
   local nMM = size(mm, 1)
   local nSafe = min(n, nMM)

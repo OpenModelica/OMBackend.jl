@@ -128,7 +128,8 @@ isTriggerAtom(e::IR.Expression)::Bool =
   callsAnyOf(e, (:pre, :edge, :change))
 
 "Whether `e` calls one of the built-ins `names`."
-callsAnyOf(e::IR.Expression, names::Tuple{Vararg{Symbol}})::Bool = IR.anyExp(x -> x isa IR.CALL && x.name in names, e)
+callsAnyOf(@nospecialize(e::IR.Expression), names::Tuple{Vararg{Symbol}})::Bool =
+  IR.anyExp(x -> x isa IR.CALL && x.name in names, e)
 
 #= ==================================================================================== =#
 #= Discrete equations as when-clusters                                                  =#
@@ -196,7 +197,7 @@ end
 Discrete-time predicate: no continuous Real dependence outside a relation (relations are event
 sources, their operands may be continuous).
 """
-function isDiscreteTime(e::IR.Expression, known::Set{Symbol})::Bool
+function isDiscreteTime(@nospecialize(e::IR.Expression), known::Set{Symbol})::Bool
   e isa IR.RELATION && return true
   e isa IR.LBINARY && return isDiscreteTime(e.exp1, known) && isDiscreteTime(e.exp2, known)
   e isa IR.LUNARY && return isDiscreteTime(e.exp, known)
@@ -213,8 +214,10 @@ function isDiscreteTime(e::IR.Expression, known::Set{Symbol})::Bool
        an affect, and StateGraph ShowCompositeStep's `suspend = anyTrue({...}) or ...` had its
        initialization row on an alias outside the lifted names =#
     return !e.attributes.builtin && !e.attributes.impure && !isempty(e.arguments) &&
-           all(a -> isDiscreteTime(a, known), e.arguments) &&
-           any(a -> IR.anyExp(x -> x isa IR.RELATION, a), e.arguments)
+           all((@nospecialize(a::IR.Expression)) -> isDiscreteTime(a, known), e.arguments) &&
+           any((@nospecialize(a::IR.Expression)) ->
+                 IR.anyExp((@nospecialize(x::IR.Expression)) -> x isa IR.RELATION, a),
+               e.arguments)
   end
   e isa IR.IF_EXPRESSION && return isDiscreteTime(e.condition, known) && isDiscreteTime(e.thenExp, known) &&
                                    isDiscreteTime(e.elseExp, known)
@@ -239,10 +242,11 @@ end
 `sample(...)`, or a conjunction with one `sample()` conjunct and no other `sample()`
 (Buildings' plotters: `sampleTrigger = active and sample(t0, samplePeriod)`).
 """
-function isSampleTrigger(e::IR.Expression)::Bool
+function isSampleTrigger(@nospecialize(e::IR.Expression))::Bool
   local conjuncts = IR.Expression[]
   local collect!
-  collect! = x -> (x isa IR.LBINARY && x.op === IR.AND) ? (collect!(x.exp1); collect!(x.exp2)) : push!(conjuncts, x)
+  collect! = (@nospecialize(x::IR.Expression)) ->
+               (x isa IR.LBINARY && x.op === IR.AND) ? (collect!(x.exp1); collect!(x.exp2)) : push!(conjuncts, x)
   collect!(e)
   local isSample = x -> IR.isBuiltinCall(x, :sample)
   return count(isSample, conjuncts) == 1 && !any(c -> !isSample(c) && callsAnyOf(c, (:sample,)), conjuncts)
@@ -362,7 +366,7 @@ how the connects are oriented.
 """
 function readThroughAliases!(candidates::Dict{Symbol, Candidate}, definitionOf::Dict{Symbol, Symbol})::Nothing
   isempty(definitionOf) && return nothing
-  local subst = e -> begin
+  local subst = (@nospecialize(e::IR.Expression)) -> begin
     e isa IR.CREF || return e
     local d = get(definitionOf, e.cref.name, e.cref.name)
     return d === e.cref.name ? e : IR.CREF(candidates[d].lhs.cref, e.ty)
@@ -411,19 +415,22 @@ function initialPreValues(starts::Dict{Symbol, IR.Expression}, names::Vector{Sym
 end
 
 "The names of `restrict` referenced anywhere in `e` (`pre()` included), in order."
-function namesReferenced(e::IR.Expression, restrict::Set{Symbol})::Vector{Symbol}
+function namesReferenced(@nospecialize(e::IR.Expression), restrict::Set{Symbol})::Vector{Symbol}
   local out = Symbol[]
   local visit
-  visit = x -> (foreach(visit, IR.children(x)); x isa IR.CREF && x.cref.name in restrict && !(x.cref.name in out) && push!(out, x.cref.name))
+  visit = (@nospecialize(x::IR.Expression)) -> begin
+    foreach(visit, IR.children(x))
+    x isa IR.CREF && x.cref.name in restrict && !(x.cref.name in out) && push!(out, x.cref.name)
+  end
   visit(e)
   return out
 end
 
 "The names of `restrict` referenced outside any `pre()`: the topological order's edges."
-function namesReferencedOutsidePre(e::IR.Expression, restrict::Set{Symbol})::Vector{Symbol}
+function namesReferencedOutsidePre(@nospecialize(e::IR.Expression), restrict::Set{Symbol})::Vector{Symbol}
   local out = Symbol[]
   local visit
-  visit = x -> begin
+  visit = (@nospecialize(x::IR.Expression)) -> begin
     IR.isBuiltinCall(x, :pre) && return
     x isa IR.CREF && x.cref.name in restrict && !(x.cref.name in out) && push!(out, x.cref.name)
     foreach(visit, IR.children(x))
@@ -438,7 +445,7 @@ right-hand side: `pre(sibling)` keeps reading the value before the event, and `e
 `change()` read `pre()` of their argument, which must stay a variable.
 """
 inlineSiblings(e::IR.Expression, subst::Dict{Symbol, IR.Expression})::IR.Expression =
-  IR.mapExpTopDown(e) do x
+  IR.mapExpTopDown(e) do @nospecialize(x::IR.Expression)
     isBuiltinCallOf(x, (:pre, :edge, :change)) && return (x, false)
     (x isa IR.CREF && haskey(subst, x.cref.name)) && return (subst[x.cref.name], false)
     return (x, true)
@@ -449,7 +456,7 @@ inlineSiblings(e::IR.Expression, subst::Dict{Symbol, IR.Expression})::IR.Express
 without a start value, its type's default: `false`, `0`, the first literal).
 """
 foldPreOfMembers(e::IR.Expression, members::Set{Symbol}, starts::Dict{Symbol, IR.Expression})::IR.Expression =
-  IR.mapExpTopDown(e) do x
+  IR.mapExpTopDown(e) do @nospecialize(x::IR.Expression)
     if IR.isBuiltinCall(x, :pre)
       local a = x.arguments[1]
       (a isa IR.CREF && a.cref.name in members) && return (get(() -> defaultStart(a.ty), starts, a.cref.name), false)
@@ -500,7 +507,7 @@ end
 function preReads(body::Vector{Tuple{IR.CREF, IR.Expression, IR.Source}})::Vector{IR.CREF}
   local found = IR.CREF[]
   local visit
-  visit = x -> begin
+  visit = (@nospecialize(x::IR.Expression)) -> begin
     foreach(visit, IR.children(x))
     if isBuiltinCallOf(x, (:pre, :edge, :change)) && x.arguments[1] isa IR.CREF
       local a = x.arguments[1]
@@ -535,7 +542,7 @@ function refsOutsidePreIndex(equations::AbstractVector{IR.Equation}, canon::F)::
   for eq in equations
     local refs = Set{Symbol}()
     local visit
-    visit = x -> begin
+    visit = (@nospecialize(x::IR.Expression)) -> begin
       IR.isBuiltinCall(x, :pre) && return
       x isa IR.CREF && push!(refs, canon(x.cref.name))
       foreach(visit, IR.children(x))
@@ -810,7 +817,7 @@ end
 
 "`e` with its event functions of continuous-time arguments read from their variables (`liftEventFunctions!`)."
 function liftEvents(l::EventFunctionLifter, e::IR.Expression)::IR.Expression
-  return IR.mapExpTopDown(e) do x::IR.Expression
+  return IR.mapExpTopDown(e) do @nospecialize(x::IR.Expression)
     isBuiltinCallOf(x, (:noEvent, :pre)) && return (x, false)
     (isBuiltinCallOf(x, EVENT_FUNCTIONS) && liftable(l, x.arguments)) || return (x, true)
     local args::Vector{IR.Expression} = IR.Expression[liftEvents(l, a) for a in x.arguments]

@@ -80,7 +80,7 @@ function resolveConstantIfExp(e::Exp, simCode::SIM_CODE)::Exp
   end
   e isa Union{IFEXP, BINARY, UNARY, LBINARY, LUNARY, RELATION, CAST, CALL, ARRAY_EXP, ASUB} ||
     return e
-  return mapChildren(x -> resolveConstantIfExp(x, simCode), e)
+  return mapChildren((@nospecialize(x::Exp)) -> resolveConstantIfExp(x, simCode), e)
 end
 
 """
@@ -181,7 +181,7 @@ function tryEvalNumeric(e::Exp, simCode::SIM_CODE, seen::OrderedSet{String})::Un
   e isa ICONST && return Float64(e.value)
   e isa ENUM_LITERAL && return Float64(e.index)
   if e isa EXP_CREF
-    return withParameterBinding(b -> tryEvalNumeric(b, simCode, seen), e, simCode, seen)
+    return withParameterBinding((@nospecialize(b::Exp)) -> tryEvalNumeric(b, simCode, seen), e, simCode, seen)
   elseif e isa UNARY && e.op === OP_UMINUS
     local v = tryEvalNumeric(e.exp, simCode, seen)
     return v === nothing ? nothing : -v

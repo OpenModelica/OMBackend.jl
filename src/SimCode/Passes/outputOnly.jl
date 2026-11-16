@@ -184,7 +184,7 @@ Whether the variable `name` appears in `e`, and if so only affinely (never under
 operator or in a function's argument): `(occurs, linear)`. Conservative: what is not known to
 be linear is not.
 """
-function occursLinearly(e::Exp, name::String)::Tuple{Bool, Bool}
+function occursLinearly(@nospecialize(e::Exp), name::String)::Tuple{Bool, Bool}
   local n = scalarReferenceName(e)
   n === nothing || return (n == name, true)
   e isa Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, WILD} && return (false, true)
@@ -271,7 +271,7 @@ function eliminateOutputOnlyVariables(simCode::SIM_CODE, options::EliminationOpt
   local initialReads = OrderedSet{String}()
   for eq in simCode.initialEquations
     eq isa ARRAY_EQUATION && continue
-    foreach(e -> crefNames!(initialReads, e), equationExps(eq))
+    foreach((@nospecialize(e::Exp)) -> crefNames!(initialReads, e), equationExps(eq))
   end
   #= a variable read, or the variable of its array (`elementArray`, `keyOf`) =#
   local stillRead = name::String -> begin

@@ -118,7 +118,7 @@ function isClockExpression(e::IR.Expression, clockVars::Set{Symbol})::Bool
 end
 
 "Scan the expression `e` into `s`, deciding where to descend."
-function scanExp!(s::EquationScan, e::IR.Expression)::Nothing
+function scanExp!(s::EquationScan, @nospecialize(e::IR.Expression))::Nothing
   if e isa IR.CREF
     local name = e.cref.name
     if name in s.clockVars
@@ -132,7 +132,7 @@ function scanExp!(s::EquationScan, e::IR.Expression)::Nothing
   elseif e isa IR.CALL
     scanCall!(s, e) || return nothing
   end
-  foreach(c -> scanExp!(s, c), IR.children(e))
+  foreach((@nospecialize(c::IR.Expression)) -> scanExp!(s, c), IR.children(e))
   return nothing
 end
 
@@ -188,7 +188,7 @@ function scanEquation(eq::IR.Equation, unknowns::Set{Symbol}, clockVars::Set{Sym
     end
     return s
   end
-  IR.foreachRootExp(e -> scanExp!(s, e), eq)
+  IR.foreachRootExp((@nospecialize(e::IR.Expression)) -> scanExp!(s, e), eq)
   return s
 end
 

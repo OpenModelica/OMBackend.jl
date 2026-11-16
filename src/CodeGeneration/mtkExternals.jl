@@ -75,18 +75,37 @@ function registerModelFunctions!(mod::Module)::Nothing
   return nothing
 end
 
-#= A Modelica function's wrapper (createModelicaFunctionWrapper): its
-   RuntimeGeneratedFunction behind a method of the function's arity. An RGF
-   binds its arguments unchecked, so a call with fewer read past the argument
-   tuple and crashed the process (MSL Water IF97, 2026-09-30); here a wrong
-   argument count is a MethodError. The RGF takes the arguments as one tuple
-   (_tupleArgFunction). =#
+#= A Modelica function's wrapper (createModelicaFunctionWrapper): its body `rgf`, a function of the arguments as one
+   tuple, behind a method of the function's arity. A body that binds its arguments unchecked (a
+   RuntimeGeneratedFunction) read past a shorter tuple and crashed the process (MSL Water IF97, 2026-09-30); here a
+   wrong argument count is a MethodError. The generated functions' bodies are ModelicaFunctionCall. =#
 struct ModelicaFunctionWrapper{N, F} <: Function
   name::Symbol
   rgf::F
 end
 ModelicaFunctionWrapper{N}(name::Symbol, rgf::F) where {N, F} = ModelicaFunctionWrapper{N, F}(name, rgf)
 (w::ModelicaFunctionWrapper{N})(args::Vararg{Any, N}) where {N} = w.rgf(args)
+
+"""
+    ModelicaFunctionCall(name, arrayFunction, outputDims)
+
+A generated Modelica function's wrapper body (createModelicaFunctionWrapper), called with the arguments as one tuple:
+with a symbolic argument a term or its eager value (`_symbolicFuncDispatch`), else the function's implementation
+(`MODELICA_FUNCTION_IMPLS`). One type for all functions: as a RuntimeGeneratedFunction each, every function's wrapper
+was compiled for each argument types it met (MSL BatchPlant: 349 instances, 1.6 s, and 54 of its derivative rule,
+0.8 s).
+"""
+struct ModelicaFunctionCall <: Function
+  name::Symbol
+  arrayFunction::Bool
+  outputDims::Tuple{Vararg{Int}}
+end
+
+function (c::ModelicaFunctionCall)(args::Tuple)
+  !isempty(args) && hasSymbolicArgs(args...) &&
+    return _symbolicFuncDispatch(c.name, Any[args...], c.arrayFunction, c.outputDims)
+  return Base.invokelatest(MODELICA_FUNCTION_IMPLS[c.name], args...)
+end
 Base.nameof(w::ModelicaFunctionWrapper) = w.name
 Base.show(io::IO, w::ModelicaFunctionWrapper) = print(io, w.name)
 
@@ -208,7 +227,12 @@ end
    generated code. A stiff model at a loose tolerance went from Success to
    Unstable or InitialFailure by process (MSL DifferenceAmplifier with QNDF
    at 1e-2, 4 of 52 verify runs). An RGF's type holds a hash of its body's
-   content (`id`), so the type identifies the function. =#
+   content (`id`), so its argument names and `id` identify the function. Not
+   the type's own hash: that includes its module's build id, random per
+   precompilation of OMBackend (`_RGF_TAG` is this module's type), so every
+   OMBackend build ordered the terms and rounded the right-hand side
+   differently (MSL BatchPlant_StandardWater: Success, Unstable or
+   InitialFailure by build, with the same model code). =#
 const _RGF_TAG = getfield(@__MODULE__, Symbol("#_RGF_ModTag"))
 
 """
@@ -325,8 +349,11 @@ function _freeExternalObject!(h::ExternalObjectHandle)::Nothing
   end
   return nothing
 end
-Base.hash(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{<:Any, _RGF_TAG, _RGF_TAG}, h::UInt) = hash(typeof(f), h)
-Base.hash(w::ModelicaFunctionWrapper, h::UInt) = hash(typeof(w), hash(w.name, h))
+"By its argument names and its code's hash (`id`), not its type (see `_RGF_TAG`)."
+Base.hash(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{A, _RGF_TAG, _RGF_TAG, ID}, h::UInt) where {A, ID} =
+  hash(ID, hash(A, hash(:RuntimeGeneratedFunction, h)))
+"By its name and arity, not its type (see `_RGF_TAG`)."
+Base.hash(w::ModelicaFunctionWrapper{N}, h::UInt) where {N} = hash(N, hash(w.name, hash(:ModelicaFunctionWrapper, h)))
 
 #= der() of a call of a function with a derivative annotation that stays a term (an
    if-statement on its input: Buildings' equalPercentage, DerivativeCheck): the partial
@@ -1614,70 +1641,6 @@ _eagerFailure!(funcName::Symbol, key::Tuple, err)::Nothing =
   (err isa TypeError && push!(_eagerFailures(funcName).args, key); nothing)
 
 """
-Build the body Expr for a wrapper function with the given arity and dispatch mode.
-Returns a quoted `function(args...) ... end` expression suitable for RuntimeGeneratedFunctions.
-"""
-function _buildWrapperBody(funcName::Symbol, nArgs::Int, arrayFunction::Bool, outputDims::Tuple{Vararg{Int}})
-  local fnQuote = QuoteNode(funcName)
-  local hasArrayDims = !isempty(outputDims)
-
-  #= Build argument names. RTG does not support varargs, so always use fixed arity. =#
-  local argNames = [Symbol("arg", i) for i in 1:nArgs]
-
-  #= Build the symbolic check =#
-  local symbolicCheckExpr
-  if nArgs == 0
-    symbolicCheckExpr = nothing
-  elseif nArgs == 1
-    symbolicCheckExpr = :(isSymbolicArg(arg1))
-  else
-    symbolicCheckExpr = Expr(:call, :hasSymbolicArgs, argNames...)
-  end
-
-  #= Build the symbolic return expression.
-     Uses _symbolicFuncDispatch which tries eager evaluation first (producing
-     elementary Num expressions Symbolics can differentiate), falling back to
-     opaque RTG Terms for functions with data-dependent if-statements. =#
-  local symbolicReturnExpr
-  if nArgs == 0
-    symbolicReturnExpr = nothing
-  else
-    local origArgsExpr = Expr(:ref, :Any, argNames...)
-    symbolicReturnExpr = :(return _symbolicFuncDispatch($fnQuote, $origArgsExpr, $arrayFunction, $outputDims))
-  end
-
-  #= Build the impl call =#
-  local implCallExpr
-  if nArgs == 0
-    implCallExpr = :(Base.invokelatest(impl))
-  else
-    implCallExpr = Expr(:call, :(Base.invokelatest), :impl, argNames...)
-  end
-
-  #= Assemble the body block =#
-  local stmts = Expr[]
-
-  #= Add symbolic dispatch if applicable =#
-  if symbolicCheckExpr !== nothing && symbolicReturnExpr !== nothing
-    push!(stmts, Expr(:if, symbolicCheckExpr, symbolicReturnExpr))
-  end
-
-  #= Add impl lookup and call =#
-  push!(stmts, :(impl = MODELICA_FUNCTION_IMPLS[$fnQuote]))
-  push!(stmts, implCallExpr)
-
-  local bodyBlock = Expr(:block, stmts...)
-
-  #= Build the arrow function expression: (args...) -> begin ... end
-     RTG requires arrow form with fixed arity (no varargs). =#
-  if nArgs == 0
-    return Expr(:->, Expr(:tuple), bodyBlock)
-  else
-    return Expr(:->, Expr(:tuple, argNames...), bodyBlock)
-  end
-end
-
-"""
 A Modelica function's code as a RuntimeGeneratedFunction can compile it, or `nothing`. An RGF's
 body can define no closure ("the function body AST defined by this @generated function is not
 pure"); RGF turns an anonymous function or an `Expr(:generator)` into an opaque closure, not
@@ -1906,13 +1869,10 @@ end
 function createModelicaFunctionWrapper(funcName::Symbol, nArgs::Int, arrayFunction::Bool = false, outputDims::Tuple{Vararg{Int}} = ())
   #= Always (re-)create the wrapper so the correct arrayFunction flag is applied. =#
 
-  #= Build the function body expression and create an RTG function.
-     RTG functions are world-age safe: they can be called from any world age,
-     unlike @eval-created functions which are "too new" when called from
-     RuntimeGeneratedFunction context (e.g., MTK equation evaluation). =#
-  local body = first(_tupleArgFunction(_buildWrapperBody(funcName, nArgs, arrayFunction, outputDims)))
-  local rtg = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, body)
-  MODELICA_FUNCTION_WRAPPERS[funcName] = ModelicaFunctionWrapper{nArgs}(funcName, rtg)
+  #= Its body a method of OMBackend, defined before any model's world: callable from any world, as the model's
+     generated code calls it (an @eval-created function was "too new" there). =#
+  MODELICA_FUNCTION_WRAPPERS[funcName] =
+    ModelicaFunctionWrapper{nArgs}(funcName, ModelicaFunctionCall(funcName, arrayFunction, outputDims))
   if arrayFunction && !isempty(outputDims)
     precreateElementExtractors(funcName, nArgs, outputDims)
   end

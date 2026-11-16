@@ -48,7 +48,7 @@ const OPERATOR_TEXT = Dict{OpKind, String}(
   OP_LESS => "<", OP_LESSEQ => "<=", OP_GREATER => ">", OP_GREATEREQ => ">=", OP_EQUAL => "==", OP_NEQUAL => "<>")
 
 "How tightly an expression binds: an operand of a tighter operator is parenthesized."
-function precedence(e::Exp)::Int
+function precedence(@nospecialize(e::Exp))::Int
   if e isa BINARY
     local t = OPERATOR_TEXT[e.op]
     t in ("+", "-", ".+", ".-") && return 5
@@ -66,7 +66,7 @@ end
 """
 An operand, parenthesized where it binds less tightly than `p` (or as tightly, `strict`).
 """
-function _printOperand(io::IO, e::Exp, p::Int; strict::Bool = false)
+function _printOperand(io::IO, @nospecialize(e::Exp), p::Int; strict::Bool = false)
   local q = precedence(e)
   local paren = q < p || (strict && q == p)
   paren && print(io, "(")

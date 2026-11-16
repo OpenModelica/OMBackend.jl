@@ -79,7 +79,7 @@ function introduceDerivatives!(variables::IR.VariableSet, partition::IR.Partitio
     push!(variables, IR.Variable(d, v.ty, IR.STATE_DER(name), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION,
                                  false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :introduceDerivatives))
   end
-  local toDerivative = e -> begin
+  local toDerivative = (@nospecialize(e::IR.Expression)) -> begin
     (IR.isBuiltinCall(e, :der) && e.arguments[1] isa IR.CREF) || return e
     local x = e.arguments[1].cref
     x.name in introduced && return IR.CREF(variables[variables[x.name].kind.derivative].cref, e.ty)

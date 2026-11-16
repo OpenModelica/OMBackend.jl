@@ -60,15 +60,14 @@ function derivativesOfDummyStates(simCode::SIM_CODE)::SIM_CODE
     return negated ? UNARY(OP_UMINUS, reference(representative)) : reference(representative)
   end
   local replaced = Ref(0)
-  local f = e -> begin
+  local f = (@nospecialize(e::Exp)) -> begin
     e isa DER || return e
     local d = derivativeOf(crefName(e.cref))
     d === nothing && return e
     replaced[] += 1
     return d
   end
-  local recur = (x, a) -> (x isa Exp ? mapExp(f, x) : x isa Statement ? mapStatement(f, x) : x, a)
-  local initialEquations = Equation[first(traverseFields(eq, recur, nothing)) for eq in simCode.initialEquations]
+  local initialEquations::Vector{Equation} = Equation[mapEquation(f, eq) for eq in simCode.initialEquations]
   replaced[] == 0 && return simCode
   @debug "[SIMCODE: $(simCode.name): derivativesOfDummyStates] $(replaced[]) der() of non-states replaced"
   return update(simCode; initialEquations)
@@ -118,7 +117,7 @@ function unlinkUnreadStateDerivatives(simCode::SIM_CODE)::SIM_CODE
   local reads = Dict{String, Int}()
   local visit::Function = (e::Exp) -> foreachExp(x::Exp -> (x isa Union{EXP_CREF, PRE} && (reads[crefName(x.cref)] = get(reads, crefName(x.cref), 0) + 1)), e)
   #= every equation's reads but the links' own =#
-  foreachEquationExp(simCode; eliminated = true) do place::Tuple{Symbol, Int}, e::Exp
+  foreachEquationExp(simCode; eliminated = true) do place::Tuple{Symbol, Int}, @nospecialize(e::Exp)
     (place[1] === :residualEquations && haskey(links, place[2])) || visit(e)
   end
   foreach(e -> (reads[e.representativeName] = get(reads, e.representativeName, 0) + 1), simCode.aliasMap)

@@ -80,16 +80,16 @@ value before the iteration, MLS 3.7.5).
 """
 function _whenReads(conditions::Vector{SC.Exp}, body::Vector{SC.Statement})::Vector{String}
   local out::Vector{String} = String[]
-  foreach(c -> _currentReads!(out, c), conditions)
+  foreach((@nospecialize(c::SC.Exp)) -> _currentReads!(out, c), conditions)
   foreach(s -> _statementReads!(out, s), body)
   return unique!(filter!(!=("time"), out))
 end
 
-function _currentReads!(out::Vector{String}, e::SC.Exp)::Nothing
+function _currentReads!(out::Vector{String}, @nospecialize(e::SC.Exp))::Nothing
   e isa SC.PRE && return nothing
   (e isa SC.CALL && e.name === :pre) && return nothing
   e isa Union{SC.EXP_CREF, SC.DER} && push!(out, SC.crefName(e.cref))
-  foreach(x -> _currentReads!(out, x), SC.children(e))
+  foreach((@nospecialize(x::SC.Exp)) -> _currentReads!(out, x), SC.children(e))
   return nothing
 end
 
@@ -124,9 +124,9 @@ The names a condition reads OUTSIDE any `change(...)` or `pre(...)`: the level-v
 Booleans of the condition (`when boolVar then`), for which the discrete callback keeps an
 edge latch.
 """
-function _collectBareCrefStrings(cond::SC.Exp)::OrderedSet{String}
+function _collectBareCrefStrings(@nospecialize(cond::SC.Exp))::OrderedSet{String}
   local out = OrderedSet{String}()
-  local walk = function (e::SC.Exp, insideObs::Bool)
+  local walk = function (@nospecialize(e::SC.Exp), insideObs::Bool)
     if e isa Union{SC.EXP_CREF, SC.DER}
       insideObs || push!(out, SC.crefName(e.cref))
     elseif e isa SC.CALL
@@ -330,7 +330,7 @@ the assigning when fires): no PresetTimeCallback, and a ContinuousCallback is un
 (simultaneous crossings of several such callbacks are tie-broken to a single applied
 affect).
 """
-function _discreteTimeEventThreshold(cond::SC.Exp, simCode::SC.SIM_CODE)::Union{Nothing, SC.Exp}
+function _discreteTimeEventThreshold(@nospecialize(cond::SC.Exp), simCode::SC.SIM_CODE)::Union{Nothing, SC.Exp}
   cond isa SC.RELATION || return nothing
   local thr = (_isTimeCref(cond.exp1) && cond.op in (SC.OP_GREATEREQ, SC.OP_GREATER)) ? cond.exp2 :
               (_isTimeCref(cond.exp2) && cond.op in (SC.OP_LESSEQ, SC.OP_LESS)) ? cond.exp1 : nothing
@@ -409,7 +409,8 @@ names a Ref shared with the parent when-branch holding the last consumed thresho
 parent consumes the threshold when it fires at or past it (elsewhen exclusivity), and this
 callback consumes it on firing so a level-true condition stays edge-only.
 """
-function _emitElsewhenThresholdTimeWhen(elseArm::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, ewRefSym::Symbol, thr::SC.Exp)::Expr
+function _emitElsewhenThresholdTimeWhen(elseArm::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, ewRefSym::Symbol,
+                                        @nospecialize(thr::SC.Exp))::Expr
   ADD_CALLBACK()
   local callbacks = COUNT_CALLBACKS()
   local whenStmts = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
@@ -431,7 +432,7 @@ function _emitElsewhenThresholdTimeWhen(elseArm::SC.WHEN_EQUATION, simCode::SC.S
       $(Symbol("affect$(callbacks)!")) = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)) -> begin
         local t = integrator.t
         local x = integrator.u
-        @debug "[CB-EW$($(callbacks)) affect] firing" t=integrator.t
+        OMBackend.CodeGeneration.whenTrace($("[CB-EW$(callbacks) affect] firing"), integrator.t, nothing)
         $(_lookupTables(:_affCache))
         $(_whenLookupBindings(affBindCrefs, simCode)...)
         $(ewRefSym)[] = Float64($(expToJuliaExpMTK(thr, simCode)))
@@ -767,7 +768,7 @@ end
 """
 The conjuncts of `e` (`a and b and c`: a, b, c).
 """
-function _conjuncts!(out::Vector{SC.Exp}, e::SC.Exp)::Vector{SC.Exp}
+function _conjuncts!(out::Vector{SC.Exp}, @nospecialize(e::SC.Exp))::Vector{SC.Exp}
   (e isa SC.LBINARY && e.op === SC.OP_AND) || return push!(out, e)
   _conjuncts!(out, e.exp1)
   return _conjuncts!(out, e.exp2)
@@ -778,7 +779,7 @@ end
 exactly one sample() conjunct (the guard: the other conjuncts, or nothing); `(nothing,
 nothing)` otherwise.
 """
-function _splitSampleCondition(cond::SC.Exp)::Tuple{Union{Nothing, SC.CALL}, Union{Nothing, SC.Exp}}
+function _splitSampleCondition(@nospecialize(cond::SC.Exp))::Tuple{Union{Nothing, SC.CALL}, Union{Nothing, SC.Exp}}
   local conjuncts = _conjuncts!(SC.Exp[], cond)
   local isSample = e::SC.Exp -> SC.isBuiltin(e, :sample)
   local samples = filter(isSample, conjuncts)
@@ -792,10 +793,10 @@ end
 """
 The sample() calls of a condition that is only sample()s or-ed (more than one), or nothing.
 """
-function _sampleDisjuncts(cond::SC.Exp)::Union{Vector{SC.CALL}, Nothing}
+function _sampleDisjuncts(@nospecialize(cond::SC.Exp))::Union{Vector{SC.CALL}, Nothing}
   local out = SC.CALL[]
   local collect! = nothing
-  collect! = e::SC.Exp -> begin
+  collect! = (@nospecialize(e::SC.Exp)) -> begin
     (e isa SC.LBINARY && e.op === SC.OP_OR) && return collect!(e.exp1) && collect!(e.exp2)
     SC.isBuiltin(e, :sample) || return false
     push!(out, e)
@@ -809,11 +810,11 @@ end
 triggers, none of them under a sample() (Buildings' occupant lighting: `when {occ,
 sampleTrigger}`, edge(occ) or sample(t0, samplePeriod)), or nothing.
 """
-function _sampleOrOthers(cond::SC.Exp)::Union{Tuple{Vector{SC.CALL}, SC.Exp}, Nothing}
+function _sampleOrOthers(@nospecialize(cond::SC.Exp))::Union{Tuple{Vector{SC.CALL}, SC.Exp}, Nothing}
   local samples = SC.CALL[]
   local others = SC.Exp[]
   local collect! = nothing
-  collect! = e::SC.Exp -> begin
+  collect! = (@nospecialize(e::SC.Exp)) -> begin
     if e isa SC.LBINARY && e.op === SC.OP_OR
       collect!(e.exp1); collect!(e.exp2)
     elseif SC.isBuiltin(e, :sample)
@@ -876,8 +877,8 @@ function _sampleClock(sampleCall::SC.CALL, simCode::SC.SIM_CODE)::Tuple{Any, Flo
   return (dtExpr, firstTick, iszero(firstTick))
 end
 
-_containsSampleCall(e::SC.Exp)::Bool = _containsCallTo(e, :sample)
-_containsCallTo(e::SC.Exp, name::Symbol)::Bool = SC.anyExp(x -> SC.isBuiltin(x, name), e)
+_containsSampleCall(@nospecialize(e::SC.Exp))::Bool = _containsCallTo(e, :sample)
+_containsCallTo(@nospecialize(e::SC.Exp), name::Symbol)::Bool = SC.anyExp(x -> SC.isBuiltin(x, name), e)
 
 """
     eqToJulia(eq, simCode, arrayIdx)
@@ -1009,7 +1010,7 @@ function _continuousWhenCondition(cond::SC.Exp, simCode::SC.SIM_CODE, callbacks:
           local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
           local params = OMBackend.CodeGeneration.getParametersAsSymbols(integrator.f)
           if $(unresolved)
-            @debug "[CB-CC$($(callbacks)) cond] no trigger (no state/param mapping)" t xs
+            OMBackend.CodeGeneration.whenTrace($("[CB-CC$(callbacks) cond] no trigger (no state/param mapping)"), t, xs)
             return 1.0
           end
           lookuptableStates = isempty(xs) ? Dict{Symbol, Union{Nothing, Int}}() : Dict(xs .=> indices)
@@ -1022,7 +1023,7 @@ function _continuousWhenCondition(cond::SC.Exp, simCode::SC.SIM_CODE, callbacks:
         end
         $(_whenLookupBindings(SC.allCrefNames(cond), simCode)...)
         local _result = $(expToJuliaExpMTK(cond, simCode))
-        @debug "[CB-CC$($(callbacks)) cond] eval" t value=_result
+        OMBackend.CodeGeneration.whenTrace($("[CB-CC$(callbacks) cond] eval"), t, _result)
         _result
       end
     end
@@ -1103,7 +1104,7 @@ function _continuousWhen(eq::SC.WHEN_EQUATION, cond::SC.Exp, simCode::SC.SIM_COD
         local $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)
         local t = integrator.t + integrator.dt
         local x = integrator.u
-        @debug "[CB-CC$($(callbacks)) affect] firing" t=integrator.t
+        OMBackend.CodeGeneration.whenTrace($("[CB-CC$(callbacks) affect] firing"), integrator.t, nothing)
         $(_lookupTables(:_affCache))
         $(_whenLookupBindings(_bodyReads(wEq.body), simCode)...)
         if integrator.dt == 0.0
@@ -1111,7 +1112,7 @@ function _continuousWhen(eq::SC.WHEN_EQUATION, cond::SC.Exp, simCode::SC.SIM_COD
           fail()
         end
         $(whenStatements...)
-        @debug "[CB-CC$($(callbacks)) affect] done" t=integrator.t u=copy(integrator.u)
+        OMBackend.CodeGeneration.whenTrace($("[CB-CC$(callbacks) affect] done"), integrator.t, integrator.u)
       end
     end
     $(Symbol("cb$(callbacks)")) = ContinuousCallback($(Symbol("condition$(callbacks)")),
@@ -1262,7 +1263,8 @@ thr` with a runtime-discrete threshold is a scheduled time event: the parent aff
 assigns the threshold) adds a tstop at it, the arm an edge-guarded DiscreteCallback ordered
 after the parent (_emitElsewhenThresholdTimeWhen).
 """
-function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, tickCalls::Union{Nothing, Vector{SC.CALL}},
+function _discreteWhen(eq::SC.WHEN_EQUATION, @nospecialize(condition::SC.Exp), @nospecialize(cond::SC.Exp),
+                       tickCalls::Union{Nothing, Vector{SC.CALL}},
                        simCode::SC.SIM_CODE, callbacks::Int)::Expr
   local wEq = eq.whenEquation
   local whenStatements = Base.ScopedValues.with(MTK_CodeGenerationUtil.PRE_FROM_SNAPSHOT => true) do
@@ -1325,7 +1327,7 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, ti
       local xs = $(Symbol[Symbol(c) for c in condCrefs])
       local indices = indexin(xs, OMBackend.CodeGeneration.getStatesAsSymbols(integrator.f))
       if !isempty(xs) && all(isnothing, indices)
-        @debug "[CB-DC$($(callbacks)) cond] false (no state mapping)" t xs
+        OMBackend.CodeGeneration.whenTrace($("[CB-DC$(callbacks) cond] false (no state mapping)"), t, xs)
         return false
       end
       lookuptableStates = Dict{Symbol, Union{Nothing, Int}}((xs) .=> indices)
@@ -1344,7 +1346,7 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, ti
       _changePreValues = _changeCache[]
     end
     local _result = $(condValue)
-    @debug "[CB-DC$($(callbacks)) cond] eval" t value=_result
+    OMBackend.CodeGeneration.whenTrace($("[CB-DC$(callbacks) cond] eval"), t, _result)
     $(useLatch ? :(_result || (_latch[] = false)) : :())
     local _fires = $(let f = useLatch ? :(_result && !_latch[]) : :_result
                        tickCalls === nothing ? f : :($f || $tickNow)
@@ -1374,7 +1376,7 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, ti
       $(Symbol("affect$(callbacks)!")) = (integrator, $(MTK_CodeGenerationUtil.PRE_SNAPSHOT) = OMBackend.CodeGeneration.instantPre(integrator)) -> begin
         local t = integrator.t
         local x = integrator.u
-        @debug "[CB-DC$($(callbacks)) affect] firing" t=integrator.t
+        OMBackend.CodeGeneration.whenTrace($("[CB-DC$(callbacks) affect] firing"), integrator.t, nothing)
         $(tickCalls === nothing ? :() : :(_tickAt[] == integrator.t && (_tickTaken[] = integrator.t)))
         local lookuptableStates
         local lookuptableParams
@@ -1400,7 +1402,7 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, condition::SC.Exp, cond::SC.Exp, ti
         #= On the state vector: the body bound the model's variables by name (a variable `x`
            replaced the state vector `x`: a BoundsError). =#
         $(useLatch ? :(_latch[] = let x = integrator.u; $(condValue) end) : :())
-        @debug "[CB-DC$($(callbacks)) affect] done" t=integrator.t u=copy(integrator.u)
+        OMBackend.CodeGeneration.whenTrace($("[CB-DC$(callbacks) affect] done"), integrator.t, integrator.u)
       end
       #= At the start of a solve: change()/edge() compare with the initialized values (pre() at
          the first event), not the start attributes: `when edge(off)` with off(start = true)

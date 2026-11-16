@@ -45,7 +45,7 @@
 """
 `bindExp`: a binding, or a start value (a parameter without a binding).
 """
-function _parameterBindingExpr(bindExp::SC.Exp, simCode::SC.SIM_CODE)
+function _parameterBindingExpr(@nospecialize(bindExp::SC.Exp), simCode::SC.SIM_CODE)
   local e = expToJuliaExpMTK(bindExp, simCode)
   _isLiteralCallElement(bindExp) || return e
   #= the indexing, inside the quote blocks of the translation =#
@@ -64,7 +64,7 @@ end
 """
 f(...)[i, ...] with literal arguments and subscripts.
 """
-_isLiteralCallElement(e::SC.Exp)::Bool =
+_isLiteralCallElement(@nospecialize(e::SC.Exp))::Bool =
   e isa SC.ASUB && e.exp isa SC.CALL && all(_isLiteralExp, e.exp.args) && all(s -> s isa SC.ICONST, e.subs)
 
 """
@@ -559,7 +559,8 @@ Statically fold a parameter bind expression to a Float64. Returns nothing
 when the expression depends on anything that is not a parameter chain
 grounded in literals.
 """
-function _foldParameterBindStatic(exp::SC.Exp, simCode::SC.SIM_CODE; depth::Int = 0)::Union{Float64, Nothing}
+function _foldParameterBindStatic(@nospecialize(exp::SC.Exp), simCode::SC.SIM_CODE;
+                                  depth::Int = 0)::Union{Float64, Nothing}
   depth > 32 && return nothing
   exp isa Union{SC.RCONST, SC.ICONST} && return Float64(exp.value)
   exp isa SC.BCONST && return exp.value ? 1.0 : 0.0

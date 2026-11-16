@@ -154,7 +154,7 @@ function orientReciprocalEquations(simCode::SIM_CODE)::SIM_CODE
   local excluded = eventAndComplexNames(simCode)
   for eq in simCode.initialEquations
     eq isa ARRAY_EQUATION && continue
-    foreach(e -> crefNames!(excluded, e), equationExps(eq))
+    foreach((@nospecialize(e::Exp)) -> crefNames!(excluded, e), equationExps(eq))
   end
   foreach(eq -> crefNames!(excluded, eq.exp), simCode.eliminatedEquations)
   local uses = Dict{String, Int}()

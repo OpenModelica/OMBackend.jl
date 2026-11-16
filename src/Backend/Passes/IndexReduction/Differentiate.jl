@@ -108,7 +108,7 @@ The derivative of `e` by the rules of calculus, the leaves by `seeds` (see `Seed
 NotHandled for an expression without rules here (a call without a derivative annotation and a
 body to inline, an array expression, ...).
 """
-function differentiate(e::IR.Expression, seeds::Seeds)::IR.Expression
+function differentiate(@nospecialize(e::IR.Expression), seeds::Seeds)::IR.Expression
   isPiecewiseConstant(e) && return ZERO
   return derivativeOf(e, seeds)
 end
@@ -481,7 +481,7 @@ function derivativeFunctionCall(call::IR.CALL, seeds::Seeds)::Union{Nothing, IR.
   end
   (n === nothing || n >= length(call.arguments)) && return nothing
   local leading = call.arguments[1:n]
-  any(a -> readsSeeded(a, seeds), leading) && return nothing
+  any((@nospecialize(a::IR.Expression)) -> readsSeeded(a, seeds), leading) && return nothing
   return IR.CALL(call.name, IR.Expression[leading..., (differentiate(a, seeds) for a in call.arguments[(n + 1):end])...],
                  call.ty, call.attributes)
 end

@@ -99,7 +99,8 @@ function power(a::IR.Expression, b::IR.Expression)::IR.Expression
 end
 
 "`if c then a else b`, or the branch where both are the same (one node, or literals of one value: the derivative of each branch of a piecewise function by a variable neither reads)."
-function ifThenElse(c::IR.Expression, a::IR.Expression, b::IR.Expression, ty::IR.ModelicaType)::IR.Expression
+function ifThenElse(@nospecialize(c::IR.Expression), @nospecialize(a::IR.Expression),
+                    @nospecialize(b::IR.Expression), @nospecialize(ty::IR.ModelicaType))::IR.Expression
   (a === b || (isLiteral(a) && isLiteral(b) && literalValue(a) == literalValue(b))) && return a
   local known = literalCondition(c)
   known === nothing || return known ? a : b
@@ -112,7 +113,7 @@ end
 The value of a condition of literals (`true`, `3 == 1`: an inlined function's `if axis == 1`
 for a literal axis); `nothing` for one that reads anything else.
 """
-function literalCondition(c::IR.Expression)::Union{Nothing, Bool}
+function literalCondition(@nospecialize(c::IR.Expression))::Union{Nothing, Bool}
   c isa IR.BOOLEAN && return c.value
   (c isa IR.RELATION && isLiteral(c.exp1) && isLiteral(c.exp2)) || return nothing
   local (a, b) = (literalValue(c.exp1), literalValue(c.exp2))

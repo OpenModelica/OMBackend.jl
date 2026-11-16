@@ -387,7 +387,9 @@ function auxiliaryVariables(model::IR.Model, partition::IR.Partition, g::Compone
   for (x, ks) in readers
     (length(ks) == 1 && !(0 in ks)) || continue
     local k::Int = only(ks)
-    local role::RolledForm = equationForm(IR.mapEquation!(e::IR.Expression -> roleExpression(e, x, memberOf), deepcopy(firstReader[x])))
+    local role::RolledForm = equationForm(IR.mapEquation!((@nospecialize(e::IR.Expression)) ->
+                                                            roleExpression(e, x, memberOf),
+                                                                         deepcopy(firstReader[x])))
     haskey(roles[k], role) && throw(NotHandled("two auxiliaries of one role in $(g.members[k])"))
     roles[k][role] = x
   end
@@ -400,7 +402,7 @@ end
 
 "`e` for an auxiliary's role: the auxiliary `x` as `§` (`MEMBER_PLACEHOLDER`), an instance's references with their member as it (`memberRelative`)."
 function roleExpression(e::IR.Expression, x::Symbol, memberOf::Dict{Symbol, Tuple{Int, Int}})::IR.Expression
-  return IR.mapExp(e) do y::IR.Expression
+  return IR.mapExp(e) do @nospecialize(y::IR.Expression)
     y isa IR.CREF || return y
     unsubscriptedName(y.cref) === x && return IR.CREF(IR.ComponentRef(MEMBER_PLACEHOLDER), y.ty)
     memberReference(y.cref, memberOf) === nothing && return y
@@ -439,7 +441,8 @@ function rolledVariable(r::RolledVariable, g::ComponentGroup, groups::Vector{Com
     IR.withOperatorsOf(first.cref, base)
   end
   isempty(r.operators) && (names.base[(1, r.rest)] = cref)
-  local rewrite::Function = (e::IR.Expression) -> rolledExpression(e, groups, memberOf, names, instanceLiteral)
+  local rewrite::Function = (@nospecialize(e::IR.Expression)) ->
+                              rolledExpression(e, groups, memberOf, names, instanceLiteral)
   local attribute::Function = (field::Symbol) -> rolledAttribute(r, n, innerSizes, (v::IR.Variable) -> getfield(v.attributes, field), rewrite)
   local a::IR.VariableAttributes = first.attributes
   local stateSelects::Vector{Union{Nothing, IR.StateSelect}} = Union{Nothing, IR.StateSelect}[x.attributes.stateSelect for x in everyOne]
@@ -480,7 +483,7 @@ function rolledAttribute(r::RolledVariable, n::Int, innerSizes::Vector{Int}, get
   any(x::Union{Nothing, IR.Expression} -> x === nothing, values) &&
     throw(NotHandled("an attribute of $(variableLabel(r)) of only some instances"))
   local rewritten::Vector{IR.Expression} = IR.Expression[rewrite(x::IR.Expression) for x in values]
-  local same::Bool = all(x::IR.Expression -> x == rewritten[1], rewritten) && rewritten[1] == values[1]
+  local same::Bool = all((@nospecialize(x::IR.Expression)) -> x == rewritten[1], rewritten) && rewritten[1] == values[1]
   local scalar::Bool = !(IR.typeOf(rewritten[1]) isa IR.T_ARRAY)
   same && scalar && return rewritten[1]
   if whole && !isempty(innerSizes)
@@ -576,7 +579,7 @@ element-only array) as the reference subscripted.
 """
 function rolledExpression(e::IR.Expression, groups::Vector{ComponentGroup}, memberOf::Dict{Symbol, Tuple{Int, Int}},
                           names::RolledNames, index::Function)::IR.Expression
-  return IR.mapExp(e) do x::IR.Expression
+  return IR.mapExp(e) do @nospecialize(x::IR.Expression)
     if x isa IR.CREF
       local r::Union{Nothing, IR.ComponentRef} = rolledReference(x.cref, groups, memberOf, names, index)
       return r === nothing ? x : IR.CREF(r, x.ty)
@@ -606,7 +609,8 @@ end
 
 The instances whose variables (records, components, derivatives, auxiliaries) the equation reads (`instanceOf`).
 """
-function instancesOf(eq::IR.Equation, memberOf::Dict{Symbol, Tuple{Int, Int}}, names::RolledNames)::Set{Int}
+function instancesOf(@nospecialize(eq::IR.Equation), memberOf::Dict{Symbol, Tuple{Int, Int}},
+                     names::RolledNames)::Set{Int}
   local out::Set{Int} = Set{Int}()
   IR.foreachExp(eq) do x::IR.Expression
     x isa IR.CREF || return nothing
@@ -649,8 +653,9 @@ equations (the instance's literal subscript).
 function rolledEquations(equations::Vector{IR.Equation}, groups::Vector{ComponentGroup}, memberOf::Dict{Symbol, Tuple{Int, Int}},
                          names::RolledNames, n::Int, iterator::Symbol; aliases::Bool)::Vector{IR.Equation}
   local loop::Function = (gi::Int, k::Int) -> IR.CREF(IR.ComponentRef(iterator, IR.T_INTEGER()), IR.T_INTEGER())
-  local rewrite::Function = (eq::IR.Equation, index::Function) ->
-    IR.mapEquation!(e::IR.Expression -> rolledExpression(e, groups, memberOf, names, index), deepcopy(eq))
+  local rewrite::Function = (@nospecialize(eq::IR.Equation), index::Function) ->
+    IR.mapEquation!((@nospecialize(e::IR.Expression)) ->
+                      rolledExpression(e, groups, memberOf, names, index), deepcopy(eq))
   local (kept::Vector{IR.Equation}, equalities::Vector{IR.Equation}) = aliases ? aliasClasses(equations, memberOf, names) : (equations, IR.Equation[])
   #= each instance's equations by their rolled forms =#
   local keyed::Vector{Dict{RolledForm, Vector{IR.Equation}}} = Dict{RolledForm, Vector{IR.Equation}}[Dict{RolledForm, Vector{IR.Equation}}() for _ in 1:n]

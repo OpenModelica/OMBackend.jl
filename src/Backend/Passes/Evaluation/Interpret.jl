@@ -129,7 +129,7 @@ whole dimensions; a record's field by position) and record fields, arithmetic on
 arrays, relations, logic, if-expressions, ranges, `size`, array constructors and reductions
 (sum, product, min, max) of any number of iterators.
 """
-function valueOf(e::IR.Expression, run::Interpretation)::Union{Nothing, FlatValue}
+function valueOf(@nospecialize(e::IR.Expression), run::Interpretation)::Union{Nothing, FlatValue}
   e isa IR.REAL && return scalarValue(e.value)
   e isa IR.INTEGER && return scalarValue(Float64(e.value))
   e isa IR.BOOLEAN && return scalarValue(e.value ? 1.0 : 0.0)

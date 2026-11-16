@@ -75,9 +75,9 @@ end
 """
 The names of the references an expression reads outside pre().
 """
-function _crefNamesOutsidePre(e::SC.Exp)::Set{String}
+function _crefNamesOutsidePre(@nospecialize(e::SC.Exp))::Set{String}
   local names = Set{String}()
-  local visit = function (x::SC.Exp)
+  local visit = function (@nospecialize(x::SC.Exp),)
     SC.isBuiltin(x, :pre) && return
     x isa SC.EXP_CREF && return push!(names, SC.crefName(x.cref))
     foreach(visit, SC.children(x))

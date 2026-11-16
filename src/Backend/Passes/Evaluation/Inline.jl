@@ -106,7 +106,7 @@ input's field the argument does not have.
 """
 function substituteBody(e::IR.Expression, inputs::Dict{Symbol, IR.Expression}, env::Dict{Symbol, IR.Expression},
                         own::Set{Symbol}, unknown::Ref{Bool})::IR.Expression
-  return IR.mapExpTopDown(e) do x
+  return IR.mapExpTopDown(e) do @nospecialize(x::IR.Expression)
     x isa IR.CREF || return (x, true)
     local parts = x.cref.parts
     if parts[1].name in own

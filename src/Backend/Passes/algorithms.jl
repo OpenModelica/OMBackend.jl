@@ -1440,10 +1440,10 @@ function elementValues(chain::IR.Expression, read::IR.Expression, run::Algorithm
 end
 
 "Whether `e` has more than `cap` nodes, counted as a tree."
-function expressionLargerThan(e::IR.Expression, cap::Int)::Bool
+function expressionLargerThan(@nospecialize(e::IR.Expression), cap::Int)::Bool
   local n = Ref(0)
   local visit
-  visit = x -> (n[] += 1; n[] > cap && return; foreach(visit, IR.children(x)))
+  visit = (@nospecialize(x::IR.Expression)) -> (n[] += 1; n[] > cap && return; foreach(visit, IR.children(x)))
   visit(e)
   return n[] > cap
 end

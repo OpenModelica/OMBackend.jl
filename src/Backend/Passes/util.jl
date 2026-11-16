@@ -166,7 +166,7 @@ end
 """
 function substituteIterators(e::IR.Expression, values::Dict{Symbol, Int})::IR.Expression
   isempty(values) && return e
-  local replace = x -> begin
+  local replace = (@nospecialize(x::IR.Expression)) -> begin
     (x isa IR.CREF && length(x.cref.parts) == 1 && !IR.hasSubscripts(x.cref) && haskey(values, x.cref.name)) || return x
     return IR.INTEGER(values[x.cref.name])
   end
@@ -186,8 +186,8 @@ function foldSubscripts(cref::IR.ComponentRef)::IR.ComponentRef
 end
 
 "`e` with `initial()` replaced by `value`."
-replaceInitial(e::IR.Expression, value::Bool)::IR.Expression =
-  IR.mapExp(x -> isInitialCall(x) ? IR.BOOLEAN(value) : x, e)
+replaceInitial(@nospecialize(e::IR.Expression), value::Bool)::IR.Expression =
+  IR.mapExp((@nospecialize(x::IR.Expression)) -> isInitialCall(x) ? IR.BOOLEAN(value) : x, e)
 
 """
     rangeValues(range)
@@ -219,10 +219,10 @@ end
 namesReadOutsidePre(e::IR.Expression)::Vector{Symbol} = Symbol[c.name for c in crefsReadOutsidePre(e)]
 
 "The relations in `e`, each once (structurally), in a bottom-up order."
-function relationsIn(e::IR.Expression)::Vector{IR.RELATION}
+function relationsIn(@nospecialize(e::IR.Expression))::Vector{IR.RELATION}
   local out = IR.RELATION[]
   local visit
-  visit = x -> begin
+  visit = (@nospecialize(x::IR.Expression)) -> begin
     foreach(visit, IR.children(x))
     x isa IR.RELATION && !(x in out) && push!(out, x)
   end

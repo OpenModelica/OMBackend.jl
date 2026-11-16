@@ -179,7 +179,7 @@ a function, `Frames.resolve2(frame_a.R, ...)`; none for a parameter or a discret
 under pre(), edge(), change() and delay() (known at the current time); only the actual
 argument of homotopy().
 """
-function continuousReads!(out::Vector{Symbol}, e::IR.Expression, resolve::F)::Vector{Symbol} where {F}
+function continuousReads!(out::Vector{Symbol}, @nospecialize(e::IR.Expression), resolve::F)::Vector{Symbol} where {F}
   if e isa IR.CREF
     for n in resolve(e.cref.name)
       n in out || push!(out, n)
@@ -230,7 +230,7 @@ function expandDerivatives!(equations::Vector{IR.Equation}, continuous::Set{Symb
     return IR.CREF(IR.derivativeCref(variables[name].cref), IR.T_REAL())
   end
   local seeds = Seeds(variable, 1.0, functions)
-  local expand = (e::IR.Expression) -> (e isa IR.CALL && e.attributes.builtin && e.name === :der) ?
+  local expand = (@nospecialize(e::IR.Expression)) -> (e isa IR.CALL && e.attributes.builtin && e.name === :der) ?
     differentiate(only(e.arguments), seeds) : e
   for eq in equations
     IR.mapEquation!(expand, eq)
@@ -415,7 +415,7 @@ inlined).
 """
 function inlineCalls(e::IR.Expression, functions::Dict{Symbol, IR.ModelicaFunction};
                      active::Vector{Symbol} = Symbol[])::IR.Expression
-  return IR.mapExp(e) do x
+  return IR.mapExp(e) do @nospecialize(x::IR.Expression)
     if x isa IR.CALL && !x.attributes.builtin
       local f = get(functions, x.name, nothing)
       (f === nothing || x.name in active || any(iteratorIndexedRecord, x.arguments)) && return x

@@ -294,7 +294,7 @@ function substituteRelayAliasesInWhens(simCode::SC.SIM_CODE, relayAliases::Dict{
   local wanted = OrderedSet{String}(string(k) for k in keys(relayAliases))
   #= The type of each name the whens read, for its representative's reference. =#
   local tyOf = Dict{String, SC.SType}()
-  local collectTy = e::SC.Exp -> SC.foreachExp(e) do x
+  local collectTy = (@nospecialize(e::SC.Exp)) -> SC.foreachExp(e) do @nospecialize(x::SC.Exp)
     x isa SC.EXP_CREF || return
     local nm = SC.crefName(x.cref)
     (nm in wanted && !haskey(tyOf, nm)) && (tyOf[nm] = x.ty)
@@ -1735,7 +1735,7 @@ function _hoistInvokelatest!(@nospecialize(e), locals::Set{Symbol}, parts::Vecto
       local same::Union{Nothing, Int} = findfirst(p -> p[2] == reads && _sameCode(p[1], body), named)
       local name::Symbol = same === nothing ? Symbol(prefix, length(parts) + 1) : named[same][3]
       if same === nothing
-        push!(parts, :(function $(name)($(reads...)) $(body) end))
+        push!(parts, :(function $(name)($(reads...)) $(_splitClosureList!(deepcopy(body), reads, parts, name)) end))
         push!(named, (body, reads, name))
       end
       e.args[i] = :(Base.invokelatest($(name), $(reads...)))
@@ -1745,6 +1745,39 @@ function _hoistInvokelatest!(@nospecialize(e), locals::Set{Symbol}, parts::Vecto
   end
   return nothing
 end
+
+"How many closures a hoisted list may hold in one function (`_splitClosureList!`)."
+const _MAX_CLOSURES_PER_FUNCTION = 8
+
+"The closures (`->`) in `e`, nested ones included."
+function _closureCount(@nospecialize(e))::Int
+  e isa Expr || return 0
+  return (e.head === :-> ? 1 : 0) + sum(_closureCount, e.args; init = 0)
+end
+
+"""
+A hoisted body `body` (the list of a build function's callbacks: `[cb, ...]`, `T[cb, ...]`) with more than
+`_MAX_CLOSURES_PER_FUNCTION` closures: each element that holds a closure as a call of a function of its own in `parts`,
+`<name>_<j>(x...)`, `x` the part's arguments `reads` the element reads. Julia's lowering of a function is quadratic
+in its closures: MSL BatchPlant's if-equation callbacks, 43 closures in one function, took 0.18 s. Other bodies as
+they are.
+"""
+function _splitClosureList!(body::Expr, reads::Vector{Symbol}, parts::Vector{Expr}, name::Symbol)::Expr
+  local list::Expr = body.head === :block && count(a -> !(a isa LineNumberNode), body.args) == 1 ?
+    body.args[findfirst(a -> !(a isa LineNumberNode), body.args)] : body
+  (list.head in (:vect, :ref) && _closureCount(list) > _MAX_CLOSURES_PER_FUNCTION) || return body
+  local readSet::Set{Symbol} = Set{Symbol}(reads)
+  for j in (list.head === :ref ? 2 : 1):length(list.args)
+    local el::Any = list.args[j]
+    _closureCount(el) == 0 && continue
+    local elReads::Vector{Symbol} = sort!(collect(intersect(_readNames!(Set{Symbol}(), el), readSet)))
+    local elName::Symbol = Symbol(name, "_", j)
+    push!(parts, :(function $(elName)($(elReads...)) $(el) end))
+    list.args[j] = :($(elName)($(elReads...)))
+  end
+  return body
+end
+_splitClosureList!(@nospecialize(body), reads::Vector{Symbol}, parts::Vector{Expr}, name::Symbol) = body
 
 """
 The names `e` reads (its symbols but quoted code, keyword names, macro names), into `out`; an over-approximation

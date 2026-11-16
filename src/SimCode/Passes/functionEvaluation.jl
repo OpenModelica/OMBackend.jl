@@ -210,7 +210,7 @@ end
 The abstract value of the scalar expression `e` in `env` (a whole array or record, and
 anything not followed, is UNKNOWN).
 """
-function interpret(e::Exp, env::Env, ctx::Interpretation)
+function interpret(@nospecialize(e::Exp), env::Env, ctx::Interpretation)
   step!(ctx)
   e isa RCONST && return e.value
   e isa ICONST && return e.value
@@ -284,7 +284,7 @@ function callValue(e::CALL, env::Env, ctx::Interpretation)
   f === nothing && return UNKNOWN
   e.kind === CALL_IMPURE_FUNCTION && return Any[UNKNOWN for _ in f.outputs]
   local args = Any[]
-  foreach(a -> argumentValues!(args, a, env, ctx), e.args)
+  foreach((@nospecialize(a::Exp)) -> argumentValues!(args, a, env, ctx), e.args)
   return functionValues(f, args, ctx)
 end
 
@@ -295,7 +295,7 @@ The values of a call's argument, as the function's inputs are flattened: a recor
 fields (nested records recursively, arrays as vectors), a record literal's or constructor's
 values, a record-valued function's outputs, an array as a vector, else the scalar value.
 """
-function argumentValues!(out::Vector{Any}, e::Exp, env::Env, ctx::Interpretation)::Vector{Any}
+function argumentValues!(out::Vector{Any}, @nospecialize(e::Exp), env::Env, ctx::Interpretation)::Vector{Any}
   if e isa EXP_CREF && recordFields(e.ty) !== nothing
     recordFieldValues!(out, e.cref.ref, e.ty::TYPE_COMPLEX, env)
   elseif e isa EXP_CREF && e.ty isa TYPE_ARRAY
@@ -405,7 +405,7 @@ function forget!(env::Env, ref::IR.ComponentRef)::Env
 end
 
 "Assign the abstract `value` to the target `lhs` (a variable, a record's fields, an array's elements, an element)."
-function assignValue!(lhs::Exp, value, env::Env, ctx::Interpretation)::Nothing
+function assignValue!(@nospecialize(lhs::Exp), value, env::Env, ctx::Interpretation)::Nothing
   lhs isa WILD && return nothing
   if lhs isa EXP_CREF
     lhs.cref.ref === nothing && throw(InterpretationBail())
@@ -568,9 +568,9 @@ function callOutputs(call::CALL, f::MODELICA_FUNCTION, ctx::Interpretation)::Uni
     #= record arguments as their fields, as the function's inputs are flattened =#
     local flat = Exp[]
     local flatten! = nothing
-    flatten! = a -> (a isa RECORD ? foreach(flatten!, a.exps) : push!(flat, a))
+    flatten! = (@nospecialize(a::Exp)) -> (a isa RECORD ? foreach(flatten!, a.exps) : push!(flat, a))
     foreach(flatten!, call.args)
-    foreach(a -> argumentValues!(args, a, env, ctx), flat)
+    foreach((@nospecialize(a::Exp)) -> argumentValues!(args, a, env, ctx), flat)
   catch err
     err isa InterpretationBail || _fallback(err, :interpretArguments; expect = MethodError)
     return nothing

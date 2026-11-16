@@ -531,13 +531,15 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
       name === nothing || get!(declared, name, k)
     end
     local stateOrder::Vector{Int} = Int[get(declared, variableName(st), typemax(Int)) for st in states]
-    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
-                                                              stateOrder = stateOrder,
-                                                              pinned=pinnedIdx,
-                                                              derivative_targets=derivativeInitTargets,
-                                                              eqLabels=eqLabels,
-                                                              extra_residuals=extraResiduals,
-                                                              discrete_pinned=discretePinnedIdx)
+    #= The arguments every initialization solve below shares. The states each row of the initialization's right-hand
+       side reads group the solve's finite differences (_fdInitResidualJacobian); not with initialization-defined
+       parameters (assignParams!), which read states too. =#
+    local initKw = (; t0 = t0, sparsity = jacProto, stateOrder = stateOrder, pinned = pinnedIdx, eqLabels = eqLabels,
+                    discrete_pinned = discretePinnedIdx,
+                    jacobianStructure = assignParams! === nothing ? _readStructure(rhs_init, states) : nothing)
+    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; initKw...,
+                                                              derivative_targets = derivativeInitTargets,
+                                                              extra_residuals = extraResiduals)
     #= A model with homotopy(): from its simplified expressions to the actual ones. =#
     local refreshRelations! = initRels === nothing ? nothing :
       (uh, pvh) -> initRels.eval!(pvh, uh, t0; finiteOnly = true)
@@ -576,13 +578,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
     local targetsNow = Ref(derivativeInitTargets)
     local resolveWith = (u, pv, ok) -> begin
       local kept = u[keptIdx]
-      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
-                                              stateOrder=stateOrder, pinned=pinnedIdx,
-                                              derivative_targets=targetsNow[],
-                                              eqLabels=eqLabels,
-                                              extra_residuals=useExtra ? residualsAt(pv) : nothing,
-                                              discrete_pinned=discretePinnedIdx,
-                                              converged=ok)
+      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; initKw...,
+                                              derivative_targets = targetsNow[],
+                                              extra_residuals = useExtra ? residualsAt(pv) : nothing,
+                                              converged = ok)
       #= A solve that relaxed the fixed starts is not a settled initialization. =#
       isapprox(un[keptIdx], kept; rtol = 1e-8, atol = 1e-10) || (ok[] = false)
       assignParams! === nothing || assignParams!(pv, un, t0)
@@ -670,13 +669,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
       end
       targetsNow[] = targets
       try
-        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
-                                         stateOrder=stateOrder, pinned=pinnedIdx,
-                                         derivative_targets=targets,
-                                         eqLabels=eqLabels,
-                                         extra_residuals=useExtra ? residualsAt(pp) : nothing,
-                                         discrete_pinned=discretePinnedIdx,
-                                         warm=homotopyIdx === nothing)
+        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; initKw...,
+                                         derivative_targets = targets,
+                                         extra_residuals = useExtra ? residualsAt(pp) : nothing,
+                                         warm = homotopyIdx === nothing)
         #= A model with homotopy(): the continuation from the run's entry, as
            OpenModelica's `-override` run does; warm from this solution it kept
            the compiled run's root (x = 1.879 for s = -2, OpenModelica -1.532). =#
@@ -1645,11 +1641,14 @@ The DAE init solve with the free parameters p[freeIdx] as unknowns: they
 are appended to u as algebraic unknowns (zero mass-matrix rows whose
 residuals are identically zero), so each phase may move them like a free
 algebraic variable; `follow!(p)` updates the parameters bound to them.
-Returns the states; p[freeIdx] keeps the solved values.
+Returns the states; p[freeIdx] keeps the solved values. The right-hand
+side's structures (`sparsity`, `jacobianStructure`) are the states' alone:
+not passed on with free parameters.
 """
 function _solveDAEInitializationFree!(u0, rhs, pv, mm, freeIdx::Vector{Int}, follow!;
-                                      extra_residuals=nothing, sparsity=nothing, kwargs...)
-  isempty(freeIdx) && return _solveDAEInitialization!(u0, rhs, pv, mm; extra_residuals=extra_residuals, sparsity=sparsity, kwargs...)
+                                      extra_residuals=nothing, sparsity=nothing, jacobianStructure=nothing, kwargs...)
+  isempty(freeIdx) && return _solveDAEInitialization!(u0, rhs, pv, mm; extra_residuals=extra_residuals, sparsity=sparsity,
+                                                      jacobianStructure=jacobianStructure, kwargs...)
   local n = length(u0)
   local nq = length(freeIdx)
   local setFree! = (p, u) -> begin
@@ -1816,6 +1815,53 @@ end
 struct _NoDagDerivative <: Exception
   what::String
   retry::Bool
+end
+
+"""
+    _readStructure(rows, states) -> Union{Nothing, SparseMatrixCSC{Float64, Int}}
+
+Which `states` each expression of `rows` reads, as a sparse matrix (an entry for each row and state it reads):
+every read, through conditions and function arguments too, each shared subexpression visited once. `nothing`
+where a row uses a scalarized state's whole array.
+"""
+function _readStructure(rows::AbstractVector, states::AbstractVector)::Union{Nothing, SA.SparseMatrixCSC{Float64, Int}}
+  local stateIdx::Dict{Any, Int} = Dict{Any, Int}(Symbolics.unwrap(s) => j for (j, s) in enumerate(states))
+  local arrParents::Set{Any} = Set{Any}(SymbolicUtils.arguments(u)[1] for u in keys(stateIdx)
+                                        if SymbolicUtils.iscall(u) && SymbolicUtils.operation(u) === getindex)
+  local memo::IdDict{Any, BitSet} = IdDict{Any, BitSet}()
+  local rowIdx::Vector{Int} = Int[]
+  local colIdx::Vector{Int} = Int[]
+  for (i, r) in enumerate(rows)
+    local reads::Union{Nothing, BitSet} = _stateReads!(memo, Symbolics.unwrap(r), stateIdx, arrParents)
+    reads === nothing && return nothing
+    for j in reads
+      push!(rowIdx, i)
+      push!(colIdx, j)
+    end
+  end
+  return SA.sparse(rowIdx, colIdx, ones(length(rowIdx)), length(rows), length(states))
+end
+
+"The states `x` reads (_readStructure), `memo` by node; `nothing` for a scalarized state's whole array."
+function _stateReads!(memo::IdDict{Any, BitSet}, @nospecialize(x), stateIdx::Dict{Any, Int},
+                      arrParents::Set{Any})::Union{Nothing, BitSet}
+  local hit::Union{Nothing, BitSet} = get(memo, x, nothing)
+  hit === nothing || return hit
+  local reads::BitSet = BitSet()
+  local j::Int = get(stateIdx, x, 0)
+  if j > 0
+    push!(reads, j)
+  elseif x in arrParents
+    return nothing
+  elseif SymbolicUtils.iscall(x)
+    for a in SymbolicUtils.arguments(x)
+      local r::Union{Nothing, BitSet} = _stateReads!(memo, a, stateIdx, arrParents)
+      r === nothing && return nothing
+      union!(reads, r)
+    end
+  end
+  memo[x] = reads
+  return reads
 end
 
 """

@@ -123,7 +123,7 @@ a binding stay references; a bound parameter and an expression are evaluated at 
 except where they read a tunable parameter, directly or through a binding: `x = p` and `x =
 q` with q = 2 * p kept x(0) for every p.
 """
-function _initialEquationRhs(rhs::SC.Exp, simCode::SC.SIM_CODE)
+function _initialEquationRhs(@nospecialize(rhs::SC.Exp), simCode::SC.SIM_CODE)
   rhs isa SC.EXP_CREF || return evalExpression(rhs, simCode; keepTunable = true)
   _isTimeCref(rhs) && return expToJuliaExpMTK(rhs, simCode)
   local entry = get(simCode.stringToSimVarHT, SC.crefName(rhs.cref), nothing)
@@ -151,7 +151,7 @@ end
 Whether `e` reads a state, an algebraic or a discrete variable, or one the passes eliminated
 (in no table).
 """
-function _readsUnknown(e::SC.Exp, simCode::SC.SIM_CODE)::Bool
+function _readsUnknown(@nospecialize(e::SC.Exp), simCode::SC.SIM_CODE)::Bool
   local ht = simCode.stringToSimVarHT
   return any(SC.allCrefNames(e)) do name
     local entry = get(ht, name, nothing)
@@ -289,7 +289,7 @@ The names an initial algorithm's statement assigns (`lhs`; a for loop's iterator
 reads (`rhs`).
 """
 function _collectInitAlgNames!(lhs::OrderedSet{String}, rhs::OrderedSet{String}, s::SC.Statement)
-  local reads = e::SC.Exp -> union!(rhs, SC.allCrefNames(e))
+  local reads = (@nospecialize(e::SC.Exp)) -> union!(rhs, SC.allCrefNames(e))
   local assigns = e::SC.Exp -> e isa SC.EXP_CREF && push!(lhs, SC.crefName(e.cref))
   if s isa SC.ASSIGN
     s.left isa SC.TUPLE ? foreach(assigns, s.left.elements) : assigns(s.left)
@@ -376,7 +376,7 @@ function _hasPeriodicWhen(simCode::SC.SIM_CODE)::Bool
   end
 end
 
-_expMentionsTime(e::SC.Exp)::Bool = SC.anyExp(_isTimeCref, e)
+_expMentionsTime(@nospecialize(e::SC.Exp))::Bool = SC.anyExp(_isTimeCref, e)
 
 """
 The initial algorithms the early pass runs: the sections (`initial algorithm`, an
@@ -422,7 +422,8 @@ Whether an initial algorithm reads der().
 """
 function _readsDerivative(ia::SC.INITIAL_ALGORITHM)::Bool
   local found = false
-  foreach(s -> SC.mapStatementExps(e -> (found |= containsDerCall(e); e), s), ia.statements)
+  foreach((@nospecialize(s::SC.Statement)) ->
+            SC.mapStatementExps((@nospecialize(e::SC.Exp)) -> (found |= containsDerCall(e); e), s), ia.statements)
   return found
 end
 
@@ -602,7 +603,9 @@ der(x) as the builtin call der(x), which the algorithmic translator emits as a c
 function has no derivatives): _initialDerivativeReads reads its value from the problem.
 """
 _derAsCall(e::SC.Exp)::SC.Exp =
-  SC.mapExp(x -> x isa SC.DER ? SC.CALL(:der, SC.Exp[SC.EXP_CREF(x.cref, SC.TYPE_REAL())], SC.TYPE_REAL(), SC.CALL_BUILTIN) : x, e)
+  SC.mapExp((@nospecialize(x::SC.Exp)) ->
+              x isa SC.DER ?
+                SC.CALL(:der, SC.Exp[SC.EXP_CREF(x.cref, SC.TYPE_REAL())], SC.TYPE_REAL(), SC.CALL_BUILTIN) : x, e)
 
 """
 der(x) in a runtime initial algorithm (the initial() arm of a relation on a derivative,
@@ -643,8 +646,8 @@ end
 pre(v) at the initialization: v's start value (MLS 3.7.3). The runtime pass runs a `when
 initial()` body after the early pass, which set v already: `n = pre(n) + 1` gave 2.
 """
-function _preAtInitialization(e::SC.Exp, simCode::SC.SIM_CODE)::SC.Exp
-  return SC.mapExp(e) do x
+function _preAtInitialization(@nospecialize(e::SC.Exp), simCode::SC.SIM_CODE)::SC.Exp
+  return SC.mapExp(e) do @nospecialize(x::SC.Exp)
     local name = _preReadName(x)
     local entry = name === nothing ? nothing : get(simCode.stringToSimVarHT, name, nothing)
     entry === nothing ? x : SC.RCONST(_readStartAttributeAsLiteral(last(entry)))
@@ -655,7 +658,8 @@ end
 Both initialization passes run at the initialization: initial() is true (a body that reads
 it, MSL Fluid PumpingSystem's TriggeredTrapezoid: UndefVarError `initial`).
 """
-_initialIsTrue(e::SC.Exp)::SC.Exp = SC.mapExp(x -> SC.isBuiltin(x, :initial) ? SC.BCONST(true) : x, e)
+_initialIsTrue(@nospecialize(e::SC.Exp))::SC.Exp = SC.mapExp((@nospecialize(x::SC.Exp)) ->
+                SC.isBuiltin(x, :initial) ? SC.BCONST(true) : x, e)
 
 """
 A statement of a runtime initial algorithm (the initial arms of when-equations) as Julia
@@ -674,8 +678,9 @@ states. An assert of level error stops the simulation, as an equation's does (on
 initialization's values).
 """
 function _initialWhenOpToJulia(wStmt::SC.Statement, simCode::SC.SIM_CODE, renamedNames::OrderedSet{String} = OrderedSet{String}())
-  local sub = e::SC.Exp -> _substituteBoundParameters(_preAtInitialization(_initialIsTrue(_derAsCall(e)), simCode), simCode)
-  local lowerAlg = e::SC.Exp -> _initialDerivativeReads(_renameAlgIdentifiers(
+  local sub = (@nospecialize(e::SC.Exp)) ->
+                _substituteBoundParameters(_preAtInitialization(_initialIsTrue(_derAsCall(e)), simCode), simCode)
+  local lowerAlg = (@nospecialize(e::SC.Exp)) -> _initialDerivativeReads(_renameAlgIdentifiers(
     _resolveModelicaCallTargets(AlgorithmicCodeGeneration.inCodeView(() -> AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e)), simCode)),
     renamedNames, ""))
   if wStmt isa SC.NORETCALL
@@ -728,8 +733,8 @@ Symbolics bindings of the same name.
 """
 function _initialWhenOpToJuliaEarly(wStmt::SC.Statement, simCode::SC.SIM_CODE,
                                     renamedNames::OrderedSet{String}, seenLHS::OrderedSet{String})::Expr
-  local sub = e::SC.Exp -> _substituteBoundParameters(_initialIsTrue(e), simCode)
-  local lowerAlg = e::SC.Exp -> _renameAlgIdentifiers(
+  local sub = (@nospecialize(e::SC.Exp)) -> _substituteBoundParameters(_initialIsTrue(e), simCode)
+  local lowerAlg = (@nospecialize(e::SC.Exp)) -> _renameAlgIdentifiers(
     _resolveModelicaCallTargets(AlgorithmicCodeGeneration.inCodeView(() -> AlgorithmicCodeGeneration.expToJuliaExpAlg(sub(e)), simCode)),
     renamedNames)
   if wStmt isa SC.NORETCALL

@@ -191,7 +191,8 @@ function derivativeEdges(model::IR.Model, partition::IR.Partition, unknowns::Set
       end
       isPiecewise(c) && continue
       if !isempty(simValues)
-        local withValues = IR.mapExp(x -> (x isa IR.CREF && haskey(simValues, x.cref.name)) ? first(simValues[x.cref.name]) : x, c)
+        local withValues = IR.mapExp((@nospecialize(x::IR.Expression)) ->
+          (x isa IR.CREF && haskey(simValues, x.cref.name)) ? first(simValues[x.cref.name]) : x, c)
         local byValues = readsNoUnknown(withValues, model.variables) ? evaluate(withValues, known) : nothing
         (byValues !== nothing && (byValues == 0 || !isfinite(byValues))) && continue
       end
@@ -351,7 +352,8 @@ function solveThroughSolved!(solved::Dict{Symbol, IR.Expression}, equationOf::Di
   local solveFrom = (d, i, others) -> begin
     local eq = partition.equations[i]
     eq isa IR.SCALAR_EQUATION || return nothing
-    local insert = x -> (x isa IR.CREF && x.cref.name in others) ? solved[x.cref.name] : x
+    local insert = (@nospecialize(x::IR.Expression)) ->
+                     (x isa IR.CREF && x.cref.name in others) ? solved[x.cref.name] : x
     local substituted = IR.SCALAR_EQUATION(IR.mapExp(insert, eq.lhs), IR.mapExp(insert, eq.rhs), eq.ty, eq.source, eq.attributes)
     local reads = readsOf(substituted)
     (d in reads && !any(o -> o in reads, others)) || return nothing
@@ -523,7 +525,8 @@ reference in `variables`), its value in the other equations; the unknowns so sol
 function substituteDerivatives!(partition::IR.Partition, solution::DerivativeSolution, variables::IR.VariableSet)::Vector{Symbol}
   local resolved::Dict{Symbol, IR.Expression} = solution.resolved
   local definitions::Dict{Int, Symbol} = Dict{Int, Symbol}(solution.equationOf[d] => d for d in keys(resolved))
-  local substitute = x -> (x isa IR.CREF && haskey(resolved, x.cref.name)) ? substitutable(x, resolved[x.cref.name]) : x
+  local substitute = (@nospecialize(x::IR.Expression)) ->
+                       (x isa IR.CREF && haskey(resolved, x.cref.name)) ? substitutable(x, resolved[x.cref.name]) : x
   for (i, eq) in enumerate(partition.equations)
     local d = get(definitions, i, nothing)
     partition.equations[i] = d === nothing ? IR.mapEquation!(substitute, eq) :

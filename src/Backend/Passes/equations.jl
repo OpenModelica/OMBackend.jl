@@ -52,7 +52,7 @@ pump; as noEvent, OpenModelica's choice, the one failed validation and the other
 """
 function removeSmooth!(model::IR.Model)::IR.Model
   local eventful = x -> x isa IR.RELATION || x isa IR.IF_EXPRESSION
-  local differentiable = e -> begin
+  local differentiable = (@nospecialize(e::IR.Expression)) -> begin
     (IR.isBuiltinCall(e, :smooth) && length(e.arguments) == 2 && e.arguments[1] isa IR.INTEGER &&
      e.arguments[1].value >= 1) || return e
     local inner = e.arguments[2]
@@ -84,7 +84,7 @@ function equationKey(eq::IR.Equation, h::UInt = zero(UInt))::UInt
     if x isa IR.Equation
       h = equationKey(x, h)
     elseif x isa Vector{IR.Equation}
-      foreach(e -> (h = equationKey(e, h)), x)
+      foreach((@nospecialize(e::IR.Equation)) -> (h = equationKey(e, h)), x)
     elseif x isa Vector{IR.EquationBranch}
       for b in x
         h = hash(b.condition, h)

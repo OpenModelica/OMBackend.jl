@@ -571,12 +571,15 @@ A when on a discrete condition (a changed discrete, a Boolean, an algorithm
 section's inputs): its condition and body, as a DiscreteCallback's. Where a
 model has buffered relations, the event iteration (`withRelationRefresh`)
 runs it, after the whens on a relation; otherwise its DiscreteCallback does.
+Not parametric: typed by its functions (closures of the model's module, a type each), it and its callback were
+compiled once per when (MSL BatchPlant_StandardWater's 55: 1.0 s of each build). The event iteration calls its
+functions dynamically either way (`EventIteration.discreteWhens`).
 """
-struct DiscreteWhenAffect{C, A, I}
-  condition::C               # (u, t, integrator[, follow::Bool]) -> Bool: whether it fires; where it does
+struct DiscreteWhenAffect
+  condition::Function        # (u, t, integrator[, follow::Bool]) -> Bool: whether it fires; where it does
                              # not and `follow`, its change()/edge() memory takes the values
-  affect!::A                 # (integrator[, pre]) -> nothing; pre(v) read from `pre` (default: u on entry)
-  initialize!::I             # (u, t, integrator) -> nothing: its state (an edge latch) at the start
+  affect!::Function          # (integrator[, pre]) -> nothing; pre(v) read from `pre` (default: u on entry)
+  initialize!::Function      # (u, t, integrator) -> nothing: its state (an edge latch) at the start
   reads::Vector{String}      # the names its condition and body read at their current values (not under pre())
   writes::Vector{String}     # the names its body assigns (`_sweepOrder`)
 end
@@ -618,6 +621,19 @@ end
 _compiledCondition(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, shared::Tuple, x::AbstractVector, t::Real,
                    integrator, follow::Bool)::Bool = f(x, t, integrator, follow, shared...)
 
+"""
+    whenTrace(tag, t, value)
+
+A when callback's debug line (`JULIA_DEBUG=OMBackend`): `tag` names the callback and the point (`"[CB-DC5 cond]
+eval"`), `value` what it shows (the condition's value, the state after the affect, the names without a state).
+A call of a compiled function, not `@debug` in the generated code: each `@debug` expanded to 3.8 KB of logging code,
+and MSL BatchPlant's 220 took 0.16 s of lowering.
+"""
+function whenTrace(tag::String, t::Real, @nospecialize(value))::Nothing
+  @debug tag t value = value isa AbstractVector ? copy(value) : value
+  return nothing
+end
+
 const _NO_WHEN_INITIALIZE = (u, t, integrator) -> nothing
 
 """
@@ -632,16 +648,30 @@ a step later instead). `reads` and `writes`: the names it reads at their
 current values and those it assigns, which place it in the event iteration's
 sweep (`_sweepOrder`).
 """
-discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE;
-                     reads::Vector{String} = String[], writes::Vector{String} = String[]) =
-  DiffEqBase.DiscreteCallback((u, t, integrator) -> condition(u, t, integrator, !_changedThisStep(integrator)),
-                              DiscreteWhenAffect(condition, affect!, initialize!, reads, writes);
-                              initialize = (c, u, t, integrator) -> begin
-                                initialize!(u, t, integrator)
-                                _derivativeDiscontinuity!(integrator, false)
-                                nothing
-                              end,
-                              save_positions = (true, true))
+function discreteWhenCallback(condition::Function, @nospecialize(affect!::Function),
+                              @nospecialize(initialize!::Function) = _NO_WHEN_INITIALIZE;
+                              reads::Vector{String} = String[], writes::Vector{String} = String[])
+  local when::DiscreteWhenAffect = DiscreteWhenAffect(condition, affect!, initialize!, reads, writes)
+  return DiffEqBase.DiscreteCallback(_WhenCheck(condition), when; initialize = _WhenInitialize(when),
+                                     save_positions = (true, true))
+end
+
+"A discrete when's DiscreteCallback condition: `condition` with its change() memory following the values unless an
+earlier callback changed them this step. Typed by the condition (a TieredCondition: one type for all whens)."
+struct _WhenCheck{C <: Function}
+  condition::C
+end
+(c::_WhenCheck)(u, t, integrator)::Bool = c.condition(u, t, integrator, !_changedThisStep(integrator))
+
+"A discrete when's DiscreteCallback initialization: its `initialize!`, then the solver told of a discontinuity."
+struct _WhenInitialize
+  when::DiscreteWhenAffect
+end
+function (w::_WhenInitialize)(c, u, t, integrator)::Nothing
+  w.when.initialize!(u, t, integrator)
+  _derivativeDiscontinuity!(integrator, false)
+  return nothing
+end
 
 #= What the event iteration updates. `reinit` solves the algebraic
    unknowns (nothing: EventReinit). =#

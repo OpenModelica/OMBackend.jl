@@ -198,9 +198,11 @@ function withKnownValues(model::IR.Model, partition::IR.Partition;
   local equations = IR.Equation[deepcopy(eq) for eq in partition.equations]
   local readers = Dict{Symbol, Vector{Int}}()
   for (i, eq) in enumerate(equations)
-    IR.mapEquation!(e -> substitute(e, i), eq)
+    IR.mapEquation!((@nospecialize(e::IR.Expression)) -> substitute(e, i), eq)
     IR.foreachRootExp(eq) do root
-      IR.foreachExp(x -> (x isa IR.CREF && push!(get!(Vector{Int}, readers, x.cref.name), i); nothing), root)
+      IR.foreachExp((@nospecialize(x::IR.Expression)) ->
+                      (x isa IR.CREF && push!(get!(Vector{Int}, readers, x.cref.name), i); nothing),
+                   root)
     end
   end
   local queue = collect(eachindex(equations))
@@ -211,7 +213,7 @@ function withKnownValues(model::IR.Model, partition::IR.Partition;
     constants[first(set)] = (last(set), i)
     for j in get(readers, first(set), Int[])
       j == i && continue
-      IR.mapEquation!(e -> substitute(e, j), equations[j])
+      IR.mapEquation!((@nospecialize(e::IR.Expression)) -> substitute(e, j), equations[j])
       push!(queue, j)
     end
   end
@@ -286,7 +288,7 @@ end
 The value of the scalar expression `e`, its references by `values(name)` (`time` is 0);
 `nothing` where it does not evaluate here (an array, an unknown function, an unknown value).
 """
-function evaluate(e::IR.Expression, values::StartValues)::Union{Nothing, Float64}
+function evaluate(@nospecialize(e::IR.Expression), values::StartValues)::Union{Nothing, Float64}
   e isa IR.REAL && return e.value
   e isa IR.INTEGER && return Float64(e.value)
   e isa IR.BOOLEAN && return e.value ? 1.0 : 0.0
@@ -386,7 +388,7 @@ function evaluateCall(e::IR.CALL, values::StartValues)::Union{Nothing, Float64}
 end
 
 "The value of a Boolean condition at the start; `nothing` where it does not evaluate."
-function evaluateCondition(e::IR.Expression, values::StartValues)::Union{Nothing, Bool}
+function evaluateCondition(@nospecialize(e::IR.Expression), values::StartValues)::Union{Nothing, Bool}
   e isa IR.BOOLEAN && return e.value
   if e isa IR.RELATION
     local (a, b) = (evaluate(e.exp1, values), evaluate(e.exp2, values))

@@ -107,7 +107,7 @@ const STATE_SELECT_NAMES = Dict(IR.NEVER => :never, IR.AVOID => :avoid, IR.DEFAU
 "The attributes of the variable `v` in the simulation code."
 function simVarAttributes(v::IR.Variable, names::Names)::SimVarAttributes
   local a = v.attributes
-  local e = x -> x === nothing ? nothing : simExp(names, x)
+  local e = (@nospecialize(x::Union{Nothing, IR.Expression})) -> x === nothing ? nothing : simExp(names, x)
   return SimVarAttributes(e(a.start), e(a.fixed), e(a.nominal), e(a.min), e(a.max), e(a.unit), e(a.displayUnit),
                           e(a.quantity), a.stateSelect === nothing ? nothing : STATE_SELECT_NAMES[a.stateSelect],
                           v.isProtected)

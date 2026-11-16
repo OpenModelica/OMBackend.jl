@@ -408,8 +408,10 @@ function generateFunctions(functions::Vector{SC.ModelicaFunction};
       local inputConversions = vcat(generateArrayConversions(func.inputs), generateIntegerInputConversions(func.inputs))
       local returnExpr = length(outputs) > 1 ? Expr(:tuple, outputs...) : length(outputs) == 1 ? outputs[1] : nothing
       _CURRENT_RETURN_EXPR[] = returnExpr
-      _directCalls!(Expr(:block, inputConversions..., generateOutputDefaults(func.outputs)..., generateLocals(func.locals)...,
-                         generateStatements(func.statements)..., :(return $(returnExpr))))
+      local statements::Expr = Expr(:block, inputConversions..., generateOutputDefaults(func.outputs)...,
+                                    generateLocals(func.locals)..., generateStatements(func.statements)...,
+                                    :(return $(returnExpr)))
+      _scalarizeLiteralIndexedLocals!(_directCalls!(statements), func.locals)
     elseif func.external.language == "FORTRAN 77"
       _fortranExternalBody(func)
     else
@@ -497,6 +499,95 @@ function _directCalls!(body::Expr)::Expr
     end
   end
   return body
+end
+
+"""
+    _scalarizeLiteralIndexedLocals!(body, locals) -> body
+
+The one-dimensional numeric locals of `locals` with a literal size and no default that `body` uses
+only by literal subscripts (`o[3]`), as one scalar local per element (`o#3`): no array allocated
+and grown at each call. MSL IF97's protected `Real o[20]` work arrays (tsat, g2, f3, region_ph,
+dewcurve_p): BatchPlant_StandardWater's right-hand side allocated 147 KB a call in its 95 IF97
+calls, its initialization's 32,000 calls 4.5 GB. Another use of the name (the whole array, a
+computed subscript, a size) keeps the array.
+"""
+function _scalarizeLiteralIndexedLocals!(body::Expr, locals::Vector{SC.FunctionVariable})::Expr
+  for v in locals
+    (v.default === nothing && _funcParamRank(v) == 1 && length(v.dimensions) == 1) || continue
+    isempty(flattenRecordInput(v)) || continue
+    local dim::Any = _daeDimToJulia(only(v.dimensions))
+    (dim isa Int && dim > 0) || continue
+    local n::Int = dim
+    local elemDefault::Any = _scalarDefault(_funcParamElemType(v))
+    elemDefault isa Union{Float64, Int, Bool} || continue
+    local name::Symbol = _varSymbol(v)
+    local declAt::Union{Nothing, Int} = findfirst(a -> _isArrayLocalDecl(a, name), body.args)
+    declAt === nothing && continue
+    local decl::Expr = body.args[declAt]
+    _onlyLiteralIndexed(body, name, n, decl) || continue
+    local elements::Vector{Symbol} = Symbol[Symbol(name, "#", k) for k in 1:n]
+    _replaceLiteralIndexed!(body, name, elements, decl, Base.IdSet{Any}())
+    body.args[declAt] = Expr(:block, Any[:(local $e = $elemDefault) for e in elements]...)
+  end
+  return body
+end
+
+"Whether `a` is the declaration `local name = zeros(T, n)` of generateLocals."
+function _isArrayLocalDecl(@nospecialize(a), name::Symbol)::Bool
+  a isa Expr && a.head === :local && length(a.args) == 1 || return false
+  local asg::Any = a.args[1]
+  asg isa Expr && asg.head === :(=) && asg.args[1] === name || return false
+  local rhs::Any = asg.args[2]
+  return rhs isa Expr && rhs.head === :call && rhs.args[1] === :zeros
+end
+
+"Whether `e` is generated code's `ensureAlgArrayLength!(name, k)` call."
+function _isLengthGuard(e::Expr, name::Symbol)::Bool
+  e.head === :call && length(e.args) == 3 && e.args[2] === name || return false
+  local f::Any = e.args[1]
+  return f === :ensureAlgArrayLength! ||
+    (f isa Expr && f.head === :. && last(f.args) == QuoteNode(:ensureAlgArrayLength!))
+end
+
+"The literal subscript `k` in 1:`n` of `e` (`x[k]`'s, a length guard's), else `nothing`."
+function _literalSubscript(@nospecialize(sub), n::Int)::Union{Nothing, Int}
+  local k::Any = _unwrapSubscriptExpr(sub)
+  return k isa Int && 1 <= k <= n ? k : nothing
+end
+
+"Whether every use of `name` in `e` but `decl` is an element `name[k]` or a length guard, k a literal in 1:`n`."
+function _onlyLiteralIndexed(@nospecialize(e), name::Symbol, n::Int, decl::Expr)::Bool
+  e === name && return false
+  e isa Expr || return true
+  e === decl && return true
+  if e.head === :ref && e.args[1] === name
+    return length(e.args) == 2 && _literalSubscript(e.args[2], n) !== nothing
+  end
+  _isLengthGuard(e, name) && return _literalSubscript(e.args[3], n) !== nothing
+  return all(a -> _onlyLiteralIndexed(a, name, n, decl), e.args)
+end
+
+"""
+`name[k]` in `e` as `elements[k]`; its length guards dropped from their blocks, elsewhere `nothing`
+(_scalarizeLiteralIndexedLocals!).
+"""
+function _replaceLiteralIndexed!(e::Expr, name::Symbol, elements::Vector{Symbol}, decl::Expr, visited::Base.IdSet{Any})::Nothing
+  (e === decl || e in visited) && return nothing
+  push!(visited, e)
+  local guards::Vector{Int} = Int[]
+  for i in eachindex(e.args)
+    local a::Any = e.args[i]
+    a isa Expr || continue
+    if a.head === :ref && a.args[1] === name
+      e.args[i] = elements[_literalSubscript(a.args[2], length(elements))::Int]
+    elseif _isLengthGuard(a, name)
+      e.head === :block ? push!(guards, i) : (e.args[i] = nothing)
+    else
+      _replaceLiteralIndexed!(a, name, elements, decl, visited)
+    end
+  end
+  deleteat!(e.args, guards)
+  return nothing
 end
 
 """
@@ -752,7 +843,7 @@ The value an assignment stores: an array variable read whole as a copy, as the d
 into PRea_new[m, k] changed PRea: Buildings' multipoleFluidTemperature saw no change after
 its first iteration and stopped.
 """
-function _algValue(exp::SC.Exp)::Expr
+function _algValue(@nospecialize(exp::SC.Exp))::Expr
   local rhs = expToJuliaExpAlg(exp)
   return _isWholeArrayVariable(exp) ? :(collect($rhs)) : rhs
 end
@@ -768,7 +859,7 @@ becomes per-field assignments; a record-valued call, a record literal and an if-
 choosing between records scatter their field tuple (a one-field record is its field). Another
 value of a record is refused.
 """
-function _recordAssignment(lhsExp::SC.Exp, rhsExp::SC.Exp)::Union{Nothing, Expr}
+function _recordAssignment(@nospecialize(lhsExp::SC.Exp), @nospecialize(rhsExp::SC.Exp))::Union{Nothing, Expr}
   local lhs = _recordCrefFields(lhsExp)
   #= An element of an array of records on either side (`r2 := r_2[1]`, `o[1] := f(...)`):
      field by field, each field array indexed alike. =#
@@ -807,7 +898,7 @@ end
 The fields of an element of an array of records, `u[k]`, as `u_re[k]`, `u_im[k]` (the flattened
 field arrays, indexed alike); `nothing` for another expression. Scalar fields only.
 """
-function _recordElementFieldExps(exp::SC.Exp)::Union{Nothing, Vector{SC.Exp}}
+function _recordElementFieldExps(@nospecialize(exp::SC.Exp))::Union{Nothing, Vector{SC.Exp}}
   local ty::SC.SType = if exp isa SC.EXP_CREF && !isempty(exp.cref.subs)
     exp.ty
   elseif exp isa SC.ASUB && exp.exp isa SC.EXP_CREF && isempty(exp.exp.cref.subs)
@@ -843,7 +934,7 @@ A record value as its field tuple: a record variable's flattened fields (it has 
 its own), an element of an array of records its fields' elements, an if-expression's
 branches each so, anything else as it lowers.
 """
-function _recordTupleExpr(exp::SC.Exp)
+function _recordTupleExpr(@nospecialize(exp::SC.Exp))
   local rec = _recordCrefFields(exp)
   rec === nothing || return Expr(:tuple, [_flatFieldSymbol(rec[1], f) for f in rec[2]]...)
   local element = _recordElementFieldExps(exp)
