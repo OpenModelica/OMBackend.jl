@@ -518,7 +518,7 @@ function reducedArrayModel(lower::Function, name::String)::Union{Nothing, OMJLIR
   end
   local reduction::Module = Passes.IndexReduction
   return _arrayReductionStep(name, decline) do
-    local lowered::OMJLIR.Model = lower()
+    local lowered::OMJLIR.Model = @BACKEND_PERFLOG "[backendAPI] lowered (arrays kept)" lower()
     #= arrays to keep: for-equations or array equations over continuous arrays, or separately declared components
        rolled into arrays (OMBACKEND_ROLL_COMPONENTS) =#
     local roll::Bool = envSwitch("OMBACKEND_ROLL_COMPONENTS") && !isempty(reduction.componentGroups(lowered.variables))
@@ -526,15 +526,15 @@ function reducedArrayModel(lower::Function, name::String)::Union{Nothing, OMJLIR
     #= the passes lower clocked partitions to when-equations on sample() (`lowerClockedPartitions!`): nothing of a
        clock is left for the array code, which takes them as any when-equation (a tick at the start, a when body's
        assignments in their order) =#
-    local model::OMJLIR.Model = Passes.runPassesKeepingArrays!(lowered)
-    local rolled::Bool = roll && reduction.rollComponents!(model) > 0
+    local model::OMJLIR.Model = @BACKEND_PERFLOG "[backendAPI] passes keeping arrays" Passes.runPassesKeepingArrays!(lowered)
+    local rolled::Bool = roll && (@BACKEND_PERFLOG "[backendAPI] rollComponents!" reduction.rollComponents!(model)) > 0
     if rolled
       #= the rolled instances' elements treated differently by the plan (a gear between rolled inertias, one of them
          no state: slicing that splits most of the rolled arrays), or another form the rolled arrays do not take:
          the components as declared (rolling only saves equations); the model is lowered again, the reduction's
          splits changed it =#
       try
-        reduction.reduceIndexArrays!(model)
+        @BACKEND_PERFLOG "[backendAPI] reduceIndexArrays! (rolled)" reduction.reduceIndexArrays!(model)
       catch err
         err isa reduction.NotHandled || rethrow()
         @info "[index reduction] $(name): rolled components not taken ($(sprint(showerror, err))), as declared"
@@ -542,7 +542,7 @@ function reducedArrayModel(lower::Function, name::String)::Union{Nothing, OMJLIR
         reduction.reduceIndexArrays!(model; arrays = own)
       end
     elseif own
-      reduction.reduceIndexArrays!(model)
+      @BACKEND_PERFLOG "[backendAPI] reduceIndexArrays!" reduction.reduceIndexArrays!(model)
     else
       #= none to keep: its index reduced, or its states committed, in the array form all the same (the array code
          takes a model of scalars as arrays of no dimensions) =#

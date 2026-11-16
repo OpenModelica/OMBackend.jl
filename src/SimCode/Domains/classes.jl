@@ -1952,14 +1952,141 @@ struct TornBlock
 end
 
 """
+The number of candidates for an iteration variable `_tearBlock` compares by their cascades (`_tearCascade`), the best by
+its greedy score first; 1: the greedy choice alone.
+"""
+const TEAR_LOOKAHEAD = Base.RefValue{Int}(4096)
+
+"""
+    _tearCascade(v, known, used, open, reads, readers, solves) -> Int
+
+The number of a torn block's unknowns known once `v` is (`_tearBlock`'s state not changed): `v` and those the
+instances then left with one unknown solve explicitly, in turn.
+"""
+function _tearCascade(v::Int, known::BitVector, used::BitVector, open::Vector{Int}, reads::Vector{Vector{Tuple{Int, Int}}},
+                      readers::Vector{Vector{Int}}, solves::Function)::Int
+  local k::BitVector = copy(known); local u::BitVector = copy(used); local o::Vector{Int} = copy(open)
+  local queue::Vector{Int} = Int[]
+  local learned::Int = 0
+  local next::Int = v
+  while true
+    k[next] = true
+    learned += 1
+    for e in readers[next]
+      o[e] -= 1
+      (o[e] == 1 && !u[e]) && push!(queue, e)
+    end
+    next = 0
+    while !isempty(queue) && next == 0
+      local e::Int = popfirst!(queue)
+      (u[e] || o[e] != 1) && continue
+      local (x::Int, access::Int) = reads[e][findfirst(y::Tuple{Int, Int} -> !k[y[1]], reads[e])]
+      solves(e, x, access) || continue
+      u[e] = true
+      next = x
+    end
+    next == 0 && return learned
+  end
+end
+
+"""
+    _piecewiseInUnknowns(x, reads) -> Bool
+
+Whether `x` is piecewise in the unknowns of an algebraic loop, with a kink or a jump between its pieces (`reads(r)`:
+the access `r` may be one, as for `_affineIn`): a relation under `noEvent`, `abs`, `min`, `max`, `sign`, `floor`,
+`ceil` or `trunc` of what reads one, an if-expression whose condition reads one. A relation with events and an
+event-generating function hold their values in the loop's solve (`_affineIn`): an ideal thyristor's `if off[i]` is
+not piecewise in the loop's unknowns.
+"""
+function _piecewiseInUnknowns(x::IR, reads::F)::Bool where {F <: Function}
+  x isa Op || return false
+  if x.op in (:<, :<=, :>, :>=, :abs, :min, :max, :sign, :floor, :ceil, :trunc)
+    any(a::IR -> _affineIn(a, reads)[2], x.args) && return true
+  elseif x.op == :if
+    _affineIn(x.args[1], reads)[2] && return true
+  end
+  return any(a::IR -> _piecewiseInUnknowns(a, reads), x.args)
+end
+
+"""
+    _tearOrder(reads, readers, solves, lookahead) -> (order, tears, used)
+
+A block's unknowns (by index) in causal order: while an instance has one unknown left that it solves (`solves(e, v,
+access)`), it is solved for it; when none has, an unknown is torn (an iteration variable): the one whose being known
+lets the most instances be solved so, then the most read; with `lookahead > 1`, of the `lookahead` best so, the one
+that solves the most unknowns in turn (`_tearCascade`). Returns the solved (instance, unknown, access) in order, the
+torn unknowns, and the instances solved.
+"""
+function _tearOrder(reads::Vector{Vector{Tuple{Int, Int}}}, readers::Vector{Vector{Int}}, solves::Function,
+                    lookahead::Int)::Tuple{Vector{Tuple{Int, Int, Int}}, Vector{Int}, BitVector}
+  local n::Int = length(reads)
+  local known::BitVector = falses(n); local used::BitVector = falses(n)
+  local open::Vector{Int} = Int[length(reads[e]) for e in 1:n]
+  local order::Vector{Tuple{Int, Int, Int}} = Tuple{Int, Int, Int}[]
+  local tears::Vector{Int} = Int[]
+  local queue::Vector{Int} = Int[e for e in 1:n if open[e] == 1]
+  local learn!::Function = function (v::Int)
+    known[v] = true
+    for e in readers[v]
+      open[e] -= 1
+      (open[e] == 1 && !used[e]) && push!(queue, e)
+    end
+  end
+  while true
+    while !isempty(queue)
+      local e::Int = popfirst!(queue)
+      (used[e] || open[e] != 1) && continue
+      local (v::Int, access::Int) = reads[e][findfirst(x::Tuple{Int, Int} -> !known[x[1]], reads[e])]
+      solves(e, v, access) || continue
+      used[e] = true
+      push!(order, (e, v, access))
+      learn!(v)
+    end
+    all(known) && break
+    local scored::Vector{Tuple{Tuple{Int, Int}, Int}} = Tuple{Tuple{Int, Int}, Int}[]
+    for v in 1:n
+      known[v] && continue
+      local unlocks::Function = function (e::Int)
+        (used[e] || open[e] != 2) && return false
+        local other::Union{Nothing, Int} = findfirst(x::Tuple{Int, Int} -> !known[x[1]] && x[1] != v, reads[e])
+        return other !== nothing && solves(e, reads[e][other]...)
+      end
+      push!(scored, ((count(unlocks, readers[v]), count(e::Int -> !used[e], readers[v])), v))
+    end
+    sort!(scored; by = first, rev = true)
+    local best::Int = scored[1][2]
+    if lookahead > 1
+      local bestCascade::Int = -1
+      for (score, v) in first(scored, lookahead)
+        #= one that unlocks no instance solves none in turn: its cascade is itself =#
+        score[1] == 0 && break
+        local c::Int = _tearCascade(v, known, used, open, reads, readers, solves)
+        c > bestCascade && ((best, bestCascade) = (v, c))
+      end
+    end
+    push!(tears, best)
+    learn!(best)
+  end
+  return (order, tears, used)
+end
+
+"""
     _tearBlock(g, el, block, matchRow) -> TornBlock
 
 A large block torn as omc tears (greedily, each instance solved for the unknown it determines last, not its matched
-one): while an instance has one unknown of the block left that it solves explicitly (`_explicitDivisors`, a divisor
+one; `_tearOrder`): an instance is solved for an unknown it solves explicitly (`_explicitDivisors`, a divisor
 nonzero at the instance, the largest coefficient among the elements of its variable it reads, `_largestCoefficient`;
-not one it reads through two references), it is solved for it; when none has, the unknown whose being known lets the
-most instances be solved so is torn (an iteration variable). The instances left are
-the residuals. Batches by level (an instance after those it reads), then (class, access).
+not one it reads through two references). Torn twice, greedily and comparing `TEAR_LOOKAHEAD` candidates by their
+cascades (MSL EngineV6's loops in 52 iteration variables instead of 100); the one with fewer iteration variables is
+kept, the greedy one on a tie (the cascade can pick more: MSL ThreeSprings 4 instead of 3, one a spring length
+guessed 0). A block piecewise in its unknowns (`_piecewiseInUnknowns`) is torn greedily only: which unknowns are
+torn decides how the bounds between the pieces move with the iteration variables and the block's inputs. MSL
+DifferentialAmplifier's op-amp limiter, torn by the cascade in two currents (4 greedily), reached its input from the
+sources with a gain of 1e9: each step's guess, the last solution, was saturated at the next time, and Newton jumped
+between the supplies. A branch on a mode held through the solve is not piecewise in the unknowns: MSL
+ThyristorBridge2mPulse_DC_Drive's thyristors (`if off[i]`), 6 iteration variables by cascades, 12 greedily, whose
+events at the start did not settle. The instances left are the residuals. Batches by level (an instance after those
+it reads), then (class, access).
 """
 function _tearBlock(g::Gen, el::InstanceTable, block::Vector{Int}, matchRow::Vector{Int})::TornBlock
   local n::Int = length(block)
@@ -1984,43 +2111,15 @@ function _tearBlock(g::Gen, el::InstanceTable, block::Vector{Int}, matchRow::Vec
     local acc::Vector{Ref} = get!(() -> accesses!(accesses!(Ref[], c.lhs), c.rhs), accessesOf, el.class[r])
     return _largestCoefficient(g, c, el.col[r], acc, access, Int[x[2] for x in reads[e] if x[1] != v])
   end
-  local known::BitVector = falses(n); local used::BitVector = falses(n)
-  local open::Vector{Int} = Int[length(reads[e]) for e in 1:n]
-  local order::Vector{Tuple{Int, Int, Int}} = Tuple{Int, Int, Int}[]   #= (instance, unknown, access) in causal order =#
-  local tears::Vector{Int} = Int[]
-  local queue::Vector{Int} = Int[e for e in 1:n if open[e] == 1]
-  local learn!::Function = function (v::Int)
-    known[v] = true
-    for e in readers[v]
-      open[e] -= 1
-      (open[e] == 1 && !used[e]) && push!(queue, e)
-    end
-  end
-  while true
-    while !isempty(queue)
-      local e::Int = popfirst!(queue)
-      (used[e] || open[e] != 1) && continue
-      local (v::Int, access::Int) = reads[e][findfirst(x::Tuple{Int, Int} -> !known[x[1]], reads[e])]
-      solves(e, v, access) || continue
-      used[e] = true
-      push!(order, (e, v, access))
-      learn!(v)
-    end
-    all(known) && break
-    #= the unknown that leaves the most instances with one unknown, then the most read =#
-    local best::Int = 0; local bestScore::Tuple{Int, Int} = (-1, -1)
-    for v in 1:n
-      known[v] && continue
-      local unlocks::Function = function (e::Int)
-        (used[e] || open[e] != 2) && return false
-        local other::Union{Nothing, Int} = findfirst(x::Tuple{Int, Int} -> !known[x[1]] && x[1] != v, reads[e])
-        return other !== nothing && solves(e, reads[e][other]...)
-      end
-      local score::Tuple{Int, Int} = (count(unlocks, readers[v]), count(e::Int -> !used[e], readers[v]))
-      score > bestScore && ((best, bestScore) = (v, score))
-    end
-    push!(tears, best)
-    learn!(best)
+  #= (instance, unknown, access) in causal order, the iteration variables, the instances solved =#
+  local (order::Vector{Tuple{Int, Int, Int}}, tears::Vector{Int}, used::BitVector) = _tearOrder(reads, readers, solves, 1)
+  local unknowns::Set{Tuple{String, Bool}} = _unknownVariables(g, Int[matchRow[r] for r in block])
+  local readsUnknown::Function = (r::Ref) -> (r.name, r.der) in unknowns
+  if TEAR_LOOKAHEAD[] > 1 && !any(ci::Int -> _piecewiseInUnknowns(g.classes[ci].lhs, readsUnknown) ||
+                                             _piecewiseInUnknowns(g.classes[ci].rhs, readsUnknown),
+                                  Set{Int}(el.class[r] for r in block))
+    local cascaded::Tuple{Vector{Tuple{Int, Int, Int}}, Vector{Int}, BitVector} = _tearOrder(reads, readers, solves, TEAR_LOOKAHEAD[])
+    length(cascaded[2]) < length(tears) && ((order, tears, used) = cascaded)
   end
   local residuals::Vector{Int} = Int[e for e in 1:n if !used[e]]
   #= as many as iteration variables: each instance solved determines one unknown, each other unknown is torn =#
@@ -2444,6 +2543,60 @@ function _affine(x::IR, key::String)::Union{Nothing, Tuple{IR, IR}}
     return (coefficient, Op(:if, IR[x.args[1], abThen[2], abElse[2]]))
   end
   return nothing
+end
+
+"""
+    _unknownVariables(g, ids) -> Set{Tuple{String, Bool}}
+
+The variables of the unknowns `ids` (a state's index for its derivative, an algebraic variable's after the states), as
+(name, der) of the accesses that read them: every element of an array that holds one counts (`_affineIn` then errs
+toward a nonlinear loop).
+"""
+function _unknownVariables(g::Gen, ids::AbstractArray{Int})::Set{Tuple{String, Bool}}
+  local found::Set{Tuple{String, Bool}} = Set{Tuple{String, Bool}}()
+  local nS::Int = g.nStates
+  for (name::String, info::VarInfo) in g.vars
+    local n::Int = prod(info.dims; init = 1)
+    if info.kind == :state
+      any(u::Int -> u <= nS && info.offset < u <= info.offset + n, ids) && push!(found, (name, true))
+    elseif info.kind == :alg
+      any(u::Int -> u > nS && info.offset < u - nS <= info.offset + n, ids) && push!(found, (name, false))
+    end
+  end
+  return found
+end
+
+"""
+    _affineIn(x, reads) -> Tuple{Bool, Bool}
+
+Whether `x` is affine in the unknowns of an algebraic loop, and whether it reads one (`reads(r)`: the access `r` may be
+one). Affine through +, -, negation, noEvent and homotopy of affine arguments, a product of which one factor reads
+an unknown, a quotient whose numerator does, and an if-expression whose condition does not. A relation and an
+event-generating function hold their values in a loop's solve (`_relationAt` with `mode` false), so they read none. An
+access whose subscript reads an unknown is not affine, nor is any other operation on one.
+"""
+function _affineIn(x::IR, reads::F)::Tuple{Bool, Bool} where {F <: Function}
+  if x isa Ref
+    any(s::IR -> _affineIn(s, reads)[2], x.subs) && return (false, true)
+    return (true, reads(x))
+  end
+  x isa Op || return (true, false)
+  local parts::Vector{Tuple{Bool, Bool}} = Tuple{Bool, Bool}[_affineIn(a, reads) for a in x.args]
+  any(last, parts) || return (true, false)
+  local n::Int = length(parts)
+  if x.op in (:+, :-, :neg, :noEvent, :homotopy)
+    return (all(first, parts), true)
+  elseif x.op == :*
+    return (all(first, parts) && count(last, parts) == 1, true)
+  elseif x.op == :/
+    return (n == 2 && parts[1][1] && !parts[2][2], true)
+  elseif x.op == :if
+    return (n == 3 && !parts[1][2] && parts[2][1] && parts[3][1], true)
+  elseif x.op == :probed
+    #= a relation's value with its abs() argument's probe, evaluated for its crossing only =#
+    return (parts[1][1], true)
+  end
+  return (false, true)
 end
 
 _isLit(x::IR, v::Float64)::Bool = x isa Lit && x.v isa Real && x.v == v

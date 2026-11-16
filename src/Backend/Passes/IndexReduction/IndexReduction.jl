@@ -108,6 +108,7 @@ include("arraySlicing.jl")
 include("componentRolling.jl")
 include("arraySolve.jl")
 include("arraySets.jl")
+include("arrayAliases.jl")
 include("explain.jl")
 
 end # IndexReduction

@@ -134,9 +134,11 @@ real(x::Float64)::IR.Expression = IR.REAL(x)
 A scalar arithmetic node (`ADD`, `SUB`, `MUL`, `DIV`, `POW`, unary minus of a Real) rebuilt with
 the constructors above, its zero and one terms dropped and its literals folded (`0 * w` is `0`);
 an if-expression of equal branches the branch (`ifThenElse`); `size` of an array literal along its first dimension
-the number of its elements; a scalar product of two vector literals the sum of its terms; another node as it is.
+the number of its elements; a scalar product of two vector literals the sum of its terms; an array literal
+subscripted by Integer literals its element (`literalElement`); another node as it is.
 """
 function foldScalar(x::IR.Expression)::IR.Expression
+  x isa IR.SUBSCRIPTED && return literalElement(x)
   if x isa IR.BINARY && x.ty isa IR.T_REAL
     x.op === IR.ADD && return plus(x.exp1, x.exp2)
     x.op === IR.SUB && return minus(x.exp1, x.exp2)
@@ -162,6 +164,23 @@ function foldScalar(x::IR.Expression)::IR.Expression
     return IR.INTEGER(length(x.exp.elements))
   end
   return x
+end
+
+"""
+    literalElement(x) -> Expression
+
+`x` (`exp[subscripts]`) as what it selects where `exp` is an array literal and its subscripts Integer literals
+within its sizes (`{{0.0, 0.0}, {0.0, 0.0}}[1, 2]`: the derivative of a constant rotation matrix, written out per
+element in array form, then `0 * w`; fewer subscripts than the nesting select an inner literal); `x` as it is
+otherwise.
+"""
+function literalElement(x::IR.SUBSCRIPTED)::IR.Expression
+  local e::IR.Expression = x.exp
+  for s in x.subscripts
+    (e isa IR.ARRAY && s isa IR.INDEX && s.exp isa IR.INTEGER && 1 <= s.exp.value <= length(e.elements)) || return x
+    e = e.elements[s.exp.value]
+  end
+  return e
 end
 
 "Whether `e` is zero: a zero literal, or an array of zeros."

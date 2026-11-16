@@ -1082,12 +1082,21 @@ have changed).
 """
 function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
   (arrays && !hasContinuousArrays(model)) && return false
-  local view::Scalarized = scalarizeArrays(model)
+  #= the element equations of the equations the steps below keep (`ScalarCache`): each step replaces the equations
+     it changes; the views share the others' (MSL EngineV6: 5 splits, re-scalarized in 0.27 s instead of 1.0 s) =#
+  local cache::ScalarCache = ScalarCache()
+  local view::Scalarized = scalarizeArrays(model; cache)
   #= the equations as the plan's structure reads them (the terms of parameters known as zero) =#
-  dropKnownZeroTerms!(model, view) && (view = scalarizeArrays(model))
-  exposeArrayLinearConstraints!(model, view) && (view = scalarizeArrays(model))
+  dropKnownZeroTerms!(model, view) && (view = scalarizeArrays(model; cache))
+  exposeArrayLinearConstraints!(model, view) && (view = scalarizeArrays(model; cache))
   local partition::IR.Partition = view.model.continuous[1]
   local written::Plan = plan(view.model, partition; indexOne = true, initialDerivatives = true)
+  #= the arrays of aliases read through representatives (`arrayAliasPlan`), the plan made again where it differentiates
+     anything: MSL EngineV6 differentiates 4974 element rows instead of 7132, translated and first simulated 5 s faster =#
+  if !isempty(written.differentiated) && envSwitch("OMBACKEND_ALIAS_SUBSTITUTION")
+    (view, written) = arrayAliasPlan(model, view, written, cache)
+    partition = view.model.continuous[1]
+  end
   #= the array form of the plan as written first: a plan it does not take is refused before the simulation code's
      values are computed for the plan again (`knownPlan`). Arrays whose elements it treats differently (slicing) are
      split into their elements, until it takes it. The element view stays (the splits keep the model's meaning), so
@@ -1116,7 +1125,7 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
       (hasArrayEquations(model) && 2 * kept >= arrayElements) ||
         throw(NotHandled("slicing that splits most of the arrays ($(arrayElements - kept) of $(arrayElements) elements, " *
                          "starting at $(err.reason))"))
-      view = scalarizeArrays(model)
+      view = scalarizeArrays(model; cache)
       partition = view.model.continuous[1]
       stale = true
     end

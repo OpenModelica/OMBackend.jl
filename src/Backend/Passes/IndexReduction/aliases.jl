@@ -149,11 +149,12 @@ function aliasEquation(eq::IR.Equation, isCandidate::F, isConstant::G)::Union{No
 end
 
 """
-    AliasUndo(equations, initialEquations, variables, removed)
+    AliasUndo(equations, initialEquations, kinds, removed, substituted, attributes)
 
 What `substituteAliases!` changed, to restore it (`undoAliases!`): the partition's equation
 lists before, the variables whose kind it changed as they were, the derivative variables it
-removed.
+removed, the number of names substituted, and the attributes it merged (`mergeAliasStarts!`) as
+they were.
 """
 struct AliasUndo
   equations::Vector{IR.Equation}
@@ -161,6 +162,7 @@ struct AliasUndo
   kinds::Vector{Pair{Symbol, IR.VariableKind}}
   removed::Vector{IR.Variable}
   substituted::Int
+  attributes::Vector{Pair{Symbol, IR.VariableAttributes}}
 end
 
 "The model as before `substituteAliases!`."
@@ -171,6 +173,61 @@ function undoAliases!(model::IR.Model, partition::IR.Partition, undo::AliasUndo)
   for (name, kind) in undo.kinds
     model.variables[name].kind = kind
   end
+  for (name, attributes) in undo.attributes
+    model.variables[name].attributes = attributes
+  end
+  return nothing
+end
+
+"""
+    fixedStart(v) -> Bool
+
+Whether `v` declares a fixed start: `fixed` given and not the literal `false` (an array's `each fixed = true`, an
+expression).
+"""
+fixedStart(v::IR.Variable)::Bool = v.attributes.fixed !== nothing && !(v.attributes.fixed isa IR.BOOLEAN && !v.attributes.fixed.value)
+
+"`-e` of a start value: an array literal element by element (its type kept), a scalar by `negate`."
+function negatedStart(e::IR.Expression)::IR.Expression
+  e isa IR.ARRAY && return IR.ARRAY(IR.Expression[negatedStart(x) for x in e.elements], e.ty)
+  return negate(e)
+end
+
+"`a` with the start `start` and the fixed attribute `fixed`."
+withStart(a::IR.VariableAttributes, start::Union{Nothing, IR.Expression}, fixed::Union{Nothing, IR.Expression})::IR.VariableAttributes =
+  IR.VariableAttributes(start, fixed, a.nominal, a.min, a.max, a.unit, a.displayUnit, a.quantity, a.stateSelect)
+
+"""
+    mergeAliasStarts!(variables, best, members, changed) -> Nothing
+
+The start values of an alias set's members read through its representative `best` (`members`: `AliasSign(m, n)`,
+`m = -best` where `n`; by priority) merged onto `best`, as omc merges them when it removes aliases
+(RemoveSimpleEquations.mergeStartFixedAttributes): a member's fixed start becomes `best`'s, the member no longer fixed
+(it is computed from `best`; MSL ThreeSprings' `body1.r_0`, fixed and `avoid`, read through the state
+`body1.frame_a.r_0`); else, where `best` has no start, the first member's start (not fixed). The set has at most one
+fixed start (the callers leave a set of more as written). The attributes as they were go to `changed`.
+"""
+function mergeAliasStarts!(variables::IR.VariableSet, best::Symbol, members::Vector{AliasSign},
+                           changed::Vector{Pair{Symbol, IR.VariableAttributes}})::Nothing
+  local target::IR.Variable = variables[best]
+  fixedStart(target) && return nothing
+  local signed = (m::AliasSign, e::IR.Expression) -> m.negated ? negatedStart(e) : e
+  local fixedMember::Union{Nothing, Int} = findfirst(m::AliasSign -> fixedStart(variables[m.name]), members)
+  if fixedMember !== nothing
+    local m::AliasSign = members[fixedMember]
+    local source::IR.Variable = variables[m.name]
+    source.attributes.start === nothing && return nothing
+    push!(changed, best => target.attributes, m.name => source.attributes)
+    target.attributes = withStart(target.attributes, signed(m, source.attributes.start), source.attributes.fixed)
+    source.attributes = withStart(source.attributes, source.attributes.start, nothing)
+    return nothing
+  end
+  target.attributes.start === nothing || return nothing
+  local withValue::Union{Nothing, Int} = findfirst(m::AliasSign -> variables[m.name].attributes.start !== nothing, members)
+  withValue === nothing && return nothing
+  local free::AliasSign = members[withValue]
+  push!(changed, best => target.attributes)
+  target.attributes = withStart(target.attributes, signed(free, variables[free.name].attributes.start), target.attributes.fixed)
   return nothing
 end
 
@@ -218,11 +275,12 @@ equations (a connection's `frame_a.r_0 = frame_b.r_0`) nor their derivatives: th
 alias equations `a = ±b` (`±a ± b = 0`) and `a = c` (a literal or a parameter) among the
 continuous variables. A set equal to a constant reads the constant, its derivatives 0. The
 representative of another: a state with a fixed start, else a state, then by StateSelect, a
-start value, the declaration order. The alias equations stay (each name is still computed;
+start value, the declaration order; the substituted members' start values merged onto it
+(`mergeAliasStarts!`). The alias equations stay (each name is still computed;
 SimCode's alias elimination takes them as before). A variable is left as it is where it is
 written by a when-equation (`reinit`) or an algorithm, read as part of a whole record or array
 (`frame_a.R` passed to a function) or by a when-equation's derivative, or is an input; a set
-with two states of fixed starts, with the signs or constants in conflict, or with a member whose
+with two fixed starts, with the signs or constants in conflict, or with a member whose
 derivatives the representative's do not match, is left too. The states substituted become
 algebraic, their derivative variables removed. Returns what to restore (`undoAliases!`).
 """
@@ -241,36 +299,8 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
     return v !== nothing && v.kind isa Union{IR.PARAMETER, IR.CONSTANT} && v.ty isa IR.T_REAL
   end
   local antiderivative::Dict{Symbol, Symbol} = antiderivatives(variables)
-  #= the variables that must keep their equations: written by whens (reinit) or algorithms, read whole, inputs =#
-  local blocked = Set{Symbol}()
-  local resolve = Resolver(Symbol[v.name for v in variables])
-  local scanWhole = (@nospecialize(e::IR.Expression)) -> begin
-    IR.foreachExp(e) do @nospecialize(x::IR.Expression)
-      x isa IR.CREF || return nothing
-      local n = x.cref.name
-      (haskey(variables, n) || !haskey(resolve.under, n)) && return nothing
-      union!(blocked, resolve.under[n])
-      nothing
-    end
-  end
-  for eq in vcat(partition.equations, partition.initialEquations)
-    if eq isa IR.ALGORITHM
-      foreach(c -> union!(blocked, resolve(c.name)), eq.outputs)
-    elseif eq isa IR.WHEN_EQUATION
-      IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
-        IR.foreachExp(e) do @nospecialize(x::IR.Expression)
-          (x isa IR.CREF && haskey(antiderivative, x.cref.name)) || return nothing
-          push!(blocked, baseVariable(antiderivative, x.cref.name))
-          nothing
-        end
-        nothing
-      end
-      for b in eq.branches, s in b.body
-        s isa IR.REINIT && push!(blocked, s.state.name)
-      end
-    end
-    IR.foreachRootExp(scanWhole, eq)
-  end
+  #= the variables that must keep their equations (inputs are no candidates) =#
+  local blocked::Set{Symbol} = aliasBlocked(variables, partition)
   #= the sets =#
   local sets = AliasSets()
   for eq in partition.equations
@@ -301,14 +331,17 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
     local r = IR.CREF(variables[name].cref, IR.T_REAL())
     negated ? negate(r) : r
   end
+  local changedAttributes::Vector{Pair{Symbol, IR.VariableAttributes}} = Pair{Symbol, IR.VariableAttributes}[]
   for (root, set) in members
-    (root in sets.conflicting || count(m -> fixedState(m.name), set) > 1) && continue
+    #= a set of two fixed starts (of states or not) is left as written =#
+    (root in sets.conflicting || count(m -> fixedStart(variables[m.name]), set) > 1) && continue
     local constant = get(sets.constant, root, nothing)
     constant !== nothing && any(m -> fixedState(m.name) || m.name in blocked, set) && continue
     local best = constant === nothing ? argmax(m -> (priority(m.name), -position[m.name]), set) : nothing
     any(m -> fixedState(m.name) && (best === nothing || m.name != best.name), set) && continue
     local bestChain = best === nothing ? Symbol[] : derivativeChain(variables, best.name)
     local substituted = false
+    local merged::Vector{AliasSign} = AliasSign[]
     for m in set
       (best !== nothing && m.name == best.name) && continue
       m.name in blocked && continue
@@ -322,16 +355,20 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
         local n = xor(m.negated, best.negated)
         replacements[m.name] = ref(best.name, n)
         foreach(((k, d),) -> replacements[d] = ref(bestChain[k], n), enumerate(chain))
+        push!(merged, AliasSign(m.name, n))
       end
       isempty(chain) || push!(states, m.name)
       substituted = true
     end
     substituted && foreach(eq -> push!(definitions, eq), sets.equations[root])
+    isempty(merged) ||
+      mergeAliasStarts!(variables, best.name, sort!(merged; by = m::AliasSign -> (-priority(m.name), position[m.name])),
+                        changedAttributes)
   end
   local undo = AliasUndo(partition.equations, partition.initialEquations,
                          Pair{Symbol, IR.VariableKind}[n => variables[n].kind for n in states],
                          IR.Variable[variables[d] for n in states for d in derivativeChain(variables, n)],
-                         count(n -> !haskey(antiderivative, n), keys(replacements)))
+                         count(n -> !haskey(antiderivative, n), keys(replacements)), changedAttributes)
   isempty(replacements) && return undo
   local substitute = (@nospecialize(e::IR.Expression)) -> (e isa IR.CREF ? get(replacements, e.cref.name, e) : e)
   local reads = (eq::IR.Equation) -> begin
@@ -354,6 +391,47 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
   end
   filter!(v -> !(v.name in removed), variables)
   return undo
+end
+
+"""
+    aliasBlocked(variables, partition) -> Set{Symbol}
+
+The variables of the partition whose equations alias substitution leaves as written (`substituteAliases!`): written
+by a when-equation (`reinit`) or an algorithm, read as part of a whole record or array (`frame_a.R` passed to a
+function: a name of no variable, the variables under it), or read through a derivative by a when-equation.
+"""
+function aliasBlocked(variables::IR.VariableSet, partition::IR.Partition)::Set{Symbol}
+  local antiderivative::Dict{Symbol, Symbol} = antiderivatives(variables)
+  local blocked::Set{Symbol} = Set{Symbol}()
+  local resolve::Resolver = Resolver(Symbol[v.name for v in variables])
+  local scanWhole = (@nospecialize(e::IR.Expression)) -> begin
+    IR.foreachExp(e) do @nospecialize(x::IR.Expression)
+      x isa IR.CREF || return nothing
+      local n::Symbol = x.cref.name
+      (haskey(variables, n) || !haskey(resolve.under, n)) && return nothing
+      union!(blocked, resolve.under[n])
+      nothing
+    end
+  end
+  for eq in vcat(partition.equations, partition.initialEquations)
+    if eq isa IR.ALGORITHM
+      foreach(c -> union!(blocked, resolve(c.name)), eq.outputs)
+    elseif eq isa IR.WHEN_EQUATION
+      IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
+        IR.foreachExp(e) do @nospecialize(x::IR.Expression)
+          (x isa IR.CREF && haskey(antiderivative, x.cref.name)) || return nothing
+          push!(blocked, baseVariable(antiderivative, x.cref.name))
+          nothing
+        end
+        nothing
+      end
+      for b in eq.branches, s in b.body
+        s isa IR.REINIT && push!(blocked, s.state.name)
+      end
+    end
+    IR.foreachRootExp(scanWhole, eq)
+  end
+  return blocked
 end
 
 "The variable a derivative variable is a derivative of, through its chain (`\$DER.\$DER.x` -> `x`; `antiderivatives`)."

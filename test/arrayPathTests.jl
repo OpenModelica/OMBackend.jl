@@ -367,6 +367,179 @@ end
     @test a[1] == 1.0e-7
   end
 
+  @testset "Affine in a loop's unknowns (_affineIn)" begin
+    local D::Module = OMBackend.SimCode.Domains
+    local (x::D.Ref, y::D.Ref, k::D.Ref) = (D.Ref("x", D.IR[], false), D.Ref("y", D.IR[], false), D.Ref("k", D.IR[], false))
+    local reads::Function = (r::D.Ref) -> r.name in ("x", "y")
+    @test D._affineIn(D.Op(:+, D.IR[D.Op(:*, D.IR[k, x]), D.Op(:neg, D.IR[y])]), reads) == (true, true)
+    @test D._affineIn(D.Op(:*, D.IR[x, y]), reads) == (false, true)
+    @test D._affineIn(D.Op(:/, D.IR[x, k]), reads) == (true, true)
+    @test D._affineIn(D.Op(:/, D.IR[k, x]), reads) == (false, true)
+    @test D._affineIn(D.Op(:sin, D.IR[k]), reads) == (true, false)
+    @test D._affineIn(D.Op(:sin, D.IR[x]), reads) == (false, true)
+    #= a relation holds its value during a solve: an if on it is affine where its branches are =#
+    @test D._affineIn(D.Op(:if, D.IR[D.Rel(:>, x, D.Lit(0.0), 1), x, D.Op(:neg, D.IR[y])]), reads) == (true, true)
+    #= an unknown as a subscript =#
+    @test D._affineIn(D.Ref("k", D.IR[y], false), reads) == (false, true)
+  end
+
+  @testset "A linear block solved directly: one Jacobian per call" begin
+    local AG::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local SA::Module = OMBackend.CodeGeneration.Symbolics.SparseArrays
+    local S::SA.SparseMatrixCSC{Float64, Int} = SA.sparse(ones(2, 2))
+    local s::AG.BlockSolver = AG.BlockSolver(S, AG.columnColors(S), [0.0, 0.0], true)
+    local A::Base.RefValue{Matrix{Float64}} = Base.RefValue{Matrix{Float64}}(zeros(2, 2))
+    local b::Vector{Float64} = [1.0, 2.0]
+    local residual!(r, y, du, a, u, p, t, z, mode, fire) = (a .= y; r .= A[] * y .- b; nothing)
+    local (du::Vector{Float64}, a::Vector{Float64}) = (zeros(2), zeros(2))
+    #= a matrix that moves between calls (a mechanism's, with its angles) =#
+    for M in ([2.0 1.0; 1.0 3.0], [2.5 1.0; 0.5 3.0], [1.0e-3 1.0; 1.0 2.0])
+      A[] = M
+      local before::Int = s.residuals
+      AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, nothing, false, false)
+      @test a ≈ M \ b rtol = 1e-12
+      #= the residuals at the guess, at the kept factors' step, two colors, at the step =#
+      @test s.residuals - before <= 5
+    end
+    @test s.jacobians == 3
+    #= a matrix that has not moved (a circuit between switchings): the kept factors' step, no Jacobian =#
+    local before::Int = s.residuals
+    AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, nothing, false, false)
+    @test s.residuals - before == 2
+    @test s.jacobians == 3
+  end
+
+  #= a linear block whose matrix changes with its relations: kept factors only for the relations they were made at.
+     The bridge's currents are zero at the start, its loop's solution zero to round-off; the kept factors' solution
+     under each new set of relations set them again from round-off signs, and the start did not settle (MSL
+     SMPM_Braking, its machine's EMFs into a diode bridge) =#
+  @testset "A switched linear block: kept factors for their relations only" begin
+    local bridge = Modelica"""
+      model SwitchedBridge "three EMFs behind inductances into six ideal diodes onto a resistor"
+        parameter Real Ron = 1e-4;
+        parameter Real Goff = 1e-4;
+        parameter Real L = 1e-3;
+        parameter Real Rs = 0.05;
+        parameter Real Rg = 1e6;
+        parameter Real R = 1;
+        parameter Real E = 100;
+        parameter Real w = 314.1592653589793;
+        Real i[3](each start = 0, each fixed = true);
+        Real e[3];
+        Real vs;
+        Real vac[3](each start = 10);
+        Real vp(start = 50);
+        Real s[6](each start = 0.5);
+        Real vd[6];
+        Real id[6];
+        Boolean off[6];
+      equation
+        for k in 1:3 loop
+          e[k] = E * sin(w * time - 2 * 3.141592653589793 * (k - 1) / 3 + 0.3);
+          L * der(i[k]) = e[k] + vs - vac[k] - Rs * i[k];
+          vd[k] = vac[k] - vp;
+          vd[3 + k] = -vac[k];
+          i[k] = id[k] - id[3 + k];
+        end for;
+        sum(i) = -vs / Rg;
+        for k in 1:6 loop
+          off[k] = s[k] < 0;
+          vd[k] = s[k] * (if off[k] then 1 else Ron);
+          id[k] = s[k] * (if off[k] then Goff else 1);
+        end for;
+        id[1] + id[2] + id[3] = vp / R;
+      end SwitchedBridge;
+      """
+    local (s::Vector{Float64}, a::Vector{Float64}, sol) = _bothWaysOf(bridge, "SwitchedBridge", ["i[1]", "vp"];
+                                                                       tspan = (0.0, 0.04))
+    @test only(sol.prob.p.blocks).linear
+    @test maximum(abs.(s .- a) ./ (1.0 .+ abs.(s))) < 1e-4
+  end
+
+  @testset "A small linear loop solved directly" begin
+    local loop = Modelica"""
+      model LinearLoop "i1 = (x + 2 sin(time)) / 7"
+        Real x(start = 1.0, fixed = true);
+        Real i1;
+        Real i2;
+      equation
+        i1 + 2.0 * i2 = x;
+        3.0 * i1 - i2 = sin(time);
+        der(x) = -i1;
+      end LinearLoop;
+      """
+    local traced::String = withenv("OMBACKEND_ARRAY_TRACE" => "true") do
+      mktemp() do path::String, io::IO
+        redirect_stdio(stdout = io) do
+          _translateProgram(loop, "LinearLoop"; scalarized = false)
+        end
+        flush(io)
+        read(path, String)
+      end
+    end
+    @test occursin("loop family 1: 2 unknowns, 1 members, linear", traced)
+    local (ss, as, _) = _bothWaysOf(loop, "LinearLoop", ["x", "i1"]; reltol = 1e-10, abstol = 1e-12)
+    #= x' + x/7 = -2/7 sin(t): x = 0.72 exp(-t/7) - 0.04 sin(t) + 0.28 cos(t) =#
+    local x1::Float64 = 0.72 * exp(-1 / 7) - 0.04 * sin(1.0) + 0.28 * cos(1.0)
+    @test as ≈ [x1, (x1 + 2 * sin(1.0)) / 7] rtol = 1e-8
+    @test maximum(abs.(ss .- as)) < 1e-8
+  end
+
+  @testset "Time-invariant rows: in invariants! only, per solve; the callbacks' types erased" begin
+    #= n and c read parameters only (SimCode Domains: invariant rows): invariants! computes them once per solve,
+       equations! (the relation's event, the observed values) calls it and holds no copy. MSL EngineV6: such rows were
+       28 % of equations!. =#
+    local rows = Modelica"""
+      model InvariantRows "x = exp(-c t), c = k n[3] = 2 k / 3; y = n[1] = 1/3 while x > 0.5, 2 n[2] = 4/3 after"
+        parameter Real k = 2;
+        parameter Real axis[3] = {1, 2, 2};
+        Real n[3] = axis / sqrt(axis * axis);
+        Real c = k * n[3];
+        Real x(start = 1, fixed = true);
+        Real y;
+      equation
+        der(x) = -c * x;
+        y = if x > 0.5 then n[1] else 2.0 * n[2];
+      end InvariantRows;
+      """
+    local (ss, as, _) = _bothWaysOf(rows, "InvariantRows", ["x", "y", "c", "n[3]"]; reltol = 1e-10, abstol = 1e-12)
+    @test as ≈ [exp(-4 / 3), 4 / 3, 4 / 3, 2 / 3] rtol = 1e-8
+    @test maximum(abs.(ss .- as)) < 1e-8
+    local name::String = OMBackend.canonicalName("InvariantRows")
+    #= n's row once in the module: in invariants!, not in equations! =#
+    @test count("sqrt(", string(OMBackend.COMPILED_MODELS_DEJL[name][1])) == 1
+    #= another solve, another k: its own invariant values (x(1) = exp(-2/3) > 0.5: y stays n[1]) =#
+    local again = OMBackend.resimulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12,
+                                            parameters = Dict{String, Any}("k" => 1.0))
+    @test _values(again, ["x", "y", "c"]) ≈ [exp(-2 / 3), 1 / 3, 2 / 3] rtol = 1e-8
+    #= the solver's callbacks: conditions and affects behind one wrapper type (`_erasedCallbacks`), nothing of the
+       model in their types, so the solver's callback code is compiled once for every model =#
+    local (_, cbs) = OMBackend.getMTKProblem(name)
+    local callbacks::Vector{Any} = Any[cbs.continuous_callbacks..., cbs.discrete_callbacks...]
+    @test !isempty(callbacks)
+    @test all(c -> c.condition isa OMBackend.CodeGeneration._ErasedCall && c.affect! isa OMBackend.CodeGeneration._ErasedCall,
+              callbacks)
+    @test !any(c -> occursin(name, string(typeof(c))), callbacks)
+  end
+
+  @testset "The time derivative's step does not grow with time" begin
+    #= tgrad! by central differences over cbrt(eps) |t|: at t = 29 a step of 1.8e-4 s, 5e-4 off on 50 Hz; a stiff
+       state driven by it took 5695 steps in the last second against 1905 in the first (MSL Electrical
+       SMEE_Generator: 618938 steps for 30 s, now 1910) =#
+    local hum = Modelica"""
+      model StiffHum "a stiff filter of a 50 Hz source over 30 s"
+        Real x(start = 0.0, fixed = true);
+      equation
+        der(x) = 1000.0 * (sin(314.1592653589793 * time) - x);
+      end StiffHum;
+      """
+    local name::String = _translateProgram(hum, "StiffHum"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 30.0), reltol = 1e-6)
+    @test sol.retcode == ReturnCode.Success
+    @test count(t::Float64 -> t > 29.0, sol.t) < 1.2 * count(t::Float64 -> t < 1.0, sol.t)
+  end
+
   @testset "A time relation an ulp after a sample tick: an event of its own" begin
     #= MSL SawTooth's reset, `time >= (pre(count) + 1) * period`, at 6 * 0.1 = 0.6000000000000001; the tick of
        sample(0.1, 0.1) at 0.1 + 5 * 0.1 = 0.6. The tick took the relation false; its crossing an ulp later was dropped
@@ -538,6 +711,28 @@ end
     local (sr, ar, _) = _bothWays("ArrayPath.RolledTables", ["a.x", "b.x"])
     @test isapprox(ar, [1.0, 2.0]; atol = 1e-6)
     @test maximum(abs.(sr .- ar)) < 1e-6
+  end
+
+  @testset "A model without continuous unknowns: its parameters in the solution" begin
+    #= no equation reads J or k: on array code they were not in the parameter layout and not in the solution (MSL
+       readRealParameterModel: J, phi_rel0, w_rel0 read from a file, "not in the solution"); the scalar route keeps
+       them where the model has no continuous equations (`eliminateDeadParameters`) =#
+    local unread = Modelica"""
+      model UnreadParameters
+        parameter Real J = 2;
+        parameter Real k = 3 * J;
+        discrete Integer n(start = 0, fixed = true);
+      equation
+        when initial() then
+          n = 1;
+        end when;
+      end UnreadParameters;
+      """
+    local name::String = _translateProgram(unread, "UnreadParameters"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    @test sol.retcode == ReturnCode.Success
+    @test _values(sol, ["J", "k"]) == [2.0, 6.0]
   end
 
   @testset "Rolled components the plan treats differently: taken as declared" begin
@@ -2437,6 +2632,56 @@ end
     #= a size along another dimension, or of what is no literal, stays =#
     @test R.foldTree(I.SIZE(a, I.INTEGER(2))) isa I.SIZE
     @test R.foldTree(I.SIZE(real(:a), I.INTEGER(1))) isa I.SIZE
+    #= an array literal subscripted by Integer literals: its element (`literalElement`; the derivative of a constant
+       rotation matrix written out per element in array form, `{{0.0, 0.0}, {0.0, 0.0}}[1, 2] * w`, then `0 * w`),
+       fewer subscripts an inner literal; a subscript out of range, or not a literal, stays =#
+    local matrixType = I.T_ARRAY(I.T_REAL(), I.Dimension[I.DIM_SIZE(2), I.DIM_SIZE(2)])
+    local matrix = I.ARRAY(I.Expression[a, b], matrixType)
+    local at = (e::I.Expression, k::Vector{I.Expression}) -> I.SUBSCRIPTED(e, I.Subscript[I.INDEX(x) for x in k], I.T_REAL())
+    @test R.foldTree(at(matrix, I.Expression[I.INTEGER(2), I.INTEGER(1)])) == real(:c)
+    @test R.foldTree(at(matrix, I.Expression[I.INTEGER(1)])) == a
+    local zeroMatrix = I.ARRAY(I.Expression[I.ARRAY(I.Expression[I.REAL(0.0), I.REAL(0.0)], vector) for _ in 1:2], matrixType)
+    @test R.foldTree(I.BINARY(at(zeroMatrix, I.Expression[I.INTEGER(1), I.INTEGER(2)]), I.MUL, real(:w), I.T_REAL())) == I.REAL(0.0)
+    @test R.foldTree(at(matrix, I.Expression[I.INTEGER(3), I.INTEGER(1)])) isa I.SUBSCRIPTED
+    @test R.foldTree(at(matrix, I.Expression[real(:i)])) isa I.SUBSCRIPTED
+  end
+
+  @testset "Tearing: the cascade of a candidate iteration variable" begin
+    #= instances e1 (v1, v2), e2 (v2, v3), e3 (v1, v2, v3): v1 known, e1 solves v2, then e2 v3: three unknowns
+       (`_tearCascade`, `_tearBlock`'s lookahead); where e1 solves nothing, v1 alone. The state passed in is not
+       changed =#
+    local D = OMBackend.SimCode.Domains
+    local reads::Vector{Vector{Tuple{Int, Int}}} = [[(1, 1), (2, 1)], [(2, 1), (3, 1)], [(1, 1), (2, 1), (3, 1)]]
+    local readers::Vector{Vector{Int}} = [[1, 3], [1, 2, 3], [2, 3]]
+    local known::BitVector = falses(3); local used::BitVector = falses(3); local open::Vector{Int} = [2, 2, 3]
+    @test D._tearCascade(1, known, used, open, reads, readers, (e::Int, v::Int, access::Int) -> true) == 3
+    @test D._tearCascade(1, known, used, open, reads, readers, (e::Int, v::Int, access::Int) -> e != 1) == 1
+    @test known == falses(3) && used == falses(3) && open == [2, 2, 3]
+  end
+
+  @testset "Tearing: greedily and by cascades; a block piecewise in its unknowns greedily" begin
+    #= the instances above torn greedily (`_tearOrder`): v2 unlocks e1 and e2, the most; e1 solves v1, e2 v3, e3 is
+       the residual. By cascades all three reach three unknowns: v2, the first, the same =#
+    local D = OMBackend.SimCode.Domains
+    local reads::Vector{Vector{Tuple{Int, Int}}} = [[(1, 1), (2, 1)], [(2, 1), (3, 1)], [(1, 1), (2, 1), (3, 1)]]
+    local readers::Vector{Vector{Int}} = [[1, 3], [1, 2, 3], [2, 3]]
+    local all3::Function = (e::Int, v::Int, access::Int) -> true
+    local (order, tears, used) = D._tearOrder(reads, readers, all3, 1)
+    @test order == [(1, 1, 1), (2, 3, 1)] && tears == [2] && used == BitVector([true, true, false])
+    @test D._tearOrder(reads, readers, all3, 3)[2] == [2]
+    #= piecewise in the unknowns (x), with which `_tearBlock` tears greedily only (MSL DifferentialAmplifier's
+       op-amp limiter): an if-expression whose condition reads x under noEvent, abs of x. Not piecewise in them: a
+       smooth function, an if-expression on a mode held through the solve (a thyristor's `off`), a relation with
+       events (held), abs of what is no unknown =#
+    local x::D.Ref = D.Ref("x", D.IR[], false); local y::D.Ref = D.Ref("y", D.IR[], false)
+    local off::D.Ref = D.Ref("off", D.IR[], false)
+    local readsX::Function = (r::D.Ref) -> r.name == "x"
+    @test D._piecewiseInUnknowns(D.Op(:if, D.IR[D.Op(:>, D.IR[x, D.Lit(0.0)]), x, y]), readsX)
+    @test D._piecewiseInUnknowns(D.Op(:+, D.IR[y, D.Op(:abs, D.IR[x])]), readsX)
+    @test !D._piecewiseInUnknowns(D.Op(:*, D.IR[x, D.Op(:sin, D.IR[y])]), readsX)
+    @test !D._piecewiseInUnknowns(D.Op(:if, D.IR[off, D.Op(:*, D.IR[x, D.Lit(1.0e-5)]), x]), readsX)
+    @test !D._piecewiseInUnknowns(D.Op(:if, D.IR[D.Rel(:<, x, D.Lit(0.0), 1), x, y]), readsX)
+    @test !D._piecewiseInUnknowns(D.Op(:abs, D.IR[y]), readsX)
   end
 
   @testset "actualStream without events" begin
@@ -2459,7 +2704,9 @@ end
         end for;
       end ReversingStreams;
       """
-    local (ss, as, _) = _bothWaysOf(streams, "ReversingStreams", ["x[1]", "x[2]"]; reltol = 1e-8, abstol = 1e-10)
+    #= reltol 1e-9: the array route crosses the 6 kinks in t without events (smooth(0, ...)); at reltol 1e-8 its error
+       there depends on the step path, 2e-8 to 1.1e-6 against an exact reference (4.3e-10 at reltol 1e-9) =#
+    local (ss, as, _) = _bothWaysOf(streams, "ReversingStreams", ["x[1]", "x[2]"]; reltol = 1e-9, abstol = 1e-11)
     @test OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[].relations == 0
     @test maximum(abs.(ss .- as)) < 1e-6
   end

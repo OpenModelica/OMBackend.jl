@@ -1202,14 +1202,25 @@ scalarReinit(s::IR.IF_STATEMENT, values::Dict{Symbol, Int}, E::Elements)::IR.Sta
 scalarReinit(s::IR.Statement, ::Dict{Symbol, Int}, ::Elements)::IR.Statement = s
 
 """
-    scalarizeArrays(model; passesFollow = false) -> Scalarized
+The element equations of equations of the array form and their origins (relative to the equation's own index), by
+the equation (its identity), for the next element view of the same model (`scalarizeArrays(model; cache)`): an
+entry holds while the arrays its equation reads keep their elements. Splitting arrays (`splitArrays!`) replaces the
+equations that read them and keeps the others, whose element equations are then the same (MSL EngineV6 split its
+arrays in 28 rounds, each view of 18321 element equations scalarized again: 7.4 s of its 11.6 s solve).
+"""
+const ScalarCache = IdDict{IR.Equation, Tuple{Vector{IR.Equation}, Vector{EquationOrigin}}}
+
+"""
+    scalarizeArrays(model; passesFollow = false, cache = nothing) -> Scalarized
 
 `model` with its arrays as their elements (`Scalarized`): its variables (`scalarVariables`), the equations and
 initial equations of its continuous partition (`scalarEquations!`). The model is not changed. NotHandled for a
 model with several continuous partitions, clocked partitions or structural modes, and for what
 `scalarEquations!` does not handle. `passesFollow`: `model` is as lowered and the scalar passes follow (`Elements`).
+`cache`: the element equations of earlier views of the model taken and kept (`ScalarCache`); the views share them.
 """
-function scalarizeArrays(model::IR.Model; passesFollow::Bool = false)::Scalarized
+function scalarizeArrays(model::IR.Model; passesFollow::Bool = false,
+                         cache::Union{Nothing, ScalarCache} = nothing)::Scalarized
   (length(model.continuous) == 1 && isempty(model.clocked) && isempty(model.modes)) ||
     throw(NotHandled("arrays in a model of several partitions or structural modes"))
   local E = elements(model.variables; passesFollow)
@@ -1218,11 +1229,12 @@ function scalarizeArrays(model::IR.Model; passesFollow::Bool = false)::Scalarize
   local equations = IR.Equation[]
   local origins = EquationOrigin[]
   for (i, eq) in enumerate(p.equations)
-    scalarEquations!(equations, origins, eq, EquationOrigin(i), NO_ITERATORS, E)
+    scalarEquationsOf!(equations, origins, eq, i, E, cache)
   end
   local initialEquations = IR.Equation[]
+  local initialOrigins = EquationOrigin[]
   for (i, eq) in enumerate(p.initialEquations)
-    scalarEquations!(initialEquations, EquationOrigin[], eq, EquationOrigin(i), NO_ITERATORS, E)
+    scalarEquationsOf!(initialEquations, initialOrigins, eq, i, E, cache)
   end
   local unknowns = Symbol[]
   for n in p.unknowns
@@ -1232,6 +1244,32 @@ function scalarizeArrays(model::IR.Model; passesFollow::Bool = false)::Scalarize
   local scalar = IR.Model(model.name, variables, IR.Partition[partition], model.clocked, model.baseClocks, model.functions,
                           model.initialMode, model.modes, model.transitions, model.frontendModel)
   return Scalarized(scalar, origins, E)
+end
+
+"""
+    scalarEquationsOf!(out, origins, eq, i, E, cache)
+
+The element equations of the `i`-th equation `eq` (`scalarEquations!`) onto `out` and their origins onto `origins`;
+taken from `cache` where it has them (`ScalarCache`), else put there.
+"""
+function scalarEquationsOf!(out::Vector{IR.Equation}, origins::Vector{EquationOrigin}, eq::IR.Equation, i::Int, E::Elements,
+                            cache::Union{Nothing, ScalarCache})::Nothing
+  if cache === nothing
+    scalarEquations!(out, origins, eq, EquationOrigin(i), NO_ITERATORS, E)
+    return nothing
+  end
+  local entry::Union{Nothing, Tuple{Vector{IR.Equation}, Vector{EquationOrigin}}} = get(cache, eq, nothing)
+  if entry === nothing
+    local mine::Vector{IR.Equation} = IR.Equation[]
+    local where::Vector{EquationOrigin} = EquationOrigin[]
+    scalarEquations!(mine, where, eq, EquationOrigin(i), NO_ITERATORS, E)
+    entry = cache[eq] = (mine, where)
+  end
+  append!(out, entry[1])
+  for o::EquationOrigin in entry[2]
+    push!(origins, EquationOrigin(i, o.path, o.iteration, o.element))
+  end
+  return nothing
 end
 
 "Whether `model` has a continuous-time array variable (not a parameter's or a constant's)."

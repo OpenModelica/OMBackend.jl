@@ -50,6 +50,26 @@ function _irArraySimulate(name::String, names::Vector{String}, stop::Float64; ke
   return Float64[OMBackend.getVariableValues(sol, n)[end] for n in names]
 end
 
+#= A test's own models written beside it, `Modelica"""..."""` (OMParser 1.0), as in arrayPathTests.jl =#
+const var"@Modelica_str" = OMFrontend.OMParser.var"@Modelica_str"
+
+"The OMJLIR model of the model `name` of the Modelica text `program` before index reduction (as `_irUnreduced`)."
+function _irUnreducedOf(program, name::String)::_IRM.Model
+  local (fm, cache) = OMFrontend.instantiateSCodeToFM(name, OMFrontend.translateToSCode(program))
+  local model = OMBackend.lowerFlatModel(fm; functions = OMFrontend.cacheToFunctionList(cache))
+  return OMBackend.Passes.runPasses!(model; through = first(last(OMBackend.Passes.PIPELINE)))
+end
+
+"The values of `names` at the end of a simulation of the model `name` of `program` to `stop`, scalarized or with its arrays kept."
+function _irSimulateOf(program, name::String, names::Vector{String}, stop::Float64; kept::Bool)::Vector{Float64}
+  local (fm, cache) = OMFrontend.instantiateSCodeToFM(name, OMFrontend.translateToSCode(program); scalarize = !kept)
+  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarized = !kept)
+  local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution =
+    OMBackend.simulateModel(OMBackend.canonicalName(name); tspan = (0.0, stop), reltol = 1e-10, abstol = 1e-10)
+  @test sol.retcode == ReturnCode.Success
+  return Float64[OMBackend.getVariableValues(sol, n)[end] for n in names]
+end
+
 "explain of `IndexReduction.<name>`."
 function _irExplain(name::String)::_IRd.Explanation
   local (fm, functions) = _irFlat(name)
@@ -124,6 +144,38 @@ end
     @test antiderivative == Dict(:v => :x, :a => :v)
     @test _IRd.baseVariable(antiderivative, :a) === :x && _IRd.baseVariable(antiderivative, :y) === :y
     @test _IRd.derivativeChain(chain, :x) == [:v, :a] && isempty(_IRd.derivativeChain(chain, :y))
+  end
+
+  @testset "an alias's fixed start merged onto its representative (omc's RemoveSimpleEquations)" begin
+    #= y = x and w = -z, y and w fixed, x and z the states and representatives: they take the fixed starts (z
+       negated), y and w no longer fixed (MSL ThreeSprings' body1.r_0, fixed and avoid, read through the state
+       body1.frame_a.r_0); undoAliases! restores the attributes. Both routes start at x = 2, z = -3 =#
+    local program = Modelica"""
+      model FixedStartOnAlias "fixed starts on algebraic aliases of states"
+        Real x;
+        Real y(start = 2.0, fixed = true);
+        Real z;
+        Real w(start = 3.0, fixed = true);
+      equation
+        y = x;
+        w = -z;
+        der(x) = -x;
+        der(z) = -z;
+      end FixedStartOnAlias;
+      """
+    local model = _irUnreducedOf(program, "FixedStartOnAlias")
+    local partition = only(model.continuous)
+    local before = Dict{Symbol, _IRM.VariableAttributes}(n => model.variables[n].attributes for n in (:x, :y, :z, :w))
+    local undo = _IRd.substituteAliases!(model, partition)
+    @test _IRd.fixedStart(model.variables[:x]) && _IRd.fixedStart(model.variables[:z])
+    @test !_IRd.fixedStart(model.variables[:y]) && !_IRd.fixedStart(model.variables[:w])
+    @test model.variables[:x].attributes.start === before[:y].start
+    @test model.variables[:z].attributes.start == _IRd.negatedStart(before[:w].start)
+    _IRd.undoAliases!(model, partition, undo)
+    @test all(n -> model.variables[n].attributes === before[n], (:x, :y, :z, :w))
+    for kept in (false, true)
+      @test _irSimulateOf(program, "FixedStartOnAlias", ["x", "z"], 1.0; kept = kept) ≈ [2.0, -3.0] ./ exp(1) atol = 1e-8
+    end
   end
 
   @testset "the choice of states" begin
@@ -548,13 +600,15 @@ end
   end
 
   @testset "arrays kept: reduced in array form (OMBACKEND_ARRAY_INDEX_REDUCTION)" begin
-    #= rigid pairs as array equations: the arrays phi1 and w1 states, phi2 and w2 dummy states, the derivatives of
-       the derivatives whole arrays, the states' derivatives an array linked by a for-equation =#
+    #= rigid pairs as array equations: the arrays phi1 and w1 states (omc's), phi2 read through phi1 (its array alias,
+       `arrayAliasPlan`: phi1 = phi2), w2 a dummy state, the derivatives of the derivatives whole arrays, the states'
+       derivatives an array linked by a for-equation =#
     local m = _irArrayUnreduced("InertiaArray")
     @test _IRd.reduceIndexArrays!(m)
     local kind = name -> m.variables[Symbol(name)].kind
     @test kind("phi1") isa _IRM.STATE && kind("w1") isa _IRM.STATE && m.variables[:phi1].ty isa _IRM.T_ARRAY
-    @test kind("phi2") isa _IRM.DUMMY_STATE && kind("w2") isa _IRM.DUMMY_STATE
+    @test kind("phi2") isa _IRM.ALGEBRAIC && kind("w2") isa _IRM.DUMMY_STATE
+    @test !haskey(m.variables, Symbol("\$DER.phi2"))
     @test m.variables[Symbol("\$DER.\$DER.phi1")].ty isa _IRM.T_ARRAY
     @test kind("\$STATEDER.phi1") isa _IRM.STATE_DER
     #= the for-equation's body marked as the link, its elements too once scalarized =#
@@ -581,12 +635,19 @@ end
     @test scalar.variables[Symbol("\$STATESET1.x[2,1]")].kind isa _IRM.STATE
     local aStart = (i, c) -> scalar.variables[Symbol("\$STATESET1.A[$(i),1,$(c)]")].attributes.start.value
     @test [aStart(i, 1) for i in 1:3] == [1, 0, 0]
-    #= a start declared on an alias of the set's candidates (ra = r, an array equation the arrays-kept model keeps):
-       at the declared starts ra = 0, the distance guarded and its gradient zero; the starts carried through the
-       explicit relations (`propagatedValues`, generic = false) give the gradient (-1, 0): r[1] the dummy, the set
-       starts on r[2] (MSL SpringDamperSystem: the generic point chose the element across the damper, Unstable) =#
+    #= an array alias of a state (ra = r): read through r (`arrayAliasPlan`), r and v the states, as omc's; s = |r|
+       the dummy, no state set =#
     m = _irArrayUnreduced("StartOnAlias")
     @test withenv(() -> _IRd.reduceIndexArrays!(m), "OMBACKEND_DYNAMIC_STATE_SETS" => "true")
+    @test m.variables[:r].kind isa _IRM.STATE && m.variables[:v].kind isa _IRM.STATE && m.variables[:s].kind isa _IRM.DUMMY_STATE
+    @test !any(v -> startswith(string(v.name), "\$STATESET"), m.variables)
+    #= the alias kept as written (its pass off): a start declared on an alias of the set's candidates (ra = r, an array
+       equation the arrays-kept model keeps): at the declared starts ra = 0, the distance guarded and its gradient zero;
+       the starts carried through the explicit relations (`propagatedValues`, generic = false) give the gradient (-1, 0):
+       r[1] the dummy, the set starts on r[2] (MSL SpringDamperSystem: the generic point chose the element across the
+       damper, Unstable) =#
+    m = _irArrayUnreduced("StartOnAlias")
+    @test withenv(() -> _IRd.reduceIndexArrays!(m), "OMBACKEND_DYNAMIC_STATE_SETS" => "true", "OMBACKEND_ALIAS_SUBSTITUTION" => "false")
     @test [m.variables[Symbol("\$STATESET1.A[1,$(c)]")].attributes.start.value for c in 1:2] == [0, 1]
     @test m.variables[:s].kind isa _IRM.STATE && m.variables[:r].kind isa _IRM.DUMMY_STATE
     #= a state without a start takes the start carried through the relations as its guess (`carriedStarts`:
@@ -677,11 +738,27 @@ end
     _IRd.reduceIndexArrays!(m)
     local beforeSolve::Vector{String} = string.(m.continuous[1].equations)
     local (solved::_IRM.Model, solvedNames::Vector{Symbol}) = _IRd.solvedInArrays(m)
-    @test Symbol("\$DER.w1") in solvedNames && Symbol("\$DER.\$DER.phi2") in solvedNames
+    @test Symbol("\$DER.w1") in solvedNames && Symbol("\$DER.\$DER.phi1") in solvedNames
     local lines::Vector{String} = string.(solved.continuous[1].equations)
     @test all(eq::_IRM.Equation -> eq isa _IRM.FOR_EQUATION, solved.continuous[1].equations)
     @test any(l::String -> occursin("\$STATEDER.w1[\$i1] = ((sin(time) * /*Real*/ \$i1) - tau[\$i1])", l), lines)
     @test string.(m.continuous[1].equations) == beforeSolve
+    #= a solved derivative array read as a whole (`R * \$DER.r`): the array its value reads by the template's own
+       subscripts (`v[\$i1]`: `v`), else the array literal of its elements' values (`wholeArray`) =#
+    let I = _IRM
+      local vec3 = I.T_ARRAY(I.T_REAL(), I.Dimension[I.DIM_SIZE(3)])
+      local it = I.CREF(I.ComponentRef(I.CrefPart[I.CrefPart(Symbol("\$i1"), I.Subscript[], I.T_INTEGER())]), I.T_INTEGER())
+      local ref = (name::Symbol, subs::Vector{I.Subscript}) ->
+        I.CREF(I.ComponentRef(I.CrefPart[I.CrefPart(name, subs, vec3)]), isempty(subs) ? vec3 : I.T_REAL())
+      local template = _IRd.SolvedTemplate(ref(Symbol("\$DER.x"), I.Subscript[I.INDEX(it)]), Symbol[Symbol("\$i1")],
+                                           ref(:v, I.Subscript[I.INDEX(it)]))
+      local whole = ref(Symbol("\$DER.x"), I.Subscript[])
+      @test string(_IRd.instantiated(template, whole, template.value)) == "v"
+      local shifted = I.BINARY(template.value, I.ADD, I.REAL(1.0), I.T_REAL())
+      local literal = _IRd.instantiated(template, whole, shifted)
+      @test literal isa I.ARRAY && length(literal.elements) == 3
+      @test string(literal.elements[2]) == string(I.BINARY(ref(:v, I.Subscript[I.INDEX(I.INTEGER(2))]), I.ADD, I.REAL(1.0), I.T_REAL()))
+    end
     #= translated with the arrays kept: the results of the scalarized model =#
     withenv("OMBACKEND_ARRAY_INDEX_REDUCTION" => "true") do
       #= InertiaArray, AngleArray: states; the pendulums: a family of dynamic state sets, over a vector (PendulumArray),

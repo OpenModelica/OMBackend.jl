@@ -52,6 +52,12 @@ const DENSE_BLOCK_SIZE = 128
 const RANK_TOLERANCE = 1.0e-6
 
 """
+The most column colors of a linear loop's Jacobian for its direct solve in every call (`_blockLinear!`): a Jacobian
+costs one evaluation per color, Newton with a kept one about eight in all (MSL EngineV6's loops of two unknowns).
+"""
+const LINEAR_DIRECT_COLORS = 4
+
+"""
     columnColors(S) -> Vector{Int}
 
 A greedy coloring of the columns of the sparse pattern `S`: columns that share no row get one color, so one residual
@@ -74,7 +80,7 @@ function columnColors(S::_SPARSE.SparseMatrixCSC{Float64, Int})::Vector{Int}
 end
 
 """
-    BlockSolver(pattern, colors, guess)
+    BlockSolver(pattern, colors, guess, linear = false)
 
 The solver of one large algebraic loop of an array model (`blockSolve!`): the columns of each color of its residuals'
 sparsity in its iteration variables, the Jacobian on that sparsity and its factorization, kept between calls (dense
@@ -82,11 +88,14 @@ up to `DENSE_BLOCK_SIZE` variables: the factors in place with their pivots; else
 call's guess; the start values until a solve succeeded), the largest of its residuals (`rsolved`; -1 before the
 first) and counters (residual evaluations, Jacobians, failed solves).
 `rankDeficient`: the dense Jacobian was singular and `factors` holds its pseudo-inverse (`_blockJacobian!`).
+`linear`: the residuals are affine in the iteration variables (`_affineIn` of the explicit solutions and residuals).
+`held`: of a linear loop, the discrete state at its last Jacobian (`_holdDiscretes!`), which its kept factors are for.
 """
 mutable struct BlockSolver
   const groups::Vector{Vector{Int}}
   const J::_SPARSE.SparseMatrixCSC{Float64, Int}
   const dense::Bool
+  const linear::Bool
   const factors::Matrix{Float64}
   const pivots::Vector{_LINALG.BlasInt}
   F::Union{Nothing, _UMFPACK_LU}
@@ -99,6 +108,7 @@ mutable struct BlockSolver
   const xp::Vector{Float64}
   const dx::Vector{Float64}
   const h::Vector{Float64}
+  const held::Vector{Float64}
   solved::Bool
   rsolved::Float64
   residuals::Int
@@ -112,24 +122,31 @@ factorization not (the copy factors again: a copied UMFPACK object shared its C 
 """
 function Base.deepcopy_internal(s::BlockSolver, dict::IdDict)::BlockSolver
   haskey(dict, s) && return dict[s]
-  local c::BlockSolver = BlockSolver(Vector{Int}[copy(g) for g in s.groups], copy(s.J), s.dense, copy(s.factors), copy(s.pivots),
+  local c::BlockSolver = BlockSolver(Vector{Int}[copy(g) for g in s.groups], copy(s.J), s.dense, s.linear, copy(s.factors), copy(s.pivots),
                                      nothing, s.dense && s.factored, s.rankDeficient, copy(s.y), copy(s.x), copy(s.r),
                                      copy(s.rp), copy(s.xp),
-                                     copy(s.dx), copy(s.h), s.solved, s.rsolved, s.residuals, s.jacobians,
+                                     copy(s.dx), copy(s.h), copy(s.held), s.solved, s.rsolved, s.residuals, s.jacobians,
                                      s.failures)
   dict[s] = c
   return c
 end
 
-function BlockSolver(pattern::_SPARSE.SparseMatrixCSC{Float64, Int}, colors::Vector{Int}, guess::Vector{Float64})::BlockSolver
+function BlockSolver(pattern::_SPARSE.SparseMatrixCSC{Float64, Int}, colors::Vector{Int}, guess::Vector{Float64},
+                     linear::Bool = false)::BlockSolver
   local n::Int = length(guess)
   local groups::Vector{Vector{Int}} = Vector{Int}[Int[] for _ in 1:maximum(colors; init = 0)]
   foreach(j::Int -> push!(groups[colors[j]], j), 1:n)
   local dense::Bool = n <= DENSE_BLOCK_SIZE
-  return BlockSolver(groups, copy(pattern), dense, zeros(dense ? n : 0, dense ? n : 0), zeros(_LINALG.BlasInt, dense ? n : 0),
+  return BlockSolver(groups, copy(pattern), dense, linear, zeros(dense ? n : 0, dense ? n : 0), zeros(_LINALG.BlasInt, dense ? n : 0),
                      nothing, false, false, copy(guess), zeros(n), zeros(n), zeros(n), zeros(n), zeros(n), zeros(n),
-                     false, -1.0, 0, 0, 0)
+                     Float64[], false, -1.0, 0, 0, 0)
 end
+
+"A solve without parameters (the solver's own tests): its residuals read no discrete state (`_holdDiscretes!`)."
+_holdDiscretes!(s::BlockSolver, ::Nothing)::Nothing = nothing
+
+"A solve without parameters: kept factors are for its matrix (`_sameDiscretes`)."
+_sameDiscretes(s::BlockSolver, ::Nothing)::Bool = true
 
 """
     blockSolve!(s, residual!, du, a, u, p, t, z, mode, fire)
@@ -144,14 +161,22 @@ with the caller's `z` and `mode` (crossing functions, relation values). Where no
 NaN (the solver rejects the step; an initialization fails). An iterate whose last Jacobian was singular is no
 solution (`rankDeficient`: its steps were least-norm steps, small where the residuals are not), but where all else
 fails one whose residuals are zero to round-off (`_consistentIterate`: a loop singular in its mode and consistent).
+A linear loop whose Jacobian costs at most `LINEAR_DIRECT_COLORS` evaluations is solved directly first
+(`_blockLinear!`).
 """
 function blockSolve!(s::BlockSolver, residual!::R, du::AbstractVector, a::AbstractVector, u::AbstractVector, p, t::Real,
                      z, mode::Bool, fire::Bool)::Nothing where {R <: Function}
   eltype(a) === Float64 ||
     error("array model: an algebraic loop solved in the equations needs Float64 values (a solver with finite differences)")
-  local args::Tuple = (du, a, u, p, t, nothing, false, fire)
+  #= of concrete type: an abstract `Tuple` boxed it (208 B per call) and made each residual call a dynamic one =#
+  local args::Tuple{typeof(du), typeof(a), typeof(u), typeof(p), typeof(t), Nothing, Bool, Bool} =
+    (du, a, u, p, t, nothing, false, fire)
   s.x .= s.y
-  local ok::Bool = _blockAttempt!(s, residual!, args, s.solved ? :kept : :full)
+  local ok::Bool = s.linear && length(s.groups) <= LINEAR_DIRECT_COLORS && _blockAttempt!(s, residual!, args, :linear)
+  if !(ok && !s.rankDeficient)
+    s.x .= s.y
+    ok = _blockAttempt!(s, residual!, args, s.solved ? :kept : :full)
+  end
   if !(ok && !s.rankDeficient) && s.solved
     s.x .= s.y
     ok = _blockAttempt!(s, residual!, args, :full)
@@ -240,7 +265,8 @@ end
 """
     _blockAttempt!(s, residual!, args, kind) -> Bool
 
-One attempt of `blockSolve!`: Newton with the kept factorization (`kind` `:kept`), with a Jacobian in every step
+One attempt of `blockSolve!`: the direct solve of a linear loop (`kind` `:linear`, `_blockLinear!`), Newton with the
+kept factorization (`:kept`), with a Jacobian in every step
 (`:full`), that with differences over the unknowns' size (`:coarse`) or over sqrt(eps) of each one's own size
 (`:fine`, `_differenceStep`), or with shortened steps (`:damped`,
 `_blockDamped!`). An error of the residuals at an iterate or at a point the Jacobian's
@@ -252,6 +278,7 @@ the scalar path's `_RHS_STEP_ERRORS`) is a failed attempt, kept as the right-han
 function _blockAttempt!(s::BlockSolver, residual!::R, args::Tuple, kind::Symbol)::Bool where {R <: Function}
   try
     kind === :damped && return _blockDamped!(s, residual!, args)
+    kind === :linear && return _blockLinear!(s, residual!, args)
     return _blockNewton!(s, residual!, args, kind !== :kept;
                          differences = kind in (:coarse, :fine) ? kind : :standard)
   catch err
@@ -336,6 +363,60 @@ function _blockNewton!(s::BlockSolver, residual!::R, args::Tuple, full::Bool;
   end
   #= the iterations used up while polishing: within 1e-10 =#
   return previous <= 1.0 && all(isfinite, r)
+end
+
+"""
+    _blockLinear!(s, residual!, args) -> Bool
+
+The solve of a loop whose residuals are affine in its unknowns (`s.linear`) from `s.x`. With kept factors made at the
+present discrete state (`_sameDiscretes`) first one step with them: where the step after it is within 1e-10 of the
+values the matrix has not moved (a circuit of constant resistances between switchings: two evaluations). A switching
+changes the matrix, and that second step, of the old factors, measures the old one: MSL SMPM_Braking's diode bridge
+at the start, its currents zero to round-off, took the kept factors' solution under each new set of relations, whose
+round-off signs set the relations again (six relations alternating between two sets). Else the Jacobian at the iterate by differences over the unknowns'
+size (exact for affine residuals, `:coarse`), one step with its factors, and steps of iterative refinement with them
+while they are beyond 1e-10 of the values (at most two). False for a singular Jacobian, residuals not finite or
+refinement that does not get within 1e-10 (the general attempts follow); the last evaluation is at the returned
+iterate. A matrix that moves with the states (MSL EngineV6's loops of two unknowns) costs the Jacobian's colors and
+three evaluations, where Newton with a kept Jacobian needed eight to nine.
+"""
+function _blockLinear!(s::BlockSolver, residual!::R, args::Tuple)::Bool where {R <: Function}
+  local x::Vector{Float64} = s.x; local r::Vector{Float64} = s.r; local dx::Vector{Float64} = s.dx
+  residual!(r, x, args...)
+  s.residuals += 1
+  all(isfinite, r) || return false
+  if s.factored && !s.rankDeficient && _sameDiscretes(s, args[4])
+    _blockStep!(s)
+    x .-= dx
+    all(isfinite, x) || return false
+    residual!(r, x, args...)
+    s.residuals += 1
+    all(isfinite, r) || return false
+    _blockStep!(s)
+    _relativeStep(x, dx) <= 1.0 && return true
+  end
+  (_blockJacobian!(s, residual!, args; differences = :coarse) && !s.rankDeficient) || return false
+  for iteration in 1:3
+    _blockStep!(s)
+    #= a refinement step within 1e-10: the solution as the last step left it =#
+    iteration > 1 && _relativeStep(x, dx) <= 1.0 && return true
+    x .-= dx
+    all(isfinite, x) || return false
+    residual!(r, x, args...)
+    s.residuals += 1
+    all(isfinite, r) || return false
+  end
+  #= refinement that does not converge (a badly conditioned loop): the general attempts =#
+  return false
+end
+
+"The largest component of the step `dx` at `x` in units of 1e-10 of the values (relative; absolute near zero)."
+function _relativeStep(x::Vector{Float64}, dx::Vector{Float64})::Float64
+  local step::Float64 = 0.0
+  for i in eachindex(x)
+    step = max(step, abs(dx[i]) / (1.0e-10 * (1.0 + abs(x[i]))))
+  end
+  return step
 end
 
 """
@@ -445,6 +526,7 @@ function _blockJacobian!(s::BlockSolver, residual!::R, args::Tuple;
   s.jacobians += 1
   s.factored = false
   s.rankDeficient = false
+  s.linear && _holdDiscretes!(s, args[4])
   all(isfinite, J.nzval) || return false
   if s.dense
     fill!(s.factors, 0.0)

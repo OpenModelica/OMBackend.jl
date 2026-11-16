@@ -2855,6 +2855,67 @@ _appendCallbacks!(::Vector{Any}, discrete::Vector{Any}, @nospecialize(cb::Modeli
   (push!(discrete, cb); nothing)
 
 """
+    _ErasedCall{R}(f)
+
+A function of a model's callback in an untyped field: called with any arguments, it calls `f` with them (a dispatch
+at run time; the model's function is compiled for the arguments it gets), its value converted to `R` (`Nothing`:
+ignored). Its type is the same for every model (`_erasedCallback`). Not a FunctionWrapper: one of those compiles a C
+function for each wrapped function's type when it is made (at the translation), and its constructor specialized on it.
+"""
+struct _ErasedCall{R} <: Function
+  f::Any
+  _ErasedCall{R}(@nospecialize(f)) where {R} = new{R}(f)
+end
+
+(c::_ErasedCall{Nothing})(args...)::Nothing = (c.f(args...); nothing)
+(c::_ErasedCall{Bool})(args...)::Bool = convert(Bool, c.f(args...))
+
+"""
+    _erasedHook(f)
+
+`f` as an `_ErasedCall{Nothing}`; SciMLBase's default hooks as they are (one type for every model already, and
+`save_final_discretes!` compares a finalize hook with its default).
+"""
+_erasedHook(f::typeof(ModelingToolkit.SciMLBase.INITIALIZE_DEFAULT))::typeof(ModelingToolkit.SciMLBase.INITIALIZE_DEFAULT) = f
+_erasedHook(f::typeof(ModelingToolkit.SciMLBase.FINALIZE_DEFAULT))::typeof(ModelingToolkit.SciMLBase.FINALIZE_DEFAULT) = f
+_erasedHook(@nospecialize(f))::_ErasedCall{Nothing} = _ErasedCall{Nothing}(f)
+
+"""
+    _erasedCallback(cb)
+
+`cb` with its condition and affect! as `_ErasedCall`s and its hooks through `_erasedHook`, its other fields as they are
+(`_erasedCallbacks`); not specialized on the callback's type (one per model).
+"""
+function _erasedCallback(@nospecialize(cb::ModelingToolkit.SciMLBase.DiscreteCallback))::ModelingToolkit.SciMLBase.DiscreteCallback
+  return ModelingToolkit.SciMLBase.DiscreteCallback(
+    _ErasedCall{Bool}(cb.condition), _ErasedCall{Nothing}(cb.affect!),
+    _erasedHook(cb.initialize), _erasedHook(cb.finalize), cb.save_positions, cb.initializealg,
+    cb.saved_clock_partitions, cb.initialize_save_discretes)
+end
+
+function _erasedCallback(@nospecialize(cb::ModelingToolkit.SciMLBase.VectorContinuousCallback))::ModelingToolkit.SciMLBase.VectorContinuousCallback
+  #= the condition writes into `out` (a view of the root finder's buffer): passed as it is =#
+  return ModelingToolkit.SciMLBase.VectorContinuousCallback(
+    _ErasedCall{Nothing}(cb.condition), _ErasedCall{Nothing}(cb.affect!), cb.len,
+    _erasedHook(cb.initialize), _erasedHook(cb.finalize), cb.idxs, cb.rootfind, cb.interp_points, cb.save_positions,
+    cb.dtrelax, cb.abstol, cb.reltol, cb.repeat_nudge, cb.initializealg, cb.saved_clock_partitions,
+    cb.maybe_discontinuity, cb.initialize_save_discretes)
+end
+
+"""
+    _erasedCallbacks(cbs) -> CallbackSet
+
+The array code's callbacks `cbs` (each a DiscreteCallback or a VectorContinuousCallback) in one set (`_joinCallbacks`),
+each erased (`_erasedCallback`): one callback type for every model. The solver's callback functions take a callback as
+an argument (`find_callback_time`, `apply_discrete_callback!`, the root finder's zero function) and were compiled
+again for each model's own function types: 0.3-0.8 s of a model's first simulate (MSL CoupledClutches 0.76 s,
+DCPM_Start 0.56 s), 5.3 s of EngineV6's with its event code. OrdinaryDiffEqCore wraps the functions of a callback
+itself only where its hooks are the defaults (`_despecialize_callbacks!`); the array code's callbacks have their own
+(`_startHysteresis!`, `_restoreStart!`, `_finiteFirstStep!`, ...).
+"""
+_erasedCallbacks(cbs::Vector{Any})::DiffEqBase.CallbackSet = _joinCallbacks(Any[_erasedCallback(cb) for cb in cbs]...)
+
+"""
     _eraseCallbackSet(cbset)
 
 `cbset` (a `CallbackSet`, one callback or nothing) for the solve: its continuous callbacks collapsed
