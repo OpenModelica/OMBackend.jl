@@ -23,31 +23,57 @@ env:
 
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ matrix.group }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
       # the nightly failure mail needs both mail secrets (not set: GitHub's own notification)
       MAIL_CONFIGURED: ${{ secrets.MAIL_USERNAME != '' && secrets.MAIL_PASSWORD != '' }}
+      # the depot cache's name: one per OS, arch and Julia version (the Linux shards share theirs)
+      DEPOT_CACHE_NAME: ombackend-cpu-targets;os=${{ matrix.os }};arch=${{ matrix.arch }};version=${{ matrix.version }}
     strategy:
       fail-fast: false
+      # group: OMBACKEND_TEST_GROUP (test/runtests.jl). Linux runs the whole suite in two shards, one per route of the
+      # array path's models: "scalarized" (with the platform tests) and "kept". macOS and Windows run "platform".
       matrix:
         include:
           - os: ubuntu-latest
             arch: x64
             version: '1.13'
+            group: scalarized
+          - os: ubuntu-latest
+            arch: x64
+            version: '1.13'
+            group: kept
           - os: macos-latest
             arch: arm64
             version: '1.13'
+            group: platform
           - os: windows-latest
             arch: x64
             version: '1.13'
+            group: platform
 
     steps:
       - name: Cap precompile concurrency (macOS)
         if: runner.os == 'macOS'
         shell: bash
         run: echo "JULIA_NUM_PRECOMPILE_TASKS=2" >> "$GITHUB_ENV"
+
+      # The x64 runners differ in CPU (AMD znver4/znver5, Intel): package images
+      # compiled for the build runner's CPU (`native`) were rejected on another,
+      # and the whole depot precompiled again (#108's Ubuntu run: 387 packages,
+      # 28 min). The targets of Julia's own x64 binaries (doc/src/devdocs/sysimg.md;
+      # its system image has them): images load on every runner, each runner uses
+      # its best target. The arm64 macOS runners have one CPU: native.
+      # The depot cache's name has `cpu-targets`: a cache with native images is not
+      # reused. The loader accepts such an image, so Pkg does not rebuild it, but a
+      # precompile worker with these targets rejects it as a dependency (#109's
+      # first run: OMBackend failed to precompile).
+      - name: CPU target of package images (x64)
+        if: matrix.arch == 'x64'
+        shell: bash
+        run: echo "JULIA_CPU_TARGET=generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1)" >> "$GITHUB_ENV"
 
       - name: Checkout OMBackend.jl
         uses: actions/checkout@v4
@@ -79,8 +105,8 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: julia-actions/cache@v2
         with:
-          cache-name: ombackend
-          include-matrix: true
+          cache-name: ${{ env.DEPOT_CACHE_NAME }}
+          include-matrix: false
 
       # A pull request restores master's cache and saves none: each PR run
       # saved 0.8-2.6 GB per OS, the repository went over its 10 GB and GitHub
@@ -102,7 +128,7 @@ jobs:
                           "$depot/scratchspaces" "$depot/logs"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "key=ombackend;os=${{ runner.os }};os=${{ matrix.os }};arch=${{ matrix.arch }};version=${{ matrix.version }};" >> "$GITHUB_OUTPUT"
+          echo "key=${DEPOT_CACHE_NAME};os=${{ runner.os }};" >> "$GITHUB_OUTPUT"
 
       - name: Restore Julia depot from master (pull request)
         if: github.event_name == 'pull_request'
@@ -154,15 +180,13 @@ jobs:
       - name: Run tests
         uses: julia-actions/julia-runtest@v1
         env:
-          # the whole suite (and coverage) on Linux; macOS and Windows run the
-          # platform group: all but the array path's models (test/runtests.jl)
-          OMBACKEND_TEST_GROUP: ${{ runner.os == 'Linux' && 'all' || 'platform' }}
+          OMBACKEND_TEST_GROUP: ${{ matrix.group }}
         with:
           project: OMBackend.jl
-          # Coverage forces --pkgimages=no, which rejects the warm depot cache
-          # and forces a full precompile on every run. Keep coverage on Linux,
-          # where it is cheap, and disable it on Windows and macOS so the
-          # restored pkgimage cache is actually usable on those runners.
+          # Coverage on Linux only: the whole suite runs there (Codecov merges
+          # the two shards' uploads of a commit). Coverage of a
+          # path (`@OMBackend.jl`) still loads the dependencies' package images
+          # from the cache (the cache report shows them on Linux).
           coverage: ${{ runner.os == 'Linux' }}
           # Use Julia's default bounds-check behavior (honor @inbounds) instead
           # of the action default --check-bounds=yes. The forced setting is a

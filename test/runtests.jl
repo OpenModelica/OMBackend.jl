@@ -46,11 +46,18 @@
   the top-level OMJL test suite at /test/runtests.jl.
 =#
 
-#= OMBACKEND_TEST_GROUP: "all" (the default) or "platform". CI runs "platform" on macOS and Windows: everything but
-   the array path's models (arrayPathTests.jl, about 80% of the suite's time), generated Julia code that runs the
-   same on every platform; Linux runs all of it. =#
+#= OMBACKEND_TEST_GROUP:
+   - "all" (the default): everything.
+   - "platform": everything but the array path's models (arrayPathTests.jl, arrayPathRoutesTests.jl: two thirds of
+     the suite's time), generated Julia code that runs the same on every platform. CI: macOS and Windows.
+   - "scalarized": "platform" and the array path's models on the scalarizing route (arrayPathRoutesTests.jl).
+   - "kept": the array path's models on the arrays-kept route (arrayPathTests.jl, arrayPathRoutesTests.jl).
+   "scalarized" and "kept" together are "all": CI's two Linux shards. =#
 const TEST_GROUP = get(ENV, "OMBACKEND_TEST_GROUP", "all")
-TEST_GROUP in ("all", "platform") || error("Unknown OMBACKEND_TEST_GROUP: $(TEST_GROUP)")
+TEST_GROUP in ("all", "platform", "scalarized", "kept") || error("Unknown OMBACKEND_TEST_GROUP: $(TEST_GROUP)")
+
+"The routes arrayPathRoutesTests.jl builds its models on: `true` the scalarizing route, `false` the arrays-kept one."
+const ROUTES = TEST_GROUP == "scalarized" ? [true] : TEST_GROUP == "kept" ? [false] : [true, false]
 
 # On Windows, a failed DLL load or a segfault in external Modelica C functions
 # opens a modal Windows Error Reporting dialog. On a headless CI runner nothing
@@ -81,7 +88,8 @@ using DifferentialEquations: ReturnCode
 include("../examples/ExampleModels.jl")
 import .ExampleModels
 
-@testset "OMBackend" begin
+#= the "kept" group: the array path only (below) =#
+TEST_GROUP == "kept" || @testset "OMBackend" begin
 
   function resetLogRunDirStack!()
     while OMBackend.hasActiveLogRunDir()
@@ -388,7 +396,11 @@ import .ExampleModels
   include("solveKwargsTests.jl")
 
   #= ── 19. Array-preserving code generation (no-scalarize models) ─ =#
-  TEST_GROUP == "all" && include("arrayPathTests.jl")
+  if TEST_GROUP in ("all", "scalarized")
+    include("arrayPathHelpers.jl")
+    TEST_GROUP == "all" && include("arrayPathTests.jl")
+    include("arrayPathRoutesTests.jl")
+  end
   include("simCodeArraysTests.jl")
 
   #= ── 20. The initialization's one-unknown rows ──────────────────── =#
@@ -525,4 +537,10 @@ import .ExampleModels
     isempty(found) || foreach(println, found)
   end
 
+end
+
+TEST_GROUP == "kept" && @testset "OMBackend: the array path, arrays-kept route" begin
+  include("arrayPathHelpers.jl")
+  include("arrayPathTests.jl")
+  include("arrayPathRoutesTests.jl")
 end
