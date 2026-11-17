@@ -55,6 +55,10 @@ jobs:
       # 28 min). The targets of Julia's own x64 binaries (doc/src/devdocs/sysimg.md;
       # its system image has them): images load on every runner, each runner uses
       # its best target. The arm64 macOS runners have one CPU: native.
+      # The depot cache's name has `cpu-targets`: a cache with native images is not
+      # reused. The loader accepts such an image, so Pkg does not rebuild it, but a
+      # precompile worker with these targets rejects it as a dependency (#109's
+      # first run: OMBackend failed to precompile).
       - name: CPU target of package images (x64)
         if: matrix.arch == 'x64'
         shell: bash
@@ -90,7 +94,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: julia-actions/cache@v2
         with:
-          cache-name: ombackend
+          cache-name: ombackend-cpu-targets
           include-matrix: true
 
       # A pull request restores master's cache and saves none: each PR run
@@ -113,7 +117,7 @@ jobs:
                           "$depot/scratchspaces" "$depot/logs"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "key=ombackend;os=${{ runner.os }};os=${{ matrix.os }};arch=${{ matrix.arch }};version=${{ matrix.version }};" >> "$GITHUB_OUTPUT"
+          echo "key=ombackend-cpu-targets;os=${{ runner.os }};os=${{ matrix.os }};arch=${{ matrix.arch }};version=${{ matrix.version }};" >> "$GITHUB_OUTPUT"
 
       - name: Restore Julia depot from master (pull request)
         if: github.event_name == 'pull_request'
