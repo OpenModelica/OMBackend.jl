@@ -391,11 +391,11 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
             local u0Dict = _buildTransferU0Dict(newSystem, oldSystem, integrator,
                                                 cb.name, activeModeName,
                                                 omProblem.topVariables)
+            #= MTK 10+: one operating point, the inherited unknowns and the new mode's parameter values =#
             local daeProb = ModelingToolkit.ODEProblem(
               newSystem.f.sys,
-              u0Dict,
-              (i.t, tspan[2]),
-              newSystem.p;
+              merge(u0Dict, _parameterValues(newSystem)),
+              (i.t, tspan[2]);
               build_initializeprob = true,
               warn_initialize_determined = false,
               callback = CallbackSet(cb.systemSpecificCallbacks, omProblem.callbackConditions...)
@@ -499,6 +499,17 @@ function _isDAETransferTarget(newSystem)::Bool
     OMBackend._fallback(err, :vssMassMatrix)
     return false
   end
+end
+
+"""
+    _parameterValues(problem::ODEProblem) -> Dict{Any, Any}
+
+The values of the parameters of the MTK system of `problem` in `problem.p` (symbolic indexing), for the operating
+point of a problem rebuilt from that system (`ODEProblem(sys, op, tspan)`).
+"""
+function _parameterValues(problem::ODEProblem)::Dict{Any, Any}
+  local sys = problem.f.sys
+  return Dict{Any, Any}(p => problem.ps[p] for p in ModelingToolkit.parameters(sys))
 end
 
 """

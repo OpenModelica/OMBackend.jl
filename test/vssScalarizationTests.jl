@@ -38,8 +38,13 @@ _vssValue(sol, name::String)::Float64 = OMBackend.getVariableValues(sol, name)[e
       """
     local name::String = _vssTranslate(program, "VSSModes")
     @test name in OMBackend.BACKEND_SCALARIZED_MODELS
+    OMBackend.resetFallbacks!()
     local sols = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-10)
     @test length(sols) == 2
+    #= b's problem rebuilt from its system at the transition (MTK's initialization with the carried values): not the
+       vector u0 fallback, whose problem starts at 0 =#
+    @test !haskey(OMBackend.FALLBACKS, :vssTransferDAEInit)
+    @test sols[2].prob.tspan == (0.5, 1.0)
     @test _vssValue(sols[1], "a_x[2]") ≈ 2 * exp(-0.5) atol = 1e-8
     #= x(0.5) carried into b, then x(1) = x(0.5) + {1, 2} * 0.5 =#
     @test _vssValue(sols[2], "b_x[1]") ≈ exp(-0.5) + 0.5 atol = 1e-8
